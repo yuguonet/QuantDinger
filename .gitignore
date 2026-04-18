@@ -1,0 +1,85 @@
+# ============================================
+# QuantDinger - Open Source Repository
+# ============================================
+
+# ========================
+# Frontend
+# ========================
+# Legacy / private frontend source (not part of this open-source tree)
+/quantdinger_vue/
+/QuantDinger-Vue-src/
+# Build artefacts are committed for Docker-only deployments
+!/frontend/
+!/frontend/dist/
+!/frontend/dist/**
+
+# ========================
+# Environment & Secrets
+# ========================
+.env
+.env.local
+.env.*.local
+backend_api_python/.env
+
+# ========================
+# IDE & OS
+# ========================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.iml
+
+# ========================
+# Python
+# ========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+# Only ignore root-level dist/, not frontend/dist/
+/dist/
+build/
+*.egg
+.eggs/
+venv/
+.venv/
+env/
+
+# ========================
+# Node (if any remain)
+# ========================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# ========================
+# Logs & Runtime Data
+# ========================
+*.log
+backend_api_python/logs/
+# Vue build output belongs in frontend/dist/, not under the API package
+backend_api_python/dist/
+backend_api_python/data/quantdinger.db
+backend_api_python/data/memory/
+
+# ========================
+# i18n tooling
+# ========================
+scripts/.i18n-cache/
+QuantDinger-Vue-src/src/locales/lang/*.bak
+
+# ========================
+# Docker
+# ========================
+docker-compose.override.yml
+backend_api_python/app/market_store/QuantDinger_数据存储分析报告.md
+backend_api_python/app/market_store/国际市场监控.md
+.gitignore
+backend_api_python/app/market_store/国际市场监控.md

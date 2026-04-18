@@ -1,0 +1,2029 @@
+"""
+Trading Strategy API Routes
+"""
+from flask import Blueprint, request, jsonify, g
+from datetime import datetime, timezone
+import json
+import re
+import traceback
+import time
+
+from app.services.strategy import StrategyService
+from app.services.strategy_compiler import StrategyCompiler
+from app.services.backtest import BacktestService
+from app.services.strategy_snapshot import StrategySnapshotResolver
+from app import get_trading_executor
+from app.utils.logger import get_logger
+from app.utils.db import get_db_connection
+
+try:
+    from psycopg2.errors import UndefinedTable as PgUndefinedTable
+except Exception:  # pragma: no cover
+    PgUndefinedTable = None  # type: ignore
+from app.utils.auth import login_required
+from app.data_sources import DataSourceFactory
+
+logger = get_logger(__name__)
+
+strategy_bp = Blueprint('strategy', __name__)
+
+
+def _normalize_trade_row_for_api(trade: dict) -> dict:
+    """Ensure numeric fields are JSON-friendly floats (PostgreSQL DECIMAL → float)."""
+    try:
+        from decimal import Decimal
+    except Exception:  # pragma: no cover
+        Decimal = ()  # type: ignore
+    out = dict(trade)
+    for k in ("price", "amount", "value", "commission", "profit"):
+        v = out.get(k)
+        if isinstance(v, Decimal):
+            out[k] = float(v)
+    return out
+
+
+def _analyze_strategy_code_quality(code: str) -> list[dict]:
+    hints = []
+    raw = (code or "").strip()
+    if not raw:
+        return [{"severity": "error", "code": "EMPTY_CODE", "params": {}}]
+
+    has_on_init = bool(re.search(r"^\s*def\s+on_init\s*\(", raw, re.MULTILINE))
+    has_on_bar = bool(re.search(r"^\s*def\s+on_bar\s*\(", raw, re.MULTILINE))
+    has_ctx_param = bool(re.search(r"\bctx\.param\s*\(", raw))
+    has_order_intent = bool(re.search(r"\bctx\.(buy|sell|close_position)\s*\(", raw))
+
+    if not has_on_init:
+        hints.append({"severity": "warn", "code": "MISSING_ON_INIT", "params": {}})
+    if not has_on_bar:
+        hints.append({"severity": "error", "code": "MISSING_ON_BAR", "params": {}})
+    if not has_ctx_param:
+        hints.append({"severity": "info", "code": "NO_CTX_PARAM_DEFAULTS", "params": {}})
+    if not has_order_intent:
+        hints.append({"severity": "info", "code": "NO_ORDER_INTENT", "params": {}})
+    return hints
+
+
+def _validate_strategy_code_internal(code: str) -> dict:
+    from app.services.strategy_script_runtime import compile_strategy_script_handlers
+
+    raw = (code or "").strip()
+    hints = _analyze_strategy_code_quality(raw)
+    if not raw:
+        return {
+            "success": False,
+            "message": "Code is empty",
+            "error_type": "EmptyCode",
+            "details": None,
+            "hints": hints,
+        }
+
+    try:
+        compile(raw, '<strategy>', 'exec')
+    except SyntaxError as se:
+        return {
+            "success": False,
+            "message": f"Syntax error at line {se.lineno}: {se.msg}",
+            "error_type": "SyntaxError",
+            "details": str(se),
+            "hints": hints,
+        }
+
+    required_funcs = ['on_bar', 'on_init']
+    found = [f for f in required_funcs if f'def {f}' in raw]
+    missing = [f for f in required_funcs if f not in found]
+    if missing:
+        return {
+            "success": False,
+            "message": f"Missing required functions: {', '.join(missing)}",
+            "error_type": "MissingFunctions",
+            "details": None,
+            "hints": hints,
+        }
+
+    try:
+        compile_strategy_script_handlers(raw)
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Runtime Error: {e}",
+            "error_type": "RuntimeError",
+            "details": str(e),
+            "hints": hints,
+        }
+
+    return {
+        "success": True,
+        "message": "Code verification passed",
+        "error_type": None,
+        "details": None,
+        "hints": hints,
+    }
+
+
+def _strategy_debug_summary(validation: dict | None = None) -> dict:
+    validation = validation or {}
+    hints = validation.get("hints") or []
+    return {
+        "success": bool(validation.get("success")),
+        "message": validation.get("message"),
+        "error_type": validation.get("error_type"),
+        "hint_codes": [h.get("code") for h in hints if h.get("code")],
+        "hint_count": len(hints),
+    }
+
+
+def _request_lang(default: str = "zh-CN") -> str:
+    raw = (
+        request.headers.get("X-App-Lang")
+        or request.headers.get("Accept-Language")
+        or default
+    )
+    lang = str(raw or default).split(",", 1)[0].strip()
+    return lang or default
+
+
+def _is_zh_lang(lang: str | None) -> bool:
+    return str(lang or "zh-CN").strip().lower().startswith("zh")
+
+
+def _strategy_ai_text(key: str, lang: str = "zh-CN") -> str:
+    is_zh = _is_zh_lang(lang)
+    texts = {
+        "prompt_empty": "提示词不能为空" if is_zh else "Prompt cannot be empty",
+        "no_llm_key": "未配置 LLM API Key" if is_zh else "No LLM API key configured",
+        "insufficient_credits": "积分不足，请充值后重试" if is_zh else "Insufficient credits. Please top up and try again.",
+        "invalid_json_params": "AI 未返回有效的 JSON 参数" if is_zh else "AI did not return valid JSON parameters",
+        "ai_empty_result": "AI 生成结果为空" if is_zh else "AI generation returned empty result",
+        "success": "success",
+    }
+    return texts.get(key, key)
+
+
+def _strategy_hint_to_text(hint_code: str, params: dict | None = None, lang: str = "zh-CN") -> str:
+    _ = params or {}
+    is_zh = _is_zh_lang(lang)
+    if hint_code == 'MISSING_ON_INIT':
+        return "缺少 on_init(ctx) 函数。" if is_zh else "Missing on_init(ctx) function."
+    if hint_code == 'MISSING_ON_BAR':
+        return "缺少 on_bar(ctx, bar) 函数。" if is_zh else "Missing on_bar(ctx, bar) function."
+    if hint_code == 'NO_CTX_PARAM_DEFAULTS':
+        return "没有通过 ctx.param(...) 声明参数默认值。" if is_zh else "No parameter defaults were declared via ctx.param(...)."
+    if hint_code == 'NO_ORDER_INTENT':
+        return "没有检测到 ctx.buy / ctx.sell / ctx.close_position 等交易动作。" if is_zh else "No order intent like ctx.buy / ctx.sell / ctx.close_position was detected."
+    if hint_code == 'EMPTY_CODE':
+        return "策略代码为空。" if is_zh else "Strategy code is empty."
+    return f"检测到策略提示：{hint_code}" if is_zh else f"Strategy hint detected: {hint_code}"
+
+
+def _strategy_human_summary(
+    initial_validation: dict,
+    final_validation: dict,
+    auto_fix_applied: bool,
+    auto_fix_succeeded: bool,
+    returned_candidate: str,
+    lang: str = "zh-CN",
+) -> dict:
+    is_zh = _is_zh_lang(lang)
+    initial_hints = initial_validation.get('hints') or []
+    final_hints = final_validation.get('hints') or []
+    initial_codes = {h.get('code') for h in initial_hints if h.get('code')}
+    final_codes = {h.get('code') for h in final_hints if h.get('code')}
+    fixed_codes = sorted(initial_codes - final_codes)
+    remaining_codes = sorted(final_codes)
+
+    fixed_messages = [
+        _strategy_hint_to_text(h.get('code'), h.get('params'), lang=lang)
+        for h in initial_hints
+        if h.get('code') in fixed_codes
+    ]
+    remaining_messages = [
+        _strategy_hint_to_text(h.get('code'), h.get('params'), lang=lang)
+        for h in final_hints
+        if h.get('code') in remaining_codes
+    ]
+
+    if auto_fix_applied and auto_fix_succeeded:
+        title = "AI 已自动修复并返回更稳定的策略代码" if is_zh else "AI auto-fixed the strategy code and returned a more stable version"
+    elif auto_fix_applied:
+        title = "AI 尝试自动修复策略代码，但仍保留部分问题" if is_zh else "AI attempted to auto-fix the strategy code, but some issues still remain"
+    else:
+        title = "AI 已生成策略代码，并通过当前质检流程" if is_zh else "AI generated strategy code and it passed the current QA flow"
+
+    returned_text = (
+        "当前返回的是自动修复后的代码。"
+        if returned_candidate == 'repaired' and is_zh else
+        "The returned code is the auto-fixed version."
+        if returned_candidate == 'repaired' else
+        "当前返回的是首次生成的代码。"
+        if is_zh else
+        "The returned code is the initially generated version."
+    )
+    return {
+        "title": title,
+        "returned_text": returned_text,
+        "fixed_messages": fixed_messages,
+        "remaining_messages": remaining_messages,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Strategy templates (loaded once from JSON file)
+# ---------------------------------------------------------------------------
+import os as _os
+
+_TEMPLATES_PATH = _os.path.join(_os.path.dirname(__file__), '..', 'data', 'strategy_templates.json')
+_templates_cache = None
+
+
+def _load_templates():
+    global _templates_cache
+    if _templates_cache is None:
+        try:
+            with open(_TEMPLATES_PATH, 'r', encoding='utf-8') as f:
+                _templates_cache = json.load(f)
+        except Exception as e:
+            logger.error("Failed to load strategy templates: %s", e)
+            _templates_cache = []
+    return _templates_cache
+
+
+@strategy_bp.route('/templates', methods=['GET'])
+@login_required
+def list_strategy_templates():
+    """Return pre-built strategy templates for one-click import."""
+    templates = _load_templates()
+    category = request.args.get('category')
+    difficulty = request.args.get('difficulty')
+    if category:
+        templates = [t for t in templates if t.get('category') == category]
+    if difficulty:
+        templates = [t for t in templates if t.get('difficulty') == difficulty]
+    return jsonify({'code': 1, 'msg': 'success', 'data': templates})
+
+
+@strategy_bp.route('/templates/<key>', methods=['GET'])
+@login_required
+def get_strategy_template(key):
+    """Return a single strategy template by key."""
+    templates = _load_templates()
+    for t in templates:
+        if t.get('key') == key:
+            return jsonify({'code': 1, 'msg': 'success', 'data': t})
+    return jsonify({'code': 0, 'msg': 'Template not found'}), 404
+
+
+# Local mode: avoid heavy initialization during module import.
+# Instantiate services lazily on first use to keep startup clean.
+_strategy_service = None
+_backtest_service = None
+
+def get_strategy_service() -> StrategyService:
+    global _strategy_service
+    if _strategy_service is None:
+        _strategy_service = StrategyService()
+    return _strategy_service
+
+
+def get_backtest_service() -> BacktestService:
+    global _backtest_service
+    if _backtest_service is None:
+        _backtest_service = BacktestService()
+    return _backtest_service
+
+
+@strategy_bp.route('/strategies', methods=['GET'])
+@login_required
+def list_strategies():
+    """
+    List strategies for the current user.
+    """
+    try:
+        user_id = g.user_id
+        items = get_strategy_service().list_strategies(user_id=user_id)
+        return jsonify({'code': 1, 'msg': 'success', 'data': {'strategies': items}})
+    except Exception as e:
+        logger.error(f"list_strategies failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': {'strategies': []}}), 500
+
+
+@strategy_bp.route('/strategies/detail', methods=['GET'])
+@login_required
+def get_strategy_detail():
+    try:
+        user_id = g.user_id
+        strategy_id = request.args.get('id', type=int)
+        if not strategy_id:
+            return jsonify({'code': 0, 'msg': 'Missing strategy id parameter', 'data': None}), 400
+        st = get_strategy_service().get_strategy(strategy_id, user_id=user_id)
+        if not st:
+            return jsonify({'code': 0, 'msg': 'Strategy not found', 'data': None}), 404
+        return jsonify({'code': 1, 'msg': 'success', 'data': st})
+    except Exception as e:
+        logger.error(f"get_strategy_detail failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@strategy_bp.route('/strategies/backtest', methods=['POST'])
+@login_required
+def run_strategy_backtest():
+    try:
+        payload = request.get_json() or {}
+        user_id = g.user_id
+        strategy_id = int(payload.get('strategyId') or 0)
+        if not strategy_id:
+            return jsonify({'code': 0, 'msg': 'strategyId is required', 'data': None}), 400
+
+        start_date_str = str(payload.get('startDate') or '').strip()
+        end_date_str = str(payload.get('endDate') or '').strip()
+        if not start_date_str or not end_date_str:
+            return jsonify({'code': 0, 'msg': 'startDate and endDate are required', 'data': None}), 400
+
+        strategy = get_strategy_service().get_strategy(strategy_id, user_id=user_id)
+        if not strategy:
+            return jsonify({'code': 0, 'msg': 'Strategy not found', 'data': None}), 404
+
+        resolver = StrategySnapshotResolver(user_id=user_id)
+        snapshot = resolver.resolve(strategy, payload.get('overrideConfig') or {})
+        snapshot['user_id'] = user_id
+
+        start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
+        end_date = datetime.strptime(end_date_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
+
+        days_diff = (end_date - start_date).days
+        timeframe = snapshot.get('timeframe') or '1D'
+        if timeframe == '1m':
+            max_days = 30
+            max_range_text = '1 month'
+        elif timeframe == '5m':
+            max_days = 180
+            max_range_text = '6 months'
+        elif timeframe in ['15m', '30m']:
+            max_days = 365
+            max_range_text = '1 year'
+        else:
+            max_days = 1095
+            max_range_text = '3 years'
+        if days_diff > max_days:
+            return jsonify({
+                'code': 0,
+                'msg': f'Backtest range exceeds limit: timeframe {timeframe} supports up to {max_range_text} ({max_days} days), but you selected {days_diff} days',
+                'data': None
+            }), 400
+
+        logger.info(
+            f"[StrategyBacktestRequest] user={user_id} strategy={strategy_id} "
+            f"{snapshot.get('market') or ''}:{snapshot.get('symbol') or ''} "
+            f"tf={timeframe} range=[{start_date_str} ~ {end_date_str}] ({days_diff}d) "
+            f"run_type={snapshot.get('run_type') or ''}"
+        )
+
+        svc = get_backtest_service()
+        result = svc.run_strategy_snapshot(snapshot, start_date=start_date, end_date=end_date)
+        run_id = svc.persist_run(
+            user_id=user_id,
+            indicator_id=snapshot.get('indicator_id'),
+            strategy_id=snapshot.get('strategy_id'),
+            strategy_name=snapshot.get('strategy_name') or '',
+            run_type=snapshot.get('run_type') or 'strategy_indicator',
+            market=snapshot.get('market') or '',
+            symbol=snapshot.get('symbol') or '',
+            timeframe=snapshot.get('timeframe') or '',
+            start_date_str=start_date_str,
+            end_date_str=end_date_str,
+            initial_capital=float(snapshot.get('initial_capital') or 0),
+            commission=float(snapshot.get('commission') or 0),
+            slippage=float(snapshot.get('slippage') or 0),
+            leverage=int(snapshot.get('leverage') or 1),
+            trade_direction=str(snapshot.get('trade_direction') or 'long'),
+            strategy_config=snapshot.get('strategy_config') or {},
+            config_snapshot=snapshot.get('config_snapshot') or {},
+            status='success',
+            error_message='',
+            result=result,
+            code=snapshot.get('code') or '',
+        )
+        return jsonify({'code': 1, 'msg': 'success', 'data': {'runId': run_id, 'result': result}})
+    except ValueError as e:
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 400
+    except Exception as e:
+        logger.error(f"run_strategy_backtest failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        try:
+            payload = payload if isinstance(payload, dict) else {}
+            strategy_id = int(payload.get('strategyId') or 0)
+            strategy = get_strategy_service().get_strategy(strategy_id, user_id=g.user_id) if strategy_id else None
+            if strategy:
+                resolver = StrategySnapshotResolver(user_id=g.user_id)
+                snapshot = resolver.resolve(strategy, payload.get('overrideConfig') or {})
+                snapshot['user_id'] = g.user_id
+                get_backtest_service().persist_run(
+                    user_id=g.user_id,
+                    indicator_id=snapshot.get('indicator_id'),
+                    strategy_id=snapshot.get('strategy_id'),
+                    strategy_name=snapshot.get('strategy_name') or '',
+                    run_type=snapshot.get('run_type') or 'strategy_indicator',
+                    market=snapshot.get('market') or '',
+                    symbol=snapshot.get('symbol') or '',
+                    timeframe=snapshot.get('timeframe') or '',
+                    start_date_str=str(payload.get('startDate') or ''),
+                    end_date_str=str(payload.get('endDate') or ''),
+                    initial_capital=float(snapshot.get('initial_capital') or 0),
+                    commission=float(snapshot.get('commission') or 0),
+                    slippage=float(snapshot.get('slippage') or 0),
+                    leverage=int(snapshot.get('leverage') or 1),
+                    trade_direction=str(snapshot.get('trade_direction') or 'long'),
+                    strategy_config=snapshot.get('strategy_config') or {},
+                    config_snapshot=snapshot.get('config_snapshot') or {},
+                    status='failed',
+                    error_message=str(e),
+                    result=None,
+                    code=snapshot.get('code') or '',
+                )
+        except Exception:
+            logger.debug("Failed to build error snapshot", exc_info=True)
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@strategy_bp.route('/strategies/backtest/history', methods=['GET'])
+@login_required
+def get_strategy_backtest_history():
+    try:
+        user_id = g.user_id
+        strategy_id = int(request.args.get('strategyId') or request.args.get('id') or 0)
+        if not strategy_id:
+            return jsonify({'code': 0, 'msg': 'strategyId is required', 'data': None}), 400
+        limit = max(1, min(int(request.args.get('limit') or 50), 200))
+        offset = max(0, int(request.args.get('offset') or 0))
+        symbol = (request.args.get('symbol') or '').strip()
+        market = (request.args.get('market') or '').strip()
+        timeframe = (request.args.get('timeframe') or '').strip()
+        rows = get_backtest_service().list_runs(
+            user_id=user_id,
+            strategy_id=strategy_id,
+            limit=limit,
+            offset=offset,
+            symbol=symbol,
+            market=market,
+            timeframe=timeframe,
+        )
+        rows = [r for r in rows if str(r.get('run_type') or '').startswith('strategy_')]
+        return jsonify({'code': 1, 'msg': 'success', 'data': rows})
+    except Exception as e:
+        logger.error(f"get_strategy_backtest_history failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@strategy_bp.route('/strategies/backtest/get', methods=['GET'])
+@login_required
+def get_strategy_backtest_run():
+    try:
+        user_id = g.user_id
+        run_id = int(request.args.get('runId') or 0)
+        if not run_id:
+            return jsonify({'code': 0, 'msg': 'runId is required', 'data': None}), 400
+        row = get_backtest_service().get_run(user_id=user_id, run_id=run_id)
+        if not row or not str(row.get('run_type') or '').startswith('strategy_'):
+            return jsonify({'code': 0, 'msg': 'run not found', 'data': None}), 404
+        return jsonify({'code': 1, 'msg': 'success', 'data': row})
+    except Exception as e:
+        logger.error(f"get_strategy_backtest_run failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@strategy_bp.route('/strategies/create', methods=['POST'])
+@login_required
+def create_strategy():
+    try:
+        user_id = g.user_id
+        payload = request.get_json() or {}
+        # Use current user's ID
+        payload['user_id'] = user_id
+        payload['strategy_type'] = payload.get('strategy_type') or 'IndicatorStrategy'
+        new_id = get_strategy_service().create_strategy(payload)
+        return jsonify({'code': 1, 'msg': 'success', 'data': {'id': new_id}})
+    except Exception as e:
+        logger.error(f"create_strategy failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@strategy_bp.route('/strategies/batch-create', methods=['POST'])
+@login_required
+def batch_create_strategies():
+    """
+    Batch create strategies (multiple symbols)
+    
+    Request body:
+        strategy_name: Base strategy name
+        symbols: Array of symbols, e.g. ["Crypto:BTC/USDT", "Crypto:ETH/USDT"]
+        ... other strategy config
+    """
+    try:
+        user_id = g.user_id
+        payload = request.get_json() or {}
+        payload['user_id'] = user_id
+        payload['strategy_type'] = payload.get('strategy_type') or 'IndicatorStrategy'
+        
+        result = get_strategy_service().batch_create_strategies(payload)
+        
+        if result['success']:
+            return jsonify({
+                'code': 1,
+                'msg': f"Successfully created {result['total_created']} strategies",
+                'data': result
+            })
+        else:
+            return jsonify({
+                'code': 0,
+                'msg': 'Batch creation failed',
+                'data': result
+            })
+    except Exception as e:
+        logger.error(f"batch_create_strategies failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@strategy_bp.route('/strategies/batch-start', methods=['POST'])
+@login_required
+def batch_start_strategies():
+    """
+    Batch start strategies
+    
+    Request body:
+        strategy_ids: Array of strategy IDs
+        or
+        strategy_group_id: Strategy group ID
+    """
+    try:
+        user_id = g.user_id
+        payload = request.get_json() or {}
+        strategy_ids = payload.get('strategy_ids') or []
+        strategy_group_id = payload.get('strategy_group_id')
+        
+        # If strategy_group_id provided, get all strategies in the group
+        if strategy_group_id and not strategy_ids:
+            strategy_ids = get_strategy_service().get_strategies_by_group(strategy_group_id, user_id=user_id)
+        
+        if not strategy_ids:
+            return jsonify({'code': 0, 'msg': 'Please provide strategy IDs', 'data': None}), 400
+        
+        # Update database status first
+        result = get_strategy_service().batch_start_strategies(strategy_ids, user_id=user_id)
+        
+        # Then start executor
+        executor = get_trading_executor()
+        for sid in result.get('success_ids', []):
+            try:
+                executor.start_strategy(sid)
+            except Exception as e:
+                logger.error(f"Failed to start executor for strategy {sid}: {e}")
+        
+        return jsonify({
+            'code': 1 if result['success'] else 0,
+            'msg': f"Successfully started {len(result.get('success_ids', []))} strategies",
+            'data': result
+        })
+    except Exception as e:
+        logger.error(f"batch_start_strategies failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@strategy_bp.route('/strategies/batch-stop', methods=['POST'])
+@login_required
+def batch_stop_strategies():
+    """
+    Batch stop strategies
+    
+    Request body:
+        strategy_ids: Array of strategy IDs
+        or
+        strategy_group_id: Strategy group ID
+    """
+    try:
+        user_id = g.user_id
+        payload = request.get_json() or {}
+        strategy_ids = payload.get('strategy_ids') or []
+        strategy_group_id = payload.get('strategy_group_id')
+        
+        if strategy_group_id and not strategy_ids:
+            strategy_ids = get_strategy_service().get_strategies_by_group(strategy_group_id, user_id=user_id)
+        
+        if not strategy_ids:
+            return jsonify({'code': 0, 'msg': 'Please provide strategy IDs', 'data': None}), 400
+        
+        # Stop executor first
+        executor = get_trading_executor()
+        for sid in strategy_ids:
+            try:
+                executor.stop_strategy(sid)
+            except Exception as e:
+                logger.error(f"Failed to stop executor for strategy {sid}: {e}")
+        
+        # Then update database status
+        result = get_strategy_service().batch_stop_strategies(strategy_ids, user_id=user_id)
+        
+        return jsonify({
+            'code': 1 if result['success'] else 0,
+            'msg': f"Successfully stopped {len(result.get('success_ids', []))} strategies",
+            'data': result
+        })
+    except Exception as e:
+        logger.error(f"batch_stop_strategies failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@strategy_bp.route('/strategies/batch-delete', methods=['DELETE'])
+@login_required
+def batch_delete_strategies():
+    """
+    Batch delete strategies
+    
+    Request body:
+        strategy_ids: Array of strategy IDs
+        or
+        strategy_group_id: Strategy group ID
+    """
+    try:
+        user_id = g.user_id
+        payload = request.get_json() or {}
+        strategy_ids = payload.get('strategy_ids') or []
+        strategy_group_id = payload.get('strategy_group_id')
+        
+        if strategy_group_id and not strategy_ids:
+            strategy_ids = get_strategy_service().get_strategies_by_group(strategy_group_id, user_id=user_id)
+        
+        if not strategy_ids:
+            return jsonify({'code': 0, 'msg': 'Please provide strategy IDs', 'data': None}), 400
+        
+        # Stop executor first
+        executor = get_trading_executor()
+        for sid in strategy_ids:
+            try:
+                executor.stop_strategy(sid)
+            except Exception as e:
+                pass  # Ignore stop errors
+        
+        # Then delete
+        result = get_strategy_service().batch_delete_strategies(strategy_ids, user_id=user_id)
+        
+        return jsonify({
+            'code': 1 if result['success'] else 0,
+            'msg': f"Successfully deleted {len(result.get('success_ids', []))} strategies",
+            'data': result
+        })
+    except Exception as e:
+        logger.error(f"batch_delete_strategies failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@strategy_bp.route('/strategies/update', methods=['PUT'])
+@login_required
+def update_strategy():
+    try:
+        user_id = g.user_id
+        strategy_id = request.args.get('id', type=int)
+        if not strategy_id:
+            return jsonify({'code': 0, 'msg': 'Missing strategy id parameter', 'data': None}), 400
+        payload = request.get_json() or {}
+        ok = get_strategy_service().update_strategy(strategy_id, payload, user_id=user_id)
+        if not ok:
+            return jsonify({'code': 0, 'msg': 'Strategy not found', 'data': None}), 404
+        return jsonify({'code': 1, 'msg': 'success', 'data': None})
+    except Exception as e:
+        logger.error(f"update_strategy failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@strategy_bp.route('/strategies/delete', methods=['DELETE'])
+@login_required
+def delete_strategy():
+    try:
+        user_id = g.user_id
+        strategy_id = request.args.get('id', type=int)
+        if not strategy_id:
+            return jsonify({'code': 0, 'msg': 'Missing strategy id parameter', 'data': None}), 400
+        ok = get_strategy_service().delete_strategy(strategy_id, user_id=user_id)
+        return jsonify({'code': 1 if ok else 0, 'msg': 'success' if ok else 'failed', 'data': None})
+    except Exception as e:
+        logger.error(f"delete_strategy failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@strategy_bp.route('/strategies/trades', methods=['GET'])
+@login_required
+def get_trades():
+    """Get trade records for the current user's strategy."""
+    try:
+        user_id = g.user_id
+        strategy_id = request.args.get('id', type=int)
+        if not strategy_id:
+            return jsonify({'code': 0, 'msg': 'Missing strategy id parameter', 'data': {'trades': [], 'items': []}}), 400
+        
+        # Verify strategy belongs to user
+        st = get_strategy_service().get_strategy(strategy_id, user_id=user_id)
+        if not st:
+            return jsonify({'code': 0, 'msg': 'Strategy not found', 'data': {'trades': [], 'items': []}}), 404
+        
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                """
+                SELECT id, strategy_id, symbol, type, price, amount, value, commission, commission_ccy, profit, created_at
+                FROM qd_strategy_trades
+                WHERE strategy_id = ?
+                ORDER BY id DESC
+                """,
+                (strategy_id,)
+            )
+            rows = cur.fetchall() or []
+            cur.close()
+        
+        # Convert created_at to Unix seconds (UTC instant).
+        # qd_strategy_trades.created_at is TIMESTAMP WITHOUT TIME ZONE; with PostgreSQL session UTC
+        # the stored wall clock is UTC. Naive datetime must not use .timestamp() alone — that would
+        # interpret it in the Python process local TZ and shift the instant (e.g. +8h on CN laptops).
+        from datetime import datetime as _dt, timezone as _tz
+        processed_rows = []
+        for row in rows:
+            trade = dict(row)
+            created_at = trade.get('created_at')
+            if created_at:
+                if hasattr(created_at, 'timestamp'):
+                    dt = created_at
+                    if getattr(dt, 'tzinfo', None) is None:
+                        dt = dt.replace(tzinfo=_tz.utc)
+                    trade['created_at'] = int(dt.timestamp())
+                elif isinstance(created_at, str):
+                    try:
+                        dt = _dt.fromisoformat(created_at.replace('Z', '+00:00'))
+                        if getattr(dt, 'tzinfo', None) is None:
+                            dt = dt.replace(tzinfo=_tz.utc)
+                        trade['created_at'] = int(dt.timestamp())
+                    except Exception:
+                        pass
+            processed_rows.append(_normalize_trade_row_for_api(trade))
+        
+        # Frontend expects data.trades; keep data.items for compatibility with list-style components.
+        return jsonify({'code': 1, 'msg': 'success', 'data': {'trades': processed_rows, 'items': processed_rows}})
+    except Exception as e:
+        logger.error(f"get_trades failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': {'trades': [], 'items': []}}), 500
+
+
+@strategy_bp.route('/strategies/positions', methods=['GET'])
+@login_required
+def get_positions():
+    """Get position records for the current user's strategy."""
+    try:
+        user_id = g.user_id
+        strategy_id = request.args.get('id', type=int)
+        if not strategy_id:
+            return jsonify({'code': 0, 'msg': 'Missing strategy id parameter', 'data': {'positions': [], 'items': []}}), 400
+        
+        # Verify strategy belongs to user
+        st = get_strategy_service().get_strategy(strategy_id, user_id=user_id)
+        if not st:
+            return jsonify({'code': 0, 'msg': 'Strategy not found', 'data': {'positions': [], 'items': []}}), 404
+        
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                """
+                SELECT id, strategy_id, symbol, side, size, entry_price, current_price, highest_price,
+                       unrealized_pnl, pnl_percent, equity, updated_at
+                FROM qd_strategy_positions
+                WHERE strategy_id = ?
+                ORDER BY id DESC
+                """,
+                (strategy_id,)
+            )
+            rows = cur.fetchall() or []
+            cur.close()
+
+        # Sync current price and PnL on read (frontend polls every few seconds).
+        def _calc_unrealized_pnl(side: str, entry_price: float, current_price: float, size: float) -> float:
+            ep = float(entry_price or 0.0)
+            cp = float(current_price or 0.0)
+            sz = float(size or 0.0)
+            if ep <= 0 or cp <= 0 or sz <= 0:
+                return 0.0
+            s = (side or "").strip().lower()
+            if s == "short":
+                return (ep - cp) * sz
+            return (cp - ep) * sz
+
+        def _calc_pnl_percent(entry_price: float, size: float, pnl: float) -> float:
+            ep = float(entry_price or 0.0)
+            sz = float(size or 0.0)
+            denom = ep * sz
+            if denom <= 0:
+                return 0.0
+            return float(pnl) / denom * 100.0
+
+        now = int(time.time())
+        # Fetch prices in parallel to reduce latency.
+        sym_to_price: dict[str, float] = {}
+        ds = DataSourceFactory.get_source("Crypto")
+        unique_syms = list({(r.get("symbol") or "").strip() for r in rows if (r.get("symbol") or "").strip()})
+
+        if unique_syms:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            def _fetch_price(sym: str) -> tuple[str, float]:
+                try:
+                    t = ds.get_ticker(sym) or {}
+                    px = float(t.get("last") or t.get("close") or 0.0)
+                    return sym, px
+                except Exception:
+                    return sym, 0.0
+
+            with ThreadPoolExecutor(max_workers=min(len(unique_syms), 10)) as pool:
+                futures = {pool.submit(_fetch_price, s): s for s in unique_syms}
+                for fut in as_completed(futures):
+                    sym, px = fut.result()
+                    if px > 0:
+                        sym_to_price[sym] = px
+
+        # Apply to rows and persist best-effort
+        out = []
+        with get_db_connection() as db:
+            cur = db.cursor()
+            for r in rows:
+                sym = (r.get("symbol") or "").strip()
+                side = (r.get("side") or "").strip().lower()
+                entry = float(r.get("entry_price") or 0.0)
+                size = float(r.get("size") or 0.0)
+                cp = float(sym_to_price.get(sym) or r.get("current_price") or 0.0)
+                pnl = _calc_unrealized_pnl(side, entry, cp, size)
+                pct = _calc_pnl_percent(entry, size, pnl)
+
+                rr = dict(r)
+                # 确保 entry_price 有值（如果数据库中是 NULL，使用计算出的 entry 值）
+                if not rr.get("entry_price") or float(rr.get("entry_price") or 0.0) <= 0:
+                    rr["entry_price"] = float(entry or 0.0)
+                else:
+                    rr["entry_price"] = float(rr.get("entry_price") or 0.0)
+                rr["current_price"] = float(cp or 0.0)
+                rr["unrealized_pnl"] = float(pnl)
+                rr["pnl_percent"] = float(pct)
+                rr["updated_at"] = now
+                out.append(rr)
+
+                try:
+                    cur.execute(
+                        """
+                        UPDATE qd_strategy_positions
+                        SET current_price = ?, unrealized_pnl = ?, pnl_percent = ?, updated_at = NOW()
+                        WHERE id = ?
+                        """,
+                        (float(cp or 0.0), float(pnl), float(pct), int(rr.get("id"))),
+                    )
+                except Exception:
+                    pass
+            db.commit()
+            cur.close()
+
+        return jsonify({'code': 1, 'msg': 'success', 'data': {'positions': out, 'items': out}})
+    except Exception as e:
+        logger.error(f"get_positions failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': {'positions': [], 'items': []}}), 500
+
+
+def _build_strategy_equity_curve(user_id: int, strategy_id: int):
+    st = get_strategy_service().get_strategy(strategy_id, user_id=user_id) or {}
+    if not st:
+        return None, 'Strategy not found'
+
+    initial = float(st.get('initial_capital') or (st.get('trading_config') or {}).get('initial_capital') or 0)
+    if initial <= 0:
+        initial = 1000.0
+
+    with get_db_connection() as db:
+        cur = db.cursor()
+        cur.execute(
+            """
+            SELECT created_at, profit
+            FROM qd_strategy_trades
+            WHERE strategy_id = ?
+            ORDER BY created_at ASC
+            """,
+            (strategy_id,)
+        )
+        rows = cur.fetchall() or []
+        cur.execute(
+            """
+            SELECT COALESCE(SUM(unrealized_pnl), 0) AS u
+            FROM qd_strategy_positions
+            WHERE strategy_id = ?
+            """,
+            (strategy_id,),
+        )
+        prow = cur.fetchone() or {}
+        cur.close()
+
+    equity = initial
+    curve = []
+    for r in rows:
+        try:
+            equity += float(r.get('profit') or 0)
+        except Exception:
+            pass
+        created_at = r.get('created_at')
+        if created_at and hasattr(created_at, 'timestamp'):
+            ts = int(created_at.timestamp())
+        elif created_at:
+            ts = int(created_at)
+        else:
+            ts = int(time.time())
+        curve.append({'time': ts, 'equity': round(equity, 2)})
+
+    try:
+        unreal = float(prow.get('u') or prow.get('U') or 0)
+    except Exception:
+        unreal = 0.0
+    live_equity = float(equity) + unreal
+    now_ts = int(time.time())
+    if abs(unreal) > 1e-12 or not curve:
+        curve.append({'time': now_ts, 'equity': round(live_equity, 2)})
+
+    return curve, None
+
+
+@strategy_bp.route('/strategies/equityCurve', methods=['GET'])
+@login_required
+def get_equity_curve():
+    """Get equity curve for the current user's strategy."""
+    try:
+        user_id = g.user_id
+        strategy_id = request.args.get('id', type=int)
+        if not strategy_id:
+            return jsonify({'code': 0, 'msg': 'Missing strategy id parameter', 'data': []}), 400
+
+        curve, error = _build_strategy_equity_curve(user_id, strategy_id)
+        if error:
+            return jsonify({'code': 0, 'msg': error, 'data': []}), 404
+
+        return jsonify({'code': 1, 'msg': 'success', 'data': curve})
+    except Exception as e:
+        logger.error(f"get_equity_curve failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': []}), 500
+
+
+
+
+
+@strategy_bp.route('/strategies/stop', methods=['POST'])
+@login_required
+def stop_strategy():
+    """
+    Stop a strategy for the current user.
+    
+    Params:
+        id: Strategy ID
+    """
+    try:
+        user_id = g.user_id
+        strategy_id = request.args.get('id', type=int)
+        
+        if not strategy_id:
+            return jsonify({
+                'code': 0,
+                'msg': 'Missing strategy id parameter',
+                'data': None
+            }), 400
+        
+        # Verify strategy belongs to user
+        st = get_strategy_service().get_strategy(strategy_id, user_id=user_id)
+        if not st:
+            return jsonify({'code': 0, 'msg': 'Strategy not found', 'data': None}), 404
+        
+        # Get strategy type
+        strategy_type = get_strategy_service().get_strategy_type(strategy_id)
+        
+        # Local backend: AI strategy executor was removed. Only indicator strategies are supported.
+        if strategy_type == 'PromptBasedStrategy':
+            return jsonify({'code': 0, 'msg': 'AI strategy has been removed; local edition does not support starting/stopping AI strategies', 'data': None}), 400
+
+        # Indicator strategy
+        get_trading_executor().stop_strategy(strategy_id)
+        
+        # Update strategy status
+        get_strategy_service().update_strategy_status(strategy_id, 'stopped', user_id=user_id)
+        
+        return jsonify({
+            'code': 1,
+            'msg': 'Stopped successfully',
+            'data': None
+        })
+        
+    except Exception as e:
+        logger.error(f"Failed to stop strategy: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({
+            'code': 0,
+            'msg': f'Failed to stop strategy: {str(e)}',
+            'data': None
+        }), 500
+
+
+@strategy_bp.route('/strategies/start', methods=['POST'])
+@login_required
+def start_strategy():
+    """
+    Start a strategy for the current user.
+    
+    Params:
+        id: Strategy ID
+    """
+    try:
+        user_id = g.user_id
+        strategy_id = request.args.get('id', type=int)
+        
+        if not strategy_id:
+            return jsonify({
+                'code': 0,
+                'msg': 'Missing strategy id parameter',
+                'data': None
+            }), 400
+        
+        # Verify strategy belongs to user
+        st = get_strategy_service().get_strategy(strategy_id, user_id=user_id)
+        if not st:
+            return jsonify({'code': 0, 'msg': 'Strategy not found', 'data': None}), 404
+        
+        # Get strategy type
+        strategy_type = get_strategy_service().get_strategy_type(strategy_id)
+
+        # IndicatorStrategy and ScriptStrategy are executed by TradingExecutor.
+        if strategy_type == 'PromptBasedStrategy':
+            return jsonify({
+                'code': 0,
+                'msg': 'AI strategy has been removed; local edition does not support starting AI strategies',
+                'data': None
+            }), 400
+        get_strategy_service().update_strategy_status(strategy_id, 'running', user_id=user_id)
+
+        success = get_trading_executor().start_strategy(strategy_id)
+        
+        if not success:
+            # If start failed, restore status
+            get_strategy_service().update_strategy_status(strategy_id, 'stopped', user_id=user_id)
+            return jsonify({
+                'code': 0,
+                'msg': 'Failed to start strategy executor',
+                'data': None
+            }), 500
+        
+        return jsonify({
+            'code': 1,
+            'msg': 'Started successfully',
+            'data': None
+        })
+        
+    except Exception as e:
+        logger.error(f"Failed to start strategy: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({
+            'code': 0,
+            'msg': f'Failed to start strategy: {str(e)}',
+            'data': None
+        }), 500
+
+
+@strategy_bp.route('/strategies/test-connection', methods=['POST'])
+@login_required
+def test_connection():
+    """
+    Test exchange connection.
+    
+    Request body:
+        exchange_config: Exchange configuration (may contain credential_id or inline keys)
+    """
+    try:
+        data = request.get_json() or {}
+        
+        # 记录请求数据（用于调试，但不记录敏感信息）
+        logger.debug(f"Connection test request keys: {list(data.keys())}")
+        
+        # 获取交易所配置
+        exchange_config = data.get('exchange_config', data)
+        
+        # Local deployment: no encryption/decryption; accept dict or JSON string.
+        if isinstance(exchange_config, str):
+            try:
+                import json
+                exchange_config = json.loads(exchange_config)
+            except Exception:
+                pass
+        
+        # 验证 exchange_config 是否为字典
+        if not isinstance(exchange_config, dict):
+            logger.error(f"Invalid exchange_config type: {type(exchange_config)}, data: {str(exchange_config)[:200]}")
+            # Frontend expects HTTP 200 with {code:0} for business failures.
+            return jsonify({'code': 0, 'msg': 'Invalid exchange config format; please check your payload', 'data': None})
+
+        # Resolve credential_id → full config (merges credential keys with any overrides).
+        # This allows the frontend to send just {credential_id: 5} without raw api_key/secret_key.
+        from app.services.exchange_execution import resolve_exchange_config
+        user_id = g.user_id if hasattr(g, 'user_id') else 1
+        resolved = resolve_exchange_config(exchange_config, user_id=user_id)
+
+        # 验证必要字段 (check resolved config after credential merge)
+        if not resolved.get('exchange_id'):
+            return jsonify({'code': 0, 'msg': 'Please select an exchange', 'data': None})
+        
+        api_key = resolved.get('api_key', '')
+        secret_key = resolved.get('secret_key', '')
+        
+        # 详细日志排查
+        logger.info(f"Testing connection: exchange_id={resolved.get('exchange_id')}")
+        if api_key:
+            logger.info(f"API Key: {api_key[:5]}... (len={len(api_key)})")
+        if secret_key:
+            logger.info(f"Secret Key: {secret_key[:5]}... (len={len(secret_key)})")
+        
+        # 检查是否有特殊字符
+        if api_key and api_key.strip() != api_key:
+            logger.warning("API key contains leading/trailing whitespace")
+        if secret_key and secret_key.strip() != secret_key:
+            logger.warning("Secret key contains leading/trailing whitespace")
+            
+        if not api_key or not secret_key:
+            return jsonify({'code': 0, 'msg': 'Please provide API key and secret key', 'data': None})
+        
+        # Pass the resolved config (with actual keys) to the service
+        result = get_strategy_service().test_exchange_connection(resolved, user_id=user_id)
+        
+        if result['success']:
+            return jsonify({'code': 1, 'msg': result.get('message') or 'Connection successful', 'data': result.get('data')})
+        # Always return HTTP 200 for business-level failures.
+        return jsonify({'code': 0, 'msg': result.get('message') or 'Connection failed', 'data': result.get('data')})
+        
+    except Exception as e:
+        logger.error(f"Connection test failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({
+            'code': 0,
+            'msg': f'Connection test failed: {str(e)}',
+            'data': None
+        }), 500
+
+
+@strategy_bp.route('/strategies/get-symbols', methods=['POST'])
+@login_required
+def get_symbols():
+    """
+    Get exchange trading pairs list.
+    
+    Request body:
+        exchange_config: Exchange configuration
+    """
+    try:
+        data = request.get_json() or {}
+        exchange_config = data.get('exchange_config', data)
+        
+        result = get_strategy_service().get_exchange_symbols(exchange_config)
+        
+        if result['success']:
+            return jsonify({
+                'code': 1,
+                'msg': result['message'],
+                'data': {
+                    'symbols': result['symbols']
+                }
+            })
+        else:
+            return jsonify({
+                'code': 0,
+                'msg': result['message'],
+                'data': {
+                    'symbols': []
+                }
+            })
+        
+    except Exception as e:
+        logger.error(f"Failed to fetch symbols: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({
+            'code': 0,
+            'msg': f'Failed to fetch symbols: {str(e)}',
+            'data': {
+                'symbols': []
+            }
+        }), 500
+
+
+@strategy_bp.route('/strategies/preview-compile', methods=['POST'])
+@login_required
+def preview_compile():
+    """
+    Preview compiled strategy result.
+    """
+    try:
+        data = request.get_json() or {}
+        # strategy_config is passed as 'config'
+        config = data.get('config')
+        
+        if not config:
+             return jsonify({'code': 0, 'msg': 'Missing config'}), 400
+
+        # Compile
+        compiler = StrategyCompiler()
+        try:
+            code = compiler.compile(config)
+        except Exception as e:
+            return jsonify({'code': 0, 'msg': f'Compilation failed: {str(e)}'}), 400
+        
+        # Execute
+        symbol = config.get('symbol', 'BTC/USDT')
+        timeframe = config.get('timeframe', '4h')
+        
+        backtest_service = BacktestService()
+        result = backtest_service.run_code_strategy(
+            code=code,
+            symbol=symbol,
+            timeframe=timeframe,
+            limit=500 
+        )
+        
+        if result.get('error'):
+             return jsonify({'code': 0, 'msg': f"Execution failed: {result['error']}"}), 400
+
+        return jsonify({
+            'code': 1,
+            'msg': 'Success',
+            'data': result
+        })
+        
+    except Exception as e:
+        logger.error(f"Preview failed: {e}")
+        return jsonify({'code': 0, 'msg': str(e)}), 500
+
+
+@strategy_bp.route('/strategies/notifications', methods=['GET'])
+@login_required
+def get_strategy_notifications():
+    """
+    Strategy signal notifications for the current user.
+
+    Query:
+      - id: strategy id (optional)
+      - limit: default 50, max 200
+      - since_id: return rows with id > since_id (optional)
+    """
+    try:
+        user_id = g.user_id
+        strategy_id = request.args.get('id', type=int)
+        limit = request.args.get('limit', type=int) or 50
+        limit = max(1, min(200, int(limit)))
+        since_id = request.args.get('since_id', type=int) or 0
+
+        # Get user's strategy IDs for filtering notifications
+        user_strategy_ids = []
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute("SELECT id FROM qd_strategies_trading WHERE user_id = ?", (user_id,))
+            rows = cur.fetchall() or []
+            user_strategy_ids = [r.get('id') for r in rows if r.get('id')]
+            cur.close()
+        
+        where = []
+        args = []
+        
+        # Filter by user's strategies
+        if strategy_id:
+            if strategy_id in user_strategy_ids:
+                where.append("strategy_id = ?")
+                args.append(int(strategy_id))
+            else:
+                return jsonify({'code': 1, 'msg': 'success', 'data': {'items': []}})
+        else:
+            if user_strategy_ids:
+                placeholders = ",".join(["?"] * len(user_strategy_ids))
+                where.append(f"(strategy_id IN ({placeholders}) OR (strategy_id IS NULL AND user_id = ?))")
+                args.extend(user_strategy_ids)
+                args.append(user_id)
+            else:
+                # Only portfolio monitor notifications (strategy_id is NULL)
+                where.append("strategy_id IS NULL AND user_id = ?")
+                args.append(user_id)
+        
+        if since_id:
+            where.append("id > ?")
+            args.append(int(since_id))
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                f"""
+                SELECT *
+                FROM qd_strategy_notifications
+                {where_sql}
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                tuple(args + [int(limit)]),
+            )
+            rows = cur.fetchall() or []
+            cur.close()
+
+        # Convert created_at to UTC timestamp (seconds) for frontend
+        from datetime import timezone as _dt_tz
+        processed_rows = []
+        for row in rows:
+            item = dict(row)
+            created_at = item.get('created_at')
+            if created_at:
+                if hasattr(created_at, 'timestamp'):
+                    # 无时区 datetime：连接已 SET TIME ZONE UTC，按 UTC 解释再转 Unix，避免服务端本地 TZ 误判
+                    if getattr(created_at, 'tzinfo', None) is None:
+                        created_at = created_at.replace(tzinfo=_dt_tz.utc)
+                    item['created_at'] = int(created_at.timestamp())
+                elif isinstance(created_at, str):
+                    try:
+                        from datetime import datetime
+                        dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                        item['created_at'] = int(dt.timestamp())
+                    except Exception:
+                        pass
+            processed_rows.append(item)
+
+        return jsonify({'code': 1, 'msg': 'success', 'data': {'items': processed_rows}})
+    except Exception as e:
+        logger.error(f"get_strategy_notifications failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': {'items': []}}), 500
+
+
+@strategy_bp.route('/strategies/notifications/unread-count', methods=['GET'])
+@login_required
+def get_unread_notification_count():
+    """
+    Get unread notification count for the current user.
+    Used by frontend header badge (cap at 99+ on UI).
+    """
+    try:
+        user_id = g.user_id
+
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute("SELECT id FROM qd_strategies_trading WHERE user_id = ?", (user_id,))
+            rows = cur.fetchall() or []
+            user_strategy_ids = [r.get('id') for r in rows if r.get('id')]
+            cur.close()
+
+        where = ["is_read = 0"]
+        args = []
+
+        if user_strategy_ids:
+            placeholders = ",".join(["?"] * len(user_strategy_ids))
+            where.append(f"(strategy_id IN ({placeholders}) OR (strategy_id IS NULL AND user_id = ?))")
+            args.extend(user_strategy_ids)
+            args.append(user_id)
+        else:
+            where.append("strategy_id IS NULL AND user_id = ?")
+            args.append(user_id)
+
+        where_sql = "WHERE " + " AND ".join(where)
+
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                f"SELECT COUNT(1) AS cnt FROM qd_strategy_notifications {where_sql}",
+                tuple(args),
+            )
+            cnt = int((cur.fetchone() or {}).get("cnt") or 0)
+            cur.close()
+
+        return jsonify({'code': 1, 'msg': 'success', 'data': {'unread': cnt}})
+    except Exception as e:
+        logger.error(f"get_unread_notification_count failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': {'unread': 0}}), 500
+
+
+@strategy_bp.route('/strategies/notifications/read', methods=['POST'])
+@login_required
+def mark_notification_read():
+    """Mark a single notification as read for the current user."""
+    try:
+        user_id = g.user_id
+        data = request.get_json(force=True, silent=True) or {}
+        notification_id = data.get('id')
+        if not notification_id:
+            return jsonify({'code': 0, 'msg': 'Missing id'}), 400
+
+        # Update notifications for user's strategies OR portfolio monitor notifications
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                """
+                UPDATE qd_strategy_notifications SET is_read = 1 
+                WHERE id = ? AND (
+                    strategy_id IN (SELECT id FROM qd_strategies_trading WHERE user_id = ?)
+                    OR (strategy_id IS NULL AND user_id = ?)
+                )
+                """,
+                (int(notification_id), user_id, user_id)
+            )
+            db.commit()
+            cur.close()
+
+        return jsonify({'code': 1, 'msg': 'success'})
+    except Exception as e:
+        logger.error(f"mark_notification_read failed: {str(e)}")
+        return jsonify({'code': 0, 'msg': str(e)}), 500
+
+
+@strategy_bp.route('/strategies/notifications/read-all', methods=['POST'])
+@login_required
+def mark_all_notifications_read():
+    """Mark all notifications as read for the current user."""
+    try:
+        user_id = g.user_id
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                """
+                UPDATE qd_strategy_notifications SET is_read = 1 
+                WHERE strategy_id IN (SELECT id FROM qd_strategies_trading WHERE user_id = ?)
+                   OR (strategy_id IS NULL AND user_id = ?)
+                """,
+                (user_id, user_id)
+            )
+            db.commit()
+            cur.close()
+
+        return jsonify({'code': 1, 'msg': 'success'})
+    except Exception as e:
+        logger.error(f"mark_all_notifications_read failed: {str(e)}")
+        return jsonify({'code': 0, 'msg': str(e)}), 500
+
+
+@strategy_bp.route('/strategies/notifications/clear', methods=['DELETE'])
+@login_required
+def clear_notifications():
+    """Clear all notifications for the current user."""
+    try:
+        user_id = g.user_id
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                """
+                DELETE FROM qd_strategy_notifications 
+                WHERE strategy_id IN (SELECT id FROM qd_strategies_trading WHERE user_id = ?)
+                   OR (strategy_id IS NULL AND user_id = ?)
+                """,
+                (user_id, user_id)
+            )
+            db.commit()
+            cur.close()
+
+        return jsonify({'code': 1, 'msg': 'success'})
+    except Exception as e:
+        logger.error(f"clear_notifications failed: {str(e)}")
+        return jsonify({'code': 0, 'msg': str(e)}), 500
+
+
+# ===== Script Strategy Endpoints =====
+
+@strategy_bp.route('/strategies/verify-code', methods=['POST'])
+@login_required
+def verify_strategy_code():
+    """Verify script strategy code syntax and safety."""
+    try:
+        payload = request.get_json() or {}
+        code = payload.get('code', '')
+        if not code.strip():
+            return jsonify({'success': False, 'message': 'Code is empty'})
+
+        validation = _validate_strategy_code_internal(code)
+        return jsonify(validation)
+    except Exception as e:
+        logger.error(f"verify_strategy_code failed: {str(e)}")
+        return jsonify({'success': False, 'message': str(e)})
+
+
+@strategy_bp.route('/strategies/ai-generate', methods=['POST'])
+@login_required
+def ai_generate_strategy():
+    """Generate strategy code or suggest template parameter updates using AI."""
+    try:
+        payload = request.get_json() or {}
+        lang = _request_lang()
+        prompt = payload.get('prompt', '')
+        if not prompt.strip():
+            return jsonify({'code': '', 'msg': _strategy_ai_text('prompt_empty', lang), 'params': None})
+
+        intent = (payload.get('intent') or 'generate_code').strip()
+        from app.services.llm import LLMService
+        llm = LLMService()
+        api_key = llm.get_api_key()
+        if not api_key:
+            return jsonify({'code': '', 'msg': _strategy_ai_text('no_llm_key', lang), 'params': None})
+
+        from app.services.billing_service import get_billing_service
+        billing = get_billing_service()
+        user_id = g.user_id
+        ok, billing_msg = billing.check_and_consume(
+            user_id=user_id,
+            feature='ai_code_gen',
+            reference_id=f"ai_strategy_{intent}_{user_id}_{int(time.time())}"
+        )
+        if not ok:
+            msg = f'积分不足: {billing_msg}' if _is_zh_lang(lang) and billing_msg else _strategy_ai_text('insufficient_credits', lang)
+            return jsonify({'code': '', 'msg': msg, 'params': None})
+
+        if intent == 'bot_recommend':
+            # ── Extract symbol from user prompt and fetch real market data ──
+            market_data_section = ""
+            try:
+                import re as _re
+                _symbol_map = {
+                    'BTC': 'BTC/USDT', 'ETH': 'ETH/USDT', 'SOL': 'SOL/USDT',
+                    'BNB': 'BNB/USDT', 'XRP': 'XRP/USDT', 'DOGE': 'DOGE/USDT',
+                    'ADA': 'ADA/USDT', 'AVAX': 'AVAX/USDT', 'DOT': 'DOT/USDT',
+                    'MATIC': 'MATIC/USDT', 'LINK': 'LINK/USDT', 'UNI': 'UNI/USDT',
+                    'ATOM': 'ATOM/USDT', 'LTC': 'LTC/USDT', 'FIL': 'FIL/USDT',
+                    'ARB': 'ARB/USDT', 'OP': 'OP/USDT', 'APT': 'APT/USDT',
+                    'SUI': 'SUI/USDT', 'PEPE': 'PEPE/USDT', 'WIF': 'WIF/USDT',
+                    'NEAR': 'NEAR/USDT', 'TRX': 'TRX/USDT', 'SHIB': 'SHIB/USDT',
+                }
+                prompt_upper = prompt.upper()
+                detected_symbol = None
+                for token, full_sym in _symbol_map.items():
+                    if token in prompt_upper:
+                        detected_symbol = full_sym
+                        break
+                if not detected_symbol:
+                    pair_match = _re.search(r'([A-Z]{2,10})\s*/?\s*USDT', prompt_upper)
+                    if pair_match:
+                        detected_symbol = pair_match.group(1) + '/USDT'
+
+                if detected_symbol:
+                    from app.services.kline import KlineService
+                    ks = KlineService()
+                    klines_4h = ks.get_kline(market='Crypto', symbol=detected_symbol, timeframe='4h', limit=50)
+                    klines_1d = ks.get_kline(market='Crypto', symbol=detected_symbol, timeframe='1d', limit=30)
+                    klines = klines_4h or klines_1d or []
+                    tf_label = '4h' if klines_4h else '1d'
+
+                    if klines and len(klines) >= 5:
+                        closes = [float(k.get('close', 0)) for k in klines if k.get('close')]
+                        highs = [float(k.get('high', 0)) for k in klines if k.get('high')]
+                        lows = [float(k.get('low', 0)) for k in klines if k.get('low')]
+                        volumes = [float(k.get('volume', 0)) for k in klines if k.get('volume')]
+                        current_price = closes[-1] if closes else 0
+                        high_recent = max(highs) if highs else 0
+                        low_recent = min(lows) if lows else 0
+                        avg_price = sum(closes) / len(closes) if closes else 0
+                        avg_volume = sum(volumes) / len(volumes) if volumes else 0
+                        price_change_pct = ((closes[-1] - closes[0]) / closes[0] * 100) if closes[0] else 0
+
+                        sma5 = sum(closes[-5:]) / min(5, len(closes[-5:])) if len(closes) >= 5 else avg_price
+                        sma20 = sum(closes[-20:]) / min(20, len(closes[-20:])) if len(closes) >= 20 else avg_price
+                        volatility = ((high_recent - low_recent) / avg_price * 100) if avg_price else 0
+
+                        market_data_section = (
+                            f"\n\n=== REAL-TIME MARKET DATA for {detected_symbol} (last {len(klines)} candles, {tf_label} timeframe) ===\n"
+                            f"Current Price: {current_price}\n"
+                            f"Period High: {high_recent}\n"
+                            f"Period Low: {low_recent}\n"
+                            f"Price Change: {price_change_pct:+.2f}%\n"
+                            f"Average Price: {avg_price:.4f}\n"
+                            f"SMA(5): {sma5:.4f}\n"
+                            f"SMA(20): {sma20:.4f}\n"
+                            f"Trend: {'Bullish (SMA5 > SMA20)' if sma5 > sma20 else 'Bearish (SMA5 < SMA20)'}\n"
+                            f"Volatility (range/avg): {volatility:.2f}%\n"
+                            f"Avg Volume: {avg_volume:.2f}\n"
+                            f"Recent 10 closes: {[round(c, 4) for c in closes[-10:]]}\n"
+                            f"=== END MARKET DATA ===\n\n"
+                            f"IMPORTANT: Use the REAL market data above to set realistic parameters. "
+                            f"For grid bots, set upperPrice/lowerPrice based on the actual Period High/Low and current volatility. "
+                            f"For trend bots, consider the current trend direction. "
+                            f"For DCA bots, consider the price level and change percentage."
+                        )
+                        logger.info(f"[AI Bot] Fetched market data for {detected_symbol}: price={current_price}, "
+                                    f"range=[{low_recent}, {high_recent}], change={price_change_pct:+.2f}%")
+            except Exception as mkt_err:
+                logger.warning(f"[AI Bot] Failed to fetch market data: {mkt_err}")
+
+            system_prompt = (
+                "You are an expert quantitative trading advisor. The user wants to create an automated trading bot.\n"
+                "Based on their description AND the real-time market data provided, recommend one of the four bot types and provide optimal parameters.\n\n"
+                "Available bot types and their parameter schemas:\n"
+                "1. grid - Grid Trading: {upperPrice: number, lowerPrice: number, gridCount: int(5-100), gridMode: 'arithmetic'|'geometric'}\n"
+                "2. martingale - Martingale: {multiplier: number(1.1-3.0), maxLayers: int(2-10), priceDropPct: number(1-20)}\n"
+                "3. trend - Trend Following: {maPeriod: int(5-200), maType: 'SMA'|'EMA', confirmBars: int(1-5), positionPct: number(10-100), direction: 'long'|'short'|'both'}\n"
+                "4. dca - DCA (Dollar-Cost Averaging): {amountEach: number, frequency: 'every_bar'|'hourly'|'4h'|'daily'|'weekly'|'biweekly'|'monthly', dipBuyEnabled: bool, dipThreshold: number(1-30)}\n\n"
+                "Also suggest base config:\n"
+                "- symbol: string (e.g. 'BTC/USDT')\n"
+                "- timeframe: '1m'|'5m'|'15m'|'1h'|'4h'|'1d'\n"
+                "- marketType: 'swap'|'spot'\n"
+                "- leverage: int(1-125, only for swap)\n"
+                "- initialCapital: number (in USDT)\n\n"
+                "Risk config:\n"
+                "- stopLossPct: number(0-100)\n"
+                "- takeProfitPct: number(0-1000)\n"
+                "- maxPosition: number\n\n"
+                "CRITICAL: If real-time market data is provided, you MUST use it to set realistic and accurate parameters.\n"
+                "For example, for grid trading, the upperPrice and lowerPrice MUST be derived from the actual price range in the market data.\n"
+                "IMPORTANT: Do NOT set initialCapital in baseConfig - leave it as 0 or omit it. The user will enter their own investment amount.\n"
+                "IMPORTANT: Keep strategyParams focused on bot logic only. Put stopLossPct/takeProfitPct only in riskConfig, not in strategyParams.\n"
+                "Also do NOT set amountPerGrid, initialAmount(for martingale), or totalBudget(for DCA) - these will be auto-calculated from the user's capital.\n\n"
+                "Return ONLY a single JSON object with this structure:\n"
+                "{\n"
+                '  "botType": "grid"|"martingale"|"trend"|"dca",\n'
+                '  "botName": "descriptive name",\n'
+                '  "reason": "brief explanation in user\'s language, mention the market analysis",\n'
+                '  "baseConfig": {symbol, timeframe, marketType, leverage, initialCapital},\n'
+                '  "strategyParams": {... type-specific params ...},\n'
+                '  "riskConfig": {stopLossPct, takeProfitPct, maxPosition}\n'
+                "}\n"
+                "Do not use markdown fences. Respond with valid JSON only."
+            )
+
+            user_content = f"User request:\n{prompt.strip()}{market_data_section}"
+
+            content = llm.call_llm_api(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                model=llm.get_code_generation_model(),
+                temperature=0.4,
+                use_json_mode=False
+            )
+
+            raw = (content or '').strip()
+            if raw.startswith('```'):
+                raw = re.sub(r'^```[a-zA-Z]*', '', raw).strip()
+                if raw.endswith('```'):
+                    raw = raw[:-3].strip()
+            result = None
+            try:
+                result = json.loads(raw)
+            except json.JSONDecodeError:
+                m = re.search(r'\{[\s\S]*\}', raw)
+                if m:
+                    try:
+                        result = json.loads(m.group(0))
+                    except json.JSONDecodeError:
+                        result = None
+            if not isinstance(result, dict) or 'botType' not in result:
+                return jsonify({'code': '', 'params': None, 'bot_recommend': None,
+                                'msg': 'AI did not return valid bot recommendation'})
+            valid_types = ('grid', 'martingale', 'trend', 'dca')
+            if result.get('botType') not in valid_types:
+                result['botType'] = 'grid'
+            params = result.get('strategyParams') if isinstance(result.get('strategyParams'), dict) else {}
+            risk_cfg = result.get('riskConfig') if isinstance(result.get('riskConfig'), dict) else {}
+            base_cfg = result.get('baseConfig') if isinstance(result.get('baseConfig'), dict) else {}
+
+            # These amounts are derived from user capital in the product UI; keep the AI
+            # recommendation focused on strategy logic to avoid duplicate/conflicting fields.
+            if 'initialCapital' in base_cfg:
+                base_cfg['initialCapital'] = 0
+            result['baseConfig'] = base_cfg
+
+            bot_type = result.get('botType')
+            if bot_type == 'grid':
+                params.pop('amountPerGrid', None)
+            elif bot_type == 'martingale':
+                params.pop('initialAmount', None)
+                params.pop('takeProfitPct', None)
+            elif bot_type == 'dca':
+                params.pop('totalBudget', None)
+                freq = str(params.get('frequency') or '').strip().lower()
+                allowed = {'every_bar', 'hourly', '4h', 'daily', 'weekly', 'biweekly', 'monthly'}
+                if freq and freq not in allowed:
+                    params['frequency'] = 'daily'
+            result['strategyParams'] = params
+            result['riskConfig'] = risk_cfg
+            return jsonify({'code': '', 'params': None, 'bot_recommend': result, 'msg': 'success'})
+
+        if intent == 'adjust_params':
+            template_key = payload.get('template_key') or ''
+            current_params = payload.get('params') or {}
+            code_snapshot = (payload.get('code') or '')[:8000]
+            system_prompt = """You tune quantitative strategy template parameters from the user's request.
+Return ONLY a single JSON object: keys are parameter names (strings), values are JSON numbers or booleans.
+You may return a partial object (only keys that should change) or a full object.
+Do not use markdown fences, do not add explanations before or after the JSON."""
+
+            user_content = (
+                f"Template key: {template_key}\n"
+                f"Current parameters (JSON):\n{json.dumps(current_params, ensure_ascii=False)}\n\n"
+                f"Strategy code excerpt (context):\n{code_snapshot}\n\n"
+                f"User request:\n{prompt.strip()}\n\n"
+                "Respond with JSON only."
+            )
+
+            content = llm.call_llm_api(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                model=llm.get_code_generation_model(),
+                temperature=0.3,
+                use_json_mode=False
+            )
+
+            raw = (content or '').strip()
+            if raw.startswith('```'):
+                raw = re.sub(r'^```[a-zA-Z]*', '', raw).strip()
+                if raw.endswith('```'):
+                    raw = raw[:-3].strip()
+            updates = None
+            try:
+                updates = json.loads(raw)
+            except json.JSONDecodeError:
+                m = re.search(r'\{[\s\S]*\}', raw)
+                if m:
+                    try:
+                        updates = json.loads(m.group(0))
+                    except json.JSONDecodeError:
+                        updates = None
+            if not isinstance(updates, dict):
+                return jsonify({'code': '', 'params': None, 'msg': _strategy_ai_text('invalid_json_params', lang)})
+            return jsonify({'code': '', 'params': updates, 'msg': _strategy_ai_text('success', lang)})
+
+        system_prompt = """You are a quantitative trading strategy code generator.
+Generate Python strategy code that follows this framework:
+- def on_init(ctx): Initialize strategy parameters using ctx.param(name, default)
+- def on_bar(ctx, bar): Core logic called on each K-line bar
+  - bar supports both bar.close and bar['close'] access, and has: open, high, low, close, volume, timestamp
+  - ctx.buy(price, amount), ctx.sell(price, amount), ctx.close_position()
+  - ctx.position supports both numeric checks and dict-style fields:
+    - if not ctx.position / if ctx.position > 0 / if ctx.position < 0
+    - ctx.position['side'], ctx.position['size'], ctx.position['entry_price']
+  - ctx.balance, ctx.equity
+  - ctx.bars(n) to get last N bars, ctx.log(message) to log
+- def on_order_filled(ctx, order): Optional callback when order fills
+- def on_stop(ctx): Optional cleanup when strategy stops
+
+Return ONLY the Python code, no explanations.
+
+Quality rules:
+- Always define both on_init(ctx) and on_bar(ctx, bar)
+- Prefer reading defaults via ctx.param(...)
+- Use ctx.buy / ctx.sell / ctx.close_position for order intent
+- Generated code must compile cleanly
+- Avoid markdown fences or explanatory text
+"""
+
+        extra = ''
+        template_key = payload.get('template_key')
+        params = payload.get('params')
+        code_ctx = (payload.get('code') or '').strip()
+        if template_key or params is not None or code_ctx:
+            extra_parts = []
+            if template_key:
+                extra_parts.append(f"Current template key: {template_key}")
+            if isinstance(params, dict) and params:
+                extra_parts.append('Current template parameters (JSON):\n' + json.dumps(params, ensure_ascii=False))
+            if code_ctx:
+                extra_parts.append('Current code (may be long):\n' + code_ctx[:12000])
+            extra = '\n\n' + '\n\n'.join(extra_parts)
+
+        user_prompt = prompt.strip() + extra
+
+        content = llm.call_llm_api(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            model=llm.get_code_generation_model(),
+            temperature=0.7,
+            use_json_mode=False
+        )
+
+        content = content.strip()
+        if content.startswith("```python"):
+            content = content[9:]
+        elif content.startswith("```"):
+            content = content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+        content = content.strip()
+
+        AUTO_FIX_HINT_CODES = {
+            'MISSING_ON_INIT',
+            'MISSING_ON_BAR',
+        }
+
+        def _needs_auto_fix_strategy(validation: dict) -> bool:
+            if not validation.get('success'):
+                return True
+            return any(h.get('code') in AUTO_FIX_HINT_CODES for h in (validation.get('hints') or []))
+
+        def _format_strategy_validation_issues(validation: dict) -> str:
+            issues = []
+            if not validation.get('success'):
+                issues.append(f"- Verification failed: {validation.get('message')}")
+                if validation.get('details'):
+                    issues.append(f"- Details: {validation.get('details')}")
+            for hint in validation.get('hints') or []:
+                code_name = hint.get('code') or 'UNKNOWN'
+                params_obj = hint.get('params') or {}
+                if params_obj:
+                    issues.append(f"- Hint {code_name}: {json.dumps(params_obj, ensure_ascii=False)}")
+                else:
+                    issues.append(f"- Hint {code_name}")
+            return "\n".join(issues) if issues else "- No issues provided"
+
+        def _repair_strategy_code_via_llm(bad_code: str, validation: dict) -> str:
+            repair_prompt = (
+                "You produced QuantDinger strategy script code that failed automatic validation. "
+                "Fix the code while preserving the user's trading idea. Return one full replacement script only.\n\n"
+                f"# Original user request\n{prompt.strip()}\n\n"
+                f"# Validation issues to fix\n{_format_strategy_validation_issues(validation)}\n\n"
+                "# Current code\n```python\n"
+                + bad_code.strip()
+                + "\n```\n\n"
+                "# Repair requirements\n"
+                "- Must define both on_init(ctx) and on_bar(ctx, bar).\n"
+                "- Must compile and run in QuantDinger strategy runtime.\n"
+                "- Prefer ctx.param(...) for defaults.\n"
+                "- Use ctx.buy / ctx.sell / ctx.close_position for actions.\n"
+                "- Return Python only, no markdown, no explanation."
+            )
+            repaired_content = llm.call_llm_api(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": repair_prompt},
+                ],
+                model=llm.get_code_generation_model(),
+                temperature=0.2,
+                use_json_mode=False
+            )
+            repaired_content = (repaired_content or '').strip()
+            if repaired_content.startswith("```python"):
+                repaired_content = repaired_content[9:]
+            elif repaired_content.startswith("```"):
+                repaired_content = repaired_content[3:]
+            if repaired_content.endswith("```"):
+                repaired_content = repaired_content[:-3]
+            return repaired_content.strip() or bad_code
+
+        validation = _validate_strategy_code_internal(content)
+        debug = {
+            'auto_fix_applied': False,
+            'auto_fix_succeeded': False,
+            'returned_candidate': 'initial',
+            'initial_validation': _strategy_debug_summary(validation),
+            'final_validation': _strategy_debug_summary(validation),
+        }
+        debug['human_summary'] = _strategy_human_summary(validation, validation, False, False, 'initial', lang=lang)
+
+        if _needs_auto_fix_strategy(validation):
+            logger.warning("ai_generate_strategy produced code needing auto-fix: %s", _format_strategy_validation_issues(validation))
+            try:
+                repaired = _repair_strategy_code_via_llm(content, validation)
+                repaired_validation = _validate_strategy_code_internal(repaired)
+                debug = {
+                    'auto_fix_applied': True,
+                    'auto_fix_succeeded': repaired_validation.get('success', False),
+                    'returned_candidate': 'repaired' if repaired_validation.get('success') else 'initial',
+                    'initial_validation': _strategy_debug_summary(validation),
+                    'final_validation': _strategy_debug_summary(repaired_validation),
+                }
+                debug['human_summary'] = _strategy_human_summary(
+                    validation,
+                    repaired_validation,
+                    True,
+                    repaired_validation.get('success', False),
+                    'repaired' if repaired_validation.get('success') else 'initial',
+                    lang=lang
+                )
+                logger.info("ai_generate_strategy debug=%s", json.dumps(debug, ensure_ascii=False))
+                if repaired_validation.get('success'):
+                    content = repaired
+                else:
+                    logger.warning("ai_generate_strategy auto-fix failed, keeping initial candidate")
+            except Exception as repair_err:
+                debug = {
+                    'auto_fix_applied': True,
+                    'auto_fix_succeeded': False,
+                    'returned_candidate': 'initial',
+                    'initial_validation': _strategy_debug_summary(validation),
+                    'final_validation': _strategy_debug_summary(validation),
+                    'auto_fix_error': str(repair_err),
+                }
+                debug['human_summary'] = _strategy_human_summary(validation, validation, True, False, 'initial', lang=lang)
+                logger.error("ai_generate_strategy auto-fix failed: %s", repair_err)
+        else:
+            debug['human_summary'] = _strategy_human_summary(validation, validation, False, False, 'initial', lang=lang)
+            logger.info("ai_generate_strategy debug=%s", json.dumps(debug, ensure_ascii=False))
+
+        if content:
+            return jsonify({'code': content, 'msg': _strategy_ai_text('success', lang), 'params': None, 'debug': debug})
+        else:
+            return jsonify({'code': '', 'msg': _strategy_ai_text('ai_empty_result', lang), 'params': None, 'debug': debug})
+    except Exception as e:
+        logger.error(f"ai_generate_strategy failed: {str(e)}")
+        return jsonify({'code': '', 'msg': str(e), 'params': None, 'debug': None})
+
+
+@strategy_bp.route('/strategies/performance', methods=['GET'])
+@login_required
+def get_strategy_performance():
+    """Get strategy performance metrics (aggregated from equity curve and trades)."""
+    try:
+        user_id = g.user_id
+        strategy_id = request.args.get('id', type=int)
+        if not strategy_id:
+            return jsonify({'code': 0, 'msg': 'Strategy ID required'})
+
+        equity_data, error = _build_strategy_equity_curve(user_id, strategy_id)
+        if error:
+            return jsonify({'code': 0, 'msg': error, 'data': None}), 404
+
+        latest_equity = float(equity_data[-1].get('equity') or 0) if equity_data else 0.0
+        first_equity = float(equity_data[0].get('equity') or 0) if equity_data else latest_equity
+        total_return = latest_equity - first_equity
+        return jsonify({
+            'code': 1,
+            'msg': 'success',
+            'data': {
+                'equity_curve': equity_data,
+                'latest_equity': round(latest_equity, 2),
+                'total_return': round(total_return, 2),
+                'points': len(equity_data),
+            }
+        })
+    except Exception as e:
+        logger.error(f"get_strategy_performance failed: {str(e)}")
+        return jsonify({'code': 0, 'msg': str(e)}), 500
+
+
+@strategy_bp.route('/strategies/logs', methods=['GET'])
+@login_required
+def get_strategy_logs():
+    """Get strategy running logs."""
+    try:
+        user_id = g.user_id
+        strategy_id = request.args.get('id')
+        limit = int(request.args.get('limit', 200))
+        if not strategy_id:
+            return jsonify({'code': 0, 'msg': 'Strategy ID required'})
+
+        st = get_strategy_service().get_strategy(int(strategy_id), user_id=user_id)
+        if not st:
+            return jsonify({'code': 0, 'msg': 'Strategy not found'}), 404
+
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                """
+                SELECT id, strategy_id, level, message, timestamp
+                FROM qd_strategy_logs
+                WHERE strategy_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (int(strategy_id), limit)
+            )
+            rows = cur.fetchall() or []
+            cur.close()
+
+        out = []
+        for r in rows or []:
+            if not isinstance(r, dict):
+                continue
+            rr = dict(r)
+            msg = str(rr.get('message') or '')
+            if msg.startswith('tick price=') or msg.startswith('tick price '):
+                continue
+            ts = rr.get('timestamp')
+            if ts is not None and hasattr(ts, 'isoformat'):
+                if getattr(ts, 'tzinfo', None) is not None:
+                    rr['timestamp'] = ts.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S') + 'Z'
+                else:
+                    rr['timestamp'] = ts.strftime('%Y-%m-%dT%H:%M:%S') + 'Z'
+            out.append(rr)
+        logs = list(reversed(out))
+        return jsonify({'code': 1, 'msg': 'success', 'data': logs})
+    except Exception as e:
+        if PgUndefinedTable is not None and isinstance(e, PgUndefinedTable):
+            return jsonify({'code': 1, 'msg': 'success', 'data': []})
+        el = str(e).lower()
+        if 'qd_strategy_logs' in el and ('does not exist' in el or 'no such table' in el):
+            return jsonify({'code': 1, 'msg': 'success', 'data': []})
+        logger.error(f"get_strategy_logs failed: {str(e)}")
+        return jsonify({'code': 0, 'msg': str(e)}), 500

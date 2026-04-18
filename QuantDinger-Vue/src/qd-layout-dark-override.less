@@ -1,0 +1,199 @@
+/**
+ * 必须在 main.js 中于 global.less 之后引入，确保覆盖 Ant Design Vue / Pro Layout 默认 #001529 等。
+ * 选择器以 .basic-layout-wrapper.{dark|realdark|light} 为准（与 BasicLayout 根节点 settings.theme 同步），
+ * 不依赖 body.dark，避免不同步时顶栏、侧栏底部 footer 仍是浅灰/深蓝。
+ */
+
+/* ========== 顶栏：亮黑 #111 + 顶缘高光 ========== */
+.basic-layout-wrapper.dark .ant-layout-header,
+.basic-layout-wrapper.realdark .ant-layout-header,
+body.dark .basic-layout-wrapper .ant-layout-header,
+body.realdark .basic-layout-wrapper .ant-layout-header {
+  background: #111111 !important;
+  background-color: #111111 !important;
+  border-bottom: 1px solid #1c1c1c !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06) !important;
+}
+
+.basic-layout-wrapper.dark .ant-pro-global-header,
+.basic-layout-wrapper.realdark .ant-pro-global-header,
+body.dark .basic-layout-wrapper .ant-pro-global-header,
+body.realdark .basic-layout-wrapper .ant-pro-global-header {
+  background: #111111 !important;
+  background-color: #111111 !important;
+  border-bottom: none !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06) !important;
+}
+
+/* 页面容器（例如 dashboard / settings 等）去蓝灰 */
+.basic-layout-wrapper.dark .ant-pro-page-header-wrap,
+.basic-layout-wrapper.realdark .ant-pro-page-header-wrap,
+.basic-layout-wrapper.dark .ant-pro-page-header-wrap-children-content,
+.basic-layout-wrapper.realdark .ant-pro-page-header-wrap-children-content,
+.basic-layout-wrapper.dark .ant-pro-basicLayout-content,
+.basic-layout-wrapper.realdark .ant-pro-basicLayout-content,
+body.dark .basic-layout-wrapper .ant-pro-page-header-wrap,
+body.realdark .basic-layout-wrapper .ant-pro-page-header-wrap,
+body.dark .basic-layout-wrapper .ant-pro-page-header-wrap-children-content,
+body.realdark .basic-layout-wrapper .ant-pro-page-header-wrap-children-content {
+  background: #141414 !important;
+  background-color: #141414 !important;
+}
+
+/* ========== 侧栏底部「联系我们」：深黑底 + 区块亮一层（去掉 opacity 发灰）========== */
+.basic-layout-wrapper.dark .custom-menu-footer,
+.basic-layout-wrapper.realdark .custom-menu-footer,
+body.dark .basic-layout-wrapper .custom-menu-footer,
+body.realdark .basic-layout-wrapper .custom-menu-footer {
+  background: #111111 !important;
+  background-color: #111111 !important;
+  border-top: 1px solid #1c1c1c !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06) !important;
+  color: rgba(255, 255, 255, 0.88) !important;
+}
+
+.basic-layout-wrapper.dark .custom-menu-footer .menu-footer-content .footer-section,
+.basic-layout-wrapper.realdark .custom-menu-footer .menu-footer-content .footer-section {
+  padding: 4px 2px !important;
+  margin-bottom: 6px !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  opacity: 1 !important;
+}
+
+.basic-layout-wrapper.dark .custom-menu-footer .menu-footer-content .footer-section:hover,
+.basic-layout-wrapper.realdark .custom-menu-footer .menu-footer-content .footer-section:hover {
+  background: transparent !important;
+}
+
+.basic-layout-wrapper.dark .custom-menu-footer .footer-section .section-title,
+.basic-layout-wrapper.realdark .custom-menu-footer .footer-section .section-title {
+  color: rgba(255, 255, 255, 0.5) !important;
+  opacity: 1 !important;
+  text-transform: uppercase !important;
+  letter-spacing: 0.5px !important;
+  font-size: 9px !important;
+}
+
+.basic-layout-wrapper.dark .custom-menu-footer .footer-section .section-links,
+.basic-layout-wrapper.realdark .custom-menu-footer .footer-section .section-links {
+  opacity: 1 !important;
+}
+
+.basic-layout-wrapper.dark .custom-menu-footer .footer-section .section-links a,
+.basic-layout-wrapper.realdark .custom-menu-footer .footer-section .section-links a {
+  color: rgba(255, 255, 255, 0.68) !important;
+}
+
+.basic-layout-wrapper.dark .custom-menu-footer .footer-section.copyright,
+.basic-layout-wrapper.realdark .custom-menu-footer .footer-section.copyright {
+  color: rgba(255, 255, 255, 0.45) !important;
+  border-top-color: #1c1c1c !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.basic-layout-wrapper.dark .custom-menu-footer .footer-section.version,
+.basic-layout-wrapper.realdark .custom-menu-footer .footer-section.version {
+  color: rgba(255, 255, 255, 0.35) !important;
+}
+
+.basic-layout-wrapper.dark .custom-menu-footer .social-icon,
+.basic-layout-wrapper.realdark .custom-menu-footer .social-icon {
+  background: rgba(255, 255, 255, 0.08) !important;
+  color: rgba(255, 255, 255, 0.75) !important;
+}
+
+/* ========== 浅色主题 footer（显式覆盖，避免残留暗色）========== */
+.basic-layout-wrapper.light .custom-menu-footer {
+  background: #ffffff !important;
+  background-color: #ffffff !important;
+  border-top-color: #e8e8e8 !important;
+  box-shadow: none !important;
+  color: rgba(0, 0, 0, 0.85) !important;
+}
+
+.basic-layout-wrapper.light .custom-menu-footer .footer-section .section-links {
+  opacity: 0.75;
+}
+
+/* ========== Modal.confirm（退出登录等全局确认框）：暗黑下文字/背景 ========== */
+body.dark .ant-modal-confirm,
+body.realdark .ant-modal-confirm {
+  .ant-modal-content {
+    background: #1f1f1f !important;
+  }
+  .ant-modal-body {
+    background: #1f1f1f !important;
+    color: rgba(255, 255, 255, 0.85) !important;
+  }
+  .ant-modal-confirm-title {
+    color: rgba(255, 255, 255, 0.85) !important;
+  }
+  .ant-modal-confirm-content {
+    color: rgba(255, 255, 255, 0.65) !important;
+  }
+  .ant-btn {
+    background: #2a2a2a !important;
+    border-color: #434343 !important;
+    color: rgba(255, 255, 255, 0.85) !important;
+    &:hover {
+      border-color: #1890ff !important;
+      color: #1890ff !important;
+    }
+  }
+  .ant-btn-primary {
+    background: #1890ff !important;
+    border-color: #1890ff !important;
+    color: #fff !important;
+    &:hover {
+      background: #40a9ff !important;
+      border-color: #40a9ff !important;
+    }
+  }
+}
+
+/* ========== USDT / 充值支付弹窗：暗黑下避免黑字顺色 ========== */
+body.dark .ant-modal-wrap [class*='usdt'],
+body.realdark .ant-modal-wrap [class*='usdt'],
+body.dark .ant-modal-wrap [class*='billing'],
+body.realdark .ant-modal-wrap [class*='billing'],
+body.dark .ant-modal-wrap [class*='recharge'],
+body.realdark .ant-modal-wrap [class*='recharge'],
+body.dark .ant-modal-wrap [class*='payment'],
+body.realdark .ant-modal-wrap [class*='payment'],
+body.dark .ant-modal-wrap [class*='checkout'],
+body.realdark .ant-modal-wrap [class*='checkout'] {
+  color: #d4d4d4 !important;
+}
+
+body.dark .ant-modal-wrap [class*='usdt'] .ant-steps-item-title,
+body.realdark .ant-modal-wrap [class*='usdt'] .ant-steps-item-title,
+body.dark .ant-modal-wrap [class*='billing'] .ant-steps-item-title,
+body.realdark .ant-modal-wrap [class*='billing'] .ant-steps-item-title,
+body.dark .ant-modal-wrap [class*='payment'] .ant-steps-item-title,
+body.realdark .ant-modal-wrap [class*='payment'] .ant-steps-item-title,
+body.dark .ant-modal-wrap [class*='usdt'] .ant-steps-item-description,
+body.realdark .ant-modal-wrap [class*='usdt'] .ant-steps-item-description,
+body.dark .ant-modal-wrap [class*='billing'] .ant-steps-item-description,
+body.realdark .ant-modal-wrap [class*='billing'] .ant-steps-item-description,
+body.dark .ant-modal-wrap [class*='payment'] .ant-steps-item-description,
+body.realdark .ant-modal-wrap [class*='payment'] .ant-steps-item-description {
+  color: #d4d4d4 !important;
+}
+
+body.dark .ant-modal-wrap [class*='usdt'] .ant-statistic-content,
+body.realdark .ant-modal-wrap [class*='usdt'] .ant-statistic-content,
+body.dark .ant-modal-wrap [class*='billing'] .ant-statistic-content,
+body.realdark .ant-modal-wrap [class*='billing'] .ant-statistic-content,
+body.dark .ant-modal-wrap [class*='payment'] .ant-statistic-content,
+body.realdark .ant-modal-wrap [class*='payment'] .ant-statistic-content,
+body.dark .ant-modal-wrap [class*='usdt'] .ant-descriptions-item-content,
+body.realdark .ant-modal-wrap [class*='usdt'] .ant-descriptions-item-content,
+body.dark .ant-modal-wrap [class*='billing'] .ant-descriptions-item-content,
+body.realdark .ant-modal-wrap [class*='billing'] .ant-descriptions-item-content,
+body.dark .ant-modal-wrap [class*='payment'] .ant-descriptions-item-content,
+body.realdark .ant-modal-wrap [class*='payment'] .ant-descriptions-item-content {
+  color: #e5e5e5 !important;
+}

@@ -1,0 +1,469 @@
+"""
+安全的代码执行工具
+提供超时、资源限制、沙箱环境和子进程隔离
+"""
+import signal
+import sys
+import os
+import threading
+import traceback
+import builtins as _builtins_mod
+from typing import Dict, Any, Optional, Tuple, Set
+from contextlib import contextmanager
+
+from app.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+
+class TimeoutError(Exception):
+    """代码执行超时异常"""
+    pass
+
+
+# ── Whitelisted builtins (strict) ──────────────────────────────────────────
+# Only pure computational builtins. No I/O, no introspection, no code gen.
+_BUILTINS_WHITELIST: Set[str] = {
+    # Types / constructors
+    'bool', 'int', 'float', 'complex', 'str', 'bytes', 'bytearray',
+    'list', 'tuple', 'dict', 'set', 'frozenset',
+    'range', 'slice', 'memoryview',
+    # Math / comparison
+    'abs', 'round', 'pow', 'divmod', 'min', 'max', 'sum',
+    # Iteration
+    'len', 'enumerate', 'zip', 'map', 'filter', 'sorted', 'reversed',
+    'iter', 'next', 'all', 'any',
+    # String / repr
+    'repr', 'ascii', 'chr', 'ord', 'format', 'bin', 'hex', 'oct',
+    'hash', 'id',
+    # Type checking (safe, no mutation)
+    'isinstance', 'issubclass', 'hasattr', 'callable',
+    # Conversion
+    'print',
+    # Exceptions (needed for try/except in user code)
+    'Exception', 'ValueError', 'TypeError', 'KeyError', 'IndexError',
+    'AttributeError', 'ZeroDivisionError', 'StopIteration',
+    'RuntimeError', 'OverflowError', 'ArithmeticError',
+    'NotImplementedError', 'NameError', 'ImportError',
+    # Constants
+    'True', 'False', 'None',
+    'Ellipsis', 'NotImplemented',
+    # Functional
+    'staticmethod', 'classmethod', 'property', 'super',
+    'object',
+}
+
+# Modules allowed in user code via `import xxx`
+SAFE_IMPORT_MODULES: Set[str] = {
+    'numpy', 'pandas', 'math', 'json', 'datetime', 'time',
+    'collections', 'functools', 'itertools', 'statistics',
+    'decimal', 'fractions', 'operator', 'copy',
+}
+
+
+def _make_safe_import():
+    """Create a restricted __import__ that only allows whitelisted modules."""
+    def safe_import(name, *args, **kwargs):
+        root = name.split('.')[0]
+        if root in SAFE_IMPORT_MODULES:
+            return _builtins_mod.__import__(name, *args, **kwargs)
+        raise ImportError(f"Import not allowed: {name}")
+    return safe_import
+
+
+def build_safe_builtins(extra_allowed: Optional[Set[str]] = None) -> Dict[str, Any]:
+    """
+    Build a restricted __builtins__ dict for sandboxed exec().
+
+    Only includes computational builtins from the whitelist.
+    Dangerous capabilities (eval, exec, open, getattr, type, __import__, etc.)
+    are excluded by default.
+
+    Args:
+        extra_allowed: additional builtin names to include (use with caution)
+    """
+    allowed = _BUILTINS_WHITELIST | (extra_allowed or set())
+    safe = {}
+    for name in allowed:
+        val = getattr(_builtins_mod, name, None)
+        if val is not None:
+            safe[name] = val
+    safe['__import__'] = _make_safe_import()
+    return safe
+
+
+# ── Timeout (cross-platform) ──────────────────────────────────────────────
+
+@contextmanager
+def timeout_context(seconds: int):
+    """
+    代码执行超时上下文管理器
+
+    - Unix 主线程: signal.SIGALRM
+    - Windows / 非主线程: threading.Timer + ctypes 异常注入
+    """
+    is_main_thread = threading.current_thread() is threading.main_thread()
+
+    # Strategy 1: Unix SIGALRM (most reliable, main thread only)
+    if sys.platform != 'win32' and is_main_thread:
+        def timeout_handler(signum, frame):
+            raise TimeoutError(f"代码执行超时（超过{seconds}秒）")
+        try:
+            old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(seconds)
+            try:
+                yield
+            finally:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
+            return
+        except ValueError:
+            pass  # fall through to timer strategy
+
+    # Strategy 2: threading.Timer + ctypes async exception (cross-platform)
+    target_tid = threading.current_thread().ident
+    timed_out = threading.Event()
+
+    def _inject_timeout():
+        timed_out.set()
+        try:
+            import ctypes
+            exc = ctypes.py_object(TimeoutError)
+            ret = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                ctypes.c_ulong(target_tid), exc
+            )
+            if ret == 0:
+                logger.warning("timeout inject: invalid thread id")
+            elif ret > 1:
+                ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                    ctypes.c_ulong(target_tid), ctypes.py_object(0)
+                )
+        except Exception as e:
+            logger.warning(f"timeout inject failed: {e}")
+
+    timer = threading.Timer(seconds, _inject_timeout)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
+        if timed_out.is_set():
+            raise TimeoutError(f"代码执行超时（超过{seconds}秒）")
+
+
+# ── Core execution ─────────────────────────────────────────────────────────
+
+def safe_exec_code(
+    code: str,
+    exec_globals: Dict[str, Any],
+    exec_locals: Optional[Dict[str, Any]] = None,
+    timeout: int = 30,
+    max_memory_mb: Optional[int] = None
+) -> Dict[str, Any]:
+    """
+    安全执行Python代码（当前进程内，带超时）
+
+    Args:
+        code: 要执行的Python代码
+        exec_globals: 全局变量字典
+        exec_locals: 局部变量字典（如果为None，则使用exec_globals）
+        timeout: 超时时间（秒），默认30秒
+        max_memory_mb: 最大内存限制（MB），默认500MB
+    """
+    if exec_locals is None:
+        exec_locals = exec_globals
+
+    if max_memory_mb is None:
+        max_memory_mb = 500
+
+    try:
+        if sys.platform != 'win32' and os.getenv('SAFE_EXEC_ENABLE_RLIMIT', 'false').lower() == 'true':
+            try:
+                import resource
+                max_memory_bytes = max_memory_mb * 1024 * 1024
+                resource.setrlimit(resource.RLIMIT_AS, (max_memory_bytes, max_memory_bytes))
+            except (ImportError, ValueError, OSError) as e:
+                logger.warning(f"Failed to set memory limit: {e}")
+
+        with timeout_context(timeout):
+            exec(code, exec_globals, exec_locals)
+
+        return {'success': True, 'error': None, 'result': None}
+
+    except MemoryError:
+        error_msg = f"代码执行内存不足（超过{max_memory_mb}MB限制）"
+        logger.error(f"Code execution out of memory (limit={max_memory_mb}MB)")
+        return {'success': False, 'error': error_msg, 'result': None}
+    except TimeoutError as e:
+        logger.error(f"Code execution timed out (timeout={timeout}s)")
+        return {'success': False, 'error': str(e), 'result': None}
+    except Exception as e:
+        error_msg = f"代码执行错误: {str(e)}\n{traceback.format_exc()}"
+        logger.error(f"Code execution error: {e}")
+        return {'success': False, 'error': error_msg, 'result': None}
+
+
+def safe_exec_with_validation(
+    code: str,
+    exec_globals: Dict[str, Any],
+    exec_locals: Optional[Dict[str, Any]] = None,
+    timeout: int = 60,
+    max_memory_mb: Optional[int] = None,
+    pre_import: str = "import numpy as np\nimport pandas as pd\n",
+) -> Dict[str, Any]:
+    """
+    Validate + execute user code in one call.
+
+    1. Runs validate_code_safety(); rejects unsafe code.
+    2. Injects build_safe_builtins() if __builtins__ is not already set.
+    3. Executes pre_import, then user code via safe_exec_code().
+
+    Returns same dict as safe_exec_code().
+    """
+    is_safe, err = validate_code_safety(code)
+    if not is_safe:
+        return {'success': False, 'error': f"Unsafe code rejected: {err}", 'result': None}
+
+    if '__builtins__' not in exec_globals:
+        exec_globals['__builtins__'] = build_safe_builtins()
+
+    if pre_import:
+        try:
+            exec(pre_import, exec_globals)
+        except Exception as e:
+            return {'success': False, 'error': f"Pre-import failed: {e}", 'result': None}
+
+    return safe_exec_code(
+        code=code,
+        exec_globals=exec_globals,
+        exec_locals=exec_locals,
+        timeout=timeout,
+        max_memory_mb=max_memory_mb,
+    )
+
+
+# ── Subprocess isolation (medium-term) ─────────────────────────────────────
+
+def safe_exec_isolated(
+    code: str,
+    input_data: Optional[Dict[str, Any]] = None,
+    timeout: int = 60,
+    max_memory_mb: int = 500,
+) -> Dict[str, Any]:
+    """
+    Execute user code in an isolated subprocess.
+
+    Data is serialized via pickle through pipes. The subprocess has its own
+    memory space; a crash or infinite loop only kills the child.
+
+    Args:
+        code: Python code to execute
+        input_data: dict of variable names → values to inject (must be picklable)
+        timeout: max seconds
+        max_memory_mb: memory limit (Linux only, via RLIMIT_AS)
+
+    Returns:
+        dict with 'success', 'error', 'result' (the child's exec_env after run)
+    """
+    import multiprocessing
+    import pickle
+
+    def _worker(code, input_data, max_memory_mb, result_pipe):
+        try:
+            if sys.platform != 'win32':
+                try:
+                    import resource
+                    mem = max_memory_mb * 1024 * 1024
+                    resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
+                except Exception:
+                    pass
+
+            import numpy as np
+            import pandas as pd
+
+            exec_env = {
+                '__builtins__': build_safe_builtins(),
+                'np': np,
+                'pd': pd,
+            }
+            if input_data:
+                exec_env.update(input_data)
+
+            pre_import = "import numpy as np\nimport pandas as pd\n"
+            exec(pre_import, exec_env)
+            exec(code, exec_env)
+
+            # Extract only picklable, non-module results
+            output = {}
+            for k, v in exec_env.items():
+                if k.startswith('_') or k in ('np', 'pd', '__builtins__'):
+                    continue
+                try:
+                    pickle.dumps(v)
+                    output[k] = v
+                except Exception:
+                    pass
+
+            result_pipe.send({'success': True, 'error': None, 'result': output})
+        except Exception as e:
+            result_pipe.send({
+                'success': False,
+                'error': f"{type(e).__name__}: {e}",
+                'result': None,
+            })
+        finally:
+            result_pipe.close()
+
+    parent_conn, child_conn = multiprocessing.Pipe(duplex=False)
+
+    proc = multiprocessing.Process(
+        target=_worker,
+        args=(code, input_data, max_memory_mb, child_conn),
+        daemon=True,
+    )
+    proc.start()
+    child_conn.close()
+
+    proc.join(timeout=timeout)
+
+    if proc.is_alive():
+        proc.kill()
+        proc.join(timeout=5)
+        return {
+            'success': False,
+            'error': f"代码执行超时（超过{timeout}秒），子进程已终止",
+            'result': None,
+        }
+
+    if proc.exitcode != 0 and not parent_conn.poll():
+        return {
+            'success': False,
+            'error': f"子进程异常退出 (exit code: {proc.exitcode})",
+            'result': None,
+        }
+
+    try:
+        if parent_conn.poll(timeout=1):
+            return parent_conn.recv()
+        return {'success': False, 'error': "子进程未返回结果", 'result': None}
+    except Exception as e:
+        return {'success': False, 'error': f"读取子进程结果失败: {e}", 'result': None}
+    finally:
+        parent_conn.close()
+
+
+# ── Static validation ──────────────────────────────────────────────────────
+
+def validate_code_safety(code: str) -> Tuple[bool, Optional[str]]:
+    """
+    验证代码安全性（正则 + AST 双重检查）
+    """
+    import ast
+    import re
+
+    dangerous_patterns = [
+        r'\bos\.system\b', r'\bos\.popen\b', r'\bos\.spawn\b',
+        r'\bos\.exec\b', r'\bos\.fork\b', r'\bos\.environ\b',
+        r'\bos\.getenv\b', r'\bos\.putenv\b',
+        r'\bos\.remove\b', r'\bos\.unlink\b', r'\bos\.rmdir\b',
+        r'\bos\.makedirs\b', r'\bos\.mkdir\b',
+        r'\bos\.listdir\b', r'\bos\.walk\b', r'\bos\.scandir\b',
+        r'\bos\.path\b',
+        r'\bsubprocess\b', r'\bcommands\b',
+        r'\b__import__\s*\(', r'\beval\s*\(', r'\bexec\s*\(',
+        r'\bcompile\s*\(', r'\bopen\s*\(', r'\bfile\s*\(',
+        r'\b__builtins__\b',
+        r'\bimport\s+os\b', r'\bimport\s+sys\b',
+        r'\bimport\s+subprocess\b', r'\bimport\s+shutil\b',
+        r'\bimport\s+pymysql\b', r'\bimport\s+sqlite3\b',
+        r'\bimport\s+psycopg\b', r'\bimport\s+sqlalchemy\b',
+        r'\bimport\s+requests\b', r'\bimport\s+urllib\b',
+        r'\bimport\s+http\b', r'\bimport\s+socket\b',
+        r'\bimport\s+ftplib\b', r'\bimport\s+telnetlib\b',
+        r'\bimport\s+smtplib\b', r'\bimport\s+ssl\b',
+        r'\bimport\s+pickle\b', r'\bimport\s+cpickle\b',
+        r'\bimport\s+marshal\b', r'\bimport\s+shelve\b',
+        r'\bimport\s+ctypes\b', r'\bimport\s+cffi\b',
+        r'\bimport\s+multiprocessing\b', r'\bimport\s+threading\b',
+        r'\bimport\s+concurrent\b', r'\bimport\s+asyncio\b',
+        r'\bimport\s+signal\b', r'\bimport\s+resource\b',
+        r'\bimport\s+importlib\b', r'\bimport\s+imp\b',
+        r'\bimport\s+builtins\b', r'\bimport\s+code\b',
+        r'\bimport\s+codeop\b', r'\bimport\s+runpy\b',
+        r'\bimport\s+tempfile\b', r'\bimport\s+glob\b',
+        r'\bimport\s+pathlib\b', r'\bimport\s+io\b',
+        r'\bgetattr\s*\(', r'\bsetattr\s*\(', r'\bdelattr\s*\(',
+        r'\b__getattribute__\b', r'\b__setattr__\b', r'\b__delattr__\b',
+        r'\b__dict__\b', r'\b__class__\b', r'\b__bases__\b',
+        r'\b__subclasses__\b', r'\b__mro__\b', r'\b__module__\b',
+        r'\b__globals__\b', r'\b__code__\b', r'\b__func__\b',
+        r'\bglobals\s*\(', r'\bvars\s*\(', r'\bdir\s*\(',
+        r'\bbreakpoint\s*\(',
+        r'\b__builtins__\s*[\[.]', r'\b__import__\s*\(',
+        r'\bimportlib\b',
+    ]
+
+    for pattern in dangerous_patterns:
+        if re.search(pattern, code):
+            return False, f"检测到危险代码模式: {pattern}"
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return False, f"代码语法错误: {e}"
+    except Exception as e:
+        # AST parse failure → reject (fail-closed, not fail-open)
+        logger.error(f"AST parse failed, rejecting code: {e}")
+        return False, f"代码解析失败: {e}"
+
+    dangerous_modules = {
+        'os', 'sys', 'subprocess', 'shutil', 'signal', 'resource',
+        'pymysql', 'sqlite3', 'psycopg2', 'sqlalchemy',
+        'requests', 'urllib', 'http', 'socket', 'ftplib', 'telnetlib',
+        'smtplib', 'ssl',
+        'pickle', 'cpickle', 'marshal', 'shelve',
+        'ctypes', 'cffi',
+        'multiprocessing', 'threading', 'concurrent', 'asyncio',
+        'importlib', 'imp', 'builtins', 'code', 'codeop', 'runpy',
+        'tempfile', 'glob', 'pathlib', 'io',
+    }
+
+    dangerous_call_names = {
+        'eval', 'exec', 'compile', '__import__',
+        'getattr', 'setattr', 'delattr',
+        'globals', 'vars', 'dir', 'breakpoint',
+        'open', 'input', 'exit', 'quit',
+    }
+
+    dangerous_dunder_attrs = {
+        '__builtins__', '__import__', '__class__', '__bases__',
+        '__subclasses__', '__mro__', '__globals__', '__code__',
+        '__func__', '__dict__', '__module__',
+    }
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split('.')[0]
+                if root not in SAFE_IMPORT_MODULES:
+                    return False, f"不允许导入模块 '{alias.name}'，仅允许: {', '.join(sorted(SAFE_IMPORT_MODULES))}"
+
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                root = node.module.split('.')[0]
+                if root not in SAFE_IMPORT_MODULES:
+                    return False, f"不允许导入模块 '{node.module}'，仅允许: {', '.join(sorted(SAFE_IMPORT_MODULES))}"
+
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id in dangerous_call_names:
+                return False, f"检测到危险函数调用: {node.func.id}()"
+            if isinstance(node.func, ast.Attribute):
+                if isinstance(node.func.value, ast.Name) and node.func.value.id in dangerous_modules:
+                    return False, f"检测到危险模块调用: {node.func.value.id}.{node.func.attr}"
+
+        elif isinstance(node, ast.Attribute):
+            if isinstance(node.attr, str) and node.attr in dangerous_dunder_attrs:
+                return False, f"检测到访问危险属性: .{node.attr}"
+
+    return True, None

@@ -1,0 +1,117 @@
+﻿name: Basic CI
+
+# Basic CI workflow for backend syntax and lint checks.
+# This workflow ensures the backend codebase has no syntax errors and passes linting.
+# It does NOT run tests, start servers, or require external services.
+#
+# Note: Frontend source code is in a separate private repository.
+# Frontend CI/CD is handled there. This repo only contains pre-built frontend assets.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  python-check:
+    name: Python Syntax Check
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          # Use Python 3.12 to match Dockerfile and support f-string expressions with backslashes (PEP 701)
+
+      - name: Install dependencies
+        working-directory: ./backend_api_python
+        run: |
+          python -m pip install --upgrade pip
+          # Install dependencies, excluding Windows-only packages (MetaTrader5)
+          # MetaTrader5 is Windows-only and not available on Linux, so we filter it out
+          grep -v "MetaTrader5" requirements.txt > /tmp/requirements_ci.txt
+          pip install -r /tmp/requirements_ci.txt
+          # Install dependencies to verify they are installable and enable import checks.
+
+      - name: Python syntax check
+        working-directory: ./backend_api_python
+        run: |
+          # Check Python syntax for all .py files using compileall
+          # This catches syntax errors, indentation issues, and basic structural problems
+          echo "Checking Python syntax..."
+          python -m py_compile run.py
+          python -m compileall -q app/ scripts/ || (echo "Python syntax check failed" && exit 1)
+          echo "✓ Python syntax check passed"
+
+      - name: Python import check
+        working-directory: ./backend_api_python
+        run: |
+          # Verify critical modules can be imported
+          # We import but do NOT call create_app() to avoid triggering:
+          # - Database connections
+          # - Worker threads
+          # - Network services
+          python -c "
+          import sys
+          sys.path.insert(0, '.')
+          
+          # Import key modules to verify they are loadable
+          from app import create_app
+          from app.config import settings
+          from app.routes import health
+          
+          print('✓ Core modules imported successfully')
+          print('✓ No critical import errors detected')
+          "
+          # This will FAIL if:
+          # - Critical imports fail (missing dependencies, broken module structure)
+          # This will PASS if:
+          # - Dependencies are available and importable
+          # - Core module structure is intact
+
+  frontend-check:
+    name: Frontend Build Check
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Verify frontend dist exists
+        run: |
+          # Since frontend source is in a private repo, we only verify
+          # that the pre-built frontend assets are present and valid
+          echo "Checking frontend dist directory..."
+          if [ -d "frontend/dist" ] && [ "$(ls -A frontend/dist 2>/dev/null)" ]; then
+            echo "✓ frontend/dist/ exists and is not empty"
+            echo "Files found:"
+            find frontend/dist -type f | head -20
+          else
+            echo "⚠ frontend/dist/ is empty or missing"
+            echo "This is expected for initial setup. Run build-frontend.sh or wait for CI to populate it."
+          fi
+
+      - name: Verify Nginx config
+        run: |
+          echo "Checking Nginx configuration..."
+          if [ -f "frontend/nginx.conf" ]; then
+            echo "✓ frontend/nginx.conf exists"
+          else
+            echo "✗ frontend/nginx.conf is missing!"
+            exit 1
+          fi
+
+      - name: Verify Dockerfile
+        run: |
+          echo "Checking frontend Dockerfile..."
+          if [ -f "frontend/Dockerfile" ]; then
+            echo "✓ frontend/Dockerfile exists"
+          else
+            echo "✗ frontend/Dockerfile is missing!"
+            exit 1
+          fi

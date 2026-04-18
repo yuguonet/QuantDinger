@@ -1,0 +1,304 @@
+@import '~ant-design-vue/es/style/themes/default.less';
+
+html,
+body,
+#app,
+#root {
+  height: 100%;
+}
+
+.colorWeak {
+  filter: invert(80%);
+}
+
+.ant-layout.layout-basic {
+  height: 100vh;
+  min-height: 100vh;
+}
+
+canvas {
+  display: block;
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizelegibility;
+}
+
+ul,
+ol {
+  list-style: none;
+}
+
+// 数据列表 样式
+.table-alert {
+  margin-bottom: 16px;
+}
+// 数据列表 操作
+.table-operator {
+  margin-bottom: 18px;
+
+  button {
+    margin-right: 8px;
+  }
+}
+// 数据列表 搜索条件
+.table-page-search-wrapper {
+  .ant-form-inline {
+    .ant-form-item {
+      display: flex;
+      margin-right: 0;
+      margin-bottom: 24px;
+
+      .ant-form-item-control-wrapper {
+        flex: 1 1;
+        display: inline-block;
+        vertical-align: middle;
+      }
+
+      > .ant-form-item-label {
+        width: auto;
+        padding-right: 8px;
+        line-height: 32px;
+      }
+
+      .ant-form-item-control {
+        height: 32px;
+        line-height: 32px;
+      }
+    }
+  }
+
+  .table-page-search-submitButtons {
+    display: block;
+    margin-bottom: 24px;
+    white-space: nowrap;
+  }
+}
+
+@media (max-width: @screen-xs) {
+  .ant-table {
+    width: 100%;
+    overflow-x: auto;
+
+    &-thead > tr,
+    &-tbody > tr {
+      > th,
+      > td {
+        white-space: pre;
+
+        > span {
+          display: block;
+        }
+      }
+    }
+  }
+}
+
+// Hide noisy webpack dev server overlay on mobile (ResizeObserver loop warnings)
+#webpack-dev-server-client-overlay,
+#webpack-hot-middleware-client-overlay,
+.webpack-dev-server-client-overlay {
+  display: none !important;
+  pointer-events: none !important;
+  visibility: hidden !important;
+}
+
+// 手机端强制覆盖 logo padding
+@media (max-width: 768px) {
+  .ant-pro-global-header-logo {
+    padding: 0 !important;
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+  }
+}
+
+// ========== 暗黑主题全局纯黑覆盖 ==========
+// 覆盖 Ant Design Pro Layout 的 #001529 深蓝色
+body.dark,
+body.realdark {
+  // 侧边栏
+  .ant-layout-sider,
+  .ant-layout-sider-dark,
+  .ant-pro-sider-menu-sider,
+  .ant-pro-sider-menu-sider.ant-layout-sider-dark,
+  aside.ant-layout-sider.ant-layout-sider-dark {
+    background: #0a0a0a !important;
+  }
+  .ant-layout-sider-children {
+    background: #0a0a0a !important;
+  }
+  .ant-pro-sider-menu-logo {
+    background: #0a0a0a !important;
+  }
+  .ant-menu-dark,
+  .ant-menu.ant-menu-dark,
+  .ant-menu-dark .ant-menu-inline.ant-menu-sub,
+  ul.ant-menu.ant-menu-dark.ant-menu-root.ant-menu-inline {
+    background: #0a0a0a !important;
+  }
+  .ant-menu-dark .ant-menu-sub,
+  .ant-menu.ant-menu-dark .ant-menu-sub {
+    background: #111111 !important;
+  }
+  .ant-layout-sider-trigger {
+    background: #111111 !important;
+    border-top: 1px solid #1c1c1c;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05) !important;
+  }
+  // 顶栏 - 与侧栏「亮黑」#111 一致 + 顶缘内高光
+  .ant-layout-header {
+    background: #111111 !important;
+    border-bottom: 1px solid #1c1c1c !important;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05) !important;
+  }
+  .ant-pro-global-header {
+    background: #111111 !important;
+    border-bottom: none !important;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05) !important;
+  }
+  // 主内容区域
+  .ant-layout {
+    background: #0a0a0a !important;
+  }
+  .ant-layout-content,
+  .ant-pro-basicLayout-content {
+    background: #141414 !important;
+  }
+  // 各页面通用卡片、表格背景
+  .ant-card {
+    background: #1c1c1c !important;
+    border-color: #2a2a2a !important;
+    color: rgba(255, 255, 255, 0.85);
+    .ant-card-head {
+      background: #1c1c1c !important;
+      border-bottom-color: #2a2a2a !important;
+      color: rgba(255, 255, 255, 0.85) !important;
+    }
+    .ant-card-body { color: rgba(255, 255, 255, 0.85); }
+  }
+  .ant-table {
+    background: #1c1c1c !important;
+    color: rgba(255, 255, 255, 0.85);
+    .ant-table-thead > tr > th {
+      background: #141414 !important;
+      border-bottom-color: #2a2a2a !important;
+      color: rgba(255, 255, 255, 0.85) !important;
+    }
+    .ant-table-tbody > tr > td {
+      border-bottom-color: #2a2a2a !important;
+      color: rgba(255, 255, 255, 0.85);
+    }
+    .ant-table-tbody > tr:hover > td {
+      background: #252525 !important;
+    }
+    .ant-table-placeholder {
+      background: #1c1c1c !important;
+      color: #666 !important;
+    }
+  }
+  .ant-pagination-item {
+    background: #1c1c1c !important;
+    border-color: #2a2a2a !important;
+    a { color: rgba(255, 255, 255, 0.85) !important; }
+  }
+  .ant-pagination-item-active {
+    border-color: #1890ff !important;
+  }
+  .ant-pagination-prev .ant-pagination-item-link,
+  .ant-pagination-next .ant-pagination-item-link {
+    background: #1c1c1c !important;
+    border-color: #2a2a2a !important;
+    color: rgba(255, 255, 255, 0.85) !important;
+  }
+  // 表单元素
+  .ant-input,
+  .ant-input-number,
+  .ant-select-selection {
+    background: #1c1c1c !important;
+    border-color: #2a2a2a !important;
+    color: rgba(255, 255, 255, 0.85) !important;
+  }
+  .ant-input::placeholder { color: #555 !important; }
+  .ant-form-item-label > label { color: rgba(255, 255, 255, 0.85) !important; }
+  // 输入组件尾部图标（清空/密码眼睛/数字步进/选择器箭头）暗黑模式可读性
+  .ant-input-suffix .anticon,
+  .ant-input-clear-icon,
+  .ant-input-clear-icon .anticon,
+  .ant-input-number-handler-wrap,
+  .ant-input-number-handler-up-inner,
+  .ant-input-number-handler-down-inner,
+  .ant-select-arrow,
+  .ant-select-clear {
+    color: #8b949e !important;
+  }
+  .ant-input-suffix .anticon:hover,
+  .ant-input-clear-icon:hover,
+  .ant-input-number-handler:hover .ant-input-number-handler-up-inner,
+  .ant-input-number-handler:hover .ant-input-number-handler-down-inner,
+  .ant-select-arrow:hover,
+  .ant-select-clear:hover {
+    color: #58a6ff !important;
+  }
+  // 按钮
+  .ant-btn-default {
+    background: #1c1c1c !important;
+    border-color: #2a2a2a !important;
+    color: rgba(255, 255, 255, 0.85) !important;
+    &:hover {
+      border-color: #1890ff !important;
+      color: #1890ff !important;
+    }
+  }
+  // Breadcrumb & PageHeader
+  .ant-page-header {
+    background: transparent !important;
+  }
+  .ant-breadcrumb-link,
+  .ant-breadcrumb-separator,
+  .ant-breadcrumb > span {
+    color: rgba(255, 255, 255, 0.45) !important;
+  }
+  .ant-page-header-heading-title {
+    color: rgba(255, 255, 255, 0.85) !important;
+  }
+  // Tabs
+  .ant-tabs-bar {
+    border-bottom-color: #2a2a2a !important;
+  }
+  .ant-tabs-tab {
+    color: #888 !important;
+    &:hover { color: #d4d4d4 !important; }
+  }
+  .ant-tabs-tab-active {
+    color: #1890ff !important;
+  }
+  // Modal
+  .ant-modal-content {
+    background: #1c1c1c !important;
+    .ant-modal-header {
+      background: #1c1c1c !important;
+      border-bottom-color: #2a2a2a !important;
+      .ant-modal-title { color: rgba(255, 255, 255, 0.85) !important; }
+    }
+    .ant-modal-body { color: rgba(255, 255, 255, 0.85) !important; }
+    .ant-modal-footer {
+      border-top-color: #2a2a2a !important;
+      background: #1c1c1c !important;
+    }
+    .ant-modal-close-x { color: #888 !important; }
+  }
+  // Select dropdown
+  .ant-select-dropdown {
+    background: #1c1c1c !important;
+    .ant-select-dropdown-menu-item {
+      color: rgba(255, 255, 255, 0.85) !important;
+      &:hover { background: #252525 !important; }
+      &-active { background: #252525 !important; }
+      &-selected { background: rgba(24, 144, 255, 0.1) !important; color: #1890ff !important; }
+    }
+  }
+}

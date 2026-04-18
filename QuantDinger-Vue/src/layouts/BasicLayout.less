@@ -1,0 +1,530 @@
+@import '~ant-design-vue/es/style/themes/default.less';
+
+/* ========== 完全隐藏 ant-layout-footer ========== */
+:global {
+  /* 全局隐藏所有 ant-layout-footer */
+  .ant-layout-footer,
+  footer.ant-layout-footer,
+  .ant-pro-layout .ant-layout-footer,
+  .ant-layout .ant-layout-footer {
+    display: none !important;
+    height: 0 !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    border: none !important;
+    min-height: 0 !important;
+    visibility: hidden !important;
+    overflow: hidden !important;
+  }
+}
+
+/* ========== ant-layout-header 主题适配 ========== */
+/* 全局样式：根据 body 或 layout 的主题类自动适配 */
+:global {
+  /* 暗黑主题下的 ant-layout-header */
+  body.dark .ant-layout-header,
+  body.realdark .ant-layout-header,
+  .ant-layout.dark .ant-layout-header,
+  .ant-layout.realdark .ant-layout-header,
+  .ant-pro-layout.dark .ant-layout-header,
+  .ant-pro-layout.realdark .ant-layout-header {
+    background: #111111 !important;
+    border-bottom: 1px solid #1c1c1c !important;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 1px 4px rgba(0, 0, 0, 0.2) !important;
+    color: rgba(255, 255, 255, 0.85) !important;
+
+    /* Header 内的所有文字和图标 */
+    * {
+      color: rgba(255, 255, 255, 0.85) !important;
+    }
+
+    /* Header 内的图标按钮 */
+    .anticon {
+      color: rgba(255, 255, 255, 0.85) !important;
+
+      &:hover {
+        color: #1890ff !important;
+        background: rgba(255, 255, 255, 0.08) !important;
+        border-radius: 4px;
+      }
+    }
+
+    /* Header 内的链接 */
+    a {
+      color: rgba(255, 255, 255, 0.85) !important;
+
+      &:hover {
+        color: #1890ff !important;
+      }
+    }
+
+    /* Header 内的工具提示容器 */
+    .ant-tooltip-open {
+      .anticon {
+        color: rgba(255, 255, 255, 0.85) !important;
+      }
+    }
+  }
+
+
+  /* 浅色主题下的 ant-layout-header（确保覆盖默认样式） */
+  body.light .ant-layout-header,
+  .ant-layout.light .ant-layout-header,
+  .ant-pro-layout.light .ant-layout-header {
+    background: #fff !important;
+    border-bottom: 1px solid #e8e8e8 !important;
+    box-shadow: 0 1px 4px rgba(0, 21, 41, 0.08) !important;
+    color: rgba(0, 0, 0, 0.85) !important;
+  }
+
+  /* ========== ant-layout-content 主题适配（中间页面内容区域） ========== */
+  /* 暗黑主题下的内容区域 */
+  body.dark .ant-layout-content,
+  body.realdark .ant-layout-content,
+  .ant-layout.dark .ant-layout-content,
+  .ant-layout.realdark .ant-layout-content,
+  .ant-pro-layout.dark .ant-layout-content,
+  .ant-pro-layout.realdark .ant-layout-content {
+    background: #141414 !important;
+    color: rgba(255, 255, 255, 0.85) !important;
+  }
+
+
+
+  /* 浅色主题下的内容区域 */
+  body.light .ant-layout-content,
+  .ant-layout.light .ant-layout-content,
+  .ant-pro-layout.light .ant-layout-content {
+    background: #f0f2f5 !important;
+    color: rgba(0, 0, 0, 0.85) !important;
+  }
+
+
+
+
+
+  /* ========== GlobalHeader 核心样式（基于 .ant-pro-global-header） ========== */
+  /* 暗黑主题下的 .ant-pro-global-header - 这是控制顶部标题栏的关键样式 */
+  body.dark .ant-pro-global-header,
+  body.realdark .ant-pro-global-header,
+  .ant-layout.dark .ant-pro-global-header,
+  .ant-layout.realdark .ant-pro-global-header,
+  .ant-pro-layout.dark .ant-pro-global-header,
+  .ant-pro-layout.realdark .ant-pro-global-header,
+  body.dark .ant-layout-header .ant-pro-global-header,
+  body.realdark .ant-layout-header .ant-pro-global-header,
+  .ant-pro-layout.dark .ant-layout-header .ant-pro-global-header,
+  .ant-pro-layout.realdark .ant-layout-header .ant-pro-global-header {
+    background: #111111 !important;
+    border-bottom: none !important;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05) !important;
+    color: rgba(255, 255, 255, 0.85) !important;
+
+    /* 强制所有子元素文字颜色 */
+    * {
+      color: rgba(255, 255, 255, 0.85) !important;
+    }
+
+    /* Logo 区域 */
+    .ant-pro-global-header-logo {
+      background: transparent !important;
+      color: rgba(255, 255, 255, 0.85) !important;
+
+      h1 {
+        color: rgba(255, 255, 255, 0.85) !important;
+      }
+
+      img {
+        opacity: 0.9;
+      }
+
+      * {
+        color: rgba(255, 255, 255, 0.85) !important;
+      }
+    }
+  }
+
+  /* Header 内容区域（中间部分，包含刷新按钮等） */
+  .ant-pro-global-header-content {
+    background: transparent !important;
+    color: rgba(255, 255, 255, 0.85) !important;
+
+    * {
+      color: rgba(255, 255, 255, 0.85) !important;
+    }
+
+    /* 刷新按钮等图标 */
+    .anticon {
+      color: rgba(255, 255, 255, 0.85) !important;
+
+      &:hover {
+        color: #1890ff !important;
+        background: rgba(255, 255, 255, 0.08) !important;
+        border-radius: 4px;
+      }
+    }
+
+    /* 工具提示内的图标 */
+    .ant-tooltip-open .anticon {
+      color: rgba(255, 255, 255, 0.85) !important;
+    }
+  }
+
+  /* Header 右侧内容区域（包含头像、语言选择、设置按钮） */
+  .ant-pro-global-header-index-right {
+    background: transparent !important;
+    color: rgba(255, 255, 255, 0.85) !important;
+
+    * {
+      color: rgba(255, 255, 255, 0.85) !important;
+    }
+
+    /* 操作按钮（头像、语言、设置） */
+    .ant-pro-global-header-index-action {
+      color: rgba(255, 255, 255, 0.85) !important;
+
+      &:hover {
+        color: #1890ff !important;
+        background: rgba(255, 255, 255, 0.08) !important;
+      }
+
+      .anticon {
+        color: rgba(255, 255, 255, 0.85) !important;
+      }
+    }
+
+    /* 头像区域 */
+    .ant-pro-account-avatar {
+      color: rgba(255, 255, 255, 0.85) !important;
+
+      span {
+        color: rgba(255, 255, 255, 0.85) !important;
+      }
+
+      .antd-pro-global-header-index-avatar {
+        background: rgba(255, 255, 255, 0.25) !important;
+      }
+    }
+
+    /* 下拉菜单触发器 */
+    .ant-pro-drop-down,
+    .ant-dropdown-trigger {
+      color: rgba(255, 255, 255, 0.85) !important;
+
+      &:hover {
+        color: #1890ff !important;
+        background: rgba(255, 255, 255, 0.08) !important;
+      }
+
+      .anticon {
+        color: rgba(255, 255, 255, 0.85) !important;
+      }
+    }
+  }
+
+  /* 链接样式 */
+  a {
+    color: rgba(255, 255, 255, 0.85) !important;
+
+    &:hover {
+      color: #1890ff !important;
+    }
+  }
+
+  /* 所有图标 */
+  .anticon {
+    color: rgba(255, 255, 255, 0.85) !important;
+
+    &:hover {
+      color: #1890ff !important;
+    }
+  }
+
+  /* 浅色主题下的 .ant-pro-global-header */
+  body.light .ant-pro-global-header,
+  .ant-layout.light .ant-pro-global-header,
+  .ant-pro-layout.light .ant-pro-global-header,
+  body.light .ant-layout-header .ant-pro-global-header,
+  .ant-pro-layout.light .ant-layout-header .ant-pro-global-header {
+    background: #fff !important;
+    border-bottom: 1px solid #e8e8e8 !important;
+    color: rgba(0, 0, 0, 0.85) !important;
+  }
+}
+
+/* ========== 全局布局主题适配 - 强化覆盖 ========== */
+:global(.ant-pro-layout) {
+  /* 暗黑主题下的完整布局 */
+  &.dark,
+  &.realdark {
+    /* 0. 基础 Layout 背景 */
+    :global(.ant-layout) {
+      background-color: #0a0a0a !important;
+    }
+
+    /* 1. 顶部 Header */
+    :global(.ant-layout-header) {
+      background: #111111 !important;
+      border-bottom: 1px solid #1c1c1c !important;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05) !important;
+      color: rgba(255, 255, 255, 0.85) !important;
+
+      :global(.ant-pro-global-header) {
+        background: #111111 !important;
+        border-bottom: none !important;
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05) !important;
+        color: rgba(255, 255, 255, 0.85) !important;
+        * { color: rgba(255, 255, 255, 0.85) !important; }
+      }
+    }
+
+    /* 2. 中间内容区域 */
+    :global(.ant-layout-content) {
+      background: #141414 !important;
+      color: rgba(255, 255, 255, 0.85) !important;
+    }
+    :global(.ant-pro-basicLayout-content) {
+      background: #141414 !important;
+      color: rgba(255, 255, 255, 0.85) !important;
+    }
+
+    /* 3. 侧边栏 - 强制去蓝改纯黑 */
+    :global(.ant-layout-sider),
+    :global(.ant-pro-sider-menu-sider),
+    :global(.ant-pro-sider) {
+      background: #0a0a0a !important;
+      :global(.ant-layout-sider-children) {
+        background: #0a0a0a !important;
+      }
+    }
+    :global(.ant-menu-dark),
+    :global(.ant-menu.ant-menu-dark),
+    :global(.ant-menu-dark .ant-menu-inline.ant-menu-sub) {
+      background: #0a0a0a !important;
+    }
+    :global(.ant-menu-dark .ant-menu-sub) {
+      background: #111111 !important;
+    }
+    :global(.ant-menu-dark .ant-menu-item-selected) {
+      background: rgba(24, 144, 255, 0.25) !important;
+    }
+    :global(.ant-menu-dark .ant-menu-item:hover),
+    :global(.ant-menu-dark .ant-menu-submenu-title:hover) {
+      background: rgba(255, 255, 255, 0.06) !important;
+    }
+    :global(.ant-layout-sider-trigger) {
+      background: #111111 !important;
+      border-top: 1px solid #1c1c1c;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+    }
+
+  }
+
+  /* 浅色主题下的完整布局 */
+  &.light {
+    /* 0. 基础 Layout 背景 */
+    :global(.ant-layout) {
+      background-color: #f0f2f5 !important;
+    }
+
+    /* 1. 顶部 Header */
+    :global(.ant-layout-header) {
+      background: #fff !important;
+      border-bottom: 1px solid #e8e8e8 !important;
+      color: rgba(0, 0, 0, 0.85) !important;
+    }
+
+    /* 2. 中间内容区域 */
+    :global(.ant-layout-content) {
+      background: #f0f2f5 !important;
+      color: rgba(0, 0, 0, 0.85) !important;
+    }
+
+    :global(.ant-pro-basicLayout-content) {
+      background: #f0f2f5 !important;
+      color: rgba(0, 0, 0, 0.85) !important;
+    }
+
+  }
+}
+
+.ant-pro-global-header-index-right {
+  margin-right: 8px;
+
+  &.ant-pro-global-header-index-dark {
+    .ant-pro-global-header-index-action {
+      color: hsl(0deg 0% 100% / 85%);
+
+      &:hover {
+        background: #1890ff;
+      }
+    }
+
+    /* 暗黑主题下的头像下拉菜单 */
+    .ant-pro-account-avatar {
+      color: rgba(255, 255, 255, 0.85);
+
+      .antd-pro-global-header-index-avatar {
+        background: rgba(255, 255, 255, 0.25) !important;
+      }
+
+      span {
+        color: rgba(255, 255, 255, 0.85);
+      }
+    }
+
+    /* 语言选择器和设置按钮 */
+    .ant-pro-drop-down {
+      color: rgba(255, 255, 255, 0.85);
+
+      &:hover {
+        color: #1890ff;
+        background: rgba(255, 255, 255, 0.08);
+      }
+    }
+  }
+
+  /* 浅色主题下的头像样式 */
+  .ant-pro-account-avatar {
+    .antd-pro-global-header-index-avatar {
+      margin: ~'calc((@{layout-header-height} - 24px) / 2)' 0;
+      margin-right: 8px;
+      color: @primary-color;
+      vertical-align: top;
+      background: rgb(255 255 255 / 85%);
+    }
+  }
+
+  .menu {
+    .anticon {
+      margin-right: 8px;
+    }
+
+    .ant-dropdown-menu-item {
+      min-width: 100px;
+    }
+  }
+}
+
+/* 暗黑主题下的下拉菜单样式 */
+:global {
+  .ant-pro-layout.dark,
+  .ant-pro-layout.realdark {
+    .ant-dropdown-menu {
+      background: #1c1c1c !important;
+      border: 1px solid #2a2a2a !important;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4) !important;
+
+      .ant-dropdown-menu-item {
+        color: rgba(255, 255, 255, 0.85) !important;
+
+        &:hover {
+          background: #252525 !important;
+          color: #1890ff !important;
+        }
+      }
+
+      .ant-dropdown-menu-item-divider {
+        background: #2a2a2a !important;
+      }
+    }
+  }
+}
+
+/* ========== 侧边栏 body 级强力覆盖 ========== */
+:global {
+  body.dark,
+  body.realdark {
+    /* 侧边栏容器 */
+    .ant-layout-sider,
+    .ant-layout-sider-dark,
+    .ant-pro-sider-menu-sider,
+    .ant-pro-sider-menu-sider.ant-layout-sider-dark {
+      background: #0a0a0a !important;
+    }
+    .ant-layout-sider-children {
+      background: #0a0a0a !important;
+    }
+    /* 菜单本体 */
+    .ant-menu-dark,
+    .ant-menu.ant-menu-dark,
+    .ant-menu-dark .ant-menu-inline.ant-menu-sub,
+    ul.ant-menu.ant-menu-dark.ant-menu-root {
+      background: #0a0a0a !important;
+    }
+    .ant-menu-dark .ant-menu-sub,
+    .ant-menu.ant-menu-dark .ant-menu-sub {
+      background: #111111 !important;
+    }
+    .ant-menu-dark .ant-menu-item-selected {
+      background: rgba(24, 144, 255, 0.25) !important;
+    }
+    /* Logo 区域 */
+    .ant-pro-sider-menu-logo {
+      background: #0a0a0a !important;
+    }
+    /* 折叠触发器 */
+    .ant-layout-sider-trigger {
+      background: #111111 !important;
+      border-top: 1px solid #1c1c1c;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05) !important;
+    }
+    /* 顶栏 - 与侧栏亮黑一致 */
+    .ant-layout-header {
+      background: #111111 !important;
+      border-bottom: 1px solid #1c1c1c !important;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05) !important;
+    }
+    .ant-pro-global-header {
+      background: #111111 !important;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05) !important;
+    }
+  }
+}
+
+/* ========== 侧栏菜单字体（系统 UI 栈 + 字重/字距，偏专业产品感）========== */
+:global {
+  .ant-pro-sider-menu-sider .ant-menu,
+  .ant-pro-sider .ant-menu.ant-menu-root,
+  .ant-layout-sider-children .ant-menu.ant-menu-root {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+      'Microsoft YaHei UI', 'Source Han Sans SC', 'Noto Sans SC', sans-serif !important;
+    font-size: 13px !important;
+    font-weight: 500 !important;
+    letter-spacing: 0.02em !important;
+    -webkit-font-smoothing: antialiased !important;
+    -moz-osx-font-smoothing: grayscale !important;
+  }
+
+  .ant-pro-sider-menu-sider .ant-menu-item-selected > a,
+  .ant-pro-sider-menu-sider .ant-menu-item-selected .ant-menu-title-content,
+  .ant-pro-sider .ant-menu-item-selected {
+    font-weight: 600 !important;
+  }
+
+  .ant-pro-sider-menu-logo h1 {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+      'Microsoft YaHei UI', sans-serif !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.03em !important;
+    -webkit-font-smoothing: antialiased !important;
+  }
+}
+
+/* 手机端适配 */
+@media (max-width: 768px) {
+  :global {
+    /* 使用更具体的选择器强制覆盖 */
+    .ant-layout-header .ant-pro-global-header .ant-pro-global-header-logo,
+    .ant-pro-layout .ant-layout-header .ant-pro-global-header .ant-pro-global-header-logo,
+    body .ant-layout-header .ant-pro-global-header .ant-pro-global-header-logo,
+    .ant-pro-global-header-logo {
+      padding: 0 !important;
+      padding-left: 0 !important;
+      padding-right: 0 !important;
+      padding-top: 0 !important;
+      padding-bottom: 0 !important;
+    }
+  }
+}
+
