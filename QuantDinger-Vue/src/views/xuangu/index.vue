@@ -880,7 +880,8 @@
         <div class="btn-group">
           <el-button type="primary" @click="onSearch" icon="el-icon-search">智能搜索</el-button>
           <el-button type="warning" @click="onEastmoneyPick" icon="el-icon-s-operation">东方财富选股</el-button>
-          <el-button type="success" @click="onFavorites" icon="el-icon-star-on">收藏</el-button>
+          <el-button type="success" @click="openSaveDialog" icon="el-icon-star-on">保存策略</el-button>
+          <el-button type="info" @click="openMyStrategies" icon="el-icon-folder-opened">我的策略</el-button>
         </div>
       </div>
 
@@ -1027,6 +1028,60 @@
           </el-pagination>
         </div>
       </div>
+
+      <!-- ===== 保存策略对话框 ===== -->
+      <el-dialog title="保存选股策略" :visible.sync="saveDialogVisible" width="420px">
+        <el-form :model="saveForm" label-width="70px">
+          <el-form-item label="名称">
+            <el-input v-model="saveForm.name" placeholder="如：低估值银行股" maxlength="100" show-word-limit></el-input>
+          </el-form-item>
+          <el-form-item label="描述">
+            <el-input v-model="saveForm.description" type="textarea" :rows="2" placeholder="可选" maxlength="500"></el-input>
+          </el-form-item>
+          <el-form-item label="条件">
+            <div class="strategy-conditions-preview">
+              {{ aiQuery || '（无筛选条件）' }}
+            </div>
+          </el-form-item>
+        </el-form>
+        <span slot="footer">
+          <el-button @click="saveDialogVisible = false">取消</el-button>
+          <el-button type="primary" @click="doSaveStrategy" :loading="saving">保存</el-button>
+        </span>
+      </el-dialog>
+
+      <!-- ===== 我的策略对话框 ===== -->
+      <el-dialog title="我的策略" :visible.sync="strategiesDialogVisible" width="600px">
+        <div v-if="strategiesLoading" style="text-align:center;padding:20px;">
+          <i class="el-icon-loading" style="font-size:24px;"></i>
+        </div>
+        <div v-else-if="myStrategies.length === 0" style="text-align:center;color:#909399;padding:30px;">
+          暂无保存的策略
+        </div>
+        <el-table v-else :data="myStrategies" style="width:100%" :show-header="false" size="small">
+          <el-table-column prop="name" label="名称" width="160">
+            <template slot-scope="{ row }">
+              <strong>{{ row.name }}</strong>
+              <div style="color:#909399;font-size:12px;">{{ row.updated_at }}</div>
+            </template>
+          </el-table-column>
+          <el-table-column prop="description" label="描述">
+            <template slot-scope="{ row }">
+              <div style="color:#606266;font-size:13px;">{{ row.description || '—' }}</div>
+            </template>
+          </el-table-column>
+          <el-table-column label="操作" width="160" align="right">
+            <template slot-scope="{ row }">
+              <el-button size="mini" type="primary" @click="loadStrategy(row)">加载</el-button>
+              <el-button size="mini" type="danger" @click="deleteStrategy(row)">删除</el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+        <span slot="footer">
+          <el-button @click="strategiesDialogVisible = false">关闭</el-button>
+        </span>
+      </el-dialog>
+
     </div>
   </div>
 </template>
@@ -1314,7 +1369,15 @@ export default {
       totalItems: 0,
 
       // 用于缓存上次更新AI查询的时间戳，防止过于频繁的更新
-      lastUpdateTimestamp: 0
+      lastUpdateTimestamp: 0,
+
+      // 策略管理
+      saveDialogVisible: false,
+      saveForm: { name: '', description: '' },
+      saving: false,
+      strategiesDialogVisible: false,
+      strategiesLoading: false,
+      myStrategies: []
     }
   },
   methods: {
@@ -1719,37 +1782,149 @@ export default {
       window.open(`https://xuangu.eastmoney.com/Result?j=question_rec&id=xc10dd2addee07009398&inputValue=${inputValue}`, '_blank')
     },
 
-    // 我的收藏
-    async onFavorites () {
+    // ---- 获取认证 headers ----
+    _authHeaders () {
+      const token = localStorage.getItem('token')
+      const h = { 'Content-Type': 'application/json' }
+      if (token) h['Authorization'] = `Bearer ${token}`
+      return h
+    },
+
+    // ====== 策略保存/加载/删除 ======
+
+    openSaveDialog () {
+      const { whereClause } = this.buildQueryConditions()
+      if (!whereClause) {
+        this.$message.warning('请先设置筛选条件再保存')
+        return
+      }
+      this.saveForm = { name: '', description: '' }
+      this.saveDialogVisible = true
+    },
+
+    async doSaveStrategy () {
+      if (!this.saveForm.name.trim()) {
+        this.$message.warning('请输入策略名称')
+        return
+      }
+
+      const { whereClause, params } = this.buildQueryConditions()
+      this.saving = true
+
       try {
-        // 使用 fetch 替代 axios
-        const response = await fetch('/api/xuangu/favorites', {
-          method: 'GET',
-          headers: {
-            'Content-Type': 'application/json'
-            // 如果需要认证，可以在这里添加 token
-            // 'Authorization': `Bearer ${localStorage.getItem('token')}`
-          }
+        const resp = await fetch('/api/xuangu/favorites', {
+          method: 'POST',
+          headers: this._authHeaders(),
+          body: JSON.stringify({
+            name: this.saveForm.name.trim(),
+            conditions: { query: whereClause, params },
+            description: this.saveForm.description.trim()
+          })
         })
-
-        if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`)
-        }
-        const responseData = await response.json()
-
-        if (responseData.code === 0) {
-          this.$alert(
-            responseData.data.map((s) => `<p><strong>${s.name}</strong>: ${s.conditions}</p>`).join(''),
-            '我的收藏策略',
-            { dangerouslyUseHTMLString: true }
-          )
+        const data = await resp.json()
+        if (data.code === 0) {
+          this.$message.success(data.msg || '保存成功')
+          this.saveDialogVisible = false
         } else {
-          // 处理后端返回的非成功状态码
-          this.$message.error(responseData.message || '加载收藏失败')
+          this.$message.error(data.msg || '保存失败')
         }
-      } catch (error) {
-        console.error('加载收藏失败:', error)
-        this.$message.error('加载收藏失败，请检查网络或稍后重试')
+      } catch (e) {
+        this.$message.error('保存失败: ' + e.message)
+      } finally {
+        this.saving = false
+      }
+    },
+
+    async openMyStrategies () {
+      this.strategiesDialogVisible = true
+      this.strategiesLoading = true
+      try {
+        const resp = await fetch('/api/xuangu/favorites', {
+          method: 'GET',
+          headers: this._authHeaders()
+        })
+        const data = await resp.json()
+        this.myStrategies = data.code === 0 ? (data.data || []) : []
+      } catch (e) {
+        this.$message.error('加载失败: ' + e.message)
+      } finally {
+        this.strategiesLoading = false
+      }
+    },
+
+    loadStrategy (strategy) {
+      // conditions 格式: { query: "WHERE ...", params: {...} }
+      let cond = strategy.conditions
+      if (typeof cond === 'string') {
+        try { cond = JSON.parse(cond) } catch (_) { cond = {} }
+      }
+
+      // 恢复筛选条件到 aiQuery 输入框 → 触发 handleAiInput 解析
+      // 但条件是结构化的，直接用 WHERE 子句 + params 填充更快
+      // 这里用简单方式：把条件对象转回 aiQuery 文本
+      if (cond && cond.query) {
+        // 直接设置搜索参数并执行
+        this._pendingQuery = cond
+        this.aiQuery = ''
+        this.strategiesDialogVisible = false
+        // 用条件直接搜索
+        this._searchWithDirectConditions(cond)
+      } else {
+        this.$message.warning('策略条件格式不兼容')
+      }
+    },
+
+    async _searchWithDirectConditions (cond) {
+      this.currentPage = 1
+      try {
+        const resp = await fetch('/api/xuangu/search', {
+          method: 'POST',
+          headers: this._authHeaders(),
+          body: JSON.stringify({
+            query: cond.query || '',
+            params: cond.params || {},
+            page: 1,
+            limit: this.pageSize,
+            sort_by: 'code',
+            order: 'asc'
+          })
+        })
+        const data = await resp.json()
+        if (data.code === 0) {
+          this.tableData = data.data
+          this.totalItems = data.count
+          this.$message.success(`已加载策略，${data.count} 条结果`)
+        } else {
+          this.$message.error(data.msg || '加载策略失败')
+        }
+      } catch (e) {
+        this.$message.error('加载策略失败: ' + e.message)
+      }
+    },
+
+    async deleteStrategy (strategy) {
+      try {
+        await this.$confirm(`确定删除策略「${strategy.name}」？`, '确认删除', {
+          type: 'warning'
+        })
+      } catch (_) {
+        return
+      }
+
+      try {
+        const resp = await fetch(`/api/xuangu/favorites/${strategy.id}`, {
+          method: 'DELETE',
+          headers: this._authHeaders()
+        })
+        const data = await resp.json()
+        if (data.code === 0) {
+          this.$message.success('已删除')
+          this.myStrategies = this.myStrategies.filter(s => s.id !== strategy.id)
+        } else {
+          this.$message.error(data.msg || '删除失败')
+        }
+      } catch (e) {
+        this.$message.error('删除失败: ' + e.message)
       }
     },
 
@@ -1758,14 +1933,9 @@ export default {
       try {
         const { whereClause, params } = this.buildQueryConditions()
 
-        // 使用 fetch 替代 axios
         const response = await fetch('/api/xuangu/search', {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-            // 如果需要认证，可以在这里添加 token
-            // 'Authorization': `Bearer ${localStorage.getItem('token')}`
-          },
+          headers: this._authHeaders(),
           body: JSON.stringify({
             query: whereClause, // 将WHERE子句传递给后端
             params: params, // 将参数对象传递给后端
@@ -2579,6 +2749,30 @@ export default {
 .btn-group .el-button--warning:hover {
   transform: translateY(-1px);
   box-shadow: 0 4px 14px rgba(230, 162, 60, 0.4);
+}
+
+.btn-group .el-button--info {
+  background: linear-gradient(135deg, #909399 0%, #73777d 100%);
+  border: none;
+  color: #fff;
+  box-shadow: 0 2px 8px rgba(144, 147, 153, 0.3);
+}
+
+.btn-group .el-button--info:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 14px rgba(144, 147, 153, 0.4);
+}
+
+.strategy-conditions-preview {
+  padding: 8px 12px;
+  background: #f5f7fa;
+  border-radius: 4px;
+  color: #606266;
+  font-size: 13px;
+  line-height: 1.6;
+  max-height: 120px;
+  overflow-y: auto;
+  word-break: break-all;
 }
 
 /* --- 筛选器面板 --- */

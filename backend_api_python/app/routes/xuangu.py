@@ -6,18 +6,20 @@
   POST /api/xuangu/search      → 自然语言搜索选股数据
   POST /api/xuangu/query       → 结构化筛选查询（字段+条件+排序+分页）
   POST /api/xuangu/sync        → 触发数据同步（从东方财富拉取并写入 PG）
-  GET  /api/xuangu/favorites   → 收藏策略列表
-  POST /api/xuangu/favorites   → 保存收藏策略
   GET  /api/xuangu/stats       → 表统计信息
+  GET  /api/xuangu/favorites   → 当前用户的收藏策略列表（需登录）
+  POST /api/xuangu/favorites   → 保存/更新收藏策略（需登录）
+  DELETE /api/xuangu/favorites/<id> → 删除收藏策略（需登录，仅限本人）
 """
 import traceback
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, g
 
 from app.utils.db import get_db_connection
 from app.utils.StockNLQ import EnterpriseStockNLQ
+from app.utils.auth import login_required, get_current_user_id
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -500,61 +502,197 @@ def table_stats():
 
 
 # ================================================================
-# GET/POST /favorites — 收藏策略
+# 收藏策略 CRUD — 每个用户只能操作自己的策略
 # ================================================================
-@xuangu_bp.route("/favorites", methods=["GET"])
-def get_favorites():
-    """获取收藏策略列表"""
+
+def _ensure_strategies_table():
+    """确保 qd_user_strategies 表存在，按需建表"""
+    ddl = """
+    CREATE TABLE IF NOT EXISTS qd_user_strategies (
+        id          SERIAL PRIMARY KEY,
+        user_id     INTEGER NOT NULL REFERENCES qd_users(id) ON DELETE CASCADE,
+        name        VARCHAR(100) NOT NULL,
+        conditions  TEXT NOT NULL DEFAULT '',
+        description VARCHAR(500) DEFAULT '',
+        created_at  TIMESTAMP DEFAULT NOW(),
+        updated_at  TIMESTAMP DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_qdus_user_id
+        ON qd_user_strategies (user_id);
+    """
     try:
         with get_db_connection() as conn:
             cur = conn.cursor()
-            # 按用户过滤（如果已认证）
-            user_id = getattr(request, 'user_id', None)
-            if user_id:
-                cur.execute(
-                    "SELECT * FROM qd_user_strategies WHERE user_id = %s ORDER BY created_at DESC",
-                    (user_id,)
-                )
-            else:
-                cur.execute(
-                    "SELECT * FROM qd_user_strategies ORDER BY created_at DESC LIMIT 50"
-                )
-            strategies = cur.fetchall() or []
+            cur.execute(ddl)
+            conn.commit()
             cur.close()
-        return jsonify({
-            "code": 0,
-            "data": [dict(r) for r in strategies],
-        })
     except Exception as e:
-        return jsonify({"code": 1, "msg": str(e), "data": []})
+        logger.error(f"_ensure_strategies_table failed: {e}")
 
 
-@xuangu_bp.route("/favorites", methods=["POST"])
-def save_favorite():
-    """保存收藏策略"""
-    data = request.get_json() or {}
-    name = (data.get("name") or "").strip()
-    conditions = data.get("conditions")
+@xuangu_bp.route("/favorites", methods=["GET"])
+@login_required
+def get_favorites():
+    """获取当前登录用户的收藏策略列表
 
-    if not name:
-        return jsonify({"code": 1, "msg": "策略名称不能为空"}), 400
+    每个用户只能看到自己的策略，不会泄露他人数据。
+    """
+    user_id = get_current_user_id()
+    if not user_id:
+        return jsonify({"code": 401, "msg": "用户未认证", "data": []}), 401
+    user_id = int(user_id)
+    _ensure_strategies_table()
 
     try:
-        import json as _json
-        cond_str = (
-            _json.dumps(conditions, ensure_ascii=False)
-            if isinstance(conditions, (dict, list))
-            else str(conditions or "")
-        )
         with get_db_connection() as conn:
             cur = conn.cursor()
             cur.execute(
-                "INSERT INTO qd_user_strategies (name, conditions) VALUES (%s, %s)",
-                (name, cond_str),
+                "SELECT id, name, conditions, description, created_at, updated_at "
+                "FROM qd_user_strategies "
+                "WHERE user_id = %s "
+                "ORDER BY updated_at DESC",
+                (user_id,)
+            )
+            rows = cur.fetchall() or []
+            cur.close()
+
+        import json as _json
+        strategies = []
+        for r in rows:
+            d = dict(r)
+            # datetime → string，方便前端渲染
+            for ts_field in ("created_at", "updated_at"):
+                if d.get(ts_field) and hasattr(d[ts_field], "isoformat"):
+                    d[ts_field] = d[ts_field].isoformat()
+            # conditions 是 JSON 字符串，解析回对象
+            try:
+                d["conditions"] = _json.loads(d["conditions"]) if d["conditions"] else []
+            except (_json.JSONDecodeError, TypeError, ValueError):
+                pass
+            strategies.append(d)
+
+        return jsonify({"code": 0, "data": strategies, "count": len(strategies)})
+    except Exception as e:
+        logger.error(f"get_favorites failed: {e}", exc_info=True)
+        return jsonify({"code": 1, "msg": str(e), "data": []}), 500
+
+
+@xuangu_bp.route("/favorites", methods=["POST"])
+@login_required
+def save_favorite():
+    """保存或更新收藏策略
+
+    请求体：
+    {
+        "id": 123,                // 可选：有 id 则更新，无 id 则新建
+        "name": "低估值银行股",
+        "conditions": [{"field":"pe9","op":"<","value":15}, ...],
+        "description": "PE < 15 的银行板块"   // 可选
+    }
+    """
+    import json as _json
+
+    user_id = get_current_user_id()
+    if not user_id:
+        return jsonify({"code": 401, "msg": "用户未认证"}), 401
+    user_id = int(user_id)
+    data = request.get_json() or {}
+    strategy_id = data.get("id")
+    name = (data.get("name") or "").strip()
+    conditions = data.get("conditions")
+    description = (data.get("description") or "").strip()
+
+    if not name:
+        return jsonify({"code": 1, "msg": "策略名称不能为空"}), 400
+    if not conditions:
+        return jsonify({"code": 1, "msg": "筛选条件不能为空"}), 400
+
+    cond_str = (
+        _json.dumps(conditions, ensure_ascii=False)
+        if isinstance(conditions, (dict, list))
+        else str(conditions)
+    )
+
+    _ensure_strategies_table()
+
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+
+            if strategy_id:
+                # 更新模式：校验归属权
+                cur.execute(
+                    "SELECT user_id FROM qd_user_strategies WHERE id = %s",
+                    (strategy_id,)
+                )
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"code": 1, "msg": "策略不存在"}), 404
+                if int(row["user_id"]) != user_id:
+                    return jsonify({"code": 1, "msg": "无权修改他人的策略"}), 403
+
+                cur.execute(
+                    "UPDATE qd_user_strategies "
+                    "SET name = %s, conditions = %s, description = %s, updated_at = NOW() "
+                    "WHERE id = %s AND user_id = %s",
+                    (name, cond_str, description, strategy_id, user_id)
+                )
+                msg = "更新成功"
+            else:
+                # 新建
+                cur.execute(
+                    "INSERT INTO qd_user_strategies (user_id, name, conditions, description) "
+                    "VALUES (%s, %s, %s, %s) RETURNING id",
+                    (user_id, name, cond_str, description)
+                )
+                new_id = cur.fetchone()["id"]
+                strategy_id = new_id
+                msg = "保存成功"
+
+            conn.commit()
+            cur.close()
+
+        return jsonify({"code": 0, "msg": msg, "data": {"id": strategy_id}})
+    except Exception as e:
+        logger.error(f"save_favorite failed: {e}", exc_info=True)
+        return jsonify({"code": 1, "msg": str(e)}), 500
+
+
+@xuangu_bp.route("/favorites/<int:strategy_id>", methods=["DELETE"])
+@login_required
+def delete_favorite(strategy_id: int):
+    """删除收藏策略 — 仅限本人
+
+    路径参数: /api/xuangu/favorites/123
+    """
+    user_id = get_current_user_id()
+    if not user_id:
+        return jsonify({"code": 401, "msg": "用户未认证"}), 401
+    user_id = int(user_id)
+    _ensure_strategies_table()
+
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            # 先查归属
+            cur.execute(
+                "SELECT user_id FROM qd_user_strategies WHERE id = %s",
+                (strategy_id,)
+            )
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"code": 1, "msg": "策略不存在"}), 404
+            if int(row["user_id"]) != user_id:
+                return jsonify({"code": 1, "msg": "无权删除他人的策略"}), 403
+
+            cur.execute(
+                "DELETE FROM qd_user_strategies WHERE id = %s AND user_id = %s",
+                (strategy_id, user_id)
             )
             conn.commit()
             cur.close()
-        return jsonify({"code": 0, "msg": "保存成功"})
+
+        return jsonify({"code": 0, "msg": "删除成功"})
     except Exception as e:
-        logger.error(f"save_favorite failed: {e}", exc_info=True)
+        logger.error(f"delete_favorite failed: {e}", exc_info=True)
         return jsonify({"code": 1, "msg": str(e)}), 500

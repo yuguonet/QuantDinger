@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>本地选股工具</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: #0a0e17;
+  color: #e0e0e0;
+  min-height: 100vh;
+}
+.container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+
+h1 {
+  text-align: center;
+  font-size: 24px;
+  font-weight: 600;
+  margin-bottom: 24px;
+  background: linear-gradient(135deg, #00d4ff, #7b2ff7);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.search-box {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 20px;
+  align-items: center;
+}
+.search-box input {
+  flex: 1;
+  padding: 12px 18px;
+  font-size: 16px;
+  border: 1px solid #2a2f3e;
+  border-radius: 8px;
+  background: #141926;
+  color: #e0e0e0;
+  outline: none;
+  transition: border-color 0.2s;
+}
+.search-box input:focus { border-color: #00d4ff; }
+.search-box input::placeholder { color: #555; }
+
+.search-box button {
+  padding: 12px 28px;
+  font-size: 16px;
+  font-weight: 600;
+  border: none;
+  border-radius: 8px;
+  background: linear-gradient(135deg, #00d4ff, #7b2ff7);
+  color: #fff;
+  cursor: pointer;
+  transition: opacity 0.2s;
+  white-space: nowrap;
+}
+.search-box button:hover { opacity: 0.85; }
+.search-box button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.hot-tags {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 20px;
+  flex-wrap: wrap;
+}
+.hot-tags span {
+  padding: 6px 14px;
+  font-size: 13px;
+  border-radius: 16px;
+  background: #1a1f2e;
+  border: 1px solid #2a2f3e;
+  color: #aaa;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.hot-tags span:hover {
+  border-color: #00d4ff;
+  color: #00d4ff;
+}
+
+.status {
+  text-align: center;
+  padding: 12px;
+  color: #888;
+  font-size: 14px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+thead th {
+  padding: 10px 12px;
+  text-align: left;
+  background: #141926;
+  color: #888;
+  font-weight: 500;
+  border-bottom: 1px solid #2a2f3e;
+  position: sticky;
+  top: 0;
+  white-space: nowrap;
+}
+tbody td {
+  padding: 10px 12px;
+  border-bottom: 1px solid #1a1f2e;
+  white-space: nowrap;
+}
+tbody tr:hover { background: #141926; }
+
+.stock-code { color: #00d4ff; font-family: monospace; }
+.stock-name { color: #e0e0e0; font-weight: 500; }
+.price { color: #e0e0e0; font-family: monospace; }
+.up { color: #ef4444; }
+.down { color: #22c55e; }
+.tag-match {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  background: rgba(239, 68, 68, 0.15);
+  color: #ef4444;
+}
+
+.loading {
+  text-align: center;
+  padding: 40px;
+  color: #555;
+}
+.loading::after {
+  content: '';
+  display: inline-block;
+  width: 20px;
+  height: 20px;
+  border: 2px solid #333;
+  border-top-color: #00d4ff;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  margin-left: 8px;
+  vertical-align: middle;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.page-info {
+  text-align: center;
+  padding: 16px;
+  color: #555;
+  font-size: 13px;
+}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>📈 本地选股工具</h1>
+
+  <div class="search-box">
+    <input type="text" id="keyword" placeholder="输入选股关键词，如：放量突破、底部放量、MACD金叉..." autofocus>
+    <button id="searchBtn" onclick="search()">🔍 选股</button>
+  </div>
+
+  <div class="hot-tags">
+    <span onclick="fillKeyword('放量突破')">放量突破</span>
+    <span onclick="fillKeyword('底部放量')">底部放量</span>
+    <span onclick="fillKeyword('MACD金叉')">MACD金叉</span>
+    <span onclick="fillKeyword('均线多头排列')">均线多头排列</span>
+    <span onclick="fillKeyword('涨停')">涨停</span>
+    <span onclick="fillKeyword('缩量回调')">缩量回调</span>
+    <span onclick="fillKeyword('高换手率')">高换手率</span>
+    <span onclick="fillKeyword('突破前高')">突破前高</span>
+  </div>
+
+  <div id="status" class="status">输入关键词开始选股</div>
+  <div id="result"></div>
+</div>
+
+<script>
+const API_URL = 'https://np-tjxg-b.eastmoney.com/api/smart-tag/stock/v3/pw/search-code';
+
+function fillKeyword(kw) {
+  document.getElementById('keyword').value = kw;
+  search();
+}
+
+document.getElementById('keyword').addEventListener('keydown', e => {
+  if (e.key === 'Enter') search();
+});
+
+function genId(len) {
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  return Array.from({length: len}, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+}
+
+async function search() {
+  const kw = document.getElementById('keyword').value.trim();
+  if (!kw) return;
+
+  const btn = document.getElementById('searchBtn');
+  const status = document.getElementById('status');
+  const result = document.getElementById('result');
+
+  btn.disabled = true;
+  status.innerHTML = '<span class="loading">正在搜索</span>';
+  result.innerHTML = '';
+
+  try {
+    const body = {
+      needAmbiguousSuggest: true,
+      pageSize: 100,
+      pageNo: 1,
+      fingerprint: genId(32),
+      matchWord: '',
+      shareToGuba: false,
+      timestamp: String(Date.now()),
+      requestId: genId(32) + String(Date.now()),
+      removedConditionIdList: [],
+      ownSelectAll: false,
+      needCorrect: true,
+      client: 'WEB',
+      product: '',
+      needShowStockNum: false,
+      biz: 'web_ai_select_stocks',
+      xcId: '',
+      gids: [],
+      dxInfoNew: [],
+      keyWordNew: kw,
+      customDataNew: JSON.stringify([{type: 'text', value: kw, extra: ''}])
+    };
+
+    const resp = await fetch(API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+
+    const data = await resp.json();
+
+    if (data.code !== '100' && data.code !== 100) {
+      status.textContent = data.msg || '搜索失败';
+      btn.disabled = false;
+      return;
+    }
+
+    const res = data.data?.result;
+    const stocks = res?.dataList || [];
+    const total = res?.total || stocks.length;
+
+    if (stocks.length === 0) {
+      status.textContent = '未找到匹配的股票';
+      btn.disabled = false;
+      return;
+    }
+
+    status.textContent = `找到 ${total} 只股票 — 「${kw}」`;
+
+    // Build table
+    let html = `<table>
+      <thead><tr>
+        <th>#</th>
+        <th>代码</th>
+        <th>名称</th>
+        <th>最新价</th>
+        <th>涨跌幅</th>
+        <th>换手率</th>
+        <th>量比</th>
+        <th>成交额</th>
+        <th>市盈率</th>
+        <th>总市值</th>
+        <th>信号</th>
+      </tr></thead><tbody>`;
+
+    stocks.forEach((s, i) => {
+      const chg = parseFloat(s.CHG) || 0;
+      const chgClass = chg > 0 ? 'up' : chg < 0 ? 'down' : '';
+      const chgSign = chg > 0 ? '+' : '';
+      const matchCol = Object.keys(s).find(k => k.startsWith('BREAK_THROUGH'));
+      const match = matchCol ? s[matchCol] : '';
+
+      html += `<tr>
+        <td>${s.SERIAL || i + 1}</td>
+        <td class="stock-code">${s.SECURITY_CODE || ''}</td>
+        <td class="stock-name">${s.SECURITY_SHORT_NAME || ''}</td>
+        <td class="price">${s.NEWEST_PRICE || '-'}</td>
+        <td class="${chgClass}">${chgSign}${chg.toFixed(2)}%</td>
+        <td>${s.TURNOVER_RATE || '-'}%</td>
+        <td>${s.QRR || '-'}</td>
+        <td>${s.TRADING_VOLUMES || '-'}</td>
+        <td>${s.PE_DYNAMIC || '-'}</td>
+        <td>${s.TOEAL_MARKET_VALUE || s['TOAL_MARKET_VALUE<140>'] || '-'}</td>
+        <td>${match ? '<span class="tag-match">' + match + '</span>' : ''}</td>
+      </tr>`;
+    });
+
+    html += '</tbody></table>';
+    html += `<div class="page-info">数据来源：东方财富 · 更新时间：${new Date().toLocaleString('zh-CN')}</div>`;
+    result.innerHTML = html;
+
+  } catch (err) {
+    status.textContent = '请求失败：' + err.message;
+  }
+
+  btn.disabled = false;
+}
+</script>
+</body>
+</html>
