@@ -5,7 +5,7 @@ market_store.py — 纯存储层：Feather 格式行情数据持久化
 职责:
   1. append()   — 追加新采集的行情（含完整性检查、价格校验、缺失回填、异常检测）
   2. query()    — 按时间范围 + 类别/标的检索
-  3. detect_anomalies() — z-score 急剧变化检测
+  3. detect_anomalies() — 时间加权斜率急剧变化检测（% change / min）
   4. prune()    — 清理过期数据
   5. stats()    — 存储统计
 
@@ -229,48 +229,137 @@ class MarketStore:
         return result.tail(limit).reset_index(drop=True)
 
     def detect_anomalies(self, new_df: pd.DataFrame) -> List[Dict[str, Any]]:
+        """
+        基于时间加权斜率的急剧变化检测。
+
+        核心思想:
+          旧版只看 abs(pct_change)，完全忽略时间维度——数据断片时会误报。
+          新版用「速度 = 涨跌幅% / 经过分钟数」作为检测指标。
+          这样数据断片完全不需要特殊处理：间隔大则斜率自然低，不会误报。
+
+        检测流程:
+          1. 取每个标的的最近 N 条历史记录（含时间戳）
+          2. 算历史每对相邻点的速度: speed = |Δp%| / Δt_min，建立基线 (μ, σ)
+          3. 算当前新数据点的速度（相对最后一条历史记录）
+          4. 两层过滤：
+             - 绝对阈值: speed < 0.05 %/min → 太慢，跳过
+             - 相对阈值: z = (current_speed - μ) / σ > ANOMALY_ZSCORE → 报警
+        """
         if new_df.empty:
             return []
+
         alerts: List[Dict[str, Any]] = []
         now = datetime.now()
+
+        # 按 (category, symbol) 分组，取每组最新一条记录待检测
         latest = (
             new_df.sort_values("timestamp")
             .groupby(["category", "symbol"])
             .last()
             .reset_index()
         )
+
         for _, row in latest.iterrows():
             cat  = row["category"]
             sym  = row["symbol"]
             name = row["name"]
             new_price = row["price"]
+
             if pd.isna(new_price) or new_price == 0:
                 continue
+
+            # === 第一步：加载历史数据，清洗时间戳和价格 ===
+
             hist = self._load_history_for_symbol(cat, sym, limit=ANOMALY_WINDOW)
             if len(hist) < 3:
                 continue
-            prices = hist["price"].dropna().astype(float).values
-            if len(prices) < 2:
+
+            hist = hist.copy()
+            hist["timestamp"] = pd.to_datetime(hist["timestamp"], errors="coerce")
+            hist["price"] = hist["price"].dropna().astype(float)
+            hist = hist.dropna(subset=["timestamp", "price"])
+            if len(hist) < 2:
                 continue
-            pct_changes = np.diff(prices) / prices[:-1] * 100
-            pct_changes = pct_changes[np.isfinite(pct_changes)]
-            if len(pct_changes) < 2:
-                continue
-            mu  = float(np.mean(pct_changes))
-            sig = float(np.std(pct_changes, ddof=1))
+
+            hist = hist.sort_values("timestamp").reset_index(drop=True)
+            prices = hist["price"].values
+            timestamps = hist["timestamp"].values
+
+            # === 第二步：算历史相邻点的速度，建立基线 ===
+            #
+            # 速度 = |Δp%| / Δt_minutes
+            # 例：5 分钟涨 2% → speed = 0.4 %/min
+            #     2 小时涨 2% → speed = 0.017 %/min（自然低，不会触发）
+            #
+            # 斜率本身就是时间归一化的，不需要断片过滤
+
+            speeds: List[float] = []
+
+            for i in range(1, len(prices)):
+                prev_p = prices[i - 1]
+                curr_p = prices[i]
+                if prev_p == 0 or pd.isna(prev_p):
+                    continue
+
+                t_prev = pd.Timestamp(timestamps[i - 1]).timestamp()
+                t_curr = pd.Timestamp(timestamps[i]).timestamp()
+                elapsed_min = (t_curr - t_prev) / 60.0
+
+                if elapsed_min <= 0:
+                    continue  # 时间戳异常，跳过
+
+                pct_chg = abs((curr_p - prev_p) / prev_p * 100.0)
+                speed = pct_chg / elapsed_min
+                speeds.append(speed)
+
+            # === 第三步：算当前新数据点的速度 ===
+
             last_hist_price = float(prices[-1])
-            current_pct = (new_price - last_hist_price) / last_hist_price * 100
-            if sig > 0.001:
-                z = abs(current_pct - mu) / sig
-            else:
-                z = 0.0 if abs(current_pct) < ANOMALY_MIN_PCT else 99.0
-            if z < ANOMALY_ZSCORE or abs(current_pct) < ANOMALY_MIN_PCT:
+            if last_hist_price == 0:
                 continue
+
+            t_last_hist = pd.Timestamp(timestamps[-1]).timestamp()
+            elapsed_min = (now.timestamp() - t_last_hist) / 60.0
+
+            if elapsed_min <= 0:
+                continue
+
+            current_pct = (new_price - last_hist_price) / last_hist_price * 100
+            current_speed = abs(current_pct) / elapsed_min
+
+            # 绝对门槛：低于 0.05 %/min 不值得报警（如隔 6h 涨 0.1%）
+            ABSOLUTE_SPEED_THRESHOLD = 0.05
+            if current_speed < ABSOLUTE_SPEED_THRESHOLD:
+                continue
+
+            # === 第四步：Z 分数判断是否显著偏离历史基线 ===
+
+            if len(speeds) < 2:
+                # 历史样本不足，无法算基线，仅靠绝对阈值（已通过）
+                z = 0.0
+                mu = 0.0
+                sig = 0.0
+            else:
+                mu  = float(np.mean(speeds))
+                sig = float(np.std(speeds, ddof=1))
+
+                if sig > 0.0001:
+                    z = (current_speed - mu) / sig
+                else:
+                    # 历史波动极小，当前速度是均值的 2 倍以上才报
+                    z = 0.0 if current_speed < mu * 2 else 99.0
+
+                if z < ANOMALY_ZSCORE:
+                    continue
+
+            # === 第五步：冷却检查 → 生成警报 ===
+
             cooldown_key = f"{cat}:{sym}"
             last_alert = self._anomaly_cooldown.get(cooldown_key)
             if last_alert and (now - last_alert).total_seconds() < ANOMALY_COOLDOWN_SEC:
                 continue
             self._anomaly_cooldown[cooldown_key] = now
+
             direction = "🔺暴涨" if current_pct > 0 else "🔻暴跌"
             severity  = "🔴" if abs(current_pct) >= ANOMALY_MIN_PCT * 3 else "🟡"
             alerts.append({
@@ -278,14 +367,17 @@ class MarketStore:
                 "old_price":  round(last_hist_price, 6),
                 "new_price":  round(new_price, 6),
                 "change_pct": round(current_pct, 3),
+                "speed_pct_per_min": round(current_speed, 4),
                 "z_score":    round(z, 2),
-                "mean_pct":   round(mu, 4),
-                "std_pct":    round(sig, 4),
+                "mean_speed": round(mu, 4),
+                "std_speed":  round(sig, 4),
                 "direction":  direction, "severity": severity,
                 "message": (
                     f"{severity} {direction} | [{cat}] {sym} ({name}) | "
                     f"{last_hist_price:.4f} → {new_price:.4f} | "
-                    f"变动 {current_pct:+.3f}% | z={z:.1f} (μ={mu:.4f} σ={sig:.4f})"
+                    f"变动 {current_pct:+.3f}% | "
+                    f"速度 {current_speed:.4f}%/min | "
+                    f"z={z:.1f} (μ={mu:.4f} σ={sig:.4f})"
                 ),
             })
         return alerts
