@@ -1,5 +1,5 @@
 <template>
-  <div class="xuangu-container" :class="{ 'theme-dark': isDarkTheme }" :style="{ '--primary-color': primaryColor }">
+  <div class="xuangu-container">
     <!-- 新增一个根包装器 -->
     <div class="stock-screener-app">
       <!-- 顶部市场选择 -->
@@ -878,139 +878,46 @@
         >
         </el-input>
         <div class="btn-group">
-          <el-button type="primary" @click="onSearch" icon="el-icon-search">智能搜索</el-button>
-          <el-button type="warning" @click="onEastmoneyPick" icon="el-icon-s-operation">东方财富选股</el-button>
-          <el-button type="success" @click="openSaveDialog" icon="el-icon-star-on">保存策略</el-button>
-          <el-button type="info" @click="openMyStrategies" icon="el-icon-folder-opened">我的策略</el-button>
+          <el-button type="primary" @click="onSearch" icon="el-icon-search" :loading="searchLoading">智能搜索</el-button>
         </div>
       </div>
 
       <!-- 结果表格 -->
       <div class="result-table">
         <div class="table-toolbar">
-          <el-button type="warning" size="small" icon="el-icon-star-off" @click="addSelectedToFavorites" :disabled="selectedRows.length === 0">加自选 ({{ selectedRows.length }})</el-button>
+          <el-button type="warning" size="small" icon="el-icon-star-off" @click="addSelectedToFavorites" :disabled="selectedRows.length === 0 || !selectedRows.some(r => r.code)">加自选 ({{ selectedRows.length }})</el-button>
+          <div class="toolbar-right">
+            <el-button type="success" size="small" icon="el-icon-star-on" @click="openSaveDialog">保存策略</el-button>
+            <el-button type="info" size="small" icon="el-icon-folder-opened" @click="openMyStrategies">我的策略</el-button>
+          </div>
         </div>
         <div class="table-scroll-wrapper">
           <el-table
-            :data="tableData"
+            :data="paginatedData"
             style="width: max-content; min-width: 100%"
             :default-sort="{ prop: 'code', order: 'ascending' }"
             @sort-change="handleSortChange"
             @selection-change="handleSelectionChange"
-            height="400"
           >
             <el-table-column type="selection" width="45" fixed></el-table-column>
-            <!-- ========== ① 基本信息 ========== -->
             <el-table-column prop="code" label="代码" sortable="custom" width="100"></el-table-column>
             <el-table-column prop="name" label="名称" sortable="custom" width="120"></el-table-column>
             <el-table-column prop="industry" label="行业" width="100"></el-table-column>
             <el-table-column prop="concept" label="概念" show-tooltip-when-overflow width="150"></el-table-column>
-            <!-- ========== ② 实时行情 ========== -->
             <el-table-column prop="new_price" label="最新价" sortable width="100"></el-table-column>
             <el-table-column prop="change_rate" label="涨跌幅(%)" sortable width="100">
               <template slot-scope="scope">
-                <span :class="scope.row.change_rate >= 0 ? 'text-red' : 'text-green'">
-                  {{ scope.row.change_rate && scope.row.change_rate.toFixed(2) }}
+                <span v-if="scope.row.change_rate != null" :class="scope.row.change_rate >= 0 ? 'text-red' : 'text-green'">
+                  {{ scope.row.change_rate.toFixed(2) }}
                 </span>
               </template>
             </el-table-column>
-            <el-table-column prop="high_price" label="最高价" sortable width="100"></el-table-column>
-            <el-table-column prop="low_price" label="最低价" sortable width="100"></el-table-column>
-            <el-table-column prop="pre_close_price" label="昨收价" sortable width="100"></el-table-column>
             <el-table-column prop="volume" label="成交量" sortable width="110"></el-table-column>
             <el-table-column prop="deal_amount" label="成交金额" sortable width="120"></el-table-column>
-            <el-table-column prop="volume_ratio" label="量比" width="80"></el-table-column>
             <el-table-column prop="turnoverrate" label="换手率(%)" width="100"></el-table-column>
-            <el-table-column prop="amplitude" label="振幅(%)" sortable width="90"></el-table-column>
-            <!-- ========== ③ 估值指标 ========== -->
             <el-table-column prop="pe9" label="PE-TTM" width="100"></el-table-column>
             <el-table-column prop="pbnewmrq" label="PB-MRQ" width="100"></el-table-column>
-            <el-table-column prop="pettmdeducted" label="扣非PE-TTM" width="110"></el-table-column>
-            <el-table-column prop="ps9" label="市销率TTM" width="100"></el-table-column>
-            <el-table-column prop="pcfjyxjl9" label="市现率TTM" width="100"></el-table-column>
-            <el-table-column prop="predict_pe_syear" label="预测PE下年" width="110"></el-table-column>
-            <el-table-column prop="predict_pe_nyear" label="预测PE后两年" width="120"></el-table-column>
-            <el-table-column prop="dtsyl" label="动态市盈率" width="100"></el-table-column>
-            <el-table-column prop="ycpeg" label="预测市盈率" width="100"></el-table-column>
-            <el-table-column prop="enterprise_value_multiple" label="企业价值倍数" width="120"></el-table-column>
             <el-table-column prop="total_market_cap" label="总市值" sortable width="120"></el-table-column>
-            <el-table-column prop="free_cap" label="流通市值" sortable width="120"></el-table-column>
-            <!-- ========== ④ 每股指标 ========== -->
-            <el-table-column prop="basic_eps" label="每股收益" width="90"></el-table-column>
-            <el-table-column prop="bvps" label="每股净资产" width="100"></el-table-column>
-            <el-table-column prop="per_netcash_operate" label="每股经营现金流" width="120"></el-table-column>
-            <el-table-column prop="per_fcfe" label="每股自由现金流" width="120"></el-table-column>
-            <el-table-column prop="per_capital_reserve" label="每股资本公积" width="110"></el-table-column>
-            <el-table-column prop="per_unassign_profit" label="每股未分配利润" width="120"></el-table-column>
-            <el-table-column prop="per_surplus_reserve" label="每股盈余公积" width="110"></el-table-column>
-            <el-table-column prop="per_retained_earning" label="每股留存收益" width="110"></el-table-column>
-            <!-- ========== ⑤ 利润与营收 ========== -->
-            <el-table-column prop="parent_netprofit" label="归母净利润" sortable width="120"></el-table-column>
-            <el-table-column prop="deduct_netprofit" label="扣非净利润" sortable width="120"></el-table-column>
-            <el-table-column prop="total_operate_income" label="营业收入" sortable width="120"></el-table-column>
-            <el-table-column prop="roe_weight" label="加权ROE(%)" width="100"></el-table-column>
-            <el-table-column prop="jroa" label="总资产报酬率(%)" width="120"></el-table-column>
-            <el-table-column prop="roic" label="投资资本回报率(%)" width="130"></el-table-column>
-            <el-table-column prop="sale_gpr" label="销售毛利率(%)" width="120"></el-table-column>
-            <el-table-column prop="sale_npr" label="销售净利率(%)" width="110"></el-table-column>
-            <el-table-column prop="zxgxl" label="新增股本" width="90"></el-table-column>
-            <!-- ========== ⑥ 成长能力 ========== -->
-            <el-table-column prop="netprofit_yoy_ratio" label="净利润同比增长(%)" width="130"></el-table-column>
-            <el-table-column prop="deduct_netprofit_growthrate" label="扣非净利增长率(%)" width="130"></el-table-column>
-            <el-table-column prop="toi_yoy_ratio" label="营收同比增长(%)" width="120"></el-table-column>
-            <el-table-column prop="netprofit_growthrate_3y" label="净利3年复合增长(%)" width="140"></el-table-column>
-            <el-table-column prop="income_growthrate_3y" label="营收3年复合增长(%)" width="140"></el-table-column>
-            <el-table-column prop="predict_netprofit_ratio" label="预测净利润比率(%)" width="130"></el-table-column>
-            <el-table-column prop="predict_income_ratio" label="预测营收比率(%)" width="120"></el-table-column>
-            <el-table-column prop="basiceps_yoy_ratio" label="EPS同比增长(%)" width="120"></el-table-column>
-            <el-table-column prop="total_profit_growthrate" label="总利润增长率(%)" width="120"></el-table-column>
-            <el-table-column prop="operate_profit_growthrate" label="营业利润增长率(%)" width="130"></el-table-column>
-            <!-- ========== ⑦ 财务健康 ========== -->
-            <el-table-column prop="debt_asset_ratio" label="资产负债率(%)" width="120"></el-table-column>
-            <el-table-column prop="equity_ratio" label="权益比率" width="90"></el-table-column>
-            <el-table-column prop="equity_multiplier" label="权益乘数" width="90"></el-table-column>
-            <el-table-column prop="current_ratio" label="流动比率" width="90"></el-table-column>
-            <el-table-column prop="speed_ratio" label="速动比率" width="90"></el-table-column>
-            <!-- ========== ⑧ 股东与机构 ========== -->
-            <el-table-column prop="total_shares" label="总股本" sortable width="100"></el-table-column>
-            <el-table-column prop="free_shares" label="流通股本" sortable width="100"></el-table-column>
-            <el-table-column prop="holder_newest" label="最新股东数" width="100"></el-table-column>
-            <el-table-column prop="holder_ratio" label="股东比例" width="90"></el-table-column>
-            <el-table-column prop="hold_amount" label="持仓金额" width="100"></el-table-column>
-            <el-table-column prop="avg_hold_num" label="平均持仓数量" width="110"></el-table-column>
-            <el-table-column prop="holdnum_growthrate_3q" label="持仓3季增长率(%)" width="130"></el-table-column>
-            <el-table-column prop="holdnum_growthrate_hy" label="持仓半年增长率(%)" width="130"></el-table-column>
-            <el-table-column prop="hold_ratio_count" label="持股比例" width="90"></el-table-column>
-            <el-table-column prop="free_hold_ratio" label="自由流通持股比例" width="130"></el-table-column>
-            <el-table-column prop="holder_change_3m" label="持股变动3月(%)" width="120"></el-table-column>
-            <el-table-column prop="executive_change_3m" label="高管持股变动3月(%)" width="140"></el-table-column>
-            <el-table-column prop="org_rating" label="机构评级" width="90"></el-table-column>
-            <el-table-column prop="allcorp_num" label="全部机构数" width="100"></el-table-column>
-            <el-table-column prop="allcorp_fund_num" label="基金公司数" width="100"></el-table-column>
-            <el-table-column prop="allcorp_qs_num" label="券商公司数" width="100"></el-table-column>
-            <el-table-column prop="allcorp_qfii_num" label="QFII公司数" width="100"></el-table-column>
-            <el-table-column prop="allcorp_bx_num" label="保险公司数" width="100"></el-table-column>
-            <el-table-column prop="allcorp_sb_num" label="社保公司数" width="100"></el-table-column>
-            <el-table-column prop="allcorp_xt_num" label="信托公司数" width="100"></el-table-column>
-            <el-table-column prop="allcorp_ratio" label="机构持股比例(%)" width="130"></el-table-column>
-            <el-table-column prop="allcorp_fund_ratio" label="基金持股比例(%)" width="120"></el-table-column>
-            <el-table-column prop="allcorp_qs_ratio" label="券商持股比例(%)" width="120"></el-table-column>
-            <el-table-column prop="allcorp_qfii_ratio" label="QFII持股比例(%)" width="120"></el-table-column>
-            <el-table-column prop="allcorp_bx_ratio" label="保险持股比例(%)" width="120"></el-table-column>
-            <el-table-column prop="allcorp_sb_ratio" label="社保持股比例(%)" width="120"></el-table-column>
-            <el-table-column prop="allcorp_xt_ratio" label="信托持股比例(%)" width="120"></el-table-column>
-            <!-- ========== ⑨ 技术指标 ========== -->
-            <el-table-column prop="short_avg_array" label="短期均线多头" width="110">
-              <template slot-scope="scope">
-                <span :class="scope.row.short_avg_array ? 'text-red' : 'text-grey'">{{ scope.row.short_avg_array ? '是' : '否' }}</span>
-              </template>
-            </el-table-column>
-            <el-table-column prop="breakup_ma_30days" label="突破30日均线" width="110">
-              <template slot-scope="scope">
-                <span :class="scope.row.breakup_ma_30days ? 'text-red' : ''">{{ scope.row.breakup_ma_30days ? '是' : '否' }}</span>
-              </template>
-            </el-table-column>
-
           </el-table>
         </div>
 
@@ -1100,6 +1007,7 @@ export default {
     return {
       selectedMarket: '全部',
       aiQuery: '', // 初始化为空
+      searchLoading: false,
       activeTab: 'fundamental',
       filterDialogVisible: false,
 
@@ -1381,405 +1289,116 @@ export default {
     }
   },
   methods: {
-    // 将前端参数转换为后端可接受的SQL WHERE条件
-    buildQueryConditions () {
-      const conditions = []
-      const params = { }
-
-      // 市场选择
-      if (this.selectedMarket !== '全部') {
-        if (this.selectedMarket === '沪深300') {
-          conditions.push('is_hs300 = "Y"') // 假设数据库中用 Y/N 表示
-        } else if (this.selectedMarket === '中证500') {
-          conditions.push('is_zz500 = "Y"')
-        } else {
-          // A股、港股、美股等，假设用market字段区分
-          conditions.push('market = :market')
-          params.market = this.selectedMarket
-        }
-      }
-
-      // 关键词搜索 (代码/名称/概念)
-      if (this.aiQuery.trim()) {
-        conditions.push('(code LIKE :keyword OR name LIKE :keyword OR concept LIKE :keyword)')
-        params.keyword = `%${this.aiQuery.trim()}%`
-      }
-
-      // 基本面条件
-      if (this.filters.pe_min !== null) {
-        conditions.push('pe9 >= :pe_min')
-        params.pe_min = this.filters.pe_min
-      }
-      if (this.filters.pe_max !== null) {
-        conditions.push('pe9 <= :pe_max')
-        params.pe_max = this.filters.pe_max
-      }
-      if (this.filters.pb_min !== null) {
-        conditions.push('pbnewmrq >= :pb_min')
-        params.pb_min = this.filters.pb_min
-      }
-      if (this.filters.pb_max !== null) {
-        conditions.push('pbnewmrq <= :pb_max')
-        params.pb_max = this.filters.pb_max
-      }
-      if (this.filters.dividend_min !== null) {
-        conditions.push('par_dividend >= :dividend_min')
-        params.dividend_min = this.filters.dividend_min
-      }
-      if (this.filters.roe_min !== null) {
-        conditions.push('roe_weight >= :roe_min')
-        params.roe_min = this.filters.roe_min
-      }
-      if (this.filters.sale_gpr_min !== null) {
-        conditions.push('sale_gpr >= :sale_gpr_min')
-        params.sale_gpr_min = this.filters.sale_gpr_min
-      }
-      // 处理成长性布尔字段 (假设数据库中是数值字段，大于0表示满足条件)
-      this.filters.growth_indicators.forEach((indicator) => {
-        if (indicator === 'netprofit_yoy_ratio') {
-          conditions.push('netprofit_yoy_ratio > 15') // 示例阈值
-        } else if (indicator === 'toi_yoy_ratio') {
-          conditions.push('toi_yoy_ratio > 15')
-        } else if (indicator === 'basiceps_yoy_ratio') {
-          conditions.push('basiceps_yoy_ratio > 10')
-        }
-      })
-      // 处理质量性布尔字段
-      this.filters.quality_indicators.forEach((indicator) => {
-        if (indicator === 'per_netcash_operate') {
-          conditions.push('per_netcash_operate > 0')
-        }
-      })
-
-      // 技术面条件 (布尔字段)
-      this.filters.ma_breakthrough.forEach((field) => {
-        conditions.push(`${field} = 1`)
-      })
-      this.filters.tech_signals.forEach((field) => {
-        conditions.push(`${field} = 1`)
-      })
-      this.filters.k_classic.forEach((field) => {
-        conditions.push(`${field} = 1`)
-      })
-      this.filters.k_intraday.forEach((field) => {
-        conditions.push(`${field} = 1`)
-      })
-      this.filters.k_other.forEach((field) => {
-        conditions.push(`${field} = 1`)
-      })
-
-      // 资金面条件
-      if (this.filters.volume_ratio_min !== null) {
-        conditions.push('volume_ratio >= :volume_ratio_min')
-        params.volume_ratio_min = this.filters.volume_ratio_min
-      }
-      if (this.filters.turnoverrate_min !== null) {
-        conditions.push('turnoverrate >= :turnoverrate_min')
-        params.turnoverrate_min = this.filters.turnoverrate_min
-      }
-      // 行情指标 - 单端下限
-      if (this.filters.mi_volume_ratio_min !== null && this.filters.mi_volume_ratio_min > 0) {
-        conditions.push('volume_ratio >= :mi_volume_ratio_min')
-        params.mi_volume_ratio_min = this.filters.mi_volume_ratio_min
-      }
-      if (this.filters.mi_turnover_rate_min !== null && this.filters.mi_turnover_rate_min > 0) {
-        conditions.push('turnoverrate >= :mi_turnover_rate_min')
-        params.mi_turnover_rate_min = this.filters.mi_turnover_rate_min
-      }
-      if (this.filters.mi_volume_min !== null && this.filters.mi_volume_min > 0) {
-        conditions.push('volume >= :mi_volume_min')
-        params.mi_volume_min = this.filters.mi_volume_min
-      }
-      if (this.filters.mi_amount_min !== null && this.filters.mi_amount_min > 0) {
-        conditions.push('deal_amount >= :mi_amount_min')
-        params.mi_amount_min = this.filters.mi_amount_min
-      }
-      this.filters.capital_flow.forEach((field) => {
-        if (field === 'low_funds_inflow') {
-          conditions.push('net_inflow > 0') // 假设 net_inflow > 0 表示净流入
-        } else if (field === 'netinflow_3days') {
-          conditions.push('netinflow_3days > 0')
-        }
-      })
-      this.filters.institutional_holding.forEach((field) => {
-        if (field === 'org_survey_3m') {
-          conditions.push('org_survey_3m > 0')
-        } else if (field === 'allcorp_fund_ratio') {
-          conditions.push('allcorp_fund_ratio > 0.05') // 示例阈值
-        }
-      })
-
-      // 概念行业
-      if (this.filters.industry.length > 0) {
-        const placeholders = this.filters.industry.map((_, i) => `:industry${i}`).join(', ')
-        conditions.push(`industry IN (${placeholders})`)
-        this.filters.industry.forEach((val, i) => {
-          params[`industry${i}`] = val
-        })
-      }
-      if (this.filters.concept.length > 0) {
-        // 概念字段通常是文本，可能包含多个概念，用逗号分隔
-        this.filters.concept.forEach((val, i) => {
-          conditions.push(`concept LIKE :concept${i}`)
-          params[`concept${i}`] = `%${val}%`
-        })
-      }
-
-      // ====== 新增基本面条件 ======
-      if (this.filters.ps_min !== null) {
-        conditions.push('ps9 >= :ps_min')
-        params.ps_min = this.filters.ps_min
-      }
-      if (this.filters.ps_max !== null) {
-        conditions.push('ps9 <= :ps_max')
-        params.ps_max = this.filters.ps_max
-      }
-      if (this.filters.pcf_min !== null) {
-        conditions.push('pcfjyxjl9 >= :pcf_min')
-        params.pcf_min = this.filters.pcf_min
-      }
-      if (this.filters.pcf_max !== null) {
-        conditions.push('pcfjyxjl9 <= :pcf_max')
-        params.pcf_max = this.filters.pcf_max
-      }
-      if (this.filters.dtsyl_min !== null) {
-        conditions.push('dtsyl >= :dtsyl_min')
-        params.dtsyl_min = this.filters.dtsyl_min
-      }
-      if (this.filters.dtsyl_max !== null) {
-        conditions.push('dtsyl <= :dtsyl_max')
-        params.dtsyl_max = this.filters.dtsyl_max
-      }
-      if (this.filters.total_market_cap_min !== null) {
-        conditions.push('total_market_cap >= :total_market_cap_min')
-        params.total_market_cap_min = this.filters.total_market_cap_min
-      }
-      if (this.filters.total_market_cap_max !== null) {
-        conditions.push('total_market_cap <= :total_market_cap_max')
-        params.total_market_cap_max = this.filters.total_market_cap_max
-      }
-      if (this.filters.free_cap_min !== null) {
-        conditions.push('free_cap >= :free_cap_min')
-        params.free_cap_min = this.filters.free_cap_min
-      }
-      if (this.filters.free_cap_max !== null) {
-        conditions.push('free_cap <= :free_cap_max')
-        params.free_cap_max = this.filters.free_cap_max
-      }
-      if (this.filters.basic_eps_min !== null) {
-        conditions.push('basic_eps >= :basic_eps_min')
-        params.basic_eps_min = this.filters.basic_eps_min
-      }
-      if (this.filters.bvps_min !== null) {
-        conditions.push('bvps >= :bvps_min')
-        params.bvps_min = this.filters.bvps_min
-      }
-      if (this.filters.per_fcfe_min !== null) {
-        conditions.push('per_fcfe >= :per_fcfe_min')
-        params.per_fcfe_min = this.filters.per_fcfe_min
-      }
-      if (this.filters.parent_netprofit_min !== null) {
-        conditions.push('parent_netprofit >= :parent_netprofit_min')
-        params.parent_netprofit_min = this.filters.parent_netprofit_min
-      }
-      if (this.filters.deduct_netprofit_min !== null) {
-        conditions.push('deduct_netprofit >= :deduct_netprofit_min')
-        params.deduct_netprofit_min = this.filters.deduct_netprofit_min
-      }
-      if (this.filters.total_operate_income_min !== null) {
-        conditions.push('total_operate_income >= :total_operate_income_min')
-        params.total_operate_income_min = this.filters.total_operate_income_min
-      }
-      if (this.filters.jroa_min !== null) {
-        conditions.push('jroa >= :jroa_min')
-        params.jroa_min = this.filters.jroa_min
-      }
-      if (this.filters.roic_min !== null) {
-        conditions.push('roic >= :roic_min')
-        params.roic_min = this.filters.roic_min
-      }
-      if (this.filters.sale_npr_min_filter !== null) {
-        conditions.push('sale_npr >= :sale_npr_min_filter')
-        params.sale_npr_min_filter = this.filters.sale_npr_min_filter
-      }
-      if (this.filters.debt_asset_ratio_max !== null) {
-        conditions.push('debt_asset_ratio <= :debt_asset_ratio_max')
-        params.debt_asset_ratio_max = this.filters.debt_asset_ratio_max
-      }
-      if (this.filters.current_ratio_min !== null) {
-        conditions.push('current_ratio >= :current_ratio_min')
-        params.current_ratio_min = this.filters.current_ratio_min
-      }
-      if (this.filters.speed_ratio_min !== null) {
-        conditions.push('speed_ratio >= :speed_ratio_min')
-        params.speed_ratio_min = this.filters.speed_ratio_min
-      }
-      if (this.filters.total_shares_min !== null) {
-        conditions.push('total_shares >= :total_shares_min')
-        params.total_shares_min = this.filters.total_shares_min
-      }
-      if (this.filters.total_shares_max !== null) {
-        conditions.push('total_shares <= :total_shares_max')
-        params.total_shares_max = this.filters.total_shares_max
-      }
-      if (this.filters.free_shares_min !== null) {
-        conditions.push('free_shares >= :free_shares_min')
-        params.free_shares_min = this.filters.free_shares_min
-      }
-      if (this.filters.free_shares_max !== null) {
-        conditions.push('free_shares <= :free_shares_max')
-        params.free_shares_max = this.filters.free_shares_max
-      }
-      if (this.filters.holder_newest_min !== null) {
-        conditions.push('holder_newest >= :holder_newest_min')
-        params.holder_newest_min = this.filters.holder_newest_min
-      }
-      if (this.filters.holder_newest_max !== null) {
-        conditions.push('holder_newest <= :holder_newest_max')
-        params.holder_newest_max = this.filters.holder_newest_max
-      }
-
-      // ====== 新增技术面条件 ======
-      this.filters.ma_30_break.forEach((field) => {
-        conditions.push(`${field} = 1`)
-      })
-      this.filters.kdj_signals.forEach((field) => {
-        conditions.push(`${field} = 1`)
-      })
-      this.filters.pattern_signals.forEach((field) => {
-        conditions.push(`${field} = 1`)
-      })
-      this.filters.consecutive_signals.forEach((field) => {
-        conditions.push(`${field} = 1`)
-      })
-      this.filters.volume_trend.forEach((field) => {
-        conditions.push(`${field} = 1`)
-      })
-
-      // ====== 新增资金面条件 ======
-      if (this.filters.net_inflow_min !== null) {
-        conditions.push('net_inflow >= :net_inflow_min')
-        params.net_inflow_min = this.filters.net_inflow_min
-      }
-      if (this.filters.ddx_min !== null) {
-        conditions.push('ddx >= :ddx_min')
-        params.ddx_min = this.filters.ddx_min
-      }
-      if (this.filters.netinflow_min_3d !== null) {
-        conditions.push('netinflow_3days >= :netinflow_min_3d')
-        params.netinflow_min_3d = this.filters.netinflow_min_3d
-      }
-      if (this.filters.netinflow_min_5d !== null) {
-        conditions.push('netinflow_5days >= :netinflow_min_5d')
-        params.netinflow_min_5d = this.filters.netinflow_min_5d
-      }
-      if (this.filters.changerate_3d_min !== null) {
-        conditions.push('changerate_3days >= :changerate_3d_min')
-        params.changerate_3d_min = this.filters.changerate_3d_min
-      }
-      if (this.filters.changerate_5d_min !== null) {
-        conditions.push('changerate_5days >= :changerate_5d_min')
-        params.changerate_5d_min = this.filters.changerate_5d_min
-      }
-      if (this.filters.changerate_10d_min !== null) {
-        conditions.push('changerate_10days >= :changerate_10d_min')
-        params.changerate_10d_min = this.filters.changerate_10d_min
-      }
-      if (this.filters.changerate_ty_min !== null) {
-        conditions.push('changerate_ty >= :changerate_ty_min')
-        params.changerate_ty_min = this.filters.changerate_ty_min
-      }
-      if (this.filters.changerate_ty_max !== null) {
-        conditions.push('changerate_ty <= :changerate_ty_max')
-        params.changerate_ty_max = this.filters.changerate_ty_max
-      }
-
-      // ====== 新增股东机构条件 ======
-      if (this.filters.holder_change_3m_min !== null) {
-        conditions.push('holder_change_3m >= :holder_change_3m_min')
-        params.holder_change_3m_min = this.filters.holder_change_3m_min
-      }
-      if (this.filters.executive_change_3m_min !== null) {
-        conditions.push('executive_change_3m >= :executive_change_3m_min')
-        params.executive_change_3m_min = this.filters.executive_change_3m_min
-      }
-      if (this.filters.org_rating_filter) {
-        conditions.push('org_rating = :org_rating_filter')
-        params.org_rating_filter = this.filters.org_rating_filter
-      }
-      if (this.filters.allcorp_ratio_min !== null) {
-        conditions.push('allcorp_ratio >= :allcorp_ratio_min')
-        params.allcorp_ratio_min = this.filters.allcorp_ratio_min
-      }
-      if (this.filters.allcorp_fund_ratio_min !== null) {
-        conditions.push('allcorp_fund_ratio >= :allcorp_fund_ratio_min')
-        params.allcorp_fund_ratio_min = this.filters.allcorp_fund_ratio_min
-      }
-      if (this.filters.allcorp_qs_ratio_min !== null) {
-        conditions.push('allcorp_qs_ratio >= :allcorp_qs_ratio_min')
-        params.allcorp_qs_ratio_min = this.filters.allcorp_qs_ratio_min
-      }
-      if (this.filters.allcorp_qfii_ratio_min !== null) {
-        conditions.push('allcorp_qfii_ratio >= :allcorp_qfii_ratio_min')
-        params.allcorp_qfii_ratio_min = this.filters.allcorp_qfii_ratio_min
-      }
-
-      // ====== 新增状态条件 ======
-      this.filters.new_high_filter.forEach((field) => {
-        conditions.push(`${field} = 1`)
-      })
-      this.filters.win_market_filter.forEach((field) => {
-        conditions.push(`${field} = 1`)
-      })
-      this.filters.hs_board_filter.forEach((field) => {
-        if (field === 'is_sz50') conditions.push('is_sz50 = "Y"')
-        if (field === 'is_zz1000') conditions.push('is_zz1000 = "Y"')
-        if (field === 'is_cy50') conditions.push('is_cy50 = "Y"')
-        if (field === 'is_issue_break') conditions.push('is_issue_break = 1')
-        if (field === 'is_bps_break') conditions.push('is_bps_break = 1')
-      })
-
-      // ====== 新增派息与质押条件 ======
-      if (this.filters.par_dividend_min !== null) {
-        conditions.push('par_dividend >= :par_dividend_min')
-        params.par_dividend_min = this.filters.par_dividend_min
-      }
-      if (this.filters.pledge_ratio_max !== null) {
-        conditions.push('pledge_ratio <= :pledge_ratio_max')
-        params.pledge_ratio_max = this.filters.pledge_ratio_max
-      }
-      if (this.filters.goodwill_max !== null) {
-        conditions.push('goodwill_scale <= :goodwill_max')
-        params.goodwill_max = this.filters.goodwill_max
-      }
-
-      // ====== 新增限价/定增/质押时间条件 ======
-      this.filters.limited_lift_filter.forEach((field) => {
-        conditions.push(`${field} = 1`)
-      })
-      this.filters.directional_seo_filter.forEach((field) => {
-        conditions.push(`${field} = 1`)
-      })
-      this.filters.equity_pledge_filter.forEach((field) => {
-        conditions.push(`${field} = 1`)
-      })
-
-      return {
-        whereClause: conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '',
-        params: params
-      }
-    },
-
-    // 搜索按钮
+    // 搜索按钮 — 调用东方财富智能选股API（纯前端方式）
     async onSearch () {
+      const kw = (this.aiQuery || '').trim()
+      if (!kw) {
+        this.$message.warning('请输入选股关键词')
+        return
+      }
       this.currentPage = 1
-      await this.performSearch()
+      await this.performEastMoneySearch(kw)
     },
 
-    // 东方财富选股
-    onEastmoneyPick () {
-      const inputValue = encodeURIComponent(this.aiQuery || '')
-      window.open(`https://xuangu.eastmoney.com/Result?j=question_rec&id=xc10dd2addee07009398&inputValue=${inputValue}`, '_blank')
+    _genId (len) {
+      const chars = 'abcdefghijklmnopqrstuvwxyz0123456789'
+      return Array.from({ length: len }, () => chars[Math.floor(Math.random() * chars.length)]).join('')
+    },
+
+    _safeParseFloat (val) {
+      if (val == null || val === '' || val === '-' || val === '--') return null
+      const n = parseFloat(val)
+      return isNaN(n) ? null : n
+    },
+
+    async performEastMoneySearch (kw) {
+      const API_URL = 'https://np-tjxg-b.eastmoney.com/api/smart-tag/stock/v3/pw/search-code'
+      this.searchLoading = true
+      try {
+        const body = {
+          needAmbiguousSuggest: true,
+          pageSize: 200,
+          pageNo: 1,
+          fingerprint: this._genId(32),
+          matchWord: '',
+          shareToGuba: false,
+          timestamp: String(Date.now()),
+          requestId: this._genId(32) + String(Date.now()),
+          removedConditionIdList: [],
+          ownSelectAll: false,
+          needCorrect: true,
+          client: 'WEB',
+          product: '',
+          needShowStockNum: false,
+          biz: 'web_ai_select_stocks',
+          xcId: '',
+          gids: [],
+          dxInfoNew: [],
+          keyWordNew: kw,
+          customDataNew: JSON.stringify([{ type: 'text', value: kw, extra: '' }])
+        }
+
+        const resp = await fetch(API_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        })
+
+        if (!resp.ok) {
+          throw new Error(`HTTP ${resp.status}: ${resp.statusText}`)
+        }
+
+        const data = await resp.json()
+
+        if (data.code !== 100 && data.code !== '100' && String(data.code) !== '100') {
+          this.$message.error(data.msg || '搜索失败')
+          this.tableData = []
+          this.totalItems = 0
+          return
+        }
+
+        const res = data.data && data.data.result
+        const stocks = (res && res.dataList) || []
+        this.totalItems = (res && res.total) || stocks.length
+
+        this.tableData = stocks.map((s) => {
+          const chg = this._safeParseFloat(s.CHG)
+          return {
+            code: s.SECURITY_CODE || '',
+            name: s.SECURITY_SHORT_NAME || '',
+            industry: s.INDUSTRY || '',
+            concept: s.CONCEPT || '',
+            new_price: this._safeParseFloat(s.NEWEST_PRICE),
+            change_rate: chg,
+            high_price: this._safeParseFloat(s.HIGH_PRICE),
+            low_price: this._safeParseFloat(s.LOW_PRICE),
+            pre_close_price: this._safeParseFloat(s.PRE_CLOSE_PRICE),
+            volume: this._safeParseFloat(s.TRADE_VOLUME),
+            deal_amount: s.TRADING_VOLUMES || s.TRADE_AMOUNT || null,
+            volume_ratio: s.QRR || null,
+            turnoverrate: this._safeParseFloat(s.TURNOVER_RATE),
+            amplitude: this._safeParseFloat(s.AMPLITUDE),
+            pe9: s.PE_DYNAMIC || s.PE9 || null,
+            pbnewmrq: s.PB_NEW_MRQ || null,
+            total_market_cap: s.TOEAL_MARKET_VALUE || s.TOTAL_MARKET_CAP || null,
+            free_cap: s.FREE_CAP || null
+          }
+        })
+
+        if (this.tableData.length === 0) {
+          this.$message.info('未找到匹配的股票')
+        }
+      } catch (err) {
+        if (err.name === 'TypeError' && err.message === 'Failed to fetch') {
+          this.$message.error('搜索失败：网络请求被阻止（可能是CORS限制），请检查网络或使用代理')
+        } else {
+          this.$message.error('搜索失败: ' + err.message)
+        }
+        this.tableData = []
+        this.totalItems = 0
+      } finally {
+        this.searchLoading = false
+      }
     },
 
     // ---- 获取认证 headers ----
@@ -1793,12 +1412,11 @@ export default {
     // ====== 策略保存/加载/删除 ======
 
     openSaveDialog () {
-      const { whereClause } = this.buildQueryConditions()
-      if (!whereClause) {
-        this.$message.warning('请先设置筛选条件再保存')
+      if (!this.aiQuery.trim()) {
+        this.$message.warning('请先输入搜索关键词再保存')
         return
       }
-      this.saveForm = { name: '', description: '' }
+      this.saveForm = { name: this.aiQuery.trim().substring(0, 20), description: '' }
       this.saveDialogVisible = true
     },
 
@@ -1807,8 +1425,6 @@ export default {
         this.$message.warning('请输入策略名称')
         return
       }
-
-      const { whereClause, params } = this.buildQueryConditions()
       this.saving = true
 
       try {
@@ -1817,7 +1433,7 @@ export default {
           headers: this._authHeaders(),
           body: JSON.stringify({
             name: this.saveForm.name.trim(),
-            conditions: { query: whereClause, params },
+            conditions: { keyword: this.aiQuery },
             description: this.saveForm.description.trim()
           })
         })
@@ -1853,52 +1469,23 @@ export default {
     },
 
     loadStrategy (strategy) {
-      // conditions 格式: { query: "WHERE ...", params: {...} }
       let cond = strategy.conditions
       if (typeof cond === 'string') {
         try { cond = JSON.parse(cond) } catch (_) { cond = {} }
       }
 
-      // 恢复筛选条件到 aiQuery 输入框 → 触发 handleAiInput 解析
-      // 但条件是结构化的，直接用 WHERE 子句 + params 填充更快
-      // 这里用简单方式：把条件对象转回 aiQuery 文本
-      if (cond && cond.query) {
-        // 直接设置搜索参数并执行
-        this._pendingQuery = cond
-        this.aiQuery = ''
-        this.strategiesDialogVisible = false
-        // 用条件直接搜索
-        this._searchWithDirectConditions(cond)
-      } else {
+      if (!cond || (!cond.keyword && !cond.query)) {
         this.$message.warning('策略条件格式不兼容')
+        return
       }
-    },
 
-    async _searchWithDirectConditions (cond) {
-      this.currentPage = 1
-      try {
-        const resp = await fetch('/api/xuangu/search', {
-          method: 'POST',
-          headers: this._authHeaders(),
-          body: JSON.stringify({
-            query: cond.query || '',
-            params: cond.params || {},
-            page: 1,
-            limit: this.pageSize,
-            sort_by: 'code',
-            order: 'asc'
-          })
-        })
-        const data = await resp.json()
-        if (data.code === 0) {
-          this.tableData = data.data
-          this.totalItems = data.count
-          this.$message.success(`已加载策略，${data.count} 条结果`)
-        } else {
-          this.$message.error(data.msg || '加载策略失败')
-        }
-      } catch (e) {
-        this.$message.error('加载策略失败: ' + e.message)
+      this.aiQuery = cond.keyword || cond.query || ''
+      this.strategiesDialogVisible = false
+
+      if (this.aiQuery.trim()) {
+        this.$nextTick(() => this.onSearch())
+      } else {
+        this.$message.info('已加载策略条件，请点击智能搜索')
       }
     },
 
@@ -1925,42 +1512,6 @@ export default {
         }
       } catch (e) {
         this.$message.error('删除失败: ' + e.message)
-      }
-    },
-
-    // 执行搜索逻辑
-    async performSearch () {
-      try {
-        const { whereClause, params } = this.buildQueryConditions()
-
-        const response = await fetch('/api/xuangu/search', {
-          method: 'POST',
-          headers: this._authHeaders(),
-          body: JSON.stringify({
-            query: whereClause, // 将WHERE子句传递给后端
-            params: params, // 将参数对象传递给后端
-            page: this.currentPage,
-            limit: this.pageSize,
-            'sort_by': 'code', // 默认排序
-            order: 'asc'
-          })
-        })
-
-        if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`)
-        }
-        const responseData = await response.json()
-
-        if (responseData.code === 0) {
-          this.tableData = responseData.data
-          this.totalItems = responseData.count
-        } else {
-          // 处理后端返回的非成功状态码
-          this.$message.error(responseData.message || '搜索失败')
-        }
-      } catch (error) {
-        console.error('搜索失败:', error)
-        this.$message.error('搜索失败，请检查网络或稍后重试')
       }
     },
 
@@ -2525,35 +2076,67 @@ export default {
       this.aiQuery = parts.join('; ')
     },
 
-    // 从AI查询框反向解析参数 (此功能已通过handleAiInput部分实现)
-    // syncFiltersFromAiQuery () { ... } // 已移除，由handleAiInput替代
-
     // 分页处理
     handleSizeChange (val) {
       this.pageSize = val
-      this.performSearch()
+      this.currentPage = 1
     },
     handleCurrentChange (val) {
       this.currentPage = val
-      this.performSearch()
     },
     handleSortChange ({ prop, order }) {
-      if (prop) {
-        // 实际项目中，这里应重新调用performSearch并传入排序参数
-        console.log(`排序: ${prop} ${order}`)
-      }
+      if (!prop || !order) return
+      const dir = order === 'ascending' ? 1 : -1
+      this.tableData.sort((a, b) => {
+        const va = a[prop]
+        const vb = b[prop]
+        if (va == null && vb == null) return 0
+        if (va == null) return dir
+        if (vb == null) return -dir
+        if (typeof va === 'number' && typeof vb === 'number') return (va - vb) * dir
+        return String(va).localeCompare(String(vb)) * dir
+      })
     },
 
-    // 自选相关
     handleSelectionChange (val) {
       this.selectedRows = val
     },
-    addSelectedToFavorites () {
+
+    async addSelectedToFavorites () {
       if (this.selectedRows.length === 0) return
-      const names = this.selectedRows.map(r => `${r.name}(${r.code})`).join(', ')
-      this.$message.success(`已加自选: ${names}`)
-      // 实际项目中调用后端API保存
-      // fetch('/api/xuangu/favorites/add', { method: 'POST', body: JSON.stringify({ codes: this.selectedRows.map(r => r.code) }) })
+
+      const stocks = this.selectedRows
+        .filter(r => r.code)
+        .map(r => ({
+          code: r.code,
+          name: r.name,
+          industry: r.industry || '',
+          concept: r.concept || '',
+          new_price: r.new_price,
+          change_rate: r.change_rate
+        }))
+
+      if (stocks.length === 0) {
+        this.$message.warning('选中的股票缺少代码，无法添加自选')
+        return
+      }
+
+      try {
+        const resp = await fetch('/api/xuangu/watchlist', {
+          method: 'POST',
+          headers: this._authHeaders(),
+          body: JSON.stringify({ stocks })
+        })
+        const data = await resp.json()
+        if (data.code === 0) {
+          const names = stocks.map(s => `${s.name}(${s.code})`).join(', ')
+          this.$message.success(`已加自选: ${names}`)
+        } else {
+          this.$message.error(data.msg || '添加自选失败')
+        }
+      } catch (e) {
+        this.$message.error('添加自选失败: ' + e.message)
+      }
     },
 
     // 滑块值变化处理 - 通用方法
@@ -2572,6 +2155,13 @@ export default {
       if (val >= 100000000) return (val / 100000000).toFixed(1) + '亿'
       if (val >= 10000) return (val / 10000).toFixed(1) + '万'
       return val
+    }
+  },
+  computed: {
+    paginatedData () {
+      const start = (this.currentPage - 1) * this.pageSize
+      const end = start + this.pageSize
+      return this.tableData.slice(start, end)
     }
   },
   watch: {
@@ -2597,11 +2187,8 @@ export default {
     }
   },
   async mounted () {
-    // 初始化AI查询框为空，符合需求
+    // 等待用户输入关键词后由智能搜索调用东方财富API
     this.aiQuery = ''
-
-    // 页面加载时获取市场总表数据 (无过滤条件)
-    await this.performSearch()
   }
 }
 </script>
@@ -2702,19 +2289,18 @@ export default {
 
 .btn-group {
   display: flex;
-  flex-direction: column;
-  gap: 4px;
+  align-items: stretch;
 }
 
 .btn-group .el-button {
-  width: 110px;
   margin: 0;
-  padding: 8px 12px;
-  font-size: 13px;
+  padding: 8px 20px;
+  font-size: 14px;
   font-weight: 600;
   border-radius: 8px;
   letter-spacing: 1px;
   transition: all 0.3s ease;
+  white-space: nowrap;
 }
 
 .btn-group .el-button--primary {
@@ -2726,41 +2312,6 @@ export default {
 .btn-group .el-button--primary:hover {
   transform: translateY(-1px);
   box-shadow: 0 4px 14px rgba(64, 158, 255, 0.4);
-}
-
-.btn-group .el-button--success {
-  background: linear-gradient(135deg, #67c23a 0%, #4da32e 100%);
-  border: none;
-  box-shadow: 0 2px 8px rgba(103, 194, 58, 0.3);
-}
-
-.btn-group .el-button--success:hover {
-  transform: translateY(-1px);
-  box-shadow: 0 4px 14px rgba(103, 194, 58, 0.4);
-}
-
-.btn-group .el-button--warning {
-  background: linear-gradient(135deg, #e6a23c 0%, #cf8e2e 100%);
-  border: none;
-  color: #fff;
-  box-shadow: 0 2px 8px rgba(230, 162, 60, 0.3);
-}
-
-.btn-group .el-button--warning:hover {
-  transform: translateY(-1px);
-  box-shadow: 0 4px 14px rgba(230, 162, 60, 0.4);
-}
-
-.btn-group .el-button--info {
-  background: linear-gradient(135deg, #909399 0%, #73777d 100%);
-  border: none;
-  color: #fff;
-  box-shadow: 0 2px 8px rgba(144, 147, 153, 0.3);
-}
-
-.btn-group .el-button--info:hover {
-  transform: translateY(-1px);
-  box-shadow: 0 4px 14px rgba(144, 147, 153, 0.4);
 }
 
 .strategy-conditions-preview {
@@ -2926,6 +2477,12 @@ export default {
   margin-bottom: 12px;
   display: flex;
   align-items: center;
+  justify-content: space-between;
+}
+
+.toolbar-right {
+  display: flex;
+  gap: 8px;
 }
 
 .table-toolbar .el-button--warning {
