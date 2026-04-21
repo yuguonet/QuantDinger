@@ -34,19 +34,20 @@
         </div>
       </div>
 
-      <!-- 市场列表 -->
+      <!-- 市场列表 — 始终显示 3 项 -->
       <div class="market-list">
         <div
-          v-for="m in marketItems"
+          v-for="m in displayItems"
           :key="m.key"
           class="market-row"
-          :class="{ 'anomaly-alert': m.anomaly }"
+          :class="{ 'anomaly-alert': m.anomaly, 'replaced-item': m.isReplaced }"
         >
           <div class="market-icon">{{ m.emoji }}</div>
           <div class="market-info">
             <div class="market-name">
               {{ m.name }}
               <span v-if="m.anomaly" class="anomaly-icon">⚠️</span>
+              <span v-if="m.isReplaced" class="replaced-badge">替换</span>
             </div>
             <div class="market-detail">
               <span class="price">{{ m.priceText }}</span>
@@ -72,7 +73,7 @@
       </div>
 
       <!-- 空状态 -->
-      <div v-if="!loading && marketItems.length === 0" class="empty-state">
+      <div v-if="!loading && displayItems.length === 0" class="empty-state">
         <span>暂无数据</span>
       </div>
     </div>
@@ -80,15 +81,15 @@
 </template>
 
 <script>
-import { getMarketOverview, getMarketSentiment } from '@/api/global-market'
-/**
- * 外围市场监控卡片
- * - 综合评分 0-100
- * - 各市场情绪值 0-100
- * - 异动检测（红色 + 警告图标 + 看多/看空）
- * - 10分钟自动刷新
- * - 异动时发送通知
- */
+import request from '@/utils/request'
+
+// 最多显示条目数
+const MAX_DISPLAY = 3
+// 异动检测阈值（百分比）
+const ANOMALY_THRESHOLD = 2.0
+// 默认三项 key
+const DEFAULT_KEYS = ['sent_fear_greed', 'sent_vix', 'sent_dxy']
+
 export default {
   name: 'PeripheralMarketCard',
   data () {
@@ -97,10 +98,64 @@ export default {
       lastUpdate: null,
       refreshTimer: null,
       overallScore: 50,
-      marketItems: [],
+      // 全量数据池（所有市场 + 情绪指标）
+      allMarketItems: [],
       isDestroyed: false,
       // 上次数据，用于检测变化
-      prevData: {}
+      prevData: {},
+      // 请求取消控制器
+      abortController: null
+    }
+  },
+  computed: {
+    /**
+     * 始终显示 MAX_DISPLAY (3) 个条目
+     *
+     * 逻辑（从下替到上）：
+     * 默认排列 [0]=恐贪指数(顶) [1]=VIX波动率(中) [2]=美元指数DXY(底)
+     * 异动项从底部(DXY)开始逐个往上替换默认项：
+     *   - 1个异动 → 替掉底部 DXY
+     *   - 2个异动 → 替掉 DXY + VIX
+     *   - 3个异动 → 全部替换
+     * 异动项 ≥ MAX_DISPLAY 时全部显示异动项
+     * 被替换进来的项标记 isReplaced = true
+     */
+    displayItems () {
+      const all = this.allMarketItems
+      if (!all || all.length === 0) return []
+
+      // 1) 筛选异动项（不含默认三项自身的），按波动幅度降序
+      //    默认三项自身的异动直接体现在默认位上，不需要额外替换
+      const anomalyPool = all
+        .filter(i => i.anomaly && !DEFAULT_KEYS.includes(i.key))
+        .sort((a, b) => Math.abs(b.change) - Math.abs(a.change))
+
+      // 2) 取出默认三项，按视觉优先级排列（顶→底）
+      //    [0]=恐贪指数(顶) [1]=VIX(中) [2]=DXY(底)
+      const defaults = DEFAULT_KEYS
+        .map(k => all.find(i => i.key === k))
+        .filter(Boolean)
+
+      // 3) 先放好默认项
+      const result = [...defaults.slice(0, MAX_DISPLAY).map(d => ({ ...d, isReplaced: false }))]
+
+      // 不够 MAX_DISPLAY 个默认项时，用全量池补
+      while (result.length < MAX_DISPLAY) {
+        const fill = all.find(i => !result.some(r => r.key === i.key))
+        if (!fill) break
+        result.push({ ...fill, isReplaced: false })
+      }
+      result.length = Math.min(result.length, MAX_DISPLAY)
+
+      // 4) 异动项从底部(result.length-1)开始往上逐个替换
+      for (let i = 0; i < anomalyPool.length && i < MAX_DISPLAY; i++) {
+        const replaceIdx = result.length - 1 - i
+        if (replaceIdx >= 0) {
+          result[replaceIdx] = { ...anomalyPool[i], isReplaced: true }
+        }
+      }
+
+      return result
     }
   },
   mounted () {
@@ -114,40 +169,59 @@ export default {
       clearInterval(this.refreshTimer)
       this.refreshTimer = null
     }
+    // 取消飞行中的请求，避免服务端 GeneratorExit
+    if (this.abortController) {
+      this.abortController.abort()
+      this.abortController = null
+    }
   },
   methods: {
     async fetchAll () {
       if (this.isDestroyed) return
       this.loading = true
+      // 每次刷新创建新的 AbortController
+      if (this.abortController) this.abortController.abort()
+      this.abortController = new AbortController()
+      const signal = this.abortController.signal
       try {
         const [overviewRes, sentimentRes] = await Promise.all([
-          this.fetchOverview(),
-          this.fetchSentiment()
+          this.fetchOverview(signal),
+          this.fetchSentiment(signal)
         ])
-        if (this.isDestroyed) return
+        if (this.isDestroyed || signal.aborted) return
         this.processData(overviewRes, sentimentRes)
         this.lastUpdate = new Date().toLocaleTimeString()
       } catch (e) {
+        // AbortError 是组件销毁的正常行为，不记录
+        if (e.name === 'AbortError' || e.code === 'ERR_CANCELED') return
         console.error('[外围市场] 数据获取失败:', e)
       } finally {
         if (!this.isDestroyed) this.loading = false
       }
     },
 
-    async fetchOverview () {
-      return this.fetchWithRetry(() => getMarketOverview(), 'overview')
+    async fetchOverview (signal) {
+      return this.fetchWithRetry(
+        () => request({ url: '/api/global-market/overview', method: 'get', signal }),
+        'overview', signal
+      )
     },
 
-    async fetchSentiment () {
-      return this.fetchWithRetry(() => getMarketSentiment(), 'sentiment')
+    async fetchSentiment (signal) {
+      return this.fetchWithRetry(
+        () => request({ url: '/api/global-market/sentiment', method: 'get', signal }),
+        'sentiment', signal
+      )
     },
 
-    async fetchWithRetry (fn, label, retries = 1, delay = 60000) {
+    async fetchWithRetry (fn, label, signal, retries = 1, delay = 60000) {
       for (let i = 0; i <= retries; i++) {
+        if (signal && signal.aborted) return null
         try {
           const res = await fn()
           return res.code === 1 ? res.data : null
         } catch (e) {
+          if (e.name === 'AbortError' || e.code === 'ERR_CANCELED') return null
           console.error(`[外围市场] ${label} 失败${i < retries ? ', 重试中...' : ' (已放弃)'}:`, e)
           if (i < retries) await new Promise(resolve => setTimeout(resolve, delay))
         }
@@ -252,24 +326,27 @@ export default {
 
       // --- 情绪指标 ---
       if (sentiment) {
-        // Fear & Greed
+        // Fear & Greed（默认第3位 / 底部）
         if (sentiment.fear_greed && sentiment.fear_greed.value !== undefined) {
           const fg = sentiment.fear_greed
           const val = parseInt(fg.value) || 50
+          const prevVal = this.prevData['sent_fear_greed']
+          const fgChange = prevVal !== undefined ? val - prevVal : 0
+          const anomaly = this.detectAnomaly('sent_fear_greed', fgChange)
           items.push({
             key: 'sent_fear_greed',
             name: '恐贪指数',
             emoji: val > 60 ? '😎' : val < 40 ? '😱' : '😐',
             price: val,
             priceText: String(val),
-            change: 0,
-            changeText: '0.00',
+            change: fgChange,
+            changeText: Math.abs(fgChange).toFixed(1),
             sentiment: val,
-            anomaly: false,
-            anomalyDir: 'neutral'
+            anomaly: anomaly.isAnomaly,
+            anomalyDir: anomaly.direction
           })
         }
-        // VIX
+        // VIX（默认第2位 / 中间）
         if (sentiment.vix && sentiment.vix.value !== undefined) {
           const vix = parseFloat(sentiment.vix.value) || 0
           const vixSentiment = Math.max(0, Math.min(100, 100 - (vix - 10) * 2.5))
@@ -289,7 +366,7 @@ export default {
             anomalyDir: anomaly.direction
           })
         }
-        // DXY
+        // DXY（默认第1位 / 顶部）
         if (sentiment.dxy && sentiment.dxy.value !== undefined) {
           const dxy = parseFloat(sentiment.dxy.value) || 0
           const dxyChange = parseFloat(sentiment.dxy.change_pct || sentiment.dxy.change || 0)
@@ -311,9 +388,9 @@ export default {
         }
       }
 
-      this.marketItems = items
+      this.allMarketItems = items
 
-      // 计算整体评分
+      // 计算整体评分（基于全量数据）
       if (items.length > 0) {
         const totalSentiment = items.reduce((sum, i) => sum + i.sentiment, 0)
         this.overallScore = Math.round(totalSentiment / items.length)
@@ -330,9 +407,8 @@ export default {
      * 异动检测：变动幅度超过阈值
      */
     detectAnomaly (key, change) {
-      const THRESHOLD = 2.0 // 2% 作为异动阈值
       const absChange = Math.abs(change)
-      const isAnomaly = absChange >= THRESHOLD
+      const isAnomaly = absChange >= ANOMALY_THRESHOLD
       const direction = change > 0 ? 'bullish' : change < 0 ? 'bearish' : 'neutral'
 
       // 更新历史（限制大小防止内存泄漏）
@@ -643,7 +719,7 @@ export default {
   background: var(--row-bg, #fafbfc);
   border-radius: 8px;
   border: 1px solid transparent;
-  transition: all 0.2s ease;
+  transition: all 0.3s ease;
 }
 
 .market-row:hover {
@@ -660,6 +736,11 @@ export default {
 @keyframes pulse-border {
   0%, 100% { border-color: #fca5a5; }
   50% { border-color: #ef4444; box-shadow: 0 0 8px rgba(239,68,68,0.15); }
+}
+
+/* 被替换的项（异动项） */
+.market-row.replaced-item {
+  border-left: 3px solid #f59e0b;
 }
 
 .market-icon {
@@ -686,6 +767,18 @@ export default {
 .anomaly-icon {
   margin-left: 4px;
   font-size: 14px;
+}
+
+.replaced-badge {
+  display: inline-block;
+  margin-left: 6px;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: #fef3c7;
+  color: #92400e;
+  vertical-align: middle;
 }
 
 .market-detail {

@@ -30,7 +30,7 @@ from app.utils.logger import get_logger
 
 
 # Unified data-provider layer
-from app.data_providers import get_cached, set_cached, clear_cache
+from app.data_providers import get_cached, set_cached, clear_cache, CACHE_TTL
 from app.data_providers.crypto import fetch_crypto_prices
 from app.data_providers.forex import fetch_forex_pairs
 from app.data_providers.commodities import fetch_commodities
@@ -58,7 +58,7 @@ global_market_bp = Blueprint("global_market", __name__)
 def market_overview():
     """Get global market overview including indices, forex, crypto, and commodities."""
     try:
-        cached = get_cached("market_overview", 30)
+        cached = get_cached("market_overview", CACHE_TTL["market_overview"])
         if cached:
             logger.debug(
                 "Returning cached overview: indices=%d, forex=%d, crypto=%d, commodities=%d",
@@ -87,7 +87,7 @@ def market_overview():
                     data = future.result()
                     result[key] = data if data else []
                     logger.info("Fetched %s: %d items", key, len(result[key]))
-                    set_cached(f"{key}_data", result[key], 30)
+                    set_cached(f"{key}_data", result[key], CACHE_TTL.get(f"{key}", 300))
                 except Exception as e:
                     logger.error("Failed to fetch %s: %s", key, e, exc_info=True)
                     result[key] = []
@@ -98,10 +98,10 @@ def market_overview():
             len(result["crypto"]), len(result["commodities"]),
         )
 
-        set_cached("stock_indices", result["indices"], 30)
-        set_cached("forex_pairs", result["forex"], 30)
-        set_cached("crypto_prices", result["crypto"], 30)
-        set_cached("market_overview", result, 30)
+        set_cached("stock_indices", result["indices"], CACHE_TTL["stock_indices"])
+        set_cached("forex_pairs", result["forex"], CACHE_TTL["forex_pairs"])
+        set_cached("crypto_prices", result["crypto"], CACHE_TTL["crypto_heatmap"])
+        set_cached("market_overview", result, CACHE_TTL["market_overview"])
 
         return jsonify({"code": 1, "msg": "success", "data": result})
 
@@ -114,12 +114,12 @@ def market_overview():
 def market_heatmap():
     """Get market heatmap data for crypto, stock sectors, forex, and indices."""
     try:
-        cached = get_cached("market_heatmap", 30)
+        cached = get_cached("market_heatmap", CACHE_TTL["market_heatmap"])
         if cached:
             return jsonify({"code": 1, "msg": "success", "data": cached})
 
         data = generate_heatmap_data()
-        set_cached("market_heatmap", data, 30)
+        set_cached("market_heatmap", data, CACHE_TTL["market_heatmap"])
 
         return jsonify({"code": 1, "msg": "success", "data": data})
 
@@ -135,12 +135,12 @@ def market_news():
         lang = request.args.get("lang", "all")
         cache_key = f"market_news_{lang}"
 
-        cached = get_cached(cache_key, 180)
+        cached = get_cached(cache_key, CACHE_TTL["market_news"])
         if cached:
             return jsonify({"code": 1, "msg": "success", "data": cached})
 
         news = fetch_financial_news(lang)
-        set_cached(cache_key, news, 180)
+        set_cached(cache_key, news, CACHE_TTL["market_news"])
 
         return jsonify({"code": 1, "msg": "success", "data": news})
 

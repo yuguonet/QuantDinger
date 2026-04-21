@@ -1,12 +1,26 @@
 """
-港股/H股数据源 — 多层 fallback
+=============================================
+港股/H股数据源 (HK Stock Data Source)
+=============================================
 
-有 TWELVE_DATA_API_KEY:
-  所有周期 → Twelve Data（主） → 腾讯日/周线 → yfinance → AkShare
+四级降级:
+    有 TWELVE_DATA_API_KEY:
+        所有周期 → Twelve Data → 腾讯日/周线 → yfinance → AkShare
+    无 API Key:
+        分钟/小时 → yfinance → AkShare
+        日/周线  → 腾讯 fqkline → yfinance → AkShare
 
-无 API Key:
-  分钟/小时 → yfinance → AkShare
-  日/周线 → 腾讯 fqkline → yfinance → AkShare
+支持功能:
+    - K线获取 (get_kline): 1m ~ 1W
+    - 实时报价 (get_ticker): 腾讯财经接口
+
+熔断保护: 海外源熔断器 (2次失败 / 15min冷却)
+    - 四级降级全部失败才返回空，空结果不触发熔断
+
+依赖:
+    - yfinance     (必需)
+    - requests     (Twelve Data / 腾讯财经)
+    - akshare      (可选, 最后降级)
 """
 
 from __future__ import annotations
@@ -14,6 +28,7 @@ from __future__ import annotations
 from typing import Dict, List, Any, Optional
 
 from app.data_sources.base import BaseDataSource
+from app.data_sources.circuit_breaker import get_overseas_circuit_breaker
 from app.data_sources.tencent import normalize_hk_code, fetch_quote, parse_quote_to_ticker, fetch_kline, tencent_kline_rows_to_dicts
 from app.data_sources.asia_stock_kline import (
     normalize_chart_timeframe,
@@ -31,6 +46,9 @@ class HKStockDataSource(BaseDataSource):
     """港股/H股数据源（TwelveData + Tencent + yfinance + AkShare）"""
 
     name = "HKStock/multi-source"
+
+    def __init__(self):
+        self.cb = get_overseas_circuit_breaker()
 
     def get_ticker(self, symbol: str) -> Dict[str, Any]:
         code = normalize_hk_code(symbol)
@@ -57,6 +75,9 @@ class HKStockDataSource(BaseDataSource):
         limit: int,
         before_time: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
+        if not self.cb.is_available(self.name):
+            return []
+
         code = normalize_hk_code(symbol)
         tf = normalize_chart_timeframe(timeframe)
         lim = max(int(limit or 300), 1)
@@ -66,6 +87,7 @@ class HKStockDataSource(BaseDataSource):
             is_hk=True, tencent_code=code, timeframe=tf, limit=lim, before_time=before_time
         )
         if rows:
+            self.cb.record_success(self.name)
             return self.filter_and_limit(rows, limit=lim, before_time=before_time)
 
         # Tier 2: Tencent for daily/weekly (fast, free)
@@ -75,6 +97,7 @@ class HKStockDataSource(BaseDataSource):
             raw_rows = fetch_kline(code, period=period, count=lim, adj="qfq")
             out = tencent_kline_rows_to_dicts(raw_rows)
             if out:
+                self.cb.record_success(self.name)
                 return self.filter_and_limit(out, limit=lim, before_time=before_time)
 
         # Tier 3: yfinance (works when Yahoo not rate-limited)
@@ -82,6 +105,7 @@ class HKStockDataSource(BaseDataSource):
             is_hk=True, tencent_code=code, timeframe=tf, limit=lim, before_time=before_time
         )
         if rows:
+            self.cb.record_success(self.name)
             return self.filter_and_limit(rows, limit=lim, before_time=before_time)
 
         # Tier 4: AkShare (fragile overseas, last resort)
@@ -96,4 +120,7 @@ class HKStockDataSource(BaseDataSource):
         else:
             rows = []
 
+        if rows:
+            self.cb.record_success(self.name)
+        # 空结果不触发熔断（可能是合法的：休市、代码不存在）
         return self.filter_and_limit(rows, limit=lim, before_time=before_time)

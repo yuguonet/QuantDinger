@@ -25,13 +25,21 @@ CACHE_TTL = {
     "crypto_heatmap": 300,
     "forex_pairs": 120,
     "stock_indices": 120,
-    "market_overview": 120,
-    "market_heatmap": 120,
-    "commodities": 120,
+    "market_overview": 300,          # 5min — 金/油等大宗商品不需要太频繁
+    "market_heatmap": 300,
+    "commodities": 300,              # 5min
     "market_news": 180,
     "economic_calendar": 3600,
-    "market_sentiment": 21600,
+    "market_sentiment": 21600,       # legacy, 不再直接使用
     "trading_opportunities": 3600,
+    # ── 情绪/宏观指标独立 TTL ──
+    "sentiment_fear_greed": 14400,   # 4h — 恐贪指数每天更新一次
+    "sentiment_vix": 300,            # 5min — 美股盘中活跃
+    "sentiment_vxn": 300,            # 5min
+    "sentiment_dxy": 600,            # 10min — 美元指数
+    "sentiment_yield_curve": 600,    # 10min — 收益率曲线
+    "sentiment_gvz": 600,            # 10min — 金波动率
+    "sentiment_vix_term": 300,       # 5min — VIX期限结构
 }
 
 _DEFAULT_TTL = 60

@@ -1,8 +1,27 @@
 """
-期货数据源
-支持：
-1. 加密货币期货（Binance Futures via CCXT）
-2. 传统期货（三级降级: Twelve Data → yfinance → Tiingo(贵金属)）
+=============================================
+期货数据源 (Futures Data Source)
+=============================================
+
+支持两种期货类型:
+    1. 加密货币期货 — CCXT Binance Futures
+    2. 传统期货 — Twelve Data → yfinance → Tiingo(贵金属) 三级降级
+
+传统期货品种: GC(黄金), SI(白银), CL(原油), NG(天然气), ZC(玉米), ZW(小麦)
+加密期货: 任意 CCXT 支持的期货交易对
+
+支持功能:
+    - K线获取 (get_kline): 自动判断传统/加密, 选择对应获取路径
+    - 实时报价 (get_ticker): Twelve Data → yfinance → Tiingo 降级
+
+熔断保护: 海外源熔断器 (2次失败 / 15min冷却)
+    - 仅异常触发熔断，空结果不计数
+
+依赖:
+    - ccxt         (加密期货, 必需)
+    - yfinance     (传统期货降级, 必需)
+    - TWELVE_DATA_API_KEY  (可选)
+    - TIINGO_API_KEY       (可选, 贵金属)
 """
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
@@ -13,6 +32,7 @@ import requests
 import yfinance as yf
 
 from app.data_sources.base import BaseDataSource, TIMEFRAME_SECONDS
+from app.data_sources.circuit_breaker import get_overseas_circuit_breaker
 from app.utils.logger import get_logger
 from app.config import CCXTConfig, TiingoConfig, APIKeys
 
@@ -88,6 +108,7 @@ class FuturesDataSource(BaseDataSource):
     }
     
     def __init__(self):
+        self.cb = get_overseas_circuit_breaker()
         # 初始化CCXT（用于加密货币期货）
         config = {
             'timeout': CCXTConfig.TIMEOUT,
@@ -223,18 +244,27 @@ class FuturesDataSource(BaseDataSource):
     ) -> List[Dict[str, Any]]:
         """
         获取期货K线数据
-        
+
         Args:
             symbol: 期货合约代码
             timeframe: 时间周期
             limit: 数据条数
             before_time: 结束时间戳
         """
+        if not self.cb.is_available(self.name):
+            return []
+
         # 判断是传统期货还是加密货币期货
         if symbol in self.YF_SYMBOLS or symbol.endswith('=F'):
-            return self._get_traditional_futures(symbol, timeframe, limit, before_time)
+            klines = self._get_traditional_futures(symbol, timeframe, limit, before_time)
         else:
-            return self._get_crypto_futures(symbol, timeframe, limit, before_time)
+            klines = self._get_crypto_futures(symbol, timeframe, limit, before_time)
+
+        if klines:
+            self.cb.record_success(self.name)
+        # 空结果不触发熔断（可能是合法的：休市、代码不存在）
+
+        return klines
     
     def _get_traditional_futures(
         self,

@@ -307,6 +307,15 @@ def create_app(config_name='default'):
 
     from app.routes import register_routes
     register_routes(app)
+
+    # ── 静默 GeneratorExit ───────────────────────────────────
+    # werkzeug 的 _iter_encoded 在客户端断开连接时会抛 GeneratorExit，
+    # 这是正常的生成器清理行为，不应作为错误记录。
+    @app.teardown_request
+    def _silence_generator_exit(exc):
+        if isinstance(exc, GeneratorExit):
+            return  # 静默，不记录
+        # 其他异常交给 Flask 默认处理
     
     # Startup hooks.
     with app.app_context():

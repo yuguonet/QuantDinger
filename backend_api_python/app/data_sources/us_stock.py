@@ -1,6 +1,21 @@
 """
-美股数据源
-使用 yfinance 和 finnhub 获取数据
+=============================================
+美股数据源 (US Stock Data Source)
+=============================================
+
+数据源: yfinance (主) + Finnhub (实时报价优先)
+
+支持功能:
+    - K线获取 (get_kline): 1m ~ 1W
+    - 实时报价 (get_ticker): Finnhub优先, 降级 yfinance fast_info
+    - 自动日期范围计算
+
+熔断保护: 海外源熔断器 (2次失败 / 15min冷却)
+    - 仅异常触发熔断，空结果不计数
+
+依赖:
+    - yfinance (必需)
+    - finnhub   (可选, 需 FINNHUB_API_KEY)
 """
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
@@ -8,6 +23,7 @@ from datetime import datetime, timedelta
 import yfinance as yf
 
 from app.data_sources.base import BaseDataSource
+from app.data_sources.circuit_breaker import get_overseas_circuit_breaker
 from app.utils.logger import get_logger
 from app.config import APIKeys, YFinanceConfig
 
@@ -45,6 +61,7 @@ class USStockDataSource(BaseDataSource):
     }
     
     def __init__(self):
+        self.cb = get_overseas_circuit_breaker()
         # 初始化 finnhub 作为备选
         self.finnhub_client = None
         try:
@@ -175,8 +192,11 @@ class USStockDataSource(BaseDataSource):
         before_time: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         """获取美股K线数据"""
+        if not self.cb.is_available(self.name):
+            return []
+
         klines = []
-        
+
         try:
             interval = self.INTERVAL_MAP.get(timeframe, '1d')
             days_func = self.DAYS_MAP.get(timeframe, lambda x: x + 1)
@@ -206,11 +226,16 @@ class USStockDataSource(BaseDataSource):
             
             # 过滤和限制
             klines = self.filter_and_limit(klines, limit, before_time)
-            
+
             # 记录结果
             self.log_result(symbol, klines, timeframe)
-            
+
+            if klines:
+                self.cb.record_success(self.name)
+            # 空结果不触发熔断（可能是合法的：休市、代码不存在）
+
         except Exception as e:
+            self.cb.record_failure(self.name, str(e))
             logger.error(f"Failed to fetch US stock K-lines {symbol}: {str(e)}")
             import traceback
             logger.error(traceback.format_exc())

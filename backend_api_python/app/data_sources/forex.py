@@ -1,6 +1,24 @@
 """
-外汇数据源
+=============================================
+外汇数据源 (Forex Data Source)
+=============================================
+
 三级降级: Twelve Data → Tiingo → yfinance
+
+支持品种: XAUUSD(黄金), XAGUSD(白银), EURUSD, GBPUSD, USDJPY 等主流外汇对
+
+支持功能:
+    - K线获取 (get_kline): 1m ~ 1D (日线以上周期依赖数据源能力)
+    - 实时报价 (get_ticker): 三级降级获取最新价
+
+熔断保护: 海外源熔断器 (2次失败 / 15min冷却)
+    - 三级降级全部失败才返回空，空结果不触发熔断
+
+依赖:
+    - yfinance     (必需, 降级兜底)
+    - requests     (Twelve Data / Tiingo API)
+    - TWELVE_DATA_API_KEY  (可选, 主数据源)
+    - TIINGO_API_KEY       (可选, 降级数据源)
 """
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
@@ -11,6 +29,7 @@ import threading
 import yfinance as yf
 
 from app.data_sources.base import BaseDataSource, TIMEFRAME_SECONDS
+from app.data_sources.circuit_breaker import get_overseas_circuit_breaker
 from app.utils.logger import get_logger
 from app.config import TiingoConfig, APIKeys
 
@@ -111,6 +130,7 @@ class ForexDataSource(BaseDataSource):
     }
 
     def __init__(self):
+        self.cb = get_overseas_circuit_breaker()
         self.base_url = TiingoConfig.BASE_URL
         td_key = _get_td_api_key()
         tiingo_key = APIKeys.TIINGO_API_KEY
@@ -311,6 +331,10 @@ class ForexDataSource(BaseDataSource):
         获取外汇K线数据
         Priority: Twelve Data → Tiingo → yfinance
         """
+        if not self.cb.is_available(self.name):
+            return []
+
+        errors = []
         for fetcher in (
             self._get_kline_twelvedata,
             self._get_kline_tiingo,
@@ -319,9 +343,16 @@ class ForexDataSource(BaseDataSource):
             try:
                 bars = fetcher(symbol, timeframe, limit, before_time)
                 if bars:
+                    self.cb.record_success(self.name)
                     return bars
             except Exception as e:
+                errors.append(str(e))
                 logger.debug("Forex kline fetcher %s failed for %s: %s", fetcher.__name__, symbol, e)
+
+        # 所有降级源均无数据；至少有一个抛异常 → 触发熔断
+        if errors:
+            self.cb.record_failure(self.name, f"all fallbacks failed: {errors[0][:120]}")
+        # 全部返回空但无异常（如休市）→ 不熔断
         return []
 
     def _get_kline_twelvedata(

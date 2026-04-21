@@ -4,13 +4,33 @@
 熔断器模块 (Circuit Breaker)
 ===================================
 
-参考 daily_stock_analysis 项目实现
-用于管理数据源的熔断/冷却状态，避免连续失败时反复请求
+管理数据源的熔断/冷却状态，避免连续失败时反复请求导致雪崩。
 
 状态机:
-CLOSED（正常） --失败N次--> OPEN（熔断）--冷却时间到--> HALF_OPEN（半开）
-HALF_OPEN --成功--> CLOSED
-HALF_OPEN --失败--> OPEN
+    CLOSED（正常） --连续失败N次--> OPEN（熔断）--冷却时间到--> HALF_OPEN（半开）
+    HALF_OPEN --成功--> CLOSED
+    HALF_OPEN --失败--> OPEN
+
+双策略:
+    - 国内数据源（宽松）:  failure_threshold=5, cooldown=5min, half_open_max=2
+    - 海外数据源（严格）:  failure_threshold=2, cooldown=15min, half_open_max=1
+
+使用方式:
+    from app.data_sources.circuit_breaker import (
+        get_realtime_circuit_breaker,   # 国内源
+        get_overseas_circuit_breaker,   # 海外源
+    )
+    cb = get_overseas_circuit_breaker()
+    if not cb.is_available("source_name"):
+        return  # 跳过该数据源
+    # ... 发起请求 ...
+    if ok:
+        cb.record_success("source_name")
+    else:
+        cb.record_failure("source_name", error="reason")
+
+线程安全: 各状态字典操作非原子性，但 CPython GIL 保证单字典操作安全。
+多线程并发写同一 source 时存在极小概率的状态竞争，实际场景可忽略。
 """
 
 import time
@@ -94,6 +114,7 @@ class CircuitBreaker:
         if state['state'] == CircuitState.HALF_OPEN:
             # 半开状态下限制请求次数
             if state['half_open_calls'] < self.half_open_max_calls:
+                state['half_open_calls'] += 1
                 return True
             return False
         
@@ -117,11 +138,11 @@ class CircuitBreaker:
         """记录失败请求"""
         state = self._get_state(source)
         current_time = time.time()
-        
+
         state['failures'] += 1
         state['last_failure_time'] = current_time
         state['last_error'] = error
-        
+
         if state['state'] == CircuitState.HALF_OPEN:
             # 半开状态下失败，继续熔断
             state['state'] = CircuitState.OPEN
@@ -130,6 +151,7 @@ class CircuitBreaker:
         elif state['failures'] >= self.failure_threshold:
             # 达到阈值，进入熔断
             state['state'] = CircuitState.OPEN
+            state['half_open_calls'] = 0
             logger.warning(f"[熔断器] {source} 连续失败 {state['failures']} 次，进入熔断状态 "
                           f"(冷却 {self.cooldown_seconds}s)")
             if error:
@@ -161,14 +183,30 @@ class CircuitBreaker:
 # 全局熔断器实例
 # ============================================
 
-# 实时行情熔断器（更严格的策略）
-_realtime_circuit_breaker = CircuitBreaker(
-    failure_threshold=2,      # 连续失败2次熔断
-    cooldown_seconds=180.0,   # 冷却3分钟
-    half_open_max_calls=1
+# ── 国内数据源熔断器（宽松策略）──
+# 国内源（腾讯/东方财富/新浪/AkShare）接口相对稳定，网络抖动多为临时性的
+# 允许更多失败次数，冷却时间更短，半开状态多试几次再判定
+_domestic_circuit_breaker = CircuitBreaker(
+    failure_threshold=5,      # 连续失败5次才熔断
+    cooldown_seconds=300.0,   # 冷却5分钟
+    half_open_max_calls=2     # 半开状态尝试2次
+)
+
+# ── 海外数据源熔断器（严格策略）──
+# 海外源（CCXT/Finnhub/yfinance/TwelveData/Tiingo）受网络波动、代理不稳定、
+# API 限流等因素影响更大，应更快熔断、更长冷却，避免雪崩式重试
+_overseas_circuit_breaker = CircuitBreaker(
+    failure_threshold=2,      # 连续失败2次即熔断
+    cooldown_seconds=900.0,   # 冷却15分钟
+    half_open_max_calls=1     # 半开状态只试1次
 )
 
 
 def get_realtime_circuit_breaker() -> CircuitBreaker:
-    """获取实时行情熔断器"""
-    return _realtime_circuit_breaker
+    """获取国内数据源熔断器（宽松策略）"""
+    return _domestic_circuit_breaker
+
+
+def get_overseas_circuit_breaker() -> CircuitBreaker:
+    """获取海外数据源熔断器（严格策略）"""
+    return _overseas_circuit_breaker

@@ -1,12 +1,27 @@
 """
-加密货币数据源
-使用 CCXT (Coinbase) 获取数据
+=============================================
+加密货币数据源 (Crypto Data Source)
+=============================================
+
+数据源: CCXT (默认 Binance, 可配置其他交易所)
+
+支持功能:
+    - K线获取 (get_kline): 所有标准周期 (1m ~ 1W)
+    - 实时报价 (get_ticker): CCXT fetch_ticker
+    - 符号自动规范化: BTCUSDT → BTC/USDT
+    - 分页获取历史数据 (before_time)
+
+熔断保护: 海外源熔断器 (2次失败 / 15min冷却)
+    - 仅异常触发熔断，空结果不计数
+
+代理: 支持 PROXY_URL / HTTPS_PROXY 环境变量
 """
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime, timedelta
 import ccxt
 
 from app.data_sources.base import BaseDataSource, TIMEFRAME_SECONDS
+from app.data_sources.circuit_breaker import get_overseas_circuit_breaker
 from app.utils.logger import get_logger
 from app.config import CCXTConfig, APIKeys
 
@@ -25,6 +40,8 @@ class CryptoDataSource(BaseDataSource):
     COMMON_QUOTES = ['USDT', 'USD', 'BTC', 'ETH', 'BUSD', 'USDC', 'BNB', 'EUR', 'GBP']
     
     def __init__(self):
+        self.cb = get_overseas_circuit_breaker()
+
         config = {
             'timeout': CCXTConfig.TIMEOUT,
             'enableRateLimit': CCXTConfig.ENABLE_RATE_LIMIT
@@ -237,8 +254,11 @@ class CryptoDataSource(BaseDataSource):
         before_time: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         """获取加密货币K线数据"""
+        if not self.cb.is_available(self.name):
+            return []
+
         klines = []
-        
+
         try:
             ccxt_timeframe = self.TIMEFRAME_MAP.get(timeframe, '1d')
             
@@ -278,6 +298,7 @@ class CryptoDataSource(BaseDataSource):
 
             # Concise trace so backtest logs can correlate requested window with actual window
             if klines:
+                self.cb.record_success(self.name)
                 try:
                     from datetime import datetime as _dt
                     first_ts = _dt.utcfromtimestamp(klines[0]['time']).isoformat()
@@ -288,8 +309,10 @@ class CryptoDataSource(BaseDataSource):
                     )
                 except Exception:
                     pass
+            # 空结果不触发熔断（可能是合法的：休市、代码不存在、时间范围无数据）
 
         except Exception as e:
+            self.cb.record_failure(self.name, str(e))
             logger.error(f"Failed to fetch crypto K-lines {symbol}: {str(e)}")
             import traceback
             logger.error(traceback.format_exc())
