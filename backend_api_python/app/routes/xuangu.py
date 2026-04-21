@@ -21,7 +21,6 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 xuangu_bp = Blueprint("xuangu", __name__)
 
-
 # ================================================================
 # GET /  — 概览（公开）
 # ================================================================
