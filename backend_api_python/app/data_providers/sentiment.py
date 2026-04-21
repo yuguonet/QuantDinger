@@ -1,500 +1,1004 @@
 """
 =============================================
-市场情绪指标模块 (Market Sentiment Indicators)
+市场情绪指标模块 v2 — 多源降级版 (修复版)
 =============================================
 
-获取并缓存 7 个核心宏观情绪指标，每个指标独立缓存 + 时间戳。
+每个指标 ≥4 个数据源，按实际响应速度排序：
+    启动时探测所有源 → 按延迟排序 → 写入 _SOURCE_PRIORITY
+    每个 fetcher 按优先级逐个尝试，失败自动降级
+
+源优先级规则:
+    1. 探测最快排最前（国内直连的源通常排前面）
+    2. yfinance 固定排最后（垫底）
+    3. akshare 固定排倒数第二
 
 指标与 TTL:
-    恐贪指数 (Fear & Greed)    4h    alternative.me (加密货币恐贪)
-    VIX (CBOE 波动率)          5min  yfinance → akshare 降级
-    VXN (纳斯达克波动率)        5min  yfinance
-    DXY (美元指数)              10min yfinance → akshare 降级
-    收益率曲线 (10Y-2Y)         10min yfinance (^TNX, ^TYX)
-    GVZ (黄金波动率)            10min yfinance
-    VIX 期限结构 (VIX/VIX3M)    5min  yfinance
-
-缓存策略:
-    - 每个指标以 ``{"data": ..., "ts": ...}`` 格式独立存储
-    - _get_cached_indicator() 检查 ts + TTL 判定是否新鲜
-    - 未超 TTL → 直接返回缓存，不打任何外部 API
-    - 超 TTL → 仅刷新过期的指标，其余保持缓存
-
-调用入口:
-    get_sentiment_data(timeout=10) → Dict   # 主入口，返回全部指标
-    fetch_vix() / fetch_dxy() / ...         # 单独调用（内部也会走独立缓存）
+    恐贪指数 (Fear & Greed)    4h
+    VIX (CBOE 波动率)          5min
+    VXN (纳斯达克波动率)        5min
+    DXY (美元指数)              10min
+    收益率曲线 (10Y-2Y)         10min
+    GVZ (黄金波动率)            10min
+    VIX 期限结构 (VIX/VIX3M)    5min
 
 依赖:
-    - yfinance (VIX/DXY/GVZ/VXN/收益率曲线 主数据源)
-    - requests  (恐贪指数 API)
-    - akshare   (VIX/DXY 降级，可选)
+    - requests   (必须)
+    - akshare    (可选，倒数第二降级)
+    - yfinance   (可选，最终降级)
 """
 from __future__ import annotations
 
 import time
+import statistics
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from typing import Any, Dict, Optional
 
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# ---------------------------------------------------------------------------
-# Per-indicator cache configuration
-# ---------------------------------------------------------------------------
+# ============================================================================
+# 超时配置
+# ============================================================================
 
-_INDICATOR_CACHE_TTL: Dict[str, int] = {
-    "fear_greed":   14400,   # 4h — 恐贪指数每天更新一次
-    "vix":          300,     # 5min — 美股盘中活跃
-    "dxy":          600,     # 10min — 美元指数
-    "yield_curve":  600,     # 10min — 收益率曲线
-    "vxn":          300,     # 5min
-    "gvz":          600,     # 10min — 金波动率
-    "vix_term":     300,     # 5min — VIX期限结构
+_FIRST_TIMEOUT = 5       # 首个源的超时（秒）
+_FALLBACK_TIMEOUT = 1.5  # 降级源的超时（秒，快速跳过）
+
+# ============================================================================
+# 数据源定义
+# ============================================================================
+
+@dataclass
+class DataSource:
+    """一个数据源的描述。"""
+    name: str
+    source_type: str        # "api" | "module"
+    description: str
+    latency_ms: float = 0.0
+    available: bool = True
+    priority: int = 99
+
+    def __repr__(self):
+        status = "✅" if self.available else "❌"
+        return f"{status} {self.name} ({self.latency_ms:.0f}ms)"
+
+
+# ============================================================================
+# 源注册表
+# ============================================================================
+
+_PROBE_ENDPOINTS: Dict[str, Dict[str, Any]] = {
+    "sina":       {"url": "http://hq.sinajs.cn/list=int_vix",           "timeout": 5},
+    "tencent":    {"url": "https://qt.gtimg.cn/q=usVIX",                "timeout": 5},
+    "eastmoney":  {"url": "https://push2.eastmoney.com/api/qt/stock/get?secid=100.VIX&fields=f43", "timeout": 5},
+    "twelvedata": {"url": "https://api.twelvedata.com/quote?symbol=VIX&apikey=test", "timeout": 5},
+    "altme":      {"url": "https://api.alternative.me/fng/?limit=1",    "timeout": 5},
+    "fx678":      {"url": "https://www.fx678.com/",                     "timeout": 5},
+    "akshare":    {"url": None, "timeout": 0},
+    "yfinance":   {"url": None, "timeout": 0},
 }
 
-# Cache key prefix
-_CK = "sentiment_"
+_INDICATOR_SOURCES: Dict[str, List[str]] = {
+    "fear_greed":  ["altme", "coinglass_scrape", "akshare_a_fear", "self_built"],
+    "vix":         ["sina", "tencent", "eastmoney", "twelvedata", "akshare", "yfinance"],
+    "vxn":         ["sina", "tencent", "eastmoney", "twelvedata", "akshare", "yfinance"],
+    "dxy":         ["sina", "eastmoney", "twelvedata", "tencent", "fx678", "akshare", "yfinance"],
+    "yield_curve": ["twelvedata", "sina", "eastmoney", "tencent", "akshare", "yfinance"],
+    "gvz":         ["sina", "eastmoney", "twelvedata", "akshare", "yfinance"],
+    "vix_term":    ["sina", "eastmoney", "twelvedata", "akshare", "yfinance"],
+}
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+_INDICATOR_CACHE_TTL: Dict[str, int] = {
+    "fear_greed":   14400,   # 4h
+    "vix":          300,     # 5min
+    "dxy":          600,     # 10min
+    "yield_curve":  600,     # 10min
+    "vxn":          300,     # 5min
+    "gvz":          600,     # 10min
+    "vix_term":     300,     # 5min
+}
+
+_source_descriptions: Dict[str, str] = {
+    "sina":       "新浪财经 API (hq.sinajs.cn) — 国内直连",
+    "tencent":    "腾讯财经 API (qt.gtimg.cn) — 国内直连",
+    "eastmoney":  "东方财富 API (push2.eastmoney.com) — 国内直连",
+    "twelvedata": "Twelve Data API — 国内可连，免费 800次/天",
+    "altme":      "alternative.me — 加密恐贪指数 API",
+    "coinglass_scrape": "CoinGlass 爬取（未实现）",
+    "akshare_a_fear": "AkShare A股恐贪指数",
+    "self_built": "自建恐贪（未实现）",
+    "fx678":      "汇通网 (fx678.com) — 外汇数据",
+    "akshare":    "AkShare Python 库 — 国内友好，覆盖广",
+    "yfinance":   "yfinance Python 库 — 最后降级，国内可能不稳定",
+}
+
+
+# ============================================================================
+# 可选模块懒加载（线程安全）
+# ============================================================================
+
+import threading as _threading
+
+_ak = None
+_yf = None
+_ak_loaded = False
+_yf_loaded = False
+_load_lock = _threading.Lock()
+
+
+def _get_ak():
+    global _ak, _ak_loaded
+    if not _ak_loaded:
+        with _load_lock:
+            if not _ak_loaded:  # double-checked locking
+                _ak_loaded = True
+                try:
+                    import akshare as ak_mod
+                    _ak = ak_mod
+                    logger.info("akshare loaded successfully")
+                except ImportError:
+                    _ak = None
+                    logger.warning("akshare not installed")
+    return _ak
+
+
+def _get_yf():
+    global _yf, _yf_loaded
+    if not _yf_loaded:
+        with _load_lock:
+            if not _yf_loaded:
+                _yf_loaded = True
+                try:
+                    import yfinance as yf_mod
+                    _yf = yf_mod
+                    logger.info("yfinance loaded successfully")
+                except ImportError:
+                    _yf = None
+                    logger.warning("yfinance not installed")
+    return _yf
+
+
+# ============================================================================
+# 速度探测
+# ============================================================================
+
+def _probe_source(name: str) -> Tuple[str, float, bool]:
+    """探测单个源的可达性和延迟，返回 (name, latency_ms, available)。"""
+    ep = _PROBE_ENDPOINTS.get(name)
+    if ep is None or ep.get("url") is None:
+        return (name, 5000.0, True)
+
+    url = ep["url"]
+    timeout = ep.get("timeout", 5)
+    latencies = []
+
+    for _ in range(3):  # 测 3 次取中位数
+        try:
+            t0 = time.monotonic()
+            r = requests.get(url, timeout=timeout)
+            elapsed = (time.monotonic() - t0) * 1000
+            if r.status_code < 500:
+                latencies.append(elapsed)
+            else:
+                latencies.append(timeout * 1000)
+        except Exception:
+            latencies.append(timeout * 1000)
+
+    median_ms = statistics.median(latencies) if latencies else 99999
+    available = median_ms < (timeout * 1000 * 0.9)
+    return (name, median_ms, available)
+
+
+def probe_all_sources() -> Dict[str, DataSource]:
+    """并行探测所有源，返回 {name: DataSource}。"""
+    results: Dict[str, DataSource] = {}
+
+    logger.info("Probing all data sources...")
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = {ex.submit(_probe_source, name): name for name in _PROBE_ENDPOINTS}
+        for f in as_completed(futures, timeout=20):
+            name = futures[f]
+            try:
+                _, latency, avail = f.result()
+            except Exception:
+                latency, avail = 99999, False
+
+            ds = DataSource(
+                name=name,
+                source_type="api" if _PROBE_ENDPOINTS[name].get("url") else "module",
+                description=_source_descriptions.get(name, ""),
+                latency_ms=latency,
+                available=avail,
+            )
+            results[name] = ds
+            logger.info("  %s: %.0fms %s", name, latency, "✅" if avail else "❌")
+
+    if "akshare" in results:
+        results["akshare"].priority = 90
+    if "yfinance" in results:
+        results["yfinance"].priority = 99
+
+    return results
+
+
+# ============================================================================
+# 源优先级管理
+# ============================================================================
+
+_SOURCE_PRIORITY: Dict[str, List[str]] = {}
+
+
+def build_source_priority(probe_results: Dict[str, DataSource]) -> None:
+    global _SOURCE_PRIORITY
+
+    for indicator, sources in _INDICATOR_SOURCES.items():
+        scored: List[Tuple[str, float]] = []
+        for src in sources:
+            ds = probe_results.get(src)
+            if ds is None:
+                scored.append((src, 88888))
+            elif not ds.available:
+                scored.append((src, 99999))
+            else:
+                scored.append((src, ds.latency_ms))
+
+        final: List[Tuple[str, float]] = []
+        for src, lat in scored:
+            if src == "akshare":
+                final.append((src, 90000))
+            elif src == "yfinance":
+                final.append((src, 99999))
+            else:
+                final.append((src, lat))
+
+        final.sort(key=lambda x: x[1])
+        _SOURCE_PRIORITY[indicator] = [s for s, _ in final]
+
+    logger.info("Source priority built:")
+    for ind, srcs in _SOURCE_PRIORITY.items():
+        logger.info("  %s: %s", ind, " → ".join(srcs))
+
+
+def get_source_priority(indicator: str) -> List[str]:
+    return _SOURCE_PRIORITY.get(indicator, _INDICATOR_SOURCES.get(indicator, []))
+
+
+def get_data_source_table() -> Dict[str, Any]:
+    table = {}
+    for indicator in _INDICATOR_SOURCES:
+        srcs = get_source_priority(indicator)
+        entries = []
+        for i, src in enumerate(srcs):
+            ds = _probe_cache.get(src)
+            entries.append({
+                "rank": i + 1,
+                "name": src,
+                "description": _source_descriptions.get(src, ""),
+                "latency_ms": round(ds.latency_ms, 0) if ds else "N/A",
+                "available": ds.available if ds else False,
+            })
+        table[indicator] = entries
+    return table
+
+
+# ============================================================================
+# 探测结果缓存
+# ============================================================================
+
+_probe_cache: Dict[str, DataSource] = {}
+
+
+def init_sources() -> None:
+    global _probe_cache
+    _probe_cache = probe_all_sources()
+    build_source_priority(_probe_cache)
+    logger.info("Data sources initialized.")
+
+
+# ============================================================================
+# 缓存层
+# ============================================================================
 
 def _cache() -> Any:
-    """Lazy accessor for CacheManager singleton."""
     from app.utils.cache import CacheManager
     return CacheManager()
 
 
-def _get_cached_indicator(name: str) -> Optional[Dict[str, Any]]:
-    """Return cached indicator if it exists and hasn't expired, else None.
+_CK = "sentiment_"
 
-    Each entry is stored as ``{"data": <payload>, "ts": <unix>}``.
-    """
-    cm = _cache()
-    raw = cm.get(f"{_CK}{name}")
-    if not raw:
-        return None
-    data = raw.get("data")
-    ts = raw.get("ts", 0)
-    ttl = _INDICATOR_CACHE_TTL.get(name, 300)
-    if data is not None and (time.time() - ts) < ttl:
-        return data
+
+def _get_cached_indicator(name: str) -> Optional[Dict[str, Any]]:
+    try:
+        cm = _cache()
+        raw = cm.get(f"{_CK}{name}")
+        if not raw:
+            return None
+        data = raw.get("data")
+        ts = raw.get("ts", 0)
+        ttl = _INDICATOR_CACHE_TTL.get(name, 300)
+        if data is not None and (time.time() - ts) < ttl:
+            return data
+    except Exception as e:
+        logger.warning("Cache read failed for %s: %s", name, e)
     return None
 
 
 def _set_cached_indicator(name: str, data: Dict[str, Any]) -> None:
-    """Write indicator data with a timestamp."""
-    cm = _cache()
-    ttl = _INDICATOR_CACHE_TTL.get(name, 300)
-    cm.set(f"{_CK}{name}", {"data": data, "ts": int(time.time())}, ttl=ttl * 2)
-    # TTL on the cache entry itself is 2× the logical TTL so stale entries
-    # survive in Redis/memory a bit longer (we check freshness ourselves).
-
-
-def _fresh(key: str, fetcher) -> Dict[str, Any]:
-    """Return cached data if fresh, otherwise call *fetcher*, cache & return."""
-    cached = _get_cached_indicator(key)
-    if cached is not None:
-        return cached
     try:
-        data = fetcher()
+        cm = _cache()
+        ttl = _INDICATOR_CACHE_TTL.get(name, 300)
+        cm.set(f"{_CK}{name}", {"data": data, "ts": int(time.time())}, ttl=ttl * 2)
     except Exception as e:
-        logger.error("_fresh(%s) fetcher failed: %s", key, e)
-        data = {}
-    _set_cached_indicator(key, data)
-    return data
+        logger.warning("Cache write failed for %s: %s", name, e)
 
 
-# ---------------------------------------------------------------------------
-# Individual fetchers
-# ---------------------------------------------------------------------------
+# ============================================================================
+# 通用 HTTP 工具
+# ============================================================================
 
-def fetch_fear_greed_index() -> Dict[str, Any]:
-    """Fetch Fear & Greed Index from alternative.me (crypto)."""
+def _safe_float(text: str, default: float = 0.0) -> float:
+    """安全地将字符串转为 float，失败返回 default。"""
     try:
-        url = "https://api.alternative.me/fng/?limit=1"
-        logger.debug("Fetching Fear & Greed Index from %s", url)
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
+        val = float(text.strip())
+        return val if val == val else default  # NaN 检查
+    except (ValueError, TypeError, AttributeError):
+        return default
 
-        if data.get("data"):
-            item = data["data"][0]
-            value = int(item.get("value", 50))
-            classification = item.get("value_classification", "Neutral")
-            logger.info("Fear & Greed Index fetched: %d (%s)", value, classification)
-            return {
-                "value": value,
-                "classification": classification,
-                "timestamp": int(item.get("timestamp", 0)),
-                "source": "alternative.me",
-            }
-        else:
-            logger.warning("Fear & Greed API returned empty data")
-    except requests.exceptions.Timeout:
-        logger.error("Fear & Greed Index request timeout")
-    except requests.exceptions.RequestException as e:
-        logger.error("Fear & Greed Index request failed: %s", e)
+
+def _safe_get_json(url: str, params: Optional[Dict] = None, timeout: int = 5) -> Dict[str, Any]:
+    """安全 HTTP GET，返回 JSON 或空 dict。"""
+    try:
+        r = requests.get(url, params=params, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
     except Exception as e:
-        logger.error("Failed to fetch Fear & Greed Index: %s", e)
+        logger.debug("HTTP GET %s failed: %s", url, e)
+        return {}
 
-    logger.warning("Returning default Fear & Greed value (50)")
-    return {"value": 50, "classification": "Neutral", "timestamp": 0, "source": "N/A"}
 
+# ============================================================================
+# 新浪系列
+# ============================================================================
+
+def _try_sina_vix(timeout: float = 5) -> Dict[str, Any]:
+    r = requests.get("http://hq.sinajs.cn/list=int_vix", timeout=timeout)
+    r.raise_for_status()
+    parts = r.text.split(",")
+    if len(parts) < 3:
+        raise ValueError(f"Sina VIX: unexpected response format ({len(parts)} fields)")
+    val = _safe_float(parts[2])
+    if val <= 0:
+        raise ValueError(f"Sina VIX: invalid value {val}")
+    return {"value": val, "source": "sina"}
+
+
+def _try_sina_vxn(timeout: float = 5) -> Dict[str, Any]:
+    r = requests.get("http://hq.sinajs.cn/list=int_vxn", timeout=timeout)
+    r.raise_for_status()
+    parts = r.text.split(",")
+    if len(parts) < 3:
+        raise ValueError(f"Sina VXN: unexpected response format")
+    val = _safe_float(parts[2])
+    if val <= 0:
+        raise ValueError(f"Sina VXN: invalid value {val}")
+    return {"value": val, "source": "sina"}
+
+
+def _try_sina_gvz(timeout: float = 5) -> Dict[str, Any]:
+    r = requests.get("http://hq.sinajs.cn/list=int_gvz", timeout=timeout)
+    r.raise_for_status()
+    parts = r.text.split(",")
+    if len(parts) < 3:
+        raise ValueError(f"Sina GVZ: unexpected response format")
+    val = _safe_float(parts[2])
+    if val <= 0:
+        raise ValueError(f"Sina GVZ: invalid value {val}")
+    return {"value": val, "source": "sina"}
+
+
+def _try_sina_dxy(timeout: float = 5) -> Dict[str, Any]:
+    r = requests.get("http://hq.sinajs.cn/list=fx_susdind", timeout=timeout)
+    r.raise_for_status()
+    parts = r.text.split(",")
+    if len(parts) < 2:
+        raise ValueError(f"Sina DXY: unexpected response format")
+    val = _safe_float(parts[1])
+    if val <= 0:
+        raise ValueError(f"Sina DXY: invalid value {val}")
+    return {"value": val, "source": "sina"}
+
+
+def _try_sina_yield(timeout: float = 5) -> Dict[str, Any]:
+    r = requests.get("http://hq.sinajs.cn/list=bond_us02y,bond_us10y", timeout=timeout)
+    r.raise_for_status()
+    lines = r.text.strip().split("\n")
+    if len(lines) < 2:
+        raise ValueError(f"Sina Yield: expected 2 lines, got {len(lines)}")
+    y2_parts = lines[0].split(",")
+    y10_parts = lines[1].split(",")
+    y2 = _safe_float(y2_parts[1]) if len(y2_parts) > 1 else 0
+    y10 = _safe_float(y10_parts[1]) if len(y10_parts) > 1 else 0
+    if y2 <= 0 or y10 <= 0:
+        raise ValueError(f"Sina Yield: invalid values y2={y2} y10={y10}")
+    return {"yield_10y": y10, "yield_2y": y2, "spread": round(y10 - y2, 3), "source": "sina"}
+
+
+# ============================================================================
+# 腾讯系列
+# ============================================================================
+
+def _parse_tencent_vix_response(text: str, label: str) -> float:
+    """解析腾讯行情返回的 ~ 分隔字段，取价格字段。"""
+    parts = text.split("~")
+    if len(parts) < 5:
+        raise ValueError(f"Tencent {label}: unexpected format ({len(parts)} fields)")
+    val = _safe_float(parts[3])
+    if val <= 0:
+        raise ValueError(f"Tencent {label}: invalid value {val}")
+    return val
+
+
+def _try_tencent_vix(timeout: float = 5) -> Dict[str, Any]:
+    r = requests.get("https://qt.gtimg.cn/q=usVIX", timeout=timeout)
+    r.raise_for_status()
+    val = _parse_tencent_vix_response(r.text, "VIX")
+    return {"value": val, "source": "tencent"}
+
+
+def _try_tencent_vxn(timeout: float = 5) -> Dict[str, Any]:
+    r = requests.get("https://qt.gtimg.cn/q=usVXN", timeout=timeout)
+    r.raise_for_status()
+    val = _parse_tencent_vix_response(r.text, "VXN")
+    return {"value": val, "source": "tencent"}
+
+
+def _try_tencent_dxy(timeout: float = 5) -> Dict[str, Any]:
+    r = requests.get("https://qt.gtimg.cn/q=fx_susdind", timeout=timeout)
+    r.raise_for_status()
+    val = _parse_tencent_vix_response(r.text, "DXY")
+    return {"value": val, "source": "tencent"}
+
+
+# ============================================================================
+# 东方财富系列
+# ============================================================================
+
+def _try_eastmoney(symbol: str, timeout: float = 5) -> Dict[str, Any]:
+    r = requests.get(
+        "https://push2.eastmoney.com/api/qt/stock/get",
+        params={"secid": symbol, "fields": "f43,f44,f45,f46,f170,f171"},
+        timeout=timeout
+    )
+    r.raise_for_status()
+    data = r.json().get("data")
+    if not data:
+        raise ValueError(f"Eastmoney {symbol}: empty data in response")
+    raw_val = data.get("f43")
+    if raw_val is None or raw_val == "":
+        raise ValueError(f"Eastmoney {symbol}: f43 field missing")
+    # f43 通常是放大100倍的整数（如 VIX=2015 表示 20.15），但也可能是直接值
+    val = _safe_float(str(raw_val))
+    if val > 1000:
+        val = val / 100  # 按东财惯例还原
+    if val <= 0:
+        raise ValueError(f"Eastmoney {symbol}: invalid value {val}")
+    return {"value": val, "source": "eastmoney"}
+
+
+# ============================================================================
+# Twelve Data 系列
+# ============================================================================
+
+_TD_KEY: str = ""
+
+
+def set_twelvedata_key(key: str) -> None:
+    """设置 Twelve Data API key。"""
+    global _TD_KEY
+    _TD_KEY = key
+
+
+def _get_td_key() -> str:
+    return _TD_KEY
+
+
+def _try_twelvedata(symbol: str, api_key: str = "", timeout: float = 8) -> Dict[str, Any]:
+    key = api_key or _get_td_key()
+    if not key:
+        raise ValueError("TwelveData: API key not set (call set_twelvedata_key())")
+    d = _safe_get_json(
+        "https://api.twelvedata.com/quote",
+        params={"symbol": symbol, "apikey": key},
+        timeout=timeout
+    )
+    if not d or "close" not in d:
+        msg = d.get("message", "unknown error") if d else "empty response"
+        raise ValueError(f"TwelveData {symbol}: {msg}")
+    val = _safe_float(d["close"])
+    if val <= 0:
+        raise ValueError(f"TwelveData {symbol}: invalid value {val}")
+    return {"value": val, "source": "twelvedata"}
+
+
+def _try_twelvedata_yield(api_key: str = "", timeout: float = 8) -> Dict[str, Any]:
+    key = api_key or _get_td_key()
+    d10 = _try_twelvedata("US10Y", key, timeout=timeout)
+    d2 = _try_twelvedata("US2Y", key, timeout=timeout)
+    y10 = d10["value"]
+    y2 = d2["value"]
+    return {"yield_10y": y10, "yield_2y": y2, "spread": round(y10 - y2, 3), "source": "twelvedata"}
+
+
+# ============================================================================
+# alternative.me
+# ============================================================================
+
+def _try_altme_fear(timeout: float = 10) -> Dict[str, Any]:
+    d = _safe_get_json("https://api.alternative.me/fng/?limit=1", timeout=timeout)
+    if not d or not d.get("data"):
+        raise ValueError("alternative.me: empty response")
+    item = d["data"][0]
+    val = _safe_float(item.get("value", "50"))
+    if val <= 0:
+        raise ValueError(f"alternative.me: invalid value {val}")
+    return {
+        "value": int(val),
+        "classification": item.get("value_classification", "Unknown"),
+        "timestamp": int(item.get("timestamp", 0)),
+        "source": "alternative.me",
+    }
+
+
+# ============================================================================
+# 分级解读函数
+# ============================================================================
+
+def _compute_change(current: float, prev: Optional[float]) -> float:
+    if prev and prev != 0:
+        return round(((current - prev) / prev) * 100, 2)
+    return 0.0
+
+
+def _vix_level(val: float) -> Tuple[str, str, str]:
+    if val < 12:
+        return "very_low", "极低波动 - 市场极度乐观", "Very Low - Extreme Optimism"
+    elif val < 20:
+        return "low", "低波动 - 市场稳定", "Low - Market Stable"
+    elif val < 25:
+        return "moderate", "中等波动 - 正常水平", "Moderate - Normal Level"
+    elif val < 30:
+        return "high", "高波动 - 市场担忧", "High - Market Concern"
+    else:
+        return "very_high", "极高波动 - 市场恐慌", "Very High - Market Panic"
+
+
+def _dxy_level(val: float) -> Tuple[str, str, str]:
+    if val > 105:
+        return "strong", "美元强势 - 利空大宗商品/新兴市场", "Strong USD - Bearish commodities/EM"
+    elif val > 100:
+        return "moderate_strong", "美元偏强 - 关注资金流向", "Moderately Strong"
+    elif val > 95:
+        return "neutral", "美元中性 - 市场均衡", "Neutral"
+    elif val > 90:
+        return "moderate_weak", "美元偏弱 - 利多风险资产", "Moderately Weak"
+    else:
+        return "weak", "美元疲软 - 利多黄金/大宗商品", "Weak USD"
+
+
+def _gvz_level(val: float) -> Tuple[str, str, str]:
+    if val < 12:
+        return "very_low", "黄金低波动 - 避险需求低", "Low Gold Vol"
+    elif val < 16:
+        return "low", "黄金稳定 - 市场平静", "Gold Stable"
+    elif val < 20:
+        return "moderate", "黄金中等波动 - 关注避险", "Moderate Gold Vol"
+    elif val < 25:
+        return "high", "黄金高波动 - 避险需求上升", "High Gold Vol"
+    else:
+        return "very_high", "黄金极高波动 - 市场避险", "Very High Gold Vol"
+
+
+def _vxn_level(val: float) -> Tuple[str, str, str]:
+    if val < 15:
+        return "very_low", "科技股极低波动 - 市场乐观", "Very Low Tech Vol"
+    elif val < 22:
+        return "low", "科技股低波动 - 稳定", "Low Tech Vol"
+    elif val < 28:
+        return "moderate", "科技股中等波动 - 正常", "Moderate Tech Vol"
+    elif val < 35:
+        return "high", "科技股高波动 - 谨慎", "High Tech Vol"
+    else:
+        return "very_high", "科技股极高波动 - 恐慌", "Very High Tech Vol"
+
+
+def _yield_level(spread: float) -> Tuple[str, str, str, str]:
+    if spread < -0.5:
+        return "deeply_inverted", "深度倒挂 - 强烈衰退信号", "Deeply Inverted", "bearish"
+    elif spread < 0:
+        return "inverted", "收益率倒挂 - 衰退预警", "Inverted", "bearish"
+    elif spread < 0.5:
+        return "flat", "曲线平坦 - 经济放缓信号", "Flat", "neutral"
+    elif spread < 1.5:
+        return "normal", "正常曲线 - 经济健康", "Normal", "bullish"
+    else:
+        return "steep", "陡峭曲线 - 经济扩张预期", "Steep", "bullish"
+
+
+# ============================================================================
+# 指标 fetcher — 每个按优先级逐源降级
+# ============================================================================
 
 def fetch_vix() -> Dict[str, Any]:
-    """Fetch VIX (CBOE Volatility Index) with multiple fallbacks."""
-    DEFAULT_VIX = {
-        "value": 18, "change": 0, "level": "low",
-        "interpretation": "低波动 - 市场稳定",
-        "interpretation_en": "Low - Market Stable",
-    }
-
-    current = 0.0
-    change = 0.0
-
-    try:
-        import yfinance as yf
-        logger.debug("Fetching VIX from yfinance")
-        ticker = yf.Ticker("^VIX")
-
+    default = {"value": 0, "change": 0, "level": "unknown", "interpretation": "数据获取失败", "interpretation_en": "Data fetch failed", "source": "N/A"}
+    for i, src in enumerate(get_source_priority("vix")):
+        to = _FIRST_TIMEOUT if i == 0 else _FALLBACK_TIMEOUT
         try:
-            hist = ticker.history(period="5d")
-        except Exception as hist_err:
-            logger.warning("yfinance VIX failed: %s", hist_err)
-            hist = None
-
-        if hist is not None and not hist.empty and len(hist) >= 1:
-            current = float(hist["Close"].iloc[-1])
-            if current > 0:
-                prev_close = float(hist["Close"].iloc[-2]) if len(hist) >= 2 else current
-                change = ((current - prev_close) / prev_close) * 100 if prev_close else 0
+            if src == "sina":
+                val = _try_sina_vix(timeout=to)["value"]
+            elif src == "tencent":
+                val = _try_tencent_vix(timeout=to)["value"]
+            elif src == "eastmoney":
+                val = _try_eastmoney("100.VIX", timeout=to)["value"]
+            elif src == "twelvedata":
+                val = _try_twelvedata("VIX", timeout=to)["value"]
+            elif src == "akshare":
+                ak = _get_ak()
+                if ak is None:
+                    raise ImportError("akshare not installed")
+                df = ak.index_vix()
+                val = float(df.iloc[-1]["close"])
+            elif src == "yfinance":
+                yf = _get_yf()
+                if yf is None:
+                    raise ImportError("yfinance not installed")
+                h = yf.Ticker("^VIX").history(period="5d")
+                if h.empty:
+                    raise ValueError("yfinance VIX: empty history")
+                val = float(h["Close"].iloc[-1])
             else:
-                raise ValueError("VIX value is 0")
-        else:
-            raise ValueError("VIX history empty")
+                continue
 
-    except Exception as e:
-        logger.warning("yfinance VIX failed, trying akshare: %s", e)
-
-        try:
-            import akshare as ak
-            vix_df = ak.index_vix()
-            if vix_df is not None and len(vix_df) > 0:
-                current = float(vix_df.iloc[-1]["close"])
-                prev_close = float(vix_df.iloc[-2]["close"]) if len(vix_df) >= 2 else current
-                change = ((current - prev_close) / prev_close) * 100 if prev_close else 0
-                logger.info("VIX from akshare: %.2f", current)
-            else:
-                raise ValueError("Akshare VIX empty")
-        except Exception as ak_err:
-            logger.warning("Akshare VIX also failed: %s", ak_err)
-            return DEFAULT_VIX
-
-    if current <= 0:
-        return DEFAULT_VIX
-
-    if current < 12:
-        level, cn, en = "very_low", "极低波动 - 市场极度乐观", "Very Low - Extreme Optimism"
-    elif current < 20:
-        level, cn, en = "low", "低波动 - 市场稳定", "Low - Market Stable"
-    elif current < 25:
-        level, cn, en = "moderate", "中等波动 - 正常水平", "Moderate - Normal Level"
-    elif current < 30:
-        level, cn, en = "high", "高波动 - 市场担忧", "High - Market Concern"
-    else:
-        level, cn, en = "very_high", "极高波动 - 市场恐慌", "Very High - Market Panic"
-
-    return {
-        "value": round(current, 2), "change": round(change, 2),
-        "level": level, "interpretation": cn, "interpretation_en": en,
-    }
-
-
-def fetch_dollar_index() -> Dict[str, Any]:
-    """Fetch US Dollar Index (DXY) with multiple fallbacks."""
-    DEFAULT_DXY = {
-        "value": 104, "change": 0, "level": "moderate_strong",
-        "interpretation": "美元偏强 - 关注资金流向",
-        "interpretation_en": "Moderately Strong - Watch capital flows",
-    }
-
-    current = 0.0
-    change = 0.0
-
-    try:
-        import yfinance as yf
-        logger.debug("Fetching DXY from yfinance")
-        ticker = yf.Ticker("DX-Y.NYB")
-
-        try:
-            hist = ticker.history(period="5d")
-        except Exception as hist_err:
-            logger.warning("yfinance DXY failed: %s", hist_err)
-            hist = None
-
-        if hist is not None and not hist.empty and len(hist) >= 1:
-            current = float(hist["Close"].iloc[-1])
-            if current > 0:
-                prev_close = float(hist["Close"].iloc[-2]) if len(hist) >= 2 else current
-                change = ((current - prev_close) / prev_close) * 100 if prev_close else 0
-                logger.info("DXY from yfinance: %.2f", current)
-            else:
-                raise ValueError("DXY value is 0")
-        else:
-            raise ValueError("DXY history empty")
-
-    except Exception as e:
-        logger.warning("yfinance DXY failed, trying akshare: %s", e)
-        try:
-            import akshare as ak
-            fx_df = ak.currency_boc_sina(symbol="美元")
-            if fx_df is not None and len(fx_df) > 0:
-                usd_cny = float(fx_df.iloc[-1]["中行汇买价"]) / 100
-                current = usd_cny * 14.5
-                change = 0
-                logger.info("DXY estimated from akshare: %.2f", current)
-            else:
-                raise ValueError("Akshare DXY empty")
-        except Exception as ak_err:
-            logger.warning("Akshare DXY also failed: %s", ak_err)
-            return DEFAULT_DXY
-
-    if current <= 0:
-        return DEFAULT_DXY
-
-    if current > 105:
-        level, cn, en = "strong", "美元强势 - 利空大宗商品/新兴市场", "Strong USD - Bearish commodities/EM"
-    elif current > 100:
-        level, cn, en = "moderate_strong", "美元偏强 - 关注资金流向", "Moderately Strong - Watch capital flows"
-    elif current > 95:
-        level, cn, en = "neutral", "美元中性 - 市场均衡", "Neutral - Market balanced"
-    elif current > 90:
-        level, cn, en = "moderate_weak", "美元偏弱 - 利多风险资产", "Moderately Weak - Bullish risk assets"
-    else:
-        level, cn, en = "weak", "美元疲软 - 利多黄金/大宗商品", "Weak USD - Bullish gold/commodities"
-
-    logger.info("DXY fetched: %.2f (%s)", current, level)
-    return {
-        "value": round(current, 2), "change": round(change, 2),
-        "level": level, "interpretation": cn, "interpretation_en": en,
-    }
-
-
-def fetch_yield_curve() -> Dict[str, Any]:
-    """Fetch Treasury Yield Curve (10Y - 2Y spread)."""
-    try:
-        import yfinance as yf
-        logger.debug("Fetching Treasury Yield Curve")
-
-        tnx = yf.Ticker("^TNX")
-        try:
-            tnx_hist = tnx.history(period="5d")
-        except Exception as hist_err:
-            logger.warning("TNX history fetch failed: %s", hist_err)
-            tnx_hist = None
-
-        if tnx_hist is None or tnx_hist.empty:
-            logger.warning("TNX history is None or empty, returning default")
-            return {
-                "yield_10y": 4.2, "yield_2y": 4.0, "spread": 0.2, "change": 0,
-                "level": "normal", "interpretation": "数据暂不可用",
-                "interpretation_en": "Data temporarily unavailable", "signal": "neutral",
-            }
-
-        if len(tnx_hist) >= 1:
-            yield_10y = tnx_hist["Close"].iloc[-1]
-            try:
-                tyx = yf.Ticker("^TYX")
-                tyx_hist = tyx.history(period="5d")
-                yield_30y = tyx_hist["Close"].iloc[-1] if len(tyx_hist) >= 1 else 0  # noqa: F841
-                yield_2y = yield_10y * 0.85
-                spread = yield_10y - yield_2y
-                if len(tnx_hist) >= 2:
-                    prev_10y = tnx_hist["Close"].iloc[-2]
-                    prev_2y = prev_10y * 0.85
-                    prev_spread = prev_10y - prev_2y
-                    yc_change = spread - prev_spread
-                else:
-                    yc_change = 0
-            except Exception:
-                yield_2y = yield_10y * 0.85
-                spread = yield_10y - yield_2y
-                yc_change = 0
-        else:
-            yield_10y = yield_2y = spread = yc_change = 0
-
-        if spread < -0.5:
-            level, cn, en, signal = "deeply_inverted", "深度倒挂 - 强烈衰退信号", "Deeply Inverted - Strong recession signal", "bearish"
-        elif spread < 0:
-            level, cn, en, signal = "inverted", "收益率倒挂 - 衰退预警", "Inverted - Recession warning", "bearish"
-        elif spread < 0.5:
-            level, cn, en, signal = "flat", "曲线平坦 - 经济放缓信号", "Flat - Economic slowdown signal", "neutral"
-        elif spread < 1.5:
-            level, cn, en, signal = "normal", "正常曲线 - 经济健康", "Normal - Healthy economy", "bullish"
-        else:
-            level, cn, en, signal = "steep", "陡峭曲线 - 经济扩张预期", "Steep - Economic expansion expected", "bullish"
-
-        logger.info("Yield Curve: 10Y=%.2f%%, spread=%.2f%% (%s)", yield_10y, spread, level)
-        return {
-            "yield_10y": round(yield_10y, 2), "yield_2y": round(yield_2y, 2),
-            "spread": round(spread, 2), "change": round(yc_change, 3),
-            "level": level, "signal": signal, "interpretation": cn, "interpretation_en": en,
-        }
-    except Exception as e:
-        logger.error("Failed to fetch Yield Curve: %s", e, exc_info=True)
-        return {
-            "yield_10y": 0, "yield_2y": 0, "spread": 0, "change": 0,
-            "level": "unknown", "signal": "neutral",
-            "interpretation": "数据获取失败", "interpretation_en": "Data fetch failed",
-        }
+            if val <= 0:
+                continue
+            level, cn, en = _vix_level(val)
+            logger.info("VIX: %.2f from %s", val, src)
+            return {"value": round(val, 2), "change": 0, "level": level, "interpretation": cn, "interpretation_en": en, "source": src}
+        except Exception as e:
+            logger.warning("VIX source %s failed: %s", src, e)
+            continue
+    return default
 
 
 def fetch_vxn() -> Dict[str, Any]:
-    """Fetch NASDAQ Volatility Index (VXN)."""
-    try:
-        import yfinance as yf
-        logger.debug("Fetching VXN from yfinance")
-        ticker = yf.Ticker("^VXN")
-        hist = ticker.history(period="5d")
+    default = {"value": 0, "change": 0, "level": "unknown", "interpretation": "数据获取失败", "interpretation_en": "Data fetch failed", "source": "N/A"}
+    for i, src in enumerate(get_source_priority("vxn")):
+        to = _FIRST_TIMEOUT if i == 0 else _FALLBACK_TIMEOUT
+        try:
+            if src == "sina":
+                val = _try_sina_vxn(timeout=to)["value"]
+            elif src == "tencent":
+                val = _try_tencent_vxn(timeout=to)["value"]
+            elif src == "eastmoney":
+                val = _try_eastmoney("100.VXN", timeout=to)["value"]
+            elif src == "twelvedata":
+                val = _try_twelvedata("VXN", timeout=to)["value"]
+            elif src == "akshare":
+                raise NotImplementedError("akshare has no VXN interface — skipping to next source")
+            elif src == "yfinance":
+                yf = _get_yf()
+                if yf is None:
+                    raise ImportError("yfinance not installed")
+                h = yf.Ticker("^VXN").history(period="5d")
+                if h.empty:
+                    raise ValueError("yfinance VXN: empty history")
+                val = float(h["Close"].iloc[-1])
+            else:
+                continue
 
-        if len(hist) >= 2:
-            prev_close = hist["Close"].iloc[-2]
-            current = hist["Close"].iloc[-1]
-            change = ((current - prev_close) / prev_close) * 100
-        elif len(hist) == 1:
-            current = hist["Close"].iloc[-1]
-            change = 0
-        else:
-            current = change = 0
+            if val <= 0:
+                continue
+            level, cn, en = _vxn_level(val)
+            return {"value": round(val, 2), "change": 0, "level": level, "interpretation": cn, "interpretation_en": en, "source": src}
+        except Exception as e:
+            logger.warning("VXN source %s failed: %s", src, e)
+            continue
+    return default
 
-        if current < 15:
-            level, cn, en = "very_low", "科技股极低波动 - 市场乐观", "Very Low Tech Volatility - Optimistic"
-        elif current < 22:
-            level, cn, en = "low", "科技股低波动 - 稳定", "Low Tech Volatility - Stable"
-        elif current < 28:
-            level, cn, en = "moderate", "科技股中等波动 - 正常", "Moderate Tech Volatility - Normal"
-        elif current < 35:
-            level, cn, en = "high", "科技股高波动 - 谨慎", "High Tech Volatility - Caution"
-        else:
-            level, cn, en = "very_high", "科技股极高波动 - 恐慌", "Very High Tech Volatility - Panic"
 
-        logger.info("VXN fetched: %.2f (%s)", current, level)
-        return {"value": round(current, 2), "change": round(change, 2), "level": level, "interpretation": cn, "interpretation_en": en}
-    except Exception as e:
-        logger.error("Failed to fetch VXN: %s", e, exc_info=True)
-        return {"value": 0, "change": 0, "level": "unknown", "interpretation": "数据获取失败", "interpretation_en": "Data fetch failed"}
+def fetch_dollar_index() -> Dict[str, Any]:
+    default = {"value": 0, "change": 0, "level": "unknown", "interpretation": "数据获取失败", "interpretation_en": "Data fetch failed", "source": "N/A"}
+    for i, src in enumerate(get_source_priority("dxy")):
+        to = _FIRST_TIMEOUT if i == 0 else _FALLBACK_TIMEOUT
+        try:
+            if src == "sina":
+                val = _try_sina_dxy(timeout=to)["value"]
+            elif src == "eastmoney":
+                val = _try_eastmoney("133.USDX", timeout=to)["value"]
+            elif src == "twelvedata":
+                val = _try_twelvedata("USD/IDX", timeout=to)["value"]
+            elif src == "tencent":
+                val = _try_tencent_dxy(timeout=to)["value"]
+            elif src == "fx678":
+                raise NotImplementedError("fx678 scraping not yet implemented")
+            elif src == "akshare":
+                ak = _get_ak()
+                if ak is None:
+                    raise ImportError("akshare not installed")
+                df = ak.futures_foreign_hist(symbol="DINI")
+                if df is None or df.empty:
+                    raise ValueError("akshare DXY: empty data")
+                val = float(df.iloc[-1]["close"])
+            elif src == "yfinance":
+                yf = _get_yf()
+                if yf is None:
+                    raise ImportError("yfinance not installed")
+                h = yf.Ticker("DX-Y.NYB").history(period="5d")
+                if h.empty:
+                    raise ValueError("yfinance DXY: empty history")
+                val = float(h["Close"].iloc[-1])
+            else:
+                continue
+
+            if val <= 0:
+                continue
+            level, cn, en = _dxy_level(val)
+            logger.info("DXY: %.2f from %s", val, src)
+            return {"value": round(val, 2), "change": 0, "level": level, "interpretation": cn, "interpretation_en": en, "source": src}
+        except Exception as e:
+            logger.warning("DXY source %s failed: %s", src, e)
+            continue
+    return default
+
+
+def fetch_yield_curve() -> Dict[str, Any]:
+    default = {"yield_10y": 0, "yield_2y": 0, "spread": 0, "change": 0, "level": "unknown", "signal": "neutral", "interpretation": "数据获取失败", "interpretation_en": "Data fetch failed", "source": "N/A"}
+    for i, src in enumerate(get_source_priority("yield_curve")):
+        to = _FIRST_TIMEOUT if i == 0 else _FALLBACK_TIMEOUT
+        try:
+            if src == "sina":
+                d = _try_sina_yield(timeout=to)
+                y10, y2 = d["yield_10y"], d["yield_2y"]
+            elif src == "twelvedata":
+                d = _try_twelvedata_yield(timeout=to)
+                y10, y2 = d["yield_10y"], d["yield_2y"]
+            elif src == "eastmoney":
+                d10 = _try_eastmoney("101.US10Y", timeout=to)
+                d2 = _try_eastmoney("101.US02Y", timeout=to)
+                y10, y2 = d10["value"], d2["value"]
+            elif src == "tencent":
+                r = requests.get("https://qt.gtimg.cn/q=usTNX", timeout=to)
+                r.raise_for_status()
+                parts = r.text.split("~")
+                y10 = _safe_float(parts[3]) if len(parts) > 3 else 0
+                y2 = y10 * 0.85  # 粗略估算
+                if y10 <= 0:
+                    raise ValueError(f"Tencent TNX: invalid value {y10}")
+            elif src == "akshare":
+                ak = _get_ak()
+                if ak is None:
+                    raise ImportError("akshare not installed")
+                df = ak.bond_zh_us_rate()
+                if df is None or df.empty:
+                    raise ValueError("akshare bond_zh_us_rate: empty data")
+                last = df.iloc[-1]
+                # akshare bond_zh_us_rate 返回的列名可能因版本不同而变化
+                # 常见列名: 中国:国债收益率:10年, 中国:国债收益率:2年 或 10Y, 2Y
+                y10 = 0
+                y2 = 0
+                for col in last.index:
+                    col_lower = str(col).lower()
+                    if "10" in col_lower and ("年" in col_lower or "y" in col_lower):
+                        y10 = _safe_float(str(last[col]))
+                    elif "2" in col_lower and ("年" in col_lower or "y" in col_lower):
+                        y2 = _safe_float(str(last[col]))
+                if y10 <= 0 or y2 <= 0:
+                    raise ValueError(f"akshare bond: could not extract 10Y/2Y from columns {list(df.columns)}")
+            elif src == "yfinance":
+                yf = _get_yf()
+                if yf is None:
+                    raise ImportError("yfinance not installed")
+                tnx_h = yf.Ticker("^TNX").history(period="5d")
+                if tnx_h.empty:
+                    raise ValueError("yfinance TNX: empty history")
+                y10 = float(tnx_h["Close"].iloc[-1])
+                y2 = y10 * 0.85  # 粗略估算（yfinance 无稳定 2Y ticker）
+            else:
+                continue
+
+            if y10 <= 0 or y2 <= 0:
+                continue
+            spread = round(y10 - y2, 3)
+            level, cn, en, signal = _yield_level(spread)
+            logger.info("Yield Curve: 10Y=%.2f 2Y=%.2f spread=%.3f from %s", y10, y2, spread, src)
+            return {
+                "yield_10y": round(y10, 2), "yield_2y": round(y2, 2),
+                "spread": spread, "change": 0,
+                "level": level, "signal": signal,
+                "interpretation": cn, "interpretation_en": en,
+                "source": src,
+            }
+        except Exception as e:
+            logger.warning("Yield Curve source %s failed: %s", src, e)
+            continue
+    return default
 
 
 def fetch_gvz() -> Dict[str, Any]:
-    """Fetch Gold Volatility Index (GVZ)."""
-    try:
-        import yfinance as yf
-        logger.debug("Fetching GVZ from yfinance")
-        ticker = yf.Ticker("^GVZ")
-        hist = ticker.history(period="5d")
+    default = {"value": 0, "change": 0, "level": "unknown", "interpretation": "数据获取失败", "interpretation_en": "Data fetch failed", "source": "N/A"}
+    for i, src in enumerate(get_source_priority("gvz")):
+        to = _FIRST_TIMEOUT if i == 0 else _FALLBACK_TIMEOUT
+        try:
+            if src == "sina":
+                val = _try_sina_gvz(timeout=to)["value"]
+            elif src == "eastmoney":
+                val = _try_eastmoney("100.GVZ", timeout=to)["value"]
+            elif src == "twelvedata":
+                val = _try_twelvedata("GVZ", timeout=to)["value"]
+            elif src == "akshare":
+                raise NotImplementedError("akshare has no GVZ interface")
+            elif src == "yfinance":
+                yf = _get_yf()
+                if yf is None:
+                    raise ImportError("yfinance not installed")
+                h = yf.Ticker("^GVZ").history(period="5d")
+                if h.empty:
+                    raise ValueError("yfinance GVZ: empty history")
+                val = float(h["Close"].iloc[-1])
+            else:
+                continue
 
-        if len(hist) >= 2:
-            prev_close = hist["Close"].iloc[-2]
-            current = hist["Close"].iloc[-1]
-            change = ((current - prev_close) / prev_close) * 100
-        elif len(hist) == 1:
-            current = hist["Close"].iloc[-1]
-            change = 0
-        else:
-            current = change = 0
+            if val <= 0:
+                continue
+            level, cn, en = _gvz_level(val)
+            return {"value": round(val, 2), "change": 0, "level": level, "interpretation": cn, "interpretation_en": en, "source": src}
+        except Exception as e:
+            logger.warning("GVZ source %s failed: %s", src, e)
+            continue
+    return default
 
-        if current < 12:
-            level, cn, en = "very_low", "黄金低波动 - 避险需求低", "Low Gold Vol - Low safe haven demand"
-        elif current < 16:
-            level, cn, en = "low", "黄金稳定 - 市场平静", "Gold Stable - Market calm"
-        elif current < 20:
-            level, cn, en = "moderate", "黄金中等波动 - 关注避险情绪", "Moderate Gold Vol - Watch safe haven"
-        elif current < 25:
-            level, cn, en = "high", "黄金高波动 - 避险需求上升", "High Gold Vol - Rising safe haven demand"
-        else:
-            level, cn, en = "very_high", "黄金极高波动 - 市场避险", "Very High Gold Vol - Flight to safety"
 
-        logger.info("GVZ fetched: %.2f (%s)", current, level)
-        return {"value": round(current, 2), "change": round(change, 2), "level": level, "interpretation": cn, "interpretation_en": en}
-    except Exception as e:
-        logger.error("Failed to fetch GVZ: %s", e, exc_info=True)
-        return {"value": 0, "change": 0, "level": "unknown", "interpretation": "数据获取失败", "interpretation_en": "Data fetch failed"}
+def fetch_fear_greed_index() -> Dict[str, Any]:
+    default = {"value": 50, "classification": "Neutral", "timestamp": 0, "source": "N/A"}
+    for i, src in enumerate(get_source_priority("fear_greed")):
+        to = _FIRST_TIMEOUT if i == 0 else _FALLBACK_TIMEOUT
+        try:
+            if src in ("altme", "alternative.me"):
+                d = _try_altme_fear(timeout=to)
+            elif src == "akshare_a_fear":
+                ak = _get_ak()
+                if ak is None:
+                    raise ImportError("akshare not installed")
+                df = ak.index_fear_greed()
+                if df is None or df.empty:
+                    raise ValueError("akshare fear_greed: empty data")
+                val = int(df.iloc[-1]["fear_greed"])
+                d = {"value": val, "classification": "见AkShare", "source": "akshare"}
+            elif src == "coinglass_scrape":
+                raise NotImplementedError("CoinGlass scraping not yet implemented")
+            elif src == "self_built":
+                raise NotImplementedError("Self-built fear/greed not yet implemented")
+            else:
+                continue
+
+            val = d.get("value", 0)
+            if val <= 0:
+                continue
+            logger.info("Fear & Greed: %d from %s", val, d.get("source", src))
+            return {
+                "value": val,
+                "classification": d.get("classification", ""),
+                "timestamp": d.get("timestamp", 0),
+                "source": d.get("source", src),
+            }
+        except Exception as e:
+            logger.warning("Fear/Greed source %s failed: %s", src, e)
+            continue
+    return default
 
 
 def fetch_put_call_ratio() -> Dict[str, Any]:
-    """Calculate Put/Call Ratio proxy using VIX term structure."""
-    try:
-        import yfinance as yf
-        logger.debug("Calculating Put/Call Ratio proxy")
+    default = {"value": 1.0, "vix": 0, "vix3m": 0, "change": 0, "level": "unknown", "signal": "neutral", "interpretation": "数据获取失败", "interpretation_en": "Data fetch failed", "source": "N/A"}
 
-        vix = yf.Ticker("^VIX")
-        vix3m = yf.Ticker("^VIX3M")
+    for i, src in enumerate(get_source_priority("vix_term")):
+        to = _FIRST_TIMEOUT if i == 0 else _FALLBACK_TIMEOUT
+        vix_val = 0.0
+        vix3m_val = 0.0
+        used_source = src
+        try:
+            if src == "sina":
+                r1 = requests.get("http://hq.sinajs.cn/list=int_vix", timeout=to)
+                r1.raise_for_status()
+                vix_val = _safe_float(r1.text.split(",")[2])
+                if vix_val <= 0:
+                    raise ValueError(f"Sina VIX for term structure: invalid value")
+                # VIX3M — 尝试东财
+                try:
+                    vix3m_val = _try_eastmoney("100.VIX3M", timeout=to)["value"]
+                    used_source = "sina+eastmoney"
+                except Exception:
+                    vix3m_val = vix_val * 0.85  # 估算 fallback
+                    used_source = "sina(estimated_vix3m)"
 
-        vix_hist = vix.history(period="5d")
-        vix3m_hist = vix3m.history(period="5d")
+            elif src == "eastmoney":
+                vix_val = _try_eastmoney("100.VIX", timeout=to)["value"]
+                vix3m_val = _try_eastmoney("100.VIX3M", timeout=to)["value"]
 
-        vix_val = vix3m_val = 0.0
+            elif src == "twelvedata":
+                vix_val = _try_twelvedata("VIX", timeout=to)["value"]
+                vix3m_val = _try_twelvedata("VIX3M", timeout=to)["value"]
 
-        if len(vix_hist) >= 1 and len(vix3m_hist) >= 1:
-            vix_val = vix_hist["Close"].iloc[-1]
-            vix3m_val = vix3m_hist["Close"].iloc[-1]
-            ratio = vix_val / vix3m_val if vix3m_val > 0 else 1.0
+            elif src == "akshare":
+                ak = _get_ak()
+                if ak is None:
+                    raise ImportError("akshare not installed")
+                df = ak.index_vix()
+                if df is None or df.empty:
+                    raise ValueError("akshare VIX term: empty data")
+                vix_val = float(df.iloc[-1]["close"])
+                vix3m_val = vix_val * 0.85
+                used_source = "akshare(estimated_vix3m)"
 
-            if len(vix_hist) >= 2 and len(vix3m_hist) >= 2:
-                prev_ratio = vix_hist["Close"].iloc[-2] / vix3m_hist["Close"].iloc[-2] if vix3m_hist["Close"].iloc[-2] > 0 else 1.0
-                change = ((ratio - prev_ratio) / prev_ratio) * 100
+            elif src == "yfinance":
+                yf = _get_yf()
+                if yf is None:
+                    raise ImportError("yfinance not installed")
+                h1 = yf.Ticker("^VIX").history(period="5d")
+                h3 = yf.Ticker("^VIX3M").history(period="5d")
+                if h1.empty or h3.empty:
+                    raise ValueError("yfinance VIX/VIX3M: empty history")
+                vix_val = float(h1["Close"].iloc[-1])
+                vix3m_val = float(h3["Close"].iloc[-1])
             else:
-                change = 0
-        else:
-            ratio = 1.0
-            change = 0
+                continue
 
-        if ratio > 1.15:
-            level, cn, en, signal = "high_fear", "VIX倒挂 - 短期恐慌情绪高涨", "VIX Backwardation - High short-term fear", "bearish"
-        elif ratio > 1.0:
-            level, cn, en, signal = "elevated", "轻度倒挂 - 市场谨慎", "Slight Backwardation - Market cautious", "neutral"
-        elif ratio > 0.9:
-            level, cn, en, signal = "normal", "正常结构 - 市场稳定", "Normal Structure - Market stable", "neutral"
-        elif ratio > 0.8:
-            level, cn, en, signal = "complacent", "深度正价差 - 市场自满", "Deep Contango - Market complacent", "bullish"
-        else:
-            level, cn, en, signal = "extreme_complacency", "极度自满 - 警惕反转", "Extreme Complacency - Watch for reversal", "neutral"
+            if vix_val <= 0 or vix3m_val <= 0:
+                logger.warning("VIX Term source %s: invalid values vix=%s vix3m=%s", src, vix_val, vix3m_val)
+                continue
 
-        logger.info("VIX Term Structure: ratio=%.3f (%s)", ratio, level)
-        return {
-            "value": round(ratio, 3), "vix": round(vix_val, 2), "vix3m": round(vix3m_val, 2),
-            "change": round(change, 2), "level": level, "signal": signal,
-            "interpretation": cn, "interpretation_en": en,
-        }
-    except Exception as e:
-        logger.error("Failed to calculate Put/Call proxy: %s", e, exc_info=True)
-        return {
-            "value": 1.0, "vix": 0, "vix3m": 0, "change": 0,
-            "level": "unknown", "signal": "neutral",
-            "interpretation": "数据获取失败", "interpretation_en": "Data fetch failed",
-        }
+            ratio = vix_val / vix3m_val
+
+            if ratio > 1.15:
+                level, cn, en, signal = "high_fear", "VIX倒挂 - 短期恐慌情绪高涨", "Backwardation - High fear", "bearish"
+            elif ratio > 1.0:
+                level, cn, en, signal = "elevated", "轻度倒挂 - 市场谨慎", "Slight Backwardation", "neutral"
+            elif ratio > 0.9:
+                level, cn, en, signal = "normal", "正常结构 - 市场稳定", "Normal Structure", "neutral"
+            elif ratio > 0.8:
+                level, cn, en, signal = "complacent", "深度正价差 - 市场自满", "Deep Contango - Complacent", "bullish"
+            else:
+                level, cn, en, signal = "extreme_complacency", "极度自满 - 警惕反转", "Extreme Complacency", "neutral"
+
+            logger.info("VIX Term: ratio=%.3f VIX=%.2f VIX3M=%.2f from %s", ratio, vix_val, vix3m_val, used_source)
+            return {
+                "value": round(ratio, 3), "vix": round(vix_val, 2), "vix3m": round(vix3m_val, 2),
+                "change": 0, "level": level, "signal": signal,
+                "interpretation": cn, "interpretation_en": en, "source": used_source,
+            }
+        except Exception as e:
+            logger.warning("VIX Term source %s failed: %s", src, e)
+            continue
+
+    return default
 
 
-# ---------------------------------------------------------------------------
-# Unified entry point — per-indicator caching with timestamps
-# ---------------------------------------------------------------------------
+# ============================================================================
+# 统一入口
+# ============================================================================
 
 def get_sentiment_data(timeout: int = 10) -> Dict[str, Any]:
-    """Return comprehensive sentiment data with per-indicator caching.
+    """返回全部 7 个指标，每个独立缓存 + 独立降级链。"""
+    timeout = max(1, min(timeout, 60))  # clamp 1~60s
 
-    Each indicator is cached independently with its own TTL.  If data exists
-    and hasn't exceeded its TTL, the cached value is returned directly — no
-    external API call is made for that indicator.
+    # 确保源优先级已初始化（首次调用时自动探测）
+    if not _SOURCE_PRIORITY:
+        try:
+            init_sources()
+        except Exception as e:
+            logger.warning("init_sources() failed, using default order: %s", e)
 
-    The returned dict always contains a top-level ``"fetched_at"`` (unix
-    timestamp of when this bundle was assembled) plus per-indicator
-    ``"_cached_at"`` fields so callers know exactly when each value was last
-    refreshed.
-    """
     fetchers = {
         "fear_greed":  fetch_fear_greed_index,
         "vix":         fetch_vix,
@@ -507,7 +1011,6 @@ def get_sentiment_data(timeout: int = 10) -> Dict[str, Any]:
 
     results: Dict[str, Any] = {}
 
-    # Separate cached vs. stale indicators
     stale_keys = []
     for key in fetchers:
         cached = _get_cached_indicator(key)
@@ -516,43 +1019,67 @@ def get_sentiment_data(timeout: int = 10) -> Dict[str, Any]:
         else:
             stale_keys.append(key)
 
-    # Fetch only stale indicators in parallel
     if stale_keys:
-        logger.info("get_sentiment_data: fetching %d stale indicators: %s",
-                    len(stale_keys), stale_keys)
-        with ThreadPoolExecutor(max_workers=len(stale_keys)) as executor:
-            futures = {executor.submit(fetchers[k]): k for k in stale_keys}
+        logger.info("Fetching %d stale indicators: %s", len(stale_keys), stale_keys)
+        with ThreadPoolExecutor(max_workers=min(len(stale_keys), 7)) as ex:
+            futures = {ex.submit(fetchers[k]): k for k in stale_keys}
             try:
-                for future in as_completed(futures, timeout=timeout):
-                    key = futures[future]
+                for f in as_completed(futures, timeout=timeout):
+                    key = futures[f]
                     try:
-                        data = future.result(timeout=5)
+                        data = f.result(timeout=5)
                         results[key] = data
                         _set_cached_indicator(key, data)
                     except Exception as e:
-                        logger.error("get_sentiment_data: failed to fetch %s: %s", key, e)
+                        logger.error("Failed to fetch %s: %s", key, e)
                         results[key] = None
             except Exception:
-                logger.warning("get_sentiment_data: total timeout (%ss), %d/%d indicators fetched",
+                logger.warning("Total timeout (%ss), %d/%d indicators fetched",
                                timeout, len(results), len(fetchers))
                 for fut, key in futures.items():
                     if key not in results:
                         results[key] = None
-    else:
-        logger.debug("get_sentiment_data: all indicators cached and fresh")
+            # 注意: Python ThreadPoolExecutor 无法强制终止线程，
+            # 未完成的线程会在内部 timeout 后自行退出，不会永久泄漏。
 
     now = int(time.time())
-
-    # Assemble final payload — always return full structure with defaults
-    data = {
-        "fear_greed":  results.get("fear_greed")  or {"value": 50, "classification": "Neutral"},
-        "vix":         results.get("vix")         or {"value": 0, "level": "unknown"},
-        "dxy":         results.get("dxy")         or {"value": 0, "level": "unknown"},
-        "yield_curve": results.get("yield_curve") or {"spread": 0, "level": "unknown"},
-        "vxn":         results.get("vxn")         or {"value": 0, "level": "unknown"},
-        "gvz":         results.get("gvz")         or {"value": 0, "level": "unknown"},
-        "vix_term":    results.get("vix_term")    or {"value": 1.0, "level": "unknown"},
+    return {
+        "fear_greed":  results.get("fear_greed")  or {"value": 50, "classification": "Neutral", "source": "default"},
+        "vix":         results.get("vix")         or {"value": 0, "level": "unknown", "source": "default"},
+        "dxy":         results.get("dxy")         or {"value": 0, "level": "unknown", "source": "default"},
+        "yield_curve": results.get("yield_curve") or {"spread": 0, "level": "unknown", "source": "default"},
+        "vxn":         results.get("vxn")         or {"value": 0, "level": "unknown", "source": "default"},
+        "gvz":         results.get("gvz")         or {"value": 0, "level": "unknown", "source": "default"},
+        "vix_term":    results.get("vix_term")    or {"value": 1.0, "level": "unknown", "source": "default"},
         "fetched_at":  now,
     }
 
-    return data
+
+# ============================================================================
+# 数据源表输出
+# ============================================================================
+
+def print_source_table() -> str:
+    lines = []
+    lines.append("=" * 90)
+    lines.append(f"{'指标':<16} {'排序':<4} {'数据源':<16} {'延迟(ms)':<10} {'状态':<6} {'说明'}")
+    lines.append("-" * 90)
+
+    for indicator in _INDICATOR_SOURCES:
+        srcs = get_source_priority(indicator)
+        for i, src in enumerate(srcs):
+            ds = _probe_cache.get(src)
+            lat = f"{ds.latency_ms:.0f}" if ds else "N/A"
+            status = "✅" if (ds and ds.available) else "❌"
+            desc = _source_descriptions.get(src, "")
+            tag = ""
+            if i == 0:
+                tag = "←主力"
+            elif src == "akshare":
+                tag = "←倒二"
+            elif src == "yfinance":
+                tag = "←垫底"
+            lines.append(f"{indicator if i == 0 else '':<16} {i+1:<4} {src:<16} {lat:<10} {status:<6} {desc} {tag}")
+        lines.append("-" * 90)
+
+    return "\n".join(lines)
