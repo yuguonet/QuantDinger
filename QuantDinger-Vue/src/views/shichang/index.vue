@@ -143,6 +143,7 @@
 
 <script>
 import * as echarts from 'echarts'
+import request from '@/utils/request'
 import StreakCard from './StreakCard.vue'
 import DragonTigerCard from './DragonTigerCard.vue'
 import HotListCard from './HotListCard.vue'
@@ -229,9 +230,7 @@ function calcEmotionIndex (limitUp, limitDown, upRatio) {
  * 一次性获取所有情绪数据（改用后端 /api/shichang/overview，不依赖 devServer proxy）
  */
 async function fetchAllSentiment () {
-  const res = await fetch('/api/shichang/overview')
-  if (!res.ok) throw new Error(`情绪数据请求失败: ${res.status}`)
-  const d = await res.json()
+  const d = await request({ url: '/api/shichang/overview', method: 'GET' })
   const data = d?.data || d
 
   const limitUp = data.limitUp || 0
@@ -398,13 +397,8 @@ export default {
     async fetchEmotionHistory () {
       if (this.isDestroyed) return
       try {
-        const res = await fetch('/api/shichang/emotion/history?hours=4')
-        if (!res.ok) {
-          console.warn('[情绪图表] 接口返回异常:', res.status)
-          return
-        }
+        const d = await request({ url: '/api/shichang/emotion/history', method: 'GET', params: { hours: 4 } })
         if (this.isDestroyed) return
-        const d = await res.json()
         this.emotionHistory = d.history || []
         this.renderChart()
         console.log('[情绪图表] 已刷新:', this.emotionHistory.length, '个点')

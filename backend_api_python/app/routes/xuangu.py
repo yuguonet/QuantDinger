@@ -133,7 +133,7 @@ def table_stats():
 # ================================================================
 
 def _ensure_strategies_table():
-    """确保 qd_user_strategies 表存在，按需建表"""
+    """确保 qd_user_strategies 表存在，按需建表；已有表自动修正列宽"""
     ddl = """
     CREATE TABLE IF NOT EXISTS qd_user_strategies (
         id          SERIAL PRIMARY KEY,
@@ -147,10 +147,19 @@ def _ensure_strategies_table():
     CREATE INDEX IF NOT EXISTS idx_qdus_user_id
         ON qd_user_strategies (user_id);
     """
+    alter_sql = """
+    ALTER TABLE qd_user_strategies ALTER COLUMN name TYPE VARCHAR(100);
+    ALTER TABLE qd_user_strategies ALTER COLUMN description TYPE VARCHAR(500);
+    """
     try:
         with get_db_connection() as conn:
             cur = conn.cursor()
             cur.execute(ddl)
+            # 兼容旧表：如果列宽不够，自动扩宽
+            try:
+                cur.execute(alter_sql)
+            except Exception:
+                pass  # 列宽已正确时 ALTER 无副作用，忽略
             conn.commit()
             cur.close()
     except Exception as e:
@@ -213,6 +222,8 @@ def save_favorite():
 
     data = request.get_json() or {}
     user_id = _safe_user_id(data)
+    if not user_id:
+        return jsonify({"code": 401, "msg": "请先登录"}), 401
     strategy_id = data.get("id")
     name = (data.get("name") or "").strip()
     conditions = data.get("conditions")
@@ -278,6 +289,8 @@ def save_favorite():
 def delete_favorite(strategy_id: int):
     """删除收藏策略"""
     user_id = _safe_user_id()
+    if not user_id:
+        return jsonify({"code": 401, "msg": "请先登录"}), 401
     _ensure_strategies_table()
 
     try:
@@ -355,6 +368,8 @@ def add_to_watchlist():
 
     # user_id: 优先从token取，其次从请求体取，默认0（未登录）
     user_id = _safe_user_id(data)
+    if not user_id:
+        return jsonify({"code": 401, "msg": "请先登录"}), 401
     stocks = data.get("stocks") or []
     if not stocks:
         return jsonify({"code": 1, "msg": "未选择任何股票"}), 400
@@ -449,6 +464,8 @@ def get_watchlist():
 def remove_from_watchlist(item_id: int):
     """从自选股中删除"""
     user_id = _safe_user_id()
+    if not user_id:
+        return jsonify({"code": 401, "msg": "请先登录"}), 401
     _ensure_watchlist_table()
 
     try:

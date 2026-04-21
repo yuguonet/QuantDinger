@@ -255,6 +255,7 @@ import 'element-ui/lib/theme-chalk/index.css'
 import FilterPanel, { getDefaultFilters } from './components/FilterPanel.vue'
 import { getWatchlist, addWatchlist, removeWatchlist, getWatchlistPrices } from '@/api/market'
 import { getUserInfo } from '@/api/login'
+import { axios as request } from '@/utils/request'
 
 Vue.config.productionTip = false
 Vue.use(ElementUI)
@@ -349,13 +350,6 @@ export default {
       const n = parseFloat(val)
       return isNaN(n) ? null : n
     },
-    _authHeaders () {
-      const token = localStorage.getItem('token')
-      const h = { 'Content-Type': 'application/json' }
-      if (token) h['Authorization'] = `Bearer ${token}`
-      return h
-    },
-
     tableRowClassName ({ row }) {
       if (row.change_rate != null && row.change_rate > 0) return 'row-up'
       if (row.change_rate != null && row.change_rate < 0) return 'row-down'
@@ -566,16 +560,15 @@ export default {
       }
       this.saving = true
       try {
-        const resp = await fetch('/api/xuangu/favorites', {
-          method: 'POST',
-          headers: this._authHeaders(),
-          body: JSON.stringify({
+        const data = await request({
+          url: '/api/xuangu/favorites',
+          method: 'post',
+          data: {
             name: this.saveForm.name.trim(),
             conditions: { keyword: this.aiQuery },
             description: this.saveForm.description.trim()
-          })
+          }
         })
-        const data = await resp.json()
         if (data.code === 0) {
           this.$message.success(data.msg || '保存成功')
           this.saveDialogVisible = false
@@ -583,7 +576,7 @@ export default {
           this.$message.error(data.msg || '保存失败')
         }
       } catch (e) {
-        this.$message.error('保存失败: ' + e.message)
+        this.$message.error('保存失败: ' + (e.message || ''))
       } finally {
         this.saving = false
       }
@@ -593,11 +586,10 @@ export default {
       this.strategiesDialogVisible = true
       this.strategiesLoading = true
       try {
-        const resp = await fetch('/api/xuangu/favorites', { method: 'GET', headers: this._authHeaders() })
-        const data = await resp.json()
+        const data = await request({ url: '/api/xuangu/favorites', method: 'get' })
         this.myStrategies = data.code === 0 ? (data.data || []) : []
       } catch (e) {
-        this.$message.error('加载失败: ' + e.message)
+        this.$message.error('加载失败: ' + (e.message || ''))
       } finally {
         this.strategiesLoading = false
       }
@@ -622,8 +614,7 @@ export default {
     async deleteStrategy (strategy) {
       try { await this.$confirm(`确定删除策略「${strategy.name}」？`, '确认删除', { type: 'warning' }) } catch (_) { return }
       try {
-        const resp = await fetch(`/api/xuangu/favorites/${strategy.id}`, { method: 'DELETE', headers: this._authHeaders() })
-        const data = await resp.json()
+        const data = await request({ url: `/api/xuangu/favorites/${strategy.id}`, method: 'delete' })
         if (data.code === 0) {
           this.$message.success('已删除')
           this.myStrategies = this.myStrategies.filter(s => s.id !== strategy.id)

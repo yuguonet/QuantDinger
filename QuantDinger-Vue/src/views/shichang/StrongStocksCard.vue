@@ -46,6 +46,7 @@
 
 <script>
 import DetailModal from './DetailModal.vue'
+import request from '@/utils/request'
 
 export default {
   name: 'StrongStocksCard',
@@ -105,9 +106,7 @@ export default {
     async refresh () {
       this.loading = true
       try {
-        const r = await fetch('/api/shichang/strong')
-        if (!r.ok) return
-        const d = await r.json()
+        const d = await request({ url: '/api/shichang/strong', method: 'GET' })
         this.list = (d.strongStocks || []).map(item => ({ ...item, gain: String(item.gain ?? '0') }))
       } catch (e) {
         console.error('强势股刷新失败:', e)
