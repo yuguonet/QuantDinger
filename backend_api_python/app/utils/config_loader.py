@@ -134,6 +134,9 @@ def load_addon_config() -> Dict[str, Any]:
         
         # SerpAPI (Google/Bing scraper)
         ('SERPAPI_KEYS', 'serpapi.api_keys', 'string'),
+
+        # Sogou search (搜狗搜索 — 微信/通用)
+        ('SOGOU_SEARCH_API_KEY', 'sogou.api_key', 'string'),
     ]
 
     for env_name, dotted_key, value_type in mappings:

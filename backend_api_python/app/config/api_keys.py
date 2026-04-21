@@ -134,6 +134,16 @@ class MetaAPIKeys(type):
         val = load_addon_config().get('baidu', {}).get('api_key')
         return val if val else ''
 
+    @property
+    def SOGOU_SEARCH_API_KEY(cls):
+        """Sogou search (搜狗搜索) API key"""
+        env_val = os.getenv('SOGOU_SEARCH_API_KEY', '').strip()
+        if env_val:
+            return env_val
+        from app.utils.config_loader import load_addon_config
+        val = load_addon_config().get('sogou', {}).get('api_key')
+        return val if val else ''
+
 
 class APIKeys(metaclass=MetaAPIKeys):
     """API 密钥配置类"""

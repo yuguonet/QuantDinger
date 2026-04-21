@@ -22,6 +22,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 from itertools import cycle
 from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from app.utils.logger import get_logger
 from app.utils.config_loader import load_addon_config
@@ -62,13 +63,23 @@ class SearchResult:
 
 @dataclass 
 class SearchResponse:
-    """搜索响应"""
+    """搜索响应
+
+    metadata 附加字段 (由 StockNews 等 provider 填充):
+      - composite_score: float  综合评分 0-10 (时间衰减加权)
+      - direction: str          利好/偏利好/中性/偏利空/利空
+      - positive/negative/neutral: int  情绪分布计数
+      - stock_news_count: int   stock_news 来源条数 (search_cn_stock_news 填充)
+      - web_results_added: int  web 去重后追加条数
+      - total_merged: int       合并后总条数
+    """
     query: str
     results: List[SearchResult]
     provider: str  # 使用的搜索引擎
     success: bool = True
     error_message: Optional[str] = None
     search_time: float = 0.0  # 搜索耗时（秒）
+    metadata: Dict[str, Any] = field(default_factory=dict)  # 附加元数据（如综合评分）
     
     def to_context(self, max_results: int = 5) -> str:
         """将搜索结果转换为可用于 AI 分析的上下文"""
@@ -845,14 +856,72 @@ class DuckDuckGoSearchProvider(BaseSearchProvider):
             return []
 
 
+class StockNewsSearchProvider(BaseSearchProvider):
+    """
+    A股个股新闻聚合 Provider (v2.0 — 挂载 stock_news.py)
+
+    特点:
+    - 5路数据源并发: 东方财富、新浪财经、新浪7x24、腾讯财经、凤凰财经
+    - 内置加权情感分析 + 时间衰减综合评分
+    - 输出标准 SearchResult, 评分在 metadata 中
+    - is_available 永远 True (无需 API Key)
+
+    调用链:
+    StockNewsSearchProvider._do_search()
+      → stock_news.fetch_stock_news()
+        → ThreadPoolExecutor 并发调用 5 个 _fetch_*()
+        → _dedup() 标题去重
+        → _calc_composite() 时间衰减综合评分
+        → SearchResponse (metadata 含 composite_score/direction)
+    """
+
+    def __init__(self):
+        super().__init__(['free'], "StockNews")
+
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+        """调用 stock_news.fetch_stock_news 执行搜索"""
+        try:
+            from app.services.stock_news import fetch_stock_news
+            # query 格式: "000858 五粮液" — 第一段是代码, 其余是名称
+            parts = query.strip().split(None, 1)
+            stock_code = parts[0]
+            stock_name = parts[1] if len(parts) > 1 else ""
+
+            resp = fetch_stock_news(
+                stock_code=stock_code,
+                days=min(days, 30),
+                stock_name=stock_name,
+                max_results=max_results or 20,
+            )
+            # provider 名称附带综合评分方向
+            direction = resp.metadata.get("direction", "")
+            score = resp.metadata.get("composite_score", "")
+            resp.provider = f"StockNews({direction} {score}/10)" if direction else "StockNews"
+            return resp
+
+        except Exception as e:
+            return SearchResponse(
+                query=query, results=[], provider="StockNews",
+                success=False, error_message=str(e),
+            )
+
+
 class SearchService:
     """
-    搜索服务
+    搜索服务 v2.1
     
-    功能：
-    1. 管理多个搜索引擎
+    功能:
+    1. 管理多个搜索引擎 (Web) + A股个股新闻 (StockNews)
     2. 自动故障转移
     3. 结果聚合和格式化
+
+    Provider 架构:
+    - _providers: Web 搜索引擎列表 (BochaAI/Baidu/Tavily/SerpAPI/Google/Bing/DuckDuckGo)
+    - _stock_news_provider: A股个股新闻聚合 (独立于 _providers, 通过 search_cn_stock_news 调用)
+
+    核心方法:
+    - search_with_fallback():  Web 搜索 + 故障转移
+    - search_cn_stock_news():  Web + StockNews 并行, 自动去重, stock_news 优先
     """
     
     def __init__(self):
@@ -912,6 +981,10 @@ class SearchService:
         # 6. DuckDuckGo（免费兜底）
         self._providers.append(DuckDuckGoSearchProvider())
         logger.info("已配置 DuckDuckGo 搜索（免费兜底）")
+
+        # 7. A股个股新闻 (stock_news.py) — 国内 A 股专用
+        self._stock_news_provider = StockNewsSearchProvider()
+        logger.info("已配置 A股个股新闻聚合 (StockNews)")
 
         if not any(p.name in ("BochaAI", "Baidu") for p in self._providers):
             logger.warning("未配置国内搜索引擎（BochaAI/百度），建议至少配置一个以保证国内可达性")
@@ -1039,6 +1112,109 @@ class SearchService:
         query = f"{stock_name} ({event_query})"
         
         return self.search_with_fallback(query, max_results=5, days=30)
+
+    def search_cn_stock_news(
+        self,
+        stock_code: str,
+        stock_name: str = "",
+        days: int = 3,
+        max_web_results: int = 5,
+    ) -> SearchResponse:
+        """
+        A股个股新闻搜索 — Web搜索 + stock_news 并行, 自动去重
+
+        架构:
+          ThreadPoolExecutor(2)
+            ├─ f_web:  search_with_fallback()  → Web 搜索引擎 (BochaAI/Baidu/...)
+            └─ f_news: stock_news_provider     → 5 路国内财经直连
+
+          合并策略:
+            1. stock_news 结果先入池 (数据源更精准, 有情感评分)
+            2. web 结果按标题指纹去重, 仅追加不重复的
+            3. 最终按时间降序排列
+
+        Args:
+            stock_code: 6位股票代码
+            stock_name: 股票名称
+            days: 搜索天数
+            max_web_results: Web搜索最大结果数
+
+        Returns:
+            SearchResponse:
+              - results: 合并去重后的 SearchResult 列表
+              - metadata: { composite_score, direction, positive, negative, neutral,
+                            stock_news_count, web_results_added, total_merged }
+              - provider: "StockNews+Web"
+        """
+        import hashlib as _hl
+        start_time = time.time()
+        query = f"{stock_code} {stock_name}".strip()
+
+        def _title_key(r: SearchResult) -> str:
+            norm = re.sub(r'[\s\u3000\uff0c\u3001\u3002\uff01\uff1f\u2014]', '', r.title)
+            return _hl.md5(norm.encode()).hexdigest()[:16]
+
+        # ── 并行: Web搜索 + stock_news ──
+        web_query = f"{stock_name} {stock_code} A股新闻" if stock_name else f"{stock_code} 股票新闻"
+
+        web_resp = None
+        news_resp = None
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_web = pool.submit(self.search_with_fallback, web_query, max_web_results, days)
+            f_news = pool.submit(self._stock_news_provider.search, query, 20, days)
+
+            try:
+                web_resp = f_web.result()
+            except Exception as e:
+                logger.warning(f"Web搜索异常: {e}")
+                web_resp = SearchResponse(query=web_query, results=[], provider="Web",
+                                          success=False, error_message=str(e))
+
+            try:
+                news_resp = f_news.result()
+            except Exception as e:
+                logger.warning(f"StockNews搜索异常: {e}")
+                news_resp = SearchResponse(query=query, results=[], provider="StockNews",
+                                           success=False, error_message=str(e))
+
+        # ── 合并去重: stock_news 优先 (数据源更精准) ──
+        seen = set()
+        merged: List[SearchResult] = []
+
+        for r in news_resp.results:
+            k = _title_key(r)
+            if k not in seen:
+                seen.add(k)
+                merged.append(r)
+
+        # web 结果去重后追加
+        web_added = 0
+        if web_resp.success:
+            for r in web_resp.results:
+                k = _title_key(r)
+                if k not in seen:
+                    seen.add(k)
+                    merged.append(r)
+                    web_added += 1
+
+        # 按时间降序
+        merged.sort(key=lambda r: r.published_date or "", reverse=True)
+
+        elapsed = round(time.time() - start_time, 2)
+        metadata = dict(news_resp.metadata) if news_resp.metadata else {}
+        metadata["web_results_added"] = web_added
+        metadata["stock_news_count"] = len(news_resp.results)
+        metadata["total_merged"] = len(merged)
+
+        return SearchResponse(
+            query=query,
+            results=merged,
+            provider="StockNews+Web",
+            success=len(merged) > 0,
+            search_time=elapsed,
+            metadata=metadata,
+        )
 
 
 # 单例实例
