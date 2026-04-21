@@ -45,6 +45,7 @@
 
 <script>
 import DetailModal from './DetailModal.vue'
+import request from '@/utils/request'
 
 export default {
   name: 'HotListCard',
@@ -87,9 +88,7 @@ export default {
     async refresh () {
       this.loading = true
       try {
-        const r = await fetch('/api/shichang/hot')
-        if (!r.ok) return
-        const d = await r.json()
+        const d = await request({ url: '/api/shichang/hot', method: 'GET' })
         this.list = (d.hotList || []).map((item, i) => ({ ...item, rank: i + 1, change: String(item.change ?? '0') }))
       } catch (e) {
         console.error('热榜刷新失败:', e)

@@ -48,6 +48,7 @@
 
 <script>
 import DetailModal from './DetailModal.vue'
+import request from '@/utils/request'
 
 export default {
   name: 'StreakCard',
@@ -106,9 +107,7 @@ export default {
     async refresh () {
       this.loading = true
       try {
-        const r = await fetch('/api/shichang/streak')
-        if (!r.ok) return
-        const d = await r.json()
+        const d = await request({ url: '/api/shichang/streak', method: 'GET' })
         this.streakStocks = d.streakStocks || []
         this.streakHeight = d.streakHeight || 0
         this.yesterdayStreakStocks = d.yesterdayStreakStocks || []

@@ -12,40 +12,18 @@
   GET  /api/xuangu/watchlist   → 获取自选股列表
   DELETE /api/xuangu/watchlist/<id> → 删除自选股
 """
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, g
 
 from app.utils.db import get_db_connection
-from app.utils.auth import get_current_user_id
+from app.utils.auth import get_current_user_id, login_required
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 xuangu_bp = Blueprint("xuangu", __name__)
 
 
-def _safe_user_id(data=None):
-    """安全获取 user_id：优先 token，其次请求体/参数，默认 0"""
-    uid = get_current_user_id()
-    if uid:
-        try:
-            return int(uid)
-        except (ValueError, TypeError):
-            pass
-    if data and 'user_id' in data:
-        try:
-            return int(data['user_id'])
-        except (ValueError, TypeError):
-            pass
-    uid_str = request.args.get('user_id')
-    if uid_str:
-        try:
-            return int(uid_str)
-        except (ValueError, TypeError):
-            pass
-    return 0
-
-
 # ================================================================
-# GET /  — 概览
+# GET /  — 概览（公开）
 # ================================================================
 @xuangu_bp.route("/")
 def index():
@@ -75,15 +53,9 @@ def index():
 # POST /sync — 触发数据同步
 # ================================================================
 @xuangu_bp.route("/sync", methods=["POST"])
+@login_required
 def trigger_sync():
-    """触发从东方财富选股器同步数据到 PostgreSQL
-
-    请求体（可选）：
-    {
-        "date": "2026-04-19",   // 指定交易日，留空则拉最新
-        "proxy": ""              // 可选 HTTP 代理
-    }
-    """
+    """触发从东方财富选股器同步数据到 PostgreSQL"""
     data = request.get_json() or {}
     trade_date = (data.get("date") or "").strip() or None
     proxy = (data.get("proxy") or "").strip() or None
@@ -99,7 +71,7 @@ def trigger_sync():
 
 
 # ================================================================
-# GET /stats — 表统计信息
+# GET /stats — 表统计信息（公开）
 # ================================================================
 @xuangu_bp.route("/stats")
 def table_stats():
@@ -133,7 +105,7 @@ def table_stats():
 # ================================================================
 
 def _ensure_strategies_table():
-    """确保 qd_user_strategies 表存在，按需建表"""
+    """确保 qd_user_strategies 表存在，按需建表；已有表自动修正列宽"""
     ddl = """
     CREATE TABLE IF NOT EXISTS qd_user_strategies (
         id          SERIAL PRIMARY KEY,
@@ -147,10 +119,18 @@ def _ensure_strategies_table():
     CREATE INDEX IF NOT EXISTS idx_qdus_user_id
         ON qd_user_strategies (user_id);
     """
+    alter_sql = """
+    ALTER TABLE qd_user_strategies ALTER COLUMN name TYPE VARCHAR(100);
+    ALTER TABLE qd_user_strategies ALTER COLUMN description TYPE VARCHAR(500);
+    """
     try:
         with get_db_connection() as conn:
             cur = conn.cursor()
             cur.execute(ddl)
+            try:
+                cur.execute(alter_sql)
+            except Exception:
+                pass
             conn.commit()
             cur.close()
     except Exception as e:
@@ -158,9 +138,10 @@ def _ensure_strategies_table():
 
 
 @xuangu_bp.route("/favorites", methods=["GET"])
+@login_required
 def get_favorites():
     """获取当前用户的收藏策略列表"""
-    user_id = _safe_user_id()
+    user_id = g.user_id
     _ensure_strategies_table()
 
     try:
@@ -180,11 +161,9 @@ def get_favorites():
         strategies = []
         for r in rows:
             d = dict(r)
-            # datetime → string，方便前端渲染
             for ts_field in ("created_at", "updated_at"):
                 if d.get(ts_field) and hasattr(d[ts_field], "isoformat"):
                     d[ts_field] = d[ts_field].isoformat()
-            # conditions 是 JSON 字符串，解析回对象
             try:
                 d["conditions"] = _json.loads(d["conditions"]) if d["conditions"] else []
             except (_json.JSONDecodeError, TypeError, ValueError):
@@ -198,21 +177,13 @@ def get_favorites():
 
 
 @xuangu_bp.route("/favorites", methods=["POST"])
+@login_required
 def save_favorite():
-    """保存或更新收藏策略
-
-    请求体：
-    {
-        "id": 123,                // 可选：有 id 则更新，无 id 则新建
-        "name": "低估值银行股",
-        "conditions": {"keyword": "PE在0到15之间; 银行"},
-        "description": "PE < 15 的银行板块"   // 可选
-    }
-    """
+    """保存或更新收藏策略"""
     import json as _json
 
     data = request.get_json() or {}
-    user_id = _safe_user_id(data)
+    user_id = g.user_id
     strategy_id = data.get("id")
     name = (data.get("name") or "").strip()
     conditions = data.get("conditions")
@@ -261,7 +232,8 @@ def save_favorite():
                     "VALUES (%s, %s, %s, %s) RETURNING id",
                     (user_id, name, cond_str, description)
                 )
-                new_id = cur.fetchone()["id"]
+                row = cur.fetchone()
+                new_id = row["id"] if row else None
                 strategy_id = new_id
                 msg = "保存成功"
 
@@ -275,15 +247,15 @@ def save_favorite():
 
 
 @xuangu_bp.route("/favorites/<int:strategy_id>", methods=["DELETE"])
+@login_required
 def delete_favorite(strategy_id: int):
     """删除收藏策略"""
-    user_id = _safe_user_id()
+    user_id = g.user_id
     _ensure_strategies_table()
 
     try:
         with get_db_connection() as conn:
             cur = conn.cursor()
-            # 先查归属
             cur.execute(
                 "SELECT user_id FROM qd_user_strategies WHERE id = %s",
                 (strategy_id,)
@@ -340,25 +312,14 @@ def _ensure_watchlist_table():
 
 
 @xuangu_bp.route("/watchlist", methods=["POST"])
+@login_required
 def add_to_watchlist():
-    """添加股票到自选股表
-
-    请求体：
-    {
-        "stocks": [
-            {"code": "000001", "name": "平安银行", "industry": "银行", "concept": "...", "new_price": 12.5, "change_rate": 2.3},
-            ...
-        ]
-    }
-    """
+    """添加股票到自选股表"""
     data = request.get_json() or {}
-
-    # user_id: 优先从token取，其次从请求体取，默认0（未登录）
-    user_id = _safe_user_id(data)
+    user_id = g.user_id
     stocks = data.get("stocks") or []
     if not stocks:
         return jsonify({"code": 1, "msg": "未选择任何股票"}), 400
-    # 限制批量大小，防止滥用
     if len(stocks) > 500:
         return jsonify({"code": 1, "msg": "单次最多添加500只自选股"}), 400
 
@@ -374,7 +335,6 @@ def add_to_watchlist():
                 if not code:
                     skipped += 1
                     continue
-                # 过滤超长字段，防止数据库报错
                 name = (s.get("name") or "")[:100]
                 industry = (s.get("industry") or "")[:100]
                 try:
@@ -412,9 +372,10 @@ def add_to_watchlist():
 
 
 @xuangu_bp.route("/watchlist", methods=["GET"])
+@login_required
 def get_watchlist():
     """获取当前用户的自选股列表"""
-    user_id = _safe_user_id()
+    user_id = g.user_id
     _ensure_watchlist_table()
 
     try:
@@ -433,7 +394,6 @@ def get_watchlist():
             d = dict(r)
             if d.get("created_at") and hasattr(d["created_at"], "isoformat"):
                 d["created_at"] = d["created_at"].isoformat()
-            # 数值转换
             for k in ("new_price", "change_rate"):
                 if d.get(k) is not None:
                     d[k] = float(d[k])
@@ -446,9 +406,10 @@ def get_watchlist():
 
 
 @xuangu_bp.route("/watchlist/<int:item_id>", methods=["DELETE"])
+@login_required
 def remove_from_watchlist(item_id: int):
     """从自选股中删除"""
-    user_id = _safe_user_id()
+    user_id = g.user_id
     _ensure_watchlist_table()
 
     try:

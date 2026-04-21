@@ -40,6 +40,7 @@
 
 <script>
 import DetailModal from './DetailModal.vue'
+import request from '@/utils/request'
 
 export default {
   name: 'DragonTigerCard',
@@ -86,9 +87,7 @@ export default {
     async refresh () {
       this.loading = true
       try {
-        const r = await fetch('/api/shichang/dragon')
-        if (!r.ok) return
-        const d = await r.json()
+        const d = await request({ url: '/api/shichang/dragon', method: 'GET' })
         this.list = (d.dragonTigerList || []).map(item => {
           const full = (item.reason || '').replace(/成功率/g, '')
           return {

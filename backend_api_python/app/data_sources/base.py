@@ -195,10 +195,6 @@ class BaseDataSource(ABC):
         """获取个股资金流向"""
         raise NotImplementedError
 
-    def get_cnstock_selection(self, **kwargs) -> List[Dict[str, Any]]:
-        """获取选股数据"""
-        raise NotImplementedError
-
     def log_result(
         self,
         symbol: str,
