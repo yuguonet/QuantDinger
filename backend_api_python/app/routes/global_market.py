@@ -38,6 +38,7 @@ from app.data_providers.indices import fetch_stock_indices
 from app.data_providers.sentiment import (
     fetch_fear_greed_index, fetch_vix, fetch_dollar_index,
     fetch_yield_curve, fetch_vxn, fetch_gvz, fetch_put_call_ratio,
+    get_sentiment_data,
 )
 from app.data_providers.news import fetch_financial_news, get_economic_calendar
 from app.data_providers.heatmap import generate_heatmap_data
@@ -170,53 +171,7 @@ def economic_calendar():
 def market_sentiment():
     """Get comprehensive market sentiment indicators."""
     try:
-        MACRO_CACHE_TTL = 21600
-        cached = get_cached("market_sentiment", MACRO_CACHE_TTL)
-        if cached:
-            logger.debug("Returning cached sentiment data (6h cache)")
-            return jsonify({"code": 1, "msg": "success", "data": cached})
-
-        logger.info("Fetching fresh sentiment data (comprehensive)")
-
-        with ThreadPoolExecutor(max_workers=7) as executor:
-            futures = {
-                executor.submit(fetch_fear_greed_index): "fear_greed",
-                executor.submit(fetch_vix): "vix",
-                executor.submit(fetch_dollar_index): "dxy",
-                executor.submit(fetch_yield_curve): "yield_curve",
-                executor.submit(fetch_vxn): "vxn",
-                executor.submit(fetch_gvz): "gvz",
-                executor.submit(fetch_put_call_ratio): "vix_term",
-            }
-            results = {}
-            for future in as_completed(futures):
-                key = futures[future]
-                try:
-                    results[key] = future.result()
-                except Exception as e:
-                    logger.error("Failed to fetch %s: %s", key, e)
-                    results[key] = None
-
-        logger.info(
-            "Sentiment data fetched: Fear&Greed=%s, VIX=%s, DXY=%s",
-            results.get("fear_greed", {}).get("value"),
-            results.get("vix", {}).get("value"),
-            results.get("dxy", {}).get("value"),
-        )
-
-        data = {
-            "fear_greed": results.get("fear_greed") or {"value": 50, "classification": "Neutral"},
-            "vix": results.get("vix") or {"value": 0, "level": "unknown"},
-            "dxy": results.get("dxy") or {"value": 0, "level": "unknown"},
-            "yield_curve": results.get("yield_curve") or {"spread": 0, "level": "unknown"},
-            "vxn": results.get("vxn") or {"value": 0, "level": "unknown"},
-            "gvz": results.get("gvz") or {"value": 0, "level": "unknown"},
-            "vix_term": results.get("vix_term") or {"value": 1.0, "level": "unknown"},
-            "timestamp": int(time.time()),
-        }
-
-        set_cached("market_sentiment", data, MACRO_CACHE_TTL)
-
+        data = get_sentiment_data(timeout=10) or {}
         return jsonify({"code": 1, "msg": "success", "data": data})
 
     except Exception as e:

@@ -1,5 +1,12 @@
-"""Market sentiment indicator fetchers (VIX, DXY, Fear&Greed, etc.)."""
+"""Market sentiment indicator fetchers (VIX, DXY, Fear&Greed, etc.).
+
+Also exposes :func:`get_sentiment_data` — the single source of truth for
+comprehensive sentiment data with built-in caching.
+"""
 from __future__ import annotations
+
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from typing import Any, Dict
@@ -7,6 +14,9 @@ from typing import Any, Dict
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+_SENTIMENT_CACHE_KEY = "market_sentiment"
+_SENTIMENT_CACHE_TTL = 21600  # 6 hours
 
 
 def fetch_fear_greed_index() -> Dict[str, Any]:
@@ -374,3 +384,84 @@ def fetch_put_call_ratio() -> Dict[str, Any]:
             "level": "unknown", "signal": "neutral",
             "interpretation": "数据获取失败", "interpretation_en": "Data fetch failed",
         }
+
+
+# ---------------------------------------------------------------------------
+# Unified entry point — single source of truth for sentiment data
+# ---------------------------------------------------------------------------
+
+def get_sentiment_data(timeout: int = 10) -> Dict[str, Any]:
+    """Return comprehensive sentiment data with built-in caching.
+
+    This is the **only** function that both ``global_market`` (API endpoint)
+    and ``market_data_collector`` (AI analysis) should call.
+
+    Flow:
+        1. Read from cache (key=``market_sentiment``, TTL=6h).
+        2. On miss: fetch all 7 indicators in parallel, assemble the result,
+           write it back to cache, then return.
+        3. On hit: return cached data directly.
+
+    Returns the raw ``data_providers`` format (keys: ``fear_greed``, ``vix``,
+    ``dxy``, ``yield_curve``, ``vxn``, ``gvz``, ``vix_term``, ``timestamp``).
+    """
+    # 1) Try cache
+    # Lazy import to avoid circular dependency:
+    # data_providers/__init__.py imports from this module.
+    from app.data_providers import get_cached, set_cached
+
+    cached = get_cached(_SENTIMENT_CACHE_KEY, _SENTIMENT_CACHE_TTL)
+    if cached:
+        logger.debug("get_sentiment_data: cache hit (%s)", _SENTIMENT_CACHE_KEY)
+        return cached
+
+    # 2) Parallel fetch (all 7 indicators)
+    logger.info("get_sentiment_data: cache miss — fetching fresh data")
+
+    fetchers = {
+        "fear_greed": fetch_fear_greed_index,
+        "vix": fetch_vix,
+        "dxy": fetch_dollar_index,
+        "yield_curve": fetch_yield_curve,
+        "vxn": fetch_vxn,
+        "gvz": fetch_gvz,
+        "vix_term": fetch_put_call_ratio,
+    }
+
+    results: Dict[str, Any] = {}
+    with ThreadPoolExecutor(max_workers=7) as executor:
+        futures = {executor.submit(fn): key for key, fn in fetchers.items()}
+        try:
+            for future in as_completed(futures, timeout=timeout):
+                key = futures[future]
+                try:
+                    results[key] = future.result(timeout=5)
+                except Exception as e:
+                    logger.error("get_sentiment_data: failed to fetch %s: %s", key, e)
+                    results[key] = None
+        except Exception as e:
+            # Total timeout — some indicators may be missing, that's OK.
+            # We'll fill them with defaults below and still cache what we got.
+            logger.warning("get_sentiment_data: total timeout (%ss), %d/%d indicators fetched: %s",
+                           timeout, len(results), len(fetchers), e)
+            # Mark unfinished futures as None
+            for fut, key in futures.items():
+                if key not in results:
+                    results[key] = None
+
+    data = {
+        "fear_greed": results.get("fear_greed") or {"value": 50, "classification": "Neutral"},
+        "vix": results.get("vix") or {"value": 0, "level": "unknown"},
+        "dxy": results.get("dxy") or {"value": 0, "level": "unknown"},
+        "yield_curve": results.get("yield_curve") or {"spread": 0, "level": "unknown"},
+        "vxn": results.get("vxn") or {"value": 0, "level": "unknown"},
+        "gvz": results.get("gvz") or {"value": 0, "level": "unknown"},
+        "vix_term": results.get("vix_term") or {"value": 1.0, "level": "unknown"},
+        "timestamp": int(time.time()),
+    }
+
+    # 3) Write cache
+    set_cached(_SENTIMENT_CACHE_KEY, data, _SENTIMENT_CACHE_TTL)
+    logger.info("get_sentiment_data: fetched & cached (%d indicators)", len(fetchers))
+
+    return data

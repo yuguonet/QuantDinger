@@ -114,6 +114,26 @@ class MetaAPIKeys(type):
             return [k.strip() for k in val.split(',') if k.strip()]
         return []
 
+    @property
+    def BOCHA_AI_API_KEY(cls):
+        """BochaAI (博查) search API key"""
+        env_val = os.getenv('BOCHA_AI_API_KEY', '').strip()
+        if env_val:
+            return env_val
+        from app.utils.config_loader import load_addon_config
+        val = load_addon_config().get('bochaai', {}).get('api_key')
+        return val if val else ''
+
+    @property
+    def BAIDU_SEARCH_API_KEY(cls):
+        """Baidu search (千帆 AppBuilder) API key"""
+        env_val = os.getenv('BAIDU_SEARCH_API_KEY', '').strip()
+        if env_val:
+            return env_val
+        from app.utils.config_loader import load_addon_config
+        val = load_addon_config().get('baidu', {}).get('api_key')
+        return val if val else ''
+
 
 class APIKeys(metaclass=MetaAPIKeys):
     """API 密钥配置类"""

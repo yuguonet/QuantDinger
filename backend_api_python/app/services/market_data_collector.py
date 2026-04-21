@@ -1722,149 +1722,112 @@ class MarketDataCollector:
     
     def _get_macro_data(self, market: str, timeout: int = 10) -> Dict[str, Any]:
         """
-        获取宏观经济数据 - 复用 global_market.py 的函数和缓存
-        
-        优势：
-        1. 数据与全球金融页面一致
-        2. 复用30秒/5分钟缓存，降低API调用
-        3. 已有完整的数据解读和级别判断
+        获取宏观经济数据 — 统一走 get_sentiment_data()
+
+        复用 global_market 的完整数据链:
+          缓存读取 → 7 指标并行 fetch → 缓存写入
+
+        collector 不再自己 fetch、不再自己维护缓存。
+        唯一职责：把 data_providers 的原始格式转换成 AI 分析需要的格式。
         """
         try:
-            # 复用 global_market.py 的市场情绪数据 (有5分钟缓存)
-            from app.data_providers import get_cached as _get_cached, set_cached as _set_cached
-            from app.data_providers.sentiment import (
-                fetch_vix as _fetch_vix,
-                fetch_dollar_index as _fetch_dollar_index,
-                fetch_yield_curve as _fetch_yield_curve,
-                fetch_fear_greed_index as _fetch_fear_greed_index,
-            )
-            
-            result = {}
-            
-            # 1) 尝试从缓存获取 (global_market 的缓存, 6小时有效)
-            MACRO_CACHE_TTL = 21600  # 6 hours
-            cached_sentiment = _get_cached("market_sentiment", MACRO_CACHE_TTL)
-            if cached_sentiment:
-                logger.info("Using cached sentiment data from global_market (6h cache)")
-                # 转换格式
-                if cached_sentiment.get('vix'):
-                    vix = cached_sentiment['vix']
-                    result['VIX'] = {
-                        'name': 'VIX恐慌指数',
-                        'description': vix.get('interpretation', ''),
-                        'price': vix.get('value', 0),
-                        'change': vix.get('change', 0),
-                        'changePercent': vix.get('change', 0),
-                        'level': vix.get('level', 'unknown'),
-                    }
-                
-                if cached_sentiment.get('dxy'):
-                    dxy = cached_sentiment['dxy']
-                    result['DXY'] = {
-                        'name': '美元指数',
-                        'description': dxy.get('interpretation', ''),
-                        'price': dxy.get('value', 0),
-                        'change': dxy.get('change', 0),
-                        'changePercent': dxy.get('change', 0),
-                        'level': dxy.get('level', 'unknown'),
-                    }
-                
-                if cached_sentiment.get('yield_curve'):
-                    yc = cached_sentiment['yield_curve']
-                    result['TNX'] = {
-                        'name': '美债10年收益率',
-                        'description': yc.get('interpretation', ''),
-                        'price': yc.get('yield_10y', 0),
-                        'change': yc.get('change', 0),
-                        'changePercent': 0,
-                        'spread': yc.get('spread', 0),
-                        'level': yc.get('level', 'unknown'),
-                    }
-                
-                if cached_sentiment.get('fear_greed'):
-                    fg = cached_sentiment['fear_greed']
-                    result['FEAR_GREED'] = {
-                        'name': '恐惧贪婪指数',
-                        'description': fg.get('classification', 'Neutral'),
-                        'price': fg.get('value', 50),
-                        'change': 0,
-                        'changePercent': 0,
-                    }
-                
-                if result:
-                    return result
-            
-            # 2) 如果没有缓存，快速并行获取关键指标
-            logger.info("Fetching macro data from global_market functions")
-            
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                futures = {
-                    executor.submit(_fetch_vix): "VIX",
-                    executor.submit(_fetch_dollar_index): "DXY",
-                    executor.submit(_fetch_yield_curve): "TNX",
-                    executor.submit(_fetch_fear_greed_index): "FEAR_GREED",
+            from app.data_providers.sentiment import get_sentiment_data
+
+            raw = get_sentiment_data(timeout=timeout)
+            if not raw:
+                logger.warning("_get_macro_data: get_sentiment_data returned empty")
+                return {}
+
+            result: Dict[str, Any] = {}
+
+            # VIX
+            vix = raw.get("vix") or {}
+            if vix.get("value", 0) > 0:
+                result["VIX"] = {
+                    "name": "VIX恐慌指数",
+                    "description": vix.get("interpretation", ""),
+                    "price": vix.get("value", 0),
+                    "change": vix.get("change", 0),
+                    "changePercent": vix.get("change", 0),
+                    "level": vix.get("level", "unknown"),
                 }
-                
-                try:
-                    for future in as_completed(futures, timeout=timeout):
-                        key = futures[future]
-                        try:
-                            data = future.result(timeout=5)
-                            if data:
-                                # 转换为统一格式
-                                if key == 'VIX':
-                                    result[key] = {
-                                        'name': 'VIX恐慌指数',
-                                        'description': data.get('interpretation', ''),
-                                        'price': data.get('value', 0),
-                                        'change': data.get('change', 0),
-                                        'changePercent': data.get('change', 0),
-                                        'level': data.get('level', 'unknown'),
-                                    }
-                                elif key == 'DXY':
-                                    result[key] = {
-                                        'name': '美元指数',
-                                        'description': data.get('interpretation', ''),
-                                        'price': data.get('value', 0),
-                                        'change': data.get('change', 0),
-                                        'changePercent': data.get('change', 0),
-                                        'level': data.get('level', 'unknown'),
-                                    }
-                                elif key == 'TNX':
-                                    result[key] = {
-                                        'name': '美债10年收益率',
-                                        'description': data.get('interpretation', ''),
-                                        'price': data.get('yield_10y', 0),
-                                        'change': data.get('change', 0),
-                                        'changePercent': 0,
-                                        'spread': data.get('spread', 0),
-                                        'level': data.get('level', 'unknown'),
-                                    }
-                                elif key == 'FEAR_GREED':
-                                    result[key] = {
-                                        'name': '恐惧贪婪指数',
-                                        'description': data.get('classification', 'Neutral'),
-                                        'price': data.get('value', 50),
-                                        'change': 0,
-                                        'changePercent': 0,
-                                    }
-                        except Exception as e:
-                            logger.debug(f"Macro indicator {key} fetch failed: {e}")
-                except TimeoutError:
-                    logger.warning("Macro data fetch timed out")
-            
-            # 注：黄金等大宗商品数据不再作为宏观指标获取
-            # 原因：1) 如果分析的是黄金，价格已在 _get_price 中获取
-            #       2) 减少 API 调用，提高稳定性
-            pass
-            
+
+            # DXY
+            dxy = raw.get("dxy") or {}
+            if dxy.get("value", 0) > 0:
+                result["DXY"] = {
+                    "name": "美元指数",
+                    "description": dxy.get("interpretation", ""),
+                    "price": dxy.get("value", 0),
+                    "change": dxy.get("change", 0),
+                    "changePercent": dxy.get("change", 0),
+                    "level": dxy.get("level", "unknown"),
+                }
+
+            # TNX (Yield Curve)
+            yc = raw.get("yield_curve") or {}
+            if yc.get("yield_10y", 0) > 0:
+                result["TNX"] = {
+                    "name": "美债10年收益率",
+                    "description": yc.get("interpretation", ""),
+                    "price": yc.get("yield_10y", 0),
+                    "change": yc.get("change", 0),
+                    "changePercent": 0,
+                    "spread": yc.get("spread", 0),
+                    "level": yc.get("level", "unknown"),
+                }
+
+            # Fear & Greed
+            fg = raw.get("fear_greed") or {}
+            if fg.get("value", 0) > 0:
+                result["FEAR_GREED"] = {
+                    "name": "恐惧贪婪指数",
+                    "description": fg.get("classification", "Neutral"),
+                    "price": fg.get("value", 50),
+                    "change": 0,
+                    "changePercent": 0,
+                }
+
+            # VXN (NASDAQ Volatility) — 之前 collector 缺少这个
+            vxn = raw.get("vxn") or {}
+            if vxn.get("value", 0) > 0:
+                result["VXN"] = {
+                    "name": "纳指波动率指数",
+                    "description": vxn.get("interpretation", ""),
+                    "price": vxn.get("value", 0),
+                    "change": vxn.get("change", 0),
+                    "changePercent": vxn.get("change", 0),
+                    "level": vxn.get("level", "unknown"),
+                }
+
+            # GVZ (Gold Volatility) — 之前 collector 缺少这个
+            gvz = raw.get("gvz") or {}
+            if gvz.get("value", 0) > 0:
+                result["GVZ"] = {
+                    "name": "黄金波动率指数",
+                    "description": gvz.get("interpretation", ""),
+                    "price": gvz.get("value", 0),
+                    "change": gvz.get("change", 0),
+                    "changePercent": gvz.get("change", 0),
+                    "level": gvz.get("level", "unknown"),
+                }
+
+            # VIX Term Structure (Put/Call proxy) — 之前 collector 缺少这个
+            vt = raw.get("vix_term") or {}
+            if vt.get("vix", 0) > 0 and vt.get("vix3m", 0) > 0:
+                result["VIX_TERM"] = {
+                    "name": "VIX期限结构",
+                    "description": vt.get("interpretation", ""),
+                    "price": vt.get("value", 1.0),
+                    "change": vt.get("change", 0),
+                    "changePercent": vt.get("change", 0),
+                    "level": vt.get("level", "unknown"),
+                }
+
             return result
-            
-        except ImportError as e:
-            logger.warning(f"Could not import from global_market: {e}")
-            return {}
+
         except Exception as e:
-            logger.error(f"_get_macro_data failed: {e}")
+            logger.error("_get_macro_data failed: %s", e)
             return {}
     
     # ==================== 新闻/情绪数据 ====================

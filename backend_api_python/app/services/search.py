@@ -3,11 +3,12 @@ Search service v2.0 - 增强版搜索服务
 整合多个搜索引擎，支持 API Key 轮换和故障转移
 
 支持的搜索引擎（按优先级）：
-1. Tavily - 专为AI设计，免费1000次/月
-2. SerpAPI - Google/Bing 结果抓取
-3. Google CSE - 自定义搜索引擎
-4. Bing Search API
-5. DuckDuckGo - 免费兜底
+1. Bocha AI (博查) - 国内 Perplexity 替代，免费额度
+2. 百度搜索 - 国内直连，无需代理
+3. SerpAPI - Google/Bing/百度结果抓取（需代理）
+4. Google CSE - 自定义搜索引擎（需代理）
+5. Bing Search API（不稳定）
+6. DuckDuckGo - 免费兜底（需代理）
 
 参考：daily_stock_analysis-main/src/search_service.py
 """
@@ -599,6 +600,137 @@ class BingSearchProvider(BaseSearchProvider):
             )
 
 
+class BaiduSearchProvider(BaseSearchProvider):
+    """
+    百度搜索 (千帆 AppBuilder API)
+
+    特点：
+    - 国内原生，无需代理
+    - 中文搜索质量最高
+    - 免费额度：每天 100 次调用
+    - 文档：https://cloud.baidu.com/doc/AppBuilder/s/7luN6rl4b
+    """
+
+    def __init__(self, api_key: str):
+        super().__init__([api_key] if api_key else [], "Baidu")
+
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+        """执行百度搜索（千帆 AppBuilder 版）"""
+        try:
+            url = "https://appbuilder.baidu.com/rpc/2.0/cloud_custom/v1/search"
+            headers = {
+                "Content-Type": "application/json",
+                "X-Appbuilder-Authorization": f"Bearer {api_key}",
+            }
+            payload = {
+                "query": query,
+                "search_lang": "zh",
+                "search_recency_filter": self._days_to_recency(days),
+                "result_num": min(max_results, 10),
+            }
+
+            resp = requests.post(url, headers=headers, json=payload, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+
+            results = []
+            for item in (data.get("result") or {}).get("results", [])[:max_results]:
+                results.append(SearchResult(
+                    title=item.get("title", ""),
+                    snippet=item.get("content", "")[:500],
+                    url=item.get("url", ""),
+                    source="百度",
+                    published_date=item.get("publish_time"),
+                ))
+
+            return SearchResponse(
+                query=query, results=results,
+                provider=self.name, success=len(results) > 0,
+                error_message=None if results else "百度搜索无结果",
+            )
+        except Exception as e:
+            return SearchResponse(
+                query=query, results=[], provider=self.name,
+                success=False, error_message=str(e),
+            )
+
+    @staticmethod
+    def _days_to_recency(days: int) -> str:
+        if days <= 1:
+            return "day"
+        elif days <= 7:
+            return "week"
+        elif days <= 30:
+            return "month"
+        return "all"
+
+
+class BochaAISearchProvider(BaseSearchProvider):
+    """
+    Bocha AI (博查) — 国内 AI 搜索引擎
+
+    特点：
+    - 类 Perplexity 的 AI 增强搜索
+    - 国内直连，无需代理
+    - 免费额度：每天 100 次
+    - 文档：https://open.bochaai.com/
+    """
+
+    def __init__(self, api_key: str):
+        super().__init__([api_key] if api_key else [], "BochaAI")
+
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+        """执行 Bocha AI 搜索"""
+        try:
+            url = "https://api.bochaai.com/v1/web-search"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            }
+            payload = {
+                "query": query,
+                "count": min(max_results, 10),
+                "search_lang": "zh",
+                "freshness": self._days_to_freshness(days),
+            }
+
+            resp = requests.post(url, headers=headers, json=payload, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+
+            results = []
+            webpages = (data.get("data") or {}).get("webPages", {}).get("value", [])
+            for item in webpages[:max_results]:
+                results.append(SearchResult(
+                    title=item.get("name", ""),
+                    snippet=item.get("snippet", "")[:500],
+                    url=item.get("url", ""),
+                    source=self._extract_domain(item.get("url", "")),
+                    published_date=item.get("datePublished"),
+                ))
+
+            return SearchResponse(
+                query=query, results=results,
+                provider=self.name, success=len(results) > 0,
+                error_message=None if results else "BochaAI 搜索无结果",
+            )
+        except Exception as e:
+            return SearchResponse(
+                query=query, results=[], provider=self.name,
+                success=False, error_message=str(e),
+            )
+
+    @staticmethod
+    def _days_to_freshness(days: int) -> str:
+        if days <= 1:
+            return "pd"       # past day
+        elif days <= 7:
+            return "pw"       # past week
+        elif days <= 30:
+            return "pm"       # past month
+        return ""             # no filter
+
+
 class DuckDuckGoSearchProvider(BaseSearchProvider):
     """DuckDuckGo 搜索引擎（免费，无需 API Key）"""
     
@@ -737,40 +869,52 @@ class SearchService:
         self.max_results = int(self._config.get('max_results', 10))
     
     def _init_providers(self):
-        """初始化搜索引擎（按优先级排序）"""
+        """初始化搜索引擎（国内优先）"""
         from app.config import APIKeys
-        
-        # 1. Tavily（AI优化搜索）
+
+        # 0. BochaAI — 国内 AI 搜索，首选
+        bocha_key = APIKeys.BOCHA_AI_API_KEY
+        if bocha_key:
+            self._providers.append(BochaAISearchProvider(bocha_key))
+            logger.info("已配置 BochaAI 搜索（国内优先）")
+
+        # 1. 百度搜索 — 国内原生
+        baidu_key = APIKeys.BAIDU_SEARCH_API_KEY
+        if baidu_key:
+            self._providers.append(BaiduSearchProvider(baidu_key))
+            logger.info("已配置百度搜索（国内原生）")
+
+        # 2. Tavily — 海外 AI 搜索
         tavily_keys = APIKeys.TAVILY_API_KEYS
         if tavily_keys:
             self._providers.append(TavilySearchProvider(tavily_keys))
             logger.info(f"已配置 Tavily 搜索，共 {len(tavily_keys)} 个 API Key")
-        
-        # 2. SerpAPI
+
+        # 3. SerpAPI — 海外通用
         serpapi_keys = APIKeys.SERPAPI_KEYS
         if serpapi_keys:
             self._providers.append(SerpAPISearchProvider(serpapi_keys))
             logger.info(f"已配置 SerpAPI 搜索，共 {len(serpapi_keys)} 个 API Key")
-        
-        # 3. Google CSE
+
+        # 4. Google CSE
         google_api_key = self._config.get('google', {}).get('api_key')
         google_cx = self._config.get('google', {}).get('cx')
         if google_api_key and google_cx:
             self._providers.append(GoogleSearchProvider(google_api_key, google_cx))
             logger.info("已配置 Google CSE 搜索")
-        
-        # 4. Bing
+
+        # 5. Bing
         bing_api_key = self._config.get('bing', {}).get('api_key')
         if bing_api_key:
             self._providers.append(BingSearchProvider(bing_api_key))
             logger.info("已配置 Bing 搜索")
-        
-        # 5. DuckDuckGo（免费兜底）
+
+        # 6. DuckDuckGo（免费兜底）
         self._providers.append(DuckDuckGoSearchProvider())
         logger.info("已配置 DuckDuckGo 搜索（免费兜底）")
-        
-        if len(self._providers) == 1:
-            logger.warning("仅有 DuckDuckGo 可用，建议配置更多搜索引擎 API Key")
+
+        if not any(p.name in ("BochaAI", "Baidu") for p in self._providers):
+            logger.warning("未配置国内搜索引擎（BochaAI/百度），建议至少配置一个以保证国内可达性")
     
     @property
     def is_available(self) -> bool:
