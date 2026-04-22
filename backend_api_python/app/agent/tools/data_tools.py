@@ -17,17 +17,8 @@ def _get_ds(market: str = "CNStock"):
     return DataSourceFactory.get_source(market)
 
 
-def _detect_market(stock_code: str) -> str:
-    code = (stock_code or "").strip().upper()
-    if code.startswith(("SH", "SZ", "BJ")):
-        return "CNStock"
-    if code.startswith("HK"):
-        return "HKStock"
-    if len(code) <= 6 and code.isdigit():
-        return "CNStock"
-    if len(code) == 6 and code.isalpha():
-        return "Forex"
-    return "Crypto"
+# ── Re-exported from shared utils (kept for backward compat) ──
+from app.agent.utils import detect_market as _detect_market
 
 
 # ── Tool functions ────────────────────────────────────────────

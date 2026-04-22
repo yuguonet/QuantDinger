@@ -54,13 +54,59 @@ from bs4 import BeautifulSoup
 from app.services.search import SearchResult, SearchResponse
 
 # ─── 配置 ───────────────────────────────────────────────
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
+]
+
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": _USER_AGENTS[0],
     "Accept-Language": "zh-CN,zh;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Connection": "keep-alive",
 }
 TIMEOUT = 12
 MAX_NEWS = 30
+
+# Reusable session with retry logic
+import random as _random
+import threading as _threading
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+_session = None
+_session_lock = _threading.Lock()
+
+def _get_session() -> requests.Session:
+    """Get a requests.Session with retry and rotating UA. Thread-safe."""
+    global _session
+    if _session is not None:
+        return _session
+    with _session_lock:
+        if _session is not None:
+            return _session
+        s = requests.Session()
+        retries = Retry(
+            total=2,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST"],
+        )
+        adapter = HTTPAdapter(max_retries=retries, pool_maxsize=10)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        _session = s
+        return s
+
+
+def _rotating_headers() -> dict:
+    """Return headers with a random User-Agent."""
+    h = dict(HEADERS)
+    h["User-Agent"] = _random.choice(_USER_AGENTS)
+    return h
 
 # ─── 情感关键词库 (权重1-3, 越强信号权重越高) ───────────
 POSITIVE_WORDS = {
@@ -168,9 +214,10 @@ def _title_hash(title: str, source: str = "") -> str:
 # ─── 股票名称/代码互查 ────────────────────────────────────
 def _get_stock_name(code: str) -> str:
     try:
-        resp = requests.get(
+        sess = _get_session()
+        resp = sess.get(
             f"https://suggest3.sinajs.cn/suggest/type=11,12,13,14,15&key={code}",
-            headers=HEADERS, timeout=5)
+            headers=_rotating_headers(), timeout=5)
         resp.encoding = "gbk"
         for item in resp.text.split(";"):
             parts = item.split(",")
@@ -193,9 +240,10 @@ def _resolve_code(input_str: str) -> tuple:
         code = m.group(2)
         return code, _get_stock_name(code)
     try:
-        resp = requests.get(
+        sess = _get_session()
+        resp = sess.get(
             f"https://suggest3.sinajs.cn/suggest/type=11,12,13,14,15&key={s}",
-            headers=HEADERS, timeout=5)
+            headers=_rotating_headers(), timeout=5)
         resp.encoding = "gbk"
         for item in resp.text.split(";"):
             parts = item.split(",")
@@ -213,13 +261,14 @@ def _fetch_eastmoney(code: str, days: int, name: str = "") -> List[SearchResult]
     items = []
     cutoff = datetime.now() - timedelta(days=days)
     keywords = list(set([code, name])) if name else [code]
+    sess = _get_session()
 
     # 公告
     try:
         url = "https://np-anotice-stock.eastmoney.com/api/security/ann"
         params = {"sr": -1, "page_size": MAX_NEWS, "page_index": 1,
                   "ann_type": "A", "client_source": "web", "stock_list": code}
-        resp = requests.get(url, headers=HEADERS, params=params, timeout=TIMEOUT)
+        resp = sess.get(url, headers=_rotating_headers(), params=params, timeout=TIMEOUT)
         if resp.status_code == 200:
             for art in resp.json().get("data", {}).get("list", []):
                 title = art.get("title", "")
@@ -255,7 +304,7 @@ def _fetch_eastmoney(code: str, days: int, name: str = "") -> List[SearchResult]
                     }}
                 }, separators=(',', ':'))
             )
-            resp = requests.get(search_url, headers=HEADERS, timeout=TIMEOUT)
+            resp = sess.get(search_url, headers=_rotating_headers(), timeout=TIMEOUT)
             resp.encoding = "utf-8"
             # 提取 JSONP 中的 JSON 部分: 找到第一个 { 对应的完整 JSON
             text = resp.text
@@ -311,11 +360,12 @@ def _fetch_eastmoney(code: str, days: int, name: str = "") -> List[SearchResult]
 def _fetch_sina(code: str, days: int, name: str = "") -> List[SearchResult]:
     items = []
     cutoff = datetime.now() - timedelta(days=days)
+    sess = _get_session()
     try:
         # 沪市: 600/601/603/605/688/689, 深市: 000/001/002/003/300/301
         market = "sh" if code[:3] in ("600", "601", "603", "605", "688", "689") else "sz"
         url = f"https://finance.sina.com.cn/realstock/company/{market}{code}/news.shtml"
-        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        resp = sess.get(url, headers=_rotating_headers(), timeout=TIMEOUT)
         resp.encoding = "gbk"
         soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -359,10 +409,11 @@ def _fetch_sina7x24(code: str, days: int, name: str = "") -> List[SearchResult]:
     search_terms = [code]
     if name:
         search_terms.append(name)
+    sess = _get_session()
     try:
         url = "https://zhibo.sina.com.cn/api/zhibo/feed"
         params = {"page": 1, "page_size": 50, "zhibo_id": 152, "tag_id": 0, "type": 0}
-        resp = requests.get(url, headers=HEADERS, params=params, timeout=TIMEOUT)
+        resp = sess.get(url, headers=_rotating_headers(), params=params, timeout=TIMEOUT)
         if resp.status_code != 200:
             return items
         data = resp.json()
@@ -394,6 +445,7 @@ def _fetch_sina7x24(code: str, days: int, name: str = "") -> List[SearchResult]:
 def _fetch_qq(code: str, days: int, name: str = "") -> List[SearchResult]:
     items = []
     cutoff = datetime.now() - timedelta(days=days)
+    sess = _get_session()
     try:
         keyword = name or code
         url = "https://i.news.qq.com/web_feed/getPCList"
@@ -402,7 +454,7 @@ def _fetch_qq(code: str, days: int, name: str = "") -> List[SearchResult]:
             "category": "stock", "ext": {"keyword": keyword},
             "page": 0, "num": 20,
         }
-        resp = requests.post(url, headers={**HEADERS, "Content-Type": "application/json"},
+        resp = sess.post(url, headers={**_rotating_headers(), "Content-Type": "application/json"},
                              json=payload, timeout=TIMEOUT)
         data = resp.json() if resp.status_code == 200 else {}
         d = data.get("data") or {}
@@ -440,10 +492,11 @@ def _fetch_qq(code: str, days: int, name: str = "") -> List[SearchResult]:
 def _fetch_ifeng(code: str, days: int, name: str = "") -> List[SearchResult]:
     items = []
     cutoff = datetime.now() - timedelta(days=days)
+    sess = _get_session()
     try:
         url = "https://so.finance.ifeng.com/api/getSearchNews"
         params = {"q": code, "p": 1, "ps": 20, "type": "news"}
-        resp = requests.get(url, headers=HEADERS, params=params, timeout=TIMEOUT)
+        resp = sess.get(url, headers=_rotating_headers(), params=params, timeout=TIMEOUT)
         if resp.status_code != 200:
             return items
         data = resp.json()

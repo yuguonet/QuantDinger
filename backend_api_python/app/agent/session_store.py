@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 # Redis keys
 _SESSION_PREFIX = "agent:session:"
 _CONVERSATION_PREFIX = "agent:conv:"
+_TOOL_RESULTS_PREFIX = "agent:tool_results:"
 
 
 def _get_redis():
@@ -52,6 +53,7 @@ class _InMemoryStore:
     def __init__(self, max_sessions: int = 200, session_ttl: int = 7200):
         self._sessions: Dict[str, Dict] = {}
         self._conversations: Dict[str, List[Dict]] = {}
+        self._tool_results: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
         self._max_sessions = max_sessions
         self._session_ttl = session_ttl
@@ -88,6 +90,7 @@ class _InMemoryStore:
     def delete_session(self, session_id: str) -> bool:
         with self._lock:
             self._conversations.pop(session_id, None)
+            self._tool_results.pop(session_id, None)
             return self._sessions.pop(session_id, None) is not None
 
     def list_sessions(self, limit: int = 50) -> List[Dict]:
@@ -115,6 +118,32 @@ class _InMemoryStore:
         with self._lock:
             self._conversations.pop(session_id, None)
 
+    # ── Tool results (cross-turn context) ─────────────────────
+
+    def save_tool_results(self, session_id: str, results: Dict[str, Any]) -> None:
+        """Persist tool call results for reuse in subsequent turns.
+
+        Args:
+            session_id: Session identifier.
+            results: Dict mapping stock_code → {quote, trend, news, ...}.
+        """
+        with self._lock:
+            existing = self._tool_results.get(session_id, {})
+            for stock_code, data in results.items():
+                if stock_code in existing and isinstance(existing[stock_code], dict) and isinstance(data, dict):
+                    existing[stock_code].update(data)
+                else:
+                    existing[stock_code] = data
+            self._tool_results[session_id] = existing
+
+    def get_tool_results(self, session_id: str) -> Dict[str, Any]:
+        with self._lock:
+            return dict(self._tool_results.get(session_id, {}))
+
+    def clear_tool_results(self, session_id: str) -> None:
+        with self._lock:
+            self._tool_results.pop(session_id, None)
+
     # ── Maintenance ──────────────────────────────────────────
 
     def _maybe_cleanup(self):
@@ -122,6 +151,7 @@ class _InMemoryStore:
             oldest = min(self._sessions, key=lambda s: self._sessions[s].get("updated_at", 0))
             self._sessions.pop(oldest, None)
             self._conversations.pop(oldest, None)
+            self._tool_results.pop(oldest, None)
 
     def cleanup_expired(self):
         now = time.time()
@@ -131,6 +161,7 @@ class _InMemoryStore:
             for sid in expired:
                 self._sessions.pop(sid, None)
                 self._conversations.pop(sid, None)
+                self._tool_results.pop(sid, None)
             if expired:
                 logger.info("Cleaned up %d expired sessions (memory)", len(expired))
 
@@ -180,6 +211,7 @@ class _RedisStore:
         pipe = self._r.pipeline()
         pipe.delete(self._session_key(session_id))
         pipe.delete(self._conv_key(session_id))
+        pipe.delete(self._tool_results_key(session_id))
         results = pipe.execute()
         return results[0] > 0
 
@@ -215,6 +247,29 @@ class _RedisStore:
 
     def clear_history(self, session_id: str):
         self._r.delete(self._conv_key(session_id))
+
+    # ── Tool results (cross-turn context) ─────────────────────
+
+    def _tool_results_key(self, session_id: str) -> str:
+        return f"{_TOOL_RESULTS_PREFIX}{session_id}"
+
+    def save_tool_results(self, session_id: str, results: Dict[str, Any]) -> None:
+        key = self._tool_results_key(session_id)
+        raw = self._r.get(key)
+        existing = json.loads(raw) if raw else {}
+        for stock_code, data in results.items():
+            if stock_code in existing and isinstance(existing[stock_code], dict) and isinstance(data, dict):
+                existing[stock_code].update(data)
+            else:
+                existing[stock_code] = data
+        self._r.setex(key, self._ttl, json.dumps(existing, ensure_ascii=False))
+
+    def get_tool_results(self, session_id: str) -> Dict[str, Any]:
+        raw = self._r.get(self._tool_results_key(session_id))
+        return json.loads(raw) if raw else {}
+
+    def clear_tool_results(self, session_id: str) -> None:
+        self._r.delete(self._tool_results_key(session_id))
 
     # ── Maintenance (Redis handles TTL natively) ─────────────
 

@@ -576,6 +576,135 @@ class LLMService:
             default_structure['report'] = f"Analysis failed: {str(e)}"
             return default_structure
 
+    # ── Tool calling (OpenAI function calling format) ─────────
+
+    def call_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        temperature: float = 0.3,
+        model: str = None,
+        provider: LLMProvider = None,
+    ) -> Dict[str, Any]:
+        """Call LLM with OpenAI function-calling tools.
+
+        Returns:
+            dict with keys: content (str|None), tool_calls (list), usage (dict)
+        """
+        p = provider or self.provider
+        api_key = self.get_api_key(p)
+        if not api_key:
+            raise ValueError(f"API key not configured for provider: {p.value}")
+
+        base_url = self.get_base_url(p)
+        model = self._normalize_model_for_provider(model, p)
+        if not model:
+            model = self.get_default_model(p)
+
+        config = load_addon_config()
+        timeout = int(config.get(p.value, {}).get("timeout", 120))
+
+        url = f"{base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        if "openrouter" in base_url:
+            headers["HTTP-Referer"] = "https://quantdinger.com"
+            headers["X-Title"] = "QuantDinger Agent"
+
+        payload: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "tools": tools,
+            "tool_choice": "auto",
+        }
+
+        resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        if resp.status_code >= 400:
+            err_text = resp.text[:300]
+            # Retryable errors
+            if resp.status_code in (429, 500, 502, 503, 504):
+                import time as _time
+                for attempt in range(2):
+                    _time.sleep(2 ** attempt)
+                    try:
+                        resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+                        if resp.status_code < 400:
+                            break
+                    except Exception:
+                        continue
+                else:
+                    raise ValueError(f"LLM API {resp.status_code} after retries: {err_text}")
+            else:
+                raise ValueError(f"LLM API {resp.status_code}: {err_text}")
+
+        data = resp.json()
+        choice = (data.get("choices") or [{}])[0]
+        msg = choice.get("message", {})
+
+        content = msg.get("content")
+        raw_tool_calls = msg.get("tool_calls") or []
+        usage = data.get("usage") or {}
+
+        tool_calls = []
+        for tc in raw_tool_calls:
+            fn = tc.get("function", {})
+            args_str = fn.get("arguments", "{}")
+            try:
+                args = json.loads(args_str)
+            except (json.JSONDecodeError, TypeError):
+                args = {"_raw": args_str}
+            tool_calls.append({
+                "id": tc.get("id", ""),
+                "name": fn.get("name", ""),
+                "arguments": args,
+            })
+
+        return {
+            "content": content,
+            "tool_calls": tool_calls,
+            "usage": usage,
+        }
+
+    # ── Async wrapper (thread pool) ───────────────────────────
+
+    def _get_async_pool(self):
+        """Lazy-init shared thread pool. One per LLMService instance."""
+        pool = getattr(self, "_async_pool", None)
+        if pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+            self._async_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="llm")
+        return self._async_pool
+
+    def shutdown_async_pool(self, wait: bool = False):
+        """Shut down the async thread pool. Call on app teardown."""
+        pool = getattr(self, "_async_pool", None)
+        if pool is not None:
+            pool.shutdown(wait=wait)
+            self._async_pool = None
+
+    def call_with_tools_async(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        **kwargs,
+    ):
+        """Non-blocking wrapper: runs call_with_tools in a thread pool.
+
+        Returns a concurrent.futures.Future.
+        """
+        return self._get_async_pool().submit(self.call_with_tools, messages, tools, **kwargs)
+
+    def call_llm_async(self, messages: list, **kwargs):
+        """Non-blocking wrapper for call_llm_api.
+
+        Returns a concurrent.futures.Future.
+        """
+        return self._get_async_pool().submit(self.call_llm_api, messages, **kwargs)
+        return _pool.submit(self.call_llm_api, messages, **kwargs)
+
     @classmethod
     def get_available_providers(cls) -> List[Dict[str, Any]]:
         """Get list of available (configured) providers."""

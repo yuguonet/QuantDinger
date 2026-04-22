@@ -2,16 +2,160 @@
 市场看板后端 API
 每个栏目独立接口，调用 Interface 层获取数据。
 数据源统一通过 DataSourceFactory 获取（与路线 B 共享同一出口）。
+
+缓存策略（与 global-market 一致的读写分离）:
+  - GET 接口优先读缓存（含过期数据，保证响应速度）
+  - 缓存过期后后台线程自动刷新远端并写缓存
+  - POST /refresh 手动触发远端拉取
 """
+import json as _json
 import threading
 import time
 from flask import Blueprint, jsonify, make_response, request
 import logging
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from concurrent.futures import ThreadPoolExecutor
 from app.data_sources.factory import DataSourceFactory
 from app.data_sources.normalizer import safe_float, safe_int
+from app.data_providers import get_cached, set_cached
+
+logger = logging.getLogger(__name__)
+
+shichang_bp = Blueprint('shichang', __name__)
+
+
+# ============================================================
+#  缓存配置（读写分离，与 global-market 一致）
+# ============================================================
+
+# 缓存 TTL（写入时使用，秒）
+CACHE_TTL_SH = {
+    "overview":           60,     # 1 分钟 — 实时性要求高
+    "streak":             60,
+    "dragon":             120,    # 2 分钟
+    "hot":                120,
+    "strong":             60,
+    "china_macro":        3600,   # 1 小时 — 宏观数据变化慢
+    "china_fg":           1800,   # 30 分钟 — 贪恐指数
+    "china_policy":       1800,   # 30 分钟 — 政策
+    "hot_sectors":        120,    # 2 分钟
+    "sector_trend":       1800,   # 30 分钟
+    "sector_prediction":  1800,
+    "sector_cycle":       3600,
+}
+
+# 后台自动刷新间隔（秒）：超过此时间没更新，读缓存时触发后台刷新
+STALE_AFTER_SH = {
+    "overview":           30,
+    "streak":             30,
+    "dragon":             60,
+    "hot":                60,
+    "strong":             30,
+    "china_macro":        1800,
+    "china_fg":           900,
+    "china_policy":       900,
+    "hot_sectors":        60,
+    "sector_trend":       900,
+    "sector_prediction":  900,
+    "sector_cycle":       1800,
+}
+
+# 防止同一 key 并发刷新
+_refresh_locks = {}
+_refresh_locks_guard = threading.Lock()
+
+
+def _get_refresh_lock(key):
+    with _refresh_locks_guard:
+        if key not in _refresh_locks:
+            _refresh_locks[key] = threading.Lock()
+        return _refresh_locks[key]
+
+
+# ============================================================
+#  缓存读写 + 后台刷新（与 global-market 一致的模式）
+# ============================================================
+
+def _sh_cache_key(endpoint):
+    """生成缓存 key"""
+    return f"dp:shichang_{endpoint}"
+
+
+def _read_cache_sh(endpoint):
+    """读缓存（含过期数据），返回 (data, cached_ts) 或 (None, 0)"""
+    try:
+        from app.utils.cache import CacheManager
+        cm = CacheManager()
+        key = _sh_cache_key(endpoint)
+        if cm.is_redis:
+            raw = cm._client.get(key)
+            if raw:
+                entry = _json.loads(raw)
+                return entry.get("data"), entry.get("ts", 0)
+        else:
+            with cm._client._lock:
+                entry = cm._client._cache.get(key)
+                if entry:
+                    parsed = _json.loads(entry[0])
+                    return parsed.get("data"), parsed.get("ts", 0)
+    except Exception:
+        pass
+    return None, 0
+
+
+def _write_cache_sh(endpoint, data):
+    """写入缓存（带时间戳）"""
+    ttl = CACHE_TTL_SH.get(endpoint, 120)
+    payload = _json.dumps({"data": data, "ts": time.time()}, ensure_ascii=False, default=str)
+    try:
+        from app.utils.cache import CacheManager
+        cm = CacheManager()
+        key = _sh_cache_key(endpoint)
+        cm.set(key, payload, ttl=ttl)
+    except Exception as e:
+        logger.warning("写缓存失败 [%s]: %s", endpoint, e)
+
+
+def _maybe_refresh_bg(endpoint, fetch_fn, cached_ts):
+    """检查缓存是否过期，过期则后台刷新"""
+    if not cached_ts:
+        return
+    elapsed = time.time() - cached_ts
+    wait = STALE_AFTER_SH.get(endpoint, 120)
+    if elapsed < wait:
+        return
+    lock = _get_refresh_lock(endpoint)
+
+    def _bg():
+        if not lock.acquire(blocking=False):
+            return
+        try:
+            logger.info("[shichang] 后台刷新 %s (过期 %ds > %ds)", endpoint, elapsed, wait)
+            result = fetch_fn()
+            if result is not None:
+                _write_cache_sh(endpoint, result)
+        except Exception as e:
+            logger.error("[shichang] 后台刷新 %s 失败: %s", endpoint, e)
+        finally:
+            lock.release()
+
+    threading.Thread(target=_bg, daemon=True).start()
+
+
+def _cached_fetch(endpoint, fetch_fn, timeout=30):
+    """统一缓存读取流程:
+    1. 读缓存（含过期数据）→ 有就返回，过期则后台刷新
+    2. 缓存空 → 走 _coalesce 去重拉远端 → 写缓存 → 返回
+    """
+    data, cached_ts = _read_cache_sh(endpoint)
+    if data is not None:
+        _maybe_refresh_bg(endpoint, fetch_fn, cached_ts)
+        return data
+    # 缓存空，走 _coalesce 防并发
+    result = _coalesce(endpoint, fetch_fn, timeout=timeout)
+    if result is not None:
+        _write_cache_sh(endpoint, result)
+    return result
 
 logger = logging.getLogger(__name__)
 
@@ -204,7 +348,7 @@ def overview():
         zt_today = _hub.zt_pool.get_realtime()
         return _do_fetch_overview(zt_data_today=zt_today)
     try:
-        data = _coalesce("overview", _run)
+        data = _cached_fetch("overview", _run)
     except Exception as e:
         logger.error(f"overview 失败: {e}")
         data = None
@@ -281,7 +425,7 @@ def streak():
         zt_today = _hub.zt_pool.get_realtime()
         return _do_fetch_streak(zt_data_today=zt_today)
     try:
-        data = _coalesce("streak", _run)
+        data = _cached_fetch("streak", _run)
     except Exception as e:
         logger.error(f"streak 失败: {e}")
         data = None
@@ -333,7 +477,7 @@ def _do_fetch_dragon():
 @shichang_bp.route('/dragon')
 def dragon():
     try:
-        data = _coalesce("dragon", _do_fetch_dragon)
+        data = _cached_fetch("dragon", _do_fetch_dragon)
     except Exception as e:
         logger.error(f"dragon 失败: {e}")
         data = None
@@ -379,7 +523,7 @@ def _do_fetch_hot(limit=50):
 @shichang_bp.route('/hot')
 def hot():
     try:
-        data = _coalesce("hot", _do_fetch_hot)
+        data = _cached_fetch("hot", _do_fetch_hot)
     except Exception as e:
         logger.error(f"hot 失败: {e}")
         data = None
@@ -450,7 +594,7 @@ def strong():
         zt_today = _hub.zt_pool.get_realtime()
         return _do_fetch_strong(zt_data_today=zt_today)
     try:
-        data = _coalesce("strong", _run)
+        data = _cached_fetch("strong", _run)
     except Exception as e:
         logger.error(f"strong 失败: {e}")
         data = None
@@ -661,7 +805,7 @@ def china_macro():
         }
 
     try:
-        data = _coalesce("china_macro", _run, timeout=60)
+        data = _cached_fetch("china_macro", _run, timeout=60)
     except Exception as e:
         logger.error("china-macro 失败: %s", e)
         data = None
@@ -676,7 +820,7 @@ def china_fear_greed():
         return fear_greed_index()
 
     try:
-        data = _coalesce("china_fg", _run, timeout=30)
+        data = _cached_fetch("china_fg", _run, timeout=30)
     except Exception as e:
         logger.error("china-fear-greed 失败: %s", e)
         data = None
@@ -697,7 +841,7 @@ def china_policy():
         }
 
     try:
-        data = _coalesce("china_policy", _run, timeout=30)
+        data = _cached_fetch("china_policy", _run, timeout=30)
     except Exception as e:
         logger.error("china-policy 失败: %s", e)
         data = None
@@ -712,7 +856,7 @@ def hot_sectors():
         return get_all_hot_sectors(industry_limit=15, concept_limit=15)
 
     try:
-        data = _coalesce("hot_sectors", _run, timeout=20)
+        data = _cached_fetch("hot_sectors", _run, timeout=20)
     except Exception as e:
         logger.error("hot-sectors 失败: %s", e)
         data = None
@@ -751,7 +895,7 @@ def sector_trend():
         return get_sector_trend(db, board_type=board_type)
 
     try:
-        data = _coalesce(cache_key, _run, timeout=30)
+        data = _cached_fetch(cache_key, _run, timeout=30)
     except Exception as e:
         logger.error("sector-trend 失败: %s", e)
         data = None
@@ -780,7 +924,7 @@ def sector_prediction():
         }
 
     try:
-        data = _coalesce("sector_prediction", _run, timeout=30)
+        data = _cached_fetch("sector_prediction", _run, timeout=30)
     except Exception as e:
         logger.error("sector-prediction 失败: %s", e)
         data = None
@@ -828,7 +972,7 @@ def sector_cycle():
         }
 
     try:
-        data = _coalesce(cache_key, _run, timeout=30)
+        data = _cached_fetch(cache_key, _run, timeout=30)
     except Exception as e:
         logger.error("sector-cycle 失败: %s", e)
         data = None
@@ -855,3 +999,103 @@ def emotion_history():
     except Exception as e:
         logger.error(f"查询情绪历史失败: {e}")
         return jsonify({"code": 0, "msg": str(e), "history": []}), 500
+
+
+# ============================================================
+#  手动刷新（与 global-market /refresh 一致）
+# ============================================================
+
+@shichang_bp.route('/refresh', methods=['POST'])
+def refresh_data():
+    """手动触发远端拉取 → 写缓存"""
+    body = request.get_json(silent=True) or {}
+    target = body.get("target", "all")
+
+    FETCH_MAP = {
+        "overview":   lambda: _do_fetch_overview(zt_data_today=_hub.zt_pool.get_realtime()),
+        "streak":     lambda: _do_fetch_streak(zt_data_today=_hub.zt_pool.get_realtime()),
+        "dragon":     _do_fetch_dragon,
+        "hot":        _do_fetch_hot,
+        "strong":     lambda: _do_fetch_strong(zt_data_today=_hub.zt_pool.get_realtime()),
+        "china_macro": lambda: _fetch_china_macro_data(),
+        "china_fg":   lambda: _fetch_china_fg_data(),
+        "china_policy": lambda: _fetch_china_policy_data(),
+        "hot_sectors": lambda: _fetch_hot_sectors_data(),
+    }
+
+    results = {}
+    targets = list(FETCH_MAP.keys()) if target == "all" else [target]
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {}
+        for t in targets:
+            if t in FETCH_MAP:
+                futures[pool.submit(_safe_refresh_one, t, FETCH_MAP[t])] = t
+        for fut in as_completed(futures, timeout=120):
+            key = futures[fut]
+            try:
+                results[key] = "ok" if fut.result() else "failed"
+            except Exception as e:
+                results[key] = f"error: {e}"
+
+    return jsonify({"code": 1, "msg": "refresh done", "results": results})
+
+
+def _safe_refresh_one(endpoint, fn):
+    """安全刷新单个 endpoint: 拉远端 → 写缓存"""
+    lock = _get_refresh_lock(endpoint)
+    if not lock.acquire(blocking=False):
+        return False
+    try:
+        data = _coalesce(endpoint, fn, timeout=60)
+        if data is not None:
+            _write_cache_sh(endpoint, data)
+            return True
+        return False
+    finally:
+        lock.release()
+
+
+def _fetch_china_macro_data():
+    """抽取 china-macro 的数据获取逻辑（供 refresh 调用）"""
+    from app.market_cn.data_sources import ChinaData
+    data = ChinaData()
+    fetchers = [
+        ("gdp", data.gdp), ("cpi", data.cpi), ("ppi", data.ppi), ("pmi", data.pmi),
+        ("m2", data.m2), ("lpr", data.lpr), ("social_financing", data.social_financing),
+        ("trade", data.trade),
+    ]
+    macro = {}
+    def _fetch_one(name, fn):
+        try:
+            df = fn()
+            if df is not None and len(df) > 0:
+                records = df.tail(6).fillna("").to_dict(orient="records")
+                return name, {"columns": list(df.columns), "latest": records, "count": len(df)}
+            return name, {"columns": [], "latest": [], "count": 0}
+        except Exception as e:
+            return name, {"columns": [], "latest": [], "count": 0, "error": str(e)}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {pool.submit(_fetch_one, n, f): n for n, f in fetchers}
+        for fut in as_completed(futures, timeout=60):
+            name, result = fut.result(timeout=5)
+            macro[name] = result
+    return {"code": 1, "msg": "success", "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "data": macro}
+
+
+def _fetch_china_fg_data():
+    from app.market_cn.fear_greed_index import fear_greed_index
+    return fear_greed_index()
+
+
+def _fetch_china_policy_data():
+    from app.market_cn.policy_analysis import get_policy_keywords, analyze_policy_impact
+    policy_items = get_policy_keywords()
+    impacts = analyze_policy_impact(policy_items) if policy_items else []
+    return {"code": 1, "msg": "success", "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "data": {"policy_items": policy_items[:30], "impacts": impacts[:20]}}
+
+
+def _fetch_hot_sectors_data():
+    from app.market_cn.hot_sectors import get_all_hot_sectors
+    return get_all_hot_sectors(industry_limit=15, concept_limit=15)

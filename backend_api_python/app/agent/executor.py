@@ -250,6 +250,75 @@ class _ConversationManager:
 _conversations = _ConversationManager()
 
 
+# ── Cross-turn tool result helpers ─────────────────────────────
+
+def _extract_tool_data(tool_calls_log: List[Dict], messages: List[Dict]) -> Dict[str, Any]:
+    """Extract useful data from tool call results in the message history.
+
+    Returns a dict with the latest results for each tool type.
+    """
+    data: Dict[str, Any] = {}
+    # Walk messages in reverse to find tool results
+    tool_name_to_result: Dict[str, Any] = {}
+    for msg in reversed(messages):
+        if msg.get("role") == "tool":
+            name = msg.get("name", "")
+            content = msg.get("content", "")
+            if name and name not in tool_name_to_result:
+                try:
+                    parsed = json.loads(content)
+                except (json.JSONDecodeError, TypeError):
+                    parsed = content
+                tool_name_to_result[name] = parsed
+
+    # Keep compact versions of key results
+    for tool_name in ("get_realtime_quote", "analyze_trend", "get_volume_analysis",
+                       "get_daily_history", "get_chip_distribution", "search_stock_news"):
+        if tool_name in tool_name_to_result:
+            result = tool_name_to_result[tool_name]
+            # Truncate large results
+            result_str = json.dumps(result, ensure_ascii=False) if isinstance(result, (dict, list)) else str(result)
+            if len(result_str) > 2000:
+                result_str = result_str[:2000] + "...(truncated)"
+            data[tool_name] = result_str
+
+    return data
+
+
+def _inject_saved_tool_results(session_id: str, context: Optional[Dict]) -> str:
+    """Retrieve saved tool results and format as injectable context text."""
+    try:
+        store = _conversations._get_store()
+        if not store:
+            return ""
+        saved = store.get_tool_results(session_id)
+        if not saved:
+            return ""
+
+        stock_code = (context or {}).get("stock_code", "")
+        # Try exact match first, then any entry
+        results = saved.get(stock_code) or next(iter(saved.values()), {})
+        if not results:
+            return ""
+
+        lines = []
+        tool_labels = {
+            "get_realtime_quote": "实时行情",
+            "analyze_trend": "技术趋势",
+            "get_volume_analysis": "量能分析",
+            "get_daily_history": "历史K线",
+            "get_chip_distribution": "筹码分布",
+            "search_stock_news": "新闻舆情",
+        }
+        for tool_name, result in results.items():
+            label = tool_labels.get(tool_name, tool_name)
+            lines.append(f"【{label}】\n{result}")
+
+        return "\n\n".join(lines)
+    except Exception:
+        return ""
+
+
 # ── AgentExecutor ─────────────────────────────────────────────
 
 class AgentExecutor:
@@ -322,8 +391,8 @@ class AgentExecutor:
         messages.extend(history)
 
         # Inject previous analysis context if provided
+        context_parts: List[str] = []
         if context:
-            context_parts = []
             if context.get("stock_code"):
                 context_parts.append(f"股票代码: {context['stock_code']}")
             if context.get("stock_name"):
@@ -332,10 +401,16 @@ class AgentExecutor:
                 summary = context["previous_analysis_summary"]
                 text = json.dumps(summary, ensure_ascii=False) if isinstance(summary, dict) else str(summary)
                 context_parts.append(f"上次分析摘要:\n{text}")
-            if context_parts:
-                ctx_msg = "[系统提供的历史分析上下文]\n" + "\n".join(context_parts)
-                messages.append({"role": "user", "content": ctx_msg})
-                messages.append({"role": "assistant", "content": "好的，我已了解该股票的历史分析数据。请告诉我你想了解什么？"})
+
+        # Inject saved tool results from previous turns
+        saved_tools = _inject_saved_tool_results(session_id, context)
+        if saved_tools:
+            context_parts.append(f"[历史工具调用结果（可直接引用，无需重复调用）]:\n{saved_tools}")
+
+        if context_parts:
+            ctx_msg = "[系统提供的历史分析上下文]\n" + "\n".join(context_parts)
+            messages.append({"role": "user", "content": ctx_msg})
+            messages.append({"role": "assistant", "content": "好的，我已了解该股票的历史分析数据。请告诉我你想了解什么？"})
 
         messages.append({"role": "user", "content": message})
 
@@ -350,6 +425,20 @@ class AgentExecutor:
         else:
             _conversations.add_message(session_id, "assistant",
                                         f"[分析失败] {result.error or '未知错误'}")
+
+        # Persist tool results for cross-turn reuse
+        if result.tool_calls_log:
+            try:
+                store = _conversations._get_store()
+                if store:
+                    # Extract key data from tool call results
+                    tool_data = _extract_tool_data(result.tool_calls_log, result.messages)
+                    if tool_data:
+                        stock_code = (context or {}).get("stock_code", "unknown")
+                        store.save_tool_results(session_id, {stock_code: tool_data})
+            except Exception:
+                pass  # Non-critical
+
         return result
 
     def _run_loop(

@@ -287,6 +287,7 @@ export default {
       emotionTimer: null,
       sectorTimer: null,
       trendTimer: null,
+      predictionTimer: null,
 
       // 数据
       marketData: {
@@ -478,6 +479,62 @@ export default {
       }
     },
 
+    // ==================== 今日板块预测（独立接口，首次+30分钟刷新） ====================
+
+    async fetchSectorPrediction () {
+      if (this.isDestroyed) return
+      try {
+        const resp = await request({ url: '/api/shichang/sector-prediction', method: 'GET', timeout: 30000 })
+        const data = resp?.data || resp
+        if (this.isDestroyed || !data?.data) return
+
+        this.sectorPrediction = data.data
+
+        // 将预测结果注入 AI 卡片热门板块
+        const industry = data.data.industry || {}
+        const concept = data.data.concept || {}
+        const candidates = [
+          ...(industry.candidates || []).map(c => ({ ...c, _type: '行业' })),
+          ...(concept.candidates || []).map(c => ({ ...c, _type: '概念' }))
+        ]
+
+        if (candidates.length > 0) {
+          // 按综合分排序，取 Top
+          candidates.sort((a, b) => (b.composite_score || 0) - (a.composite_score || 0))
+          const topCandidates = candidates.slice(0, 4)
+
+          // 合并到 hotSectors（prediction 优先，去重）
+          const existing = this.aiAnalysis.hotSectors || []
+          const merged = []
+
+          for (const c of topCandidates) {
+            merged.push({
+              name: c.name,
+              driver: c.reasons?.[0] || `${c._type}预测`,
+              score: Math.round(c.composite_score || 50),
+              source: 'prediction'
+            })
+          }
+
+          // 追加非预测来源的已有板块（去重）
+          for (const s of existing) {
+            if (!merged.find(m => m.name === s.name) && merged.length < 6) {
+              merged.push(s)
+            }
+          }
+
+          this.aiAnalysis.hotSectors = merged.slice(0, 6)
+        }
+
+        // 重新生成操作建议
+        this.buildAiFromOverview()
+
+        console.log('[板块预测] 已刷新:', candidates.length, '个候选板块')
+      } catch (e) {
+        console.error('[板块预测] 刷新失败:', e)
+      }
+    },
+
     // ==================== AI 分析构建 ====================
 
     buildAiFromOverview () {
@@ -542,6 +599,22 @@ export default {
         const top = this.sectorTrend.prediction.candidates.slice(0, 2)
         const names = top.map(c => c.name).join('、')
         advices.push(`关注主线: ${names}`)
+      }
+
+      // 今日板块预测（独立接口，更精确的预测）
+      if (this.sectorPrediction) {
+        const indPred = this.sectorPrediction.industry || {}
+        const conPred = this.sectorPrediction.concept || {}
+        const allPred = [
+          ...(indPred.candidates || []).map(c => ({ ...c, _type: '行业' })),
+          ...(conPred.candidates || []).map(c => ({ ...c, _type: '概念' }))
+        ]
+        if (allPred.length > 0) {
+          allPred.sort((a, b) => (b.composite_score || 0) - (a.composite_score || 0))
+          const top3 = allPred.slice(0, 3)
+          const predLine = top3.map(c => `${c.name}(${Math.round(c.composite_score || 0)}分)`).join('、')
+          advices.push(`🎯 今日预测: ${predLine}`)
+        }
       }
       if (this.sectorTrend?.trend?.items?.length > 0) {
         const strong = this.sectorTrend.trend.items.filter(x => x.score > 70).slice(0, 2)
@@ -665,6 +738,7 @@ export default {
     this.fetchEmotionHistory()
     this.fetchHotSectors()
     this.fetchSectorTrend()
+    this.fetchSectorPrediction()
 
     // 大盘指数：10秒刷新一次
     this.indexTimer = setInterval(() => this.fetchIndex(), 10000)
@@ -680,6 +754,9 @@ export default {
 
     // 趋势分析：30分钟刷新一次（数据变化慢）
     this.trendTimer = setInterval(() => this.fetchSectorTrend(), 1800000)
+
+    // 板块预测：30分钟刷新一次
+    this.predictionTimer = setInterval(() => this.fetchSectorPrediction(), 1800000)
   },
 
   beforeDestroy () {
@@ -689,6 +766,7 @@ export default {
     if (this.emotionTimer) clearInterval(this.emotionTimer)
     if (this.sectorTimer) clearInterval(this.sectorTimer)
     if (this.trendTimer) clearInterval(this.trendTimer)
+    if (this.predictionTimer) clearInterval(this.predictionTimer)
     if (this.resizeHandler) window.removeEventListener('resize', this.resizeHandler)
     if (this.chartInstance) {
       this.chartInstance.dispose()

@@ -135,6 +135,14 @@ def ts_money_supply():
 
 
 @retry()
+def ts_lpr():
+    """Tushare: LPR 利率"""
+    pro = _tushare_api()
+    df = pro.lpr()
+    return df.sort_values("date").tail(12)
+
+
+@retry()
 def ts_index_daily(symbol="000300.SH"):
     """Tushare: 指数日线"""
     pro = _tushare_api()
@@ -492,6 +500,7 @@ class ChinaData:
         """LPR 利率"""
         print("\n📊 LPR")
         return fallback(
+            ("tushare", ts_lpr),
             ("akshare", ak_lpr),
             ("official-pbc", official_lpr),
         )()

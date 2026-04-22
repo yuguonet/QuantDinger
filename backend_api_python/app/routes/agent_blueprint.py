@@ -55,6 +55,10 @@ TOOL_DISPLAY_NAMES: Dict[str, str] = {
 }
 
 
+# ── 共享市场检测 ─────────────────────────────────────────────
+from app.agent.utils import detect_market as _detect_market
+
+
 # ── 股票代码提取 ─────────────────────────────────────────────
 
 def _extract_stock_code(msg: str, ctx: Optional[Dict], session: Dict) -> Optional[str]:
@@ -66,38 +70,6 @@ def _extract_stock_code(msg: str, ctx: Optional[Dict], session: Dict) -> Optiona
     if m:
         return m.group(1)
     return session.get("stock_code")
-
-
-def _detect_market(stock_code: str) -> str:
-    code = (stock_code or "").strip().upper()
-    if not code:
-        return "Crypto"
-
-    # Explicit exchange prefixes
-    if code.startswith(("SH", "SZ", "BJ")):
-        return "CNStock"
-    if code.startswith("HK"):
-        return "HKStock"
-
-    # Chinese A-share: 6-digit numeric (SH 6xxxxx/9xxxxx, SZ 0xxxxx/3xxxxx)
-    if len(code) == 6 and code.isdigit():
-        return "CNStock"
-
-    # Known crypto patterns
-    _CRYPTO_PREFIXES = ("BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "DOT",
-                        "AVAX", "MATIC", "LINK", "UNI", "LTC", "ATOM", "FIL",
-                        "ARB", "OP", "APT", "SUI", "PEPE", "SHIB", "TRX")
-    _CRYPTO_SUFFIXES = ("USDT", "USDC", "BUSD", "BTC", "ETH")
-    if any(code.startswith(p) for p in _CRYPTO_PREFIXES):
-        return "Crypto"
-    if any(code.endswith(s) for s in _CRYPTO_SUFFIXES) and not code.isalpha():
-        return "Crypto"
-
-    # Forex: exactly 6 alphabetic characters (e.g. EURUSD, GBPJPY)
-    if len(code) == 6 and code.isalpha():
-        return "Forex"
-
-    return "Crypto"
 
 
 # ── 会话存储（Redis / 内存自动降级）──────────────────────────
