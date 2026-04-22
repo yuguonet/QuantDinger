@@ -382,7 +382,38 @@ class CryptoDataSource(BaseDataSource):
 
                 ohlcv = all_ohlcv
             else:
-                ohlcv = self.exchange.fetch_ohlcv(symbol_pair, ccxt_timeframe, limit=limit)
+                # 最新数据：也用分批拉取，避免单次 limit 超过交易所上限（如 Coinbase 300）
+                all_ohlcv = []
+                batch_limit = 300
+                # 从最近的时间开始，往前回溯分批拉取
+                batch = self.exchange.fetch_ohlcv(
+                    symbol_pair, ccxt_timeframe, limit=batch_limit
+                )
+                if batch:
+                    all_ohlcv.extend(batch)
+                    # 还需要更多数据时继续往前拉
+                    while len(all_ohlcv) < limit:
+                        last_ts = batch[-1][0]
+                        next_since = last_ts + TIMEFRAME_SECONDS.get(timeframe, 86400) * 1000
+                        batch = self.exchange.fetch_ohlcv(
+                            symbol_pair, ccxt_timeframe, since=next_since, limit=batch_limit
+                        )
+                        if not batch:
+                            break
+                        all_ohlcv.extend(batch)
+                        # 防死循环：时间戳没前进
+                        if batch[-1][0] <= last_ts:
+                            break
+                    # 去重（按 timestamp）
+                    seen = set()
+                    deduped = []
+                    for bar in all_ohlcv:
+                        if bar[0] not in seen:
+                            seen.add(bar[0])
+                            deduped.append(bar)
+                    ohlcv = deduped
+                else:
+                    ohlcv = []
 
             # logger.info(f"CCXT 返回 {len(ohlcv) if ohlcv else 0} 条数据")
             return ohlcv

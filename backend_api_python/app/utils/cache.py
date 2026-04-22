@@ -3,6 +3,7 @@ Cache utilities.
 Local-first behavior: use in-memory cache by default.
 Redis is only used when explicitly enabled via environment variables.
 """
+import os
 import time
 import threading
 from typing import Optional, Any
@@ -17,7 +18,7 @@ logger = get_logger(__name__)
 class MemoryCache:
     """内存缓存（Redis 不可用时的备选方案）"""
     
-    MAX_SIZE = 10000  # 最大条目数，超出后清理过期条目
+    MAX_SIZE = int(os.getenv('CACHE_MAX_ENTRIES', 10000))  # 最大条目数，超出后清理过期条目
     
     def __init__(self):
         self._cache = {}

@@ -81,7 +81,7 @@ def _em_secid_from_cn(symbol: str) -> str:
 
 # ---------- K线数据 ----------
 
-@retry_with_backoff(max_attempts=3, base_delay=2.0, max_delay=12.0, exceptions=(
+@retry_with_backoff(max_attempts=1, exceptions=(
     requests.exceptions.RequestException,
     ConnectionError,
     TimeoutError,
@@ -188,7 +188,7 @@ def fetch_eastmoney_kline(
 
 # ---------- 实时行情（单股）----------
 
-@retry_with_backoff(max_attempts=2, base_delay=1.5, max_delay=8.0, exceptions=(
+@retry_with_backoff(max_attempts=1, exceptions=(
     requests.exceptions.RequestException,
     ConnectionError,
     TimeoutError,

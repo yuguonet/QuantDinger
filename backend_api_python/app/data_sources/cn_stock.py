@@ -245,8 +245,8 @@ class CNStockDataSource(BaseDataSource):
         before_time: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
-        获取K线数据，fallback chain:
-          Twelve Data → 腾讯(日/周) → 东方财富 → 新浪(日) → yfinance → AkShare
+        获取K线数据，fallback chain（国内优先）:
+          东方财富(全周期) → 腾讯(日/周) → 新浪(日) → AkShare(分钟/周) → Twelve Data → yfinance
         """
         code = normalize_cn_code(symbol)
         tf = normalize_chart_timeframe(timeframe)
@@ -316,19 +316,20 @@ class CNStockDataSource(BaseDataSource):
         """
         按数据源和周期构建 fallback 列表。
         用 default-arg 捕获循环变量，避免 lambda 闭包陷阱。
+
+        A 股优先国内源（直连快、免费），海外源降级兜底。
         """
         sources: List[Tuple[str, Callable[[], List[Dict[str, Any]]]]] = []
 
-        # 1) Twelve Data (付费，无 Key 时快速返回 [])
+        # 1) 东方财富直接API（国内直连，全周期，最稳定）
         sources.append((
-            "twelvedata",
-            lambda _c=code, _t=tf, _l=lim, _b=before_time: fetch_twelvedata_klines(
-                is_hk=False, tencent_code=_c,
-                timeframe=_t, limit=_l, before_time=_b,
+            "eastmoney_kline",
+            lambda _c=code, _t=tf, _l=lim: fetch_eastmoney_kline(
+                _c, period=_t, count=_l, adj="qfq",
             ),
         ))
 
-        # 2) 腾讯日/周线
+        # 2) 腾讯日/周线（国内直连）
         if tf in ("1D", "1W"):
             period = "day" if tf == "1D" else "week"
             sources.append((
@@ -338,31 +339,14 @@ class CNStockDataSource(BaseDataSource):
                 ),
             ))
 
-        # 3) 东方财富直接API（全周期）
-        sources.append((
-            "eastmoney_kline",
-            lambda _c=code, _t=tf, _l=lim: fetch_eastmoney_kline(
-                _c, period=_t, count=_l, adj="qfq",
-            ),
-        ))
-
-        # 4) 新浪（仅日线）
+        # 3) 新浪（国内直连，仅日线）
         if tf == "1D":
             sources.append((
                 "sina_kline",
                 lambda _c=code, _l=lim: fetch_sina_kline(_c, count=_l, adj="qfq"),
             ))
 
-        # 5) yfinance
-        sources.append((
-            "yfinance",
-            lambda _c=code, _t=tf, _l=lim, _b=before_time: fetch_yfinance_klines(
-                is_hk=False, tencent_code=_c,
-                timeframe=_t, limit=_l, before_time=_b,
-            ),
-        ))
-
-        # 6) AkShare
+        # 4) AkShare（国内兜底，分钟线/周线）
         if tf in ("1m", "5m", "15m", "30m", "1H", "4H"):
             sources.append((
                 "akshare_minute",
@@ -379,6 +363,24 @@ class CNStockDataSource(BaseDataSource):
                     limit=_l, before_time=_b,
                 ),
             ))
+
+        # 5) Twelve Data（海外付费，降级）
+        sources.append((
+            "twelvedata",
+            lambda _c=code, _t=tf, _l=lim, _b=before_time: fetch_twelvedata_klines(
+                is_hk=False, tencent_code=_c,
+                timeframe=_t, limit=_l, before_time=_b,
+            ),
+        ))
+
+        # 6) yfinance（海外，最后兜底）
+        sources.append((
+            "yfinance",
+            lambda _c=code, _t=tf, _l=lim, _b=before_time: fetch_yfinance_klines(
+                is_hk=False, tencent_code=_c,
+                timeframe=_t, limit=_l, before_time=_b,
+            ),
+        ))
 
         return sources
 
