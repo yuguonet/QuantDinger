@@ -45,6 +45,11 @@ from app.data_sources.rate_limiter import (
     random_sleep,
     retry_with_backoff
 )
+from app.data_sources.market_detector import (
+    detect_market,
+    validate_market,
+    safe_market,
+)
 
 __all__ = [
     # 工厂
@@ -63,4 +68,8 @@ __all__ = [
     'get_random_user_agent',
     'random_sleep',
     'retry_with_backoff',
+    # 市场类型推断
+    'detect_market',
+    'validate_market',
+    'safe_market',
 ]

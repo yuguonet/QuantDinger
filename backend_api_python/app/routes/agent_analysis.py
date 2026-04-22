@@ -38,7 +38,7 @@ def canonical_stock_code(code: str) -> str:
     return (code or "").strip().upper()
 
 
-def _get_ds(market: str = "AShare"):
+def _get_ds(market: str = "CNStock"):
     from app.data_sources.factory import DataSourceFactory
     return DataSourceFactory.get_source(market)
 
@@ -46,11 +46,13 @@ def _get_ds(market: str = "AShare"):
 def _detect_market(stock_code: str) -> str:
     code = canonical_stock_code(stock_code)
     if code.startswith(("SH", "SZ", "BJ")):
-        return "AShare"
+        return "CNStock"
     if code.startswith("HK"):
-        return "HShare"
+        return "HKStock"
     if len(code) <= 6 and code.isdigit():
-        return "AShare"
+        return "CNStock"
+    if len(code) == 6 and code.isalpha():
+        return "Forex"
     return "Crypto"
 
 

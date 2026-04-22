@@ -171,25 +171,28 @@ def _build_messages(session_id: str, user_message: str,
 
 # ── 工具执行 ─────────────────────────────────────────────
 
-def _get_ds(market: str = "AShare"):
+def _get_ds(market: str = "CNStock"):
     """从 DataSourceFactory 获取数据源。"""
     from app.data_sources.factory import DataSourceFactory
     return DataSourceFactory.get_source(market)
 
 
 def _detect_market(stock_code: str) -> str:
-    """根据股票代码粗判市场。"""
+    """根据股票代码粗判市场，返回 DataSourceFactory 兼容的市场名称。"""
     code = (stock_code or "").strip().upper()
     if code.startswith(("SH", "SZ", "BJ")):
-        return "AShare"
+        return "CNStock"
     if code.startswith(("HK",)):
-        return "HShare"
+        return "HKStock"
     if len(code) <= 6 and code.isdigit():
-        return "AShare"
+        return "CNStock"
+    # 6字母外汇对
+    if len(code) == 6 and code.isalpha():
+        return "Forex"
     return "Crypto"
 
 
-def _exec_tool(tool_name: str, params: Dict, market: str = "AShare") -> Any:
+def _exec_tool(tool_name: str, params: Dict, market: str = "CNStock") -> Any:
     """执行单个工具调用，返回结果。"""
     ds = _get_ds(market)
     stock_code = params.get("stock_code", "")
@@ -303,7 +306,7 @@ class _AgentExecutor:
             # 获取会话和提取股票代码
             session = _get_session(session_id)
             stock_code = _extract_stock_code(message, context, session)
-            market = _detect_market(stock_code) if stock_code else "AShare"
+            market = _detect_market(stock_code) if stock_code else "CNStock"
 
             # 记录股票代码到会话
             if stock_code:
