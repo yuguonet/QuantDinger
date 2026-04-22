@@ -48,7 +48,7 @@ build/
 venv/
 .venv/
 env/
-
+/docs/
 # ========================
 # Node (if any remain)
 # ========================
