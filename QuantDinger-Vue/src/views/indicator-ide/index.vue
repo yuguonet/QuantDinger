@@ -54,13 +54,7 @@
             size="small"
             class="tf-group ide-tf-seg"
           >
-            <a-radio-button value="1m">1m</a-radio-button>
-            <a-radio-button value="5m">5m</a-radio-button>
-            <a-radio-button value="15m">15m</a-radio-button>
-            <a-radio-button value="1H">1H</a-radio-button>
-            <a-radio-button value="4H">4H</a-radio-button>
-            <a-radio-button value="1D">1D</a-radio-button>
-            <a-radio-button value="1W">1W</a-radio-button>
+            <a-radio-button v-for="tf in timeframeOptions" :key="tf" :value="tf">{{ tf }}</a-radio-button>
           </a-radio-group>
         </div>
 
@@ -1063,10 +1057,16 @@ const TF_MAX_DAYS = {
   '15m': 365,
   '30m': 365,
   '1H': 730,
+  '2H': 1460,
   '4H': 1460,
   '1D': 3650,
   '1W': 7300
 }
+
+/** A 股 / 港股交易半天，4H 无意义，用 2H（上午/下午各一根） */
+const ASIAN_STOCK_TF = ['1m', '5m', '15m', '1H', '2H', '1D', '1W']
+/** 美股 / 加密 / 外汇 / 期货连续交易，4H 更合适 */
+const GLOBAL_MARKET_TF = ['1m', '5m', '15m', '1H', '4H', '1D', '1W']
 
 const DATE_PRESETS = [
   { key: '1m', label: '1M', days: 30 },
@@ -1232,6 +1232,12 @@ export default {
     },
     chartTheme () {
       return this.isDarkTheme ? 'dark' : 'light'
+    },
+    /** 按市场类型返回可用的时间周期列表 */
+    timeframeOptions () {
+      const m = (this.market || '').toLowerCase()
+      if (m === 'cnstock' || m === 'hkstock') return ASIAN_STOCK_TF
+      return GLOBAL_MARKET_TF
     },
     /** 有标的时开启 K 线轮询更新（与指标分析页一致） */
     klineRealtimeEnabled () {
@@ -3724,6 +3730,10 @@ export default {
       }
     },
     market () {
+      // 切换市场时，若当前 timeframe 不在新市场的可选项中，自动修正为 1D
+      if (this.timeframeOptions.indexOf(this.timeframe) === -1) {
+        this.timeframe = '1D'
+      }
       this.schedulePersistIdeUiState()
     },
     selectedIndicatorId () {

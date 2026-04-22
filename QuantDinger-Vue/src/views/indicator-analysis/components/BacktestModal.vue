@@ -489,14 +489,7 @@
                     style="width: 100%"
                     @change="onTimeframeChange"
                   >
-                    <a-select-option value="1m">1m</a-select-option>
-                    <a-select-option value="5m">5m</a-select-option>
-                    <a-select-option value="15m">15m</a-select-option>
-                    <a-select-option value="30m">30m</a-select-option>
-                    <a-select-option value="1H">1H</a-select-option>
-                    <a-select-option value="4H">4H</a-select-option>
-                    <a-select-option value="1D">1D</a-select-option>
-                    <a-select-option value="1W">1W</a-select-option>
+                    <a-select-option v-for="tf in backtestTimeframeOptions" :key="tf" :value="tf">{{ tf }}</a-select-option>
                   </a-select>
                 </a-form-item>
               </a-col>
@@ -718,6 +711,14 @@ export default {
     isDarkTheme () {
       return this.navTheme === 'dark' || this.navTheme === 'realdark'
     },
+    /** 按市场类型返回可用的回测时间周期 */
+    backtestTimeframeOptions () {
+      const m = (this.market || '').toLowerCase()
+      if (m === 'cnstock' || m === 'hkstock') {
+        return ['1m', '5m', '15m', '30m', '1H', '2H', '1D', '1W']
+      }
+      return ['1m', '5m', '15m', '30m', '1H', '4H', '1D', '1W']
+    },
     backtestModalWrapClass () {
       return this.isDarkTheme ? 'backtest-modal-wrap backtest-modal-wrap--dark' : 'backtest-modal-wrap'
     },
@@ -806,6 +807,12 @@ export default {
     // entryPctMaxUi is in data (percent units)
   },
   watch: {
+    market () {
+      // 切换市场时，若当前 timeframe 不在新市场的可选项中，自动修正为 1D
+      if (this.backtestTimeframeOptions.indexOf(this.selectedTimeframe) === -1) {
+        this.selectedTimeframe = '1D'
+      }
+    },
     visible (val) {
       if (val) {
         // 弹窗打开时重置状态
@@ -818,6 +825,10 @@ export default {
         this.precisionInfo = null
         this.selectedDatePreset = null
         this.selectedTimeframe = this.timeframe || '1D' // 初始化为props传入的时间周期
+        // 确保初始 timeframe 在当前市场可选项中
+        if (this.backtestTimeframeOptions.indexOf(this.selectedTimeframe) === -1) {
+          this.selectedTimeframe = '1D'
+        }
         this.result = {
           totalReturn: 0,
           annualReturn: 0,

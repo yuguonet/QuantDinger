@@ -2150,6 +2150,11 @@ registerOverlay({
                  date1.getMonth() === date2.getMonth() &&
                  date1.getDate() === date2.getDate() &&
                  date1.getHours() === date2.getHours()
+        case '2H':
+          return date1.getFullYear() === date2.getFullYear() &&
+                 date1.getMonth() === date2.getMonth() &&
+                 date1.getDate() === date2.getDate() &&
+                 Math.floor(date1.getHours() / 2) === Math.floor(date2.getHours() / 2)
         case '4H':
           return date1.getFullYear() === date2.getFullYear() &&
                  date1.getMonth() === date2.getMonth() &&
@@ -2639,6 +2644,7 @@ registerOverlay({
         '15m': 15000,
         '30m': 30000,
         '1H': 60000,
+        '2H': 180000,
         '4H': 300000,
         '1D': 600000,
         '1W': 1800000
