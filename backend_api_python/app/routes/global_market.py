@@ -2,18 +2,21 @@
 Global Market Dashboard APIs.
 
 Provides aggregated global market data including:
-- Major indices (US, Europe, Japan, Korea, Australia, India)
-- Forex pairs
-- Crypto prices
-- Market heatmap data (crypto, stocks, forex)
-- Economic calendar with impact indicators
-- Fear & Greed Index / VIX
-- Financial news (Chinese & English)
+- Market sentiment (Fear & Greed, VIX, DXY, yield curve, VXN, GVZ, VIX term structure)
+- Commodities (gold, silver, oil, natural gas)
+- Stock indices — 独立接口，按需调用 (S&P 500, Dow, NASDAQ, DAX, FTSE, CAC40, Nikkei, KOSPI, ASX, SENSEX)
+- Forex pairs (bundled with indices endpoint)
+- Crypto prices (bundled with indices endpoint)
+- Market heatmap, financial news, economic calendar
+
+Read-write separation:
+- GET  endpoints read from cache
+- POST /refresh fetches remote → writes cache
 
 Endpoints:
-- GET  /api/global-market/overview       - Read overview from cache
-- GET  /api/global-market/sentiment      - Read sentiment from cache
-- POST /api/global-market/refresh        - Fetch remote → write cache
+- GET  /api/global-market/sentiment      - Sentiment indicators + commodities (from cache)
+- GET  /api/global-market/indices         - Indices + forex + crypto (from cache, independent)
+- POST /api/global-market/refresh         - Fetch remote → write cache (target: sentiment|indices|all)
 """
 
 from __future__ import annotations
@@ -49,14 +52,13 @@ global_market_bp = Blueprint("global_market", __name__)
 
 # 缓存过期等待时间（秒）：超过这个时间没更新，后台自动去拉远端
 STALE_AFTER = {
-    "overview":  300,   # 5 分钟
     "sentiment": 300,   # 5 分钟
 }
 
 # 防止并发刷新的锁
 _refresh_locks = {
-    "overview":  threading.Lock(),
     "sentiment": threading.Lock(),
+    "indices":   threading.Lock(),
 }
 
 
@@ -64,28 +66,27 @@ _refresh_locks = {
 # 读 — 返回缓存，同时检查是否过期需要刷新
 # =====================================================================
 
-@global_market_bp.route("/overview", methods=["GET"])
-def market_overview():
-    """Read overview from cache.  Auto-refreshes in background if stale."""
-    cached = _read_stale("market_overview")
-    if cached:
-        # 定时器比对：现在时间 - 日期戳 > 等待时间 → 后台取远端
-        _maybe_refresh("overview", cached.get("timestamp", 0))
-        return jsonify({"code": 1, "msg": "success", "data": cached})
-    # 缓存完全空 → 首次启动，同步拉一次
-    data = _fetch_overview()
-    return jsonify({"code": 1, "msg": "success", "data": data})
-
-
 @global_market_bp.route("/sentiment", methods=["GET"])
 def market_sentiment():
-    """Read sentiment from cache.  Auto-refreshes in background if stale."""
+    """读 sentiment + commodities 缓存，路由层合并返回。"""
     cached = _read_stale_sentiment()
     if cached:
         _maybe_refresh("sentiment", cached.get("fetched_at", 0))
         return jsonify({"code": 1, "msg": "success", "data": cached})
-    # 缓存完全空 → 首次启动，同步拉一次
-    data = _fetch_sentiment()
+    # 缓存完全空 → 首次启动，同步拉一次（两个独立 fetch，各写各缓存）
+    _fetch_sentiment()
+    _fetch_commodities()
+    return jsonify({"code": 1, "msg": "success", "data": _read_stale_sentiment()})
+
+
+@global_market_bp.route("/indices", methods=["GET"])
+def market_indices():
+    """独立接口：读全球股指缓存。前端按需调用，不在 overview 里附带。"""
+    cached = get_cached("stock_indices", CACHE_TTL["stock_indices"])
+    if cached:
+        return jsonify({"code": 1, "msg": "success", "data": cached})
+    # 缓存空 → 同步拉一次
+    data = _fetch_indices()
     return jsonify({"code": 1, "msg": "success", "data": data})
 
 
@@ -97,25 +98,34 @@ def market_sentiment():
 def refresh_data():
     """Fetch fresh data from remote, then write to cache on success."""
     body = request.get_json(silent=True) or {}
-    target = body.get("target", "all")  # "overview" | "sentiment" | "all"
+    target = body.get("target", "all")  # "sentiment" | "indices" | "all"
 
     results = {}
 
-    if target in ("overview", "all"):
-        try:
-            results["overview"] = _fetch_overview()
-        except Exception as e:
-            logger.error("refresh overview failed: %s", e, exc_info=True)
-            results["overview_error"] = str(e)
-
     if target in ("sentiment", "all"):
-        try:
-            results["sentiment"] = _fetch_sentiment()
-        except Exception as e:
-            logger.error("refresh sentiment failed: %s", e, exc_info=True)
-            results["sentiment_error"] = str(e)
+        # sentiment + commodities 独立拉取，各写各缓存，并行执行
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_sent = pool.submit(_fetch_sentiment)
+            f_comm = pool.submit(_fetch_commodities)
+            try:
+                results["sentiment"] = f_sent.result(timeout=20)
+            except Exception as e:
+                logger.error("refresh sentiment failed: %s", e, exc_info=True)
+                results["sentiment_error"] = str(e)
+            try:
+                results["commodities"] = f_comm.result(timeout=20)
+            except Exception as e:
+                logger.error("refresh commodities failed: %s", e, exc_info=True)
+                results["commodities_error"] = str(e)
 
-    ok = "overview_error" not in results and "sentiment_error" not in results
+    if target in ("indices", "all"):
+        try:
+            results["indices"] = _fetch_indices()
+        except Exception as e:
+            logger.error("refresh indices failed: %s", e, exc_info=True)
+            results["indices_error"] = str(e)
+
+    ok = "sentiment_error" not in results and "indices_error" not in results
     return jsonify({"code": 1 if ok else 0, "msg": "refreshed" if ok else "partial", "data": results})
 
 
@@ -123,39 +133,8 @@ def refresh_data():
 # 内部：从远端拉取 → 写缓存
 # =====================================================================
 
-def _fetch_overview():
-    """Fetch overview from remote APIs, write to cache, return data."""
-    result = {
-        "indices": [], "forex": [], "crypto": [], "commodities": [],
-        "timestamp": int(time.time()),
-    }
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {
-            pool.submit(fetch_stock_indices): "indices",
-            pool.submit(fetch_forex_pairs): "forex",
-            pool.submit(fetch_crypto_prices): "crypto",
-            pool.submit(fetch_commodities): "commodities",
-        }
-        for f in as_completed(futures):
-            key = futures[f]
-            try:
-                data = f.result()
-                result[key] = data if data else []
-                logger.info("fetched %s: %d items", key, len(result[key]))
-            except Exception as e:
-                logger.error("fetch %s failed: %s", key, e, exc_info=True)
-                result[key] = []
-
-    # 成功后写缓存
-    set_cached("market_overview", result, CACHE_TTL["market_overview"])
-    set_cached("stock_indices", result["indices"], CACHE_TTL["stock_indices"])
-    set_cached("forex_pairs", result["forex"], CACHE_TTL["forex_pairs"])
-    set_cached("crypto_prices", result["crypto"], CACHE_TTL["crypto_heatmap"])
-    return result
-
-
 def _fetch_sentiment():
-    """Fetch sentiment from remote APIs, write per-indicator cache, return data."""
+    """只拉 7 个宏观情绪指标，写 sentiment 专用缓存。"""
     fetchers = {
         "fear_greed":  fetch_fear_greed_index,
         "vix":         fetch_vix,
@@ -179,37 +158,26 @@ def _fetch_sentiment():
         except Exception:
             logger.warning("sentiment fetch total timeout")
 
-    # 成功的指标写缓存
+    # 写 sentiment 专用缓存
     from app.data_providers.sentiment import _set_cached_indicator
     for key, data in results.items():
         if data is not None:
             _set_cached_indicator(key, data)
 
-    return _pack_sentiment(results)
+    return results
+
+
+def _fetch_commodities():
+    """拉大宗商品，写通用缓存。"""
+    data = fetch_commodities()
+    if data:
+        set_cached("commodities_data", data, CACHE_TTL.get("commodities", 600))
+    return data or []
 
 
 # =====================================================================
 # 内部：读缓存（含过期数据）
 # =====================================================================
-
-def _read_stale(cache_key):
-    """Read cache entry ignoring TTL — returns data even if expired."""
-    cm_obj = _cm()
-    dp_key = f"dp:{cache_key}"
-    try:
-        if cm_obj.is_redis:
-            raw = cm_obj._client.get(dp_key)
-            if raw:
-                return json.loads(raw)
-        else:
-            with cm_obj._client._lock:
-                entry = cm_obj._client._cache.get(dp_key)
-                if entry:
-                    return json.loads(entry[0])
-    except Exception:
-        pass
-    return None
-
 
 def _read_stale_sentiment():
     """Read all sentiment indicators from cache (including expired).
@@ -245,13 +213,30 @@ def _read_stale_sentiment():
 
     if not has_any:
         return None
-    return _pack_sentiment(results, fetched_at=oldest_ts)
+
+    # 同时读大宗商品缓存
+    commodities_data = None
+    try:
+        if cm_obj.is_redis:
+            v = cm_obj._client.get("dp:commodities_data")
+            if v:
+                commodities_data = json.loads(v)
+        else:
+            with cm_obj._client._lock:
+                entry = cm_obj._client._cache.get("dp:commodities_data")
+                if entry:
+                    commodities_data = json.loads(entry[0])
+    except Exception:
+        pass
+
+    return _pack_sentiment(results, fetched_at=oldest_ts, commodities=commodities_data)
 
 
-def _pack_sentiment(results, fetched_at=None):
+def _pack_sentiment(results, fetched_at=None, commodities=None):
     """Assemble standard sentiment response.
 
     fetched_at: original cache timestamp; defaults to now only for fresh data.
+    commodities: 大宗商品数据，合并进 sentiment 返回。
     """
     return {
         "fear_greed":  results.get("fear_greed")  or {"value": 50, "classification": "Neutral"},
@@ -261,6 +246,7 @@ def _pack_sentiment(results, fetched_at=None):
         "vxn":         results.get("vxn")         or {"value": 0, "level": "unknown"},
         "gvz":         results.get("gvz")         or {"value": 0, "level": "unknown"},
         "vix_term":    results.get("vix_term")    or {"value": 1.0, "level": "unknown"},
+        "commodities": commodities or [],
         "fetched_at":  fetched_at or int(time.time()),
     }
 
@@ -287,10 +273,11 @@ def _maybe_refresh(target, cached_ts):
             return
         try:
             logger.info("auto-refresh %s (stale %ds > %ds)", target, elapsed, wait)
-            if target == "overview":
-                _fetch_overview()
-            elif target == "sentiment":
-                _fetch_sentiment()
+            if target == "sentiment":
+                # 两个独立 fetch 并行
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    pool.submit(_fetch_sentiment)
+                    pool.submit(_fetch_commodities)
         except Exception as e:
             logger.error("auto-refresh %s failed: %s", target, e)
         finally:

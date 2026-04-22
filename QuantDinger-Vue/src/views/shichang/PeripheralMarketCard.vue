@@ -34,7 +34,7 @@
         </div>
       </div>
 
-      <!-- 市场列表 — 始终显示 3 项 -->
+      <!-- 市场列表 — 始终显示 3 项，异动从下往上替换 -->
       <div class="market-list">
         <div
           v-for="m in displayItems"
@@ -83,7 +83,7 @@
 <script>
 import request from '@/utils/request'
 
-// 最多显示条目数
+// 最多显示条数
 const MAX_DISPLAY = 3
 // 异动检测阈值（百分比）
 const ANOMALY_THRESHOLD = 2.0
@@ -164,52 +164,37 @@ export default {
         await request({
           url: '/api/global-market/refresh',
           method: 'post',
-          data: { target: 'all' }
+          data: { target: 'sentiment' }
         })
         // 写缓存成功后，重新读缓存
         await this.fetchCache()
       } catch (e) {
-        console.error('[外围市场] 刷新失败:', e)
+        console.error('[宏观指标] 刷新失败:', e)
       } finally {
         if (!this.isDestroyed) this.loading = false
       }
     },
 
-    // ─── 读：从后端缓存拿数据 ───
+    // ─── 读：只读 sentiment 缓存，不再拉 overview ───
     async fetchCache () {
       if (this.isDestroyed) return
       if (this.abortController) this.abortController.abort()
       this.abortController = new AbortController()
       const signal = this.abortController.signal
       try {
-        const [overviewRes, sentimentRes] = await Promise.all([
-          this.readOverview(signal),
-          this.readSentiment(signal)
-        ])
+        const sentimentRes = await this.readSentiment(signal)
         if (this.isDestroyed || signal.aborted) return
-        this.processData(overviewRes, sentimentRes)
+        this.processData(null, sentimentRes)
         this.lastUpdate = new Date().toLocaleTimeString()
       } catch (e) {
         if (e.name === 'AbortError' || e.code === 'ERR_CANCELED') return
-        console.error('[外围市场] 读缓存失败:', e)
+        console.error('[宏观指标] 读缓存失败:', e)
       }
     },
 
     // ─── 定时器：轮询读缓存，后端自己判断是否过期刷新 ───
     async pollCache () {
       await this.fetchCache()
-    },
-
-    async readOverview (signal) {
-      try {
-        const res = await request({ url: '/api/global-market/overview', method: 'get', signal })
-        return res.code === 1 ? res.data : null
-      } catch (e) {
-        if (e.name !== 'AbortError' && e.code !== 'ERR_CANCELED') {
-          console.error('[外围市场] overview 读取失败:', e)
-        }
-        return null
-      }
     },
 
     async readSentiment (signal) {
@@ -227,79 +212,8 @@ export default {
     // ─── 数据处理（不变） ───
 
     processData (overview, sentiment) {
+      // overview 已废弃，所有数据来自 sentiment（含 commodities）
       const items = []
-
-      if (overview && overview.indices) {
-        for (const idx of overview.indices) {
-          const change = parseFloat(idx.change_pct || idx.changePct || idx.change || 0)
-          const price = parseFloat(idx.price || idx.current || 0)
-          const key = `idx_${idx.symbol || idx.code}`
-          const anomaly = this.detectAnomaly(key, change)
-          items.push({
-            key,
-            name: idx.name || idx.name_cn || idx.symbol || '指数',
-            emoji: this.getIndexEmoji(idx.symbol || idx.code || idx.name),
-            price, priceText: this.formatPrice(price),
-            change, changeText: Math.abs(change).toFixed(2),
-            sentiment: this.calcIndexSentiment(change),
-            anomaly: anomaly.isAnomaly, anomalyDir: anomaly.direction
-          })
-        }
-      }
-
-      if (overview && overview.crypto) {
-        for (const c of overview.crypto) {
-          const change = parseFloat(c.change_24h || c.change_pct || c.changePct || c.change || 0)
-          const price = parseFloat(c.price || c.current || 0)
-          const key = `crypto_${c.symbol || c.code}`
-          const anomaly = this.detectAnomaly(key, change)
-          items.push({
-            key,
-            name: c.name || c.name_cn || c.symbol || '加密',
-            emoji: this.getCryptoEmoji(c.symbol || c.code),
-            price, priceText: this.formatPrice(price),
-            change, changeText: Math.abs(change).toFixed(2),
-            sentiment: this.calcCryptoSentiment(change),
-            anomaly: anomaly.isAnomaly, anomalyDir: anomaly.direction
-          })
-        }
-      }
-
-      if (overview && overview.forex) {
-        for (const f of overview.forex) {
-          const change = parseFloat(f.change_pct || f.changePct || f.change || 0)
-          const price = parseFloat(f.price || f.current || 0)
-          const key = `forex_${f.symbol || f.code}`
-          const anomaly = this.detectAnomaly(key, change)
-          items.push({
-            key,
-            name: f.name || f.name_cn || f.symbol || '外汇',
-            emoji: '💱',
-            price, priceText: price.toFixed(4),
-            change, changeText: Math.abs(change).toFixed(3),
-            sentiment: this.calcForexSentiment(change),
-            anomaly: anomaly.isAnomaly, anomalyDir: anomaly.direction
-          })
-        }
-      }
-
-      if (overview && overview.commodities) {
-        for (const c of overview.commodities) {
-          const change = parseFloat(c.change_pct || c.changePct || c.change || 0)
-          const price = parseFloat(c.price || c.current || 0)
-          const key = `comm_${c.symbol || c.code}`
-          const anomaly = this.detectAnomaly(key, change)
-          items.push({
-            key,
-            name: c.name || c.name_cn || c.symbol || '商品',
-            emoji: this.getCommodityEmoji(c.symbol || c.code),
-            price, priceText: this.formatPrice(price),
-            change, changeText: Math.abs(change).toFixed(2),
-            sentiment: this.calcCommoditySentiment(change, c.symbol || c.code),
-            anomaly: anomaly.isAnomaly, anomalyDir: anomaly.direction
-          })
-        }
-      }
 
       if (sentiment) {
         if (sentiment.fear_greed && sentiment.fear_greed.value !== undefined) {
@@ -345,6 +259,81 @@ export default {
             anomaly: anomaly.isAnomaly, anomalyDir: anomaly.direction
           })
         }
+        if (sentiment.yield_curve && sentiment.yield_curve.spread !== undefined) {
+          const yc = parseFloat(sentiment.yield_curve.spread) || 0
+          const ycChange = parseFloat(sentiment.yield_curve.change || 0)
+          const ycSentiment = Math.max(0, Math.min(100, 50 + yc * 30))
+          const anomaly = this.detectAnomaly('sent_yield', ycChange)
+          items.push({
+            key: 'sent_yield', name: '收益率曲线 (10Y-2Y)',
+            emoji: '📐',
+            price: yc, priceText: yc.toFixed(3) + '%',
+            change: ycChange, changeText: Math.abs(ycChange).toFixed(3),
+            sentiment: Math.round(ycSentiment),
+            anomaly: anomaly.isAnomaly, anomalyDir: anomaly.direction
+          })
+        }
+        if (sentiment.vxn && sentiment.vxn.value !== undefined) {
+          const vxn = parseFloat(sentiment.vxn.value) || 0
+          const vxnChange = parseFloat(sentiment.vxn.change_pct || sentiment.vxn.change || 0)
+          const vxnSentiment = Math.max(0, Math.min(100, 100 - (vxn - 10) * 2.5))
+          const anomaly = this.detectAnomaly('sent_vxn', vxnChange)
+          items.push({
+            key: 'sent_vxn', name: 'VXN 纳指波动率',
+            emoji: vxn > 25 ? '🔴' : vxn > 18 ? '🟡' : '🟢',
+            price: vxn, priceText: vxn.toFixed(2),
+            change: vxnChange, changeText: Math.abs(vxnChange).toFixed(2),
+            sentiment: Math.round(vxnSentiment),
+            anomaly: anomaly.isAnomaly, anomalyDir: anomaly.direction
+          })
+        }
+        if (sentiment.gvz && sentiment.gvz.value !== undefined) {
+          const gvz = parseFloat(sentiment.gvz.value) || 0
+          const gvzChange = parseFloat(sentiment.gvz.change_pct || sentiment.gvz.change || 0)
+          const gvzSentiment = Math.max(0, Math.min(100, 100 - (gvz - 10) * 3))
+          const anomaly = this.detectAnomaly('sent_gvz', gvzChange)
+          items.push({
+            key: 'sent_gvz', name: 'GVZ 黄金波动率',
+            emoji: gvz > 20 ? '🔴' : gvz > 14 ? '🟡' : '🟢',
+            price: gvz, priceText: gvz.toFixed(2),
+            change: gvzChange, changeText: Math.abs(gvzChange).toFixed(2),
+            sentiment: Math.round(gvzSentiment),
+            anomaly: anomaly.isAnomaly, anomalyDir: anomaly.direction
+          })
+        }
+        if (sentiment.vix_term && sentiment.vix_term.value !== undefined) {
+          const vt = parseFloat(sentiment.vix_term.value) || 1.0
+          const vtChange = parseFloat(sentiment.vix_term.change_pct || sentiment.vix_term.change || 0)
+          // VIX/VIX3M ratio: <1 bullish (backwardation), >1 bearish (contango)
+          const vtSentiment = Math.max(0, Math.min(100, 150 - vt * 100))
+          const anomaly = this.detectAnomaly('sent_vix_term', vtChange)
+          items.push({
+            key: 'sent_vix_term', name: 'VIX 期限结构',
+            emoji: vt > 1.1 ? '🔴' : vt > 0.85 ? '🟡' : '🟢',
+            price: vt, priceText: vt.toFixed(3),
+            change: vtChange, changeText: Math.abs(vtChange).toFixed(3),
+            sentiment: Math.round(vtSentiment),
+            anomaly: anomaly.isAnomaly, anomalyDir: anomaly.direction
+          })
+        }
+        // 大宗商品（来自 sentiment 接口）
+        if (sentiment.commodities && sentiment.commodities.length > 0) {
+          for (const c of sentiment.commodities) {
+            const change = parseFloat(c.change_pct || c.changePct || c.change || 0)
+            const price = parseFloat(c.price || c.current || 0)
+            const key = `comm_${c.symbol || c.code}`
+            const anomaly = this.detectAnomaly(key, change)
+            items.push({
+              key,
+              name: c.name || c.name_cn || c.symbol || '商品',
+              emoji: this.getCommodityEmoji(c.symbol || c.code),
+              price, priceText: this.formatPrice(price),
+              change, changeText: Math.abs(change).toFixed(2),
+              sentiment: this.calcCommoditySentiment(change, c.symbol || c.code),
+              anomaly: anomaly.isAnomaly, anomalyDir: anomaly.direction
+            })
+          }
+        }
       }
 
       this.allMarketItems = items
@@ -371,15 +360,6 @@ export default {
       return { isAnomaly, direction }
     },
 
-    calcIndexSentiment (change) {
-      return Math.round(Math.max(0, Math.min(100, 50 + change * (50 / 3))))
-    },
-    calcCryptoSentiment (change) {
-      return Math.round(Math.max(0, Math.min(100, 50 + change * (50 / 8))))
-    },
-    calcForexSentiment (change) {
-      return Math.round(Math.max(0, Math.min(100, 50 + change * 50)))
-    },
     calcCommoditySentiment (change, symbol) {
       if (symbol && (symbol.includes('GC') || symbol.includes('gold'))) {
         return Math.round(Math.max(0, Math.min(100, 50 - change * (50 / 3))))
@@ -443,29 +423,6 @@ export default {
       if (price >= 10000) return price.toLocaleString('en-US', { maximumFractionDigits: 0 })
       if (price >= 100) return price.toFixed(2)
       return price.toFixed(4)
-    },
-    getIndexEmoji (symbol) {
-      const s = String(symbol).toUpperCase()
-      if (s.includes('GSPC') || s.includes('SPX') || s.includes('SPY')) return '🇺🇸'
-      if (s.includes('DJI') || s.includes('DOW')) return '🇺🇸'
-      if (s.includes('IXIC') || s.includes('NASDAQ')) return '🇺🇸'
-      if (s.includes('N225') || s.includes('NIKKEI')) return '🇯🇵'
-      if (s.includes('HSI') || s.includes('HANG')) return '🇭🇰'
-      if (s.includes('FTSE')) return '🇬🇧'
-      if (s.includes('GDAXI') || s.includes('DAX')) return '🇩🇪'
-      if (s.includes('FCHI') || s.includes('CAC')) return '🇫🇷'
-      if (s.includes('KS11') || s.includes('KOSPI')) return '🇰🇷'
-      if (s.includes('AS51') || s.includes('ASX')) return '🇦🇺'
-      if (s.includes('SENSEX') || s.includes('NIFTY')) return '🇮🇳'
-      return '📊'
-    },
-    getCryptoEmoji (symbol) {
-      const s = String(symbol).toUpperCase()
-      if (s.includes('BTC')) return '₿'
-      if (s.includes('ETH')) return 'Ξ'
-      if (s.includes('SOL')) return '◎'
-      if (s.includes('BNB')) return '🔶'
-      return '🪙'
     },
     getCommodityEmoji (symbol) {
       const s = String(symbol).toUpperCase()

@@ -25,7 +25,6 @@ CACHE_TTL = {
     "crypto_heatmap": 300,
     "forex_pairs": 120,
     "stock_indices": 120,
-    "market_overview": 300,          # 5min — 金/油等大宗商品不需要太频繁
     "market_heatmap": 300,
     "commodities": 300,              # 5min
     "market_news": 180,

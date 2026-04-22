@@ -6,17 +6,6 @@ import request from '@/utils/request'
 const BASE_URL = '/api/global-market'
 
 /**
- * Get global market overview (indices, forex, crypto, commodities)
- * Includes geo coordinates for world map display
- */
-export function getMarketOverview () {
-  return request({
-    url: `${BASE_URL}/overview`,
-    method: 'get'
-  })
-}
-
-/**
  * Get market heatmap data (crypto, stock sectors, forex)
  */
 export function getMarketHeatmap () {

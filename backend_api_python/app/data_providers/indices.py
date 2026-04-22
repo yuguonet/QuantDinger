@@ -24,7 +24,7 @@ INDICES = [
         "region": "US", "flag": "\U0001f1fa\U0001f1f8",
         "lat": 40.7, "lng": -74.0,
         "sina": "int_sp500", "eastmoney": "100.SPX", "tencent": "usSPX",
-        "akshare": "000001",  # akshare index_df 用
+        "akshare": "000001",
     },
     {
         "symbol": "^DJI", "name_cn": "道琼斯", "name_en": "Dow Jones",
