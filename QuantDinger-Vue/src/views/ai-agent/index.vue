@@ -511,7 +511,7 @@ export default {
 
     // ── 生命周期 ────────────────────────────────────────
 
-    sessionId.value = 'session_' + Date.now()
+    sessionId.value = 'session_' + (crypto.randomUUID?.() || Date.now().toString(36) + Math.random().toString(36).slice(2))
     initTaskStream()
     fetchStrategies()
 

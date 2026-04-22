@@ -345,12 +345,12 @@ def fear_greed_index():
         'indicators': indicators
     }
 
-    # 保存
-    # 保存到当前工作目录
-    output_path = 'fear_greed_index.json'
-    with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-    print(f"\n  ✅ 结果已保存: {output_path}")
+    # 保存（仅 CLI 模式写文件，API 模式跳过避免 CWD 问题）
+    if __name__ == "__main__":
+        output_path = 'fear_greed_index.json'
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+        print(f"\n  ✅ 结果已保存: {output_path}")
 
     return result
 

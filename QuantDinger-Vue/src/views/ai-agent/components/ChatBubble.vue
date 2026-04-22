@@ -45,14 +45,26 @@ export default defineComponent({
   setup (props) {
     const renderedContent = computed(() => {
       const raw = props.message.content || ''
-      return raw
+      // Step 1: HTML entity encode (escape everything)
+      let safe = raw
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#x27;')
+
+      // Step 2: Apply allowed markdown transforms (safe because input is already escaped)
+      safe = safe
         .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre class="code-block"><code>$2</code></pre>')
         .replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>')
         .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
         .replace(/\n/g, '<br>')
+
+      // Step 3: Strip any remaining raw HTML tags that may have survived
+      // (defense-in-depth — shouldn't be needed but belt-and-suspenders)
+      safe = safe.replace(/<(?!\/?(strong|code|pre|br)\b)[^>]+>/gi, '')
+
+      return safe
     })
 
     return { renderedContent }

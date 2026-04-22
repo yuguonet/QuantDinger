@@ -11,6 +11,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
@@ -29,10 +30,11 @@ class ToolSpec:
 
 
 class ToolRegistry:
-    """Central registry for agent tools."""
+    """Central registry for agent tools. Thread-safe."""
 
     def __init__(self):
         self._tools: Dict[str, ToolSpec] = {}
+        self._lock = threading.Lock()
 
     # ── registration ─────────────────────────────────────────
 
@@ -53,7 +55,8 @@ class ToolRegistry:
             fn=fn,
             required_params=required or [],
         )
-        self._tools[tool_name] = spec
+        with self._lock:
+            self._tools[tool_name] = spec
 
     def register_many(self, tools: List[Dict[str, Any]]) -> None:
         """Batch register tools from dicts with keys: fn, name, description, parameters, required."""
@@ -69,15 +72,19 @@ class ToolRegistry:
     # ── discovery ─────────────────────────────────────────────
 
     def list_tools(self) -> List[str]:
-        return list(self._tools.keys())
+        with self._lock:
+            return list(self._tools.keys())
 
     def get_spec(self, name: str) -> Optional[ToolSpec]:
-        return self._tools.get(name)
+        with self._lock:
+            return self._tools.get(name)
 
     def to_openai_tools(self) -> List[Dict[str, Any]]:
         """Convert all registered tools to OpenAI function-calling format."""
+        with self._lock:
+            tools_snapshot = list(self._tools.values())
         tools = []
-        for spec in self._tools.values():
+        for spec in tools_snapshot:
             tools.append({
                 "type": "function",
                 "function": {
@@ -92,7 +99,8 @@ class ToolRegistry:
 
     def execute(self, name: str, **kwargs) -> Any:
         """Execute a tool by name.  Raises KeyError if not found."""
-        spec = self._tools.get(name)
+        with self._lock:
+            spec = self._tools.get(name)
         if spec is None:
             return {"error": f"Unknown tool: {name}", "retriable": False}
         t0 = time.time()

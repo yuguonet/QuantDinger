@@ -18,7 +18,7 @@ import json
 import logging
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -169,16 +169,36 @@ def run_agent_loop(
                 thinking_msg = f"「{label}」已完成，继续深入分析..."
             progress_callback({"type": "thinking", "step": step + 1, "message": thinking_msg})
 
-        # ── LLM call ──
-        try:
-            response = call_with_tools_fn(messages, tool_decls)
-        except Exception as e:
-            logger.error("LLM call failed at step %d: %s", step + 1, e)
+        # ── LLM call (with retry) ──
+        _LLM_MAX_RETRIES = 3
+        _LLM_RETRY_BASE_DELAY = 2.0
+        response = None
+        for _attempt in range(_LLM_MAX_RETRIES):
+            try:
+                response = call_with_tools_fn(messages, tool_decls)
+                break
+            except Exception as e:
+                err_str = str(e)
+                is_retriable = any(s in err_str for s in ("429", "500", "502", "503", "529", "timeout", "Rate"))
+                if is_retriable and _attempt < _LLM_MAX_RETRIES - 1:
+                    delay = _LLM_RETRY_BASE_DELAY * (2 ** _attempt)
+                    logger.warning("LLM call failed (attempt %d/%d), retrying in %.1fs: %s",
+                                   _attempt + 1, _LLM_MAX_RETRIES, delay, e)
+                    time.sleep(delay)
+                    continue
+                logger.error("LLM call failed at step %d: %s", step + 1, e)
+                return RunLoopResult(
+                    success=False, tool_calls_log=tool_calls_log,
+                    total_steps=step + 1, total_tokens=total_tokens,
+                    provider=provider_used, models_used=models_used,
+                    error=f"LLM call failed: {e}", messages=messages,
+                )
+        if response is None:
             return RunLoopResult(
                 success=False, tool_calls_log=tool_calls_log,
                 total_steps=step + 1, total_tokens=total_tokens,
                 provider=provider_used, models_used=models_used,
-                error=f"LLM call failed: {e}", messages=messages,
+                error="LLM call failed after retries", messages=messages,
             )
 
         usage = response.get("usage", {}) or {}
@@ -326,17 +346,24 @@ def _execute_tools(
         max_workers = min(len(tool_calls), 5)
         pool = ThreadPoolExecutor(max_workers=max_workers)
         try:
+            batch_start = time.time()
             futures = {pool.submit(_exec_single, tc, registry, cache): tc for tc in tool_calls}
-            for future in futures:
+            for future in as_completed(futures):
+                # Calculate remaining budget across the whole batch
+                elapsed = time.time() - batch_start
+                if timeout_seconds and timeout_seconds > 0:
+                    per_future_timeout = max(0.1, timeout_seconds - elapsed)
+                else:
+                    per_future_timeout = None
                 try:
                     tc_item, result_str, success, dur, cached = future.result(
-                        timeout=timeout_seconds if timeout_seconds and timeout_seconds > 0 else None
+                        timeout=per_future_timeout
                     )
                 except FuturesTimeoutError:
                     tc_item = futures[future]
-                    result_str = json.dumps({"error": f"Tool timed out after {timeout_seconds}s", "timeout": True})
+                    result_str = json.dumps({"error": f"Tool timed out after {per_future_timeout:.1f}s", "timeout": True})
                     success = False
-                    dur = round(timeout_seconds or 0, 2)
+                    dur = round(per_future_timeout or 0, 2)
                     cached = False
 
                 if progress_callback:

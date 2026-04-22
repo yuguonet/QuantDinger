@@ -5,15 +5,27 @@
 依赖: pip install akshare requests beautifulsoup4
 """
 
-import akshare as ak
 import pandas as pd
 from datetime import datetime, timedelta
 import json
 import re
 
 
+def _get_akshare():
+    """懒加载 akshare，缺失时返回 None"""
+    try:
+        import akshare as ak
+        return ak
+    except ImportError:
+        return None
+
+
 def get_financial_news():
     """获取财经要闻"""
+    ak = _get_akshare()
+    if ak is None:
+        print("  ⚠️ akshare 未安装")
+        return None
     print("\n📰 财经要闻 (东方财富)")
     print("=" * 60)
     try:
@@ -30,6 +42,10 @@ def get_financial_news():
 
 def get_macro_news():
     """获取宏观要闻"""
+    ak = _get_akshare()
+    if ak is None:
+        print("  ⚠️ akshare 未安装")
+        return None
     print("\n📰 宏观经济新闻")
     print("=" * 60)
     try:
@@ -58,13 +74,16 @@ def get_policy_keywords():
         '碳中和', '共同富裕', '一带一路', 'RCEP',
     ]
 
+    ak = _get_akshare()
     all_titles = []
 
     # 从多个来源收集标题
-    sources = [
-        ('东方财富', lambda: ak.stock_news_em(symbol="财经")),
-        ('同花顺', lambda: ak.news_cctv(date=datetime.now().strftime("%Y%m%d"))),
-    ]
+    sources = []
+    if ak is not None:
+        sources = [
+            ('东方财富', lambda: ak.stock_news_em(symbol="财经")),
+            ('同花顺', lambda: ak.news_cctv(date=datetime.now().strftime("%Y%m%d"))),
+        ]
 
     for source_name, fetcher in sources:
         try:

@@ -82,9 +82,12 @@ export function createAgentStream (params, callbacks) {
       buffer = lines.pop() || ''
 
       for (const line of lines) {
-        if (!line.startsWith('data: ')) continue
+        const trimmed = line.trim()
+        if (!trimmed.startsWith('data:')) continue
+        const dataStr = trimmed.slice(5).trimStart()
+        if (!dataStr) continue
         try {
-          const event = JSON.parse(line.slice(6))
+          const event = JSON.parse(dataStr)
           switch (event.type) {
             case 'thinking': callbacks.onThinking?.(event); break
             case 'tool_start': callbacks.onToolStart?.(event); break

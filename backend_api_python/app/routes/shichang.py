@@ -406,7 +406,7 @@ def _do_fetch_strong(limit=50, zt_data_today=None):
             ]
             # 按连板天数降序、再按涨跌幅降序
             sorted_zt = sorted(
-                filtered or zt_data,
+                filtered or zt_data_today,
                 key=lambda x: (
                     safe_int(x.get("continuous_zt_days", 1)),
                     safe_float(x.get("change_percent", 0))

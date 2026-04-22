@@ -20,6 +20,9 @@ from typing import Any, Dict, List, Optional
 
 from flask import Blueprint, request, jsonify, Response
 
+# ── 输入限制 ────────────────────────────────────────────────
+MAX_MESSAGE_LENGTH = int(os.getenv("AGENT_MAX_MESSAGE_LENGTH", "4000"))
+
 logger = logging.getLogger(__name__)
 
 # ── 策略加载 ──────────────────────────────────────────────────
@@ -67,31 +70,53 @@ def _extract_stock_code(msg: str, ctx: Optional[Dict], session: Dict) -> Optiona
 
 def _detect_market(stock_code: str) -> str:
     code = (stock_code or "").strip().upper()
+    if not code:
+        return "Crypto"
+
+    # Explicit exchange prefixes
     if code.startswith(("SH", "SZ", "BJ")):
         return "CNStock"
     if code.startswith("HK"):
         return "HKStock"
-    if len(code) <= 6 and code.isdigit():
+
+    # Chinese A-share: 6-digit numeric (SH 6xxxxx/9xxxxx, SZ 0xxxxx/3xxxxx)
+    if len(code) == 6 and code.isdigit():
         return "CNStock"
+
+    # Known crypto patterns
+    _CRYPTO_PREFIXES = ("BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "DOT",
+                        "AVAX", "MATIC", "LINK", "UNI", "LTC", "ATOM", "FIL",
+                        "ARB", "OP", "APT", "SUI", "PEPE", "SHIB", "TRX")
+    _CRYPTO_SUFFIXES = ("USDT", "USDC", "BUSD", "BTC", "ETH")
+    if any(code.startswith(p) for p in _CRYPTO_PREFIXES):
+        return "Crypto"
+    if any(code.endswith(s) for s in _CRYPTO_SUFFIXES) and not code.isalpha():
+        return "Crypto"
+
+    # Forex: exactly 6 alphabetic characters (e.g. EURUSD, GBPJPY)
     if len(code) == 6 and code.isalpha():
         return "Forex"
+
     return "Crypto"
 
 
-# ── 会话存储 ──────────────────────────────────────────────────
-_sessions: Dict[str, Dict] = {}
+# ── 会话存储（Redis / 内存自动降级）──────────────────────────
+from app.agent.session_store import get_session_store
+
 MAX_HISTORY_TURNS = 20
 
 
 def _get_session(session_id: str) -> Dict:
-    if session_id not in _sessions:
-        _sessions[session_id] = {
-            "messages": [],
-            "created_at": time.time(),
-            "updated_at": time.time(),
-            "stock_code": None,
-        }
-    return _sessions[session_id]
+    store = get_session_store()
+    session = store.get_session(session_id)
+    if not session:
+        session = store.create_session(session_id, {})
+    return session
+
+
+def _touch_session(session_id: str, **fields):
+    store = get_session_store()
+    store.update_session(session_id, **fields)
 
 
 # ── 预取数据（避免 Agent 重复调用工具）────────────────────────
@@ -164,10 +189,20 @@ def agent_chat():
         message = data.get("message")
         if not message:
             return jsonify({"error": "Message is required"}), 400
+        if not isinstance(message, str):
+            return jsonify({"error": "Message must be a string"}), 400
+        if len(message) > MAX_MESSAGE_LENGTH:
+            return jsonify({"error": f"Message too long (max {MAX_MESSAGE_LENGTH} characters)"}), 400
 
         session_id = data.get("session_id") or str(uuid.uuid4())
+        if not isinstance(session_id, str) or len(session_id) > 128:
+            return jsonify({"error": "Invalid session_id"}), 400
         skills = data.get("skills")
+        if skills is not None and not isinstance(skills, (list, str)):
+            return jsonify({"error": "skills must be a list or string"}), 400
         context = data.get("context")
+        if context is not None and not isinstance(context, dict):
+            return jsonify({"error": "context must be a dict"}), 400
 
         # Build executor via factory
         from app.agent.factory import build_agent_executor
@@ -181,7 +216,6 @@ def agent_chat():
         session = _get_session(session_id)
         stock_code = _extract_stock_code(message, context, session)
         if stock_code:
-            session["stock_code"] = stock_code
             market = _detect_market(stock_code)
             prefetch = _prefetch_context(stock_code, market)
             if context:
@@ -189,6 +223,7 @@ def agent_chat():
             else:
                 context = prefetch
             context["stock_code"] = stock_code
+            _touch_session(session_id, stock_code=stock_code)
 
         result = executor.chat(
             message=message,
@@ -225,10 +260,20 @@ def agent_chat_stream():
         message = data.get("message")
         if not message:
             return jsonify({"error": "Message is required"}), 400
+        if not isinstance(message, str):
+            return jsonify({"error": "Message must be a string"}), 400
+        if len(message) > MAX_MESSAGE_LENGTH:
+            return jsonify({"error": f"Message too long (max {MAX_MESSAGE_LENGTH} characters)"}), 400
 
         session_id = data.get("session_id") or str(uuid.uuid4())
+        if not isinstance(session_id, str) or len(session_id) > 128:
+            return jsonify({"error": "Invalid session_id"}), 400
         skills = data.get("skills")
+        if skills is not None and not isinstance(skills, (list, str)):
+            return jsonify({"error": "skills must be a list or string"}), 400
         context = data.get("context")
+        if context is not None and not isinstance(context, dict):
+            return jsonify({"error": "context must be a dict"}), 400
 
         event_queue: queue.Queue = queue.Queue()
 
@@ -247,11 +292,11 @@ def agent_chat_stream():
                 stock_code = _extract_stock_code(message, context, session)
                 enriched_ctx = dict(context) if context else {}
                 if stock_code:
-                    session["stock_code"] = stock_code
                     market = _detect_market(stock_code)
                     prefetch = _prefetch_context(stock_code, market)
                     enriched_ctx.update(prefetch)
                     enriched_ctx["stock_code"] = stock_code
+                    _touch_session(session_id, stock_code=stock_code)
 
                 executor = build_agent_executor(
                     skills=skills,
@@ -309,27 +354,28 @@ def agent_chat_stream():
 def list_chat_sessions():
     """获取会话列表。"""
     limit = int(request.args.get("limit", 50))
-    sessions = []
-    for sid, s in sorted(_sessions.items(), key=lambda x: x[1]["updated_at"], reverse=True)[:limit]:
-        sessions.append({
-            "session_id": sid,
-            "created_at": s["created_at"],
-            "updated_at": s["updated_at"],
-            "message_count": len(s["messages"]),
-            "stock_code": s.get("stock_code"),
-        })
+    store = get_session_store()
+    raw = store.list_sessions(limit)
+    sessions = [{
+        "session_id": s["session_id"],
+        "created_at": s.get("created_at"),
+        "updated_at": s.get("updated_at"),
+        "message_count": len(s.get("messages", [])),
+        "stock_code": s.get("stock_code"),
+    } for s in raw]
     return jsonify({"sessions": sessions})
 
 
 @agent_bp.route("/chat/sessions/<session_id>", methods=["GET"])
 def get_chat_session_messages(session_id: str):
     """获取会话消息。"""
-    session = _sessions.get(session_id)
+    store = get_session_store()
+    session = store.get_session(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
     return jsonify({
         "session_id": session_id,
-        "messages": session["messages"],
+        "messages": session.get("messages", []),
         "stock_code": session.get("stock_code"),
     })
 
@@ -337,11 +383,7 @@ def get_chat_session_messages(session_id: str):
 @agent_bp.route("/chat/sessions/<session_id>", methods=["DELETE"])
 def delete_chat_session(session_id: str):
     """删除会话。"""
-    # Also clear conversation history in executor
-    from app.agent.executor import _conversations
-    _conversations.clear(session_id)
-
-    if session_id in _sessions:
-        del _sessions[session_id]
-        return jsonify({"deleted": 1})
-    return jsonify({"deleted": 0})
+    store = get_session_store()
+    store.clear_history(session_id)
+    deleted = store.delete_session(session_id)
+    return jsonify({"deleted": 1 if deleted else 0})

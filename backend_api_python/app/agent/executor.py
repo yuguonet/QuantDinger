@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -22,6 +24,60 @@ from app.agent.tools.registry import ToolRegistry
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# ── Startup dependency check ─────────────────────────────────
+try:
+    import json_repair  # noqa: F401
+except ImportError:
+    logger.warning("json_repair not installed — dashboard JSON parsing will be less resilient. "
+                   "Install with: pip install json-repair>=0.15.0")
+
+# ── Token budget ─────────────────────────────────────────────
+CONTEXT_TOKEN_BUDGET = int(os.getenv("AGENT_CONTEXT_TOKEN_BUDGET", "12000"))
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate: ~3 chars per token for mixed zh/en."""
+    if not text:
+        return 0
+    return max(1, len(text) // 3)
+
+
+def _truncate_context_if_needed(messages: List[Dict], budget: int = CONTEXT_TOKEN_BUDGET) -> List[Dict]:
+    """Keep total message list under token budget by trimming oldest messages.
+
+    Always preserves: system message (index 0) + last user message (tail).
+    Trims from the middle (conversation history).
+    """
+    total = sum(_estimate_tokens(m.get("content", "") or "") for m in messages)
+    if total <= budget:
+        return messages
+
+    if len(messages) <= 2:
+        for m in messages:
+            c = m.get("content") or ""
+            if len(c) > 2000:
+                m["content"] = c[:2000] + "\n... (truncated)"
+        return messages
+
+    system_msg = messages[0]
+    tail_msg = messages[-1]
+    middle = messages[1:-1]
+
+    total = (_estimate_tokens(system_msg.get("content", "") or "") +
+             _estimate_tokens(tail_msg.get("content", "") or ""))
+    kept_middle = []
+    for m in reversed(middle):
+        t = _estimate_tokens(m.get("content", "") or "")
+        if total + t > budget:
+            break
+        total += t
+        kept_middle.append(m)
+
+    kept_middle.reverse()
+    result = [system_msg] + kept_middle + [tail_msg]
+    logger.info("Context trimmed: %d messages -> %d (est. %d tokens)", len(messages), len(result), total)
+    return result
 
 
 # ── Agent result ──────────────────────────────────────────────
@@ -145,28 +201,50 @@ def _build_language_section(language: str) -> str:
     return "\n## 输出语言\n- 使用中文回答。\n- 所有面向用户的文本值使用中文。\n"
 
 
-# ── In-memory conversation manager ────────────────────────────
+# ── In-memory conversation manager (delegates to SessionStore) ──
 
 class _ConversationManager:
-    """Simple in-memory conversation history (per session_id)."""
+    """Conversation history backed by SessionStore (Redis or memory). Thread-safe."""
 
     def __init__(self, max_turns: int = 20):
-        self._sessions: Dict[str, List[Dict]] = {}
         self._max_turns = max_turns
+        self._local_fallback: Dict[str, List[Dict]] = {}
+        self._lock = threading.Lock()
+
+    def _get_store(self):
+        try:
+            from app.agent.session_store import get_session_store
+            return get_session_store()
+        except Exception:
+            return None
 
     def get_history(self, session_id: str) -> List[Dict]:
-        return self._sessions.get(session_id, [])
+        store = self._get_store()
+        if store:
+            return store.get_history(session_id)
+        with self._lock:
+            return list(self._local_fallback.get(session_id, []))
 
     def add_message(self, session_id: str, role: str, content: str):
-        if session_id not in self._sessions:
-            self._sessions[session_id] = []
-        self._sessions[session_id].append({"role": role, "content": content})
-        max_msgs = self._max_turns * 2
-        if len(self._sessions[session_id]) > max_msgs:
-            self._sessions[session_id] = self._sessions[session_id][-max_msgs:]
+        store = self._get_store()
+        if store:
+            store.add_message(session_id, role, content, max_turns=self._max_turns)
+            return
+        with self._lock:
+            if session_id not in self._local_fallback:
+                self._local_fallback[session_id] = []
+            self._local_fallback[session_id].append({"role": role, "content": content})
+            max_msgs = self._max_turns * 2
+            if len(self._local_fallback[session_id]) > max_msgs:
+                self._local_fallback[session_id] = self._local_fallback[session_id][-max_msgs:]
 
     def clear(self, session_id: str):
-        self._sessions.pop(session_id, None)
+        store = self._get_store()
+        if store:
+            store.clear_history(session_id)
+            return
+        with self._lock:
+            self._local_fallback.pop(session_id, None)
 
 
 _conversations = _ConversationManager()
@@ -280,6 +358,9 @@ class AgentExecutor:
         parse_dashboard: bool,
         progress_callback: Optional[Callable] = None,
     ) -> AgentResult:
+        # Enforce token budget before sending to LLM
+        messages = _truncate_context_if_needed(messages)
+
         loop_result = run_agent_loop(
             messages=messages,
             tool_registry=self.tool_registry,

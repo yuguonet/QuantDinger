@@ -8,7 +8,19 @@
 from datetime import datetime
 import json
 import os
-from openai import OpenAI
+
+
+def _get_openai_client():
+    """懒加载 openai，缺失时 raise 清晰错误"""
+    try:
+        from openai import OpenAI
+        return OpenAI
+    except ImportError:
+        raise ImportError(
+            "❌ openai 包未安装\n"
+            "   运行: pip install openai\n"
+            "   或使用 --policy (关键词版，无需 LLM)"
+        )
 
 
 # ═══════════════════════════════════════════════════════
@@ -44,6 +56,7 @@ DEFAULT_CONFIGS = {
 
 def get_llm_client(provider="deepseek"):
     """初始化 LLM 客户端"""
+    OpenAI = _get_openai_client()
     config = DEFAULT_CONFIGS.get(provider, DEFAULT_CONFIGS["deepseek"])
     api_key = os.environ.get(config["env_key"])
 

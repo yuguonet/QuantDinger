@@ -120,6 +120,9 @@
               </div>
             </div>
 
+            <!-- 国内宏观数据 -->
+            <MacroCard />
+
             <!-- 外围市场 -->
             <PeripheralMarketCard />
 
@@ -149,6 +152,7 @@ import DragonTigerCard from './DragonTigerCard.vue'
 import HotListCard from './HotListCard.vue'
 import StrongStocksCard from './StrongStocksCard.vue'
 import PeripheralMarketCard from './PeripheralMarketCard.vue'
+import MacroCard from './MacroCard.vue'
 
 // ==================== 数据源配置 ====================
 
@@ -264,7 +268,7 @@ async function fetchAllSentiment () {
 
 export default {
   name: 'AI综合看板',
-  components: { StreakCard, DragonTigerCard, HotListCard, StrongStocksCard, PeripheralMarketCard },
+  components: { StreakCard, DragonTigerCard, HotListCard, StrongStocksCard, PeripheralMarketCard, MacroCard },
   data () {
     return {
       isLightTheme: true,
@@ -272,11 +276,11 @@ export default {
       chartInstance: null,
       emotionHistory: [],
       isDestroyed: false,
-      _sectorSentiment: '',
-      _sectorSummary: '',
-      _hotSectorsData: null,
-      _sectorTrend: null,
-      _sectorPrediction: null,
+      sectorSentiment: '',
+      sectorSummary: '',
+      hotSectorsData: null,
+      sectorTrend: null,
+      sectorPrediction: null,
       // 定时器
       indexTimer: null,
       sentimentTimer: null,
@@ -315,8 +319,8 @@ export default {
     // ==================== 大盘指数（腾讯接口，10秒刷新） ====================
 
     async fetchIndex () {
-      if (this.isDestroyed || this._indexFetching) return
-      this._indexFetching = true
+      if (this.isDestroyed || this.indexFetching) return
+      this.indexFetching = true
       try {
         let idx = null
         for (let i = 0; i <= 1; i++) {
@@ -335,7 +339,7 @@ export default {
         this.marketData.bzse = idx.bzse
         console.log('[指数] 已刷新:', new Date().toLocaleTimeString(), idx)
       } finally {
-        this._indexFetching = false
+        this.indexFetching = false
       }
     },
 
@@ -352,7 +356,7 @@ export default {
         this.marketData.heat = s.heat
         this.marketData.emotionIndex = s.emotionIndex
         this.marketData.brokenBoard = s.brokenBoard
-        this._buildAiFromOverview()
+        this.buildAiFromOverview()
         console.log('[情绪] 已刷新:', new Date().toLocaleTimeString())
       } catch (e) {
         console.error('[情绪] 刷新失败:', e)
@@ -411,12 +415,12 @@ export default {
 
         // 更新市场情绪指标
         if (analysis.sentiment) {
-          this._sectorSentiment = analysis.sentiment
-          this._sectorSummary = analysis.summary || ''
+          this.sectorSentiment = analysis.sentiment
+          this.sectorSummary = analysis.summary || ''
         }
 
         // 缓存原始数据供其他组件使用
-        this._hotSectorsData = data
+        this.hotSectorsData = data
 
         console.log('[板块] 已刷新:', data.industry?.length, '行业 +', data.concept?.length, '概念')
       } catch (e) {
@@ -433,7 +437,7 @@ export default {
         const data = resp?.data || resp
         if (this.isDestroyed || !data?.trend) return
 
-        this._sectorTrend = data
+        this.sectorTrend = data
 
         // 用趋势分析增强 AI 卡片的热门板块
         const trendItems = data.trend?.items || []
@@ -466,7 +470,7 @@ export default {
         }
 
         // 重新生成操作建议（融合趋势数据）
-        this._buildAiFromOverview()
+        this.buildAiFromOverview()
 
         console.log('[趋势] 已刷新:', data.data_days, '天数据, 趋势', trendItems.length, '个板块')
       } catch (e) {
@@ -476,7 +480,7 @@ export default {
 
     // ==================== AI 分析构建 ====================
 
-    _buildAiFromOverview () {
+    buildAiFromOverview () {
       const sc = this.marketData.sse.change
       const em = this.marketData.emotionIndex
       let phase = null
@@ -499,9 +503,9 @@ export default {
       }
 
       // 融合板块情绪（如果已拉取过 hot-sectors）
-      if (this._sectorSentiment) {
+      if (this.sectorSentiment) {
         const sectorMap = { '全面做多': 80, '偏多震荡': 65, '多空拉锯': 50, '偏空调整': 35, '全面下跌': 20 }
-        const sectorEm = sectorMap[this._sectorSentiment] || em
+        const sectorEm = sectorMap[this.sectorSentiment] || em
         // 综合情绪 = 加权平均（板块 40% + 涨跌停 60%）
         const blended = Math.round(sectorEm * 0.4 + em * 0.6)
         this.aiAnalysis.temperature = blended
@@ -534,17 +538,17 @@ export default {
       else if (north < -50) advices.push(`北向净流出${Math.abs(north).toFixed(1)}亿，注意风险`)
 
       // 板块趋势建议（如果数据已加载）
-      if (this._sectorTrend?.prediction?.candidates?.length > 0) {
-        const top = this._sectorTrend.prediction.candidates.slice(0, 2)
+      if (this.sectorTrend?.prediction?.candidates?.length > 0) {
+        const top = this.sectorTrend.prediction.candidates.slice(0, 2)
         const names = top.map(c => c.name).join('、')
         advices.push(`关注主线: ${names}`)
       }
-      if (this._sectorTrend?.trend?.items?.length > 0) {
-        const strong = this._sectorTrend.trend.items.filter(x => x.score > 70).slice(0, 2)
+      if (this.sectorTrend?.trend?.items?.length > 0) {
+        const strong = this.sectorTrend.trend.items.filter(x => x.score > 70).slice(0, 2)
         if (strong.length > 0) {
           advices.push(`持续强势板块: ${strong.map(s => s.name).join('、')}`)
         }
-        const weak = this._sectorTrend.trend.items.filter(x => x.score < 30).slice(0, 2)
+        const weak = this.sectorTrend.trend.items.filter(x => x.score < 30).slice(0, 2)
         if (weak.length > 0) {
           advices.push(`回避走弱板块: ${weak.map(s => s.name).join('、')}`)
         }
@@ -592,8 +596,8 @@ export default {
       if (!el) return
 
       // 先清理旧的 resize 监听
-      if (this._resizeHandler) {
-        window.removeEventListener('resize', this._resizeHandler)
+      if (this.resizeHandler) {
+        window.removeEventListener('resize', this.resizeHandler)
       }
 
       // 复用或创建实例
@@ -650,8 +654,8 @@ export default {
         }]
       })
 
-      this._resizeHandler = () => this.chartInstance?.resize()
-      window.addEventListener('resize', this._resizeHandler)
+      this.resizeHandler = () => this.chartInstance?.resize()
+      window.addEventListener('resize', this.resizeHandler)
     }
   },
 
@@ -685,7 +689,7 @@ export default {
     if (this.emotionTimer) clearInterval(this.emotionTimer)
     if (this.sectorTimer) clearInterval(this.sectorTimer)
     if (this.trendTimer) clearInterval(this.trendTimer)
-    if (this._resizeHandler) window.removeEventListener('resize', this._resizeHandler)
+    if (this.resizeHandler) window.removeEventListener('resize', this.resizeHandler)
     if (this.chartInstance) {
       this.chartInstance.dispose()
       this.chartInstance = null
