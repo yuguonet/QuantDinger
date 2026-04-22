@@ -272,10 +272,17 @@ export default {
       chartInstance: null,
       emotionHistory: [],
       isDestroyed: false,
+      _sectorSentiment: '',
+      _sectorSummary: '',
+      _hotSectorsData: null,
+      _sectorTrend: null,
+      _sectorPrediction: null,
       // 定时器
       indexTimer: null,
       sentimentTimer: null,
       emotionTimer: null,
+      sectorTimer: null,
+      trendTimer: null,
 
       // 数据
       marketData: {
@@ -352,6 +359,121 @@ export default {
       }
     },
 
+    // ==================== 热门板块（独立接口，3分钟刷新） ====================
+
+    async fetchHotSectors () {
+      if (this.isDestroyed) return
+      try {
+        const resp = await request({ url: '/api/shichang/hot-sectors', method: 'GET', timeout: 15000 })
+        const data = resp?.data || resp
+        if (this.isDestroyed || !data?.industry) return
+
+        // 更新 AI 分析卡片的热门板块
+        const analysis = data.analysis || {}
+        const hotSectors = []
+
+        // 行业主线
+        if (analysis.top_industry) {
+          for (const s of analysis.top_industry.slice(0, 3)) {
+            hotSectors.push({
+              name: s.name,
+              driver: `${s.change_pct >= 0 ? '+' : ''}${(s.change_pct || 0).toFixed(2)}%`,
+              score: Math.min(95, Math.max(30, 50 + (s.change_pct || 0) * 10))
+            })
+          }
+        }
+
+        // 概念板块
+        if (analysis.top_concept) {
+          for (const s of analysis.top_concept.slice(0, 2)) {
+            hotSectors.push({
+              name: s.name,
+              driver: `概念 ${s.change_pct >= 0 ? '+' : ''}${(s.change_pct || 0).toFixed(2)}%`,
+              score: Math.min(90, Math.max(30, 50 + (s.change_pct || 0) * 10))
+            })
+          }
+        }
+
+        // 涨停集中板块
+        if (analysis.zt_concentrated) {
+          for (const s of analysis.zt_concentrated.slice(0, 2)) {
+            hotSectors.push({
+              name: s.name,
+              driver: `${s.zt_count}家涨停`,
+              score: Math.min(95, 60 + (s.zt_count || 0) * 5)
+            })
+          }
+        }
+
+        if (hotSectors.length > 0) {
+          this.aiAnalysis.hotSectors = hotSectors.slice(0, 6)
+        }
+
+        // 更新市场情绪指标
+        if (analysis.sentiment) {
+          this._sectorSentiment = analysis.sentiment
+          this._sectorSummary = analysis.summary || ''
+        }
+
+        // 缓存原始数据供其他组件使用
+        this._hotSectorsData = data
+
+        console.log('[板块] 已刷新:', data.industry?.length, '行业 +', data.concept?.length, '概念')
+      } catch (e) {
+        console.error('[板块] 刷新失败:', e)
+      }
+    },
+
+    // ==================== 板块趋势分析（独立接口，首次+每天刷新） ====================
+
+    async fetchSectorTrend () {
+      if (this.isDestroyed) return
+      try {
+        const resp = await request({ url: '/api/shichang/sector-trend', method: 'GET', params: { type: 'industry' }, timeout: 20000 })
+        const data = resp?.data || resp
+        if (this.isDestroyed || !data?.trend) return
+
+        this._sectorTrend = data
+
+        // 用趋势分析增强 AI 卡片的热门板块
+        const trendItems = data.trend?.items || []
+        const prediction = data.prediction?.candidates || []
+
+        // 合并: 趋势强势 + 预测 Top → 更新 hotSectors
+        const merged = []
+        // 先加预测 Top3
+        for (const c of prediction.slice(0, 3)) {
+          merged.push({
+            name: c.name,
+            driver: c.reasons?.[0] || '综合预测',
+            score: Math.round(c.composite_score || 50),
+            source: 'prediction'
+          })
+        }
+        // 再加强势趋势（去重）
+        for (const t of trendItems.filter(x => x.score > 60).slice(0, 4)) {
+          if (!merged.find(m => m.name === t.name)) {
+            merged.push({
+              name: t.name,
+              driver: `${t.direction} | 胜率${t.win_rate}%`,
+              score: Math.round(t.score),
+              source: 'trend'
+            })
+          }
+        }
+        if (merged.length > 0) {
+          this.aiAnalysis.hotSectors = merged.slice(0, 6)
+        }
+
+        // 重新生成操作建议（融合趋势数据）
+        this._buildAiFromOverview()
+
+        console.log('[趋势] 已刷新:', data.data_days, '天数据, 趋势', trendItems.length, '个板块')
+      } catch (e) {
+        console.error('[趋势] 刷新失败:', e)
+      }
+    },
+
     // ==================== AI 分析构建 ====================
 
     _buildAiFromOverview () {
@@ -375,13 +497,60 @@ export default {
         phase = '弱势下跌'
         advice = '控制仓位，防御为主'
       }
+
+      // 融合板块情绪（如果已拉取过 hot-sectors）
+      if (this._sectorSentiment) {
+        const sectorMap = { '全面做多': 80, '偏多震荡': 65, '多空拉锯': 50, '偏空调整': 35, '全面下跌': 20 }
+        const sectorEm = sectorMap[this._sectorSentiment] || em
+        // 综合情绪 = 加权平均（板块 40% + 涨跌停 60%）
+        const blended = Math.round(sectorEm * 0.4 + em * 0.6)
+        this.aiAnalysis.temperature = blended
+      } else {
+        this.aiAnalysis.temperature = em
+      }
+
       this.aiAnalysis.phase = phase
       this.aiAnalysis.advice = advice
-      this.aiAnalysis.temperature = em
-      this.aiAnalysis.profitEffect = Math.min(em, 70)
-      this.aiAnalysis.riskScore = 100 - em
-      this.aiAnalysis.riskLevel = em > 60 ? '低' : (em > 40 ? '中' : '高')
-      this.aiAnalysis.confidence = Math.min(85, 50 + Math.abs(sc) * 30 + (em > 50 ? em - 50 : 50 - em))
+      this.aiAnalysis.profitEffect = Math.min(this.aiAnalysis.temperature, 70)
+      this.aiAnalysis.riskScore = 100 - this.aiAnalysis.temperature
+      this.aiAnalysis.riskLevel = this.aiAnalysis.temperature > 60 ? '低' : (this.aiAnalysis.temperature > 40 ? '中' : '高')
+      this.aiAnalysis.confidence = Math.min(85, 50 + Math.abs(sc) * 30 + (this.aiAnalysis.temperature > 50 ? this.aiAnalysis.temperature - 50 : 50 - this.aiAnalysis.temperature))
+
+      // 生成操作建议（融合板块数据）
+      const advices = []
+      const lup = this.marketData.limitUp || 0
+      const ldn = this.marketData.limitDown || 0
+      const north = parseFloat(this.marketData.northBound) || 0
+      const broken = this.marketData.brokenBoard || 0
+
+      if (lup > 50) advices.push(`涨停${lup}家，赚钱效应极强，顺势而为`)
+      else if (lup > 30) advices.push(`涨停${lup}家，赚钱效应较好`)
+      else if (lup > 10) advices.push(`涨停${lup}家，赚钱效应一般，精选个股`)
+      else advices.push(`仅涨停${lup}家，赚钱效应差，建议观望`)
+
+      if (ldn > 30) advices.push(`跌停${ldn}家，高位补跌风险大，回避高位股`)
+      if (broken > 20) advices.push(`炸板${broken}家，封板成功率低，追涨需谨慎`)
+      if (north > 50) advices.push(`北向净流入${north.toFixed(1)}亿，外资看好`)
+      else if (north < -50) advices.push(`北向净流出${Math.abs(north).toFixed(1)}亿，注意风险`)
+
+      // 板块趋势建议（如果数据已加载）
+      if (this._sectorTrend?.prediction?.candidates?.length > 0) {
+        const top = this._sectorTrend.prediction.candidates.slice(0, 2)
+        const names = top.map(c => c.name).join('、')
+        advices.push(`关注主线: ${names}`)
+      }
+      if (this._sectorTrend?.trend?.items?.length > 0) {
+        const strong = this._sectorTrend.trend.items.filter(x => x.score > 70).slice(0, 2)
+        if (strong.length > 0) {
+          advices.push(`持续强势板块: ${strong.map(s => s.name).join('、')}`)
+        }
+        const weak = this._sectorTrend.trend.items.filter(x => x.score < 30).slice(0, 2)
+        if (weak.length > 0) {
+          advices.push(`回避走弱板块: ${weak.map(s => s.name).join('、')}`)
+        }
+      }
+
+      this.aiAnalysis.operationAdvice = advices.slice(0, 8)
     },
 
     // ==================== 工具方法 ====================
@@ -490,6 +659,8 @@ export default {
     this.fetchIndex()
     this.fetchSentiment()
     this.fetchEmotionHistory()
+    this.fetchHotSectors()
+    this.fetchSectorTrend()
 
     // 大盘指数：10秒刷新一次
     this.indexTimer = setInterval(() => this.fetchIndex(), 10000)
@@ -499,6 +670,12 @@ export default {
 
     // 情绪图表：5分钟刷新一次
     this.emotionTimer = setInterval(() => this.fetchEmotionHistory(), 300000)
+
+    // 热门板块：3分钟刷新一次
+    this.sectorTimer = setInterval(() => this.fetchHotSectors(), 180000)
+
+    // 趋势分析：30分钟刷新一次（数据变化慢）
+    this.trendTimer = setInterval(() => this.fetchSectorTrend(), 1800000)
   },
 
   beforeDestroy () {
@@ -506,6 +683,8 @@ export default {
     if (this.indexTimer) clearInterval(this.indexTimer)
     if (this.sentimentTimer) clearInterval(this.sentimentTimer)
     if (this.emotionTimer) clearInterval(this.emotionTimer)
+    if (this.sectorTimer) clearInterval(this.sectorTimer)
+    if (this.trendTimer) clearInterval(this.trendTimer)
     if (this._resizeHandler) window.removeEventListener('resize', this._resizeHandler)
     if (this.chartInstance) {
       this.chartInstance.dispose()

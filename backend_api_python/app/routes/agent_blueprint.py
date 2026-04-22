@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 /api/agent/* — AI Agent 聊天 & 流式接口
-适配 eQuant 项目，数据通过 DataSourceFactory 取得。
+v3 — 真正的 ReAct Tool-Calling Agent，基于 app/agent 模块。
 
-v2 — LLM 驱动的 Agent 实现，支持会话记忆和工具调用。
+对标 daily_stock_analysis 的 Agent 架构：
+- OpenAI 原生 function calling（非文本模拟）
+- 多步 ReAct 循环（可配置 max_steps）
+- 工具并行执行
+- SSE 流式进度推送
 """
 import os
 import json
@@ -11,7 +15,6 @@ import logging
 import uuid
 import threading
 import queue
-import re
 import time
 from typing import Any, Dict, List, Optional
 
@@ -19,9 +22,8 @@ from flask import Blueprint, request, jsonify, Response
 
 logger = logging.getLogger(__name__)
 
-# ── 策略加载器（延迟导入，避免循环依赖）─────────────────
+# ── 策略加载 ──────────────────────────────────────────────────
 def _load_strategies():
-    """加载 YAML 策略列表。"""
     try:
         from app.services.strategy_loader import load_strategies
         return load_strategies()
@@ -30,24 +32,17 @@ def _load_strategies():
         return []
 
 
-def _get_strategy_by_id(sid: str):
-    """按 ID 获取单个策略。"""
-    try:
-        from app.services.strategy_loader import get_strategy_by_id
-        return get_strategy_by_id(sid)
-    except Exception:
-        return None
-
-# ── Blueprint ─────────────────────────────────────────────
+# ── Blueprint ─────────────────────────────────────────────────
 agent_bp = Blueprint("agent", __name__, url_prefix="/api/agent")
 
-# ── 工具中文名映射 ────────────────────────────────────────
+# ── 工具中文名映射（前端显示用）───────────────────────────────
 TOOL_DISPLAY_NAMES: Dict[str, str] = {
     "get_realtime_quote": "获取实时行情",
     "get_daily_history": "获取历史K线",
     "get_chip_distribution": "分析筹码分布",
     "get_stock_info": "获取股票基本面",
     "search_stock_news": "搜索股票新闻",
+    "search_comprehensive_intel": "综合情报搜索",
     "analyze_trend": "分析技术趋势",
     "calculate_ma": "计算均线系统",
     "get_volume_analysis": "分析量能变化",
@@ -56,87 +51,39 @@ TOOL_DISPLAY_NAMES: Dict[str, str] = {
     "get_sector_rankings": "分析行业板块",
 }
 
-# ── System Prompt ─────────────────────────────────────────
-BASE_SYSTEM_PROMPT = """你是 eQuant 金融分析助手，一个专业的 AI 投资顾问。
 
-## 你的能力
-你可以调用以下工具获取数据，帮助用户分析股票和市场：
+# ── 股票代码提取 ─────────────────────────────────────────────
 
-1. **get_realtime_quote** — 获取股票实时行情（价格、涨跌幅、成交量等）
-   参数：stock_code（股票代码，如 000001）
-2. **get_daily_history** — 获取股票历史K线数据（日线）
-   参数：stock_code, days（默认30天）
-3. **get_stock_info** — 获取股票基本面信息（公司简介、行业、市值等）
-   参数：stock_code
-4. **get_chip_distribution** — 分析筹码分布
-   参数：stock_code
-5. **analyze_trend** — 分析技术趋势
-   参数：stock_code
-6. **search_stock_news** — 搜索股票相关新闻
-   参数：stock_code, keyword（可选）
-7. **get_market_indices** — 获取大盘指数行情
-8. **get_sector_rankings** — 获取行业板块涨跌排名
-
-## 回复规则
-- 用中文回复，风格专业但亲切
-- 直接回答用户问题，不要废话
-- 数据引用时给出具体数字
-- 如果需要调用工具，用以下格式输出：
-
-```
-CALL_TOOL:{"tool": "工具名", "params": {"stock_code": "000001"}}
-```
-
-- 一次只调用一个工具
-- 工具结果返回后，用自然语言总结分析
-- 如果不需要工具，直接用自然语言回复
-- 不要输出 JSON 给用户看
-
-## 注意
-- A股代码通常是6位数字（如 000001 平安银行、600519 贵州茅台）
-- 如果用户没有明确股票代码，且对话历史中有提到过，沿用之前的代码
-- 对话中保持上下文连贯性
-"""
+def _extract_stock_code(msg: str, ctx: Optional[Dict], session: Dict) -> Optional[str]:
+    """从上下文、消息中提取股票代码。"""
+    import re
+    if ctx and ctx.get("stock_code"):
+        return ctx["stock_code"]
+    m = re.search(r"\b(\d{6})\b", msg)
+    if m:
+        return m.group(1)
+    return session.get("stock_code")
 
 
-def _build_system_prompt(skills: Optional[List[str]] = None) -> str:
-    """根据激活的 YAML 策略构建增强版 system prompt。"""
-    prompt = BASE_SYSTEM_PROMPT
+def _detect_market(stock_code: str) -> str:
+    code = (stock_code or "").strip().upper()
+    if code.startswith(("SH", "SZ", "BJ")):
+        return "CNStock"
+    if code.startswith("HK"):
+        return "HKStock"
+    if len(code) <= 6 and code.isdigit():
+        return "CNStock"
+    if len(code) == 6 and code.isalpha():
+        return "Forex"
+    return "Crypto"
 
-    if not skills:
-        return prompt
 
-    # 加载选中的策略 instructions 注入到 prompt
-    strategy_sections = []
-    for sid in skills:
-        strat = _get_strategy_by_id(sid)
-        if not strat:
-            continue
-        instructions = strat.get("instructions", "")
-        if not instructions:
-            continue
-        strategy_sections.append(
-            f"### 当前激活策略：{strat['name']}（{sid}）\n"
-            f"{instructions}"
-        )
-
-    if strategy_sections:
-        prompt += (
-            "\n\n## 当前激活的分析策略\n"
-            "用户已选择以下分析策略，请严格按照策略框架执行分析：\n\n"
-            + "\n\n".join(strategy_sections)
-        )
-
-    return prompt
-
-# ── 会话存储（内存）───────────────────────────────────────
-# session_id → {"messages": [...], "created_at": float, "updated_at": float, "stock_code": str|None}
+# ── 会话存储 ──────────────────────────────────────────────────
 _sessions: Dict[str, Dict] = {}
-MAX_HISTORY_TURNS = 20  # 保留最近 20 轮对话
+MAX_HISTORY_TURNS = 20
 
 
 def _get_session(session_id: str) -> Dict:
-    """获取或创建会话。"""
     if session_id not in _sessions:
         _sessions[session_id] = {
             "messages": [],
@@ -147,308 +94,44 @@ def _get_session(session_id: str) -> Dict:
     return _sessions[session_id]
 
 
-def _append_message(session_id: str, role: str, content: str):
-    """向会话历史追加消息，超出上限自动裁剪。"""
-    session = _get_session(session_id)
-    session["messages"].append({"role": role, "content": content})
-    session["updated_at"] = time.time()
-    # 保留 system + 最近 N*2 条（N 轮 = user+assistant 各 N 条）
-    max_msgs = MAX_HISTORY_TURNS * 2
-    if len(session["messages"]) > max_msgs:
-        session["messages"] = session["messages"][-max_msgs:]
+# ── 预取数据（避免 Agent 重复调用工具）────────────────────────
 
-
-def _build_messages(session_id: str, user_message: str,
-                    skills: Optional[List[str]] = None) -> List[Dict]:
-    """组装发给 LLM 的 messages 列表（system + 历史 + 新消息）。"""
-    session = _get_session(session_id)
-    system_prompt = _build_system_prompt(skills)
-    messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(session["messages"])
-    messages.append({"role": "user", "content": user_message})
-    return messages
-
-
-# ── 工具执行 ─────────────────────────────────────────────
-
-def _get_ds(market: str = "CNStock"):
-    """从 DataSourceFactory 获取数据源。"""
-    from app.data_sources.factory import DataSourceFactory
-    return DataSourceFactory.get_source(market)
-
-
-def _detect_market(stock_code: str) -> str:
-    """根据股票代码粗判市场，返回 DataSourceFactory 兼容的市场名称。"""
-    code = (stock_code or "").strip().upper()
-    if code.startswith(("SH", "SZ", "BJ")):
-        return "CNStock"
-    if code.startswith(("HK",)):
-        return "HKStock"
-    if len(code) <= 6 and code.isdigit():
-        return "CNStock"
-    # 6字母外汇对
-    if len(code) == 6 and code.isalpha():
-        return "Forex"
-    return "Crypto"
-
-
-def _exec_tool(tool_name: str, params: Dict, market: str = "CNStock") -> Any:
-    """执行单个工具调用，返回结果。"""
-    ds = _get_ds(market)
-    stock_code = params.get("stock_code", "")
-
+def _prefetch_context(stock_code: str, market: str) -> Dict[str, Any]:
+    """预先获取行情 + 筹码数据，注入 Agent 上下文避免重复工具调用。"""
+    context = {}
     try:
-        if tool_name == "get_realtime_quote":
-            return ds.get_ticker(stock_code)
-        elif tool_name == "get_daily_history":
-            days = params.get("days", 30)
-            return ds.get_kline(stock_code, "1D", days)
-        elif tool_name == "get_stock_info":
-            return ds.get_stock_info(stock_code)
-        elif tool_name == "get_chip_distribution":
-            # 部分数据源可能没有此方法
-            if hasattr(ds, "get_chip_distribution"):
-                return ds.get_chip_distribution(stock_code)
-            return {"error": "当前数据源不支持筹码分布分析"}
-        elif tool_name == "analyze_trend":
-            # 用 kline 数据做简单趋势分析
-            klines = ds.get_kline(stock_code, "1D", 60)
-            if not klines:
-                return {"error": "无法获取K线数据"}
-            closes = [k.get("close", 0) for k in klines if k.get("close")]
-            if len(closes) < 2:
-                return {"error": "数据不足"}
-            latest = closes[-1]
-            prev = closes[-2]
-            ma5 = sum(closes[-5:]) / min(5, len(closes))
-            ma20 = sum(closes[-20:]) / min(20, len(closes))
-            ma60 = sum(closes) / len(closes)
-            return {
-                "latest_close": latest,
-                "change_pct": round((latest - prev) / prev * 100, 2) if prev else 0,
-                "ma5": round(ma5, 2),
-                "ma20": round(ma20, 2),
-                "ma60": round(ma60, 2),
-                "trend": "多头" if ma5 > ma20 > ma60 else ("空头" if ma5 < ma20 < ma60 else "震荡"),
-                "data_points": len(closes),
-            }
-        elif tool_name == "search_stock_news":
-            # 简单返回提示，实际需要对接新闻 API
-            keyword = params.get("keyword", stock_code)
-            return {"message": f"新闻搜索功能待接入，搜索关键词: {keyword}"}
-        elif tool_name == "get_market_indices":
-            if hasattr(ds, "get_index_quotes"):
-                return ds.get_index_quotes(["000001", "399001", "399006"])
-            return {"error": "当前数据源不支持指数查询"}
-        elif tool_name == "get_sector_rankings":
-            if hasattr(ds, "get_sector_fund_flow"):
-                return ds.get_sector_fund_flow()
-            return {"error": "当前数据源不支持板块排名"}
-        else:
-            return {"error": f"未知工具: {tool_name}"}
-    except NotImplementedError:
-        return {"error": f"工具 {tool_name} 在当前数据源中未实现"}
-    except Exception as e:
-        logger.error("Tool %s error: %s", tool_name, e, exc_info=True)
-        return {"error": str(e)}
+        from app.data_sources.factory import DataSourceFactory
+        ds = DataSourceFactory.get_source(market)
 
-
-def _extract_stock_code(msg: str, ctx: Optional[Dict], session: Dict) -> Optional[str]:
-    """从上下文、消息中提取股票代码。"""
-    # 优先用 context 中的
-    if ctx and ctx.get("stock_code"):
-        return ctx["stock_code"]
-    # 从消息中提取 6 位数字
-    m = re.search(r"\b(\d{6})\b", msg)
-    if m:
-        return m.group(1)
-    # 从会话历史中沿用
-    return session.get("stock_code")
-
-
-def _extract_tool_call(llm_response: str) -> Optional[Dict]:
-    """从 LLM 回复中解析工具调用指令。"""
-    # 匹配 CALL_TOOL:{"tool": "...", "params": {...}}
-    m = re.search(r"CALL_TOOL:\s*(\{.*?\})", llm_response, re.DOTALL)
-    if m:
+        # 实时行情
         try:
-            tool_call = json.loads(m.group(1))
-            if "tool" in tool_call:
-                return tool_call
-        except json.JSONDecodeError:
+            ticker = ds.get_ticker(stock_code)
+            if isinstance(ticker, dict) and "error" not in ticker:
+                context["realtime_quote"] = ticker
+        except Exception:
             pass
-    return None
 
-
-# ── AgentExecutor ─────────────────────────────────────────
-
-class _AgentExecutor:
-    """
-    LLM 驱动的 AgentExecutor。
-    - 集成 LLMService 做意图理解和自然语言生成
-    - 内存会话历史，支持多轮上下文
-    - 两步工具调用：LLM 判断 → 执行工具 → LLM 总结
-    """
-
-    def __init__(self, skills: Optional[List[str]] = None):
-        self.skills = skills or []
-        from app.services.llm import LLMService
-        self.llm_service = LLMService()
-
-    def chat(self, message: str, session_id: str,
-             context: Optional[Dict] = None,
-             progress_callback=None) -> Any:
-        """同步聊天。"""
-        try:
-            if progress_callback:
-                progress_callback({"type": "thinking"})
-
-            # 获取会话和提取股票代码
-            session = _get_session(session_id)
-            stock_code = _extract_stock_code(message, context, session)
-            market = _detect_market(stock_code) if stock_code else "CNStock"
-
-            # 记录股票代码到会话
-            if stock_code:
-                session["stock_code"] = stock_code
-
-            # 追加用户消息到历史
-            _append_message(session_id, "user", message)
-
-            # 构建 messages 发给 LLM（注入策略 instructions）
-            messages = _build_messages(session_id, message, self.skills)
-
-            # 第一步：LLM 判断意图
+        # 筹码分布（仅A股）
+        if market == "CNStock" and hasattr(ds, "get_chip_distribution"):
             try:
-                llm_response = self.llm_service.call_llm_api(
-                    messages,
-                    use_json_mode=False,  # 对话场景，不要 JSON 模式
-                    temperature=0.7,
-                )
-            except Exception as e:
-                logger.error("LLM call failed: %s", e, exc_info=True)
-                # LLM 不可用时降级到关键词匹配
-                answer = self._fallback_dispatch(message, stock_code, market, progress_callback)
-                _append_message(session_id, "assistant", answer)
-                return _Result(success=True, content=answer, error=None)
+                chip = ds.get_chip_distribution(stock_code)
+                if isinstance(chip, dict) and "error" not in chip:
+                    context["chip_distribution"] = chip
+            except Exception:
+                pass
+    except Exception as e:
+        logger.debug("Prefetch failed for %s: %s", stock_code, e)
 
-            # 检查是否需要调用工具
-            tool_call = _extract_tool_call(llm_response)
-
-            if tool_call:
-                tool_name = tool_call.get("tool", "")
-                tool_params = tool_call.get("params", {})
-
-                # 如果工具参数没有 stock_code，自动补上
-                if "stock_code" not in tool_params and stock_code:
-                    tool_params["stock_code"] = stock_code
-
-                if progress_callback:
-                    progress_callback({
-                        "type": "tool_start",
-                        "tool": tool_name,
-                        "display_name": TOOL_DISPLAY_NAMES.get(tool_name, tool_name),
-                    })
-
-                # 执行工具
-                tool_result = _exec_tool(tool_name, tool_params, market)
-
-                if progress_callback:
-                    progress_callback({
-                        "type": "tool_done",
-                        "tool": tool_name,
-                        "display_name": TOOL_DISPLAY_NAMES.get(tool_name, tool_name),
-                    })
-
-                # 第二步：把工具结果喂回 LLM，生成最终回复
-                tool_result_str = json.dumps(tool_result, ensure_ascii=False, indent=2)
-                followup_messages = messages + [
-                    {"role": "assistant", "content": llm_response},
-                    {"role": "user", "content": f"工具返回结果：\n```json\n{tool_result_str}\n```\n请根据以上数据，用自然语言总结分析。"},
-                ]
-
-                if progress_callback:
-                    progress_callback({"type": "generating"})
-
-                try:
-                    final_response = self.llm_service.call_llm_api(
-                        followup_messages,
-                        use_json_mode=False,
-                        temperature=0.7,
-                    )
-                except Exception as e:
-                    logger.error("LLM followup call failed: %s", e, exc_info=True)
-                    # 降级：直接返回工具数据
-                    final_response = f"以下是从数据源获取的结果：\n```json\n{tool_result_str}\n```"
-            else:
-                # 不需要工具，LLM 直接回复
-                if progress_callback:
-                    progress_callback({"type": "generating"})
-
-                # 去掉可能残留的 CALL_TOOL 格式标记
-                final_response = re.sub(r"CALL_TOOL:\s*\{.*?\}", "", llm_response, flags=re.DOTALL).strip()
-                if not final_response:
-                    final_response = llm_response
-
-            # 追加助手回复到历史
-            _append_message(session_id, "assistant", final_response)
-
-            if progress_callback:
-                progress_callback({
-                    "type": "done",
-                    "success": True,
-                    "content": final_response,
-                })
-
-            return _Result(success=True, content=final_response, error=None)
-
-        except Exception as e:
-            logger.error("Agent chat error: %s", e, exc_info=True)
-            return _Result(success=False, content="", error=str(e))
-
-    def _fallback_dispatch(self, msg: str, stock_code: Optional[str],
-                           market: str, cb) -> str:
-        """LLM 不可用时的降级方案——关键词匹配。"""
-        msg_low = msg.lower()
-
-        if any(k in msg_low for k in ("行情", "报价", "quote", "price")) and stock_code:
-            if cb:
-                cb({"type": "tool_start", "tool": "get_realtime_quote"})
-            result = _exec_tool("get_realtime_quote", {"stock_code": stock_code}, market)
-            if cb:
-                cb({"type": "tool_done", "tool": "get_realtime_quote"})
-            return json.dumps(result or {}, ensure_ascii=False, indent=2)
-
-        if any(k in msg_low for k in ("k线", "历史", "history", "kline")) and stock_code:
-            if cb:
-                cb({"type": "tool_start", "tool": "get_daily_history"})
-            result = _exec_tool("get_daily_history", {"stock_code": stock_code}, market)
-            if cb:
-                cb({"type": "tool_done", "tool": "get_daily_history"})
-            return f"近 30 日 K 线数据（共 {len(result) if isinstance(result, list) else 0} 条）:\n" + json.dumps(
-                (result or [])[-5:], ensure_ascii=False, indent=2)
-
-        return (
-            f"收到消息：{msg}\n"
-            f"请提供股票代码（6 位数字），我可以查询实时行情或历史 K 线。"
-        )
+    return context
 
 
-class _Result:
-    def __init__(self, success: bool, content: str, error: Optional[str]):
-        self.success = success
-        self.content = content
-        self.error = error
-        self.total_steps = 0
-
-
-# ── 路由 ──────────────────────────────────────────────────
+# ── 路由 ──────────────────────────────────────────────────────
 
 @agent_bp.route("/strategies", methods=["GET"])
 def get_strategies():
-    """获取可用 Agent 策略（从 YAML 策略文件加载）。"""
+    """获取可用 Agent 策略。"""
     try:
-        if os.getenv('AGENT_MODE','true').lower() != 'true':
+        if os.getenv("AGENT_MODE", "true").lower() != "true":
             return jsonify({"error": "Agent mode is not enabled"}), 400
 
         strategies = _load_strategies()
@@ -469,9 +152,9 @@ def get_strategies():
 
 @agent_bp.route("/chat", methods=["POST"])
 def agent_chat():
-    """普通聊天接口。"""
+    """普通聊天接口（同步，阻塞等待结果）。"""
     try:
-        if os.getenv('AGENT_MODE','true').lower() != 'true':
+        if os.getenv("AGENT_MODE", "true").lower() != "true":
             return jsonify({"error": "Agent mode is not enabled"}), 400
 
         data = request.get_json()
@@ -486,7 +169,27 @@ def agent_chat():
         skills = data.get("skills")
         context = data.get("context")
 
-        executor = _AgentExecutor(skills)
+        # Build executor via factory
+        from app.agent.factory import build_agent_executor
+        executor = build_agent_executor(
+            skills=skills,
+            max_steps=int(os.getenv("AGENT_MAX_STEPS", "10")),
+            timeout_seconds=float(os.getenv("AGENT_TIMEOUT_SECONDS", "180")),
+        )
+
+        # Extract stock code and prefetch
+        session = _get_session(session_id)
+        stock_code = _extract_stock_code(message, context, session)
+        if stock_code:
+            session["stock_code"] = stock_code
+            market = _detect_market(stock_code)
+            prefetch = _prefetch_context(stock_code, market)
+            if context:
+                context.update(prefetch)
+            else:
+                context = prefetch
+            context["stock_code"] = stock_code
+
         result = executor.chat(
             message=message,
             session_id=session_id,
@@ -498,6 +201,10 @@ def agent_chat():
             "content": result.content,
             "session_id": session_id,
             "error": result.error,
+            "total_steps": result.total_steps,
+            "total_tokens": result.total_tokens,
+            "model": result.model,
+            "tool_calls_log": result.tool_calls_log,
         })
     except Exception as e:
         logger.error("Agent chat failed: %s", e, exc_info=True)
@@ -506,9 +213,9 @@ def agent_chat():
 
 @agent_bp.route("/chat/stream", methods=["POST"])
 def agent_chat_stream():
-    """流式聊天（SSE）。"""
+    """流式聊天（SSE），实时推送工具调用进度。"""
     try:
-        if os.getenv('AGENT_MODE','true').lower() != 'true':
+        if os.getenv("AGENT_MODE", "true").lower() != "true":
             return jsonify({"error": "Agent mode is not enabled"}), 400
 
         data = request.get_json()
@@ -533,14 +240,38 @@ def agent_chat_stream():
 
         def _run():
             try:
-                executor = _AgentExecutor(skills)
-                r = executor.chat(message=message, session_id=session_id,
-                                  context=context, progress_callback=_cb)
+                from app.agent.factory import build_agent_executor
+
+                # Extract stock code and prefetch
+                session = _get_session(session_id)
+                stock_code = _extract_stock_code(message, context, session)
+                enriched_ctx = dict(context) if context else {}
+                if stock_code:
+                    session["stock_code"] = stock_code
+                    market = _detect_market(stock_code)
+                    prefetch = _prefetch_context(stock_code, market)
+                    enriched_ctx.update(prefetch)
+                    enriched_ctx["stock_code"] = stock_code
+
+                executor = build_agent_executor(
+                    skills=skills,
+                    max_steps=int(os.getenv("AGENT_MAX_STEPS", "10")),
+                    timeout_seconds=float(os.getenv("AGENT_TIMEOUT_SECONDS", "180")),
+                )
+                r = executor.chat(
+                    message=message,
+                    session_id=session_id,
+                    context=enriched_ctx,
+                    progress_callback=_cb,
+                )
                 event_queue.put({
                     "type": "done",
                     "success": r.success,
                     "content": r.content,
                     "error": r.error,
+                    "total_steps": r.total_steps,
+                    "total_tokens": r.total_tokens,
+                    "model": r.model,
                     "session_id": session_id,
                 })
             except Exception as exc:
@@ -606,6 +337,10 @@ def get_chat_session_messages(session_id: str):
 @agent_bp.route("/chat/sessions/<session_id>", methods=["DELETE"])
 def delete_chat_session(session_id: str):
     """删除会话。"""
+    # Also clear conversation history in executor
+    from app.agent.executor import _conversations
+    _conversations.clear(session_id)
+
     if session_id in _sessions:
         del _sessions[session_id]
         return jsonify({"deleted": 1})

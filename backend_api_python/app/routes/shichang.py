@@ -8,6 +8,7 @@ import time
 from flask import Blueprint, jsonify, make_response, request
 import logging
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import ThreadPoolExecutor
 from app.data_sources.factory import DataSourceFactory
 from app.data_sources.normalizer import safe_float, safe_int
@@ -607,6 +608,231 @@ def _build_ai_analysis(ov, sk):
         'hotSectors': hot_sectors[:5],
         'operationAdvice': op[:6],
     }
+
+
+# ============================================================
+#  国内大环境分析 — market_cn 模块 API
+# ============================================================
+
+@shichang_bp.route('/china-macro')
+def china_macro():
+    """国内宏观经济数据: GDP, CPI, PPI, PMI, M2, 社融, 进出口, LPR"""
+    def _run():
+        from app.market_cn.data_sources import ChinaData
+        data = ChinaData()
+
+        fetchers = [
+            ("gdp", data.gdp),
+            ("cpi", data.cpi),
+            ("ppi", data.ppi),
+            ("pmi", data.pmi),
+            ("m2", data.m2),
+            ("lpr", data.lpr),
+            ("social_financing", data.social_financing),
+            ("trade", data.trade),
+        ]
+
+        macro = {}
+
+        def _fetch_one(name, fn):
+            try:
+                df = fn()
+                if df is not None and len(df) > 0:
+                    records = df.tail(6).fillna("").to_dict(orient="records")
+                    return name, {"columns": list(df.columns), "latest": records, "count": len(df)}
+                else:
+                    return name, {"columns": [], "latest": [], "count": 0}
+            except Exception as e:
+                logger.error("china-macro %s 失败: %s", name, e)
+                return name, {"columns": [], "latest": [], "count": 0, "error": str(e)}
+
+        # 并行获取（每个指标独立线程，互不阻塞）
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(_fetch_one, n, f): n for n, f in fetchers}
+            for fut in as_completed(futures, timeout=60):
+                name, result = fut.result(timeout=5)
+                macro[name] = result
+
+        return {
+            "code": 1,
+            "msg": "success",
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "data": macro,
+        }
+
+    try:
+        data = _coalesce("china_macro", _run, timeout=60)
+    except Exception as e:
+        logger.error("china-macro 失败: %s", e)
+        data = None
+    return _make_resp(data or {"code": 0, "msg": "获取失败", "data": {}})
+
+
+@shichang_bp.route('/china-fear-greed')
+def china_fear_greed():
+    """A股市场贪婪恐惧指数 (7维度综合)"""
+    def _run():
+        from app.market_cn.fear_greed_index import fear_greed_index
+        return fear_greed_index()
+
+    try:
+        data = _coalesce("china_fg", _run, timeout=30)
+    except Exception as e:
+        logger.error("china-fear-greed 失败: %s", e)
+        data = None
+    return _make_resp({"code": 1 if data else 0, "msg": "success" if data else str(e), "data": data or {}})
+
+
+@shichang_bp.route('/china-policy')
+def china_policy():
+    """AI政策解读（关键词版，无需 LLM API Key）"""
+    def _run():
+        from app.market_cn.policy_analysis import get_policy_keywords, analyze_policy_impact
+        policy_items = get_policy_keywords()
+        impacts = analyze_policy_impact(policy_items) if policy_items else []
+        return {
+            "code": 1, "msg": "success",
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "data": {"policy_items": policy_items[:30], "impacts": impacts[:20]},
+        }
+
+    try:
+        data = _coalesce("china_policy", _run, timeout=30)
+    except Exception as e:
+        logger.error("china-policy 失败: %s", e)
+        data = None
+    return _make_resp(data or {"code": 0, "msg": "获取失败", "data": {}})
+
+
+@shichang_bp.route('/hot-sectors')
+def hot_sectors():
+    """热门板块 & 概念板块实时分析"""
+    def _run():
+        from app.market_cn.hot_sectors import get_all_hot_sectors
+        return get_all_hot_sectors(industry_limit=15, concept_limit=15)
+
+    try:
+        data = _coalesce("hot_sectors", _run, timeout=20)
+    except Exception as e:
+        logger.error("hot-sectors 失败: %s", e)
+        data = None
+    return _make_resp({"code": 1 if data else 0, "msg": "success" if data else str(e), "data": data or {}})
+
+
+@shichang_bp.route('/sector-detail/<board_code>')
+def sector_detail(board_code):
+    """板块内个股详情"""
+    # 防注入：只允许字母数字
+    if not board_code.isalnum():
+        return _make_resp({"code": 0, "msg": "非法板块代码", "data": []})
+    try:
+        from app.market_cn.hot_sectors import get_sector_detail
+        stocks = get_sector_detail(board_code, limit=15)
+        return _make_resp({"code": 1, "msg": "success", "data": stocks})
+    except Exception as e:
+        logger.error("sector-detail %s 失败: %s", board_code, e)
+        return _make_resp({"code": 0, "msg": str(e), "data": []})
+
+
+# ============================================================
+#  板块历史分析 — 趋势 / 周期 / 预测
+# ============================================================
+
+@shichang_bp.route('/sector-trend')
+def sector_trend():
+    """板块1个月趋势分析 + 6个月周期 + 今日预测（汇总接口）"""
+    board_type = request.args.get("type", "industry")
+    cache_key = f"sector_trend_{board_type}"
+
+    def _run():
+        from app.interfaces.cache_file import cache_db
+        from app.market_cn.sector_history import get_sector_trend
+        db = cache_db()
+        return get_sector_trend(db, board_type=board_type)
+
+    try:
+        data = _coalesce(cache_key, _run, timeout=30)
+    except Exception as e:
+        logger.error("sector-trend 失败: %s", e)
+        data = None
+    return _make_resp({"code": 1 if data else 0, "msg": "success" if data else str(e), "data": data or {}})
+
+
+@shichang_bp.route('/sector-prediction')
+def sector_prediction():
+    """今日热门板块预测（基于趋势+季节性+最新排名）"""
+    def _run():
+        from app.interfaces.cache_file import cache_db
+        from app.market_cn.sector_history import SectorAnalyzer
+        db = cache_db()
+        analyzer = SectorAnalyzer(db)
+
+        industry = analyzer.full_analysis("industry")
+        concept = analyzer.full_analysis("concept")
+
+        return {
+            "code": 1, "msg": "success",
+            "data": {
+                "industry": industry.get("prediction", {}),
+                "concept": concept.get("prediction", {}),
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        }
+
+    try:
+        data = _coalesce("sector_prediction", _run, timeout=30)
+    except Exception as e:
+        logger.error("sector-prediction 失败: %s", e)
+        data = None
+    return _make_resp(data or {"code": 0, "msg": "获取失败", "data": {}})
+
+
+@shichang_bp.route('/sector-history')
+def sector_history():
+    """板块历史排名数据（供前端图表使用）"""
+    try:
+        board_type = request.args.get("type", "industry")
+        days = request.args.get("days", 30, type=int)
+        days = min(max(days, 1), 200)  # clamp 1~200
+
+        from app.interfaces.cache_file import cache_db
+        from app.market_cn.sector_history import get_sector_history
+
+        db = cache_db()
+        rows = get_sector_history(db, board_type=board_type, days=days)
+        return _make_resp({"code": 1, "msg": "success", "count": len(rows), "data": rows})
+    except Exception as e:
+        logger.error("sector-history 失败: %s", e)
+        return _make_resp({"code": 0, "msg": str(e), "data": []})
+
+
+@shichang_bp.route('/sector-cycle')
+def sector_cycle():
+    """板块6个月周期分析"""
+    board_type = request.args.get("type", "industry")
+    cache_key = f"sector_cycle_{board_type}"
+
+    def _run():
+        from app.interfaces.cache_file import cache_db
+        from app.market_cn.sector_history import SectorAnalyzer
+        db = cache_db()
+        analyzer = SectorAnalyzer(db)
+        result = analyzer.full_analysis(board_type)
+        return {
+            "code": 1, "msg": "success",
+            "data": {
+                "cycle": result.get("cycle", {}),
+                "data_days": result.get("data_days", 0),
+                "date_range": result.get("date_range", {}),
+            }
+        }
+
+    try:
+        data = _coalesce(cache_key, _run, timeout=30)
+    except Exception as e:
+        logger.error("sector-cycle 失败: %s", e)
+        data = None
+    return _make_resp(data or {"code": 0, "msg": "获取失败", "data": {}})
 
 
 # ============================================================

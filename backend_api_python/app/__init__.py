@@ -187,6 +187,32 @@ def start_emotion_scheduler():
         logger.error(f"Failed to start emotion scheduler: {e}")
 
 
+def start_sector_history_scheduler():
+    """启动板块历史采集调度器（仅在 SECTOR_HISTORY_ENABLED=true 时）
+
+    每日收盘后 15:30 采集行业板块 & 概念板块排名存入 feather，
+    保留 ~200 天（~6.5 个月），供趋势/周期/预测分析使用。
+    """
+    import os
+    if os.getenv("SECTOR_HISTORY_ENABLED", "false").lower() != "true":
+        logger.info("Sector history scheduler is disabled. Set SECTOR_HISTORY_ENABLED=true to enable.")
+        return
+
+    debug = os.getenv("PYTHON_API_DEBUG", "false").lower() == "true"
+    if debug and os.environ.get("WERKZEUG_RUN_MAIN") != "true":
+        return
+
+    try:
+        from app.interfaces.cache_file import cache_db
+        from app.market_cn.sector_history import SectorHistoryScheduler
+
+        db = cache_db()
+        scheduler = SectorHistoryScheduler(db)
+        scheduler.start()
+    except Exception as e:
+        logger.error(f"Failed to start sector history scheduler: {e}")
+
+
 def restore_running_strategies():
     """
     Restore running strategies on startup.
@@ -324,6 +350,7 @@ def create_app(config_name='default'):
         start_usdt_order_worker()
         start_polymarket_worker()
         start_emotion_scheduler()
+        start_sector_history_scheduler()
         # Offline calibration to make AI thresholds self-tuning.
         try:
             from app.services.ai_calibration import start_ai_calibration_worker

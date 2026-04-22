@@ -35,6 +35,8 @@ TABLE_PRIMARY_KEYS: Dict[str, List[str]] = {
     "cnd_concept_fund_flow":  ["trade_date", "name"],
     "cnd_stock_info":         ["stock_code"],
     "cnd_emotion_history":    ["timestamp"],
+    "cnd_sector_history":     ["trade_date", "name", "board_type"],
+    "cnd_concept_history":    ["trade_date", "name", "board_type"],
 }
 
 # 每张表的推荐列类型（写入时强制转换，防止类型漂移）
@@ -89,6 +91,24 @@ TABLE_DTYPES: Dict[str, Dict[str, str]] = {
         "up_count": "Int64", "down_count": "Int64",
         "limit_up": "Int64", "limit_down": "Int64",
         "north_net_flow": "float64",
+    },
+    "cnd_sector_history": {
+        "trade_date": "string", "board_type": "string", "name": "string",
+        "code": "string", "rank": "Int64", "change_pct": "float64",
+        "amount": "float64", "turnover": "float64",
+        "up_count": "Int64", "down_count": "Int64",
+        "lead_stock": "string", "lead_stock_pct": "float64",
+        "limit_up_count": "Int64", "total_mv": "float64",
+        "fetch_time": "string",
+    },
+    "cnd_concept_history": {
+        "trade_date": "string", "board_type": "string", "name": "string",
+        "code": "string", "rank": "Int64", "change_pct": "float64",
+        "amount": "float64", "turnover": "float64",
+        "up_count": "Int64", "down_count": "Int64",
+        "lead_stock": "string", "lead_stock_pct": "float64",
+        "limit_up_count": "Int64",
+        "fetch_time": "string",
     },
 }
 
@@ -475,6 +495,26 @@ class cache_db:
                 shutil.copy2(path, bak)
                 backed_up.append(table)
         return backed_up
+
+    def replace_rows(self, table: str, rows: List[Dict[str, Any]]) -> int:
+        """原子替换整表数据（用于裁剪/过滤后的重写）
+
+        Args:
+            table: 表名
+            rows: 新的完整行列表（覆盖旧表）
+
+        Returns:
+            写入行数
+        """
+        if not rows:
+            return 0
+        self._validate_table(table)
+        new_df = pd.DataFrame(rows)
+        with self._locks[table]:
+            new_df = self._normalize_dtypes(table, new_df)
+            self._write_feather(table, new_df)
+            self._invalidate_cache(table)
+            return len(new_df)
 
     def upsert_and_prune(self, table: str, rows: List[Dict[str, Any]],
                          prune_column: str = "timestamp",
