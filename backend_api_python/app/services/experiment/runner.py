@@ -242,7 +242,7 @@ class ExperimentRunnerService:
         user_id: int,
         best_output: Dict[str, Any],
         strategy_name: str,
-        market_category: str = 'Crypto',
+        market_category: str = 'CNStock',
     ) -> int:
         """Persist the best experiment candidate as a strategy record."""
         from app.services.strategy import StrategyService
@@ -487,7 +487,7 @@ class ExperimentRunnerService:
         }
 
     def detect_regime(self, base: Dict[str, Any]) -> Dict[str, Any]:
-        market = str(base.get('market') or 'Crypto')
+        market = str(base.get('market') or 'CNStock')
         symbol = str(base.get('symbol') or '')
         timeframe = str(base.get('timeframe') or '1D')
         start_date, end_date = self._parse_dates(base)
@@ -553,7 +553,7 @@ class ExperimentRunnerService:
         if not snapshot:
             snapshot = {
                 'code': base.get('indicatorCode') or base.get('code') or '',
-                'market': base.get('market') or 'Crypto',
+                'market': base.get('market') or 'CNStock',
                 'symbol': base.get('symbol') or '',
                 'timeframe': base.get('timeframe') or '1D',
                 'initial_capital': float(base.get('initialCapital') or 10000),

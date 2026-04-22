@@ -845,7 +845,7 @@ class TradingExecutor:
 
             # 获取市场类别（Crypto, USStock, Forex, Futures）
             # 这决定了使用哪个数据源来获取价格和K线数据
-            market_category = (strategy.get('market_category') or 'Crypto').strip()
+            market_category = (strategy.get('market_category') or 'CNStock').strip()
             logger.info(f"Strategy {strategy_id} market_category: {market_category}")
 
             # 安全获取 initial_capital（横截面分支也需要）
@@ -1426,7 +1426,7 @@ class TradingExecutor:
                                 try:
                                     from app.services.portfolio_monitor import notify_strategy_signal_for_positions
                                     notify_strategy_signal_for_positions(
-                                        market=market_type or 'Crypto',
+                                        market=market_type or 'CNStock',
                                         symbol=symbol,
                                         signal_type=signal_type,
                                         signal_detail=f"Strategy: {strategy_name}\nSignal: {signal_type}\nPrice: {execute_price:.4f}"
@@ -1621,7 +1621,7 @@ class TradingExecutor:
                 self._exchange_fee_cache[strategy_id] = None
             return None
 
-    def _fetch_latest_kline(self, symbol: str, timeframe: str, limit: int = 500, market_category: str = 'Crypto') -> List[Dict[str, Any]]:
+    def _fetch_latest_kline(self, symbol: str, timeframe: str, limit: int = 500, market_category: str = 'CNStock') -> List[Dict[str, Any]]:
         """获取最新K线数据（优先从缓存获取）
         
         Args:
@@ -1643,7 +1643,7 @@ class TradingExecutor:
             logger.error(f"Failed to fetch K-lines for {market_category}:{symbol}: {str(e)}")
             return []
     
-    def _fetch_current_price(self, exchange: Any, symbol: str, market_type: str = None, market_category: str = 'Crypto') -> Optional[float]:
+    def _fetch_current_price(self, exchange: Any, symbol: str, market_type: str = None, market_category: str = 'CNStock') -> Optional[float]:
         """获取当前价格 (根据 market_category 选择正确的数据源)
         
         Args:
@@ -2467,7 +2467,7 @@ class TradingExecutor:
         leverage: int,
         initial_capital: float,
         market_type: str = 'swap',
-        market_category: str = 'Crypto',
+        market_category: str = 'CNStock',
         margin_mode: str = 'cross',
         stop_loss_price: float = None,
         take_profit_price: float = None,
@@ -2836,7 +2836,7 @@ class TradingExecutor:
         tc = trading_config if isinstance(trading_config, dict) else {}
 
         # Market for AnalysisService. Live trading executor is Crypto-focused.
-        market = str(amc.get("market") or amc.get("analysis_market") or "Crypto").strip() or "Crypto"
+        market = str(amc.get("market") or amc.get("analysis_market") or "CNStock").strip() or "Crypto"
 
         # Optional model override (OpenRouter model id)
         model = amc.get("model") or amc.get("openrouter_model") or amc.get("openrouterModel") or None
@@ -2993,7 +2993,7 @@ class TradingExecutor:
         amount: float,
         ref_price: Optional[float] = None,
         market_type: str = 'swap',
-        market_category: str = 'Crypto',
+        market_category: str = 'CNStock',
         leverage: float = 1.0,
         margin_mode: str = 'cross',
         stop_loss_price: float = None,

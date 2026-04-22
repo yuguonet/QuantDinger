@@ -924,7 +924,7 @@ class PendingOrderWorker:
         exchange_config = resolve_exchange_config(cfg.get("exchange_config") or {}, user_id=strategy_user_id)
         safe_cfg = safe_exchange_config_for_log(exchange_config)
         exchange_id = str(exchange_config.get("exchange_id") or "").strip().lower()
-        market_category = str(cfg.get("market_category") or "Crypto").strip()
+        market_category = str(cfg.get("market_category") or "CNStock").strip()
 
         # Validate market category and exchange_id combination for live trading
         # Futures does not support live trading

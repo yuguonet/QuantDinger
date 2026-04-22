@@ -578,7 +578,7 @@ CONFIG_SCHEMA = {
                 'key': 'AI_CALIBRATION_MARKETS',
                 'label': 'Calibration Markets',
                 'type': 'text',
-                'default': 'Crypto',
+                'default': 'CNStock',
                 'description': 'Comma-separated markets to run threshold calibration'
             },
             {

@@ -43,8 +43,8 @@ class DataSourceFactory:
             return cls.get_source("Crypto")
         if key in ("futures",):
             return cls.get_source("Futures")
-        # Default to Crypto for safety (most callers want a ticker for crypto pairs).
-        return cls.get_source("Crypto")
+        # Default to CNStock for safety (A-share is the primary market).
+        return cls.get_source("CNStock")
     
     @classmethod
     def _create_source(cls, market: str) -> BaseDataSource:
@@ -98,12 +98,15 @@ class DataSourceFactory:
             K线数据列表
         """
         try:
+            if not market:
+                logger.error(f"Missing market parameter for symbol: {symbol}")
+                return []
             source = cls.get_source(market)
             klines = source.get_kline(symbol, timeframe, limit, before_time)
-            
+
             # 确保数据按时间排序
             klines.sort(key=lambda x: x['time'])
-            
+
             return klines
         except Exception as e:
             logger.error(f"Failed to fetch K-lines {market}:{symbol} - {str(e)}")
@@ -127,6 +130,9 @@ class DataSourceFactory:
             }
         """
         try:
+            if not market:
+                logger.error(f"Missing market parameter for symbol: {symbol}")
+                return {'last': 0, 'symbol': symbol}
             source = cls.get_source(market)
             return source.get_ticker(symbol)
         except NotImplementedError:

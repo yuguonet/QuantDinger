@@ -1999,7 +1999,7 @@ IMPORTANT:
             "crypto_factor_summary": crypto_factor_objective.get("summary") or (crypto_factors.get("summary") if crypto_factors else ""),
         }
 
-    def _get_ai_calibration(self, market: str = "Crypto") -> Dict[str, Any]:
+    def _get_ai_calibration(self, market: str = "CNStock") -> Dict[str, Any]:
         """
         Load latest offline calibration thresholds for the given market.
         Cached briefly to avoid DB load on every request.
@@ -2549,7 +2549,7 @@ IMPORTANT:
             return "trending"
         return "ranging"
 
-    def _score_to_decision(self, score: float, *, market: str = "Crypto") -> str:
+    def _score_to_decision(self, score: float, *, market: str = "CNStock") -> str:
         """
         根据客观评分转换为决策
         

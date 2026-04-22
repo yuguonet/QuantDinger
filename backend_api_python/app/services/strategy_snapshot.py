@@ -126,7 +126,7 @@ class StrategySnapshotResolver:
             raise ValueError("Cross-sectional strategies are not supported in strategy backtest yet")
 
         symbol = str(override.get("symbol") or trading_config.get("symbol") or strategy.get("symbol") or "").strip()
-        market = str(override.get("market") or strategy.get("market_category") or trading_config.get("market_category") or "Crypto").strip() or "Crypto"
+        market = str(override.get("market") or strategy.get("market_category") or trading_config.get("market_category") or "CNStock").strip() or "CNStock"
         if ":" in symbol and "market" not in override:
             maybe_market, maybe_symbol = symbol.split(":", 1)
             market = maybe_market or market

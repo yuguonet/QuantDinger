@@ -172,7 +172,7 @@ def save_experiment_strategy():
         if not strategy_name:
             return jsonify({'code': 0, 'msg': 'strategyName is required', 'data': None}), 400
 
-        market_category = payload.get('marketCategory') or 'Crypto'
+        market_category = payload.get('marketCategory') or 'CNStock'
         strategy_id = experiment_runner.save_as_strategy(
             user_id=int(g.user_id or 1),
             best_output=best_output,

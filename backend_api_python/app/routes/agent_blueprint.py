@@ -184,7 +184,7 @@ def _detect_market(stock_code: str) -> str:
         return "AShare"
     if code.startswith(("HK",)):
         return "HShare"
-    if len(code) <= 5 and code.isdigit():
+    if len(code) <= 6 and code.isdigit():
         return "AShare"
     return "Crypto"
 

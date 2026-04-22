@@ -77,7 +77,7 @@ def load_strategy_configs(strategy_id: int) -> Dict[str, Any]:
     market_type = (row.get("market_type") or exchange_config.get("market_type") or "swap").strip()
     leverage = float(row.get("leverage") or trading_config.get("leverage") or exchange_config.get("leverage") or 1.0)
     execution_mode = (row.get("execution_mode") or "signal").strip().lower()
-    market_category = (row.get("market_category") or "Crypto").strip()
+    market_category = (row.get("market_category") or "CNStock").strip()
     user_id = int(row.get("user_id") or 1)
 
     return {

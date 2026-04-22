@@ -162,7 +162,7 @@ class AICalibrationService:
 
     def calibrate_market(
         self,
-        market: str = "Crypto",
+        market: str = "CNStock",
         *,
         lookback_days: int = 30,
         min_samples: int = 80,
@@ -323,7 +323,7 @@ def start_ai_calibration_worker() -> None:
         svc = AICalibrationService()
         lookback_days = int(os.getenv("AI_CALIBRATION_LOOKBACK_DAYS", "30"))
         min_samples = int(os.getenv("AI_CALIBRATION_MIN_SAMPLES", "80"))
-        market = os.getenv("AI_CALIBRATION_MARKET", "Crypto").strip() or "Crypto"
+        market = os.getenv("AI_CALIBRATION_MARKET", "CNStock").strip() or "Crypto"
         logger.info(
             f"Starting offline AI calibration: market={market}, lookback_days={lookback_days}, min_samples={min_samples}"
         )

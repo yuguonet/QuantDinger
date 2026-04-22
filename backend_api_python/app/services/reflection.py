@@ -54,7 +54,7 @@ class ReflectionService:
         try:
             from app.services.ai_calibration import AICalibrationService
             svc = AICalibrationService()
-            markets = (os.getenv("AI_CALIBRATION_MARKETS", "Crypto") or "Crypto").strip().split(",")
+            markets = (os.getenv("AI_CALIBRATION_MARKETS", "CNStock") or "Crypto").strip().split(",")
             for market in markets:
                 market = market.strip()
                 if not market:

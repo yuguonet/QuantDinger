@@ -1464,7 +1464,7 @@ class BacktestService:
             raise ValueError("strategy snapshot is required")
 
         code = snapshot.get('code') or ''
-        market = snapshot.get('market') or 'Crypto'
+        market = snapshot.get('market') or 'CNStock'
         symbol = snapshot.get('symbol') or ''
         timeframe = snapshot.get('timeframe') or '1D'
         initial_capital = float(snapshot.get('initial_capital') or 10000)

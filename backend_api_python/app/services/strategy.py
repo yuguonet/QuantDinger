@@ -854,7 +854,7 @@ class StrategyService:
 
         user_id = payload.get('user_id') or 1
         strategy_type = payload.get('strategy_type') or 'IndicatorStrategy'
-        market_category = payload.get('market_category') or 'Crypto'
+        market_category = payload.get('market_category') or 'CNStock'
         execution_mode = payload.get('execution_mode') or 'signal'
         notification_config = payload.get('notification_config') or {}
 
@@ -970,7 +970,7 @@ class StrategyService:
             raise ValueError("strategy_name is required")
         
         # Validate MT5 can only be used for Forex trading
-        market_category = payload.get('market_category') or 'Crypto'
+        market_category = payload.get('market_category') or 'CNStock'
         exchange_config = payload.get('exchange_config') or {}
         exchange_id = (exchange_config.get('exchange_id') or '').strip().lower() if isinstance(exchange_config, dict) else ''
         if exchange_id == 'mt5' and market_category != 'Forex':
@@ -996,7 +996,7 @@ class StrategyService:
                     market_category = parts[0]
                     symbol_name = parts[1]
                 else:
-                    market_category = payload.get('market_category') or 'Crypto'
+                    market_category = payload.get('market_category') or 'CNStock'
                     symbol_name = symbol
                 
                 # Strategy name with symbol suffix
@@ -1113,7 +1113,7 @@ class StrategyService:
 
         # Merge: allow partial updates
         name = (payload.get('strategy_name') or existing.get('strategy_name') or '').strip()
-        market_category = payload.get('market_category') or existing.get('market_category') or 'Crypto'
+        market_category = payload.get('market_category') or existing.get('market_category') or 'CNStock'
         execution_mode = payload.get('execution_mode') or existing.get('execution_mode') or 'signal'
         notification_config = payload.get('notification_config') if payload.get('notification_config') is not None else (existing.get('notification_config') or {})
 
