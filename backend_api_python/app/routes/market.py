@@ -345,16 +345,24 @@ def remove_watchlist():
     try:
         user_id = g.user_id
         data = request.get_json() or {}
+        market = (data.get('market') or '').strip()
         symbol = _normalize_symbol(data.get('symbol'))
         if not symbol:
             return jsonify({'code': 0, 'msg': 'Missing symbol', 'data': None}), 400
 
         with get_db_connection() as db:
             cur = db.cursor()
-            cur.execute(
-                "DELETE FROM qd_watchlist WHERE user_id = ? AND symbol = ?",
-                (user_id, symbol)
-            )
+            if market:
+                cur.execute(
+                    "DELETE FROM qd_watchlist WHERE user_id = ? AND market = ? AND symbol = ?",
+                    (user_id, market, symbol)
+                )
+            else:
+                # 兼容旧调用：未传 market 时按 symbol 删除（可能误删跨市场同名标的）
+                cur.execute(
+                    "DELETE FROM qd_watchlist WHERE user_id = ? AND symbol = ?",
+                    (user_id, symbol)
+                )
             db.commit()
             cur.close()
         return jsonify({'code': 1, 'msg': 'success', 'data': None})

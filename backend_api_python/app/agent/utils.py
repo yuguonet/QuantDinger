@@ -12,7 +12,7 @@ def detect_market(stock_code: str) -> str:
     """
     code = (stock_code or "").strip().upper()
     if not code:
-        return "Crypto"
+        return "CNStock"
 
     # Explicit exchange prefixes
     if code.startswith(("SH", "SZ", "BJ")):
@@ -40,4 +40,4 @@ def detect_market(stock_code: str) -> str:
     if len(code) == 6 and code.isalpha():
         return "Forex"
 
-    return "Crypto"
+    return "CNStock"

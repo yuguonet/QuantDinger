@@ -283,19 +283,21 @@ def delete_favorite(strategy_id: int):
 # ================================================================
 
 def _ensure_watchlist_table():
-    """确保自选股表存在"""
+    """确保自选股表存在（使用统一 schema，含 market 列）"""
     ddl = """
     CREATE TABLE IF NOT EXISTS qd_watchlist (
         id          SERIAL PRIMARY KEY,
         user_id     INTEGER NOT NULL DEFAULT 0,
-        code        VARCHAR(20) NOT NULL,
+        market      VARCHAR(20) NOT NULL DEFAULT 'CNStock',
+        symbol      VARCHAR(30) NOT NULL,
         name        VARCHAR(100) NOT NULL DEFAULT '',
         industry    VARCHAR(100) DEFAULT '',
         concept     TEXT DEFAULT '',
         new_price   NUMERIC DEFAULT NULL,
         change_rate NUMERIC DEFAULT NULL,
         created_at  TIMESTAMP DEFAULT NOW(),
-        UNIQUE(user_id, code)
+        updated_at  TIMESTAMP DEFAULT NOW(),
+        UNIQUE(user_id, market, symbol)
     );
     CREATE INDEX IF NOT EXISTS idx_qdwl_user_id
         ON qd_watchlist (user_id);
@@ -330,25 +332,27 @@ def add_to_watchlist():
             added = 0
             skipped = 0
             for s in stocks:
-                code = (s.get("code") or "").strip()
+                code = (s.get("code") or s.get("symbol") or "").strip()
                 if not code:
                     skipped += 1
                     continue
+                market = (s.get("market") or "CNStock").strip()
                 name = (s.get("name") or "")[:100]
                 industry = (s.get("industry") or "")[:100]
                 try:
                     cur.execute(
-                        """INSERT INTO qd_watchlist (user_id, code, name, industry, concept, new_price, change_rate)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s)
-                           ON CONFLICT (user_id, code) DO UPDATE SET
+                        """INSERT INTO qd_watchlist (user_id, market, symbol, name, industry, concept, new_price, change_rate)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                           ON CONFLICT (user_id, market, symbol) DO UPDATE SET
                                name = EXCLUDED.name,
                                industry = EXCLUDED.industry,
                                concept = EXCLUDED.concept,
                                new_price = EXCLUDED.new_price,
                                change_rate = EXCLUDED.change_rate,
-                               created_at = NOW()""",
+                               updated_at = NOW()""",
                         (
                             user_id,
+                            market,
                             code,
                             name,
                             industry,
@@ -381,7 +385,7 @@ def get_watchlist():
         with get_db_connection() as conn:
             cur = conn.cursor()
             cur.execute(
-                "SELECT id, code, name, industry, concept, new_price, change_rate, created_at "
+                "SELECT id, market, symbol AS code, name, industry, concept, new_price, change_rate, created_at "
                 "FROM qd_watchlist WHERE user_id = %s ORDER BY created_at DESC",
                 (user_id,)
             )

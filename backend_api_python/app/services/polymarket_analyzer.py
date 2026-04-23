@@ -471,7 +471,7 @@ IMPORTANT: All text in the JSON response (reasoning, key_factors, risk_factors) 
         elif len(symbol) <= 5 and symbol.isupper():
             return "USStock"
         else:
-            return "Crypto"  # 默认
+            return "CNStock"  # 默认
     
     def _extract_keywords(self, text: str) -> List[str]:
         """提取关键词"""

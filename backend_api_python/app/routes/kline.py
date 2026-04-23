@@ -12,6 +12,7 @@ from datetime import datetime
 import traceback
 
 from app.services.kline import KlineService
+from app.data_sources.market_detector import detect_market
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -39,7 +40,9 @@ def get_kline():
       - 缓存未命中 → 走远程拉取并写入缓存
     """
     try:
-        market = request.args.get('market', 'CNStock')
+        market = request.args.get('market', '').strip()
+        if not market:
+            market = detect_market(symbol) or 'CNStock'
         symbol = request.args.get('symbol', '')
         timeframe = request.args.get('timeframe', '1D')
         try:
@@ -105,9 +108,11 @@ def prewarm_cache():
 
     请求体 JSON:
         {
-            "symbols": ["600519", "000001", ...],  // 股票代码列表
-            "market": "CNStock"                      // 可选，默认 CNStock
+            "symbols": ["600519", "000001", ...],  // 股票代码列表（可选）
+            "market": "CNStock"                      // 可选，指定 symbols 的市场类型
         }
+
+    如果不传 symbols，则从自选股表自动获取（按市场分组预热）。
 
     流程：
         1. 去重股票代码
@@ -118,31 +123,53 @@ def prewarm_cache():
     try:
         data = request.get_json() or {}
         symbols = data.get('symbols', [])
-        market = data.get('market', 'CNStock')
+        market = data.get('market', '')
 
         if not symbols:
-            # 尝试从自选股表获取
+            # 从自选股表获取，按市场分组预热（避免 A 股代码被当作 Crypto 拉取）
             try:
                 from app.utils.db import get_db_connection
                 with get_db_connection() as conn:
                     cur = conn.cursor()
-                    cur.execute("SELECT DISTINCT code FROM qd_watchlist")
+                    cur.execute("SELECT market, symbol FROM qd_watchlist WHERE market IS NOT NULL AND symbol IS NOT NULL")
                     rows = cur.fetchall() or []
                     cur.close()
-                symbols = [r['code'] for r in rows if r.get('code')]
+
+                watchlist_by_market = {}
+                for r in rows:
+                    mkt = (r.get('market') or '').strip()
+                    sym = (r.get('symbol') or '').strip()
+                    if mkt and sym:
+                        watchlist_by_market.setdefault(mkt, []).append(sym)
+
+                total = sum(len(syms) for syms in watchlist_by_market.values())
+                if total == 0:
+                    return jsonify({'code': 0, 'msg': 'No symbols to prewarm', 'data': None}), 400
+
+                logger.info(f"Prewarming cache for {total} symbols across {len(watchlist_by_market)} markets")
+                all_results = {}
+                for mkt, syms in watchlist_by_market.items():
+                    unique = list(dict.fromkeys(s.strip() for s in syms if s.strip()))
+                    if unique:
+                        all_results[mkt] = kline_service.prewarm_all(symbols=unique, market=mkt)
+
+                all_ok = all(v for results in all_results.values() for v in results.values())
+                return jsonify({
+                    'code': 1 if all_ok else 0,
+                    'msg': f'Prewarm completed: {all_results}',
+                    'data': {'results': all_results}
+                })
+
             except Exception as e:
                 logger.warning(f"Failed to fetch watchlist symbols: {e}")
+                return jsonify({'code': 0, 'msg': f'Failed: {e}', 'data': None}), 500
 
-        if not symbols:
-            return jsonify({
-                'code': 0,
-                'msg': 'No symbols to prewarm',
-                'data': None
-            }), 400
+        # 指定了 symbols + market 的情况
+        if not market:
+            market = 'CNStock'
 
-        # 去重
         unique_symbols = list(dict.fromkeys(s.strip() for s in symbols if s.strip()))
-        logger.info(f"Prewarming cache for {len(unique_symbols)} unique symbols")
+        logger.info(f"Prewarming cache for {len(unique_symbols)} unique symbols (market={market})")
 
         results = kline_service.prewarm_all(
             symbols=unique_symbols,
@@ -212,8 +239,10 @@ def cache_status():
 def get_price():
     """获取最新价格"""
     try:
-        market = request.args.get('market', 'CNStock')
+        market = request.args.get('market', '').strip()
         symbol = request.args.get('symbol', '')
+        if not market and symbol:
+            market = detect_market(symbol) or 'CNStock'
 
         if not symbol:
             return jsonify({
