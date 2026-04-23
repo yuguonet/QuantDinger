@@ -401,42 +401,82 @@ class KlineCacheManager:
 
     def _full_fetch(self, tf, symbols, fetch_func, market):
         limit = {"1D": DAILY_LIMIT, "1W": WEEKLY_LIMIT, "1M": MONTHLY_LIMIT}.get(tf, DAILY_LIMIT)
-        logger.info(f"[KlineCache] 全量拉取 {tf} {len(symbols)} 只股票")
+        batch_size = 500  # 一次最多拉取 500 支，超过分批
+
+        # 1) 去重：同一市场只保留唯一 symbol
+        symbols = list(dict.fromkeys(s.strip() for s in symbols if s.strip()))
+        logger.info(f"[KlineCache] 全量拉取 {tf} {len(symbols)} 只股票（去重后）")
+
+        # 2) 读已有 feather，算出缺失的 symbol
+        cached = self.get_cached_symbols(tf)
+        missing = [s for s in symbols if s not in cached]
+
+        if not missing:
+            logger.info(f"[KlineCache] {tf} 所有 {len(symbols)} 只已在缓存中，无需拉取")
+            return True
+
+        logger.info(f"[KlineCache] {tf} 缓存已有 {len(cached)} 只，需拉取 {len(missing)} 只")
 
         # 盘中：过滤当天未完成数据，只存历史已完成 K 线
         in_market = tf == "1D" and _is_market_hours()
         today_start = _ts_from_date(_today_str()) if in_market else 0
 
-        all_rows = []
-        ok = 0
-        for sym in symbols:
-            try:
-                bars = fetch_func(market, sym, tf, limit)
-                if bars:
-                    for bar in bars:
-                        # 盘中跳过当天未完成 bar
-                        if in_market and bar.get("time", 0) >= today_start:
-                            continue
-                        row = {k: bar.get(k, 0) for k in KLINE_COLUMNS}
-                        row["symbol"] = sym
-                        all_rows.append(row)
-                    ok += 1
-            except Exception as e:
-                logger.warning(f"[KlineCache] 拉取 {sym} {tf} 失败: {e}")
+        # 3) 分批串行拉取缺失的 symbol（每批最多 500 只）
+        fetched_rows: List[Dict[str, Any]] = []
+        fetched_symbols: List[str] = []
+        fail_count = 0
+        total_batches = (len(missing) + batch_size - 1) // batch_size
 
-        if not all_rows:
-            logger.warning(f"[KlineCache] 全量拉取 {tf} 无数据")
-            return False
+        for batch_idx in range(total_batches):
+            batch = missing[batch_idx * batch_size : (batch_idx + 1) * batch_size]
+            logger.info(f"[KlineCache] 第 {batch_idx + 1}/{total_batches} 批，{len(batch)} 只")
 
-        df = pd.DataFrame(all_rows)
+            for sym in batch:
+                try:
+                    bars = fetch_func(market, sym, tf, limit)
+                    if bars:
+                        for bar in bars:
+                            if in_market and bar.get("time", 0) >= today_start:
+                                continue
+                            row = {k: bar.get(k, 0) for k in KLINE_COLUMNS}
+                            row["symbol"] = sym
+                            fetched_rows.append(row)
+                        fetched_symbols.append(sym)
+                    else:
+                        logger.debug(f"[KlineCache] {sym} {tf} 返回空数据，跳过")
+                except Exception as e:
+                    fail_count += 1
+                    logger.warning(f"[KlineCache] 拉取 {sym} {tf} 失败: {e}")
+
+        if not fetched_rows:
+            logger.warning(f"[KlineCache] 全量拉取 {tf} 无新数据 (失败 {fail_count} 只)")
+            # 有旧缓存就继续用，没有就返回失败
+            return len(cached) > 0
+
+        new_df = pd.DataFrame(fetched_rows)
         for col in KLINE_COLUMNS:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-        df["symbol"] = df["symbol"].astype(str)
+            if col in new_df.columns:
+                new_df[col] = pd.to_numeric(new_df[col], errors="coerce")
+        new_df["symbol"] = new_df["symbol"].astype(str)
 
+        # 4) 合并：读已有 → 去掉本次已拉的 → 拼接新数据 → 写回
         with self._file_lock:
-            self._write_feather(tf, _today_str(), df)
-        logger.info(f"[KlineCache] 全量拉取 {tf} 完成: {ok}/{len(symbols)}, {len(df)} 行")
+            existing_df = self._read_latest(tf)
+            if not existing_df.empty and "symbol" in existing_df.columns:
+                if fetched_symbols:
+                    existing_df = existing_df[~existing_df["symbol"].isin(fetched_symbols)]
+                merged = pd.concat([existing_df, new_df], ignore_index=True)
+            else:
+                merged = new_df
+            merged = merged.drop_duplicates(subset=["time", "symbol"], keep="last")
+            merged = merged.sort_values(["symbol", "time"])
+            self._write_feather(tf, _today_str(), merged)
+
+        logger.info(
+            f"[KlineCache] 全量拉取 {tf} 完成: "
+            f"成功 {len(fetched_symbols)}/{len(missing)} 只, "
+            f"失败 {fail_count} 只, 缓存共 {len(merged)} 行"
+        )
         return True
 
     def _incremental_fetch(self, tf, symbols, fetch_func, market):
@@ -448,39 +488,42 @@ class KlineCacheManager:
             return True
 
         limit = {"1D": DAILY_LIMIT, "1W": WEEKLY_LIMIT, "1M": MONTHLY_LIMIT}.get(tf, DAILY_LIMIT)
+        batch_size = 500
         logger.info(f"[KlineCache] 增量拉取 {tf} {len(missing)} 只缺失股票")
 
         # 盘中：过滤当天未完成数据，与 _full_fetch 行为一致
         in_market = tf == "1D" and _is_market_hours()
         today_start = _ts_from_date(_today_str()) if in_market else 0
 
-        # 锁外拉取：逐只获取，按 symbol 分组收集成功行
-        fetched_rows: List[Dict[str, Any]] = []    # 所有成功拉到的原始行
-        fetched_symbols: List[str] = []             # 成功拉到数据的 symbol 列表
+        # 分批串行拉取缺失的 symbol（每批最多 500 只）
+        fetched_rows: List[Dict[str, Any]] = []
+        fetched_symbols: List[str] = []
         fail_count = 0
+        total_batches = (len(missing) + batch_size - 1) // batch_size
 
-        for sym in missing:
-            try:
-                bars = fetch_func(market, sym, tf, limit)
-                if bars:
-                    for bar in bars:
-                        # 盘中跳过当天未完成 bar
-                        if in_market and bar.get("time", 0) >= today_start:
-                            continue
-                        row = {k: bar.get(k, 0) for k in KLINE_COLUMNS}
-                        row["symbol"] = sym
-                        fetched_rows.append(row)
-                    fetched_symbols.append(sym)
-                else:
-                    # 空数据不算成功，下次预热仍会重试
-                    logger.debug(f"[KlineCache] {sym} {tf} 返回空数据，跳过")
-            except Exception as e:
-                fail_count += 1
-                logger.warning(f"[KlineCache] 拉取 {sym} {tf} 失败: {e}")
+        for batch_idx in range(total_batches):
+            batch = missing[batch_idx * batch_size : (batch_idx + 1) * batch_size]
+            logger.info(f"[KlineCache] 增量第 {batch_idx + 1}/{total_batches} 批，{len(batch)} 只")
+
+            for sym in batch:
+                try:
+                    bars = fetch_func(market, sym, tf, limit)
+                    if bars:
+                        for bar in bars:
+                            if in_market and bar.get("time", 0) >= today_start:
+                                continue
+                            row = {k: bar.get(k, 0) for k in KLINE_COLUMNS}
+                            row["symbol"] = sym
+                            fetched_rows.append(row)
+                        fetched_symbols.append(sym)
+                    else:
+                        logger.debug(f"[KlineCache] {sym} {tf} 返回空数据，跳过")
+                except Exception as e:
+                    fail_count += 1
+                    logger.warning(f"[KlineCache] 拉取 {sym} {tf} 失败: {e}")
 
         if not fetched_rows:
             logger.info(f"[KlineCache] 增量拉取 {tf} 无新数据 (失败 {fail_count} 只)")
-            # 全部失败 → 返回 False，让上层降级
             return fail_count < len(missing)
 
         new_df = pd.DataFrame(fetched_rows)
@@ -493,8 +536,6 @@ class KlineCacheManager:
         with self._file_lock:
             existing_df = self._read_latest(tf)
             if not existing_df.empty and "symbol" in existing_df.columns:
-                # 先去掉本次已成功拉取的 symbol 的旧数据，再合并
-                # 避免同一个 symbol 在新旧 DataFrame 中产生重复
                 if fetched_symbols:
                     existing_df = existing_df[~existing_df["symbol"].isin(fetched_symbols)]
                 merged = pd.concat([existing_df, new_df], ignore_index=True)

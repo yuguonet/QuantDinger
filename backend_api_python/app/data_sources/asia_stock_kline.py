@@ -151,7 +151,7 @@ _TD_INTERVAL_MAP = {
 def _td_symbol_and_exchange(tencent_code: str, is_hk: bool) -> tuple[str, str]:
     """Convert Tencent code to Twelve Data (symbol, exchange).
 
-    Twelve Data time_series requires exchange *name* (SSE / SZSE / HKEX),
+    Twelve Data time_series requires exchange *name* (SSE / SZSE / HKEX / BSE),
     not the MIC code (XSHG / XSHE / XHKG).
     """
     c = (tencent_code or "").strip().upper()
@@ -160,9 +160,11 @@ def _td_symbol_and_exchange(tencent_code: str, is_hk: bool) -> tuple[str, str]:
         if num.isdigit():
             num = str(int(num)).zfill(4)
         return num, "HKEX"
-    digits = c.lstrip("SHSZ")
-    if c.startswith("SH") or digits.startswith("6"):
+    digits = c.lstrip("SHSZBJ")
+    if c.startswith("SH") or digits.startswith(("6", "9")):
         return digits, "SSE"
+    if c.startswith("BJ") or digits.startswith(("43", "82", "83", "87", "88")):
+        return digits, "BSE"
     return digits, "SZSE"
 
 
@@ -269,7 +271,7 @@ def fetch_twelvedata_klines(
 # ---------------------------------------------------------------------------
 
 def yf_symbol_from_tencent(tencent_code: str, is_hk: bool) -> str:
-    """Convert Tencent-style code (SH600519 / SZ000001 / HK00700) to yfinance ticker."""
+    """Convert Tencent-style code (SH600519 / SZ000001 / BJ830799 / HK00700) to yfinance ticker."""
     c = (tencent_code or "").strip().upper()
     if is_hk:
         num = c.replace("HK", "")
@@ -280,9 +282,13 @@ def yf_symbol_from_tencent(tencent_code: str, is_hk: bool) -> str:
         return c[2:] + ".SS"
     if c.startswith("SZ"):
         return c[2:] + ".SZ"
-    digits = c.lstrip("SHSZ")
-    if digits.startswith("6"):
+    if c.startswith("BJ"):
+        return c[2:] + ".BSE"
+    digits = c.lstrip("SHSZBJ")
+    if digits.startswith(("6", "9")):
         return digits + ".SS"
+    if digits.startswith(("43", "82", "83", "87", "88")):
+        return digits + ".BSE"
     return digits + ".SZ"
 
 

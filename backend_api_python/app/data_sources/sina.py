@@ -50,20 +50,30 @@ _sina_quote_limiter = RateLimiter(
 
 def _sina_code_from_cn(symbol: str) -> str:
     """
-    Convert A-share symbol to Sina format: sh600519 / sz000001.
-    Accepts: 600519, 600519.SH, sh600519, SZ000001, etc.
+    Convert A-share symbol to Sina format: sh600519 / sz000001 / bj830799.
+    Accepts: 600519, 600519.SH, sh600519, SZ000001, 830799.BJ, etc.
     """
     s = (symbol or "").strip().upper()
-    if s.startswith(("SH", "SZ")) and not s.startswith(("SH.", "SZ.")):
+    if s.startswith(("SH", "SZ", "BJ")) and not s.startswith(("SH.", "SZ.", "BJ.")):
         return s.lower()
     if s.endswith((".SH", ".SS")):
         return "sh" + s[:s.rfind(".")]
     if s.endswith(".SZ"):
         return "sz" + s[:s.rfind(".")]
+    if s.endswith(".BJ"):
+        return "bj" + s[:s.rfind(".")]
     if s.isdigit() and len(s) == 6:
-        return ("sh" + s) if s.startswith("6") else ("sz" + s)
+        # 沪市：60x / 688 / 900
+        if s.startswith(("600", "601", "603", "605", "688", "900")):
+            return "sh" + s
+        # 深市：00x / 300 / 200
+        if s.startswith(("000", "001", "002", "003", "300", "200")):
+            return "sz" + s
+        # 北证：43 / 82 / 83 / 87 / 88
+        if s.startswith(("43", "82", "83", "87", "88")):
+            return "bj" + s
     # 已经是 sh600519 格式
-    if len(s) >= 3 and s[:2].lower() in ("sh", "sz") and s[2:].isdigit():
+    if len(s) >= 3 and s[:2].lower() in ("sh", "sz", "bj") and s[2:].isdigit():
         return s.lower()
     return s.lower()
 

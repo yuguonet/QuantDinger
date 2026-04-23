@@ -127,54 +127,47 @@ class KlineService:
 
     def _try_prewarm(self, market: str, symbol: str, tf: str, fetch) -> bool:
         """
-        触发预热：获取当前市场的所有自选股 + 确保当前股票在内 → 批量拉取。
+        触发全市场预热：遍历所有自选股市场，逐市场批量拉取。
 
         日线：1天1次全量 / 增量缺失
         周线：1周1次全量 / 增量缺失
         月线：1月1次全量 / 增量缺失
 
-        关键：只预热当前请求的市场，不跨市场预热。
-        避免 A 股请求触发 Crypto 拉取（或反之）。
+        批量拉取优先级高于单只拉取：一次遍历所有市场，全部预热。
+        返回当前请求的 market 是否预热成功。
         """
         if not market:
             return False
 
-        # 只获取当前市场的自选股
-        symbols = self._get_watchlist_symbols_for_market(market)
+        # 一次查出所有市场的自选股
+        all_by_market = self._get_all_watchlist_symbols_by_market()
 
-        # 确保当前请求的 symbol 在预热列表中
-        if symbol and symbol not in symbols:
-            symbols.append(symbol)
-        symbols = list(dict.fromkeys(s.strip() for s in symbols if s.strip()))
+        # 确保当前 symbol 在对应市场中
+        if symbol:
+            syms = all_by_market.setdefault(market, [])
+            if symbol not in syms:
+                syms.append(symbol)
 
-        if not symbols:
+        # 去重每个市场
+        for mkt in list(all_by_market.keys()):
+            all_by_market[mkt] = list(dict.fromkeys(
+                s.strip() for s in all_by_market[mkt] if s.strip()
+            ))
+            if not all_by_market[mkt]:
+                del all_by_market[mkt]
+
+        if not all_by_market:
             return False
 
-        # 如果自选股列表获取失败（只有当前股票），不要以"预热"名义写入不完整缓存
-        # 直接返回 False，让上层走降级单只拉取，不污染缓存
-        if len(symbols) <= 1 and symbol in symbols:
-            logger.warning(f"[KlineCache] {market} 自选股列表为空，跳过预热，避免写入不完整缓存")
-            return False
+        # 逐市场预热，记录当前 market 的结果
+        current_ok = False
+        for mkt, syms in all_by_market.items():
+            logger.info(f"[KlineCache] 预热 {mkt} {len(syms)} 只: {syms[:5]}{'...' if len(syms) > 5 else ''}")
+            ok = self._kc.prewarm(tf, syms, fetch, mkt)
+            if mkt == market:
+                current_ok = ok
 
-        logger.info(f"[KlineCache] 预热 {market} {len(symbols)} 只: {symbols[:5]}{'...' if len(symbols) > 5 else ''}")
-        return self._kc.prewarm(tf, symbols, fetch, market)
-
-    def _get_watchlist_symbols_for_market(self, market: str) -> List[str]:
-        """获取指定市场的自选股 symbol 列表"""
-        try:
-            from app.utils.db import get_db_connection
-            with get_db_connection() as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    "SELECT symbol FROM qd_watchlist WHERE market = ? AND symbol IS NOT NULL",
-                    (market,)
-                )
-                rows = cur.fetchall() or []
-                cur.close()
-            return [r['symbol'] for r in rows if r.get('symbol')]
-        except Exception as e:
-            logger.debug(f"[KlineCache] 获取 {market} 自选股失败: {e}")
-            return []
+        return current_ok
 
     def _get_all_watchlist_symbols_by_market(self) -> Dict[str, List[str]]:
         """

@@ -23,26 +23,36 @@ logger = get_logger(__name__)
 
 def normalize_cn_code(symbol: str) -> str:
     """
-    Normalize A-share symbol to Tencent code: sh600519 / sz000001.
-    Accepts:
-    - 600519 / 600519.SH / 600519.SS
-    - 000001 / 000001.SZ
+    Normalize A-share symbol to Tencent code: sh600519 / sz000001 / bj830799.
+
+    前缀规则：
+      沪市 (sh): 600/601/603/605/688/900
+      深市 (sz): 000/001/002/003/300/200
+      北证 (bj): 43/82/83/87/88
+
+    Accepts: 600519 / 600519.SH / 600519.SS / 000001.SZ / 830799.BJ
     """
     s = (symbol or "").strip().upper()
     if not s:
         return s
-    if s.endswith(".SH"):
-        s = s[:-3]
-        return f"SH{s}"
-    if s.endswith(".SS"):
-        s = s[:-3]
-        return f"SH{s}"
+    # 已带后缀 → 剥离并直接加前缀
+    if s.endswith(".SH") or s.endswith(".SS"):
+        return "SH" + s[:-3]
     if s.endswith(".SZ"):
-        s = s[:-3]
-        return f"SZ{s}"
+        return "SZ" + s[:-3]
+    if s.endswith(".BJ"):
+        return "BJ" + s[:-3]
 
     if s.isdigit() and len(s) == 6:
-        return ("SH" + s) if s.startswith("6") else ("SZ" + s)
+        # 沪市：60x / 688 / 900
+        if s.startswith(("600", "601", "603", "605", "688", "900")):
+            return "SH" + s
+        # 深市：00x / 300 / 200
+        if s.startswith(("000", "001", "002", "003", "300", "200")):
+            return "SZ" + s
+        # 北证：43 / 82 / 83 / 87 / 88
+        if s.startswith(("43", "82", "83", "87", "88")):
+            return "BJ" + s
 
     return s
 

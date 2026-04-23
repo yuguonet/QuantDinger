@@ -7,7 +7,7 @@
     "description_en": "Classic dual moving average crossover. Buy when fast MA crosses above slow MA, sell when it crosses below.",
     "category": "trend",
     "difficulty": "beginner",
-    "markets": ["Crypto", "USStock", "Forex"],
+    "markets": ["CNStock", "USStock", "Forex"],
     "default_params": {
       "fast_period": 10,
       "slow_period": 30,
@@ -23,12 +23,12 @@
     "description_en": "Enter long when RSI bounces from oversold territory. Exit when RSI reaches overbought.",
     "category": "mean_reversion",
     "difficulty": "beginner",
-    "markets": ["Crypto", "USStock"],
+    "markets": ["CNStock", "USStock"],
     "default_params": {
       "rsi_period": 14,
       "oversold": 30,
       "overbought": 70,
-      "timeframe": "4H"
+      "timeframe": "1D"
     },
     "tags": ["mean-reversion", "RSI", "beginner"]
   },
@@ -40,7 +40,7 @@
     "description_en": "Trade breakouts after Bollinger Band squeezes. Long on upper band breakout, short on lower.",
     "category": "volatility",
     "difficulty": "intermediate",
-    "markets": ["Crypto", "USStock", "Forex"],
+    "markets": ["CNStock", "USStock", "Forex"],
     "default_params": {
       "bb_period": 20,
       "bb_std": 2.0,
@@ -57,7 +57,7 @@
     "description_en": "Enter long on bullish MACD divergence (price makes lower low but MACD doesn't). Short on bearish divergence.",
     "category": "trend",
     "difficulty": "intermediate",
-    "markets": ["Crypto", "USStock"],
+    "markets": ["CNStock", "USStock"],
     "default_params": {
       "fast_period": 12,
       "slow_period": 26,
@@ -74,7 +74,7 @@
     "description_en": "Place buy/sell orders at regular intervals within a price range. Profits from range-bound markets.",
     "category": "market_making",
     "difficulty": "intermediate",
-    "markets": ["Crypto"],
+    "markets": ["CNStock"],
     "default_params": {
       "grid_count": 10,
       "upper_price": 0,
@@ -91,7 +91,7 @@
     "description_en": "Buy a fixed amount at regular intervals to average out the cost basis over time.",
     "category": "passive",
     "difficulty": "beginner",
-    "markets": ["Crypto", "USStock"],
+    "markets": ["CNStock", "USStock"],
     "default_params": {
       "buy_amount": 100,
       "interval_hours": 168,
@@ -107,7 +107,7 @@
     "description_en": "Enter when price breaks above recent high with above-average volume. ATR-based stop loss.",
     "category": "trend",
     "difficulty": "intermediate",
-    "markets": ["Crypto", "USStock", "CNStock"],
+    "markets": ["CNStock", "USStock", "CNStock"],
     "default_params": {
       "lookback": 20,
       "volume_multiplier": 1.5,
@@ -124,7 +124,7 @@
     "description_en": "Buy when price touches lower Bollinger Band, sell at upper band. Best for ranging markets.",
     "category": "mean_reversion",
     "difficulty": "beginner",
-    "markets": ["Crypto", "Forex"],
+    "markets": ["CNStock", "Forex"],
     "default_params": {
       "bb_period": 20,
       "bb_std": 2.0,
@@ -140,7 +140,7 @@
     "description_en": "Classic trend following. Enter on 20-day high breakout, exit on 10-day low. ATR-based position sizing.",
     "category": "trend",
     "difficulty": "advanced",
-    "markets": ["Crypto", "USStock", "Forex"],
+    "markets": ["CNStock", "USStock", "Forex"],
     "default_params": {
       "entry_period": 20,
       "exit_period": 10,
@@ -158,7 +158,7 @@
     "description_en": "Trade the spread between two correlated assets. Short the outperformer, long the underperformer when spread diverges.",
     "category": "statistical_arbitrage",
     "difficulty": "advanced",
-    "markets": ["Crypto", "USStock"],
+    "markets": ["CNStock", "USStock"],
     "default_params": {
       "symbol_a": "BTC/USDT",
       "symbol_b": "ETH/USDT",
@@ -177,7 +177,7 @@
     "description_en": "Rank a universe of assets by momentum score weekly. Hold the top N performers and rebalance.",
     "category": "portfolio",
     "difficulty": "advanced",
-    "markets": ["Crypto", "USStock"],
+    "markets": ["CNStock", "USStock"],
     "default_params": {
       "universe_size": 20,
       "hold_count": 5,
