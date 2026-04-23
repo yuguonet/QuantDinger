@@ -192,7 +192,7 @@ export default {
       aiResult: '',
       filterSymbol: '',
       filterTimeframe: undefined,
-      timeframes: ['1m', '5m', '15m', '30m', '1H', '2H', '4H', '1D', '1W'],
+      timeframes: ['1m', '5m', '15m', '30m', '1H', '1D', '1W'], // [MODIFIED] 2H/4H K线已移除
       runs: [],
       columns: [],
       selectedRowKeys: [],

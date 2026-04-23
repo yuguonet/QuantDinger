@@ -2150,16 +2150,7 @@ registerOverlay({
                  date1.getMonth() === date2.getMonth() &&
                  date1.getDate() === date2.getDate() &&
                  date1.getHours() === date2.getHours()
-        case '2H':
-          return date1.getFullYear() === date2.getFullYear() &&
-                 date1.getMonth() === date2.getMonth() &&
-                 date1.getDate() === date2.getDate() &&
-                 Math.floor(date1.getHours() / 2) === Math.floor(date2.getHours() / 2)
-        case '4H':
-          return date1.getFullYear() === date2.getFullYear() &&
-                 date1.getMonth() === date2.getMonth() &&
-                 date1.getDate() === date2.getDate() &&
-                 Math.floor(date1.getHours() / 4) === Math.floor(date2.getHours() / 4)
+        // [MODIFIED] 2H/4H K线已移除
         case '1D':
           return date1.getFullYear() === date2.getFullYear() &&
                  date1.getMonth() === date2.getMonth() &&
@@ -2644,8 +2635,7 @@ registerOverlay({
         '15m': 15000,
         '30m': 30000,
         '1H': 60000,
-        '2H': 180000,
-        '4H': 300000,
+        // [MODIFIED] 2H/4H K线已移除
         '1D': 600000,
         '1W': 1800000
       }

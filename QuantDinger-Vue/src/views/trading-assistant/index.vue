@@ -841,7 +841,7 @@
                               <a-select-option value="15m">{{ $t('trading-assistant.form.timeframe15m') }}</a-select-option>
                               <a-select-option value="30m">{{ $t('trading-assistant.form.timeframe30m') }}</a-select-option>
                               <a-select-option value="1H">{{ $t('trading-assistant.form.timeframe1H') }}</a-select-option>
-                              <a-select-option value="4H">{{ $t('trading-assistant.form.timeframe4H') }}</a-select-option>
+                              <!-- [MODIFIED] 4H K线已移除 -->
                               <a-select-option value="1D">{{ $t('trading-assistant.form.timeframe1D') }}</a-select-option>
                             </a-select>
                           </a-form-item>
@@ -930,7 +930,7 @@
                             <a-select-option value="15m">{{ $t('trading-assistant.form.timeframe15m') }}</a-select-option>
                             <a-select-option value="30m">{{ $t('trading-assistant.form.timeframe30m') }}</a-select-option>
                             <a-select-option value="1H">{{ $t('trading-assistant.form.timeframe1H') }}</a-select-option>
-                            <a-select-option value="4H">{{ $t('trading-assistant.form.timeframe4H') }}</a-select-option>
+                            <!-- [MODIFIED] 4H K线已移除 -->
                             <a-select-option value="1D">{{ $t('trading-assistant.form.timeframe1D') }}</a-select-option>
                           </a-select>
                         </a-form-item>

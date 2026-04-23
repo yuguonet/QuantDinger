@@ -161,11 +161,11 @@ const EXCHANGE_WS = {
 
 // ── Timeframe mapping per exchange ──────────────────────────
 
-const BINANCE_TF = { '1m': '1m', '5m': '5m', '15m': '15m', '30m': '30m', '1H': '1h', '4H': '4h', '1D': '1d', '1W': '1w', '1M': '1M' }
-const OKX_TF = { '1m': '1m', '5m': '5m', '15m': '15m', '30m': '30m', '1H': '1H', '4H': '4H', '1D': '1D', '1W': '1W', '1M': '1M' }
-const BITGET_TF = { '1m': '1m', '5m': '5m', '15m': '15m', '30m': '30m', '1H': '1h', '4H': '4h', '1D': '1d', '1W': '1w', '1M': '1M' }
-const BYBIT_TF = { '1m': '1', '5m': '5', '15m': '15', '30m': '30', '1H': '60', '4H': '240', '1D': 'D', '1W': 'W', '1M': 'M' }
-const GATE_TF = { '1m': '1m', '5m': '5m', '15m': '15m', '30m': '30m', '1H': '1h', '4H': '4h', '1D': '1d', '1W': '7d', '1M': '30d' }
+const BINANCE_TF = { '1m': '1m', '5m': '5m', '15m': '15m', '30m': '30m', '1H': '1h', '1D': '1d', '1W': '1w', '1M': '1M' } // [MODIFIED] 4H K线已移除
+const OKX_TF = { '1m': '1m', '5m': '5m', '15m': '15m', '30m': '30m', '1H': '1H', '1D': '1D', '1W': '1W', '1M': '1M' } // [MODIFIED] 4H K线已移除
+const BITGET_TF = { '1m': '1m', '5m': '5m', '15m': '15m', '30m': '30m', '1H': '1h', '1D': '1d', '1W': '1w', '1M': '1M' } // [MODIFIED] 4H K线已移除
+const BYBIT_TF = { '1m': '1', '5m': '5', '15m': '15', '30m': '30', '1H': '60', '1D': 'D', '1W': 'W', '1M': 'M' } // [MODIFIED] 4H K线已移除
+const GATE_TF = { '1m': '1m', '5m': '5m', '15m': '15m', '30m': '30m', '1H': '1h', '1D': '1d', '1W': '7d', '1M': '30d' } // [MODIFIED] 4H K线已移除
 
 function getInterval (exchange, timeframe) {
   const map = { binance: BINANCE_TF, okx: OKX_TF, bitget: BITGET_TF, bybit: BYBIT_TF, gate: GATE_TF }

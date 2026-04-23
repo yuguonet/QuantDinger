@@ -715,9 +715,9 @@ export default {
     backtestTimeframeOptions () {
       const m = (this.market || '').toLowerCase()
       if (m === 'cnstock' || m === 'hkstock') {
-        return ['1m', '5m', '15m', '30m', '1H', '2H', '1D', '1W']
+        return ['1m', '5m', '15m', '30m', '1H', '1D', '1W'] // [MODIFIED] 2H/4H K线已移除
       }
-      return ['1m', '5m', '15m', '30m', '1H', '4H', '1D', '1W']
+      return ['1m', '5m', '15m', '30m', '1H', '1D', '1W'] // [MODIFIED] 2H/4H K线已移除
     },
     backtestModalWrapClass () {
       return this.isDarkTheme ? 'backtest-modal-wrap backtest-modal-wrap--dark' : 'backtest-modal-wrap'

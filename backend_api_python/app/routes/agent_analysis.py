@@ -53,7 +53,7 @@ def _detect_market(stock_code: str) -> str:
         return "CNStock"
     if len(code) == 6 and code.isalpha():
         return "Forex"
-    return "Crypto"
+    return "CNStock"
 
 
 # ── 重复任务异常 ──────────────────────────────────────────

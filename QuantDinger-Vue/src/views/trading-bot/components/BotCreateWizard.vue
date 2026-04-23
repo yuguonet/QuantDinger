@@ -80,7 +80,7 @@
               <a-select-option value="5m">5 {{ $t('trading-bot.timeframe.min') }}</a-select-option>
               <a-select-option value="15m">15 {{ $t('trading-bot.timeframe.min') }}</a-select-option>
               <a-select-option value="1h">1 {{ $t('trading-bot.timeframe.hour') }}</a-select-option>
-              <a-select-option value="4h">4 {{ $t('trading-bot.timeframe.hour') }}</a-select-option>
+              <!-- [MODIFIED] 4H K线已移除 -->
               <a-select-option value="1d">1 {{ $t('trading-bot.timeframe.day') }}</a-select-option>
             </a-select>
           </a-form-model-item>

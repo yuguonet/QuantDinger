@@ -1114,11 +1114,11 @@ export default {
       resizeDragStartY: 0,
       resizeDragStartH: 0,
 
-      market: 'Crypto',
-      symbol: 'BTC/USDT',
+      market: '',
+      symbol: '',
       timeframe: '1D',
       watchlist: [],
-      selectedWatchlistKey: 'Crypto:BTC/USDT',
+      selectedWatchlistKey: undefined,
 
       initialCapital: 10000,
       leverage: 1,
@@ -1179,7 +1179,7 @@ export default {
       lastAppliedExperimentChanges: [],
 
       // Quick Trade drawer reuse
-      qtSymbol: 'BTC/USDT',
+      qtSymbol: '',
       qtSide: '',
       qtPrice: 0,
 

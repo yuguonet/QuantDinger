@@ -16,7 +16,7 @@
  */
 
 const TIMEFRAME_MINUTES = {
-  '1m': 1, '5m': 5, '15m': 15, '1h': 60, '4h': 240, '1d': 1440
+  '1m': 1, '5m': 5, '15m': 15, '1h': 60, '1d': 1440  // [MODIFIED] 4H K线已移除
 }
 
 const FREQUENCY_MINUTES = {
