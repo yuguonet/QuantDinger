@@ -2,12 +2,12 @@
 东方财富直接数据源 — A股多周期K线 + 实时行情（免费、无需API Key）
 
 数据接口:
-- K线: push2his.eastmoney.com/api/qt/stock/kline/get
+- K线: 49.push2his.eastmoney.com/api/qt/stock/kline/get
 - 实时行情: push2.eastmoney.com/api/qt/stock/get
 
 特点:
 - 国内最稳定的免费数据源之一
-- 支持多周期: 1m/5m/15m/30m/1H/4H/1D/1W
+- 支持多周期: 1m/5m/15m/30m/1H/1D/1W（注意: 49.push2his 节点不稳定，需重试）
 - 支持前复权/后复权
 - 有频率限制，需要限流 + 随机 UA
 """
@@ -40,7 +40,6 @@ _EASTMONEY_KLT = {
     "15m": 15,
     "30m": 30,
     "1H": 60,
-    "4H": 240,
     "1D": 101,
     "1W": 102,
 }
@@ -114,11 +113,11 @@ def fetch_eastmoney_kline(
     limiter = get_eastmoney_limiter()
     limiter.wait()
 
-    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    url = "https://49.push2his.eastmoney.com/api/qt/stock/kline/get"
     params = {
         "secid": secid,
-        "ut": "fa5fd1943c7b386f172d6893dbfba10b",
-        "fields1": "f1,f2,f3,f4,f5,f6",
+        "ut": "fa5fd1943c7b386f172d6893dbbd1835",
+        "fields1": "f1,f2,f3",
         "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
         "klt": klt,
         "fqt": fqt,
@@ -139,8 +138,13 @@ def fetch_eastmoney_kline(
         logger.warning("EastMoney kline: invalid JSON for %s", code)
         return []
 
-    if not isinstance(data, dict) or int(data.get("code", -1)) != 0:
-        logger.warning("EastMoney kline: API error for %s: %s", code, data.get("msg", ""))
+    if not isinstance(data, dict):
+        return []
+    try:
+        if int(data.get("code", -1)) != 0:
+            logger.warning("EastMoney kline: API error for %s: %s", code, data.get("msg", ""))
+            return []
+    except (ValueError, TypeError):
         return []
 
     klines_data = (data.get("data") or {}).get("klines")
@@ -155,7 +159,16 @@ def fetch_eastmoney_kline(
         try:
             # f51=日期, f52=开盘, f53=收盘, f54=最高, f55=最低, f56=成交量
             dt_str = parts[0].strip()
-            ts = int(datetime.strptime(dt_str, "%Y-%m-%d").timestamp())
+            ts = None
+            for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+                try:
+                    ts = int(datetime.strptime(dt_str, fmt).timestamp())
+                    break
+                except ValueError:
+                    continue
+            if ts is None:
+                continue
+
             o = float(parts[1])
             c = float(parts[2])
             h = float(parts[3])

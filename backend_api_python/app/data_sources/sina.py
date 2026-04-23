@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from datetime import datetime
@@ -197,14 +198,25 @@ def fetch_sina_kline(
 
 
 def _parse_sina_json_kline(data: list, count: int) -> List[Dict[str, Any]]:
-    """Parse Sina JSON API kline response."""
+    """Parse Sina JSON API kline response. Supports both daily and minute bars."""
     out: List[Dict[str, Any]] = []
     for item in data:
         try:
-            dt_str = item.get("day", "")
+            dt_str = str(item.get("day", "")).strip()
             if not dt_str:
                 continue
-            ts = int(datetime.strptime(dt_str, "%Y-%m-%d").timestamp())
+
+            # 支持两种格式: "2026-04-22" (日K) 和 "2026-04-22 15:00:00" (分钟K)
+            ts = None
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+                try:
+                    ts = int(datetime.strptime(dt_str, fmt).timestamp())
+                    break
+                except ValueError:
+                    continue
+            if ts is None:
+                continue
+
             o = float(item.get("open", 0))
             h = float(item.get("high", 0))
             low = float(item.get("low", 0))
@@ -300,3 +312,81 @@ def sina_kline_to_ticker(code: str) -> Optional[Dict[str, Any]]:
         "name": q.get("name", ""),
         "symbol": q.get("symbol", code),
     }
+
+
+# ---------- 分钟K线 (quotes.sina.cn) ----------
+
+# 内部周期 → 新浪 scale 参数
+_SINA_TF_TO_SCALE = {
+    "1m": 1,
+    "5m": 5,
+    "15m": 15,
+    "30m": 30,
+    "1H": 60,
+    "1D": 240,
+}
+
+
+@retry_with_backoff(max_attempts=3, base_delay=1.5, max_delay=10.0, exceptions=(
+    requests.exceptions.RequestException,
+    ConnectionError,
+    TimeoutError,
+))
+def fetch_sina_minute_kline(
+    code: str,
+    timeframe: str,
+    count: int = 300,
+    timeout: int = 10,
+) -> List[Dict[str, Any]]:
+    """
+    新浪分钟K线 — quotes.sina.cn JSONP 接口。
+
+    支持周期: 1m / 5m / 15m / 30m / 1H / 1D(日K)
+    数据格式: JSONP 回调包裹的 JSON 数组，每条含 day/open/high/low/close/volume/amount
+
+    Args:
+        code: 代码，如 sh600519 / sz000001
+        timeframe: 内部周期
+        count: 请求条数
+    """
+    sc = _sina_code_from_cn(code)
+    if not sc:
+        return []
+
+    scale = _SINA_TF_TO_SCALE.get(timeframe)
+    if scale is None:
+        logger.warning(f"[新浪分钟K线] 不支持的周期: {timeframe}")
+        return []
+
+    _sina_limiter.wait()
+
+    url = "https://quotes.sina.cn/cn/api/jsonp_v2.php/var/CN_MarketDataService.getKLineData"
+    params = {
+        "symbol": sc,
+        "scale": scale,
+        "ma": "no",
+        "datalen": min(int(count), 2000),
+    }
+
+    resp = requests.get(
+        url,
+        headers=get_request_headers(referer="https://finance.sina.com.cn/"),
+        params=params,
+        timeout=timeout,
+    )
+
+    # 解析 JSONP: var([{...}]); → [{...}]
+    text = (resp.text or "").strip()
+    m = re.search(r'\[.*\]', text, re.DOTALL)
+    if not m:
+        return []
+
+    try:
+        data = json.loads(m.group())
+    except Exception:
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+    return _parse_sina_json_kline(data, count)

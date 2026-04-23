@@ -198,7 +198,7 @@ def fetch_kline(code: str, period: str, count: int = 300, adj: str = "qfq", time
     period examples:
     - day, week, month (supported by Tencent fqkline)
 
-    Note: Minute periods (m1/m5/…) return **bad params** on this endpoint; use AkShare in ``asia_stock_kline``.
+    Note: Minute periods (m1/m5/…) return **bad params** on this endpoint; use fetch_minute_kline instead.
     """
     c = _lower_code(code)
     if not c:
@@ -211,7 +211,12 @@ def fetch_kline(code: str, period: str, count: int = 300, adj: str = "qfq", time
     params = {"param": f"{c},{period},,,{int(count)},{adj}"}
     resp = requests.get(url, headers=get_request_headers(referer="https://gu.qq.com/"), params=params, timeout=timeout)
     data = resp.json() if resp.text else {}
-    if not isinstance(data, dict) or int(data.get("code", 0)) != 0:
+    if not isinstance(data, dict):
+        return []
+    try:
+        if int(data.get("code", 0)) != 0:
+            return []
+    except (ValueError, TypeError):
         return []
     root = (data.get("data") or {}).get(c)
     if not isinstance(root, dict):
@@ -235,4 +240,113 @@ def fetch_kline(code: str, period: str, count: int = 300, adj: str = "qfq", time
         if isinstance(v, list) and v and str(k).lower().endswith(str(period).lower()):
             return v
     return []
+
+
+# ================================================================
+# 腾讯分钟K线 (mkline 接口)
+# ================================================================
+
+# 内部周期 → 腾讯 mkline 参数
+_TF_TO_MKLINE = {
+    "1m": "m1",
+    "5m": "m5",
+    "15m": "m15",
+    "30m": "m30",
+    "1H": "m60",
+}
+
+
+@retry_with_backoff(max_attempts=3, base_delay=1.2, max_delay=8.0, exceptions=(Exception,))
+def fetch_minute_kline(
+    code: str,
+    timeframe: str,
+    count: int = 300,
+    timeout: int = 10,
+) -> List[List[Any]]:
+    """
+    腾讯分钟K线 — proxy.finance.qq.com mkline 接口。
+
+    支持周期: m1 / m5 / m15 / m30 / m60
+    数据格式: [时间字符串, 开盘, 收盘, 最高, 最低, 成交量, {}, 振幅]
+
+    Args:
+        code: 腾讯格式代码，如 sh600519 / sz000001
+        timeframe: 内部周期 1m/5m/15m/30m/1H
+        count: 请求条数
+    """
+    c = _lower_code(code)
+    if not c:
+        return []
+
+    mk_period = _TF_TO_MKLINE.get(timeframe)
+    if not mk_period:
+        logger.warning(f"[腾讯分钟K线] 不支持的周期: {timeframe}")
+        return []
+
+    limiter = get_tencent_limiter()
+    limiter.wait()
+
+    url = "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/kline/mkline"
+    params = {"param": f"{c},{mk_period},{int(count)}"}
+    resp = requests.get(
+        url,
+        headers=get_request_headers(referer="https://gu.qq.com/"),
+        params=params,
+        timeout=timeout,
+    )
+
+    try:
+        data = resp.json()
+    except Exception:
+        return []
+
+    if not isinstance(data, dict):
+        return []
+    try:
+        if int(data.get("code", 0)) != 0:
+            return []
+    except (ValueError, TypeError):
+        return []
+
+    root = (data.get("data") or {}).get(c)
+    if not isinstance(root, dict):
+        return []
+
+    rows = root.get(mk_period)
+    if not isinstance(rows, list):
+        return []
+
+    return rows
+
+
+def tencent_minute_kline_to_dicts(rows: List[List[Any]]) -> List[Dict[str, Any]]:
+    """
+    腾讯分钟K线原始行 → 标准 dict 列表。
+
+    原始格式: [时间字符串, 开盘, 收盘, 最高, 最低, 成交量, {}, 振幅]
+    """
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        if not isinstance(r, (list, tuple)) or len(r) < 6:
+            continue
+        ts = parse_tencent_kline_time(r[0])
+        if ts is None:
+            continue
+        try:
+            o = float(r[1])
+            c = float(r[2])
+            h = float(r[3])
+            low = float(r[4])
+            vol = float(r[5])
+        except (TypeError, ValueError):
+            continue
+        out.append({
+            "time": ts,
+            "open": round(o, 4),
+            "high": round(h, 4),
+            "low": round(low, 4),
+            "close": round(c, 4),
+            "volume": round(vol, 2),
+        })
+    return out
 
