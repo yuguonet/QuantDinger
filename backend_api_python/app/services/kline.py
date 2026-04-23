@@ -133,28 +133,29 @@ class KlineService:
         周线：1周1次全量 / 增量缺失
         月线：1月1次全量 / 增量缺失
         """
-        try:
-            symbols = self._get_all_watchlist_symbols()
-            if symbol and symbol not in symbols:
-                symbols.append(symbol)
-            symbols = list(dict.fromkeys(s.strip() for s in symbols if s.strip()))
-            if not symbols:
-                return False
-
-            return self._kc.prewarm(tf, symbols, fetch, market)
-        except Exception as e:
-            logger.warning(f"[KlineCache] 预热失败: {e}")
+        symbols = self._get_all_watchlist_symbols()
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+        symbols = list(dict.fromkeys(s.strip() for s in symbols if s.strip()))
+        if not symbols:
             return False
+        # 如果自选股列表获取失败（只有当前股票），不要以"预热"名义写入不完整缓存
+        # 直接返回 False，让上层走降级单只拉取，不污染缓存
+        if len(symbols) <= 1 and symbol in symbols:
+            logger.warning(f"[KlineCache] 自选股列表为空，跳过预热，避免写入不完整缓存")
+            return False
+
+        return self._kc.prewarm(tf, symbols, fetch, market)
 
     def _get_all_watchlist_symbols(self) -> List[str]:
         try:
             from app.utils.db import get_db_connection
             with get_db_connection() as conn:
                 cur = conn.cursor()
-                cur.execute("SELECT DISTINCT code FROM qd_watchlist")
+                cur.execute("SELECT DISTINCT symbol FROM qd_watchlist WHERE market='CNStock'")
                 rows = cur.fetchall() or []
                 cur.close()
-            return [r['code'] for r in rows if r.get('code')]
+            return [r['symbol'] for r in rows if r.get('symbol')]
         except Exception as e:
             logger.debug(f"[KlineCache] 获取自选股失败: {e}")
             return []
