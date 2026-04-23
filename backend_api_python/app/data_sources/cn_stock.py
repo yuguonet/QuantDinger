@@ -155,6 +155,100 @@ def _strip_cn_prefix(code: str) -> str:
 
 
 # ================================================================
+# 东财批量行情（clist 全市场接口）
+# ================================================================
+
+def _fetch_eastmoney_batch_quotes(
+    symbols: List[str],
+    timeout: int = 15,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    通过东方财富 clist 接口批量获取当日行情。
+
+    一次请求拉全市场（约 5000 只），从中筛选目标股票。
+    字段: f2=最新价, f5=成交量, f6=成交额, f7=振幅,
+          f12=代码, f15=最高, f16=最低, f17=开盘, f18=昨收
+
+    Returns:
+        {symbol: {"time", "open", "high", "low", "close", "volume"}}
+    """
+    if not symbols:
+        return {}
+
+    # 建立纯数字代码 → symbol 映射
+    code_set: Dict[str, str] = {}
+    for sym in symbols:
+        raw = sym.strip()
+        for prefix in ("SH", "SZ", "BJ", "sh", "sz", "bj"):
+            if raw.startswith(prefix):
+                raw = raw[2:]
+                break
+        if raw.isdigit() and len(raw) == 6:
+            code_set[raw] = sym
+
+    if not code_set:
+        return {}
+
+    try:
+        from app.data_sources.rate_limiter import get_request_headers, get_eastmoney_limiter
+        import requests as _req
+
+        limiter = get_eastmoney_limiter()
+        limiter.wait()
+
+        # 沪深A股: m:0+t:6(深主板) m:0+t:80(深创业板) m:1+t:2(沪主板) m:1+t:23(科创板)
+        url = "https://push2.eastmoney.com/api/qt/clist/get"
+        params = {
+            "pn": 1, "pz": 6000, "po": 1, "np": 1,
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "fltt": 2, "invt": 2,
+            "fid": "f3",
+            "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+            "fields": "f2,f5,f6,f12,f15,f16,f17,f18",
+        }
+        resp = _req.get(
+            url,
+            headers=get_request_headers(referer="https://quote.eastmoney.com/"),
+            timeout=timeout,
+        )
+        data = resp.json()
+        diff = ((data.get("data") or {}).get("diff")) or []
+    except Exception as e:
+        logger.warning(f"[东财批量] clist 请求失败: {e}")
+        return {}
+
+    now = datetime.now(timezone(timedelta(hours=8)))
+    today_ts = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    result: Dict[str, Dict[str, Any]] = {}
+
+    for item in diff:
+        code = str(item.get("f12", "")).strip()
+        sym = code_set.get(code)
+        if not sym:
+            continue
+        try:
+            last = float(item.get("f2", 0))
+            if last <= 0:
+                continue
+            open_p = float(item.get("f17", 0))
+            high = float(item.get("f15", 0))
+            low = float(item.get("f16", 0))
+            vol = float(item.get("f5", 0))
+            result[sym] = {
+                "time": today_ts,
+                "open": round(open_p, 4),
+                "high": round(high, 4),
+                "low": round(low, 4),
+                "close": round(last, 4),
+                "volume": round(vol, 2),
+            }
+        except (ValueError, TypeError):
+            continue
+
+    return result
+
+
+# ================================================================
 # 数据源类
 # ================================================================
 
@@ -308,6 +402,162 @@ class CNStockDataSource(BaseDataSource):
             f"(耗时={total_elapsed:.1f}s): {'; '.join(errors)}"
         )
         return []
+
+    def get_kline_batch(
+        self,
+        symbols: List[str],
+        timeframe: str,
+        limit: int,
+        cached_symbols: Optional[set] = None,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        批量获取多只股票 K 线数据。
+
+        日线优化：
+          1. 用腾讯批量行情 API（一个请求）拿所有股票的当日数据
+          2. 只对缺失历史的股票逐只调 K 线 API 补数据
+          3. 合并：历史 K 线 + 当日行情 → 完整结果
+
+        非日线 / 不支持批量的市场：退回到逐只 get_kline。
+        """
+        if not symbols:
+            return {}
+
+        tf = normalize_chart_timeframe(timeframe)
+        result: Dict[str, List[Dict[str, Any]]] = {}
+
+        # 只有日线走批量行情优化
+        if tf != "1D" or cached_symbols is None:
+            for sym in symbols:
+                try:
+                    klines = self.get_kline(sym, tf, limit)
+                    if klines:
+                        result[sym] = klines
+                except Exception as e:
+                    logger.warning(f"[K线批量] {sym} {tf} 失败: {e}")
+            return result
+
+        # ─── 日线批量优化 ───
+        # 1) 批量行情拿当日数据（一个 HTTP 请求），腾讯优先 → 新浪 fallback
+        codes = [normalize_cn_code(s).lower() for s in symbols]
+        # 腾讯/新浪返回小写代码（sh600519），用小写做 key 匹配
+        code_to_sym = {normalize_cn_code(s).lower(): s for s in symbols}
+        today_bars: Dict[str, Dict[str, Any]] = {}
+
+        today_ts = int(datetime.now(timezone(timedelta(hours=8))).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).timestamp())
+
+        # 尝试腾讯批量行情
+        try:
+            from app.data_sources.tencent import fetch_quotes_batch
+            quotes = fetch_quotes_batch(codes)
+            for code, parts in quotes.items():
+                sym = code_to_sym.get(code)
+                if not sym or len(parts) < 35:
+                    continue
+                try:
+                    last = float(parts[3])
+                    open_p = float(parts[5])
+                    high = float(parts[33]) if parts[33] else last
+                    low = float(parts[34]) if parts[34] else last
+                    vol = float(parts[6]) if parts[6] else 0
+                    if last <= 0:
+                        continue
+                    today_bars[sym] = {
+                        "time": today_ts,
+                        "open": round(open_p, 4),
+                        "high": round(high, 4),
+                        "low": round(low, 4),
+                        "close": round(last, 4),
+                        "volume": round(vol, 2),
+                    }
+                except (ValueError, IndexError):
+                    continue
+            logger.info(f"[K线批量] 腾讯批量行情获取 {len(today_bars)}/{len(symbols)} 只当日数据")
+        except Exception as e:
+            logger.warning(f"[K线批量] 腾讯批量行情失败: {e}")
+
+        # 腾讯失败或结果不足 → fallback 新浪批量行情
+        if len(today_bars) < len(symbols):
+            try:
+                from app.data_sources.sina import fetch_sina_quotes_batch
+                missing_codes = [c for c, s in code_to_sym.items() if s not in today_bars]
+                if missing_codes:
+                    sina_quotes = fetch_sina_quotes_batch(missing_codes)
+                    for code_str, q in sina_quotes.items():
+                        sym = code_to_sym.get(code_str)
+                        if not sym:
+                            continue
+                        last = q.get("last", 0)
+                        if last <= 0:
+                            continue
+                        today_bars[sym] = {
+                            "time": today_ts,
+                            "open": round(q.get("open", last), 4),
+                            "high": round(q.get("high", last), 4),
+                            "low": round(q.get("low", last), 4),
+                            "close": round(last, 4),
+                            "volume": round(q.get("volume", 0), 2),
+                        }
+                    logger.info(f"[K线批量] 新浪批量行情补充 {len(sina_quotes)} 只，共 {len(today_bars)}/{len(symbols)} 只")
+            except Exception as e:
+                logger.warning(f"[K线批量] 新浪批量行情失败: {e}")
+
+        # 新浪也不足 → fallback 东方财富（clist 全市场接口，一次拉全部）
+        if len(today_bars) < len(symbols):
+            try:
+                from app.data_sources.eastmoney import _em_secid_from_cn
+                missing_syms = [s for s in symbols if s not in today_bars]
+                if missing_syms:
+                    em_quotes = _fetch_eastmoney_batch_quotes(missing_syms)
+                    for sym, bar in em_quotes.items():
+                        today_bars[sym] = bar
+                    logger.info(f"[K线批量] 东财批量行情补充 {len(em_quotes)} 只，共 {len(today_bars)}/{len(symbols)} 只")
+            except Exception as e:
+                logger.warning(f"[K线批量] 东财批量行情失败: {e}")
+
+        # 2) 需要补历史的 symbol（缓存中没有的）
+        # 统一用 normalize_cn_code 对齐格式，避免 600519 vs SH600519 不匹配
+        cached_normalized = {normalize_cn_code(s) for s in cached_symbols}
+        need_history = [s for s in symbols if normalize_cn_code(s) not in cached_normalized]
+        has_today_only = [s for s in symbols if normalize_cn_code(s) in cached_normalized]
+
+        # 有缓存的：直接从缓存拿历史 + 拼当日行情
+        for sym in has_today_only:
+            try:
+                cached = self.kline_cache.get(
+                    generate_kline_cache_key(normalize_cn_code(sym), tf, limit, None)
+                )
+                if cached:
+                    bars = list(cached)
+                    # 去掉已有的当日 bar，用批量行情的最新数据替换
+                    if sym in today_bars:
+                        tb = today_bars[sym]
+                        bars = [b for b in bars if b.get("time") != tb["time"]]
+                        bars.append(tb)
+                        bars.sort(key=lambda x: x["time"])
+                    result[sym] = bars[-limit:] if len(bars) > limit else bars
+            except Exception as e:
+                logger.warning(f"[K线批量] {sym} 缓存读取失败: {e}")
+
+        # 3) 缺失历史的：逐只调 K 线 API
+        for sym in need_history:
+            try:
+                klines = self.get_kline(sym, tf, limit)
+                if klines:
+                    bars = list(klines)
+                    # 用批量行情的当日数据覆盖（更实时）
+                    if sym in today_bars:
+                        tb = today_bars[sym]
+                        bars = [b for b in bars if b.get("time") != tb["time"]]
+                        bars.append(tb)
+                        bars.sort(key=lambda x: x["time"])
+                    result[sym] = bars[-limit:] if len(bars) > limit else bars
+            except Exception as e:
+                logger.warning(f"[K线批量] {sym} {tf} 历史拉取失败: {e}")
+
+        return result
 
     def _build_kline_sources(
         self,

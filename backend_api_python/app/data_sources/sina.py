@@ -154,6 +154,81 @@ def fetch_sina_quote(code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
     return quote
 
 
+def fetch_sina_quotes_batch(codes: List[str], timeout: int = 10) -> Dict[str, Dict[str, Any]]:
+    """
+    批量获取多只股票的实时行情（一个 HTTP 请求）。
+
+    新浪行情 API 支持逗号拼接多只代码：
+      https://hq.sinajs.cn/list=sh600000,sh600001,sh600002,...
+
+    返回: {code: {name, open, prev_close, last, high, low, volume, amount}}
+    """
+    if not codes:
+        return {}
+    lowered = [_sina_code_from_cn(c) for c in codes if c]
+    if not lowered:
+        return {}
+
+    batch_size = 500
+    result: Dict[str, Dict[str, Any]] = {}
+
+    for i in range(0, len(lowered), batch_size):
+        batch = lowered[i:i + batch_size]
+        query = ",".join(batch)
+
+        _sina_quote_limiter.wait()
+        url = f"https://hq.sinajs.cn/list={query}"
+        try:
+            resp = requests.get(
+                url,
+                headers=get_request_headers(referer="https://finance.sina.com.cn/"),
+                timeout=timeout,
+            )
+            resp.encoding = "gbk"
+        except Exception as e:
+            logger.warning(f"[新浪批量行情] 请求失败: {e}")
+            continue
+
+        # 每行一只: var hq_str_sh600519="贵州茅台,1750.00,1745.00,...";
+        for line in (resp.text or "").strip().split("\n"):
+            line = line.strip().rstrip(";")
+            m = re.search(r'hq_str_(\w+)="(.+?)"', line)
+            if not m:
+                continue
+            code_str = m.group(1)
+            data = m.group(2)
+            parts = data.split(",")
+            if len(parts) < 6:
+                continue
+            try:
+                name = parts[0].strip()
+                if not name:
+                    continue
+                open_p = float(parts[1]) if parts[1] else 0.0
+                prev_close = float(parts[2]) if parts[2] else 0.0
+                last = float(parts[3]) if parts[3] else 0.0
+                high = float(parts[4]) if parts[4] else 0.0
+                low = float(parts[5]) if parts[5] else 0.0
+                vol = float(parts[8]) if len(parts) > 8 and parts[8] else 0.0
+                amt = float(parts[9]) if len(parts) > 9 and parts[9] else 0.0
+                if last == 0 and prev_close == 0 and open_p == 0:
+                    continue
+                result[code_str] = {
+                    "name": name,
+                    "open": open_p,
+                    "prev_close": prev_close,
+                    "last": last,
+                    "high": high,
+                    "low": low,
+                    "volume": vol,
+                    "amount": amt,
+                }
+            except (ValueError, IndexError):
+                continue
+
+    return result
+
+
 # ---------- 日K线 ----------
 
 @retry_with_backoff(max_attempts=3, base_delay=2.0, max_delay=12.0, exceptions=(

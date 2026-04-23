@@ -86,14 +86,14 @@ class DataSourceFactory:
     ) -> List[Dict[str, Any]]:
         """
         获取K线数据的便捷方法
-        
+
         Args:
             market: 市场类型
             symbol: 交易对/股票代码
             timeframe: 时间周期
             limit: 数据条数
             before_time: 获取此时间之前的数据
-            
+
         Returns:
             K线数据列表
         """
@@ -111,6 +111,52 @@ class DataSourceFactory:
         except Exception as e:
             logger.error(f"Failed to fetch K-lines {market}:{symbol} - {str(e)}")
             return []
+
+    @classmethod
+    def get_kline_batch(
+        cls,
+        market: str,
+        symbols: List[str],
+        timeframe: str,
+        limit: int,
+        cached_symbols: Optional[set] = None,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        批量获取多只股票的 K 线数据。
+
+        一次调用返回所有成功拉取的 symbol → klines 映射，
+        内部串行调用底层数据源（K 线 API 不支持多股拼请求）。
+
+        Args:
+            market: 市场类型
+            symbols: 股票代码列表
+            timeframe: 时间周期
+            limit: 数据条数
+            cached_symbols: 已有缓存的 symbol 集合（用于优化：有缓存的只补当日）
+
+        Returns:
+            {symbol: [kline_bars]} — 仅包含成功返回非空数据的 symbol
+        """
+        try:
+            if not market or not symbols:
+                return {}
+            source = cls.get_source(market)
+            if hasattr(source, 'get_kline_batch'):
+                return source.get_kline_batch(symbols, timeframe, limit, cached_symbols=cached_symbols)
+            # fallback: 逐只串行拉取
+            result: Dict[str, List[Dict[str, Any]]] = {}
+            for sym in symbols:
+                try:
+                    klines = source.get_kline(sym, timeframe, limit)
+                    if klines:
+                        klines.sort(key=lambda x: x['time'])
+                        result[sym] = klines
+                except Exception as e:
+                    logger.warning(f"Batch fetch failed for {market}:{sym} - {e}")
+            return result
+        except Exception as e:
+            logger.error(f"Failed to batch fetch K-lines {market} - {str(e)}")
+            return {}
     
     @classmethod
     def get_ticker(cls, market: str, symbol: str) -> Dict[str, Any]:

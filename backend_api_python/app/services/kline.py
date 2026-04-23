@@ -159,11 +159,14 @@ class KlineService:
         if not all_by_market:
             return False
 
+        # 批量拉取函数
+        batch_fetch = lambda m, syms, tf, lim, cs=None: DataSourceFactory.get_kline_batch(m, syms, tf, lim, cached_symbols=cs)
+
         # 逐市场预热，记录当前 market 的结果
         current_ok = False
         for mkt, syms in all_by_market.items():
             logger.info(f"[KlineCache] 预热 {mkt} {len(syms)} 只: {syms[:5]}{'...' if len(syms) > 5 else ''}")
-            ok = self._kc.prewarm(tf, syms, fetch, mkt)
+            ok = self._kc.prewarm(tf, syms, fetch, mkt, batch_fetch_func=batch_fetch)
             if mkt == market:
                 current_ok = ok
 
@@ -296,11 +299,12 @@ class KlineService:
             {"1D": True/False, "1W": True/False, "1M": True/False}
         """
         fetch = lambda m, s, tf, lim: DataSourceFactory.get_kline(m, s, tf, lim)
+        batch_fetch = lambda m, syms, tf, lim, cs=None: DataSourceFactory.get_kline_batch(m, syms, tf, lim, cached_symbols=cs)
         results = {}
 
         for tf in ("1D", "1W", "1M"):
             try:
-                results[tf] = self._kc.prewarm(tf, symbols, fetch, market)
+                results[tf] = self._kc.prewarm(tf, symbols, fetch, market, batch_fetch_func=batch_fetch)
             except Exception as e:
                 logger.warning(f"[KlineCache] 预热 {tf} 失败: {e}")
                 results[tf] = False

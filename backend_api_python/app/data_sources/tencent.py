@@ -115,6 +115,60 @@ def fetch_quote(code: str, timeout: int = 8) -> Optional[List[str]]:
     return parts if len(parts) > 5 else None
 
 
+def fetch_quotes_batch(codes: List[str], timeout: int = 10) -> Dict[str, List[str]]:
+    """
+    批量获取多只股票的实时行情（一个 HTTP 请求）。
+
+    腾讯行情 API 支持逗号拼接多只代码：
+      http://qt.gtimg.cn/q=sh600000,sh600001,sh600002,...
+
+    返回: {code: [~分割的字段列表]} — 仅包含有效数据的 code
+    """
+    if not codes:
+        return {}
+    lowered = [_lower_code(c) for c in codes if c]
+    if not lowered:
+        return {}
+
+    # 分批，每批最多 500 只（腾讯支持）
+    batch_size = 500
+    result: Dict[str, List[str]] = {}
+
+    for i in range(0, len(lowered), batch_size):
+        batch = lowered[i:i + batch_size]
+        query = ",".join(batch)
+
+        limiter = get_tencent_limiter()
+        limiter.wait()
+        url = f"https://qt.gtimg.cn/q={query}"
+        try:
+            resp = requests.get(url, headers=get_request_headers(referer="https://qt.gtimg.cn/"), timeout=timeout)
+            resp.encoding = "gbk"
+        except Exception as e:
+            logger.warning(f"[腾讯批量行情] 请求失败: {e}")
+            continue
+
+        # 每行一只股票: v_sh600519="1~贵州茅台~600519~1750.00~..."
+        for line in (resp.text or "").strip().split("\n"):
+            line = line.strip().rstrip(";")
+            if "=" not in line or '""' in line:
+                continue
+            try:
+                var_name, data = line.split("=", 1)
+                data = data.strip('"')
+                parts = data.split("~")
+                if len(parts) > 5 and parts[1] and parts[2]:
+                    # 从变量名提取原始 code（v_sh600519 → sh600519）
+                    for c in batch:
+                        if c in var_name:
+                            result[c] = parts
+                            break
+            except Exception:
+                continue
+
+    return result
+
+
 def parse_quote_to_ticker(parts: List[str]) -> Dict[str, Any]:
     """
     Best-effort conversion to a unified ticker dict.
