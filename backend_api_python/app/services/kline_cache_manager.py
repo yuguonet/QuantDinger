@@ -29,7 +29,7 @@ logger = get_logger(__name__)
 # ─── 常量 ───────────────────────────────────────────────────────────
 
 DAILY_LIMIT = 1500       # 日线：约 5 年
-WEEKLY_LIMIT = 260       # 周线：约 5 年
+WEEKLY_LIMIT = 520       # 周线：约 10 年
 MONTHLY_LIMIT = 240      # 月线：约 20 年
 
 STALE_THRESHOLD = {
