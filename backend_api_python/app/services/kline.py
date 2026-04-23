@@ -166,10 +166,13 @@ class KlineService:
         return self._append_current(tf, cached, today_candle, symbol, market, fetch, limit)
 
     def _append_current(self, tf, bars, today_candle, symbol, market, fetch, limit):
-        """追加合成当前周期"""
+        """追加合成当前周期（盘中去重，避免当日 K 线重复）"""
         if tf == "1D":
             result = list(bars)
             if today_candle:
+                today_ts = today_candle["time"]
+                # 去掉已有当日 bar（_full_fetch 盘中可能已写入），再追加最新合成
+                result = [b for b in result if b.get("time") != today_ts]
                 result.append(today_candle)
             result.sort(key=lambda x: x["time"])
             return result[-limit:]

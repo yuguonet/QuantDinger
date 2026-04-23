@@ -23,6 +23,7 @@ import pandas as pd
 import pyarrow.feather as feather
 
 from app.utils.logger import get_logger
+from app.interfaces.trading_calendar import is_trading_day_today, prev_trading_day
 
 logger = get_logger(__name__)
 
@@ -66,12 +67,13 @@ def _ts_from_date(date_str: str) -> int:
 
 
 def _is_market_hours() -> bool:
-    now = datetime.now(timezone(timedelta(hours=8)))
-    if now.weekday() >= 5:
+    """判断当前是否为 A 股交易时段（使用交易日历精确判断）"""
+    if not is_trading_day_today():
         return False
     from datetime import time as dt_time
+    now = datetime.now(timezone(timedelta(hours=8)))
     t = now.time()
-    return (dt_time(9, 30) <= t <= dt_time(11, 30)) or (dt_time(13, 0) <= t <= dt_time(15, 0))
+    return (dt_time(9, 15) <= t <= dt_time(11, 30)) or (dt_time(13, 0) <= t <= dt_time(15, 0))
 
 
 def _iso_week_start(ts: int) -> int:
@@ -318,11 +320,55 @@ class KlineCacheManager:
             return set()
 
     def is_stale(self, tf: str) -> bool:
+        """根据交易日历判断缓存是否过期。
+
+        日线：缓存日期不是今天（或上一个交易日）→ 过期
+        周线：缓存日期早于本周第一个交易日 → 过期
+        月线：缓存日期早于本月第一个交易日 → 过期
+        """
         if tf not in VALID_TIMEFRAMES:
             return True
         cached_date = self._find_latest_date(tf)
         if not cached_date:
             return True
+
+        today = _today_str()
+
+        if tf == "1D":
+            # 盘中或盘前：缓存日期不是今天 → 需要增量更新
+            # 盘后：缓存日期不是今天 → 需要增量更新（收盘数据）
+            if cached_date < today:
+                return True
+            return False
+
+        if tf == "1W":
+            # 本周第一个交易日
+            try:
+                this_week_start = _iso_week_start(_now_ts())
+                this_week_start_str = datetime.fromtimestamp(
+                    this_week_start, tz=timezone(timedelta(hours=8))
+                ).strftime("%Y-%m-%d")
+                # 用实际交易日来判断：找到本周一之后的第一个交易日
+                # 简化：如果缓存日期早于本周一 → 过期
+                if cached_date < this_week_start_str:
+                    return True
+                return False
+            except Exception:
+                return True
+
+        if tf == "1M":
+            try:
+                this_month_start = _month_start(_now_ts())
+                this_month_start_str = datetime.fromtimestamp(
+                    this_month_start, tz=timezone(timedelta(hours=8))
+                ).strftime("%Y-%m-%d")
+                if cached_date < this_month_start_str:
+                    return True
+                return False
+            except Exception:
+                return True
+
+        # fallback：使用 STALE_THRESHOLD
         try:
             cached_ts = _ts_from_date(cached_date)
         except Exception:
@@ -357,6 +403,10 @@ class KlineCacheManager:
         limit = {"1D": DAILY_LIMIT, "1W": WEEKLY_LIMIT, "1M": MONTHLY_LIMIT}.get(tf, DAILY_LIMIT)
         logger.info(f"[KlineCache] 全量拉取 {tf} {len(symbols)} 只股票")
 
+        # 盘中：过滤当天未完成数据，只存历史已完成 K 线
+        in_market = tf == "1D" and _is_market_hours()
+        today_start = _ts_from_date(_today_str()) if in_market else 0
+
         all_rows = []
         ok = 0
         for sym in symbols:
@@ -364,6 +414,9 @@ class KlineCacheManager:
                 bars = fetch_func(market, sym, tf, limit)
                 if bars:
                     for bar in bars:
+                        # 盘中跳过当天未完成 bar
+                        if in_market and bar.get("time", 0) >= today_start:
+                            continue
                         row = {k: bar.get(k, 0) for k in KLINE_COLUMNS}
                         row["symbol"] = sym
                         all_rows.append(row)
@@ -397,41 +450,65 @@ class KlineCacheManager:
         limit = {"1D": DAILY_LIMIT, "1W": WEEKLY_LIMIT, "1M": MONTHLY_LIMIT}.get(tf, DAILY_LIMIT)
         logger.info(f"[KlineCache] 增量拉取 {tf} {len(missing)} 只缺失股票")
 
-        existing_df = self._read_latest(tf)
-        new_rows = []
-        ok = 0
+        # 盘中：过滤当天未完成数据，与 _full_fetch 行为一致
+        in_market = tf == "1D" and _is_market_hours()
+        today_start = _ts_from_date(_today_str()) if in_market else 0
+
+        # 锁外拉取：逐只获取，按 symbol 分组收集成功行
+        fetched_rows: List[Dict[str, Any]] = []    # 所有成功拉到的原始行
+        fetched_symbols: List[str] = []             # 成功拉到数据的 symbol 列表
+        fail_count = 0
+
         for sym in missing:
             try:
                 bars = fetch_func(market, sym, tf, limit)
                 if bars:
                     for bar in bars:
+                        # 盘中跳过当天未完成 bar
+                        if in_market and bar.get("time", 0) >= today_start:
+                            continue
                         row = {k: bar.get(k, 0) for k in KLINE_COLUMNS}
                         row["symbol"] = sym
-                        new_rows.append(row)
-                    ok += 1
+                        fetched_rows.append(row)
+                    fetched_symbols.append(sym)
+                else:
+                    # 空数据不算成功，下次预热仍会重试
+                    logger.debug(f"[KlineCache] {sym} {tf} 返回空数据，跳过")
             except Exception as e:
+                fail_count += 1
                 logger.warning(f"[KlineCache] 拉取 {sym} {tf} 失败: {e}")
 
-        if new_rows:
-            new_df = pd.DataFrame(new_rows)
-            for col in KLINE_COLUMNS:
-                if col in new_df.columns:
-                    new_df[col] = pd.to_numeric(new_df[col], errors="coerce")
-            new_df["symbol"] = new_df["symbol"].astype(str)
+        if not fetched_rows:
+            logger.info(f"[KlineCache] 增量拉取 {tf} 无新数据 (失败 {fail_count} 只)")
+            # 全部失败 → 返回 False，让上层降级
+            return fail_count < len(missing)
 
-            with self._file_lock:
-                existing_df = self._read_latest(tf)
-                if not existing_df.empty:
-                    merged = pd.concat([existing_df, new_df], ignore_index=True)
-                else:
-                    merged = new_df
-                merged = merged.drop_duplicates(subset=["time", "symbol"], keep="last")
-                merged = merged.sort_values(["symbol", "time"])
-                self._write_feather(tf, _today_str(), merged)
-            logger.info(f"[KlineCache] 增量拉取 {tf} 完成: 新增 {ok} 只, {len(new_rows)} 行")
-        else:
-            logger.info(f"[KlineCache] 增量拉取 {tf} 无新数据")
+        new_df = pd.DataFrame(fetched_rows)
+        for col in KLINE_COLUMNS:
+            if col in new_df.columns:
+                new_df[col] = pd.to_numeric(new_df[col], errors="coerce")
+        new_df["symbol"] = new_df["symbol"].astype(str)
 
+        # 锁内：读 → 合并 → 写（原子操作，避免竞态）
+        with self._file_lock:
+            existing_df = self._read_latest(tf)
+            if not existing_df.empty and "symbol" in existing_df.columns:
+                # 先去掉本次已成功拉取的 symbol 的旧数据，再合并
+                # 避免同一个 symbol 在新旧 DataFrame 中产生重复
+                if fetched_symbols:
+                    existing_df = existing_df[~existing_df["symbol"].isin(fetched_symbols)]
+                merged = pd.concat([existing_df, new_df], ignore_index=True)
+            else:
+                merged = new_df
+            merged = merged.drop_duplicates(subset=["time", "symbol"], keep="last")
+            merged = merged.sort_values(["symbol", "time"])
+            self._write_feather(tf, _today_str(), merged)
+
+        logger.info(
+            f"[KlineCache] 增量拉取 {tf} 完成: "
+            f"成功 {len(fetched_symbols)}/{len(missing)} 只, "
+            f"失败 {fail_count} 只, {len(fetched_rows)} 行"
+        )
         return True
 
     # ═══════════════════════════════════════════════════════════════════
@@ -439,7 +516,11 @@ class KlineCacheManager:
     # ═══════════════════════════════════════════════════════════════════
 
     def store_single(self, tf: str, symbol: str, bars: List[Dict[str, Any]]):
-        """将单只股票的 K 线写入缓存（预热失败降级用）。去掉当日数据后存入。"""
+        """将单只股票的 K 线写入缓存（预热失败降级用）。
+
+        盘中时段：去掉当天未完成数据，只存历史已完成 K 线
+        盘后/非交易日：保留全部数据（当天已收盘）
+        """
         if not bars or tf not in VALID_TIMEFRAMES:
             return
 
@@ -448,7 +529,12 @@ class KlineCacheManager:
         except Exception:
             return
 
-        bars_clean = [b for b in bars if b.get("time", 0) < today_start]
+        if _is_market_hours():
+            # 盘中：去掉当天数据（未完成），只存历史
+            bars_clean = [b for b in bars if b.get("time", 0) < today_start]
+        else:
+            # 盘后或非交易日：保留全部（含当天已完成 K 线）
+            bars_clean = list(bars)
         if not bars_clean:
             return
 
