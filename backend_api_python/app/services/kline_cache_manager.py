@@ -2,20 +2,21 @@
 """
 K线 Feather 缓存管理器
 
-按日/周/月分别存储 K 线数据为本地 feather 文件。
+按日/月分别存储 K 线数据为本地 feather 文件（周线由日线实时聚合）。
 
 核心特性：
   - 惰性加载：优先读本地 feather 缓存，缓存未命中才走远程
   - 增量更新：只拉取缺失的股票，完全过期才全量拉取
   - 批量预热：遍历所有用户自选股去重后批量拉取
   - 市场时段合成：用 1m/5m/15m/30m/1H 合成当日未完成 K 线
-  - 预热频率：日线1天1次 / 周线1周1次 / 月线1月1次
+  - 预热频率：日线1天1次 / 月线1月1次
 """
 
 import os
 import shutil
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set
 
@@ -34,17 +35,15 @@ logger = get_logger(__name__)
 # ─── 常量 ───────────────────────────────────────────────────────────
 
 DAILY_LIMIT = 1500       # 日线：约 5 年
-WEEKLY_LIMIT = 520       # 周线：约 10 年
 MONTHLY_LIMIT = 240      # 月线：约 20 年
 
 STALE_THRESHOLD = {
     "1D": 1 * 86400,
-    "1W": 7 * 86400,
     "1M": 30 * 86400,
 }
 
 KLINE_COLUMNS = ["time", "open", "high", "low", "close", "volume"]
-VALID_TIMEFRAMES = {"1D", "1W", "1M"}
+VALID_TIMEFRAMES = {"1D", "1M"}
 
 # 预热锁：独立于文件锁，避免预热期间阻塞读操作
 _prewarm_lock = threading.Lock()
@@ -100,37 +99,6 @@ def _bar_field(bar: Dict[str, Any], field: str, default: float = 0.0) -> float:
 
 # ─── 聚合函数（不修改原列表） ───────────────────────────────────────
 
-def aggregate_daily_to_weekly(daily_bars: List[Dict[str, Any]], limit: int = WEEKLY_LIMIT) -> List[Dict[str, Any]]:
-    if not daily_bars:
-        return []
-    bars = sorted(daily_bars, key=lambda x: x.get("time", 0))
-    groups: Dict[int, List[Dict]] = {}
-    order: List[int] = []
-    for bar in bars:
-        t = bar.get("time", 0)
-        if not t:
-            continue
-        wk = _iso_week_start(t)
-        if wk not in groups:
-            groups[wk] = []
-            order.append(wk)
-        groups[wk].append(bar)
-    result = []
-    for wk in order:
-        chunk = groups[wk]
-        if not chunk:
-            continue
-        result.append({
-            "time": wk,
-            "open": _bar_field(chunk[0], "open"),
-            "high": max(_bar_field(b, "high") for b in chunk),
-            "low": min(_bar_field(b, "low") for b in chunk),
-            "close": _bar_field(chunk[-1], "close"),
-            "volume": round(sum(_bar_field(b, "volume") for b in chunk), 2),
-        })
-    return result[-limit:] if len(result) > limit else result
-
-
 def aggregate_daily_to_monthly(daily_bars: List[Dict[str, Any]], limit: int = MONTHLY_LIMIT) -> List[Dict[str, Any]]:
     if not daily_bars:
         return []
@@ -170,7 +138,6 @@ class KlineCacheManager:
 
     文件布局：
       kline_1D_{YYYY-MM-DD}.feather   日线快照
-      kline_1W_{YYYY-MM-DD}.feather   周线快照
       kline_1M_{YYYY-MM-DD}.feather   月线快照
 
     锁策略：
@@ -333,7 +300,6 @@ class KlineCacheManager:
           - 缓存是今天盘中建的（mtime < 15:00），现在已收盘 → 过期
             （盘中建的缓存过滤了当日数据，盘后需重建以包含当日确认数据）
 
-        周线：缓存日期 < 本周最后一个已过交易日 → 过期（当前周实时合成）
         月线：缓存日期 < 本月最后一个已过交易日 → 过期（当前月实时合成）
         """
         if tf not in VALID_TIMEFRAMES:
@@ -362,19 +328,6 @@ class KlineCacheManager:
             except Exception:
                 pass
             return False
-
-        if tf == "1W":
-            try:
-                now = datetime.now(timezone(timedelta(hours=8)))
-                monday = (now - timedelta(days=now.weekday())).strftime("%Y-%m-%d")
-                d = now.strftime("%Y-%m-%d")
-                while d >= monday:
-                    if is_trading_day(d):
-                        return cached_date < d
-                    d = (datetime.strptime(d, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
-                return True
-            except Exception:
-                return True
 
         if tf == "1M":
             try:
@@ -421,8 +374,58 @@ class KlineCacheManager:
             else:
                 return self._incremental_fetch(tf, all_symbols, fetch_func, market, batch_fetch_func)
 
+    def _concurrent_fetch_klines(
+        self,
+        market: str,
+        symbols: List[str],
+        tf: str,
+        limit: int,
+        fetch_func,
+        max_workers: int = 8,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """并发拉取多只股票 K 线（ThreadPoolExecutor）。
+
+        当数据源不支持批量 API 时，用并发替代串行逐只拉取，
+        显著减少总耗时（8 只并发 ≈ 串行 1/8 时间）。
+        """
+        if not symbols:
+            return {}
+
+        result: Dict[str, List[Dict[str, Any]]] = {}
+        workers = min(max_workers, len(symbols))
+        lock = threading.Lock()
+
+        def _fetch_one(sym: str) -> Optional[tuple]:
+            try:
+                bars = fetch_func(market, sym, tf, limit)
+                if bars:
+                    bars.sort(key=lambda x: x.get("time", 0))
+                    return (sym, bars)
+            except Exception as e:
+                logger.warning(f"[KlineCache] 并发拉取 {sym} {tf} 失败: {e}")
+            return None
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_fetch_one, sym): sym for sym in symbols}
+            for future in as_completed(futures):
+                try:
+                    res = future.result()
+                except Exception as e:
+                    logger.warning(f"[KlineCache] 并发 future 异常: {e}")
+                    continue
+                if res:
+                    sym, bars = res
+                    with lock:
+                        result[sym] = bars
+
+        logger.info(
+            f"[KlineCache] 并发拉取 {tf} 完成: "
+            f"{len(result)}/{len(symbols)} 只成功 (workers={workers})"
+        )
+        return result
+
     def _full_fetch(self, tf, symbols, fetch_func, market, batch_fetch_func=None):
-        limit = {"1D": DAILY_LIMIT, "1W": WEEKLY_LIMIT, "1M": MONTHLY_LIMIT}.get(tf, DAILY_LIMIT)
+        limit = {"1D": DAILY_LIMIT, "1M": MONTHLY_LIMIT}.get(tf, DAILY_LIMIT)
 
         # 1) 去重：同一市场只保留唯一 symbol
         symbols = list(dict.fromkeys(s.strip() for s in symbols if s.strip()))
@@ -443,25 +446,26 @@ class KlineCacheManager:
         now = datetime.now(timezone(timedelta(hours=8)))
         if tf == "1D":
             cutoff = _ts_from_date(_today_str())
-        elif tf == "1W":
-            cutoff = _iso_week_start(int(now.timestamp()))
         elif tf == "1M":
             cutoff = _month_start(int(now.timestamp()))
         else:
             cutoff = 0
 
-        # 3) 批量拉取缺失的 symbol
+        # 3) 批量拉取缺失的 symbol：batch API → 并发逐只
+        raw_data: Dict[str, List[Dict[str, Any]]] = {}
         if batch_fetch_func:
-            raw_data = batch_fetch_func(market, missing, tf, limit, cached)
-        else:
-            raw_data = {}
-            for sym in missing:
-                try:
-                    bars = fetch_func(market, sym, tf, limit)
-                    if bars:
-                        raw_data[sym] = bars
-                except Exception as e:
-                    logger.warning(f"[KlineCache] 拉取 {sym} {tf} 失败: {e}")
+            try:
+                raw_data = batch_fetch_func(market, missing, tf, limit, cached)
+            except Exception as e:
+                logger.warning(f"[KlineCache] batch_fetch_func 失败，降级并发: {e}")
+
+        # batch 未覆盖的 symbol，用并发补拉
+        batch_missed = [s for s in missing if s not in raw_data]
+        if batch_missed:
+            logger.info(f"[KlineCache] batch 未覆盖 {len(batch_missed)} 只，并发补拉")
+            raw_data.update(
+                self._concurrent_fetch_klines(market, batch_missed, tf, limit, fetch_func)
+            )
 
         fetched_rows: List[Dict[str, Any]] = []
         fetched_symbols: List[str] = []
@@ -516,32 +520,33 @@ class KlineCacheManager:
             logger.debug(f"[KlineCache] {tf} 缓存完整，无需拉取")
             return True
 
-        limit = {"1D": DAILY_LIMIT, "1W": WEEKLY_LIMIT, "1M": MONTHLY_LIMIT}.get(tf, DAILY_LIMIT)
+        limit = {"1D": DAILY_LIMIT, "1M": MONTHLY_LIMIT}.get(tf, DAILY_LIMIT)
         logger.info(f"[KlineCache] 增量拉取 {tf} {len(missing)} 只缺失股票")
 
         # 过滤当前未确认周期：今日/本周/本月的 K 线是聚合数据，不进缓存
         now = datetime.now(timezone(timedelta(hours=8)))
         if tf == "1D":
             cutoff = _ts_from_date(_today_str())
-        elif tf == "1W":
-            cutoff = _iso_week_start(int(now.timestamp()))
         elif tf == "1M":
             cutoff = _month_start(int(now.timestamp()))
         else:
             cutoff = 0
 
-        # 批量拉取缺失的 symbol
+        # 批量拉取缺失的 symbol：batch API → 并发逐只
+        raw_data: Dict[str, List[Dict[str, Any]]] = {}
         if batch_fetch_func:
-            raw_data = batch_fetch_func(market, missing, tf, limit, cached)
-        else:
-            raw_data = {}
-            for sym in missing:
-                try:
-                    bars = fetch_func(market, sym, tf, limit)
-                    if bars:
-                        raw_data[sym] = bars
-                except Exception as e:
-                    logger.warning(f"[KlineCache] 拉取 {sym} {tf} 失败: {e}")
+            try:
+                raw_data = batch_fetch_func(market, missing, tf, limit, cached)
+            except Exception as e:
+                logger.warning(f"[KlineCache] batch_fetch_func 失败，降级并发: {e}")
+
+        # batch 未覆盖的 symbol，用并发补拉
+        batch_missed = [s for s in missing if s not in raw_data]
+        if batch_missed:
+            logger.info(f"[KlineCache] batch 未覆盖 {len(batch_missed)} 只，并发补拉")
+            raw_data.update(
+                self._concurrent_fetch_klines(market, batch_missed, tf, limit, fetch_func)
+            )
 
         fetched_rows: List[Dict[str, Any]] = []
         fetched_symbols: List[str] = []
@@ -603,8 +608,6 @@ class KlineCacheManager:
             now = datetime.now(timezone(timedelta(hours=8)))
             if tf == "1D":
                 cutoff = _ts_from_date(_today_str())
-            elif tf == "1W":
-                cutoff = _iso_week_start(int(now.timestamp()))
             elif tf == "1M":
                 cutoff = _month_start(int(now.timestamp()))
             else:

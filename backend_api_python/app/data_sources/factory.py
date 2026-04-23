@@ -3,6 +3,8 @@
 根据市场类型返回对应的数据源
 """
 from typing import Dict, List, Any, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 from app.data_sources.base import BaseDataSource
 from app.utils.logger import get_logger
@@ -143,16 +145,35 @@ class DataSourceFactory:
             source = cls.get_source(market)
             if hasattr(source, 'get_kline_batch'):
                 return source.get_kline_batch(symbols, timeframe, limit, cached_symbols=cached_symbols)
-            # fallback: 逐只串行拉取
+            # fallback: 并发逐只拉取（替代串行）
             result: Dict[str, List[Dict[str, Any]]] = {}
-            for sym in symbols:
+            workers = min(8, len(symbols))
+            lock = threading.Lock()
+
+            def _fetch_one(sym: str) -> Optional[tuple]:
                 try:
                     klines = source.get_kline(sym, timeframe, limit)
                     if klines:
                         klines.sort(key=lambda x: x['time'])
-                        result[sym] = klines
+                        return (sym, klines)
                 except Exception as e:
                     logger.warning(f"Batch fetch failed for {market}:{sym} - {e}")
+                return None
+
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(_fetch_one, sym): sym for sym in symbols}
+                for future in as_completed(futures):
+                    try:
+                        res = future.result()
+                    except Exception as e:
+                        logger.warning(f"Batch fetch future exception for {market}: {e}")
+                        continue
+                    if res:
+                        sym, klines = res
+                        with lock:
+                            result[sym] = klines
+
+            logger.info(f"Batch fetch {market} {timeframe}: {len(result)}/{len(symbols)} succeeded (concurrent, workers={workers})")
             return result
         except Exception as e:
             logger.error(f"Failed to batch fetch K-lines {market} - {str(e)}")

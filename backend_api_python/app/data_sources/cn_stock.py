@@ -29,7 +29,9 @@ Fallback Chain (实时行情/报价):
 from __future__ import annotations
 
 import concurrent.futures
+import threading
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from app.data_sources.base import BaseDataSource
@@ -249,6 +251,98 @@ def _fetch_eastmoney_batch_quotes(
 
 
 # ================================================================
+# 日线聚合辅助（月线批量拉取用）
+# ================================================================
+
+def _month_start_from_dt(dt: datetime) -> int:
+    """计算给定 datetime 所在月初的 Unix 时间戳"""
+    return int(dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp())
+
+
+def _aggregate_daily_to_monthly(daily_bars: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    """将日线聚合为月线"""
+    if not daily_bars:
+        return []
+    bars = sorted(daily_bars, key=lambda x: x.get("time", 0))
+    groups: Dict[int, List[Dict]] = {}
+    order: List[int] = []
+    for bar in bars:
+        t = bar.get("time", 0)
+        if not t:
+            continue
+        dt = datetime.fromtimestamp(t, tz=timezone(timedelta(hours=8)))
+        ms = _month_start_from_dt(dt)
+        if ms not in groups:
+            groups[ms] = []
+            order.append(ms)
+        groups[ms].append(bar)
+    result = []
+    for ms in order:
+        chunk = groups[ms]
+        if not chunk:
+            continue
+        result.append({
+            "time": ms,
+            "open": float(chunk[0].get("open", 0)),
+            "high": max(float(b.get("high", 0)) for b in chunk),
+            "low": min(float(b.get("low", 0)) for b in chunk),
+            "close": float(chunk[-1].get("close", 0)),
+            "volume": round(sum(float(b.get("volume", 0)) for b in chunk), 2),
+        })
+    return result[-limit:] if len(result) > limit else result
+
+
+def _concurrent_fetch_kline_batch(
+    source: "CNStockDataSource",
+    symbols: List[str],
+    tf: str,
+    limit: int,
+    today_bars: Dict[str, Dict[str, Any]],
+    result: Dict[str, List[Dict[str, Any]]],
+    max_workers: int = 8,
+) -> None:
+    """并发拉取多只股票的历史 K 线，合并当日行情后写入 result。"""
+    if not symbols:
+        return
+
+    workers = min(max_workers, len(symbols))
+    lock = threading.Lock()
+
+    def _fetch_one(sym: str) -> Optional[tuple]:
+        try:
+            klines = source.get_kline(sym, tf, limit)
+            if klines:
+                bars = list(klines)
+                if sym in today_bars:
+                    tb = today_bars[sym]
+                    bars = [b for b in bars if b.get("time") != tb["time"]]
+                    bars.append(tb)
+                bars.sort(key=lambda x: x["time"])
+                return (sym, bars[-limit:] if len(bars) > limit else bars)
+        except Exception as e:
+            logger.warning(f"[K线批量并发] {sym} {tf} 失败: {e}")
+        return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_fetch_one, sym): sym for sym in symbols}
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                res = future.result()
+            except Exception as e:
+                logger.warning(f"[K线批量并发] future 异常: {e}")
+                continue
+            if res:
+                sym, bars = res
+                with lock:
+                    result[sym] = bars
+
+    logger.info(
+        f"[K线批量并发] 历史拉取 {tf} 完成: "
+        f"{len(result)}/{len(symbols)} 只成功 (workers={workers})"
+    )
+
+
+# ================================================================
 # 数据源类
 # ================================================================
 
@@ -418,7 +512,11 @@ class CNStockDataSource(BaseDataSource):
           2. 只对缺失历史的股票逐只调 K 线 API 补数据
           3. 合并：历史 K 线 + 当日行情 → 完整结果
 
-        非日线 / 不支持批量的市场：退回到逐只 get_kline。
+        月线优化：
+          1. 先走日线批量路径拉取日线数据
+          2. 再从日线聚合为月线
+
+        非日线且非月线 / 不支持批量的市场：并发逐只拉取。
         """
         if not symbols:
             return {}
@@ -426,16 +524,20 @@ class CNStockDataSource(BaseDataSource):
         tf = normalize_chart_timeframe(timeframe)
         result: Dict[str, List[Dict[str, Any]]] = {}
 
-        # 只有日线走批量行情优化
-        if tf != "1D" or cached_symbols is None:
-            for sym in symbols:
-                try:
-                    klines = self.get_kline(sym, tf, limit)
-                    if klines:
-                        result[sym] = klines
-                except Exception as e:
-                    logger.warning(f"[K线批量] {sym} {tf} 失败: {e}")
+        # ── 月线：走日线批量 + 聚合 ──
+        if tf == "1M":
+            daily_limit = min(limit * 21 + 100, 5000)
+            daily_result = self.get_kline_batch(
+                symbols, "1D", daily_limit, cached_symbols=cached_symbols,
+            )
+            for sym, daily_bars in daily_result.items():
+                if daily_bars:
+                    result[sym] = _aggregate_daily_to_monthly(daily_bars, limit)
             return result
+
+        # ── 日线走批量行情优化 ──
+        if cached_symbols is None:
+            cached_symbols = set()
 
         # ─── 日线批量优化 ───
         # 1) 批量行情拿当日数据（一个 HTTP 请求），腾讯优先 → 新浪 fallback
@@ -541,21 +643,9 @@ class CNStockDataSource(BaseDataSource):
             except Exception as e:
                 logger.warning(f"[K线批量] {sym} 缓存读取失败: {e}")
 
-        # 3) 缺失历史的：逐只调 K 线 API
-        for sym in need_history:
-            try:
-                klines = self.get_kline(sym, tf, limit)
-                if klines:
-                    bars = list(klines)
-                    # 用批量行情的当日数据覆盖（更实时）
-                    if sym in today_bars:
-                        tb = today_bars[sym]
-                        bars = [b for b in bars if b.get("time") != tb["time"]]
-                        bars.append(tb)
-                        bars.sort(key=lambda x: x["time"])
-                    result[sym] = bars[-limit:] if len(bars) > limit else bars
-            except Exception as e:
-                logger.warning(f"[K线批量] {sym} {tf} 历史拉取失败: {e}")
+        # 3) 缺失历史的：并发拉取（替代逐只串行）
+        if need_history:
+            _concurrent_fetch_kline_batch(self, need_history, tf, limit, today_bars, result)
 
         return result
 

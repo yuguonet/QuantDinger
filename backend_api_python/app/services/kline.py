@@ -2,7 +2,8 @@
 K线数据服务
 
 核心改造：
-  - 日线/周线/月线使用本地 feather 缓存（KlineCacheManager）
+  - 日线/月线使用本地 feather 缓存（KlineCacheManager）
+  - 周线由日线实时聚合，不单独缓存
   - 惰性加载：优先读本地缓存，缓存未命中触发预热
   - 预热：查自选股去重 → 比对缓存 → 全量或增量拉取
   - 降级：预热失败 → 单只拉取 → 去掉当日存入缓存
@@ -14,7 +15,6 @@ from typing import Dict, List, Any, Optional, Tuple
 from app.data_sources import DataSourceFactory
 from app.services.kline_cache_manager import (
     KlineCacheManager,
-    aggregate_daily_to_weekly,
     aggregate_daily_to_monthly,
     _is_market_hours,
     _today_str,
@@ -23,7 +23,6 @@ from app.services.kline_cache_manager import (
     _month_start,
     _bar_field,
     DAILY_LIMIT,
-    WEEKLY_LIMIT,
     MONTHLY_LIMIT,
 )
 from app.utils.cache import CacheManager
@@ -82,9 +81,78 @@ class KlineService:
         limit: int = 1000,
         before_time: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        if timeframe in ("1D", "1W", "1M") and not before_time:
+        # 周线：从日线实时聚合，不走缓存
+        if timeframe == "1W" and not before_time:
+            return self._get_weekly_from_daily(market, symbol, limit)
+        if timeframe in ("1D", "1M") and not before_time:
             return self._get_cached_kline(market, symbol, timeframe, limit)
         return self._get_remote_kline(market, symbol, timeframe, limit, before_time)
+
+    def _get_weekly_from_daily(
+        self, market: str, symbol: str, limit: int,
+    ) -> List[Dict[str, Any]]:
+        """周线由日线实时聚合（日线走缓存，周线不单独存储）"""
+        # 每周约 5 个交易日，多拉一些保证覆盖
+        daily_limit = min(limit * 5 + 50, DAILY_LIMIT)
+        daily = self.get_kline(market, symbol, "1D", daily_limit)
+        if not daily:
+            return []
+        weekly = self._aggregate_weekly(daily, limit)
+        # 追加当日合成
+        fetch = lambda m, s, t, l: DataSourceFactory.get_kline(m, s, t, l)
+        today_candle = self._kc.synthesize_today_candle(symbol, fetch, market)
+        if today_candle:
+            now_ts = today_candle["time"]
+            week_start = _iso_week_start(now_ts)
+            historical = [b for b in weekly if b["time"] < week_start]
+            # 从日线取本周数据（daily 已含 _append_current 追加的当日 bar，需去重）
+            this_week = [b for b in daily if b["time"] >= week_start and b.get("time") != now_ts]
+            this_week.append(today_candle)
+            this_week.sort(key=lambda x: x["time"])
+            if this_week:
+                historical.append({
+                    "time": week_start,
+                    "open": _bar_field(this_week[0], "open"),
+                    "high": max(_bar_field(b, "high") for b in this_week),
+                    "low": min(_bar_field(b, "low") for b in this_week),
+                    "close": _bar_field(this_week[-1], "close"),
+                    "volume": round(sum(_bar_field(b, "volume") for b in this_week), 2),
+                })
+            historical.sort(key=lambda x: x["time"])
+            return historical[-limit:]
+        return weekly
+
+    @staticmethod
+    def _aggregate_weekly(daily_bars: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+        """将日线聚合为周线"""
+        if not daily_bars:
+            return []
+        bars = sorted(daily_bars, key=lambda x: x.get("time", 0))
+        groups: Dict[int, List[Dict]] = {}
+        order: List[int] = []
+        for bar in bars:
+            t = bar.get("time", 0)
+            if not t:
+                continue
+            wk = _iso_week_start(t)
+            if wk not in groups:
+                groups[wk] = []
+                order.append(wk)
+            groups[wk].append(bar)
+        result = []
+        for wk in order:
+            chunk = groups[wk]
+            if not chunk:
+                continue
+            result.append({
+                "time": wk,
+                "open": _bar_field(chunk[0], "open"),
+                "high": max(_bar_field(b, "high") for b in chunk),
+                "low": min(_bar_field(b, "low") for b in chunk),
+                "close": _bar_field(chunk[-1], "close"),
+                "volume": round(sum(_bar_field(b, "volume") for b in chunk), 2),
+            })
+        return result[-limit:] if len(result) > limit else result
 
     # ═══════════════════════════════════════════════════════════════════
     #  日/周/月线：缓存优先
@@ -130,7 +198,6 @@ class KlineService:
         触发全市场预热：遍历所有自选股市场，逐市场批量拉取。
 
         日线：1天1次全量 / 增量缺失
-        周线：1周1次全量 / 增量缺失
         月线：1月1次全量 / 增量缺失
 
         批量拉取优先级高于单只拉取：一次遍历所有市场，全部预热。
@@ -223,39 +290,10 @@ class KlineService:
             result.sort(key=lambda x: x["time"])
             return result[-limit:]
 
-        if tf == "1W":
-            return self._append_current_week(bars, today_candle, symbol, market, fetch, limit)
-
         if tf == "1M":
             return self._append_current_month(bars, today_candle, symbol, market, fetch, limit)
 
         return bars[-limit:]
-
-    def _append_current_week(self, cached_weekly, today_candle, symbol, market, fetch, limit):
-        now_ts = today_candle["time"] if today_candle else int(
-            datetime.now(timezone(timedelta(hours=8))).timestamp()
-        )
-        week_start = _iso_week_start(now_ts)
-        historical = [b for b in cached_weekly if b["time"] < week_start]
-
-        daily = self._kc.get_cached("1D", symbol) or []
-        this_week = [b for b in daily if b["time"] >= week_start]
-        if today_candle:
-            this_week.append(today_candle)
-
-        result = list(historical)
-        if this_week:
-            this_week.sort(key=lambda x: x["time"])
-            result.append({
-                "time": week_start,
-                "open": _bar_field(this_week[0], "open"),
-                "high": max(_bar_field(b, "high") for b in this_week),
-                "low": min(_bar_field(b, "low") for b in this_week),
-                "close": _bar_field(this_week[-1], "close"),
-                "volume": round(sum(_bar_field(b, "volume") for b in this_week), 2),
-            })
-        result.sort(key=lambda x: x["time"])
-        return result[-limit:]
 
     def _append_current_month(self, cached_monthly, today_candle, symbol, market, fetch, limit):
         now_ts = today_candle["time"] if today_candle else int(
@@ -289,20 +327,19 @@ class KlineService:
 
     def prewarm_all(self, symbols: List[str], market: str = "CNStock") -> Dict[str, bool]:
         """
-        统一预热入口：日/周/月线各自独立预热。
+        统一预热入口：日/月线各自独立预热（周线由日线实时聚合）。
 
         日线：1天1次
-        周线：1周1次
         月线：1月1次
 
         Returns:
-            {"1D": True/False, "1W": True/False, "1M": True/False}
+            {"1D": True/False, "1M": True/False}
         """
         fetch = lambda m, s, tf, lim: DataSourceFactory.get_kline(m, s, tf, lim)
         batch_fetch = lambda m, syms, tf, lim, cs=None: DataSourceFactory.get_kline_batch(m, syms, tf, lim, cached_symbols=cs)
         results = {}
 
-        for tf in ("1D", "1W", "1M"):
+        for tf in ("1D", "1M"):
             try:
                 results[tf] = self._kc.prewarm(tf, symbols, fetch, market, batch_fetch_func=batch_fetch)
             except Exception as e:
