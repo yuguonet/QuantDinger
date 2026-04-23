@@ -48,6 +48,53 @@ VALID_TIMEFRAMES = {"1D", "1M"}
 # 预热锁：独立于文件锁，避免预热期间阻塞读操作
 _prewarm_lock = threading.Lock()
 
+# 失败 symbol 记录：{symbol: 失败时间戳}，避免无限重试拉取失败的股票
+# 在预热周期内（日线 1 天 / 月线 1 月），失败的 symbol 不再重试
+_failed_symbols: Dict[str, float] = {}
+_failed_lock = threading.Lock()
+FAILED_COOLDOWN = {
+    "1D": 6 * 3600,    # 日线失败后冷却 6 小时
+    "1M": 7 * 86400,   # 月线失败后冷却 7 天
+}
+
+
+# ─── 失败 symbol 管理 ──────────────────────────────────────────────
+
+def _get_failed_symbols(tf: str) -> Set[str]:
+    """获取当前冷却期内的失败 symbol 集合"""
+    cooldown = FAILED_COOLDOWN.get(tf, 6 * 3600)
+    now = time.time()
+    with _failed_lock:
+        expired = [s for s, ts in _failed_symbols.items() if now - ts > cooldown]
+        for s in expired:
+            del _failed_symbols[s]
+        return set(_failed_symbols.keys())
+
+
+def _record_failed_symbols(symbols: List[str]):
+    """记录拉取失败的 symbol 及其时间戳"""
+    if not symbols:
+        return
+    now = time.time()
+    with _failed_lock:
+        for s in symbols:
+            _failed_symbols[s] = now
+        # 防止无限增长：超过 2000 条时清理最旧的
+        if len(_failed_symbols) > 2000:
+            sorted_items = sorted(_failed_symbols.items(), key=lambda x: x[1])
+            for s, _ in sorted_items[:len(sorted_items) // 2]:
+                del _failed_symbols[s]
+    logger.info(f"[KlineCache] 记录 {len(symbols)} 只失败 symbol（冷却期内不再重试）: {symbols[:10]}")
+
+
+def _clear_failed_symbols(symbols: List[str]):
+    """清除成功拉取的 symbol 的失败记录"""
+    if not symbols:
+        return
+    with _failed_lock:
+        for s in symbols:
+            _failed_symbols.pop(s, None)
+
 
 # ─── 工具函数 ───────────────────────────────────────────────────────
 
@@ -290,6 +337,30 @@ class KlineCacheManager:
         except Exception:
             return set()
 
+    @staticmethod
+    def clear_failed(symbols: Optional[List[str]] = None):
+        """清除失败 symbol 记录，允许重新拉取。
+
+        Args:
+            symbols: 要清除的 symbol 列表。None 表示清除全部。
+        """
+        with _failed_lock:
+            if symbols is None:
+                count = len(_failed_symbols)
+                _failed_symbols.clear()
+                logger.info(f"[KlineCache] 清除全部 {count} 条失败记录")
+            else:
+                for s in symbols:
+                    _failed_symbols.pop(s, None)
+                logger.info(f"[KlineCache] 清除 {len(symbols)} 条失败记录")
+
+    @staticmethod
+    def get_failed_info() -> Dict[str, float]:
+        """获取当前失败 symbol 及其冷却剩余秒数（供调试/监控用）"""
+        now = time.time()
+        with _failed_lock:
+            return {s: max(0, ts + 6 * 3600 - now) for s, ts in _failed_symbols.items()}
+
     def is_stale(self, tf: str) -> bool:
         """根据交易日历判断缓存是否过期。
 
@@ -431,15 +502,21 @@ class KlineCacheManager:
         symbols = list(dict.fromkeys(s.strip() for s in symbols if s.strip()))
         logger.info(f"[KlineCache] 全量拉取 {tf} {len(symbols)} 只股票（去重后）")
 
-        # 2) 读已有 feather，算出缺失的 symbol
+        # 2) 读已有 feather，算出缺失的 symbol，排除冷却期内失败的
         cached = self.get_cached_symbols(tf)
-        missing = [s for s in symbols if s not in cached]
+        failed = _get_failed_symbols(tf)
+        missing = [s for s in symbols if s not in cached and s not in failed]
 
         if not missing:
-            logger.info(f"[KlineCache] {tf} 所有 {len(symbols)} 只已在缓存中，无需拉取")
+            if failed:
+                logger.info(f"[KlineCache] {tf} 缓存已有 {len(cached)} 只，"
+                            f"{len(failed)} 只在冷却期内跳过，无需拉取")
+            else:
+                logger.info(f"[KlineCache] {tf} 所有 {len(symbols)} 只已在缓存中，无需拉取")
             return True
 
-        logger.info(f"[KlineCache] {tf} 缓存已有 {len(cached)} 只，需拉取 {len(missing)} 只")
+        logger.info(f"[KlineCache] {tf} 缓存已有 {len(cached)} 只，"
+                     f"冷却期跳过 {len(failed)} 只，需拉取 {len(missing)} 只")
 
         # 过滤当前未确认周期：今日/本周/本月的 K 线是聚合数据，不进缓存
         # 缓存只存已完成的周期，当前周期在 serve 时实时合成
@@ -467,6 +544,9 @@ class KlineCacheManager:
                 self._concurrent_fetch_klines(market, batch_missed, tf, limit, fetch_func)
             )
 
+        # 过滤掉空列表（batch API 可能返回 {sym: []}，不算成功）
+        raw_data = {s: b for s, b in raw_data.items() if b}
+
         fetched_rows: List[Dict[str, Any]] = []
         fetched_symbols: List[str] = []
 
@@ -478,6 +558,13 @@ class KlineCacheManager:
                 row["symbol"] = sym
                 fetched_rows.append(row)
             fetched_symbols.append(sym)
+
+        # 记录失败 symbol（在 missing 中但未成功拉取的），避免无限重试
+        failed_this_round = [s for s in missing if s not in fetched_symbols]
+        if failed_this_round:
+            _record_failed_symbols(failed_this_round)
+        # 清除本次成功拉取的 symbol 的失败记录（如有）
+        _clear_failed_symbols(fetched_symbols)
 
         fail_count = len(missing) - len(fetched_symbols)
 
@@ -514,10 +601,11 @@ class KlineCacheManager:
 
     def _incremental_fetch(self, tf, symbols, fetch_func, market, batch_fetch_func=None):
         cached = self.get_cached_symbols(tf)
-        missing = [s for s in symbols if s not in cached]
+        failed = _get_failed_symbols(tf)
+        missing = [s for s in symbols if s not in cached and s not in failed]
 
         if not missing:
-            logger.debug(f"[KlineCache] {tf} 缓存完整，无需拉取")
+            logger.debug(f"[KlineCache] {tf} 缓存完整（{len(failed)} 只冷却期跳过），无需拉取")
             return True
 
         limit = {"1D": DAILY_LIMIT, "1M": MONTHLY_LIMIT}.get(tf, DAILY_LIMIT)
@@ -548,6 +636,9 @@ class KlineCacheManager:
                 self._concurrent_fetch_klines(market, batch_missed, tf, limit, fetch_func)
             )
 
+        # 过滤掉空列表（batch API 可能返回 {sym: []}，不算成功）
+        raw_data = {s: b for s, b in raw_data.items() if b}
+
         fetched_rows: List[Dict[str, Any]] = []
         fetched_symbols: List[str] = []
 
@@ -559,6 +650,12 @@ class KlineCacheManager:
                 row["symbol"] = sym
                 fetched_rows.append(row)
             fetched_symbols.append(sym)
+
+        # 记录失败 symbol，避免无限重试
+        failed_this_round = [s for s in missing if s not in fetched_symbols]
+        if failed_this_round:
+            _record_failed_symbols(failed_this_round)
+        _clear_failed_symbols(fetched_symbols)
 
         fail_count = len(missing) - len(fetched_symbols)
 
