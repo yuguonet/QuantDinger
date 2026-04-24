@@ -460,12 +460,8 @@ class KlineCacheManager:
                 tf, limit = "1m", 100
             elif elapsed_min < 30:
                 tf, limit = "5m", 100
-            elif elapsed_min < 120:
-                tf, limit = "15m", 100
-            elif elapsed_min < 240:
-                tf, limit = "30m", 50
             else:
-                tf, limit = "1H", 20
+                tf, limit = "15m", 100
 
             bars = fetch_func(market, symbol, tf, limit)
             if not bars:

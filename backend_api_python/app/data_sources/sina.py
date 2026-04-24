@@ -63,11 +63,11 @@ def _sina_code_from_cn(symbol: str) -> str:
     if s.endswith(".BJ"):
         return "bj" + s[:s.rfind(".")]
     if s.isdigit() and len(s) == 6:
-        # 沪市：60x / 688 / 900
-        if s.startswith(("600", "601", "603", "605", "688", "900")):
+        # 沪市：60x / 688 / 689 / 900
+        if s.startswith(("600", "601", "603", "605", "688", "689", "900")):
             return "sh" + s
-        # 深市：00x / 300 / 200
-        if s.startswith(("000", "001", "002", "003", "300", "200")):
+        # 深市：00x / 300 / 301 / 200
+        if s.startswith(("000", "001", "002", "003", "300", "301", "200")):
             return "sz" + s
         # 北证：43 / 82 / 83 / 87 / 88
         if s.startswith(("43", "82", "83", "87", "88")):
