@@ -2,14 +2,17 @@
 """
 K线 Feather 缓存管理器
 
-按日/月分别存储 K 线数据为本地 feather 文件（周线由日线实时聚合）。
+仅缓存日线数据（周线/月线由日线实时聚合）。
+
+存储布局（每只股票独立一个文件）：
+  data/kline_cache/1D/{market}_{symbol}.feather
 
 核心特性：
   - 惰性加载：优先读本地 feather 缓存，缓存未命中才走远程
   - 增量更新：只拉取缺失的股票，完全过期才全量拉取
   - 批量预热：遍历所有用户自选股去重后批量拉取
   - 市场时段合成：用 1m/5m/15m/30m/1H 合成当日未完成 K 线
-  - 预热频率：日线1天1次 / 月线1月1次
+  - 周线/月线由日线缓存实时聚合，不单独存储
 """
 
 import os
@@ -26,7 +29,6 @@ import pyarrow.feather as feather
 from app.utils.logger import get_logger
 from app.interfaces.trading_calendar import (
     is_trading_day_today,
-    is_trading_day,
     prev_trading_day,
 )
 
@@ -35,26 +37,19 @@ logger = get_logger(__name__)
 # ─── 常量 ───────────────────────────────────────────────────────────
 
 DAILY_LIMIT = 1500       # 日线：约 5 年
-MONTHLY_LIMIT = 240      # 月线：约 20 年
-
-STALE_THRESHOLD = {
-    "1D": 1 * 86400,
-    "1M": 30 * 86400,
-}
+MONTHLY_LIMIT = 240      # 月线聚合：约 20 年
 
 KLINE_COLUMNS = ["time", "open", "high", "low", "close", "volume"]
-VALID_TIMEFRAMES = {"1D", "1M"}
+VALID_TIMEFRAMES = {"1D"}
 
-# 预热锁：独立于文件锁，避免预热期间阻塞读操作
+# 预热锁：防止并发预热
 _prewarm_lock = threading.Lock()
 
 # 失败 symbol 记录：{symbol: 失败时间戳}，避免无限重试拉取失败的股票
-# 在预热周期内（日线 1 天 / 月线 1 月），失败的 symbol 不再重试
 _failed_symbols: Dict[str, float] = {}
 _failed_lock = threading.Lock()
 FAILED_COOLDOWN = {
     "1D": 6 * 3600,    # 日线失败后冷却 6 小时
-    "1M": 7 * 86400,   # 月线失败后冷却 7 天
 }
 
 
@@ -144,6 +139,11 @@ def _bar_field(bar: Dict[str, Any], field: str, default: float = 0.0) -> float:
         return default
 
 
+def _sanitize_symbol(symbol: str) -> str:
+    """将 symbol 中不适合做文件名的字符替换为下划线"""
+    return symbol.replace("/", "_").replace("\\", "_").replace(":", "_").replace(" ", "_")
+
+
 # ─── 聚合函数（不修改原列表） ───────────────────────────────────────
 
 def aggregate_daily_to_monthly(daily_bars: List[Dict[str, Any]], limit: int = MONTHLY_LIMIT) -> List[Dict[str, Any]]:
@@ -181,57 +181,44 @@ def aggregate_daily_to_monthly(daily_bars: List[Dict[str, Any]], limit: int = MO
 
 class KlineCacheManager:
     """
-    K线本地 feather 缓存管理器。
+    K线本地 feather 缓存管理器（仅日线，每只股票独立一个文件）。
 
     文件布局：
-      kline_1D_{YYYY-MM-DD}.feather   日线快照
-      kline_1M_{YYYY-MM-DD}.feather   月线快照
+      {data_dir}/1D/{market}_{symbol}.feather
+
+    周线/月线由日线缓存实时聚合，不单独存储。
+    无 market 的股票不写入缓存，仅记录日志。
 
     锁策略：
-      _file_lock  — 保护文件读写（短期持有）
-      _prewarm_lock（模块级） — 保护预热流程（长期持有，不阻塞读）
+      _prewarm_lock（模块级） — 保护预热流程，不阻塞读操作
+      无需文件级锁 — 每只股票独立文件，原子写入天然无竞态
     """
 
     def __init__(self, data_dir: Optional[str] = None):
         self.data_dir = data_dir or os.path.join(os.getcwd(), "data", "kline_cache")
-        os.makedirs(self.data_dir, exist_ok=True)
-        self._file_lock = threading.Lock()
+        os.makedirs(os.path.join(self.data_dir, "1D"), exist_ok=True)
 
     # ═══════════════════════════════════════════════════════════════════
     #  文件路径 & 读写
     # ═══════════════════════════════════════════════════════════════════
 
-    def _feather_path(self, tf: str, date_str: str) -> str:
-        return os.path.join(self.data_dir, f"kline_{tf}_{date_str}.feather")
+    def _feather_path(self, tf: str, market: str, symbol: str) -> str:
+        """获取单只股票的 feather 文件路径: {data_dir}/{tf}/{market}_{symbol}.feather"""
+        safe_symbol = _sanitize_symbol(symbol)
+        safe_market = _sanitize_symbol(market)
+        return os.path.join(self.data_dir, tf, f"{safe_market}_{safe_symbol}.feather")
 
-    def _list_feather_files(self, tf: str) -> List[str]:
-        """安全列出指定周期的 feather 文件名"""
-        prefix = f"kline_{tf}_"
+    def _list_symbol_files(self, tf: str) -> List[str]:
+        """列出指定 timeframe 下的所有 feather 文件名"""
+        tf_dir = os.path.join(self.data_dir, tf)
         try:
-            return [f for f in os.listdir(self.data_dir)
-                    if f.startswith(prefix) and f.endswith(".feather")]
+            return [f for f in os.listdir(tf_dir) if f.endswith(".feather")]
         except OSError as e:
-            logger.warning(f"[KlineCache] 列目录失败 {self.data_dir}: {e}")
+            logger.warning(f"[KlineCache] 列目录失败 {tf_dir}: {e}")
             return []
 
-    def _find_latest_file(self, tf: str) -> Optional[str]:
-        best_date, best_path = "", None
-        for fname in self._list_feather_files(tf):
-            d = fname[len(f"kline_{tf}_"):-8]
-            if d > best_date:
-                best_date = d
-                best_path = os.path.join(self.data_dir, fname)
-        return best_path
-
-    def _find_latest_date(self, tf: str) -> Optional[str]:
-        best = ""
-        for fname in self._list_feather_files(tf):
-            d = fname[len(f"kline_{tf}_"):-8]
-            if d > best:
-                best = d
-        return best or None
-
     def _read_feather(self, path: str) -> pd.DataFrame:
+        """读取 feather 文件，带容错恢复"""
         if not path or not os.path.exists(path):
             return pd.DataFrame()
         try:
@@ -250,12 +237,8 @@ class KlineCacheManager:
                     pass
             return pd.DataFrame()
 
-    def _read_latest(self, tf: str) -> pd.DataFrame:
-        return self._read_feather(self._find_latest_file(tf))
-
-    def _write_feather(self, tf: str, date_str: str, df: pd.DataFrame):
-        """原子写入（先备份 → 写 tmp → 验证 → rename）。调用方需确保线程安全。"""
-        path = self._feather_path(tf, date_str)
+    def _write_feather(self, path: str, df: pd.DataFrame):
+        """原子写入单只股票的 feather 文件（先备份 → 写 tmp → 验证 → rename）。"""
         bak = path + ".bak"
         tmp = path + f".tmp.{os.getpid()}.{int(time.time()*1000)}"
 
@@ -278,7 +261,6 @@ class KlineCacheManager:
                 raise ve
 
             os.replace(tmp, path)
-            self._cleanup_old(tf, keep=3)
 
         except Exception as e:
             logger.error(f"[KlineCache] 写入失败 {path}: {e}")
@@ -293,57 +275,44 @@ class KlineCacheManager:
                 except OSError:
                     pass
 
-    def _cleanup_old(self, tf: str, keep: int = 3):
-        files = []
-        for fname in self._list_feather_files(tf):
-            fpath = os.path.join(self.data_dir, fname)
-            try:
-                files.append((os.path.getmtime(fpath), fpath))
-            except OSError:
-                continue
-        files.sort(reverse=True)
-        for _, fpath in files[keep:]:
-            try:
-                os.remove(fpath)
-            except OSError:
-                pass
-
     # ═══════════════════════════════════════════════════════════════════
-    #  缓存查询（只读，不持锁 — 依赖原子文件操作）
+    #  缓存查询（只读，依赖原子文件操作）
     # ═══════════════════════════════════════════════════════════════════
 
-    def get_cached(self, tf: str, symbol: str) -> Optional[List[Dict[str, Any]]]:
+    def get_cached(self, tf: str, symbol: str, market: str = "") -> Optional[List[Dict[str, Any]]]:
+        """读取单只股票的缓存（直接读对应文件，无需全量过滤）"""
         if tf not in VALID_TIMEFRAMES:
             return None
-        df = self._read_latest(tf)
-        if df.empty or "symbol" not in df.columns:
+        if not market:
+            return None
+        path = self._feather_path(tf, market, symbol)
+        df = self._read_feather(path)
+        if df.empty:
             return None
         try:
-            sym_df = df[df["symbol"] == symbol].sort_values("time")
+            for col in KLINE_COLUMNS:
+                if col not in df.columns:
+                    df[col] = 0
+            return df[KLINE_COLUMNS].to_dict("records")
         except Exception:
             return None
-        if sym_df.empty:
-            return None
-        return sym_df[KLINE_COLUMNS].to_dict("records")
 
     def get_cached_symbols(self, tf: str) -> Set[str]:
+        """获取指定 timeframe 下已缓存的所有 symbol（从文件名解析）"""
         if tf not in VALID_TIMEFRAMES:
             return set()
-        df = self._read_latest(tf)
-        if df.empty or "symbol" not in df.columns:
-            return set()
-        try:
-            return set(df["symbol"].dropna().unique())
-        except Exception:
-            return set()
+        symbols = set()
+        for fname in self._list_symbol_files(tf):
+            # 格式: {market}_{symbol}.feather
+            name = fname[:-8]  # 去掉 .feather
+            parts = name.split("_", 1)
+            if len(parts) == 2:
+                symbols.add(parts[1])  # symbol 部分
+        return symbols
 
     @staticmethod
     def clear_failed(symbols: Optional[List[str]] = None):
-        """清除失败 symbol 记录，允许重新拉取。
-
-        Args:
-            symbols: 要清除的 symbol 列表。None 表示清除全部。
-        """
+        """清除失败 symbol 记录，允许重新拉取。"""
         with _failed_lock:
             if symbols is None:
                 count = len(_failed_symbols)
@@ -361,64 +330,46 @@ class KlineCacheManager:
         with _failed_lock:
             return {s: max(0, ts + 6 * 3600 - now) for s, ts in _failed_symbols.items()}
 
-    def is_stale(self, tf: str) -> bool:
-        """根据交易日历判断缓存是否过期。
-
-        缓存只存已完成周期的数据，当前周期永远在 serve 时实时合成。
+    def is_stale(self, tf: str, symbol: str, market: str) -> bool:
+        """根据文件修改时间和交易日历判断单只股票的日线缓存是否过期。
 
         日线：
-          - 缓存日期 < 上一个交易日 → 过期（缺上一个交易日的数据）
-          - 缓存是今天盘中建的（mtime < 15:00），现在已收盘 → 过期
-            （盘中建的缓存过滤了当日数据，盘后需重建以包含当日确认数据）
-
-        月线：缓存日期 < 本月最后一个已过交易日 → 过期（当前月实时合成）
+          - 文件不存在 → 过期
+          - 文件 mtime < 上一个交易日收盘时间 → 过期
+          - 盘中建的文件（mtime < 15:00），当前已收盘 → 过期
         """
-        if tf not in VALID_TIMEFRAMES:
+        if tf != "1D":
             return True
-        cached_date = self._find_latest_date(tf)
-        if not cached_date:
+        if not market:
             return True
 
-        if tf == "1D":
-            if cached_date < prev_trading_day():
-                return True
-            # 盘中建的缓存，盘后需刷新以包含当日确认数据
-            try:
-                latest_file = self._find_latest_file(tf)
-                if latest_file:
-                    mtime = datetime.fromtimestamp(
-                        os.path.getmtime(latest_file),
-                        tz=timezone(timedelta(hours=8))
-                    )
-                    now = datetime.now(timezone(timedelta(hours=8)))
-                    from datetime import time as dt_time
-                    if (mtime.strftime("%Y-%m-%d") == _today_str()
-                            and mtime.time() < dt_time(15, 0)
-                            and now.time() >= dt_time(15, 0)):
-                        return True
-            except Exception:
-                pass
-            return False
+        path = self._feather_path(tf, market, symbol)
+        if not os.path.exists(path):
+            return True
 
-        if tf == "1M":
-            try:
-                now = datetime.now(timezone(timedelta(hours=8)))
-                month_start = now.replace(day=1).strftime("%Y-%m-%d")
-                d = now.strftime("%Y-%m-%d")
-                while d >= month_start:
-                    if is_trading_day(d):
-                        return cached_date < d
-                    d = (datetime.strptime(d, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
-                return True
-            except Exception:
-                return True
-
-        # fallback
         try:
-            cached_ts = _ts_from_date(cached_date)
-        except Exception:
+            mtime_dt = datetime.fromtimestamp(
+                os.path.getmtime(path),
+                tz=timezone(timedelta(hours=8))
+            )
+            mtime_date = mtime_dt.strftime("%Y-%m-%d")
+        except OSError:
             return True
-        return (_now_ts() - cached_ts) > STALE_THRESHOLD.get(tf, 86400)
+
+        last_td = prev_trading_day()
+        if mtime_date < last_td:
+            return True
+        # 盘中建的文件，盘后需刷新以包含当日确认数据
+        try:
+            now = datetime.now(timezone(timedelta(hours=8)))
+            from datetime import time as dt_time
+            if (mtime_date == _today_str()
+                    and mtime_dt.time() < dt_time(15, 0)
+                    and now.time() >= dt_time(15, 0)):
+                return True
+        except Exception:
+            pass
+        return False
 
     # ═══════════════════════════════════════════════════════════════════
     #  预热核心（使用 _prewarm_lock，不阻塞读操作）
@@ -437,13 +388,13 @@ class KlineCacheManager:
             return False
         if not all_symbols:
             return False
+        if not market:
+            logger.warning(f"[KlineCache] 预热跳过: 无 market 信息")
+            return False
 
         # 预热锁：防止并发预热，但不阻塞 get_cached 读操作
         with _prewarm_lock:
-            if self.is_stale(tf):
-                return self._full_fetch(tf, all_symbols, fetch_func, market, batch_fetch_func)
-            else:
-                return self._incremental_fetch(tf, all_symbols, fetch_func, market, batch_fetch_func)
+            return self._fetch_missing(tf, all_symbols, fetch_func, market, batch_fetch_func)
 
     def _concurrent_fetch_klines(
         self,
@@ -454,11 +405,7 @@ class KlineCacheManager:
         fetch_func,
         max_workers: int = 8,
     ) -> Dict[str, List[Dict[str, Any]]]:
-        """并发拉取多只股票 K 线（ThreadPoolExecutor）。
-
-        当数据源不支持批量 API 时，用并发替代串行逐只拉取，
-        显著减少总耗时（8 只并发 ≈ 串行 1/8 时间）。
-        """
+        """并发拉取多只股票 K 线（ThreadPoolExecutor）。"""
         if not symbols:
             return {}
 
@@ -495,220 +442,105 @@ class KlineCacheManager:
         )
         return result
 
-    def _full_fetch(self, tf, symbols, fetch_func, market, batch_fetch_func=None):
-        limit = {"1D": DAILY_LIMIT, "1M": MONTHLY_LIMIT}.get(tf, DAILY_LIMIT)
+    def _fetch_missing(self, tf, symbols, fetch_func, market, batch_fetch_func=None):
+        """统一拉取逻辑：按 symbol 独立判断过期 → 拉取日线 → 写入各自文件。"""
+        limit = DAILY_LIMIT
 
-        # 1) 去重：同一市场只保留唯一 symbol
+        # 1) 去重
         symbols = list(dict.fromkeys(s.strip() for s in symbols if s.strip()))
-        logger.info(f"[KlineCache] 全量拉取 {tf} {len(symbols)} 只股票（去重后）")
 
-        # 2) 读已有 feather，算出缺失的 symbol，排除冷却期内失败的
-        cached = self.get_cached_symbols(tf)
+        # 2) 过滤：排除冷却期内失败的；排除有新鲜缓存的
         failed = _get_failed_symbols(tf)
-        missing = [s for s in symbols if s not in cached and s not in failed]
+        to_fetch: List[str] = []
+        for sym in symbols:
+            if sym in failed:
+                continue
+            if self.is_stale(tf, sym, market):
+                to_fetch.append(sym)
 
-        if not missing:
-            if failed:
-                logger.info(f"[KlineCache] {tf} 缓存已有 {len(cached)} 只，"
-                            f"{len(failed)} 只在冷却期内跳过，无需拉取")
-            else:
-                logger.info(f"[KlineCache] {tf} 所有 {len(symbols)} 只已在缓存中，无需拉取")
+        if not to_fetch:
+            logger.debug(f"[KlineCache] {tf} 所有 {len(symbols)} 只缓存新鲜，无需拉取")
             return True
 
-        logger.info(f"[KlineCache] {tf} 缓存已有 {len(cached)} 只，"
-                     f"冷却期跳过 {len(failed)} 只，需拉取 {len(missing)} 只")
+        logger.info(f"[KlineCache] 需拉取 {tf} {len(to_fetch)}/{len(symbols)} 只: {to_fetch[:5]}{'...' if len(to_fetch) > 5 else ''}")
 
-        # 过滤当前未确认周期：今日/本周/本月的 K 线是聚合数据，不进缓存
-        # 缓存只存已完成的周期，当前周期在 serve 时实时合成
-        now = datetime.now(timezone(timedelta(hours=8)))
-        if tf == "1D":
-            cutoff = _ts_from_date(_today_str())
-        elif tf == "1M":
-            cutoff = _month_start(int(now.timestamp()))
-        else:
-            cutoff = 0
+        # 过滤当日未确认数据（当日 K 线在 serve 时实时合成）
+        cutoff = _ts_from_date(_today_str())
 
-        # 3) 批量拉取缺失的 symbol：batch API → 并发逐只
+        # 3) 批量拉取：batch API → 并发逐只
         raw_data: Dict[str, List[Dict[str, Any]]] = {}
         if batch_fetch_func:
             try:
-                raw_data = batch_fetch_func(market, missing, tf, limit, cached)
+                raw_data = batch_fetch_func(market, to_fetch, tf, limit)
             except Exception as e:
                 logger.warning(f"[KlineCache] batch_fetch_func 失败，降级并发: {e}")
 
-        # batch 未覆盖的 symbol，用并发补拉
-        batch_missed = [s for s in missing if s not in raw_data]
+        batch_missed = [s for s in to_fetch if s not in raw_data]
         if batch_missed:
             logger.info(f"[KlineCache] batch 未覆盖 {len(batch_missed)} 只，并发补拉")
             raw_data.update(
                 self._concurrent_fetch_klines(market, batch_missed, tf, limit, fetch_func)
             )
 
-        # 过滤掉空列表（batch API 可能返回 {sym: []}，不算成功）
         raw_data = {s: b for s, b in raw_data.items() if b}
 
-        fetched_rows: List[Dict[str, Any]] = []
-        fetched_symbols: List[str] = []
-
+        # 4) 逐只写入各自文件
+        success_count = 0
         for sym, bars in raw_data.items():
+            filtered = []
             for bar in bars:
                 if cutoff and bar.get("time", 0) >= cutoff:
                     continue
                 row = {k: bar.get(k, 0) for k in KLINE_COLUMNS}
-                row["symbol"] = sym
-                fetched_rows.append(row)
-            fetched_symbols.append(sym)
+                filtered.append(row)
 
-        # 记录失败 symbol（在 missing 中但未成功拉取的），避免无限重试
-        failed_this_round = [s for s in missing if s not in fetched_symbols]
-        if failed_this_round:
-            _record_failed_symbols(failed_this_round)
-        # 清除本次成功拉取的 symbol 的失败记录（如有）
-        _clear_failed_symbols(fetched_symbols)
+            if not filtered:
+                continue
 
-        fail_count = len(missing) - len(fetched_symbols)
+            df = pd.DataFrame(filtered)
+            for col in KLINE_COLUMNS:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        if not fetched_rows:
-            logger.warning(f"[KlineCache] 全量拉取 {tf} 无新数据 (失败 {fail_count} 只)")
-            # 有旧缓存就继续用，没有就返回失败
-            return len(cached) > 0
-
-        new_df = pd.DataFrame(fetched_rows)
-        for col in KLINE_COLUMNS:
-            if col in new_df.columns:
-                new_df[col] = pd.to_numeric(new_df[col], errors="coerce")
-        new_df["symbol"] = new_df["symbol"].astype(str)
-
-        # 4) 合并：读已有 → 去掉本次已拉的 → 拼接新数据 → 写回
-        with self._file_lock:
-            existing_df = self._read_latest(tf)
-            if not existing_df.empty and "symbol" in existing_df.columns:
-                if fetched_symbols:
-                    existing_df = existing_df[~existing_df["symbol"].isin(fetched_symbols)]
-                merged = pd.concat([existing_df, new_df], ignore_index=True)
-            else:
-                merged = new_df
-            merged = merged.drop_duplicates(subset=["time", "symbol"], keep="last")
-            merged = merged.sort_values(["symbol", "time"])
-            self._write_feather(tf, _today_str(), merged)
-
-        logger.info(
-            f"[KlineCache] 全量拉取 {tf} 完成: "
-            f"成功 {len(fetched_symbols)}/{len(missing)} 只, "
-            f"失败 {fail_count} 只, 缓存共 {len(merged)} 行"
-        )
-        return True
-
-    def _incremental_fetch(self, tf, symbols, fetch_func, market, batch_fetch_func=None):
-        cached = self.get_cached_symbols(tf)
-        failed = _get_failed_symbols(tf)
-        missing = [s for s in symbols if s not in cached and s not in failed]
-
-        if not missing:
-            logger.debug(f"[KlineCache] {tf} 缓存完整（{len(failed)} 只冷却期跳过），无需拉取")
-            return True
-
-        limit = {"1D": DAILY_LIMIT, "1M": MONTHLY_LIMIT}.get(tf, DAILY_LIMIT)
-        logger.info(f"[KlineCache] 增量拉取 {tf} {len(missing)} 只缺失股票")
-
-        # 过滤当前未确认周期：今日/本周/本月的 K 线是聚合数据，不进缓存
-        now = datetime.now(timezone(timedelta(hours=8)))
-        if tf == "1D":
-            cutoff = _ts_from_date(_today_str())
-        elif tf == "1M":
-            cutoff = _month_start(int(now.timestamp()))
-        else:
-            cutoff = 0
-
-        # 批量拉取缺失的 symbol：batch API → 并发逐只
-        raw_data: Dict[str, List[Dict[str, Any]]] = {}
-        if batch_fetch_func:
+            path = self._feather_path(tf, market, sym)
             try:
-                raw_data = batch_fetch_func(market, missing, tf, limit, cached)
+                self._write_feather(path, df)
+                success_count += 1
             except Exception as e:
-                logger.warning(f"[KlineCache] batch_fetch_func 失败，降级并发: {e}")
+                logger.error(f"[KlineCache] 写入 {sym} {tf} 失败: {e}")
 
-        # batch 未覆盖的 symbol，用并发补拉
-        batch_missed = [s for s in missing if s not in raw_data]
-        if batch_missed:
-            logger.info(f"[KlineCache] batch 未覆盖 {len(batch_missed)} 只，并发补拉")
-            raw_data.update(
-                self._concurrent_fetch_klines(market, batch_missed, tf, limit, fetch_func)
-            )
-
-        # 过滤掉空列表（batch API 可能返回 {sym: []}，不算成功）
-        raw_data = {s: b for s, b in raw_data.items() if b}
-
-        fetched_rows: List[Dict[str, Any]] = []
-        fetched_symbols: List[str] = []
-
-        for sym, bars in raw_data.items():
-            for bar in bars:
-                if cutoff and bar.get("time", 0) >= cutoff:
-                    continue
-                row = {k: bar.get(k, 0) for k in KLINE_COLUMNS}
-                row["symbol"] = sym
-                fetched_rows.append(row)
-            fetched_symbols.append(sym)
-
-        # 记录失败 symbol，避免无限重试
-        failed_this_round = [s for s in missing if s not in fetched_symbols]
+        # 记录失败 / 清除成功
+        fetched_symbols = set(raw_data.keys())
+        failed_this_round = [s for s in to_fetch if s not in fetched_symbols]
         if failed_this_round:
             _record_failed_symbols(failed_this_round)
-        _clear_failed_symbols(fetched_symbols)
+        _clear_failed_symbols(list(fetched_symbols))
 
-        fail_count = len(missing) - len(fetched_symbols)
-
-        if not fetched_rows:
-            logger.info(f"[KlineCache] 增量拉取 {tf} 无新数据 (失败 {fail_count} 只)")
-            return fail_count < len(missing)
-
-        new_df = pd.DataFrame(fetched_rows)
-        for col in KLINE_COLUMNS:
-            if col in new_df.columns:
-                new_df[col] = pd.to_numeric(new_df[col], errors="coerce")
-        new_df["symbol"] = new_df["symbol"].astype(str)
-
-        # 锁内：读 → 合并 → 写（原子操作，避免竞态）
-        with self._file_lock:
-            existing_df = self._read_latest(tf)
-            if not existing_df.empty and "symbol" in existing_df.columns:
-                if fetched_symbols:
-                    existing_df = existing_df[~existing_df["symbol"].isin(fetched_symbols)]
-                merged = pd.concat([existing_df, new_df], ignore_index=True)
-            else:
-                merged = new_df
-            merged = merged.drop_duplicates(subset=["time", "symbol"], keep="last")
-            merged = merged.sort_values(["symbol", "time"])
-            self._write_feather(tf, _today_str(), merged)
-
+        fail_count = len(to_fetch) - success_count
         logger.info(
-            f"[KlineCache] 增量拉取 {tf} 完成: "
-            f"成功 {len(fetched_symbols)}/{len(missing)} 只, "
-            f"失败 {fail_count} 只, {len(fetched_rows)} 行"
+            f"[KlineCache] 拉取 {tf} 完成: "
+            f"成功 {success_count}/{len(to_fetch)} 只, 失败 {fail_count} 只"
         )
-        return True
+        return success_count > 0
 
     # ═══════════════════════════════════════════════════════════════════
-    #  写入单只（降级用，线程安全）
+    #  写入单只（降级用）
     # ═══════════════════════════════════════════════════════════════════
 
-    def store_single(self, tf: str, symbol: str, bars: List[Dict[str, Any]]):
-        """将单只股票的 K 线写入缓存（预热失败降级用）。
+    def store_single(self, tf: str, market: str, symbol: str, bars: List[Dict[str, Any]]):
+        """将单只股票的日线 K 线写入缓存（预热失败降级用）。
 
-        过滤当前未确认周期：今日/本周/本月的 K 线是聚合数据，不进缓存。
+        过滤当日未确认数据：当日 K 线在 serve 时实时合成。
+        无 market 时不写入，仅记录日志。
         """
-        if not bars or tf not in VALID_TIMEFRAMES:
+        if not bars or tf != "1D":
+            return
+        if not market:
+            logger.warning(f"[KlineCache] 跳过写入 {symbol} {tf}: 无 market 信息")
             return
 
         try:
-            now = datetime.now(timezone(timedelta(hours=8)))
-            if tf == "1D":
-                cutoff = _ts_from_date(_today_str())
-            elif tf == "1M":
-                cutoff = _month_start(int(now.timestamp()))
-            else:
-                cutoff = 0
+            cutoff = _ts_from_date(_today_str())
         except Exception:
             return
 
@@ -722,26 +554,19 @@ class KlineCacheManager:
         new_rows = []
         for bar in bars_clean:
             row = {k: bar.get(k, 0) for k in KLINE_COLUMNS}
-            row["symbol"] = symbol
             new_rows.append(row)
-        new_df = pd.DataFrame(new_rows)
+
+        df = pd.DataFrame(new_rows)
         for col in KLINE_COLUMNS:
-            if col in new_df.columns:
-                new_df[col] = pd.to_numeric(new_df[col], errors="coerce")
-        new_df["symbol"] = new_df["symbol"].astype(str)
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        with self._file_lock:
-            existing_df = self._read_latest(tf)
-            if existing_df.empty or "symbol" not in existing_df.columns:
-                merged = new_df
-            else:
-                old_without = existing_df[existing_df["symbol"] != symbol]
-                merged = pd.concat([old_without, new_df], ignore_index=True)
-            merged = merged.drop_duplicates(subset=["time", "symbol"], keep="last")
-            merged = merged.sort_values(["symbol", "time"])
-            self._write_feather(tf, _today_str(), merged)
-
-        logger.debug(f"[KlineCache] 降级存入 {symbol} {tf} {len(bars_clean)} 行")
+        path = self._feather_path(tf, market, symbol)
+        try:
+            self._write_feather(path, df)
+            logger.debug(f"[KlineCache] 降级存入 {market}:{symbol} {tf} {len(bars_clean)} 行")
+        except Exception as e:
+            logger.error(f"[KlineCache] 降级写入 {market}:{symbol} {tf} 失败: {e}")
 
     # ═══════════════════════════════════════════════════════════════════
     #  市场时段合成当日 K 线
@@ -753,15 +578,17 @@ class KlineCacheManager:
         fetch_func,
         market: str = "CNStock",
     ) -> Optional[Dict[str, Any]]:
+        if not market:
+            return None
         if not _is_market_hours():
             return None
 
         try:
             now = datetime.now(timezone(timedelta(hours=8)))
-            market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+            market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
             elapsed_min = (now - market_open).total_seconds() / 60
 
-            # 午休时段（11:30-13:00）按上午收盘处理
+            # 午休时段（11:30-13:00）使用上午已有的分钟线合成
             if elapsed_min < 0:
                 return None
 
@@ -795,5 +622,5 @@ class KlineCacheManager:
                 "volume": round(sum(_bar_field(b, "volume") for b in today_bars), 2),
             }
         except Exception as e:
-            logger.warning(f"[KlineCache] 合成当日失败 {symbol}: {e}")
+            logger.warning(f"[KlineCache] 合成当日失败 {market}:{symbol}: {e}")
             return None

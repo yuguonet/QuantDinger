@@ -2,12 +2,13 @@
 K线数据服务
 
 核心改造：
-  - 日线/月线使用本地 feather 缓存（KlineCacheManager）
-  - 周线由日线实时聚合，不单独缓存
+  - 日线使用本地 feather 缓存（KlineCacheManager）
+  - 周线/月线由日线实时聚合，不单独缓存
   - 惰性加载：优先读本地缓存，缓存未命中触发预热
   - 预热：查自选股去重 → 比对缓存 → 全量或增量拉取
   - 降级：预热失败 → 单只拉取 → 去掉当日存入缓存
   - 市场时段：用分钟线合成当日未完成 K 线
+  - 闭市后到次日开盘前：日线缓存已包含当日确认数据，无需补齐
 """
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Any, Optional, Tuple
@@ -23,8 +24,8 @@ from app.services.kline_cache_manager import (
     _month_start,
     _bar_field,
     DAILY_LIMIT,
-    MONTHLY_LIMIT,
 )
+from app.interfaces.trading_calendar import is_trading_day_today
 from app.utils.cache import CacheManager
 from app.utils.logger import get_logger
 from app.config import CacheConfig
@@ -81,10 +82,12 @@ class KlineService:
         limit: int = 1000,
         before_time: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        # 周线：从日线实时聚合，不走缓存
+        # 周线/月线：从日线实时聚合，不走单独缓存
         if timeframe == "1W" and not before_time:
             return self._get_weekly_from_daily(market, symbol, limit)
-        if timeframe in ("1D", "1M") and not before_time:
+        if timeframe == "1M" and not before_time:
+            return self._get_monthly_from_daily(market, symbol, limit)
+        if timeframe == "1D" and not before_time:
             return self._get_cached_kline(market, symbol, timeframe, limit)
         return self._get_remote_kline(market, symbol, timeframe, limit, before_time)
 
@@ -154,8 +157,51 @@ class KlineService:
             })
         return result[-limit:] if len(result) > limit else result
 
+    # ── 月线：由日线实时聚合 ─────────────────────────────────────────
+
+    def _get_monthly_from_daily(
+        self, market: str, symbol: str, limit: int,
+    ) -> List[Dict[str, Any]]:
+        """月线由日线实时聚合（日线走缓存，月线不单独存储）
+
+        闭市后到次日开盘前：日线缓存已包含当日确认数据，聚合结果完整。
+        盘中：追加分钟线合成的当日未完成 K 线。
+        """
+        # 每月约 22 个交易日，多拉一些保证覆盖
+        daily_limit = min(limit * 22 + 50, DAILY_LIMIT)
+        daily = self.get_kline(market, symbol, "1D", daily_limit)
+        if not daily:
+            return []
+
+        monthly = aggregate_daily_to_monthly(daily, limit)
+
+        # 盘中：合成当日 K 线追加到当月
+        fetch = lambda m, s, t, l: DataSourceFactory.get_kline(m, s, t, l)
+        today_candle = self._kc.synthesize_today_candle(symbol, fetch, market)
+        if today_candle:
+            now_ts = today_candle["time"]
+            month_start = _month_start(now_ts)
+            historical = [b for b in monthly if b["time"] < month_start]
+            # 从日线取当月数据（daily 已含 _append_current 追加的当日 bar，需去重）
+            this_month = [b for b in daily if b["time"] >= month_start and b.get("time") != now_ts]
+            this_month.append(today_candle)
+            this_month.sort(key=lambda x: x["time"])
+            if this_month:
+                historical.append({
+                    "time": month_start,
+                    "open": _bar_field(this_month[0], "open"),
+                    "high": max(_bar_field(b, "high") for b in this_month),
+                    "low": min(_bar_field(b, "low") for b in this_month),
+                    "close": _bar_field(this_month[-1], "close"),
+                    "volume": round(sum(_bar_field(b, "volume") for b in this_month), 2),
+                })
+            historical.sort(key=lambda x: x["time"])
+            return historical[-limit:]
+
+        return monthly
+
     # ═══════════════════════════════════════════════════════════════════
-    #  日/周/月线：缓存优先
+    #  日线：缓存优先
     # ═══════════════════════════════════════════════════════════════════
 
     def _get_cached_kline(
@@ -169,7 +215,7 @@ class KlineService:
         fetch = lambda m, s, t, l: DataSourceFactory.get_kline(m, s, t, l)
 
         # 1) 读缓存
-        cached = self._kc.get_cached(tf, symbol)
+        cached = self._kc.get_cached(tf, symbol, market)
         if cached:
             return self._serve(symbol, tf, limit, cached, market, fetch)
 
@@ -178,7 +224,7 @@ class KlineService:
         warmed = self._try_prewarm(market, symbol, tf, fetch)
 
         if warmed:
-            cached = self._kc.get_cached(tf, symbol)
+            cached = self._kc.get_cached(tf, symbol, market)
             if cached:
                 return self._serve(symbol, tf, limit, cached, market, fetch)
 
@@ -186,7 +232,7 @@ class KlineService:
         logger.info(f"[KlineCache] 预热未覆盖 {symbol}，降级单只拉取")
         klines = fetch(market, symbol, tf, limit)
         if klines:
-            self._kc.store_single(tf, symbol, klines)
+            self._kc.store_single(tf, market, symbol, klines)
 
         today_candle = self._kc.synthesize_today_candle(symbol, fetch, market)
         return self._append_current(tf, klines or [], today_candle, symbol, market, fetch, limit)
@@ -197,14 +243,15 @@ class KlineService:
         """
         触发全市场预热：遍历所有自选股市场，逐市场批量拉取。
 
-        日线：1天1次全量 / 增量缺失
-        月线：1月1次全量 / 增量缺失
-
+        仅预热日线缓存（周线/月线由日线实时聚合）。
         批量拉取优先级高于单只拉取：一次遍历所有市场，全部预热。
         返回当前请求的 market 是否预热成功。
         """
         if not market:
             return False
+
+        # 周线/月线的预热实际只预热日线
+        cache_tf = "1D"
 
         # 一次查出所有市场的自选股
         all_by_market = self._get_all_watchlist_symbols_by_market()
@@ -233,7 +280,7 @@ class KlineService:
         current_ok = False
         for mkt, syms in all_by_market.items():
             logger.info(f"[KlineCache] 预热 {mkt} {len(syms)} 只: {syms[:5]}{'...' if len(syms) > 5 else ''}")
-            ok = self._kc.prewarm(tf, syms, fetch, mkt, batch_fetch_func=batch_fetch)
+            ok = self._kc.prewarm(cache_tf, syms, fetch, mkt, batch_fetch_func=batch_fetch)
             if mkt == market:
                 current_ok = ok
 
@@ -250,9 +297,11 @@ class KlineService:
             from app.utils.db import get_db_connection
             with get_db_connection() as conn:
                 cur = conn.cursor()
-                cur.execute("SELECT market, symbol FROM qd_watchlist WHERE market IS NOT NULL AND symbol IS NOT NULL")
-                rows = cur.fetchall() or []
-                cur.close()
+                try:
+                    cur.execute("SELECT market, symbol FROM qd_watchlist WHERE market IS NOT NULL AND symbol IS NOT NULL")
+                    rows = cur.fetchall() or []
+                finally:
+                    cur.close()
             result: Dict[str, List[str]] = {}
             for r in rows:
                 mkt = (r.get('market') or '').strip()
@@ -279,47 +328,62 @@ class KlineService:
         return self._append_current(tf, cached, today_candle, symbol, market, fetch, limit)
 
     def _append_current(self, tf, bars, today_candle, symbol, market, fetch, limit):
-        """追加合成当前周期（盘中去重，避免当日 K 线重复）"""
+        """追加当日 K 线（盘中合成 / 闭市后取远程已完成 bar）"""
         if tf == "1D":
             result = list(bars)
             if today_candle:
                 today_ts = today_candle["time"]
-                # 去掉已有当日 bar（_full_fetch 盘中可能已写入），再追加最新合成
                 result = [b for b in result if b.get("time") != today_ts]
                 result.append(today_candle)
+            else:
+                # 盘中 synthesize 无结果（闭市/午休/非交易日）→ 尝试取当日已完成 bar
+                completed = self._try_fetch_completed_bar(market, symbol, fetch)
+                if completed:
+                    today_ts = completed["time"]
+                    result = [b for b in result if b.get("time") != today_ts]
+                    result.append(completed)
             result.sort(key=lambda x: x["time"])
             return result[-limit:]
 
-        if tf == "1M":
-            return self._append_current_month(bars, today_candle, symbol, market, fetch, limit)
-
         return bars[-limit:]
 
-    def _append_current_month(self, cached_monthly, today_candle, symbol, market, fetch, limit):
-        now_ts = today_candle["time"] if today_candle else int(
-            datetime.now(timezone(timedelta(hours=8))).timestamp()
-        )
-        month_start = _month_start(now_ts)
-        historical = [b for b in cached_monthly if b["time"] < month_start]
+    def _try_fetch_completed_bar(self, market, symbol, fetch):
+        """闭市后当日已完成日线（不存 feather，带内存缓存防重复调用）
 
-        daily = self._kc.get_cached("1D", symbol) or []
-        this_month = [b for b in daily if b["time"] >= month_start]
-        if today_candle:
-            this_month.append(today_candle)
+        判断逻辑：
+          - _is_market_hours() == False（盘中由 synthesize_today_candle 处理）
+          - is_trading_day_today() == True（非交易日不需要当日 bar）
+          - 非午休时段（11:30-13:00 半日数据不完整，由 synthesize 覆盖）
+          - 远程数据源已更新当日收盘数据（有 time == today_ts 的 bar）
+        """
+        if not market or _is_market_hours() or not is_trading_day_today():
+            return None
 
-        result = list(historical)
-        if this_month:
-            this_month.sort(key=lambda x: x["time"])
-            result.append({
-                "time": month_start,
-                "open": _bar_field(this_month[0], "open"),
-                "high": max(_bar_field(b, "high") for b in this_month),
-                "low": min(_bar_field(b, "low") for b in this_month),
-                "close": _bar_field(this_month[-1], "close"),
-                "volume": round(sum(_bar_field(b, "volume") for b in this_month), 2),
-            })
-        result.sort(key=lambda x: x["time"])
-        return result[-limit:]
+        # 午休时段不从远程取当日 bar（数据只有上午部分，不完整）
+        # synthesize_today_candle 已用上午分钟线合成，此处跳过
+        from datetime import time as dt_time
+        now = datetime.now(timezone(timedelta(hours=8)))
+        if dt_time(11, 30) < now.time() < dt_time(13, 0):
+            return None
+
+        today_ts = _ts_from_date(_today_str())
+        cache_key = f"today_completed:{market}:{symbol}"
+
+        cached = self.cache.get(cache_key)
+        if cached and cached.get("time") == today_ts:
+            return cached
+
+        try:
+            bars = fetch(market, symbol, "1D", 2)
+            if bars:
+                for b in bars:
+                    if b.get("time") == today_ts:
+                        self.cache.set(cache_key, b, 3600)
+                        return b
+        except Exception as e:
+            logger.debug(f"[Kline] 获取当日已完成 bar 失败 {market}:{symbol}: {e}")
+
+        return None
 
     # ═══════════════════════════════════════════════════════════════════
     #  统一预热入口（供 API 调用）
@@ -327,24 +391,22 @@ class KlineService:
 
     def prewarm_all(self, symbols: List[str], market: str = "CNStock") -> Dict[str, bool]:
         """
-        统一预热入口：日/月线各自独立预热（周线由日线实时聚合）。
+        统一预热入口：仅预热日线（周线/月线由日线实时聚合）。
 
         日线：1天1次
-        月线：1月1次
 
         Returns:
-            {"1D": True/False, "1M": True/False}
+            {"1D": True/False}
         """
         fetch = lambda m, s, tf, lim: DataSourceFactory.get_kline(m, s, tf, lim)
         batch_fetch = lambda m, syms, tf, lim, cs=None: DataSourceFactory.get_kline_batch(m, syms, tf, lim, cached_symbols=cs)
         results = {}
 
-        for tf in ("1D", "1M"):
-            try:
-                results[tf] = self._kc.prewarm(tf, symbols, fetch, market, batch_fetch_func=batch_fetch)
-            except Exception as e:
-                logger.warning(f"[KlineCache] 预热 {tf} 失败: {e}")
-                results[tf] = False
+        try:
+            results["1D"] = self._kc.prewarm("1D", symbols, fetch, market, batch_fetch_func=batch_fetch)
+        except Exception as e:
+            logger.warning(f"[KlineCache] 预热 1D 失败: {e}")
+            results["1D"] = False
 
         return results
 

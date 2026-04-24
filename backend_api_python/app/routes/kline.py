@@ -41,10 +41,10 @@ def get_kline():
     """
     try:
         market = request.args.get('market', '').strip()
-        if not market:
-            market = detect_market(symbol) or 'CNStock'
         symbol = request.args.get('symbol', '')
         timeframe = request.args.get('timeframe', '1D')
+        if not market:
+            market = detect_market(symbol) or 'CNStock'
         try:
             limit = min(int(request.args.get('limit', 1000)), KLINE_MAX_LIMIT)
         except (ValueError, TypeError):
