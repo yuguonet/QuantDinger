@@ -19,7 +19,6 @@ import os
 import shutil
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set
 
@@ -45,56 +44,8 @@ VALID_TIMEFRAMES = {"1D"}
 # 预热锁：防止并发预热
 _prewarm_lock = threading.Lock()
 
-# 失败 symbol 记录：{symbol: 失败时间戳}，避免无限重试拉取失败的股票
-_failed_symbols: Dict[str, float] = {}
-_failed_lock = threading.Lock()
-FAILED_COOLDOWN = {
-    "1D": 6 * 3600,    # 日线失败后冷却 6 小时
-}
-
-
-# ─── 失败 symbol 管理 ──────────────────────────────────────────────
-
-def _get_failed_symbols(tf: str) -> Set[str]:
-    """获取当前冷却期内的失败 symbol 集合"""
-    cooldown = FAILED_COOLDOWN.get(tf, 6 * 3600)
-    now = time.time()
-    with _failed_lock:
-        expired = [s for s, ts in _failed_symbols.items() if now - ts > cooldown]
-        for s in expired:
-            del _failed_symbols[s]
-        return set(_failed_symbols.keys())
-
-
-def _record_failed_symbols(symbols: List[str]):
-    """记录拉取失败的 symbol 及其时间戳"""
-    if not symbols:
-        return
-    now = time.time()
-    with _failed_lock:
-        for s in symbols:
-            _failed_symbols[s] = now
-        # 防止无限增长：超过 2000 条时清理最旧的
-        if len(_failed_symbols) > 2000:
-            sorted_items = sorted(_failed_symbols.items(), key=lambda x: x[1])
-            for s, _ in sorted_items[:len(sorted_items) // 2]:
-                del _failed_symbols[s]
-    logger.info(f"[KlineCache] 记录 {len(symbols)} 只失败 symbol（冷却期内不再重试）: {symbols[:10]}")
-
-
-def _clear_failed_symbols(symbols: List[str]):
-    """清除成功拉取的 symbol 的失败记录"""
-    if not symbols:
-        return
-    with _failed_lock:
-        for s in symbols:
-            _failed_symbols.pop(s, None)
-
 
 # ─── 工具函数 ───────────────────────────────────────────────────────
-
-def _now_ts() -> int:
-    return int(time.time())
 
 
 def _dt_from_ts(ts: int) -> datetime:
@@ -310,26 +261,6 @@ class KlineCacheManager:
                 symbols.add(parts[1])  # symbol 部分
         return symbols
 
-    @staticmethod
-    def clear_failed(symbols: Optional[List[str]] = None):
-        """清除失败 symbol 记录，允许重新拉取。"""
-        with _failed_lock:
-            if symbols is None:
-                count = len(_failed_symbols)
-                _failed_symbols.clear()
-                logger.info(f"[KlineCache] 清除全部 {count} 条失败记录")
-            else:
-                for s in symbols:
-                    _failed_symbols.pop(s, None)
-                logger.info(f"[KlineCache] 清除 {len(symbols)} 条失败记录")
-
-    @staticmethod
-    def get_failed_info() -> Dict[str, float]:
-        """获取当前失败 symbol 及其冷却剩余秒数（供调试/监控用）"""
-        now = time.time()
-        with _failed_lock:
-            return {s: max(0, ts + 6 * 3600 - now) for s, ts in _failed_symbols.items()}
-
     def is_stale(self, tf: str, symbol: str, market: str) -> bool:
         """根据文件修改时间和交易日历判断单只股票的日线缓存是否过期。
 
@@ -379,7 +310,6 @@ class KlineCacheManager:
         self,
         tf: str,
         all_symbols: List[str],
-        fetch_func,
         market: str = "CNStock",
         batch_fetch_func=None,
     ) -> bool:
@@ -394,69 +324,17 @@ class KlineCacheManager:
 
         # 预热锁：防止并发预热，但不阻塞 get_cached 读操作
         with _prewarm_lock:
-            return self._fetch_missing(tf, all_symbols, fetch_func, market, batch_fetch_func)
+            return self._fetch_missing(tf, all_symbols, market, batch_fetch_func)
 
-    def _concurrent_fetch_klines(
-        self,
-        market: str,
-        symbols: List[str],
-        tf: str,
-        limit: int,
-        fetch_func,
-        max_workers: int = 8,
-    ) -> Dict[str, List[Dict[str, Any]]]:
-        """并发拉取多只股票 K 线（ThreadPoolExecutor）。"""
-        if not symbols:
-            return {}
-
-        result: Dict[str, List[Dict[str, Any]]] = {}
-        workers = min(max_workers, len(symbols))
-        lock = threading.Lock()
-
-        def _fetch_one(sym: str) -> Optional[tuple]:
-            try:
-                bars = fetch_func(market, sym, tf, limit)
-                if bars:
-                    bars.sort(key=lambda x: x.get("time", 0))
-                    return (sym, bars)
-            except Exception as e:
-                logger.warning(f"[KlineCache] 并发拉取 {sym} {tf} 失败: {e}")
-            return None
-
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_fetch_one, sym): sym for sym in symbols}
-            for future in as_completed(futures):
-                try:
-                    res = future.result()
-                except Exception as e:
-                    logger.warning(f"[KlineCache] 并发 future 异常: {e}")
-                    continue
-                if res:
-                    sym, bars = res
-                    with lock:
-                        result[sym] = bars
-
-        logger.info(
-            f"[KlineCache] 并发拉取 {tf} 完成: "
-            f"{len(result)}/{len(symbols)} 只成功 (workers={workers})"
-        )
-        return result
-
-    def _fetch_missing(self, tf, symbols, fetch_func, market, batch_fetch_func=None):
+    def _fetch_missing(self, tf, symbols, market, batch_fetch_func=None):
         """统一拉取逻辑：按 symbol 独立判断过期 → 拉取日线 → 写入各自文件。"""
         limit = DAILY_LIMIT
 
         # 1) 去重
         symbols = list(dict.fromkeys(s.strip() for s in symbols if s.strip()))
 
-        # 2) 过滤：排除冷却期内失败的；排除有新鲜缓存的
-        failed = _get_failed_symbols(tf)
-        to_fetch: List[str] = []
-        for sym in symbols:
-            if sym in failed:
-                continue
-            if self.is_stale(tf, sym, market):
-                to_fetch.append(sym)
+        # 2) 过滤：排除有新鲜缓存的
+        to_fetch: List[str] = [sym for sym in symbols if self.is_stale(tf, sym, market)]
 
         if not to_fetch:
             logger.debug(f"[KlineCache] {tf} 所有 {len(symbols)} 只缓存新鲜，无需拉取")
@@ -467,20 +345,13 @@ class KlineCacheManager:
         # 过滤当日未确认数据（当日 K 线在 serve 时实时合成）
         cutoff = _ts_from_date(_today_str())
 
-        # 3) 批量拉取：batch API → 并发逐只
+        # 3) 拉取：统一走 batch_fetch_func（并发逻辑在 DataSourceFactory 里）
         raw_data: Dict[str, List[Dict[str, Any]]] = {}
         if batch_fetch_func:
             try:
                 raw_data = batch_fetch_func(market, to_fetch, tf, limit)
             except Exception as e:
-                logger.warning(f"[KlineCache] batch_fetch_func 失败，降级并发: {e}")
-
-        batch_missed = [s for s in to_fetch if s not in raw_data]
-        if batch_missed:
-            logger.info(f"[KlineCache] batch 未覆盖 {len(batch_missed)} 只，并发补拉")
-            raw_data.update(
-                self._concurrent_fetch_klines(market, batch_missed, tf, limit, fetch_func)
-            )
+                logger.warning(f"[KlineCache] batch_fetch_func 失败: {e}")
 
         raw_data = {s: b for s, b in raw_data.items() if b}
 
@@ -508,13 +379,6 @@ class KlineCacheManager:
                 success_count += 1
             except Exception as e:
                 logger.error(f"[KlineCache] 写入 {sym} {tf} 失败: {e}")
-
-        # 记录失败 / 清除成功
-        fetched_symbols = set(raw_data.keys())
-        failed_this_round = [s for s in to_fetch if s not in fetched_symbols]
-        if failed_this_round:
-            _record_failed_symbols(failed_this_round)
-        _clear_failed_symbols(list(fetched_symbols))
 
         fail_count = len(to_fetch) - success_count
         logger.info(

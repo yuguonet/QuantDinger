@@ -221,7 +221,7 @@ class KlineService:
 
         # 2) 缓存未命中 → 触发预热
         logger.info(f"[KlineCache] 缓存未命中 {symbol} {tf}，触发预热")
-        warmed = self._try_prewarm(market, symbol, tf, fetch)
+        warmed = self._try_prewarm(market, symbol, tf)
 
         if warmed:
             cached = self._kc.get_cached(tf, symbol, market)
@@ -239,7 +239,7 @@ class KlineService:
 
     # ── 预热 ─────────────────────────────────────────────────────────
 
-    def _try_prewarm(self, market: str, symbol: str, tf: str, fetch) -> bool:
+    def _try_prewarm(self, market: str, symbol: str, tf: str) -> bool:
         """
         触发全市场预热：遍历所有自选股市场，逐市场批量拉取。
 
@@ -280,7 +280,7 @@ class KlineService:
         current_ok = False
         for mkt, syms in all_by_market.items():
             logger.info(f"[KlineCache] 预热 {mkt} {len(syms)} 只: {syms[:5]}{'...' if len(syms) > 5 else ''}")
-            ok = self._kc.prewarm(cache_tf, syms, fetch, mkt, batch_fetch_func=batch_fetch)
+            ok = self._kc.prewarm(cache_tf, syms, mkt, batch_fetch_func=batch_fetch)
             if mkt == market:
                 current_ok = ok
 
@@ -398,12 +398,11 @@ class KlineService:
         Returns:
             {"1D": True/False}
         """
-        fetch = lambda m, s, tf, lim: DataSourceFactory.get_kline(m, s, tf, lim)
         batch_fetch = lambda m, syms, tf, lim, cs=None: DataSourceFactory.get_kline_batch(m, syms, tf, lim, cached_symbols=cs)
         results = {}
 
         try:
-            results["1D"] = self._kc.prewarm("1D", symbols, fetch, market, batch_fetch_func=batch_fetch)
+            results["1D"] = self._kc.prewarm("1D", symbols, market, batch_fetch_func=batch_fetch)
         except Exception as e:
             logger.warning(f"[KlineCache] 预热 1D 失败: {e}")
             results["1D"] = False

@@ -292,56 +292,6 @@ def _aggregate_daily_to_monthly(daily_bars: List[Dict[str, Any]], limit: int) ->
     return result[-limit:] if len(result) > limit else result
 
 
-def _concurrent_fetch_kline_batch(
-    source: "CNStockDataSource",
-    symbols: List[str],
-    tf: str,
-    limit: int,
-    today_bars: Dict[str, Dict[str, Any]],
-    result: Dict[str, List[Dict[str, Any]]],
-    max_workers: int = 8,
-) -> None:
-    """并发拉取多只股票的历史 K 线，合并当日行情后写入 result。"""
-    if not symbols:
-        return
-
-    workers = min(max_workers, len(symbols))
-    lock = threading.Lock()
-
-    def _fetch_one(sym: str) -> Optional[tuple]:
-        try:
-            klines = source.get_kline(sym, tf, limit)
-            if klines:
-                bars = list(klines)
-                if sym in today_bars:
-                    tb = today_bars[sym]
-                    bars = [b for b in bars if b.get("time") != tb["time"]]
-                    bars.append(tb)
-                bars.sort(key=lambda x: x["time"])
-                return (sym, bars[-limit:] if len(bars) > limit else bars)
-        except Exception as e:
-            logger.warning(f"[K线批量并发] {sym} {tf} 失败: {e}")
-        return None
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_fetch_one, sym): sym for sym in symbols}
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                res = future.result()
-            except Exception as e:
-                logger.warning(f"[K线批量并发] future 异常: {e}")
-                continue
-            if res:
-                sym, bars = res
-                with lock:
-                    result[sym] = bars
-
-    logger.info(
-        f"[K线批量并发] 历史拉取 {tf} 完成: "
-        f"{len(result)}/{len(symbols)} 只成功 (workers={workers})"
-    )
-
-
 # ================================================================
 # 数据源类
 # ================================================================
@@ -643,11 +593,44 @@ class CNStockDataSource(BaseDataSource):
             except Exception as e:
                 logger.warning(f"[K线批量] {sym} 缓存读取失败: {e}")
 
-        # 3) 缺失历史的：并发拉取（替代逐只串行）
+        # 3) 缺失历史的：串行拉取
         if need_history:
-            _concurrent_fetch_kline_batch(self, need_history, tf, limit, today_bars, result)
+            self._serial_fetch_kline_batch(need_history, tf, limit, today_bars, result)
 
         return result
+
+    def _serial_fetch_kline_batch(
+        self,
+        symbols: List[str],
+        tf: str,
+        limit: int,
+        today_bars: Dict[str, Dict[str, Any]],
+        result: Dict[str, List[Dict[str, Any]]],
+    ) -> None:
+        """串行拉取多只股票的历史 K 线，合并当日行情后写入 result。"""
+        if not symbols:
+            return
+
+        success = 0
+        for sym in symbols:
+            try:
+                klines = self.get_kline(sym, tf, limit)
+                if klines:
+                    bars = list(klines)
+                    if sym in today_bars:
+                        tb = today_bars[sym]
+                        bars = [b for b in bars if b.get("time") != tb["time"]]
+                        bars.append(tb)
+                    bars.sort(key=lambda x: x["time"])
+                    result[sym] = bars[-limit:] if len(bars) > limit else bars
+                    success += 1
+            except Exception as e:
+                logger.warning(f"[K线批量] {sym} {tf} 失败: {e}")
+
+        logger.info(
+            f"[K线批量] 历史拉取 {tf} 完成: "
+            f"{success}/{len(symbols)} 只成功 (serial)"
+        )
 
     def _build_kline_sources(
         self,
