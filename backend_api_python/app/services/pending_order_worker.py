@@ -617,10 +617,13 @@ class PendingOrderWorker:
                                 ins_user_id = int(strategy_row["user_id"])
                         except Exception:
                             pass
+                        _ins_market = str(sc.get("market_category") or '')
+                        if not _ins_market:
+                            logger.warning(f"position sync: market_category is empty for strategy_id={ins['strategy_id']} symbol={ins['symbol']}, position record market will be blank")
                         cur.execute(
-                            """INSERT INTO qd_strategy_positions (user_id, strategy_id, symbol, side, size, entry_price, updated_at)
-                               VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
-                            (ins_user_id, int(ins["strategy_id"]), str(ins["symbol"]), str(ins["side"]), float(ins["size"]), float(ins["entry_price"]))
+                            """INSERT INTO qd_strategy_positions (user_id, strategy_id, symbol, market, side, size, entry_price, updated_at)
+                               VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())""",
+                            (ins_user_id, int(ins["strategy_id"]), str(ins["symbol"]), _ins_market, str(ins["side"]), float(ins["size"]), float(ins["entry_price"]))
                         )
                     db.commit()
                     cur.close()
@@ -727,6 +730,7 @@ class PendingOrderWorker:
         price = float(payload.get("price") or order_row.get("price") or 0.0)
         amount = float(payload.get("amount") or order_row.get("amount") or 0.0)
         direction = "short" if "short" in str(signal_type) else "long"
+        order_market = str(order_row.get("market") or payload.get("market") or "").strip()
         notification_config = payload.get("notification_config") or {}
         strategy_name = str(payload.get("strategy_name") or "").strip()
         if not strategy_name:
@@ -761,6 +765,7 @@ class PendingOrderWorker:
                 direction=str(direction or "long"),
                 notification_config=notification_config if isinstance(notification_config, dict) else {},
                 extra={"pending_order_id": order_id, "mode": mode},
+                market=order_market,
             )
 
             attempted = list(results.keys())
@@ -870,6 +875,7 @@ class PendingOrderWorker:
                 sig0 = payload.get("signal_type") or order_row.get("signal_type") or ""
                 ref0 = float(payload.get("ref_price") or payload.get("price") or order_row.get("price") or 0.0)
                 amt0 = float(payload.get("amount") or order_row.get("amount") or 0.0)
+                market0 = str(order_row.get("market") or payload.get("market") or "").strip()
 
                 px = float(price_hint) if (price_hint is not None and float(price_hint or 0.0) > 0) else ref0
                 amt = float(amount_hint) if (amount_hint is not None and float(amount_hint or 0.0) > 0) else amt0
@@ -883,6 +889,7 @@ class PendingOrderWorker:
                     stake_amount=float(amt or 0.0),
                     direction=("short" if "short" in str(sig0 or "").lower() else "long"),
                     notification_config=notification_config if isinstance(notification_config, dict) else {},
+                    market=market0,
                     extra={
                         "pending_order_id": int(order_id),
                         "mode": "live",
@@ -2018,6 +2025,7 @@ class PendingOrderWorker:
                     signal_type=str(signal_type),
                     filled=filled,
                     avg_price=avg_price,
+                    market=market_category,
                 )
                 # Best-effort: subtract commission from profit if fee is in USDT/USDC/USD.
                 if profit is not None and total_fee > 0 and str(fee_ccy or "").upper() in ("USDT", "USDC", "USD"):
@@ -2031,6 +2039,7 @@ class PendingOrderWorker:
                     commission=float(total_fee or 0.0),
                     commission_ccy=str(fee_ccy or "").strip().upper(),
                     profit=profit,
+                    market=market_category,
                 )
                 logger.info(f"live record done: pending_id={order_id} strategy_id={strategy_id} symbol={symbol} signal={signal_type}")
                 _profit_str = f", profit={profit:.4f}" if profit is not None else ""
@@ -2176,6 +2185,7 @@ class PendingOrderWorker:
                         signal_type=str(signal_type),
                         filled=filled,
                         avg_price=avg_price,
+                        market=market_category,
                     )
                     record_trade(
                         strategy_id=strategy_id,
@@ -2186,6 +2196,7 @@ class PendingOrderWorker:
                         commission=0.0,  # IBKR commission is complex, skip for now
                         commission_ccy="USD",
                         profit=profit,
+                        market=market_category,
                     )
                     logger.info(f"IBKR record done: pending_id={order_id} strategy_id={strategy_id} symbol={symbol}")
                     _pstr = f", profit={profit:.4f}" if profit is not None else ""
@@ -2322,6 +2333,7 @@ class PendingOrderWorker:
                         signal_type=str(signal_type),
                         filled=filled,
                         avg_price=avg_price,
+                        market="Forex",
                     )
                     record_trade(
                         strategy_id=strategy_id,
@@ -2332,6 +2344,7 @@ class PendingOrderWorker:
                         commission=0.0,  # MT5 commission is complex, skip for now
                         commission_ccy="USD",
                         profit=profit,
+                        market="Forex",
                     )
                     logger.info(f"MT5 record done: pending_id={order_id} strategy_id={strategy_id} symbol={symbol}")
                     _pstr = f", profit={profit:.4f}" if profit is not None else ""

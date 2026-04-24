@@ -93,7 +93,10 @@ def record_trade(
     commission_ccy: str = "",
     profit: Optional[float] = None,
     user_id: int = None,
+    market: str = '',
 ) -> None:
+    if not market:
+        logger.warning(f"record_trade: market is empty for strategy_id={strategy_id} symbol={symbol} type={trade_type}, trade record market will be blank")
     value = float(amount or 0.0) * float(price or 0.0)
     if user_id is None:
         user_id = _get_user_id_from_strategy(strategy_id)
@@ -103,14 +106,15 @@ def record_trade(
         cur.execute(
             """
             INSERT INTO qd_strategy_trades
-            (user_id, strategy_id, symbol, type, price, amount, value, commission, commission_ccy, profit, created_at)
+            (user_id, strategy_id, symbol, market, type, price, amount, value, commission, commission_ccy, profit, created_at)
             VALUES
-            (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
             """,
             (
                 int(user_id),
                 int(strategy_id),
                 sym_out,
+                str(market or ''),
                 str(trade_type),
                 float(price or 0.0),
                 float(amount or 0.0),
@@ -136,12 +140,14 @@ def _fetch_position(strategy_id: int, symbol: str, side: str) -> Dict[str, Any]:
     return row if isinstance(row, dict) else {}
 
 
-def _delete_position(strategy_id: int, symbol: str, side: str) -> None:
+def _delete_position(strategy_id: int, symbol: str, side: str, market: str = '') -> None:
+    if not market:
+        logger.warning(f"_delete_position: market is empty for strategy_id={strategy_id} symbol={symbol} side={side}, DELETE will use empty market")
     with get_db_connection() as db:
         cur = db.cursor()
         cur.execute(
-            "DELETE FROM qd_strategy_positions WHERE strategy_id = %s AND symbol = %s AND side = %s",
-            (int(strategy_id), str(symbol), str(side)),
+            "DELETE FROM qd_strategy_positions WHERE strategy_id = %s AND market = %s AND symbol = %s AND side = %s",
+            (int(strategy_id), str(market or ''), str(symbol), str(side)),
         )
         db.commit()
         cur.close()
@@ -158,7 +164,10 @@ def upsert_position(
     highest_price: float = 0.0,
     lowest_price: float = 0.0,
     user_id: int = None,
+    market: str = '',
 ) -> None:
+    if not market:
+        logger.warning(f"upsert_position: market is empty for strategy_id={strategy_id} symbol={symbol} side={side}, position record market will be blank")
     if user_id is None:
         user_id = _get_user_id_from_strategy(strategy_id)
     with get_db_connection() as db:
@@ -166,10 +175,10 @@ def upsert_position(
         cur.execute(
             """
             INSERT INTO qd_strategy_positions
-            (user_id, strategy_id, symbol, side, size, entry_price, current_price, highest_price, lowest_price, updated_at)
+            (user_id, strategy_id, symbol, market, side, size, entry_price, current_price, highest_price, lowest_price, updated_at)
             VALUES
-            (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-            ON CONFLICT(strategy_id, symbol, side) DO UPDATE SET
+            (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT(strategy_id, market, symbol, side) DO UPDATE SET
                 size = excluded.size,
                 entry_price = excluded.entry_price,
                 current_price = excluded.current_price,
@@ -177,7 +186,7 @@ def upsert_position(
                 lowest_price = CASE WHEN excluded.lowest_price > 0 THEN excluded.lowest_price ELSE qd_strategy_positions.lowest_price END,
                 updated_at = NOW()
             """,
-            (int(user_id), int(strategy_id), str(symbol), str(side), float(size or 0.0), float(entry_price or 0.0), float(current_price or 0.0), float(highest_price or 0.0), float(lowest_price or 0.0)),
+            (int(user_id), int(strategy_id), str(symbol), str(market or ''), str(side), float(size or 0.0), float(entry_price or 0.0), float(current_price or 0.0), float(highest_price or 0.0), float(lowest_price or 0.0)),
         )
         db.commit()
         cur.close()
@@ -190,6 +199,7 @@ def apply_fill_to_local_position(
     signal_type: str,
     filled: float,
     avg_price: float,
+    market: str = '',
 ) -> Tuple[Optional[float], Optional[Dict[str, Any]]]:
     """
     Apply a fill to the local position snapshot.
@@ -243,6 +253,7 @@ def apply_fill_to_local_position(
             current_price=px,
             highest_price=new_high,
             lowest_price=new_low,
+            market=market,
         )
         return None, _fetch_position(sid, sym_key, side)
 
@@ -257,7 +268,7 @@ def apply_fill_to_local_position(
 
         new_size = cur_size - filled_qty
         if new_size <= 0:
-            _delete_position(sid, sym_key, side)
+            _delete_position(sid, sym_key, side, market=market)
             return profit, None
         # Keep entry price for remaining position.
         new_high = max(cur_high or px, px)
@@ -271,6 +282,7 @@ def apply_fill_to_local_position(
             current_price=px,
             highest_price=new_high,
             lowest_price=new_low,
+            market=market,
         )
         return profit, _fetch_position(sid, sym_key, side)
 

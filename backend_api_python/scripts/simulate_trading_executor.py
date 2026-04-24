@@ -252,11 +252,11 @@ def _insert_strategy(
             """
             INSERT INTO qd_strategies_trading
             (strategy_name, strategy_type, market_category, execution_mode, notification_config,
-             status, symbol, timeframe, initial_capital, leverage, market_type,
+             status, symbol, market, timeframe, initial_capital, leverage, market_type,
              exchange_config, indicator_config, trading_config, ai_model_config, decide_interval,
              created_at, updated_at)
             VALUES
-            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 "SIM_ETH_1m",
@@ -266,6 +266,7 @@ def _insert_strategy(
                 json.dumps({"channels": ["webhook"]}, ensure_ascii=False),
                 "running",
                 symbol,
+                "Crypto",
                 timeframe,
                 float(initial_capital),
                 int(leverage),

@@ -1061,8 +1061,8 @@ def _send_batch_notification(
                         cur.execute(
                             """
                             INSERT INTO qd_strategy_notifications
-                            (user_id, strategy_id, symbol, signal_type, channels, title, message, payload_json, created_at)
-                            VALUES (?, NULL, ?, ?, ?, ?, ?, ?, NOW())
+                            (user_id, strategy_id, symbol, market, signal_type, channels, title, message, payload_json, created_at)
+                            VALUES (?, NULL, ?, '', ?, ?, ?, ?, ?, NOW())
                             """,
                             (user_id, 'PORTFOLIO', 'ai_monitor', 'browser', title, html_report,
                              json.dumps({'batch': True, 'count': len(successful)}, ensure_ascii=False, default=str)),
@@ -1136,8 +1136,8 @@ def _send_monitor_notification(
                             cur.execute(
                                 """
                                 INSERT INTO qd_strategy_notifications
-                                (user_id, strategy_id, symbol, signal_type, channels, title, message, payload_json, created_at)
-                                VALUES (?, NULL, ?, ?, ?, ?, ?, ?, NOW())
+                                (user_id, strategy_id, symbol, market, signal_type, channels, title, message, payload_json, created_at)
+                                VALUES (?, NULL, ?, '', ?, ?, ?, ?, ?, NOW())
                                 """,
                                 (effective_user_id, 'PORTFOLIO', 'ai_monitor', 'browser', error_title, error_msg,
                                  json.dumps(result, ensure_ascii=False, default=str))
@@ -1183,8 +1183,8 @@ def _send_monitor_notification(
                         cur.execute(
                             """
                             INSERT INTO qd_strategy_notifications
-                            (user_id, strategy_id, symbol, signal_type, channels, title, message, payload_json, created_at)
-                            VALUES (?, NULL, ?, ?, ?, ?, ?, ?, NOW())
+                            (user_id, strategy_id, symbol, market, signal_type, channels, title, message, payload_json, created_at)
+                            VALUES (?, NULL, ?, '', ?, ?, ?, ?, ?, NOW())
                             """,
                             (effective_user_id, 'PORTFOLIO', 'ai_monitor', 'browser', title, html_report,
                              json.dumps(result, ensure_ascii=False, default=str))
@@ -1564,10 +1564,10 @@ def _check_position_alerts():
                                     cur.execute(
                                         """
                                         INSERT INTO qd_strategy_notifications
-                                        (user_id, strategy_id, symbol, signal_type, channels, title, message, payload_json, created_at)
-                                        VALUES (?, NULL, ?, ?, ?, ?, ?, ?, NOW())
+                                        (user_id, strategy_id, symbol, market, signal_type, channels, title, message, payload_json, created_at)
+                                        VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, NOW())
                                         """,
-                                        (alert_user_id, symbol, 'price_alert', 'browser', alert_title, alert_message,
+                                        (alert_user_id, symbol, alert.get('market') or '', 'price_alert', 'browser', alert_title, alert_message,
                                          json.dumps({'alert_id': alert_id, 'alert_type': alert_type}, ensure_ascii=False))
                                     )
                                     db.commit()
@@ -1656,10 +1656,10 @@ def notify_strategy_signal_for_positions(market: str, symbol: str, signal_type: 
                 cur.execute(
                     """
                     INSERT INTO qd_strategy_notifications
-                    (user_id, strategy_id, symbol, signal_type, channels, title, message, payload_json, created_at)
-                    VALUES (?, NULL, ?, ?, ?, ?, ?, ?, NOW())
+                    (user_id, strategy_id, symbol, market, signal_type, channels, title, message, payload_json, created_at)
+                    VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, NOW())
                     """,
-                    (pos_user_id, symbol, 'strategy_linkage', 'browser', title, message,
+                    (pos_user_id, symbol, market or '', 'strategy_linkage', 'browser', title, message,
                      json.dumps({'signal_type': signal_type}, ensure_ascii=False))
                 )
                 db.commit()

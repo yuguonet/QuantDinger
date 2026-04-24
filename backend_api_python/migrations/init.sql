@@ -189,6 +189,7 @@ CREATE TABLE IF NOT EXISTS qd_strategies_trading (
     notification_config TEXT DEFAULT '',
     status VARCHAR(20) DEFAULT 'stopped',
     symbol VARCHAR(50),
+    market VARCHAR(50) DEFAULT '',
     timeframe VARCHAR(10),
     initial_capital DECIMAL(20,8) DEFAULT 1000,
     leverage INTEGER DEFAULT 1,
@@ -209,6 +210,7 @@ CREATE TABLE IF NOT EXISTS qd_strategies_trading (
 CREATE INDEX IF NOT EXISTS idx_strategies_user_id ON qd_strategies_trading(user_id);
 CREATE INDEX IF NOT EXISTS idx_strategies_status ON qd_strategies_trading(status);
 CREATE INDEX IF NOT EXISTS idx_strategies_group_id ON qd_strategies_trading(strategy_group_id);
+CREATE INDEX IF NOT EXISTS idx_strategies_market ON qd_strategies_trading(market);
 
 -- Add strategy_mode and strategy_code columns (script strategy support)
 DO $$
@@ -250,6 +252,7 @@ CREATE TABLE IF NOT EXISTS qd_strategy_positions (
     user_id INTEGER NOT NULL DEFAULT 1 REFERENCES qd_users(id) ON DELETE CASCADE,
     strategy_id INTEGER REFERENCES qd_strategies_trading(id) ON DELETE CASCADE,
     symbol VARCHAR(50),
+    market VARCHAR(50) DEFAULT '',
     side VARCHAR(10),  -- long/short
     size DECIMAL(20,8),
     entry_price DECIMAL(20,8),
@@ -260,11 +263,12 @@ CREATE TABLE IF NOT EXISTS qd_strategy_positions (
     pnl_percent DECIMAL(10,4) DEFAULT 0,
     equity DECIMAL(20,8) DEFAULT 0,
     updated_at TIMESTAMP DEFAULT NOW(),
-    UNIQUE(strategy_id, symbol, side)
+    UNIQUE(strategy_id, market, symbol, side)
 );
 
 CREATE INDEX IF NOT EXISTS idx_positions_user_id ON qd_strategy_positions(user_id);
 CREATE INDEX IF NOT EXISTS idx_positions_strategy_id ON qd_strategy_positions(strategy_id);
+CREATE INDEX IF NOT EXISTS idx_positions_market ON qd_strategy_positions(market);
 
 -- =============================================================================
 -- 4. Strategy Trades
@@ -275,6 +279,7 @@ CREATE TABLE IF NOT EXISTS qd_strategy_trades (
     user_id INTEGER NOT NULL DEFAULT 1 REFERENCES qd_users(id) ON DELETE CASCADE,
     strategy_id INTEGER REFERENCES qd_strategies_trading(id) ON DELETE CASCADE,
     symbol VARCHAR(50),
+    market VARCHAR(50) DEFAULT '',
     type VARCHAR(30),  -- open_long, close_short, etc.
     price DECIMAL(20,8),
     amount DECIMAL(20,8),
@@ -288,6 +293,7 @@ CREATE TABLE IF NOT EXISTS qd_strategy_trades (
 CREATE INDEX IF NOT EXISTS idx_trades_user_id ON qd_strategy_trades(user_id);
 CREATE INDEX IF NOT EXISTS idx_trades_strategy_id ON qd_strategy_trades(strategy_id);
 CREATE INDEX IF NOT EXISTS idx_trades_created_at ON qd_strategy_trades(created_at);
+CREATE INDEX IF NOT EXISTS idx_trades_market ON qd_strategy_trades(market);
 
 -- =============================================================================
 -- 5. Pending Orders Queue
@@ -298,6 +304,7 @@ CREATE TABLE IF NOT EXISTS pending_orders (
     user_id INTEGER NOT NULL DEFAULT 1 REFERENCES qd_users(id) ON DELETE CASCADE,
     strategy_id INTEGER REFERENCES qd_strategies_trading(id) ON DELETE SET NULL,
     symbol VARCHAR(50) NOT NULL,
+    market VARCHAR(50) DEFAULT '',
     signal_type VARCHAR(30) NOT NULL,
     signal_ts BIGINT,
     market_type VARCHAR(20) DEFAULT 'swap',
@@ -327,6 +334,7 @@ CREATE TABLE IF NOT EXISTS pending_orders (
 CREATE INDEX IF NOT EXISTS idx_pending_orders_user_id ON pending_orders(user_id);
 CREATE INDEX IF NOT EXISTS idx_pending_orders_status ON pending_orders(status);
 CREATE INDEX IF NOT EXISTS idx_pending_orders_strategy_id ON pending_orders(strategy_id);
+CREATE INDEX IF NOT EXISTS idx_pending_orders_market ON pending_orders(market);
 
 -- =============================================================================
 -- 6. Strategy Notifications
@@ -337,6 +345,7 @@ CREATE TABLE IF NOT EXISTS qd_strategy_notifications (
     user_id INTEGER NOT NULL DEFAULT 1 REFERENCES qd_users(id) ON DELETE CASCADE,
     strategy_id INTEGER REFERENCES qd_strategies_trading(id) ON DELETE CASCADE,
     symbol VARCHAR(50) DEFAULT '',
+    market VARCHAR(50) DEFAULT '',
     signal_type VARCHAR(30) DEFAULT '',
     channels VARCHAR(255) DEFAULT '',
     title VARCHAR(255) DEFAULT '',
@@ -349,6 +358,7 @@ CREATE TABLE IF NOT EXISTS qd_strategy_notifications (
 CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON qd_strategy_notifications(user_id);
 CREATE INDEX IF NOT EXISTS idx_notifications_strategy_id ON qd_strategy_notifications(strategy_id);
 CREATE INDEX IF NOT EXISTS idx_notifications_is_read ON qd_strategy_notifications(is_read);
+CREATE INDEX IF NOT EXISTS idx_notifications_market ON qd_strategy_notifications(market);
 
 -- =============================================================================
 -- 6b. Strategy runtime logs (dashboard / API)
@@ -814,6 +824,7 @@ CREATE TABLE IF NOT EXISTS qd_quick_trades (
     credential_id   INTEGER DEFAULT 0,
     exchange_id     VARCHAR(40) NOT NULL DEFAULT '',
     symbol          VARCHAR(60) NOT NULL DEFAULT '',
+    market          VARCHAR(50) DEFAULT '',
     side            VARCHAR(10) NOT NULL DEFAULT '',       -- buy / sell
     order_type      VARCHAR(20) NOT NULL DEFAULT 'market', -- market / limit
     amount          DECIMAL(24, 8) DEFAULT 0,
@@ -834,6 +845,7 @@ CREATE TABLE IF NOT EXISTS qd_quick_trades (
 
 CREATE INDEX IF NOT EXISTS idx_quick_trades_user    ON qd_quick_trades(user_id);
 CREATE INDEX IF NOT EXISTS idx_quick_trades_created ON qd_quick_trades(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_quick_trades_market  ON qd_quick_trades(market);
 
 -- =============================================================================
 -- Polymarket Prediction Markets (预测市场数据和分析)
@@ -896,6 +908,99 @@ CREATE TABLE IF NOT EXISTS qd_polymarket_asset_opportunities (
 
 CREATE INDEX IF NOT EXISTS idx_polymarket_opp_market ON qd_polymarket_asset_opportunities(market_id);
 CREATE INDEX IF NOT EXISTS idx_polymarket_opp_asset ON qd_polymarket_asset_opportunities(asset_symbol, asset_market);
+
+-- =============================================================================
+-- Migration: Add market column to 6 tables (if not exists)
+-- =============================================================================
+DO $$
+BEGIN
+    -- qd_strategies_trading
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'qd_strategies_trading' AND column_name = 'market'
+    ) THEN
+        ALTER TABLE qd_strategies_trading ADD COLUMN market VARCHAR(50) DEFAULT '';
+        RAISE NOTICE 'Added market column to qd_strategies_trading';
+    END IF;
+
+    -- qd_strategy_positions
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'qd_strategy_positions' AND column_name = 'market'
+    ) THEN
+        ALTER TABLE qd_strategy_positions ADD COLUMN market VARCHAR(50) DEFAULT '';
+        RAISE NOTICE 'Added market column to qd_strategy_positions';
+    END IF;
+
+    -- qd_strategy_trades
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'qd_strategy_trades' AND column_name = 'market'
+    ) THEN
+        ALTER TABLE qd_strategy_trades ADD COLUMN market VARCHAR(50) DEFAULT '';
+        RAISE NOTICE 'Added market column to qd_strategy_trades';
+    END IF;
+
+    -- pending_orders
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'pending_orders' AND column_name = 'market'
+    ) THEN
+        ALTER TABLE pending_orders ADD COLUMN market VARCHAR(50) DEFAULT '';
+        RAISE NOTICE 'Added market column to pending_orders';
+    END IF;
+
+    -- qd_strategy_notifications
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'qd_strategy_notifications' AND column_name = 'market'
+    ) THEN
+        ALTER TABLE qd_strategy_notifications ADD COLUMN market VARCHAR(50) DEFAULT '';
+        RAISE NOTICE 'Added market column to qd_strategy_notifications';
+    END IF;
+
+    -- qd_quick_trades
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'qd_quick_trades' AND column_name = 'market'
+    ) THEN
+        ALTER TABLE qd_quick_trades ADD COLUMN market VARCHAR(50) DEFAULT '';
+        RAISE NOTICE 'Added market column to qd_quick_trades';
+    END IF;
+END $$;
+
+-- Migrate UNIQUE constraint on qd_strategy_positions (add market)
+DO $$
+BEGIN
+    -- Drop old constraint if exists
+    IF EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+        WHERE table_name = 'qd_strategy_positions'
+          AND constraint_type = 'UNIQUE'
+          AND constraint_name = 'qd_strategy_positions_strategy_id_symbol_side_key'
+    ) THEN
+        ALTER TABLE qd_strategy_positions DROP CONSTRAINT qd_strategy_positions_strategy_id_symbol_side_key;
+        RAISE NOTICE 'Dropped old UNIQUE constraint on qd_strategy_positions';
+    END IF;
+    -- Create new constraint with market
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+        WHERE table_name = 'qd_strategy_positions'
+          AND constraint_type = 'UNIQUE'
+          AND constraint_name = 'qd_strategy_positions_strategy_id_market_symbol_side_key'
+    ) THEN
+        ALTER TABLE qd_strategy_positions ADD CONSTRAINT qd_strategy_positions_strategy_id_market_symbol_side_key UNIQUE(strategy_id, market, symbol, side);
+        RAISE NOTICE 'Added new UNIQUE constraint (strategy_id, market, symbol, side) on qd_strategy_positions';
+    END IF;
+END $$;
+
+-- Create indexes for market columns (if not exists)
+CREATE INDEX IF NOT EXISTS idx_strategies_market ON qd_strategies_trading(market);
+CREATE INDEX IF NOT EXISTS idx_positions_market ON qd_strategy_positions(market);
+CREATE INDEX IF NOT EXISTS idx_trades_market ON qd_strategy_trades(market);
+CREATE INDEX IF NOT EXISTS idx_pending_orders_market ON pending_orders(market);
+CREATE INDEX IF NOT EXISTS idx_notifications_market ON qd_strategy_notifications(market);
+CREATE INDEX IF NOT EXISTS idx_quick_trades_market ON qd_quick_trades(market);
 
 -- =============================================================================
 -- Completion Notice

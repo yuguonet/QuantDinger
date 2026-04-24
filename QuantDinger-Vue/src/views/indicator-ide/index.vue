@@ -426,7 +426,7 @@
                   </a-row>
                 </div>
 
-                <div class="param-section param-section--full">
+                <div class="param-section param-section--direction">
                   <div class="param-label">{{ $t('indicatorIde.direction') }}</div>
                   <a-radio-group v-model="tradeDirection" class="direction-radio-group">
                     <a-radio-button value="long">
@@ -1104,13 +1104,13 @@ export default {
       codeDirty: false,
       cmInstance: null,
 
-      codeDrawerVisible: true,
+      codeDrawerVisible: false,
       codePanelExpanded: true,
-      paramsPanelExpanded: true,
+      paramsPanelExpanded: false,
       /** 已购指标说明条：用户关闭后按账号写入 storage，不再展示 */
       purchasedMarketHintDismissed: false,
 
-      chartPanelHeight: 340,
+      chartPanelHeight: 408,
       resizeDragStartY: 0,
       resizeDragStartH: 0,
 
@@ -1124,12 +1124,12 @@ export default {
       leverage: 1,
       commission: 0.02,
       slippage: 0.02,
-      tradeDirection: 'long',
+      tradeDirection: 'both',
       enableMtf: false,
 
-      startDate: moment().subtract(6, 'months'),
+      startDate: moment().subtract(1, 'years'),
       endDate: moment(),
-      datePreset: '6m',
+      datePreset: '1y',
 
       running: false,
       runTip: '',
@@ -4380,6 +4380,12 @@ export default {
     grid-template-columns: minmax(0, 1fr);
   }
 
+  .params-grid > .param-section:nth-child(1),
+  .params-grid > .param-section:nth-child(2),
+  .params-grid > .param-section:nth-child(3) {
+    grid-column: auto;
+  }
+
   .param-section--full {
     grid-column: auto;
   }
@@ -4585,11 +4591,16 @@ export default {
 }
 .params-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 12px;
   min-width: 0;
   overflow: hidden;
 }
+.params-grid > .param-section:nth-child(1) { grid-column: span 3; }
+.params-grid > .param-section:nth-child(2) { grid-column: span 2; }
+.params-grid > .param-section:nth-child(3) { grid-column: span 1; }
+.param-section--full { grid-column: 1 / -1; }
+.param-section--direction { grid-column: span 1; }
 .result-tabs {
   flex: 0 0 auto;
   min-height: auto;

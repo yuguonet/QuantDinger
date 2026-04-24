@@ -911,11 +911,11 @@ class StrategyService:
                 """
                 INSERT INTO qd_strategies_trading
                 (user_id, strategy_name, strategy_type, market_category, execution_mode, notification_config,
-                 status, symbol, timeframe, initial_capital, leverage, market_type,
+                 status, symbol, market, timeframe, initial_capital, leverage, market_type,
                  exchange_config, indicator_config, trading_config, ai_model_config, decide_interval,
                  strategy_group_id, group_base_name, strategy_mode, strategy_code,
                  created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
                 """,
                 (
                     user_id,
@@ -926,6 +926,7 @@ class StrategyService:
                     self._dump_json_or_encrypt(notification_config, encrypt=False),
                     payload.get('status') or 'stopped',
                     symbol,
+                    market_category,
                     timeframe,
                     float(initial_capital or 1000),
                     int(leverage or 1),

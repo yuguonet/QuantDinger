@@ -1148,7 +1148,8 @@ class TradingExecutor:
                                                     strategy_id, p['symbol'], p['side'],
                                                     float(p['size']), float(p['entry_price']),
                                                     current_close,
-                                                    highest_price=new_hp
+                                                    highest_price=new_hp,
+                                                    market=market_category
                                                 )
                     else:
                         # ============================================
@@ -1228,7 +1229,8 @@ class TradingExecutor:
                                                 strategy_id, p['symbol'], p['side'],
                                                 float(p['size']), float(p['entry_price']),
                                                 current_price,
-                                                highest_price=new_hp
+                                                highest_price=new_hp,
+                                                market=market_category
                                             )
                             except Exception as e:
                                 logger.warning(f"Strategy {strategy_id} realtime indicator recompute failed: {str(e)}")
@@ -1306,6 +1308,7 @@ class TradingExecutor:
                         leverage=float(leverage),
                         trading_config=trading_config,
                         timeframe_seconds=int(timeframe_seconds or 60),
+                        market=market_category,
                     )
                     if risk_tp:
                         triggered_signals.append(risk_tp)
@@ -1318,6 +1321,7 @@ class TradingExecutor:
                         leverage=float(leverage),
                         trading_config=trading_config,
                         timeframe_seconds=int(timeframe_seconds or 60),
+                        market=market_category,
                     )
                     if risk_sl:
                         triggered_signals.append(risk_sl)
@@ -1442,7 +1446,7 @@ class TradingExecutor:
                                 )
 
                     # Update positions once per tick.
-                    self._update_positions(strategy_id, symbol, current_price)
+                    self._update_positions(strategy_id, symbol, current_price, market=market_category)
 
                     # Heartbeat for UI observability (once per tick).
                     self._console_print(
@@ -1696,6 +1700,7 @@ class TradingExecutor:
         leverage: float,
         trading_config: Dict[str, Any],
         timeframe_seconds: int,
+        market: str = '',
     ) -> Optional[Dict[str, Any]]:
         """
         服务端兜底止损：当价格穿透止损线时，直接生成 close_long/close_short 信号。
@@ -1787,6 +1792,7 @@ class TradingExecutor:
         leverage: float,
         trading_config: Dict[str, Any],
         timeframe_seconds: int,
+        market: str = '',
     ) -> Optional[Dict[str, Any]]:
         """
         Server-side exits driven by trading_config (no indicator script required):
@@ -1868,6 +1874,7 @@ class TradingExecutor:
                     current_price=float(current_price),
                     highest_price=hp,
                     lowest_price=lp,
+                    market=market,
                 )
             except Exception:
                 pass
@@ -2525,6 +2532,7 @@ class TradingExecutor:
                             "reason": str(reason),
                             "signal_ts": int(signal_ts or 0),
                         },
+                        market=market_category,
                     )
                     logger.info(
                         f"AI entry filter rejected: strategy_id={strategy_id} symbol={symbol} signal={sig} ai={ai_decision} reason={reason}"
@@ -2666,6 +2674,7 @@ class TradingExecutor:
                 trailing_stop_price=trailing_stop_price,
                 signal_ts=int(signal_ts or 0),
                 order_mode=bot_order_mode,
+                market=market_category,
             )
             
             if order_result and order_result.get('success'):
@@ -2689,7 +2698,7 @@ class TradingExecutor:
                     self._record_trade(
                         strategy_id=strategy_id, symbol=symbol, type=signal_type,
                         price=current_price, amount=amount, value=amount*current_price,
-                        commission=_est_commission
+                        commission=_est_commission, market=market_category
                     )
                     side = 'short' if 'short' in signal_type else 'long'
                     
@@ -2704,7 +2713,8 @@ class TradingExecutor:
 
                     self._update_position(
                         strategy_id=strategy_id, symbol=symbol, side=side,
-                        size=new_size, entry_price=new_entry, current_price=current_price
+                        size=new_size, entry_price=new_entry, current_price=current_price,
+                        market=market_category
                     )
                     append_strategy_log(
                         strategy_id, "trade",
@@ -2731,16 +2741,17 @@ class TradingExecutor:
                     self._record_trade(
                         strategy_id=strategy_id, symbol=symbol, type=signal_type,
                         price=current_price, amount=amount, value=amount*current_price,
-                        profit=reduce_profit, commission=_est_commission
+                        profit=reduce_profit, commission=_est_commission, market=market_category
                     )
                     
                     new_size = max(0.0, old_size - float(amount or 0.0))
                     if new_size <= old_size * 0.001:
-                        self._close_position(strategy_id, symbol, side)
+                        self._close_position(strategy_id, symbol, side, market=market_category)
                     else:
                         self._update_position(
                             strategy_id=strategy_id, symbol=symbol, side=side,
-                            size=new_size, entry_price=old_entry, current_price=current_price
+                            size=new_size, entry_price=old_entry, current_price=current_price,
+                            market=market_category
                         )
                     _pstr = f", profit={reduce_profit:.4f}" if reduce_profit is not None else ""
                     append_strategy_log(
@@ -2765,9 +2776,9 @@ class TradingExecutor:
                     self._record_trade(
                         strategy_id=strategy_id, symbol=symbol, type=signal_type,
                         price=current_price, amount=amount, value=amount*current_price,
-                        profit=close_profit, commission=_est_commission
+                        profit=close_profit, commission=_est_commission, market=market_category
                     )
-                    self._close_position(strategy_id, symbol, side)
+                    self._close_position(strategy_id, symbol, side, market=market_category)
                     _pstr = f", profit={close_profit:.4f}" if close_profit is not None else ""
                     append_strategy_log(
                         strategy_id, "trade",
@@ -2945,9 +2956,12 @@ class TradingExecutor:
         message: str,
         payload: Optional[Dict[str, Any]] = None,
         user_id: int = None,
+        market: str = '',
     ) -> None:
         """Best-effort persist notification row for the frontend '通知' panel (browser channel)."""
         try:
+            if not market:
+                logger.warning(f"_persist_browser_notification: market is empty for strategy_id={strategy_id} symbol={symbol}, notification market will be blank")
             now = int(time.time())
             # Get user_id from strategy if not provided
             if user_id is None:
@@ -2965,13 +2979,14 @@ class TradingExecutor:
                 cur.execute(
                     """
                     INSERT INTO qd_strategy_notifications
-                    (user_id, strategy_id, symbol, signal_type, channels, title, message, payload_json, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())
+                    (user_id, strategy_id, symbol, market, signal_type, channels, title, message, payload_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
                     """,
                     (
                         int(user_id),
                         int(strategy_id),
                         str(symbol or ""),
+                        str(market or ""),
                         str(signal_type or ""),
                         "browser",
                         str(title or ""),
@@ -3011,6 +3026,7 @@ class TradingExecutor:
         execution_mode: str = 'signal',
         notification_config: Optional[Dict[str, Any]] = None,
         signal_ts: int = 0,
+        market: str = '',
     ) -> Optional[Dict[str, Any]]:
         """
         将信号转为 pending_orders 队列记录（本方法不直连交易所、不使用 ccxt）。
@@ -3053,6 +3069,7 @@ class TradingExecutor:
                 execution_mode=execution_mode,
                 notification_config=notification_config,
                 extra_payload=extra_payload,
+                market=market,
             )
 
             pending_flag = str(execution_mode or "").strip().lower() == "live"
@@ -3086,9 +3103,12 @@ class TradingExecutor:
         execution_mode: str,
         notification_config: Optional[Dict[str, Any]] = None,
         extra_payload: Optional[Dict[str, Any]] = None,
+        market: str = '',
     ) -> Optional[int]:
         """Insert a pending order record and return its id."""
         try:
+            if not market:
+                logger.warning(f"_enqueue_pending_order: market is empty for strategy_id={strategy_id} symbol={symbol} signal={signal_type}, pending_orders market will be blank")
             now = int(time.time())
             # Local deployment supports both "signal" and "live" (live is executed by PendingOrderWorker).
             mode = (execution_mode or "signal").strip().lower()
@@ -3204,11 +3224,11 @@ class TradingExecutor:
                 cur.execute(
                     """
                     INSERT INTO pending_orders
-                    (user_id, strategy_id, symbol, signal_type, signal_ts, market_type, order_type, amount, price,
+                    (user_id, strategy_id, symbol, market, signal_type, signal_ts, market_type, order_type, amount, price,
                      execution_mode, status, priority, attempts, max_attempts, last_error, payload_json,
                      created_at, updated_at, processed_at, sent_at)
                     VALUES
-                    (%s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                      %s, %s, %s, %s, %s, %s, %s,
                      NOW(), NOW(), NULL, NULL)
                     """,
@@ -3216,6 +3236,7 @@ class TradingExecutor:
                         int(user_id),
                         int(strategy_id),
                         symbol,
+                        market or '',
                         signal_type,
                         int(signal_ts or 0),
                         market_type or 'swap',
@@ -3382,9 +3403,11 @@ class TradingExecutor:
             logger.warning(f"Failed to get daily pnl for strategy {strategy_id}: {e}")
             return 0.0
 
-    def _record_trade(self, strategy_id: int, symbol: str, type: str, price: float, amount: float, value: float, profit: float = None, commission: float = None):
+    def _record_trade(self, strategy_id: int, symbol: str, type: str, price: float, amount: float, value: float, profit: float = None, commission: float = None, market: str = ''):
         """记录交易到数据库"""
         try:
+            if not market:
+                logger.warning(f"_record_trade: market is empty for strategy_id={strategy_id} symbol={symbol} type={type}, trade record market will be blank")
             # Get user_id from strategy
             user_id = 1
             with get_db_connection() as db:
@@ -3397,12 +3420,12 @@ class TradingExecutor:
                     pass
                 query = """
                     INSERT INTO qd_strategy_trades (
-                        user_id, strategy_id, symbol, type, price, amount, value, commission, profit, created_at
+                        user_id, strategy_id, symbol, market, type, price, amount, value, commission, profit, created_at
                     ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
                     )
                 """
-                cursor.execute(query, (user_id, strategy_id, symbol, type, price, amount, value, commission or 0, profit))
+                cursor.execute(query, (user_id, strategy_id, symbol, market, type, price, amount, value, commission or 0, profit))
                 db.commit()
                 cursor.close()
         except Exception as e:
@@ -3418,9 +3441,12 @@ class TradingExecutor:
         current_price: float,
         highest_price: float = 0.0,
         lowest_price: float = 0.0,
+        market: str = '',
     ):
         """更新持仓状态"""
         try:
+            if not market:
+                logger.warning(f"_update_position: market is empty for strategy_id={strategy_id} symbol={symbol} side={side}, position record market will be blank")
             # Get user_id from strategy
             user_id = 1
             with get_db_connection() as db:
@@ -3434,10 +3460,10 @@ class TradingExecutor:
                 # 简化：直接 Update 或 Insert
                 upsert_query = """
                     INSERT INTO qd_strategy_positions (
-                        user_id, strategy_id, symbol, side, size, entry_price, current_price, highest_price, lowest_price, updated_at
+                        user_id, strategy_id, symbol, market, side, size, entry_price, current_price, highest_price, lowest_price, updated_at
                     ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
-                    ) ON CONFLICT(strategy_id, symbol, side) DO UPDATE SET
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
+                    ) ON CONFLICT(strategy_id, market, symbol, side) DO UPDATE SET
                         size = excluded.size,
                         entry_price = excluded.entry_price,
                         current_price = excluded.current_price,
@@ -3446,19 +3472,21 @@ class TradingExecutor:
                         updated_at = NOW()
                 """
                 cursor.execute(upsert_query, (
-                    user_id, strategy_id, symbol, side, size, entry_price, current_price, highest_price, lowest_price
+                    user_id, strategy_id, symbol, market, side, size, entry_price, current_price, highest_price, lowest_price
                 ))
                 db.commit()
                 cursor.close()
         except Exception as e:
             logger.error(f"Failed to update position: {e}")
 
-    def _close_position(self, strategy_id: int, symbol: str, side: str):
+    def _close_position(self, strategy_id: int, symbol: str, side: str, market: str = ''):
         """平仓：删除持仓记录"""
         try:
+            if not market:
+                logger.warning(f"_close_position: market is empty for strategy_id={strategy_id} symbol={symbol} side={side}, DELETE will use empty market")
             with get_db_connection() as db:
                 cursor = db.cursor()
-                cursor.execute("DELETE FROM qd_strategy_positions WHERE strategy_id = %s AND symbol = %s AND side = %s", (strategy_id, symbol, side))
+                cursor.execute("DELETE FROM qd_strategy_positions WHERE strategy_id = %s AND market = %s AND symbol = %s AND side = %s", (strategy_id, market, symbol, side))
                 db.commit()
                 cursor.close()
         except Exception as e:
@@ -3467,12 +3495,14 @@ class TradingExecutor:
     def _delete_position_by_id(self, position_id: int):
          pass
 
-    def _update_positions(self, strategy_id: int, symbol: str, current_price: float):
+    def _update_positions(self, strategy_id: int, symbol: str, current_price: float, market: str = ''):
         """更新所有持仓的当前价格"""
         try:
+            if not market:
+                logger.warning(f"_update_positions: market is empty for strategy_id={strategy_id} symbol={symbol}, UPDATE will use empty market")
             with get_db_connection() as db:
                 cursor = db.cursor()
-                cursor.execute("UPDATE qd_strategy_positions SET current_price = %s WHERE strategy_id = %s AND symbol = %s", (current_price, strategy_id, symbol))
+                cursor.execute("UPDATE qd_strategy_positions SET current_price = %s WHERE strategy_id = %s AND market = %s AND symbol = %s", (current_price, strategy_id, market, symbol))
                 db.commit()
                 cursor.close()
         except Exception:

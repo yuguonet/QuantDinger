@@ -180,6 +180,7 @@ class SignalNotifier:
         direction: str = "long",
         notification_config: Optional[Dict[str, Any]] = None,
         extra: Optional[Dict[str, Any]] = None,
+        market: str = '',
     ) -> Dict[str, Dict[str, Any]]:
         cfg = _safe_json(notification_config or {})
         channels = _as_list(cfg.get("channels"))
@@ -220,6 +221,7 @@ class SignalNotifier:
                         title=title,
                         message=message_plain,
                         payload=payload,
+                        market=market,
                     )
                 elif c == "webhook":
                     url = (targets.get("webhook") or "").strip()
@@ -492,8 +494,11 @@ class SignalNotifier:
         message: str,
         payload: Dict[str, Any],
         user_id: int = None,
+        market: str = '',
     ) -> Tuple[bool, str]:
         try:
+            if not market:
+                logger.warning(f"_notify_browser: market is empty for strategy_id={strategy_id} symbol={symbol}, notification market will be blank")
             now = int(time.time())
             # Get user_id from strategy if not provided
             if user_id is None:
@@ -515,13 +520,14 @@ class SignalNotifier:
                 cur.execute(
                     """
                     INSERT INTO qd_strategy_notifications
-                    (user_id, strategy_id, symbol, signal_type, channels, title, message, payload_json, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())
+                    (user_id, strategy_id, symbol, market, signal_type, channels, title, message, payload_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
                     """,
                     (
                         int(user_id),
                         sid,
                         str(symbol or ""),
+                        str(market or ""),
                         str(signal_type or ""),
                         ",".join([str(c) for c in (channels or [])]),
                         str(title or ""),

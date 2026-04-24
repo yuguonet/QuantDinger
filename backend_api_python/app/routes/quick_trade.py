@@ -312,6 +312,7 @@ def _record_quick_trade(
     error_msg: str,
     source: str,
     raw_result: Dict[str, Any],
+    market: str = '',
 ):
     """Insert a quick trade record into the database."""
     try:
@@ -320,15 +321,15 @@ def _record_quick_trade(
             cur.execute(
                 """
                 INSERT INTO qd_quick_trades
-                    (user_id, credential_id, exchange_id, symbol, side, order_type,
+                    (user_id, credential_id, exchange_id, symbol, market, side, order_type,
                      amount, price, leverage, market_type, tp_price, sl_price,
                      status, exchange_order_id, filled_amount, avg_fill_price,
                      error_msg, source, raw_result, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                 RETURNING id
                 """,
                 (
-                    user_id, credential_id, exchange_id, symbol, side, order_type,
+                    user_id, credential_id, exchange_id, symbol, market or '', side, order_type,
                     amount, price, leverage, market_type, tp_price, sl_price,
                     status, exchange_order_id, filled, avg_price,
                     error_msg, source, json.dumps(raw_result or {}),
@@ -538,6 +539,7 @@ def place_order():
             error_msg="",
             source=source,
             raw_result=raw,
+            market="Crypto",
         )
 
         return jsonify({
@@ -578,6 +580,7 @@ def place_order():
                 error_msg=str(e)[:500],
                 source=str(body.get("source") or "manual"),
                 raw_result={},
+                market="Crypto",
             )
         except Exception:
             pass
@@ -1458,6 +1461,7 @@ def close_position():
             error_msg="",
             source=source,
             raw_result=raw,
+            market="Crypto",
         )
 
         return jsonify({
