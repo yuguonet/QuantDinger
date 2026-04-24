@@ -208,7 +208,6 @@ class FastAnalysisService:
         *,
         include_macro: bool = True,
         include_news: bool = True,
-        include_polymarket: bool = True,
         timeout: int = 45,
     ) -> Dict[str, Any]:
         """
@@ -219,7 +218,6 @@ class FastAnalysisService:
         2. 基本面: 公司信息、财务数据
         3. 宏观数据: DXY、VIX、TNX、黄金等
         4. 情绪数据: 新闻、市场情绪
-        5. 预测市场: 相关预测市场事件（新增）
         """
         return self.data_collector.collect_all(
             market=market,
@@ -227,7 +225,6 @@ class FastAnalysisService:
             timeframe=timeframe,
             include_macro=include_macro,
             include_news=include_news,
-            include_polymarket=include_polymarket,  # 包含预测市场数据
             timeout=timeout,  # 增加超时时间，确保数据收集完成
         )
     
@@ -371,19 +368,6 @@ class FastAnalysisService:
         
         return "\n".join(summaries) if summaries else "No recent news available."
     
-    def _format_polymarket_summary(self, polymarket_events: List[Dict], max_items: int = 3) -> str:
-        """Format prediction market events into a concise summary for the prompt."""
-        if not polymarket_events:
-            return "No related prediction market events found."
-        
-        summaries = []
-        for event in polymarket_events[:max_items]:
-            question = event.get('question', '')
-            prob = event.get('current_probability', 50.0)
-            summaries.append(f"- {question[:80]}: Market probability {prob:.1f}%")
-        
-        return "\n".join(summaries) if summaries else "No related prediction market events found."
-
     def _format_crypto_factor_prompt(self, crypto_factors: Dict[str, Any], language: str) -> str:
         """Format crypto-specific market structure data for prompts."""
         if not crypto_factors:
@@ -445,7 +429,84 @@ class FastAnalysisService:
             f"- Squeeze risk: {signals.get('squeeze_risk', 'low')}\n"
             f"- Factor summary: {crypto_factors.get('summary') or 'N/A'}"
         )
-    
+
+    def _format_ashare_factor_prompt(self, ashare_factors: Dict[str, Any], language: str) -> str:
+        """Format A-share market structure data for prompts (基于 fear_greed_index 7 维度)。"""
+        if not ashare_factors:
+            return "A 股市场因子数据暂不可用。"
+
+        is_zh = str(language or "").lower().startswith("zh")
+        signals = ashare_factors.get("signals") or {}
+        composite = ashare_factors.get("composite_score")
+        label = str(ashare_factors.get("composite_label") or "")
+        indicators = ashare_factors.get("indicators") or []
+
+        def _safe_f(v: Any, default: float = 0.0) -> float:
+            try:
+                f = float(v)
+                return f if f == f else default
+            except (TypeError, ValueError):
+                return default
+
+        def _fmt_num(v: Any, suffix: str = "") -> str:
+            if v is None or v == "":
+                return "N/A"
+            try:
+                n = float(v)
+            except Exception:
+                return str(v)
+            if n != n:  # NaN
+                return "N/A"
+            if abs(n) >= 1_0000_0000:
+                return f"{n / 1_0000_0000:.2f}亿{suffix}"
+            if abs(n) >= 1_0000:
+                return f"{n / 1_0000:.2f}万{suffix}"
+            return f"{n:.2f}{suffix}"
+
+        lines = []
+        if is_zh:
+            if composite is not None:
+                lines.append(f"- 综合贪恐指数: {_safe_f(composite):.0f}/100（{label}）")
+            for ind in indicators:
+                name = str(ind.get("name") or "")
+                score = ind.get("score")
+                detail = str(ind.get("detail") or "")
+                if score is not None:
+                    lines.append(f"- {name}: {_safe_f(score):.0f}分 — {detail}")
+            mf = ashare_factors.get("main_fund_netflow")
+            if mf is not None:
+                mf_f = _safe_f(mf)
+                direction = "流入" if mf_f > 0 else "流出"
+                lines.append(f"- 主力资金净: {direction}{_fmt_num(abs(mf_f))}")
+            tr = ashare_factors.get("turnover_rate")
+            if tr is not None:
+                lines.append(f"- 换手率: {_safe_f(tr):.2f}%")
+            lines.append(f"- 广度偏向: {signals.get('breadth_bias', 'neutral')}")
+            lines.append(f"- 北向偏向: {signals.get('northbound_bias', 'neutral')}")
+            lines.append(f"- 涨停热度: {signals.get('limit_heat', 'normal')}")
+        else:
+            if composite is not None:
+                lines.append(f"- Composite Fear & Greed: {_safe_f(composite):.0f}/100 ({label})")
+            for ind in indicators:
+                name = str(ind.get("name") or "")
+                score = ind.get("score")
+                detail = str(ind.get("detail") or "")
+                if score is not None:
+                    lines.append(f"- {name}: {_safe_f(score):.0f} — {detail}")
+            mf = ashare_factors.get("main_fund_netflow")
+            if mf is not None:
+                mf_f = _safe_f(mf)
+                direction = "Inflow" if mf_f > 0 else "Outflow"
+                lines.append(f"- Main fund net: {direction} {_fmt_num(abs(mf_f))}")
+            tr = ashare_factors.get("turnover_rate")
+            if tr is not None:
+                lines.append(f"- Turnover rate: {_safe_f(tr):.2f}%")
+            lines.append(f"- Breadth bias: {signals.get('breadth_bias', 'neutral')}")
+            lines.append(f"- Northbound bias: {signals.get('northbound_bias', 'neutral')}")
+            lines.append(f"- Limit heat: {signals.get('limit_heat', 'normal')}")
+
+        return "\n".join(lines) if lines else ("A 股市场因子数据暂不可用。" if is_zh else "A-share market factor data unavailable.")
+
     # ==================== Memory Layer ====================
     
     def _get_memory_context(self, market: str, symbol: str, current_indicators: Dict) -> str:
@@ -496,10 +557,7 @@ class FastAnalysisService:
         indicators = data.get("indicators") or {}
         fundamental = data.get("fundamental") or {}
         company = data.get("company") or {}
-        crypto_factors = data.get("crypto_factors") or {}
-        is_crypto = str(data.get("market") or "").strip().lower() == "crypto"
         news_summary = self._format_news_summary(data.get("news") or [])
-        polymarket_events = data.get("polymarket") or []
         
         # Language instruction - MUST be enforced strictly
         lang_map = {
@@ -541,11 +599,18 @@ class FastAnalysisService:
         
         # Build decision guidance based on technical indicators
         decision_guidance = self._build_decision_guidance(rsi_value, macd_signal, ma_trend, change_24h)
-        crypto_factor_block = self._format_crypto_factor_prompt(crypto_factors, language)
-        crypto_system_rules = ""
-        crypto_user_block = ""
+        market = str(data.get("market") or "").strip()
+        is_crypto = market.lower() == "crypto"
+        is_ashare = market == "CNStock"
+        crypto_factors = data.get("crypto_factors") or {}
+        ashare_factors = data.get("ashare_factors") or {}
+
+        # Market-specific factor block + system rules
+        market_factor_system_rules = ""
+        market_factor_user_block = ""
         if is_crypto:
-            crypto_system_rules = """
+            crypto_factor_block = self._format_crypto_factor_prompt(crypto_factors, language)
+            market_factor_system_rules = """
 8. **Crypto Market Structure Override**:
    - For Crypto, DO NOT rely on stock-style valuation logic as your core thesis.
    - Prioritize derivatives positioning, funding rate, open interest, long/short ratio, exchange netflow, and stablecoin netflow.
@@ -554,9 +619,26 @@ class FastAnalysisService:
    - Stablecoin net inflow can imply fresh buying power entering the market.
    - If derivatives are crowded or squeeze risk is high, explicitly mention this in summary, reasons, and risks.
 """
-            crypto_user_block = f"""
+            market_factor_user_block = f"""
 🪙 CRYPTO MARKET STRUCTURE:
 {crypto_factor_block}
+"""
+        elif is_ashare:
+            ashare_factor_block = self._format_ashare_factor_prompt(ashare_factors, language)
+            market_factor_system_rules = """
+8. **A 股市场结构分析**:
+   - 核心指标：贪恐指数 (0-100, 50=中性)，包含 7 个维度：动量、市场宽度、波动率、成交量、北向资金、涨跌停比、股价强度。
+   - 贪恐指数 < 25 (极度恐惧): 市场可能过度悲观，是潜在抄底机会（利多信号）。
+   - 贪恐指数 > 75 (极度贪婪): 市场可能过热，需警惕回调风险（利空信号）。
+   - 北向资金维度大幅偏向恐惧/贪婪时，是重要的外资情绪信号。
+   - 市场宽度（上涨占比）反映赚钱效应，宽度高=多数股票上涨=趋势健康。
+   - 涨跌停比极端时（大量涨停或跌停），市场情绪处于极端状态。
+   - 补充因子：个股主力资金净流入/流出、换手率异常。
+   - A 股分析应结合贪恐指数 + 个股资金流 + 宏观政策综合判断。
+"""
+            market_factor_user_block = f"""
+🇨🇳 A 股市场结构因子:
+{ashare_factor_block}
 """
         
         system_prompt = f"""You are QuantDinger's Senior Financial Analyst with 20+ years of experience. 
@@ -595,7 +677,7 @@ You are CONSERVATIVE and OBJECTIVE. Your analysis must be based on DATA, not spe
    - High VIX (>30) indicates fear → Consider SELL or HOLD, avoid BUY
    - Rising interest rates usually negative for growth assets → Consider SELL
    - Geopolitical tensions can cause sudden volatility → Consider SELL if risk-off sentiment
-{crypto_system_rules}
+{market_factor_system_rules}
 
 {decision_guidance}
 
@@ -629,24 +711,18 @@ You are CONSERVATIVE and OBJECTIVE. Your analysis must be based on DATA, not spe
    - Consider regulatory changes, partnerships, scandals, geopolitical tensions, etc.
    - **DO NOT ignore major geopolitical news** (e.g., US-Iran conflict, Russia-Ukraine war) even if technical indicators look good
    - Global events like wars can override all technical analysis - treat them as HIGHEST PRIORITY
-4. **Prediction Market Analysis**:
-   - Review related prediction market events and their current probabilities
-   - Prediction markets reflect collective market wisdom and can indicate future price movements
-   - If prediction markets show high probability for bullish events (e.g., "BTC reaches $100k"), consider this as a positive signal
-   - If prediction markets show high probability for bearish events, consider this as a risk factor
-   - Use prediction market probabilities as a sentiment indicator alongside technical analysis
-5. **Fundamental Analysis**: For Crypto, focus on market structure / flow / derivatives factors instead of stock-style valuation. For equities, evaluate valuation, growth, competitive position if data available.
-6. **Risk Assessment**: 
+4. **Fundamental Analysis**: For Crypto, focus on market structure / flow / derivatives factors instead of stock-style valuation. For equities, evaluate valuation, growth, competitive position if data available.
+5. **Risk Assessment**: 
    - Explain why the stop loss level is appropriate
    - List ALL significant risks (technical, macro, news, fundamental)
    - Consider tail risks from unexpected events
-7. **Clear Recommendation**: BUY/SELL/HOLD with entry, stop loss (near suggested), take profit (near suggested)
+6. **Clear Recommendation**: BUY/SELL/HOLD with entry, stop loss (near suggested), take profit (near suggested)
    - **BUY**: For long positions when indicators suggest upside
    - **SELL**: For short positions when indicators suggest downside - this is a VALID trading opportunity
    - **HOLD**: Only when signals are truly unclear - DO NOT default to HOLD just to be safe
    - Your decision should reflect the WEIGHTED importance of ALL factors
    - If macro/news factors strongly contradict technical, explain why you prioritize one over the other
-8. **Trading Opportunity Recognition**:
+7. **Trading Opportunity Recognition**:
    - When you see RSI > 60, bearish MACD, downtrend → Give SELL signal (short opportunity)
    - When you see RSI < 40, bullish MACD, uptrend → Give BUY signal (long opportunity)
    - Only choose HOLD when signals are genuinely mixed or unclear
@@ -716,16 +792,13 @@ When the score is neutral (-20 to +20), you can use your judgment, but still con
 - Volatility: {vol_data.get('level', 'N/A')} ({vol_data.get('pct', 0)}%)
 - Trend: {indicators.get('trend', 'N/A')}
 - Price Position (20d): {indicators.get('price_position', 'N/A')}%
-{crypto_user_block}
+{market_factor_user_block}
 
 🌐 MACRO ENVIRONMENT:
 {macro_summary}
 
 📰 MARKET NEWS ({len(data.get('news') or [])} items):
 {news_summary}
-
-🎯 PREDICTION MARKETS ({len(polymarket_events)} related events):
-{self._format_polymarket_summary(polymarket_events)}
 
 💼 FUNDAMENTALS / MARKET STRUCTURE:
 - Company: {company.get('name', data['symbol'])}
@@ -991,14 +1064,13 @@ IMPORTANT:
                 # De-dup keep order
                 seen = set()
                 consensus_timeframes = [x for x in consensus_timeframes if not (x in seen or seen.add(x))]
-            # Collect primary data including macro/news/polymarket for prompt quality
+            # Collect primary data including macro/news for prompt quality
             primary_data = self._collect_market_data(
                 market,
                 symbol,
                 primary_tf,
                 include_macro=True,
                 include_news=True,
-                include_polymarket=True,
             )
 
             # Collect extra timeframes for objective consensus (technical-only for cost)
@@ -1044,7 +1116,6 @@ IMPORTANT:
                         tf_norm,
                         include_macro=False,
                         include_news=False,
-                        include_polymarket=False,
                         timeout=25,
                     )
 
@@ -1077,7 +1148,6 @@ IMPORTANT:
                         "1W",
                         include_macro=False,
                         include_news=False,
-                        include_polymarket=False,
                         timeout=25,
                     )
                     cp_1w = _extract_current_price(d_1w) or 0.0
@@ -1101,7 +1171,6 @@ IMPORTANT:
                         "1H",
                         include_macro=False,
                         include_news=False,
-                        include_polymarket=False,
                         timeout=18,
                     )
                     cp_1h = _extract_current_price(d_1h) or 0.0
@@ -1133,8 +1202,6 @@ IMPORTANT:
                 quality_multiplier *= 0.85
             if "news" in failed_items:
                 quality_multiplier *= 0.8
-            if "polymarket" in failed_items:
-                quality_multiplier *= 0.9
             # If indicators missing key sections, reduce confidence more
             ind = primary_data.get("indicators") or {}
             if not ind or not ind.get("rsi") or not ind.get("moving_averages"):
@@ -1247,13 +1314,16 @@ IMPORTANT:
                 f"(Technical: {objective_score['technical_score']:.1f}, Fundamental: {objective_score['fundamental_score']:.1f}, "
                 f"Sentiment: {objective_score['sentiment_score']:.1f}, Macro: {objective_score['macro_score']:.1f})"
             )
+            factor_score = objective_score.get("factor_score", 0.0)
+            factor_summary = objective_score.get("factor_summary") or ""
+            # 兼容旧字段
             crypto_factor_score = objective_score.get("crypto_factor_score")
-            crypto_factor_summary = objective_score.get("crypto_factor_summary") or (data.get("crypto_factors") or {}).get("summary", "")
+            crypto_factor_summary = objective_score.get("crypto_factor_summary") or ""
 
             score_based_decision = self._score_to_decision(objective_score["overall_score"], market=market)
             llm_decision = str(analysis.get("decision", "HOLD") or "HOLD").upper()
-            if market == "Crypto" and crypto_factor_score is not None:
-                analysis["fundamental_score"] = max(0, min(100, int(round((float(crypto_factor_score) + 100.0) / 2.0))))
+            if market in ("Crypto", "CNStock") and factor_score:
+                analysis["fundamental_score"] = max(0, min(100, int(round((float(factor_score) + 100.0) / 2.0))))
 
             # Horizon trend outlook for users (short/medium/long decision reference)
             score_1d = float((objective_by_tf.get("1D") or {}).get("overall_score", objective_score.get("overall_score", 0.0)) or 0.0)
@@ -1417,6 +1487,8 @@ IMPORTANT:
                 detailed_analysis = {"technical": detailed_analysis, "fundamental": "", "sentiment": ""}
             if market == "Crypto" and not detailed_analysis.get("fundamental"):
                 detailed_analysis["fundamental"] = crypto_factor_summary or (data.get("crypto_factors") or {}).get("summary", "")
+            elif market == "CNStock" and not detailed_analysis.get("fundamental"):
+                detailed_analysis["fundamental"] = factor_summary or (data.get("ashare_factors") or {}).get("summary", "")
             
             result.update({
                 "decision": analysis.get("decision", "HOLD"),
@@ -1454,7 +1526,14 @@ IMPORTANT:
                     "overall": self._calculate_overall_score(analysis),
                 },
                 "objective_score": analysis.get("objective_score", {}),
+                # 市场因子 (按市场类型)
                 "crypto_factors": data.get("crypto_factors", {}),
+                "ashare_factors": data.get("ashare_factors", {}),
+                "market_factors": data.get("ashare_factors") or data.get("crypto_factors") or {},
+                "factor_score": factor_score,
+                "factor_breakdown": objective_score.get("factor_breakdown", []),
+                "factor_summary": factor_summary,
+                # 兼容旧字段
                 "crypto_factor_score": crypto_factor_score,
                 "crypto_factor_breakdown": objective_score.get("crypto_factor_breakdown", []),
                 "crypto_factor_summary": crypto_factor_summary,
@@ -1905,17 +1984,25 @@ IMPORTANT:
         news = data.get("news") or []
         macro = data.get("macro") or {}
         price_data = data.get("price") or {}
-        crypto_factors = data.get("crypto_factors") or {}
         
         # 1. 技术指标评分 (-100 to +100)
         technical_score = self._calculate_technical_score(indicators, price_data)
         
         # 2. 基本面评分 (-100 to +100)
         fundamental_score = self._calculate_fundamental_score(fundamental, data.get("market", ""))
-        crypto_factor_objective = self._calculate_crypto_factor_score(crypto_factors, price_data)
-        crypto_factor_score = float(crypto_factor_objective.get("score", 0.0) or 0.0)
-        if str(data.get("market") or "").strip() == "Crypto" and crypto_factors:
-            fundamental_score = crypto_factor_score
+        market_type = str(data.get("market") or "").strip()
+        crypto_factors = data.get("crypto_factors") or {}
+        ashare_factors = data.get("ashare_factors") or {}
+        factor_objective = {"score": 0.0, "breakdown": [], "summary": ""}
+        factor_score = 0.0
+        if market_type == "Crypto" and crypto_factors:
+            factor_objective = self._calculate_crypto_factor_score(crypto_factors, price_data)
+            factor_score = float(factor_objective.get("score", 0.0) or 0.0)
+            fundamental_score = factor_score
+        elif market_type == "CNStock" and ashare_factors:
+            factor_objective = self._calculate_ashare_factor_score(ashare_factors)
+            factor_score = float(factor_objective.get("score", 0.0) or 0.0)
+            fundamental_score = factor_score
         
         # 3. 新闻情绪评分 (-100 to +100)
         sentiment_score = self._calculate_sentiment_score(news)
@@ -1994,9 +2081,13 @@ IMPORTANT:
             "sentiment_score": sentiment_score,
             "macro_score": macro_score,
             "overall_score": overall_score,
-            "crypto_factor_score": crypto_factor_score,
-            "crypto_factor_breakdown": crypto_factor_objective.get("breakdown", []),
-            "crypto_factor_summary": crypto_factor_objective.get("summary") or (crypto_factors.get("summary") if crypto_factors else ""),
+            "factor_score": factor_score,
+            "factor_breakdown": factor_objective.get("breakdown", []),
+            "factor_summary": factor_objective.get("summary") or "",
+            # 兼容旧字段 (Crypto)
+            "crypto_factor_score": factor_score if market_type == "Crypto" else None,
+            "crypto_factor_breakdown": factor_objective.get("breakdown", []) if market_type == "Crypto" else [],
+            "crypto_factor_summary": factor_objective.get("summary") if market_type == "Crypto" else "",
         }
 
     def _get_ai_calibration(self, market: str = "CNStock") -> Dict[str, Any]:
@@ -2365,7 +2456,92 @@ IMPORTANT:
             "breakdown": breakdown,
             "summary": summary,
         }
-    
+
+    def _calculate_ashare_factor_score(self, ashare_factors: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        基于 A 股贪恐指数 (fear_greed_index 7 维度) 计算可解释评分。
+        贪恐指数 0-100 (50=中性) → 映射到 -100~+100。
+        """
+        if not ashare_factors:
+            return {"score": 0.0, "breakdown": [], "summary": ""}
+
+        breakdown = []
+        score = 0.0
+
+        def _safe_f(v: Any, default: float = 0.0) -> float:
+            try:
+                f = float(v)
+                return f if f == f else default
+            except (TypeError, ValueError):
+                return default
+
+        def add(name: str, value: float, reason: str):
+            nonlocal score
+            score += float(value)
+            breakdown.append({"factor": name, "score": round(float(value), 2), "reason": reason})
+
+        # 1. 综合贪恐指数 → 映射到 -50~+50
+        composite = ashare_factors.get("composite_score")
+        if composite is not None:
+            composite_f = _safe_f(composite, 50.0)
+            # 0-100 → -50~+50, 50=中性=0
+            mapped = (composite_f - 50.0)
+            # 极端值加强权重
+            if composite_f <= 20:
+                mapped *= 1.3  # 极度恐惧 → 更强利多（抄底信号）
+            elif composite_f >= 80:
+                mapped *= 1.3  # 极度贪婪 → 更强利空（过热信号）
+            add("composite_fear_greed", round(mapped, 2),
+                f"贪恐指数 {composite_f:.0f}（{ashare_factors.get('composite_label', '')}）")
+
+        # 2. 逐维度分析（异常维度加分）
+        for ind in ashare_factors.get("indicators", []):
+            name = str(ind.get("name") or "")
+            s = _safe_f(ind.get("score"), 50.0)
+            detail = str(ind.get("detail") or "")
+            # 跳过无 score 的指标
+            if ind.get("score") is None:
+                continue
+
+            # 极端维度单独加分
+            if s <= 25:
+                # 恐惧维度 → 可能是利多（反向信号）
+                delta = min(15, (25 - s) * 0.6)
+                add(f"dim_{name}", round(delta, 2), f"{name} 极度恐惧 ({s:.0f}分): {detail}")
+            elif s >= 75:
+                # 贪婪维度 → 可能是利空（过热信号）
+                delta = -min(15, (s - 75) * 0.6)
+                add(f"dim_{name}", round(delta, 2), f"{name} 极度贪婪 ({s:.0f}分): {detail}")
+
+        # 3. 个股主力资金（补充）
+        mf = ashare_factors.get("main_fund_netflow")
+        if mf is not None:
+            mf_f = _safe_f(mf)
+            if mf_f > 5000:
+                add("main_fund", 12, f"主力资金大幅净流入 {mf_f:.0f} 万")
+            elif mf_f > 1000:
+                add("main_fund", 6, f"主力资金净流入 {mf_f:.0f} 万")
+            elif mf_f < -5000:
+                add("main_fund", -12, f"主力资金大幅净流出 {mf_f:.0f} 万")
+            elif mf_f < -1000:
+                add("main_fund", -6, f"主力资金净流出 {mf_f:.0f} 万")
+
+        # 4. 换手率异常
+        tr = ashare_factors.get("turnover_rate")
+        if tr is not None:
+            tr_f = _safe_f(tr)
+            if tr_f > 15:
+                add("turnover", -5, f"换手率 {tr_f:.1f}% 极高，短线博弈剧烈")
+            elif tr_f > 8:
+                add("turnover", 3, f"换手率 {tr_f:.1f}% 偏高，交投活跃")
+
+        summary = str(ashare_factors.get("summary") or "")
+        return {
+            "score": max(-100.0, min(100.0, score)),
+            "breakdown": breakdown,
+            "summary": summary,
+        }
+
     def _calculate_sentiment_score(self, news: List[Dict]) -> float:
         """
         计算新闻情绪评分 (-100 to +100)

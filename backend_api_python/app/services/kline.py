@@ -256,12 +256,16 @@ class KlineService:
 
     # ── 从缓存生成响应 ───────────────────────────────────────────────
 
-    def _ensure_today_batch(self, market: str) -> Dict[str, Dict[str, Any]]:
+    def _ensure_today_batch(self, market: str, symbol: str = "") -> Dict[str, Dict[str, Any]]:
         """批量获取当日 OHLCV（一个 HTTP 请求拉全市场），带 30s 缓存。
 
         通过东方财富 clist 接口一次拿到所有 A 股当日行情，
         避免 N 只股票逐只调分钟线 API。
         仅 CNStock 市场走批量，其他市场返回空（回退逐只）。
+
+        Args:
+            market: 市场类型
+            symbol: 当前请求的 symbol（可选，确保非自选股也能命中批量结果）
         """
         if market != "CNStock":
             return {}
@@ -269,11 +273,18 @@ class KlineService:
         now = _time.time()
         ts = self._today_batch_ts.get(market, 0)
         if (now - ts) < self._SYNTHESIZE_TTL:
-            return self._today_batch.get(market, {})
+            batch = self._today_batch.get(market, {})
+            # 缓存命中且包含目标 symbol → 直接返回
+            if not symbol or symbol in batch:
+                return batch
+            # 缓存命中但不包含目标 symbol → 需要扩展拉取
+            # （fall through 重新拉取，包含额外 symbol）
 
         # 收集该市场所有自选股 + 当前请求的 symbol
         all_by_market = self._get_all_watchlist_symbols_by_market()
         symbols = all_by_market.get(market, [])
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
         if not symbols:
             return {}
 
@@ -307,7 +318,8 @@ class KlineService:
             return cached  # dict 或 None
 
         # 2) 批量缓存（东财 clist，1 次 HTTP 拿全市场）
-        batch = self._ensure_today_batch(market)
+        #    传入 symbol 确保非自选股也能命中批量结果
+        batch = self._ensure_today_batch(market, symbol=symbol)
         if symbol in batch:
             candle = batch[symbol]
             self.cache.set(cache_key, candle, self._SYNTHESIZE_TTL)
@@ -342,6 +354,9 @@ class KlineService:
 
         return bars[-limit:]
 
+    # 闭市后远端未更新时的重试间隔（秒）
+    _COMPLETED_BAR_RETRY_TTL = 300  # 5 分钟后重试
+
     def _try_fetch_completed_bar(self, market, symbol, fetch):
         """闭市后当日已完成日线（不存 feather，带内存缓存防重复调用）
 
@@ -350,6 +365,10 @@ class KlineService:
           - is_trading_day_today() == True（非交易日不需要当日 bar）
           - 非午休时段（11:30-13:00 半日数据不完整，由 synthesize 覆盖）
           - 远程数据源已更新当日收盘数据（有 time == today_ts 的 bar）
+
+        缓存策略：
+          - 成功：缓存 1 小时（当日 bar 不会变）
+          - 失败（远端未更新）：缓存 5 分钟后重试，避免每次请求都打远端
         """
         if not market or _is_market_hours() or not is_trading_day_today():
             return None
@@ -363,10 +382,16 @@ class KlineService:
 
         today_ts = _ts_from_date(_today_str())
         cache_key = f"today_completed:{market}:{symbol}"
+        retry_key = f"today_completed_retry:{market}:{symbol}"
 
+        # 命中成功缓存 → 直接返回
         cached = self.cache.get(cache_key)
         if cached and cached.get("time") == today_ts:
             return cached
+
+        # 命中失败重试缓存 → 5 分钟内不重试
+        if self.cache.get(retry_key):
+            return None
 
         try:
             bars = fetch(market, symbol, "1D", 2)
@@ -374,10 +399,18 @@ class KlineService:
                 for b in bars:
                     if b.get("time") == today_ts:
                         self.cache.set(cache_key, b, 3600)
+                        # 清除重试缓存
+                        self.cache.delete(retry_key)
                         return b
         except Exception as e:
             logger.debug(f"[Kline] 获取当日已完成 bar 失败 {market}:{symbol}: {e}")
 
+        # 远端未更新 → 设置重试缓存，5 分钟后再试
+        self.cache.set(retry_key, True, self._COMPLETED_BAR_RETRY_TTL)
+        logger.debug(
+            f"[Kline] 当日 bar 尚未更新 {market}:{symbol}，"
+            f"{self._COMPLETED_BAR_RETRY_TTL}s 后重试"
+        )
         return None
 
     # ═══════════════════════════════════════════════════════════════════
@@ -393,7 +426,13 @@ class KlineService:
         Returns:
             {"1D": True/False}
         """
-        batch_fetch = lambda m, syms, tf, lim, cs=None: DataSourceFactory.get_kline_batch(m, syms, tf, lim, cached_symbols=cs)
+        try:
+            cached_symbols = self._kc.get_cached_symbols("1D")
+        except Exception:
+            cached_symbols = set()
+        batch_fetch = lambda m, syms, tf, lim, cs=None: DataSourceFactory.get_kline_batch(
+            m, syms, tf, lim, cached_symbols=cs if cs is not None else cached_symbols,
+        )
         results = {}
 
         try:

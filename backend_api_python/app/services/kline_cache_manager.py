@@ -43,6 +43,8 @@ VALID_TIMEFRAMES = {"1D"}
 
 # 预热锁：防止并发预热
 _prewarm_lock = threading.Lock()
+# 预热锁超时（秒）：避免无限等待
+PREWARM_LOCK_TIMEOUT = 15
 
 
 # ─── 工具函数 ───────────────────────────────────────────────────────
@@ -322,9 +324,18 @@ class KlineCacheManager:
             logger.warning(f"[KlineCache] 预热跳过: 无 market 信息")
             return False
 
-        # 预热锁：防止并发预热，但不阻塞 get_cached 读操作
-        with _prewarm_lock:
+        # 预热锁：防止并发预热，带超时避免无限阻塞
+        acquired = _prewarm_lock.acquire(timeout=PREWARM_LOCK_TIMEOUT)
+        if not acquired:
+            logger.warning(
+                f"[KlineCache] 预热锁获取超时 ({PREWARM_LOCK_TIMEOUT}s)，跳过 "
+                f"{market}:{all_symbols[:3]}{'...' if len(all_symbols) > 3 else ''}"
+            )
+            return False
+        try:
             return self._fetch_missing(tf, all_symbols, market, batch_fetch_func)
+        finally:
+            _prewarm_lock.release()
 
     def _fetch_missing(self, tf, symbols, market, batch_fetch_func=None):
         """统一拉取逻辑：按 symbol 独立判断过期 → 拉取日线 → 写入各自文件。"""

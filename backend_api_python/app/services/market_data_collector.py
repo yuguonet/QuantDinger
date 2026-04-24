@@ -161,7 +161,7 @@ class MarketDataCollector:
             data["indicators"] = self._calculate_indicators(data["kline"])
             data["_meta"]["success_items"].append("indicators")
 
-        # === 阶段1.5: Crypto 交易大数据因子 ===
+        # === 阶段1.5: 市场微观结构因子 (按市场类型分支) ===
         if market == 'Crypto':
             try:
                 data["crypto_factors"] = self._get_crypto_factors(
@@ -176,7 +176,25 @@ class MarketDataCollector:
             except Exception as e:
                 logger.warning(f"Crypto factor fetch failed for {symbol}: {e}")
                 data["_meta"]["failed_items"].append("crypto_factors")
-        
+        elif market == 'CNStock':
+            try:
+                data["ashare_factors"] = self._get_ashare_factors(
+                    symbol=symbol,
+                    price_data=data.get("price") or {},
+                    kline_data=data.get("kline") or [],
+                )
+                if data["ashare_factors"] and (
+                    data["ashare_factors"].get("summary")
+                    or data["ashare_factors"].get("composite_score") is not None
+                    or data["ashare_factors"].get("indicators")
+                ):
+                    data["_meta"]["success_items"].append("ashare_factors")
+                else:
+                    data["_meta"]["failed_items"].append("ashare_factors")
+            except Exception as e:
+                logger.warning(f"A-share factor fetch failed for {symbol}: {e}")
+                data["_meta"]["failed_items"].append("ashare_factors")
+
         # === 阶段2: 宏观数据 (如果需要) ===
         if include_macro:
             try:
@@ -1178,6 +1196,160 @@ class MarketDataCollector:
                 "capital_flow": capital_flow.get("source"),
             }
         }
+
+    # ==================== A 股市场因子 ====================
+
+    def _get_ashare_factors(self, symbol: str, price_data: Dict[str, Any], kline_data: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        采集 A 股专属市场微观结构因子。
+        核心数据源: market_cn/fear_greed_index.py (7 维度贪恐指数 + 多源降级)
+        补充: 个股主力资金流向 (cn_stock_extent)
+        """
+        factors: Dict[str, Any] = {
+            "composite_score": None,         # 综合贪恐指数 (0-100, 50=中性)
+            "composite_label": "",           # 贪恐标签
+            "indicators": [],                # 7 维度明细
+            "main_fund_netflow": None,       # 主力资金净流入 (万元)
+            "turnover_rate": None,           # 换手率 (%)
+            "signals": {},
+            "summary": "",
+            "sources": {},
+        }
+
+        def _safe_float(v: Any, default: float = None) -> Optional[float]:
+            if v is None:
+                return default
+            try:
+                f = float(v)
+                return f if f == f else default  # NaN check
+            except (TypeError, ValueError):
+                return default
+
+        # 1. 贪恐指数 (7 维度: 动量/宽度/波动率/成交量/北向/涨跌停/强度)
+        try:
+            from app.market_cn.fear_greed_index import (
+                calc_momentum, calc_breadth, calc_volatility,
+                calc_volume, calc_northbound, calc_limit_ratio, calc_strength,
+            )
+            # 逐个调用避免 fear_greed_index() 里的 print 输出
+            calc_funcs = [
+                calc_momentum, calc_breadth, calc_volatility,
+                calc_volume, calc_northbound, calc_limit_ratio, calc_strength,
+            ]
+            indicators = []
+            for fn in calc_funcs:
+                try:
+                    result = fn()
+                    if isinstance(result, dict):
+                        # 确保 score 是数值
+                        s = _safe_float(result.get("score"))
+                        if s is not None:
+                            result["score"] = s
+                        indicators.append(result)
+                except Exception as e:
+                    logger.debug(f"A-share calc function {fn.__name__} failed: {e}")
+
+            scores = [_safe_float(ind.get("score")) for ind in indicators]
+            scores = [s for s in scores if s is not None]
+            composite = round(sum(scores) / len(scores), 1) if scores else 50.0
+
+            # 标签
+            if composite <= 25:
+                label = "极度恐惧"
+            elif composite <= 40:
+                label = "恐惧"
+            elif composite <= 60:
+                label = "中性"
+            elif composite <= 75:
+                label = "贪婪"
+            else:
+                label = "极度贪婪"
+
+            factors["composite_score"] = composite
+            factors["composite_label"] = label
+            factors["indicators"] = indicators
+            factors["sources"]["fear_greed"] = "market_cn/fear_greed_index"
+
+            # 从 indicators 提取关键信号 (按 name 匹配，不依赖顺序)
+            ind_map = {}
+            for ind in indicators:
+                n = str(ind.get("name") or "").strip()
+                if n:
+                    ind_map[n] = ind
+
+            # 兼容可能的名称变体
+            breadth = ind_map.get("市场宽度(上涨占比)") or ind_map.get("市场宽度")
+            northbound = ind_map.get("北向资金")
+            limit = ind_map.get("涨跌停比")
+            volume = ind_map.get("成交量变化")
+            volatility = ind_map.get("市场波动率")
+            momentum = ind_map.get("股价动量")
+
+            signals = factors["signals"]
+            signals["composite_score"] = composite
+            signals["composite_label"] = label
+
+            def _score_to_bias(entry: Optional[Dict], thresholds: tuple = (70, 55, 45, 30)) -> str:
+                if not entry:
+                    return "neutral"
+                s = _safe_float(entry.get("score"), 50.0)
+                hi2, hi1, lo1, lo2 = thresholds
+                if s >= hi2:
+                    return "strong_bullish"
+                elif s >= hi1:
+                    return "bullish"
+                elif s <= lo2:
+                    return "strong_bearish"
+                elif s <= lo1:
+                    return "bearish"
+                return "neutral"
+
+            signals["breadth_bias"] = _score_to_bias(breadth)
+            signals["northbound_bias"] = _score_to_bias(northbound)
+            signals["limit_heat"] = _score_to_bias(limit, (70, 55, 45, 30))
+
+        except Exception as e:
+            logger.warning(f"A-share fear_greed_index fetch failed: {e}")
+            factors["sources"]["fear_greed_error"] = str(e)
+
+        # 2. 个股主力资金流向 (补充因子)
+        try:
+            if symbol:
+                from app.interfaces.cn_stock_extent import CNStockExtent
+                from app.data_sources.tencent import normalize_cn_code
+                ext = CNStockExtent()
+                code = normalize_cn_code(symbol)
+                if code:
+                    flow = ext.get_stock_fund_flow(code)
+                    if flow:
+                        # 显式 None 检查，避免 0 值被 or 跳过
+                        mf = flow.get("main_net_inflow")
+                        if mf is None:
+                            mf = flow.get("net_inflow")
+                        factors["main_fund_netflow"] = _safe_float(mf)
+                        factors["turnover_rate"] = _safe_float(flow.get("turnover_rate"))
+                        if factors["main_fund_netflow"] is not None or factors["turnover_rate"] is not None:
+                            factors["sources"]["fund_flow"] = "eastmoney/akshare"
+        except Exception as e:
+            logger.debug(f"A-share fund flow fetch failed: {e}")
+
+        # 3. 摘要
+        summary_parts = []
+        if factors["composite_score"] is not None:
+            summary_parts.append(f"贪恐指数 {factors['composite_score']:.0f}（{factors['composite_label']}）")
+        for ind in factors.get("indicators", []):
+            name = str(ind.get("name") or "")
+            score = _safe_float(ind.get("score"))
+            detail = str(ind.get("detail") or "")
+            if score is not None and (score <= 30 or score >= 70):
+                summary_parts.append(f"{name} {score:.0f}分: {detail}")
+        mf = factors.get("main_fund_netflow")
+        if mf is not None:
+            direction = "流入" if mf > 0 else "流出"
+            summary_parts.append(f"主力资金{direction}{abs(mf):.0f}万")
+        factors["summary"] = "；".join(summary_parts) if summary_parts else ""
+
+        return factors
 
     def _normalize_crypto_base_symbol(self, symbol: str) -> str:
         raw = str(symbol or "").strip().upper()

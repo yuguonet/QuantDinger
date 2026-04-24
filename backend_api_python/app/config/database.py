@@ -61,7 +61,7 @@ class MetaCacheConfig(type):
     @property
     def KLINE_CACHE_TTL(cls):
         return {
-            '1m': 5,       # 1分钟K线缓存5秒
+            '1m': 15,       # 1分钟K线缓存15秒
             '3m': 30,      # 3分钟K线缓存30秒
             '5m': 60,      # 5分钟K线缓存1分钟
             '15m': 300,    # 15分钟K线缓存5分钟
