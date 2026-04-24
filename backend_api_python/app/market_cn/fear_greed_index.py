@@ -27,7 +27,7 @@ import os as _os
 import sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 
-from .data_sources import ChinaData, fallback, ak_index_daily, ak_northbound
+from .china_stock import ChinaData, fallback, ak_index_daily, ak_northbound
 
 # 懒初始化数据源
 _data = None
@@ -41,7 +41,7 @@ def _get_data():
 
 def _get_index_df():
     """获取沪深300日线 (多源降级)"""
-    from .data_sources import ts_index_daily, bs_index_daily, ak_index_daily
+    from .china_stock import ts_index_daily, bs_index_daily, ak_index_daily
     return fallback(
         ("tushare", lambda: ts_index_daily("000300.SH")),
         ("akshare", lambda: ak_index_daily("sh000300")),
@@ -51,7 +51,7 @@ def _get_index_df():
 
 def _get_spot_df():
     """获取全A股实时行情 (多源降级)"""
-    from .data_sources import ak_stock_basic
+    from .china_stock import ak_stock_basic
     try:
         import akshare as ak
         return ak.stock_zh_a_spot_em()
@@ -212,7 +212,7 @@ def calc_volume():
 def calc_northbound():
     """5. 北向资金: 近5日净流入"""
     try:
-        from .data_sources import ts_northbound, ak_northbound
+        from .china_stock import ts_northbound, ak_northbound
         df = fallback(
             ("tushare", ts_northbound),
             ("akshare", ak_northbound),

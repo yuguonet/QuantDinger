@@ -762,7 +762,7 @@ def _build_ai_analysis(ov, sk):
 def china_macro():
     """国内宏观经济数据: GDP, CPI, PPI, PMI, M2, 社融, 进出口, LPR"""
     def _run():
-        from app.market_cn.data_sources import ChinaData
+        from app.market_cn.china_stock import ChinaData
         data = ChinaData()
 
         fetchers = [
@@ -1058,7 +1058,7 @@ def _safe_refresh_one(endpoint, fn):
 
 def _fetch_china_macro_data():
     """抽取 china-macro 的数据获取逻辑（供 refresh 调用）"""
-    from app.market_cn.data_sources import ChinaData
+    from app.market_cn.china_stock import ChinaData
     data = ChinaData()
     fetchers = [
         ("gdp", data.gdp), ("cpi", data.cpi), ("ppi", data.ppi), ("pmi", data.pmi),

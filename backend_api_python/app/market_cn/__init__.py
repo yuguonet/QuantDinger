@@ -21,7 +21,7 @@
 
 __version__ = "1.2.0"
 
-from .data_sources import ChinaData
+from .china_stock import ChinaData
 from .fear_greed_index import fear_greed_index
 from .hot_sectors import (
     get_hot_industry_boards,
