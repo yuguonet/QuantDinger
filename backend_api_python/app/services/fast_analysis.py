@@ -1073,6 +1073,10 @@ IMPORTANT:
                 include_news=True,
             )
 
+            # Pre-compute stable scores (macro/sentiment/fundamental/factors)
+            # These are invariant across timeframes; only technical_score changes per tf.
+            stable_scores = self._precompute_stable_scores(primary_data)
+
             # Collect extra timeframes for objective consensus (technical-only for cost)
             objective_by_tf: Dict[str, Dict[str, Any]] = {}
             decision_votes: Dict[str, int] = {"BUY": 0, "SELL": 0, "HOLD": 0}
@@ -1120,7 +1124,14 @@ IMPORTANT:
                     )
 
                 current_price_tf = _extract_current_price(d_tf) or 0.0
-                objective = self._calculate_objective_score(d_tf, current_price_tf)
+                is_primary = (tf_norm == primary_tf)
+                objective = self._fast_objective_score(
+                    stable_scores,
+                    d_tf.get("indicators") or {},
+                    d_tf.get("price") or {},
+                    has_news=is_primary,
+                    has_macro=is_primary,
+                )
                 overall_score = float(objective.get("overall_score", 0.0) or 0.0)
                 decision = self._score_to_decision(overall_score, market=market)
                 abs_score = abs(overall_score)
@@ -1151,7 +1162,13 @@ IMPORTANT:
                         timeout=25,
                     )
                     cp_1w = _extract_current_price(d_1w) or 0.0
-                    obj_1w = self._calculate_objective_score(d_1w, cp_1w)
+                    obj_1w = self._fast_objective_score(
+                        stable_scores,
+                        d_1w.get("indicators") or {},
+                        d_1w.get("price") or {},
+                        has_news=False,
+                        has_macro=False,
+                    )
                     sc_1w = float(obj_1w.get("overall_score", 0.0) or 0.0)
                     objective_by_tf["1W"] = {
                         "objective_score": obj_1w,
@@ -1174,7 +1191,13 @@ IMPORTANT:
                         timeout=18,
                     )
                     cp_1h = _extract_current_price(d_1h) or 0.0
-                    obj_1h = self._calculate_objective_score(d_1h, cp_1h)
+                    obj_1h = self._fast_objective_score(
+                        stable_scores,
+                        d_1h.get("indicators") or {},
+                        d_1h.get("price") or {},
+                        has_news=False,
+                        has_macro=False,
+                    )
                     sc_1h = float(obj_1h.get("overall_score", 0.0) or 0.0)
                     objective_by_tf["1H"] = {
                         "objective_score": obj_1h,
@@ -1307,8 +1330,15 @@ IMPORTANT:
             llm_time = int((time.time() - llm_start) * 1000)
             logger.info(f"LLM call completed in {llm_time}ms")
             
-            # Phase 4: Objective score (primary tf) + consensus calibration
-            objective_score = self._calculate_objective_score(data, current_price)
+            # Phase 4: Reuse cached primary objective score (already computed in consensus loop)
+            objective_score = (objective_by_tf.get(primary_tf) or {}).get("objective_score") or \
+                self._fast_objective_score(
+                    stable_scores,
+                    data.get("indicators") or {},
+                    data.get("price") or {},
+                    has_news=True,
+                    has_macro=True,
+                )
             logger.info(
                 f"Primary objective score: {objective_score['overall_score']:.1f} "
                 f"(Technical: {objective_score['technical_score']:.1f}, Fundamental: {objective_score['fundamental_score']:.1f}, "
@@ -2088,6 +2118,156 @@ IMPORTANT:
             "crypto_factor_score": factor_score if market_type == "Crypto" else None,
             "crypto_factor_breakdown": factor_objective.get("breakdown", []) if market_type == "Crypto" else [],
             "crypto_factor_summary": factor_objective.get("summary") if market_type == "Crypto" else "",
+        }
+
+    # ── Stable-score precomputation (reused across timeframes) ──────────
+
+    @staticmethod
+    def _fundamental_meaningful(fundamental: Dict[str, Any]) -> bool:
+        """Check whether fundamental dict carries actionable valuation data."""
+        if not fundamental:
+            return False
+        for key in (
+            "pe_ratio", "pb_ratio", "ps_ratio", "market_cap",
+            "roe", "eps", "revenue_growth", "profit_margin", "dividend_yield",
+        ):
+            v = fundamental.get(key)
+            if v is None or v == "":
+                continue
+            try:
+                if isinstance(v, float) and v != v:  # NaN
+                    continue
+                return True
+            except Exception:
+                return True
+        return False
+
+    def _precompute_stable_scores(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Pre-compute scores that are invariant across timeframes.
+
+        Returns a cache dict consumed by ``_fast_objective_score``.
+        Must be called ONCE with primary_data (which contains news, macro, factors).
+        """
+        market_type = str(data.get("market") or "").strip()
+        fundamental = data.get("fundamental") or {}
+        news = data.get("news") or []
+        macro = data.get("macro") or {}
+        price_data = data.get("price") or {}
+        crypto_factors = data.get("crypto_factors") or {}
+        ashare_factors = data.get("ashare_factors") or {}
+
+        # fundamental / factor score
+        fundamental_score = self._calculate_fundamental_score(fundamental, market_type)
+        factor_objective: Dict[str, Any] = {"score": 0.0, "breakdown": [], "summary": ""}
+        factor_score = 0.0
+        if market_type == "Crypto" and crypto_factors:
+            factor_objective = self._calculate_crypto_factor_score(crypto_factors, price_data)
+            factor_score = float(factor_objective.get("score", 0.0) or 0.0)
+            fundamental_score = factor_score
+        elif market_type == "CNStock" and ashare_factors:
+            factor_objective = self._calculate_ashare_factor_score(ashare_factors)
+            factor_score = float(factor_objective.get("score", 0.0) or 0.0)
+            fundamental_score = factor_score
+
+        sentiment_score = self._calculate_sentiment_score(news)
+        macro_score = self._calculate_macro_score(macro, market_type)
+
+        # present flags (with-news/macro variant used by primary & post-LLM)
+        fundamental_present = (
+            market_type in ("USStock", "CNStock", "HKStock")
+            and self._fundamental_meaningful(fundamental)
+        )
+        if market_type == "Crypto" and crypto_factors:
+            fundamental_present = True
+        sentiment_present = bool(news)
+        macro_present = bool(macro)
+
+        weights = {
+            "technical": 0.35,
+            "fundamental": 0.20,
+            "sentiment": 0.25,
+            "macro": 0.20,
+        }
+        present_flags = {
+            "technical": True,  # always present when called
+            "fundamental": fundamental_present,
+            "sentiment": sentiment_present,
+            "macro": macro_present,
+        }
+
+        return {
+            "market_type": market_type,
+            "fundamental_score": fundamental_score,
+            "sentiment_score": sentiment_score,
+            "macro_score": macro_score,
+            "factor_score": factor_score,
+            "factor_objective": factor_objective,
+            "weights": weights,
+            "present_flags": present_flags,
+        }
+
+    def _fast_objective_score(
+        self,
+        stable: Dict[str, Any],
+        indicators: Dict[str, Any],
+        price_data: Dict[str, Any],
+        *,
+        has_news: bool = True,
+        has_macro: bool = True,
+    ) -> Dict[str, float]:
+        """
+        Compute objective score using pre-computed stable scores.
+
+        Only ``_calculate_technical_score`` runs per call; all other
+        sub-scores are read from *stable* cache.
+
+        Args:
+            stable: output of ``_precompute_stable_scores``
+            indicators: timeframe-specific indicators
+            price_data: timeframe-specific price dict
+            has_news: whether this timeframe carries news data
+            has_macro: whether this timeframe carries macro data
+        """
+        technical_score = self._calculate_technical_score(indicators, price_data)
+        fundamental_score = stable["fundamental_score"]
+        sentiment_score = stable["sentiment_score"] if has_news else 0.0
+        macro_score = stable["macro_score"] if has_macro else 0.0
+        weights = stable["weights"]
+        present_flags = {
+            "technical": True,
+            "fundamental": stable["present_flags"]["fundamental"],
+            "sentiment": has_news and stable["present_flags"]["sentiment"],
+            "macro": has_macro and stable["present_flags"]["macro"],
+        }
+
+        total_w = sum(w for k, w in weights.items() if present_flags.get(k))
+        if total_w <= 0:
+            overall_score = technical_score
+        else:
+            overall_score = (
+                (technical_score * weights["technical"] if present_flags.get("technical") else 0.0)
+                + (fundamental_score * weights["fundamental"] if present_flags.get("fundamental") else 0.0)
+                + (sentiment_score * weights["sentiment"] if present_flags.get("sentiment") else 0.0)
+                + (macro_score * weights["macro"] if present_flags.get("macro") else 0.0)
+            ) / total_w
+
+        fo = stable["factor_objective"]
+        factor_score = stable["factor_score"]
+        market_type = stable["market_type"]
+
+        return {
+            "technical_score": technical_score,
+            "fundamental_score": fundamental_score,
+            "sentiment_score": sentiment_score,
+            "macro_score": macro_score,
+            "overall_score": overall_score,
+            "factor_score": factor_score,
+            "factor_breakdown": fo.get("breakdown", []),
+            "factor_summary": fo.get("summary") or "",
+            "crypto_factor_score": factor_score if market_type == "Crypto" else None,
+            "crypto_factor_breakdown": fo.get("breakdown", []) if market_type == "Crypto" else [],
+            "crypto_factor_summary": fo.get("summary") if market_type == "Crypto" else "",
         }
 
     def _get_ai_calibration(self, market: str = "CNStock") -> Dict[str, Any]:
