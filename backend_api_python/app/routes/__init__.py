@@ -21,7 +21,6 @@ def register_routes(app: Flask):
     from app.routes.ibkr import ibkr_bp
     from app.routes.mt5 import mt5_bp
     from app.routes.user import user_bp
-    from app.routes.global_market import global_market_bp
     from app.routes.community import community_bp
     from app.routes.fast_analysis import fast_analysis_bp
     from app.routes.billing import billing_bp
@@ -30,7 +29,7 @@ def register_routes(app: Flask):
     from app.routes.experiment import experiment_bp
     # eQuant features: stock picker, market dashboard, AI agent
     from app.routes.xuangu import xuangu_bp
-    from app.routes.shichang import shichang_bp
+    from app.routes.shichang import shichang_bp, global_market_bp
     from app.routes.agent_blueprint import agent_bp
     from app.routes.agent_analysis import analysis_bp
     # market_local — 本地行情存储 (feather)，数据源来自 global-market
