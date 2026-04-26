@@ -36,7 +36,8 @@ class BaseDataSource(ABC):
         symbol: str,
         timeframe: str,
         limit: int,
-        before_time: Optional[int] = None
+        before_time: Optional[int] = None,
+        after_time: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
         获取K线数据
@@ -46,6 +47,7 @@ class BaseDataSource(ABC):
             timeframe: 时间周期 (1m, 5m, 15m, 30m, 1H, 4H, 1D, 1W)
             limit: 数据条数
             before_time: 获取此时间之前的数据（Unix时间戳，秒）
+            after_time: 可选，仅保留 time >= after_time 的 K 线（Unix 秒），用于回测窗口左边界
             
         Returns:
             K线数据列表，格式:
@@ -105,7 +107,9 @@ class BaseDataSource(ABC):
         self,
         klines: List[Dict[str, Any]],
         limit: int,
-        before_time: Optional[int] = None
+        before_time: Optional[int] = None,
+        after_time: Optional[int] = None,
+        truncate: bool = True,
     ) -> List[Dict[str, Any]]:
         """
         过滤和限制K线数据
@@ -114,6 +118,8 @@ class BaseDataSource(ABC):
             klines: K线数据列表
             limit: 最大数量
             before_time: 过滤此时间之后的数据
+            after_time: 若设置，仅保留 time >= after_time
+            truncate: 为 False 时不在末尾按 limit 截断（回测需整段 [after_time, before_time) 时避免误丢左端）
             
         Returns:
             处理后的K线数据
@@ -124,9 +130,11 @@ class BaseDataSource(ABC):
         # 过滤时间
         if before_time:
             klines = [k for k in klines if k['time'] < before_time]
+        if after_time is not None:
+            klines = [k for k in klines if k['time'] >= after_time]
         
         # 限制数量（取最新的）
-        if len(klines) > limit:
+        if truncate and len(klines) > limit:
             klines = klines[-limit:]
         
         return klines

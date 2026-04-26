@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 import ccxt
 
 from app.data_sources.base import BaseDataSource, TIMEFRAME_SECONDS
-from app.data_sources.circuit_breaker import get_overseas_circuit_breaker
+from app.data_sources.circuit_breaker import get_realtime_circuit_breaker
 from app.utils.logger import get_logger
 from app.config import CCXTConfig, APIKeys
 
@@ -40,7 +40,7 @@ class CryptoDataSource(BaseDataSource):
     COMMON_QUOTES = ['USDT', 'USD', 'BTC', 'ETH', 'BUSD', 'USDC', 'BNB', 'EUR', 'GBP']
 
     def __init__(self):
-        self.cb = get_overseas_circuit_breaker()
+        self.cb = get_realtime_circuit_breaker()
 
         config = {
             'timeout': CCXTConfig.TIMEOUT,
@@ -255,7 +255,8 @@ class CryptoDataSource(BaseDataSource):
         symbol: str,
         timeframe: str,
         limit: int,
-        before_time: Optional[int] = None
+        before_time: Optional[int] = None,
+        after_time: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """获取加密货币K线数据"""
         if not self.cb.is_available(self.name):
@@ -295,7 +296,10 @@ class CryptoDataSource(BaseDataSource):
                 ))
 
             # 过滤和限制
-            klines = self.filter_and_limit(klines, limit, before_time)
+            klines = self.filter_and_limit(
+                klines, limit, before_time, after_time,
+                truncate=(after_time is None),
+            )
 
             # 记录结果
             self.log_result(symbol, klines, timeframe)

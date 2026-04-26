@@ -384,6 +384,7 @@ class CNStockDataSource(BaseDataSource):
         timeframe: str,
         limit: int,
         before_time: Optional[int] = None,
+        after_time: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
         获取K线数据，fallback chain:
@@ -425,7 +426,10 @@ class CNStockDataSource(BaseDataSource):
             # 校验结果
             if _validate_kline_result(result):
                 cb.record_success(source_name)
-                out = self.filter_and_limit(result, limit=lim, before_time=before_time)
+                out = self.filter_and_limit(
+                    result, limit=lim, before_time=before_time,
+                    after_time=after_time, truncate=(after_time is None),
+                )
                 total_elapsed = time.time() - t_total_start
                 logger.info(
                     f"[K线成功] {symbol} tf={tf} 来源={source_name} "

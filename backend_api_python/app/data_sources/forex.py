@@ -29,7 +29,7 @@ import threading
 import yfinance as yf
 
 from app.data_sources.base import BaseDataSource, TIMEFRAME_SECONDS
-from app.data_sources.circuit_breaker import get_overseas_circuit_breaker
+from app.data_sources.circuit_breaker import get_realtime_circuit_breaker
 from app.utils.logger import get_logger
 from app.config import TiingoConfig, APIKeys
 
@@ -130,7 +130,7 @@ class ForexDataSource(BaseDataSource):
     }
 
     def __init__(self):
-        self.cb = get_overseas_circuit_breaker()
+        self.cb = get_realtime_circuit_breaker()
         self.base_url = TiingoConfig.BASE_URL
         td_key = _get_td_api_key()
         tiingo_key = APIKeys.TIINGO_API_KEY
@@ -325,7 +325,8 @@ class ForexDataSource(BaseDataSource):
         symbol: str,
         timeframe: str,
         limit: int,
-        before_time: Optional[int] = None
+        before_time: Optional[int] = None,
+        after_time: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
         获取外汇K线数据

@@ -32,7 +32,7 @@ import requests
 import yfinance as yf
 
 from app.data_sources.base import BaseDataSource, TIMEFRAME_SECONDS
-from app.data_sources.circuit_breaker import get_overseas_circuit_breaker
+from app.data_sources.circuit_breaker import get_realtime_circuit_breaker
 from app.utils.logger import get_logger
 from app.config import CCXTConfig, TiingoConfig, APIKeys
 
@@ -108,7 +108,7 @@ class FuturesDataSource(BaseDataSource):
     }
     
     def __init__(self):
-        self.cb = get_overseas_circuit_breaker()
+        self.cb = get_realtime_circuit_breaker()
         # 初始化CCXT（用于加密货币期货）
         config = {
             'timeout': CCXTConfig.TIMEOUT,
@@ -240,7 +240,8 @@ class FuturesDataSource(BaseDataSource):
         symbol: str,
         timeframe: str,
         limit: int,
-        before_time: Optional[int] = None
+        before_time: Optional[int] = None,
+        after_time: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
         获取期货K线数据

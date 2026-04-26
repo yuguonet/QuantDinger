@@ -25,7 +25,7 @@ from __future__ import annotations
 from typing import Dict, List, Any, Optional
 
 from app.data_sources.base import BaseDataSource
-from app.data_sources.circuit_breaker import get_overseas_circuit_breaker
+from app.data_sources.circuit_breaker import get_realtime_circuit_breaker
 from app.data_sources.tencent import normalize_hk_code, fetch_quote, parse_quote_to_ticker, fetch_kline, tencent_kline_rows_to_dicts
 from app.data_sources.asia_stock_kline import (
     normalize_chart_timeframe,
@@ -45,7 +45,7 @@ class HKStockDataSource(BaseDataSource):
     name = "HKStock/multi-source"
 
     def __init__(self):
-        self.cb = get_overseas_circuit_breaker()
+        self.cb = get_realtime_circuit_breaker()
 
     def get_ticker(self, symbol: str) -> Dict[str, Any]:
         code = normalize_hk_code(symbol)
@@ -71,6 +71,7 @@ class HKStockDataSource(BaseDataSource):
         timeframe: str,
         limit: int,
         before_time: Optional[int] = None,
+        after_time: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         if not self.cb.is_available(self.name):
             return []
@@ -87,7 +88,7 @@ class HKStockDataSource(BaseDataSource):
             out = tencent_kline_rows_to_dicts(raw_rows)
             if out:
                 self.cb.record_success(self.name)
-                return self.filter_and_limit(out, limit=lim, before_time=before_time)
+                return self.filter_and_limit(out, limit=lim, before_time=before_time, after_time=after_time, truncate=(after_time is None))
 
         # Tier 2: yfinance (all timeframes)
         rows = fetch_yfinance_klines(
@@ -95,7 +96,7 @@ class HKStockDataSource(BaseDataSource):
         )
         if rows:
             self.cb.record_success(self.name)
-            return self.filter_and_limit(rows, limit=lim, before_time=before_time)
+            return self.filter_and_limit(rows, limit=lim, before_time=before_time, after_time=after_time, truncate=(after_time is None))
 
         # Tier 3: AkShare (国内兜底, minute/weekly)
         if tf in ("1m", "5m", "15m", "30m", "1H", "4H"):
@@ -110,7 +111,7 @@ class HKStockDataSource(BaseDataSource):
             rows = []
         if rows:
             self.cb.record_success(self.name)
-            return self.filter_and_limit(rows, limit=lim, before_time=before_time)
+            return self.filter_and_limit(rows, limit=lim, before_time=before_time, after_time=after_time, truncate=(after_time is None))
 
         # Tier 4: Twelve Data (海外付费, 最后降级)
         rows = fetch_twelvedata_klines(
@@ -119,4 +120,4 @@ class HKStockDataSource(BaseDataSource):
         if rows:
             self.cb.record_success(self.name)
         # 空结果不触发熔断（可能是合法的：休市、代码不存在）
-        return self.filter_and_limit(rows, limit=lim, before_time=before_time)
+        return self.filter_and_limit(rows, limit=lim, before_time=before_time, after_time=after_time, truncate=(after_time is None))
