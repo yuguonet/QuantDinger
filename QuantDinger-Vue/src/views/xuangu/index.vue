@@ -88,9 +88,42 @@
         <!-- 右侧结果表格 -->
         <div class="result-panel">
           <div class="table-toolbar">
-            <el-button type="warning" size="small" icon="el-icon-star-off" @click="addSelectedToWatchlist" :disabled="selectedRows.length === 0 || !selectedRows.some(r => r.code)">
-              加自选 <span v-if="selectedRows.length > 0">({{ selectedRows.length }})</span>
-            </el-button>
+            <!-- 左侧：加自选 + 指标策略下拉 + 自动审核按钮 -->
+            <div class="toolbar-left-group">
+              <el-button type="warning" size="small" icon="el-icon-star-off" @click="addSelectedToWatchlist" :disabled="selectedRows.length === 0 || !selectedRows.some(r => r.code)">
+                加自选 <span v-if="selectedRows.length > 0">({{ selectedRows.length }})</span>
+              </el-button>
+              <!-- 指标策略下拉：从 /api/indicator/getIndicators 加载用户的所有指标 -->
+              <el-select
+                v-model="selectedReviewIndicatorId"
+                size="small"
+                placeholder="选择指标策略"
+                clearable
+                filterable
+                :loading="reviewIndicatorsLoading"
+                class="review-indicator-select"
+              >
+                <el-option
+                  v-for="ind in reviewIndicators"
+                  :key="ind.id"
+                  :label="ind.name || ('指标 #' + ind.id)"
+                  :value="ind.id"
+                >
+                  <span>{{ ind.name || ('指标 #' + ind.id) }}</span>
+                </el-option>
+              </el-select>
+              <!-- 自动审核：选择指标+勾选股票后可点击，发起 SSE 审核流 -->
+              <el-button
+                type="primary"
+                size="small"
+                icon="el-icon-s-check"
+                @click="startAutoReview"
+                :disabled="selectedRows.length === 0 || !selectedReviewIndicatorId"
+                :loading="reviewRunning"
+              >
+                自动审核 <span v-if="selectedRows.length > 0">({{ selectedRows.length }})</span>
+              </el-button>
+            </div>
             <div class="toolbar-right">
               <el-button type="success" size="small" icon="el-icon-star-on" @click="openSaveDialog">保存策略</el-button>
               <el-button type="info" size="small" icon="el-icon-folder-opened" @click="openMyStrategies">我的策略</el-button>
@@ -244,6 +277,75 @@
         </span>
       </el-dialog>
 
+      <!-- ═══════════════════════════════════════════════════════
+           指标策略自动审核对话框
+           - 审核中：禁用点击遮罩/ESC/关闭按钮
+           - 显示进度条 + 逐条结果滚动列表 + 完成汇总
+           ═══════════════════════════════════════════════════════ -->
+      <el-dialog
+        title="指标策略自动审核"
+        :visible.sync="reviewDialogVisible"
+        width="560px"
+        :close-on-click-modal="!reviewRunning"
+        :close-on-press-escape="!reviewRunning"
+        :show-close="!reviewRunning"
+      >
+        <div class="review-dialog-body">
+          <!-- 总体进度 -->
+          <div class="review-progress-header" v-if="reviewRunning || reviewDone">
+            <el-progress
+              :percentage="reviewTotal > 0 ? Math.round((reviewCurrentIndex / reviewTotal) * 100) : 0"
+              :status="reviewDone ? 'success' : ''"
+              :stroke-width="10"
+            ></el-progress>
+            <div class="review-progress-text">
+              <span v-if="reviewRunning">正在审核 {{ reviewCurrentIndex }} / {{ reviewTotal }}</span>
+              <span v-else-if="reviewDone">审核完成</span>
+            </div>
+          </div>
+
+          <!-- 当前状态 -->
+          <div v-if="reviewCurrentMsg" class="review-current-msg">
+            <i class="el-icon-loading" v-if="reviewRunning"></i>
+            <span>{{ reviewCurrentMsg }}</span>
+          </div>
+
+          <!-- 审核结果列表 -->
+          <div class="review-results" ref="reviewResultsList">
+            <div
+              v-for="(r, idx) in reviewResults"
+              :key="idx"
+              class="review-result-item"
+              :class="{
+                'result-pass': r.added,
+                'result-skip': !r.added && r.type === 'result',
+                'result-progress': r.type === 'progress'
+              }"
+            >
+              <i v-if="r.added" class="el-icon-circle-check result-icon-pass"></i>
+              <i v-else-if="r.type === 'result' && !r.added" class="el-icon-circle-close result-icon-skip"></i>
+              <i v-else class="el-icon-loading result-icon-loading"></i>
+              <span class="result-msg">{{ r.msg }}</span>
+            </div>
+          </div>
+
+          <!-- 完成汇总 -->
+          <div v-if="reviewDone" class="review-summary">
+            <el-alert
+              :title="`审核完成：共${reviewDoneData.total}只，通过${reviewDoneData.added}只，跳过${reviewDoneData.skipped}只`"
+              :type="reviewDoneData.added > 0 ? 'success' : 'info'"
+              show-icon
+              :closable="false"
+            ></el-alert>
+          </div>
+        </div>
+
+        <span slot="footer">
+          <el-button v-if="!reviewRunning" @click="reviewDialogVisible = false">关闭</el-button>
+          <el-button v-if="reviewRunning" type="danger" @click="cancelReview">取消</el-button>
+        </span>
+      </el-dialog>
+
     </div>
   </div>
 </template>
@@ -252,6 +354,8 @@
 import Vue from 'vue'
 import ElementUI from 'element-ui'
 import 'element-ui/lib/theme-chalk/index.css'
+import storage from 'store'
+import { ACCESS_TOKEN } from '@/store/mutation-types'
 import FilterPanel, { getDefaultFilters } from './components/FilterPanel.vue'
 import { getWatchlist, addWatchlist, removeWatchlist, getWatchlistPrices } from '@/api/market'
 import { getUserInfo } from '@/api/login'
@@ -295,7 +399,21 @@ export default {
       saving: false,
       strategiesDialogVisible: false,
       strategiesLoading: false,
-      myStrategies: []
+      myStrategies: [],
+
+      // ── 指标策略审核相关状态 ──
+      reviewIndicators: [],              // 可选指标列表（从 /api/indicator/getIndicators 加载）
+      reviewIndicatorsLoading: false,    // 指标列表加载中
+      selectedReviewIndicatorId: null,   // 当前选中的指标ID
+      reviewDialogVisible: false,        // 审核对话框是否可见
+      reviewRunning: false,              // 审核是否进行中（禁用关闭按钮）
+      reviewDone: false,                 // 审核是否已完成
+      reviewCurrentIndex: 0,             // 当前审核到第几只
+      reviewTotal: 0,                    // 总共多少只
+      reviewCurrentMsg: '',              // 当前状态消息
+      reviewResults: [],                 // 审核结果列表（用于滚动显示）
+      reviewDoneData: { total: 0, added: 0, skipped: 0 },  // 完成汇总
+      reviewAbortController: null        // fetch AbortController（用于取消审核）
     }
   },
   computed: {
@@ -452,6 +570,7 @@ export default {
         }
       } catch (e) { /* silent */ }
       this.loadWatchlist()
+      this.loadReviewIndicators()
     },
 
     async loadWatchlist () {
@@ -1011,6 +1130,211 @@ export default {
       this.filters[minKey] = val[0]
       this.filters[maxKey] = val[1]
       this.updateAiQuery()
+    },
+
+    // ═══════════════════════════════════════════════════════════
+    //  指标策略审核
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * 加载用户可用的指标列表（自己的 + 社区购买的）
+     * 用于填充"指标策略"下拉框
+     */
+    async loadReviewIndicators () {
+      this.reviewIndicatorsLoading = true
+      try {
+        const res = await request({ url: '/api/indicator/getIndicators', method: 'get', params: { userid: this.userId } })
+        if (res && res.code === 1 && res.data) {
+          this.reviewIndicators = res.data
+        }
+      } catch (e) {
+        /* silent */
+      } finally {
+        this.reviewIndicatorsLoading = false
+      }
+    },
+
+    /**
+     * 发起自动审核
+     *
+     * 流程：
+     *   1. 校验：指标已选 + 股票已勾选
+     *   2. 收集选中股票 → {code, name, market}
+     *   3. 打开审核对话框，初始化状态
+     *   4. fetch POST /api/xuangu/review（SSE 流）
+     *   5. ReadableStream 逐行读取 "data: {...}" JSON
+     *   6. 每条消息调用 handleReviewSSE 更新 UI
+     *   7. 完成/中断后清理状态
+     *
+     * 取消机制：
+     *   用户点"取消" → abortController.abort()
+     *   → fetch 的 signal 触发 → 抛 AbortError
+     *   → 后端检测到连接断开 → GeneratorExit → 当前股票跑完后退出
+     */
+    async startAutoReview () {
+      if (!this.selectedReviewIndicatorId) {
+        this.$message.warning('请先选择指标策略')
+        return
+      }
+      if (this.selectedRows.length === 0) {
+        this.$message.warning('请先勾选要审核的股票')
+        return
+      }
+
+      const stocks = this.selectedRows.filter(r => r.code).map(r => ({
+        code: r.code,
+        name: r.name || '',
+        market: 'CNStock'
+      }))
+
+      if (stocks.length === 0) {
+        this.$message.warning('无有效股票')
+        return
+      }
+
+      const indicatorName = (this.reviewIndicators.find(i => i.id === this.selectedReviewIndicatorId) || {}).name || '指标策略'
+
+      this.reviewDialogVisible = true
+      this.reviewRunning = true
+      this.reviewDone = false
+      this.reviewCurrentIndex = 0
+      this.reviewTotal = stocks.length
+      this.reviewCurrentMsg = `正在按照${indicatorName}审核${stocks.length}只股票...`
+      this.reviewResults = []
+      this.reviewDoneData = { total: 0, added: 0, skipped: 0 }
+
+      // 使用 fetch + ReadableStream 处理 SSE
+      const abortController = new AbortController()
+      this.reviewAbortController = abortController
+
+      try {
+        // 获取 token（兼容字符串和对象两种格式，与 request.js 一致）
+        let token = storage.get(ACCESS_TOKEN) || ''
+        if (typeof token !== 'string') {
+          token = (token && typeof token === 'object') ? (token.token || token.value || '') : ''
+        }
+        const resp = await fetch('/api/xuangu/review', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': token ? `Bearer ${token}` : '',
+            [ACCESS_TOKEN]: token,
+            'token': token
+          },
+          body: JSON.stringify({
+            indicator_id: this.selectedReviewIndicatorId,
+            stocks: stocks
+          }),
+          signal: abortController.signal
+        })
+
+        if (!resp.ok) {
+          const errData = await resp.json().catch(() => ({}))
+          throw new Error(errData.msg || `HTTP ${resp.status}`)
+        }
+
+        const reader = resp.body.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n')
+          buffer = lines.pop() || ''
+
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue
+            const jsonStr = line.substring(6).trim()
+            if (!jsonStr || jsonStr === '[DONE]') continue
+
+            try {
+              const data = JSON.parse(jsonStr)
+              this.handleReviewSSE(data, indicatorName)
+            } catch (parseErr) {
+              /* skip malformed */
+            }
+          }
+        }
+      } catch (err) {
+        if (err.name === 'AbortError') {
+          this.$message.info('审核已取消')
+        } else {
+          this.$message.error('审核失败: ' + err.message)
+        }
+      } finally {
+        this.reviewRunning = false
+        this.reviewAbortController = null
+        this.$nextTick(() => this.scrollReviewResults())
+      }
+    },
+
+    /**
+     * 处理后端推送的单条 SSE 消息，更新审核对话框 UI
+     *
+     * 消息类型：
+     *   progress — 正在处理中，显示 loading 图标
+     *   result   — 单只股票审核结论，取消该股票的复选框勾选
+     *   done     — 全部完成，刷新自选股列表
+     *   error    — 致命错误（指标不存在等）
+     */
+    handleReviewSSE (data, indicatorName) {
+      if (data.type === 'progress') {
+        this.reviewCurrentIndex = data.index || this.reviewCurrentIndex
+        this.reviewCurrentMsg = data.msg || ''
+        this.reviewResults.push(data)
+      } else if (data.type === 'result') {
+        this.reviewCurrentIndex = data.index || this.reviewCurrentIndex
+        this.reviewCurrentMsg = data.msg || ''
+        this.reviewResults.push(data)
+
+        // 取消该股票的复选框
+        if (data.symbol) {
+          const row = this.selectedRows.find(r => r.code === data.symbol)
+          if (row) {
+            this.$nextTick(() => {
+              // 从 selectedRows 中移除该股票，取消表格复选框勾选
+              this.selectedRows = this.selectedRows.filter(r => r.code !== data.symbol)
+            })
+          }
+        }
+      } else if (data.type === 'done') {
+        this.reviewDone = true
+        this.reviewDoneData = {
+          total: data.total || 0,
+          added: data.added || 0,
+          skipped: data.skipped || 0
+        }
+        this.reviewCurrentMsg = data.msg || '审核完成'
+        if (data.added > 0) {
+          this.$message.success(`审核完成，已添加 ${data.added} 只到自选股`)
+          this.loadWatchlist()
+        }
+      } else if (data.type === 'error') {
+        this.$message.error(data.msg || '审核出错')
+        this.reviewDone = true
+      }
+
+      this.$nextTick(() => this.scrollReviewResults())
+    },
+
+    scrollReviewResults () {
+      const el = this.$refs.reviewResultsList
+      if (el) {
+        el.scrollTop = el.scrollHeight
+      }
+    },
+
+    /**
+     * 取消审核
+     * 通过 AbortController 中止 fetch 请求，后端会在当前股票跑完后退出
+     */
+    cancelReview () {
+      if (this.reviewAbortController) {
+        this.reviewAbortController.abort()
+      }
     }
   },
   watch: {
@@ -1319,6 +1643,21 @@ export default {
   justify-content: space-between;
 }
 
+.toolbar-left-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.review-indicator-select {
+  width: 200px;
+}
+
+.review-indicator-select ::v-deep .el-input__inner {
+  border-radius: 6px;
+  font-size: 13px;
+}
+
 .toolbar-right {
   display: flex;
   gap: 8px;
@@ -1423,6 +1762,104 @@ export default {
   max-height: 120px;
   overflow-y: auto;
   word-break: break-all;
+}
+
+/* --- 审核对话框 --- */
+.review-dialog-body {
+  max-height: 480px;
+  display: flex;
+  flex-direction: column;
+}
+
+.review-progress-header {
+  margin-bottom: 12px;
+}
+
+.review-progress-text {
+  text-align: center;
+  font-size: 13px;
+  color: #606266;
+  margin-top: 4px;
+}
+
+.review-current-msg {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: #ecf5ff;
+  border-radius: 6px;
+  font-size: 13px;
+  color: #409eff;
+  margin-bottom: 12px;
+}
+
+.review-current-msg i {
+  font-size: 14px;
+}
+
+.review-results {
+  flex: 1;
+  overflow-y: auto;
+  max-height: 300px;
+  border: 1px solid #ebeef5;
+  border-radius: 6px;
+  padding: 6px;
+  background: #fafbfc;
+}
+
+.review-result-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  font-size: 13px;
+  margin-bottom: 4px;
+  transition: background 0.2s;
+}
+
+.review-result-item:hover {
+  background: #f0f2f5;
+}
+
+.result-icon-pass {
+  color: #67c23a;
+  font-size: 15px;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.result-icon-skip {
+  color: #f56c6c;
+  font-size: 15px;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.result-icon-loading {
+  color: #409eff;
+  font-size: 14px;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.result-msg {
+  color: #303133;
+  line-height: 1.4;
+  word-break: break-all;
+}
+
+.result-pass .result-msg {
+  color: #67c23a;
+}
+
+.result-skip .result-msg {
+  color: #909399;
+}
+
+.review-summary {
+  margin-top: 12px;
 }
 
 /* --- 响应式 --- */

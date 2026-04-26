@@ -91,6 +91,19 @@
       <div class="toolbar-right">
         <a-tooltip placement="bottomLeft">
           <template slot="title">
+            {{ codeDrawerVisible ? '显示自选股' : '显示代码编辑器' }}
+          </template>
+          <a-button
+            class="ide-toolbar-icon-btn"
+            size="small"
+            :type="codeDrawerVisible ? 'default' : 'primary'"
+            @click="codeDrawerVisible = !codeDrawerVisible"
+          >
+            <a-icon type="star" theme="filled" />
+          </a-button>
+        </a-tooltip>
+        <a-tooltip placement="bottomLeft">
+          <template slot="title">
             {{ quickTradeDrawerVisible ? $t('indicatorIde.hideQuickTrade') : $t('indicatorIde.showQuickTrade') }}
           </template>
           <a-button
@@ -109,9 +122,9 @@
     <!-- Main split panels -->
     <div class="ide-main">
       <!-- Left panel (collapsible drawer) -->
-      <div v-show="codeDrawerVisible" class="ide-left">
+      <div class="ide-left">
         <!-- Code Editor (collapsible) -->
-        <div class="code-panel" :class="{ collapsed: !codePanelExpanded }">
+        <div v-show="codeDrawerVisible" class="code-panel" :class="{ collapsed: !codePanelExpanded }">
           <div class="panel-title" @click="codePanelExpanded = !codePanelExpanded" style="cursor: pointer;">
             <a-icon type="code" />
             <span>{{ $t('indicatorIde.codeEditor') }}</span>
@@ -289,6 +302,15 @@
               </div>
             </div>
           </div>
+        </div>
+
+        <!-- 自选股面板（代码编辑器隐藏时显示） -->
+        <div v-show="!codeDrawerVisible" class="ide-watchlist-inline">
+          <watchlist-panel
+            v-model="selectedWatchlistKey"
+            @select="onWatchlistPanelSelect"
+            style="width: 100%; flex: 1; max-height: none; border: none; box-shadow: none; border-radius: 0; align-self: stretch;"
+          />
         </div>
 
       </div>
@@ -1049,6 +1071,7 @@ import { getWatchlist, addWatchlist, searchSymbols } from '@/api/market'
 import KlineChart from '@/views/indicator-analysis/components/KlineChart.vue'
 import BacktestHistoryDrawer from '@/views/indicator-analysis/components/BacktestHistoryDrawer.vue'
 import QuickTradePanel from '@/components/QuickTradePanel/QuickTradePanel'
+import WatchlistPanel from '@/components/WatchlistPanel'
 import { Modal } from 'ant-design-vue'
 
 const TF_MAX_DAYS = {
@@ -1093,7 +1116,7 @@ function ideUiCacheStorageKey (userId) {
 export default {
   name: 'IndicatorIDE',
   mixins: [baseMixin],
-  components: { KlineChart, BacktestHistoryDrawer, QuickTradePanel },
+  components: { KlineChart, BacktestHistoryDrawer, QuickTradePanel, WatchlistPanel },
   data () {
     return {
       userId: null,
@@ -3506,6 +3529,16 @@ export default {
         this.symbol = ''
       }
     },
+    onWatchlistPanelSelect (stock) {
+      if (stock && stock.market && stock.symbol) {
+        this.market = stock.market
+        this.symbol = stock.symbol
+        this.qtSymbol = stock.symbol
+        this.selectedWatchlistKey = `${stock.market}:${stock.symbol}`
+        this.ensureChartReady()
+        this.schedulePersistIdeUiState()
+      }
+    },
     getMarketColor (m) {
       const colors = { Crypto: 'orange', USStock: 'blue', CNStock: 'magenta', HKStock: 'red', Forex: 'green', Futures: 'purple', PredictionMarket: 'cyan' }
       return colors[m] || 'default'
@@ -3980,6 +4013,23 @@ export default {
 }
 .code-panel-body { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
 .code-editor-wrapper { flex: 1; position: relative; overflow: hidden; display: flex; flex-direction: column; }
+
+// ===== Watchlist Inline (代码编辑器隐藏时显示) =====
+.ide-watchlist-inline {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  ::v-deep .watchlist-panel {
+    width: 100% !important;
+    flex: 1 !important;
+    max-height: none !important;
+    border: none !important;
+    box-shadow: none !important;
+    border-radius: 0 !important;
+    align-self: stretch !important;
+  }
+}
 
 // ===== AI Loading Overlay on code editor =====
 .code-ai-overlay {
@@ -5401,6 +5451,9 @@ export default {
   .ai-optimize-card-desc { color: rgba(255, 255, 255, 0.45); }
   .panel-title { color: rgba(255,255,255,0.85); border-bottom-color: #303030; &:hover { background: rgba(255,255,255,0.04); } }
   .ai-gen-panel { border-top-color: #303030; }
+  .ide-watchlist-inline {
+    ::v-deep .watchlist-panel { background: #1a1a1c; }
+  }
   .ai-gen-header { color: rgba(255,255,255,0.85); &:hover { background: rgba(255,255,255,0.04); } }
   .code-ai-overlay { background: rgba(20,20,20,0.82); }
   .code-ai-overlay-inner { color: #58a6ff; }

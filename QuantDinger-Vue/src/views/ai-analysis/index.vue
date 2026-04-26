@@ -4,132 +4,11 @@
     <div class="main-content-full">
       <!-- 主体三栏布局 -->
       <div class="main-body">
-        <!-- 右侧自选股面板 -->
-        <div class="watchlist-panel">
-          <div class="panel-header">
-            <span class="panel-title"><a-icon type="star" theme="filled" /> {{ $t('dashboard.analysis.watchlist.title') }}</span>
-            <span class="panel-header-actions">
-              <a-tooltip :title="$t('aiAssetAnalysis.tasks.manage')">
-                <a-badge :count="monitors.length" :offset="[-2, 2]" :number-style="{ fontSize: '9px', minWidth: '14px', height: '14px', lineHeight: '14px', padding: '0 3px' }">
-                  <a-icon type="unordered-list" class="panel-header-icon" @click="showTaskDrawer = true" />
-                </a-badge>
-              </a-tooltip>
-              <a-tooltip :title="$t('aiAssetAnalysis.batch.schedule')">
-                <a-icon type="schedule" class="panel-header-icon" @click="toggleBatchMode" />
-              </a-tooltip>
-              <a-icon type="plus" class="panel-header-icon" @click="showAddStockModal = true" />
-            </span>
-          </div>
-
-          <!-- 汇总统计条 -->
-          <div class="panel-summary" v-if="watchlist && watchlist.length > 0">
-            <div class="summary-chip">
-              <span class="sc-num">{{ watchlist.length }}</span>
-              <span class="sc-label">{{ $t('aiAssetAnalysis.watchlist.totalAssets') }}</span>
-            </div>
-            <div class="summary-chip" v-if="watchlistPositionCount > 0">
-              <span class="sc-num">{{ watchlistPositionCount }}</span>
-              <span class="sc-label">{{ $t('aiAssetAnalysis.watchlist.positionCount') }}</span>
-            </div>
-            <div class="summary-chip" v-if="watchlistTaskCount > 0">
-              <span class="sc-num">{{ watchlistTaskCount }}</span>
-              <span class="sc-label">{{ $t('aiAssetAnalysis.watchlist.taskCount') }}</span>
-            </div>
-            <div class="summary-chip pnl" v-if="watchlistTotalPnl !== 0">
-              <span class="sc-num" :class="watchlistTotalPnl >= 0 ? 'up' : 'down'">{{ watchlistTotalPnl >= 0 ? '+' : '' }}{{ formatNum(watchlistTotalPnl) }}</span>
-              <span class="sc-label">P&amp;L</span>
-            </div>
-          </div>
-
-          <!-- 批量勾选栏 -->
-          <div class="batch-bar" v-if="batchMode">
-            <a-checkbox :checked="batchSelectedAll" :indeterminate="batchIndeterminate" @change="onBatchSelectAll" class="batch-all-cb">
-              {{ $t('aiAssetAnalysis.batch.selectAll') }}
-            </a-checkbox>
-            <a-button type="primary" size="small" :disabled="batchSelectedKeys.length === 0" @click="openBatchScheduleModal">
-              {{ $t('aiAssetAnalysis.batch.schedule') }}<template v-if="batchSelectedKeys.length > 0"> {{ batchSelectedKeys.length }}</template>
-            </a-button>
-            <a-button size="small" @click="toggleBatchMode">{{ $t('common.cancel') }}</a-button>
-          </div>
-
-          <div class="watchlist-list">
-            <div
-              v-for="stock in (watchlist || [])"
-              :key="`wl-${stock.market}-${stock.symbol}`"
-              class="wl-card"
-              :class="{ active: selectedSymbol === `${stock.market}:${stock.symbol}` }"
-              @click="selectWatchlistItem(stock)"
-            >
-              <a-checkbox
-                v-if="batchMode"
-                class="wl-card-cb"
-                :checked="batchSelectedKeys.includes(`${stock.market}:${stock.symbol}`)"
-                @change="onBatchItemToggle(stock, $event)"
-                @click.native.stop
-              />
-              <div class="wl-card-body" :class="{ 'with-cb': batchMode }">
-                <!-- 主信息行：代码 + 价格/涨跌 -->
-                <div class="wl-row-main">
-                  <div class="wl-info-left">
-                    <div class="wl-symbol-line">
-                      <span class="wl-symbol">{{ stock.symbol }}</span>
-                      <span class="wl-market">{{ getMarketName(stock.market) }}</span>
-                    </div>
-                    <div class="wl-name" v-if="stock.name && stock.name !== stock.symbol">{{ stock.name }}</div>
-                  </div>
-                  <div class="wl-sparkline-wrap" v-if="watchlistPrices[`${stock.market}:${stock.symbol}`]">
-                    <svg class="wl-sparkline" viewBox="0 0 60 20" preserveAspectRatio="none">
-                      <polyline
-                        :points="getSparklinePoints(stock)"
-                        fill="none"
-                        :stroke="(watchlistPrices[`${stock.market}:${stock.symbol}`]?.change || 0) >= 0 ? '#10b981' : '#ef4444'"
-                        stroke-width="1.5"
-                        stroke-linecap="round"
-                        stroke-linejoin="round"
-                      />
-                    </svg>
-                  </div>
-                  <span v-else class="wl-spacer"></span>
-                  <div class="wl-info-right" v-if="watchlistPrices[`${stock.market}:${stock.symbol}`]">
-                    <span class="wl-price">{{ formatPrice(watchlistPrices[`${stock.market}:${stock.symbol}`].price) }}</span>
-                    <span class="wl-change" :class="(watchlistPrices[`${stock.market}:${stock.symbol}`]?.change || 0) >= 0 ? 'up' : 'down'">
-                      {{ (watchlistPrices[`${stock.market}:${stock.symbol}`]?.change || 0) >= 0 ? '+' : '' }}{{ formatNum(watchlistPrices[`${stock.market}:${stock.symbol}`]?.change) }}%
-                    </span>
-                  </div>
-                </div>
-                <!-- 持仓/盈亏行（仅有持仓时） -->
-                <div class="wl-row-pnl" v-if="positionSummaryMap[`${stock.market}:${stock.symbol}`]">
-                  <span class="wl-pnl-qty">{{ formatNum(positionSummaryMap[`${stock.market}:${stock.symbol}`].quantity, 4) }} @ {{ formatPrice(positionSummaryMap[`${stock.market}:${stock.symbol}`].avgEntry || 0) }}</span>
-                  <span class="wl-pnl-val" :class="positionSummaryMap[`${stock.market}:${stock.symbol}`].pnl >= 0 ? 'up' : 'down'">
-                    {{ positionSummaryMap[`${stock.market}:${stock.symbol}`].pnl >= 0 ? '+' : '' }}{{ formatNum(positionSummaryMap[`${stock.market}:${stock.symbol}`].pnl || 0) }}
-                    ({{ positionSummaryMap[`${stock.market}:${stock.symbol}`].pnlPercent >= 0 ? '+' : '' }}{{ formatNum(positionSummaryMap[`${stock.market}:${stock.symbol}`].pnlPercent || 0) }}%)
-                  </span>
-                </div>
-                <!-- 任务状态（仅有任务时） -->
-                <div class="wl-row-task" v-if="getMonitorMeta(stock)">
-                  <span class="wl-task-badge" :class="getMonitorMeta(stock).activeCount > 0 ? 'active' : 'paused'" @click.stop="toggleStockMonitor(stock)">
-                    <a-icon :type="getMonitorMeta(stock).activeCount > 0 ? 'sync' : 'pause-circle'" :spin="getMonitorMeta(stock).activeCount > 0" />
-                    {{ getMonitorMeta(stock).activeCount > 0 ? ($t('aiAssetAnalysis.monitor.running')) : ($t('aiAssetAnalysis.monitor.paused')) }}
-                  </span>
-                  <span class="wl-task-next" v-if="getMonitorMeta(stock).nextRunAtText">{{ getMonitorMeta(stock).nextRunAtText }}</span>
-                </div>
-              </div>
-              <!-- hover 浮出操作 -->
-              <div class="wl-card-hover-actions">
-                <a-tooltip :title="$t('aiAssetAnalysis.position.quickAdd')"><span class="wl-hover-btn" @click.stop="openPositionModal(stock)"><a-icon type="wallet" /></span></a-tooltip>
-                <a-tooltip :title="$t('aiAssetAnalysis.monitor.quickTask')"><span class="wl-hover-btn" @click.stop="openMonitorModal(stock)"><a-icon type="clock-circle" /></span></a-tooltip>
-                <span class="wl-hover-btn danger" @click.stop="removeFromWatchlist(stock)"><a-icon type="delete" /></span>
-              </div>
-            </div>
-            <div v-if="!watchlist || watchlist.length === 0" class="watchlist-empty">
-              <div class="we-icon"><a-icon type="star" /></div>
-              <p>{{ $t('dashboard.analysis.empty.noWatchlist') }}</p>
-              <a-button type="primary" size="small" icon="plus" @click="showAddStockModal = true">
-                {{ $t('dashboard.analysis.watchlist.add') }}
-              </a-button>
-            </div>
-          </div>
-        </div>
+        <!-- 自选股面板（独立模块） -->
+        <watchlist-panel
+          v-model="selectedSymbol"
+          @select="onWatchlistSelect"
+        />
         <!-- 右侧：工具栏 + AI 分析 -->
         <div class="right-panel">
           <!-- 分析工具栏 -->
@@ -627,6 +506,7 @@ import { getWatchlist, addWatchlist, removeWatchlist, getWatchlistPrices, getMar
 import { getPositions, addPosition, getMonitors, addMonitor, updateMonitor, deleteMonitor } from '@/api/portfolio'
 import { fastAnalyze, getAllAnalysisHistory, deleteAnalysisHistory } from '@/api/fast-analysis'
 import FastAnalysisReport from './components/FastAnalysisReport.vue'
+import WatchlistPanel from '@/components/WatchlistPanel'
 
 export default {
   name: 'Analysis',
@@ -645,7 +525,8 @@ export default {
     }
   },
   components: {
-    FastAnalysisReport
+    FastAnalysisReport,
+    WatchlistPanel
   },
   data () {
     return {
@@ -857,6 +738,13 @@ export default {
       this.$emit('symbol-change', value)
     },
     selectWatchlistItem (stock) {
+      this.selectedSymbol = `${stock.market}:${stock.symbol}`
+      this.analysisResult = null
+      this.analysisError = null
+      this.analysisErrorTone = 'error'
+      this.$emit('symbol-change', this.selectedSymbol)
+    },
+    onWatchlistSelect (stock) {
       this.selectedSymbol = `${stock.market}:${stock.symbol}`
       this.analysisResult = null
       this.analysisError = null

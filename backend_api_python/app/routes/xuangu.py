@@ -429,3 +429,90 @@ def remove_from_watchlist(item_id: int):
     except Exception as e:
         logger.error(f"remove_from_watchlist failed: {e}", exc_info=True)
         return jsonify({"code": 1, "msg": str(e)}), 500
+
+
+# ================================================================
+# 指标策略审核（SSE 流式）
+# ================================================================
+
+# ================================================================
+# POST /review — 指标策略自动审核（SSE 流式）
+# ================================================================
+# 【作用】
+#   接收前端选股器提交的股票列表 + 指标策略ID，
+#   逐只股票执行指标分析，通过 SSE 实时推送审核进度和结果。
+#
+# 【前端调用方式】
+#   fetch('/api/xuangu/review', { method:'POST', body: JSON.stringify({...}) })
+#   → ReadableStream 逐条读取 SSE 消息
+#
+# 【SSE 消息流】
+#   data: {"type":"progress","symbol":"000001","status":"checking","msg":"..."}
+#   data: {"type":"result",  "symbol":"000001","added":true,   "msg":"..."}
+#   data: {"type":"done",    "total":5,"added":2,"skipped":3}
+#
+# 【安全约束】
+#   - @login_required：必须登录
+#   - 单次最多 200 只（防滥用）
+#   - 指标代码在沙箱中执行（safe_exec，30s 超时）
+
+@xuangu_bp.route("/review", methods=["POST"])
+@login_required
+def review_by_indicator():
+    """
+    指标策略自动审核 — SSE 流式返回逐只股票审核进度。
+
+    Request JSON:
+      {
+        "indicator_id": int,          # 指标ID（必填）
+        "stocks": [                   # 待审核股票列表
+          {"code": "000001", "name": "平安银行", "market": "CNStock"},
+          ...
+        ],
+        "params": {}                  # 指标参数覆盖（可选）
+      }
+
+    Response: text/event-stream
+      data: {"type":"progress","symbol":"000001","status":"checking","msg":"..."}
+      data: {"type":"result","symbol":"000001","added":true,"msg":"..."}
+      data: {"type":"done","total":5,"added":2,"skipped":3}
+    """
+    from flask import Response
+    from app.services.indicator_review import review_stocks
+
+    data = request.get_json() or {}
+    user_id = g.user_id               # @login_required 已注入
+    indicator_id = data.get("indicator_id")
+    stocks = data.get("stocks") or []
+    user_params = data.get("params") or {}
+
+    # ── 参数校验（快速失败，不进入 SSE 流） ──
+    if not indicator_id:
+        return jsonify({"code": 1, "msg": "请选择指标策略"}), 400
+    if not stocks:
+        return jsonify({"code": 1, "msg": "未选择任何股票"}), 400
+    if len(stocks) > 200:
+        return jsonify({"code": 1, "msg": "单次最多审核200只股票"}), 400
+
+    # ── SSE Generator ──
+    # Flask 的 Response 接收生成器，逐块推送给客户端。
+    # 客户端断开时 Flask 在下一个 yield 处抛 GeneratorExit。
+    def generate():
+        try:
+            for sse_msg in review_stocks(user_id, int(indicator_id), stocks, user_params):
+                logger.debug(f"review SSE yield: {sse_msg[:80]}...")
+                yield sse_msg
+        except GeneratorExit:
+            logger.info("review SSE: client disconnected")
+        except Exception as e:
+            logger.error(f"review SSE generator error: {e}", exc_info=True)
+
+    # X-Accel-Buffering: no → 告诉 Nginx 不要缓冲，实时推送
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
