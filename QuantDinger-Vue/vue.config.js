@@ -148,7 +148,40 @@ const vueConfig = {
         ws: true,
         changeOrigin: true,
         timeout: 600000, // 10 minutes for long-running requests like backtest
-        proxyTimeout: 600000 // 10 minutes proxy timeout
+        proxyTimeout: 600000, // 10 minutes proxy timeout
+
+        // ── SSE 流式穿透 ──
+        // http-proxy 默认会缓冲整个 HTTP 响应再转发给客户端。
+        // 对于 SSE（text/event-stream），这意味着前端在后端完成前
+        // 收不到任何数据 → 进度条永远为 0%。
+        // selfHandleResponse=true 后手动 pipe 响应流，跳过缓冲。
+        selfHandleResponse: true,
+        onProxyRes (proxyRes, req, res) {
+          // 非 SSE 响应：让 http-proxy 默认处理（已接管，需手动 pipe）
+          const ct = proxyRes.headers['content-type'] || ''
+          if (!ct.includes('text/event-stream')) {
+            // 写响应头
+            res.writeHead(proxyRes.statusCode, proxyRes.headers)
+            proxyRes.pipe(res)
+            return
+          }
+          // SSE 响应：逐 chunk flush，确保前端实时收到
+          const headers = Object.assign({}, proxyRes.headers)
+          delete headers['content-length']       // 流式响应无固定长度
+          delete headers['content-encoding']     // 禁止 gzip 压缩流
+          headers['cache-control'] = 'no-cache'
+          headers['x-accel-buffering'] = 'no'
+          res.writeHead(proxyRes.statusCode, headers)
+          proxyRes.on('data', (chunk) => {
+            res.write(chunk)
+            if (typeof res.flush === 'function') res.flush()
+          })
+          proxyRes.on('end', () => res.end())
+          proxyRes.on('error', (err) => {
+            console.error('[proxy] SSE stream error:', err.message)
+            res.end()
+          })
+        }
       },
       // 腾讯行情接口（大盘指数，10秒刷新）
       '/qt': {

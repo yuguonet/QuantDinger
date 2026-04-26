@@ -299,14 +299,16 @@
               :stroke-width="10"
             ></el-progress>
             <div class="review-progress-text">
-              <span v-if="reviewRunning">正在审核 {{ reviewCurrentIndex }} / {{ reviewTotal }}</span>
+              <span v-if="reviewCancelling">正在取消，等待当前股票处理完毕…</span>
+              <span v-else-if="reviewRunning">正在审核 {{ reviewCurrentIndex }} / {{ reviewTotal }}</span>
               <span v-else-if="reviewDone">审核完成</span>
             </div>
           </div>
 
           <!-- 当前状态 -->
-          <div v-if="reviewCurrentMsg" class="review-current-msg">
-            <i class="el-icon-loading" v-if="reviewRunning"></i>
+          <div v-if="reviewCurrentMsg" class="review-current-msg" :class="{ 'msg-cancelling': reviewCancelling }">
+            <i class="el-icon-loading" v-if="reviewRunning && !reviewCancelling"></i>
+            <i class="el-icon-warning-outline" v-if="reviewCancelling"></i>
             <span>{{ reviewCurrentMsg }}</span>
           </div>
 
@@ -319,11 +321,13 @@
               :class="{
                 'result-pass': r.added,
                 'result-skip': !r.added && r.type === 'result',
-                'result-progress': r.type === 'progress'
+                'result-progress': r.type === 'progress',
+                'result-heartbeat': r.type === 'heartbeat'
               }"
             >
               <i v-if="r.added" class="el-icon-circle-check result-icon-pass"></i>
               <i v-else-if="r.type === 'result' && !r.added" class="el-icon-circle-close result-icon-skip"></i>
+              <i v-else-if="r.type === 'heartbeat'" class="el-icon-time result-icon-heartbeat"></i>
               <i v-else class="el-icon-loading result-icon-loading"></i>
               <span class="result-msg">{{ r.msg }}</span>
             </div>
@@ -342,7 +346,10 @@
 
         <span slot="footer">
           <el-button v-if="!reviewRunning" @click="reviewDialogVisible = false">关闭</el-button>
-          <el-button v-if="reviewRunning" type="danger" @click="cancelReview">取消</el-button>
+          <el-button v-if="reviewRunning && !reviewCancelling" type="danger" @click="cancelReview">取消审核</el-button>
+          <el-button v-if="reviewCancelling" type="info" disabled>
+            <i class="el-icon-loading"></i> 正在取消…
+          </el-button>
         </span>
       </el-dialog>
 
@@ -413,7 +420,8 @@ export default {
       reviewCurrentMsg: '',              // 当前状态消息
       reviewResults: [],                 // 审核结果列表（用于滚动显示）
       reviewDoneData: { total: 0, added: 0, skipped: 0 },  // 完成汇总
-      reviewAbortController: null        // fetch AbortController（用于取消审核）
+      reviewAbortController: null,       // fetch AbortController（用于取消审核）
+      reviewCancelling: false            // 正在取消中（等待后端当前股票处理完）
     }
   },
   computed: {
@@ -1205,6 +1213,7 @@ export default {
       this.reviewDialogVisible = true
       this.reviewRunning = true
       this.reviewDone = false
+      this.reviewCancelling = false
       this.reviewCurrentIndex = 0
       this.reviewTotal = stocks.length
       this.reviewCurrentMsg = `正在按照${indicatorName}审核${stocks.length}只股票...`
@@ -1214,6 +1223,25 @@ export default {
       // 使用 fetch + ReadableStream 处理 SSE
       const abortController = new AbortController()
       this.reviewAbortController = abortController
+
+      // decoder/buffer/processLines 放在 try 外面，确保 catch 块也能访问
+      const decoder = new TextDecoder()
+      let buffer = ''
+      const processLines = (text) => {
+        buffer += text
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          const jsonStr = line.substring(6).trim()
+          if (!jsonStr || jsonStr === '[DONE]') continue
+          try {
+            const data = JSON.parse(jsonStr)
+            console.log('[SSE] msg:', data.type, data.msg || '')
+            this.handleReviewSSE(data, indicatorName)
+          } catch (parseErr) { /* skip malformed */ }
+        }
+      }
 
       try {
         // 获取 token（兼容字符串和对象两种格式，与 request.js 一致）
@@ -1243,8 +1271,6 @@ export default {
 
         console.log('[SSE] connected, status:', resp.status, 'content-type:', resp.headers.get('content-type'))
         const reader = resp.body.getReader()
-        const decoder = new TextDecoder()
-        let buffer = ''
 
         while (true) {
           const { done, value } = await reader.read()
@@ -1252,34 +1278,29 @@ export default {
 
           const chunk = decoder.decode(value, { stream: true })
           console.log('[SSE] chunk:', chunk.length, 'bytes')
-          buffer += chunk
-          const lines = buffer.split('\n')
-          buffer = lines.pop() || ''
-
-          for (const line of lines) {
-            if (!line.startsWith('data: ')) continue
-            const jsonStr = line.substring(6).trim()
-            if (!jsonStr || jsonStr === '[DONE]') continue
-
-            try {
-              const data = JSON.parse(jsonStr)
-              console.log('[SSE] msg:', data.type, data.msg || '')
-              this.handleReviewSSE(data, indicatorName)
-            } catch (parseErr) {
-              /* skip malformed */
-            }
-          }
+          processLines(chunk)
         }
       } catch (err) {
         console.error('[SSE] error:', err.name, err.message)
         if (err.name === 'AbortError') {
-          // 用户取消 — cancelReview 已关闭对话框，无需额外提示
+          // abort 后 decoder 缓冲区可能还有未 decode 的数据，buffer 可能还有未处理的行
+          try {
+            const tail = decoder.decode()
+            if (tail) processLines(tail)
+          } catch (_) {}
+          console.log('[SSE] fetch aborted, buffer flushed')
         } else {
           this.$message.error('审核失败: ' + err.message)
+          this.reviewDialogVisible = false
         }
       } finally {
-        this.reviewRunning = false
+        // 取消中不立即改 reviewRunning，保持"正在取消…"按钮状态，
+        // 等 done 消息到达后再设 false。
+        if (!this.reviewCancelling) {
+          this.reviewRunning = false
+        }
         this.reviewAbortController = null
+        // 注意：不清理 _cancelForceTimer，让 done handler 或 timer 自己清理
       }
     },
 
@@ -1293,7 +1314,14 @@ export default {
      *   error    — 致命错误（指标不存在等）
      */
     handleReviewSSE (data, indicatorName) {
-      if (data.type === 'progress') {
+      if (data.type === 'heartbeat') {
+        // 心跳消息：后端仍在处理中，更新当前状态但不追加到结果列表（避免刷屏）
+        // 仅更新进度文字和索引，让用户知道连接还活着
+        this.reviewCurrentIndex = data.index || this.reviewCurrentIndex
+        if (!this.reviewCancelling) {
+          this.reviewCurrentMsg = data.msg || `正在处理第 ${this.reviewCurrentIndex} / ${this.reviewTotal} 只…`
+        }
+      } else if (data.type === 'progress') {
         this.reviewCurrentIndex = data.index || this.reviewCurrentIndex
         this.reviewCurrentMsg = data.msg || ''
         this.reviewResults.push(data)
@@ -1314,12 +1342,19 @@ export default {
         }
       } else if (data.type === 'done') {
         this.reviewDone = true
+        this.reviewRunning = false
+        this.reviewCancelling = false
         this.reviewDoneData = {
           total: data.total || 0,
           added: data.added || 0,
           skipped: data.skipped || 0
         }
         this.reviewCurrentMsg = data.msg || '审核完成'
+        // 清理 force timer
+        if (this._cancelForceTimer) {
+          clearTimeout(this._cancelForceTimer)
+          this._cancelForceTimer = null
+        }
         if (data.added > 0) {
           this.$message.success(`审核完成，已添加 ${data.added} 只到自选股`)
           this.loadWatchlist()
@@ -1327,6 +1362,12 @@ export default {
       } else if (data.type === 'error') {
         this.$message.error(data.msg || '审核出错')
         this.reviewDone = true
+        this.reviewRunning = false
+        this.reviewCancelling = false
+        if (this._cancelForceTimer) {
+          clearTimeout(this._cancelForceTimer)
+          this._cancelForceTimer = null
+        }
       }
 
       this.$nextTick(() => this.scrollReviewResults())
@@ -1341,14 +1382,41 @@ export default {
 
     /**
      * 取消审核
-     * 通过 AbortController 中止 fetch 请求，后端会在当前股票跑完后退出
+     *
+     * 时序关键：必须让 Vue 先渲染"取消中"状态，再中断 fetch。
+     *   1. 设置 reviewCancelling = true → Vue 排队 DOM 更新
+     *   2. $nextTick → DOM 已渲染"正在取消…"按钮 + 提示文字
+     *   3. 再用 setTimeout(500) 确保用户肉眼可见
+     *   4. abort() → reader.read() 抛 AbortError → catch → finally
+     *   5. 后端 GeneratorExit → cancelled[0]=True → 当前股票跑完后停
+     *   6. 后端发 done → 前端收到 → 关闭对话框
+     *   7. 兜底：8 秒超时强制关闭（防止后端卡死）
      */
     cancelReview () {
-      if (this.reviewAbortController) {
-        this.reviewAbortController.abort()
-      }
-      this.reviewRunning = false
-      this.reviewDialogVisible = false
+      // ① 先更新 UI 状态
+      this.reviewCancelling = true
+      this.reviewCurrentMsg = '正在取消审核，等待当前股票处理完毕…'
+
+      // ② 等 Vue 渲染完再中断连接
+      this.$nextTick(() => {
+        setTimeout(() => {
+          // ③ 此时用户已看到"正在取消"状态，安全中断
+          if (this.reviewAbortController) {
+            this.reviewAbortController.abort()
+          }
+        }, 500)
+      })
+
+      // ④ 兜底：8 秒后强制关闭（后端可能卡在阻塞调用上）
+      this._cancelForceTimer = setTimeout(() => {
+        if (this.reviewCancelling) {
+          console.warn('[SSE] force closing after 8s timeout')
+          this.reviewRunning = false
+          this.reviewCancelling = false
+          this.reviewDialogVisible = false
+          this.$message.info('审核已取消')
+        }
+      }, 8000)
     }
   },
   watch: {
@@ -1374,6 +1442,12 @@ export default {
     this.startWatchlistPriceRefresh()
   },
   beforeDestroy () {
+    if (this._cancelForceTimer) {
+      clearTimeout(this._cancelForceTimer)
+    }
+    if (this.reviewAbortController) {
+      this.reviewAbortController.abort()
+    }
   }
 }
 </script>
@@ -1858,6 +1932,13 @@ export default {
   margin-top: 1px;
 }
 
+.result-icon-heartbeat {
+  color: #909399;
+  font-size: 14px;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
 .result-msg {
   color: #303133;
   line-height: 1.4;
@@ -1870,6 +1951,22 @@ export default {
 
 .result-skip .result-msg {
   color: #909399;
+}
+
+.result-heartbeat .result-msg {
+  color: #c0c4cc;
+  font-size: 12px;
+  font-style: italic;
+}
+
+.result-heartbeat {
+  opacity: 0.6;
+}
+
+.msg-cancelling {
+  background: #fdf6ec !important;
+  color: #e6a23c !important;
+  border: 1px solid #f5dab1;
 }
 
 .review-summary {

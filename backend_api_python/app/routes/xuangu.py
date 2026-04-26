@@ -13,6 +13,7 @@
   DELETE /api/xuangu/watchlist/<id> → 删除自选股
 """
 from flask import Blueprint, request, jsonify, g
+import json
 
 from app.utils.db import get_db_connection
 from app.utils.auth import get_current_user_id, login_required
@@ -502,6 +503,8 @@ def review_by_indicator():
         cancelled = [False]
         q = queue.Queue()
         stop_event = threading.Event()
+        # 最新进度快照，心跳线程用它生成 data 类型心跳（非注释）
+        _latest_progress = {"index": 0, "total": len(stocks), "symbol": "", "status": "initializing"}
 
         try:
             _indicator_id = int(indicator_id)
@@ -509,11 +512,27 @@ def review_by_indicator():
             yield 'data: {"type":"error","msg":"无效的指标ID"}\n\n'
             return
 
-        # 心跳线程：每秒发一条注释，强制代理刷新缓冲
+        # 心跳线程：每 2 秒发一条 *data 类型* 心跳，确保前端能感知连接存活。
+        # 旧版用 SSE 注释（": heartbeat"），前端 parser 忽略注释，导致长时间无
+        # data 消息时进度条完全静止。改为 type=heartbeat 的真实 data 消息后，
+        # 前端收到即可更新"仍在处理"状态。
         def heartbeat():
             while not stop_event.is_set():
                 try:
-                    q.put(("heartbeat", ": heartbeat\n\n"), timeout=1)
+                    # 等 2 秒；如果有数据进来先发数据
+                    stop_event.wait(timeout=2)
+                    if stop_event.is_set():
+                        break
+                    p = _latest_progress
+                    hb_msg = json.dumps({
+                        "type": "heartbeat",
+                        "symbol": p.get("symbol", ""),
+                        "index": p.get("index", 0),
+                        "total": p.get("total", len(stocks)),
+                        "status": p.get("status", "checking"),
+                        "msg": f"正在处理第 {p.get('index', 0)}/{p.get('total', len(stocks))} 只…",
+                    }, ensure_ascii=False)
+                    q.put(("data", f"data: {hb_msg}\n\n"), timeout=1)
                 except queue.Full:
                     pass
 
@@ -524,6 +543,22 @@ def review_by_indicator():
         def producer():
             try:
                 for sse_msg in review_stocks(user_id, _indicator_id, stocks, user_params, _cancelled=cancelled):
+                    # 更新进度快照（心跳线程读取）
+                    try:
+                        _raw = sse_msg.strip()
+                        if _raw.startswith("data: "):
+                            _raw = _raw[6:]
+                        _d = json.loads(_raw)
+                        if "index" in _d:
+                            _latest_progress["index"] = _d["index"]
+                        if "symbol" in _d:
+                            _latest_progress["symbol"] = _d["symbol"]
+                        if "status" in _d:
+                            _latest_progress["status"] = _d["status"]
+                        if "total" in _d:
+                            _latest_progress["total"] = _d["total"]
+                    except Exception:
+                        pass
                     q.put(("data", sse_msg))
             except Exception as e:
                 logger.error(f"review SSE producer error: {e}", exc_info=True)
@@ -539,14 +574,11 @@ def review_by_indicator():
                 try:
                     msg_type, msg = q.get(timeout=30)
                 except queue.Empty:
-                    # 30秒无数据 → 连接可能已死，退出
                     logger.warning("review SSE: 30s timeout, closing")
                     break
 
                 if msg_type == "done":
                     break
-                elif msg_type == "heartbeat":
-                    yield msg
                 else:
                     yield msg
         except GeneratorExit:

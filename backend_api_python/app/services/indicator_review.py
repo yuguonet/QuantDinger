@@ -187,7 +187,8 @@ def _get_current_price_ticker(
 # ================================================================
 
 def _run_indicator_on_stock(
-    indicator_code: str, market: str, symbol: str, user_params: Dict[str, Any] = None
+    indicator_code: str, market: str, symbol: str, user_params: Dict[str, Any] = None,
+    _cancelled: List[bool] = None,
 ) -> Dict[str, Any]:
     """
     在真实股票K线数据上执行用户指标代码，提取买点信号。
@@ -204,6 +205,11 @@ def _run_indicator_on_stock(
       - 禁止 import/os/sys/网络操作
       - 超时自动终止
 
+    取消支持：
+      - _cancelled 标志在每个耗时步骤前后检查
+      - 标志置 True 时立即返回 cancelled 结果，不继续后续步骤
+      - 沙箱执行通过 ThreadPoolExecutor 包装，每 0.5s 轮询取消标志
+
     返回:
       {
         "success": bool,              # 整体是否成功
@@ -211,10 +217,13 @@ def _run_indicator_on_stock(
         "current_price": float | None,# 当前价格（实时或K线close）
         "has_buy_signal": bool,       # 指标是否产生了 buy=True 的信号
         "error": str | None,          # 失败原因
+        "cancelled": bool,            # 是否被取消（可选）
       }
     """
     from app.services.indicator_params import IndicatorParamsParser
     from app.utils.safe_exec import build_safe_builtins, safe_exec_with_validation
+
+    cancelled = _cancelled or [False]
 
     result = {
         "success": False,
@@ -222,7 +231,14 @@ def _run_indicator_on_stock(
         "current_price": None,
         "has_buy_signal": False,
         "error": None,
+        "cancelled": False,
     }
+
+    # ── 检查取消 ──
+    if cancelled[0]:
+        result["cancelled"] = True
+        result["error"] = "已取消"
+        return result
 
     # ── 1. 获取 K 线 ──
     df = _get_stock_kline(market, symbol, limit=200)
@@ -230,41 +246,78 @@ def _run_indicator_on_stock(
         result["error"] = f"无法获取 {symbol} 的K线数据"
         return result
 
+    # ── 检查取消（K线拉取后） ──
+    if cancelled[0]:
+        result["cancelled"] = True
+        result["error"] = "已取消"
+        return result
+
     # ── 2. 当前价格（实时优先，K线兜底） ──
     current_price = _get_current_price_ticker(market, symbol, fallback_df=df)
     result["current_price"] = current_price
 
     # ── 3. 解析指标参数 ──
-    # 例：代码中 # @param rsi_len int 14 RSI周期 → {"rsi_len": 14}
-    # 用户可通过前端传入 params={"rsi_len": 20} 覆盖默认值
     declared_params = IndicatorParamsParser.parse_params(indicator_code)
     merged_params = IndicatorParamsParser.merge_params(declared_params, user_params or {})
 
-    # ── 4. 沙箱执行 ──
+    # ── 检查取消（沙箱执行前） ──
+    if cancelled[0]:
+        result["cancelled"] = True
+        result["error"] = "已取消"
+        return result
+
+    # ── 4. 沙箱执行（带取消感知） ──
     df_copy = df.copy()
     exec_env = {
-        "df": df_copy,       # 指标代码操作的 DataFrame
-        "pd": pd,            # pandas（沙箱内可用）
-        "np": np,            # numpy（沙箱内可用）
-        "params": merged_params,  # 合并后的参数字典
-        "output": None,      # 部分指标用 output dict 输出图表数据
+        "df": df_copy,
+        "pd": pd,
+        "np": np,
+        "params": merged_params,
+        "output": None,
     }
     exec_env["__builtins__"] = build_safe_builtins()
 
     try:
-        exec_result = safe_exec_with_validation(
-            code=indicator_code,
-            exec_globals=exec_env,
-            exec_locals=exec_env,
-            timeout=30,
-        )
+        # 使用 ThreadPoolExecutor 包装，支持取消中断
+        # 关键：daemon=True + shutdown(wait=False)，取消时立即返回不等后台线程
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+
+        def _exec_indicator():
+            return safe_exec_with_validation(
+                code=indicator_code,
+                exec_globals=exec_env,
+                exec_locals=exec_env,
+                timeout=30,
+            )
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(_exec_indicator)
+        try:
+            exec_result = None
+            for _ in range(60):  # 30s / 0.5s = 60 次
+                if cancelled[0]:
+                    future.cancel()
+                    result["cancelled"] = True
+                    result["error"] = "已取消"
+                    return result
+                try:
+                    exec_result = future.result(timeout=0.5)
+                    break
+                except FuturesTimeoutError:
+                    continue
+
+            if exec_result is None:
+                result["error"] = "指标执行超时(30s)"
+                return result
+        finally:
+            # 关键：wait=False 不等后台线程，取消时立即返回
+            executor.shutdown(wait=False)
+
         if not exec_result.get("success"):
             result["error"] = f"指标执行失败: {exec_result.get('error', '未知错误')}"
             return result
 
         # ── 5. 提取买点信号 ──
-        # 指标代码执行后，应在 df 上设置 df['buy'] = True/False 布尔列
-        # 代表"这里出现了买点信号"
         executed_df = exec_env.get("df", df_copy)
         if "buy" not in executed_df.columns:
             result["error"] = "指标未生成 buy 信号列"
@@ -272,7 +325,6 @@ def _run_indicator_on_stock(
 
         buy_series = executed_df["buy"].astype(bool)
         if buy_series.any():
-            # 取最后一个买点信号位置的 close 作为"买点价格"
             buy_indices = buy_series[buy_series].index.tolist()
             last_buy_idx = buy_indices[-1]
             try:
@@ -296,7 +348,7 @@ def _run_indicator_on_stock(
 #  新闻情感分析层
 # ================================================================
 
-def _search_stock_news_sentiment(symbol: str, name: str = "") -> Dict[str, Any]:
+def _search_stock_news_sentiment(symbol: str, name: str = "", _cancelled: List[bool] = None) -> Dict[str, Any]:
     """
     搜索个股近3天新闻并分析情感倾向。
 
@@ -304,6 +356,11 @@ def _search_stock_news_sentiment(symbol: str, name: str = "") -> Dict[str, Any]:
       - Web 搜索引擎（百度/博查等）
       - 5 路国内财经直连（东财公告/新浪/腾讯/凤凰/新浪7x24）
     自动去重 + 加权情感评分 + 时间衰减综合评分。
+
+    取消支持：
+      - 使用 ThreadPoolExecutor 包装搜索调用
+      - 每 0.5s 轮询取消标志，最多等待 15s
+      - 取消时立即返回默认中性结果
 
     返回:
       {
@@ -319,6 +376,7 @@ def _search_stock_news_sentiment(symbol: str, name: str = "") -> Dict[str, Any]:
       - direction=中性/利好/偏利好 → 通过
       - direction=利空/偏利空 且 composite_score<=0 → 不通过
     """
+    cancelled = _cancelled or [False]
     result = {
         "has_news": False,
         "composite_score": 5.0,  # 默认中性
@@ -327,16 +385,43 @@ def _search_stock_news_sentiment(symbol: str, name: str = "") -> Dict[str, Any]:
         "error": None,
     }
 
+    # ── 检查取消 ──
+    if cancelled[0]:
+        return result
+
     try:
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
         from app.services.search import SearchService
 
-        svc = SearchService()
-        search_resp = svc.search_cn_stock_news(
-            stock_code=symbol,
-            stock_name=name or "",
-            days=3,               # 搜索近3天
-            max_web_results=3,    # Web搜索最多3条
-        )
+        def _do_search():
+            svc = SearchService()
+            return svc.search_cn_stock_news(
+                stock_code=symbol,
+                stock_name=name or "",
+                days=3,
+                max_web_results=3,
+            )
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(_do_search)
+        try:
+            search_resp = None
+            for _ in range(30):  # 15s / 0.5s = 30 次
+                if cancelled[0]:
+                    future.cancel()
+                    logger.info(f"_search_stock_news_sentiment({symbol}): cancelled")
+                    return result
+                try:
+                    search_resp = future.result(timeout=0.5)
+                    break
+                except FuturesTimeoutError:
+                    continue
+
+            if search_resp is None:
+                result["error"] = "新闻搜索超时(15s)"
+                return result
+        finally:
+            executor.shutdown(wait=False)
 
         if not search_resp or not search_resp.success:
             err_msg = getattr(search_resp, "error_message", None)
@@ -352,8 +437,6 @@ def _search_stock_news_sentiment(symbol: str, name: str = "") -> Dict[str, Any]:
 
         result["has_news"] = True
 
-        # 综合评分来自 search_cn_stock_news 的 metadata
-        # 计算方式：每条新闻关键词情感分析 → 指数时间衰减 → 加权汇总
         metadata = getattr(search_resp, "metadata", None) or {}
         composite_score = metadata.get("composite_score")
         direction = metadata.get("direction")
@@ -469,9 +552,13 @@ def review_stocks(
       用户关闭对话框 → 前端 abort fetch → Flask 在下一个 yield 处抛 GeneratorExit
       → 外层 generate() 设置 cancelled[0]=True 并调用 gen.close()
       → 内层在下一个 yield 点收到 GeneratorExit，except 捕获后 return
-      → 当前正在跑的耗时操作（指标执行/新闻搜索）不会被中断，
-        跑完后到 yield 才退出（最多多跑一只）
-      → cancelled 标志让循环在下一只股票开始前主动 break，双保险
+
+      【增强】cancelled 标志同时透传到底层耗时操作：
+      - _run_indicator_on_stock：在 K线拉取后、沙箱执行前检查取消；
+        沙箱执行通过 ThreadPoolExecutor + 0.5s 轮询，最坏 0.5s 内响应取消
+      - _search_stock_news_sentiment：同样用 ThreadPoolExecutor 包装，
+        每 0.5s 检查取消标志，最多等 15s
+      → 用户取消后最多 ~0.5s 即可中断当前操作，无需等满 30s
 
     【审核规则汇总】
       ├─ 指标代码不存在或无权 → error + done
@@ -542,8 +629,12 @@ def review_stocks(
             logger.info(f"[review] {idx+1}/{total} {symbol} 开始指标分析")
             try:
                 indicator_result = _run_indicator_on_stock(
-                    indicator_code, market, symbol, user_params
+                    indicator_code, market, symbol, user_params, _cancelled=cancelled
                 )
+                # 检查是否在指标执行过程中被取消
+                if indicator_result.get("cancelled"):
+                    logger.info(f"[review] {idx+1}/{total} {symbol} 指标执行中被取消")
+                    break
                 logger.info(f"[review] {idx+1}/{total} {symbol} success={indicator_result['success']} has_buy={indicator_result['has_buy_signal']} buy_price={indicator_result['buy_price']} current={indicator_result['current_price']}")
             except Exception as e:
                 logger.error(f"Review indicator failed for {symbol}: {e}", exc_info=True)
@@ -601,7 +692,11 @@ def review_stocks(
             })
 
             logger.info(f"[review] {idx+1}/{total} {symbol} 搜索新闻中...")
-            news_result = _search_stock_news_sentiment(symbol, name)
+            news_result = _search_stock_news_sentiment(symbol, name, _cancelled=cancelled)
+            # 检查是否在新闻搜索过程中被取消
+            if cancelled[0]:
+                logger.info(f"[review] {idx+1}/{total} {symbol} 新闻搜索中被取消")
+                break
             logger.info(f"[review] {idx+1}/{total} {symbol} news: has_news={news_result['has_news']} direction={news_result['direction']} score={news_result['composite_score']}")
 
             # ── Step 4: 新闻情感判断 ──

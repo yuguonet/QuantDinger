@@ -334,6 +334,58 @@ def create_app(config_name='default'):
     from app.routes import register_routes
     register_routes(app)
 
+    # ── SSE TCP_NODELAY 中间件 ───────────────────────────────
+    # 问题：Gunicorn gthread worker 的 socket 默认启用 Nagle 算法，
+    # 小数据包（SSE 消息 ~100字节）滞留在内核 TCP 发送缓冲区，
+    # 前端收不到进度更新，直到连接关闭时才一次性 flush。
+    # 解决：对 SSE 响应设置 TCP_NODELAY，强制每个 packet 立即发送。
+    # 原理：TCP_NODELAY 作用于 socket fd（内核级别），
+    #       socket.fromfd(fd) 创建的新对象与原始 socket 共享同一个 fd，
+    #       setsockopt 对 fd 生效后，原始 socket 的发送行为也改变。
+    import socket as _socket_module
+
+    class _SSENoDelayMiddleware:
+        def __init__(self, wsgi_app):
+            self.app = wsgi_app
+
+        def __call__(self, environ, start_response):
+            resp = self.app(environ, start_response)
+            # 仅对 SSE 响应设置 TCP_NODELAY
+            ct = ''
+            if hasattr(resp, 'headers'):
+                ct = resp.headers.get('Content-Type', '') or resp.headers.get('content-type', '')
+            if 'text/event-stream' not in ct:
+                return resp
+
+            # 获取底层 socket fd 并设置 TCP_NODELAY
+            # 兼容多种 WSGI 服务器（Gunicorn gthread/eventlet/gevent）
+            _fd = None
+            try:
+                if hasattr(resp, 'response'):
+                    _sock_obj = resp.response
+                    # Gunicorn socket 对象：_sock 是原始 socket.socket
+                    if hasattr(_sock_obj, '_sock') and hasattr(_sock_obj._sock, 'fileno'):
+                        _fd = _sock_obj._sock.fileno()
+                    elif hasattr(_sock_obj, 'fileno'):
+                        _fd = _sock_obj.fileno()
+                # 降级：从 WSGI environ 获取
+                if _fd is None and 'gunicorn.socket' in environ:
+                    _fd = environ['gunicorn.socket'].fileno()
+            except Exception:
+                pass
+
+            if _fd is not None:
+                try:
+                    _dup = _socket_module.fromfd(_fd, _socket_module.AF_INET, _socket_module.SOCK_STREAM)
+                    _dup.setsockopt(_socket_module.IPPROTO_TCP, _socket_module.TCP_NODELAY, 1)
+                    _dup.detach()  # 不关闭原始 fd
+                except Exception:
+                    pass  # 非 TCP socket（如 Unix socket）或 fd 无效，静默降级
+
+            return resp
+
+    app.wsgi_app = _SSENoDelayMiddleware(app.wsgi_app)
+
     # ── 静默 GeneratorExit ───────────────────────────────────
     # werkzeug 的 _iter_encoded 在客户端断开连接时会抛 GeneratorExit，
     # 这是正常的生成器清理行为，不应作为错误记录。
