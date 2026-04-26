@@ -86,31 +86,9 @@ REVIEW_TIMEFRAMES = {
     },
 }
 
-
-def _assign_hearts(win_rate: float, total_return: float) -> int:
-    """
-    根据胜率和收益率打心:
-      - 胜率>=80% 且 收益率>0 → ♥ (1)
-      - 胜率>=90% 且 收益率>3% → ♥♥ (2)
-      - 胜率>=95% 且 收益率>5% → ♥♥♥ (3)
-      - 胜率>=98% 且 收益率>6% → ♥♥♥♥ (4)
-      - 胜率==100% 且 收益率>8% → ♥♥♥♥♥ (5)
-    """
-    if win_rate >= 100 and total_return > 8:
-        return 5
-    if win_rate >= 98 and total_return > 6:
-        return 4
-    if win_rate >= 95 and total_return > 5:
-        return 3
-    if win_rate >= 90 and total_return > 3:
-        return 2
-    if win_rate >= 80 and total_return > 0:
-        return 1
-    return 0
-
-
-def _hearts_str(n: int) -> str:
-    return "♥" * n if n > 0 else ""
+# ── 回测通过阈值（硬性要求，所有周期必须同时满足） ──
+BACKTEST_MIN_WIN_RATE = 70.0   # 最低胜率 70%
+BACKTEST_MIN_RETURN = 0.0      # 最低收益率 > 0%（正收益率）
 
 
 def _run_backtest(cancelled: List[bool], **kwargs) -> Optional[Dict[str, Any]]:
@@ -752,7 +730,7 @@ def review_stocks(
         每 0.5s 检查取消标志，最多等 15s
       → 用户取消后最多 ~0.5s 即可中断当前操作，无需等满 30s
 
-    【审核规则汇总】
+    【审核规则汇总（全部为硬性门槛，任一不满足即跳过）】
       ├─ 指标代码不存在或无权 → error + done
       ├─ 指标执行失败         → skip (indicator_error)
       ├─ 无 buy 信号          → skip (no_buy_signal)
@@ -762,12 +740,18 @@ def review_stocks(
       ├─ 买点价 > 卖点价      → skip (buy_after_sell) — 策略逻辑异常
       ├─ 买点日期 < 卖点日期  → skip (buy_before_sell) — 时间线异常
       ├─ 有负面新闻(<=0分)    → skip (negative_news)
+      ├─ 多周期回测不通过     → skip (backtest_failed)
+      │   所有周期必须同时满足：收益率 > 0% 且 胜率 >= 70%
+      │   任一周期不满足即跳过
       ├─ 加自选失败           → skip (add_failed)
-      └─ 全部通过             → 加入自选 → 多周期回测 → hearts评分 (passed)
+      └─ 全部通过             → 加入自选 (passed)
 
-    【多周期回测】
-      通过审核后自动按 review_mode(短线/中线/长线) 进行多周期回测,
-      根据胜率和收益率打心评分(♥~♥♥♥♥♥), 5心时发送通知。
+    【多周期回测（前置硬性门槛）】
+      加入自选之前，按 review_mode(短线/中线/长线) 对应的所有周期进行回测。
+      每个周期都必须满足：收益率 > 0% 且 胜率 >= 70%，否则直接跳过。
+      短线: 6月线, 3月线, 1月线, 1h线
+      中线: 年线, 6月线, 3月线
+      长线: 6M, 1年, 3年
 
     【参数】
       review_mode: 审核模式 "short"/"mid"/"long"，默认 "mid"(中线)
@@ -986,22 +970,17 @@ def review_stocks(
                     skipped_count += 1
                     continue
 
-            # ── Step 5: 加入自选股 ──
-            logger.info(f"[review] {idx+1}/{total} {symbol} 加入自选股...")
-            success = _add_to_watchlist(user_id, market, symbol, name)
-            logger.info(f"[review] {idx+1}/{total} {symbol} add_result={success}")
-            if not success:
-                yield _sse({
-                    "type": "result", "symbol": symbol, "market": market, "name": name,
-                    "index": idx + 1, "total": total, "added": False,
-                    "reason": "add_failed",
-                    "msg": f"{symbol} 加入自选股失败",
-                })
-                skipped_count += 1
-                continue
-            added_count += 1
+            # ── 基本检查全部通过，提示用户 ──
+            yield _sse({
+                "type": "progress", "symbol": symbol, "market": market, "name": name,
+                "index": idx + 1, "total": total,
+                "status": "basic_passed",
+                "msg": f"{symbol} 基本检测通过，正在进行多周期回测验证...",
+            })
 
-            # ── Step 6: 多周期回测审核 ──
+            # ── Step 5: 多周期回测（前置硬性门槛） ──
+            # 所有周期必须同时满足：收益率 > 0% 且 胜率 >= 70%
+            # 任一不满足 → 跳过，不加入自选
             yield _sse({
                 "type": "progress", "symbol": symbol, "market": market, "name": name,
                 "index": idx + 1, "total": total,
@@ -1009,15 +988,12 @@ def review_stocks(
                 "msg": f"{symbol} 正在进行{review_mode_label}多周期回测...",
             })
 
-            hearts = 0
-            hearts_str = ""
-            bt_summary = "回测无结果"
-            bt_notification = None
+            bt_pass = True
+            bt_fail_reason = ""
+            bt_msg_parts = []
             try:
                 tf_cfg = REVIEW_TIMEFRAMES.get(review_mode, REVIEW_TIMEFRAMES["mid"])
                 now = datetime.now()
-                best_hearts = 0
-                bt_msg_parts = []
 
                 for period_cfg in tf_cfg["periods"]:
                     # 检查取消（每个周期之间）
@@ -1032,7 +1008,6 @@ def review_stocks(
                     start_date = end_date - timedelta(days=months * 30)
 
                     try:
-                        # 线程化回测：后台线程执行，主线程每 0.2s 检查 cancelled
                         bt_result = _run_backtest(
                             cancelled=cancelled,
                             indicator_code=indicator_code,
@@ -1050,62 +1025,85 @@ def review_stocks(
                         )
 
                         if bt_result is None:
-                            # 取消或超时或异常
                             if cancelled[0]:
                                 break
                             bt_msg_parts.append(f"{label}:无结果")
+                            bt_pass = False
+                            bt_fail_reason = f"{label}回测无结果"
                             continue
 
                         win_rate = (bt_result or {}).get("winRate", 0) or 0
                         total_return = (bt_result or {}).get("totalReturn", 0) or 0
-                        period_hearts = _assign_hearts(win_rate, total_return)
-                        period_hearts_str = _hearts_str(period_hearts)
+
+                        period_ok = (win_rate >= BACKTEST_MIN_WIN_RATE and total_return > BACKTEST_MIN_RETURN)
+                        status_mark = "✓" if period_ok else "✗"
                         bt_msg_parts.append(
-                            f"{label}:{period_hearts_str or '✗'} "
-                            f"收益{round(total_return, 2)}% 胜率{round(win_rate, 2)}%"
+                            f"{label}:{status_mark} 收益{round(total_return, 2)}% 胜率{round(win_rate, 2)}%"
                         )
-                        if period_hearts > best_hearts:
-                            best_hearts = period_hearts
+
+                        if not period_ok:
+                            bt_pass = False
+                            if not bt_fail_reason:
+                                reasons = []
+                                if total_return <= BACKTEST_MIN_RETURN:
+                                    reasons.append(f"收益率{round(total_return, 2)}%≤0")
+                                if win_rate < BACKTEST_MIN_WIN_RATE:
+                                    reasons.append(f"胜率{round(win_rate, 2)}%<{BACKTEST_MIN_WIN_RATE}%")
+                                bt_fail_reason = f"{label}: {', '.join(reasons)}"
+
                     except Exception as period_err:
-                        logger.warning(
-                            f"[review] {symbol} {label}({tf}) 回测失败: {period_err}"
-                        )
+                        logger.warning(f"[review] {symbol} {label}({tf}) 回测失败: {period_err}")
                         bt_msg_parts.append(f"{label}:异常")
-
-                hearts = best_hearts
-                hearts_str = _hearts_str(hearts)
-                bt_summary = " | ".join(bt_msg_parts) if bt_msg_parts else "回测无结果"
-
-                # 5♥通知消息
-                if hearts >= 5:
-                    bt_notification = (
-                        f"🌟 5♥优质标的发现: {symbol}\n"
-                        f"模式: {review_mode_label}\n"
-                        f"{bt_summary}\n"
-                    )
-                    try:
-                        from app.services.signal_notifier import SignalNotifier
-                        notifier = SignalNotifier()
-                        notifier.send_notification(user_id, bt_notification)
-                    except Exception as notify_err:
-                        logger.warning(
-                            f"Failed to send 5♥ notification for {symbol}: {notify_err}"
-                        )
+                        bt_pass = False
+                        if not bt_fail_reason:
+                            bt_fail_reason = f"{label}回测异常: {str(period_err)}"
 
             except Exception as bt_err:
                 logger.warning(f"[review] {idx+1}/{total} {symbol} 回测失败: {bt_err}")
-                bt_summary = f"回测异常: {str(bt_err)}"
+                bt_pass = False
+                bt_fail_reason = f"回测异常: {str(bt_err)}"
 
-            # 包含回测信息的结果
+            bt_summary = " | ".join(bt_msg_parts) if bt_msg_parts else "回测无结果"
+
+            # 回测未通过 → 跳过，不加入自选
+            if cancelled[0]:
+                logger.info(f"[review] {idx+1}/{total} {symbol} 回测中被取消")
+                break
+
+            if not bt_pass:
+                yield _sse({
+                    "type": "result", "symbol": symbol, "market": market, "name": name,
+                    "index": idx + 1, "total": total, "added": False,
+                    "reason": "backtest_failed",
+                    "backtest_summary": bt_summary,
+                    "backtest_mode": review_mode,
+                    "msg": f"{symbol} 回测未通过: {bt_fail_reason} | {bt_summary}",
+                })
+                skipped_count += 1
+                continue
+
+            # ── Step 6: 全部回测通过 → 加入自选股 ──
+            logger.info(f"[review] {idx+1}/{total} {symbol} 回测全部通过，加入自选股...")
+            success = _add_to_watchlist(user_id, market, symbol, name)
+            logger.info(f"[review] {idx+1}/{total} {symbol} add_result={success}")
+            if not success:
+                yield _sse({
+                    "type": "result", "symbol": symbol, "market": market, "name": name,
+                    "index": idx + 1, "total": total, "added": False,
+                    "reason": "add_failed",
+                    "msg": f"{symbol} 加入自选股失败",
+                })
+                skipped_count += 1
+                continue
+            added_count += 1
+
             yield _sse({
                 "type": "result", "symbol": symbol, "market": market, "name": name,
                 "index": idx + 1, "total": total, "added": True,
                 "reason": "passed",
-                "hearts": hearts,
-                "hearts_str": hearts_str,
                 "backtest_summary": bt_summary,
                 "backtest_mode": review_mode,
-                "msg": f"{symbol} 通过审核{hearts_str} | {bt_summary}",
+                "msg": f"{symbol} 通过审核 | {bt_summary}",
             })
 
         # ── 全部处理完毕 ──
