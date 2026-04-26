@@ -40,9 +40,10 @@
 """
 
 import json
+import multiprocessing
+import queue
 import re
-import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, Generator, List, Optional
 
 import pandas as pd
@@ -52,6 +53,76 @@ from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+# ================================================================
+#  多周期回测审核配置
+# ================================================================
+
+REVIEW_TIMEFRAMES = {
+    "short": {
+        "label": "短线",
+        "periods": [
+            {"tf": "1D", "months": 6, "label": "6月线"},
+            {"tf": "1D", "months": 3, "label": "3月线"},
+            {"tf": "1D", "months": 1, "label": "1月线"},
+            {"tf": "1H", "months": 1, "label": "1h线"},
+        ],
+    },
+    "mid": {
+        "label": "中线",
+        "periods": [
+            {"tf": "1W", "months": 12, "label": "年线"},
+            {"tf": "1D", "months": 6, "label": "6月线"},
+            {"tf": "1D", "months": 3, "label": "3月线"},
+        ],
+    },
+    "long": {
+        "label": "长线",
+        "periods": [
+            {"tf": "1D", "months": 6, "label": "6M"},
+            {"tf": "1D", "months": 12, "label": "1年"},
+            {"tf": "1M", "months": 36, "label": "3年"},
+        ],
+    },
+}
+
+
+def _assign_hearts(win_rate: float, total_return: float) -> int:
+    """
+    根据胜率和收益率打心:
+      - 胜率>=80% 且 收益率>0 → ♥ (1)
+      - 胜率>=90% 且 收益率>3% → ♥♥ (2)
+      - 胜率>=95% 且 收益率>5% → ♥♥♥ (3)
+      - 胜率>=98% 且 收益率>6% → ♥♥♥♥ (4)
+      - 胜率==100% 且 收益率>8% → ♥♥♥♥♥ (5)
+    """
+    if win_rate >= 100 and total_return > 8:
+        return 5
+    if win_rate >= 98 and total_return > 6:
+        return 4
+    if win_rate >= 95 and total_return > 5:
+        return 3
+    if win_rate >= 90 and total_return > 3:
+        return 2
+    if win_rate >= 80 and total_return > 0:
+        return 1
+    return 0
+
+
+def _hearts_str(n: int) -> str:
+    return "♥" * n if n > 0 else ""
+
+
+def _bt_worker(q, **kwargs):
+    """子进程回测 worker，通过 Queue 返回结果。"""
+    try:
+        from app.services.backtest import BacktestService
+        svc = BacktestService()
+        result = svc.run(**kwargs)
+        q.put(("ok", result))
+    except Exception as e:
+        q.put(("error", str(e)))
 
 
 # ================================================================
@@ -623,6 +694,7 @@ def review_stocks(
     indicator_id: int,
     stocks: List[Dict[str, Any]],
     user_params: Dict[str, Any] = None,
+    review_mode: str = "mid",
     _cancelled: List[bool] = None,
 ) -> Generator[str, None, None]:
     """
@@ -666,9 +738,17 @@ def review_stocks(
       ├─ 现价 > 买点价格      → skip (price_above_buy)
       ├─ 买点超过3个交易日    → skip (buy_too_old)
       ├─ 买点价 > 卖点价      → skip (buy_after_sell) — 策略逻辑异常
+      ├─ 买点日期 < 卖点日期  → skip (buy_before_sell) — 日期逻辑异常
       ├─ 有负面新闻(<=0分)    → skip (negative_news)
       ├─ 加自选失败           → skip (add_failed)
-      └─ 全部通过             → 加入自选 (passed)
+      └─ 全部通过             → 加入自选 → 多周期回测 → hearts评分 (passed)
+
+    【多周期回测】
+      通过审核后自动按 review_mode(短线/中线/长线) 进行多周期回测,
+      根据胜率和收益率打心评分(♥~♥♥♥♥♥), 5心时发送通知。
+
+    【参数】
+      review_mode: 审核模式 "short"/"mid"/"long"，默认 "mid"(中线)
     """
     # ── 预初始化所有变量，防止 GeneratorExit 时 except 块引用未定义变量 ──
     total = len(stocks)
@@ -676,6 +756,10 @@ def review_stocks(
     skipped_count = 0
     idx = 0
     cancelled = _cancelled or [False]
+
+    # review_mode 标签映射
+    _mode_labels = {"short": "短线", "mid": "中线", "long": "长线"}
+    review_mode_label = _mode_labels.get(review_mode, "中线")
 
     # ── 预检：指标代码是否存在 ──
     try:
@@ -821,6 +905,25 @@ def review_stocks(
                 skipped_count += 1
                 continue
 
+            # 买卖日期逻辑校验：买点日期不能在卖点日期之前
+            buy_date_str_check = indicator_result.get("buy_date") or ""
+            sell_date_str_check = indicator_result.get("sell_date") or ""
+            if buy_date_str_check and sell_date_str_check:
+                try:
+                    buy_dt = datetime.strptime(buy_date_str_check, "%Y-%m-%d")
+                    sell_dt = datetime.strptime(sell_date_str_check, "%Y-%m-%d")
+                    if buy_dt < sell_dt:
+                        yield _sse({
+                            "type": "result", "symbol": symbol, "market": market, "name": name,
+                            "index": idx + 1, "total": total, "added": False,
+                            "reason": "buy_before_sell",
+                            "msg": f"{symbol} 策略逻辑异常：买点日期({buy_date_str_check})在卖点日期({sell_date_str_check})之前，不符合基本交易逻辑",
+                        })
+                        skipped_count += 1
+                        continue
+                except ValueError:
+                    pass
+
             # ── Step 3: 搜索新闻 ──
             yield _sse({
                 "type": "progress", "symbol": symbol, "market": market, "name": name,
@@ -857,15 +960,7 @@ def review_stocks(
             logger.info(f"[review] {idx+1}/{total} {symbol} 加入自选股...")
             success = _add_to_watchlist(user_id, market, symbol, name)
             logger.info(f"[review] {idx+1}/{total} {symbol} add_result={success}")
-            if success:
-                added_count += 1
-                yield _sse({
-                    "type": "result", "symbol": symbol, "market": market, "name": name,
-                    "index": idx + 1, "total": total, "added": True,
-                    "reason": "passed",
-                    "msg": f"{symbol} 通过审核，已加入自选股",
-                })
-            else:
+            if not success:
                 yield _sse({
                     "type": "result", "symbol": symbol, "market": market, "name": name,
                     "index": idx + 1, "total": total, "added": False,
@@ -873,6 +968,158 @@ def review_stocks(
                     "msg": f"{symbol} 加入自选股失败",
                 })
                 skipped_count += 1
+                continue
+            added_count += 1
+
+            # ── Step 6: 多周期回测审核 ──
+            yield _sse({
+                "type": "progress", "symbol": symbol, "market": market, "name": name,
+                "index": idx + 1, "total": total,
+                "status": "backtesting",
+                "msg": f"{symbol} 正在进行{review_mode_label}多周期回测...",
+            })
+
+            hearts = 0
+            hearts_str = ""
+            bt_summary = "回测无结果"
+            bt_notification = None
+            try:
+                tf_cfg = REVIEW_TIMEFRAMES.get(review_mode, REVIEW_TIMEFRAMES["mid"])
+                now = datetime.now()
+                best_hearts = 0
+                bt_msg_parts = []
+
+                for period_cfg in tf_cfg["periods"]:
+                    # 检查取消（每个周期之间）
+                    if cancelled[0]:
+                        logger.info(f"[review] {idx+1}/{total} {symbol} 回测中被取消")
+                        break
+
+                    tf = period_cfg["tf"]
+                    months = period_cfg["months"]
+                    label = period_cfg["label"]
+                    end_date = now
+                    start_date = end_date - timedelta(days=months * 30)
+
+                    try:
+                        # 用子进程跑回测，取消时直接 terminate() 杀掉
+                        q = multiprocessing.Queue()
+                        p = multiprocessing.Process(
+                            target=_bt_worker,
+                            kwargs=dict(
+                                indicator_code=indicator_code,
+                                market=market,
+                                symbol=symbol,
+                                timeframe=tf,
+                                start_date=start_date,
+                                end_date=end_date,
+                                initial_capital=100000.0,
+                                commission=0.001,
+                                trade_direction="long",
+                                indicator_params=user_params,
+                                user_id=user_id,
+                                indicator_id=indicator_id,
+                                q=q,
+                            ),
+                            daemon=True,
+                        )
+                        p.start()
+
+                        bt_result = None
+                        # 轮询等待子进程，每 0.5s 检查取消/超时
+                        waited = 0.0
+                        while p.is_alive() and waited < 20.0:
+                            if cancelled[0]:
+                                p.terminate()
+                                p.join(timeout=2)
+                                logger.info(f"[review] {symbol} {label}({tf}) 回测被取消，子进程已杀掉")
+                                break
+                            p.join(timeout=0.5)
+                            waited += 0.5
+
+                        if cancelled[0]:
+                            break
+
+                        if p.is_alive():
+                            # 超时 → 杀掉
+                            p.terminate()
+                            p.join(timeout=2)
+                            logger.warning(f"[review] {symbol} {label}({tf}) 回测超时，已杀掉")
+                            bt_msg_parts.append(f"{label}:超时")
+                            continue
+
+                        # 取结果（用 timeout 避免管道竞态）
+                        try:
+                            status, payload = q.get(timeout=2)
+                        except queue.Empty:
+                            bt_msg_parts.append(f"{label}:无结果")
+                            continue
+                        except Exception as q_err:
+                            logger.warning(f"[review] {symbol} {label}({tf}) Queue读取异常: {q_err}")
+                            bt_msg_parts.append(f"{label}:异常")
+                            continue
+
+                        if status == "ok":
+                            bt_result = payload
+                        else:
+                            logger.warning(f"[review] {symbol} {label}({tf}) 回测子进程报错: {payload}")
+                            bt_msg_parts.append(f"{label}:异常")
+                            continue
+
+                        win_rate = (bt_result or {}).get("winRate", 0) or 0
+                        total_return = (bt_result or {}).get("totalReturn", 0) or 0
+                        period_hearts = _assign_hearts(win_rate, total_return)
+                        period_hearts_str = _hearts_str(period_hearts)
+                        bt_msg_parts.append(
+                            f"{label}:{period_hearts_str or '✗'} "
+                            f"收益{round(total_return, 2)}% 胜率{round(win_rate, 2)}%"
+                        )
+                        if period_hearts > best_hearts:
+                            best_hearts = period_hearts
+                    except Exception as period_err:
+                        logger.warning(
+                            f"[review] {symbol} {label}({tf}) 回测失败: {period_err}"
+                        )
+                        bt_msg_parts.append(f"{label}:异常")
+
+                if cancelled[0]:
+                    break
+
+                hearts = best_hearts
+                hearts_str = _hearts_str(hearts)
+                bt_summary = " | ".join(bt_msg_parts) if bt_msg_parts else "回测无结果"
+
+                # 5♥通知消息
+                if hearts >= 5:
+                    bt_notification = (
+                        f"🌟 5♥优质标的发现: {symbol}\n"
+                        f"模式: {review_mode_label}\n"
+                        f"{bt_summary}\n"
+                    )
+                    try:
+                        from app.services.signal_notifier import SignalNotifier
+                        notifier = SignalNotifier()
+                        notifier.send_notification(user_id, bt_notification)
+                    except Exception as notify_err:
+                        logger.warning(
+                            f"Failed to send 5♥ notification for {symbol}: {notify_err}"
+                        )
+
+            except Exception as bt_err:
+                logger.warning(f"[review] {idx+1}/{total} {symbol} 回测失败: {bt_err}")
+                bt_summary = f"回测异常: {str(bt_err)}"
+
+            # 包含回测信息的结果
+            yield _sse({
+                "type": "result", "symbol": symbol, "market": market, "name": name,
+                "index": idx + 1, "total": total, "added": True,
+                "reason": "passed",
+                "hearts": hearts,
+                "hearts_str": hearts_str,
+                "backtest_summary": bt_summary,
+                "backtest_mode": review_mode,
+                "msg": f"{symbol} 通过审核{hearts_str} | {bt_summary}",
+            })
 
         # ── 全部处理完毕 ──
         yield _sse({

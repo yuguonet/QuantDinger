@@ -31,6 +31,7 @@ xuangu_bp = Blueprint("xuangu", __name__)
 import threading as _threading
 
 _review_cancel_events: dict[int, _threading.Event] = {}
+_review_cancelled_flags: dict[int, list] = {}
 _review_cancel_lock = _threading.Lock()
 
 
@@ -535,6 +536,9 @@ def review_by_indicator():
         # ── 取消事件：通过显式 API 调用触发，不依赖 GeneratorExit ──
         cancel_event = _get_or_create_cancel_event(user_id)
         cancel_event.clear()  # 开始前重置
+        # 注册 cancelled 标志，让 /review/cancel 端点可以直接设置
+        with _review_cancel_lock:
+            _review_cancelled_flags[user_id] = cancelled
 
         try:
             _indicator_id = int(indicator_id)
@@ -574,11 +578,13 @@ def review_by_indicator():
 
         # 生产者线程：运行审核并将结果放入队列
         def producer():
+            gen = review_stocks(user_id, _indicator_id, stocks, user_params, _cancelled=cancelled)
             try:
-                for sse_msg in review_stocks(user_id, _indicator_id, stocks, user_params, _cancelled=cancelled):
+                for sse_msg in gen:
                     # 检查取消事件（来自显式 API 调用）
                     if cancel_event.is_set():
                         logger.info(f"[review] producer 检测到取消事件，停止推送")
+                        cancelled[0] = True  # 同步到 review_stocks 内部检查的标志
                         break
                     # 更新进度快照（心跳线程读取）
                     try:
@@ -601,6 +607,10 @@ def review_by_indicator():
                 logger.error(f"review SSE producer error: {e}", exc_info=True)
                 q.put(("data", f'data: {{"type":"error","msg":"审核异常: {str(e)}"}}\n\n'))
             finally:
+                try:
+                    gen.close()  # 确保 generator 清理（释放 ThreadPoolExecutor 等资源）
+                except Exception:
+                    pass
                 q.put(("done", None))
 
         producer_thread = threading.Thread(target=producer, daemon=True)
@@ -635,6 +645,8 @@ def review_by_indicator():
             # 无论 generator 以何种方式退出，都设置 cancelled[0] = True
             cancelled[0] = True
             stop_event.set()
+            with _review_cancel_lock:
+                _review_cancelled_flags.pop(user_id, None)
             _cleanup_cancel_event(user_id)
 
     # X-Accel-Buffering: no → 告诉 Nginx 不要缓冲，实时推送
@@ -668,5 +680,10 @@ def cancel_review():
     user_id = g.user_id
     event = _get_or_create_cancel_event(user_id)
     event.set()
+    # 直接设置 cancelled 标志，不依赖 producer 线程中转
+    with _review_cancel_lock:
+        flag = _review_cancelled_flags.get(user_id)
+        if flag:
+            flag[0] = True
     logger.info(f"[review] 用户 {user_id} 发起取消审核")
     return jsonify({"code": 0, "msg": "已发送取消信号"})
