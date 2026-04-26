@@ -41,6 +41,7 @@
 
 import json
 import re
+import time
 from typing import Any, Dict, Generator, List, Optional
 
 import pandas as pd
@@ -440,6 +441,7 @@ def review_stocks(
     indicator_id: int,
     stocks: List[Dict[str, Any]],
     user_params: Dict[str, Any] = None,
+    _cancelled: List[bool] = None,
 ) -> Generator[str, None, None]:
     """
     逐个审核股票，通过 SSE 流式返回进度。
@@ -464,11 +466,12 @@ def review_stocks(
         {"type":"error","msg":"指标ID 999 不存在"}
 
     【中断机制】
-      用户关闭对话框 → 前端 abort fetch → Flask 检测到连接断开
-      → 在下一个 yield 处抛出 GeneratorExit
-      → except GeneratorExit 捕获，log 当前进度后 return
+      用户关闭对话框 → 前端 abort fetch → Flask 在下一个 yield 处抛 GeneratorExit
+      → 外层 generate() 设置 cancelled[0]=True 并调用 gen.close()
+      → 内层在下一个 yield 点收到 GeneratorExit，except 捕获后 return
       → 当前正在跑的耗时操作（指标执行/新闻搜索）不会被中断，
         跑完后到 yield 才退出（最多多跑一只）
+      → cancelled 标志让循环在下一只股票开始前主动 break，双保险
 
     【审核规则汇总】
       ├─ 指标代码不存在或无权 → error + done
@@ -479,28 +482,43 @@ def review_stocks(
       ├─ 加自选失败           → skip (add_failed)
       └─ 全部通过             → 加入自选 (passed)
     """
-    # ── 预检：指标代码是否存在 ──
-    indicator_code = _get_indicator_code(indicator_id, user_id)
-    logger.info(f"review_stocks: indicator_id={indicator_id}, user_id={user_id}, code_len={len(indicator_code) if indicator_code else 0}")
-    if not indicator_code:
-        yield _sse({"type": "error", "msg": f"指标ID {indicator_id} 不存在或无权访问"})
-        yield _sse({"type": "done", "total": 0, "added": 0, "skipped": 0})
-        return
-
-    # 提取指标名称，用于进度提示
-    indicator_name = _extract_indicator_name(indicator_code)
-    logger.info(f"[review] 开始审核: indicator={indicator_name or '(unnamed)'}, stocks={total}")
-
+    # ── 预初始化所有变量，防止 GeneratorExit 时 except 块引用未定义变量 ──
     total = len(stocks)
     added_count = 0
     skipped_count = 0
-    idx = 0  # 预初始化，防止 GeneratorExit 时变量未定义
+    idx = 0
+    cancelled = _cancelled or [False]
+
+    # ── 预检：指标代码是否存在 ──
+    try:
+        indicator_code = _get_indicator_code(indicator_id, user_id)
+    except Exception as e:
+        logger.error(f"[review] _get_indicator_code failed: {e}", exc_info=True)
+        yield _sse({"type": "error", "msg": f"获取指标代码失败: {e}"})
+        return
+
+    logger.info(f"review_stocks: indicator_id={indicator_id}, user_id={user_id}, code_len={len(indicator_code) if indicator_code else 0}")
+    if not indicator_code:
+        yield _sse({"type": "error", "msg": f"指标ID {indicator_id} 不存在或无权访问"})
+        return
+
+    # 提取指标名称，用于进度提示
+    try:
+        indicator_name = _extract_indicator_name(indicator_code)
+    except Exception:
+        indicator_name = None
+    logger.info(f"[review] 开始审核: indicator={indicator_name or '(unnamed)'}, stocks={total}")
 
     try:
         for idx, stock in enumerate(stocks):
-            symbol = (stock.get("code") or stock.get("symbol") or "").strip()
-            market = (stock.get("market") or "CNStock").strip()
-            name = (stock.get("name") or "").strip()
+            # ── 检查是否已取消 ──
+            if cancelled[0]:
+                logger.info(f"[review] cancelled before stock {idx+1}/{total}")
+                break
+
+            symbol = str(stock.get("code") or stock.get("symbol") or "").strip()
+            market = str(stock.get("market") or "CNStock").strip()
+            name = str(stock.get("name") or "").strip()
 
             # 跳过无代码的空行
             if not symbol:
@@ -634,8 +652,7 @@ def review_stocks(
 
     except GeneratorExit:
         logger.info(f"[review] client disconnected at {idx+1}/{total}")
-        return
+        return  # 不要 yield — 连接已断开，无处可发
     except Exception as e:
         logger.error(f"[review] unexpected error at {idx+1}/{total}: {e}", exc_info=True)
-        yield _sse({"type": "error", "msg": f"审核异常: {str(e)}"})
-        return
+        return  # 不要 yield — 出错时 yield 可能导致二次异常

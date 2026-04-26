@@ -495,17 +495,71 @@ def review_by_indicator():
         return jsonify({"code": 1, "msg": "单次最多审核200只股票"}), 400
 
     # ── SSE Generator ──
-    # Flask 的 Response 接收生成器，逐块推送给客户端。
-    # 客户端断开时 Flask 在下一个 yield 处抛 GeneratorExit。
+    # 使用心跳线程 + 队列，穿透 nginx 等代理的缓冲层
     def generate():
+        import time, threading, queue
+
+        cancelled = [False]
+        q = queue.Queue()
+        stop_event = threading.Event()
+
         try:
-            for sse_msg in review_stocks(user_id, int(indicator_id), stocks, user_params):
-                logger.debug(f"review SSE yield: {sse_msg[:80]}...")
-                yield sse_msg
+            _indicator_id = int(indicator_id)
+        except (TypeError, ValueError):
+            yield 'data: {"type":"error","msg":"无效的指标ID"}\n\n'
+            return
+
+        # 心跳线程：每秒发一条注释，强制代理刷新缓冲
+        def heartbeat():
+            while not stop_event.is_set():
+                try:
+                    q.put(("heartbeat", ": heartbeat\n\n"), timeout=1)
+                except queue.Full:
+                    pass
+
+        hb_thread = threading.Thread(target=heartbeat, daemon=True)
+        hb_thread.start()
+
+        # 生产者线程：运行审核并将结果放入队列
+        def producer():
+            try:
+                for sse_msg in review_stocks(user_id, _indicator_id, stocks, user_params, _cancelled=cancelled):
+                    q.put(("data", sse_msg))
+            except Exception as e:
+                logger.error(f"review SSE producer error: {e}", exc_info=True)
+                q.put(("data", f'data: {{"type":"error","msg":"审核异常: {str(e)}"}}\n\n'))
+            finally:
+                q.put(("done", None))
+
+        producer_thread = threading.Thread(target=producer, daemon=True)
+        producer_thread.start()
+
+        try:
+            while True:
+                try:
+                    msg_type, msg = q.get(timeout=30)
+                except queue.Empty:
+                    # 30秒无数据 → 连接可能已死，退出
+                    logger.warning("review SSE: 30s timeout, closing")
+                    break
+
+                if msg_type == "done":
+                    break
+                elif msg_type == "heartbeat":
+                    yield msg
+                else:
+                    yield msg
         except GeneratorExit:
-            logger.info("review SSE: client disconnected")
+            logger.info("review SSE: client disconnected, cancelling")
+            cancelled[0] = True
+            stop_event.set()
+            raise
         except Exception as e:
             logger.error(f"review SSE generator error: {e}", exc_info=True)
+            cancelled[0] = True
+            stop_event.set()
+        finally:
+            stop_event.set()
 
     # X-Accel-Buffering: no → 告诉 Nginx 不要缓冲，实时推送
     return Response(
@@ -513,6 +567,7 @@ def review_by_indicator():
         mimetype="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
     )

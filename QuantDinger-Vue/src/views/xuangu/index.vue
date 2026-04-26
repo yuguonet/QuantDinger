@@ -634,10 +634,12 @@ export default {
     async addSelectedToWatchlist () {
       if (this.selectedRows.length === 0) return
       if (!this.userId) { this.$message.warning('用户信息未加载'); return }
+      const marketMap = { '港股': 'HKStock', '美股': 'USStock' }
+      const stockMarket = marketMap[this.selectedMarket] || 'CNStock'
       let added = 0
       for (const r of this.selectedRows.filter(x => x.code)) {
         try {
-          const res = await addWatchlist({ userid: this.userId, market: 'CNStock', symbol: r.code, name: r.name || '' })
+          const res = await addWatchlist({ userid: this.userId, market: stockMarket, symbol: r.code, name: r.name || '' })
           if (res && res.code === 1) added++
         } catch (e) { /* skip */ }
       }
@@ -1181,10 +1183,16 @@ export default {
         return
       }
 
+      // 根据 selectedMarket 映射后端 market 值
+      const marketMap = {
+        '港股': 'HKStock', '美股': 'USStock'
+      }
+      const stockMarket = marketMap[this.selectedMarket] || 'CNStock'
+
       const stocks = this.selectedRows.filter(r => r.code).map(r => ({
         code: r.code,
         name: r.name || '',
-        market: 'CNStock'
+        market: stockMarket
       }))
 
       if (stocks.length === 0) {
@@ -1233,15 +1241,18 @@ export default {
           throw new Error(errData.msg || `HTTP ${resp.status}`)
         }
 
+        console.log('[SSE] connected, status:', resp.status, 'content-type:', resp.headers.get('content-type'))
         const reader = resp.body.getReader()
         const decoder = new TextDecoder()
         let buffer = ''
 
         while (true) {
           const { done, value } = await reader.read()
-          if (done) break
+          if (done) { console.log('[SSE] stream done'); break }
 
-          buffer += decoder.decode(value, { stream: true })
+          const chunk = decoder.decode(value, { stream: true })
+          console.log('[SSE] chunk:', chunk.length, 'bytes')
+          buffer += chunk
           const lines = buffer.split('\n')
           buffer = lines.pop() || ''
 
@@ -1252,6 +1263,7 @@ export default {
 
             try {
               const data = JSON.parse(jsonStr)
+              console.log('[SSE] msg:', data.type, data.msg || '')
               this.handleReviewSSE(data, indicatorName)
             } catch (parseErr) {
               /* skip malformed */
@@ -1259,15 +1271,15 @@ export default {
           }
         }
       } catch (err) {
+        console.error('[SSE] error:', err.name, err.message)
         if (err.name === 'AbortError') {
-          this.$message.info('审核已取消')
+          // 用户取消 — cancelReview 已关闭对话框，无需额外提示
         } else {
           this.$message.error('审核失败: ' + err.message)
         }
       } finally {
         this.reviewRunning = false
         this.reviewAbortController = null
-        this.$nextTick(() => this.scrollReviewResults())
       }
     },
 
@@ -1335,6 +1347,8 @@ export default {
       if (this.reviewAbortController) {
         this.reviewAbortController.abort()
       }
+      this.reviewRunning = false
+      this.reviewDialogVisible = false
     }
   },
   watch: {
