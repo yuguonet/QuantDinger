@@ -42,6 +42,7 @@
 import json
 import re
 import time
+from datetime import datetime
 from typing import Any, Dict, Generator, List, Optional
 
 import pandas as pd
@@ -116,6 +117,72 @@ def _get_stock_kline(market: str, symbol: str, limit: int = 200) -> Optional[pd.
     except Exception as e:
         logger.error(f"_get_stock_kline({market},{symbol}) failed: {e}", exc_info=True)
         return None
+
+
+# ================================================================
+#  买点验证辅助函数
+# ================================================================
+
+def _extract_date_from_df(df: pd.DataFrame, idx) -> Optional[datetime]:
+    """
+    从 DataFrame 行提取交易日期。
+
+    优先级：time 列 → 索引 → 返回 None。
+    支持 Unix 时间戳（int/float）和 ISO 日期字符串。
+    """
+    try:
+        # 优先从 time 列获取
+        if "time" in df.columns:
+            t = df.loc[idx, "time"]
+            if isinstance(t, (int, float)) and t > 0:
+                return datetime.fromtimestamp(t)
+            elif isinstance(t, str) and t:
+                try:
+                    return datetime.fromisoformat(t.replace("Z", "+00:00"))
+                except ValueError:
+                    pass
+        # 降级：尝试从索引获取
+        if hasattr(idx, "to_pydatetime"):
+            return idx.to_pydatetime()
+        if isinstance(idx, (int, float)) and idx > 1_000_000_000:
+            return datetime.fromtimestamp(idx)
+    except Exception:
+        pass
+    return None
+
+
+def _is_buy_recency_valid(df: pd.DataFrame, last_buy_idx, max_trading_days: int = 3) -> bool:
+    """
+    验证最新买点是否在 max_trading_days 个交易日内。
+
+    计算方式：从 DataFrame 末尾到买点所在行的行数差 ≤ max_trading_days。
+    行数差等价于交易日差（日线 DataFrame 每行 = 1 个交易日）。
+    如果买点日期可以解析，则用日期差做精确校验（自然日差 ≤ max_trading_days * 2，
+    以覆盖周末/节假日，宽松容错）。
+    """
+    if df is None or len(df) == 0:
+        return False
+
+    n = len(df)
+    try:
+        buy_pos = df.index.get_loc(last_buy_idx)
+    except (KeyError, TypeError):
+        return False
+
+    # 行数差检查：买点距末尾超过 max_trading_days 行 → 过期
+    if (n - 1 - buy_pos) > max_trading_days:
+        return False
+
+    # 日期差双重校验（宽松）
+    buy_date = _extract_date_from_df(df, last_buy_idx)
+    if buy_date is not None:
+        last_date = _extract_date_from_df(df, df.index[-1])
+        if last_date is not None:
+            delta = (last_date - buy_date).days
+            if delta > max_trading_days * 2:  # 宽松容错周末/节假日
+                return False
+
+    return True
 
 
 # ================================================================
@@ -214,6 +281,9 @@ def _run_indicator_on_stock(
       {
         "success": bool,              # 整体是否成功
         "buy_price": float | None,    # 最近买点信号对应的 close
+        "buy_date": str | None,       # 买点日期 (ISO 格式)
+        "sell_price": float | None,   # 最近卖点信号对应的 close（无卖点则 None）
+        "sell_date": str | None,      # 卖点日期 (ISO 格式)
         "current_price": float | None,# 当前价格（实时或K线close）
         "has_buy_signal": bool,       # 指标是否产生了 buy=True 的信号
         "error": str | None,          # 失败原因
@@ -228,6 +298,9 @@ def _run_indicator_on_stock(
     result = {
         "success": False,
         "buy_price": None,
+        "buy_date": None,
+        "sell_price": None,
+        "sell_date": None,
         "current_price": None,
         "has_buy_signal": False,
         "error": None,
@@ -317,7 +390,7 @@ def _run_indicator_on_stock(
             result["error"] = f"指标执行失败: {exec_result.get('error', '未知错误')}"
             return result
 
-        # ── 5. 提取买点信号 ──
+        # ── 5. 提取买点信号 + 卖点信号 ──
         executed_df = exec_env.get("df", df_copy)
         if "buy" not in executed_df.columns:
             result["error"] = "指标未生成 buy 信号列"
@@ -335,7 +408,33 @@ def _run_indicator_on_stock(
                 logger.warning(f"_run_indicator_on_stock({symbol}): buy信号存在但取价格失败: {e}")
                 result["has_buy_signal"] = False
 
+            # 提取买点日期
+            try:
+                buy_dt = _extract_date_from_df(executed_df, last_buy_idx)
+                if buy_dt is not None:
+                    result["buy_date"] = buy_dt.strftime("%Y-%m-%d")
+            except Exception as e:
+                logger.debug(f"_run_indicator_on_stock({symbol}): 提取买点日期失败: {e}")
+
+        # 提取卖点信号（用于买卖逻辑校验）
+        if "sell" in executed_df.columns:
+            sell_series = executed_df["sell"].astype(bool)
+            if sell_series.any():
+                sell_indices = sell_series[sell_series].index.tolist()
+                last_sell_idx = sell_indices[-1]
+                try:
+                    result["sell_price"] = float(executed_df.loc[last_sell_idx, "close"])
+                except (ValueError, TypeError, KeyError):
+                    pass
+                try:
+                    sell_dt = _extract_date_from_df(executed_df, last_sell_idx)
+                    if sell_dt is not None:
+                        result["sell_date"] = sell_dt.strftime("%Y-%m-%d")
+                except Exception:
+                    pass
+
         result["success"] = True
+        result["_executed_df"] = executed_df  # 供调用方做买点时效性校验
         return result
 
     except Exception as e:
@@ -565,6 +664,8 @@ def review_stocks(
       ├─ 指标执行失败         → skip (indicator_error)
       ├─ 无 buy 信号          → skip (no_buy_signal)
       ├─ 现价 > 买点价格      → skip (price_above_buy)
+      ├─ 买点超过3个交易日    → skip (buy_too_old)
+      ├─ 买点价 > 卖点价      → skip (buy_after_sell) — 策略逻辑异常
       ├─ 有负面新闻(<=0分)    → skip (negative_news)
       ├─ 加自选失败           → skip (add_failed)
       └─ 全部通过             → 加入自选 (passed)
@@ -679,6 +780,43 @@ def review_stocks(
                     "index": idx + 1, "total": total, "added": False,
                     "reason": "price_above_buy",
                     "msg": f"{symbol} 现价({current_price:.2f})高于买点价格({buy_price:.2f})，未出现买点",
+                })
+                skipped_count += 1
+                continue
+
+            # 买点时效性检查：最新买点不超过3个交易日
+            buy_date_str = indicator_result.get("buy_date") or ""
+            executed_df = indicator_result.get("_executed_df")
+            if buy_date_str and executed_df is not None and "buy" in executed_df.columns:
+                try:
+                    buy_series = executed_df["buy"].astype(bool)
+                    if buy_series.any():
+                        last_buy_idx = buy_series[buy_series].index.tolist()[-1]
+                        if not _is_buy_recency_valid(executed_df, last_buy_idx, max_trading_days=3):
+                            yield _sse({
+                                "type": "result", "symbol": symbol, "market": market, "name": name,
+                                "index": idx + 1, "total": total, "added": False,
+                                "reason": "buy_too_old",
+                                "msg": f"{symbol} 最新买点({buy_date_str})超过3个交易日，已过期",
+                            })
+                            skipped_count += 1
+                            continue
+                except Exception:
+                    pass  # 提取失败不阻断流程
+
+            # 买卖逻辑校验：买点价不能高于卖点价
+            sell_price = indicator_result.get("sell_price")
+            if sell_price is not None and buy_price is not None and buy_price > sell_price:
+                sell_date_str = indicator_result.get("sell_date") or ""
+                yield _sse({
+                    "type": "result", "symbol": symbol, "market": market, "name": name,
+                    "index": idx + 1, "total": total, "added": False,
+                    "reason": "buy_after_sell",
+                    "msg": (
+                        f"{symbol} 策略逻辑异常：买点价({buy_price:.2f})高于卖点价({sell_price:.2f})"
+                        + (f"，买点({buy_date_str})在卖点({sell_date_str})之后" if buy_date_str and sell_date_str else "")
+                        + "，策略不符合基本交易逻辑"
+                    ),
                 })
                 skipped_count += 1
                 continue

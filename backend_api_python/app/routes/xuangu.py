@@ -22,6 +22,32 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 xuangu_bp = Blueprint("xuangu", __name__)
 
+
+# ================================================================
+#  审核取消注册表（进程内，单 worker 场景）
+# ================================================================
+#  不依赖 GeneratorExit（Nginx/Gunicorn 不保证投递），
+#  通过显式 API 调用设置 cancel event 来停止审核。
+import threading as _threading
+
+_review_cancel_events: dict[int, _threading.Event] = {}
+_review_cancel_lock = _threading.Lock()
+
+
+def _get_or_create_cancel_event(user_id: int) -> _threading.Event:
+    """获取或创建用户的取消事件（线程安全）"""
+    with _review_cancel_lock:
+        if user_id not in _review_cancel_events:
+            _review_cancel_events[user_id] = _threading.Event()
+        return _review_cancel_events[user_id]
+
+
+def _cleanup_cancel_event(user_id: int):
+    """审核结束时清理取消事件"""
+    with _review_cancel_lock:
+        _review_cancel_events.pop(user_id, None)
+
+
 # ================================================================
 # GET /  — 概览（公开）
 # ================================================================
@@ -506,6 +532,10 @@ def review_by_indicator():
         # 最新进度快照，心跳线程用它生成 data 类型心跳（非注释）
         _latest_progress = {"index": 0, "total": len(stocks), "symbol": "", "status": "initializing"}
 
+        # ── 取消事件：通过显式 API 调用触发，不依赖 GeneratorExit ──
+        cancel_event = _get_or_create_cancel_event(user_id)
+        cancel_event.clear()  # 开始前重置
+
         try:
             _indicator_id = int(indicator_id)
         except (TypeError, ValueError):
@@ -522,6 +552,9 @@ def review_by_indicator():
                     # 等 2 秒；如果有数据进来先发数据
                     stop_event.wait(timeout=2)
                     if stop_event.is_set():
+                        break
+                    # 检查取消事件（来自显式 API 调用）
+                    if cancel_event.is_set():
                         break
                     p = _latest_progress
                     hb_msg = json.dumps({
@@ -543,6 +576,10 @@ def review_by_indicator():
         def producer():
             try:
                 for sse_msg in review_stocks(user_id, _indicator_id, stocks, user_params, _cancelled=cancelled):
+                    # 检查取消事件（来自显式 API 调用）
+                    if cancel_event.is_set():
+                        logger.info(f"[review] producer 检测到取消事件，停止推送")
+                        break
                     # 更新进度快照（心跳线程读取）
                     try:
                         _raw = sse_msg.strip()
@@ -572,9 +609,17 @@ def review_by_indicator():
         try:
             while True:
                 try:
-                    msg_type, msg = q.get(timeout=30)
+                    msg_type, msg = q.get(timeout=1)
                 except queue.Empty:
-                    logger.warning("review SSE: 30s timeout, closing")
+                    # 短超时轮询：检查取消事件 + 让 GeneratorExit 有机会投递
+                    if cancel_event.is_set():
+                        logger.info(f"[review] generator 检测到取消事件，退出主循环")
+                        break
+                    continue
+
+                # 检查取消事件
+                if cancel_event.is_set():
+                    logger.info(f"[review] generator 检测到取消事件，退出主循环")
                     break
 
                 if msg_type == "done":
@@ -583,15 +628,14 @@ def review_by_indicator():
                     yield msg
         except GeneratorExit:
             logger.info("review SSE: client disconnected, cancelling")
-            cancelled[0] = True
-            stop_event.set()
             raise
         except Exception as e:
             logger.error(f"review SSE generator error: {e}", exc_info=True)
+        finally:
+            # 无论 generator 以何种方式退出，都设置 cancelled[0] = True
             cancelled[0] = True
             stop_event.set()
-        finally:
-            stop_event.set()
+            _cleanup_cancel_event(user_id)
 
     # X-Accel-Buffering: no → 告诉 Nginx 不要缓冲，实时推送
     return Response(
@@ -603,3 +647,26 @@ def review_by_indicator():
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ================================================================
+# POST /review/cancel — 取消正在进行的审核（显式 API）
+# ================================================================
+@xuangu_bp.route("/review/cancel", methods=["POST"])
+@login_required
+def cancel_review():
+    """
+    显式取消当前用户正在进行的指标审核。
+
+    前端在用户点击"取消审核"按钮时调用此端点，
+    通过共享的 threading.Event 通知审核 generator 停止，
+    不依赖 Nginx/Gunicorn 的 GeneratorExit 投递。
+
+    Request: {} (空 JSON 或无 body)
+    Response: {"code": 0, "msg": "已发送取消信号"}
+    """
+    user_id = g.user_id
+    event = _get_or_create_cancel_event(user_id)
+    event.set()
+    logger.info(f"[review] 用户 {user_id} 发起取消审核")
+    return jsonify({"code": 0, "msg": "已发送取消信号"})

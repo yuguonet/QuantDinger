@@ -1397,17 +1397,23 @@ export default {
       this.reviewCancelling = true
       this.reviewCurrentMsg = '正在取消审核，等待当前股票处理完毕…'
 
-      // ② 等 Vue 渲染完再中断连接
+      // ② 调用显式取消 API（不依赖 TCP 断连传播，解决 Nginx/Gunicorn 下无法取消的问题）
+      fetch('/api/xuangu/review/cancel', {
+        method: 'POST',
+        credentials: 'include'
+      }).catch(() => {})
+
+      // ③ 等 Vue 渲染完再中断连接
       this.$nextTick(() => {
         setTimeout(() => {
-          // ③ 此时用户已看到"正在取消"状态，安全中断
+          // ④ 此时用户已看到"正在取消"状态，安全中断
           if (this.reviewAbortController) {
             this.reviewAbortController.abort()
           }
         }, 500)
       })
 
-      // ④ 兜底：8 秒后强制关闭（后端可能卡在阻塞调用上）
+      // ⑤ 兜底：8 秒后强制关闭（后端可能卡在阻塞调用上）
       this._cancelForceTimer = setTimeout(() => {
         if (this.reviewCancelling) {
           console.warn('[SSE] force closing after 8s timeout')
