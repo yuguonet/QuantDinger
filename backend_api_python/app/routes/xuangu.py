@@ -16,7 +16,7 @@ from flask import Blueprint, request, jsonify, g
 import json
 
 from app.utils.db import get_db_connection
-from app.utils.auth import get_current_user_id, login_required
+from app.utils.auth import login_required
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -32,6 +32,7 @@ import threading as _threading
 
 _review_cancel_events: dict[int, _threading.Event] = {}
 _review_cancelled_flags: dict[int, list] = {}
+_review_in_progress: dict[int, bool] = {}  # 防止同一用户并发审核
 _review_cancel_lock = _threading.Lock()
 
 
@@ -43,10 +44,19 @@ def _get_or_create_cancel_event(user_id: int) -> _threading.Event:
         return _review_cancel_events[user_id]
 
 
+def _new_cancel_event(user_id: int) -> _threading.Event:
+    """为新审核创建全新的 Event（避免 clear() 竞态影响旧审核）"""
+    with _review_cancel_lock:
+        event = _threading.Event()
+        _review_cancel_events[user_id] = event
+        return event
+
+
 def _cleanup_cancel_event(user_id: int):
-    """审核结束时清理取消事件"""
+    """审核结束时清理取消事件和进行中标志"""
     with _review_cancel_lock:
         _review_cancel_events.pop(user_id, None)
+        _review_in_progress.pop(user_id, None)
 
 
 # ================================================================
@@ -525,7 +535,7 @@ def review_by_indicator():
     # ── SSE Generator ──
     # 使用心跳线程 + 队列，穿透 nginx 等代理的缓冲层
     def generate():
-        import time, threading, queue
+        import threading, queue
 
         cancelled = [False]
         q = queue.Queue()
@@ -534,11 +544,19 @@ def review_by_indicator():
         _latest_progress = {"index": 0, "total": len(stocks), "symbol": "", "status": "initializing"}
 
         # ── 取消事件：通过显式 API 调用触发，不依赖 GeneratorExit ──
-        cancel_event = _get_or_create_cancel_event(user_id)
-        cancel_event.clear()  # 开始前重置
+        # ── 防重入：同一用户只能有一个审核在跑 ──
+        with _review_cancel_lock:
+            if _review_in_progress.get(user_id):
+                yield 'data: {"type":"error","msg":"审核已在进行中，请等待完成或先取消"}\n\n'
+                return
+            _review_in_progress[user_id] = True
+
+        # 每次审核创建全新 Event，避免与旧审核的 cancel_event 互相干扰
+        cancel_event = _new_cancel_event(user_id)
         # 注册 cancelled 标志，让 /review/cancel 端点可以直接设置
         with _review_cancel_lock:
             _review_cancelled_flags[user_id] = cancelled
+
 
         try:
             _indicator_id = int(indicator_id)

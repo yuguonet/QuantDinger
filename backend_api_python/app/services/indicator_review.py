@@ -40,14 +40,13 @@
 """
 
 import json
-import multiprocessing
 import queue
 import re
+import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, Generator, List, Optional
 
 import pandas as pd
-import numpy as np
 
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
@@ -114,15 +113,49 @@ def _hearts_str(n: int) -> str:
     return "♥" * n if n > 0 else ""
 
 
-def _bt_worker(q, **kwargs):
-    """子进程回测 worker，通过 Queue 返回结果。"""
-    try:
-        from app.services.backtest import BacktestService
-        svc = BacktestService()
-        result = svc.run(**kwargs)
-        q.put(("ok", result))
-    except Exception as e:
-        q.put(("error", str(e)))
+def _run_backtest(cancelled: List[bool], **kwargs) -> Optional[Dict[str, Any]]:
+    """
+    线程化执行单次回测，支持取消。
+
+    用 threading.Thread 在后台跑回测，主线程每 0.2s 轮询 cancelled 标志。
+    cancelled[0] 为 True 时立即返回 None，不等线程结束。
+    线程是 daemon，进程退出时自动终止。
+    """
+    q = queue.Queue()
+
+    def _worker():
+        try:
+            from app.services.backtest import BacktestService
+            svc = BacktestService()
+            result = svc.run(**kwargs)
+            q.put(("ok", result))
+        except Exception as e:
+            q.put(("error", str(e)))
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+
+    # 轮询：每 0.2s 检查 cancelled，最多等 30s
+    result = None
+    for _ in range(150):  # 30s / 0.2s = 150
+        if cancelled[0]:
+            t.join(timeout=2)  # 等线程结束，避免泄漏
+            return None
+        try:
+            status, payload = q.get(timeout=0.2)
+            if status == "ok":
+                result = payload
+            else:
+                logger.warning(f"_run_backtest error: {payload}")
+            break
+        except queue.Empty:
+            continue
+
+    if result is None and not cancelled[0]:
+        logger.warning("_run_backtest timeout (30s)")
+
+    t.join(timeout=2)  # 确保线程结束
+    return result
 
 
 # ================================================================
@@ -390,12 +423,6 @@ def _run_indicator_on_stock(
         result["error"] = f"无法获取 {symbol} 的K线数据"
         return result
 
-    # ── 检查取消（K线拉取后） ──
-    if cancelled[0]:
-        result["cancelled"] = True
-        result["error"] = "已取消"
-        return result
-
     # ── 2. 当前价格（实时优先，K线兜底） ──
     current_price = _get_current_price_ticker(market, symbol, fallback_df=df)
     result["current_price"] = current_price
@@ -403,12 +430,6 @@ def _run_indicator_on_stock(
     # ── 3. 解析指标参数 ──
     declared_params = IndicatorParamsParser.parse_params(indicator_code)
     merged_params = IndicatorParamsParser.merge_params(declared_params, user_params or {})
-
-    # ── 检查取消（沙箱执行前） ──
-    if cancelled[0]:
-        result["cancelled"] = True
-        result["error"] = "已取消"
-        return result
 
     # ── 4. 沙箱执行（带取消感知） ──
     df_copy = df.copy()
@@ -737,8 +758,9 @@ def review_stocks(
       ├─ 无 buy 信号          → skip (no_buy_signal)
       ├─ 现价 > 买点价格      → skip (price_above_buy)
       ├─ 买点超过3个交易日    → skip (buy_too_old)
+      ├─ 策略无卖点信号       → skip (no_sell_signal) — 交易逻辑不完整
       ├─ 买点价 > 卖点价      → skip (buy_after_sell) — 策略逻辑异常
-      ├─ 买点日期 < 卖点日期  → skip (buy_before_sell) — 日期逻辑异常
+      ├─ 买点日期 < 卖点日期  → skip (buy_before_sell) — 时间线异常
       ├─ 有负面新闻(<=0分)    → skip (negative_news)
       ├─ 加自选失败           → skip (add_failed)
       └─ 全部通过             → 加入自选 → 多周期回测 → hearts评分 (passed)
@@ -888,36 +910,44 @@ def review_stocks(
                 except Exception:
                     pass  # 提取失败不阻断流程
 
-            # 买卖逻辑校验：买点价不能高于卖点价
+            # ── 买卖逻辑校验（合并价格+日期，必须同时通过） ──
             sell_price = indicator_result.get("sell_price")
-            if sell_price is not None and buy_price is not None and buy_price > sell_price:
-                sell_date_str = indicator_result.get("sell_date") or ""
+            sell_date_str = indicator_result.get("sell_date") or ""
+            buy_date_str = indicator_result.get("buy_date") or ""
+
+            # 策略必须有卖点信号，否则逻辑不完整
+            if sell_price is None:
                 yield _sse({
                     "type": "result", "symbol": symbol, "market": market, "name": name,
                     "index": idx + 1, "total": total, "added": False,
-                    "reason": "buy_after_sell",
-                    "msg": (
-                        f"{symbol} 策略逻辑异常：买点价({buy_price:.2f})高于卖点价({sell_price:.2f})"
-                        + (f"，买点({buy_date_str})在卖点({sell_date_str})之后" if buy_date_str and sell_date_str else "")
-                        + "，策略不符合基本交易逻辑"
-                    ),
+                    "reason": "no_sell_signal",
+                    "msg": f"{symbol} 策略缺少卖点信号，交易逻辑不完整",
                 })
                 skipped_count += 1
                 continue
 
-            # 买卖日期逻辑校验：买点日期不能在卖点日期之前
-            buy_date_str_check = indicator_result.get("buy_date") or ""
-            sell_date_str_check = indicator_result.get("sell_date") or ""
-            if buy_date_str_check and sell_date_str_check:
+            # 买点价 > 卖点价 → 策略反了
+            if buy_price is not None and buy_price > sell_price:
+                yield _sse({
+                    "type": "result", "symbol": symbol, "market": market, "name": name,
+                    "index": idx + 1, "total": total, "added": False,
+                    "reason": "buy_after_sell",
+                    "msg": f"{symbol} 策略逻辑异常：买点价({buy_price:.2f})高于卖点价({sell_price:.2f})，不符合基本交易逻辑",
+                })
+                skipped_count += 1
+                continue
+
+            # 买点日期 < 卖点日期 → 时间线反了
+            if buy_date_str and sell_date_str:
                 try:
-                    buy_dt = datetime.strptime(buy_date_str_check, "%Y-%m-%d")
-                    sell_dt = datetime.strptime(sell_date_str_check, "%Y-%m-%d")
+                    buy_dt = datetime.strptime(buy_date_str, "%Y-%m-%d")
+                    sell_dt = datetime.strptime(sell_date_str, "%Y-%m-%d")
                     if buy_dt < sell_dt:
                         yield _sse({
                             "type": "result", "symbol": symbol, "market": market, "name": name,
                             "index": idx + 1, "total": total, "added": False,
                             "reason": "buy_before_sell",
-                            "msg": f"{symbol} 策略逻辑异常：买点日期({buy_date_str_check})在卖点日期({sell_date_str_check})之前，不符合基本交易逻辑",
+                            "msg": f"{symbol} 策略逻辑异常：买点日期({buy_date_str})在卖点日期({sell_date_str})之前，不符合基本交易逻辑",
                         })
                         skipped_count += 1
                         continue
@@ -1002,68 +1032,28 @@ def review_stocks(
                     start_date = end_date - timedelta(days=months * 30)
 
                     try:
-                        # 用子进程跑回测，取消时直接 terminate() 杀掉
-                        q = multiprocessing.Queue()
-                        p = multiprocessing.Process(
-                            target=_bt_worker,
-                            kwargs=dict(
-                                indicator_code=indicator_code,
-                                market=market,
-                                symbol=symbol,
-                                timeframe=tf,
-                                start_date=start_date,
-                                end_date=end_date,
-                                initial_capital=100000.0,
-                                commission=0.001,
-                                trade_direction="long",
-                                indicator_params=user_params,
-                                user_id=user_id,
-                                indicator_id=indicator_id,
-                                q=q,
-                            ),
-                            daemon=True,
+                        # 线程化回测：后台线程执行，主线程每 0.2s 检查 cancelled
+                        bt_result = _run_backtest(
+                            cancelled=cancelled,
+                            indicator_code=indicator_code,
+                            market=market,
+                            symbol=symbol,
+                            timeframe=tf,
+                            start_date=start_date,
+                            end_date=end_date,
+                            initial_capital=100000.0,
+                            commission=0.001,
+                            trade_direction="long",
+                            indicator_params=user_params,
+                            user_id=user_id,
+                            indicator_id=indicator_id,
                         )
-                        p.start()
 
-                        bt_result = None
-                        # 轮询等待子进程，每 0.5s 检查取消/超时
-                        waited = 0.0
-                        while p.is_alive() and waited < 20.0:
+                        if bt_result is None:
+                            # 取消或超时或异常
                             if cancelled[0]:
-                                p.terminate()
-                                p.join(timeout=2)
-                                logger.info(f"[review] {symbol} {label}({tf}) 回测被取消，子进程已杀掉")
                                 break
-                            p.join(timeout=0.5)
-                            waited += 0.5
-
-                        if cancelled[0]:
-                            break
-
-                        if p.is_alive():
-                            # 超时 → 杀掉
-                            p.terminate()
-                            p.join(timeout=2)
-                            logger.warning(f"[review] {symbol} {label}({tf}) 回测超时，已杀掉")
-                            bt_msg_parts.append(f"{label}:超时")
-                            continue
-
-                        # 取结果（用 timeout 避免管道竞态）
-                        try:
-                            status, payload = q.get(timeout=2)
-                        except queue.Empty:
                             bt_msg_parts.append(f"{label}:无结果")
-                            continue
-                        except Exception as q_err:
-                            logger.warning(f"[review] {symbol} {label}({tf}) Queue读取异常: {q_err}")
-                            bt_msg_parts.append(f"{label}:异常")
-                            continue
-
-                        if status == "ok":
-                            bt_result = payload
-                        else:
-                            logger.warning(f"[review] {symbol} {label}({tf}) 回测子进程报错: {payload}")
-                            bt_msg_parts.append(f"{label}:异常")
                             continue
 
                         win_rate = (bt_result or {}).get("winRate", 0) or 0
@@ -1081,9 +1071,6 @@ def review_stocks(
                             f"[review] {symbol} {label}({tf}) 回测失败: {period_err}"
                         )
                         bt_msg_parts.append(f"{label}:异常")
-
-                if cancelled[0]:
-                    break
 
                 hearts = best_hearts
                 hearts_str = _hearts_str(hearts)

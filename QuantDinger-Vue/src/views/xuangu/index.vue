@@ -1398,9 +1398,18 @@ export default {
       this.reviewCurrentMsg = '正在取消审核，等待当前股票处理完毕…'
 
       // ② 调用显式取消 API（不依赖 TCP 断连传播，解决 Nginx/Gunicorn 下无法取消的问题）
+      let token = storage.get(ACCESS_TOKEN) || ''
+      if (typeof token !== 'string') {
+        token = (token && typeof token === 'object') ? (token.token || token.value || '') : ''
+      }
       fetch('/api/xuangu/review/cancel', {
         method: 'POST',
-        credentials: 'include'
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': token ? `Bearer ${token}` : '',
+          [ACCESS_TOKEN]: token,
+          'token': token
+        }
       }).catch(() => {})
 
       // ③ 等 Vue 渲染完再中断连接
