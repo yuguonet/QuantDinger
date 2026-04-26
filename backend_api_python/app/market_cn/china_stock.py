@@ -40,11 +40,41 @@ def retry(max_retries=2, delay=1):
     return decorator
 
 
+def _check_available(name):
+    """快速检查数据源是否可用（import + token），不走 retry。"""
+    try:
+        if name == "tushare":
+            import tushare
+            return bool(_get_tushare_token())
+        elif name == "akshare":
+            import akshare
+            return True
+        elif name == "baostock":
+            import baostock
+            return True
+    except ImportError:
+        return False
+    return True
+
+
 def fallback(*sources):
-    """降级链: 按顺序尝试数据源，第一个成功即返回"""
+    """降级链: 按顺序尝试数据源，第一个成功即返回。
+    快速跳过不可用的源（未安装 / 无 token），不浪费 retry 时间。
+    """
+    # 预检查可用性，过滤掉不可用的源
+    available = []
+    for name, func in sources:
+        # 从 name 中提取库名（如 "tushare"、"akshare"）
+        lib = name.split("-")[0] if "-" in name else name
+        if lib in ("tushare", "akshare", "baostock"):
+            if not _check_available(lib):
+                print(f"    ⏭️  {name} 跳过 (未安装或无 token)")
+                continue
+        available.append((name, func))
+
     def wrapper(*args, **kwargs):
         errors = []
-        for name, func in sources:
+        for name, func in available:
             try:
                 result = func(*args, **kwargs)
                 if result is None:

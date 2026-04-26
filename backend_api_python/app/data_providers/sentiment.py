@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import time
 import statistics
+import os as _os
+import json as _json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -290,12 +292,104 @@ def get_data_source_table() -> Dict[str, Any]:
 
 _probe_cache: Dict[str, DataSource] = {}
 
+# 探测结果文件缓存 — 避免每次重启都重新探测所有源
+_PROBE_CACHE_DIR = None
+_PROBE_CACHE_MAX_AGE = 86400  # 探测结果有效期 1 天
+
+
+def _probe_cache_dir():
+    global _PROBE_CACHE_DIR
+    if _PROBE_CACHE_DIR is None:
+        _PROBE_CACHE_DIR = _os.path.join(_os.getcwd(), "data", "market_cn_cache")
+        _os.makedirs(_PROBE_CACHE_DIR, exist_ok=True)
+    return _PROBE_CACHE_DIR
+
+
+def _probe_cache_path():
+    return _os.path.join(_probe_cache_dir(), "sentiment_probe_cache.json")
+
+
+def _load_probe_cache():
+    """从文件加载探测结果，过期返回 None。"""
+    path = _probe_cache_path()
+    if not _os.path.exists(path):
+        return None
+    try:
+        mtime = _os.path.getmtime(path)
+        if time.time() - mtime > _PROBE_CACHE_MAX_AGE:
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            raw = _json.load(f)
+        result = {}
+        for name, ds_dict in raw.items():
+            result[name] = DataSource(
+                name=ds_dict["name"],
+                source_type=ds_dict.get("source_type", "api"),
+                description=ds_dict.get("description", ""),
+                latency_ms=ds_dict.get("latency_ms", 5000),
+                available=ds_dict.get("available", False),
+                priority=ds_dict.get("priority", 99),
+            )
+        logger.info("Loaded probe cache from file (%d sources, age %.0fmin)",
+                     len(result), (time.time() - mtime) / 60)
+        return result
+    except Exception as e:
+        logger.warning("Failed to load probe cache: %s", e)
+        return None
+
+
+def _save_probe_cache(probe_results: Dict[str, DataSource]):
+    """将探测结果写入文件缓存。"""
+    path = _probe_cache_path()
+    try:
+        raw = {}
+        for name, ds in probe_results.items():
+            raw[name] = {
+                "name": ds.name,
+                "source_type": ds.source_type,
+                "description": ds.description,
+                "latency_ms": ds.latency_ms,
+                "available": ds.available,
+                "priority": ds.priority,
+            }
+        tmp_path = f"{path}.tmp.{_os.getpid()}"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            _json.dump(raw, f, ensure_ascii=False, indent=2)
+        _os.replace(tmp_path, path)
+        logger.info("Saved probe cache to file (%d sources)", len(raw))
+    except Exception as e:
+        logger.warning("Failed to save probe cache: %s", e)
+
 
 def init_sources() -> None:
+    """初始化数据源优先级：优先读文件缓存，过期或缺失才重新探测。"""
     global _probe_cache
+
+    cached = _load_probe_cache()
+    if cached and len(cached) >= 5:
+        _probe_cache = cached
+        build_source_priority(_probe_cache)
+        logger.info("Data sources initialized from file cache.")
+        # 后台异步刷新探测结果
+        def _bg_refresh():
+            try:
+                fresh = probe_all_sources()
+                if fresh and len(fresh) >= 5:
+                    _probe_cache.update(fresh)
+                    build_source_priority(_probe_cache)
+                    _save_probe_cache(_probe_cache)
+                    logger.info("Probe cache refreshed in background.")
+            except Exception as e:
+                logger.warning("Background probe refresh failed: %s", e)
+        import threading
+        threading.Thread(target=_bg_refresh, daemon=True).start()
+        return
+
+    # 无缓存：同步探测
     _probe_cache = probe_all_sources()
     build_source_priority(_probe_cache)
-    logger.info("Data sources initialized.")
+    _save_probe_cache(_probe_cache)
+    logger.info("Data sources initialized (fresh probe).")
 
 
 # ============================================================================
