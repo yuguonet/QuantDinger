@@ -170,21 +170,40 @@
           <div v-if="activeTab === 'policy'" class="tab-content">
             <div v-if="policyLoading" class="loading-state">加载中...</div>
             <div v-else-if="policyData && policyItems.length > 0" class="policy-content">
+              <!-- AI 深度分析摘要 -->
+              <div v-if="policyData.data && policyData.data.mode === 'ai'" class="policy-ai-summary">
+                <div class="policy-sentiment">
+                  <span class="sentiment-label">政策基调:</span>
+                  <span class="sentiment-value">{{ policyData.data.overall_sentiment || '—' }}</span>
+                </div>
+                <p class="policy-summary-text">{{ policyData.data.summary || '' }}</p>
+                <div v-if="policyData.data.market_outlook" class="policy-outlook">
+                  <h4>🔮 市场展望</h4>
+                  <p>{{ policyData.data.market_outlook }}</p>
+                </div>
+                <div v-if="policyData.data.actionable_advice" class="policy-advice">
+                  <h4>💡 策略建议</h4>
+                  <p>{{ policyData.data.actionable_advice }}</p>
+                </div>
+              </div>
+              <!-- 政策影响列表 -->
               <div v-if="policyImpacts.length > 0" class="policy-impacts">
                 <h4>🎯 政策影响分析</h4>
                 <div v-for="(imp, i) in policyImpacts" :key="i" class="policy-impact-row">
                   <span class="impact-keyword">{{ imp.keyword }}</span>
-                  <span class="impact-direction" :class="imp.direction > 0 ? 'up' : imp.direction < 0 ? 'down' : ''">
-                    {{ imp.direction > 0 ? '利好' : imp.direction < 0 ? '利空' : '中性' }}
+                  <span class="impact-direction" :class="typeof imp.direction === 'number' ? (imp.direction > 0 ? 'up' : imp.direction < 0 ? 'down' : '') : ''">
+                    {{ typeof imp.direction === 'number' ? (imp.direction > 0 ? '利好' : imp.direction < 0 ? '利空' : '中性') : imp.direction || '中性' }}
                   </span>
                   <span class="impact-sector">{{ imp.sector || '' }}</span>
                 </div>
               </div>
+              <!-- 政策详情列表 -->
               <div class="policy-list">
-                <h4>📰 政策关键词扫描</h4>
+                <h4>📰 {{ policyData.data.mode === 'ai' ? '政策详情' : '政策关键词扫描' }}</h4>
                 <div v-for="(item, i) in policyItems" :key="i" class="policy-item-row">
                   <span class="policy-time">{{ item.time || '' }}</span>
                   <span class="policy-title">{{ item.title || item.text || '' }}</span>
+                  <span v-if="item.impact_detail" class="policy-impact-detail">{{ item.impact_detail }}</span>
                   <span v-if="item.keywords && item.keywords.length > 0" class="policy-keywords">
                     <span v-for="kw in item.keywords.slice(0, 3)" :key="kw" class="policy-kw-tag">{{ kw }}</span>
                   </span>
@@ -991,8 +1010,21 @@ export default {
 .fg-ind-detail { flex: 1; font-size: 12px; color: #909399; min-width: 0; }
 
 /* 政策 */
+.policy-ai-summary {
+  background: linear-gradient(135deg, #f5f7fa 0%, #e8ecf1 100%);
+  border-radius: 8px; padding: 16px; margin-bottom: 16px;
+  border-left: 3px solid #409eff;
+}
+.policy-sentiment { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.sentiment-label { font-size: 13px; color: #606266; }
+.sentiment-value { font-size: 14px; font-weight: 700; color: #303133; }
+.policy-summary-text { font-size: 13px; color: #333; line-height: 1.6; margin: 0 0 12px; }
+.policy-outlook, .policy-advice { margin-top: 10px; }
+.policy-outlook h4, .policy-advice h4 { margin: 0 0 6px; font-size: 13px; color: #333; }
+.policy-outlook p, .policy-advice p { margin: 0; font-size: 12px; color: #606266; line-height: 1.5; }
 .policy-impacts { margin-bottom: 20px; }
 .policy-impacts h4, .policy-list h4 { margin: 0 0 12px; font-size: 14px; color: #333; }
+.policy-impact-detail { font-size: 12px; color: #909399; margin-left: 4px; }
 .policy-impact-row {
   display: flex; align-items: center; gap: 12px;
   padding: 8px 12px; background: #fafbfc; border-radius: 6px; margin-bottom: 6px;

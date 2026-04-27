@@ -9,6 +9,9 @@ import pandas as pd
 from datetime import datetime, timedelta
 import json
 import re
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def _get_akshare():
@@ -31,8 +34,8 @@ def get_financial_news():
     try:
         df = ak.stock_news_em(symbol="财经")
         for i, row in df.head(15).iterrows():
-            title = row.get('新闻标题', row.iloc[0] if len(row) > 0 else '')
-            time_str = row.get('发布时间', row.iloc[1] if len(row) > 1 else '')
+            title = row.get('新闻标题', row.iloc[1] if len(row) > 1 else '')
+            time_str = row.get('发布时间', row.iloc[3] if len(row) > 3 else '')
             print(f"  • [{time_str}] {title}")
         return df
     except Exception as e:
@@ -41,18 +44,20 @@ def get_financial_news():
 
 
 def get_macro_news():
-    """获取宏观要闻"""
+    """获取宏观要闻 (兼容新旧 AKShare 版本)"""
     ak = _get_akshare()
     if ak is None:
         print("  ⚠️ akshare 未安装")
         return None
     print("\n📰 宏观经济新闻")
     print("=" * 60)
+    # 新版 AKShare 已移除 macro_news, 用 news_cctv 替代
     try:
-        df = ak.macro_news()
+        from datetime import datetime as _dt
+        df = ak.news_cctv(date=_dt.now().strftime("%Y%m%d"))
         for i, row in df.head(15).iterrows():
-            title = row.iloc[0] if len(row) > 0 else ''
-            time_str = row.iloc[1] if len(row) > 1 else ''
+            title = row.get('title', row.iloc[1] if len(row) > 1 else '')
+            time_str = str(row.get('date', row.iloc[0] if len(row) > 0 else ''))
             print(f"  • [{time_str}] {title}")
         return df
     except Exception as e:
@@ -82,7 +87,7 @@ def get_policy_keywords():
     if ak is not None:
         sources = [
             ('东方财富', lambda: ak.stock_news_em(symbol="财经")),
-            ('同花顺', lambda: ak.news_cctv(date=datetime.now().strftime("%Y%m%d"))),
+            ('央视新闻', lambda: ak.news_cctv(date=datetime.now().strftime("%Y%m%d"))),
         ]
 
     for source_name, fetcher in sources:
@@ -90,15 +95,25 @@ def get_policy_keywords():
             df = fetcher()
             if df is not None:
                 for _, row in df.iterrows():
-                    title = str(row.iloc[0])
-                    time_str = str(row.iloc[1]) if len(row) > 1 else ''
-                    all_titles.append({
-                        'source': source_name,
-                        'title': title,
-                        'time': time_str,
-                        'matched_keywords': []
-                    })
-        except:
+                    # 兼容新旧列结构: stock_news_em 列0=关键词/列1=标题, news_cctv 列0=date/列1=title
+                    if '新闻标题' in df.columns:
+                        title = str(row.get('新闻标题', row.iloc[1] if len(row) > 1 else ''))
+                        time_str = str(row.get('发布时间', row.iloc[3] if len(row) > 3 else ''))
+                    elif 'title' in df.columns:
+                        title = str(row.get('title', row.iloc[1] if len(row) > 1 else ''))
+                        time_str = str(row.get('date', row.iloc[0] if len(row) > 0 else ''))
+                    else:
+                        title = str(row.iloc[1]) if len(row) > 1 else str(row.iloc[0])
+                        time_str = str(row.iloc[0]) if len(row) > 1 else ''
+                    if title and title not in ('财经', 'None', ''):
+                        all_titles.append({
+                            'source': source_name,
+                            'title': title,
+                            'time': time_str,
+                            'matched_keywords': []
+                        })
+        except Exception as e:
+            logger.warning(f"[政策关键词] {source_name} 异常: {e}")
             continue
 
     # 关键词匹配

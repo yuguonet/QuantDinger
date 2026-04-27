@@ -47,6 +47,9 @@ MARKET_NEWS_SYMBOLS = {
     "Futures":  "MARKET_FUTURES",  # 期货市场新闻
 }
 
+# 政策解读分析结果 (AI分析后存入 qd_news_cache_items, 通过此 symbol 区分)
+POLICY_ANALYSIS_SYMBOL = "POLICY_ANALYSIS"
+
 
 # ═══════════════════════════════════════════════════════════════
 # 新闻缓存配置
@@ -824,3 +827,146 @@ def get_economic_calendar() -> List[Dict[str, Any]]:
 
     events.sort(key=lambda x: (x["date"], x["time"]))
     return events
+
+
+# ═══════════════════════════════════════════════════════════════
+# 政策解读 — 缓存读写 + 统一入口
+# ═══════════════════════════════════════════════════════════════
+#
+# 算法在 news_preprocessor.py (keyword_score / ai_analyze_policy)
+# 本模块负责: 搜索新闻 → 调前处理 → 缓存结果
+#
+
+_POLICY_CACHE_TTL = 12 * 3600  # 12h
+
+
+def _get_policy_cached() -> Optional[Dict[str, Any]]:
+    """从 qd_news_cache_items 读政策分析缓存"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT snippet, created_at FROM qd_news_cache_items
+                   WHERE symbol = %s AND market = %s
+                   ORDER BY created_at DESC LIMIT 1""",
+                (POLICY_ANALYSIS_SYMBOL, "CNStock"),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            age = (datetime.now() - row["created_at"]).total_seconds()
+            if age > _POLICY_CACHE_TTL:
+                return None
+            try:
+                data = json.loads(row["snippet"])
+                data["_cached"] = True
+                return data
+            except (json.JSONDecodeError, TypeError):
+                return None
+    except Exception as e:
+        logger.warning("[政策缓存] 读取失败: %s", e)
+        return None
+
+
+def _save_policy_cache(analysis: Dict[str, Any]) -> bool:
+    """将分析结果存入 qd_news_cache_items"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            today = datetime.now().strftime("%Y-%m-%d")
+            cursor.execute(
+                """INSERT INTO qd_news_cache_items
+                   (symbol, market, title, snippet, url, source, published_date,
+                    sentiment, sentiment_score)
+                   VALUES (%s, %s, %s, %s, '', %s, %s, 'neutral', %s)
+                   ON CONFLICT (symbol, market, title) DO UPDATE SET
+                       snippet = EXCLUDED.snippet,
+                       source = EXCLUDED.source,
+                       sentiment_score = EXCLUDED.sentiment_score,
+                       created_at = NOW()""",
+                (
+                    POLICY_ANALYSIS_SYMBOL, "CNStock",
+                    f"政策解读_{today}",
+                    json.dumps(analysis, ensure_ascii=False, default=str),
+                    analysis.get("llm_provider", ""),
+                    datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    analysis.get("composite_score", 5.0),
+                ),
+            )
+            conn.commit()
+            logger.info("[政策缓存] 已保存 (%s)", today)
+            return True
+    except Exception as e:
+        logger.error("[政策缓存] 保存失败: %s", e)
+        return False
+
+
+def process_policy_news() -> Dict[str, Any]:
+    """
+    政策解读统一入口 — 搜索 + 前处理 + 缓存
+
+    流程:
+      1. 查缓存 → 命中直接返回
+      2. search_market_news() 搜新闻
+      3. news_preprocessor.keyword_score_batch() 关键词评分
+      4. news_preprocessor.ai_analyze_policy() AI解读 (可选)
+      5. 存缓存 → 返回
+
+    Returns:
+        {"mode": "ai"/"keyword", "summary": ..., "policies": [...], ...}
+    """
+    # ── 1. 查缓存 ──
+    cached = _get_policy_cached()
+    if cached:
+        logger.info("[政策解读] 缓存命中")
+        return cached
+
+    # ── 2. 搜新闻 ──
+    resp = search_market_news(market="CNStock", max_fetcher_per_source=10)
+    news_list = [
+        {"title": r.title, "source": r.source or "财经", "time": r.published_date or "", "url": r.url or ""}
+        for r in resp.results if r.title
+    ]
+    if not news_list:
+        return {"mode": "keyword", "summary": "未获取到新闻", "policy_items": [], "impacts": []}
+
+    # ── 3. 关键词评分 ──
+    from app.services.news_processor import keyword_score, keyword_score_batch, ai_analyze_policy
+    keyword_score_batch(news_list)
+    policy_items = [n for n in news_list if n.get("keywords")]
+
+    # ── 4. AI 解读 ──
+    ai_result = ai_analyze_policy(news_list)
+
+    if ai_result:
+        for p in ai_result.get("policies", []):
+            kw = keyword_score(p.get("headline", ""))
+            if not p.get("keywords"):
+                p["keywords"] = kw["keywords"]
+            if not p.get("score"):
+                p["score"] = kw["score"]
+        ai_result["mode"] = "ai"
+        ai_result["keyword_count"] = len(policy_items)
+        _save_policy_cache(ai_result)
+        return ai_result
+
+    # ── 5. 无 LLM → 纯关键词 ──
+    impacts = []
+    for item in policy_items:
+        for kw in item.get("keywords", []):
+            impacts.append({"keyword": kw, "direction": 1, "score": item.get("sentiment_score", 5.0)})
+
+    kw_result = {
+        "mode": "keyword",
+        "summary": f"关键词匹配, {len(policy_items)} 条政策相关 (共 {len(news_list)} 条新闻)",
+        "overall_sentiment": "中性",
+        "composite_score": 5.0,
+        "policy_items": policy_items[:30],
+        "impacts": impacts[:20],
+        "policies": [],
+        "market_outlook": "",
+        "actionable_advice": "",
+        "news_count": len(news_list),
+    }
+    _save_policy_cache(kw_result)
+    return kw_result

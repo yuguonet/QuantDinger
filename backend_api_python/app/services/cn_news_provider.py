@@ -210,16 +210,18 @@ def fetch_wallstreetcn_news(max_items=20):
 
 
 def fetch_akshare_news(max_items=20):
-    """AKShare 财经新闻 (降级备选)"""
+    """AKShare 财经新闻 (降级备选) — 兼容新旧列结构"""
     try:
         import akshare as ak
         df = ak.stock_news_em(symbol="财经")
         news = []
         for _, row in df.head(max_items).iterrows():
-            title = str(row.iloc[0])
-            time_str = str(row.iloc[1]) if len(row) > 1 else ""
-            url = str(row.iloc[2]) if len(row) > 2 else ""
-            news.append({"title": title, "time": time_str, "url": url, "source": "AKShare-东方财富"})
+            # 新版列: 0=关键词, 1=新闻标题, 2=新闻内容, 3=发布时间, 4=文章来源, 5=新闻链接
+            title = str(row.get('新闻标题', row.iloc[1] if len(row) > 1 else ''))
+            time_str = str(row.get('发布时间', row.iloc[3] if len(row) > 3 else ''))
+            url = str(row.get('新闻链接', row.iloc[5] if len(row) > 5 else ''))
+            if title and title not in ('财经', 'None', ''):
+                news.append({"title": title, "time": time_str, "url": url, "source": "AKShare-东方财富"})
         return news
     except Exception as e:
         return [{"error": f"akshare: {e}"}]

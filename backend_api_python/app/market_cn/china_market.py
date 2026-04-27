@@ -347,14 +347,13 @@ def _china_macro_fetch() -> dict:
 
 
 def _china_policy_fetch() -> dict:
-    """政策解读原始获取逻辑（无缓存）。"""
-    from .policy_analysis import get_policy_keywords, analyze_policy_impact
-    policy_items = get_policy_keywords()
-    impacts = analyze_policy_impact(policy_items) if policy_items else []
+    """政策解读原始获取逻辑 — 委托 news.py (搜索→前处理→缓存)。"""
+    from app.data_providers.news import process_policy_news
+    data = process_policy_news()
     return {
         "code": 1, "msg": "success",
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "data": {"policy_items": policy_items[:30], "impacts": impacts[:20]},
+        "data": data,
     }
 
 
