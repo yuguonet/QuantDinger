@@ -32,6 +32,8 @@ def register_routes(app: Flask):
     from app.routes.shichang import shichang_bp, global_market_bp
     from app.routes.agent_blueprint import agent_bp
     from app.routes.agent_analysis import analysis_bp
+    # stock screener — 选股器独立 API（前端功能移植到后端）
+    from app.routes.stock_screener_api import stock_screener_bp
     # market_local — 本地行情存储 (feather)，数据源来自 global-market
     from app.market_store.plugin_api import market_local_bp
 
@@ -62,4 +64,5 @@ def register_routes(app: Flask):
     app.register_blueprint(shichang_bp, url_prefix='/api/shichang')
     app.register_blueprint(agent_bp)
     app.register_blueprint(analysis_bp)
+    app.register_blueprint(stock_screener_bp, url_prefix='/api/stock-screener')
     app.register_blueprint(market_local_bp, url_prefix='/api/market-local')

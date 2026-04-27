@@ -52,6 +52,20 @@ TOOL_DISPLAY_NAMES: Dict[str, str] = {
     "analyze_pattern": "识别K线形态",
     "get_market_indices": "获取市场指数",
     "get_sector_rankings": "分析行业板块",
+    "screen_stocks": "智能选股",
+    "get_screener_presets": "获取选股条件",
+    "get_dragon_tiger_stocks": "获取龙虎榜",
+    "get_dragon_tiger_by_stock": "查询个股龙虎榜",
+    "get_hot_rank_stocks": "获取热榜",
+    "get_zt_pool_stocks": "获取涨停池",
+    "get_limit_down_stocks": "获取跌停池",
+    "get_broken_board_stocks": "获取炸板池",
+    "get_market_overview": "获取市场快照",
+    "get_stock_fund_flow": "获取个股资金流",
+    "batch_get_stock_fund_flow": "批量获取资金流",
+    "get_sector_fund_flow": "获取板块资金流",
+    "get_concept_fund_flow": "获取概念资金流",
+    "smart_screen": "综合选股",
 }
 
 

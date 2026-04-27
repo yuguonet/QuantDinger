@@ -17,6 +17,7 @@ from app.agent.tools.data_tools import DATA_TOOLS
 from app.agent.tools.analysis_tools import ANALYSIS_TOOLS
 from app.agent.tools.search_tools import SEARCH_TOOLS
 from app.agent.tools.market_tools import MARKET_TOOLS
+from app.agent.tools.stock_screener_tools import SCREENER_TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,7 @@ def get_tool_registry() -> ToolRegistry:
         return _TOOL_REGISTRY
 
     registry = ToolRegistry()
-    all_tools = DATA_TOOLS + ANALYSIS_TOOLS + SEARCH_TOOLS + MARKET_TOOLS
+    all_tools = DATA_TOOLS + ANALYSIS_TOOLS + SEARCH_TOOLS + MARKET_TOOLS + SCREENER_TOOLS
     registry.register_many(all_tools)
     _TOOL_REGISTRY = registry
     logger.info("[AgentFactory] ToolRegistry cached (%d tools)", len(registry.list_tools()))
