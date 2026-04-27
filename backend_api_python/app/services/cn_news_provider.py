@@ -194,9 +194,14 @@ def fetch_wallstreetcn_news(max_items=20):
             title = item.get("content_text", "") or item.get("content_plain", "") or item.get("title", "")
             if not title:
                 continue
+            display_time = item.get("display_time", 0)
+            try:
+                time_str = datetime.fromtimestamp(int(display_time)).strftime("%H:%M") if display_time else ""
+            except (ValueError, TypeError, OSError):
+                time_str = ""
             results.append({
                 "title": title.strip(),
-                "time": datetime.fromtimestamp(item.get("display_time", 0)).strftime("%H:%M"),
+                "time": time_str,
                 "source": "华尔街见闻",
             })
         return results
@@ -221,8 +226,17 @@ def fetch_akshare_news(max_items=20):
 
 
 def fetch_all_news(max_per_source=10):
-    """聚合所有新闻源"""
-    all_news = []
+    """
+    聚合所有新闻源 (供 news.py 调用)
+    返回 dict 列表: [{"title", "url", "source", "time"}, ...]
+    """
+    import time
+    import logging
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    logger = logging.getLogger(__name__)
+    logger.info(f"[cn_news] 开始抓取, max_per_source={max_per_source}")
+
     sources = [
         ("财联社", lambda: fetch_cls_news(max_items=max_per_source)),
         ("华尔街见闻", lambda: fetch_wallstreetcn_news(max_items=max_per_source)),
@@ -230,14 +244,23 @@ def fetch_all_news(max_per_source=10):
         ("新浪财经", lambda: fetch_sina_finance_news(max_items=max_per_source)),
         ("AKShare", lambda: fetch_akshare_news(max_items=max_per_source)),
     ]
-    for name, fetcher in sources:
-        try:
-            items = fetcher()
-            valid = [i for i in items if "error" not in i]
-            all_news.extend(valid)
-        except Exception:
-            pass
 
+    t0 = time.time()
+    all_news = []
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(fn): name for name, fn in sources}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                items = future.result(timeout=15)
+                valid = [i for i in items if isinstance(i, dict) and "error" not in i]
+                all_news.extend(valid)
+                logger.info(f"[cn_news] {name}: {len(valid)} 条")
+            except Exception as e:
+                logger.warning(f"[cn_news] {name} 异常: {e}")
+
+    elapsed = time.time() - t0
+    logger.info(f"[cn_news] 完成, 共 {len(all_news)} 条, 耗时 {elapsed:.2f}s")
     return all_news
 
 
@@ -246,25 +269,40 @@ def fetch_all_news(max_per_source=10):
 # ═══════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     print(f"\n{'='*60}")
     print(f"  📰 新闻抓取测试 — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"{'='*60}\n")
 
     sources = [
-        ("东方财富", fetch_eastmoney_news),
         ("财联社", fetch_cls_news),
         ("华尔街见闻", fetch_wallstreetcn_news),
+        ("东方财富", fetch_eastmoney_news),
         ("新浪财经", fetch_sina_finance_news),
+        ("AKShare", fetch_akshare_news),
     ]
 
-    total = 0
-    for name, fn in sources:
-        items = fn(max_items=5)
-        valid = [i for i in items if "error" not in i]
-        total += len(valid)
-        print(f"  ✅ {name}: {len(valid)} 条")
-        for i, item in enumerate(valid[:3], 1):
-            title = item.get("title", "")[:60]
-            print(f"     {i}. {title}")
+    # ── 并行抓取 ──
+    def _fetch(name, fn, max_items=5):
+        try:
+            items = fn(max_items=max_items)
+            valid = [i for i in items if "error" not in i]
+            return name, valid
+        except Exception:
+            return name, []
 
-    print(f"\n  共 {total} 条新闻")
+    t0 = time.perf_counter()
+    all_news = []
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(_fetch, n, f): n for n, f in sources}
+        for future in as_completed(futures):
+            name, items = future.result()
+            all_news.extend(items)
+            print(f"  ✅ {name}: {len(items)} 条")
+            for i, item in enumerate(items[:3], 1):
+                print(f"     {i}. {item.get('title', '')[:60]}")
+
+    elapsed = time.perf_counter() - t0
+    print(f"\n  共 {len(all_news)} 条新闻 | 耗时 {elapsed:.2f}s (并行)")

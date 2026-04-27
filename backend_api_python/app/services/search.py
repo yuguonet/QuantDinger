@@ -1,6 +1,6 @@
 """
-Search service v2.2 - 搜索引擎调度器
-整合多个搜索引擎，支持 API Key 轮换和故障转移
+Search service v2.3 - 搜索引擎调度器
+整合多个搜索引擎 + 财经新闻源，支持多源并行 + 聚合去重
 
 支持的搜索引擎（按优先级）：
 1. Bocha AI (博查) - 国内 Perplexity 替代，免费额度
@@ -10,12 +10,20 @@ Search service v2.2 - 搜索引擎调度器
 5. Bing Search API（不稳定）
 6. DuckDuckGo - 免费兜底（需代理）
 
+支持的财经新闻源：
+7. 财联社电报
+8. 华尔街见闻快讯
+9. 东方财富财经新闻
+10. 新浪财经新闻
+11. AKShare 财经新闻 (降级备选)
+
 注意: 新闻缓存、情感评分、search_cn_stock_news 已迁移至 app/data_providers/news.py
 """
 import requests
 import time
 import re
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
@@ -24,6 +32,13 @@ from urllib.parse import urlparse
 
 from app.utils.logger import get_logger
 from app.utils.config_loader import load_addon_config
+from app.services.cn_news_provider import (
+    fetch_cls_news,
+    fetch_wallstreetcn_news,
+    fetch_eastmoney_news,
+    fetch_sina_finance_news,
+    fetch_akshare_news,
+)
 
 logger = get_logger(__name__)
 
@@ -581,6 +596,115 @@ class DuckDuckGoSearchProvider(BaseSearchProvider):
             return []
 
 
+# ═══════════════════════════════════════════════════════════════
+# 财经新闻 Providers (从 cn_news_provider 整合)
+# ═══════════════════════════════════════════════════════════════
+
+class _BaseNewsProvider(BaseSearchProvider):
+    """新闻源基类 — 无需 API Key"""
+
+    def __init__(self, name: str):
+        super().__init__(['free'], name)
+
+    def _news_to_results(self, items: List[Dict]) -> List[SearchResult]:
+        """将新闻 dict 列表转为 SearchResult 列表"""
+        if not items:
+            return []
+        results = []
+        for item in items:
+            if not isinstance(item, dict) or "error" in item:
+                continue
+            title = _safe_encode(item.get("title", ""))
+            if not title:
+                continue
+            results.append(SearchResult(
+                title=title,
+                snippet=title,
+                url=_safe_encode(item.get("url", "")),
+                source=item.get("source", self.name),
+                published_date=item.get("time", ""),
+            ))
+        return results
+
+    @abstractmethod
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+        pass
+
+
+class CLSNewsProvider(_BaseNewsProvider):
+    """财联社电报"""
+
+    def __init__(self):
+        super().__init__("财联社")
+
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+        try:
+            items = fetch_cls_news(max_items=max_results)
+            results = self._news_to_results(items)
+            return SearchResponse(query=query, results=results, provider=self.name, success=len(results) > 0)
+        except Exception as e:
+            return SearchResponse(query=query, results=[], provider=self.name, success=False, error_message=str(e))
+
+
+class WallStreetCNNewsProvider(_BaseNewsProvider):
+    """华尔街见闻快讯"""
+
+    def __init__(self):
+        super().__init__("华尔街见闻")
+
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+        try:
+            items = fetch_wallstreetcn_news(max_items=max_results)
+            results = self._news_to_results(items)
+            return SearchResponse(query=query, results=results, provider=self.name, success=len(results) > 0)
+        except Exception as e:
+            return SearchResponse(query=query, results=[], provider=self.name, success=False, error_message=str(e))
+
+
+class EastMoneyNewsProvider(_BaseNewsProvider):
+    """东方财富财经新闻"""
+
+    def __init__(self):
+        super().__init__("东方财富")
+
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+        try:
+            items = fetch_eastmoney_news(max_items=max_results)
+            results = self._news_to_results(items)
+            return SearchResponse(query=query, results=results, provider=self.name, success=len(results) > 0)
+        except Exception as e:
+            return SearchResponse(query=query, results=[], provider=self.name, success=False, error_message=str(e))
+
+
+class SinaFinanceNewsProvider(_BaseNewsProvider):
+    """新浪财经新闻"""
+
+    def __init__(self):
+        super().__init__("新浪财经")
+
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+        try:
+            items = fetch_sina_finance_news(max_items=max_results)
+            results = self._news_to_results(items)
+            return SearchResponse(query=query, results=results, provider=self.name, success=len(results) > 0)
+        except Exception as e:
+            return SearchResponse(query=query, results=[], provider=self.name, success=False, error_message=str(e))
+
+
+class AKShareNewsProvider(_BaseNewsProvider):
+    """AKShare 财经新闻 (降级备选)"""
+
+    def __init__(self):
+        super().__init__("AKShare")
+
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+        try:
+            items = fetch_akshare_news(max_items=max_results)
+            results = self._news_to_results(items)
+            return SearchResponse(query=query, results=results, provider=self.name, success=len(results) > 0)
+        except Exception as e:
+            return SearchResponse(query=query, results=[], provider=self.name, success=False, error_message=str(e))
+
 
 class SearchService:
     """
@@ -595,7 +719,8 @@ class SearchService:
     - _providers: Web 搜索引擎列表 (BochaAI/Baidu/Tavily/SerpAPI/Google/Bing/DuckDuckGo)
 
     核心方法:
-    - search_with_fallback():  Web 搜索 + 故障转移
+    - search_parallel():      多源并行搜索 + 聚合去重 (默认)
+    - search_with_fallback():  串行故障转移 (备用)
     """
 
     def __init__(self):
@@ -613,6 +738,15 @@ class SearchService:
     def _init_providers(self):
         from app.config import APIKeys
 
+        # ── 财经新闻源 (免费, 优先) ──
+        self._providers.append(CLSNewsProvider())
+        self._providers.append(WallStreetCNNewsProvider())
+        self._providers.append(EastMoneyNewsProvider())
+        self._providers.append(SinaFinanceNewsProvider())
+        self._providers.append(AKShareNewsProvider())
+        logger.info("已配置 5 个财经新闻源 (财联社/华尔街见闻/东方财富/新浪财经/AKShare)")
+
+        # ── Web 搜索引擎 ──
         bocha_key = APIKeys.BOCHA_AI_API_KEY
         if bocha_key:
             self._providers.append(BochaAISearchProvider(bocha_key))
@@ -655,7 +789,7 @@ class SearchService:
         return any(p.is_available for p in self._providers)
 
     def search(self, query: str, num_results: int = None, date_restrict: str = None, days: int = 7) -> List[Dict[str, Any]]:
-        """执行搜索（兼容旧接口）"""
+        """执行搜索（兼容旧接口，默认走并行）"""
         limit = num_results if num_results else self.max_results
         if date_restrict and not days:
             if date_restrict.startswith('d'):
@@ -664,8 +798,19 @@ class SearchService:
                 days = int(date_restrict[1:]) * 7
             elif date_restrict.startswith('m'):
                 days = int(date_restrict[1:]) * 30
-        response = self.search_with_fallback(query, limit, days)
+        response = self.search_parallel(query, limit, days)
         return response.to_list()
+
+    def _search_single_provider(self, provider: BaseSearchProvider, query: str, max_results: int, days: int):
+        """单引擎搜索 (带异常隔离)"""
+        try:
+            if not provider.is_available:
+                return provider.name, None
+            response = provider.search(query, max_results, days)
+            return provider.name, response
+        except Exception as e:
+            logger.error(f"[{provider.name}] 并行搜索异常: {e}")
+            return provider.name, None
 
     def search_with_fallback(self, query: str, max_results: int = 5, days: int = 7) -> SearchResponse:
         """执行搜索（带自动故障转移）"""
@@ -680,6 +825,83 @@ class SearchService:
         return SearchResponse(
             query=query, results=[], provider="None", success=False,
             error_message="所有搜索引擎都不可用或搜索失败"
+        )
+
+    def search_parallel(
+        self, query: str, max_results: int = 5, days: int = 7,
+        max_workers: int = 4, dedup: bool = True, timeout: float = 20.0,
+    ) -> SearchResponse:
+        """
+        多源并行搜索 — 同时请求所有可用引擎, 聚合去重
+
+        Args:
+            query:         搜索关键词
+            max_results:   每个引擎最多返回条数
+            days:          时间范围 (天)
+            max_workers:   并行线程数
+            dedup:         是否按 URL 去重
+            timeout:       单源超时秒数 (防止拖死整体)
+
+        Returns:
+            SearchResponse: 聚合后的结果, provider 标记为 "Parallel"
+        """
+        start_time = time.time()
+        available = [p for p in self._providers if p.is_available]
+
+        if not available:
+            return SearchResponse(
+                query=query, results=[], provider="Parallel",
+                success=False, error_message="无可用搜索引擎"
+            )
+
+        all_results: List[SearchResult] = []
+        errors: List[str] = []
+
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(available))) as executor:
+            future_map = {
+                executor.submit(self._search_single_provider, p, query, max_results, days): p.name
+                for p in available
+            }
+            for future in as_completed(future_map):
+                try:
+                    name, response = future.result(timeout=timeout)
+                except Exception as e:
+                    name = future_map.get(future, "unknown")
+                    errors.append(f"{name}: 超时或异常 {e}")
+                    logger.warning(f"[{name}] 并行搜索超时/异常: {e}")
+                    continue
+
+                if response and response.success and response.results:
+                    all_results.extend(response.results)
+                    logger.info(f"[{name}] 并行返回 {len(response.results)} 条")
+                elif response and response.error_message:
+                    errors.append(f"{name}: {response.error_message}")
+                    logger.warning(f"[{name}] 并行搜索失败: {response.error_message}")
+
+        # 按 URL 去重 (跳过空 key)
+        if dedup:
+            seen_urls = set()
+            deduped = []
+            for r in all_results:
+                key = r.url or r.title
+                if not key:
+                    deduped.append(r)  # 无 key 的保留
+                    continue
+                if key not in seen_urls:
+                    seen_urls.add(key)
+                    deduped.append(r)
+            all_results = deduped
+
+        elapsed = time.time() - start_time
+        logger.info(f"[Parallel] '{query}' 聚合 {len(all_results)} 条, 耗时 {elapsed:.2f}s")
+
+        return SearchResponse(
+            query=query,
+            results=all_results[:max_results * 2],  # 聚合后适当放宽上限
+            provider="Parallel",
+            success=len(all_results) > 0,
+            error_message="; ".join(errors) if errors and not all_results else None,
+            search_time=elapsed,
         )
 
     def search_stock_news(
@@ -703,7 +925,7 @@ class SearchService:
         else:
             query = f"{stock_name} {stock_code} latest news"
         logger.info(f"搜索股票新闻: {stock_name}({stock_code}), market={market}, days={search_days}")
-        return self.search_with_fallback(query, max_results, search_days)
+        return self.search_parallel(query, max_results, search_days)
 
     def search_stock_events(
         self, stock_code: str, stock_name: str,
@@ -714,7 +936,7 @@ class SearchService:
             event_types = ["年报预告", "减持公告", "业绩快报"]
         event_query = " OR ".join(event_types)
         query = f"{stock_name} ({event_query})"
-        return self.search_with_fallback(query, max_results=5, days=30)
+        return self.search_parallel(query, max_results=5, days=30)
 
 
 

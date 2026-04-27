@@ -137,6 +137,62 @@ def _run_backtest(cancelled: List[bool], **kwargs) -> Optional[Dict[str, Any]]:
     return result
 
 
+def _run_backtests_parallel(
+    cancelled: List[bool],
+    periods: List[Dict],
+    max_workers: int = 3,
+    **kwargs,
+) -> List[Dict[str, Any]]:
+    """
+    并行执行多个周期的回测，返回按原顺序排列的结果列表。
+
+    Args:
+        cancelled:    取消标志
+        periods:      周期配置列表 [{"tf", "months", "label"}, ...]
+        max_workers:  并行线程数 (默认 3)
+        **kwargs:     传递给 _run_backtest 的其他参数
+
+    Returns:
+        每个元素: {"label", "tf", "result": bt_result_or_None}
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    results = [None] * len(periods)
+
+    def _run_one(idx, period_cfg):
+        if cancelled[0]:
+            return idx, None
+        tf = period_cfg["tf"]
+        months = period_cfg["months"]
+        label = period_cfg["label"]
+        now = datetime.now()
+        end_date = now
+        start_date = end_date - timedelta(days=months * 30)
+        try:
+            bt_result = _run_backtest(
+                cancelled=cancelled,
+                timeframe=tf,
+                start_date=start_date,
+                end_date=end_date,
+                **kwargs,
+            )
+            return idx, {"label": label, "tf": tf, "result": bt_result}
+        except Exception as e:
+            logger.warning(f"_run_backtests_parallel {label}({tf}) failed: {e}")
+            return idx, {"label": label, "tf": tf, "result": None, "error": str(e)}
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(periods))) as executor:
+        futures = [executor.submit(_run_one, i, p) for i, p in enumerate(periods)]
+        for future in as_completed(futures):
+            try:
+                idx, result = future.result(timeout=35)
+                results[idx] = result
+            except Exception as e:
+                logger.warning(f"_run_backtests_parallel future error: {e}")
+
+    return [r for r in results if r is not None]
+
+
 # ================================================================
 #  数据获取层
 # ================================================================
@@ -939,27 +995,67 @@ def review_stocks(
                 except ValueError:
                     pass
 
-            # ── Step 3: 搜索新闻 ──
+            # ── Step 3+5 并行: 新闻搜索 + 多周期回测同时执行 ──
             yield _sse({
                 "type": "progress", "symbol": symbol, "market": market, "name": name,
                 "index": idx + 1, "total": total,
-                "status": "checking_news",
-                "msg": f"{symbol} 出现买点，正在搜索新闻...",
+                "status": "checking_news_backtest",
+                "msg": f"{symbol} 出现买点，正在并行搜索新闻和多周期回测...",
             })
 
-            logger.info(f"[review] {idx+1}/{total} {symbol} 搜索新闻中...")
-            news_result = _search_stock_news_sentiment(symbol, name, _cancelled=cancelled)
-            # 检查是否在新闻搜索过程中被取消
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            news_result = None
+            bt_results = None
+
+            def _do_news():
+                return _search_stock_news_sentiment(symbol, name, _cancelled=cancelled)
+
+            def _do_backtests():
+                tf_cfg = REVIEW_TIMEFRAMES.get(review_mode, REVIEW_TIMEFRAMES["mid"])
+                return _run_backtests_parallel(
+                    cancelled=cancelled,
+                    periods=tf_cfg["periods"],
+                    max_workers=len(tf_cfg["periods"]),
+                    indicator_code=indicator_code,
+                    market=market,
+                    symbol=symbol,
+                    initial_capital=100000.0,
+                    commission=0.001,
+                    trade_direction="long",
+                    indicator_params=user_params,
+                    user_id=user_id,
+                    indicator_id=indicator_id,
+                )
+
+            with ThreadPoolExecutor(max_workers=2) as parallel_executor:
+                news_future = parallel_executor.submit(_do_news)
+                bt_future = parallel_executor.submit(_do_backtests)
+
+                for future in as_completed([news_future, bt_future]):
+                    if cancelled[0]:
+                        break
+                    try:
+                        if future is news_future:
+                            news_result = future.result(timeout=20)
+                        else:
+                            bt_results = future.result(timeout=40)
+                    except Exception as e:
+                        logger.warning(f"[review] {symbol} parallel task error: {e}")
+
             if cancelled[0]:
-                logger.info(f"[review] {idx+1}/{total} {symbol} 新闻搜索中被取消")
+                logger.info(f"[review] {idx+1}/{total} {symbol} 并行任务中被取消")
                 break
-            logger.info(f"[review] {idx+1}/{total} {symbol} news: has_news={news_result['has_news']} direction={news_result['direction']} score={news_result['composite_score']}")
 
             # ── Step 4: 新闻情感判断 ──
-            # 负面新闻 + 综合评分 <= 0 → 不加入
-            if news_result["has_news"]:
-                direction = news_result["direction"]
-                score = news_result["composite_score"]
+            if news_result is None:
+                news_result = {"has_news": False, "composite_score": 5.0, "direction": "中性", "news_count": 0, "error": "并行执行未返回"}
+
+            logger.info(f"[review] {idx+1}/{total} {symbol} news: has_news={news_result.get('has_news')} direction={news_result.get('direction')} score={news_result.get('composite_score')}")
+
+            if news_result.get("has_news"):
+                direction = news_result.get("direction", "中性")
+                score = news_result.get("composite_score", 5.0)
 
                 if direction in ("利空", "偏利空") and score <= 0:
                     yield _sse({
@@ -971,106 +1067,59 @@ def review_stocks(
                     skipped_count += 1
                     continue
 
-            # ── 基本检查全部通过，提示用户 ──
-            yield _sse({
-                "type": "progress", "symbol": symbol, "market": market, "name": name,
-                "index": idx + 1, "total": total,
-                "status": "basic_passed",
-                "msg": f"{symbol} 基本检测通过，正在进行多周期回测验证...",
-            })
-
-            # ── Step 5: 多周期回测（前置硬性门槛） ──
-            # 所有周期必须同时满足：收益率 > 0% 且 胜率 >= 70%
-            # 任一不满足 → 跳过，不加入自选
-            yield _sse({
-                "type": "progress", "symbol": symbol, "market": market, "name": name,
-                "index": idx + 1, "total": total,
-                "status": "backtesting",
-                "msg": f"{symbol} 正在进行{review_mode_label}多周期回测...",
-            })
-
+            # ── Step 5: 多周期回测结果判断 ──
             bt_pass = True
             bt_fail_reason = ""
             bt_msg_parts = []
-            try:
-                tf_cfg = REVIEW_TIMEFRAMES.get(review_mode, REVIEW_TIMEFRAMES["mid"])
-                now = datetime.now()
 
-                for period_cfg in tf_cfg["periods"]:
-                    # 检查取消（每个周期之间）
-                    if cancelled[0]:
-                        logger.info(f"[review] {idx+1}/{total} {symbol} 回测中被取消")
-                        break
+            if bt_results is None:
+                bt_pass = False
+                bt_fail_reason = "回测未返回结果"
+                bt_msg_parts.append("回测无结果")
+            else:
+                for bt_item in bt_results:
+                    if bt_item is None:
+                        continue
+                    label = bt_item.get("label", "?")
+                    bt_result = bt_item.get("result")
+                    error = bt_item.get("error")
 
-                    tf = period_cfg["tf"]
-                    months = period_cfg["months"]
-                    label = period_cfg["label"]
-                    end_date = now
-                    start_date = end_date - timedelta(days=months * 30)
-
-                    try:
-                        bt_result = _run_backtest(
-                            cancelled=cancelled,
-                            indicator_code=indicator_code,
-                            market=market,
-                            symbol=symbol,
-                            timeframe=tf,
-                            start_date=start_date,
-                            end_date=end_date,
-                            initial_capital=100000.0,
-                            commission=0.001,
-                            trade_direction="long",
-                            indicator_params=user_params,
-                            user_id=user_id,
-                            indicator_id=indicator_id,
-                        )
-
-                        if bt_result is None:
-                            if cancelled[0]:
-                                break
-                            bt_msg_parts.append(f"{label}:无结果")
-                            bt_pass = False
-                            bt_fail_reason = f"{label}回测无结果"
-                            continue
-
-                        win_rate = (bt_result or {}).get("winRate", 0) or 0
-                        total_return = (bt_result or {}).get("totalReturn", 0) or 0
-
-                        period_ok = (win_rate >= BACKTEST_MIN_WIN_RATE and total_return > BACKTEST_MIN_RETURN)
-                        status_mark = "✓" if period_ok else "✗"
-                        bt_msg_parts.append(
-                            f"{label}:{status_mark} 收益{round(total_return, 2)}% 胜率{round(win_rate, 2)}%"
-                        )
-
-                        if not period_ok:
-                            bt_pass = False
-                            if not bt_fail_reason:
-                                reasons = []
-                                if total_return <= BACKTEST_MIN_RETURN:
-                                    reasons.append(f"收益率{round(total_return, 2)}%≤0")
-                                if win_rate < BACKTEST_MIN_WIN_RATE:
-                                    reasons.append(f"胜率{round(win_rate, 2)}%<{BACKTEST_MIN_WIN_RATE}%")
-                                bt_fail_reason = f"{label}: {', '.join(reasons)}"
-
-                    except Exception as period_err:
-                        logger.warning(f"[review] {symbol} {label}({tf}) 回测失败: {period_err}")
+                    if error:
                         bt_msg_parts.append(f"{label}:异常")
                         bt_pass = False
                         if not bt_fail_reason:
-                            bt_fail_reason = f"{label}回测异常: {str(period_err)}"
+                            bt_fail_reason = f"{label}回测异常: {error}"
+                        continue
 
-            except Exception as bt_err:
-                logger.warning(f"[review] {idx+1}/{total} {symbol} 回测失败: {bt_err}")
-                bt_pass = False
-                bt_fail_reason = f"回测异常: {str(bt_err)}"
+                    if bt_result is None:
+                        bt_msg_parts.append(f"{label}:无结果")
+                        bt_pass = False
+                        if not bt_fail_reason:
+                            bt_fail_reason = f"{label}回测无结果"
+                        continue
+
+                    win_rate = bt_result.get("winRate", 0) or 0
+                    total_return = bt_result.get("totalReturn", 0) or 0
+
+                    period_ok = (win_rate >= BACKTEST_MIN_WIN_RATE and total_return > BACKTEST_MIN_RETURN)
+                    status_mark = "✓" if period_ok else "✗"
+                    bt_msg_parts.append(
+                        f"{label}:{status_mark} 收益{round(total_return, 2)}% 胜率{round(win_rate, 2)}%"
+                    )
+
+                    if not period_ok:
+                        bt_pass = False
+                        if not bt_fail_reason:
+                            reasons = []
+                            if total_return <= BACKTEST_MIN_RETURN:
+                                reasons.append(f"收益率{round(total_return, 2)}%≤0")
+                            if win_rate < BACKTEST_MIN_WIN_RATE:
+                                reasons.append(f"胜率{round(win_rate, 2)}%<{BACKTEST_MIN_WIN_RATE}%")
+                            bt_fail_reason = f"{label}: {', '.join(reasons)}"
 
             bt_summary = " | ".join(bt_msg_parts) if bt_msg_parts else "回测无结果"
 
             # 回测未通过 → 跳过，不加入自选
-            if cancelled[0]:
-                logger.info(f"[review] {idx+1}/{total} {symbol} 回测中被取消")
-                break
-
             if not bt_pass:
                 yield _sse({
                     "type": "result", "symbol": symbol, "market": market, "name": name,
