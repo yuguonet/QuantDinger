@@ -564,15 +564,15 @@ def review_by_indicator():
             yield 'data: {"type":"error","msg":"无效的指标ID"}\n\n'
             return
 
-        # 心跳线程：每 2 秒发一条 *data 类型* 心跳，确保前端能感知连接存活。
+        # 心跳线程：每 1 秒发一条 *data 类型* 心跳，确保前端能感知连接存活。
         # 旧版用 SSE 注释（": heartbeat"），前端 parser 忽略注释，导致长时间无
         # data 消息时进度条完全静止。改为 type=heartbeat 的真实 data 消息后，
         # 前端收到即可更新"仍在处理"状态。
         def heartbeat():
             while not stop_event.is_set():
                 try:
-                    # 等 2 秒；如果有数据进来先发数据
-                    stop_event.wait(timeout=2)
+                    # 等 1 秒；如果有数据进来先发数据
+                    stop_event.wait(timeout=1)
                     if stop_event.is_set():
                         break
                     # 检查取消事件（来自显式 API 调用）

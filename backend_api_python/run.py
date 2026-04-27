@@ -114,9 +114,29 @@ def main():
     if not Config.DEBUG and current_secret == default_secret:
         import secrets as _secrets
         new_key = _secrets.token_hex(32)
-        os.environ["SECRET_KEY"] = new_key
-        print("[AUTO] SECRET_KEY was default; generated random key for this session.")
-        print("[TIP]  Set a persistent SECRET_KEY in backend_api_python/.env for production.")
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+        try:
+            lines = []
+            if os.path.exists(env_path):
+                with open(env_path, 'r') as f:
+                    lines = f.readlines()
+            found = False
+            for i, line in enumerate(lines):
+                if line.strip().startswith('SECRET_KEY=') or line.strip().startswith('# SECRET_KEY='):
+                    lines[i] = f'SECRET_KEY={new_key}\n'
+                    found = True
+                    break
+            if not found:
+                if lines and not lines[-1].endswith('\n'):
+                    lines.append('\n')
+                lines.append(f'SECRET_KEY={new_key}\n')
+            with open(env_path, 'w') as f:
+                f.writelines(lines)
+            os.environ["SECRET_KEY"] = new_key
+            print(f"[AUTO] Generated persistent SECRET_KEY → {env_path}")
+        except Exception as e:
+            os.environ["SECRET_KEY"] = new_key
+            print(f"[WARN] Could not write .env ({e}); SECRET_KEY is session-only.")
     
     print(f"Service starting at: http://{Config.HOST}:{Config.PORT}")
     
