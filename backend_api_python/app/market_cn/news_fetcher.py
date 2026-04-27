@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 """
-财经新闻直接抓取 — 不依赖 AKShare
+财经新闻直接抓取 — 不依赖 AKShare (v2.2)
 数据源: 东方财富、新浪财经、央视网 直接爬取
-依赖: pip install requests beautifulsoup4
+依赖: pip install requests
+
+v2.2 修复:
+- 东方财富: API 新增 req_trace 参数, 改用 7x24 快讯接口
+- 财联社: content 字段类型变更(str), 适配 brief + ctime
+- 新浪财经: zhibo API 失效, 改用 feed.mix.sina.com.cn 滚动新闻
+- 华尔街见闻: 保持不变 (正常工作)
 """
 
 import requests
 import json
+import re
+import uuid
 from datetime import datetime
-from bs4 import BeautifulSoup
+from typing import List, Dict, Any
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -16,93 +24,182 @@ HEADERS = {
 
 
 def fetch_eastmoney_news(category="财经", max_items=20):
-    """东方财富财经新闻 (JSON API)"""
-    url = "https://30.push2.eastmoney.com/api/qt/clist/get"
+    """
+    东方财富财经新闻
+    优先: 7x24 快讯 JSON API (需 req_trace)
+    备用: newsapi JSONP 接口
+    """
+    # ── 主接口: 7x24 快讯 ──
+    url = "https://np-listapi.eastmoney.com/comm/web/getNewsByColumns"
     params = {
-        "pn": 1,
-        "pz": max_items,
-        "po": 1,
-        "np": 1,
-        "fltt": 2,
-        "invt": 2,
-        "fid": "f3",
-        "fs": "b:BK0816",  # 财经要闻板块
-        "fields": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f13,f14,f15,f16,f17,f18,f20,f21,f23,f24,f25,f26,f22,f33,f11,f62,f128,f136,f115,f152",
+        "client": "web",
+        "biz": "web_724",
+        "column": "724",
+        "order": "1",
+        "needInteractData": "0",
+        "page_index": "1",
+        "page_size": str(max_items),
+        "req_trace": str(uuid.uuid4()),
     }
     try:
         resp = requests.get(url, params=params, headers=HEADERS, timeout=10)
         data = resp.json()
-        items = data.get("data", {}).get("diff", [])
+        items = data.get("data", {}).get("list", [])
         if items:
-            return [{"title": i.get("f14", ""), "code": i.get("f12", "")} for i in items]
+            results = []
+            for i in items:
+                title = i.get("title", "") or i.get("summary", "")
+                if title:
+                    results.append({
+                        "title": title.strip(),
+                        "url": i.get("url", "") or i.get("uniqueUrl", ""),
+                        "time": i.get("showTime", ""),
+                        "source": i.get("mediaName", "东方财富"),
+                    })
+            return results[:max_items]
     except Exception:
-        pass  # API 不可用，降级到网页抓取
+        pass
 
-    # 备用: 新闻列表页
-    url2 = "https://finance.eastmoney.com/"
+    # ── 备用: newsapi JSONP ──
+    url2 = "https://newsapi.eastmoney.com/kuaixun/v1/getlist_102_ajaxResult_50_1_.html"
     try:
         resp = requests.get(url2, headers=HEADERS, timeout=10)
-        soup = BeautifulSoup(resp.text, "html.parser")
-        news = []
-        for a in soup.select("a[href]")[:max_items]:
-            title = a.get_text(strip=True)
-            href = a.get("href", "")
-            if len(title) > 8 and "http" in href:
-                news.append({"title": title, "url": href})
-        return news
-    except Exception as e:
-        return [{"error": str(e)}]
+        text = resp.text
+        # var ajaxResult={...}
+        match = re.search(r'var\s+\w+=\s*(\{.*\})', text, re.DOTALL)
+        if match:
+            data = json.loads(match.group(1))
+            items = data.get("LivesList", [])
+            results = []
+            for i in items[:max_items]:
+                title = i.get("title", "") or i.get("digest", "")
+                if title:
+                    results.append({
+                        "title": title.strip(),
+                        "url": i.get("url_w", "") or i.get("url_m", ""),
+                        "time": i.get("showtime", ""),
+                        "source": "东方财富",
+                    })
+            return results
+    except Exception:
+        pass
+
+    return []
 
 
 def fetch_sina_finance_news(max_items=20):
-    """新浪财经新闻 (API)"""
-    url = "https://zhibo.sina.com.cn/api/zhibo/feed?page=1&page_size=" + str(max_items)
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=10)
-        data = resp.json()
-        items = data.get("result", {}).get("data", {}).get("feed", {}).get("feed_list", [])
-        return [{"title": item.get("rich_text", "").strip(), "time": item.get("create_time", "")}
-                for item in items if item.get("rich_text")]
-    except Exception as e:
-        return [{"error": str(e)}]
+    """
+    新浪财经新闻
+    接口: feed.mix.sina.com.cn 滚动新闻 API
+    注意: 该 API 有频率限制, 部分 lid 会返回 403, 自动尝试备用 lid
+    """
+    url = "https://feed.mix.sina.com.cn/api/roll/get"
+    # 2516=财经综合, 2509=股票, 2511=国际, 2519=7x24
+    lids = ["2516", "2509", "2511", "2519"]
+    for lid in lids:
+        params = {
+            "pageid": "153",
+            "lid": lid,
+            "k": "",
+            "num": str(max_items),
+            "page": "1",
+        }
+        try:
+            resp = requests.get(url, params=params, headers=HEADERS, timeout=10)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            items = data.get("result", {}).get("data", [])
+            if not items:
+                continue
+            results = []
+            for item in items[:max_items]:
+                title = item.get("title", "").strip()
+                if not title:
+                    continue
+                ctime = item.get("ctime", "")
+                try:
+                    time_str = datetime.fromtimestamp(int(ctime)).strftime("%Y-%m-%d %H:%M") if ctime else ""
+                except (ValueError, TypeError):
+                    time_str = str(ctime)
+                results.append({
+                    "title": title,
+                    "url": item.get("url", ""),
+                    "time": time_str,
+                    "source": "新浪财经",
+                })
+            if results:
+                return results
+        except Exception:
+            continue
+    return []
 
 
 def fetch_cls_news(max_items=20):
-    """财联社电报 (公开 API)"""
+    """
+    财联社电报
+    接口: updateTelegraphList (稳定, 无需签名)
+    注意: content 字段现在是 str 类型, brief 有摘要, ctime 是 unix 时间戳
+    """
     url = "https://www.cls.cn/nodeapi/updateTelegraphList"
-    params = {"app": "CailianpressWeb", "os": "web", "sv": "7.7.5", "rn": max_items}
+    params = {"app": "CailianpressWeb", "os": "web", "sv": "7.7.5", "rn": str(max_items)}
     try:
         resp = requests.get(url, params=params, headers=HEADERS, timeout=10)
         data = resp.json()
         items = data.get("data", {}).get("roll_data", [])
         news = []
         for item in items:
-            for content in item.get("content", []):
-                title = content.get("brief", content.get("title", ""))
-                if title:
-                    news.append({
-                        "title": title,
-                        "time": datetime.fromtimestamp(content.get("ctime", 0)).strftime("%H:%M"),
-                        "source": "财联社"
-                    })
+            # brief 是摘要文本, content 现在是 str (非 list)
+            brief = item.get("brief", "")
+            if not brief:
+                # 兜底: 尝试从 content 字段取
+                content = item.get("content", "")
+                if isinstance(content, str):
+                    brief = content
+                elif isinstance(content, list):
+                    # 兼容旧格式
+                    for c in content:
+                        brief = c.get("brief", c.get("title", ""))
+                        if brief:
+                            break
+            if not brief:
+                continue
+
+            ctime = item.get("ctime", 0)
+            try:
+                time_str = datetime.fromtimestamp(int(ctime)).strftime("%H:%M") if ctime else ""
+            except (ValueError, TypeError):
+                time_str = ""
+
+            news.append({
+                "title": brief.strip(),
+                "time": time_str,
+                "source": "财联社",
+            })
         return news[:max_items]
     except Exception as e:
         return [{"error": str(e)}]
 
 
 def fetch_wallstreetcn_news(max_items=20):
-    """华尔街见闻快讯 (公开 API)"""
+    """华尔街见闻快讯 (公开 API) — 无需修改, 原样工作"""
     url = "https://api-one-wscn.awtmt.com/apiv1/content/lives"
     params = {"channel": "global-channel", "limit": max_items}
     try:
         resp = requests.get(url, params=params, headers=HEADERS, timeout=10)
         data = resp.json()
         items = data.get("data", {}).get("items", [])
-        return [{
-            "title": item.get("content_plain", item.get("title", "")),
-            "time": datetime.fromtimestamp(item.get("display_time", 0)).strftime("%H:%M"),
-            "source": "华尔街见闻"
-        } for item in items]
+        results = []
+        for item in items:
+            title = item.get("content_text", "") or item.get("content_plain", "") or item.get("title", "")
+            if not title:
+                continue
+            results.append({
+                "title": title.strip(),
+                "time": datetime.fromtimestamp(item.get("display_time", 0)).strftime("%H:%M"),
+                "source": "华尔街见闻",
+            })
+        return results
     except Exception as e:
         return [{"error": str(e)}]
 
@@ -129,8 +226,8 @@ def fetch_all_news(max_per_source=10):
     sources = [
         ("财联社", lambda: fetch_cls_news(max_items=max_per_source)),
         ("华尔街见闻", lambda: fetch_wallstreetcn_news(max_items=max_per_source)),
-        ("新浪财经", lambda: fetch_sina_finance_news(max_items=max_per_source)),
         ("东方财富", lambda: fetch_eastmoney_news(max_items=max_per_source)),
+        ("新浪财经", lambda: fetch_sina_finance_news(max_items=max_per_source)),
         ("AKShare", lambda: fetch_akshare_news(max_items=max_per_source)),
     ]
     for name, fetcher in sources:
@@ -138,9 +235,8 @@ def fetch_all_news(max_per_source=10):
             items = fetcher()
             valid = [i for i in items if "error" not in i]
             all_news.extend(valid)
-            print(f"  ✅ {name}: {len(valid)} 条")
-        except Exception as e:
-            print(f"  ⚠️ {name} 失败: {e}")
+        except Exception:
+            pass
 
     return all_news
 
@@ -154,10 +250,21 @@ if __name__ == "__main__":
     print(f"  📰 新闻抓取测试 — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"{'='*60}\n")
 
-    news = fetch_all_news(max_per_source=5)
-    print(f"\n  共 {len(news)} 条新闻:\n")
-    for i, item in enumerate(news[:15], 1):
-        title = item.get("title", "")[:60]
-        source = item.get("source", "")
-        time_str = item.get("time", "")
-        print(f"  {i}. [{source}|{time_str}] {title}")
+    sources = [
+        ("东方财富", fetch_eastmoney_news),
+        ("财联社", fetch_cls_news),
+        ("华尔街见闻", fetch_wallstreetcn_news),
+        ("新浪财经", fetch_sina_finance_news),
+    ]
+
+    total = 0
+    for name, fn in sources:
+        items = fn(max_items=5)
+        valid = [i for i in items if "error" not in i]
+        total += len(valid)
+        print(f"  ✅ {name}: {len(valid)} 条")
+        for i, item in enumerate(valid[:3], 1):
+            title = item.get("title", "")[:60]
+            print(f"     {i}. {title}")
+
+    print(f"\n  共 {total} 条新闻")
