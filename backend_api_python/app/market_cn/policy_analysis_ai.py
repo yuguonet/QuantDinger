@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 最新政策解读 — AI 深度分析版
-数据源: 直接抓取财经新闻 API → 交给大模型做政策解读
+数据源: 通过 news.py 统一入口获取市场新闻 → 交给大模型做政策解读
 依赖: pip install requests beautifulsoup4 openai
 """
 
@@ -89,19 +89,18 @@ def get_llm_client(provider="deepseek"):
 # ═══════════════════════════════════════════════════════
 
 def fetch_news():
-    """抓取最新财经/宏观/政策新闻 — 直接抓取，不依赖 AKShare"""
-    from .news_fetcher import fetch_all_news
-    print("  📡 抓取新闻 (直接 API)...")
-    news = fetch_all_news(max_per_source=15)
-    # 统一格式
+    """抓取最新财经/宏观/政策新闻 — 通过 news.py 统一入口"""
+    from app.data_providers.news import search_market_news
+    print("  📡 抓取新闻 (市场新闻统一接口)...")
+    resp = search_market_news(market="CNStock", max_fetcher_per_source=15)
     all_news = []
-    for item in news:
-        if item.get("title"):
+    for r in resp.results:
+        if r.title:
             all_news.append({
-                "source": item.get("source", "财经"),
-                "title": item["title"],
-                "time": item.get("time", ""),
-                "url": item.get("url", ""),
+                "source": r.source or "财经",
+                "title": r.title,
+                "time": r.published_date or "",
+                "url": r.url or "",
             })
     print(f"  共获取 {len(all_news)} 条有效新闻")
     return all_news
