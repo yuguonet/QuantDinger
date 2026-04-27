@@ -11,14 +11,23 @@ Search service v2.0 - 增强版搜索服务
 6. DuckDuckGo - 免费兜底（需代理）
 
 参考：daily_stock_analysis-main/src/search_service.py
+
+新增: PostgreSQL 持久化缓存 (qd_news_cache 表)
+- 缓存有效期: 15天, 15天后清除
+- 24小时内不重复搜索同一股票
+- 自选股开盘前2h(7:30-9:30)/午间12-13点强制刷新
+- 情感评分写入缓存
+- 读取优先缓存, 超出规则才更新
+- 外部接口参数保持不变
 """
 import requests
 import json
 import time
 import re
+import hashlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 from itertools import cycle
 from urllib.parse import urlparse
@@ -26,12 +35,231 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from app.utils.logger import get_logger
 from app.utils.config_loader import load_addon_config
+from app.utils.db import get_db_connection
 
 logger = get_logger(__name__)
+
+# ── 新闻缓存配置 (顶部统一管理) ─────────────────────────────
+NEWS_CACHE_TTL_DAYS = 15    # 缓存有效期，15天后清除
+NEWS_CACHE_DEDUP_HOURS = 24 # 24小时内不重复搜索
 
 # Track Google API quota status
 _google_quota_exhausted = False
 _google_quota_reset_time = 0
+
+
+# ═══════════════════════════════════════════════════════════════
+# PostgreSQL 新闻缓存管理器
+# ═══════════════════════════════════════════════════════════════
+
+class NewsCacheManager:
+    """
+    新闻缓存管理器 (单表设计)
+
+    存储:
+    - qd_news_cache_items: 新闻明细 (每条一行, UNIQUE(symbol, market, title))
+    - 内存 dict: 搜索时间跟踪 (重启丢弃, 最多多搜一次)
+
+    策略:
+    - 15天过期: created_at < NOW() - 15天 的记录由 cleanup_expired() 清除
+    - 24h去重: 内存记录最后搜索时间, <24h 不搜
+    - 自选股: 7:30-9:30 / 12:00-13:00 按最后搜索时间判断是否需要刷新
+    - 无结果不写库, 自然没有空记录
+    - 评分从 items 实时算, 不冗余存储
+    """
+
+    def __init__(self):
+        # {symbol:market: last_search_timestamp} 重启丢弃, 不影响正确性
+        self._last_search: Dict[str, float] = {}
+
+    def _search_key(self, symbol: str, market: str) -> str:
+        return f"{symbol}:{market}"
+
+    def _get_last_search_time(self, symbol: str, market: str) -> Optional[datetime]:
+        """从内存获取最后搜索时间"""
+        ts = self._last_search.get(self._search_key(symbol, market))
+        return datetime.fromtimestamp(ts) if ts else None
+
+    def _set_last_search_time(self, symbol: str, market: str) -> None:
+        """记录搜索时间到内存"""
+        self._last_search[self._search_key(symbol, market)] = time.time()
+
+    def get_items(self, symbol: str, market: str = "CNStock") -> List[Dict[str, Any]]:
+        """从 DB 查询该股票的缓存新闻"""
+        try:
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """SELECT title, snippet, url, source, published_date, sentiment
+                       FROM qd_news_cache_items
+                       WHERE symbol = %s AND market = %s
+                       ORDER BY published_date DESC""",
+                    (symbol, market)
+                )
+                return [dict(r) for r in cursor.fetchall()] or []
+        except Exception as e:
+            logger.warning(f"查询新闻缓存异常: {e}")
+            return []
+
+    def should_search(self, symbol: str, market: str = "CNStock",
+                      is_watchlist: bool = False) -> tuple:
+        """
+        判断是否需要搜索
+
+        判断顺序:
+          1. 自选股 + 开盘前窗口(7:30-9:30) + 今日未搜 → 搜索
+          2. 自选股 + 午间窗口(12:00-13:00) + 午间未搜 → 搜索
+          3. 内存中距上次搜索 <24h → 跳过
+          4. 其他 → 搜索
+
+        Returns:
+            (should_search: bool, reason: str)
+        """
+        last_search = self._get_last_search_time(symbol, market)
+        now = datetime.now()
+
+        # 自选股特殊策略 (A股 9:30 开盘)
+        if is_watchlist and market == "CNStock":
+            # 开盘前2小时窗口: 7:30-9:30
+            pre_market = (now.hour == 7 and now.minute >= 30) or (now.hour == 8) or (now.hour == 9 and now.minute < 30)
+            if pre_market:
+                if last_search and last_search.date() == now.date():
+                    return False, f"自选股今日已搜({last_search.strftime('%H:%M')}), 开盘前无需重复"
+                else:
+                    return True, "自选股开盘前刷新(今日未搜索)"
+
+            # 午间窗口: 12:00-13:00
+            if now.hour == 12:
+                if last_search and last_search.date() == now.date() and last_search.hour >= 12:
+                    return False, f"自选股午间已搜({last_search.strftime('%H:%M')})"
+                else:
+                    return True, "自选股午间刷新"
+
+        # 24小时去重
+        if last_search:
+            hours_since = (now - last_search).total_seconds() / 3600
+            if hours_since < NEWS_CACHE_DEDUP_HOURS:
+                return False, f"距上次搜索仅{hours_since:.1f}h(<24h), 使用缓存"
+
+        return True, "需要搜索" if not last_search else f"距上次搜索超过{NEWS_CACHE_DEDUP_HOURS}h"
+
+    def save_items(self, symbol: str, market: str, results: List['SearchResult']) -> bool:
+        """将搜索结果写入明细表, ON CONFLICT 更新已有标题"""
+        if not symbol or not market or not results:
+            return False
+        try:
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                rows = [
+                    (symbol, market, r.title, r.snippet, r.url,
+                     r.source, r.published_date or '', r.sentiment)
+                    for r in results
+                ]
+                cursor.executemany(
+                    """INSERT INTO qd_news_cache_items
+                       (symbol, market, title, snippet, url, source, published_date, sentiment)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                       ON CONFLICT (symbol, market, title) DO UPDATE SET
+                           snippet = EXCLUDED.snippet,
+                           url = EXCLUDED.url,
+                           source = EXCLUDED.source,
+                           published_date = EXCLUDED.published_date,
+                           sentiment = EXCLUDED.sentiment,
+                           created_at = NOW()""",
+                    rows
+                )
+                conn.commit()
+                self._set_last_search_time(symbol, market)
+                logger.info(f"新闻缓存已保存: {symbol}({market}) {len(results)}条")
+                return True
+        except Exception as e:
+            logger.error(f"保存新闻缓存异常: {e}")
+            return False
+
+    def record_empty_search(self, symbol: str, market: str) -> None:
+        """无结果时仅记录搜索时间 (内存), 不写库"""
+        self._set_last_search_time(symbol, market)
+        logger.info(f"记录空搜索: {symbol}({market}) 仅更新内存时间")
+
+    @staticmethod
+    def calc_score(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """从新闻列表实时计算综合评分 (复用 stock_news.py 的衰减逻辑)"""
+        if not items:
+            return {"composite_score": 5.0, "direction": "中性",
+                    "positive": 0, "negative": 0, "neutral": 0}
+
+        now = datetime.now()
+        pos = neg = neu = 0
+        total_weighted = 0.0
+        total_weight = 0.0
+
+        for item in items:
+            s = item.get("sentiment", "neutral")
+            if s == "positive":
+                pos += 1
+            elif s == "negative":
+                neg += 1
+            else:
+                neu += 1
+
+            # 时间衰减
+            pub = item.get("published_date", "")
+            try:
+                pub_dt = datetime.fromisoformat(pub) if pub else now
+                hours = max(0, (now - pub_dt).total_seconds() / 3600)
+            except (ValueError, TypeError):
+                hours = 24
+            decay = 0.8 ** (hours / 24)
+            boost = 1.5 if s != "neutral" else 1.0
+            weight = decay * boost
+            score = {"positive": 7.5, "negative": 2.5, "neutral": 5.0}.get(s, 5.0)
+            total_weighted += score * weight
+            total_weight += weight
+
+        composite = round(total_weighted / total_weight, 1) if total_weight > 0 else 5.0
+        composite = max(0.0, min(10.0, composite))
+
+        if composite >= 7:
+            direction = "利好"
+        elif composite <= 3:
+            direction = "利空"
+        elif composite >= 6:
+            direction = "偏利好"
+        elif composite <= 4:
+            direction = "偏利空"
+        else:
+            direction = "中性"
+
+        return {"composite_score": composite, "direction": direction,
+                "positive": pos, "negative": neg, "neutral": neu}
+
+    def cleanup_expired(self) -> int:
+        """清理超过15天的缓存记录"""
+        try:
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    f"DELETE FROM qd_news_cache_items WHERE created_at < NOW() - INTERVAL '{NEWS_CACHE_TTL_DAYS} days'"
+                )
+                deleted = cursor.rowcount
+                conn.commit()
+                if deleted > 0:
+                    logger.info(f"清理过期新闻缓存: {deleted} 条")
+                return deleted
+        except Exception as e:
+            logger.error(f"清理过期缓存异常: {e}")
+            return 0
+
+
+# 全局缓存管理器单例
+_news_cache_manager: Optional[NewsCacheManager] = None
+
+def get_news_cache_manager() -> NewsCacheManager:
+    """获取新闻缓存管理器单例"""
+    global _news_cache_manager
+    if _news_cache_manager is None:
+        _news_cache_manager = NewsCacheManager()
+    return _news_cache_manager
 
 
 @dataclass
@@ -519,8 +747,7 @@ class GoogleSearchProvider(BaseSearchProvider):
             
             if response.status_code == 429:
                 _google_quota_exhausted = True
-                import datetime
-                tomorrow = datetime.datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(days=1)
+                tomorrow = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
                 _google_quota_reset_time = tomorrow.timestamp()
                 return SearchResponse(
                     query=query,
@@ -1119,46 +1346,70 @@ class SearchService:
         stock_name: str = "",
         days: int = 3,
         max_web_results: int = 5,
+        market: str = "CNStock",
+        is_watchlist: bool = False,
     ) -> SearchResponse:
         """
-        A股个股新闻搜索 — Web搜索 + stock_news 并行, 自动去重
+        A股个股新闻搜索 — 带 PostgreSQL 持久化缓存
 
-        架构:
-          ThreadPoolExecutor(2)
-            ├─ f_web:  search_with_fallback()  → Web 搜索引擎 (BochaAI/Baidu/...)
-            └─ f_news: stock_news_provider     → 5 路国内财经直连
-
-          合并策略:
-            1. stock_news 结果先入池 (数据源更精准, 有情感评分)
-            2. web 结果按标题指纹去重, 仅追加不重复的
-            3. 最终按时间降序排列
+        缓存策略:
+          1. 内存判断是否需要搜索 (24h去重 / 自选股时间窗口)
+          2. 需要搜索 → 并行 Web + StockNews → 写入明细表
+          3. 不需要搜索 → 从明细表取 items → 实时算评分返回
+          4. 无结果不写库, 仅记录内存搜索时间
 
         Args:
             stock_code: 6位股票代码
             stock_name: 股票名称
             days: 搜索天数
             max_web_results: Web搜索最大结果数
+            market: 市场类型 (CNStock/USStock/Crypto等)
+            is_watchlist: 是否为自选股 (影响刷新策略)
 
         Returns:
             SearchResponse:
-              - results: 合并去重后的 SearchResult 列表
-              - metadata: { composite_score, direction, positive, negative, neutral,
-                            stock_news_count, web_results_added, total_merged }
-              - provider: "StockNews+Web"
+              - results: 搜索结果列表
+              - metadata: { composite_score, direction, positive, negative, neutral, from_cache }
         """
-        import hashlib as _hl
         start_time = time.time()
         query = f"{stock_code} {stock_name}".strip()
 
+        # ── 第一步: 判断是否需要搜索 ──
+        cache_mgr = get_news_cache_manager()
+        should, reason = cache_mgr.should_search(stock_code, market, is_watchlist)
+
+        if not should:
+            # 从缓存取 items, 实时算评分
+            items = cache_mgr.get_items(stock_code, market)
+            if items:
+                score_info = cache_mgr.calc_score(items)
+                results = [
+                    SearchResult(
+                        title=i["title"], snippet=i.get("snippet", ""),
+                        url=i.get("url", ""), source=i.get("source", ""),
+                        published_date=i.get("published_date", ""),
+                        sentiment=i.get("sentiment", "neutral"),
+                    ) for i in items
+                ]
+                score_info["from_cache"] = True
+                provider = f"Cache({score_info['direction']} {score_info['composite_score']}/10)"
+                logger.info(f"[缓存命中] {stock_code}({market}) {stock_name}: {reason}")
+                return SearchResponse(
+                    query=query, results=results, provider=provider,
+                    success=True, search_time=round(time.time() - start_time, 2),
+                    metadata=score_info,
+                )
+            # 内存说不搜但 DB 里没数据 (重启后), 降级为搜索
+            logger.info(f"[缓存降级] {stock_code}({market}): {reason}, 但DB无数据, 重新搜索")
+
+        logger.info(f"[需要搜索] {stock_code}({market}) {stock_name}: {reason}")
+
+        # ── 第二步: 并行搜索 ──
         def _title_key(r: SearchResult) -> str:
             norm = re.sub(r'[\s\u3000\uff0c\u3001\u3002\uff01\uff1f\u2014]', '', r.title)
-            return _hl.md5(norm.encode()).hexdigest()[:16]
+            return hashlib.md5(norm.encode()).hexdigest()[:16]
 
-        # ── 并行: Web搜索 + stock_news ──
         web_query = f"{stock_name} {stock_code} A股新闻" if stock_name else f"{stock_code} 股票新闻"
-
-        web_resp = None
-        news_resp = None
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             f_web = pool.submit(self.search_with_fallback, web_query, max_web_results, days)
@@ -1170,7 +1421,6 @@ class SearchService:
                 logger.warning(f"Web搜索异常: {e}")
                 web_resp = SearchResponse(query=web_query, results=[], provider="Web",
                                           success=False, error_message=str(e))
-
             try:
                 news_resp = f_news.result()
             except Exception as e:
@@ -1178,17 +1428,15 @@ class SearchService:
                 news_resp = SearchResponse(query=query, results=[], provider="StockNews",
                                            success=False, error_message=str(e))
 
-        # ── 合并去重: stock_news 优先 (数据源更精准) ──
+        # 合并去重: stock_news 优先
         seen = set()
         merged: List[SearchResult] = []
-
         for r in news_resp.results:
             k = _title_key(r)
             if k not in seen:
                 seen.add(k)
                 merged.append(r)
 
-        # web 结果去重后追加
         web_added = 0
         if web_resp.success:
             for r in web_resp.results:
@@ -1198,22 +1446,24 @@ class SearchService:
                     merged.append(r)
                     web_added += 1
 
-        # 按时间降序
         merged.sort(key=lambda r: r.published_date or "", reverse=True)
+
+        # ── 第三步: 写入缓存 ──
+        if merged:
+            cache_mgr.save_items(stock_code, market, merged)
+        else:
+            cache_mgr.record_empty_search(stock_code, market)
 
         elapsed = round(time.time() - start_time, 2)
         metadata = dict(news_resp.metadata) if news_resp.metadata else {}
         metadata["web_results_added"] = web_added
         metadata["stock_news_count"] = len(news_resp.results)
         metadata["total_merged"] = len(merged)
+        metadata["from_cache"] = False
 
         return SearchResponse(
-            query=query,
-            results=merged,
-            provider="StockNews+Web",
-            success=len(merged) > 0,
-            search_time=elapsed,
-            metadata=metadata,
+            query=query, results=merged, provider="StockNews+Web",
+            success=len(merged) > 0, search_time=elapsed, metadata=metadata,
         )
 
 
@@ -1231,5 +1481,6 @@ def get_search_service() -> SearchService:
 
 def reset_search_service() -> None:
     """重置搜索服务（用于测试或配置更新后）"""
-    global _search_service
+    global _search_service, _news_cache_manager
     _search_service = None
+    _news_cache_manager = None

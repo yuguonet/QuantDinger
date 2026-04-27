@@ -47,6 +47,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, Generator, List, Optional
 
 import pandas as pd
+import numpy as np
 
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
