@@ -39,13 +39,23 @@ logger = get_logger(__name__)
 # 市场新闻不针对个股, 需要统一的 symbol 标识
 # 个股新闻直接用股票代码作为 symbol
 #
-MARKET_NEWS_SYMBOLS = {
-    "CNStock":  "MARKET_CN",       # A股市场综合新闻
-    "USStock":  "MARKET_US",       # 美股市场综合新闻
-    "Crypto":   "MARKET_CRYPTO",   # 加密货币市场新闻
-    "Forex":    "MARKET_FOREX",    # 外汇市场新闻
-    "Futures":  "MARKET_FUTURES",  # 期货市场新闻
-}
+POLICY_NEWS_SYMBOL = "POLICY"      # 政策/宏观新闻 symbol
+
+
+def get_news_type(symbol: str, market: str) -> str:
+    """
+    通过 market + symbol 判断新闻类型
+
+    规则:
+      - symbol == market          → "market"     市场新闻 (symbol 直接等于 market)
+      - symbol == POLICY_NEWS_SYMBOL → "policy"  政策/宏观新闻
+      - 其它                       → "stock"      个股新闻 (symbol = 股票代码)
+    """
+    if symbol == market:
+        return "market"
+    if symbol == POLICY_NEWS_SYMBOL:
+        return "policy"
+    return "stock"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -64,35 +74,7 @@ _MARKET_TRADING_WINDOWS = {
     "Forex":    {"pre_open": (5, 30, 6, 0),   "midday": (12, 0, 13, 0)},    # 外汇 6:00开盘
 }
 
-# ── 重大负面新闻一票否决关键词 (命中任一 → sentiment_score = -999) ──
-_VETO_KEYWORDS = {
-    "跌停", "一字跌停", "连续跌停", "天地板",
-    "闪崩", "崩盘",
-    "历史新低",
-    "净利大跌",
-    "业绩暴雷", "暴雷", "业绩变脸",
-    "巨亏", "大幅亏损", "由盈转亏",
-    "商誉减值",
-    "财务造假",
-    "清仓",
-    "大股东减持", "违规减持",
-    "破产", "清算",
-    "质量事故", "安全事故",
-    "监管调查", "立案调查", "违法",
-    "退市", "暂停上市",
-    "债务危机", "债务违约", "资金链断裂",
-    "巨额索赔",
-    "重大利空", "黑天鹅",
-}
-
-
-def _check_veto(title: str, snippet: str = "") -> bool:
-    """检查是否触发重大负面一票否决"""
-    text = f"{title} {snippet}"
-    for kw in _VETO_KEYWORDS:
-        if kw in text:
-            return True
-    return False
+# ── 一票否决逻辑已迁移至 app.services.news_analysis ──
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -250,9 +232,10 @@ class NewsCacheManager:
     def save_items(self, symbol: str, market: str, results: List[SearchResult]) -> bool:
         """
         将搜索结果写入明细表, ON CONFLICT 更新已有标题
-        - 写入前强制 utf-8 编码清洗
-        - 每条先做情感评分 (sentiment + sentiment_score)
-        - 重大负面一票否决 → sentiment_score = -999
+
+        流程: 去重 → 按类型评分 → 存 DB
+          - 政策/宏观新闻 (symbol=POLICY): AI 分析评分 (LLM 改写+评分)
+          - 市场/个股新闻: 关键词评分 (纯算法)
         """
         if not symbol or not market or not results:
             return False
@@ -260,6 +243,16 @@ class NewsCacheManager:
             with get_db_connection() as conn:
                 self._purge_expired(conn)
                 cursor = conn.cursor()
+
+                # 判断新闻类型, 选择评分方式
+                news_type = get_news_type(symbol, market)
+                from app.services.news_analysis import keyword_score_article, ai_analyze_article
+
+                if news_type == "policy":
+                    logger.info(f"[评分] 政策/宏观新闻, 启用 AI 分析: {len(results)}条")
+                else:
+                    logger.debug(f"[评分] {news_type}新闻, 关键词评分: {len(results)}条")
+
                 rows = []
                 for r in results:
                     title = _safe_encode(r.title, 500)
@@ -267,18 +260,35 @@ class NewsCacheManager:
                     url = _safe_encode(r.url, 1000)
                     source = _safe_encode(r.source, 100)
                     pub_date = _safe_encode(r.published_date or '', 40)
-                    sentiment = _safe_encode(r.sentiment, 20)
 
-                    # 计算数值评分
-                    score = r.sentiment_score
-                    if score is None:
-                        score = {"positive": 7.5, "negative": 2.5, "neutral": 5.0}.get(sentiment, 5.0)
-
-                    # 重大负面一票否决检测
-                    if _check_veto(title, snippet):
-                        score = -999.0
-                        sentiment = "negative"
-                        logger.warning(f"[一票否决] 检测到重大负面: {title[:60]}")
+                    if news_type == "policy":
+                        # 政策/宏观: AI 分析评分
+                        ai_result = ai_analyze_article(
+                            title=title, snippet=snippet,
+                            source=source, published_date=pub_date,
+                        )
+                        if ai_result:
+                            score = ai_result["score"]
+                            sentiment = ai_result["sentiment"]
+                            # 用 AI 改写的通俗版本覆盖 snippet
+                            simplified = ai_result.get("simplified_text", "")
+                            if simplified:
+                                snippet = _safe_encode(simplified, 2000)
+                        else:
+                            # AI 不可用, 降级为关键词评分
+                            kw_result = keyword_score_article(title, snippet)
+                            score = kw_result["score"]
+                            sentiment = kw_result["sentiment"]
+                    else:
+                        # 市场/个股: 关键词评分
+                        kw_result = keyword_score_article(title, snippet)
+                        if kw_result["veto"]:
+                            score = -999.0
+                            sentiment = "negative"
+                            logger.warning(f"[一票否决] 检测到重大负面: {title[:60]}")
+                        else:
+                            score = kw_result["score"]
+                            sentiment = kw_result["sentiment"]
 
                     rows.append((symbol, market, title, snippet, url, source,
                                  pub_date, sentiment, score))
@@ -298,34 +308,50 @@ class NewsCacheManager:
                     rows
                 )
                 conn.commit()
-                logger.info(f"新闻缓存已保存: {symbol}({market}) {len(results)}条")
+                logger.info(f"新闻缓存已保存: {symbol}({market}) {news_type} {len(results)}条")
                 return True
         except Exception as e:
             logger.error(f"保存新闻缓存异常: {e}")
             return False
 
     @staticmethod
-    def calc_score(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def calc_score(symbol: str, market: str) -> Dict[str, Any]:
         """
-        从新闻列表实时计算综合评分 (复用 stock_news.py 的衰减逻辑)
+        综合评分 = 所有文章 (score × 遗忘因子) 求和 ÷ 文章数
 
-        一票否决规则:
-        - 任一条 sentiment_score == -999 → 直接参与加权求和
-        - -999 乘以权重后, 不管多少篇正面文章, 累计分永远 < 0
+        规则:
+          - 从 DB 按 (symbol, market) 读取全部文章
+          - 一票否决 (sentiment_score == -999): 评分视为 0
+          - 遗忘因子: 0.8^(created_hours/24), 基于入库时间 created_at
+          - 最终 = Σ(score × decay) / count
         """
-        if not items:
+        try:
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """SELECT sentiment, sentiment_score, created_at
+                       FROM qd_news_cache_items
+                       WHERE symbol = %s AND market = %s""",
+                    (symbol, market)
+                )
+                rows = cursor.fetchall()
+        except Exception as e:
+            logger.warning(f"calc_score 查询异常: {e}")
+            rows = []
+
+        if not rows:
             return {"composite_score": 5.0, "direction": "中性",
-                    "positive": 0, "negative": 0, "neutral": 0}
+                    "positive": 0, "negative": 0, "neutral": 0, "veto": False}
 
         now = datetime.now()
         pos = neg = neu = 0
-        total_weighted = 0.0
-        total_weight = 0.0
-        has_veto = False
+        veto_count = 0
+        scores = []
 
-        for item in items:
-            s = item.get("sentiment", "neutral")
-            raw_score = item.get("sentiment_score", None)
+        for row in rows:
+            s = row.get("sentiment", "neutral")
+            raw_score = row.get("sentiment_score")
+            created_at = row.get("created_at")
 
             if s == "positive":
                 pos += 1
@@ -334,39 +360,29 @@ class NewsCacheManager:
             else:
                 neu += 1
 
-            # 一票否决检测
-            if raw_score is not None and float(raw_score) == -999.0:
-                has_veto = True
+            # 一票否决: 直接赋值 0, 不参与遗忘因子计算
+            is_veto = raw_score is not None and float(raw_score) == -999.0
+            if is_veto:
+                veto_count += 1
+                scores.append(0.0)
+                continue
 
-            # 时间衰减
-            pub = item.get("published_date", "")
-            try:
-                pub_dt = datetime.fromisoformat(pub) if pub else now
-                hours = max(0, (now - pub_dt).total_seconds() / 3600)
-            except (ValueError, TypeError):
+            score = float(raw_score) if raw_score is not None else \
+                {"positive": 7.5, "negative": 2.5, "neutral": 5.0}.get(s, 5.0)
+
+            # 遗忘因子: 基于入库时间
+            if created_at:
+                try:
+                    hours = max(0, (now - created_at).total_seconds() / 3600)
+                except Exception:
+                    hours = 24
+            else:
                 hours = 24
             decay = 0.8 ** (hours / 24)
-            boost = 1.5 if s != "neutral" else 1.0
-            weight = decay * boost
 
-            # -999 直接参与加权, 确保累计分 < 0
-            if raw_score is not None and float(raw_score) == -999.0:
-                score = -999.0
-            else:
-                score = float(raw_score) if raw_score is not None else \
-                    {"positive": 7.5, "negative": 2.5, "neutral": 5.0}.get(s, 5.0)
+            scores.append(score * decay)
 
-            total_weighted += score * weight
-            total_weight += weight
-
-        # 一票否决: 任何重大负面 → 综合分 < 0
-        if has_veto:
-            veto_score = round(total_weighted / total_weight, 1) if total_weight > 0 else -999.0
-            return {"composite_score": veto_score, "direction": "重大利空",
-                    "positive": pos, "negative": neg, "neutral": neu,
-                    "veto": True}
-
-        composite = round(total_weighted / total_weight, 1) if total_weight > 0 else 5.0
+        composite = round(sum(scores) / len(scores), 1) if scores else 5.0
         composite = max(0.0, min(10.0, composite))
 
         if composite >= 7:
@@ -381,7 +397,8 @@ class NewsCacheManager:
             direction = "中性"
 
         return {"composite_score": composite, "direction": direction,
-                "positive": pos, "negative": neg, "neutral": neu}
+                "positive": pos, "negative": neg, "neutral": neu,
+                "veto": veto_count > 0, "veto_count": veto_count}
 
 
 # 全局缓存管理器单例
@@ -449,10 +466,10 @@ def search_cn_stock_news(
     should, reason = cache_mgr.should_search(stock_code, market, is_watchlist)
 
     if not should:
-        # 从缓存取 items, 实时算评分
+        # 从缓存取 items, 从 DB 实时算评分
         items = cache_mgr.get_items(stock_code, market)
         if items:
-            score_info = cache_mgr.calc_score(items)
+            score_info = cache_mgr.calc_score(stock_code, market)
             results = [
                 SearchResult(
                     title=i["title"], snippet=i.get("snippet", ""),
@@ -542,7 +559,7 @@ def search_cn_stock_news(
 # ═══════════════════════════════════════════════════════════════
 #
 # 市场新闻 vs 个股新闻:
-#   市场新闻 → symbol = MARKET_NEWS_SYMBOLS[market] (预定义)
+#   市场新闻 → symbol = market
 #   个股新闻 → symbol = 股票代码 (search_cn_stock_news)
 #
 # A股市场新闻优先使用 news_fetcher.py 直爬 (5路数据源, 无需搜索引擎)
@@ -551,6 +568,7 @@ def search_cn_stock_news(
 
 def search_market_news(
     market: str = "CNStock",
+    symbol: str = "",
     days: int = 1, max_web_results: int = 5,
     max_fetcher_per_source: int = 10,
 ) -> SearchResponse:
@@ -560,10 +578,12 @@ def search_market_news(
     - A股: news_fetcher.py 直爬 (优先) + Web 补充
     - 其他市场: Web 搜索
 
-    缓存 symbol 使用 MARKET_NEWS_SYMBOLS 中的预定义值
+    symbol 不传时默认等于 market (市场新闻)
+    传 "POLICY" 时为政策/宏观新闻
     """
     start_time = time.time()
-    symbol = MARKET_NEWS_SYMBOLS.get(market, f"MARKET_{market}")
+    if not symbol:
+        symbol = market
     cache_mgr = get_news_cache_manager()
 
     # ── 判断是否需要搜索 ──
@@ -572,7 +592,7 @@ def search_market_news(
     if not should:
         items = cache_mgr.get_items(symbol, market)
         if items:
-            score_info = cache_mgr.calc_score(items)
+            score_info = cache_mgr.calc_score(symbol, market)
             results = [
                 SearchResult(
                     title=i["title"], snippet=i.get("snippet", ""),
