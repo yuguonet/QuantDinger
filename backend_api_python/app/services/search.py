@@ -12,10 +12,11 @@ Search service v2.1 - 增强版搜索服务 (PostgreSQL 新闻缓存版)
 
 参考：daily_stock_analysis-main/src/search_service.py
 
-v2.1 变更:
-- 新增 sentiment_score REAL 列: 0-10 数值评分, 重大负面 = -999 (一票否决)
-- 编码安全: 所有入库文本强制 utf-8 清洗, 替换不可解码字节
-- calc_score: 检测 -999 → 综合分直接归零 (一票否决)
+v2.2 变更:
+- 15天过期清理: save/get 时自动 DELETE 超期记录, 配置 NEWS_CACHE_EXPIRY_DAYS
+- 一票否决累计修复: -999 参与加权求和, 确保累计分 < 0
+- 动态搜索天数: 根据最后搜索时间自动缩减 days, 降低 API 调用
+- 非A股自选股时间窗口: 美股/加密/外汇按各自开盘时间判断
 - 外部接口参数保持不变
 """
 import requests
@@ -38,7 +39,17 @@ from app.utils.db import get_db_connection
 logger = get_logger(__name__)
 
 # ── 新闻缓存配置 (顶部统一管理) ─────────────────────────────
-NEWS_CACHE_DEDUP_HOURS = 24 # 24小时内不重复搜索
+NEWS_CACHE_DEDUP_HOURS = 24  # 24小时内不重复搜索
+NEWS_CACHE_EXPIRY_DAYS = 15  # 15天后自动清除过期新闻
+
+# ── 各市场交易时间窗口 (用于自选股刷新判断) ─────────────────
+# 格式: (start_hour, start_minute, end_hour, end_minute)
+_MARKET_TRADING_WINDOWS = {
+    "CNStock":  {"pre_open": (7, 30, 9, 30),  "midday": (12, 0, 13, 0)},   # A股 9:30开盘
+    "USStock":  {"pre_open": (20, 30, 21, 30), "midday": (1, 0, 2, 0)},     # 美股 21:30开盘 (北京时间)
+    "Crypto":   {"pre_open": None, "midday": None},                          # 7x24 无特殊窗口
+    "Forex":    {"pre_open": (5, 30, 6, 0),   "midday": (12, 0, 13, 0)},    # 外汇 6:00开盘
+}
 
 # ── 重大负面新闻一票否决关键词 (命中任一 → sentiment_score = -999) ──
 # 这些是 stock_news.py 中 weight=3 的极端负面词, 任一命中即触发一票否决
@@ -125,6 +136,21 @@ class NewsCacheManager:
     def __init__(self):
         pass
 
+    def _purge_expired(self, conn) -> int:
+        """清除超过 NEWS_CACHE_EXPIRY_DAYS 天的过期记录, 返回删除行数"""
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"DELETE FROM qd_news_cache_items WHERE created_at < NOW() - INTERVAL '{NEWS_CACHE_EXPIRY_DAYS} days'"
+            )
+            deleted = cursor.rowcount
+            if deleted > 0:
+                logger.info(f"[过期清理] 已清除 {deleted} 条超过 {NEWS_CACHE_EXPIRY_DAYS} 天的新闻缓存")
+            return deleted
+        except Exception as e:
+            logger.warning(f"过期清理异常(非致命): {e}")
+            return 0
+
     def _get_last_search_time(self, symbol: str, market: str) -> Optional[datetime]:
         """从 DB 查询该股票最后一条缓存的入库时间"""
         try:
@@ -143,9 +169,12 @@ class NewsCacheManager:
             return None
 
     def get_items(self, symbol: str, market: str = "CNStock") -> List[Dict[str, Any]]:
-        """从 DB 查询该股票的缓存新闻"""
+        """从 DB 查询该股票的缓存新闻, 同时清理过期记录"""
         try:
             with get_db_connection() as conn:
+                # 读取时顺带清理过期数据 (轻量级, 利用 idx_news_items_created 索引)
+                self._purge_expired(conn)
+                conn.commit()
                 cursor = conn.cursor()
                 cursor.execute(
                     """SELECT title, snippet, url, source, published_date, sentiment, sentiment_score
@@ -165,8 +194,8 @@ class NewsCacheManager:
         判断是否需要搜索
 
         判断顺序:
-          1. 自选股 + 开盘前窗口(7:30-9:30) + 今日未搜 → 搜索
-          2. 自选股 + 午间窗口(12:00-13:00) + 午间未搜 → 搜索
+          1. 自选股 + 开盘前窗口 + 今日未搜 → 搜索
+          2. 自选股 + 午间窗口 + 午间未搜 → 搜索
           3. DB中距上次搜索 <24h → 跳过
           4. 其他 → 搜索
 
@@ -176,22 +205,33 @@ class NewsCacheManager:
         last_search = self._get_last_search_time(symbol, market)
         now = datetime.now()
 
-        # 自选股特殊策略 (A股 9:30 开盘)
-        if is_watchlist and market == "CNStock":
-            # 开盘前2小时窗口: 7:30-9:30
-            pre_market = (now.hour == 7 and now.minute >= 30) or (now.hour == 8) or (now.hour == 9 and now.minute < 30)
-            if pre_market:
-                if last_search and last_search.date() == now.date():
-                    return False, f"自选股今日已搜({last_search.strftime('%H:%M')}), 开盘前无需重复"
-                else:
-                    return True, "自选股开盘前刷新(今日未搜索)"
+        # 自选股特殊策略 (支持多市场)
+        if is_watchlist:
+            windows = _MARKET_TRADING_WINDOWS.get(market)
+            if windows:
+                # 开盘前窗口
+                pre = windows.get("pre_open")
+                if pre:
+                    sh, sm, eh, em = pre
+                    in_pre = (now.hour > sh or (now.hour == sh and now.minute >= sm)) and \
+                             (now.hour < eh or (now.hour == eh and now.minute < em))
+                    if in_pre:
+                        if last_search and last_search.date() == now.date():
+                            return False, f"自选股今日已搜({last_search.strftime('%H:%M')}), 开盘前无需重复"
+                        else:
+                            return True, f"自选股开盘前刷新({market}, 今日未搜索)"
 
-            # 午间窗口: 12:00-13:00
-            if now.hour == 12:
-                if last_search and last_search.date() == now.date() and last_search.hour >= 12:
-                    return False, f"自选股午间已搜({last_search.strftime('%H:%M')})"
-                else:
-                    return True, "自选股午间刷新"
+                # 午间窗口
+                mid = windows.get("midday")
+                if mid:
+                    mh, mm, meh, mem = mid
+                    in_mid = (now.hour > mh or (now.hour == mh and now.minute >= mm)) and \
+                             (now.hour < meh or (now.hour == meh and now.minute < mem))
+                    if in_mid:
+                        if last_search and last_search.date() == now.date() and last_search.hour >= mh:
+                            return False, f"自选股午间已搜({last_search.strftime('%H:%M')})"
+                        else:
+                            return True, f"自选股午间刷新({market})"
 
         # 24小时去重
         if last_search:
@@ -200,6 +240,33 @@ class NewsCacheManager:
                 return False, f"距上次搜索仅{hours_since:.1f}h(<24h), 使用缓存"
 
         return True, "需要搜索" if not last_search else f"距上次搜索超过{NEWS_CACHE_DEDUP_HOURS}h"
+
+    def calc_dynamic_days(self, symbol: str, market: str, default_days: int = 3) -> int:
+        """
+        根据最后搜索时间动态缩减搜索天数, 降低 API 调用
+
+        规则:
+        - 从未搜索 → 返回 default_days
+        - 距上次搜索 < 1h → 1 天 (只补最新)
+        - 距上次搜索 < 6h → 2 天
+        - 距上次搜索 < 12h → 3 天
+        - 距上次搜索 < 24h → 4 天
+        - 超过 24h → default_days
+        """
+        last_search = self._get_last_search_time(symbol, market)
+        if not last_search:
+            return default_days
+
+        hours_since = (datetime.now() - last_search).total_seconds() / 3600
+        if hours_since < 1:
+            return 1
+        elif hours_since < 6:
+            return 2
+        elif hours_since < 12:
+            return 3
+        elif hours_since < 24:
+            return 4
+        return default_days
 
     def save_items(self, symbol: str, market: str, results: List['SearchResult']) -> bool:
         """
@@ -212,6 +279,8 @@ class NewsCacheManager:
             return False
         try:
             with get_db_connection() as conn:
+                # 写入时顺带清理过期数据
+                self._purge_expired(conn)
                 cursor = conn.cursor()
                 rows = []
                 for r in results:
@@ -264,7 +333,8 @@ class NewsCacheManager:
         从新闻列表实时计算综合评分 (复用 stock_news.py 的衰减逻辑)
 
         一票否决规则:
-        - 任一条 sentiment_score == -999 → 综合分直接归 0, direction=重大利空
+        - 任一条 sentiment_score == -999 → 直接参与加权求和
+        - -999 乘以权重后, 不管多少篇正面文章, 累计分永远 < 0
         """
         if not items:
             return {"composite_score": 5.0, "direction": "中性",
@@ -290,7 +360,6 @@ class NewsCacheManager:
             # 一票否决检测
             if raw_score is not None and float(raw_score) == -999.0:
                 has_veto = True
-                continue  # 不参与加权, 但已标记
 
             # 时间衰减
             pub = item.get("published_date", "")
@@ -302,13 +371,21 @@ class NewsCacheManager:
             decay = 0.8 ** (hours / 24)
             boost = 1.5 if s != "neutral" else 1.0
             weight = decay * boost
-            score = {"positive": 7.5, "negative": 2.5, "neutral": 5.0}.get(s, 5.0)
+
+            # -999 直接参与加权, 确保累计分 < 0
+            if raw_score is not None and float(raw_score) == -999.0:
+                score = -999.0
+            else:
+                score = float(raw_score) if raw_score is not None else \
+                    {"positive": 7.5, "negative": 2.5, "neutral": 5.0}.get(s, 5.0)
+
             total_weighted += score * weight
             total_weight += weight
 
-        # 一票否决: 任何重大负面 → 综合分归零
+        # 一票否决: 任何重大负面 → 综合分 < 0
         if has_veto:
-            return {"composite_score": 0.0, "direction": "重大利空",
+            veto_score = round(total_weighted / total_weight, 1) if total_weight > 0 else -999.0
+            return {"composite_score": veto_score, "direction": "重大利空",
                     "positive": pos, "negative": neg, "neutral": neu,
                     "veto": True}
 
@@ -1061,8 +1138,11 @@ class SearchService:
         start_time = time.time()
         query = f"{stock_code} {stock_name}".strip()
 
-        # ── 第一步: 判断是否需要搜索 ──
+        # ── 第零步: 动态缩减搜索天数 ──
         cache_mgr = get_news_cache_manager()
+        effective_days = cache_mgr.calc_dynamic_days(stock_code, market, default_days=days)
+
+        # ── 第一步: 判断是否需要搜索 ──
         should, reason = cache_mgr.should_search(stock_code, market, is_watchlist)
 
         if not should:
@@ -1100,8 +1180,8 @@ class SearchService:
         web_query = f"{stock_name} {stock_code} A股新闻" if stock_name else f"{stock_code} 股票新闻"
 
         with ThreadPoolExecutor(max_workers=2) as pool:
-            f_web = pool.submit(self.search_with_fallback, web_query, max_web_results, days)
-            f_news = pool.submit(self._stock_news_provider.search, query, 20, days)
+            f_web = pool.submit(self.search_with_fallback, web_query, max_web_results, effective_days)
+            f_news = pool.submit(self._stock_news_provider.search, query, 20, effective_days)
 
             try:
                 web_resp = f_web.result()
@@ -1146,6 +1226,7 @@ class SearchService:
         metadata["stock_news_count"] = len(news_resp.results)
         metadata["total_merged"] = len(merged)
         metadata["from_cache"] = False
+        metadata["effective_days"] = effective_days
 
         return SearchResponse(
             query=query, results=merged, provider="StockNews+Web",
