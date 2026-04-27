@@ -284,7 +284,7 @@ def _fetch_eastmoney(code: str, days: int, name: str = "") -> List[SearchResult]
                 items.append(SearchResult(
                     title=title, snippet=summary, url=art_url,
                     source="东方财富公告", published_date=pub_time.isoformat(),
-                    sentiment=sentiment))
+                    sentiment=sentiment, sentiment_score=score))
     except Exception as e:
         print(f"  [东方财富公告] 异常: {e}", file=sys.stderr)
 
@@ -347,7 +347,7 @@ def _fetch_eastmoney(code: str, days: int, name: str = "") -> List[SearchResult]
                 items.append(SearchResult(
                     title=title, snippet=summary, url=url_link,
                     source="东方财富新闻", published_date=pub_time.isoformat(),
-                    sentiment=sentiment))
+                    sentiment=sentiment, sentiment_score=score))
         except Exception as e:
             print(f"  [东方财富新闻/{kw}] 异常: {e}", file=sys.stderr)
 
@@ -394,7 +394,7 @@ def _fetch_sina(code: str, days: int, name: str = "") -> List[SearchResult]:
             items.append(SearchResult(
                 title=title, snippet=summary, url=href,
                 source="新浪财经", published_date=pub_time.isoformat(),
-                sentiment=sentiment))
+                sentiment=sentiment, sentiment_score=score))
     except Exception as e:
         print(f"  [新浪财经] 异常: {e}", file=sys.stderr)
     return items
@@ -433,7 +433,7 @@ def _fetch_sina7x24(code: str, days: int, name: str = "") -> List[SearchResult]:
                 title=title[:80], snippet=summary,
                 url=f"https://zhibo.sina.com.cn/152/{item_data.get('id', '')}.html",
                 source="新浪7x24", published_date=pub_time.isoformat(),
-                sentiment=sentiment))
+                sentiment=sentiment, sentiment_score=score))
     except Exception as e:
         print(f"  [新浪7x24] 异常: {e}", file=sys.stderr)
     return items
@@ -480,7 +480,7 @@ def _fetch_qq(code: str, days: int, name: str = "") -> List[SearchResult]:
             items.append(SearchResult(
                 title=title, snippet=summary, url=art_url,
                 source="腾讯财经", published_date=pub_time.isoformat(),
-                sentiment=sentiment))
+                sentiment=sentiment, sentiment_score=score))
     except Exception as e:
         print(f"  [腾讯财经] 异常: {e}", file=sys.stderr)
     return items
@@ -520,7 +520,7 @@ def _fetch_ifeng(code: str, days: int, name: str = "") -> List[SearchResult]:
             items.append(SearchResult(
                 title=title, snippet=summary, url=art_url,
                 source="凤凰财经", published_date=pub_time.isoformat(),
-                sentiment=sentiment))
+                sentiment=sentiment, sentiment_score=score))
     except Exception as e:
         print(f"  [凤凰财经] 异常: {e}", file=sys.stderr)
     return items

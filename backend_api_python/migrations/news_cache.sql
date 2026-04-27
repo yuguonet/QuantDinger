@@ -1,6 +1,7 @@
 -- =============================================================================
--- 新闻缓存明细表 (单表设计)
+-- 新闻缓存明细表 (单表设计) v2.1
 -- 每条新闻一行, 通过 (symbol, market) 关联
+-- 新增: sentiment_score 数值评分, 重大负面一票否决 (-999)
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS qd_news_cache_items (
@@ -13,6 +14,7 @@ CREATE TABLE IF NOT EXISTS qd_news_cache_items (
     source          VARCHAR(100) DEFAULT '',              -- 来源 (东方财富/新浪/腾讯等)
     published_date  VARCHAR(40) DEFAULT '',               -- 原文发布时间
     sentiment       VARCHAR(20) DEFAULT 'neutral',        -- positive/negative/neutral
+    sentiment_score REAL DEFAULT 5.0,                     -- 数值评分 0-10, 重大负面=-999 (一票否决)
     created_at      TIMESTAMP DEFAULT NOW(),              -- 入库时间 (用于过期清理)
     UNIQUE(symbol, market, title)                         -- 同一股票不存重复标题
 );
@@ -24,4 +26,4 @@ CREATE INDEX IF NOT EXISTS idx_news_items_created ON qd_news_cache_items(created
 -- 按发布时间排序
 CREATE INDEX IF NOT EXISTS idx_news_items_published ON qd_news_cache_items(published_date);
 
-COMMENT ON TABLE qd_news_cache_items IS '新闻缓存: 每条新闻一行, 15天过期, 24h去重';
+COMMENT ON TABLE qd_news_cache_items IS '新闻缓存: 每条新闻一行, 24h去重, sentiment_score支持一票否决';

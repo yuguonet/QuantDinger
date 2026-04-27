@@ -317,39 +317,6 @@ def list_user_selection_strategies(user_id: int = 1) -> Dict[str, Any]:
 
 SCREENING_TOOLS = [
     {
-        "fn": screen_stocks,
-        "name": "screen_stocks",
-        "description": (
-            "从全市场筛选股票（初选）。查询选股数据库，支持按行业、概念、涨跌幅、"
-            "换手率、量比等条件过滤。返回候选股票列表。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "conditions": {
-                    "type": "object",
-                    "description": "筛选条件，可选键：industry(行业), concept(概念), "
-                                   "min_change_rate(最低涨跌幅%), max_change_rate(最高涨跌幅%), "
-                                   "min_turnover(最低换手率%), min_volume_ratio(最低量比)",
-                },
-                "market": {
-                    "type": "string",
-                    "description": "市场，默认 CNStock",
-                    "default": "CNStock",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "返回数量上限，默认50，最大200",
-                    "default": 50,
-                },
-                "date": {
-                    "type": "string",
-                    "description": "交易日期 YYYY-MM-DD，空则取最新",
-                },
-            },
-        },
-    },
-    {
         "fn": review_stocks_with_indicator,
         "name": "review_stocks_with_indicator",
         "description": (
