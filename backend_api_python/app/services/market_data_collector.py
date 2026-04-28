@@ -2101,22 +2101,12 @@ class MarketDataCollector:
         news_list = []
         
         try:
-            from app.services.search import get_search_service
-            search_service = get_search_service()
-            
-            if not search_service.is_available:
-                return news_list
-            
-            # 构建搜索名称
-            search_name = company_name or symbol
-            
-            # 搜索股票新闻
-            response = search_service.search_stock_news(
-                stock_code=symbol,
-                stock_name=search_name,
-                market=market,
-                max_results=5
-            )
+            from app.data_providers.news import fetch_financial_news
+            response = fetch_financial_news(lang="all", 
+                                        market="CNStock",
+                                        symbol=symbol,
+                                        name=company_name or "", 
+                                        )           
             
             if response.success and response.results:
                 for result in response.results:
@@ -2145,7 +2135,7 @@ class MarketDataCollector:
         news_list = []
         
         try:
-            from app.services.search import get_search_service
+            from app.services.news_search import get_search_service
             search_service = get_search_service()
             
             if not search_service.is_available:

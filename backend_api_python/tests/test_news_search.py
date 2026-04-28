@@ -82,7 +82,7 @@ os.environ.setdefault("SECRET_KEY", "test")
 os.environ.setdefault("TQDM_DISABLE", "1")
 os.environ.setdefault("CACHE_ENABLED", "false")
 
-from app.services.search import (
+from app.services.news_search import (
     _safe_encode,
     SearchResult,
     SearchResponse,

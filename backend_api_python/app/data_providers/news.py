@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 
 from app.utils.logger import get_logger
 from app.utils.db import get_db_connection
-from app.services.search import SearchResult, SearchResponse, get_search_service, _safe_encode
+from app.services.news_search import SearchResult, SearchResponse, get_search_service, _safe_encode
 
 logger = get_logger(__name__)
 
