@@ -913,9 +913,9 @@ def _safe_refresh_sh(endpoint, fn):
 
 from app.data_providers.global_market import (
     get_sentiment,
-    get_indices as _get_indices,
-    get_heatmap as _get_heatmap,
-    get_news as _get_news,
+#    get_indices as _get_indices,
+#    get_heatmap as _get_heatmap,
+#    get_news as _get_news,
     refresh as refresh_intl,
 )
 
@@ -935,32 +935,32 @@ def market_sentiment():
 @global_market_bp.route("/indices", methods=["GET"])
 def market_indices():
     """全球股指 + 外汇 + 加密货币"""
-    try:
-        return jsonify(_get_indices())
-    except Exception as e:
-        logger.error("indices 失败: %s", e, exc_info=True)
-        return jsonify({"code": 0, "msg": str(e), "data": {}})
+#    try:
+#        return jsonify(_get_indices())
+#    except Exception as e:
+    logger.error("关闭全球股指,可以获取全球股票状况,使用国内的应该更快 indices 失败: %s", e, exc_info=True)
+    return jsonify({"code": 0, "msg": str(e), "data": {}})
 
 
 @global_market_bp.route("/heatmap", methods=["GET"])
 def market_heatmap():
     """市场热力图"""
-    try:
-        return jsonify(_get_heatmap())
-    except Exception as e:
-        logger.error("heatmap 失败: %s", e, exc_info=True)
-        return jsonify({"code": 0, "msg": str(e), "data": {}})
+#    try:
+#        return jsonify(_get_heatmap())
+#    except Exception as e:
+    logger.error("市场热力图关闭,可以获取国外板块涨跌的有用信息 heatmap 失败: %s", e, exc_info=True)
+    return jsonify({"code": 0, "msg": str(e), "data": {}})
 
 
 @global_market_bp.route("/news", methods=["GET"])
 def market_news():
     """财经新闻"""
-    lang = request.args.get("lang", "all")
-    try:
-        return jsonify(_get_news(lang=lang))
-    except Exception as e:
-        logger.error("news 失败: %s", e, exc_info=True)
-        return jsonify({"code": 0, "msg": str(e), "data": {}})
+#    lang = request.args.get("lang", "all")
+#    try:
+#        return jsonify(_get_news(lang=lang))
+#    except Exception as e:
+    logger.error("关闭国际财经 失败: %s", e, exc_info=True)
+    return jsonify({"code": 0, "msg": str(e), "data": {}})
 
 
 @global_market_bp.route("/refresh", methods=["POST"])
