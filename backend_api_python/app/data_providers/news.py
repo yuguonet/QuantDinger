@@ -381,30 +381,6 @@ def get_news_cache_manager() -> NewsCacheManager:
 
 
 # ═══════════════════════════════════════════════════════════════
-# A股个股新闻搜索 (带缓存)
-# ═══════════════════════════════════════════════════════════════
-
-def _fetch_stock_news_search(query: str, max_results: int = 20, days: int = 7) -> SearchResponse:
-    """调用 stock_news.py 获取A股个股新闻 (5路数据源)"""
-    try:
-        from app.services.stock_news import fetch_stock_news
-        parts = query.strip().split(None, 1)
-        stock_code = parts[0]
-        stock_name = parts[1] if len(parts) > 1 else ""
-        resp = fetch_stock_news(
-            stock_code=stock_code, days=min(days, 30),
-            stock_name=stock_name, max_results=max_results or 20,
-        )
-        direction = resp.metadata.get("direction", "")
-        score = resp.metadata.get("composite_score", "")
-        resp.provider = f"StockNews({direction} {score}/10)" if direction else "StockNews"
-        return resp
-    except Exception as e:
-        return SearchResponse(query=query, results=[], provider="StockNews",
-                              success=False, error_message=str(e))
-
-
-# ═══════════════════════════════════════════════════════════════
 # 统一新闻搜索 (个股 + 市场)
 # ═══════════════════════════════════════════════════════════════
 
@@ -499,11 +475,6 @@ def search_news(
         futures = {}
 
         if is_stock:
-            # ── 个股: StockNews 5路 (仅中文) ──
-            if lang in ("cn", "all"):
-                query = f"{symbol} {name}".strip()
-                futures[pool.submit(_fetch_stock_news_search, query, 20, effective_days)] = "StockNews"
-
             # ── 个股: Web 搜索 ──
             if lang in ("cn", "all"):
                 cn_q = f"{name} {symbol} A股新闻" if name else f"{symbol} 股票新闻"

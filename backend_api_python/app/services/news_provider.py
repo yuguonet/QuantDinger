@@ -1,45 +1,270 @@
 #!/usr/bin/env python3
 """
-A股个股多渠道新闻聚合工具 — stock_news.py v3.0
+财经新闻直接抓取 — 不依赖 AKShare (v2.2)
+数据源: 东方财富、新浪财经、央视网 直接爬取
+依赖: pip install requests
 
-功能:
-  - 5路数据源并发抓取: 东方财富(公告+新闻)、新浪财经、新浪7x24快讯、腾讯财经、凤凰财经
-  - 标题归一化去重
-  - 输出标准 SearchResponse(SearchResult), 由上层 news.py 负责缓存和评分
-
-数据模型:
-  - 复用 search.py 的 SearchResult / SearchResponse
-  - sentiment 默认 "neutral", sentiment_score 默认 0.0 (评分由 news_analysis 负责)
-
-对外接口:
-  fetch_stock_news(stock_code, days, stock_name, sources, max_results) -> SearchResponse
-  - stock_code: 6位股票代码
-  - days: 有效天数 (默认3)
-  - stock_name: 可选, 不传则自动查询
-  - sources: 指定数据源, None=全部, 可选: eastmoney/sina/sina7x24/qq/ifeng
-  - max_results: 限制返回条数, 0=不限
-
-去重规则:
-  - 标题归一化指纹(md5), 去除空白/标点, 与 search.py 的 _title_key 保持一致
-  - stock_news 内部 5 路数据源先去重, search_cn_stock_news 中再与 web 结果去重
-  - 优先级: stock_news > web搜索 (国内财经直连数据源优先)
-
-依赖: requests, beautifulsoup4 (bs4)
+v2.2 修复:
+- 东方财富: API 新增 req_trace 参数, 改用 7x24 快讯接口
+- 财联社: content 字段类型变更(str), 适配 brief + ctime
+- 新浪财经: zhibo API 失效, 改用 feed.mix.sina.com.cn 滚动新闻
+- 华尔街见闻: 保持不变 (正常工作)
 """
 
-import sys
+import requests
 import json
 import re
-import argparse
-from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional, List
+import uuid
+from datetime import datetime
+from typing import List, Dict, Any
 
-import requests
-from bs4 import BeautifulSoup
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+}
 
-# ─── 复用 search.py 的数据模型 ──────────────────────────
-from app.services.search import SearchResult, SearchResponse
+
+def fetch_eastmoney_news(category="财经", max_items=20):
+    """
+    东方财富财经新闻
+    优先: 7x24 快讯 JSON API (需 req_trace)
+    备用: newsapi JSONP 接口
+    """
+    # ── 主接口: 7x24 快讯 ──
+    url = "https://np-listapi.eastmoney.com/comm/web/getNewsByColumns"
+    params = {
+        "client": "web",
+        "biz": "web_724",
+        "column": "724",
+        "order": "1",
+        "needInteractData": "0",
+        "page_index": "1",
+        "page_size": str(max_items),
+        "req_trace": str(uuid.uuid4()),
+    }
+    try:
+        resp = requests.get(url, params=params, headers=HEADERS, timeout=10)
+        data = resp.json()
+        items = data.get("data", {}).get("list", [])
+        if items:
+            results = []
+            for i in items:
+                title = i.get("title", "") or i.get("summary", "")
+                if title:
+                    results.append({
+                        "title": title.strip(),
+                        "url": i.get("url", "") or i.get("uniqueUrl", ""),
+                        "time": i.get("showTime", ""),
+                        "source": i.get("mediaName", "东方财富"),
+                    })
+            return results[:max_items]
+    except Exception:
+        pass
+
+    # ── 备用: newsapi JSONP ──
+    url2 = "https://newsapi.eastmoney.com/kuaixun/v1/getlist_102_ajaxResult_50_1_.html"
+    try:
+        resp = requests.get(url2, headers=HEADERS, timeout=10)
+        text = resp.text
+        # var ajaxResult={...}
+        match = re.search(r'var\s+\w+=\s*(\{.*\})', text, re.DOTALL)
+        if match:
+            data = json.loads(match.group(1))
+            items = data.get("LivesList", [])
+            results = []
+            for i in items[:max_items]:
+                title = i.get("title", "") or i.get("digest", "")
+                if title:
+                    results.append({
+                        "title": title.strip(),
+                        "url": i.get("url_w", "") or i.get("url_m", ""),
+                        "time": i.get("showtime", ""),
+                        "source": "东方财富",
+                    })
+            return results
+    except Exception:
+        pass
+
+    return []
+
+
+def fetch_sina_finance_news(max_items=20):
+    """
+    新浪财经新闻
+    接口: feed.mix.sina.com.cn 滚动新闻 API
+    注意: 该 API 有频率限制, 部分 lid 会返回 403, 自动尝试备用 lid
+    """
+    url = "https://feed.mix.sina.com.cn/api/roll/get"
+    # 2516=财经综合, 2509=股票, 2511=国际, 2519=7x24
+    lids = ["2516", "2509", "2511", "2519"]
+    for lid in lids:
+        params = {
+            "pageid": "153",
+            "lid": lid,
+            "k": "",
+            "num": str(max_items),
+            "page": "1",
+        }
+        try:
+            resp = requests.get(url, params=params, headers=HEADERS, timeout=10)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            items = data.get("result", {}).get("data", [])
+            if not items:
+                continue
+            results = []
+            for item in items[:max_items]:
+                title = item.get("title", "").strip()
+                if not title:
+                    continue
+                ctime = item.get("ctime", "")
+                try:
+                    time_str = datetime.fromtimestamp(int(ctime)).strftime("%Y-%m-%d %H:%M") if ctime else ""
+                except (ValueError, TypeError):
+                    time_str = str(ctime)
+                results.append({
+                    "title": title,
+                    "url": item.get("url", ""),
+                    "time": time_str,
+                    "source": "新浪财经",
+                })
+            if results:
+                return results
+        except Exception:
+            continue
+    return []
+
+
+def fetch_cls_news(max_items=20):
+    """
+    财联社电报
+    接口: updateTelegraphList (稳定, 无需签名)
+    注意: content 字段现在是 str 类型, brief 有摘要, ctime 是 unix 时间戳
+    """
+    url = "https://www.cls.cn/nodeapi/updateTelegraphList"
+    params = {"app": "CailianpressWeb", "os": "web", "sv": "7.7.5", "rn": str(max_items)}
+    try:
+        resp = requests.get(url, params=params, headers=HEADERS, timeout=10)
+        data = resp.json()
+        items = data.get("data", {}).get("roll_data", [])
+        news = []
+        for item in items:
+            # brief 是摘要文本, content 现在是 str (非 list)
+            brief = item.get("brief", "")
+            if not brief:
+                # 兜底: 尝试从 content 字段取
+                content = item.get("content", "")
+                if isinstance(content, str):
+                    brief = content
+                elif isinstance(content, list):
+                    # 兼容旧格式
+                    for c in content:
+                        brief = c.get("brief", c.get("title", ""))
+                        if brief:
+                            break
+            if not brief:
+                continue
+
+            ctime = item.get("ctime", 0)
+            try:
+                time_str = datetime.fromtimestamp(int(ctime)).strftime("%H:%M") if ctime else ""
+            except (ValueError, TypeError):
+                time_str = ""
+
+            news.append({
+                "title": brief.strip(),
+                "time": time_str,
+                "source": "财联社",
+            })
+        return news[:max_items]
+    except Exception as e:
+        return [{"error": str(e)}]
+
+
+def fetch_wallstreetcn_news(max_items=20):
+    """华尔街见闻快讯 (公开 API) — 无需修改, 原样工作"""
+    url = "https://api-one-wscn.awtmt.com/apiv1/content/lives"
+    params = {"channel": "global-channel", "limit": max_items}
+    try:
+        resp = requests.get(url, params=params, headers=HEADERS, timeout=10)
+        data = resp.json()
+        items = data.get("data", {}).get("items", [])
+        results = []
+        for item in items:
+            title = item.get("content_text", "") or item.get("content_plain", "") or item.get("title", "")
+            if not title:
+                continue
+            display_time = item.get("display_time", 0)
+            try:
+                time_str = datetime.fromtimestamp(int(display_time)).strftime("%H:%M") if display_time else ""
+            except (ValueError, TypeError, OSError):
+                time_str = ""
+            results.append({
+                "title": title.strip(),
+                "time": time_str,
+                "source": "华尔街见闻",
+            })
+        return results
+    except Exception as e:
+        return [{"error": str(e)}]
+
+
+def fetch_akshare_news(max_items=20):
+    """AKShare 财经新闻 (降级备选) — 兼容新旧列结构"""
+    try:
+        import akshare as ak
+        df = ak.stock_news_em(symbol="财经")
+        news = []
+        for _, row in df.head(max_items).iterrows():
+            # 新版列: 0=关键词, 1=新闻标题, 2=新闻内容, 3=发布时间, 4=文章来源, 5=新闻链接
+            title = str(row.get('新闻标题', row.iloc[1] if len(row) > 1 else ''))
+            time_str = str(row.get('发布时间', row.iloc[3] if len(row) > 3 else ''))
+            url = str(row.get('新闻链接', row.iloc[5] if len(row) > 5 else ''))
+            if title and title not in ('财经', 'None', ''):
+                news.append({"title": title, "time": time_str, "url": url, "source": "AKShare-东方财富"})
+        return news
+    except Exception as e:
+        return [{"error": f"akshare: {e}"}]
+
+
+def fetch_all_news(max_per_source=10):
+    """
+    聚合所有新闻源 (供 news.py 调用)
+    返回 dict 列表: [{"title", "url", "source", "time"}, ...]
+    """
+    import time
+    import logging
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    logger = logging.getLogger(__name__)
+    logger.info(f"[cn_news] 开始抓取, max_per_source={max_per_source}")
+
+    sources = [
+        ("财联社", lambda: fetch_cls_news(max_items=max_per_source)),
+        ("华尔街见闻", lambda: fetch_wallstreetcn_news(max_items=max_per_source)),
+        ("东方财富", lambda: fetch_eastmoney_news(max_items=max_per_source)),
+        ("新浪财经", lambda: fetch_sina_finance_news(max_items=max_per_source)),
+        ("AKShare", lambda: fetch_akshare_news(max_items=max_per_source)),
+    ]
+
+    t0 = time.time()
+    all_news = []
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(fn): name for name, fn in sources}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                items = future.result(timeout=15)
+                valid = [i for i in items if isinstance(i, dict) and "error" not in i]
+                all_news.extend(valid)
+                logger.info(f"[cn_news] {name}: {len(valid)} 条")
+            except Exception as e:
+                logger.warning(f"[cn_news] {name} 异常: {e}")
+
+    elapsed = time.time() - t0
+    logger.info(f"[cn_news] 完成, 共 {len(all_news)} 条, 耗时 {elapsed:.2f}s")
+    return all_news
+
 
 # ─── 配置 ───────────────────────────────────────────────
 _USER_AGENTS = [
@@ -431,121 +656,45 @@ def _fetch_ifeng(code: str, days: int, name: str = "") -> List[SearchResult]:
         print(f"  [凤凰财经] 异常: {e}", file=sys.stderr)
     return items
 
-
-# ═══════════════════════════════════════════════════════════
-# 对外主接口
-# ═══════════════════════════════════════════════════════════
-ALL_FETCHERS = {
-    "eastmoney": _fetch_eastmoney,
-    "sina": _fetch_sina,
-    "sina7x24": _fetch_sina7x24,
-    "qq": _fetch_qq,
-    "ifeng": _fetch_ifeng,
-}
-
-
-def fetch_stock_news(
-    stock_code: str,
-    days: int = 3,
-    stock_name: str = "",
-    sources: list = None,
-    max_results: int = 0,
-) -> SearchResponse:
-    """
-    A股个股新闻聚合 → SearchResponse
-
-    Args:
-        stock_code: 6位股票代码
-        days: 有效天数
-        stock_name: 股票名称 (可选, 不传则自动查询)
-        sources: 指定数据源列表, None=全部
-        max_results: 限制返回条数, 0=不限
-
-    Returns:
-        SearchResponse (metadata 不含评分, 由上层 news_analysis 负责)
-    """
-    import time as _time
-    t0 = _time.time()
-
-    # 解析代码/名称
-    if not stock_name:
-        stock_name = _get_stock_name(stock_code)
-    query = f"{stock_code} {stock_name}"
-
-    fetchers = {k: v for k, v in ALL_FETCHERS.items() if k in (sources or ALL_FETCHERS)}
-
-    if not fetchers:
-        return SearchResponse(
-            query=query, results=[], provider="StockNews",
-            success=False, search_time=0, metadata={},
-            error_message="无可用数据源",
-        )
-
-    # 并发抓取
-    all_results: List[SearchResult] = []
-    with ThreadPoolExecutor(max_workers=len(fetchers)) as pool:
-        futures = {pool.submit(fn, stock_code, days, stock_name): name
-                   for name, fn in fetchers.items()}
-        for future in as_completed(futures):
-            name = futures[future]
-            try:
-                all_results.extend(future.result())
-            except Exception:
-                pass
-
-    # 按时间降序
-    all_results.sort(key=lambda r: r.published_date or "", reverse=True)
-
-    if max_results > 0:
-        all_results = all_results[:max_results]
-
-    return SearchResponse(
-        query=query,
-        results=all_results,
-        provider="StockNews",
-        success=len(all_results) > 0,
-        search_time=round(_time.time() - t0, 2),
-        metadata={},
-    )
-
-
-# ═══════════════════════════════════════════════════════════
-# CLI
-# ═══════════════════════════════════════════════════════════
-
-
-def main():
-    parser = argparse.ArgumentParser(description="A股个股多渠道新闻聚合工具")
-    parser.add_argument("code", help="股票代码或名称")
-    parser.add_argument("days", type=int, nargs="?", default=3, help="有效天数 (默认 3)")
-    parser.add_argument("--top", type=int, default=0, help="只输出前 N 条")
-    parser.add_argument("--json-only", action="store_true", help="只输出 JSON")
-    parser.add_argument("--sources", nargs="+",
-                        choices=list(ALL_FETCHERS.keys()), default=None)
-    args = parser.parse_args()
-
-    resp = fetch_stock_news(args.code.strip(), args.days, sources=args.sources)
-
-    if args.top > 0:
-        resp.results = resp.results[:args.top]
-
-    output = {
-        "query": resp.query,
-        "provider": resp.provider,
-        "success": resp.success,
-        "search_time": resp.search_time,
-        "news": [r.to_dict() for r in resp.results],
-    }
-
-    if args.json_only:
-        print(json.dumps(output, ensure_ascii=False, indent=2))
-    else:
-        for i, r in enumerate(resp.results, 1):
-            print(f"  {i:>3}. [{r.source}] {r.title}")
-            if r.snippet and r.snippet != r.title:
-                print(f"      📝 {r.snippet[:120]}")
-        print(f"\n  共 {len(resp.results)} 条, 耗时 {resp.search_time}s")
-
+# ═══════════════════════════════════════════════════
+#  测试
+# ═══════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    main()
+    import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    print(f"\n{'='*60}")
+    print(f"  📰 新闻抓取测试 — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"{'='*60}\n")
+
+    sources = [
+        ("财联社", fetch_cls_news),
+        ("华尔街见闻", fetch_wallstreetcn_news),
+        ("东方财富", fetch_eastmoney_news),
+        ("新浪财经", fetch_sina_finance_news),
+        ("AKShare", fetch_akshare_news),
+    ]
+
+    # ── 并行抓取 ──
+    def _fetch(name, fn, max_items=5):
+        try:
+            items = fn(max_items=max_items)
+            valid = [i for i in items if "error" not in i]
+            return name, valid
+        except Exception:
+            return name, []
+
+    t0 = time.perf_counter()
+    all_news = []
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(_fetch, n, f): n for n, f in sources}
+        for future in as_completed(futures):
+            name, items = future.result()
+            all_news.extend(items)
+            print(f"  ✅ {name}: {len(items)} 条")
+            for i, item in enumerate(items[:3], 1):
+                print(f"     {i}. {item.get('title', '')[:60]}")
+
+    elapsed = time.perf_counter() - t0
+    print(f"\n  共 {len(all_news)} 条新闻 | 耗时 {elapsed:.2f}s (并行)")

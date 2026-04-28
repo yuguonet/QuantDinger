@@ -32,7 +32,7 @@ from urllib.parse import urlparse
 
 from app.utils.logger import get_logger
 from app.utils.config_loader import load_addon_config
-from app.services.cn_news_provider import (
+from app.services.news_provider import (
     fetch_cls_news,
     fetch_wallstreetcn_news,
     fetch_eastmoney_news,
@@ -597,7 +597,7 @@ class DuckDuckGoSearchProvider(BaseSearchProvider):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 财经新闻 Providers (从 cn_news_provider 整合)
+# 财经新闻 Providers (从 news_provider 整合)
 # ═══════════════════════════════════════════════════════════════
 
 class _BaseNewsProvider(BaseSearchProvider):
