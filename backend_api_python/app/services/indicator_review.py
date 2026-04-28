@@ -591,7 +591,7 @@ def _search_stock_news_sentiment(symbol: str, name: str = "", _cancelled: List[b
     返回:
       {
         "has_news": bool,              # 是否找到相关新闻
-        "composite_score": float,      # 综合评分 (0-10)，5.0=中性
+        "composite_score": float,      # 综合评分 (-5 ~ +5)，0=中性
         "direction": str,              # 利好/偏利好/中性/偏利空/利空
         "news_count": int,             # 新闻条数
         "error": str | None,           # 搜索失败原因
@@ -605,7 +605,7 @@ def _search_stock_news_sentiment(symbol: str, name: str = "", _cancelled: List[b
     cancelled = _cancelled or [False]
     result = {
         "has_news": False,
-        "composite_score": 5.0,  # 默认中性
+        "composite_score": 0.0,  # 默认中性
         "direction": "中性",
         "news_count": 0,
         "error": None,
@@ -668,7 +668,7 @@ def _search_stock_news_sentiment(symbol: str, name: str = "", _cancelled: List[b
         direction = metadata.get("direction")
 
         if composite_score is not None:
-            result["composite_score"] = _safe_float(composite_score) or 5.0
+            result["composite_score"] = _safe_float(composite_score) or 0.0
         if direction:
             result["direction"] = direction
 
@@ -1049,13 +1049,13 @@ def review_stocks(
 
             # ── Step 4: 新闻情感判断 ──
             if news_result is None:
-                news_result = {"has_news": False, "composite_score": 5.0, "direction": "中性", "news_count": 0, "error": "并行执行未返回"}
+                news_result = {"has_news": False, "composite_score": 0.0, "direction": "中性", "news_count": 0, "error": "并行执行未返回"}
 
             logger.info(f"[review] {idx+1}/{total} {symbol} news: has_news={news_result.get('has_news')} direction={news_result.get('direction')} score={news_result.get('composite_score')}")
 
             if news_result.get("has_news"):
                 direction = news_result.get("direction", "中性")
-                score = news_result.get("composite_score", 5.0)
+                score = news_result.get("composite_score", 0.0)
 
                 if direction in ("利空", "偏利空") and score <= 0:
                     yield _sse({

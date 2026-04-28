@@ -79,7 +79,7 @@ class SearchResult:
     source: str  # 来源网站
     published_date: Optional[str] = None
     sentiment: str = 'neutral'  # 情绪标签
-    sentiment_score: Optional[float] = None  # 数值评分 0-10, -999=一票否决
+    sentiment_score: Optional[float] = None  # 数值评分 -10 ~ +10, -999=一票否决
 
     def to_text(self) -> str:
         """转换为文本格式"""
@@ -104,7 +104,7 @@ class SearchResponse:
     """搜索响应
 
     metadata 附加字段 (由 StockNews 等 provider 填充):
-      - composite_score: float  综合评分 0-10 (时间衰减加权)
+      - composite_score: float  综合评分 -5 ~ +5 (RMS聚合+时间衰减, 0=中性)
       - direction: str          利好/偏利好/中性/偏利空/利空/重大利空
       - positive/negative/neutral: int  情绪分布计数
       - veto: bool              是否触发一票否决

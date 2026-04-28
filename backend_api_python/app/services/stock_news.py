@@ -152,7 +152,9 @@ def _clean_html(text: str) -> str:
 
 
 def _analyze_sentiment(title: str, summary: str = "") -> tuple:
-    """加权情感评分 0-10, 返回 (label, score, keywords)"""
+    """加权情感评分 -10 ~ +10, 返回 (label, score, keywords)
+    0 = 中性, 正 = 利好, 负 = 利空
+    """
     text = f"{title} {summary}"
     pos_weight, neg_weight = 0, 0
     hits = []
@@ -168,16 +170,17 @@ def _analyze_sentiment(title: str, summary: str = "") -> tuple:
 
     total = pos_weight + neg_weight
     if total == 0:
-        return "neutral", 5.0, []
+        return "neutral", 0.0, []
 
-    raw = (pos_weight - neg_weight) / total
+    raw = (pos_weight - neg_weight) / total  # ∈ [-1, +1]
     confidence = min(total / 6, 1.0)
-    score = round(raw * 5 * confidence + 5, 1)
-    score = max(0.0, min(10.0, score))
+    # 映射到 -10 ~ +10
+    score = round(raw * 10.0 * confidence, 1)
+    score = max(-10.0, min(10.0, score))
 
-    if score >= 7:
+    if score > 1.0:
         label = "positive"
-    elif score <= 3:
+    elif score < -1.0:
         label = "negative"
     else:
         label = "neutral"
@@ -527,52 +530,79 @@ def _fetch_ifeng(code: str, days: int, name: str = "") -> List[SearchResult]:
 
 
 # ═══════════════════════════════════════════════════════════
-# 综合评分 (时间衰减)
+# 综合评分 (RMS 聚合 + 非对称时间衰减)
 # ═══════════════════════════════════════════════════════════
-DECAY_PER_DAY = 0.8
+import math
+
+# 衰减参数: 好消息 10 天半衰期, 坏消息 15 天半衰期
+GOOD_HALF_LIFE_HOURS = 10.0 * 24  # 240 小时
+BAD_HALF_LIFE_HOURS  = 15.0 * 24  # 360 小时
 
 
-def _time_decay(hours_old: float) -> float:
-    return DECAY_PER_DAY ** (hours_old / 24)
+def _time_decay(hours_old: float, is_negative: bool) -> float:
+    """指数衰减: weight = 0.5^(t / half_life)"""
+    half_life = BAD_HALF_LIFE_HOURS if is_negative else GOOD_HALF_LIFE_HOURS
+    return math.pow(0.5, hours_old / half_life)
 
 
 def _calc_composite(results: List[SearchResult]) -> dict:
-    """基于时间衰减的综合评分"""
+    """基于 RMS + 非对称时间衰减的综合评分 (-5 ~ +5)"""
     now = datetime.now()
-    total_weighted = 0.0
-    total_weight = 0.0
+    pos_weighted: List[float] = []
+    neg_weighted: List[float] = []
     pos = neg = neu = 0
 
     for r in results:
-        if not r.published_date:
-            continue
-        pub = datetime.fromisoformat(r.published_date)
-        hours = (now - pub).total_seconds() / 3600
-        decay = _time_decay(hours)
-        boost = 1.5 if r.sentiment != "neutral" else 1.0
-        weight = decay * boost
+        score = r.sentiment_score  # 已经是 -10 ~ +10
+        if score is None:
+            score = 0.0  # 无评分视为中性
 
-        score = {"positive": 7.5, "negative": 2.5, "neutral": 5.0}.get(r.sentiment, 5.0)
-        total_weighted += score * weight
-        total_weight += weight
+        # 计算时间衰减
+        hours_old = 0.0
+        if r.published_date:
+            try:
+                pub = datetime.fromisoformat(r.published_date)
+                hours_old = max(0.0, (now - pub).total_seconds() / 3600.0)
+            except (ValueError, TypeError):
+                pass
 
-        if r.sentiment == "positive":
+        is_neg = score < 0
+        decay = _time_decay(hours_old, is_neg)
+        weighted = score * decay
+
+        if weighted > 0.01:
+            pos_weighted.append(weighted)
             pos += 1
-        elif r.sentiment == "negative":
+        elif weighted < -0.01:
+            neg_weighted.append(abs(weighted))
             neg += 1
         else:
             neu += 1
 
-    composite = round(total_weighted / total_weight, 1) if total_weight > 0 else 5.0
-    composite = max(0.0, min(10.0, composite))
+    # 加权 RMS 聚合 (quartic weighting): 强信号自权重极高, 中性不稀释
+    def _weighted_rms(values: List[float]) -> float:
+        if not values:
+            return 0.0
+        weights = [abs(v) ** 4 for v in values]
+        total_weight = sum(weights)
+        if total_weight == 0:
+            return 0.0
+        return math.sqrt(sum(v * v * w for v, w in zip(values, weights)) / total_weight)
 
-    if composite >= 7:
+    pos_rms = _weighted_rms(pos_weighted)
+    neg_rms = _weighted_rms(neg_weighted)
+
+    # 合成: raw ∈ [-10, +10] → composite ∈ [-5, +5]
+    raw = pos_rms - neg_rms
+    composite = round(max(-5.0, min(5.0, raw * 0.5)), 1)
+
+    if composite >= 3.0:
         direction = "利好"
-    elif composite <= 3:
-        direction = "利空"
-    elif composite >= 6:
+    elif composite >= 1.0:
         direction = "偏利好"
-    elif composite <= 4:
+    elif composite <= -3.0:
+        direction = "利空"
+    elif composite <= -1.0:
         direction = "偏利空"
     else:
         direction = "中性"
@@ -718,11 +748,11 @@ def main():
     if args.json_only:
         print(json.dumps(output, ensure_ascii=False, indent=2))
     else:
-        sc = output.get("composite_score", 5)
+        sc = output.get("composite_score", 0)
         direction = output.get("direction", "中性")
-        icon = "🟢" if sc >= 6 else ("🔴" if sc <= 4 else "⚪")
-        bars = "█" * max(1, int(abs(sc - 5) * 2))
-        print(f"\n  {icon} 综合评分: {bars} {sc}/10  [{direction}]  "
+        icon = "🟢" if sc >= 1 else ("🔴" if sc <= -1 else "⚪")
+        bars = "█" * max(1, int(abs(sc) * 2))
+        print(f"\n  {icon} 综合评分: {bars} {sc:+.1f}/5  [{direction}]  "
               f"利好{output.get('positive',0)} 利空{output.get('negative',0)} 中性{output.get('neutral',0)}")
         for i, r in enumerate(resp.results, 1):
             ri = _SENTIMENT_ICONS.get(r.sentiment, "⚪")
