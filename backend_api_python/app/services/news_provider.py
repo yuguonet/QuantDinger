@@ -14,13 +14,18 @@ v2.2 修复:
 import requests
 import json
 import re
+import sys
 import uuid
-from datetime import datetime
-from typing import List, Dict, Any
+import time
+import random as _random
+import threading as _threading
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-}
+from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 def fetch_eastmoney_news(category="财经", max_items=20):
@@ -232,9 +237,7 @@ def fetch_all_news(max_per_source=10):
     聚合所有新闻源 (供 news.py 调用)
     返回 dict 列表: [{"title", "url", "source", "time"}, ...]
     """
-    import time
     import logging
-    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     logger = logging.getLogger(__name__)
     logger.info(f"[cn_news] 开始抓取, max_per_source={max_per_source}")
@@ -285,11 +288,6 @@ TIMEOUT = 12
 MAX_NEWS = 30
 
 # Reusable session with retry logic
-import random as _random
-import threading as _threading
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
 _session = None
 _session_lock = _threading.Lock()
 
@@ -392,9 +390,9 @@ def _resolve_code(input_str: str) -> tuple:
 
 
 # ═══════════════════════════════════════════════════════════
-# 数据源 1: 东方财富 — 公告 + 新闻
+# 数据源 1: 东方财富 — 公告 + 新闻 (个股)
 # ═══════════════════════════════════════════════════════════
-def _fetch_eastmoney(code: str, days: int, name: str = "") -> List[SearchResult]:
+def _fetch_eastmoney(code: str, days: int, name: str = "") -> List[Dict[str, Any]]:
     items = []
     cutoff = datetime.now() - timedelta(days=days)
     keywords = list(set([code, name])) if name else [code]
@@ -416,11 +414,12 @@ def _fetch_eastmoney(code: str, days: int, name: str = "") -> List[SearchResult]
                     continue
                 art_code = art.get("art_code", "")
                 art_url = f"https://data.eastmoney.com/notices/detail/{code}/{art_code}.html"
-                summary = _summarize(title)
-                items.append(SearchResult(
-                    title=title, snippet=summary, url=art_url,
-                    source="东方财富公告", published_date=pub_time.isoformat(),
-                    sentiment="neutral", sentiment_score=0.0))
+                items.append({
+                    "title": title,
+                    "url": art_url,
+                    "time": pub_time.strftime("%Y-%m-%d %H:%M"),
+                    "source": "东方财富公告",
+                })
     except Exception as e:
         print(f"  [东方财富公告] 异常: {e}", file=sys.stderr)
 
@@ -442,12 +441,10 @@ def _fetch_eastmoney(code: str, days: int, name: str = "") -> List[SearchResult]
             )
             resp = sess.get(search_url, headers=_rotating_headers(), timeout=TIMEOUT)
             resp.encoding = "utf-8"
-            # 提取 JSONP 中的 JSON 部分: 找到第一个 { 对应的完整 JSON
             text = resp.text
             start = text.find('{')
             if start < 0:
                 continue
-            # 从第一个 { 开始, 用括号计数找到匹配的 }
             depth = 0
             end = -1
             for i in range(start, len(text)):
@@ -477,12 +474,12 @@ def _fetch_eastmoney(code: str, days: int, name: str = "") -> List[SearchResult]
                 url_link = art.get("url", "")
                 if url_link and not url_link.startswith("http"):
                     url_link = "https:" + url_link
-                content = art.get("content", "")
-                summary = _summarize(title, abstract=content)
-                items.append(SearchResult(
-                    title=title, snippet=summary, url=url_link,
-                    source="东方财富新闻", published_date=pub_time.isoformat(),
-                    sentiment="neutral", sentiment_score=0.0))
+                items.append({
+                    "title": title,
+                    "url": url_link,
+                    "time": pub_time.strftime("%Y-%m-%d %H:%M"),
+                    "source": "东方财富新闻",
+                })
         except Exception as e:
             print(f"  [东方财富新闻/{kw}] 异常: {e}", file=sys.stderr)
 
@@ -490,14 +487,13 @@ def _fetch_eastmoney(code: str, days: int, name: str = "") -> List[SearchResult]
 
 
 # ═══════════════════════════════════════════════════════════
-# 数据源 2: 新浪财经
+# 数据源 2: 新浪财经 (个股)
 # ═══════════════════════════════════════════════════════════
-def _fetch_sina(code: str, days: int, name: str = "") -> List[SearchResult]:
+def _fetch_sina(code: str, days: int, name: str = "") -> List[Dict[str, Any]]:
     items = []
     cutoff = datetime.now() - timedelta(days=days)
     sess = _get_session()
     try:
-        # 沪市: 600/601/603/605/688/689, 深市: 000/001/002/003/300/301
         market = "sh" if code[:3] in ("600", "601", "603", "605", "688", "689") else "sz"
         url = f"https://finance.sina.com.cn/realstock/company/{market}{code}/news.shtml"
         resp = sess.get(url, headers=_rotating_headers(), timeout=TIMEOUT)
@@ -524,20 +520,21 @@ def _fetch_sina(code: str, days: int, name: str = "") -> List[SearchResult]:
             if not pub_time or pub_time < cutoff:
                 continue
 
-            summary = _summarize(title)
-            items.append(SearchResult(
-                title=title, snippet=summary, url=href,
-                source="新浪财经", published_date=pub_time.isoformat(),
-                sentiment="neutral", sentiment_score=0.0))
+            items.append({
+                "title": title,
+                "url": href,
+                "time": pub_time.strftime("%Y-%m-%d %H:%M"),
+                "source": "新浪财经",
+            })
     except Exception as e:
         print(f"  [新浪财经] 异常: {e}", file=sys.stderr)
     return items
 
 
 # ═══════════════════════════════════════════════════════════
-# 数据源 3: 新浪 7x24 财经快讯
+# 数据源 3: 新浪 7x24 财经快讯 (个股)
 # ═══════════════════════════════════════════════════════════
-def _fetch_sina7x24(code: str, days: int, name: str = "") -> List[SearchResult]:
+def _fetch_sina7x24(code: str, days: int, name: str = "") -> List[Dict[str, Any]]:
     items = []
     cutoff = datetime.now() - timedelta(days=days)
     search_terms = [code]
@@ -561,21 +558,21 @@ def _fetch_sina7x24(code: str, days: int, name: str = "") -> List[SearchResult]:
             if not pub_time or pub_time < cutoff:
                 continue
 
-            summary = _summarize(title, content)
-            items.append(SearchResult(
-                title=title[:80], snippet=summary,
-                url=f"https://zhibo.sina.com.cn/152/{item_data.get('id', '')}.html",
-                source="新浪7x24", published_date=pub_time.isoformat(),
-                sentiment="neutral", sentiment_score=0.0))
+            items.append({
+                "title": title[:80],
+                "url": f"https://zhibo.sina.com.cn/152/{item_data.get('id', '')}.html",
+                "time": pub_time.strftime("%Y-%m-%d %H:%M"),
+                "source": "新浪7x24",
+            })
     except Exception as e:
         print(f"  [新浪7x24] 异常: {e}", file=sys.stderr)
     return items
 
 
 # ═══════════════════════════════════════════════════════════
-# 数据源 4: 腾讯财经
+# 数据源 4: 腾讯财经 (个股)
 # ═══════════════════════════════════════════════════════════
-def _fetch_qq(code: str, days: int, name: str = "") -> List[SearchResult]:
+def _fetch_qq(code: str, days: int, name: str = "") -> List[Dict[str, Any]]:
     items = []
     cutoff = datetime.now() - timedelta(days=days)
     sess = _get_session()
@@ -608,20 +605,21 @@ def _fetch_qq(code: str, days: int, name: str = "") -> List[SearchResult]:
             art_url = item.get("url", "") or item.get("article_url", "")
             if art_url and not art_url.startswith("http"):
                 art_url = "https:" + art_url
-            summary = _summarize(title, item.get("brief", "") or item.get("abstract", ""))
-            items.append(SearchResult(
-                title=title, snippet=summary, url=art_url,
-                source="腾讯财经", published_date=pub_time.isoformat(),
-                sentiment="neutral", sentiment_score=0.0))
+            items.append({
+                "title": title,
+                "url": art_url,
+                "time": pub_time.strftime("%Y-%m-%d %H:%M"),
+                "source": "腾讯财经",
+            })
     except Exception as e:
         print(f"  [腾讯财经] 异常: {e}", file=sys.stderr)
     return items
 
 
 # ═══════════════════════════════════════════════════════════
-# 数据源 5: 凤凰财经
+# 数据源 5: 凤凰财经 (个股)
 # ═══════════════════════════════════════════════════════════
-def _fetch_ifeng(code: str, days: int, name: str = "") -> List[SearchResult]:
+def _fetch_ifeng(code: str, days: int, name: str = "") -> List[Dict[str, Any]]:
     items = []
     cutoff = datetime.now() - timedelta(days=days)
     sess = _get_session()
@@ -647,14 +645,149 @@ def _fetch_ifeng(code: str, days: int, name: str = "") -> List[SearchResult]:
             art_url = item.get("url", "") or item.get("articleUrl", "")
             if art_url and not art_url.startswith("http"):
                 art_url = "https:" + art_url
-            summary = _summarize(title, item.get("brief", item.get("digest", "")))
-            items.append(SearchResult(
-                title=title, snippet=summary, url=art_url,
-                source="凤凰财经", published_date=pub_time.isoformat(),
-                sentiment="neutral", sentiment_score=0.0))
+            items.append({
+                "title": title,
+                "url": art_url,
+                "time": pub_time.strftime("%Y-%m-%d %H:%M"),
+                "source": "凤凰财经",
+            })
     except Exception as e:
         print(f"  [凤凰财经] 异常: {e}", file=sys.stderr)
     return items
+
+
+# ═══════════════════════════════════════════════════════════════
+# 公开接口 — 统一命名 + 聚合函数
+# ═══════════════════════════════════════════════════════════════
+#
+# 所有函数统一返回: [{"title", "url", "time", "source"}, ...]
+#
+# 市场源: fetch_xxx_market(max_items=20)
+# 个股源: fetch_xxx_stock(code, days=3, name="")
+#
+
+# ── 市场新闻公开接口 ─────────────────────────────────────
+def fetch_cls_market(max_items: int = 20, days: int = 1) -> List[Dict[str, Any]]:
+    """财联社电报 (市场)"""
+    return fetch_cls_news(max_items=max_items)
+
+
+def fetch_wallstreetcn_market(max_items: int = 20, days: int = 1) -> List[Dict[str, Any]]:
+    """华尔街见闻快讯 (市场)"""
+    return fetch_wallstreetcn_news(max_items=max_items)
+
+
+def fetch_eastmoney_market(max_items: int = 20, days: int = 1) -> List[Dict[str, Any]]:
+    """东方财富财经新闻 (市场)"""
+    return fetch_eastmoney_news(max_items=max_items)
+
+
+def fetch_sina_market(max_items: int = 20, days: int = 1) -> List[Dict[str, Any]]:
+    """新浪财经新闻 (市场)"""
+    return fetch_sina_finance_news(max_items=max_items)
+
+
+def fetch_akshare_market(max_items: int = 20, days: int = 1) -> List[Dict[str, Any]]:
+    """AKShare 财经新闻 (市场)"""
+    return fetch_akshare_news(max_items=max_items)
+
+
+# ── 个股新闻公开接口 ─────────────────────────────────────
+def fetch_eastmoney_stock(code: str, days: int = 3, name: str = "") -> List[Dict[str, Any]]:
+    """东方财富 公告+新闻 (个股)"""
+    return _fetch_eastmoney(code, days, name)
+
+
+def fetch_sina_stock(code: str, days: int = 3, name: str = "") -> List[Dict[str, Any]]:
+    """新浪财经个股页"""
+    return _fetch_sina(code, days, name)
+
+
+def fetch_sina7x24_stock(code: str, days: int = 3, name: str = "") -> List[Dict[str, Any]]:
+    """新浪7x24 快讯 (按个股关键词过滤)"""
+    return _fetch_sina7x24(code, days, name)
+
+
+def fetch_tencent_stock(code: str, days: int = 3, name: str = "") -> List[Dict[str, Any]]:
+    """腾讯财经个股新闻"""
+    return _fetch_qq(code, days, name)
+
+
+def fetch_ifeng_stock(code: str, days: int = 3, name: str = "") -> List[Dict[str, Any]]:
+    """凤凰财经个股新闻"""
+    return _fetch_ifeng(code, days, name)
+
+
+# ── 聚合函数 (并行抓取所有子源) ──────────────────────────
+def fetch_all_market_news(max_per_source: int = 10, days: int = 1) -> List[Dict[str, Any]]:
+    """
+    并行抓取所有市场新闻源
+    返回: [{"title", "url", "time", "source"}, ...]
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"[市场新闻] 开始并行抓取, max_per_source={max_per_source}, days={days}")
+
+    sources = [
+        ("财联社", lambda: fetch_cls_market(max_items=max_per_source, days=days)),
+        ("华尔街见闻", lambda: fetch_wallstreetcn_market(max_items=max_per_source, days=days)),
+        ("东方财富", lambda: fetch_eastmoney_market(max_items=max_per_source, days=days)),
+        ("新浪财经", lambda: fetch_sina_market(max_items=max_per_source, days=days)),
+        ("AKShare", lambda: fetch_akshare_market(max_items=max_per_source, days=days)),
+    ]
+
+    all_news = []
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(fn): name for name, fn in sources}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                items = future.result(timeout=15)
+                valid = [i for i in items if isinstance(i, dict) and "error" not in i and i.get("title")]
+                all_news.extend(valid)
+                logger.info(f"[市场新闻] {name}: {len(valid)} 条")
+            except Exception as e:
+                logger.warning(f"[市场新闻] {name} 异常: {e}")
+
+    logger.info(f"[市场新闻] 完成, 共 {len(all_news)} 条")
+    return all_news
+
+
+def fetch_all_stock_news(
+    code: str, days: int = 3, name: str = "",
+) -> List[Dict[str, Any]]:
+    """
+    并行抓取所有个股新闻源
+    返回: [{"title", "url", "time", "source"}, ...]
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"[个股新闻] 开始并行抓取: {code}({name}), days={days}")
+
+    sources = [
+        ("东方财富", lambda: fetch_eastmoney_stock(code, days, name)),
+        ("新浪财经", lambda: fetch_sina_stock(code, days, name)),
+        ("新浪7x24", lambda: fetch_sina7x24_stock(code, days, name)),
+        ("腾讯财经", lambda: fetch_tencent_stock(code, days, name)),
+        ("凤凰财经", lambda: fetch_ifeng_stock(code, days, name)),
+    ]
+
+    all_news = []
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(fn): name for name, fn in sources}
+        for future in as_completed(futures):
+            src_name = futures[future]
+            try:
+                items = future.result(timeout=15)
+                valid = [i for i in items if isinstance(i, dict) and "error" not in i and i.get("title")]
+                all_news.extend(valid)
+                logger.info(f"[个股新闻] {src_name}: {len(valid)} 条")
+            except Exception as e:
+                logger.warning(f"[个股新闻] {src_name} 异常: {e}")
+
+    logger.info(f"[个股新闻] 完成, {code} 共 {len(all_news)} 条")
+    return all_news
+
 
 # ═══════════════════════════════════════════════════
 #  测试

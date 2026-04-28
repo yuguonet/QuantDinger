@@ -22,6 +22,7 @@ Search service v2.3 - 搜索引擎调度器
 import requests
 import time
 import re
+import hashlib
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -33,11 +34,25 @@ from urllib.parse import urlparse
 from app.utils.logger import get_logger
 from app.utils.config_loader import load_addon_config
 from app.services.news_provider import (
+    # 旧接口 (向后兼容, search.py Provider 类使用)
     fetch_cls_news,
     fetch_wallstreetcn_news,
     fetch_eastmoney_news,
     fetch_sina_finance_news,
     fetch_akshare_news,
+    # 新统一接口 (调度层使用)
+    fetch_cls_market,
+    fetch_wallstreetcn_market,
+    fetch_eastmoney_market,
+    fetch_sina_market,
+    fetch_akshare_market,
+    fetch_eastmoney_stock,
+    fetch_sina_stock,
+    fetch_sina7x24_stock,
+    fetch_tencent_stock,
+    fetch_ifeng_stock,
+    fetch_all_market_news,
+    fetch_all_stock_news,
 )
 
 logger = get_logger(__name__)
@@ -902,6 +917,281 @@ class SearchService:
             success=len(all_results) > 0,
             error_message="; ".join(errors) if errors and not all_results else None,
             search_time=elapsed,
+        )
+
+    # ═══════════════════════════════════════════════════════════════
+    # 新闻调度入口 — 根据 symbol/market 类型自动选源
+    # ═══════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _classify_news_type(symbol: str, market: str) -> str:
+        """
+        判断新闻类型:
+          symbol == "POLICY"              → "policy"
+          symbol == market                → "market"
+          symbol 是股票代码               → "stock"
+        """
+        if symbol == "POLICY":
+            return "policy"
+        if symbol == market:
+            return "market"
+        return "stock"
+
+    @staticmethod
+    def _is_stock_code(symbol: str) -> bool:
+        """判断 symbol 是股票代码还是市场名"""
+        if not symbol:
+            return False
+        if symbol in ("CNStock", "USStock", "Crypto", "Forex", "HKStock", "Futures", "POLICY"):
+            return False
+        return True
+
+    def _dicts_to_results(self, items: List[Dict[str, Any]]) -> List[SearchResult]:
+        """将 news_provider 返回的 dict 列表转为 SearchResult 列表"""
+        results = []
+        for item in items:
+            if not isinstance(item, dict) or not item.get("title"):
+                continue
+            results.append(SearchResult(
+                title=_safe_encode(item.get("title", "")),
+                snippet=_safe_encode(item.get("title", "")),
+                url=_safe_encode(item.get("url", "")),
+                source=item.get("source", ""),
+                published_date=item.get("time", ""),
+            ))
+        return results
+
+    def _web_search_policy(self, market: str, days: int = 1, max_per_query: int = 5) -> List[SearchResult]:
+        """政策/宏观 Web 搜索 (按市场区分关键词)"""
+        queries_map = {
+            "CNStock": [
+                "国务院政策 最新", "宏观经济分析 GDP CPI PPI",
+                "央行货币政策 降准 降息 LPR", "财政政策 减税 专项债",
+                "产业政策 新能源 芯片 制造业", "经济数据 社融 M2 进出口",
+            ],
+            "USStock": [
+                "美联储货币政策 利率决议", "美国经济数据 非农 CPI GDP",
+                "美国财政政策 减税 刺激计划", "美国贸易政策 关税 制裁",
+            ],
+            "Crypto": [
+                "加密货币监管政策 各国", "数字货币政策 央行数字货币",
+            ],
+            "Forex": [
+                "外汇政策 央行干预 汇率", "货币政策 利率决议 各国央行",
+            ],
+        }
+        queries = queries_map.get(market, queries_map["CNStock"])
+        all_results = []
+
+        def _search_one(query: str) -> List[SearchResult]:
+            try:
+                resp = self.search_with_fallback(query, max_per_query, days)
+                return resp.results if resp.success else []
+            except Exception:
+                return []
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            futures = {pool.submit(_search_one, q): q for q in queries}
+            for future in as_completed(futures):
+                try:
+                    all_results.extend(future.result())
+                except Exception:
+                    pass
+
+        # 按 URL 去重
+        seen = set()
+        deduped = []
+        for r in all_results:
+            key = r.url or r.title
+            if key and key not in seen:
+                seen.add(key)
+                deduped.append(r)
+        return deduped
+
+    def _web_search_market(self, market: str, days: int = 1, max_results: int = 5) -> List[SearchResult]:
+        """市场新闻 Web 搜索 (备选)"""
+        cn_map = {
+            "USStock": "美股市场新闻 股票",
+            "Crypto": "加密货币新闻 比特币",
+            "Forex": "外汇市场分析 汇率",
+            "CNStock": "A股市场 财经新闻 股票",
+        }
+        en_map = {
+            "USStock": "US stock market news today",
+            "Crypto": "cryptocurrency market news bitcoin",
+            "Forex": "forex market analysis news",
+            "CNStock": "China A-share stock market news",
+        }
+        cn_q = cn_map.get(market, f"{market} 市场新闻")
+        en_q = en_map.get(market, f"{market} market news")
+
+        all_results = []
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f1 = pool.submit(self.search_with_fallback, cn_q, max_results, days)
+            f2 = pool.submit(self.search_with_fallback, en_q, max_results, days)
+            for f in [f1, f2]:
+                try:
+                    resp = f.result()
+                    if resp.success:
+                        all_results.extend(resp.results)
+                except Exception:
+                    pass
+        return all_results
+
+    def _web_search_stock(
+        self, symbol: str, market: str, name: str = "",
+        days: int = 3, max_results: int = 5,
+    ) -> List[SearchResult]:
+        """个股新闻 Web 搜索 (备选)"""
+        cn_q = f"{name} {symbol} A股新闻" if name else f"{symbol} 股票新闻"
+        en_q = f"{name or symbol} stock news analysis"
+
+        all_results = []
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f1 = pool.submit(self.search_with_fallback, cn_q, max_results, days)
+            if market != "CNStock":
+                f2 = pool.submit(self.search_with_fallback, en_q, max_results, days)
+            else:
+                f2 = None
+            for f in [f1, f2]:
+                if f is None:
+                    continue
+                try:
+                    resp = f.result()
+                    if resp.success:
+                        all_results.extend(resp.results)
+                except Exception:
+                    pass
+        return all_results
+
+    def search_news_dispatch(
+        self,
+        symbol: str,
+        market: str = "CNStock",
+        lang: str = "all",
+        days: int = 3,
+        max_web_results: int = 5,
+        name: str = "",
+    ) -> SearchResponse:
+        """
+        新闻统一调度入口 — 根据 symbol/market 类型自动选择数据源组合
+
+        路由规则:
+          POLICY  → Web搜索(政策关键词, 必选) + 市场新闻源(5路, 并行)
+          市场新闻 → 市场新闻源(5路, 并行), 空则补充 Web搜索
+          个股新闻 → 个股新闻源(5路, 并行), 空则补充 Web搜索
+
+        Args:
+            symbol:  股票代码 ("600519", "AAPL") 或 市场名 ("CNStock") 或 "POLICY"
+            market:  市场标识
+            lang:    "cn"/"en"/"all" (仅影响 Web 搜索)
+            days:    搜索天数
+            max_web_results: Web 搜索最大条数
+            name:    股票名称 (仅个股)
+
+        Returns:
+            SearchResponse, metadata 含:
+              - news_type: "policy" / "market" / "stock"
+              - source_count: 新闻源条数
+              - web_results_added: Web 补充条数
+              - from_cache: False (缓存由上层 news.py 管理)
+        """
+        start_time = time.time()
+        news_type = self._classify_news_type(symbol, market)
+        source_results: List[SearchResult] = []
+        web_results: List[SearchResult] = []
+
+        if news_type == "policy":
+            # ── POLICY: Web必选 + 市场源并行 ──
+            logger.info(f"[调度] POLICY({market}): Web + 市场源并行, days={days}")
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                f_web = pool.submit(self._web_search_policy, market, days, max_web_results)
+                f_market = pool.submit(fetch_all_market_news, 10, days)
+                try:
+                    web_results = f_web.result(timeout=30)
+                except Exception as e:
+                    logger.warning(f"[调度] POLICY Web搜索异常: {e}")
+                try:
+                    market_dicts = f_market.result(timeout=20)
+                    source_results = self._dicts_to_results(market_dicts)
+                except Exception as e:
+                    logger.warning(f"[调度] POLICY 市场源异常: {e}")
+
+        elif news_type == "market":
+            # ── 市场新闻: 市场源优先, 空则 Web 补充 ──
+            logger.info(f"[调度] 市场新闻({market}): 市场源优先, days={days}")
+            try:
+                market_dicts = fetch_all_market_news(10, days)
+                source_results = self._dicts_to_results(market_dicts)
+            except Exception as e:
+                logger.warning(f"[调度] 市场源异常: {e}")
+
+            if not source_results:
+                logger.info(f"[调度] 市场源无结果, 补充 Web 搜索")
+                web_results = self._web_search_market(market, days, max_web_results)
+
+        else:
+            # ── 个股新闻: 个股源优先, 空则 Web 补充 ──
+            logger.info(f"[调度] 个股新闻({symbol}, {market}): 个股源优先, days={days}")
+            try:
+                stock_dicts = fetch_all_stock_news(symbol, days, name)
+                source_results = self._dicts_to_results(stock_dicts)
+            except Exception as e:
+                logger.warning(f"[调度] 个股源异常: {e}")
+
+            if not source_results:
+                logger.info(f"[调度] 个股源无结果, 补充 Web 搜索")
+                web_results = self._web_search_stock(symbol, market, name, days, max_web_results)
+
+        # ── 合并去重: 新闻源 > Web ──
+        seen: set = set()
+        merged: List[SearchResult] = []
+
+        def _title_key(r: SearchResult) -> str:
+            norm = re.sub(r'[\s\u3000\uff0c\u3001\u3002\uff01\uff1f\u2014]', '', r.title)
+            return hashlib.md5(norm.encode()).hexdigest()[:16]
+
+        for r in source_results:
+            k = _title_key(r)
+            if k not in seen:
+                seen.add(k)
+                merged.append(r)
+
+        web_added = 0
+        for r in web_results:
+            k = _title_key(r)
+            if k not in seen:
+                seen.add(k)
+                merged.append(r)
+                web_added += 1
+
+        merged.sort(key=lambda r: r.published_date or "", reverse=True)
+
+        elapsed = round(time.time() - start_time, 2)
+        provider_label = {
+            "policy": "Web+市场源",
+            "market": "市场源" if source_results else "Web(备选)",
+            "stock": "个股源" if source_results else "Web(备选)",
+        }
+
+        logger.info(
+            f"[调度] {news_type}({symbol}): "
+            f"源={len(source_results)}, Web+{web_added}, 合并={len(merged)}, 耗时={elapsed}s"
+        )
+
+        return SearchResponse(
+            query=f"{symbol} {name}".strip() if name else symbol,
+            results=merged,
+            provider=provider_label.get(news_type, "Unknown"),
+            success=len(merged) > 0,
+            search_time=elapsed,
+            metadata={
+                "news_type": news_type,
+                "source_count": len(source_results),
+                "web_results_added": web_added,
+                "total_merged": len(merged),
+                "from_cache": False,
+            },
         )
 
     def search_stock_news(
