@@ -19,23 +19,23 @@ logger = logging.getLogger(__name__)
 
 # ============================================================
 #  缓存 TTL / 过期阈值
-#  STALE_AFTER = TTL 的 60%，过期后先返回旧数据、后台刷新
+#  STALE_AFTER = TTL 的 80%，过期后先返回旧数据、后台刷新
 # ============================================================
 
 _CACHE_TTL = {
-    "sentiment":          300,
-    "commodities":        300,
-    "indices":            120,
-    "heatmap":            300,
-    "news":               180,
+    "sentiment":          1800,
+    "commodities":        1800,
+    "indices":            7200,
+    "heatmap":            1800,
+    "news":               10800,
 }
 
 _STALE_AFTER = {
-    "sentiment":          180,
-    "commodities":        180,
-    "indices":            72,
-    "heatmap":            180,
-    "news":               108,
+    "sentiment":          1440,
+    "commodities":        1440,
+    "indices":            5760,
+    "heatmap":            1440,
+    "news":               8640,
 }
 
 

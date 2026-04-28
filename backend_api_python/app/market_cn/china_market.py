@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-#  缓存 TTL / 过期阈值
+#  缓存 TTL / 过期阈值80%
 # ============================================================
 
 _CACHE_TTL = {
@@ -31,11 +31,11 @@ _CACHE_TTL = {
 }
 
 _STALE_AFTER = {
-    "china_fg":           900,
-    "hot_sectors":        300,
-    "sector_trend":       900,
-    "sector_prediction":  900,
-    "sector_cycle":       1800,
+    "china_fg":           1440,
+    "hot_sectors":        480,
+    "sector_trend":       1440,
+    "sector_prediction":  1440,
+    "sector_cycle":       2880,
 }
 
 # 文件缓存 TTL（秒）— 低频更新数据用文件持久化，重启不丢
