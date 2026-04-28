@@ -41,7 +41,6 @@ _STALE_AFTER = {
 # 文件缓存 TTL（秒）— 低频更新数据用文件持久化，重启不丢
 _FILE_CACHE_TTL = {
     "china_macro":  86400,    # 1天 — 宏观数据月度/季度更新
-    "china_policy": 43200,    # 半天 — 政策解读日更数次
 }
 
 
@@ -347,22 +346,81 @@ def _china_macro_fetch() -> dict:
 
 
 def _china_policy_fetch() -> dict:
-    """政策解读原始获取逻辑 — 通过 fetch_financial_news 统一接口获取。"""
+    """政策解读原始获取逻辑 — 直接调用 news.py，由其内部 PostgreSQL 缓存管理。"""
     from app.services.news_service import fetch_financial_news, get_news_cache_manager
-    resp = fetch_financial_news(lang="all", market="CNStock", symbol="POLICY")
-    cache_mgr = get_news_cache_manager()
-    items = cache_mgr.get_items("POLICY", "CNStock")
-    score_info = cache_mgr.calc_score("POLICY", "CNStock")
-    news_list = resp.get("cn", []) + resp.get("en", [])
+    from app.services.news_analysis import composite_score
+
+    # ── 1. 直接调用 fetch_financial_news（内部已有永久缓存） ──
+    news_list = []
+    try:
+        resp = fetch_financial_news(lang="all", market="CNStock", symbol="POLICY")
+        news_list = resp.get("cn", []) + resp.get("en", [])
+    except Exception as e:
+        logger.error("fetch_financial_news(POLICY) 异常: %s", e)
+
+    # ── 2. 降级：搜索无结果时从 DB 缓存兜底 ──
+    if not news_list:
+        try:
+            cache_mgr = get_news_cache_manager()
+            cached_items = cache_mgr.get_items("POLICY", "CNStock")
+            if cached_items:
+                news_list = [
+                    {
+                        "title": r.get("title", ""),
+                        "link": r.get("url", ""),
+                        "snippet": r.get("snippet", ""),
+                        "source": r.get("source", ""),
+                        "published": r.get("published_date", ""),
+                        "sentiment": r.get("sentiment", "neutral"),
+                        "sentiment_score": r.get("sentiment_score"),
+                        "category": f"政策/宏观:CNStock", "lang": "cn",
+                    }
+                    for r in cached_items
+                ]
+                logger.info("[降级] 使用 DB 缓存 %d 条政策新闻", len(news_list))
+        except Exception as e:
+            logger.error("DB 缓存降级失败: %s", e)
+
+    if not news_list:
+        return {"code": 0, "msg": "暂无政策数据", "data": {}}
+
+    # ── 3. 综合评分 ──
+    score_articles = [
+        {"score": item.get("sentiment_score", 0.0) or 0.0,
+         "published_date": item.get("published", "")}
+        for item in news_list
+    ]
+    try:
+        score_info = composite_score(score_articles)
+    except Exception:
+        score_info = {}
+
     return {
         "code": 1, "msg": "success",
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "data": {
             "news": news_list,
-            "items": items,
-            "score": score_info,
+            "items": news_list,
+            "score": {
+                "composite_score": score_info.get("composite_score", 0.0),
+                "direction": score_info.get("direction", "中性"),
+                "positive": score_info.get("positive_count", 0),
+                "negative": score_info.get("negative_count", 0),
+                "neutral": score_info.get("neutral_count", 0),
+                "veto": score_info.get("veto", False),
+                "veto_count": 1 if score_info.get("veto") else 0,
+            },
         },
     }
+
+
+# ============================================================
+#  政策解读
+# ============================================================
+
+def get_policy() -> dict:
+    """AI政策解读 — 直接调用，由 news.py PostgreSQL 缓存管理生命周期"""
+    return _china_policy_fetch()
 
 
 def get_china_macro() -> dict:
@@ -386,17 +444,6 @@ def get_fear_greed() -> dict:
     """A股市场贪婪恐惧指数 (7维度综合)"""
     data = _cached_fetch("china_fg", _fear_greed_fetch, timeout=30)
     return {"code": 1 if data else 0, "msg": "success", "data": data or {}}
-
-
-# ============================================================
-#  政策解读
-# ============================================================
-
-def get_policy() -> dict:
-    """AI政策解读（关键词版, 文件缓存, 半天）"""
-    return _file_cache_fetch("china_policy", _china_policy_fetch) or {
-        "code": 0, "msg": "获取失败", "data": {}
-    }
 
 
 # ============================================================
@@ -535,7 +582,10 @@ def refresh(target="all") -> dict:
     # 文件缓存 endpoint
     FILE_MAP = {
         "china_macro":  ("china_macro", _china_macro_fetch),
-        "china_policy": ("china_policy", _china_policy_fetch),
+    }
+    # 无需文件缓存的 endpoint（由 news.py 内部 PostgreSQL 管理）
+    DIRECT_MAP = {
+        "china_policy": _china_policy_fetch,
     }
     # 内存缓存 endpoint
     MEM_MAP = {
@@ -543,7 +593,7 @@ def refresh(target="all") -> dict:
         "hot_sectors": _hot_sectors_fetch,
     }
 
-    all_targets = list(set(list(FILE_MAP.keys()) + list(MEM_MAP.keys())))
+    all_targets = list(set(list(FILE_MAP.keys()) + list(DIRECT_MAP.keys()) + list(MEM_MAP.keys())))
     targets = all_targets if target == "all" else [target]
     results = {}
 
@@ -555,6 +605,9 @@ def refresh(target="all") -> dict:
                 _write_file_cache(cache_key, data)
                 return "ok"
             return "failed"
+        elif ep in DIRECT_MAP:
+            data = DIRECT_MAP[ep]()
+            return "ok" if data and data.get("code") == 1 else "failed"
         elif ep in MEM_MAP:
             data = MEM_MAP[ep]()
             if data is not None:
