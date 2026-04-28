@@ -127,13 +127,20 @@ def market_heatmap():
 def market_news():
     """Get financial news from various sources.
 
+    路由规则 (由 fetch_financial_news 统一处理):
+        symbol=="POLICY"              → 政策/宏观新闻 (按 market 区分国家)
+        symbol==market                → 市场新闻 (如 symbol=CNStock, market=CNStock)
+        symbol!=market, symbol 非空   → 个股新闻 (如 symbol=600519, market=CNStock)
+        market 非空, 无 symbol        → 默认市场新闻
+        都没有                        → 通用财经新闻
+
     Query params:
         lang   — 'cn' | 'en' | 'all'
-        market — 行情类: 'Crypto'|'USStock'|'CNStock'|'HKStock'|'Forex'|'Futures'
-                 政策类: 'MacroCN' (中国政策) | 'MacroIntl' (国际政策)
+        market — 'CNStock'|'USStock'|'Crypto'|'Forex'|'HKStock'|'Futures'
+                 政策类: 'MacroCN'(中国政策) | 'MacroIntl'(国际政策)
                  'all' = 全部
-        symbol — 个股代码/交易对, e.g. 'AAPL', '600519', 'BTC/USDT'
-                 传入后自动识别市场并搜索个股新闻
+        symbol — 'POLICY'=政策新闻 | 市场名=市场新闻 | 个股代码=个股新闻
+                 e.g. '600519', 'AAPL', 'BTC/USDT'
         name   — 个股名称(可选), e.g. '苹果', '贵州茅台'
     """
     try:
@@ -142,10 +149,14 @@ def market_news():
         symbol = request.args.get("symbol", "").strip()
         name = request.args.get("name", "").strip()
 
-        # 规范化缓存键：替换特殊字符避免 Redis key 模式冲突
+        # 规范化缓存键: 按路由类型分组, 替换特殊字符避免 Redis key 冲突
         safe_symbol = symbol.replace("/", "_").replace(":", "_") if symbol else ""
-        if symbol:
+        if symbol == "POLICY" or market in ("MacroCN", "MacroIntl"):
+            cache_key = f"policy_news_{lang}_{market}"
+        elif symbol and symbol != market:
             cache_key = f"stock_news_{lang}_{market}_{safe_symbol}_{name}"
+        elif symbol and symbol == market:
+            cache_key = f"market_news_{lang}_{market}"
         else:
             cache_key = f"market_news_{lang}_{market}"
 

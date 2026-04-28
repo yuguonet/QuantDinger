@@ -347,17 +347,18 @@ def _china_macro_fetch() -> dict:
 
 
 def _china_policy_fetch() -> dict:
-    """政策解读原始获取逻辑 — 直接调用 search_market_news 接口。"""
-    from app.data_providers.news import search_market_news, get_news_cache_manager
-    resp = search_market_news(market="CNStock", symbol="POLICY", days=1, max_web_results=10)
+    """政策解读原始获取逻辑 — 通过 fetch_financial_news 统一接口获取。"""
+    from app.data_providers.news import fetch_financial_news, get_news_cache_manager
+    resp = fetch_financial_news(lang="all", market="CNStock", symbol="POLICY")
     cache_mgr = get_news_cache_manager()
     items = cache_mgr.get_items("POLICY", "CNStock")
     score_info = cache_mgr.calc_score("POLICY", "CNStock")
+    news_list = resp.get("cn", []) + resp.get("en", [])
     return {
         "code": 1, "msg": "success",
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "data": {
-            "news": [r.to_dict() for r in resp.results] if resp.success else [],
+            "news": news_list,
             "items": items,
             "score": score_info,
         },

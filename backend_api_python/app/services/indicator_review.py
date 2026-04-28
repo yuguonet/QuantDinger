@@ -578,7 +578,7 @@ def _search_stock_news_sentiment(symbol: str, name: str = "", _cancelled: List[b
     """
     搜索个股近3天新闻并分析情感倾向。
 
-    调用 SearchService.search_cn_stock_news()，内部并行执行：
+    调用 fetch_financial_news() 统一接口，内部并行执行：
       - Web 搜索引擎（百度/博查等）
       - 5 路国内财经直连（东财公告/新浪/腾讯/凤凰/新浪7x24）
     自动去重 + 加权情感评分 + 时间衰减综合评分。
@@ -617,14 +617,14 @@ def _search_stock_news_sentiment(symbol: str, name: str = "", _cancelled: List[b
 
     try:
         from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-        from app.data_providers.news import search_cn_stock_news
+        from app.data_providers.news import fetch_financial_news
 
         def _do_search():
-            return search_cn_stock_news(
-                stock_code=symbol,
-                stock_name=name or "",
-                days=3,
-                max_web_results=3,
+            return fetch_financial_news(
+                lang="all",
+                market="CNStock",
+                symbol=symbol,
+                name=name or "",
             )
 
         executor = ThreadPoolExecutor(max_workers=1)
@@ -648,13 +648,11 @@ def _search_stock_news_sentiment(symbol: str, name: str = "", _cancelled: List[b
         finally:
             executor.shutdown(wait=False)
 
-        if not search_resp or not search_resp.success:
-            err_msg = getattr(search_resp, "error_message", None)
-            if err_msg:
-                result["error"] = f"新闻搜索失败: {err_msg}"
+        if not search_resp or not isinstance(search_resp, dict):
+            result["error"] = "新闻搜索失败: 返回格式异常"
             return result
 
-        items = search_resp.results or []
+        items = search_resp.get("cn", []) + search_resp.get("en", [])
         result["news_count"] = len(items)
 
         if len(items) == 0:
@@ -662,7 +660,7 @@ def _search_stock_news_sentiment(symbol: str, name: str = "", _cancelled: List[b
 
         result["has_news"] = True
 
-        metadata = getattr(search_resp, "metadata", None) or {}
+        metadata = search_resp.get("_meta") or {}
         composite_score = metadata.get("composite_score")
         direction = metadata.get("direction")
 

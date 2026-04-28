@@ -19,7 +19,7 @@ from __future__ import annotations
 import hashlib
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -404,157 +404,57 @@ def _fetch_stock_news_search(query: str, max_results: int = 20, days: int = 7) -
                               success=False, error_message=str(e))
 
 
-def search_cn_stock_news(
-    stock_code: str, stock_name: str = "",
-    days: int = 3, max_web_results: int = 5,
-    market: str = "CNStock", is_watchlist: bool = False,
-) -> SearchResponse:
-    """
-    A股个股新闻搜索 — 带 PostgreSQL 持久化缓存 v2.2
-
-    缓存策略:
-      1. 查 DB 判断是否需要搜索 (24h去重 / 自选股时间窗口)
-      2. 需要搜索 → 并行 Web + StockNews → 写入明细表
-      3. 不需要搜索 → 从明细表取 items → 实时算评分返回
-      4. 无结果不写库, 下次重新搜索
-      5. 重大负面一票否决 → sentiment_score=-999 → 综合分归零
-
-    外部接口参数保持不变
-    """
-    start_time = time.time()
-    query = f"{stock_code} {stock_name}".strip()
-    search_svc = get_search_service()
-
-    # ── 第零步: 动态缩减搜索天数 ──
-    cache_mgr = get_news_cache_manager()
-    effective_days = cache_mgr.calc_dynamic_days(stock_code, market, default_days=days)
-
-    # ── 第一步: 判断是否需要搜索 ──
-    should, reason = cache_mgr.should_search(stock_code, market, is_watchlist)
-
-    if not should:
-        # 从缓存取 items, 从 DB 实时算评分
-        items = cache_mgr.get_items(stock_code, market)
-        if items:
-            score_info = cache_mgr.calc_score(stock_code, market)
-            results = [
-                SearchResult(
-                    title=i["title"], snippet=i.get("snippet", ""),
-                    url=i.get("url", ""), source=i.get("source", ""),
-                    published_date=i.get("published_date", ""),
-                    sentiment=i.get("sentiment", "neutral"),
-                    sentiment_score=i.get("sentiment_score"),
-                ) for i in items
-            ]
-            score_info["from_cache"] = True
-            provider = f"Cache({score_info['direction']} {score_info['composite_score']}/10)"
-            logger.info(f"[缓存命中] {stock_code}({market}) {stock_name}: {reason}")
-            return SearchResponse(
-                query=query, results=results, provider=provider,
-                success=True, search_time=round(time.time() - start_time, 2),
-                metadata=score_info,
-            )
-        # DB说不搜但实际没数据 (可能数据被手动删了), 降级为搜索
-        logger.info(f"[缓存降级] {stock_code}({market}): {reason}, 但DB无数据, 重新搜索")
-
-    logger.info(f"[需要搜索] {stock_code}({market}) {stock_name}: {reason}")
-
-    # ── 第二步: 并行搜索 ──
-    def _title_key(r: SearchResult) -> str:
-        norm = re.sub(r'[\s\u3000\uff0c\u3001\u3002\uff01\uff1f\u2014]', '', r.title)
-        return hashlib.md5(norm.encode()).hexdigest()[:16]
-
-    web_query = f"{stock_name} {stock_code} A股新闻" if stock_name else f"{stock_code} 股票新闻"
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        f_web = pool.submit(search_svc.search_with_fallback, web_query, max_web_results, effective_days)
-        f_news = pool.submit(_fetch_stock_news_search, query, 20, effective_days)
-
-        try:
-            web_resp = f_web.result()
-        except Exception as e:
-            logger.warning(f"Web搜索异常: {e}")
-            web_resp = SearchResponse(query=web_query, results=[], provider="Web",
-                                      success=False, error_message=str(e))
-        try:
-            news_resp = f_news.result()
-        except Exception as e:
-            logger.warning(f"StockNews搜索异常: {e}")
-            news_resp = SearchResponse(query=query, results=[], provider="StockNews",
-                                       success=False, error_message=str(e))
-
-    # 合并去重: stock_news 优先
-    seen = set()
-    merged: List[SearchResult] = []
-    for r in news_resp.results:
-        k = _title_key(r)
-        if k not in seen:
-            seen.add(k)
-            merged.append(r)
-
-    web_added = 0
-    if web_resp.success:
-        for r in web_resp.results:
-            k = _title_key(r)
-            if k not in seen:
-                seen.add(k)
-                merged.append(r)
-                web_added += 1
-
-    merged.sort(key=lambda r: r.published_date or "", reverse=True)
-
-    # ── 第三步: 写入缓存 ──
-    if merged:
-        cache_mgr.save_items(stock_code, market, merged)
-
-    elapsed = round(time.time() - start_time, 2)
-    metadata = dict(news_resp.metadata) if news_resp.metadata else {}
-    metadata["web_results_added"] = web_added
-    metadata["stock_news_count"] = len(news_resp.results)
-    metadata["total_merged"] = len(merged)
-    metadata["from_cache"] = False
-    metadata["effective_days"] = effective_days
-
-    return SearchResponse(
-        query=query, results=merged, provider="StockNews+Web",
-        success=len(merged) > 0, search_time=elapsed, metadata=metadata,
-    )
-
-
 # ═══════════════════════════════════════════════════════════════
-# 市场新闻 (news_fetcher.py 直爬, A股优先)
+# 统一新闻搜索 (个股 + 市场)
 # ═══════════════════════════════════════════════════════════════
-#
-# 市场新闻 vs 个股新闻:
-#   市场新闻 → symbol = market
-#   个股新闻 → symbol = 股票代码 (search_cn_stock_news)
-#
-# A股市场新闻优先使用 news_fetcher.py 直爬 (5路数据源, 无需搜索引擎)
-# 其他市场走 search_with_fallback
-#
 
-def search_market_news(
-    market: str = "CNStock",
-    symbol: str = "",
-    days: int = 1, max_web_results: int = 5,
-    max_fetcher_per_source: int = 10,
-) -> SearchResponse:
-    """
-    市场新闻搜索 — 带缓存, 区分数据源
-
-    - A股: news_fetcher.py 直爬 (优先) + Web 补充
-    - 其他市场: Web 搜索
-
-    symbol 不传时默认等于 market (市场新闻)
-    传 "POLICY" 时为政策/宏观新闻
-    """
-    start_time = time.time()
+def _is_stock_code(symbol: str) -> bool:
+    """判断 symbol 是股票代码还是市场名"""
     if not symbol:
-        symbol = market
+        return False
+    # 纯数字 (A股/港股)、含点的代码 (BRK.A)、1-5位字母+数字混合 (AAPL, TSLA)
+    if symbol in ("CNStock", "USStock", "Crypto", "Forex", "HKStock", "Futures"):
+        return False
+    return True
+
+
+def search_news(
+    symbol: str,
+    market: str = "CNStock",
+    lang: str = "all",
+    days: int = 3,
+    max_web_results: int = 5,
+    is_watchlist: bool = False,
+    name: str = "",
+) -> SearchResponse:
+    """
+    统一新闻搜索 — 个股 + 市场, 带缓存 + 评分
+
+    内部按 symbol 类型自动选数据源:
+      symbol 是股票代码 → StockNews 5路 (A股) + Web (按 lang 选中/英文)
+      symbol 是市场名   → cn_news_provider (A股) + Web (按 lang 选中/英文)
+
+    Args:
+        symbol:    股票代码 ("600519", "AAPL") 或 市场名 ("CNStock", "USStock")
+        market:    市场标识
+        lang:      "cn"=仅中文源 | "en"=仅英文源 | "all"=全部
+        days:      搜索天数 (仅个股, 市场固定1天)
+        max_web_results: Web 搜索最大条数
+        is_watchlist: 是否自选股 (启用时间窗口策略)
+        name:      股票名称 (仅个股, 提升搜索精度)
+    """
+    start_time = time.time()
+    is_stock = _is_stock_code(symbol)
     cache_mgr = get_news_cache_manager()
 
-    # ── 判断是否需要搜索 ──
-    should, reason = cache_mgr.should_search(symbol, market, is_watchlist=False)
+    # ── 动态缩减搜索天数 (仅个股) ──
+    if is_stock:
+        effective_days = cache_mgr.calc_dynamic_days(symbol, market, default_days=days)
+    else:
+        effective_days = 1  # 市场新闻固定1天
+
+    # ── 缓存检查 ──
+    should, reason = cache_mgr.should_search(symbol, market, is_watchlist and is_stock)
 
     if not should:
         items = cache_mgr.get_items(symbol, market)
@@ -571,71 +471,99 @@ def search_market_news(
             ]
             score_info["from_cache"] = True
             provider = f"Cache({score_info['direction']} {score_info['composite_score']}/10)"
+            label = f"{symbol}({market})" if is_stock else f"市场:{market}"
+            logger.info(f"[缓存命中] {label}: {reason}")
             return SearchResponse(
-                query=f"市场新闻({market})", results=results, provider=provider,
+                query=f"{symbol} {name}".strip() if is_stock else f"市场新闻({market})",
+                results=results, provider=provider,
                 success=True, search_time=round(time.time() - start_time, 2),
                 metadata=score_info,
             )
+        logger.info(f"[缓存降级] {symbol}({market}): {reason}, 但DB无数据, 重新搜索")
 
-    logger.info(f"[市场新闻] {symbol}({market}): {reason}")
+    label = f"{symbol}({market})" if is_stock else f"市场:{market}"
+    logger.info(f"[需要搜索] {label}: {reason}")
 
-    # ── 数据源: A股用 news_fetcher 直爬, 其他走 Web ──
-    fetcher_results: List[SearchResult] = []
-    web_results: List[SearchResult] = []
-
-    if market == "CNStock":
-        # A股: news_fetcher 直爬 (并行)
-        def _do_fetch():
-            from app.services.cn_news_provider import fetch_all_news
-            return fetch_all_news(max_per_source=max_fetcher_per_source)
-
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            f_fetcher = pool.submit(_do_fetch)
-            f_web = pool.submit(
-                get_search_service().search_with_fallback,
-                "A股市场 财经新闻 股票", max_web_results, days,
-            )
-            try:
-                raw_fetcher = f_fetcher.result()
-                for item in raw_fetcher:
-                    fetcher_results.append(SearchResult(
-                        title=item.get("title", ""),
-                        snippet=item.get("title", ""),
-                        url=item.get("url", ""),
-                        source=item.get("source", "财经"),
-                        published_date=item.get("time", ""),
-                    ))
-            except Exception as e:
-                logger.warning(f"news_fetcher 异常: {e}")
-
-            try:
-                web_resp = f_web.result()
-                web_results = web_resp.results if web_resp.success else []
-            except Exception as e:
-                logger.warning(f"Web搜索异常: {e}")
-    else:
-        # 其他市场: Web 搜索
-        query_map = {
-            "USStock": "US stock market news today",
-            "Crypto": "cryptocurrency market news bitcoin",
-            "Forex": "forex market analysis news",
-        }
-        query = query_map.get(market, f"{market} market news")
-        try:
-            web_resp = get_search_service().search_with_fallback(query, max_web_results, days)
-            web_results = web_resp.results if web_resp.success else []
-        except Exception as e:
-            logger.warning(f"Web搜索异常: {e}")
-
-    # ── 合并去重: news_fetcher 优先 ──
-    seen = set()
-    merged: List[SearchResult] = []
+    # ═══════════════════════════════════════════════
+    # 搜索: 按 symbol 类型 + lang 选择数据源
+    # ═══════════════════════════════════════════════
+    search_svc = get_search_service()
+    source_results: List[SearchResult] = []  # 优先源 (StockNews / cn_news_provider)
+    web_results: List[SearchResult] = []     # Web 补充
 
     def _title_key(r: SearchResult) -> str:
         norm = re.sub(r'[\s\u3000\uff0c\u3001\u3002\uff01\uff1f\u2014]', '', r.title)
         return hashlib.md5(norm.encode()).hexdigest()[:16]
 
-    for r in fetcher_results:
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {}
+
+        if is_stock:
+            # ── 个股: StockNews 5路 (仅中文) ──
+            if lang in ("cn", "all"):
+                query = f"{symbol} {name}".strip()
+                futures[pool.submit(_fetch_stock_news_search, query, 20, effective_days)] = "StockNews"
+
+            # ── 个股: Web 搜索 ──
+            if lang in ("cn", "all"):
+                cn_q = f"{name} {symbol} A股新闻" if name else f"{symbol} 股票新闻"
+                futures[pool.submit(search_svc.search_with_fallback, cn_q, max_web_results, effective_days)] = "cn_web"
+            if lang in ("en", "all"):
+                en_q = f"{name or symbol} stock news analysis" if name else f"{symbol} stock financial news"
+                futures[pool.submit(search_svc.search_with_fallback, en_q, max_web_results, effective_days)] = "en_web"
+
+        else:
+            # ── 市场: cn_news_provider (A股, 仅中文) ──
+            if market == "CNStock" and lang in ("cn", "all"):
+                def _do_fetch():
+                    from app.services.cn_news_provider import fetch_all_news
+                    return fetch_all_news(max_per_source=10)
+                futures[pool.submit(_do_fetch)] = "cn_news"
+
+            # ── 市场: Web 搜索 (按 lang 选查询词) ──
+            cn_query_map = {
+                "USStock": "美股市场新闻 股票",
+                "Crypto": "加密货币新闻 比特币",
+                "Forex": "外汇市场分析 汇率",
+                "CNStock": "A股市场 财经新闻 股票",
+            }
+            en_query_map = {
+                "USStock": "US stock market news today",
+                "Crypto": "cryptocurrency market news bitcoin",
+                "Forex": "forex market analysis news",
+                "CNStock": "China A-share stock market news",
+            }
+            if lang in ("cn", "all"):
+                cn_q = cn_query_map.get(market, f"{market} 市场新闻")
+                futures[pool.submit(search_svc.search_with_fallback, cn_q, max_web_results, effective_days)] = "cn_web"
+            if lang in ("en", "all"):
+                en_q = en_query_map.get(market, f"{market} market news")
+                futures[pool.submit(search_svc.search_with_fallback, en_q, max_web_results, effective_days)] = "en_web"
+
+        # ── 收集结果 ──
+        for future in as_completed(futures):
+            src = futures[future]
+            try:
+                resp = future.result()
+                if src == "StockNews":
+                    source_results.extend(resp.results if isinstance(resp, SearchResponse) else [])
+                elif src == "cn_news":
+                    for item in (resp or []):
+                        source_results.append(SearchResult(
+                            title=item.get("title", ""), snippet=item.get("title", ""),
+                            url=item.get("url", ""), source=item.get("source", "财经"),
+                            published_date=item.get("time", ""),
+                        ))
+                else:
+                    if isinstance(resp, SearchResponse) and resp.success:
+                        web_results.extend(resp.results)
+            except Exception as e:
+                logger.warning(f"{src} 搜索异常: {e}")
+
+    # ── 合并去重: 优先源 > Web ──
+    seen: set = set()
+    merged: List[SearchResult] = []
+    for r in source_results:
         k = _title_key(r)
         if k not in seen:
             seen.add(k)
@@ -655,25 +583,388 @@ def search_market_news(
     if merged:
         cache_mgr.save_items(symbol, market, merged)
 
+    # ── 构造返回 ──
     elapsed = round(time.time() - start_time, 2)
     metadata = {
-        "fetcher_count": len(fetcher_results),
+        "source_count": len(source_results),
         "web_results_added": web_added,
         "total_merged": len(merged),
         "from_cache": False,
-        "symbol": symbol,
+        "effective_days": effective_days,
+        "is_stock": is_stock,
     }
+    # 个股附加 StockNews 评分元数据
+    if is_stock and source_results:
+        # 从 StockNews 的 metadata 取评分 (如果有)
+        pass  # 评分已在 save_items 里完成, calc_score 在缓存读取时返回
 
+    provider = "StockNews+Web" if is_stock else ("NewsFetcher+Web" if source_results else "Web")
     return SearchResponse(
-        query=f"市场新闻({market})", results=merged,
-        provider="NewsFetcher+Web" if fetcher_results else "Web",
+        query=f"{symbol} {name}".strip() if is_stock else f"市场新闻({market})",
+        results=merged, provider=provider,
         success=len(merged) > 0, search_time=elapsed, metadata=metadata,
     )
+
+
+# ── 向后兼容别名 ──
+def search_cn_stock_news(
+    stock_code: str, stock_name: str = "",
+    days: int = 3, max_web_results: int = 5,
+    market: str = "CNStock", is_watchlist: bool = False,
+    lang: str = "all",
+) -> SearchResponse:
+    """兼容旧调用 → 委托 search_news"""
+    return search_news(
+        symbol=stock_code, market=market, lang=lang,
+        days=days, max_web_results=max_web_results,
+        is_watchlist=is_watchlist, name=stock_name,
+    )
+
+
+def search_market_news(
+    market: str = "CNStock", symbol: str = "",
+    days: int = 1, max_web_results: int = 5,
+    max_fetcher_per_source: int = 10,
+    lang: str = "all",
+) -> SearchResponse:
+    """兼容旧调用 → 委托 search_news"""
+    return search_news(
+        symbol=symbol or market, market=market, lang=lang,
+        days=days, max_web_results=max_web_results,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# 政策/宏观新闻 (独立路由, 非股市)
+# ═══════════════════════════════════════════════════════════════
+
+# ── 政策/宏观专用搜索关键词 (按市场区分) ──
+_POLICY_QUERIES: Dict[str, Dict[str, List[str]]] = {
+    "CNStock": {
+        "cn": [
+            "国务院政策 最新",
+            "宏观经济分析 GDP CPI PPI",
+            "央行货币政策 降准 降息 LPR",
+            "财政政策 减税 专项债",
+            "产业政策 新能源 芯片 制造业",
+            "经济数据 社融 M2 进出口",
+        ],
+        "en": [
+            "China economic policy latest",
+            "China central bank monetary policy",
+            "China fiscal policy stimulus GDP",
+            "China industry policy manufacturing",
+        ],
+    },
+    "USStock": {
+        "cn": [
+            "美联储货币政策 利率决议",
+            "美国经济数据 非农 CPI GDP",
+            "美国财政政策 减税 刺激计划",
+            "美国贸易政策 关税 制裁",
+            "美国产业政策 芯片法案 科技监管",
+        ],
+        "en": [
+            "Federal Reserve interest rate decision",
+            "US economic data nonfarm CPI GDP",
+            "US fiscal policy tax cut stimulus",
+            "US trade policy tariff sanctions",
+            "US industrial policy CHIPS act regulation",
+        ],
+    },
+    "Crypto": {
+        "cn": [
+            "加密货币监管政策 各国",
+            "数字货币政策 央行数字货币",
+            "区块链监管 Web3 政策",
+        ],
+        "en": [
+            "cryptocurrency regulation policy",
+            "digital currency CBDC policy",
+            "crypto regulation Web3 government",
+        ],
+    },
+    "Forex": {
+        "cn": [
+            "外汇政策 央行干预 汇率",
+            "货币政策 利率决议 各国央行",
+            "国际贸易收支 外汇储备",
+        ],
+        "en": [
+            "forex policy central bank intervention",
+            "monetary policy interest rate decision",
+            "trade balance foreign exchange reserves",
+        ],
+    },
+}
+
+
+def _fetch_policy_news(
+    market: str = "CNStock",
+    days: int = 1,
+    max_per_query: int = 5,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    政策/宏观新闻 — 按市场区分, 带缓存 + AI 评分
+
+    与市场新闻的区别:
+      - 市场新闻: 行情、板块轮动、个股涨跌、资金流向
+      - 政策/宏观: 央行政策、财政政策、产业规划、经济数据、监管动态
+
+    Args:
+        market: CNStock=中国政策, USStock=美国政策, Crypto=加密监管, Forex=外汇政策
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    cache_mgr = get_news_cache_manager()
+    result: Dict[str, List[Dict[str, Any]]] = {"cn": [], "en": []}
+
+    market_queries = _POLICY_QUERIES.get(market, _POLICY_QUERIES["CNStock"])
+
+    # ── 缓存检查 ──
+    should, reason = cache_mgr.should_search("POLICY", market, is_watchlist=False)
+    if not should:
+        cached = cache_mgr.get_items("POLICY", market)
+        if cached:
+            for item in cached:
+                lang_key = "cn"  # 政策新闻默认中文, 英文结果较少
+                result[lang_key].append({
+                    "title": item["title"], "link": item.get("url", ""),
+                    "snippet": item.get("snippet", ""), "source": item.get("source", ""),
+                    "published": item.get("published_date", ""),
+                    "sentiment": item.get("sentiment", "neutral"),
+                    "sentiment_score": item.get("sentiment_score"),
+                    "category": f"政策/宏观:{market}", "lang": lang_key,
+                })
+            logger.info(f"[政策新闻缓存命中] {market} {reason}, {len(cached)}条")
+            return result
+        logger.info(f"[政策新闻缓存降级] {market} {reason}, 但无数据, 重新搜索")
+
+    logger.info(f"[政策新闻] {market} 缓存未命中, 并行搜索")
+
+    # ── Web 搜索 ──
+    search = get_search_service()
+    all_results: List[SearchResult] = []
+
+    queries = []
+    for lang_key in ("cn", "en"):
+        for q in market_queries.get(lang_key, []):
+            queries.append((lang_key, q))
+
+    def _do_search(lang_key: str, query: str) -> List[SearchResult]:
+        try:
+            resp = search.search_with_fallback(query, max_per_query, days)
+            return resp.results if resp.success else []
+        except Exception:
+            return []
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_do_search, lk, q): (lk, q) for lk, q in queries}
+        for future in as_completed(futures):
+            lk, q = futures[future]
+            try:
+                items = future.result()
+                all_results.extend(items)
+            except Exception as e:
+                logger.warning(f"政策新闻搜索异常({q}): {e}")
+
+    # ── 去重 ──
+    seen: set = set()
+    deduped: List[SearchResult] = []
+    for r in all_results:
+        norm = re.sub(r'[\s\u3000]', '', r.title)
+        key = hashlib.md5(norm.encode()).hexdigest()[:16]
+        if key not in seen:
+            seen.add(key)
+            deduped.append(r)
+
+    # ── 写缓存 (save_items 自动触发 AI 评分: get_news_type="policy") ──
+    if deduped:
+        cache_mgr.save_items("POLICY", market, deduped)
+
+    # ── 构造返回 (从缓存重新读取, 带评分) ──
+    saved = cache_mgr.get_items("POLICY", market)
+    for item in saved:
+        lang_key = "cn"
+        result[lang_key].append({
+            "title": item["title"], "link": item.get("url", ""),
+            "snippet": item.get("snippet", ""), "source": item.get("source", ""),
+            "published": item.get("published_date", ""),
+            "sentiment": item.get("sentiment", "neutral"),
+            "sentiment_score": item.get("sentiment_score"),
+            "category": f"政策/宏观:{market}", "lang": lang_key,
+        })
+
+    logger.info(f"[政策新闻] {market} 搜索完成, {len(deduped)}条去重, 评分后{len(saved)}条入库")
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════
 # 通用财经新闻
 # ═══════════════════════════════════════════════════════════════
+
+def _fetch_general_news_cached(
+    lang: str = "all",
+) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    通用财经新闻 — 带缓存 + 情感评分
+
+    流程:
+      1. 查 NewsCacheManager 缓存 (symbol=GENERAL_NEWS, 24h 去重)
+      2. 缓存命中 → 直接返回
+      3. 缓存未命中 → 并行搜索中英文关键词 → 关键词评分 → 写缓存 → 返回
+    """
+    from app.services.news_analysis import keyword_score_article
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    cache_mgr = get_news_cache_manager()
+    result: Dict[str, List[Dict[str, Any]]] = {"cn": [], "en": []}
+
+    # ── 缓存检查 ──
+    should, reason = cache_mgr.should_search("GENERAL_NEWS", "General", is_watchlist=False)
+    if not should:
+        cached_cn = cache_mgr.get_items("GENERAL_NEWS", "CN")
+        cached_en = cache_mgr.get_items("GENERAL_NEWS", "EN")
+        if cached_cn or cached_en:
+            for item in cached_cn:
+                result["cn"].append({
+                    "title": item["title"], "link": item.get("url", ""),
+                    "snippet": item.get("snippet", ""), "source": item.get("source", ""),
+                    "published": item.get("published_date", ""),
+                    "sentiment": item.get("sentiment", "neutral"),
+                    "sentiment_score": item.get("sentiment_score"),
+                    "category": "通用", "lang": "cn",
+                })
+            for item in cached_en:
+                result["en"].append({
+                    "title": item["title"], "link": item.get("url", ""),
+                    "snippet": item.get("snippet", ""), "source": item.get("source", ""),
+                    "published": item.get("published_date", ""),
+                    "sentiment": item.get("sentiment", "neutral"),
+                    "sentiment_score": item.get("sentiment_score"),
+                    "category": "通用", "lang": "en",
+                })
+            if result["cn"] or result["en"]:
+                logger.info(f"[通用新闻缓存命中] {reason}")
+                return result
+        # 缓存为空, 降级搜索
+        logger.info(f"[通用新闻缓存降级] {reason}, 但无数据, 重新搜索")
+
+    logger.info(f"[通用新闻] 缓存未命中, 并行搜索中英文")
+
+    # ── 搜索关键词 ──
+    cn_queries = [
+        "加密货币新闻", "美联储利率", "美股市场最新消息",
+        "外汇市场分析", "全球经济数据", "期货市场动态",
+    ]
+    en_queries = [
+        "stock market news today", "cryptocurrency bitcoin news",
+        "forex market analysis", "federal reserve interest rate",
+        "global economic outlook", "S&P 500 market update",
+    ]
+
+    search = SearchService()
+
+    def _search_and_score(query: str, num: int = 5) -> List[SearchResult]:
+        """搜索 + 关键词评分, 返回 SearchResult 列表"""
+        try:
+            raw = search.search(query, num_results=num, date_restrict="d1")
+        except Exception:
+            return []
+        items: List[SearchResult] = []
+        for r in raw:
+            title = r.get("title", "")
+            snippet = r.get("snippet", "")
+            kw = keyword_score_article(title, snippet)
+            items.append(SearchResult(
+                title=title, snippet=snippet,
+                url=r.get("link", ""), source=r.get("source", ""),
+                published_date=r.get("published", ""),
+                sentiment=kw["sentiment"],
+                sentiment_score=kw["score"],
+            ))
+        return items
+
+    # ── 并行搜索 ──
+    cn_results: List[SearchResult] = []
+    en_results: List[SearchResult] = []
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {}
+        if lang in ("all", "cn"):
+            for q in cn_queries:
+                futures[pool.submit(_search_and_score, q, 5)] = ("cn", q)
+        if lang in ("all", "en"):
+            for q in en_queries:
+                futures[pool.submit(_search_and_score, q, 5)] = ("en", q)
+
+        for future in as_completed(futures):
+            lang_key, q = futures[future]
+            try:
+                items = future.result()
+                if lang_key == "cn":
+                    cn_results.extend(items)
+                else:
+                    en_results.extend(items)
+            except Exception as e:
+                logger.warning(f"通用新闻搜索异常({q}): {e}")
+
+    # ── 去重 + 填充 ──
+    def _dedup_and_fill(items: List[SearchResult], lang_key: str):
+        seen: set = set()
+        for r in items:
+            if r.url and r.url not in seen:
+                seen.add(r.url)
+                result[lang_key].append({
+                    "title": r.title, "link": r.url,
+                    "snippet": r.snippet, "source": r.source,
+                    "published": r.published_date or "",
+                    "sentiment": r.sentiment,
+                    "sentiment_score": r.sentiment_score,
+                    "category": "通用", "lang": lang_key,
+                })
+        result[lang_key] = result[lang_key][:15]
+
+    _dedup_and_fill(cn_results, "cn")
+    _dedup_and_fill(en_results, "en")
+
+    # ── 写入缓存 ──
+    if cn_results:
+        cache_mgr.save_items("GENERAL_NEWS", "CN", cn_results)
+    if en_results:
+        cache_mgr.save_items("GENERAL_NEWS", "EN", en_results)
+
+    return result
+
+
+def _results_to_list(
+    results: List[SearchResult],
+    lang: str,
+    category: str,
+) -> List[Dict[str, Any]]:
+    """SearchResult → 统一 dict 格式 (含情感评分)"""
+    return [
+        {
+            "title": r.title, "link": r.url,
+            "snippet": r.snippet, "source": r.source,
+            "published": r.published_date or "",
+            "sentiment": r.sentiment,
+            "sentiment_score": r.sentiment_score,
+            "category": category, "lang": lang,
+        }
+        for r in results
+    ]
+
+
+def _detect_lang(results: List[SearchResult], default: str = "cn") -> str:
+    """根据结果内容推断实际语言 (简单启发: 中文字符占比)"""
+    sample = " ".join(r.title for r in results[:5])
+    if not sample:
+        return default
+    cn_chars = len(re.findall(r'[\u4e00-\u9fff]', sample))
+    total = len(sample) or 1
+    return "cn" if cn_chars / total > 0.15 else "en"
+
 
 def fetch_financial_news(
     lang: str = "all",
@@ -682,103 +973,98 @@ def fetch_financial_news(
     name: str = "",
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
-    财经新闻统一入口 — 按 lang/market/symbol 分发
+    财经新闻统一入口 v2.1 — 统一 search_news 路由
 
-    路由:
-      - symbol 有值 → 个股新闻 (search_cn_stock_news / search_market_news)
-      - market != "all" → 市场新闻 (search_market_news)
-      - 其他 → 通用财经新闻 (SearchService 多关键词)
+    路由规则 (严格按条件匹配):
+      0. symbol=="POLICY"              → 政策/宏观新闻, 按 market 区分国家/市场
+      1. symbol 有值 + symbol == market → 市场新闻 (如 symbol=CNStock, market=CNStock)
+      2. symbol 有值 + symbol != market → 个股新闻 (如 symbol=600519, market=CNStock)
+      3. market != "all", 无 symbol    → 市场新闻 (默认该市场)
+      4. 都没有                        → 通用财经新闻
+
+    所有路径统一返回格式:
+      {"cn": [...], "en": [...]}
+      每条: {title, link, snippet, source, published, sentiment, sentiment_score, category, lang}
     """
     result: Dict[str, List[Dict[str, Any]]] = {"cn": [], "en": []}
 
     try:
-        # ── 个股新闻 ──
-        if symbol:
-            resp = search_cn_stock_news(
-                stock_code=symbol, stock_name=name or "",
-                days=3, max_web_results=5,
-                market=market if market != "all" else "CNStock",
-            )
-            if resp.success:
-                lang_key = "cn" if lang in ("all", "cn") else "en"
-                for r in resp.results:
-                    result[lang_key].append({
-                        "title": r.title, "link": r.url,
-                        "snippet": r.snippet, "source": r.source,
-                        "published": r.published_date or "",
-                        "sentiment": r.sentiment,
-                        "sentiment_score": r.sentiment_score,
-                        "category": f"个股:{symbol}", "lang": lang_key,
-                    })
-            return result
+        effective_market = market if market != "all" else "CNStock"
 
-        # ── 市场新闻 ──
-        if market != "all":
-            resp = search_market_news(
-                market=market, symbol=symbol or market,
+        # ── 规范化: API 层 MacroCN/MacroIntl 映射为 POLICY 路由 ──
+        _MACRO_MARKET_MAP = {
+            "MacroCN": "CNStock",
+            "MacroIntl": "USStock",
+        }
+        if market in _MACRO_MARKET_MAP:
+            symbol = "POLICY"
+            effective_market = _MACRO_MARKET_MAP[market]
+
+        # ═══════════════════════════════════════════════
+        # 路由 0: 政策/宏观新闻 (symbol == POLICY)
+        # ═══════════════════════════════════════════════
+        if symbol == "POLICY":
+            return _fetch_policy_news(market=effective_market)
+
+        # ═══════════════════════════════════════════════
+        # 路由 1: 市场新闻 (symbol == market, 如 symbol=CNStock, market=CNStock)
+        # ═══════════════════════════════════════════════
+        if symbol and symbol == market:
+            resp = search_news(
+                symbol=market, market=market, lang=lang,
                 days=1, max_web_results=10,
             )
             if resp.success:
-                lang_key = "cn" if lang in ("all", "cn") else "en"
-                for r in resp.results:
-                    result[lang_key].append({
-                        "title": r.title, "link": r.url,
-                        "snippet": r.snippet, "source": r.source,
-                        "published": r.published_date or "",
-                        "sentiment": r.sentiment,
-                        "sentiment_score": r.sentiment_score,
-                        "category": f"市场:{market}", "lang": lang_key,
-                    })
+                actual_lang = _detect_lang(resp.results, "cn" if market == "CNStock" else "en")
+                target_lang = lang if lang != "all" else actual_lang
+                items = _results_to_list(resp.results, target_lang, f"市场:{market}")
+                result[target_lang].extend(items)
             return result
 
-        # ── 通用财经新闻 (原有逻辑) ──
-        search = SearchService()
+        # ═══════════════════════════════════════════════
+        # 路由 2: 个股新闻 (symbol 有值 且 symbol != market)
+        # ═══════════════════════════════════════════════
+        if symbol:
+            resp = search_news(
+                symbol=symbol, market=effective_market, lang=lang,
+                days=3, max_web_results=5, name=name or "",
+            )
+            if resp.success:
+                actual_lang = _detect_lang(resp.results, "cn" if effective_market == "CNStock" else "en")
+                target_lang = lang if lang != "all" else actual_lang
+                items = _results_to_list(resp.results, target_lang, f"个股:{symbol}")
+                result[target_lang].extend(items)
 
-        cn_queries = [
-            "加密货币新闻", "美联储利率", "美股市场最新消息",
-            "外汇市场分析", "全球经济数据", "期货市场动态",
-        ]
-        en_queries = [
-            "stock market news today", "cryptocurrency bitcoin news",
-            "forex market analysis", "federal reserve interest rate",
-            "global economic outlook", "S&P 500 market update",
-        ]
+                # 附加评分元数据
+                score_info = resp.metadata
+                if score_info:
+                    result["_meta"] = {
+                        "composite_score": score_info.get("composite_score", 0),
+                        "direction": score_info.get("direction", "中性"),
+                        "from_cache": score_info.get("from_cache", False),
+                        "total": len(resp.results),
+                    }
+            return result
 
-        if lang in ("all", "cn"):
-            for query in cn_queries:
-                try:
-                    results = search.search(query, num_results=5, date_restrict="d1")
-                    for r in results:
-                        result["cn"].append({
-                            "title": r.get("title", ""), "link": r.get("link", ""),
-                            "snippet": r.get("snippet", ""), "source": r.get("source", ""),
-                            "published": r.get("published", ""), "category": query, "lang": "cn",
-                        })
-                except Exception:
-                    pass
+        # ═══════════════════════════════════════════════
+        # 路由 3: 市场新闻 (market 有值, 无 symbol, 默认该市场)
+        # ═══════════════════════════════════════════════
+        if market != "all":
+            resp = search_news(
+                symbol=market, market=market, lang=lang,
+                days=1, max_web_results=10,
+            )
+            if resp.success:
+                actual_lang = _detect_lang(resp.results, "cn" if market == "CNStock" else "en")
+                target_lang = lang if lang != "all" else actual_lang
+                items = _results_to_list(resp.results, target_lang, f"市场:{market}")
+                result[target_lang].extend(items)
+            return result
 
-        if lang in ("all", "en"):
-            for query in en_queries:
-                try:
-                    results = search.search(query, num_results=5, date_restrict="d1")
-                    for r in results:
-                        result["en"].append({
-                            "title": r.get("title", ""), "link": r.get("link", ""),
-                            "snippet": r.get("snippet", ""), "source": r.get("source", ""),
-                            "published": r.get("published", ""), "category": query, "lang": "en",
-                        })
-                except Exception:
-                    pass
-
-        for lang_key in ["cn", "en"]:
-            seen: set = set()
-            unique = []
-            for news in result[lang_key]:
-                link = news.get("link", "")
-                if link and link not in seen:
-                    seen.add(link)
-                    unique.append(news)
-            result[lang_key] = unique[:15]
+        # ═══════════════════════════════════════════════
+        # 路由 4: 通用财经新闻 (无 symbol, 无 market)
+        # ═══════════════════════════════════════════════
+        return _fetch_general_news_cached(lang=lang)
 
     except Exception as e:
         logger.error("Failed to fetch financial news: %s", e)
