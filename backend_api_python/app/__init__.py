@@ -75,7 +75,10 @@ def get_pending_order_worker():
 
 
 def start_polymarket_worker():
-    """启动Polymarket后台任务"""
+    """[DISCONNECTED] Polymarket后台任务 — 已断开，不启动"""
+    logger.info("Polymarket worker is disconnected (code preserved, not started)")
+    return
+    # ── Original code below (preserved) ──
     try:
         from app.services.polymarket_worker import get_polymarket_worker
         get_polymarket_worker().start()

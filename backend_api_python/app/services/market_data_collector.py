@@ -224,15 +224,16 @@ class MarketDataCollector:
                 data["_meta"]["failed_items"].append("news")
         
         # === 阶段4: 预测市场数据 (如果需要) ===
-        if include_polymarket:
-            try:
-                polymarket_events = self._get_polymarket_events(symbol, market)
-                data["polymarket"] = polymarket_events
-                if polymarket_events:
-                    data["_meta"]["success_items"].append("polymarket")
-            except Exception as e:
-                logger.debug(f"Polymarket data fetch failed: {e}")
-                data["_meta"]["failed_items"].append("polymarket")
+        # [DISCONNECTED] Polymarket data collection disabled
+        # if include_polymarket:
+        #     try:
+        #         polymarket_events = self._get_polymarket_events(symbol, market)
+        #         data["polymarket"] = polymarket_events
+        #         if polymarket_events:
+        #             data["_meta"]["success_items"].append("polymarket")
+        #     except Exception as e:
+        #         logger.debug(f"Polymarket data fetch failed: {e}")
+        #         data["_meta"]["failed_items"].append("polymarket")
         
         # 记录总耗时
         data["_meta"]["duration_ms"] = int((time.time() - start_time) * 1000)

@@ -25,7 +25,8 @@ def register_routes(app: Flask):
     from app.routes.fast_analysis import fast_analysis_bp
     from app.routes.billing import billing_bp
     from app.routes.quick_trade import quick_trade_bp
-    from app.routes.polymarket import polymarket_bp
+    # [DISCONNECTED] Polymarket routes disabled — module code preserved but not loaded
+    # from app.routes.polymarket import polymarket_bp
     from app.routes.experiment import experiment_bp
     # eQuant features: stock picker, market dashboard, AI agent
     from app.routes.xuangu import xuangu_bp
@@ -57,7 +58,8 @@ def register_routes(app: Flask):
     app.register_blueprint(fast_analysis_bp, url_prefix='/api/fast-analysis')
     app.register_blueprint(billing_bp, url_prefix='/api/billing')
     app.register_blueprint(quick_trade_bp, url_prefix='/api/quick-trade')
-    app.register_blueprint(polymarket_bp, url_prefix='/api/polymarket')
+    # [DISCONNECTED] Polymarket blueprint registration disabled
+    # app.register_blueprint(polymarket_bp, url_prefix='/api/polymarket')
     app.register_blueprint(experiment_bp, url_prefix='/api/experiment')
     # eQuant features
     app.register_blueprint(xuangu_bp, url_prefix='/api/xuangu')

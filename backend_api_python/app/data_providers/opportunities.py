@@ -319,7 +319,10 @@ def analyze_opportunities_forex(opportunities: list):
 
 
 def analyze_opportunities_polymarket(opportunities: list):
-    """Scan prediction markets for opportunities."""
+    """[DISCONNECTED] Scan prediction markets for opportunities — Polymarket disabled."""
+    logger.info("Polymarket opportunity analysis is disconnected (code preserved, not executed)")
+    return
+    # ── Original code below (preserved) ──
     try:
         from app.data_sources.polymarket import PolymarketDataSource
         from app.services.polymarket_analyzer import PolymarketAnalyzer
