@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-A股个股多渠道新闻聚合工具 — stock_news.py v2.0
+A股个股多渠道新闻聚合工具 — stock_news.py v3.0
 
 功能:
   - 5路数据源并发抓取: 东方财富(公告+新闻)、新浪财经、新浪7x24快讯、腾讯财经、凤凰财经
-  - 标题归一化去重, 加权情感分析(0-10分), 时间衰减综合评分
-  - 输出标准 SearchResponse(SearchResult), 直接挂载到 search.py 搜索体系
+  - 标题归一化去重
+  - 输出标准 SearchResponse(SearchResult), 由上层 news.py 负责缓存和评分
 
 数据模型:
   - 复用 search.py 的 SearchResult / SearchResponse
-  - 情感标签: SearchResult.sentiment = "positive" | "negative" | "neutral"
-  - 综合评分: SearchResponse.metadata = { composite_score, direction, positive, negative, neutral }
+  - sentiment 默认 "neutral", sentiment_score 默认 0.0 (评分由 news_analysis 负责)
 
 对外接口:
   fetch_stock_news(stock_code, days, stock_name, sources, max_results) -> SearchResponse
@@ -20,28 +19,17 @@ A股个股多渠道新闻聚合工具 — stock_news.py v2.0
   - sources: 指定数据源, None=全部, 可选: eastmoney/sina/sina7x24/qq/ifeng
   - max_results: 限制返回条数, 0=不限
 
-挂载方式 (search.py):
-  StockNewsSearchProvider._do_search() 调用本模块 fetch_stock_news()
-  SearchService.search_cn_stock_news() 并行调用 Web搜索 + StockNews, 自动去重
-
 去重规则:
   - 标题归一化指纹(md5), 去除空白/标点, 与 search.py 的 _title_key 保持一致
   - stock_news 内部 5 路数据源先去重, search_cn_stock_news 中再与 web 结果去重
   - 优先级: stock_news > web搜索 (国内财经直连数据源优先)
 
-评分机制 (未改变):
-  - 每条新闻: 关键词加权情感分析 → sentiment + score
-  - 综合评分: 指数时间衰减(每天衰减20%), 非中性消息额外×1.5权重
-  - direction: 利好(≥7) / 偏利好(≥6) / 中性 / 偏利空(≤4) / 利空(≤3)
-
 依赖: requests, beautifulsoup4 (bs4)
-用法: python stock_news.py <股票代码> [有效天数] [--top N] [--json-only]
 """
 
 import sys
 import json
 import re
-import hashlib
 import argparse
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -108,84 +96,11 @@ def _rotating_headers() -> dict:
     h["User-Agent"] = _random.choice(_USER_AGENTS)
     return h
 
-# ─── 情感关键词库 (权重1-3, 越强信号权重越高) ───────────
-POSITIVE_WORDS = {
-    "涨停": 3, "封板": 3, "连板": 3, "一字涨停": 3, "地天板": 3,
-    "大涨": 2, "暴涨": 2, "飙升": 2, "强势涨停": 3,
-    "创新高": 2, "历史新高": 2, "突破": 2, "放量上涨": 2, "领涨": 2,
-    "强势": 1, "反弹": 1, "反转": 2, "金叉": 1, "上涨": 1, "走强": 1,
-    "业绩增长": 2, "利润增长": 2, "营收增长": 2, "净利增长": 2,
-    "超预期": 3, "超市场预期": 3, "大超预期": 3,
-    "业绩预增": 2, "扭亏": 2, "翻倍": 3, "高增长": 2,
-    "买入": 2, "增持": 2, "推荐": 2, "强烈推荐": 3, "上调目标价": 2,
-    "重大合同": 3, "中标": 2, "签大单": 2, "战略合作": 2,
-    "技术突破": 2, "量产": 2, "产能扩张": 2, "获批": 2,
-    "分红": 1, "回购": 2, "大股东增持": 3, "并购": 2,
-    "政策利好": 3, "政策支持": 2, "行业景气": 2, "涨价": 2,
-    "利好": 2, "重大利好": 3, "利好消息": 2,
-    "进军": 1, "拓展": 1, "布局": 1, "里程碑": 2,
-}
-NEGATIVE_WORDS = {
-    "跌停": 3, "一字跌停": 3, "连续跌停": 3, "天地板": 3,
-    "闪崩": 3, "崩盘": 3, "跳水": 2, "大跌": 2, "暴跌": 2, "重挫": 2,
-    "破位": 2, "破发": 2, "新低": 2, "历史新低": 3,
-    "放量下跌": 2, "领跌": 2, "弱势": 1, "下跌": 1, "走弱": 1,
-    "业绩下滑": 2, "利润下滑": 2, "净利下滑": 2, "净利大跌": 3,
-    "不及预期": 2, "业绩暴雷": 3, "暴雷": 3, "业绩变脸": 3,
-    "亏损": 2, "巨亏": 3, "大幅亏损": 3, "由盈转亏": 3,
-    "商誉减值": 3, "资产减值": 2, "财务造假": 3,
-    "卖出": 2, "减持": 2, "抛售": 2, "清仓": 3, "下调目标价": 2,
-    "大股东减持": 3, "违规减持": 3, "限售解禁": 2,
-    "裁员": 2, "停产": 2, "破产": 3, "清算": 3,
-    "质量事故": 3, "安全事故": 3, "产品召回": 2,
-    "监管调查": 3, "立案调查": 3, "违规": 2, "违法": 3,
-    "退市": 3, "ST": 2, "暂停上市": 3,
-    "债务危机": 3, "债务违约": 3, "资金链断裂": 3,
-    "诉讼": 2, "巨额索赔": 3,
-    "利空": 2, "重大利空": 3, "黑天鹅": 3,
-}
-
 
 # ─── 工具函数 ────────────────────────────────────────────
 def _clean_html(text: str) -> str:
     return BeautifulSoup(text, "html.parser").get_text(separator=" ", strip=True)
 
-
-def _analyze_sentiment(title: str, summary: str = "") -> tuple:
-    """加权情感评分 -10 ~ +10, 返回 (label, score, keywords)
-    0 = 中性, 正 = 利好, 负 = 利空
-    """
-    text = f"{title} {summary}"
-    pos_weight, neg_weight = 0, 0
-    hits = []
-
-    for word, weight in POSITIVE_WORDS.items():
-        if word in text:
-            pos_weight += weight
-            hits.append(word)
-    for word, weight in NEGATIVE_WORDS.items():
-        if word in text:
-            neg_weight += weight
-            hits.append(word)
-
-    total = pos_weight + neg_weight
-    if total == 0:
-        return "neutral", 0.0, []
-
-    raw = (pos_weight - neg_weight) / total  # ∈ [-1, +1]
-    confidence = min(total / 6, 1.0)
-    # 映射到 -10 ~ +10
-    score = round(raw * 10.0 * confidence, 1)
-    score = max(-10.0, min(10.0, score))
-
-    if score > 1.0:
-        label = "positive"
-    elif score < -1.0:
-        label = "negative"
-    else:
-        label = "neutral"
-
-    return label, score, list(set(hits))
 
 
 def _summarize(title: str, text: str = "", abstract: str = "", max_len: int = 1000) -> str:
@@ -208,13 +123,7 @@ def _parse_time(t: str) -> Optional[datetime]:
     return None
 
 
-def _title_hash(title: str, source: str = "") -> str:
-    """标题归一化指纹, 用于去重 — 与 search.py 的 _title_key 保持一致"""
-    norm = re.sub(r'[\s\u3000\uff0c\u3001\u3002\uff01\uff1f\u2014]', '', title)
-    return hashlib.md5(norm.encode()).hexdigest()[:16]
-
-
-# ─── 股票名称/代码互查 ────────────────────────────────────
+# ═══════════════════════════════════════════════════════════# ─── 股票名称/代码互查 ────────────────────────────────────
 def _get_stock_name(code: str) -> str:
     try:
         sess = _get_session()
@@ -283,11 +192,10 @@ def _fetch_eastmoney(code: str, days: int, name: str = "") -> List[SearchResult]
                 art_code = art.get("art_code", "")
                 art_url = f"https://data.eastmoney.com/notices/detail/{code}/{art_code}.html"
                 summary = _summarize(title)
-                sentiment, score, skw = _analyze_sentiment(title, summary)
                 items.append(SearchResult(
                     title=title, snippet=summary, url=art_url,
                     source="东方财富公告", published_date=pub_time.isoformat(),
-                    sentiment=sentiment, sentiment_score=score))
+                    sentiment="neutral", sentiment_score=0.0))
     except Exception as e:
         print(f"  [东方财富公告] 异常: {e}", file=sys.stderr)
 
@@ -346,11 +254,10 @@ def _fetch_eastmoney(code: str, days: int, name: str = "") -> List[SearchResult]
                     url_link = "https:" + url_link
                 content = art.get("content", "")
                 summary = _summarize(title, abstract=content)
-                sentiment, score, skw = _analyze_sentiment(title, summary)
                 items.append(SearchResult(
                     title=title, snippet=summary, url=url_link,
                     source="东方财富新闻", published_date=pub_time.isoformat(),
-                    sentiment=sentiment, sentiment_score=score))
+                    sentiment="neutral", sentiment_score=0.0))
         except Exception as e:
             print(f"  [东方财富新闻/{kw}] 异常: {e}", file=sys.stderr)
 
@@ -393,11 +300,10 @@ def _fetch_sina(code: str, days: int, name: str = "") -> List[SearchResult]:
                 continue
 
             summary = _summarize(title)
-            sentiment, score, keywords = _analyze_sentiment(title, summary)
             items.append(SearchResult(
                 title=title, snippet=summary, url=href,
                 source="新浪财经", published_date=pub_time.isoformat(),
-                sentiment=sentiment, sentiment_score=score))
+                sentiment="neutral", sentiment_score=0.0))
     except Exception as e:
         print(f"  [新浪财经] 异常: {e}", file=sys.stderr)
     return items
@@ -431,12 +337,11 @@ def _fetch_sina7x24(code: str, days: int, name: str = "") -> List[SearchResult]:
                 continue
 
             summary = _summarize(title, content)
-            sentiment, score, skw = _analyze_sentiment(title, summary)
             items.append(SearchResult(
                 title=title[:80], snippet=summary,
                 url=f"https://zhibo.sina.com.cn/152/{item_data.get('id', '')}.html",
                 source="新浪7x24", published_date=pub_time.isoformat(),
-                sentiment=sentiment, sentiment_score=score))
+                sentiment="neutral", sentiment_score=0.0))
     except Exception as e:
         print(f"  [新浪7x24] 异常: {e}", file=sys.stderr)
     return items
@@ -479,11 +384,10 @@ def _fetch_qq(code: str, days: int, name: str = "") -> List[SearchResult]:
             if art_url and not art_url.startswith("http"):
                 art_url = "https:" + art_url
             summary = _summarize(title, item.get("brief", "") or item.get("abstract", ""))
-            sentiment, score, skw = _analyze_sentiment(title, summary)
             items.append(SearchResult(
                 title=title, snippet=summary, url=art_url,
                 source="腾讯财经", published_date=pub_time.isoformat(),
-                sentiment=sentiment, sentiment_score=score))
+                sentiment="neutral", sentiment_score=0.0))
     except Exception as e:
         print(f"  [腾讯财经] 异常: {e}", file=sys.stderr)
     return items
@@ -519,114 +423,13 @@ def _fetch_ifeng(code: str, days: int, name: str = "") -> List[SearchResult]:
             if art_url and not art_url.startswith("http"):
                 art_url = "https:" + art_url
             summary = _summarize(title, item.get("brief", item.get("digest", "")))
-            sentiment, score, keywords = _analyze_sentiment(title, summary)
             items.append(SearchResult(
                 title=title, snippet=summary, url=art_url,
                 source="凤凰财经", published_date=pub_time.isoformat(),
-                sentiment=sentiment, sentiment_score=score))
+                sentiment="neutral", sentiment_score=0.0))
     except Exception as e:
         print(f"  [凤凰财经] 异常: {e}", file=sys.stderr)
     return items
-
-
-# ═══════════════════════════════════════════════════════════
-# 综合评分 (RMS 聚合 + 非对称时间衰减)
-# ═══════════════════════════════════════════════════════════
-import math
-
-# 衰减参数: 好消息 10 天半衰期, 坏消息 15 天半衰期
-GOOD_HALF_LIFE_HOURS = 10.0 * 24  # 240 小时
-BAD_HALF_LIFE_HOURS  = 15.0 * 24  # 360 小时
-
-
-def _time_decay(hours_old: float, is_negative: bool) -> float:
-    """指数衰减: weight = 0.5^(t / half_life)"""
-    half_life = BAD_HALF_LIFE_HOURS if is_negative else GOOD_HALF_LIFE_HOURS
-    return math.pow(0.5, hours_old / half_life)
-
-
-def _calc_composite(results: List[SearchResult]) -> dict:
-    """基于 RMS + 非对称时间衰减的综合评分 (-5 ~ +5)"""
-    now = datetime.now()
-    pos_weighted: List[float] = []
-    neg_weighted: List[float] = []
-    pos = neg = neu = 0
-
-    for r in results:
-        score = r.sentiment_score  # 已经是 -10 ~ +10
-        if score is None:
-            score = 0.0  # 无评分视为中性
-
-        # 计算时间衰减
-        hours_old = 0.0
-        if r.published_date:
-            try:
-                pub = datetime.fromisoformat(r.published_date)
-                hours_old = max(0.0, (now - pub).total_seconds() / 3600.0)
-            except (ValueError, TypeError):
-                pass
-
-        is_neg = score < 0
-        decay = _time_decay(hours_old, is_neg)
-        weighted = score * decay
-
-        if weighted > 0.01:
-            pos_weighted.append(weighted)
-            pos += 1
-        elif weighted < -0.01:
-            neg_weighted.append(abs(weighted))
-            neg += 1
-        else:
-            neu += 1
-
-    # 加权 RMS 聚合 (quartic weighting): 强信号自权重极高, 中性不稀释
-    def _weighted_rms(values: List[float]) -> float:
-        if not values:
-            return 0.0
-        weights = [abs(v) ** 4 for v in values]
-        total_weight = sum(weights)
-        if total_weight == 0:
-            return 0.0
-        return math.sqrt(sum(v * v * w for v, w in zip(values, weights)) / total_weight)
-
-    pos_rms = _weighted_rms(pos_weighted)
-    neg_rms = _weighted_rms(neg_weighted)
-
-    # 合成: raw ∈ [-10, +10] → composite ∈ [-5, +5]
-    raw = pos_rms - neg_rms
-    composite = round(max(-5.0, min(5.0, raw * 0.5)), 1)
-
-    if composite >= 3.0:
-        direction = "利好"
-    elif composite >= 1.0:
-        direction = "偏利好"
-    elif composite <= -3.0:
-        direction = "利空"
-    elif composite <= -1.0:
-        direction = "偏利空"
-    else:
-        direction = "中性"
-
-    return {
-        "composite_score": composite,
-        "direction": direction,
-        "positive": pos, "negative": neg, "neutral": neu,
-    }
-
-
-# ═══════════════════════════════════════════════════════════
-# 去重
-# ═══════════════════════════════════════════════════════════
-def _dedup(results: List[SearchResult]) -> List[SearchResult]:
-    """标题归一化去重 (跨数据源)"""
-    seen = set()
-    out = []
-    for r in results:
-        h = _title_hash(r.title)
-        if h not in seen:
-            seen.add(h)
-            out.append(r)
-    return out
 
 
 # ═══════════════════════════════════════════════════════════
@@ -659,7 +462,7 @@ def fetch_stock_news(
         max_results: 限制返回条数, 0=不限
 
     Returns:
-        SearchResponse (metadata 含 composite_score / direction / 正负面统计)
+        SearchResponse (metadata 不含评分, 由上层 news_analysis 负责)
     """
     import time as _time
     t0 = _time.time()
@@ -690,12 +493,8 @@ def fetch_stock_news(
             except Exception:
                 pass
 
-    # 去重 + 按时间降序
-    all_results = _dedup(all_results)
+    # 按时间降序
     all_results.sort(key=lambda r: r.published_date or "", reverse=True)
-
-    # 综合评分
-    composite = _calc_composite(all_results)
 
     if max_results > 0:
         all_results = all_results[:max_results]
@@ -706,14 +505,13 @@ def fetch_stock_news(
         provider="StockNews",
         success=len(all_results) > 0,
         search_time=round(_time.time() - t0, 2),
-        metadata=composite,
+        metadata={},
     )
 
 
 # ═══════════════════════════════════════════════════════════
 # CLI
 # ═══════════════════════════════════════════════════════════
-_SENTIMENT_ICONS = {"positive": "🟢", "negative": "🔴", "neutral": "⚪"}
 
 
 def main():
@@ -722,16 +520,11 @@ def main():
     parser.add_argument("days", type=int, nargs="?", default=3, help="有效天数 (默认 3)")
     parser.add_argument("--top", type=int, default=0, help="只输出前 N 条")
     parser.add_argument("--json-only", action="store_true", help="只输出 JSON")
-    parser.add_argument("--keep-neutral", action="store_true", help="保留中性消息")
     parser.add_argument("--sources", nargs="+",
                         choices=list(ALL_FETCHERS.keys()), default=None)
     args = parser.parse_args()
 
     resp = fetch_stock_news(args.code.strip(), args.days, sources=args.sources)
-
-    if not args.keep_neutral:
-        resp.results = [r for r in resp.results if r.sentiment != "neutral"]
-        resp.metadata = _calc_composite(resp.results)
 
     if args.top > 0:
         resp.results = resp.results[:args.top]
@@ -741,22 +534,14 @@ def main():
         "provider": resp.provider,
         "success": resp.success,
         "search_time": resp.search_time,
-        **resp.metadata,
         "news": [r.to_dict() for r in resp.results],
     }
 
     if args.json_only:
         print(json.dumps(output, ensure_ascii=False, indent=2))
     else:
-        sc = output.get("composite_score", 0)
-        direction = output.get("direction", "中性")
-        icon = "🟢" if sc >= 1 else ("🔴" if sc <= -1 else "⚪")
-        bars = "█" * max(1, int(abs(sc) * 2))
-        print(f"\n  {icon} 综合评分: {bars} {sc:+.1f}/5  [{direction}]  "
-              f"利好{output.get('positive',0)} 利空{output.get('negative',0)} 中性{output.get('neutral',0)}")
         for i, r in enumerate(resp.results, 1):
-            ri = _SENTIMENT_ICONS.get(r.sentiment, "⚪")
-            print(f"  {ri} {i:>3}. [{r.source}] {r.title}")
+            print(f"  {i:>3}. [{r.source}] {r.title}")
             if r.snippet and r.snippet != r.title:
                 print(f"      📝 {r.snippet[:120]}")
         print(f"\n  共 {len(resp.results)} 条, 耗时 {resp.search_time}s")

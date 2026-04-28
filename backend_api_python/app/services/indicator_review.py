@@ -617,11 +617,10 @@ def _search_stock_news_sentiment(symbol: str, name: str = "", _cancelled: List[b
 
     try:
         from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-        from app.services.search import SearchService
+        from app.data_providers.news import search_cn_stock_news
 
         def _do_search():
-            svc = SearchService()
-            return svc.search_cn_stock_news(
+            return search_cn_stock_news(
                 stock_code=symbol,
                 stock_name=name or "",
                 days=3,

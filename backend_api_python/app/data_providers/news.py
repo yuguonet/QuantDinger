@@ -7,8 +7,7 @@ Financial news data provider — 新闻数据生命周期管理
 3. 市场新闻 vs 个股新闻 区分:
    - 市场新闻: news_fetcher.py 直爬 (A股优先) + Web 补充, 预定义 symbol
    - 个股新闻: stock_news.py 5路源 + Web 并行, symbol=股票代码
-4. 通用财经新闻: fetch_financial_news() 按语言分类
-5. 经济日历: get_economic_calendar() 模板化事件
+4. 通用财经新闻: fetch_financial_news() 按语言/市场/个股分发
 
 数据流:
   市场新闻 → news_fetcher.py (A股直爬, 优先) + search.py (Web 补充)
@@ -19,10 +18,9 @@ from __future__ import annotations
 
 import hashlib
 import re
-import random
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from app.utils.logger import get_logger
@@ -317,19 +315,21 @@ class NewsCacheManager:
     @staticmethod
     def calc_score(symbol: str, market: str) -> Dict[str, Any]:
         """
-        综合评分 = 所有文章 (score × 遗忘因子) 求和 ÷ 文章数
+        综合评分 — 委托 news_analysis.composite_score() (RMS + 非对称时间衰减)
 
-        规则:
-          - 从 DB 按 (symbol, market) 读取全部文章
-          - 一票否决 (sentiment_score == -999): 评分视为 0
-          - 遗忘因子: 0.8^(created_hours/24), 基于入库时间 created_at
-          - 最终 = Σ(score × decay) / count
+        输出分值范围: -5 ~ +5 (与 composite_score 一致)
+        外部接口:
+          输入: symbol, market
+          输出: {"composite_score": -5~+5, "direction": ..., "positive": ..., ...}
         """
+        from app.services.news_analysis import composite_score as _composite_score
+
+        # ── 从 DB 读取 ──
         try:
             with get_db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    """SELECT sentiment, sentiment_score, created_at
+                    """SELECT sentiment_score, created_at
                        FROM qd_news_cache_items
                        WHERE symbol = %s AND market = %s""",
                     (symbol, market)
@@ -340,65 +340,32 @@ class NewsCacheManager:
             rows = []
 
         if not rows:
-            return {"composite_score": 5.0, "direction": "中性",
-                    "positive": 0, "negative": 0, "neutral": 0, "veto": False}
+            return {"composite_score": 0.0, "direction": "中性",
+                    "positive": 0, "negative": 0, "neutral": 0,
+                    "veto": False, "veto_count": 0}
 
-        now = datetime.now()
-        pos = neg = neu = 0
-        veto_count = 0
-        scores = []
-
+        # ── 构造 composite_score() 所需的 articles 列表 ──
+        articles = []
         for row in rows:
-            s = row.get("sentiment", "neutral")
             raw_score = row.get("sentiment_score")
             created_at = row.get("created_at")
+            articles.append({
+                "score": float(raw_score) if raw_score is not None else 0.0,
+                "published_date": created_at.isoformat() if created_at else "",
+            })
 
-            if s == "positive":
-                pos += 1
-            elif s == "negative":
-                neg += 1
-            else:
-                neu += 1
+        # ── 调用 composite_score() ──
+        result = _composite_score(articles)
 
-            # 一票否决: 直接赋值 0, 不参与遗忘因子计算
-            is_veto = raw_score is not None and float(raw_score) == -999.0
-            if is_veto:
-                veto_count += 1
-                scores.append(0.0)
-                continue
-
-            score = float(raw_score) if raw_score is not None else \
-                {"positive": 7.5, "negative": 2.5, "neutral": 5.0}.get(s, 5.0)
-
-            # 遗忘因子: 基于入库时间
-            if created_at:
-                try:
-                    hours = max(0, (now - created_at).total_seconds() / 3600)
-                except Exception:
-                    hours = 24
-            else:
-                hours = 24
-            decay = 0.8 ** (hours / 24)
-
-            scores.append(score * decay)
-
-        composite = round(sum(scores) / len(scores), 1) if scores else 5.0
-        composite = max(0.0, min(10.0, composite))
-
-        if composite >= 7:
-            direction = "利好"
-        elif composite <= 3:
-            direction = "利空"
-        elif composite >= 6:
-            direction = "偏利好"
-        elif composite <= 4:
-            direction = "偏利空"
-        else:
-            direction = "中性"
-
-        return {"composite_score": composite, "direction": direction,
-                "positive": pos, "negative": neg, "neutral": neu,
-                "veto": veto_count > 0, "veto_count": veto_count}
+        return {
+            "composite_score": result["composite_score"],   # -5 ~ +5
+            "direction": result["direction"],
+            "positive": result.get("positive_count", 0),
+            "negative": result.get("negative_count", 0),
+            "neutral": result.get("neutral_count", 0),
+            "veto": result.get("veto", False),
+            "veto_count": 1 if result.get("veto") else 0,
+        }
 
 
 # 全局缓存管理器单例
@@ -619,7 +586,7 @@ def search_market_news(
     if market == "CNStock":
         # A股: news_fetcher 直爬 (并行)
         def _do_fetch():
-            from app.services.news_fetcher import fetch_all_news
+            from app.services.cn_news_provider import fetch_all_news
             return fetch_all_news(max_per_source=max_fetcher_per_source)
 
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -708,11 +675,63 @@ def search_market_news(
 # 通用财经新闻
 # ═══════════════════════════════════════════════════════════════
 
-def fetch_financial_news(lang: str = "all") -> Dict[str, List[Dict[str, Any]]]:
-    """Fetch financial news using search service — separated by language."""
+def fetch_financial_news(
+    lang: str = "all",
+    market: str = "all",
+    symbol: str = "",
+    name: str = "",
+) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    财经新闻统一入口 — 按 lang/market/symbol 分发
+
+    路由:
+      - symbol 有值 → 个股新闻 (search_cn_stock_news / search_market_news)
+      - market != "all" → 市场新闻 (search_market_news)
+      - 其他 → 通用财经新闻 (SearchService 多关键词)
+    """
     result: Dict[str, List[Dict[str, Any]]] = {"cn": [], "en": []}
 
     try:
+        # ── 个股新闻 ──
+        if symbol:
+            resp = search_cn_stock_news(
+                stock_code=symbol, stock_name=name or "",
+                days=3, max_web_results=5,
+                market=market if market != "all" else "CNStock",
+            )
+            if resp.success:
+                lang_key = "cn" if lang in ("all", "cn") else "en"
+                for r in resp.results:
+                    result[lang_key].append({
+                        "title": r.title, "link": r.url,
+                        "snippet": r.snippet, "source": r.source,
+                        "published": r.published_date or "",
+                        "sentiment": r.sentiment,
+                        "sentiment_score": r.sentiment_score,
+                        "category": f"个股:{symbol}", "lang": lang_key,
+                    })
+            return result
+
+        # ── 市场新闻 ──
+        if market != "all":
+            resp = search_market_news(
+                market=market, symbol=symbol or market,
+                days=1, max_web_results=10,
+            )
+            if resp.success:
+                lang_key = "cn" if lang in ("all", "cn") else "en"
+                for r in resp.results:
+                    result[lang_key].append({
+                        "title": r.title, "link": r.url,
+                        "snippet": r.snippet, "source": r.source,
+                        "published": r.published_date or "",
+                        "sentiment": r.sentiment,
+                        "sentiment_score": r.sentiment_score,
+                        "category": f"市场:{market}", "lang": lang_key,
+                    })
+            return result
+
+        # ── 通用财经新闻 (原有逻辑) ──
         search = SearchService()
 
         cn_queries = [
@@ -766,81 +785,3 @@ def fetch_financial_news(lang: str = "all") -> Dict[str, List[Dict[str, Any]]]:
 
     return result
 
-
-# ---------------------------------------------------------------------------
-# Economic calendar (template-based, no real API yet)
-# ---------------------------------------------------------------------------
-
-_SAMPLE_EVENTS = [
-    {"name": "美国非农就业数据", "name_en": "US Non-Farm Payrolls", "country": "US", "importance": "high", "forecast": "180K", "previous": "175K", "impact_if_above": "bullish", "impact_if_below": "bearish", "impact_desc": "高于预期利多美元/美股，低于预期利空", "impact_desc_en": "Above forecast: bullish USD/stocks; Below: bearish"},
-    {"name": "美联储利率决议", "name_en": "Fed Interest Rate Decision", "country": "US", "importance": "high", "forecast": "5.25%", "previous": "5.25%", "impact_if_above": "bearish", "impact_if_below": "bullish", "impact_desc": "加息利空股市/加密货币，降息利多", "impact_desc_en": "Rate hike: bearish stocks/crypto; Cut: bullish"},
-    {"name": "美国CPI月率", "name_en": "US CPI m/m", "country": "US", "importance": "high", "forecast": "0.3%", "previous": "0.4%", "impact_if_above": "bearish", "impact_if_below": "bullish", "impact_desc": "CPI高于预期增加加息预期，利空股市", "impact_desc_en": "Higher CPI increases rate hike expectations, bearish stocks"},
-    {"name": "欧洲央行利率决议", "name_en": "ECB Interest Rate Decision", "country": "EU", "importance": "high", "forecast": "4.50%", "previous": "4.50%", "impact_if_above": "bearish", "impact_if_below": "bullish", "impact_desc": "加息利空欧股，利多欧元", "impact_desc_en": "Rate hike: bearish EU stocks, bullish EUR"},
-    {"name": "日本央行利率决议", "name_en": "BoJ Interest Rate Decision", "country": "JP", "importance": "high", "forecast": "0.10%", "previous": "0.10%", "impact_if_above": "bullish", "impact_if_below": "bearish", "impact_desc": "加息预期利多日元，利空日股", "impact_desc_en": "Rate hike expectation: bullish JPY, bearish Nikkei"},
-    {"name": "美国初请失业金人数", "name_en": "US Initial Jobless Claims", "country": "US", "importance": "medium", "forecast": "215K", "previous": "212K", "impact_if_above": "bearish", "impact_if_below": "bullish", "impact_desc": "失业人数上升利空美元，利多黄金", "impact_desc_en": "Rising claims: bearish USD, bullish gold"},
-    {"name": "英国央行利率决议", "name_en": "BoE Interest Rate Decision", "country": "UK", "importance": "high", "forecast": "5.25%", "previous": "5.25%", "impact_if_above": "bullish", "impact_if_below": "bearish", "impact_desc": "加息利多英镑，利空英股", "impact_desc_en": "Rate hike: bullish GBP, bearish UK stocks"},
-    {"name": "美国零售销售月率", "name_en": "US Retail Sales m/m", "country": "US", "importance": "medium", "forecast": "0.4%", "previous": "0.6%", "impact_if_above": "bullish", "impact_if_below": "bearish", "impact_desc": "零售数据强劲利多美元和美股", "impact_desc_en": "Strong retail: bullish USD and stocks"},
-    {"name": "OPEC月度报告", "name_en": "OPEC Monthly Report", "country": "INTL", "importance": "medium", "forecast": "-", "previous": "-", "impact_if_above": "bullish", "impact_if_below": "bearish", "impact_desc": "减产预期利多原油，增产预期利空", "impact_desc_en": "Production cut: bullish oil; Increase: bearish"},
-]
-
-
-def get_economic_calendar() -> List[Dict[str, Any]]:
-    """Generate economic calendar events with impact indicators."""
-    today = datetime.now()
-    events = []
-
-    for i, evt in enumerate(_SAMPLE_EVENTS):
-        days_offset = i % 14 - 5
-        event_date = today + timedelta(days=days_offset)
-        hour = (8 + (i * 3)) % 24
-
-        is_released = event_date.date() < today.date() or (
-            event_date.date() == today.date() and hour < today.hour
-        )
-
-        actual_value = None
-        actual_impact = None
-        expected_impact = evt["impact_if_above"]
-
-        if is_released:
-            forecast_num = "".join(filter(lambda x: x.isdigit() or x == ".", evt["forecast"]))
-            if forecast_num:
-                try:
-                    base = float(forecast_num)
-                    variation = random.uniform(-0.15, 0.15)
-                    actual_num = base * (1 + variation)
-                    if "K" in evt["forecast"]:
-                        actual_value = f"{actual_num:.0f}K"
-                    elif "%" in evt["forecast"]:
-                        actual_value = f"{actual_num:.2f}%"
-                    else:
-                        actual_value = f"{actual_num:.2f}"
-                    if actual_num > base:
-                        actual_impact = evt["impact_if_above"]
-                    elif actual_num < base:
-                        actual_impact = evt["impact_if_below"]
-                    else:
-                        actual_impact = "neutral"
-                except Exception:
-                    actual_value = evt["forecast"]
-                    actual_impact = "neutral"
-            else:
-                actual_value = evt["forecast"]
-                actual_impact = "neutral"
-
-        events.append({
-            "id": i + 1,
-            "name": evt["name"], "name_en": evt["name_en"],
-            "country": evt["country"],
-            "date": event_date.strftime("%Y-%m-%d"),
-            "time": f"{hour:02d}:30",
-            "importance": evt["importance"],
-            "actual": actual_value, "forecast": evt["forecast"], "previous": evt["previous"],
-            "impact_if_above": evt["impact_if_above"], "impact_if_below": evt["impact_if_below"],
-            "impact_desc": evt["impact_desc"], "impact_desc_en": evt["impact_desc_en"],
-            "expected_impact": expected_impact, "actual_impact": actual_impact,
-            "is_released": is_released,
-        })
-
-    events.sort(key=lambda x: (x["date"], x["time"]))
-    return events
