@@ -617,7 +617,7 @@ def _search_stock_news_sentiment(symbol: str, name: str = "", _cancelled: List[b
 
     try:
         from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-        from app.data_providers.news import fetch_financial_news
+        from app.services.news_service import fetch_financial_news
 
         def _do_search():
             return fetch_financial_news(

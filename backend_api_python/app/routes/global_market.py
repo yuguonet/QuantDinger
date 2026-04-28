@@ -36,7 +36,7 @@ from app.data_providers.sentiment import (
     fetch_fear_greed_index, fetch_vix, fetch_dollar_index,
     fetch_yield_curve, fetch_vxn, fetch_gvz, fetch_put_call_ratio,
 )
-from app.data_providers.news import fetch_financial_news
+from app.services.news_service import fetch_financial_news
 from app.data_providers.heatmap import generate_heatmap_data
 
 logger = get_logger(__name__)

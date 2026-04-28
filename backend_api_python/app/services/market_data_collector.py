@@ -2101,7 +2101,7 @@ class MarketDataCollector:
         news_list = []
         
         try:
-            from app.data_providers.news import fetch_financial_news
+            from app.services.news_service import fetch_financial_news
             response = fetch_financial_news(lang="all", 
                                         market="CNStock",
                                         symbol=symbol,

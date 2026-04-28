@@ -586,30 +586,54 @@ def _fetch_ifeng(code: str, days: int, name: str = "") -> List[Dict[str, Any]]:
 
 # ─── 数据源 6: 同花顺 (v2.3 新增) ───
 def _fetch_ths(code: str, days: int, name: str = "") -> List[Dict[str, Any]]:
-    """同花顺个股新闻 (v2.3 新增, 2026-04 验证可用)"""
+    """同花顺个股新闻 (v2.3 新增, 2026-04 验证可用)
+    数据源: stockpage.10jqka.com.cn/{code}/ HTML 页面
+    从个股页面的 news 区块提取新闻链接，支持按股票代码筛选
+    """
     items = []
     cutoff = datetime.now() - timedelta(days=days)
     sess = _get_session()
     try:
-        url = "https://news.10jqka.com.cn/tapp/news/push/stock/"
-        params = {"page": "1", "track": "website", "pagesize": "20"}
+        url = f"https://stockpage.10jqka.com.cn/{code}/"
         resp = sess.get(url, headers=_rotating_headers(), timeout=TIMEOUT)
         if resp.status_code != 200:
             return items
-        data = resp.json()
-        news_list = data.get("data", {}).get("list", []) if isinstance(data.get("data"), dict) else []
-        for item in news_list:
-            title = item.get("title", "").strip()
-            if not title:
-                continue
-            ctime = item.get("ctime", "") or item.get("datetime", "")
-            try:
-                pub_time = datetime.fromtimestamp(int(ctime)) if ctime else None
-            except (ValueError, TypeError):
-                pub_time = _parse_time(str(ctime))
-            if not pub_time or pub_time < cutoff:
-                continue
-            items.append({"title": title, "url": item.get("url", ""), "time": pub_time.strftime("%Y-%m-%d %H:%M"), "source": "同花顺"})
+        resp.encoding = 'utf-8'
+        # 提取 news 区块中的链接
+        news_blocks = re.findall(
+            r'class="[^"]*news[^"]*"[^>]*>(.*?)</(?:div|ul|section)',
+            resp.text, re.DOTALL | re.IGNORECASE
+        )
+        seen_titles = set()
+        for block in news_blocks:
+            links = re.findall(r'<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>', block, re.DOTALL)
+            for href, raw_title in links:
+                title = re.sub(r'<[^>]+>', '', raw_title).strip()
+                title = title.replace('&nbsp;', '').replace('\n', '').strip()
+                if not title or len(title) < 6 or title in seen_titles:
+                    continue
+                seen_titles.add(title)
+                # 从 URL 提取日期 (格式: /20260428/xxxxx.shtml)
+                date_match = re.search(r'/(\d{8})/', href)
+                time_str = ""
+                pub_time = None
+                if date_match:
+                    try:
+                        pub_time = datetime.strptime(date_match.group(1), "%Y%m%d")
+                        time_str = pub_time.strftime("%Y-%m-%d %H:%M")
+                    except ValueError:
+                        pass
+                if pub_time and pub_time < cutoff:
+                    continue
+                # 补全 URL
+                if href and not href.startswith("http"):
+                    href = "https:" + href if href.startswith("//") else "https://stockpage.10jqka.com.cn" + href
+                items.append({
+                    "title": title,
+                    "url": href,
+                    "time": time_str,
+                    "source": "同花顺",
+                })
     except Exception as e:
         print(f"  [同花顺] 异常: {e}", file=sys.stderr)
     return items

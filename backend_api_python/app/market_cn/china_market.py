@@ -348,7 +348,7 @@ def _china_macro_fetch() -> dict:
 
 def _china_policy_fetch() -> dict:
     """政策解读原始获取逻辑 — 通过 fetch_financial_news 统一接口获取。"""
-    from app.data_providers.news import fetch_financial_news, get_news_cache_manager
+    from app.services.news_service import fetch_financial_news, get_news_cache_manager
     resp = fetch_financial_news(lang="all", market="CNStock", symbol="POLICY")
     cache_mgr = get_news_cache_manager()
     items = cache_mgr.get_items("POLICY", "CNStock")
