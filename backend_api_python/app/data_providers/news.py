@@ -432,7 +432,7 @@ def search_news(
 
     内部按 symbol 类型自动选数据源:
       symbol 是股票代码 → StockNews 5路 (A股) + Web (按 lang 选中/英文)
-      symbol 是市场名   → cn_news_provider (A股) + Web (按 lang 选中/英文)
+      symbol 是市场名   → StockNews(A股) + Web (按 lang 选中/英文)
 
     Args:
         symbol:    股票代码 ("600519", "AAPL") 或 市场名 ("CNStock", "USStock")
@@ -488,7 +488,7 @@ def search_news(
     # 搜索: 按 symbol 类型 + lang 选择数据源
     # ═══════════════════════════════════════════════
     search_svc = get_search_service()
-    source_results: List[SearchResult] = []  # 优先源 (StockNews / cn_news_provider)
+    source_results: List[SearchResult] = []  # 优先源 (StockNews)
     web_results: List[SearchResult] = []     # Web 补充
 
     def _title_key(r: SearchResult) -> str:
@@ -513,13 +513,6 @@ def search_news(
                 futures[pool.submit(search_svc.search_with_fallback, en_q, max_web_results, effective_days)] = "en_web"
 
         else:
-            # ── 市场: cn_news_provider (A股, 仅中文) ──
-            if market == "CNStock" and lang in ("cn", "all"):
-                def _do_fetch():
-                    from app.services.cn_news_provider import fetch_all_news
-                    return fetch_all_news(max_per_source=10)
-                futures[pool.submit(_do_fetch)] = "cn_news"
-
             # ── 市场: Web 搜索 (按 lang 选查询词) ──
             cn_query_map = {
                 "USStock": "美股市场新闻 股票",
