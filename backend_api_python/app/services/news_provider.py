@@ -7,7 +7,7 @@
 v2.2 修复:
 - 东方财富: API 新增 req_trace 参数, 改用 7x24 快讯接口
 - 财联社: content 字段类型变更(str), 适配 brief + ctime
-- 新浪财经: zhibo API 失效, 改用 feed.mix.sina.com.cn 滚动新闻
+- 新浪财经: feed.mix 大量 403, 改用 zhibo.sina.com.cn 7x24 + top 热榜双通道
 - 华尔街见闻: 保持不变 (正常工作)
 """
 
@@ -93,50 +93,70 @@ def fetch_eastmoney_news(category="财经", max_items=20):
 
 
 def fetch_sina_finance_news(max_items=20):
+    """新浪财经新闻 (v2.3 修复)
+    主通道: zhibo.sina.com.cn 7x24 直播流 (稳定, 已验证)
+    备用: top.finance.sina.com.cn 热榜
+    已弃用: feed.mix.sina.com.cn (大量 lid 返回 403)
     """
-    新浪财经新闻
-    接口: feed.mix.sina.com.cn 滚动新闻 API
-    注意: 该 API 有频率限制, 部分 lid 会返回 403, 自动尝试备用 lid
-    """
-    url = "https://feed.mix.sina.com.cn/api/roll/get"
-    # 2516=财经综合, 2509=股票, 2511=国际, 2519=7x24
-    lids = ["2516", "2509", "2511", "2519"]
-    for lid in lids:
-        params = {
-            "pageid": "153",
-            "lid": lid,
-            "k": "",
-            "num": str(max_items),
-            "page": "1",
-        }
-        try:
-            resp = requests.get(url, params=params, headers=HEADERS, timeout=10)
-            if resp.status_code != 200:
-                continue
+    sess = _get_session()
+
+    # ── 主通道: zhibo 7x24 ──
+    try:
+        url = "https://zhibo.sina.com.cn/api/zhibo/feed"
+        params = {"page": 1, "page_size": max_items, "zhibo_id": 152, "tag_id": 0, "type": 0}
+        resp = sess.get(url, params=params, headers=_rotating_headers(), timeout=TIMEOUT)
+        if resp.status_code == 200:
             data = resp.json()
-            items = data.get("result", {}).get("data", [])
-            if not items:
-                continue
+            feed_list = data.get("result", {}).get("data", {}).get("feed", {}).get("list", [])
             results = []
-            for item in items[:max_items]:
-                title = item.get("title", "").strip()
+            for item in feed_list[:max_items]:
+                rich = item.get("rich_text", "") or item.get("text_content", "") or item.get("content", "")
+                title = _clean_html(rich).strip()[:200]
                 if not title:
                     continue
-                ctime = item.get("ctime", "")
+                create_time = item.get("create_time", "")
                 try:
-                    time_str = datetime.fromtimestamp(int(ctime)).strftime("%Y-%m-%d %H:%M") if ctime else ""
+                    time_str = datetime.fromtimestamp(int(create_time)).strftime("%Y-%m-%d %H:%M") if create_time else ""
                 except (ValueError, TypeError):
-                    time_str = str(ctime)
+                    time_str = str(create_time)
                 results.append({
                     "title": title,
-                    "url": item.get("url", ""),
+                    "url": f"https://finance.sina.com.cn/7x24/{item.get('id', '')}.shtml" if item.get("id") else "",
                     "time": time_str,
-                    "source": "新浪财经",
+                    "source": "新浪财经7x24",
                 })
             if results:
                 return results
-        except Exception:
-            continue
+    except Exception as e:
+        print(f"  [新浪财经zhibo] 异常: {e}", file=sys.stderr)
+
+    # ── 备用: top 热榜 ──
+    try:
+        url2 = "https://top.finance.sina.com.cn/ws/GetTopDataList.php"
+        today_str = datetime.now().strftime("%Y%m%d")
+        params2 = {
+            "top_type": "day", "top_cat": "finance_0_suda",
+            "top_time": today_str, "top_show_num": str(max_items),
+            "top_order": "DESC", "js_var": "all",
+        }
+        resp = sess.get(url2, params=params2, headers=_rotating_headers(), timeout=TIMEOUT)
+        if resp.status_code == 200:
+            import re as _re
+            match = _re.search(r'var\s+\w+\s*=\s*(\{.*\})', resp.text, _re.DOTALL)
+            if match:
+                data = json.loads(match.group(1))
+                items = data.get("data", [])
+                results = []
+                for item in items[:max_items]:
+                    title = item.get("title", "").strip()
+                    if not title:
+                        continue
+                    results.append({"title": title, "url": item.get("url", ""), "time": "", "source": "新浪财经热榜"})
+                if results:
+                    return results
+    except Exception as e:
+        print(f"  [新浪财经top] 异常: {e}", file=sys.stderr)
+
     return []
 
 
@@ -426,44 +446,20 @@ def _fetch_eastmoney(code: str, days: int, name: str = "") -> List[Dict[str, Any
     # 新闻 (用名称搜索覆盖更全)
     for kw in keywords:
         try:
-            search_url = (
-                "https://search-api-web.eastmoney.com/search/jsonp"
-                "?cb=jQuery&param=" + json.dumps({
-                    "uid": "", "keyword": kw,
-                    "type": ["cmsArticleWebOld"],
-                    "client": "web", "clientType": "web", "clientVersion": "curr",
-                    "param": {"cmsArticleWebOld": {
-                        "searchScope": "default", "sort": "default",
-                        "pageIndex": 1, "pageSize": MAX_NEWS,
-                        "preTag": "", "postTag": ""
-                    }}
-                }, separators=(',', ':'))
-            )
-            resp = sess.get(search_url, headers=_rotating_headers(), timeout=TIMEOUT)
-            resp.encoding = "utf-8"
-            text = resp.text
-            start = text.find('{')
-            if start < 0:
+            # v2.3 修复: search-api-web 已返回 400, 改用 listapi+keyword
+            listapi_url = "https://np-listapi.eastmoney.com/comm/web/getNewsByColumns"
+            listapi_params = {
+                "client": "web", "biz": "web_724", "column": "724",
+                "order": "1", "needInteractData": "0",
+                "page_index": "1", "page_size": str(MAX_NEWS),
+                "req_trace": str(uuid.uuid4()),
+                "keyword": kw,
+            }
+            resp = sess.get(listapi_url, params=listapi_params, headers=_rotating_headers(), timeout=TIMEOUT)
+            if resp.status_code != 200:
                 continue
-            depth = 0
-            end = -1
-            for i in range(start, len(text)):
-                if text[i] == '{':
-                    depth += 1
-                elif text[i] == '}':
-                    depth -= 1
-                    if depth == 0:
-                        end = i + 1
-                        break
-            if end < 0:
-                continue
-            try:
-                data = json.loads(text[start:end])
-            except json.JSONDecodeError:
-                continue
-            articles = data.get("result", {}).get("cmsArticleWebOld", [])
-            if isinstance(articles, dict):
-                articles = articles.get("list", [])
+            listapi_data = resp.json()
+            articles = listapi_data.get("data", {}).get("list", [])
             for art in articles:
                 title = _clean_html(art.get("title", ""))
                 if not title:
@@ -573,98 +569,51 @@ def _fetch_sina7x24(code: str, days: int, name: str = "") -> List[Dict[str, Any]
 # 数据源 4: 腾讯财经 (个股)
 # ═══════════════════════════════════════════════════════════
 def _fetch_qq(code: str, days: int, name: str = "") -> List[Dict[str, Any]]:
-    items = []
-    cutoff = datetime.now() - timedelta(days=days)
-    sess = _get_session()
-    try:
-        keyword = name or code
-        url = "https://i.news.qq.com/web_feed/getPCList"
-        payload = {
-            "qimei36": "", "appver": "2401.01", "devid": "", "os": "2",
-            "category": "stock", "ext": {"keyword": keyword},
-            "page": 0, "num": 20,
-        }
-        resp = sess.post(url, headers={**_rotating_headers(), "Content-Type": "application/json"},
-                             json=payload, timeout=TIMEOUT)
-        data = resp.json() if resp.status_code == 200 else {}
-        d = data.get("data") or {}
-        news_list = d.get("list", []) if isinstance(d, dict) else (d if isinstance(d, list) else [])
-        for item in news_list:
-            if isinstance(item, str):
-                continue
-            title = item.get("title", "") or item.get("brief", "")
-            if not title:
-                continue
-            ctime = item.get("timestamp", "") or item.get("time", "") or item.get("date", "")
-            if isinstance(ctime, (int, float)) and ctime > 1e9:
-                pub_time = datetime.fromtimestamp(ctime)
-            else:
-                pub_time = _parse_time(str(ctime))
-            if not pub_time or pub_time < cutoff:
-                continue
-            art_url = item.get("url", "") or item.get("article_url", "")
-            if art_url and not art_url.startswith("http"):
-                art_url = "https:" + art_url
-            items.append({
-                "title": title,
-                "url": art_url,
-                "time": pub_time.strftime("%Y-%m-%d %H:%M"),
-                "source": "腾讯财经",
-            })
-    except Exception as e:
-        print(f"  [腾讯财经] 异常: {e}", file=sys.stderr)
-    return items
+    """腾讯财经 (v2.3 修复)
+    已知问题: i.news.qq.com 全部接口返回 404 (2026-04 确认)
+    """
+    return []
 
 
-# ═══════════════════════════════════════════════════════════
-# 数据源 5: 凤凰财经 (个股)
-# ═══════════════════════════════════════════════════════════
+
 def _fetch_ifeng(code: str, days: int, name: str = "") -> List[Dict[str, Any]]:
+    """凤凰财经 (v2.3 修复)
+    已知问题: so.finance.ifeng.com 域名无法解析 (DNS failure, 2026-04 确认)
+    """
+    return []
+
+
+
+# ─── 数据源 6: 同花顺 (v2.3 新增) ───
+def _fetch_ths(code: str, days: int, name: str = "") -> List[Dict[str, Any]]:
+    """同花顺个股新闻 (v2.3 新增, 2026-04 验证可用)"""
     items = []
     cutoff = datetime.now() - timedelta(days=days)
     sess = _get_session()
     try:
-        url = "https://so.finance.ifeng.com/api/getSearchNews"
-        params = {"q": code, "p": 1, "ps": 20, "type": "news"}
-        resp = sess.get(url, headers=_rotating_headers(), params=params, timeout=TIMEOUT)
+        url = "https://news.10jqka.com.cn/tapp/news/push/stock/"
+        params = {"page": "1", "track": "website", "pagesize": "20"}
+        resp = sess.get(url, headers=_rotating_headers(), timeout=TIMEOUT)
         if resp.status_code != 200:
             return items
         data = resp.json()
-        items_list = (data.get("result", {}) or {}).get("items", []) or data.get("data", []) or []
-        for item in items_list:
-            title = _clean_html(item.get("title", "") or item.get("name", ""))
+        news_list = data.get("data", {}).get("list", []) if isinstance(data.get("data"), dict) else []
+        for item in news_list:
+            title = item.get("title", "").strip()
             if not title:
                 continue
-            ctime = item.get("timeStamp", "") or item.get("updateTime", "") or item.get("time", "")
-            if isinstance(ctime, (int, float)) and ctime > 1e9:
-                pub_time = datetime.fromtimestamp(ctime)
-            else:
+            ctime = item.get("ctime", "") or item.get("datetime", "")
+            try:
+                pub_time = datetime.fromtimestamp(int(ctime)) if ctime else None
+            except (ValueError, TypeError):
                 pub_time = _parse_time(str(ctime))
             if not pub_time or pub_time < cutoff:
                 continue
-            art_url = item.get("url", "") or item.get("articleUrl", "")
-            if art_url and not art_url.startswith("http"):
-                art_url = "https:" + art_url
-            items.append({
-                "title": title,
-                "url": art_url,
-                "time": pub_time.strftime("%Y-%m-%d %H:%M"),
-                "source": "凤凰财经",
-            })
+            items.append({"title": title, "url": item.get("url", ""), "time": pub_time.strftime("%Y-%m-%d %H:%M"), "source": "同花顺"})
     except Exception as e:
-        print(f"  [凤凰财经] 异常: {e}", file=sys.stderr)
+        print(f"  [同花顺] 异常: {e}", file=sys.stderr)
     return items
 
-
-# ═══════════════════════════════════════════════════════════════
-# 公开接口 — 统一命名 + 聚合函数
-# ═══════════════════════════════════════════════════════════════
-#
-# 所有函数统一返回: [{"title", "url", "time", "source"}, ...]
-#
-# 市场源: fetch_xxx_market(max_items=20)
-# 个股源: fetch_xxx_stock(code, days=3, name="")
-#
 
 # ── 市场新闻公开接口 ─────────────────────────────────────
 def fetch_cls_market(max_items: int = 20, days: int = 1) -> List[Dict[str, Any]]:
@@ -770,6 +719,7 @@ def fetch_all_stock_news(
         ("新浪7x24", lambda: fetch_sina7x24_stock(code, days, name)),
         ("腾讯财经", lambda: fetch_tencent_stock(code, days, name)),
         ("凤凰财经", lambda: fetch_ifeng_stock(code, days, name)),
+        ("同花顺", lambda: _fetch_ths(code, days, name)),
     ]
 
     all_news = []
