@@ -94,7 +94,7 @@ def _read_cache(endpoint):
 
 def _write_cache(endpoint, data):
     ttl = _CACHE_TTL.get(endpoint, 300)
-    payload = _json.dumps({"data": data, "ts": time.time()}, ensure_ascii=False, default=str)
+    payload = {"data": data, "ts": time.time()}
     try:
         cm = _get_cm()
         key = _cache_key(endpoint)
