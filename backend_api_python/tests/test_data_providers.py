@@ -20,12 +20,3 @@ def test_cache_round_trip():
     assert result == {"msg": "hello"}
     clear_cache()
     assert get_cached("_test_unit") is None
-
-
-def test_economic_calendar_not_empty():
-    from app.data_providers.news import get_economic_calendar
-    events = get_economic_calendar()
-    assert isinstance(events, list)
-    assert len(events) > 0
-    assert "name" in events[0]
-    assert "date" in events[0]

@@ -916,8 +916,6 @@ from app.data_providers.global_market import (
     get_indices as _get_indices,
     get_heatmap as _get_heatmap,
     get_news as _get_news,
-    get_calendar as _get_calendar,
-    get_opportunities as _get_opportunities,
     refresh as refresh_intl,
 )
 
@@ -963,26 +961,6 @@ def market_news():
     except Exception as e:
         logger.error("news 失败: %s", e, exc_info=True)
         return jsonify({"code": 0, "msg": str(e), "data": {}})
-
-
-@global_market_bp.route("/calendar", methods=["GET"])
-def economic_calendar():
-    """经济日历"""
-    try:
-        return jsonify(_get_calendar())
-    except Exception as e:
-        logger.error("calendar 失败: %s", e, exc_info=True)
-        return jsonify({"code": 0, "msg": str(e), "data": []})
-
-
-@global_market_bp.route("/opportunities", methods=["GET"])
-def trading_opportunities():
-    """交易机会扫描"""
-    try:
-        return jsonify(_get_opportunities())
-    except Exception as e:
-        logger.error("opportunities 失败: %s", e, exc_info=True)
-        return jsonify({"code": 0, "msg": str(e), "data": []})
 
 
 @global_market_bp.route("/refresh", methods=["POST"])

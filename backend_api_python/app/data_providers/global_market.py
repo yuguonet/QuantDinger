@@ -28,8 +28,6 @@ _CACHE_TTL = {
     "indices":            120,
     "heatmap":            300,
     "news":               180,
-    "economic_calendar":  3600,
-    "opportunities":      3600,
 }
 
 _STALE_AFTER = {
@@ -38,8 +36,6 @@ _STALE_AFTER = {
     "indices":            72,
     "heatmap":            180,
     "news":               108,
-    "economic_calendar":  2160,
-    "opportunities":      2160,
 }
 
 
@@ -277,38 +273,6 @@ def _news_fetch(lang="all"):
     return fetch_financial_news(lang)
 
 
-def _calendar_fetch():
-    from .news import get_economic_calendar
-    return get_economic_calendar()
-
-
-def _opportunities_fetch() -> list:
-    from .opportunities import (
-        analyze_opportunities_crypto,
-        analyze_opportunities_stocks,
-        analyze_opportunities_local_stocks,
-        analyze_opportunities_forex,
-    )
-    opportunities = []
-    scanners = [
-        ("Crypto", lambda: analyze_opportunities_crypto(opportunities)),
-        ("USStock", lambda: analyze_opportunities_stocks(opportunities)),
-        ("CNStock", lambda: analyze_opportunities_local_stocks(opportunities, "CNStock")),
-        ("HKStock", lambda: analyze_opportunities_local_stocks(opportunities, "HKStock")),
-        ("Forex", lambda: analyze_opportunities_forex(opportunities)),
-    ]
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        futs = {pool.submit(scanner): label for label, scanner in scanners}
-        for fut in as_completed(futs, timeout=60):
-            label = futs[fut]
-            try:
-                fut.result(timeout=5)
-            except Exception as e:
-                logger.error("opportunities %s failed: %s", label, e)
-    opportunities.sort(key=lambda x: abs(x.get("change_24h", 0)), reverse=True)
-    return opportunities
-
-
 def _pack_sentiment(results, commodities=None):
     return {
         "fear_greed":  results.get("fear_greed")  or {"value": 50, "classification": "Neutral"},
@@ -353,16 +317,6 @@ def get_news(lang="all") -> dict:
     return {"code": 1, "msg": "success", "data": data or {}}
 
 
-def get_calendar() -> dict:
-    data = _cached_fetch("economic_calendar", _calendar_fetch, timeout=20)
-    return {"code": 1, "msg": "success", "data": data or []}
-
-
-def get_opportunities() -> dict:
-    data = _cached_fetch("opportunities", _opportunities_fetch, timeout=60)
-    return {"code": 1, "msg": "success", "data": data or []}
-
-
 # ============================================================
 #  手动刷新 — 强制拉新，绕过缓存
 # ============================================================
@@ -372,8 +326,6 @@ _REFRESH_MAP = {
     "indices":           _indices_fetch,
     "heatmap":           _heatmap_fetch,
     "news":              _news_fetch,
-    "economic_calendar": _calendar_fetch,
-    "opportunities":     _opportunities_fetch,
 }
 
 

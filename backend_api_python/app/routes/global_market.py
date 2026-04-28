@@ -6,7 +6,6 @@ Provides aggregated global market data including:
 - Forex pairs
 - Crypto prices
 - Market heatmap data (crypto, stocks, forex)
-- Economic calendar with impact indicators
 - Fear & Greed Index / VIX
 - Financial news (Chinese & English)
 
@@ -14,10 +13,7 @@ Endpoints:
 - GET /api/global-market/overview       - Global market overview
 - GET /api/global-market/heatmap        - Market heatmap data
 - GET /api/global-market/news           - Financial news (with lang param)
-- GET /api/global-market/calendar       - Economic calendar
 - GET /api/global-market/sentiment      - Fear & Greed / VIX
-- GET /api/global-market/adanos-sentiment - Optional Adanos stock sentiment
-- GET /api/global-market/opportunities  - Trading opportunities scanner
 """
 
 from __future__ import annotations
@@ -40,13 +36,8 @@ from app.data_providers.sentiment import (
     fetch_fear_greed_index, fetch_vix, fetch_dollar_index,
     fetch_yield_curve, fetch_vxn, fetch_gvz, fetch_put_call_ratio,
 )
-from app.data_providers.adanos_sentiment import fetch_adanos_market_sentiment
-from app.data_providers.news import fetch_financial_news, get_economic_calendar
+from app.data_providers.news import fetch_financial_news
 from app.data_providers.heatmap import generate_heatmap_data
-from app.data_providers.opportunities import (
-    analyze_opportunities_crypto, analyze_opportunities_stocks,
-    analyze_opportunities_local_stocks, analyze_opportunities_forex,
-)
 
 logger = get_logger(__name__)
 
@@ -172,25 +163,6 @@ def market_news():
         return jsonify({"code": 0, "msg": str(e), "data": None}), 500
 
 
-@global_market_bp.route("/calendar", methods=["GET"])
-@login_required
-def economic_calendar():
-    """Get economic calendar events with impact indicators."""
-    try:
-        cached = get_cached("economic_calendar", 3600)
-        if cached:
-            return jsonify({"code": 1, "msg": "success", "data": cached})
-
-        events = get_economic_calendar()
-        set_cached("economic_calendar", events, 3600)
-
-        return jsonify({"code": 1, "msg": "success", "data": events})
-
-    except Exception as e:
-        logger.error("economic_calendar failed: %s", e, exc_info=True)
-        return jsonify({"code": 0, "msg": str(e), "data": None}), 500
-
-
 @global_market_bp.route("/sentiment", methods=["GET"])
 @login_required
 def market_sentiment():
@@ -247,78 +219,6 @@ def market_sentiment():
 
     except Exception as e:
         logger.error("market_sentiment failed: %s", e, exc_info=True)
-        return jsonify({"code": 0, "msg": str(e), "data": None}), 500
-
-
-@global_market_bp.route("/adanos-sentiment", methods=["GET"])
-@login_required
-def adanos_market_sentiment():
-    """Get optional Adanos Market Sentiment for selected US stock tickers."""
-    try:
-        tickers = request.args.get("tickers", "")
-        source = request.args.get("source")
-        days = int(request.args.get("days") or 7)
-        cache_key = f"adanos_sentiment:{source or 'default'}:{days}:{tickers.upper()}"
-
-        cached = get_cached(cache_key, 300)
-        if cached:
-            return jsonify({"code": 1, "msg": "success", "data": cached})
-
-        data = fetch_adanos_market_sentiment(tickers, source=source, days=days)
-        if data.get("enabled") and not data.get("error"):
-            set_cached(cache_key, data, 300)
-
-        return jsonify({"code": 1, "msg": "success", "data": data})
-
-    except ValueError as e:
-        return jsonify({"code": 0, "msg": str(e), "data": None}), 400
-    except Exception as e:
-        logger.error("adanos_market_sentiment failed: %s", e, exc_info=True)
-        return jsonify({"code": 0, "msg": str(e), "data": None}), 500
-
-
-@global_market_bp.route("/opportunities", methods=["GET"])
-@login_required
-def trading_opportunities():
-    """Scan for trading opportunities across Crypto, US/CN/HK Stocks, and Forex."""
-    try:
-        force = request.args.get("force", "").lower() in ("true", "1")
-
-        if not force:
-            cached = get_cached("trading_opportunities")
-            if cached:
-                return jsonify({"code": 1, "msg": "success", "data": cached})
-
-        opportunities: list = []
-
-        scanners = [
-            ("Crypto", lambda: analyze_opportunities_crypto(opportunities)),
-            ("USStock", lambda: analyze_opportunities_stocks(opportunities)),
-            ("CNStock", lambda: analyze_opportunities_local_stocks(opportunities, "CNStock")),
-            ("HKStock", lambda: analyze_opportunities_local_stocks(opportunities, "HKStock")),
-            ("Forex", lambda: analyze_opportunities_forex(opportunities)),
-        ]
-        for label, scanner in scanners:
-            try:
-                scanner()
-                count = len([o for o in opportunities if o.get("market") == label])
-                logger.info("Trading opportunities: found %d %s opportunities", count, label)
-            except Exception as e:
-                logger.error("Failed to analyze %s opportunities: %s", label, e, exc_info=True)
-
-        opportunities.sort(key=lambda x: abs(x.get("change_24h", 0)), reverse=True)
-
-        by_market = {}
-        for o in opportunities:
-            by_market[o.get("market", "?")] = by_market.get(o.get("market", "?"), 0) + 1
-        logger.info("Trading opportunities: total %d (%s)", len(opportunities), by_market)
-
-        set_cached("trading_opportunities", opportunities, 3600)
-
-        return jsonify({"code": 1, "msg": "success", "data": opportunities})
-
-    except Exception as e:
-        logger.error("trading_opportunities failed: %s", e, exc_info=True)
         return jsonify({"code": 0, "msg": str(e), "data": None}), 500
 
 

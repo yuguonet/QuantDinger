@@ -28,9 +28,7 @@ CACHE_TTL = {
     "market_heatmap": 300,
     "commodities": 300,              # 5min
     "market_news": 180,
-    "economic_calendar": 3600,
     "market_sentiment": 21600,       # legacy, 不再直接使用
-    "trading_opportunities": 3600,
     # ── 情绪/宏观指标独立 TTL ──
     "sentiment_fear_greed": 14400,   # 4h — 恐贪指数每天更新一次
     "sentiment_vix": 300,            # 5min — 美股盘中活跃
