@@ -4,20 +4,18 @@
 
 从现有数据源（腾讯/新浪/东财）批量下载历史 K 线数据到本地仓库。
 
-用法:
-    cd backend_api_python
-
+用法（在项目根目录运行）:
     # 下载 A 股日线（默认沪深300成分股）
-    python -m app.data_warehouse.downloader --market CNStock --timeframe 1D
+    python -m optimizer.data_warehouse.downloader --market CNStock --timeframe 1D
 
     # 指定股票列表
-    python -m app.data_warehouse.downloader --market CNStock --symbols "000001.SZ,600000.SH,300750.SZ"
+    python -m optimizer.data_warehouse.downloader --market CNStock --symbols "000001.SZ,600000.SH,300750.SZ"
 
     # 从文件读取股票列表（每行一个）
-    python -m app.data_warehouse.downloader --market CNStock --symbols-file stock_list.txt
+    python -m optimizer.data_warehouse.downloader --market CNStock --symbols-file stock_list.txt
 
     # 下载多年数据
-    python -m app.data_warehouse.downloader --market CNStock --years 5
+    python -m optimizer.data_warehouse.downloader --market CNStock --years 5
 
     # 查看仓库状态
     python -m app.data_warehouse.downloader --status
@@ -38,7 +36,7 @@ if _backend_root not in sys.path:
     sys.path.insert(0, _backend_root)
 
 from optimizer.data_warehouse.storage import (
-    write_local, exists, get_stats, list_local, get_warehouse_root,
+    write_local, exists, get_stats, list_local, get_warehouse_root, _TF_DIR_MAP,
 )
 from app.utils.logger import get_logger
 
@@ -332,12 +330,35 @@ def main():
     parser = argparse.ArgumentParser(
         description="QuantDinger 数据仓库批量下载器",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+存储路径: data_warehouse/{市场}/{周期}/{股票代码}.csv
+  例: data_warehouse/CNStock/daily/000001.SZ.csv
+      data_warehouse/CNStock/weekly/600000.SH.csv
+      data_warehouse/Crypto/4h/BTC_USDT.csv
+
+CSV 格式: time,open,high,low,close,volume (time 为 Unix 秒)
+
+示例（在项目根目录运行）:
+  # 下载沪深300日线（默认）
+  python -m optimizer.data_warehouse.downloader -m CNStock -tf 1D
+
+  # 指定股票
+  python -m optimizer.data_warehouse.downloader -m CNStock -s "000001.SZ,600000.SH"
+
+  # 下载到自定义目录
+  python -m optimizer.data_warehouse.downloader -m CNStock -tf 1D -o /path/to/my_data
+
+  # 查看仓库状态
+  python -m optimizer.data_warehouse.downloader --status
+""",
     )
     parser.add_argument("--market", "-m", default="CNStock", help="市场类型 (CNStock, Crypto, ...)")
     parser.add_argument("--timeframe", "-tf", default="1D", help="时间周期 (1D, 1H, ...)")
     parser.add_argument("--years", "-y", type=int, default=3, help="下载几年的数据")
     parser.add_argument("--force", "-f", action="store_true", help="强制重新下载已有数据")
     parser.add_argument("--delay", type=float, default=0.3, help="每只股票间隔秒数")
+    parser.add_argument("--output", "-o", type=str, default=None,
+                        help="数据仓库根目录 (默认: optimizer/data_warehouse/)")
 
     # 股票来源
     src = parser.add_mutually_exclusive_group()
@@ -352,17 +373,32 @@ def main():
 
     args = parser.parse_args()
 
+    # 指定自定义仓库根目录
+    if args.output:
+        os.environ["DATA_WAREHOUSE_ROOT"] = os.path.abspath(args.output)
+        print(f"   📁 自定义仓库路径: {os.environ['DATA_WAREHOUSE_ROOT']}")
+
     # 查看状态
     if args.status:
         stats = get_stats()
+        root = stats['root']
         print(f"\n📊 数据仓库状态")
-        print(f"   路径: {stats['root']}")
+        print(f"   路径: {root}")
+        print(f"   目录结构: {root}/{{市场}}/{{周期}}/{{股票代码}}.csv")
         print(f"   存在: {stats['exists']}")
         if stats['exists']:
             print(f"   股票数: {stats['stocks']}")
             print(f"   总行数: {stats['total_rows']:,}")
             for mkt, count in stats.get('markets', {}).items():
                 print(f"   - {mkt}: {count} 只")
+                # 展示该市场下的子目录（周期）
+                mkt_dir = os.path.join(root, mkt)
+                if os.path.isdir(mkt_dir):
+                    for tf in sorted(os.listdir(mkt_dir)):
+                        tf_dir = os.path.join(mkt_dir, tf)
+                        if os.path.isdir(tf_dir):
+                            n = len([f for f in os.listdir(tf_dir) if f.endswith('.csv')])
+                            print(f"     {tf}/: {n} 只")
         return
 
     # 列出已有数据
@@ -399,7 +435,8 @@ def main():
 
     print(f"\n🚀 准备下载 {len(symbols)} 只股票的 {args.timeframe} 数据 ({args.years}年)")
     print(f"   市场: {args.market}")
-    print(f"   存储: {get_warehouse_root()}")
+    print(f"   存储: {get_warehouse_root()}/{args.market}/{_TF_DIR_MAP.get(args.timeframe, args.timeframe.lower())}/")
+    print(f"   格式: {{symbol}}.csv (time,open,high,low,close,volume)")
 
     summary = download_batch(
         market=args.market,
