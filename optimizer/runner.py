@@ -19,10 +19,10 @@
     python -m app.optimizer.runner --all --symbol "A_SHARE:600000.SH"
 
     # 仅原始模板
-    python -m app.optimizer.runner --all --set original
+    python -m optimizer.runner --all --set original
 
     # 仅 A 股模板
-    python -m app.optimizer.runner --all --set ashare
+    python -m optimizer.runner --all --set ashare
 
     # 加密市场（向后兼容）
     python -m app.optimizer.runner --template ma_crossover --symbol "Crypto:BTC/USDT" --market crypto
@@ -36,10 +36,38 @@ import traceback
 from datetime import datetime
 from typing import Dict, Any, List
 
-# 确保项目根目录在 path 中
-_project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# 确保 backend_api_python 在 path 中（app 模块在那里）
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_backend_root = os.path.join(_project_root, "backend_api_python")
+if _backend_root not in sys.path:
+    sys.path.insert(0, _backend_root)
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
+
+# ── Monkey-patch: 让 DataSourceFactory.get_kline 优先读本地 data_warehouse ──
+def _patch_datasource_warehouse():
+    """在 BacktestService 加载前，注入本地仓库读取逻辑"""
+    from app.data_sources.factory import DataSourceFactory
+    from data_warehouse.storage import read_local
+
+    _orig_get_kline = DataSourceFactory.get_kline.__func__
+
+    def _get_kline_with_warehouse(cls, market, symbol, timeframe, limit, before_time=None, after_time=None):
+        try:
+            data = read_local(
+                market=market, timeframe=timeframe, symbol=symbol,
+                limit=limit, before_time=before_time, after_time=after_time,
+            )
+            if data and len(data) >= 10:
+                print(f"  [本地仓库] 命中 {symbol} {timeframe}: {len(data)} 条")
+                return data
+        except Exception:
+            pass
+        return _orig_get_kline(cls, market, symbol, timeframe, limit, before_time=before_time, after_time=after_time)
+
+    DataSourceFactory.get_kline = classmethod(_get_kline_with_warehouse)
+
+_patch_datasource_warehouse()
 
 # 直接导入具体模块，避免触发 app/services/__init__.py 的重量级导入
 from importlib import import_module as _im
@@ -54,15 +82,15 @@ def _lazy_import():
         _BacktestService = _bt_mod.BacktestService
 
 # 导入策略模板（原始 + A 股扩展）
-from app.optimizer.param_space import STRATEGY_TEMPLATES, get_template, list_templates
-from app.optimizer.strategy_templates_ashare import ASHARE_STRATEGY_TEMPLATES
-from app.optimizer.ashare_adapter import (
+from optimizer.param_space import STRATEGY_TEMPLATES, get_template, list_templates
+from optimizer.strategy_templates_ashare import ASHARE_STRATEGY_TEMPLATES
+from optimizer.ashare_adapter import (
     parse_market_symbol, normalize_symbol,
     get_ashare_commission, get_ashare_initial_capital,
     AShareRules, AShareBacktestAdapter,
 )
-from app.optimizer.optimizer import StrategyOptimizer
-from app.optimizer.walk_forward import WalkForwardValidator
+from optimizer.optimizer import StrategyOptimizer
+from optimizer.walk_forward import WalkForwardValidator
 
 _StrategyCompiler = None
 _BacktestService = None

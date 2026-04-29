@@ -13,7 +13,7 @@ from typing import Dict, Any, List, Optional, Callable
 
 import numpy as np
 
-from app.optimizer.param_space import STRATEGY_TEMPLATES, get_template
+from optimizer.param_space import STRATEGY_TEMPLATES, get_template
 
 
 class TrialResult:

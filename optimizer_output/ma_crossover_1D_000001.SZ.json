@@ -1,0 +1,280 @@
+{
+  "template": "ma_crossover",
+  "template_name": "均线交叉策略",
+  "symbol": "000001.SZ",
+  "market": "A_SHARE",
+  "timeframe": "1D",
+  "period": "2024-01-01 ~ 2025-12-31",
+  "n_trials": 100,
+  "score_fn": "composite",
+  "initial_capital": 100000.0,
+  "commission": 0.0015,
+  "elapsed_seconds": 13.1,
+  "best": {
+    "trial_id": 71,
+    "params": {
+      "fast_period": 34,
+      "slow_period": 103,
+      "fast_type": "ema",
+      "slow_type": "ema",
+      "use_rsi_filter": false,
+      "rsi_period": 19,
+      "rsi_lower": 33,
+      "rsi_upper": 68
+    },
+    "score": 2.9238,
+    "metrics": {
+      "sharpeRatio": 0.78,
+      "totalReturn": 39.9,
+      "winRate": 14.29,
+      "maxDrawdown": -16.3,
+      "profitFactor": 7.99,
+      "totalTrades": 7,
+      "avgProfit": 0,
+      "avgLoss": 0
+    }
+  },
+  "validation": null,
+  "top_10": [
+    {
+      "trial_id": 71,
+      "params": {
+        "fast_period": 34,
+        "slow_period": 103,
+        "fast_type": "ema",
+        "slow_type": "ema",
+        "use_rsi_filter": false,
+        "rsi_period": 19,
+        "rsi_lower": 33,
+        "rsi_upper": 68
+      },
+      "score": 2.9238,
+      "metrics": {
+        "sharpeRatio": 0.78,
+        "totalReturn": 39.9,
+        "winRate": 14.29,
+        "maxDrawdown": -16.3,
+        "profitFactor": 7.99,
+        "totalTrades": 7,
+        "avgProfit": 0,
+        "avgLoss": 0
+      }
+    },
+    {
+      "trial_id": 19,
+      "params": {
+        "fast_period": 39,
+        "slow_period": 52,
+        "fast_type": "sma",
+        "slow_type": "ema",
+        "use_rsi_filter": true,
+        "rsi_period": 11,
+        "rsi_lower": 36,
+        "rsi_upper": 79
+      },
+      "score": 2.5706,
+      "metrics": {
+        "sharpeRatio": 0.36,
+        "totalReturn": 14.11,
+        "winRate": 37.5,
+        "maxDrawdown": -14.23,
+        "profitFactor": 3.48,
+        "totalTrades": 8,
+        "avgProfit": 0,
+        "avgLoss": 0
+      }
+    },
+    {
+      "trial_id": 30,
+      "params": {
+        "fast_period": 30,
+        "slow_period": 35,
+        "fast_type": "sma",
+        "slow_type": "ema",
+        "use_rsi_filter": true,
+        "rsi_period": 13,
+        "rsi_lower": 28,
+        "rsi_upper": 74
+      },
+      "score": 2.5468,
+      "metrics": {
+        "sharpeRatio": 0.48,
+        "totalReturn": 18.81,
+        "winRate": 44.44,
+        "maxDrawdown": -12.1,
+        "profitFactor": 3.06,
+        "totalTrades": 9,
+        "avgProfit": 0,
+        "avgLoss": 0
+      }
+    },
+    {
+      "trial_id": 7,
+      "params": {
+        "fast_period": 10,
+        "slow_period": 79,
+        "fast_type": "sma",
+        "slow_type": "ema",
+        "use_rsi_filter": false,
+        "rsi_period": 14,
+        "rsi_lower": 40,
+        "rsi_upper": 71
+      },
+      "score": 2.2094,
+      "metrics": {
+        "sharpeRatio": 0.28,
+        "totalReturn": 11.62,
+        "winRate": 40.0,
+        "maxDrawdown": -22.67,
+        "profitFactor": 2.11,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      }
+    },
+    {
+      "trial_id": 48,
+      "params": {
+        "fast_period": 9,
+        "slow_period": 91,
+        "fast_type": "ema",
+        "slow_type": "ema",
+        "use_rsi_filter": false,
+        "rsi_period": 7,
+        "rsi_lower": 23,
+        "rsi_upper": 68
+      },
+      "score": 1.914,
+      "metrics": {
+        "sharpeRatio": 0.36,
+        "totalReturn": 15.51,
+        "winRate": 20.0,
+        "maxDrawdown": -22.9,
+        "profitFactor": 2.28,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      }
+    },
+    {
+      "trial_id": 27,
+      "params": {
+        "fast_period": 20,
+        "slow_period": 69,
+        "fast_type": "sma",
+        "slow_type": "ema",
+        "use_rsi_filter": true,
+        "rsi_period": 13,
+        "rsi_lower": 25,
+        "rsi_upper": 68
+      },
+      "score": 1.8556,
+      "metrics": {
+        "sharpeRatio": 0.2,
+        "totalReturn": 7.81,
+        "winRate": 33.33,
+        "maxDrawdown": -17.25,
+        "profitFactor": 1.91,
+        "totalTrades": 6,
+        "avgProfit": 0,
+        "avgLoss": 0
+      }
+    },
+    {
+      "trial_id": 86,
+      "params": {
+        "fast_period": 49,
+        "slow_period": 67,
+        "fast_type": "sma",
+        "slow_type": "sma",
+        "use_rsi_filter": false,
+        "rsi_period": 11,
+        "rsi_lower": 38,
+        "rsi_upper": 76
+      },
+      "score": 1.8004,
+      "metrics": {
+        "sharpeRatio": 0.17,
+        "totalReturn": 6.93,
+        "winRate": 33.33,
+        "maxDrawdown": -13.89,
+        "profitFactor": 1.97,
+        "totalTrades": 6,
+        "avgProfit": 0,
+        "avgLoss": 0
+      }
+    },
+    {
+      "trial_id": 4,
+      "params": {
+        "fast_period": 26,
+        "slow_period": 46,
+        "fast_type": "sma",
+        "slow_type": "ema",
+        "use_rsi_filter": true,
+        "rsi_period": 12,
+        "rsi_lower": 31,
+        "rsi_upper": 79
+      },
+      "score": 1.7328,
+      "metrics": {
+        "sharpeRatio": 0.04,
+        "totalReturn": 2.57,
+        "winRate": 42.86,
+        "maxDrawdown": -14.78,
+        "profitFactor": 1.41,
+        "totalTrades": 7,
+        "avgProfit": 0,
+        "avgLoss": 0
+      }
+    },
+    {
+      "trial_id": 29,
+      "params": {
+        "fast_period": 5,
+        "slow_period": 43,
+        "fast_type": "sma",
+        "slow_type": "sma",
+        "use_rsi_filter": false,
+        "rsi_period": 14,
+        "rsi_lower": 35,
+        "rsi_upper": 66
+      },
+      "score": 1.7028,
+      "metrics": {
+        "sharpeRatio": 0.02,
+        "totalReturn": 2.72,
+        "winRate": 42.86,
+        "maxDrawdown": -14.68,
+        "profitFactor": 1.36,
+        "totalTrades": 7,
+        "avgProfit": 0,
+        "avgLoss": 0
+      }
+    },
+    {
+      "trial_id": 14,
+      "params": {
+        "fast_period": 36,
+        "slow_period": 43,
+        "fast_type": "sma",
+        "slow_type": "sma",
+        "use_rsi_filter": true,
+        "rsi_period": 17,
+        "rsi_lower": 25,
+        "rsi_upper": 73
+      },
+      "score": 1.6842,
+      "metrics": {
+        "sharpeRatio": 0.18,
+        "totalReturn": 7.03,
+        "winRate": 28.57,
+        "maxDrawdown": -12.84,
+        "profitFactor": 1.96,
+        "totalTrades": 7,
+        "avgProfit": 0,
+        "avgLoss": 0
+      }
+    }
+  ]
+}
