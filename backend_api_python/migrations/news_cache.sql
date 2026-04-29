@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS qd_news_cache_items (
     source          VARCHAR(100) DEFAULT '',              -- 来源 (东方财富/新浪/腾讯等)
     published_date  VARCHAR(40) DEFAULT '',               -- 原文发布时间
     sentiment       VARCHAR(20) DEFAULT 'neutral',        -- positive/negative/neutral
-    sentiment_score REAL DEFAULT 5.0,                     -- 数值评分 0-10, 重大负面=-999 (一票否决)
+    sentiment_score REAL DEFAULT 0.0,                     -- 数值评分 -10 ~ +10 (0=中性), 一票否决=-999
     created_at      TIMESTAMP DEFAULT NOW(),              -- 入库时间 (用于过期清理)
     UNIQUE(symbol, market, title)                         -- 同一股票不存重复标题
 );

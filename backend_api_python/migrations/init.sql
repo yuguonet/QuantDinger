@@ -1003,6 +1003,30 @@ CREATE INDEX IF NOT EXISTS idx_notifications_market ON qd_strategy_notifications
 CREATE INDEX IF NOT EXISTS idx_quick_trades_market ON qd_quick_trades(market);
 
 -- =============================================================================
+-- 新闻缓存明细表 (news_cache)
+-- 每条新闻一行, 通过 (symbol, market) 关联
+-- 评分范围: -10 ~ +10 (0=中性), 一票否决=-999
+-- 24h去重 (应用层), 15天过期自动清理
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS qd_news_cache_items (
+    id              SERIAL PRIMARY KEY,
+    symbol          VARCHAR(20) NOT NULL,
+    market          VARCHAR(50) NOT NULL DEFAULT 'CNStock',
+    title           TEXT NOT NULL DEFAULT '',
+    snippet         TEXT DEFAULT '',
+    url             TEXT DEFAULT '',
+    source          VARCHAR(100) DEFAULT '',
+    published_date  VARCHAR(40) DEFAULT '',
+    sentiment       VARCHAR(20) DEFAULT 'neutral',
+    sentiment_score REAL DEFAULT 0.0,
+    created_at      TIMESTAMP DEFAULT NOW(),
+    UNIQUE(symbol, market, title)
+);
+CREATE INDEX IF NOT EXISTS idx_news_items_stock ON qd_news_cache_items(symbol, market);
+CREATE INDEX IF NOT EXISTS idx_news_items_created ON qd_news_cache_items(created_at);
+CREATE INDEX IF NOT EXISTS idx_news_items_published ON qd_news_cache_items(published_date);
+
+-- =============================================================================
 -- Completion Notice
 -- =============================================================================
 DO $$

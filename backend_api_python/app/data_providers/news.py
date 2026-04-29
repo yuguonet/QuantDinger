@@ -129,6 +129,7 @@ class NewsCacheManager:
                     """SELECT title, snippet, url, source, published_date, sentiment, sentiment_score
                        FROM qd_news_cache_items
                        WHERE symbol = %s AND market = %s
+                         AND title NOT LIKE '__empty_%%__'
                        ORDER BY published_date DESC""",
                     (symbol, market)
                 )
@@ -152,7 +153,7 @@ class NewsCacheManager:
             (should_search: bool, reason: str)
         """
         last_search = self._get_last_search_time(symbol, market)
-        now = datetime.now()
+        now = datetime.utcnow()
 
         if is_watchlist:
             windows = _MARKET_TRADING_WINDOWS.get(market)
@@ -192,7 +193,7 @@ class NewsCacheManager:
         if not last_search:
             return default_days
 
-        hours_since = (datetime.now() - last_search).total_seconds() / 3600
+        hours_since = (datetime.utcnow() - last_search).total_seconds() / 3600
         if hours_since < 1:
             return 1
         elif hours_since < 6:
@@ -298,7 +299,8 @@ class NewsCacheManager:
                 cursor.execute(
                     """SELECT sentiment_score, created_at
                        FROM qd_news_cache_items
-                       WHERE symbol = %s AND market = %s""",
+                       WHERE symbol = %s AND market = %s
+                         AND title NOT LIKE '__empty_%%__'""",
                     (symbol, market)
                 )
                 rows = cursor.fetchall()
@@ -486,12 +488,27 @@ def fetch_financial_news(
             keywords=keywords,
         )
 
-        if not resp.success or not resp.results:
-            logger.info(f"[搜索无结果] {cache_symbol}({cache_market})")
-            return result
-
         # ── 4. 评分 + 写缓存 ──
-        cache_mgr.save_items(cache_symbol, cache_market, resp.results)
+        # BUG FIX: 无论 resp.success 如何，只要有结果就写缓存。
+        # 原因: Provider 可能取到数据但去重后为空（success=False, results=[]），
+        #        或 success=False 但 results 非空。不保存会导致 should_search
+        #        下次仍返回 True，白白重复请求远端。
+        if resp.results:
+            cache_mgr.save_items(cache_symbol, cache_market, resp.results)
+        else:
+            # 远端确实无数据：记录搜索时间戳，避免下次立即重搜。
+            # should_search 依赖 MAX(created_at) 判断间隔，插入哨兵行使其生效。
+            logger.info(f"[搜索无结果] {cache_symbol}({cache_market}), 记录空搜索")
+            cache_mgr.save_items(cache_symbol, cache_market, [
+                SearchResult(
+                    title=f"__empty_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}__",
+                    snippet="", url="", source="system",
+                    published_date=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                )
+            ])
+
+        if not resp.results:
+            return result
 
         # ── 5. 格式化返回 ──
         news_type = resp.metadata.get("news_type", "stock")

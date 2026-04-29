@@ -354,7 +354,9 @@ def _china_policy_fetch() -> dict:
     news_list = []
     try:
         resp = fetch_financial_news(lang="all", market="CNStock", symbol="POLICY")
+        logger.info(f"[政策调试] resp keys={list(resp.keys())}, cn={len(resp.get('cn',[]))}, en={len(resp.get('en',[]))}")
         news_list = resp.get("cn", []) + resp.get("en", [])
+        logger.info(f"[政策调试] news_list={len(news_list)}条")
     except Exception as e:
         logger.error("fetch_financial_news(POLICY) 异常: %s", e)
 
@@ -382,6 +384,7 @@ def _china_policy_fetch() -> dict:
             logger.error("DB 缓存降级失败: %s", e)
 
     if not news_list:
+        logger.warning("[政策调试] 最终 news_list 为空, 返回暂无政策数据")
         return {"code": 0, "msg": "暂无政策数据", "data": {}}
 
     # ── 3. 综合评分 ──

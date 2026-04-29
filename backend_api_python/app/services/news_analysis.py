@@ -439,7 +439,7 @@ def composite_score(
         }
     """
     if now is None:
-        now = datetime.now()
+        now = datetime.utcnow()
 
     pos_weighted: List[float] = []   # 正分 (已衰减)
     neg_weighted: List[float] = []   # 负分 (已衰减, 取绝对值)
