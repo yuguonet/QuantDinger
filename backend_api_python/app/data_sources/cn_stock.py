@@ -313,7 +313,7 @@ class CNStockDataSource(BaseDataSource):
     def get_ticker(self, symbol: str) -> Dict[str, Any]:
         """
         获取最新报价，fallback chain:
-          腾讯 → 东方财富 → 新浪
+          腾讯 → 新浪 → 东方财富
         """
         code = normalize_cn_code(symbol)  # e.g. "SH600519"
         raw_code = _strip_cn_prefix(code)  # e.g. "600519"
@@ -329,8 +329,8 @@ class CNStockDataSource(BaseDataSource):
 
         sources: List[Tuple[str, Callable[[], Optional[Dict[str, Any]]]]] = [
             ("tencent_quote", lambda: self._try_tencent_ticker(code)),
-            ("eastmoney_quote", lambda: eastmoney_kline_to_ticker(raw_code)),
             ("sina_quote", lambda: sina_kline_to_ticker(code)),
+            ("eastmoney_quote", lambda: eastmoney_kline_to_ticker(raw_code)),
         ]
 
         for source_name, fetcher in sources:

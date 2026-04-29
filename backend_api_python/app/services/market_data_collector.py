@@ -247,10 +247,10 @@ class MarketDataCollector:
     
     def _get_price(self, market: str, symbol: str) -> Optional[Dict[str, Any]]:
         """
-        获取实时价格 - 使用 kline_service (与自选列表一致)
+        获取实时价格 - 使用 kline_service (与自选列表一致，走缓存)
         """
         try:
-            price_data = self.kline_service.get_realtime_price(market, symbol, force_refresh=True)
+            price_data = self.kline_service.get_realtime_price(market, symbol, force_refresh=False)
             if price_data and price_data.get('price', 0) > 0:
                 price = safe_float(price_data.get('price'))
                 return {
@@ -297,10 +297,10 @@ class MarketDataCollector:
         self, market: str, symbol: str, timeframe: str, limit: int = 60
     ) -> Optional[List[Dict[str, Any]]]:
         """
-        获取K线数据 - 使用 DataSourceFactory (与K线模块一致)
+        获取K线数据 - 使用 KlineService (带缓存，日线300s/分钟线120s)
         """
         try:
-            klines = DataSourceFactory.get_kline(market, symbol, timeframe, limit)
+            klines = self.kline_service.get_kline(market, symbol, timeframe, limit)
             if klines and len(klines) > 0:
                 return klines
         except Exception as e:
@@ -642,11 +642,31 @@ class MarketDataCollector:
     # ==================== 基本面数据 ====================
     
     def _get_fundamental(self, market: str, symbol: str) -> Optional[Dict[str, Any]]:
-        """获取基本面数据"""
+        """获取基本面数据 — CNStock 优先走 CNStockExtent 缓存 (1h TTL)"""
         try:
             if market == 'USStock':
                 return self._get_us_fundamental(symbol)
             if market in ('CNStock', 'HKStock'):
+                # CNStock: 先走 CNStockExtent 缓存，命中则直接返回
+                if market == 'CNStock':
+                    try:
+                        from app.interfaces.cn_stock_extent import CNStockExtent
+                        from app.data_sources.tencent import normalize_cn_code
+                        ext = CNStockExtent()
+                        code = normalize_cn_code(symbol)
+                        if code:
+                            info = ext.get_stock_info(code)
+                            if info and info.get("stock_name"):
+                                return {
+                                    "pe_ratio": info.get("pe_ratio"),
+                                    "pb_ratio": info.get("pb_ratio"),
+                                    "market_cap": info.get("total_mv"),
+                                    "industry": info.get("industry"),
+                                    "source": "cn_stock_extent/cached",
+                                }
+                    except Exception as e:
+                        logger.debug(f"CNStockExtent cache miss for {symbol}: {e}")
+                # 缓存未命中或 HKStock: 走完整多层降级
                 return self._get_cn_hk_fundamental(market, symbol)
         except Exception as e:
             logger.warning(f"Fundamental data fetch failed for {market}:{symbol}: {e}")
@@ -1203,20 +1223,9 @@ class MarketDataCollector:
     def _get_ashare_factors(self, symbol: str, price_data: Dict[str, Any], kline_data: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
         采集 A 股专属市场微观结构因子。
-        核心数据源: market_cn/fear_greed_index.py (7 维度贪恐指数 + 多源降级)
+        核心数据源: china_market.get_fear_greed() (带缓存，TTL 1800s)
         补充: 个股主力资金流向 (cn_stock_extent)
         """
-        factors: Dict[str, Any] = {
-            "composite_score": None,         # 综合贪恐指数 (0-100, 50=中性)
-            "composite_label": "",           # 贪恐标签
-            "indicators": [],                # 7 维度明细
-            "main_fund_netflow": None,       # 主力资金净流入 (万元)
-            "turnover_rate": None,           # 换手率 (%)
-            "signals": {},
-            "summary": "",
-            "sources": {},
-        }
-
         def _safe_float(v: Any, default: float = None) -> Optional[float]:
             if v is None:
                 return default
@@ -1226,65 +1235,63 @@ class MarketDataCollector:
             except (TypeError, ValueError):
                 return default
 
-        # 1. 贪恐指数 (7 维度: 动量/宽度/波动率/成交量/北向/涨跌停/强度)
+        factors: Dict[str, Any] = {
+            "composite_score": None,
+            "composite_label": "",
+            "indicators": [],
+            "main_fund_netflow": None,
+            "turnover_rate": None,
+            "signals": {},
+            "summary": "",
+            "sources": {},
+        }
+
+        # 1. 贪恐指数 — 直接走 china_market 缓存 (TTL 1800s)
         try:
-            from app.market_cn.fear_greed_index import (
-                calc_momentum, calc_breadth, calc_volatility,
-                calc_volume, calc_northbound, calc_limit_ratio, calc_strength,
-            )
-            # 逐个调用避免 fear_greed_index() 里的 print 输出
-            calc_funcs = [
-                calc_momentum, calc_breadth, calc_volatility,
-                calc_volume, calc_northbound, calc_limit_ratio, calc_strength,
-            ]
-            indicators = []
-            for fn in calc_funcs:
-                try:
-                    result = fn()
-                    if isinstance(result, dict):
-                        # 确保 score 是数值
-                        s = _safe_float(result.get("score"))
-                        if s is not None:
-                            result["score"] = s
-                        indicators.append(result)
-                except Exception as e:
-                    logger.debug(f"A-share calc function {fn.__name__} failed: {e}")
+            from app.market_cn.china_market import get_fear_greed
+            resp = get_fear_greed()
+            fg_data = resp.get("data") or {}
 
-            scores = [_safe_float(ind.get("score")) for ind in indicators]
-            scores = [s for s in scores if s is not None]
-            composite = round(sum(scores) / len(scores), 1) if scores else 50.0
+            composite = _safe_float(fg_data.get("composite_score"), 50.0)
+            # fear_greed_index() 返回 'label'，兼容 'composite_label'
+            label = str(fg_data.get("label") or fg_data.get("composite_label") or "")
+            indicators = fg_data.get("indicators") or []
 
-            # 标签
-            if composite <= 25:
-                label = "极度恐惧"
-            elif composite <= 40:
-                label = "恐惧"
-            elif composite <= 60:
-                label = "中性"
-            elif composite <= 75:
-                label = "贪婪"
-            else:
-                label = "极度贪婪"
+            # 确保 score 是数值
+            for ind in indicators:
+                s = _safe_float(ind.get("score"))
+                if s is not None:
+                    ind["score"] = s
 
             factors["composite_score"] = composite
             factors["composite_label"] = label
             factors["indicators"] = indicators
-            factors["sources"]["fear_greed"] = "market_cn/fear_greed_index"
+            factors["sources"]["fear_greed"] = "china_market/cached"
 
-            # 从 indicators 提取关键信号 (按 name 匹配，不依赖顺序)
+            # 标签兜底
+            if not label and composite is not None:
+                if composite <= 25:
+                    label = "极度恐惧"
+                elif composite <= 40:
+                    label = "恐惧"
+                elif composite <= 60:
+                    label = "中性"
+                elif composite <= 75:
+                    label = "贪婪"
+                else:
+                    label = "极度贪婪"
+                factors["composite_label"] = label
+
+            # 从 indicators 提取关键信号
             ind_map = {}
             for ind in indicators:
                 n = str(ind.get("name") or "").strip()
                 if n:
                     ind_map[n] = ind
 
-            # 兼容可能的名称变体
             breadth = ind_map.get("市场宽度(上涨占比)") or ind_map.get("市场宽度")
             northbound = ind_map.get("北向资金")
             limit = ind_map.get("涨跌停比")
-            volume = ind_map.get("成交量变化")
-            volatility = ind_map.get("市场波动率")
-            momentum = ind_map.get("股价动量")
 
             signals = factors["signals"]
             signals["composite_score"] = composite
@@ -1310,7 +1317,7 @@ class MarketDataCollector:
             signals["limit_heat"] = _score_to_bias(limit, (70, 55, 45, 30))
 
         except Exception as e:
-            logger.warning(f"A-share fear_greed_index fetch failed: {e}")
+            logger.warning(f"A-share fear_greed fetch failed: {e}")
             factors["sources"]["fear_greed_error"] = str(e)
 
         # 2. 个股主力资金流向 (补充因子)
@@ -1323,7 +1330,6 @@ class MarketDataCollector:
                 if code:
                     flow = ext.get_stock_fund_flow(code)
                     if flow:
-                        # 显式 None 检查，避免 0 值被 or 跳过
                         mf = flow.get("main_net_inflow")
                         if mf is None:
                             mf = flow.get("net_inflow")
@@ -1797,7 +1803,7 @@ class MarketDataCollector:
         return f"{base}，整体{outlook}，{risk_text}"
     
     def _get_company(self, market: str, symbol: str) -> Optional[Dict[str, Any]]:
-        """获取公司信息"""
+        """获取公司信息 — CNStock 优先走 CNStockExtent 缓存 (1h TTL)"""
         try:
             if market == 'USStock' and self._finnhub_client:
                 profile = self._finnhub_client.company_profile2(symbol=symbol)
@@ -1811,6 +1817,25 @@ class MarketDataCollector:
                         'market_cap': profile.get('marketCapitalization'),
                         'website': profile.get('weburl'),
                     }
+            if market == 'CNStock':
+                # 先走 CNStockExtent 缓存
+                try:
+                    from app.interfaces.cn_stock_extent import CNStockExtent
+                    from app.data_sources.tencent import normalize_cn_code
+                    ext = CNStockExtent()
+                    code = normalize_cn_code(symbol)
+                    if code:
+                        info = ext.get_stock_info(code)
+                        if info and info.get("stock_name"):
+                            return {
+                                'name': info.get("stock_name"),
+                                'industry': info.get("industry"),
+                                'country': 'CN',
+                                'exchange': 'SSE/SZSE',
+                                'source': 'cn_stock_extent/cached',
+                            }
+                except Exception as e:
+                    logger.debug(f"CNStockExtent company cache miss for {symbol}: {e}")
             if market in ('CNStock', 'HKStock'):
                 return self._get_cn_hk_company(market, symbol)
             
@@ -1895,20 +1920,21 @@ class MarketDataCollector:
     
     def _get_macro_data(self, market: str, timeout: int = 10) -> Dict[str, Any]:
         """
-        获取宏观经济数据 — 统一走 get_sentiment_data()
+        获取宏观经济数据 — 统一走 global_market.get_sentiment() (带缓存)
 
         复用 global_market 的完整数据链:
-          缓存读取 → 7 指标并行 fetch → 缓存写入
+          缓存读取(TTL 1800s) → 过期后台刷新 → 7 指标并行 fetch
 
         collector 不再自己 fetch、不再自己维护缓存。
         唯一职责：把 data_providers 的原始格式转换成 AI 分析需要的格式。
         """
         try:
-            from app.data_providers.sentiment import get_sentiment_data
+            from app.data_providers.global_market import get_sentiment
 
-            raw = get_sentiment_data(timeout=timeout)
+            resp = get_sentiment()
+            raw = resp.get("data") or {}
             if not raw:
-                logger.warning("_get_macro_data: get_sentiment_data returned empty")
+                logger.warning("_get_macro_data: get_sentiment returned empty")
                 return {}
 
             result: Dict[str, Any] = {}
@@ -2066,13 +2092,9 @@ class MarketDataCollector:
         if len(news_list) < 5:
             search_news = self._get_news_from_search(market, symbol, company_name)
             news_list.extend(search_news)
-        
-        # === 4) 获取全球重大事件新闻（地缘政治、战争等） ===
-        # 这些事件会影响所有市场，特别是加密货币
-        global_events = self._get_global_major_events()
-        if global_events:
-            news_list.extend(global_events)
-            logger.info(f"Added {len(global_events)} global major events to news list")
+
+        # 注意: 全球重大事件新闻已由 Finnhub + 搜索引擎覆盖，
+        # 不再单独调用 _get_global_major_events() (多次搜索API调用，耗时严重)
         
         # 去重（按标题）
         seen_titles = set()

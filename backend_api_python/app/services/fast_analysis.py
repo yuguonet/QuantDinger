@@ -1029,7 +1029,8 @@ IMPORTANT:
         
         try:
             # Phase 1: Data collection (multi-timeframe for consensus)
-            logger.info(f"Fast analysis starting: {market}:{symbol}")
+            logger.info(f"[PERF] Fast analysis starting: {market}:{symbol}")
+            phase_start = time.time()
 
             # Consensus timeframes:
             # - 默认：用用户传入的 timeframe 作为主周期，再加一个上层周期（1D/4H）提升稳定性
@@ -1065,6 +1066,7 @@ IMPORTANT:
                 seen = set()
                 consensus_timeframes = [x for x in consensus_timeframes if not (x in seen or seen.add(x))]
             # Collect primary data including macro/news for prompt quality
+            t0 = time.time()
             primary_data = self._collect_market_data(
                 market,
                 symbol,
@@ -1072,10 +1074,13 @@ IMPORTANT:
                 include_macro=True,
                 include_news=True,
             )
+            logger.info(f"[PERF] Primary data collection ({primary_tf}): {_elapsed_ms(t0)}ms")
 
             # Pre-compute stable scores (macro/sentiment/fundamental/factors)
+            t0 = time.time()
             # These are invariant across timeframes; only technical_score changes per tf.
             stable_scores = self._precompute_stable_scores(primary_data)
+            logger.info(f"[PERF] Stable scores precompute: {_elapsed_ms(t0)}ms")
 
             # Collect extra timeframes for objective consensus (technical-only for cost)
             objective_by_tf: Dict[str, Dict[str, Any]] = {}
@@ -1105,12 +1110,14 @@ IMPORTANT:
                         return None
                 return None
 
-            logger.info(f"Consensus timeframes: {consensus_timeframes}")
+            logger.info(f"[PERF] Consensus timeframes: {consensus_timeframes}")
+            consensus_loop_start = time.time()
             for tf in consensus_timeframes:
                 tf_norm = (tf or "").strip().upper()
                 if not tf_norm:
                     continue
 
+                tf_start = time.time()
                 if tf_norm == primary_tf:
                     d_tf = primary_data
                 else:
@@ -1122,9 +1129,11 @@ IMPORTANT:
                         include_news=False,
                         timeout=25,
                     )
+                    logger.info(f"[PERF]   Consensus data collection ({tf_norm}): {_elapsed_ms(tf_start)}ms")
 
                 current_price_tf = _extract_current_price(d_tf) or 0.0
                 is_primary = (tf_norm == primary_tf)
+                obj_start = time.time()
                 objective = self._fast_objective_score(
                     stable_scores,
                     d_tf.get("indicators") or {},
@@ -1132,6 +1141,7 @@ IMPORTANT:
                     has_news=is_primary,
                     has_macro=is_primary,
                 )
+                logger.info(f"[PERF]   Objective score ({tf_norm}): {_elapsed_ms(obj_start)}ms")
                 overall_score = float(objective.get("overall_score", 0.0) or 0.0)
                 decision = self._score_to_decision(overall_score, market=market)
                 abs_score = abs(overall_score)
@@ -1151,8 +1161,10 @@ IMPORTANT:
 
             # Extra horizon score (not used in consensus override):
             # add 1W objective score for short/medium trend outlook.
+            logger.info(f"[PERF] Consensus loop total: {_elapsed_ms(consensus_loop_start)}ms")
             if "1W" not in objective_by_tf:
                 try:
+                    t0 = time.time()
                     d_1w = self._collect_market_data(
                         market,
                         symbol,
@@ -1161,7 +1173,9 @@ IMPORTANT:
                         include_news=False,
                         timeout=25,
                     )
+                    logger.info(f"[PERF] 1W data collection: {_elapsed_ms(t0)}ms")
                     cp_1w = _extract_current_price(d_1w) or 0.0
+                    t0 = time.time()
                     obj_1w = self._fast_objective_score(
                         stable_scores,
                         d_1w.get("indicators") or {},
@@ -1176,12 +1190,14 @@ IMPORTANT:
                         "decision": self._score_to_decision(sc_1w, market=market),
                         "abs_score": abs(sc_1w),
                     }
+                    logger.info(f"[PERF] 1W objective score: {_elapsed_ms(t0)}ms")
                 except Exception as e:
                     logger.debug(f"1W outlook score skipped: {e}")
 
             # Short-horizon outlook: 1H bar (24h-style), not 1D close
             if "1H" not in objective_by_tf:
                 try:
+                    t0 = time.time()
                     d_1h = self._collect_market_data(
                         market,
                         symbol,
@@ -1190,7 +1206,9 @@ IMPORTANT:
                         include_news=False,
                         timeout=18,
                     )
+                    logger.info(f"[PERF] 1H data collection: {_elapsed_ms(t0)}ms")
                     cp_1h = _extract_current_price(d_1h) or 0.0
+                    t0 = time.time()
                     obj_1h = self._fast_objective_score(
                         stable_scores,
                         d_1h.get("indicators") or {},
@@ -1205,6 +1223,7 @@ IMPORTANT:
                         "decision": self._score_to_decision(sc_1h, market=market),
                         "abs_score": abs(sc_1h),
                     }
+                    logger.info(f"[PERF] 1H objective score: {_elapsed_ms(t0)}ms")
                 except Exception as e:
                     logger.debug(f"1H outlook score skipped: {e}")
 
@@ -1280,7 +1299,9 @@ IMPORTANT:
                 return result
             
             # Phase 2: Build prompt
+            t0 = time.time()
             system_prompt, user_prompt = self._build_analysis_prompt(data, language)
+            logger.info(f"[PERF] Phase 2 prompt building: {_elapsed_ms(t0)}ms")
 
             default_struct = {
                 "decision": "HOLD",
@@ -1299,7 +1320,7 @@ IMPORTANT:
             }
 
             # Phase 3: LLM call(s) - single or ensemble voting
-            logger.info("Calling LLM for analysis...")
+            logger.info("[PERF] Phase 3: Calling LLM for analysis...")
             llm_start = time.time()
             ensemble_models = []
             if os.getenv("ENABLE_AI_ENSEMBLE", "false").lower() == "true":
@@ -1328,9 +1349,10 @@ IMPORTANT:
                 )
 
             llm_time = int((time.time() - llm_start) * 1000)
-            logger.info(f"LLM call completed in {llm_time}ms")
+            logger.info(f"[PERF] Phase 3 LLM call completed: {llm_time}ms")
             
             # Phase 4: Reuse cached primary objective score (already computed in consensus loop)
+            t0 = time.time()
             objective_score = (objective_by_tf.get(primary_tf) or {}).get("objective_score") or \
                 self._fast_objective_score(
                     stable_scores,
@@ -1339,6 +1361,7 @@ IMPORTANT:
                     has_news=True,
                     has_macro=True,
                 )
+            logger.info(f"[PERF] Phase 4 objective score: {_elapsed_ms(t0)}ms")
             logger.info(
                 f"Primary objective score: {objective_score['overall_score']:.1f} "
                 f"(Technical: {objective_score['technical_score']:.1f}, Fundamental: {objective_score['fundamental_score']:.1f}, "
@@ -1467,6 +1490,7 @@ IMPORTANT:
             }
             
             # Phase 5: Validate and constrain output (pass indicators for decision validation)
+            t0 = time.time()
             # Check for major news or macro events that could override technical indicators
             news_data = data.get("news") or []
             macro_data = data.get("macro") or {}
@@ -1480,6 +1504,7 @@ IMPORTANT:
                 has_major_news=has_major_news,
                 has_macro_event=has_macro_event
             )
+            logger.info(f"[PERF] Phase 5 validation: {_elapsed_ms(t0)}ms")
 
             # Post-validate: adjust position sizing based on quality + agreement
             try:
@@ -1586,11 +1611,25 @@ IMPORTANT:
             })
             
             # Store in memory for future retrieval and get memory_id for feedback
+            t0 = time.time()
             memory_id = self._store_analysis_memory(result, user_id=user_id)
+            logger.info(f"[PERF] Memory storage: {_elapsed_ms(t0)}ms")
             if memory_id:
                 result["memory_id"] = memory_id
             
-            logger.info(f"Fast analysis completed in {total_time}ms: {market}:{symbol} -> {result['decision']} (memory_id={memory_id}, user_id={user_id})")
+            logger.info(f"[PERF] Fast analysis completed in {total_time}ms: {market}:{symbol} -> {result['decision']} (memory_id={memory_id}, user_id={user_id})")
+            # Performance summary
+            data_collection_ms = data.get("collection_time_ms", 0)
+            logger.info(
+                f"[PERF] === Timing Breakdown === "
+                f"DataCollection: {data_collection_ms}ms | "
+                f"ConsensusLoop: {_elapsed_ms(consensus_loop_start)}ms | "
+                f"PromptBuild: see Phase 2 | "
+                f"LLM: {llm_time}ms | "
+                f"Validation: see Phase 5 | "
+                f"Memory: see above | "
+                f"TOTAL: {total_time}ms"
+            )
             
         except Exception as e:
             logger.error(f"Fast analysis failed: {e}", exc_info=True)
@@ -3158,3 +3197,8 @@ def fast_analyze(market: str, symbol: str, language: str = 'en-US',
     """Convenience function for fast analysis."""
     service = get_fast_analysis_service()
     return service.analyze(market, symbol, language, model, timeframe)
+
+
+def _elapsed_ms(start: float) -> int:
+    """Return elapsed milliseconds since start (time.time())."""
+    return int((time.time() - start) * 1000)

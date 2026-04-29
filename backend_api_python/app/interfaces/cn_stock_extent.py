@@ -467,7 +467,7 @@ class AStockDataSource(CNStockDataSource):
     def get_stock_info(self, stock_code: str) -> Optional[Dict[str, Any]]:
         """
         获取个股基本信息。缓存1小时。
-        fallback: 东财 direct → AkShare
+        fallback: AkShare → 东财 direct
         """
         code = (stock_code or "").strip()
         if not code:
@@ -479,19 +479,6 @@ class AStockDataSource(CNStockDataSource):
             return cached
 
         cb = self.circuit_breaker
-
-        # 东财 direct
-        if cb.is_available("eastmoney_info"):
-            result, err = _fetch_with_timeout(
-                lambda: self._fetch_stock_info_eastmoney(code),
-                timeout=min(_get_timeout(), 8),
-                source_name="eastmoney_info",
-            )
-            if result:
-                cb.record_success("eastmoney_info")
-                self._info_cache.set(cache_key, result, ttl=3600)
-                return result
-            cb.record_failure("eastmoney_info", err or "empty")
 
         # AkShare fallback
         if cb.is_available("akshare_info"):
@@ -505,6 +492,18 @@ class AStockDataSource(CNStockDataSource):
                 self._info_cache.set(cache_key, result, ttl=3600)
                 return result
             cb.record_failure("akshare_info", err or "empty")
+        # 东财 direct
+        if cb.is_available("eastmoney_info"):
+            result, err = _fetch_with_timeout(
+                lambda: self._fetch_stock_info_eastmoney(code),
+                timeout=min(_get_timeout(), 8),
+                source_name="eastmoney_info",
+            )
+            if result:
+                cb.record_success("eastmoney_info")
+                self._info_cache.set(cache_key, result, ttl=3600)
+                return result
+            cb.record_failure("eastmoney_info", err or "empty")
 
         return None
 
