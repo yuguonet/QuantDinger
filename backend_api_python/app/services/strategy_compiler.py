@@ -401,6 +401,8 @@ open_short_price = [0.0] * len(df)
 add_short_price = [0.0] * len(df)
 close_short_price = [0.0] * len(df)
 close_short_text = [None] * len(df)
+open_short_text = [None] * len(df)
+add_short_text = [None] * len(df)
 
 position = 0 # 0, 1 (Long), -1 (Short)
 position_count = 0
@@ -562,6 +564,18 @@ df['close_long_price'] = [p if s else None for p, s in zip(close_long_price, clo
 df['open_long_text'] = open_long_text
 df['add_long_text'] = add_long_text
 df['close_long_text'] = close_long_text
+df['open_short'] = open_short_signals
+df['add_short'] = add_short_signals
+df['close_short'] = close_short_signals
+df['open_short_price'] = [p if s else None for p, s in zip(open_short_price, open_short_signals)]
+df['add_short_price'] = [p if s else None for p, s in zip(add_short_price, add_short_signals)]
+df['close_short_price'] = [p if s else None for p, s in zip(close_short_price, close_short_signals)]
+df['open_short_text'] = open_short_text
+df['add_short_text'] = add_short_text
+df['close_short_text'] = close_short_text
+df['buy'] = open_long_signals
+df['sell'] = open_short_signals
+
 """
 
     def _get_output_section(self, name, rules):
