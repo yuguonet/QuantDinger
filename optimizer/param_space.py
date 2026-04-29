@@ -333,9 +333,16 @@ STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
 
 
 def get_template(key: str) -> dict:
-    if key not in STRATEGY_TEMPLATES:
-        raise ValueError(f"Unknown strategy template: {key}. Available: {list(STRATEGY_TEMPLATES.keys())}")
-    return STRATEGY_TEMPLATES[key]
+    if key in STRATEGY_TEMPLATES:
+        return STRATEGY_TEMPLATES[key]
+    # 尝试加载 A 股扩展模板
+    try:
+        from optimizer.strategy_templates_ashare import ASHARE_STRATEGY_TEMPLATES
+        if key in ASHARE_STRATEGY_TEMPLATES:
+            return ASHARE_STRATEGY_TEMPLATES[key]
+    except ImportError:
+        pass
+    raise ValueError(f"Unknown strategy template: {key}. Available: {list(STRATEGY_TEMPLATES.keys())}")
 
 
 def list_templates() -> List[str]:

@@ -307,8 +307,8 @@ ASHARE_STRATEGY_PROMPTS = [
 
 def batch_generate(output_path: str = "strategies_generated.py"):
     """批量生成策略模板"""
-    from app.optimizer.param_space import list_templates as _orig_list
-    from app.optimizer.strategy_templates_ashare import ASHARE_STRATEGY_TEMPLATES
+    from optimizer.param_space import list_templates as _orig_list
+    from optimizer.strategy_templates_ashare import ASHARE_STRATEGY_TEMPLATES
 
     existing = _orig_list() + list(ASHARE_STRATEGY_TEMPLATES.keys())
     all_templates = {}
@@ -376,8 +376,8 @@ def batch_generate(output_path: str = "strategies_generated.py"):
 
 def merge_templates():
     """将所有扩展模板合并到统一注册表"""
-    from app.optimizer.param_space import STRATEGY_TEMPLATES
-    from app.optimizer.strategy_templates_ashare import ASHARE_STRATEGY_TEMPLATES
+    from optimizer.param_space import STRATEGY_TEMPLATES
+    from optimizer.strategy_templates_ashare import ASHARE_STRATEGY_TEMPLATES
 
     merged = {}
     merged.update(STRATEGY_TEMPLATES)
@@ -385,7 +385,7 @@ def merge_templates():
 
     # 尝试加载 LLM 生成的模板
     try:
-        from app.optimizer.strategies_generated import GENERATED_TEMPLATES
+        from optimizer.strategies_generated import GENERATED_TEMPLATES
         merged.update(GENERATED_TEMPLATES)
         print(f"  加载 LLM 生成模板: {len(GENERATED_TEMPLATES)} 个")
     except ImportError:
@@ -443,8 +443,8 @@ def main():
         merge_templates()
 
     elif args.command == "list":
-        from app.optimizer.param_space import list_templates
-        from app.optimizer.strategy_templates_ashare import ASHARE_STRATEGY_TEMPLATES
+        from optimizer.param_space import list_templates
+        from optimizer.strategy_templates_ashare import ASHARE_STRATEGY_TEMPLATES
         print(f"\n  原始模板 ({len(list_templates())}):")
         for t in list_templates():
             print(f"    - {t}")

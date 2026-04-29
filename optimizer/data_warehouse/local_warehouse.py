@@ -3,10 +3,20 @@
 本地数据仓库数据源
 集成到 DataSourceFactory，作为最高优先级数据源（本地优先 → API fallback）。
 """
+import os
+import sys
 from typing import Any, Dict, List, Optional
 
+# 确保 backend_api_python 在 path 中
+_backend_root = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "backend_api_python",
+)
+if _backend_root not in sys.path:
+    sys.path.insert(0, _backend_root)
+
 from app.data_sources.base import BaseDataSource
-from app.data_warehouse.storage import read_local, exists, list_local
+from optimizer.data_warehouse.storage import read_local, exists, list_local
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)

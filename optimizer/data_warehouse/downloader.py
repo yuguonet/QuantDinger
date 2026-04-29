@@ -33,8 +33,11 @@ from typing import Dict, List, Any, Optional
 _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
+_backend_root = os.path.join(_project_root, "backend_api_python")
+if _backend_root not in sys.path:
+    sys.path.insert(0, _backend_root)
 
-from app.data_warehouse.storage import (
+from optimizer.data_warehouse.storage import (
     write_local, exists, get_stats, list_local, get_warehouse_root,
 )
 from app.utils.logger import get_logger
@@ -140,7 +143,7 @@ def _fetch_kline_from_source(
     从现有数据源拉取 K 线数据。
     直接复用 DataSourceFactory 的数据源链路。
     """
-    from app.data_warehouse.factory2 import DataSourceFactory2
+    from optimizer.data_warehouse.factory2 import DataSourceFactory2
 
     source = DataSourceFactory2.get_source(market)
     data = source.get_kline(

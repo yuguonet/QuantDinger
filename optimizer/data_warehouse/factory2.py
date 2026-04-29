@@ -7,7 +7,16 @@
   2. 远程 API（腾讯/新浪/东财/...）
 """
 import os
+import sys
 from typing import Dict, List, Any, Optional
+
+# 确保 backend_api_python 在 path 中
+_backend_root = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "backend_api_python",
+)
+if _backend_root not in sys.path:
+    sys.path.insert(0, _backend_root)
 
 from app.data_sources.base import BaseDataSource
 from app.utils.logger import get_logger
@@ -128,7 +137,7 @@ class DataSourceFactory2:
         if not _WAREHOUSE_ENABLED:
             return None
         try:
-            from app.data_warehouse.storage import read_local, exists as warehouse_exists
+            from optimizer.data_warehouse.storage import read_local, exists as warehouse_exists
             if not warehouse_exists(market, timeframe, symbol):
                 return None
             data = read_local(

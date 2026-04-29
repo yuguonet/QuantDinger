@@ -16,17 +16,26 @@
 """
 import csv
 import os
+import sys
 import threading
 from datetime import datetime
 from typing import Dict, List, Any, Optional
+
+# 确保 backend_api_python 在 path 中（app 模块在那里）
+_backend_root = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "backend_api_python",
+)
+if _backend_root not in sys.path:
+    sys.path.insert(0, _backend_root)
 
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# 默认仓库根目录（项目根目录下的 data_warehouse/）
+# 默认仓库根目录（optimizer 目录下的 data_warehouse/）
 _DEFAULT_ROOT = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "data_warehouse",
 )
 

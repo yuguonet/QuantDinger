@@ -37,7 +37,8 @@ from datetime import datetime
 from typing import Dict, Any, List
 
 # 确保 backend_api_python 在 path 中（app 模块在那里）
-_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_optimizer_dir = os.path.dirname(os.path.abspath(__file__))
+_project_root = os.path.dirname(_optimizer_dir)
 _backend_root = os.path.join(_project_root, "backend_api_python")
 if _backend_root not in sys.path:
     sys.path.insert(0, _backend_root)
@@ -48,7 +49,7 @@ if _project_root not in sys.path:
 def _patch_datasource_warehouse():
     """在 BacktestService 加载前，注入本地仓库读取逻辑"""
     from app.data_sources.factory import DataSourceFactory
-    from data_warehouse.storage import read_local
+    from optimizer.data_warehouse.storage import read_local
 
     _orig_get_kline = DataSourceFactory.get_kline.__func__
 
@@ -314,9 +315,11 @@ def run_single_template(
     n_trials: int = 100,
     score_fn: str = "composite",
     do_validate: bool = True,
-    output_dir: str = "optimizer_output",
+    output_dir: str = None,
 ) -> Dict[str, Any]:
     """对单个策略模板运行完整优化流程"""
+    if output_dir is None:
+        output_dir = os.path.join(_optimizer_dir, "optimizer_output")
     template = get_template_unified(template_key)
 
     # A 股默认参数调整
@@ -468,7 +471,7 @@ def main():
     parser.add_argument("--score", type=str, default="composite",
                         choices=["sharpe", "return_dd_ratio", "composite"], help="评分函数")
     parser.add_argument("--no-validate", action="store_true", help="跳过 Walk-Forward 验证")
-    parser.add_argument("--output", "-o", type=str, default="optimizer_output", help="输出目录")
+    parser.add_argument("--output", "-o", type=str, default=os.path.join(_optimizer_dir, "optimizer_output"), help="输出目录")
     parser.add_argument("--list", "-l", action="store_true", help="列出所有可用模板")
 
     args = parser.parse_args()
@@ -557,7 +560,7 @@ def main():
 
         ranked = sorted(
             all_results,
-            key=lambda r: r.get("validation", {}).get("avg_test_score", r["best"]["score"]),
+            key=lambda r: (r.get("validation") or {}).get("avg_test_score", r["best"]["score"]),
             reverse=True,
         )
 
@@ -565,8 +568,8 @@ def main():
         print(f"  {'-'*90}")
         for rank, r in enumerate(ranked, 1):
             best = r["best"]["metrics"]
-            wf_score = r.get("validation", {}).get("avg_test_score", "N/A")
-            verdict = r.get("validation", {}).get("verdict", "未验证")[:20]
+            wf_score = (r.get("validation") or {}).get("avg_test_score", "N/A")
+            verdict = (r.get("validation") or {}).get("verdict", "未验证")[:20]
             print(f"  {rank:<5} {r['template']:<25} "
                   f"{best.get('sharpeRatio',0):<10.2f} "
                   f"{best.get('winRate',0):<10.1f} "

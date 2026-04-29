@@ -6,9 +6,19 @@
   - 加密市场模拟（高波动、24/7 交易）
   - A 股模拟（涨跌停、T+1、换手率、正常交易时间）
 """
+import os
+import sys
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
+
+# 确保 backend_api_python 在 path 中
+_backend_root = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "backend_api_python",
+)
+if _backend_root not in sys.path:
+    sys.path.insert(0, _backend_root)
 
 
 def generate_mock_klines(
