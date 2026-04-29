@@ -214,9 +214,9 @@ def _fetch_ashare_daily_batch(symbol: str, years: int = 3) -> List[Dict[str, Any
     all_data: List[Dict[str, Any]] = []
     total_bars = years * 250  # 约 250 个交易日/年
 
-    # 腾讯 fqkline 不支持 before_time 分页，直接拉最大量
-    # 单次拉 10000 根（覆盖多年）
-    raw = fetch_kline(code, "day", count=10000, adj="qfq")
+    # 腾讯 fqkline 单次上限约 800 根，超过 1000 返回空数据
+    # 800 根日线 ≈ 3.2 年，足够覆盖常见需求
+    raw = fetch_kline(code, "day", count=800, adj="qfq")
     if raw:
         all_data = tencent_kline_rows_to_dicts(raw)
 
@@ -224,7 +224,7 @@ def _fetch_ashare_daily_batch(symbol: str, years: int = 3) -> List[Dict[str, Any
         # Fallback: 尝试东方财富
         try:
             from app.data_sources.eastmoney import fetch_eastmoney_kline, eastmoney_kline_to_ticker
-            raw2 = fetch_eastmoney_kline(code, "day", count=10000)
+            raw2 = fetch_eastmoney_kline(code, "1D", count=10000)
             if raw2:
                 all_data = eastmoney_kline_to_ticker(raw2)
         except Exception:

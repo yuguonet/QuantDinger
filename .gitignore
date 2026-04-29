@@ -84,3 +84,4 @@ backend_api_python/app/market_store/国际市场监控.md
 .gitignore
 backend_api_python/AI分析数据流全景.md
 backend_api_python/optimizer_output/
+backend_api_python/data_warehouse/
