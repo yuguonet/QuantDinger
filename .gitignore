@@ -87,3 +87,4 @@ backend_api_python/optimizer_output/
 optimizer/data_warehouse/
 optimizer/optimizer_output/
 optimizer_output_llm_v2/
+optimizer_output_llm_v2x/

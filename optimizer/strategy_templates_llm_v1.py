@@ -260,7 +260,6 @@ def _build_macd_vol_divergence_config(p: dict) -> dict:
 LLM_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
 
     # ── 1. VWAP + 放量确认 ──
-    # v2: 收窄参数，Phase 1 表现好(Sharpe 0.838)但仍可优化
     "vwap_volume_confirm": {
         "name": "VWAP偏离+放量确认",
         "description": (
@@ -270,21 +269,19 @@ LLM_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
         ),
         "indicators": ["vwap", "volume", "rsi"],
         "params": {
-            "vwap_dev_pct":      _p_float(1.5, 4.0, 0.1),  # 原 1-5 → 1.5-4，去极端
-            "vol_ma_period":     _p_int(10, 20, 1),         # 原 10-30 → 10-20
-            "vol_ratio":         _p_float(1.2, 2.5, 0.1),   # 原 1-3 → 1.2-2.5
+            "vwap_dev_pct":      _p_float(1.0, 5.0, 0.1),
+            "vol_ma_period":     _p_int(10, 30, 1),
+            "vol_ratio":         _p_float(1.0, 3.0, 0.1),
             "use_rsi_filter":    _p_choice([True, False]),
-            "rsi_period":        _p_int(10, 18, 1),         # 原 7-21 → 10-18
-            "rsi_level":         _p_int(28, 42, 1),         # 原 25-45 → 28-42
-            "stop_loss_pct":     _p_float(2.0, 4.0, 0.5),   # 原 2-5 → 2-4
+            "rsi_period":        _p_int(7, 21, 1),
+            "rsi_level":         _p_int(25, 45, 1),
+            "stop_loss_pct":     _p_float(2.0, 5.0, 0.5),
         },
         "constraints": [],
         "build_config": _build_vwap_volume_confirm_config,
     },
 
     # ── 2. RSI + 量价背离 ──
-    # v2 优化: 收窄参数空间 + 加约束，降低过拟合风险
-    # 原始空间 2.3 亿组合 → 优化后 ~48 万组合（减少 99.8%）
     "rsi_volume_divergence": {
         "name": "RSI超卖+量价背离",
         "description": (
@@ -294,23 +291,20 @@ LLM_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
         ),
         "indicators": ["rsi", "volume", "ma"],
         "params": {
-            "rsi_period":       _p_int(10, 18, 1),      # 原 7-21 → 10-18，去掉极端值
-            "rsi_oversold":     _p_int(25, 35, 1),      # 原 20-40 → 25-35，经典超卖区
-            "lookback_period":  _p_int(15, 30, 1),      # 原 10-40 → 15-30，去噪+保信号
-            "price_ma_period":  _p_int(5, 15, 1),       # 原 5-20 → 5-15，短期MA
-            "vol_ma_period":    _p_int(10, 20, 1),      # 原 10-30 → 10-20，量能窗口
+            "rsi_period":       _p_int(7, 21, 1),
+            "rsi_oversold":     _p_int(20, 40, 1),
+            "lookback_period":  _p_int(10, 40, 1),
+            "price_ma_period":  _p_int(5, 20, 1),
+            "vol_ma_period":    _p_int(10, 30, 1),
             "use_ma_filter":    _p_choice([True, False]),
-            "ma_period":        _p_int(20, 60, 10),     # 原 20-120 → 20-60，趋势过滤
-            "stop_loss_pct":    _p_float(3.0, 5.0, 0.5), # 原 3-6 → 3-5，收窄
+            "ma_period":        _p_int(20, 120, 10),
+            "stop_loss_pct":    _p_float(3.0, 6.0, 0.5),
         },
-        "constraints": [
-            ("price_ma_period", "<", "lookback_period"),  # 价格MA必须短于回看期
-        ],
+        "constraints": [],
         "build_config": _build_rsi_volume_divergence_config,
     },
 
     # ── 3. 三周期 RSI 动量 ──
-    # Phase 1 冠军(Sharpe 0.630, 100%正得分)，参数空间已较合理，微调
     "triple_rsi_momentum": {
         "name": "三周期RSI动量",
         "description": (
@@ -321,12 +315,12 @@ LLM_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
         "indicators": ["rsi"],
         "params": {
             "rsi_fast":       _p_int(5, 10, 1),
-            "rsi_mid":        _p_int(11, 18, 1),       # 原 10-18 → 11-18，避免与fast重叠
-            "rsi_slow":       _p_int(19, 30, 1),       # 原 18-30 → 19-30，避免与mid重叠
-            "rsi_entry":      _p_int(28, 42, 1),       # 原 25-45 → 28-42，收窄
-            "rsi_trend_mid":  _p_int(42, 53, 1),       # 原 40-55 → 42-53
-            "rsi_trend_slow": _p_int(42, 53, 1),       # 原 40-55 → 42-53
-            "stop_loss_pct":  _p_float(2.5, 4.5, 0.5), # 原 2.5-5 → 2.5-4.5
+            "rsi_mid":        _p_int(10, 18, 1),
+            "rsi_slow":       _p_int(18, 30, 1),
+            "rsi_entry":      _p_int(25, 45, 1),
+            "rsi_trend_mid":  _p_int(40, 55, 1),
+            "rsi_trend_slow": _p_int(40, 55, 1),
+            "stop_loss_pct":  _p_float(2.5, 5.0, 0.5),
         },
         "constraints": [
             ("rsi_fast", "<", "rsi_mid"),
@@ -336,7 +330,6 @@ LLM_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
     },
 
     # ── 4. VWAP + 布林带收缩 ──
-    # Phase 1 亚军(Sharpe 1.101, 100%正得分)，微调去极端
     "vwap_bollinger_squeeze": {
         "name": "VWAP偏离+布林带收缩",
         "description": (
@@ -346,45 +339,40 @@ LLM_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
         ),
         "indicators": ["vwap", "bollinger"],
         "params": {
-            "vwap_dev_pct":       _p_float(1.0, 3.5, 0.1),  # 原 1-4 → 1-3.5
-            "bb_period":          _p_int(12, 28, 1),         # 原 10-30 → 12-28
-            "bb_std":             _p_float(1.8, 2.8, 0.1),   # 原 1.5-3 → 1.8-2.8
+            "vwap_dev_pct":       _p_float(1.0, 4.0, 0.1),
+            "bb_period":          _p_int(10, 30, 1),
+            "bb_std":             _p_float(1.5, 3.0, 0.1),
             "use_squeeze_filter": _p_choice([True, False]),
-            "squeeze_percentile": _p_int(10, 25, 5),         # 原 10-30 → 10-25
-            "stop_loss_pct":      _p_float(2.0, 3.5, 0.5),   # 原 2-4 → 2-3.5
+            "squeeze_percentile": _p_int(10, 30, 5),
+            "stop_loss_pct":      _p_float(2.0, 4.0, 0.5),
         },
         "constraints": [],
         "build_config": _build_vwap_bollinger_squeeze_config,
     },
 
     # ── 5. MACD 底背离 + 量价背离 ──
-    # Phase 1 最差(Sharpe -0.309)，已修复 histogram→diff_lt_dea
-    # v2: 固定 RSI 确认(减少参数维度)，围绕经典 MACD(12,26,9)
     "macd_vol_divergence": {
         "name": "MACD底背离+量价背离",
         "description": (
             "MACD 柱状线翻红 + 量价底背离双重反转确认。"
             "数据依据: macd_kdj_resonance (#6, 0.51) + volume_price_divergence (#3, 0.60)。"
             "动量反转+形态确认，捕捉底部反转。"
-            "v2: 修复 histogram_negative→diff_lt_dea，固定RSI确认，收窄参数空间。"
         ),
         "indicators": ["macd", "volume", "rsi"],
         "params": {
-            "macd_fast":       _p_int(10, 14, 1),        # 围绕标准12
-            "macd_slow":       _p_int(22, 30, 1),        # 围绕标准26
-            "macd_signal":     _p_int(7, 11, 1),         # 围绕标准9
-            "lookback_period": _p_int(15, 30, 1),
-            "price_ma_period": _p_int(5, 15, 1),
-            "vol_ma_period":   _p_int(10, 20, 1),
-            # 固定 RSI 确认开启 + 标准周期14，去掉 3 个自由参数
-            "use_rsi_confirm": _p_choice([True]),
-            "rsi_period":      _p_int(14, 14, 1),
-            "rsi_level":       _p_int(30, 40, 1),        # 原 25-45 → 30-40
-            "stop_loss_pct":   _p_float(3.0, 5.0, 0.5),
+            "macd_fast":       _p_int(8, 16, 1),
+            "macd_slow":       _p_int(20, 35, 1),
+            "macd_signal":     _p_int(5, 12, 1),
+            "lookback_period": _p_int(10, 40, 1),
+            "price_ma_period": _p_int(5, 20, 1),
+            "vol_ma_period":   _p_int(10, 30, 1),
+            "use_rsi_confirm": _p_choice([True, True, True, False]),  # 默认开启
+            "rsi_period":      _p_int(7, 21, 1),
+            "rsi_level":       _p_int(25, 45, 1),
+            "stop_loss_pct":   _p_float(3.0, 6.0, 0.5),
         },
         "constraints": [
             ("macd_fast", "<", "macd_slow"),
-            ("price_ma_period", "<", "lookback_period"),
         ],
         "build_config": _build_macd_vol_divergence_config,
     },
