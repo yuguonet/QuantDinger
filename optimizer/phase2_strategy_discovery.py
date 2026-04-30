@@ -288,10 +288,24 @@ A 股技术分析的经典组合：
 # ============================================================
 
 def _init_backend_path():
-    """将 backend_api_python 加入 sys.path"""
+    """将 backend_api_python 加入 sys.path 并加载 .env"""
     backend_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backend_api_python")
     if backend_path not in sys.path:
         sys.path.insert(0, backend_path)
+    # 加载 backend_api_python/.env
+    env_path = os.path.join(backend_path, ".env")
+    if os.path.exists(env_path):
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(env_path)
+        except ImportError:
+            # 手动解析 .env
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        os.environ.setdefault(k.strip(), v.strip())
 
 
 def call_llm_via_backend(prompt: str, system: str = "") -> str:
@@ -317,7 +331,7 @@ def call_llm_via_backend(prompt: str, system: str = "") -> str:
         response = llm.call_llm_api(
             messages=messages,
             temperature=0.3,
-            max_tokens=4000,
+            # max_tokens=4000,
         )
 
         # call_llm_api 直接返回字符串
