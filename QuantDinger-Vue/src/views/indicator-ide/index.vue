@@ -3,49 +3,6 @@
     <!-- Header toolbar -->
     <div class="ide-toolbar">
       <div class="toolbar-left">
-        <div class="ide-toolbar-code-slot">
-          <a-tooltip :title="codeDrawerVisible ? $t('indicatorIde.hideCode') : $t('indicatorIde.showCode')">
-            <a-button
-              class="ide-toolbar-icon-btn"
-              size="small"
-              :type="codeDrawerVisible ? 'primary' : 'default'"
-              @click="codeDrawerVisible = !codeDrawerVisible"
-            >
-              <a-icon type="code" />
-            </a-button>
-          </a-tooltip>
-        </div>
-
-        <div class="ide-toolbar-group ide-toolbar-group--watchlist">
-          <span class="ide-toolbar-label">{{ $t('indicatorIde.toolbar.watchlist') }}</span>
-          <a-select
-            v-model="selectedWatchlistKey"
-            class="ide-toolbar-select ide-toolbar-select--watchlist"
-            :placeholder="$t('backtest-center.config.watchlistPlaceholder')"
-            size="small"
-            show-search
-            allow-clear
-            :filter-option="filterWatchlistOption"
-            :dropdown-class-name="isDarkTheme ? 'ide-watchlist-dropdown ide-watchlist-dropdown--dark' : 'ide-watchlist-dropdown'"
-            @change="handleWatchlistChange"
-          >
-            <a-select-option
-              v-for="w in watchlist"
-              :key="`${w.market}:${w.symbol}`"
-              :value="`${w.market}:${w.symbol}`"
-            >
-              <span class="wl-opt-tag" :class="'wl-mkt-' + (w.market || '').toLowerCase()">{{ marketLabel(w.market) }}</span>
-              <strong class="wl-opt-symbol">{{ w.symbol }}</strong>
-              <span v-if="w.name" class="wl-opt-name">{{ w.name }}</span>
-            </a-select-option>
-            <a-select-option key="__add__" value="__add__" class="add-option">
-              <div class="ide-watchlist-add-row">
-                <a-icon type="plus" /> {{ $t('backtest-center.config.addSymbol') }}
-              </div>
-            </a-select-option>
-          </a-select>
-        </div>
-
         <div class="ide-toolbar-group ide-toolbar-group--tf">
           <span class="ide-toolbar-label">{{ $t('indicatorIde.toolbar.timeframe') }}</span>
           <a-radio-group
@@ -91,19 +48,6 @@
       <div class="toolbar-right">
         <a-tooltip placement="bottomLeft">
           <template slot="title">
-            {{ codeDrawerVisible ? '显示自选股' : '显示代码编辑器' }}
-          </template>
-          <a-button
-            class="ide-toolbar-icon-btn"
-            size="small"
-            :type="codeDrawerVisible ? 'default' : 'primary'"
-            @click="codeDrawerVisible = !codeDrawerVisible"
-          >
-            <a-icon type="star" theme="filled" />
-          </a-button>
-        </a-tooltip>
-        <a-tooltip placement="bottomLeft">
-          <template slot="title">
             {{ quickTradeDrawerVisible ? $t('indicatorIde.hideQuickTrade') : $t('indicatorIde.showQuickTrade') }}
           </template>
           <a-button
@@ -121,16 +65,39 @@
 
     <!-- Main split panels -->
     <div class="ide-main">
-      <!-- Left panel (collapsible drawer) -->
-      <div class="ide-left">
-        <!-- Code Editor (collapsible) -->
-        <div v-show="codeDrawerVisible" class="code-panel" :class="{ collapsed: !codePanelExpanded }">
-          <div class="panel-title" @click="codePanelExpanded = !codePanelExpanded" style="cursor: pointer;">
-            <a-icon type="code" />
-            <span>{{ $t('indicatorIde.codeEditor') }}</span>
-            <a-tag v-if="codeDirty && !selectedIndicatorIsPurchased" color="orange" size="small" style="margin-left: 8px;">{{ $t('indicatorIde.modified') }}</a-tag>
-            <a-tag v-if="selectedIndicatorIsPurchased" color="purple" size="small" style="margin-left: 8px;">{{ $t('indicatorIde.purchasedReadOnlyTag') }}</a-tag>
-            <div class="panel-title-actions" @click.stop>
+      <!-- Left panel: 自选股 -->
+      <div class="ide-left" :style="{ width: leftPanelWidthPct + '%' }">
+        <watchlist-panel
+          v-model="selectedWatchlistKey"
+          @select="onWatchlistPanelSelect"
+          style="width: 100%; flex: 1; max-height: none; border: none; box-shadow: none; border-radius: 0; align-self: stretch;"
+        />
+      </div>
+
+      <!-- 拖拽调整左右比例 -->
+      <div class="ide-lr-resize-handle" @mousedown="startResizeLeftRight">
+        <span class="ide-lr-resize-handle-dots"></span>
+      </div>
+
+      <!-- Right panel (chart/code/AI tabs + results) -->
+      <div class="ide-right">
+        <!-- K线视窗 / 代码编辑器 / AI生成 tab 切换 -->
+        <div class="ide-chart-area" :style="{ flex: 'none', height: chartPanelHeight + '%' }">
+          <div class="ide-chart-tabs">
+            <div
+              v-for="tab in chartTabOptions"
+              :key="tab.key"
+              class="ide-chart-tab"
+              :class="{ active: activeChartTab === tab.key }"
+              @click="switchChartTab(tab.key)"
+            >
+              <a-icon :type="tab.icon" />
+              <span>{{ tab.label }}</span>
+              <a-tag v-if="tab.key === 'code' && codeDirty && !selectedIndicatorIsPurchased" color="orange" size="small" class="ide-chart-tab-badge">{{ $t('indicatorIde.modified') }}</a-tag>
+              <a-tag v-if="tab.key === 'code' && selectedIndicatorIsPurchased" color="purple" size="small" class="ide-chart-tab-badge">{{ $t('indicatorIde.purchasedReadOnlyTag') }}</a-tag>
+            </div>
+            <!-- 代码编辑器操作按钮（仅代码tab激活时显示） -->
+            <div v-if="activeChartTab === 'code'" class="ide-chart-tab-actions">
               <a-tooltip :title="$t('dashboard.indicator.create')">
                 <a-button size="small" :loading="creatingIndicator" @click="handleCreateIndicator"><a-icon type="plus" /></a-button>
               </a-tooltip>
@@ -138,12 +105,7 @@
                 <a-button size="small" :disabled="!selectedIndicatorId || !codeDirty || selectedIndicatorIsPurchased" @click="saveIndicator"><a-icon type="save" /></a-button>
               </a-tooltip>
               <a-tooltip :title="selectedIndicatorIsPurchased ? $t('indicatorIde.deleteBlockedPurchased') : $t('dashboard.indicator.action.delete')">
-                <a-button
-                  size="small"
-                  :disabled="!selectedIndicatorId || selectedIndicatorIsPurchased"
-                  :loading="deletingIndicator"
-                  @click="handleDeleteIndicator"
-                ><a-icon type="delete" /></a-button>
+                <a-button size="small" :disabled="!selectedIndicatorId || selectedIndicatorIsPurchased" :loading="deletingIndicator" @click="handleDeleteIndicator"><a-icon type="delete" /></a-button>
               </a-tooltip>
               <a-tooltip :title="selectedIndicatorIsPurchased ? $t('indicatorIde.publishBlockedPurchased') : $t('dashboard.indicator.action.publish')">
                 <a-button size="small" :disabled="!selectedIndicatorId || selectedIndicatorIsPurchased" @click="handlePublishIndicator"><a-icon type="cloud-upload" /></a-button>
@@ -155,18 +117,30 @@
                 <a-button size="small" :disabled="!userId || !currentCode" @click="openSaveAsIndicatorModal"><a-icon type="copy" /></a-button>
               </a-tooltip>
               <a-tooltip :title="chartIndicatorRunning ? $t('indicatorIde.stopIndicatorOnChart') : $t('indicatorIde.runIndicatorOnChart')">
-                <a-button
-                  size="small"
-                  :disabled="chartIndicatorToggleDisabled"
-                  @click="toggleChartIndicatorRun"
-                >
+                <a-button size="small" :disabled="chartIndicatorToggleDisabled" @click="toggleChartIndicatorRun">
                   <a-icon :type="chartIndicatorRunning ? 'pause-circle' : 'play-circle'" />
                 </a-button>
               </a-tooltip>
             </div>
-            <a-icon :type="codePanelExpanded ? 'up' : 'down'" style="margin-left: auto;" />
           </div>
-          <div v-show="codePanelExpanded" class="code-panel-body">
+
+          <!-- K线图 -->
+          <div v-show="activeChartTab === 'chart'" class="ide-chart-tab-content">
+            <kline-chart
+              ref="klineChart"
+              :symbol="symbol"
+              :market="market"
+              :timeframe="timeframe"
+              :theme="chartTheme"
+              :activeIndicators="activeIndicators"
+              :userId="userId"
+              :realtime-enabled="klineRealtimeEnabled"
+              @indicator-toggle="handleIndicatorToggle"
+            />
+          </div>
+
+          <!-- 代码编辑器 -->
+          <div v-show="activeChartTab === 'code'" class="ide-chart-tab-content ide-code-tab-content">
             <div class="ide-guide-bar">
               <a-icon type="book" />
               <span>{{ $t('indicatorIde.devGuideTooltip') }}</span>
@@ -187,10 +161,7 @@
             <div class="code-editor-wrapper">
               <div ref="codeEditor" class="code-editor-area"></div>
               <transition name="fade">
-                <div
-                  v-if="aiGenerating"
-                  class="code-ai-overlay"
-                >
+                <div v-if="aiGenerating" class="code-ai-overlay">
                   <div class="code-ai-overlay-inner">
                     <a-icon type="loading" spin style="font-size: 22px; color: #1890ff;" />
                     <span>{{ $t('indicatorIde.generating') }}</span>
@@ -202,38 +173,21 @@
                 </div>
               </transition>
             </div>
-
-            <!-- Code quality (between editor and AI) -->
+            <!-- Code quality -->
             <div class="code-quality-panel">
               <div class="code-quality-head">
                 <span class="code-quality-title">{{ $t('indicatorIde.codeQualityTitle') }}</span>
-                <a-button
-                  type="link"
-                  size="small"
-                  class="code-quality-recheck"
-                  :loading="codeQualityLoading"
-                  @click="runCodeQualityCheck"
-                >{{ $t('indicatorIde.codeQualityRecheck') }}</a-button>
+                <a-button type="link" size="small" class="code-quality-recheck" :loading="codeQualityLoading" @click="runCodeQualityCheck">{{ $t('indicatorIde.codeQualityRecheck') }}</a-button>
               </div>
               <a-spin v-if="codeQualityLoading" size="small" class="code-quality-spin" />
               <ul v-else-if="sortedCodeQualityHints.length" class="code-quality-list">
-                <li
-                  v-for="(h, idx) in sortedCodeQualityHints"
-                  :key="idx"
-                  :class="qualityHintClass(h)"
-                >{{ formatQualityHint(h) }}</li>
+                <li v-for="(h, idx) in sortedCodeQualityHints" :key="idx" :class="qualityHintClass(h)">{{ formatQualityHint(h) }}</li>
               </ul>
             </div>
-
-            <div
-              v-if="aiDebugSummary"
-              class="ai-debug-card"
-              :class="`ai-debug-card--${aiDebugState()}`"
-            >
+            <!-- AI debug summary -->
+            <div v-if="aiDebugSummary" class="ai-debug-card" :class="`ai-debug-card--${aiDebugState()}`">
               <div class="ai-debug-card__header">
-                <div class="ai-debug-card__badge">
-                  <a-icon :type="aiDebugStateIcon()" />
-                </div>
+                <div class="ai-debug-card__badge"><a-icon :type="aiDebugStateIcon()" /></div>
                 <div class="ai-debug-card__headline">
                   <span class="ai-debug-card__tag">{{ $t('indicatorIde.aiQaTag') || 'AI 质检' }}</span>
                   <span class="ai-debug-card__title">{{ aiDebugSummary.title }}</span>
@@ -242,132 +196,71 @@
               </div>
               <div class="ai-debug-card__chips">
                 <span :class="['ai-debug-chip', `ai-debug-chip--${aiDebugState()}`]">{{ aiDebugStateLabel() }}</span>
-                <span v-if="aiDebugSummary.fixed_messages.length" class="ai-debug-chip ai-debug-chip--success">
-                  <a-icon type="check" style="font-size: 10px;" /> {{ aiDebugSummary.fixed_messages.length }} {{ $t('indicatorIde.fixed') || '已修复' }}
-                </span>
-                <span v-if="aiDebugSummary.remaining_messages.length" class="ai-debug-chip ai-debug-chip--warning">
-                  <a-icon type="eye" style="font-size: 10px;" /> {{ aiDebugSummary.remaining_messages.length }} {{ $t('indicatorIde.toWatch') || '待关注' }}
-                </span>
+                <span v-if="aiDebugSummary.fixed_messages.length" class="ai-debug-chip ai-debug-chip--success"><a-icon type="check" style="font-size: 10px;" /> {{ aiDebugSummary.fixed_messages.length }} {{ $t('indicatorIde.fixed') || '已修复' }}</span>
+                <span v-if="aiDebugSummary.remaining_messages.length" class="ai-debug-chip ai-debug-chip--warning"><a-icon type="eye" style="font-size: 10px;" /> {{ aiDebugSummary.remaining_messages.length }} {{ $t('indicatorIde.toWatch') || '待关注' }}</span>
               </div>
-              <div v-if="aiDebugSummary.returned_text" class="ai-debug-card__body">
-                {{ aiDebugSummary.returned_text }}
-              </div>
+              <div v-if="aiDebugSummary.returned_text" class="ai-debug-card__body">{{ aiDebugSummary.returned_text }}</div>
               <div v-if="aiDebugSummary.fixed_messages.length" class="ai-debug-card__group ai-debug-card__group--fixed">
                 <div class="ai-debug-card__group-label"><a-icon type="check-circle" /> {{ $t('indicatorIde.autoFixed') || '已自动修复' }}</div>
-                <div v-for="(msg, idx) in aiDebugSummary.fixed_messages" :key="`fixed-${idx}`" class="ai-debug-card__item">
-                  <span class="ai-debug-card__bullet ai-debug-card__bullet--green"></span>{{ msg }}
-                </div>
+                <div v-for="(msg, idx) in aiDebugSummary.fixed_messages" :key="`fixed-${idx}`" class="ai-debug-card__item"><span class="ai-debug-card__bullet ai-debug-card__bullet--green"></span>{{ msg }}</div>
               </div>
               <div v-if="aiDebugSummary.remaining_messages.length" class="ai-debug-card__group ai-debug-card__group--remaining">
                 <div class="ai-debug-card__group-label"><a-icon type="warning" /> {{ $t('indicatorIde.needAttention') || '仍需关注' }}</div>
-                <div v-for="(msg, idx) in aiDebugSummary.remaining_messages" :key="`remaining-${idx}`" class="ai-debug-card__item">
-                  <span class="ai-debug-card__bullet ai-debug-card__bullet--orange"></span>{{ msg }}
-                </div>
+                <div v-for="(msg, idx) in aiDebugSummary.remaining_messages" :key="`remaining-${idx}`" class="ai-debug-card__item"><span class="ai-debug-card__bullet ai-debug-card__bullet--orange"></span>{{ msg }}</div>
               </div>
             </div>
+          </div>
 
-            <!-- AI Generation Panel -->
-            <div class="ai-gen-panel">
-              <div class="ai-gen-header" @click="aiPanelExpanded = !aiPanelExpanded">
-                <a-icon type="robot" />
-                <span>{{ $t('indicatorIde.aiGenerate') }}</span>
-                <a-icon :type="aiPanelExpanded ? 'up' : 'down'" style="margin-left: auto;" />
-              </div>
-              <div v-show="aiPanelExpanded" class="ai-gen-body">
-                <div class="ai-helper-tip">{{ $t('indicatorIde.aiAssistHint') }}</div>
-                <a-textarea
-                  v-model="aiPrompt"
-                  class="ai-prompt-input"
-                  :placeholder="$t('indicatorIde.aiPromptPlaceholder')"
-                  :rows="6"
-                  :disabled="aiGenerating || selectedIndicatorIsPurchased"
-                  style="resize: vertical;"
-                  @pressEnter="handleAIGenerateEnterKey"
-                />
-                <a-button
-                  type="primary"
-                  size="small"
-                  block
-                  :loading="aiGenerating"
-                  :disabled="selectedIndicatorIsPurchased"
-                  @click="handleAIGenerate"
-                  style="margin-top: 8px;"
-                >
-                  <a-icon v-if="!aiGenerating" type="robot" />
-                  {{ aiGenerating ? $t('indicatorIde.generating') : $t('indicatorIde.generateCode') }}
-                </a-button>
-                <div class="ai-helper-links">
-                  <a @click.prevent="goToIndicatorMarket">{{ $t('indicatorIde.goIndicatorMarket') }}</a>
-                </div>
+          <!-- AI 生成 -->
+          <div v-show="activeChartTab === 'ai'" class="ide-chart-tab-content ide-ai-tab-content">
+            <div class="ai-gen-body" style="padding: 16px; display: flex; flex-direction: column; flex: 1; min-height: 0;">
+              <div class="ai-helper-tip">{{ $t('indicatorIde.aiAssistHint') }}</div>
+              <a-textarea
+                v-model="aiPrompt"
+                class="ai-prompt-input"
+                :placeholder="$t('indicatorIde.aiPromptPlaceholder')"
+                :disabled="aiGenerating || selectedIndicatorIsPurchased"
+                style="resize: none; flex: 1; min-height: 200px;"
+                @pressEnter="handleAIGenerateEnterKey"
+              />
+              <a-button
+                type="primary"
+                size="small"
+                block
+                :loading="aiGenerating"
+                :disabled="selectedIndicatorIsPurchased"
+                @click="handleAIGenerate"
+                style="margin-top: 8px;"
+              >
+                <a-icon v-if="!aiGenerating" type="robot" />
+                {{ aiGenerating ? $t('indicatorIde.generating') : $t('indicatorIde.generateCode') }}
+              </a-button>
+              <div class="ai-helper-links">
+                <a @click.prevent="goToIndicatorMarket">{{ $t('indicatorIde.goIndicatorMarket') }}</a>
               </div>
             </div>
           </div>
         </div>
 
-        <!-- 自选股面板（代码编辑器隐藏时显示） -->
-        <div v-show="!codeDrawerVisible" class="ide-watchlist-inline">
-          <watchlist-panel
-            v-model="selectedWatchlistKey"
-            @select="onWatchlistPanelSelect"
-            style="width: 100%; flex: 1; max-height: none; border: none; box-shadow: none; border-radius: 0; align-self: stretch;"
-          />
-        </div>
-
-      </div>
-
-      <!-- Right panel (chart + results) -->
-      <div class="ide-right">
-        <div class="chart-panel" :style="{ flex: 'none', height: chartPanelHeight + 'px' }">
-          <kline-chart
-            ref="klineChart"
-            :symbol="symbol"
-            :market="market"
-            :timeframe="timeframe"
-            :theme="chartTheme"
-            :activeIndicators="activeIndicators"
-            :userId="userId"
-            :realtime-enabled="klineRealtimeEnabled"
-            @indicator-toggle="handleIndicatorToggle"
-          />
-        </div>
-        <div
-          class="ide-resize-handle"
-          @mousedown="startResizePanel"
-        >
+        <div class="ide-resize-handle" @mousedown="startResizePanel">
           <span class="ide-resize-handle-dots"></span>
         </div>
         <div class="result-panel">
-          <div class="params-card">
-            <div class="params-card-header" @click="paramsPanelExpanded = !paramsPanelExpanded">
-              <div class="params-card-title">
-                <a-icon type="control" />
-                <span>{{ $t('indicatorIde.backtestParameters') }}</span>
-              </div>
-              <div class="params-card-actions" @click.stop>
-                <a-tooltip :title="$t('indicatorIde.history')">
-                  <a-button
-                    size="small"
-                    :disabled="!selectedIndicatorId"
-                    @click="showHistoryDrawer = true; historyIndicatorId = selectedIndicatorId"
-                  >
-                    <a-icon type="history" />
+          <a-tabs v-model="resultTab" size="small" class="result-tabs" :animated="false">
+            <a-tab-pane key="params" :tab="$t('indicatorIde.backtestParameters')">
+              <div class="params-scroll params-scroll--right">
+                <div class="params-card-actions" style="margin-bottom: 10px; display: flex; gap: 8px;">
+                  <a-tooltip :title="$t('indicatorIde.history')">
+                    <a-button size="small" :disabled="!selectedIndicatorId" @click="showHistoryDrawer = true; historyIndicatorId = selectedIndicatorId">
+                      <a-icon type="history" />
+                    </a-button>
+                  </a-tooltip>
+                  <a-button type="primary" size="small" :loading="running" :disabled="!canRunBacktest" @click="runBacktest">
+                    <a-icon v-if="!running" type="thunderbolt" />
+                    {{ $t('indicatorIde.runBacktest') }}
                   </a-button>
-                </a-tooltip>
-                <a-button
-                  type="primary"
-                  size="small"
-                  :loading="running"
-                  :disabled="!canRunBacktest"
-                  @click="runBacktest"
-                >
-                  <a-icon v-if="!running" type="thunderbolt" />
-                  {{ $t('indicatorIde.runBacktest') }}
-                </a-button>
-                <a-icon :type="paramsPanelExpanded ? 'up' : 'down'" @click="paramsPanelExpanded = !paramsPanelExpanded" />
-              </div>
-            </div>
-            <div v-show="paramsPanelExpanded" class="params-scroll params-scroll--right">
-              <div class="params-grid">
+                </div>
+                <div class="params-grid">
                 <div class="param-section">
                   <div class="param-label">{{ $t('indicatorIde.dateRange') }}</div>
                   <div class="date-presets">
@@ -466,12 +359,12 @@
                       <a-checkbox v-model="enableMtf">{{ $t('indicatorIde.highPrecisionMtf') }}</a-checkbox>
                     </a-tooltip>
                   </div>
-                  <div class="param-strategy-hint">{{ $t('indicatorIde.strategyFromCodeHint') }}</div>
+                  <div class="param-strategy-hint">止损、止盈、仓位与追踪止损等请在代码中用 # @strategy 声明；成交时机固定为下一根 K 线开盘（贴近实盘）。</div>
                 </div>
               </div>
-            </div>
-          </div>
-          <a-tabs v-model="resultTab" size="small" class="result-tabs" :animated="false">
+              </div>
+            </a-tab-pane>
+
             <a-tab-pane key="backtest" :tab="$t('indicatorIde.backtestResults')">
               <!-- Running state -->
               <div v-if="running" class="result-running">
@@ -521,7 +414,7 @@
                     rowKey="id"
                   >
                     <template slot="type" slot-scope="text">
-                      <a-tag :color="text === 'long' ? 'green' : 'red'" style="margin: 0;">{{ text.toUpperCase() }}</a-tag>
+                      <a-tag :color="text === 'long' ? 'red' : 'green'" style="margin: 0;">{{ text.toUpperCase() }}</a-tag>
                     </template>
                     <template slot="exitTag" slot-scope="text, record">
                       <a-tag
@@ -534,7 +427,7 @@
                       <span style="font-variant-numeric: tabular-nums;">{{ fmtPrice(text) }}</span>
                     </template>
                     <template slot="profit" slot-scope="text">
-                      <span :style="{ color: text > 0 ? '#52c41a' : text < 0 ? '#f5222d' : '#666', fontWeight: 600, fontVariantNumeric: 'tabular-nums' }">{{ fmtMoney(text) }}</span>
+                      <span :style="{ color: text > 0 ? '#f5222d' : text < 0 ? '#52c41a' : '#666', fontWeight: 600, fontVariantNumeric: 'tabular-nums' }">{{ fmtMoney(text) }}</span>
                     </template>
                     <template slot="money" slot-scope="text">
                       <span style="font-weight: 600; font-variant-numeric: tabular-nums;">{{ fmtMoney(text) }}</span>
@@ -853,7 +746,7 @@
                       </a-tag>
                     </template>
                     <template slot="experimentReturn" slot-scope="text, record">
-                      <span :style="{ color: (((record.result || {}).totalReturn || 0) >= 0) ? '#52c41a' : '#f5222d', fontWeight: 600 }">
+                      <span :style="{ color: (((record.result || {}).totalReturn || 0) >= 0) ? '#f5222d' : '#52c41a', fontWeight: 600 }">
                         {{ fmtPct((record.result || {}).totalReturn) }}
                       </span>
                     </template>
@@ -1129,11 +1022,13 @@ export default {
 
       codeDrawerVisible: false,
       codePanelExpanded: true,
-      paramsPanelExpanded: false,
+      activeChartTab: 'chart',
+      leftPanelWidthPct: 20,
+      paramsPanelExpanded: true,
       /** 已购指标说明条：用户关闭后按账号写入 storage，不再展示 */
       purchasedMarketHintDismissed: false,
 
-      chartPanelHeight: 408,
+      chartPanelHeight: 80,
       resizeDragStartY: 0,
       resizeDragStartH: 0,
 
@@ -1255,6 +1150,13 @@ export default {
     },
     chartTheme () {
       return this.isDarkTheme ? 'dark' : 'light'
+    },
+    chartTabOptions () {
+      return [
+        { key: 'chart', label: this.$t('indicatorIde.chartTab') || 'K线图', icon: 'stock' },
+        { key: 'code', label: this.$t('indicatorIde.codeEditor'), icon: 'code' },
+        { key: 'ai', label: this.$t('indicatorIde.aiGenerate'), icon: 'robot' }
+      ]
     },
     /** 按市场类型返回可用的时间周期列表 */
     timeframeOptions () {
@@ -1785,6 +1687,19 @@ export default {
       if (!this.chartIndicatorRunning && this.chartIndicatorToggleDisabled) return
       this.chartIndicatorRunning = !this.chartIndicatorRunning
       this.syncSelectedIndicatorToChart()
+    },
+    switchChartTab (tabKey) {
+      if (this.activeChartTab === tabKey) return
+      this.activeChartTab = tabKey
+      this.$nextTick(() => {
+        if (tabKey === 'chart') {
+          const chart = this.$refs.klineChart
+          if (chart && typeof chart.resize === 'function') chart.resize()
+          this.ensureChartReady()
+        } else if (tabKey === 'code') {
+          if (this.cmInstance) this.cmInstance.refresh()
+        }
+      })
     },
     handleIndicatorToggle ({ action, indicator }) {
       if (!indicator || !indicator.id) return
@@ -3217,9 +3132,7 @@ export default {
     async handleAIOptimize () {
       if (!this.hasResult || !this.currentCode) return
       this.aiOptimizing = true
-      this.codeDrawerVisible = true
-      this.codePanelExpanded = true
-      this.aiPanelExpanded = true
+      this.activeChartTab = 'code'
 
       const r = this.result || {}
       const metricsText = [
@@ -3269,14 +3182,42 @@ export default {
     goToIndicatorMarket () {
       this.$router.push('/indicator-community')
     },
+    startResizeLeftRight (e) {
+      e.preventDefault()
+      const mainEl = e.target.closest('.ide-main')
+      if (!mainEl) return
+      const mainRect = mainEl.getBoundingClientRect()
+      const startX = e.clientX
+      const startWidthPx = mainRect.width * (this.leftPanelWidthPct / 100)
+      const onMove = (ev) => {
+        const delta = ev.clientX - startX
+        const newWidthPx = startWidthPx + delta
+        const pct = (newWidthPx / mainRect.width) * 100
+        this.leftPanelWidthPct = Math.max(10, Math.min(50, pct))
+      }
+      const onUp = () => {
+        document.removeEventListener('mousemove', onMove)
+        document.removeEventListener('mouseup', onUp)
+        document.body.style.cursor = ''
+        document.body.style.userSelect = ''
+      }
+      document.body.style.cursor = 'col-resize'
+      document.body.style.userSelect = 'none'
+      document.addEventListener('mousemove', onMove)
+      document.addEventListener('mouseup', onUp)
+    },
     startResizePanel (e) {
       e.preventDefault()
-      this.resizeDragStartY = e.clientY
-      this.resizeDragStartH = this.chartPanelHeight
+      const mainEl = e.target.closest('.ide-right')
+      if (!mainEl) return
+      const mainRect = mainEl.getBoundingClientRect()
+      const startY = e.clientY
+      const startHeightPx = mainRect.height * (this.chartPanelHeight / 100)
       const onMove = (ev) => {
-        const delta = ev.clientY - this.resizeDragStartY
-        const next = this.resizeDragStartH + delta
-        this.chartPanelHeight = Math.max(160, Math.min(next, window.innerHeight - 220))
+        const delta = ev.clientY - startY
+        const newHeightPx = startHeightPx + delta
+        const pct = (newHeightPx / mainRect.height) * 100
+        this.chartPanelHeight = Math.max(30, Math.min(90, pct))
       }
       const onUp = () => {
         document.removeEventListener('mousemove', onMove)
@@ -3465,7 +3406,7 @@ export default {
       const dk = this.isDarkTheme
       const data = r.equityCurve
       const isPositive = data.length > 1 && (data[data.length - 1].value || 0) >= (data[0].value || 0)
-      const lineColor = isPositive ? '#52c41a' : '#f5222d'
+      const lineColor = isPositive ? '#f5222d' : '#52c41a'
       this.eqChartInstance.setOption({
         backgroundColor: 'transparent',
         tooltip: {
@@ -3792,6 +3733,17 @@ export default {
         this.ensureChartReady()
       })
     },
+    activeChartTab () {
+      this.$nextTick(() => {
+        if (this.activeChartTab === 'chart') {
+          const chart = this.$refs.klineChart
+          if (chart && typeof chart.resize === 'function') chart.resize()
+          this.ensureChartReady()
+        } else if (this.activeChartTab === 'code') {
+          if (this.cmInstance) this.cmInstance.refresh()
+        }
+      })
+    },
     quickTradeDrawerVisible () {
       this.$nextTick(() => this.ensureChartReady())
     },
@@ -3901,9 +3853,9 @@ export default {
 }
 .ide-toolbar-group {
   display: flex;
-  flex-direction: column;
-  align-items: stretch;
-  gap: 4px;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
   min-width: 0;
   padding: 6px 10px 8px;
   border-radius: 10px;
@@ -3912,13 +3864,13 @@ export default {
   box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04);
 }
 .ide-toolbar-label {
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.06em;
-  text-transform: uppercase;
   color: #64748b;
   line-height: 1;
   white-space: nowrap;
+  flex-shrink: 0;
 }
 .ide-toolbar-select {
   min-width: 0;
@@ -3946,6 +3898,18 @@ export default {
   flex-wrap: wrap;
   align-items: center;
   row-gap: 6px;
+}
+.ide-toolbar-group--tf-indicator {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 6px 10px 8px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid rgba(0, 0, 0, 0.05);
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04);
 }
 .ide-purchased-hint {
   margin: 0 0 10px 0;
@@ -3987,20 +3951,41 @@ export default {
 .ide-main { display: flex; flex: 1 1 auto; overflow: visible; min-height: 0; align-items: flex-start; }
 
 .ide-left {
-  width: 30%;
-  min-width: 280px;
-  max-width: 400px;
+  min-width: 180px;
+  max-width: 50%;
   height: calc(100vh - 64px - 56px);
   max-height: calc(100vh - 64px - 56px);
   display: flex;
   flex-direction: column;
-  border-right: 1px solid #eee;
+  border-right: none;
   overflow: hidden;
   flex-shrink: 0;
   background: #fcfcfd;
   position: sticky;
   top: 0;
   align-self: flex-start;
+}
+// ===== Left-Right Resize Handle =====
+.ide-lr-resize-handle {
+  flex: 0 0 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: col-resize;
+  background: #f0f0f0;
+  border-left: 1px solid #e8e8e8;
+  border-right: 1px solid #e8e8e8;
+  transition: background 0.15s;
+  flex-shrink: 0;
+  &:hover { background: #e2e2e2; }
+  &:active { background: #d4d4d4; }
+}
+.ide-lr-resize-handle-dots {
+  display: block;
+  width: 4px;
+  height: 28px;
+  border-radius: 2px;
+  background: #c0c0c0;
 }
 
 // ===== Code Panel =====
@@ -4347,14 +4332,14 @@ export default {
   display: flex !important;
   width: 100%;
   min-width: 0;
-  flex-wrap: wrap;
-  gap: 8px;
+  flex-wrap: nowrap;
+  gap: 6px;
   /deep/ .ant-radio-button-wrapper {
-    flex: 1 1 calc(33.333% - 6px);
-    min-width: 120px;
+    flex: 1 1 0;
+    min-width: 0;
     text-align: center;
-    height: 34px;
-    line-height: 32px;
+    height: 30px;
+    line-height: 28px;
     font-size: 12px;
     font-weight: 500;
     border-radius: 8px !important;
@@ -4366,6 +4351,7 @@ export default {
     text-overflow: ellipsis;
     white-space: nowrap;
     margin-left: 0 !important;
+    padding: 0 6px;
     &::before { display: none !important; }
     &:hover {
       color: #595959;
@@ -4427,35 +4413,122 @@ export default {
 
 @media (max-width: 1500px) {
   .params-grid {
-    grid-template-columns: minmax(0, 1fr);
+    flex-wrap: wrap;
   }
-
   .params-grid > .param-section:nth-child(1),
   .params-grid > .param-section:nth-child(2),
   .params-grid > .param-section:nth-child(3) {
-    grid-column: auto;
-  }
-
-  .param-section--full {
-    grid-column: auto;
+    flex: 1 1 100%;
   }
 }
 
 @media (max-width: 1280px) {
   .direction-radio-group /deep/ .ant-radio-button-wrapper {
-    flex-basis: calc(50% - 4px);
+    flex-basis: 0;
   }
 }
 
 @media (max-width: 1100px) {
   .direction-radio-group /deep/ .ant-radio-button-wrapper {
-    flex-basis: 100%;
-    min-width: 0;
+    flex-basis: 0;
   }
 }
 
 // ===== Right Panel =====
 .ide-right { flex: 1; display: flex; flex-direction: column; overflow: visible; min-width: 0; }
+
+// ===== Chart Area with Tabs =====
+.ide-chart-area {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-bottom: 1px solid #e8e8e8;
+}
+.ide-chart-tabs {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  padding: 0 8px;
+  background: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%);
+  border-bottom: 1px solid #e8e8e8;
+  flex-shrink: 0;
+  height: 36px;
+}
+.ide-chart-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 14px;
+  height: 36px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #64748b;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: all 0.2s;
+  white-space: nowrap;
+  user-select: none;
+  &:hover { color: #334155; background: rgba(0,0,0,0.02); }
+  &.active {
+    color: #1890ff;
+    border-bottom-color: #1890ff;
+    background: rgba(24, 144, 255, 0.04);
+  }
+  .anticon { font-size: 13px; }
+}
+.ide-chart-tab-badge {
+  font-size: 10px !important;
+  line-height: 16px !important;
+  padding: 0 4px !important;
+  margin-left: 4px !important;
+}
+.ide-chart-tab-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  /deep/ .ant-btn-sm {
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+    font-size: 13px;
+    border-color: #e0e0e0;
+    &:hover { border-color: #1890ff; color: #1890ff; }
+    &[disabled] { opacity: 0.35; }
+  }
+}
+.ide-chart-tab-content {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  /deep/ .chart-left,
+  /deep/ .chart-wrapper,
+  /deep/ .chart-content-area,
+  /deep/ .kline-chart-container {
+    height: 100% !important;
+    min-height: 0 !important;
+  }
+  /deep/ .chart-left {
+    width: 100% !important;
+    flex: 1 1 100% !important;
+    border-right: none !important;
+  }
+}
+.ide-code-tab-content {
+  overflow-y: auto;
+}
+.ide-ai-tab-content {
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
 
 /* 闪电交易：主布局内右侧栏，与 .ide-left 同为抽拉分栏（无全屏遮罩） */
 .ide-quick-right {
@@ -4640,15 +4713,15 @@ export default {
   }
 }
 .params-grid {
-  display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  display: flex;
   gap: 12px;
   min-width: 0;
   overflow: hidden;
+  flex-wrap: nowrap;
 }
-.params-grid > .param-section:nth-child(1) { grid-column: span 3; }
-.params-grid > .param-section:nth-child(2) { grid-column: span 2; }
-.params-grid > .param-section:nth-child(3) { grid-column: span 1; }
+.params-grid > .param-section:nth-child(1) { flex: 4 1 0; min-width: 0; }
+.params-grid > .param-section:nth-child(2) { flex: 3 1 0; min-width: 0; }
+.params-grid > .param-section:nth-child(3) { flex: 3 1 0; min-width: 0; }
 .param-section--full { grid-column: 1 / -1; }
 .param-section--direction { grid-column: span 1; }
 .result-tabs {
@@ -4690,8 +4763,8 @@ export default {
     &:hover { transform: translateY(-1px); box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06); }
     .metric-label { font-size: 10px; color: #8c8c8c; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.3px; }
     .metric-value { font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; color: #333; line-height: 1.2; }
-    &.positive .metric-value { color: #52c41a; }
-    &.negative .metric-value { color: #f5222d; }
+    &.positive .metric-value { color: #f5222d; }
+    &.negative .metric-value { color: #52c41a; }
   }
 }
 .ai-optimize-card {
@@ -5372,6 +5445,11 @@ export default {
     border-color: #363636;
     box-shadow: none;
   }
+  .ide-toolbar-group--tf-indicator {
+    background: rgba(255, 255, 255, 0.04);
+    border-color: #363636;
+    box-shadow: none;
+  }
   .ide-toolbar-label { color: rgba(255, 255, 255, 0.45); }
   .ide-toolbar-icon-btn {
     background: #262626;
@@ -5384,6 +5462,30 @@ export default {
     color: rgba(255, 255, 255, 0.65);
   }
   .ide-left { background: #181818; border-right-color: #303030; }
+  .ide-lr-resize-handle {
+    background: #1f1f1f;
+    border-left-color: #303030;
+    border-right-color: #303030;
+    &:hover { background: #2a2a2a; }
+    &:active { background: #333; }
+  }
+  .ide-lr-resize-handle-dots { background: #555; }
+  .ide-chart-area { border-bottom-color: #303030; }
+  .ide-chart-tabs {
+    background: linear-gradient(180deg, #1f1f1f 0%, #1a1a1a 100%);
+    border-bottom-color: #303030;
+  }
+  .ide-chart-tab {
+    color: rgba(255, 255, 255, 0.55);
+    &:hover { color: rgba(255, 255, 255, 0.85); background: rgba(255, 255, 255, 0.04); }
+    &.active { color: #58a6ff; border-bottom-color: #58a6ff; background: rgba(88, 166, 255, 0.06); }
+  }
+  .ide-chart-tab-actions /deep/ .ant-btn-sm {
+    background: #1f1f1f;
+    border-color: #434343;
+    color: rgba(255, 255, 255, 0.65);
+    &:hover { border-color: #177ddc; color: #177ddc; }
+  }
   .ide-toolbar-qt-btn.ant-btn-default {
     background: #262626;
     border-color: #434343;
@@ -5570,8 +5672,8 @@ export default {
       &:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.4); }
       .metric-label { color: rgba(255,255,255,0.45); }
       .metric-value { color: rgba(255,255,255,0.85); }
-      &.positive .metric-value { color: #49aa19; }
-      &.negative .metric-value { color: #d32029; }
+      &.positive .metric-value { color: #d32029; }
+      &.negative .metric-value { color: #49aa19; }
     }
   }
   .experiment-hero,

@@ -1933,11 +1933,11 @@ registerOverlay({
           displayText += `  (${timeSpan})`
         }
 
-        // 根据涨跌设置颜色
+        // 根据涨跌设置颜色（中国市场：红涨绿跌）
         const isUp = priceChange >= 0
-        const lineColor = isUp ? '#0ecb81' : '#f6465d'
-        const textColor = isUp ? '#0ecb81' : '#f6465d'
-        const bgColor = isUp ? 'rgba(14, 203, 129, 0.1)' : 'rgba(246, 70, 93, 0.1)'
+        const lineColor = isUp ? '#f5222d' : '#52c41a'
+        const textColor = isUp ? '#f5222d' : '#52c41a'
+        const bgColor = isUp ? 'rgba(245, 34, 45, 0.1)' : 'rgba(82, 196, 26, 0.1)'
 
         const x1 = coordinates[0].x
         const y1 = coordinates[0].y
@@ -3185,8 +3185,8 @@ registerOverlay({
             }
           },
           bar: {
-            upColor: isDark ? '#0ecb81' : '#13c2c2',
-            downColor: isDark ? '#f6465d' : '#fa541c',
+            upColor: isDark ? '#ef5350' : '#f5222d',
+            downColor: isDark ? '#0ecb81' : '#52c41a',
             noChangeColor: theme.borderColor
           },
           // 若使用面积图类型，关闭末端点动画可减少实时跳动观感

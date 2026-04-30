@@ -15,26 +15,6 @@
       </span>
     </div>
 
-    <!-- 汇总统计条 -->
-    <div class="panel-summary" v-if="watchlist && watchlist.length > 0">
-      <div class="summary-chip">
-        <span class="sc-num">{{ watchlist.length }}</span>
-        <span class="sc-label">{{ $t('aiAssetAnalysis.watchlist.totalAssets') }}</span>
-      </div>
-      <div class="summary-chip" v-if="watchlistPositionCount > 0">
-        <span class="sc-num">{{ watchlistPositionCount }}</span>
-        <span class="sc-label">{{ $t('aiAssetAnalysis.watchlist.positionCount') }}</span>
-      </div>
-      <div class="summary-chip" v-if="watchlistTaskCount > 0">
-        <span class="sc-num">{{ watchlistTaskCount }}</span>
-        <span class="sc-label">{{ $t('aiAssetAnalysis.watchlist.taskCount') }}</span>
-      </div>
-      <div class="summary-chip pnl" v-if="watchlistTotalPnl !== 0">
-        <span class="sc-num" :class="watchlistTotalPnl >= 0 ? 'up' : 'down'">{{ watchlistTotalPnl >= 0 ? '+' : '' }}{{ formatNum(watchlistTotalPnl) }}</span>
-        <span class="sc-label">P&amp;L</span>
-      </div>
-    </div>
-
     <!-- 批量勾选栏 -->
     <div class="batch-bar" v-if="batchMode">
       <a-checkbox :checked="batchSelectedAll" :indeterminate="batchIndeterminate" @change="onBatchSelectAll" class="batch-all-cb">
@@ -62,32 +42,24 @@
           @click.native.stop
         />
         <div class="wl-card-body" :class="{ 'with-cb': batchMode }">
-          <div class="wl-row-main">
+          <div class="wl-row-main" :class="{ 'negative-news': stock.news_score !== undefined && stock.news_score < -4 }">
             <div class="wl-info-left">
               <div class="wl-symbol-line">
-                <span class="wl-symbol">{{ stock.symbol }}</span>
+                <span class="wl-symbol" v-if="stock.name && stock.name !== stock.symbol">{{ stock.name }}</span>
+                <span class="wl-symbol" v-else>{{ stock.symbol }}</span>
                 <span class="wl-market">{{ getMarketName(stock.market) }}</span>
               </div>
-              <div class="wl-name" v-if="stock.name && stock.name !== stock.symbol">{{ stock.name }}</div>
+              <div class="wl-name" v-if="stock.name && stock.name !== stock.symbol">{{ stock.symbol }}</div>
             </div>
-            <div class="wl-sparkline-wrap" v-if="watchlistPrices[`${stock.market}:${stock.symbol}`]">
-              <svg class="wl-sparkline" viewBox="0 0 60 20" preserveAspectRatio="none">
-                <polyline
-                  :points="getSparklinePoints(stock)"
-                  fill="none"
-                  :stroke="(watchlistPrices[`${stock.market}:${stock.symbol}`]?.change || 0) >= 0 ? '#10b981' : '#ef4444'"
-                  stroke-width="1.5"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                />
-              </svg>
-            </div>
-            <span v-else class="wl-spacer"></span>
             <div class="wl-info-right" v-if="watchlistPrices[`${stock.market}:${stock.symbol}`]">
               <span class="wl-price">{{ formatPrice(watchlistPrices[`${stock.market}:${stock.symbol}`].price) }}</span>
               <span class="wl-change" :class="(watchlistPrices[`${stock.market}:${stock.symbol}`]?.change || 0) >= 0 ? 'up' : 'down'">
                 {{ (watchlistPrices[`${stock.market}:${stock.symbol}`]?.change || 0) >= 0 ? '+' : '' }}{{ formatNum(watchlistPrices[`${stock.market}:${stock.symbol}`]?.change) }}%
               </span>
+            </div>
+            <div class="wl-news-score" v-if="stock.news_score !== undefined">
+              <span v-if="stock.news_score > 4" class="wl-news-heart">♥</span>
+              <span v-else class="wl-news-num" :class="{ 'news-negative': stock.news_score < -4 }">{{ stock.news_score }}</span>
             </div>
           </div>
           <div class="wl-row-pnl" v-if="positionSummaryMap[`${stock.market}:${stock.symbol}`]">
@@ -992,7 +964,6 @@ export default {
   &.theme-dark {
     background: #1a1a1c; border-color: rgba(255, 255, 255, 0.06); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
     .panel-header { background: #141416; border-bottom-color: rgba(255, 255, 255, 0.05); .panel-title { color: #ccc; } }
-    .panel-summary { background: #141416; border-bottom-color: rgba(255, 255, 255, 0.05); .summary-chip { border-right-color: rgba(255, 255, 255, 0.05); } .sc-num { color: #d4d4d4; } .sc-label { color: #666; } }
     .batch-bar { background: #1c1c1c; border: 1px solid #2a2a2a; border-radius: 10px; margin: 8px 10px; margin-bottom: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.2); }
     .batch-bar .batch-all-cb { color: #a0a0a8; }
     .batch-bar .ant-btn:not(.ant-btn-primary) { background: #2a2a2c; border-color: #3a3a3c; color: #b0b0b8; &:hover { background: #333336; border-color: var(--primary-color, #1890ff); color: var(--primary-color, #1890ff); } }
@@ -1021,49 +992,47 @@ export default {
 .panel-header-icon { font-size: 15px; color: #94a3b8; cursor: pointer; padding: 4px; border-radius: 6px; transition: color 0.2s, background 0.2s; }
 .panel-header-icon:hover { color: var(--primary-color, #1890ff); background: rgba(24,144,255,0.08); }
 
-.panel-summary { display: flex; gap: 0; padding: 0; border-bottom: 1px solid #f1f5f9; }
-.summary-chip { flex: 1; display: flex; flex-direction: column; align-items: center; padding: 8px 4px; border-right: 1px solid #f1f5f9; }
-.summary-chip:last-child { border-right: none; }
-.sc-num { font-size: 14px; font-weight: 700; color: #0f172a; line-height: 1.2; font-family: 'SF Mono', Monaco, monospace; }
-.sc-num.up { color: #16a34a; }
-.sc-num.down { color: #dc2626; }
-.sc-label { font-size: 9px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; margin-top: 2px; }
-
 .batch-bar { display: flex; align-items: center; gap: 8px; padding: 10px 12px; margin: 8px 10px; margin-bottom: 4px; background: #fff; border: 1px solid #e2e8f0; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); flex-wrap: wrap; }
 .batch-all-cb { font-size: 12px; font-weight: 500; color: #475569; margin-right: 4px; }
 .batch-bar .ant-btn { border-radius: 6px; font-size: 12px; font-weight: 500; height: 28px; padding: 0 10px; flex-shrink: 0; transition: all 0.2s; }
 .batch-bar .ant-btn-primary { box-shadow: 0 1px 2px color-mix(in srgb, var(--primary-color, #1890ff) 20%, transparent); &:hover { filter: brightness(1.05); } }
 .batch-bar .ant-btn:not(.ant-btn-primary) { background: #f8fafc; border-color: #e2e8f0; color: #64748b; &:hover { background: #f1f5f9; border-color: #cbd5e1; color: #475569; } }
 
-.wl-card { position: relative; padding: 10px 12px; border-radius: 8px; cursor: pointer; transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1); margin-bottom: 3px; border: 1px solid transparent; }
+.wl-card { position: relative; padding: 8px 12px; border-radius: 8px; cursor: pointer; transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1); margin-bottom: 2px; border: 1px solid transparent; }
 .wl-card:hover { background: #f5f7fa; border-color: #e8ecf1; }
 .wl-card.active { background: linear-gradient(135deg, color-mix(in srgb, var(--primary-color, #1890ff) 6%, #fff) 0%, color-mix(in srgb, var(--primary-color, #1890ff) 4%, #fff) 100%); border-color: color-mix(in srgb, var(--primary-color, #1890ff) 28%, transparent); box-shadow: 0 1px 4px color-mix(in srgb, var(--primary-color, #1890ff) 10%, transparent); }
 .wl-card-cb { position: absolute; top: 12px; left: 4px; z-index: 1; }
 .wl-card-body { transition: padding-left 0.2s; }
 .wl-card-body.with-cb { padding-left: 24px; }
-.wl-row-main { display: grid; grid-template-columns: 1fr 80px auto; align-items: center; gap: 4px; }
+.wl-row-main { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 4px; }
 .wl-info-left { display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
 .wl-symbol-line { display: flex; align-items: baseline; gap: 5px; overflow: hidden; }
-.wl-name { font-size: 11px; color: #94a3b8; line-height: 1.3; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
+.wl-name { font-size: 12px; color: #94a3b8; line-height: 1.3; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
 .wl-info-right { display: flex; flex-direction: column; align-items: flex-end; white-space: nowrap; }
-.wl-symbol { font-size: 13px; font-weight: 700; color: #0f172a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wl-symbol { font-size: 12px; font-weight: 700; color: #0f172a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .wl-market { font-size: 9px; color: #94a3b8; letter-spacing: 0.3px; padding: 1px 4px; background: #f1f5f9; border-radius: 3px; flex-shrink: 0; }
-.wl-sparkline-wrap { width: 80px; padding: 0 2px; display: flex; align-items: center; justify-content: center; .wl-sparkline { width: 100%; height: 20px; } }
-.wl-price { font-size: 12px; font-weight: 600; color: #0f172a; font-family: 'SF Mono', Monaco, monospace; }
-.wl-change { font-size: 10px; font-weight: 600; font-family: 'SF Mono', Monaco, monospace; padding: 1px 5px; border-radius: 4px; margin-left: 4px; }
-.wl-change.up { color: #16a34a; background: rgba(22,163,74,0.08); }
-.wl-change.down { color: #dc2626; background: rgba(220,38,38,0.06); }
+
+.wl-price { font-size: 11px; font-weight: 600; color: #0f172a; font-family: 'SF Mono', Monaco, monospace; }
+.wl-change { font-size: 12px; font-weight: 600; font-family: 'SF Mono', Monaco, monospace; padding: 1px 5px; border-radius: 4px; margin-left: 4px; }
+.wl-change.up { color: #ef4444; background: rgba(239,68,68,0.08); }
+.wl-change.down { color: #10b981; background: rgba(16,185,129,0.06); }
 .wl-row-pnl { display: flex; align-items: center; gap: 8px; margin-top: 4px; font-family: 'SF Mono', Monaco, monospace; }
 .wl-pnl-qty { font-size: 10px; color: #94a3b8; }
 .wl-pnl-val { font-size: 10px; font-weight: 600; margin-left: auto; }
-.wl-pnl-val.up { color: #16a34a; }
-.wl-pnl-val.down { color: #dc2626; }
+.wl-pnl-val.up { color: #ef4444; }
+.wl-pnl-val.down { color: #10b981; }
 .wl-row-task { display: flex; align-items: center; gap: 6px; margin-top: 4px; }
 .wl-task-badge { display: inline-flex; align-items: center; gap: 3px; font-size: 10px; padding: 1px 8px; border-radius: 10px; cursor: pointer; transition: all 0.2s; }
 .wl-task-badge.active { color: #16a34a; background: rgba(22,163,74,0.08); }
 .wl-task-badge.paused { color: #94a3b8; background: #f1f5f9; }
 .wl-task-badge:hover { opacity: 0.75; }
 .wl-task-next { font-size: 10px; color: #94a3b8; margin-left: auto; }
+
+.negative-news { background: rgba(239, 68, 68, 0.08) !important; border-color: rgba(239, 68, 68, 0.2) !important; }
+.wl-news-score { display: flex; align-items: center; justify-content: center; min-width: 24px; }
+.wl-news-heart { color: #ef4444; font-size: 14px; }
+.wl-news-num { font-size: 11px; font-weight: 600; font-family: 'SF Mono', Monaco, monospace; color: #64748b; }
+.wl-news-num.news-negative { color: #10b981; }
 
 .wl-card-hover-actions { position: absolute; top: 0; right: 0; bottom: 0; display: flex; align-items: center; gap: 2px; padding-right: 8px; opacity: 0; transition: opacity 0.15s; background: linear-gradient(90deg, transparent 0%, #f8fafc 30%); border-radius: 0 8px 8px 0; pointer-events: none; }
 .wl-card:hover .wl-card-hover-actions { opacity: 1; pointer-events: auto; }

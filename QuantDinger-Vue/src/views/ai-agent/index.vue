@@ -625,7 +625,7 @@ export default {
 }
 
 .chat-messages {
-  max-width: 900px;
+  max-width: 99%;
   margin: 0 auto;
 }
 

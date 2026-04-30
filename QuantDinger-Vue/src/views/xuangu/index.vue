@@ -48,41 +48,17 @@
       <div class="content-body">
 
         <!-- 左侧自选股 -->
-        <div class="watchlist-side">
-          <div class="watchlist-side-header">
-            <span class="wl-side-title"><i class="el-icon-star-on"></i> 自选股</span>
-            <el-button type="text" size="mini" icon="el-icon-plus" @click="showAddWatchlistDialog = true"></el-button>
-          </div>
-          <div class="watchlist-side-list" v-loading="watchlistLoading">
-            <div
-              v-for="stock in watchlist"
-              :key="`${stock.market}-${stock.symbol}`"
-              class="wl-side-item"
-              :class="{ active: selectedWatchlistKey === `${stock.market}:${stock.symbol}` }"
-              @click="selectWatchlistStock(stock)"
-            >
-              <div class="wl-si-left">
-                <span class="wl-si-symbol">{{ stock.symbol }}</span>
-                <span class="wl-si-name" v-if="stock.name && stock.name !== stock.symbol">{{ stock.name }}</span>
-              </div>
-              <div class="wl-si-right">
-                <span class="wl-si-price" v-if="watchlistPrices[`${stock.market}:${stock.symbol}`]">
-                  {{ formatPrice(watchlistPrices[`${stock.market}:${stock.symbol}`].price) }}
-                </span>
-                <span
-                  class="wl-si-change"
-                  v-if="watchlistPrices[`${stock.market}:${stock.symbol}`]"
-                  :class="(watchlistPrices[`${stock.market}:${stock.symbol}`].change || 0) >= 0 ? 'up' : 'down'"
-                >
-                  {{ (watchlistPrices[`${stock.market}:${stock.symbol}`].change || 0) >= 0 ? '+' : '' }}{{ formatRate(watchlistPrices[`${stock.market}:${stock.symbol}`].change) }}%
-                </span>
-              </div>
-              <span class="wl-si-remove" @click.stop="removeFromWatchlist(stock)"><i class="el-icon-close"></i></span>
-            </div>
-            <div v-if="!watchlistLoading && watchlist.length === 0" class="wl-side-empty">
-              暂无自选股
-            </div>
-          </div>
+        <div class="watchlist-side" :style="{ width: watchlistPanelWidth + '%' }">
+          <watchlist-panel
+            v-model="selectedWatchlistKey"
+            @select="onWatchlistPanelSelect"
+            style="width: 100%; flex: 1; max-height: none; border: none; box-shadow: none; border-radius: 0; align-self: stretch;"
+          />
+        </div>
+
+        <!-- 拖拽调整比例 -->
+        <div class="xuangu-resize-handle" @mousedown="startResizeWatchlist">
+          <span class="xuangu-resize-handle-dots"></span>
         </div>
 
         <!-- 右侧结果表格 -->
@@ -364,6 +340,7 @@ import 'element-ui/lib/theme-chalk/index.css'
 import storage from 'store'
 import { ACCESS_TOKEN } from '@/store/mutation-types'
 import FilterPanel, { getDefaultFilters } from './components/FilterPanel.vue'
+import WatchlistPanel from '@/components/WatchlistPanel'
 import { getWatchlist, addWatchlist, removeWatchlist, getWatchlistPrices } from '@/api/market'
 import { getUserInfo } from '@/api/login'
 import { axios as request } from '@/utils/request'
@@ -373,7 +350,7 @@ Vue.use(ElementUI)
 
 export default {
   name: 'StockScreener',
-  components: { FilterPanel },
+  components: { FilterPanel, WatchlistPanel },
   data () {
     return {
       selectedMarket: '全部',
@@ -388,6 +365,7 @@ export default {
       watchlistLoading: false,
       watchlistPrices: {},
       selectedWatchlistKey: null,
+      watchlistPanelWidth: 20,
       showAddWatchlistDialog: false,
       watchlistInputCode: '',
       watchlistInputName: '',
@@ -619,6 +597,37 @@ export default {
       this.selectedWatchlistKey = `${stock.market}:${stock.symbol}`
       this.aiQuery = stock.name || stock.symbol
       this.$nextTick(() => this.onSearch())
+    },
+    onWatchlistPanelSelect (stock) {
+      if (stock && stock.market && stock.symbol) {
+        this.selectedWatchlistKey = `${stock.market}:${stock.symbol}`
+        this.aiQuery = stock.name || stock.symbol
+        this.$nextTick(() => this.onSearch())
+      }
+    },
+    startResizeWatchlist (e) {
+      e.preventDefault()
+      const container = e.target.closest('.content-body')
+      if (!container) return
+      const containerRect = container.getBoundingClientRect()
+      const startX = e.clientX
+      const startWidthPx = containerRect.width * (this.watchlistPanelWidth / 100)
+      const onMove = (ev) => {
+        const delta = ev.clientX - startX
+        const newWidthPx = startWidthPx + delta
+        const pct = (newWidthPx / containerRect.width) * 100
+        this.watchlistPanelWidth = Math.max(10, Math.min(40, pct))
+      }
+      const onUp = () => {
+        document.removeEventListener('mousemove', onMove)
+        document.removeEventListener('mouseup', onUp)
+        document.body.style.cursor = ''
+        document.body.style.userSelect = ''
+      }
+      document.body.style.cursor = 'col-resize'
+      document.body.style.userSelect = 'none'
+      document.addEventListener('mousemove', onMove)
+      document.addEventListener('mouseup', onUp)
     },
 
     async addToWatchlistByInput () {
@@ -1521,13 +1530,37 @@ export default {
 
 /* 左侧自选股 */
 .watchlist-side {
-  width: 220px;
+  width: 20%;
+  min-width: 180px;
+  max-width: 40%;
   flex-shrink: 0;
   border-right: 1px solid #ebeef5;
   background: #fafbfc;
   display: flex;
   flex-direction: column;
   max-height: calc(100vh - 240px);
+}
+
+/* 拖拽调整比例手柄 */
+.xuangu-resize-handle {
+  flex: 0 0 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: col-resize;
+  background: #f0f0f0;
+  border-left: 1px solid #e8e8e8;
+  border-right: 1px solid #e8e8e8;
+  transition: background 0.15s;
+  &:hover { background: #e2e2e2; }
+  &:active { background: #d4d4d4; }
+}
+.xuangu-resize-handle-dots {
+  display: block;
+  width: 3px;
+  height: 24px;
+  border-radius: 2px;
+  background: #c0c0c0;
 }
 
 .watchlist-side-header {
@@ -2009,10 +2042,11 @@ export default {
   }
 
   .watchlist-side {
-    width: 100%;
+    width: 100% !important;
     max-height: 200px;
     border-right: none;
     border-bottom: 1px solid #ebeef5;
   }
+  .xuangu-resize-handle { display: none; }
 }
 </style>
