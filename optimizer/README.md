@@ -141,7 +141,7 @@ Phase 1 是基础，不管走哪条路都要先做。 要不要我先把 Phase 1
 tar xzf auto-strategy-optimizer.tar.gz -C backend_api_python/
 # 然后直接用
 cd backend_api_python
-python -m app.optimizer.runner --template ma_crossover --trials 100
+python -m optimizer.runner --template ma_crossover --trials 100
 核心流程：参数空间定义 → 随机/Optuna 搜索 → 回测评估 → Walk-Forward 验证 → 输出最优策略 JSON。7 个模板全部编译验证通过。
 
 1.先让 LLM 批量生成 A 股适用的 IndicatorStrategy 模板（扩充 param_space.py）
@@ -176,7 +176,7 @@ bash
 cd backend_api_python
 
 # 对一只股票跑全部 17 个模板，每个模板 100 组参数
-python -m app.optimizer.runner \
+python -m optimizer.runner \
   --all \
   --symbol "A_SHARE:000001.SZ" \
   --timeframe 1D \
