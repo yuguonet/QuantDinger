@@ -51,7 +51,7 @@ def load_all_results(output_dir: str) -> List[Dict]:
 def extract_indicator_patterns(results: List[Dict]) -> Dict[str, Any]:
     """
     从回测结果中提取指标组合模式
-    
+
     分析维度：
     1. 哪些指标组合产生高 Sharpe
     2. 哪些 entry_rules 条件最有效
@@ -114,13 +114,8 @@ def extract_indicator_patterns(results: List[Dict]) -> Dict[str, Any]:
 def generate_llm_prompts(patterns: Dict) -> List[Dict[str, str]]:
     """
     基于模式分析生成 LLM 策略发现 prompt
-    
-    策略思路：
-    1. 组合成功指标（RSI + VWAP + Volume 三重确认）
-    2. 反向策略（做空/止盈逻辑）
-    3. 多时间框架确认
-    4. 新指标引入（OBV、ADX、CCI 等）
-    5. 自适应参数（基于波动率调整阈值）
+
+    改进版：每个 prompt 都包含具体的指标组合、参数建议和代码结构提示
     """
     prompts = []
 
@@ -146,6 +141,66 @@ def generate_llm_prompts(patterns: Dict) -> List[Dict[str, str]]:
             fail_info += (f"- **{tpl}**: 正得分率={stats['positive_rate']:.0%}, "
                          f"平均Sharpe={stats['avg_sharpe']:.3f}\n")
 
+    # ── 通用的代码结构提示 ──
+    code_hint = """
+## 代码结构要求（必须严格遵循）
+
+你需要生成以下内容：
+
+### 1. _build_xxx_config 函数
+```python
+def _build_your_strategy_name_config(p: dict) -> dict:
+    entry_rules = [
+        {"indicator": "rsi", "params": {"period": p["rsi_period"], "threshold": p["rsi_oversold"]}, "operator": "<"},
+        {"indicator": "volume", "params": {"period": p["vol_ma_period"]}, "operator": "volume_ratio_above", "threshold": p["vol_ratio"]},
+        # ... 更多入场条件
+    ]
+    # 可选条件（用 if p.get(...) 控制）
+    if p.get("use_ma_filter"):
+        entry_rules.append({"indicator": "ma", "params": {"period": p["ma_period"], "ma_type": "ema"}, "operator": "price_above"})
+
+    return {
+        "name": f"YourStrategy_{p['param1']}_{p['param2']}",
+        "entry_rules": entry_rules,
+        "position_config": {"initial_size_pct": 100, "leverage": 1, "max_pyramiding": 0},
+        "pyramiding_rules": {"enabled": False},
+        "risk_management": {
+            "stop_loss": {"enabled": True, "value": p.get("stop_loss_pct", 3.0)},
+            "trailing_stop": {"enabled": False},
+        },
+    }
+```
+
+### 2. STRATEGY_TEMPLATE_KEY 和 STRATEGY_TEMPLATE_DICT
+```python
+STRATEGY_TEMPLATE_KEY = "your_strategy_name"
+
+STRATEGY_TEMPLATE_DICT = {
+    "name": "你的策略中文名",
+    "description": "策略描述",
+    "indicators": ["rsi", "volume", "ma"],  # 使用的指标列表
+    "params": {
+        "rsi_period": _p_int(10, 20, 1),       # 整数参数
+        "rsi_oversold": _p_int(25, 35, 1),     # 整数参数
+        "vol_ma_period": _p_int(10, 30, 1),    # 整数参数
+        "vol_ratio": _p_float(1.2, 2.5, 0.1), # 浮点参数
+        "use_ma_filter": _p_choice([True, False]),  # 布尔选择
+        "ma_period": _p_int(20, 60, 10),       # 整数参数
+        "stop_loss_pct": _p_float(2.0, 5.0, 0.5),  # 止损百分比
+    },
+    "constraints": [
+        ("rsi_period", "<", "lookback_period"),  # 参数约束
+    ],
+    "build_config": _build_your_strategy_name_config,  # 函数引用，不要加引号！
+}
+```
+
+### 3. 参数空间控制
+- 参数组合数控制在 100 万以内（避免搜索空间太大导致过拟合）
+- 常用参数范围：RSI period 10-20, 均线 period 5-60, 成交量倍数 1.2-3.0
+- 止损范围：2%-5%（日线策略）
+"""
+
     # Prompt 1: 指标组合创新
     prompts.append({
         "name": "indicator_combo_innovation",
@@ -163,12 +218,14 @@ def generate_llm_prompts(patterns: Dict) -> List[Dict[str, str]]:
 5. 必须包含止损（ATR 动态止损优先）
 6. 目标：正得分率 > 90%，平均 Sharpe > 0.5，平均交易次数 > 10
 
-## 输出格式
-生成一个完整的 Python 策略模板，包含：
-1. `_build_xxx_config(p: dict) -> dict` 函数
-2. 参数空间定义（使用 _p_int, _p_float, _p_choice）
-3. 参数约束条件
-4. STRATEGY_TEMPLATE_KEY 和 STRATEGY_TEMPLATE_DICT 变量
+## 推荐策略思路
+RSI 超卖 + VWAP 偏离 + 成交量放大 三重共振：
+- RSI(14) < 30（超卖区）
+- 价格低于 VWAP 2% 以上（偏离均值）
+- 成交量 > 1.5 倍 20 日均量（放量确认）
+- 可选：EMA(20) 趋势过滤
+
+{code_hint}
 """
     })
 
@@ -187,14 +244,20 @@ def generate_llm_prompts(patterns: Dict) -> List[Dict[str, str]]:
 3. 高波动扩张期 → 趋势跟踪或止盈
 4. 参数阈值随波动率动态调整（而非固定值）
 
+## 推荐策略思路
+布林带宽度收缩 + RSI + 成交量确认：
+- 布林带宽度处于近 60 天的低位 20%（收缩状态）
+- RSI 从超卖区回升（cross_up 30）
+- 成交量放大确认突破
+- 止损：2.5% 固定止损
+
 ## A 股特点
 - T+1 制度，日内信号需隔日出场
 - 涨跌停限制（主板 10%，创业板/科创板 20%）
 - 量价关系比美股更重要
 - 均线系统（5/10/20/60/120/250 日）是基础
 
-## 输出格式
-完整的 Python 策略模板代码，包含 _build_xxx_config、参数空间、约束条件。
+{code_hint}
 """
     })
 
@@ -214,16 +277,15 @@ A 股的量价关系是最重要的信号来源：
 3. **放量突破**：关键阻力位放量突破 → 强势信号
 4. **缩量回调**：上涨趋势中缩量回调 → 买入机会
 
-结合趋势指标（EMA 多头排列、ADX 趋势强度）确认方向。
+## 推荐策略思路
+EMA 多头排列 + 缩量回调 + RSI 确认：
+- EMA(5) > EMA(10) > EMA(20)（多头排列，趋势向上）
+- 价格回调到 EMA(10) 附近（支撑位）
+- 成交量 < 0.8 倍 10 日均量（缩量回调）
+- RSI(14) 在 40-60 区间（不超买不超卖）
+- 止损：跌破 EMA(20) 或 3% 固定止损
 
-## 设计要求
-1. 使用 RSI、Volume MA、EMA、ADX 组合
-2. 入场条件：趋势确认 + 量价配合 + 动量不超买
-3. 出场：ATR 动态止损 + 移动止盈
-4. 目标交易次数 > 15（增加统计可靠性）
-
-## 输出格式
-完整的 Python 策略模板代码。
+{code_hint}
 """
     })
 
@@ -242,15 +304,15 @@ A 股技术分析的经典组合：
 3. 回调到均线支撑位 + KDJ 超卖回升 = 最佳买点
 4. 用成交量确认突破有效性
 
-## 设计要点
-- 快速均线：EMA(5/10)
-- 慢速均线：EMA(20/60)
-- KDJ 参数：(9,3,3) 为基础，可优化
-- 入场：价格在均线支撑 + KDJ 金叉 + RSI 不超买
-- 出场：KDJ 死叉 或 跌破关键均线 或 ATR 止损
+## 推荐策略思路
+EMA(20) 支撑 + KDJ 金叉 + RSI 过滤：
+- 价格在 EMA(20) 上方（趋势向上）
+- KDJ 的 J 线从超卖区回升（J < 20 → J 上穿 20）
+- RSI(14) < 65（不超买）
+- 成交量 > 1.2 倍 20 日均量（放量确认）
+- 止损：3.5%
 
-## 输出格式
-完整的 Python 策略模板代码。
+{code_hint}
 """
     })
 
@@ -269,14 +331,15 @@ A 股技术分析的经典组合：
 2. **MACD 确认**：MACD 金叉或柱状图转正 → 动量确认
 3. **成交量确认**：放量突破或缩量回调 → 资金确认
 
-## 进阶设计
-- 布林带宽度作为波动率指标（收缩后突破更有效）
-- MACD 零轴上方金叉比下方金叉更可靠
-- 成交量相对 MA 的比值作为强度指标
-- ATR 动态止损
+## 推荐策略思路
+布林带下轨 + MACD diff < DEA（即将金叉）+ 放量：
+- 价格触及布林带下轨（price_below_lower）
+- MACD 的 diff < DEA（空头但即将反转）
+- 成交量 > 1.3 倍 20 日均量（放量）
+- RSI(14) < 35（超卖区）
+- 止损：3%
 
-## 输出格式
-完整的 Python 策略模板代码。
+{code_hint}
 """
     })
 
@@ -334,10 +397,31 @@ def call_llm_via_backend(prompt: str, system: str = "") -> str:
             # max_tokens=4000,
         )
 
-        # call_llm_api 直接返回字符串
+        # ── 统一提取纯文本内容 ──
+        result = ""
         if isinstance(response, str):
-            return response
-        return str(response) if response else ""
+            result = response
+        elif isinstance(response, dict):
+            # OpenAI 格式: {"choices": [{"message": {"content": "..."}}]}
+            try:
+                result = response["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError):
+                pass
+            if not result and "content" in response:
+                result = str(response["content"])
+            if not result:
+                import json as _json
+                result = _json.dumps(response, ensure_ascii=False)
+        elif response is not None:
+            result = str(response)
+
+        # ── 通用转义处理 ──
+        if '\\n' in result:
+            result = result.replace('\\n', '\n')
+        if '\\t' in result:
+            result = result.replace('\\t', '\t')
+
+        return result
 
     except Exception as e:
         print(f"    ❌ LLM 调用失败: {e}")
@@ -369,7 +453,8 @@ def run_phase2(output_dir: str = "optimizer_output",
     """
     from optimizer.llm_strategy_generator import (
         extract_python_code, validate_strategy_code,
-        execute_and_extract, format_template_code
+        execute_and_extract, format_template_code,
+        try_fix_strategy_code, SYSTEM_PROMPT,
     )
 
     print("=" * 60)
@@ -397,7 +482,7 @@ def run_phase2(output_dir: str = "optimizer_output",
     for i, p_info in enumerate(prompts, 1):
         print(f"\n  [{i}/{len(prompts)}] {p_info['name']}: {p_info['description']}")
 
-        from optimizer.llm_strategy_generator import build_generation_prompt, SYSTEM_PROMPT
+        from optimizer.llm_strategy_generator import build_generation_prompt
         prompt = build_generation_prompt(p_info["prompt"])
         raw = call_llm_via_backend(prompt, SYSTEM_PROMPT)
 
@@ -405,24 +490,49 @@ def run_phase2(output_dir: str = "optimizer_output",
             print(f"    ⚠️ LLM 无响应，跳过")
             continue
 
+        # Debug: 显示 LLM 原始响应
+        print(f"    📡 LLM 响应类型: {type(raw).__name__}, 长度: {len(raw)}")
+        print(f"    📡 原始响应（前300字）:\n{raw[:300]}\n    ---")
+
         code = extract_python_code(raw)
+        print(f"    📄 提取后代码（前500字）:\n{code[:500]}\n    ---")
         valid, msg = validate_strategy_code(code)
 
         if not valid:
             print(f"    ❌ {msg}")
-            # 尝试修复
-            print(f"    🔧 尝试修复...")
-            fix_prompt = f"修复以下代码错误：\n{msg}\n\n代码：\n{code}"
-            fixed = call_llm_via_backend(fix_prompt, SYSTEM_PROMPT)
-            if fixed:
-                code = extract_python_code(fixed)
-                valid, msg = validate_strategy_code(code)
-                if not valid:
-                    print(f"    ❌ 修复失败")
+            # 尝试本地自动修复
+            print(f"    🔧 尝试本地自动修复...")
+            code = try_fix_strategy_code(code, msg)
+            valid, msg = validate_strategy_code(code)
+
+            if not valid:
+                print(f"    ❌ 本地修复失败: {msg}")
+                # 尝试 LLM 修复
+                print(f"    🔧 尝试 LLM 修复...")
+                fix_prompt = f"以下代码有错误，请修复并只输出修复后的完整代码：\n\n错误信息：{msg}\n\n代码：\n{code}"
+                fixed = call_llm_via_backend(fix_prompt, SYSTEM_PROMPT)
+                if fixed:
+                    code = extract_python_code(fixed)
+                    code = try_fix_strategy_code(code, msg)
+                    valid, msg = validate_strategy_code(code)
+                    if not valid:
+                        print(f"    ❌ LLM 修复也失败: {msg}")
+                        continue
+                else:
                     continue
 
         templates = execute_and_extract(code)
         if templates:
+            # 处理重复 key
+            for k, v in list(templates.items()):
+                if k in all_templates:
+                    # 加数字后缀去重
+                    counter = 2
+                    while f"{k}_{counter}" in all_templates:
+                        counter += 1
+                    new_key = f"{k}_{counter}"
+                    templates[new_key] = templates.pop(k)
+                    print(f"    ⚠️ key '{k}' 重复，重命名为 '{new_key}'")
             all_templates.update(templates)
             print(f"    ✅ 生成: {list(templates.keys())}")
         else:
@@ -443,7 +553,7 @@ def run_phase2(output_dir: str = "optimizer_output",
     for key, template in all_templates.items():
         lines.append(format_template_code(key, template))
 
-    lines.append(f"\nGENERATED_TEMPLATES = {json.dumps({k: {kk: vv for kk, vv in v.items() if kk != 'build_config'} for k, v in all_templates.items()}, indent=2, ensure_ascii=False)}\n")
+    lines.append(f"\nGENERATED_TEMPLATES = {json.dumps({k: {kk: vv for kk, vv in v.items() if kk not in ('build_config', '_source_code')} for k, v in all_templates.items()}, indent=2, ensure_ascii=False)}\n")
 
     with open(gen_path, "w", encoding="utf-8") as f:
         f.writelines(lines)
