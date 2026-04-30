@@ -315,24 +315,6 @@ df['bbw_{period}_{std_dev}_{squeeze_percentile}_pctile'] = df['bbw_{period}'].ro
 """
                     calculated.add(key)
 
-            elif ind == 'limitup_detect':
-                # 涨停/大涨检测：今日涨幅在近 N 天中排名前 M%
-                lookback = params.get('lookback', 60)
-                top_pct = params.get('top_pct', 5)
-                key = f"limitup_{lookback}_{top_pct}"
-                if key not in calculated:
-                    code += f"""
-# 大涨检测: 今日涨幅在近 {lookback} 天中排名前 {top_pct}%
-df['pct_change'] = (df['close'] / df['close'].shift(1) - 1) * 100
-def _rank_pct(x, _np=np):
-    if len(x) < 10:
-        return _np.nan
-    return (_np.sum(x[:-1] < x[-1]) + 0.5 * _np.sum(x[:-1] == x[-1])) / (len(x) - 1) * 100
-df['pct_rank_{lookback}'] = df['pct_change'].rolling(window={lookback}, min_periods=10).apply(_rank_pct, raw=True)
-df['is_limitup'] = df['pct_rank_{lookback}'] >= (100 - {top_pct})
-"""
-                    calculated.add(key)
-
             elif ind == 'price_volume_divergence':
                 lookback = params.get('lookback', 20)
                 price_ma = params.get('price_ma', 10)
@@ -618,12 +600,6 @@ df['raw_sell'] = False
                     # 带宽处于历史低位 → 收缩
                     conditions_buy.append(f"({pctile_col} < {squeeze_percentile})")
                     conditions_sell.append(f"({pctile_col} > {100 - squeeze_percentile})")
-
-            elif ind == 'limitup_detect':
-                operator = rule.get('operator', 'is_limitup')
-                if operator == 'is_limitup':
-                    conditions_buy.append("(df['is_limitup'])")
-                    # 卖出由其他规则（RSI、止损等）提供
 
             elif ind == 'price_volume_divergence':
                 operator = rule.get('operator', 'bullish_divergence')

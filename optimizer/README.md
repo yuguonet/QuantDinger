@@ -16,7 +16,7 @@ optimizer/
 ├── __init__.py                  # 模块入口
 ├── param_space.py               # 7 种原始策略模板 + 参数空间定义
 ├── strategy_templates_ashare.py # A 股扩展模板（10 个）
-├── strategy_templates_llm.py    # LLM 生成模板（5 个）
+├── strategy_templates_llm.py    # LLM 生成模板（6 个，含 limitup_continuation）
 ├── strategy_compiler.py         # 策略配置 → 可执行代码编译器
 ├── strategy_optimizer.py        # 优化引擎（随机搜索 + Optuna）
 ├── walk_forward.py              # Walk-Forward 验证（防过拟合）
@@ -44,7 +44,7 @@ python -m optimizer.runner --list
 模板集合：
 - **original** (7 个)：ma_crossover, rsi_oversold, bollinger_breakout, macd_crossover, supertrend, kdj_crossover, dual_rsi
 - **ashare** (10 个)：A 股专用模板
-- **llm** (5 个)：LLM 生成的模板，基于 Phase 1 数据洞察
+- **llm** (6 个)：LLM 生成的模板，基于 Phase 1 数据洞察（含 limitup_continuation 涨停追涨策略）
 
 ### 单模板回测
 
@@ -139,6 +139,49 @@ optimizer_output/
 
 ---
 
+### Phase 1.5：涨停追涨策略 🔄 进行中
+
+**目标**：设计并验证短线涨停追涨策略（大涨后吃延续溢价）
+
+**设计思路**：不预测涨停，涨停/大涨是已发生事件，信号确定性高。关键在于过滤掉烂板（无量大涨）和超买追高。
+
+#### 模板演进
+
+| 版本 | 模板名 | 信号逻辑 | 结果 | 问题 |
+|:--:|:--|:--|:--:|:--|
+| v1 | limitup_catcher | RSI上穿 + 放量 + 布林收缩 + 均线 | ❌ 0%胜率 | 信号太泛，预测涨停命中率极低 |
+| v2 | limitup_continuation | 涨停(>=9.5%) + 放量 + RSI<75 | ⚠️ 41/1300触发 | 固定阈值导致大部分股票永远不触发 |
+| v3 | limitup_continuation | 滚动百分位排名(top 5%) + 放量 + RSI | 🔄 待验证 | 自适应阈值，每只股票都有机会触发 |
+
+#### v2 全量回测结果（1300 只 × 1 模板 × 100 trials）
+
+- **触发率**：41/1300（3.2%），96.7% 股票无信号
+- **有交易的 41 只策略**：平均得分 1.59，39% 正收益
+- **Top 策略**：
+  - 688498.SH：200.2% 收益，Sharpe 1.20，胜率 60%
+  - 300580.SZ：62.4% 收益，Sharpe 0.72，胜率 80%
+  - 300475.SZ：35.0% 收益，胜率 100%
+- **关键发现**：Top 策略集中在创业板/科创板（20% 涨跌幅），大涨日更频繁
+
+#### v3 改动
+
+- **核心变化**：用滚动百分位排名替代固定涨幅阈值
+  - 旧：`今日涨幅 >= 9.5%`（固定，大部分股票触发不了）
+  - 新：`今日涨幅在近60天中排名前5%`（自适应每只股票波动）
+- **新增指标**：`limitup_detect`（滚动百分位排名检测）
+- **修改文件**：`strategy_templates_llm.py`、`strategy_compiler.py`
+- **待验证**：v3 全量回测
+
+#### 命令
+
+```powershell
+# v3 全量回测
+python -m optimizer.runner -t limitup_continuation -m CNStock --all-local -tf 1D `
+  --start 2023-05-01 --end 2026-03-31 --trials 100 --score composite -j 35
+```
+
+---
+
 ### Phase 2：LLM 策略发现 ⏳ 待启动
 
 **目标**：用 LLM 分析 Phase 1 数据模式，自动生成新的策略模板
@@ -165,63 +208,6 @@ Phase 1 结果矩阵 (phase1_patterns.json)
 
 **产出**：高质量的 ScriptStrategy（非模板化，完全由 LLM 生成代码）
 
+---
 
-### 特定策略
-完全可以，这是一个很好的思路。有两种实现方式：
-
-
-方式 1：筛选特定股票 + 特定时间段回测
-
-在现有框架上，只需要：
-
-
-1.筛选目标股票 — 找出在某时间段内涨停过的股票
-2.限定回测窗口 — 用 --start--end 只跑那个时间段
-3.定制评分函数 — 给涨停捕获更高权重
-
-powershell
-powershell
-# 比如只跑 2024年9月（A股大反弹期间）
-python -m optimizer.runner -t vwap_rsi_confirm -m CNStock -s "000001.SZ,000002.SZ" -tf 1D --start 2024-09-01 --end 2024-09-30 --trials 200
-
-方式 2：写一个涨停板专用策略模板
-
-更直接的做法——专门设计一个抓涨停的模板。我来分析一下涨停板的特征：## 回答
-
-
-可以，而且现有框架已经支持。 有两种玩法：
-
-
-玩法 1：时间段限定训练
-
-直接用 --start--end 跑特定行情区间：
-
-
-powershell
-powershell
-# 2024年9月大反弹期间训练
-python -m optimizer.runner -t vwap_rsi_confirm -m CNStock --all-local -tf 1D --start 2024-09-01 --end 2024-09-30 --trials 200 -j 35
-
-# 2025年1月震荡期训练
-python -m optimizer.runner -t vwap_rsi_confirm -m CNStock --all-local -tf 1D --start 2025-01-01 --end 2025-01-31 --trials 200 -j 35
-
-然后对不同时间段的最优参数做集合分析——哪些参数在多个行情周期都有效，哪些只在特定行情有效。
-
-
-玩法 2：涨停板专用策略模板
-
-从数据看，收益 >100% 的 792 组回测有明确规律：
-
-
-低频高弹性：平均 6.4 笔交易，单笔收益极高
-模板偏好：rsi_volume_divergence(240) 和 macd_vol_divergence(195) 最多，因为它们捕捉反转
-科创板/创业板占比高（688xxx、300xxx），因为 20% 涨跌幅
-
-要不要我基于这些数据设计一个涨停板专用模板？思路是：
-
-
-1.筛选有过涨停历史的股票作为训练集
-2.用涨停日作为信号触发点训练参数
-3.评分函数改为以捕获大涨为核心（而非夏普比率）
-
-你想做哪个？
+*最后更新：2026-04-30*

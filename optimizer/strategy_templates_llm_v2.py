@@ -254,67 +254,6 @@ def _build_macd_vol_divergence_config(p: dict) -> dict:
 
 
 # ============================================================
-# 6. 涨停追涨（涨停次日延续策略）
-# ============================================================
-# 设计思路: 不预测涨停，而是涨停后吃延续溢价
-#   信号 = 今天涨幅 >= limitup_pct（接近涨停）
-#   确认 = 成交量放大（封板资金充足，非烂板）
-#   确认 = RSI 未超买（还有上涨空间）
-#   可选 = 价格站上短期均线（趋势环境好）
-# 入场: 信号日收盘价买入（即涨停价）
-# 出场: 追踪止损锁定利润 + 固定止损防低开
-# 预期持仓: 1-3 天（短线溢价交易）
-#
-# 核心逻辑:
-#   涨停 + 放量 = 主力资金介入 → 次日高开概率大
-#   涨停 + 缩量 = 纯情绪驱动 → 次日容易低开（排除）
-#   RSI < 70 = 还没到极端超买 → 有延续空间
-#   RSI > 80 = 已经连续涨了 → 追高风险大（排除）
-
-def _build_limitup_continuation_config(p: dict) -> dict:
-    """涨停追涨 — 大涨日买入，吃延续溢价"""
-    entry_rules = [
-        # 1. 大涨确认：今日涨幅在近 N 天中排名前 M%
-        {
-            "indicator": "limitup_detect",
-            "params": {"lookback": p["rank_lookback"], "top_pct": p["top_pct"]},
-            "operator": "is_limitup",
-        },
-        # 2. 放量确认：大涨日成交量 > N 倍均量（资金介入，非虚涨）
-        {
-            "indicator": "volume",
-            "params": {"period": p["vol_ma_period"]},
-            "operator": "volume_ratio_above",
-            "threshold": p["vol_ratio"],
-        },
-        # 3. RSI 未超买：还有上涨空间
-        {
-            "indicator": "rsi",
-            "params": {"period": p["rsi_period"], "threshold": p["rsi_max"]},
-            "operator": "<",
-        },
-    ]
-    # 4. 可选：均线过滤（只在趋势向上时追涨）
-    if p.get("use_ma_filter"):
-        entry_rules.append({
-            "indicator": "ma",
-            "params": {"period": p["ma_period"], "ma_type": "ema"},
-            "operator": "price_above",
-        })
-
-    return {
-        "name": f"LimitUpCont_{p['top_pct']}pct_{p['vol_ratio']}x",
-        "entry_rules": entry_rules,
-        "position_config": {"initial_size_pct": 100, "leverage": 1, "max_pyramiding": 0},
-        "pyramiding_rules": {"enabled": False},
-        "risk_management": {
-            "stop_loss": {"enabled": True, "value": p.get("stop_loss_pct", 4.0)},
-            "trailing_stop": {"enabled": True, "type": "trailing_pct", "value": p.get("trailing_pct", 3.0)},
-        },
-    }
-
-
-# ============================================================
 # 模板注册表
 # ============================================================
 
@@ -448,34 +387,5 @@ LLM_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             ("price_ma_period", "<", "lookback_period"),
         ],
         "build_config": _build_macd_vol_divergence_config,
-    },
-
-    # ── 6. 涨停追涨（涨停次日延续策略）──
-    # 不预测涨停，涨停后吃延续溢价
-    # 信号确定性高（涨停是已发生的事件），关键在于过滤烂板
-    "limitup_continuation": {
-        "name": "涨停追涨",
-        "description": (
-            "大涨日买入，吃延续溢价。"
-            "用滚动百分位排名替代固定阈值，自动适应每只股票的波动特征。"
-            "大涨 + 放量 = 主力资金介入 → 次日延续概率大。"
-            "RSI 未超买确保有延续空间，追踪止损锁定利润。"
-            "短线持仓 1-3 天。"
-        ),
-        "indicators": ["limitup_detect", "volume", "rsi", "ma"],
-        "params": {
-            "rank_lookback":     _p_int(20, 120, 10),       # 排名窗口：近 N 天
-            "top_pct":           _p_int(3, 15, 1),          # 前 M%：涨幅排名前 M%
-            "vol_ma_period":     _p_int(5, 15, 1),          # 量能均线周期
-            "vol_ratio":         _p_float(1.2, 3.0, 0.1),   # 量比：资金介入程度
-            "rsi_period":        _p_int(6, 14, 1),          # RSI 周期
-            "rsi_max":           _p_int(65, 85, 1),         # RSI 上限（排除超买）
-            "use_ma_filter":     _p_choice([True, False]),   # 均线趋势过滤
-            "ma_period":         _p_int(10, 30, 1),         # 均线周期
-            "stop_loss_pct":     _p_float(3.0, 6.0, 0.5),   # 止损
-            "trailing_pct":      _p_float(2.0, 5.0, 0.5),   # 追踪止损
-        },
-        "constraints": [],
-        "build_config": _build_limitup_continuation_config,
     },
 }
