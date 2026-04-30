@@ -359,7 +359,7 @@
                         <a-checkbox v-model="enableMtf">{{ $t('indicatorIde.highPrecisionMtf') }}</a-checkbox>
                       </a-tooltip>
                     </div>
-                    <div class="param-strategy-hint">止损、止盈、仓位与追踪止损等请在代码中用 # @strategy 声明；成交时机固定为下一根 K 线开盘（贴近实盘）。</div>
+                    <div class="param-strategy-hint" style="display: none;">止损、止盈、仓位与追踪止损等请在代码中用 # @strategy 声明；成交时机固定为下一根 K 线开盘（贴近实盘）。</div>
                   </div>
                 </div>
               </div>
@@ -3961,6 +3961,7 @@ export default {
 // ===== Left-Right Resize Handle =====
 .ide-lr-resize-handle {
   flex: 0 0 6px;
+  align-self: stretch;
   display: flex;
   align-items: flex-start;
   justify-content: center;
@@ -4871,10 +4872,12 @@ export default {
 }
 .ide-tuning-method-cards {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   gap: 10px;
 }
 .ide-tuning-method-card {
+  flex: 1 1 50%;
+  min-width: 0;
   position: relative;
   padding: 14px 16px;
   border-radius: 10px;

@@ -3196,7 +3196,13 @@ registerOverlay({
           bar: {
             upColor: isDark ? '#ef5350' : '#f5222d',
             downColor: isDark ? '#0ecb81' : '#52c41a',
-            noChangeColor: theme.borderColor
+            noChangeColor: theme.borderColor,
+            upBorderColor: isDark ? '#ef5350' : '#f5222d',
+            downBorderColor: isDark ? '#0ecb81' : '#52c41a',
+            noChangeBorderColor: theme.borderColor,
+            upWickColor: isDark ? '#ef5350' : '#f5222d',
+            downWickColor: isDark ? '#0ecb81' : '#52c41a',
+            noChangeWickColor: theme.borderColor
           },
           // 若使用面积图类型，关闭末端点动画可减少实时跳动观感
           area: {
@@ -3211,7 +3217,13 @@ registerOverlay({
           bar: {
             upColor: isDark ? '#ef5350' : '#f5222d',
             downColor: isDark ? '#0ecb81' : '#52c41a',
-            noChangeColor: theme.borderColor
+            noChangeColor: theme.borderColor,
+            upBorderColor: isDark ? '#ef5350' : '#f5222d',
+            downBorderColor: isDark ? '#0ecb81' : '#52c41a',
+            noChangeBorderColor: theme.borderColor,
+            upWickColor: isDark ? '#ef5350' : '#f5222d',
+            downWickColor: isDark ? '#0ecb81' : '#52c41a',
+            noChangeWickColor: theme.borderColor
           }
         },
         xAxis: {
