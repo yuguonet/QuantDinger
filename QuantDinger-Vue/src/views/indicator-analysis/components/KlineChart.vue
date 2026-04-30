@@ -3198,6 +3198,11 @@ registerOverlay({
           tooltip: {
             showRule: 'always',
             showType: 'standard'
+          },
+          bar: {
+            upColor: isDark ? '#ef5350' : '#f5222d',
+            downColor: isDark ? '#0ecb81' : '#52c41a',
+            noChangeColor: theme.borderColor
           }
         },
         xAxis: {

@@ -158,8 +158,8 @@ def _build_bollinger_rsi_squeeze_config(p: dict) -> dict:
         {
             "indicator": "bollinger_bandwidth",
             "params": {
-                "period": p["bb_period"],
-                "std_dev": p["bb_std"],
+                "period": p["bb_period"],           # 编译器期望 'period'
+                "std_dev": p["bb_std"],             # 编译器期望 'std_dev'
                 "squeeze_percentile": p["squeeze_percentile"],
             },
             "operator": "below_percentile",

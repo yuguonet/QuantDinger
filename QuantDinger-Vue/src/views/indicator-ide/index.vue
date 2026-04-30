@@ -74,11 +74,9 @@
         />
       </div>
 
-      <!-- 拖拽调整左右比例（仅顶部手柄可拖拽） -->
-      <div class="ide-lr-resize-handle">
-        <span class="ide-lr-resize-handle-grip" @mousedown="startResizeLeftRight" :title="$t('indicatorIde.dragToResize')">
-          <span class="ide-lr-resize-handle-dots"></span>
-        </span>
+      <!-- 左右调整手柄 -->
+      <div class="ide-lr-resize-handle" @mousedown="startResizeLeftRight">
+        <span class="ide-lr-resize-handle-dots"></span>
       </div>
 
       <!-- Right panel (chart/code/AI tabs + results) -->
@@ -463,13 +461,6 @@
 
             <a-tab-pane key="aisystem" :tab="$t('indicatorIde.aiExperimentTab')">
               <div v-if="!experimentRunning" class="ide-tuning-launch">
-                <div class="ide-tuning-launch-header">
-                  <div class="ide-tuning-launch-icon"><a-icon type="experiment" /></div>
-                  <div>
-                    <div class="ide-tuning-launch-title">{{ $t('indicatorIde.tuningLaunchTitle') }}</div>
-                    <div class="ide-tuning-launch-subtitle" :title="$t('indicatorIde.tuningLaunchDesc')"></div>
-                  </div>
-                </div>
 
                 <div class="ide-tuning-method-cards">
                   <div class="ide-tuning-method-card">
@@ -1060,7 +1051,7 @@ export default {
       activeIndicators: [],
       /** 是否在 K 线图上运行当前指标（关闭后仅保留 K 线，不计算/绘制指标） */
       chartIndicatorRunning: true,
-      resultTab: 'backtest',
+      resultTab: 'params',
       quickTradeDrawerVisible: false,
 
       // AI generation
@@ -3969,34 +3960,36 @@ export default {
 }
 // ===== Left-Right Resize Handle =====
 .ide-lr-resize-handle {
-  flex: 0 0 10px;
+  flex: 0 0 6px;
   display: flex;
   align-items: flex-start;
   justify-content: center;
-  padding-top: 8px;
-  background: #f0f0f0;
+  padding-top: 12px;
+  cursor: col-resize;
+  background: transparent;
   border-left: 1px solid #e8e8e8;
   border-right: 1px solid #e8e8e8;
-  flex-shrink: 0;
-}
-.ide-lr-resize-handle-grip {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 100%;
-  height: 24px;
-  cursor: col-resize;
-  border-radius: 2px;
   transition: background 0.15s;
-  &:hover { background: #e2e2e2; }
-  &:active { background: #d4d4d4; }
+  flex-shrink: 0;
+  position: relative;
+  &::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: -3px;
+    right: -3px;
+    bottom: 0;
+  }
+  &:hover { background: rgba(24, 144, 255, 0.08); }
+  &:active { background: rgba(24, 144, 255, 0.15); }
 }
 .ide-lr-resize-handle-dots {
   display: block;
   width: 4px;
-  height: 18px;
+  height: 20px;
   border-radius: 2px;
   background: #c0c0c0;
+  flex-shrink: 0;
 }
 
 // ===== Code Panel =====
@@ -4446,7 +4439,7 @@ export default {
 }
 
 // ===== Right Panel =====
-.ide-right { flex: 1; display: flex; flex-direction: column; overflow: visible; min-width: 0; }
+.ide-right { flex: 1; display: flex; flex-direction: column; overflow: visible; min-width: 0; height: calc(100vh - 64px - 56px); max-height: calc(100vh - 64px - 56px); }
 
 // ===== Chart Area with Tabs =====
 .ide-chart-area {
@@ -5479,13 +5472,10 @@ export default {
   }
   .ide-left { background: #181818; border-right-color: #303030; }
   .ide-lr-resize-handle {
-    background: #1f1f1f;
     border-left-color: #303030;
     border-right-color: #303030;
-  }
-  .ide-lr-resize-handle-grip {
-    &:hover { background: #2a2a2a; }
-    &:active { background: #333; }
+    &:hover { background: rgba(88, 166, 255, 0.08); }
+    &:active { background: rgba(88, 166, 255, 0.15); }
   }
   .ide-lr-resize-handle-dots { background: #555; }
   .ide-chart-area { border-bottom-color: #303030; }

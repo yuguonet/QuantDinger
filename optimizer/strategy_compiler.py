@@ -307,11 +307,11 @@ df['bbw_lower_{period}'] = bb_sma - ({std_dev} * bb_std)
 df['bbw_{period}'] = (df['bbw_upper_{period}'] - df['bbw_lower_{period}']) / bb_sma.replace(0, np.nan)
 # 百分位排名：rolling 内计算当前值在窗口内的百分位
 _bbw_win = min(120, max(len(df) - 1, 20))
-def _pct_rank(x):
+def _pct_rank(x, _np=np):
     if len(x) < 20:
-        return np.nan
-    return (np.sum(x[:-1] < x[-1]) + 0.5 * np.sum(x[:-1] == x[-1])) / (len(x) - 1) * 100
-df['bbw_{period}_pctile'] = df['bbw_{period}'].rolling(window=_bbw_win, min_periods=20).apply(_pct_rank, raw=True)
+        return _np.nan
+    return (_np.sum(x[:-1] < x[-1]) + 0.5 * _np.sum(x[:-1] == x[-1])) / (len(x) - 1) * 100
+df['bbw_{period}_{std_dev}_{squeeze_percentile}_pctile'] = df['bbw_{period}'].rolling(window=_bbw_win, min_periods=20).apply(_pct_rank, raw=True)
 """
                     calculated.add(key)
 
@@ -593,8 +593,8 @@ df['raw_sell'] = False
                 
                 if operator == 'bullish_divergence':
                     conditions_buy.append(f"({pvd_col})")
-                    # 卖出: 价格创新高但量缩（用参数中的 volume_ma，不硬编码 20）
-                    conditions_sell.append(f"(df['close'] > df['close'].rolling(window={lookback}).max().shift(1)) & (df['volume'] < df['vol_ma_{vol_ma}'])")
+                    # 卖出: 价格创新高但量缩（列名带 pvd_ 前缀，与指标计算一致）
+                    conditions_sell.append(f"(df['close'] > df['close'].rolling(window={lookback}).max().shift(1)) & (df['volume'] < df['pvd_vol_ma_{vol_ma}'])")
 
         if conditions_buy:
             code += f"\ndf['raw_buy'] = {' & '.join(conditions_buy)}\n"
