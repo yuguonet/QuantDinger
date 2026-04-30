@@ -323,20 +323,36 @@ df['bbw_{period}_{std_dev}_{squeeze_percentile}_pctile'] = df['bbw_{period}'].ro
                 if key not in calculated:
                     code += f"""
 # Price-Volume Divergence (lookback={lookback}, price_ma={price_ma}, vol_ma={volume_ma})
-# 底背离: 价格创新低但成交量萎缩
+# 经典动量底背离: 价格创新低，但RSI没创新低（动量在恢复）
 df['pvd_price_low_{lookback}'] = df['low'].rolling(window={lookback}).min()
+df['pvd_price_high_{lookback}'] = df['high'].rolling(window={lookback}).max()
+
+# 内置RSI用于背离检测
+_delta = df['close'].diff()
+_gain = _delta.clip(lower=0)
+_loss = (-_delta).clip(lower=0)
+_avg_gain = _gain.rolling(window=14, min_periods=14).mean()
+_avg_loss = _loss.rolling(window=14, min_periods=14).mean()
+_rs = _avg_gain / _avg_loss.replace(0, 0.0001)
+df['pvd_rsi'] = 100 - (100 / (1 + _rs))
+
+# 价格在N日最低附近（容忍2%）
+df['pvd_price_at_low'] = df['close'] <= df['pvd_price_low_{lookback}'] * 1.02
+# RSI高于N日最低值（动量背离：价格新低但RSI没新低）
+df['pvd_rsi_floor'] = df['pvd_rsi'].rolling(window={lookback}, min_periods=5).min()
+df['pvd_rsi_higher'] = df['pvd_rsi'] > df['pvd_rsi_floor'] * 1.05
+# 成交量低于均量（量缩确认）
 df['pvd_vol_ma_{volume_ma}'] = df['volume'].rolling(window={volume_ma}).mean()
-df['pvd_price_ma_{price_ma}'] = df['close'].rolling(window={price_ma}).mean()
+df['pvd_vol_shrink'] = df['volume'] < df['pvd_vol_ma_{volume_ma}'] * 1.0
 
-# 价格接近N日低点
-df['pvd_near_low'] = df['close'] <= df['pvd_price_low_{lookback}'] * 1.03
-# 成交量低于均量
-df['pvd_vol_shrink'] = df['volume'] < df['pvd_vol_ma_{volume_ma}'] * 0.8
-# 价格在下跌（当前MA低于前N日MA）
-df['pvd_price_falling'] = df['pvd_price_ma_{price_ma}'] < df['pvd_price_ma_{price_ma}'].shift({lookback})
+# 底背离信号: 价格在低位 + RSI没创新低（经典动量背离）
+df['pvd_bullish'] = df['pvd_price_at_low'] & df['pvd_rsi_higher']
 
-# 底背离信号: 价格在低位 + 量缩 + 之前在跌
-df['pvd_bullish'] = df['pvd_near_low'] & df['pvd_vol_shrink'] & df['pvd_price_falling']
+# 顶背离信号: 价格在高位 + RSI没创新高
+df['pvd_price_at_high'] = df['close'] >= df['pvd_price_high_{lookback}'] * 0.98
+df['pvd_rsi_ceil'] = df['pvd_rsi'].rolling(window={lookback}, min_periods=5).max()
+df['pvd_rsi_lower'] = df['pvd_rsi'] < df['pvd_rsi_ceil'] * 0.95
+df['pvd_bearish'] = df['pvd_price_at_high'] & df['pvd_rsi_lower']
 """
                     calculated.add(key)
 
@@ -587,14 +603,13 @@ df['raw_sell'] = False
 
             elif ind == 'price_volume_divergence':
                 operator = rule.get('operator', 'bullish_divergence')
-                pvd_col = "df['pvd_bullish']"
                 lookback = params.get('lookback', 20)
-                vol_ma = params.get('volume_ma', 20)
-                
+
                 if operator == 'bullish_divergence':
-                    conditions_buy.append(f"({pvd_col})")
-                    # 卖出: 价格创新高但量缩（列名带 pvd_ 前缀，与指标计算一致）
-                    conditions_sell.append(f"(df['close'] > df['close'].rolling(window={lookback}).max().shift(1)) & (df['volume'] < df['pvd_vol_ma_{vol_ma}'])")
+                    # 买入: 经典动量底背离（价格新低但RSI没新低）
+                    conditions_buy.append("(df['pvd_bullish'])")
+                    # 卖出: 经典动量顶背离（价格新高但RSI没新高）
+                    conditions_sell.append("(df['pvd_bearish'])")
 
         if conditions_buy:
             code += f"\ndf['raw_buy'] = {' & '.join(conditions_buy)}\n"

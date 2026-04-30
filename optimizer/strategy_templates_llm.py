@@ -88,7 +88,7 @@ def _build_rsi_volume_divergence_config(p: dict) -> dict:
         {
             "indicator": "rsi",
             "params": {"period": p["rsi_period"], "threshold": p["rsi_oversold"]},
-            "operator": "cross_up",
+            "operator": "<",
         },
         {
             "indicator": "price_volume_divergence",
@@ -217,7 +217,7 @@ def _build_macd_vol_divergence_config(p: dict) -> dict:
                 "slow_period": p["macd_slow"],
                 "signal_period": p["macd_signal"],
             },
-            "operator": "histogram_positive",
+            "operator": "histogram_negative",
         },
         {
             "indicator": "price_volume_divergence",

@@ -136,12 +136,12 @@ def get_llm_template_keys() -> List[str]:
 
 def get_template_unified(key: str) -> dict:
     """从统一注册表获取模板"""
-    if key not in ALL_TEMPLATES:
-        raise ValueError(
-            f"未知模板: {key}\n"
-            f"可用模板: {', '.join(get_all_template_keys())}"
-        )
-    return ALL_TEMPLATES[key]
+    if key in ALL_TEMPLATES:
+        return ALL_TEMPLATES[key]
+    # fallback: 动态加载（多进程 worker 用）
+    from optimizer.param_space import get_template
+    return get_template(key)
+
 
 
 # ============================================================
@@ -439,9 +439,9 @@ def run_single_template(
 
 def _worker_init():
     """每个子进程初始化：确保 monkey-patch 和模块路径就绪"""
-    # monkey-patch 在模块级已执行，子进程 import 时自动生效
-    # 这里不需要额外操作，但保留作为扩展点
-    pass
+    import optimizer.strategy_templates_llm   # 确保 LLM 模板注册
+    import optimizer.strategy_templates_ashare # 确保 A 股模板注册
+
 
 
 def _worker_run_one(args: tuple) -> Dict[str, Any]:

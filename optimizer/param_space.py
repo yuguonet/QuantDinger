@@ -342,6 +342,13 @@ def get_template(key: str) -> dict:
             return ASHARE_STRATEGY_TEMPLATES[key]
     except ImportError:
         pass
+    # 尝试加载 LLM 生成模板
+    try:
+        from optimizer.strategy_templates_llm import LLM_STRATEGY_TEMPLATES
+        if key in LLM_STRATEGY_TEMPLATES:
+            return LLM_STRATEGY_TEMPLATES[key]
+    except ImportError:
+        pass
     raise ValueError(f"Unknown strategy template: {key}. Available: {list(STRATEGY_TEMPLATES.keys())}")
 
 
