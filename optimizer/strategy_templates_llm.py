@@ -209,6 +209,9 @@ def _build_vwap_bollinger_squeeze_config(p: dict) -> dict:
 # 设计考量: 量价背离在大样本下表现好，替代 KDJ 作为 MACD 的搭档
 
 def _build_macd_vol_divergence_config(p: dict) -> dict:
+    # 修复：histogram_negative 要求零轴穿越，日线上极罕见
+    # 改用 diff_lt_dea（MACD线 < 信号线），更宽松的空头条件
+    # 配合量价底背离 = 经典"MACD底背离"形态
     entry_rules = [
         {
             "indicator": "macd",
@@ -217,7 +220,7 @@ def _build_macd_vol_divergence_config(p: dict) -> dict:
                 "slow_period": p["macd_slow"],
                 "signal_period": p["macd_signal"],
             },
-            "operator": "histogram_negative",
+            "operator": "diff_lt_dea",
         },
         {
             "indicator": "price_volume_divergence",
@@ -230,7 +233,8 @@ def _build_macd_vol_divergence_config(p: dict) -> dict:
             "operator": "bullish_divergence",
         },
     ]
-    if p.get("use_rsi_confirm"):
+    # RSI 确认默认开启（经典底背离需要 RSI 处于低位）
+    if p.get("use_rsi_confirm", True):
         entry_rules.append({
             "indicator": "rsi",
             "params": {"period": p.get("rsi_period", 14), "threshold": p.get("rsi_level", 40)},
@@ -362,7 +366,7 @@ LLM_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "lookback_period": _p_int(10, 40, 1),
             "price_ma_period": _p_int(5, 20, 1),
             "vol_ma_period":   _p_int(10, 30, 1),
-            "use_rsi_confirm": _p_choice([True, False]),
+            "use_rsi_confirm": _p_choice([True, True, True, False]),  # 默认开启
             "rsi_period":      _p_int(7, 21, 1),
             "rsi_level":       _p_int(25, 45, 1),
             "stop_loss_pct":   _p_float(3.0, 6.0, 0.5),
