@@ -113,6 +113,13 @@ ALL_TEMPLATES.update(STRATEGY_TEMPLATES)
 ALL_TEMPLATES.update(ASHARE_STRATEGY_TEMPLATES)
 ALL_TEMPLATES.update(LLM_STRATEGY_TEMPLATES)
 
+# 加载 LLM 批量生成的模板
+try:
+    from optimizer.strategies_generated import GENERATED_TEMPLATES
+    ALL_TEMPLATES.update(GENERATED_TEMPLATES)
+except ImportError:
+    pass
+
 
 def get_all_template_keys() -> List[str]:
     """返回全部模板 key"""

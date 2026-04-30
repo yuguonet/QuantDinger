@@ -820,15 +820,6 @@ def format_template_code(key: str, template: dict) -> str:
     code = f'''
 # ── {template.get("name", key)} ──
 {build_source}
-
-"{key}": {{
-    "name": "{template.get('name', key)}",
-    "description": "{template.get('description', '')}",
-    "indicators": {indicators_str},
-    "params": {params_str},
-    "constraints": {constraints_str},
-    "build_config": {build_fn_name},
-}},
 '''
     return code
 
@@ -937,8 +928,35 @@ def batch_generate(output_path: str = "strategies_generated.py"):
     # 输出
     if all_templates:
         output_lines = ['"""LLM 生成的 A 股策略模板"""\n']
+        # 先写所有 _build 函数
         for key, template in all_templates.items():
             output_lines.append(format_template_code(key, template))
+        # 再写 GENERATED_TEMPLATES 字典
+        output_lines.append('\nGENERATED_TEMPLATES = {\n')
+        for key, template in all_templates.items():
+            build_fn_name = f"_build_{key}_config"
+            params_str = "{\n"
+            for pname, pspec in template.get("params", {}).items():
+                if pname.startswith("_"):
+                    continue
+                params_str += f'            "{pname}": {pspec},\n'
+            params_str += "        }"
+            constraints_str = "[\n"
+            for c in template.get("constraints", []):
+                if isinstance(c, (list, tuple)) and len(c) == 3:
+                    left, op, right = c
+                    constraints_str += f'            ("{left}", "{op}", "{right}"),\n'
+            constraints_str += "        ]"
+            indicators_str = str(template.get("indicators", []))
+            output_lines.append(f'''    "{key}": {{
+        "name": "{template.get('name', key)}",
+        "description": "{template.get('description', '')}",
+        "indicators": {indicators_str},
+        "params": {params_str},
+        "constraints": {constraints_str},
+        "build_config": {build_fn_name},
+    }},''')
+        output_lines.append('}\n')
 
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(output_lines))
