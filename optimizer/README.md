@@ -227,7 +227,31 @@ python -m optimizer.runner -t limitup_continuation -m CNStock --all-local -tf 1D
 - [x] `phase2_strategy_discovery.py` — 数据驱动的策略发现脚本
 - [x] 5 个数据驱动的 LLM prompt 模板（基于 Phase 1 已验证有效的指标组合）
 - [x] 复用 `backend_api_python` 的 LLMService（无需额外配置 API Key）
-- [ ] 实际执行 LLM 生成 + 回测验证
+- [x] LLM 生成策略代码 → `strategies_generated.py`（5 个模板）
+- [ ] 全量回测 + Walk-Forward 验证
+
+**生成的 5 个模板**：
+
+| 模板 key | 名称 | 状态 |
+|---|---|---|
+| rsi_vwap_volume | RSI VWAP Volume 共振 | 🔄 全量回测中 |
+| adaptive_volatility | 自适应波动率 | ⏳ 待回测 |
+| ema_rsi_volume | EMA RSI Volume | ⏳ 待回测 |
+| kdj | 均线 KDJ 动量 | ⏳ 待回测 |
+| bollinger_macd_volume | 布林 MACD Volume | ⏳ 待回测 |
+
+#### 小范围测试结果（3 只股票 × 50 trials）
+
+| 股票 | 最佳模板 | Sharpe | 胜率 | 最大回撤 | WF 得分 |
+|---|---|---|---|---|---|
+| 300674.SZ | rsi_vwap_volume | 1.13 | 71.4% | -11.7% | -10.0 ❌ |
+| 301215.SZ | rsi_vwap_volume | 0.61 | 60.0% | -15.2% | -10.0 ❌ |
+
+**小结**：回测 Sharpe 尚可，但 WF 全挂（-10.0），严重过拟合。需全量回测验证。
+
+#### 全量回测结果
+
+_待补充（1260 只 × 5 模板 × 50 trials，2023-05-01 ~ 2026-03-31）_
 
 **流程**：
 ```
@@ -275,4 +299,4 @@ python -m optimizer.phase2_strategy_discovery prompts
 
 ---
 
-*最后更新：2026-04-30 21:33*
+*最后更新：2026-05-01 00:18*

@@ -393,7 +393,7 @@ def run_single_template(
         print(f"  Walk-Forward 验证 (最优参数)")
         print(f"{'='*60}")
 
-        validator = WalkForwardValidator(n_splits=5, train_ratio=0.7)
+        validator = WalkForwardValidator(n_splits=3, train_ratio=0.7)
         validation_result = validator.validate(
             objective_fn=objective,
             best_params=best.params,

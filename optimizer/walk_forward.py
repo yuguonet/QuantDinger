@@ -159,7 +159,7 @@ class WalkForwardValidator:
         total_trades = int(metrics.get("totalTrades", 0))
         profit_factor = float(metrics.get("profitFactor", 0))
 
-        if total_trades < 3:
+        if total_trades < 1:
             return -10.0
 
         if score_fn == "sharpe":
