@@ -16,9 +16,9 @@
           <svg viewBox="0 0 120 120">
             <circle cx="60" cy="60" r="52" class="ring-bg" />
             <circle cx="60" cy="60" r="52"
-              class="ring-progress"
-              :stroke-dasharray="`${overallScore * 3.267}, 326.7`"
-              :class="getScoreClass(overallScore)"
+                    class="ring-progress"
+                    :stroke-dasharray="`${overallScore * 3.267}, 326.7`"
+                    :class="getScoreClass(overallScore)"
             />
           </svg>
           <div class="score-inner">
@@ -59,7 +59,7 @@
           <div class="market-score-col">
             <div class="sentiment-bar-wrap">
               <div class="sentiment-bar" :class="getSentimentClass(m.sentiment)"
-                :style="{ width: m.sentiment + '%' }">
+                   :style="{ width: m.sentiment + '%' }">
               </div>
             </div>
             <div class="sentiment-value" :class="getSentimentClass(m.sentiment)">

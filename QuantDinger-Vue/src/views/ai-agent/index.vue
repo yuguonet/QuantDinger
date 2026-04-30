@@ -3,7 +3,7 @@
     <!-- 顶部操作栏 -->
     <div class="agent-header">
       <div class="header-left">
-        <RobotOutlined class="header-icon" />
+        <a-icon type="robot" class="header-icon" />
         <span class="header-title">AI Agent</span>
         <a-tag :color="connected ? 'green' : 'default'" class="status-tag">
           {{ connected ? 'ONLINE' : 'OFFLINE' }}
@@ -41,22 +41,22 @@
           @pressEnter="sendAnalysis"
         >
           <template #prefix>
-            <StockOutlined />
+            <a-icon type="stock" />
           </template>
         </a-input>
         <a-button type="primary" @click="sendAnalysis" :loading="analyzing" style="margin-left: 8px">
-          <template #icon><ThunderboltOutlined /></template>
+          <template #icon><a-icon type="thunderbolt" /></template>
           分析
         </a-button>
         <a-dropdown style="margin-left: 8px">
           <a-button>
-            <SettingOutlined />
-            <DownOutlined />
+            <a-icon type="setting" />
+            <a-icon type="down" />
           </a-button>
           <template #overlay>
             <a-menu @click="handleMenuClick">
-              <a-menu-item key="clear"><DeleteOutlined /> 清空对话</a-menu-item>
-              <a-menu-item key="sessions"><HistoryOutlined /> 历史会话</a-menu-item>
+              <a-menu-item key="clear"><a-icon type="delete" /> 清空对话</a-menu-item>
+              <a-menu-item key="sessions"><a-icon type="history" /> 历史会话</a-menu-item>
             </a-menu>
           </template>
         </a-dropdown>
@@ -65,10 +65,10 @@
 
     <!-- 当前策略提示条 -->
     <div v-if="currentStrategyInfo" class="strategy-banner">
-      <ExperimentOutlined />
+      <a-icon type="experiment" />
       <span>当前策略：<strong>{{ currentStrategyInfo.name }}</strong></span>
       <span v-if="currentStrategyInfo.description" class="strategy-desc">— {{ currentStrategyInfo.description }}</span>
-      <CloseCircleOutlined class="strategy-clear" @click="clearStrategy" />
+      <a-icon type="close-circle" class="strategy-clear" @click="clearStrategy" />
     </div>
 
     <!-- 聊天区域 -->
@@ -76,7 +76,7 @@
       <div class="chat-messages">
         <!-- 欢迎消息 -->
         <div v-if="messages.length === 0" class="welcome-message">
-          <RobotOutlined class="welcome-icon" />
+          <a-icon type="robot" class="welcome-icon" />
           <h2>AI Agent 助手</h2>
           <p>选择策略并输入股票代码，或直接提问：</p>
           <div class="quick-actions">
@@ -129,7 +129,7 @@
           @click="sendMessage"
           class="send-btn"
         >
-          <template #icon><ArrowUpOutlined /></template>
+          <template #icon><a-icon type="arrow-up" /></template>
         </a-button>
       </div>
       <div class="input-hint">
@@ -180,18 +180,7 @@
 <script>
 import { ref, computed, nextTick, onBeforeUnmount } from 'vue'
 import { message } from 'ant-design-vue'
-import {
-  RobotOutlined,
-  StockOutlined,
-  ThunderboltOutlined,
-  SettingOutlined,
-  DownOutlined,
-  DeleteOutlined,
-  HistoryOutlined,
-  ExperimentOutlined,
-  CloseCircleOutlined,
-  ArrowUpOutlined
-} from '@ant-design/icons-vue'
+// icons: using <a-icon type="xxx" /> (ant-design-vue 1.x pattern)
 
 import ChatBubble from './components/ChatBubble.vue'
 import {
@@ -206,17 +195,7 @@ import {
 export default {
   name: 'AiAgent',
   components: {
-    ChatBubble,
-    RobotOutlined,
-    StockOutlined,
-    ThunderboltOutlined,
-    SettingOutlined,
-    DownOutlined,
-    DeleteOutlined,
-    HistoryOutlined,
-    ExperimentOutlined,
-    CloseCircleOutlined,
-    ArrowUpOutlined
+    ChatBubble
   },
   setup () {
     // ── 响应式状态 ──────────────────────────────────────

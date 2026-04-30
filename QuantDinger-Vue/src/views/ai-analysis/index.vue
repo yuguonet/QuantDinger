@@ -43,13 +43,13 @@
               </a-select-option>
             </a-select>
             <a-button
-type="primary"
-size="large"
-icon="thunderbolt"
-@click="startFastAnalysis"
-:loading="analyzing"
-:disabled="!selectedSymbol || analyzing"
-class="analyze-button">
+              type="primary"
+              size="large"
+              icon="thunderbolt"
+              @click="startFastAnalysis"
+              :loading="analyzing"
+              :disabled="!selectedSymbol || analyzing"
+              class="analyze-button">
               {{ $t('fastAnalysis.startAnalysis') }}
             </a-button>
             <a-button size="large" icon="history" @click="showHistoryModal = true; loadHistoryList()" class="history-button">

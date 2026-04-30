@@ -261,107 +261,107 @@
                   </a-button>
                 </div>
                 <div class="params-grid">
-                <div class="param-section">
-                  <div class="param-label">{{ $t('indicatorIde.dateRange') }}</div>
-                  <div class="date-presets">
-                    <a-button
-                      v-for="p in filteredDatePresets"
-                      :key="p.key"
-                      size="small"
-                      :type="datePreset === p.key ? 'primary' : 'default'"
-                      @click="applyDatePreset(p)"
-                    >{{ p.label }}</a-button>
+                  <div class="param-section">
+                    <div class="param-label">{{ $t('indicatorIde.dateRange') }}</div>
+                    <div class="date-presets">
+                      <a-button
+                        v-for="p in filteredDatePresets"
+                        :key="p.key"
+                        size="small"
+                        :type="datePreset === p.key ? 'primary' : 'default'"
+                        @click="applyDatePreset(p)"
+                      >{{ p.label }}</a-button>
+                    </div>
+                    <a-row :gutter="8" style="margin-top: 6px;">
+                      <a-col :span="12">
+                        <a-date-picker v-model="startDate" :placeholder="$t('indicatorIde.start')" style="width: 100%" size="small" />
+                      </a-col>
+                      <a-col :span="12">
+                        <a-date-picker v-model="endDate" :placeholder="$t('indicatorIde.end')" style="width: 100%" size="small" />
+                      </a-col>
+                    </a-row>
                   </div>
-                  <a-row :gutter="8" style="margin-top: 6px;">
-                    <a-col :span="12">
-                      <a-date-picker v-model="startDate" :placeholder="$t('indicatorIde.start')" style="width: 100%" size="small" />
-                    </a-col>
-                    <a-col :span="12">
-                      <a-date-picker v-model="endDate" :placeholder="$t('indicatorIde.end')" style="width: 100%" size="small" />
-                    </a-col>
-                  </a-row>
-                </div>
 
-                <div class="param-section">
-                  <div class="param-label">{{ $t('indicatorIde.capital') }}</div>
-                  <a-row :gutter="8">
-                    <a-col :span="12">
-                      <div class="field-label">{{ $t('indicatorIde.initialCapital') }}</div>
-                      <a-input-number
-                        v-model="initialCapital"
-                        :min="1000"
-                        :step="10000"
-                        :precision="2"
-                        size="small"
-                        style="width: 100%"
-                        :formatter="v => `$ ${v}`.replace(/\B(?=(\d{3})+(?!\d))/g, ',')"
-                        :parser="v => v.replace(/\$\s?|(,*)/g, '')"
-                      />
-                    </a-col>
-                    <a-col :span="12">
-                      <div class="field-label">{{ $t('indicatorIde.leverage') }}</div>
-                      <a-input-number
-                        v-model="leverage"
-                        :min="1"
-                        :max="125"
-                        :step="1"
-                        :precision="0"
-                        size="small"
-                        style="width: 100%"
-                        :formatter="v => `${v}x`"
-                        :parser="v => v.replace('x', '')"
-                      />
-                    </a-col>
-                  </a-row>
-                  <a-row :gutter="8" style="margin-top: 6px;">
-                    <a-col :span="12">
-                      <div class="field-label">{{ $t('indicatorIde.commission') }}</div>
-                      <a-input-number
-                        v-model="commission"
-                        :min="0"
-                        :max="10"
-                        :step="0.01"
-                        :precision="4"
-                        size="small"
-                        style="width: 100%"
-                      />
-                    </a-col>
-                    <a-col :span="12">
-                      <div class="field-label">{{ $t('indicatorIde.slippage') }}</div>
-                      <a-input-number
-                        v-model="slippage"
-                        :min="0"
-                        :max="10"
-                        :step="0.01"
-                        :precision="4"
-                        size="small"
-                        style="width: 100%"
-                      />
-                    </a-col>
-                  </a-row>
-                </div>
-
-                <div class="param-section param-section--direction">
-                  <div class="param-label">{{ $t('indicatorIde.direction') }}</div>
-                  <a-radio-group v-model="tradeDirection" class="direction-radio-group">
-                    <a-radio-button value="long">
-                      <a-icon type="arrow-up" /> {{ $t('indicatorIde.long') }}
-                    </a-radio-button>
-                    <a-radio-button value="short">
-                      <a-icon type="arrow-down" /> {{ $t('indicatorIde.short') }}
-                    </a-radio-button>
-                    <a-radio-button value="both">
-                      <a-icon type="swap" /> {{ $t('indicatorIde.both') }}
-                    </a-radio-button>
-                  </a-radio-group>
-                  <div style="margin-top: 8px;">
-                    <a-tooltip :title="$t('indicatorIde.mtfHint')">
-                      <a-checkbox v-model="enableMtf">{{ $t('indicatorIde.highPrecisionMtf') }}</a-checkbox>
-                    </a-tooltip>
+                  <div class="param-section">
+                    <div class="param-label">{{ $t('indicatorIde.capital') }}</div>
+                    <a-row :gutter="8">
+                      <a-col :span="12">
+                        <div class="field-label">{{ $t('indicatorIde.initialCapital') }}</div>
+                        <a-input-number
+                          v-model="initialCapital"
+                          :min="1000"
+                          :step="10000"
+                          :precision="2"
+                          size="small"
+                          style="width: 100%"
+                          :formatter="v => `$ ${v}`.replace(/\B(?=(\d{3})+(?!\d))/g, ',')"
+                          :parser="v => v.replace(/\$\s?|(,*)/g, '')"
+                        />
+                      </a-col>
+                      <a-col :span="12">
+                        <div class="field-label">{{ $t('indicatorIde.leverage') }}</div>
+                        <a-input-number
+                          v-model="leverage"
+                          :min="1"
+                          :max="125"
+                          :step="1"
+                          :precision="0"
+                          size="small"
+                          style="width: 100%"
+                          :formatter="v => `${v}x`"
+                          :parser="v => v.replace('x', '')"
+                        />
+                      </a-col>
+                    </a-row>
+                    <a-row :gutter="8" style="margin-top: 6px;">
+                      <a-col :span="12">
+                        <div class="field-label">{{ $t('indicatorIde.commission') }}</div>
+                        <a-input-number
+                          v-model="commission"
+                          :min="0"
+                          :max="10"
+                          :step="0.01"
+                          :precision="4"
+                          size="small"
+                          style="width: 100%"
+                        />
+                      </a-col>
+                      <a-col :span="12">
+                        <div class="field-label">{{ $t('indicatorIde.slippage') }}</div>
+                        <a-input-number
+                          v-model="slippage"
+                          :min="0"
+                          :max="10"
+                          :step="0.01"
+                          :precision="4"
+                          size="small"
+                          style="width: 100%"
+                        />
+                      </a-col>
+                    </a-row>
                   </div>
-                  <div class="param-strategy-hint">止损、止盈、仓位与追踪止损等请在代码中用 # @strategy 声明；成交时机固定为下一根 K 线开盘（贴近实盘）。</div>
+
+                  <div class="param-section param-section--direction">
+                    <div class="param-label">{{ $t('indicatorIde.direction') }}</div>
+                    <a-radio-group v-model="tradeDirection" class="direction-radio-group">
+                      <a-radio-button value="long">
+                        <a-icon type="arrow-up" /> {{ $t('indicatorIde.long') }}
+                      </a-radio-button>
+                      <a-radio-button value="short">
+                        <a-icon type="arrow-down" /> {{ $t('indicatorIde.short') }}
+                      </a-radio-button>
+                      <a-radio-button value="both">
+                        <a-icon type="swap" /> {{ $t('indicatorIde.both') }}
+                      </a-radio-button>
+                    </a-radio-group>
+                    <div style="margin-top: 8px;">
+                      <a-tooltip :title="$t('indicatorIde.mtfHint')">
+                        <a-checkbox v-model="enableMtf">{{ $t('indicatorIde.highPrecisionMtf') }}</a-checkbox>
+                      </a-tooltip>
+                    </div>
+                    <div class="param-strategy-hint">止损、止盈、仓位与追踪止损等请在代码中用 # @strategy 声明；成交时机固定为下一根 K 线开盘（贴近实盘）。</div>
+                  </div>
                 </div>
-              </div>
               </div>
             </a-tab-pane>
 
@@ -3969,19 +3969,29 @@ export default {
   background: transparent;
   border-left: 1px solid #e8e8e8;
   border-right: 1px solid #e8e8e8;
-  transition: background 0.15s;
+  transition: background 0.15s, border-color 0.15s;
   flex-shrink: 0;
   position: relative;
   &::after {
     content: '';
     position: absolute;
     top: 0;
-    left: -3px;
-    right: -3px;
+    left: -4px;
+    right: -4px;
     bottom: 0;
+    z-index: 1;
   }
-  &:hover { background: rgba(24, 144, 255, 0.08); }
-  &:active { background: rgba(24, 144, 255, 0.15); }
+  &:hover {
+    background: rgba(24, 144, 255, 0.12);
+    border-left-color: rgba(24, 144, 255, 0.35);
+    border-right-color: rgba(24, 144, 255, 0.35);
+    .ide-lr-resize-handle-dots { background: #1890ff; }
+  }
+  &:active {
+    background: rgba(24, 144, 255, 0.2);
+    border-left-color: rgba(24, 144, 255, 0.5);
+    border-right-color: rgba(24, 144, 255, 0.5);
+  }
 }
 .ide-lr-resize-handle-dots {
   display: block;
@@ -5474,10 +5484,17 @@ export default {
   .ide-lr-resize-handle {
     border-left-color: #303030;
     border-right-color: #303030;
-    &:hover { background: rgba(88, 166, 255, 0.08); }
-    &:active { background: rgba(88, 166, 255, 0.15); }
+    &:hover {
+      background: rgba(88, 166, 255, 0.12);
+      border-left-color: rgba(88, 166, 255, 0.35);
+      border-right-color: rgba(88, 166, 255, 0.35);
+    }
+    &:active {
+      background: rgba(88, 166, 255, 0.2);
+    }
   }
   .ide-lr-resize-handle-dots { background: #555; }
+  .ide-lr-resize-handle:hover .ide-lr-resize-handle-dots { background: #58a6ff; }
   .ide-chart-area { border-bottom-color: #303030; }
   .ide-chart-tabs {
     background: linear-gradient(180deg, #1f1f1f 0%, #1a1a1a 100%);

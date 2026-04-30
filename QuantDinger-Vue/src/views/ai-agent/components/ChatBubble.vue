@@ -1,7 +1,7 @@
 <template>
   <div class="chat-bubble" :class="[message.role, { streaming: message.streaming }]">
     <div class="avatar">
-      <component :is="message.role === 'user' ? UserOutlined : RobotOutlined" />
+      <a-icon :type="message.role === 'user' ? 'user' : 'robot'" />
     </div>
     <div class="bubble-body">
       <div class="bubble-meta">
@@ -12,8 +12,8 @@
       <!-- 工具调用过程 -->
       <div v-if="message.toolEvents && message.toolEvents.length" class="tool-events">
         <div v-for="(ev, i) in message.toolEvents" :key="i" class="tool-event">
-          <CheckCircleOutlined v-if="ev.status === 'done'" class="done" />
-          <LoadingOutlined v-else class="loading" />
+          <a-icon v-if="ev.status === 'done'" type="check-circle" class="done" />
+          <a-icon v-else type="loading" class="loading" />
           <span class="tool-name">{{ ev.display_name || ev.tool }}</span>
         </div>
       </div>
@@ -31,11 +31,9 @@
 
 <script>
 import { computed, defineComponent } from 'vue'
-import { UserOutlined, RobotOutlined, CheckCircleOutlined, LoadingOutlined } from '@ant-design/icons-vue'
 
 export default defineComponent({
   name: 'ChatBubble',
-  components: { UserOutlined, RobotOutlined, CheckCircleOutlined, LoadingOutlined },
   props: {
     message: {
       type: Object,

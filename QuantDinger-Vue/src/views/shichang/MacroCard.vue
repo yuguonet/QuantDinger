@@ -17,9 +17,9 @@
           <svg viewBox="0 0 120 120">
             <circle cx="60" cy="60" r="52" class="ring-bg" />
             <circle cx="60" cy="60" r="52"
-              class="ring-progress"
-              :stroke-dasharray="`${overallScore * 3.267}, 326.7`"
-              :class="getScoreClass(overallScore)"
+                    class="ring-progress"
+                    :stroke-dasharray="`${overallScore * 3.267}, 326.7`"
+                    :class="getScoreClass(overallScore)"
             />
           </svg>
           <div class="score-inner">
@@ -56,7 +56,7 @@
           <div class="macro-score-col">
             <div class="sentiment-bar-wrap">
               <div class="sentiment-bar" :class="getSentimentClass(item.score)"
-                :style="{ width: item.score + '%' }">
+                   :style="{ width: item.score + '%' }">
               </div>
             </div>
             <div class="sentiment-value" :class="getSentimentClass(item.score)">
@@ -118,7 +118,7 @@
                     <tbody>
                       <tr v-for="(row, ri) in getMacroRecords(ind)" :key="ri">
                         <td v-for="col in getMacroColumns(ind)" :key="col"
-                          :class="isNumericCol(col, row) ? getNumericClass(row[col]) : ''">
+                            :class="isNumericCol(col, row) ? getNumericClass(row[col]) : ''">
                           {{ formatTableCell(row[col], col) }}
                         </td>
                       </tr>
@@ -142,7 +142,7 @@
                 <div class="fg-bar-wrap">
                   <div class="fg-bar">
                     <div class="fg-bar-fill" :style="{ width: fgData.composite_score + '%' }"
-                      :class="getFgClass(fgData.composite_score)"></div>
+                         :class="getFgClass(fgData.composite_score)"></div>
                   </div>
                   <div class="fg-bar-labels">
                     <span>极度恐惧</span><span>中性</span><span>极度贪婪</span>
@@ -155,7 +155,7 @@
                   <div class="fg-ind-bar-wrap">
                     <div class="fg-ind-bar">
                       <div class="fg-ind-bar-fill" :class="getFgClass(ind.score)"
-                        :style="{ width: ind.score + '%' }"></div>
+                           :style="{ width: ind.score + '%' }"></div>
                     </div>
                   </div>
                   <div class="fg-ind-score" :class="getFgClass(ind.score)">{{ ind.score }}</div>

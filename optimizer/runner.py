@@ -90,6 +90,7 @@ def _lazy_import():
 # 导入策略模板（原始 + A 股扩展）
 from optimizer.param_space import STRATEGY_TEMPLATES, get_template, list_templates
 from optimizer.strategy_templates_ashare import ASHARE_STRATEGY_TEMPLATES
+from optimizer.strategy_templates_llm import LLM_STRATEGY_TEMPLATES
 from optimizer.ashare_adapter import (
     parse_market_symbol, normalize_symbol,
     get_ashare_commission, get_ashare_initial_capital,
@@ -110,6 +111,7 @@ _BacktestService = None
 ALL_TEMPLATES: Dict[str, Dict[str, Any]] = {}
 ALL_TEMPLATES.update(STRATEGY_TEMPLATES)
 ALL_TEMPLATES.update(ASHARE_STRATEGY_TEMPLATES)
+ALL_TEMPLATES.update(LLM_STRATEGY_TEMPLATES)
 
 
 def get_all_template_keys() -> List[str]:
@@ -125,6 +127,11 @@ def get_original_template_keys() -> List[str]:
 def get_ashare_template_keys() -> List[str]:
     """返回 A 股扩展模板 key"""
     return list(ASHARE_STRATEGY_TEMPLATES.keys())
+
+
+def get_llm_template_keys() -> List[str]:
+    """返回 LLM 生成的模板 key"""
+    return list(LLM_STRATEGY_TEMPLATES.keys())
 
 
 def get_template_unified(key: str) -> dict:
@@ -503,6 +510,12 @@ def main():
   # 多进程并行（4 核同时跑）
   python -m optimizer.runner --all -m CNStock -tf 1D --all-local -j 4
 
+  # 随机抽 100 只股票（防止单一化，seed 可复现）
+  python -m optimizer.runner --all -m CNStock -tf 1D --random-sample 100 --seed 42
+
+  # 每次随机不同样本
+  python -m optimizer.runner --all -m CNStock -tf 1D --random-sample 100
+
   # 加密市场
   python -m optimizer.runner -t ma_crossover -m Crypto -s "BTC/USDT" -tf 4H
 
@@ -514,15 +527,16 @@ stock_list.txt 格式（同 downloader）:
 
 可用模板:
   原始 (7): """ + ", ".join(get_original_template_keys()) + """
-  A股 (10): """ + ", ".join(get_ashare_template_keys()),
+  A股 (10): """ + ", ".join(get_ashare_template_keys()) + """
+  LLM (5): """ + ", ".join(get_llm_template_keys()),
     )
 
     parser.add_argument("--template", "-t", type=str, default=None,
                         help="策略模板名")
     parser.add_argument("--all", action="store_true", help="运行所有模板")
     parser.add_argument("--set", type=str, default="all",
-                        choices=["all", "original", "ashare"],
-                        help="模板集合: all=全部, original=原始7个, ashare=A股10个")
+                        choices=["all", "original", "ashare", "llm"],
+                        help="模板集合: all=全部, original=原始7个, ashare=A股10个, llm=LLM生成5个")
     parser.add_argument("--market", "-m", type=str, default="CNStock",
                         help="市场类型 (CNStock, Crypto, ...)")
     parser.add_argument("--symbol", "-s", type=str, default=None,
@@ -531,6 +545,10 @@ stock_list.txt 格式（同 downloader）:
                         help="股票列表文件（每行一个代码，同 downloader 格式）")
     parser.add_argument("--all-local", action="store_true",
                         help="自动扫描本地仓库中该市场+时间框架下的全部股票")
+    parser.add_argument("--random-sample", type=int, default=0, metavar="N",
+                        help="从本地仓库随机抽取 N 只股票（防止单一化，每次运行样本不同）")
+    parser.add_argument("--seed", type=int, default=None, metavar="S",
+                        help="随机种子（配合 --random-sample 使用，固定抽样结果可复现）")
     parser.add_argument("--timeframe", "-tf", type=str, default="1D",
                         help="时间框架 (1m/5m/15m/30m/1H/4H/1D)")
     parser.add_argument("--start", type=str, default="2024-01-01",
@@ -562,6 +580,10 @@ stock_list.txt 格式（同 downloader）:
         for k in get_ashare_template_keys():
             tpl = ALL_TEMPLATES[k]
             print(f"    - {k:<25} {tpl['name']}")
+        print(f"\n  LLM 生成模板 ({len(get_llm_template_keys())}):")
+        for k in get_llm_template_keys():
+            tpl = ALL_TEMPLATES[k]
+            print(f"    - {k:<25} {tpl['name']}")
         print(f"\n  总计: {len(get_all_template_keys())} 个模板")
         return
 
@@ -591,16 +613,35 @@ stock_list.txt 格式（同 downloader）:
     start_date = datetime.strptime(args.start, "%Y-%m-%d")
     end_date = datetime.strptime(args.end, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
 
-    # 解析多个标的 — 三种来源（优先级: --symbol > --symbols-file > --all-local）
+    # 解析多个标的 — 四种来源（优先级: --symbol > --symbols-file > --random-sample > --all-local）
     symbols_raw = []
     if args.symbol:
         symbols_raw = [s.strip() for s in args.symbol.split(",") if s.strip()]
     elif args.symbols_file:
+        if not os.path.isfile(args.symbols_file):
+            print(f"❌ 股票列表文件不存在: {args.symbols_file}")
+            sys.exit(1)
         with open(args.symbols_file, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#"):
                     symbols_raw.append(line)
+        if not symbols_raw:
+            print(f"❌ 股票列表文件为空: {args.symbols_file}")
+            sys.exit(1)
+    elif args.random_sample > 0:
+        import random as _random
+        from optimizer.data_warehouse.storage import list_local
+        all_local = list_local(args.market, args.timeframe)
+        if not all_local:
+            print(f"❌ 本地仓库中没有 {args.market}/{args.timeframe} 的数据")
+            sys.exit(1)
+        n = min(args.random_sample, len(all_local))
+        if args.seed is not None:
+            _random.seed(args.seed)
+        symbols_raw = _random.sample(all_local, n)
+        print(f"  🎲 从本地仓库 {len(all_local)} 只股票中随机抽取 {n} 只"
+              f"{f' (seed={args.seed})' if args.seed is not None else ''}")
     elif args.all_local:
         from optimizer.data_warehouse.storage import list_local
         symbols_raw = list_local(args.market, args.timeframe)
@@ -620,15 +661,23 @@ stock_list.txt 格式（同 downloader）:
             symbols_raw = ["000001.SZ"]
             print(f"  ℹ️  本地仓库无数据，使用默认标的 000001.SZ")
 
+    # 参数组合校验
+    if args.seed is not None and args.random_sample <= 0:
+        print(f"⚠️  --seed 需要配合 --random-sample 使用，当前将被忽略")
+
     # 选择模板
     if args.all:
         if args.set == "original":
             templates = get_original_template_keys()
         elif args.set == "ashare":
             templates = get_ashare_template_keys()
+        elif args.set == "llm":
+            templates = get_llm_template_keys()
         else:
             templates = get_all_template_keys()
     elif args.template:
+        if args.set != "all":
+            print(f"⚠️  --set {args.set} 在指定 --template 时将被忽略，使用 --all 才生效")
         if args.template not in ALL_TEMPLATES:
             print(f"❌ 未知模板: {args.template}")
             print(f"可用模板: {', '.join(get_all_template_keys())}")
@@ -642,6 +691,10 @@ stock_list.txt 格式（同 downloader）:
     # 解析标的：统一走 parse_market_symbol，兼容新旧格式
     #   "000001.SZ"          + --market CNStock → ("CNStock", "000001.SZ")
     #   "A_SHARE:000001.SZ"  （含冒号）         → ("CNStock", "000001.SZ")
+    if not symbols_raw:
+        print(f"❌ 没有可用的股票标的，请检查参数")
+        sys.exit(1)
+
     resolved = []
     for s in symbols_raw:
         if ":" in s:

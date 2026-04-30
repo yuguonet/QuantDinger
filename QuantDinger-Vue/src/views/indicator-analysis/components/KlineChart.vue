@@ -3136,6 +3136,15 @@ registerOverlay({
       const isDark = chartTheme.value === 'dark'
 
       chartRef.value.setStyles({
+        // 顶层 bars：VOL 等内置副图指标读取 defaultStyles.bars[0] 而非 indicator.bar
+        bars: [{
+          upColor: isDark ? '#ef5350' : '#f5222d',
+          downColor: isDark ? '#0ecb81' : '#52c41a',
+          noChangeColor: theme.borderColor,
+          upBorderColor: isDark ? '#ef5350' : '#f5222d',
+          downBorderColor: isDark ? '#0ecb81' : '#52c41a',
+          noChangeBorderColor: theme.borderColor
+        }],
         grid: {
           show: true,
           horizontal: {
