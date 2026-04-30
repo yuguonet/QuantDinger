@@ -38,6 +38,7 @@ const locale = {
   'indicatorIde.direction': 'Hướng giao dịch',
   'indicatorIde.tuningLaunchTitle': 'Tối ưu thông minh',
   'indicatorIde.tuningLaunchDesc': 'Tự động tìm tham số chiến lược tối ưu để cải thiện lợi nhuận backtest. Chọn phương pháp bên dưới và nhấn Chạy.',
+  'indicatorIde.dragToResize': 'Kéo để điều chỉnh độ rộng bảng trái/phải',
   'indicatorIde.structuredTuneExplain': 'Lưới hoặc lấy mẫu ngẫu nhiên các tham số cắt lỗ, chốt lời và khối lượng vị thế được gắn @strategy trong mã. Kết quả xếp theo lợi nhuận. Phù hợp chiến lược có khoảng tham số rõ ràng.',
   'indicatorIde.aiTuneExplain': 'AI phân tích kết quả backtest và tìm kiếm lặp tổ hợp tham số tốt nhất qua nhiều vòng. Không cần thiết lập khoảng thủ công — lý tưởng để khám phá nhanh.',
   'indicatorIde.runTune': 'Chạy',

@@ -226,5 +226,4 @@ LLM 生成 → 编译 → 回测 → 筛选 → 保留好策略 → 再喂数据
 要我直接写 Step 2 的批量跑批脚本吗？
 
 中证1000跑完了，那 Step 1 基线数据集已经有了。下一步你想：
-
-修改readme的问题,将每一步骤操作指令加进去,readme中错误修改,工作进度只需要标记到哪一步就可以了
+python -m optimizer.runner --all -m CNStock -s "000012.SZ,000019.SZ,000028.SZ,000029.SZ,000030.SZ,000035.SZ,000048.SZ,000049.SZ,000058.SZ,000059.SZ" -tf 1D --start 2023-01-01 --end 2025-12-31 --trials 50 --score composite --no-validate -j 35

@@ -38,6 +38,7 @@ const locale = {
 'indicatorIde.direction': '交易方向',
 'indicatorIde.tuningLaunchTitle': '智能調參',
 'indicatorIde.tuningLaunchDesc': '自動搜尋最佳策略參數以提升回測報酬。選擇下方調參方式後點擊執行。',
+  'indicatorIde.dragToResize': '拖動調整左右面板寬度',
 'indicatorIde.structuredTuneExplain': '對程式碼中以 @strategy 標註的停損、停利、倉位等參數進行網格或隨機採樣，批量回測後依報酬排序。最適合參數範圍明確的策略。',
 'indicatorIde.aiTuneExplain': 'AI 自動分析回測結果，多輪迭代尋找最佳參數組合。無需手動設定範圍，適合快速探索。',
 'indicatorIde.runTune': '執行',

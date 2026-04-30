@@ -74,9 +74,11 @@
         />
       </div>
 
-      <!-- 拖拽调整左右比例 -->
-      <div class="ide-lr-resize-handle" @mousedown="startResizeLeftRight">
-        <span class="ide-lr-resize-handle-dots"></span>
+      <!-- 拖拽调整左右比例（仅顶部手柄可拖拽） -->
+      <div class="ide-lr-resize-handle">
+        <span class="ide-lr-resize-handle-grip" @mousedown="startResizeLeftRight" :title="$t('indicatorIde.dragToResize')">
+          <span class="ide-lr-resize-handle-dots"></span>
+        </span>
       </div>
 
       <!-- Right panel (chart/code/AI tabs + results) -->
@@ -465,7 +467,7 @@
                   <div class="ide-tuning-launch-icon"><a-icon type="experiment" /></div>
                   <div>
                     <div class="ide-tuning-launch-title">{{ $t('indicatorIde.tuningLaunchTitle') }}</div>
-                    <div class="ide-tuning-launch-subtitle">{{ $t('indicatorIde.tuningLaunchDesc') }}</div>
+                    <div class="ide-tuning-launch-subtitle" :title="$t('indicatorIde.tuningLaunchDesc')"></div>
                   </div>
                 </div>
 
@@ -475,7 +477,7 @@
                       <a-icon type="deployment-unit" class="ide-tuning-method-icon ide-tuning-method-icon--grid" />
                       <span class="ide-tuning-method-name">{{ $t('indicatorIde.runStructuredTune') }}</span>
                     </div>
-                    <div class="ide-tuning-method-desc">{{ $t('indicatorIde.structuredTuneExplain') }}</div>
+                    <div class="ide-tuning-method-desc" :title="$t('indicatorIde.structuredTuneExplain')"></div>
                     <div class="ide-tuning-method-actions">
                       <a-radio-group v-model="structuredTuneMethod" size="small">
                         <a-radio-button value="grid">{{ $t('indicatorIde.structuredTuneGrid') }}</a-radio-button>
@@ -499,7 +501,7 @@
                       <span class="ide-tuning-method-name">{{ $t('indicatorIde.runAiExperiment') }}</span>
                       <a-tag color="blue" size="small" style="margin-left: auto;">AI</a-tag>
                     </div>
-                    <div class="ide-tuning-method-desc">{{ $t('indicatorIde.aiTuneExplain') }}</div>
+                    <div class="ide-tuning-method-desc" :title="$t('indicatorIde.aiTuneExplain')"></div>
                     <div class="ide-tuning-method-actions">
                       <a-button
                         type="primary"
@@ -3969,21 +3971,30 @@ export default {
 .ide-lr-resize-handle {
   flex: 0 0 10px;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: center;
-  cursor: col-resize;
+  padding-top: 8px;
   background: #f0f0f0;
   border-left: 1px solid #e8e8e8;
   border-right: 1px solid #e8e8e8;
-  transition: background 0.15s;
   flex-shrink: 0;
+}
+.ide-lr-resize-handle-grip {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 24px;
+  cursor: col-resize;
+  border-radius: 2px;
+  transition: background 0.15s;
   &:hover { background: #e2e2e2; }
   &:active { background: #d4d4d4; }
 }
 .ide-lr-resize-handle-dots {
   display: block;
   width: 4px;
-  height: 28px;
+  height: 18px;
   border-radius: 2px;
   background: #c0c0c0;
 }
@@ -4851,6 +4862,9 @@ export default {
   color: #8c8c8c;
   margin-top: 2px;
   line-height: 1.5;
+  height: 0;
+  overflow: hidden;
+  margin: 0;
 }
 .ide-tuning-method-cards {
   display: flex;
@@ -4913,7 +4927,9 @@ export default {
   font-size: 11px;
   color: #8c8c8c;
   line-height: 1.6;
-  margin-bottom: 10px;
+  height: 0;
+  overflow: hidden;
+  margin: 0;
 }
 .ide-tuning-method-actions {
   display: flex;
@@ -5466,6 +5482,8 @@ export default {
     background: #1f1f1f;
     border-left-color: #303030;
     border-right-color: #303030;
+  }
+  .ide-lr-resize-handle-grip {
     &:hover { background: #2a2a2a; }
     &:active { background: #333; }
   }

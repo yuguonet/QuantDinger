@@ -23,6 +23,7 @@ const locale = {
   'indicatorIde.direction': '거래 방향',
   'indicatorIde.tuningLaunchTitle': '스마트 튜닝',
   'indicatorIde.tuningLaunchDesc': '최적의 전략 파라미터를 자동으로 탐색하여 백테스트 수익을 개선합니다. 아래에서 방식을 선택한 뒤 실행을 클릭하세요.',
+  'indicatorIde.dragToResize': '드래그하여 좌우 패널 너비 조절',
   'indicatorIde.structuredTuneExplain': '코드에서 @strategy로 표시된 손절, 익절, 포지션 크기 파라미터를 그리드 또는 무작위 샘플링합니다. 수익률 순으로 정렬됩니다. 파라미터 범위가 잘 정의된 전략에 가장 적합합니다.',
   'indicatorIde.aiTuneExplain': 'AI가 백테스트 결과를 분석하고 여러 라운드에 걸쳐 최적의 파라미터 조합을 반복 탐색합니다. 수동으로 범위를 설정할 필요가 없어 빠른 탐색에 적합합니다.',
   'indicatorIde.runTune': '실행',

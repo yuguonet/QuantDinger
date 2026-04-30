@@ -4054,6 +4054,7 @@ const locale = {
   'indicatorIde.tuningMovedToTabHint': '网格/随机扫参与「运行智能调参」已移至右侧「智能调参」标签页。',
   'indicatorIde.tuningLaunchTitle': '智能调参',
   'indicatorIde.tuningLaunchDesc': '自动搜索最优策略参数，提升回测收益。选择下方调参方式后点击运行。',
+  'indicatorIde.dragToResize': '拖动调整左右面板宽度',
   'indicatorIde.structuredTuneExplain': '对代码中 @strategy 标注的止盈、止损、仓位等参数进行网格或随机采样，批量回测后按收益排序。适合参数范围明确的策略。',
   'indicatorIde.aiTuneExplain': 'AI 自动分析回测结果，多轮迭代寻找最佳参数组合。无需手动设定范围，适合快速探索。',
   'indicatorIde.runTune': '运行',

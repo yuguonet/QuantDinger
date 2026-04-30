@@ -24,6 +24,7 @@ const locale = {
   'indicatorIde.direction': '取引方向',
   'indicatorIde.tuningLaunchTitle': 'スマートチューニング',
   'indicatorIde.tuningLaunchDesc': '最適なストラテジーパラメータを自動検索し、バックテストのリターンを改善します。下の方式を選び、「実行」をクリックしてください。',
+  'indicatorIde.dragToResize': 'ドラッグして左右パネルの幅を調整',
   'indicatorIde.structuredTuneExplain': 'コード内の @strategy で注釈したストップロス、テイクプロフィット、ポジションサイズなどをグリッドまたはランダムサンプリングします。リターン順にランキングされます。パラメータ範囲が明確なストラテジーに最適です。',
   'indicatorIde.aiTuneExplain': 'AI がバックテスト結果を分析し、複数ラウンドで最良のパラメータ組み合わせを反復的に探索します。手動での範囲設定は不要で、迅速な探索に適しています。',
   'indicatorIde.runTune': '実行',

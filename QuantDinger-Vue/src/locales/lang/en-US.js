@@ -4147,6 +4147,7 @@ const locale = {
   'indicatorIde.tuningMovedToTabHint': 'Grid/random scan and Smart Tuning are in the Smart Tuning tab on the right.',
   'indicatorIde.tuningLaunchTitle': 'Smart Tuning',
   'indicatorIde.tuningLaunchDesc': 'Automatically search for optimal strategy parameters to improve backtest returns. Choose a method below and click Run.',
+  'indicatorIde.dragToResize': 'Drag to resize left/right panels',
   'indicatorIde.structuredTuneExplain': 'Grid or random sampling of stop-loss, take-profit, and position-size parameters annotated with @strategy in your code. Results are ranked by return. Best for strategies with well-defined parameter ranges.',
   'indicatorIde.aiTuneExplain': 'AI analyzes backtest results and iteratively searches for the best parameter combination across multiple rounds. No manual range setup needed — ideal for quick exploration.',
   'indicatorIde.runTune': 'Run',

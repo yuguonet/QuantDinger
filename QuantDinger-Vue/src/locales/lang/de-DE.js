@@ -24,6 +24,7 @@ const locale = {
   'indicatorIde.direction': 'Handelsrichtung',
   'indicatorIde.tuningLaunchTitle': 'Intelligentes Tuning',
   'indicatorIde.tuningLaunchDesc': 'Sucht automatisch optimale Strategieparameter, um die Backtest-Rendite zu verbessern. Wählen Sie unten eine Methode und klicken Sie auf Ausführen.',
+  'indicatorIde.dragToResize': 'Ziehen, um die Breite der linken/rechten Panels anzupassen',
   'indicatorIde.structuredTuneExplain': 'Raster- oder Zufallsstichprobe von Stop-Loss-, Take-Profit- und Positionsgrößen-Parametern, die im Code mit @strategy markiert sind. Ergebnisse werden nach Rendite sortiert. Am besten für Strategien mit klar definierten Parameterbereichen.',
   'indicatorIde.aiTuneExplain': 'Die KI wertet Backtestergebnisse aus und sucht über mehrere Runden iterativ die beste Parameterkombination. Keine manuelle Bereichsdefinition nötig — ideal zur schnellen Erkundung.',
   'indicatorIde.runTune': 'Ausführen',

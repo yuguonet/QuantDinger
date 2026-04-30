@@ -24,6 +24,7 @@ const locale = {
   'indicatorIde.direction': 'Sens du trade',
   'indicatorIde.tuningLaunchTitle': 'Réglage intelligent',
   'indicatorIde.tuningLaunchDesc': 'Recherche automatiquement les paramètres de stratégie optimaux pour améliorer le rendement du backtest. Choisissez une méthode ci-dessous et cliquez sur Exécuter.',
+  'indicatorIde.dragToResize': 'Glisser pour ajuster la largeur des panneaux gauche/droite',
   'indicatorIde.structuredTuneExplain': 'Échantillonnage par grille ou aléatoire des paramètres stop-loss, take-profit et taille de position annotés avec @strategy dans votre code. Les résultats sont classés par rendement. Idéal pour les stratégies aux plages de paramètres bien définies.',
   'indicatorIde.aiTuneExplain': 'L’IA analyse les résultats du backtest et recherche de façon itérative la meilleure combinaison de paramètres sur plusieurs tours. Pas de plage manuelle — idéal pour explorer rapidement.',
   'indicatorIde.runTune': 'Exécuter',
