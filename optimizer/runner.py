@@ -82,7 +82,7 @@ def _lazy_import():
     """延迟导入回测相关模块，只在实际运行时才加载"""
     global _StrategyCompiler, _BacktestService
     if '_StrategyCompiler' not in globals() or globals().get('_StrategyCompiler') is None:
-        _sc_mod = _im('app.services.strategy_compiler')
+        _sc_mod = _im('optimizer.strategy_compiler')
         _StrategyCompiler = _sc_mod.StrategyCompiler
         _bt_mod = _im('app.services.backtest')
         _BacktestService = _bt_mod.BacktestService

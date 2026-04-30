@@ -243,11 +243,12 @@ df['atr_{period}'] = df['tr_atr_{period}'].ewm(alpha=1/{period}, adjust=False).m
 # ATR Channel ({period}, {multiplier})
 df['tr_atr_ch_{period}'] = np.maximum(df['high'] - df['low'], np.maximum(abs(df['high'] - df['close'].shift(1)), abs(df['low'] - df['close'].shift(1))))
 df['atr_ch_{period}'] = df['tr_atr_ch_{period}'].ewm(alpha=1/{period}, adjust=False).mean()
-df['atr_ch_{period}_upper'] = df['close'] + ({multiplier} * df['atr_ch_{period}'])
-df['atr_ch_{period}_lower'] = df['close'] - ({multiplier} * df['atr_ch_{period}'])
-# 用滚动高点作为通道上轨（海龟变体）
-df['atr_ch_{period}_upper'] = df['high'].rolling(window={period}).max()
-df['atr_ch_{period}_lower'] = df['low'].rolling(window={period}).min()
+# Donchian 风格通道：滚动高/低点
+df['atr_ch_{period}_high'] = df['high'].rolling(window={period}).max()
+df['atr_ch_{period}_low'] = df['low'].rolling(window={period}).min()
+# ATR 扩展通道：在 Donchian 基础上加减 ATR 偏移
+df['atr_ch_{period}_upper'] = df['atr_ch_{period}_high'] + ({multiplier} * df['atr_ch_{period}'])
+df['atr_ch_{period}_lower'] = df['atr_ch_{period}_low'] - ({multiplier} * df['atr_ch_{period}'])
 """
                     calculated.add(key)
 
@@ -304,7 +305,13 @@ bb_std = df['close'].rolling(window={period}).std()
 df['bbw_upper_{period}'] = bb_sma + ({std_dev} * bb_std)
 df['bbw_lower_{period}'] = bb_sma - ({std_dev} * bb_std)
 df['bbw_{period}'] = (df['bbw_upper_{period}'] - df['bbw_lower_{period}']) / bb_sma.replace(0, np.nan)
-df['bbw_{period}_pctile'] = df['bbw_{period}'].rolling(window=120).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1] * 100, raw=False)
+# 百分位排名：rolling 内计算当前值在窗口内的百分位
+_bbw_win = min(120, max(len(df) - 1, 20))
+def _pct_rank(x):
+    if len(x) < 20:
+        return np.nan
+    return (np.sum(x[:-1] < x[-1]) + 0.5 * np.sum(x[:-1] == x[-1])) / (len(x) - 1) * 100
+df['bbw_{period}_pctile'] = df['bbw_{period}'].rolling(window=_bbw_win, min_periods=20).apply(_pct_rank, raw=True)
 """
                     calculated.add(key)
 
@@ -581,11 +588,13 @@ df['raw_sell'] = False
             elif ind == 'price_volume_divergence':
                 operator = rule.get('operator', 'bullish_divergence')
                 pvd_col = "df['pvd_bullish']"
+                lookback = params.get('lookback', 20)
+                vol_ma = params.get('volume_ma', 20)
                 
                 if operator == 'bullish_divergence':
                     conditions_buy.append(f"({pvd_col})")
-                    # 卖出: 量价背离的反面 — 价格创新高但量缩
-                    conditions_sell.append(f"(df['close'] > df['close'].rolling(window=20).max().shift(1)) & (df['volume'] < df['vol_ma_20'])")
+                    # 卖出: 价格创新高但量缩（用参数中的 volume_ma，不硬编码 20）
+                    conditions_sell.append(f"(df['close'] > df['close'].rolling(window={lookback}).max().shift(1)) & (df['volume'] < df['vol_ma_{vol_ma}'])")
 
         if conditions_buy:
             code += f"\ndf['raw_buy'] = {' & '.join(conditions_buy)}\n"
