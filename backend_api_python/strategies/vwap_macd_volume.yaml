@@ -1,0 +1,36 @@
+# VWAP + MACD 金叉 + 放量策略
+name: vwap_macd_volume
+display_name: VWAP+MACD+放量
+description: 三重确认策略——VWAP均值回归+MACD动量转向+成交量放大，适合捕捉反转启动点。
+category: reversal
+core_rules: [2, 3, 5]
+required_tools:
+  - get_daily_history
+  - get_realtime_quote
+  - analyze_trend
+
+instructions: |
+  **VWAP+MACD+放量策略（Triple Confirmation Reversal）**
+
+  核心逻辑：价格偏离VWAP（超跌）+ MACD金叉（动量转向）+ 放量（资金入场）= 三重反转确认。
+
+  ## 信号判定
+
+  ### 买入条件（全部满足）
+  1. **VWAP偏离**：价格 < VWAP × (1 - 1.5%~3.0%)
+  2. **MACD金叉**：MACD线上穿信号线
+  3. **放量**：成交量 > 15日均量 × 1.3倍
+
+  ### 卖出条件
+  1. 价格回到VWAP上方
+
+  ### 止损
+  - 2.5% ~ 4.5%
+
+  ## 评分调整
+  - 三重确认：sentiment_score +12
+  - 在 buy_reason 中注明"VWAP+MACD+放量三重确认"
+
+  ## 适用场景
+  - 下跌末期的反转启动
+  - 需要三个条件同时满足，信号较少但质量高

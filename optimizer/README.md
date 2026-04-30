@@ -164,3 +164,64 @@ Phase 1 结果矩阵 (phase1_patterns.json)
 **目标**：用 Phase 1/2 的回测数据作为 LLM 上下文，生成高质量的 ScriptStrategy
 
 **产出**：高质量的 ScriptStrategy（非模板化，完全由 LLM 生成代码）
+
+
+### 特定策略
+完全可以，这是一个很好的思路。有两种实现方式：
+
+
+方式 1：筛选特定股票 + 特定时间段回测
+
+在现有框架上，只需要：
+
+
+1.筛选目标股票 — 找出在某时间段内涨停过的股票
+2.限定回测窗口 — 用 --start--end 只跑那个时间段
+3.定制评分函数 — 给涨停捕获更高权重
+
+powershell
+powershell
+# 比如只跑 2024年9月（A股大反弹期间）
+python -m optimizer.runner -t vwap_rsi_confirm -m CNStock -s "000001.SZ,000002.SZ" -tf 1D --start 2024-09-01 --end 2024-09-30 --trials 200
+
+方式 2：写一个涨停板专用策略模板
+
+更直接的做法——专门设计一个抓涨停的模板。我来分析一下涨停板的特征：## 回答
+
+
+可以，而且现有框架已经支持。 有两种玩法：
+
+
+玩法 1：时间段限定训练
+
+直接用 --start--end 跑特定行情区间：
+
+
+powershell
+powershell
+# 2024年9月大反弹期间训练
+python -m optimizer.runner -t vwap_rsi_confirm -m CNStock --all-local -tf 1D --start 2024-09-01 --end 2024-09-30 --trials 200 -j 35
+
+# 2025年1月震荡期训练
+python -m optimizer.runner -t vwap_rsi_confirm -m CNStock --all-local -tf 1D --start 2025-01-01 --end 2025-01-31 --trials 200 -j 35
+
+然后对不同时间段的最优参数做集合分析——哪些参数在多个行情周期都有效，哪些只在特定行情有效。
+
+
+玩法 2：涨停板专用策略模板
+
+从数据看，收益 >100% 的 792 组回测有明确规律：
+
+
+低频高弹性：平均 6.4 笔交易，单笔收益极高
+模板偏好：rsi_volume_divergence(240) 和 macd_vol_divergence(195) 最多，因为它们捕捉反转
+科创板/创业板占比高（688xxx、300xxx），因为 20% 涨跌幅
+
+要不要我基于这些数据设计一个涨停板专用模板？思路是：
+
+
+1.筛选有过涨停历史的股票作为训练集
+2.用涨停日作为信号触发点训练参数
+3.评分函数改为以捕获大涨为核心（而非夏普比率）
+
+你想做哪个？

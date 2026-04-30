@@ -1,0 +1,2594 @@
+{
+  "generated_at": "2026-04-30T18:50:00",
+  "description": "WF 验证通过 + 回测质量筛选的精选策略清单",
+  "criteria": {
+    "wf_overfitting_ratio": "-5 < x < 0.3",
+    "wf_test_score": "> 3.0",
+    "wf_consistency": "> 0.85",
+    "backtest_sharpe": "> 0",
+    "backtest_winRate": ">= 30%",
+    "backtest_totalTrades": ">= 5"
+  },
+  "total_elite": 81,
+  "multi_template_stocks": 7,
+  "strategies": [
+    {
+      "symbol": "CNStock:688631.SH",
+      "market": "CNStock",
+      "template": "vwap_volume_confirm",
+      "params": {
+        "vwap_dev_pct": 2.1,
+        "vol_ma_period": 16,
+        "vol_ratio": 1.4,
+        "use_rsi_filter": false,
+        "rsi_period": 17,
+        "rsi_level": 33,
+        "stop_loss_pct": 4.0
+      },
+      "backtest": {
+        "score": 3.7594,
+        "metrics": {
+          "sharpeRatio": 0.9,
+          "totalReturn": 28.65,
+          "winRate": 60.0,
+          "maxDrawdown": -9.97,
+          "profitFactor": 8.75,
+          "totalTrades": 5,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.7787,
+        "overfitting_ratio": -0.5977,
+        "consistency": 0.9927
+      }
+    },
+    {
+      "symbol": "CNStock:002967.SZ",
+      "market": "CNStock",
+      "template": "triple_rsi_momentum",
+      "params": {
+        "rsi_fast": 9,
+        "rsi_mid": 18,
+        "rsi_slow": 20,
+        "rsi_entry": 31,
+        "rsi_trend_mid": 45,
+        "rsi_trend_slow": 43,
+        "stop_loss_pct": 3.0
+      },
+      "backtest": {
+        "score": 4.3682,
+        "metrics": {
+          "sharpeRatio": 1.07,
+          "totalReturn": 71.8,
+          "winRate": 80.0,
+          "maxDrawdown": -17.01,
+          "profitFactor": 16.19,
+          "totalTrades": 5,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.5603,
+        "overfitting_ratio": -2.3132,
+        "consistency": 0.9912
+      }
+    },
+    {
+      "symbol": "CNStock:601058.SH",
+      "market": "CNStock",
+      "template": "vwap_volume_confirm",
+      "params": {
+        "vwap_dev_pct": 2.3,
+        "vol_ma_period": 17,
+        "vol_ratio": 1.5,
+        "use_rsi_filter": false,
+        "rsi_period": 15,
+        "rsi_level": 32,
+        "stop_loss_pct": 4.0
+      },
+      "backtest": {
+        "score": 3.728,
+        "metrics": {
+          "sharpeRatio": 1.1,
+          "totalReturn": 29.34,
+          "winRate": 57.14,
+          "maxDrawdown": -7.26,
+          "profitFactor": 5.15,
+          "totalTrades": 7,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.1265,
+        "overfitting_ratio": -0.5257,
+        "consistency": 0.9817
+      }
+    },
+    {
+      "symbol": "CNStock:301363.SZ",
+      "market": "CNStock",
+      "template": "rsi_volume_divergence",
+      "params": {
+        "rsi_period": 10,
+        "rsi_oversold": 32,
+        "lookback_period": 18,
+        "price_ma_period": 11,
+        "vol_ma_period": 11,
+        "use_ma_filter": false,
+        "ma_period": 60,
+        "stop_loss_pct": 4.0
+      },
+      "backtest": {
+        "score": 4.662,
+        "metrics": {
+          "sharpeRatio": 1.51,
+          "totalReturn": 149.04,
+          "winRate": 75.0,
+          "maxDrawdown": -27.9,
+          "profitFactor": 16.08,
+          "totalTrades": 8,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.7883,
+        "overfitting_ratio": -0.7453,
+        "consistency": 0.9791
+      }
+    },
+    {
+      "symbol": "CNStock:300031.SZ",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 2.4,
+        "bb_period": 19,
+        "bb_std": 1.8,
+        "use_squeeze_filter": true,
+        "squeeze_percentile": 17,
+        "stop_loss_pct": 2.0
+      },
+      "backtest": {
+        "score": 3.6306,
+        "metrics": {
+          "sharpeRatio": 0.88,
+          "totalReturn": 57.09,
+          "winRate": 40.0,
+          "maxDrawdown": -23.93,
+          "profitFactor": 7.71,
+          "totalTrades": 5,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.5118,
+        "overfitting_ratio": -3.6427,
+        "consistency": 0.9765
+      }
+    },
+    {
+      "symbol": "CNStock:603103.SH",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 1.7,
+        "bb_period": 27,
+        "bb_std": 1.8,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 22,
+        "stop_loss_pct": 3.0
+      },
+      "backtest": {
+        "score": 2.5256,
+        "metrics": {
+          "sharpeRatio": 0.59,
+          "totalReturn": 29.43,
+          "winRate": 33.33,
+          "maxDrawdown": -39.95,
+          "profitFactor": 2.06,
+          "totalTrades": 12,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.7233,
+        "overfitting_ratio": -0.5094,
+        "consistency": 0.9646
+      }
+    },
+    {
+      "symbol": "CNStock:603599.SH",
+      "market": "CNStock",
+      "template": "macd_vol_divergence",
+      "params": {
+        "macd_fast": 12,
+        "macd_slow": 23,
+        "macd_signal": 11,
+        "lookback_period": 22,
+        "price_ma_period": 9,
+        "vol_ma_period": 20,
+        "use_rsi_confirm": true,
+        "rsi_period": 14,
+        "rsi_level": 38,
+        "stop_loss_pct": 3.5
+      },
+      "backtest": {
+        "score": 2.3706,
+        "metrics": {
+          "sharpeRatio": 0.6,
+          "totalReturn": 29.84,
+          "winRate": 36.36,
+          "maxDrawdown": -20.17,
+          "profitFactor": 2.5,
+          "totalTrades": 11,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.0179,
+        "overfitting_ratio": -0.5869,
+        "consistency": 0.961
+      }
+    },
+    {
+      "symbol": "CNStock:300747.SZ",
+      "market": "CNStock",
+      "template": "vwap_volume_confirm",
+      "params": {
+        "vwap_dev_pct": 1.8,
+        "vol_ma_period": 13,
+        "vol_ratio": 1.3,
+        "use_rsi_filter": true,
+        "rsi_period": 18,
+        "rsi_level": 31,
+        "stop_loss_pct": 3.0
+      },
+      "backtest": {
+        "score": 3.982,
+        "metrics": {
+          "sharpeRatio": 1.53,
+          "totalReturn": 103.46,
+          "winRate": 50.0,
+          "maxDrawdown": -18.5,
+          "profitFactor": 13.39,
+          "totalTrades": 6,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.6919,
+        "overfitting_ratio": -0.5933,
+        "consistency": 0.9602
+      }
+    },
+    {
+      "symbol": "CNStock:002371.SZ",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 1.5,
+        "bb_period": 12,
+        "bb_std": 1.8,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 12,
+        "stop_loss_pct": 2.5
+      },
+      "backtest": {
+        "score": 4.3068,
+        "metrics": {
+          "sharpeRatio": 2.17,
+          "totalReturn": 123.88,
+          "winRate": 63.64,
+          "maxDrawdown": -8.3,
+          "profitFactor": 6.63,
+          "totalTrades": 11,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.9347,
+        "overfitting_ratio": -0.0086,
+        "consistency": 0.9598
+      }
+    },
+    {
+      "symbol": "CNStock:002371.SZ",
+      "market": "CNStock",
+      "template": "vwap_volume_confirm",
+      "params": {
+        "vwap_dev_pct": 2.0,
+        "vol_ma_period": 15,
+        "vol_ratio": 1.3,
+        "use_rsi_filter": false,
+        "rsi_period": 11,
+        "rsi_level": 33,
+        "stop_loss_pct": 3.5
+      },
+      "backtest": {
+        "score": 4.3724,
+        "metrics": {
+          "sharpeRatio": 1.2,
+          "totalReturn": 52.9,
+          "winRate": 83.33,
+          "maxDrawdown": -11.29,
+          "profitFactor": 14.41,
+          "totalTrades": 6,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.9627,
+        "overfitting_ratio": -0.1727,
+        "consistency": 0.9591
+      }
+    },
+    {
+      "symbol": "CNStock:002747.SZ",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 3.0,
+        "bb_period": 21,
+        "bb_std": 2.2,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 14,
+        "stop_loss_pct": 2.5
+      },
+      "backtest": {
+        "score": 4.527,
+        "metrics": {
+          "sharpeRatio": 1.85,
+          "totalReturn": 115.17,
+          "winRate": 75.0,
+          "maxDrawdown": -14.35,
+          "profitFactor": 8.35,
+          "totalTrades": 8,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.9035,
+        "overfitting_ratio": -0.5081,
+        "consistency": 0.9532
+      }
+    },
+    {
+      "symbol": "CNStock:002145.SZ",
+      "market": "CNStock",
+      "template": "rsi_volume_divergence",
+      "params": {
+        "rsi_period": 10,
+        "rsi_oversold": 30,
+        "lookback_period": 17,
+        "price_ma_period": 13,
+        "vol_ma_period": 13,
+        "use_ma_filter": false,
+        "ma_period": 51,
+        "stop_loss_pct": 3.5
+      },
+      "backtest": {
+        "score": 3.0742,
+        "metrics": {
+          "sharpeRatio": 0.85,
+          "totalReturn": 56.97,
+          "winRate": 33.33,
+          "maxDrawdown": -18.98,
+          "profitFactor": 4.22,
+          "totalTrades": 6,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.3447,
+        "overfitting_ratio": -0.2461,
+        "consistency": 0.9517
+      }
+    },
+    {
+      "symbol": "CNStock:688502.SH",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 3.4,
+        "bb_period": 17,
+        "bb_std": 2.1,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 16,
+        "stop_loss_pct": 3.5
+      },
+      "backtest": {
+        "score": 3.9014,
+        "metrics": {
+          "sharpeRatio": 1.5,
+          "totalReturn": 92.79,
+          "winRate": 50.0,
+          "maxDrawdown": -15.07,
+          "profitFactor": 5.7,
+          "totalTrades": 8,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 5.0749,
+        "overfitting_ratio": -3.9064,
+        "consistency": 0.951
+      }
+    },
+    {
+      "symbol": "CNStock:601606.SH",
+      "market": "CNStock",
+      "template": "macd_vol_divergence",
+      "params": {
+        "macd_fast": 14,
+        "macd_slow": 23,
+        "macd_signal": 10,
+        "lookback_period": 17,
+        "price_ma_period": 13,
+        "vol_ma_period": 14,
+        "use_rsi_confirm": true,
+        "rsi_period": 14,
+        "rsi_level": 31,
+        "stop_loss_pct": 3.0
+      },
+      "backtest": {
+        "score": 4.8182,
+        "metrics": {
+          "sharpeRatio": 1.94,
+          "totalReturn": 454.76,
+          "winRate": 60.0,
+          "maxDrawdown": -42.11,
+          "profitFactor": 30.53,
+          "totalTrades": 5,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.6899,
+        "overfitting_ratio": -0.1668,
+        "consistency": 0.9487
+      }
+    },
+    {
+      "symbol": "CNStock:688091.SH",
+      "market": "CNStock",
+      "template": "vwap_volume_confirm",
+      "params": {
+        "vwap_dev_pct": 1.5,
+        "vol_ma_period": 18,
+        "vol_ratio": 1.3,
+        "use_rsi_filter": false,
+        "rsi_period": 13,
+        "rsi_level": 38,
+        "stop_loss_pct": 2.0
+      },
+      "backtest": {
+        "score": 2.7222,
+        "metrics": {
+          "sharpeRatio": 1.02,
+          "totalReturn": 52.03,
+          "winRate": 50.0,
+          "maxDrawdown": -12.11,
+          "profitFactor": 2.68,
+          "totalTrades": 18,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 5.248,
+        "overfitting_ratio": -3.4842,
+        "consistency": 0.9484
+      }
+    },
+    {
+      "symbol": "CNStock:600480.SH",
+      "market": "CNStock",
+      "template": "vwap_volume_confirm",
+      "params": {
+        "vwap_dev_pct": 2.0,
+        "vol_ma_period": 15,
+        "vol_ratio": 1.3,
+        "use_rsi_filter": false,
+        "rsi_period": 11,
+        "rsi_level": 33,
+        "stop_loss_pct": 3.5
+      },
+      "backtest": {
+        "score": 4.5018,
+        "metrics": {
+          "sharpeRatio": 1.81,
+          "totalReturn": 62.59,
+          "winRate": 83.33,
+          "maxDrawdown": -5.56,
+          "profitFactor": 19.41,
+          "totalTrades": 6,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 5.0628,
+        "overfitting_ratio": -0.0648,
+        "consistency": 0.948
+      }
+    },
+    {
+      "symbol": "CNStock:000848.SZ",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 2.4,
+        "bb_period": 13,
+        "bb_std": 2.1,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 21,
+        "stop_loss_pct": 2.0
+      },
+      "backtest": {
+        "score": 4.3042,
+        "metrics": {
+          "sharpeRatio": 1.41,
+          "totalReturn": 52.81,
+          "winRate": 71.43,
+          "maxDrawdown": -15.58,
+          "profitFactor": 7.88,
+          "totalTrades": 7,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 5.1966,
+        "overfitting_ratio": -1.1325,
+        "consistency": 0.9478
+      }
+    },
+    {
+      "symbol": "CNStock:688552.SH",
+      "market": "CNStock",
+      "template": "vwap_volume_confirm",
+      "params": {
+        "vwap_dev_pct": 2.0,
+        "vol_ma_period": 15,
+        "vol_ratio": 1.3,
+        "use_rsi_filter": false,
+        "rsi_period": 11,
+        "rsi_level": 33,
+        "stop_loss_pct": 3.5
+      },
+      "backtest": {
+        "score": 1.989,
+        "metrics": {
+          "sharpeRatio": 0.17,
+          "totalReturn": 6.72,
+          "winRate": 50.0,
+          "maxDrawdown": -14.05,
+          "profitFactor": 1.6,
+          "totalTrades": 6,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.2033,
+        "overfitting_ratio": -0.48,
+        "consistency": 0.9451
+      }
+    },
+    {
+      "symbol": "CNStock:002123.SZ",
+      "market": "CNStock",
+      "template": "vwap_volume_confirm",
+      "params": {
+        "vwap_dev_pct": 2.0,
+        "vol_ma_period": 15,
+        "vol_ratio": 1.3,
+        "use_rsi_filter": false,
+        "rsi_period": 11,
+        "rsi_level": 33,
+        "stop_loss_pct": 3.5
+      },
+      "backtest": {
+        "score": 2.91,
+        "metrics": {
+          "sharpeRatio": 0.88,
+          "totalReturn": 32.3,
+          "winRate": 50.0,
+          "maxDrawdown": -9.1,
+          "profitFactor": 3.44,
+          "totalTrades": 8,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.9261,
+        "overfitting_ratio": -0.9837,
+        "consistency": 0.944
+      }
+    },
+    {
+      "symbol": "CNStock:600866.SH",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 1.5,
+        "bb_period": 19,
+        "bb_std": 1.9,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 13,
+        "stop_loss_pct": 3.0
+      },
+      "backtest": {
+        "score": 3.9962,
+        "metrics": {
+          "sharpeRatio": 1.39,
+          "totalReturn": 72.27,
+          "winRate": 57.14,
+          "maxDrawdown": -15.47,
+          "profitFactor": 4.97,
+          "totalTrades": 7,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.6219,
+        "overfitting_ratio": -0.1063,
+        "consistency": 0.9431
+      }
+    },
+    {
+      "symbol": "CNStock:000100.SZ",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 1.8,
+        "bb_period": 20,
+        "bb_std": 2.2,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 24,
+        "stop_loss_pct": 2.5
+      },
+      "backtest": {
+        "score": 3.6028,
+        "metrics": {
+          "sharpeRatio": 1.15,
+          "totalReturn": 42.87,
+          "winRate": 44.44,
+          "maxDrawdown": -12.7,
+          "profitFactor": 5.15,
+          "totalTrades": 9,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.8243,
+        "overfitting_ratio": -1.7984,
+        "consistency": 0.9409
+      }
+    },
+    {
+      "symbol": "CNStock:301500.SZ",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 3.0,
+        "bb_period": 21,
+        "bb_std": 2.2,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 14,
+        "stop_loss_pct": 2.5
+      },
+      "backtest": {
+        "score": 4.8606,
+        "metrics": {
+          "sharpeRatio": 1.79,
+          "totalReturn": 68.63,
+          "winRate": 100.0,
+          "maxDrawdown": -7.23,
+          "profitFactor": 69790.78,
+          "totalTrades": 6,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.4511,
+        "overfitting_ratio": 0.0323,
+        "consistency": 0.9409
+      }
+    },
+    {
+      "symbol": "CNStock:600210.SH",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 1.8,
+        "bb_period": 20,
+        "bb_std": 2.2,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 24,
+        "stop_loss_pct": 2.5
+      },
+      "backtest": {
+        "score": 3.8094,
+        "metrics": {
+          "sharpeRatio": 1.13,
+          "totalReturn": 37.37,
+          "winRate": 60.0,
+          "maxDrawdown": -7.87,
+          "profitFactor": 5.49,
+          "totalTrades": 5,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.2704,
+        "overfitting_ratio": -0.4481,
+        "consistency": 0.9384
+      }
+    },
+    {
+      "symbol": "CNStock:600009.SH",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 3.0,
+        "bb_period": 18,
+        "bb_std": 1.9,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 21,
+        "stop_loss_pct": 2.5
+      },
+      "backtest": {
+        "score": 1.9172,
+        "metrics": {
+          "sharpeRatio": 0.3,
+          "totalReturn": 8.96,
+          "winRate": 42.86,
+          "maxDrawdown": -10.6,
+          "profitFactor": 1.82,
+          "totalTrades": 7,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.5259,
+        "overfitting_ratio": -3.213,
+        "consistency": 0.9367
+      }
+    },
+    {
+      "symbol": "CNStock:603128.SH",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 3.1,
+        "bb_period": 17,
+        "bb_std": 2.2,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 16,
+        "stop_loss_pct": 3.5
+      },
+      "backtest": {
+        "score": 4.463,
+        "metrics": {
+          "sharpeRatio": 1.62,
+          "totalReturn": 80.9,
+          "winRate": 71.43,
+          "maxDrawdown": -19.32,
+          "profitFactor": 10.32,
+          "totalTrades": 7,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.9406,
+        "overfitting_ratio": -0.659,
+        "consistency": 0.9359
+      }
+    },
+    {
+      "symbol": "CNStock:002048.SZ",
+      "market": "CNStock",
+      "template": "vwap_volume_confirm",
+      "params": {
+        "vwap_dev_pct": 2.0,
+        "vol_ma_period": 15,
+        "vol_ratio": 1.3,
+        "use_rsi_filter": false,
+        "rsi_period": 11,
+        "rsi_level": 33,
+        "stop_loss_pct": 3.5
+      },
+      "backtest": {
+        "score": 3.0152,
+        "metrics": {
+          "sharpeRatio": 0.76,
+          "totalReturn": 18.6,
+          "winRate": 60.0,
+          "maxDrawdown": -4.76,
+          "profitFactor": 3.54,
+          "totalTrades": 5,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 5.0856,
+        "overfitting_ratio": -0.2428,
+        "consistency": 0.9358
+      }
+    },
+    {
+      "symbol": "CNStock:300607.SZ",
+      "market": "CNStock",
+      "template": "vwap_volume_confirm",
+      "params": {
+        "vwap_dev_pct": 3.7,
+        "vol_ma_period": 12,
+        "vol_ratio": 1.3,
+        "use_rsi_filter": false,
+        "rsi_period": 15,
+        "rsi_level": 31,
+        "stop_loss_pct": 3.0
+      },
+      "backtest": {
+        "score": 3.7728,
+        "metrics": {
+          "sharpeRatio": 1.31,
+          "totalReturn": 53.12,
+          "winRate": 62.5,
+          "maxDrawdown": -8.94,
+          "profitFactor": 4.55,
+          "totalTrades": 8,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.3646,
+        "overfitting_ratio": -0.011,
+        "consistency": 0.9355
+      }
+    },
+    {
+      "symbol": "CNStock:600643.SH",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 2.4,
+        "bb_period": 13,
+        "bb_std": 2.1,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 21,
+        "stop_loss_pct": 2.0
+      },
+      "backtest": {
+        "score": 2.4828,
+        "metrics": {
+          "sharpeRatio": 0.6,
+          "totalReturn": 17.59,
+          "winRate": 50.0,
+          "maxDrawdown": -8.54,
+          "profitFactor": 2.68,
+          "totalTrades": 10,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.7176,
+        "overfitting_ratio": -2.3265,
+        "consistency": 0.9349
+      }
+    },
+    {
+      "symbol": "CNStock:601375.SH",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 3.4,
+        "bb_period": 20,
+        "bb_std": 1.8,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 21,
+        "stop_loss_pct": 3.0
+      },
+      "backtest": {
+        "score": 4.095,
+        "metrics": {
+          "sharpeRatio": 1.09,
+          "totalReturn": 35.47,
+          "winRate": 71.43,
+          "maxDrawdown": -11.52,
+          "profitFactor": 6.39,
+          "totalTrades": 7,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.3993,
+        "overfitting_ratio": -0.8524,
+        "consistency": 0.9311
+      }
+    },
+    {
+      "symbol": "CNStock:688182.SH",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 3.4,
+        "bb_period": 20,
+        "bb_std": 1.8,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 21,
+        "stop_loss_pct": 3.0
+      },
+      "backtest": {
+        "score": 3.3594,
+        "metrics": {
+          "sharpeRatio": 1.36,
+          "totalReturn": 148.48,
+          "winRate": 46.67,
+          "maxDrawdown": -26.3,
+          "profitFactor": 3.39,
+          "totalTrades": 15,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.8643,
+        "overfitting_ratio": -0.1572,
+        "consistency": 0.9283
+      }
+    },
+    {
+      "symbol": "CNStock:600657.SH",
+      "market": "CNStock",
+      "template": "vwap_volume_confirm",
+      "params": {
+        "vwap_dev_pct": 2.0,
+        "vol_ma_period": 15,
+        "vol_ratio": 1.3,
+        "use_rsi_filter": false,
+        "rsi_period": 11,
+        "rsi_level": 33,
+        "stop_loss_pct": 3.5
+      },
+      "backtest": {
+        "score": 4.002,
+        "metrics": {
+          "sharpeRatio": 0.54,
+          "totalReturn": 19.51,
+          "winRate": 80.0,
+          "maxDrawdown": -12.9,
+          "profitFactor": 4.82,
+          "totalTrades": 5,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.8149,
+        "overfitting_ratio": -0.6208,
+        "consistency": 0.9254
+      }
+    },
+    {
+      "symbol": "CNStock:601229.SH",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 1.5,
+        "bb_period": 12,
+        "bb_std": 1.8,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 12,
+        "stop_loss_pct": 2.5
+      },
+      "backtest": {
+        "score": 3.5314,
+        "metrics": {
+          "sharpeRatio": 1.21,
+          "totalReturn": 26.6,
+          "winRate": 70.0,
+          "maxDrawdown": -8.57,
+          "profitFactor": 3.69,
+          "totalTrades": 10,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 5.318,
+        "overfitting_ratio": -4.2727,
+        "consistency": 0.9239
+      }
+    },
+    {
+      "symbol": "CNStock:000737.SZ",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 2.4,
+        "bb_period": 19,
+        "bb_std": 1.8,
+        "use_squeeze_filter": true,
+        "squeeze_percentile": 17,
+        "stop_loss_pct": 2.0
+      },
+      "backtest": {
+        "score": 3.5998,
+        "metrics": {
+          "sharpeRatio": 0.9,
+          "totalReturn": 36.91,
+          "winRate": 40.0,
+          "maxDrawdown": -21.99,
+          "profitFactor": 5.29,
+          "totalTrades": 5,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.5456,
+        "overfitting_ratio": -0.0266,
+        "consistency": 0.9234
+      }
+    },
+    {
+      "symbol": "CNStock:300660.SZ",
+      "market": "CNStock",
+      "template": "rsi_volume_divergence",
+      "params": {
+        "rsi_period": 17,
+        "rsi_oversold": 35,
+        "lookback_period": 25,
+        "price_ma_period": 12,
+        "vol_ma_period": 19,
+        "use_ma_filter": false,
+        "ma_period": 55,
+        "stop_loss_pct": 4.0
+      },
+      "backtest": {
+        "score": 4.2158,
+        "metrics": {
+          "sharpeRatio": 1.35,
+          "totalReturn": 220.94,
+          "winRate": 40.0,
+          "maxDrawdown": -43.79,
+          "profitFactor": 14.79,
+          "totalTrades": 5,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 5.1315,
+        "overfitting_ratio": -0.1441,
+        "consistency": 0.923
+      }
+    },
+    {
+      "symbol": "CNStock:301376.SZ",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 1.6,
+        "bb_period": 15,
+        "bb_std": 2.2,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 14,
+        "stop_loss_pct": 3.5
+      },
+      "backtest": {
+        "score": 4.3882,
+        "metrics": {
+          "sharpeRatio": 0.83,
+          "totalReturn": 46.7,
+          "winRate": 71.43,
+          "maxDrawdown": -31.38,
+          "profitFactor": 5.93,
+          "totalTrades": 7,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.879,
+        "overfitting_ratio": -0.7328,
+        "consistency": 0.9201
+      }
+    },
+    {
+      "symbol": "CNStock:600741.SH",
+      "market": "CNStock",
+      "template": "rsi_volume_divergence",
+      "params": {
+        "rsi_period": 17,
+        "rsi_oversold": 35,
+        "lookback_period": 25,
+        "price_ma_period": 12,
+        "vol_ma_period": 19,
+        "use_ma_filter": false,
+        "ma_period": 55,
+        "stop_loss_pct": 4.0
+      },
+      "backtest": {
+        "score": 3.0502,
+        "metrics": {
+          "sharpeRatio": 0.66,
+          "totalReturn": 24.08,
+          "winRate": 57.14,
+          "maxDrawdown": -22.17,
+          "profitFactor": 3.0,
+          "totalTrades": 7,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.5617,
+        "overfitting_ratio": -0.2895,
+        "consistency": 0.9175
+      }
+    },
+    {
+      "symbol": "CNStock:600660.SH",
+      "market": "CNStock",
+      "template": "vwap_volume_confirm",
+      "params": {
+        "vwap_dev_pct": 1.8,
+        "vol_ma_period": 14,
+        "vol_ratio": 1.4,
+        "use_rsi_filter": false,
+        "rsi_period": 10,
+        "rsi_level": 29,
+        "stop_loss_pct": 3.0
+      },
+      "backtest": {
+        "score": 4.3886,
+        "metrics": {
+          "sharpeRatio": 1.65,
+          "totalReturn": 33.33,
+          "winRate": 83.33,
+          "maxDrawdown": -3.1,
+          "profitFactor": 39.59,
+          "totalTrades": 6,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.5595,
+        "overfitting_ratio": -1.6267,
+        "consistency": 0.9165
+      }
+    },
+    {
+      "symbol": "CNStock:601998.SH",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 1.6,
+        "bb_period": 15,
+        "bb_std": 2.2,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 14,
+        "stop_loss_pct": 3.5
+      },
+      "backtest": {
+        "score": 3.104,
+        "metrics": {
+          "sharpeRatio": 0.65,
+          "totalReturn": 15.77,
+          "winRate": 66.67,
+          "maxDrawdown": -6.73,
+          "profitFactor": 3.44,
+          "totalTrades": 6,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.8722,
+        "overfitting_ratio": -0.5192,
+        "consistency": 0.9163
+      }
+    },
+    {
+      "symbol": "CNStock:002096.SZ",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 1.6,
+        "bb_period": 15,
+        "bb_std": 2.2,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 14,
+        "stop_loss_pct": 3.5
+      },
+      "backtest": {
+        "score": 4.385,
+        "metrics": {
+          "sharpeRatio": 1.62,
+          "totalReturn": 74.96,
+          "winRate": 75.0,
+          "maxDrawdown": -11.85,
+          "profitFactor": 17.0,
+          "totalTrades": 8,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.8408,
+        "overfitting_ratio": -0.072,
+        "consistency": 0.915
+      }
+    },
+    {
+      "symbol": "CNStock:600888.SH",
+      "market": "CNStock",
+      "template": "rsi_volume_divergence",
+      "params": {
+        "rsi_period": 12,
+        "rsi_oversold": 35,
+        "lookback_period": 17,
+        "price_ma_period": 9,
+        "vol_ma_period": 18,
+        "use_ma_filter": false,
+        "ma_period": 25,
+        "stop_loss_pct": 4.5
+      },
+      "backtest": {
+        "score": 2.4996,
+        "metrics": {
+          "sharpeRatio": 0.22,
+          "totalReturn": 8.43,
+          "winRate": 60.0,
+          "maxDrawdown": -14.58,
+          "profitFactor": 2.3,
+          "totalTrades": 5,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.4862,
+        "overfitting_ratio": -0.7747,
+        "consistency": 0.9114
+      }
+    },
+    {
+      "symbol": "CNStock:001287.SZ",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 3.4,
+        "bb_period": 20,
+        "bb_std": 1.8,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 21,
+        "stop_loss_pct": 3.0
+      },
+      "backtest": {
+        "score": 2.5734,
+        "metrics": {
+          "sharpeRatio": 1.25,
+          "totalReturn": 79.35,
+          "winRate": 31.25,
+          "maxDrawdown": -20.42,
+          "profitFactor": 2.6,
+          "totalTrades": 16,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.3613,
+        "overfitting_ratio": -0.592,
+        "consistency": 0.9088
+      }
+    },
+    {
+      "symbol": "CNStock:600810.SH",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 3.0,
+        "bb_period": 18,
+        "bb_std": 1.9,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 21,
+        "stop_loss_pct": 2.5
+      },
+      "backtest": {
+        "score": 3.2722,
+        "metrics": {
+          "sharpeRatio": 1.25,
+          "totalReturn": 58.14,
+          "winRate": 50.0,
+          "maxDrawdown": -10.61,
+          "profitFactor": 3.9,
+          "totalTrades": 12,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.8611,
+        "overfitting_ratio": -1.9027,
+        "consistency": 0.908
+      }
+    },
+    {
+      "symbol": "CNStock:300180.SZ",
+      "market": "CNStock",
+      "template": "vwap_volume_confirm",
+      "params": {
+        "vwap_dev_pct": 2.0,
+        "vol_ma_period": 15,
+        "vol_ratio": 1.3,
+        "use_rsi_filter": false,
+        "rsi_period": 11,
+        "rsi_level": 33,
+        "stop_loss_pct": 3.5
+      },
+      "backtest": {
+        "score": 4.7948,
+        "metrics": {
+          "sharpeRatio": 2.08,
+          "totalReturn": 319.43,
+          "winRate": 85.71,
+          "maxDrawdown": -12.43,
+          "profitFactor": 27.18,
+          "totalTrades": 7,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.6727,
+        "overfitting_ratio": -1.0028,
+        "consistency": 0.908
+      }
+    },
+    {
+      "symbol": "CNStock:002268.SZ",
+      "market": "CNStock",
+      "template": "vwap_volume_confirm",
+      "params": {
+        "vwap_dev_pct": 3.8,
+        "vol_ma_period": 10,
+        "vol_ratio": 1.3,
+        "use_rsi_filter": false,
+        "rsi_period": 14,
+        "rsi_level": 28,
+        "stop_loss_pct": 2.0
+      },
+      "backtest": {
+        "score": 2.682,
+        "metrics": {
+          "sharpeRatio": 1.03,
+          "totalReturn": 50.71,
+          "winRate": 36.36,
+          "maxDrawdown": -15.34,
+          "profitFactor": 3.09,
+          "totalTrades": 11,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.9225,
+        "overfitting_ratio": -2.0645,
+        "consistency": 0.9071
+      }
+    },
+    {
+      "symbol": "CNStock:600480.SH",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 1.6,
+        "bb_period": 15,
+        "bb_std": 2.2,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 14,
+        "stop_loss_pct": 3.5
+      },
+      "backtest": {
+        "score": 4.9946,
+        "metrics": {
+          "sharpeRatio": 1.67,
+          "totalReturn": 157.41,
+          "winRate": 83.33,
+          "maxDrawdown": -33.0,
+          "profitFactor": 17.02,
+          "totalTrades": 6,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.6923,
+        "overfitting_ratio": -0.4206,
+        "consistency": 0.904
+      }
+    },
+    {
+      "symbol": "CNStock:688106.SH",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 3.4,
+        "bb_period": 17,
+        "bb_std": 2.1,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 16,
+        "stop_loss_pct": 3.5
+      },
+      "backtest": {
+        "score": 4.1154,
+        "metrics": {
+          "sharpeRatio": 1.28,
+          "totalReturn": 50.69,
+          "winRate": 71.43,
+          "maxDrawdown": -8.74,
+          "profitFactor": 13.15,
+          "totalTrades": 7,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.8357,
+        "overfitting_ratio": -0.1309,
+        "consistency": 0.9038
+      }
+    },
+    {
+      "symbol": "CNStock:000301.SZ",
+      "market": "CNStock",
+      "template": "macd_vol_divergence",
+      "params": {
+        "macd_fast": 13,
+        "macd_slow": 23,
+        "macd_signal": 11,
+        "lookback_period": 29,
+        "price_ma_period": 5,
+        "vol_ma_period": 12,
+        "use_rsi_confirm": true,
+        "rsi_period": 14,
+        "rsi_level": 31,
+        "stop_loss_pct": 4.0
+      },
+      "backtest": {
+        "score": 2.284,
+        "metrics": {
+          "sharpeRatio": 0.59,
+          "totalReturn": 29.86,
+          "winRate": 37.5,
+          "maxDrawdown": -19.7,
+          "profitFactor": 2.26,
+          "totalTrades": 8,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.836,
+        "overfitting_ratio": -1.0776,
+        "consistency": 0.9031
+      }
+    },
+    {
+      "symbol": "CNStock:000301.SZ",
+      "market": "CNStock",
+      "template": "rsi_volume_divergence",
+      "params": {
+        "rsi_period": 12,
+        "rsi_oversold": 32,
+        "lookback_period": 29,
+        "price_ma_period": 9,
+        "vol_ma_period": 13,
+        "use_ma_filter": false,
+        "ma_period": 53,
+        "stop_loss_pct": 4.0
+      },
+      "backtest": {
+        "score": 1.8908,
+        "metrics": {
+          "sharpeRatio": 0.34,
+          "totalReturn": 15.31,
+          "winRate": 30.0,
+          "maxDrawdown": -25.94,
+          "profitFactor": 1.59,
+          "totalTrades": 10,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.836,
+        "overfitting_ratio": -1.1531,
+        "consistency": 0.9031
+      }
+    },
+    {
+      "symbol": "CNStock:600115.SH",
+      "market": "CNStock",
+      "template": "vwap_volume_confirm",
+      "params": {
+        "vwap_dev_pct": 2.0,
+        "vol_ma_period": 15,
+        "vol_ratio": 1.3,
+        "use_rsi_filter": false,
+        "rsi_period": 11,
+        "rsi_level": 33,
+        "stop_loss_pct": 3.5
+      },
+      "backtest": {
+        "score": 4.3952,
+        "metrics": {
+          "sharpeRatio": 1.12,
+          "totalReturn": 34.74,
+          "winRate": 83.33,
+          "maxDrawdown": -14.03,
+          "profitFactor": 15.99,
+          "totalTrades": 6,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.5726,
+        "overfitting_ratio": -0.0808,
+        "consistency": 0.9031
+      }
+    },
+    {
+      "symbol": "CNStock:600331.SH",
+      "market": "CNStock",
+      "template": "vwap_volume_confirm",
+      "params": {
+        "vwap_dev_pct": 2.0,
+        "vol_ma_period": 15,
+        "vol_ratio": 1.3,
+        "use_rsi_filter": false,
+        "rsi_period": 11,
+        "rsi_level": 33,
+        "stop_loss_pct": 3.5
+      },
+      "backtest": {
+        "score": 4.3052,
+        "metrics": {
+          "sharpeRatio": 1.36,
+          "totalReturn": 46.38,
+          "winRate": 83.33,
+          "maxDrawdown": -4.73,
+          "profitFactor": 14.06,
+          "totalTrades": 6,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.6205,
+        "overfitting_ratio": -0.3581,
+        "consistency": 0.9028
+      }
+    },
+    {
+      "symbol": "CNStock:600100.SH",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 1.5,
+        "bb_period": 26,
+        "bb_std": 2.0,
+        "use_squeeze_filter": true,
+        "squeeze_percentile": 24,
+        "stop_loss_pct": 3.0
+      },
+      "backtest": {
+        "score": 3.4946,
+        "metrics": {
+          "sharpeRatio": 1.04,
+          "totalReturn": 45.18,
+          "winRate": 40.0,
+          "maxDrawdown": -15.33,
+          "profitFactor": 4.93,
+          "totalTrades": 5,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.71,
+        "overfitting_ratio": -0.3078,
+        "consistency": 0.9018
+      }
+    },
+    {
+      "symbol": "CNStock:002192.SZ",
+      "market": "CNStock",
+      "template": "vwap_volume_confirm",
+      "params": {
+        "vwap_dev_pct": 1.5,
+        "vol_ma_period": 18,
+        "vol_ratio": 1.3,
+        "use_rsi_filter": false,
+        "rsi_period": 13,
+        "rsi_level": 38,
+        "stop_loss_pct": 2.0
+      },
+      "backtest": {
+        "score": 3.7068,
+        "metrics": {
+          "sharpeRatio": 0.88,
+          "totalReturn": 21.58,
+          "winRate": 62.5,
+          "maxDrawdown": -6.24,
+          "profitFactor": 4.95,
+          "totalTrades": 8,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.5318,
+        "overfitting_ratio": -0.5353,
+        "consistency": 0.9017
+      }
+    },
+    {
+      "symbol": "CNStock:600861.SH",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 3.3,
+        "bb_period": 13,
+        "bb_std": 1.9,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 18,
+        "stop_loss_pct": 2.0
+      },
+      "backtest": {
+        "score": 2.4144,
+        "metrics": {
+          "sharpeRatio": 1.07,
+          "totalReturn": 39.21,
+          "winRate": 33.33,
+          "maxDrawdown": -9.39,
+          "profitFactor": 2.83,
+          "totalTrades": 12,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.6579,
+        "overfitting_ratio": -2.2675,
+        "consistency": 0.9015
+      }
+    },
+    {
+      "symbol": "CNStock:002011.SZ",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 2.1,
+        "bb_period": 24,
+        "bb_std": 2.2,
+        "use_squeeze_filter": true,
+        "squeeze_percentile": 25,
+        "stop_loss_pct": 2.0
+      },
+      "backtest": {
+        "score": 4.0444,
+        "metrics": {
+          "sharpeRatio": 1.38,
+          "totalReturn": 44.34,
+          "winRate": 66.67,
+          "maxDrawdown": -7.95,
+          "profitFactor": 12.63,
+          "totalTrades": 6,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.8239,
+        "overfitting_ratio": -0.048,
+        "consistency": 0.9014
+      }
+    },
+    {
+      "symbol": "CNStock:300773.SZ",
+      "market": "CNStock",
+      "template": "vwap_volume_confirm",
+      "params": {
+        "vwap_dev_pct": 1.5,
+        "vol_ma_period": 18,
+        "vol_ratio": 1.3,
+        "use_rsi_filter": false,
+        "rsi_period": 13,
+        "rsi_level": 38,
+        "stop_loss_pct": 2.0
+      },
+      "backtest": {
+        "score": 4.8678,
+        "metrics": {
+          "sharpeRatio": 1.2,
+          "totalReturn": 97.79,
+          "winRate": 87.5,
+          "maxDrawdown": -31.89,
+          "profitFactor": 18.88,
+          "totalTrades": 8,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.6938,
+        "overfitting_ratio": -0.3931,
+        "consistency": 0.9007
+      }
+    },
+    {
+      "symbol": "CNStock:300401.SZ",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 1.5,
+        "bb_period": 12,
+        "bb_std": 1.8,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 12,
+        "stop_loss_pct": 2.5
+      },
+      "backtest": {
+        "score": 2.8516,
+        "metrics": {
+          "sharpeRatio": 0.69,
+          "totalReturn": 25.78,
+          "winRate": 55.56,
+          "maxDrawdown": -13.22,
+          "profitFactor": 3.0,
+          "totalTrades": 9,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.5028,
+        "overfitting_ratio": -0.3171,
+        "consistency": 0.898
+      }
+    },
+    {
+      "symbol": "CNStock:603300.SH",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 1.7,
+        "bb_period": 27,
+        "bb_std": 1.8,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 22,
+        "stop_loss_pct": 3.0
+      },
+      "backtest": {
+        "score": 2.4016,
+        "metrics": {
+          "sharpeRatio": 0.93,
+          "totalReturn": 54.34,
+          "winRate": 38.89,
+          "maxDrawdown": -25.39,
+          "profitFactor": 1.86,
+          "totalTrades": 18,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.6089,
+        "overfitting_ratio": -1.0704,
+        "consistency": 0.8963
+      }
+    },
+    {
+      "symbol": "CNStock:300782.SZ",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 3.2,
+        "bb_period": 14,
+        "bb_std": 1.9,
+        "use_squeeze_filter": true,
+        "squeeze_percentile": 22,
+        "stop_loss_pct": 3.0
+      },
+      "backtest": {
+        "score": 3.358,
+        "metrics": {
+          "sharpeRatio": 0.91,
+          "totalReturn": 45.63,
+          "winRate": 40.0,
+          "maxDrawdown": -19.3,
+          "profitFactor": 4.52,
+          "totalTrades": 5,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.1788,
+        "overfitting_ratio": -2.4934,
+        "consistency": 0.8935
+      }
+    },
+    {
+      "symbol": "CNStock:000420.SZ",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 3.4,
+        "bb_period": 20,
+        "bb_std": 1.8,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 21,
+        "stop_loss_pct": 3.0
+      },
+      "backtest": {
+        "score": 4.0674,
+        "metrics": {
+          "sharpeRatio": 1.81,
+          "totalReturn": 67.72,
+          "winRate": 62.5,
+          "maxDrawdown": -4.67,
+          "profitFactor": 6.53,
+          "totalTrades": 8,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 5.1209,
+        "overfitting_ratio": -0.1647,
+        "consistency": 0.8931
+      }
+    },
+    {
+      "symbol": "CNStock:600938.SH",
+      "market": "CNStock",
+      "template": "rsi_volume_divergence",
+      "params": {
+        "rsi_period": 11,
+        "rsi_oversold": 34,
+        "lookback_period": 21,
+        "price_ma_period": 12,
+        "vol_ma_period": 14,
+        "use_ma_filter": false,
+        "ma_period": 30,
+        "stop_loss_pct": 4.0
+      },
+      "backtest": {
+        "score": 2.4042,
+        "metrics": {
+          "sharpeRatio": 0.42,
+          "totalReturn": 15.09,
+          "winRate": 50.0,
+          "maxDrawdown": -25.01,
+          "profitFactor": 1.84,
+          "totalTrades": 10,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.9251,
+        "overfitting_ratio": -0.4261,
+        "consistency": 0.893
+      }
+    },
+    {
+      "symbol": "CNStock:002179.SZ",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 3.3,
+        "bb_period": 13,
+        "bb_std": 1.9,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 18,
+        "stop_loss_pct": 2.0
+      },
+      "backtest": {
+        "score": 3.0094,
+        "metrics": {
+          "sharpeRatio": 1.08,
+          "totalReturn": 38.27,
+          "winRate": 41.67,
+          "maxDrawdown": -17.0,
+          "profitFactor": 3.51,
+          "totalTrades": 12,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.7037,
+        "overfitting_ratio": -4.6914,
+        "consistency": 0.8924
+      }
+    },
+    {
+      "symbol": "CNStock:002097.SZ",
+      "market": "CNStock",
+      "template": "vwap_volume_confirm",
+      "params": {
+        "vwap_dev_pct": 3.8,
+        "vol_ma_period": 10,
+        "vol_ratio": 1.3,
+        "use_rsi_filter": false,
+        "rsi_period": 14,
+        "rsi_level": 28,
+        "stop_loss_pct": 2.0
+      },
+      "backtest": {
+        "score": 1.7268,
+        "metrics": {
+          "sharpeRatio": 0.21,
+          "totalReturn": 8.0,
+          "winRate": 37.5,
+          "maxDrawdown": -14.64,
+          "profitFactor": 1.5,
+          "totalTrades": 8,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.5929,
+        "overfitting_ratio": -2.9056,
+        "consistency": 0.8901
+      }
+    },
+    {
+      "symbol": "CNStock:300866.SZ",
+      "market": "CNStock",
+      "template": "vwap_volume_confirm",
+      "params": {
+        "vwap_dev_pct": 2.4,
+        "vol_ma_period": 16,
+        "vol_ratio": 1.5,
+        "use_rsi_filter": false,
+        "rsi_period": 14,
+        "rsi_level": 34,
+        "stop_loss_pct": 3.5
+      },
+      "backtest": {
+        "score": 4.5198,
+        "metrics": {
+          "sharpeRatio": 1.25,
+          "totalReturn": 62.22,
+          "winRate": 88.89,
+          "maxDrawdown": -12.1,
+          "profitFactor": 7.35,
+          "totalTrades": 9,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.6361,
+        "overfitting_ratio": -0.7704,
+        "consistency": 0.8899
+      }
+    },
+    {
+      "symbol": "CNStock:688552.SH",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 2.7,
+        "bb_period": 22,
+        "bb_std": 2.2,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 14,
+        "stop_loss_pct": 2.5
+      },
+      "backtest": {
+        "score": 4.2304,
+        "metrics": {
+          "sharpeRatio": 1.0,
+          "totalReturn": 55.57,
+          "winRate": 66.67,
+          "maxDrawdown": -24.85,
+          "profitFactor": 5.02,
+          "totalTrades": 6,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.6802,
+        "overfitting_ratio": -0.5175,
+        "consistency": 0.8893
+      }
+    },
+    {
+      "symbol": "CNStock:300666.SZ",
+      "market": "CNStock",
+      "template": "rsi_volume_divergence",
+      "params": {
+        "rsi_period": 18,
+        "rsi_oversold": 34,
+        "lookback_period": 24,
+        "price_ma_period": 6,
+        "vol_ma_period": 13,
+        "use_ma_filter": false,
+        "ma_period": 34,
+        "stop_loss_pct": 3.5
+      },
+      "backtest": {
+        "score": 4.3374,
+        "metrics": {
+          "sharpeRatio": 1.82,
+          "totalReturn": 261.44,
+          "winRate": 60.0,
+          "maxDrawdown": -20.47,
+          "profitFactor": 22.34,
+          "totalTrades": 5,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.7857,
+        "overfitting_ratio": -0.0463,
+        "consistency": 0.8877
+      }
+    },
+    {
+      "symbol": "CNStock:002043.SZ",
+      "market": "CNStock",
+      "template": "vwap_volume_confirm",
+      "params": {
+        "vwap_dev_pct": 1.5,
+        "vol_ma_period": 18,
+        "vol_ratio": 1.3,
+        "use_rsi_filter": false,
+        "rsi_period": 13,
+        "rsi_level": 38,
+        "stop_loss_pct": 2.0
+      },
+      "backtest": {
+        "score": 2.8142,
+        "metrics": {
+          "sharpeRatio": 0.93,
+          "totalReturn": 21.34,
+          "winRate": 44.44,
+          "maxDrawdown": -4.87,
+          "profitFactor": 3.64,
+          "totalTrades": 9,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.8201,
+        "overfitting_ratio": -0.1722,
+        "consistency": 0.8875
+      }
+    },
+    {
+      "symbol": "CNStock:002174.SZ",
+      "market": "CNStock",
+      "template": "vwap_volume_confirm",
+      "params": {
+        "vwap_dev_pct": 2.1,
+        "vol_ma_period": 16,
+        "vol_ratio": 1.2,
+        "use_rsi_filter": true,
+        "rsi_period": 15,
+        "rsi_level": 34,
+        "stop_loss_pct": 2.0
+      },
+      "backtest": {
+        "score": 2.1842,
+        "metrics": {
+          "sharpeRatio": 0.3,
+          "totalReturn": 9.2,
+          "winRate": 50.0,
+          "maxDrawdown": -12.81,
+          "profitFactor": 2.02,
+          "totalTrades": 8,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 5.2471,
+        "overfitting_ratio": -1.0698,
+        "consistency": 0.8856
+      }
+    },
+    {
+      "symbol": "CNStock:688382.SH",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 2.4,
+        "bb_period": 19,
+        "bb_std": 1.8,
+        "use_squeeze_filter": true,
+        "squeeze_percentile": 17,
+        "stop_loss_pct": 2.0
+      },
+      "backtest": {
+        "score": 4.6496,
+        "metrics": {
+          "sharpeRatio": 1.87,
+          "totalReturn": 288.0,
+          "winRate": 71.43,
+          "maxDrawdown": -23.65,
+          "profitFactor": 32.47,
+          "totalTrades": 7,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.8906,
+        "overfitting_ratio": -2.7491,
+        "consistency": 0.885
+      }
+    },
+    {
+      "symbol": "CNStock:603279.SH",
+      "market": "CNStock",
+      "template": "vwap_volume_confirm",
+      "params": {
+        "vwap_dev_pct": 1.7,
+        "vol_ma_period": 14,
+        "vol_ratio": 1.7,
+        "use_rsi_filter": false,
+        "rsi_period": 18,
+        "rsi_level": 33,
+        "stop_loss_pct": 4.0
+      },
+      "backtest": {
+        "score": 4.2222,
+        "metrics": {
+          "sharpeRatio": 1.35,
+          "totalReturn": 39.97,
+          "winRate": 80.0,
+          "maxDrawdown": -4.11,
+          "profitFactor": 10.49,
+          "totalTrades": 5,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.8284,
+        "overfitting_ratio": -0.1849,
+        "consistency": 0.8837
+      }
+    },
+    {
+      "symbol": "CNStock:688128.SH",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 1.4,
+        "bb_period": 22,
+        "bb_std": 1.9,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 13,
+        "stop_loss_pct": 2.5
+      },
+      "backtest": {
+        "score": 4.095,
+        "metrics": {
+          "sharpeRatio": 1.62,
+          "totalReturn": 71.26,
+          "winRate": 63.64,
+          "maxDrawdown": -8.71,
+          "profitFactor": 9.0,
+          "totalTrades": 11,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.2117,
+        "overfitting_ratio": 0.0832,
+        "consistency": 0.883
+      }
+    },
+    {
+      "symbol": "CNStock:002174.SZ",
+      "market": "CNStock",
+      "template": "rsi_volume_divergence",
+      "params": {
+        "rsi_period": 12,
+        "rsi_oversold": 32,
+        "lookback_period": 29,
+        "price_ma_period": 9,
+        "vol_ma_period": 13,
+        "use_ma_filter": false,
+        "ma_period": 53,
+        "stop_loss_pct": 4.0
+      },
+      "backtest": {
+        "score": 2.2268,
+        "metrics": {
+          "sharpeRatio": 0.74,
+          "totalReturn": 41.77,
+          "winRate": 37.5,
+          "maxDrawdown": -19.64,
+          "profitFactor": 1.97,
+          "totalTrades": 8,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.5475,
+        "overfitting_ratio": -2.8109,
+        "consistency": 0.8821
+      }
+    },
+    {
+      "symbol": "CNStock:688543.SH",
+      "market": "CNStock",
+      "template": "vwap_volume_confirm",
+      "params": {
+        "vwap_dev_pct": 1.5,
+        "vol_ma_period": 18,
+        "vol_ratio": 1.3,
+        "use_rsi_filter": false,
+        "rsi_period": 13,
+        "rsi_level": 38,
+        "stop_loss_pct": 2.0
+      },
+      "backtest": {
+        "score": 4.605,
+        "metrics": {
+          "sharpeRatio": 1.91,
+          "totalReturn": 112.47,
+          "winRate": 85.71,
+          "maxDrawdown": -6.34,
+          "profitFactor": 18.49,
+          "totalTrades": 7,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.6501,
+        "overfitting_ratio": 0.0219,
+        "consistency": 0.8748
+      }
+    },
+    {
+      "symbol": "CNStock:301078.SZ",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 1.5,
+        "bb_period": 22,
+        "bb_std": 2.0,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 22,
+        "stop_loss_pct": 3.5
+      },
+      "backtest": {
+        "score": 3.3408,
+        "metrics": {
+          "sharpeRatio": 0.91,
+          "totalReturn": 53.48,
+          "winRate": 50.0,
+          "maxDrawdown": -18.44,
+          "profitFactor": 4.02,
+          "totalTrades": 8,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.7589,
+        "overfitting_ratio": -1.3685,
+        "consistency": 0.8714
+      }
+    },
+    {
+      "symbol": "CNStock:688337.SH",
+      "market": "CNStock",
+      "template": "rsi_volume_divergence",
+      "params": {
+        "rsi_period": 16,
+        "rsi_oversold": 30,
+        "lookback_period": 22,
+        "price_ma_period": 7,
+        "vol_ma_period": 18,
+        "use_ma_filter": false,
+        "ma_period": 25,
+        "stop_loss_pct": 4.5
+      },
+      "backtest": {
+        "score": 4.1538,
+        "metrics": {
+          "sharpeRatio": 1.15,
+          "totalReturn": 108.66,
+          "winRate": 60.0,
+          "maxDrawdown": -24.69,
+          "profitFactor": 9.89,
+          "totalTrades": 5,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.7773,
+        "overfitting_ratio": -3.2207,
+        "consistency": 0.8706
+      }
+    },
+    {
+      "symbol": "CNStock:600452.SH",
+      "market": "CNStock",
+      "template": "vwap_volume_confirm",
+      "params": {
+        "vwap_dev_pct": 3.8,
+        "vol_ma_period": 10,
+        "vol_ratio": 1.3,
+        "use_rsi_filter": false,
+        "rsi_period": 14,
+        "rsi_level": 28,
+        "stop_loss_pct": 2.0
+      },
+      "backtest": {
+        "score": 4.0554,
+        "metrics": {
+          "sharpeRatio": 1.67,
+          "totalReturn": 67.37,
+          "winRate": 60.0,
+          "maxDrawdown": -9.37,
+          "profitFactor": 9.97,
+          "totalTrades": 10,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.4568,
+        "overfitting_ratio": -0.8106,
+        "consistency": 0.8701
+      }
+    },
+    {
+      "symbol": "CNStock:600456.SH",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 1.6,
+        "bb_period": 15,
+        "bb_std": 2.2,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 14,
+        "stop_loss_pct": 3.5
+      },
+      "backtest": {
+        "score": 4.7294,
+        "metrics": {
+          "sharpeRatio": 2.22,
+          "totalReturn": 110.45,
+          "winRate": 85.71,
+          "maxDrawdown": -6.36,
+          "profitFactor": 23.77,
+          "totalTrades": 7,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.6828,
+        "overfitting_ratio": -0.0041,
+        "consistency": 0.8684
+      }
+    },
+    {
+      "symbol": "CNStock:002041.SZ",
+      "market": "CNStock",
+      "template": "macd_vol_divergence",
+      "params": {
+        "macd_fast": 14,
+        "macd_slow": 29,
+        "macd_signal": 8,
+        "lookback_period": 30,
+        "price_ma_period": 11,
+        "vol_ma_period": 13,
+        "use_rsi_confirm": true,
+        "rsi_period": 14,
+        "rsi_level": 40,
+        "stop_loss_pct": 4.0
+      },
+      "backtest": {
+        "score": 2.2744,
+        "metrics": {
+          "sharpeRatio": 0.63,
+          "totalReturn": 28.71,
+          "winRate": 40.0,
+          "maxDrawdown": -18.92,
+          "profitFactor": 2.11,
+          "totalTrades": 10,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.3402,
+        "overfitting_ratio": -1.8862,
+        "consistency": 0.8659
+      }
+    },
+    {
+      "symbol": "CNStock:300773.SZ",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 3.4,
+        "bb_period": 17,
+        "bb_std": 2.1,
+        "use_squeeze_filter": false,
+        "squeeze_percentile": 16,
+        "stop_loss_pct": 3.5
+      },
+      "backtest": {
+        "score": 4.2446,
+        "metrics": {
+          "sharpeRatio": 1.14,
+          "totalReturn": 95.64,
+          "winRate": 66.67,
+          "maxDrawdown": -22.76,
+          "profitFactor": 7.84,
+          "totalTrades": 9,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.766,
+        "overfitting_ratio": -0.5164,
+        "consistency": 0.8631
+      }
+    },
+    {
+      "symbol": "CNStock:002434.SZ",
+      "market": "CNStock",
+      "template": "vwap_bollinger_squeeze",
+      "params": {
+        "vwap_dev_pct": 2.4,
+        "bb_period": 19,
+        "bb_std": 1.8,
+        "use_squeeze_filter": true,
+        "squeeze_percentile": 17,
+        "stop_loss_pct": 2.0
+      },
+      "backtest": {
+        "score": 3.4152,
+        "metrics": {
+          "sharpeRatio": 1.24,
+          "totalReturn": 40.65,
+          "winRate": 33.33,
+          "maxDrawdown": -12.63,
+          "profitFactor": 5.01,
+          "totalTrades": 6,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.8645,
+        "overfitting_ratio": -1.8122,
+        "consistency": 0.8606
+      }
+    },
+    {
+      "symbol": "CNStock:688337.SH",
+      "market": "CNStock",
+      "template": "macd_vol_divergence",
+      "params": {
+        "macd_fast": 13,
+        "macd_slow": 28,
+        "macd_signal": 10,
+        "lookback_period": 16,
+        "price_ma_period": 15,
+        "vol_ma_period": 20,
+        "use_rsi_confirm": true,
+        "rsi_period": 14,
+        "rsi_level": 36,
+        "stop_loss_pct": 4.5
+      },
+      "backtest": {
+        "score": 3.775,
+        "metrics": {
+          "sharpeRatio": 1.06,
+          "totalReturn": 89.75,
+          "winRate": 42.86,
+          "maxDrawdown": -24.69,
+          "profitFactor": 5.13,
+          "totalTrades": 7,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 4.6479,
+        "overfitting_ratio": -3.1853,
+        "consistency": 0.8585
+      }
+    },
+    {
+      "symbol": "CNStock:603358.SH",
+      "market": "CNStock",
+      "template": "vwap_volume_confirm",
+      "params": {
+        "vwap_dev_pct": 1.8,
+        "vol_ma_period": 14,
+        "vol_ratio": 1.4,
+        "use_rsi_filter": false,
+        "rsi_period": 10,
+        "rsi_level": 29,
+        "stop_loss_pct": 3.0
+      },
+      "backtest": {
+        "score": 4.5516,
+        "metrics": {
+          "sharpeRatio": 1.77,
+          "totalReturn": 57.61,
+          "winRate": 85.71,
+          "maxDrawdown": -6.47,
+          "profitFactor": 12.7,
+          "totalTrades": 7,
+          "avgProfit": 0,
+          "avgLoss": 0
+        }
+      },
+      "wf": {
+        "test_score": 5.1917,
+        "overfitting_ratio": -0.2098,
+        "consistency": 0.8533
+      }
+    }
+  ]
+}

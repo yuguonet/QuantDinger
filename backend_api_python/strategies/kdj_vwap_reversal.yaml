@@ -1,0 +1,37 @@
+# KDJ 超卖 + VWAP 偏离策略
+name: kdj_vwap_reversal
+display_name: KDJ+VWAP反转
+description: KDJ极端超卖+VWAP均值回归，A股经典KDJ指标与VWAP的新组合。
+category: reversal
+core_rules: [2, 3, 5]
+required_tools:
+  - get_daily_history
+  - get_realtime_quote
+
+instructions: |
+  **KDJ+VWAP反转策略（KDJ + VWAP Reversal）**
+
+  核心逻辑：KDJ J值极端超卖 + 价格偏离VWAP = 强反转信号。
+
+  ## 信号判定
+
+  ### 买入条件（全部满足）
+  1. **KDJ超卖**：J值 < 20（极端超卖）
+  2. **VWAP偏离**：价格 < VWAP × (1 - 1.5%~3.0%)
+  3. **RSI确认**（可选）：RSI < 33
+
+  ### 卖出条件
+  1. 价格回到VWAP上方
+  2. KDJ J值 > 80
+
+  ### 止损
+  - 2.5% ~ 4.5%
+
+  ## 评分调整
+  - KDJ+VWAP双重超卖：sentiment_score +10
+  - 在 buy_reason 中注明"KDJ+VWAP反转"
+
+  ## A股特点
+  - KDJ是A股最常用的技术指标之一
+  - J值<0是极端信号，<20已属超卖
+  - 适合短线反弹交易

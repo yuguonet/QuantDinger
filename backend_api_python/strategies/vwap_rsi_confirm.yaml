@@ -1,0 +1,42 @@
+# VWAP + RSI 双确认策略
+name: vwap_rsi_confirm
+display_name: VWAP+RSI双确认
+description: 基于VWAP偏离和RSI超卖的双重均值回归策略，81只WF通过股票中65只使用VWAP、41只使用RSI。
+category: reversal
+core_rules: [2, 3, 5]
+required_tools:
+  - get_daily_history
+  - get_realtime_quote
+  - analyze_trend
+
+instructions: |
+  **VWAP+RSI双确认策略（VWAP + RSI Double Confirmation）**
+
+  核心逻辑：价格偏离VWAP过多（均值回归）+ RSI进入超卖区（动量确认）= 双重抄底信号。
+
+  ## 信号判定
+
+  ### 买入条件（全部满足）
+  1. **VWAP偏离**：当前价格 < VWAP × (1 - 偏离阈值%)
+     - 最优偏离区间：1.5% ~ 3.0%（数据验证）
+     - 偏离太小信号频繁，偏离太大信号稀少
+  2. **RSI超卖**：RSI(14) < 33
+     - A股超卖区比传统30更宽（28~38有效）
+  3. **成交量确认**（可选）：当日成交量 > 15日均量 × 1.3倍
+
+  ### 卖出条件（任一满足）
+  1. 价格回到VWAP上方（均值回归完成）
+  2. RSI > 70（进入超买区）
+
+  ### 止损
+  - 固定止损：2.0% ~ 4.0%（VWAP类策略偏紧）
+
+  ## 评分调整
+  - VWAP偏离+RSI双确认：sentiment_score +10
+  - 配合放量确认：额外 +3
+  - 在 buy_reason 中注明"VWAP+RSI双确认"
+
+  ## 风险提示
+  - 均值回归策略在趋势市中可能连续止损
+  - 需要确认股票不是因利空而下跌
+  - 适合震荡市和温和下跌后的反弹

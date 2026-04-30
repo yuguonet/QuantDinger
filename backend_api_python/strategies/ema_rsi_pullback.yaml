@@ -1,0 +1,44 @@
+# EMA 多头 + RSI 回调买入策略
+name: ema_rsi_pullback
+display_name: EMA趋势+RSI回调
+description: EMA多头排列确认趋势+RSI回调找买点，解决纯趋势跟踪在A股小盘股失败的问题。
+category: trend
+core_rules: [1, 2, 3]
+required_tools:
+  - get_daily_history
+  - analyze_trend
+  - get_realtime_quote
+
+instructions: |
+  **EMA趋势+RSI回调策略（EMA Trend + RSI Pullback）**
+
+  核心逻辑：EMA多头排列确认趋势向上 + RSI回调到合理区间 = 趋势中的买点。
+
+  ## 信号判定
+
+  ### 买入条件（全部满足）
+  1. **EMA多头排列**：EMA(10) > EMA(30)
+     - 确认中期趋势向上
+  2. **RSI回调**：RSI(14) < 42
+     - 在趋势中找超卖/回调买点
+     - 比纯超卖（30）更宽松，抓住回调而非反转
+
+  ### 卖出条件
+  1. RSI > 70（超买）
+  2. EMA死叉（趋势反转）
+
+  ### 止损
+  - 2.5% ~ 5.0%
+
+  ## 评分调整
+  - EMA趋势向上+RSI回调：sentiment_score +8
+  - 在 buy_reason 中注明"趋势回调买入"
+
+  ## 设计思路
+  - Phase 1发现纯趋势跟踪（dual_ma_volume）在小盘股系统性失败
+  - 改进：不追趋势，在趋势确认后等回调买入
+  - 适合主升浪中的波段操作
+
+  ## 风险提示
+  - 需确认不是假突破后的回调
+  - 适合中线持有，不适合超短线

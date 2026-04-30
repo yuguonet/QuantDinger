@@ -1,0 +1,39 @@
+# RSI + 布林带下轨支撑策略
+name: rsi_bollinger_support
+display_name: RSI+布林带支撑
+description: RSI超卖+布林带下轨双重超卖确认，结合A股量价关系特征。
+category: reversal
+core_rules: [2, 3, 5]
+required_tools:
+  - get_daily_history
+  - get_realtime_quote
+  - analyze_trend
+
+instructions: |
+  **RSI+布林带支撑策略（RSI + Bollinger Band Support）**
+
+  核心逻辑：RSI超卖 + 价格触及布林带下轨 = 双重超卖，反弹概率高。
+
+  ## 信号判定
+
+  ### 买入条件（全部满足）
+  1. **RSI超卖**：RSI(14) < 33
+  2. **布林带下轨**：价格 < BB下轨（周期18，标准差2.0）
+     - BB标准差集中在1.8~2.2，传统2.0基本正确
+  3. **成交量确认**（可选）：放量1.3倍以上
+
+  ### 卖出条件
+  1. 价格突破BB上轨
+  2. RSI > 70
+
+  ### 止损
+  - 2.5% ~ 4.5%
+
+  ## 评分调整
+  - RSI+BB双重超卖：sentiment_score +8
+  - 在 buy_reason 中注明"RSI+BB支撑"
+
+  ## 适用场景
+  - 震荡市中的区间交易
+  - 短期超跌反弹
+  - 不适合单边下跌市
