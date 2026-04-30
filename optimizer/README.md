@@ -5,7 +5,7 @@
 - 只允许调用 `optimizer/` 以外的内容，不允许修改 `optimizer/` 文件夹以外的文件
 - 可以在 `optimizer/` 下进行任意改动
 - 存储文件必须放在 `optimizer/` 目录内，如需修改外部文件，必须先同意
-
+- 每次创建或修改文件后将文件按目录打包成.tar.gz格式文件,删除的文件则告知
 # 工作环境
 - windows10 + vscode + powershell + 40cpu + RAM:64G
 
@@ -22,6 +22,7 @@ optimizer/
 ├── walk_forward.py              # Walk-Forward 验证（防过拟合）
 ├── ashare_adapter.py            # A 股规则适配（T+1、涨跌停、佣金）
 ├── llm_strategy_generator.py    # LLM 策略发现（Phase 2）
+├── phase2_strategy_discovery.py # 数据驱动的 Phase 2 策略发现脚本
 ├── runner.py                    # 主入口脚本
 ├── mock_data.py                 # 本地模拟数据
 ├── analyze_results.py           # 结果分析工具
@@ -170,7 +171,39 @@ optimizer_output/
   - 新：`今日涨幅在近60天中排名前5%`（自适应每只股票波动）
 - **新增指标**：`limitup_detect`（滚动百分位排名检测）
 - **修改文件**：`strategy_templates_llm.py`、`strategy_compiler.py`
-- **待验证**：v3 全量回测
+
+#### v3 全量回测结果（1260 只 × 1 模板 × 100 trials，2023-05-01 ~ 2026-03-31）
+
+| 指标 | 数值 |
+|---|---|
+| 有交易信号 | 729/1260（57.9%）✅ 相比 v2 的 3.2% 大幅提升 |
+| 正得分率 | 694/729（95.2%）|
+| 平均得分 | 1.55 |
+| 平均 Sharpe | -0.26 |
+| 平均胜率 | 32.8% |
+| 平均交易次数 | 5.9 |
+
+**Top 5 策略**：
+
+| 股票 | 得分 | Sharpe | 收益 | 胜率 |
+|:--|:--:|:--:|:--:|:--:|
+| 603583.SH | 4.77 | 0.67 | +62.2% | 100% |
+| 603119.SH | 4.60 | 1.30 | +154.4% | 80% |
+| 000833.SZ | 4.47 | 0.66 | +66.6% | 60% |
+| 301155.SZ | 4.44 | 0.47 | +23.6% | 100% |
+| 688331.SH | 4.38 | 0.69 | +55.2% | 80% |
+
+#### v3 Walk-Forward 验证结果
+
+| 指标 | 数值 |
+|---|---|
+| WF 已测试 | 16 只（1260 只中） |
+| WF 通过（score>0）| **0** |
+| WF 失败（score≤0）| **16（100%）** |
+| WF 得分范围 | -6.94 ~ -8.47 |
+| 回测得分 vs WF 相关系数 | 0.175（不相关） |
+
+**结论**：❌ **limitup_continuation 在日线上不具备泛化能力**，WF 全部失败，严重过拟合。自适应阈值解决了触发率问题，但信号本身没有持续预测力。
 
 #### 命令
 
@@ -178,27 +211,59 @@ optimizer_output/
 # v3 全量回测
 python -m optimizer.runner -t limitup_continuation -m CNStock --all-local -tf 1D `
   --start 2023-05-01 --end 2026-03-31 --trials 100 --score composite -j 35
+
+# v3 Walk-Forward 验证（已执行，结果见上）
 ```
 
 ---
 
-### Phase 2：LLM 策略发现 ⏳ 待启动
+### Phase 2：LLM 策略发现 🔄 进行中
 
 **目标**：用 LLM 分析 Phase 1 数据模式，自动生成新的策略模板
 
-**前置条件**：Phase 1 Walk-Forward 验证通过
+**前置条件**：Phase 1 基本完成 ✅，Phase 1.5 结论明确 ✅
+
+**已完成**：
+- [x] `phase2_strategy_discovery.py` — 数据驱动的策略发现脚本
+- [x] 5 个数据驱动的 LLM prompt 模板（基于 Phase 1 已验证有效的指标组合）
+- [x] 复用 `backend_api_python` 的 LLMService（无需额外配置 API Key）
+- [ ] 实际执行 LLM 生成 + 回测验证
 
 **流程**：
 ```
-Phase 1 结果矩阵 (phase1_patterns.json)
-    ↓  数据模式提炼（哪些指标组合在哪些股票上有效）
-    ↓  LLM 分析模式（prompt + 数据摘要）
-    ↓  生成新策略模板（扩充 strategy_templates_llm.py）
-    ↓  编译 → 回测 → 筛选 → 参数优化
-    ↓  保留好策略，迭代循环
+Phase 1 结果 → 模式提取 → 数据驱动的 LLM Prompt
+    ↓
+5 个策略发现方向：
+  1. indicator_combo_innovation  — RSI+VWAP+Volume 三重共振
+  2. adaptive_volatility         — ATR/布林宽度自适应参数
+  3. volume_price_trend          — 量价背离+趋势确认
+  4. ma_kdj_momentum             — 均线支撑+KDJ金叉
+  5. bollinger_macd_volume       — 布林带+MACD+成交量三重过滤
+    ↓
+LLM 生成策略代码 → 验证 → 编译 → 回测 → WF 筛选
+    ↓
+保留好策略，迭代循环
 ```
 
-**产出**：更丰富的策略候选，超越人工定义的参数空间
+**关键设计**：
+- 不再用预定义 prompt（旧版 `ASHARE_STRATEGY_PROMPTS`），改为从 Phase 1 数据中提取有效模式驱动 prompt 生成
+- 已验证有效的指标组合：RSI、VWAP、Volume MA、Bollinger、EMA
+- 引入新指标：OBV、ADX、CCI、MFI
+- 目标：正得分率 > 90%，平均 Sharpe > 0.5，WF 通过率 > 50%
+
+**使用方法**：
+```powershell
+# 全流程
+python -m optimizer.phase2_strategy_discovery run --all-local -m CNStock -tf 1D `
+  --start 2023-05-01 --end 2026-03-31 --trials 50 --score composite -j 35
+
+# 小范围测试
+python -m optimizer.phase2_strategy_discovery run -m CNStock `
+  -s "301215.SZ,688686.SH,300674.SZ" -tf 1D --trials 50
+
+# 只看 prompt
+python -m optimizer.phase2_strategy_discovery prompts
+```
 
 ---
 
@@ -210,4 +275,4 @@ Phase 1 结果矩阵 (phase1_patterns.json)
 
 ---
 
-*最后更新：2026-04-30*
+*最后更新：2026-04-30 21:33*

@@ -264,12 +264,13 @@ class KlineCacheManager:
         return symbols
 
     def is_stale(self, tf: str, symbol: str, market: str) -> bool:
-        """根据文件修改时间和交易日历判断单只股票的日线缓存是否过期。
+        """根据文件修改时间、交易日历和数据完整性判断单只股票的日线缓存是否过期。
 
         日线：
           - 文件不存在 → 过期
           - 文件 mtime < 上一个交易日收盘时间 → 过期
           - 盘中建的文件（mtime < 15:00），当前已收盘 → 过期
+          - 缓存数据的最后日期 < 上一个交易日 → 过期（数据有缺口）
         """
         if tf != "1D":
             return True
@@ -290,8 +291,29 @@ class KlineCacheManager:
             return True
 
         last_td = prev_trading_day()
+
+        # 检查1：文件修改时间是否足够新
         if mtime_date < last_td:
             return True
+
+        # 检查2：缓存数据的实际日期是否覆盖到前一个交易日
+        # 解决问题：数据源返回不完整数据时，mtime 虽新但数据有缺口
+        try:
+            df = self._read_feather(path)
+            if not df.empty and "time" in df.columns and len(df) > 0:
+                max_ts = int(df["time"].max())
+                last_bar_date = datetime.fromtimestamp(
+                    max_ts, tz=timezone(timedelta(hours=8))
+                ).strftime("%Y-%m-%d")
+                if last_bar_date < last_td:
+                    logger.info(
+                        f"[KlineCache] 缓存数据不完整 {market}:{symbol}: "
+                        f"最后日期={last_bar_date}, 需覆盖到={last_td}"
+                    )
+                    return True
+        except Exception:
+            pass
+
         # 盘中建的文件，盘后需刷新以包含当日确认数据
         try:
             now = datetime.now(timezone(timedelta(hours=8)))

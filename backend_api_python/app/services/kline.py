@@ -21,11 +21,12 @@ from app.services.kline_cache_manager import (
     _is_market_hours,
     _today_str,
     _ts_from_date,
+    _dt_from_ts,
     _iso_week_start,
     _bar_field,
     DAILY_LIMIT,
 )
-from app.interfaces.trading_calendar import is_trading_day_today
+from app.interfaces.trading_calendar import is_trading_day_today, prev_trading_day
 from app.utils.cache import CacheManager
 from app.utils.logger import get_logger
 from app.config import CacheConfig
@@ -335,9 +336,13 @@ class KlineService:
         return self._append_current(tf, cached, today_candle, symbol, market, fetch, limit)
 
     def _append_current(self, tf, bars, today_candle, symbol, market, fetch, limit):
-        """追加当日 K 线（盘中合成 / 闭市后取远程已完成 bar）"""
+        """追加当日 K 线（盘中合成 / 闭市后取远程已完成 bar），并填补缓存缺口"""
         if tf == "1D":
             result = list(bars)
+
+            # 先填补缓存数据与今天之间的缺口
+            result = self._fill_gap(result, market, symbol, fetch)
+
             if today_candle:
                 today_ts = today_candle["time"]
                 result = [b for b in result if b.get("time") != today_ts]
@@ -353,6 +358,63 @@ class KlineService:
             return result[-limit:]
 
         return bars[-limit:]
+
+    def _fill_gap(self, bars, market, symbol, fetch):
+        """检测并填补缓存数据与前一个交易日之间的缺口。
+
+        当缓存数据的最后日期距前一个交易日超过1天时，从远程拉取更多历史数据来填补。
+        这解决了数据源返回不完整数据导致缓存有缺口的问题。
+        """
+        if not bars or not market:
+            return bars
+
+        try:
+            last_td = prev_trading_day()
+
+            # 找到缓存数据中最大的时间戳
+            max_ts = max(b.get("time", 0) for b in bars)
+            if max_ts <= 0:
+                return bars
+
+            last_bar_date = _dt_from_ts(max_ts).strftime("%Y-%m-%d")
+
+            # 如果缓存数据的最后日期已经 >= 前一个交易日，无需填补
+            if last_bar_date >= last_td:
+                return bars
+
+            # 计算缺口天数
+            last_bar_dt = datetime.strptime(last_bar_date, "%Y-%m-%d")
+            last_td_dt = datetime.strptime(last_td, "%Y-%m-%d")
+            gap_days = (last_td_dt - last_bar_dt).days
+
+            # 只有缺口超过1天时才填补（1天可能是正常的当日未更新）
+            if gap_days <= 1:
+                return bars
+
+            logger.info(
+                f"[Kline] 检测到缺口 {market}:{symbol}: "
+                f"最后日期={last_bar_date}, 需覆盖到={last_td}, 缺口={gap_days}天"
+            )
+
+            # 从远程拉取更多数据来填补缺口
+            # 拉取足够多的 bar 以覆盖缺口
+            fetch_limit = max(gap_days + 50, 100)
+            try:
+                remote_bars = fetch(market, symbol, "1D", fetch_limit)
+                if remote_bars and len(remote_bars) > len(bars):
+                    # 用远程数据替换缓存数据（远程数据更完整）
+                    logger.info(
+                        f"[Kline] 填补缺口成功 {market}:{symbol}: "
+                        f"缓存={len(bars)}条, 远程={len(remote_bars)}条"
+                    )
+                    return remote_bars
+            except Exception as e:
+                logger.warning(f"[Kline] 填补缺口失败 {market}:{symbol}: {e}")
+
+        except Exception as e:
+            logger.debug(f"[Kline] 缺口检测失败 {market}:{symbol}: {e}")
+
+        return bars
 
     # 闭市后远端未更新时的重试间隔（秒）
     _COMPLETED_BAR_RETRY_TTL = 300  # 5 分钟后重试
