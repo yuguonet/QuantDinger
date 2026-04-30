@@ -1,9 +1,11 @@
 # QuantDinger 自动策略优化器
+这个项目只允许调用optimizer/以外的内容,不允许修改optimizer/文件夹以外的文件,可以在optimizer/下进行任意改动.
+也不允许将存储文件放到这个目录以外,如果必须要修改或创建,建议将需要的文件复制到当前目录下再修改,
+如果实在不行,在修改或创建前必须同意才行
 
 ## 文件结构
-
 ```
-app/optimizer/
+optimizer/
 ├── __init__.py       # 模块入口
 ├── param_space.py    # 7 种策略模板 + 参数空间定义
 ├── optimizer.py      # 优化引擎（随机搜索 + Optuna 可选）
@@ -14,7 +16,7 @@ app/optimizer/
 
 ## 放置位置
 
-解压到 `backend_api_python/app/optimizer/` 目录即可。
+解压到 `optimizer/` 目录即可。
 
 ## 使用方法
 
@@ -24,7 +26,7 @@ app/optimizer/
 cd backend_api_python
 
 # 单个模板
-python -m app.optimizer.runner \
+python -m optimizer.runner \
     --template ma_crossover \
     --symbol "Crypto:BTC/USDT" \
     --timeframe 4H \
@@ -35,7 +37,7 @@ python -m app.optimizer.runner \
     --validate
 
 # 所有模板对比
-python -m app.optimizer.runner \
+python -m optimizer.runner \
     --all \
     --symbol "Crypto:BTC/USDT" \
     --timeframe 4H \
@@ -48,9 +50,9 @@ python -m app.optimizer.runner \
 
 ```python
 from datetime import datetime
-from app.optimizer.mock_data import generate_mock_klines, patch_backtest_with_mock
-from app.optimizer.runner import BacktestObjective
-from app.optimizer.optimizer import StrategyOptimizer
+from optimizer.mock_data import generate_mock_klines, patch_backtest_with_mock
+from optimizer.runner import BacktestObjective
+from optimizer.optimizer import StrategyOptimizer
 
 # 生成模拟数据（1 年 4H K 线）
 mock_data = generate_mock_klines(
