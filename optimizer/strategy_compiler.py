@@ -13,6 +13,7 @@ class StrategyCompiler:
         position_config = config.get('position_config', {})
         pyramiding_rules = config.get('pyramiding_rules', {})
         risk_management = config.get('risk_management', {})
+        exit_mode = config.get('exit_mode', None)
         
         # 1. Imports and Setup
         code = self._get_header(name)
@@ -27,7 +28,7 @@ class StrategyCompiler:
         code += self._get_entry_logic(entry_rules)
         
         # 5. Core Loop (Position Management) - Based on code2.py
-        code += self._get_core_loop(position_config, pyramiding_rules, risk_management)
+        code += self._get_core_loop(position_config, pyramiding_rules, risk_management, exit_mode)
         
         # 6. Output Formatting
         code += self._get_output_section(name, entry_rules)
@@ -315,6 +316,48 @@ df['bbw_{period}_{std_dev}_{squeeze_percentile}_pctile'] = df['bbw_{period}'].ro
 """
                     calculated.add(key)
 
+            elif ind == 'recent_surge':
+                # 近期大涨检测: 近N天内最大单日涨幅是否超过阈值
+                lookback = params.get('lookback', 10)
+                min_pct = params.get('min_pct', 5.0)
+                key = f"recent_surge_{lookback}_{min_pct}"
+                if key not in calculated:
+                    code += f"""
+# 近期大涨检测: 近{lookback}天内最大单日涨幅 >= {min_pct}%
+df['pct_change_raw'] = (df['close'] / df['close'].shift(1) - 1) * 100
+df['max_surge_{lookback}'] = df['pct_change_raw'].rolling(window={lookback}, min_periods=1).max()
+df['has_recent_surge_{lookback}'] = df['max_surge_{lookback}'] >= {min_pct}
+"""
+                    calculated.add(key)
+
+            elif ind == 'dragon_pullback':
+                # 龙回头: 从近期高点回调的幅度
+                high_lookback = params.get('high_lookback', 10)
+                pullback_min = params.get('pullback_min', 0.03)
+                pullback_max = params.get('pullback_max', 0.15)
+                key = f"dragon_pb_{high_lookback}"
+                if key not in calculated:
+                    code += f"""
+# Dragon Pullback: 从近{high_lookback}日高点的回撤幅度
+df['dpb_high_{high_lookback}'] = df['high'].rolling(window={high_lookback}).max()
+df['dpb_pullback_{high_lookback}'] = (df['close'] - df['dpb_high_{high_lookback}']) / df['dpb_high_{high_lookback}']
+# 回撤区间: pullback_min% ~ pullback_max%（过浅=没回调够，过深=趋势破了）
+df['dpb_in_zone_{high_lookback}'] = (df['dpb_pullback_{high_lookback}'] >= -{pullback_max}) & (df['dpb_pullback_{high_lookback}'] <= -{pullback_min})
+"""
+                    calculated.add(key)
+
+            elif ind == 'close_position':
+                # 收盘价在当日K线中的位置（0=最低, 1=最高）
+                # 用于判断尾盘强度：收盘在高位说明尾盘有资金抢筹
+                key = "close_position"
+                if key not in calculated:
+                    code += f"""
+# Close Position: 收盘价在当日K线中的相对位置
+df['close_position'] = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, np.nan)
+df['close_position'] = df['close_position'].fillna(0.5)
+"""
+                    calculated.add(key)
+
             elif ind == 'limitup_detect':
                 # 涨停/大涨检测：今日涨幅在近 N 天中排名前 M%
                 lookback = params.get('lookback', 60)
@@ -584,6 +627,9 @@ df['raw_sell'] = False
                 elif operator == 'volume_ratio_above':
                     conditions_buy.append(f"({vol_ratio} > {threshold})")
                     conditions_sell.append(f"({vol_ratio} < {threshold})")
+                elif operator == 'volume_ratio_below':
+                    conditions_buy.append(f"({vol_ratio} < {threshold})")
+                    conditions_sell.append(f"({vol_ratio} > {threshold})")
                 elif operator == 'volume_shrink':
                     conditions_buy.append(f"({vol_ratio} < 0.8)")
                     conditions_sell.append(f"({vol_ratio} > 1.2)")
@@ -619,6 +665,29 @@ df['raw_sell'] = False
                     conditions_buy.append(f"({pctile_col} < {squeeze_percentile})")
                     conditions_sell.append(f"({pctile_col} > {100 - squeeze_percentile})")
 
+            elif ind == 'recent_surge':
+                # 近期大涨检测
+                lookback = params.get('lookback', 10)
+                operator = rule.get('operator', 'has_surge')
+                if operator == 'has_surge':
+                    conditions_buy.append(f"(df['has_recent_surge_{lookback}'])")
+
+            elif ind == 'dragon_pullback':
+                # 龙回头: 大涨后回调到买入区间
+                high_lookback = params.get('high_lookback', 10)
+                operator = rule.get('operator', 'in_pullback_zone')
+                if operator == 'in_pullback_zone':
+                    conditions_buy.append(f"(df['dpb_in_zone_{high_lookback}'])")
+
+            elif ind == 'close_position':
+                # 收盘强度：收盘价在当日K线中的位置
+                operator = rule.get('operator', 'above')
+                threshold = rule.get('threshold', params.get('threshold', 0.7))
+                if operator == 'above':
+                    conditions_buy.append(f"(df['close_position'] > {threshold})")
+                elif operator == 'below':
+                    conditions_buy.append(f"(df['close_position'] < {threshold})")
+
             elif ind == 'limitup_detect':
                 operator = rule.get('operator', 'is_limitup')
                 if operator == 'is_limitup':
@@ -642,7 +711,9 @@ df['raw_sell'] = False
             
         return code
 
-    def _get_core_loop(self, pos_config, pyr_rules, risk_mgmt):
+    def _get_core_loop(self, pos_config, pyr_rules, risk_mgmt, exit_mode=None):
+        if exit_mode == "next_bar_open_exit":
+            return self._get_core_loop_overnight(pos_config, pyr_rules, risk_mgmt)
         # This mirrors the logic in code2.py loop
         return """
 # ===========================
@@ -843,6 +914,185 @@ df['close_short_text'] = close_short_text
 df['buy'] = open_long_signals
 df['sell'] = open_short_signals
 
+"""
+
+    def _get_core_loop_overnight(self, pos_config, pyr_rules, risk_mgmt):
+        """隔夜策略专用 core loop: 买入次日开盘卖出，除非涨停封板则继续持有"""
+        initial_size = pos_config.get('initial_size_pct', 10) / 100.0
+        leverage = pos_config.get('leverage', 1)
+        max_pyramiding = pos_config.get('max_pyramiding', 0)
+
+        sl = risk_mgmt.get('stop_loss', {})
+        sl_enabled = sl.get('enabled', False)
+        sl_pct = sl.get('value', 0) / 100.0 if sl_enabled else 0.0
+
+        trailing = risk_mgmt.get('trailing_stop', {})
+        ts_enabled = trailing.get('enabled', False)
+        ts_pct = trailing.get('value', 0) / 100.0 if ts_enabled else 0.0
+
+        limit_up_pct = risk_mgmt.get('limit_up_pct', 0.10)
+
+        return f"""
+# ===========================
+# 4. Core Loop (Overnight Exit Mode)
+# ===========================
+# 策略逻辑: 尾盘买入 → 次日开盘卖出（除非涨停封板）
+# 涨停封板判定: 次日开盘价 >= 前收 × (1 + limit_up_pct) × 0.995
+# 涨停封板后持有，直到涨停板打开或止损触发
+
+open_long_signals = [False] * len(df)
+add_long_signals = [False] * len(df)
+close_long_signals = [False] * len(df)
+
+open_long_text = [None] * len(df)
+add_long_text = [None] * len(df)
+
+open_long_price = [0.0] * len(df)
+add_long_price = [0.0] * len(df)
+close_long_price = [0.0] * len(df)
+close_long_text = [None] * len(df)
+
+open_short_signals = [False] * len(df)
+add_short_signals = [False] * len(df)
+close_short_signals = [False] * len(df)
+
+open_short_price = [0.0] * len(df)
+add_short_price = [0.0] * len(df)
+close_short_price = [0.0] * len(df)
+close_short_text = [None] * len(df)
+open_short_text = [None] * len(df)
+add_short_text = [None] * len(df)
+
+position = 0  # 0, 1 (Long)
+position_count = 0
+avg_entry_price = 0.0
+entry_day = -1           # 买入发生在第几天
+highest_since_entry = 0.0
+is_holding_limitup = False  # 是否因涨停封板而持有
+
+close_arr = df['close'].values
+high_arr = df['high'].values
+low_arr = df['low'].values
+open_arr = df['open'].values
+raw_buy_arr = df['raw_buy'].values
+raw_sell_arr = df['raw_sell'].values
+
+limit_up_pct = {limit_up_pct}
+stop_loss_pct = {sl_pct}
+trailing_pct = {ts_pct}
+
+for i in range(len(df)):
+    current_open = open_arr[i]
+    current_close = close_arr[i]
+    current_high = high_arr[i]
+    current_low = low_arr[i]
+
+    if position == 1:
+        # ── 已持仓 ──
+        if current_high > highest_since_entry:
+            highest_since_entry = current_high
+
+        days_held = i - entry_day
+
+        if days_held == 1:
+            # === 买入后第一个交易日（T+1 可卖出）===
+            # 判断是否涨停封板
+            prev_close = close_arr[entry_day]
+            limit_up_price = prev_close * (1 + limit_up_pct)
+            is_limit_up = current_open >= limit_up_price * 0.995
+
+            if is_limit_up:
+                # 涨停封板 → 继续持有
+                is_holding_limitup = True
+                # 不卖出，等后续 bar
+            else:
+                # 非涨停 → 开盘卖出（隔夜溢价了结）
+                close_long_signals[i] = True
+                close_long_price[i] = current_open
+                close_long_text[i] = "Overnight Exit (Open)"
+                position = 0
+                position_count = 0
+                is_holding_limitup = False
+                continue
+
+        elif days_held > 1 and is_holding_limitup:
+            # === 涨停封板持有期间 ===
+            prev_close = close_arr[i - 1]
+            limit_up_price = prev_close * (1 + limit_up_pct)
+            still_limit_up = current_open >= limit_up_price * 0.995
+
+            if still_limit_up:
+                # 继续涨停 → 继续持有
+                # 更新追踪止损
+                pass
+            else:
+                # 涨停板打开 → 开盘卖出
+                close_long_signals[i] = True
+                close_long_price[i] = current_open
+                close_long_text[i] = "Limit-Up Break (Open)"
+                position = 0
+                position_count = 0
+                is_holding_limitup = False
+                continue
+
+            # 追踪止损（涨停持有期间生效）
+            if trailing_pct > 0:
+                drawdown = (highest_since_entry - current_close) / avg_entry_price
+                if drawdown >= trailing_pct:
+                    close_long_signals[i] = True
+                    close_long_price[i] = current_close
+                    close_long_text[i] = "Trailing Stop"
+                    position = 0
+                    position_count = 0
+                    is_holding_limitup = False
+                    continue
+
+        # 固定止损（任何持仓期间生效）
+        if stop_loss_pct > 0:
+            loss_pct = (avg_entry_price - current_low) / avg_entry_price
+            if loss_pct >= stop_loss_pct:
+                close_long_signals[i] = True
+                close_long_price[i] = avg_entry_price * (1 - stop_loss_pct)
+                close_long_text[i] = "Stop Loss"
+                position = 0
+                position_count = 0
+                is_holding_limitup = False
+                continue
+
+    else:
+        # ── 空仓 ──
+        if raw_buy_arr[i]:
+            open_long_signals[i] = True
+            open_long_price[i] = current_close
+            open_long_text[i] = "Open Long (Close)"
+            position = 1
+            position_count = 1
+            avg_entry_price = current_close
+            entry_day = i
+            highest_since_entry = current_close
+            is_holding_limitup = False
+
+# Append columns
+df['open_long'] = open_long_signals
+df['add_long'] = add_long_signals
+df['close_long'] = close_long_signals
+df['open_long_price'] = [p if s else None for p, s in zip(open_long_price, open_long_signals)]
+df['add_long_price'] = [p if s else None for p, s in zip(add_long_price, add_long_signals)]
+df['close_long_price'] = [p if s else None for p, s in zip(close_long_price, close_long_signals)]
+df['open_long_text'] = open_long_text
+df['add_long_text'] = add_long_text
+df['close_long_text'] = close_long_text
+df['open_short'] = open_short_signals
+df['add_short'] = add_short_signals
+df['close_short'] = close_short_signals
+df['open_short_price'] = [p if s else None for p, s in zip(open_short_price, open_short_signals)]
+df['add_short_price'] = [p if s else None for p, s in zip(add_short_price, add_short_signals)]
+df['close_short_price'] = [p if s else None for p, s in zip(close_short_price, close_short_signals)]
+df['open_short_text'] = open_short_text
+df['add_short_text'] = add_short_text
+df['close_short_text'] = close_short_text
+df['buy'] = open_long_signals
+df['sell'] = open_short_signals
 """
 
     def _get_output_section(self, name, rules):

@@ -217,6 +217,106 @@ python -m optimizer.runner -t limitup_continuation -m CNStock --all-local -tf 1D
 
 ---
 
+### Phase 1.6：龙回头策略 🆕
+
+**目标**：大涨后回调缩量买入，吃第二波拉升
+
+**设计思路**：
+- 大涨/涨停后有辨识度（主力资金介入），回调是获利盘消化
+- 缩量回调 = 卖压衰竭（非主力出货），二次启动概率高
+- 比追涨策略风险更低（回调后买入），收益潜力大（吃第二波）
+
+**策略逻辑**：
+```
+买入条件（全部满足）:
+  1. 近N天内有过大涨（单日涨幅 >= M%）
+  2. 从近期高点回调 X%~Y%（回调到位但趋势未破）
+  3. 回调时缩量（成交量 < 均量的 Z 倍 = 卖压衰竭）
+  4. 可选: RSI > 25（避免超卖接飞刀）
+  5. 可选: 收盘 > EMA(N)（中期趋势保护）
+
+卖出条件:
+  - Signal Exit: 买入条件不再满足时卖出
+  - Stop Loss: 固定止损兜底
+```
+
+**与 limitup_continuation 的区别**：
+| | limitup_continuation | dragon_pullback |
+|---|---|---|
+| 买入时机 | 涨停当天 | 涨停后回调 |
+| 风险 | 高（追涨） | **低（低吸）** |
+| 持仓 | 1-3 天 | 3-10 天 |
+| 核心逻辑 | 吃延续溢价 | 吃第二波拉升 |
+
+**新增指标**：
+- `recent_surge`: 近N天最大单日涨幅是否超阈值（替代 `limitup_detect`，解决信号不重叠问题）
+- `dragon_pullback`: 从近期高点的回撤幅度（回撤区间可配置）
+
+**使用命令**：
+```powershell
+# 单股票测试
+python -m optimizer.runner -t dragon_pullback -m CNStock -s "000001.SZ" -tf 1D `
+  --start 2023-05-01 --end 2026-03-31 --trials 100
+
+# 全量回测
+python -m optimizer.runner -t dragon_pullback -m CNStock --all-local -tf 1D `
+  --start 2023-05-01 --end 2026-03-31 --trials 100 --score composite -j 35
+```
+
+**状态**：🔄 待回测验证
+
+---
+
+### Phase 1.7：尾盘抢筹隔夜溢价策略 🆕
+
+**目标**：设计并验证"尾盘买入 → 次日开盘卖出"的隔夜溢价策略，追求高胜率和稳定溢价
+
+**设计思路**：
+- 不追涨停，不抄底，而是捕捉"尾盘有资金抢筹"的确定性信号
+- 收盘在当日K线高位 = 主力尾盘拉升/吸筹 → 次日高开概率大
+- 放量确认 = 非散户行为，有真实资金介入
+- 涨停封板 = 极端强势信号，继续持有吃连板溢价
+
+**策略逻辑**：
+```
+买入条件（全部满足）:
+  1. close_position > 0.7（收盘在当日K线上 70% 以上位置）
+  2. volume_ratio > 1.2（成交量 > 20日均量的 1.2 倍）
+  3. RSI < 75（未超买）
+  4. 可选: 收盘价 > EMA(N)（趋势向上）
+
+卖出逻辑（T+1 隔夜模式）:
+  - 次日开盘: 如果开盘价 >= 前收 × 1.095（接近涨停）→ 涨停封板，继续持有
+  - 次日开盘: 否则 → 开盘价卖出（吃隔夜溢价）
+  - 涨停持有期间: 每天检查涨停板是否打开，打开则次日开盘卖出
+  - 追踪止损: 涨停持有期间，从最高点回撤 N% 则卖出
+  - 固定止损: 任何持仓期间，亏损达 N% 则卖出
+```
+
+**与 limitup_continuation 的区别**：
+| | limitup_continuation | close_strength_overnight |
+|---|---|---|
+| 买入时机 | 今天涨停/大涨后 | 今天尾盘收盘在高位 |
+| 卖出时机 | 追踪止损 | 次日开盘（除非涨停封板）|
+| 持仓周期 | 1-3 天 | 1-2 天 |
+| 核心信号 | 涨幅排名 | 收盘价位置 |
+| 目标 | 吃延续溢价 | 吃隔夜溢价 |
+
+**使用命令**：
+```powershell
+# 单股票回测
+python -m optimizer.runner -t close_strength_overnight -m CNStock -s "000001.SZ" -tf 1D `
+  --start 2023-05-01 --end 2026-03-31 --trials 100 --score composite
+
+# 全量回测
+python -m optimizer.runner -t close_strength_overnight -m CNStock --all-local -tf 1D `
+  --start 2023-05-01 --end 2026-03-31 --trials 100 --score composite -j 35
+```
+
+**状态**：🔄 待回测验证
+
+---
+
 ### Phase 2：LLM 策略发现 🔄 进行中
 
 **目标**：用 LLM 分析 Phase 1 数据模式，自动生成新的策略模板
@@ -324,4 +424,53 @@ python -m optimizer.phase2_strategy_discovery prompts
 
 ---
 
-*最后更新：2026-05-01 08:05*
+## 更新日志
+
+### 2026-05-01 19:23 — 新增龙回头策略 + close_position 框架扩展
+
+#### 新增模板
+
+| 模板 | 策略 | 状态 |
+|---|---|---|
+| `dragon_pullback` | 龙回头（大涨后回调缩量买入） | 🔄 待回测 |
+| `close_strength_overnight` | 尾盘抢筹隔夜溢价 | 🔄 待回测 |
+
+#### 框架改动（strategy_compiler.py）
+
+| 改动 | 说明 |
+|---|---|
+| 新增 `recent_surge` 指标 | 近N天最大单日涨幅是否超阈值，替代 `limitup_detect` 用于"近期大涨"检测 |
+| 新增 `dragon_pullback` 指标 | 从近N日高点的回撤幅度，支持配置回撤区间 |
+| 新增 `close_position` 指标 | 收盘价在当日K线中的相对位置（0=最低, 1=最高） |
+| 新增 `volume_ratio_below` 操作符 | 量比低于阈值（缩量确认），与 `volume_ratio_above` 对称 |
+| 新增 `next_bar_open_exit` 退出模式 | 隔夜策略专用：次日开盘价卖出，支持涨停封板检测和持有逻辑 |
+
+#### 模板改动（strategy_templates_llm.py）
+
+- `_build_dragon_pullback_config`: 龙回头配置构建
+  - 入场: `recent_surge` + `dragon_pullback` + `volume_ratio_below`
+  - 可选: RSI 下限过滤 + EMA 趋势保护
+- `_build_close_strength_overnight_config`: 尾盘抢筹配置构建
+  - 入场: `close_position` + `volume` + `rsi` + `ma`
+  - 退出: `exit_mode: "next_bar_open_exit"` 自定义 core loop
+- 模板编号: 6=dragon_pullback, 7=close_strength_overnight, 8=limitup_continuation
+
+#### 设计决策记录
+
+1. **close_position 与次日收益无相关性** — 统计验证（r=0.003），单独使用无预测力，仅作为过滤器配合其他信号
+2. **limitup_detect 不适合龙回头** — 只检测当天涨幅排名，回调日永远不触发；改用 `recent_surge`（检测近期是否大涨）
+3. **龙回头核心假设** — 大涨后缩量回调 = 卖压衰竭，二次启动概率高（行为金融学支撑，待真实数据验证）
+4. **next_bar_open_exit 模式** — 现有 core loop 无法区分"开盘卖"和"收盘卖"，新增自定义 core loop 支持 T+1 开盘价卖出 + 涨停封板持有
+
+#### 文件清单
+
+```
+修改: optimizer/strategy_templates_llm.py  (+2 个模板函数 + 模板注册)
+修改: optimizer/strategy_compiler.py       (+3 个指标 + 1 个操作符 + 1 个退出模式)
+修改: optimizer/README.md                  (+龙回头策略文档 + 更新日志)
+新增: optimizer_changes.tar.gz             (打包文件)
+```
+
+---
+
+*最后更新：2026-05-01 19:23*
