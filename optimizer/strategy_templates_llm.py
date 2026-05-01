@@ -609,20 +609,21 @@ LLM_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
         ),
         "indicators": ["recent_surge", "dragon_pullback", "volume", "rsi", "ma"],
         "params": {
-            "surge_lookback":   _p_int(5, 30, 1),          # 检测大涨的回看窗口
-            "surge_min_pct":    _p_float(3.0, 10.0, 0.5),  # 大涨定义: 单日涨幅 >= N%
-            "high_lookback":    _p_int(5, 20, 1),          # 近高点回看窗口
-            "pullback_min":     _p_float(0.02, 0.08, 0.01), # 最小回撤（过浅=没回调够）
-            "pullback_max":     _p_float(0.08, 0.20, 0.01), # 最大回撤（过深=趋势破了）
-            "vol_ma_period":    _p_int(5, 20, 1),          # 量能均线周期
-            "vol_shrink_ratio": _p_float(0.5, 1.0, 0.05),  # 缩量阈值（越小越严格）
-            "use_rsi_filter":   _p_choice([True, False]),   # RSI过滤
-            "rsi_period":       _p_int(10, 20, 1),         # RSI周期
-            "rsi_min":          _p_int(25, 45, 1),         # RSI下限（避免超卖接飞刀）
-            "use_ma_filter":    _p_choice([True, False]),   # 均线趋势保护
-            "ma_period":        _p_int(20, 60, 10),        # 中期均线周期
-            "stop_loss_pct":    _p_float(3.0, 8.0, 0.5),   # 止损
+            "surge_lookback":   _p_int(5, 40, 1),
+            "surge_min_pct":    _p_float(2.0, 12.0, 0.5),
+            "high_lookback":    _p_int(5, 30, 1),
+            "pullback_min":     _p_float(0.01, 0.10, 0.01),
+            "pullback_max":     _p_float(0.08, 0.30, 0.01),
+            "vol_ma_period":    _p_int(3, 25, 1),
+            "vol_shrink_ratio": _p_float(0.3, 1.2, 0.05),
+            "use_rsi_filter":   _p_choice([True, False]),
+            "rsi_period":       _p_int(6, 25, 1),
+            "rsi_min":          _p_int(15, 50, 1),
+            "use_ma_filter":    _p_choice([True, False]),
+            "ma_period":        _p_int(10, 80, 5),
+            "stop_loss_pct":    _p_float(2.0, 12.0, 0.5),
         },
+
         "constraints": [
             ("pullback_min", "<", "pullback_max"),  # 最小回撤 < 最大回撤
         ],

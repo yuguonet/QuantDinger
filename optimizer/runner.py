@@ -835,6 +835,7 @@ stock_list.txt 格式（同 downloader）:
                 "template": r["template"],
                 "best_score": r["best"]["score"],
                 "metrics": r["best"]["metrics"],
+                "best_params": r["best"]["params"],      # ← 加这行
                 "wf_test_score": (r.get("validation") or {}).get("avg_test_score"),
             }
             for sym, r in stock_summaries.items()
