@@ -1,0 +1,815 @@
+{
+  "description": "adaptive_volatility 双优策略索引",
+  "generated_at": "2026-05-01 09:29",
+  "total": 101,
+  "strategies": {
+    "000603.SZ": {
+      "file": "adaptive_vol_000603_SZ.yaml",
+      "score": 3.9172,
+      "wf_score": 5.4333,
+      "sharpe": 0.86,
+      "return_pct": 82.45,
+      "win_rate": 50.0
+    },
+    "300284.SZ": {
+      "file": "adaptive_vol_300284_SZ.yaml",
+      "score": 3.5978,
+      "wf_score": 5.3505,
+      "sharpe": 0.95,
+      "return_pct": 101.09,
+      "win_rate": 33.33
+    },
+    "600210.SH": {
+      "file": "adaptive_vol_600210_SH.yaml",
+      "score": 4.1558,
+      "wf_score": 5.3291,
+      "sharpe": 1.09,
+      "return_pct": 112.36,
+      "win_rate": 60.0
+    },
+    "000650.SZ": {
+      "file": "adaptive_vol_000650_SZ.yaml",
+      "score": 3.306,
+      "wf_score": 5.2457,
+      "sharpe": 0.76,
+      "return_pct": 32.72,
+      "win_rate": 50.0
+    },
+    "002745.SZ": {
+      "file": "adaptive_vol_002745_SZ.yaml",
+      "score": 3.7616,
+      "wf_score": 5.0927,
+      "sharpe": 0.84,
+      "return_pct": 68.73,
+      "win_rate": 50.0
+    },
+    "002489.SZ": {
+      "file": "adaptive_vol_002489_SZ.yaml",
+      "score": 3.5686,
+      "wf_score": 5.0661,
+      "sharpe": 0.69,
+      "return_pct": 69.43,
+      "win_rate": 40.0
+    },
+    "000829.SZ": {
+      "file": "adaptive_vol_000829_SZ.yaml",
+      "score": 4.2208,
+      "wf_score": 5.0637,
+      "sharpe": 1.25,
+      "return_pct": 174.31,
+      "win_rate": 60.0
+    },
+    "002906.SZ": {
+      "file": "adaptive_vol_002906_SZ.yaml",
+      "score": 4.0296,
+      "wf_score": 5.0572,
+      "sharpe": 0.94,
+      "return_pct": 68.0,
+      "win_rate": 60.0
+    },
+    "601777.SH": {
+      "file": "adaptive_vol_601777_SH.yaml",
+      "score": 4.0004,
+      "wf_score": 5.0479,
+      "sharpe": 0.8,
+      "return_pct": 71.11,
+      "win_rate": 60.0
+    },
+    "600125.SH": {
+      "file": "adaptive_vol_600125_SH.yaml",
+      "score": 3.8026,
+      "wf_score": 5.0169,
+      "sharpe": 1.04,
+      "return_pct": 62.55,
+      "win_rate": 60.0
+    },
+    "002063.SZ": {
+      "file": "adaptive_vol_002063_SZ.yaml",
+      "score": 3.5944,
+      "wf_score": 4.885,
+      "sharpe": 0.74,
+      "return_pct": 46.81,
+      "win_rate": 50.0
+    },
+    "300770.SZ": {
+      "file": "adaptive_vol_300770_SZ.yaml",
+      "score": 4.0668,
+      "wf_score": 4.8554,
+      "sharpe": 0.71,
+      "return_pct": 54.99,
+      "win_rate": 60.0
+    },
+    "000156.SZ": {
+      "file": "adaptive_vol_000156_SZ.yaml",
+      "score": 3.6056,
+      "wf_score": 4.8345,
+      "sharpe": 0.42,
+      "return_pct": 17.4,
+      "win_rate": 60.0
+    },
+    "300098.SZ": {
+      "file": "adaptive_vol_300098_SZ.yaml",
+      "score": 3.5712,
+      "wf_score": 4.8138,
+      "sharpe": 0.5,
+      "return_pct": 15.37,
+      "win_rate": 60.0
+    },
+    "600459.SH": {
+      "file": "adaptive_vol_600459_SH.yaml",
+      "score": 3.899,
+      "wf_score": 4.8067,
+      "sharpe": 0.46,
+      "return_pct": 29.96,
+      "win_rate": 60.0
+    },
+    "002354.SZ": {
+      "file": "adaptive_vol_002354_SZ.yaml",
+      "score": 3.8832,
+      "wf_score": 4.7687,
+      "sharpe": 0.31,
+      "return_pct": 13.81,
+      "win_rate": 80.0
+    },
+    "300925.SZ": {
+      "file": "adaptive_vol_300925_SZ.yaml",
+      "score": 4.7022,
+      "wf_score": 4.7337,
+      "sharpe": 1.48,
+      "return_pct": 318.93,
+      "win_rate": 80.0
+    },
+    "603327.SH": {
+      "file": "adaptive_vol_603327_SH.yaml",
+      "score": 3.4974,
+      "wf_score": 4.6959,
+      "sharpe": 0.41,
+      "return_pct": 13.25,
+      "win_rate": 80.0
+    },
+    "002516.SZ": {
+      "file": "adaptive_vol_002516_SZ.yaml",
+      "score": 3.4094,
+      "wf_score": 4.6877,
+      "sharpe": 0.35,
+      "return_pct": 10.84,
+      "win_rate": 80.0
+    },
+    "300298.SZ": {
+      "file": "adaptive_vol_300298_SZ.yaml",
+      "score": 4.0318,
+      "wf_score": 4.66,
+      "sharpe": 0.84,
+      "return_pct": 55.58,
+      "win_rate": 66.67
+    },
+    "301207.SZ": {
+      "file": "adaptive_vol_301207_SZ.yaml",
+      "score": 4.1128,
+      "wf_score": 4.6439,
+      "sharpe": 0.72,
+      "return_pct": 75.11,
+      "win_rate": 60.0
+    },
+    "002123.SZ": {
+      "file": "adaptive_vol_002123_SZ.yaml",
+      "score": 4.1992,
+      "wf_score": 4.6283,
+      "sharpe": 1.17,
+      "return_pct": 76.61,
+      "win_rate": 71.43
+    },
+    "688182.SH": {
+      "file": "adaptive_vol_688182_SH.yaml",
+      "score": 3.4568,
+      "wf_score": 4.6217,
+      "sharpe": 0.41,
+      "return_pct": 18.99,
+      "win_rate": 80.0
+    },
+    "301153.SZ": {
+      "file": "adaptive_vol_301153_SZ.yaml",
+      "score": 3.7924,
+      "wf_score": 4.5681,
+      "sharpe": 0.91,
+      "return_pct": 65.75,
+      "win_rate": 60.0
+    },
+    "300482.SZ": {
+      "file": "adaptive_vol_300482_SZ.yaml",
+      "score": 3.8676,
+      "wf_score": 4.5418,
+      "sharpe": 0.63,
+      "return_pct": 37.85,
+      "win_rate": 60.0
+    },
+    "300725.SZ": {
+      "file": "adaptive_vol_300725_SZ.yaml",
+      "score": 3.8938,
+      "wf_score": 4.4848,
+      "sharpe": 0.71,
+      "return_pct": 89.48,
+      "win_rate": 40.0
+    },
+    "300768.SZ": {
+      "file": "adaptive_vol_300768_SZ.yaml",
+      "score": 3.1142,
+      "wf_score": 4.4525,
+      "sharpe": 0.56,
+      "return_pct": 34.92,
+      "win_rate": 60.0
+    },
+    "688352.SH": {
+      "file": "adaptive_vol_688352_SH.yaml",
+      "score": 3.271,
+      "wf_score": 3.8685,
+      "sharpe": 0.67,
+      "return_pct": 33.96,
+      "win_rate": 66.67
+    },
+    "002651.SZ": {
+      "file": "adaptive_vol_002651_SZ.yaml",
+      "score": 4.0826,
+      "wf_score": 3.8665,
+      "sharpe": 0.81,
+      "return_pct": 55.25,
+      "win_rate": 66.67
+    },
+    "000935.SZ": {
+      "file": "adaptive_vol_000935_SZ.yaml",
+      "score": 4.4536,
+      "wf_score": 3.7779,
+      "sharpe": 1.19,
+      "return_pct": 146.57,
+      "win_rate": 66.67
+    },
+    "600850.SH": {
+      "file": "adaptive_vol_600850_SH.yaml",
+      "score": 3.9456,
+      "wf_score": 3.7583,
+      "sharpe": 0.62,
+      "return_pct": 39.86,
+      "win_rate": 60.0
+    },
+    "600654.SH": {
+      "file": "adaptive_vol_600654_SH.yaml",
+      "score": 4.1914,
+      "wf_score": 3.7471,
+      "sharpe": 1.11,
+      "return_pct": 117.87,
+      "win_rate": 57.14
+    },
+    "300077.SZ": {
+      "file": "adaptive_vol_300077_SZ.yaml",
+      "score": 4.152,
+      "wf_score": 3.5562,
+      "sharpe": 0.84,
+      "return_pct": 124.37,
+      "win_rate": 57.14
+    },
+    "688083.SH": {
+      "file": "adaptive_vol_688083_SH.yaml",
+      "score": 3.6706,
+      "wf_score": 3.4958,
+      "sharpe": 0.53,
+      "return_pct": 29.37,
+      "win_rate": 60.0
+    },
+    "601100.SH": {
+      "file": "adaptive_vol_601100_SH.yaml",
+      "score": 3.8592,
+      "wf_score": 3.4041,
+      "sharpe": 1.06,
+      "return_pct": 55.75,
+      "win_rate": 57.14
+    },
+    "300101.SZ": {
+      "file": "adaptive_vol_300101_SZ.yaml",
+      "score": 4.1412,
+      "wf_score": 3.2511,
+      "sharpe": 1.12,
+      "return_pct": 176.58,
+      "win_rate": 50.0
+    },
+    "688433.SH": {
+      "file": "adaptive_vol_688433_SH.yaml",
+      "score": 3.7836,
+      "wf_score": 3.2285,
+      "sharpe": 0.9,
+      "return_pct": 49.09,
+      "win_rate": 60.0
+    },
+    "688575.SH": {
+      "file": "adaptive_vol_688575_SH.yaml",
+      "score": 3.2094,
+      "wf_score": 3.1991,
+      "sharpe": 0.33,
+      "return_pct": 16.42,
+      "win_rate": 60.0
+    },
+    "600458.SH": {
+      "file": "adaptive_vol_600458_SH.yaml",
+      "score": 3.7964,
+      "wf_score": 3.1968,
+      "sharpe": 0.96,
+      "return_pct": 87.59,
+      "win_rate": 40.0
+    },
+    "002747.SZ": {
+      "file": "adaptive_vol_002747_SZ.yaml",
+      "score": 4.3882,
+      "wf_score": 3.1949,
+      "sharpe": 0.87,
+      "return_pct": 104.89,
+      "win_rate": 60.0
+    },
+    "601658.SH": {
+      "file": "adaptive_vol_601658_SH.yaml",
+      "score": 3.6758,
+      "wf_score": 3.1173,
+      "sharpe": 0.74,
+      "return_pct": 36.33,
+      "win_rate": 60.0
+    },
+    "000828.SZ": {
+      "file": "adaptive_vol_000828_SZ.yaml",
+      "score": 4.4764,
+      "wf_score": 3.1163,
+      "sharpe": 1.25,
+      "return_pct": 132.82,
+      "win_rate": 80.0
+    },
+    "301078.SZ": {
+      "file": "adaptive_vol_301078_SZ.yaml",
+      "score": 4.102,
+      "wf_score": 3.0976,
+      "sharpe": 1.4,
+      "return_pct": 271.8,
+      "win_rate": 50.0
+    },
+    "002324.SZ": {
+      "file": "adaptive_vol_002324_SZ.yaml",
+      "score": 3.6262,
+      "wf_score": 3.0479,
+      "sharpe": 0.8,
+      "return_pct": 80.63,
+      "win_rate": 40.0
+    },
+    "600894.SH": {
+      "file": "adaptive_vol_600894_SH.yaml",
+      "score": 4.1758,
+      "wf_score": 3.0461,
+      "sharpe": 0.73,
+      "return_pct": 31.52,
+      "win_rate": 80.0
+    },
+    "301263.SZ": {
+      "file": "adaptive_vol_301263_SZ.yaml",
+      "score": 3.5456,
+      "wf_score": 3.0137,
+      "sharpe": 0.68,
+      "return_pct": 59.84,
+      "win_rate": 50.0
+    },
+    "688232.SH": {
+      "file": "adaptive_vol_688232_SH.yaml",
+      "score": 3.544,
+      "wf_score": 3.0093,
+      "sharpe": 0.29,
+      "return_pct": 18.7,
+      "win_rate": 50.0
+    },
+    "002626.SZ": {
+      "file": "adaptive_vol_002626_SZ.yaml",
+      "score": 3.2478,
+      "wf_score": 2.9959,
+      "sharpe": 0.8,
+      "return_pct": 44.81,
+      "win_rate": 40.0
+    },
+    "000029.SZ": {
+      "file": "adaptive_vol_000029_SZ.yaml",
+      "score": 3.5054,
+      "wf_score": 2.9615,
+      "sharpe": 0.73,
+      "return_pct": 40.02,
+      "win_rate": 60.0
+    },
+    "002892.SZ": {
+      "file": "adaptive_vol_002892_SZ.yaml",
+      "score": 3.8688,
+      "wf_score": 2.9559,
+      "sharpe": 1.25,
+      "return_pct": 76.86,
+      "win_rate": 60.0
+    },
+    "600662.SH": {
+      "file": "adaptive_vol_600662_SH.yaml",
+      "score": 4.015,
+      "wf_score": 2.9346,
+      "sharpe": 0.59,
+      "return_pct": 53.35,
+      "win_rate": 60.0
+    },
+    "300357.SZ": {
+      "file": "adaptive_vol_300357_SZ.yaml",
+      "score": 4.1406,
+      "wf_score": 2.9118,
+      "sharpe": 0.54,
+      "return_pct": 47.83,
+      "win_rate": 60.0
+    },
+    "000913.SZ": {
+      "file": "adaptive_vol_000913_SZ.yaml",
+      "score": 4.0668,
+      "wf_score": 2.8811,
+      "sharpe": 1.13,
+      "return_pct": 141.6,
+      "win_rate": 60.0
+    },
+    "300433.SZ": {
+      "file": "adaptive_vol_300433_SZ.yaml",
+      "score": 4.2728,
+      "wf_score": 2.8425,
+      "sharpe": 1.01,
+      "return_pct": 78.07,
+      "win_rate": 80.0
+    },
+    "002993.SZ": {
+      "file": "adaptive_vol_002993_SZ.yaml",
+      "score": 3.5596,
+      "wf_score": 2.8121,
+      "sharpe": 0.93,
+      "return_pct": 62.52,
+      "win_rate": 42.86
+    },
+    "605333.SH": {
+      "file": "adaptive_vol_605333_SH.yaml",
+      "score": 3.1452,
+      "wf_score": 2.5313,
+      "sharpe": 1.01,
+      "return_pct": 37.61,
+      "win_rate": 40.0
+    },
+    "300341.SZ": {
+      "file": "adaptive_vol_300341_SZ.yaml",
+      "score": 3.96,
+      "wf_score": 2.4654,
+      "sharpe": 1.01,
+      "return_pct": 152.46,
+      "win_rate": 50.0
+    },
+    "600776.SH": {
+      "file": "adaptive_vol_600776_SH.yaml",
+      "score": 3.04,
+      "wf_score": 2.046,
+      "sharpe": 0.45,
+      "return_pct": 37.08,
+      "win_rate": 33.33
+    },
+    "601319.SH": {
+      "file": "adaptive_vol_601319_SH.yaml",
+      "score": 3.3404,
+      "wf_score": 1.7667,
+      "sharpe": 0.56,
+      "return_pct": 30.88,
+      "win_rate": 60.0
+    },
+    "688088.SH": {
+      "file": "adaptive_vol_688088_SH.yaml",
+      "score": 3.9,
+      "wf_score": 1.5292,
+      "sharpe": 0.48,
+      "return_pct": 29.7,
+      "win_rate": 60.0
+    },
+    "688789.SH": {
+      "file": "adaptive_vol_688789_SH.yaml",
+      "score": 3.1704,
+      "wf_score": 1.2613,
+      "sharpe": 0.63,
+      "return_pct": 49.24,
+      "win_rate": 55.56
+    },
+    "603983.SH": {
+      "file": "adaptive_vol_603983_SH.yaml",
+      "score": 4.1702,
+      "wf_score": 1.2535,
+      "sharpe": 0.88,
+      "return_pct": 105.61,
+      "win_rate": 62.5
+    },
+    "600030.SH": {
+      "file": "adaptive_vol_600030_SH.yaml",
+      "score": 4.091,
+      "wf_score": 1.169,
+      "sharpe": 1.0,
+      "return_pct": 75.72,
+      "win_rate": 60.0
+    },
+    "688658.SH": {
+      "file": "adaptive_vol_688658_SH.yaml",
+      "score": 3.5368,
+      "wf_score": 1.1267,
+      "sharpe": 0.97,
+      "return_pct": 99.72,
+      "win_rate": 37.5
+    },
+    "002487.SZ": {
+      "file": "adaptive_vol_002487_SZ.yaml",
+      "score": 4.076,
+      "wf_score": 0.3889,
+      "sharpe": 1.07,
+      "return_pct": 89.68,
+      "win_rate": 60.0
+    },
+    "300251.SZ": {
+      "file": "adaptive_vol_300251_SZ.yaml",
+      "score": 3.8456,
+      "wf_score": 0.3573,
+      "sharpe": 0.98,
+      "return_pct": 74.28,
+      "win_rate": 50.0
+    },
+    "300033.SZ": {
+      "file": "adaptive_vol_300033_SZ.yaml",
+      "score": 3.332,
+      "wf_score": 0.3301,
+      "sharpe": 0.96,
+      "return_pct": 186.06,
+      "win_rate": 16.67
+    },
+    "688321.SH": {
+      "file": "adaptive_vol_688321_SH.yaml",
+      "score": 4.482,
+      "wf_score": 0.3289,
+      "sharpe": 1.32,
+      "return_pct": 223.38,
+      "win_rate": 60.0
+    },
+    "002399.SZ": {
+      "file": "adaptive_vol_002399_SZ.yaml",
+      "score": 3.6086,
+      "wf_score": 0.3045,
+      "sharpe": 0.74,
+      "return_pct": 65.28,
+      "win_rate": 40.0
+    },
+    "600502.SH": {
+      "file": "adaptive_vol_600502_SH.yaml",
+      "score": 3.934,
+      "wf_score": 0.2919,
+      "sharpe": 0.64,
+      "return_pct": 46.69,
+      "win_rate": 60.0
+    },
+    "603826.SH": {
+      "file": "adaptive_vol_603826_SH.yaml",
+      "score": 3.6098,
+      "wf_score": 0.2709,
+      "sharpe": 0.76,
+      "return_pct": 49.85,
+      "win_rate": 40.0
+    },
+    "000950.SZ": {
+      "file": "adaptive_vol_000950_SZ.yaml",
+      "score": 3.7364,
+      "wf_score": 0.2187,
+      "sharpe": 0.81,
+      "return_pct": 27.94,
+      "win_rate": 60.0
+    },
+    "002287.SZ": {
+      "file": "adaptive_vol_002287_SZ.yaml",
+      "score": 3.9308,
+      "wf_score": 0.2183,
+      "sharpe": 0.81,
+      "return_pct": 63.08,
+      "win_rate": 60.0
+    },
+    "300102.SZ": {
+      "file": "adaptive_vol_300102_SZ.yaml",
+      "score": 3.7098,
+      "wf_score": 0.2051,
+      "sharpe": 0.73,
+      "return_pct": 44.44,
+      "win_rate": 60.0
+    },
+    "300352.SZ": {
+      "file": "adaptive_vol_300352_SZ.yaml",
+      "score": 4.3424,
+      "wf_score": 0.1697,
+      "sharpe": 0.61,
+      "return_pct": 49.06,
+      "win_rate": 80.0
+    },
+    "300428.SZ": {
+      "file": "adaptive_vol_300428_SZ.yaml",
+      "score": 3.6162,
+      "wf_score": 0.1616,
+      "sharpe": 0.85,
+      "return_pct": 92.16,
+      "win_rate": 40.0
+    },
+    "603236.SH": {
+      "file": "adaptive_vol_603236_SH.yaml",
+      "score": 4.0404,
+      "wf_score": 0.1615,
+      "sharpe": 1.47,
+      "return_pct": 254.9,
+      "win_rate": 42.86
+    },
+    "002625.SZ": {
+      "file": "adaptive_vol_002625_SZ.yaml",
+      "score": 3.1982,
+      "wf_score": 0.1531,
+      "sharpe": 1.01,
+      "return_pct": 91.95,
+      "win_rate": 20.0
+    },
+    "300327.SZ": {
+      "file": "adaptive_vol_300327_SZ.yaml",
+      "score": 3.9088,
+      "wf_score": 0.1345,
+      "sharpe": 0.7,
+      "return_pct": 77.11,
+      "win_rate": 50.0
+    },
+    "001308.SZ": {
+      "file": "adaptive_vol_001308_SZ.yaml",
+      "score": 3.5508,
+      "wf_score": 0.1228,
+      "sharpe": 0.86,
+      "return_pct": 35.94,
+      "win_rate": 50.0
+    },
+    "600056.SH": {
+      "file": "adaptive_vol_600056_SH.yaml",
+      "score": 3.1282,
+      "wf_score": 0.1213,
+      "sharpe": 0.14,
+      "return_pct": 8.92,
+      "win_rate": 60.0
+    },
+    "002075.SZ": {
+      "file": "adaptive_vol_002075_SZ.yaml",
+      "score": 3.466,
+      "wf_score": 0.1171,
+      "sharpe": 0.99,
+      "return_pct": 129.11,
+      "win_rate": 33.33
+    },
+    "300772.SZ": {
+      "file": "adaptive_vol_300772_SZ.yaml",
+      "score": 3.5414,
+      "wf_score": 0.1146,
+      "sharpe": 0.96,
+      "return_pct": 158.97,
+      "win_rate": 20.0
+    },
+    "300009.SZ": {
+      "file": "adaptive_vol_300009_SZ.yaml",
+      "score": 3.347,
+      "wf_score": 0.1135,
+      "sharpe": 0.53,
+      "return_pct": 14.54,
+      "win_rate": 80.0
+    },
+    "688126.SH": {
+      "file": "adaptive_vol_688126_SH.yaml",
+      "score": 3.7722,
+      "wf_score": 0.1067,
+      "sharpe": 0.63,
+      "return_pct": 22.62,
+      "win_rate": 66.67
+    },
+    "600335.SH": {
+      "file": "adaptive_vol_600335_SH.yaml",
+      "score": 3.557,
+      "wf_score": 0.1061,
+      "sharpe": 0.61,
+      "return_pct": 20.97,
+      "win_rate": 60.0
+    },
+    "605009.SH": {
+      "file": "adaptive_vol_605009_SH.yaml",
+      "score": 4.122,
+      "wf_score": 0.0973,
+      "sharpe": 1.28,
+      "return_pct": 120.45,
+      "win_rate": 63.64
+    },
+    "603871.SH": {
+      "file": "adaptive_vol_603871_SH.yaml",
+      "score": 4.063,
+      "wf_score": 0.0858,
+      "sharpe": 1.16,
+      "return_pct": 135.42,
+      "win_rate": 57.14
+    },
+    "603613.SH": {
+      "file": "adaptive_vol_603613_SH.yaml",
+      "score": 3.5244,
+      "wf_score": 0.0676,
+      "sharpe": 0.63,
+      "return_pct": 58.92,
+      "win_rate": 60.0
+    },
+    "300910.SZ": {
+      "file": "adaptive_vol_300910_SZ.yaml",
+      "score": 3.429,
+      "wf_score": 0.0587,
+      "sharpe": 0.63,
+      "return_pct": 23.99,
+      "win_rate": 60.0
+    },
+    "300682.SZ": {
+      "file": "adaptive_vol_300682_SZ.yaml",
+      "score": 3.8306,
+      "wf_score": 0.054,
+      "sharpe": 1.0,
+      "return_pct": 129.42,
+      "win_rate": 33.33
+    },
+    "002351.SZ": {
+      "file": "adaptive_vol_002351_SZ.yaml",
+      "score": 3.182,
+      "wf_score": 0.0527,
+      "sharpe": 0.41,
+      "return_pct": 16.31,
+      "win_rate": 71.43
+    },
+    "600657.SH": {
+      "file": "adaptive_vol_600657_SH.yaml",
+      "score": 3.6354,
+      "wf_score": 0.0519,
+      "sharpe": 0.89,
+      "return_pct": 93.0,
+      "win_rate": 40.0
+    },
+    "600273.SH": {
+      "file": "adaptive_vol_600273_SH.yaml",
+      "score": 4.2262,
+      "wf_score": 0.0468,
+      "sharpe": 1.19,
+      "return_pct": 54.55,
+      "win_rate": 80.0
+    },
+    "300457.SZ": {
+      "file": "adaptive_vol_300457_SZ.yaml",
+      "score": 3.0702,
+      "wf_score": 0.0349,
+      "sharpe": 0.45,
+      "return_pct": 39.99,
+      "win_rate": 40.0
+    },
+    "688432.SH": {
+      "file": "adaptive_vol_688432_SH.yaml",
+      "score": 3.4356,
+      "wf_score": 0.0203,
+      "sharpe": 0.53,
+      "return_pct": 30.23,
+      "win_rate": 60.0
+    },
+    "300702.SZ": {
+      "file": "adaptive_vol_300702_SZ.yaml",
+      "score": 3.5964,
+      "wf_score": 0.0159,
+      "sharpe": 0.59,
+      "return_pct": 25.35,
+      "win_rate": 60.0
+    },
+    "688262.SH": {
+      "file": "adaptive_vol_688262_SH.yaml",
+      "score": 3.7056,
+      "wf_score": 0.0136,
+      "sharpe": 1.11,
+      "return_pct": 233.64,
+      "win_rate": 28.57
+    },
+    "688396.SH": {
+      "file": "adaptive_vol_688396_SH.yaml",
+      "score": 3.7122,
+      "wf_score": 0.0133,
+      "sharpe": 0.95,
+      "return_pct": 41.26,
+      "win_rate": 60.0
+    },
+    "300579.SZ": {
+      "file": "adaptive_vol_300579_SZ.yaml",
+      "score": 4.0706,
+      "wf_score": 0.008,
+      "sharpe": 0.45,
+      "return_pct": 39.64,
+      "win_rate": 60.0
+    },
+    "301550.SZ": {
+      "file": "adaptive_vol_301550_SZ.yaml",
+      "score": 4.0926,
+      "wf_score": 0.0013,
+      "sharpe": 1.32,
+      "return_pct": 105.4,
+      "win_rate": 66.67
+    }
+  }
+}

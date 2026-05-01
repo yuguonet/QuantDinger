@@ -88,3 +88,4 @@ optimizer/data_warehouse/
 optimizer/optimizer_output/
 optimizer_output_llm_v2/
 optimizer_output_llm_v2x/
+optimizer/strategies/

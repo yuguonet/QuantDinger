@@ -1,0 +1,3966 @@
+{
+  "description": "双优股票清单：回测得分>3 且 WF验证得分>0",
+  "criteria": {
+    "min_best_score": 3.0,
+    "min_wf_score": 0.0
+  },
+  "extracted_at": "2026-05-01 08:54",
+  "total_scanned": 1266,
+  "elite_count": 101,
+  "stocks": {
+    "000603.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.9172,
+      "best_params": {
+        "rsi_period": 15,
+        "rsi_threshold": 34,
+        "vol_ma_period": 17,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 4.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.86,
+        "totalReturn": 82.45,
+        "winRate": 50.0,
+        "maxDrawdown": -28.66,
+        "profitFactor": 7.87,
+        "totalTrades": 6,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 5.4333,
+      "wf_validation": {
+        "avg_train_score": -6.9537,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.9071,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\000603.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "深主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "300284.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.5978,
+      "best_params": {
+        "rsi_period": 11,
+        "rsi_threshold": 32,
+        "vol_ma_period": 16,
+        "vol_ratio": 1.4,
+        "stop_loss_pct": 3.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.95,
+        "totalReturn": 101.09,
+        "winRate": 33.33,
+        "maxDrawdown": -27.56,
+        "profitFactor": 5.06,
+        "totalTrades": 6,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 5.3505,
+      "wf_validation": {
+        "avg_train_score": -6.507,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.9028,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\300284.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "600210.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.1558,
+      "best_params": {
+        "rsi_period": 19,
+        "rsi_threshold": 31,
+        "vol_ma_period": 18,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 3.5
+      },
+      "metrics": {
+        "sharpeRatio": 1.09,
+        "totalReturn": 112.36,
+        "winRate": 60.0,
+        "maxDrawdown": -25.99,
+        "profitFactor": 14.89,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 5.3291,
+      "wf_validation": {
+        "avg_train_score": -6.8317,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.9107,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\600210.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "沪主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "000650.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.306,
+      "best_params": {
+        "rsi_period": 11,
+        "rsi_threshold": 32,
+        "vol_ma_period": 16,
+        "vol_ratio": 1.4,
+        "stop_loss_pct": 3.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.76,
+        "totalReturn": 32.72,
+        "winRate": 50.0,
+        "maxDrawdown": -8.7,
+        "profitFactor": 4.57,
+        "totalTrades": 6,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 5.2457,
+      "wf_validation": {
+        "avg_train_score": -3.5287,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.9468,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\000650.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "深主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "002745.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.7616,
+      "best_params": {
+        "rsi_period": 18,
+        "rsi_threshold": 35,
+        "vol_ma_period": 10,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 5.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.84,
+        "totalReturn": 68.73,
+        "winRate": 50.0,
+        "maxDrawdown": -21.28,
+        "profitFactor": 7.76,
+        "totalTrades": 6,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 5.0927,
+      "wf_validation": {
+        "avg_train_score": -3.6143,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.9458,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\002745.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "中小板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "002489.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.5686,
+      "best_params": {
+        "rsi_period": 15,
+        "rsi_threshold": 31,
+        "vol_ma_period": 12,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 2.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.69,
+        "totalReturn": 69.43,
+        "winRate": 40.0,
+        "maxDrawdown": -24.63,
+        "profitFactor": 6.35,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 5.0661,
+      "wf_validation": {
+        "avg_train_score": -6.8923,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.9525,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\002489.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "中小板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "000829.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.2208,
+      "best_params": {
+        "rsi_period": 15,
+        "rsi_threshold": 34,
+        "vol_ma_period": 17,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 4.5
+      },
+      "metrics": {
+        "sharpeRatio": 1.25,
+        "totalReturn": 174.31,
+        "winRate": 60.0,
+        "maxDrawdown": -26.04,
+        "profitFactor": 20.54,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 5.0637,
+      "wf_validation": {
+        "avg_train_score": -6.6571,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.972,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\000829.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "深主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "002906.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.0296,
+      "best_params": {
+        "rsi_period": 15,
+        "rsi_threshold": 34,
+        "vol_ma_period": 17,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 4.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.94,
+        "totalReturn": 68.0,
+        "winRate": 60.0,
+        "maxDrawdown": -22.68,
+        "profitFactor": 6.39,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 5.0572,
+      "wf_validation": {
+        "avg_train_score": -6.5661,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.9331,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\002906.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "中小板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "601777.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.0004,
+      "best_params": {
+        "rsi_period": 15,
+        "rsi_threshold": 38,
+        "vol_ma_period": 17,
+        "vol_ratio": 1.5,
+        "stop_loss_pct": 4.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.8,
+        "totalReturn": 71.11,
+        "winRate": 60.0,
+        "maxDrawdown": -24.02,
+        "profitFactor": 8.0,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 5.0479,
+      "wf_validation": {
+        "avg_train_score": -3.3592,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.9838,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\601777.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "沪主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "600125.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.8026,
+      "best_params": {
+        "rsi_period": 11,
+        "rsi_threshold": 32,
+        "vol_ma_period": 16,
+        "vol_ratio": 1.4,
+        "stop_loss_pct": 3.5
+      },
+      "metrics": {
+        "sharpeRatio": 1.04,
+        "totalReturn": 62.55,
+        "winRate": 60.0,
+        "maxDrawdown": -9.33,
+        "profitFactor": 6.23,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 5.0169,
+      "wf_validation": {
+        "avg_train_score": -6.9841,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.9424,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\600125.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "沪主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "002063.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.5944,
+      "best_params": {
+        "rsi_period": 20,
+        "rsi_threshold": 39,
+        "vol_ma_period": 14,
+        "vol_ratio": 1.5,
+        "stop_loss_pct": 2.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.74,
+        "totalReturn": 46.81,
+        "winRate": 50.0,
+        "maxDrawdown": -14.92,
+        "profitFactor": 7.06,
+        "totalTrades": 6,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 4.885,
+      "wf_validation": {
+        "avg_train_score": -3.5139,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.9756,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\002063.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "中小板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "300770.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.0668,
+      "best_params": {
+        "rsi_period": 18,
+        "rsi_threshold": 35,
+        "vol_ma_period": 10,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 5.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.71,
+        "totalReturn": 54.99,
+        "winRate": 60.0,
+        "maxDrawdown": -29.14,
+        "profitFactor": 8.16,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 4.8554,
+      "wf_validation": {
+        "avg_train_score": -3.4897,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.8819,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\300770.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "000156.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.6056,
+      "best_params": {
+        "rsi_period": 15,
+        "rsi_threshold": 31,
+        "vol_ma_period": 12,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 2.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.42,
+        "totalReturn": 17.4,
+        "winRate": 60.0,
+        "maxDrawdown": -11.88,
+        "profitFactor": 5.4,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 4.8345,
+      "wf_validation": {
+        "avg_train_score": -6.6874,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.9969,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\000156.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "深主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "300098.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.5712,
+      "best_params": {
+        "rsi_period": 15,
+        "rsi_threshold": 31,
+        "vol_ma_period": 12,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 2.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.5,
+        "totalReturn": 15.37,
+        "winRate": 60.0,
+        "maxDrawdown": -8.56,
+        "profitFactor": 5.54,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 4.8138,
+      "wf_validation": {
+        "avg_train_score": -10.0,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.9292,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\300098.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "600459.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.899,
+      "best_params": {
+        "rsi_period": 15,
+        "rsi_threshold": 31,
+        "vol_ma_period": 12,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 2.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.46,
+        "totalReturn": 29.96,
+        "winRate": 60.0,
+        "maxDrawdown": -25.75,
+        "profitFactor": 7.82,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 4.8067,
+      "wf_validation": {
+        "avg_train_score": -2.049,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.9129,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\600459.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "沪主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "002354.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.8832,
+      "best_params": {
+        "rsi_period": 18,
+        "rsi_threshold": 35,
+        "vol_ma_period": 10,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 5.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.31,
+        "totalReturn": 13.81,
+        "winRate": 80.0,
+        "maxDrawdown": -13.56,
+        "profitFactor": 4.72,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 4.7687,
+      "wf_validation": {
+        "avg_train_score": -1.9933,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.9674,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\002354.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "中小板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "300925.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.7022,
+      "best_params": {
+        "rsi_period": 15,
+        "rsi_threshold": 31,
+        "vol_ma_period": 12,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 2.5
+      },
+      "metrics": {
+        "sharpeRatio": 1.48,
+        "totalReturn": 318.93,
+        "winRate": 80.0,
+        "maxDrawdown": -25.51,
+        "profitFactor": 64.77,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 4.7337,
+      "wf_validation": {
+        "avg_train_score": -10.0,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.9095,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\300925.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "603327.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.4974,
+      "best_params": {
+        "rsi_period": 12,
+        "rsi_threshold": 33,
+        "vol_ma_period": 11,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 3.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.41,
+        "totalReturn": 13.25,
+        "winRate": 80.0,
+        "maxDrawdown": -4.67,
+        "profitFactor": 4.1,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 4.6959,
+      "wf_validation": {
+        "avg_train_score": -6.8822,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.9353,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\603327.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "沪主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "002516.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.4094,
+      "best_params": {
+        "rsi_period": 17,
+        "rsi_threshold": 36,
+        "vol_ma_period": 15,
+        "vol_ratio": 1.7,
+        "stop_loss_pct": 2.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.35,
+        "totalReturn": 10.84,
+        "winRate": 80.0,
+        "maxDrawdown": -4.07,
+        "profitFactor": 3.97,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 4.6877,
+      "wf_validation": {
+        "avg_train_score": -6.9755,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.9396,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\002516.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "中小板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "300298.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.0318,
+      "best_params": {
+        "rsi_period": 10,
+        "rsi_threshold": 26,
+        "vol_ma_period": 20,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 4.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.84,
+        "totalReturn": 55.58,
+        "winRate": 66.67,
+        "maxDrawdown": -18.12,
+        "profitFactor": 11.27,
+        "totalTrades": 6,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 4.66,
+      "wf_validation": {
+        "avg_train_score": -5.3723,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.9609,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\300298.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "301207.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.1128,
+      "best_params": {
+        "rsi_period": 18,
+        "rsi_threshold": 40,
+        "vol_ma_period": 14,
+        "vol_ratio": 1.4,
+        "stop_loss_pct": 2.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.72,
+        "totalReturn": 75.11,
+        "winRate": 60.0,
+        "maxDrawdown": -31.24,
+        "profitFactor": 10.54,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 4.6439,
+      "wf_validation": {
+        "avg_train_score": -4.9759,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.8598,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\301207.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "002123.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.1992,
+      "best_params": {
+        "rsi_period": 15,
+        "rsi_threshold": 34,
+        "vol_ma_period": 17,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 4.5
+      },
+      "metrics": {
+        "sharpeRatio": 1.17,
+        "totalReturn": 76.61,
+        "winRate": 71.43,
+        "maxDrawdown": -15.13,
+        "profitFactor": 6.85,
+        "totalTrades": 7,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 4.6283,
+      "wf_validation": {
+        "avg_train_score": -1.3793,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.9175,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\002123.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "中小板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "688182.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.4568,
+      "best_params": {
+        "rsi_period": 18,
+        "rsi_threshold": 35,
+        "vol_ma_period": 10,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 5.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.41,
+        "totalReturn": 18.99,
+        "winRate": 80.0,
+        "maxDrawdown": -12.04,
+        "profitFactor": 3.63,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 4.6217,
+      "wf_validation": {
+        "avg_train_score": -5.1597,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.9369,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\688182.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "科创板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "301153.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.7924,
+      "best_params": {
+        "rsi_period": 18,
+        "rsi_threshold": 40,
+        "vol_ma_period": 14,
+        "vol_ratio": 1.4,
+        "stop_loss_pct": 2.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.91,
+        "totalReturn": 65.75,
+        "winRate": 60.0,
+        "maxDrawdown": -11.42,
+        "profitFactor": 6.99,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 4.5681,
+      "wf_validation": {
+        "avg_train_score": -10.0,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.8557,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\301153.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "300482.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.8676,
+      "best_params": {
+        "rsi_period": 14,
+        "rsi_threshold": 38,
+        "vol_ma_period": 20,
+        "vol_ratio": 1.7,
+        "stop_loss_pct": 3.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.63,
+        "totalReturn": 37.85,
+        "winRate": 60.0,
+        "maxDrawdown": -20.78,
+        "profitFactor": 6.27,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 4.5418,
+      "wf_validation": {
+        "avg_train_score": -3.6762,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.8938,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\300482.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "300725.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.8938,
+      "best_params": {
+        "rsi_period": 15,
+        "rsi_threshold": 34,
+        "vol_ma_period": 17,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 4.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.71,
+        "totalReturn": 89.48,
+        "winRate": 40.0,
+        "maxDrawdown": -40.49,
+        "profitFactor": 6.69,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 4.4848,
+      "wf_validation": {
+        "avg_train_score": -7.0111,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.79,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\300725.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "300768.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.1142,
+      "best_params": {
+        "rsi_period": 18,
+        "rsi_threshold": 35,
+        "vol_ma_period": 10,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 5.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.56,
+        "totalReturn": 34.92,
+        "winRate": 60.0,
+        "maxDrawdown": -15.11,
+        "profitFactor": 3.47,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 4.4525,
+      "wf_validation": {
+        "avg_train_score": -10.0,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.8792,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\300768.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "688352.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.271,
+      "best_params": {
+        "rsi_period": 12,
+        "rsi_threshold": 33,
+        "vol_ma_period": 11,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 3.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.67,
+        "totalReturn": 33.96,
+        "winRate": 66.67,
+        "maxDrawdown": -12.28,
+        "profitFactor": 3.56,
+        "totalTrades": 6,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 3.8685,
+      "wf_validation": {
+        "avg_train_score": -6.6568,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.7487,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\688352.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "科创板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "002651.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.0826,
+      "best_params": {
+        "rsi_period": 18,
+        "rsi_threshold": 35,
+        "vol_ma_period": 10,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 5.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.81,
+        "totalReturn": 55.25,
+        "winRate": 66.67,
+        "maxDrawdown": -21.26,
+        "profitFactor": 5.78,
+        "totalTrades": 6,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 3.8665,
+      "wf_validation": {
+        "avg_train_score": -7.0395,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.592,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\002651.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "中小板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "000935.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.4536,
+      "best_params": {
+        "rsi_period": 18,
+        "rsi_threshold": 35,
+        "vol_ma_period": 10,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 5.0
+      },
+      "metrics": {
+        "sharpeRatio": 1.19,
+        "totalReturn": 146.57,
+        "winRate": 66.67,
+        "maxDrawdown": -32.21,
+        "profitFactor": 14.76,
+        "totalTrades": 6,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 3.7779,
+      "wf_validation": {
+        "avg_train_score": -0.4651,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.5524,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\000935.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "深主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "600850.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.9456,
+      "best_params": {
+        "rsi_period": 12,
+        "rsi_threshold": 33,
+        "vol_ma_period": 11,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 3.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.62,
+        "totalReturn": 39.86,
+        "winRate": 60.0,
+        "maxDrawdown": -24.88,
+        "profitFactor": 5.68,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 3.7583,
+      "wf_validation": {
+        "avg_train_score": -1.8199,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.4869,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\600850.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "沪主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "600654.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.1914,
+      "best_params": {
+        "rsi_period": 18,
+        "rsi_threshold": 35,
+        "vol_ma_period": 10,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 5.0
+      },
+      "metrics": {
+        "sharpeRatio": 1.11,
+        "totalReturn": 117.87,
+        "winRate": 57.14,
+        "maxDrawdown": -30.23,
+        "profitFactor": 7.25,
+        "totalTrades": 7,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 3.7471,
+      "wf_validation": {
+        "avg_train_score": 3.2171,
+        "overfitting_ratio": -0.1647,
+        "consistency": 0.4489,
+        "verdict": "⚠️ 不稳定 — 测试集得分波动大，策略不够稳健"
+      },
+      "source_file": "CNStock\\daily\\600654.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "沪主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "300077.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.152,
+      "best_params": {
+        "rsi_period": 15,
+        "rsi_threshold": 31,
+        "vol_ma_period": 12,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 2.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.84,
+        "totalReturn": 124.37,
+        "winRate": 57.14,
+        "maxDrawdown": -33.66,
+        "profitFactor": 9.23,
+        "totalTrades": 7,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 3.5562,
+      "wf_validation": {
+        "avg_train_score": -3.3999,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.5155,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\300077.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "688083.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.6706,
+      "best_params": {
+        "rsi_period": 20,
+        "rsi_threshold": 39,
+        "vol_ma_period": 14,
+        "vol_ratio": 1.5,
+        "stop_loss_pct": 2.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.53,
+        "totalReturn": 29.37,
+        "winRate": 60.0,
+        "maxDrawdown": -12.93,
+        "profitFactor": 5.78,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 3.4958,
+      "wf_validation": {
+        "avg_train_score": -6.7606,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.4676,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\688083.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "科创板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "601100.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.8592,
+      "best_params": {
+        "rsi_period": 12,
+        "rsi_threshold": 28,
+        "vol_ma_period": 27,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 3.5
+      },
+      "metrics": {
+        "sharpeRatio": 1.06,
+        "totalReturn": 55.75,
+        "winRate": 57.14,
+        "maxDrawdown": -14.62,
+        "profitFactor": 9.47,
+        "totalTrades": 7,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 3.4041,
+      "wf_validation": {
+        "avg_train_score": -0.7501,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.3182,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\601100.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "沪主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "300101.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.1412,
+      "best_params": {
+        "rsi_period": 18,
+        "rsi_threshold": 35,
+        "vol_ma_period": 10,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 5.0
+      },
+      "metrics": {
+        "sharpeRatio": 1.12,
+        "totalReturn": 176.58,
+        "winRate": 50.0,
+        "maxDrawdown": -34.66,
+        "profitFactor": 9.4,
+        "totalTrades": 6,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 3.2511,
+      "wf_validation": {
+        "avg_train_score": 1.2763,
+        "overfitting_ratio": -1.5472,
+        "consistency": 0.188,
+        "verdict": "⚠️ 不稳定 — 测试集得分波动大，策略不够稳健"
+      },
+      "source_file": "CNStock\\daily\\300101.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "688433.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.7836,
+      "best_params": {
+        "rsi_period": 12,
+        "rsi_threshold": 33,
+        "vol_ma_period": 11,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 3.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.9,
+        "totalReturn": 49.09,
+        "winRate": 60.0,
+        "maxDrawdown": -11.18,
+        "profitFactor": 10.72,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 3.2285,
+      "wf_validation": {
+        "avg_train_score": -5.4815,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.2833,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\688433.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "科创板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "688575.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.2094,
+      "best_params": {
+        "rsi_period": 11,
+        "rsi_threshold": 32,
+        "vol_ma_period": 16,
+        "vol_ratio": 1.4,
+        "stop_loss_pct": 3.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.33,
+        "totalReturn": 16.42,
+        "winRate": 60.0,
+        "maxDrawdown": -15.47,
+        "profitFactor": 3.92,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 3.1991,
+      "wf_validation": {
+        "avg_train_score": -5.7741,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.2897,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\688575.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "科创板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "600458.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.7964,
+      "best_params": {
+        "rsi_period": 16,
+        "rsi_threshold": 35,
+        "vol_ma_period": 18,
+        "vol_ratio": 1.4,
+        "stop_loss_pct": 5.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.96,
+        "totalReturn": 87.59,
+        "winRate": 40.0,
+        "maxDrawdown": -30.62,
+        "profitFactor": 13.6,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 3.1968,
+      "wf_validation": {
+        "avg_train_score": -1.9508,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\600458.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "沪主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "002747.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.3882,
+      "best_params": {
+        "rsi_period": 18,
+        "rsi_threshold": 40,
+        "vol_ma_period": 14,
+        "vol_ratio": 1.4,
+        "stop_loss_pct": 2.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.87,
+        "totalReturn": 104.89,
+        "winRate": 60.0,
+        "maxDrawdown": -42.01,
+        "profitFactor": 6.91,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 3.1949,
+      "wf_validation": {
+        "avg_train_score": -10.0,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0984,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\002747.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "中小板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "601658.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.6758,
+      "best_params": {
+        "rsi_period": 11,
+        "rsi_threshold": 39,
+        "vol_ma_period": 27,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 4.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.74,
+        "totalReturn": 36.33,
+        "winRate": 60.0,
+        "maxDrawdown": -13.99,
+        "profitFactor": 4.75,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 3.1173,
+      "wf_validation": {
+        "avg_train_score": -1.8927,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.1355,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\601658.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "沪主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "000828.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.4764,
+      "best_params": {
+        "rsi_period": 15,
+        "rsi_threshold": 34,
+        "vol_ma_period": 17,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 4.5
+      },
+      "metrics": {
+        "sharpeRatio": 1.25,
+        "totalReturn": 132.82,
+        "winRate": 80.0,
+        "maxDrawdown": -18.82,
+        "profitFactor": 14.46,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 3.1163,
+      "wf_validation": {
+        "avg_train_score": 3.0642,
+        "overfitting_ratio": -0.017,
+        "consistency": 0.2148,
+        "verdict": "⚠️ 不稳定 — 测试集得分波动大，策略不够稳健"
+      },
+      "source_file": "CNStock\\daily\\000828.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "深主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "301078.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.102,
+      "best_params": {
+        "rsi_period": 12,
+        "rsi_threshold": 33,
+        "vol_ma_period": 11,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 3.5
+      },
+      "metrics": {
+        "sharpeRatio": 1.4,
+        "totalReturn": 271.8,
+        "winRate": 50.0,
+        "maxDrawdown": -27.1,
+        "profitFactor": 18.89,
+        "totalTrades": 6,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 3.0976,
+      "wf_validation": {
+        "avg_train_score": -1.8258,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.1077,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\301078.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "002324.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.6262,
+      "best_params": {
+        "rsi_period": 18,
+        "rsi_threshold": 35,
+        "vol_ma_period": 10,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 5.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.8,
+        "totalReturn": 80.63,
+        "winRate": 40.0,
+        "maxDrawdown": -30.51,
+        "profitFactor": 4.74,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 3.0479,
+      "wf_validation": {
+        "avg_train_score": -5.4535,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.1964,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\002324.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "中小板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "600894.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.1758,
+      "best_params": {
+        "rsi_period": 11,
+        "rsi_threshold": 32,
+        "vol_ma_period": 16,
+        "vol_ratio": 1.4,
+        "stop_loss_pct": 3.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.73,
+        "totalReturn": 31.52,
+        "winRate": 80.0,
+        "maxDrawdown": -14.19,
+        "profitFactor": 19.22,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 3.0461,
+      "wf_validation": {
+        "avg_train_score": -5.1039,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.1507,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\600894.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "沪主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "301263.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.5456,
+      "best_params": {
+        "rsi_period": 16,
+        "rsi_threshold": 35,
+        "vol_ma_period": 18,
+        "vol_ratio": 1.4,
+        "stop_loss_pct": 5.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.68,
+        "totalReturn": 59.84,
+        "winRate": 50.0,
+        "maxDrawdown": -32.88,
+        "profitFactor": 4.04,
+        "totalTrades": 6,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 3.0137,
+      "wf_validation": {
+        "avg_train_score": -3.2607,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.1078,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\301263.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "688232.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.544,
+      "best_params": {
+        "rsi_period": 10,
+        "rsi_threshold": 30,
+        "vol_ma_period": 22,
+        "vol_ratio": 1.2,
+        "stop_loss_pct": 3.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.29,
+        "totalReturn": 18.7,
+        "winRate": 50.0,
+        "maxDrawdown": -48.4,
+        "profitFactor": 3.65,
+        "totalTrades": 6,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 3.0093,
+      "wf_validation": {
+        "avg_train_score": 2.8001,
+        "overfitting_ratio": -0.0747,
+        "consistency": 0.0896,
+        "verdict": "⚠️ 不稳定 — 测试集得分波动大，策略不够稳健"
+      },
+      "source_file": "CNStock\\daily\\688232.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "科创板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "002626.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.2478,
+      "best_params": {
+        "rsi_period": 18,
+        "rsi_threshold": 40,
+        "vol_ma_period": 14,
+        "vol_ratio": 1.4,
+        "stop_loss_pct": 2.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.8,
+        "totalReturn": 44.81,
+        "winRate": 40.0,
+        "maxDrawdown": -10.99,
+        "profitFactor": 4.77,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 2.9959,
+      "wf_validation": {
+        "avg_train_score": -6.6441,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.1192,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\002626.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "中小板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "000029.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.5054,
+      "best_params": {
+        "rsi_period": 18,
+        "rsi_threshold": 35,
+        "vol_ma_period": 10,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 5.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.73,
+        "totalReturn": 40.02,
+        "winRate": 60.0,
+        "maxDrawdown": -20.07,
+        "profitFactor": 4.03,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 2.9615,
+      "wf_validation": {
+        "avg_train_score": -6.8351,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.1864,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\000029.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "深主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "002892.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.8688,
+      "best_params": {
+        "rsi_period": 12,
+        "rsi_threshold": 33,
+        "vol_ma_period": 11,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 3.5
+      },
+      "metrics": {
+        "sharpeRatio": 1.25,
+        "totalReturn": 76.86,
+        "winRate": 60.0,
+        "maxDrawdown": -8.44,
+        "profitFactor": 8.17,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 2.9559,
+      "wf_validation": {
+        "avg_train_score": -4.9344,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0876,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\002892.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "中小板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "600662.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.015,
+      "best_params": {
+        "rsi_period": 15,
+        "rsi_threshold": 34,
+        "vol_ma_period": 17,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 4.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.59,
+        "totalReturn": 53.35,
+        "winRate": 60.0,
+        "maxDrawdown": -28.95,
+        "profitFactor": 5.23,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 2.9346,
+      "wf_validation": {
+        "avg_train_score": -2.1825,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.1258,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\600662.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "沪主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "300357.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.1406,
+      "best_params": {
+        "rsi_period": 13,
+        "rsi_threshold": 31,
+        "vol_ma_period": 19,
+        "vol_ratio": 1.7,
+        "stop_loss_pct": 4.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.54,
+        "totalReturn": 47.83,
+        "winRate": 60.0,
+        "maxDrawdown": -36.23,
+        "profitFactor": 7.49,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 2.9118,
+      "wf_validation": {
+        "avg_train_score": -1.7187,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0873,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\300357.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "000913.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.0668,
+      "best_params": {
+        "rsi_period": 18,
+        "rsi_threshold": 35,
+        "vol_ma_period": 10,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 5.0
+      },
+      "metrics": {
+        "sharpeRatio": 1.13,
+        "totalReturn": 141.6,
+        "winRate": 60.0,
+        "maxDrawdown": -20.74,
+        "profitFactor": 10.32,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 2.8811,
+      "wf_validation": {
+        "avg_train_score": -1.7197,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.121,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\000913.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "深主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "300433.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.2728,
+      "best_params": {
+        "rsi_period": 15,
+        "rsi_threshold": 31,
+        "vol_ma_period": 12,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 2.5
+      },
+      "metrics": {
+        "sharpeRatio": 1.01,
+        "totalReturn": 78.07,
+        "winRate": 80.0,
+        "maxDrawdown": -13.44,
+        "profitFactor": 7.38,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 2.8425,
+      "wf_validation": {
+        "avg_train_score": -10.0,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\300433.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "002993.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.5596,
+      "best_params": {
+        "rsi_period": 18,
+        "rsi_threshold": 40,
+        "vol_ma_period": 14,
+        "vol_ratio": 1.4,
+        "stop_loss_pct": 2.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.93,
+        "totalReturn": 62.52,
+        "winRate": 42.86,
+        "maxDrawdown": -18.12,
+        "profitFactor": 4.92,
+        "totalTrades": 7,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 2.8121,
+      "wf_validation": {
+        "avg_train_score": -6.8661,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0661,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\002993.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "中小板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "605333.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.1452,
+      "best_params": {
+        "rsi_period": 18,
+        "rsi_threshold": 35,
+        "vol_ma_period": 10,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 5.0
+      },
+      "metrics": {
+        "sharpeRatio": 1.01,
+        "totalReturn": 37.61,
+        "winRate": 40.0,
+        "maxDrawdown": -4.66,
+        "profitFactor": 4.62,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 2.5313,
+      "wf_validation": {
+        "avg_train_score": -7.0769,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0799,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\605333.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "沪主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "300341.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.96,
+      "best_params": {
+        "rsi_period": 18,
+        "rsi_threshold": 35,
+        "vol_ma_period": 10,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 5.0
+      },
+      "metrics": {
+        "sharpeRatio": 1.01,
+        "totalReturn": 152.46,
+        "winRate": 50.0,
+        "maxDrawdown": -27.8,
+        "profitFactor": 6.38,
+        "totalTrades": 6,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 2.4654,
+      "wf_validation": {
+        "avg_train_score": -5.2981,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.2063,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\300341.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "600776.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.04,
+      "best_params": {
+        "rsi_period": 18,
+        "rsi_threshold": 35,
+        "vol_ma_period": 10,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 5.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.45,
+        "totalReturn": 37.08,
+        "winRate": 33.33,
+        "maxDrawdown": -28.87,
+        "profitFactor": 4.04,
+        "totalTrades": 6,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 2.046,
+      "wf_validation": {
+        "avg_train_score": -10.0,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\600776.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "沪主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "601319.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.3404,
+      "best_params": {
+        "rsi_period": 15,
+        "rsi_threshold": 34,
+        "vol_ma_period": 17,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 4.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.56,
+        "totalReturn": 30.88,
+        "winRate": 60.0,
+        "maxDrawdown": -14.82,
+        "profitFactor": 4.05,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 1.7667,
+      "wf_validation": {
+        "avg_train_score": -5.0882,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\601319.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "沪主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "688088.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.9,
+      "best_params": {
+        "rsi_period": 18,
+        "rsi_threshold": 40,
+        "vol_ma_period": 14,
+        "vol_ratio": 1.4,
+        "stop_loss_pct": 2.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.48,
+        "totalReturn": 29.7,
+        "winRate": 60.0,
+        "maxDrawdown": -26.2,
+        "profitFactor": 4.96,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 1.5292,
+      "wf_validation": {
+        "avg_train_score": -5.1825,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\688088.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "科创板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "688789.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.1704,
+      "best_params": {
+        "rsi_period": 10,
+        "rsi_threshold": 30,
+        "vol_ma_period": 22,
+        "vol_ratio": 1.2,
+        "stop_loss_pct": 3.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.63,
+        "totalReturn": 49.24,
+        "winRate": 55.56,
+        "maxDrawdown": -23.56,
+        "profitFactor": 3.34,
+        "totalTrades": 9,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 1.2613,
+      "wf_validation": {
+        "avg_train_score": 4.223,
+        "overfitting_ratio": 0.7013,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\688789.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "科创板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "603983.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.1702,
+      "best_params": {
+        "rsi_period": 10,
+        "rsi_threshold": 30,
+        "vol_ma_period": 22,
+        "vol_ratio": 1.2,
+        "stop_loss_pct": 3.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.88,
+        "totalReturn": 105.61,
+        "winRate": 62.5,
+        "maxDrawdown": -28.41,
+        "profitFactor": 8.97,
+        "totalTrades": 8,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 1.2535,
+      "wf_validation": {
+        "avg_train_score": 2.9876,
+        "overfitting_ratio": 0.5804,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\603983.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "沪主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "600030.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.091,
+      "best_params": {
+        "rsi_period": 15,
+        "rsi_threshold": 34,
+        "vol_ma_period": 17,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 4.5
+      },
+      "metrics": {
+        "sharpeRatio": 1.0,
+        "totalReturn": 75.72,
+        "winRate": 60.0,
+        "maxDrawdown": -24.55,
+        "profitFactor": 5.73,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 1.169,
+      "wf_validation": {
+        "avg_train_score": -4.8511,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\600030.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "沪主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "688658.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.5368,
+      "best_params": {
+        "rsi_period": 12,
+        "rsi_threshold": 27,
+        "vol_ma_period": 29,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 4.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.97,
+        "totalReturn": 99.72,
+        "winRate": 37.5,
+        "maxDrawdown": -19.94,
+        "profitFactor": 5.94,
+        "totalTrades": 8,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 1.1267,
+      "wf_validation": {
+        "avg_train_score": -3.2159,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\688658.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "科创板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "002487.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.076,
+      "best_params": {
+        "rsi_period": 18,
+        "rsi_threshold": 40,
+        "vol_ma_period": 14,
+        "vol_ratio": 1.4,
+        "stop_loss_pct": 2.5
+      },
+      "metrics": {
+        "sharpeRatio": 1.07,
+        "totalReturn": 89.68,
+        "winRate": 60.0,
+        "maxDrawdown": -22.4,
+        "profitFactor": 9.64,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.3889,
+      "wf_validation": {
+        "avg_train_score": -2.2991,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\002487.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "中小板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "300251.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.8456,
+      "best_params": {
+        "rsi_period": 12,
+        "rsi_threshold": 33,
+        "vol_ma_period": 11,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 3.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.98,
+        "totalReturn": 74.28,
+        "winRate": 50.0,
+        "maxDrawdown": -22.68,
+        "profitFactor": 5.63,
+        "totalTrades": 6,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.3573,
+      "wf_validation": {
+        "avg_train_score": -2.2119,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\300251.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "300033.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.332,
+      "best_params": {
+        "rsi_period": 12,
+        "rsi_threshold": 33,
+        "vol_ma_period": 11,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 3.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.96,
+        "totalReturn": 186.06,
+        "winRate": 16.67,
+        "maxDrawdown": -30.73,
+        "profitFactor": 11.3,
+        "totalTrades": 6,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.3301,
+      "wf_validation": {
+        "avg_train_score": -1.0304,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\300033.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "688321.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.482,
+      "best_params": {
+        "rsi_period": 10,
+        "rsi_threshold": 27,
+        "vol_ma_period": 16,
+        "vol_ratio": 1.5,
+        "stop_loss_pct": 4.0
+      },
+      "metrics": {
+        "sharpeRatio": 1.32,
+        "totalReturn": 223.38,
+        "winRate": 60.0,
+        "maxDrawdown": -37.7,
+        "profitFactor": 16.51,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.3289,
+      "wf_validation": {
+        "avg_train_score": -6.3409,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\688321.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "科创板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "002399.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.6086,
+      "best_params": {
+        "rsi_period": 19,
+        "rsi_threshold": 31,
+        "vol_ma_period": 18,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 3.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.74,
+        "totalReturn": 65.28,
+        "winRate": 40.0,
+        "maxDrawdown": -25.63,
+        "profitFactor": 7.72,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.3045,
+      "wf_validation": {
+        "avg_train_score": -7.1048,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\002399.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "中小板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "600502.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.934,
+      "best_params": {
+        "rsi_period": 15,
+        "rsi_threshold": 34,
+        "vol_ma_period": 17,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 4.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.64,
+        "totalReturn": 46.69,
+        "winRate": 60.0,
+        "maxDrawdown": -23.9,
+        "profitFactor": 5.97,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.2919,
+      "wf_validation": {
+        "avg_train_score": 2.8989,
+        "overfitting_ratio": 0.8993,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\600502.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "沪主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "603826.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.6098,
+      "best_params": {
+        "rsi_period": 16,
+        "rsi_threshold": 35,
+        "vol_ma_period": 18,
+        "vol_ratio": 1.4,
+        "stop_loss_pct": 5.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.76,
+        "totalReturn": 49.85,
+        "winRate": 40.0,
+        "maxDrawdown": -25.29,
+        "profitFactor": 6.26,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.2709,
+      "wf_validation": {
+        "avg_train_score": -1.8638,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\603826.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "沪主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "000950.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.7364,
+      "best_params": {
+        "rsi_period": 15,
+        "rsi_threshold": 34,
+        "vol_ma_period": 17,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 4.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.81,
+        "totalReturn": 27.94,
+        "winRate": 60.0,
+        "maxDrawdown": -10.62,
+        "profitFactor": 5.2,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.2187,
+      "wf_validation": {
+        "avg_train_score": -3.0183,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\000950.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "深主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "002287.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.9308,
+      "best_params": {
+        "rsi_period": 20,
+        "rsi_threshold": 39,
+        "vol_ma_period": 14,
+        "vol_ratio": 1.5,
+        "stop_loss_pct": 2.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.81,
+        "totalReturn": 63.08,
+        "winRate": 60.0,
+        "maxDrawdown": -20.34,
+        "profitFactor": 5.05,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.2183,
+      "wf_validation": {
+        "avg_train_score": -0.2709,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\002287.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "中小板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "300102.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.7098,
+      "best_params": {
+        "rsi_period": 12,
+        "rsi_threshold": 33,
+        "vol_ma_period": 11,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 3.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.73,
+        "totalReturn": 44.44,
+        "winRate": 60.0,
+        "maxDrawdown": -20.69,
+        "profitFactor": 4.51,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.2051,
+      "wf_validation": {
+        "avg_train_score": -6.8025,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\300102.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "300352.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.3424,
+      "best_params": {
+        "rsi_period": 18,
+        "rsi_threshold": 40,
+        "vol_ma_period": 14,
+        "vol_ratio": 1.4,
+        "stop_loss_pct": 2.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.61,
+        "totalReturn": 49.06,
+        "winRate": 80.0,
+        "maxDrawdown": -24.92,
+        "profitFactor": 6.54,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.1697,
+      "wf_validation": {
+        "avg_train_score": -3.2041,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\300352.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "300428.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.6162,
+      "best_params": {
+        "rsi_period": 18,
+        "rsi_threshold": 35,
+        "vol_ma_period": 10,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 5.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.85,
+        "totalReturn": 92.16,
+        "winRate": 40.0,
+        "maxDrawdown": -23.81,
+        "profitFactor": 5.1,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.1616,
+      "wf_validation": {
+        "avg_train_score": -6.7636,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\300428.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "603236.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.0404,
+      "best_params": {
+        "rsi_period": 10,
+        "rsi_threshold": 26,
+        "vol_ma_period": 20,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 4.0
+      },
+      "metrics": {
+        "sharpeRatio": 1.47,
+        "totalReturn": 254.9,
+        "winRate": 42.86,
+        "maxDrawdown": -29.76,
+        "profitFactor": 18.8,
+        "totalTrades": 7,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.1615,
+      "wf_validation": {
+        "avg_train_score": -0.9164,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\603236.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "沪主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "002625.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.1982,
+      "best_params": {
+        "rsi_period": 15,
+        "rsi_threshold": 31,
+        "vol_ma_period": 12,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 2.5
+      },
+      "metrics": {
+        "sharpeRatio": 1.01,
+        "totalReturn": 91.95,
+        "winRate": 20.0,
+        "maxDrawdown": -33.91,
+        "profitFactor": 4.29,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.1531,
+      "wf_validation": {
+        "avg_train_score": -1.9777,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\002625.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "中小板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "300327.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.9088,
+      "best_params": {
+        "rsi_period": 16,
+        "rsi_threshold": 40,
+        "vol_ma_period": 22,
+        "vol_ratio": 1.5,
+        "stop_loss_pct": 4.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.7,
+        "totalReturn": 77.11,
+        "winRate": 50.0,
+        "maxDrawdown": -31.44,
+        "profitFactor": 6.25,
+        "totalTrades": 6,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.1345,
+      "wf_validation": {
+        "avg_train_score": -6.3598,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\300327.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "001308.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.5508,
+      "best_params": {
+        "rsi_period": 15,
+        "rsi_threshold": 31,
+        "vol_ma_period": 12,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 2.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.86,
+        "totalReturn": 35.94,
+        "winRate": 50.0,
+        "maxDrawdown": -10.34,
+        "profitFactor": 5.02,
+        "totalTrades": 6,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.1228,
+      "wf_validation": {
+        "avg_train_score": 1.1317,
+        "overfitting_ratio": 0.8915,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\001308.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "深主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "600056.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.1282,
+      "best_params": {
+        "rsi_period": 17,
+        "rsi_threshold": 38,
+        "vol_ma_period": 27,
+        "vol_ratio": 1.2,
+        "stop_loss_pct": 2.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.14,
+        "totalReturn": 8.92,
+        "winRate": 60.0,
+        "maxDrawdown": -15.41,
+        "profitFactor": 3.91,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.1213,
+      "wf_validation": {
+        "avg_train_score": -2.2585,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\600056.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "沪主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "002075.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.466,
+      "best_params": {
+        "rsi_period": 10,
+        "rsi_threshold": 30,
+        "vol_ma_period": 22,
+        "vol_ratio": 1.2,
+        "stop_loss_pct": 3.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.99,
+        "totalReturn": 129.11,
+        "winRate": 33.33,
+        "maxDrawdown": -20.17,
+        "profitFactor": 7.32,
+        "totalTrades": 6,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.1171,
+      "wf_validation": {
+        "avg_train_score": -2.058,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\002075.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "中小板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "300772.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.5414,
+      "best_params": {
+        "rsi_period": 10,
+        "rsi_threshold": 30,
+        "vol_ma_period": 22,
+        "vol_ratio": 1.2,
+        "stop_loss_pct": 3.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.96,
+        "totalReturn": 158.97,
+        "winRate": 20.0,
+        "maxDrawdown": -37.87,
+        "profitFactor": 12.16,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.1146,
+      "wf_validation": {
+        "avg_train_score": -6.6841,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\300772.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "300009.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.347,
+      "best_params": {
+        "rsi_period": 10,
+        "rsi_threshold": 30,
+        "vol_ma_period": 22,
+        "vol_ratio": 1.2,
+        "stop_loss_pct": 3.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.53,
+        "totalReturn": 14.54,
+        "winRate": 80.0,
+        "maxDrawdown": -6.35,
+        "profitFactor": 3.52,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.1135,
+      "wf_validation": {
+        "avg_train_score": -5.355,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\300009.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "688126.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.7722,
+      "best_params": {
+        "rsi_period": 15,
+        "rsi_threshold": 31,
+        "vol_ma_period": 12,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 2.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.63,
+        "totalReturn": 22.62,
+        "winRate": 66.67,
+        "maxDrawdown": -9.34,
+        "profitFactor": 6.74,
+        "totalTrades": 6,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.1067,
+      "wf_validation": {
+        "avg_train_score": -6.0652,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\688126.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "科创板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "600335.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.557,
+      "best_params": {
+        "rsi_period": 17,
+        "rsi_threshold": 38,
+        "vol_ma_period": 27,
+        "vol_ratio": 1.2,
+        "stop_loss_pct": 2.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.61,
+        "totalReturn": 20.97,
+        "winRate": 60.0,
+        "maxDrawdown": -5.65,
+        "profitFactor": 5.41,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.1061,
+      "wf_validation": {
+        "avg_train_score": -3.6129,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\600335.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "沪主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "605009.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.122,
+      "best_params": {
+        "rsi_period": 17,
+        "rsi_threshold": 38,
+        "vol_ma_period": 27,
+        "vol_ratio": 1.2,
+        "stop_loss_pct": 2.0
+      },
+      "metrics": {
+        "sharpeRatio": 1.28,
+        "totalReturn": 120.45,
+        "winRate": 63.64,
+        "maxDrawdown": -16.86,
+        "profitFactor": 10.44,
+        "totalTrades": 11,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.0973,
+      "wf_validation": {
+        "avg_train_score": 2.0467,
+        "overfitting_ratio": 0.9525,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\605009.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "沪主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "603871.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.063,
+      "best_params": {
+        "rsi_period": 11,
+        "rsi_threshold": 39,
+        "vol_ma_period": 27,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 4.0
+      },
+      "metrics": {
+        "sharpeRatio": 1.16,
+        "totalReturn": 135.42,
+        "winRate": 57.14,
+        "maxDrawdown": -22.81,
+        "profitFactor": 7.23,
+        "totalTrades": 7,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.0858,
+      "wf_validation": {
+        "avg_train_score": -1.3127,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\603871.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "沪主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "603613.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.5244,
+      "best_params": {
+        "rsi_period": 18,
+        "rsi_threshold": 35,
+        "vol_ma_period": 10,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 5.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.63,
+        "totalReturn": 58.92,
+        "winRate": 60.0,
+        "maxDrawdown": -34.62,
+        "profitFactor": 3.45,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.0676,
+      "wf_validation": {
+        "avg_train_score": -1.8368,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\603613.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "沪主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "300910.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.429,
+      "best_params": {
+        "rsi_period": 19,
+        "rsi_threshold": 31,
+        "vol_ma_period": 18,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 3.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.63,
+        "totalReturn": 23.99,
+        "winRate": 60.0,
+        "maxDrawdown": -9.65,
+        "profitFactor": 4.46,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.0587,
+      "wf_validation": {
+        "avg_train_score": -3.3016,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\300910.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "300682.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.8306,
+      "best_params": {
+        "rsi_period": 15,
+        "rsi_threshold": 38,
+        "vol_ma_period": 17,
+        "vol_ratio": 1.5,
+        "stop_loss_pct": 4.5
+      },
+      "metrics": {
+        "sharpeRatio": 1.0,
+        "totalReturn": 129.42,
+        "winRate": 33.33,
+        "maxDrawdown": -38.2,
+        "profitFactor": 9.13,
+        "totalTrades": 6,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.054,
+      "wf_validation": {
+        "avg_train_score": -1.7164,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\300682.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "002351.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.182,
+      "best_params": {
+        "rsi_period": 17,
+        "rsi_threshold": 38,
+        "vol_ma_period": 27,
+        "vol_ratio": 1.2,
+        "stop_loss_pct": 2.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.41,
+        "totalReturn": 16.31,
+        "winRate": 71.43,
+        "maxDrawdown": -9.67,
+        "profitFactor": 3.49,
+        "totalTrades": 7,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.0527,
+      "wf_validation": {
+        "avg_train_score": -2.0199,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\002351.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "中小板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "600657.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.6354,
+      "best_params": {
+        "rsi_period": 18,
+        "rsi_threshold": 35,
+        "vol_ma_period": 10,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 5.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.89,
+        "totalReturn": 93.0,
+        "winRate": 40.0,
+        "maxDrawdown": -23.97,
+        "profitFactor": 5.69,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.0519,
+      "wf_validation": {
+        "avg_train_score": -1.5264,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\600657.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "沪主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "600273.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.2262,
+      "best_params": {
+        "rsi_period": 15,
+        "rsi_threshold": 38,
+        "vol_ma_period": 17,
+        "vol_ratio": 1.5,
+        "stop_loss_pct": 4.5
+      },
+      "metrics": {
+        "sharpeRatio": 1.19,
+        "totalReturn": 54.55,
+        "winRate": 80.0,
+        "maxDrawdown": -7.51,
+        "profitFactor": 8.21,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.0468,
+      "wf_validation": {
+        "avg_train_score": -0.2629,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\600273.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "沪主板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "300457.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.0702,
+      "best_params": {
+        "rsi_period": 10,
+        "rsi_threshold": 30,
+        "vol_ma_period": 22,
+        "vol_ratio": 1.2,
+        "stop_loss_pct": 3.0
+      },
+      "metrics": {
+        "sharpeRatio": 0.45,
+        "totalReturn": 39.99,
+        "winRate": 40.0,
+        "maxDrawdown": -34.71,
+        "profitFactor": 3.49,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.0349,
+      "wf_validation": {
+        "avg_train_score": -10.0,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\300457.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "688432.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.4356,
+      "best_params": {
+        "rsi_period": 14,
+        "rsi_threshold": 31,
+        "vol_ma_period": 14,
+        "vol_ratio": 1.7,
+        "stop_loss_pct": 2.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.53,
+        "totalReturn": 30.23,
+        "winRate": 60.0,
+        "maxDrawdown": -19.38,
+        "profitFactor": 4.09,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.0203,
+      "wf_validation": {
+        "avg_train_score": -6.9057,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\688432.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "科创板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "300702.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.5964,
+      "best_params": {
+        "rsi_period": 15,
+        "rsi_threshold": 31,
+        "vol_ma_period": 12,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 2.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.59,
+        "totalReturn": 25.35,
+        "winRate": 60.0,
+        "maxDrawdown": -8.02,
+        "profitFactor": 6.37,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.0159,
+      "wf_validation": {
+        "avg_train_score": 1.253,
+        "overfitting_ratio": 0.9873,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\300702.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "688262.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.7056,
+      "best_params": {
+        "rsi_period": 18,
+        "rsi_threshold": 35,
+        "vol_ma_period": 10,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 5.0
+      },
+      "metrics": {
+        "sharpeRatio": 1.11,
+        "totalReturn": 233.64,
+        "winRate": 28.57,
+        "maxDrawdown": -34.51,
+        "profitFactor": 10.39,
+        "totalTrades": 7,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.0136,
+      "wf_validation": {
+        "avg_train_score": -1.6695,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\688262.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "科创板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "688396.SH": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 3.7122,
+      "best_params": {
+        "rsi_period": 12,
+        "rsi_threshold": 33,
+        "vol_ma_period": 11,
+        "vol_ratio": 1.3,
+        "stop_loss_pct": 3.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.95,
+        "totalReturn": 41.26,
+        "winRate": 60.0,
+        "maxDrawdown": -6.61,
+        "profitFactor": 10.22,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.0133,
+      "wf_validation": {
+        "avg_train_score": -3.8769,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\688396.SH_adaptive_volatility.json",
+      "name": "",
+      "board": "科创板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "300579.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.0706,
+      "best_params": {
+        "rsi_period": 18,
+        "rsi_threshold": 40,
+        "vol_ma_period": 14,
+        "vol_ratio": 1.4,
+        "stop_loss_pct": 2.5
+      },
+      "metrics": {
+        "sharpeRatio": 0.45,
+        "totalReturn": 39.64,
+        "winRate": 60.0,
+        "maxDrawdown": -34.53,
+        "profitFactor": 6.61,
+        "totalTrades": 5,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.008,
+      "wf_validation": {
+        "avg_train_score": -5.0291,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\300579.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    },
+    "301550.SZ": {
+      "template": "adaptive_volatility",
+      "template_name": "adaptive_volatility",
+      "best_score": 4.0926,
+      "best_params": {
+        "rsi_period": 10,
+        "rsi_threshold": 30,
+        "vol_ma_period": 22,
+        "vol_ratio": 1.2,
+        "stop_loss_pct": 3.0
+      },
+      "metrics": {
+        "sharpeRatio": 1.32,
+        "totalReturn": 105.4,
+        "winRate": 66.67,
+        "maxDrawdown": -11.56,
+        "profitFactor": 10.54,
+        "totalTrades": 6,
+        "avgProfit": 0,
+        "avgLoss": 0
+      },
+      "wf_test_score": 0.0013,
+      "wf_validation": {
+        "avg_train_score": -5.3163,
+        "overfitting_ratio": 1.0,
+        "consistency": 0.0,
+        "verdict": "❌ 严重过拟合 — 训练集表现远好于测试集，策略不可用"
+      },
+      "source_file": "CNStock\\daily\\301550.SZ_adaptive_volatility.json",
+      "name": "",
+      "board": "创业板",
+      "em_industry": "",
+      "em_industry_l1": "",
+      "csrc_industry": "",
+      "csrc_industry_l1": "",
+      "province": "",
+      "reg_capital": null,
+      "emp_num": null
+    }
+  },
+  "industry_analysis": {
+    "description": "双优股票行业/板块/地域分布",
+    "enriched_at": "2026-05-01 09:15",
+    "enriched_count": 101,
+    "failed_count": 0,
+    "board_distribution": {
+      "创业板": 31,
+      "沪主板": 27,
+      "中小板": 19,
+      "科创板": 14,
+      "深主板": 10
+    },
+    "industry_distribution": {},
+    "province_distribution": {}
+  }
+}
