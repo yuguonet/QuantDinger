@@ -48,28 +48,111 @@ SERVERS = [
 # 获取A股列表
 # ═══════════════════════════════════════════════════════
 
+def _fetch_security_list(api, market, offset):
+    """获取证券列表，自动处理 pytdx offset>=8000 解析失败的 bug
+
+    pytdx已知BUG: get_security_list 在 offset>=8000 时 parseResponse 返回 None
+    (服务器有数据但解析器无法处理)。这里通过 monkey-patch parseResponse 修复。
+    """
+    # 首次调用时安装 monkey-patch
+    if not hasattr(_fetch_security_list, '_patched'):
+        from pytdx.parser.get_security_list import GetSecurityList
+        import struct as _struct
+        from pytdx.helper import get_volume
+
+        _orig_parse = GetSecurityList.parseResponse
+
+        def _robust_parse(self, body_buf):
+            """修复版 parseResponse：先尝试原始解析，失败或结果异常则手动按29字节/记录解析"""
+            result = None
+            try:
+                result = _orig_parse(self, body_buf)
+            except Exception:
+                pass
+            # 原始解析成功且有数据 → 直接返回
+            if result and len(result) > 0:
+                return result
+            # fallback: 原始解析失败或返回空/None，手动按29字节/记录解析
+            try:
+                if len(body_buf) < 2:
+                    return None
+                num, = _struct.unpack("<H", body_buf[:2])
+                pos = 2
+                stocks = []
+                for _ in range(num):
+                    if pos + 29 > len(body_buf):
+                        break
+                    one_bytes = body_buf[pos:pos + 29]
+                    code_bytes, volunit, name_bytes, _, decimal_point, pre_close_raw, _ = \
+                        _struct.unpack("<6sH8s4sBI4s", one_bytes)
+                    code = code_bytes.decode("utf-8", errors="ignore").strip('\x00').strip()
+                    if not code:
+                        pos += 29
+                        continue
+                    name = name_bytes.decode("gbk", errors="ignore").rstrip("\x00")
+                    pre_close = get_volume(pre_close_raw)
+                    stocks.append({
+                        'code': code, 'volunit': volunit,
+                        'decimal_point': decimal_point, 'name': name,
+                        'pre_close': pre_close,
+                    })
+                    pos += 29
+                return stocks if stocks else None
+            except Exception:
+                pass
+            # 最后兜底: 原始解析和29字节解析都失败，尝试跳过开头找6字节数字code
+            try:
+                num2, = _struct.unpack("<H", body_buf[:2])
+                stocks2 = []
+                scan = 2
+                while scan < len(body_buf) - 29 and len(stocks2) < num2:
+                    # 找6字节数字ASCII code
+                    chunk = body_buf[scan:scan+6]
+                    code_try = chunk.decode("ascii", errors="ignore").strip('\x00').strip()
+                    if code_try.isdigit() and len(code_try) >= 4:
+                        name_chunk = body_buf[scan+8:scan+24]
+                        name_try = name_chunk.decode("gbk", errors="ignore").rstrip("\x00")
+                        if name_try:
+                            stocks2.append({
+                                'code': code_try, 'volunit': 100,
+                                'decimal_point': 2, 'name': name_try,
+                                'pre_close': 0,
+                            })
+                            scan += 29
+                            continue
+                    scan += 1
+                return stocks2 if stocks2 else None
+            except Exception:
+                return None
+
+        GetSecurityList.parseResponse = _robust_parse
+        _fetch_security_list._patched = True
+
+    return api.get_security_list(market, offset)
+
+
 def get_stock_list():
-    """从通达信获取全部A股代码 (约4700只)"""
+    """从通达信获取全部A股代码 (约5000+只)"""
     api = TdxHq_API()
     api.connect(SERVERS[0][0], SERVERS[0][1])
 
     a_shares = []
 
-    # 深圳: 00xxxx(主板) 30xxxx(创业板)
-    for offset in range(0, 24000, 1000):
-        batch = api.get_security_list(0, offset)
+    # 深圳: 00xxxx(主板) 30xxxx(创业板)  +  北交所 83xxxx/87xxxx/43xxxx (market=0)
+    for offset in range(0, 40000, 1000):
+        batch = _fetch_security_list(api, 0, offset)
         if not batch:
             break
         for s in batch:
             c = s['code']
-            if c.startswith(('00', '30')):
+            if c.startswith(('00', '30', '83', '87', '43')):
                 a_shares.append((0, c, s['name']))
 
     # 上海: 60xxxx(主板) 68xxxx(科创板)
-    for offset in range(0, 28000, 1000):
-        batch = api.get_security_list(1, offset)
+    for offset in range(0, 40000, 1000):
+        batch = _fetch_security_list(api, 1, offset)
         if not batch:
-            continue
+            break
         for s in batch:
             c = s['code']
             if c.startswith(('60', '68')):
@@ -84,6 +167,18 @@ def get_stock_list():
         if c not in seen:
             seen.add(c)
             unique.append((m, c, n))
+
+    # 统计各板块数量
+    cnt = {'00': 0, '30': 0, '60': 0, '68': 0, '83': 0, '87': 0, '43': 0, 'other': 0}
+    for _, c, _ in unique:
+        prefix = c[:2]
+        if prefix in cnt:
+            cnt[prefix] += 1
+        else:
+            cnt['other'] += 1
+    print(f"    主板(00): {cnt['00']}  创业板(30): {cnt['30']}  "
+          f"主板(60): {cnt['60']}  科创板(68): {cnt['68']}  "
+          f"北交所(83/87/43): {cnt['83']+cnt['87']+cnt['43']}  其他: {cnt['other']}")
 
     return unique
 
@@ -190,7 +285,7 @@ def _worker_minute(args):
 # 并行下载引擎
 # ═══════════════════════════════════════════════════════
 
-def parallel_download(stocks, worker_fn, out_dir, workers, **kwargs):
+def parallel_download(stocks, worker_fn, out_dir, workers, **extra):
     """多进程并行下载"""
     os.makedirs(out_dir, exist_ok=True)
 
@@ -202,7 +297,7 @@ def parallel_download(stocks, worker_fn, out_dir, workers, **kwargs):
         end = start + bs if i < workers - 1 else len(stocks)
         if start < len(stocks):
             batch = stocks[start:end]
-            batches.append((batch, i, *kwargs.values(), out_dir))
+            batches.append((batch, i, *extra.values(), out_dir))
 
     t0 = time.time()
 
@@ -241,7 +336,7 @@ def run_daily(out_dir, start_date, end_date, workers):
     out = os.path.join(out_dir, f'tdx_daily_{start_date}_{end_date}')
     success, fail, total_rows, elapsed = parallel_download(
         stocks, _worker_daily, out, workers,
-        kwargs={'start_date': start_date, 'end_date': end_date},
+        start_date=start_date, end_date=end_date,
     )
 
     print(f"\n  ✅ 成功: {success}  ❌ 失败: {fail}")
@@ -268,7 +363,7 @@ def run_minute(out_dir, freq, start_date, end_date, workers):
     out = os.path.join(out_dir, f'tdx_{fname.get(freq)}_{start_date}_{end_date}')
     success, fail, total_rows, elapsed = parallel_download(
         stocks, _worker_minute, out, workers,
-        kwargs={'freq': freq, 'start_date': start_date, 'end_date': end_date},
+        freq=freq, start_date=start_date, end_date=end_date,
     )
 
     print(f"\n  ✅ 成功: {success}  ❌ 失败: {fail}")
