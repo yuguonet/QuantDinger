@@ -28,7 +28,7 @@ def _build_adaptive_volatility_config(p: dict) -> dict:
     entry_rules = [
         {"indicator": "rsi", "params": {"period": p.get("rsi_period", 14), "threshold": p.get("rsi_threshold", 30)}, "operator": "<"},
         {"indicator": "bollinger", "params": {"period": 20, "std_dev": 2.0}, "operator": "price_below_lower"},
-        {"indicator": "ma", "params": {"period": 20, "ma_type": "ema"}, "operator": "price_above"},
+        {"indicator": "volume", "params": {"period": p.get("vol_ma_period", 20)}, "operator": "volume_ratio_above", "threshold": p.get("vol_ratio", 1.5)},
     ]
     return {
         "name": f"adaptive_volatility_{p.get('rsi_period', 14)}",
@@ -46,7 +46,7 @@ def _build_ema_rsi_volume_config(p: dict) -> dict:
     entry_rules = [
         {"indicator": "rsi", "params": {"period": p.get("rsi_period", 14), "threshold": p.get("rsi_threshold", 30)}, "operator": "<"},
         {"indicator": "ma", "params": {"period": 20, "ma_type": "ema"}, "operator": "price_above"},
-        {"indicator": "ma", "params": {"period": 20, "ma_type": "ema"}, "operator": "price_above"},
+        {"indicator": "volume", "params": {"period": p.get("vol_ma_period", 20)}, "operator": "volume_ratio_above", "threshold": p.get("vol_ratio", 1.5)},
     ]
     return {
         "name": f"ema_rsi_volume_{p.get('rsi_period', 14)}",
@@ -114,7 +114,7 @@ GENERATED_TEMPLATES = {
     "adaptive_volatility": {
         "name": "adaptive_volatility",
         "description": "LLM 生成的策略（自动重建）",
-        "indicators": ["rsi", "bollinger", "ema", "volume"],
+        "indicators": ["rsi", "bollinger", "volume"],
         "params": {
             "rsi_period": {"type": "int", "low": 10, "high": 20, "step": 1},
             "rsi_threshold": {"type": "int", "low": 25, "high": 40, "step": 1},
@@ -128,7 +128,7 @@ GENERATED_TEMPLATES = {
     "ema_rsi_volume": {
         "name": "ema_rsi_volume",
         "description": "LLM 生成的策略（自动重建）",
-        "indicators": ["rsi", "ema", "ma", "volume"],
+        "indicators": ["rsi", "ma", "volume"],
         "params": {
             "rsi_period": {"type": "int", "low": 10, "high": 20, "step": 1},
             "rsi_threshold": {"type": "int", "low": 25, "high": 40, "step": 1},

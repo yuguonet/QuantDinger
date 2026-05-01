@@ -235,8 +235,8 @@ python -m optimizer.runner -t limitup_continuation -m CNStock --all-local -tf 1D
 | 模板 key | 名称 | 状态 |
 |---|---|---|
 | rsi_vwap_volume | RSI VWAP Volume 共振 | 🔄 全量回测中 |
-| adaptive_volatility | 自适应波动率 | ⏳ 待回测 |
-| ema_rsi_volume | EMA RSI Volume | ⏳ 待回测 |
+| adaptive_volatility | 自适应波动率 | 🔧 已修复 bug，待重跑 |
+| ema_rsi_volume | EMA RSI Volume | 🔧 已修复 bug，待重跑 |
 | kdj | 均线 KDJ 动量 | ⏳ 待回测 |
 | bollinger_macd_volume | 布林 MACD Volume | ⏳ 待回测 |
 
@@ -251,7 +251,32 @@ python -m optimizer.runner -t limitup_continuation -m CNStock --all-local -tf 1D
 
 #### 全量回测结果
 
-_待补充（1260 只 × 5 模板 × 50 trials，2023-05-01 ~ 2026-03-31）_
+##### adaptive_volatility v1（2026-05-01）
+
+| 指标 | 数值 |
+|---|---|
+| 股票数 | 1266 |
+| **有交易信号** | **0（0%）** |
+| 正得分 | 0 |
+| 平均得分 | -10.0（WF 默认失败分） |
+
+**结果：全军覆没，无任何交易信号。**
+
+**根因分析**：入场条件逻辑矛盾 —— `price_below_lower`（布林下轨 = SMA20 - 2σ）AND `price_above`（EMA20 ≈ SMA20），两个条件在数学上不可能同时满足。
+
+**修复**（`strategies_generated.py`）：
+- 去掉矛盾的 EMA 条件
+- 改为均值回归逻辑：RSI 超卖 + 布林下轨 + 放量确认
+- 修复后入场：`RSI < threshold AND close < BB_lower AND volume > vol_ratio × MA`
+- 同步修复 `ema_rsi_volume`：EMA 条件重复 + 缺少 volume 条件
+
+**待重跑**：
+```powershell
+python -m optimizer.runner -t adaptive_volatility -m CNStock --all-local -tf 1D `
+  --start 2023-05-01 --end 2026-03-31 --trials 100 --score composite -j 35
+```
+
+_其余模板全量回测结果待补充（1260 只 × 5 模板 × 50 trials，2023-05-01 ~ 2026-03-31）_
 
 **流程**：
 ```
@@ -299,4 +324,4 @@ python -m optimizer.phase2_strategy_discovery prompts
 
 ---
 
-*最后更新：2026-05-01 00:18*
+*最后更新：2026-05-01 08:05*
