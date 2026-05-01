@@ -19,19 +19,111 @@
   python tdx_download.py -T 1D -s 2021-01-01         # 指定起始日期
   python tdx_download.py -T 1D -s 2021-01-01 -e 2026-05-01
   python tdx_download.py -T 15m -w 40 --merge        # 40进程, 合并
+
+断点续传:
+  每次下载会在输出目录生成 _progress.json，记录已下载的股票。
+  中断后重新运行相同命令，自动跳过已完成的股票，只补下缺失的。
+  加 --no-resume 可忽略断点，强制重新下载。
 """
 
 import os
 import sys
 import csv
+import json
 import time
 from datetime import datetime, timedelta
 from multiprocessing import Pool
 from pytdx.hq import TdxHq_API
 
 # ═══════════════════════════════════════════════════════
+# 断点续传 - 进度追踪器
+# ═══════════════════════════════════════════════════════
+
+class ProgressTracker:
+    """记录已下载的股票，支持断点续传
+
+    在输出目录维护 _progress.json，格式:
+    {
+      "meta": {
+        "type": "daily",          # 数据类型
+        "start_date": "2021-01-01",
+        "end_date": "2026-05-01",
+        "created": "2026-05-01T22:30:00",
+        "last_updated": "2026-05-01T23:05:00"
+      },
+      "done": {
+        "000001": {"name": "平安银行", "rows": 1200, "ts": "2026-05-01T22:31:00"},
+        "000002": {"name": "万科A",    "rows": 1180, "ts": "2026-05-01T22:31:01"},
+        ...
+      }
+    }
+    """
+
+    def __init__(self, out_dir, data_type, start_date, end_date):
+        self.path = os.path.join(out_dir, '_progress.json')
+        self.data_type = data_type
+        self.start_date = start_date
+        self.end_date = end_date
+        self.data = self._load()
+
+    def _load(self):
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                # 校验: 参数必须一致才复用
+                meta = data.get('meta', {})
+                if (meta.get('type') == self.data_type and
+                    meta.get('start_date') == self.start_date and
+                    meta.get('end_date') == self.end_date):
+                    return data
+                else:
+                    print(f"  ⚠️  进度文件参数不匹配，重新开始")
+            except (json.JSONDecodeError, KeyError):
+                pass
+        return {
+            'meta': {
+                'type': self.data_type,
+                'start_date': self.start_date,
+                'end_date': self.end_date,
+                'created': datetime.now().isoformat(timespec='seconds'),
+                'last_updated': datetime.now().isoformat(timespec='seconds'),
+            },
+            'done': {},
+        }
+
+    def is_done(self, code):
+        return code in self.data['done']
+
+    def get_done_codes(self):
+        return set(self.data['done'].keys())
+
+    def mark(self, code, name, rows):
+        self.data['done'][code] = {
+            'name': name,
+            'rows': rows,
+            'ts': datetime.now().isoformat(timespec='seconds'),
+        }
+
+    def save(self):
+        self.data['meta']['last_updated'] = datetime.now().isoformat(timespec='seconds')
+        tmp = self.path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(self.data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, self.path)  # 原子写入
+
+    def summary(self):
+        done = self.data['done']
+        total_rows = sum(v['rows'] for v in done.values())
+        with_data = sum(1 for v in done.values() if v['rows'] > 0)
+        return len(done), with_data, total_rows
+
+
+# ═══════════════════════════════════════════════════════
 # 通达信服务器
 # ═══════════════════════════════════════════════════════
+
+CONNECT_TIMEOUT = 5  # 秒，单次连接/请求超时
 
 SERVERS = [
     ('218.75.126.9', 7709),
@@ -134,7 +226,7 @@ def _fetch_security_list(api, market, offset):
 def get_stock_list():
     """从通达信获取全部A股代码 (约5000+只)"""
     api = TdxHq_API()
-    api.connect(SERVERS[0][0], SERVERS[0][1])
+    api.connect(SERVERS[0][0], SERVERS[0][1], time_out=CONNECT_TIMEOUT)
 
     a_shares = []
 
@@ -187,97 +279,147 @@ def get_stock_list():
 # 工作进程
 # ═══════════════════════════════════════════════════════
 
-def _worker_daily(args):
-    """工作进程: 下载日线"""
-    stocks, worker_id, start_date, end_date, out_dir = args
-    srv = SERVERS[worker_id % len(SERVERS)]
 
-    api = TdxHq_API()
-    api.connect(srv[0], srv[1])
+def _connect_api(worker_id):
+    """连接通达信服务器，带超时，自动切换备用服务器"""
+    for attempt in range(len(SERVERS)):
+        idx = (worker_id + attempt) % len(SERVERS)
+        srv = SERVERS[idx]
+        try:
+            api = TdxHq_API()
+            api.connect(srv[0], srv[1], time_out=CONNECT_TIMEOUT)
+            return api
+        except Exception:
+            continue
+    raise ConnectionError(f"Worker-{worker_id}: 所有服务器连接失败")
+
+
+def _worker_daily(args):
+    """工作进程: 下载日线（单个股票失败不影响整体）"""
+    stocks, worker_id, start_date, end_date, out_dir, done_codes = args
+
+    api = _connect_api(worker_id)
 
     results = []
 
     for market, code, name in stocks:
-        all_bars = []
-        for offset in range(0, 800 * 10, 800):
-            bars = api.get_security_bars(9, market, code, offset, 800)
-            if not bars:
+        if code in done_codes:
+            continue
+        # 每只股票最多重试2次
+        for retry in range(3):
+            try:
+                all_bars = []
+                for offset in range(0, 800 * 10, 800):
+                    bars = api.get_security_bars(9, market, code, offset, 800)
+                    if not bars:
+                        break
+                    all_bars = bars + all_bars
+                    if bars[0]['datetime'][:10] <= start_date:
+                        break
+
+                filtered = [b for b in all_bars if start_date <= b['datetime'][:10] <= end_date]
+
+                if filtered:
+                    path = os.path.join(out_dir, f"{code}.csv")
+                    with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+                        w = csv.writer(f)
+                        w.writerow(['date', 'open', 'close', 'high', 'low', 'volume', 'amount'])
+                        for b in filtered:
+                            w.writerow([b['datetime'][:10], b['open'], b['close'],
+                                        b['high'], b['low'], int(b['vol']), b['amount']])
+                    results.append((code, name, len(filtered)))
+                else:
+                    results.append((code, name, 0))
+                break  # 成功，跳出重试
+            except (ConnectionError, OSError, TimeoutError):
+                # 连接断开/超时，重连后重试
+                try:
+                    api = _connect_api(worker_id)
+                except ConnectionError:
+                    pass
+                if retry == 2:
+                    results.append((code, name, 0))
+            except Exception:
+                results.append((code, name, 0))
                 break
-            all_bars = bars + all_bars
-            if bars[0]['datetime'][:10] <= start_date:
-                break
 
-        filtered = [b for b in all_bars if start_date <= b['datetime'][:10] <= end_date]
-
-        if filtered:
-            path = os.path.join(out_dir, f"{code}.csv")
-            with open(path, 'w', newline='', encoding='utf-8-sig') as f:
-                w = csv.writer(f)
-                w.writerow(['date', 'open', 'close', 'high', 'low', 'volume', 'amount'])
-                for b in filtered:
-                    w.writerow([b['datetime'][:10], b['open'], b['close'],
-                                b['high'], b['low'], int(b['vol']), b['amount']])
-            results.append((code, len(filtered)))
-        else:
-            results.append((code, 0))
-
-    api.disconnect()
+    try:
+        api.disconnect()
+    except Exception:
+        pass
     return results
 
 
 def _worker_minute(args):
-    """工作进程: 下载分钟线"""
-    stocks, worker_id, freq, start_date, end_date, out_dir = args
-    srv = SERVERS[worker_id % len(SERVERS)]
+    """工作进程: 下载分钟线（单个股票失败不影响整体）"""
+    stocks, worker_id, freq, start_date, end_date, out_dir, done_codes = args
 
     freq_map = {0: '5min', 1: '15min', 4: '1min', 5: '30min', 6: '60min'}
     fname = freq_map.get(freq, f'{freq}min')
 
-    api = TdxHq_API()
-    api.connect(srv[0], srv[1])
+    api = _connect_api(worker_id)
 
     start_dt = datetime.strptime(start_date, '%Y-%m-%d')
     end_dt = datetime.strptime(end_date, '%Y-%m-%d')
     span_days = (end_dt - start_dt).days
-    max_req = int(span_days / 33) + 3  # 800条15分线≈33天
+    max_req = int(span_days / 33) + 3
     results = []
 
     for market, code, name in stocks:
-        all_bars = []
-        for i in range(max_req):
-            bars = api.get_security_bars(freq, market, code, i * 800, 800)
-            if not bars:
+        if code in done_codes:
+            continue
+        # 每只股票最多重试2次
+        for retry in range(3):
+            try:
+                all_bars = []
+                for i in range(max_req):
+                    bars = api.get_security_bars(freq, market, code, i * 800, 800)
+                    if not bars:
+                        break
+                    all_bars = bars + all_bars
+                    try:
+                        first_dt = datetime.strptime(bars[0]['datetime'][:10], '%Y-%m-%d')
+                        if first_dt <= start_dt:
+                            break
+                    except:
+                        pass
+
+                filtered = []
+                for b in all_bars:
+                    try:
+                        dt_str = b['datetime'][:10]
+                        if start_date <= dt_str <= end_date:
+                            filtered.append(b)
+                    except:
+                        filtered.append(b)
+
+                if filtered:
+                    path = os.path.join(out_dir, f"{code}_{fname}.csv")
+                    with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+                        w = csv.writer(f)
+                        w.writerow(['datetime', 'open', 'close', 'high', 'low', 'volume', 'amount'])
+                        for b in filtered:
+                            w.writerow([b['datetime'], b['open'], b['close'],
+                                        b['high'], b['low'], int(b['vol']), b['amount']])
+                    results.append((code, name, len(filtered)))
+                else:
+                    results.append((code, name, 0))
+                break  # 成功，跳出重试
+            except (ConnectionError, OSError, TimeoutError):
+                try:
+                    api = _connect_api(worker_id)
+                except ConnectionError:
+                    pass
+                if retry == 2:
+                    results.append((code, name, 0))
+            except Exception:
+                results.append((code, name, 0))
                 break
-            all_bars = bars + all_bars
-            try:
-                first_dt = datetime.strptime(bars[0]['datetime'][:10], '%Y-%m-%d')
-                if first_dt <= start_dt:
-                    break
-            except:
-                pass
 
-        filtered = []
-        for b in all_bars:
-            try:
-                dt_str = b['datetime'][:10]
-                if start_date <= dt_str <= end_date:
-                    filtered.append(b)
-            except:
-                filtered.append(b)
-
-        if filtered:
-            path = os.path.join(out_dir, f"{code}_{fname}.csv")
-            with open(path, 'w', newline='', encoding='utf-8-sig') as f:
-                w = csv.writer(f)
-                w.writerow(['datetime', 'open', 'close', 'high', 'low', 'volume', 'amount'])
-                for b in filtered:
-                    w.writerow([b['datetime'], b['open'], b['close'],
-                                b['high'], b['low'], int(b['vol']), b['amount']])
-            results.append((code, len(filtered)))
-        else:
-            results.append((code, 0))
-
-    api.disconnect()
+    try:
+        api.disconnect()
+    except Exception:
+        pass
     return results
 
 
@@ -285,9 +427,34 @@ def _worker_minute(args):
 # 并行下载引擎
 # ═══════════════════════════════════════════════════════
 
-def parallel_download(stocks, worker_fn, out_dir, workers, **extra):
-    """多进程并行下载"""
+def _worker_init():
+    """子进程忽略 SIGINT，由主进程统一管理退出"""
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+def parallel_download(stocks, worker_fn, out_dir, workers, tracker=None, **extra):
+    """多进程并行下载（支持断点续传，单批失败不影响整体）
+
+    使用 apply_async + 主动轮询替代 imap_unordered，
+    确保主进程的 KeyboardInterrupt 能被及时捕获。
+    """
     os.makedirs(out_dir, exist_ok=True)
+
+    # 断点续传: 过滤已完成的股票
+    if tracker:
+        done_codes = tracker.get_done_codes()
+        remaining = [(m, c, n) for m, c, n in stocks if c not in done_codes]
+        skipped = len(stocks) - len(remaining)
+        if skipped > 0:
+            print(f"  📋 断点续传: 已完成 {skipped} 只，剩余 {len(remaining)} 只")
+        if not remaining:
+            print("  ✅ 全部已完成，无需下载")
+            done_count, with_data, total_rows = tracker.summary()
+            return done_count, done_count - with_data, total_rows, 0
+        stocks = remaining
+    else:
+        done_codes = set()
 
     # 分配任务
     bs = max(1, len(stocks) // workers)
@@ -297,23 +464,101 @@ def parallel_download(stocks, worker_fn, out_dir, workers, **extra):
         end = start + bs if i < workers - 1 else len(stocks)
         if start < len(stocks):
             batch = stocks[start:end]
-            batches.append((batch, i, *extra.values(), out_dir))
+            batches.append((batch, i, *extra.values(), out_dir, done_codes))
 
     t0 = time.time()
+    last_save_t = t0
 
-    with Pool(workers) as pool:
-        batch_results = pool.map(worker_fn, batches)
+    pool = Pool(workers, initializer=_worker_init)
+
+    # 用 apply_async 替代 imap_unordered，主进程不会阻塞在 C 层调用
+    async_results = []
+    for batch_args in batches:
+        ar = pool.apply_async(worker_fn, (batch_args,))
+        async_results.append(ar)
+
+    pool.close()  # 不再接受新任务
+
+    batch_results = []  # [(index, result_list), ...]
+    done_set = set()    # 已收集的 batch 索引
+    try:
+        while len(done_set) < len(async_results):
+            # 主动轮询，每次 sleep 让出 GIL，保证 KeyboardInterrupt 能被处理
+            time.sleep(0.5)
+
+            # 收集已完成的结果
+            for idx, ar in enumerate(async_results):
+                if idx in done_set:
+                    continue
+                if ar.ready():
+                    try:
+                        result = ar.get(timeout=0)
+                        batch_results.append((idx, result))
+                        # 实时更新进度追踪
+                        if tracker:
+                            for code, name, rows in result:
+                                tracker.mark(code, name, rows)
+                            now = time.time()
+                            if now - last_save_t >= 5:
+                                tracker.save()
+                                last_save_t = now
+                    except Exception:
+                        batch_results.append((idx, []))
+                    done_set.add(idx)
+
+            done = len(done_set)
+            pct = done * 100 // len(batches)
+            elapsed_so_far = time.time() - t0
+            processed = sum(len(r[1]) for r in batch_results)
+            print(f"\r  进度: {done}/{len(batches)} 批 ({pct}%)  "
+                  f"已处理: {processed} 只  耗时: {elapsed_so_far:.0f}s",
+                  end='', flush=True)
+        print()
+    except KeyboardInterrupt:
+        print("\n\n⚠️  收到中断信号，正在保存进度...")
+        if tracker:
+            for idx, result in batch_results:
+                for code, name, rows in result:
+                    tracker.mark(code, name, rows)
+            tracker.save()
+            print(f"  💾 进度已保存: {len(tracker.data['done'])} 只")
+        # 强制终止所有子进程（包括卡住的）
+        pool.terminate()
+        pool.join()
+        # 如果还有活的子进程，SIGKILL 强杀
+        for p in pool._pool:
+            if p.is_alive():
+                try:
+                    import signal as _sig
+                    os.kill(p.pid, _sig.SIGKILL)
+                except (OSError, AttributeError):
+                    pass
+        pool.join()
+        print("❌ 已强制退出 (下次运行自动续传)")
+        sys.exit(1)
+    finally:
+        pool.join()
+
+    # 最终保存一次
+    if tracker:
+        tracker.save()
 
     elapsed = time.time() - t0
 
     success = fail = total_rows = 0
-    for results in batch_results:
-        for code, rows in results:
+    for idx, results in batch_results:
+        for item in results:
+            code, name, rows = item[0], item[1], item[2]
             if rows > 0:
                 success += 1
                 total_rows += rows
             else:
                 fail += 1
+
+    # 合并断点续传的统计
+    if tracker:
+        done_count, with_data, tracker_rows = tracker.summary()
+        return done_count, done_count - with_data, tracker_rows, elapsed
 
     return success, fail, total_rows, elapsed
 
@@ -322,20 +567,38 @@ def parallel_download(stocks, worker_fn, out_dir, workers, **extra):
 # 主流程
 # ═══════════════════════════════════════════════════════
 
-def run_daily(out_dir, start_date, end_date, workers):
+PERIOD_DIR = {
+    '1D': 'daily', '1m': '1m', '5m': '5m',
+    '15m': '15m', '30m': '30m', '60m': '1h',
+}
+
+def run_daily(out_dir, start_date, end_date, workers, no_resume=False):
     print(f"\n{'='*55}")
     print(f"  📊 通达信日线全量下载")
     print(f"  日期: {start_date} → {end_date}  进程: {workers}")
     print(f"{'='*55}")
+
+    out = os.path.join(out_dir, PERIOD_DIR['1D'])
+    os.makedirs(out, exist_ok=True)
+
+    # 初始化断点续传
+    if no_resume:
+        tracker = None
+        print("\n  🔄 --no-resume: 忽略断点，强制重新下载")
+    else:
+        tracker = ProgressTracker(out, 'daily', start_date, end_date)
+        done_count, _, _ = tracker.summary()
+        if done_count > 0:
+            print(f"\n  💾 检测到断点记录: 已完成 {done_count} 只")
 
     print("\n[1/3] 获取A股列表...")
     stocks = get_stock_list()
     print(f"  共 {len(stocks)} 只A股")
 
     print(f"\n[2/3] 开始下载...")
-    out = os.path.join(out_dir, f'tdx_daily_{start_date}_{end_date}')
     success, fail, total_rows, elapsed = parallel_download(
         stocks, _worker_daily, out, workers,
+        tracker=tracker,
         start_date=start_date, end_date=end_date,
     )
 
@@ -343,26 +606,42 @@ def run_daily(out_dir, start_date, end_date, workers):
     print(f"  📈 总行数: {total_rows:,}")
     print(f"  ⏱  耗时: {elapsed:.1f}s ({elapsed/60:.1f}分钟)")
     print(f"  📁 输出: {out}/")
+    if tracker:
+        print(f"  📋 断点文件: {tracker.path}")
     return out
 
 
-def run_minute(out_dir, freq, start_date, end_date, workers):
+def run_minute(out_dir, freq, start_date, end_date, workers, no_resume=False):
     freq_name = {0: '5分钟', 1: '15分钟', 4: '1分钟', 5: '30分钟', 6: '60分钟'}
-    fname = {0: '5min', 1: '15min', 4: '1min', 5: '30min', 6: '60min'}
+    fname = {0: '5m', 1: '15m', 4: '1m', 5: '30m', 6: '60m'}
 
     print(f"\n{'='*55}")
     print(f"  📊 通达信{freq_name.get(freq, '')}线全量下载")
     print(f"  日期: {start_date} → {end_date}  进程: {workers}")
     print(f"{'='*55}")
 
+    out = os.path.join(out_dir, fname.get(freq, f'{freq}m'))
+    os.makedirs(out, exist_ok=True)
+
+    # 初始化断点续传
+    if no_resume:
+        tracker = None
+        print("\n  🔄 --no-resume: 忽略断点，强制重新下载")
+    else:
+        type_label = fname.get(freq, f'{freq}m')
+        tracker = ProgressTracker(out, type_label, start_date, end_date)
+        done_count, _, _ = tracker.summary()
+        if done_count > 0:
+            print(f"\n  💾 检测到断点记录: 已完成 {done_count} 只")
+
     print("\n[1/3] 获取A股列表...")
     stocks = get_stock_list()
     print(f"  共 {len(stocks)} 只A股")
 
     print(f"\n[2/3] 开始下载...")
-    out = os.path.join(out_dir, f'tdx_{fname.get(freq)}_{start_date}_{end_date}')
     success, fail, total_rows, elapsed = parallel_download(
         stocks, _worker_minute, out, workers,
+        tracker=tracker,
         freq=freq, start_date=start_date, end_date=end_date,
     )
 
@@ -370,6 +649,8 @@ def run_minute(out_dir, freq, start_date, end_date, workers):
     print(f"  📈 总行数: {total_rows:,}")
     print(f"  ⏱  耗时: {elapsed:.1f}s ({elapsed/60:.1f}分钟)")
     print(f"  📁 输出: {out}/")
+    if tracker:
+        print(f"  📋 断点文件: {tracker.path}")
     return out
 
 
@@ -422,8 +703,9 @@ def main():
     ap.add_argument('--end', '-e', default='', help='截止日期, 如 2026-05-01 (默认今天)')
     ap.add_argument('--years', '-y', type=int, default=5, help='年限 (默认5, 若指定--start则忽略)')
     ap.add_argument('--workers', '-w', type=int, default=5, help='并行进程数 (默认5)')
-    ap.add_argument('--output', '-o', default='data_tdx', help='输出目录')
+    ap.add_argument('--output', '-o', default='optimizer_output/CNStock', help='输出目录 (默认 optimizer_output/CNStock)')
     ap.add_argument('--merge', action='store_true', help='合并为单CSV')
+    ap.add_argument('--no-resume', action='store_true', help='忽略断点记录，强制重新下载')
 
     args = ap.parse_args()
 
@@ -460,19 +742,19 @@ def main():
     if args.type == 'all_min':
         # 全部分钟线
         for name, freq in [('1m', 4), ('5m', 0), ('15m', 1), ('30m', 5), ('60m', 6)]:
-            out = run_minute(args.output, freq, start_date, end_date, args.workers)
+            out = run_minute(args.output, freq, start_date, end_date, args.workers, args.no_resume)
             outputs.append((name, out))
     elif args.type == '1D':
-        out = run_daily(args.output, start_date, end_date, args.workers)
+        out = run_daily(args.output, start_date, end_date, args.workers, args.no_resume)
         outputs.append(('1D', out))
     else:
         kind, freq = type_map[args.type]
-        out = run_minute(args.output, freq, start_date, end_date, args.workers)
+        out = run_minute(args.output, freq, start_date, end_date, args.workers, args.no_resume)
         outputs.append((args.type, out))
 
     if args.merge:
         for name, out_dir in outputs:
-            merge_all(out_dir, os.path.join(args.output, f'all_{name}.csv'))
+            merge_all(out_dir, os.path.join(out_dir, 'all.csv'))
 
     print(f"\n{'='*55}")
     print(f"  ✅ 全部完成!")
@@ -481,4 +763,8 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n⚠️  用户中断，退出。")
+        sys.exit(1)

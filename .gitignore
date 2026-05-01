@@ -90,3 +90,4 @@ optimizer_output_llm_v2/
 optimizer_output_llm_v2x/
 optimizer/strategies/
 data_tdx/
+optimizer_output/
