@@ -189,7 +189,7 @@ class MarketPool:
         broken = False
         try:
             yield conn
-        except Exception:
+        except BaseException:
             conn.rollback()
             if getattr(conn, "closed", 0):
                 broken = True
@@ -260,8 +260,13 @@ class MarketDBManager:
         self._pool_lock = threading.Lock()
         # 数据库存在性缓存（避免每次都连 postgres 系统库查询）
         self._db_exists_cache: Dict[str, bool] = {}
+        # 年份表存在性缓存（避免重复查 information_schema）
+        self._year_table_cache: set[str] = set()
         # 管理员连接复用（避免每次都新建连接到 postgres 系统库）
         self._admin_conn_instance = None
+        self._admin_conn_lock = threading.Lock()
+        # schema 初始化回调（由上层注册，用于创建聚合 VIEW 等业务逻辑）
+        self._on_schema_init = None
 
         logger.info(
             f"MarketDBManager 初始化: "
@@ -315,32 +320,33 @@ class MarketDBManager:
     # ---- DDL 操作（直接连接，autocommit） ----
 
     def _admin_conn(self):
-        """获取管理员连接（autocommit，复用长连接）"""
-        if self._admin_conn_instance is not None:
-            try:
-                cur = self._admin_conn_instance.cursor()
-                cur.execute("SELECT 1")
-                cur.close()
-                return self._admin_conn_instance
-            except Exception:
+        """获取管理员连接（autocommit，复用长连接，线程安全）"""
+        with self._admin_conn_lock:
+            if self._admin_conn_instance is not None:
                 try:
-                    self._admin_conn_instance.close()
+                    cur = self._admin_conn_instance.cursor()
+                    cur.execute("SELECT 1")
+                    cur.close()
+                    return self._admin_conn_instance
                 except Exception:
-                    pass
-                self._admin_conn_instance = None
+                    try:
+                        self._admin_conn_instance.close()
+                    except Exception:
+                        pass
+                    self._admin_conn_instance = None
 
-        import psycopg2
-        conn = psycopg2.connect(
-            host=self._conn_params["host"],
-            port=self._conn_params["port"],
-            user=self._conn_params["user"],
-            password=self._conn_params["password"],
-            dbname="postgres",
-            connect_timeout=10,
-        )
-        conn.autocommit = True
-        self._admin_conn_instance = conn
-        return conn
+            import psycopg2
+            conn = psycopg2.connect(
+                host=self._conn_params["host"],
+                port=self._conn_params["port"],
+                user=self._conn_params["user"],
+                password=self._conn_params["password"],
+                dbname="postgres",
+                connect_timeout=10,
+            )
+            conn.autocommit = True
+            self._admin_conn_instance = conn
+            return conn
 
     def market_db_exists(self, market: str) -> bool:
         # 使用缓存，避免每次都连 postgres 系统库
@@ -476,10 +482,6 @@ class MarketDBManager:
             for year in range(current_year - 4, current_year + 1):
                 self._ensure_kline_table(cur, "1D", year)
 
-            # 聚合 VIEW：15m → 30m/1h/2h/4h/1D，1D → 1W/1M
-            self._ensure_agg_views(cur, "15m", ["30m", "1h", "2h", "4h", "1D"])
-            self._ensure_agg_views(cur, "1D",  ["1W", "1M"])
-
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS _market_meta (
                     key   VARCHAR(50) PRIMARY KEY,
@@ -496,6 +498,10 @@ class MarketDBManager:
                 VALUES ('schema_version', '1')
                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
             """)
+
+        # 回调钩子：由上层（db_market.py）注册聚合 VIEW 等业务逻辑
+        if self._on_schema_init:
+            self._on_schema_init(self, market)
 
         logger.info(f"✅ 已初始化 {market}_db 表结构（{current_year - 1}-{current_year}）")
 
@@ -516,112 +522,14 @@ class MarketDBManager:
             ON "{table}" (time)
         """)
 
-    # ---- 聚合 VIEW 生成 ----
-
-    # 目标周期 → (bucket 类型, 附加参数)
-    _AGG_VIEW_TFS = {
-        "30m": ("interval", 1800),
-        "1h":  ("interval", 3600),
-        "2h":  ("interval", 7200),
-        "4h":  ("interval", 14400),
-        "1D":  ("daily",    None),
-        "1W":  ("weekly",   None),
-        "1M":  ("monthly",  None),
-    }
-
-    @staticmethod
-    def _ensure_agg_views(cursor, source_timeframe: str, target_tfs: list):
-        """
-        为指定目标周期创建聚合 VIEW（TIMESTAMP 兼容）。
-
-        使用 EXTRACT(EPOCH FROM time) + to_timestamp() 确保 VIEW 列类型为 TIMESTAMP。
-
-        Args:
-            source_timeframe: 源数据周期 "15m" 或 "1D"
-            target_tfs:       目标周期列表，如 ["30m", "1h", "2h", "4h"] 或 ["1W", "1M"]
-        """
-        # 发现所有源周期分区表
-        cursor.execute("""
-            SELECT table_name FROM information_schema.tables
-            WHERE table_schema = 'public'
-              AND table_type = 'BASE TABLE'
-              AND table_name LIKE %s
-            ORDER BY table_name
-        """, (f'kline_{source_timeframe}_%',))
-        tables = [r[0] for r in cursor.fetchall()]
-
-        if not tables:
-            logger.warning(f"无法创建聚合 VIEW：没有找到 {source_timeframe} 表")
-            return
-
-        # 过滤掉已有的聚合 VIEW 对应的表名前缀
-        agg_prefixes = ('kline_30m_', 'kline_1h_', 'kline_2h_', 'kline_4h_',
-                        'kline_1d_', 'kline_1w_', 'kline_1m_')
-        tables = [t for t in tables if not any(t.startswith(p) for p in agg_prefixes)]
-
-        tz = 28800  # UTC+8
-
-        for tf in target_tfs:
-            if tf not in MarketDBManager._AGG_VIEW_TFS:
-                continue
-
-            bucket_type, bucket_param = MarketDBManager._AGG_VIEW_TFS[tf]
-            view_name = f"kline_{tf}_from_{source_timeframe}"
-
-            # 构造 TIMESTAMP 兼容的 bucket 表达式
-            if bucket_type == "interval":
-                sec = bucket_param
-                bucket_expr = (
-                    f"to_timestamp(EXTRACT(EPOCH FROM time)"
-                    f" - MOD(EXTRACT(EPOCH FROM time)::integer, {sec}))"
-                )
-            elif bucket_type == "daily":
-                bucket_expr = (
-                    f"to_timestamp("
-                    f"(EXTRACT(EPOCH FROM time + interval '{tz}s')::integer / 86400) * 86400 - {tz})"
-                )
-            elif bucket_type == "weekly":
-                bucket_expr = (
-                    f"to_timestamp("
-                    f"(EXTRACT(EPOCH FROM time + interval '{tz}s')::integer / 86400) * 86400 - {tz})"
-                    f" - (EXTRACT(DOW FROM time AT TIME ZONE 'Asia/Shanghai')::int - 1 + 7)"
-                    f" % 7 * 86400"
-                )
-            elif bucket_type == "monthly":
-                bucket_expr = (
-                    f"(date_trunc('month', time AT TIME ZONE 'Asia/Shanghai')"
-                    f" AT TIME ZONE 'Asia/Shanghai')"
-                )
-            else:
-                continue
-
-            union_parts = []
-            for tbl in tables:
-                union_parts.append(f'''
-                    SELECT
-                        symbol,
-                        {bucket_expr}                              AS bucket,
-                        (ARRAY_AGG(open  ORDER BY time ASC))[1]    AS open,
-                        MAX(high)                                  AS high,
-                        MIN(low)                                   AS low,
-                        (ARRAY_AGG(close ORDER BY time DESC))[1]   AS close,
-                        SUM(volume)                                AS volume
-                    FROM "{tbl}"
-                    GROUP BY symbol, {bucket_expr}
-                ''')
-
-            query = f"""
-                CREATE OR REPLACE VIEW "{view_name}" AS
-                {' UNION ALL '.join(union_parts)}
-            """
-            cursor.execute(query)
-
-        logger.info(f"✅ 已创建聚合 VIEW: {', '.join(target_tfs)}（源: {source_timeframe}）")
-
     def ensure_year_table(self, market: str, timeframe: str, year: int):
+        table_key = f"{_resolve_market(market)}_{timeframe}_{year}"
+        if table_key in self._year_table_cache:
+            return
         pool = self._get_pool(market)
         with pool.cursor() as cur:
             self._ensure_kline_table(cur, timeframe, year)
+        self._year_table_cache.add(table_key)
         logger.debug(f"确保表存在: {market}_db.{_table_name(timeframe, year)}")
 
     # ---- FDW 桥接（可选） ----

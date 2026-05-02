@@ -40,12 +40,11 @@ db_market.py — 多市场行情数据读写与聚合（上层）
 from __future__ import annotations
 
 import os
-import re
-import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
-from contextlib import contextmanager
+
+from psycopg2.extras import execute_values
 
 from app.utils.logger import get_logger
 from app.utils.db_multi import (
@@ -53,7 +52,7 @@ from app.utils.db_multi import (
     KLINE_COLUMNS, POOL_MIN, POOL_MAX,
     KNOWN_MARKETS, _MARKET_ALIASES,
     _market_db_name, _resolve_market, _table_name,
-    _daily_view_name, _is_valid_market,
+    _daily_view_name,
 )
 
 logger = get_logger(__name__)
@@ -64,22 +63,24 @@ logger = get_logger(__name__)
 
 TIMEFRAMES = ["1m", "5m", "15m", "30m", "1H", "4H", "1D", "1W"]
 
+# 聚合 VIEW 配置：目标周期 → (bucket 类型, 附加参数)
+# 从 db_multi.py 迁移至此（聚合 VIEW 是业务逻辑，不属于连接层）
+_AGG_VIEW_TFS = {
+    "30m": ("interval", 1800),
+    "1h":  ("interval", 3600),
+    "2h":  ("interval", 7200),
+    "4h":  ("interval", 14400),
+    "1D":  ("daily",    None),
+    "1W":  ("weekly",   None),
+    "1M":  ("monthly",  None),
+}
+
 
 def _year_from_ts(ts) -> int:
     """从 datetime 对象或整数时间戳提取年份"""
     if isinstance(ts, datetime):
         return ts.year
     return datetime.fromtimestamp(ts, tz=timezone.utc).year
-
-
-def _is_valid_market(market: str) -> bool:
-    """检查市场名是否合法（标准名或别名均可）"""
-    m = market.strip()
-    if m in KNOWN_MARKETS:
-        return True
-    if m.lower() in _MARKET_ALIASES:
-        return True
-    return bool(re.match(r'^[a-zA-Z][a-zA-Z0-9_]*$', m))
 
 
 def _ensure_datetime(value) -> datetime:
@@ -124,6 +125,8 @@ class MarketKlineWriter:
 
     def __init__(self, manager: MarketDBManager = None):
         self._mgr = manager or MarketDBManager()
+        # 分区表列表缓存：{(market, timeframe): set(years)}
+        self._partition_cache: Dict[Tuple[str, str], set] = {}
 
     # ================================================================
     # 接口A: 增量写入
@@ -135,6 +138,7 @@ class MarketKlineWriter:
         symbol: str,
         timeframe: str,
         records: List[Dict[str, Any]],
+        atomic: bool = True,
     ) -> Dict[str, Any]:
         """
         增量写入 K 线数据（UPSERT）。
@@ -146,9 +150,9 @@ class MarketKlineWriter:
             market:    市场标识，如 "CNStock", "us", "crypto"
             symbol:    品种代码，如 "600519", "BTC/USDT"
             timeframe: K线周期，如 "15m", "1H", "1D"
-            records:   K线数据列表，每条包含:
-                       {"time": int, "open": float, "high": float,
-                        "low": float, "close": float, "volume": float}
+            records:   K线数据列表
+            atomic:    True（默认）= 一条失败不影响其余，最终全部提交
+                       False = 遇到第一条异常立即回滚全部
 
         Returns:
             {"inserted": int, "updated": int, "errors": int,
@@ -201,6 +205,9 @@ class MarketKlineWriter:
                         except Exception as e:
                             total_errors += 1
                             logger.warning(f"upsert 失败: {market}/{symbol} t={rec.get('time')}: {e}")
+                            if not atomic:
+                                conn.rollback()
+                                raise
 
                 conn.commit()
             except Exception:
@@ -232,7 +239,8 @@ class MarketKlineWriter:
         """
         大批量写入 K 线数据。
 
-        自动按 symbol + timeframe + year 三维分组，批量写入对应表。
+        使用 psycopg2.extras.execute_values 批量 INSERT（比字符串拼接快 3-5 倍）。
+        失败时先拆半重试，再逐条 INSERT，避免一批冲突导致整批变逐条。
 
         Args:
             market:      市场标识
@@ -267,77 +275,59 @@ class MarketKlineWriter:
         )
         by_table: Dict[str, int] = defaultdict(int)
 
+        conflict_clause = self._conflict_clause(on_conflict)
+
         with pool.connection() as conn:
             cur = conn.cursor()
-            try:
-                for (symbol, timeframe, year), group_records in groups.items():
-                    table = _table_name(timeframe, year)
+            for (symbol, timeframe, year), group_records in groups.items():
+                table = _table_name(timeframe, year)
 
-                    for batch_start in range(0, len(group_records), batch_size):
-                        batch = group_records[batch_start:batch_start + batch_size]
-                        values, params = [], []
-                        for rec in batch:
-                            values.append("(%s, %s, %s, %s, %s, %s, %s)")
-                            params.extend([
-                                symbol, _ensure_datetime(rec["time"]), rec["open"],
-                                rec["high"], rec["low"], rec["close"],
-                                rec.get("volume", 0),
-                            ])
+                base_sql = f"""
+                    INSERT INTO "{table}"
+                        (symbol, time, open, high, low, close, volume)
+                    VALUES %s
+                    {conflict_clause}
+                """
 
-                        conflict_clause = self._conflict_clause(on_conflict)
-                        sql = f"""
-                            INSERT INTO "{table}"
-                                (symbol, time, open, high, low, close, volume)
-                            VALUES {', '.join(values)}
-                            {conflict_clause}
-                        """
+                for batch_start in range(0, len(group_records), batch_size):
+                    batch = group_records[batch_start:batch_start + batch_size]
+                    value_list = [
+                        (symbol, _ensure_datetime(rec["time"]), rec["open"],
+                         rec["high"], rec["low"], rec["close"],
+                         rec.get("volume", 0))
+                        for rec in batch
+                    ]
 
-                        try:
-                            cur.execute(sql, params)
-                            affected = cur.rowcount
-                            if on_conflict == "skip":
-                                total_skipped += affected
-                                by_symbol[symbol]["skipped"] += affected
-                            else:
-                                total_inserted += affected
-                                by_symbol[symbol]["inserted"] += affected
-                                by_table[table] += affected
-                        except Exception as e:
-                            logger.warning(
-                                f"批量写入失败，回退逐条: {market}/{symbol} "
-                                f"{table} batch_size={len(batch)}: {e}"
-                            )
-                            conn.rollback()
-                            single_sql = f"""
-                                INSERT INTO "{table}"
-                                    (symbol, time, open, high, low, close, volume)
-                                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                                {conflict_clause}
-                            """
-                            for rec in batch:
-                                try:
-                                    cur.execute(single_sql, [
-                                        symbol, _ensure_datetime(rec["time"]),
-                                        rec["open"], rec["high"],
-                                        rec["low"], rec["close"],
-                                        rec.get("volume", 0),
-                                    ])
-                                    if on_conflict == "skip":
-                                        total_skipped += cur.rowcount
-                                        by_symbol[symbol]["skipped"] += cur.rowcount
-                                    else:
-                                        total_inserted += cur.rowcount
-                                        by_symbol[symbol]["inserted"] += cur.rowcount
-                                        by_table[table] += cur.rowcount
-                                except Exception as e2:
-                                    total_errors += 1
-                                    by_symbol[symbol]["errors"] += 1
-                                    logger.debug(f"逐条写入失败: {market}/{symbol} t={rec.get('time')}: {e2}")
+                    try:
+                        execute_values(cur, base_sql, value_list, page_size=len(value_list))
+                        affected = cur.rowcount
+                        if on_conflict == "skip":
+                            total_skipped += affected
+                            by_symbol[symbol]["skipped"] += affected
+                            by_table[table] += affected
+                        else:
+                            total_inserted += affected
+                            by_symbol[symbol]["inserted"] += affected
+                            by_table[table] += affected
+                        conn.commit()
+                    except Exception as e:
+                        conn.rollback()
+                        logger.warning(
+                            f"批量写入失败，拆半重试: {market}/{symbol} "
+                            f"{table} batch_size={len(batch)}: {e}"
+                        )
+                        ok, fail = self._retry_with_split(
+                            conn, cur, base_sql, value_list,
+                            symbol, table, on_conflict,
+                        )
+                        total_inserted += ok
+                        total_errors += fail
+                        by_symbol[symbol]["inserted"] += ok
+                        by_symbol[symbol]["errors"] += fail
+                        by_table[table] += ok
+                        conn.commit()
 
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
+            cur.close()
 
         result = {
             "total": len(records), "inserted": total_inserted,
@@ -351,6 +341,36 @@ class MarketKlineWriter:
             f"品种={len(by_symbol)} 表={len(by_table)}"
         )
         return result
+
+    @staticmethod
+    def _retry_with_split(conn, cur, base_sql, value_list, symbol, table, on_conflict):
+        """批量失败时先拆半重试，再逐条 INSERT。
+
+        拆半能快速隔离冲突行，比直接逐条 INSERT 快 5-10 倍。
+        每次重试前 conn.rollback() 清除 aborted 状态，重试后由外层统一 commit。
+
+        Returns:
+            (ok_count, fail_count)
+        """
+        if len(value_list) <= 1:
+            # 只剩 1 条，逐条处理
+            try:
+                conn.rollback()  # 清除 aborted 状态
+                execute_values(cur, base_sql, value_list, page_size=1)
+                if on_conflict == "skip":
+                    return (0, 0)
+                return (cur.rowcount, 0)
+            except Exception:
+                conn.rollback()
+                return (0, 1)
+
+        # 拆半递归
+        mid = len(value_list) // 2
+        ok1, fail1 = MarketKlineWriter._retry_with_split(
+            conn, cur, base_sql, value_list[:mid], symbol, table, on_conflict)
+        ok2, fail2 = MarketKlineWriter._retry_with_split(
+            conn, cur, base_sql, value_list[mid:], symbol, table, on_conflict)
+        return (ok1 + ok2, fail1 + fail2)
 
     # ================================================================
     # 查询辅助
@@ -389,21 +409,27 @@ class MarketKlineWriter:
         pool = self._mgr._get_pool(market)
 
         if not years:
-            # 不指定时间范围 → 自动扫描所有存在的年份分区表
-            with pool.cursor() as cur:
-                cur.execute("""
-                    SELECT table_name FROM information_schema.tables
-                    WHERE table_schema = 'public'
-                      AND table_type = 'BASE TABLE'
-                      AND table_name LIKE %s
-                """, (f'kline_{timeframe}_%',))
-                for row in cur.fetchall():
-                    parts = row[0].rsplit('_', 1)
-                    if len(parts) == 2:
-                        try:
-                            years.add(int(parts[1]))
-                        except ValueError:
-                            pass
+            # 不指定时间范围 → 用缓存或扫描分区表
+            cache_key = (_resolve_market(market), timeframe)
+            if cache_key in self._partition_cache:
+                years = self._partition_cache[cache_key]
+            else:
+                with pool.cursor() as cur:
+                    cur.execute("""
+                        SELECT table_name FROM information_schema.tables
+                        WHERE table_schema = 'public'
+                          AND table_type = 'BASE TABLE'
+                          AND table_name LIKE %s
+                    """, (f'kline_{timeframe}_%',))
+                    for row in cur.fetchall():
+                        parts = row[0].rsplit('_', 1)
+                        if len(parts) == 2:
+                            try:
+                                years.add(int(parts[1]))
+                            except ValueError:
+                                pass
+                if years:
+                    self._partition_cache[cache_key] = years
             if not years:
                 years = {datetime.now().year}
 
@@ -573,7 +599,7 @@ class MarketKlineWriter:
         # 再用 to_timestamp() 转回 TIMESTAMP，确保 VIEW 列类型与源表一致。
         if bucket_type == "interval":
             sec = target_cfg["sec"]
-            bucket_expr = f"to_timestamp(EXTRACT(EPOCH FROM t.time) - MOD(EXTRACT(EPOCH FROM t.time)::integer, {sec}))"
+            bucket_expr = f"to_timestamp(EXTRACT(EPOCH FROM t.time) - MOD(EXTRACT(EPOCH FROM t.time)::bigint, {sec}))"
         elif bucket_type == "daily":
             bucket_expr = (
                 f"to_timestamp((EXTRACT(EPOCH FROM t.time + interval '{tz_offset}s')::integer / 86400) * 86400 - {tz_offset})"
@@ -717,15 +743,28 @@ _manager: Optional[MarketDBManager] = None
 _writer: Optional[MarketKlineWriter] = None
 
 
+def _schema_init_hook(mgr: MarketDBManager, market: str):
+    """MarketDBManager 初始化新库后的回调：创建聚合 VIEW。
+
+    通过 MarketDBManager._on_schema_init 注册，避免 db_multi.py 反向调用 db_market.py。
+    """
+    try:
+        _create_agg_views_for_market(mgr, market)
+    except Exception as e:
+        logger.warning(f"聚合 VIEW 创建失败: {market}: {e}")
+
+
 def get_market_db_manager() -> MarketDBManager:
     """
     获取全局 MarketDBManager 实例。
 
     连接信息从 DATABASE_URL 解析，strategy_db 名从 STRATEGY_DB_NAME 或 URL 推导。
+    注册 _schema_init_hook，新建库时自动创建聚合 VIEW。
     """
     global _manager
     if _manager is None:
         _manager = MarketDBManager()
+        _manager._on_schema_init = _schema_init_hook
     return _manager
 
 
@@ -737,10 +776,10 @@ def get_market_kline_writer() -> MarketKlineWriter:
 
 
 # ---------------------------------------------------------------------------
-# 聚合 VIEW 创建（独立函数，替代 db_multi.py 中的整数版本）
+# 聚合 VIEW 创建（业务逻辑，从 db_multi.py 迁移）
 # ---------------------------------------------------------------------------
 
-# 聚合目标配置
+# 聚合目标配置（与 _AGG_VIEW_TFS 对应，拆分为 source/type/sec 便于业务层使用）
 _AGG_VIEW_TARGETS = {
     "30m": {"source": "15m", "type": "interval", "sec": 1800},
     "1h":  {"source": "15m", "type": "interval", "sec": 3600},
@@ -752,33 +791,21 @@ _AGG_VIEW_TARGETS = {
 }
 
 
-def ensure_agg_views(market: str, manager: MarketDBManager = None):
-    """为指定市场创建所有聚合 VIEW（TIMESTAMP 兼容版本）。
+def _create_agg_views_for_market(mgr: MarketDBManager, market: str):
+    """为指定市场创建所有聚合 VIEW（内部实现）。
 
-    替代 db_multi.py 中 MarketDBManager._ensure_agg_views 的整数算术版本。
-    使用 EXTRACT(EPOCH FROM ...) 和 to_timestamp() 确保 VIEW 列类型为 TIMESTAMP。
-
-    聚合目标:
-      15m → 30m, 1h, 2h, 4h, 1D
-      1D  → 1W, 1M
-
-    Args:
-        market: 市场标识，如 "CNStock"
-        manager: MarketDBManager 实例（可选，默认使用全局实例）
+    按源周期分组，发现分区表后创建 VIEW。
+    被 ensure_agg_views() 和 _schema_init_hook() 共用。
     """
-    mgr = manager or get_market_db_manager()
     pool = mgr._get_pool(market)
     tz = 28800  # UTC+8
 
-    # 按源周期分组
-    from collections import defaultdict
-    by_source = defaultdict(list)
+    by_source: Dict[str, List[str]] = defaultdict(list)
     for tf, cfg in _AGG_VIEW_TARGETS.items():
         by_source[cfg["source"]].append(tf)
 
     with pool.cursor() as cur:
         for source_tf, target_tfs in by_source.items():
-            # 发现所有源周期分区表
             cur.execute("""
                 SELECT table_name FROM information_schema.tables
                 WHERE table_schema = 'public'
@@ -792,7 +819,6 @@ def ensure_agg_views(market: str, manager: MarketDBManager = None):
                 logger.warning(f"无法创建聚合 VIEW：没有找到 {source_tf} 表")
                 continue
 
-            # 过滤掉已有的聚合 VIEW 对应的表名前缀
             agg_prefixes = ('kline_30m_', 'kline_1h_', 'kline_2h_', 'kline_4h_',
                             'kline_1d_', 'kline_1w_', 'kline_1m_')
             tables = [t for t in tables if not any(t.startswith(p) for p in agg_prefixes)]
@@ -802,17 +828,16 @@ def ensure_agg_views(market: str, manager: MarketDBManager = None):
                 bucket_type = cfg["type"]
                 view_name = f"kline_{tf}_from_{source_tf}"
 
-                # 构造 TIMESTAMP 兼容的 bucket 表达式
                 if bucket_type == "interval":
                     sec = cfg["sec"]
                     bucket_expr = (
                         f"to_timestamp(EXTRACT(EPOCH FROM time)"
-                        f" - MOD(EXTRACT(EPOCH FROM time)::integer, {sec}))"
+                        f" - MOD(EXTRACT(EPOCH FROM time)::bigint, {sec}))"
                     )
                 elif bucket_type == "daily":
                     bucket_expr = (
                         f"to_timestamp("
-                        f"(EXTRACT(EPOCH FROM time + interval '{tz}s')::integer / 86400) * 86400 - {tz})"
+                        f"(EXTRACT(EPOCH FROM time + interval '{tz}s')::bigint / 86400) * 86400 - {tz})"
                     )
                 elif bucket_type == "weekly":
                     bucket_expr = (
@@ -852,3 +877,18 @@ def ensure_agg_views(market: str, manager: MarketDBManager = None):
                 logger.info(f"✅ 已创建聚合 VIEW: {view_name}（源: {source_tf}）")
 
     logger.info(f"✅ {market} 聚合 VIEW 全部创建完成")
+
+
+def ensure_agg_views(market: str, manager: MarketDBManager = None):
+    """为指定市场创建所有聚合 VIEW（TIMESTAMP 兼容版本）。
+
+    聚合目标:
+      15m → 30m, 1h, 2h, 4h, 1D
+      1D  → 1W, 1M
+
+    Args:
+        market: 市场标识，如 "CNStock"
+        manager: MarketDBManager 实例（可选，默认使用全局实例）
+    """
+    mgr = manager or get_market_db_manager()
+    _create_agg_views_for_market(mgr, market)

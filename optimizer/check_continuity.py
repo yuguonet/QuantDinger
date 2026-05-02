@@ -522,7 +522,9 @@ def _worker_check_batch(args: Tuple) -> Tuple[
 
     from app.utils.db_market import get_market_kline_writer
     writer = get_market_kline_writer()
-    _build_trading_day_cache(market)
+    # fork 后继承父进程的交易日缓存，仅在未构建时才重新拉取
+    if _TRADING_DAY_SET is None:
+        _build_trading_day_cache(market)
 
     local_gaps: List[Dict[str, Any]] = []
     local_issues: List[Dict[str, Any]] = []
@@ -954,6 +956,12 @@ def fill_1d_gaps_from_15m(
     filled_dates = set()
     both_missing = []
 
+    # 预确保所有可能用到的 1D 年份表存在（避免在 cursor 上下文内嵌套取连接）
+    if not dry_run:
+        years_needed = {datetime.strptime(d, "%Y-%m-%d").year for d in all_missing_dates}
+        for y in years_needed:
+            writer._mgr.ensure_year_table(market, "1D", y)
+
     for d in sorted(all_missing_dates):
         recs_15m = date_to_15m.get(d, [])
         if len(recs_15m) >= 8:
@@ -961,13 +969,10 @@ def fill_1d_gaps_from_15m(
             agg_bar = _aggregate_15m_to_1d(recs_15m)
             if agg_bar is not None:
                 if not dry_run:
-                    # 确保 1D 年份表存在
                     year = datetime.strptime(d, "%Y-%m-%d").year
                     table = f"kline_1D_{year}"
                     ts_1d = _date_to_ts(d)  # 返回 datetime 对象
                     try:
-                        # 先确保表存在（避免在 cursor 上下文内嵌套取连接）
-                        writer._mgr.ensure_year_table(market, "1D", year)
                         with pool.cursor() as cur:
                             cur.execute(f"""
                                 INSERT INTO "{table}"
@@ -1170,6 +1175,7 @@ def main():
     print()
 
     _build_trading_day_cache(market)
+    assert _TRADING_DAY_SET is not None, "交易日缓存必须在 fork 前构建完成"
 
     batches = [syms[i:i + batch_size] for i in range(0, total, batch_size)]
 
