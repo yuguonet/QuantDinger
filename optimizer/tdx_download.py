@@ -934,7 +934,7 @@ def merge_to_db(input_dir, data_type, workers=4, db_url=None):
             if os.path.isfile(env_path):
                 load_dotenv(env_path, override=False)
                 break
-    except ImportError:
+    except Exception:
         pass
 
     # 如果指定了 db_url，设为环境变量

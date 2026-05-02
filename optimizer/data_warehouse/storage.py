@@ -37,7 +37,6 @@ _TF_DIR_MAP = {
 
 def _load_env():
     """加载 .env 文件（优先 backend 目录，其次项目根目录）"""
-    import os
     try:
         from dotenv import load_dotenv
         _this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -50,7 +49,7 @@ def _load_env():
             if os.path.isfile(env_path):
                 load_dotenv(env_path, override=False)
                 break
-    except ImportError:
+    except Exception:
         pass
 
 

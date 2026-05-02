@@ -287,6 +287,8 @@ class MarketDBManager:
 
         self._pools: Dict[str, MarketPool] = {}
         self._pool_lock = threading.Lock()
+        # 数据库存在性缓存（避免每次都连 postgres 系统库查询）
+        self._db_exists_cache: Dict[str, bool] = {}
 
         logger.info(
             f"MarketDBManager 初始化: "
@@ -344,14 +346,24 @@ class MarketDBManager:
         return conn
 
     def market_db_exists(self, market: str) -> bool:
-        db_name = _market_db_name(market)
-        conn = self._admin_conn()
+        # 使用缓存，避免每次都连 postgres 系统库
+        resolved = _resolve_market(market)
+        if resolved in self._db_exists_cache:
+            return self._db_exists_cache[resolved]
+        db_name = _market_db_name(resolved)
         try:
-            cur = conn.cursor()
-            cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (db_name,))
-            return cur.fetchone() is not None
-        finally:
-            conn.close()
+            conn = self._admin_conn()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (db_name,))
+                exists = cur.fetchone() is not None
+                self._db_exists_cache[resolved] = exists
+                return exists
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.error(f"检查数据库 {db_name} 存在性失败: {e}")
+            return False
 
     def create_market_db(self, market: str) -> bool:
         resolved = _resolve_market(market)
@@ -368,6 +380,7 @@ class MarketDBManager:
         try:
             cur = conn.cursor()
             cur.execute(f'CREATE DATABASE "{db_name}" TEMPLATE template0')
+            self._db_exists_cache[resolved] = True  # 更新缓存
             logger.info(f"✅ 已创建市场数据库: {db_name}")
         except Exception as e:
             logger.error(f"创建数据库 {db_name} 失败: {e}")
@@ -383,7 +396,8 @@ class MarketDBManager:
 
     def drop_market_db(self, market: str) -> bool:
         self.close_pool(market)
-        db_name = _market_db_name(market)
+        resolved = _resolve_market(market)
+        db_name = _market_db_name(resolved)
         conn = self._admin_conn()
         try:
             cur = conn.cursor()
@@ -393,6 +407,7 @@ class MarketDBManager:
                 WHERE datname = %s AND pid != pg_backend_pid()
             """, (db_name,))
             cur.execute(f'DROP DATABASE IF EXISTS "{db_name}"')
+            self._db_exists_cache.pop(resolved, None)  # 清除缓存
             logger.warning(f"⚠️ 已删除市场数据库: {db_name}")
             return True
         finally:
@@ -947,10 +962,28 @@ class MarketKlineWriter:
             years.add(_year_from_ts(start_time))
         if end_time:
             years.add(_year_from_ts(end_time))
-        if not years:
-            years = {datetime.now().year}
 
         pool = self._mgr._get_pool(market)
+
+        if not years:
+            # 不指定时间范围 → 自动扫描所有存在的年份分区表
+            with pool.cursor() as cur:
+                cur.execute("""
+                    SELECT table_name FROM information_schema.tables
+                    WHERE table_schema = 'public'
+                      AND table_type = 'BASE TABLE'
+                      AND table_name LIKE %s
+                """, (f'kline_{timeframe}_%',))
+                for row in cur.fetchall():
+                    parts = row[0].rsplit('_', 1)
+                    if len(parts) == 2:
+                        try:
+                            years.add(int(parts[1]))
+                        except ValueError:
+                            pass
+            if not years:
+                years = {datetime.now().year}
+
         all_rows = []
 
         with pool.cursor() as cur:

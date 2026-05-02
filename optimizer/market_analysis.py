@@ -28,7 +28,6 @@ if _project_root not in sys.path:
 
 def _load_env():
     """加载 .env 文件"""
-    import os
     try:
         from dotenv import load_dotenv
         _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -40,7 +39,7 @@ def _load_env():
             if os.path.isfile(env_path):
                 load_dotenv(env_path, override=False)
                 break
-    except ImportError:
+    except Exception:
         pass
 
 
