@@ -170,9 +170,11 @@ def _deduce_trading_days_from_db(market: str, min_stocks: int = 10) -> set[str]:
 
 def _build_trading_day_cache(market: str = "CNStock"):
     """
-    构建交易日集合（两级）:
+    构建交易日集合（两级 + 合并）:
       1. akshare — 新浪真实交易日历（含调休，排除假日）
       2. 数据库反推 — 统计每天有数据的股票数，>=10 只视为交易日
+
+    如果 akshare 日历过期（不含数据最新日期），自动合并数据库反推的结果。
 
     Args:
         market: 市场标识，用于数据库反推
@@ -181,22 +183,31 @@ def _build_trading_day_cache(market: str = "CNStock"):
     if _TRADING_DAY_SET is not None:
         return
 
-    # 1. akshare
-    dates = _fetch_trading_days_from_akshare()
-    if dates and len(dates) > 100:
-        _TRADING_DAY_SET = frozenset(dates)
-        print(f"📅 交易日历: akshare（{len(dates)} 天）")
+    akshare_dates = _fetch_trading_days_from_akshare()
+    db_dates = _deduce_trading_days_from_db(market)
+
+    # 检查 akshare 日历是否覆盖数据范围
+    akshare_max = max(akshare_dates) if akshare_dates else ""
+    db_max = max(db_dates) if db_dates else ""
+    data_max = max(akshare_max, db_max)
+
+    if akshare_dates and len(akshare_dates) > 100:
+        if db_dates and db_max > akshare_max:
+            # akshare 日历过期，合并数据库反推的日期
+            merged = akshare_dates | db_dates
+            _TRADING_DAY_SET = frozenset(merged)
+            print(f"📅 交易日历: akshare + 数据库合并（{len(merged)} 天，"
+                  f"akshare 截至 {akshare_max}，数据截至 {db_max}）")
+        else:
+            _TRADING_DAY_SET = frozenset(akshare_dates)
+            print(f"📅 交易日历: akshare（{len(akshare_dates)} 天）")
         return
 
-    # 2. 数据库反推
-    print(f"⚠️  akshare 不可用，从数据库反推交易日历（{market}）...")
-    dates = _deduce_trading_days_from_db(market)
-    if dates and len(dates) > 100:
-        _TRADING_DAY_SET = frozenset(dates)
-        print(f"📅 交易日历: 数据库反推（{len(dates)} 天）")
+    if db_dates and len(db_dates) > 100:
+        _TRADING_DAY_SET = frozenset(db_dates)
+        print(f"📅 交易日历: 数据库反推（{len(db_dates)} 天）")
         return
 
-    # 3. 都失败了
     print("❌ 无法确定交易日历（akshare 不可用且数据库无足够数据）")
     _TRADING_DAY_SET = frozenset()
 
