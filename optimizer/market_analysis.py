@@ -4,7 +4,8 @@ A 股全市场数据分析 — 策略设计前的数据画像
 数据来源：db_market (CNStock_db)，不再依赖本地 CSV。
 
 用法:
-    python market_analysis.py              # 完整分析（日线）
+    python market_analysis.py              # 完整分析（抽样500只）
+    python market_analysis.py --full       # 全量分析（全部5000+只）
     python market_analysis.py --15m        # 包含15分钟线分析
     python market_analysis.py --quick      # 快速模式（抽样200只）
 """
@@ -25,16 +26,36 @@ if _backend_root not in sys.path:
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+def _load_env():
+    """加载 .env 文件"""
+    import os
+    try:
+        from dotenv import load_dotenv
+        _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _backend_root = os.path.join(_project_root, "backend_api_python")
+        for env_path in [
+            os.path.join(_backend_root, '.env'),
+            os.path.join(_project_root, '.env'),
+        ]:
+            if os.path.isfile(env_path):
+                load_dotenv(env_path, override=False)
+                break
+    except ImportError:
+        pass
+
+
 def _get_writer():
     """延迟导入 db_market writer"""
+    _load_env()
     from app.utils.db_market import get_market_kline_writer
-    return _get_writer()
+    return get_market_kline_writer()
 
 
 def _get_mgr():
     """延迟导入 db_market manager"""
+    _load_env()
     from app.utils.db_market import get_market_db_manager
-    return _get_mgr()
+    return get_market_db_manager()
 
 
 OUTPUT_DIR = os.path.join(_optimizer_dir, "analysis_output")
@@ -116,7 +137,10 @@ def market_overview(all_codes: list, sample_n: int = 500):
     date_ranges = []
     row_counts = []
 
-    for code in sample:
+    total = len(sample)
+    for i, code in enumerate(sample):
+        if (i + 1) % 100 == 0 or i == 0:
+            print(f"\r   加载中: {i+1}/{total} ({(i+1)/total*100:.0f}%)", end="", flush=True)
         df = load_csv(code)
         if df is None or len(df) < 100:
             continue
@@ -131,6 +155,7 @@ def market_overview(all_codes: list, sample_n: int = 500):
         row_counts.append(len(df))
 
     all_returns = np.array(all_returns)
+    all_returns = all_returns[~np.isnan(all_returns)]
 
     print(f"\n📈 收益率分布 (抽样 {len(sample)} 只, 共 {len(all_returns):,} 个交易日):")
     print(f"   均值: {all_returns.mean()*100:.4f}%")
@@ -166,7 +191,10 @@ def cross_sectional_analysis(all_codes: list, sample_n: int = 500):
     sample = all_codes[:sample_n] if len(all_codes) > sample_n else all_codes
 
     stats = []
-    for code in sample:
+    total = len(sample)
+    for i, code in enumerate(sample):
+        if (i + 1) % 100 == 0 or i == 0:
+            print(f"\r   分析中: {i+1}/{total} ({(i+1)/total*100:.0f}%)", end="", flush=True)
         df = load_csv(code)
         if df is None or len(df) < 200:
             continue
@@ -277,7 +305,10 @@ def time_series_analysis(all_codes: list, sample_n: int = 300):
     sample = all_codes[:sample_n] if len(all_codes) > sample_n else all_codes
 
     all_data = []
-    for code in sample:
+    total = len(sample)
+    for i, code in enumerate(sample):
+        if (i + 1) % 100 == 0 or i == 0:
+            print(f"\r   加载中: {i+1}/{total} ({(i+1)/total*100:.0f}%)", end="", flush=True)
         df = load_csv(code)
         if df is None or len(df) < 200:
             continue
@@ -380,7 +411,10 @@ def volume_price_analysis(all_codes: list, sample_n: int = 300):
 
     vol_change_by_return = defaultdict(list)
 
-    for code in sample:
+    total = len(sample)
+    for i, code in enumerate(sample):
+        if (i + 1) % 100 == 0 or i == 0:
+            print(f"\r   分析中: {i+1}/{total} ({(i+1)/total*100:.0f}%)", end="", flush=True)
         df = load_csv(code)
         if df is None or len(df) < 200:
             continue
@@ -469,7 +503,10 @@ def sector_rotation_analysis(all_codes: list, sample_n: int = 500):
 
     board_monthly = defaultdict(lambda: defaultdict(list))
 
-    for code in sample:
+    total = len(sample)
+    for i, code in enumerate(sample):
+        if (i + 1) % 100 == 0 or i == 0:
+            print(f"\r   加载中: {i+1}/{total} ({(i+1)/total*100:.0f}%)", end="", flush=True)
         df = load_csv(code)
         if df is None or len(df) < 200:
             continue
@@ -575,12 +612,18 @@ def strategy_suggestions(df_stats, all_returns):
 # ============================================================
 def main():
     quick = "--quick" in sys.argv
+    full = "--full" in sys.argv
     include_15m = "--15m" in sys.argv
 
-    sample_n = 200 if quick else 500
+    if full:
+        sample_n = 99999  # 不限制
+    elif quick:
+        sample_n = 200
+    else:
+        sample_n = 500
 
     print("🚀 A 股全市场数据分析 (db_market)")
-    print(f"   模式: {'快速' if quick else '完整'}")
+    print(f"   模式: {'全量' if full else '快速' if quick else '完整'}")
 
     all_codes = get_all_codes()
     print(f"   股票总数: {len(all_codes)}")

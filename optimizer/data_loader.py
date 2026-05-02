@@ -25,14 +25,34 @@ if _backend_root not in sys.path:
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+def _load_env():
+    """加载 .env 文件"""
+    import os
+    try:
+        from dotenv import load_dotenv
+        _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _backend_root = os.path.join(_project_root, "backend_api_python")
+        for env_path in [
+            os.path.join(_backend_root, '.env'),
+            os.path.join(_project_root, '.env'),
+        ]:
+            if os.path.isfile(env_path):
+                load_dotenv(env_path, override=False)
+                break
+    except ImportError:
+        pass
+
+
 def _get_writer():
     """延迟导入 db_market writer"""
+    _load_env()
     from app.utils.db_market import get_market_kline_writer
     return get_market_kline_writer()
 
 
 def _get_mgr():
     """延迟导入 db_market manager"""
+    _load_env()
     from app.utils.db_market import get_market_db_manager
     return get_market_db_manager()
 

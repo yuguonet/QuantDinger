@@ -153,18 +153,19 @@ def _is_valid_market(market: str) -> bool:
 
 
 def _parse_database_url(url: str) -> Dict[str, Any]:
+    if not url:
+        return {"host": "localhost", "port": 5432, "user": "postgres", "password": ""}
     if url.startswith("postgresql://"):
         url = url[13:]
     elif url.startswith("postgres://"):
         url = url[11:]
-    result = {}
+    result = {"host": "localhost", "port": 5432, "user": "postgres", "password": ""}
     if "@" in url:
         auth, hostpart = url.rsplit("@", 1)
         if ":" in auth:
             result["user"], result["password"] = auth.split(":", 1)
         else:
             result["user"] = auth
-            result["password"] = ""
     else:
         hostpart = url
     if "/" in hostpart:
