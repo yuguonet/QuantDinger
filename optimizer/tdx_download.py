@@ -9,6 +9,11 @@
 
 多进程并行可进一步加速 (每进程独立连接)
 
+时间格式:
+  - 数据库 time 列为 TIMESTAMP 类型
+  - 通达信 CSV 标准格式：15m="YYYY-MM-DD HH:MM", 1D="YYYY-MM-DD"
+  - 写入前校验 15m 时间对齐（±1min 容差），偏差过大丢弃并记日志
+
 用法:
   python tdx_download.py -T 1D                       # 日线
   python tdx_download.py -T 1m                       # 1分钟线
@@ -25,7 +30,6 @@
   中断后重新运行相同命令，自动跳过已完成的股票，只补下缺失的。
   加 --no-resume 可忽略断点，强制重新下载。
   加 --retry-failed 可将旧进度中 rows=0 的条目重置为待重试状态。
-    (适用于旧版脚本生成的进度文件，下载失败的股票被错误标记为已完成)
 
 修复模式 (--repair):
   与 check_continuity.py 联动，逐只股票修复已下载数据中的断裂和坏数据。
@@ -43,6 +47,11 @@
     日线 gap 优先用 akshare 前复权数据（时间戳匹配更可靠），
     分钟线 gap 仍走通达信（akshare 不支持分钟线前复权）。
     加 --no-fallback 可强制全部走通达信。
+
+依赖:
+  - db_market.py / db_multi.py（backend_api_python/app/utils/）
+  - pytdx
+  - akshare（可选，用于换源补数和停牌检测）
 """
 
 import os
@@ -892,12 +901,20 @@ def _merge_worker(args):
                                 continue
                         if dt is None:
                             continue
-                        ts = int(dt.timestamp())
+                        # 返回 datetime 对象（TIMESTAMP 列兼容）
+                        if dt.tzinfo is None:
+                            from datetime import timezone as _tz, timedelta as _td
+                            dt = dt.replace(tzinfo=_tz(_td(hours=8)))
+
+                        # 校验时间正确性（15m 对齐 ±1min，偏差过大丢弃）
+                        dt, action = validate_and_calibrate_time(dt, timeframe)
+                        if dt is None:
+                            continue  # 丢弃
 
                         records.append({
                             "symbol": code,
                             "timeframe": timeframe,
-                            "time": ts,
+                            "time": dt,
                             "open": float(row.get('open', 0)),
                             "high": float(row.get('high', 0)),
                             "low": float(row.get('low', 0)),
@@ -1095,13 +1112,147 @@ from multiprocessing import Pool as _Pool_repair
 _TZ_SH_REPAIR = __import__('datetime').timezone(__import__('datetime').timedelta(hours=8))
 
 
-def _truncate_ts_to_minute(ts: int) -> int:
-    """时间戳截断到分钟（秒归零），用于 15m 比对"""
-    dt = _dt_repair.fromtimestamp(ts, tz=_TZ_SH_REPAIR).replace(second=0, microsecond=0)
+def _truncate_ts_to_minute(ts) -> int:
+    """时间戳截断到分钟（秒归零），用于 15m 比对
+    支持 datetime 对象、整数时间戳或 ISO 字符串"""
+    if isinstance(ts, __import__('datetime').datetime):
+        dt = ts if ts.tzinfo else ts.replace(tzinfo=_TZ_SH_REPAIR)
+    elif isinstance(ts, str):
+        # ISO 字符串: "2024-04-12T09:45:00+08:00"
+        for fmt in ('%Y-%m-%dT%H:%M:%S%z', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M',
+                     '%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%d'):
+            try:
+                dt = _dt_repair.strptime(ts.strip(), fmt)
+                break
+            except ValueError:
+                continue
+        else:
+            dt = _dt_repair.fromtimestamp(0, tz=_TZ_SH_REPAIR)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_TZ_SH_REPAIR)
+    else:
+        dt = _dt_repair.fromtimestamp(ts, tz=_TZ_SH_REPAIR)
+    dt = dt.replace(second=0, microsecond=0)
     return int(dt.timestamp())
 
 
+def _ensure_datetime_repair(value):
+    """将各种时间格式统一转为 datetime 对象（TIMESTAMP 列兼容）"""
+    if isinstance(value, __import__('datetime').datetime):
+        return value
+    if isinstance(value, (int, float)):
+        return _dt_repair.fromtimestamp(value, tz=_TZ_SH_REPAIR)
+    if isinstance(value, str):
+        for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%d'):
+            try:
+                dt = _dt_repair.strptime(value.strip(), fmt)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_TZ_SH_REPAIR)
+                return dt
+            except ValueError:
+                continue
+    raise ValueError(f"无法解析时间值: {value!r}")
+
+
+# 15m 标准 bar 时间表（通达信 A 股）
+_BAR_TIMES_15M = [
+    (9, 30), (9, 45), (10, 0), (10, 15), (10, 30), (10, 45), (11, 0), (11, 15),
+    (13, 0), (13, 15), (13, 30), (13, 45), (14, 0), (14, 15), (14, 30), (14, 45),
+]
+
+
+def validate_and_calibrate_time(dt, timeframe: str, tolerance_min: int = 1):
+    """校验写入数据库的时间戳，对齐到标准 bar 时间
+
+    15m 数据：时间必须落在 A 股交易时间的 ±tolerance_min 分钟内，
+    超出容差的记录直接丢弃并返回 None。
+    非 15m 数据（1D 等）：只做基本的时区补全，不做 bar 对齐。
+
+    Args:
+        dt: datetime 对象（需带时区）
+        timeframe: K 线周期，如 "15m", "1D"
+        tolerance_min: 容差分钟数（默认 1）
+
+    Returns:
+        (calibrated_dt, action)
+        - calibrated_dt: 校准后的 datetime，或 None（丢弃）
+        - action: "ok"=无需校准  "calibrated"=已校准  "discarded"=已丢弃
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_TZ_SH_REPAIR)
+
+    # 非 15m 数据只做基本校验
+    if timeframe != "15m":
+        return dt, "ok"
+
+    total_min = dt.hour * 60 + dt.minute
+    tolerance = tolerance_min
+
+    # 上午时段: 9:30 ~ 11:30 (570 ~ 690)
+    if 570 <= total_min <= 690:
+        # 找最近的标准 bar 时间
+        best_diff = 999
+        best_bar = None
+        for h, m in _BAR_TIMES_15M:
+            if h >= 12:
+                continue
+            bar_min = h * 60 + m
+            diff = abs(total_min - bar_min)
+            if diff < best_diff:
+                best_diff = diff
+                best_bar = (h, m)
+
+        if best_diff <= tolerance:
+            if best_diff == 0:
+                return dt, "ok"
+            calibrated = dt.replace(hour=best_bar[0], minute=best_bar[1], second=0, microsecond=0)
+            return calibrated, "calibrated"
+        else:
+            logger.warning(
+                f"15m 时间偏差过大（{best_diff}分钟 > 容差{tolerance}分钟），丢弃: "
+                f"{dt.strftime('%Y-%m-%d %H:%M:%S')} 最近标准bar={best_bar[0]:02d}:{best_bar[1]:02d}"
+            )
+            return None, "discarded"
+
+    # 下午时段: 13:00 ~ 15:00 (780 ~ 900)
+    elif 780 <= total_min <= 900:
+        best_diff = 999
+        best_bar = None
+        for h, m in _BAR_TIMES_15M:
+            if h < 12:
+                continue
+            bar_min = h * 60 + m
+            diff = abs(total_min - bar_min)
+            if diff < best_diff:
+                best_diff = diff
+                best_bar = (h, m)
+
+        if best_diff <= tolerance:
+            if best_diff == 0:
+                return dt, "ok"
+            calibrated = dt.replace(hour=best_bar[0], minute=best_bar[1], second=0, microsecond=0)
+            return calibrated, "calibrated"
+        else:
+            logger.warning(
+                f"15m 时间偏差过大（{best_diff}分钟 > 容差{tolerance}分钟），丢弃: "
+                f"{dt.strftime('%Y-%m-%d %H:%M:%S')} 最近标准bar={best_bar[0]:02d}:{best_bar[1]:02d}"
+            )
+            return None, "discarded"
+
+    # 午休 11:30~13:00 或非交易时间 → 丢弃
+    else:
+        logger.warning(
+            f"15m 时间不在交易时段，丢弃: {dt.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"(有效时段 09:30-11:30, 13:00-14:45)"
+        )
+        return None, "discarded"
+
+
 def _repair_ts_to_date(ts):
+    """从 datetime 对象或整数时间戳提取日期字符串"""
+    if isinstance(ts, _dt_repair):
+        dt = ts if ts.tzinfo else ts.replace(tzinfo=_TZ_SH_REPAIR)
+        return dt.strftime("%Y-%m-%d")
     return _dt_repair.fromtimestamp(ts, tz=_TZ_SH_REPAIR).strftime("%Y-%m-%d")
 
 
@@ -1212,9 +1363,11 @@ def _repair_fetch_bars(api, market, code, freq, start_date, end_date):
                 # 必须归一化到午夜，否则 expected_ts_set 过滤永远不匹配
                 if is_daily:
                     dt = dt.replace(hour=0, minute=0, second=0)
-                ts = int(dt.timestamp())
+                # 返回 datetime 对象（TIMESTAMP 兼容），带时区
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_TZ_SH_REPAIR)
                 filtered.append({
-                    "time": ts,
+                    "time": dt,
                     "open": b["open"],
                     "high": b["high"],
                     "low": b["low"],
@@ -1270,9 +1423,8 @@ def _repair_worker(args):
             expected_ts_set = set()
             for g in gaps:
                 for ts in g.get("expected_ts", []):
-                    # 截断到分钟：秒归零
-                    dt = _dt_repair.fromtimestamp(ts, tz=_TZ_SH_REPAIR).replace(second=0, microsecond=0)
-                    expected_ts_set.add(int(dt.timestamp()))
+                    # 兼容 datetime 对象、整数时间戳和 ISO 字符串
+                    expected_ts_set.add(_truncate_ts_to_minute(ts))
 
             # 拉取
             bars = _repair_fetch_bars(api, market_int, code, freq, all_start, all_end)
@@ -1298,19 +1450,28 @@ def _repair_worker(args):
                     result_gaps_remaining.append(g)
                 continue
 
-            # 直接写入 db_market
+            # 直接写入 db_market（带时间校验）
             timeframe_map = {9: "1D", 1: "15m", 4: "1m", 0: "5m", 5: "30m", 6: "60m"}
             tf = timeframe_map.get(freq, f"{freq}m")
-            records = [{
-                "symbol": code,
-                "timeframe": tf,
-                "time": b["time"],
-                "open": b["open"],
-                "high": b["high"],
-                "low": b["low"],
-                "close": b["close"],
-                "volume": b["volume"],
-            } for b in bars]
+            records = []
+            discarded = 0
+            for b in bars:
+                dt_cal, action = validate_and_calibrate_time(b["time"], tf)
+                if dt_cal is None:
+                    discarded += 1
+                    continue
+                records.append({
+                    "symbol": code,
+                    "timeframe": tf,
+                    "time": dt_cal,
+                    "open": b["open"],
+                    "high": b["high"],
+                    "low": b["low"],
+                    "close": b["close"],
+                    "volume": b["volume"],
+                })
+            if discarded > 0:
+                logger.warning(f"{code}: 丢弃 {discarded} 条时间校验失败的 {tf} 记录")
             result = writer.bulk_write("CNStock", records, batch_size=5000)
             total_bars += result.get("inserted", 0)
 
@@ -1376,9 +1537,11 @@ def _repair_fetch_akshare(code, start_date, end_date, timeframe="1D"):
         for _, row in df.iterrows():
             dt_str = str(row["日期"])[:10]
             dt = _dt_repair.strptime(dt_str, "%Y-%m-%d")
-            ts = int(dt.timestamp())
+            # 返回 datetime 对象（TIMESTAMP 兼容），带时区
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_TZ_SH_REPAIR)
             records.append({
-                "time": ts,
+                "time": dt,
                 "open": float(row["开盘"]),
                 "high": float(row["最高"]),
                 "low": float(row["最低"]),
@@ -1435,8 +1598,8 @@ def _repair_fallback_akshare(remaining_gaps, data_type, writer, market="CNStock"
         expected_ts_set = set()
         for g in gaps:
             for ts in g.get("expected_ts", []):
-                dt = _dt_repair.fromtimestamp(ts, tz=_TZ_SH_REPAIR).replace(second=0, microsecond=0)
-                expected_ts_set.add(int(dt.timestamp()))
+                # 兼容 datetime 对象、整数时间戳和 ISO 字符串
+                expected_ts_set.add(_truncate_ts_to_minute(ts))
 
         # 从 akshare 拉取
         bars = _repair_fetch_akshare(code, all_start, all_end, "1D")
@@ -1452,17 +1615,26 @@ def _repair_fallback_akshare(remaining_gaps, data_type, writer, market="CNStock"
             still_remaining.extend(gaps)
             continue
 
-        # 写入 db
-        records = [{
-            "symbol": code,
-            "timeframe": "1D",
-            "time": b["time"],
-            "open": b["open"],
-            "high": b["high"],
-            "low": b["low"],
-            "close": b["close"],
-            "volume": b["volume"],
-        } for b in bars]
+        # 写入 db（带时间校验）
+        records = []
+        discarded = 0
+        for b in bars:
+            dt_cal, action = validate_and_calibrate_time(b["time"], "1D")
+            if dt_cal is None:
+                discarded += 1
+                continue
+            records.append({
+                "symbol": code,
+                "timeframe": "1D",
+                "time": dt_cal,
+                "open": b["open"],
+                "high": b["high"],
+                "low": b["low"],
+                "close": b["close"],
+                "volume": b["volume"],
+            })
+        if discarded > 0:
+            logger.warning(f"{code}: 丢弃 {discarded} 条时间校验失败的 1D 记录")
         result = writer.bulk_write(market, records, batch_size=5000)
         if result.get("inserted", 0) > 0:
             fixed.extend(gaps)
@@ -1685,6 +1857,7 @@ def _repair_fill_suspend(code, gaps, freq, writer, market="CNStock"):
             continue
 
         for ts in expected_ts_list:
+            # ts 已经是 datetime 对象（TIMESTAMP 兼容）
             all_records.append({
                 "symbol": code,
                 "timeframe": timeframe,

@@ -1,40 +1,40 @@
 """
-db_market.py — 多市场行情数据库管理器（独立连接池，不修改 db.py）
+db_market.py — 多市场行情数据读写与聚合（上层）
 
 职责:
-  1. 创建 / 管理多个市场数据库（{market}_db 命名）
-  2. 接口A: 增量写入（单条/小批量，UPSERT）
-  3. 接口B: 大批量写入（自动分市场、分年存储）
+  1. 接口A: 增量写入（单条/小批量，UPSERT）
+  2. 接口B: 大批量写入（自动分市场、分年存储）
+  3. 接口C: 查询（按 symbol + 时间范围）
+  4. 接口D: SQL 实时聚合（15m→30m/1h/2h/4h/1D，1D→1W/1M）
+  5. 聚合 VIEW 创建（TIMESTAMP 兼容版本）
+  6. 全局单例管理（get_market_db_manager / get_market_kline_writer）
 
-设计依据:
-  - strategy_db（public schema）已有，存储用户策略/信号/回测/持仓
-  - market_db 按市场隔离：CNStock_db, USStock_db, Crypto_db ...
-  - 每个市场库内按年分区：kline_15m_2021, kline_15m_2022 ...
-  - 15分钟K线为唯一原始数据源，日线通过 VIEW 从15分钟聚合
-  - 增量写入使用 UPSERT（ON CONFLICT DO UPDATE）
-  - 自建连接池，不修改现有 db.py
-  - 列名与现有 KlineCacheManager 保持一致：time, open, high, low, close, volume
+依赖:
+  - db_multi.py（下层）：连接池、MarketDBManager、共享常量
 
 用法:
-  from app.utils.db_market import get_market_kline_writer, get_market_db_manager
+  from app.utils.db_market import get_market_kline_writer, get_market_db_manager, ensure_agg_views
 
   mgr = get_market_db_manager()
   mgr.ensure_market_db("CNStock")
-  mgr.ensure_market_db("us")          # 别名，自动映射为 USStock
-
   writer = get_market_kline_writer()
 
-  # 接口A: 增量写入
+  # 增量写入
   writer.upsert("CNStock", "600519", "15m", [
-      {"time": 1714636800, "open": 1650.0, "high": 1660.0,
-       "low": 1645.0, "close": 1655.0, "volume": 12345}
+      {"time": datetime(2024,4,12,9,45), "open": 15.79, "high": 15.88,
+       "low": 15.72, "close": 15.81, "volume": 580200}
   ])
 
-  # 接口B: 大批量写入（自动分市场分年）
+  # 批量写入
   writer.bulk_write("CNStock", [
-      {"symbol": "600519", "timeframe": "15m", "time": 1714636800, ...},
-      {"symbol": "000001", "timeframe": "15m", "time": 1609459200, ...},
+      {"symbol": "600519", "timeframe": "15m", "time": datetime(...), ...},
   ])
+
+  # 查询
+  rows = writer.query("CNStock", "600519", "15m", start_time=..., end_time=...)
+
+  # 创建聚合 VIEW
+  ensure_agg_views("CNStock")
 """
 
 from __future__ import annotations
@@ -48,96 +48,27 @@ from collections import defaultdict
 from contextlib import contextmanager
 
 from app.utils.logger import get_logger
+from app.utils.db_multi import (
+    MarketDBManager, MarketPool,
+    KLINE_COLUMNS, POOL_MIN, POOL_MAX,
+    KNOWN_MARKETS, _MARKET_ALIASES,
+    _market_db_name, _resolve_market, _table_name,
+    _daily_view_name, _is_valid_market,
+)
 
 logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
-# 配置
+# db_market 专属常量
 # ---------------------------------------------------------------------------
-
-# 市场名标准定义（PascalCase，与后端 market.py / init.sql 一致）
-KNOWN_MARKETS = {
-    "CNStock": "A股",
-    "USStock": "美股",
-    "HKStock": "港股",
-    "Crypto":  "加密货币",
-    "Forex":   "外汇",
-    "Futures": "期货",
-}
-
-# 小写别名映射（方便调用时不用记大小写）
-_MARKET_ALIASES = {
-    "cn":       "CNStock",
-    "us":       "USStock",
-    "hk":       "HKStock",
-    "crypto":   "Crypto",
-    "forex":    "Forex",
-    "futures":  "Futures",
-    "cstock":   "CNStock",
-    "ustock":   "USStock",
-    "hkstock":  "HKStock",
-    "a股":      "CNStock",
-    "美股":     "USStock",
-    "港股":     "HKStock",
-    "加密":     "Crypto",
-    "外汇":     "Forex",
-    "期货":     "Futures",
-}
 
 TIMEFRAMES = ["1m", "5m", "15m", "30m", "1H", "4H", "1D", "1W"]
 
-# 连接池配置（市场库独立池，不复用 db.py 的 strategy_db 池）
-POOL_MIN = int(os.getenv("MARKET_DB_POOL_MIN", "2"))
-POOL_MAX = int(os.getenv("MARKET_DB_POOL_MAX", "10"))
-POOL_ACQUIRE_TIMEOUT = int(os.getenv("MARKET_DB_POOL_ACQUIRE_TIMEOUT", "10"))
 
-# K线表列定义（与 KlineCacheManager.KLINE_COLUMNS 一致）
-KLINE_COLUMNS = """
-    symbol      VARCHAR(20)  NOT NULL,
-    time        TIMESTAMP NOT NULL,
-    open        FLOAT PRECISION NOT NULL,
-    high        FLOAT PRECISION NOT NULL,
-    low         FLOAT PRECISION NOT NULL,
-    close       FLOAT PRECISION NOT NULL,
-    volume      DOUBLE PRECISION DEFAULT 0,
-    PRIMARY KEY (symbol, time)
-"""
-
-
-# ---------------------------------------------------------------------------
-# 工具函数
-# ---------------------------------------------------------------------------
-
-def _market_db_name(market: str) -> str:
-    """市场名 → 数据库名: CNStock → CNStock_db"""
-    return f"{_resolve_market(market)}_db"
-
-
-def _resolve_market(market: str) -> str:
-    """
-    统一市场名：支持别名 → 标准 PascalCase。
-    cn → CNStock, us → USStock, crypto → Crypto, ...
-    已经是标准名的直接返回。
-    """
-    m = market.strip()
-    if m in KNOWN_MARKETS:
-        return m
-    resolved = _MARKET_ALIASES.get(m.lower())
-    if resolved:
-        return resolved
-    logger.warning(f"未知市场名 '{market}'，使用原值")
-    return m
-
-
-def _table_name(timeframe: str, year: int) -> str:
-    return f"kline_{timeframe}_{year}"
-
-
-def _daily_view_name(timeframe: str) -> str:
-    return f"kline_1d_from_{timeframe}"
-
-
-def _year_from_ts(ts: int) -> int:
+def _year_from_ts(ts) -> int:
+    """从 datetime 对象或整数时间戳提取年份"""
+    if isinstance(ts, datetime):
+        return ts.year
     return datetime.fromtimestamp(ts, tz=timezone.utc).year
 
 
@@ -149,6 +80,32 @@ def _is_valid_market(market: str) -> bool:
     if m.lower() in _MARKET_ALIASES:
         return True
     return bool(re.match(r'^[a-zA-Z][a-zA-Z0-9_]*$', m))
+
+
+def _ensure_datetime(value) -> datetime:
+    """将各种时间格式统一转为 datetime 对象（兼容 TIMESTAMP 列）
+
+    支持:
+      - datetime 对象 → 直接返回
+      - int/float → 视为 Unix 时间戳（秒）
+      - str → 尝试 ISO 格式解析
+    """
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+    if isinstance(value, str):
+        # ISO 格式: "2024-04-12T09:45:00" 或 "2024-04-12 09:45"
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
+                     "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(value.strip(), fmt)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
+            except ValueError:
+                continue
+    raise ValueError(f"无法解析时间值: {value!r}")
 
 # ---------------------------------------------------------------------------
 # MarketKlineWriter — K线数据写入
@@ -222,6 +179,7 @@ class MarketKlineWriter:
 
                     for rec in year_records:
                         try:
+                            time_val = _ensure_datetime(rec["time"])
                             cur.execute(f"""
                                 INSERT INTO "{table}"
                                     (symbol, time, open, high, low, close, volume)
@@ -234,7 +192,7 @@ class MarketKlineWriter:
                                     volume     = EXCLUDED.volume,
                                     updated_at = NOW()
                             """, (
-                                symbol, rec["time"], rec["open"], rec["high"],
+                                symbol, time_val, rec["open"], rec["high"],
                                 rec["low"], rec["close"], rec.get("volume", 0),
                             ))
                             if cur.rowcount == 1:
@@ -322,8 +280,9 @@ class MarketKlineWriter:
                         for rec in batch:
                             values.append("(%s, %s, %s, %s, %s, %s, %s)")
                             params.extend([
-                                symbol, rec["time"], rec["open"], rec["high"],
-                                rec["low"], rec["close"], rec.get("volume", 0),
+                                symbol, _ensure_datetime(rec["time"]), rec["open"],
+                                rec["high"], rec["low"], rec["close"],
+                                rec.get("volume", 0),
                             ])
 
                         conflict_clause = self._conflict_clause(on_conflict)
@@ -359,8 +318,10 @@ class MarketKlineWriter:
                             for rec in batch:
                                 try:
                                     cur.execute(single_sql, [
-                                        symbol, rec["time"], rec["open"], rec["high"],
-                                        rec["low"], rec["close"], rec.get("volume", 0),
+                                        symbol, _ensure_datetime(rec["time"]),
+                                        rec["open"], rec["high"],
+                                        rec["low"], rec["close"],
+                                        rec.get("volume", 0),
                                     ])
                                     if on_conflict == "skip":
                                         total_skipped += cur.rowcount
@@ -401,25 +362,30 @@ class MarketKlineWriter:
         market: str,
         symbol: str,
         timeframe: str,
-        start_time: int = None,
-        end_time: int = None,
+        start_time=None,
+        end_time=None,
         limit: int = 500,
     ) -> List[Dict[str, Any]]:
         """
         查询 K 线数据。
 
+        start_time/end_time: datetime 对象、ISO 字符串或 Unix 时间戳（整数）均可。
         返回格式与 BaseDataSource.format_kline 一致：
-        [{"time": int, "open": float, "high": float,
+        [{"time": datetime, "open": float, "high": float,
           "low": float, "close": float, "volume": float}, ...]
         """
         if not self._mgr.market_db_exists(market):
             return []
 
+        # 确保 start_time / end_time 是 datetime 对象（TIMESTAMP 列兼容）
+        start_dt = _ensure_datetime(start_time) if start_time is not None else None
+        end_dt = _ensure_datetime(end_time) if end_time is not None else None
+
         years = set()
-        if start_time:
-            years.add(_year_from_ts(start_time))
-        if end_time:
-            years.add(_year_from_ts(end_time))
+        if start_dt:
+            years.add(start_dt.year)
+        if end_dt:
+            years.add(end_dt.year)
 
         pool = self._mgr._get_pool(market)
 
@@ -455,12 +421,12 @@ class MarketKlineWriter:
                     continue
 
                 conditions, params = ["symbol = %s"], [symbol]
-                if start_time:
+                if start_dt is not None:
                     conditions.append("time >= %s")
-                    params.append(start_time)
-                if end_time:
+                    params.append(start_dt)
+                if end_dt is not None:
                     conditions.append("time <= %s")
-                    params.append(end_time)
+                    params.append(end_dt)
 
                 cur.execute(f"""
                     SELECT time, open, high, low, close, volume
@@ -520,6 +486,14 @@ class MarketKlineWriter:
                 except Exception:
                     pass
 
+        # min_time/max_time 可能是 datetime 对象（TIMESTAMP 列），直接用
+        def _fmt_time(t):
+            if t is None:
+                return None
+            if isinstance(t, datetime):
+                return t.isoformat()
+            return datetime.fromtimestamp(t, tz=timezone.utc).isoformat()
+
         return {
             "market": market,
             "db_name": _market_db_name(market),
@@ -529,8 +503,8 @@ class MarketKlineWriter:
             "symbol_list": sorted(all_symbols),
             "total_rows": total_rows,
             "date_range": {
-                "start": datetime.fromtimestamp(min_time, tz=timezone.utc).isoformat() if min_time else None,
-                "end": datetime.fromtimestamp(max_time, tz=timezone.utc).isoformat() if max_time else None,
+                "start": _fmt_time(min_time),
+                "end": _fmt_time(max_time),
             },
         }
 
@@ -538,22 +512,28 @@ class MarketKlineWriter:
     # 聚合查询（SQL 在 PG 内计算，只读不落盘）
     # ================================================================
 
-    # 15m → 目标周期的秒数映射
-    _AGG_SECONDS = {
-        "30m":  1800,
-        "1h":   3600,
-        "2h":   7200,
-        "1D":   86400,
-        "1W":   604800,
+    # 15m → 目标周期的聚合配置
+    # "source": 数据源周期, "type": "interval"|"daily"|"weekly"|"monthly"
+    _AGG_TARGETS = {
+        "30m":  {"source": "15m", "type": "interval", "sec": 1800},
+        "1h":   {"source": "15m", "type": "interval", "sec": 3600},
+        "2h":   {"source": "15m", "type": "interval", "sec": 7200},
+        "4h":   {"source": "15m", "type": "interval", "sec": 14400},
+        "1D":   {"source": "15m", "type": "daily"},
+        "1W":   {"source": "1D",  "type": "weekly"},
+        "1M":   {"source": "1D",  "type": "monthly"},
     }
+
+    # 向后兼容
+    _AGG_SECONDS = {k: v.get("sec", 0) for k, v in _AGG_TARGETS.items()}
 
     def aggregate(
         self,
         market: str,
         symbol: str,
         target_tf: str,
-        start_time: int = None,
-        end_time: int = None,
+        start_time=None,
+        end_time=None,
         limit: int = 500,
         tz_offset: int = 28800,   # 默认 UTC+8 (A股)
     ) -> List[Dict[str, Any]]:
@@ -561,9 +541,10 @@ class MarketKlineWriter:
         将 15m/1D K线实时聚合成更大周期（SQL 在 PG 内计算，只读不落盘）。
 
         数据源:
-          - 30m/1h/2h: 从 15m 表聚合（2 年数据）
-          - 1D:        从 15m 表聚合（2 年数据）
-          - 1W:        从 1D 表聚合（5 年数据）
+          - 30m/1h/2h/4h: 从 15m 表聚合
+          - 1D:           从 15m 表聚合
+          - 1W:           从 1D 表聚合
+          - 1M:           从 1D 表聚合
 
         聚合规则:
           - open   = 该桶内第一根的 open
@@ -571,34 +552,44 @@ class MarketKlineWriter:
           - low    = 该桶内所有 low 的最小值
           - close  = 该桶内最后一根的 close
           - volume = 该桶内所有 volume 之和
+
+        start_time/end_time: datetime 对象、ISO 字符串或 Unix 时间戳（整数）均可。
         """
         target_tf = target_tf.strip()
-        if target_tf not in self._AGG_SECONDS:
+        if target_tf not in self._AGG_TARGETS:
             raise ValueError(
                 f"不支持的目标周期: {target_tf}，"
-                f"可选: {', '.join(self._AGG_SECONDS.keys())}"
+                f"可选: {', '.join(self._AGG_TARGETS.keys())}"
             )
 
         if not self._mgr.market_db_exists(market):
             return []
 
-        bucket_sec = self._AGG_SECONDS[target_tf]
+        target_cfg = self._AGG_TARGETS[target_tf]
+        source_tf = target_cfg["source"]
+        bucket_type = target_cfg["type"]
 
-        # 确定数据源：1W 从 1D 表聚合，其余从 15m 表聚合
-        if target_tf == "1W":
-            source_tf = "1D"
+        # 构造 TIMESTAMP 兼容的 bucket 表达式
+        # 使用 EXTRACT(EPOCH FROM time) 将 TIMESTAMP 转为整数秒进行分桶，
+        # 再用 to_timestamp() 转回 TIMESTAMP，确保 VIEW 列类型与源表一致。
+        if bucket_type == "interval":
+            sec = target_cfg["sec"]
+            bucket_expr = f"to_timestamp(EXTRACT(EPOCH FROM t.time) - MOD(EXTRACT(EPOCH FROM t.time)::integer, {sec}))"
+        elif bucket_type == "daily":
             bucket_expr = (
-                f"(((t.time + {tz_offset}) / 86400) * 86400 - {tz_offset})"
-                f" - (EXTRACT(DOW FROM"
-                f" TO_TIMESTAMP(t.time + {tz_offset}) AT TIME ZONE 'Asia/Shanghai')"
-                f" ::int - 1 + 7) % 7 * 86400"
+                f"to_timestamp((EXTRACT(EPOCH FROM t.time + interval '{tz_offset}s')::integer / 86400) * 86400 - {tz_offset})"
             )
-        elif target_tf == "1D":
-            source_tf = "15m"
-            bucket_expr = f"(t.time + {tz_offset}) / 86400 * 86400 - {tz_offset}"
+        elif bucket_type == "weekly":
+            bucket_expr = (
+                f"to_timestamp((EXTRACT(EPOCH FROM t.time + interval '{tz_offset}s')::integer / 86400) * 86400 - {tz_offset})"
+                f" - (EXTRACT(DOW FROM t.time AT TIME ZONE 'Asia/Shanghai')::int - 1 + 7) % 7 * interval '1 day'"
+            )
+        elif bucket_type == "monthly":
+            bucket_expr = (
+                f"date_trunc('month', t.time AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai'"
+            )
         else:
-            source_tf = "15m"
-            bucket_expr = f"t.time - t.time % {bucket_sec}"
+            raise ValueError(f"未知 bucket 类型: {bucket_type}")
 
         # 发现所有源周期分区表
         pool = self._mgr._get_pool(market)
@@ -619,13 +610,10 @@ class MarketKlineWriter:
         union_parts = []
         for tbl in tables:
             conditions = [f"t.symbol = %s"]
-            params_slot = ["sym"]
-            if start_time:
+            if start_time is not None:
                 conditions.append(f"t.time >= %s")
-                params_slot.append("start")
-            if end_time:
+            if end_time is not None:
                 conditions.append(f"t.time <= %s")
-                params_slot.append("end")
 
             where = " AND ".join(conditions)
             union_parts.append(f"""
@@ -653,9 +641,9 @@ class MarketKlineWriter:
         params = []
         for _ in tables:
             params.append(symbol)
-            if start_time:
+            if start_time is not None:
                 params.append(start_time)
-            if end_time:
+            if end_time is not None:
                 params.append(end_time)
 
         if limit:
@@ -678,7 +666,7 @@ class MarketKlineWriter:
         ]
 
         logger.debug(
-            f"SQL 聚合: {market}/{symbol} 15m→{target_tf} "
+            f"SQL 聚合: {market}/{symbol} {source_tf}→{target_tf} "
             f"表数={len(tables)} 输出={len(result)}条"
         )
         return result
@@ -748,3 +736,121 @@ def get_market_kline_writer() -> MarketKlineWriter:
     if _writer is None:
         _writer = MarketKlineWriter(get_market_db_manager())
     return _writer
+
+
+# ---------------------------------------------------------------------------
+# 聚合 VIEW 创建（独立函数，替代 db_multi.py 中的整数版本）
+# ---------------------------------------------------------------------------
+
+# 聚合目标配置
+_AGG_VIEW_TARGETS = {
+    "30m": {"source": "15m", "type": "interval", "sec": 1800},
+    "1h":  {"source": "15m", "type": "interval", "sec": 3600},
+    "2h":  {"source": "15m", "type": "interval", "sec": 7200},
+    "4h":  {"source": "15m", "type": "interval", "sec": 14400},
+    "1D":  {"source": "15m", "type": "daily"},
+    "1W":  {"source": "1D",  "type": "weekly"},
+    "1M":  {"source": "1D",  "type": "monthly"},
+}
+
+
+def ensure_agg_views(market: str, manager: MarketDBManager = None):
+    """为指定市场创建所有聚合 VIEW（TIMESTAMP 兼容版本）。
+
+    替代 db_multi.py 中 MarketDBManager._ensure_agg_views 的整数算术版本。
+    使用 EXTRACT(EPOCH FROM ...) 和 to_timestamp() 确保 VIEW 列类型为 TIMESTAMP。
+
+    聚合目标:
+      15m → 30m, 1h, 2h, 4h, 1D
+      1D  → 1W, 1M
+
+    Args:
+        market: 市场标识，如 "CNStock"
+        manager: MarketDBManager 实例（可选，默认使用全局实例）
+    """
+    mgr = manager or get_market_db_manager()
+    pool = mgr._get_pool(market)
+    tz = 28800  # UTC+8
+
+    # 按源周期分组
+    from collections import defaultdict
+    by_source = defaultdict(list)
+    for tf, cfg in _AGG_VIEW_TARGETS.items():
+        by_source[cfg["source"]].append(tf)
+
+    with pool.cursor() as cur:
+        for source_tf, target_tfs in by_source.items():
+            # 发现所有源周期分区表
+            cur.execute("""
+                SELECT table_name FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_type = 'BASE TABLE'
+                  AND table_name LIKE %s
+                ORDER BY table_name
+            """, (f'kline_{source_tf}_%',))
+            tables = [r[0] for r in cur.fetchall()]
+
+            if not tables:
+                logger.warning(f"无法创建聚合 VIEW：没有找到 {source_tf} 表")
+                continue
+
+            # 过滤掉已有的聚合 VIEW 对应的表名前缀
+            agg_prefixes = ('kline_30m_', 'kline_1h_', 'kline_2h_', 'kline_4h_',
+                            'kline_1d_', 'kline_1w_', 'kline_1m_')
+            tables = [t for t in tables if not any(t.startswith(p) for p in agg_prefixes)]
+
+            for tf in target_tfs:
+                cfg = _AGG_VIEW_TARGETS[tf]
+                bucket_type = cfg["type"]
+                view_name = f"kline_{tf}_from_{source_tf}"
+
+                # 构造 TIMESTAMP 兼容的 bucket 表达式
+                if bucket_type == "interval":
+                    sec = cfg["sec"]
+                    bucket_expr = (
+                        f"to_timestamp(EXTRACT(EPOCH FROM time)"
+                        f" - MOD(EXTRACT(EPOCH FROM time)::integer, {sec}))"
+                    )
+                elif bucket_type == "daily":
+                    bucket_expr = (
+                        f"to_timestamp("
+                        f"(EXTRACT(EPOCH FROM time + interval '{tz}s')::integer / 86400) * 86400 - {tz})"
+                    )
+                elif bucket_type == "weekly":
+                    bucket_expr = (
+                        f"to_timestamp("
+                        f"(EXTRACT(EPOCH FROM time + interval '{tz}s')::integer / 86400) * 86400 - {tz})"
+                        f" - (EXTRACT(DOW FROM time AT TIME ZONE 'Asia/Shanghai')::int - 1 + 7)"
+                        f" % 7 * 86400"
+                    )
+                elif bucket_type == "monthly":
+                    bucket_expr = (
+                        f"(date_trunc('month', time AT TIME ZONE 'Asia/Shanghai')"
+                        f" AT TIME ZONE 'Asia/Shanghai')"
+                    )
+                else:
+                    continue
+
+                union_parts = []
+                for tbl in tables:
+                    union_parts.append(f'''
+                        SELECT
+                            symbol,
+                            {bucket_expr}                              AS bucket,
+                            (ARRAY_AGG(open  ORDER BY time ASC))[1]    AS open,
+                            MAX(high)                                  AS high,
+                            MIN(low)                                   AS low,
+                            (ARRAY_AGG(close ORDER BY time DESC))[1]   AS close,
+                            SUM(volume)                                AS volume
+                        FROM "{tbl}"
+                        GROUP BY symbol, {bucket_expr}
+                    ''')
+
+                query = f"""
+                    CREATE OR REPLACE VIEW "{view_name}" AS
+                    {' UNION ALL '.join(union_parts)}
+                """
+                cur.execute(query)
+                logger.info(f"✅ 已创建聚合 VIEW: {view_name}（源: {source_tf}）")
+
+    logger.info(f"✅ {market} 聚合 VIEW 全部创建完成")

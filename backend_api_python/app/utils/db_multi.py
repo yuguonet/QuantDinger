@@ -1,6 +1,19 @@
 """
-（独立连接池，不修改 db.py）
-只处理与数据库的连接关系
+db_multi.py — 多市场数据库连接池与 DDL 管理（下层）
+
+职责:
+  1. 共享常量与工具函数（KLINE_COLUMNS、市场名解析、表名生成）
+  2. PostgreSQL 连接池管理（MarketPool，线程安全）
+  3. 数据库生命周期管理（MarketDBManager：CREATE/DROP DATABASE）
+  4. 表结构初始化（kline 分区表 + 聚合 VIEW）
+  5. FDW 桥接（可选）
+
+连接方式:
+  - DDL 操作（CREATE/DROP DATABASE）：直连 postgres 系统库，autocommit
+  - 数据操作（读写）：ThreadedConnectionPool，每个市场库独立池
+  - 管理员连接复用长连接，自动检测断线重连
+
+被 db_market.py（上层）导入，不依赖任何 app 内部模块（除 logger）。
 """
 from __future__ import annotations
 
@@ -17,7 +30,97 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-def _parse_database_url(url: str) -> Dict[str, Any]:
+# ---------------------------------------------------------------------------
+# 共享常量
+# ---------------------------------------------------------------------------
+
+# 市场名标准定义（PascalCase，与后端 market.py / init.sql 一致）
+KNOWN_MARKETS = {
+    "CNStock": "A股",
+    "USStock": "美股",
+    "HKStock": "港股",
+    "Crypto":  "加密货币",
+    "Forex":   "外汇",
+    "Futures": "期货",
+}
+
+# 小写别名映射（方便调用时不用记大小写）
+_MARKET_ALIASES = {
+    "cn":       "CNStock",
+    "us":       "USStock",
+    "hk":       "HKStock",
+    "crypto":   "Crypto",
+    "forex":    "Forex",
+    "futures":  "Futures",
+    "cstock":   "CNStock",
+    "ustock":   "USStock",
+    "hkstock":  "HKStock",
+    "a股":      "CNStock",
+    "美股":     "USStock",
+    "港股":     "HKStock",
+    "加密":     "Crypto",
+    "外汇":     "Forex",
+    "期货":     "Futures",
+}
+
+# 连接池配置
+POOL_MIN = int(os.getenv("MARKET_DB_POOL_MIN", "2"))
+POOL_MAX = int(os.getenv("MARKET_DB_POOL_MAX", "10"))
+
+# K线表列定义（time 为 TIMESTAMP 类型，与 CSV 标准格式兼容）
+KLINE_COLUMNS = """
+    symbol      VARCHAR(20)  NOT NULL,
+    time        TIMESTAMP NOT NULL,
+    open        FLOAT PRECISION NOT NULL,
+    high        FLOAT PRECISION NOT NULL,
+    low         FLOAT PRECISION NOT NULL,
+    close       FLOAT PRECISION NOT NULL,
+    volume      DOUBLE PRECISION DEFAULT 0,
+    PRIMARY KEY (symbol, time)
+"""
+
+
+# ---------------------------------------------------------------------------
+# 工具函数
+# ---------------------------------------------------------------------------
+
+def _market_db_name(market: str) -> str:
+    """市场名 → 数据库名: CNStock → CNStock_db"""
+    return f"{_resolve_market(market)}_db"
+
+
+def _resolve_market(market: str) -> str:
+    """
+    统一市场名：支持别名 → 标准 PascalCase。
+    cn → CNStock, us → USStock, crypto → Crypto, ...
+    已经是标准名的直接返回。
+    """
+    m = market.strip()
+    if m in KNOWN_MARKETS:
+        return m
+    resolved = _MARKET_ALIASES.get(m.lower())
+    if resolved:
+        return resolved
+    logger.warning(f"未知市场名 '{market}'，使用原值")
+    return m
+
+
+def _table_name(timeframe: str, year: int) -> str:
+    return f"kline_{timeframe}_{year}"
+
+
+def _daily_view_name(timeframe: str) -> str:
+    return f"kline_1d_from_{timeframe}"
+
+
+def _is_valid_market(market: str) -> bool:
+    """检查市场名是否合法（标准名或别名均可）"""
+    m = market.strip()
+    if m in KNOWN_MARKETS:
+        return True
+    if m.lower() in _MARKET_ALIASES:
+        return True
+    return bool(re.match(r'^[a-zA-Z][a-zA-Z0-9_]*$', m))
     if not url:
         return {"host": "localhost", "port": 5432, "user": "postgres", "password": ""}
     if url.startswith("postgresql://"):
@@ -369,9 +472,9 @@ class MarketDBManager:
             for year in range(current_year - 4, current_year + 1):
                 self._ensure_kline_table(cur, "1D", year)
 
-            # 聚合 VIEW：30m/1h/2h 从 15m，1W 从 1D
-            self._ensure_agg_views(cur, "15m", ["30m", "1h", "2h"])
-            self._ensure_agg_views(cur, "1D",  ["1W"])
+            # 聚合 VIEW：15m → 30m/1h/2h/4h/1D，1D → 1W/1M
+            self._ensure_agg_views(cur, "15m", ["30m", "1h", "2h", "4h", "1D"])
+            self._ensure_agg_views(cur, "1D",  ["1W", "1M"])
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS _market_meta (
@@ -412,23 +515,27 @@ class MarketDBManager:
 
     # ---- 聚合 VIEW 生成 ----
 
-    # 目标周期 → (秒数, 是否需要时区对齐)
+    # 目标周期 → (bucket 类型, 附加参数)
     _AGG_VIEW_TFS = {
-        "30m": (1800,  False),
-        "1h":  (3600,  False),
-        "2h":  (7200,  False),
-        "1D":  (86400, True),
-        "1W":  (604800, True),
+        "30m": ("interval", 1800),
+        "1h":  ("interval", 3600),
+        "2h":  ("interval", 7200),
+        "4h":  ("interval", 14400),
+        "1D":  ("daily",    None),
+        "1W":  ("weekly",   None),
+        "1M":  ("monthly",  None),
     }
 
     @staticmethod
     def _ensure_agg_views(cursor, source_timeframe: str, target_tfs: list):
         """
-        为指定目标周期创建聚合 VIEW。
+        为指定目标周期创建聚合 VIEW（TIMESTAMP 兼容）。
+
+        使用 EXTRACT(EPOCH FROM time) + to_timestamp() 确保 VIEW 列类型为 TIMESTAMP。
 
         Args:
             source_timeframe: 源数据周期 "15m" 或 "1D"
-            target_tfs:       目标周期列表，如 ["30m", "1h", "2h"] 或 ["1W"]
+            target_tfs:       目标周期列表，如 ["30m", "1h", "2h", "4h"] 或 ["1W", "1M"]
         """
         # 发现所有源周期分区表
         cursor.execute("""
@@ -444,8 +551,9 @@ class MarketDBManager:
             logger.warning(f"无法创建聚合 VIEW：没有找到 {source_timeframe} 表")
             return
 
-        # 过滤掉已有的聚合 VIEW 目录名
-        agg_prefixes = ('kline_30m_', 'kline_1h_', 'kline_2h_', 'kline_1d_', 'kline_1w_')
+        # 过滤掉已有的聚合 VIEW 对应的表名前缀
+        agg_prefixes = ('kline_30m_', 'kline_1h_', 'kline_2h_', 'kline_4h_',
+                        'kline_1d_', 'kline_1w_', 'kline_1m_')
         tables = [t for t in tables if not any(t.startswith(p) for p in agg_prefixes)]
 
         tz = 28800  # UTC+8
@@ -454,24 +562,38 @@ class MarketDBManager:
             if tf not in MarketDBManager._AGG_VIEW_TFS:
                 continue
 
-            bucket_sec, need_tz = MarketDBManager._AGG_VIEW_TFS[tf]
+            bucket_type, bucket_param = MarketDBManager._AGG_VIEW_TFS[tf]
             view_name = f"kline_{tf}_from_{source_timeframe}"
+
+            # 构造 TIMESTAMP 兼容的 bucket 表达式
+            if bucket_type == "interval":
+                sec = bucket_param
+                bucket_expr = (
+                    f"to_timestamp(EXTRACT(EPOCH FROM time)"
+                    f" - MOD(EXTRACT(EPOCH FROM time)::integer, {sec}))"
+                )
+            elif bucket_type == "daily":
+                bucket_expr = (
+                    f"to_timestamp("
+                    f"(EXTRACT(EPOCH FROM time + interval '{tz}s')::integer / 86400) * 86400 - {tz})"
+                )
+            elif bucket_type == "weekly":
+                bucket_expr = (
+                    f"to_timestamp("
+                    f"(EXTRACT(EPOCH FROM time + interval '{tz}s')::integer / 86400) * 86400 - {tz})"
+                    f" - (EXTRACT(DOW FROM time AT TIME ZONE 'Asia/Shanghai')::int - 1 + 7)"
+                    f" % 7 * 86400"
+                )
+            elif bucket_type == "monthly":
+                bucket_expr = (
+                    f"(date_trunc('month', time AT TIME ZONE 'Asia/Shanghai')"
+                    f" AT TIME ZONE 'Asia/Shanghai')"
+                )
+            else:
+                continue
 
             union_parts = []
             for tbl in tables:
-                if need_tz:
-                    if tf == "1W":
-                        bucket_expr = (
-                            f"(((time + {tz}) / 86400) * 86400 - {tz})"
-                            f" - (EXTRACT(DOW FROM"
-                            f" TO_TIMESTAMP(time + {tz}) AT TIME ZONE 'Asia/Shanghai')"
-                            f" ::int - 1 + 7) % 7 * 86400"
-                        )
-                    else:
-                        bucket_expr = f"(time + {tz}) / 86400 * 86400 - {tz}"
-                else:
-                    bucket_expr = f"time - time % {bucket_sec}"
-
                 union_parts.append(f'''
                     SELECT
                         symbol,
@@ -492,44 +614,6 @@ class MarketDBManager:
             cursor.execute(query)
 
         logger.info(f"✅ 已创建聚合 VIEW: {', '.join(target_tfs)}（源: {source_timeframe}）")
-
-    @staticmethod
-    def _ensure_daily_view(cursor, source_timeframe: str):
-        """兼容旧调用：只创建日线 VIEW"""
-        view_name = _daily_view_name(source_timeframe)
-        cursor.execute("""
-            SELECT table_name FROM information_schema.tables
-            WHERE table_schema = 'public'
-              AND table_name LIKE %s
-              AND table_name NOT LIKE 'kline_1d_%%'
-            ORDER BY table_name
-        """, (f'kline_{source_timeframe}_%',))
-        tables = [r[0] for r in cursor.fetchall()]
-
-        if not tables:
-            logger.warning(f"无法创建日线 VIEW：没有找到 {source_timeframe} 表")
-            return
-
-        union_parts = []
-        for tbl in tables:
-            union_parts.append(f'''
-                SELECT
-                    symbol,
-                    (time / 86400) * 86400 AS day_open_time,
-                    (ARRAY_AGG(open  ORDER BY time ASC))[1]  AS open,
-                    MAX(high)                                  AS high,
-                    MIN(low)                                   AS low,
-                    (ARRAY_AGG(close ORDER BY time DESC))[1]   AS close,
-                    SUM(volume)                                AS volume
-                FROM "{tbl}"
-                GROUP BY symbol, time / 86400
-            ''')
-
-        query = f"""
-            CREATE OR REPLACE VIEW "{view_name}" AS
-            {' UNION ALL '.join(union_parts)}
-        """
-        cursor.execute(query)
 
     def ensure_year_table(self, market: str, timeframe: str, year: int):
         pool = self._get_pool(market)

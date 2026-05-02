@@ -27,20 +27,19 @@
 #   5. 双缺失批量写入：15m 和 1D 都缺失的日期，批量写入 data_issue_report
 #      - issue_type 为 "both_missing"，expected_action 为 "fetch"
 #
+# 时间格式:
+#   - 数据库 time 列为 TIMESTAMP 类型
+#   - expected_ts 存储 datetime 对象，序列化为 ISO 字符串写入 JSONB
+#   - 通达信 CSV 标准格式：15m="YYYY-MM-DD HH:MM", 1D="YYYY-MM-DD"
+#
 # 输出:
-#   - data_issue_report    — 统一问题表（断裂 + 质量问题合并存储，含期望时间戳、OHLC 原始值、处理建议）
+#   - data_issue_report    — 统一问题表（断裂 + 质量问题合并存储）
 #   - 可选 CSV 导出
 #
 # 多进程:
 #   - 使用 multiprocessing.Pool 并行检查，默认 CPU 核数，上限 16
 #   - 每个子进程独立建立 db_market 连接池，fork 后重置全局单例
 #   - 支持 Ctrl+C 中断：已检查的部分正常写库
-#
-# 补数支持:
-#   - gap_report 的 expected_ts 字段存储缺失的精确时间戳列表
-#   - 1D: 期望的交易日 00:00 时间戳
-#   - 15m 整日缺失: 该日 16 根 bar 的时间戳
-#   - 15m 日内缺失: 精确缺失的那几根 bar 的时间戳
 #
 # 用法:
 #   python optimizer/check_continuity.py                     # 全市场检查，只标记
@@ -55,7 +54,7 @@
 #   python optimizer/check_continuity.py --clean-delist --fill-1d --fix  # 全量修复
 #
 # 依赖:
-#   - db_market.py（backend_api_python/app/utils/）
+#   - db_market.py / db_multi.py（backend_api_python/app/utils/）
 #   - psycopg2
 #   - python-dotenv（可选，用于加载 .env）
 #
@@ -155,8 +154,9 @@ def _deduce_trading_days_from_db(market: str, min_stocks: int = 10) -> set[str]:
             for t in tables:
                 union_parts.append(f'SELECT time FROM "{t}"')
             sql = " UNION ALL ".join(union_parts)
+            # time 列为 TIMESTAMP 类型，直接用 AT TIME ZONE 转换
             cur.execute(f"""
-                SELECT to_char(to_timestamp(time) AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD') AS d, COUNT(*)
+                SELECT to_char(time AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD') AS d, COUNT(*)
                 FROM ({sql}) sub
                 GROUP BY d
                 HAVING COUNT(*) >= %s
@@ -220,7 +220,12 @@ def _trading_days_between(d1: str, d2: str) -> int:
     return count
 
 
-def _ts_to_date(ts: int) -> str:
+def _ts_to_date(ts) -> str:
+    """从 datetime 对象或整数时间戳提取日期字符串"""
+    if isinstance(ts, datetime):
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=TZ_SH)
+        return ts.strftime("%Y-%m-%d")
     return datetime.fromtimestamp(ts, tz=TZ_SH).strftime("%Y-%m-%d")
 
 
@@ -232,9 +237,11 @@ def _prev_day(d: str) -> str:
     return (datetime.strptime(d, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
 
 
-def _date_to_ts(d: str, hour: int = 0, minute: int = 0) -> int:
-    dt = datetime.strptime(d, "%Y-%m-%d").replace(hour=hour, minute=minute, tzinfo=TZ_SH)
-    return int(dt.timestamp())
+def _date_to_ts(d: str, hour: int = 0, minute: int = 0) -> datetime:
+    """日期字符串 → datetime 对象（TIMESTAMP 兼容）"""
+    return datetime.strptime(d, "%Y-%m-%d").replace(
+        hour=hour, minute=minute, tzinfo=TZ_SH
+    )
 
 
 # 15m bar 时间表
@@ -244,9 +251,13 @@ _ALL_BAR_TIMES = _MORNING_BARS + _AFTERNOON_BARS
 
 
 
-def _ts_to_dhm(ts: int) -> Tuple[str, int, int]:
-    """时间戳 → (日期, 时, 分)，用于 15m 比对，忽略秒级精度"""
-    dt = datetime.fromtimestamp(ts, tz=TZ_SH)
+def _ts_to_dhm(ts) -> Tuple[str, int, int]:
+    """时间戳 → (日期, 时, 分)，用于 15m 比对，忽略秒级精度
+    支持 datetime 对象或整数时间戳"""
+    if isinstance(ts, datetime):
+        dt = ts if ts.tzinfo else ts.replace(tzinfo=TZ_SH)
+    else:
+        dt = datetime.fromtimestamp(ts, tz=TZ_SH)
     return (dt.strftime("%Y-%m-%d"), dt.hour, dt.minute)
 
 
@@ -258,15 +269,17 @@ def _dhm_to_bar_index(dhm: Tuple[str, int, int]) -> int:
         return -1
 
 
-def _expected_15m_ts_for_date(d: str) -> List[int]:
+def _expected_15m_ts_for_date(d: str) -> List[datetime]:
+    """返回指定日期的 16 根 15m bar 的 datetime 对象列表"""
     base = datetime.strptime(d, "%Y-%m-%d")
     return [
-        int(base.replace(hour=h, minute=m, tzinfo=TZ_SH).timestamp())
+        base.replace(hour=h, minute=m, tzinfo=TZ_SH)
         for h, m in _ALL_BAR_TIMES
     ]
 
 
-def _expected_1d_ts_between(d1: str, d2: str) -> List[int]:
+def _expected_1d_ts_between(d1: str, d2: str) -> List[datetime]:
+    """返回 d1 和 d2 之间所有交易日的 datetime 对象列表（午夜）"""
     if d1 >= d2:
         return []
     _build_trading_day_cache()
@@ -275,12 +288,13 @@ def _expected_1d_ts_between(d1: str, d2: str) -> List[int]:
     end = datetime.strptime(d2, "%Y-%m-%d")
     while cur < end:
         if cur.strftime("%Y-%m-%d") in _TRADING_DAY_SET:
-            result.append(int(cur.replace(tzinfo=TZ_SH).timestamp()))
+            result.append(cur.replace(tzinfo=TZ_SH))
         cur += timedelta(days=1)
     return result
 
 
-def _expected_15m_ts_between_dates(d1: str, d2: str) -> List[int]:
+def _expected_15m_ts_between_dates(d1: str, d2: str) -> List[datetime]:
+    """返回 d1 和 d2 之间所有交易日的 15m bar datetime 对象列表"""
     if d1 >= d2:
         return []
     _build_trading_day_cache()
@@ -571,6 +585,19 @@ def ensure_tables(pool):
         cur.execute(DDL_ISSUE)
 
 
+def _serialize_expected_ts(ts_list):
+    """将 datetime 对象列表序列化为 ISO 字符串列表（JSON 兼容）"""
+    if ts_list is None:
+        return None
+    result = []
+    for ts in ts_list:
+        if isinstance(ts, datetime):
+            result.append(ts.isoformat())
+        else:
+            result.append(ts)
+    return result
+
+
 def write_issues(pool, gaps: List[Dict[str, Any]], issues: List[Dict[str, Any]],
                   batch_size: int = 500):
     """将 gap 和 quality issues 统一写入 data_issue_report 表"""
@@ -583,7 +610,7 @@ def write_issues(pool, gaps: List[Dict[str, Any]], issues: List[Dict[str, Any]],
             "issue_type": g["gap_type"],  # middle / tail / intraday
             "start_date": g["start_date"],
             "end_date": g["end_date"],
-            "expected_ts": g.get("expected_ts", []),
+            "expected_ts": _serialize_expected_ts(g.get("expected_ts", [])),
             "ohlc": None,
             "expected_action": "insert",
         })
@@ -655,10 +682,14 @@ def delete_bad_records(pool, market: str, bad_records: List[Dict[str, Any]]) -> 
         return 0
 
     # 按 (timeframe, year) 分组
-    groups: Dict[Tuple[str, int], List[Tuple[str, int]]] = defaultdict(list)
+    groups: Dict[Tuple[str, int], List[Tuple[str, Any]]] = defaultdict(list)
     for rec in bad_records:
-        year = datetime.fromtimestamp(rec["time"], tz=TZ_SH).year
-        groups[(rec["timeframe"], year)].append((rec["symbol"], rec["time"]))
+        t = rec["time"]
+        if isinstance(t, datetime):
+            year = t.year
+        else:
+            year = datetime.fromtimestamp(t, tz=TZ_SH).year
+        groups[(rec["timeframe"], year)].append((rec["symbol"], t))
 
     total_deleted = 0
     with pool.connection() as conn:
@@ -933,7 +964,7 @@ def fill_1d_gaps_from_15m(
                     # 确保 1D 年份表存在
                     year = datetime.strptime(d, "%Y-%m-%d").year
                     table = f"kline_1D_{year}"
-                    ts_1d = _date_to_ts(d)
+                    ts_1d = _date_to_ts(d)  # 返回 datetime 对象
                     try:
                         # 先确保表存在（避免在 cursor 上下文内嵌套取连接）
                         writer._mgr.ensure_year_table(market, "1D", year)
@@ -1014,7 +1045,9 @@ def export_csv(gaps, issues, path):
             "symbol": g["symbol"], "timeframe": g["timeframe"],
             "issue_type": g["gap_type"],
             "start_date": g["start_date"], "end_date": g["end_date"],
-            "expected_ts": json.dumps(g.get("expected_ts", []), separators=(",", ":")),
+            "expected_ts": json.dumps(
+                _serialize_expected_ts(g.get("expected_ts", [])),
+                separators=(",", ":")),
             "ohlc": "",
             "expected_action": "insert",
         })
