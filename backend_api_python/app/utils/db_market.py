@@ -189,8 +189,7 @@ class MarketKlineWriter:
                                     high       = EXCLUDED.high,
                                     low        = EXCLUDED.low,
                                     close      = EXCLUDED.close,
-                                    volume     = EXCLUDED.volume,
-                                    updated_at = NOW()
+                                    volume     = EXCLUDED.volume
                             """, (
                                 symbol, time_val, rec["open"], rec["high"],
                                 rec["low"], rec["close"], rec.get("volume", 0),
@@ -700,8 +699,7 @@ class MarketKlineWriter:
                     high       = EXCLUDED.high,
                     low        = EXCLUDED.low,
                     close      = EXCLUDED.close,
-                    volume     = EXCLUDED.volume,
-                    updated_at = NOW()
+                    volume     = EXCLUDED.volume
             """
         elif on_conflict == "skip":
             return "ON CONFLICT (symbol, time) DO NOTHING"

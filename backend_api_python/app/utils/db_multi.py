@@ -71,10 +71,10 @@ POOL_MAX = int(os.getenv("MARKET_DB_POOL_MAX", "10"))
 KLINE_COLUMNS = """
     symbol      VARCHAR(20)  NOT NULL,
     time        TIMESTAMP NOT NULL,
-    open        FLOAT PRECISION NOT NULL,
-    high        FLOAT PRECISION NOT NULL,
-    low         FLOAT PRECISION NOT NULL,
-    close       FLOAT PRECISION NOT NULL,
+    open        FLOAT NOT NULL,
+    high        FLOAT NOT NULL,
+    low         FLOAT NOT NULL,
+    close       FLOAT NOT NULL,
     volume      DOUBLE PRECISION DEFAULT 0,
     PRIMARY KEY (symbol, time)
 """
@@ -121,6 +121,10 @@ def _is_valid_market(market: str) -> bool:
     if m.lower() in _MARKET_ALIASES:
         return True
     return bool(re.match(r'^[a-zA-Z][a-zA-Z0-9_]*$', m))
+
+
+def _parse_database_url(url: str) -> dict:
+    """解析 DATABASE_URL 为连接参数字典"""
     if not url:
         return {"host": "localhost", "port": 5432, "user": "postgres", "password": ""}
     if url.startswith("postgresql://"):

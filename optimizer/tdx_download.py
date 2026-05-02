@@ -62,6 +62,8 @@ import time
 from datetime import datetime, timedelta
 from multiprocessing import Pool
 from pytdx.hq import TdxHq_API
+import logging
+logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════
 # 断点续传 - 进度追踪器
@@ -1156,8 +1158,8 @@ def _ensure_datetime_repair(value):
 
 # 15m 标准 bar 时间表（通达信 A 股）
 _BAR_TIMES_15M = [
-    (9, 30), (9, 45), (10, 0), (10, 15), (10, 30), (10, 45), (11, 0), (11, 15),
-    (13, 0), (13, 15), (13, 30), (13, 45), (14, 0), (14, 15), (14, 30), (14, 45),
+    (9, 30), (9, 45), (10, 0), (10, 15), (10, 30), (10, 45), (11, 0), (11, 15), (11, 30),
+    (13, 15), (13, 30), (13, 45), (14, 0), (14, 15), (14, 30), (14, 45), (15, 0),
 ]
 
 
@@ -2255,6 +2257,41 @@ def main():
         help='(修复模式) 只修复指定股票代码，如 600519。')
 
     args = ap.parse_args()
+
+    # ---- --merge-db 独立模式：跳过下载，直接扫描CSV写入数据库 ----
+    if args.merge_db and not args.repair:
+        import glob as _glob
+        # 扫描输出目录下所有子目录的CSV，按子目录名推断数据类型
+        tf_dir_map = {
+            'daily': '1D', '1m': '1m', '5m': '5m',
+            '15m': '15m', '30m': '30m', '1h': '60m', '60m': '60m',
+        }
+        found = []
+        for subdir, tf in tf_dir_map.items():
+            csv_dir = os.path.join(args.output, subdir)
+            csvs = _glob.glob(os.path.join(csv_dir, '*.csv'))
+            if csvs:
+                found.append((csv_dir, tf, len(csvs)))
+
+        if not found:
+            print(f"❌ 在 {args.output} 下未找到任何CSV文件")
+            print(f"   期望目录结构: {args.output}/{{daily,1m,5m,15m,30m,1h}}/*.csv")
+            sys.exit(1)
+
+        print(f"\n{'='*55}")
+        print(f"  📦 --merge-db 独立模式（跳过下载）")
+        print(f"  扫描目录: {args.output}")
+        for csv_dir, tf, cnt in found:
+            print(f"    {tf:>4}  →  {csv_dir}  ({cnt} 文件)")
+        print(f"{'='*55}")
+
+        for csv_dir, tf, cnt in found:
+            merge_to_db(csv_dir, tf, args.workers, db_url=args.db_url)
+
+        print(f"\n{'='*55}")
+        print(f"  ✅ 全部完成!")
+        print(f"{'='*55}")
+        return
 
     # ---- 修复模式分发 ----
     if args.repair:
