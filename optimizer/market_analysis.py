@@ -1,5 +1,8 @@
 """
 A 股全市场数据分析 — 策略设计前的数据画像
+
+数据来源：db_market (CNStock_db)，不再依赖本地 CSV。
+
 用法:
     python market_analysis.py              # 完整分析（日线）
     python market_analysis.py --15m        # 包含15分钟线分析
@@ -9,44 +12,54 @@ import os
 import sys
 import pandas as pd
 import numpy as np
-from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
 import json
 
-BASE_DIR = Path(__file__).parent.parent / "optimizer_output" / "CNStock"
-DAILY_DIR = BASE_DIR / "daily"
-MIN15_DIR = BASE_DIR / "15m"
-OUTPUT_DIR = Path(__file__).parent / "analysis_output"
+# 确保 backend_api_python 在 path 中
+_optimizer_dir = os.path.dirname(os.path.abspath(__file__))
+_project_root = os.path.dirname(_optimizer_dir)
+_backend_root = os.path.join(_project_root, "backend_api_python")
+if _backend_root not in sys.path:
+    sys.path.insert(0, _backend_root)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
+def _get_writer():
+    """延迟导入 db_market writer"""
+    from app.utils.db_market import get_market_kline_writer
+    return _get_writer()
+
+
+def _get_mgr():
+    """延迟导入 db_market manager"""
+    from app.utils.db_market import get_market_db_manager
+    return _get_mgr()
+
+
+OUTPUT_DIR = os.path.join(_optimizer_dir, "analysis_output")
 
 
 def load_csv(code: str, timeframe: str = "daily") -> pd.DataFrame:
-    """加载 CSV 并标准化"""
-    if timeframe == "daily":
-        path = DAILY_DIR / f"{code}.csv"
-    else:
-        path = MIN15_DIR / f"{code}_15min.csv"
-    
-    if not path.exists():
+    """从 db_market 加载数据并标准化"""
+    tf_map = {"daily": "1D", "15m": "15m"}
+    tf = tf_map.get(timeframe, timeframe)
+
+    writer = _get_writer()
+    data = writer.query("CNStock", code, tf, limit=10000)
+
+    if not data:
         return None
-    
-    df = pd.read_csv(path)
-    df.columns = [c.strip().lower() for c in df.columns]
-    
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"])
-        df = df.set_index("date")
-    elif "time" in df.columns:
-        df["time"] = pd.to_datetime(df["time"])
-        df = df.set_index("time")
-    
+
+    df = pd.DataFrame(data)
+    df["date"] = pd.to_datetime(df["time"], unit="s")
+    df = df.set_index("date").drop(columns=["time"])
+    df = df.sort_index()
+
     for col in ["open", "high", "low", "close", "volume"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    if "amount" in df.columns:
-        df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
-    
-    return df.sort_index()
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df
 
 
 def get_board(code: str) -> str:
@@ -67,10 +80,12 @@ def get_board(code: str) -> str:
 
 def get_all_codes() -> list:
     """获取全部日线股票代码"""
-    if not DAILY_DIR.exists():
-        print(f"❌ 数据目录不存在: {DAILY_DIR}")
+    writer = _get_writer()
+    stats = writer.stats("CNStock")
+    if not stats.get("exists"):
+        print("❌ CNStock_db 不存在，请先运行 tdx_download --merge-db")
         sys.exit(1)
-    return sorted([f.stem for f in DAILY_DIR.glob("*.csv")])
+    return stats.get("symbol_list", [])
 
 
 # ============================================================
@@ -81,44 +96,42 @@ def market_overview(all_codes: list, sample_n: int = 500):
     print("\n" + "=" * 70)
     print("  1. 市场整体概况")
     print("=" * 70)
-    
+
     sample = all_codes[:sample_n] if len(all_codes) > sample_n else all_codes
-    
+
     # 板块分布
     boards = defaultdict(int)
     for code in all_codes:
         boards[get_board(code)] += 1
-    
+
     print(f"\n📊 全市场股票数: {len(all_codes)}")
     print(f"   板块分布:")
     for board, count in sorted(boards.items(), key=lambda x: -x[1]):
         print(f"     {board}: {count} ({count/len(all_codes)*100:.1f}%)")
-    
+
     # 加载数据统计
     all_returns = []
     all_volumes = []
     all_amounts = []
     date_ranges = []
     row_counts = []
-    
+
     for code in sample:
         df = load_csv(code)
         if df is None or len(df) < 100:
             continue
-        
+
         returns = df["close"].pct_change().dropna()
         all_returns.extend(returns.tolist())
-        
+
         if "volume" in df.columns:
             all_volumes.append(df["volume"].mean())
-        if "amount" in df.columns:
-            all_amounts.append(df["amount"].mean())
-        
+
         date_ranges.append((df.index.min(), df.index.max()))
         row_counts.append(len(df))
-    
+
     all_returns = np.array(all_returns)
-    
+
     print(f"\n📈 收益率分布 (抽样 {len(sample)} 只, 共 {len(all_returns):,} 个交易日):")
     print(f"   均值: {all_returns.mean()*100:.4f}%")
     print(f"   中位数: {np.median(all_returns)*100:.4f}%")
@@ -129,7 +142,7 @@ def market_overview(all_codes: list, sample_n: int = 500):
     print(f"   >9.5% (涨停)占比: {(all_returns >= 0.095).sum() / len(all_returns) * 100:.4f}%")
     print(f"   <-5% 天数占比: {(all_returns < -0.05).sum() / len(all_returns) * 100:.2f}%")
     print(f"   <-9.5% (跌停)占比: {(all_returns <= -0.095).sum() / len(all_returns) * 100:.4f}%")
-    
+
     if date_ranges:
         all_starts = [d[0] for d in date_ranges]
         all_ends = [d[1] for d in date_ranges]
@@ -137,7 +150,7 @@ def market_overview(all_codes: list, sample_n: int = 500):
         print(f"   最早: {min(all_starts).strftime('%Y-%m-%d')}")
         print(f"   最晚: {max(all_ends).strftime('%Y-%m-%d')}")
         print(f"   平均交易日数: {int(np.median(row_counts))}")
-    
+
     return all_returns
 
 
@@ -149,48 +162,41 @@ def cross_sectional_analysis(all_codes: list, sample_n: int = 500):
     print("\n" + "=" * 70)
     print("  2. 横截面分析 — 股票特征画像")
     print("=" * 70)
-    
+
     sample = all_codes[:sample_n] if len(all_codes) > sample_n else all_codes
-    
+
     stats = []
     for code in sample:
         df = load_csv(code)
         if df is None or len(df) < 200:
             continue
-        
+
         returns = df["close"].pct_change().dropna()
-        
-        # 跳过数据不完整的
+
         if len(returns) < 200:
             continue
-        
+
         daily_vol = returns.std()
         annual_return = (1 + returns.mean()) ** 252 - 1
         annual_vol = daily_vol * np.sqrt(252)
         sharpe = annual_return / annual_vol if annual_vol > 0 else 0
         max_dd = ((df["close"] / df["close"].cummax()) - 1).min()
-        
-        # 涨停/跌停频率
+
         limit_up = (returns >= 0.095).sum()
         limit_down = (returns <= -0.095).sum()
-        
-        # 成交量特征
+
         vol_mean = df["volume"].mean()
         vol_std = df["volume"].std()
-        vol_cv = vol_std / vol_mean if vol_mean > 0 else 0  # 成交量变异系数
-        
-        # 量价相关性
+        vol_cv = vol_std / vol_mean if vol_mean > 0 else 0
+
         vol_price_corr = returns.corr(df["volume"].pct_change()) if len(returns) > 10 else 0
-        
-        # 趋势性（用收益自相关衡量）
         autocorr = returns.autocorr(lag=1) if len(returns) > 10 else 0
-        
-        # 日均振幅
+
         if "high" in df.columns and "low" in df.columns:
             amplitude = ((df["high"] - df["low"]) / df["close"]).mean()
         else:
             amplitude = 0
-        
+
         stats.append({
             "code": code,
             "board": get_board(code),
@@ -208,9 +214,9 @@ def cross_sectional_analysis(all_codes: list, sample_n: int = 500):
             "autocorr": autocorr,
             "amplitude": amplitude,
         })
-    
+
     df_stats = pd.DataFrame(stats)
-    
+
     # 按板块分组统计
     print(f"\n📊 按板块统计 (抽样 {len(stats)} 只):")
     for board, group in df_stats.groupby("board"):
@@ -225,7 +231,7 @@ def cross_sectional_analysis(all_codes: list, sample_n: int = 500):
         print(f"    量价相关:  中位数 {group['vol_price_corr'].median():.3f}")
         print(f"    收益自相关: 中位数 {group['autocorr'].median():.4f}")
         print(f"    涨停次数:  均值 {group['limit_up_count'].mean():.1f} / 5年")
-    
+
     # Top/Bottom 特征股票
     print(f"\n🏆 高波动 + 高振幅（适合短线策略）:")
     df_stats["short_score"] = df_stats["daily_vol"].rank(pct=True) * 0.5 + \
@@ -237,7 +243,7 @@ def cross_sectional_analysis(all_codes: list, sample_n: int = 500):
               f"amp={row['amplitude']*100:.2f}%  "
               f"涨停={int(row['limit_up_count'])}次  "
               f"板块={row['board']}")
-    
+
     print(f"\n📈 高趋势性（适合趋势跟踪）:")
     df_stats["trend_score"] = df_stats["autocorr"].rank(pct=True) * 0.5 + \
                                df_stats["sharpe"].rank(pct=True) * 0.3 + \
@@ -248,14 +254,14 @@ def cross_sectional_analysis(all_codes: list, sample_n: int = 500):
               f"sharpe={row['sharpe']:.3f}  "
               f"回撤={row['max_drawdown']*100:.1f}%  "
               f"板块={row['board']}")
-    
+
     print(f"\n🏆 高量价相关（适合量价策略）:")
     top_vp = df_stats.nlargest(15, "vol_price_corr")
     for _, row in top_vp.iterrows():
         print(f"    {row['code']:>8s}  量价相关={row['vol_price_corr']:.4f}  "
               f"sharpe={row['sharpe']:.3f}  "
               f"板块={row['board']}")
-    
+
     return df_stats
 
 
@@ -267,10 +273,9 @@ def time_series_analysis(all_codes: list, sample_n: int = 300):
     print("\n" + "=" * 70)
     print("  3. 时间序列分析 — 寻找时间规律")
     print("=" * 70)
-    
+
     sample = all_codes[:sample_n] if len(all_codes) > sample_n else all_codes
-    
-    # 收集所有股票的收益率
+
     all_data = []
     for code in sample:
         df = load_csv(code)
@@ -284,13 +289,13 @@ def time_series_analysis(all_codes: list, sample_n: int = 300):
                 "code": code,
                 "board": get_board(code),
             })
-    
+
     df_all = pd.DataFrame(all_data)
     df_all["date"] = pd.to_datetime(df_all["date"])
     df_all["weekday"] = df_all["date"].dt.weekday
     df_all["month"] = df_all["date"].dt.month
     df_all["year"] = df_all["date"].dt.year
-    
+
     # 3.1 星期效应
     print("\n📅 星期效应 (全市场平均日收益率):")
     weekday_names = ["周一", "周二", "周三", "周四", "周五"]
@@ -299,7 +304,7 @@ def time_series_analysis(all_codes: list, sample_n: int = 300):
         mean_ret = df_all.loc[mask, "return"].mean()
         win_rate = (df_all.loc[mask, "return"] > 0).mean()
         print(f"   {weekday_names[wd]}: 均值={mean_ret*100:.4f}%  胜率={win_rate*100:.1f}%")
-    
+
     # 3.2 月份效应
     print("\n📅 月份效应 (全市场平均日收益率):")
     for m in range(1, 13):
@@ -309,7 +314,7 @@ def time_series_analysis(all_codes: list, sample_n: int = 300):
         mean_ret = df_all.loc[mask, "return"].mean()
         win_rate = (df_all.loc[mask, "return"] > 0).mean()
         print(f"   {m:>2d}月: 均值={mean_ret*100:.4f}%  胜率={win_rate*100:.1f}%  样本={mask.sum():,}")
-    
+
     # 3.3 年度表现
     print("\n📅 年度表现 (全市场平均年化收益率):")
     for year in sorted(df_all["year"].unique()):
@@ -320,7 +325,7 @@ def time_series_analysis(all_codes: list, sample_n: int = 300):
         positive_pct = (year_returns > 0).mean()
         print(f"   {year}: 均值={mean_annual*100:+.1f}%  中位数={median_annual*100:+.1f}%  "
               f"正收益占比={positive_pct*100:.0f}%")
-    
+
     # 3.4 连涨/连跌统计
     print("\n📊 连涨/连跌统计 (抽样):")
     streak_data = []
@@ -330,8 +335,7 @@ def time_series_analysis(all_codes: list, sample_n: int = 300):
             continue
         returns = df["close"].pct_change().dropna()
         signs = (returns > 0).astype(int)
-        
-        # 计算连涨/连跌
+
         streak = 0
         current_sign = None
         for s in signs:
@@ -343,20 +347,20 @@ def time_series_analysis(all_codes: list, sample_n: int = 300):
                 current_sign = s
                 streak = 1
         streak_data.append({"sign": current_sign, "length": streak})
-    
+
     df_streak = pd.DataFrame(streak_data)
     print("   连涨天数分布:")
     for n in range(1, 11):
         up_streak = ((df_streak["sign"] == 1) & (df_streak["length"] >= n)).sum()
         total_up = (df_streak["sign"] == 1).sum()
         print(f"     ≥{n}天: {up_streak} ({up_streak/total_up*100:.1f}%)")
-    
+
     print("   连跌天数分布:")
     for n in range(1, 11):
         down_streak = ((df_streak["sign"] == 0) & (df_streak["length"] >= n)).sum()
         total_down = (df_streak["sign"] == 0).sum()
         print(f"     ≥{n}天: {down_streak} ({down_streak/total_down*100:.1f}%)")
-    
+
     return df_all
 
 
@@ -368,35 +372,32 @@ def volume_price_analysis(all_codes: list, sample_n: int = 300):
     print("\n" + "=" * 70)
     print("  4. 量价关系分析")
     print("=" * 70)
-    
+
     sample = all_codes[:sample_n] if len(all_codes) > sample_n else all_codes
-    
-    # 涨幅分组统计
+
     bins = [-0.12, -0.07, -0.05, -0.03, -0.01, 0.01, 0.03, 0.05, 0.07, 0.12]
     bin_labels = ["<-7%", "-7~-5%", "-5~-3%", "-3~-1%", "-1~1%", "1~3%", "3~5%", "5~7%", ">7%"]
-    
+
     vol_change_by_return = defaultdict(list)
-    
+
     for code in sample:
         df = load_csv(code)
         if df is None or len(df) < 200:
             continue
-        
+
         returns = df["close"].pct_change().dropna()
         vol_change = df["volume"].pct_change().dropna()
-        
-        # 对齐
+
         common_idx = returns.index.intersection(vol_change.index)
         r = returns.loc[common_idx]
         v = vol_change.loc[common_idx]
-        
-        # 用 pd.cut 分箱
+
         binned = pd.cut(r, bins=bins, labels=bin_labels, right=False, include_lowest=True)
         for label, vc in zip(binned, v):
             if pd.isna(label) or pd.isna(vc):
                 continue
             vol_change_by_return[str(label)].append(vc)
-    
+
     print("\n📊 涨跌幅 vs 成交量变化 (全市场统计):")
     print(f"   {'涨跌幅':>12s}  {'成交量变化均值':>14s}  {'成交量变化中位数':>16s}  {'样本数':>8s}")
     for label in bin_labels:
@@ -405,7 +406,7 @@ def volume_price_analysis(all_codes: list, sample_n: int = 300):
             mean_vc = np.mean(vals)
             median_vc = np.median(vals)
             print(f"   {label:>12s}  {mean_vc*100:>+13.1f}%  {median_vc*100:>+15.1f}%  {len(vals):>8,}")
-    
+
     # 大涨后回调概率
     print("\n📊 大涨后次日表现 (涨幅>5% 后):")
     next_day_after_surge = []
@@ -417,7 +418,7 @@ def volume_price_analysis(all_codes: list, sample_n: int = 300):
         for i in range(len(returns) - 1):
             if returns.iloc[i] > 0.05:
                 next_day_after_surge.append(returns.iloc[i + 1])
-    
+
     if next_day_after_surge:
         arr = np.array(next_day_after_surge)
         print(f"   样本数: {len(arr):,}")
@@ -426,7 +427,7 @@ def volume_price_analysis(all_codes: list, sample_n: int = 300):
         print(f"   次日上涨概率: {(arr > 0).mean()*100:.1f}%")
         print(f"   次日继续涨>3%: {(arr > 0.03).mean()*100:.1f}%")
         print(f"   次日跌>3%: {(arr < -0.03).mean()*100:.1f}%")
-    
+
     # 缩量回调后反弹概率
     print("\n📊 缩量回调后表现 (连续3天缩量+小幅下跌后):")
     bounce_after_shrink = []
@@ -439,20 +440,19 @@ def volume_price_analysis(all_codes: list, sample_n: int = 300):
         common_idx = returns.index.intersection(vol_change.index)
         r = returns.loc[common_idx]
         v = vol_change.loc[common_idx]
-        
+
         for i in range(3, len(r) - 1):
-            # 连续3天缩量（成交量下降）+ 小幅下跌
             if (v.iloc[i-2] < 0 and v.iloc[i-1] < 0 and v.iloc[i] < 0 and
                 r.iloc[i-2] < 0 and r.iloc[i-1] < 0 and r.iloc[i] < 0 and
-                r.iloc[i] > -0.05):  # 不是暴跌
+                r.iloc[i] > -0.05):
                 bounce_after_shrink.append(r.iloc[i + 1])
-    
+
     if bounce_after_shrink:
         arr = np.array(bounce_after_shrink)
         print(f"   样本数: {len(arr):,}")
         print(f"   次日均值: {arr.mean()*100:+.4f}%")
         print(f"   次日上涨概率: {(arr > 0).mean()*100:.1f}%")
-    
+
     return vol_change_by_return
 
 
@@ -464,34 +464,31 @@ def sector_rotation_analysis(all_codes: list, sample_n: int = 500):
     print("\n" + "=" * 70)
     print("  5. 板块轮动分析")
     print("=" * 70)
-    
+
     sample = all_codes[:sample_n] if len(all_codes) > sample_n else all_codes
-    
-    # 按月收集各板块收益
+
     board_monthly = defaultdict(lambda: defaultdict(list))
-    
+
     for code in sample:
         df = load_csv(code)
         if df is None or len(df) < 200:
             continue
         board = get_board(code)
         returns = df["close"].pct_change().dropna()
-        
-        # 按月聚合
+
         monthly = returns.resample("ME").sum()
         for date, ret in monthly.items():
             key = f"{date.year}-{date.month:02d}"
             board_monthly[board][key].append(ret)
-    
-    # 找出轮动规律
+
     print("\n📊 各板块月度平均收益 (近3年):")
     months = sorted(set(key for bd in board_monthly.values() for key in bd.keys()))
-    recent_months = [m for m in months if m >= "2023-01"][-24:]  # 最近24个月
-    
+    recent_months = [m for m in months if m >= "2023-01"][-24:]
+
     boards = sorted(board_monthly.keys())
     header = f"{'月份':>8s}" + "".join(f"  {b:>8s}" for b in boards)
     print(f"   {header}")
-    
+
     for month in recent_months:
         row = f"   {month:>8s}"
         for board in boards:
@@ -502,8 +499,7 @@ def sector_rotation_analysis(all_codes: list, sample_n: int = 500):
             else:
                 row += f"  {'N/A':>8s}"
         print(row)
-    
-    # 板块相关性
+
     print("\n📊 板块月度收益相关性:")
     board_returns = {}
     for board in boards:
@@ -512,7 +508,7 @@ def sector_rotation_analysis(all_codes: list, sample_n: int = 500):
             vals = board_monthly[board].get(month, [])
             monthly_means.append(np.mean(vals) if vals else 0)
         board_returns[board] = monthly_means
-    
+
     df_br = pd.DataFrame(board_returns)
     corr = df_br.corr()
     print(f"   {'':>8s}" + "".join(f"  {b:>8s}" for b in boards))
@@ -531,46 +527,40 @@ def strategy_suggestions(df_stats, all_returns):
     print("\n" + "=" * 70)
     print("  6. 策略方向建议 (基于数据分析)")
     print("=" * 70)
-    
+
     print("""
 ┌─────────────────────────────────────────────────────────────────────┐
 │                       策略方向矩阵                                  │
 ├──────────────┬──────────────────────────────────────────────────────┤
 │  策略类型    │  适用条件 (你的数据是否支持)                          │
 ├──────────────┼──────────────────────────────────────────────────────┤""")
-    
-    # 根据数据特征判断
+
     if df_stats is not None and len(df_stats) > 0:
         median_autocorr = df_stats["autocorr"].median()
         median_vol_price = df_stats["vol_price_corr"].median()
         median_amplitude = df_stats["amplitude"].median()
         limit_up_pct = (df_stats["limit_up_count"] > 0).mean()
-        
-        # 趋势跟踪
+
         trend_support = "✅ 强" if median_autocorr > 0.02 else "⚠️ 弱" if median_autocorr > -0.01 else "❌ 不支持"
         print(f"│  趋势跟踪    │  收益自相关={median_autocorr:.4f} {trend_support:<20s}│")
-        
-        # 量价策略
+
         vp_support = "✅ 强" if median_vol_price > 0.1 else "⚠️ 中" if median_vol_price > 0 else "❌ 弱"
         print(f"│  量价策略    │  量价相关={median_vol_price:.3f} {vp_support:<22s}│")
-        
-        # 短线/日内
+
         amp_support = "✅ 适合" if median_amplitude > 0.03 else "⚠️ 一般" if median_amplitude > 0.02 else "❌ 波动太小"
         print(f"│  短线策略    │  日均振幅={median_amplitude*100:.2f}% {amp_support:<20s}│")
-        
-        # 涨停追涨
+
         limit_support = "✅ 有信号源" if limit_up_pct > 0.3 else "⚠️ 信号稀少"
         print(f"│  涨停策略    │  有涨停股票={limit_up_pct*100:.0f}% {limit_support:<19s}│")
-    
-    # 均值回归
+
     kurt = pd.Series(all_returns).kurtosis()
     mr_support = "✅ 肥尾明显" if kurt > 5 else "⚠️ 轻微肥尾" if kurt > 3 else "❌ 近似正态"
     print(f"│  均值回归    │  峰度={kurt:.1f} {mr_support:<24s}│")
-    
+
     print(f"""├──────────────┼──────────────────────────────────────────────────────┤
 │  多因子组合  │  ✅ 全市场数据+多指标 → 天然适合多因子选股           │
 └──────────────┴──────────────────────────────────────────────────────┘""")
-    
+
     print("""
 💡 建议优先级:
    1. 量价策略 — 你的数据有 volume+amount，量价关系是最直接的 alpha 来源
@@ -586,41 +576,40 @@ def strategy_suggestions(df_stats, all_returns):
 def main():
     quick = "--quick" in sys.argv
     include_15m = "--15m" in sys.argv
-    
+
     sample_n = 200 if quick else 500
-    
-    print("🚀 A 股全市场数据分析")
+
+    print("🚀 A 股全市场数据分析 (db_market)")
     print(f"   模式: {'快速' if quick else '完整'}")
-    print(f"   数据目录: {DAILY_DIR}")
-    
+
     all_codes = get_all_codes()
     print(f"   股票总数: {len(all_codes)}")
-    
+
     # 1. 市场概况
     all_returns = market_overview(all_codes, sample_n)
-    
+
     # 2. 横截面分析
     df_stats = cross_sectional_analysis(all_codes, sample_n)
-    
+
     # 3. 时间序列
     df_all = time_series_analysis(all_codes, sample_n // 2)
-    
+
     # 4. 量价关系
     volume_price_analysis(all_codes, sample_n // 2)
-    
+
     # 5. 板块轮动
     sector_rotation_analysis(all_codes, sample_n)
-    
+
     # 6. 策略建议
     strategy_suggestions(df_stats, all_returns)
-    
+
     # 保存结果
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     if df_stats is not None and len(df_stats) > 0:
-        stats_path = OUTPUT_DIR / "stock_stats.csv"
+        stats_path = os.path.join(OUTPUT_DIR, "stock_stats.csv")
         df_stats.to_csv(stats_path, index=False, encoding="utf-8-sig")
         print(f"\n💾 股票统计已保存: {stats_path}")
-    
+
     print("\n✅ 分析完成")
 
 

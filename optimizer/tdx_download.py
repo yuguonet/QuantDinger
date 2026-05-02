@@ -819,6 +819,231 @@ def merge_all(input_dir, output_file):
     print(f"✅ {total:,} 行 → {output_file}")
 
 
+def _merge_worker_init():
+    """子进程忽略 SIGINT，由主进程统一管理退出"""
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+def _merge_worker(args):
+    """工作进程：读取一批 CSV 并写入 db_market
+
+    Args:
+        args: (file_list, timeframe, batch_id)
+
+    Returns:
+        (batch_id, total_files, total_rows, errors, error_msgs)
+    """
+    file_list, timeframe, batch_id = args
+
+    import sys as _sys
+    import os as _os
+    _project_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    _backend_root = _os.path.join(_project_root, "backend_api_python")
+    if _backend_root not in _sys.path:
+        _sys.path.insert(0, _backend_root)
+
+    from app.utils.db_market import get_market_kline_writer
+
+    writer = get_market_kline_writer()
+    from datetime import datetime
+
+    total_rows = 0
+    total_files = 0
+    errors = 0
+    error_msgs = []
+
+    for fpath in file_list:
+        fname = _os.path.basename(fpath)
+        code = fname.split('_')[0].replace('.csv', '')
+
+        try:
+            with open(fpath, 'r', encoding='utf-8-sig') as f:
+                reader = csv.DictReader(f)
+                records = []
+                for row in reader:
+                    try:
+                        dt_str = row.get('date') or row.get('datetime', '')
+                        if not dt_str:
+                            continue
+                        dt = None
+                        for fmt in ('%Y-%m-%d', '%Y-%m-%d %H:%M', '%Y-%m-%d %H:%M:%S'):
+                            try:
+                                dt = datetime.strptime(dt_str.strip(), fmt)
+                                break
+                            except ValueError:
+                                continue
+                        if dt is None:
+                            continue
+                        ts = int(dt.timestamp())
+
+                        records.append({
+                            "symbol": code,
+                            "timeframe": timeframe,
+                            "time": ts,
+                            "open": float(row.get('open', 0)),
+                            "high": float(row.get('high', 0)),
+                            "low": float(row.get('low', 0)),
+                            "close": float(row.get('close', 0)),
+                            "volume": float(row.get('volume', 0)),
+                        })
+                    except (ValueError, KeyError):
+                        continue
+
+                if records:
+                    result = writer.bulk_write("CNStock", records, batch_size=5000)
+                    total_rows += result.get("inserted", 0)
+                    total_files += 1
+
+        except Exception as e:
+            errors += 1
+            error_msgs.append(f"{fname}: {e}")
+
+    return (batch_id, total_files, total_rows, errors, error_msgs)
+
+
+def merge_to_db(input_dir, data_type, workers=4, db_url=None):
+    """将下载的 CSV 数据写入 db_market（调用 bulk_write，多进程并行）
+
+    自动扫描 input_dir 下所有 CSV，解析后批量写入 CNStock_db。
+
+    Args:
+        input_dir:  CSV 目录（如 optimizer_output/CNStock/daily）
+        data_type:  数据类型，决定 timeframe 映射
+                    "daily" / "1D" → 1D
+                    "1m" → 1m, "5m" → 5m, "15m" → 15m,
+                    "30m" → 30m, "60m" / "1h" → 60m
+        workers:    并行写入进程数
+        db_url:     数据库连接 URL（可选，默认从 DATABASE_URL 环境变量读取）
+    """
+    import glob
+
+    # 确保 backend_api_python 在 path 中
+    _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _backend_root = os.path.join(_project_root, "backend_api_python")
+    if _backend_root not in sys.path:
+        sys.path.insert(0, _backend_root)
+
+    # 加载 .env（优先 backend 目录，其次项目根目录）
+    try:
+        from dotenv import load_dotenv
+        for env_path in [
+            os.path.join(_backend_root, '.env'),
+            os.path.join(_project_root, '.env'),
+        ]:
+            if os.path.isfile(env_path):
+                load_dotenv(env_path, override=False)
+                break
+    except ImportError:
+        pass
+
+    # 如果指定了 db_url，设为环境变量
+    if db_url:
+        os.environ['DATABASE_URL'] = db_url
+
+    # 检查 DATABASE_URL
+    if not os.getenv('DATABASE_URL'):
+        print("❌ 未设置 DATABASE_URL，请通过以下方式之一提供:")
+        print("   1. 设置环境变量: set DATABASE_URL=postgresql://user:pass@host:5432/dbname")
+        print("   2. 创建 backend_api_python/.env 文件")
+        print("   3. 使用 --db-url 参数")
+        return
+
+    from app.utils.db_market import get_market_db_manager
+
+    # timeframe 映射
+    tf_map = {
+        "daily": "1D", "1D": "1D",
+        "1m": "1m", "5m": "5m", "15m": "15m",
+        "30m": "30m", "60m": "60m", "1h": "60m",
+    }
+    timeframe = tf_map.get(data_type, data_type)
+
+    files = sorted(glob.glob(os.path.join(input_dir, '*.csv')))
+    if not files:
+        print(f"❌ 目录下无 CSV: {input_dir}")
+        return
+
+    print(f"\n{'='*55}")
+    print(f"  📦 CSV → db_market 多进程写入")
+    print(f"  目录: {input_dir}")
+    print(f"  文件数: {len(files)}")
+    print(f"  时间框架: {timeframe}")
+    print(f"  进程数: {workers}")
+    print(f"{'='*55}")
+
+    mgr = get_market_db_manager()
+    mgr.ensure_market_db("CNStock")
+
+    # 分配任务给各工作进程
+    bs = max(1, len(files) // workers)
+    batches = []
+    for i in range(workers):
+        start = i * bs
+        end = start + bs if i < workers - 1 else len(files)
+        if start < len(files):
+            batches.append((files[start:end], timeframe, i))
+
+    import time
+    from multiprocessing import Pool
+
+    t0 = time.time()
+
+    pool = Pool(workers, initializer=_merge_worker_init)
+
+    try:
+        async_results = []
+        for batch_args in batches:
+            ar = pool.apply_async(_merge_worker, (batch_args,))
+            async_results.append(ar)
+
+        pool.close()
+
+        # 轮询等待完成
+        done_set = set()
+        while len(done_set) < len(async_results):
+            time.sleep(1)
+            for idx, ar in enumerate(async_results):
+                if idx in done_set:
+                    continue
+                if ar.ready():
+                    done_set.add(idx)
+            print(f"\r  进度: {len(done_set)}/{len(async_results)} 批", end='', flush=True)
+        print()
+
+        pool.join()
+
+    except KeyboardInterrupt:
+        print("\n\n⚠️  收到中断信号，等待子进程退出...")
+        pool.terminate()
+        pool.join()
+        print("❌ 已退出（已写入的数据不会丢失）")
+        sys.exit(1)
+
+    elapsed = time.time() - t0
+
+    # 汇总结果
+    total_rows = 0
+    total_files = 0
+    errors = 0
+    for ar in async_results:
+        try:
+            batch_id, n_files, n_rows, n_err, msgs = ar.get(timeout=0)
+            total_files += n_files
+            total_rows += n_rows
+            errors += n_err
+            for msg in msgs:
+                print(f"  ❌ {msg}")
+        except Exception:
+            pass
+
+    print(f"\n  ✅ 写入完成:")
+    print(f"     文件: {total_files} 个 (失败 {errors} 个)")
+    print(f"     行数: {total_rows:,}")
+    print(f"     市场: CNStock_db, 时间框架: {timeframe}")
+    print(f"     耗时: {elapsed:.1f}s ({elapsed/60:.1f}分钟)")
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser(
@@ -842,6 +1067,10 @@ def main():
     ap.add_argument('--workers', '-w', type=int, default=5, help='并行进程数 (默认5)')
     ap.add_argument('--output', '-o', default='optimizer_output/CNStock', help='输出目录 (默认 optimizer_output/CNStock)')
     ap.add_argument('--merge', action='store_true', help='合并为单CSV')
+    ap.add_argument('--merge-db', action='store_true',
+        help='将下载的 CSV 写入 db_market（CNStock_db），不再生成合并 CSV')
+    ap.add_argument('--db-url', type=str, default=None,
+        help='数据库连接 URL，如 postgresql://user:pass@localhost:5432/quantdinger（默认从 DATABASE_URL 环境变量读取）')
     ap.add_argument('--no-resume', action='store_true', help='忽略断点记录，强制重新下载')
     ap.add_argument('--retry-failed', action='store_true',
         help='将旧进度中 rows=0 的条目全部重置为 failed 状态，使其在本次运行中被重试。\n'
@@ -914,6 +1143,10 @@ def main():
     if args.merge:
         for name, out_dir in outputs:
             merge_all(out_dir, os.path.join(out_dir, 'all.csv'))
+
+    if args.merge_db:
+        for name, out_dir in outputs:
+            merge_to_db(out_dir, name, args.workers, db_url=args.db_url)
 
     print(f"\n{'='*55}")
     print(f"  ✅ 全部完成!")

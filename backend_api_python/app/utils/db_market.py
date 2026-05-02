@@ -93,6 +93,7 @@ POOL_ACQUIRE_TIMEOUT = int(os.getenv("MARKET_DB_POOL_ACQUIRE_TIMEOUT", "10"))
 
 # K线表列定义（与 KlineCacheManager.KLINE_COLUMNS 一致）
 KLINE_COLUMNS = """
+    symbol      VARCHAR(20)  NOT NULL,
     time        BIGINT       NOT NULL,
     open        DOUBLE PRECISION NOT NULL,
     high        DOUBLE PRECISION NOT NULL,
