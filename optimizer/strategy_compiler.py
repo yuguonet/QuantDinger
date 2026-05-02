@@ -417,6 +417,53 @@ df['pvd_bearish'] = df['pvd_price_at_high'] & df['pvd_rsi_lower']
 """
                     calculated.add(key)
 
+            # ============================================================
+            # NEW INDICATORS (自定义中短线策略所需)
+            # ============================================================
+
+            elif ind == 'change_pct':
+                # 当日涨幅 % = (close / prev_close - 1) * 100
+                key = "change_pct"
+                if key not in calculated:
+                    code += """
+# 当日涨幅 %
+df['change_pct'] = (df['close'] / df['close'].shift(1) - 1) * 100
+"""
+                    calculated.add(key)
+
+            elif ind == 'open_gap':
+                # 开盘跳空 % = (open / prev_close - 1) * 100
+                key = "open_gap"
+                if key not in calculated:
+                    code += """
+# 开盘跳空 %
+df['open_gap'] = (df['open'] / df['close'].shift(1) - 1) * 100
+"""
+                    calculated.add(key)
+
+            elif ind == 'period_return':
+                # N 日累计涨幅 %
+                lookback = params.get('lookback', 5)
+                key = f"period_return_{lookback}"
+                if key not in calculated:
+                    code += f"""
+# {lookback} 日累计涨幅 %
+df['period_return_{lookback}'] = (df['close'] / df['close'].shift({lookback}) - 1) * 100
+"""
+                    calculated.add(key)
+
+            elif ind == 'drawdown_from_high':
+                # 从 N 日高点的回撤 %
+                lookback = params.get('lookback', 20)
+                key = f"drawdown_from_high_{lookback}"
+                if key not in calculated:
+                    code += f"""
+# 从 {lookback} 日高点的回撤 %
+df['ddfh_high_{lookback}'] = df['high'].rolling(window={lookback}).max()
+df['drawdown_from_high_{lookback}'] = (df['close'] - df['ddfh_high_{lookback}']) / df['ddfh_high_{lookback}'] * 100
+"""
+                    calculated.add(key)
+
         return code
 
     def _get_entry_logic(self, rules):
@@ -447,6 +494,7 @@ df['raw_sell'] = False
             elif ind == 'ema':
                 period = params.get('period', 20)
                 operator = rule.get('operator', 'price_above')
+                thresh = rule.get('threshold', 3.0)
                 col = f"df['ema_{period}']"
                 if operator == 'price_above':
                     conditions_buy.append(f"(df['close'] > {col})")
@@ -460,6 +508,9 @@ df['raw_sell'] = False
                 elif operator == 'cross_down':
                     conditions_buy.append(f"(df['close'] < {col}) & (df['close'].shift(1) >= {col}.shift(1))")
                     conditions_sell.append(f"(df['close'] > {col}) & (df['close'].shift(1) <= {col}.shift(1))")
+                elif operator == 'price_near':
+                    # 价格在 EMA 附近（偏离度 < 阈值%）
+                    conditions_buy.append(f"(abs(df['close'] - {col}) / {col} * 100 < {thresh})")
 
             elif ind == 'rsi':
                 period = params.get('period', 14)
@@ -478,6 +529,9 @@ df['raw_sell'] = False
                 elif operator == 'cross_down':
                     conditions_buy.append(f"({col} < {thresh}) & ({col}.shift(1) >= {thresh})")
                     conditions_sell.append(f"({col} > {100-thresh}) & ({col}.shift(1) <= {100-thresh})")
+                elif operator == 'between':
+                    low, high = thresh
+                    conditions_buy.append(f"({col} >= {low}) & ({col} <= {high})")
 
             elif ind == 'macd':
                 fast = params.get('fast_period', 12)
@@ -703,6 +757,76 @@ df['raw_sell'] = False
                     conditions_buy.append("(df['pvd_bullish'])")
                     # 卖出: 经典动量顶背离（价格新高但RSI没新高）
                     conditions_sell.append("(df['pvd_bearish'])")
+
+            # ============================================================
+            # NEW INDICATORS / OPERATORS (自定义中短线策略所需)
+            # ============================================================
+
+            elif ind == 'change_pct':
+                # 当日涨幅
+                operator = rule.get('operator', '>=')
+                thresh = rule.get('threshold', 0)
+                col = "df['change_pct']"
+                if operator == '>=':
+                    conditions_buy.append(f"({col} >= {thresh})")
+                elif operator == '<=':
+                    conditions_buy.append(f"({col} <= {thresh})")
+                elif operator == '>':
+                    conditions_buy.append(f"({col} > {thresh})")
+                elif operator == '<':
+                    conditions_buy.append(f"({col} < {thresh})")
+                elif operator == 'between':
+                    low, high = thresh
+                    conditions_buy.append(f"({col} >= {low}) & ({col} <= {high})")
+
+            elif ind == 'open_gap':
+                # 开盘跳空
+                operator = rule.get('operator', '<')
+                thresh = rule.get('threshold', 0)
+                col = "df['open_gap']"
+                if operator == '<':
+                    conditions_buy.append(f"({col} < {thresh})")
+                elif operator == '>':
+                    conditions_buy.append(f"({col} > {thresh})")
+                elif operator == '<=':
+                    conditions_buy.append(f"({col} <= {thresh})")
+                elif operator == '>=':
+                    conditions_buy.append(f"({col} >= {thresh})")
+                elif operator == 'between':
+                    low, high = thresh
+                    conditions_buy.append(f"({col} >= {low}) & ({col} <= {high})")
+
+            elif ind == 'period_return':
+                # N 日累计涨幅
+                lookback = params.get('lookback', 5)
+                operator = rule.get('operator', '>=')
+                thresh = rule.get('threshold', 0)
+                col = f"df['period_return_{lookback}']"
+                if operator == '>=':
+                    conditions_buy.append(f"({col} >= {thresh})")
+                elif operator == '<=':
+                    conditions_buy.append(f"({col} <= {thresh})")
+                elif operator == '>':
+                    conditions_buy.append(f"({col} > {thresh})")
+                elif operator == '<':
+                    conditions_buy.append(f"({col} < {thresh})")
+                elif operator == 'between':
+                    low, high = thresh
+                    conditions_buy.append(f"({col} >= {low}) & ({col} <= {high})")
+
+            elif ind == 'drawdown_from_high':
+                # 从 N 日高点的回撤
+                lookback = params.get('lookback', 20)
+                operator = rule.get('operator', 'between')
+                thresh = rule.get('threshold', 0)
+                col = f"df['drawdown_from_high_{lookback}']"
+                if operator == 'between':
+                    low, high = thresh
+                    conditions_buy.append(f"({col} >= {low}) & ({col} <= {high})")
+                elif operator == '<=':
+                    conditions_buy.append(f"({col} <= {thresh})")
+                elif operator == '>=':
+                    conditions_buy.append(f"({col} >= {thresh})")
 
         if conditions_buy:
             code += f"\ndf['raw_buy'] = {' & '.join(conditions_buy)}\n"

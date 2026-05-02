@@ -90,6 +90,7 @@ def _lazy_import():
 # 导入策略模板（原始 + A 股扩展）
 from optimizer.param_space import STRATEGY_TEMPLATES, get_template, list_templates
 from optimizer.strategy_templates_ashare import ASHARE_STRATEGY_TEMPLATES
+from optimizer.strategy_templates_mine import MY_STRATEGY_TEMPLATES
 from optimizer.strategy_templates_llm import LLM_STRATEGY_TEMPLATES
 from optimizer.ashare_adapter import (
     parse_market_symbol, normalize_symbol,
@@ -112,6 +113,7 @@ ALL_TEMPLATES: Dict[str, Dict[str, Any]] = {}
 ALL_TEMPLATES.update(STRATEGY_TEMPLATES)
 ALL_TEMPLATES.update(ASHARE_STRATEGY_TEMPLATES)
 ALL_TEMPLATES.update(LLM_STRATEGY_TEMPLATES)
+ALL_TEMPLATES.update(MY_STRATEGY_TEMPLATES)
 
 # 加载 LLM 批量生成的模板
 try:
@@ -139,6 +141,11 @@ def get_ashare_template_keys() -> List[str]:
 def get_llm_template_keys() -> List[str]:
     """返回 LLM 生成的模板 key"""
     return list(LLM_STRATEGY_TEMPLATES.keys())
+
+
+def get_mine_template_keys() -> List[str]:
+    """返回自定义中短线模板 key"""
+    return list(MY_STRATEGY_TEMPLATES.keys())
 
 
 def get_template_unified(key: str) -> dict:
@@ -445,9 +452,26 @@ def run_single_template(
 # ============================================================
 
 def _worker_init():
-    """每个子进程初始化：确保 monkey-patch 和模块路径就绪"""
+    """每个子进程初始化：确保 monkey-patch、环境变量和模块路径就绪"""
+    # 加载 .env（子进程继承不到父进程的 load_dotenv 结果）
+    try:
+        from dotenv import load_dotenv
+        import optimizer.data_warehouse.storage as _stor
+        _this_dir = os.path.dirname(os.path.abspath(_stor.__file__))
+        _project_root = os.path.dirname(os.path.dirname(_this_dir))
+        _backend_root = os.path.join(_project_root, "backend_api_python")
+        for env_path in [
+            os.path.join(_backend_root, '.env'),
+            os.path.join(_project_root, '.env'),
+        ]:
+            if os.path.isfile(env_path):
+                load_dotenv(env_path, override=False)
+                break
+    except Exception:
+        pass
     import optimizer.strategy_templates_llm   # 确保 LLM 模板注册
     import optimizer.strategy_templates_ashare # 确保 A 股模板注册
+    import optimizer.strategy_templates_mine  # 确保自定义中短线模板注册
 
 
 
@@ -535,14 +559,15 @@ stock_list.txt 格式（同 downloader）:
 可用模板:
   原始 (7): """ + ", ".join(get_original_template_keys()) + """
   A股 (10): """ + ", ".join(get_ashare_template_keys()) + """
-  LLM (5): """ + ", ".join(get_llm_template_keys()),
+  LLM (5): """ + ", ".join(get_llm_template_keys()) + """
+  自定义中短线 (5): """ + ", ".join(get_mine_template_keys()),
     )
 
     parser.add_argument("--template", "-t", type=str, default=None,
                         help="策略模板名")
     parser.add_argument("--all", action="store_true", help="运行所有模板")
     parser.add_argument("--set", type=str, default="all",
-                        choices=["all", "original", "ashare", "llm"],
+                        choices=["all", "original", "ashare", "llm", "mine"],
                         help="模板集合: all=全部, original=原始7个, ashare=A股10个, llm=LLM生成5个")
     parser.add_argument("--market", "-m", type=str, default="CNStock",
                         help="市场类型 (CNStock, Crypto, ...)")
@@ -680,6 +705,8 @@ stock_list.txt 格式（同 downloader）:
             templates = get_ashare_template_keys()
         elif args.set == "llm":
             templates = get_llm_template_keys()
+        elif args.set == "mine":
+            templates = get_mine_template_keys()
         else:
             templates = get_all_template_keys()
     elif args.template:
