@@ -458,9 +458,17 @@ class MarketDBManager:
         pool = self._get_pool(market)
 
         with pool.cursor() as cur:
+            # 15m 分区表：2 年（通达信 15m 数据只有 2 年）
             for year in [current_year - 1, current_year]:
                 self._ensure_kline_table(cur, "15m", year)
-            self._ensure_daily_view(cur, "15m")
+
+            # 1D 分区表：5 年（日线数据需要 5 年）
+            for year in range(current_year - 4, current_year + 1):
+                self._ensure_kline_table(cur, "1D", year)
+
+            # 聚合 VIEW：30m/1h/2h 从 15m，1W 从 1D
+            self._ensure_agg_views(cur, "15m", ["30m", "1h", "2h"])
+            self._ensure_agg_views(cur, "1D",  ["1W"])
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS _market_meta (
@@ -499,16 +507,99 @@ class MarketDBManager:
             ON "{table}" (time)
         """)
 
+    # ---- 聚合 VIEW 生成 ----
+
+    # 目标周期 → (秒数, 是否需要时区对齐)
+    _AGG_VIEW_TFS = {
+        "30m": (1800,  False),
+        "1h":  (3600,  False),
+        "2h":  (7200,  False),
+        "1D":  (86400, True),
+        "1W":  (604800, True),
+    }
+
+    @staticmethod
+    def _ensure_agg_views(cursor, source_timeframe: str, target_tfs: list):
+        """
+        为指定目标周期创建聚合 VIEW。
+
+        Args:
+            source_timeframe: 源数据周期 "15m" 或 "1D"
+            target_tfs:       目标周期列表，如 ["30m", "1h", "2h"] 或 ["1W"]
+        """
+        # 发现所有源周期分区表
+        cursor.execute("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_name LIKE %s
+            ORDER BY table_name
+        """, (f'kline_{source_timeframe}_%',))
+        tables = [r[0] for r in cursor.fetchall()]
+
+        if not tables:
+            logger.warning(f"无法创建聚合 VIEW：没有找到 {source_timeframe} 表")
+            return
+
+        # 过滤掉已有的聚合 VIEW 目录名
+        agg_prefixes = ('kline_30m_', 'kline_1h_', 'kline_2h_', 'kline_1d_', 'kline_1w_')
+        tables = [t for t in tables if not any(t.startswith(p) for p in agg_prefixes)]
+
+        tz = 28800  # UTC+8
+
+        for tf in target_tfs:
+            if tf not in MarketDBManager._AGG_VIEW_TFS:
+                continue
+
+            bucket_sec, need_tz = MarketDBManager._AGG_VIEW_TFS[tf]
+            view_name = f"kline_{tf}_from_{source_timeframe}"
+
+            union_parts = []
+            for tbl in tables:
+                if need_tz:
+                    if tf == "1W":
+                        bucket_expr = (
+                            f"(((time + {tz}) / 86400) * 86400 - {tz})"
+                            f" - (EXTRACT(DOW FROM"
+                            f" TO_TIMESTAMP(time + {tz}) AT TIME ZONE 'UTC')"
+                            f" ::int - 1 + 7) % 7 * 86400"
+                        )
+                    else:
+                        bucket_expr = f"(time + {tz}) / 86400 * 86400 - {tz}"
+                else:
+                    bucket_expr = f"time - time % {bucket_sec}"
+
+                union_parts.append(f'''
+                    SELECT
+                        symbol,
+                        {bucket_expr}                              AS bucket,
+                        (ARRAY_AGG(open  ORDER BY time ASC))[1]    AS open,
+                        MAX(high)                                  AS high,
+                        MIN(low)                                   AS low,
+                        (ARRAY_AGG(close ORDER BY time DESC))[1]   AS close,
+                        SUM(volume)                                AS volume
+                    FROM "{tbl}"
+                    GROUP BY symbol, {bucket_expr}
+                ''')
+
+            query = f"""
+                CREATE OR REPLACE VIEW "{view_name}" AS
+                {' UNION ALL '.join(union_parts)}
+            """
+            cursor.execute(query)
+
+        logger.info(f"✅ 已创建聚合 VIEW: {', '.join(target_tfs)}（源: {source_timeframe}）")
+
     @staticmethod
     def _ensure_daily_view(cursor, source_timeframe: str):
+        """兼容旧调用：只创建日线 VIEW"""
         view_name = _daily_view_name(source_timeframe)
         cursor.execute("""
             SELECT table_name FROM information_schema.tables
             WHERE table_schema = 'public'
-              AND table_name LIKE 'kline_%s_%%'
+              AND table_name LIKE %s
               AND table_name NOT LIKE 'kline_1d_%%'
             ORDER BY table_name
-        """ % source_timeframe)
+        """, (f'kline_{source_timeframe}_%',))
         tables = [r[0] for r in cursor.fetchall()]
 
         if not tables:
@@ -949,6 +1040,154 @@ class MarketKlineWriter:
                 "end": datetime.fromtimestamp(max_time, tz=timezone.utc).isoformat() if max_time else None,
             },
         }
+
+    # ================================================================
+    # 聚合查询（SQL 在 PG 内计算，只读不落盘）
+    # ================================================================
+
+    # 15m → 目标周期的秒数映射
+    _AGG_SECONDS = {
+        "30m":  1800,
+        "1h":   3600,
+        "2h":   7200,
+        "1D":   86400,
+        "1W":   604800,
+    }
+
+    def aggregate(
+        self,
+        market: str,
+        symbol: str,
+        target_tf: str,
+        start_time: int = None,
+        end_time: int = None,
+        limit: int = 500,
+        tz_offset: int = 28800,   # 默认 UTC+8 (A股)
+    ) -> List[Dict[str, Any]]:
+        """
+        将 15m/1D K线实时聚合成更大周期（SQL 在 PG 内计算，只读不落盘）。
+
+        数据源:
+          - 30m/1h/2h: 从 15m 表聚合（2 年数据）
+          - 1D:        从 15m 表聚合（2 年数据）
+          - 1W:        从 1D 表聚合（5 年数据）
+
+        聚合规则:
+          - open   = 该桶内第一根的 open
+          - high   = 该桶内所有 high 的最大值
+          - low    = 该桶内所有 low 的最小值
+          - close  = 该桶内最后一根的 close
+          - volume = 该桶内所有 volume 之和
+        """
+        target_tf = target_tf.strip()
+        if target_tf not in self._AGG_SECONDS:
+            raise ValueError(
+                f"不支持的目标周期: {target_tf}，"
+                f"可选: {', '.join(self._AGG_SECONDS.keys())}"
+            )
+
+        if not self._mgr.market_db_exists(market):
+            return []
+
+        bucket_sec = self._AGG_SECONDS[target_tf]
+
+        # 确定数据源：1W 从 1D 表聚合，其余从 15m 表聚合
+        if target_tf == "1W":
+            source_tf = "1D"
+            bucket_expr = (
+                f"(((t.time + {tz_offset}) / 86400) * 86400 - {tz_offset})"
+                f" - (EXTRACT(DOW FROM"
+                f" TO_TIMESTAMP(t.time + {tz_offset}) AT TIME ZONE 'UTC')"
+                f" ::int - 1 + 7) % 7 * 86400"
+            )
+        elif target_tf == "1D":
+            source_tf = "15m"
+            bucket_expr = f"(t.time + {tz_offset}) / 86400 * 86400 - {tz_offset}"
+        else:
+            source_tf = "15m"
+            bucket_expr = f"t.time - t.time % {bucket_sec}"
+
+        # 发现所有源周期分区表
+        pool = self._mgr._get_pool(market)
+        with pool.cursor() as cur:
+            cur.execute("""
+                SELECT table_name FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_name LIKE %s
+                ORDER BY table_name
+            """, (f'kline_{source_tf}_%',))
+            tables = [r[0] for r in cur.fetchall()]
+
+        if not tables:
+            return []
+
+        # 拼接 UNION ALL 子查询
+        union_parts = []
+        for tbl in tables:
+            conditions = [f"t.symbol = %s"]
+            params_slot = ["sym"]
+            if start_time:
+                conditions.append(f"t.time >= %s")
+                params_slot.append("start")
+            if end_time:
+                conditions.append(f"t.time <= %s")
+                params_slot.append("end")
+
+            where = " AND ".join(conditions)
+            union_parts.append(f"""
+                SELECT
+                    {bucket_expr}                                  AS bucket,
+                    (ARRAY_AGG(t.open  ORDER BY t.time ASC))[1]    AS open,
+                    MAX(t.high)                                    AS high,
+                    MIN(t.low)                                     AS low,
+                    (ARRAY_AGG(t.close ORDER BY t.time DESC))[1]   AS close,
+                    SUM(t.volume)                                  AS volume
+                FROM "{tbl}" t
+                WHERE {where}
+                GROUP BY {bucket_expr}
+            """)
+
+        sql = f"""
+            SELECT bucket AS time, open, high, low, close, volume
+            FROM (
+                {' UNION ALL '.join(union_parts)}
+            ) agg
+            ORDER BY bucket ASC
+        """
+
+        # 构造参数：每个 UNION 子查询都要 symbol + 可选的 start/end
+        params = []
+        for _ in tables:
+            params.append(symbol)
+            if start_time:
+                params.append(start_time)
+            if end_time:
+                params.append(end_time)
+
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+
+        with pool.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+
+        result = [
+            {
+                "time":   row[0],
+                "open":   float(row[1]),
+                "high":   float(row[2]),
+                "low":    float(row[3]),
+                "close":  float(row[4]),
+                "volume": float(row[5]),
+            }
+            for row in rows
+        ]
+
+        logger.debug(
+            f"SQL 聚合: {market}/{symbol} 15m→{target_tf} "
+            f"表数={len(tables)} 输出={len(result)}条"
+        )
+        return result
 
     # ================================================================
     # 内部工具
