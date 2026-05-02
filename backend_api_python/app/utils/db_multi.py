@@ -483,19 +483,18 @@ class MarketDBManager:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS _market_meta (
                     key   VARCHAR(50) PRIMARY KEY,
-                    value TEXT NOT NULL,
-                    updated_at TIMESTAMP DEFAULT NOW()
+                    value TEXT NOT NULL
                 )
             """)
             cur.execute("""
                 INSERT INTO _market_meta (key, value)
                 VALUES ('market', %s)
-                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
             """, (market,))
             cur.execute("""
                 INSERT INTO _market_meta (key, value)
                 VALUES ('schema_version', '1')
-                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
             """)
 
         logger.info(f"✅ 已初始化 {market}_db 表结构（{current_year - 1}-{current_year}）")
