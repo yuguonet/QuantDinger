@@ -24,6 +24,8 @@
   每次下载会在输出目录生成 _progress.json，记录已下载的股票。
   中断后重新运行相同命令，自动跳过已完成的股票，只补下缺失的。
   加 --no-resume 可忽略断点，强制重新下载。
+  加 --retry-failed 可将旧进度中 rows=0 的条目重置为待重试状态。
+    (适用于旧版脚本生成的进度文件，下载失败的股票被错误标记为已完成)
 """
 
 import os
@@ -52,12 +54,23 @@ class ProgressTracker:
         "last_updated": "2026-05-01T23:05:00"
       },
       "done": {
-        "000001": {"name": "平安银行", "rows": 1200, "ts": "2026-05-01T22:31:00"},
-        "000002": {"name": "万科A",    "rows": 1180, "ts": "2026-05-01T22:31:01"},
+        "000001": {"name": "平安银行", "rows": 1200, "status": "success", "ts": "2026-05-01T22:31:00"},
+        "000002": {"name": "万科A",    "rows": 0,    "status": "empty",   "ts": "2026-05-01T22:31:01"},
+        "688999": {"name": "某科创",    "rows": 0,    "status": "failed",  "ts": "2026-05-01T22:31:02"},
         ...
       }
     }
+
+    status 说明:
+      "success" - 成功下载，rows > 0
+      "empty"   - API 正常返回但该日期范围确实无数据 (rows=0 且无异常)
+      "failed"  - 下载出错 (连接断开/超时/异常)，rows=0 但原因不明，下次应重试
     """
+
+    # 旧版进度文件可能没有 status 字段，向后兼容时的默认值
+    STATUS_SUCCESS = "success"
+    STATUS_EMPTY = "empty"
+    STATUS_FAILED = "failed"
 
     def __init__(self, out_dir, data_type, start_date, end_date):
         self.path = os.path.join(out_dir, '_progress.json')
@@ -76,6 +89,10 @@ class ProgressTracker:
                 if (meta.get('type') == self.data_type and
                     meta.get('start_date') == self.start_date and
                     meta.get('end_date') == self.end_date):
+                    # 向后兼容: 旧版进度文件没有 status 字段，补上
+                    for code, info in data.get('done', {}).items():
+                        if 'status' not in info:
+                            info['status'] = self.STATUS_SUCCESS if info.get('rows', 0) > 0 else self.STATUS_EMPTY
                     return data
                 else:
                     print(f"  ⚠️  进度文件参数不匹配，重新开始")
@@ -93,15 +110,34 @@ class ProgressTracker:
         }
 
     def is_done(self, code):
-        return code in self.data['done']
+        """只跳过 status=success 或 status=empty 的股票，failed 的需要重试"""
+        info = self.data['done'].get(code)
+        if not info:
+            return False
+        status = info.get('status', self.STATUS_SUCCESS)
+        return status in (self.STATUS_SUCCESS, self.STATUS_EMPTY)
 
     def get_done_codes(self):
-        return set(self.data['done'].keys())
+        """返回所有无需重试的股票 code 集合 (success + empty)"""
+        return {code for code, info in self.data['done'].items()
+                if info.get('status', self.STATUS_SUCCESS) in (self.STATUS_SUCCESS, self.STATUS_EMPTY)}
 
-    def mark(self, code, name, rows):
+    def mark(self, code, name, rows, status=None):
+        """标记股票下载结果
+
+        Args:
+            code: 股票代码
+            name: 股票名称
+            rows: 数据行数
+            status: 显式指定状态 ("success"/"empty"/"failed")。
+                    若为 None 则根据 rows 自动判断: rows>0 → success, rows==0 → empty
+        """
+        if status is None:
+            status = self.STATUS_SUCCESS if rows > 0 else self.STATUS_EMPTY
         self.data['done'][code] = {
             'name': name,
             'rows': rows,
+            'status': status,
             'ts': datetime.now().isoformat(timespec='seconds'),
         }
 
@@ -116,7 +152,63 @@ class ProgressTracker:
         done = self.data['done']
         total_rows = sum(v['rows'] for v in done.values())
         with_data = sum(1 for v in done.values() if v['rows'] > 0)
-        return len(done), with_data, total_rows
+        failed = sum(1 for v in done.values() if v.get('status') == self.STATUS_FAILED)
+        return len(done), with_data, total_rows, failed
+
+    def reset_zero_rows(self):
+        """将旧进度中 rows=0 的条目重置为 failed，使其可重试
+
+        旧版脚本无法区分「下载失败」和「确实没数据」，两者都记 rows=0。
+        本方法将所有 rows=0 的条目重置为 failed，让下载器重新验证。
+        如果某只股票真的没数据，下载后会重新标记为 empty。
+
+        返回被重置的数量。
+        """
+        reset_count = 0
+        for code, info in self.data['done'].items():
+            if info.get('rows', 0) == 0 and info.get('status') != self.STATUS_FAILED:
+                info['status'] = self.STATUS_FAILED
+                reset_count += 1
+        if reset_count > 0:
+            self.save()
+        return reset_count
+
+    def show_progress(self):
+        """打印进度文件的详细统计信息"""
+        done = self.data['done']
+        if not done:
+            print("  进度文件为空，没有已记录的股票。")
+            return
+
+        status_counts = {'success': 0, 'empty': 0, 'failed': 0}
+        no_status = 0
+        for info in done.values():
+            s = info.get('status')
+            if s in status_counts:
+                status_counts[s] += 1
+            else:
+                no_status += 1
+
+        total_rows = sum(v['rows'] for v in done.values())
+
+        print(f"\n  📋 进度文件: {self.path}")
+        print(f"  {'─'*45}")
+        print(f"  总记录:     {len(done):>6} 只")
+        print(f"  ✅ success:  {status_counts['success']:>6} 只  (有数据)")
+        print(f"  ⬜ empty:    {status_counts['empty']:>6} 只  (rows=0, 标记为无数据)")
+        print(f"  ❌ failed:   {status_counts['failed']:>6} 只  (下载失败, 待重试)")
+        if no_status:
+            print(f"  ❓ 无status: {no_status:>6} 只  (旧格式)")
+        print(f"  总行数:     {total_rows:>6,}")
+        print(f"  {'─'*45}")
+        print(f"  参数: type={self.data['meta'].get('type')}  "
+              f"start={self.data['meta'].get('start_date')}  "
+              f"end={self.data['meta'].get('end_date')}")
+
+        # 按失败数量提示
+        retryable = status_counts['empty'] + status_counts['failed'] + no_status
+        if retryable > 0:
+            print(f"\n  💡 有 {retryable} 只股票可能需要重试 (--retry-failed 可重置 empty 为 failed)")
 
 
 # ═══════════════════════════════════════════════════════
@@ -295,7 +387,11 @@ def _connect_api(worker_id):
 
 
 def _worker_daily(args):
-    """工作进程: 下载日线（单个股票失败不影响整体）"""
+    """工作进程: 下载日线（单个股票失败不影响整体）
+
+    返回: [(code, name, rows, status), ...]
+      status: "success"=有数据  "empty"=API正常但确实无数据  "failed"=下载出错
+    """
     stocks, worker_id, start_date, end_date, out_dir, done_codes = args
 
     api = _connect_api(worker_id)
@@ -306,6 +402,7 @@ def _worker_daily(args):
         if code in done_codes:
             continue
         # 每只股票最多重试2次
+        last_status = "failed"
         for retry in range(3):
             try:
                 all_bars = []
@@ -314,6 +411,9 @@ def _worker_daily(args):
                     if not bars:
                         break
                     all_bars = bars + all_bars
+                    # 安全终止: 只有当返回的数据量不足一批，或确实触及起始日期时才停止
+                    if len(bars) < 800:
+                        break
                     if bars[0]['datetime'][:10] <= start_date:
                         break
 
@@ -327,9 +427,11 @@ def _worker_daily(args):
                         for b in filtered:
                             w.writerow([b['datetime'][:10], b['open'], b['close'],
                                         b['high'], b['low'], int(b['vol']), b['amount']])
-                    results.append((code, name, len(filtered)))
+                    results.append((code, name, len(filtered), "success"))
                 else:
-                    results.append((code, name, 0))
+                    # API 正常返回但日期范围内确实无数据
+                    results.append((code, name, 0, "empty"))
+                last_status = None  # 标记为成功处理
                 break  # 成功，跳出重试
             except (ConnectionError, OSError, TimeoutError):
                 # 连接断开/超时，重连后重试
@@ -338,10 +440,14 @@ def _worker_daily(args):
                 except ConnectionError:
                     pass
                 if retry == 2:
-                    results.append((code, name, 0))
+                    results.append((code, name, 0, "failed"))
             except Exception:
-                results.append((code, name, 0))
+                results.append((code, name, 0, "failed"))
                 break
+
+        # 兜底: 如果重试全部失败但没记录结果
+        if last_status == "failed" and not any(r[0] == code for r in results):
+            results.append((code, name, 0, "failed"))
 
     try:
         api.disconnect()
@@ -351,7 +457,11 @@ def _worker_daily(args):
 
 
 def _worker_minute(args):
-    """工作进程: 下载分钟线（单个股票失败不影响整体）"""
+    """工作进程: 下载分钟线（单个股票失败不影响整体）
+
+    返回: [(code, name, rows, status), ...]
+      status: "success"=有数据  "empty"=API正常但确实无数据  "failed"=下载出错
+    """
     stocks, worker_id, freq, start_date, end_date, out_dir, done_codes = args
 
     freq_map = {0: '5min', 1: '15min', 4: '1min', 5: '30min', 6: '60min'}
@@ -377,6 +487,9 @@ def _worker_minute(args):
                     if not bars:
                         break
                     all_bars = bars + all_bars
+                    # 安全终止: 返回量不足一批，或确实触及起始日期
+                    if len(bars) < 800:
+                        break
                     try:
                         first_dt = datetime.strptime(bars[0]['datetime'][:10], '%Y-%m-%d')
                         if first_dt <= start_dt:
@@ -401,9 +514,9 @@ def _worker_minute(args):
                         for b in filtered:
                             w.writerow([b['datetime'], b['open'], b['close'],
                                         b['high'], b['low'], int(b['vol']), b['amount']])
-                    results.append((code, name, len(filtered)))
+                    results.append((code, name, len(filtered), "success"))
                 else:
-                    results.append((code, name, 0))
+                    results.append((code, name, 0, "empty"))
                 break  # 成功，跳出重试
             except (ConnectionError, OSError, TimeoutError):
                 try:
@@ -411,9 +524,9 @@ def _worker_minute(args):
                 except ConnectionError:
                     pass
                 if retry == 2:
-                    results.append((code, name, 0))
+                    results.append((code, name, 0, "failed"))
             except Exception:
-                results.append((code, name, 0))
+                results.append((code, name, 0, "failed"))
                 break
 
     try:
@@ -450,7 +563,7 @@ def parallel_download(stocks, worker_fn, out_dir, workers, tracker=None, **extra
             print(f"  📋 断点续传: 已完成 {skipped} 只，剩余 {len(remaining)} 只")
         if not remaining:
             print("  ✅ 全部已完成，无需下载")
-            done_count, with_data, total_rows = tracker.summary()
+            done_count, with_data, total_rows, failed_count = tracker.summary()
             return done_count, done_count - with_data, total_rows, 0
         stocks = remaining
     else:
@@ -496,8 +609,10 @@ def parallel_download(stocks, worker_fn, out_dir, workers, tracker=None, **extra
                         batch_results.append((idx, result))
                         # 实时更新进度追踪
                         if tracker:
-                            for code, name, rows in result:
-                                tracker.mark(code, name, rows)
+                            for item in result:
+                                code, name, rows = item[0], item[1], item[2]
+                                status = item[3] if len(item) > 3 else None
+                                tracker.mark(code, name, rows, status=status)
                             now = time.time()
                             if now - last_save_t >= 5:
                                 tracker.save()
@@ -518,10 +633,13 @@ def parallel_download(stocks, worker_fn, out_dir, workers, tracker=None, **extra
         print("\n\n⚠️  收到中断信号，正在保存进度...")
         if tracker:
             for idx, result in batch_results:
-                for code, name, rows in result:
-                    tracker.mark(code, name, rows)
+                for item in result:
+                    code, name, rows = item[0], item[1], item[2]
+                    status = item[3] if len(item) > 3 else None
+                    tracker.mark(code, name, rows, status=status)
             tracker.save()
-            print(f"  💾 进度已保存: {len(tracker.data['done'])} 只")
+            failed_cnt = sum(1 for v in tracker.data['done'].values() if v.get('status') == 'failed')
+            print(f"  💾 进度已保存: {len(tracker.data['done'])} 只 (其中失败 {failed_cnt} 只将在下次重试)")
         # 强制终止所有子进程（包括卡住的）
         pool.terminate()
         pool.join()
@@ -557,7 +675,9 @@ def parallel_download(stocks, worker_fn, out_dir, workers, tracker=None, **extra
 
     # 合并断点续传的统计
     if tracker:
-        done_count, with_data, tracker_rows = tracker.summary()
+        done_count, with_data, tracker_rows, failed_count = tracker.summary()
+        if failed_count > 0:
+            print(f"  ⚠️  有 {failed_count} 只股票下载失败，下次运行将自动重试")
         return done_count, done_count - with_data, tracker_rows, elapsed
 
     return success, fail, total_rows, elapsed
@@ -572,7 +692,7 @@ PERIOD_DIR = {
     '15m': '15m', '30m': '30m', '60m': '1h',
 }
 
-def run_daily(out_dir, start_date, end_date, workers, no_resume=False):
+def run_daily(out_dir, start_date, end_date, workers, no_resume=False, retry_failed=False):
     print(f"\n{'='*55}")
     print(f"  📊 通达信日线全量下载")
     print(f"  日期: {start_date} → {end_date}  进程: {workers}")
@@ -587,9 +707,18 @@ def run_daily(out_dir, start_date, end_date, workers, no_resume=False):
         print("\n  🔄 --no-resume: 忽略断点，强制重新下载")
     else:
         tracker = ProgressTracker(out, 'daily', start_date, end_date)
-        done_count, _, _ = tracker.summary()
+        done_count, _, _, failed_count = tracker.summary()
+
+        # --retry-failed: 将旧进度中 rows=0 且无 status 的条目重置为 failed
+        if retry_failed and done_count > 0:
+            reset_count = tracker.reset_zero_rows()
+            if reset_count > 0:
+                print(f"\n  🔄 --retry-failed: 已将 {reset_count} 只 rows=0 的条目重置为待重试")
+                # 重新统计
+                done_count, _, _, failed_count = tracker.summary()
+
         if done_count > 0:
-            print(f"\n  💾 检测到断点记录: 已完成 {done_count} 只")
+            print(f"\n  💾 检测到断点记录: 已完成 {done_count} 只 (其中 {failed_count} 只失败待重试)")
 
     print("\n[1/3] 获取A股列表...")
     stocks = get_stock_list()
@@ -611,7 +740,7 @@ def run_daily(out_dir, start_date, end_date, workers, no_resume=False):
     return out
 
 
-def run_minute(out_dir, freq, start_date, end_date, workers, no_resume=False):
+def run_minute(out_dir, freq, start_date, end_date, workers, no_resume=False, retry_failed=False):
     freq_name = {0: '5分钟', 1: '15分钟', 4: '1分钟', 5: '30分钟', 6: '60分钟'}
     fname = {0: '5m', 1: '15m', 4: '1m', 5: '30m', 6: '60m'}
 
@@ -630,9 +759,17 @@ def run_minute(out_dir, freq, start_date, end_date, workers, no_resume=False):
     else:
         type_label = fname.get(freq, f'{freq}m')
         tracker = ProgressTracker(out, type_label, start_date, end_date)
-        done_count, _, _ = tracker.summary()
+        done_count, _, _, failed_count = tracker.summary()
+
+        # --retry-failed: 将旧进度中 rows=0 且无 status 的条目重置为 failed
+        if retry_failed and done_count > 0:
+            reset_count = tracker.reset_zero_rows()
+            if reset_count > 0:
+                print(f"\n  🔄 --retry-failed: 已将 {reset_count} 只 rows=0 的条目重置为待重试")
+                done_count, _, _, failed_count = tracker.summary()
+
         if done_count > 0:
-            print(f"\n  💾 检测到断点记录: 已完成 {done_count} 只")
+            print(f"\n  💾 检测到断点记录: 已完成 {done_count} 只 (其中 {failed_count} 只失败待重试)")
 
     print("\n[1/3] 获取A股列表...")
     stocks = get_stock_list()
@@ -706,6 +843,11 @@ def main():
     ap.add_argument('--output', '-o', default='optimizer_output/CNStock', help='输出目录 (默认 optimizer_output/CNStock)')
     ap.add_argument('--merge', action='store_true', help='合并为单CSV')
     ap.add_argument('--no-resume', action='store_true', help='忽略断点记录，强制重新下载')
+    ap.add_argument('--retry-failed', action='store_true',
+        help='将旧进度中 rows=0 的条目全部重置为 failed 状态，使其在本次运行中被重试。\n'
+             '适用于: 旧版脚本生成的进度文件，下载失败的股票被错误标记为"已完成"。')
+    ap.add_argument('--show-progress', action='store_true',
+        help='仅显示当前进度文件的统计信息，不执行下载。')
 
     args = ap.parse_args()
 
@@ -730,6 +872,23 @@ def main():
 
     print(f"  日期范围: {start_date} → {end_date}\n")
 
+    # --show-progress: 仅显示进度，不下载
+    if args.show_progress:
+        types_to_show = []
+        if args.type == 'all_min':
+            types_to_show = [('1m', 4), ('5m', 0), ('15m', 1), ('30m', 5), ('60m', 6)]
+        elif args.type == '1D':
+            types_to_show = [('daily', None)]
+        else:
+            types_to_show = [(args.type, None)]
+
+        for type_label, _ in types_to_show:
+            dir_name = PERIOD_DIR.get(type_label, type_label)
+            out = os.path.join(args.output, dir_name)
+            tracker = ProgressTracker(out, type_label, start_date, end_date)
+            tracker.show_progress()
+        return
+
     type_map = {
         '1D':  ('daily', None),
         '1m':  ('min', 4),
@@ -742,14 +901,14 @@ def main():
     if args.type == 'all_min':
         # 全部分钟线
         for name, freq in [('1m', 4), ('5m', 0), ('15m', 1), ('30m', 5), ('60m', 6)]:
-            out = run_minute(args.output, freq, start_date, end_date, args.workers, args.no_resume)
+            out = run_minute(args.output, freq, start_date, end_date, args.workers, args.no_resume, args.retry_failed)
             outputs.append((name, out))
     elif args.type == '1D':
-        out = run_daily(args.output, start_date, end_date, args.workers, args.no_resume)
+        out = run_daily(args.output, start_date, end_date, args.workers, args.no_resume, args.retry_failed)
         outputs.append(('1D', out))
     else:
         kind, freq = type_map[args.type]
-        out = run_minute(args.output, freq, start_date, end_date, args.workers, args.no_resume)
+        out = run_minute(args.output, freq, start_date, end_date, args.workers, args.no_resume, args.retry_failed)
         outputs.append((args.type, out))
 
     if args.merge:
