@@ -833,7 +833,13 @@ def merge_all(input_dir, output_file):
     with open(output_file, 'w', newline='', encoding='utf-8-sig') as out:
         header_written = False
         for f in files:
-            with open(f, 'r', encoding='utf-8-sig') as inp:
+            try:
+                with open(f, 'r', encoding='utf-8-sig') as inp:
+                    inp.read(1)
+                inp_enc = 'utf-8-sig'
+            except (UnicodeDecodeError, UnicodeError):
+                inp_enc = 'gbk'
+            with open(f, 'r', encoding=inp_enc) as inp:
                 reader = csv.reader(inp)
                 header = next(reader)
                 if not header_written:
@@ -886,7 +892,14 @@ def _merge_worker(args):
         code = fname.split('_')[0].replace('.csv', '')
 
         try:
-            with open(fpath, 'r', encoding='utf-8-sig') as f:
+            # 自动检测编码：先试 utf-8-sig，失败则 gbk
+            try:
+                with open(fpath, 'r', encoding='utf-8-sig') as f:
+                    f.read(1)
+                open_encoding = 'utf-8-sig'
+            except (UnicodeDecodeError, UnicodeError):
+                open_encoding = 'gbk'
+            with open(fpath, 'r', encoding=open_encoding) as f:
                 reader = csv.DictReader(f)
                 records = []
                 for row in reader:
