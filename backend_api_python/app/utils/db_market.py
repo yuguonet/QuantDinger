@@ -531,6 +531,7 @@ class MarketDBManager:
         cursor.execute("""
             SELECT table_name FROM information_schema.tables
             WHERE table_schema = 'public'
+              AND table_type = 'BASE TABLE'
               AND table_name LIKE %s
             ORDER BY table_name
         """, (f'kline_{source_timeframe}_%',))
@@ -560,7 +561,7 @@ class MarketDBManager:
                         bucket_expr = (
                             f"(((time + {tz}) / 86400) * 86400 - {tz})"
                             f" - (EXTRACT(DOW FROM"
-                            f" TO_TIMESTAMP(time + {tz}) AT TIME ZONE 'UTC')"
+                            f" TO_TIMESTAMP(time + {tz}) AT TIME ZONE 'Asia/Shanghai')"
                             f" ::int - 1 + 7) % 7 * 86400"
                         )
                     else:
@@ -1097,7 +1098,7 @@ class MarketKlineWriter:
             bucket_expr = (
                 f"(((t.time + {tz_offset}) / 86400) * 86400 - {tz_offset})"
                 f" - (EXTRACT(DOW FROM"
-                f" TO_TIMESTAMP(t.time + {tz_offset}) AT TIME ZONE 'UTC')"
+                f" TO_TIMESTAMP(t.time + {tz_offset}) AT TIME ZONE 'Asia/Shanghai')"
                 f" ::int - 1 + 7) % 7 * 86400"
             )
         elif target_tf == "1D":
@@ -1113,6 +1114,7 @@ class MarketKlineWriter:
             cur.execute("""
                 SELECT table_name FROM information_schema.tables
                 WHERE table_schema = 'public'
+                  AND table_type = 'BASE TABLE'
                   AND table_name LIKE %s
                 ORDER BY table_name
             """, (f'kline_{source_tf}_%',))
