@@ -467,8 +467,12 @@ def _worker_init():
             if os.path.isfile(env_path):
                 load_dotenv(env_path, override=False)
                 break
-    except Exception:
-        pass
+        else:
+            print(f"⚠️ 子进程 {os.getpid()}: 未找到 .env 文件")
+    except ImportError:
+        print(f"⚠️ 子进程 {os.getpid()}: python-dotenv 未安装")
+    except Exception as e:
+        print(f"⚠️ 子进程 {os.getpid()}: 加载 .env 失败: {e}")
     import optimizer.strategy_templates_llm   # 确保 LLM 模板注册
     import optimizer.strategy_templates_ashare # 确保 A 股模板注册
     import optimizer.strategy_templates_mine  # 确保自定义中短线模板注册

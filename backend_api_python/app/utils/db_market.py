@@ -289,6 +289,8 @@ class MarketDBManager:
         self._pool_lock = threading.Lock()
         # 数据库存在性缓存（避免每次都连 postgres 系统库查询）
         self._db_exists_cache: Dict[str, bool] = {}
+        # 管理员连接复用（避免每次都新建连接到 postgres 系统库）
+        self._admin_conn_instance = None
 
         logger.info(
             f"MarketDBManager 初始化: "
@@ -322,17 +324,40 @@ class MarketDBManager:
                 pool.close()
 
     def close_all_pools(self):
-        """关闭所有市场库连接池"""
+        """关闭所有市场库连接池 + 管理员连接"""
         with self._pool_lock:
             for pool in self._pools.values():
                 pool.close()
             self._pools.clear()
-            logger.info("所有市场库连接池已关闭")
+        self.close_admin_conn()
+        logger.info("所有市场库连接池已关闭")
+
+    def close_admin_conn(self):
+        """关闭管理员连接"""
+        if self._admin_conn_instance is not None:
+            try:
+                self._admin_conn_instance.close()
+            except Exception:
+                pass
+            self._admin_conn_instance = None
 
     # ---- DDL 操作（直接连接，autocommit） ----
 
     def _admin_conn(self):
-        """获取管理员连接（autocommit，用于 CREATE DATABASE）"""
+        """获取管理员连接（autocommit，复用长连接）"""
+        if self._admin_conn_instance is not None:
+            try:
+                cur = self._admin_conn_instance.cursor()
+                cur.execute("SELECT 1")
+                cur.close()
+                return self._admin_conn_instance
+            except Exception:
+                try:
+                    self._admin_conn_instance.close()
+                except Exception:
+                    pass
+                self._admin_conn_instance = None
+
         import psycopg2
         conn = psycopg2.connect(
             host=self._conn_params["host"],
@@ -343,6 +368,7 @@ class MarketDBManager:
             connect_timeout=10,
         )
         conn.autocommit = True
+        self._admin_conn_instance = conn
         return conn
 
     def market_db_exists(self, market: str) -> bool:
@@ -353,14 +379,12 @@ class MarketDBManager:
         db_name = _market_db_name(resolved)
         try:
             conn = self._admin_conn()
-            try:
-                cur = conn.cursor()
-                cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (db_name,))
-                exists = cur.fetchone() is not None
-                self._db_exists_cache[resolved] = exists
-                return exists
-            finally:
-                conn.close()
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (db_name,))
+            exists = cur.fetchone() is not None
+            cur.close()
+            self._db_exists_cache[resolved] = exists
+            return exists
         except Exception as e:
             logger.error(f"检查数据库 {db_name} 存在性失败: {e}")
             return False
@@ -380,13 +404,12 @@ class MarketDBManager:
         try:
             cur = conn.cursor()
             cur.execute(f'CREATE DATABASE "{db_name}" TEMPLATE template0')
+            cur.close()
             self._db_exists_cache[resolved] = True  # 更新缓存
             logger.info(f"✅ 已创建市场数据库: {db_name}")
         except Exception as e:
             logger.error(f"创建数据库 {db_name} 失败: {e}")
             raise
-        finally:
-            conn.close()
 
         self._init_market_schema(resolved)
         return True
@@ -407,25 +430,25 @@ class MarketDBManager:
                 WHERE datname = %s AND pid != pg_backend_pid()
             """, (db_name,))
             cur.execute(f'DROP DATABASE IF EXISTS "{db_name}"')
+            cur.close()
             self._db_exists_cache.pop(resolved, None)  # 清除缓存
             logger.warning(f"⚠️ 已删除市场数据库: {db_name}")
             return True
-        finally:
-            conn.close()
+        except Exception as e:
+            logger.error(f"删除数据库 {db_name} 失败: {e}")
+            raise
 
     def list_market_dbs(self) -> List[Dict[str, Any]]:
         conn = self._admin_conn()
-        try:
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT datname FROM pg_database
-                WHERE datname LIKE '%_db'
-                  AND datname NOT IN ('template0', 'template1', 'postgres')
-                ORDER BY datname
-            """)
-            db_names = [row[0] for row in cur.fetchall()]
-        finally:
-            conn.close()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT datname FROM pg_database
+            WHERE datname LIKE '%_db'
+              AND datname NOT IN ('template0', 'template1', 'postgres')
+            ORDER BY datname
+        """)
+        db_names = [row[0] for row in cur.fetchall()]
+        cur.close()
 
         result = []
         for db_name in db_names:

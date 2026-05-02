@@ -19,6 +19,7 @@ storage.py — 统一数据读取层（桥接 db_market）
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Optional
 
 # 时间框架 → 目录名映射（与旧 CSV 结构兼容）
@@ -37,20 +38,25 @@ _TF_DIR_MAP = {
 
 def _load_env():
     """加载 .env 文件（优先 backend 目录，其次项目根目录）"""
+    if os.getenv("_STORAGE_ENV_LOADED"):
+        return
     try:
         from dotenv import load_dotenv
-        _this_dir = os.path.dirname(os.path.abspath(__file__))
-        _project_root = os.path.dirname(os.path.dirname(_this_dir))
-        _backend_root = os.path.join(_project_root, "backend_api_python")
-        for env_path in [
-            os.path.join(_backend_root, '.env'),
-            os.path.join(_project_root, '.env'),
-        ]:
-            if os.path.isfile(env_path):
-                load_dotenv(env_path, override=False)
-                break
-    except Exception:
-        pass
+    except ImportError:
+        print("⚠️ python-dotenv 未安装，无法加载 .env 文件 (pip install python-dotenv)")
+        return
+    _this_dir = os.path.dirname(os.path.abspath(__file__))
+    _project_root = os.path.dirname(os.path.dirname(_this_dir))
+    _backend_root = os.path.join(_project_root, "backend_api_python")
+    for env_path in [
+        os.path.join(_backend_root, '.env'),
+        os.path.join(_project_root, '.env'),
+    ]:
+        if os.path.isfile(env_path):
+            load_dotenv(env_path, override=False)
+            os.environ["_STORAGE_ENV_LOADED"] = "1"
+            return
+    print(f"⚠️ 未找到 .env 文件（已检查: backend_api_python/.env, 项目根/.env）")
 
 
 def _get_writer():
