@@ -29,13 +29,13 @@
 
 修复模式 (--repair):
   与 check_continuity.py 联动，逐只股票修复已下载数据中的断裂和坏数据。
-  流程: 检测断裂 → 逐只股票处理（akshare优先(日线) → 通达信兜底 → 验证 → 清理报表）
+  数据直接写入 db_market，不做 CSV 写操作。
+  流程: 检测断裂 → 逐只股票处理（停牌填充→akshare/通达信下载→验证→清理报表）
 
   python tdx_download.py -T 1D --repair              # 检测+修复日线断裂
   python tdx_download.py -T 15m --repair              # 检测+修复15分钟线断裂
   python tdx_download.py -T 1D --repair --dry-run     # 仅检测，不下载不写库
   python tdx_download.py -T 1D --repair --symbol 600519  # 单只股票修复
-  python tdx_download.py -T 1D --repair --from-report    # 直接读库中已有的gap报告（跳过检测）
   python tdx_download.py -T 1D --repair --workers 10     # 10进程并行修复
   python tdx_download.py -T 1D --repair --no-fallback    # 禁用akshare（仅用通达信）
 
@@ -1066,13 +1066,11 @@ def merge_to_db(input_dir, data_type, workers=4, db_url=None):
 # ═══════════════════════════════════════════════════════
 #
 # 设计思路:
-#   1. 检测阶段: 调用 check_continuity 的逻辑，得到每只股票的 gap 列表
-#      - 或者直接从 db 的 data_issue_report 表读取已有报告 (--from-report)
-#   2. 下载阶段: 对每个 gap，按 gap_start_date ~ gap_end_date 从通达信重新拉取
-#      - 1D:  拉取日线，只保留缺失日期的数据
-#      - 15m: 拉取分钟线，只保留缺失 bar 的数据
-#   3. 合并阶段: 将补下的数据与已有 CSV 合并（去重、排序），或直接写入 db_market
-#   4. 标记阶段: 在 data_issue_report 中标记已修复的 gap (resolved=TRUE)
+#   1. 检测阶段: 从 db 的 data_issue_report 读取 gap 列表（fallback 本地 CSV 检测）
+#   2. 停牌处理: 查百度停牌数据，停牌期间用最后收盘价填充，直接 INSERT db
+#   3. 下载阶段: 非停牌 gap 从 akshare(日线) 或通达信(分钟线) 下载，直接写入 db
+#   4. 验证阶段: 重新检测，确认已修复的 gap 从 data_issue_report 删除
+#   5. 未修好的留在表中，下次再修
 #
 # 依赖:
 #   - check_continuity.py (同目录)
@@ -1192,125 +1190,6 @@ def _repair_load_gaps_from_db(market, timeframe_filter=None, symbol_filter=None)
 
 # --- 从本地 CSV 检测 gap（不依赖数据库）---
 
-def _repair_detect_gaps_from_csv(csv_dir, timeframe, today=None):
-    """扫描 CSV 目录，用 check_continuity 的逻辑检测 gap
-
-    Args:
-        csv_dir: CSV 文件目录（如 optimizer_output/CNStock/daily）
-        timeframe: "1D" 或 "15m"
-        today: 今天日期，默认自动取
-
-    Returns:
-        list of dict: gap 列表（同 check_continuity 的输出格式）
-    """
-    import glob
-
-    if today is None:
-        today = _dt_repair.now(_TZ_SH_REPAIR).strftime("%Y-%m-%d")
-
-    # 导入 check_continuity 的检测函数
-    _co_dir = os.path.dirname(os.path.abspath(__file__))
-    sys.path.insert(0, _co_dir)
-    from check_continuity import check_1d_gaps, check_15m_gaps, _build_trading_day_cache
-    _build_trading_day_cache()
-
-    csv_files = sorted(glob.glob(os.path.join(csv_dir, "*.csv")))
-    if not csv_files:
-        print(f"  ⚠️  目录下无 CSV: {csv_dir}")
-        return []
-
-    all_gaps = []
-    for fpath in csv_files:
-        fname = os.path.basename(fpath)
-        if fname.startswith("_"):  # 跳过 _progress.json 等
-            continue
-        code = fname.split("_")[0].replace(".csv", "")
-
-        # 读取 CSV 为 records 格式
-        records = []
-        try:
-            with open(fpath, "r", encoding="utf-8-sig") as f:
-                reader = _csv_repair.DictReader(f)
-                for row in reader:
-                    dt_str = row.get("date") or row.get("datetime", "")
-                    if not dt_str:
-                        continue
-                    dt = None
-                    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
-                        try:
-                            dt = _dt_repair.strptime(dt_str.strip(), fmt)
-                            break
-                        except ValueError:
-                            continue
-                    if dt is None:
-                        continue
-                    ts = int(dt.timestamp())
-                    records.append({
-                        "time": ts,
-                        "open": float(row.get("open", 0)),
-                        "high": float(row.get("high", 0)),
-                        "low": float(row.get("low", 0)),
-                        "close": float(row.get("close", 0)),
-                        "volume": float(row.get("volume", 0)),
-                    })
-        except Exception as e:
-            print(f"  ⚠️  读取失败 {fname}: {e}")
-            continue
-
-        if len(records) < 2:
-            continue
-
-        if timeframe == "1D":
-            gaps = check_1d_gaps(code, records, today)
-        elif timeframe == "15m":
-            gaps = check_15m_gaps(code, records, today)
-        else:
-            # 其他分钟线用简化检测（只查跨天 gap）
-            gaps = _repair_check_minute_gaps_simple(code, records, today, timeframe)
-
-        all_gaps.extend(gaps)
-
-    return all_gaps
-
-
-def _repair_check_minute_gaps_simple(symbol, records, today, timeframe):
-    """简化版分钟线 gap 检测（仅检测跨天缺失）"""
-    from check_continuity import _trading_days_between, _ts_to_date, _next_day, _prev_day
-    from check_continuity import _expected_1d_ts_between
-
-    gaps = []
-    ts_list = sorted(r["time"] for r in records)
-    dates = [_ts_to_date(t) for t in ts_list]
-
-    for i in range(1, len(dates)):
-        if dates[i] == dates[i - 1]:
-            continue
-        skipped = _trading_days_between(dates[i - 1], dates[i])
-        if skipped > 0:
-            gaps.append({
-                "symbol": symbol, "timeframe": timeframe, "gap_type": "middle",
-                "start_date": _next_day(dates[i - 1]),
-                "end_date": _prev_day(dates[i]),
-                "expected_ts": _expected_1d_ts_between(dates[i - 1], dates[i]),
-            })
-
-    last_date = dates[-1]
-    if last_date < today:
-        trailing = _trading_days_between(last_date, today)
-        if _repair_is_trading_day(today):
-            trailing += 1
-        if trailing > 0:
-            gaps.append({
-                "symbol": symbol, "timeframe": timeframe, "gap_type": "tail",
-                "start_date": _next_day(last_date),
-                "end_date": today,
-                "expected_ts": [],
-            })
-    return gaps
-
-
-# --- 单只股票的修复下载 ---
-
 def _repair_fetch_bars(api, market, code, freq, start_date, end_date):
     """从通达信拉取指定日期范围的 K 线数据
 
@@ -1344,12 +1223,17 @@ def _repair_fetch_bars(api, market, code, freq, start_date, end_date):
             pass
 
     # 过滤目标日期范围
+    is_daily = (freq == 9)
     filtered = []
     for b in all_bars:
         try:
             dt_str = b["datetime"][:10]
             if start_date <= dt_str <= end_date:
                 dt = _dt_repair.strptime(b["datetime"][:16], "%Y-%m-%d %H:%M")
+                # 日线: 通达信返回 15:00 时间戳，但 check_continuity 用 00:00
+                # 必须归一化到午夜，否则 expected_ts_set 过滤永远不匹配
+                if is_daily:
+                    dt = dt.replace(hour=0, minute=0, second=0)
                 ts = int(dt.timestamp())
                 filtered.append({
                     "time": ts,
@@ -1367,19 +1251,17 @@ def _repair_fetch_bars(api, market, code, freq, start_date, end_date):
 
 
 def _repair_worker(args):
-    """修复工作进程
+    """修复工作进程 — 始终写入 db_market
 
     Args:
-        args: (task_list, worker_id, freq, out_dir, mode)
-            task_list: [(code, market_int, gap_list), ...]  — market_int 内嵌在每个 task 中
+        args: (task_list, worker_id, freq)
+            task_list: [(code, market_int, gap_list), ...]
             freq: 通达信频率码
-            out_dir: CSV 输出目录
-            mode: "csv" 或 "db"
 
     Returns:
         (worker_id, repaired_count, failed_count, total_bars, error_msgs)
     """
-    task_list, worker_id, freq, out_dir, mode = args
+    task_list, worker_id, freq = args
 
     # 建立连接
     api = _connect_api(worker_id)
@@ -1390,17 +1272,15 @@ def _repair_worker(args):
     errors = []
     result_gaps_remaining = []  # 数据源缺失的 gap（无法修复）
 
-    # db 写入器（按需初始化）
-    writer = None
-    if mode == "db":
-        import sys as _sys
-        import os as _os
-        _proj = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
-        _be = _os.path.join(_proj, "backend_api_python")
-        if _be not in _sys.path:
-            _sys.path.insert(0, _be)
-        from app.utils.db_market import get_market_kline_writer
-        writer = get_market_kline_writer()
+    # 初始化 db writer
+    import sys as _sys
+    import os as _os
+    _proj = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    _be = _os.path.join(_proj, "backend_api_python")
+    if _be not in _sys.path:
+        _sys.path.insert(0, _be)
+    from app.utils.db_market import get_market_kline_writer
+    writer = get_market_kline_writer()
 
     for code, market_int, gaps in task_list:
         try:
@@ -1437,28 +1317,21 @@ def _repair_worker(args):
                     result_gaps_remaining.append(g)
                 continue
 
-            if mode == "csv":
-                # 合并写入 CSV
-                _repair_merge_csv(code, bars, out_dir, freq)
-                total_bars += len(bars)
-            elif mode == "db" and writer:
-                # 直接写入 db_market
-                timeframe_map = {9: "1D", 1: "15m", 4: "1m", 0: "5m", 5: "30m", 6: "60m"}
-                tf = timeframe_map.get(freq, f"{freq}m")
-                records = []
-                for b in bars:
-                    records.append({
-                        "symbol": code,
-                        "timeframe": tf,
-                        "time": b["time"],
-                        "open": b["open"],
-                        "high": b["high"],
-                        "low": b["low"],
-                        "close": b["close"],
-                        "volume": b["volume"],
-                    })
-                result = writer.bulk_write("CNStock", records, batch_size=5000)
-                total_bars += result.get("inserted", 0)
+            # 直接写入 db_market
+            timeframe_map = {9: "1D", 1: "15m", 4: "1m", 0: "5m", 5: "30m", 6: "60m"}
+            tf = timeframe_map.get(freq, f"{freq}m")
+            records = [{
+                "symbol": code,
+                "timeframe": tf,
+                "time": b["time"],
+                "open": b["open"],
+                "high": b["high"],
+                "low": b["low"],
+                "close": b["close"],
+                "volume": b["volume"],
+            } for b in bars]
+            result = writer.bulk_write("CNStock", records, batch_size=5000)
+            total_bars += result.get("inserted", 0)
 
             repaired += 1
 
@@ -1479,103 +1352,7 @@ def _repair_worker(args):
     except Exception:
         pass
 
-    return (worker_id, repaired, failed, total_bars, errors)
-
-
-def _repair_merge_csv(code, new_bars, out_dir, freq):
-    """将修复数据合并到已有的 CSV 文件
-
-    策略: 读取已有 CSV → 合并新数据（去重，以 time 为 key）→ 排序 → 回写
-    """
-    freq_map = {9: "daily", 1: "15m", 4: "1m", 0: "5m", 5: "30m", 6: "60m"}
-    subdir = freq_map.get(freq, f"{freq}m")
-    target_dir = os.path.join(out_dir, subdir)
-    os.makedirs(target_dir, exist_ok=True)
-
-    # 查找已有文件
-    existing_path = None
-    for suffix in ("", f"_{subdir}"):
-        candidate = os.path.join(target_dir, f"{code}{suffix}.csv")
-        if os.path.exists(candidate):
-            existing_path = candidate
-            break
-
-    # 合并
-    merged = {}  # time -> bar_dict
-
-    # 读取已有数据
-    if existing_path:
-        try:
-            with open(existing_path, "r", encoding="utf-8-sig") as f:
-                reader = _csv_repair.DictReader(f)
-                for row in reader:
-                    dt_str = row.get("date") or row.get("datetime", "")
-                    if not dt_str:
-                        continue
-                    dt = None
-                    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
-                        try:
-                            dt = _dt_repair.strptime(dt_str.strip(), fmt)
-                            break
-                        except ValueError:
-                            continue
-                    if dt is None:
-                        continue
-                    ts = int(dt.timestamp())
-                    merged[ts] = {
-                        "datetime": dt_str.strip(),
-                        "open": float(row.get("open", 0)),
-                        "close": float(row.get("close", 0)),
-                        "high": float(row.get("high", 0)),
-                        "low": float(row.get("low", 0)),
-                        "volume": int(float(row.get("volume", 0))),
-                        "amount": float(row.get("amount", 0)),
-                    }
-        except Exception as e:
-            print(f"  ⚠️  读取 {existing_path} 失败: {e}")
-
-    # 写入新数据（覆盖同时间戳的旧数据）
-    for b in new_bars:
-        dt_str = _dt_repair.fromtimestamp(b["time"], tz=_TZ_SH_REPAIR).strftime(
-            "%Y-%m-%d" if freq == 9 else "%Y-%m-%d %H:%M"
-        )
-        merged[b["time"]] = {
-            "datetime": dt_str,
-            "open": b["open"],
-            "close": b["close"],
-            "high": b["high"],
-            "low": b["low"],
-            "volume": b["volume"],
-            "amount": b.get("amount", 0),
-        }
-
-    # 排序回写
-    out_path = existing_path or os.path.join(target_dir, f"{code}.csv")
-    with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
-        if freq == 9:
-            fields = ["date", "open", "close", "high", "low", "volume", "amount"]
-            w = _csv_repair.DictWriter(f, fieldnames=fields)
-            w.writeheader()
-            for ts in sorted(merged.keys()):
-                row = merged[ts]
-                w.writerow({
-                    "date": row["datetime"][:10],
-                    "open": row["open"], "close": row["close"],
-                    "high": row["high"], "low": row["low"],
-                    "volume": row["volume"], "amount": row["amount"],
-                })
-        else:
-            fields = ["datetime", "open", "close", "high", "low", "volume", "amount"]
-            w = _csv_repair.DictWriter(f, fieldnames=fields)
-            w.writeheader()
-            for ts in sorted(merged.keys()):
-                row = merged[ts]
-                w.writerow({
-                    "datetime": row["datetime"],
-                    "open": row["open"], "close": row["close"],
-                    "high": row["high"], "low": row["low"],
-                    "volume": row["volume"], "amount": row["amount"],
-                })
+    return (worker_id, repaired, failed, total_bars, errors, result_gaps_remaining)
 
 
 # --- 验证修复结果：重新检测，找出确实被修复的 gap ---
@@ -1632,15 +1409,16 @@ def _repair_fetch_akshare(code, start_date, end_date, timeframe="1D"):
         return []
 
 
-def _repair_fallback_akshare(remaining_gaps, out_dir, data_type, today=None):
-    """对通达信修不了的 gap，用 akshare 前复权数据补数
+def _repair_fallback_akshare(remaining_gaps, data_type, writer, market="CNStock", today=None):
+    """对通达信修不了的 gap，用 akshare 前复权数据补数，直接写入 db
 
     只处理 1D gap（akshare 不支持分钟线前复权）。
 
     Args:
         remaining_gaps: 通达信修复后仍存在的 gap 列表
-        out_dir: CSV 输出目录
         data_type: "1D" / "15m" / ...
+        writer: kline writer
+        market: 市场名
         today: 今天日期
 
     Returns:
@@ -1691,33 +1469,42 @@ def _repair_fallback_akshare(remaining_gaps, out_dir, data_type, today=None):
             still_remaining.extend(gaps)
             continue
 
-        # 合并到 CSV
-        _repair_merge_csv(code, bars, out_dir, 9)  # 9 = 日线
-        fixed.extend(gaps)
+        # 写入 db
+        records = [{
+            "symbol": code,
+            "timeframe": "1D",
+            "time": b["time"],
+            "open": b["open"],
+            "high": b["high"],
+            "low": b["low"],
+            "close": b["close"],
+            "volume": b["volume"],
+        } for b in bars]
+        result = writer.bulk_write(market, records, batch_size=5000)
+        if result.get("inserted", 0) > 0:
+            fixed.extend(gaps)
+        else:
+            still_remaining.extend(gaps)
 
     return len(fixed), len(still_remaining), fixed, still_remaining
 
 
-def _repair_verify_fixed(csv_dir, data_type, original_gaps, today=None):
-    """修复下载后重新检测，与原始 gap 对比，返回确实被修复的 gap 列表
+def _repair_verify_fixed(writer, market, data_type, original_gaps, today=None):
+    """修复后从 db 重新检测，与原始 gap 对比，返回确实被修复的 gap 列表
 
     Args:
-        csv_dir: CSV 目录
+        writer: kline writer
+        market: 市场名
         data_type: "1D" / "15m" / ...
         original_gaps: 修复前检测到的 gap 列表
         today: 今天日期
 
     Returns:
         (fixed_gaps, remaining_gaps)
-        - fixed_gaps:   重新检测后消失的 gap（确实被修复了）
-        - remaining_gaps: 仍然存在的 gap（修复失败或数据源缺失）
     """
-    import glob
-
     if today is None:
         today = _dt_repair.now(_TZ_SH_REPAIR).strftime("%Y-%m-%d")
 
-    # 只重新检测涉及到的 CSV 文件
     affected_symbols = set(g["symbol"] for g in original_gaps)
 
     # 导入检测函数
@@ -1727,85 +1514,37 @@ def _repair_verify_fixed(csv_dir, data_type, original_gaps, today=None):
     from check_continuity import check_1d_gaps, check_15m_gaps, _build_trading_day_cache
     _build_trading_day_cache()
 
-    # 重新检测，只扫受影响的股票
-    new_gap_keys = set()  # (symbol, timeframe, gap_type, gap_start_date, gap_end_date)
-    verified_symbols = set()  # 成功读取并重新检测的股票
-    subdir = PERIOD_DIR.get(data_type, data_type)
-    target_dir = os.path.join(csv_dir, subdir)
+    # 从 db 重新检测受影响的股票
+    new_gap_keys = set()
+    verified_symbols = set()
 
     for code in affected_symbols:
-        # 找到该股票的 CSV 文件
-        csv_path = None
-        for suffix in ("", f"_{subdir}"):
-            candidate = os.path.join(target_dir, f"{code}{suffix}.csv")
-            if os.path.exists(candidate):
-                csv_path = candidate
-                break
-        if not csv_path:
-            # CSV 不存在 = 修复失败或从未下载，跳过验证
-            continue
-
-        # 读取 CSV
-        records = []
         try:
-            with open(csv_path, "r", encoding="utf-8-sig") as f:
-                reader = _csv_repair.DictReader(f)
-                for row in reader:
-                    dt_str = row.get("date") or row.get("datetime", "")
-                    if not dt_str:
-                        continue
-                    dt = None
-                    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
-                        try:
-                            dt = _dt_repair.strptime(dt_str.strip(), fmt)
-                            break
-                        except ValueError:
-                            continue
-                    if dt is None:
-                        continue
-                    ts = int(dt.timestamp())
-                    records.append({
-                        "time": ts,
-                        "open": float(row.get("open", 0)),
-                        "high": float(row.get("high", 0)),
-                        "low": float(row.get("low", 0)),
-                        "close": float(row.get("close", 0)),
-                        "volume": float(row.get("volume", 0)),
-                    })
+            if data_type == "1D":
+                records = writer.query(market, code, "1D", limit=0)
+                if records:
+                    for ng in check_1d_gaps(code, records, today):
+                        new_gap_keys.add((ng["symbol"], ng["timeframe"], ng["gap_type"],
+                                          ng["start_date"], ng["end_date"]))
+                    verified_symbols.add(code)
+            elif data_type == "15m":
+                records = writer.query(market, code, "15m", limit=0)
+                if records:
+                    for ng in check_15m_gaps(code, records, today):
+                        new_gap_keys.add((ng["symbol"], ng["timeframe"], ng["gap_type"],
+                                          ng["start_date"], ng["end_date"]))
+                    verified_symbols.add(code)
         except Exception:
-            continue
+            pass
 
-        if len(records) < 2:
-            continue
-
-        # 重新检测
-        if data_type == "1D":
-            new_gaps = check_1d_gaps(code, records, today)
-        elif data_type == "15m":
-            new_gaps = check_15m_gaps(code, records, today)
-        else:
-            new_gaps = _repair_check_minute_gaps_simple(code, records, today, data_type)
-
-        for ng in new_gaps:
-            new_gap_keys.add((
-                ng["symbol"], ng["timeframe"], ng["gap_type"],
-                ng["start_date"], ng["end_date"],
-            ))
-
-        # 标记该股票已成功验证
-        verified_symbols.add(code)
-
-    # 对比：只有成功验证过的 symbol 才做对比
-    # 未验证的 symbol（CSV 不存在/读取失败）→ gap 全部归入 remaining
+    # 对比
     fixed = []
     remaining = []
     for g in original_gaps:
         if g["symbol"] not in verified_symbols:
-            # 无法验证，保守归入 remaining
             remaining.append(g)
             continue
-        key = (g["symbol"], g["timeframe"], g["gap_type"],
-               g["start_date"], g["end_date"])
+        key = (g["symbol"], g["timeframe"], g["gap_type"], g["start_date"], g["end_date"])
         if key in new_gap_keys:
             remaining.append(g)
         else:
@@ -1883,89 +1622,64 @@ def _repair_check_suspend_baidu(code, gap_start, gap_end):
                 suspend_start = str(row.get("停牌时间", ""))[:10]
                 resume_date = str(row.get("复牌时间", ""))[:10]
                 reason = str(row.get("停牌事项说明", ""))
-                # 复牌日期必须覆盖 gap 结束日期才算是这段 gap 的停牌
-                if resume_date and resume_date <= gap_end:
-                    return None  # 复牌太早，不覆盖整个 gap
-                return {
-                    "suspend_start": suspend_start,
-                    "resume_date": resume_date,
-                    "reason": reason,
-                }
+                # gap 必须完全落在停牌期间内才填充
+                # 条件：停牌开始 <= gap开始 且 复牌日 >= gap结束
+                if suspend_start and suspend_start <= gap_start:
+                    # 复牌日为空表示尚未复牌，或复牌日 >= gap结束 → 整个 gap 在停牌期间
+                    if not resume_date or resume_date >= gap_end:
+                        return {
+                            "suspend_start": suspend_start,
+                            "resume_date": resume_date or "",
+                            "reason": reason,
+                        }
+                # 否则：停牌不覆盖整个 gap，视为正常 gap（尝试下载）
+                return None
         return None
     except Exception:
         return None
 
 
-def _repair_fill_suspend(code, gaps, out_dir, freq):
-    """用停牌前最后收盘价填充停牌期间的数据
+def _repair_fill_suspend(code, gaps, freq, writer, market="CNStock"):
+    """用停牌前最后收盘价填充停牌期间的数据，直接写入数据库
 
-    对每个 gap：读取 CSV 中 gap 前最后一条数据的 close，
-    然后为 expected_ts 中每个时间戳生成一条数据：
-      open=close=high=low=last_close, volume=0, amount=0
+    停牌期间无交易数据 → 直接 INSERT，量=0，价=停牌前最后收盘价。
+    last_close 从 db 的 kline 表查询。
 
     Args:
         code: 股票代码
         gaps: 该股票的 gap 列表（已确认为停牌）
-        out_dir: 父目录 (如 optimizer_output/CNStock)
         freq: 通达信频率码
+        writer: kline writer（必传）
+        market: 市场名
 
     Returns:
         (filled_count, total_bars)
     """
-    freq_map = {9: "daily", 1: "15m", 4: "1m", 0: "5m", 5: "30m", 6: "60m"}
-    subdir = freq_map.get(freq, f"{freq}m")
-    is_daily = (freq == 9)
-
-    # 找到 CSV 文件，读取停牌前最后一条数据
-    target_dir = os.path.join(out_dir, subdir)
-    csv_path = None
-    for suffix in ("", f"_{subdir}"):
-        candidate = os.path.join(target_dir, f"{code}{suffix}.csv")
-        if os.path.exists(candidate):
-            csv_path = candidate
-            break
-
-    if not csv_path:
+    if not writer:
         return 0, 0
 
-    # 读取全部已有数据，按时间排序
-    existing = {}  # ts -> row_dict
+    timeframe_map = {9: "1D", 1: "15m", 4: "1m", 0: "5m", 5: "30m", 6: "60m"}
+    timeframe = timeframe_map.get(freq, f"{freq}m")
+
+    # ── 从 db 查 last_close ──
+    existing = {}  # ts -> close
     try:
-        with open(csv_path, "r", encoding="utf-8-sig") as f:
-            reader = _csv_repair.DictReader(f)
-            for row in reader:
-                dt_str = row.get("date") or row.get("datetime", "")
-                if not dt_str:
-                    continue
-                dt = None
-                for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
-                    try:
-                        dt = _dt_repair.strptime(dt_str.strip(), fmt)
-                        break
-                    except ValueError:
-                        continue
-                if dt is None:
-                    continue
-                ts = int(dt.timestamp())
-                existing[ts] = {
-                    "datetime": dt_str.strip(),
-                    "open": float(row.get("open", 0)),
-                    "close": float(row.get("close", 0)),
-                    "high": float(row.get("high", 0)),
-                    "low": float(row.get("low", 0)),
-                    "volume": int(float(row.get("volume", 0))),
-                    "amount": float(row.get("amount", 0)),
-                }
+        rows = writer.query(market, code, timeframe, limit=10)
+        if rows:
+            for r in rows:
+                existing[r["time"]] = r.get("close", 0)
     except Exception:
-        return 0, 0
+        pass
 
     if not existing:
         return 0, 0
 
-    # 为每个 gap 生成填充数据
+    sorted_ts = sorted(existing.keys())
+
+    # ── 为每个 gap 生成填充数据，直接 INSERT ──
     filled_count = 0
     total_bars = 0
-    sorted_ts = sorted(existing.keys())
+    all_records = []
 
     for g in gaps:
         expected_ts_list = g.get("expected_ts", [])
@@ -1977,66 +1691,40 @@ def _repair_fill_suspend(code, gaps, out_dir, freq):
         last_close = None
         for ts in reversed(sorted_ts):
             if ts < gap_first_ts:
-                last_close = existing[ts]["close"]
+                last_close = existing[ts]
                 break
         if last_close is None:
-            # 没有 gap 前的数据，用 gap 后第一条
             for ts in sorted_ts:
                 if ts > max(expected_ts_list):
-                    last_close = existing[ts]["open"]
+                    last_close = existing[ts]
                     break
         if last_close is None:
             continue
 
-        # 为每个 expected_ts 生成填充行
         for ts in expected_ts_list:
-            if is_daily:
-                dt_str = _dt_repair.fromtimestamp(ts, tz=_TZ_SH_REPAIR).strftime("%Y-%m-%d")
-            else:
-                dt_str = _dt_repair.fromtimestamp(ts, tz=_TZ_SH_REPAIR).strftime("%Y-%m-%d %H:%M")
-            existing[ts] = {
-                "datetime": dt_str,
+            all_records.append({
+                "symbol": code,
+                "timeframe": timeframe,
+                "time": ts,
                 "open": last_close,
-                "close": last_close,
                 "high": last_close,
                 "low": last_close,
+                "close": last_close,
                 "volume": 0,
-                "amount": 0,
-            }
+            })
             total_bars += 1
         filled_count += 1
 
-    # 排序回写 CSV
-    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
-        if is_daily:
-            fields = ["date", "open", "close", "high", "low", "volume", "amount"]
-            w = _csv_repair.DictWriter(f, fieldnames=fields)
-            w.writeheader()
-            for ts in sorted(existing.keys()):
-                row = existing[ts]
-                w.writerow({
-                    "date": row["datetime"][:10],
-                    "open": row["open"], "close": row["close"],
-                    "high": row["high"], "low": row["low"],
-                    "volume": row["volume"], "amount": row["amount"],
-                })
-        else:
-            fields = ["datetime", "open", "close", "high", "low", "volume", "amount"]
-            w = _csv_repair.DictWriter(f, fieldnames=fields)
-            w.writeheader()
-            for ts in sorted(existing.keys()):
-                row = existing[ts]
-                w.writerow({
-                    "datetime": row["datetime"],
-                    "open": row["open"], "close": row["close"],
-                    "high": row["high"], "low": row["low"],
-                    "volume": row["volume"], "amount": row["amount"],
-                })
+    if all_records:
+        result = writer.bulk_write(market, all_records, batch_size=5000)
+        inserted = result.get("inserted", 0)
+        if inserted == 0:
+            return 0, 0
 
     return filled_count, total_bars
 
 
-def _repair_single_stock(code, gaps, freq, out_dir, mode, market, no_fallback, dry_run, today):
+def _repair_single_stock(code, gaps, freq, out_dir, market, no_fallback, dry_run, today):
     """逐只股票修复：先查停牌 → 停牌补数据 → 非停牌走 akshare/tdx → 验证 → 清理
 
     流程:
@@ -2049,8 +1737,7 @@ def _repair_single_stock(code, gaps, freq, out_dir, mode, market, no_fallback, d
         code: 股票代码
         gaps: 该股票的 gap 列表
         freq: 通达信频率码
-        out_dir: CSV 输出目录
-        mode: "csv" 或 "db"
+        out_dir: 数据目录
         market: 市场名
         no_fallback: 禁用 akshare（强制全走通达信）
         dry_run: 仅检测不下载
@@ -2074,44 +1761,39 @@ def _repair_single_stock(code, gaps, freq, out_dir, mode, market, no_fallback, d
         result["remaining_gaps"] = gaps
         return result
 
-    # 确定目录和数据类型
+    # 确定数据类型
     freq_to_dir = {9: "daily", 1: "15m", 4: "1m", 0: "5m", 5: "30m", 6: "60m"}
     subdir = freq_to_dir.get(freq, f"{freq}m")
-    csv_dir = os.path.join(out_dir, subdir)
     data_type = subdir
 
+    # 初始化 db writer
+    _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _backend_root = os.path.join(_project_root, "backend_api_python")
+    if _backend_root not in sys.path:
+        sys.path.insert(0, _backend_root)
+    from app.utils.db_market import get_market_kline_writer
+    writer = get_market_kline_writer()
+
     # ══════════════════════════════════════════════
-    # 第一步: 查停牌（取第一个 gap 的开始日期查询）
+    # 第一步: 逐个 gap 查停牌
     # ══════════════════════════════════════════════
-    suspend_info = None
     suspend_gaps = []
     normal_gaps = []
 
-    # 用最早 gap 的开始日期查询停牌
-    earliest_gap = min(gaps, key=lambda g: g["start_date"])
-    latest_gap_end = max(gaps, key=lambda g: g["end_date"])["end_date"]
-
-    suspend_info = _repair_check_suspend_baidu(code, earliest_gap["start_date"], latest_gap_end)
-
-    if suspend_info:
-        # 有停牌记录，检查哪些 gap 落在停牌期间内
-        resume_date = suspend_info["resume_date"]
-        for g in gaps:
-            # gap 结束日期在复牌日之前或等于复牌日 → 属于停牌期间
-            if g["end_date"] <= resume_date:
-                suspend_gaps.append(g)
-            else:
-                normal_gaps.append(g)
-        if suspend_gaps:
+    for g in gaps:
+        suspend_info = _repair_check_suspend_baidu(code, g["start_date"], g["end_date"])
+        if suspend_info:
+            suspend_gaps.append(g)
             result["suspended"] = True
-    else:
-        normal_gaps = gaps
+        else:
+            normal_gaps.append(g)
 
     # ══════════════════════════════════════════════
     # 第二步: 停牌 gap → 用最后收盘价填充
     # ══════════════════════════════════════════════
     if suspend_gaps:
-        filled, bars = _repair_fill_suspend(code, suspend_gaps, out_dir, freq)
+        filled, bars = _repair_fill_suspend(code, suspend_gaps, freq,
+                                             writer=writer, market=market)
         if filled > 0:
             result["repaired"] += filled
             result["bars"] += bars
@@ -2130,7 +1812,7 @@ def _repair_single_stock(code, gaps, freq, out_dir, mode, market, no_fallback, d
     # 日线 → akshare 优先
     if gaps_1d and not no_fallback:
         ak_fixed_n, ak_remaining_n, ak_fixed_g, ak_remaining_g = \
-            _repair_fallback_akshare(gaps_1d, out_dir, "1D", today)
+            _repair_fallback_akshare(gaps_1d, "1D", writer, market, today)
         if ak_fixed_n > 0:
             result["repaired"] += ak_fixed_n
             result["fixed_gaps"].extend(ak_fixed_g)
@@ -2147,18 +1829,23 @@ def _repair_single_stock(code, gaps, freq, out_dir, mode, market, no_fallback, d
     if tdx_gaps:
         market_int = 1 if code.startswith(("60", "68")) else 0
         task_list = [(code, market_int, tdx_gaps)]
-        worker_args = (task_list, 0, freq, out_dir, mode)
-        _, repaired, failed, total_bars, errors = _repair_worker(worker_args)
+        worker_args = (task_list, 0, freq)
+        _, repaired, failed, total_bars, errors, tdx_remaining = _repair_worker(worker_args)
 
         result["repaired"] += repaired
         result["failed"] += failed
         result["bars"] += total_bars
         result["errors"].extend(errors)
 
-        # 验证通达信修复结果
-        fixed_gaps, remaining_gaps = _repair_verify_fixed(out_dir, data_type, tdx_gaps, today)
-        result["fixed_gaps"].extend(fixed_gaps)
-        remaining_after_repair = remaining_gaps
+        # 验证：下载成功的 gap 从 db 重新检测确认
+        # tdx_remaining: 数据源缺失，根本没下到的 gap
+        attempted_gaps = [g for g in tdx_gaps if g not in tdx_remaining]
+        if attempted_gaps:
+            fixed_gaps, still_broken = _repair_verify_fixed(writer, market, data_type, attempted_gaps, today)
+            result["fixed_gaps"].extend(fixed_gaps)
+            remaining_after_repair = tdx_remaining + still_broken
+        else:
+            remaining_after_repair = tdx_remaining
 
     result["remaining_gaps"] = remaining_after_repair
 
@@ -2176,23 +1863,20 @@ def _repair_single_stock(code, gaps, freq, out_dir, mode, market, no_fallback, d
 
 
 def run_repair(data_type, out_dir, workers=5, dry_run=False, symbol=None,
-               from_report=False, market="CNStock", db_url=None, mode="csv",
-               no_fallback=False):
-    """主修复入口 — 逐只股票模式：下一只股修一只股
+               market="CNStock", db_url=None, no_fallback=False):
+    """主修复入口 — 逐只股票模式
 
-    流程: 全局检测 gap → 按股票分组 → 逐只股票处理（下载→验证→换源→清理报表）
-    每只股票处理完毕后立即输出结果，不再等全部完成再统一验证。
+    gap 检测优先从 db 的 data_issue_report 读取，fallback 到本地 CSV 检测。
+    修复数据直接写入 db_market。
 
     Args:
         data_type: "1D", "15m", "1m", "5m", "30m", "60m"
-        out_dir: CSV 输出目录 (如 optimizer_output/CNStock)
-        workers: 并行进程数（仅用于单只股票内的并行下载，当前单只股票用单进程）
+        out_dir: 数据目录 (如 optimizer_output/CNStock)
+        workers: 并行进程数
         dry_run: 仅检测不下载
         symbol: 只修复指定股票
-        from_report: 直接从 db 的 data_issue_report 读取，跳过检测
         market: 市场名
         db_url: 数据库连接 URL
-        mode: "csv"（修复数据合并到CSV）或 "db"（直接写入 db_market）
         no_fallback: 禁用 akshare 换源补数
     """
     if db_url:
@@ -2226,34 +1910,17 @@ def run_repair(data_type, out_dir, workers=5, dry_run=False, symbol=None,
     print(f"  dry-run={dry_run}  symbol={symbol or '全部'}  换源={'关' if no_fallback else '开'}")
     print(f"{'='*55}")
 
-    # ---- 阶段 1: 获取全部 gap 列表 ----
+    # ---- 阶段 1: 从 db 读取 gap 列表 ----
     gaps = []
 
-    if from_report:
-        print("\n[1/3] 从 data_issue_report 读取已有 gap...")
-        try:
-            tf_filter = data_type
-            gaps = _repair_load_gaps_from_db(market, timeframe_filter=tf_filter, symbol_filter=symbol)
-            print(f"  读取到 {len(gaps)} 条未修复的 gap")
-        except ConnectionError as e:
-            print(f"\n  ❌ 数据库连接失败: {e}")
-            print(f"  💡 请先配置数据库连接，或改用本地 CSV 检测:")
-            print(f"     python tdx_download.py -T {data_type} --repair")
-            return
-    else:
-        print(f"\n[1/3] 检测 {data_type} 数据断裂...")
-        csv_dir = os.path.join(out_dir, PERIOD_DIR.get(data_type, data_type))
-        if not os.path.isdir(csv_dir):
-            print(f"  ❌ CSV 目录不存在: {csv_dir}")
-            print(f"  请先运行下载: python tdx_download.py -T {data_type}")
-            return
-
-        gaps = _repair_detect_gaps_from_csv(csv_dir, data_type, today)
-
-        if symbol:
-            gaps = [g for g in gaps if g["symbol"] == symbol]
-
-        print(f"  检测到 {len(gaps)} 条 gap")
+    print("\n[1/3] 从 data_issue_report 读取 gap...")
+    try:
+        gaps = _repair_load_gaps_from_db(market, timeframe_filter=data_type, symbol_filter=symbol)
+        print(f"  读取到 {len(gaps)} 条未修复的 gap")
+    except Exception as e:
+        print(f"  ❌ db 读取失败: {e}")
+        print(f"  💡 请先运行 check_continuity.py 写入 gap 报告")
+        return
 
     if not gaps:
         print("\n  ✅ 无断裂数据，无需修复")
@@ -2319,7 +1986,6 @@ def run_repair(data_type, out_dir, workers=5, dry_run=False, symbol=None,
             gaps=stock_gaps,
             freq=freq,
             out_dir=out_dir,
-            mode=mode,
             market=market,
             no_fallback=no_fallback,
             dry_run=dry_run,
@@ -2427,10 +2093,6 @@ def main():
         help='修复模式: 与 check_continuity.py 联动，自动修复已下载数据中的断裂和坏数据。')
     ap.add_argument('--dry-run', action='store_true',
         help='(修复模式) 仅检测断裂，不执行下载和写库。')
-    ap.add_argument('--from-report', action='store_true',
-        help='(修复模式) 直接从 db 的 data_issue_report 表读取已有 gap 报告，跳过重新检测。')
-    ap.add_argument('--repair-db', action='store_true',
-        help='(修复模式) 将修复数据直接写入 db_market，而非合并到 CSV。')
     ap.add_argument('--no-fallback', action='store_true',
         help='(修复模式) 禁用 akshare 换源补数，仅用通达信修复。')
     ap.add_argument('--symbol', type=str, default=None,
@@ -2455,9 +2117,7 @@ def main():
             workers=args.workers,
             dry_run=args.dry_run,
             symbol=args.symbol,
-            from_report=args.from_report,
             db_url=args.db_url,
-            mode="db" if args.repair_db else "csv",
             no_fallback=args.no_fallback,
         )
         return

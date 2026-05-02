@@ -16,8 +16,7 @@
 #      - incomplete: OHLC 逻辑矛盾 / 部分字段为零 / 有价无量
 #
 # 输出:
-#   - data_gap_report      — 断裂记录（含期望时间戳 JSONB，可供补数脚本使用）
-#   - data_quality_report  — 质量问题记录（含 OHLC 原始值、处理建议、是否已解决）
+#   - data_issue_report    — 统一问题表（断裂 + 质量问题合并存储，含期望时间戳、OHLC 原始值、处理建议）
 #   - 可选 CSV 导出
 #
 # 多进程:
@@ -232,11 +231,11 @@ def classify_bar(bar: Dict[str, Any]) -> str:
         "bad"        — 坏数据（OHLC 全为 0，必须删除后重新拉取）
         "incomplete" — 数据不完整（volume 缺失 / 部分字段为 0 / OHLC 逻辑矛盾）
     """
-    o = bar.get("open", 0)
-    h = bar.get("high", 0)
-    l = bar.get("low", 0)
-    c = bar.get("close", 0)
-    v = bar.get("volume", 0)
+    o = bar.get("open") or 0
+    h = bar.get("high") or 0
+    l = bar.get("low") or 0
+    c = bar.get("close") or 0
+    v = bar.get("volume") or 0
 
     # 全零 → 坏数据（真实股价不可能为 0）
     if o == 0 and h == 0 and l == 0 and c == 0:
@@ -617,8 +616,8 @@ def delete_bad_records(pool, market: str, bad_records: List[Dict[str, Any]]) -> 
 
 
 def clear_tables(pool):
-    with pool.cursor() as cur:
-        cur.execute(f'DELETE FROM "{ISSUE_TABLE}"')
+    with pool.connection() as conn:
+        conn.execute(f'DELETE FROM "{ISSUE_TABLE}"')
 
 
 def export_csv(gaps, issues, path):
@@ -654,8 +653,6 @@ def export_csv(gaps, issues, path):
         w.writerows(all_rows)
 
     print(f"✅ CSV: {path}（{len(all_rows)} 条）")
-    if issues:
-        print(f"✅ CSV: {q_path}（{len(issues)} 条质量问题）")
 
 
 # ---------------------------------------------------------------------------
