@@ -15,6 +15,18 @@
 #      - suspended:  OHLC 全等 > 0 且 volume = 0（停牌，数据源用昨收填充）
 #      - incomplete: OHLC 逻辑矛盾 / 部分字段为零 / 有价无量
 #
+#   3. 退市股清理：检测最后数据距今超过阈值的股票，删除其 15m 和 1D 数据
+#      - 阈值默认 60 天，可通过 --delist-threshold 调整
+#      - 需配合 --clean-delist 开启
+#
+#   4. 1D 缺失补全：检查 1D 缺失日期是否有 15m 数据，有则聚合写入 1D 表
+#      - 聚合规则：open=第一根, high=MAX, low=MIN, close=最后一根, volume=SUM
+#      - 至少需要 8/16 根 15m bar 才算有效
+#      - 需配合 --fill-1d 开启
+#
+#   5. 双缺失批量写入：15m 和 1D 都缺失的日期，批量写入 data_issue_report
+#      - issue_type 为 "both_missing"，expected_action 为 "fetch"
+#
 # 输出:
 #   - data_issue_report    — 统一问题表（断裂 + 质量问题合并存储，含期望时间戳、OHLC 原始值、处理建议）
 #   - 可选 CSV 导出
@@ -38,6 +50,9 @@
 #   python optimizer/check_continuity.py --dry-run            # 不写库
 #   python optimizer/check_continuity.py --csv gaps.csv       # 导出 CSV
 #   python optimizer/check_continuity.py --clear              # 写前清空旧报告数据
+#   python optimizer/check_continuity.py --clean-delist       # 清理退市股（15m+1D）
+#   python optimizer/check_continuity.py --fill-1d            # 用 15m 聚合补全 1D 缺失
+#   python optimizer/check_continuity.py --clean-delist --fill-1d --fix  # 全量修复
 #
 # 依赖:
 #   - db_market.py（backend_api_python/app/utils/）
@@ -58,7 +73,7 @@ import argparse
 import traceback
 import multiprocessing as mp
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
 
 # ---------------------------------------------------------------------------
@@ -620,6 +635,311 @@ def clear_tables(pool):
         conn.execute(f'DELETE FROM "{ISSUE_TABLE}"')
 
 
+# ---------------------------------------------------------------------------
+# 退市股检测 & 清理
+# ---------------------------------------------------------------------------
+
+def detect_delisted(
+    market: str,
+    symbol: str,
+    writer,
+    today: str,
+    threshold_days: int = 90,
+) -> bool:
+    """
+    判断股票是否已退市。
+
+    策略：查询该股票在所有周期表中的最新时间戳，
+    如果距今超过 threshold_days 个自然日，视为已退市。
+
+    Args:
+        market: 市场标识
+        symbol: 股票代码
+        writer: MarketKlineWriter 实例
+        today: 今日日期字符串 YYYY-MM-DD
+        threshold_days: 阈值天数（默认 60 天）
+
+    Returns:
+        True 表示已退市
+    """
+    try:
+        # 查询最近的 1D 数据
+        r1d = writer.query(market, symbol, "1D", limit=1)
+        # 查询最近的 15m 数据
+        r15m = writer.query(market, symbol, "15m", limit=1)
+
+        latest_ts = 0
+        if r1d:
+            latest_ts = max(latest_ts, r1d[-1]["time"])
+        if r15m:
+            latest_ts = max(latest_ts, r15m[-1]["time"])
+
+        if latest_ts == 0:
+            # 完全没有数据，也视为空壳清理
+            return True
+
+        last_date = _ts_to_date(latest_ts)
+        last_dt = datetime.strptime(last_date, "%Y-%m-%d")
+        today_dt = datetime.strptime(today, "%Y-%m-%d")
+        gap_days = (today_dt - last_dt).days
+
+        return gap_days > threshold_days
+    except Exception:
+        return False
+
+
+def delete_stock_data(
+    pool,
+    market: str,
+    symbol: str,
+    timeframes: List[str] = None,
+) -> int:
+    """
+    删除指定股票在所有年份分区表中的全部 K 线数据。
+
+    Args:
+        pool: 数据库连接池
+        market: 市场标识
+        symbol: 股票代码
+        timeframes: 要删除的时间周期列表，默认 ["15m", "1D"]
+
+    Returns:
+        删除的总行数
+    """
+    if timeframes is None:
+        timeframes = ["15m", "1D"]
+
+    total_deleted = 0
+    with pool.connection() as conn:
+        cur = conn.cursor()
+        try:
+            for tf in timeframes:
+                # 查找所有该周期的分区表
+                cur.execute("""
+                    SELECT table_name FROM information_schema.tables
+                    WHERE table_schema = 'public'
+                      AND table_type = 'BASE TABLE'
+                      AND table_name LIKE %s
+                """, (f'kline_{tf}_%',))
+                tables = [r[0] for r in cur.fetchall()]
+
+                for table in tables:
+                    # 跳过聚合 view 对应的表名前缀
+                    if '_from_' in table:
+                        continue
+                    cur.execute(
+                        f'DELETE FROM "{table}" WHERE symbol = %s',
+                        (symbol,)
+                    )
+                    total_deleted += cur.rowcount
+
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    return total_deleted
+
+
+# ---------------------------------------------------------------------------
+# 1D 缺失补全：从 15m 聚合
+# ---------------------------------------------------------------------------
+
+def _aggregate_15m_to_1d(
+    records_15m: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """
+    将一天的 15m K 线数据聚合成一根 1D K 线。
+
+    聚合规则：
+      - open   = 第一根的 open
+      - high   = 所有 high 的最大值
+      - low    = 所有 low 的最小值
+      - close  = 最后一根的 close
+      - volume = 所有 volume 之和
+
+    Args:
+        records_15m: 该天所有 15m K 线记录（已按 time 排序）
+
+    Returns:
+        聚合后的 1D bar 字典，如果数据不足则返回 None
+    """
+    if not records_15m or len(records_15m) < 8:
+        # 至少需要一半以上的 bar 才算有效
+        return None
+
+    sorted_recs = sorted(records_15m, key=lambda r: r["time"])
+
+    open_price = sorted_recs[0]["open"]
+    high_price = max(r["high"] for r in sorted_recs)
+    low_price = min(r["low"] for r in sorted_recs)
+    close_price = sorted_recs[-1]["close"]
+    total_volume = sum(r.get("volume", 0) for r in sorted_recs)
+
+    # 如果 OHLC 全为 0，认为数据无效
+    if open_price == 0 and high_price == 0 and low_price == 0 and close_price == 0:
+        return None
+
+    return {
+        "open": open_price,
+        "high": high_price,
+        "low": low_price,
+        "close": close_price,
+        "volume": total_volume,
+    }
+
+
+def fill_1d_gaps_from_15m(
+    market: str,
+    symbol: str,
+    gaps_1d: List[Dict[str, Any]],
+    writer,
+    pool,
+    dry_run: bool = False,
+) -> Tuple[List[Dict[str, Any]], int, List[Dict[str, Any]]]:
+    """
+    尝试用 15m 数据聚合填补 1D 断裂。
+
+    对于每个 1D gap 中的缺失日期：
+      - 查询该日期是否有 15m 数据
+      - 如果有，聚合成 1D 写入 kline_1D_YYYY 表
+      - 如果 15m 也没有，保留为"双缺失"
+
+    Args:
+        market: 市场标识
+        symbol: 股票代码
+        gaps_1d: 1D 断裂列表（来自 check_1d_gaps）
+        writer: MarketKlineWriter 实例
+        pool: 数据库连接池
+        dry_run: 是否只计算不写库
+
+    Returns:
+        (remaining_gaps, filled_count, both_missing)
+        - remaining_gaps: 无法填补的 1D gap（去掉已填补的日期后）
+        - filled_count: 成功填补的 1D bar 数量
+        - both_missing: 15m 和 1D 都缺失的日期列表
+    """
+    if not gaps_1d:
+        return [], 0, []
+
+    # 收集所有 1D gap 中缺失的日期
+    all_missing_dates = set()
+    for g in gaps_1d:
+        for ts in g.get("expected_ts", []):
+            all_missing_dates.add(_ts_to_date(ts))
+
+    if not all_missing_dates:
+        return [], 0, []
+
+    # 批量查询该股票的全部 15m 数据（一次查询，内存筛选）
+    all_15m = writer.query(market, symbol, "15m", limit=0)
+    if not all_15m:
+        # 完全没有 15m 数据，全部都是双缺失
+        both_missing = []
+        for d in sorted(all_missing_dates):
+            both_missing.append({
+                "symbol": symbol,
+                "date": d,
+                "reason": "15m_data_not_found",
+            })
+        return gaps_1d, 0, both_missing
+
+    # 按日期分组 15m 数据
+    ts_to_date_cache: Dict[int, str] = {}
+    for rec in all_15m:
+        ts_to_date_cache[rec["time"]] = _ts_to_date(rec["time"])
+
+    date_to_15m: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for rec in all_15m:
+        d = ts_to_date_cache[rec["time"]]
+        if d in all_missing_dates:
+            date_to_15m[d].append(rec)
+
+    # 逐日判断
+    filled_dates = set()
+    both_missing = []
+
+    for d in sorted(all_missing_dates):
+        recs_15m = date_to_15m.get(d, [])
+        if len(recs_15m) >= 8:
+            # 15m 数据充足，可以聚合
+            agg_bar = _aggregate_15m_to_1d(recs_15m)
+            if agg_bar is not None:
+                if not dry_run:
+                    # 确保 1D 年份表存在
+                    year = datetime.strptime(d, "%Y-%m-%d").year
+                    table = f"kline_1D_{year}"
+                    ts_1d = _date_to_ts(d)
+                    try:
+                        # 先确保表存在（避免在 cursor 上下文内嵌套取连接）
+                        writer._mgr.ensure_year_table(market, "1D", year)
+                        with pool.cursor() as cur:
+                            cur.execute(f"""
+                                INSERT INTO "{table}"
+                                    (symbol, time, open, high, low, close, volume)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                ON CONFLICT (symbol, time) DO UPDATE SET
+                                    open       = EXCLUDED.open,
+                                    high       = EXCLUDED.high,
+                                    low        = EXCLUDED.low,
+                                    close      = EXCLUDED.close,
+                                    volume     = EXCLUDED.volume,
+                                    updated_at = NOW()
+                            """, (
+                                symbol, ts_1d,
+                                agg_bar["open"], agg_bar["high"],
+                                agg_bar["low"], agg_bar["close"],
+                                agg_bar["volume"],
+                            ))
+                    except Exception as e:
+                        print(f"⚠️  写入聚合 1D 失败: {symbol} {d}: {e}")
+                        both_missing.append({
+                            "symbol": symbol,
+                            "date": d,
+                            "reason": f"write_failed: {e}",
+                        })
+                        continue
+
+                filled_dates.add(d)
+            else:
+                # 15m 数据存在但 OHLC 全零
+                both_missing.append({
+                    "symbol": symbol,
+                    "date": d,
+                    "reason": "15m_data_all_zero",
+                })
+        elif recs_15m:
+            # 有部分 15m 数据但不足 8 根
+            both_missing.append({
+                "symbol": symbol,
+                "date": d,
+                "reason": f"15m_partial({len(recs_15m)}/16)",
+            })
+        else:
+            # 完全没有 15m 数据
+            both_missing.append({
+                "symbol": symbol,
+                "date": d,
+                "reason": "15m_data_not_found",
+            })
+
+    # 重建 remaining_gaps：只保留未填补的日期
+    remaining_gaps = []
+    for g in gaps_1d:
+        new_expected = []
+        for ts in g.get("expected_ts", []):
+            d = _ts_to_date(ts)
+            if d not in filled_dates:
+                new_expected.append(ts)
+        if new_expected:
+            remaining_gaps.append({
+                **g,
+                "expected_ts": new_expected,
+            })
+
+    return remaining_gaps, len(filled_dates), both_missing
+
+
 def export_csv(gaps, issues, path):
     if not gaps and not issues:
         print("无数据，跳过 CSV")
@@ -686,6 +1006,12 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="只打印不写库")
     parser.add_argument("--fix", action="store_true",
                         help="删除坏数据行（OHLC 全零），默认只标记不删")
+    parser.add_argument("--delist-threshold", type=int, default=60,
+                        help="退市判定阈值：最后数据距今超过该天数视为退市（默认 60 天）")
+    parser.add_argument("--clean-delist", action="store_true",
+                        help="清理退市股票的 15m 和 1D 数据")
+    parser.add_argument("--fill-1d", action="store_true",
+                        help="用 15m 数据聚合填补 1D 缺失")
     parser.add_argument("--csv", help="导出 CSV 路径")
     parser.add_argument("--clear", action="store_true", help="写入前清空旧报告数据")
     parser.add_argument("--batch-size", type=int, default=50,
@@ -699,7 +1025,6 @@ def main():
     writer = get_market_kline_writer()
     mgr = get_market_db_manager()
     market = args.market
-    today = datetime.now(TZ_SH).strftime("%Y-%m-%d")
 
     if not mgr.market_db_exists(market):
         print(f"❌ {market}_db 不存在")
@@ -710,6 +1035,18 @@ def main():
     if not all_syms:
         print(f"❌ 无股票数据")
         return 1
+
+    # 以全库最新数据日期为基准（而非今天），避免尾部延迟被误报为断裂
+    date_range = stats.get("date_range", {})
+    raw_end = date_range.get("end")
+    if raw_end:
+        ref_dt = datetime.fromisoformat(raw_end)
+        if ref_dt.tzinfo is None:
+            ref_dt = ref_dt.replace(tzinfo=timezone.utc)
+        today = ref_dt.astimezone(TZ_SH).strftime("%Y-%m-%d")
+    else:
+        today = datetime.now(TZ_SH).strftime("%Y-%m-%d")
+    print(f"📅 数据基准日期: {today}（全库最新数据日）")
 
     if args.symbol:
         if args.symbol not in all_syms:
@@ -730,6 +1067,10 @@ def main():
     print(f"   进程: {n_workers} | 每批: {batch_size} | "
           f"模式: {'dry-run' if args.dry_run else '写库'} | "
           f"坏数据: {'删除' if args.fix else '仅标记'}")
+    if args.clean_delist:
+        print(f"   退市清理: 开启（阈值 {args.delist_threshold} 天）")
+    if args.fill_1d:
+        print(f"   1D 补全: 开启（从 15m 聚合）")
     print()
 
     _build_trading_day_cache()
@@ -842,7 +1183,104 @@ def main():
                 print(f"  {iss['symbol']:>8} | {iss['timeframe']:>3} | "
                       f"{iss['start_date']} | ohlc={iss['ohlc']}")
 
-    # ---- 写库 ----
+    # ---- 退市股检测 & 清理 ----
+    delisted_syms: List[str] = []
+    delisted_deleted = 0
+    if args.clean_delist and not _INTERRUPTED:
+        print(f"\n{'='*60}")
+        print(f"🔍 检测退市股（阈值 {args.delist_threshold} 天）...")
+        try:
+            pool_db = mgr._get_pool(market)
+            for sym in syms:
+                if _INTERRUPTED:
+                    break
+                if detect_delisted(market, sym, writer, today, args.delist_threshold):
+                    delisted_syms.append(sym)
+                    if not args.dry_run:
+                        n = delete_stock_data(pool_db, market, sym, ["15m", "1D"])
+                        delisted_deleted += n
+
+            print(f"  检测到退市股: {len(delisted_syms)} 只")
+            if delisted_deleted:
+                print(f"  已删除退市股数据: {delisted_deleted} 行")
+            if delisted_syms and len(delisted_syms) <= 20:
+                for s in delisted_syms:
+                    print(f"    - {s}")
+            elif delisted_syms:
+                for s in delisted_syms[:10]:
+                    print(f"    - {s}")
+                print(f"    ... 还有 {len(delisted_syms) - 10} 只")
+        except Exception as e:
+            print(f"❌ 退市检测失败: {e}")
+            traceback.print_exc()
+
+    # ---- 1D 缺失补全：从 15m 聚合 ----
+    filled_1d_count = 0
+    both_missing_records: List[Dict[str, Any]] = []
+    if args.fill_1d and not _INTERRUPTED:
+        print(f"\n{'='*60}")
+        print(f"🔄 用 15m 数据聚合填补 1D 缺失...")
+        try:
+            pool_db = mgr._get_pool(market)
+            # 按 symbol 分组 1D gaps
+            gaps_by_sym: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+            for g in all_gaps:
+                if g["timeframe"] == "1D":
+                    gaps_by_sym[g["symbol"]].append(g)
+
+            remaining_1d_gaps: List[Dict[str, Any]] = []
+            syms_to_fill = [s for s in gaps_by_sym if s not in set(delisted_syms)]
+
+            for idx, sym in enumerate(syms_to_fill):
+                if _INTERRUPTED:
+                    break
+                sym_gaps = gaps_by_sym[sym]
+                remaining, filled, missing = fill_1d_gaps_from_15m(
+                    market, sym, sym_gaps, writer, pool_db, args.dry_run
+                )
+                remaining_1d_gaps.extend(remaining)
+                filled_1d_count += filled
+                both_missing_records.extend(missing)
+
+                if (idx + 1) % 200 == 0 or (idx + 1) == len(syms_to_fill):
+                    print(f"  [{idx + 1}/{len(syms_to_fill)}] "
+                          f"已补全={filled_1d_count} 双缺失={len(both_missing_records)}")
+
+            # 从 all_gaps 中移除已全部填补的 1D gap
+            if not args.dry_run:
+                all_gaps = [g for g in all_gaps if g["timeframe"] != "1D"] + remaining_1d_gaps
+
+            print(f"  补全结果: 填充 {filled_1d_count} 根 1D bar")
+            print(f"  双缺失（15m+1D 都没有）: {len(both_missing_records)} 天")
+        except Exception as e:
+            print(f"❌ 1D 补全失败: {e}")
+            traceback.print_exc()
+
+    # ---- 双缺失批量写入问题表 ----
+    if both_missing_records and not args.dry_run:
+        try:
+            pool_db = mgr._get_pool(market)
+            ensure_tables(pool_db)
+            # 将双缺失转为 issue 格式，一次性批量写入
+            both_missing_issues = []
+            for rec in both_missing_records:
+                both_missing_issues.append({
+                    "symbol": rec["symbol"],
+                    "timeframe": "1D",
+                    "issue_type": "both_missing",
+                    "start_date": rec["date"],
+                    "end_date": rec["date"],
+                    "expected_ts": None,
+                    "ohlc": None,
+                    "expected_action": "fetch",
+                })
+            n = write_issues(pool_db, [], both_missing_issues)
+            print(f"✅ 双缺失批量写入 {ISSUE_TABLE}: {n} 条")
+        except Exception as e:
+            print(f"❌ 双缺失写入失败: {e}")
+            traceback.print_exc()
+
+    # ---- 写库（原有逻辑） ----
     if not args.dry_run:
         try:
             pool_db = mgr._get_pool(market)
