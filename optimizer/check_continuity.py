@@ -278,9 +278,9 @@ def check_1d_gaps(symbol: str, records: List[Dict[str, Any]], today: str) -> Lis
             expected_ts = _expected_1d_ts_between(dates[i - 1], dates[i])
             gaps.append({
                 "symbol": symbol, "timeframe": "1D", "gap_type": "middle",
-                "gap_start_date": _next_day(dates[i - 1]),
-                "gap_end_date": _prev_day(dates[i]),
-                "missing_bars": skipped, "expected_ts": expected_ts,
+                "start_date": _next_day(dates[i - 1]),
+                "end_date": _prev_day(dates[i]),
+                "expected_ts": expected_ts,
             })
 
     last_date = dates[-1]
@@ -294,9 +294,9 @@ def check_1d_gaps(symbol: str, records: List[Dict[str, Any]], today: str) -> Lis
                 expected_ts.append(_date_to_ts(today))
             gaps.append({
                 "symbol": symbol, "timeframe": "1D", "gap_type": "tail",
-                "gap_start_date": _next_day(last_date),
-                "gap_end_date": today,
-                "missing_bars": trailing, "expected_ts": expected_ts,
+                "start_date": _next_day(last_date),
+                "end_date": today,
+                "expected_ts": expected_ts,
             })
     return gaps
 
@@ -318,9 +318,9 @@ def check_15m_gaps(symbol: str, records: List[Dict[str, Any]], today: str) -> Li
                 expected_ts = _expected_15m_ts_between_dates(d_prev, d_curr)
                 gaps.append({
                     "symbol": symbol, "timeframe": "15m", "gap_type": "middle",
-                    "gap_start_date": _next_day(d_prev),
-                    "gap_end_date": _prev_day(d_curr),
-                    "missing_bars": skipped * 16, "expected_ts": expected_ts,
+                    "start_date": _next_day(d_prev),
+                    "end_date": _prev_day(d_curr),
+                    "expected_ts": expected_ts,
                 })
         else:
             idx_prev = _bar_index_in_day(t_prev)
@@ -333,8 +333,8 @@ def check_15m_gaps(symbol: str, records: List[Dict[str, Any]], today: str) -> Li
                 expected_ts = all_ts[idx_prev + 1: idx_curr]
                 gaps.append({
                     "symbol": symbol, "timeframe": "15m", "gap_type": "intraday",
-                    "gap_start_date": d_prev, "gap_end_date": d_prev,
-                    "missing_bars": gap_bars, "expected_ts": expected_ts,
+                    "start_date": d_prev, "end_date": d_prev,
+                    "expected_ts": expected_ts,
                 })
 
     last_date = _ts_to_date(ts_list[-1])
@@ -348,9 +348,9 @@ def check_15m_gaps(symbol: str, records: List[Dict[str, Any]], today: str) -> Li
                 expected_ts.extend(_expected_15m_ts_for_date(today))
             gaps.append({
                 "symbol": symbol, "timeframe": "15m", "gap_type": "tail",
-                "gap_start_date": _next_day(last_date),
-                "gap_end_date": today,
-                "missing_bars": trailing * 16, "expected_ts": expected_ts,
+                "start_date": _next_day(last_date),
+                "end_date": today,
+                "expected_ts": expected_ts,
             })
     return gaps
 
@@ -393,8 +393,8 @@ def check_quality(
         issues.append({
             "symbol": symbol,
             "timeframe": timeframe,
-            "bar_time": ts,
-            "bar_date": _ts_to_date(ts),
+            "start_date": _ts_to_date(ts),
+            "end_date": _ts_to_date(ts),
             "issue_type": cls,
             "ohlc": ohlc,
             "expected_action": expected_action,
@@ -469,128 +469,87 @@ def _worker_check_batch(args: Tuple) -> Tuple[
 # 数据库操作
 # ---------------------------------------------------------------------------
 
-GAP_TABLE = "data_gap_report"
-QUALITY_TABLE = "data_quality_report"
+ISSUE_TABLE = "data_issue_report"
 
-DDL_GAP = f"""
-CREATE TABLE IF NOT EXISTS "{GAP_TABLE}" (
+DDL_ISSUE = f"""
+CREATE TABLE IF NOT EXISTS "{ISSUE_TABLE}" (
     id              SERIAL PRIMARY KEY,
     symbol          VARCHAR(20) NOT NULL,
     timeframe       VARCHAR(10) NOT NULL,
-    gap_type        VARCHAR(20) NOT NULL,
-    gap_start_date  VARCHAR(10) NOT NULL,
-    gap_end_date    VARCHAR(10) NOT NULL,
-    missing_bars    INTEGER     NOT NULL DEFAULT 0,
-    expected_ts     JSONB       NOT NULL DEFAULT '[]'::jsonb,
-    checked_at      TIMESTAMP   DEFAULT NOW(),
-    UNIQUE (symbol, timeframe, gap_type, gap_start_date, gap_end_date)
-)
-"""
-
-DDL_QUALITY = f"""
-CREATE TABLE IF NOT EXISTS "{QUALITY_TABLE}" (
-    id              SERIAL PRIMARY KEY,
-    symbol          VARCHAR(20) NOT NULL,
-    timeframe       VARCHAR(10) NOT NULL,
-    bar_time        BIGINT      NOT NULL,
-    bar_date        VARCHAR(10) NOT NULL,
     issue_type      VARCHAR(20) NOT NULL,
+    start_date      VARCHAR(10) NOT NULL,
+    end_date        VARCHAR(10) NOT NULL,
+    expected_ts     JSONB,
     ohlc            JSONB,
     expected_action VARCHAR(20) NOT NULL DEFAULT 'review',
-    resolved        BOOLEAN     DEFAULT FALSE,
     checked_at      TIMESTAMP   DEFAULT NOW(),
-    UNIQUE (symbol, timeframe, bar_time, issue_type)
+    UNIQUE (symbol, timeframe, issue_type, start_date, end_date)
 )
 """
 
 
 def ensure_tables(pool):
     with pool.cursor() as cur:
-        cur.execute(DDL_GAP)
-        cur.execute(DDL_QUALITY)
-        # 兼容旧表升级
-        cur.execute(f"""
-            DO $$
-            BEGIN
-                IF NOT EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name = '{GAP_TABLE}' AND column_name = 'expected_ts'
-                ) THEN
-                    ALTER TABLE "{GAP_TABLE}"
-                    ADD COLUMN expected_ts JSONB NOT NULL DEFAULT '[]'::jsonb;
-                END IF;
-                IF NOT EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name = '{QUALITY_TABLE}' AND column_name = 'resolved'
-                ) THEN
-                    ALTER TABLE "{QUALITY_TABLE}"
-                    ADD COLUMN resolved BOOLEAN DEFAULT FALSE;
-                END IF;
-            END$$;
-        """)
+        cur.execute(DDL_ISSUE)
 
 
-def write_gaps(pool, gaps: List[Dict[str, Any]], batch_size: int = 500):
-    if not gaps:
+def write_issues(pool, gaps: List[Dict[str, Any]], issues: List[Dict[str, Any]],
+                  batch_size: int = 500):
+    """将 gap 和 quality issues 统一写入 data_issue_report 表"""
+    all_records = []
+
+    for g in gaps:
+        all_records.append({
+            "symbol": g["symbol"],
+            "timeframe": g["timeframe"],
+            "issue_type": g["gap_type"],  # middle / tail / intraday
+            "start_date": g["start_date"],
+            "end_date": g["end_date"],
+            "expected_ts": g.get("expected_ts", []),
+            "ohlc": None,
+            "expected_action": "insert",
+        })
+
+    for iss in issues:
+        all_records.append({
+            "symbol": iss["symbol"],
+            "timeframe": iss["timeframe"],
+            "issue_type": iss["issue_type"],  # bad / suspended / incomplete
+            "start_date": iss["start_date"],
+            "end_date": iss["end_date"],
+            "expected_ts": None,
+            "ohlc": iss["ohlc"],
+            "expected_action": iss["expected_action"],
+        })
+
+    if not all_records:
         return 0
-    sql = f"""
-        INSERT INTO "{GAP_TABLE}"
-            (symbol, timeframe, gap_type, gap_start_date, gap_end_date,
-             missing_bars, expected_ts)
-        VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
-        ON CONFLICT (symbol, timeframe, gap_type, gap_start_date, gap_end_date)
-        DO UPDATE SET
-            missing_bars = EXCLUDED.missing_bars,
-            expected_ts  = EXCLUDED.expected_ts,
-            checked_at   = NOW()
-    """
-    written = 0
-    with pool.connection() as conn:
-        cur = conn.cursor()
-        try:
-            for start in range(0, len(gaps), batch_size):
-                batch = gaps[start:start + batch_size]
-                args_list = [
-                    (g["symbol"], g["timeframe"], g["gap_type"],
-                     g["gap_start_date"], g["gap_end_date"],
-                     g["missing_bars"], json.dumps(g.get("expected_ts", []), separators=(",", ":")))
-                    for g in batch
-                ]
-                cur.executemany(sql, args_list)
-                written += len(batch)
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-    return written
 
-
-def write_quality(pool, issues: List[Dict[str, Any]], batch_size: int = 500):
-    if not issues:
-        return 0
     sql = f"""
-        INSERT INTO "{QUALITY_TABLE}"
-            (symbol, timeframe, bar_time, bar_date, issue_type, ohlc, expected_action)
-        VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s)
-        ON CONFLICT (symbol, timeframe, bar_time, issue_type)
+        INSERT INTO "{ISSUE_TABLE}"
+            (symbol, timeframe, issue_type,
+             start_date, end_date, expected_ts, ohlc, expected_action)
+        VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s)
+        ON CONFLICT (symbol, timeframe, issue_type, start_date, end_date)
         DO UPDATE SET
+            expected_ts     = EXCLUDED.expected_ts,
             ohlc            = EXCLUDED.ohlc,
             expected_action = EXCLUDED.expected_action,
-            resolved        = FALSE,
             checked_at      = NOW()
     """
     written = 0
     with pool.connection() as conn:
         cur = conn.cursor()
         try:
-            for start in range(0, len(issues), batch_size):
-                batch = issues[start:start + batch_size]
+            for start in range(0, len(all_records), batch_size):
+                batch = all_records[start:start + batch_size]
                 args_list = [
-                    (iss["symbol"], iss["timeframe"], iss["bar_time"],
-                     iss["bar_date"], iss["issue_type"],
-                     json.dumps(iss["ohlc"], separators=(",", ":")),
-                     iss["expected_action"])
-                    for iss in batch
+                    (r["symbol"], r["timeframe"], r["issue_type"],
+                     r["start_date"], r["end_date"],
+                     json.dumps(r["expected_ts"], separators=(",", ":")) if r["expected_ts"] is not None else None,
+                     json.dumps(r["ohlc"], separators=(",", ":")) if r["ohlc"] is not None else None,
+                     r["expected_action"])
+                    for r in batch
                 ]
                 cur.executemany(sql, args_list)
                 written += len(batch)
@@ -599,6 +558,14 @@ def write_quality(pool, issues: List[Dict[str, Any]], batch_size: int = 500):
             conn.rollback()
             raise
     return written
+
+
+# 兼容旧代码
+def write_gaps(pool, gaps, batch_size=500):
+    return write_issues(pool, gaps, [], batch_size)
+
+def write_quality(pool, issues, batch_size=500):
+    return write_issues(pool, [], issues, batch_size)
 
 
 def delete_bad_records(pool, market: str, bad_records: List[Dict[str, Any]]) -> int:
@@ -651,8 +618,7 @@ def delete_bad_records(pool, market: str, bad_records: List[Dict[str, Any]]) -> 
 
 def clear_tables(pool):
     with pool.cursor() as cur:
-        cur.execute(f'DELETE FROM "{GAP_TABLE}"')
-        cur.execute(f'DELETE FROM "{QUALITY_TABLE}"')
+        cur.execute(f'DELETE FROM "{ISSUE_TABLE}"')
 
 
 def export_csv(gaps, issues, path):
@@ -660,31 +626,34 @@ def export_csv(gaps, issues, path):
         print("无数据，跳过 CSV")
         return
 
-    # gaps
-    gap_fields = ["symbol", "timeframe", "gap_type", "gap_start_date",
-                  "gap_end_date", "missing_bars", "expected_ts"]
+    all_rows = []
+    for g in gaps:
+        all_rows.append({
+            "symbol": g["symbol"], "timeframe": g["timeframe"],
+            "issue_type": g["gap_type"],
+            "start_date": g["start_date"], "end_date": g["end_date"],
+            "expected_ts": json.dumps(g.get("expected_ts", []), separators=(",", ":")),
+            "ohlc": "",
+            "expected_action": "insert",
+        })
+    for iss in issues:
+        all_rows.append({
+            "symbol": iss["symbol"], "timeframe": iss["timeframe"],
+            "issue_type": iss["issue_type"],
+            "start_date": iss["start_date"], "end_date": iss["end_date"],
+            "expected_ts": "",
+            "ohlc": json.dumps(iss["ohlc"], separators=(",", ":")),
+            "expected_action": iss["expected_action"],
+        })
+
+    fields = ["symbol", "timeframe", "issue_type", "start_date", "end_date",
+              "expected_ts", "ohlc", "expected_action"]
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=gap_fields, extrasaction="ignore")
+        w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
-        for g in gaps:
-            row = dict(g)
-            row["expected_ts"] = json.dumps(row.get("expected_ts", []), separators=(",", ":"))
-            w.writerow(row)
+        w.writerows(all_rows)
 
-    # quality issues
-    q_path = path.replace(".csv", "_quality.csv")
-    if issues:
-        q_fields = ["symbol", "timeframe", "bar_time", "bar_date",
-                     "issue_type", "ohlc", "expected_action"]
-        with open(q_path, "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.DictWriter(f, fieldnames=q_fields, extrasaction="ignore")
-            w.writeheader()
-            for iss in issues:
-                row = dict(iss)
-                row["ohlc"] = json.dumps(row["ohlc"], separators=(",", ":"))
-                w.writerow(row)
-
-    print(f"✅ CSV: {path}（{len(gaps)} 条断裂）")
+    print(f"✅ CSV: {path}（{len(all_rows)} 条）")
     if issues:
         print(f"✅ CSV: {q_path}（{len(issues)} 条质量问题）")
 
@@ -851,11 +820,11 @@ def main():
         print(f"  15m: {by_tf['15m']} 条 | 1D: {by_tf['1D']} 条")
         print(f"  middle: {by_type['middle']} | tail: {by_type['tail']} | intraday: {by_type['intraday']}")
 
-        all_gaps.sort(key=lambda g: g["missing_bars"], reverse=True)
+        all_gaps.sort(key=lambda g: len(g.get("expected_ts", [])), reverse=True)
         print(f"\n断裂最严重的 10 条:")
         for g in all_gaps[:10]:
             print(f"  {g['symbol']:>8} | {g['timeframe']:>3} | {g['gap_type']:>8} | "
-                  f"{g['gap_start_date']}~{g['gap_end_date']} | 缺 {g['missing_bars']} 根")
+                  f"{g['start_date']}~{g['end_date']} | 缺 {len(g.get('expected_ts', []))} 根")
 
     if all_issues:
         by_itype = defaultdict(int)
@@ -874,7 +843,7 @@ def main():
             print(f"\n坏数据示例（前 5 条）:")
             for iss in bad_samples[:5]:
                 print(f"  {iss['symbol']:>8} | {iss['timeframe']:>3} | "
-                      f"{iss['bar_date']} | ohlc={iss['ohlc']}")
+                      f"{iss['start_date']} | ohlc={iss['ohlc']}")
 
     # ---- 写库 ----
     if not args.dry_run:
@@ -886,26 +855,14 @@ def main():
                 clear_tables(pool_db)
                 print(f"\n🗑️  已清空旧报告数据")
 
-            if all_gaps:
-                n = write_gaps(pool_db, all_gaps)
-                print(f"✅ 写入 {GAP_TABLE}: {n} 条")
-
-            if all_issues:
-                n = write_quality(pool_db, all_issues)
-                print(f"✅ 写入 {QUALITY_TABLE}: {n} 条")
+            if all_gaps or all_issues:
+                n = write_issues(pool_db, all_gaps, all_issues)
+                print(f"✅ 写入 {ISSUE_TABLE}: {n} 条")
 
             # 删除坏数据
             if args.fix and all_bad:
                 deleted = delete_bad_records(pool_db, market, all_bad)
                 print(f"🗑️  已删除坏数据行: {deleted} 条")
-                # 标记为已解决
-                with pool_db.cursor() as cur:
-                    cur.execute(f"""
-                        UPDATE "{QUALITY_TABLE}"
-                        SET resolved = TRUE
-                        WHERE issue_type = 'bad' AND expected_action = 'delete'
-                    """)
-                print(f"✅ 已标记坏数据为 resolved")
 
         except Exception as e:
             print(f"\n❌ 数据库操作失败: {e}")
