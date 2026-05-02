@@ -100,7 +100,6 @@ KLINE_COLUMNS = """
     low         DOUBLE PRECISION NOT NULL,
     close       DOUBLE PRECISION NOT NULL,
     volume      DOUBLE PRECISION DEFAULT 0,
-    updated_at  TIMESTAMP    DEFAULT NOW(),
     PRIMARY KEY (symbol, time)
 """
 

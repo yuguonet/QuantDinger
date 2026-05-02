@@ -1094,33 +1094,11 @@ from multiprocessing import Pool as _Pool_repair
 
 _TZ_SH_REPAIR = __import__('datetime').timezone(__import__('datetime').timedelta(hours=8))
 
-_HOLIDAYS_REPAIR = None  # 延迟加载
-_TRADING_DAY_SET_REPAIR = None
 
-
-def _repair_load_holidays():
-    """从 check_continuity 模块导入假期表，避免重复维护"""
-    global _HOLIDAYS_REPAIR, _TRADING_DAY_SET_REPAIR
-    if _HOLIDAYS_REPAIR is not None:
-        return
-    try:
-        from check_continuity import HOLIDAYS, _build_trading_day_cache, _TRADING_DAY_SET
-        _HOLIDAYS_REPAIR = HOLIDAYS
-        _build_trading_day_cache()
-        _TRADING_DAY_SET_REPAIR = _TRADING_DAY_SET
-    except ImportError:
-        # fallback: 从同目录导入
-        _co_dir = os.path.dirname(os.path.abspath(__file__))
-        sys.path.insert(0, _co_dir)
-        from check_continuity import HOLIDAYS, _build_trading_day_cache, _TRADING_DAY_SET
-        _HOLIDAYS_REPAIR = HOLIDAYS
-        _build_trading_day_cache()
-        _TRADING_DAY_SET_REPAIR = _TRADING_DAY_SET
-
-
-def _repair_is_trading_day(d):
-    _repair_load_holidays()
-    return d in _TRADING_DAY_SET_REPAIR
+def _truncate_ts_to_minute(ts: int) -> int:
+    """时间戳截断到分钟（秒归零），用于 15m 比对"""
+    dt = _dt_repair.fromtimestamp(ts, tz=_TZ_SH_REPAIR).replace(second=0, microsecond=0)
+    return int(dt.timestamp())
 
 
 def _repair_ts_to_date(ts):
@@ -1288,10 +1266,13 @@ def _repair_worker(args):
             all_start = min(g["start_date"] for g in gaps)
             all_end = max(g["end_date"] for g in gaps)
 
-            # 构建期望时间戳集合（用于精确过滤）
+            # 构建期望时间戳集合（用于精确过滤，截断到分钟避免秒级偏差）
             expected_ts_set = set()
             for g in gaps:
-                expected_ts_set.update(g.get("expected_ts", []))
+                for ts in g.get("expected_ts", []):
+                    # 截断到分钟：秒归零
+                    dt = _dt_repair.fromtimestamp(ts, tz=_TZ_SH_REPAIR).replace(second=0, microsecond=0)
+                    expected_ts_set.add(int(dt.timestamp()))
 
             # 拉取
             bars = _repair_fetch_bars(api, market_int, code, freq, all_start, all_end)
@@ -1305,9 +1286,9 @@ def _repair_worker(args):
                     result_gaps_remaining.append(g)
                 continue
 
-            # 如果有精确的 expected_ts，只保留那些时间戳对应的 bar
+            # 如果有精确的 expected_ts，只保留那些时间戳对应的 bar（截断到分钟比对）
             if expected_ts_set:
-                bars = [b for b in bars if b["time"] in expected_ts_set]
+                bars = [b for b in bars if _truncate_ts_to_minute(b["time"]) in expected_ts_set]
 
             if not bars:
                 # 拉到了数据但时间戳全不匹配（数据源缺失或日期对不上）
@@ -1450,10 +1431,12 @@ def _repair_fallback_akshare(remaining_gaps, data_type, writer, market="CNStock"
         all_start = min(g["start_date"] for g in gaps)
         all_end = max(g["end_date"] for g in gaps)
 
-        # 构建期望时间戳集合
+        # 构建期望时间戳集合（截断到分钟避免秒级偏差）
         expected_ts_set = set()
         for g in gaps:
-            expected_ts_set.update(g.get("expected_ts", []))
+            for ts in g.get("expected_ts", []):
+                dt = _dt_repair.fromtimestamp(ts, tz=_TZ_SH_REPAIR).replace(second=0, microsecond=0)
+                expected_ts_set.add(int(dt.timestamp()))
 
         # 从 akshare 拉取
         bars = _repair_fetch_akshare(code, all_start, all_end, "1D")
@@ -1461,9 +1444,9 @@ def _repair_fallback_akshare(remaining_gaps, data_type, writer, market="CNStock"
             still_remaining.extend(gaps)
             continue
 
-        # 精确过滤
+        # 精确过滤（截断到分钟比对）
         if expected_ts_set:
-            bars = [b for b in bars if b["time"] in expected_ts_set]
+            bars = [b for b in bars if _truncate_ts_to_minute(b["time"]) in expected_ts_set]
 
         if not bars:
             still_remaining.extend(gaps)
@@ -1512,7 +1495,7 @@ def _repair_verify_fixed(writer, market, data_type, original_gaps, today=None):
     if _co_dir not in sys.path:
         sys.path.insert(0, _co_dir)
     from check_continuity import check_1d_gaps, check_15m_gaps, _build_trading_day_cache
-    _build_trading_day_cache()
+    _build_trading_day_cache(market)
 
     # 从 db 重新检测受影响的股票
     new_gap_keys = set()

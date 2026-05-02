@@ -106,42 +106,99 @@ _load_env()
 
 TZ_SH = timezone(timedelta(hours=8))
 
-HOLIDAYS = {
-    "2021-01-01","2021-02-11","2021-02-12","2021-02-15","2021-02-16","2021-02-17",
-    "2021-04-05","2021-05-03","2021-05-04","2021-05-05","2021-06-14",
-    "2021-09-20","2021-09-21","2021-10-01","2021-10-04","2021-10-05","2021-10-06","2021-10-07",
-    "2022-01-03","2022-01-31","2022-02-01","2022-02-02","2022-02-03","2022-02-04",
-    "2022-04-04","2022-04-05","2022-05-02","2022-05-03","2022-05-04",
-    "2022-06-03","2022-09-12","2022-10-03","2022-10-04","2022-10-05","2022-10-06","2022-10-07",
-    "2023-01-02","2023-01-23","2023-01-24","2023-01-25","2023-01-26","2023-01-27",
-    "2023-04-05","2023-05-01","2023-05-02","2023-05-03","2023-06-22","2023-06-23",
-    "2023-09-29","2023-10-02","2023-10-03","2023-10-04","2023-10-05","2023-10-06",
-    "2024-01-01","2024-02-09","2024-02-12","2024-02-13","2024-02-14","2024-02-15","2024-02-16",
-    "2024-04-04","2024-04-05","2024-05-01","2024-05-02","2024-05-03",
-    "2024-06-10","2024-09-16","2024-09-17","2024-10-01","2024-10-02","2024-10-03","2024-10-04","2024-10-07",
-    "2025-01-01","2025-01-28","2025-01-29","2025-01-30","2025-01-31",
-    "2025-02-03","2025-02-04","2025-04-04","2025-05-01","2025-05-02","2025-05-05",
-    "2025-06-02","2025-10-01","2025-10-02","2025-10-03","2025-10-06","2025-10-07",
-    "2026-01-01","2026-01-02","2026-02-17","2026-02-18","2026-02-19","2026-02-20","2026-02-23",
-    "2026-04-06","2026-05-01","2026-06-19",
-}
-
 _TRADING_DAY_SET: frozenset[str] | None = None
 
 
-def _build_trading_day_cache():
+def _fetch_trading_days_from_akshare() -> set[str]:
+    """从 akshare 拉取沪深交易所真实交易日历（含调休日）"""
+    try:
+        import akshare as ak
+        df = ak.tool_trade_date_hist_sina()
+        dates = set()
+        for v in df["trade_date"]:
+            d = str(v)[:10]
+            dates.add(d)
+        return dates
+    except Exception as e:
+        print(f"⚠️  akshare 拉取交易日历失败: {e}")
+        return set()
+
+
+def _deduce_trading_days_from_db(market: str, min_stocks: int = 10) -> set[str]:
+    """
+    从数据库反推交易日历：统计每天有数据的股票数，>= min_stocks 的视为交易日。
+    直接查 kline_1D_* 分区表，按日期分组计数。
+    """
+    try:
+        from app.utils.db_market import get_market_db_manager
+        mgr = get_market_db_manager()
+        pool = mgr._get_pool(market)
+
+        with pool.connection() as conn:
+            cur = conn.cursor()
+            # 找所有 1D 分区表
+            cur.execute("""
+                SELECT table_name FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_type = 'BASE TABLE'
+                  AND table_name LIKE 'kline_1D_%'
+                  AND table_name NOT LIKE '%%_from_%%'
+                ORDER BY table_name
+            """)
+            tables = [r[0] for r in cur.fetchall()]
+
+            if not tables:
+                return set()
+
+            # union all 查所有日期的股票数
+            union_parts = []
+            for t in tables:
+                union_parts.append(f'SELECT time FROM "{t}"')
+            sql = " UNION ALL ".join(union_parts)
+            cur.execute(f"""
+                SELECT to_char(to_timestamp(time) AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD') AS d, COUNT(*)
+                FROM ({sql}) sub
+                GROUP BY d
+                HAVING COUNT(*) >= %s
+            """, (min_stocks,))
+            dates = {r[0] for r in cur.fetchall()}
+            return dates
+    except Exception as e:
+        print(f"⚠️  数据库反推交易日历失败: {e}")
+        return set()
+
+
+def _build_trading_day_cache(market: str = "CNStock"):
+    """
+    构建交易日集合（两级）:
+      1. akshare — 新浪真实交易日历（含调休，排除假日）
+      2. 数据库反推 — 统计每天有数据的股票数，>=10 只视为交易日
+
+    Args:
+        market: 市场标识，用于数据库反推
+    """
     global _TRADING_DAY_SET
     if _TRADING_DAY_SET is not None:
         return
-    s = set()
-    cur = datetime(2020, 1, 1)
-    end = datetime(2027, 12, 31)
-    while cur <= end:
-        d = cur.strftime("%Y-%m-%d")
-        if cur.weekday() < 5 and d not in HOLIDAYS:
-            s.add(d)
-        cur += timedelta(days=1)
-    _TRADING_DAY_SET = frozenset(s)
+
+    # 1. akshare
+    dates = _fetch_trading_days_from_akshare()
+    if dates and len(dates) > 100:
+        _TRADING_DAY_SET = frozenset(dates)
+        print(f"📅 交易日历: akshare（{len(dates)} 天）")
+        return
+
+    # 2. 数据库反推
+    print(f"⚠️  akshare 不可用，从数据库反推交易日历（{market}）...")
+    dates = _deduce_trading_days_from_db(market)
+    if dates and len(dates) > 100:
+        _TRADING_DAY_SET = frozenset(dates)
+        print(f"📅 交易日历: 数据库反推（{len(dates)} 天）")
+        return
+
+    # 3. 都失败了
+    print("❌ 无法确定交易日历（akshare 不可用且数据库无足够数据）")
+    _TRADING_DAY_SET = frozenset()
 
 
 def _is_trading_day(d: str) -> bool:
@@ -186,11 +243,17 @@ _AFTERNOON_BARS = [(13, 0), (13, 15), (13, 30), (13, 45), (14, 0), (14, 15), (14
 _ALL_BAR_TIMES = _MORNING_BARS + _AFTERNOON_BARS
 
 
-def _bar_index_in_day(ts: int) -> int:
+
+def _ts_to_dhm(ts: int) -> Tuple[str, int, int]:
+    """时间戳 → (日期, 时, 分)，用于 15m 比对，忽略秒级精度"""
     dt = datetime.fromtimestamp(ts, tz=TZ_SH)
-    hm = (dt.hour, dt.minute)
+    return (dt.strftime("%Y-%m-%d"), dt.hour, dt.minute)
+
+
+def _dhm_to_bar_index(dhm: Tuple[str, int, int]) -> int:
+    """(日期, 时, 分) → bar 序号，-1 表示不在交易时间表内"""
     try:
-        return _ALL_BAR_TIMES.index(hm)
+        return _ALL_BAR_TIMES.index((dhm[1], dhm[2]))
     except ValueError:
         return -1
 
@@ -319,12 +382,12 @@ def check_15m_gaps(symbol: str, records: List[Dict[str, Any]], today: str) -> Li
     if len(records) < 2:
         return []
     gaps = []
-    ts_list = sorted(r["time"] for r in records)
+    # 按 (日期, 时, 分) 排序，忽略秒级精度
+    dhm_list = sorted(_ts_to_dhm(r["time"]) for r in records)
 
-    for i in range(1, len(ts_list)):
-        t_prev, t_curr = ts_list[i - 1], ts_list[i]
-        d_prev = _ts_to_date(t_prev)
-        d_curr = _ts_to_date(t_curr)
+    for i in range(1, len(dhm_list)):
+        dhm_prev, dhm_curr = dhm_list[i - 1], dhm_list[i]
+        d_prev, d_curr = dhm_prev[0], dhm_curr[0]
 
         if d_prev != d_curr:
             skipped = _trading_days_between(d_prev, d_curr)
@@ -337,8 +400,8 @@ def check_15m_gaps(symbol: str, records: List[Dict[str, Any]], today: str) -> Li
                     "expected_ts": expected_ts,
                 })
         else:
-            idx_prev = _bar_index_in_day(t_prev)
-            idx_curr = _bar_index_in_day(t_curr)
+            idx_prev = _dhm_to_bar_index(dhm_prev)
+            idx_curr = _dhm_to_bar_index(dhm_curr)
             if idx_prev < 0 or idx_curr < 0:
                 continue
             gap_bars = idx_curr - idx_prev - 1
@@ -351,7 +414,7 @@ def check_15m_gaps(symbol: str, records: List[Dict[str, Any]], today: str) -> Li
                     "expected_ts": expected_ts,
                 })
 
-    last_date = _ts_to_date(ts_list[-1])
+    last_date = dhm_list[-1][0]
     if last_date < today:
         trailing = _trading_days_between(last_date, today)
         if _is_trading_day(today):
@@ -445,6 +508,7 @@ def _worker_check_batch(args: Tuple) -> Tuple[
 
     from app.utils.db_market import get_market_kline_writer
     writer = get_market_kline_writer()
+    _build_trading_day_cache(market)
 
     local_gaps: List[Dict[str, Any]] = []
     local_issues: List[Dict[str, Any]] = []
@@ -883,8 +947,7 @@ def fill_1d_gaps_from_15m(
                                     high       = EXCLUDED.high,
                                     low        = EXCLUDED.low,
                                     close      = EXCLUDED.close,
-                                    volume     = EXCLUDED.volume,
-                                    updated_at = NOW()
+                                    volume     = EXCLUDED.volume
                             """, (
                                 symbol, ts_1d,
                                 agg_bar["open"], agg_bar["high"],
@@ -1073,7 +1136,7 @@ def main():
         print(f"   1D 补全: 开启（从 15m 聚合）")
     print()
 
-    _build_trading_day_cache()
+    _build_trading_day_cache(market)
 
     batches = [syms[i:i + batch_size] for i in range(0, total, batch_size)]
 
