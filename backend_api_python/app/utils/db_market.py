@@ -86,24 +86,25 @@ def _year_from_ts(ts) -> int:
 def _ensure_datetime(value) -> datetime:
     """将各种时间格式统一转为 datetime 对象（兼容 TIMESTAMP 列）
 
+    TIMESTAMP WITHOUT TIME ZONE 列不存储时区信息。
+    写入前统一去掉时区，避免 psycopg2 按 session timezone 做隐式转换导致日期偏移。
+
     支持:
-      - datetime 对象 → 直接返回
-      - int/float → 视为 Unix 时间戳（秒）
+      - datetime 对象 → 去掉时区后返回
+      - int/float → 视为 Unix 时间戳（秒），转为 UTC naive datetime
       - str → 尝试 ISO 格式解析
     """
     if isinstance(value, datetime):
-        return value
+        return value.replace(tzinfo=None) if value.tzinfo else value
     if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(value, tz=timezone.utc)
+        return datetime.fromtimestamp(value, tz=timezone.utc).replace(tzinfo=None)
     if isinstance(value, str):
         # ISO 格式: "2024-04-12T09:45:00" 或 "2024-04-12 09:45"
         for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
                      "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
             try:
                 dt = datetime.strptime(value.strip(), fmt)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                return dt
+                return dt  # naive datetime，无需补时区
             except ValueError:
                 continue
     raise ValueError(f"无法解析时间值: {value!r}")
@@ -607,7 +608,7 @@ class MarketKlineWriter:
         elif bucket_type == "weekly":
             bucket_expr = (
                 f"to_timestamp((EXTRACT(EPOCH FROM t.time + interval '{tz_offset}s')::integer / 86400) * 86400 - {tz_offset})"
-                f" - (EXTRACT(DOW FROM t.time AT TIME ZONE 'Asia/Shanghai')::int - 1 + 7) % 7 * interval '1 day'"
+                f" - (((EXTRACT(DOW FROM t.time AT TIME ZONE 'Asia/Shanghai')::int - 1 + 7) % 7) * interval '1 day')"
             )
         elif bucket_type == "monthly":
             bucket_expr = (

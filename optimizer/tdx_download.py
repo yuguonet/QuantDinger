@@ -923,24 +923,34 @@ def _merge_worker(args):
             records = []
             for row in df.itertuples(index=False):
                 try:
-                    dt_str = str(getattr(row, dt_col)).strip()
-                    if not dt_str or dt_str == 'nan':
-                        continue
-                    dt = None
-                    for fmt in ('%Y-%m-%d', '%Y-%m-%d %H:%M', '%Y-%m-%d %H:%M:%S'):
-                        try:
-                            dt = datetime.strptime(dt_str, fmt)
-                            break
-                        except ValueError:
+                    raw_val = getattr(row, dt_col)
+                    # 兼容 pandas Timestamp / datetime / str
+                    if hasattr(raw_val, 'strftime'):
+                        dt = raw_val if isinstance(raw_val, datetime) else raw_val.to_pydatetime()
+                    else:
+                        dt_str = str(raw_val).strip()
+                        if not dt_str or dt_str == 'nan':
                             continue
-                    if dt is None:
-                        continue
+                        dt = None
+                        for fmt in ('%Y-%m-%d', '%Y-%m-%d %H:%M', '%Y-%m-%d %H:%M:%S'):
+                            try:
+                                dt = datetime.strptime(dt_str, fmt)
+                                break
+                            except ValueError:
+                                continue
+                        if dt is None:
+                            continue
+
+                    # 校准时间（15m 对齐等）
                     if dt.tzinfo is None:
                         dt = dt.replace(tzinfo=_tz_sh)
-
                     dt, action = validate_and_calibrate_time(dt, timeframe)
                     if dt is None:
                         continue
+
+                    # 写入前去掉时区，避免 psycopg2 按 session timezone 转换导致日期偏移
+                    if dt.tzinfo is not None:
+                        dt = dt.replace(tzinfo=None)
 
                     records.append({
                         "symbol": code,
@@ -1038,6 +1048,13 @@ def merge_to_db(input_dir, data_type, workers=4, db_url=None):
     print(f"{'='*55}")
 
     mgr = get_market_db_manager()
+    if mgr.market_db_exists("CNStock"):
+        pool = mgr._get_pool("CNStock")
+        with pool.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public' AND table_name LIKE 'kline_%'")
+            has_tables = cur.fetchone()[0] > 0
+        if not has_tables:
+            mgr.drop_market_db("CNStock")
     mgr.ensure_market_db("CNStock")
 
     # 分配任务给各工作进程

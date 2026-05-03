@@ -996,7 +996,8 @@ def fill_1d_gaps_from_15m(
                                     close      = EXCLUDED.close,
                                     volume     = EXCLUDED.volume
                             """, (
-                                symbol, ts_1d,
+                                symbol,
+                                ts_1d.replace(tzinfo=None),  # 去掉时区，避免 psycopg2 隐式转换
                                 agg_bar["open"], agg_bar["high"],
                                 agg_bar["low"], agg_bar["close"],
                                 agg_bar["volume"],
