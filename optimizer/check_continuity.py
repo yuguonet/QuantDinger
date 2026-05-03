@@ -170,46 +170,16 @@ def _deduce_trading_days_from_db(market: str, min_stocks: int = 10) -> set[str]:
 
 def _build_trading_day_cache(market: str = "CNStock"):
     """
-    构建交易日集合（两级 + 合并）:
-      1. akshare — 新浪真实交易日历（含调休，排除假日）
-      2. 数据库反推 — 统计每天有数据的股票数，>=10 只视为交易日
+    构建交易日集合 — 委托给 trading_day 模块（单例 + DB 持久化 + akshare 增量）。
 
-    如果 akshare 日历过期（不含数据最新日期），自动合并数据库反推的结果。
-
-    Args:
-        market: 市场标识，用于数据库反推
+    结果写入 _TRADING_DAY_SET 供内部函数使用。
     """
     global _TRADING_DAY_SET
     if _TRADING_DAY_SET is not None:
         return
-
-    akshare_dates = _fetch_trading_days_from_akshare()
-    db_dates = _deduce_trading_days_from_db(market)
-
-    # 检查 akshare 日历是否覆盖数据范围
-    akshare_max = max(akshare_dates) if akshare_dates else ""
-    db_max = max(db_dates) if db_dates else ""
-    data_max = max(akshare_max, db_max)
-
-    if akshare_dates and len(akshare_dates) > 100:
-        if db_dates and db_max > akshare_max:
-            # akshare 日历过期，合并数据库反推的日期
-            merged = akshare_dates | db_dates
-            _TRADING_DAY_SET = frozenset(merged)
-            print(f"📅 交易日历: akshare + 数据库合并（{len(merged)} 天，"
-                  f"akshare 截至 {akshare_max}，数据截至 {db_max}）")
-        else:
-            _TRADING_DAY_SET = frozenset(akshare_dates)
-            print(f"📅 交易日历: akshare（{len(akshare_dates)} 天）")
-        return
-
-    if db_dates and len(db_dates) > 100:
-        _TRADING_DAY_SET = frozenset(db_dates)
-        print(f"📅 交易日历: 数据库反推（{len(db_dates)} 天）")
-        return
-
-    print("❌ 无法确定交易日历（akshare 不可用且数据库无足够数据）")
-    _TRADING_DAY_SET = frozenset()
+    import trading_day as _td
+    _TRADING_DAY_SET = _td.get_trading_day_set()
+    print(f"📅 交易日历: trading_day 模块（{len(_TRADING_DAY_SET)} 天）")
 
 
 def _is_trading_day(d: str) -> bool:
@@ -488,7 +458,7 @@ def check_quality(
         if cls == "bad":
             expected_action = "delete"
         elif cls == "suspended":
-            expected_action = "skip"
+            continue  # 停牌数据不写入问题表
         else:  # incomplete
             expected_action = "review"
 
@@ -1118,7 +1088,7 @@ def main():
                         help="进程数（默认 CPU 核数，上限 16）")
     parser.add_argument("--dry-run", action="store_true", help="只打印不写库")
     parser.add_argument("--fix", action="store_true",
-                        help="删除坏数据行（OHLC 全零），默认只标记不删")
+                        help="标记坏数据行（OHLC 全零），不再删除")
     parser.add_argument("--delist-threshold", type=int, default=60,
                         help="退市判定阈值：最后数据距今超过该天数视为退市（默认 60 天）")
     parser.add_argument("--clean-delist", action="store_true",
@@ -1408,10 +1378,9 @@ def main():
                 n = write_issues(pool_db, all_gaps, all_issues)
                 print(f"✅ 写入 {ISSUE_TABLE}: {n} 条")
 
-            # 删除坏数据
+            # --fix: 坏数据只标记不删除（已通过 write_issues 写入 bad 类型记录）
             if args.fix and all_bad:
-                deleted = delete_bad_records(pool_db, market, all_bad)
-                print(f"🗑️  已删除坏数据行: {deleted} 条")
+                print(f"📝 标记坏数据: {len(all_bad)} 条（仅写入报告，不删除）")
 
         except Exception as e:
             print(f"\n❌ 数据库操作失败: {e}")

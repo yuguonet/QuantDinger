@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-🔧 通达信修复模式 - A股数据断裂自动修复
+🔧 数据断裂自动修复
 
 与 check_continuity.py 联动，逐只股票修复已下载数据中的断裂和坏数据。
 数据直接写入 db_market，不做 CSV 写操作。
 
-流程: 检测断裂 → 逐只股票处理（停牌填充→akshare/通达信下载→验证→清理报表）
+流程: 检测断裂 → 逐只股票处理（DataSourceFactory 获取前复权数据→写入→验证→清理报表）
 
 数据源策略:
-  日线 gap 优先用 akshare 前复权数据（时间戳匹配更可靠），
-  分钟线 gap 仍走通达信（akshare 不支持分钟线前复权）。
-  加 --no-fallback 可强制全部走通达信。
+  统一通过 DataSourceFactory 获取数据（自动 provider fallback + 熔断），
+  再由 adjust_kline 计算前复权，写入 db_market。
 
 用法:
   python tdx_repair.py -T 1D                        # 检测+修复日线断裂
@@ -18,13 +17,11 @@
   python tdx_repair.py -T 1D --dry-run              # 仅检测，不下载不写库
   python tdx_repair.py -T 1D --symbol 600519        # 单只股票修复
   python tdx_repair.py -T 1D --workers 10           # 10进程并行修复
-  python tdx_repair.py -T 1D --no-fallback          # 禁用akshare（仅用通达信）
 
 依赖:
   - check_continuity.py (同目录)
   - db_market.py / db_multi.py（backend_api_python/app/utils/）
-  - pytdx
-  - akshare（可选，用于换源补数和停牌检测）
+  - DataSourceFactory（backend_api_python/app/data_sources/）
 """
 
 import os
@@ -32,34 +29,31 @@ import sys
 import json
 import time
 from datetime import datetime, timedelta, timezone
-from multiprocessing import Pool
-from pytdx.hq import TdxHq_API
+from collections import defaultdict
 import logging
 logger = logging.getLogger(__name__)
+
+# 延迟导入 DataSourceFactory（避免循环依赖）
+_factory = None
+
+def _get_factory():
+    """获取全局 DataSourceFactory 单例（延迟导入）"""
+    global _factory
+    if _factory is None:
+        _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _backend_root = os.path.join(_project_root, "backend_api_python")
+        if _backend_root not in sys.path:
+            sys.path.insert(0, _backend_root)
+        from app.data_sources.factory import get_factory
+        _factory = get_factory()
+    return _factory
 
 
 # ═══════════════════════════════════════════════════════
 # 公共常量（与 tdx_download.py 保持一致）
 # ═══════════════════════════════════════════════════════
 
-CONNECT_TIMEOUT = 5
-
-SERVERS = [
-    ('218.75.126.9', 7709),
-    ('115.238.56.198', 7709),
-    ('124.160.88.183', 7709),
-    ('60.12.136.250', 7709),
-    ('218.108.98.244', 7709),
-    ('218.108.47.69', 7709),
-    ('180.153.39.51', 7709),
-]
-
 _TZ_SH = timezone(timedelta(hours=8))
-
-PERIOD_DIR = {
-    '1D': 'daily', '1m': '1m', '5m': '5m',
-    '15m': '15m', '30m': '30m', '60m': '1h',
-}
 
 
 # ═══════════════════════════════════════════════════════
@@ -132,29 +126,16 @@ def validate_and_calibrate_time(dt, timeframe: str, tolerance_min: int = 1):
             return None, "discarded"
 
     else:
+        # 15:00~15:59 的数据视为收盘 bar，校准到 15:00
+        if total_min >= 900 and total_min < 960:
+            calibrated = dt.replace(hour=15, minute=0, second=0, microsecond=0)
+            return calibrated, "calibrated"
+
         logger.warning(
             f"15m 时间不在交易时段，丢弃: {dt.strftime('%Y-%m-%d %H:%M:%S')} "
-            f"(有效时段 09:30-11:30, 13:00-14:45)"
+            f"(有效时段 09:30-11:30, 13:00-15:00)"
         )
         return None, "discarded"
-
-
-# ═══════════════════════════════════════════════════════
-# 连接通达信服务器
-# ═══════════════════════════════════════════════════════
-
-def _connect_api(worker_id):
-    """连接通达信服务器，带超时，自动切换备用服务器"""
-    for attempt in range(len(SERVERS)):
-        idx = (worker_id + attempt) % len(SERVERS)
-        srv = SERVERS[idx]
-        try:
-            api = TdxHq_API()
-            api.connect(srv[0], srv[1], time_out=CONNECT_TIMEOUT)
-            return api
-        except Exception:
-            continue
-    raise ConnectionError(f"Worker-{worker_id}: 所有服务器连接失败")
 
 
 # ═══════════════════════════════════════════════════════
@@ -182,24 +163,6 @@ def _truncate_ts_to_minute(ts) -> int:
     dt = dt.replace(second=0, microsecond=0)
     return int(dt.timestamp())
 
-
-def _ensure_datetime_repair(value):
-    """将各种时间格式统一转为 datetime 对象（TIMESTAMP 列兼容）"""
-    if isinstance(value, datetime):
-        return value
-    if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(value, tz=_TZ_SH)
-    if isinstance(value, str):
-        for fmt in ('%Y-%m-%dT%H:%M:%S%z', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M',
-                     '%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%d'):
-            try:
-                dt = datetime.strptime(value.strip(), fmt)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=_TZ_SH)
-                return dt
-            except ValueError:
-                continue
-    raise ValueError(f"无法解析时间值: {value!r}")
 
 
 def _repair_ts_to_date(ts):
@@ -268,263 +231,150 @@ def _repair_load_gaps_from_db(market, timeframe_filter=None, symbol_filter=None)
 
 
 # ═══════════════════════════════════════════════════════
-# 从通达信拉取 K 线数据
+# 通过 DataSourceFactory 获取前复权数据
 # ═══════════════════════════════════════════════════════
 
-def _repair_fetch_bars(api, market, code, freq, start_date, end_date):
-    """从通达信拉取指定日期范围的 K 线数据"""
-    all_bars = []
-    max_offset = 800 * 10
+def _calc_fetch_count(start_date: str, end_date: str, timeframe: str) -> int:
+    """根据日期范围和周期估算需要拉取的 bar 数量（留 2 倍余量）"""
+    try:
+        d0 = datetime.strptime(start_date, "%Y-%m-%d")
+        d1 = datetime.strptime(end_date, "%Y-%m-%d")
+        days = max((d1 - d0).days, 1)
+    except ValueError:
+        days = 30
 
-    for offset in range(0, max_offset, 800):
-        bars = api.get_security_bars(freq, market, code, offset, 800)
-        if not bars:
-            break
-        all_bars = bars + all_bars
-        if len(bars) < 800:
-            break
-        try:
-            first_dt = bars[0]["datetime"][:10]
-            if first_dt <= start_date:
-                break
-        except (KeyError, IndexError):
-            pass
-
-    is_daily = (freq == 9)
-    filtered = []
-    for b in all_bars:
-        try:
-            dt_str = b["datetime"][:10]
-            if start_date <= dt_str <= end_date:
-                dt = datetime.strptime(b["datetime"][:16], "%Y-%m-%d %H:%M")
-                if is_daily:
-                    dt = dt.replace(hour=0, minute=0, second=0)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=_TZ_SH)
-                filtered.append({
-                    "time": dt,
-                    "open": b["open"],
-                    "high": b["high"],
-                    "low": b["low"],
-                    "close": b["close"],
-                    "volume": int(b["vol"]),
-                    "amount": b["amount"],
-                })
-        except (KeyError, ValueError):
-            continue
-
-    return filtered
+    bars_per_day = {
+        "1D": 1, "15m": 16, "1m": 240, "5m": 48, "30m": 8, "60m": 4,
+    }
+    per_day = bars_per_day.get(timeframe, 16)
+    return max(days * per_day * 2, 100)
 
 
-# ═══════════════════════════════════════════════════════
-# 修复工作进程
-# ═══════════════════════════════════════════════════════
+def _repair_fetch_from_factory(code, gaps, timeframe, market="CNStock"):
+    """
+    通过 DataSourceFactory 获取前复权 K 线数据，按 expected_ts 过滤。
 
-def _repair_worker(args):
-    """修复工作进程 — 始终写入 db_market"""
-    task_list, worker_id, freq = args
+    流程:
+      1. 估算 fetch count，调用 SourceAdapter.get_kline(adj="qfq")
+      2. 按 gap 的 expected_ts 时间戳集合过滤
+      3. 返回匹配的 bars 列表
+    """
+    all_start = min(g["start_date"] for g in gaps)
+    all_end = max(g["end_date"] for g in gaps)
 
-    api = _connect_api(worker_id)
+    # 收集所有需要的时间戳（截断到分钟用于比对）
+    expected_ts_set = set()
+    for g in gaps:
+        for ts in g.get("expected_ts", []):
+            expected_ts_set.add(_truncate_ts_to_minute(ts))
 
-    repaired = 0
-    failed = 0
-    total_bars = 0
-    errors = []
-    result_gaps_remaining = []
-
-    import sys as _sys
-    import os as _os
-    _proj = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
-    _be = _os.path.join(_proj, "backend_api_python")
-    if _be not in _sys.path:
-        _sys.path.insert(0, _be)
-    from app.utils.db_market import get_market_kline_writer
-    writer = get_market_kline_writer()
-
-    for code, market_int, gaps in task_list:
-        try:
-            all_start = min(g["start_date"] for g in gaps)
-            all_end = max(g["end_date"] for g in gaps)
-
-            expected_ts_set = set()
-            for g in gaps:
-                for ts in g.get("expected_ts", []):
-                    expected_ts_set.add(_truncate_ts_to_minute(ts))
-
-            bars = _repair_fetch_bars(api, market_int, code, freq, all_start, all_end)
-
-            if not bars:
-                failed += 1
-                errors.append(f"{code}: 数据源缺失 ({all_start}~{all_end})")
-                for g in gaps:
-                    result_gaps_remaining.append(g)
-                continue
-
-            if expected_ts_set:
-                bars = [b for b in bars if _truncate_ts_to_minute(b["time"]) in expected_ts_set]
-
-            if not bars:
-                failed += 1
-                errors.append(f"{code}: 数据源缺失（时间戳无匹配）")
-                for g in gaps:
-                    result_gaps_remaining.append(g)
-                continue
-
-            timeframe_map = {9: "1D", 1: "15m", 4: "1m", 0: "5m", 5: "30m", 6: "60m"}
-            tf = timeframe_map.get(freq, f"{freq}m")
-            records = []
-            discarded = 0
-            for b in bars:
-                dt_cal, action = validate_and_calibrate_time(b["time"], tf)
-                if dt_cal is None:
-                    discarded += 1
-                    continue
-                records.append({
-                    "symbol": code,
-                    "timeframe": tf,
-                    "time": dt_cal,
-                    "open": b["open"],
-                    "high": b["high"],
-                    "low": b["low"],
-                    "close": b["close"],
-                    "volume": b["volume"],
-                })
-            if discarded > 0:
-                logger.warning(f"{code}: 丢弃 {discarded} 条时间校验失败的 {tf} 记录")
-            result = writer.bulk_write("CNStock", records, batch_size=5000)
-            total_bars += result.get("inserted", 0)
-
-            repaired += 1
-
-        except (ConnectionError, OSError, TimeoutError):
-            try:
-                api = _connect_api(worker_id)
-            except ConnectionError:
-                pass
-            failed += 1
-            errors.append(f"{code}: 连接失败")
-        except Exception as e:
-            failed += 1
-            errors.append(f"{code}: {type(e).__name__}: {e}")
+    count = _calc_fetch_count(all_start, all_end, timeframe)
 
     try:
-        api.disconnect()
-    except Exception:
-        pass
-
-    return (worker_id, repaired, failed, total_bars, errors, result_gaps_remaining)
-
-
-# ═══════════════════════════════════════════════════════
-# akshare 换源补数
-# ═══════════════════════════════════════════════════════
-
-def _repair_fetch_akshare(code, start_date, end_date, timeframe="1D"):
-    """从 akshare 获取前复权 K 线数据"""
-    try:
-        import akshare as ak
-    except ImportError:
+        factory = _get_factory()
+        source = factory.get_source(market)
+        # SourceAdapter.get_kline 内部: fetch_kline_raw → adjust_kline(qfq)
+        # 返回前复权后的 bars，time 为 unix timestamp (int)
+        bars = source.get_kline(code, timeframe, count)
+    except Exception as e:
+        logger.warning(f"[Factory] 获取 K 线失败 {code} tf={timeframe}: {e}")
         return []
 
-    try:
-        sym = code.strip()
-        df = ak.stock_zh_a_hist(
-            symbol=sym,
-            period="daily",
-            start_date=start_date.replace("-", ""),
-            end_date=end_date.replace("-", ""),
-            adjust="qfq",
-        )
-        if df is None or df.empty:
-            return []
-
-        records = []
-        for _, row in df.iterrows():
-            dt_str = str(row["日期"])[:10]
-            dt = datetime.strptime(dt_str, "%Y-%m-%d")
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=_TZ_SH)
-            records.append({
-                "time": dt,
-                "open": float(row["开盘"]),
-                "high": float(row["最高"]),
-                "low": float(row["最低"]),
-                "close": float(row["收盘"]),
-                "volume": int(row["成交量"]),
-            })
-        return records
-    except Exception:
+    if not bars:
         return []
 
+    # 按日期范围粗筛
+    start_dt = datetime.strptime(all_start, "%Y-%m-%d").replace(tzinfo=_TZ_SH)
+    end_dt = datetime.strptime(all_end, "%Y-%m-%d").replace(hour=23, minute=59, tzinfo=_TZ_SH)
+    start_ts = int(start_dt.timestamp())
+    end_ts = int(end_dt.timestamp())
+    bars = [b for b in bars if start_ts <= b.get("time", 0) <= end_ts]
 
-def _repair_fallback_akshare(remaining_gaps, data_type, writer, market="CNStock", today=None):
-    """对通达信修不了的 gap，用 akshare 前复权数据补数，直接写入 db"""
-    if today is None:
-        today = datetime.now(_TZ_SH).strftime("%Y-%m-%d")
+    if not bars:
+        return []
 
-    gaps_to_fix = [g for g in remaining_gaps if g["timeframe"] == "1D"]
-    other_gaps = [g for g in remaining_gaps if g["timeframe"] != "1D"]
+    # 按 expected_ts 精确匹配（如果有）
+    if expected_ts_set:
+        bars = [b for b in bars if _truncate_ts_to_minute(b["time"]) in expected_ts_set]
 
-    if not gaps_to_fix:
-        return 0, len(remaining_gaps), [], remaining_gaps
+    return bars
 
-    symbol_gaps = {}
-    for g in gaps_to_fix:
-        code = g["symbol"]
-        if code not in symbol_gaps:
-            symbol_gaps[code] = []
-        symbol_gaps[code].append(g)
 
-    fixed = []
-    still_remaining = list(other_gaps)
+def _repair_aggregate_15m_to_1d(code, gaps, market="CNStock"):
+    """
+    当 DataSourceFactory 取 1D 数据失败时，从 15m 数据聚合补数。
 
-    for code, gaps in symbol_gaps.items():
-        all_start = min(g["start_date"] for g in gaps)
-        all_end = max(g["end_date"] for g in gaps)
+    流程:
+      1. 从 DataSourceFactory 获取 15m 前复权数据
+      2. 按日期分组，每天 ≥8 根 bar 才算有效
+      3. 聚合: open=第一根, high=MAX, low=MIN, close=最后一根, volume=SUM
+      4. 返回 1D bars（时间戳为当天午夜）
+    """
+    missing_dates = set()
+    for g in gaps:
+        for ts in g.get("expected_ts", []):
+            d = _repair_ts_to_date(ts)
+            missing_dates.add(d)
 
-        expected_ts_set = set()
-        for g in gaps:
-            for ts in g.get("expected_ts", []):
-                expected_ts_set.add(_truncate_ts_to_minute(ts))
+    if not missing_dates:
+        return []
 
-        bars = _repair_fetch_akshare(code, all_start, all_end, "1D")
-        if not bars:
-            still_remaining.extend(gaps)
-            continue
+    # 计算需要多少 15m bar（每天 16 根，留 2 倍余量）
+    count = max(len(missing_dates) * 16 * 2, 200)
 
-        if expected_ts_set:
-            bars = [b for b in bars if _truncate_ts_to_minute(b["time"]) in expected_ts_set]
+    try:
+        factory = _get_factory()
+        source = factory.get_source(market)
+        bars_15m = source.get_kline(code, "15m", count)
+    except Exception as e:
+        logger.warning(f"[Factory] 15m 聚合获取失败 {code}: {e}")
+        return []
 
-        if not bars:
-            still_remaining.extend(gaps)
-            continue
+    if not bars_15m:
+        return []
 
-        records = []
-        discarded = 0
-        for b in bars:
-            dt_cal, action = validate_and_calibrate_time(b["time"], "1D")
-            if dt_cal is None:
-                discarded += 1
-                continue
-            records.append({
-                "symbol": code,
-                "timeframe": "1D",
-                "time": dt_cal,
-                "open": b["open"],
-                "high": b["high"],
-                "low": b["low"],
-                "close": b["close"],
-                "volume": b["volume"],
-            })
-        if discarded > 0:
-            logger.warning(f"{code}: 丢弃 {discarded} 条时间校验失败的 1D 记录")
-        result = writer.bulk_write(market, records, batch_size=5000)
-        if result.get("inserted", 0) > 0:
-            fixed.extend(gaps)
+    # 按日期分组
+    date_to_bars = defaultdict(list)
+    for b in bars_15m:
+        ts = b.get("time", 0)
+        if isinstance(ts, (int, float)):
+            d = datetime.fromtimestamp(ts, tz=_TZ_SH).strftime("%Y-%m-%d")
+        elif isinstance(ts, datetime):
+            d = (ts if ts.tzinfo else ts.replace(tzinfo=_TZ_SH)).strftime("%Y-%m-%d")
         else:
-            still_remaining.extend(gaps)
+            continue
+        if d in missing_dates:
+            date_to_bars[d].append(b)
 
-    return len(fixed), len(still_remaining), fixed, still_remaining
+    # 逐日聚合
+    result = []
+    for d, day_bars in sorted(date_to_bars.items()):
+        if len(day_bars) < 8:
+            continue
+
+        day_bars.sort(key=lambda x: x.get("time", 0))
+        o = day_bars[0]["open"]
+        h = max(b["high"] for b in day_bars)
+        lo = min(b["low"] for b in day_bars)
+        c = day_bars[-1]["close"]
+        vol = sum(b.get("volume", 0) for b in day_bars)
+
+        if o == 0 and h == 0 and lo == 0 and c == 0:
+            continue
+
+        # 1D bar 时间戳统一用当天午夜（与 expected_ts / 数据库格式一致）
+        dt = datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=_TZ_SH)
+
+        result.append({
+            "time": dt,
+            "open": o,
+            "high": h,
+            "low": lo,
+            "close": c,
+            "volume": vol,
+        })
+
+    return result
 
 
 # ═══════════════════════════════════════════════════════
@@ -623,132 +473,11 @@ def _repair_cleanup_reports(market, fixed_gaps):
 
 
 # ═══════════════════════════════════════════════════════
-# 停牌检测与填充
-# ═══════════════════════════════════════════════════════
-
-def _repair_check_suspend_baidu(code, gap_start, gap_end):
-    """查询百度停牌数据，确认股票在 gap 期间是否停牌"""
-    try:
-        import akshare as ak
-
-        gap_dt = datetime.strptime(gap_start, "%Y-%m-%d")
-        search_dates = []
-        for i in range(0, 31):
-            d = gap_dt - timedelta(days=i)
-            search_dates.append(d.strftime("%Y%m%d"))
-
-        for date_str in search_dates:
-            try:
-                df = ak.news_trade_notify_suspend_baidu(date=date_str)
-            except Exception:
-                continue
-            if df is None or df.empty:
-                continue
-
-            for _, row in df.iterrows():
-                row_code = str(row.get("股票代码", "")).strip()
-                if row_code != code:
-                    continue
-                suspend_start = str(row.get("停牌时间", ""))[:10]
-                resume_date = str(row.get("复牌时间", ""))[:10]
-                reason = str(row.get("停牌事项说明", ""))
-                if not suspend_start:
-                    continue
-                if suspend_start <= gap_end:
-                    if not resume_date or resume_date >= gap_start:
-                        return {
-                            "suspend_start": suspend_start,
-                            "resume_date": resume_date or "",
-                            "reason": reason,
-                        }
-        return None
-    except Exception:
-        return None
-
-
-def _repair_fill_suspend(code, gaps, freq, writer, market="CNStock"):
-    """用停牌前最后收盘价填充停牌期间的数据，直接写入数据库"""
-    if not writer:
-        return 0, 0
-
-    timeframe_map = {9: "1D", 1: "15m", 4: "1m", 0: "5m", 5: "30m", 6: "60m"}
-    timeframe = timeframe_map.get(freq, f"{freq}m")
-
-    existing = {}
-    try:
-        rows = writer.query(market, code, timeframe, limit=10)
-        if rows:
-            for r in rows:
-                existing[r["time"]] = r.get("close", 0)
-    except Exception:
-        pass
-
-    if not existing:
-        return 0, 0
-
-    _naive_fixed = {}
-    for _k, _v in existing.items():
-        if isinstance(_k, datetime) and _k.tzinfo is None:
-            _k = _k.replace(tzinfo=_TZ_SH)
-        _naive_fixed[_k] = _v
-    existing = _naive_fixed
-
-    sorted_ts = sorted(existing.keys())
-
-    filled_count = 0
-    total_bars = 0
-    all_records = []
-
-    for g in gaps:
-        expected_ts_list = g.get("expected_ts", [])
-        if not expected_ts_list:
-            continue
-
-        expected_ts_list = [_ensure_datetime_repair(t) for t in expected_ts_list]
-
-        gap_first_ts = min(expected_ts_list)
-        last_close = None
-        for ts in reversed(sorted_ts):
-            if ts < gap_first_ts:
-                last_close = existing[ts]
-                break
-        if last_close is None:
-            for ts in sorted_ts:
-                if ts > max(expected_ts_list):
-                    last_close = existing[ts]
-                    break
-        if last_close is None:
-            continue
-
-        for ts in expected_ts_list:
-            all_records.append({
-                "symbol": code,
-                "timeframe": timeframe,
-                "time": ts,
-                "open": last_close,
-                "high": last_close,
-                "low": last_close,
-                "close": last_close,
-                "volume": 0,
-            })
-            total_bars += 1
-        filled_count += 1
-
-    if all_records:
-        result = writer.bulk_write(market, all_records, batch_size=5000)
-        inserted = result.get("inserted", 0)
-        if inserted == 0:
-            return 0, 0
-
-    return filled_count, total_bars
-
-
-# ═══════════════════════════════════════════════════════
 # 单只股票修复主流程
 # ═══════════════════════════════════════════════════════
 
-def _repair_single_stock(code, gaps, freq, out_dir, market, no_fallback, dry_run, today):
-    """逐只股票修复：先查停牌 → 停牌补数据 → 非停牌走 akshare/tdx → 验证 → 清理"""
+def _repair_single_stock(code, gaps, freq, out_dir, market, dry_run, today):
+    """逐只股票修复：DataSourceFactory 获取前复权数据 → 写入 → 验证 → 清理"""
     result = {
         "code": code,
         "repaired": 0,
@@ -757,7 +486,6 @@ def _repair_single_stock(code, gaps, freq, out_dir, market, no_fallback, dry_run
         "fixed_gaps": [],
         "remaining_gaps": [],
         "errors": [],
-        "suspended": False,
     }
 
     if dry_run:
@@ -768,6 +496,9 @@ def _repair_single_stock(code, gaps, freq, out_dir, market, no_fallback, dry_run
     subdir = freq_to_dir.get(freq, f"{freq}m")
     data_type = subdir
 
+    timeframe_map = {9: "1D", 1: "15m", 4: "1m", 0: "5m", 5: "30m", 6: "60m"}
+    timeframe = timeframe_map.get(freq, f"{freq}m")
+
     _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     _backend_root = os.path.join(_project_root, "backend_api_python")
     if _backend_root not in sys.path:
@@ -775,73 +506,79 @@ def _repair_single_stock(code, gaps, freq, out_dir, market, no_fallback, dry_run
     from app.utils.db_market import get_market_kline_writer
     writer = get_market_kline_writer()
 
-    # 第一步: 逐个 gap 查停牌
-    suspend_gaps = []
-    normal_gaps = []
+    # 第一步: 通过 DataSourceFactory 获取前复权数据
+    bars = _repair_fetch_from_factory(code, gaps, timeframe, market)
 
-    for g in gaps:
-        suspend_info = _repair_check_suspend_baidu(code, g["start_date"], g["end_date"])
-        if suspend_info:
-            suspend_gaps.append(g)
-            result["suspended"] = True
+    # 1D 失败 → 尝试从 15m 聚合
+    if not bars and timeframe == "1D":
+        bars = _repair_aggregate_15m_to_1d(code, gaps, market)
+        if bars:
+            logger.info(f"{code}: DataSourceFactory 1D 失败，从 15m 聚合 {len(bars)} 根")
+
+    if not bars:
+        result["failed"] = 1
+        result["errors"].append(f"{code}: DataSourceFactory 数据缺失")
+        result["remaining_gaps"] = gaps
+        return result
+
+    # 第二步: 校验时间戳 + 构造写入记录
+    records = []
+    discarded = 0
+    for b in bars:
+        # DataSourceFactory 返回 time 为 unix timestamp (int)，转为 datetime
+        ts = b["time"]
+        if isinstance(ts, (int, float)):
+            dt = datetime.fromtimestamp(ts, tz=_TZ_SH)
+        elif isinstance(ts, datetime):
+            dt = ts if ts.tzinfo else ts.replace(tzinfo=_TZ_SH)
         else:
-            normal_gaps.append(g)
+            discarded += 1
+            continue
 
-    # 第二步: 停牌 gap → 用最后收盘价填充
-    if suspend_gaps:
-        filled, bars = _repair_fill_suspend(code, suspend_gaps, freq,
-                                             writer=writer, market=market)
-        if filled > 0:
-            result["repaired"] += filled
-            result["bars"] += bars
-            result["fixed_gaps"].extend(suspend_gaps)
-        else:
-            normal_gaps.extend(suspend_gaps)
+        dt_cal, action = validate_and_calibrate_time(dt, timeframe)
+        if dt_cal is None:
+            discarded += 1
+            continue
+        records.append({
+            "symbol": code,
+            "timeframe": timeframe,
+            "time": dt_cal,
+            "open": b["open"],
+            "high": b["high"],
+            "low": b["low"],
+            "close": b["close"],
+            "volume": b.get("volume", 0),
+        })
+    if discarded > 0:
+        logger.warning(f"{code}: 丢弃 {discarded} 条时间校验失败的 {timeframe} 记录")
 
-    # 第三步: 非停牌 gap → akshare / 通达信修复
-    gaps_1d = [g for g in normal_gaps if g["timeframe"] == "1D"]
-    gaps_min = [g for g in normal_gaps if g["timeframe"] != "1D"]
-    remaining_after_repair = []
+    if not records:
+        result["failed"] = 1
+        result["errors"].append(f"{code}: 所有记录时间校验失败")
+        result["remaining_gaps"] = gaps
+        return result
 
-    # 日线 → akshare 优先
-    if gaps_1d and not no_fallback:
-        ak_fixed_n, ak_remaining_n, ak_fixed_g, ak_remaining_g = \
-            _repair_fallback_akshare(gaps_1d, "1D", writer, market, today)
-        if ak_fixed_n > 0:
-            result["repaired"] += ak_fixed_n
-            result["fixed_gaps"].extend(ak_fixed_g)
-            result["bars"] += sum(len(g.get("expected_ts", [])) for g in ak_fixed_g)
-        if ak_remaining_g:
-            remaining_after_repair.extend(ak_remaining_g)
-    elif gaps_1d and no_fallback:
-        remaining_after_repair.extend(gaps_1d)
+    # 第三步: 写入 db
+    try:
+        write_result = writer.bulk_write(market, records, batch_size=5000)
+        result["bars"] = write_result.get("inserted", 0)
+        result["repaired"] = 1
+    except Exception as e:
+        result["failed"] = 1
+        result["errors"].append(f"{code}: 写入失败: {e}")
+        result["remaining_gaps"] = gaps
+        return result
 
-    # 分钟线 + akshare 没修好的日线 → 通达信
-    tdx_gaps = gaps_min + remaining_after_repair
-    remaining_after_repair = []
+    # 第四步: 验证修复结果
+    try:
+        fixed_gaps, still_broken = _repair_verify_fixed(writer, market, data_type, gaps, today)
+        result["fixed_gaps"] = fixed_gaps
+        result["remaining_gaps"] = still_broken
+    except Exception as e:
+        result["errors"].append(f"{code}: 验证失败: {e}")
+        result["remaining_gaps"] = gaps
 
-    if tdx_gaps:
-        market_int = 1 if code.startswith(("60", "68")) else 0
-        task_list = [(code, market_int, tdx_gaps)]
-        worker_args = (task_list, 0, freq)
-        _, repaired, failed, total_bars, errors, tdx_remaining = _repair_worker(worker_args)
-
-        result["repaired"] += repaired
-        result["failed"] += failed
-        result["bars"] += total_bars
-        result["errors"].extend(errors)
-
-        attempted_gaps = [g for g in tdx_gaps if g not in tdx_remaining]
-        if attempted_gaps:
-            fixed_gaps, still_broken = _repair_verify_fixed(writer, market, data_type, attempted_gaps, today)
-            result["fixed_gaps"].extend(fixed_gaps)
-            remaining_after_repair = tdx_remaining + still_broken
-        else:
-            remaining_after_repair = tdx_remaining
-
-    result["remaining_gaps"] = remaining_after_repair
-
-    # 第四步: 清理已修复的报表记录
+    # 第五步: 清理已修复的报表记录
     if result["fixed_gaps"]:
         try:
             gap_del = _repair_cleanup_reports(market, result["fixed_gaps"])
@@ -857,7 +594,7 @@ def _repair_single_stock(code, gaps, freq, out_dir, market, no_fallback, dry_run
 # ═══════════════════════════════════════════════════════
 
 def run_repair(data_type, out_dir, workers=5, dry_run=False, symbol=None,
-               market="CNStock", db_url=None, no_fallback=False):
+               market="CNStock", db_url=None):
     """主修复入口 — 逐只股票模式"""
     if db_url:
         os.environ["DATABASE_URL"] = db_url
@@ -886,7 +623,7 @@ def run_repair(data_type, out_dir, workers=5, dry_run=False, symbol=None,
 
     print(f"\n{'='*55}")
     print(f"  🔧 修复模式（逐只股票） | {data_type} | {market}")
-    print(f"  dry-run={dry_run}  symbol={symbol or '全部'}  换源={'关' if no_fallback else '开'}")
+    print(f"  dry-run={dry_run}  symbol={symbol or '全部'}  数据源=DataSourceFactory")
     print(f"{'='*55}")
 
     # 阶段 1: 从 db 读取 gap 列表
@@ -965,7 +702,6 @@ def run_repair(data_type, out_dir, workers=5, dry_run=False, symbol=None,
             freq=freq,
             out_dir=out_dir,
             market=market,
-            no_fallback=no_fallback,
             dry_run=dry_run,
             today=today,
         )
@@ -979,9 +715,7 @@ def run_repair(data_type, out_dir, workers=5, dry_run=False, symbol=None,
 
         fixed_n = len(result["fixed_gaps"])
         remain_n = len(result["remaining_gaps"])
-        if result.get("suspended"):
-            status = f"  🔄 停牌填充 {fixed_n} gap (停牌期间价不变量为0)"
-        elif fixed_n > 0 and remain_n == 0:
+        if fixed_n > 0 and remain_n == 0:
             status = f"  ✅ 已修复 {fixed_n} gap"
         elif fixed_n > 0 and remain_n > 0:
             status = f"  ⚠️  修复 {fixed_n}, 剩余 {remain_n} (数据源缺失)"
@@ -1033,7 +767,7 @@ def run_repair(data_type, out_dir, workers=5, dry_run=False, symbol=None,
 def main():
     import argparse
     ap = argparse.ArgumentParser(
-        description='🔧 通达信修复模式 - A股数据断裂自动修复',
+        description='🔧 数据断裂自动修复 - 通过 DataSourceFactory 获取前复权数据',
         formatter_class=argparse.RawTextHelpFormatter,
     )
     ap.add_argument('--type', '-T',
@@ -1052,8 +786,6 @@ def main():
         help='数据库连接 URL (默认从 DATABASE_URL 环境变量读取)')
     ap.add_argument('--dry-run', action='store_true',
         help='仅检测断裂，不执行下载和写库。')
-    ap.add_argument('--no-fallback', action='store_true',
-        help='禁用 akshare 换源补数，仅用通达信修复。')
     ap.add_argument('--symbol', type=str, default=None,
         help='只修复指定股票代码，如 600519。')
     ap.add_argument('--market', type=str, default='CNStock',
@@ -1063,7 +795,7 @@ def main():
 
     print(f"""
 ╔═══════════════════════════════════════════════════╗
-║  🔧 修复模式 - 通达信补数                          ║
+║  🔧 修复模式 - DataSourceFactory 前复权补数        ║
 ║  与 check_continuity.py 联动，自动修复数据断裂      ║
 ╠═══════════════════════════════════════════════════╣
 ║  类型: {args.type:<10}  进程: {args.workers:<6}               ║
@@ -1079,7 +811,6 @@ def main():
         symbol=args.symbol,
         market=args.market,
         db_url=args.db_url,
-        no_fallback=args.no_fallback,
     )
 
 
