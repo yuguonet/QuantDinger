@@ -73,7 +73,7 @@ PERIOD_DIR = {
 
 
 # ═══════════════════════════════════════════════════════
-# 15m 标准 bar 时间表 & 时间校验
+# 15m 标准 bar 时间表（17 根）
 # ═══════════════════════════════════════════════════════
 
 _BAR_TIMES_15M = [
@@ -82,90 +82,31 @@ _BAR_TIMES_15M = [
 ]
 
 
-def validate_and_calibrate_time(dt, timeframe: str, tolerance_min: int = 1):
-    """校验写入数据库的时间戳，对齐到标准 bar 时间
-
-    15m 数据：时间必须落在 A 股交易时间的 ±tolerance_min 分钟内，
-    超出容差的记录直接丢弃并返回 None。
-    非 15m 数据（1D 等）：只做基本的时区补全，不做 bar 对齐。
-
-    Args:
-        dt: datetime 对象（需带时区）
-        timeframe: K 线周期，如 "15m", "1D"
-        tolerance_min: 容差分钟数（默认 1）
-
-    Returns:
-        (calibrated_dt, action)
-        - calibrated_dt: 校准后的 datetime，或 None（丢弃）
-        - action: "ok"=无需校准  "calibrated"=已校准  "discarded"=已丢弃
+def validate_and_calibrate_time(dt, timeframe: str):
+    """
+    校准写入数据库的时间戳（仅 15m）：
+      - 11:30~13:00 → 11:30
+      - 15:00~23:59 → 15:00
+      - 其他时间保持原样
+    不丢弃任何记录。
     """
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=_TZ_SH)
 
-    # 非 15m 数据只做基本校验
     if timeframe != "15m":
-        return dt, "ok"
+        return dt
 
     total_min = dt.hour * 60 + dt.minute
-    tolerance = tolerance_min
 
-    # 上午时段: 9:30 ~ 11:30 (570 ~ 690)
-    if 570 <= total_min <= 690:
-        best_diff = 999
-        best_bar = None
-        for h, m in _BAR_TIMES_15M:
-            if h >= 12:
-                continue
-            bar_min = h * 60 + m
-            diff = abs(total_min - bar_min)
-            if diff < best_diff:
-                best_diff = diff
-                best_bar = (h, m)
+    # 11:30~13:00 → 11:30
+    if 690 <= total_min < 780:
+        return dt.replace(hour=11, minute=30, second=0, microsecond=0)
 
-        if best_diff <= tolerance:
-            if best_diff == 0:
-                return dt, "ok"
-            calibrated = dt.replace(hour=best_bar[0], minute=best_bar[1], second=0, microsecond=0)
-            return calibrated, "calibrated"
-        else:
-            logger.warning(
-                f"15m 时间偏差过大（{best_diff}分钟 > 容差{tolerance}分钟），丢弃: "
-                f"{dt.strftime('%Y-%m-%d %H:%M:%S')} 最近标准bar={best_bar[0]:02d}:{best_bar[1]:02d}"
-            )
-            return None, "discarded"
+    # 15:00~23:59 → 15:00
+    if total_min >= 900:
+        return dt.replace(hour=15, minute=0, second=0, microsecond=0)
 
-    # 下午时段: 13:00 ~ 15:00 (780 ~ 900)
-    elif 780 <= total_min <= 900:
-        best_diff = 999
-        best_bar = None
-        for h, m in _BAR_TIMES_15M:
-            if h < 12:
-                continue
-            bar_min = h * 60 + m
-            diff = abs(total_min - bar_min)
-            if diff < best_diff:
-                best_diff = diff
-                best_bar = (h, m)
-
-        if best_diff <= tolerance:
-            if best_diff == 0:
-                return dt, "ok"
-            calibrated = dt.replace(hour=best_bar[0], minute=best_bar[1], second=0, microsecond=0)
-            return calibrated, "calibrated"
-        else:
-            logger.warning(
-                f"15m 时间偏差过大（{best_diff}分钟 > 容差{tolerance}分钟），丢弃: "
-                f"{dt.strftime('%Y-%m-%d %H:%M:%S')} 最近标准bar={best_bar[0]:02d}:{best_bar[1]:02d}"
-            )
-            return None, "discarded"
-
-    # 午休 11:30~13:00 或非交易时间 → 丢弃
-    else:
-        logger.warning(
-            f"15m 时间不在交易时段，丢弃: {dt.strftime('%Y-%m-%d %H:%M:%S')} "
-            f"(有效时段 09:30-11:30, 13:00-14:45)"
-        )
-        return None, "discarded"
+    return dt
 
 
 # ═══════════════════════════════════════════════════════
@@ -948,7 +889,7 @@ def _merge_worker(args):
 
                     if dt.tzinfo is None:
                         dt = dt.replace(tzinfo=_tz_sh)
-                    dt, action = validate_and_calibrate_time(dt, timeframe)
+                    dt = validate_and_calibrate_time(dt, timeframe)
                     if dt is None:
                         continue
 

@@ -68,12 +68,15 @@ import sys
 import csv
 import json
 import signal
+import logging
 import argparse
 import traceback
 import multiprocessing as mp
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # 路径 & 环境
@@ -226,8 +229,8 @@ def _date_to_ts(d: str, hour: int = 0, minute: int = 0) -> datetime:
 
 
 # 15m bar 时间表
-_MORNING_BARS = [(9, 30), (9, 45), (10, 0), (10, 15), (10, 30), (10, 45), (11, 0), (11, 15)]
-_AFTERNOON_BARS = [(13, 0), (13, 15), (13, 30), (13, 45), (14, 0), (14, 15), (14, 30), (14, 45)]
+_MORNING_BARS = [(9, 45), (10, 0), (10, 15), (10, 30), (10, 45), (11, 0), (11, 15), (11, 30)]
+_AFTERNOON_BARS = [(13, 15), (13, 30), (13, 45), (14, 0), (14, 15), (14, 30), (14, 45), (15, 0)]
 _ALL_BAR_TIMES = _MORNING_BARS + _AFTERNOON_BARS
 
 
@@ -248,6 +251,40 @@ def _dhm_to_bar_index(dhm: Tuple[str, int, int]) -> int:
         return _ALL_BAR_TIMES.index((dhm[1], dhm[2]))
     except ValueError:
         return -1
+
+
+def _calibrate_15m_records(records: List[Dict[str, Any]], symbol: str) -> List[Dict[str, Any]]:
+    """
+    校准 15m bar 时间戳：
+      - 9:30 的 bar → 丢弃（不参与连贯性检查）
+      - 11:30~13:00 的 bar → 时间改为 11:30
+      - 15:00~23:59 的 bar → 时间改为 15:00
+      - 其他时间保持原样
+    """
+    result = []
+    for rec in records:
+        ts = rec["time"]
+        if isinstance(ts, datetime):
+            dt = ts if ts.tzinfo else ts.replace(tzinfo=TZ_SH)
+        else:
+            dt = datetime.fromtimestamp(ts, tz=TZ_SH)
+
+        total_min = dt.hour * 60 + dt.minute
+
+        # 9:30 → 丢弃
+        if total_min == 570:
+            continue
+
+        # 11:30~13:00 → 11:30
+        if 690 <= total_min < 780:
+            dt = dt.replace(hour=11, minute=30, second=0, microsecond=0)
+        # 15:00~23:59 → 15:00
+        elif total_min >= 900:
+            dt = dt.replace(hour=15, minute=0, second=0, microsecond=0)
+
+        result.append({**rec, "time": dt})
+
+    return result
 
 
 def _expected_15m_ts_for_date(d: str) -> List[datetime]:
@@ -376,6 +413,12 @@ def check_1d_gaps(symbol: str, records: List[Dict[str, Any]], today: str) -> Lis
 def check_15m_gaps(symbol: str, records: List[Dict[str, Any]], today: str) -> List[Dict[str, Any]]:
     if len(records) < 2:
         return []
+
+    # 校准非标时间戳（11:30~13:00 → 11:30，15:00~23:59 → 15:00）
+    records = _calibrate_15m_records(records, symbol)
+    if len(records) < 2:
+        return []
+
     gaps = []
     # 按 (日期, 时, 分) 排序，忽略秒级精度
     dhm_list = sorted(_ts_to_dhm(r["time"]) for r in records)
@@ -843,7 +886,7 @@ def _aggregate_15m_to_1d(
         聚合后的 1D bar 字典，如果数据不足则返回 None
     """
     if not records_15m or len(records_15m) < 8:
-        # 至少需要一半以上的 bar 才算有效
+        # 至少需要一半以上的 bar 才算有效（每天 16 根，阈值 8）
         return None
 
     sorted_recs = sorted(records_15m, key=lambda r: r["time"])

@@ -31,6 +31,10 @@ from app.data_sources.circuit_breaker import (
     get_overseas_circuit_breaker,
 )
 from app.data_sources.normalizer import detect_market
+from app.data_sources.provider import autodiscover
+
+# 自动发现并注册所有 Provider（import 即注册）
+autodiscover()
 
 __all__ = [
     'DataSourceFactory',

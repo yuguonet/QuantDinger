@@ -166,10 +166,13 @@ def _truncate_ts_to_minute(ts) -> int:
 
 
 def _repair_ts_to_date(ts):
-    """从 datetime 对象或整数时间戳提取日期字符串"""
+    """从 datetime 对象、整数时间戳或日期字符串提取日期字符串"""
     if isinstance(ts, datetime):
         dt = ts if ts.tzinfo else ts.replace(tzinfo=_TZ_SH)
         return dt.strftime("%Y-%m-%d")
+    if isinstance(ts, str):
+        # 兼容 "2026-04-30" 或 "2026-04-30 00:00:00" 等格式
+        return ts[:10]
     return datetime.fromtimestamp(ts, tz=_TZ_SH).strftime("%Y-%m-%d")
 
 
@@ -341,6 +344,8 @@ def _repair_aggregate_15m_to_1d(code, gaps, market="CNStock"):
             d = datetime.fromtimestamp(ts, tz=_TZ_SH).strftime("%Y-%m-%d")
         elif isinstance(ts, datetime):
             d = (ts if ts.tzinfo else ts.replace(tzinfo=_TZ_SH)).strftime("%Y-%m-%d")
+        elif isinstance(ts, str):
+            d = ts[:10]
         else:
             continue
         if d in missing_dates:
@@ -531,6 +536,19 @@ def _repair_single_stock(code, gaps, freq, out_dir, market, dry_run, today):
             dt = datetime.fromtimestamp(ts, tz=_TZ_SH)
         elif isinstance(ts, datetime):
             dt = ts if ts.tzinfo else ts.replace(tzinfo=_TZ_SH)
+        elif isinstance(ts, str):
+            # 字符串时间戳，解析为 datetime
+            for fmt in ('%Y-%m-%dT%H:%M:%S%z', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+                try:
+                    dt = datetime.strptime(ts.strip(), fmt)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=_TZ_SH)
+                    break
+                except ValueError:
+                    continue
+            else:
+                discarded += 1
+                continue
         else:
             discarded += 1
             continue

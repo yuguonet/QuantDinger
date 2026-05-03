@@ -110,6 +110,15 @@ def get_eastmoney_limiter() -> RateLimiter:
     return _eastmoney_limiter
 
 
+# AkShare 通过底层库调用东财/新浪等接口，同样需要限流
+_akshare_limiter = RateLimiter(min_interval=0.5, jitter_min=0.1, jitter_max=0.5)
+
+
+def get_akshare_limiter() -> RateLimiter:
+    """获取 AkShare 数据源限流器实例"""
+    return _akshare_limiter
+
+
 # ================================================================
 # 通用请求头
 # ================================================================

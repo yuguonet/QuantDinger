@@ -109,7 +109,8 @@ class _TradingDayCache:
 
     def _init_cache_table(self, pool):
         with pool.connection() as conn:
-            conn.execute("""
+            cur = conn.cursor()
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS trading_day_cache (
                     trade_date  VARCHAR(10) PRIMARY KEY,
                     updated_at  TIMESTAMP DEFAULT NOW()
@@ -119,9 +120,11 @@ class _TradingDayCache:
 
     def _load_from_db(self, pool) -> set[str]:
         with pool.connection() as conn:
-            rows = conn.execute(
+            cur = conn.cursor()
+            cur.execute(
                 "SELECT trade_date FROM trading_day_cache"
-            ).fetchall()
+            )
+            rows = cur.fetchall()
         return {r[0] for r in rows}
 
     def _bulk_insert(self, pool, dates: set[str]):

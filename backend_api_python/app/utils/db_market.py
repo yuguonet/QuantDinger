@@ -603,12 +603,14 @@ class MarketKlineWriter:
             bucket_expr = f"to_timestamp(EXTRACT(EPOCH FROM t.time) - MOD(EXTRACT(EPOCH FROM t.time)::bigint, {sec}))"
         elif bucket_type == "daily":
             bucket_expr = (
-                f"to_timestamp((EXTRACT(EPOCH FROM t.time + interval '{tz_offset}s')::integer / 86400) * 86400 - {tz_offset})"
+                f"to_timestamp((EXTRACT(EPOCH FROM t.time + interval '{tz_offset}s')::bigint / 86400) * 86400 - {tz_offset})"
             )
         elif bucket_type == "weekly":
             bucket_expr = (
-                f"to_timestamp((EXTRACT(EPOCH FROM t.time + interval '{tz_offset}s')::integer / 86400) * 86400 - {tz_offset})"
-                f" - (((EXTRACT(DOW FROM t.time AT TIME ZONE 'Asia/Shanghai')::int - 1 + 7) % 7) * interval '1 day')"
+                f"to_timestamp("
+                f"(EXTRACT(EPOCH FROM t.time + interval '{tz_offset}s')::bigint / 86400) * 86400 - {tz_offset}"
+                f" - (EXTRACT(DOW FROM t.time AT TIME ZONE 'Asia/Shanghai')::int - 1 + 7)"
+                f" % 7 * 86400)"
             )
         elif bucket_type == "monthly":
             bucket_expr = (
@@ -843,9 +845,9 @@ def _create_agg_views_for_market(mgr: MarketDBManager, market: str):
                 elif bucket_type == "weekly":
                     bucket_expr = (
                         f"to_timestamp("
-                        f"(EXTRACT(EPOCH FROM time + interval '{tz}s')::integer / 86400) * 86400 - {tz})"
+                        f"(EXTRACT(EPOCH FROM time + interval '{tz}s')::bigint / 86400) * 86400 - {tz}"
                         f" - (EXTRACT(DOW FROM time AT TIME ZONE 'Asia/Shanghai')::int - 1 + 7)"
-                        f" % 7 * 86400"
+                        f" % 7 * 86400)"
                     )
                 elif bucket_type == "monthly":
                     bucket_expr = (
