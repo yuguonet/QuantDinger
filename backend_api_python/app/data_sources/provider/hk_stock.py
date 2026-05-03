@@ -208,12 +208,14 @@ class HKStockDataSource:
     """
 
     name = "hk_stock"
-    priority = 40
+    priority = 60
 
     capabilities = {
         "kline": True,
+        "kline_priority": 60,
         "kline_tf": {"1m", "5m", "15m", "30m", "1H", "1D", "1W"},
         "quote": True,
+        "quote_priority": 60,
         "batch_quote": False,
         "hk": True,
         "markets": {"HKStock"},

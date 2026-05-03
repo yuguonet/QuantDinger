@@ -186,13 +186,15 @@ class AkShareDataSource:
     """
 
     name = "akshare"
-    priority = 50
+    priority = 55
 
     capabilities = {
         "kline": True,
+        "kline_priority": 45,
         "kline_tf": {"1m", "5m", "15m", "30m", "1H", "1D", "1W"},
         "quote": False,
         "batch_quote": True,
+        "batch_quote_priority": 45,
         "hk": False,
         "markets": {"CNStock", "HKStock"},
     }

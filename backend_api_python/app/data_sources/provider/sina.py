@@ -28,8 +28,10 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import re
+import threading
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -43,6 +45,40 @@ from app.data_sources.provider import register
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+# ================================================================
+# Referer 轮换池 — 提高访问成功率
+# ================================================================
+
+class _RefererPool:
+    """线程安全的 Referer 轮换池"""
+
+    def __init__(self, referers: List[str]):
+        self._referers = referers
+        self._cycle = itertools.cycle(referers)
+        self._lock = threading.Lock()
+
+    def next(self) -> str:
+        with self._lock:
+            return next(self._cycle)
+
+
+# 新浪 K线接口 Referer 池
+_sina_kline_referers = _RefererPool([
+    "https://finance.sina.com.cn/",
+    "https://stock.finance.sina.com.cn/",
+    "https://vip.stock.finance.sina.com.cn/",
+    "https://money.finance.sina.com.cn/",
+])
+
+# 新浪行情接口 Referer 池
+_sina_quote_referers = _RefererPool([
+    "https://finance.sina.com.cn/",
+    "https://hq.sinajs.cn/",
+    "https://stock.finance.sina.com.cn/",
+    "https://money.finance.sina.com.cn/",
+])
 
 
 # ================================================================
@@ -190,7 +226,7 @@ def _fetch_sina_kline_hisdata(sc: str, count: int, timeout: int) -> List[Dict[st
     _sina_limiter.wait()
     resp = requests.get(
         url,
-        headers=get_request_headers(referer="https://finance.sina.com.cn/"),
+        headers=get_request_headers(referer=_sina_kline_referers.next()),
         timeout=timeout,
     )
     resp.encoding = "gbk"
@@ -244,13 +280,16 @@ class SinaDataSource:
     """
 
     name = "sina"
-    priority = 20
+    priority = 15
 
     capabilities = {
         "kline": True,
+        "kline_priority": 10,
         "kline_tf": {"1m", "5m", "15m", "30m", "1H", "1D"},
         "quote": True,
+        "quote_priority": 15,
         "batch_quote": True,
+        "batch_quote_priority": 15,
         "hk": False,
         "markets": {"CNStock"},
     }
@@ -306,7 +345,7 @@ class SinaDataSource:
         params = {"symbol": sc, "scale": 240, "ma": "no", "datalen": min(int(count), 2000)}
         resp = requests.get(
             url,
-            headers=get_request_headers(referer="https://finance.sina.com.cn/"),
+            headers=get_request_headers(referer=_sina_kline_referers.next()),
             params=params, timeout=timeout,
         )
         try:
@@ -338,7 +377,7 @@ class SinaDataSource:
         params = {"symbol": sc, "scale": scale, "ma": "no", "datalen": min(int(count), 2000)}
         resp = requests.get(
             url,
-            headers=get_request_headers(referer="https://finance.sina.com.cn/"),
+            headers=get_request_headers(referer=_sina_kline_referers.next()),
             params=params, timeout=timeout,
         )
         text = (resp.text or "").strip()
@@ -375,7 +414,7 @@ class SinaDataSource:
         _sina_quote_limiter.wait()
         resp = requests.get(
             f"https://hq.sinajs.cn/list={sc}",
-            headers=get_request_headers(referer="https://finance.sina.com.cn/"),
+            headers=get_request_headers(referer=_sina_quote_referers.next()),
             timeout=timeout,
         )
         resp.encoding = "gbk"
@@ -422,7 +461,7 @@ class SinaDataSource:
             try:
                 resp = requests.get(
                     f"https://hq.sinajs.cn/list={query}",
-                    headers=get_request_headers(referer="https://finance.sina.com.cn/"),
+                    headers=get_request_headers(referer=_sina_quote_referers.next()),
                     timeout=timeout,
                 )
                 resp.encoding = "gbk"

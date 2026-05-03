@@ -29,6 +29,8 @@
 
 from __future__ import annotations
 
+import itertools
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -42,6 +44,41 @@ from app.data_sources.provider import register
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+# ================================================================
+# Referer 轮换池 — 提高访问成功率
+# ================================================================
+
+class _RefererPool:
+    """线程安全的 Referer 轮换池"""
+
+    def __init__(self, referers: List[str]):
+        self._referers = referers
+        self._cycle = itertools.cycle(referers)
+        self._lock = threading.Lock()
+
+    def next(self) -> str:
+        with self._lock:
+            return next(self._cycle)
+
+
+# 东财行情/K线接口 Referer 池
+_em_quote_referers = _RefererPool([
+    "https://quote.eastmoney.com/",
+    "https://www.eastmoney.com/",
+    "https://stock.eastmoney.com/",
+    "https://data.eastmoney.com/",
+    "https://push2.eastmoney.com/",
+])
+
+# 东财数据中心 Referer 池
+_em_data_referers = _RefererPool([
+    "https://data.eastmoney.com/",
+    "https://datacenter-web.eastmoney.com/",
+    "https://www.eastmoney.com/",
+    "https://quote.eastmoney.com/",
+])
 
 # 东财K线周期映射: 内部周期 → 东财 klt 参数
 # klt (K Line Type): 1=1分钟, 5=5分钟, ..., 101=日线, 102=周线
@@ -77,14 +114,17 @@ class EastMoneyDataSource:
     """
 
     name = "eastmoney"
-    priority = 30
+    priority = 25
 
     capabilities = {
         "kline": True,
+        "kline_priority": 25,
         "kline_tf": {"1m", "5m", "15m", "30m", "1H", "1D", "1W"},
         "kline_batch": False,   # 东财K线API是per-symbol，无原生批量
         "quote": True,
+        "quote_priority": 20,
         "batch_quote": True,
+        "batch_quote_priority": 5,
         "hk": False,
         "markets": {"CNStock"},
     }
@@ -121,7 +161,7 @@ class EastMoneyDataSource:
         get_eastmoney_limiter().wait()
         resp = requests.get(
             "https://49.push2his.eastmoney.com/api/qt/stock/kline/get",
-            headers=get_request_headers(referer="https://quote.eastmoney.com/"),
+            headers=get_request_headers(referer=_em_quote_referers.next()),
             params={
                 "secid": secid,                    # 证券ID（如 "1.600519"）
                 "ut": "fa5fd1943c7b386f172d6893dbbd1835",  # 用户令牌（固定值）
@@ -198,7 +238,7 @@ class EastMoneyDataSource:
         get_eastmoney_limiter().wait()
         resp = requests.get(
             "https://push2.eastmoney.com/api/qt/stock/get",
-            headers=get_request_headers(referer="https://quote.eastmoney.com/"),
+            headers=get_request_headers(referer=_em_quote_referers.next()),
             params={
                 "secid": secid,
                 "ut": "fa5fd1943c7b386f172d6893dbfba10b",  # 用户令牌（固定值）
@@ -271,7 +311,7 @@ class EastMoneyDataSource:
             get_eastmoney_limiter().wait()
             resp = requests.get(
                 "https://push2.eastmoney.com/api/qt/clist/get",
-                headers=get_request_headers(referer="https://quote.eastmoney.com/"),
+                headers=get_request_headers(referer=_em_quote_referers.next()),
                 params={
                     "pn": 1, "pz": 6000, "po": 1, "np": 1,  # 分页: 第1页, 每页6000条
                     "ut": "bd1d9ddb04089700cf9c27f6f7426281",  # 用户令牌
@@ -344,7 +384,7 @@ def _em_request(report_name: str, params: dict = None, timeout: int = 10) -> lis
         default_params.update(params)
     resp = requests.get(
         "https://datacenter-web.eastmoney.com/api/data/v1/get",
-        headers=get_request_headers(referer="https://data.eastmoney.com/"),
+        headers=get_request_headers(referer=_em_data_referers.next()),
         params=default_params, timeout=timeout,
     )
     try:

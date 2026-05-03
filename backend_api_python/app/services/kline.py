@@ -1009,10 +1009,10 @@ class KlineService:
         self, symbols: List[str], market: str = "CNStock",
     ) -> Dict[str, bool]:
         """
-        批量预热缓存入口。
+        批量预热自选股的 5m 行情缓存。
 
-        15m+ 数据来自 DB（已持久化），无需预热。
-        < 15m 数据走远程 API + 内存缓存，首次请求时自动填充。
+        通过 fetch_kline_batch 一次性批量拉取，写入 TieredCache 内存缓存，
+        后续 get_kline 请求直接命中缓存，避免逐只请求。
 
         Args:
             symbols: 股票代码列表
@@ -1022,7 +1022,26 @@ class KlineService:
             {timeframe: success_bool} 预热结果
         """
         results = {}
-        # 15m+ 来自 DB，不需要预热
-        results["1D"] = True
-        logger.info("[预热] %s 1D: 跳过（数据来自DB）", market)
+        timeframe = "5m"
+        limit = 240  # 5 天 × 48 根/天 ≈ 240
+        data_type = f"kline:{timeframe}"
+        ttl = get_ttl("kline", timeframe)
+
+        try:
+            fetched = self._factory.fetch_kline_batch(
+                symbols, timeframe, limit, market,
+                on_raw_data=lambda sym, bars: self._cache.set(
+                    make_key("kline", sym, timeframe, limit), bars, ttl, data_type,
+                ),
+            )
+            ok = len(fetched) > 0
+            results[timeframe] = ok
+            logger.info(
+                "[预热] %s %s: %d/%d 只成功",
+                market, timeframe, len(fetched), len(symbols),
+            )
+        except Exception as e:
+            logger.warning("[预热] %s %s 失败: %s", market, timeframe, e)
+            results[timeframe] = False
+
         return results

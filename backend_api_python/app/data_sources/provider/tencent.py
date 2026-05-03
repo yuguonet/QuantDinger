@@ -23,6 +23,8 @@
 
 from __future__ import annotations
 
+import itertools
+import threading
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -38,6 +40,49 @@ from app.data_sources.provider import register
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+# ================================================================
+# Referer 轮换池 — 提高访问成功率
+# ================================================================
+
+class _RefererPool:
+    """
+    线程安全的 Referer 轮换池。
+
+    每次调用 next() 返回下一个 Referer，循环轮换。
+    不同 API 端点使用不同的 Referer 池，模拟不同来源的访问。
+
+    Args:
+        referers: Referer 列表
+    """
+
+    def __init__(self, referers: List[str]):
+        self._referers = referers
+        self._cycle = itertools.cycle(referers)
+        self._lock = threading.Lock()
+
+    def next(self) -> str:
+        """返回下一个 Referer"""
+        with self._lock:
+            return next(self._cycle)
+
+
+# 腾讯 K线接口 Referer 池
+_tc_kline_referers = _RefererPool([
+    "https://gu.qq.com/",
+    "https://finance.qq.com/",
+    "https://stockapp.finance.qq.com/",
+    "https://stock.qq.com/",
+])
+
+# 腾讯行情接口 Referer 池
+_tc_quote_referers = _RefererPool([
+    "https://qt.gtimg.cn/",
+    "https://gu.qq.com/",
+    "https://finance.qq.com/",
+    "https://stockapp.finance.qq.com/",
+])
 
 
 def _lower(code: str) -> str:
@@ -145,9 +190,12 @@ class TencentDataSource:
 
     capabilities = {
         "kline": True,
+        "kline_priority": 15,
         "kline_tf": {"1m", "5m", "15m", "30m", "1H", "1D", "1W"},
         "quote": True,
+        "quote_priority": 10,
         "batch_quote": True,
+        "batch_quote_priority": 10,
         "hk": True,
         "markets": {"CNStock", "HKStock"},
     }
@@ -198,7 +246,7 @@ class TencentDataSource:
             params = {"param": f"{c},{tc_tf},,,{int(count)}"}
 
         resp = requests.get(
-            url, headers=get_request_headers(referer="https://gu.qq.com/"),
+            url, headers=get_request_headers(referer=_tc_kline_referers.next()),
             params=params, timeout=timeout,
         )
 
@@ -258,7 +306,7 @@ class TencentDataSource:
         get_tencent_limiter().wait()
         resp = requests.get(
             f"https://qt.gtimg.cn/q={c}",
-            headers=get_request_headers(referer="https://qt.gtimg.cn/"),
+            headers=get_request_headers(referer=_tc_quote_referers.next()),
             timeout=timeout,
         )
         try:
@@ -332,7 +380,7 @@ class TencentDataSource:
             try:
                 resp = requests.get(
                     f"https://qt.gtimg.cn/q={','.join(batch)}",
-                    headers=get_request_headers(referer="https://qt.gtimg.cn/"),
+                    headers=get_request_headers(referer=_tc_quote_referers.next()),
                     timeout=timeout,
                 )
                 resp.encoding = "gbk"

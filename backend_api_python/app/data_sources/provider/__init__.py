@@ -230,9 +230,6 @@ def get_providers(
     with _lock:
         providers = list(_registry.values())
 
-    # 按 priority 排序（数字越小越优先）
-    providers.sort(key=lambda p: getattr(p, 'priority', 100))
-
     # 能力过滤: capabilities[capability] 必须为 True
     if capability:
         providers = [
@@ -253,6 +250,14 @@ def get_providers(
             p for p in providers
             if market in p.capabilities.get('markets', set())
         ]
+
+    # 按能力专属优先级排序: {capability}_priority > 全局 priority
+    if capability:
+        providers.sort(key=lambda p: p.capabilities.get(
+            f"{capability}_priority", p.priority
+        ))
+    else:
+        providers.sort(key=lambda p: getattr(p, 'priority', 100))
 
     return providers
 
