@@ -350,10 +350,7 @@ class DataSourceFactory:
             (p.name, lambda p=p: p.fetch_kline(symbol, timeframe, limit))
             for p in get_providers("kline", timeframe=timeframe, market=market or None)
         ]
-        result, src = sequential_fallback(
-            symbol, providers, self._cb,
-            validate=lambda x: x is not None and len(x) > 0,
-        )
+        result, src = sequential_fallback(symbol, providers, self._cb)
         if result:
             logger.info("[K线] %s tf=%s 来源=%s bars=%d", symbol, timeframe, src, len(result))
         else:
@@ -432,11 +429,11 @@ class DataSourceFactory:
         market: str,
     ) -> Optional[Dict[str, Any]]:
         """
-        获取单只行情 — 去重 + fallback。
+        获取单只行情 — 去重 + race 竞赛。
 
         流程:
           1. InflightDedup 去重
-          2. sequential_fallback 按优先级逐源尝试
+          2. race 多源并发竞赛，第一个有效结果返回
           3. 返回行情数据
         """
         result = self._dedup.get_or_submit(
@@ -448,12 +445,12 @@ class DataSourceFactory:
     def _fetch_ticker_raw(
         self, symbol: str, market: str,
     ) -> Optional[Dict[str, Any]]:
-        """内部: sequential_fallback 取行情"""
+        """内部: race 多源并发竞赛取行情"""
         providers = [
             (p.name, lambda p=p: p.fetch_quote(symbol))
             for p in get_providers("quote", market=market or None)
         ]
-        result, src = sequential_fallback(symbol, providers, self._cb)
+        result, src = race(providers, self._cb)
         if result:
             logger.info("[行情] %s 来源=%s", symbol, src)
         else:
@@ -471,43 +468,50 @@ class DataSourceFactory:
         market: str,
     ) -> Dict[str, Dict[str, Any]]:
         """
-        批量行情 — fetch_quotes_batch 一次HTTP取多只 + 逐只 fallback。
+        批量行情 — 多源并发 race 批量接口 + 逐只 fallback。
 
         流程:
-          1. 按 Provider 优先级调用 fetch_quotes_batch（一次HTTP取多只）
-          2. 未取到的 symbol fallback 到逐只 sequential_fallback
+          1. race 多源并发调用 fetch_quotes_batch（每个源一次HTTP取多只）
+          2. 未取到的 symbol fallback 到逐只 race
           3. 返回 {symbol: 行情数据}
         """
         providers = get_providers("quote", market=market or None)
 
-        # 尝试批量接口
-        for p in providers:
-            if not self._cb.is_available(p.name):
-                continue
-            try:
-                batch = p.fetch_quotes_batch(symbols)
-                if batch:
-                    self._cb.record_success(p.name)
-                    logger.info(
-                        f"[批量行情] {p.name} 一次HTTP取到 {len(batch)}/{len(symbols)} 只"
-                    )
-                    return batch
-                self._cb.record_failure(p.name, "empty")
-            except Exception as e:
-                self._cb.record_failure(p.name, str(e))
-                logger.warning("[批量行情] %s 批量获取失败: %s", p.name, e)
+        # 多源并发 race 批量接口
+        batch_providers = [
+            (p.name, lambda p=p: p.fetch_quotes_batch(symbols))
+            for p in providers
+        ]
+        batch, src = race(
+            batch_providers, self._cb,
+            validate=lambda d: bool(d),
+        )
+        if batch:
+            logger.info(
+                f"[批量行情] {src} race 取到 {len(batch)}/{len(symbols)} 只"
+            )
+        else:
+            logger.info("[批量行情] 所有批量源均失败，fallback 到逐只模式")
 
-        # 所有批量源都失败 → fallback 到逐只
-        logger.info("[批量行情] 所有批量源失败，fallback 到逐只模式")
-        result: Dict[str, Dict[str, Any]] = {}
-        for sym in symbols:
-            try:
-                data = self.fetch_ticker(sym, market)
-                if data and data.get("last", 0) > 0:
-                    result[sym] = data
-            except Exception:
-                pass
-        return result
+        # 逐只 fallback：补齐批量未覆盖的 symbol
+        if not batch:
+            batch = {}
+        missing = [s for s in symbols if s not in batch]
+        if missing:
+            filled = 0
+            for sym in missing:
+                try:
+                    data = self.fetch_ticker(sym, market)
+                    if data and data.get("last", 0) > 0:
+                        batch[sym] = data
+                        filled += 1
+                except Exception:
+                    pass
+            logger.info(
+                f"[批量行情] 逐只 fallback 补齐 {filled}/{len(missing)} 只"
+            )
+
+        return batch
 
     # ═══════════════════════════════════════════════════════════════════
     #  公共工具 — 供 KlineService 调用

@@ -137,8 +137,11 @@ def fetch_exdividend_events(code: str) -> List[Dict[str, Any]]:
     # 解析 API 返回的原始数据，提取复权所需字段
     events = []
     for item in items:
-        ex_date = str(item.get("EX_DIVIDEND_DATE", "")).strip()[:10]
-        if not ex_date:
+        raw_date = item.get("EX_DIVIDEND_DATE")
+        if not raw_date:
+            continue
+        ex_date = str(raw_date).strip()[:10]
+        if not ex_date or ex_date == "None":
             continue
 
         # 每股派现 — 尝试多个字段名（东财API字段名可能随版本变化）
@@ -256,7 +259,10 @@ def calc_adjustment_factors(
         """
         if not ex_date or ex_date == "None":
             return None
-        dt = datetime.strptime(ex_date, "%Y-%m-%d")
+        try:
+            dt = datetime.strptime(ex_date, "%Y-%m-%d")
+        except (ValueError, TypeError):
+            return None
         for i in range(1, 15):
             prev_str = (dt - timedelta(days=i)).strftime("%Y-%m-%d")
             c = date_to_close.get(prev_str)
@@ -277,10 +283,9 @@ def calc_adjustment_factors(
     #   除权参考价   = 除权后总市值 / 除权后总股数
     event_pairs: List[Tuple[str, float]] = []
     for ev in events:
-        ex_date = ev.get("date")
-        if not ex_date or ex_date == "None":
+        if not ev.get("date"):
             continue
-        prev_close = _get_prev_close(ex_date)
+        prev_close = _get_prev_close(ev["date"])
         if prev_close is None or prev_close <= 0:
             continue
 
@@ -300,7 +305,7 @@ def calc_adjustment_factors(
 
         # 过滤异常因子（正常范围 0.01 ~ 100）
         if 0.01 < factor < 100:
-            event_pairs.append((ex_date, factor))
+            event_pairs.append((ev["date"], factor))
 
     if not event_pairs:
         return {}
@@ -410,7 +415,14 @@ def adjust_kline(
         >>> raw = [{"time": 1700000000, "open": 10, "high": 11, "low": 9, "close": 10.5, "volume": 1000}]
         >>> adjust_kline("600519", raw, adj="qfq")
     """
-    if not adj or not raw_bars:
+    if not adj or raw_bars is None:
+        return raw_bars
+
+    # 缓存层可能返回 DataFrame，统一转为 list[dict]
+    if hasattr(raw_bars, 'to_dict'):
+        raw_bars = raw_bars.to_dict('records')
+
+    if not raw_bars:
         return raw_bars
 
     events = fetch_exdividend_events(code)
