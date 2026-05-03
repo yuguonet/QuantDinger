@@ -254,6 +254,8 @@ def calc_adjustment_factors(
         由于K线数据可能不包含周末/节假日，需要向前搜索最多15天。
         为什么是15天？最长的连续假期（如春节）通常不超过10天，15天留有余量。
         """
+        if not ex_date or ex_date == "None":
+            return None
         dt = datetime.strptime(ex_date, "%Y-%m-%d")
         for i in range(1, 15):
             prev_str = (dt - timedelta(days=i)).strftime("%Y-%m-%d")
@@ -275,7 +277,10 @@ def calc_adjustment_factors(
     #   除权参考价   = 除权后总市值 / 除权后总股数
     event_pairs: List[Tuple[str, float]] = []
     for ev in events:
-        prev_close = _get_prev_close(ev["date"])
+        ex_date = ev.get("date")
+        if not ex_date or ex_date == "None":
+            continue
+        prev_close = _get_prev_close(ex_date)
         if prev_close is None or prev_close <= 0:
             continue
 
@@ -295,7 +300,7 @@ def calc_adjustment_factors(
 
         # 过滤异常因子（正常范围 0.01 ~ 100）
         if 0.01 < factor < 100:
-            event_pairs.append((ev["date"], factor))
+            event_pairs.append((ex_date, factor))
 
     if not event_pairs:
         return {}

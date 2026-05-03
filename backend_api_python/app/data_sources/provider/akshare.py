@@ -10,7 +10,7 @@ AkShare 数据源 Provider — A股国内兜底
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from app.data_sources.normalizer import to_raw_digits
@@ -143,6 +143,9 @@ def _parse_ak_kline(df, count: int) -> List[Dict[str, Any]]:
                     continue
             elif hasattr(dt_val, "timestamp"):
                 ts = int(dt_val.timestamp())
+            elif isinstance(dt_val, date):
+                # datetime.date 没有 .timestamp()，手动转
+                ts = int(datetime(dt_val.year, dt_val.month, dt_val.day).timestamp())
             else:
                 ts = int(dt_val)
             o = _safe_float(row.get(col_map.get("open", "")))

@@ -350,7 +350,10 @@ class DataSourceFactory:
             (p.name, lambda p=p: p.fetch_kline(symbol, timeframe, limit))
             for p in get_providers("kline", timeframe=timeframe, market=market or None)
         ]
-        result, src = sequential_fallback(symbol, providers, self._cb)
+        result, src = sequential_fallback(
+            symbol, providers, self._cb,
+            validate=lambda x: x is not None and len(x) > 0,
+        )
         if result:
             logger.info("[K线] %s tf=%s 来源=%s bars=%d", symbol, timeframe, src, len(result))
         else:

@@ -138,7 +138,7 @@ class EastMoneyDataSource:
             data = resp.json()
         except Exception:
             return []
-        if not isinstance(data, dict) or int(data.get("code", -1)) != 0:
+        if not isinstance(data, dict):
             return []
         klines_data = (data.get("data") or {}).get("klines")
         if not isinstance(klines_data, list):
@@ -210,7 +210,7 @@ class EastMoneyDataSource:
             data = resp.json()
         except Exception:
             return None
-        if not isinstance(data, dict) or int(data.get("code", -1)) != 0:
+        if not isinstance(data, dict):
             return None
         d = data.get("data")
         if not isinstance(d, dict):
