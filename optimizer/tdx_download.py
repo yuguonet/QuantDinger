@@ -1191,7 +1191,8 @@ def _ensure_datetime_repair(value):
     if isinstance(value, (int, float)):
         return _dt_repair.fromtimestamp(value, tz=_TZ_SH_REPAIR)
     if isinstance(value, str):
-        for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%d'):
+        for fmt in ('%Y-%m-%dT%H:%M:%S%z', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M',
+                     '%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%d'):
             try:
                 dt = _dt_repair.strptime(value.strip(), fmt)
                 if dt.tzinfo is None:
@@ -1815,28 +1816,42 @@ def _repair_check_suspend_baidu(code, gap_start, gap_end):
     """
     try:
         import akshare as ak
-        df = ak.news_trade_notify_suspend_baidu(date=gap_start.replace("-", ""))
-        if df is None or df.empty:
-            return None
-        # 在停牌列表中查找目标股票
-        for _, row in df.iterrows():
-            row_code = str(row.get("股票代码", "")).strip()
-            if row_code == code:
+        from datetime import timedelta
+
+        # 停牌公告可能在 gap_start 之前就发布了，向前多查几天
+        # 用 gap_start 往前 30 天的日期逐天查询，直到找到或超出范围
+        gap_dt = _dt_repair.strptime(gap_start, "%Y-%m-%d")
+        search_dates = []
+        for i in range(0, 31):
+            d = gap_dt - timedelta(days=i)
+            search_dates.append(d.strftime("%Y%m%d"))
+
+        for date_str in search_dates:
+            try:
+                df = ak.news_trade_notify_suspend_baidu(date=date_str)
+            except Exception:
+                continue
+            if df is None or df.empty:
+                continue
+
+            for _, row in df.iterrows():
+                row_code = str(row.get("股票代码", "")).strip()
+                if row_code != code:
+                    continue
                 suspend_start = str(row.get("停牌时间", ""))[:10]
                 resume_date = str(row.get("复牌时间", ""))[:10]
                 reason = str(row.get("停牌事项说明", ""))
-                # gap 必须完全落在停牌期间内才填充
-                # 条件：停牌开始 <= gap开始 且 复牌日 >= gap结束
-                if suspend_start and suspend_start <= gap_start:
-                    # 复牌日为空表示尚未复牌，或复牌日 >= gap结束 → 整个 gap 在停牌期间
-                    if not resume_date or resume_date >= gap_end:
+                if not suspend_start:
+                    continue
+                # 停牌期间与 gap 有重叠即可（不要求完全覆盖）
+                # 条件：停牌开始 <= gap结束 且 (复牌日为空 或 复牌日 >= gap开始)
+                if suspend_start <= gap_end:
+                    if not resume_date or resume_date >= gap_start:
                         return {
                             "suspend_start": suspend_start,
                             "resume_date": resume_date or "",
                             "reason": reason,
                         }
-                # 否则：停牌不覆盖整个 gap，视为正常 gap（尝试下载）
-                return None
         return None
     except Exception:
         return None
@@ -1877,6 +1892,14 @@ def _repair_fill_suspend(code, gaps, freq, writer, market="CNStock"):
     if not existing:
         return 0, 0
 
+    # 统一确保 datetime 带时区（writer 可能返回 naive datetime）
+    _naive_fixed = {}
+    for _k, _v in existing.items():
+        if isinstance(_k, __import__('datetime').datetime) and _k.tzinfo is None:
+            _k = _k.replace(tzinfo=_TZ_SH_REPAIR)
+        _naive_fixed[_k] = _v
+    existing = _naive_fixed
+
     sorted_ts = sorted(existing.keys())
 
     # ── 为每个 gap 生成填充数据，直接 INSERT ──
@@ -1888,6 +1911,9 @@ def _repair_fill_suspend(code, gaps, freq, writer, market="CNStock"):
         expected_ts_list = g.get("expected_ts", [])
         if not expected_ts_list:
             continue
+
+        # 统一转为 datetime 对象（数据库 JSONB 可能存为字符串）
+        expected_ts_list = [_ensure_datetime_repair(t) for t in expected_ts_list]
 
         # 找 gap 前最后一条数据的 close
         gap_first_ts = min(expected_ts_list)
