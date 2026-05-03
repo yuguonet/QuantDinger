@@ -570,13 +570,33 @@ class KlineService:
             historical = self._get_historical_from_db(
                 resolved_market, symbol, timeframe, limit,
             )
-            # 2. 从低周期 K 线聚合当日 bar
+            # 2. DB 数据不足时 fallback 到远程 API（避免只返回 1 根当日 bar）
+            if len(historical) < max(limit // 2, 10):
+                try:
+                    raw = self._factory.fetch_kline_raw(
+                        symbol, timeframe, limit, resolved_market,
+                    )
+                    if raw and len(raw) > len(historical):
+                        historical = raw
+                except Exception as e:
+                    logger.warning(
+                        "[KlineService] 远程API fallback失败 %s:%s: %s",
+                        market, symbol, e,
+                    )
+            # 3. 从低周期 K 线聚合当日 bar
             today_bar = self._get_today_from_lower_tf(resolved_market, symbol)
-            # 3. 合并: 历史 + 当日
+            # 4. 合并: 历史 + 当日
             combined = list(historical)
             if today_bar:
-                combined.append(today_bar)
-            # 4. 统一复权后返回
+                # 避免重复: 如果远程 API 已包含今日数据，不再追加
+                if combined:
+                    last_ts = combined[-1].get("time", 0)
+                    today_ts = self._today_cutoff_ts()
+                    if last_ts < today_ts:
+                        combined.append(today_bar)
+                else:
+                    combined.append(today_bar)
+            # 5. 统一复权后返回
             return adjust_kline(symbol, combined, adj)
 
         # ══════════════════════════════════════════════════════════════
@@ -653,20 +673,41 @@ class KlineService:
                 if hist:
                     result[sym] = hist
 
-            # 2. 批量获取当日聚合（低周期 K 线 + ticker 行情补齐）
+            # 2. DB 数据不足的 symbol，fallback 到远程 API
+            need_fallback = [
+                s for s in symbols
+                if len(result.get(s, [])) < max(limit // 2, 10)
+            ]
+            if need_fallback:
+                try:
+                    fetched = self._factory.fetch_kline_batch(
+                        need_fallback, timeframe, limit, resolved_market,
+                    )
+                    for sym, bars in (fetched or {}).items():
+                        if bars and len(bars) > len(result.get(sym, [])):
+                            result[sym] = bars
+                except Exception as e:
+                    logger.warning(
+                        "[KlineService] 批量远程API fallback失败: %s", e,
+                    )
+
+            # 3. 批量获取当日聚合（低周期 K 线 + ticker 行情补齐）
             today_map = self._get_today_batch_from_lower_tf(
                 resolved_market, symbols,
             )
 
-            # 3. 合并: 每只股票的历史 + 当日
+            # 4. 合并: 每只股票的历史 + 当日（避免重复）
+            today_ts = self._today_cutoff_ts()
             for sym in symbols:
                 today_bar = today_map.get(sym)
                 if today_bar:
                     hist = result.get(sym, [])
+                    if hist and hist[-1].get("time", 0) >= today_ts:
+                        continue  # 远程 API 已包含今日数据，跳过
                     hist.append(today_bar)
                     result[sym] = hist
 
-            # 4. 统一复权后返回
+            # 5. 统一复权后返回
             return {
                 sym: adjust_kline(sym, bars, "qfq")
                 for sym, bars in result.items()

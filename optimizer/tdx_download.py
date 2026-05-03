@@ -1,29 +1,27 @@
 #!/usr/bin/env python3
 """
-🚀 通达信协议直连 - A股全量数据下载
+🚀 A股全量K线数据下载 - 支持通达信/BaoStock双数据源
 
-实测性能 (串行, 单连接):
+数据源:
+  tdx       - 通达信协议直连，支持全部周期（日线+分钟线），无需API Key
+  baostock  - 证券宝HTTP API，仅支持日线（免费、稳定），分钟线自动回退tdx
+  both      - 双源模式：日线优先baostock，失败回退tdx；分钟线走tdx
+
+实测性能 (tdx, 串行, 单连接):
   日线 5年:    ~3-4 分钟
   15分线 2年:  ~29 分钟
   15分线 5年:  ~72 分钟
 
-多进程并行可进一步加速 (每进程独立连接)
-
-时间格式:
-  - 数据库 time 列为 TIMESTAMP 类型
-  - 通达信 CSV 标准格式：15m="YYYY-MM-DD HH:MM", 1D="YYYY-MM-DD"
-  - 写入前校验 15m 时间对齐（±1min 容差），偏差过大丢弃并记日志
-
 用法:
-  python tdx_download.py -T 1D                       # 日线
-  python tdx_download.py -T 1m                       # 1分钟线
-  python tdx_download.py -T 5m                       # 5分钟线
-  python tdx_download.py -T 15m                      # 15分钟线
-  python tdx_download.py -T 60m                      # 60分钟线
-  python tdx_download.py -T all_min                  # 全部分钟线
-  python tdx_download.py -T 1D -s 2021-01-01         # 指定起始日期
+  python tdx_download.py -T 1D                            # 日线 (默认tdx)
+  python tdx_download.py -T 1D --source baostock          # 日线 (baostock)
+  python tdx_download.py -T 1D --source both              # 日线 (双源, 优先baostock)
+  python tdx_download.py -T 1m                            # 1分钟线 (仅tdx)
+  python tdx_download.py -T 15m                           # 15分钟线 (仅tdx)
+  python tdx_download.py -T all_min                       # 全部分钟线
+  python tdx_download.py -T 1D -s 2021-01-01              # 指定起始日期
   python tdx_download.py -T 1D -s 2021-01-01 -e 2026-05-01
-  python tdx_download.py -T 15m -w 40 --merge        # 40进程, 合并
+  python tdx_download.py -T 15m -w 40 --merge             # 40进程, 合并
 
 断点续传:
   每次下载会在输出目录生成 _progress.json，记录已下载的股票。
@@ -33,7 +31,8 @@
 
 依赖:
   - db_market.py / db_multi.py（backend_api_python/app/utils/）
-  - pytdx
+  - pytdx (tdx数据源)
+  - baostock (baostock数据源, pip install baostock)
 """
 
 import os
@@ -41,11 +40,24 @@ import sys
 import csv
 import json
 import time
+import logging
 from datetime import datetime, timedelta, timezone
 from multiprocessing import Pool
-from pytdx.hq import TdxHq_API
-import logging
+
 logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════
+# 延迟导入（按需加载，不强制依赖）
+# ═══════════════════════════════════════════════════════
+
+def _import_tdx():
+    """延迟导入 pytdx"""
+    try:
+        from pytdx.hq import TdxHq_API
+        return TdxHq_API
+    except ImportError:
+        raise ImportError("pytdx 未安装，请执行: pip install pytdx")
 
 
 # ═══════════════════════════════════════════════════════
@@ -115,6 +127,7 @@ def validate_and_calibrate_time(dt, timeframe: str):
 
 def _connect_api(worker_id):
     """连接通达信服务器，带超时，自动切换备用服务器"""
+    TdxHq_API = _import_tdx()
     for attempt in range(len(SERVERS)):
         idx = (worker_id + attempt) % len(SERVERS)
         srv = SERVERS[idx]
@@ -125,6 +138,180 @@ def _connect_api(worker_id):
         except Exception:
             continue
     raise ConnectionError(f"Worker-{worker_id}: 所有服务器连接失败")
+
+
+# ═══════════════════════════════════════════════════════
+# BaoStock 数据源 (Python SDK, TCP协议)
+# ═══════════════════════════════════════════════════════
+
+def _import_baostock():
+    """延迟导入 baostock"""
+    try:
+        import baostock as bs
+        return bs
+    except ImportError:
+        raise ImportError("baostock 未安装，请执行: pip install baostock")
+
+
+def get_stock_list_baostock():
+    """从 BaoStock SDK 获取全部A股代码 (TCP协议, bs.query_stock_basic)"""
+    bs = _import_baostock()
+
+    lg = bs.login()
+    if lg.error_code != '0':
+        raise ConnectionError(f"BaoStock 登录失败: {lg.error_msg}")
+
+    try:
+        rs = bs.query_stock_basic()
+        if rs.error_code != '0':
+            raise RuntimeError(f"BaoStock query_stock_basic 失败: {rs.error_msg}")
+
+        a_shares = []
+        while rs.next():
+            row = rs.get_row_data()
+            # fields: code, code_name, ipoDate, outDate, type, status
+            # type: 1-股票 2-指数 ... 只要股票
+            code_full = str(row[0]).strip()   # sh.600519
+            name = str(row[1]).strip()
+            stock_type = str(row[4]).strip() if len(row) > 4 else ""
+            status = str(row[5]).strip() if len(row) > 5 else ""
+
+            if stock_type not in ('1', ''):  # 1=股票, 空值也保留兼容
+                continue
+            if status == '0':  # 0=退市
+                continue
+
+            if '.' not in code_full:
+                continue
+            market_prefix, digits = code_full.split('.', 1)
+            if not digits:
+                continue
+            # 只要A股: 00/30/60/68/83/87/43
+            if not digits.startswith(('00', '30', '60', '68', '83', '87', '43')):
+                continue
+            market = 1 if market_prefix == 'sh' else 0
+            a_shares.append((market, digits, name))
+
+        seen = set()
+        unique = []
+        for m, c, n in a_shares:
+            if c not in seen:
+                seen.add(c)
+                unique.append((m, c, n))
+
+        cnt = {'00': 0, '30': 0, '60': 0, '68': 0, '83': 0, '87': 0, '43': 0, 'other': 0}
+        for _, c, _ in unique:
+            prefix = c[:2]
+            if prefix in cnt:
+                cnt[prefix] += 1
+            else:
+                cnt['other'] += 1
+        print(f"    主板(00): {cnt['00']}  创业板(30): {cnt['30']}  "
+              f"主板(60): {cnt['60']}  科创板(68): {cnt['68']}  "
+              f"北交所(83/87/43): {cnt['83']+cnt['87']+cnt['43']}  其他: {cnt['other']}")
+
+        return unique
+    finally:
+        bs.logout()
+
+
+def _worker_daily_baostock(args):
+    """工作进程: 通过 BaoStock SDK 下载日线 (TCP协议)
+
+    每个 worker 进程独立 login/logout，避免跨进程共享连接。
+    返回: [(code, name, rows, status), ...]
+    """
+    bs = _import_baostock()
+    stocks, worker_id, start_date, end_date, out_dir, done_codes = args
+
+    lg = bs.login()
+    if lg.error_code != '0':
+        logger.warning("[BaoStock Worker-%d] 登录失败: %s", worker_id, lg.error_msg)
+        return [(code, name, 0, "failed") for _, code, name in stocks if code not in done_codes]
+
+    results = []
+
+    try:
+        for market, code, name in stocks:
+            if code in done_codes:
+                continue
+
+            bs_code = f"{'sh' if market == 1 else 'sz'}.{code}"
+
+            for retry in range(3):
+                try:
+                    rs = bs.query_history_k_data_plus(
+                        bs_code,
+                        "date,open,high,low,close,volume,amount",
+                        start_date=start_date,
+                        end_date=end_date,
+                        frequency="d",
+                        adjustflag="1",  # 前复权
+                    )
+                    if rs.error_code != '0':
+                        logger.warning("[BaoStock] %s(%s) 查询失败: %s", code, name, rs.error_msg)
+                        if retry == 2:
+                            results.append((code, name, 0, "failed"))
+                        continue
+
+                    filtered = []
+                    while rs.next():
+                        row = rs.get_row_data()
+                        # row: [date, open, high, low, close, volume, amount]
+                        if len(row) < 7:
+                            continue
+                        dt_str = str(row[0]).strip()
+                        if not dt_str or dt_str == '':
+                            continue
+                        try:
+                            o = float(row[1]) if row[1] and row[1] != '' else 0
+                            h = float(row[2]) if row[2] and row[2] != '' else 0
+                            low = float(row[3]) if row[3] and row[3] != '' else 0
+                            c = float(row[4]) if row[4] and row[4] != '' else 0
+                            v = float(row[5]) if row[5] and row[5] != '' else 0
+                            amount = float(row[6]) if row[6] and row[6] != '' else 0
+                        except (ValueError, TypeError):
+                            continue
+                        if o == 0 and c == 0:
+                            continue
+                        filtered.append((dt_str, o, c, h, low, v, amount))
+
+                    if filtered:
+                        path = os.path.join(out_dir, f"{code}.csv")
+                        with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+                            w = csv.writer(f)
+                            w.writerow(['date', 'open', 'close', 'high', 'low', 'volume', 'amount'])
+                            for row in filtered:
+                                w.writerow(row)
+                        results.append((code, name, len(filtered), "success"))
+                    else:
+                        results.append((code, name, 0, "empty"))
+                    break
+                except (ConnectionError, OSError, TimeoutError) as e:
+                    logger.warning("[BaoStock] %s(%s) 连接异常(重试%d): %s", code, name, retry, e)
+                    if retry == 2:
+                        results.append((code, name, 0, "failed"))
+                    else:
+                        # 重连
+                        try:
+                            bs.logout()
+                        except Exception:
+                            pass
+                        try:
+                            bs.login()
+                        except Exception:
+                            pass
+                except Exception as e:
+                    results.append((code, name, 0, "failed"))
+                    logger.warning("[BaoStock] %s(%s) 异常: %s", code, name, e)
+                    break
+    finally:
+        try:
+            bs.logout()
+        except Exception:
+            pass
+
+    return results
 
 
 # ═══════════════════════════════════════════════════════
@@ -356,6 +543,7 @@ def _fetch_security_list(api, market, offset):
 
 def get_stock_list():
     """从通达信获取全部A股代码 (约5000+只)"""
+    TdxHq_API = _import_tdx()
     api = TdxHq_API()
     api.connect(SERVERS[0][0], SERVERS[0][1], time_out=CONNECT_TIMEOUT)
 
@@ -686,9 +874,10 @@ def parallel_download(stocks, worker_fn, out_dir, workers, tracker=None, **extra
 # 主流程
 # ═══════════════════════════════════════════════════════
 
-def run_daily(out_dir, start_date, end_date, workers, no_resume=False, retry_failed=False):
+def run_daily(out_dir, start_date, end_date, workers, no_resume=False, retry_failed=False, source='tdx'):
+    source_label = {'tdx': '通达信', 'baostock': 'BaoStock', 'both': '双源(优先BaoStock)'}
     print(f"\n{'='*55}")
-    print(f"  📊 通达信日线全量下载")
+    print(f"  📊 日线全量下载 [{source_label.get(source, source)}]")
     print(f"  日期: {start_date} → {end_date}  进程: {workers}")
     print(f"{'='*55}")
 
@@ -711,16 +900,61 @@ def run_daily(out_dir, start_date, end_date, workers, no_resume=False, retry_fai
         if done_count > 0:
             print(f"\n  💾 检测到断点记录: 已完成 {done_count} 只 (其中 {failed_count} 只失败待重试)")
 
-    print("\n[1/3] 获取A股列表...")
-    stocks = get_stock_list()
+    # ── 获取股票列表 ──
+    if source in ('baostock', 'both'):
+        print("\n[1/3] 获取A股列表 (BaoStock)...")
+        try:
+            stocks = get_stock_list_baostock()
+        except Exception as e:
+            if source == 'both':
+                print(f"  ⚠️  BaoStock 获取列表失败({e})，回退通达信...")
+                stocks = None
+            else:
+                raise
+        if source == 'baostock' or (source == 'both' and stocks):
+            pass
+        elif source == 'both' and not stocks:
+            print("\n[1/3] 获取A股列表 (通达信)...")
+            stocks = get_stock_list()
+    else:
+        print("\n[1/3] 获取A股列表 (通达信)...")
+        stocks = get_stock_list()
     print(f"  共 {len(stocks)} 只A股")
 
-    print(f"\n[2/3] 开始下载...")
-    success, fail, total_rows, elapsed = parallel_download(
-        stocks, _worker_daily, out, workers,
-        tracker=tracker,
-        start_date=start_date, end_date=end_date,
-    )
+    # ── 下载日线 ──
+    if source == 'baostock':
+        print(f"\n[2/3] 开始下载 (BaoStock)...")
+        success, fail, total_rows, elapsed = parallel_download(
+            stocks, _worker_daily_baostock, out, workers,
+            tracker=tracker,
+            start_date=start_date, end_date=end_date,
+        )
+    elif source == 'both':
+        # 双源模式: 先用 baostock 下载，失败的再用 tdx 补下
+        print(f"\n[2/3] 开始下载 (BaoStock 优先)...")
+        success, fail, total_rows, elapsed = parallel_download(
+            stocks, _worker_daily_baostock, out, workers,
+            tracker=tracker,
+            start_date=start_date, end_date=end_date,
+        )
+        if fail > 0:
+            print(f"\n  🔄 BaoStock 有 {fail} 只失败/无数据，尝试通达信补下...")
+            tdx_success, tdx_fail, tdx_rows, tdx_elapsed = parallel_download(
+                stocks, _worker_daily, out, workers,
+                tracker=tracker,
+                start_date=start_date, end_date=end_date,
+            )
+            success += tdx_success
+            fail = tdx_fail
+            total_rows += tdx_rows
+            elapsed += tdx_elapsed
+    else:
+        print(f"\n[2/3] 开始下载 (通达信)...")
+        success, fail, total_rows, elapsed = parallel_download(
+            stocks, _worker_daily, out, workers,
+            tracker=tracker,
+            start_date=start_date, end_date=end_date,
+        )
 
     print(f"\n  ✅ 成功: {success}  ❌ 失败: {fail}")
     print(f"  📈 总行数: {total_rows:,}")
@@ -731,12 +965,15 @@ def run_daily(out_dir, start_date, end_date, workers, no_resume=False, retry_fai
     return out
 
 
-def run_minute(out_dir, freq, start_date, end_date, workers, no_resume=False, retry_failed=False):
+def run_minute(out_dir, freq, start_date, end_date, workers, no_resume=False, retry_failed=False, source='tdx'):
     freq_name = {0: '5分钟', 1: '15分钟', 4: '1分钟', 5: '30分钟', 6: '60分钟'}
     fname = {0: '5m', 1: '15m', 4: '1m', 5: '30m', 6: '60m'}
 
+    if source == 'baostock':
+        print(f"\n  ⚠️  BaoStock 不支持分钟线，自动切换为通达信下载")
+
     print(f"\n{'='*55}")
-    print(f"  📊 通达信{freq_name.get(freq, '')}线全量下载")
+    print(f"  📊 {freq_name.get(freq, '')}线全量下载 [通达信]")
     print(f"  日期: {start_date} → {end_date}  进程: {workers}")
     print(f"{'='*55}")
 
@@ -760,11 +997,24 @@ def run_minute(out_dir, freq, start_date, end_date, workers, no_resume=False, re
         if done_count > 0:
             print(f"\n  💾 检测到断点记录: 已完成 {done_count} 只 (其中 {failed_count} 只失败待重试)")
 
-    print("\n[1/3] 获取A股列表...")
-    stocks = get_stock_list()
+    if source in ('baostock', 'both'):
+        print("\n[1/3] 获取A股列表 (BaoStock)...")
+        try:
+            stocks = get_stock_list_baostock()
+        except Exception as e:
+            if source == 'both':
+                print(f"  ⚠️  BaoStock 获取列表失败({e})，回退通达信...")
+                stocks = get_stock_list()
+            else:
+                print(f"  ⚠️  BaoStock 获取列表失败({e})，回退通达信...")
+                stocks = get_stock_list()
+    else:
+        print("\n[1/3] 获取A股列表 (通达信)...")
+        stocks = get_stock_list()
     print(f"  共 {len(stocks)} 只A股")
 
-    print(f"\n[2/3] 开始下载...")
+    # 分钟线始终走通达信
+    print(f"\n[2/3] 开始下载 (通达信)...")
     success, fail, total_rows, elapsed = parallel_download(
         stocks, _worker_minute, out, workers,
         tracker=tracker,
@@ -1057,7 +1307,7 @@ def merge_to_db(input_dir, data_type, workers=4, db_url=None):
 def main():
     import argparse
     ap = argparse.ArgumentParser(
-        description='🚀 通达信直连下载A股全量数据',
+        description='🚀 A股全量K线数据下载 - 支持通达信/BaoStock双数据源',
         formatter_class=argparse.RawTextHelpFormatter,
     )
     ap.add_argument('--type', '-T',
@@ -1071,6 +1321,13 @@ def main():
   30m     - 30分钟线
   60m     - 60分钟线
   all_min - 全部分钟线 (1m+5m+15m+30m+60m)''')
+    ap.add_argument('--source', '-S',
+        choices=['tdx', 'baostock', 'both'],
+        default='tdx',
+        help='''数据源 (默认tdx):
+  tdx       - 通达信协议直连, 支持全部周期
+  baostock  - 证券宝HTTP API, 仅支持日线, 分钟线自动回退tdx
+  both      - 双源模式: 日线优先baostock, 失败回退tdx; 分钟线走tdx''')
     ap.add_argument('--start', '-s', default='', help='起始日期, 如 2021-01-01 (优先于--years)')
     ap.add_argument('--end', '-e', default='', help='截止日期, 如 2026-05-01 (默认今天)')
     ap.add_argument('--years', '-y', type=int, default=5, help='年限 (默认5, 若指定--start则忽略)')
@@ -1089,6 +1346,9 @@ def main():
         help='仅显示当前进度文件的统计信息，不执行下载。')
 
     args = ap.parse_args()
+
+    source = args.source
+    source_label = {'tdx': '通达信', 'baostock': 'BaoStock', 'both': '双源(优先BaoStock)'}
 
     # ---- --merge-db 独立模式：跳过下载，直接扫描CSV写入数据库 ----
     if args.merge_db:
@@ -1126,8 +1386,8 @@ def main():
 
     print(f"""
 ╔═══════════════════════════════════════════════════╗
-║  🚀 通达信协议直连 - A股全量数据下载               ║
-║  无需API Key, 直连通达信行情服务器                  ║
+║  🚀 A股全量K线数据下载                             ║
+║  数据源: {source_label.get(source, source):<15}                       ║
 ╠═══════════════════════════════════════════════════╣
 ║  类型: {args.type:<10}  进程: {args.workers:<6}               ║
 ║  输出: {args.output:<38}║
@@ -1171,14 +1431,14 @@ def main():
 
     if args.type == 'all_min':
         for name, freq in [('1m', 4), ('5m', 0), ('15m', 1), ('30m', 5), ('60m', 6)]:
-            out = run_minute(args.output, freq, start_date, end_date, args.workers, args.no_resume, args.retry_failed)
+            out = run_minute(args.output, freq, start_date, end_date, args.workers, args.no_resume, args.retry_failed, source=source)
             outputs.append((name, out))
     elif args.type == '1D':
-        out = run_daily(args.output, start_date, end_date, args.workers, args.no_resume, args.retry_failed)
+        out = run_daily(args.output, start_date, end_date, args.workers, args.no_resume, args.retry_failed, source=source)
         outputs.append(('1D', out))
     else:
         kind, freq = type_map[args.type]
-        out = run_minute(args.output, freq, start_date, end_date, args.workers, args.no_resume, args.retry_failed)
+        out = run_minute(args.output, freq, start_date, end_date, args.workers, args.no_resume, args.retry_failed, source=source)
         outputs.append((args.type, out))
 
     if args.merge:
