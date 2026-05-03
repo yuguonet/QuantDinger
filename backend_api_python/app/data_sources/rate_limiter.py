@@ -1,272 +1,196 @@
 # -*- coding: utf-8 -*-
 """
-===================================
-防封禁工具模块 (Rate Limiter)
-===================================
+限流器模块 — 控制对各数据源的请求频率
 
-参考 daily_stock_analysis 项目实现
-提供反爬虫策略：
-1. 随机休眠（Jitter）
-2. 随机 User-Agent 轮换
-3. 指数退避重试
-4. 请求频率限制
+模块职责:
+    为每个数据源提供独立的请求限流能力，防止因请求过于频繁而被封 IP 或触发
+    反爬机制。同时提供带指数退避的重试装饰器，增强网络请求的健壮性。
+
+设计原理:
+    - 最小间隔 + 随机抖动: 每次请求间隔 = min_interval + random(jitter_min, jitter_max)
+      随机抖动避免固定节奏被服务端识别为爬虫
+    - 线程安全: 使用 threading.Lock 保护共享状态，支持多线程并发调用
+    - 指数退避重试: 失败后等待时间按 2^n 增长，避免在服务端故障时雪崩式重试
+
+在架构中的位置:
+    数据源层 — 被所有 Provider 和复权模块依赖
+
+关键依赖:
+    - app.utils.logger: 日志记录
 """
 
-import time
+from __future__ import annotations
+
 import random
-import logging
-from typing import Optional, Callable, Any, Type, Tuple
+import threading
+import time
 from functools import wraps
+from typing import Any, Callable, Dict, Optional, Tuple, Type
 
-logger = logging.getLogger(__name__)
+from app.utils.logger import get_logger
 
+logger = get_logger(__name__)
 
-# ============================================
-# User-Agent 池
-# ============================================
-
-USER_AGENTS = [
-    # Chrome Windows
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-    # Chrome Mac
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-    # Firefox
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0',
-    # Safari
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
-    # Edge
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
-    # Linux Chrome
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-]
-
-
-def get_random_user_agent() -> str:
-    """获取随机 User-Agent"""
-    return random.choice(USER_AGENTS)
-
-
-def get_request_headers(referer: Optional[str] = None) -> dict:
-    """
-    获取带有随机 User-Agent 的请求头
-    
-    Args:
-        referer: 可选的 Referer 头
-        
-    Returns:
-        请求头字典
-    """
-    headers = {
-        'User-Agent': get_random_user_agent(),
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-        'Accept-Encoding': 'gzip, deflate',
-        'Connection': 'keep-alive',
-    }
-    
-    if referer:
-        headers['Referer'] = referer
-    
-    return headers
-
-
-# ============================================
-# 随机休眠
-# ============================================
-
-def random_sleep(
-    min_seconds: float = 1.0,
-    max_seconds: float = 3.0,
-    log: bool = False
-) -> None:
-    """
-    随机休眠（Jitter）
-    
-    防封禁策略：模拟人类行为的随机延迟
-    在请求之间加入不规则的等待时间
-    
-    Args:
-        min_seconds: 最小休眠时间（秒）
-        max_seconds: 最大休眠时间（秒）
-        log: 是否记录日志
-    """
-    sleep_time = random.uniform(min_seconds, max_seconds)
-    if log:
-        logger.debug(f"随机休眠 {sleep_time:.2f} 秒...")
-    time.sleep(sleep_time)
-
-
-# ============================================
-# 请求频率限制器
-# ============================================
 
 class RateLimiter:
     """
-    请求频率限制器
-    
-    确保请求之间有最小间隔时间
+    通用限流器 — 最小间隔 + 随机抖动。
+
+    通过在每次请求前调用 wait() 方法，确保两次请求之间的间隔不低于
+    min_interval + random(jitter_min, jitter_max)。
+
+    设计模式:
+        单例模式 — 每个数据源创建一个全局实例（见模块底部）
+
+    线程安全性:
+        使用 threading.Lock 保护 _last_call 状态，多线程调用安全。
+
+    Args:
+        min_interval: 两次请求的最小间隔（秒）
+        jitter_min: 随机抖动最小值（秒）
+        jitter_max: 随机抖动最大值（秒）
+
+    Examples:
+        >>> limiter = RateLimiter(min_interval=0.5, jitter_min=0.1, jitter_max=0.5)
+        >>> limiter.wait()  # 首次调用不等待
+        >>> limiter.wait()  # 至少等待 0.5 + random(0.1, 0.5) 秒
     """
-    
+
     def __init__(
         self,
         min_interval: float = 1.0,
-        jitter_min: float = 0.5,
-        jitter_max: float = 1.5
+        jitter_min: float = 0.0,
+        jitter_max: float = 0.0,
     ):
+        """初始化限流器，设置最小间隔和随机抖动范围"""
+        self._min_interval = min_interval
+        self._jitter_min = jitter_min
+        self._jitter_max = jitter_max
+        self._last_call = 0.0
+        self._lock = threading.Lock()
+
+    def wait(self):
         """
-        初始化频率限制器
-        
-        Args:
-            min_interval: 最小请求间隔（秒）
-            jitter_min: 随机抖动最小值（秒）
-            jitter_max: 随机抖动最大值（秒）
+        等待直到可以发起下一次请求。
+
+        计算下次请求的最早时间 = 上次请求时间 + min_interval + random jitter，
+        如果当前时间早于该时间点，则 sleep 等待。
         """
-        self.min_interval = min_interval
-        self.jitter_min = jitter_min
-        self.jitter_max = jitter_max
-        self._last_request_time: Optional[float] = None
-    
-    def wait(self) -> float:
-        """
-        等待直到可以发起下一次请求
-        
-        Returns:
-            实际等待的时间（秒）
-        """
-        wait_time = 0.0
-        
-        if self._last_request_time is not None:
-            elapsed = time.time() - self._last_request_time
-            if elapsed < self.min_interval:
-                # 补充休眠到最小间隔
-                wait_time = self.min_interval - elapsed
+        with self._lock:
+            now = time.time()
+            elapsed = now - self._last_call
+            # 随机抖动：避免固定节奏被反爬识别
+            jitter = random.uniform(self._jitter_min, self._jitter_max) if self._jitter_max > 0 else 0
+            wait_time = self._min_interval + jitter - elapsed
+            if wait_time > 0:
                 time.sleep(wait_time)
-        
-        # 添加随机抖动
-        jitter = random.uniform(self.jitter_min, self.jitter_max)
-        time.sleep(jitter)
-        wait_time += jitter
-        
-        # 记录本次请求时间
-        self._last_request_time = time.time()
-        
-        return wait_time
-    
-    def reset(self) -> None:
-        """重置限制器"""
-        self._last_request_time = None
+            self._last_call = time.time()
 
 
-# ============================================
-# 指数退避重试装饰器
-# ============================================
+# ================================================================
+# 各源限流器实例
+# ================================================================
 
-def retry_with_backoff(
-    max_attempts: int = 3,
-    base_delay: float = 2.0,
-    max_delay: float = 30.0,
-    exponential_base: float = 2.0,
-    exceptions: Tuple[Type[Exception], ...] = (Exception,),
-    on_retry: Optional[Callable[[int, Exception], None]] = None
-):
-    """
-    指数退避重试装饰器
-    
-    Args:
-        max_attempts: 最大重试次数
-        base_delay: 基础延迟时间（秒）
-        max_delay: 最大延迟时间（秒）
-        exponential_base: 指数基数
-        exceptions: 需要重试的异常类型
-        on_retry: 重试时的回调函数
-        
-    使用示例:
-        @retry_with_backoff(max_attempts=3, exceptions=(ConnectionError, TimeoutError))
-        def fetch_data():
-            ...
-    """
-    def decorator(func: Callable) -> Callable:
-        @wraps(func)
-        def wrapper(*args, **kwargs) -> Any:
-            last_exception = None
-            
-            for attempt in range(1, max_attempts + 1):
-                try:
-                    return func(*args, **kwargs)
-                except exceptions as e:
-                    last_exception = e
-                    
-                    if attempt == max_attempts:
-                        logger.error(f"[重试] {func.__name__} 已达最大重试次数 ({max_attempts})，放弃")
-                        raise
-                    
-                    # 计算退避延迟: base_delay * (exponential_base ^ (attempt - 1))
-                    delay = min(
-                        base_delay * (exponential_base ** (attempt - 1)),
-                        max_delay
-                    )
-                    # 添加随机抖动 (±20%)
-                    delay *= random.uniform(0.8, 1.2)
-                    
-                    logger.warning(
-                        f"[重试] {func.__name__} 第 {attempt}/{max_attempts} 次失败: {e}, "
-                        f"等待 {delay:.1f}s 后重试..."
-                    )
-                    
-                    if on_retry:
-                        on_retry(attempt, e)
-                    
-                    time.sleep(delay)
-            
-            # 不应该到达这里
-            raise last_exception
-        
-        return wrapper
-    return decorator
+# 腾讯实时行情限流：最小间隔 0.5s + 0.1~0.5s 随机抖动
+# 腾讯 API 对高频请求较敏感，适当限流可避免被封
+_tencent_limiter = RateLimiter(min_interval=0.5, jitter_min=0.1, jitter_max=0.5)
 
-
-# ============================================
-# 全局限流器实例
-# ============================================
-
-# 东方财富接口限流器（较严格）
-_eastmoney_limiter = RateLimiter(
-    min_interval=2.0,
-    jitter_min=1.0,
-    jitter_max=3.0
-)
-
-# 腾讯财经接口限流器（较宽松）
-_tencent_limiter = RateLimiter(
-    min_interval=1.0,
-    jitter_min=0.5,
-    jitter_max=1.5
-)
-
-# Akshare 接口限流器
-_akshare_limiter = RateLimiter(
-    min_interval=2.0,
-    jitter_min=1.5,
-    jitter_max=3.5
-)
-
-
-def get_eastmoney_limiter() -> RateLimiter:
-    """获取东方财富限流器"""
-    return _eastmoney_limiter
+# 东财数据限流：最小间隔 0.5s + 0.1~0.5s 随机抖动
+# 东财 API 有较严格的频率限制，与腾讯使用相同策略
+_eastmoney_limiter = RateLimiter(min_interval=0.5, jitter_min=0.1, jitter_max=0.5)
 
 
 def get_tencent_limiter() -> RateLimiter:
-    """获取腾讯财经限流器"""
+    """获取腾讯数据源限流器实例"""
     return _tencent_limiter
 
 
-def get_akshare_limiter() -> RateLimiter:
-    """获取 Akshare 限流器"""
-    return _akshare_limiter
+def get_eastmoney_limiter() -> RateLimiter:
+    """获取东财数据源限流器实例"""
+    return _eastmoney_limiter
+
+
+# ================================================================
+# 通用请求头
+# ================================================================
+
+def get_request_headers(referer: str = None) -> Dict[str, str]:
+    """
+    构造通用 HTTP 请求头。
+
+    模拟 Chrome 浏览器的 User-Agent，降低被反爬拦截的概率。
+
+    Args:
+        referer: 可选的 Referer 头，部分 API 需要合法的来源页面
+
+    Returns:
+        HTTP 请求头字典
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
+    if referer:
+        headers["Referer"] = referer
+    return headers
+
+
+# ================================================================
+# 重试装饰器
+# ================================================================
+
+def retry_with_backoff(
+    max_attempts: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 10.0,
+    exceptions: Tuple[Type[Exception], ...] = (Exception,),
+):
+    """
+    带指数退避的重试装饰器。
+
+    算法说明 — 指数退避 (Exponential Backoff):
+        1. 第1次失败后等待 base_delay × 2^0 = base_delay 秒
+        2. 第2次失败后等待 base_delay × 2^1 = 2×base_delay 秒
+        3. 第3次失败后等待 base_delay × 2^2 = 4×base_delay 秒
+        4. ...不超过 max_delay 秒
+        5. 每次等待时间额外乘以 random(0.8, 1.2) 的抖动系数，避免多客户端同时重试
+
+    适用场景:
+        - 网络请求的瞬时故障（超时、连接重置）
+        - 数据源临时不可用（503、429 限流）
+        - 不适用于永久性错误（401 认证失败、404 资源不存在）
+
+    Args:
+        max_attempts: 最大尝试次数（含首次调用）
+        base_delay: 基础等待时间（秒）
+        max_delay: 最大等待时间上限（秒）
+        exceptions: 需要重试的异常类型元组
+
+    Returns:
+        装饰器函数
+
+    Examples:
+        >>> @retry_with_backoff(max_attempts=3, base_delay=1.0)
+        ... def fetch_data():
+        ...     return requests.get(url)
+    """
+    def decorator(fn):
+        """装饰器: 包装原函数，添加重试逻辑"""
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            """重试包装: 指数退避 + 随机抖动"""
+            last_exc = None
+            for attempt in range(max_attempts):
+                try:
+                    return fn(*args, **kwargs)
+                except exceptions as e:
+                    last_exc = e
+                    if attempt < max_attempts - 1:
+                        # 指数退避: base_delay * 2^attempt，不超过 max_delay
+                        delay = min(base_delay * (2 ** attempt), max_delay)
+                        # 随机抖动: ±20%，避免多客户端同时重试造成雷群效应
+                        delay *= random.uniform(0.8, 1.2)
+                        logger.debug("[重试] %s 第%d次失败，%.1fs后重试: %s", fn.__name__, attempt + 1, delay, e)
+                        time.sleep(delay)
+            raise last_exc
+        return wrapper
+    return decorator

@@ -1,26 +1,59 @@
+# -*- coding: utf-8 -*-
 """
-A股数据标准化层 — 统一不同数据源的字段命名和数据格式
+股票代码标准化模块 — 统一市场判断 + 各数据源格式转换
 
-不同数据源返回的字段名、格式、精度都不同:
-- 东财: stock_code, stock_name, trade_date, buy_amount ...
-- AkShare: 代码, 名称, 上榜日, 龙虎榜买入额 ...
-- 新浪: code, name, changepercent ...
+模块职责:
+    提供股票代码的统一解析和格式转换能力。核心函数 detect_market() 将任意格式的
+    股票代码解析为 (market, digits) 标准二元组，各数据源 Provider 只需调用对应转换
+    函数即可获得目标格式，消除重复的市场判断逻辑。
 
-标准化层确保:
-  1. 所有数据源返回统一的字段名
-  2. 类型安全 (float/int/str)
-  3. 缺失字段有合理默认值
-  4. 数据校验 (合理性检查)
+设计原理:
+    - 唯一真相源 (Single Source of Truth): 所有市场判断逻辑集中在 detect_market()
+    - 无状态纯函数: 所有函数均为无副作用的纯函数，线程安全
+    - 防御性输入: safe_float/safe_int 处理市场数据中常见的 "-" / "" / None 异常值
+
+在架构中的位置:
+    数据源层 — 被所有 Provider 和缓存层依赖，是最底层的工具模块
+
+关键依赖:
+    无外部依赖，仅使用 Python 标准库
+
+支持输入格式:
+    600519 / 600519.SH / sh600519 / SZ000001 / 830799.BJ
 """
 
-from __future__ import annotations
-
-from typing import Any, Dict, List, Optional
+from typing import Any, Tuple
 
 
-def _sf(v, default=0.0) -> float:
-    """safe float"""
-    if v is None or v == "-" or v == "" or str(v).strip() == "nan":
+# ================================================================
+# 安全类型转换 — 从旧架构迁移，市场数据解析常用
+# ================================================================
+
+def safe_float(v: Any, default: float = 0.0) -> float:
+    """
+    安全转 float，处理市场数据中常见的异常值。
+
+    市场数据源（东财、新浪、腾讯等）返回的数值字段经常包含 "-"、""、None
+    等非数值标记，直接 float() 转换会抛异常。此函数提供安全降级。
+
+    Args:
+        v: 待转换的值，可以是任意类型
+        default: 转换失败时的默认值
+
+    Returns:
+        转换后的 float 值，失败时返回 default
+
+    Examples:
+        >>> safe_float("12.34")    # 正常转换
+        12.34
+        >>> safe_float("-")        # 数据源的空值标记
+        0.0
+        >>> safe_float(None)       # API 返回的空值
+        0.0
+        >>> safe_float("abc", -1)  # 非数值字符串
+        -1
+    """
+    if v is None or v == "-" or v == "":
         return default
     try:
         return float(v)
@@ -28,8 +61,30 @@ def _sf(v, default=0.0) -> float:
         return default
 
 
-def _si(v, default=0) -> int:
-    """safe int"""
+def safe_int(v: Any, default: int = 0) -> int:
+    """
+    安全转 int，处理市场数据中常见的异常值。
+
+    先转 float 再转 int，兼容 "12.0" 这类字符串。
+    市场数据中的成交量、笔数等字段常用此函数。
+
+    Args:
+        v: 待转换的值，可以是任意类型
+        default: 转换失败时的默认值
+
+    Returns:
+        转换后的 int 值，失败时返回 default
+
+    Examples:
+        >>> safe_int("123")       # 正常转换
+        123
+        >>> safe_int("12.0")      # 浮点字符串 → int
+        12
+        >>> safe_int("-")         # 数据源空值标记
+        0
+        >>> safe_int(None)
+        0
+    """
     if v is None or v == "-" or v == "":
         return default
     try:
@@ -38,304 +93,214 @@ def _si(v, default=0) -> int:
         return default
 
 
-def _ss(v, default="") -> str:
-    """safe str"""
-    if v is None:
-        return default
-    return str(v).strip()
-
-
-# ================================================================
-# 龙虎榜
-# ================================================================
-
-DRAGON_TIGER_SCHEMA = {
-    "stock_code": str,        # 股票代码 6位
-    "stock_name": str,        # 股票名称
-    "trade_date": str,        # 上榜日期 YYYY-MM-DD
-    "reason": str,            # 上榜原因
-    "buy_amount": float,      # 买入金额 (元)
-    "sell_amount": float,     # 卖出金额 (元)
-    "net_amount": float,      # 净买入额 (元)
-    "change_percent": float,  # 涨跌幅 %
-    "close_price": float,     # 收盘价
-    "turnover_rate": float,   # 换手率 %
-    "amount": float,          # 成交额 (元)
-    "buy_seat_count": int,    # 买入席位数
-    "sell_seat_count": int,   # 卖出席位数
-}
-
-
-def normalize_dragon_tiger(raw: Dict[str, Any], source: str = "") -> Dict[str, Any]:
+def detect_market(code: str) -> Tuple[str, str]:
     """
-    标准化一条龙虎榜记录。
+    统一市场判断 — 将任意格式的股票代码解析为标准 (market, digits) 二元组。
 
-    支持的源字段映射:
-    - eastmoney: 直接使用标准字段
-    - akshare: 代码/名称/上榜日/解读 → stock_code/stock_name/trade_date/reason
+    判断优先级:
+        1. 带后缀格式 (600519.SH) → 直接提取后缀作为市场
+        2. 带前缀格式 (SH600519) → 直接提取前缀作为市场
+        3. 纯数字格式 (600519) → 根据代码段规则推断市场：
+           - 沪市: 60x主板、688/689科创板、900 B股、51x ETF、11x可转债
+           - 深市: 00x主板、30x创业板、200 B股、15x/16x/18x基金、12x可转债
+           - 北证: 43/82/83/87/88 开头
+
+    Args:
+        code: 任意格式的股票代码（支持带前缀/后缀/纯数字）
+
+    Returns:
+        (market, digits) 二元组：
+        - market: 'SH'/'SZ'/'BJ'/'' （空字符串表示无法识别）
+        - digits: 纯6位数字代码
+
+    Examples:
+        detect_market('600519')      → ('SH', '600519')
+        detect_market('sh600519')    → ('SH', '600519')
+        detect_market('600519.SH')   → ('SH', '600519')
+        detect_market('SZ000001')    → ('SZ', '000001')
+        detect_market('830799.BJ')   → ('BJ', '830799')
+        detect_market('UNKNOWN')     → ('', 'UNKNOWN')
     """
-    if source == "akshare" or "代码" in raw:
-        return {
-            "stock_code": _ss(raw.get("代码", raw.get("code", raw.get("stock_code")))),
-            "stock_name": _ss(raw.get("名称", raw.get("name", raw.get("stock_name")))),
-            "trade_date": _ss(raw.get("上榜日", raw.get("trade_date", raw.get("stock_code", ""))))[:10],
-            "reason": _ss(raw.get("解读", raw.get("reason", raw.get("EXPLANATION"))))[:100],
-            "buy_amount": _sf(raw.get("龙虎榜买入额", raw.get("buy_amount", raw.get("BUY")))),
-            "sell_amount": _sf(raw.get("龙虎榜卖出额", raw.get("sell_amount", raw.get("SELL")))),
-            "net_amount": _sf(raw.get("龙虎榜净额", raw.get("net_amount", raw.get("NET_BUY")))),
-            "change_percent": _sf(raw.get("涨跌幅", raw.get("change_percent", raw.get("CHANGE_RATE")))),
-            "close_price": _sf(raw.get("收盘价", raw.get("close_price", raw.get("CLOSE_PRICE")))),
-            "turnover_rate": _sf(raw.get("换手率", raw.get("turnover_rate", raw.get("TURNOVERRATE")))),
-            "amount": _sf(raw.get("成交额", raw.get("amount", raw.get("ACCUM_AMOUNT")))),
-            "buy_seat_count": _si(raw.get("买入席位数", raw.get("buy_seat_count", raw.get("BUYER_NUM", 0)))),
-            "sell_seat_count": _si(raw.get("卖出席位数", raw.get("sell_seat_count", raw.get("SELLER_NUM", 0)))),
-        }
+    s = (code or "").strip().upper()
+    if not s:
+        return "", ""
 
-    # eastmoney / default: 直接取标准字段
-    return {
-        "stock_code": _ss(raw.get("stock_code", raw.get("SECURITY_CODE"))),
-        "stock_name": _ss(raw.get("stock_name", raw.get("SECURITY_NAME_ABBR"))),
-        "trade_date": _ss(raw.get("trade_date", raw.get("TRADE_DATE", "")))[:10],
-        "reason": _ss(raw.get("reason", raw.get("EXPLANATION"))),
-        "buy_amount": _sf(raw.get("buy_amount", raw.get("BUY"))),
-        "sell_amount": _sf(raw.get("sell_amount", raw.get("SELL"))),
-        "net_amount": _sf(raw.get("net_amount", raw.get("NET_BUY"))),
-        "change_percent": _sf(raw.get("change_percent", raw.get("CHANGE_RATE"))),
-        "close_price": _sf(raw.get("close_price", raw.get("CLOSE_PRICE"))),
-        "turnover_rate": _sf(raw.get("turnover_rate", raw.get("TURNOVERRATE"))),
-        "amount": _sf(raw.get("amount", raw.get("ACCUM_AMOUNT"))),
-        "buy_seat_count": _si(raw.get("buy_seat_count", raw.get("BUYER_NUM", 0))),
-        "sell_seat_count": _si(raw.get("sell_seat_count", raw.get("SELLER_NUM", 0))),
-    }
+    # 1) 带后缀: 600519.SH / 600519.SS / 600519.SZ / 830799.BJ
+    for suffix in (".SH", ".SS", ".SZ", ".BJ"):
+        if s.endswith(suffix):
+            return s[-2:], s[:-3]
 
+    # 2) 带前缀: SH600519 / SZ000001 / BJ830799
+    if s.startswith(("SH", "SZ", "BJ")) and len(s) >= 3:
+        rest = s[2:]
+        if rest.isdigit() and len(rest) == 6:
+            return s[:2], rest
 
-def normalize_dragon_tiger_list(raw_list: List[Dict], source: str = "") -> List[Dict[str, Any]]:
-    """批量标准化龙虎榜数据"""
-    return [normalize_dragon_tiger(r, source) for r in raw_list if isinstance(r, dict)]
+    # 3) 纯6位数字: 600519 / 000001 / 830799 / 510050
+    if s.isdigit() and len(s) == 6:
+        # 沪市: 主板60x, 科创板688/689, B股900, ETF51x, 可转债110/113/118
+        if s.startswith(("600", "601", "603", "605", "688", "689", "900",
+                         "510", "511", "512", "513", "515", "516", "518", "519",
+                         "110", "113", "118")):
+            return "SH", s
+        # 深市: 主板00x, 创业板300/301, B股200, 基金15/16/18, 可转债127/128
+        if s.startswith(("000", "001", "002", "003", "300", "301", "200",
+                         "150", "159", "160", "161", "162", "163", "164", "165",
+                         "166", "167", "168", "169",
+                         "180", "184", "185", "186", "187", "188", "189",
+                         "127", "128")):
+            return "SZ", s
+        # 北证: 43/82/83/87/88
+        if s.startswith(("43", "82", "83", "87", "88")):
+            return "BJ", s
+
+    return "", s
 
 
 # ================================================================
-# 热榜
+# 各数据源格式转换
 # ================================================================
 
-HOT_RANK_SCHEMA = {
-    "rank": int,              # 排名
-    "stock_code": str,        # 股票代码
-    "stock_name": str,        # 股票名称
-    "price": float,           # 最新价
-    "change_percent": float,  # 涨跌幅 %
-    "popularity_score": float,  # 人气分数
-    "current_rank_change": str, # 排名变化
-}
+def to_tencent_code(code: str) -> str:
+    """
+    转换为腾讯实时行情 API 格式: sh600519 / sz000001 / bj830799。
+
+    腾讯/新浪的实时行情接口使用小写市场前缀 + 6位数字的格式。
+
+    Args:
+        code: 任意格式的股票代码
+
+    Returns:
+        腾讯格式代码，无法识别时返回小写原始输入
+
+    Examples:
+        to_tencent_code('600519')    → 'sh600519'
+        to_tencent_code('SH600519')  → 'sh600519'
+        to_tencent_code('600519.SH') → 'sh600519'
+    """
+    market, digits = detect_market(code)
+    if market and digits:
+        return f"{market.lower()}{digits}"
+    return (code or "").strip().lower()
 
 
-def normalize_hot_rank(raw: Dict[str, Any], source: str = "") -> Dict[str, Any]:
-    """标准化一条热榜记录"""
-    if source == "akshare" or "股票代码" in raw:
-        return {
-            "rank": _si(raw.get("当前排名", raw.get("rank", raw.get("RANK")))),
-            "stock_code": _ss(raw.get("股票代码", raw.get("code", raw.get("SECURITY_CODE")))),
-            "stock_name": _ss(raw.get("股票名称", raw.get("name", raw.get("SECURITY_NAME_ABBR")))),
-            "price": _sf(raw.get("最新价", raw.get("price", raw.get("NEWEST_PRICE")))),
-            "change_percent": _sf(raw.get("涨跌幅", raw.get("change_percent", raw.get("CHANGE_RATE")))),
-            "popularity_score": _sf(raw.get("人气值", raw.get("popularity", raw.get("HOT_NUM", raw.get("SCORE"))))),
-            "current_rank_change": _ss(raw.get("排名变化", raw.get("rank_change", raw.get("RANK_CHANGE")))),
-        }
+def to_sina_code(code: str) -> str:
+    """
+    转换为新浪行情 API 格式: sh600519 / sz000001 / bj830799。
 
-    return {
-        "rank": _si(raw.get("rank", raw.get("RANK"))),
-        "stock_code": _ss(raw.get("stock_code", raw.get("SECURITY_CODE"))),
-        "stock_name": _ss(raw.get("stock_name", raw.get("SECURITY_NAME_ABBR"))),
-        "price": _sf(raw.get("price", raw.get("NEWEST_PRICE"))),
-        "change_percent": _sf(raw.get("change_percent", raw.get("CHANGE_RATE"))),
-        "popularity_score": _sf(raw.get("popularity_score", raw.get("HOT_NUM", raw.get("SCORE")))),
-        "current_rank_change": _ss(raw.get("current_rank_change", raw.get("RANK_CHANGE"))),
-    }
+    新浪格式与腾讯完全相同（小写前缀 + 数字），直接复用 to_tencent_code()。
+
+    Args:
+        code: 任意格式的股票代码
+
+    Returns:
+        新浪格式代码
+    """
+    return to_tencent_code(code)
 
 
-# ================================================================
-# 涨停池 / 跌停池 / 炸板池
-# ================================================================
+def to_eastmoney_secid(code: str) -> str:
+    """
+    转换为东财 secid 格式: 1.600519 / 0.000001 / 0.830799。
 
-ZT_POOL_SCHEMA = {
-    "stock_code": str,
-    "stock_name": str,
-    "trade_date": str,
-    "price": float,
-    "change_percent": float,
-    "continuous_zt_days": int,   # 连板天数
-    "zt_time": str,              # 涨停时间
-    "seal_amount": float,        # 封板资金
-    "turnover_rate": float,
-    "volume": float,
-    "amount": float,
-    "sector": str,               # 所属板块
-    "reason": str,               # 涨停原因
-    "open_count": int,           # 炸板次数
-}
+    东财 API 使用 "市场ID.数字代码" 格式：
+    - 沪市(含科创板) → market_id=1
+    - 深市(含创业板) → market_id=0
+    - 北证 → market_id=0（与深市共用）
 
+    Args:
+        code: 任意格式的股票代码
 
-def normalize_zt_pool(raw: Dict[str, Any], source: str = "", trade_date: str = "") -> Dict[str, Any]:
-    """标准化涨停池记录"""
-    if source == "akshare" or "代码" in raw:
-        return {
-            "stock_code": _ss(raw.get("代码", raw.get("code", raw.get("stock_code")))),
-            "stock_name": _ss(raw.get("名称", raw.get("name", raw.get("stock_name")))),
-            "trade_date": trade_date,
-            "price": _sf(raw.get("最新价", raw.get("close", raw.get("price")))),
-            "change_percent": _sf(raw.get("涨跌幅", raw.get("pct_chg", raw.get("change_percent")))),
-            "continuous_zt_days": _si(raw.get("连板数", raw.get("zt_days", raw.get("continuous_zt_days", 1)))),
-            "zt_time": _ss(raw.get("涨停时间", raw.get("zt_time"))),
-            "seal_amount": _sf(raw.get("封板资金", raw.get("seal_amount"))),
-            "turnover_rate": _sf(raw.get("换手率", raw.get("turnover_rate"))),
-            "volume": _sf(raw.get("成交额", raw.get("amount", raw.get("volume")))),
-            "amount": _sf(raw.get("成交额", raw.get("amount"))),
-            "sector": _ss(raw.get("所属行业", raw.get("sector"))),
-            "reason": _ss(raw.get("涨停原因", raw.get("reason"))),
-            "open_count": _si(raw.get("炸板次数", raw.get("open_count", 0))),
-        }
+    Returns:
+        东财 secid 格式字符串，无法识别时返回空字符串
 
-    return {
-        "stock_code": _ss(raw.get("stock_code", raw.get("SECURITY_CODE"))),
-        "stock_name": _ss(raw.get("stock_name", raw.get("SECURITY_NAME_ABBR"))),
-        "trade_date": _ss(raw.get("trade_date", trade_date)),
-        "price": _sf(raw.get("price", raw.get("CLOSE_PRICE"))),
-        "change_percent": _sf(raw.get("change_percent", raw.get("CHANGE_RATE"))),
-        "continuous_zt_days": _si(raw.get("continuous_zt_days", raw.get("CONTINUOUS_LIMIT_DAYS", raw.get("ZT_DAYS", 1)))),
-        "zt_time": _ss(raw.get("zt_time", raw.get("FIRST_ZDT_TIME"))),
-        "seal_amount": _sf(raw.get("seal_amount", raw.get("LIMIT_ORDER_AMT"))),
-        "turnover_rate": _sf(raw.get("turnover_rate", raw.get("TURNOVERRATE"))),
-        "volume": _sf(raw.get("volume", raw.get("VOLUME"))),
-        "amount": _sf(raw.get("amount", raw.get("TURNOVER"))),
-        "sector": _ss(raw.get("sector", raw.get("BOARD_NAME"))),
-        "reason": _ss(raw.get("reason", raw.get("ZT_REASON"))),
-        "open_count": _si(raw.get("open_count", raw.get("OPEN_NUM", 0))),
-    }
+    Examples:
+        to_eastmoney_secid('600519')    → '1.600519'
+        to_eastmoney_secid('000001')    → '0.000001'
+        to_eastmoney_secid('830799')    → '0.830799'
+        to_eastmoney_secid('UNKNOWN')   → ''
+    """
+    market, digits = detect_market(code)
+    if not market or not digits:
+        return ""
+    if market == "SH":
+        return f"1.{digits}"
+    # SZ / BJ
+    return f"0.{digits}"
 
 
-def normalize_dt_pool(raw: Dict[str, Any], source: str = "", trade_date: str = "") -> Dict[str, Any]:
-    """标准化跌停池记录"""
-    if source == "akshare" or "代码" in raw:
-        return {
-            "stock_code": _ss(raw.get("代码", raw.get("code", raw.get("stock_code")))),
-            "stock_name": _ss(raw.get("名称", raw.get("name", raw.get("stock_name")))),
-            "trade_date": trade_date,
-            "price": _sf(raw.get("最新价", raw.get("price"))),
-            "change_percent": _sf(raw.get("涨跌幅", raw.get("change_percent"))),
-            "seal_amount": _sf(raw.get("封单资金", raw.get("seal_amount"))),
-            "turnover_rate": _sf(raw.get("换手率", raw.get("turnover_rate"))),
-            "amount": _sf(raw.get("成交额", raw.get("amount"))),
-        }
+def to_raw_digits(code: str) -> str:
+    """
+    提取纯6位数字代码 — 剥离所有前缀/后缀。
 
-    return {
-        "stock_code": _ss(raw.get("stock_code", raw.get("SECURITY_CODE"))),
-        "stock_name": _ss(raw.get("stock_name", raw.get("SECURITY_NAME_ABBR"))),
-        "trade_date": _ss(raw.get("trade_date", trade_date)),
-        "price": _sf(raw.get("price", raw.get("CLOSE_PRICE"))),
-        "change_percent": _sf(raw.get("change_percent", raw.get("CHANGE_RATE"))),
-        "seal_amount": _sf(raw.get("seal_amount", raw.get("LIMIT_ORDER_AMT"))),
-        "turnover_rate": _sf(raw.get("turnover_rate", raw.get("TURNOVERRATE"))),
-        "amount": _sf(raw.get("amount", raw.get("TURNOVER"))),
-    }
+    适用于需要纯数字代码的场景，如东财 API 的 filter 参数、缓存键等。
+
+    Args:
+        code: 任意格式的股票代码
+
+    Returns:
+        6位纯数字代码字符串
+
+    Examples:
+        to_raw_digits('SH600519')  → '600519'
+        to_raw_digits('000001.SZ') → '000001'
+        to_raw_digits('600519')    → '600519'
+    """
+    _, digits = detect_market(code)
+    return digits
 
 
-def normalize_broken_board(raw: Dict[str, Any], source: str = "", trade_date: str = "") -> Dict[str, Any]:
-    """标准化炸板池记录"""
-    if source == "akshare" or "代码" in raw:
-        return {
-            "stock_code": _ss(raw.get("代码", raw.get("code", raw.get("stock_code")))),
-            "stock_name": _ss(raw.get("名称", raw.get("name", raw.get("stock_name")))),
-            "trade_date": trade_date,
-            "price": _sf(raw.get("最新价", raw.get("price"))),
-            "change_percent": _sf(raw.get("涨跌幅", raw.get("change_percent"))),
-            "zt_time": _ss(raw.get("涨停时间", raw.get("zt_time"))),
-            "break_time": _ss(raw.get("炸板时间", raw.get("break_time"))),
-            "turnover_rate": _sf(raw.get("换手率", raw.get("turnover_rate"))),
-            "amount": _sf(raw.get("成交额", raw.get("amount"))),
-        }
+def to_canonical(code: str) -> str:
+    """
+    转换为标准格式: SH600519 / SZ000001 / BJ830799。
 
-    return {
-        "stock_code": _ss(raw.get("stock_code", raw.get("SECURITY_CODE"))),
-        "stock_name": _ss(raw.get("stock_name", raw.get("SECURITY_NAME_ABBR"))),
-        "trade_date": _ss(raw.get("trade_date", trade_date)),
-        "price": _sf(raw.get("price", raw.get("CLOSE_PRICE"))),
-        "change_percent": _sf(raw.get("change_percent", raw.get("CHANGE_RATE"))),
-        "zt_time": _ss(raw.get("zt_time", raw.get("FIRST_ZDT_TIME"))),
-        "break_time": _ss(raw.get("break_time", raw.get("LAST_ZDT_TIME"))),
-        "turnover_rate": _sf(raw.get("turnover_rate", raw.get("TURNOVERRATE"))),
-        "amount": _sf(raw.get("amount", raw.get("TURNOVER"))),
-    }
+    标准格式用于内部缓存键、日志输出等需要统一格式的场景。
+
+    Args:
+        code: 任意格式的股票代码
+
+    Returns:
+        标准格式代码，无法识别时返回大写原始输入
+
+    Examples:
+        to_canonical('600519')    → 'SH600519'
+        to_canonical('sh600519')  → 'SH600519'
+        to_canonical('600519.SH') → 'SH600519'
+    """
+    market, digits = detect_market(code)
+    if market and digits:
+        return f"{market}{digits}"
+    return (code or "").strip().upper()
 
 
 # ================================================================
-# 市场快照
+# 港股代码标准化
 # ================================================================
 
-MARKET_SNAPSHOT_SCHEMA = {
-    "up_count": int,          # 上涨家数
-    "down_count": int,        # 下跌家数
-    "flat_count": int,        # 平盘家数
-    "limit_up": int,          # 涨停家数
-    "limit_down": int,        # 跌停家数
-    "total_amount": float,    # 总成交额 (亿元)
-    "emotion": int,           # 情绪指标 0-100
-    "north_net_flow": float,  # 北向净流入 (亿元)
-}
+def normalize_hk_code(symbol: str) -> str:
+    """
+    港股代码标准化: 补齐为 HK + 5位数字格式。
 
+    港股代码长度不固定（1-5位），统一补齐为5位便于后续处理。
 
-def normalize_market_snapshot(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """标准化市场快照"""
-    up = _si(raw.get("up_count", 0))
-    down = _si(raw.get("down_count", 0))
-    total = up + down
-    emotion = _si(raw.get("emotion", -1))
-    if emotion < 0:
-        emotion = int(up / total * 100) if total > 0 else 50
+    Args:
+        symbol: 港股代码，支持任意格式（700 / 0700 / 00700.HK / HK700）
 
-    return {
-        "up_count": up,
-        "down_count": down,
-        "flat_count": _si(raw.get("flat_count", 0)),
-        "limit_up": _si(raw.get("limit_up", 0)),
-        "limit_down": _si(raw.get("limit_down", 0)),
-        "total_amount": _sf(raw.get("total_amount", 0)),
-        "emotion": emotion,
-        "north_net_flow": _sf(raw.get("north_net_flow", 0)),
-    }
+    Returns:
+        标准化的港股代码 (HK00700 格式)
 
-
-# ================================================================
-# 数据校验
-# ================================================================
-
-def validate_dragon_tiger(item: Dict) -> bool:
-    """校验龙虎榜记录是否有效"""
-    return bool(item.get("stock_code")) and bool(item.get("trade_date"))
-
-
-def validate_hot_rank(item: Dict) -> bool:
-    """校验热榜记录是否有效"""
-    return bool(item.get("stock_code"))
-
-
-def validate_zt_pool(item: Dict) -> bool:
-    """校验涨停池记录是否有效"""
-    return bool(item.get("stock_code")) and item.get("change_percent", 0) > 0
-
-
-def validate_dt_pool(item: Dict) -> bool:
-    """校验跌停池记录是否有效"""
-    return bool(item.get("stock_code")) and item.get("change_percent", 0) < 0
-
-
-def validate_broken_board(item: Dict) -> bool:
-    """校验炸板池记录是否有效"""
-    return bool(item.get("stock_code"))
-
-
-# ================================================================
-# 公开别名 — 供外部模块统一引用
-# ================================================================
-safe_float = _sf
-safe_int = _si
-safe_str = _ss
+    Examples:
+        normalize_hk_code('700')      → 'HK00700'
+        normalize_hk_code('00700.HK') → 'HK00700'
+        normalize_hk_code('HK700')    → 'HK00700'
+    """
+    s = (symbol or "").strip().upper()
+    if not s:
+        return s
+    if s.endswith(".HK"):
+        s = s[:-3]
+    if s.isdigit():
+        return "HK" + s.zfill(5)
+    if s.startswith("HK") and s[2:].isdigit():
+        return "HK" + s[2:].zfill(5)
+    return s
