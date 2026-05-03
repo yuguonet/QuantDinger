@@ -87,26 +87,6 @@ def index():
 
 
 # ================================================================
-# POST /sync — 触发数据同步
-# ================================================================
-@xuangu_bp.route("/sync", methods=["POST"])
-@login_required
-def trigger_sync():
-    """触发从东方财富选股器同步数据到 PostgreSQL"""
-    data = request.get_json() or {}
-    trade_date = (data.get("date") or "").strip() or None
-    proxy = (data.get("proxy") or "").strip() or None
-
-    try:
-        from app.services.stock_selection_sync import run_sync
-        result = run_sync(proxy=proxy, trade_date=trade_date)
-        status = 200 if result["success"] else 500
-        return jsonify({"code": 0 if result["success"] else 1, "data": result}), status
-    except Exception as e:
-        logger.error(f"sync failed: {e}", exc_info=True)
-        return jsonify({"code": 1, "msg": str(e)}), 500
-
-
 # ================================================================
 # GET /stats — 表统计信息（公开）
 # ================================================================

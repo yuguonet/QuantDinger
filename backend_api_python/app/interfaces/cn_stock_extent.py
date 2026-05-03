@@ -1,7 +1,7 @@
 """
-A股数据接口扩展 — 为 CNStockDataSource 补充 interfaces 层所需的全部方法
+A股数据接口扩展 — interfaces 层所需的全部方法
 
-继承 CNStockDataSource，添加:
+提供:
 - get_index_quotes()      → 指数实时行情 (东财→腾讯→新浪)
 - get_market_snapshot()   → 市场涨跌统计 (东财全量→AkShare兜底)
 - get_stock_info()        → 个股基本信息 (东财)
@@ -27,10 +27,42 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 
-from app.data_sources.cn_stock import CNStockDataSource, _fetch_with_timeout, _get_timeout
-from app.data_sources.tencent import normalize_cn_code, fetch_quote
+from app.data_sources.circuit_breaker import get_realtime_circuit_breaker
+from app.config.data_sources import DataSourceConfig
+import concurrent.futures
+import logging as _logging
+
+_TIMEOUT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="cn-ext-tmo")
+
+def _get_timeout() -> float:
+    """统一获取超时配置"""
+    return float(getattr(DataSourceConfig, 'DEFAULT_TIMEOUT', None) or 10)
+
+def _fetch_with_timeout(
+    func: Callable,
+    *args,
+    timeout: Optional[float] = None,
+    source_name: str = "",
+    **kwargs,
+) -> Tuple[Optional[Any], Optional[str]]:
+    """在独立线程中执行 func，超时后放弃。"""
+    if timeout is None:
+        timeout = _get_timeout()
+    future = _TIMEOUT_EXECUTOR.submit(func, *args, **kwargs)
+    try:
+        result = future.result(timeout=timeout)
+        return result, None
+    except concurrent.futures.TimeoutError:
+        logger.warning(f"[超时] {source_name} 调用超时 ({timeout}s)")
+        future.cancel()
+        return None, f"{source_name} timeout ({timeout}s)"
+    except Exception as e:
+        logger.warning(f"[异常] {source_name} 调用失败: {e}")
+        return None, f"{source_name} error: {e}"
+from app.data_sources.normalizer import to_tencent_code as normalize_cn_code
+from app.data_sources.tencent import fetch_quote
+from app.data_sources.normalizer import to_eastmoney_secid as _em_secid_from_cn
 from app.data_sources.eastmoney import (
-    _em_secid_from_cn,
     fetch_eastmoney_dragon_tiger,
     fetch_eastmoney_hot_rank,
     fetch_eastmoney_zt_pool,
@@ -92,17 +124,16 @@ def _index_secid(code: str) -> str:
     return f"0.{c}"
 
 
-class AStockDataSource(CNStockDataSource):
+class AStockDataSource:
     """
-    A股完整数据源 — 继承 CNStockDataSource 的多源 fallback，
-    补充 interfaces 层所需的扩展方法。
+    A股完整数据源 — 多源 fallback，补充 interfaces 层所需的扩展方法。
     """
 
     name = "AStock/multi-source"
     enabled = True
 
     def __init__(self):
-        super().__init__()
+        self.circuit_breaker = get_realtime_circuit_breaker()
         # DataCache 支持 per-key TTL，用于长缓存场景
         self._info_cache = get_stock_info_cache()  # 默认 TTL=86400s
 

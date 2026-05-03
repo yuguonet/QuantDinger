@@ -651,7 +651,7 @@ class MarketDataCollector:
                 if market == 'CNStock':
                     try:
                         from app.interfaces.cn_stock_extent import CNStockExtent
-                        from app.data_sources.tencent import normalize_cn_code
+                        from app.data_sources.normalizer import to_tencent_code as normalize_cn_code
                         ext = CNStockExtent()
                         code = normalize_cn_code(symbol)
                         if code:
@@ -681,9 +681,8 @@ class MarketDataCollector:
           + Tencent quote for live price fields
         """
         try:
+            from app.data_sources.normalizer import to_tencent_code as normalize_cn_code, normalize_hk_code
             from app.data_sources.tencent import (
-                normalize_cn_code,
-                normalize_hk_code,
                 fetch_quote,
                 parse_quote_to_ticker,
             )
@@ -1324,7 +1323,7 @@ class MarketDataCollector:
         try:
             if symbol:
                 from app.interfaces.cn_stock_extent import CNStockExtent
-                from app.data_sources.tencent import normalize_cn_code
+                from app.data_sources.normalizer import to_tencent_code as normalize_cn_code
                 ext = CNStockExtent()
                 code = normalize_cn_code(symbol)
                 if code:
@@ -1821,7 +1820,7 @@ class MarketDataCollector:
                 # 先走 CNStockExtent 缓存
                 try:
                     from app.interfaces.cn_stock_extent import CNStockExtent
-                    from app.data_sources.tencent import normalize_cn_code
+                    from app.data_sources.normalizer import to_tencent_code as normalize_cn_code
                     ext = CNStockExtent()
                     code = normalize_cn_code(symbol)
                     if code:
@@ -1852,11 +1851,8 @@ class MarketDataCollector:
           + Tencent quote for Chinese name
         """
         try:
-            from app.data_sources.tencent import (
-                normalize_cn_code,
-                normalize_hk_code,
-                fetch_quote,
-            )
+            from app.data_sources.normalizer import to_tencent_code as normalize_cn_code, normalize_hk_code
+            from app.data_sources.tencent import fetch_quote
             from app.data_sources.cn_hk_fundamentals import (
                 fetch_twelvedata_profile,
                 fetch_cn_company_extras,

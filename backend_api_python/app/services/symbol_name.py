@@ -21,7 +21,7 @@ import requests
 
 from app.utils.logger import get_logger
 from app.data.market_symbols_seed import get_symbol_name as seed_get_symbol_name
-from app.data_sources.tencent import normalize_cn_code, normalize_hk_code
+from app.data_sources.normalizer import to_tencent_code as normalize_cn_code, normalize_hk_code
 
 logger = get_logger(__name__)
 
