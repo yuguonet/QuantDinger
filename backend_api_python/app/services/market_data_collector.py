@@ -650,9 +650,9 @@ class MarketDataCollector:
                 # CNStock: 先走 CNStockExtent 缓存，命中则直接返回
                 if market == 'CNStock':
                     try:
-                        from app.interfaces.cn_stock_extent import CNStockExtent
+                        from app.interfaces.cn_stock_extent import AStockDataSource
                         from app.data_sources.normalizer import to_tencent_code as normalize_cn_code
-                        ext = CNStockExtent()
+                        ext = AStockDataSource()
                         code = normalize_cn_code(symbol)
                         if code:
                             info = ext.get_stock_info(code)
@@ -682,10 +682,8 @@ class MarketDataCollector:
         """
         try:
             from app.data_sources.normalizer import to_tencent_code as normalize_cn_code, normalize_hk_code
-            from app.data_sources.tencent import (
-                fetch_quote,
-                parse_quote_to_ticker,
-            )
+            from app.data_sources.provider.tencent import TencentDataSource
+            _tencent_ds = TencentDataSource()
             from app.data_sources.cn_hk_fundamentals import (
                 fetch_twelvedata_fundamental,
                 fetch_twelvedata_statements,
@@ -701,8 +699,7 @@ class MarketDataCollector:
             code = normalize_cn_code(symbol) if market == 'CNStock' else normalize_hk_code(symbol)
             is_hk = market == 'HKStock'
 
-            parts = fetch_quote(code)
-            t = parse_quote_to_ticker(parts) if parts else {}
+            t = _tencent_ds.fetch_quote(code) or {}
             result: Dict[str, Any] = {
                 "pe_ratio": None,
                 "pb_ratio": None,
@@ -1322,9 +1319,9 @@ class MarketDataCollector:
         # 2. 个股主力资金流向 (补充因子)
         try:
             if symbol:
-                from app.interfaces.cn_stock_extent import CNStockExtent
+                from app.interfaces.cn_stock_extent import AStockDataSource
                 from app.data_sources.normalizer import to_tencent_code as normalize_cn_code
-                ext = CNStockExtent()
+                ext = AStockDataSource()
                 code = normalize_cn_code(symbol)
                 if code:
                     flow = ext.get_stock_fund_flow(code)
@@ -1819,9 +1816,9 @@ class MarketDataCollector:
             if market == 'CNStock':
                 # 先走 CNStockExtent 缓存
                 try:
-                    from app.interfaces.cn_stock_extent import CNStockExtent
+                    from app.interfaces.cn_stock_extent import AStockDataSource
                     from app.data_sources.normalizer import to_tencent_code as normalize_cn_code
-                    ext = CNStockExtent()
+                    ext = AStockDataSource()
                     code = normalize_cn_code(symbol)
                     if code:
                         info = ext.get_stock_info(code)
@@ -1852,7 +1849,7 @@ class MarketDataCollector:
         """
         try:
             from app.data_sources.normalizer import to_tencent_code as normalize_cn_code, normalize_hk_code
-            from app.data_sources.tencent import fetch_quote
+            from app.data_sources.provider.tencent import TencentDataSource
             from app.data_sources.cn_hk_fundamentals import (
                 fetch_twelvedata_profile,
                 fetch_cn_company_extras,
@@ -1862,10 +1859,10 @@ class MarketDataCollector:
             code = normalize_cn_code(symbol) if market == 'CNStock' else normalize_hk_code(symbol)
             is_hk = market == 'HKStock'
 
-            parts = fetch_quote(code)
+            q = TencentDataSource().fetch_quote(code)
             cn_name = ""
-            if parts:
-                cn_name = (parts[1] or "").strip() if len(parts) > 1 else ""
+            if q:
+                cn_name = (q.get("name", "") or "").strip()
 
             row: Dict[str, Any] = {
                 "name": cn_name or code,

@@ -113,10 +113,10 @@ def resolve_symbol_name(market: str, symbol: str) -> Optional[str]:
     # CN/HK stocks: try Tencent quote name first (no key), then yfinance best-effort.
     if m in ('CNStock', 'HKStock'):
         try:
-            from app.data_sources.tencent import fetch_quote
-            parts = fetch_quote(s)
-            if parts and len(parts) > 1 and parts[1]:
-                return str(parts[1]).strip()
+            from app.data_sources.provider.tencent import TencentDataSource
+            q = TencentDataSource().fetch_quote(s)
+            if q and q.get("name"):
+                return str(q["name"]).strip()
         except Exception:
             pass
         return _resolve_name_from_yfinance(s)

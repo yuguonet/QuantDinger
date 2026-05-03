@@ -20,6 +20,7 @@ storage.py — 统一数据读取层（桥接 db_market）
 from __future__ import annotations
 
 import os
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 # 时间框架 → 目录名映射（与旧 CSV 结构兼容）
@@ -105,6 +106,42 @@ def read_local(
         end_time=before_time,
         limit=limit,
     )
+
+
+def read_clean(
+    market: str = "CNStock",
+    symbol: str = "000001",
+    timeframe: str = "1D",
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
+    """
+    通过 kline_clean.MarketDataProvider 获取清洗后的 K 线数据。
+
+    相比 read_local，增加了：交易日过滤、缺失段前向填充、聚合周期支持
+    （30m/60m/2H/4H 自动从 15m 聚合）。
+
+    Args:
+        market:    市场标识，如 "CNStock"
+        symbol:    品种代码，如 "000001"
+        timeframe: K线周期，如 "15m", "1D"
+        start:     起始时间（datetime），None 则默认一年前
+        end:       结束时间（datetime），None 则默认当前时间
+
+    Returns:
+        清洗后的 K 线数据列表: [{"time": datetime, "open": float, "high": float,
+                                 "low": float, "close": float, "volume": float}, ...]
+    """
+    from app.data_sources.kline_clean import MarketDataProvider
+
+    if end is None:
+        end = datetime.now()
+    if start is None:
+        start = end - timedelta(days=365)
+
+    writer = _get_writer()
+    provider = MarketDataProvider(writer)
+    return provider.get_clean_klines(market, symbol, start, end, timeframe)
 
 
 def list_local(

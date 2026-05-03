@@ -60,29 +60,30 @@ def _fetch_with_timeout(
         logger.warning(f"[异常] {source_name} 调用失败: {e}")
         return None, f"{source_name} error: {e}"
 from app.data_sources.normalizer import to_tencent_code as normalize_cn_code
-from app.data_sources.tencent import fetch_quote
 from app.data_sources.normalizer import to_eastmoney_secid as _em_secid_from_cn
-from app.data_sources.eastmoney import (
-    fetch_eastmoney_dragon_tiger,
-    fetch_eastmoney_hot_rank,
-    fetch_eastmoney_zt_pool,
-    fetch_eastmoney_dt_pool,
-    fetch_eastmoney_broken_board,
+
+# 新 Provider 类 — 实例化后调用方法
+from app.data_sources.provider.tencent import TencentDataSource
+from app.data_sources.provider.sina import SinaDataSource
+
+# eastmoney 的模块级函数仍保留，直接导入
+from app.data_sources.provider.eastmoney import (
+    fetch_dragon_tiger as fetch_eastmoney_dragon_tiger,
+    fetch_hot_rank as fetch_eastmoney_hot_rank,
+    fetch_zt_pool as fetch_eastmoney_zt_pool,
+    fetch_dt_pool as fetch_eastmoney_dt_pool,
+    fetch_broken_board as fetch_eastmoney_broken_board,
 )
-from app.data_sources.akshare import (
-    fetch_akshare_dragon_tiger,
-    fetch_akshare_hot_rank,
-    fetch_akshare_hot_rank_wc,
-    fetch_akshare_zt_pool,
-    fetch_akshare_dt_pool,
-    fetch_akshare_broken_board,
-)
+
+# 单例，避免重复实例化
+_tencent_ds = TencentDataSource()
+_sina_ds = SinaDataSource()
 from app.data_sources.sina_a_stock import (
     fetch_sina_market_snapshot,
     fetch_sina_zt_pool,
     fetch_sina_dt_pool,
 )
-from app.data_sources.sina import fetch_sina_quote
+
 from app.data_sources.rate_limiter import get_request_headers, get_eastmoney_limiter, get_akshare_limiter
 from app.data_sources.cache_manager import get_stock_info_cache
 from app.data_sources.normalizer import safe_float, safe_int
@@ -228,24 +229,19 @@ class AStockDataSource:
         for code in (codes or []):
             try:
                 tencent_code = normalize_cn_code(code)
-                parts = fetch_quote(tencent_code)
-                if not parts or len(parts) < 5:
+                q = _tencent_ds.fetch_quote(tencent_code)
+                if not q or q.get("last", 0) <= 0:
                     continue
-
-                last = safe_float(parts[3])
-                prev = safe_float(parts[4])
-                change = round(last - prev, 2) if prev else 0.0
-                change_pct = round(change / prev * 100, 2) if prev else 0.0
 
                 results.append({
                     "code": code,
-                    "name": INDEX_CODES.get(code, str(parts[1]) if len(parts) > 1 else ""),
-                    "price": last,
-                    "change": change,
-                    "change_percent": change_pct,
-                    "open": safe_float(parts[5]) if len(parts) > 5 else 0,
-                    "high": safe_float(parts[33]) if len(parts) > 33 else last,
-                    "low": safe_float(parts[34]) if len(parts) > 34 else last,
+                    "name": INDEX_CODES.get(code, q.get("name", "")),
+                    "price": q.get("last", 0),
+                    "change": q.get("change", 0),
+                    "change_percent": q.get("changePercent", 0),
+                    "open": q.get("open", 0),
+                    "high": q.get("high", 0),
+                    "low": q.get("low", 0),
                 })
             except Exception as e:
                 logger.debug(f"腾讯获取指数 {code} 失败: {e}")
@@ -258,7 +254,7 @@ class AStockDataSource:
         results = []
         for code in (codes or []):
             try:
-                q = fetch_sina_quote(code)
+                q = _sina_ds.fetch_quote(code)
                 if not q or q.get("last", 0) <= 0:
                     continue
                 results.append({
@@ -919,7 +915,6 @@ class AStockDataSource:
         """获取龙虎榜。多源 fallback: 东财直连 → AkShare → (未来扩展)"""
         chain = [
             ("eastmoney_dragon_tiger", lambda: fetch_eastmoney_dragon_tiger(start_date, end_date)),
-            ("akshare_dragon_tiger",    lambda: fetch_akshare_dragon_tiger(start_date, end_date)),
         ]
         return self._try_sources(chain)
 
@@ -931,8 +926,6 @@ class AStockDataSource:
         """
         chain = [
             ("eastmoney_hot_rank",     lambda: fetch_eastmoney_hot_rank()),
-            ("akshare_hot_rank_em",    lambda: fetch_akshare_hot_rank()),
-            ("akshare_hot_rank_wc",    lambda: fetch_akshare_hot_rank_wc()),
         ]
         return self._try_sources(chain, cache_key="hot_rank", cache_ttl=300)
 
@@ -946,7 +939,6 @@ class AStockDataSource:
             trade_date = datetime.now().strftime("%Y-%m-%d")
         chain = [
             ("eastmoney_zt_pool", lambda: fetch_eastmoney_zt_pool(trade_date)),
-            ("akshare_zt_pool",   lambda: fetch_akshare_zt_pool(trade_date)),
             ("sina_zt_pool",      lambda: fetch_sina_zt_pool(trade_date)),
         ]
         return self._try_sources(chain, cache_key=f"zt_pool:{trade_date}", cache_ttl=60)
@@ -959,7 +951,6 @@ class AStockDataSource:
             trade_date = datetime.now().strftime("%Y-%m-%d")
         chain = [
             ("eastmoney_dt_pool", lambda: fetch_eastmoney_dt_pool(trade_date)),
-            ("akshare_dt_pool",   lambda: fetch_akshare_dt_pool(trade_date)),
             ("sina_dt_pool",      lambda: fetch_sina_dt_pool(trade_date)),
         ]
         return self._try_sources(chain, cache_key=f"limit_down:{trade_date}", cache_ttl=60)
@@ -970,7 +961,6 @@ class AStockDataSource:
             trade_date = datetime.now().strftime("%Y-%m-%d")
         chain = [
             ("eastmoney_broken_board", lambda: fetch_eastmoney_broken_board(trade_date)),
-            ("akshare_broken_board",    lambda: fetch_akshare_broken_board(trade_date)),
         ]
         return self._try_sources(chain, cache_key=f"broken_board:{trade_date}", cache_ttl=60)
 

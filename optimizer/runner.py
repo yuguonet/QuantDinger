@@ -50,26 +50,62 @@ if _backend_root not in sys.path:
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-# ── Monkey-patch: 让 DataSourceFactory.get_kline 优先读本地 data_warehouse ──
+# ── Monkey-patch: 让 DataSourceFactory.get_kline 通过 kline_clean 读取数据 ──
 def _patch_datasource_warehouse():
-    """在 BacktestService 加载前，注入本地仓库读取逻辑"""
+    """在 BacktestService 加载前，注入 kline_clean 数据读取逻辑"""
     from app.data_sources.factory import DataSourceFactory
-    from optimizer.data_warehouse.storage import read_local
+    from optimizer.data_warehouse.storage import read_clean
+    from datetime import datetime, timedelta
 
     _orig_get_kline = DataSourceFactory.get_kline.__func__
 
+    # 时间框架 → 估算每根 bar 的时间跨度（用于 limit → start 转换）
+    _TF_DELTA = {
+        "1m": timedelta(minutes=1), "5m": timedelta(minutes=5),
+        "15m": timedelta(minutes=15), "30m": timedelta(minutes=30),
+        "60m": timedelta(hours=1), "1H": timedelta(hours=1),
+        "2H": timedelta(hours=2), "4H": timedelta(hours=4),
+        "1D": timedelta(days=1), "1W": timedelta(weeks=1),
+    }
+
+    # 小写/别名 → 标准 key（与 kline_clean._TF_ALIASES 对齐）
+    _TF_NORM = {
+        "1d": "1D", "d": "1D", "day": "1D", "daily": "1D",
+        "1w": "1W", "w": "1W", "week": "1W", "weekly": "1W",
+        "h": "60m", "1h": "1H",
+        "2h": "2H", "4h": "4H",
+    }
+
+    def _to_dt(t):
+        """将时间戳（int/float）或 datetime 统一转为 naive datetime（不加时区）"""
+        if t is None:
+            return None
+        if isinstance(t, datetime):
+            return t.replace(tzinfo=None) if t.tzinfo else t
+        if isinstance(t, (int, float)):
+            return datetime.fromtimestamp(t)
+        return None
+
     def _get_kline_with_warehouse(cls, market, symbol, timeframe, limit, before_time=None, after_time=None):
         try:
-            data = read_local(
-                market=market, timeframe=timeframe, symbol=symbol,
-                limit=limit, before_time=before_time, after_time=after_time,
+            end = _to_dt(before_time) or datetime.now()
+            start = _to_dt(after_time)
+            if start is None:
+                # 从 limit 估算起始时间（多留 50% 余量应对非交易日）
+                tf_key = _TF_NORM.get(timeframe, timeframe)
+                delta = _TF_DELTA.get(tf_key, timedelta(days=1))
+                start = end - delta * int(limit * 1.5)
+
+            data = read_clean(
+                market=market, symbol=symbol,
+                timeframe=timeframe, start=start, end=end,
             )
             if data and len(data) >= 10:
-                print(f"  [本地仓库] 命中 {symbol} {timeframe}: {len(data)} 条")
                 return data
         except Exception:
             pass
-        return _orig_get_kline(cls, market, symbol, timeframe, limit, before_time=before_time, after_time=after_time)
+        return _orig_get_kline(cls, market, symbol, timeframe, limit,
+                               before_time=before_time, after_time=after_time)
 
     DataSourceFactory.get_kline = classmethod(_get_kline_with_warehouse)
 
