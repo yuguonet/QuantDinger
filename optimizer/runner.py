@@ -50,6 +50,26 @@ if _backend_root not in sys.path:
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+# ── 加载 .env（主进程，仿 dual_source_sync.py）──
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    for _env_path in [
+        os.path.join(_backend_root, '.env'),
+        os.path.join(_project_root, '.env'),
+    ]:
+        if os.path.isfile(_env_path):
+            _load_dotenv(_env_path, override=False)
+            _db_url = os.getenv("DATABASE_URL", "")
+            print(f"  ✅ .env 已加载: {_env_path}")
+            print(f"  📌 DATABASE_URL: {_db_url[:30]}..." if len(_db_url) > 30 else f"  📌 DATABASE_URL: {_db_url}")
+            break
+    else:
+        print(f"  ⚠️ 未找到 .env（已检查: {_backend_root}, {_project_root}）")
+except ImportError:
+    print("  ⚠️ python-dotenv 未安装 (pip install python-dotenv)")
+except Exception as _env_e:
+    print(f"  ⚠️ 加载 .env 失败: {_env_e}")
+
 # ── Monkey-patch: 让 DataSourceFactory.get_kline 通过 kline_clean 读取数据 ──
 def _patch_datasource_warehouse():
     """在 BacktestService 加载前，注入 kline_clean 数据读取逻辑"""
@@ -488,7 +508,20 @@ def run_single_template(
 # ============================================================
 
 def _worker_init():
-    """每个子进程初始化：确保 monkey-patch、环境变量和模块路径就绪"""
+    """每个子进程初始化：忽略 SIGINT（由主进程统一管理退出）+ 环境变量"""
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    # fork 后重置 db 全局单例（仿 dual_source_sync.py，避免继承父进程脏连接）
+    import app.utils.db_market as _dbm
+    if _dbm._manager is not None:
+        try:
+            _dbm._manager.close_all_pools()
+        except Exception:
+            pass
+    _dbm._manager = None
+    _dbm._writer = None
+
     # 加载 .env（子进程继承不到父进程的 load_dotenv 结果）
     try:
         from dotenv import load_dotenv
@@ -824,17 +857,58 @@ stock_list.txt 格式（同 downloader）:
         print(f"\n  🚀 启动 {args.jobs} 个进程并行优化...")
         # 子进程需要 unbuffered 输出，否则 print 会攒到结束才显示
         os.environ["PYTHONUNBUFFERED"] = "1"
-        with multiprocessing.Pool(
+        pool = multiprocessing.Pool(
             processes=args.jobs,
             initializer=_worker_init,
-        ) as pool:
-            results = pool.map(_worker_run_one, tasks)
+        )
+        async_results = []
+        for task in tasks:
+            ar = pool.apply_async(_worker_run_one, (task,))
+            async_results.append(ar)
+        pool.close()
+
+        done_set = set()
+        results = [None] * len(async_results)
+        try:
+            while len(done_set) < len(async_results):
+                time.sleep(0.5)
+                for idx, ar in enumerate(async_results):
+                    if idx in done_set:
+                        continue
+                    if ar.ready():
+                        try:
+                            results[idx] = ar.get(timeout=0)
+                        except Exception:
+                            results[idx] = {"_error": "子进程异常退出"}
+                        done_set.add(idx)
+                done = len(done_set)
+                pct = done * 100 // len(async_results)
+                elapsed_so_far = time.time() - t_total
+                print(f"\r  进度: {done}/{len(async_results)} ({pct}%)  "
+                      f"耗时: {elapsed_so_far:.0f}s", end='', flush=True)
+            print()
+        except KeyboardInterrupt:
+            print("\n\n⚠️  收到中断信号，正在终止子进程...")
+            pool.terminate()
+            pool.join()
+            for p in pool._pool:
+                if p.is_alive():
+                    try:
+                        import signal as _sig
+                        os.kill(p.pid, _sig.SIGKILL)
+                    except (OSError, AttributeError):
+                        pass
+            pool.join()
+            print("❌ 已强制退出")
+            sys.exit(1)
+        finally:
+            pool.join()
 
         for result in results:
             if result and "_error" not in result:
                 all_results.append(result)
             elif result and "_error" in result:
-                print(f"\n  ❌ {result['_symbol_raw']} / {result['_template']} 失败: {result['_error']}")
+                print(f"\n  ❌ {result.get('_symbol_raw', '?')} / {result.get('_template', '?')} 失败: {result['_error']}")
 
     elapsed_total = time.time() - t_total
 
