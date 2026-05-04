@@ -619,6 +619,7 @@ def _lookup_market_code(code: str) -> int:
 
 # BaoStock 全局连接状态（进程级单例，非线程安全）
 _bs_logged_in: bool = False
+_bs_lock = None  # fork 后在 worker 中初始化
 
 
 def _ensure_bs_login():
@@ -627,6 +628,9 @@ def _ensure_bs_login():
     if _bs_logged_in:
         return
     import baostock as bs
+    # 设置 socket 超时，防止单个请求卡死整个 worker
+    import socket as _sock
+    _sock.setdefaulttimeout(30)
     lg = bs.login()
     if lg.error_code != '0':
         raise ConnectionError(f"BaoStock 登录失败: {lg.error_msg}")
@@ -658,25 +662,58 @@ def download_baostock_1d(market_code: int, code: str, start_date: str, end_date:
                           worker_id: int = 0) -> List[Dict[str, Any]]:
     """
     从 BaoStock 下载单只股票的 1D 前复权数据。
-
-    注意: BaoStock 是全局单例 TCP 连接，非线程安全。
-    调用方应确保同一进程内不并发调用此函数。
+    带单股超时保护（60s），防止单个卡住拖慢整个 worker。
     """
     bs = _import_baostock()
-    _ensure_bs_login()
+
+    # 每次查询前检查连接，fork 后的首次调用会自动重新登录
+    try:
+        _ensure_bs_login()
+    except Exception as e:
+        logger.warning("[BaoStock] Worker-%d 登录失败: %s", worker_id, e)
+        return []
 
     bs_code = f"{'sh' if market_code == 1 else 'sz'}.{code}"
 
     for retry in range(3):
         try:
-            rs = bs.query_history_k_data_plus(
-                bs_code,
-                "date,open,high,low,close,volume,amount",
-                start_date=start_date,
-                end_date=end_date,
-                frequency="d",
-                adjustflag="1",  # 前复权
-            )
+            # 带超时的查询：用线程包装
+            result_holder: Dict[str, Any] = {}
+            def _query():
+                try:
+                    rs = bs.query_history_k_data_plus(
+                        bs_code,
+                        "date,open,high,low,close,volume,amount",
+                        start_date=start_date,
+                        end_date=end_date,
+                        frequency="d",
+                        adjustflag="1",
+                    )
+                    result_holder["rs"] = rs
+                except Exception as e:
+                    result_holder["error"] = e
+
+            import threading as _th
+            t = _th.Thread(target=_query, daemon=True)
+            t.start()
+            t.join(timeout=60)  # 单股最多等 60s
+
+            if t.is_alive():
+                # 超时 → 重连
+                logger.warning("[BaoStock] %s 查询超时(60s)，重连...", code)
+                _bs_logout()
+                try:
+                    _ensure_bs_login()
+                except Exception:
+                    pass
+                continue
+
+            if "error" in result_holder:
+                raise result_holder["error"]
+
+            rs = result_holder.get("rs")
+            if rs is None:
+                return []
             if rs.error_code != '0':
                 if retry == 2:
                     return []
@@ -710,7 +747,6 @@ def download_baostock_1d(market_code: int, code: str, start_date: str, end_date:
         except (ConnectionError, OSError, TimeoutError):
             if retry == 2:
                 return []
-            # 重连
             _bs_logout()
             try:
                 _ensure_bs_login()
@@ -1204,9 +1240,16 @@ def check_continuity_simple(
 
 def _worker_init():
     import signal as _sig
+    import socket as _sock
     # 忽略 SIGINT，让主进程统一处理 Ctrl+C
     _sig.signal(_sig.SIGINT, _sig.SIG_IGN)
     # SIGTERM 保持默认（终止进程），这样 pool.terminate() 能生效
+    # 全局 socket 超时 30s，防止单个请求卡死 worker（TDX + BaoStock）
+    _sock.setdefaulttimeout(30)
+
+    # fork 后 BaoStock 继承了父进程的 TCP 连接，已失效，强制重置
+    global _bs_logged_in
+    _bs_logged_in = False
 
 
 def _worker_batch(args: Tuple) -> Dict[str, Any]:
@@ -1406,6 +1449,12 @@ def main():
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
+    # set_wakeup_fd: SIGINT handler 写 1 字节到 pipe，强制中断 C 层阻塞调用
+    # （pool.get(timeout=5) 底层是管道 select，收到 wakeup fd 的写入会立即返回）
+    _wakeup_r, _wakeup_w = os.pipe()
+    os.set_blocking(_wakeup_r, False)
+    signal.set_wakeup_fd(_wakeup_w)
+
     # 日期范围
     end_date = args.end or datetime.now().strftime('%Y-%m-%d')
     if args.start:
@@ -1492,39 +1541,57 @@ def main():
                   end='', flush=True)
         print()
     else:
-        # 多进程模式
+        # 多进程模式：用独立 Process + Queue，支持 Ctrl+C 立即终止
         task_args = [
             (batch, i % n_workers, args.type, start_date, end_date,
              market, args.tolerance, args.dry_run, today)
             for i, batch in enumerate(batches)
         ]
 
-        pool = mp.Pool(n_workers, initializer=_worker_init)
+        result_queue = mp.Queue()
+        procs: List[mp.Process] = []
+
+        def _worker_wrapper(worker_args, queue):
+            """包装 _worker_batch，结果放入 Queue"""
+            try:
+                result = _worker_batch(worker_args)
+                queue.put(result)
+            except Exception as e:
+                queue.put({"results": [], "stats": {
+                    "total": 0, "dual_ok": 0, "single_source": 0, "no_data": 0,
+                    "written": 0, "price_mismatch": 0, "quality_issues": 0, "gaps": 0,
+                }, "errors": [("_worker_", str(e))]})
+
         try:
-            results_iter = pool.imap_unordered(_worker_batch, task_args, chunksize=1)
+            # 启动所有 worker 进程
+            for i, ta in enumerate(task_args):
+                p = mp.Process(target=_worker_wrapper, args=(ta, result_queue), daemon=True)
+                p.start()
+                procs.append(p)
+
+            # 收集结果
             done_batches = 0
-            while not _INTERRUPTED:
+            while done_batches < len(task_args) and not _INTERRUPTED:
                 try:
-                    batch_result = results_iter.__next__()
-                except StopIteration:
-                    break
-                except KeyboardInterrupt:
-                    _INTERRUPTED = True
-                    break
-                all_results.extend(batch_result["results"])
-                all_errors.extend(batch_result["errors"])
-                for k in agg_stats:
-                    agg_stats[k] += batch_result["stats"].get(k, 0)
-                done_batches += 1
-                processed = min(done_batches * batch_size, total)
-                if done_batches % max(1, len(batches) // 20) == 0 or done_batches == len(batches):
-                    elapsed_so_far = time.time() - t0
-                    print(f"\r  [{processed}/{total}] "
-                          f"双源={agg_stats['dual_ok']} 单源={agg_stats['single_source']} "
-                          f"无数据={agg_stats['no_data']} 写入={agg_stats['written']} "
-                          f"偏差={agg_stats['price_mismatch']} 质量={agg_stats['quality_issues']} "
-                          f"耗时={elapsed_so_far:.0f}s",
-                          end='', flush=True)
+                    # get 带短超时，频繁检查 _INTERRUPTED
+                    batch_result = result_queue.get(timeout=2)
+                    all_results.extend(batch_result["results"])
+                    all_errors.extend(batch_result["errors"])
+                    for k in agg_stats:
+                        agg_stats[k] += batch_result["stats"].get(k, 0)
+                    done_batches += 1
+                    processed = min(done_batches * batch_size, total)
+                    if done_batches % max(1, len(batches) // 20) == 0 or done_batches == len(batches):
+                        elapsed_so_far = time.time() - t0
+                        print(f"\r  [{processed}/{total}] "
+                              f"双源={agg_stats['dual_ok']} 单源={agg_stats['single_source']} "
+                              f"无数据={agg_stats['no_data']} 写入={agg_stats['written']} "
+                              f"偏差={agg_stats['price_mismatch']} 质量={agg_stats['quality_issues']} "
+                              f"耗时={elapsed_so_far:.0f}s",
+                              end='', flush=True)
+                except Exception:
+                    # queue.get 超时 或 其他异常，继续循环检查 _INTERRUPTED
+                    pass
             print()
         except KeyboardInterrupt:
             _INTERRUPTED = True

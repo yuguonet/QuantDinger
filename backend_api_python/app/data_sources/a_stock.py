@@ -15,7 +15,7 @@ import requests
 
 from app.data_sources.cn_stock import _fetch_with_timeout, _get_timeout
 from app.data_sources.circuit_breaker import get_realtime_circuit_breaker
-from app.data_sources.normalizer import normalize_cn_code, fetch_quote
+from app.data_sources.normalizer import normalize_cn_code
 from app.data_sources.eastmoney import (
     _em_secid_from_cn,
     fetch_eastmoney_dragon_tiger,
