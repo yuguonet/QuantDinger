@@ -187,6 +187,7 @@ class AStockDataSource:
         for code in (codes or []):
             try:
                 tencent_code = normalize_cn_code(code)
+                from app.services.symbol_name import fetch_quote
                 parts = fetch_quote(tencent_code)
                 if not parts or len(parts) < 5:
                     continue

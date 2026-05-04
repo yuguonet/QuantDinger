@@ -2,72 +2,73 @@
 交易日历模块
 基于 akshare 获取沪深交易所交易日历，提供精确的交易日判断。
 
-日历数据按年存 feather 文件，优先从文件加载；
-文件不存在时调 akshare 获取整年数据并保存。
+日历数据以 pickle 单文件存储（加载快、体积小），过滤 2000 年之前的数据。
+文件不存在时调 akshare 获取并保存。
 """
 
 import os
+import pickle
 import logging
 from datetime import datetime, timedelta
 from typing import List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
-# feather 文件存放目录，默认在模块同级 calendar/ 子目录
-_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calendar")
+# 缓存目录：app/data/trading_calendar/
+_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "trading_calendar")
+_CACHE_FILE = os.path.join(_DIR, "trading_days.pkl")
+
+# 内存缓存：避免重复反序列化
+_cached_dates: Set[str] = set()
+_loaded = False
 
 
-def _file_path(year: int) -> str:
-    return os.path.join(_DIR, f"{year}.feather")
+def _load() -> Set[str]:
+    """加载交易日集合（内存缓存 + pickle 文件）"""
+    global _cached_dates, _loaded
+    if _loaded:
+        return _cached_dates
+
+    if os.path.isfile(_CACHE_FILE):
+        try:
+            with open(_CACHE_FILE, "rb") as f:
+                _cached_dates = pickle.load(f)
+            _loaded = True
+            logger.info(f"交易日历已加载，共 {len(_cached_dates)} 个交易日")
+            return _cached_dates
+        except Exception as e:
+            logger.error(f"读取 {_CACHE_FILE} 失败: {e}")
+
+    # 文件不存在或损坏 → 拉取
+    _fetch_and_save()
+    return _cached_dates
 
 
-def _load_year(year: int) -> Set[str]:
-    """从 feather 文件加载某年交易日集合，文件不存在返回空 set"""
-    path = _file_path(year)
-    if not os.path.isfile(path):
-        return set()
-    try:
-        import pandas as pd
-        df = pd.read_feather(path)
-        return set(df["trade_date"].astype(str).tolist())
-    except Exception as e:
-        logger.error(f"读取 {path} 失败: {e}")
-        return set()
-
-
-def _fetch_and_save(year: int) -> Set[str]:
-    """从 akshare 获取整年交易日，保存 feather 文件，返回日期集合"""
+def _fetch_and_save():
+    """从 akshare 获取交易日，过滤 2000 年前，保存 pickle"""
+    global _cached_dates, _loaded
     import akshare as ak
-    import pandas as pd
 
-    logger.info(f"从 akshare 获取 {year} 年交易日历...")
+    logger.info("从 akshare 获取交易日历...")
     df = ak.tool_trade_date_hist_sina()
 
-    prefix = str(year)
-    dates = []
+    dates: Set[str] = set()
     for val in df["trade_date"]:
         s = str(val).strip()
         if len(s) == 8 and s.isdigit():
             s = f"{s[:4]}-{s[4:6]}-{s[6:8]}"
-        if s.startswith(prefix):
-            dates.append(s)
-    dates.sort()
+        # 过滤 2000 年之前
+        if s >= "2000-01-01":
+            dates.add(s)
 
     if dates:
         os.makedirs(_DIR, exist_ok=True)
-        out = pd.DataFrame({"trade_date": dates})
-        out.to_feather(_file_path(year))
-        logger.info(f"{year} 年共 {len(dates)} 个交易日，已保存到 {_file_path(year)}")
+        with open(_CACHE_FILE, "wb") as f:
+            pickle.dump(dates, f, protocol=pickle.HIGHEST_PROTOCOL)
+        logger.info(f"共 {len(dates)} 个交易日（2000-至今），已保存到 {_CACHE_FILE}")
 
-    return set(dates)
-
-
-def _ensure_year(year: int) -> Set[str]:
-    """确保某年数据可用，优先文件，文件不存在则请求 akshare"""
-    dates = _load_year(year)
-    if not dates:
-        dates = _fetch_and_save(year)
-    return dates
+    _cached_dates = dates
+    _loaded = True
 
 
 # ─── 公共 API ───────────────────────────────────────────────
@@ -77,7 +78,7 @@ def is_trading_day(date: str) -> bool:
     """判断是否为交易日 (YYYY-MM-DD 或 YYYYMMDD)"""
     if len(date) == 8 and date.isdigit():
         date = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
-    return date in _ensure_year(int(date[:4]))
+    return date in _load()
 
 
 def is_trading_day_today() -> bool:
@@ -89,12 +90,9 @@ def prev_trading_day(date: Optional[str] = None, n: int = 1) -> str:
     if date is None:
         date = datetime.now().strftime("%Y-%m-%d")
 
-    year = int(date[:4])
-    # 可能跨年，合并当前年和前一年的交易日
-    dates = sorted(_ensure_year(year) | _ensure_year(year - 1))
-
+    all_dates = sorted(_load())
     result = []
-    for d in reversed(dates):
+    for d in reversed(all_dates):
         if d < date:
             result.append(d)
             if len(result) == n:
@@ -104,7 +102,7 @@ def prev_trading_day(date: Optional[str] = None, n: int = 1) -> str:
     dt = datetime.strptime(date, "%Y-%m-%d") - timedelta(days=1)
     while len(result) < n:
         s = dt.strftime("%Y-%m-%d")
-        if s in _ensure_year(dt.year):
+        if s in _load():
             result.append(s)
         dt -= timedelta(days=1)
     return result[-1]
@@ -115,11 +113,9 @@ def next_trading_day(date: Optional[str] = None, n: int = 1) -> str:
     if date is None:
         date = datetime.now().strftime("%Y-%m-%d")
 
-    year = int(date[:4])
-    dates = sorted(_ensure_year(year) | _ensure_year(year + 1))
-
+    all_dates = sorted(_load())
     result = []
-    for d in dates:
+    for d in all_dates:
         if d > date:
             result.append(d)
             if len(result) == n:
@@ -128,7 +124,7 @@ def next_trading_day(date: Optional[str] = None, n: int = 1) -> str:
     dt = datetime.strptime(date, "%Y-%m-%d") + timedelta(days=1)
     while len(result) < n:
         s = dt.strftime("%Y-%m-%d")
-        if s in _ensure_year(dt.year):
+        if s in _load():
             result.append(s)
         dt += timedelta(days=1)
     return result[-1]
@@ -136,14 +132,7 @@ def next_trading_day(date: Optional[str] = None, n: int = 1) -> str:
 
 def trade_date_range(start_date: str, end_date: str) -> List[str]:
     """范围内的交易日列表"""
-    y1, y2 = int(start_date[:4]), int(end_date[:4])
-    result = []
-    for y in range(y1, y2 + 1):
-        for d in _ensure_year(y):
-            if start_date <= d <= end_date:
-                result.append(d)
-    result.sort()
-    return result
+    return sorted(d for d in _load() if start_date <= d <= end_date)
 
 
 def trading_days_count(start_date: str, end_date: str) -> int:

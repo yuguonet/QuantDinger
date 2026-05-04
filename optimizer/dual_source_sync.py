@@ -1541,69 +1541,68 @@ def main():
                   end='', flush=True)
         print()
     else:
-        # 多进程模式：用独立 Process + Queue，支持 Ctrl+C 立即终止
+        # 多进程模式：Pool + apply_async（参考 tdx_download.py）
         task_args = [
             (batch, i % n_workers, args.type, start_date, end_date,
              market, args.tolerance, args.dry_run, today)
             for i, batch in enumerate(batches)
         ]
 
-        result_queue = mp.Queue()
-        procs: List[mp.Process] = []
+        pool = mp.Pool(n_workers, initializer=_worker_init)
 
-        def _worker_wrapper(worker_args, queue):
-            """包装 _worker_batch，结果放入 Queue"""
-            try:
-                result = _worker_batch(worker_args)
-                queue.put(result)
-            except Exception as e:
-                queue.put({"results": [], "stats": {
-                    "total": 0, "dual_ok": 0, "single_source": 0, "no_data": 0,
-                    "written": 0, "price_mismatch": 0, "quality_issues": 0, "gaps": 0,
-                }, "errors": [("_worker_", str(e))]})
+        async_results = []
+        for ta in task_args:
+            ar = pool.apply_async(_worker_batch, (ta,))
+            async_results.append(ar)
 
+        pool.close()
+
+        done_set = set()
         try:
-            # 启动所有 worker 进程
-            for i, ta in enumerate(task_args):
-                p = mp.Process(target=_worker_wrapper, args=(ta, result_queue), daemon=True)
-                p.start()
-                procs.append(p)
+            while len(done_set) < len(async_results):
+                time.sleep(0.5)
+                for idx, ar in enumerate(async_results):
+                    if idx in done_set:
+                        continue
+                    if ar.ready():
+                        try:
+                            batch_result = ar.get(timeout=0)
+                            all_results.extend(batch_result["results"])
+                            all_errors.extend(batch_result["errors"])
+                            for k in agg_stats:
+                                agg_stats[k] += batch_result["stats"].get(k, 0)
+                        except Exception:
+                            pass
+                        done_set.add(idx)
 
-            # 收集结果
-            done_batches = 0
-            while done_batches < len(task_args) and not _INTERRUPTED:
-                try:
-                    # get 带短超时，频繁检查 _INTERRUPTED
-                    batch_result = result_queue.get(timeout=2)
-                    all_results.extend(batch_result["results"])
-                    all_errors.extend(batch_result["errors"])
-                    for k in agg_stats:
-                        agg_stats[k] += batch_result["stats"].get(k, 0)
-                    done_batches += 1
-                    processed = min(done_batches * batch_size, total)
-                    if done_batches % max(1, len(batches) // 20) == 0 or done_batches == len(batches):
-                        elapsed_so_far = time.time() - t0
-                        print(f"\r  [{processed}/{total}] "
-                              f"双源={agg_stats['dual_ok']} 单源={agg_stats['single_source']} "
-                              f"无数据={agg_stats['no_data']} 写入={agg_stats['written']} "
-                              f"偏差={agg_stats['price_mismatch']} 质量={agg_stats['quality_issues']} "
-                              f"耗时={elapsed_so_far:.0f}s",
-                              end='', flush=True)
-                except Exception:
-                    # queue.get 超时 或 其他异常，继续循环检查 _INTERRUPTED
-                    pass
+                done = len(done_set)
+                processed = min(done * batch_size, total)
+                if done % max(1, len(batches) // 20) == 0 or done == len(batches):
+                    elapsed_so_far = time.time() - t0
+                    print(f"\r  [{processed}/{total}] "
+                          f"双源={agg_stats['dual_ok']} 单源={agg_stats['single_source']} "
+                          f"无数据={agg_stats['no_data']} 写入={agg_stats['written']} "
+                          f"偏差={agg_stats['price_mismatch']} 质量={agg_stats['quality_issues']} "
+                          f"耗时={elapsed_so_far:.0f}s",
+                          end='', flush=True)
             print()
         except KeyboardInterrupt:
             _INTERRUPTED = True
+            print("\n\n⚠️  收到中断信号，正在保存已处理的结果...")
         finally:
-            # terminate() 发 SIGTERM 给所有 worker（worker 未忽略 SIGTERM）
             pool.terminate()
-            # join 加超时，防止 worker 卡在 C 扩展阻塞调用时无限挂起
-            pool.join(timeout=10)
-            # 如果 join 超时，强制退出主进程（daemon worker 会被系统回收）
+            pool.join()
+            for p in pool._pool:
+                if p.is_alive():
+                    try:
+                        import signal as _sig
+                        os.kill(p.pid, _sig.SIGKILL)
+                    except (OSError, AttributeError):
+                        pass
+            pool.join()
             if _INTERRUPTED:
-                print("\n⚡ 强制退出（worker 可能仍在后台运行）")
-                os._exit(1)
+                print("❌ 已强制退出")
+                sys.exit(1)
 
     elapsed = time.time() - t0
 

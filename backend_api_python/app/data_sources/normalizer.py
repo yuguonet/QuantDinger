@@ -13,12 +13,7 @@ A股数据标准化层 — 统一不同数据源的字段命名和数据格式
   4. 数据校验 (合理性检查)
 """
 
-
 from __future__ import annotations
-from app.utils.logger import get_logger
-
-logger = get_logger(__name__)
-
 
 from typing import Any, Dict, List, Optional
 
@@ -58,6 +53,12 @@ Provides:
 
 This is used as a stable alternative when Yahoo/yfinance gets rate-limited.
 """
+
+from app.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+
 def normalize_cn_code(symbol: str) -> str:
     """
     Normalize A-share symbol to Tencent code: sh600519 / sz000001 / bj830799.

@@ -31,6 +31,14 @@ from app.utils.cache import CacheManager
 from app.utils.logger import get_logger
 from app.config import CacheConfig
 
+import os as _os
+
+class _NoOpCache:
+    """Cache stand-in that always misses — every read goes to the remote source."""
+    def get(self, *a, **kw): return None
+    def set(self, *a, **kw): pass
+    def delete(self, *a, **kw): pass
+
 logger = get_logger(__name__)
 
 # 非日/周/月线的降级映射
@@ -66,9 +74,11 @@ class KlineService:
     _SYNTHESIZE_TTL = 30  # 秒
 
     def __init__(self):
-        self.cache = CacheManager()
+        _cache_disabled = _os.getenv("KLINE_CACHE_DISABLED", "false").lower() in ("1", "true", "yes")
+        self.cache = _NoOpCache() if _cache_disabled else CacheManager()
         self.cache_ttl = CacheConfig.KLINE_CACHE_TTL
         self._kc = KlineCacheManager()
+        self._cache_disabled = _cache_disabled
         # 批量当日 K 线缓存：{market: {symbol: candle_dict}}
         self._today_batch: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._today_batch_ts: Dict[str, float] = {}
@@ -176,6 +186,12 @@ class KlineService:
           未命中 → 触发预热 → 预热成功从缓存读 / 预热失败降级单只
         """
         fetch = lambda m, s, t, l: DataSourceFactory.get_kline(m, s, t, l)
+
+        # 缓存禁用 → 直接走远程
+        if self._cache_disabled:
+            klines = fetch(market, symbol, tf, limit)
+            today_candle = self._kc.synthesize_today_candle(symbol, fetch, market)
+            return self._append_current(tf, klines or [], today_candle, symbol, market, fetch, limit)
 
         # 1) 读缓存
         cached = self._kc.get_cached(tf, symbol, market)
