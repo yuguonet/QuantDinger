@@ -1,6 +1,7 @@
 """
-A股扩展数据源 — 继承 CNStockDataSource，补充 interfaces 层所需的全部方法
+A股扩展数据源 — 独立模块，提供指数/快照/涨停池/龙虎榜/热榜等 A 股特色数据接口
 
+不继承 CNStockDataSource，与 K 线/行情完全解耦。
 从 interfaces/cn_stock_extent.py 拆分而来，纯数据源，不含 AShareDataHub。
 """
 
@@ -12,7 +13,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 
-from app.data_sources.cn_stock import CNStockDataSource, _fetch_with_timeout, _get_timeout
+from app.data_sources.cn_stock import _fetch_with_timeout, _get_timeout
+from app.data_sources.circuit_breaker import get_realtime_circuit_breaker
 from app.data_sources.tencent import normalize_cn_code, fetch_quote
 from app.data_sources.eastmoney import (
     _em_secid_from_cn,
@@ -77,17 +79,20 @@ def _index_secid(code: str) -> str:
     return f"0.{c}"
 
 
-class AStockDataSource(CNStockDataSource):
+class AStockDataSource:
     """
-    A股完整数据源 — 继承 CNStockDataSource 的多源 fallback，
-    补充 interfaces 层所需的扩展方法。
+    A股特色数据源 — 独立类，不继承任何基类。
+
+    提供指数行情、市场快照、涨停池、跌停池、炸板池、龙虎榜、热榜、
+    个股信息、个股资金流等 A 股特色数据接口。
+    每个接口都有 2-3 个源的 fallback 链。
     """
 
     name = "AStock/multi-source"
     enabled = True
 
     def __init__(self):
-        super().__init__()
+        self.circuit_breaker = get_realtime_circuit_breaker()
         # DataCache 支持 per-key TTL，用于长缓存场景
         self._info_cache = get_stock_info_cache()  # 默认 TTL=86400s
 

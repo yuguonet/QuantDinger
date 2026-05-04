@@ -1,7 +1,7 @@
 """
 中国A股数据源 — Coordinator 统一调度
 
-架构:
+架构: 
   get_ticker()      → Coordinator race 模式（并发，第一个成功的返回）
   get_kline()       → Coordinator 动态队列（单只），自动从 Provider 层发现源
   get_kline_batch() → Coordinator 动态队列（批量），月线走日线聚合
