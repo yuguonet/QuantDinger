@@ -651,7 +651,7 @@ class MarketDataCollector:
                 if market == 'CNStock':
                     try:
                         from app.data_sources.a_stock import AStockDataSource
-                        from app.data_sources.tencent import normalize_cn_code
+                        from app.data_sources.normalizer import normalize_cn_code
                         ext = AStockDataSource()
                         code = normalize_cn_code(symbol)
                         if code:
@@ -681,7 +681,7 @@ class MarketDataCollector:
           + Tencent quote for live price fields
         """
         try:
-            from app.data_sources.tencent import (
+            from app.data_sources.normalizer import (
                 normalize_cn_code,
                 normalize_hk_code,
                 fetch_quote,
@@ -1324,7 +1324,7 @@ class MarketDataCollector:
         try:
             if symbol:
                 from app.data_sources.a_stock import AStockDataSource
-                from app.data_sources.tencent import normalize_cn_code
+                from app.data_sources.normalizer import normalize_cn_code
                 ext = AStockDataSource()
                 code = normalize_cn_code(symbol)
                 if code:
@@ -1821,7 +1821,7 @@ class MarketDataCollector:
                 # 先走 CNStockExtent 缓存
                 try:
                     from app.data_sources.a_stock import AStockDataSource
-                    from app.data_sources.tencent import normalize_cn_code
+                    from app.data_sources.normalizer import normalize_cn_code
                     ext = AStockDataSource()
                     code = normalize_cn_code(symbol)
                     if code:
@@ -1852,7 +1852,7 @@ class MarketDataCollector:
           + Tencent quote for Chinese name
         """
         try:
-            from app.data_sources.tencent import (
+            from app.data_sources.normalizer import (
                 normalize_cn_code,
                 normalize_hk_code,
                 fetch_quote,

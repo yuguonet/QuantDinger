@@ -20,18 +20,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from app.data_sources.base import BaseDataSource
-from app.data_sources.tencent import (
+from app.data_sources.normalizer import (
     normalize_cn_code,
-    tencent_quote_to_ticker,
-)
-from app.data_sources.eastmoney import (
-    fetch_eastmoney_batch_quotes,
-    eastmoney_kline_to_ticker,
 )
 from app.data_sources.asia_stock_kline import (
     normalize_chart_timeframe,
 )
-from app.data_sources.sina import sina_kline_to_ticker
 from app.data_sources.circuit_breaker import get_realtime_circuit_breaker
 from app.data_sources.cache_manager import (
     get_realtime_cache,
@@ -191,7 +185,7 @@ class CNStockDataSource(BaseDataSource):
     # ----------------------------------------------------------
 
     def get_ticker(self, symbol: str) -> Dict[str, Any]:
-        """获取最新报价 — 优先走东财批量接口（1次HTTP），降级走 Coordinator race"""
+        """获取最新报价 — Coordinator 从 Provider 层自动发现源，race 模式"""
         code = normalize_cn_code(symbol)
 
         # 先检查缓存
@@ -200,37 +194,11 @@ class CNStockDataSource(BaseDataSource):
         if cached:
             return cached
 
-        # ★ 优先：东财 clist 批量接口（1次HTTP拿全市场，比3路race高效）
-        try:
-            batch = get_coordinator().passthrough(fetch_eastmoney_batch_quotes, [code])
-            q = batch.get(code)
-            if q and q.get("close", 0) > 0:
-                prev = q.get("previousClose", 0)
-                last = q["close"]
-                result = {
-                    "last": last,
-                    "change": round(last - prev, 4) if prev else 0,
-                    "changePercent": round((last - prev) / prev * 100, 2) if prev else 0,
-                    "high": q["high"],
-                    "low": q["low"],
-                    "open": q["open"],
-                    "previousClose": prev,
-                    "symbol": code,
-                }
-                self.realtime_cache.set(cache_key, result, ttl=600)
-                return result
-        except Exception as e:
-            logger.debug(f"[行情] 东财批量接口降级 {code}: {e}")
-
-        # 降级：Coordinator race 模式
+        # 交给 Coordinator（自动从 Provider 层发现源，race 模式）
         result = get_coordinator().coordinate_ticker(
             symbol=code,
-            sources=[
-                ("tencent_quote", lambda sym: tencent_quote_to_ticker(sym)),
-                ("sina_quote", lambda sym: sina_kline_to_ticker(sym)),
-                ("eastmoney_quote", lambda sym: eastmoney_kline_to_ticker(_strip_cn_prefix(code))),
-            ],
             cb=self.circuit_breaker,
+            market="CNStock",
             timeout=min(_get_timeout(), 8),
         )
 
@@ -246,8 +214,17 @@ class CNStockDataSource(BaseDataSource):
     # ----------------------------------------------------------
 
     def get_batch_quotes(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
-        """批量获取当日行情 — 透传东财 clist 接口"""
-        return get_coordinator().passthrough(fetch_eastmoney_batch_quotes, symbols)
+        """批量获取当日行情 — 透传 Provider 层 batch_quote 接口"""
+        from app.data_sources.provider import get_providers
+        providers = get_providers(capability="batch_quote", market="CNStock")
+        if not providers:
+            return {}
+        # 按优先级逐源尝试（passthrough 透传，失败自动降级）
+        for p in providers:
+            result = get_coordinator().passthrough(p.fetch_quotes_batch, symbols)
+            if result:
+                return result
+        return {}
 
     # ----------------------------------------------------------
     # K线数据 — 统一走 Coordinator（自动源发现）

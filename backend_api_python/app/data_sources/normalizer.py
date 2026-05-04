@@ -44,6 +44,79 @@ def _ss(v, default="") -> str:
         return default
     return str(v).strip()
 
+"""
+Tencent market data helpers (no API key).
+
+Provides:
+- Quote: https://qt.gtimg.cn/q=sh600519 / sz000001 / hk00700
+- Kline: https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=CODE,PERIOD,,,COUNT,ADJ
+
+This is used as a stable alternative when Yahoo/yfinance gets rate-limited.
+"""
+
+from __future__ import annotations
+from app.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+
+def normalize_cn_code(symbol: str) -> str:
+    """
+    Normalize A-share symbol to Tencent code: sh600519 / sz000001 / bj830799.
+
+    前缀规则：
+      沪市 (sh): 600/601/603/605/688/900
+      深市 (sz): 000/001/002/003/300/200
+      北证 (bj): 43/82/83/87/88
+
+    Accepts: 600519 / 600519.SH / 600519.SS / 000001.SZ / 830799.BJ
+    """
+    s = (symbol or "").strip().upper()
+    if not s:
+        return s
+    # 已带后缀 → 剥离并直接加前缀
+    if s.endswith(".SH") or s.endswith(".SS"):
+        return "SH" + s[:-3]
+    if s.endswith(".SZ"):
+        return "SZ" + s[:-3]
+    if s.endswith(".BJ"):
+        return "BJ" + s[:-3]
+
+    if s.isdigit() and len(s) == 6:
+        # 沪市：60x / 688 / 689 / 900
+        if s.startswith(("600", "601", "603", "605", "688", "689", "900")):
+            return "SH" + s
+        # 深市：00x / 300 / 301 / 200
+        if s.startswith(("000", "001", "002", "003", "300", "301", "200")):
+            return "SZ" + s
+        # 北证：43 / 82 / 83 / 87 / 88
+        if s.startswith(("43", "82", "83", "87", "88")):
+            return "BJ" + s
+
+    return s
+
+
+def normalize_hk_code(symbol: str) -> str:
+    """
+    Normalize HK stock symbol to Tencent code: hk00700 (5 digits).
+    Accepts:
+    - 700 / 0700 / 00700.HK / 0700.HK
+    """
+    s = (symbol or "").strip().upper()
+    if not s:
+        return s
+    if s.endswith(".HK"):
+        s = s[:-3]
+    if s.isdigit():
+        return "HK" + s.zfill(5)
+    # If user already passed HKxxxxx
+    if s.startswith("HK") and s[2:].isdigit():
+        return "HK" + s[2:].zfill(5)
+    return s
+
+
+def _lower_code(code: str) -> str:
+    return (code or "").strip().lower()
 
 # ================================================================
 # 龙虎榜

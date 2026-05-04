@@ -84,46 +84,84 @@ def _make_provider_fetch_fn(provider) -> Callable:
     return fetch_fn
 
 
+def _make_provider_quote_fn(provider) -> Callable:
+    """
+    将 Provider 的 fetch_quote 方法适配为 Coordinator 的 fetch_fn 签名。
+
+    Coordinator 期望: fetch_fn(symbol) -> Dict | None
+    Provider 提供:    provider.fetch_quote(code, timeout=8) -> Dict | None | NotSupportedResult
+
+    适配逻辑:
+      1. 调用 provider.fetch_quote
+      2. 如果返回 NotSupportedResult 或 None，返回 None（Coordinator 跳过）
+      3. 如果返回有效 Dict（last > 0），直接返回
+
+    Args:
+        provider: Provider 实例（实现 BaseDataSource 协议）
+
+    Returns:
+        适配后的 fetch_fn(symbol) -> Dict | None
+    """
+    def fetch_fn(symbol: str):
+        try:
+            result = provider.fetch_quote(symbol)
+            if not result:
+                return None
+            return result
+        except Exception as e:
+            logger.debug("[适配器] %s.fetch_quote(%s) 异常: %s",
+                        provider.name, symbol, e)
+            return None
+
+    fetch_fn.__name__ = f"provider_{provider.name}_quote"
+    return fetch_fn
+
+
 def _discover_sources(
     market: str,
     timeframe: str,
     cb: CircuitBreaker,
     preferred_source: str = "",
+    capability: str = "kline",
 ) -> List[Tuple[str, Callable, SourceConfig]]:
     """
     从 Provider 层自动发现可用数据源。
 
     流程:
-      1. 调用 get_providers(capability="kline", timeframe=tf, market=market)
-         → 按 kline_priority 排序的 Provider 列表
+      1. 调用 get_providers(capability=capability, timeframe=tf, market=market)
+         → 按对应 priority 排序的 Provider 列表
       2. 过滤已熔断的源
-      3. 将每个 Provider 的 fetch_kline 适配为 Coordinator 的 fetch_fn
+      3. 将每个 Provider 的 fetch 方法适配为 Coordinator 的 fetch_fn
       4. 如果指定了 preferred_source，将其排到第一位
 
     Args:
         market:    市场名称（"CNStock" / "HKStock"）
-        timeframe: K线周期（"1D" / "5m" / ...）
+        timeframe: K线周期（"1D" / "5m" / ...）, capability="quote" 时可为空
         cb:        熔断器
         preferred_source: 指定的首选源名称
+        capability: 能力类型（"kline" / "quote"），默认 "kline"
 
     Returns:
         [(name, fetch_fn, source_config), ...]
     """
     from app.data_sources.provider import get_providers
 
-    # 从 Provider 层获取按 kline_priority 排序的源
+    # 从 Provider 层获取按对应 priority 排序的源
     providers = get_providers(
-        capability="kline",
-        timeframe=timeframe,
+        capability=capability,
+        timeframe=timeframe if capability == "kline" else None,
         market=market,
     )
 
     if not providers:
-        logger.warning("[协助层] Provider 层无可用源: market=%s tf=%s", market, timeframe)
+        logger.warning("[协助层] Provider 层无可用源: market=%s capability=%s", market, capability)
         return []
 
     result = []
     preferred_item = None
+
+    # 根据 capability 选择适配器
+    adapter = _make_provider_quote_fn if capability == "quote" else _make_provider_fetch_fn
 
     for p in providers:
         # 检查熔断器
@@ -135,7 +173,7 @@ def _discover_sources(
         cfg = get_source_config(p.name)
 
         # 适配 fetch_fn
-        fetch_fn = _make_provider_fetch_fn(p)
+        fetch_fn = adapter(p)
 
         item = (p.name, fetch_fn, cfg)
 
@@ -444,33 +482,54 @@ class Coordinator:
     def coordinate_ticker(
         self,
         symbol: str,
-        sources: List[Tuple[str, Callable]],
-        cb: CircuitBreaker,
+        sources: Optional[List[Tuple[str, Callable]]] = None,
+        cb: CircuitBreaker = None,
         timeout: float = 8.0,
         preferred_source: str = "",
+        market: str = "",
     ) -> Optional[Dict[str, Any]]:
         """
         实时行情 Race 模式 — 所有源并发，第一个成功的直接返回。
 
+        支持两种模式:
+          1. 自动发现模式（推荐）: 不传 sources，传 market，Coordinator 从 Provider 层自动发现
+          2. 手动指定模式（兼容）: 传入 sources=[(name, fetch_fn), ...]
+
         Args:
             symbol: 股票代码
-            sources: [(name, fetch_fn), ...]  fetch_fn(symbol) -> Dict | None
+            sources: [(name, fetch_fn), ...]  fetch_fn(symbol) -> Dict | None。为 None 时自动发现。
             cb: 熔断器
             timeout: 超时
             preferred_source: 指定数据源名称，优先 race 该源
+            market: 市场名称（如 "CNStock"），用于 Provider 层自动发现
 
         Returns:
             第一个成功的 Dict，全部失败返回 None
         """
-        if not sources:
-            return None
-
-        if preferred_source:
-            preferred = [(n, fn) for n, fn in sources if n == preferred_source and cb.is_available(n)]
-            others = [(n, fn) for n, fn in sources if n != preferred_source and cb.is_available(n)]
-            available = preferred + others
+        # ── 源获取：自动发现 or 手动指定 ──
+        if sources is not None:
+            # 手动指定模式（兼容旧调用）
+            if not sources:
+                return None
+            if preferred_source:
+                preferred = [(n, fn) for n, fn in sources if n == preferred_source and cb.is_available(n)]
+                others = [(n, fn) for n, fn in sources if n != preferred_source and cb.is_available(n)]
+                available = preferred + others
+            else:
+                available = [(name, fn) for name, fn in sources if cb.is_available(name)]
         else:
-            available = [(name, fn) for name, fn in sources if cb.is_available(name)]
+            # 自动发现模式 — 从 Provider 层获取源
+            discovered = _discover_sources(
+                market=market,
+                timeframe="",
+                cb=cb,
+                preferred_source=preferred_source,
+                capability="quote",
+            )
+            if not discovered:
+                logger.warning("[协助层] ticker %s market=%s 无可用源", symbol, market)
+                return None
+            available = [(name, fn) for name, fn, _ in discovered]
 
         if not available:
             logger.warning("[协助层] ticker %s 无可用源", symbol)

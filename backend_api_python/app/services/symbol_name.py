@@ -21,7 +21,7 @@ import requests
 
 from app.utils.logger import get_logger
 from app.data.market_symbols_seed import get_symbol_name as seed_get_symbol_name
-from app.data_sources.tencent import normalize_cn_code, normalize_hk_code
+from app.data_sources.normalizer import normalize_cn_code, normalize_hk_code
 
 logger = get_logger(__name__)
 
@@ -113,7 +113,7 @@ def resolve_symbol_name(market: str, symbol: str) -> Optional[str]:
     # CN/HK stocks: try Tencent quote name first (no key), then yfinance best-effort.
     if m in ('CNStock', 'HKStock'):
         try:
-            from app.data_sources.tencent import fetch_quote
+            from app.data_sources.normalizer import fetch_quote
             parts = fetch_quote(s)
             if parts and len(parts) > 1 and parts[1]:
                 return str(parts[1]).strip()

@@ -483,15 +483,14 @@ def batch_download_tdx(
                     results[code] = _download_tdx_1d(api, market_code, code, start_date, end_date)
                 else:
                     results[code] = _download_tdx_15m(api, market_code, code, start_date, end_date)
-            except (ConnectionError, OSError, TimeoutError) as conn_err:
-                # 连接断了，重连一次，且把新 api 赋回同一变量
-                logger.debug("[TDX] %s 连接断开: %s，尝试重连...", code, conn_err)
+            except (ConnectionError, OSError, TimeoutError):
+                # 连接断了，重连一次
                 try:
                     api.disconnect()
                 except Exception:
                     pass
                 try:
-                    api = _connect_tdx(worker_id)  # 赋回 api，后续循环继续用新连接
+                    api = _connect_tdx(worker_id)
                     if timeframe == "1D":
                         results[code] = _download_tdx_1d(api, market_code, code, start_date, end_date)
                     else:
@@ -518,11 +517,7 @@ def _download_tdx_1d(api, market_code: int, code: str,
     for offset in range(0, 800 * 10, 800):
         bars = api.get_security_bars(9, market_code, code, offset, 800)
         if not bars:
-            # 第一次请求就无数据 → 正常（可能是新股/停牌/代码错误）
-            if offset == 0:
-                break
-            # 非首次请求无数据 → 可能是连接断了，抛异常触发重连
-            raise ConnectionError(f"TDX {code} offset={offset} 返回空，疑似连接断开")
+            break
         all_bars = bars + all_bars
         if len(bars) < 800:
             break
@@ -557,9 +552,7 @@ def _download_tdx_15m(api, market_code: int, code: str,
     for i in range(max_req):
         bars = api.get_security_bars(1, market_code, code, i * 800, 800)
         if not bars:
-            if i == 0:
-                break
-            raise ConnectionError(f"TDX {code} 15m offset={i * 800} 返回空，疑似连接断开")
+            break
         all_bars = bars + all_bars
         if len(bars) < 800:
             break
@@ -1204,9 +1197,7 @@ def check_continuity_simple(
 
 def _worker_init():
     import signal as _sig
-    # 忽略 SIGINT，让主进程统一处理 Ctrl+C
     _sig.signal(_sig.SIGINT, _sig.SIG_IGN)
-    # SIGTERM 保持默认（终止进程），这样 pool.terminate() 能生效
 
 
 def _worker_batch(args: Tuple) -> Dict[str, Any]:
@@ -1503,13 +1494,8 @@ def main():
         try:
             results_iter = pool.imap_unordered(_worker_batch, task_args, chunksize=1)
             done_batches = 0
-            while not _INTERRUPTED:
-                try:
-                    batch_result = results_iter.__next__()
-                except StopIteration:
-                    break
-                except KeyboardInterrupt:
-                    _INTERRUPTED = True
+            for batch_result in results_iter:
+                if _INTERRUPTED:
                     break
                 all_results.extend(batch_result["results"])
                 all_errors.extend(batch_result["errors"])
@@ -1529,14 +1515,8 @@ def main():
         except KeyboardInterrupt:
             _INTERRUPTED = True
         finally:
-            # terminate() 发 SIGTERM 给所有 worker（worker 未忽略 SIGTERM）
             pool.terminate()
-            # join 加超时，防止 worker 卡在 C 扩展阻塞调用时无限挂起
-            pool.join(timeout=10)
-            # 如果 join 超时，强制退出主进程（daemon worker 会被系统回收）
-            if _INTERRUPTED:
-                print("\n⚡ 强制退出（worker 可能仍在后台运行）")
-                os._exit(1)
+            pool.join()
 
     elapsed = time.time() - t0
 

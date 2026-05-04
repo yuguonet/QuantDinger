@@ -1,23 +1,18 @@
 """
-=============================================
-港股/H股数据源 (HK Stock Data Source)
-=============================================
+港股/H股数据源 — Coordinator 统一调度
 
-降级链（国内优先）:
-    日/周线 → 腾讯 fqkline → yfinance → AkShare → Twelve Data
-    分钟线  → yfinance → AkShare → Twelve Data
+架构:
+  get_ticker()      → Coordinator race 模式（自动从 Provider 层发现源）
+  get_kline()       → Coordinator 动态队列（自动从 Provider 层发现源）
 
-支持功能:
-    - K线获取 (get_kline): 1m ~ 1W
-    - 实时报价 (get_ticker): 腾讯财经接口
+数据源:
+  由 Coordinator 从 Provider 层自动发现（@register 注册的所有源），
+  按 quote_priority / kline_priority 排序。
 
-熔断保护: 海外源熔断器 (2次失败 / 15min冷却)
-    - 四级降级全部失败才返回空，空结果不触发熔断
-
-依赖:
-    - yfinance     (必需)
-    - requests     (腾讯财经 / Twelve Data)
-    - akshare      (可选, 降级)
+Provider 层港股源:
+  tencent   (priority=10)  ← 首选，国内直连
+  hk_stock  (priority=40)  ← 备选，含海外源降级
+  akshare   (priority=50)  ← 兜底
 """
 
 from __future__ import annotations
@@ -25,45 +20,59 @@ from __future__ import annotations
 from typing import Dict, List, Any, Optional
 
 from app.data_sources.base import BaseDataSource
+from app.data_sources.normalizer import normalize_hk_code
 from app.data_sources.circuit_breaker import get_realtime_circuit_breaker
-from app.data_sources.tencent import normalize_hk_code, fetch_quote, parse_quote_to_ticker, fetch_kline, tencent_kline_rows_to_dicts
-from app.data_sources.asia_stock_kline import (
-    normalize_chart_timeframe,
-    fetch_twelvedata_klines,
-    fetch_yfinance_klines,
-    fetch_akshare_minute_klines,
-    fetch_akshare_weekly_klines,
+from app.data_sources.cache_manager import (
+    get_realtime_cache,
+    get_kline_cache,
+    generate_kline_cache_key,
 )
+from app.data_sources.coordinator import get_coordinator
+from app.config.data_sources import DataSourceConfig
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 
+def _get_timeout() -> float:
+    """统一获取超时配置"""
+    return float(DataSourceConfig.DEFAULT_TIMEOUT or 10)
+
+
 class HKStockDataSource(BaseDataSource):
-    """港股/H股数据源（TwelveData + Tencent + yfinance + AkShare）"""
+    """港股/H股数据源 — Coordinator 自动发现 + race 模式"""
 
     name = "HKStock/multi-source"
 
     def __init__(self):
         self.cb = get_realtime_circuit_breaker()
+        self.realtime_cache = get_realtime_cache()
+        self.kline_cache = get_kline_cache()
 
     def get_ticker(self, symbol: str) -> Dict[str, Any]:
+        """获取最新报价 — Coordinator 从 Provider 层自动发现源，race 模式"""
         code = normalize_hk_code(symbol)
-        parts = fetch_quote(code)
-        if not parts:
-            return {"last": 0, "symbol": code}
-        t = parse_quote_to_ticker(parts)
-        return {
-            "last": t.get("last", 0),
-            "change": t.get("change", 0),
-            "changePercent": t.get("changePercent", 0),
-            "high": t.get("high", 0),
-            "low": t.get("low", 0),
-            "open": t.get("open", 0),
-            "previousClose": t.get("previousClose", 0),
-            "name": t.get("name", ""),
-            "symbol": code,
-        }
+
+        # 先检查缓存
+        cache_key = f"ticker:{code}"
+        cached = self.realtime_cache.get(cache_key)
+        if cached:
+            return cached
+
+        # 交给 Coordinator（自动从 Provider 层发现源，race 模式）
+        result = get_coordinator().coordinate_ticker(
+            symbol=code,
+            cb=self.cb,
+            market="HKStock",
+            timeout=min(_get_timeout(), 8),
+        )
+
+        if result:
+            self.realtime_cache.set(cache_key, result, ttl=600)
+            return result
+
+        logger.warning(f"[港股行情] 所有数据源均失败: {symbol}")
+        return {"last": 0, "symbol": code}
 
     def get_kline(
         self,
@@ -73,51 +82,41 @@ class HKStockDataSource(BaseDataSource):
         before_time: Optional[int] = None,
         after_time: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        if not self.cb.is_available(self.name):
-            return []
-
+        """获取 K 线 — Coordinator 从 Provider 层自动发现源并调度"""
         code = normalize_hk_code(symbol)
-        tf = normalize_chart_timeframe(timeframe)
+        tf = timeframe
         lim = max(int(limit or 300), 1)
 
-        # Tier 1: Tencent for daily/weekly (国内直连, fast, free)
-        if tf in ("1D", "1W"):
-            tf_map = {"1D": "day", "1W": "week"}
-            period = tf_map.get(tf, "day")
-            raw_rows = fetch_kline(code, period=period, count=lim, adj="qfq")
-            out = tencent_kline_rows_to_dicts(raw_rows)
-            if out:
-                self.cb.record_success(self.name)
-                return self.filter_and_limit(out, limit=lim, before_time=before_time, after_time=after_time, truncate=(after_time is None))
+        # 先检查缓存
+        cache_key = generate_kline_cache_key(code, tf, lim, before_time)
+        cached = self.kline_cache.get(cache_key)
+        if cached:
+            return cached
 
-        # Tier 2: yfinance (all timeframes)
-        rows = fetch_yfinance_klines(
-            is_hk=True, tencent_code=code, timeframe=tf, limit=lim, before_time=before_time
+        # 交给 Coordinator（自动从 Provider 层发现源）
+        results, failed = get_coordinator().coordinate_kline(
+            symbols=[code],
+            timeframe=tf,
+            limit=lim,
+            cb=self.cb,
+            market="HKStock",
+            timeout=_get_timeout() + 5,
         )
-        if rows:
-            self.cb.record_success(self.name)
-            return self.filter_and_limit(rows, limit=lim, before_time=before_time, after_time=after_time, truncate=(after_time is None))
 
-        # Tier 3: AkShare (国内兜底, minute/weekly)
-        if tf in ("1m", "5m", "15m", "30m", "1H", "4H"):
-            rows = fetch_akshare_minute_klines(
-                is_hk=True, tencent_code=code, timeframe=tf, limit=lim, before_time=before_time
-            )
-        elif tf == "1W":
-            rows = fetch_akshare_weekly_klines(
-                is_hk=True, tencent_code=code, limit=lim, before_time=before_time
-            )
-        else:
-            rows = []
-        if rows:
-            self.cb.record_success(self.name)
-            return self.filter_and_limit(rows, limit=lim, before_time=before_time, after_time=after_time, truncate=(after_time is None))
+        bars = results.get(code)
+        if not bars:
+            logger.warning(f"[港股K线终止] {symbol} tf={tf} 所有数据源失败")
+            return []
 
-        # Tier 4: Twelve Data (海外付费, 最后降级)
-        rows = fetch_twelvedata_klines(
-            is_hk=True, tencent_code=code, timeframe=tf, limit=lim, before_time=before_time
+        # 过滤 + 截断
+        out = self.filter_and_limit(
+            bars, limit=lim, before_time=before_time,
+            after_time=after_time, truncate=(after_time is None),
         )
-        if rows:
-            self.cb.record_success(self.name)
-        # 空结果不触发熔断（可能是合法的：休市、代码不存在）
-        return self.filter_and_limit(rows, limit=lim, before_time=before_time, after_time=after_time, truncate=(after_time is None))
+
+        # 写入缓存
+        kline_ttl = 300.0 if tf in ("1D", "1W") else 120.0
+        self.kline_cache.set(cache_key, out, ttl=kline_ttl)
+
+        logger.info(f"[港股K线成功] {symbol} tf={tf} bars={len(out)}")
+        return out
