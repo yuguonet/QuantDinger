@@ -26,7 +26,7 @@ import pandas as pd
 import pyarrow.feather as feather
 
 from app.utils.logger import get_logger
-from app.interfaces.trading_calendar import (
+from app.utils.trading_calendar import (
     is_trading_day_today,
     prev_trading_day,
 )

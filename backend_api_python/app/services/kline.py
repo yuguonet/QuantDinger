@@ -26,7 +26,7 @@ from app.services.kline_cache_manager import (
     _bar_field,
     DAILY_LIMIT,
 )
-from app.interfaces.trading_calendar import is_trading_day_today, prev_trading_day
+from app.utils.trading_calendar import is_trading_day_today, prev_trading_day
 from app.utils.cache import CacheManager
 from app.utils.logger import get_logger
 from app.config import CacheConfig

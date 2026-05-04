@@ -180,7 +180,7 @@ def _build_trading_day_cache(market: str = "CNStock"):
     global _TRADING_DAY_SET
     if _TRADING_DAY_SET is not None:
         return
-    from app.interfaces.trading_calendar import trade_date_range
+    from app.utils.trading_calendar import trade_date_range
     # 2015~明年 覆盖全量历史数据
     end_year = datetime.now(TZ_SH).year + 1
     dates = trade_date_range("2015-01-01", f"{end_year}-12-31")

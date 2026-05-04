@@ -25,7 +25,7 @@ _co_dir = os.path.dirname(os.path.abspath(__file__))
 if _co_dir not in sys.path:
     sys.path.insert(0, _co_dir)
 
-from app.interfaces.trading_calendar import is_trading_day as _is_trading_day_str
+from app.utils.trading_calendar import is_trading_day as _is_trading_day_str
 
 TZ_SH = ZoneInfo("Asia/Shanghai")
 
@@ -79,7 +79,7 @@ def _get_sorted_trading_days() -> list[str]:
     如果 frozenset 引用变了（说明 refresh 过），重新排序。
     """
     global _sorted_trading_days, _trading_day_ref
-    from app.interfaces.trading_calendar import trade_date_range
+    from app.utils.trading_calendar import trade_date_range
     # 2015~明年 覆盖全量历史数据
     from datetime import datetime
     end_year = datetime.now().year + 1

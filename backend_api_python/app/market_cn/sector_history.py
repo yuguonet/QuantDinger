@@ -82,7 +82,7 @@ class SectorHistoryScheduler:
 
     def _tick(self):
         try:
-            from app.interfaces.trading_calendar import is_trading_day_today
+            from app.utils.trading_calendar import is_trading_day_today
             if not is_trading_day_today():
                 logger.debug("[SectorHistory] 非交易日，跳过")
                 return

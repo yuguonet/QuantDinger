@@ -172,7 +172,7 @@ def start_emotion_scheduler():
         from app.interfaces.cn_stock_extent import AShareDataHub
         from app.interfaces.cache_file import cache_db
         from app.interfaces.emotion_scheduler import EmotionScheduler
-        from app.interfaces.trading_calendar import is_trading_day_today
+        from app.utils.trading_calendar import is_trading_day_today
         from app.data_sources.factory import DataSourceFactory
 
         if is_trading_day_today():
