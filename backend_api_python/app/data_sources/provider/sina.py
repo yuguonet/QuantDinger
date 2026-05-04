@@ -37,7 +37,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from app.data_sources.normalizer import to_sina_code
+from app.data_sources.normalizer import normalize_cn_code as to_sina_code
 from app.data_sources.rate_limiter import (
     get_request_headers, retry_with_backoff, RateLimiter,
 )

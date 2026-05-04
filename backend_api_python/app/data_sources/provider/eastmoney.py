@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from app.data_sources.normalizer import to_eastmoney_secid, to_raw_digits, safe_float, safe_int
+from app.data_sources.normalizer import to_raw_digits, safe_float, safe_int, detect_market
 from app.data_sources.rate_limiter import (
     get_request_headers, retry_with_backoff, get_eastmoney_limiter,
 )
@@ -44,6 +44,14 @@ from app.data_sources.provider import register
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def _to_eastmoney_secid(symbol: str) -> str:
+    """股票代码 → 东财 secid（沪1.xxx / 深北0.xxx）"""
+    market, digits = detect_market(symbol)
+    if not market or not digits:
+        return ""
+    return f"1.{digits}" if market == "SH" else f"0.{digits}"
 
 
 # ================================================================
@@ -160,7 +168,7 @@ class EastMoneyDataSource:
         Returns:
             K线数据列表
         """
-        secid = to_eastmoney_secid(code)
+        secid = _to_eastmoney_secid(code)
         if not secid:
             return []
         klt = _EM_KLT.get(timeframe)
@@ -240,7 +248,7 @@ class EastMoneyDataSource:
         Returns:
             行情字典，失败返回 None
         """
-        secid = to_eastmoney_secid(code)
+        secid = _to_eastmoney_secid(code)
         if not secid:
             return None
         get_eastmoney_limiter().wait()

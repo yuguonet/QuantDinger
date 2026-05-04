@@ -373,13 +373,17 @@ def autodiscover():
       3. 跳过以 _ 开头的模块（私有模块）
       4. 逐个 import 子模块，触发模块顶部的 @register 装饰器
 
-    在 app/__init__.py 或启动时调用一次即可。
-    调用后，所有 Provider 自动注册到全局 _registry。
+    在模块加载时自动执行，也可手动调用。
     """
-    package = importlib.import_module("app.data_sources.provider")
-    for importer, modname, ispkg in pkgutil.iter_modules(package.__path__):
+    import sys
+    pkg = sys.modules[__name__]
+    for importer, modname, ispkg in pkgutil.iter_modules(pkg.__path__):
         if not modname.startswith("_"):
             try:
                 importlib.import_module(f"app.data_sources.provider.{modname}")
             except Exception as e:
                 logger.warning("[Provider] 加载 %s 失败: %s", modname, e)
+
+
+# 模块加载时自动扫描并注册所有 Provider
+autodiscover()

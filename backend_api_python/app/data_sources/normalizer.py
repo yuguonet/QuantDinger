@@ -406,6 +406,77 @@ def validate_broken_board(item: Dict) -> bool:
 
 
 # ================================================================
+# 股票代码工具函数 — 供 Provider 层使用
+# ================================================================
+
+def to_raw_digits(symbol: str) -> str:
+    """
+    从各种格式的股票代码中提取纯 6 位数字。
+
+    支持格式:
+      600519 / SH600519 / 600519.SH / 600519.SS / sh600519 / SZ000001 / 000001.SZ
+
+    Returns:
+        6 位数字字符串，无法识别返回 ""
+    """
+    s = (symbol or "").strip().upper()
+    if not s:
+        return ""
+    # 去掉常见前缀/后缀
+    for prefix in ("SH", "SZ", "BJ"):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            break
+    for suffix in (".SH", ".SS", ".SZ", ".BJ"):
+        if s.endswith(suffix):
+            s = s[:-len(suffix)]
+            break
+    s = s.strip()
+    if s.isdigit() and len(s) == 6:
+        return s
+    return ""
+
+
+def detect_market(symbol: str) -> tuple:
+    """
+    识别股票代码所属市场。
+
+    Returns:
+        (market, digits) — 如 ("SH", "600519") / ("SZ", "000001") / ("BJ", "830799")
+        无法识别返回 ("", "")
+    """
+    s = (symbol or "").strip().upper()
+    if not s:
+        return ("", "")
+
+    # 已带后缀
+    if s.endswith(".SH") or s.endswith(".SS"):
+        return ("SH", s[:-3].strip())
+    if s.endswith(".SZ"):
+        return ("SZ", s[:-3].strip())
+    if s.endswith(".BJ"):
+        return ("BJ", s[:-3].strip())
+
+    # 已带前缀
+    for prefix in ("SH", "SZ", "BJ"):
+        if s.startswith(prefix):
+            digits = s[len(prefix):]
+            if digits.isdigit() and len(digits) == 6:
+                return (prefix, digits)
+
+    # 纯 6 位数字，按规则推断
+    if s.isdigit() and len(s) == 6:
+        if s.startswith(("600", "601", "603", "605", "688", "689", "900")):
+            return ("SH", s)
+        if s.startswith(("000", "001", "002", "003", "300", "301", "200")):
+            return ("SZ", s)
+        if s.startswith(("43", "82", "83", "87", "88")):
+            return ("BJ", s)
+
+    return ("", "")
+
+
+# ================================================================
 # 公开别名 — 供外部模块统一引用
 # ================================================================
 safe_float = _sf

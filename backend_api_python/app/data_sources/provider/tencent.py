@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from app.data_sources.normalizer import (
-    to_tencent_code, normalize_hk_code,
+    normalize_cn_code as to_tencent_code, normalize_hk_code,
 )
 from app.data_sources.rate_limiter import (
     get_request_headers, retry_with_backoff, get_tencent_limiter,
