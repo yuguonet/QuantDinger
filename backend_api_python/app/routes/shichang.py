@@ -179,7 +179,7 @@ def _cached_fetch_sh(endpoint, fetch_fn, timeout=30):
 
 def _build_hub():
     """通过 DataSourceFactory 获取 AStockDataSource，构造 Interface 层统一入口"""
-    from app.interfaces.cn_stock_extent import AShareDataHub
+    from app.interfaces.cn_stock_hub import AShareDataHub
     source = DataSourceFactory.get_source("CNStock")
     return AShareDataHub(sources=[source])
 

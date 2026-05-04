@@ -133,4 +133,5 @@
 - [x] 项目下载 & 解压
 - [x] 架构分析 & 重构计划制定
 - [x] Phase 1 Step 1.1: 盘点数据层依赖关系 ✅ (2026-05-04)
+- [x] 拆分 cn_stock_extent.py → data_sources/a_stock.py + interfaces/hub.py ✅ (2026-05-04)
 - [ ] Phase 1 Step 1.2: 定义统一 DataSource 协议 ← **下一步**

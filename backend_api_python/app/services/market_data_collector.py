@@ -650,9 +650,9 @@ class MarketDataCollector:
                 # CNStock: 先走 CNStockExtent 缓存，命中则直接返回
                 if market == 'CNStock':
                     try:
-                        from app.interfaces.cn_stock_extent import CNStockExtent
+                        from app.data_sources.a_stock import AStockDataSource
                         from app.data_sources.tencent import normalize_cn_code
-                        ext = CNStockExtent()
+                        ext = AStockDataSource()
                         code = normalize_cn_code(symbol)
                         if code:
                             info = ext.get_stock_info(code)
@@ -662,7 +662,7 @@ class MarketDataCollector:
                                     "pb_ratio": info.get("pb_ratio"),
                                     "market_cap": info.get("total_mv"),
                                     "industry": info.get("industry"),
-                                    "source": "cn_stock_extent/cached",
+                                    "source": "a_stock/cached",
                                 }
                     except Exception as e:
                         logger.debug(f"CNStockExtent cache miss for {symbol}: {e}")
@@ -1323,9 +1323,9 @@ class MarketDataCollector:
         # 2. 个股主力资金流向 (补充因子)
         try:
             if symbol:
-                from app.interfaces.cn_stock_extent import CNStockExtent
+                from app.data_sources.a_stock import AStockDataSource
                 from app.data_sources.tencent import normalize_cn_code
-                ext = CNStockExtent()
+                ext = AStockDataSource()
                 code = normalize_cn_code(symbol)
                 if code:
                     flow = ext.get_stock_fund_flow(code)
@@ -1820,9 +1820,9 @@ class MarketDataCollector:
             if market == 'CNStock':
                 # 先走 CNStockExtent 缓存
                 try:
-                    from app.interfaces.cn_stock_extent import CNStockExtent
+                    from app.data_sources.a_stock import AStockDataSource
                     from app.data_sources.tencent import normalize_cn_code
-                    ext = CNStockExtent()
+                    ext = AStockDataSource()
                     code = normalize_cn_code(symbol)
                     if code:
                         info = ext.get_stock_info(code)
@@ -1832,7 +1832,7 @@ class MarketDataCollector:
                                 'industry': info.get("industry"),
                                 'country': 'CN',
                                 'exchange': 'SSE/SZSE',
-                                'source': 'cn_stock_extent/cached',
+                                'source': 'a_stock/cached',
                             }
                 except Exception as e:
                     logger.debug(f"CNStockExtent company cache miss for {symbol}: {e}")

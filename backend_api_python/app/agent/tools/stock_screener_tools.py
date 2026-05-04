@@ -1443,7 +1443,7 @@ def _get_hub():
         if _hub_init_failed:
             raise RuntimeError("AShareDataHub 初始化失败，已标记为不可用。")
         try:
-            from app.interfaces.cn_stock_extent import AShareDataHub
+            from app.interfaces.cn_stock_hub import AShareDataHub
             from app.data_sources.factory import DataSourceFactory
             source = DataSourceFactory.get_source("CNStock")
             _hub_instance = AShareDataHub(sources=[source])

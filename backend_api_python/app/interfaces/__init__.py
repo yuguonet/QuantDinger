@@ -2,8 +2,8 @@
 A股接口层 (interfaces)
 
 统一数据访问入口，包含:
-- AShareDataHub: 主入口 (cn_stock_extent.py) — 组合所有 Interface 对象
-- AStockDataSource: 多源 A股数据源 (cn_stock_extent.py)
+- AShareDataHub: 主入口 (cn_stock_hub.py) — 组合所有 Interface 对象
+- AStockDataSource: 多源 A股数据源 (data_sources/a_stock.py)
 - IndexInterface: 指数行情
 - MarketSnapshotInterface: 市场快照
 - StockInfoInterface: 个股信息
@@ -18,6 +18,7 @@ A股接口层 (interfaces)
 
 
 from .cache_file import cache_db
-from .cn_stock_extent import AShareDataHub, AStockDataSource
+from .cn_stock_hub import AShareDataHub
+from app.data_sources.a_stock import AStockDataSource
 
 __all__ = ['AShareDataHub', 'AStockDataSource']

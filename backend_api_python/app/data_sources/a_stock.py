@@ -1,22 +1,7 @@
 """
-A股数据接口扩展 — 为 CNStockDataSource 补充 interfaces 层所需的全部方法
+A股扩展数据源 — 继承 CNStockDataSource，补充 interfaces 层所需的全部方法
 
-继承 CNStockDataSource，添加:
-- get_index_quotes()      → 指数实时行情 (东财→腾讯→新浪)
-- get_market_snapshot()   → 市场涨跌统计 (东财全量→AkShare兜底)
-- get_stock_info()        → 个股基本信息 (东财)
-- get_all_stock_codes()   → 全部A股代码列表 (东财)
-- get_stock_fund_flow()   → 个股资金流向 (东财)
-- get_dragon_tiger()      → 龙虎榜 (可插拔多源)
-- get_hot_rank()          → 热榜/人气榜 (可插拔多源)
-- get_zt_pool()           → 涨停池 (可插拔多源)
-- get_limit_down()        → 跌停池 (可插拔多源)
-- get_broken_board()      → 炸板池 (可插拔多源)
-- AShareDataHub           → 接口层统一入口 (组合所有 Interface 对象)
-
-多源 fallback 链通过 ASTOCK_SOURCE_CHAIN 配置，新增数据源只需:
-  1. 在 app/data_sources/ 下新建模块，实现对应 fetch_* 函数
-  2. 在 ASTOCK_SOURCE_CHAIN 中加入 (name, module.fetch_func)
+从 interfaces/cn_stock_extent.py 拆分而来，纯数据源，不含 AShareDataHub。
 """
 
 from __future__ import annotations
@@ -832,14 +817,14 @@ class AStockDataSource(CNStockDataSource):
     # ================================================================
     #
     # 每个方法都走统一的 _try_sources() 调度:
-    #   1. 依次尝试 ASTOCK_SOURCE_CHAIN 中的数据源
+    #   1. 依次尝试数据源链中的数据源
     #   2. 熔断保护 — 跳过已熔断的数据源
     #   3. 超时保护 — 单源超时自动切换下一源
     #   4. 返回第一个成功的结果
     #
     # 新增数据源只需两步:
     #   a. 在 app/data_sources/ 新模块实现 fetch_xxx 函数
-    #   b. 在 ASTOCK_SOURCE_CHAIN 加入 (name, fetcher)
+    #   b. 加入对应的 chain 列表
 
     def _try_sources(
         self,
@@ -942,58 +927,3 @@ class AStockDataSource(CNStockDataSource):
             ("akshare_broken_board",    lambda: fetch_akshare_broken_board(trade_date)),
         ]
         return self._try_sources(chain, cache_key=f"broken_board:{trade_date}", cache_ttl=60)
-
-
-# ================================================================
-# AShareDataHub — 接口层统一入口
-# ================================================================
-
-class AShareDataHub:
-    """
-    A股数据统一入口 — 组合所有 Interface 对象，供 routes/emotion_scheduler 调用。
-
-    属性:
-        index:           IndexInterface           指数行情
-        market_snapshot: MarketSnapshotInterface   市场快照
-        zt_pool:         ZTPoolInterface           涨停池
-        limit_down:      LimitDownInterface        跌停池
-        broken_board:    BrokenBoardInterface      炸板池
-        dragon_tiger:    DragonTigerInterface      龙虎榜
-        hot_rank:        HotRankInterface          热榜/人气榜
-        stock_info:      StockInfoInterface        个股信息
-        stock_fund_flow: StockFundFlowInterface    个股资金流
-        fund_flow:       FundFlowInterface         板块资金流
-    """
-
-    def __init__(self, sources=None, db=None):
-        from app.interfaces.index import IndexInterface
-        from app.interfaces.market_snapshot import MarketSnapshotInterface
-        from app.interfaces.zt_pool import ZTPoolInterface
-        from app.interfaces.limit_down import LimitDownInterface
-        from app.interfaces.broken_board import BrokenBoardInterface
-        from app.interfaces.dragon_tiger import DragonTigerInterface
-        from app.interfaces.hot_rank import HotRankInterface
-        from app.interfaces.stock_info import StockInfoInterface
-        from app.interfaces.stock_fund_flow import StockFundFlowInterface
-        from app.interfaces.fund_flow import FundFlowInterface
-        from .cache_file import cache_db
-
-        # 数据源列表: 默认使用 AStockDataSource (多源 fallback)
-        if sources is None:
-            _ds = AStockDataSource()
-            sources = [_ds]
-
-        if db is None:
-            db = cache_db()
-
-        # 缓存统一由 AStockDataSource._info_cache 负责，不再使用 RealtimeCache
-        self.index = IndexInterface(sources, db)
-        self.market_snapshot = MarketSnapshotInterface(sources, db)
-        self.zt_pool = ZTPoolInterface(sources, db)
-        self.limit_down = LimitDownInterface(sources, db)
-        self.broken_board = BrokenBoardInterface(sources, db)
-        self.dragon_tiger = DragonTigerInterface(sources, db)
-        self.hot_rank = HotRankInterface(sources, db)
-        self.stock_info = StockInfoInterface(sources, db)
-        self.stock_fund_flow = StockFundFlowInterface(sources)
-        self.fund_flow = FundFlowInterface(sources, db)

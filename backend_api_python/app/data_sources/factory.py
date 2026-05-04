@@ -87,7 +87,7 @@ class DataSourceFactory:
             from app.data_sources.cn_stock import CNStockDataSource
             # 返回 AStockDataSource（继承 CNStockDataSource，补充龙虎榜/热榜/涨跌停池等扩展方法）
             try:
-                from app.interfaces.cn_stock_extent import AStockDataSource
+                from app.data_sources.a_stock import AStockDataSource
                 return AStockDataSource()
             except ImportError:
                 return CNStockDataSource()
