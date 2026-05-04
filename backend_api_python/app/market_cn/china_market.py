@@ -314,7 +314,7 @@ def get_sector_history(board_type="industry", days=30) -> dict:
     """板块历史排名数据（无缓存，每次直接读 feather）"""
     days = min(max(days, 1), 200)
     try:
-        from app.utils.cache_file import cache_db
+        from app.interfaces.cache_file import cache_db
         from .sector_history import get_sector_history as _get_history
         db = cache_db()
         rows = _get_history(db, board_type=board_type, days=days)
@@ -327,7 +327,7 @@ def get_sector_history(board_type="industry", days=30) -> dict:
 def get_emotion_history(hours=None, date=None) -> dict:
     """情绪指数历史数据（无缓存，每次直接读 feather）"""
     try:
-        from app.utils.cache_file import cache_db
+        from app.interfaces.cache_file import cache_db
         from app.interfaces.emotion_scheduler import query_emotion_history
         db = cache_db()
         history = query_emotion_history(db, date=date, hours=hours)
@@ -422,13 +422,13 @@ def _fetch_hot_sectors():
 
 
 def _fetch_sector_trend(board_type="industry"):
-    from app.utils.cache_file import cache_db
+    from app.interfaces.cache_file import cache_db
     from .sector_history import get_sector_trend as _get_trend
     return _get_trend(cache_db(), board_type=board_type)
 
 
 def _fetch_sector_prediction():
-    from app.utils.cache_file import cache_db
+    from app.interfaces.cache_file import cache_db
     from .sector_history import SectorAnalyzer
     analyzer = SectorAnalyzer(cache_db())
     industry = analyzer.full_analysis("industry")
@@ -444,7 +444,7 @@ def _fetch_sector_prediction():
 
 
 def _fetch_sector_cycle(board_type="industry"):
-    from app.utils.cache_file import cache_db
+    from app.interfaces.cache_file import cache_db
     from .sector_history import SectorAnalyzer
     analyzer = SectorAnalyzer(cache_db())
     result = analyzer.full_analysis(board_type)
@@ -523,8 +523,8 @@ def _fetch_policy() -> dict:
 
 
 # ============================================================
-#  模块初始化
+#  模块初始化 (后台线程已禁用，需手动调用 _warmup() 启动)
 # ============================================================
 
-threading.Thread(target=_warmup, daemon=True).start()
-threading.Thread(target=_bg_watchdog, daemon=True).start()
+# threading.Thread(target=_warmup, daemon=True).start()
+# threading.Thread(target=_bg_watchdog, daemon=True).start()

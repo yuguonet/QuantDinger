@@ -77,15 +77,21 @@ class MarketScorer:
     def __init__(self, df: pd.DataFrame):
         self.df = df.copy() if not df.empty else pd.DataFrame()
         self._cache: Dict[str, Any] = {}
+        self._cat_cache: Dict[str, pd.DataFrame] = {}
 
     # ---- 数据提取辅助 ----
 
     def _by_cat(self, category: str) -> pd.DataFrame:
+        if category in self._cat_cache:
+            return self._cat_cache[category]
         if self.df.empty:
-            return pd.DataFrame()
+            self._cat_cache[category] = pd.DataFrame()
+            return self._cat_cache[category]
         sub = self.df[self.df["category"] == category]
         # 取每个 symbol 最新一条
-        return sub.sort_values("timestamp").groupby("symbol").last().reset_index()
+        result = sub.sort_values("timestamp").groupby("symbol").last().reset_index()
+        self._cat_cache[category] = result
+        return result
 
     def _get_val(self, category: str, symbol: str) -> Optional[float]:
         """获取某标的最新价格。"""
@@ -458,12 +464,25 @@ class MarketScorer:
         composite = round(cfgi["score"] * 0.5 + mhs["score"] * 0.3 + (100 - vol["vix"] * 2 if vol["vix"] else 50) * 0.2, 1)
         composite = float(np.clip(composite, 0, 100))
 
+        # 数据质量: 检查哪些 category 有数据
+        cats_present = set(self.df["category"].unique()) if not self.df.empty else set()
+        required = {"indices", "crypto", "commodities", "sentiment"}
+        missing = required - cats_present
+        data_quality = {
+            "categories_present": sorted(cats_present),
+            "categories_missing": sorted(missing),
+            "has_vix": self._get_val("sentiment", "VIX") is not None,
+            "has_dxy": self._get_chg("sentiment", "DXY") is not None,
+            "total_rows": len(self.df),
+        }
+
         return {
             "composite_score": composite,
             "cfgi":   cfgi,
             "mhs":    mhs,
             "vol":    vol,
             "signals": sigs,
+            "data_quality": data_quality,
             "summary": self._format_summary(cfgi, mhs, vol, sigs, composite),
         }
 

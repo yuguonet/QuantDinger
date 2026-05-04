@@ -44,7 +44,7 @@ def register_to_init_py(backend_dir: str | Path):
 # === market_local plugin (auto-registered) ===
 try:
     import sys, os
-    _plugin_dir = os.environ.get("MARKET_STORE_DIR", os.path.join(os.path.dirname(__file__), "..", "market_feather_store"))
+    _plugin_dir = os.environ.get("MARKET_STORE_DIR", os.path.join(os.path.dirname(__file__), "..", "market_store"))
     if os.path.isdir(_plugin_dir) and _plugin_dir not in sys.path:
         sys.path.insert(0, _plugin_dir)
     from plugin_api import market_local_bp
@@ -98,14 +98,14 @@ def create_wrapper_file(backend_dir: str | Path):
     wrapper = routes_dir / "market_local_plugin.py"
     wrapper_content = '''"""
 market_local_plugin.py — Wrapper to import market_local blueprint.
-Place market_feather_store/ next to backend_api_python/ directory,
+Place market_store/ next to backend_api_python/ directory,
 or set MARKET_STORE_DIR env var to its location.
 """
 import sys, os
 
 _plugin_dir = os.environ.get(
     "MARKET_STORE_DIR",
-    os.path.join(os.path.dirname(__file__), "..", "..", "market_feather_store"),
+    os.path.join(os.path.dirname(__file__), "..", "..", "market_store"),
 )
 if os.path.isdir(_plugin_dir) and _plugin_dir not in sys.path:
     sys.path.insert(0, _plugin_dir)
@@ -151,8 +151,8 @@ def main():
         print()
         print("✓ Registration complete!")
         print()
-        print("Make sure market_feather_store/ is accessible at one of:")
-        print(f"  - {backend_dir}/market_feather_store/")
+        print("Make sure market_store/ is accessible at one of:")
+        print(f"  - {backend_dir}/market_store/")
         print(f"  - or set MARKET_STORE_DIR env var")
         print()
         print("API endpoints will be available at:")

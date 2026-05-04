@@ -295,6 +295,7 @@ def ak_news():
 #  BaoStock 数据源
 # ═══════════════════════════════════════════════════
 
+@retry()
 def bs_index_daily(code="sh.000300"):
     """BaoStock: 指数日线"""
     import baostock as bs
@@ -317,11 +318,13 @@ def bs_index_daily(code="sh.000300"):
         bs.logout()
 
 
+@retry()
 def bs_stock_daily(code="sh.600519"):
     """BaoStock: 个股日线"""
     return bs_index_daily(code)
 
 
+@retry()
 def bs_stock_basic():
     """BaoStock: A股列表"""
     import baostock as bs

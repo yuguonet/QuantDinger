@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-market_store.py — 纯存储层：Feather 格式行情数据持久化
+market_store.py — 纯存储层：Pickle 格式行情数据持久化
 
 职责:
   1. append()   — 追加新采集的行情（含完整性检查、价格校验、缺失回填、异常检测）
@@ -10,6 +10,11 @@ market_store.py — 纯存储层：Feather 格式行情数据持久化
   5. stats()    — 存储统计
 
 数据源已上移到 plugin_api.py，本文件不负责 fetch。
+
+存储格式:
+  单个 Pickle 文件 (data/market_store.pkl)，内含完整 DataFrame。
+  原子写入: 先写 .tmp 再 rename，防止写中断导致损坏。
+  自动备份: 写入前将旧文件保留为 .bak。
 
 用法:
   from market_store import MarketStore
@@ -21,8 +26,9 @@ market_store.py — 纯存储层：Feather 格式行情数据持久化
 from __future__ import annotations
 
 import os
-import json
+import pickle
 import logging
+import shutil
 from pathlib import Path
 from datetime import datetime, timedelta, date
 from typing import Any, Dict, List, Optional
@@ -51,20 +57,21 @@ def _load_dotenv(path: str = ".env"):
 
 # _load_dotenv()
 
-RETENTION_DAYS = int(os.getenv("FEATHER_RETENTION_DAYS", "15"))
-DATA_DIR = Path(os.getenv("FEATHER_DATA_DIR", "./data/feather"))
-VERBOSE = os.getenv("FEATHER_VERBOSE", "1") == "1"
+RETENTION_DAYS = int(os.getenv("MARKET_RETENTION_DAYS", "15"))
+DATA_DIR = Path(os.getenv("MARKET_DATA_DIR", "./data"))
+STORE_FILE = "market_store.pkl"
+VERBOSE = os.getenv("MARKET_VERBOSE", "1") == "1"
 
 # 急剧变化检测配置
-ANOMALY_WINDOW       = int(os.getenv("FEATHER_ANOMALY_WINDOW", "15"))
-ANOMALY_ZSCORE       = float(os.getenv("FEATHER_ANOMALY_ZSCORE", "2.5"))
-ANOMALY_MIN_PCT      = float(os.getenv("FEATHER_ANOMALY_MIN_PCT", "2.0"))
-ANOMALY_COOLDOWN_SEC = int(os.getenv("FEATHER_ANOMALY_COOLDOWN", "600"))
+ANOMALY_WINDOW       = int(os.getenv("MARKET_ANOMALY_WINDOW", "15"))
+ANOMALY_ZSCORE       = float(os.getenv("MARKET_ANOMALY_ZSCORE", "2.5"))
+ANOMALY_MIN_PCT      = float(os.getenv("MARKET_ANOMALY_MIN_PCT", "2.0"))
+ANOMALY_COOLDOWN_SEC = int(os.getenv("MARKET_ANOMALY_COOLDOWN", "600"))
 
 # 容错 & 数据质量配置
-SANITY_MAX_PCT  = float(os.getenv("FEATHER_SANITY_MAX_PCT", "50.0"))
-MIN_FETCH_RATIO = float(os.getenv("FEATHER_MIN_FETCH_RATIO", "0.5"))
-FILL_MISSING    = os.getenv("FEATHER_FILL_MISSING", "1") == "1"
+SANITY_MAX_PCT  = float(os.getenv("MARKET_SANITY_MAX_PCT", "50.0"))
+MIN_FETCH_RATIO = float(os.getenv("MARKET_MIN_FETCH_RATIO", "0.5"))
+FILL_MISSING    = os.getenv("MARKET_FILL_MISSING", "1") == "1"
 
 # ---------------------------------------------------------------------------
 # 日志
@@ -78,7 +85,7 @@ logging.basicConfig(
 log = logging.getLogger("market_store")
 
 # ---------------------------------------------------------------------------
-# Feather Schema — 统一扁平表
+# Schema — 统一扁平表
 # ---------------------------------------------------------------------------
 
 COLUMNS = ["timestamp", "category", "symbol", "name", "name_en",
@@ -143,7 +150,7 @@ def _check_sanity_jump(
 
 
 # ===================================================================
-# MarketStore — 纯存储层
+# MarketStore — 纯存储层 (Pickle)
 # ===================================================================
 
 class MarketStore:
@@ -151,82 +158,102 @@ class MarketStore:
     def __init__(self, data_dir: str | Path | None = None):
         self.data_dir = Path(data_dir) if data_dir else DATA_DIR
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._store_path = self.data_dir / STORE_FILE
+        self._backup_path = self.data_dir / f"{STORE_FILE}.bak"
         self._anomaly_cooldown: Dict[str, datetime] = {}
         self._last_known: Dict[str, Dict[str, Any]] = {}
-        log.debug("MarketStore init, data_dir=%s", self.data_dir.resolve())
+        # 内存缓存: 避免重复读盘
+        self._cache: Optional[pd.DataFrame] = None
+        log.debug("MarketStore init, store=%s", self._store_path.resolve())
 
-    # ---- 文件路径 ----
+    # ----------------------------------------------------------------
+    # 底层读写 — 单 Pickle 文件，原子写入 + 自动备份
+    # ----------------------------------------------------------------
 
-    def _file_for_date(self, d: date) -> Path:
-        return self.data_dir / f"market_{d.isoformat()}.feather"
-
-    def _date_from_file(self, p: Path) -> Optional[date]:
+    def _load(self) -> pd.DataFrame:
+        """从 pickle 文件加载全量数据。带内存缓存。"""
+        if self._cache is not None:
+            return self._cache
+        if not self._store_path.exists():
+            self._cache = pd.DataFrame(columns=COLUMNS)
+            return self._cache
         try:
-            ds = p.stem.replace("market_", "")
-            return date.fromisoformat(ds)
-        except Exception:
-            return None
-
-    # ---- 读写 ----
-
-    def _read_file(self, path: Path) -> Optional[pd.DataFrame]:
-        if not path.exists():
-            return None
-        try:
-            df = pd.read_feather(path)
+            with open(self._store_path, "rb") as f:
+                df = pickle.load(f)
+            # 兼容性校验
+            if not isinstance(df, pd.DataFrame):
+                raise ValueError(f"expected DataFrame, got {type(df)}")
             expected = set(COLUMNS)
             if not expected.issubset(set(df.columns)):
                 raise ValueError(f"missing columns: {expected - set(df.columns)}")
             if len(df) > 0 and df["timestamp"].isna().all():
                 raise ValueError("all timestamps are NaT")
-            return df
+            self._cache = df
+            log.debug("loaded %d rows from %s", len(df), self._store_path.name)
+            return self._cache
         except Exception as e:
-            log.warning("feather file corrupted (%s): %s — deleting & rebuilding", path.name, e)
+            log.warning("pickle file corrupted (%s): %s — attempting backup",
+                        self._store_path.name, e)
+            # 尝试从备份恢复
+            if self._backup_path.exists():
+                try:
+                    with open(self._backup_path, "rb") as f:
+                        df = pickle.load(f)
+                    if isinstance(df, pd.DataFrame) and set(COLUMNS).issubset(set(df.columns)):
+                        self._cache = df
+                        log.info("restored from backup: %d rows", len(df))
+                        # 用备份覆盖损坏的主文件
+                        shutil.copy2(self._backup_path, self._store_path)
+                        return self._cache
+                except Exception as e2:
+                    log.error("backup also corrupted: %s", e2)
+            # 都坏了，返回空
+            self._cache = pd.DataFrame(columns=COLUMNS)
+            return self._cache
+
+    def _save(self, df: pd.DataFrame):
+        """原子写入 pickle 文件。写入前备份旧文件。"""
+        # 备份旧文件
+        if self._store_path.exists():
             try:
-                path.unlink()
-            except Exception:
-                pass
-            return None
+                shutil.copy2(self._store_path, self._backup_path)
+            except Exception as e:
+                log.warning("backup failed: %s", e)
 
-    def _write_file(self, path: Path, df: pd.DataFrame):
-        tmp = path.with_suffix(".tmp")
-        df.to_feather(tmp)
-        tmp.replace(path)
-        log.debug("wrote %s (%d rows)", path.name, len(df))
+        # 原子写入: .tmp → rename
+        tmp_path = self._store_path.with_suffix(".tmp")
+        try:
+            with open(tmp_path, "wb") as f:
+                pickle.dump(df, f, protocol=pickle.HIGHEST_PROTOCOL)
+            tmp_path.replace(self._store_path)
+            self._cache = df  # 更新内存缓存
+            log.debug("saved %d rows to %s", len(df), self._store_path.name)
+        except Exception as e:
+            log.error("save failed: %s", e)
+            if tmp_path.exists():
+                tmp_path.unlink()
+            raise
 
-    def _load_day(self, d: date) -> pd.DataFrame:
-        path = self._file_for_date(d)
-        df = self._read_file(path)
-        return df if df is not None else pd.DataFrame(columns=COLUMNS)
+    def _invalidate_cache(self):
+        """使内存缓存失效，下次 _load() 会重新读盘。"""
+        self._cache = None
 
-    def _save_day(self, d: date, df: pd.DataFrame):
-        self._write_file(self._file_for_date(d), df)
-
-    # ---- 急剧变化检测 ----
+    # ----------------------------------------------------------------
+    # 急剧变化检测
+    # ----------------------------------------------------------------
 
     def _load_history_for_symbol(
         self, category: str, symbol: str, limit: int = 20,
     ) -> pd.DataFrame:
-        today = date.today()
-        frames: List[pd.DataFrame] = []
-        collected = 0
-        for offset in range(RETENTION_DAYS + 1):
-            d = today - timedelta(days=offset)
-            df = self._load_day(d)
-            if df.empty:
-                continue
-            sub = df[(df["category"] == category) & (df["symbol"] == symbol)]
-            if sub.empty:
-                continue
-            frames.append(sub)
-            collected += len(sub)
-            if collected >= limit:
-                break
-        if not frames:
+        """从全量数据中提取某标的的最近 N 条记录。"""
+        df = self._load()
+        if df.empty:
             return pd.DataFrame(columns=COLUMNS)
-        result = pd.concat(frames, ignore_index=True)
-        result.sort_values("timestamp", inplace=True)
-        return result.tail(limit).reset_index(drop=True)
+        sub = df[(df["category"] == category) & (df["symbol"] == symbol)]
+        if sub.empty:
+            return pd.DataFrame(columns=COLUMNS)
+        sub = sub.sort_values("timestamp")
+        return sub.tail(limit).reset_index(drop=True)
 
     def detect_anomalies(self, new_df: pd.DataFrame) -> List[Dict[str, Any]]:
         """
@@ -382,20 +409,21 @@ class MarketStore:
             })
         return alerts
 
-    # ---- 内部辅助 ----
+    # ----------------------------------------------------------------
+    # 内部辅助
+    # ----------------------------------------------------------------
 
     def _build_last_known_cache(self):
-        today = date.today()
+        """从全量数据构建每个标的的最新值缓存。"""
+        df = self._load()
+        if df.empty:
+            self._last_known = {}
+            return
+        df = df.sort_values("timestamp")
         self._last_known = {}
-        for offset in range(3):
-            d = today - timedelta(days=offset)
-            df = self._load_day(d)
-            if df.empty:
-                continue
-            df = df.sort_values("timestamp")
-            for _, row in df.iterrows():
-                key = f"{row['category']}:{row['symbol']}"
-                self._last_known[key] = row.to_dict()
+        for _, row in df.iterrows():
+            key = f"{row['category']}:{row['symbol']}"
+            self._last_known[key] = row.to_dict()
         log.debug("last_known cache: %d entries", len(self._last_known))
 
     def _fill_missing_symbols(
@@ -474,7 +502,9 @@ class MarketStore:
             log.warning("validate: rejected %d / %d rows", rejected, len(df))
         return df[valid_mask].copy()
 
-    # ---- 核心写入 ----
+    # ----------------------------------------------------------------
+    # 核心写入
+    # ----------------------------------------------------------------
 
     def append(self, df: pd.DataFrame):
         """
@@ -485,7 +515,7 @@ class MarketStore:
           2. 价格合理性 + 跳变校验
           3. 缺失标的回填
           4. 急剧变化检测
-          5. 写入 feather 文件
+          5. 合并去重 → 写入 pickle
         """
         if df.empty:
             log.warning("append: empty dataframe, skip")
@@ -525,21 +555,26 @@ class MarketStore:
             log.info("anomaly detection SKIPPED — fetch quality too low (%.0f%%)",
                      quality["ratio"] * 100)
 
-        # 5. 写入 feather
+        # 5. 合并去重 → 写入 pickle
         df_to_write = df[COLUMNS].copy()
         df_to_write["timestamp"] = pd.to_datetime(df_to_write["timestamp"])
-        for day, group in df_to_write.groupby(df_to_write["timestamp"].dt.date):
-            existing = self._load_day(day)
-            combined = pd.concat([existing, group], ignore_index=True)
-            combined.sort_values("timestamp", inplace=True)
-            combined.drop_duplicates(
-                subset=["timestamp", "category", "symbol"],
-                keep="last", inplace=True,
-            )
-            combined.reset_index(drop=True, inplace=True)
-            self._save_day(day, combined)
 
-        # 6. 更新缓存
+        existing = self._load()
+        if existing.empty:
+            combined = df_to_write
+        else:
+            combined = pd.concat([existing, df_to_write], ignore_index=True)
+
+        combined.sort_values("timestamp", inplace=True)
+        combined.drop_duplicates(
+            subset=["timestamp", "category", "symbol"],
+            keep="last", inplace=True,
+        )
+        combined.reset_index(drop=True, inplace=True)
+
+        self._save(combined)
+
+        # 6. 更新内存缓存
         for _, row in df_to_write.iterrows():
             key = f"{row['category']}:{row['symbol']}"
             self._last_known[key] = row.to_dict()
@@ -551,10 +586,12 @@ class MarketStore:
             parts.append(f"{filled_n} filled")
         if alerts:
             parts.append(f"{len(alerts)} alerts")
-        log.info("append: %s | quality=%.0f%%", " + ".join(parts),
-                 quality["ratio"] * 100)
+        log.info("append: %s | quality=%.0f%% | total=%d rows",
+                 " + ".join(parts), quality["ratio"] * 100, len(combined))
 
-    # ---- 查询 ----
+    # ----------------------------------------------------------------
+    # 查询
+    # ----------------------------------------------------------------
 
     def query(
         self,
@@ -575,67 +612,72 @@ class MarketStore:
             start = pd.to_datetime(start).to_pydatetime()
         if isinstance(end, str):
             end = pd.to_datetime(end).to_pydatetime()
-        start_d = start.date() if isinstance(start, datetime) else start
-        end_d = end.date() if isinstance(end, datetime) else end
 
-        frames = []
-        cur = start_d
-        while cur <= end_d:
-            df = self._load_day(cur)
-            if not df.empty:
-                frames.append(df)
-            cur += timedelta(days=1)
-        if not frames:
+        df = self._load()
+        if df.empty:
             return pd.DataFrame(columns=COLUMNS)
 
-        result = pd.concat(frames, ignore_index=True)
-        result = result[result["timestamp"] >= pd.Timestamp(start)]
-        result = result[result["timestamp"] <= pd.Timestamp(end)]
+        result = df[
+            (df["timestamp"] >= pd.Timestamp(start)) &
+            (df["timestamp"] <= pd.Timestamp(end))
+        ]
         if category:
             result = result[result["category"] == category]
         if symbol:
             result = result[result["symbol"] == symbol]
-        result.sort_values("timestamp", inplace=True)
-        result.reset_index(drop=True, inplace=True)
+        result = result.sort_values("timestamp").reset_index(drop=True)
         return result
 
-    # ---- 清理 ----
+    # ----------------------------------------------------------------
+    # 清理
+    # ----------------------------------------------------------------
 
     def prune(self, retention_days: int | None = None) -> int:
+        """清理过期数据：从 DataFrame 中删除超出保留天数的行。"""
         days = retention_days if retention_days is not None else RETENTION_DAYS
-        cutoff = date.today() - timedelta(days=days)
-        deleted = 0
-        for f in sorted(self.data_dir.glob("market_*.feather")):
-            d = self._date_from_file(f)
-            if d and d < cutoff:
-                try:
-                    f.unlink()
-                    deleted += 1
-                    log.info("pruned old file: %s", f.name)
-                except Exception as e:
-                    log.warning("failed to delete %s: %s", f.name, e)
-        if deleted:
-            log.info("pruned %d files older than %d days", deleted, days)
-        return deleted
+        cutoff = pd.Timestamp.now() - timedelta(days=days)
 
-    # ---- 统计 ----
+        df = self._load()
+        if df.empty:
+            return 0
+
+        before_count = len(df)
+        df = df[df["timestamp"] >= cutoff].reset_index(drop=True)
+        pruned = before_count - len(df)
+
+        if pruned > 0:
+            self._save(df)
+            log.info("pruned %d rows older than %d days (remaining: %d)",
+                     pruned, days, len(df))
+        else:
+            log.debug("nothing to prune (retention=%d days)", days)
+        return pruned
+
+    # ----------------------------------------------------------------
+    # 统计
+    # ----------------------------------------------------------------
 
     def stats(self) -> Dict[str, Any]:
-        files = sorted(self.data_dir.glob("market_*.feather"))
-        total_rows = 0
-        date_range = []
-        for f in files:
-            df = self._read_file(f)
-            if df is not None:
-                total_rows += len(df)
-                d = self._date_from_file(f)
-                if d:
-                    date_range.append(d)
+        df = self._load()
+        store_size = self._store_path.stat().st_size if self._store_path.exists() else 0
+        backup_size = self._backup_path.stat().st_size if self._backup_path.exists() else 0
+
+        date_min = None
+        date_max = None
+        if not df.empty and "timestamp" in df.columns:
+            ts = df["timestamp"]
+            if hasattr(ts.min(), "isoformat"):
+                date_min = ts.min().isoformat()
+                date_max = ts.max().isoformat()
+
         return {
             "data_dir": str(self.data_dir.resolve()),
-            "file_count": len(files),
-            "total_rows": total_rows,
-            "date_min": min(date_range).isoformat() if date_range else None,
-            "date_max": max(date_range).isoformat() if date_range else None,
+            "store_file": str(self._store_path.resolve()),
+            "store_size_bytes": store_size,
+            "backup_size_bytes": backup_size,
+            "total_rows": len(df),
+            "date_min": date_min,
+            "date_max": date_max,
             "retention_days": RETENTION_DAYS,
+            "categories": df["category"].value_counts().to_dict() if not df.empty else {},
         }

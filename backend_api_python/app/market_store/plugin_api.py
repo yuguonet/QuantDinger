@@ -45,7 +45,7 @@ if str(_PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_DIR))
 
 try:
-    from market_store import MarketStore, RETENTION_DAYS, COLUMNS
+    from market_store import MarketStore, RETENTION_DAYS, COLUMNS  # noqa: F401
     from market_scorer import MarketScorer
     _HAS_DEPS = True
 except ImportError as _e:
@@ -91,7 +91,7 @@ _store = None
 def _get_store() -> "MarketStore":
     global _store
     if _store is None:
-        data_dir = os.getenv("FEATHER_DATA_DIR", "./data/feather")
+        data_dir = os.getenv("MARKET_DATA_DIR", "./data")
         _store = MarketStore(data_dir=data_dir)
     return _store
 
@@ -117,62 +117,54 @@ def _get_base_url() -> str:
     return f"{scheme}://{host}:{port}"
 
 
-# ---- 方式 A: 同进程直调 data_providers（更快，无 HTTP 开销）----
+# ---- 方式 A: 同进程调用 global_market（带缓存，推荐）----
 
 def _fetch_overview_inproc() -> Dict[str, Any]:
-    """直接调用 data_providers 获取 overview 数据。"""
-    from app.data_providers.crypto import fetch_crypto_prices
-    from app.data_providers.forex import fetch_forex_pairs
-    from app.data_providers.commodities import fetch_commodities
-    from app.data_providers.indices import fetch_stock_indices
+    """通过 global_market 获取 overview 数据（自带缓存）。"""
+    from app.data_providers.global_market import get_indices
 
     result = {"indices": [], "forex": [], "crypto": [], "commodities": []}
 
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {
-            pool.submit(fetch_stock_indices): "indices",
-            pool.submit(fetch_forex_pairs):   "forex",
-            pool.submit(fetch_crypto_prices): "crypto",
-            pool.submit(fetch_commodities):    "commodities",
-        }
-        for fut in as_completed(futures):
-            key = futures[fut]
-            try:
-                data = fut.result()
-                result[key] = data if data else []
-            except Exception as e:
-                log.error("inproc fetch %s failed: %s", key, e)
-                result[key] = []
+    try:
+        resp = get_indices()
+        data = resp.get("data", {}) if isinstance(resp, dict) else {}
+        result["indices"] = data.get("indices", []) or []
+        result["forex"] = data.get("forex", []) or []
+        result["crypto"] = data.get("crypto", []) or []
+    except Exception as e:
+        log.error("inproc fetch indices/forex/crypto failed: %s", e)
+
+    # commodities 在 get_sentiment() 里
+    try:
+        from app.data_providers.global_market import get_sentiment
+        sent_resp = get_sentiment()
+        sent_data = sent_resp.get("data", {}) if isinstance(sent_resp, dict) else {}
+        result["commodities"] = sent_data.get("commodities", []) or []
+    except Exception as e:
+        log.error("inproc fetch commodities failed: %s", e)
 
     return result
 
 
 def _fetch_sentiment_inproc() -> Dict[str, Any]:
-    """直接调用 data_providers 获取 sentiment 数据。"""
-    from app.data_providers.sentiment import (
-        fetch_fear_greed_index, fetch_vix, fetch_dollar_index,
-    )
+    """通过 global_market 获取 sentiment 数据（自带缓存）。"""
+    from app.data_providers.global_market import get_sentiment
 
-    results = {}
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        futures = {
-            pool.submit(fetch_fear_greed_index): "fear_greed",
-            pool.submit(fetch_vix):              "vix",
-            pool.submit(fetch_dollar_index):      "dxy",
+    try:
+        resp = get_sentiment()
+        data = resp.get("data", {}) if isinstance(resp, dict) else {}
+        return {
+            "fear_greed": data.get("fear_greed") or {"value": 50, "classification": "Neutral"},
+            "vix":        data.get("vix") or {"value": 0, "level": "unknown"},
+            "dxy":        data.get("dxy") or {"value": 0, "level": "unknown"},
         }
-        for fut in as_completed(futures):
-            key = futures[fut]
-            try:
-                results[key] = fut.result()
-            except Exception as e:
-                log.error("inproc fetch %s failed: %s", key, e)
-                results[key] = None
-
-    return {
-        "fear_greed": results.get("fear_greed") or {"value": 50, "classification": "Neutral"},
-        "vix":        results.get("vix") or {"value": 0, "level": "unknown"},
-        "dxy":        results.get("dxy") or {"value": 0, "level": "unknown"},
-    }
+    except Exception as e:
+        log.error("inproc fetch sentiment failed: %s", e)
+        return {
+            "fear_greed": {"value": 50, "classification": "Neutral"},
+            "vix":        {"value": 0, "level": "unknown"},
+            "dxy":        {"value": 0, "level": "unknown"},
+        }
 
 
 # ---- 方式 B: HTTP 回调（解耦，跨服务场景）----
