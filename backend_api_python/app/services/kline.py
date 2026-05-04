@@ -349,8 +349,8 @@ class KlineService:
             return {}
 
         try:
-            from app.data_sources.cn_stock import _fetch_eastmoney_batch_quotes
-            result = _fetch_eastmoney_batch_quotes(symbols)
+            from app.data_sources.eastmoney import fetch_eastmoney_batch_quotes
+            result = fetch_eastmoney_batch_quotes(symbols)
             self._today_batch[market] = result
             self._today_batch_ts[market] = now
             logger.info(

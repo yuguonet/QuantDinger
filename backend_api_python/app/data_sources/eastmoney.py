@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -530,4 +530,92 @@ def fetch_eastmoney_broken_board(trade_date: str) -> List[Dict[str, Any]]:
             continue
 
     logger.info(f"[EastMoney] broken_board {trade_date}: {len(result)} stocks")
+    return result
+
+
+# ---------- 批量当日行情（clist 全市场接口）----------
+
+def fetch_eastmoney_batch_quotes(
+    symbols: List[str],
+    timeout: int = 15,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    通过东方财富 clist 接口批量获取当日行情。
+    一次请求拉全市场（约 5000 只），从中筛选目标股票。
+
+    字段: f2=最新价, f5=成交量, f6=成交额, f12=代码,
+          f15=最高, f16=最低, f17=开盘, f18=昨收
+
+    Returns:
+        {symbol: {"time", "open", "high", "low", "close", "volume"}}
+    """
+    if not symbols:
+        return {}
+
+    # 建立纯数字代码 → symbol 映射
+    code_set: Dict[str, str] = {}
+    for sym in symbols:
+        raw = sym.strip()
+        for prefix in ("SH", "SZ", "BJ", "sh", "sz", "bj"):
+            if raw.startswith(prefix):
+                raw = raw[2:]
+                break
+        if raw.isdigit() and len(raw) == 6:
+            code_set[raw] = sym
+
+    if not code_set:
+        return {}
+
+    try:
+        limiter = get_eastmoney_limiter()
+        limiter.wait()
+
+        url = "https://push2.eastmoney.com/api/qt/clist/get"
+        params = {
+            "pn": 1, "pz": 6000, "po": 1, "np": 1,
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "fltt": 2, "invt": 2,
+            "fid": "f3",
+            "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+            "fields": "f2,f5,f6,f12,f15,f16,f17,f18",
+        }
+        resp = requests.get(
+            url,
+            headers=get_request_headers(referer="https://quote.eastmoney.com/"),
+            timeout=timeout,
+        )
+        data = resp.json()
+        diff = ((data.get("data") or {}).get("diff")) or []
+    except Exception as e:
+        logger.warning(f"[EastMoney] clist 批量行情请求失败: {e}")
+        return {}
+
+    now = datetime.now(timezone(timedelta(hours=8)))
+    today_ts = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    result: Dict[str, Dict[str, Any]] = {}
+
+    for item in diff:
+        code = str(item.get("f12", "")).strip()
+        sym = code_set.get(code)
+        if not sym:
+            continue
+        try:
+            last = float(item.get("f2", 0))
+            if last <= 0:
+                continue
+            open_p = float(item.get("f17", 0))
+            high = float(item.get("f15", 0))
+            low = float(item.get("f16", 0))
+            vol = float(item.get("f5", 0))
+            result[sym] = {
+                "time": today_ts,
+                "open": round(open_p, 4),
+                "high": round(high, 4),
+                "low": round(low, 4),
+                "close": round(last, 4),
+                "volume": round(vol, 2),
+            }
+        except (ValueError, TypeError):
+            continue
+
     return result

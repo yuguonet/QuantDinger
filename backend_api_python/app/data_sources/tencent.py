@@ -10,7 +10,7 @@ This is used as a stable alternative when Yahoo/yfinance gets rate-limited.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -169,6 +169,64 @@ def fetch_quotes_batch(codes: List[str], timeout: int = 10) -> Dict[str, List[st
     return result
 
 
+def fetch_tencent_batch_quotes(
+    symbols: List[str],
+    timeout: int = 10,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    批量获取当日行情，返回标准化格式（与 fetch_eastmoney_batch_quotes 接口一致）。
+
+    Args:
+        symbols: 股票代码列表 (SH600519 / 600519 均可)
+
+    Returns:
+        {symbol: {"time", "open", "high", "low", "close", "volume"}}
+    """
+    if not symbols:
+        return {}
+
+    # 建立 tencent_code(lower) → original_symbol 映射
+    code_to_sym: Dict[str, str] = {}
+    for sym in symbols:
+        tc = _lower_code(normalize_cn_code(sym))
+        if tc:
+            code_to_sym[tc] = sym
+
+    if not code_to_sym:
+        return {}
+
+    raw = fetch_quotes_batch(list(code_to_sym.keys()), timeout=timeout)
+
+    now = datetime.now(timezone(timedelta(hours=8)))
+    today_ts = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    result: Dict[str, Dict[str, Any]] = {}
+
+    for code, parts in raw.items():
+        sym = code_to_sym.get(code)
+        if not sym or len(parts) < 35:
+            continue
+        try:
+            last = float(parts[3])
+            if last <= 0:
+                continue
+            open_p = float(parts[5])
+            high = float(parts[33]) if parts[33] else last
+            low = float(parts[34]) if parts[34] else last
+            vol = float(parts[6]) if parts[6] else 0
+            result[sym] = {
+                "time": today_ts,
+                "open": round(open_p, 4),
+                "high": round(high, 4),
+                "low": round(low, 4),
+                "close": round(last, 4),
+                "volume": round(vol, 2),
+            }
+        except (ValueError, IndexError):
+            continue
+
+    return result
+
+
 def parse_quote_to_ticker(parts: List[str]) -> Dict[str, Any]:
     """
     Best-effort conversion to a unified ticker dict.
@@ -206,6 +264,31 @@ def parse_quote_to_ticker(parts: List[str]) -> Dict[str, Any]:
         "open": open_ or last_,
         "previousClose": prev,
         "raw": parts,
+    }
+
+
+def tencent_quote_to_ticker(code: str) -> Optional[Dict[str, Any]]:
+    """
+    获取腾讯实时行情并转换为统一 ticker 格式。
+    返回 None 表示获取失败或数据无效。
+    """
+    parts = fetch_quote(code)
+    if not parts:
+        return None
+    t = parse_quote_to_ticker(parts)
+    last = t.get("last", 0)
+    if last <= 0:
+        return None
+    return {
+        "last": last,
+        "change": t.get("change", 0),
+        "changePercent": t.get("changePercent", 0),
+        "high": t.get("high", 0),
+        "low": t.get("low", 0),
+        "open": t.get("open", 0),
+        "previousClose": t.get("previousClose", 0),
+        "name": t.get("name", ""),
+        "symbol": code,
     }
 
 

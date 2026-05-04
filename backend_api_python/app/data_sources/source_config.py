@@ -233,6 +233,16 @@ SOURCE_CONFIGS: Dict[str, SourceConfig] = {
         batch_size=5000,
     ),
 
+    # Twelve Data — 海外付费源，仅作降级兜底
+    # max_workers=1 较低（国内访问不稳定）
+    "twelvedata": SourceConfig(
+        name="twelvedata",
+        max_workers=1,
+        markets={"CNStock", "HKStock"},
+        batch_capable=False,
+        batch_size=1,
+    ),
+
     # 港股专用源 — 仅支持港股，不支持批量
     # max_workers=3，batch_size=1（逐个请求）
     "hk_stock": SourceConfig(
