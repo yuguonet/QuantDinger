@@ -1,23 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-协助层 (Coordinator) — 数据源层与调度层之间的并发协调
+协助层 (Coordinator) — 统一调度：fallback / race / 并发
 
 定位:
-  调度层(KlineService/Dispatcher) → 协助层(Coordinator) → 数据源层(Providers)
+  DataSourceFactory(入口层) → Coordinator(本层) → Providers(数据源层)
 
 核心职责:
-  1. 动态队列: 源干完一个活立刻拿下一个，不闲着
-  2. 并发控制: 每个源的并发数不超过其 max_workers 配置
-  3. 吞吐跟踪: 记录每个源的实际 QPS，动态调整分配优先级
-  4. 批量优先: 支持批量接口的源直接调用 fetch_kline_batch
-  5. 失败处理: 每个 symbol 最多被所有可用源各试一次，全部失败则放弃
+  1. sequential_fallback: 单只按优先级逐源尝试（K线默认策略）
+  2. race:                多源并发竞赛，第一个有效结果返回（行情默认策略）
+  3. 动态队列批量并发:    源干完一个活立刻拿下一个，不闲着
+  4. 并发控制:            每个源的并发数不超过其 max_workers 配置
+  5. 吞吐跟踪:            记录每个源的实际 QPS，动态调整分配优先级
 
 设计原则:
+  - Factory 负责去重、复权、市场解析；本层负责所有调度
+  - 所有 Provider 交互都经过本层，Factory 不直接碰 Provider
   - 能批量的绝对不并发（调用 provider.fetch_kline_batch）
   - 不能批量的按源并发（每个源独立线池，互不干扰）
-  - 最大化利用每个源的并发能力（源支持多少并发就开多少）
-  - 不影响现有调度机制（sequential_fallback / race 保持不变）
-  - 动态队列保证负载均衡（谁快谁多干）
 """
 
 from __future__ import annotations
@@ -31,17 +30,136 @@ from app.data_sources.source_config import (
     SourceConfig, get_source_config, get_sources_for_market,
 )
 from app.data_sources.circuit_breaker import CircuitBreaker
+from app.data_sources.provider import get_providers
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 T = TypeVar("T")
 
-# 单次请求的超时上限（秒），Coordinator 层兜底，防止 fetch_kline 卡死
+# 单次请求的超时上限（秒），兜底防止 fetch_kline 卡死
 PER_TASK_TIMEOUT = 20.0
 
 # 队列空时等待的超时（秒），超时后认为所有工作已完成
 QUEUE_DRAIN_TIMEOUT = 3.0
+
+
+# ================================================================
+# 调度策略 — fallback / race
+# ================================================================
+
+def sequential_fallback(
+    symbol: str,
+    providers: List[Tuple[str, Callable[[], Optional[T]]]],
+    cb: CircuitBreaker,
+    validate: Callable[[T], bool] = lambda x: x is not None,
+    timeout: float = PER_TASK_TIMEOUT,
+) -> Tuple[Optional[T], Optional[str]]:
+    """
+    顺序 fallback — 按优先级逐源尝试，成功就停。
+
+    适合 K线（每只1次HTTP，race浪费API）。
+
+    Args:
+        symbol:     股票代码
+        providers:  [(name, fetcher), ...]
+        cb:         熔断器
+        validate:   结果校验
+        timeout:    单源超时秒数（防止单个 provider 卡住阻塞整个链）
+
+    Returns:
+        (result, source_name) 或 (None, None)
+    """
+    for name, fetcher in providers:
+        if not cb.is_available(name):
+            continue
+        try:
+            # 带超时调用，防止 provider 卡住
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(fetcher)
+                try:
+                    result = future.result(timeout=timeout)
+                except concurrent.futures.TimeoutError:
+                    logger.warning("[fallback] %s 超时 (%ss)", name, timeout)
+                    cb.record_failure(name, "timeout")
+                    continue
+
+            if validate(result):
+                cb.record_success(name)
+                return result, name
+            cb.record_failure(name, "empty/invalid")
+        except Exception as e:
+            cb.record_failure(name, str(e))
+
+    return None, None
+
+
+def race(
+    providers: List[Tuple[str, Callable[[], Optional[T]]]],
+    cb: CircuitBreaker,
+    timeout: float = 8.0,
+    validate: Callable[[T], bool] = lambda x: x is not None,
+) -> Tuple[Optional[T], Optional[str]]:
+    """
+    并发竞赛 — 多源同时取，第一个有效结果返回。
+
+    适合行情（有批量接口，race代价低）。
+
+    Args:
+        providers: [(name, fetcher), ...]
+        cb:        熔断器
+        timeout:   超时秒数
+        validate:  结果校验
+
+    Returns:
+        (result, source_name) 或 (None, None)
+    """
+    available = [(n, f) for n, f in providers if cb.is_available(n)]
+    if not available:
+        return None, None
+
+    if len(available) == 1:
+        name, fn = available[0]
+        try:
+            result = fn()
+            if validate(result):
+                cb.record_success(name)
+                return result, name
+            cb.record_failure(name, "empty/invalid")
+        except Exception as e:
+            cb.record_failure(name, str(e))
+        return None, None
+
+    result_holder: Dict[str, Any] = {"result": None, "source": None}
+    done_event = threading.Event()
+    lock = threading.Lock()
+
+    def _try(source_name: str, fetcher: Callable) -> None:
+        try:
+            data = fetcher()
+            if done_event.is_set():
+                return
+            if validate(data):
+                with lock:
+                    if result_holder["result"] is None:
+                        result_holder["result"] = data
+                        result_holder["source"] = source_name
+                        done_event.set()
+                cb.record_success(source_name)
+            else:
+                cb.record_failure(source_name, "empty/invalid")
+        except Exception as e:
+            if not done_event.is_set():
+                cb.record_failure(source_name, str(e))
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(available))
+    try:
+        futures = {executor.submit(_try, n, f): n for n, f in available}
+        done_event.wait(timeout=timeout + 1)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    return result_holder["result"], result_holder["source"]
 
 
 # ================================================================
@@ -58,32 +176,23 @@ class _WorkQueue:
     """
 
     def __init__(self, items: List[str]):
-        """初始化阻塞任务队列。
-
-        Args:
-            items: 初始任务列表 (symbol 列表)
-        """
         self._items = list(items)
         self._cond = threading.Condition()
-        self._done = False       # True → 所有工作已完成，线程应退出
-        self._pending = 0        # 正在处理中的 symbol 数量
+        self._done = False
+        self._pending = 0
 
     def get(self) -> Optional[str]:
-        """取下一个任务。队列空时等待，超时或 done 时返回 None。"""
         with self._cond:
             while not self._items:
                 if self._done:
                     return None
-                # 等待新任务或 done 信号
                 notified = self._cond.wait(timeout=QUEUE_DRAIN_TIMEOUT)
                 if not notified and not self._items:
-                    # 超时且仍无任务 → 认为完成
                     return None
             self._pending += 1
             return self._items.pop(0)
 
     def get_batch(self, batch_size: int) -> List[str]:
-        """批量取任务"""
         with self._cond:
             actual = min(batch_size, len(self._items))
             if actual <= 0:
@@ -94,47 +203,167 @@ class _WorkQueue:
             return batch
 
     def put_back(self, sym: str):
-        """放回队尾并唤醒等待线程"""
         with self._cond:
             self._items.append(sym)
             self._pending = max(0, self._pending - 1)
             self._cond.notify()
 
     def task_done(self):
-        """标记一个任务完成（不放回队列）"""
         with self._cond:
             self._pending = max(0, self._pending - 1)
-            # 如果队列空且无 pending，通知等待线程可能已全部完成
             if not self._items and self._pending == 0:
                 self._cond.notify_all()
 
     def drain_done(self):
-        """标记所有工作完成，唤醒所有等待线程退出"""
         with self._cond:
             self._done = True
             self._cond.notify_all()
 
     @property
     def is_empty(self) -> bool:
-        """检查队列是否为空 (不考虑 pending 中的任务)"""
         with self._cond:
             return len(self._items) == 0
 
 
 # ================================================================
-# 协助层主类
+# Coordinator — 统一调度层
 # ================================================================
 
 class Coordinator:
     """
-    协助层 — 动态队列 + 吞吐反馈 + 批量优先。
+    协助层 — 统一调度：fallback / race / 批量并发。
+
+    所有 Provider 交互都经过本层。
     """
 
     def __init__(self):
-        """初始化协助层，创建线程锁"""
         self._lock = threading.Lock()
 
-    # ── K线批量协调 ─────────────────────────────────────────────
+    # ── 单只 K线: fallback ──────────────────────────────────────
+
+    def fetch_single_kline(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int,
+        market: str,
+        cb: CircuitBreaker,
+    ) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+        """
+        获取单只K线 — 按优先级逐源 fallback。
+
+        Args:
+            symbol:    股票代码
+            timeframe: K线周期
+            limit:     数据条数
+            market:    市场类型
+            cb:        熔断器
+
+        Returns:
+            (kline_bars, source_name) 或 (None, None)
+        """
+        providers = [
+            (p.name, lambda p=p: p.fetch_kline(symbol, timeframe, limit))
+            for p in get_providers("kline", timeframe=timeframe, market=market or None)
+        ]
+        result, src = sequential_fallback(symbol, providers, cb)
+        if result:
+            logger.info("[K线] %s tf=%s 来源=%s bars=%d", symbol, timeframe, src, len(result))
+        else:
+            names = [n for n, _ in providers]
+            logger.warning("[K线] %s tf=%s 全部源失败: %s", symbol, timeframe, names)
+        return result, src
+
+    # ── 单只行情: race ──────────────────────────────────────────
+
+    def fetch_single_ticker(
+        self,
+        symbol: str,
+        market: str,
+        cb: CircuitBreaker,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """
+        获取单只行情 — 多源并发 race。
+
+        Args:
+            symbol: 股票代码
+            market: 市场类型
+            cb:     熔断器
+
+        Returns:
+            (ticker_dict, source_name) 或 (None, None)
+        """
+        providers = [
+            (p.name, lambda p=p: p.fetch_quote(symbol))
+            for p in get_providers("quote", market=market or None)
+        ]
+        result, src = race(providers, cb)
+        if result:
+            logger.info("[行情] %s 来源=%s", symbol, src)
+        else:
+            names = [n for n, _ in providers]
+            logger.warning("[行情] %s 全部源失败: %s", symbol, names)
+        return result, src
+
+    # ── 批量行情: race 批量接口 + 逐只 fallback ─────────────────
+
+    def fetch_batch_ticker(
+        self,
+        symbols: List[str],
+        market: str,
+        cb: CircuitBreaker,
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        批量行情 — race 批量接口 + 逐只 fallback。
+
+        流程:
+          1. race 多源并发调用 fetch_quotes_batch（一次HTTP取多只）
+          2. 未取到的 symbol fallback 到逐只 race
+
+        Args:
+            symbols: 股票代码列表
+            market:  市场类型
+            cb:      熔断器
+
+        Returns:
+            {symbol: ticker_dict}
+        """
+        providers = get_providers("quote", market=market or None)
+
+        # race 批量接口
+        batch_providers = [
+            (p.name, lambda p=p: p.fetch_quotes_batch(symbols))
+            for p in providers
+        ]
+        batch, src = race(
+            batch_providers, cb,
+            validate=lambda d: bool(d),
+        )
+        if batch:
+            logger.info("[批量行情] %s race 取到 %d/%d 只", src, len(batch), len(symbols))
+        else:
+            logger.info("[批量行情] 所有批量源均失败，fallback 到逐只模式")
+
+        if not batch:
+            batch = {}
+
+        # 逐只 fallback 补齐
+        missing = [s for s in symbols if s not in batch]
+        if missing:
+            filled = 0
+            for sym in missing:
+                try:
+                    data, _ = self.fetch_single_ticker(sym, market, cb)
+                    if data and data.get("last", 0) > 0:
+                        batch[sym] = data
+                        filled += 1
+                except Exception:
+                    pass
+            logger.info("[批量行情] 逐只 fallback 补齐 %d/%d 只", filled, len(missing))
+
+        return batch
+
+    # ── 批量 K线: 动态队列并发 ──────────────────────────────────
 
     def coordinate_kline(
         self,
@@ -169,40 +398,34 @@ class Coordinator:
         failed: List[str] = []
         failed_lock = threading.Lock()
 
-        # per-symbol 失败记录
         symbol_tried: Dict[str, Set[str]] = {}
         symbol_tried_lock = threading.Lock()
 
-        # per-source 连续失败计数（R2: 用锁保护原子性）
         source_consecutive_fails: Dict[str, int] = {}
         fails_lock = threading.Lock()
         MAX_SOURCE_FAILS = 5
 
         def _get_consecutive_fails(name: str) -> int:
-            """获取指定源的连续失败次数"""
             with fails_lock:
                 return source_consecutive_fails.get(name, 0)
 
         def _inc_consecutive_fails(name: str):
-            """递增指定源的连续失败计数"""
             with fails_lock:
                 source_consecutive_fails[name] = source_consecutive_fails.get(name, 0) + 1
 
         def _reset_consecutive_fails(name: str):
-            """重置指定源的连续失败计数 (成功时调用)"""
             with fails_lock:
                 source_consecutive_fails[name] = 0
 
         def _mark_success(sym: str, bars: List[Dict[str, Any]], source_name: str):
-            """标记 symbol 获取成功，写入结果集"""
             with results_lock:
                 results[sym] = bars
 
         def _mark_failed(sym: str, source_name: str):
-            """标记 symbol 在某个源上失败"""
             with results_lock:
                 if sym in results:
-                    return  # 已被其他源成功获取
+                    wq.task_done()
+                    return
 
             with symbol_tried_lock:
                 tried = symbol_tried.setdefault(sym, set())
@@ -210,16 +433,16 @@ class Coordinator:
                 untried = [name for name, _ in source_configs if name not in tried]
 
             if untried:
-                wq.put_back(sym)  # 还有源没试过 → 放回队尾
+                wq.task_done()
+                wq.put_back(sym)
             else:
                 with failed_lock:
                     if sym not in failed:
                         failed.append(sym)
-                wq.task_done()  # 彻底失败，不再重试
+                wq.task_done()
 
         def _fetch_with_timeout(provider: Any, sym: str, tf: str, lim: int,
                                 timeout_s: float) -> Optional[List[Dict[str, Any]]]:
-            """R1: 带超时兜底的 fetch_kline 调用"""
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as task_pool:
                 future = task_pool.submit(provider.fetch_kline, sym, tf, lim)
                 try:
@@ -230,10 +453,6 @@ class Coordinator:
 
         def _process_symbol(sym: str, source_name: str, provider: Any,
                             cfg: SourceConfig) -> bool:
-            """
-            处理单个 symbol。返回是否成功。
-            R4: 每个 symbol 独立 record()。
-            """
             with results_lock:
                 if sym in results:
                     wq.task_done()
@@ -270,7 +489,6 @@ class Coordinator:
                 return False
 
         def _worker(source_name: str, cfg: SourceConfig, provider: Any):
-            """单个源的 worker 循环"""
             while True:
                 if _get_consecutive_fails(source_name) >= MAX_SOURCE_FAILS:
                     break
@@ -286,7 +504,7 @@ class Coordinator:
                 else:
                     sym = wq.get()
                     if sym is None:
-                        break  # 队列空 + 超时 → 退出
+                        break
                     _process_symbol(sym, source_name, provider, cfg)
 
         # 3. 构建线程池
@@ -307,14 +525,11 @@ class Coordinator:
                 for _ in range(tc):
                     futures.append(pool.submit(_worker, name, cfg, provider))
 
-            # 等待所有 worker 完成
             concurrent.futures.wait(futures, timeout=timeout + 2)
 
         # 4. 标记完成 + 收集剩余
         wq.drain_done()
 
-        # 5. 队列中未处理的 symbol 标记为失败
-        # （所有 worker 都退出了但队列里还有 symbol）
         while True:
             sym = wq.get()
             if sym is None:
@@ -326,7 +541,7 @@ class Coordinator:
                 if sym not in failed:
                     failed.append(sym)
 
-        # 6. 打印各源吞吐统计
+        # 5. 打印统计
         stats = " | ".join(cfg.stats_summary() for _, cfg in source_configs)
         logger.info("[协助层] 完成: %d成功 %d失败 | %s", len(results), len(failed), stats)
 
@@ -340,7 +555,6 @@ class Coordinator:
         provider_map: Dict[str, Any],
         cb: CircuitBreaker,
     ) -> List[Tuple[str, SourceConfig]]:
-        """获取支持指定市场且未熔断的源列表，按 effective_weight 降序"""
         if market:
             configs = get_sources_for_market(market)
         else:

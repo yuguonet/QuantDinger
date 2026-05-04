@@ -25,7 +25,7 @@ _co_dir = os.path.dirname(os.path.abspath(__file__))
 if _co_dir not in sys.path:
     sys.path.insert(0, _co_dir)
 
-from trading_day import is_trading_day as _is_trading_day_str
+from app.interfaces.trading_calendar import is_trading_day as _is_trading_day_str
 
 TZ_SH = ZoneInfo("Asia/Shanghai")
 
@@ -75,12 +75,15 @@ _trading_day_ref: frozenset[str] | None = None  # 用于检测缓存是否过期
 def _get_sorted_trading_days() -> list[str]:
     """获取排序后的交易日列表（模块级缓存，避免重复排序）
 
-    自动跟踪 trading_day 模块的缓存刷新：
+    自动跟踪 trading_calendar 模块的缓存刷新：
     如果 frozenset 引用变了（说明 refresh 过），重新排序。
     """
     global _sorted_trading_days, _trading_day_ref
-    from trading_day import get_trading_day_set
-    current = get_trading_day_set()
+    from app.interfaces.trading_calendar import trade_date_range
+    # 2015~明年 覆盖全量历史数据
+    from datetime import datetime
+    end_year = datetime.now().year + 1
+    current = frozenset(trade_date_range("2015-01-01", f"{end_year}-12-31"))
     if current is not _trading_day_ref:
         _sorted_trading_days = sorted(current)
         _trading_day_ref = current

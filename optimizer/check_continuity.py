@@ -173,16 +173,19 @@ def _deduce_trading_days_from_db(market: str, min_stocks: int = 10) -> set[str]:
 
 def _build_trading_day_cache(market: str = "CNStock"):
     """
-    构建交易日集合 — 委托给 trading_day 模块（单例 + DB 持久化 + akshare 增量）。
+    构建交易日集合 — 委托给 trading_calendar 模块（feather 文件 + akshare）。
 
     结果写入 _TRADING_DAY_SET 供内部函数使用。
     """
     global _TRADING_DAY_SET
     if _TRADING_DAY_SET is not None:
         return
-    import trading_day as _td
-    _TRADING_DAY_SET = _td.get_trading_day_set()
-    print(f"📅 交易日历: trading_day 模块（{len(_TRADING_DAY_SET)} 天）")
+    from app.interfaces.trading_calendar import trade_date_range
+    # 2015~明年 覆盖全量历史数据
+    end_year = datetime.now(TZ_SH).year + 1
+    dates = trade_date_range("2015-01-01", f"{end_year}-12-31")
+    _TRADING_DAY_SET = frozenset(dates)
+    print(f"📅 交易日历: trading_calendar 模块（{len(_TRADING_DAY_SET)} 天）")
 
 
 def _is_trading_day(d: str) -> bool:
