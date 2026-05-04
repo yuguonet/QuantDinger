@@ -387,6 +387,13 @@ class Coordinator:
         logger.warning("[协助层] ticker %s 所有源失败", symbol)
         return None
 
+    # ── 纯透传 ────────────────────────────────────────────────────
+
+    @staticmethod
+    def passthrough(fn: Callable, *args, **kwargs):
+        """纯透传，不加任何逻辑"""
+        return fn(*args, **kwargs)
+
     # ── 内部工具 ─────────────────────────────────────────────────
 
     def _get_available_sources(

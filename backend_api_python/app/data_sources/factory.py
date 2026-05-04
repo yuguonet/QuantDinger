@@ -219,3 +219,29 @@ class DataSourceFactory:
         except Exception as e:
             logger.error(f"Failed to fetch ticker {market}:{symbol} (normalized={cls.normalize_market(market or '')}) - {str(e)}")
             return {'last': 0, 'symbol': symbol}
+
+    @classmethod
+    def get_batch_quotes(
+        cls,
+        market: str,
+        symbols: List[str],
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        批量获取当日行情（仅 CNStock 支持，其他市场返回空）。
+
+        Args:
+            market: 市场类型
+            symbols: 股票代码列表
+
+        Returns:
+            {symbol: {"time", "open", "high", "low", "close", "volume", "previousClose"}}
+        """
+        try:
+            m = cls.normalize_market(market or "")
+            source = cls.get_source(m)
+            if hasattr(source, 'get_batch_quotes'):
+                return source.get_batch_quotes(symbols)
+            return {}
+        except Exception as e:
+            logger.error(f"Failed to batch fetch quotes {market} - {str(e)}")
+            return {}

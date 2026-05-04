@@ -27,7 +27,11 @@ from app.data_sources.tencent import (
     fetch_minute_kline,
     tencent_minute_kline_to_dicts,
 )
-from app.data_sources.eastmoney import fetch_eastmoney_batch_quotes
+from app.data_sources.eastmoney import (
+    fetch_eastmoney_batch_quotes,
+    fetch_eastmoney_kline,
+    eastmoney_kline_to_ticker,
+)
 from app.data_sources.asia_stock_kline import (
     normalize_chart_timeframe,
     fetch_twelvedata_klines,
@@ -36,7 +40,6 @@ from app.data_sources.asia_stock_kline import (
     fetch_akshare_weekly_klines,
 )
 from app.data_sources.sina import fetch_sina_kline, sina_kline_to_ticker, fetch_sina_minute_kline
-from app.data_sources.eastmoney import fetch_eastmoney_kline, eastmoney_kline_to_ticker
 from app.data_sources.circuit_breaker import get_realtime_circuit_breaker
 from app.data_sources.cache_manager import (
     get_realtime_cache,
@@ -300,9 +303,8 @@ class CNStockDataSource(BaseDataSource):
     # ----------------------------------------------------------
 
     def get_ticker(self, symbol: str) -> Dict[str, Any]:
-        """获取最新报价 — Coordinator race 模式，所有源并发，第一个成功的返回"""
+        """获取最新报价 — 优先走东财批量接口（1次HTTP），降级走 Coordinator race"""
         code = normalize_cn_code(symbol)  # e.g. "SH600519"
-        raw_code = _strip_cn_prefix(code)  # e.g. "600519"
 
         # 先检查缓存
         cache_key = f"ticker:{code}"
@@ -310,12 +312,35 @@ class CNStockDataSource(BaseDataSource):
         if cached:
             return cached
 
+        # ★ 优先：东财 clist 批量接口（1次HTTP拿全市场，比3路race高效）
+        try:
+            batch = get_coordinator().passthrough(fetch_eastmoney_batch_quotes, [code])
+            q = batch.get(code)
+            if q and q.get("close", 0) > 0:
+                prev = q.get("previousClose", 0)
+                last = q["close"]
+                result = {
+                    "last": last,
+                    "change": round(last - prev, 4) if prev else 0,
+                    "changePercent": round((last - prev) / prev * 100, 2) if prev else 0,
+                    "high": q["high"],
+                    "low": q["low"],
+                    "open": q["open"],
+                    "previousClose": prev,
+                    "symbol": code,
+                }
+                self.realtime_cache.set(cache_key, result, ttl=600)
+                return result
+        except Exception as e:
+            logger.debug(f"[行情] 东财批量接口降级 {code}: {e}")
+
+        # 降级：Coordinator race 模式，所有源并发，第一个成功的返回
         result = get_coordinator().coordinate_ticker(
             symbol=code,
             sources=[
                 ("tencent_quote", lambda sym: tencent_quote_to_ticker(sym)),
                 ("sina_quote", lambda sym: sina_kline_to_ticker(sym)),
-                ("eastmoney_quote", lambda sym: eastmoney_kline_to_ticker(_strip_cn_prefix(sym))),
+                ("eastmoney_quote", lambda sym: eastmoney_kline_to_ticker(_strip_cn_prefix(code))),
             ],
             cb=self.circuit_breaker,
             timeout=min(_get_timeout(), 8),
@@ -327,6 +352,14 @@ class CNStockDataSource(BaseDataSource):
 
         logger.warning(f"[行情] 所有数据源均失败: {symbol}")
         return {"last": 0, "symbol": code}
+
+    # ----------------------------------------------------------
+    # 批量当日行情（供 K 线服务合成当日 K 线用）
+    # ----------------------------------------------------------
+
+    def get_batch_quotes(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+        """批量获取当日行情 — 透传东财 clist 接口"""
+        return get_coordinator().passthrough(fetch_eastmoney_batch_quotes, symbols)
 
     # ----------------------------------------------------------
     # K线数据 — 统一走 Coordinator

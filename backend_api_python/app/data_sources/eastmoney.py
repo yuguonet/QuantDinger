@@ -607,6 +607,7 @@ def fetch_eastmoney_batch_quotes(
             high = float(item.get("f15", 0))
             low = float(item.get("f16", 0))
             vol = float(item.get("f5", 0))
+            prev_close = float(item.get("f18", 0))
             result[sym] = {
                 "time": today_ts,
                 "open": round(open_p, 4),
@@ -614,6 +615,7 @@ def fetch_eastmoney_batch_quotes(
                 "low": round(low, 4),
                 "close": round(last, 4),
                 "volume": round(vol, 2),
+                "previousClose": round(prev_close, 4),
             }
         except (ValueError, TypeError):
             continue
