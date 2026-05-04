@@ -1,387 +1,221 @@
-# -*- coding: utf-8 -*-
 """
-DataSourceFactory — 去重 / 复权 / 市场解析 / 统一入口
-
-定位:
-  KlineService(缓存层) → DataSourceFactory(本层) → Coordinator(调度层)
-
-职责:
-  1. 请求去重: InflightDedup 防止同一 symbol 并发重复请求
-  2. 复权:     统一调用 adjust_kline 处理前/后复权
-  3. 市场解析: resolve_market / normalize_symbols
-  4. 统一入口: 所有外部调用方只与本层交互
-
-不负责:
-  - 调度策略（fallback / race / 并发）→ 委托给 Coordinator
-  - 直接与 Provider 通信 → 委托给 Coordinator
-  - 缓存读写（由 KlineService 处理）
-
-调用链:
-  单只K线:  Factory.fetch_kline → dedup → Coordinator.fetch_single_kline → adjust
-  批量K线:  Factory.fetch_kline_batch → Coordinator.coordinate_kline → adjust
-  单只行情: Factory.fetch_ticker → dedup → Coordinator.fetch_single_ticker
-  批量行情: Factory.fetch_ticker_batch → Coordinator.fetch_batch_ticker
+数据源工厂
+根据市场类型返回对应的数据源
 """
+from typing import Dict, List, Any, Optional
 
-from __future__ import annotations
-
-import threading
-import concurrent.futures
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
-
-from app.data_sources.adjustment import adjust_kline
-from app.data_sources.circuit_breaker import CircuitBreaker, get_realtime_circuit_breaker
-from app.data_sources.coordinator import get_coordinator
-from app.data_sources.normalizer import detect_market, to_canonical, normalize_hk_code
-from app.data_sources.provider import get_providers
+from app.data_sources.base import BaseDataSource
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-T = TypeVar("T")
-
-
-# ================================================================
-# 请求去重 — 同一 symbol 正在取时，等结果不重复发
-# ================================================================
-
-class InflightDedup:
-    """
-    请求去重器。
-
-    如果 symbol A 正在被某个线程取数据，其他线程对 A 的请求
-    直接等结果，不重复发 API 调用。
-    """
-
-    def __init__(self, max_workers: int = 4):
-        self._lock = threading.Lock()
-        self._inflight: Dict[str, concurrent.futures.Future] = {}
-        self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=max_workers, thread_name_prefix="dedup",
-        )
-
-    def get_or_submit(self, key: str, fn: Callable[[], T]) -> T:
-        with self._lock:
-            if key in self._inflight:
-                future = self._inflight[key]
-            else:
-                future = self._executor.submit(fn)
-                self._inflight[key] = future
-
-        try:
-            return future.result(timeout=30)
-        finally:
-            with self._lock:
-                if key in self._inflight and self._inflight[key] is future:
-                    del self._inflight[key]
-
-
-# ================================================================
-# 市场类型
-# ================================================================
-
-MARKET_CN_STOCK = "CNStock"
-MARKET_HK_STOCK = "HKStock"
-MARKET_US_STOCK = "USStock"
-MARKET_CRYPTO   = "Crypto"
-MARKET_FOREX    = "Forex"
-MARKET_FUTURES  = "Futures"
-
-_MARKET_ALIASES = {
-    "CNStock":  MARKET_CN_STOCK,
-    "HKStock":  MARKET_HK_STOCK,
-    "USStock":  MARKET_US_STOCK,
-    "Crypto":   MARKET_CRYPTO,
-    "Forex":    MARKET_FOREX,
-    "Futures":  MARKET_FUTURES,
-    "CN":       MARKET_CN_STOCK,
-    "HK":       MARKET_HK_STOCK,
-    "US":       MARKET_US_STOCK,
-    "A":        MARKET_CN_STOCK,
-    "A股":      MARKET_CN_STOCK,
-    "港股":     MARKET_HK_STOCK,
-    "美股":     MARKET_US_STOCK,
-    "加密":     MARKET_CRYPTO,
-    "外汇":     MARKET_FOREX,
-    "期货":     MARKET_FUTURES,
+# 小写 / 别名 -> 与 _create_source 一致的 PascalCase key
+_MARKET_ALIASES: Dict[str, str] = {
+    "crypto": "Crypto",
+    "cryptocurrency": "Crypto",
+    "forex": "Forex",
+    "fx": "Forex",
+    "usstock": "USStock",
+    "us_stocks": "USStock",
+    "stock": "USStock",
+    "cnstock": "CNStock",
+    "hkstock": "HKStock",
+    "futures": "Futures",
 }
 
 
-def _resolve_market(market: str, symbol: str) -> str:
-    if market:
-        return _MARKET_ALIASES.get(market, market)
-
-    s = (symbol or "").strip().upper()
-    if "/" in s:
-        return MARKET_CRYPTO
-
-    exchange, _ = detect_market(symbol)
-    if exchange in ("SH", "SZ", "BJ"):
-        return MARKET_CN_STOCK
-    if exchange == "HK":
-        return MARKET_HK_STOCK
-
-    return ""
-
-
-def _parse_symbols(symbol: str) -> List[str]:
-    return [s.strip() for s in symbol.split(",") if s.strip()]
-
-
-def _normalize_symbols(symbols: List[str], market: str) -> List[str]:
-    result = []
-    for sym in symbols:
-        if market == "HKStock":
-            result.append(normalize_hk_code(sym))
-        else:
-            canon = to_canonical(sym)
-            result.append(canon if canon else sym)
-    return result
-
-
-# ================================================================
-# DataSourceFactory — 去重 / 复权 / 市场解析 / 统一入口
-# ================================================================
-
 class DataSourceFactory:
     """
-    数据源工厂层 — 统一入口。
-
-    负责去重、复权、市场解析，调度全部委托 Coordinator。
+    数据源工厂。
+    K 线 / 报价 使用哪个接口完全由调用方传入的 market（与自选分类一致）决定，不做根据 symbol 字符串的推断。
     """
+    
+    _sources: Dict[str, BaseDataSource] = {}
+    
+    @classmethod
+    def normalize_market(cls, market: str) -> str:
+        """统一市场枚举大小写与别名，供路由与数据源入口使用。"""
+        if not market:
+            return "Crypto"
+        raw = str(market).strip()
+        if raw in ("Crypto", "Forex", "Futures", "USStock", "CNStock", "HKStock"):
+            return raw
+        key = raw.lower().replace(" ", "").replace("-", "_")
+        return _MARKET_ALIASES.get(key, raw)
 
-    def __init__(self):
-        self._cb = get_realtime_circuit_breaker()
-        self._dedup = InflightDedup()
-        self._coordinator = get_coordinator()
+    @classmethod
+    def get_source(cls, market: str) -> BaseDataSource:
+        """
+        获取指定市场的数据源
+        
+        Args:
+            market: 市场类型 (Crypto, USStock, Forex, Futures, CNStock, HKStock)
+            
+        Returns:
+            数据源实例
+        """
+        market = cls.normalize_market(market or "")
+        if market not in cls._sources:
+            cls._sources[market] = cls._create_source(market)
+        return cls._sources[market]
 
-    # ═══════════════════════════════════════════════════════════════════
-    #  K线 — 单只
-    # ═══════════════════════════════════════════════════════════════════
+    @classmethod
+    def get_data_source(cls, name: str) -> BaseDataSource:
+        """
+        Backward compatible alias used by older code paths.
 
-    def fetch_kline(
-        self,
-        symbol: str,
-        timeframe: str,
-        limit: int,
-        market: str,
-        adj: str = "qfq",
-    ) -> Optional[List[Dict[str, Any]]]:
-        """获取单只K线 — 去重 + Coordinator fallback + 复权"""
-        raw = self.fetch_kline_raw(symbol, timeframe, limit, market)
-        if raw:
-            return adjust_kline(symbol, raw, adj)
-        return None
-
-    def fetch_kline_raw(
-        self, symbol: str, timeframe: str, limit: int, market: str,
-    ) -> Optional[List]:
-        """获取单只K线原始数据 — 去重 + Coordinator fallback，不复权"""
-        return self._dedup.get_or_submit(
-            f"kline:{symbol}:{timeframe}:{limit}",
-            lambda: self._coordinator.fetch_single_kline(
-                symbol, timeframe, limit, market, self._cb,
-            )[0],
-        )
-
-    # ═══════════════════════════════════════════════════════════════════
-    #  K线 — 批量
-    # ═══════════════════════════════════════════════════════════════════
-
-    def fetch_kline_batch(
-        self,
-        symbols: List[str],
-        timeframe: str,
-        limit: int,
-        market: str,
-        adj: str = "qfq",
-        on_raw_data: Optional[Callable[[str, List[Dict[str, Any]]], None]] = None,
-    ) -> Dict[str, List[Dict[str, Any]]]:
-        """批量K线 — Coordinator 并发协调 + 统一复权"""
-        from app.data_sources.provider import get_providers as _gp
-        providers = _gp("kline", timeframe=timeframe, market=market or None)
-
-        fetched, failed = self._coordinator.coordinate_kline(
-            symbols=symbols,
-            timeframe=timeframe,
-            limit=limit,
-            providers=providers,
-            cb=self._cb,
-            market=market,
-        )
-
-        if failed:
-            logger.warning(
-                f"[批量K线] {len(failed)} 只所有源均失败: "
-                f"{failed[:5]}{'...' if len(failed) > 5 else ''}"
-            )
-
-        result = {}
-        for sym, bars in fetched.items():
-            if bars:
-                if on_raw_data is not None:
-                    try:
-                        on_raw_data(sym, bars)
-                    except Exception as e:
-                        logger.warning("[批量K线] on_raw_data 回调失败 %s: %s", sym, e)
-                result[sym] = adjust_kline(sym, bars, adj)
-
-        logger.info("[批量K线] DataSourceFactory: %d/%d 成功", len(result), len(symbols))
-        return result
-
-    # ═══════════════════════════════════════════════════════════════════
-    #  行情 — 单只
-    # ═══════════════════════════════════════════════════════════════════
-
-    def fetch_ticker(
-        self,
-        symbol: str,
-        market: str,
-    ) -> Optional[Dict[str, Any]]:
-        """获取单只行情 — 去重 + Coordinator race"""
-        return self._dedup.get_or_submit(
-            f"ticker:{symbol}",
-            lambda: self._coordinator.fetch_single_ticker(
-                symbol, market, self._cb,
-            )[0],
-        )
-
-    # ═══════════════════════════════════════════════════════════════════
-    #  行情 — 批量
-    # ═══════════════════════════════════════════════════════════════════
-
-    def fetch_ticker_batch(
-        self,
-        symbols: List[str],
-        market: str,
-    ) -> Dict[str, Dict[str, Any]]:
-        """批量行情 — Coordinator race 批量接口 + 逐只 fallback"""
-        return self._coordinator.fetch_batch_ticker(symbols, market, self._cb)
-
-    # ═══════════════════════════════════════════════════════════════════
-    #  公共工具
-    # ═══════════════════════════════════════════════════════════════════
-
-    @staticmethod
-    def resolve_market(market: str, symbol: str) -> str:
-        return _resolve_market(market, symbol)
-
-    @staticmethod
-    def parse_symbols(symbol: str) -> List[str]:
-        return _parse_symbols(symbol)
-
-    @staticmethod
-    def normalize_symbols(symbols: List[str], market: str) -> List[str]:
-        return _normalize_symbols(symbols, market)
-
-    def source_stats(self) -> Dict[str, Any]:
-        from app.data_sources.source_config import get_all_enabled_sources
-        return {
-            cfg.name: {
-                "qps": round(cfg.throughput, 2),
-                "success_rate": round(cfg.success_rate, 3),
-                "avg_latency": round(cfg.avg_latency, 3),
-                "effective_weight": round(cfg.effective_weight(), 2),
-                "max_workers": cfg.max_workers,
-                "markets": list(cfg.markets),
-            }
-            for cfg in get_all_enabled_sources()
-        }
-
-
-# ================================================================
-# SourceAdapter — 兼容旧 BaseDataSource 接口
-# ================================================================
-
-class SourceAdapter:
-    """适配器：包装 Factory，暴露旧 BaseDataSource 接口"""
-
-    def __init__(self, market: str):
-        self._market = market
-        self._factory = get_factory()
-
+        Some modules historically called `get_data_source("binance")` to fetch a crypto data source.
+        In the localized Python backend we primarily use `get_source("Crypto")`.
+        """
+        key = (name or "").strip().lower()
+        if key in ("crypto", "binance", "okx", "bybit", "bitget", "kucoin", "gate", "mexc", "kraken", "coinbase"):
+            return cls.get_source("Crypto")
+        if key in ("futures",):
+            return cls.get_source("Futures")
+        if key in ("forex", "fx"):
+            return cls.get_source("Forex")
+        # Default to Crypto for safety (most callers want a ticker for crypto pairs).
+        return cls.get_source("Crypto")
+    
+    @classmethod
+    def _create_source(cls, market: str) -> BaseDataSource:
+        """创建数据源实例"""
+        if market == 'Crypto':
+            from app.data_sources.crypto import CryptoDataSource
+            return CryptoDataSource()
+        elif market == 'CNStock':
+            from app.data_sources.cn_stock import CNStockDataSource
+            # 返回 AStockDataSource（继承 CNStockDataSource，补充龙虎榜/热榜/涨跌停池等扩展方法）
+            try:
+                from app.interfaces.cn_stock_extent import AStockDataSource
+                return AStockDataSource()
+            except ImportError:
+                return CNStockDataSource()
+        elif market == 'HKStock':
+            from app.data_sources.hk_stock import HKStockDataSource
+            return HKStockDataSource()
+        elif market == 'USStock':
+            from app.data_sources.us_stock import USStockDataSource
+            return USStockDataSource()
+        elif market == 'Forex':
+            from app.data_sources.forex import ForexDataSource
+            return ForexDataSource()
+        elif market == 'Futures':
+            from app.data_sources.futures import FuturesDataSource
+            return FuturesDataSource()
+        else:
+            raise ValueError(f"不支持的市场类型: {market}")
+    
+    @classmethod
     def get_kline(
-        self,
+        cls,
+        market: str,
         symbol: str,
         timeframe: str,
         limit: int,
         before_time: Optional[int] = None,
         after_time: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        raw = self._factory.fetch_kline_raw(symbol, timeframe, limit, self._market)
-        if not raw:
+        """
+        获取K线数据的便捷方法
+
+        Args:
+            market: 市场类型
+            symbol: 交易对/股票代码
+            timeframe: 时间周期
+            limit: 数据条数
+            before_time: 获取此时间之前的数据
+            after_time: 可选，Unix 秒，K 线 time 需 >= 此值（回测左边界）
+            
+        Returns:
+            K线数据列表
+        """
+        try:
+            m = cls.normalize_market(market or "")
+            source = cls.get_source(m)
+            klines = source.get_kline(symbol, timeframe, limit, before_time, after_time)
+            
+            # 确保数据按时间排序
+            klines.sort(key=lambda x: x['time'])
+            
+            return klines
+        except Exception as e:
+            logger.error(f"Failed to fetch K-lines {market}:{symbol} (normalized={cls.normalize_market(market or '')}) - {str(e)}")
             return []
-        adjusted = adjust_kline(symbol, raw, "qfq")
-        if after_time and adjusted:
-            adjusted = [b for b in adjusted if b.get("time", 0) >= after_time]
-        if before_time and adjusted:
-            adjusted = [b for b in adjusted if b.get("time", 0) < before_time]
-        adjusted.sort(key=lambda x: x.get("time", 0))
-        return adjusted
 
-    def get_ticker(self, symbol: str) -> Dict[str, Any]:
-        result = self._factory.fetch_ticker(symbol, self._market)
-        return result or {"last": 0, "symbol": symbol}
+    @classmethod
+    def get_kline_batch(
+        cls,
+        market: str,
+        symbols: List[str],
+        timeframe: str,
+        limit: int,
+        cached_symbols: Optional[set] = None,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        批量获取多只股票的 K 线数据。
 
+        一次调用返回所有成功拉取的 symbol → klines 映射，
+        内部串行调用底层数据源（K 线 API 不支持多股拼请求）。
 
-# ================================================================
-# classmethod 兼容层
-# ================================================================
+        Args:
+            market: 市场类型
+            symbols: 股票代码列表
+            timeframe: 时间周期
+            limit: 数据条数
+            cached_symbols: 已有缓存的 symbol 集合（用于优化：有缓存的只补当日）
 
-def _cm_get_kline(
-    cls, market: str, symbol: str, timeframe: str, limit: int,
-    before_time: Optional[int] = None, after_time: Optional[int] = None,
-) -> List[Dict[str, Any]]:
-    source = SourceAdapter(market)
-    return source.get_kline(symbol, timeframe, limit, before_time, after_time)
+        Returns:
+            {symbol: [kline_bars]} — 仅包含成功返回非空数据的 symbol
+        """
+        try:
+            m = cls.normalize_market(market or "")
+            if not m or not symbols:
+                return {}
+            source = cls.get_source(m)
+            if hasattr(source, 'get_kline_batch'):
+                return source.get_kline_batch(symbols, timeframe, limit, cached_symbols=cached_symbols)
+            # fallback: 串行逐只拉取
+            result: Dict[str, List[Dict[str, Any]]] = {}
+            for sym in symbols:
+                try:
+                    klines = source.get_kline(sym, timeframe, limit)
+                    if klines:
+                        klines.sort(key=lambda x: x['time'])
+                        result[sym] = klines
+                except Exception as e:
+                    logger.warning(f"Batch fetch failed for {market}:{sym} - {e}")
 
-
-def _cm_get_kline_batch(
-    cls, market: str, symbols: List[str], timeframe: str, limit: int,
-    cached_symbols: Optional[set] = None,
-) -> Dict[str, List[Dict[str, Any]]]:
-    resolved = _resolve_market(market, symbols[0] if symbols else "")
-    return _factory.fetch_kline_batch(symbols, timeframe, limit, resolved)
-
-
-def _cm_get_ticker(cls, market: str, symbol: str) -> Dict[str, Any]:
-    resolved = _resolve_market(market, symbol)
-    result = _factory.fetch_ticker(symbol, resolved)
-    return result or {"last": 0, "symbol": symbol}
-
-
-def _cm_get_source(cls, market: str) -> SourceAdapter:
-    return SourceAdapter(market)
-
-
-def _cm_get_data_source(cls, name: str) -> SourceAdapter:
-    key = (name or "").strip().lower()
-    market_map = {
-        "crypto": "Crypto", "binance": "Crypto", "okx": "Crypto",
-        "bybit": "Crypto", "bitget": "Crypto", "kucoin": "Crypto",
-        "gate": "Crypto", "mexc": "Crypto", "kraken": "Crypto", "coinbase": "Crypto",
-        "futures": "Futures", "forex": "Forex", "fx": "Forex",
-        "cnstock": "CNStock", "hkstock": "HKStock", "usstock": "USStock",
-    }
-    market = market_map.get(key, "Crypto")
-    return SourceAdapter(market)
-
-
-DataSourceFactory.get_kline = classmethod(_cm_get_kline)           # type: ignore
-DataSourceFactory.get_kline_batch = classmethod(_cm_get_kline_batch)  # type: ignore
-DataSourceFactory.get_ticker = classmethod(_cm_get_ticker)         # type: ignore
-DataSourceFactory.get_source = classmethod(_cm_get_source)         # type: ignore
-DataSourceFactory.get_data_source = classmethod(_cm_get_data_source)  # type: ignore
-DataSourceFactory.normalize_market = staticmethod(_resolve_market)  # type: ignore
-
-
-# ================================================================
-# 全局实例
-# ================================================================
-
-_factory = DataSourceFactory()
-
-
-def get_factory() -> DataSourceFactory:
-    """获取全局 DataSourceFactory 实例"""
-    return _factory
+            logger.info(f"Batch fetch {market} {timeframe}: {len(result)}/{len(symbols)} succeeded (serial)")
+            return result
+        except Exception as e:
+            logger.error(f"Failed to batch fetch K-lines {market} - {str(e)}")
+            return {}
+    
+    @classmethod
+    def get_ticker(cls, market: str, symbol: str) -> Dict[str, Any]:
+        """
+        获取实时报价的便捷方法
+        
+        Args:
+            market: 市场类型
+            symbol: 交易对/股票代码
+            
+        Returns:
+            实时报价数据: {
+                'last': 最新价,
+                'change': 涨跌额,
+                'changePercent': 涨跌幅,
+                ...
+            }
+        """
+        try:
+            m = cls.normalize_market(market or "")
+            source = cls.get_source(m)
+            return source.get_ticker(symbol)
+        except NotImplementedError:
+            logger.warning(f"get_ticker not implemented for market: {market}")
+            return {'last': 0, 'symbol': symbol}
+        except Exception as e:
+            logger.error(f"Failed to fetch ticker {market}:{symbol} (normalized={cls.normalize_market(market or '')}) - {str(e)}")
+            return {'last': 0, 'symbol': symbol}

@@ -91,3 +91,4 @@ optimizer/strategies/
 data_tdx/
 optimizer_output/
 backend_api_python/cache/
+backend_api_python/app/interfaces/calendar/

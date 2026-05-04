@@ -22,7 +22,7 @@ from typing import Any, Dict, List
 import requests
 
 from app.data_sources.rate_limiter import get_request_headers
-from app.market_cn.market_schema import (
+from app.data_sources.normalizer import (
     normalize_market_snapshot,
     normalize_zt_pool,
     normalize_dt_pool,
