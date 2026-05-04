@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-🚀 A股全量K线数据下载 - 支持通达信/BaoStock双数据源
+🚀 A股全量K线数据下载 - 支持通达信/BaoStock/AKShare多数据源
 
 数据源:
   tdx       - 通达信协议直连，支持全部周期（日线+分钟线），无需API Key
   baostock  - 证券宝HTTP API，仅支持日线（免费、稳定），分钟线自动回退tdx
+  akshare   - AKShare(东方财富) API，支持分钟线前复权（15m推荐），日线走tdx
   both      - 双源模式：日线优先baostock，失败回退tdx；分钟线走tdx
 
 实测性能 (tdx, 串行, 单连接):
@@ -18,6 +19,8 @@
   python tdx_download.py -T 1D --source both              # 日线 (双源, 优先baostock)
   python tdx_download.py -T 1m                            # 1分钟线 (仅tdx)
   python tdx_download.py -T 15m                           # 15分钟线 (仅tdx)
+  python tdx_download.py -T 15m --source akshare          # 15分钟线 (akshare, 前复权)
+  python tdx_download.py -T 15m --source both             # 15分钟线 (双源, 优先akshare)
   python tdx_download.py -T all_min                       # 全部分钟线
   python tdx_download.py -T 1D -s 2021-01-01              # 指定起始日期
   python tdx_download.py -T 1D -s 2021-01-01 -e 2026-05-01
@@ -310,6 +313,135 @@ def _worker_daily_baostock(args):
             bs.logout()
         except Exception:
             pass
+
+    return results
+
+
+def _import_akshare():
+    """延迟导入 akshare"""
+    try:
+        import akshare as ak
+        return ak
+    except ImportError:
+        raise ImportError("akshare 未安装，请执行: pip install akshare")
+
+
+def get_stock_list_akshare():
+    """从 AKShare 获取全部A股代码 (东方财富数据源)"""
+    ak = _import_akshare()
+    df = ak.stock_zh_a_spot_em()
+    a_shares = []
+    for _, row in df.iterrows():
+        code = str(row['代码']).strip()
+        name = str(row['名称']).strip()
+        if not code:
+            continue
+        if not code.startswith(('00', '30', '60', '68', '83', '87', '43')):
+            continue
+        market = 1 if code.startswith(('60', '68')) else 0
+        a_shares.append((market, code, name))
+
+    seen = set()
+    unique = []
+    for m, c, n in a_shares:
+        if c not in seen:
+            seen.add(c)
+            unique.append((m, c, n))
+
+    cnt = {'00': 0, '30': 0, '60': 0, '68': 0, '83': 0, '87': 0, '43': 0, 'other': 0}
+    for _, c, _ in unique:
+        prefix = c[:2]
+        if prefix in cnt:
+            cnt[prefix] += 1
+        else:
+            cnt['other'] += 1
+    print(f"    主板(00): {cnt['00']}  创业板(30): {cnt['30']}  "
+          f"主板(60): {cnt['60']}  科创板(68): {cnt['68']}  "
+          f"北交所(83/87/43): {cnt['83']+cnt['87']+cnt['43']}  其他: {cnt['other']}")
+
+    return unique
+
+
+# ═══════════════════════════════════════════════════════
+# AKShare 数据源 (东方财富, 支持分钟线前复权)
+# ═══════════════════════════════════════════════════════
+
+def _worker_15m_akshare(args):
+    """工作进程: 通过 AKShare 下载15分钟线 (东方财富, 前复权)
+
+    akshare 的 stock_zh_a_hist_min_em 接口:
+      - symbol: 股票代码 (如 "000001")
+      - start_date / end_date: "YYYY-MM-DD HH:MM:SS"
+      - period: "15"
+      - adjust: "qfq" (前复权) / "hfq" (后复权) / "" (不复权)
+    返回 DataFrame 列: 时间, 开盘, 收盘, 最高, 最低, 成交量, 成交额, 振幅, 涨跌幅, 涨跌额, 换手率
+
+    注意: 东方财富分钟线数据仅保留近3年左右，超出范围无数据。
+    返回: [(code, name, rows, status), ...]
+    """
+    stocks, worker_id, start_date, end_date, out_dir, done_codes = args
+
+    ak = _import_akshare()
+
+    ak_start = f"{start_date} 09:30:00"
+    ak_end = f"{end_date} 15:00:00"
+
+    results = []
+
+    for market, code, name in stocks:
+        if code in done_codes:
+            continue
+        for retry in range(3):
+            try:
+                df = ak.stock_zh_a_hist_min_em(
+                    symbol=code,
+                    start_date=ak_start,
+                    end_date=ak_end,
+                    period="15",
+                    adjust="qfq",  # 前复权
+                )
+
+                if df is None or df.empty:
+                    results.append((code, name, 0, "empty"))
+                    break
+
+                filtered = []
+                for _, row in df.iterrows():
+                    try:
+                        dt_str = str(row['时间']).strip()
+                        o = float(row['开盘'])
+                        c = float(row['收盘'])
+                        h = float(row['最高'])
+                        low = float(row['最低'])
+                        v = float(row['成交量'])
+                        amount = float(row['成交额'])
+                        if o == 0 and c == 0:
+                            continue
+                        filtered.append((dt_str, o, c, h, low, v, amount))
+                    except (ValueError, TypeError, KeyError):
+                        continue
+
+                if filtered:
+                    path = os.path.join(out_dir, f"{code}_15min.csv")
+                    with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+                        w = csv.writer(f)
+                        w.writerow(['datetime', 'open', 'close', 'high', 'low', 'volume', 'amount'])
+                        for row in filtered:
+                            w.writerow(row)
+                    results.append((code, name, len(filtered), "success"))
+                else:
+                    results.append((code, name, 0, "empty"))
+                break
+            except Exception as e:
+                err_msg = str(e)
+                if '该股票' in err_msg or '暂无数据' in err_msg or 'None' in err_msg:
+                    results.append((code, name, 0, "empty"))
+                    break
+                if retry == 2:
+                    results.append((code, name, 0, "failed"))
+                    logger.warning("[AKShare] %s(%s) 失败: %s", code, name, e)
+                else:
+                    time.sleep(2 * (retry + 1))  # 递增等待: 2s, 4s
 
     return results
 
@@ -875,7 +1007,12 @@ def parallel_download(stocks, worker_fn, out_dir, workers, tracker=None, **extra
 # ═══════════════════════════════════════════════════════
 
 def run_daily(out_dir, start_date, end_date, workers, no_resume=False, retry_failed=False, source='tdx'):
-    source_label = {'tdx': '通达信', 'baostock': 'BaoStock', 'both': '双源(优先BaoStock)'}
+    # akshare 仅支持分钟线，日线自动回退 tdx
+    if source == 'akshare':
+        print(f"\n  ⚠️  AKShare 日线下载暂未实现，自动切换为通达信")
+        source = 'tdx'
+
+    source_label = {'tdx': '通达信', 'baostock': 'BaoStock', 'akshare': 'AKShare(东方财富)', 'both': '双源(优先BaoStock)'}
     print(f"\n{'='*55}")
     print(f"  📊 日线全量下载 [{source_label.get(source, source)}]")
     print(f"  日期: {start_date} → {end_date}  进程: {workers}")
@@ -969,11 +1106,24 @@ def run_minute(out_dir, freq, start_date, end_date, workers, no_resume=False, re
     freq_name = {0: '5分钟', 1: '15分钟', 4: '1分钟', 5: '30分钟', 6: '60分钟'}
     fname = {0: '5m', 1: '15m', 4: '1m', 5: '30m', 6: '60m'}
 
+    # akshare 仅支持15分钟线，其他周期自动回退 tdx
+    if source == 'akshare' and freq != 1:
+        print(f"\n  ⚠️  AKShare 仅支持15分钟线，{freq_name.get(freq, '')}自动切换为通达信下载")
+        source = 'tdx'
     if source == 'baostock':
         print(f"\n  ⚠️  BaoStock 不支持分钟线，自动切换为通达信下载")
+        source = 'tdx'
+
+    # 确定实际使用的数据源和标签
+    if source == 'akshare':
+        source_label = 'AKShare(东方财富, 前复权)'
+    elif source == 'both' and freq == 1:
+        source_label = '双源(优先AKShare)'
+    else:
+        source_label = '通达信'
 
     print(f"\n{'='*55}")
-    print(f"  📊 {freq_name.get(freq, '')}线全量下载 [通达信]")
+    print(f"  📊 {freq_name.get(freq, '')}线全量下载 [{source_label}]")
     print(f"  日期: {start_date} → {end_date}  进程: {workers}")
     print(f"{'='*55}")
 
@@ -997,29 +1147,69 @@ def run_minute(out_dir, freq, start_date, end_date, workers, no_resume=False, re
         if done_count > 0:
             print(f"\n  💾 检测到断点记录: 已完成 {done_count} 只 (其中 {failed_count} 只失败待重试)")
 
-    if source in ('baostock', 'both'):
+    # 获取股票列表
+    # akshare/baostock 仅用于特定数据源，非 15m 分钟线始终走 tdx
+    need_akshare_list = (source in ('akshare', 'both') and freq == 1)
+    need_baostock_list = (source in ('baostock', 'both') and not need_akshare_list)
+
+    if need_akshare_list:
+        print("\n[1/3] 获取A股列表 (AKShare/东方财富)...")
+        try:
+            stocks = get_stock_list_akshare()
+        except Exception as e:
+            if source == 'both':
+                print(f"  ⚠️  AKShare 获取列表失败({e})，回退通达信...")
+                stocks = get_stock_list()
+            else:
+                raise
+    elif need_baostock_list:
         print("\n[1/3] 获取A股列表 (BaoStock)...")
         try:
             stocks = get_stock_list_baostock()
         except Exception as e:
-            if source == 'both':
-                print(f"  ⚠️  BaoStock 获取列表失败({e})，回退通达信...")
-                stocks = get_stock_list()
-            else:
-                print(f"  ⚠️  BaoStock 获取列表失败({e})，回退通达信...")
-                stocks = get_stock_list()
+            print(f"  ⚠️  BaoStock 获取列表失败({e})，回退通达信...")
+            stocks = get_stock_list()
     else:
         print("\n[1/3] 获取A股列表 (通达信)...")
         stocks = get_stock_list()
     print(f"  共 {len(stocks)} 只A股")
 
-    # 分钟线始终走通达信
-    print(f"\n[2/3] 开始下载 (通达信)...")
-    success, fail, total_rows, elapsed = parallel_download(
-        stocks, _worker_minute, out, workers,
-        tracker=tracker,
-        freq=freq, start_date=start_date, end_date=end_date,
-    )
+    # 下载分钟线
+    if source == 'akshare' and freq == 1:
+        # akshare 15分钟线 (前复权)
+        print(f"\n[2/3] 开始下载 (AKShare/东方财富, 前复权)...")
+        success, fail, total_rows, elapsed = parallel_download(
+            stocks, _worker_15m_akshare, out, workers,
+            tracker=tracker,
+            start_date=start_date, end_date=end_date,
+        )
+    elif source == 'both' and freq == 1:
+        # 双源模式: 先 akshare，失败的再 tdx 补下
+        print(f"\n[2/3] 开始下载 (AKShare 优先)...")
+        success, fail, total_rows, elapsed = parallel_download(
+            stocks, _worker_15m_akshare, out, workers,
+            tracker=tracker,
+            start_date=start_date, end_date=end_date,
+        )
+        if fail > 0:
+            print(f"\n  🔄 AKShare 有 {fail} 只失败/无数据，尝试通达信补下...")
+            tdx_success, tdx_fail, tdx_rows, tdx_elapsed = parallel_download(
+                stocks, _worker_minute, out, workers,
+                tracker=tracker,
+                freq=freq, start_date=start_date, end_date=end_date,
+            )
+            success += tdx_success
+            fail = tdx_fail
+            total_rows += tdx_rows
+            elapsed += tdx_elapsed
+    else:
+        # 通达信 (默认)
+        print(f"\n[2/3] 开始下载 (通达信)...")
+        success, fail, total_rows, elapsed = parallel_download(
+            stocks, _worker_minute, out, workers,
+            tracker=tracker,
+            freq=freq, start_date=start_date, end_date=end_date,
+        )
 
     print(f"\n  ✅ 成功: {success}  ❌ 失败: {fail}")
     print(f"  📈 总行数: {total_rows:,}")
@@ -1322,12 +1512,13 @@ def main():
   60m     - 60分钟线
   all_min - 全部分钟线 (1m+5m+15m+30m+60m)''')
     ap.add_argument('--source', '-S',
-        choices=['tdx', 'baostock', 'both'],
+        choices=['tdx', 'baostock', 'akshare', 'both'],
         default='tdx',
         help='''数据源 (默认tdx):
   tdx       - 通达信协议直连, 支持全部周期
   baostock  - 证券宝HTTP API, 仅支持日线, 分钟线自动回退tdx
-  both      - 双源模式: 日线优先baostock, 失败回退tdx; 分钟线走tdx''')
+  akshare   - AKShare(东方财富), 支持15分钟线前复权, 其他周期自动回退tdx
+  both      - 双源模式: 日线优先baostock, 15m优先akshare, 失败回退tdx''')
     ap.add_argument('--start', '-s', default='', help='起始日期, 如 2021-01-01 (优先于--years)')
     ap.add_argument('--end', '-e', default='', help='截止日期, 如 2026-05-01 (默认今天)')
     ap.add_argument('--years', '-y', type=int, default=5, help='年限 (默认5, 若指定--start则忽略)')
@@ -1348,7 +1539,7 @@ def main():
     args = ap.parse_args()
 
     source = args.source
-    source_label = {'tdx': '通达信', 'baostock': 'BaoStock', 'both': '双源(优先BaoStock)'}
+    source_label = {'tdx': '通达信', 'baostock': 'BaoStock', 'akshare': 'AKShare(东方财富)', 'both': '双源'}
 
     # ---- --merge-db 独立模式：跳过下载，直接扫描CSV写入数据库 ----
     if args.merge_db:

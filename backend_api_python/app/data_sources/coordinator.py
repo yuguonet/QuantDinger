@@ -3,16 +3,23 @@
 协助层 (Coordinator) — 数据源层与调度层之间的并发协调
 
 定位:
-  调度层(CNStockDataSource) → 协助层(Coordinator) → 数据源层(函数)
+  调度层(CNStockDataSource) → 协助层(Coordinator) → 数据源层(Provider)
 
 核心职责:
   1. 动态队列: 源干完一个活立刻拿下一个，不闲着
   2. 并发控制: 每个源的并发数不超过其 max_workers 配置
   3. 吞吐跟踪: 记录每个源的实际 QPS，动态调整分配优先级
   4. 失败处理: 每个 symbol 最多被所有可用源各试一次，全部失败则放弃
+  5. 指定源: 支持 preferred_source 直接指定数据源，快速失败后自动回退
+  6. 源自动发现: 从 Provider 层按能力/周期/市场自动获取可用源
 
 接口:
-  sources = [("tencent", fetch_fn), ("sina", fetch_fn), ...]
+  # 自动发现模式（推荐）— Coordinator 从 Provider 层自动发现源
+  coordinate_kline(symbols, timeframe, limit, cb, market="CNStock")
+
+  # 手动指定模式（兼容旧调用）— 调用方传入源列表
+  coordinate_kline(symbols, timeframe, limit, sources=[...], cb, market="CNStock")
+
   fetch_fn(symbol: str, timeframe: str, limit: int) -> List[Dict] | None
 """
 
@@ -36,6 +43,116 @@ PER_TASK_TIMEOUT = 20.0
 
 # 队列空时等待的超时（秒），超时后认为所有工作已完成
 QUEUE_DRAIN_TIMEOUT = 3.0
+
+
+# ================================================================
+# Provider 适配器 — 将 Provider.fetch_kline 适配为 Coordinator 的 fetch_fn
+# ================================================================
+
+def _make_provider_fetch_fn(provider) -> Callable:
+    """
+    将 Provider 的 fetch_kline 方法适配为 Coordinator 期望的 fetch_fn 签名。
+
+    Coordinator 期望: fetch_fn(symbol, timeframe, limit) -> List[Dict] | None
+    Provider 提供:    provider.fetch_kline(code, timeframe, count) -> List[Dict] | NotSupportedResult
+
+    适配逻辑:
+      1. 调用 provider.fetch_kline
+      2. 如果返回 NotSupportedResult（不支持该接口），返回 None（Coordinator 跳过）
+      3. 如果返回空列表，返回 None（Coordinator 判定失败，尝试下一个源）
+      4. 如果返回非空列表，直接返回
+
+    Args:
+        provider: Provider 实例（实现 BaseDataSource 协议）
+
+    Returns:
+        适配后的 fetch_fn(symbol, timeframe, limit) -> List[Dict] | None
+    """
+    def fetch_fn(symbol: str, timeframe: str, limit: int):
+        try:
+            result = provider.fetch_kline(symbol, timeframe, limit)
+            # NotSupportedResult 布尔值为 False，和空列表一样处理
+            if not result:
+                return None
+            return result
+        except Exception as e:
+            logger.debug("[适配器] %s.fetch_kline(%s) 异常: %s",
+                        provider.name, symbol, e)
+            return None
+
+    fetch_fn.__name__ = f"provider_{provider.name}"
+    return fetch_fn
+
+
+def _discover_sources(
+    market: str,
+    timeframe: str,
+    cb: CircuitBreaker,
+    preferred_source: str = "",
+) -> List[Tuple[str, Callable, SourceConfig]]:
+    """
+    从 Provider 层自动发现可用数据源。
+
+    流程:
+      1. 调用 get_providers(capability="kline", timeframe=tf, market=market)
+         → 按 kline_priority 排序的 Provider 列表
+      2. 过滤已熔断的源
+      3. 将每个 Provider 的 fetch_kline 适配为 Coordinator 的 fetch_fn
+      4. 如果指定了 preferred_source，将其排到第一位
+
+    Args:
+        market:    市场名称（"CNStock" / "HKStock"）
+        timeframe: K线周期（"1D" / "5m" / ...）
+        cb:        熔断器
+        preferred_source: 指定的首选源名称
+
+    Returns:
+        [(name, fetch_fn, source_config), ...]
+    """
+    from app.data_sources.provider import get_providers
+
+    # 从 Provider 层获取按 kline_priority 排序的源
+    providers = get_providers(
+        capability="kline",
+        timeframe=timeframe,
+        market=market,
+    )
+
+    if not providers:
+        logger.warning("[协助层] Provider 层无可用源: market=%s tf=%s", market, timeframe)
+        return []
+
+    result = []
+    preferred_item = None
+
+    for p in providers:
+        # 检查熔断器
+        if not cb.is_available(p.name):
+            logger.debug("[协助层] Provider %s 已熔断，跳过", p.name)
+            continue
+
+        # 获取 SourceConfig（含 max_workers 等并发配置）
+        cfg = get_source_config(p.name)
+
+        # 适配 fetch_fn
+        fetch_fn = _make_provider_fetch_fn(p)
+
+        item = (p.name, fetch_fn, cfg)
+
+        if preferred_source and p.name == preferred_source:
+            preferred_item = item
+        else:
+            result.append(item)
+
+    # 指定源排第一
+    if preferred_item:
+        logger.info("[协助层] 使用指定源 %s (优先), 回退源 %d 个",
+                   preferred_source, len(result))
+        result.insert(0, preferred_item)
+    elif preferred_source:
+        logger.warning("[协助层] 指定源 %s 不可用，使用默认分配", preferred_source)
+
+    return result
 
 
 # ================================================================
@@ -112,7 +229,7 @@ class _WorkQueue:
 
 class Coordinator:
     """
-    协助层 — 动态队列 + 吞吐反馈。
+    协助层 — 动态队列 + 吞吐反馈 + Provider 层自动发现。
     """
 
     def __init__(self):
@@ -123,49 +240,71 @@ class Coordinator:
         symbols: List[str],
         timeframe: str,
         limit: int,
-        sources: List[Tuple[str, Callable]],
         cb: CircuitBreaker,
         market: str = "",
         timeout: float = 15.0,
+        preferred_source: str = "",
+        sources: Optional[List[Tuple[str, Callable]]] = None,
     ) -> Tuple[Dict[str, List[Dict[str, Any]]], List[str]]:
         """
         协调 K 线获取 — 动态队列模式。
+
+        支持两种模式:
+          1. 自动发现模式（推荐）: 不传 sources，Coordinator 从 Provider 层自动发现
+          2. 手动指定模式（兼容）: 传入 sources=[(name, fetch_fn), ...]
 
         Args:
             symbols: 股票代码列表（1 只或多只均可）
             timeframe: K 线周期
             limit: K 线条数
-            sources: [(name, fetch_fn), ...]
-                     fetch_fn(symbol, timeframe, limit) -> List[Dict] | None
             cb: 熔断器
-            market: 市场名称（用于查 SourceConfig）
+            market: 市场名称（如 "CNStock"，用于 Provider 层过滤 + SourceConfig 查询）
             timeout: 总超时
+            preferred_source: 指定数据源名称（如 "tencent"），优先使用该源
+            sources: 手动指定源列表（可选）。为 None 时自动从 Provider 层发现。
 
         Returns:
             (results, failed)
         """
-        if not symbols or not sources:
+        if not symbols:
             return {}, list(symbols)
 
-        # 1. 构建 source 映射 + 找可用源
-        source_map = {name: fn for name, fn in sources}
-        available = self._get_available_sources(market, source_map, cb)
+        # ── 源获取：自动发现 or 手动指定 ──
+        if sources is not None:
+            # 手动指定模式（兼容旧调用）
+            source_map = {name: fn for name, fn in sources}
+            if preferred_source and preferred_source in source_map:
+                available = self._get_preferred_available(
+                    preferred_source, market, source_map, cb
+                )
+            else:
+                available = self._get_available_sources(market, source_map, cb)
+        else:
+            # 自动发现模式 — 从 Provider 层获取源
+            discovered = _discover_sources(market, timeframe, cb, preferred_source)
+            if not discovered:
+                logger.warning("[协助层] 市场 %s 无可用源", market)
+                return {}, list(symbols)
+            # 转换为 (name, cfg) 格式供后续使用
+            available = [(name, cfg) for name, _, cfg in discovered]
+            # 构建 source_map
+            source_map = {name: fn for name, fn, _ in discovered}
+
         if not available:
             logger.warning("[协助层] 市场 %s 无可用源", market)
             return {}, list(symbols)
 
-        # 2. 构建阻塞任务队列 + 结果收集
+        # ── 以下是原有的动态队列逻辑（不变）──
+
         wq = _WorkQueue(symbols)
         results: Dict[str, List[Dict[str, Any]]] = {}
         results_lock = threading.Lock()
         failed: List[str] = []
         failed_lock = threading.Lock()
 
-        # per-symbol 失败记录
         symbol_tried: Dict[str, Set[str]] = {}
         symbol_tried_lock = threading.Lock()
 
-        # per-source 连续失败计数
         source_consecutive_fails: Dict[str, int] = {}
         fails_lock = threading.Lock()
         MAX_SOURCE_FAILS = 5
@@ -189,7 +328,7 @@ class Coordinator:
         def _mark_failed(sym: str, source_name: str):
             with results_lock:
                 if sym in results:
-                    return  # 已被其他源成功获取
+                    return
 
             with symbol_tried_lock:
                 tried = symbol_tried.setdefault(sym, set())
@@ -197,16 +336,15 @@ class Coordinator:
                 untried = [name for name, _ in available if name not in tried]
 
             if untried:
-                wq.put_back(sym)  # 还有源没试过 → 放回队尾
+                wq.put_back(sym)
             else:
                 with failed_lock:
                     if sym not in failed:
                         failed.append(sym)
-                wq.task_done()  # 彻底失败，不再重试
+                wq.task_done()
 
         def _fetch_with_timeout(fn: Callable, sym: str, tf: str, lim: int,
                                 timeout_s: float) -> Optional[List[Dict[str, Any]]]:
-            """带超时兜底的 fetch 调用"""
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as task_pool:
                 future = task_pool.submit(fn, sym, tf, lim)
                 try:
@@ -217,7 +355,6 @@ class Coordinator:
 
         def _process_symbol(sym: str, source_name: str, fetch_fn: Callable,
                             cfg: SourceConfig) -> bool:
-            """处理单个 symbol。返回是否成功。"""
             with results_lock:
                 if sym in results:
                     wq.task_done()
@@ -254,7 +391,6 @@ class Coordinator:
                 return False
 
         def _worker(source_name: str, cfg: SourceConfig, fetch_fn: Callable):
-            """单个源的 worker 循环"""
             while True:
                 if _get_consecutive_fails(source_name) >= MAX_SOURCE_FAILS:
                     break
@@ -263,10 +399,10 @@ class Coordinator:
 
                 sym = wq.get()
                 if sym is None:
-                    break  # 队列空 + 超时 → 退出
+                    break
                 _process_symbol(sym, source_name, fetch_fn, cfg)
 
-        # 3. 构建线程池
+        # 构建线程池
         total_threads = 0
         thread_plan = []
         for name, cfg in available:
@@ -283,13 +419,10 @@ class Coordinator:
                 for _ in range(tc):
                     futures.append(pool.submit(_worker, name, cfg, fn))
 
-            # 等待所有 worker 完成
             concurrent.futures.wait(futures, timeout=timeout + 2)
 
-        # 4. 标记完成 + 收集剩余
         wq.drain_done()
 
-        # 5. 队列中未处理的 symbol 标记为失败
         while True:
             sym = wq.get()
             if sym is None:
@@ -301,7 +434,6 @@ class Coordinator:
                 if sym not in failed:
                     failed.append(sym)
 
-        # 6. 打印各源吞吐统计
         stats = " | ".join(cfg.stats_summary() for _, cfg in available)
         logger.info("[协助层] 完成: %d成功 %d失败 | %s", len(results), len(failed), stats)
 
@@ -315,6 +447,7 @@ class Coordinator:
         sources: List[Tuple[str, Callable]],
         cb: CircuitBreaker,
         timeout: float = 8.0,
+        preferred_source: str = "",
     ) -> Optional[Dict[str, Any]]:
         """
         实时行情 Race 模式 — 所有源并发，第一个成功的直接返回。
@@ -324,6 +457,7 @@ class Coordinator:
             sources: [(name, fetch_fn), ...]  fetch_fn(symbol) -> Dict | None
             cb: 熔断器
             timeout: 超时
+            preferred_source: 指定数据源名称，优先 race 该源
 
         Returns:
             第一个成功的 Dict，全部失败返回 None
@@ -331,8 +465,13 @@ class Coordinator:
         if not sources:
             return None
 
-        # 过滤熔断源
-        available = [(name, fn) for name, fn in sources if cb.is_available(name)]
+        if preferred_source:
+            preferred = [(n, fn) for n, fn in sources if n == preferred_source and cb.is_available(n)]
+            others = [(n, fn) for n, fn in sources if n != preferred_source and cb.is_available(n)]
+            available = preferred + others
+        else:
+            available = [(name, fn) for name, fn in sources if cb.is_available(name)]
+
         if not available:
             logger.warning("[协助层] ticker %s 无可用源", symbol)
             return None
@@ -351,7 +490,6 @@ class Coordinator:
 
                 if result and result.get("last", 0) > 0:
                     cb.record_success(source_name)
-                    # 记录吞吐（ticker 视为 1 条 K 线的成功请求）
                     cfg = get_source_config(source_name)
                     cfg.record(True, elapsed)
 
@@ -376,7 +514,6 @@ class Coordinator:
                 pool.submit(_race_one, name, fn)
                 for name, fn in available
             ]
-            # 等第一个完成或超时
             done_event.wait(timeout=timeout)
 
         if result_holder:
@@ -418,6 +555,37 @@ class Coordinator:
             available.append((cfg.name, cfg))
 
         return available
+
+    def _get_preferred_available(
+        self,
+        preferred: str,
+        market: str,
+        source_map: Dict[str, Callable],
+        cb: CircuitBreaker,
+    ) -> List[Tuple[str, SourceConfig]]:
+        """
+        获取可用源列表，指定源排在第一位。
+        """
+        all_available = self._get_available_sources(market, source_map, cb)
+
+        if not all_available:
+            return []
+
+        preferred_item = None
+        others = []
+        for item in all_available:
+            if item[0] == preferred:
+                preferred_item = item
+            else:
+                others.append(item)
+
+        if preferred_item:
+            logger.info("[协助层] 使用指定源 %s (优先), 回退源 %d 个",
+                       preferred, len(others))
+            return [preferred_item] + others
+        else:
+            logger.warning("[协助层] 指定源 %s 不可用，回退到默认分配", preferred)
+            return all_available
 
 
 # ================================================================

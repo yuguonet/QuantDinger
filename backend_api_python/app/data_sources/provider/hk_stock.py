@@ -241,6 +241,14 @@ class HKStockDataSource:
             return None
         return _fetch_tencent_hk_quote(hk_code, timeout)
 
+    def fetch_kline_batch(
+        self, codes: List[str], timeframe: str = "1D", count: int = 300,
+        adj: str = "qfq", timeout: int = 15,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """批量K线 — 港股源不支持原生批量，返回 NotSupportedResult"""
+        from app.data_sources.provider import NotSupportedResult
+        return NotSupportedResult(self.name, "fetch_kline_batch")
+
     def fetch_kline(
         self, code: str, timeframe: str = "1D", count: int = 300,
         adj: str = "qfq", timeout: int = 10,

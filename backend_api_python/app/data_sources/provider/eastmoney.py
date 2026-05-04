@@ -129,6 +129,14 @@ class EastMoneyDataSource:
         "markets": {"CNStock"},
     }
 
+    def fetch_kline_batch(
+        self, codes: List[str], timeframe: str = "1D", count: int = 300,
+        adj: str = "qfq", timeout: int = 15,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """批量K线 — 东财K线API是per-symbol，不支持原生批量，返回 NotSupportedResult"""
+        from app.data_sources.provider import NotSupportedResult
+        return NotSupportedResult(self.name, "fetch_kline_batch")
+
     @retry_with_backoff(max_attempts=3, base_delay=2.0, max_delay=12.0, exceptions=(
         requests.exceptions.RequestException, ConnectionError, TimeoutError,
     ))

@@ -58,12 +58,67 @@ logger = get_logger(__name__)
 # Provider 协议 — 所有源必须实现
 # ================================================================
 
+# ================================================================
+# 不支持接口的标准化响应
+# ================================================================
+
+NOT_SUPPORTED_REASON = "not_supported"
+
+class NotSupportedResult:
+    """
+    标准化的"不支持"响应包装。
+
+    当 Provider 不支持某个接口时，返回此对象而非抛出异常。
+    Coordinator 可通过 is_not_supported() 快速判断并切换到其他源。
+
+    Attributes:
+        source: 不支持该接口的数据源名称
+        interface: 不支持的接口名称（如 "fetch_kline_batch"）
+        reason: 不支持的原因说明
+    """
+
+    def __init__(self, source: str, interface: str, reason: str = ""):
+        self.source = source
+        self.interface = interface
+        self.reason = reason or f"{source} does not support {interface}"
+
+    def __bool__(self) -> bool:
+        """布尔值为 False，便于 Coordinator 快速判断"""
+        return False
+
+    def __repr__(self) -> str:
+        return f"NotSupportedResult({self.source}.{self.interface})"
+
+
+def is_not_supported(result: Any) -> bool:
+    """
+    判断结果是否为"不支持"响应。
+
+    Coordinator 在获取结果后调用此函数，快速判断是否需要切换数据源。
+
+    Args:
+        result: Provider 接口的返回值
+
+    Returns:
+        True 表示该 Provider 不支持此接口，Coordinator 应尝试其他源
+    """
+    return isinstance(result, NotSupportedResult)
+
+
 @runtime_checkable
 class BaseDataSource(Protocol):
     """
     A股数据源统一接口（Protocol 类型协议）。
 
-    所有 Provider 必须实现此协议定义的属性和方法。
+    所有 Provider 必须实现此协议定义的4个标准接口:
+      1. fetch_kline       — 单只K线
+      2. fetch_kline_batch  — 批量K线
+      3. fetch_quote        — 单只行情
+      4. fetch_quotes_batch — 批量行情
+
+    不支持的接口返回 NotSupportedResult（而非 None 或抛异常），
+    以便 Coordinator 快速识别并切换到其他数据源。
+
     使用 @runtime_checkable 装饰器，支持 isinstance() 运行时检查。
 
     属性:
@@ -100,6 +155,7 @@ class BaseDataSource(Protocol):
         Returns:
             K线数据列表，每个元素包含 time/open/high/low/close/volume。
             失败或无数据返回空列表。
+            不支持返回 NotSupportedResult。
 
         Raises:
             不抛出异常，内部捕获所有异常并返回空列表。
@@ -114,7 +170,7 @@ class BaseDataSource(Protocol):
         批量K线（单次HTTP或单次API调用）。
 
         能一次拉全市场的源（如东财 clist）应实现此方法。
-        未实现的源自动退化为逐只调用 fetch_kline。
+        不支持批量的源返回 NotSupportedResult，Coordinator 自动退化为逐只调用。
 
         Args:
             codes:     股票代码列表
@@ -124,7 +180,8 @@ class BaseDataSource(Protocol):
             timeout:   请求超时秒数
 
         Returns:
-            {code: kline_bars} — 仅包含成功获取的代码
+            {code: kline_bars} — 仅包含成功获取的代码。
+            不支持返回 NotSupportedResult。
         """
         ...
 
@@ -139,6 +196,7 @@ class BaseDataSource(Protocol):
         Returns:
             行情字典，包含 last/change/changePercent/high/low/open/previousClose/name/symbol。
             失败返回 None。
+            不支持返回 NotSupportedResult。
         """
         ...
 
@@ -151,7 +209,8 @@ class BaseDataSource(Protocol):
             timeout:  请求超时秒数
 
         Returns:
-            {code: quote_dict} — 仅包含成功获取的代码
+            {code: quote_dict} — 仅包含成功获取的代码。
+            不支持返回 NotSupportedResult。
         """
         ...
 

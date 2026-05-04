@@ -200,6 +200,14 @@ class TencentDataSource:
         "markets": {"CNStock", "HKStock"},
     }
 
+    def fetch_kline_batch(
+        self, codes: List[str], timeframe: str = "1D", count: int = 300,
+        adj: str = "qfq", timeout: int = 15,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """批量K线 — 腾讯不支持原生批量，返回 NotSupportedResult"""
+        from app.data_sources.provider import NotSupportedResult
+        return NotSupportedResult(self.name, "fetch_kline_batch")
+
     @retry_with_backoff(max_attempts=3, base_delay=1.2, max_delay=8.0, exceptions=(Exception,))
     def fetch_kline(
         self, code: str, timeframe: str = "1D", count: int = 300,

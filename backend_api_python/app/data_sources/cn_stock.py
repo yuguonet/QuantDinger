@@ -3,11 +3,12 @@
 
 架构:
   get_ticker()      → Coordinator race 模式（并发，第一个成功的返回）
-  get_kline()       → Coordinator 动态队列（单只）
+  get_kline()       → Coordinator 动态队列（单只），自动从 Provider 层发现源
   get_kline_batch() → Coordinator 动态队列（批量），月线走日线聚合
 
 数据源:
-  腾讯 · 新浪 · 东方财富 · AkShare · TwelveData
+  由 Coordinator 从 Provider 层自动发现（@register 注册的所有源），
+  按 kline_priority 排序，支持 preferred_source 指定源。
 """
 
 from __future__ import annotations
@@ -22,24 +23,15 @@ from app.data_sources.base import BaseDataSource
 from app.data_sources.tencent import (
     normalize_cn_code,
     tencent_quote_to_ticker,
-    fetch_kline,
-    tencent_kline_rows_to_dicts,
-    fetch_minute_kline,
-    tencent_minute_kline_to_dicts,
 )
 from app.data_sources.eastmoney import (
     fetch_eastmoney_batch_quotes,
-    fetch_eastmoney_kline,
     eastmoney_kline_to_ticker,
 )
 from app.data_sources.asia_stock_kline import (
     normalize_chart_timeframe,
-    fetch_twelvedata_klines,
-    fetch_yfinance_klines,
-    fetch_akshare_minute_klines,
-    fetch_akshare_weekly_klines,
 )
-from app.data_sources.sina import fetch_sina_kline, sina_kline_to_ticker, fetch_sina_minute_kline
+from app.data_sources.sina import sina_kline_to_ticker
 from app.data_sources.circuit_breaker import get_realtime_circuit_breaker
 from app.data_sources.cache_manager import (
     get_realtime_cache,
@@ -57,7 +49,6 @@ logger = get_logger(__name__)
 # 超时封装工具
 # ================================================================
 
-# 共享线程池 — 避免每次调用创建/销毁 executor
 _TIMEOUT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=4,
     thread_name_prefix="cnstock-timeout",
@@ -182,26 +173,11 @@ def _aggregate_daily_to_monthly(daily_bars: List[Dict[str, Any]], limit: int) ->
 
 
 # ================================================================
-# K线校验包装器（给 Coordinator 用，过滤无效结果）
-# ================================================================
-
-def _validated_fetch(fetch_fn: Callable, source_name: str):
-    """包装 fetch_fn，校验结果后返回，无效返回 None"""
-    def _inner(sym: str, tf: str, lim: int):
-        result = fetch_fn(sym, tf, lim)
-        if _validate_kline_result(result):
-            return result
-        return None
-    _inner.__name__ = source_name
-    return _inner
-
-
-# ================================================================
 # 数据源类
 # ================================================================
 
 class CNStockDataSource(BaseDataSource):
-    """A股数据源 — Coordinator 动态队列 + 串行 fallback"""
+    """A股数据源 — Coordinator 动态队列 + 自动源发现"""
 
     name = "CNStock/multi-source"
 
@@ -211,100 +187,12 @@ class CNStockDataSource(BaseDataSource):
         self.kline_cache = get_kline_cache()
 
     # ----------------------------------------------------------
-    # K线数据源列表（供 Coordinator 使用）
-    # ----------------------------------------------------------
-
-    @staticmethod
-    def _build_sources(tf: str, lim: int) -> List[Tuple[str, Callable]]:
-        """
-        按周期构建数据源列表。
-        返回 [(name, fetch_fn), ...]，fetch_fn(sym, tf, lim) -> List[Dict] | None
-        """
-        sources: List[Tuple[str, Callable]] = []
-
-        # 腾讯
-        if tf in ("1D", "1W"):
-            period = "day" if tf == "1D" else "week"
-            sources.append((
-                "tencent",
-                _validated_fetch(
-                    lambda sym, _tf, _lim, _p=period: tencent_kline_rows_to_dicts(
-                        fetch_kline(sym, period=_p, count=_lim, adj="qfq")
-                    ),
-                    "tencent",
-                ),
-            ))
-        if tf in ("1m", "5m", "15m", "30m", "1H"):
-            sources.append((
-                "tencent",
-                _validated_fetch(
-                    lambda sym, _tf, _lim: tencent_minute_kline_to_dicts(
-                        fetch_minute_kline(sym, timeframe=_tf, count=_lim)
-                    ),
-                    "tencent_minute",
-                ),
-            ))
-
-        # 新浪
-        if tf in ("1m", "5m", "15m", "30m", "1H"):
-            sources.append((
-                "sina",
-                _validated_fetch(
-                    lambda sym, _tf, _lim: fetch_sina_minute_kline(sym, timeframe=_tf, count=_lim),
-                    "sina_minute",
-                ),
-            ))
-        if tf == "1D":
-            sources.append((
-                "sina",
-                _validated_fetch(
-                    lambda sym, _tf, _lim: fetch_sina_kline(sym, count=_lim, adj="qfq"),
-                    "sina",
-                ),
-            ))
-
-        # AkShare
-        if tf in ("1m", "5m", "15m", "30m", "1H"):
-            sources.append((
-                "akshare",
-                lambda sym, _tf, _lim: fetch_akshare_minute_klines(
-                    is_hk=False, tencent_code=sym, timeframe=_tf, limit=_lim, before_time=None,
-                ),
-            ))
-        elif tf == "1W":
-            sources.append((
-                "akshare",
-                lambda sym, _tf, _lim: fetch_akshare_weekly_klines(
-                    is_hk=False, tencent_code=sym, limit=_lim, before_time=None,
-                ),
-            ))
-
-        # 东方财富
-        sources.append((
-            "eastmoney",
-            _validated_fetch(
-                lambda sym, _tf, _lim: fetch_eastmoney_kline(sym, period=_tf, count=_lim, adj="qfq"),
-                "eastmoney",
-            ),
-        ))
-
-        # Twelve Data（海外，降级兜底）
-        sources.append((
-            "twelvedata",
-            lambda sym, _tf, _lim: fetch_twelvedata_klines(
-                is_hk=False, tencent_code=sym, timeframe=_tf, limit=_lim, before_time=None,
-            ),
-        ))
-
-        return sources
-
-    # ----------------------------------------------------------
     # 实时行情 / 报价（串行 fallback，不走 Coordinator）
     # ----------------------------------------------------------
 
     def get_ticker(self, symbol: str) -> Dict[str, Any]:
         """获取最新报价 — 优先走东财批量接口（1次HTTP），降级走 Coordinator race"""
-        code = normalize_cn_code(symbol)  # e.g. "SH600519"
+        code = normalize_cn_code(symbol)
 
         # 先检查缓存
         cache_key = f"ticker:{code}"
@@ -334,7 +222,7 @@ class CNStockDataSource(BaseDataSource):
         except Exception as e:
             logger.debug(f"[行情] 东财批量接口降级 {code}: {e}")
 
-        # 降级：Coordinator race 模式，所有源并发，第一个成功的返回
+        # 降级：Coordinator race 模式
         result = get_coordinator().coordinate_ticker(
             symbol=code,
             sources=[
@@ -362,7 +250,7 @@ class CNStockDataSource(BaseDataSource):
         return get_coordinator().passthrough(fetch_eastmoney_batch_quotes, symbols)
 
     # ----------------------------------------------------------
-    # K线数据 — 统一走 Coordinator
+    # K线数据 — 统一走 Coordinator（自动源发现）
     # ----------------------------------------------------------
 
     def get_kline(
@@ -373,7 +261,7 @@ class CNStockDataSource(BaseDataSource):
         before_time: Optional[int] = None,
         after_time: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """获取单只股票 K 线 — 走 Coordinator 动态队列"""
+        """获取单只股票 K 线 — Coordinator 从 Provider 层自动发现源并调度"""
         code = normalize_cn_code(symbol)
         tf = normalize_chart_timeframe(timeframe)
         lim = max(int(limit or 300), 1)
@@ -384,15 +272,11 @@ class CNStockDataSource(BaseDataSource):
         if cached:
             return cached
 
-        # 构建数据源列表
-        sources = self._build_sources(tf, lim)
-
-        # 交给 Coordinator
+        # 交给 Coordinator（自动从 Provider 层发现源，无需手动构建 sources）
         results, failed = get_coordinator().coordinate_kline(
             symbols=[code],
             timeframe=tf,
             limit=lim,
-            sources=sources,
             cb=self.circuit_breaker,
             market="CNStock",
             timeout=_get_timeout() + 5,
@@ -424,7 +308,7 @@ class CNStockDataSource(BaseDataSource):
         cached_symbols: Optional[set] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
-        批量获取多只股票 K 线 — 走 Coordinator 动态队列。
+        批量获取多只股票 K 线 — Coordinator 自动源发现 + 动态队列。
         月线先走日线批量再聚合。
         """
         if not symbols:
@@ -463,14 +347,11 @@ class CNStockDataSource(BaseDataSource):
         if not uncached:
             return result
 
-        # ── 未缓存的交给 Coordinator ──
-        sources = self._build_sources(tf, limit)
-
+        # ── 未缓存的交给 Coordinator（自动源发现）──
         coord_results, failed = get_coordinator().coordinate_kline(
             symbols=[normalize_cn_code(s) for s in uncached],
             timeframe=tf,
             limit=limit,
-            sources=sources,
             cb=self.circuit_breaker,
             market="CNStock",
             timeout=_get_timeout() + 10,
