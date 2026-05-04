@@ -603,10 +603,10 @@ def add_monitor():
                 """
                 INSERT INTO qd_position_monitors 
                 (user_id, name, position_ids, monitor_type, config, notification_config, is_active, next_run_at, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, NOW() + INTERVAL '%s minutes', NOW(), NOW())
+                VALUES (?, ?, ?, ?, ?, ?, ?, NOW() + (? || ' minutes')::INTERVAL, NOW(), NOW())
                 """,
                 (user_id, name, position_ids_json, monitor_type, config_json, notification_config_json, 
-                 1 if is_active else 0, interval_minutes)
+                 1 if is_active else 0, str(interval_minutes))
             )
             monitor_id = cur.lastrowid
             db.commit()
@@ -685,7 +685,8 @@ def update_monitor(monitor_id):
         
         # Add next_run_at update if interval was changed
         if next_run_interval is not None:
-            updates.append(f"next_run_at = NOW() + INTERVAL '{next_run_interval} minutes'")
+            updates.append("next_run_at = NOW() + (? || ' minutes')::INTERVAL")
+            params.insert(len(params) - 2, str(next_run_interval))  # insert before monitor_id and user_id
         
         updates.append('updated_at = NOW()')
         params.append(monitor_id)

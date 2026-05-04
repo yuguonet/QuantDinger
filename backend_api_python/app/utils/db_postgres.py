@@ -235,70 +235,226 @@ def _acquire_conn_with_wait(pg_pool):
 
 
 class PostgresCursor:
-    """PostgreSQL cursor wrapper with placeholder conversion for backward compatibility"""
-    
+    """PostgreSQL cursor wrapper with placeholder conversion for backward compatibility.
+
+    Two ways to get the inserted row's id:
+
+    1. **Preferred** — use ``insert_returning()`` which appends ``RETURNING id``
+       and returns the new id directly::
+
+           new_id = cur.insert_returning(
+               "INSERT INTO t (a) VALUES (%s)", (val,)
+           )
+
+    2. **Legacy** — call ``execute()`` with ``RETURNING id`` already in the SQL,
+       then read ``cur.lastrowid``::
+
+           cur.execute("INSERT INTO t (a) VALUES (%s) RETURNING id", (val,))
+           new_id = cur.lastrowid
+
+    ``execute()`` **never** mutates your SQL.  If you need the inserted id,
+    add ``RETURNING id`` yourself or use ``insert_returning()``.
+    """
+
     def __init__(self, cursor):
         self._cursor = cursor
         self._last_insert_id = None
-    
-    def _convert_placeholders(self, query: str) -> str:
+        # Row returned by RETURNING (not yet consumed by caller's fetchone)
+        self._returning_row: Optional[Dict[str, Any]] = None
+
+    # ------------------------------------------------------------------
+    # Placeholder / SQL conversion
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _convert_placeholders(query: str) -> str:
+        """Convert ``?`` placeholders to PostgreSQL ``%s`` for backward
+        compatibility with legacy SQLite-style code.
         """
-        Convert ? placeholders to PostgreSQL %s for backward compatibility.
-        Also handle some SQL syntax differences.
-        """
-        # Replace ? -> %s
         query = query.replace('?', '%s')
-        
-        # INSERT OR IGNORE -> PostgreSQL: INSERT ... ON CONFLICT DO NOTHING
-        query = query.replace('INSERT OR IGNORE', 'INSERT')
-        
         return query
-    
+
+    @staticmethod
+    def _rewrite_insert_or_ignore(query: str) -> str:
+        """Rewrite ``INSERT OR IGNORE`` to ``INSERT … ON CONFLICT DO NOTHING``.
+
+        Returns the (possibly rewritten) query.
+        """
+        import re
+        # Check if the query contains INSERT OR IGNORE (case-insensitive)
+        if not re.search(r'\bINSERT\s+OR\s+IGNORE\b', query, re.IGNORECASE):
+            return query
+
+        # Remove the OR IGNORE keyword
+        query = re.sub(
+            r'\bINSERT\s+OR\s+IGNORE\b',
+            'INSERT',
+            query,
+            flags=re.IGNORECASE,
+        )
+
+        # Insert ON CONFLICT DO NOTHING before RETURNING (if present) or at end
+        returning_match = re.search(r'\bRETURNING\b', query, re.IGNORECASE)
+        if returning_match:
+            pos = returning_match.start()
+            query = (
+                query[:pos].rstrip()
+                + ' ON CONFLICT DO NOTHING '
+                + query[pos:]
+            )
+        else:
+            query = query.rstrip().rstrip(';') + ' ON CONFLICT DO NOTHING'
+
+        return query
+
+    # ------------------------------------------------------------------
+    # Core execution
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_simple_insert(query_upper: str) -> bool:
+        """Check if this is a simple INSERT ... VALUES statement (not INSERT ... SELECT
+        or INSERT ... ON CONFLICT DO NOTHING) that is safe to auto-append RETURNING id.
+        """
+        # INSERT ... SELECT — don't auto-append (would return multiple rows)
+        # Find the first VALUES or SELECT after INSERT
+        insert_pos = query_upper.find('INSERT')
+        if insert_pos < 0:
+            return False
+        after_insert = query_upper[insert_pos:]
+        # If SELECT appears before VALUES (or no VALUES), it's INSERT ... SELECT
+        values_pos = after_insert.find('VALUES')
+        select_pos = after_insert.find('SELECT')
+        if select_pos >= 0 and (values_pos < 0 or select_pos < values_pos):
+            return False
+        # INSERT ... ON CONFLICT DO NOTHING — don't auto-append (may insert 0 rows)
+        if 'ON CONFLICT' in after_insert and 'DO NOTHING' in after_insert:
+            return False
+        return True
+
     def execute(self, query: str, args: Any = None):
-        """Execute SQL statement"""
+        """Execute SQL statement.
+
+        For simple INSERT … VALUES statements, automatically appends ``RETURNING id``
+        so that :attr:`lastrowid` is populated.  This is skipped for:
+        - INSERT … SELECT (returns multiple rows)
+        - INSERT … ON CONFLICT DO NOTHING (may insert 0 rows)
+        - Statements that already contain RETURNING
+
+        If the caller's SQL already contains RETURNING, the returned row is
+        captured and made available via :attr:`lastrowid` and :meth:`fetchone`.
+        """
+        self._last_insert_id = None
+        self._returning_row = None
+
+        query = self._rewrite_insert_or_ignore(query)
         query = self._convert_placeholders(query)
-        
-        # Check if this is an INSERT and add RETURNING id if not present
-        is_insert = query.strip().upper().startswith('INSERT')
-        if is_insert and 'RETURNING' not in query.upper():
-            query = query.rstrip(';').rstrip() + ' RETURNING id'
-        
+
+        upper_q = query.strip().upper()
+        is_insert = upper_q.startswith('INSERT')
+        has_returning = 'RETURNING' in upper_q
+
+        # Auto-append RETURNING id for simple INSERT … VALUES
+        if is_insert and not has_returning and self._is_simple_insert(upper_q):
+            query = query.rstrip().rstrip(';') + ' RETURNING id'
+            has_returning = True
+
         if args:
             if not isinstance(args, (tuple, list)):
                 args = (args,)
             result = self._cursor.execute(query, args)
         else:
             result = self._cursor.execute(query)
-        
-        # Capture last insert id for INSERT statements
-        if is_insert:
+
+        # If the SQL contains RETURNING, capture the row so lastrowid works
+        # and the row isn't silently consumed when caller calls fetchone().
+        if is_insert and has_returning:
             try:
                 row = self._cursor.fetchone()
-                if row and 'id' in row:
-                    self._last_insert_id = row['id']
+                if row is not None:
+                    row_dict = row if isinstance(row, dict) else dict(row)
+                    self._returning_row = row_dict
+                    self._last_insert_id = row_dict.get('id')
             except Exception:
                 pass
-        
+
         return result
-    
+
+    def insert_returning(self, query: str, args: Any = None) -> Optional[int]:
+        """Execute an INSERT and return the new row's ``id``.
+
+        Appends ``RETURNING id`` if the query doesn't already have it.
+        This is the **preferred** way to get the inserted id::
+
+            new_id = cur.insert_returning(
+                "INSERT INTO t (a, b) VALUES (%s, %s)", (val_a, val_b)
+            )
+            db.commit()
+
+        Returns the inserted row's ``id``, or ``None`` if no row was inserted
+        (e.g. ``ON CONFLICT DO NOTHING`` hit a conflict).
+        """
+        self._last_insert_id = None
+        self._returning_row = None
+
+        query = self._rewrite_insert_or_ignore(query)
+        query = self._convert_placeholders(query)
+
+        # Append RETURNING id if not already present
+        upper_q = query.strip().upper()
+        if 'RETURNING' not in upper_q:
+            query = query.rstrip().rstrip(';') + ' RETURNING id'
+
+        if args:
+            if not isinstance(args, (tuple, list)):
+                args = (args,)
+            self._cursor.execute(query, args)
+        else:
+            self._cursor.execute(query)
+
+        try:
+            row = self._cursor.fetchone()
+            if row is not None:
+                row_dict = row if isinstance(row, dict) else dict(row)
+                self._returning_row = row_dict
+                self._last_insert_id = row_dict.get('id')
+        except Exception:
+            pass
+
+        return self._last_insert_id
+
+    # ------------------------------------------------------------------
+    # Fetch helpers
+    # ------------------------------------------------------------------
+
     def fetchone(self) -> Optional[Dict[str, Any]]:
-        """Fetch single row"""
+        """Fetch single row.
+
+        If ``execute()`` was called with a ``RETURNING`` clause, the first
+        ``fetchone()`` returns that row (the cursor's internal row was already
+        read into :attr:`_returning_row`).
+        """
+        # Return the cached RETURNING row if it hasn't been consumed yet
+        if self._returning_row is not None:
+            row = self._returning_row
+            self._returning_row = None  # consume
+            return row
+
         row = self._cursor.fetchone()
         if row is None:
             return None
-        # RealDictCursor already returns a dict, so return as-is
         return row if isinstance(row, dict) else dict(row) if row else None
-    
+
     def fetchall(self) -> List[Dict[str, Any]]:
         """Fetch all rows"""
         rows = self._cursor.fetchall()
         if not rows:
             return []
-        # RealDictCursor already returns dicts, so return as-is
         return [row if isinstance(row, dict) else dict(row) for row in rows]
-    
+
     def executemany(self, query: str, args_list: list):
         """Execute SQL statement for multiple rows"""
+        query = self._rewrite_insert_or_ignore(query)
         query = self._convert_placeholders(query)
         # Strip RETURNING clause if present (executemany doesn't support it)
         upper_q = query.upper()
@@ -310,11 +466,24 @@ class PostgresCursor:
     def close(self):
         """Close cursor"""
         self._cursor.close()
-    
+
     @property
     def lastrowid(self) -> Optional[int]:
-        """Get last inserted row ID"""
+        """Get last inserted row ID.
+
+        Populated when:
+        - ``execute()`` is called with ``RETURNING id`` in the SQL, or
+        - ``insert_returning()`` is used.
+        """
         return self._last_insert_id
+
+    @property
+    def returning_row(self) -> Optional[Dict[str, Any]]:
+        """The full row returned by ``RETURNING`` (if any).
+
+        Useful when ``RETURNING *`` or ``RETURNING col1, col2`` is used.
+        """
+        return self._returning_row
     
     @property
     def rowcount(self) -> int:

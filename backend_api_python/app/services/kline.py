@@ -39,6 +39,17 @@ class _NoOpCache:
     def set(self, *a, **kw): pass
     def delete(self, *a, **kw): pass
 
+
+class _NoOpKlineCacheManager:
+    """Feather cache stand-in that always misses — no disk reads/writes."""
+    def __init__(self):
+        self.data_dir = ""
+    def get_cached(self, *a, **kw): return None
+    def store_single(self, *a, **kw): pass
+    def get_cached_symbols(self, *a, **kw): return set()
+    def prewarm(self, *a, **kw): return False
+    def synthesize_today_candle(self, *a, **kw): return None
+
 logger = get_logger(__name__)
 
 # 非日/周/月线的降级映射
@@ -77,7 +88,7 @@ class KlineService:
         _cache_disabled = _os.getenv("KLINE_CACHE_DISABLED", "false").lower() in ("1", "true", "yes")
         self.cache = _NoOpCache() if _cache_disabled else CacheManager()
         self.cache_ttl = CacheConfig.KLINE_CACHE_TTL
-        self._kc = KlineCacheManager()
+        self._kc = _NoOpKlineCacheManager() if _cache_disabled else KlineCacheManager()
         self._cache_disabled = _cache_disabled
         # 批量当日 K 线缓存：{market: {symbol: candle_dict}}
         self._today_batch: Dict[str, Dict[str, Dict[str, Any]]] = {}
@@ -229,7 +240,7 @@ class KlineService:
         修复逻辑：比较缓存数据最后日期与前一个交易日，若缺口 > 1 天，
         从远程拉取完整数据（DAILY_LIMIT 条）并刷新缓存文件。
         """
-        if tf != "1D" or not cached or not market:
+        if tf != "1D" or not cached or not market or self._cache_disabled:
             return cached
 
         try:
@@ -283,7 +294,7 @@ class KlineService:
         全量预热（批量拉取所有自选股）应通过 /kline/prewarm API 或定时任务触发，
         不应在单次请求中触发，避免雷群效应。
         """
-        if not market or not symbol:
+        if not market or not symbol or self._cache_disabled:
             return False
 
         batch_fetch = lambda m, syms, tf, lim, cs=None: DataSourceFactory.get_kline_batch(
@@ -343,7 +354,7 @@ class KlineService:
             market: 市场类型
             symbol: 当前请求的 symbol（可选，确保非自选股也能命中批量结果）
         """
-        if market != "CNStock":
+        if market != "CNStock" or self._cache_disabled:
             return {}
 
         now = _time.time()
@@ -385,6 +396,10 @@ class KlineService:
         """
         if not _is_market_hours():
             return None
+
+        # 缓存禁用 → 直接走逐只合成，跳过 Redis/批量缓存
+        if self._cache_disabled:
+            return self._kc.synthesize_today_candle(symbol, fetch, market)
 
         # 1) 逐只 Redis 缓存
         cache_key = f"today_candle:{market}:{symbol}"
@@ -456,6 +471,19 @@ class KlineService:
             return None
 
         today_ts = _ts_from_date(_today_str())
+
+        # 缓存禁用 → 直接远程拉取，不读写 Redis
+        if self._cache_disabled:
+            try:
+                bars = fetch(market, symbol, "1D", 2)
+                if bars:
+                    for b in bars:
+                        if b.get("time") == today_ts:
+                            return b
+            except Exception as e:
+                logger.debug(f"[Kline] 获取当日已完成 bar 失败 {market}:{symbol}: {e}")
+            return None
+
         cache_key = f"today_completed:{market}:{symbol}"
         retry_key = f"today_completed_retry:{market}:{symbol}"
 
@@ -524,7 +552,7 @@ class KlineService:
 
     def _get_remote_kline(self, market, symbol, timeframe, limit, before_time):
         # before_time 模式不缓存（历史翻页）
-        if not before_time:
+        if not before_time and not self._cache_disabled:
             cache_key = f"kline:{market}:{symbol}:{timeframe}"
             cached = self.cache.get(cache_key)
             if cached:
@@ -540,8 +568,9 @@ class KlineService:
                 market, symbol, timeframe, limit, before_time,
             )
 
-        if klines and not before_time:
+        if klines and not before_time and not self._cache_disabled:
             ttl = self.cache_ttl.get(timeframe, 300)
+            cache_key = f"kline:{market}:{symbol}:{timeframe}"
             self.cache.set(cache_key, klines, ttl)
         return klines
 
@@ -573,7 +602,7 @@ class KlineService:
 
     def get_realtime_price(self, market: str, symbol: str, force_refresh: bool = False) -> Dict[str, Any]:
         cache_key = f"realtime_price:{market}:{symbol}"
-        if not force_refresh:
+        if not force_refresh and not self._cache_disabled:
             cached = self.cache.get(cache_key)
             if cached:
                 return cached
