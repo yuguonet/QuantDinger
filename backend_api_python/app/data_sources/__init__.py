@@ -3,12 +3,12 @@
 支持多种市场的K线数据获取
 
 改进版本（参考 daily_stock_analysis 项目）:
-- 熔断器保护 (circuit_breaker)
+- 熔断器保护 (coordinator.CircuitBreaker)
 - 数据缓存 (cache_manager)
 - 防封禁策略 (rate_limiter)
 """
 from app.data_sources.factory import DataSourceFactory
-from app.data_sources.circuit_breaker import (
+from app.data_sources.coordinator import (
     CircuitBreaker,
     get_realtime_circuit_breaker,
     get_overseas_circuit_breaker,

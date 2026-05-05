@@ -114,6 +114,14 @@ def _patch_datasource_warehouse():
             return datetime.fromtimestamp(t)
         return None
 
+    def _strip_suffix(symbol: str) -> str:
+        """剥掉 .SZ / .SH / .BJ 后缀，返回 DB 存储格式（纯数字代码）"""
+        s = symbol.strip().upper()
+        for suffix in (".SZ", ".SH", ".BJ", ".SS"):
+            if s.endswith(suffix):
+                return s[:-len(suffix)]
+        return s
+
     def _get_kline_with_warehouse(cls, market, symbol, timeframe, limit, before_time=None, after_time=None):
         try:
             end = _to_dt(before_time) or datetime.now()
@@ -124,8 +132,10 @@ def _patch_datasource_warehouse():
                 delta = _TF_DELTA.get(tf_key, timedelta(days=1))
                 start = end - delta * int(limit * 1.5)
 
+            # DB 存储的 symbol 不带后缀（如 "000001"），需剥掉 .SZ/.SH
+            db_symbol = _strip_suffix(symbol)
             data = _provider.get_clean_klines(
-                market=market, symbol=symbol,
+                market=market, symbol=db_symbol,
                 start=start, end=end, timeframe=timeframe,
             )
             if data and len(data) >= 10:

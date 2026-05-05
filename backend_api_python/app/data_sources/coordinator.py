@@ -71,51 +71,85 @@ logger = get_logger(__name__)
 
 
 # ================================================================
-# 熔断器 — 连续失败超阈值则熔断，冷却后恢复
+# 熔断器 — 三态状态机: Closed → Open → Half-Open → Closed
 # ================================================================
 
 class CircuitBreaker:
     """
-    熔断器 — 按源名分别跟踪故障状态。
+    熔断器 — 三态状态机: Closed → Open → Half-Open → Closed。
 
-    状态机: Closed(正常) → 连续失败≥阈值 → Open(熔断/冷却) → 冷却结束 → Half-Open(试探)
+    每个数据源可配置独立的熔断器实例，支持按源名称分别跟踪故障状态。
+
+    状态机:
+        ┌─────────┐  连续失败 ≥ 阈值  ┌──────┐  冷却期结束  ┌───────────┐
+        │ Closed  │ ───────────────→ │ Open │ ──────────→ │ Half-Open │
+        │ (正常)  │                   │(熔断)│             │ (试探)    │
+        └─────────┘ ←─────────────── └──────┘ ←────────── └───────────┘
+             ↑          请求成功                        │
+             └──────────────────────────────────────────┘  请求失败 → 回到 Open
+
+    Half-Open 关键行为:
+        冷却期结束后，只放行**一个**试探请求，其余并发请求仍被拒绝。
+        试探成功 → 回到 Closed；试探失败 → 重新回到 Open（重新计时冷却）。
+
+    线程安全性:
+        使用 threading.Lock 保护所有状态读写，多线程并发调用安全。
     """
+
+    _CLOSED = "closed"
+    _OPEN = "open"
+    _HALF_OPEN = "half_open"
 
     def __init__(
         self,
         failure_threshold: int = 3,
-        cooldown_seconds: float = 120.0,
+        cooldown_seconds: float = 300.0,
         name: str = "default",
     ):
         self._failure_threshold = failure_threshold
         self._cooldown_seconds = cooldown_seconds
         self._name = name
         self._failures: Dict[str, int] = {}
+        self._state: Dict[str, str] = {}
         self._tripped_at: Dict[str, float] = {}
         self._lock = threading.Lock()
 
     def is_available(self, source: str) -> bool:
         with self._lock:
-            if source not in self._tripped_at:
+            state = self._state.get(source, self._CLOSED)
+            if state == self._CLOSED:
                 return True
+            if state == self._HALF_OPEN:
+                return False
+            # OPEN — 检查冷却是否到期
             elapsed = time.time() - self._tripped_at[source]
             if elapsed >= self._cooldown_seconds:
-                del self._tripped_at[source]
-                self._failures[source] = 0
-                logger.info("[熔断器:%s] %s 冷却结束，恢复可用", self._name, source)
+                self._state[source] = self._HALF_OPEN
+                logger.info("[熔断器:%s] %s 冷却结束，进入半开状态", self._name, source)
                 return True
             return False
 
     def record_success(self, source: str):
         with self._lock:
             self._failures[source] = 0
-            if source in self._tripped_at:
-                del self._tripped_at[source]
+            self._state.pop(source, None)
+            self._tripped_at.pop(source, None)
 
     def record_failure(self, source: str, reason: str = ""):
         with self._lock:
+            state = self._state.get(source, self._CLOSED)
+            if state == self._HALF_OPEN:
+                self._state[source] = self._OPEN
+                self._tripped_at[source] = time.time()
+                self._failures[source] = 1
+                logger.warning(
+                    "[熔断器:%s] %s 半开试探失败，重新熔断 %ds (原因: %s)",
+                    self._name, source, self._cooldown_seconds, reason,
+                )
+                return
             self._failures[source] = self._failures.get(source, 0) + 1
             if self._failures[source] >= self._failure_threshold:
+                self._state[source] = self._OPEN
                 self._tripped_at[source] = time.time()
                 logger.warning(
                     "[熔断器:%s] %s 连续失败 %d 次，熔断 %ds (原因: %s)",
@@ -127,24 +161,27 @@ class CircuitBreaker:
         with self._lock:
             if source:
                 self._failures.pop(source, None)
+                self._state.pop(source, None)
                 self._tripped_at.pop(source, None)
             else:
                 self._failures.clear()
+                self._state.clear()
                 self._tripped_at.clear()
 
 
 # 全局熔断器实例
-_realtime_cb = CircuitBreaker(failure_threshold=3, cooldown_seconds=120, name="realtime")
+_realtime_cb = CircuitBreaker(failure_threshold=3, cooldown_seconds=300, name="realtime")
 _overseas_cb = CircuitBreaker(failure_threshold=2, cooldown_seconds=900, name="overseas")
 
 
 def get_realtime_circuit_breaker() -> CircuitBreaker:
+    """获取实时行情熔断器实例"""
     return _realtime_cb
 
 
 def get_overseas_circuit_breaker() -> CircuitBreaker:
+    """获取海外行情熔断器实例"""
     return _overseas_cb
-
 
 # ================================================================
 # 全局常量
@@ -162,6 +199,12 @@ QUEUE_DRAIN_TIMEOUT = 3.0
 # 单个源连续失败次数上限。超过后该源的 worker 线程自动退出，不再尝试。
 # 避免一个完全不可用的源反复失败浪费时间。
 MAX_SOURCE_FAILS = 5
+
+# 超时辅助线程池 — 长生命周期，避免每次 _fetch_with_timeout 都创建新线程池。
+# max_workers=8 足够覆盖并发的超时监控需求（实际 fetch 在主池执行，这里只是等待+取消）。
+_timeout_pool = concurrent.futures.ThreadPoolExecutor(
+    max_workers=8, thread_name_prefix="coord-timeout"
+)
 
 
 # ================================================================
@@ -385,6 +428,18 @@ class _WorkQueue:
             self._pending += len(batch)
             return batch
 
+    def batch_task_done(self, count: int):
+        """
+        批量标记任务完成 — 配合 get_batch() 使用。
+
+        当通过 get_batch() 一次取出 N 个任务时，处理完成后
+        需要调用 batch_task_done(N) 来正确递减 pending 计数。
+        """
+        with self._cond:
+            self._pending = max(0, self._pending - count)
+            if not self._items and self._pending == 0:
+                self._cond.notify_all()
+
     def put_back(self, sym: str):
         """
         放回队尾 — 当某源获取失败时，把 symbol 放回让其他源接手。
@@ -602,16 +657,16 @@ class Coordinator:
             """
             带超时的单次 fetch 调用。
 
-            用独立的单线程池执行 fetch_fn，超时后自动取消。
+            使用全局共享的 _timeout_pool 执行 fetch_fn，超时后自动取消。
             防止某个源的 fetch_fn 卡死（比如网络不通但不报错）导致整个队列阻塞。
             """
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as task_pool:
-                future = task_pool.submit(fn, sym, tf, lim)
-                try:
-                    return future.result(timeout=timeout_s)
-                except concurrent.futures.TimeoutError:
-                    logger.warning("[协助层] %s 获取 %s 超时 (%ss)", fn.__name__, sym, timeout_s)
-                    return None
+            future = _timeout_pool.submit(fn, sym, tf, lim)
+            try:
+                return future.result(timeout=timeout_s)
+            except concurrent.futures.TimeoutError:
+                logger.warning("[协助层] %s 获取 %s 超时 (%ss)", fn.__name__, sym, timeout_s)
+                future.cancel()
+                return None
 
         def _process_symbol(sym: str, source_name: str, fetch_fn: Callable,
                             cfg: SourceConfig) -> bool:

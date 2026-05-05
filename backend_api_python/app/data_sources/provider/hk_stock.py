@@ -19,7 +19,7 @@ from app.data_sources.rate_limiter import (
     get_request_headers, get_tencent_limiter,
 )
 from app.data_sources.provider import register
-from app.data_sources.circuit_breaker import get_overseas_circuit_breaker
+from app.data_sources.coordinator import get_overseas_circuit_breaker
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -282,23 +282,25 @@ class HKStockDataSource:
             period = tf_map.get(timeframe, "day")
             bars = _fetch_tencent_hk_kline(hk_code, period, lim, adj, timeout)
             if bars:
-                self.cb.record_success(self.name)
+                self.cb.record_success(self.name)  # tencent 走 hk_stock 主源
                 return bars
 
         # 降级链: yfinance → AkShare → Twelve Data
+        # 注意: record_success 必须与 record_failure 使用相同的源名称，
+        # 否则失败计数永远不会归零，熔断器无法恢复。
         bars = self._try_yfinance(hk_code, timeframe, lim, timeout)
         if bars:
-            self.cb.record_success(self.name)
+            self.cb.record_success("yfinance")
             return bars
 
         bars = self._try_akshare(hk_code, timeframe, lim, timeout)
         if bars:
-            self.cb.record_success(self.name)
+            self.cb.record_success("akshare")
             return bars
 
         bars = self._try_twelvedata(hk_code, timeframe, lim, timeout)
         if bars:
-            self.cb.record_success(self.name)
+            self.cb.record_success("twelvedata")
             return bars
 
         return []
