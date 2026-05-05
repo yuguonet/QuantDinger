@@ -430,21 +430,41 @@ def get_watchlist_prices():
                 market_groups.setdefault(market, []).append(symbol)
         
         results = []
-        
-        # 对每个市场使用批量 API
+
+        # 对每个市场，A股批量逗号拼接一次调 get_ticker，其他市场逐只
         for market, symbols in market_groups.items():
             try:
-                batch_result = DataSourceFactory.get_batch_tickers(market, symbols)
-                for sym in symbols:
-                    ticker = batch_result.get(sym, {})
-                    price = ticker.get('last', 0) or ticker.get('price', 0) or 0
-                    results.append({
-                        'market': market,
-                        'symbol': sym,
-                        'price': price,
-                        'change': ticker.get('change', 0),
-                        'changePercent': ticker.get('changePercent', 0) or ticker.get('percentage', 0),
-                    })
+                if market == 'CNStock':
+                    # A股: 所有自选股逗号拼接，一次调 get_ticker（内部走 Provider 批量接口）
+                    ticker_map = DataSourceFactory.get_ticker(market, ",".join(symbols))
+                    for sym in symbols:
+                        ticker = ticker_map.get(sym, {}) if isinstance(ticker_map, dict) else {}
+                        price = ticker.get('last', 0) or ticker.get('price', 0) or 0
+                        results.append({
+                            'market': market,
+                            'symbol': sym,
+                            'price': price,
+                            'change': ticker.get('change', 0),
+                            'changePercent': ticker.get('changePercent', 0) or ticker.get('percentage', 0),
+                        })
+                else:
+                    # 其他市场: 逐只调 get_ticker
+                    for sym in symbols:
+                        try:
+                            ticker = DataSourceFactory.get_ticker(market, sym)
+                            price = ticker.get('last', 0) or ticker.get('price', 0) or 0
+                            results.append({
+                                'market': market,
+                                'symbol': sym,
+                                'price': price,
+                                'change': ticker.get('change', 0),
+                                'changePercent': ticker.get('changePercent', 0) or ticker.get('percentage', 0),
+                            })
+                        except Exception:
+                            results.append({
+                                'market': market, 'symbol': sym,
+                                'price': 0, 'change': 0, 'changePercent': 0,
+                            })
             except Exception as e:
                 logger.warning(f"Batch ticker fetch failed for {market}: {e}")
                 # 降级：逐个获取

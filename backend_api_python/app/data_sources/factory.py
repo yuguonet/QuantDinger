@@ -232,6 +232,49 @@ class DataSourceFactory:
             return {'last': 0, 'symbol': symbol}
 
     @classmethod
+    def get_batch_tickers(
+        cls,
+        market: str,
+        symbols: List[str],
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        批量获取实时行情（ticker 格式: last, change, changePercent, ...）。
+
+        层级链路:
+          Provider.fetch_quotes_batch → Coordinator.passthrough
+          → DataSource.get_batch_quotes → ★ DataSourceFactory.get_batch_tickers
+
+        - CNStock: 透传 Provider 层批量接口（腾讯/新浪一次 HTTP 拿多只）
+        - 其他市场: 逐只调用 get_ticker
+
+        Args:
+            market: 市场类型
+            symbols: 交易标的列表
+
+        Returns:
+            {symbol: {"last", "change", "changePercent", ...}}
+        """
+        try:
+            m = cls.normalize_market(market or "")
+            source = cls.get_source(m)
+            # CNStockDataSource 实现了 get_batch_quotes（透传 Provider 批量接口）
+            if hasattr(source, 'get_batch_quotes'):
+                return source.get_batch_quotes(symbols)
+            # 其他市场逐只获取
+            results: Dict[str, Dict[str, Any]] = {}
+            for sym in symbols:
+                try:
+                    ticker = source.get_ticker(sym)
+                    if ticker:
+                        results[sym] = ticker
+                except Exception as e:
+                    logger.debug(f"get_batch_tickers fallback failed for {m}:{sym} - {e}")
+            return results
+        except Exception as e:
+            logger.error(f"Failed to batch fetch tickers {market} - {str(e)}")
+            return {}
+
+    @classmethod
     def get_batch_quotes(
         cls,
         market: str,

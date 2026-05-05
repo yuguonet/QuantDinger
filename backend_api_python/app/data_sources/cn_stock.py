@@ -185,7 +185,20 @@ class CNStockDataSource(BaseDataSource):
     # ----------------------------------------------------------
 
     def get_ticker(self, symbol: str) -> Dict[str, Any]:
-        """获取最新报价 — Coordinator 从 Provider 层自动发现源，race 模式"""
+        """
+        获取最新报价 — Coordinator 从 Provider 层自动发现源，race 模式。
+
+        支持逗号分隔批量: "600519,000001,000690" → 返回 {symbol: ticker, ...}
+        单只时返回单个 ticker dict。
+        """
+        # ── 批量模式：逗号分隔 ──
+        if ',' in symbol:
+            symbols = [s.strip() for s in symbol.split(',') if s.strip()]
+            if not symbols:
+                return {"last": 0, "symbol": symbol}
+            return self.get_batch_quotes(symbols)
+
+        # ── 单只模式 ──
         code = normalize_cn_code(symbol)
 
         # 先检查缓存
@@ -239,11 +252,22 @@ class CNStockDataSource(BaseDataSource):
         after_time: Optional[int] = None,
         adj: str = "qfq",
     ) -> List[Dict[str, Any]]:
-        """获取单只股票 K 线 — Coordinator 从 Provider 层自动发现源并调度
+        """
+        获取单只股票 K 线 — Coordinator 从 Provider 层自动发现源并调度。
+
+        支持逗号分隔批量: "600519,000001,000690" → 返回 {symbol: [bars, ...], ...}
+        单只时返回 List[Dict]。
 
         Args:
             adj: 复权方式 — "qfq"(前复权,默认) / "hfq"(后复权) / ""(不复权)
         """
+        # ── 批量模式：逗号分隔 ──
+        if ',' in symbol:
+            symbols = [s.strip() for s in symbol.split(',') if s.strip()]
+            if not symbols:
+                return []
+            return self.get_kline_batch(symbols, timeframe, limit, adj=adj)
+
         code = normalize_cn_code(symbol)
         tf = normalize_chart_timeframe(timeframe)
         lim = max(int(limit or 300), 1)

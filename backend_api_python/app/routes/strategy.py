@@ -801,7 +801,7 @@ def get_positions():
             cur = db.cursor()
             cur.execute(
                 """
-                SELECT id, strategy_id, symbol, side, size, entry_price, current_price, highest_price,
+                SELECT id, strategy_id, market, symbol, side, size, entry_price, current_price, highest_price,
                        unrealized_pnl, pnl_percent, equity, updated_at
                 FROM qd_strategy_positions
                 WHERE strategy_id = ?
@@ -833,17 +833,30 @@ def get_positions():
             return float(pnl) / denom * 100.0
 
         now = int(time.time())
-        # Fetch prices in parallel to reduce latency.
+        # Fetch prices — 按市场分组，避免 A 股代码混入 Crypto 数据源
         sym_to_price: dict[str, float] = {}
-        ds = DataSourceFactory.get_source("Crypto")
-        unique_syms = list({(r.get("symbol") or "").strip() for r in rows if (r.get("symbol") or "").strip()})
+        from app.data_sources.market_detector import detect_market as _detect_sym_market
+        market_groups: dict[str, list[str]] = {}
+        for r in rows:
+            sym = (r.get("symbol") or "").strip()
+            mkt = (r.get("market") or "").strip()
+            if not sym:
+                continue
+            if not mkt:
+                mkt = _detect_sym_market(sym) or "Crypto"
+            market_groups.setdefault(mkt, []).append(sym)
 
-        if unique_syms:
+        for mkt, syms in market_groups.items():
+            unique_syms = list(dict.fromkeys(syms))  # 保序去重
+            if not unique_syms:
+                continue
+            ds = DataSourceFactory.get_source(mkt)
+
             from concurrent.futures import ThreadPoolExecutor, as_completed
 
-            def _fetch_price(sym: str) -> tuple[str, float]:
+            def _fetch_price(sym: str, _ds=ds) -> tuple[str, float]:
                 try:
-                    t = ds.get_ticker(sym) or {}
+                    t = _ds.get_ticker(sym) or {}
                     px = float(t.get("last") or t.get("close") or 0.0)
                     return sym, px
                 except Exception:
