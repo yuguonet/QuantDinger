@@ -312,13 +312,13 @@ class TestGetTicker:
 class TestGetTickerBatch:
 
     def test_delegates_to_provider(self, ds, mock_coordinator):
-        """有 Provider 时透传 fetch_quotes_batch。"""
+        """有 Provider 时透传 fetch_tickers。"""
         expected = {"600519": {"close": 1800.0}, "000001": {"close": 10.0}}
         mock_provider = MagicMock()
-        mock_provider.fetch_quotes_batch.return_value = expected
+        mock_provider.fetch_tickers.return_value = expected
 
         with patch("app.data_sources.provider.get_providers", return_value=[mock_provider]):
-            with patch.object(mock_coordinator, "passthrough", side_effect=lambda fn, *a: fn(*a)):
+            with patch.object(mock_coordinator, "direct_call", side_effect=lambda fn, *a: fn(*a)):
                 result = ds.get_ticker("600519,000001")
 
         assert result == expected
@@ -332,12 +332,12 @@ class TestGetTickerBatch:
     def test_provider_returns_empty(self, ds, mock_coordinator):
         """Provider 返回空时继续尝试下一个。"""
         p1 = MagicMock()
-        p1.fetch_quotes_batch.return_value = {}
+        p1.fetch_tickers.return_value = {}
         p2 = MagicMock()
-        p2.fetch_quotes_batch.return_value = {}
+        p2.fetch_tickers.return_value = {}
 
         with patch("app.data_sources.provider.get_providers", return_value=[p1, p2]):
-            with patch.object(mock_coordinator, "passthrough", side_effect=lambda fn, *a: fn(*a)):
+            with patch.object(mock_coordinator, "direct_call", side_effect=lambda fn, *a: fn(*a)):
                 result = ds.get_ticker("600519,000001")
         assert result == {}
 

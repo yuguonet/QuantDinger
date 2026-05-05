@@ -308,7 +308,7 @@ class TwelveDataSource:
         """批量K线 — Twelve Data 不支持原生批量，返回 NotSupportedResult"""
         return NotSupportedResult(self.name, "fetch_kline_batch")
 
-    def fetch_quote(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
+    def fetch_ticker(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
         """
         获取单只股票实时行情 — 通过 Twelve Data /quote API。
 
@@ -374,8 +374,8 @@ class TwelveDataSource:
             "symbol": f"{symbol}.{exchange}",
         }
 
-    def fetch_quotes_batch(
+    def fetch_tickers(
         self, codes: List[str], timeout: int = 10,
     ) -> Dict[str, Dict[str, Any]]:
         """批量行情 — Twelve Data 不支持批量行情，返回 NotSupportedResult"""
-        return NotSupportedResult(self.name, "fetch_quotes_batch")
+        return NotSupportedResult(self.name, "fetch_tickers")

@@ -50,7 +50,7 @@
 
   coordinate_kline  → 实际含义: "并发批量拉K线，动态队列分配多源"
   coordinate_ticker → 实际含义: "实时行情多源Race，谁先返回用谁"
-  passthrough       → 实际含义: "透传调用，不加任何协调逻辑，直接调函数"
+  direct_call       → 实际含义: "直接调用，不加任何协调逻辑"
   _mark_failed      → 实际含义: "标记某源对某symbol失败，放回队列尝试下一个源，或彻底放弃"
   _mark_success     → 实际含义: "标记某symbol获取成功，从队列中移除"
 """
@@ -233,22 +233,22 @@ def _make_provider_fetch_fn(provider, adj: str = "qfq") -> Callable:
 
 def _make_provider_quote_fn(provider) -> Callable:
     """
-    行情适配器: 把 Provider.fetch_quote 包装成 Coordinator 能用的 fetch_fn。
+    行情适配器: 把 Provider.fetch_ticker 包装成 Coordinator 能用的 fetch_fn。
 
     签名转换:
-      Provider:  provider.fetch_quote(code, timeout=8) -> Dict | None | NotSupportedResult
+      Provider:  provider.fetch_ticker(code, timeout=8) -> Dict | None | NotSupportedResult
       Coordinator 期望:  fetch_fn(symbol) -> Dict | None
 
     注意: fetch_fn 只接收 symbol 一个参数（和 K线适配器不同，没有 timeframe/limit）。
     """
     def fetch_fn(symbol: str):
         try:
-            result = provider.fetch_quote(symbol)
+            result = provider.fetch_ticker(symbol)
             if not result:
                 return None
             return result
         except Exception as e:
-            logger.debug("[适配器] %s.fetch_quote(%s) 异常: %s",
+            logger.debug("[适配器] %s.fetch_ticker(%s) 异常: %s",
                         provider.name, symbol, e)
             return None
 
@@ -931,12 +931,12 @@ class Coordinator:
     # ================================================================
 
     @staticmethod
-    def passthrough(fn: Callable, *args, **kwargs):
+    def direct_call(fn: Callable, *args, **kwargs):
         """
-        纯透传 — 直接调用函数，不加任何并发/重试/熔断逻辑。
+        直接调用 — 不加任何并发/重试/熔断逻辑。
 
         使用场景: 当调用方已经知道自己要调什么、不需要 Coordinator 的调度能力时。
-        例如: CNStockDataSource.get_batch_quotes() 直接透传到 Provider 的 fetch_quotes_batch()。
+        例如: CNStockDataSource.get_batch_quotes() 直接调用 Provider 的 fetch_tickers()。
 
         为什么不直接调 fn？
         保留统一入口，方便以后加日志/监控/限流等横切关注点。
@@ -1038,3 +1038,28 @@ def get_coordinator() -> Coordinator:
     调用方: CNStockDataSource, DataSourceFactory, routes/*, services/*
     """
     return _coordinator
+
+
+def Coordinator_direct_call(fn: Callable, *args, **kwargs):
+    """
+    Coordinator 的直接调用入口 — 不走动态队列/Race/熔断，直接执行 fn。
+
+    命名来源: Coordinator.direct_call() 的模块级快捷方式。
+    前缀 "Coordinator_" 标明出处，避免与普通工具函数混淆。
+
+    使用场景:
+      - Provider 层的 batch_quote 等接口形状不适合 coordinate_kline / coordinate_ticker 时
+      - 调用方已自行处理错误恢复，不需要 Coordinator 的调度保护
+
+    Args:
+        fn: 要直接调用的函数
+        *args, **kwargs: 透传给 fn 的参数
+
+    Returns:
+        fn 的返回值
+
+    示例:
+        from app.data_sources.coordinator import Coordinator_direct_call
+        result = Coordinator_direct_call(provider.fetch_tickers, symbols)
+    """
+    return _coordinator.direct_call(fn, *args, **kwargs)

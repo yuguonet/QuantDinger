@@ -3,7 +3,7 @@
 港股/H股数据源 — 直接调用 Provider 层
 
 架构:
-  get_ticker()      → 逐源尝试 fetch_quote，第一个成功的直接返回
+  get_ticker()      → 逐源尝试 fetch_ticker，第一个成功的直接返回
   get_kline()       → 逐源尝试 fetch_kline，第一个成功的直接返回
 
 数据源:
@@ -74,7 +74,7 @@ class HKStockDataSource(BaseDataSource):
         for p in providers:
             try:
                 start = time.time()
-                result = p.fetch_quote(code)
+                result = p.fetch_ticker(code)
                 elapsed = time.time() - start
 
                 if result and ("last" in result or "price" in result):

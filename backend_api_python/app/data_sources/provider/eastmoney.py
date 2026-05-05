@@ -10,12 +10,11 @@
   - K线: 全周期（1m/5m/15m/30m/1H/1D/1W），通过 kline/get API
   - 单只行情: 实时行情快照（stock/get API）
   - 批量行情: 单次HTTP获取全市场行情（clist/get API，最多6000只）
-  - 市场数据: 龙虎榜、热度排名、涨停池、跌停池、炸板池（datacenter API）
+  - 市场数据（龙虎榜/涨停池等）已迁移至 maket_cn/eastmoney_market.py
 
 特点:
   - 国内最稳定的免费数据源
   - 批量行情支持全市场（一次HTTP获取所有A股行情）
-  - 市场数据丰富（龙虎榜/涨停池等独有数据）
   - K线API是 per-symbol 的，不支持原生批量
 
 在架构中的位置:
@@ -23,7 +22,7 @@
 
 关键依赖:
   - requests: HTTP 请求
-  - app.data_sources.normalizer: 股票代码标准化（to_eastmoney_secid, to_raw_digits, safe_float, safe_int）
+  - app.data_sources.normalizer: 股票代码标准化（to_eastmoney_secid, to_raw_digits）
   - app.data_sources.rate_limiter: 限流器
 """
 
@@ -36,7 +35,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from app.data_sources.normalizer import to_raw_digits, safe_float, safe_int, detect_market
+from app.data_sources.normalizer import to_raw_digits, detect_market
 from app.data_sources.rate_limiter import (
     get_request_headers, retry_with_backoff, get_eastmoney_limiter,
 )
@@ -80,13 +79,7 @@ _em_quote_referers = _RefererPool([
     "https://push2.eastmoney.com/",
 ])
 
-# 东财数据中心 Referer 池
-_em_data_referers = _RefererPool([
-    "https://data.eastmoney.com/",
-    "https://datacenter-web.eastmoney.com/",
-    "https://www.eastmoney.com/",
-    "https://quote.eastmoney.com/",
-])
+
 
 # 东财K线周期映射: 内部周期 → 东财 klt 参数
 # klt (K Line Type): 1=1分钟, 5=5分钟, ..., 101=日线, 102=周线
@@ -232,7 +225,7 @@ class EastMoneyDataSource:
         out.sort(key=lambda x: x["time"])
         return out[-count:] if len(out) > count else out
 
-    def fetch_quote(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
+    def fetch_ticker(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
         """
         获取单只股票实时行情。
 
@@ -299,7 +292,7 @@ class EastMoneyDataSource:
             "symbol": secid,
         }
 
-    def fetch_quotes_batch(self, codes: List[str], timeout: int = 15) -> Dict[str, Dict[str, Any]]:
+    def fetch_tickers(self, codes: List[str], timeout: int = 15) -> Dict[str, Dict[str, Any]]:
         """
         批量获取全市场实时行情 — 单次HTTP请求。
 
@@ -379,310 +372,3 @@ class EastMoneyDataSource:
         return result
 
 
-# ================================================================
-# 市场数据 — 独立函数
-# ================================================================
-
-def _em_request(report_name: str, params: dict = None, timeout: int = 10) -> list:
-    """
-    东财 datacenter API 通用请求函数。
-
-    所有市场数据（龙虎榜/涨停池等）共用同一个 datacenter API，
-    通过 report_name 区分不同的报表。
-
-    Args:
-        report_name: 报表名称（如 "RPT_DAILYBILLBOARD_DETAILSNEW"）
-        params:      额外请求参数
-        timeout:     请求超时秒数
-
-    Returns:
-        数据列表，失败返回空列表
-    """
-    get_eastmoney_limiter().wait()
-    default_params = {
-        "sortColumns": "TRADE_DATE", "sortTypes": "-1",
-        "pageSize": 500, "pageNumber": 1,
-        "reportName": report_name, "columns": "ALL",
-        "source": "WEB", "client": "WEB",
-    }
-    if params:
-        default_params.update(params)
-    resp = requests.get(
-        "https://datacenter-web.eastmoney.com/api/data/v1/get",
-        headers=get_request_headers(referer=_em_data_referers.next()),
-        params=default_params, timeout=timeout,
-    )
-    try:
-        data = resp.json()
-    except Exception:
-        return []
-    return ((data.get("result") or {}).get("data")) or []
-
-
-def fetch_dragon_tiger(start_date: str, end_date: str) -> List[Dict[str, Any]]:
-    """
-    获取龙虎榜数据（每日龙虎榜明细）。
-
-    龙虎榜是交易所公布的异常波动股票的买卖席位明细，
-    包括买入/卖出金额、净买入、涨跌幅、换手率等。
-
-    Args:
-        start_date: 开始日期（格式: "2024-01-01"）
-        end_date:   结束日期（格式: "2024-01-31"）
-
-    Returns:
-        龙虎榜明细列表，每个元素包含:
-          stock_code/stock_name/trade_date/reason/buy_amount/sell_amount/net_amount
-          change_percent/close_price/turnover_rate/amount/buy_seat_count/sell_seat_count
-    """
-    items = _em_request(
-        "RPT_DAILYBILLBOARD_DETAILSNEW",
-        params={"filter": f"(TRADE_DATE>='{start_date}')(TRADE_DATE<='{end_date}')"},
-    )
-    if not items:
-        return []
-    result = []
-    for item in items:
-        try:
-            result.append({
-                "stock_code": str(item.get("SECURITY_CODE", "")).strip(),
-                "stock_name": str(item.get("SECURITY_NAME_ABBR", "")).strip(),
-                "trade_date": (str(item.get("TRADE_DATE", ""))[:10]).strip(),
-                "reason": str(item.get("EXPLANATION", "") or "").strip()[:100],
-                "buy_amount": safe_float(item.get("BUY")),
-                "sell_amount": safe_float(item.get("SELL")),
-                "net_amount": safe_float(item.get("NET_BUY")),
-                "change_percent": safe_float(item.get("CHANGE_RATE")),
-                "close_price": safe_float(item.get("CLOSE_PRICE")),
-                "turnover_rate": safe_float(item.get("TURNOVERRATE")),
-                "amount": safe_float(item.get("ACCUM_AMOUNT")),
-                "buy_seat_count": safe_int(item.get("BUYER_NUM") or 0),
-                "sell_seat_count": safe_int(item.get("SELLER_NUM") or 0),
-            })
-        except Exception:
-            continue
-    return result
-
-
-def fetch_hot_rank() -> List[Dict[str, Any]]:
-    """
-    获取市场热度排名（热门股票TOP50）。
-
-    热度排名基于东财的热度数据，按涨跌幅降序排列，
-    包含热度分数和排名变化。
-
-    Returns:
-        热门股票列表（最多50只），每个元素包含:
-          rank/stock_code/stock_name/price/change_percent/popularity_score/current_rank_change
-    """
-    items = _em_request(
-        "RPT_HOT_STOCK_NEW",
-        params={
-            "sortColumns": "CHANGE_RATE", "sortTypes": "-1", "pageSize": 50,
-            "filter": "(MARKET_TYPE in (\"沪深A股\"))",
-        },
-    )
-    if not items:
-        return []
-    result = []
-    for i, item in enumerate(items):
-        try:
-            code = str(item.get("SECURITY_CODE", "")).strip()
-            if not code:
-                continue
-            result.append({
-                "rank": i + 1, "stock_code": code,
-                "stock_name": str(item.get("SECURITY_NAME_ABBR", "")).strip(),
-                "price": safe_float(item.get("NEWEST_PRICE", item.get("CLOSE_PRICE"))),
-                "change_percent": safe_float(item.get("CHANGE_RATE")),
-                "popularity_score": safe_float(item.get("HOT_NUM", item.get("SCORE"))),
-                "current_rank_change": str(item.get("RANK_CHANGE", "")),
-            })
-        except Exception:
-            continue
-    return result
-
-
-def fetch_zt_pool(trade_date: str) -> List[Dict[str, Any]]:
-    """
-    获取涨停板股票池（当日涨停股票列表）。
-
-    涨停板是当日涨幅达到涨停限制（主板10%，创业板/科创板20%）的股票，
-    包含涨停时间、封单金额、连板天数等信息。
-
-    Args:
-        trade_date: 交易日期（格式: "2024-01-01"）
-
-    Returns:
-        涨停股票列表，每个元素包含:
-          stock_code/stock_name/trade_date/price/change_percent/continuous_zt_days
-          zt_time/seal_amount/turnover_rate/volume/amount/sector/reason/open_count
-    """
-    items = _em_request(
-        "RPT_LIMITED_BOARD_POOL",
-        params={"sortColumns": "TOTAL_MARKET_CAP", "sortTypes": "-1",
-                "filter": f"(TRADE_DATE='{trade_date}')"},
-    )
-    if not items:
-        return []
-    result = []
-    for item in items:
-        try:
-            result.append({
-                "stock_code": str(item.get("SECURITY_CODE", "")).strip(),
-                "stock_name": str(item.get("SECURITY_NAME_ABBR", "")).strip(),
-                "trade_date": trade_date,
-                "price": safe_float(item.get("CLOSE_PRICE")),
-                "change_percent": safe_float(item.get("CHANGE_RATE")),
-                "continuous_zt_days": safe_int(item.get("CONTINUOUS_LIMIT_DAYS", item.get("ZT_DAYS", 1)) or 1),
-                "zt_time": str(item.get("FIRST_ZDT_TIME", "")),
-                "seal_amount": safe_float(item.get("LIMIT_ORDER_AMT")),
-                "turnover_rate": safe_float(item.get("TURNOVERRATE")),
-                "volume": safe_float(item.get("VOLUME")),
-                "amount": safe_float(item.get("TURNOVER")),
-                "sector": str(item.get("BOARD_NAME", "")),
-                "reason": str(item.get("ZT_REASON", ""))[:80],
-                "open_count": safe_int(item.get("OPEN_NUM", 0) or 0),
-            })
-        except Exception:
-            continue
-    return result
-
-
-def fetch_dt_pool(trade_date: str) -> List[Dict[str, Any]]:
-    """
-    获取跌停板股票池（当日跌停股票列表）。
-
-    跌停板是当日跌幅达到跌停限制的股票。
-
-    Args:
-        trade_date: 交易日期（格式: "2024-01-01"）
-
-    Returns:
-        跌停股票列表，每个元素包含:
-          stock_code/stock_name/trade_date/price/change_percent/seal_amount
-          turnover_rate/amount
-    """
-    items = _em_request(
-        "RPT_DOWNTREND_LIMIT_POOL",
-        params={"sortColumns": "TOTAL_MARKET_CAP", "sortTypes": "-1",
-                "filter": f"(TRADE_DATE='{trade_date}')"},
-    )
-    if not items:
-        return []
-    result = []
-    for item in items:
-        try:
-            result.append({
-                "stock_code": str(item.get("SECURITY_CODE", "")).strip(),
-                "stock_name": str(item.get("SECURITY_NAME_ABBR", "")).strip(),
-                "trade_date": trade_date,
-                "price": safe_float(item.get("CLOSE_PRICE")),
-                "change_percent": safe_float(item.get("CHANGE_RATE")),
-                "seal_amount": safe_float(item.get("LIMIT_ORDER_AMT")),
-                "turnover_rate": safe_float(item.get("TURNOVERRATE")),
-                "amount": safe_float(item.get("TURNOVER")),
-            })
-        except Exception:
-            continue
-    return result
-
-
-def fetch_broken_board(trade_date: str) -> List[Dict[str, Any]]:
-    """
-    获取炸板股票池（当日涨停后打开的股票列表）。
-
-    炸板是指股票涨停后，封单被打开（未能封住涨停至收盘），
-    包含涨停时间和炸板时间。
-
-    Args:
-        trade_date: 交易日期（格式: "2024-01-01"）
-
-    Returns:
-        炸板股票列表，每个元素包含:
-          stock_code/stock_name/trade_date/price/change_percent
-          zt_time/break_time/turnover_rate/amount
-    """
-    items = _em_request(
-        "RPT_LIMITED_BOARD_UNSEALED",
-        params={"sortColumns": "TOTAL_MARKET_CAP", "sortTypes": "-1",
-                "filter": f"(TRADE_DATE='{trade_date}')"},
-    )
-    if not items:
-        return []
-    result = []
-    for item in items:
-        try:
-            result.append({
-                "stock_code": str(item.get("SECURITY_CODE", "")).strip(),
-                "stock_name": str(item.get("SECURITY_NAME_ABBR", "")).strip(),
-                "trade_date": trade_date,
-                "price": safe_float(item.get("CLOSE_PRICE")),
-                "change_percent": safe_float(item.get("CHANGE_RATE")),
-                "zt_time": str(item.get("FIRST_ZDT_TIME", "")),
-                "break_time": str(item.get("LAST_ZDT_TIME", "")),
-                "turnover_rate": safe_float(item.get("TURNOVERRATE")),
-                "amount": safe_float(item.get("TURNOVER")),
-            })
-        except Exception:
-            continue
-    return result
-
-
-def aggregate_daily_to_monthly(daily_bars: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
-    """
-    将日线K线聚合为月线K线。
-
-    聚合算法:
-      1. 按时间排序所有日线数据
-      2. 按月份分组（以每月1日零点为分组键）
-      3. 每组内:
-         - open = 该月第一天的开盘价
-         - high = 该月所有最高价的最大值
-         - low = 该月所有最低价的最小值
-         - close = 该月最后一天的收盘价
-         - volume = 该月所有成交量之和
-      4. 截取最后 limit 条
-
-    Args:
-        daily_bars: 日线K线数据列表
-        limit:      返回的月线条数
-
-    Returns:
-        月线K线数据列表，按时间升序排列
-    """
-    if not daily_bars:
-        return []
-    # 按时间排序
-    bars = sorted(daily_bars, key=lambda x: x.get("time", 0))
-
-    # 按月份分组: 使用每月1日零点时间戳作为分组键
-    groups: Dict[int, list] = {}
-    order: List[int] = []
-    for bar in bars:
-        t = bar.get("time", 0)
-        if not t:
-            continue
-        dt = datetime.fromtimestamp(t, tz=timezone(timedelta(hours=8)))
-        # 取该月1日零点时间戳
-        ms = int(dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp())
-        if ms not in groups:
-            groups[ms] = []
-            order.append(ms)
-        groups[ms].append(bar)
-
-    # 按月聚合
-    result = []
-    for ms in order:
-        chunk = groups[ms]
-        if not chunk:
-            continue
-        result.append({
-            "time": ms,
-            "open": float(chunk[0].get("open", 0)),                          # 月初开盘
-            "high": max(float(b.get("high", 0)) for b in chunk),             # 月内最高
-            "low": min(float(b.get("low", 0)) for b in chunk),               # 月内最低
-            "close": float(chunk[-1].get("close", 0)),                        # 月末收盘
-            "volume": round(sum(float(b.get("volume", 0)) for b in chunk), 2),  # 月内总成交量
-        })
-    return result[-limit:] if len(result) > limit else result

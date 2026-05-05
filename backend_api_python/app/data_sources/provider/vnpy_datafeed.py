@@ -227,7 +227,7 @@ class VnpyDataSource:
     @retry_with_backoff(max_attempts=3, base_delay=1.0, max_delay=8.0, exceptions=(
         requests.exceptions.RequestException, ConnectionError, TimeoutError,
     ))
-    def fetch_quote(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
+    def fetch_ticker(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
         """
         获取单只股票实时行情。
 
@@ -297,7 +297,7 @@ class VnpyDataSource:
             "previousClose": prev, "volume": _f("f47"), "amount": _f("f48"),
         }
 
-    def fetch_quotes_batch(self, codes: List[str], timeout: int = 10) -> Dict[str, Dict[str, Any]]:
+    def fetch_tickers(self, codes: List[str], timeout: int = 10) -> Dict[str, Dict[str, Any]]:
         """
         批量获取多只股票实时行情。
 

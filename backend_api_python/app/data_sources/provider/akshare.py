@@ -182,7 +182,7 @@ class AkShareDataSource:
     限制:
       - akshare 是重量级依赖，首次导入耗时
       - 限流严格: 最小间隔 1s + 随机抖动 0.5-2s
-      - 不支持单只行情 (fetch_quote 返回 None)
+      - 不支持单只行情 (fetch_ticker 返回 None)
     """
 
     name = "akshare"
@@ -289,11 +289,11 @@ class AkShareDataSource:
             df = ak.stock_zh_a_hist_min_em(symbol=code, period=period)
         return _parse_ak_kline(df, count)
 
-    def fetch_quote(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
+    def fetch_ticker(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
         """单只行情 — AkShare 不支持，返回 None (由其他源提供)"""
         return None
 
-    def fetch_quotes_batch(self, codes: List[str], timeout: int = 15) -> Dict[str, Dict[str, Any]]:
+    def fetch_tickers(self, codes: List[str], timeout: int = 15) -> Dict[str, Dict[str, Any]]:
         """
         批量获取A股实时行情 — 通过全市场行情接口 (stock_zh_a_spot_em)。
 

@@ -320,7 +320,7 @@ class BaoStockDataSource:
 
         return []
 
-    def fetch_quote(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
+    def fetch_ticker(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
         """
         获取单只股票实时行情。
 
@@ -419,11 +419,11 @@ class BaoStockDataSource:
 
         return None
 
-    def fetch_quotes_batch(self, codes: List[str], timeout: int = 10) -> Dict[str, Dict[str, Any]]:
+    def fetch_tickers(self, codes: List[str], timeout: int = 10) -> Dict[str, Dict[str, Any]]:
         """
         批量获取多只股票实时行情。
 
-        通过逐只调用 fetch_quote 实现。
+        通过逐只调用 fetch_ticker 实现。
 
         Args:
             codes:   股票代码列表
@@ -438,7 +438,7 @@ class BaoStockDataSource:
         for c in codes:
             if not c:
                 continue
-            q = self.fetch_quote(c, timeout=timeout)
+            q = self.fetch_ticker(c, timeout=timeout)
             if q:
                 result[c] = q
         return result

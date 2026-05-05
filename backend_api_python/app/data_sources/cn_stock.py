@@ -18,7 +18,8 @@ from app.data_sources.base import BaseDataSource
 from app.data_sources.normalizer import normalize_cn_code
 from app.data_sources.asia_stock_kline import normalize_chart_timeframe
 from app.data_sources.circuit_breaker import get_realtime_circuit_breaker
-from app.data_sources.coordinator import get_coordinator
+from app.data_sources.coordinator import get_coordinator, Coordinator_direct_call
+from app.data_sources.kline_clean import clean_klines
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -122,9 +123,9 @@ class CNStockDataSource(BaseDataSource):
         providers = get_providers(capability="batch_quote", market="CNStock")
         if not providers:
             return {}
-        # 按优先级逐源尝试（passthrough 透传，失败自动降级）
+        # 按优先级逐源尝试（Coordinator_direct_call，失败自动降级）
         for p in providers:
-            raw_result = get_coordinator().passthrough(p.fetch_quotes_batch, normalized)
+            raw_result = Coordinator_direct_call(p.fetch_tickers, normalized)
             if raw_result:
                 # 统一去掉 key 和 symbol 字段的市场前缀
                 cleaned = {}
@@ -242,6 +243,14 @@ class CNStockDataSource(BaseDataSource):
         # 合并结果 — 统一去掉 key 的市场前缀
         for sym, bars in coord_results.items():
             result[_strip_cn_prefix(sym)] = bars
+
+        # 清洗 K 线：补齐中间缺失 bar
+        for sym in result:
+            before = len(result[sym])
+            result[sym] = clean_klines(result[sym], tf)
+            after = len(result[sym])
+            if after > before:
+                logger.info(f"[K线补齐] {sym} tf={tf} {before}→{after} bars (+{after - before})")
 
         if failed:
             logger.warning(f"[K线批量] {len(failed)} 只失败: {failed[:5]}...")

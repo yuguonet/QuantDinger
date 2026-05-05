@@ -86,13 +86,13 @@ def _make_provider_fetch_fn(provider) -> Callable:
 
 def _make_provider_quote_fn(provider) -> Callable:
     """
-    将 Provider 的 fetch_quote 方法适配为 Coordinator 的 fetch_fn 签名。
+    将 Provider 的 fetch_ticker 方法适配为 Coordinator 的 fetch_fn 签名。
 
     Coordinator 期望: fetch_fn(symbol) -> Dict | None
-    Provider 提供:    provider.fetch_quote(code, timeout=8) -> Dict | None | NotSupportedResult
+    Provider 提供:    provider.fetch_ticker(code, timeout=8) -> Dict | None | NotSupportedResult
 
     适配逻辑:
-      1. 调用 provider.fetch_quote
+      1. 调用 provider.fetch_ticker
       2. 如果返回 NotSupportedResult 或 None，返回 None（Coordinator 跳过）
       3. 如果返回有效 Dict（last > 0），直接返回
 
@@ -104,12 +104,12 @@ def _make_provider_quote_fn(provider) -> Callable:
     """
     def fetch_fn(symbol: str):
         try:
-            result = provider.fetch_quote(symbol)
+            result = provider.fetch_ticker(symbol)
             if not result:
                 return None
             return result
         except Exception as e:
-            logger.debug("[适配器] %s.fetch_quote(%s) 异常: %s",
+            logger.debug("[适配器] %s.fetch_ticker(%s) 异常: %s",
                         provider.name, symbol, e)
             return None
 
@@ -586,8 +586,8 @@ class Coordinator:
     # ── 纯透传 ────────────────────────────────────────────────────
 
     @staticmethod
-    def passthrough(fn: Callable, *args, **kwargs):
-        """纯透传，不加任何逻辑"""
+    def direct_call(fn: Callable, *args, **kwargs):
+        """直接调用，不加任何协调逻辑"""
         return fn(*args, **kwargs)
 
     # ── 内部工具 ─────────────────────────────────────────────────
