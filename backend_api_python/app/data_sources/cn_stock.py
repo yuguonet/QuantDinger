@@ -237,19 +237,24 @@ class CNStockDataSource(BaseDataSource):
         limit: int,
         before_time: Optional[int] = None,
         after_time: Optional[int] = None,
+        adj: str = "qfq",
     ) -> List[Dict[str, Any]]:
-        """获取单只股票 K 线 — Coordinator 从 Provider 层自动发现源并调度"""
+        """获取单只股票 K 线 — Coordinator 从 Provider 层自动发现源并调度
+
+        Args:
+            adj: 复权方式 — "qfq"(前复权,默认) / "hfq"(后复权) / ""(不复权)
+        """
         code = normalize_cn_code(symbol)
         tf = normalize_chart_timeframe(timeframe)
         lim = max(int(limit or 300), 1)
 
-        # 先检查缓存
-        cache_key = generate_kline_cache_key(code, tf, lim, before_time)
+        # 先检查缓存（缓存 key 包含 adj，不同复权方式独立缓存）
+        cache_key = generate_kline_cache_key(code, tf, lim, before_time, adj=adj)
         cached = self.kline_cache.get(cache_key)
         if cached:
             return cached
 
-        # 交给 Coordinator（自动从 Provider 层发现源，无需手动构建 sources）
+        # 交给 Coordinator（自动从 Provider 层发现源，传递 adj）
         results, failed = get_coordinator().coordinate_kline(
             symbols=[code],
             timeframe=tf,
@@ -257,6 +262,7 @@ class CNStockDataSource(BaseDataSource):
             cb=self.circuit_breaker,
             market="CNStock",
             timeout=_get_timeout() + 5,
+            adj=adj,
         )
 
         bars = results.get(code)
@@ -283,10 +289,14 @@ class CNStockDataSource(BaseDataSource):
         timeframe: str,
         limit: int,
         cached_symbols: Optional[set] = None,
+        adj: str = "qfq",
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
         批量获取多只股票 K 线 — Coordinator 自动源发现 + 动态队列。
         月线先走日线批量再聚合。
+
+        Args:
+            adj: 复权方式 — "qfq"(前复权,默认) / "hfq"(后复权) / ""(不复权)
         """
         if not symbols:
             return {}
@@ -298,7 +308,7 @@ class CNStockDataSource(BaseDataSource):
         if tf == "1M":
             daily_limit = min(limit * 21 + 100, 5000)
             daily_result = self.get_kline_batch(
-                symbols, "1D", daily_limit, cached_symbols=cached_symbols,
+                symbols, "1D", daily_limit, cached_symbols=cached_symbols, adj=adj,
             )
             for sym, daily_bars in daily_result.items():
                 if daily_bars:
@@ -313,10 +323,10 @@ class CNStockDataSource(BaseDataSource):
         uncached = [s for s in symbols if normalize_cn_code(s) not in cached_normalized]
         already_cached = [s for s in symbols if normalize_cn_code(s) in cached_normalized]
 
-        # 已缓存的直接读
+        # 已缓存的直接读（缓存 key 包含 adj）
         for sym in already_cached:
             cached = self.kline_cache.get(
-                generate_kline_cache_key(normalize_cn_code(sym), tf, limit, None)
+                generate_kline_cache_key(normalize_cn_code(sym), tf, limit, None, adj=adj)
             )
             if cached:
                 result[sym] = cached
@@ -324,7 +334,7 @@ class CNStockDataSource(BaseDataSource):
         if not uncached:
             return result
 
-        # ── 未缓存的交给 Coordinator（自动源发现）──
+        # ── 未缓存的交给 Coordinator（自动源发现，传递 adj）──
         coord_results, failed = get_coordinator().coordinate_kline(
             symbols=[normalize_cn_code(s) for s in uncached],
             timeframe=tf,
@@ -332,11 +342,12 @@ class CNStockDataSource(BaseDataSource):
             cb=self.circuit_breaker,
             market="CNStock",
             timeout=_get_timeout() + 10,
+            adj=adj,
         )
 
-        # 写入缓存 + 合并结果
+        # 写入缓存 + 合并结果（缓存 key 包含 adj）
         for sym, bars in coord_results.items():
-            key = generate_kline_cache_key(sym, tf, limit, None)
+            key = generate_kline_cache_key(sym, tf, limit, None, adj=adj)
             kline_ttl = 300.0 if tf in ("1D", "1W") else 120.0
             self.kline_cache.set(key, bars, ttl=kline_ttl)
             result[sym] = bars

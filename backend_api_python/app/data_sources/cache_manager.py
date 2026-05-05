@@ -219,14 +219,18 @@ def generate_kline_cache_key(
     symbol: str,
     timeframe: str,
     limit: int,
-    before_time: Optional[int] = None
+    before_time: Optional[int] = None,
+    adj: str = "qfq",
 ) -> str:
     """
     生成K线缓存键
     
-    格式: symbol:timeframe:limit[:before_time]
+    格式: symbol:timeframe:limit[:adj][:before_time]
+    不同复权方式的缓存独立（adj 不同 → key 不同）
     """
     key = f"{symbol}:{timeframe}:{limit}"
+    if adj != "qfq":
+        key += f":adj={adj}"
     if before_time:
         key += f":{before_time}"
     return key

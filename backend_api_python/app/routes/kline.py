@@ -34,6 +34,7 @@ def get_kline():
         timeframe: 时间周期 (1m, 5m, 15m, 30m, 1H, 4H, 1D, 1W, 1M)
         limit: 数据条数 (默认1000, 上限由 KLINE_MAX_LIMIT 控制)
         before_time: 获取此时间之前的数据 (可选，Unix时间戳)
+        adj: 复权方式 (仅A股生效) — qfq(前复权,默认) / hfq(后复权) / ""(不复权)
 
     日/周/月线（1D/1W/1M）自动走本地 feather 缓存：
       - 缓存命中 → 直接返回（含市场时段合成当日 K 线）
@@ -43,6 +44,10 @@ def get_kline():
         market = request.args.get('market', '').strip()
         symbol = request.args.get('symbol', '')
         timeframe = request.args.get('timeframe', '1D')
+        adj = request.args.get('adj', 'qfq').strip()
+        # 校验 adj 合法值
+        if adj not in ('qfq', 'hfq', ''):
+            adj = 'qfq'
         if not market:
             market = detect_market(symbol) or 'CNStock'
         try:
@@ -70,6 +75,7 @@ def get_kline():
             timeframe=timeframe,
             limit=limit,
             before_time=before_time,
+            adj=adj,
         )
 
         if not klines:

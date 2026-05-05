@@ -97,22 +97,25 @@ MAX_SOURCE_FAILS = 5
 # 这两个适配器做的就是这个转换。
 #
 
-def _make_provider_fetch_fn(provider) -> Callable:
+def _make_provider_fetch_fn(provider, adj: str = "qfq") -> Callable:
     """
     K线适配器: 把 Provider.fetch_kline 包装成 Coordinator 能用的 fetch_fn。
 
     签名转换:
-      Provider:  provider.fetch_kline(code, timeframe, count) -> List[Dict] | NotSupportedResult
+      Provider:  provider.fetch_kline(code, timeframe, count, adj="qfq") -> List[Dict] | NotSupportedResult
       Coordinator 期望:  fetch_fn(symbol, timeframe, limit) -> List[Dict] | None
 
     转换规则:
       - NotSupportedResult（布尔值为 False）→ 返回 None → Coordinator 跳过该源
       - 空列表 → 返回 None → Coordinator 判定失败，尝试下一个源
       - 非空列表 → 直接返回 → Coordinator 判定成功
+
+    Args:
+        adj: 复权方式 — "qfq"(前复权,默认) / "hfq"(后复权) / ""(不复权)
     """
     def fetch_fn(symbol: str, timeframe: str, limit: int):
         try:
-            result = provider.fetch_kline(symbol, timeframe, limit)
+            result = provider.fetch_kline(symbol, timeframe, limit, adj=adj)
             if not result:  # None / [] / NotSupportedResult 都走这里
                 return None
             return result
@@ -156,6 +159,7 @@ def _discover_sources(
     cb: CircuitBreaker,
     preferred_source: str = "",
     capability: str = "kline",
+    adj: str = "qfq",
 ) -> List[Tuple[str, Callable, SourceConfig]]:
     """
     源自动发现 — 从 Provider 层获取可用数据源列表。
@@ -177,6 +181,10 @@ def _discover_sources(
         capability: 能力类型
           - "kline"  → 获取K线数据（默认）
           - "quote"  → 获取实时行情
+        adj: 复权方式（仅 capability="kline" 时生效）
+          - "qfq"  → 前复权（默认）
+          - "hfq"  → 后复权
+          - ""     → 不复权
 
     Returns:
         [(源名称, fetch_fn, 源配置), ...]
@@ -201,7 +209,11 @@ def _discover_sources(
     preferred_item = None
 
     # 根据 capability 选择适配器（K线 vs 行情的接口签名不同）
-    adapter = _make_provider_quote_fn if capability == "quote" else _make_provider_fetch_fn
+    if capability == "quote":
+        adapter = _make_provider_quote_fn
+    else:
+        # K线适配器: 传入 adj，由适配器闭包捕获
+        adapter = lambda p: _make_provider_fetch_fn(p, adj=adj)
 
     for p in providers:
         # 熔断检查 — 跳过已熔断的源
@@ -382,6 +394,7 @@ class Coordinator:
         timeout: float = 15.0,
         preferred_source: str = "",
         sources: Optional[List[Tuple[str, Callable]]] = None,
+        adj: str = "qfq",
     ) -> Tuple[Dict[str, List[Dict[str, Any]]], List[str]]:
         """
         K线批量获取 — 动态队列模式。
@@ -404,6 +417,7 @@ class Coordinator:
             sources:   手动指定源列表（可选）。为 None 时自动从 Provider 层发现。
                        格式: [(name, fetch_fn), ...]
                        fetch_fn 签名: fetch_fn(symbol, timeframe, limit) -> List[Dict] | None
+            adj:       复权方式 — "qfq"(前复权,默认) / "hfq"(后复权) / ""(不复权)
 
         Returns:
             (results, failed)
@@ -426,7 +440,7 @@ class Coordinator:
                 available = self._get_available_sources(market, source_map, cb)
         else:
             # 自动发现模式 — 从 Provider 层获取源
-            discovered = _discover_sources(market, timeframe, cb, preferred_source)
+            discovered = _discover_sources(market, timeframe, cb, preferred_source, adj=adj)
             if not discovered:
                 logger.warning("[协助层] 市场 %s 无可用源", market)
                 return {}, list(symbols)

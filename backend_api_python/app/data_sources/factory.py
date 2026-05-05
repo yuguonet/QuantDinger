@@ -110,6 +110,7 @@ class DataSourceFactory:
         limit: int,
         before_time: Optional[int] = None,
         after_time: Optional[int] = None,
+        adj: str = "qfq",
     ) -> List[Dict[str, Any]]:
         """
         获取K线数据的便捷方法
@@ -121,6 +122,8 @@ class DataSourceFactory:
             limit: 数据条数
             before_time: 获取此时间之前的数据
             after_time: 可选，Unix 秒，K 线 time 需 >= 此值（回测左边界）
+            adj: 复权方式 — "qfq"(前复权,默认) / "hfq"(后复权) / ""(不复权)
+                 仅 A 股(CNStock) 生效，其他市场忽略此参数
             
         Returns:
             K线数据列表
@@ -128,7 +131,11 @@ class DataSourceFactory:
         try:
             m = cls.normalize_market(market or "")
             source = cls.get_source(m)
-            klines = source.get_kline(symbol, timeframe, limit, before_time, after_time)
+            # 仅 CNStock 支持 adj 参数（A股复权）
+            if m == "CNStock":
+                klines = source.get_kline(symbol, timeframe, limit, before_time, after_time, adj=adj)
+            else:
+                klines = source.get_kline(symbol, timeframe, limit, before_time, after_time)
             
             # 确保数据按时间排序
             klines.sort(key=lambda x: x['time'])
@@ -146,6 +153,7 @@ class DataSourceFactory:
         timeframe: str,
         limit: int,
         cached_symbols: Optional[set] = None,
+        adj: str = "qfq",
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
         批量获取多只股票的 K 线数据。
@@ -159,6 +167,8 @@ class DataSourceFactory:
             timeframe: 时间周期
             limit: 数据条数
             cached_symbols: 已有缓存的 symbol 集合（用于优化：有缓存的只补当日）
+            adj: 复权方式 — "qfq"(前复权,默认) / "hfq"(后复权) / ""(不复权)
+                 仅 A 股(CNStock) 生效
 
         Returns:
             {symbol: [kline_bars]} — 仅包含成功返回非空数据的 symbol
@@ -169,12 +179,18 @@ class DataSourceFactory:
                 return {}
             source = cls.get_source(m)
             if hasattr(source, 'get_kline_batch'):
+                # 仅 CNStock 支持 adj 参数
+                if m == "CNStock":
+                    return source.get_kline_batch(symbols, timeframe, limit, cached_symbols=cached_symbols, adj=adj)
                 return source.get_kline_batch(symbols, timeframe, limit, cached_symbols=cached_symbols)
             # fallback: 串行逐只拉取
             result: Dict[str, List[Dict[str, Any]]] = {}
             for sym in symbols:
                 try:
-                    klines = source.get_kline(sym, timeframe, limit)
+                    if m == "CNStock":
+                        klines = source.get_kline(sym, timeframe, limit, adj=adj)
+                    else:
+                        klines = source.get_kline(sym, timeframe, limit)
                     if klines:
                         klines.sort(key=lambda x: x['time'])
                         result[sym] = klines
