@@ -2,7 +2,7 @@
 新闻分析评分引擎 — news_analysis.py
 
 职责:
-  1. keyword_score_article()  → 单篇关键词评分 (-10 ~ +10, 纯算法, 无外部依赖)
+  1. keyword_score_article()  → 单篇规则引擎评分 (-10 ~ +10, 纯算法, 无外部依赖)
   2. ai_analyze_article()     → 单篇 AI 分析评分 (LLM, 允许改写/降级/加关键词)
   3. composite_score()        → 多篇综合评分 (RMS 聚合 + 非对称时间衰减)
 
@@ -13,6 +13,7 @@
 
 设计原则:
   - 单篇评分: 每篇文章独立打分, 范围 -10 ~ +10, 0 = 中性, -999 = 一票否决
+  - 规则引擎: 声明式规则 (正则/分类/权重/上下文), 替代原扁平字典匹配
   - AI 分析: 允许 LLM 改写文章内容, 增加关键词, 降级为通俗易懂版本
   - 综合评分: RMS 聚合 (强信号不被弱/中性稀释), 非对称时间衰减
     好消息 10 天衰减至 0, 坏消息 15 天衰减至 0
@@ -30,181 +31,39 @@ logger = get_logger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════
-#  1. 关键词评分 (单篇, 0-10, 无需 LLM)
+#  1. 规则引擎评分 (单篇, -10 ~ +10, 无需 LLM)
 # ═══════════════════════════════════════════════════════════════
 
-# ── 利好关键词 → 分值 (越高越利好) ──
-_BULLISH_KEYWORDS: Dict[str, float] = {
-    # 政策类
-    "降准": 8.0, "降息": 8.0, "LPR下调": 8.0, "MLF投放": 7.0,
-    "逆回购": 6.5, "货币宽松": 7.5, "财政刺激": 7.5,
-    "补贴": 7.0, "扶持": 7.0, "减税": 7.0, "免税": 7.0,
-    "政策利好": 8.0, "政策支持": 7.0, "产业政策": 7.0,
-    # 行业类
-    "新基建": 7.5, "新能源": 7.0, "AI": 7.0, "人工智能": 7.0,
-    "芯片": 6.5, "半导体": 6.5, "碳中和": 6.5,
-    "RCEP": 6.5, "一带一路": 6.5, "共同富裕": 6.0,
-    # 个股类
-    "涨停": 8.0, "封板": 8.0, "连板": 8.5, "一字涨停": 9.0,
-    "大涨": 7.0, "暴涨": 8.0, "飙升": 7.5, "创新高": 7.0,
-    "业绩增长": 7.0, "超预期": 8.0, "大超预期": 8.5,
-    "翻倍": 8.0, "高增长": 7.0, "扭亏": 7.0,
-    "重大合同": 7.5, "中标": 7.0, "战略合作": 6.5,
-    "增持": 7.0, "回购": 7.0, "大股东增持": 7.5,
-    "利好": 6.5, "重大利好": 8.0,
-    # 市场类
-    "突破": 6.5, "放量上涨": 7.0, "领涨": 6.5, "反弹": 6.0,
-    "金叉": 6.0, "牛市": 7.0,
-}
-
-# ── 利空关键词 → 分值 (越低越利空) ──
-_BEARISH_KEYWORDS: Dict[str, float] = {
-    # 政策类
-    "调控": 3.0, "监管": 3.5, "收紧": 2.5, "加息": 2.0,
-    "制裁": 2.0, "限制": 3.0, "整顿": 3.0, "去杠杆": 2.5,
-    # 个股类
-    "跌停": 2.0, "一字跌停": 1.0, "连续跌停": 0.5, "天地板": 1.0,
-    "闪崩": 1.5, "崩盘": 1.0, "大跌": 2.5, "暴跌": 1.5,
-    "净利大跌": 2.0, "业绩暴雷": 1.5, "暴雷": 1.5, "业绩变脸": 2.0,
-    "巨亏": 1.0, "大幅亏损": 1.0, "由盈转亏": 1.5,
-    "财务造假": 0.5, "立案调查": 1.0, "退市": 0.5,
-    "破产": 0.5, "清算": 0.5, "债务危机": 1.0,
-    "减持": 3.0, "清仓": 1.5, "大股东减持": 1.5,
-    "利空": 3.0, "重大利空": 1.5, "黑天鹅": 1.0,
-    # 市场类
-    "破位": 3.0, "新低": 2.5, "历史新低": 1.5,
-    "熊市": 2.0, "资金链断裂": 1.0,
-}
-
-# ── 一票否决关键词 (命中任一 → score = -999) ──
-_VETO_KEYWORDS = {
-    "跌停", "一字跌停", "连续跌停", "天地板",
-    "闪崩", "崩盘", "历史新低", "净利大跌",
-    "业绩暴雷", "暴雷", "业绩变脸",
-    "巨亏", "大幅亏损", "由盈转亏",
-    "商誉减值", "财务造假", "清仓",
-    "大股东减持", "违规减持",
-    "破产", "清算", "质量事故", "安全事故",
-    "监管调查", "立案调查", "违法",
-    "退市", "暂停上市",
-    "债务危机", "债务违约", "资金链断裂",
-    "巨额索赔", "重大利空", "黑天鹅",
-}
+from app.services.rule_engine import rule_engine_score as _rule_engine_score
 
 
-def keyword_score_article(title: str, snippet: str = "") -> Dict[str, Any]:
+def keyword_score_article(title: str, snippet: str = "", news_type: str = "stock") -> Dict[str, Any]:
     """
-    单篇关键词评分 (纯算法, -10 ~ +10)
+    单篇规则引擎评分 (纯算法, -10 ~ +10)
 
-    评分逻辑:
-      1. 一票否决: 命中 veto 关键词 → score = -999
-      2. 分别匹配利好/利空关键词, 取各自最高分
-      3. 利好分 > 利空分 → 正分区间, 反之亦然
-      4. 无命中 → 中性 0
+    已从扁平字典匹配升级为声明式规则引擎:
+      - 正则模式匹配 (非子串)
+      - 标题权重 ×2, 摘要权重 ×1
+      - 按 category 去重取最强信号
+      - 一票否决: veto 规则命中 → score = -999
 
     Args:
         title: 文章标题
         snippet: 文章摘要/正文片段 (可选)
+        news_type: "policy" / "stock" / "market" / "general"
 
     Returns:
         {
             "score": 7.5,              # 评分 (-10 ~ +10, 一票否决时为 -999)
             "sentiment": "positive",    # positive / negative / neutral
-            "keywords": ["降准", "央行"],  # 命中的关键词
+            "keywords": ["涨停", ...],  # 命中的规则标签
             "veto": False,             # 是否触发一票否决
-            "veto_keyword": None,      # 一票否决的关键词
-            "bullish_hits": {"降准": 8.0},  # 命中的利好关键词及分值
-            "bearish_hits": {},        # 命中的利空关键词及分值
+            "veto_keyword": None,      # 一票否决的规则标签
+            "bullish_hits": {"涨停": 8.0},  # 命中的利好规则及分值
+            "bearish_hits": {},        # 命中的利空规则及分值
         }
     """
-    text = f"{title} {snippet}"
-
-    # ── 一票否决 ──
-    for kw in _VETO_KEYWORDS:
-        if kw in text:
-            return {
-                "score": -999.0,
-                "sentiment": "negative",
-                "keywords": [kw],
-                "veto": True,
-                "veto_keyword": kw,
-                "bullish_hits": {},
-                "bearish_hits": {kw: 0.0},
-            }
-
-    # ── 匹配利好/利空 ──
-    bullish_hits: Dict[str, float] = {}
-    bearish_hits: Dict[str, float] = {}
-
-    for kw, score in _BULLISH_KEYWORDS.items():
-        if kw in text:
-            bullish_hits[kw] = score
-
-    for kw, score in _BEARISH_KEYWORDS.items():
-        if kw in text:
-            bearish_hits[kw] = score
-
-    all_keywords = list(set(list(bullish_hits.keys()) + list(bearish_hits.keys())))
-
-    # ── 无命中 → 中性 ──
-    if not bullish_hits and not bearish_hits:
-        return {
-            "score": 0.0,
-            "sentiment": "neutral",
-            "keywords": [],
-            "veto": False,
-            "veto_keyword": None,
-            "bullish_hits": {},
-            "bearish_hits": {},
-        }
-
-    # ── 计算综合分 (-10 ~ +10) ──
-    best_bull = max(bullish_hits.values()) if bullish_hits else 0.0
-    best_bear = min(bearish_hits.values()) if bearish_hits else 10.0
-
-    bull_count = len(bullish_hits)
-    bear_count = len(bearish_hits)
-
-    # 将原始 0-10 分映射到 -10 ~ +10:
-    #   原始 10 → +10, 原始 0 → -10, 原始 5 → 0
-    if bull_count > bear_count:
-        # 偏利好: 以最高利好分为基础, 利空越多越往下拉
-        base = best_bull
-        penalty = bear_count * 0.5
-        raw_score = max(5.0, base - penalty)
-        # 映射: raw_score ∈ [5,10] → score ∈ [0, +10]
-        score = (raw_score - 5.0) * 2.0
-    elif bear_count > bull_count:
-        # 偏利空: 以最高利空分为基础, 利好越多越往上抬
-        base = best_bear
-        bonus = bull_count * 0.5
-        raw_score = min(5.0, base + bonus)
-        # 映射: raw_score ∈ [0,5] → score ∈ [-10, 0]
-        score = (raw_score - 5.0) * 2.0
-    else:
-        # 数量相当: 取两者的中点, 映射到 -10 ~ +10
-        raw_mid = (best_bull + best_bear) / 2
-        score = (raw_mid - 5.0) * 2.0
-
-    score = round(max(-10.0, min(10.0, score)), 1)
-
-    # 情感标签
-    if score > 1.0:
-        sentiment = "positive"
-    elif score < -1.0:
-        sentiment = "negative"
-    else:
-        sentiment = "neutral"
-
-    return {
-        "score": score,
-        "sentiment": sentiment,
-        "keywords": all_keywords,
-        "veto": False,
-        "veto_keyword": None,
-        "bullish_hits": bullish_hits,
-        "bearish_hits": bearish_hits,
-    }
+    return _rule_engine_score(title=title, snippet=snippet, news_type=news_type)
 
 
 # ═══════════════════════════════════════════════════════════════

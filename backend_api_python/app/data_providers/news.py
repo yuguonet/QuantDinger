@@ -57,13 +57,14 @@ def get_news_type(symbol: str, market: str) -> str:
 # ═══════════════════════════════════════════════════════════════
 
 NEWS_CACHE_DEDUP_HOURS = 24
-NEWS_CACHE_EXPIRY_DAYS = 15
+NEWS_CACHE_EXPIRY_DAYS = 12
 
+# 所有时间均为 UTC，括号内注释为对应本地时间
 _MARKET_TRADING_WINDOWS = {
-    "CNStock":  {"pre_open": (7, 30, 9, 30),  "midday": (12, 0, 13, 0)},
-    "USStock":  {"pre_open": (20, 30, 21, 30), "midday": (1, 0, 2, 0)},
+    "CNStock":  {"pre_open": (23, 30, 1, 30),  "midday": (4, 0, 5, 0)},    # 北京 7:30-9:30 / 12:00-13:00
+    "USStock":  {"pre_open": (12, 30, 13, 30), "midday": (17, 0, 18, 0)},  # 北京 20:30-21:30 / 次日 1:00-2:00
     "Crypto":   {"pre_open": None, "midday": None},
-    "Forex":    {"pre_open": (5, 30, 6, 0),   "midday": (12, 0, 13, 0)},
+    "Forex":    {"pre_open": (21, 30, 22, 0),  "midday": (4, 0, 5, 0)},    # 北京 5:30-6:00 / 12:00-13:00
 }
 
 # 宏观市场映射 (API 层 → POLICY 路由)
@@ -71,6 +72,31 @@ _MACRO_MARKET_MAP = {
     "MacroCN": "CNStock",
     "MacroIntl": "USStock",
 }
+
+
+def _in_time_window(hour: int, minute: int, window: tuple) -> bool:
+    """
+    判断当前时间是否在 [start, end) 窗口内，支持跨午夜
+
+    Args:
+        hour, minute: 当前 UTC 时间
+        window: (sh, sm, eh, em) UTC 时间
+
+    Examples:
+        (23, 30, 1, 30) → 23:30~次日01:30 (跨午夜)
+        (4, 0, 5, 0)    → 04:00~05:00 (不跨午夜)
+    """
+    sh, sm, eh, em = window
+    cur = hour * 60 + minute
+    start = sh * 60 + sm
+    end = eh * 60 + em
+
+    if start <= end:
+        # 不跨午夜: 正常区间 [start, end)
+        return start <= cur < end
+    else:
+        # 跨午夜: [start, 24:00) ∪ [00:00, end)
+        return cur >= start or cur < end
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -211,26 +237,18 @@ class NewsCacheManager:
             windows = _MARKET_TRADING_WINDOWS.get(market)
             if windows:
                 pre = windows.get("pre_open")
-                if pre:
-                    sh, sm, eh, em = pre
-                    in_pre = (now.hour > sh or (now.hour == sh and now.minute >= sm)) and \
-                             (now.hour < eh or (now.hour == eh and now.minute < em))
-                    if in_pre:
-                        if last_search and last_search.date() == now.date():
-                            return False, f"自选股今日已搜({last_search.strftime('%H:%M')}), 开盘前无需重复"
-                        else:
-                            return True, f"自选股开盘前刷新({market}, 今日未搜索)"
+                if pre and _in_time_window(now.hour, now.minute, pre):
+                    if last_search and last_search.date() == now.date():
+                        return False, f"自选股今日已搜({last_search.strftime('%H:%M')}), 开盘前无需重复"
+                    else:
+                        return True, f"自选股开盘前刷新({market}, 今日未搜索)"
 
                 mid = windows.get("midday")
-                if mid:
-                    mh, mm, meh, mem = mid
-                    in_mid = (now.hour > mh or (now.hour == mh and now.minute >= mm)) and \
-                             (now.hour < meh or (now.hour == meh and now.minute < mem))
-                    if in_mid:
-                        if last_search and last_search.date() == now.date() and last_search.hour >= mh:
-                            return False, f"自选股午间已搜({last_search.strftime('%H:%M')})"
-                        else:
-                            return True, f"自选股午间刷新({market})"
+                if mid and _in_time_window(now.hour, now.minute, mid):
+                    if last_search and last_search.date() == now.date() and last_search.hour >= mid[0]:
+                        return False, f"自选股午间已搜({last_search.strftime('%H:%M')})"
+                    else:
+                        return True, f"自选股午间刷新({market})"
 
         if last_search:
             hours_since = (now - last_search).total_seconds() / 3600
@@ -297,7 +315,7 @@ class NewsCacheManager:
                 if news_type == "policy":
                     logger.info(f"[评分] 政策/宏观新闻, 启用 AI 分析: {len(results)}条")
                 else:
-                    logger.debug(f"[评分] {news_type}新闻, 关键词评分: {len(results)}条")
+                    logger.debug(f"[评分] {news_type}新闻, 规则引擎评分: {len(results)}条")
 
                 rows = []
                 for r in results:
@@ -319,11 +337,11 @@ class NewsCacheManager:
                             if simplified:
                                 snippet = _safe_encode(simplified, 2000)
                         else:
-                            kw_result = keyword_score_article(title, snippet)
+                            kw_result = keyword_score_article(title, snippet, news_type=news_type)
                             score = kw_result["score"]
                             sentiment = kw_result["sentiment"]
                     else:
-                        kw_result = keyword_score_article(title, snippet)
+                        kw_result = keyword_score_article(title, snippet, news_type=news_type)
                         if kw_result["veto"]:
                             score = -999.0
                             sentiment = "negative"
@@ -452,13 +470,22 @@ def _detect_lang(results: List[SearchResult], default: str = "cn") -> str:
     return "cn" if cn_chars / total > 0.15 else "en"
 
 
+def _detect_lang_from_text(text: str, default: str = "cn") -> str:
+    """根据文本推断语言：中文字符占比 >15% 视为中文"""
+    if not text:
+        return default
+    cn_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
+    return "cn" if cn_chars / max(len(text), 1) > 0.15 else "en"
+
+
 def _format_cached(items: List[Dict[str, Any]], lang: str) -> Dict[str, List[Dict[str, Any]]]:
     """缓存命中 → 格式化为 {"cn": [...], "en": [...]}"""
     result: Dict[str, List[Dict[str, Any]]] = {"cn": [], "en": []}
     for item in items:
-        lang_key = "cn"  # 默认中文
+        title = item.get("title", "")
+        lang_key = _detect_lang_from_text(title, "cn")
         result[lang_key].append({
-            "title": item["title"], "link": item.get("url", ""),
+            "title": title, "link": item.get("url", ""),
             "snippet": item.get("snippet", ""), "source": item.get("source", ""),
             "published": item.get("published_date", ""),
             "sentiment": item.get("sentiment", "neutral"),
