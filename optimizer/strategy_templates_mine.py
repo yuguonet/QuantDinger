@@ -360,6 +360,14 @@ def _build_dragon_pullback_config(p: dict) -> dict:
         },
     ]
 
+    # 趋势过滤：价格在长期均线之上（避免在下跌趋势中买入）
+    if p.get("use_trend_filter"):
+        entry_rules.append({
+            "indicator": "ema",
+            "params": {"period": p["trend_ema_period"]},
+            "operator": "price_above",
+        })
+
     if p.get("use_ma_support"):
         entry_rules.append({
             "indicator": "ema",
@@ -516,6 +524,7 @@ MY_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "数据验证：limit_up_count>=30 的 1082 只龙头股，"
             "年化中位数 25.6%（全市场 12.3%），Sharpe 0.48。100% 盈利。"
             "⚠️ 回撤中位数 -68%，需严格止损。适合超短（2-5 天）。"
+            "增加趋势过滤：价格在长期均线之上才买入，避免下跌趋势中抄底。"
         ),
         "indicators": ["dragon_pullback", "volume", "rsi", "ema"],
         "params": {
@@ -526,6 +535,8 @@ MY_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "vol_shrink_ratio":   _p_float(0.3, 0.7, 0.1),
             "rsi_period":         _p_int(7, 21, 1),
             "rsi_bounce":         _p_int(25, 45, 1),
+            "use_trend_filter":   _p_choice([True, False]),
+            "trend_ema_period":   _p_int(20, 60, 5),
             "use_ma_support":     _p_choice([True, False]),
             "ma_support_period":  _p_int(10, 30, 5),
             "ma_near_pct":        _p_float(1.0, 4.0, 0.5),

@@ -227,8 +227,8 @@ class StrategyOptimizer:
         total_trades = int(metrics.get("totalTrades", 0))
         profit_factor = float(metrics.get("profitFactor", 0))
 
-        # 交易次数过少 → 惩罚
-        if total_trades < 5:
+        # 交易次数过少 → 惩罚（降低阈值，从5改为3）
+        if total_trades < 3:
             return -10.0
 
         if self.score_fn == "sharpe":
@@ -240,12 +240,24 @@ class StrategyOptimizer:
             return total_return / max_dd
 
         if self.score_fn == "composite":
-            # 综合评分：夏普 * 0.4 + 胜率 * 0.2 + 盈亏比 * 0.2 - 回撤 * 0.2
+            # 改进的综合评分：
+            # - 收益权重提升（核心目标）
+            # - 胜率权重降低（避免偏好高胜率低收益）
+            # - 回撤惩罚降低（避免偏好低回撤低收益）
+            # - 增加交易次数惩罚（太少或太多都不好）
+            trade_penalty = 0.0
+            if total_trades < 10:
+                trade_penalty = (10 - total_trades) * 0.08
+            elif total_trades > 60:
+                trade_penalty = (total_trades - 60) * 0.03
+
             return (
-                sharpe * 0.4
-                + win_rate * 2.0
-                + min(profit_factor, 5.0) * 0.4
-                - max_dd * 2.0
+                sharpe * 0.3
+                + total_return * 0.3
+                + win_rate * 1.0
+                + min(profit_factor, 5.0) * 0.3
+                - max_dd * 1.0
+                - trade_penalty
             )
 
         return sharpe

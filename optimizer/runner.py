@@ -140,10 +140,21 @@ def _patch_datasource_warehouse():
             )
             if data and len(data) >= 10:
                 return data
+
+            # 也加一行，看 fallback 返回了什么
+            result = _orig_get_kline(cls, market, symbol, timeframe, limit,
+                                    before_time=before_time, after_time=after_time)
+            if not result:
+                print(f"  ⚠️ [patch] {symbol} fallback 也返回空 (orig_get_kline)")
+            return result
+            # 本地数据不足，直接抛异常让 worker 跳过（不走网络、不重试）
+            raise ValueError(f"{symbol} 本地数据不足 ({len(data) if data else 0} 条)，跳过")
+        except ValueError:
+            print(f"  ⚠️ [patch] {symbol} get_clean_klines 异常: {e}")
+            raise
         except Exception:
-            pass
-        return _orig_get_kline(cls, market, symbol, timeframe, limit,
-                               before_time=before_time, after_time=after_time)
+            print(f"  ⚠️ [patch] {symbol} get_clean_klines 异常: {e}")
+            raise ValueError(f"{symbol} 本地数据读取失败，跳过")
 
     DataSourceFactory.get_kline = classmethod(_get_kline_with_warehouse)
 
@@ -289,12 +300,54 @@ _TF_DIR_MAP = {
 }
 
 
-def _list_local_symbols(market: str = "CNStock") -> list:
-    """直接从 db_market 获取本地仓库中指定市场的股票列表"""
+def _list_local_symbols(market: str = "CNStock", timeframe: str = None) -> list:
+    """从 db_market 获取本地仓库中指定市场的股票列表
+
+    如果指定 timeframe，只返回该时间框架下实际有数据的股票。
+    """
     from app.utils.db_market import get_market_kline_writer
     writer = get_market_kline_writer()
     stats = writer.stats(market)
-    return stats.get("symbol_list", [])
+    all_symbols = stats.get("symbol_list", [])
+    if not timeframe or not all_symbols:
+        return all_symbols
+
+    # 按 timeframe 过滤：直接查对应 kline 表里的 distinct symbol
+    #   1D → kline_1d_YYYY, 15m → kline_15m_YYYY, ...
+    from datetime import datetime
+    tf_norm = timeframe.strip().upper()
+    # 标准化别名
+    _TF_MAP = {"D": "1D", "DAY": "1D", "DAILY": "1D", "W": "1W", "WEEK": "1W", "WEEKLY": "1W"}
+    tf_norm = _TF_MAP.get(tf_norm, timeframe)
+
+    mgr = writer._mgr if hasattr(writer, '_mgr') else None
+    if mgr is None:
+        return all_symbols
+
+    pool = mgr._get_pool(market)
+    valid = set()
+    with pool.cursor() as cur:
+        # 查所有该 timeframe 的分年表
+        cur.execute("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_name LIKE %s
+            ORDER BY table_name
+        """, (f"kline_{tf_norm}_%",))
+        tables = [r[0] for r in cur.fetchall()]
+
+        for tbl in tables:
+            try:
+                cur.execute(f'SELECT DISTINCT symbol FROM "{tbl}"')
+                for r in cur.fetchall():
+                    valid.add(r[0])
+            except Exception:
+                pass
+
+    # 只返回同时在 all_symbols 和 valid 中的（取交集）
+    if valid:
+        return [s for s in all_symbols if s in valid]
+    return all_symbols
 
 
 def _get_local_stats(market: str = "CNStock") -> dict:
@@ -438,12 +491,24 @@ class BacktestObjective:
         self._compiler = None
         self._backtest = None
 
+        # 预检数据可用性（第一次 get_kline 调用，失败则快速退出）
+        self._prefetch()
+        self._data_failed = False  # 标记数据是否不可用，避免重复试验
+
     def _ensure_services(self):
         global _StrategyCompiler, _BacktestService
         if _StrategyCompiler is None:
             _lazy_import()
         self._compiler = _StrategyCompiler()
         self._backtest = _BacktestService()
+
+    def _prefetch(self):
+        """预检数据可用性，本地无数据则直接抛异常（不走网络、不重试）"""
+        from app.data_sources.factory import DataSourceFactory
+        DataSourceFactory.get_kline(
+            self.market, self.symbol, self.timeframe,
+            limit=100, before_time=int(self.end_date.timestamp()),
+        )
 
     def __call__(self, params: dict, start_date: datetime = None, end_date: datetime = None) -> dict:
         """
@@ -457,6 +522,10 @@ class BacktestObjective:
         Returns:
             metrics dict
         """
+        # 数据已确认不可用，跳过后续所有试验
+        if self._data_failed:
+            raise ValueError(f"{self.symbol} 数据不可用，跳过")
+
         self._ensure_services()
 
         sd = start_date or self.start_date
@@ -478,16 +547,21 @@ class BacktestObjective:
             raise RuntimeError(f"编译失败: {e}")
 
         # 3. 回测
-        result = self._backtest.run(
-            indicator_code=code,
-            market=self.market,
-            symbol=self.symbol,
-            timeframe=self.timeframe,
-            start_date=sd,
-            end_date=ed,
-            initial_capital=self.initial_capital,
-            commission=self.commission,
-        )
+        try:
+            result = self._backtest.run(
+                indicator_code=code,
+                market=self.market,
+                symbol=self.symbol,
+                timeframe=self.timeframe,
+                start_date=sd,
+                end_date=ed,
+                initial_capital=self.initial_capital,
+                commission=self.commission,
+            )
+        except Exception as e:
+            # 数据相关错误，标记后续试验全部跳过
+            self._data_failed = True
+            raise ValueError(f"{self.symbol} 回测失败: {e}")
 
         # A 股模式：后处理（T+1、涨跌停等约束）
         if self.is_ashare:
@@ -851,7 +925,7 @@ stock_list.txt 格式（同 downloader）:
         print(f"   数据总行数: {stats['total_rows']:,}")
         for mkt, count in stats.get('markets', {}).items():
             print(f"   - {mkt}: {count} 只")
-        symbols = _list_local_symbols(args.market)
+        symbols = _list_local_symbols(args.market, args.timeframe)
         if symbols:
             print(f"\n   {args.market} / {args.timeframe}: {len(symbols)} 只")
             for s in symbols:
@@ -882,7 +956,7 @@ stock_list.txt 格式（同 downloader）:
             sys.exit(1)
     elif args.random_sample > 0:
         import random as _random
-        all_local = _list_local_symbols(args.market)
+        all_local = _list_local_symbols(args.market, args.timeframe)
         if not all_local:
             print(f"❌ 本地仓库中没有 {args.market}/{args.timeframe} 的数据")
             sys.exit(1)
@@ -893,7 +967,7 @@ stock_list.txt 格式（同 downloader）:
         print(f"  🎲 从本地仓库 {len(all_local)} 只股票中随机抽取 {n} 只"
               f"{f' (seed={args.seed})' if args.seed is not None else ''}")
     elif args.all_local:
-        symbols_raw = _list_local_symbols(args.market)
+        symbols_raw = _list_local_symbols(args.market, args.timeframe)
         if not symbols_raw:
             print(f"❌ 本地仓库中没有 {args.market}/{args.timeframe} 的数据")
             print(f"   先用 downloader 下载: python -m optimizer.data_warehouse.downloader -m CNStock -tf 1D")
@@ -901,7 +975,7 @@ stock_list.txt 格式（同 downloader）:
         print(f"  📦 从本地仓库发现 {len(symbols_raw)} 只股票 ({args.market}/{args.timeframe})")
     else:
         # 默认：扫描本地仓库，没有则 fallback 到 000001.SZ
-        local = _list_local_symbols(args.market)
+        local = _list_local_symbols(args.market, args.timeframe)
         if local:
             symbols_raw = local
             print(f"  📦 自动发现本地仓库 {len(symbols_raw)} 只股票 ({args.market}/{args.timeframe})")
