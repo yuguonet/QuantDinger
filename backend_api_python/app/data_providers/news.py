@@ -274,7 +274,8 @@ class NewsCacheManager:
             return 4
         return default_days
 
-    def save_items(self, symbol: str, market: str, results: List[SearchResult]) -> bool:
+    def save_items(self, symbol: str, market: str, results: List[SearchResult],
+                   name: str = "") -> bool:
         """
         将搜索结果写入明细表, ON CONFLICT 更新
 
@@ -311,6 +312,23 @@ class NewsCacheManager:
                 if not results:
                     logger.info(f"[去重] {symbol}({market}) 全部重复, 跳过写入")
                     return True
+
+                # ── 相关性过滤 (仅个股): 标题/摘要必须提及股票代码或名称 ──
+                if news_type == "stock" and symbol:
+                    before_relv = len(results)
+                    # 构建匹配模式: 代码 + 可选名称
+                    patterns = [re.escape(symbol)]
+                    if name:
+                        patterns.append(re.escape(name))
+                    relv_re = re.compile("|".join(patterns), re.IGNORECASE)
+                    results = [r for r in results
+                               if relv_re.search(r.title or "") or relv_re.search(r.snippet or "")]
+                    relv_filtered = before_relv - len(results)
+                    if relv_filtered > 0:
+                        logger.info(f"[相关性] {symbol}({market}) 过滤 {relv_filtered} 条不相关文章")
+                    if not results:
+                        logger.info(f"[相关性] {symbol}({market}) 无相关文章, 跳过写入")
+                        return True
 
                 if news_type == "policy":
                     logger.info(f"[评分] 政策/宏观新闻, 启用 AI 分析: {len(results)}条")
@@ -602,7 +620,7 @@ def fetch_financial_news(
         #        或 success=False 但 results 非空。不保存会导致 should_search
         #        下次仍返回 True，白白重复请求远端。
         if resp.results:
-            cache_mgr.save_items(cache_symbol, cache_market, resp.results)
+            cache_mgr.save_items(cache_symbol, cache_market, resp.results, name=name)
         else:
             # 远端确实无数据：记录搜索时间戳，避免下次立即重搜。
             # should_search 依赖 MAX(created_at) 判断间隔，插入哨兵行使其生效。
@@ -613,7 +631,7 @@ def fetch_financial_news(
                     snippet="", url="", source="system",
                     published_date=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
                 )
-            ])
+            ], name=name)
 
         if not resp.results:
             return result
