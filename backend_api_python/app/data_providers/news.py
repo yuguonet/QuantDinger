@@ -350,8 +350,17 @@ class NewsCacheManager:
                             score = kw_result["score"]
                             sentiment = kw_result["sentiment"]
 
+                    # 跳过中性文章 (score=0), 无评分价值不入库
+                    if score == 0.0:
+                        logger.debug(f"[跳过中性] {title[:60]}")
+                        continue
+
                     rows.append((symbol, market, title, snippet, url, source,
                                  pub_date, sentiment, score))
+
+                if not rows:
+                    logger.info(f"[评分过滤] {symbol}({market}) 全部为中性, 无有效数据写入")
+                    return True
 
                 cursor.executemany(
                     """INSERT INTO qd_news_cache_items
