@@ -12,9 +12,6 @@
     # 跑本地仓库全部 A 股（多进程）
     python -m optimizer.runner --all -m CNStock -tf 1D --all-local -j 4
 
-    # 中断后恢复（跳过已完成的任务）
-    python -m optimizer.runner --all -m CNStock -tf 1D --all-local -j 4 --resume
-
 stock_list.txt 格式（同 downloader）:
     000001.SZ
     600000.SH
@@ -38,12 +35,11 @@ import argparse
 import json
 import multiprocessing
 import os
-import signal
 import sys
 import time
 import traceback
 from datetime import datetime
-from typing import Dict, Any, List, Set, Tuple
+from typing import Dict, Any, List
 
 # 确保 backend_api_python 在 path 中（app 模块在那里）
 _optimizer_dir = os.path.dirname(os.path.abspath(__file__))
@@ -134,114 +130,6 @@ def _patch_datasource_warehouse():
     DataSourceFactory.get_kline = classmethod(_get_kline_with_warehouse)
 
 _patch_datasource_warehouse()
-
-
-# ============================================================
-# 进度追踪（断点续跑）
-# ============================================================
-
-class ProgressTracker:
-    """
-    追踪已完成的 (symbol, template) 任务，支持中断后恢复。
-
-    进度文件格式 (_progress.json):
-    {
-        "run_id": "20260505_071030",
-        "started_at": "2026-05-05 07:10:30",
-        "total_tasks": 500,
-        "completed": [["000001.SZ", "ma_crossover"], ...],
-        "failed": [["000002.SZ", "rsi_oversold"], ...]
-    }
-    """
-
-    def __init__(self, output_dir: str, resume: bool = False):
-        self._progress_path = os.path.join(output_dir, "_progress.json")
-        self._completed: Set[Tuple[str, str]] = set()
-        self._failed: Set[Tuple[str, str]] = set()
-        self._run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._total_tasks = 0
-        self._started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self._resume = resume
-
-        if resume:
-            self._load()
-
-    def _load(self):
-        """从磁盘加载已有进度"""
-        if not os.path.isfile(self._progress_path):
-            print(f"  ℹ️  未找到进度文件，将从头开始")
-            return
-        try:
-            with open(self._progress_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            for pair in data.get("completed", []):
-                if isinstance(pair, list) and len(pair) == 2:
-                    self._completed.add((pair[0], pair[1]))
-            for pair in data.get("failed", []):
-                if isinstance(pair, list) and len(pair) == 2:
-                    self._failed.add((pair[0], pair[1]))
-            self._run_id = data.get("run_id", self._run_id)
-            print(f"  📂 已加载进度: {len(self._completed)} 完成, {len(self._failed)} 失败")
-        except Exception as e:
-            print(f"  ⚠️  读取进度文件失败: {e}，将从头开始")
-
-    def save(self):
-        """将当前进度写入磁盘"""
-        data = {
-            "run_id": self._run_id,
-            "started_at": self._started_at,
-            "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "total_tasks": self._total_tasks,
-            "completed_count": len(self._completed),
-            "failed_count": len(self._failed),
-            "completed": [list(p) for p in sorted(self._completed)],
-            "failed": [list(p) for p in sorted(self._failed)],
-        }
-        try:
-            tmp = self._progress_path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, self._progress_path)
-        except Exception as e:
-            print(f"  ⚠️  保存进度失败: {e}")
-
-    def set_total(self, n: int):
-        self._total_tasks = n
-
-    def is_done(self, symbol: str, template: str) -> bool:
-        return (symbol, template) in self._completed
-
-    def mark_done(self, symbol: str, template: str):
-        self._completed.add((symbol, template))
-
-    def mark_failed(self, symbol: str, template: str):
-        self._failed.add((symbol, template))
-
-    def filter_pending(self, tasks: list) -> list:
-        """过滤掉已完成的任务，返回待执行列表"""
-        if not self._resume:
-            return tasks
-        pending = []
-        skipped = 0
-        for task in tasks:
-            # task tuple: (template_key, symbol, market, timeframe, start, end, trials, score, validate, output, seed)
-            tpl_key, sym = task[0], task[1]
-            if self.is_done(sym, tpl_key):
-                skipped += 1
-            else:
-                pending.append(task)
-        if skipped:
-            print(f"  ⏭️  跳过已完成任务: {skipped} 个, 剩余待执行: {len(pending)} 个")
-        return pending
-
-    @property
-    def stats(self) -> dict:
-        return {
-            "completed": len(self._completed),
-            "failed": len(self._failed),
-            "total": self._total_tasks,
-        }
-
 
 # 直接导入具体模块，避免触发 app/services/__init__.py 的重量级导入
 from importlib import import_module as _im
@@ -781,8 +669,6 @@ stock_list.txt 格式（同 downloader）:
     parser.add_argument("--output", "-o", type=str,
                         default=os.path.join(_optimizer_dir, "optimizer_output"),
                         help="输出目录")
-    parser.add_argument("--resume", action="store_true",
-                        help="断点续跑：跳过已完成的任务（基于 _progress.json）")
     parser.add_argument("--list", "-l", action="store_true", help="列出所有可用模板")
     parser.add_argument("--list-local", action="store_true",
                         help="列出本地仓库中已有数据的股票")
@@ -954,58 +840,18 @@ stock_list.txt 格式（同 downloader）:
                 not args.no_validate, args.output, seed,
             ))
 
-    # ── 进度追踪 ──
-    os.makedirs(args.output, exist_ok=True)
-    progress = ProgressTracker(output_dir=args.output, resume=args.resume)
-    progress.set_total(len(tasks))
-    tasks = progress.filter_pending(tasks)
-
-    if not tasks:
-        print(f"\n  ✅ 所有任务已完成，无需重新运行")
-        # 读取已有汇总
-        summary_path = os.path.join(args.output, "_summary.json")
-        if os.path.isfile(summary_path):
-            print(f"  汇总文件: {summary_path}")
-        return
-
-    # 注册信号处理：优雅退出时保存进度
-    _shutdown_requested = False
-
-    def _signal_handler(signum, frame):
-        nonlocal _shutdown_requested
-        if _shutdown_requested:
-            # 第二次 Ctrl+C → 强制退出
-            print("\n\n  🔴 强制退出")
-            sys.exit(1)
-        _shutdown_requested = True
-        print(f"\n\n  ⚠️  收到中断信号，正在保存进度...")
-        progress.save()
-        print(f"  📂 进度已保存: {progress._progress_path}")
-        print(f"  💡 下次运行加 --resume 可从断点继续")
-
-    signal.signal(signal.SIGINT, _signal_handler)
-
     # 执行：单进程 or 多进程
     all_results = []
     t_total = time.time()
 
     if args.jobs <= 1:
         # 单进程（原逻辑，保留实时输出）
-        for idx, task in enumerate(tasks):
-            if _shutdown_requested:
-                break
+        for task in tasks:
             result = _worker_run_one(task)
-            tpl_key, sym = task[0], task[1]
             if result and "_error" not in result:
                 all_results.append(result)
-                progress.mark_done(sym, tpl_key)
             elif result and "_error" in result:
                 print(f"\n  ❌ {result['_symbol_raw']} / {result['_template']} 失败: {result['_error']}")
-                progress.mark_failed(sym, tpl_key)
-            # 每完成一个任务就保存进度（防止意外崩溃丢失）
-            if (idx + 1) % 10 == 0 or _shutdown_requested:
-                progress.save()
-        progress.save()
     else:
         # 多进程
         print(f"\n  🚀 启动 {args.jobs} 个进程并行优化...")
@@ -1023,12 +869,8 @@ stock_list.txt 格式（同 downloader）:
 
         done_set = set()
         results = [None] * len(async_results)
-        last_save_count = 0
-        save_interval = max(1, args.jobs * 2)  # 每完成 N 个任务存一次进度
         try:
             while len(done_set) < len(async_results):
-                if _shutdown_requested:
-                    break
                 time.sleep(0.5)
                 for idx, ar in enumerate(async_results):
                     if idx in done_set:
@@ -1044,47 +886,28 @@ stock_list.txt 格式（同 downloader）:
                 elapsed_so_far = time.time() - t_total
                 print(f"\r  进度: {done}/{len(async_results)} ({pct}%)  "
                       f"耗时: {elapsed_so_far:.0f}s", end='', flush=True)
-                # 定期保存进度（防止崩溃丢失）
-                if done - last_save_count >= save_interval:
-                    for j in range(last_save_count, done):
-                        if j < len(results) and results[j] is not None:
-                            t, s = tasks[j][0], tasks[j][1]
-                            if "_error" not in results[j]:
-                                progress.mark_done(s, t)
-                            else:
-                                progress.mark_failed(s, t)
-                    progress.save()
-                    last_save_count = done
             print()
         except KeyboardInterrupt:
-            # 信号处理器已处理保存进度，这里只需清理
-            pass
+            print("\n\n⚠️  收到中断信号，正在终止子进程...")
+            pool.terminate()
+            pool.join()
+            for p in pool._pool:
+                if p.is_alive():
+                    try:
+                        import signal as _sig
+                        os.kill(p.pid, _sig.SIGKILL)
+                    except (OSError, AttributeError):
+                        pass
+            pool.join()
+            print("❌ 已强制退出")
+            sys.exit(1)
         finally:
-            # 记录剩余未保存的任务到进度
-            for idx in range(last_save_count, len(tasks)):
-                if idx < len(results) and results[idx] is not None:
-                    tpl_key, sym = tasks[idx][0], tasks[idx][1]
-                    r = results[idx]
-                    if "_error" not in r:
-                        progress.mark_done(sym, tpl_key)
-                    else:
-                        progress.mark_failed(sym, tpl_key)
-            progress.save()
-
-            if _shutdown_requested:
-                pool.terminate()
             pool.join()
 
-            if _shutdown_requested:
-                print("  ⏸️  已暂停（进度已保存，下次 --resume 继续）")
-                sys.exit(0)
-
-        for idx, result in enumerate(results):
-            if result is None:
-                continue
-            if "_error" not in result:
+        for result in results:
+            if result and "_error" not in result:
                 all_results.append(result)
-            elif "_error" in result:
+            elif result and "_error" in result:
                 print(f"\n  ❌ {result.get('_symbol_raw', '?')} / {result.get('_template', '?')} 失败: {result['_error']}")
 
     elapsed_total = time.time() - t_total
@@ -1142,18 +965,12 @@ stock_list.txt 格式（同 downloader）:
     # 保存汇总
     os.makedirs(args.output, exist_ok=True)
     summary_path = os.path.join(args.output, "_summary.json")
-    ps = progress.stats
     summary_output = {
         "symbols": [f"{m}:{s}" for m, s in resolved],
         "timeframe": args.timeframe,
         "period": f"{args.start} ~ {args.end}",
         "templates": templates,
         "total_runs": len(all_results),
-        "progress": {
-            "completed": ps["completed"],
-            "failed": ps["failed"],
-            "total": ps["total"],
-        },
         "stock_best": {
             sym: {
                 "template": r["template"],
@@ -1178,18 +995,6 @@ stock_list.txt 格式（同 downloader）:
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary_output, f, ensure_ascii=False, indent=2)
     print(f"\n  汇总保存: {summary_path}")
-
-    # 最终进度保存
-    progress.save()
-
-    # 清理进度文件（全部完成时）
-    ps = progress.stats
-    if ps["failed"] == 0 and ps["completed"] == ps["total"]:
-        try:
-            os.remove(progress._progress_path)
-            print(f"  🧹 全部完成，已清理进度文件")
-        except OSError:
-            pass
 
     print(f"\n{'='*60}")
     print(f"  优化完成!")
