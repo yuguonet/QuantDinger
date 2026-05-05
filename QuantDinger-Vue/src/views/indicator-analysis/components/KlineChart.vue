@@ -72,10 +72,17 @@
             </a-tooltip>
           </div>
         </div>
-        <div
-          id="kline-chart-container"
-          class="kline-chart-container"
-        ></div>
+        <div class="kline-chart-with-pct">
+          <div
+            ref="pctAxisRef"
+            class="pct-axis-overlay"
+            :class="{ 'pct-axis-overlay--dark': chartTheme === 'dark' }"
+          ></div>
+          <div
+            id="kline-chart-container"
+            class="kline-chart-container"
+          ></div>
+        </div>
         <canvas
           ref="wmCanvasRef"
           class="qd-wm-layer"
@@ -225,6 +232,7 @@ export default {
     let chartResizeRafId = null
 
     const wmCanvasRef = ref(null)
+    const pctAxisRef = ref(null)
     let _wmTimer = null
     let _wmObserver = null
 
@@ -2706,6 +2714,11 @@ registerOverlay({
         // 直接用最后两根算价格，避免 convertToInternalFormat 遍历全部 500 根
         updatePricePanelFromLastBars(arr)
 
+        // 如果价格超出当前可见范围，刷新百分比轴
+        if (bar.high > lastBar.high || bar.low < lastBar.low) {
+          renderPctAxis()
+        }
+
         // 合并到 rAF 再刷新图表（如果 WS tick 1秒来多次，只刷最后一次）
         pendingWsBar = merged
         if (wsTickRafId == null) {
@@ -2728,6 +2741,7 @@ registerOverlay({
         }
         // 新K线产生时立即刷新指标
         maybeUpdateIndicators(true)
+        renderPctAxis()
       }
     }
 
@@ -3067,9 +3081,15 @@ registerOverlay({
 
               // 更新上一次的可见范围
               lastVisibleFrom = data.from
+              renderPctAxis()
             }
           })
         }
+
+        // ── 拖拽到边界后变缩放 ──
+        // 当 hasMoreHistory=false 且用户继续往左拖，或拖到数据最右端时，
+        // 把拖拽平移量转为 setVisibleRange 缩放（缩窄可见K线数量，等效于放大）
+        _attachBoundaryDragZoom()
 
         // 如果有数据，应用数据
         if (klineData.value && klineData.value.length > 0) {
@@ -3103,6 +3123,7 @@ registerOverlay({
             // 延迟更新指标，确保K线先渲染
             nextTick(() => {
               updateIndicators()
+              renderPctAxis()
             })
           }
         }
@@ -3118,6 +3139,7 @@ registerOverlay({
         setTimeout(() => {
           if (chartRef.value) {
             chartRef.value.resize()
+            renderPctAxis()
           }
         }, 100)
       } else {
@@ -4294,6 +4316,159 @@ registerOverlay({
       }
     }
 
+    // ── 边界拖拽变缩放：核心逻辑 ──
+    const _applyBoundaryDragZoom = (deltaX) => {
+      const chart = chartRef.value
+      if (!chart) return
+      const range = chart.getVisibleRange()
+      if (!range) return
+      // klinecharts v9 getVisibleRange 返回的是百分比 (0-100)
+      const fromPct = range.from
+      const toPct = range.to
+      const dataLen = klineData.value.length
+      if (dataLen <= 1) return
+
+      // 把像素拖拽量转换为 K 线根数
+      const container = document.getElementById('kline-chart-container')
+      if (!container) return
+      const containerWidth = container.clientWidth || 1
+      const visibleBars = Math.max(1, Math.round((toPct - fromPct) / 100 * dataLen))
+      const barSpacing = containerWidth / visibleBars
+      const deltaBars = Math.round(-deltaX / barSpacing)
+
+      if (deltaBars === 0) return
+
+      // 从拖拽起始的可见范围开始计算（避免累积误差）
+      const baseFromPct = _bdDragStartFromPct
+      const baseToPct = _bdDragStartToPct
+
+      let newFromPct = baseFromPct
+      let newToPct = baseToPct
+
+      // 往左拖（deltaX > 0, deltaBars > 0）→ 到左边界了 → 右边界左移（缩窄）
+      // 往右拖（deltaX < 0, deltaBars < 0）→ 到右边界了 → 左边界右移（缩窄）
+      if (deltaBars > 0) {
+        newToPct = Math.max(baseFromPct + 1, baseToPct - deltaBars / dataLen * 100)
+      } else {
+        newFromPct = Math.min(baseToPct - 1, baseFromPct - deltaBars / dataLen * 100)
+      }
+
+      // 最小可见 20 根 K 线
+      const minPct = 20 / dataLen * 100
+      if ((newToPct - newFromPct) < minPct) return
+
+      newFromPct = Math.max(0, newFromPct)
+      newToPct = Math.min(100, newToPct)
+      if (newToPct <= newFromPct) return
+
+      // 转为数据索引（klinecharts v9 setVisibleRange 接受 { from, to } 数据索引）
+      const fromIdx = Math.max(0, Math.round(newFromPct / 100 * dataLen))
+      const toIdx = Math.min(dataLen - 1, Math.round(newToPct / 100 * dataLen))
+      if (toIdx <= fromIdx) return
+
+      try {
+        if (typeof chart.setVisibleRange === 'function') {
+          chart.setVisibleRange({ from: fromIdx, to: toIdx })
+        }
+      } catch (e) {
+        // 静默失败
+      }
+    }
+
+    let _bdDragging = false
+    let _bdStartX = null
+    let _bdStartFromPct = 0
+    let _bdStartToPct = 0
+    // 拖拽起始时的可见范围百分比（用于缩放计算）
+    let _bdDragStartFromPct = 0
+    let _bdDragStartToPct = 0
+
+    const _attachBoundaryDragZoom = () => {
+      const container = document.getElementById('kline-chart-container')
+      if (!container) return
+
+      const onMouseDown = (e) => {
+        // 只处理左键拖拽
+        if (e.button !== 0) return
+        const chart = chartRef.value
+        if (!chart) return
+
+        _bdDragging = false
+        _bdStartX = e.clientX
+
+        // 记录当前可见范围
+        try {
+          const range = chart.getVisibleRange()
+          if (range) {
+            _bdStartFromPct = range.from
+            _bdStartToPct = range.to
+            _bdDragStartFromPct = range.from
+            _bdDragStartToPct = range.to
+          }
+        } catch (_) {}
+      }
+
+      const onMouseMove = (e) => {
+        if (_bdStartX === null && !_bdDragging) return
+        const chart = chartRef.value
+        if (!chart) return
+
+        const deltaX = e.clientX - _bdStartX
+        if (Math.abs(deltaX) < 3) return
+
+        // 判断当前是否在边界
+        try {
+          const range = chart.getVisibleRange()
+          if (!range) return
+          const dataLen = klineData.value.length
+          if (dataLen <= 0) return
+
+          // from ≈ 0 表示已到左边界（数据最左侧）
+          const atLeftBoundary = range.from <= 0.5
+          // to ≈ 100 表示已到右边界（数据最右侧）
+          const atRightBoundary = range.to >= 99.5
+
+          // 是否在可拖拽方向的边界上
+          // 往左拖（deltaX > 0）且到左边界 → 且没有更多历史 → 转缩放
+          // 往右拖（deltaX < 0）且到右边界 → 转缩放
+          const atBoundary = (deltaX > 0 && atLeftBoundary && !hasMoreHistory.value) ||
+                             (deltaX < 0 && atRightBoundary)
+
+          if (atBoundary) {
+            // 进入边界缩放模式
+            if (!_bdDragging) {
+              _bdDragging = true
+              // 记录拖拽起始的可见范围（用于计算缩放量）
+              _bdDragStartFromPct = _bdStartFromPct
+              _bdDragStartToPct = _bdStartToPct
+            }
+            _applyBoundaryDragZoom(deltaX)
+          } else if (_bdDragging) {
+            // 离开边界（比如数据加载完成了），退出缩放模式
+            _bdDragging = false
+          }
+        } catch (_) {}
+      }
+
+      const onMouseUp = () => {
+        _bdDragging = false
+        _bdStartX = null
+      }
+
+      container.addEventListener('mousedown', onMouseDown, { passive: true })
+      window.addEventListener('mousemove', onMouseMove, { passive: true })
+      window.addEventListener('mouseup', onMouseUp, { passive: true })
+
+      // 保存引用用于清理
+      _bdCleanup = () => {
+        container.removeEventListener('mousedown', onMouseDown)
+        window.removeEventListener('mousemove', onMouseMove)
+        window.removeEventListener('mouseup', onMouseUp)
+      }
+    }
+
+    let _bdCleanup = null
+
     const handleRetry = () => {
       loadKlineData()
     }
@@ -4390,6 +4565,7 @@ registerOverlay({
               }
             }
             _ensureWmLayer()
+            renderPctAxis()
           })
         })
         chartResizeObserver.observe(el)
@@ -4447,6 +4623,75 @@ registerOverlay({
       ctx.restore()
     }
 
+    // ── 百分比 Y 轴（左侧叠加层）──
+    // 在 K 线图左侧叠加一个半透明的百分比刻度，价格仍在右侧显示
+    const _pctAxisRafId = ref(null)
+
+    const renderPctAxis = () => {
+      if (_pctAxisRafId.value != null) return // 节流：同一帧内只渲染一次
+      _pctAxisRafId.value = requestAnimationFrame(() => {
+        _pctAxisRafId.value = null
+        _doRenderPctAxis()
+      })
+    }
+
+    const _doRenderPctAxis = () => {
+      const el = pctAxisRef.value
+      const chart = chartRef.value
+      if (!el || !chart) return
+
+      const container = document.getElementById('kline-chart-container')
+      if (!container) return
+      const containerW = container.clientWidth
+      const containerH = container.clientHeight
+      if (containerW <= 0 || containerH <= 0) return
+
+      // 获取可见 K 线的价格范围
+      const data = klineData.value
+      if (!data || data.length === 0) { el.innerHTML = ''; return }
+
+      const range = chart.getVisibleRange()
+      if (!range) { el.innerHTML = ''; return }
+
+      // range.from/to 是百分比 (0-100)，转为数据索引
+      const dataLen = data.length
+      const fromIdx = Math.max(0, Math.floor(range.from / 100 * dataLen))
+      const toIdx = Math.min(dataLen - 1, Math.ceil(range.to / 100 * dataLen))
+      if (fromIdx >= toIdx) { el.innerHTML = ''; return }
+
+      // 计算可见区间的最高价和最低价
+      let visHigh = -Infinity
+      let visLow = Infinity
+      for (let i = fromIdx; i <= toIdx; i++) {
+        const bar = data[i]
+        if (bar.high > visHigh) visHigh = bar.high
+        if (bar.low < visLow) visLow = bar.low
+      }
+      if (visHigh <= visLow) { el.innerHTML = ''; return }
+
+      // 参考价：可见区间的最低价（所有百分比相对它计算）
+      const refPrice = visLow
+      const priceRange = visHigh - visLow
+
+      // 计算刻度数量（和右侧 klinecharts 的 Y 轴刻度对齐）
+      // klinecharts 默认大约 6-8 个刻度
+      const tickCount = 7
+      const labels = []
+      for (let i = 0; i <= tickCount; i++) {
+        const ratio = i / tickCount
+        const price = visLow + priceRange * ratio
+        const pct = ((price - refPrice) / refPrice) * 100
+        const y = containerH * (1 - ratio) // 从底部到顶部
+        labels.push({ y, pct })
+      }
+
+      // 渲染
+      el.innerHTML = labels.map(l => {
+        const sign = l.pct >= 0 ? '+' : ''
+        return `<div class="pct-tick" style="top:${l.y}px">${sign}${l.pct.toFixed(2)}%</div>`
+      }).join('')
+    }
+
     const _ensureWmLayer = () => {
       const cvs = wmCanvasRef.value
       if (!cvs) return
@@ -4488,6 +4733,8 @@ registerOverlay({
         chartResizeObserver.disconnect()
         chartResizeObserver = null
       }
+      if (_bdCleanup) { _bdCleanup(); _bdCleanup = null }
+      if (_pctAxisRafId.value != null) { cancelAnimationFrame(_pctAxisRafId.value); _pctAxisRafId.value = null }
       if (_wmTimer) { clearInterval(_wmTimer); _wmTimer = null }
       if (_wmObserver) { _wmObserver.disconnect(); _wmObserver = null }
       if (chartRef.value) {
@@ -4506,6 +4753,7 @@ registerOverlay({
       chartTheme,
       themeConfig,
       wmCanvasRef,
+      pctAxisRef,
       getIndicatorColor,
       handleRetry,
       loadingPython,
@@ -4523,6 +4771,7 @@ registerOverlay({
       handleResize,
       updateChartTheme,
       updateIndicators,
+      renderPctAxis,
       executePythonStrategy,
       parsePythonStrategy,
       indicatorButtons,
@@ -4941,6 +5190,44 @@ registerOverlay({
   .theme-dark & {
     background: #141414;
   }
+}
+
+/* 百分比 Y 轴叠加层 */
+.kline-chart-with-pct {
+  flex: 1;
+  display: flex;
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.pct-axis-overlay {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 58px;
+  height: 100%;
+  z-index: 5;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+.pct-tick {
+  position: absolute;
+  left: 4px;
+  transform: translateY(-50%);
+  font-size: 10px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: rgba(100, 116, 139, 0.7);
+  white-space: nowrap;
+  line-height: 1;
+  text-shadow: 0 0 3px #fff, 0 0 6px #fff;
+}
+
+.pct-axis-overlay--dark .pct-tick {
+  color: rgba(148, 163, 184, 0.6);
+  text-shadow: 0 0 3px #141414, 0 0 6px #141414;
 }
 
 .chart-overlay {
