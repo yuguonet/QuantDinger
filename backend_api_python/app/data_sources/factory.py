@@ -113,20 +113,30 @@ class DataSourceFactory:
         adj: str = "qfq",
     ) -> List[Dict[str, Any]]:
         """
-        获取K线数据的便捷方法
+        获取K线数据
+
+        支持单只和批量两种调用方式:
+          单只: symbol="600519"  → 返回 List[Dict]
+          批量: symbol="600519,000001,000690"  → 返回 Dict[symbol, List[Dict]]
+
+        批量实现规则:
+          1. CNStock — 逗号拼接传入 DataSource，内部走 Coordinator 动态队列多源并发
+             Provider 层无原生批量 K 线 API，通过 Coordinator 并发单只实现
+          2. 其他市场 — 当前无批量实现，逗号模式不生效（走单只路径）
 
         Args:
             market: 市场类型
-            symbol: 交易对/股票代码
+            symbol: 交易对/股票代码，多只用逗号分隔
             timeframe: 时间周期
             limit: 数据条数
             before_time: 获取此时间之前的数据
             after_time: 可选，Unix 秒，K 线 time 需 >= 此值（回测左边界）
             adj: 复权方式 — "qfq"(前复权,默认) / "hfq"(后复权) / ""(不复权)
                  仅 A 股(CNStock) 生效，其他市场忽略此参数
-            
+
         Returns:
-            K线数据列表
+            单只: K线数据列表 [bar, ...]
+            批量: {symbol: [bar, ...], ...}
         """
         try:
             m = cls.normalize_market(market or "")
@@ -146,79 +156,26 @@ class DataSourceFactory:
             return []
 
     @classmethod
-    def get_kline_batch(
-        cls,
-        market: str,
-        symbols: List[str],
-        timeframe: str,
-        limit: int,
-        cached_symbols: Optional[set] = None,
-        adj: str = "qfq",
-    ) -> Dict[str, List[Dict[str, Any]]]:
-        """
-        批量获取多只股票的 K 线数据。
-
-        一次调用返回所有成功拉取的 symbol → klines 映射，
-        内部串行调用底层数据源（K 线 API 不支持多股拼请求）。
-
-        Args:
-            market: 市场类型
-            symbols: 股票代码列表
-            timeframe: 时间周期
-            limit: 数据条数
-            cached_symbols: 已有缓存的 symbol 集合（用于优化：有缓存的只补当日）
-            adj: 复权方式 — "qfq"(前复权,默认) / "hfq"(后复权) / ""(不复权)
-                 仅 A 股(CNStock) 生效
-
-        Returns:
-            {symbol: [kline_bars]} — 仅包含成功返回非空数据的 symbol
-        """
-        try:
-            m = cls.normalize_market(market or "")
-            if not m or not symbols:
-                return {}
-            source = cls.get_source(m)
-            if hasattr(source, 'get_kline_batch'):
-                # 仅 CNStock 支持 adj 参数
-                if m == "CNStock":
-                    return source.get_kline_batch(symbols, timeframe, limit, cached_symbols=cached_symbols, adj=adj)
-                return source.get_kline_batch(symbols, timeframe, limit, cached_symbols=cached_symbols)
-            # fallback: 串行逐只拉取
-            result: Dict[str, List[Dict[str, Any]]] = {}
-            for sym in symbols:
-                try:
-                    if m == "CNStock":
-                        klines = source.get_kline(sym, timeframe, limit, adj=adj)
-                    else:
-                        klines = source.get_kline(sym, timeframe, limit)
-                    if klines:
-                        klines.sort(key=lambda x: x['time'])
-                        result[sym] = klines
-                except Exception as e:
-                    logger.warning(f"Batch fetch failed for {market}:{sym} - {e}")
-
-            logger.info(f"Batch fetch {market} {timeframe}: {len(result)}/{len(symbols)} succeeded (serial)")
-            return result
-        except Exception as e:
-            logger.error(f"Failed to batch fetch K-lines {market} - {str(e)}")
-            return {}
-    
-    @classmethod
     def get_ticker(cls, market: str, symbol: str) -> Dict[str, Any]:
         """
-        获取实时报价的便捷方法
-        
+        获取实时行情
+
+        支持单只和批量两种调用方式:
+          单只: symbol="600519"  → 返回 Dict (ticker)
+          批量: symbol="600519,000001,000690"  → 返回 Dict[symbol, Dict]
+
+        批量实现规则:
+          1. CNStock — 逗号拼接传入 DataSource，内部走 Provider 批量接口
+             腾讯/新浪一次 HTTP 请求拿多只行情，性能最优
+          2. 其他市场 — 当前无批量实现，逗号模式不生效（走单只路径）
+
         Args:
             market: 市场类型
-            symbol: 交易对/股票代码
-            
+            symbol: 交易对/股票代码，多只用逗号分隔
+
         Returns:
-            实时报价数据: {
-                'last': 最新价,
-                'change': 涨跌额,
-                'changePercent': 涨跌幅,
-                ...
-            }
+            单只: {"last", "change", "changePercent", ...}
+            批量: {symbol: {"last", "change", "changePercent", ...}, ...}
         """
         try:
             m = cls.normalize_market(market or "")
@@ -231,71 +188,3 @@ class DataSourceFactory:
             logger.error(f"Failed to fetch ticker {market}:{symbol} (normalized={cls.normalize_market(market or '')}) - {str(e)}")
             return {'last': 0, 'symbol': symbol}
 
-    @classmethod
-    def get_batch_tickers(
-        cls,
-        market: str,
-        symbols: List[str],
-    ) -> Dict[str, Dict[str, Any]]:
-        """
-        批量获取实时行情（ticker 格式: last, change, changePercent, ...）。
-
-        层级链路:
-          Provider.fetch_quotes_batch → Coordinator.passthrough
-          → DataSource.get_batch_quotes → ★ DataSourceFactory.get_batch_tickers
-
-        - CNStock: 透传 Provider 层批量接口（腾讯/新浪一次 HTTP 拿多只）
-        - 其他市场: 逐只调用 get_ticker
-
-        Args:
-            market: 市场类型
-            symbols: 交易标的列表
-
-        Returns:
-            {symbol: {"last", "change", "changePercent", ...}}
-        """
-        try:
-            m = cls.normalize_market(market or "")
-            source = cls.get_source(m)
-            # CNStockDataSource 实现了 get_batch_quotes（透传 Provider 批量接口）
-            if hasattr(source, 'get_batch_quotes'):
-                return source.get_batch_quotes(symbols)
-            # 其他市场逐只获取
-            results: Dict[str, Dict[str, Any]] = {}
-            for sym in symbols:
-                try:
-                    ticker = source.get_ticker(sym)
-                    if ticker:
-                        results[sym] = ticker
-                except Exception as e:
-                    logger.debug(f"get_batch_tickers fallback failed for {m}:{sym} - {e}")
-            return results
-        except Exception as e:
-            logger.error(f"Failed to batch fetch tickers {market} - {str(e)}")
-            return {}
-
-    @classmethod
-    def get_batch_quotes(
-        cls,
-        market: str,
-        symbols: List[str],
-    ) -> Dict[str, Dict[str, Any]]:
-        """
-        批量获取当日行情（仅 CNStock 支持，其他市场返回空）。
-
-        Args:
-            market: 市场类型
-            symbols: 股票代码列表
-
-        Returns:
-            {symbol: {"time", "open", "high", "low", "close", "volume", "previousClose"}}
-        """
-        try:
-            m = cls.normalize_market(market or "")
-            source = cls.get_source(m)
-            if hasattr(source, 'get_batch_quotes'):
-                return source.get_batch_quotes(symbols)
-            return {}
-        except Exception as e:
-            logger.error(f"Failed to batch fetch quotes {market} - {str(e)}")
-            return {}

@@ -4,7 +4,7 @@
 架构: 
   get_ticker()      → Coordinator race 模式（并发，第一个成功的返回）
   get_kline()       → Coordinator 动态队列（单只），自动从 Provider 层发现源
-  get_kline_batch() → Coordinator 动态队列（批量），月线走日线聚合
+  _get_klines() → Coordinator 动态队列（批量），月线走日线聚合
 
 数据源:
   由 Coordinator 从 Provider 层自动发现（@register 注册的所有源），
@@ -186,17 +186,39 @@ class CNStockDataSource(BaseDataSource):
 
     def get_ticker(self, symbol: str) -> Dict[str, Any]:
         """
-        获取最新报价 — Coordinator 从 Provider 层自动发现源，race 模式。
+        获取实时行情
 
-        支持逗号分隔批量: "600519,000001,000690" → 返回 {symbol: ticker, ...}
-        单只时返回单个 ticker dict。
+        支持单只和批量两种调用方式:
+          单只: symbol="600519"
+            → 返回 {"last": 1800.0, "change": 15.0, "changePercent": 0.84, "high": ..., "low": ..., "name": "贵州茅台", ...}
+
+          批量: symbol="600519,000001,000690"
+            → 返回 {"600519": {"last": ..., ...}, "000001": {"last": ..., ...}, ...}
+
+        单只实现:
+          1. 查缓存 → 命中直接返回
+          2. Coordinator race 模式（并发请求多个 Provider，第一个成功的返回）
+          3. 写入缓存（TTL 600s），返回结果
+          4. 全部失败 → {"last": 0, "symbol": code}
+
+        批量实现:
+          1. 透传 Provider 层 batch_quote 接口（腾讯/新浪一次 HTTP 拿多只）
+          2. 按 Provider 优先级逐源尝试，失败自动降级
+          3. 无 Provider 可用 → 返回 {}
+
+        Args:
+            symbol: 股票代码，多只用逗号分隔（如 "600519,000001"）
+
+        Returns:
+            单只: {"last", "change", "changePercent", "high", "low", "open", "previousClose", "name", "symbol", ...}
+            批量: {symbol: {"last", "change", ...}, ...}
         """
         # ── 批量模式：逗号分隔 ──
         if ',' in symbol:
             symbols = [s.strip() for s in symbol.split(',') if s.strip()]
             if not symbols:
                 return {"last": 0, "symbol": symbol}
-            return self.get_batch_quotes(symbols)
+            return self._get_tickers(symbols)
 
         # ── 单只模式 ──
         code = normalize_cn_code(symbol)
@@ -226,8 +248,8 @@ class CNStockDataSource(BaseDataSource):
     # 批量当日行情（供 K 线服务合成当日 K 线用）
     # ----------------------------------------------------------
 
-    def get_batch_quotes(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
-        """批量获取当日行情 — 透传 Provider 层 batch_quote 接口"""
+    def _get_tickers(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+        """批量获取实时行情（ticker 格式）— 透传 Provider 层 batch_quote 接口"""
         from app.data_sources.provider import get_providers
         providers = get_providers(capability="batch_quote", market="CNStock")
         if not providers:
@@ -253,43 +275,52 @@ class CNStockDataSource(BaseDataSource):
         adj: str = "qfq",
     ) -> List[Dict[str, Any]]:
         """
-        获取单只股票 K 线 — Coordinator 从 Provider 层自动发现源并调度。
+        获取 K 线数据
 
-        支持逗号分隔批量: "600519,000001,000690" → 返回 {symbol: [bars, ...], ...}
-        单只时返回 List[Dict]。
+        支持单只和批量两种调用方式:
+          单只: symbol="600519"
+            → 返回 [{"time": 1700000000, "open": 1795.0, "high": 1810.0, "low": 1790.0, "close": 1800.0, "volume": 12345}, ...]
+
+          批量: symbol="600519,000001,000690"
+            → 返回 {"600519": [bar, ...], "000001": [bar, ...], ...}
+
+        单只实现:
+          1. 委托 _get_klines（走缓存 + Coordinator）
+          2. 过滤 + 截断（before_time / after_time）
+          3. 全部失败 → 返回 []
+
+        批量实现:
+          1. 委托 _get_klines（缓存 + Coordinator 动态队列）
+          2. 月线 → 先拉日线批量，再聚合为月线
+          3. 部分失败时，成功的仍返回
 
         Args:
+            symbol: 股票代码，多只用逗号分隔（如 "600519,000001"）
+            timeframe: 时间周期（"1D", "1W", "1M", "5m", "15m", "30m", "60m" 等）
+            limit: 数据条数
+            before_time: 获取此时间之前的数据（Unix 秒）
+            after_time: K 线 time 需 >= 此值（回测左边界，Unix 秒）
             adj: 复权方式 — "qfq"(前复权,默认) / "hfq"(后复权) / ""(不复权)
+
+        Returns:
+            单只: [bar, ...] — 每个 bar 包含 {"time", "open", "high", "low", "close", "volume"}
+            批量: {symbol: [bar, ...], ...}
         """
         # ── 批量模式：逗号分隔 ──
         if ',' in symbol:
             symbols = [s.strip() for s in symbol.split(',') if s.strip()]
             if not symbols:
                 return []
-            return self.get_kline_batch(symbols, timeframe, limit, adj=adj)
+            return self._get_klines(symbols, timeframe, limit, adj=adj)
 
         code = normalize_cn_code(symbol)
         tf = normalize_chart_timeframe(timeframe)
         lim = max(int(limit or 300), 1)
 
-        # 先检查缓存（缓存 key 包含 adj，不同复权方式独立缓存）
-        cache_key = generate_kline_cache_key(code, tf, lim, before_time, adj=adj)
-        cached = self.kline_cache.get(cache_key)
-        if cached:
-            return cached
+        # 单只 → 走批量，取一个结果
+        result = self._get_klines([symbol], tf, lim, adj=adj)
+        bars = result.get(code, [])
 
-        # 交给 Coordinator（自动从 Provider 层发现源，传递 adj）
-        results, failed = get_coordinator().coordinate_kline(
-            symbols=[code],
-            timeframe=tf,
-            limit=lim,
-            cb=self.circuit_breaker,
-            market="CNStock",
-            timeout=_get_timeout() + 5,
-            adj=adj,
-        )
-
-        bars = results.get(code)
         if not bars:
             logger.warning(f"[K线终止] {symbol} tf={tf} 所有数据源失败")
             return []
@@ -300,14 +331,10 @@ class CNStockDataSource(BaseDataSource):
             after_time=after_time, truncate=(after_time is None),
         )
 
-        # 写入缓存
-        kline_ttl = 300.0 if tf in ("1D", "1W") else 120.0
-        self.kline_cache.set(cache_key, out, ttl=kline_ttl)
-
         logger.info(f"[K线成功] {symbol} tf={tf} bars={len(out)}")
         return out
 
-    def get_kline_batch(
+    def _get_klines(
         self,
         symbols: List[str],
         timeframe: str,
@@ -331,7 +358,7 @@ class CNStockDataSource(BaseDataSource):
         # ── 月线：走日线批量 + 聚合 ──
         if tf == "1M":
             daily_limit = min(limit * 21 + 100, 5000)
-            daily_result = self.get_kline_batch(
+            daily_result = self._get_klines(
                 symbols, "1D", daily_limit, cached_symbols=cached_symbols, adj=adj,
             )
             for sym, daily_bars in daily_result.items():

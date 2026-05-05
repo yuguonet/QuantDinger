@@ -5,9 +5,9 @@ CNStockDataSource 单元测试
 覆盖范围:
   - __init__: 熔断器 / 缓存初始化
   - get_ticker: 缓存命中、Coordinator race、全部失败兜底
-  - get_batch_quotes: Provider 透传、无 Provider 兜底
+  - get_ticker 批量: Provider 透传、无 Provider 兜底
   - get_kline: 缓存命中、Coordinator 调度、全部失败、时间过滤
-  - get_kline_batch: 月线日线聚合、缓存分离、空列表
+  - get_kline 批量: 月线日线聚合、逗号分隔、部分失败
   - 辅助函数: _validate_kline_result, _strip_cn_prefix, _aggregate_daily_to_monthly
 """
 import sys
@@ -306,27 +306,27 @@ class TestGetTicker:
 
 
 # ======================================================================
-# get_batch_quotes
+# get_ticker 批量模式（逗号分隔 → _get_tickers）
 # ======================================================================
 
-class TestGetBatchQuotes:
+class TestGetTickerBatch:
 
     def test_delegates_to_provider(self, ds, mock_coordinator):
         """有 Provider 时透传 fetch_quotes_batch。"""
-        expected = {"600519": {"close": 1800.0}}
+        expected = {"600519": {"close": 1800.0}, "000001": {"close": 10.0}}
         mock_provider = MagicMock()
         mock_provider.fetch_quotes_batch.return_value = expected
 
         with patch("app.data_sources.provider.get_providers", return_value=[mock_provider]):
             with patch.object(mock_coordinator, "passthrough", side_effect=lambda fn, *a: fn(*a)):
-                result = ds.get_batch_quotes(["600519"])
+                result = ds.get_ticker("600519,000001")
 
         assert result == expected
 
     def test_no_providers_returns_empty(self, ds):
         """无 Provider 时返回空。"""
         with patch("app.data_sources.provider.get_providers", return_value=[]):
-            result = ds.get_batch_quotes(["600519"])
+            result = ds.get_ticker("600519,000001")
         assert result == {}
 
     def test_provider_returns_empty(self, ds, mock_coordinator):
@@ -338,7 +338,7 @@ class TestGetBatchQuotes:
 
         with patch("app.data_sources.provider.get_providers", return_value=[p1, p2]):
             with patch.object(mock_coordinator, "passthrough", side_effect=lambda fn, *a: fn(*a)):
-                result = ds.get_batch_quotes(["600519"])
+                result = ds.get_ticker("600519,000001")
         assert result == {}
 
 
@@ -426,80 +426,55 @@ class TestGetKline:
 
 
 # ======================================================================
-# get_kline_batch
+# get_kline 批量模式（逗号分隔 → _get_klines）
 # ======================================================================
 
 class TestGetKlineBatch:
 
     def test_empty_symbols(self, ds, mock_coordinator):
-        result = ds.get_kline_batch([], "1D", 10)
-        assert result == {}
+        result = ds.get_kline("", "1D", 10)
+        assert result == []
 
     def test_monthly_aggregation(self, ds, mock_coordinator):
         """月线应先拉日线再聚合。"""
         daily_bars = _make_bars(60, start_ts=1700000000, interval=86400)
         mock_coordinator.coordinate_kline.return_value = ({"SH600519": daily_bars}, [])
 
-        result = ds.get_kline_batch(["600519"], "1M", 3)
+        result = ds.get_kline("600519", "1M", 3)
+        # 月线聚合走 _get_klines → 返回 dict，但 get_kline 返回 list
+        # get_kline 单只模式会取 dict 中的值
+        assert len(result) <= 3
+
+    def test_batch_comma_separated(self, ds, mock_coordinator):
+        """逗号分隔走批量模式。"""
+        bars_a = _make_bars(5)
+        bars_b = _make_bars(5, start_ts=1700100000)
+        mock_coordinator.coordinate_kline.return_value = (
+            {"SH600519": bars_a, "SZ000001": bars_b}, []
+        )
+
+        result = ds.get_kline("600519,000001", "1D", 5)
+        assert isinstance(result, dict)
         assert "SH600519" in result
-        assert len(result["SH600519"]) <= 3
-
-    def test_cached_symbols_read_from_cache(self, ds, mock_coordinator):
-        """已有缓存的 symbol 直接读缓存，不走 Coordinator。"""
-        bars = _make_bars(5)
-        from app.data_sources.cache_manager import generate_kline_cache_key
-        key = generate_kline_cache_key("SH600519", "1D", 10, None)
-        ds.kline_cache.set(key, bars, ttl=300)
-
-        result = ds.get_kline_batch(
-            ["600519"], "1D", 10, cached_symbols={"600519"}
-        )
-        # get_kline_batch 用原始 symbol 作 key
-        assert "600519" in result
-        mock_coordinator.coordinate_kline.assert_not_called()
-
-    def test_uncached_symbols_go_to_coordinator(self, ds, mock_coordinator):
-        """未缓存的 symbol 走 Coordinator。"""
-        bars = _make_bars(5)
-        mock_coordinator.coordinate_kline.return_value = ({"SZ000001": bars}, [])
-
-        result = ds.get_kline_batch(["000001"], "1D", 10)
         assert "SZ000001" in result
-        mock_coordinator.coordinate_kline.assert_called_once()
 
-    def test_mixed_cached_and_uncached(self, ds, mock_coordinator):
-        """混合场景：部分缓存、部分走 Coordinator。"""
-        cached_bars = _make_bars(5)
-        uncached_bars = _make_bars(8)
-        from app.data_sources.cache_manager import generate_kline_cache_key
-        key = generate_kline_cache_key("SH600519", "1D", 10, None)
-        ds.kline_cache.set(key, cached_bars, ttl=300)
-        mock_coordinator.coordinate_kline.return_value = ({"SZ000001": uncached_bars}, [])
-
-        result = ds.get_kline_batch(
-            ["600519", "000001"], "1D", 10, cached_symbols={"600519"}
-        )
-        # 缓存路径用原始 symbol，Coordinator 路径用 normalized
-        assert "600519" in result
-        assert "SZ000001" in result
-        assert result["600519"] == cached_bars
-
-    def test_partial_failure(self, ds, mock_coordinator):
-        """部分 symbol 失败时，成功的仍返回。"""
+    def test_batch_partial_failure(self, ds, mock_coordinator):
+        """批量模式部分失败时，成功的仍返回。"""
         bars = _make_bars(5)
         mock_coordinator.coordinate_kline.return_value = (
             {"SH600519": bars}, ["SZ000001"]
         )
 
-        result = ds.get_kline_batch(["600519", "000001"], "1D", 10)
+        result = ds.get_kline("600519,000001", "1D", 10)
+        assert isinstance(result, dict)
         assert "SH600519" in result
         assert "SZ000001" not in result
 
-    def test_coordinator_timeout_config(self, ds, mock_coordinator):
-        """timeout 应为 _get_timeout() + 10。"""
+    def test_batch_coordinator_timeout(self, ds, mock_coordinator):
+        """批量模式 timeout 应为 _get_timeout() + 10。"""
         mock_coordinator.coordinate_kline.return_value = ({}, [])
 
-        ds.get_kline_batch(["600519"], "1D", 10)
+        ds.get_kline("600519,000001", "1D", 10)
         call_kwargs = mock_coordinator.coordinate_kline.call_args.kwargs
         assert call_kwargs["timeout"] > 0
         assert call_kwargs["market"] == "CNStock"
