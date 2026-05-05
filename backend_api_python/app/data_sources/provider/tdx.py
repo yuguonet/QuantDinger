@@ -294,11 +294,15 @@ class TdxDataSource:
 
         chg = round(last - prev, 4) if prev else 0.0
         return {
-            "symbol": f"{digits}", "name": name,
-            "last": last, "change": chg,
+            "last": last,
+            "change": chg,
             "changePercent": round(chg / prev * 100, 2) if prev else 0.0,
-            "open": open_p, "high": high, "low": low,
-            "previousClose": prev, "volume": vol,
+            "high": high,
+            "low": low,
+            "open": open_p,
+            "previousClose": prev,
+            "name": name,
+            "symbol": f"{digits}",
         }
 
     def fetch_quotes_batch(self, codes: List[str], timeout: int = 10) -> Dict[str, Dict[str, Any]]:

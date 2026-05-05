@@ -429,14 +429,20 @@ class SinaDataSource:
         quote = _parse_sina_quote(resp.text)
         if not quote:
             return None
-        quote["symbol"] = sc
         last = quote["last"]
         prev = quote["prev_close"]
-        quote["change"] = round(last - prev, 4) if prev else 0.0
-        quote["changePercent"] = round(quote["change"] / prev * 100, 2) if prev else 0.0
-        quote["open"] = quote.get("open", last) or last
-        quote["previousClose"] = prev
-        return quote
+        chg = round(last - prev, 4) if prev else 0.0
+        return {
+            "last": last,
+            "change": chg,
+            "changePercent": round(chg / prev * 100, 2) if prev else 0.0,
+            "high": quote.get("high", last),
+            "low": quote.get("low", last),
+            "open": quote.get("open", last) or last,
+            "previousClose": prev,
+            "name": quote.get("name", ""),
+            "symbol": sc,
+        }
 
     def fetch_quotes_batch(self, codes: List[str], timeout: int = 10) -> Dict[str, Dict[str, Any]]:
         """

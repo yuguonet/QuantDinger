@@ -370,15 +370,20 @@ class AkShareDataSource:
                 last = _safe_float(row.get(last_col))
                 if last <= 0:
                     continue
+                prev = round(_safe_float(row.get(prev_col)), 4) if prev_col else 0
+                chg = round(last - prev, 4) if prev else 0.0
+                name = str(row.get(name_col, "")) if name_col else ""
                 result[sym] = {
                     "last": last,
-                    "name": str(row.get(name_col, "")) if name_col else "",
-                    "open": round(_safe_float(row.get(open_col, last)), 4) if open_col else last,
+                    "change": chg,
+                    "changePercent": round(chg / prev * 100, 2) if prev else 0.0,
                     "high": round(_safe_float(row.get(high_col, last)), 4) if high_col else last,
                     "low": round(_safe_float(row.get(low_col, last)), 4) if low_col else last,
-                    "previousClose": round(_safe_float(row.get(prev_col)), 4) if prev_col else 0,
-                    "volume": round(_safe_float(row.get(vol_col)), 2) if vol_col else 0,
-                    "symbol": sym, "time": today_ts,
+                    "open": round(_safe_float(row.get(open_col, last)), 4) if open_col else last,
+                    "previousClose": prev,
+                    "name": name,
+                    "symbol": sym,
+                    "time": today_ts,
                 }
             except (ValueError, TypeError):
                 continue

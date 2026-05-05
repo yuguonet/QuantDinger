@@ -393,11 +393,15 @@ class BaoStockDataSource:
 
                         if last > 0:
                             return {
-                                "symbol": bs_code, "name": "",
-                                "last": last, "change": 0.0,
+                                "last": last,
+                                "change": 0.0,
                                 "changePercent": 0.0,
-                                "open": open_p, "high": high, "low": low,
-                                "previousClose": 0.0, "volume": vol,
+                                "high": high,
+                                "low": low,
+                                "open": open_p,
+                                "previousClose": 0.0,
+                                "name": "",
+                                "symbol": bs_code,
                             }
                     return None
 

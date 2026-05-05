@@ -286,13 +286,17 @@ class EastMoneyDataSource:
         prev = _f("f60")
         if last == 0 and prev == 0:
             return None
-        change = round(last - prev, 4) if prev else 0.0
-        change_pct = round(change / prev * 100, 2) if prev else 0.0
+        chg = round(last - prev, 4) if prev else 0.0
         return {
-            "symbol": secid, "name": str(d.get("f58", "")).strip(),
-            "last": last, "change": change, "changePercent": change_pct,
-            "high": _f("f44"), "low": _f("f45"), "open": _f("f46"),
-            "previousClose": prev, "volume": _f("f47"), "amount": _f("f48"),
+            "last": last,
+            "change": chg,
+            "changePercent": round(chg / prev * 100, 2) if prev else 0.0,
+            "high": _f("f44"),
+            "low": _f("f45"),
+            "open": _f("f46"),
+            "previousClose": prev,
+            "name": str(d.get("f58", "")).strip(),
+            "symbol": secid,
         }
 
     def fetch_quotes_batch(self, codes: List[str], timeout: int = 15) -> Dict[str, Dict[str, Any]]:
@@ -356,14 +360,19 @@ class EastMoneyDataSource:
                 last = float(item.get("f2", 0))
                 if last <= 0:
                     continue
+                prev = float(item.get("f18", 0))
+                chg = round(last - prev, 4) if prev else 0.0
                 result[sym] = {
                     "last": last,
-                    "open": round(float(item.get("f17", 0)), 4),
+                    "change": chg,
+                    "changePercent": round(chg / prev * 100, 2) if prev else 0.0,
                     "high": round(float(item.get("f15", 0)), 4),
                     "low": round(float(item.get("f16", 0)), 4),
-                    "previousClose": float(item.get("f18", 0)),
-                    "volume": round(float(item.get("f5", 0)), 2),
-                    "name": "", "symbol": sym, "time": today_ts,
+                    "open": round(float(item.get("f17", 0)), 4),
+                    "previousClose": prev,
+                    "name": "",
+                    "symbol": sym,
+                    "time": today_ts,
                 }
             except (ValueError, TypeError):
                 continue
