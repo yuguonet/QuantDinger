@@ -8,10 +8,9 @@
 - 防封禁策略 (rate_limiter)
 """
 from app.data_sources.factory import DataSourceFactory
-from app.data_sources.coordinator import (
+from app.data_sources.circuit_breaker import (
     CircuitBreaker,
     get_realtime_circuit_breaker,
-    get_overseas_circuit_breaker,
 )
 from app.data_sources.cache_manager import (
     DataCache,
@@ -37,7 +36,6 @@ __all__ = [
     # 熔断器
     'CircuitBreaker',
     'get_realtime_circuit_breaker',
-    'get_overseas_circuit_breaker',
     # 缓存
     'DataCache',
     'get_realtime_cache',

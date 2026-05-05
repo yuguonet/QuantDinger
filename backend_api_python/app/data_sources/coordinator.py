@@ -57,6 +57,7 @@
 
 from __future__ import annotations
 
+import atexit
 import concurrent.futures
 import threading
 import time
@@ -71,26 +72,24 @@ logger = get_logger(__name__)
 
 
 # ================================================================
-# 熔断器 — 三态状态机: Closed → Open → Half-Open → Closed
+# 熔断器 — 两态状态机: Closed → Open → Closed
 # ================================================================
 
 class CircuitBreaker:
     """
-    熔断器 — 三态状态机: Closed → Open → Half-Open → Closed。
+    熔断器 — 两态状态机: Closed → Open → Closed。
 
     每个数据源可配置独立的熔断器实例，支持按源名称分别跟踪故障状态。
 
     状态机:
-        ┌─────────┐  连续失败 ≥ 阈值  ┌──────┐  冷却期结束  ┌───────────┐
-        │ Closed  │ ───────────────→ │ Open │ ──────────→ │ Half-Open │
-        │ (正常)  │                   │(熔断)│             │ (试探)    │
-        └─────────┘ ←─────────────── └──────┘ ←────────── └───────────┘
-             ↑          请求成功                        │
-             └──────────────────────────────────────────┘  请求失败 → 回到 Open
+        ┌─────────┐  连续失败 ≥ 阈值  ┌──────┐  冷却期结束  ┌─────────┐
+        │ Closed  │ ───────────────→ │ Open │ ──────────→ │ Closed  │
+        │ (正常)  │ ←─────────────── │(熔断)│             │ (恢复)  │
+        └─────────┘    请求成功       └──────┘             └─────────┘
 
-    Half-Open 关键行为:
-        冷却期结束后，只放行**一个**试探请求，其余并发请求仍被拒绝。
-        试探成功 → 回到 Closed；试探失败 → 重新回到 Open（重新计时冷却）。
+    行为:
+        冷却期结束后，自动恢复为 Closed 状态，所有请求正常放行。
+        如果恢复后再次连续失败，重新进入 Open。
 
     线程安全性:
         使用 threading.Lock 保护所有状态读写，多线程并发调用安全。
@@ -98,7 +97,6 @@ class CircuitBreaker:
 
     _CLOSED = "closed"
     _OPEN = "open"
-    _HALF_OPEN = "half_open"
 
     def __init__(
         self,
@@ -119,13 +117,14 @@ class CircuitBreaker:
             state = self._state.get(source, self._CLOSED)
             if state == self._CLOSED:
                 return True
-            if state == self._HALF_OPEN:
-                return False
             # OPEN — 检查冷却是否到期
             elapsed = time.time() - self._tripped_at[source]
             if elapsed >= self._cooldown_seconds:
-                self._state[source] = self._HALF_OPEN
-                logger.info("[熔断器:%s] %s 冷却结束，进入半开状态", self._name, source)
+                # 冷却到期，直接恢复 Closed
+                self._state[source] = self._CLOSED
+                self._failures[source] = 0
+                self._tripped_at.pop(source, None)
+                logger.info("[熔断器:%s] %s 冷却结束，恢复正常", self._name, source)
                 return True
             return False
 
@@ -137,16 +136,6 @@ class CircuitBreaker:
 
     def record_failure(self, source: str, reason: str = ""):
         with self._lock:
-            state = self._state.get(source, self._CLOSED)
-            if state == self._HALF_OPEN:
-                self._state[source] = self._OPEN
-                self._tripped_at[source] = time.time()
-                self._failures[source] = 1
-                logger.warning(
-                    "[熔断器:%s] %s 半开试探失败，重新熔断 %ds (原因: %s)",
-                    self._name, source, self._cooldown_seconds, reason,
-                )
-                return
             self._failures[source] = self._failures.get(source, 0) + 1
             if self._failures[source] >= self._failure_threshold:
                 self._state[source] = self._OPEN
@@ -171,17 +160,11 @@ class CircuitBreaker:
 
 # 全局熔断器实例
 _realtime_cb = CircuitBreaker(failure_threshold=3, cooldown_seconds=300, name="realtime")
-_overseas_cb = CircuitBreaker(failure_threshold=2, cooldown_seconds=900, name="overseas")
 
 
 def get_realtime_circuit_breaker() -> CircuitBreaker:
     """获取实时行情熔断器实例"""
     return _realtime_cb
-
-
-def get_overseas_circuit_breaker() -> CircuitBreaker:
-    """获取海外行情熔断器实例"""
-    return _overseas_cb
 
 # ================================================================
 # 全局常量
@@ -205,6 +188,7 @@ MAX_SOURCE_FAILS = 5
 _timeout_pool = concurrent.futures.ThreadPoolExecutor(
     max_workers=8, thread_name_prefix="coord-timeout"
 )
+atexit.register(_timeout_pool.shutdown, wait=False)
 
 
 # ================================================================
@@ -619,9 +603,16 @@ class Coordinator:
             """
             标记某 symbol 获取成功。
             成功后该 symbol 从队列中彻底移除（不再让其他源尝试）。
+
+            Returns:
+                True  = 首次成功（调用方应 task_done）
+                False = 已被其他源抢先成功（调用方不应 task_done，避免重复计数）
             """
             with results_lock:
+                if sym in results:
+                    return False  # 已被其他源成功获取，忽略重复
                 results[sym] = bars
+                return True
 
         def _mark_failed(sym: str, source_name: str):
             """
@@ -643,6 +634,10 @@ class Coordinator:
                 untried = [name for name, _ in available if name not in tried]
 
             if untried:
+                # 二次检查: put_back 前再确认一次，避免已成功的 symbol 被重复放回
+                with results_lock:
+                    if sym in results:
+                        return
                 # 还有未尝试的源 → 放回队尾，让其他 worker 接手
                 wq.put_back(sym)
             else:
@@ -703,9 +698,10 @@ class Coordinator:
                     # 成功
                     cb.record_success(source_name)       # 通知熔断器
                     cfg.record(True, elapsed)            # 记录统计
-                    _mark_success(sym, bars, source_name)
+                    is_first = _mark_success(sym, bars, source_name)
                     _reset_consecutive_fails(source_name)
-                    wq.task_done()
+                    if is_first:
+                        wq.task_done()
                     return True
                 else:
                     # 失败（返回了空结果）
@@ -891,7 +887,7 @@ class Coordinator:
                 result = fetch_fn(symbol)
                 elapsed = time.time() - start
 
-                if result and result.get("last", 0) > 0:
+                if result and ("last" in result or "price" in result):
                     # 获取到有效数据
                     cb.record_success(source_name)
                     cfg = get_source_config(source_name)

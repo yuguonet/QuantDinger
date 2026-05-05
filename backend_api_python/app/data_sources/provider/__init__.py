@@ -26,7 +26,7 @@ A股数据源 Provider 框架 — 自注册 + 能力声明 + 统一接口
 
 已实现 Provider:
   CNStock (A股)  → tencent(10), sina(20), eastmoney(30), akshare(50)
-  HKStock (港股) → hk_stock(40), tencent(10)
+  CNStock (A股) → tencent(10), sina(20), eastmoney(30)
 
 待实现 Provider (仅预留常量，暂不注册):
   USStock (美股) → yfinance / twelvedata / finnhub
