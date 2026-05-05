@@ -12,107 +12,16 @@
 
 from __future__ import annotations
 
-import concurrent.futures
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from app.data_sources.base import BaseDataSource
-from app.data_sources.normalizer import (
-    normalize_cn_code,
-)
-from app.data_sources.asia_stock_kline import (
-    normalize_chart_timeframe,
-)
+from app.data_sources.normalizer import normalize_cn_code
+from app.data_sources.asia_stock_kline import normalize_chart_timeframe
 from app.data_sources.circuit_breaker import get_realtime_circuit_breaker
 from app.data_sources.coordinator import get_coordinator
-from app.config.data_sources import DataSourceConfig
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
-
-
-# ================================================================
-# 超时封装工具
-# ================================================================
-
-_TIMEOUT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=4,
-    thread_name_prefix="cnstock-timeout",
-)
-
-
-def _get_timeout() -> float:
-    """统一获取超时配置"""
-    return float(DataSourceConfig.DEFAULT_TIMEOUT or 10)
-
-
-def _fetch_with_timeout(
-    func: Callable,
-    *args,
-    timeout: Optional[float] = None,
-    source_name: str = "",
-    **kwargs,
-) -> Tuple[Optional[Any], Optional[str]]:
-    """
-    在独立线程中执行 func，超时后放弃。
-
-    Returns:
-        (result, error)  —— result 非 None 表示成功，error 非 None 表示失败原因。
-    """
-    if timeout is None:
-        timeout = _get_timeout()
-
-    future = _TIMEOUT_EXECUTOR.submit(func, *args, **kwargs)
-    try:
-        result = future.result(timeout=timeout)
-        return result, None
-    except concurrent.futures.TimeoutError:
-        logger.warning(f"[超时] {source_name} 调用超时 ({timeout}s)")
-        future.cancel()
-        return None, f"{source_name} timeout ({timeout}s)"
-    except Exception as e:
-        logger.warning(f"[异常] {source_name} 调用失败: {e}")
-        return None, f"{source_name} error: {e}"
-
-
-# ================================================================
-# K线数据校验
-# ================================================================
-
-def _validate_kline_result(bars: List[Dict[str, Any]], min_bars: int = 1) -> bool:
-    """
-    校验K线数据基本合理性。
-    返回 True 表示数据可用，False 表示应丢弃。
-    """
-    if not bars or len(bars) < min_bars:
-        return False
-
-    last = bars[-1]
-    if not isinstance(last, dict):
-        return False
-
-    t = last.get("time")
-    if not t or not isinstance(t, (int, float)) or t <= 0:
-        return False
-
-    if last.get("close", 0) <= 0:
-        return False
-
-    h, low = last.get("high", 0), last.get("low", 0)
-    if h > 0 and low > 0 and h < low:
-        return False
-
-    return True
-
-
-def _strip_cn_prefix(code: str) -> str:
-    """
-    安全剥离 A股代码的 SH/SZ/BJ 前缀。
-    """
-    s = (code or "").strip()
-    upper = s.upper()
-    if upper.startswith(("SH", "SZ", "BJ")) and len(s) >= 3:
-        return s[2:]
-    return s
 
 
 # ================================================================
@@ -173,7 +82,7 @@ class CNStockDataSource(BaseDataSource):
             symbol=code,
             cb=self.circuit_breaker,
             market="CNStock",
-            timeout=min(_get_timeout(), 8),
+            timeout=8,
         )
 
         if result:
@@ -300,7 +209,7 @@ class CNStockDataSource(BaseDataSource):
             limit=limit,
             cb=self.circuit_breaker,
             market="CNStock",
-            timeout=_get_timeout() + 10,
+            timeout=20,
             adj=adj,
         )
 
