@@ -24,6 +24,22 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+def _strip_cn_prefix(code: str) -> str:
+    """
+    去掉 A 股代码的市场前缀，返回纯 6 位数字。
+
+    "SH600519" → "600519"
+    "sh600519" → "600519"
+    "SZ000001" → "000001"
+    "BJ830799" → "830799"
+    "600519"   → "600519"  (无前缀，原样返回)
+    """
+    s = (code or "").strip()
+    if len(s) > 6 and s[:2].upper() in ("SH", "SZ", "BJ"):
+        return s[2:]
+    return s
+
+
 # ================================================================
 # 数据源类
 # ================================================================
@@ -76,6 +92,7 @@ class CNStockDataSource(BaseDataSource):
 
         # ── 单只模式 ──
         code = normalize_cn_code(symbol)
+        raw = _strip_cn_prefix(code)
 
         # 交给 Coordinator（自动从 Provider 层发现源，race 模式）
         result = get_coordinator().coordinate_ticker(
@@ -86,17 +103,18 @@ class CNStockDataSource(BaseDataSource):
         )
 
         if result:
+            result["symbol"] = raw
             return result
 
         logger.warning(f"[行情] 所有数据源均失败: {symbol}")
-        return {"last": 0, "symbol": code}
+        return {"last": 0, "symbol": raw}
 
     # ----------------------------------------------------------
     # 批量当日行情（供 K 线服务合成当日 K 线用）
     # ----------------------------------------------------------
 
     def _get_tickers(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
-        """批量获取实时行情（ticker 格式）— 透传 Provider 层 batch_quote 接口"""
+        """批量获取实时行情（ticker 格式）— 透传 Provider 层 batch_quote 接口，返回纯数字 key"""
         from app.data_sources.provider import get_providers
         normalized = [normalize_cn_code(s) for s in symbols if s]
         if not normalized:
@@ -106,9 +124,16 @@ class CNStockDataSource(BaseDataSource):
             return {}
         # 按优先级逐源尝试（passthrough 透传，失败自动降级）
         for p in providers:
-            result = get_coordinator().passthrough(p.fetch_quotes_batch, normalized)
-            if result:
-                return result
+            raw_result = get_coordinator().passthrough(p.fetch_quotes_batch, normalized)
+            if raw_result:
+                # 统一去掉 key 和 symbol 字段的市场前缀
+                cleaned = {}
+                for k, v in raw_result.items():
+                    raw_key = _strip_cn_prefix(k)
+                    if isinstance(v, dict):
+                        v["symbol"] = raw_key
+                    cleaned[raw_key] = v
+                return cleaned
         return {}
 
     # ----------------------------------------------------------
@@ -163,12 +188,13 @@ class CNStockDataSource(BaseDataSource):
             return self._get_klines(symbols, timeframe, limit, adj=adj)
 
         code = normalize_cn_code(symbol)
+        raw = _strip_cn_prefix(code)
         tf = normalize_chart_timeframe(timeframe)
         lim = max(int(limit or 300), 1)
 
         # 单只 → 走批量，取一个结果
         result = self._get_klines([symbol], tf, lim, adj=adj)
-        bars = result.get(code, [])
+        bars = result.get(raw, [])
 
         if not bars:
             logger.warning(f"[K线终止] {symbol} tf={tf} 所有数据源失败")
@@ -213,9 +239,9 @@ class CNStockDataSource(BaseDataSource):
             adj=adj,
         )
 
-        # 合并结果
+        # 合并结果 — 统一去掉 key 的市场前缀
         for sym, bars in coord_results.items():
-            result[sym] = bars
+            result[_strip_cn_prefix(sym)] = bars
 
         if failed:
             logger.warning(f"[K线批量] {len(failed)} 只失败: {failed[:5]}...")

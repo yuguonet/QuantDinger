@@ -435,30 +435,32 @@ def get_watchlist_prices():
         for market, symbols in market_groups.items():
             try:
                 if market == 'CNStock':
-                    # A股: 所有自选股逗号拼接，一次调 get_ticker（内部走 Provider 批量接口）
+                    # A股: 所有自选股逗号拼接一次调 get_ticker（内部走 Provider 批量接口）
+                    # CNStockDataSource 已统一返回纯数字 key 和 symbol
                     ticker_map = DataSourceFactory.get_ticker(market, ",".join(symbols))
+                    if not isinstance(ticker_map, dict):
+                        ticker_map = {}
+
                     for sym in symbols:
-                        ticker = ticker_map.get(sym, {}) if isinstance(ticker_map, dict) else {}
-                        price = ticker.get('last', 0) or ticker.get('price', 0) or 0
+                        ticker = ticker_map.get(sym, {})
                         results.append({
                             'market': market,
                             'symbol': sym,
-                            'price': price,
+                            'price': ticker.get('last', 0),
                             'change': ticker.get('change', 0),
-                            'changePercent': ticker.get('changePercent', 0) or ticker.get('percentage', 0),
+                            'changePercent': ticker.get('changePercent', 0),
                         })
                 else:
                     # 其他市场: 逐只调 get_ticker
                     for sym in symbols:
                         try:
                             ticker = DataSourceFactory.get_ticker(market, sym)
-                            price = ticker.get('last', 0) or ticker.get('price', 0) or 0
                             results.append({
                                 'market': market,
                                 'symbol': sym,
-                                'price': price,
+                                'price': ticker.get('last', 0),
                                 'change': ticker.get('change', 0),
-                                'changePercent': ticker.get('changePercent', 0) or ticker.get('percentage', 0),
+                                'changePercent': ticker.get('changePercent', 0),
                             })
                         except Exception:
                             results.append({

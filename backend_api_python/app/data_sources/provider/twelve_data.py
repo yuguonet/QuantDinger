@@ -310,7 +310,10 @@ class TwelveDataSource:
 
     def fetch_quote(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
         """
-        获取单只股票实时价格 — 通过 Twelve Data /price API。
+        获取单只股票实时行情 — 通过 Twelve Data /quote API。
+
+        /quote API 返回完整行情数据（含涨跌额/涨跌幅/昨收等），
+        优于 /price API（仅返回当前价格）。
 
         Args:
             code:    股票代码
@@ -328,7 +331,7 @@ class TwelveDataSource:
 
         try:
             resp = requests.get(
-                "https://api.twelvedata.com/price",
+                "https://api.twelvedata.com/quote",
                 params={
                     "symbol": symbol,
                     "exchange": exchange,
@@ -344,27 +347,30 @@ class TwelveDataSource:
         if data.get("status") != "ok":
             return None
 
-        price = data.get("price")
-        if not price:
-            return None
-
         try:
-            last = float(price)
+            last = float(data.get("close", 0) or 0)
         except (TypeError, ValueError):
-            return None
+            last = 0
 
         if last <= 0:
             return None
 
+        try:
+            prev = float(data.get("previous_close", 0) or 0)
+        except (TypeError, ValueError):
+            prev = 0
+
+        chg = round(last - prev, 4) if prev else 0.0
+
         return {
             "last": last,
-            "change": 0.0,
-            "changePercent": 0.0,
-            "high": last,
-            "low": last,
-            "open": last,
-            "previousClose": 0.0,
-            "name": "",
+            "change": chg,
+            "changePercent": round(chg / prev * 100, 2) if prev else 0.0,
+            "high": float(data.get("high", 0) or 0),
+            "low": float(data.get("low", 0) or 0),
+            "open": float(data.get("open", 0) or 0),
+            "previousClose": prev,
+            "name": str(data.get("name", "") or ""),
             "symbol": f"{symbol}.{exchange}",
         }
 
