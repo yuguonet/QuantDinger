@@ -21,6 +21,7 @@ from app.data.market_symbols_seed import (
     get_symbol_name as seed_get_symbol_name
 )
 from app.services.symbol_name import resolve_symbol_name
+from app.data_sources.factory import DataSourceFactory
 
 logger = get_logger(__name__)
 
@@ -400,7 +401,7 @@ def get_single_price(market: str, symbol: str) -> dict:
 @market_bp.route('/watchlist/prices', methods=['GET'])
 def get_watchlist_prices():
     """
-    批量获取自选股价格
+    批量获取自选股价格 — 按市场分组，使用批量 API 一次拉取。
     
     Params (Query String):
         watchlist: JSON string of list of {market, symbol} objects
@@ -420,54 +421,45 @@ def get_watchlist_prices():
                 'data': []
             }), 400
         
-        # logger.info(f"开始获取 {len(watchlist)} 个自选股价格数据")
+        # 按市场分组
+        market_groups = {}
+        for item in watchlist:
+            market = (item.get('market') or '').strip()
+            symbol = (item.get('symbol') or '').strip()
+            if market and symbol:
+                market_groups.setdefault(market, []).append(symbol)
         
         results = []
         
-        # 使用线程池并行获取价格
-        futures = {}
-        for item in watchlist:
-            market = item.get('market', '')
-            symbol = item.get('symbol', '')
-            
-            if market and symbol:
-                future = executor.submit(get_single_price, market, symbol)
-                futures[future] = (market, symbol)
-        
-        # 收集结果（带超时保护）
-        completed_futures = set()
-        try:
-            for future in as_completed(futures, timeout=30):
-                completed_futures.add(future)
-                try:
-                    result = future.result()
-                    results.append(result)
-                except Exception as e:
-                    market, symbol = futures[future]
-                    logger.warning(f"Price fetch failed: {market}:{symbol} - {str(e)}")
+        # 对每个市场使用批量 API
+        for market, symbols in market_groups.items():
+            try:
+                batch_result = DataSourceFactory.get_batch_tickers(market, symbols)
+                for sym in symbols:
+                    ticker = batch_result.get(sym, {})
+                    price = ticker.get('last', 0) or ticker.get('price', 0) or 0
                     results.append({
                         'market': market,
-                        'symbol': symbol,
-                        'price': 0,
-                        'change': 0,
-                        'changePercent': 0
+                        'symbol': sym,
+                        'price': price,
+                        'change': ticker.get('change', 0),
+                        'changePercent': ticker.get('changePercent', 0) or ticker.get('percentage', 0),
                     })
-        except TimeoutError:
-            # 超时时，为未完成的任务添加默认结果
-            for future, (market, symbol) in futures.items():
-                if future not in completed_futures:
-                    logger.warning(f"Price fetch timed out: {market}:{symbol}")
-                    results.append({
-                        'market': market,
-                        'symbol': symbol,
-                        'price': 0,
-                        'change': 0,
-                        'changePercent': 0,
-                        'error': 'timeout'
-                    })
+            except Exception as e:
+                logger.warning(f"Batch ticker fetch failed for {market}: {e}")
+                # 降级：逐个获取
+                for sym in symbols:
+                    try:
+                        price_data = get_single_price(market, sym)
+                        results.append(price_data)
+                    except Exception:
+                        results.append({
+                            'market': market, 'symbol': sym,
+                            'price': 0, 'change': 0, 'changePercent': 0,
+                        })
         
         success_count = sum(1 for r in results if r.get('price', 0) > 0)
-        logger.info(f"Watchlist prices: {success_count}/{len(results)} successful")
+        logger.info(f"Watchlist prices (batch): {success_count}/{len(results)} successful")
         
         return jsonify({
             'code': 1,

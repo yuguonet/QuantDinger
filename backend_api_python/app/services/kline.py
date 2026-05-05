@@ -85,7 +85,7 @@ class KlineService:
     _SYNTHESIZE_TTL = 30  # 秒
 
     def __init__(self):
-        _cache_disabled = _os.getenv("KLINE_CACHE_DISABLED", "false").lower() in ("1", "true", "yes")
+        _cache_disabled = _os.getenv("KLINE_CACHE_DISABLED", "true").lower() in ("1", "true", "yes")
         self.cache = _NoOpCache() if _cache_disabled else CacheManager()
         self.cache_ttl = CacheConfig.KLINE_CACHE_TTL
         self._kc = _NoOpKlineCacheManager() if _cache_disabled else KlineCacheManager()
