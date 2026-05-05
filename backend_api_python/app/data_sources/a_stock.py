@@ -12,8 +12,9 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
+import concurrent.futures
+from app.config.data_sources import DataSourceConfig
 
-from app.data_sources.cn_stock import _fetch_with_timeout, _get_timeout
 from app.data_sources.circuit_breaker import get_realtime_circuit_breaker
 from app.data_sources.normalizer import normalize_cn_code
 from app.data_sources.eastmoney import (
@@ -67,6 +68,45 @@ _INDEX_SECID = {
     "000905": "1.000905",   # 中证500
 }
 
+
+_TIMEOUT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4,
+    thread_name_prefix="cnstock-timeout",
+)
+
+
+def _get_timeout() -> float:
+    """统一获取超时配置"""
+    return float(DataSourceConfig.DEFAULT_TIMEOUT or 10)
+
+
+def _fetch_with_timeout(
+    func: Callable,
+    *args,
+    timeout: Optional[float] = None,
+    source_name: str = "",
+    **kwargs,
+) -> Tuple[Optional[Any], Optional[str]]:
+    """
+    在独立线程中执行 func，超时后放弃。
+
+    Returns:
+        (result, error)  —— result 非 None 表示成功，error 非 None 表示失败原因。
+    """
+    if timeout is None:
+        timeout = _get_timeout()
+
+    future = _TIMEOUT_EXECUTOR.submit(func, *args, **kwargs)
+    try:
+        result = future.result(timeout=timeout)
+        return result, None 
+    except concurrent.futures.TimeoutError:
+        logger.warning(f"[超时] {source_name} 调用超时 ({timeout}s)")
+        future.cancel()
+        return None, f"{source_name} timeout ({timeout}s)"
+    except Exception as e:
+        logger.warning(f"[异常] {source_name} 调用失败: {e}")
+        return None, f"{source_name} error: {e}"
 
 def _index_secid(code: str) -> str:
     """获取指数的东财 secid，优先查表，兜底用前缀判断"""
