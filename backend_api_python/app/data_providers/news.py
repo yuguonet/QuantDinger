@@ -11,9 +11,11 @@ Financial news data provider — 新闻数据生命周期管理
 """
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 from datetime import datetime
+from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional
 
 from app.utils.logger import get_logger
@@ -72,15 +74,65 @@ _MACRO_MARKET_MAP = {
 
 
 # ═══════════════════════════════════════════════════════════════
+# 标题去重工具 (归一化 hash + 模糊匹配)
+# ═══════════════════════════════════════════════════════════════
+
+# 全角/半角标点 + 空白的统一正则
+_PUNCT_RE = re.compile(r'[^\w\u4e00-\u9fff]')
+
+
+def _normalize_title(title: str) -> str:
+    """归一化标题：去标点、空白，统一小写"""
+    t = (title or "").strip().lower()
+    t = _PUNCT_RE.sub('', t)
+    return t
+
+
+def _title_hash(title: str) -> str:
+    """归一化后取 MD5，用于精确匹配"""
+    return hashlib.md5(_normalize_title(title).encode()).hexdigest()
+
+
+def _is_dup(new_title: str, existing: List[Dict[str, str]], threshold: float = 0.85) -> bool:
+    """
+    两层去重：归一化 hash 精确匹配 + 模糊匹配
+
+    Args:
+        new_title:  待检测标题
+        existing:   已有标题列表，每项 {"title": str, "norm": str}
+        threshold:  模糊匹配阈值 (0~1)
+    Returns:
+        True = 重复
+    """
+    new_norm = _normalize_title(new_title)
+    if not new_norm:
+        return False
+    new_hash = hashlib.md5(new_norm.encode()).hexdigest()
+
+    for item in existing:
+        # 第一层：归一化 hash 精确匹配（O(1)）
+        if item["hash"] == new_hash:
+            return True
+        # 长度差 > 30% 直接跳过模糊比对
+        if abs(len(new_norm) - len(item["norm"])) > max(len(new_norm), len(item["norm"])) * 0.3:
+            continue
+        # 第二层：模糊匹配
+        if SequenceMatcher(None, new_norm, item["norm"]).ratio() >= threshold:
+            return True
+    return False
+
+
+# ═══════════════════════════════════════════════════════════════
 # PostgreSQL 新闻缓存管理器
 # ═══════════════════════════════════════════════════════════════
+
 
 class NewsCacheManager:
     """
     新闻缓存管理器 (纯 DB 比对, 无内存状态)
 
     存储: qd_news_cache_items (每条一行, UNIQUE(symbol, market, title))
-    策略: 24h去重, 15天过期, 自选股时间窗口, 评分写入
+    策略: 24h去重, 15天过期, 自选股时间窗口, 评分写入, 标题模糊去重
     """
 
     def __init__(self):
@@ -221,6 +273,26 @@ class NewsCacheManager:
 
                 news_type = get_news_type(symbol, market)
                 from app.services.news_analysis import keyword_score_article, ai_analyze_article
+
+                # ── 查库去重：归一化 hash + 模糊匹配 ──
+                cursor.execute(
+                    "SELECT title FROM qd_news_cache_items WHERE symbol=%s AND market=%s",
+                    (symbol, market)
+                )
+                existing = [
+                    {"title": row["title"], "norm": _normalize_title(row["title"]),
+                     "hash": _title_hash(row["title"])}
+                    for row in cursor.fetchall()
+                ]
+                before_count = len(results)
+                results = [r for r in results if not _is_dup(r.title, existing)]
+                dup_count = before_count - len(results)
+                if dup_count > 0:
+                    logger.info(f"[去重] {symbol}({market}) 过滤 {dup_count} 条重复标题 (库中已有 {len(existing)} 条)")
+
+                if not results:
+                    logger.info(f"[去重] {symbol}({market}) 全部重复, 跳过写入")
+                    return True
 
                 if news_type == "policy":
                     logger.info(f"[评分] 政策/宏观新闻, 启用 AI 分析: {len(results)}条")

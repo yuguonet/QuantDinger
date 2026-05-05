@@ -304,14 +304,14 @@ _YF_INTERVAL_MAP = {
 }
 
 _YF_DAYS_MAP = {
-    "1m": lambda lim: min(7, max(2, (lim // 240) + 2)),
-    "5m": lambda lim: min(60, max(3, (lim // 48) + 3)),
-    "15m": lambda lim: min(60, max(3, (lim // 16) + 3)),
-    "30m": lambda lim: min(60, max(5, (lim // 8) + 5)),
-    "1H": lambda lim: min(730, max(8, (lim // 4) + 8)),
-    "4H": lambda lim: min(730, max(20, lim + 10)),
-    "1D": lambda lim: min(3650, lim + 10),
-    "1W": lambda lim: min(3650, lim * 7 + 30),
+    "1m": lambda lim: int(min(7, max(2, (int(lim) // 240) + 2))),
+    "5m": lambda lim: int(min(60, max(3, (int(lim) // 48) + 3))),
+    "15m": lambda lim: int(min(60, max(3, (int(lim) // 16) + 3))),
+    "30m": lambda lim: int(min(60, max(5, (int(lim) // 8) + 5))),
+    "1H": lambda lim: int(min(730, max(8, (int(lim) // 4) + 8))),
+    "4H": lambda lim: int(min(730, max(20, int(lim) + 10))),
+    "1D": lambda lim: int(min(3650, int(lim) + 10)),
+    "1W": lambda lim: int(min(3650, int(lim) * 7 + 30)),
 }
 
 
@@ -378,8 +378,8 @@ def fetch_yfinance_klines(
         return []
 
     yf_sym = yf_symbol_from_tencent(tencent_code, is_hk)
-    effective_limit = limit * 4 if timeframe == "4H" else limit
-    days_func = _YF_DAYS_MAP.get(timeframe, lambda x: x + 10)
+    effective_limit = int(limit) * 4 if timeframe == "4H" else int(limit)
+    days_func = _YF_DAYS_MAP.get(timeframe, lambda x: int(x) + 10)
     days = days_func(effective_limit)
 
     end = datetime.fromtimestamp(int(before_time)) if before_time else datetime.now()

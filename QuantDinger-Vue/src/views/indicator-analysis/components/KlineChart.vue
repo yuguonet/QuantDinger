@@ -4353,8 +4353,8 @@ registerOverlay({
         newFromPct = Math.min(baseToPct - 1, baseFromPct - deltaBars / dataLen * 100)
       }
 
-      // 最小可见 20 根 K 线
-      const minPct = 20 / dataLen * 100
+      // 最小可见 5 根 K 线
+      const minPct = 5 / dataLen * 100
       if ((newToPct - newFromPct) < minPct) return
 
       newFromPct = Math.max(0, newFromPct)
@@ -5195,7 +5195,6 @@ registerOverlay({
 /* 百分比 Y 轴叠加层 */
 .kline-chart-with-pct {
   flex: 1;
-  display: flex;
   position: relative;
   min-width: 0;
   overflow: hidden;

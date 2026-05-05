@@ -74,8 +74,9 @@ class DataSourceFactory:
             return cls.get_source("Futures")
         if key in ("forex", "fx"):
             return cls.get_source("Forex")
-        # Default to Crypto for safety (most callers want a ticker for crypto pairs).
-        return cls.get_source("Crypto")
+        # 不再默认兜底到 Crypto — 避免 A 股代码误入加密货币数据源
+        logger.warning("get_data_source(%s): 未知数据源名称，默认使用 CNStock", name)
+        return cls.get_source("CNStock")
     
     @classmethod
     def _create_source(cls, market: str) -> BaseDataSource:
@@ -152,7 +153,9 @@ class DataSourceFactory:
             
             return klines
         except Exception as e:
+            import traceback
             logger.error(f"Failed to fetch K-lines {market}:{symbol} (normalized={cls.normalize_market(market or '')}) - {str(e)}")
+            logger.debug(traceback.format_exc())
             return []
 
     @classmethod

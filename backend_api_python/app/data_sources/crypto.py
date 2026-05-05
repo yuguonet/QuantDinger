@@ -98,6 +98,8 @@ class CryptoDataSource(BaseDataSource):
         - BTC/USDT:USDT -> BTC/USDT
         - BTC -> BTC/USDT (默认)
         - PI, TRX -> PI/USDT, TRX/USDT
+
+        拒绝 A 股 / 港股 / 美股代码（纯数字 4-6 位、带 SH/SZ/BJ/HK 前缀）。
         """
         if not symbol:
             return '', ''
@@ -109,6 +111,22 @@ class CryptoDataSource(BaseDataSource):
             sym = sym.split(':', 1)[0]
 
         sym = sym.upper()
+
+        # ── 拒绝股票代码，避免 A 股/港股代码误入 Crypto 数据源 ──
+        # A 股: 6 位纯数字 (000001-999999)
+        # 港股: 4-5 位纯数字
+        # 美股: 1-5 位纯字母
+        # 带交易所前缀: SH/SZ/BJ/HK + 数字
+        if sym.startswith(("SH", "SZ", "BJ", "HK")):
+            logger.warning(
+                "Rejected stock code %s in Crypto data source (has exchange prefix)", symbol
+            )
+            return '', ''
+        if sym.isdigit() and 4 <= len(sym) <= 6:
+            logger.warning(
+                "Rejected stock code %s in Crypto data source (pure numeric 4-6 digits)", symbol
+            )
+            return '', ''
 
         # 如果已经有分隔符，直接解析
         if '/' in sym:
@@ -172,7 +190,7 @@ class CryptoDataSource(BaseDataSource):
         normalized, base = self._normalize_symbol(symbol)
 
         if not normalized or not base:
-            return symbol
+            return ''
 
         exchange_id = getattr(self.exchange, 'id', '').lower()
 

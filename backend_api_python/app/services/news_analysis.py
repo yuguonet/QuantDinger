@@ -211,33 +211,67 @@ def keyword_score_article(title: str, snippet: str = "") -> Dict[str, Any]:
 #  2. AI 分析评分 (单篇, LLM, 允许改写/降级/加关键词)
 # ═══════════════════════════════════════════════════════════════
 
-_ARTICLE_ANALYSIS_SYSTEM_PROMPT = """你是一位资深金融分析师兼科普作者。你的任务是分析一篇财经新闻，完成以下工作：
+_ARTICLE_ANALYSIS_SYSTEM_PROMPT = """金融分析师。分析财经新闻，输出JSON：
+- score: -10~+10（负=利空，0=中性，正=利好）
+- sentiment: positive/negative/neutral
+- keywords: 金融关键词列表
+- simplified_text: 通俗改写（100字内）
+- impact_level: high/medium/low
+- reasoning: 评分理由（20字内）"""
 
-1. **评分**：根据文章内容对投资者的影响，给出 -10 到 +10 的评分
-   - -10 ~ -1: 利空（负面消息，对投资者不利，越低越严重）
-   - 0: 中性（信息性内容，无明显方向）
-   - +1 ~ +10: 利好（正面消息，对投资者有利，越高越利好）
 
-2. **提取关键词**：从文章中提取所有金融/政策/行业关键词
+def _extract_key_sentences(text: str, max_chars: int = 300) -> str:
+    """
+    从文本中提取含金融关键词的关键句，压缩到 max_chars 以内。
 
-3. **改写降级**：将专业术语改写为通俗易懂的版本，让普通投资者也能看懂
-   - 保留核心信息不变
-   - 用日常用语替代专业术语
-   - 必要时增加简短解释
+    策略: 按句切分 → 含关键词的句子优先保留 → 按原文顺序拼接 → 截断
+    """
+    if not text or len(text) <= max_chars:
+        return text or ""
 
-4. **补充关键词**：在不改变原意的前提下，补充文章隐含但未明说的关键词
+    # 切句（中文句号/问号/叹号/分号，英文句号/问号/叹号）
+    sentences = re.split(r'(?<=[。！？；.!?])\s*', text)
+    sentences = [s.strip() for s in sentences if s.strip()]
 
-输出严格 JSON：
-{
-  "score": 7.5,
-  "sentiment": "positive",
-  "keywords": ["关键词1", "关键词2"],
-  "original_summary": "原文摘要（50字内）",
-  "simplified_text": "改写后的通俗版本（200字内）",
-  "added_keywords": ["补充的关键词1"],
-  "impact_level": "high",
-  "reasoning": "评分理由（30字内）"
-}"""
+    if len(sentences) <= 1:
+        return text[:max_chars]
+
+    # 金融关键词集合（复用评分关键词 + 常见财经术语）
+    _KEY_PATTERNS = re.compile(
+        r'降[准息]|LPR|央行|货币政策|财政|减税|补贴|利好|利空|'
+        r'涨停|跌停|大涨|暴跌|闪崩|暴雷|业绩|净利润|营收|'
+        r'增持|减持|回购|分红|配股|IPO|定增|'
+        r'利率|汇率|GDP|CPI|PPI|PMI|M2|社融|'
+        r'新能源|芯片|半导体|AI|人工智能|碳中和|'
+        r'监管|制裁|关税|退市|破产|造假|调查|'
+        r'突破|新高|新低|放量|缩量|金叉|死叉'
+    )
+
+    # 给每个句子打分：含关键词的句子优先
+    scored = []
+    for i, s in enumerate(sentences):
+        hits = len(_KEY_PATTERNS.findall(s))
+        scored.append((hits, i, s))
+
+    # 先按关键词命中数降序，再按原文顺序
+    scored.sort(key=lambda x: (-x[0], x[1]))
+
+    # 贪心拼接，不超过 max_chars
+    selected = []
+    total = 0
+    for _, orig_idx, s in scored:
+        if total + len(s) + 1 > max_chars:
+            # 如果一句话太长，截取前 max_chars - total 字符
+            remaining = max_chars - total - 1
+            if remaining > 20 and s:
+                selected.append((orig_idx, s[:remaining]))
+            break
+        selected.append((orig_idx, s))
+        total += len(s) + 1
+
+    # 按原文顺序排列
+    selected.sort(key=lambda x: x[0])
+    return " ".join(s for _, s in selected)
 
 
 def ai_analyze_article(
@@ -281,14 +315,15 @@ def ai_analyze_article(
     if not title:
         return None
 
-    # 构建文章信息
+    # 构建文章信息 — 提取关键句压缩 token
     article_info = f"标题: {title}"
     if snippet:
-        article_info += f"\n摘要: {snippet[:800]}"
+        condensed = _extract_key_sentences(snippet, max_chars=300)
+        article_info += f"\n摘要: {condensed}"
     if source:
         article_info += f"\n来源: {source}"
     if published_date:
-        article_info += f"\n发布时间: {published_date}"
+        article_info += f"\n时间: {published_date}"
 
     messages = [
         {"role": "system", "content": _ARTICLE_ANALYSIS_SYSTEM_PROMPT},
@@ -318,8 +353,7 @@ def ai_analyze_article(
         result["score"] = max(-10.0, min(10.0, float(result.get("score", 0.0))))
         result["sentiment"] = _score_to_sentiment(result["score"])
         result["keywords"] = result.get("keywords", [])
-        result["simplified_text"] = result.get("simplified_text", "")
-        result["added_keywords"] = result.get("added_keywords", [])
+        result["simplified_text"] = _safe_truncate(result.get("simplified_text", ""), 200)
         result["impact_level"] = result.get("impact_level", "medium")
         result["reasoning"] = result.get("reasoning", "")
         result["llm_provider"] = getattr(llm.provider, "value", "unknown")
@@ -331,6 +365,13 @@ def ai_analyze_article(
 # ═══════════════════════════════════════════════════════════════
 #  工具函数
 # ═══════════════════════════════════════════════════════════════
+
+def _safe_truncate(text: str, max_len: int) -> str:
+    """安全截断，不在词中间断开"""
+    if not text or len(text) <= max_len:
+        return text or ""
+    return text[:max_len].rstrip() + "…"
+
 
 def _score_to_sentiment(score: float) -> str:
     """评分 → 情感标签 (适用于 -10 ~ +10 分制)"""

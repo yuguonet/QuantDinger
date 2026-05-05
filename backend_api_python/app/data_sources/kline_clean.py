@@ -162,7 +162,7 @@ def _expected_intraday_between(
     """生成两个时间之间的分钟级时间点（只在交易时段内）"""
     start_d = _ensure_aware(start)
     end_d = _ensure_aware(end)
-    interval_min = interval_sec // 60
+    interval_min = int(interval_sec) // 60
 
     start_str = start_d.strftime("%Y-%m-%d")
     end_str = end_d.strftime("%Y-%m-%d")
