@@ -70,9 +70,9 @@ except ImportError:
 except Exception as _env_e:
     print(f"  ⚠️ 加载 .env 失败: {_env_e}")
 
-# ── Monkey-patch: 让 DataSourceFactory.get_kline 通过 kline_clean 读取数据 ──
+# ── Monkey-patch: 让 DataSourceFactory.get_kline 通过 kline_clean_db 读取数据 ──
 def _patch_datasource_warehouse():
-    """在 BacktestService 加载前，注入 kline_clean 数据读取逻辑"""
+    """在 BacktestService 加载前，注入 kline_clean_db 数据读取逻辑"""
     from app.data_sources.factory import DataSourceFactory
     from optimizer.data_warehouse.storage import read_clean
     from datetime import datetime, timedelta
@@ -88,7 +88,7 @@ def _patch_datasource_warehouse():
         "1D": timedelta(days=1), "1W": timedelta(weeks=1),
     }
 
-    # 小写/别名 → 标准 key（与 kline_clean._TF_ALIASES 对齐）
+    # 小写/别名 → 标准 key（与 kline_clean_db._TF_ALIASES 对齐）
     _TF_NORM = {
         "1d": "1D", "d": "1D", "day": "1D", "daily": "1D",
         "1w": "1W", "w": "1W", "week": "1W", "weekly": "1W",

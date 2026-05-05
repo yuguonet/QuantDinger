@@ -342,6 +342,13 @@ def get_template(key: str) -> dict:
             return ASHARE_STRATEGY_TEMPLATES[key]
     except ImportError:
         pass
+    # 尝试加载自定义中短线模板（优先级高于 LLM，与 runner.py ALL_TEMPLATES 顺序一致）
+    try:
+        from optimizer.strategy_templates_mine import MY_STRATEGY_TEMPLATES
+        if key in MY_STRATEGY_TEMPLATES:
+            return MY_STRATEGY_TEMPLATES[key]
+    except ImportError:
+        pass
     # 尝试加载 LLM 生成模板
     try:
         from optimizer.strategy_templates_llm import LLM_STRATEGY_TEMPLATES

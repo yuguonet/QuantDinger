@@ -65,86 +65,10 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from app.data_sources.source_config import (
     SourceConfig, get_source_config, get_sources_for_market, get_all_enabled_sources,
 )
+from app.data_sources.circuit_breaker import CircuitBreaker
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
-
-
-# ================================================================
-# 熔断器 — 连续失败超阈值则熔断，冷却后恢复
-# ================================================================
-
-class CircuitBreaker:
-    """
-    熔断器 — 按源名分别跟踪故障状态。
-
-    状态机: Closed(正常) → 连续失败≥阈值 → Open(熔断/冷却) → 冷却结束 → Half-Open(试探)
-    """
-
-    def __init__(
-        self,
-        failure_threshold: int = 3,
-        cooldown_seconds: float = 120.0,
-        name: str = "default",
-    ):
-        self._failure_threshold = failure_threshold
-        self._cooldown_seconds = cooldown_seconds
-        self._name = name
-        self._failures: Dict[str, int] = {}
-        self._tripped_at: Dict[str, float] = {}
-        self._lock = threading.Lock()
-
-    def is_available(self, source: str) -> bool:
-        with self._lock:
-            if source not in self._tripped_at:
-                return True
-            elapsed = time.time() - self._tripped_at[source]
-            if elapsed >= self._cooldown_seconds:
-                del self._tripped_at[source]
-                self._failures[source] = 0
-                logger.info("[熔断器:%s] %s 冷却结束，恢复可用", self._name, source)
-                return True
-            return False
-
-    def record_success(self, source: str):
-        with self._lock:
-            self._failures[source] = 0
-            if source in self._tripped_at:
-                del self._tripped_at[source]
-
-    def record_failure(self, source: str, reason: str = ""):
-        with self._lock:
-            self._failures[source] = self._failures.get(source, 0) + 1
-            if self._failures[source] >= self._failure_threshold:
-                self._tripped_at[source] = time.time()
-                logger.warning(
-                    "[熔断器:%s] %s 连续失败 %d 次，熔断 %ds (原因: %s)",
-                    self._name, source, self._failures[source],
-                    self._cooldown_seconds, reason,
-                )
-
-    def reset(self, source: str = None):
-        with self._lock:
-            if source:
-                self._failures.pop(source, None)
-                self._tripped_at.pop(source, None)
-            else:
-                self._failures.clear()
-                self._tripped_at.clear()
-
-
-# 全局熔断器实例
-_realtime_cb = CircuitBreaker(failure_threshold=3, cooldown_seconds=120, name="realtime")
-_overseas_cb = CircuitBreaker(failure_threshold=2, cooldown_seconds=900, name="overseas")
-
-
-def get_realtime_circuit_breaker() -> CircuitBreaker:
-    return _realtime_cb
-
-
-def get_overseas_circuit_breaker() -> CircuitBreaker:
-    return _overseas_cb
-
 
 # ================================================================
 # 全局常量
@@ -236,7 +160,6 @@ def _discover_sources(
     preferred_source: str = "",
     capability: str = "kline",
     adj: str = "qfq",
-    skip_cb_filter: bool = False,
 ) -> List[Tuple[str, Callable, SourceConfig]]:
     """
     源自动发现 — 从 Provider 层获取可用数据源列表。
@@ -293,8 +216,8 @@ def _discover_sources(
         adapter = lambda p: _make_provider_fetch_fn(p, adj=adj)
 
     for p in providers:
-        # 熔断检查 — 跳过已熔断的源（skip_cb_filter=True 时跳过此检查）
-        if not skip_cb_filter and not cb.is_available(p.name):
+        # 熔断检查 — 跳过已熔断的源
+        if not cb.is_available(p.name):
             logger.debug("[协助层] Provider %s 已熔断，跳过", p.name)
             continue
 
@@ -758,7 +681,6 @@ class Coordinator:
         timeout: float = 8.0,
         preferred_source: str = "",
         market: str = "",
-        max_race_sources: int = 3,
     ) -> Optional[Dict[str, Any]]:
         """
         实时行情 Race 模式 — 所有源并发，第一个返回有效价格的直接用。
@@ -793,14 +715,13 @@ class Coordinator:
             else:
                 available = [(name, fn) for name, fn in sources if cb.is_available(name)]
         else:
-            # 自动发现模式 — race 模式跳过熔断过滤，所有源都尝试（快的先返回）
+            # 自动发现模式
             discovered = _discover_sources(
                 market=market,
                 timeframe="",
                 cb=cb,
                 preferred_source=preferred_source,
                 capability="quote",
-                skip_cb_filter=True,
             )
             if not discovered:
                 logger.warning("[协助层] ticker %s market=%s 无可用源", symbol, market)
@@ -811,11 +732,7 @@ class Coordinator:
             logger.warning("[协助层] ticker %s 无可用源", symbol)
             return None
 
-        # 限制抢答源数量 — 按 priority 排序（discovered 已排好序），取前 max_race_sources 个
-        if max_race_sources > 0 and len(available) > max_race_sources:
-            available = available[:max_race_sources]
-
-        # ── Race: 前 N 个源并发抢答，第一个成功的直接返回 ──
+        # ── Race: 所有源并发，第一个成功的直接返回 ──
         result_holder: List[Tuple[str, Dict[str, Any]]] = []
         done_event = threading.Event()  # 用于通知"已经有结果了，其他线程可以停了"
         lock = threading.Lock()

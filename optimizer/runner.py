@@ -74,11 +74,12 @@ except ImportError:
 except Exception as _env_e:
     print(f"  ⚠️ 加载 .env 失败: {_env_e}")
 
-# ── Monkey-patch: 让 DataSourceFactory.get_kline 通过 kline_clean 读取数据 ──
+# ── Monkey-patch: 让 DataSourceFactory.get_kline 通过 kline_clean_db 读取数据 ──
 def _patch_datasource_warehouse():
-    """在 BacktestService 加载前，注入 kline_clean 数据读取逻辑"""
+    """在 BacktestService 加载前，注入 kline_clean_db 数据读取逻辑"""
     from app.data_sources.factory import DataSourceFactory
-    from optimizer.data_warehouse.storage import read_clean
+    from app.utils.db_market import get_market_kline_writer
+    from optimizer.kline_clean_db import MarketDataProvider
     from datetime import datetime, timedelta
 
     _orig_get_kline = DataSourceFactory.get_kline.__func__
@@ -92,13 +93,16 @@ def _patch_datasource_warehouse():
         "1D": timedelta(days=1), "1W": timedelta(weeks=1),
     }
 
-    # 小写/别名 → 标准 key（与 kline_clean._TF_ALIASES 对齐）
+    # 小写/别名 → 标准 key（与 kline_clean_db._TF_ALIASES 对齐）
     _TF_NORM = {
         "1d": "1D", "d": "1D", "day": "1D", "daily": "1D",
         "1w": "1W", "w": "1W", "week": "1W", "weekly": "1W",
         "h": "60m", "1h": "1H",
         "2h": "2H", "4h": "4H",
     }
+
+    _writer = get_market_kline_writer()
+    _provider = MarketDataProvider(_writer)
 
     def _to_dt(t):
         """将时间戳（int/float）或 datetime 统一转为 naive datetime（不加时区）"""
@@ -120,9 +124,9 @@ def _patch_datasource_warehouse():
                 delta = _TF_DELTA.get(tf_key, timedelta(days=1))
                 start = end - delta * int(limit * 1.5)
 
-            data = read_clean(
+            data = _provider.get_clean_klines(
                 market=market, symbol=symbol,
-                timeframe=timeframe, start=start, end=end,
+                start=start, end=end, timeframe=timeframe,
             )
             if data and len(data) >= 10:
                 return data
@@ -267,7 +271,30 @@ from optimizer.ashare_adapter import (
 )
 from optimizer.strategy_optimizer import StrategyOptimizer
 from optimizer.walk_forward import WalkForwardValidator
-from optimizer.data_warehouse.storage import _TF_DIR_MAP
+# 时间框架 → 输出目录名
+_TF_DIR_MAP = {
+    "1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min",
+    "1H": "1hour", "2H": "2hour", "4H": "4hour",
+    "1D": "daily", "1W": "weekly",
+}
+
+
+def _list_local_symbols(market: str = "CNStock") -> list:
+    """直接从 db_market 获取本地仓库中指定市场的股票列表"""
+    from app.utils.db_market import get_market_kline_writer
+    writer = get_market_kline_writer()
+    stats = writer.stats(market)
+    return stats.get("symbol_list", [])
+
+
+def _get_local_stats(market: str = "CNStock") -> dict:
+    """直接从 db_market 获取本地仓库统计信息"""
+    from app.utils.db_market import get_market_kline_writer
+    writer = get_market_kline_writer()
+    stats = writer.stats(market)
+    stats.setdefault("root", f"db_market ({stats.get('db_name', 'unknown')})")
+    stats.setdefault("stocks", stats.get("symbols", 0))
+    return stats
 
 _StrategyCompiler = None
 _BacktestService = None
@@ -637,10 +664,6 @@ def _worker_init():
     # 加载 .env（子进程继承不到父进程的 load_dotenv 结果）
     try:
         from dotenv import load_dotenv
-        import optimizer.data_warehouse.storage as _stor
-        _this_dir = os.path.dirname(os.path.abspath(_stor.__file__))
-        _project_root = os.path.dirname(os.path.dirname(_this_dir))
-        _backend_root = os.path.join(_project_root, "backend_api_python")
         for env_path in [
             os.path.join(_backend_root, '.env'),
             os.path.join(_project_root, '.env'),
@@ -808,8 +831,7 @@ stock_list.txt 格式（同 downloader）:
 
     # 列出本地仓库数据
     if args.list_local:
-        from optimizer.data_warehouse.storage import list_local, get_stats
-        stats = get_stats()
+        stats = _get_local_stats()
         print(f"\n📊 本地数据仓库")
         print(f"   路径: {stats['root']}")
         if not stats['exists']:
@@ -819,7 +841,7 @@ stock_list.txt 格式（同 downloader）:
         print(f"   数据总行数: {stats['total_rows']:,}")
         for mkt, count in stats.get('markets', {}).items():
             print(f"   - {mkt}: {count} 只")
-        symbols = list_local(args.market, args.timeframe)
+        symbols = _list_local_symbols(args.market)
         if symbols:
             print(f"\n   {args.market} / {args.timeframe}: {len(symbols)} 只")
             for s in symbols:
@@ -850,8 +872,7 @@ stock_list.txt 格式（同 downloader）:
             sys.exit(1)
     elif args.random_sample > 0:
         import random as _random
-        from optimizer.data_warehouse.storage import list_local
-        all_local = list_local(args.market, args.timeframe)
+        all_local = _list_local_symbols(args.market)
         if not all_local:
             print(f"❌ 本地仓库中没有 {args.market}/{args.timeframe} 的数据")
             sys.exit(1)
@@ -862,8 +883,7 @@ stock_list.txt 格式（同 downloader）:
         print(f"  🎲 从本地仓库 {len(all_local)} 只股票中随机抽取 {n} 只"
               f"{f' (seed={args.seed})' if args.seed is not None else ''}")
     elif args.all_local:
-        from optimizer.data_warehouse.storage import list_local
-        symbols_raw = list_local(args.market, args.timeframe)
+        symbols_raw = _list_local_symbols(args.market)
         if not symbols_raw:
             print(f"❌ 本地仓库中没有 {args.market}/{args.timeframe} 的数据")
             print(f"   先用 downloader 下载: python -m optimizer.data_warehouse.downloader -m CNStock -tf 1D")
@@ -871,8 +891,7 @@ stock_list.txt 格式（同 downloader）:
         print(f"  📦 从本地仓库发现 {len(symbols_raw)} 只股票 ({args.market}/{args.timeframe})")
     else:
         # 默认：扫描本地仓库，没有则 fallback 到 000001.SZ
-        from optimizer.data_warehouse.storage import list_local
-        local = list_local(args.market, args.timeframe)
+        local = _list_local_symbols(args.market)
         if local:
             symbols_raw = local
             print(f"  📦 自动发现本地仓库 {len(symbols_raw)} 只股票 ({args.market}/{args.timeframe})")

@@ -116,7 +116,7 @@ def read_clean(
     end: Optional[datetime] = None,
 ) -> List[Dict[str, Any]]:
     """
-    通过 kline_clean.MarketDataProvider 获取清洗后的 K 线数据。
+    通过 kline_clean_db.MarketDataProvider 获取清洗后的 K 线数据。
 
     相比 read_local，增加了：交易日过滤、缺失段前向填充、聚合周期支持
     （30m/60m/2H/4H 自动从 15m 聚合）。
@@ -132,7 +132,7 @@ def read_clean(
         清洗后的 K 线数据列表: [{"time": datetime, "open": float, "high": float,
                                  "low": float, "close": float, "volume": float}, ...]
     """
-    from app.data_sources.kline_clean import MarketDataProvider
+    from optimizer.kline_clean_db import MarketDataProvider
 
     if end is None:
         end = datetime.now()
