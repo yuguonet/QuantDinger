@@ -67,19 +67,32 @@ logger = logging.getLogger(__name__)
 # 路径 & 环境
 # ---------------------------------------------------------------------------
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# Windows 兼容: 如果 __file__ 解析结果异常，用 CWD 做 fallback
-if not os.path.isdir(os.path.join(PROJECT_ROOT, "backend_api_python")):
-    _cwd = os.getcwd()
-    if os.path.isdir(os.path.join(_cwd, "backend_api_python")):
-        PROJECT_ROOT = _cwd
-    elif os.path.isfile(os.path.join(_cwd, "optimizer", "bat_in_kline.py")):
-        PROJECT_ROOT = _cwd
+def _find_project_root() -> str:
+    """向上查找包含 backend_api_python/ 的项目根目录"""
+    # 从本文件位置向上搜索（最多 5 层）
+    d = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(5):
+        if os.path.isdir(os.path.join(d, "backend_api_python")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    # fallback: CWD
+    cwd = os.getcwd()
+    if os.path.isdir(os.path.join(cwd, "backend_api_python")):
+        return cwd
+    # 最后尝试 CWD 的父目录
+    parent_cwd = os.path.dirname(cwd)
+    if os.path.isdir(os.path.join(parent_cwd, "backend_api_python")):
+        return parent_cwd
+    return cwd
+
+PROJECT_ROOT = _find_project_root()
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "backend_api_python"))
 
-_OPTIMIZER_DIR = os.path.dirname(os.path.abspath(__file__))
-if _OPTIMIZER_DIR not in sys.path:
-    sys.path.insert(0, _OPTIMIZER_DIR)
+# NOTE: 不要把本文件所在目录 (app/utils/) 加入 sys.path，
+# 否则 http.py 会遮蔽标准库 http 模块，导致 Flask/werkzeug 导入崩溃。
 
 
 def _load_env():
@@ -1046,8 +1059,9 @@ def _delete_db_range(pool, market: str, code: str, timeframe: str,
     for year in range(start_year, end_year + 1):
         table = f"kline_{timeframe}_{year}"
         # 该年的删除范围：取 start_dt/end_dt 与年份交集
-        y_start = max(start_dt, datetime(year, 1, 1, tzinfo=TZ_SH))
-        y_end = min(end_dt, datetime(year, 12, 31, 23, 59, 59, tzinfo=TZ_SH))
+        # DB 用 TIMESTAMP WITHOUT TIME ZONE（存上海时间 naive），传入 naive datetime 避免时区偏移
+        y_start = max(start_dt.replace(tzinfo=None), datetime(year, 1, 1))
+        y_end = min(end_dt.replace(tzinfo=None), datetime(year, 12, 31, 23, 59, 59))
         try:
             with pool.connection() as conn:
                 with conn.cursor() as cur:
@@ -1132,14 +1146,26 @@ def _do_update(
         syms = sorted(csv_syms)
         total = len(syms)
         print(f"   股票数: {total}")
-        print(f"   CSV 目录: {csv_dir}\n")
+        print(f"   CSV 目录: {csv_dir}")
+        print(f"   PROJECT_ROOT: {PROJECT_ROOT}\n")
+
+        start_date_1d = start_1d.strftime("%Y-%m-%d")
+        end_date_1d = end_dt.strftime("%Y-%m-%d")
+
+        # 诊断: 抽样检查前 3 只股票的 CSV 加载情况
+        for probe_code in syms[:3]:
+            probe_data = load_baostock_csv(csv_dir, probe_code)
+            probe_filtered = [r for r in probe_data if start_date_1d <= r["date"] <= end_date_1d]
+            print(f"   🔍 {probe_code}: CSV 共 {len(probe_data)} 条, 筛选后 {len(probe_filtered)} 条"
+                  f"（{start_date_1d} ~ {end_date_1d}）")
+            if probe_data:
+                print(f"      日期范围: {probe_data[0]['date']} ~ {probe_data[-1]['date']}")
+        print()
 
         # ── 1D 更新 ──
         print(f"── 1D 更新（{mode}）──")
         deleted_1d = 0
         written_1d = 0
-        start_date_1d = start_1d.strftime("%Y-%m-%d")
-        end_date_1d = end_dt.strftime("%Y-%m-%d")
 
         for i, code in enumerate(syms):
             try:
