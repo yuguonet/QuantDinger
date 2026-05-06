@@ -74,15 +74,6 @@ def _is_market_hours() -> bool:
     return dt_time(9, 15) <= t <= dt_time(15, 0)
 
 
-def _is_after_close() -> bool:
-    """判断当前是否已收盘（15:00 之后）。"""
-    from app.utils.trading_calendar import is_trading_day_today
-    if not is_trading_day_today():
-        return False
-    now = datetime.now(_TZ_CN)
-    return now.time() >= dt_time(15, 0)
-
-
 def _today_str() -> str:
     return datetime.now(_TZ_CN).strftime("%Y-%m-%d")
 
@@ -90,6 +81,24 @@ def _today_str() -> str:
 def _today_ts() -> int:
     dt = datetime.strptime(_today_str(), "%Y-%m-%d")
     return int(dt.replace(tzinfo=_TZ_CN).timestamp())
+
+
+def _day_ts(day_str: str) -> int:
+    """'YYYY-MM-DD' → 当天 00:00 的 Unix 时间戳（秒）。"""
+    dt = datetime.strptime(day_str, "%Y-%m-%d")
+    return int(dt.replace(tzinfo=_TZ_CN).timestamp())
+
+
+def _latest_trading_day_ts() -> int:
+    """从交易日历获取最近一个交易日的时间戳。"""
+    from app.utils.trading_calendar import is_trading_day_today, prev_trading_day
+    if is_trading_day_today():
+        return _today_ts()
+    try:
+        return _day_ts(prev_trading_day())
+    except Exception:
+        # 交易日历不可用时降级为今天
+        return _today_ts()
 
 
 # ================================================================
@@ -147,6 +156,18 @@ class RealtimeQuoteCache:
     def __init__(self):
         self._lock = threading.Lock()
         self._entries: Dict[str, _QuoteCacheEntry] = {}
+
+    def _put(self, symbol: str, result: Dict[str, Any]):
+        """将 ticker 结果写入缓存（内部方法）。"""
+        raw = _strip_cn_prefix(symbol)
+        if not result or float(result.get('last', 0) or 0) <= 0:
+            return
+        with self._lock:
+            entry = self._entries.get(raw)
+            if entry is None:
+                entry = _QuoteCacheEntry()
+                self._entries[raw] = entry
+            entry.update_from_ticker(result)
 
     def get_or_fetch(self, symbol: str, ds: 'CNStockDataSource') -> Optional[_QuoteCacheEntry]:
         """获取缓存行情，过期则惰性刷新。"""
@@ -259,14 +280,28 @@ class DBKlineBridge:
         after_time: Optional[int] = None,
         adj: str = "qfq",
     ) -> List[Dict[str, Any]]:
-        """DB 优先取 K 线，自动补充缺失数据。"""
-        if not self.available:
-            return self._ds._get_kline_remote(symbol, timeframe, limit,
-                                               before_time, after_time, adj)
+        """DB 优先取 K 线，自动补充缺失数据。
 
+        周期路由:
+          1m / 5m     → 直接走远端（DB 不存）
+          15m / 1D    → DB 直接读取
+          30m~4h      → DB 从 15m 聚合
+          1W / 1M     → DB 从 1D 聚合
+        """
         raw = _strip_cn_prefix(symbol)
         tf = normalize_chart_timeframe(timeframe)
         lim = max(int(limit or 300), 1)
+
+        # ── 1m/5m 不走 DB，直接远端 ──
+        if tf in ("1m", "5m"):
+            return self._ds._get_kline_remote(
+                raw, tf, lim, before_time, after_time, adj
+            )
+
+        if not self.available:
+            return self._ds._get_kline_remote(
+                raw, tf, lim, before_time, after_time, adj
+            )
 
         # ── 第一步: 从 DB 取数据 ──
         db_bars = self._fetch_from_db(raw, tf, lim)
@@ -307,6 +342,10 @@ class DBKlineBridge:
 
         tf = normalize_chart_timeframe(timeframe)
         lim = max(int(limit or 300), 1)
+
+        # ── 1m/5m 不走 DB，直接远端 ──
+        if tf in ("1m", "5m"):
+            return self._ds._get_klines_remote(symbols, tf, lim, adj)
 
         if not self.available:
             return self._ds._get_klines_remote(symbols, tf, lim, adj)
@@ -359,7 +398,13 @@ class DBKlineBridge:
     # ── DB 读取 ──
 
     def _fetch_from_db(self, raw: str, tf: str, limit: int) -> List[Dict[str, Any]]:
-        """从 db_market 查询 K 线数据，统一转为 {time: int, ...} 格式。"""
+        """从 db_market 查询 K 线数据，统一转为 {time: int, ...} 格式。
+
+        周期路由 (调用方已排除 1m/5m):
+          15m / 1D    → 直接查询
+          30m~4h      → 从 15m 聚合
+          1W / 1M     → 从 1D 聚合
+        """
         try:
             if tf in ("15m", "1D"):
                 rows = self._writer.query("CNStock", raw, tf, limit=limit)
@@ -396,61 +441,69 @@ class DBKlineBridge:
     def _fill_today_if_needed(
         self, raw: str, bars: List[Dict[str, Any]], adj: str
     ) -> List[Dict[str, Any]]:
-        """检查 bars 是否覆盖今日，缺失则补充。"""
+        """检查 bars 是否覆盖最近一个交易日，缺失则补充。"""
         if not bars:
             return bars
 
-        today_ts = _today_ts()
-        has_today = any(b["time"] == today_ts for b in bars)
-        if has_today:
+        latest_ts = _latest_trading_day_ts()
+        has_latest = any(int(b.get("time", 0)) == latest_ts for b in bars)
+        if has_latest:
             return bars
 
-        today_bar = self._fetch_today_bar(raw, adj)
+        latest_day = datetime.fromtimestamp(latest_ts, tz=_TZ_CN).strftime("%Y-%m-%d")
+        today_bar = self._fetch_today_bar(raw, adj, target_day=latest_day)
         if today_bar:
-            bars = [b for b in bars if b["time"] != today_ts]
+            bars = [b for b in bars if int(b.get("time", 0)) != latest_ts]
             bars.append(today_bar)
             bars.sort(key=lambda b: b["time"])
         return bars
 
-    def _fetch_today_bar(self, raw: str, adj: str) -> Optional[Dict[str, Any]]:
-        """获取当日日线 bar。
+    def _fetch_today_bar(self, raw: str, adj: str, target_day: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """获取指定交易日的日线 bar。
 
-        盘中: 远程 15m 聚合 + 实时行情比对
-        收盘后: 远程直接取已完成日线
+        target_day: 'YYYY-MM-DD'，默认为今天。
+        盘中（当日）: 15m 聚合，内部自动用 get_ticker 积累的惰性缓存比对
+        非盘中/非当日: 远程直接取已完成日线
         """
-        # 收盘后 → 直接取已完成日线
-        if _is_after_close():
-            return self._fetch_completed_daily_bar(raw, adj)
+        if target_day is None:
+            target_day = _today_str()
 
-        # 盘中 → 15m 聚合 + 实时行情
-        if _is_market_hours():
-            return self._fetch_today_bar_from_15m(raw, adj)
+        is_today = (target_day == _today_str())
 
-        return None
+        # 当日盘中 → 15m 聚合（内部自动用缓存比对）
+        if is_today and _is_market_hours():
+            return self._fetch_today_bar_from_15m(raw, adj, target_day)
 
-    def _fetch_completed_daily_bar(self, raw: str, adj: str) -> Optional[Dict[str, Any]]:
-        """收盘后从远程取当日已完成日线 bar。"""
+        # 其他情况（当日收盘后、非交易日、历史交易日）→ 取已完成日线
+        return self._fetch_completed_daily_bar(raw, adj, target_day)
+
+    def _fetch_completed_daily_bar(self, raw: str, adj: str, target_day: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """从远程取指定交易日的已完成日线 bar。"""
+        if target_day is None:
+            target_day = _today_str()
+        target_ts = _day_ts(target_day)
         try:
             remote = self._ds._get_kline_remote(raw, "1D", 3, adj=adj)
             if not remote:
                 return None
-            today_ts = _today_ts()
             for b in remote:
-                if b.get("time") == today_ts:
+                if int(b.get("time", 0)) == target_ts:
                     return b
         except Exception as e:
-            logger.debug(f"[DB桥接] 取已完成日线失败 {raw}: {e}")
+            logger.debug(f"[DB桥接] 取已完成日线失败 {raw}/{target_day}: {e}")
         return None
 
-    def _fetch_today_bar_from_15m(self, raw: str, adj: str) -> Optional[Dict[str, Any]]:
-        """盘中: 远程取 15m K 线聚合成当日日线，和实时行情比对修正。"""
+    def _fetch_today_bar_from_15m(self, raw: str, adj: str, target_day: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """盘中: 远程取 15m K 线聚合成指定交易日的日线，和实时行情比对修正。"""
+        if target_day is None:
+            target_day = _today_str()
+        target_ts = _day_ts(target_day)
         try:
             remote_15m = self._ds._get_kline_remote(raw, "15m", 200, adj=adj)
             if not remote_15m:
                 return None
 
-            today_ts = _today_ts()
-            today_bars = [b for b in remote_15m if b.get("time", 0) >= today_ts]
+            today_bars = [b for b in remote_15m if b.get("time", 0) >= target_ts]
             if not today_bars:
                 return None
 
@@ -475,7 +528,7 @@ class DBKlineBridge:
                 close_price = today_bars[-1].get("close", 0)
 
             return {
-                "time": today_ts,
+                "time": target_ts,
                 "open": today_bars[0].get("open", 0),
                 "high": round(agg_high, 4),
                 "low": round(agg_low, 4),
@@ -580,6 +633,8 @@ class CNStockDataSource(BaseDataSource):
 
         if result:
             result["symbol"] = raw
+            # 写入惰性行情缓存，供 get_kline 补充当日 bar 使用
+            self._db_bridge._quote_cache._put(raw, result)
             return result
 
         logger.warning(f"[行情] 所有数据源均失败: {symbol}")
@@ -602,6 +657,8 @@ class CNStockDataSource(BaseDataSource):
                     raw_key = _strip_cn_prefix(k)
                     if isinstance(v, dict):
                         v["symbol"] = raw_key
+                        # 批量写入惰性行情缓存
+                        self._db_bridge._quote_cache._put(raw_key, v)
                     cleaned[raw_key] = v
                 return cleaned
         return {}
