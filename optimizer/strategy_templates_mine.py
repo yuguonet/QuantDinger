@@ -101,7 +101,7 @@ def _build_vol_price_resonance_config(p: dict) -> dict:
         "risk_management": {
             "stop_loss": {"enabled": True, "type": "percentage", "value": p["stop_loss_pct"]},
             "take_profit": {"enabled": True, "type": "percentage", "value": p["take_profit_pct"]},
-            "trailing_stop": {"enabled": True, "type": "trailing_pct", "value": p.get("trailing_pct", 5.0)},
+            "trailing_stop": {"enabled": True, "type": "trailing_pct", "activation_profit": p["take_profit_pct"], "callback_pct": p.get("trailing_pct", 5.0)},
             "ashare_rules": {"t_plus_1": True, "price_limit": True, "min_lot": 100},
         },
     }
@@ -388,14 +388,18 @@ def _build_dragon_pullback_config(p: dict) -> dict:
         "risk_management": {
             "stop_loss": {"enabled": True, "type": "percentage", "value": p["stop_loss_pct"]},
             "take_profit": {"enabled": True, "type": "percentage", "value": p["take_profit_pct"]},
-            "trailing_stop": {"enabled": True, "type": "trailing_pct", "value": p.get("trailing_pct", 5.0)},
+            "trailing_stop": {"enabled": True, "type": "trailing_pct", "activation_profit": p["take_profit_pct"], "callback_pct": p.get("trailing_pct", 5.0)},
             "ashare_rules": {"t_plus_1": True, "price_limit": True, "min_lot": 100},
         },
     }
 
 
 def _build_dragon_pullback_v2_config(p: dict) -> dict:
-    """龙回头 V2 — 优化版，去掉无用过滤器，参数空间收窄"""
+    """龙回头 V2 — 优化版，去掉无用过滤器，参数空间收窄
+
+    买入逻辑：大涨后回调到区间 + 缩量 + RSI 处于低位
+    RSI 用 '<' (区间) 而非 'cross_up' (穿越)，大幅提高信号频率
+    """
     entry_rules = [
         # 大涨后回调到买入区间
         {
@@ -414,11 +418,11 @@ def _build_dragon_pullback_v2_config(p: dict) -> dict:
             "operator": "volume_ratio_below",
             "threshold": p["vol_shrink_ratio"],
         },
-        # RSI 从超卖区回升
+        # RSI 处于低位（超卖区域）
         {
             "indicator": "rsi",
             "params": {"period": p["rsi_period"], "threshold": p["rsi_bounce"]},
-            "operator": "cross_up",
+            "operator": "<",
         },
     ]
     # 不加 trend_filter / ma_support — WF 验证证明它们降低样本外表现
@@ -434,8 +438,12 @@ def _build_dragon_pullback_v2_config(p: dict) -> dict:
         "pyramiding_rules": {"enabled": False},
         "risk_management": {
             "stop_loss": {"enabled": True, "type": "percentage", "value": p["stop_loss_pct"]},
-            "take_profit": {"enabled": True, "type": "percentage", "value": p["take_profit_pct"]},
-            "trailing_stop": {"enabled": True, "type": "trailing_pct", "value": p.get("trailing_pct", 5.0)},
+            "trailing_stop": {
+                "enabled": True,
+                "type": "trailing_pct",
+                "activation_profit": p["take_profit_pct"],
+                "callback_pct": p.get("trailing_pct", 5.0),
+            },
             "ashare_rules": {"t_plus_1": True, "price_limit": True, "min_lot": 100},
         },
     }

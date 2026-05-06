@@ -277,8 +277,7 @@ class DBKlineBridge:
         timeframe: str,
         limit: int,
         before_time: Optional[int] = None,
-        after_time: Optional[int] = None,
-        adj: str = "qfq",
+        after_time: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         """DB 优先取 K 线，自动补充缺失数据。
 
@@ -288,6 +287,7 @@ class DBKlineBridge:
           30m~4h      → DB 从 15m 聚合
           1W / 1M     → DB 从 1D 聚合
         """
+        adj = "qfq"
         raw = _strip_cn_prefix(symbol)
         tf = normalize_chart_timeframe(timeframe)
         lim = max(int(limit or 300), 1)
