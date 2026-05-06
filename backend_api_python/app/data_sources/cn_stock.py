@@ -65,21 +65,19 @@ _CACHE_MAX_ENTRIES = 2000
 # ================================================================
 
 def _strip_cn_prefix(code: str) -> str:
-    """去掉 A 股代码的市场前缀（SH/SZ/BJ），返回纯 6 位数字。"""
+    """去掉 A 股代码的市场前缀（SH/SZ/BJ），返回纯 6 位数字代码。"""
     s = (code or "").strip()
-    if len(s) > 6 and s[:2].upper() in ("SH", "SZ", "BJ"):
+    if len(s) == 8 and s[:2].upper() in ("SH", "SZ", "BJ") and s[2:].isdigit():
         return s[2:]
     return s
 
 
 def _dt_to_ts(dt) -> int:
-    """db_market 返回的 datetime → Unix 时间戳（秒）。兼容 naive/aware。"""
+    """db_market 返回的 datetime → Unix 时间戳（秒）。统一用 naive datetime。"""
     if isinstance(dt, (int, float)):
         return int(dt)
     if isinstance(dt, datetime):
-        if dt.tzinfo:
-            return int(dt.timestamp())
-        return int(dt.replace(tzinfo=_TZ_CN).timestamp())
+        return int(dt.timestamp())
     return 0
 
 
@@ -104,13 +102,13 @@ def _today_str() -> str:
 def _today_ts() -> int:
     """今天 00:00 的 Unix 时间戳（秒）。用于过滤"当日 bar"。"""
     dt = datetime.strptime(_today_str(), "%Y-%m-%d")
-    return int(dt.replace(tzinfo=_TZ_CN).timestamp())
+    return int(dt.timestamp())
 
 
 def _day_ts(day_str: str) -> int:
     """'YYYY-MM-DD' → 当天 00:00 的 Unix 时间戳（秒）。"""
     dt = datetime.strptime(day_str, "%Y-%m-%d")
-    return int(dt.replace(tzinfo=_TZ_CN).timestamp())
+    return int(dt.timestamp())
 
 
 def _latest_trading_day_ts() -> int:
@@ -625,7 +623,7 @@ class DBKlineBridge:
 
     # DB 只存 15m，其余周期全部在 Python 内存中聚合。
     # 统一从 15m 表读取，避免 SQL 聚合的大小写/时区/分区发现问题。
-    _AGG_NEED_15M = {"30m", "1h", "1H", "2h", "2H", "4h", "4H", "1D", "1W", "1M"}
+    _AGG_NEED_15M = {"30m", "1H", "2H", "4H", "1D", "1W", "1M"}
 
     def _fetch_from_db(self, raw: str, tf: str, limit: int) -> List[Dict[str, Any]]:
         """从 db_market 读取 15m K 线，在内存中聚合成目标周期。
@@ -686,7 +684,7 @@ class DBKlineBridge:
             ts = b.get("time", 0)
             if ts <= 0:
                 continue
-            day_ts = int(datetime.fromtimestamp(ts, tz=_TZ_CN).replace(
+            day_ts = int(datetime.fromtimestamp(ts).replace(
                 hour=0, minute=0, second=0, microsecond=0
             ).timestamp())
             if day_ts not in groups:
@@ -719,7 +717,7 @@ class DBKlineBridge:
             ts = b.get("time", 0)
             if ts <= 0:
                 continue
-            dt = datetime.fromtimestamp(ts, tz=_TZ_CN)
+            dt = datetime.fromtimestamp(ts)
             key = dt.isocalendar()[:2]
             if key not in groups:
                 groups[key] = []
@@ -751,7 +749,7 @@ class DBKlineBridge:
             ts = b.get("time", 0)
             if ts <= 0:
                 continue
-            dt = datetime.fromtimestamp(ts, tz=_TZ_CN)
+            dt = datetime.fromtimestamp(ts)
             month_ts = int(dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp())
             if month_ts not in groups:
                 groups[month_ts] = []
@@ -774,8 +772,7 @@ class DBKlineBridge:
 
     # 15m → 盘中周期聚合（按 bar.time 对齐，天然跳过午休）
     _INTRADAY_BUCKET_SEC = {
-        "30m": 1800, "1h": 3600, "1H": 3600,
-        "2h": 7200, "2H": 7200, "4h": 14400, "4H": 14400,
+        "30m": 1800, "1H": 3600, "2H": 7200, "4H": 14400,
     }
 
     @staticmethod
@@ -856,7 +853,7 @@ class DBKlineBridge:
             ts = b.get("time", 0)
             if ts <= 0:
                 continue
-            dt = datetime.fromtimestamp(ts, tz=_TZ_CN).replace(tzinfo=None)
+            dt = datetime.fromtimestamp(ts)
             records.append({
                 "time": dt,
                 "open": b.get("open", 0),
