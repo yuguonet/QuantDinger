@@ -12,9 +12,6 @@
 # @param trend_ema_period int 30 趋势EMA周期
 # @param use_trend_filter bool true 是否叠加趋势过滤
 
-import pandas as pd
-import numpy as np
-
 # ── 参数 ──
 breakout_period = params.get('breakout_period', 20)
 vol_ma_period = params.get('vol_ma_period', 20)
@@ -62,3 +59,14 @@ df['sell'] = (cond_sell_trend | cond_sell_dd).fillna(False)
 # ── NaN 安全处理 ──
 df['buy'] = df['buy'].fillna(False).astype(bool)
 df['sell'] = df['sell'].fillna(False).astype(bool)
+
+buy_marks = [df['low'].iloc[i] * 0.995 if bool(df['buy'].iloc[i]) else None for i in range(len(df))]
+sell_marks = [df['high'].iloc[i] * 1.005 if bool(df['sell'].iloc[i]) else None for i in range(len(df))]
+
+output = {
+  'name': my_indicator_name,
+  'signals': [
+    {'type': 'buy', 'text': 'B', 'data': buy_marks, 'color': '#00E676'},
+    {'type': 'sell', 'text': 'S', 'data': sell_marks, 'color': '#FF5252'}
+  ]
+}
