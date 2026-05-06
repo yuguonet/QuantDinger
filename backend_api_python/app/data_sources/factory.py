@@ -21,6 +21,11 @@ _MARKET_ALIASES: Dict[str, str] = {
     "cnstock": "CNStock",
     "hkstock": "HKStock",
     "futures": "Futures",
+    "moex": "MOEX",
+    "rustock": "MOEX",
+    "rustocks": "MOEX",
+    "russianstock": "MOEX",
+    "russia": "MOEX",
 }
 
 
@@ -36,9 +41,9 @@ class DataSourceFactory:
     def normalize_market(cls, market: str) -> str:
         """统一市场枚举大小写与别名，供路由与数据源入口使用。"""
         if not market:
-            return "Crypto"
+            return "CNStock"
         raw = str(market).strip()
-        if raw in ("Crypto", "Forex", "Futures", "USStock", "CNStock", "HKStock"):
+        if raw in ("Crypto", "Forex", "Futures", "USStock", "CNStock", "HKStock", "MOEX"):
             return raw
         key = raw.lower().replace(" ", "").replace("-", "_")
         return _MARKET_ALIASES.get(key, raw)
@@ -49,7 +54,7 @@ class DataSourceFactory:
         获取指定市场的数据源
         
         Args:
-            market: 市场类型 (Crypto, USStock, Forex, Futures, CNStock, HKStock)
+            market: 市场类型 (Crypto, USStock, Forex, Futures)
             
         Returns:
             数据源实例
@@ -74,9 +79,8 @@ class DataSourceFactory:
             return cls.get_source("Futures")
         if key in ("forex", "fx"):
             return cls.get_source("Forex")
-        # 不再默认兜底到 Crypto — 避免 A 股代码误入加密货币数据源
-        logger.warning("get_data_source(%s): 未知数据源名称，默认使用 CNStock", name)
-        return cls.get_source("CNStock")
+        # Default to Crypto for safety (most callers want a ticker for crypto pairs).
+        return cls.get_source("Crypto")
     
     @classmethod
     def _create_source(cls, market: str) -> BaseDataSource:
@@ -99,6 +103,9 @@ class DataSourceFactory:
         elif market == 'Futures':
             from app.data_sources.futures import FuturesDataSource
             return FuturesDataSource()
+        elif market == 'MOEX':
+            from app.data_sources.moex import MOEXDataSource
+            return MOEXDataSource()
         else:
             raise ValueError(f"不支持的市场类型: {market}")
     
@@ -111,74 +118,50 @@ class DataSourceFactory:
         limit: int,
         before_time: Optional[int] = None,
         after_time: Optional[int] = None,
-        adj: str = "qfq",
     ) -> List[Dict[str, Any]]:
         """
-        获取K线数据
-
-        支持单只和批量两种调用方式:
-          单只: symbol="600519"  → 返回 List[Dict]
-          批量: symbol="600519,000001,000690"  → 返回 Dict[symbol, List[Dict]]
-
-        批量实现规则:
-          1. CNStock — 逗号拼接传入 DataSource，内部走 Coordinator 动态队列多源并发
-             Provider 层无原生批量 K 线 API，通过 Coordinator 并发单只实现
-          2. 其他市场 — 当前无批量实现，逗号模式不生效（走单只路径）
-
+        获取K线数据的便捷方法
+        
         Args:
             market: 市场类型
-            symbol: 交易对/股票代码，多只用逗号分隔
+            symbol: 交易对/股票代码
             timeframe: 时间周期
             limit: 数据条数
             before_time: 获取此时间之前的数据
             after_time: 可选，Unix 秒，K 线 time 需 >= 此值（回测左边界）
-            adj: 复权方式 — "qfq"(前复权,默认) / "hfq"(后复权) / ""(不复权)
-                 仅 A 股(CNStock) 生效，其他市场忽略此参数
-
+            
         Returns:
-            单只: K线数据列表 [bar, ...]
-            批量: {symbol: [bar, ...], ...}
+            K线数据列表
         """
         try:
             m = cls.normalize_market(market or "")
             source = cls.get_source(m)
-            # 仅 CNStock 支持 adj 参数（A股复权）
-            if m == "CNStock":
-                klines = source.get_kline(symbol, timeframe, limit, before_time, after_time, adj=adj)
-            else:
-                klines = source.get_kline(symbol, timeframe, limit, before_time, after_time)
+            klines = source.get_kline(symbol, timeframe, limit, before_time, after_time)
             
             # 确保数据按时间排序
             klines.sort(key=lambda x: x['time'])
             
             return klines
         except Exception as e:
-            import traceback
             logger.error(f"Failed to fetch K-lines {market}:{symbol} (normalized={cls.normalize_market(market or '')}) - {str(e)}")
-            logger.debug(traceback.format_exc())
             return []
-
+    
     @classmethod
     def get_ticker(cls, market: str, symbol: str) -> Dict[str, Any]:
         """
-        获取实时行情
-
-        支持单只和批量两种调用方式:
-          单只: symbol="600519"  → 返回 Dict (ticker)
-          批量: symbol="600519,000001,000690"  → 返回 Dict[symbol, Dict]
-
-        批量实现规则:
-          1. CNStock — 逗号拼接传入 DataSource，内部走 Provider 批量接口
-             腾讯/新浪一次 HTTP 请求拿多只行情，性能最优
-          2. 其他市场 — 当前无批量实现，逗号模式不生效（走单只路径）
-
+        获取实时报价的便捷方法
+        
         Args:
             market: 市场类型
-            symbol: 交易对/股票代码，多只用逗号分隔
-
+            symbol: 交易对/股票代码
+            
         Returns:
-            单只: {"last", "change", "changePercent", ...}
-            批量: {symbol: {"last", "change", "changePercent", ...}, ...}
+            实时报价数据: {
+                'last': 最新价,
+                'change': 涨跌额,
+                'changePercent': 涨跌幅,
+                ...
+            }
         """
         try:
             m = cls.normalize_market(market or "")
@@ -188,6 +171,6 @@ class DataSourceFactory:
             logger.warning(f"get_ticker not implemented for market: {market}")
             return {'last': 0, 'symbol': symbol}
         except Exception as e:
-            logger.error(f"Failed to fetch ticker {market}:{symbol} (normalized={cls.normalize_market(market or '')}) - {str(e)}")
+            logger.error(f"Failed to fetch ticker {market}:{symbol} - {str(e)}")
             return {'last': 0, 'symbol': symbol}
 

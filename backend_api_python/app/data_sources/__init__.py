@@ -3,14 +3,14 @@
 支持多种市场的K线数据获取
 
 改进版本（参考 daily_stock_analysis 项目）:
-- 熔断器保护 (coordinator.CircuitBreaker)
+- 熔断器保护 (circuit_breaker)
 - 数据缓存 (cache_manager)
 - 防封禁策略 (rate_limiter)
 """
 from app.data_sources.factory import DataSourceFactory
 from app.data_sources.circuit_breaker import (
     CircuitBreaker,
-    get_realtime_circuit_breaker,
+    get_realtime_circuit_breaker
 )
 from app.data_sources.cache_manager import (
     DataCache,
@@ -23,11 +23,6 @@ from app.data_sources.rate_limiter import (
     get_random_user_agent,
     random_sleep,
     retry_with_backoff
-)
-from app.data_sources.market_detector import (
-    detect_market,
-    validate_market,
-    safe_market,
 )
 
 __all__ = [
@@ -46,8 +41,4 @@ __all__ = [
     'get_random_user_agent',
     'random_sleep',
     'retry_with_backoff',
-    # 市场类型推断
-    'detect_market',
-    'validate_market',
-    'safe_market',
 ]

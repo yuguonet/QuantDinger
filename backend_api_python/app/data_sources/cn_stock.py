@@ -332,7 +332,6 @@ class DBKlineBridge:
         limit: int,
         before_time: Optional[int] = None,
         after_time: Optional[int] = None,
-        adj: str = "qfq",
     ) -> Dict[str, List[Dict[str, Any]]]:
         """批量取 K 线 — 先批量查 DB，未命中的再走远程。"""
         if not symbols:
@@ -340,6 +339,7 @@ class DBKlineBridge:
 
         tf = normalize_chart_timeframe(timeframe)
         lim = max(int(limit or 300), 1)
+        adj = "qfq"
 
         # ── 1m/5m 不走 DB，直接远端 ──
         if tf in ("1m", "5m"):
@@ -679,7 +679,6 @@ class CNStockDataSource(BaseDataSource):
         limit: int,
         before_time: Optional[int] = None,
         after_time: Optional[int] = None,
-        adj: str = "qfq",
     ) -> List[Dict[str, Any]]:
         """获取 K 线数据（DB 优先）。
 
@@ -694,7 +693,7 @@ class CNStockDataSource(BaseDataSource):
             if not symbols:
                 return []
             batch = self._db_bridge.get_kline_batch(
-                symbols, timeframe, limit, before_time, after_time, adj
+                symbols, timeframe, limit, before_time, after_time
             )
             # 合并为统一列表返回（按 symbol 顺序）
             merged = []
@@ -706,7 +705,7 @@ class CNStockDataSource(BaseDataSource):
 
         # ── 单只模式 ──
         return self._db_bridge.get_kline(
-            symbol, timeframe, limit, before_time, after_time, adj
+            symbol, timeframe, limit, before_time, after_time
         )
 
     # ----------------------------------------------------------

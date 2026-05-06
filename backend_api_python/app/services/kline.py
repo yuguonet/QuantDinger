@@ -54,7 +54,7 @@ class KlineService:
             timeframe=timeframe,
             limit=limit,
             before_time=before_time
-        )   
+        )
         
         # 设置缓存（仅最新数据）
         if klines and not before_time:
@@ -187,3 +187,4 @@ class KlineService:
             logger.error(f"All price sources failed for {market}:{symbol}: {e}")
         
         return result
+

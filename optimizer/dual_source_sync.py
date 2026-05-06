@@ -804,7 +804,6 @@ def download_akshare_15m(market_code: int, code: str, start_date: str, end_date:
                 start_date=ak_start,
                 end_date=ak_end,
                 period="15",
-                adjust="qfq",
             )
             if df is None or df.empty:
                 return []

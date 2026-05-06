@@ -843,7 +843,7 @@ def get_positions():
             if not sym:
                 continue
             if not mkt:
-                mkt = _detect_sym_market(sym) or "Crypto"
+                mkt = _detect_sym_market(sym) or "CNStock"
             market_groups.setdefault(mkt, []).append(sym)
 
         for mkt, syms in market_groups.items():
