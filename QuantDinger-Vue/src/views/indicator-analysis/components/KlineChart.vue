@@ -2250,6 +2250,11 @@ registerOverlay({
                 chartRef.value.applyNewData(validData)
               }
 
+              // 确保 VOL 副图指标存在（applyNewData 可能导致 VOL pane 数据绑定丢失）
+              try {
+                chartRef.value.createIndicator('VOL', false, { height: 100, dragEnabled: true })
+              } catch (_) {}
+
               // 延迟更新指标
               setTimeout(() => {
                 if (chartRef.value) {

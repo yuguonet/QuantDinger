@@ -310,9 +310,7 @@ class DBKlineBridge:
             # ── 第二步: kline_clean 填充中间缺失 ──
             cleaned = clean_klines(db_bars, tf)
 
-            # ── 第三步: 补充当日缺失（仅日线） ──
-            if tf == "1D":
-                cleaned = self._fill_today_if_needed(raw, cleaned, adj)
+            # 不再需要 _fill_today_if_needed — 1D 已从 15m 实时聚合，天然包含当日数据
 
             out = self._ds.filter_and_limit(
                 cleaned, limit=lim, before_time=before_time,
@@ -360,8 +358,7 @@ class DBKlineBridge:
 
             if db_bars:
                 cleaned = clean_klines(db_bars, tf)
-                if tf == "1D":
-                    cleaned = self._fill_today_if_needed(raw, cleaned, adj)
+                # 1D 已从 15m 聚合，无需 _fill_today_if_needed
                 out = self._ds.filter_and_limit(
                     cleaned, limit=lim, before_time=before_time,
                     after_time=after_time, truncate=(after_time is None),
@@ -379,8 +376,7 @@ class DBKlineBridge:
             )
             for raw, bars in remote_results.items():
                 self._backfill_db(raw, tf, bars)
-                if tf == "1D":
-                    bars = self._fill_today_if_needed(raw, bars, adj)
+                # 1D 已从 15m 聚合，无需 _fill_today_if_needed
                 out = self._ds.filter_and_limit(
                     bars, limit=lim, before_time=before_time,
                     after_time=after_time, truncate=(after_time is None),
@@ -401,18 +397,22 @@ class DBKlineBridge:
         """从 db_market 查询 K 线数据，统一转为 {time: int, ...} 格式。
 
         周期路由 (调用方已排除 1m/5m):
-          15m / 1D    → 直接查询
-          30m~4h      → 从 15m 聚合
-          1W / 1M     → 从 1D 聚合
+          15m         → 直接查询（唯一基线数据）
+          1D / 30m~4h → 从 15m 聚合
+          1W / 1M     → 从 15m 聚合（取更多 15m bar 再按日/周/月分组）
         """
         try:
-            if tf in ("15m", "1D"):
-                rows = self._writer.query("CNStock", raw, tf, limit=limit)
+            if tf == "15m":
+                rows = self._writer.query("CNStock", raw, "15m", limit=limit)
+            elif tf == "1D":
+                # 日线从 15m 聚合，不再单独存 1D
+                # 每天约 16 根 15m bar，取 limit*16+冗余
+                rows = self._writer.aggregate("CNStock", raw, "15m", limit=limit * 16 + 50)
+            elif tf in ("30m", "1h", "2h", "4h"):
+                rows = self._writer.aggregate("CNStock", raw, "15m", limit=limit)
             else:
-                # 非 15m/1D → 从 DB 数据实时聚合
-                # 30m/1h/2h/4h 从 15m 聚合，1W/1M 从 1D 聚合
-                agg_tf = tf if tf in ("30m", "1h", "2h", "4h") else "1D"
-                rows = self._writer.aggregate("CNStock", raw, agg_tf, limit=limit)
+                # 1W / 1M → 从 15m 聚合（先聚到日，再聚到周/月）
+                rows = self._writer.aggregate("CNStock", raw, "15m", limit=limit * 16 + 200)
         except Exception as e:
             logger.debug(f"[DB桥接] DB查询异常 {raw} tf={tf}: {e}")
             return []
@@ -434,111 +434,117 @@ class DBKlineBridge:
                 "volume": round(float(row.get("volume", 0)), 2),
             })
         bars.sort(key=lambda b: b["time"])
-        return bars
 
-    # ── 补充当日缺失 ──
-
-    def _fill_today_if_needed(
-        self, raw: str, bars: List[Dict[str, Any]], adj: str
-    ) -> List[Dict[str, Any]]:
-        """检查 bars 是否覆盖最近一个交易日，缺失则补充。"""
-        if not bars:
-            return bars
-
-        latest_ts = _latest_trading_day_ts()
-        has_latest = any(int(b.get("time", 0)) == latest_ts for b in bars)
-        if has_latest:
-            return bars
-
-        latest_day = datetime.fromtimestamp(latest_ts, tz=_TZ_CN).strftime("%Y-%m-%d")
-        today_bar = self._fetch_today_bar(raw, adj, target_day=latest_day)
-        if today_bar:
-            bars = [b for b in bars if int(b.get("time", 0)) != latest_ts]
-            bars.append(today_bar)
-            bars.sort(key=lambda b: b["time"])
-        return bars
-
-    def _fetch_today_bar(self, raw: str, adj: str, target_day: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """获取指定交易日的日线 bar。
-
-        target_day: 'YYYY-MM-DD'，默认为今天。
-        盘中（当日）: 15m 聚合，内部自动用 get_ticker 积累的惰性缓存比对
-        非盘中/非当日: 远程直接取已完成日线
-        """
-        if target_day is None:
-            target_day = _today_str()
-
-        is_today = (target_day == _today_str())
-
-        # 当日盘中 → 15m 聚合（内部自动用缓存比对）
-        if is_today and _is_market_hours():
-            return self._fetch_today_bar_from_15m(raw, adj, target_day)
-
-        # 其他情况（当日收盘后、非交易日、历史交易日）→ 取已完成日线
-        return self._fetch_completed_daily_bar(raw, adj, target_day)
-
-    def _fetch_completed_daily_bar(self, raw: str, adj: str, target_day: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """从远程取指定交易日的已完成日线 bar。"""
-        if target_day is None:
-            target_day = _today_str()
-        target_ts = _day_ts(target_day)
-        try:
-            remote = self._ds._get_kline_remote(raw, "1D", 3, adj=adj)
-            if not remote:
-                return None
-            for b in remote:
-                if int(b.get("time", 0)) == target_ts:
-                    return b
-        except Exception as e:
-            logger.debug(f"[DB桥接] 取已完成日线失败 {raw}/{target_day}: {e}")
-        return None
-
-    def _fetch_today_bar_from_15m(self, raw: str, adj: str, target_day: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """盘中: 远程取 15m K 线聚合成指定交易日的日线，和实时行情比对修正。"""
-        if target_day is None:
-            target_day = _today_str()
-        target_ts = _day_ts(target_day)
-        try:
-            remote_15m = self._ds._get_kline_remote(raw, "15m", 200, adj=adj)
-            if not remote_15m:
-                return None
-
-            today_bars = [b for b in remote_15m if b.get("time", 0) >= target_ts]
-            if not today_bars:
-                return None
-
-            today_bars.sort(key=lambda x: x.get("time", 0))
-
-            agg_high = max(b.get("high", 0) for b in today_bars)
-            agg_low = min(b.get("low", float('inf')) for b in today_bars)
-            agg_volume = sum(b.get("volume", 0) for b in today_bars)
-
-            # 和实时行情比对（惰性缓存，15 分钟刷新）
-            quote = self._quote_cache.get_or_fetch(raw, self._ds)
-
-            if quote and quote.is_valid:
-                if quote.high > agg_high:
-                    agg_high = quote.high
-                if quote.low > 0 and agg_low > 0 and quote.low < agg_low:
-                    agg_low = quote.low
-                close_price = quote.price
-                if quote.volume > 0:
-                    agg_volume = quote.volume
+        # 1D / 1W / 1M 需要二次聚合（15m → 日 → 周/月）
+        if tf == "1D":
+            return self._aggregate_15m_to_daily(bars, limit)
+        elif tf in ("1W", "1M"):
+            daily = self._aggregate_15m_to_daily(bars, limit * 8)
+            if tf == "1W":
+                return self._aggregate_daily_to_weekly(daily, limit)
             else:
-                close_price = today_bars[-1].get("close", 0)
+                return self._aggregate_daily_to_monthly(daily, limit)
+        return bars
 
-            return {
-                "time": target_ts,
-                "open": today_bars[0].get("open", 0),
-                "high": round(agg_high, 4),
-                "low": round(agg_low, 4),
-                "close": round(close_price, 4),
-                "volume": round(agg_volume, 2),
-            }
+    # ── 15m → 日/周/月 聚合 ──
 
-        except Exception as e:
-            logger.debug(f"[DB桥接] 15m聚合当日失败 {raw}: {e}")
-            return None
+    @staticmethod
+    def _aggregate_15m_to_daily(bars: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+        """将 15m K 线按交易日聚合为日线。"""
+        if not bars:
+            return []
+        groups: Dict[int, List[Dict]] = {}
+        order: List[int] = []
+        for b in bars:
+            ts = b.get("time", 0)
+            if ts <= 0:
+                continue
+            # 按北京时间日期分组
+            day_ts = int(datetime.fromtimestamp(ts, tz=_TZ_CN).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).timestamp())
+            if day_ts not in groups:
+                groups[day_ts] = []
+                order.append(day_ts)
+            groups[day_ts].append(b)
+        result = []
+        for day_ts in order:
+            chunk = groups[day_ts]
+            if not chunk:
+                continue
+            result.append({
+                "time": day_ts,
+                "open": float(chunk[0].get("open", 0)),
+                "high": max(float(b.get("high", 0)) for b in chunk),
+                "low": min(float(b.get("low", 0)) for b in chunk),
+                "close": float(chunk[-1].get("close", 0)),
+                "volume": round(sum(float(b.get("volume", 0)) for b in chunk), 2),
+            })
+        return result[-limit:] if len(result) > limit else result
+
+    @staticmethod
+    def _aggregate_daily_to_weekly(daily_bars: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+        """将日线按 ISO 周聚合为周线。"""
+        if not daily_bars:
+            return []
+        groups: Dict[tuple, List[Dict]] = {}
+        order: List[tuple] = []
+        for b in daily_bars:
+            ts = b.get("time", 0)
+            if ts <= 0:
+                continue
+            dt = datetime.fromtimestamp(ts, tz=_TZ_CN)
+            key = dt.isocalendar()[:2]  # (year, week)
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(b)
+        result = []
+        for key in order:
+            chunk = groups[key]
+            if not chunk:
+                continue
+            result.append({
+                "time": chunk[0]["time"],
+                "open": float(chunk[0].get("open", 0)),
+                "high": max(float(b.get("high", 0)) for b in chunk),
+                "low": min(float(b.get("low", 0)) for b in chunk),
+                "close": float(chunk[-1].get("close", 0)),
+                "volume": round(sum(float(b.get("volume", 0)) for b in chunk), 2),
+            })
+        return result[-limit:] if len(result) > limit else result
+
+    @staticmethod
+    def _aggregate_daily_to_monthly(daily_bars: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+        """将日线按月聚合为月线。"""
+        if not daily_bars:
+            return []
+        groups: Dict[int, List[Dict]] = {}
+        order: List[int] = []
+        for b in daily_bars:
+            ts = b.get("time", 0)
+            if ts <= 0:
+                continue
+            dt = datetime.fromtimestamp(ts, tz=_TZ_CN)
+            month_ts = int(dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp())
+            if month_ts not in groups:
+                groups[month_ts] = []
+                order.append(month_ts)
+            groups[month_ts].append(b)
+        result = []
+        for month_ts in order:
+            chunk = groups[month_ts]
+            if not chunk:
+                continue
+            result.append({
+                "time": month_ts,
+                "open": float(chunk[0].get("open", 0)),
+                "high": max(float(b.get("high", 0)) for b in chunk),
+                "low": min(float(b.get("low", 0)) for b in chunk),
+                "close": float(chunk[-1].get("close", 0)),
+                "volume": round(sum(float(b.get("volume", 0)) for b in chunk), 2),
+            })
+        return result[-limit:] if len(result) > limit else result
 
     # ── 远程全量拉取 + 回填 DB ──
 
@@ -553,8 +559,7 @@ class DBKlineBridge:
 
         self._backfill_db(raw, tf, remote_bars)
 
-        if tf == "1D":
-            remote_bars = self._fill_today_if_needed(raw, remote_bars, adj)
+        # 1D 已从 15m 聚合，无需 _fill_today_if_needed
 
         out = self._ds.filter_and_limit(
             remote_bars, limit=limit, before_time=before_time,
@@ -564,8 +569,8 @@ class DBKlineBridge:
         return out
 
     def _backfill_db(self, raw: str, tf: str, bars: List[Dict[str, Any]]):
-        """将远程拉取的 K 线回填到 DB（只存 15m / 1D）。"""
-        if tf not in ("15m", "1D"):
+        """将远程拉取的 K 线回填到 DB（只存 15m，1D 从 15m 聚合）。"""
+        if tf != "15m":
             return
 
         records = []

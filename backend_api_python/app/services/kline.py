@@ -280,7 +280,16 @@ class KlineService:
         """日线直接从远程获取，盘中合成当日未完成 K 线"""
         klines = DataSourceFactory.get_kline(market, symbol, "1D", limit, adj=adj) or []
 
-        # 合成当日 K 线（盘中）或追加当日已完成 bar（盘后）
+        # DBKlineBridge 内部的 _fill_today_if_needed 已用 15m 聚合 + 实时行情缓存
+        # 补充了当日 bar，这里检查是否已存在，避免重复合成导致 OHLC 不一致
+        today_ts = _ts_from_date(_today_str())
+        has_today = any(int(b.get("time", 0)) == today_ts for b in klines)
+
+        if has_today:
+            # 已有当日 bar（由 DB 桥接层补充），直接截断返回
+            return klines[-limit:]
+
+        # 无当日 bar → 合成（盘中）或追加已完成 bar（盘后）
         today_candle = _synthesize_today_candle(symbol, market)
         return self._append_current(klines, today_candle, market, symbol, limit, adj)
 
