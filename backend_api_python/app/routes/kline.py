@@ -74,8 +74,7 @@ def get_kline():
             symbol=symbol,
             timeframe=timeframe,
             limit=limit,
-            before_time=before_time,
-            adj=adj,
+            before_time=before_time
         )
 
         if not klines:
