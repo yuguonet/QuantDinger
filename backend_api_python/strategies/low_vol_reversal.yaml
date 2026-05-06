@@ -1,0 +1,83 @@
+# 低波反转策略（中线 5-20 天）
+# ⚠️ stock_stats 中低波股票年化仅 4.5%（弱势非蓄势）
+# 因此本策略不做预筛选，全市场实时扫描 BB 带宽收缩信号
+
+name: low_vol_reversal
+display_name: 低波反转
+description: |
+  全市场实时扫描 BB 带宽收缩信号，捕捉波动率收敛后的反转。
+  ⚠️ stock_stats 中低波股票年化仅 4.5%（弱势非蓄势），
+  因此本策略不做预筛选，由实时 BB 带宽收缩 + 放量突破 + RSI 确认。
+  适合中线（5-20 天），胜率偏低但赔率高。
+
+category: reversal
+core_rules: [1, 2, 3, 5]
+required_tools:
+  - get_daily_history
+  - get_realtime_quote
+  - analyze_trend
+
+default_active: true
+default_priority: 40
+
+# ── 优化参数（基于数据验证的最佳参数组合）──
+params:
+  bb_period: 20                # 布林带周期（15-30）
+  bb_std: 2.0                  # 布林带标准差（1.5-2.5）
+  squeeze_percentile: 20       # BB 带宽历史分位（10-30，越低越极端）
+  vol_ma_period: 20            # 成交量均线周期
+  vol_ratio: 1.5               # 放量倍数（1.3-2.5）
+  ma_period: 10                # 短期均线周期（5-20）
+  rsi_period: 14               # RSI 周期
+  rsi_exit_oversold: 35        # RSI 脱离超卖区阈值（25-45）
+  position_pct: 60             # 仓位比例 %
+  stop_loss_pct: 5.0           # 止损比例 %
+  take_profit_pct: 15.0        # 止盈比例 %
+  trailing_pct: 6.0            # 移动止损 %
+
+instructions: |
+  **低波反转（Low Volatility Reversal）**
+
+  核心逻辑：BB 带宽收缩到历史低位 = 波动率收敛到极致 + 放量突破 + RSI 脱离超卖 = 反转信号。
+
+  ## 策略说明
+  ⚠️ 本策略不做 stock_stats 预筛选！
+  - 原因：stock_stats 中 daily_vol<0.03 + vol_cv<0.8 的 528 只低波股票，
+    年化收益中位数仅 4.5%（全市场 12.3%），说明低波在 A 股是弱势信号
+  - 解决方案：全市场实时扫描，用 BB 带宽收缩识别真正的蓄势股
+
+  ## 信号判定
+
+  ### 买入条件（全部满足）
+  1. **波动率收敛**：BB 带宽处于近 120 日最低 20% 分位
+     - BB 带宽 = (上轨 - 下轨) / 中轨
+     - 使用 `get_daily_history` 计算近 120 日 BB 带宽分布
+     - 当前带宽 < 20 分位数 → 波动率收敛到极致
+  2. **放量突破**：当日成交量 > 20 日均量 × 1.5
+     - 使用 `get_realtime_quote` → volume_ratio > 1.5
+     - 缩量蓄势后放量，是启动信号
+  3. **价格站上均线**：收盘价 > 10 日 SMA
+     - 确认价格脱离底部
+  4. **RSI 脱离超卖**：RSI(14) 从下方上穿 35
+     - 使用 `get_daily_history` 计算 RSI
+     - RSI 从超卖区回升 = 动量反转
+
+  ### 卖出条件
+  1. 止损：-5.0%
+  2. 止盈：+15.0%
+  3. 移动止损：从最高点回撤 6.0%
+  4. RSI > 70（超买离场）
+
+  ## 评分调整
+  - BB 带宽收缩 + 放量突破：sentiment_score +10
+  - 在 buy_reason 中注明"低波反转信号"
+
+  ## 设计思路
+  - 先用 BB 带宽收缩筛选出波动率收敛的股票
+  - 再用放量 + RSI 确认反转启动
+  - 避免被长期弱势低波股干扰
+
+  ## A 股规则
+  - T+1：买入当日不可卖出
+  - 涨跌停：±10%（创业板/科创板 ±20%）
+  - 最小交易单位：100 股

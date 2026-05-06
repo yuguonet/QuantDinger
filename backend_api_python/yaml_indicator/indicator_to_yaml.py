@@ -391,6 +391,20 @@ class YAMLGenerator:
         'volume': ['volume', 'vwap'],
     }
 
+    # ── 趋势类策略特征关键词（名称语义检测）──
+    TREND_KEYWORDS: List[str] = [
+        r'龙头', r'突破', r'趋势', r'动量', r'金叉', r'死叉',
+        r'多头', r'空头', r'排列', r'主升', r'拉升', r'回踩',
+        r'dragon', r'breakout', r'trend', r'momentum', r'pullback',
+    ]
+
+    # ── 反转类策略特征关键词（名称语义检测）──
+    REVERSAL_KEYWORDS: List[str] = [
+        r'反转', r'反弹', r'超卖', r'超买', r'回归', r'底部',
+        r'顶部', r'低吸', r'高抛', r'均值回归', r'触底',
+        r'reversal', r'bounce', r'oversold', r'overbought',
+    ]
+
     # ── 框架类策略特征关键词 ──
     # 这些策略的核心是分析框架/方法论，而非单一指标公式
     FRAMEWORK_KEYWORDS: List[str] = [
@@ -513,6 +527,22 @@ class YAMLGenerator:
         if pattern_in_name >= 1 or pattern_in_conds >= 1:
             return 'pattern'
 
+        # 检测名称中的趋势/反转关键词（增强：捕获"龙头"、"突破"等语义）
+        trend_in_name = sum(1 for kw in YAMLGenerator.TREND_KEYWORDS if re.search(kw, name_text, re.IGNORECASE))
+        reversal_in_name = sum(1 for kw in YAMLGenerator.REVERSAL_KEYWORDS if re.search(kw, name_text, re.IGNORECASE))
+
+        # 名称中有明确趋势关键词 + 有趋势指标 → 直接判定 trend
+        if trend_in_name >= 1:
+            has_trend_ind = any(ind in indicators for ind in ('ema', 'sma', 'macd', 'supertrend'))
+            if has_trend_ind or not indicators:
+                return 'trend'
+
+        # 名称中有明确反转关键词 + 有反转指标 → 直接判定 reversal
+        if reversal_in_name >= 1:
+            has_reversal_ind = any(ind in indicators for ind in ('rsi', 'kdj', 'bollinger'))
+            if has_reversal_ind:
+                return 'reversal'
+
         # ── 第二层：买卖条件语义分析 ──
         # 区分 "趋势跟随" vs "均值回归"
         # 趋势信号：均线排列、突破、金叉死叉
@@ -526,7 +556,7 @@ class YAMLGenerator:
             r"close.*>\s*resistance",  # 突破阻力位
             r"close.*>\s*high.*\.shift",  # 突破前高
         ]
-        # 反转信号：超买超卖、极端值回归
+        # 反转信号：超买超卖、极端值回归、量价背离
         reversal_signal_patterns = [
             r"rsi.*<\s*\d{1,2}\b",  # RSI < 30/20 区域
             r"rsi.*>\s*[78]\d\b",  # RSI > 70/80 区域
@@ -536,6 +566,14 @@ class YAMLGenerator:
             r"close.*>.*bb_upper",  # 触及布林上轨
             r"close.*<.*vwap\s*\*",  # 价格低于 VWAP 偏离
             r"close.*<.*vwap\b",  # 价格低于 VWAP
+            r"vol_ratio.*>\s*\d",  # 放量信号（底部放量反转）
+            r"volume.*>\s*vol_ma",  # 成交量突破均量
+            r"rsi.*cross_up",  # RSI 上穿（从超卖回升）
+            r"rsi.*<\s*params",  # RSI < 参数阈值（动态超卖）
+            r"close.*<.*bb_mid",  # 价格低于布林中轨（均值下方）
+            r"cross_up.*rsi",  # RSI 金叉
+            r"close.*<=.*bb_lower",  # 价格触及布林下轨
+            r"close.*<.*vwap\b.*\+",  # 价格低于 VWAP+偏离
         ]
 
         buy_lower = buy_conditions.lower() if buy_conditions else ''
@@ -557,12 +595,33 @@ class YAMLGenerator:
             has_vwap = 'vwap' in indicators
             has_macd = 'macd' in indicators
             has_volume = 'volume' in indicators
+            has_rsi = 'rsi' in indicators
+            has_bb = 'bollinger' in indicators
             # VWAP 作为均值锚点 + MACD/成交量辅助 = 反转策略
             if has_vwap and (has_macd or has_volume):
+                return 'reversal'
+            # RSI/Bollinger + 成交量 = 反转策略（底部放量等）
+            if (has_rsi or has_bb) and has_volume:
                 return 'reversal'
             # 有明确的趋势指标主导 → trend
             if has_macd and not has_vwap:
                 return 'trend'
+
+        # VWAP + MACD 组合：VWAP 作为均值锚点，MACD 作为动量确认 → reversal
+        # 适用于"VWAP+MACD+放量"等均值回归型策略
+        if 'vwap' in indicators and 'macd' in indicators:
+            # 如果还有 RSI/Bollinger → 强反转信号
+            if any(ind in indicators for ind in ('rsi', 'bollinger')):
+                return 'reversal'
+            # VWAP+MACD+成交量 → 反转（均值回归 + 量能确认）
+            if 'volume' in indicators:
+                return 'reversal'
+
+        # RSI + Bollinger + VWAP 三重反转信号：即使有趋势指标也优先判定 reversal
+        # 这种组合是经典的均值回归模式（超卖 + 触及下轨 + 偏离均值）
+        reversal_trio = sum(1 for ind in ('rsi', 'bollinger', 'vwap') if ind in indicators)
+        if reversal_trio >= 2:
+            return 'reversal'
 
         # ── 第三层：指标组合基础映射（兜底） ──
         BUY_CONDITION_INDICATORS = {
@@ -598,7 +657,18 @@ class YAMLGenerator:
         # 平分打破：bollinger 存在时优先 reversal（布林带本质是均值回归）
         if scores.get('reversal') == scores.get('trend') and 'bollinger' in indicators:
             return 'reversal'
-        return max(scores, key=scores.get)
+        # volume 类别兜底：根据其他指标和语义判断归属
+        top_cat = max(scores, key=scores.get)
+        if top_cat == 'volume':
+            # 纯量能策略：有反转指标 → reversal，否则 → trend
+            has_reversal_ind = any(ind in indicators for ind in ('rsi', 'kdj', 'bollinger'))
+            if has_reversal_ind:
+                return 'reversal'
+            # 底部/放量关键词 → reversal
+            if any(re.search(kw, name_text, re.IGNORECASE) for kw in (YAMLGenerator.REVERSAL_KEYWORDS or [])):
+                return 'reversal'
+            return 'trend'  # 默认：量能突破
+        return top_cat
 
     @staticmethod
     def _generate_display_name(name: str, indicators: List[str]) -> str:

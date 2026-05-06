@@ -374,7 +374,7 @@ class MarketDataProvider:
 
     def _query_raw(self, market: str, symbol: str, timeframe: str,
                    start: datetime, end: datetime) -> list[dict]:
-        """从 db 读原始 K 线"""
+        """从 db 读原始 K 线（带 start/end 过滤，减少无效数据读取）"""
         import logging
         logger = logging.getLogger(__name__)
         try:
@@ -383,20 +383,14 @@ class MarketDataProvider:
                     market, symbol, timeframe,
                     start=start, end=end
                 )
-            rows = self.writer.query(market, symbol, timeframe, limit=0)
+            # 直接传 start_time/end_time 给 query，让 DB 层按年分表 + SQL 过滤
+            rows = self.writer.query(
+                market, symbol, timeframe,
+                start_time=start, end_time=end, limit=0,
+            )
             if not rows:
                 return []
-            start_d = start.astimezone(TZ_SH) if start.tzinfo else start.replace(tzinfo=TZ_SH)
-            end_d = end.astimezone(TZ_SH) if end.tzinfo else end.replace(tzinfo=TZ_SH)
-            filtered = []
-            for r in rows:
-                t = r["time"]
-                if isinstance(t, datetime):
-                    if t.tzinfo is None:
-                        t = t.replace(tzinfo=TZ_SH)
-                    if start_d <= t <= end_d:
-                        filtered.append(r)
-            return filtered
+            return rows
         except Exception as e:
             logger.warning(f"查询 {market}/{symbol}/{timeframe} 失败: {e}")
             return []

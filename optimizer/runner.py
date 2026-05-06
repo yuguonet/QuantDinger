@@ -141,19 +141,12 @@ def _patch_datasource_warehouse():
             if data and len(data) >= 10:
                 return data
 
-            # 也加一行，看 fallback 返回了什么
-            result = _orig_get_kline(cls, market, symbol, timeframe, limit,
-                                    before_time=before_time, after_time=after_time)
-            if not result:
-                print(f"  ⚠️ [patch] {symbol} fallback 也返回空 (orig_get_kline)")
-            return result
-            # 本地数据不足，直接抛异常让 worker 跳过（不走网络、不重试）
+            # 本地数据不足，直接跳过（不走外部 API）
             raise ValueError(f"{symbol} 本地数据不足 ({len(data) if data else 0} 条)，跳过")
         except ValueError:
-            print(f"  ⚠️ [patch] {symbol} get_clean_klines 异常: {e}")
             raise
-        except Exception:
-            print(f"  ⚠️ [patch] {symbol} get_clean_klines 异常: {e}")
+        except Exception as e:
+            print(f"  ⚠️ [patch] {symbol} 本地数据读取异常: {e}")
             raise ValueError(f"{symbol} 本地数据读取失败，跳过")
 
     DataSourceFactory.get_kline = classmethod(_get_kline_with_warehouse)

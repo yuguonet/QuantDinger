@@ -17,16 +17,13 @@ kline_clean.py — K 线数据连贯性补齐（纯数据处理)
     cleaned = clean_klines(bars, "1D")
 """
 
-from datetime import datetime, timedelta, time as dt_time
+from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
-from zoneinfo import ZoneInfo
 
 from app.utils.trading_calendar import is_trading_day as _is_trading_day_str
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
-
-TZ_SH = ZoneInfo("Asia/Shanghai")
 
 # ── 交易时段（分钟级补齐用）──
 
@@ -58,25 +55,23 @@ def _normalize_tf(timeframe: str) -> str:
     return _TF_ALIASES.get(timeframe, timeframe)
 
 
-def _ensure_aware(t: datetime) -> datetime:
-    if t.tzinfo is None:
-        return t.replace(tzinfo=TZ_SH)
-    return t
-
-
 def _bar_to_dt(bar: dict) -> Optional[datetime]:
+    """原样解析 time 字段，不做时区转换"""
     t = bar.get("time")
     if t is None:
         return None
     if isinstance(t, datetime):
-        return _ensure_aware(t)
+        return t  # 原样返回，不加时区
     if isinstance(t, (int, float)):
-        return datetime.fromtimestamp(t, tz=TZ_SH)
+        return datetime.fromtimestamp(t)  # 本地时间，不加时区
     return None
 
 
-def _dt_to_ts(t: datetime) -> int:
-    return int(t.timestamp())
+def _dt_to_ts(t: datetime, original_type: type) -> Any:
+    """按原始类型回写时间"""
+    if original_type in (int, float):
+        return int(t.timestamp())
+    return t  # datetime 原样返回
 
 
 def _is_trading_day(d: str) -> bool:
@@ -118,39 +113,37 @@ def _expected_times_between(
 
 
 def _expected_daily_between(start: datetime, end: datetime) -> List[datetime]:
-    """生成两个日期之间的交易日（不含 start 当天，不含 end 当天）"""
-    start_d = _ensure_aware(start).strftime("%Y-%m-%d")
-    end_d = _ensure_aware(end).strftime("%Y-%m-%d")
+    """生成两个日期之间的交易日（不含 start 当天，不含 end 当天），不加时区"""
+    start_d = start.strftime("%Y-%m-%d")
+    end_d = end.strftime("%Y-%m-%d")
 
     result = []
     for d in _get_sorted_trading_days():
         if d <= start_d or d >= end_d:
             continue
-        result.append(datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=TZ_SH))
+        result.append(datetime.strptime(d, "%Y-%m-%d"))
     return result
 
 
 def _expected_weekly_between(start: datetime, end: datetime) -> List[datetime]:
-    """生成两个时间之间的周线时间点（每周最后一个交易日）"""
-    start_d = _ensure_aware(start).strftime("%Y-%m-%d")
-    end_d = _ensure_aware(end).strftime("%Y-%m-%d")
+    """生成两个时间之间的周线时间点（每周最后一个交易日），不加时区"""
+    start_d = start.strftime("%Y-%m-%d")
+    end_d = end.strftime("%Y-%m-%d")
 
-    # 收集范围内的所有交易日（含边界），按周分组
     weeks: Dict[tuple, str] = {}
     for d in _get_sorted_trading_days():
         if d < start_d or d > end_d:
             continue
         iso = datetime.strptime(d, "%Y-%m-%d").isocalendar()
-        weeks[(iso[0], iso[1])] = d  # 排序后最后一个覆盖
+        weeks[(iso[0], iso[1])] = d
 
-    # 排除 start 和 end 所在周（只补中间）
-    start_iso = _ensure_aware(start).isocalendar()
-    end_iso = _ensure_aware(end).isocalendar()
+    start_iso = start.isocalendar()
+    end_iso = end.isocalendar()
     start_key = (start_iso[0], start_iso[1])
     end_key = (end_iso[0], end_iso[1])
 
     return [
-        datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=TZ_SH)
+        datetime.strptime(d, "%Y-%m-%d")
         for key, d in sorted(weeks.items())
         if key != start_key and key != end_key
     ]
@@ -159,13 +152,11 @@ def _expected_weekly_between(start: datetime, end: datetime) -> List[datetime]:
 def _expected_intraday_between(
     start: datetime, end: datetime, interval_sec: int
 ) -> List[datetime]:
-    """生成两个时间之间的分钟级时间点（只在交易时段内）"""
-    start_d = _ensure_aware(start)
-    end_d = _ensure_aware(end)
+    """生成两个时间之间的分钟级时间点（只在交易时段内），不加时区"""
     interval_min = int(interval_sec) // 60
 
-    start_str = start_d.strftime("%Y-%m-%d")
-    end_str = end_d.strftime("%Y-%m-%d")
+    start_str = start.strftime("%Y-%m-%d")
+    end_str = end.strftime("%Y-%m-%d")
 
     result = []
     for d in _get_sorted_trading_days():
@@ -177,8 +168,8 @@ def _expected_intraday_between(
             t_end = eh * 60 + em
             while t <= t_end:
                 h, m = divmod(t, 60)
-                bar_dt = dt_base.replace(hour=h, minute=m, tzinfo=TZ_SH)
-                if start_d < bar_dt < end_d:
+                bar_dt = dt_base.replace(hour=h, minute=m)
+                if start < bar_dt < end:
                     result.append(bar_dt)
                 t += interval_min
     return result
@@ -225,6 +216,9 @@ def clean_klines(
     if len(dt_bars) < 2:
         return sorted_bars
 
+    # 检测原始 time 类型（datetime / int / float）
+    _orig_time_type = type(dt_bars[0][1].get("time", datetime))
+
     # 获取时间间隔
     interval_sec = _TF_SECONDS.get(tf)
     if interval_sec is None:
@@ -254,7 +248,7 @@ def clean_klines(
 
             for gap_dt in gaps:
                 result.append({
-                    "time": _dt_to_ts(gap_dt),
+                    "time": _dt_to_ts(gap_dt, _orig_time_type),
                     "open": prev_close,
                     "high": prev_close,
                     "low": prev_close,

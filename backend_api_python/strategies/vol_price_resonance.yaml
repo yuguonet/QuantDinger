@@ -1,0 +1,73 @@
+# 量价共振突破策略（超短 1-3 天）
+# 数据验证：short_score>0.85 + vol_price_corr>0.3 + vol_cv>1.0 的 105 只股票
+# 年化中位数 23.0%（全市场 12.3%），88% 胜率
+
+name: vol_price_resonance
+display_name: 量价共振突破
+description: |
+  放量突破 N 日高点，捕捉主升浪启动。
+  数据验证：short_score>0.85 + vol_price_corr>0.3 + vol_cv>1.0 的 105 只股票，
+  年化中位数 23.0%（全市场 12.3%），88% 胜率。
+  适合超短线（1-3 天）。
+
+category: breakout
+core_rules: [1, 2, 3]
+required_tools:
+  - get_daily_history
+  - get_realtime_quote
+  - analyze_trend
+
+default_active: true
+default_priority: 10
+
+# ── 优化参数（基于数据验证的最佳参数组合）──
+params:
+  breakout_period: 20          # Donchian 通道周期（5-30，取中值）
+  vol_ma_period: 20            # 成交量均线周期（10-30）
+  vol_ratio: 2.0               # 放量倍数（1.5-3.5，验证值 2.0）
+  min_change_pct: 3.0          # 近期涨幅下限 %（排除弱势股）
+  max_change_pct: 8.0          # 近期涨幅上限 %（不追涨停板）
+  use_trend_filter: true       # 是否叠加 EMA 趋势过滤
+  trend_ema_period: 30         # 趋势 EMA 周期（20-60）
+  stop_loss_pct: 5.0           # 止损比例 %
+  take_profit_pct: 12.0        # 止盈比例 %
+  trailing_pct: 5.0            # 移动止损 %
+
+instructions: |
+  **量价共振突破（Volume-Price Resonance Breakout）**
+
+  核心逻辑：价格突破 N 日高点 + 成交量放大确认 = 主升浪启动信号。
+
+  ## 选股预筛（stock_stats.csv 条件）
+  - short_score > 0.85（短期动量得分 p85+）
+  - vol_price_corr > 0.3（量价正相关）
+  - vol_cv > 1.0（成交量波动率 p25+）
+  - 满足条件的股票约 105 只，年化中位数 23.0%，88% 胜率
+
+  ## 信号判定
+
+  ### 买入条件（全部满足）
+  1. **价格突破**：收盘价突破 20 日 Donchian 通道上轨
+     - 使用 `get_daily_history` 计算近 20 日最高价
+     - 当前收盘价 > 前一日的 20 日最高价（避免前瞻偏差）
+  2. **放量确认**：当日成交量 > 20 日均量 × 2.0
+     - 使用 `get_realtime_quote` → volume_ratio > 2.0
+  3. **涨幅过滤**：
+     - 近 5 日涨幅 >= 3.0%（排除弱势股）
+     - 近 5 日涨幅 <= 8.0%（不追涨停板）
+  4. **趋势过滤**（可选）：价格在 30 日 EMA 上方
+
+  ### 卖出条件
+  1. 止损：-5.0%
+  2. 止盈：+12.0%
+  3. 移动止损：从最高点回撤 5.0%
+
+  ## 评分调整
+  - 放量突破确认：sentiment_score +12
+  - 突破伴随板块共振：额外 +5
+  - 在 buy_reason 中注明"量价共振突破"
+
+  ## A 股规则
+  - T+1：买入当日不可卖出
+  - 涨跌停：±10%（创业板/科创板 ±20%）
+  - 最小交易单位：100 股
