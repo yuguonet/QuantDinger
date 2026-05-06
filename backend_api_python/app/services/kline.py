@@ -53,8 +53,7 @@ class KlineService:
             symbol=symbol,
             timeframe=timeframe,
             limit=limit,
-            before_time=before_time,
-            adj=adj
+            before_time=before_time
         )   
         
         # 设置缓存（仅最新数据）
