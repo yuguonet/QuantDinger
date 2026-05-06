@@ -316,6 +316,7 @@ export default {
 
     // 已添加的指标 ID 列表（用于清理）
     const addedIndicatorIds = ref([])
+    const volPaneId = ref(null)  // 追踪 VOL 副图 paneId，避免重复创建
     // 已添加的信号 overlay ID 列表（用于清理）
     const addedSignalOverlayIds = ref([])
     // 已添加的画线 overlay ID 列表（用于清理和管理）
@@ -2251,8 +2252,15 @@ registerOverlay({
               }
 
               // 确保 VOL 副图指标存在（applyNewData 可能导致 VOL pane 数据绑定丢失）
+              // 先移除旧 VOL pane，避免重复创建
               try {
-                chartRef.value.createIndicator('VOL', false, { height: 100, dragEnabled: true })
+                if (volPaneId.value != null) {
+                  chartRef.value.removeIndicator(volPaneId.value, 'VOL')
+                  volPaneId.value = null
+                }
+              } catch (_) {}
+              try {
+                volPaneId.value = chartRef.value.createIndicator('VOL', false, { height: 100, dragEnabled: true })
               } catch (_) {}
 
               // 延迟更新指标
@@ -2885,6 +2893,7 @@ registerOverlay({
           chartRef.value.destroy()
         } catch (e) {}
         chartRef.value = null
+        volPaneId.value = null
       }
 
       try {
@@ -3121,7 +3130,7 @@ registerOverlay({
 
             // 创建成交量指标（默认显示）
             try {
-              chartRef.value.createIndicator('VOL', false, { height: 100, dragEnabled: true })
+              volPaneId.value = chartRef.value.createIndicator('VOL', false, { height: 100, dragEnabled: true })
             } catch (e) {
             }
 
@@ -4745,6 +4754,7 @@ registerOverlay({
       if (chartRef.value) {
         chartRef.value.destroy()
         chartRef.value = null
+        volPaneId.value = null
       }
       window.removeEventListener('resize', handleResize)
     })

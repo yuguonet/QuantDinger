@@ -724,6 +724,19 @@ export default {
         this.handleCreate()
       }
     },
+    /**
+     * Infer market category from symbol format.
+     * e.g. 'BTC/USDT' → 'Crypto', 'AAPL' → 'Stock'
+     */
+    detectMarket (symbol) {
+      if (!symbol) return 'Crypto'
+      // Crypto pairs typically contain '/' with USDT/BTC/ETH/BNB etc. as quote
+      const cryptoQuotePattern = /\/(USDT|USDC|BTC|ETH|BNB|DAI|BUSD|TUSD|FDUSD)$/i
+      if (cryptoQuotePattern.test(symbol)) return 'Crypto'
+      // Futures-style symbols like BTCUSDT or BTC-USDT
+      if (/^[A-Z]{2,10}(USDT|USDC|BTC|ETH)$/i.test(symbol.replace('-', ''))) return 'Crypto'
+      return 'Crypto' // fallback
+    },
     async fetchGridReferencePrice () {
       if (this.botType !== 'grid') return null
       const symbol = this.baseForm.symbol
@@ -732,7 +745,7 @@ export default {
         const res = await request({
           url: '/api/market/price',
           method: 'get',
-          params: { market: 'Crypto', symbol }
+          params: { market: this.detectMarket(symbol), symbol }
         })
         const price = parseFloat(res?.data?.price)
         return price > 0 ? price : null
@@ -767,7 +780,7 @@ export default {
         strategy_type: 'ScriptStrategy',
         strategy_mode: 'bot',
         strategy_code: strategyCode,
-        market_category: 'Crypto',
+        market_category: this.detectMarket(this.baseForm.symbol),
         execution_mode: 'live',
         exchange_config: {
           credential_id: this.baseForm.credentialId,

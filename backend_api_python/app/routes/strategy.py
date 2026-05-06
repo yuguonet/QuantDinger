@@ -1264,13 +1264,15 @@ def preview_compile():
         # Execute
         symbol = config.get('symbol', 'BTC/USDT')
         timeframe = config.get('timeframe', '4h')
+        market = config.get('market', 'Crypto')
         
         backtest_service = BacktestService()
         result = backtest_service.run_code_strategy(
             code=code,
             symbol=symbol,
             timeframe=timeframe,
-            limit=500 
+            limit=500,
+            market=market
         )
         
         if result.get('error'):

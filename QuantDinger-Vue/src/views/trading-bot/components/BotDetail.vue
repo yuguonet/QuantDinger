@@ -618,7 +618,7 @@ export default {
       request({
         url: '/api/indicator/kline',
         method: 'get',
-        params: { market: 'Crypto', symbol, timeframe: '1H', limit: 200 }
+        params: { market: this.bot.market_category || 'Crypto', symbol, timeframe: '1H', limit: 200 }
       }).then(res => {
         if (res && res.code === 1 && Array.isArray(res.data)) {
           this.klineData = res.data

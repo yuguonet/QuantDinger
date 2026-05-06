@@ -1588,7 +1588,8 @@ class BacktestService:
         code: str,
         symbol: str,
         timeframe: str,
-        limit: int = 1000
+        limit: int = 1000,
+        market: str = 'Crypto'
     ) -> Dict[str, Any]:
         """
         Run strategy code and return the 'output' variable defined in code.
@@ -1599,8 +1600,8 @@ class BacktestService:
         tf_seconds = self.TIMEFRAME_SECONDS.get(timeframe, 3600)
         start_date = end_date - timedelta(seconds=tf_seconds * limit)
         
-        # 2. Fetch data (assuming market='crypto', can be optimized later)
-        df = self._fetch_kline_data('crypto', symbol, timeframe, start_date, end_date)
+        # 2. Fetch data
+        df = self._fetch_kline_data(market, symbol, timeframe, start_date, end_date)
         
         if df.empty:
             return {"error": "No data found"}

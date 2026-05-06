@@ -401,6 +401,7 @@ export default {
     presetPrice: { type: Number, default: 0 },
     source: { type: String, default: 'manual' }, // ai_radar / ai_analysis / indicator / manual
     marketType: { type: String, default: 'swap' }, // swap / spot
+    market: { type: String, default: 'Crypto' }, // Crypto / Stock / Futures — market category for price API
     embedded: { type: Boolean, default: false },
     /** 指标 IDE 右侧浮动面板：更紧凑的分区与卡片样式 */
     embeddedIde: { type: Boolean, default: false }
@@ -668,7 +669,7 @@ export default {
       this.symbolSearchTimer = setTimeout(async () => {
         this.symbolSearching = true
         try {
-          const res = await searchSymbols({ market: 'Crypto', keyword: value.trim(), limit: 20 })
+          const res = await searchSymbols({ market: this.market, keyword: value.trim(), limit: 20 })
           if (res && res.code === 1 && res.data) {
             this.symbolSuggestions = (res.data.items || res.data || []).map(item => ({
               value: item.symbol || '',
@@ -710,7 +711,7 @@ export default {
           url: '/api/market/price',
           method: 'get',
           params: {
-            market: 'Crypto',
+            market: this.market,
             symbol: this.currentSymbol
           }
         })

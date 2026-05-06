@@ -1,20 +1,40 @@
 """
-中国A股数据源 — Coordinator 统一调度 + DB 行情缓存
+中国A股数据源
 
-架构:
-  get_ticker()  → Coordinator race 模式（并发，第一个成功的返回）
-  get_kline()   → DB 优先 + 远程补充，数据流:
-    上游取K线 ← cn_stock接口 ← kline_clean填充 ← 补充数据 ← db_market取数据
+═══════════════════════════════════════════════════════════════
+  核心设计: get_ticker 负责"取"，get_kline 负责"发"
+═══════════════════════════════════════════════════════════════
 
-补充数据策略（db 只存 15m / 1D）:
-  - db 无数据或缺 >1 交易日 → 远程全量拉取，能补则补，无法补放弃
-  - 缺当日 → 远程 15m 聚合（最大 200 只股全量内存缓冲）+ 实时行情比对
-    只在成交量上有误差，15 分钟内不重复取
-  - 实时行情惰性比对缓存（记录最高价、最低价、现价，有成交量就记录）
+职责分离:
+  get_ticker()  → 只管从远程取实时行情，取到后写入 ticker 缓存
+  get_kline()   → 只管组装 K 线数据返回给调用方
 
-批量模式优化:
-  - 先批量查 DB，命中直接返回
-  - 未命中的走远程批量拉取 + 回填 DB
+DB 策略:
+  - DB 只存 15m 基线数据（唯一需要持久化的周期）
+  - 其余周期（1D/30m/1h/1W/1M）全部从 15m 实时聚合，不单独存
+  - 1m/5m 不走 DB，直接远程
+
+盘中 vs 盘后（关键设计）:
+  ┌─────────┬──────────────────────────────────────────────────────┐
+  │ 盘中     │ 9:15-15:00 交易时段                                  │
+  │         │ 1. 强制远程拉取当日 15m 全量，覆盖 DB 中当日部分       │
+  │         │ 2. ticker 缓存被动补充最后一根 bar 的实时数据         │
+  │         │    （15 分钟间隔内有误差，但够用）                    │
+  │         │ 3. 日线/30m/1h 等从已刷新的 15m 聚合，天然包含最新   │
+  ├─────────┼──────────────────────────────────────────────────────┤
+  │ 盘后     │ 15:15 之后，最后一次 15m 更新完成后                   │
+  │         │ 直接读 DB，不折腾。误差交给校准程序处理。              │
+  └─────────┴──────────────────────────────────────────────────────┘
+
+为什么不"先出后进"（DB 有旧数据就直接返回）:
+  盘中时 DB 里的当日 15m 是过时快照——最后一根 bar 可能还在走。
+  如果直接返回 DB，调用方拿到的是 15 分钟前的数据。
+  所以盘中必须先拿远程数据覆盖当日部分，再返回。
+
+ticker 缓存的作用:
+  远程 15m 数据最多 15 分钟更新一次，但 ticker 是实时的。
+  在一根 15m bar 还没结束时，ticker 能提供 high/low/close 的实时值。
+  这是"最后一公里"的补充，精度有限但延迟最低。
 """
 
 from __future__ import annotations
@@ -36,8 +56,8 @@ logger = get_logger(__name__)
 
 _TZ_CN = timezone(timedelta(hours=8))
 
-# 实时行情惰性缓存刷新间隔（秒）
-_QUOTE_CACHE_TTL = 900  # 15 分钟
+# ticker 缓存最大条目数。每条约 40 字节，1000 条 ≈ 40KB。
+_CACHE_MAX_ENTRIES = 1000
 
 
 # ================================================================
@@ -45,7 +65,7 @@ _QUOTE_CACHE_TTL = 900  # 15 分钟
 # ================================================================
 
 def _strip_cn_prefix(code: str) -> str:
-    """去掉 A 股代码的市场前缀，返回纯 6 位数字。"""
+    """去掉 A 股代码的市场前缀（SH/SZ/BJ），返回纯 6 位数字。"""
     s = (code or "").strip()
     if len(s) > 6 and s[:2].upper() in ("SH", "SZ", "BJ"):
         return s[2:]
@@ -53,7 +73,7 @@ def _strip_cn_prefix(code: str) -> str:
 
 
 def _dt_to_ts(dt) -> int:
-    """db_market 返回的 datetime → Unix 时间戳（秒），兼容 naive/aware。"""
+    """db_market 返回的 datetime → Unix 时间戳（秒）。兼容 naive/aware。"""
     if isinstance(dt, (int, float)):
         return int(dt)
     if isinstance(dt, datetime):
@@ -64,13 +84,16 @@ def _dt_to_ts(dt) -> int:
 
 
 def _is_market_hours() -> bool:
-    """判断当前是否为 A 股交易时段（含集合竞价 9:15-9:30、午休 11:30-13:00）。"""
+    """判断当前是否为 A 股交易时段。
+
+    范围: 9:15（集合竞价开始）~ 15:00（收盘）。
+    午休 11:30-13:00 也算，因为这段时间数据仍有参考价值。
+    """
     from app.utils.trading_calendar import is_trading_day_today
     if not is_trading_day_today():
         return False
     now = datetime.now(_TZ_CN)
     t = now.time()
-    # 9:15 ~ 15:00 都算（含集合竞价和午休，数据仍有参考价值）
     return dt_time(9, 15) <= t <= dt_time(15, 0)
 
 
@@ -79,6 +102,7 @@ def _today_str() -> str:
 
 
 def _today_ts() -> int:
+    """今天 00:00 的 Unix 时间戳（秒）。用于过滤"当日 bar"。"""
     dt = datetime.strptime(_today_str(), "%Y-%m-%d")
     return int(dt.replace(tzinfo=_TZ_CN).timestamp())
 
@@ -97,31 +121,64 @@ def _latest_trading_day_ts() -> int:
     try:
         return _day_ts(prev_trading_day())
     except Exception:
-        # 交易日历不可用时降级为今天
         return _today_ts()
 
 
 # ================================================================
 # 实时行情惰性比对缓存
 # ================================================================
+#
+# 每只股票一个缓存行，存三样东西:
+#   1. ticker 实时数据（high/low/price/volume）— 惰性更新
+#   2. 最后一根远端 15m bar 的结束时间（remote_ts）— 用于判断是否需要刷新
+#   3. 远端数据的时间戳（ts）— 写入时间
+#
+# 刷新逻辑（纯惰性，无后台线程）:
+#   - get_ticker 被调 → 写入 ticker 数据
+#   - get_kline 被调 → 检查 remote_ts，过期则调 _refresh_today_15m
+#   - 远端 15m bar 的结束时间 = bar.time + 900 秒
+#   - 当前时间 > remote_ts → 说明当前窗口有新数据可拉，标记过期
+#
+# "惰性"的含义:
+#   不是每次都覆盖，而是只往极端方向写——
+#   high 只往更高走，low 只往更低走，price 始终取最新。
+#   这样即使 ticker 短暂波动，也不会丢失已观测到的极端值。
+#
 
 class _QuoteCacheEntry:
-    """单只股票的惰性行情缓存条目。"""
-    __slots__ = ('high', 'low', 'price', 'volume', 'ts')
+    """单只股票的惰性行情缓存条目。
+
+    每个 entry 对应一只股票，包含:
+    - ticker 实时数据（high/low/price/volume）
+    - 最后一根远端 15m bar 的结束时间（remote_ts）
+    """
+    __slots__ = ('high', 'low', 'price', 'volume', 'remote_ts', 'ts')
 
     def __init__(self):
         self.high: float = 0.0
         self.low: float = 0.0
         self.price: float = 0.0
         self.volume: float = 0.0
-        self.ts: float = 0.0
+        self.remote_ts: float = 0.0  # 最后一根远端 15m bar 的结束时间（bar.time + 900）
+        self.ts: float = 0.0         # 写入时间
 
     @property
-    def is_valid(self) -> bool:
-        return self.price > 0 and (time.time() - self.ts) < _QUOTE_CACHE_TTL
+    def is_remote_outdated(self) -> bool:
+        """远端 15m 数据是否过期（当前窗口有新数据可拉）。
+
+        判断逻辑: 当前时间 > 最后一根远端 bar 的结束时间。
+        remote_ts 是远端返回的 bar.time + 900 秒，不是本地更新时间。
+        """
+        if self.remote_ts <= 0:
+            return True  # 从未拉过远端数据
+        return time.time() > self.remote_ts
 
     def update_from_ticker(self, ticker: Dict[str, Any]):
-        """从 ticker 数据更新缓存（惰性: 只往极端方向写）。"""
+        """从 ticker 数据更新缓存（惰性: 只往极端方向写）。
+
+        只更新 ticker 字段，不动 remote_ts。
+        remote_ts 只由 _refresh_today_15m 更新。
+        """
         last = float(ticker.get('last', 0) or 0)
         if last <= 0:
             return
@@ -130,8 +187,8 @@ class _QuoteCacheEntry:
         low = float(ticker.get('low', 0) or 0)
         vol = float(ticker.get('volume', 0) or ticker.get('baseVolume', 0) or 0)
 
-        # 首次填充或缓存过期
-        if self.price <= 0 or (now - self.ts) >= _QUOTE_CACHE_TTL:
+        # 首次填充 → 直接覆盖
+        if self.price <= 0:
             self.high = max(high, last) if high > 0 else last
             self.low = min(low, last) if low > 0 else last
             self.price = last
@@ -139,45 +196,72 @@ class _QuoteCacheEntry:
             self.ts = now
             return
 
-        # 惰性更新: 只往极端方向写
+        # 惰性更新: high/low 只往极端方向写，price 始终取最新
         if high > self.high:
             self.high = high
         if low > 0 and (self.low <= 0 or low < self.low):
             self.low = low
-        self.price = last  # 现价始终取最新
+        self.price = last
         if vol > 0:
             self.volume = vol
         self.ts = now
 
+    def reset_ticker(self):
+        """重置 ticker 字段（进入新 15m 窗口时调用）。
+
+        技巧: 新窗口开始时，旧的 ticker high/low 属于上一个窗口，
+        必须清掉，否则会跟新窗口的数据混在一起。
+        只清 ticker 字段，remote_ts 不动。
+        """
+        self.high = 0.0
+        self.low = 0.0
+        self.price = 0.0
+        self.volume = 0.0
+        self.ts = 0.0
+
 
 class RealtimeQuoteCache:
-    """全局实时行情惰性比对缓存（线程安全）。"""
+    """全局 ticker 缓存（线程安全）。
+
+    key 是纯 6 位数字代码（如 "600000"），不含市场前缀。
+    由 get_ticker() 写入，由 get_kline() 的 _apply_ticker_to_last_bar() 读取。
+
+    容量: 最多 _CACHE_MAX_ENTRIES 条，满时淘汰 remote_ts 最老的（最久没更新远端数据的）。
+    """
 
     def __init__(self):
         self._lock = threading.Lock()
         self._entries: Dict[str, _QuoteCacheEntry] = {}
 
+    def _evict_if_full(self):
+        """容量满时淘汰 remote_ts 最老的条目。调用方需持锁。"""
+        if len(self._entries) < _CACHE_MAX_ENTRIES:
+            return
+        # 找 remote_ts 最小的（最久没拉过远端数据的）
+        oldest_key = min(self._entries, key=lambda k: self._entries[k].remote_ts or float('inf'))
+        del self._entries[oldest_key]
+
     def _put(self, symbol: str, result: Dict[str, Any]):
-        """将 ticker 结果写入缓存（内部方法）。"""
+        """将 ticker 结果写入缓存。由 get_ticker / _get_tickers 调用。"""
         raw = _strip_cn_prefix(symbol)
         if not result or float(result.get('last', 0) or 0) <= 0:
             return
         with self._lock:
             entry = self._entries.get(raw)
             if entry is None:
+                self._evict_if_full()
                 entry = _QuoteCacheEntry()
                 self._entries[raw] = entry
             entry.update_from_ticker(result)
 
     def get_or_fetch(self, symbol: str, ds: 'CNStockDataSource') -> Optional[_QuoteCacheEntry]:
-        """获取缓存行情，过期则惰性刷新。"""
+        """获取缓存行情，远端过期则惰性刷新（锁外取远程，避免持锁阻塞）。"""
         raw = _strip_cn_prefix(symbol)
         with self._lock:
             entry = self._entries.get(raw)
-            if entry and entry.is_valid:
+            if entry and not entry.is_remote_outdated:
                 return entry
 
-        # 缓存失效，远程取（锁外）
         try:
             ticker = ds.get_ticker(raw)
             if not ticker or float(ticker.get('last', 0) or 0) <= 0:
@@ -188,13 +272,14 @@ class RealtimeQuoteCache:
         with self._lock:
             entry = self._entries.get(raw)
             if entry is None:
+                self._evict_if_full()
                 entry = _QuoteCacheEntry()
                 self._entries[raw] = entry
             entry.update_from_ticker(ticker)
             return entry
 
     def batch_fetch(self, symbols: List[str], ds: 'CNStockDataSource') -> Dict[str, _QuoteCacheEntry]:
-        """批量获取/刷新行情缓存（一次 batch_quote 调用覆盖多只）。"""
+        """批量获取/刷新行情缓存。一次 batch_quote HTTP 调用覆盖多只。"""
         need_refresh: List[str] = []
         result: Dict[str, _QuoteCacheEntry] = {}
 
@@ -202,7 +287,7 @@ class RealtimeQuoteCache:
             for sym in symbols:
                 raw = _strip_cn_prefix(sym)
                 entry = self._entries.get(raw)
-                if entry and entry.is_valid:
+                if entry and not entry.is_remote_outdated:
                     result[raw] = entry
                 else:
                     need_refresh.append(raw)
@@ -210,7 +295,6 @@ class RealtimeQuoteCache:
         if not need_refresh:
             return result
 
-        # 批量取行情（一次 HTTP）
         try:
             tickers = ds._get_tickers(need_refresh)
         except Exception:
@@ -223,6 +307,7 @@ class RealtimeQuoteCache:
                     continue
                 entry = self._entries.get(raw)
                 if entry is None:
+                    self._evict_if_full()
                     entry = _QuoteCacheEntry()
                     self._entries[raw] = entry
                 entry.update_from_ticker(ticker)
@@ -236,7 +321,14 @@ class RealtimeQuoteCache:
 # ================================================================
 
 class DBKlineBridge:
-    """DB 行情桥接层 — 封装 db_market.py 的读写逻辑。"""
+    """DB 行情桥接层 — 封装 db_market.py 的读写逻辑。
+
+    核心职责:
+    1. 盘中强制刷新当日 15m（_refresh_today_15m）
+    2. ticker 补充最后一根 bar（_apply_ticker_to_last_bar）
+    3. 所有非 15m 周期从 15m 聚合
+    4. 远程数据回填 DB（只存 15m）
+    """
 
     def __init__(self, ds: 'CNStockDataSource'):
         self._ds = ds
@@ -244,10 +336,10 @@ class DBKlineBridge:
         self._writer = None
         self._quote_cache = RealtimeQuoteCache()
         self._init_lock = threading.Lock()
-        self._init_attempted = False  # 避免反复尝试失败的初始化
+        self._init_attempted = False
 
     def _ensure_init(self):
-        """惰性初始化 db_market 实例（只尝试一次）。"""
+        """惰性初始化 db_market（只尝试一次，失败后不再重试）。"""
         if self._init_attempted:
             return
         with self._init_lock:
@@ -269,7 +361,9 @@ class DBKlineBridge:
         self._ensure_init()
         return self._writer is not None
 
-    # ── 单只: DB 优先取 K 线 ──
+    # ────────────────────────────────────────────────────────────
+    # 主入口: get_kline / get_kline_batch
+    # ────────────────────────────────────────────────────────────
 
     def get_kline(
         self,
@@ -279,20 +373,26 @@ class DBKlineBridge:
         before_time: Optional[int] = None,
         after_time: Optional[int] = None
     ) -> List[Dict[str, Any]]:
-        """DB 优先取 K 线，自动补充缺失数据。
+        """取 K 线数据。
 
         周期路由:
-          1m / 5m     → 直接走远端（DB 不存）
-          15m / 1D    → DB 直接读取
-          30m~4h      → DB 从 15m 聚合
-          1W / 1M     → DB 从 1D 聚合
+          1m / 5m → 直接远程（DB 不存低周期）
+          15m     → DB + 盘中远程覆盖 + ticker 补充
+          1D      → 从 15m 聚合（每天约 16 根 15m bar）
+          30m~4h  → 从 15m 聚合
+          1W / 1M → 15m → 日 → 周/月，两级聚合
+
+        盘中 vs 盘后:
+          盘中 → 先 _refresh_today_15m 覆盖当日 DB，再读 DB，再 ticker 补充
+          盘后 → 直接读 DB（最后一次 15m 更新约在 15:15 完成）
         """
         adj = "qfq"
         raw = _strip_cn_prefix(symbol)
         tf = normalize_chart_timeframe(timeframe)
         lim = max(int(limit or 300), 1)
+        in_trading = _is_market_hours()  # 算一次，后面复用
 
-        # ── 1m/5m 不走 DB，直接远端 ──
+        # 低周期直接远程，不走 DB
         if tf in ("1m", "5m"):
             return self._ds._get_kline_remote(
                 raw, tf, lim, before_time, after_time, adj
@@ -303,14 +403,26 @@ class DBKlineBridge:
                 raw, tf, lim, before_time, after_time, adj
             )
 
-        # ── 第一步: 从 DB 取数据 ──
+        # ── 盘中: 远端 15m 过期则刷新 ──
+        # 技巧: 用缓存行的 remote_ts 判断是否需要刷新，不是每次 get_kline 都拉。
+        # remote_ts 是远端最后一根 bar 的结束时间（bar.time + 900），
+        # 当前时间 > remote_ts 说明当前窗口有新数据可拉。
+        if in_trading:
+            with self._quote_cache._lock:
+                entry = self._quote_cache._entries.get(raw)
+                need_refresh = entry is None or entry.is_remote_outdated
+            if need_refresh:
+                self._refresh_today_15m(raw)
+
+        # ── 从 DB 取数据 ──
         db_bars = self._fetch_from_db(raw, tf, lim)
 
         if db_bars:
-            # ── 第二步: kline_clean 填充中间缺失 ──
             cleaned = clean_klines(db_bars, tf)
 
-            # 不再需要 _fill_today_if_needed — 1D 已从 15m 实时聚合，天然包含当日数据
+            # 盘中 15m: ticker 补充最后一根 bar
+            if tf == "15m" and in_trading:
+                self._apply_ticker_to_last_bar(raw, cleaned)
 
             out = self._ds.filter_and_limit(
                 cleaned, limit=lim, before_time=before_time,
@@ -320,10 +432,8 @@ class DBKlineBridge:
                 logger.info(f"[DB桥接] {raw} tf={tf} DB命中 bars={len(out)}")
                 return out
 
-        # ── DB 无数据 → 远程全量拉取 ──
+        # ── DB 无数据（历史首次查询）→ 远程全量拉取 ──
         return self._remote_with_backfill(raw, tf, lim, before_time, after_time, adj)
-
-    # ── 批量: 分类优化 ──
 
     def get_kline_batch(
         self,
@@ -333,32 +443,42 @@ class DBKlineBridge:
         before_time: Optional[int] = None,
         after_time: Optional[int] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
-        """批量取 K 线 — 先批量查 DB，未命中的再走远程。"""
+        """批量取 K 线。逻辑与单只一致，盘中按 remote_ts 刷新、盘后直接读 DB。"""
         if not symbols:
             return {}
 
         tf = normalize_chart_timeframe(timeframe)
         lim = max(int(limit or 300), 1)
         adj = "qfq"
+        in_trading = _is_market_hours()
 
-        # ── 1m/5m 不走 DB，直接远端 ──
         if tf in ("1m", "5m"):
             return self._ds._get_klines_remote(symbols, tf, lim, adj)
 
         if not self.available:
             return self._ds._get_klines_remote(symbols, tf, lim, adj)
 
+        # 盘中: 按 remote_ts 判断哪些需要刷新（不重复拉已刷新的）
+        if in_trading:
+            for sym in symbols:
+                raw = _strip_cn_prefix(sym)
+                with self._quote_cache._lock:
+                    entry = self._quote_cache._entries.get(raw)
+                    need_refresh = entry is None or entry.is_remote_outdated
+                if need_refresh:
+                    self._refresh_today_15m(raw)
+
         result: Dict[str, List[Dict[str, Any]]] = {}
         need_remote: List[str] = []
 
-        # ── 第一步: 批量查 DB ──
         for sym in symbols:
             raw = _strip_cn_prefix(sym)
             db_bars = self._fetch_from_db(raw, tf, lim)
 
             if db_bars:
                 cleaned = clean_klines(db_bars, tf)
-                # 1D 已从 15m 聚合，无需 _fill_today_if_needed
+                if tf == "15m" and in_trading:
+                    self._apply_ticker_to_last_bar(raw, cleaned)
                 out = self._ds.filter_and_limit(
                     cleaned, limit=lim, before_time=before_time,
                     after_time=after_time, truncate=(after_time is None),
@@ -369,49 +489,148 @@ class DBKlineBridge:
 
             need_remote.append(raw)
 
-        # ── 第二步: 未命中的走远程（批量） ──
         if need_remote:
-            remote_results = self._ds._get_klines_remote(
-                need_remote, tf, lim, adj
-            )
+            remote_results = self._ds._get_klines_remote(need_remote, tf, lim, adj)
             for raw, bars in remote_results.items():
                 self._backfill_db(raw, tf, bars)
-                # 1D 已从 15m 聚合，无需 _fill_today_if_needed
                 out = self._ds.filter_and_limit(
                     bars, limit=lim, before_time=before_time,
                     after_time=after_time, truncate=(after_time is None),
                 )
                 result[raw] = out
-
-        if need_remote:
             logger.info(
                 f"[DB桥接批量] tf={tf} 总={len(symbols)} "
-                f"DB命中={len(result) - len(need_remote)} "
-                f"远程补充={len(need_remote)}"
+                f"DB命中={len(result) - len(need_remote)} 远程={len(need_remote)}"
             )
+
         return result
 
-    # ── DB 读取 ──
+    # ────────────────────────────────────────────────────────────
+    # 盘中刷新: _refresh_today_15m + _apply_ticker_to_last_bar
+    # ────────────────────────────────────────────────────────────
+
+    def _refresh_today_15m(self, raw: str):
+        """盘中: 从远程拉取当日 15m 全量，覆盖 DB 中当日部分。
+
+        刷新后更新缓存行的 remote_ts（远端最后一根 bar 的结束时间）。
+        下次 get_kline 检查 remote_ts，未过期就不再拉。
+        """
+        today_start = _today_ts()
+        try:
+            remote_bars = self._ds._get_kline_remote(raw, "15m", 200, adj="qfq")
+        except Exception as e:
+            logger.debug(f"[盘中刷新] 远程拉取失败 {raw}: {e}")
+            return
+
+        if not remote_bars:
+            return
+
+        # 只取当日的 bar，过滤掉历史数据
+        today_bars = [b for b in remote_bars if b.get("time", 0) >= today_start]
+        if not today_bars:
+            return
+
+        today_bars.sort(key=lambda b: b["time"])
+
+        # 覆盖 DB 中当日部分
+        self._backfill_db(raw, "15m", today_bars)
+
+        # 更新缓存行: remote_ts = 最后一根 bar 的结束时间
+        # 技巧: 用 bar.time + 900 作为过期判断依据。
+        # 当前时间 > remote_ts 时，说明当前 15m 窗口有新数据可拉。
+        last_bar_ts = today_bars[-1].get("time", 0)
+        new_remote_ts = last_bar_ts + 900
+
+        with self._quote_cache._lock:
+            entry = self._quote_cache._entries.get(raw)
+            if entry is None:
+                self._quote_cache._evict_if_full()
+                entry = _QuoteCacheEntry()
+                self._quote_cache._entries[raw] = entry
+
+            # 进入新 15m 窗口时，旧的 ticker high/low 属于上一个窗口，必须清掉
+            if entry.remote_ts > 0 and new_remote_ts > entry.remote_ts:
+                # 新窗口开始，重置 ticker 字段
+                entry.reset_ticker()
+
+            entry.remote_ts = new_remote_ts
+
+        logger.debug(
+            f"[盘中刷新] {raw} 当日 15m 覆盖 {len(today_bars)} 根, "
+            f"remote_ts={new_remote_ts}"
+        )
+
+    def _apply_ticker_to_last_bar(self, raw: str, bars: List[Dict[str, Any]]):
+        """盘中: 用 ticker 缓存补充最后一根 15m bar 的实时数据。
+
+        场景: 一根 15m bar 还没结束（比如 10:00-10:15 这根，现在是 10:08），
+        远程 15m 数据里这根 bar 的 close 是 10:00 的价格，
+        但 ticker 有 10:08 的实时价格。用 ticker 补上。
+
+        技巧: 需要判断最后一根 bar 是否属于"当前 15 分钟窗口"。
+        - 属于当前窗口 → 用 ticker 更新 high/low/close/volume
+        - 不属于（ticker 已进入新窗口但远程还没返回新 bar）→ 追加一根新 bar
+          这根新 bar 的 open=close=price，后续远程数据会覆盖它。
+
+        ticker 有效性: 只看 price > 0（有没有写入过），不设 TTL。
+        因为 remote_ts 已经控制了远端刷新频率，ticker 数据在 15m 窗口内不会过期。
+        """
+        if not bars:
+            return
+
+        with self._quote_cache._lock:
+            entry = self._quote_cache._entries.get(raw)
+            if not entry or entry.price <= 0:
+                return
+
+            last_bar = bars[-1]
+            bar_ts = last_bar.get("time", 0)
+
+            # 当前 15 分钟窗口的起始时间（向下取整到 900 秒）
+            now_ts = int(time.time())
+            current_window_start = (now_ts // 900) * 900
+
+            if bar_ts < current_window_start:
+                # 最后一根 bar 是上一个窗口的，ticker 已经进入新窗口
+                # → 追加一根临时 bar，等下次 _refresh_today_15m 会被远程数据覆盖
+                bars.append({
+                    "time": current_window_start,
+                    "open": entry.price,
+                    "high": entry.high,
+                    "low": entry.low,
+                    "close": entry.price,
+                    "volume": entry.volume,
+                })
+            else:
+                # 最后一根 bar 就是当前窗口 → 用 ticker 补充实时值
+                if entry.high > last_bar.get("high", 0):
+                    last_bar["high"] = round(entry.high, 4)
+                if entry.low > 0 and (last_bar.get("low", 0) <= 0 or entry.low < last_bar["low"]):
+                    last_bar["low"] = round(entry.low, 4)
+                last_bar["close"] = round(entry.price, 4)
+                if entry.volume > 0:
+                    last_bar["volume"] = round(entry.volume, 2)
+
+    # ────────────────────────────────────────────────────────────
+    # DB 读取 + 周期聚合
+    # ────────────────────────────────────────────────────────────
 
     def _fetch_from_db(self, raw: str, tf: str, limit: int) -> List[Dict[str, Any]]:
-        """从 db_market 查询 K 线数据，统一转为 {time: int, ...} 格式。
+        """从 db_market 读取 K 线，统一转为 {time: int, ...} 格式。
 
-        周期路由 (调用方已排除 1m/5m):
-          15m         → 直接查询（唯一基线数据）
-          1D / 30m~4h → 从 15m 聚合
-          1W / 1M     → 从 15m 聚合（取更多 15m bar 再按日/周/月分组）
+        技巧: DB 只存 15m，其余周期通过 aggregate/query 读 15m 后在内存中聚合。
+        这样只需要维护一张 15m 表，所有周期都能从它派生。
         """
         try:
             if tf == "15m":
                 rows = self._writer.query("CNStock", raw, "15m", limit=limit)
             elif tf == "1D":
-                # 日线从 15m 聚合，不再单独存 1D
-                # 每天约 16 根 15m bar，取 limit*16+冗余
+                # 日线从 15m 聚合。每天约 16 根 15m bar，多取一些保证够用
                 rows = self._writer.aggregate("CNStock", raw, "15m", limit=limit * 16 + 50)
             elif tf in ("30m", "1h", "2h", "4h"):
                 rows = self._writer.aggregate("CNStock", raw, "15m", limit=limit)
             else:
-                # 1W / 1M → 从 15m 聚合（先聚到日，再聚到周/月）
+                # 1W / 1M → 先读足够多的 15m bar，后续聚到日再聚到周/月
                 rows = self._writer.aggregate("CNStock", raw, "15m", limit=limit * 16 + 200)
         except Exception as e:
             logger.debug(f"[DB桥接] DB查询异常 {raw} tf={tf}: {e}")
@@ -435,7 +654,7 @@ class DBKlineBridge:
             })
         bars.sort(key=lambda b: b["time"])
 
-        # 1D / 1W / 1M 需要二次聚合（15m → 日 → 周/月）
+        # 1D / 1W / 1M 需要二次聚合
         if tf == "1D":
             return self._aggregate_15m_to_daily(bars, limit)
         elif tf in ("1W", "1M"):
@@ -446,11 +665,9 @@ class DBKlineBridge:
                 return self._aggregate_daily_to_monthly(daily, limit)
         return bars
 
-    # ── 15m → 日/周/月 聚合 ──
-
     @staticmethod
     def _aggregate_15m_to_daily(bars: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
-        """将 15m K 线按交易日聚合为日线。"""
+        """15m → 日线。按北京时间日期分组，OHLCV 合并。"""
         if not bars:
             return []
         groups: Dict[int, List[Dict]] = {}
@@ -459,7 +676,6 @@ class DBKlineBridge:
             ts = b.get("time", 0)
             if ts <= 0:
                 continue
-            # 按北京时间日期分组
             day_ts = int(datetime.fromtimestamp(ts, tz=_TZ_CN).replace(
                 hour=0, minute=0, second=0, microsecond=0
             ).timestamp())
@@ -484,7 +700,7 @@ class DBKlineBridge:
 
     @staticmethod
     def _aggregate_daily_to_weekly(daily_bars: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
-        """将日线按 ISO 周聚合为周线。"""
+        """日线 → 周线。按 ISO 周（年, 周号）分组。"""
         if not daily_bars:
             return []
         groups: Dict[tuple, List[Dict]] = {}
@@ -494,7 +710,7 @@ class DBKlineBridge:
             if ts <= 0:
                 continue
             dt = datetime.fromtimestamp(ts, tz=_TZ_CN)
-            key = dt.isocalendar()[:2]  # (year, week)
+            key = dt.isocalendar()[:2]
             if key not in groups:
                 groups[key] = []
                 order.append(key)
@@ -516,7 +732,7 @@ class DBKlineBridge:
 
     @staticmethod
     def _aggregate_daily_to_monthly(daily_bars: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
-        """将日线按月聚合为月线。"""
+        """日线 → 月线。按年月分组。"""
         if not daily_bars:
             return []
         groups: Dict[int, List[Dict]] = {}
@@ -546,20 +762,20 @@ class DBKlineBridge:
             })
         return result[-limit:] if len(result) > limit else result
 
-    # ── 远程全量拉取 + 回填 DB ──
+    # ────────────────────────────────────────────────────────────
+    # 远程拉取 + DB 回填
+    # ────────────────────────────────────────────────────────────
 
     def _remote_with_backfill(
         self, raw: str, tf: str, limit: int,
         before_time: Optional[int], after_time: Optional[int], adj: str
     ) -> List[Dict[str, Any]]:
-        """DB 无数据 → 远程全量拉取，能补则补回 DB。"""
+        """DB 无数据时的 fallback: 远程全量拉取，能回填 DB 就回填。"""
         remote_bars = self._ds._get_kline_remote(raw, tf, limit, adj=adj)
         if not remote_bars:
             return []
 
         self._backfill_db(raw, tf, remote_bars)
-
-        # 1D 已从 15m 聚合，无需 _fill_today_if_needed
 
         out = self._ds.filter_and_limit(
             remote_bars, limit=limit, before_time=before_time,
@@ -569,7 +785,11 @@ class DBKlineBridge:
         return out
 
     def _backfill_db(self, raw: str, tf: str, bars: List[Dict[str, Any]]):
-        """将远程拉取的 K 线回填到 DB（只存 15m，1D 从 15m 聚合）。"""
+        """将 K 线数据写入 DB。只存 15m，其余周期不存。
+
+        技巧: 用 upsert（按 time 去重），不是 insert。
+        盘中刷新时会反复覆盖当日的 15m bar，upsert 保证不会重复插入。
+        """
         if tf != "15m":
             return
 
@@ -606,7 +826,12 @@ class DBKlineBridge:
 # ================================================================
 
 class CNStockDataSource(BaseDataSource):
-    """A股数据源 — Coordinator 动态队列 + 自动源发现 + DB 行情缓存"""
+    """A股数据源。
+
+    职责分离:
+      get_ticker → 只管取行情，取到后写入 ticker 缓存
+      get_kline  → 只管组装 K 线，盘中刷新 + ticker 补充 + 聚合
+    """
 
     name = "CNStock/multi-source"
 
@@ -614,12 +839,10 @@ class CNStockDataSource(BaseDataSource):
         self.circuit_breaker = get_realtime_circuit_breaker()
         self._db_bridge = DBKlineBridge(self)
 
-    # ----------------------------------------------------------
-    # 实时行情 / 报价
-    # ----------------------------------------------------------
+    # ── get_ticker: 只负责取行情，取到后写入 ticker 缀存 ──
 
     def get_ticker(self, symbol: str) -> Dict[str, Any]:
-        """获取实时行情（单只/批量）。"""
+        """获取实时行情。取到后自动写入 ticker 缓存供 get_kline 使用。"""
         if ',' in symbol:
             symbols = [s.strip() for s in symbol.split(',') if s.strip()]
             if not symbols:
@@ -638,7 +861,7 @@ class CNStockDataSource(BaseDataSource):
 
         if result:
             result["symbol"] = raw
-            # 写入惰性行情缓存，供 get_kline 补充当日 bar 使用
+            # 写入 ticker 缓存，供 get_kline 的 _apply_ticker_to_last_bar 使用
             self._db_bridge._quote_cache._put(raw, result)
             return result
 
@@ -646,7 +869,7 @@ class CNStockDataSource(BaseDataSource):
         return {"last": 0, "symbol": raw}
 
     def _get_tickers(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
-        """批量获取实时行情（ticker 格式）— 透传 Provider 层 batch_quote 接口。"""
+        """批量获取实时行情。透传 Provider 层 batch_quote 接口，一次 HTTP 取多只。"""
         from app.data_sources.provider import get_providers
         normalized = [normalize_cn_code(s) for s in symbols if s]
         if not normalized:
@@ -662,15 +885,12 @@ class CNStockDataSource(BaseDataSource):
                     raw_key = _strip_cn_prefix(k)
                     if isinstance(v, dict):
                         v["symbol"] = raw_key
-                        # 批量写入惰性行情缓存
                         self._db_bridge._quote_cache._put(raw_key, v)
                     cleaned[raw_key] = v
                 return cleaned
         return {}
 
-    # ----------------------------------------------------------
-    # K线数据 — DB 优先
-    # ----------------------------------------------------------
+    # ── get_kline: 负责发 K 线数据 ──
 
     def get_kline(
         self,
@@ -680,14 +900,8 @@ class CNStockDataSource(BaseDataSource):
         before_time: Optional[int] = None,
         after_time: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """获取 K 线数据（DB 优先）。
-
-        数据流:
-          上游取K线 ← cn_stock接口 ← kline_clean填充 ← 补充数据 ← db_market取数据
-
-        批量模式（逗号分隔）: 先批量查 DB，未命中的再批量走远程。
-        """
-        # ── 批量模式 ──
+        """获取 K 线数据。盘中刷新 + 盘后直读，支持逗号分隔的批量模式。"""
+        # 批量模式
         if ',' in symbol:
             symbols = [s.strip() for s in symbol.split(',') if s.strip()]
             if not symbols:
@@ -695,22 +909,17 @@ class CNStockDataSource(BaseDataSource):
             batch = self._db_bridge.get_kline_batch(
                 symbols, timeframe, limit, before_time, after_time
             )
-            # 合并为统一列表返回（按 symbol 顺序）
             merged = []
             for sym in symbols:
-                raw = _strip_cn_prefix(sym)
-                bars = batch.get(raw, [])
-                merged.extend(bars)
+                merged.extend(batch.get(_strip_cn_prefix(sym), []))
             return merged
 
-        # ── 单只模式 ──
+        # 单只模式
         return self._db_bridge.get_kline(
             symbol, timeframe, limit, before_time, after_time
         )
 
-    # ----------------------------------------------------------
-    # 内部: Coordinator 远程拉取（单只）
-    # ----------------------------------------------------------
+    # ── 远程拉取（Coordinator 调度）──
 
     def _get_kline_remote(
         self,
@@ -721,10 +930,7 @@ class CNStockDataSource(BaseDataSource):
         after_time: Optional[int] = None,
         adj: str = "qfq",
     ) -> List[Dict[str, Any]]:
-        """直接走 Coordinator 远程拉取，不经过 DB 层。
-
-        注意: timeframe 应已由调用方 normalize 过，这里不再重复。
-        """
+        """单只远程拉取。不经过 DB 层，直接走 Coordinator。"""
         code = normalize_cn_code(symbol)
         lim = max(int(limit or 300), 1)
 
@@ -741,7 +947,6 @@ class CNStockDataSource(BaseDataSource):
         bars = coord_results.get(code, [])
         if not bars:
             bars = self._try_aggregate_lower(timeframe, code, lim, adj)
-
         if bars:
             bars = clean_klines(bars, timeframe)
 
@@ -750,10 +955,6 @@ class CNStockDataSource(BaseDataSource):
             after_time=after_time, truncate=(after_time is None),
         )
 
-    # ----------------------------------------------------------
-    # 内部: Coordinator 远程批量拉取
-    # ----------------------------------------------------------
-
     def _get_klines_remote(
         self,
         symbols: List[str],
@@ -761,7 +962,7 @@ class CNStockDataSource(BaseDataSource):
         limit: int,
         adj: str = "qfq",
     ) -> Dict[str, List[Dict[str, Any]]]:
-        """批量走 Coordinator 远程拉取。timeframe 应已 normalize。"""
+        """批量远程拉取。"""
         if not symbols:
             return {}
 
@@ -777,17 +978,14 @@ class CNStockDataSource(BaseDataSource):
 
         result: Dict[str, List[Dict[str, Any]]] = {}
         for sym, bars in coord_results.items():
-            raw = _strip_cn_prefix(sym)
-            result[raw] = clean_klines(bars, timeframe)
+            result[_strip_cn_prefix(sym)] = clean_klines(bars, timeframe)
 
         if failed:
             logger.warning(f"[远程批量] {len(failed)} 只失败: {failed[:5]}...")
 
         return result
 
-    # ----------------------------------------------------------
-    # 内部: 低周期聚合 fallback
-    # ----------------------------------------------------------
+    # ── 低周期聚合 fallback ──
 
     _AGG_FALLBACK = {
         '5m':  ('1m',  5),
@@ -800,7 +998,7 @@ class CNStockDataSource(BaseDataSource):
     def _try_aggregate_lower(
         self, tf: str, code: str, limit: int, adj: str
     ) -> List[Dict[str, Any]]:
-        """从低周期聚合目标周期（fallback）。tf 应已 normalize。"""
+        """当目标周期远程无数据时，尝试从低周期聚合（fallback）。"""
         fallback = self._AGG_FALLBACK.get(tf)
         if not fallback:
             return []
