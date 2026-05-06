@@ -1,17 +1,27 @@
 """
-中国A股数据源 — Coordinator 统一调度
+中国A股数据源 — Coordinator 统一调度 + DB 行情缓存
 
-架构: 
-  get_ticker()      → Coordinator race 模式（并发，第一个成功的返回）
-  get_kline()       → Coordinator 动态队列（单只/批量），自动从 Provider 层发现源
+架构:
+  get_ticker()  → Coordinator race 模式（并发，第一个成功的返回）
+  get_kline()   → DB 优先 + 远程补充，数据流:
+    上游取K线 ← cn_stock接口 ← kline_clean填充 ← 补充数据 ← db_market取数据
 
-数据源:
-  由 Coordinator 从 Provider 层自动发现（@register 注册的所有源），
-  按 kline_priority 排序，支持 preferred_source 指定源。
+补充数据策略（db 只存 15m / 1D）:
+  - db 无数据或缺 >1 交易日 → 远程全量拉取，能补则补，无法补放弃
+  - 缺当日 → 远程 15m 聚合（最大 200 只股全量内存缓冲）+ 实时行情比对
+    只在成交量上有误差，15 分钟内不重复取
+  - 实时行情惰性比对缓存（记录最高价、最低价、现价，有成交量就记录）
+
+批量模式优化:
+  - 先批量查 DB，命中直接返回
+  - 未命中的走远程批量拉取 + 回填 DB
 """
 
 from __future__ import annotations
 
+import threading
+import time
+from datetime import datetime, timedelta, timezone, time as dt_time
 from typing import Any, Dict, List, Optional
 
 from app.data_sources.base import BaseDataSource
@@ -24,21 +34,513 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+_TZ_CN = timezone(timedelta(hours=8))
+
+# 实时行情惰性缓存刷新间隔（秒）
+_QUOTE_CACHE_TTL = 900  # 15 分钟
+
+
+# ================================================================
+# 工具函数
+# ================================================================
 
 def _strip_cn_prefix(code: str) -> str:
-    """
-    去掉 A 股代码的市场前缀，返回纯 6 位数字。
-
-    "SH600519" → "600519"
-    "sh600519" → "600519"
-    "SZ000001" → "000001"
-    "BJ830799" → "830799"
-    "600519"   → "600519"  (无前缀，原样返回)
-    """
+    """去掉 A 股代码的市场前缀，返回纯 6 位数字。"""
     s = (code or "").strip()
     if len(s) > 6 and s[:2].upper() in ("SH", "SZ", "BJ"):
         return s[2:]
     return s
+
+
+def _dt_to_ts(dt) -> int:
+    """db_market 返回的 datetime → Unix 时间戳（秒），兼容 naive/aware。"""
+    if isinstance(dt, (int, float)):
+        return int(dt)
+    if isinstance(dt, datetime):
+        if dt.tzinfo:
+            return int(dt.timestamp())
+        return int(dt.replace(tzinfo=_TZ_CN).timestamp())
+    return 0
+
+
+def _is_market_hours() -> bool:
+    """判断当前是否为 A 股交易时段（含集合竞价 9:15-9:30、午休 11:30-13:00）。"""
+    from app.utils.trading_calendar import is_trading_day_today
+    if not is_trading_day_today():
+        return False
+    now = datetime.now(_TZ_CN)
+    t = now.time()
+    # 9:15 ~ 15:00 都算（含集合竞价和午休，数据仍有参考价值）
+    return dt_time(9, 15) <= t <= dt_time(15, 0)
+
+
+def _is_after_close() -> bool:
+    """判断当前是否已收盘（15:00 之后）。"""
+    from app.utils.trading_calendar import is_trading_day_today
+    if not is_trading_day_today():
+        return False
+    now = datetime.now(_TZ_CN)
+    return now.time() >= dt_time(15, 0)
+
+
+def _today_str() -> str:
+    return datetime.now(_TZ_CN).strftime("%Y-%m-%d")
+
+
+def _today_ts() -> int:
+    dt = datetime.strptime(_today_str(), "%Y-%m-%d")
+    return int(dt.replace(tzinfo=_TZ_CN).timestamp())
+
+
+# ================================================================
+# 实时行情惰性比对缓存
+# ================================================================
+
+class _QuoteCacheEntry:
+    """单只股票的惰性行情缓存条目。"""
+    __slots__ = ('high', 'low', 'price', 'volume', 'ts')
+
+    def __init__(self):
+        self.high: float = 0.0
+        self.low: float = 0.0
+        self.price: float = 0.0
+        self.volume: float = 0.0
+        self.ts: float = 0.0
+
+    @property
+    def is_valid(self) -> bool:
+        return self.price > 0 and (time.time() - self.ts) < _QUOTE_CACHE_TTL
+
+    def update_from_ticker(self, ticker: Dict[str, Any]):
+        """从 ticker 数据更新缓存（惰性: 只往极端方向写）。"""
+        last = float(ticker.get('last', 0) or 0)
+        if last <= 0:
+            return
+        now = time.time()
+        high = float(ticker.get('high', 0) or 0)
+        low = float(ticker.get('low', 0) or 0)
+        vol = float(ticker.get('volume', 0) or ticker.get('baseVolume', 0) or 0)
+
+        # 首次填充或缓存过期
+        if self.price <= 0 or (now - self.ts) >= _QUOTE_CACHE_TTL:
+            self.high = max(high, last) if high > 0 else last
+            self.low = min(low, last) if low > 0 else last
+            self.price = last
+            self.volume = vol
+            self.ts = now
+            return
+
+        # 惰性更新: 只往极端方向写
+        if high > self.high:
+            self.high = high
+        if low > 0 and (self.low <= 0 or low < self.low):
+            self.low = low
+        self.price = last  # 现价始终取最新
+        if vol > 0:
+            self.volume = vol
+        self.ts = now
+
+
+class RealtimeQuoteCache:
+    """全局实时行情惰性比对缓存（线程安全）。"""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._entries: Dict[str, _QuoteCacheEntry] = {}
+
+    def get_or_fetch(self, symbol: str, ds: 'CNStockDataSource') -> Optional[_QuoteCacheEntry]:
+        """获取缓存行情，过期则惰性刷新。"""
+        raw = _strip_cn_prefix(symbol)
+        with self._lock:
+            entry = self._entries.get(raw)
+            if entry and entry.is_valid:
+                return entry
+
+        # 缓存失效，远程取（锁外）
+        try:
+            ticker = ds.get_ticker(raw)
+            if not ticker or float(ticker.get('last', 0) or 0) <= 0:
+                return None
+        except Exception:
+            return None
+
+        with self._lock:
+            entry = self._entries.get(raw)
+            if entry is None:
+                entry = _QuoteCacheEntry()
+                self._entries[raw] = entry
+            entry.update_from_ticker(ticker)
+            return entry
+
+    def batch_fetch(self, symbols: List[str], ds: 'CNStockDataSource') -> Dict[str, _QuoteCacheEntry]:
+        """批量获取/刷新行情缓存（一次 batch_quote 调用覆盖多只）。"""
+        need_refresh: List[str] = []
+        result: Dict[str, _QuoteCacheEntry] = {}
+
+        with self._lock:
+            for sym in symbols:
+                raw = _strip_cn_prefix(sym)
+                entry = self._entries.get(raw)
+                if entry and entry.is_valid:
+                    result[raw] = entry
+                else:
+                    need_refresh.append(raw)
+
+        if not need_refresh:
+            return result
+
+        # 批量取行情（一次 HTTP）
+        try:
+            tickers = ds._get_tickers(need_refresh)
+        except Exception:
+            tickers = {}
+
+        with self._lock:
+            for raw in need_refresh:
+                ticker = tickers.get(raw)
+                if not ticker or float(ticker.get('last', 0) or 0) <= 0:
+                    continue
+                entry = self._entries.get(raw)
+                if entry is None:
+                    entry = _QuoteCacheEntry()
+                    self._entries[raw] = entry
+                entry.update_from_ticker(ticker)
+                result[raw] = entry
+
+        return result
+
+
+# ================================================================
+# DB 行情桥接层
+# ================================================================
+
+class DBKlineBridge:
+    """DB 行情桥接层 — 封装 db_market.py 的读写逻辑。"""
+
+    def __init__(self, ds: 'CNStockDataSource'):
+        self._ds = ds
+        self._mgr = None
+        self._writer = None
+        self._quote_cache = RealtimeQuoteCache()
+        self._init_lock = threading.Lock()
+        self._init_attempted = False  # 避免反复尝试失败的初始化
+
+    def _ensure_init(self):
+        """惰性初始化 db_market 实例（只尝试一次）。"""
+        if self._init_attempted:
+            return
+        with self._init_lock:
+            if self._init_attempted:
+                return
+            self._init_attempted = True
+            try:
+                from app.utils.db_market import get_market_db_manager, get_market_kline_writer
+                self._mgr = get_market_db_manager()
+                self._mgr.ensure_market_db("CNStock")
+                self._writer = get_market_kline_writer()
+            except Exception as e:
+                logger.warning(f"[DB桥接] 初始化失败，降级为纯远程: {e}")
+                self._mgr = None
+                self._writer = None
+
+    @property
+    def available(self) -> bool:
+        self._ensure_init()
+        return self._writer is not None
+
+    # ── 单只: DB 优先取 K 线 ──
+
+    def get_kline(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int,
+        before_time: Optional[int] = None,
+        after_time: Optional[int] = None,
+        adj: str = "qfq",
+    ) -> List[Dict[str, Any]]:
+        """DB 优先取 K 线，自动补充缺失数据。"""
+        if not self.available:
+            return self._ds._get_kline_remote(symbol, timeframe, limit,
+                                               before_time, after_time, adj)
+
+        raw = _strip_cn_prefix(symbol)
+        tf = normalize_chart_timeframe(timeframe)
+        lim = max(int(limit or 300), 1)
+
+        # ── 第一步: 从 DB 取数据 ──
+        db_bars = self._fetch_from_db(raw, tf, lim)
+
+        if db_bars:
+            # ── 第二步: kline_clean 填充中间缺失 ──
+            cleaned = clean_klines(db_bars, tf)
+
+            # ── 第三步: 补充当日缺失（仅日线） ──
+            if tf == "1D":
+                cleaned = self._fill_today_if_needed(raw, cleaned, adj)
+
+            out = self._ds.filter_and_limit(
+                cleaned, limit=lim, before_time=before_time,
+                after_time=after_time, truncate=(after_time is None),
+            )
+            if out:
+                logger.info(f"[DB桥接] {raw} tf={tf} DB命中 bars={len(out)}")
+                return out
+
+        # ── DB 无数据 → 远程全量拉取 ──
+        return self._remote_with_backfill(raw, tf, lim, before_time, after_time, adj)
+
+    # ── 批量: 分类优化 ──
+
+    def get_kline_batch(
+        self,
+        symbols: List[str],
+        timeframe: str,
+        limit: int,
+        before_time: Optional[int] = None,
+        after_time: Optional[int] = None,
+        adj: str = "qfq",
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """批量取 K 线 — 先批量查 DB，未命中的再走远程。"""
+        if not symbols:
+            return {}
+
+        tf = normalize_chart_timeframe(timeframe)
+        lim = max(int(limit or 300), 1)
+
+        if not self.available:
+            return self._ds._get_klines_remote(symbols, tf, lim, adj)
+
+        result: Dict[str, List[Dict[str, Any]]] = {}
+        need_remote: List[str] = []
+
+        # ── 第一步: 批量查 DB ──
+        for sym in symbols:
+            raw = _strip_cn_prefix(sym)
+            db_bars = self._fetch_from_db(raw, tf, lim)
+
+            if db_bars:
+                cleaned = clean_klines(db_bars, tf)
+                if tf == "1D":
+                    cleaned = self._fill_today_if_needed(raw, cleaned, adj)
+                out = self._ds.filter_and_limit(
+                    cleaned, limit=lim, before_time=before_time,
+                    after_time=after_time, truncate=(after_time is None),
+                )
+                if out:
+                    result[raw] = out
+                    continue
+
+            need_remote.append(raw)
+
+        # ── 第二步: 未命中的走远程（批量） ──
+        if need_remote:
+            remote_results = self._ds._get_klines_remote(
+                need_remote, tf, lim, adj
+            )
+            for raw, bars in remote_results.items():
+                self._backfill_db(raw, tf, bars)
+                if tf == "1D":
+                    bars = self._fill_today_if_needed(raw, bars, adj)
+                out = self._ds.filter_and_limit(
+                    bars, limit=lim, before_time=before_time,
+                    after_time=after_time, truncate=(after_time is None),
+                )
+                result[raw] = out
+
+        if need_remote:
+            logger.info(
+                f"[DB桥接批量] tf={tf} 总={len(symbols)} "
+                f"DB命中={len(result) - len(need_remote)} "
+                f"远程补充={len(need_remote)}"
+            )
+        return result
+
+    # ── DB 读取 ──
+
+    def _fetch_from_db(self, raw: str, tf: str, limit: int) -> List[Dict[str, Any]]:
+        """从 db_market 查询 K 线数据，统一转为 {time: int, ...} 格式。"""
+        try:
+            if tf in ("15m", "1D"):
+                rows = self._writer.query("CNStock", raw, tf, limit=limit)
+            else:
+                # 非 15m/1D → 从 DB 数据实时聚合
+                # 30m/1h/2h/4h 从 15m 聚合，1W/1M 从 1D 聚合
+                agg_tf = tf if tf in ("30m", "1h", "2h", "4h") else "1D"
+                rows = self._writer.aggregate("CNStock", raw, agg_tf, limit=limit)
+        except Exception as e:
+            logger.debug(f"[DB桥接] DB查询异常 {raw} tf={tf}: {e}")
+            return []
+
+        if not rows:
+            return []
+
+        bars = []
+        for row in rows:
+            ts = _dt_to_ts(row.get("time"))
+            if ts <= 0:
+                continue
+            bars.append({
+                "time": ts,
+                "open": round(float(row.get("open", 0)), 4),
+                "high": round(float(row.get("high", 0)), 4),
+                "low": round(float(row.get("low", 0)), 4),
+                "close": round(float(row.get("close", 0)), 4),
+                "volume": round(float(row.get("volume", 0)), 2),
+            })
+        bars.sort(key=lambda b: b["time"])
+        return bars
+
+    # ── 补充当日缺失 ──
+
+    def _fill_today_if_needed(
+        self, raw: str, bars: List[Dict[str, Any]], adj: str
+    ) -> List[Dict[str, Any]]:
+        """检查 bars 是否覆盖今日，缺失则补充。"""
+        if not bars:
+            return bars
+
+        today_ts = _today_ts()
+        has_today = any(b["time"] == today_ts for b in bars)
+        if has_today:
+            return bars
+
+        today_bar = self._fetch_today_bar(raw, adj)
+        if today_bar:
+            bars = [b for b in bars if b["time"] != today_ts]
+            bars.append(today_bar)
+            bars.sort(key=lambda b: b["time"])
+        return bars
+
+    def _fetch_today_bar(self, raw: str, adj: str) -> Optional[Dict[str, Any]]:
+        """获取当日日线 bar。
+
+        盘中: 远程 15m 聚合 + 实时行情比对
+        收盘后: 远程直接取已完成日线
+        """
+        # 收盘后 → 直接取已完成日线
+        if _is_after_close():
+            return self._fetch_completed_daily_bar(raw, adj)
+
+        # 盘中 → 15m 聚合 + 实时行情
+        if _is_market_hours():
+            return self._fetch_today_bar_from_15m(raw, adj)
+
+        return None
+
+    def _fetch_completed_daily_bar(self, raw: str, adj: str) -> Optional[Dict[str, Any]]:
+        """收盘后从远程取当日已完成日线 bar。"""
+        try:
+            remote = self._ds._get_kline_remote(raw, "1D", 3, adj=adj)
+            if not remote:
+                return None
+            today_ts = _today_ts()
+            for b in remote:
+                if b.get("time") == today_ts:
+                    return b
+        except Exception as e:
+            logger.debug(f"[DB桥接] 取已完成日线失败 {raw}: {e}")
+        return None
+
+    def _fetch_today_bar_from_15m(self, raw: str, adj: str) -> Optional[Dict[str, Any]]:
+        """盘中: 远程取 15m K 线聚合成当日日线，和实时行情比对修正。"""
+        try:
+            remote_15m = self._ds._get_kline_remote(raw, "15m", 200, adj=adj)
+            if not remote_15m:
+                return None
+
+            today_ts = _today_ts()
+            today_bars = [b for b in remote_15m if b.get("time", 0) >= today_ts]
+            if not today_bars:
+                return None
+
+            today_bars.sort(key=lambda x: x.get("time", 0))
+
+            agg_high = max(b.get("high", 0) for b in today_bars)
+            agg_low = min(b.get("low", float('inf')) for b in today_bars)
+            agg_volume = sum(b.get("volume", 0) for b in today_bars)
+
+            # 和实时行情比对（惰性缓存，15 分钟刷新）
+            quote = self._quote_cache.get_or_fetch(raw, self._ds)
+
+            if quote and quote.is_valid:
+                if quote.high > agg_high:
+                    agg_high = quote.high
+                if quote.low > 0 and agg_low > 0 and quote.low < agg_low:
+                    agg_low = quote.low
+                close_price = quote.price
+                if quote.volume > 0:
+                    agg_volume = quote.volume
+            else:
+                close_price = today_bars[-1].get("close", 0)
+
+            return {
+                "time": today_ts,
+                "open": today_bars[0].get("open", 0),
+                "high": round(agg_high, 4),
+                "low": round(agg_low, 4),
+                "close": round(close_price, 4),
+                "volume": round(agg_volume, 2),
+            }
+
+        except Exception as e:
+            logger.debug(f"[DB桥接] 15m聚合当日失败 {raw}: {e}")
+            return None
+
+    # ── 远程全量拉取 + 回填 DB ──
+
+    def _remote_with_backfill(
+        self, raw: str, tf: str, limit: int,
+        before_time: Optional[int], after_time: Optional[int], adj: str
+    ) -> List[Dict[str, Any]]:
+        """DB 无数据 → 远程全量拉取，能补则补回 DB。"""
+        remote_bars = self._ds._get_kline_remote(raw, tf, limit, adj=adj)
+        if not remote_bars:
+            return []
+
+        self._backfill_db(raw, tf, remote_bars)
+
+        if tf == "1D":
+            remote_bars = self._fill_today_if_needed(raw, remote_bars, adj)
+
+        out = self._ds.filter_and_limit(
+            remote_bars, limit=limit, before_time=before_time,
+            after_time=after_time, truncate=(after_time is None),
+        )
+        logger.info(f"[DB桥接] {raw} tf={tf} 远程补充 bars={len(out)}")
+        return out
+
+    def _backfill_db(self, raw: str, tf: str, bars: List[Dict[str, Any]]):
+        """将远程拉取的 K 线回填到 DB（只存 15m / 1D）。"""
+        if tf not in ("15m", "1D"):
+            return
+
+        records = []
+        for b in bars:
+            ts = b.get("time", 0)
+            if ts <= 0:
+                continue
+            dt = datetime.fromtimestamp(ts, tz=_TZ_CN).replace(tzinfo=None)
+            records.append({
+                "time": dt,
+                "open": b.get("open", 0),
+                "high": b.get("high", 0),
+                "low": b.get("low", 0),
+                "close": b.get("close", 0),
+                "volume": b.get("volume", 0),
+            })
+
+        if not records:
+            return
+
+        try:
+            result = self._writer.upsert("CNStock", raw, tf, records)
+            logger.debug(
+                f"[DB桥接] 回填 {raw}/{tf}: "
+                f"+{result.get('inserted', 0)} ~{result.get('updated', 0)}"
+            )
+        except Exception as e:
+            logger.debug(f"[DB桥接] 回填失败 {raw}/{tf}: {e}")
 
 
 # ================================================================
@@ -46,56 +548,29 @@ def _strip_cn_prefix(code: str) -> str:
 # ================================================================
 
 class CNStockDataSource(BaseDataSource):
-    """A股数据源 — Coordinator 动态队列 + 自动源发现"""
+    """A股数据源 — Coordinator 动态队列 + 自动源发现 + DB 行情缓存"""
 
     name = "CNStock/multi-source"
 
     def __init__(self):
         self.circuit_breaker = get_realtime_circuit_breaker()
+        self._db_bridge = DBKlineBridge(self)
 
     # ----------------------------------------------------------
-    # 实时行情 / 报价（串行 fallback，不走 Coordinator）
+    # 实时行情 / 报价
     # ----------------------------------------------------------
 
     def get_ticker(self, symbol: str) -> Dict[str, Any]:
-        """
-        获取实时行情
-
-        支持单只和批量两种调用方式:
-          单只: symbol="600519"
-            → 返回 {"last": 1800.0, "change": 15.0, "changePercent": 0.84, "high": ..., "low": ..., "name": "贵州茅台", ...}
-
-          批量: symbol="600519,000001,000690"
-            → 返回 {"600519": {"last": ..., ...}, "000001": {"last": ..., ...}, ...}
-
-        单只实现:
-          1. Coordinator race 模式（并发请求多个 Provider，第一个成功的返回）
-          2. 全部失败 → {"last": 0, "symbol": code}
-
-        批量实现:
-          1. 透传 Provider 层 batch_quote 接口（腾讯/新浪一次 HTTP 拿多只）
-          2. 按 Provider 优先级逐源尝试，失败自动降级
-          3. 无 Provider 可用 → 返回 {}
-
-        Args:
-            symbol: 股票代码，多只用逗号分隔（如 "600519,000001"）
-
-        Returns:
-            单只: {"last", "change", "changePercent", "high", "low", "open", "previousClose", "name", "symbol", ...}
-            批量: {symbol: {"last", "change", ...}, ...}
-        """
-        # ── 批量模式：逗号分隔 ──
+        """获取实时行情（单只/批量）。"""
         if ',' in symbol:
             symbols = [s.strip() for s in symbol.split(',') if s.strip()]
             if not symbols:
                 return {"last": 0, "symbol": symbol}
             return self._get_tickers(symbols)
 
-        # ── 单只模式 ──
         code = normalize_cn_code(symbol)
         raw = _strip_cn_prefix(code)
 
-        # 交给 Coordinator（自动从 Provider 层发现源，race 模式）
         result = get_coordinator().coordinate_ticker(
             symbol=code,
             cb=self.circuit_breaker,
@@ -110,12 +585,8 @@ class CNStockDataSource(BaseDataSource):
         logger.warning(f"[行情] 所有数据源均失败: {symbol}")
         return {"last": 0, "symbol": raw}
 
-    # ----------------------------------------------------------
-    # 批量当日行情（供 K 线服务合成当日 K 线用）
-    # ----------------------------------------------------------
-
     def _get_tickers(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
-        """批量获取实时行情（ticker 格式）— 透传 Provider 层 batch_quote 接口，返回纯数字 key"""
+        """批量获取实时行情（ticker 格式）— 透传 Provider 层 batch_quote 接口。"""
         from app.data_sources.provider import get_providers
         normalized = [normalize_cn_code(s) for s in symbols if s]
         if not normalized:
@@ -123,11 +594,9 @@ class CNStockDataSource(BaseDataSource):
         providers = get_providers(capability="batch_quote", market="CNStock")
         if not providers:
             return {}
-        # 按优先级逐源尝试（Coordinator_direct_call，失败自动降级）
         for p in providers:
             raw_result = Coordinator_direct_call(p.fetch_tickers, normalized)
             if raw_result:
-                # 统一去掉 key 和 symbol 字段的市场前缀
                 cleaned = {}
                 for k, v in raw_result.items():
                     raw_key = _strip_cn_prefix(k)
@@ -138,7 +607,7 @@ class CNStockDataSource(BaseDataSource):
         return {}
 
     # ----------------------------------------------------------
-    # K线数据 — 统一走 Coordinator（自动源发现）
+    # K线数据 — DB 优先
     # ----------------------------------------------------------
 
     def get_kline(
@@ -150,89 +619,94 @@ class CNStockDataSource(BaseDataSource):
         after_time: Optional[int] = None,
         adj: str = "qfq",
     ) -> List[Dict[str, Any]]:
+        """获取 K 线数据（DB 优先）。
+
+        数据流:
+          上游取K线 ← cn_stock接口 ← kline_clean填充 ← 补充数据 ← db_market取数据
+
+        批量模式（逗号分隔）: 先批量查 DB，未命中的再批量走远程。
         """
-        获取 K 线数据
-
-        支持单只和批量两种调用方式:
-          单只: symbol="600519"
-            → 返回 [{"time": 1700000000, "open": 1795.0, "high": 1810.0, "low": 1790.0, "close": 1800.0, "volume": 12345}, ...]
-
-          批量: symbol="600519,000001,000690"
-            → 返回 {"600519": [bar, ...], "000001": [bar, ...], ...}
-
-        单只实现:
-          1. 委托 _get_klines（走 Coordinator）
-          2. 过滤 + 截断（before_time / after_time）
-          3. 全部失败 → 返回 []
-
-        批量实现:
-          1. 委托 _get_klines（Coordinator 动态队列）
-          2. 部分失败时，成功的仍返回
-
-        Args:
-            symbol: 股票代码，多只用逗号分隔（如 "600519,000001"）
-            timeframe: 时间周期（"1D", "1W", "1M", "5m", "15m", "30m", "60m" 等）
-            limit: 数据条数
-            before_time: 获取此时间之前的数据（Unix 秒）
-            after_time: K 线 time 需 >= 此值（回测左边界，Unix 秒）
-            adj: 复权方式 — "qfq"(前复权,默认) / "hfq"(后复权) / ""(不复权)
-
-        Returns:
-            单只: [bar, ...] — 每个 bar 包含 {"time", "open", "high", "low", "close", "volume"}
-            批量: {symbol: [bar, ...], ...}
-        """
-        # ── 批量模式：逗号分隔 ──
+        # ── 批量模式 ──
         if ',' in symbol:
             symbols = [s.strip() for s in symbol.split(',') if s.strip()]
             if not symbols:
                 return []
-            return self._get_klines(symbols, timeframe, limit, adj=adj)
+            batch = self._db_bridge.get_kline_batch(
+                symbols, timeframe, limit, before_time, after_time, adj
+            )
+            # 合并为统一列表返回（按 symbol 顺序）
+            merged = []
+            for sym in symbols:
+                raw = _strip_cn_prefix(sym)
+                bars = batch.get(raw, [])
+                merged.extend(bars)
+            return merged
 
+        # ── 单只模式 ──
+        return self._db_bridge.get_kline(
+            symbol, timeframe, limit, before_time, after_time, adj
+        )
+
+    # ----------------------------------------------------------
+    # 内部: Coordinator 远程拉取（单只）
+    # ----------------------------------------------------------
+
+    def _get_kline_remote(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int,
+        before_time: Optional[int] = None,
+        after_time: Optional[int] = None,
+        adj: str = "qfq",
+    ) -> List[Dict[str, Any]]:
+        """直接走 Coordinator 远程拉取，不经过 DB 层。
+
+        注意: timeframe 应已由调用方 normalize 过，这里不再重复。
+        """
         code = normalize_cn_code(symbol)
-        raw = _strip_cn_prefix(code)
-        tf = normalize_chart_timeframe(timeframe)
         lim = max(int(limit or 300), 1)
 
-        # 单只 → 走批量，取一个结果
-        result = self._get_klines([symbol], tf, lim, adj=adj)
-        bars = result.get(raw, [])
+        coord_results, failed = get_coordinator().coordinate_kline(
+            symbols=[code],
+            timeframe=timeframe,
+            limit=lim,
+            cb=self.circuit_breaker,
+            market="CNStock",
+            timeout=20,
+            adj=adj,
+        )
 
+        bars = coord_results.get(code, [])
         if not bars:
-            logger.warning(f"[K线终止] {symbol} tf={tf} 所有数据源失败")
-            return []
+            bars = self._try_aggregate_lower(timeframe, code, lim, adj)
 
-        # 过滤 + 截断
-        out = self.filter_and_limit(
+        if bars:
+            bars = clean_klines(bars, timeframe)
+
+        return self.filter_and_limit(
             bars, limit=lim, before_time=before_time,
             after_time=after_time, truncate=(after_time is None),
         )
 
-        logger.info(f"[K线成功] {symbol} tf={tf} bars={len(out)}")
-        return out
+    # ----------------------------------------------------------
+    # 内部: Coordinator 远程批量拉取
+    # ----------------------------------------------------------
 
-    def _get_klines(
+    def _get_klines_remote(
         self,
         symbols: List[str],
         timeframe: str,
         limit: int,
         adj: str = "qfq",
     ) -> Dict[str, List[Dict[str, Any]]]:
-        """
-        批量获取多只股票 K 线 — Coordinator 自动源发现 + 动态队列。
-
-        Args:
-            adj: 复权方式 — "qfq"(前复权,默认) / "hfq"(后复权) / ""(不复权)
-        """
+        """批量走 Coordinator 远程拉取。timeframe 应已 normalize。"""
         if not symbols:
             return {}
 
-        tf = normalize_chart_timeframe(timeframe)
-        result: Dict[str, List[Dict[str, Any]]] = {}
-
-        # ── 交给 Coordinator（自动源发现，传递 adj）──
         coord_results, failed = get_coordinator().coordinate_kline(
             symbols=[normalize_cn_code(s) for s in symbols],
-            timeframe=tf,
+            timeframe=timeframe,
             limit=limit,
             cb=self.circuit_breaker,
             market="CNStock",
@@ -240,19 +714,70 @@ class CNStockDataSource(BaseDataSource):
             adj=adj,
         )
 
-        # 合并结果 — 统一去掉 key 的市场前缀
+        result: Dict[str, List[Dict[str, Any]]] = {}
         for sym, bars in coord_results.items():
-            result[_strip_cn_prefix(sym)] = bars
-
-        # 清洗 K 线：补齐中间缺失 bar
-        for sym in result:
-            before = len(result[sym])
-            result[sym] = clean_klines(result[sym], tf)
-            after = len(result[sym])
-            if after > before:
-                logger.info(f"[K线补齐] {sym} tf={tf} {before}→{after} bars (+{after - before})")
+            raw = _strip_cn_prefix(sym)
+            result[raw] = clean_klines(bars, timeframe)
 
         if failed:
-            logger.warning(f"[K线批量] {len(failed)} 只失败: {failed[:5]}...")
+            logger.warning(f"[远程批量] {len(failed)} 只失败: {failed[:5]}...")
 
         return result
+
+    # ----------------------------------------------------------
+    # 内部: 低周期聚合 fallback
+    # ----------------------------------------------------------
+
+    _AGG_FALLBACK = {
+        '5m':  ('1m',  5),
+        '30m': ('15m', 2),
+        '1H':  ('30m', 2),
+        '2H':  ('1H',  2),
+        '4H':  ('1H',  4),
+    }
+
+    def _try_aggregate_lower(
+        self, tf: str, code: str, limit: int, adj: str
+    ) -> List[Dict[str, Any]]:
+        """从低周期聚合目标周期（fallback）。tf 应已 normalize。"""
+        fallback = self._AGG_FALLBACK.get(tf)
+        if not fallback:
+            return []
+        source_tf, group_size = fallback
+        source_limit = limit * group_size + group_size
+        try:
+            coord_results, _ = get_coordinator().coordinate_kline(
+                symbols=[code],
+                timeframe=source_tf,
+                limit=source_limit,
+                cb=self.circuit_breaker,
+                market="CNStock",
+                timeout=20,
+                adj=adj,
+            )
+            source_bars = coord_results.get(code, [])
+        except Exception:
+            return []
+        if not source_bars:
+            return []
+        source_bars.sort(key=lambda x: x['time'])
+        return self._aggregate_fixed_window(source_bars, group_size, limit)
+
+    @staticmethod
+    def _aggregate_fixed_window(
+        source_klines: List[Dict], group_size: int, limit: int
+    ) -> List[Dict[str, Any]]:
+        """将低周期 K 线按固定窗口聚合为高周期。"""
+        result = []
+        total = len(source_klines)
+        for i in range(0, total, group_size):
+            chunk = source_klines[i:i + group_size]
+            result.append({
+                'time': chunk[0]['time'],
+                'open': float(chunk[0].get('open', 0)),
+                'high': max(float(b.get('high', 0)) for b in chunk),
+                'low': min(float(b.get('low', 0)) for b in chunk),
+                'close': float(chunk[-1].get('close', 0)),
+                'volume': round(sum(float(b.get('volume', 0)) for b in chunk), 2),
+            })
+        return result[-limit:] if len(result) > limit else result
