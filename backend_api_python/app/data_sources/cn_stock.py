@@ -418,7 +418,12 @@ class DBKlineBridge:
         db_bars = self._fetch_from_db(raw, tf, lim)
 
         if db_bars:
-            cleaned = clean_klines(db_bars, tf)
+            # 盘中聚合周期（30m/1h/2h/4h）的 bar 已对齐到 bucket 边界，
+            # clean_klines 的期望时间点与之不匹配，会错误插入空 bar，跳过。
+            if tf in self._INTRADAY_BUCKET_SEC:
+                cleaned = db_bars
+            else:
+                cleaned = clean_klines(db_bars, tf)
 
             # 盘中 15m: ticker 补充最后一根 bar
             if tf == "15m" and in_trading:
@@ -476,7 +481,10 @@ class DBKlineBridge:
             db_bars = self._fetch_from_db(raw, tf, lim)
 
             if db_bars:
-                cleaned = clean_klines(db_bars, tf)
+                if tf in self._INTRADAY_BUCKET_SEC:
+                    cleaned = db_bars
+                else:
+                    cleaned = clean_klines(db_bars, tf)
                 if tf == "15m" and in_trading:
                     self._apply_ticker_to_last_bar(raw, cleaned)
                 out = self._ds.filter_and_limit(
@@ -615,23 +623,23 @@ class DBKlineBridge:
     # DB 读取 + 周期聚合
     # ────────────────────────────────────────────────────────────
 
-    def _fetch_from_db(self, raw: str, tf: str, limit: int) -> List[Dict[str, Any]]:
-        """从 db_market 读取 K 线，统一转为 {time: int, ...} 格式。
+    # DB 只存 15m，其余周期全部在 Python 内存中聚合。
+    # 统一从 15m 表读取，避免 SQL 聚合的大小写/时区/分区发现问题。
+    _AGG_NEED_15M = {"30m", "1h", "1H", "2h", "2H", "4h", "4H", "1D", "1W", "1M"}
 
-        技巧: DB 只存 15m，其余周期通过 aggregate/query 读 15m 后在内存中聚合。
-        这样只需要维护一张 15m 表，所有周期都能从它派生。
+    def _fetch_from_db(self, raw: str, tf: str, limit: int) -> List[Dict[str, Any]]:
+        """从 db_market 读取 15m K 线，在内存中聚合成目标周期。
+
+        所有非 15m 周期统一走: query 15m → Python 聚合。
         """
         try:
             if tf == "15m":
                 rows = self._writer.query("CNStock", raw, "15m", limit=limit)
-            elif tf == "1D":
-                # 日线从 15m 聚合。每天约 16 根 15m bar，多取一些保证够用
-                rows = self._writer.aggregate("CNStock", raw, "15m", limit=limit * 16 + 50)
-            elif tf in ("30m", "1h", "2h", "4h"):
-                rows = self._writer.aggregate("CNStock", raw, "15m", limit=limit)
+            elif tf in ("1D", "1W", "1M"):
+                rows = self._writer.query("CNStock", raw, "15m", limit=limit * 16 + 200)
             else:
-                # 1W / 1M → 先读足够多的 15m bar，后续聚到日再聚到周/月
-                rows = self._writer.aggregate("CNStock", raw, "15m", limit=limit * 16 + 200)
+                # 30m / 1h / 2h / 4h → 每天最多 16 根 15m，取够天数
+                rows = self._writer.query("CNStock", raw, "15m", limit=limit * 16 + 50)
         except Exception as e:
             logger.debug(f"[DB桥接] DB查询异常 {raw} tf={tf}: {e}")
             return []
@@ -654,8 +662,9 @@ class DBKlineBridge:
             })
         bars.sort(key=lambda b: b["time"])
 
-        # 1D / 1W / 1M 需要二次聚合
-        if tf == "1D":
+        if tf == "15m":
+            return bars
+        elif tf == "1D":
             return self._aggregate_15m_to_daily(bars, limit)
         elif tf in ("1W", "1M"):
             daily = self._aggregate_15m_to_daily(bars, limit * 8)
@@ -663,7 +672,8 @@ class DBKlineBridge:
                 return self._aggregate_daily_to_weekly(daily, limit)
             else:
                 return self._aggregate_daily_to_monthly(daily, limit)
-        return bars
+        else:
+            return self._aggregate_15m_to_intraday(bars, tf, limit)
 
     @staticmethod
     def _aggregate_15m_to_daily(bars: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
@@ -754,6 +764,54 @@ class DBKlineBridge:
                 continue
             result.append({
                 "time": month_ts,
+                "open": float(chunk[0].get("open", 0)),
+                "high": max(float(b.get("high", 0)) for b in chunk),
+                "low": min(float(b.get("low", 0)) for b in chunk),
+                "close": float(chunk[-1].get("close", 0)),
+                "volume": round(sum(float(b.get("volume", 0)) for b in chunk), 2),
+            })
+        return result[-limit:] if len(result) > limit else result
+
+    # 15m → 盘中周期聚合（按 bar.time 对齐，天然跳过午休）
+    _INTRADAY_BUCKET_SEC = {
+        "30m": 1800, "1h": 3600, "1H": 3600,
+        "2h": 7200, "2H": 7200, "4h": 14400, "4H": 14400,
+    }
+
+    @staticmethod
+    def _aggregate_15m_to_intraday(
+        bars: List[Dict[str, Any]], tf: str, limit: int
+    ) -> List[Dict[str, Any]]:
+        """15m → 30m/1h/2h/4h。按 bar.time 向下取整到 bucket 边界分组。
+
+        因为 15m bar 本身只在交易时段存在（9:30-11:30, 13:00-15:00），
+        分桶后自然跳过午休和盘后，不会产生空桶。
+        """
+        if not bars:
+            return []
+        sec = DBKlineBridge._INTRADAY_BUCKET_SEC.get(tf)
+        if sec is None:
+            return bars
+
+        groups: Dict[int, List[Dict]] = {}
+        order: List[int] = []
+        for b in bars:
+            ts = b.get("time", 0)
+            if ts <= 0:
+                continue
+            bucket = ts - (ts % sec)
+            if bucket not in groups:
+                groups[bucket] = []
+                order.append(bucket)
+            groups[bucket].append(b)
+
+        result = []
+        for bucket_ts in order:
+            chunk = groups[bucket_ts]
+            if not chunk:
+                continue
+            result.append({
+                "time": bucket_ts,
                 "open": float(chunk[0].get("open", 0)),
                 "high": max(float(b.get("high", 0)) for b in chunk),
                 "low": min(float(b.get("low", 0)) for b in chunk),

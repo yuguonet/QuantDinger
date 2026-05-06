@@ -312,30 +312,36 @@ class AICalibrationService:
 
 def start_ai_calibration_worker() -> None:
     """
-    Run offline calibration once on service startup (best-effort).
+    Run offline calibration once on service startup (best-effort, non-blocking).
     """
+    import threading
+
     enabled = os.getenv("ENABLE_OFFLINE_AI_CALIBRATION", "true").lower() == "true"
     if not enabled:
         logger.info("AI calibration worker disabled (ENABLE_OFFLINE_AI_CALIBRATION=false).")
         return
 
-    try:
-        svc = AICalibrationService()
-        lookback_days = int(os.getenv("AI_CALIBRATION_LOOKBACK_DAYS", "30"))
-        min_samples = int(os.getenv("AI_CALIBRATION_MIN_SAMPLES", "80"))
-        market = os.getenv("AI_CALIBRATION_MARKET", "CNStock").strip() or "Crypto"
-        logger.info(
-            f"Starting offline AI calibration: market={market}, lookback_days={lookback_days}, min_samples={min_samples}"
-        )
-        result = svc.calibrate_market(market=market, lookback_days=lookback_days, min_samples=min_samples)
-        if result:
+    def _run():
+        try:
+            svc = AICalibrationService()
+            lookback_days = int(os.getenv("AI_CALIBRATION_LOOKBACK_DAYS", "30"))
+            min_samples = int(os.getenv("AI_CALIBRATION_MIN_SAMPLES", "80"))
+            market = os.getenv("AI_CALIBRATION_MARKET", "CNStock").strip() or "Crypto"
             logger.info(
-                f"[AI Calibration] market={result.market} best_thr=+{result.buy_threshold:.1f} "
-                f"accuracy={result.best_accuracy:.2f}% sample={result.sample_count} "
-                f"coverage={result.coverage} validated_new={result.validated_count}"
+                f"Starting offline AI calibration: market={market}, lookback_days={lookback_days}, min_samples={min_samples}"
             )
-        else:
-            logger.info("[AI Calibration] No calibration update applied (not enough data).")
-    except Exception as e:
-        logger.error(f"start_ai_calibration_worker failed: {e}", exc_info=True)
+            result = svc.calibrate_market(market=market, lookback_days=lookback_days, min_samples=min_samples)
+            if result:
+                logger.info(
+                    f"[AI Calibration] market={result.market} best_thr=+{result.buy_threshold:.1f} "
+                    f"accuracy={result.best_accuracy:.2f}% sample={result.sample_count} "
+                    f"coverage={result.coverage} validated_new={result.validated_count}"
+                )
+            else:
+                logger.info("[AI Calibration] No calibration update applied (not enough data).")
+        except Exception as e:
+            logger.error(f"start_ai_calibration_worker failed: {e}", exc_info=True)
+
+    t = threading.Thread(target=_run, name="ai-calibration", daemon=True)
+    t.start()
 

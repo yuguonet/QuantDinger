@@ -251,7 +251,7 @@ class TencentDataSource:
         else:
             # 日/周级复权K线接口
             url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
-            params = {"param": f"{c},{tc_tf},,,{int(count)}"}
+            params = {"param": f"{c},{tc_tf},,,{int(count)},{adj or 'qfq'}"}
 
         resp = requests.get(
             url, headers=get_request_headers(referer=_tc_kline_referers.next()),

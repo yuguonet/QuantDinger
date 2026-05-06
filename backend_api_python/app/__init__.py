@@ -403,9 +403,8 @@ def create_app(config_name='default'):
         start_pending_order_worker()
         start_portfolio_monitor()
         start_usdt_order_worker()
-        start_polymarket_worker()
+#        start_polymarket_worker()
         start_emotion_scheduler()
-        start_sector_history_scheduler()
         # Offline calibration to make AI thresholds self-tuning.
         try:
             from app.services.ai_calibration import start_ai_calibration_worker
