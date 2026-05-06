@@ -401,7 +401,7 @@ export default {
     presetPrice: { type: Number, default: 0 },
     source: { type: String, default: 'manual' }, // ai_radar / ai_analysis / indicator / manual
     marketType: { type: String, default: 'swap' }, // swap / spot
-    market: { type: String, default: 'Crypto' }, // Crypto / Stock / Futures — market category for price API
+    market: { type: String, required: true }, // Crypto / Stock / Futures — market category for price API
     embedded: { type: Boolean, default: false },
     /** 指标 IDE 右侧浮动面板：更紧凑的分区与卡片样式 */
     embeddedIde: { type: Boolean, default: false }

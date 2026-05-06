@@ -12,6 +12,7 @@
     <quick-trade-panel
       :visible="showQuickTrade"
       :symbol="qtSymbol"
+      :market="currentAnalysisMarket"
       :preset-side="qtSide"
       :preset-price="qtPrice"
       :source="qtSource"
@@ -134,6 +135,10 @@ export default {
     },
     openQuickTradeFromCurrent () {
       if (!this.currentAnalysisSymbol) return
+      if (this.currentAnalysisMarket !== 'Crypto') {
+        this.$message.warning(this.$t('quickTrade.cryptoOnly'))
+        return
+      }
       this.qtSymbol = this.currentAnalysisSymbol
       this.qtSide = ''
       this.qtPrice = 0

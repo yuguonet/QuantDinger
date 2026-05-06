@@ -797,6 +797,7 @@
             embedded-ide
             :visible="true"
             :symbol="qtSymbol"
+            :market="market"
             :preset-side="qtSide"
             :preset-price="qtPrice"
             source="indicator"
@@ -1467,14 +1468,14 @@ export default {
         if (s.market && s.symbol) {
           this.market = String(s.market)
           this.symbol = String(s.symbol)
-          this.qtSymbol = this.symbol
+          this.qtSymbol = String(s.market) === 'Crypto' ? this.symbol : ''
           this.selectedWatchlistKey = `${this.market}:${this.symbol}`
         } else if (s.selectedWatchlistKey && typeof s.selectedWatchlistKey === 'string') {
           const [m, sym] = s.selectedWatchlistKey.split(':')
           if (m && sym) {
             this.market = m
             this.symbol = sym
-            this.qtSymbol = sym
+            this.qtSymbol = m === 'Crypto' ? sym : ''
             this.selectedWatchlistKey = s.selectedWatchlistKey
           }
         }
@@ -3467,8 +3468,16 @@ export default {
       if (stock && stock.market && stock.symbol) {
         this.market = stock.market
         this.symbol = stock.symbol
-        this.qtSymbol = stock.symbol
         this.selectedWatchlistKey = `${stock.market}:${stock.symbol}`
+        // QuickTradePanel 仅支持 Crypto，非 Crypto 时关闭抽屉并清空 qtSymbol
+        if (stock.market === 'Crypto') {
+          this.qtSymbol = stock.symbol
+        } else {
+          this.qtSymbol = ''
+          if (this.quickTradeDrawerVisible) {
+            this.quickTradeDrawerVisible = false
+          }
+        }
         this.ensureChartReady()
         this.schedulePersistIdeUiState()
       }
@@ -3580,7 +3589,15 @@ export default {
       if (run.market) this.market = String(run.market)
       if (run.symbol) {
         this.symbol = String(run.symbol)
-        this.qtSymbol = String(run.symbol)
+        // QuickTradePanel 仅支持 Crypto，非 Crypto 时清空 qtSymbol 并关闭抽屉
+        if (String(run.market) === 'Crypto') {
+          this.qtSymbol = String(run.symbol)
+        } else {
+          this.qtSymbol = ''
+          if (this.quickTradeDrawerVisible) {
+            this.quickTradeDrawerVisible = false
+          }
+        }
       }
       if (this.market && this.symbol) {
         this.selectedWatchlistKey = `${this.market}:${this.symbol}`
@@ -3744,7 +3761,15 @@ export default {
       this.$nextTick(() => this.ensureChartReady())
     },
     symbol () {
-      this.qtSymbol = this.symbol
+      // QuickTradePanel 仅支持 Crypto，非 Crypto 时不同步 qtSymbol
+      if (this.market === 'Crypto') {
+        this.qtSymbol = this.symbol
+      } else {
+        this.qtSymbol = ''
+        if (this.quickTradeDrawerVisible) {
+          this.quickTradeDrawerVisible = false
+        }
+      }
       this.ensureChartReady()
       this.schedulePersistIdeUiState()
     },

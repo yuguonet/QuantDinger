@@ -56,8 +56,8 @@ logger = get_logger(__name__)
 
 _TZ_CN = timezone(timedelta(hours=8))
 
-# ticker 缓存最大条目数。每条约 40 字节，1000 条 ≈ 40KB。
-_CACHE_MAX_ENTRIES = 1000
+# ticker 缓存最大条目数。每条约 40 字节，2000 条 ≈ 80KB。
+_CACHE_MAX_ENTRIES = 2000
 
 
 # ================================================================
