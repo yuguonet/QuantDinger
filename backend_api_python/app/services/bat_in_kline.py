@@ -5,11 +5,11 @@
 # ============================================================================
 #
 # 数据源:
-#   日K:  东方财富 clist 接口 (1次HTTP拉全市场当天快照)
+#   日K:  新浪财经 + 腾讯财经 (双源并发, 交叉验证)
 #   15min: 新浪财经 (逐只拉取, 30并发)
 #
 # 流程:
-#   1. 东财 clist 一次HTTP拉全市场日K快照
+#   1. 新浪+腾讯 30并发拉全市场日K, 交叉验证close价
 #   2. 新浪 30并发拉全市场15min
 #   3. 写入DB
 #
@@ -129,6 +129,37 @@ def _safe_float(v, default: float = 0.0) -> float:
     except (ValueError, TypeError):
         return default
 
+
+# ---------------------------------------------------------------------------
+# 15m 时间标准化 (来源: optimizer/dual_source_sync.py)
+# ---------------------------------------------------------------------------
+
+def _normalize_15m_time(dt: datetime) -> Optional[datetime]:
+    """
+    标准化 15m 时间戳:
+      - 9:30 → 丢弃 (返回 None, 非交易时段)
+      - 11:30~13:00 → 归到 11:30
+      - 15:00~23:59 → 归到 15:00
+      - 其他保持原样
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=TZ_SH)
+    total_min = dt.hour * 60 + dt.minute
+
+    # 9:30 → 丢弃
+    if total_min == 570:
+        return None
+
+    # 11:30~13:00 → 11:30
+    if 690 <= total_min < 780:
+        return dt.replace(hour=11, minute=30, second=0, microsecond=0)
+
+    # 15:00~23:59 → 15:00
+    if total_min >= 900:
+        return dt.replace(hour=15, minute=0, second=0, microsecond=0)
+
+    return dt
+
 def log(msg):
     print(msg, flush=True)
 
@@ -143,69 +174,218 @@ _HTTP.headers.update({
 })
 
 MAX_WORKERS = 30
+MAX_RETRIES = 3
+RETRY_BACKOFF = [2, 5, 10]  # 秒, 指数退避
+
+
+def _retry_get(url: str, params: dict, timeout: int = 15, retries: int = MAX_RETRIES) -> requests.Response:
+    """带重试的 GET 请求, 处理连接被重置/远端断开等瞬时错误"""
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            r = _HTTP.get(url, params=params, timeout=timeout)
+            r.raise_for_status()
+            return r
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ChunkedEncodingError) as e:
+            last_exc = e
+            if attempt < retries:
+                wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
+                log(f"  ⚠️ 请求失败 (attempt {attempt+1}/{retries+1}), {wait}s 后重试: {type(e).__name__}")
+                time.sleep(wait)
+                # 重建连接, 避免复用被服务端关闭的连接
+                _HTTP.close()
+            else:
+                raise
+    raise last_exc  # 不会走到这里, 但保底
 
 
 # ===================================================================
-#  日K: 东方财富 clist (1次HTTP拉全市场)
+#  股票代码生成 (沪深A股)
 # ===================================================================
+
+def _gen_stock_codes() -> List[str]:
+    """生成沪深A股候选代码列表"""
+    codes = []
+    # 沪市主板 600000-605999
+    for i in range(600000, 606000):
+        codes.append(f"sh{i}")
+    # 科创板 688000-689999
+    for i in range(688000, 690000):
+        codes.append(f"sh{i}")
+    # 深市主板 000001-003999
+    for i in range(1, 4000):
+        codes.append(f"sz{i:06d}")
+    # 创业板 300000-301999
+    for i in range(300000, 302000):
+        codes.append(f"sz{i}")
+    return codes
+
+
+# ===================================================================
+#  日K: 新浪 + 腾讯 双源拉取 + 交叉验证
+# ===================================================================
+
+def _fetch_daily_sina(sym: str) -> Optional[Dict[str, Any]]:
+    """新浪日K, 单只, 返回最近一天的 bar"""
+    url = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
+    params = {"symbol": sym, "scale": 240, "ma": "no", "datalen": 3}
+    try:
+        r = _retry_get(url, params=params, timeout=8, retries=2)
+        data = json.loads(r.text)
+        if not data:
+            return None
+        last = data[-1]
+        return {
+            "date": last["day"][:10],
+            "open": float(last["open"]),
+            "high": float(last["high"]),
+            "low": float(last["low"]),
+            "close": float(last["close"]),
+            "volume": float(last["volume"]),
+        }
+    except Exception:
+        return None
+
+
+def _fetch_daily_qq(sym: str) -> Optional[Dict[str, Any]]:
+    """腾讯日K (前复权), 单只, 返回最近一天的 bar"""
+    url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+    today = datetime.now(TZ_SH).strftime("%Y-%m-%d")
+    start = (datetime.now(TZ_SH) - timedelta(days=15)).strftime("%Y-%m-%d")
+    params = {"param": f"{sym},day,{start},{today},30,qfq"}
+    try:
+        r = _retry_get(url, params=params, timeout=8, retries=2)
+        data = r.json()
+        stock = data.get("data", {}).get(sym, {})
+        klines = stock.get("qfqday") or stock.get("day") or []
+        if not klines:
+            return None
+        last = klines[-1]
+        return {
+            "date": last[0],
+            "open": float(last[1]),
+            "close": float(last[2]),
+            "high": float(last[3]),
+            "low": float(last[4]),
+            "volume": float(last[5]) if len(last) > 5 else 0.0,
+        }
+    except Exception:
+        return None
+
+
+def _batch_fetch_daily(codes: List[str], fetch_fn, label: str) -> Dict[str, Dict[str, Any]]:
+    """并发拉取日K, 通用框架"""
+    log(f"[{label}] 启动 ({len(codes)} 只, {MAX_WORKERS} 并发)")
+    results = {}
+    ok = fail = 0
+    t0 = time.time()
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futs = {pool.submit(fetch_fn, c): c for c in codes}
+        for f in as_completed(futs):
+            if _INTERRUPTED:
+                break
+            c = futs[f]
+            try:
+                bar = f.result()
+                if bar:
+                    results[c] = bar
+                    ok += 1
+                else:
+                    fail += 1
+            except Exception:
+                fail += 1
+            total = ok + fail
+            if total % 500 == 0:
+                log(f"  [{label}] {total}/{len(codes)} ok={ok} {time.time()-t0:.0f}s")
+
+    log(f"[{label}] ok:{ok} fail:{fail} {time.time()-t0:.0f}s")
+    return results
+
 
 def fetch_daily_snapshot() -> Dict[str, Dict[str, Any]]:
     """
-    东财 clist 接口, 1次HTTP拉全市场当天日K快照。
+    新浪 + 腾讯 双源日K, 交叉验证。
 
-    返回: {code: {"open": float, "high": float, "low": float,
-                   "close": float, "volume": float, "name": str,
-                   "pct_chg": float, "amount": float, "turnover": float}}
+    流程:
+      1. 新浪 30并发拉日K
+      2. 腾讯 30并发拉日K (前复权)
+      3. 交叉验证 close 价, 差异 > 0.1% 记录警告
+      4. 取新浪数据为主, 腾讯仅做校验
+
+    返回: {sym: {"code": str, "open": float, "high": float, "low": float,
+                  "close": float, "volume": float}}
     """
-    log("[东财] 1次HTTP拉全市场日K快照...")
-    url = "https://push2.eastmoney.com/api/qt/clist/get"
-    params = {
-        "pn": 1, "pz": 6000,
-        "po": 1, "np": 1,
-        "fltt": 2, "invt": 2,
-        "fid": "f3",
-        "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048",
-        # f2=最新价 f3=涨跌幅 f5=成交量 f6=成交额 f7=振幅
-        # f10=量比 f15=最高 f16=最低 f17=今开 f18=昨收
-        "fields": "f2,f3,f5,f6,f7,f10,f12,f14,f15,f16,f17,f18",
-    }
-    r = _HTTP.get(url, params=params, timeout=15)
-    r.raise_for_status()
-    data = r.json()
+    codes = _gen_stock_codes()
 
-    items = data.get("data", {}).get("diff", [])
-    if not items:
-        log("[东财] 返回数据为空!")
+    # 双源并发拉取
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_sina = pool.submit(_batch_fetch_daily, codes, _fetch_daily_sina, "新浪-日K")
+        f_qq = pool.submit(_batch_fetch_daily, codes, _fetch_daily_qq, "腾讯-日K")
+        sina_data = f_sina.result()
+        qq_data = f_qq.result()
+
+    if not sina_data and not qq_data:
+        log("❌ 新浪+腾讯日K全部失败!")
         return {}
 
-    result = {}
-    for it in items:
-        code = it.get("f12", "")
-        name = it.get("f14", "")
-        if not code:
+    # 交叉验证
+    both = set(sina_data) & set(qq_data)
+    match = diff = 0
+    diff_samples = []
+
+    for sym in both:
+        s_close = sina_data[sym]["close"]
+        q_close = qq_data[sym]["close"]
+        if s_close == 0 or q_close == 0:
             continue
-
-        # 东财沪深代码 → sh/sz 前缀格式
-        if code.startswith("6") or code.startswith("9"):
-            sym = f"sh{code}"
+        pct = abs(s_close - q_close) / max(s_close, q_close) * 100
+        if pct > 0.1:
+            diff += 1
+            if len(diff_samples) < 10:
+                diff_samples.append(f"{sym}: 新浪={s_close} 腾讯={q_close} Δ={pct:.2f}%")
         else:
-            sym = f"sz{code}"
+            match += 1
 
+    total_validated = match + diff
+    log(f"[双源验证] 共同:{total_validated} 一致:{match} 差异:{diff}")
+    if diff_samples:
+        for s in diff_samples:
+            log(f"  ⚠️ {s}")
+
+    # 以新浪为主源, 新浪没有的用腾讯补
+    result = {}
+    for sym in sina_data:
+        bar = sina_data[sym]
+        code = sym[2:]  # sh600519 → 600519
         result[sym] = {
             "code": code,
-            "name": name,
-            "open": _safe_float(it.get("f17")),      # 今开
-            "high": _safe_float(it.get("f15")),       # 最高
-            "low": _safe_float(it.get("f16")),        # 最低
-            "close": _safe_float(it.get("f2")),       # 最新价
-            "volume": _safe_float(it.get("f5")) * 100,  # 成交量: 手→股
-            "amount": _safe_float(it.get("f6")),      # 成交额(元)
-            "pct_chg": _safe_float(it.get("f3")),     # 涨跌幅(%)
-            "amplitude": _safe_float(it.get("f7")),   # 振幅(%)
-            "turnover": _safe_float(it.get("f10")),   # 量比
+            "date": bar["date"],
+            "open": bar["open"],
+            "high": bar["high"],
+            "low": bar["low"],
+            "close": bar["close"],
+            "volume": bar["volume"],
         }
 
-    log(f"[东财] 获取 {len(result)} 只股票")
+    # 腾讯有但新浪没有的, 用腾讯补
+    for sym in qq_data:
+        if sym not in result:
+            bar = qq_data[sym]
+            code = sym[2:]
+            result[sym] = {
+                "code": code,
+                "date": bar["date"],
+                "open": bar["open"],
+                "high": bar["high"],
+                "low": bar["low"],
+                "close": bar["close"],
+                "volume": bar["volume"],
+            }
+
+    log(f"[日K] 最终: {len(result)} 只 (新浪:{len(sina_data)} 腾讯:{len(qq_data)})")
     return result
 
 
@@ -215,16 +395,14 @@ def fetch_daily_snapshot() -> Dict[str, Dict[str, Any]]:
 
 def fetch_15min_sina(sym: str, datalen: int = 100) -> Optional[List[Dict[str, Any]]]:
     """
-    新浪15分钟K线, 单只股票。
+    新浪15分钟K线, 单只股票。带重试。
 
     返回: [{"datetime": "2026-05-06 14:00:00", "open": float, ...}, ...]
     """
     url = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
     params = {"symbol": sym, "scale": 15, "ma": "no", "datalen": datalen}
     try:
-        r = _HTTP.get(url, params=params, timeout=8)
-        if r.status_code != 200:
-            return None
+        r = _retry_get(url, params=params, timeout=8, retries=2)
         data = json.loads(r.text)
         if not data:
             return None
@@ -253,6 +431,9 @@ def batch_fetch_15min(codes: List[str]) -> Dict[str, List[Dict[str, Any]]]:
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futs = {pool.submit(fetch_15min_sina, c): c for c in codes}
         for f in as_completed(futs):
+            if _INTERRUPTED:
+                log("⚠️ 收到中断信号, 停止拉取...")
+                break
             c = futs[f]
             try:
                 bars = f.result()
@@ -283,17 +464,23 @@ def write_snapshot_to_db(
     dry_run: bool = False,
 ) -> int:
     """
-    将东财快照数据写入DB (1D)。
+    将日K快照数据写入DB (1D)。
     每只股票写入1条当天数据。
+    时间来自数据源返回的交易日期, 非系统时间。
     """
     if dry_run:
         log(f"[写入1D] dry-run, 跳过 ({len(snapshot)} 只)")
         return len(snapshot)
 
     log(f"[写入1D] {len(snapshot)} 只...")
-    dt = _date_to_ts_midnight(today)
     records = []
     for sym, bar in snapshot.items():
+        # 时间必须来自数据源 (交易时间), 没有则跳过
+        date_str = bar.get("date")
+        if not date_str:
+            logger.warning(f"[写入1D] {sym} 缺少交易日期, 跳过")
+            continue
+        dt = _date_to_ts_midnight(date_str)
         records.append({
             "symbol": bar["code"],
             "timeframe": "1D",
@@ -322,27 +509,31 @@ def write_15min_to_db(
     dry_run: bool = False,
 ) -> int:
     """
-    将新浪15min数据写入DB。
-    每只股票写入多条15min数据。
+    将新浪15min数据写入DB (批量, 非逐只)。
+    时间经 normalize_15m_time 标准化: 9:30丢弃, 午休归11:30, 盘后归15:00。
     """
     if dry_run:
         total_bars = sum(len(bars) for bars in data.values())
         log(f"[写入15min] dry-run, 跳过 ({len(data)} 只, {total_bars} 条)")
         return total_bars
 
-    total_written = 0
-    total = len(data)
     t0 = time.time()
+    all_records = []
+    skipped = 0
 
-    for i, (sym, bars) in enumerate(data.items()):
+    for sym, bars in data.items():
         code = sym[2:]  # sh600000 → 600000
-        records = []
         for bar in bars:
             try:
                 dt = datetime.strptime(bar["datetime"][:16], "%Y-%m-%d %H:%M").replace(tzinfo=TZ_SH)
             except ValueError:
                 continue
-            records.append({
+            # 标准化 15m 时间 (9:30丢弃, 午休归11:30, 盘后归15:00)
+            dt = _normalize_15m_time(dt)
+            if dt is None:
+                skipped += 1
+                continue
+            all_records.append({
                 "symbol": code,
                 "timeframe": "15m",
                 "time": dt,
@@ -352,17 +543,17 @@ def write_15min_to_db(
                 "close": bar["close"],
                 "volume": bar["volume"],
             })
-        if records:
-            try:
-                result = writer.bulk_write(market, records, on_conflict="update", batch_size=5000)
-                total_written += result.get("inserted", 0)
-            except Exception as e:
-                logger.warning(f"写入15min失败 {code}: {e}")
 
-        if (i + 1) % 200 == 0 or i + 1 == total:
-            log(f"  [写入15min] {i+1}/{total} written={total_written} {time.time()-t0:.0f}s")
+    log(f"[写入15min] {len(data)} 只, {len(all_records)} 条记录, 跳过={skipped}条, 开始批量写入...")
 
-    log(f"[写入15min] 完成: {total_written} 条")
+    total_written = 0
+    try:
+        result = writer.bulk_write(market, all_records, on_conflict="update", batch_size=5000)
+        total_written = result.get("inserted", 0)
+    except Exception as e:
+        logger.warning(f"写入15min失败: {e}")
+
+    log(f"[写入15min] 完成: {total_written} 条 ({time.time()-t0:.0f}s)")
     return total_written
 
 
@@ -493,8 +684,7 @@ def _ensure_last_update_table(pool) -> None:
         with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS last_update (
-                    id          SERIAL PRIMARY KEY,
-                    updated_at  TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                    updated_at  TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW() PRIMARY KEY,
                     report      TEXT,
                     batch_size  INTEGER NOT NULL DEFAULT 0
                 )
@@ -506,7 +696,9 @@ def _insert_last_update(pool, report: str, batch_size: int) -> None:
     with pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO last_update (updated_at, report, batch_size) VALUES (NOW(), %s, %s)",
+                """INSERT INTO last_update (updated_at, report, batch_size)
+                   VALUES (NOW(), %s, %s)
+                   ON CONFLICT (updated_at) DO UPDATE SET report = EXCLUDED.report, batch_size = EXCLUDED.batch_size""",
                 (report, batch_size),
             )
     log(f"📝 last_update: {report}")
@@ -566,7 +758,7 @@ def do_full_fetch(
     全量拉取 + 存库。
 
     流程:
-      1. 东财 clist 1次HTTP拉全市场日K快照
+      1. 新浪+腾讯双源 30并发拉日K, 交叉验证
       2. 新浪 30并发拉全市场15min
       3. 写入DB
     """
@@ -589,17 +781,21 @@ def do_full_fetch(
         log(f"   模式: {'dry-run' if dry_run else '写入DB'}")
         log(f"{'='*60}")
 
-        # ── Step 1: 东财 1次HTTP 日K快照 ──
+        # ── Step 1: 新浪+腾讯双源日K ──
         snapshot = fetch_daily_snapshot()
         if not snapshot:
-            log("❌ 东财日K拉取失败!")
-            return {"error": "东财拉取失败"}
+            log("❌ 日K拉取失败! (新浪+腾讯均无数据)")
+            return {"error": "日K拉取失败"}
 
         codes = sorted(snapshot.keys())
         log(f"   有效股票: {len(codes)}")
 
         # ── Step 2: 新浪 30并发 15min ──
         data_15m = batch_fetch_15min(codes)
+
+        if _INTERRUPTED:
+            log("⚠️ 中断, 跳过写入DB")
+            return {"interrupted": True, "stocks": len(codes)}
 
         # ── Step 3: 写入DB ──
         log(f"\n{'='*40} 写入DB {'='*40}")
