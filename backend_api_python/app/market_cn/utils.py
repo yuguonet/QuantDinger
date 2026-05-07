@@ -1,30 +1,31 @@
 """
-market_cn 公共工具 — 缓存 + HTTP session + 重试
+market_cn 公共工具 — 缓存 + 重试 + 类型转换
 
+HTTP session 复用 app.utils.http.get_retry_session()
 缓存位置: data/market_cn_cache/macro_backend.pkl
-与 china_market.py 的 cache.pkl 同目录、同形式，互不干扰。
 """
 import os
 import time
 import pickle
 import logging
 import threading
-import requests
 from functools import wraps
 from datetime import datetime
 
+from app.utils.http import get_retry_session
+
 logger = logging.getLogger(__name__)
 
-# ── HTTP session ──────────────────────────────────────────────
+# ── HTTP session (复用 app.utils.http，补充请求头) ────────────
 
-_session = requests.Session()
+_session = get_retry_session(retries=2, backoff_factor=1.0)
 _session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "application/json, text/plain, */*",
     "Referer": "https://finance.sina.com.cn/",
 })
 
-def get_session() -> requests.Session:
+def get_session():
     return _session
 
 
@@ -64,6 +65,11 @@ def safe_int(v, default=0):
         return int(float(v))
     except (TypeError, ValueError):
         return default
+
+def safe_str(v, default=""):
+    if v is None or v == "-":
+        return default
+    return str(v)
 
 
 # ── 缓存 ─────────────────────────────────────────────────────

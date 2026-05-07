@@ -81,6 +81,9 @@ COORD_TIMEOUT = 25
 
 # bar 完成后的更新延迟（秒）—— 给远端数据源留出写入时间
 # 例: 10:00 的 bar，会在 10:00:30 之后才去拉取
+# [废弃] 新方案以远端实际返回数据为准，bar_index 按实际写入推进，
+# 不再需要 lag 来推断 bar 是否完成。时间校正由 _align_to_bar_schedule 统一处理。
+# 保留此常量仅供 _completed_bars_since（已废弃）参考，可安全删除。
 _UPDATE_LAG_SECONDS = 30
 
 # 15m 周期秒数（用于 delete_range 的 end_ts 偏移）
@@ -367,6 +370,10 @@ def _ts_to_bar_index(total_min: int) -> int:
 
     Returns:
         bar 序号（0~15），未找到返回 -1
+
+    [健壮性建议] 当前用 list.index() 线性查找（O(n)，n=16 可接受）。
+    如果 _ALL_BAR_TIMES 将来扩展，可改用 dict 映射:
+        _BAR_MIN_TO_IDX = {m: i for i, m in enumerate(_BAR_MINUTES)}
     """
     try:
         return _BAR_MINUTES.index(total_min)
@@ -514,6 +521,9 @@ def _delete_future_data(writer, symbol: str):
     """删除该 symbol 中 time > 当前时间的错误数据。
 
     远端数据偶尔会返回未来时间戳（时区错误等），必须清理。
+    [健壮性建议] datetime.now() 返回无时区的本地时间，而 bar 的 time 字段
+    可能是 timezone-aware 的 datetime，两者直接比较可能产生意外结果。
+    建议统一使用 datetime.now(_TZ_CN) 或 datetime.now(tz=timezone.utc)。
     """
     pool = _get_pool(writer)
     now_dt = datetime.now()
@@ -586,19 +596,10 @@ def _safe_upsert(writer, symbol: str, bars: List[Dict[str, Any]]) -> Dict[str, A
 # ================================================================
 
 def _completed_bars_since(last_bar_idx: int, now_ts: int) -> List[Tuple[int, int]]:
-    """返回已完成但尚未更新的 15m bar 列表。
+    """[已废弃] 返回已完成但尚未更新的 15m bar 列表。
 
-    判断逻辑:
-      - bar 已完成 = 当前时间 >= bar 收盘时间 + _UPDATE_LAG_SECONDS
-      - 尚未更新 = bar 序号 > last_bar_idx
-
-    Args:
-        last_bar_idx: 上次更新到的 bar 序号（0~15），-1 表示未开始
-        now_ts: 当前 Unix 时间戳（秒）
-
-    Returns:
-        [(bar_time_ts, bar_index), ...] 按时间升序
-        例: [(1715040000, 2), (1715040900, 3)] 表示第 3、4 根 bar 需要更新
+    废弃原因: 新方案以远端实际返回的数据为准，bar_index 按实际写入推进，
+    不再需要通过调度表推断哪些 bar 已完成。此函数不再被调用，可安全删除。
     """
     now_dt = datetime.fromtimestamp(now_ts, tz=_TZ_CN)
     base = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -730,9 +731,15 @@ def _backfill_batch(
         # 成功条件: 有清洗后的数据写入 且 无错误
         if cleaned_count > 0 and "error" not in result and result.get("errors", 0) == 0:
             success += 1
-            # 用实际写入的数据计算 bar index，而非调度表推断
-            for b in bars:
-                aligned_ts = _align_to_bar_schedule(int(b.get("time", 0)))
+            # 用 _clean_bars 的结果计算实际写入的最大 bar index
+            # 不能用 raw bars，因为 _validate_bar 可能丢弃了部分 bar（如 OHLC=0）
+            # 此时 raw bars 里有该 bar 但实际未写入，bar_index 就会虚高
+            # [健壮性建议] _clean_bars 在此被调用两次（此处 + _safe_upsert 内部），
+            # 纯函数无副作用所以结果一致，但有性能开销。
+            # 建议让 _safe_upsert 返回 cleaned bars 列表，避免重复计算。
+            cleaned_bars = _clean_bars(bars)
+            for b in cleaned_bars:
+                aligned_ts = b["time"]  # _clean_bars 已经做过 _align_to_bar_schedule
                 aligned_dt = datetime.fromtimestamp(aligned_ts, tz=_TZ_CN)
                 aligned_min = aligned_dt.hour * 60 + aligned_dt.minute
                 bar_idx = _ts_to_bar_index(aligned_min)
@@ -989,6 +996,7 @@ def run_once() -> Dict[str, Any]:
 
         # 始终尝试拉取 — 以远端返回的数据为准，不再用调度表推断
         # 远端有什么就写什么，没有就不写
+        # [健壮性建议] if True: 是遗留守卫，可移除（原条件 has_new_bars 已不再需要）
         if True:
             # 尝试拿锁（拿不到说明别人在跑）
             if not _acquire_lock(pool, "15m", today):
@@ -1036,6 +1044,8 @@ def run_once() -> Dict[str, Any]:
                         time.sleep(0.5)
 
                 # ── Step 3: 回写状态（按实际写入的 bar index 推进）──
+                # [健壮性建议] all_failed_codes 可能含重复项（Step 1 重试失败 + Step 2 再次失败），
+                # 建议写入前做 dedup: all_failed_codes = list(set(all_failed_codes))
                 new_bar_idx = actual_bar_idx
                 status = "ok" if not all_failed_codes else "partial"
                 _release_lock(pool, "15m", today, status, new_bar_idx, all_failed_codes)
