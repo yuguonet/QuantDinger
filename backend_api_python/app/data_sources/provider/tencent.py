@@ -297,52 +297,77 @@ class TencentDataSource:
         if not lowered:
             return {}
 
-        result: Dict[str, Dict[str, Any]] = {}
         batch_size = 500
+        batches = [lowered[i:i + batch_size] for i in range(0, len(lowered), batch_size)]
 
-        for i in range(0, len(lowered), batch_size):
-            batch = lowered[i:i + batch_size]
-            get_tencent_limiter().wait()
-            try:
-                resp = requests.get(
-                    f"https://qt.gtimg.cn/q={','.join(batch)}",
-                    headers=get_request_headers(referer=_tc_quote_referers.next()),
-                    timeout=timeout,
-                )
-                resp.encoding = "gbk"
-            except Exception:
-                continue
+        if len(batches) <= 1:
+            # 只有 1 批，直接串行，没必要开线程池
+            result: Dict[str, Dict[str, Any]] = {}
+            self._fetch_single_quote_batch(batches[0], result, timeout)
+            return result
 
-            for line in (resp.text or "").strip().split("\n"):
-                line = line.strip().rstrip(";")
-                if "=" not in line or '""' in line:
-                    continue
-                try:
-                    var_name, data = line.split("=", 1)
-                    parts = data.strip('"').split("~")
-                    if len(parts) < 6 or not parts[1]:
-                        continue
-                    for c in batch:
-                        if c in var_name:
-                            last = float(parts[3]) if parts[3] else 0
-                            if last <= 0:
-                                break
-                            prev = float(parts[4]) if parts[4] else 0
-                            chg = round(last - prev, 4) if prev else 0
-                            result[c] = {
-                                "last": last, "change": chg,
-                                "changePercent": round(chg / prev * 100, 2) if prev else 0,
-                                "high": float(parts[33]) if len(parts) > 33 and parts[33] else last,
-                                "low": float(parts[34]) if len(parts) > 34 and parts[34] else last,
-                                "open": float(parts[5]) if parts[5] else last,
-                                "previousClose": prev,
-                                "name": parts[1].strip(),
-                                "symbol": parts[2].strip(),
-                            }
-                            break
-                except Exception:
-                    continue
+        # 多批并发
+        import concurrent.futures
+        result: Dict[str, Dict[str, Any]] = {}
+        lock = threading.Lock()
+        max_workers = min(len(batches), 10)
+
+        def _fetch_batch(batch):
+            local: Dict[str, Dict[str, Any]] = {}
+            self._fetch_single_quote_batch(batch, local, timeout)
+            if local:
+                with lock:
+                    result.update(local)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(_fetch_batch, b) for b in batches]
+            concurrent.futures.wait(futures, timeout=timeout + 5)
 
         return result
+
+    def _fetch_single_quote_batch(
+        self, batch: List[str], result: Dict[str, Dict[str, Any]], timeout: int
+    ):
+        """单批次行情请求（内部辅助，供并发调用）"""
+        get_tencent_limiter().wait()
+        try:
+            resp = requests.get(
+                f"https://qt.gtimg.cn/q={','.join(batch)}",
+                headers=get_request_headers(referer=_tc_quote_referers.next()),
+                timeout=timeout,
+            )
+            resp.encoding = "gbk"
+        except Exception:
+            return
+
+        for line in (resp.text or "").strip().split("\n"):
+            line = line.strip().rstrip(";")
+            if "=" not in line or '""' in line:
+                continue
+            try:
+                var_name, data = line.split("=", 1)
+                parts = data.strip('"').split("~")
+                if len(parts) < 6 or not parts[1]:
+                    continue
+                for c in batch:
+                    if c in var_name:
+                        last = float(parts[3]) if parts[3] else 0
+                        if last <= 0:
+                            break
+                        prev = float(parts[4]) if parts[4] else 0
+                        chg = round(last - prev, 4) if prev else 0
+                        result[c] = {
+                            "last": last, "change": chg,
+                            "changePercent": round(chg / prev * 100, 2) if prev else 0,
+                            "high": float(parts[33]) if len(parts) > 33 and parts[33] else last,
+                            "low": float(parts[34]) if len(parts) > 34 and parts[34] else last,
+                            "open": float(parts[5]) if parts[5] else last,
+                            "previousClose": prev,
+                            "name": parts[1].strip(),
+                            "symbol": parts[2].strip(),
+                        }
+                        break
+            except Exception:
+                continue
 
 

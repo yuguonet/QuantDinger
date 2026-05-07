@@ -411,6 +411,9 @@ class DBKlineBridge:
                 need_refresh = entry is None or entry.is_remote_outdated
             if need_refresh:
                 self._refresh_today_15m(raw)
+        else:
+            # 盘后: 惰性触发全市场回填（17:00 后拉 1D）
+            self._backfill_db()
 
         # ── 从 DB 取数据 ──
         db_bars = self._fetch_from_db(raw, tf, lim)
@@ -470,6 +473,9 @@ class DBKlineBridge:
                     need_refresh = entry is None or entry.is_remote_outdated
                 if need_refresh:
                     self._refresh_today_15m(raw)
+        else:
+            # 盘后: 惰性触发全市场回填（17:00 后拉 1D）
+            self._backfill_db()
 
         result: Dict[str, List[Dict[str, Any]]] = {}
         need_remote: List[str] = []
@@ -839,124 +845,44 @@ class DBKlineBridge:
         logger.info(f"[DB桥接] {raw} tf={tf} 远程补充 bars={len(out)}")
         return out
 
-    def _backfill_db(self, raw: str, tf: str, bars: List[Dict[str, Any]]):
-        """将 K 线数据写入 DB。只存 15m，其余周期不存。
+    _run_once_lock = threading.Lock()
+    _last_run_once_ts: float = 0.0
 
-        写入保障:
-          1. 时间标准化 — 使用 A 股 15m bar 精确时间表对齐
-          2. 数据清洗 — OHLC > 0, high >= low, volume 缺失填 0
-          3. 先删后写 — 删除该 symbol + 时间范围旧数据，再 upsert
-          4. 删未来数据 — time > now 的错误数据一律清除
-          5. 唯一性 — (symbol, time) 唯一约束 + 先删后写双重保障
-          6. 防重复 — 查库中最新时间，数据已足够新则跳过
+    def _backfill_db(self, raw: str = "", tf: str = "", bars: list = None):
+        """非阻塞触发 backfill_db.run_once() 全市场回填。
+
+        fire-and-forget: 后台线程调用，不阻塞当前请求。
+        节流: 5 分钟内不重复触发。
         """
-        if tf != "15m":
+        now = time.time()
+        if now - self._last_run_once_ts < 300:
             return
+        with self._run_once_lock:
+            if now - self._last_run_once_ts < 300:
+                return
+            self._last_run_once_ts = now
+            t = threading.Thread(target=self._run_once_bg, daemon=True)
+            t.start()
 
-        from app.data_sources.backfill_db import _align_to_bar_schedule
-
-        # 防重复: 查库中该 symbol 最新一条的时间，落在当前 15m 窗口内就跳过
+    @staticmethod
+    def _run_once_bg():
+        from app.data_sources.backfill_db import run_once
         try:
-            recent = self._writer.query("CNStock", raw, "15m", limit=1)
-            if recent:
-                last_ts = recent[-1].get("time")
-                if isinstance(last_ts, datetime):
-                    last_ts = int(last_ts.timestamp())
-                # 最新数据在当前 15m 窗口内 → 不需要重复写
-                if last_ts > 0 and (time.time() - last_ts) < 900:
-                    return
-        except Exception:
-            pass  # 查不到就继续写
-
-        _15M_SEC = 900
-        now_ts = int(time.time())
-
-        # Step 1: 清洗 + 校验 + 标准化到 bar 时间表
-        seen: Dict[int, Dict] = {}
-        for b in bars:
-            ts = b.get("time", 0)
-            if not isinstance(ts, (int, float)) or ts <= 0:
-                continue
-            ts = _align_to_bar_schedule(int(ts))  # 标准化到精确 bar 时间
-            if ts <= 0:
-                continue
-
-            try:
-                o = float(b.get("open", 0))
-                h = float(b.get("high", 0))
-                l = float(b.get("low", 0))
-                c = float(b.get("close", 0))
-                v = b.get("volume", 0)
-                v = float(v) if v is not None and str(v).strip() not in ("", "-", "nan") else 0.0
-            except (TypeError, ValueError):
-                continue
-
-            if o <= 0 or h <= 0 or l <= 0 or c <= 0:
-                continue
-
-            if h < l:
-                h, l = l, h
-            if h < max(o, c):
-                h = max(o, c)
-            if l > min(o, c):
-                l = min(o, c)
-
-            seen[ts] = {
-                "time": ts,
-                "open": round(o, 4), "high": round(h, 4),
-                "low": round(l, 4), "close": round(c, 4),
-                "volume": round(max(v, 0), 2),
-            }
-
-        if not seen:
-            return
-
-        sorted_bars = sorted(seen.values(), key=lambda x: x["time"])
-        min_ts = sorted_bars[0]["time"]
-        max_ts = sorted_bars[-1]["time"]
-
-        records = [{"time": datetime.fromtimestamp(b["time"]), **{k: b[k] for k in ("open", "high", "low", "close", "volume")}} for b in sorted_bars]
-
-        # Step 2: 删除该时间范围旧数据 + 未来数据
-        try:
-            pool = self._mgr._get_pool("CNStock")
-            start_dt = datetime.fromtimestamp(min_ts)
-            end_dt = datetime.fromtimestamp(max_ts + _15M_SEC)
-            now_dt = datetime.now()
-            with pool.connection() as conn:
-                cur = conn.cursor()
-                for year in set([start_dt.year, end_dt.year, now_dt.year]):
-                    table = f"kline_15m_{year}"
-                    try:
-                        cur.execute(f'DELETE FROM "{table}" WHERE symbol = %s AND time >= %s AND time < %s', (raw, start_dt, end_dt))
-                        cur.execute(f'DELETE FROM "{table}" WHERE symbol = %s AND time > %s', (raw, now_dt))
-                    except Exception:
-                        pass
-                conn.commit()
+            result = run_once()
+            logger.info(f"[DB桥接] 全市场回填: {result}")
         except Exception as e:
-            logger.debug(f"[DB桥接] 清理旧数据失败 {raw}: {e}")
-
-        # Step 3: upsert 写入
-        try:
-            result = self._writer.upsert("CNStock", raw, tf, records)
-            logger.debug(
-                f"[DB桥接] 回填 {raw}/{tf}: "
-                f"+{result.get('inserted', 0)} ~{result.get('updated', 0)} "
-                f"清洗后={len(records)}"
-            )
-        except Exception as e:
-            logger.debug(f"[DB桥接] 回填失败 {raw}/{tf}: {e}")
+            logger.warning(f"[DB桥接] 全市场回填异常: {e}")
 
     def backfill_all_market(self, **kwargs):
-        """全市场 15m 回填 — 已委托给 backfill_db.py 的智能调度模块。
+        """全市场 15m 回填 — 委托给 backfill_db.py 的智能调度模块。
 
-        调用 start_backfill() 启动后台守护线程，按 bar 时间表智能调度，
+        调用 start_backfill() 启动智能回填，按 bar 时间表调度，
         只在每根 15m bar 完成后更新，收盘后自动聚合 1D。
 
         具体实现见 app.data_sources.backfill_db
         """
-        from app.data_sources.backfill_db import start_backfill
-        start_backfill()
+        from app.data_sources.backfill_db import run_once
+        return run_once(**kwargs)
 
 
 # ================================================================

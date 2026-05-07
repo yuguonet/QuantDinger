@@ -356,55 +356,82 @@ class SinaDataSource:
         sina_codes = [to_sina_code(c) for c in codes if c]
         if not sina_codes:
             return {}
+
         batch_size = 500
+        batches = [sina_codes[i:i + batch_size] for i in range(0, len(sina_codes), batch_size)]
+
+        if len(batches) <= 1:
+            # 只有 1 批，直接串行，没必要开线程池
+            result: Dict[str, Dict[str, Any]] = {}
+            self._fetch_single_quote_batch(batches[0], result, timeout)
+            return result
+
+        # 多批并发
+        import concurrent.futures
         result: Dict[str, Dict[str, Any]] = {}
+        lock = threading.Lock()
+        max_workers = min(len(batches), 10)
 
-        for i in range(0, len(sina_codes), batch_size):
-            batch = sina_codes[i:i + batch_size]
-            query = ",".join(batch)
-            _sina_quote_limiter.wait()
-            try:
-                resp = requests.get(
-                    f"https://hq.sinajs.cn/list={query}",
-                    headers=get_request_headers(referer=_sina_quote_referers.next()),
-                    timeout=timeout,
-                )
-                resp.encoding = "gbk"
-            except Exception as e:
-                logger.warning("[新浪批量行情] 请求失败: %s", e)
-                continue
+        def _fetch_batch(batch):
+            local: Dict[str, Dict[str, Any]] = {}
+            self._fetch_single_quote_batch(batch, local, timeout)
+            if local:
+                with lock:
+                    result.update(local)
 
-            for line in (resp.text or "").strip().split("\n"):
-                line = line.strip().rstrip(";")
-                m = re.search(r'hq_str_(\w+)="(.+?)"', line)
-                if not m:
-                    continue
-                code_str = m.group(1)
-                data = m.group(2)
-                parts = data.split(",")
-                if len(parts) < 6:
-                    continue
-                try:
-                    name = parts[0].strip()
-                    if not name:
-                        continue
-                    open_p = float(parts[1]) if parts[1] else 0.0
-                    prev_close = float(parts[2]) if parts[2] else 0.0
-                    last = float(parts[3]) if parts[3] else 0.0
-                    high = float(parts[4]) if parts[4] else 0.0
-                    low = float(parts[5]) if parts[5] else 0.0
-                    vol = float(parts[8]) if len(parts) > 8 and parts[8] else 0.0
-                    if last == 0 and prev_close == 0 and open_p == 0:
-                        continue
-                    chg = round(last - prev_close, 4) if prev_close else 0.0
-                    result[code_str] = {
-                        "name": name, "last": last, "change": chg,
-                        "changePercent": round(chg / prev_close * 100, 2) if prev_close else 0.0,
-                        "open": open_p, "high": high, "low": low,
-                        "previousClose": prev_close, "volume": vol, "symbol": code_str,
-                    }
-                except (ValueError, IndexError):
-                    continue
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(_fetch_batch, b) for b in batches]
+            concurrent.futures.wait(futures, timeout=timeout + 5)
+
         return result
+
+    def _fetch_single_quote_batch(
+        self, batch: List[str], result: Dict[str, Dict[str, Any]], timeout: int
+    ):
+        """单批次行情请求（内部辅助，供并发调用）"""
+        query = ",".join(batch)
+        _sina_quote_limiter.wait()
+        try:
+            resp = requests.get(
+                f"https://hq.sinajs.cn/list={query}",
+                headers=get_request_headers(referer=_sina_quote_referers.next()),
+                timeout=timeout,
+            )
+            resp.encoding = "gbk"
+        except Exception as e:
+            logger.warning("[新浪批量行情] 请求失败: %s", e)
+            return
+
+        for line in (resp.text or "").strip().split("\n"):
+            line = line.strip().rstrip(";")
+            m = re.search(r'hq_str_(\w+)="(.+?)"', line)
+            if not m:
+                continue
+            code_str = m.group(1)
+            data = m.group(2)
+            parts = data.split(",")
+            if len(parts) < 6:
+                continue
+            try:
+                name = parts[0].strip()
+                if not name:
+                    continue
+                open_p = float(parts[1]) if parts[1] else 0.0
+                prev_close = float(parts[2]) if parts[2] else 0.0
+                last = float(parts[3]) if parts[3] else 0.0
+                high = float(parts[4]) if parts[4] else 0.0
+                low = float(parts[5]) if parts[5] else 0.0
+                vol = float(parts[8]) if len(parts) > 8 and parts[8] else 0.0
+                if last == 0 and prev_close == 0 and open_p == 0:
+                    continue
+                chg = round(last - prev_close, 4) if prev_close else 0.0
+                result[code_str] = {
+                    "name": name, "last": last, "change": chg,
+                    "changePercent": round(chg / prev_close * 100, 2) if prev_close else 0.0,
+                    "open": open_p, "high": high, "low": low,
+                    "previousClose": prev_close, "volume": vol, "symbol": code_str,
+                }
+            except (ValueError, IndexError):
+                continue
 
 
