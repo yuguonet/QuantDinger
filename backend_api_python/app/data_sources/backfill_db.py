@@ -359,6 +359,21 @@ def _align_to_bar_schedule(ts: int) -> int:
     return int(aligned.timestamp())
 
 
+def _ts_to_bar_index(total_min: int) -> int:
+    """将分钟数（从午夜算起）转换为 bar 序号（0~15）。
+
+    Args:
+        total_min: 从午夜算起的分钟数，如 14:45 → 885
+
+    Returns:
+        bar 序号（0~15），未找到返回 -1
+    """
+    try:
+        return _BAR_MINUTES.index(total_min)
+    except ValueError:
+        return -1
+
+
 # ================================================================
 # 数据清洗
 # ================================================================
@@ -657,7 +672,7 @@ def _get_all_codes() -> List[str]:
 
 def _backfill_batch(
     codes: List[str], writer, cb, today_start_ts: int
-) -> Tuple[int, int, int, int, int, List[str]]:
+) -> Tuple[int, int, int, int, int, List[str], int]:
     """拉取一批股票的当日 15m 数据并写入 DB。
 
     流程:
@@ -674,7 +689,8 @@ def _backfill_batch(
         today_start_ts: 今天 00:00 的 Unix 时间戳
 
     Returns:
-        (成功数, coordinator失败数, 跳过数, 脏数据数, vol缺失数, 失败代码列表)
+        (成功数, coordinator失败数, 跳过数, 脏数据数, vol缺失数, 失败代码列表, 最大已写入bar序号)
+        最大已写入bar序号: 实际写入 DB 的最大 bar index（-1 表示无有效数据写入）
     """
     coord = get_coordinator()
     normalized = [normalize_cn_code(c) for c in codes]
@@ -686,6 +702,7 @@ def _backfill_batch(
 
     success = skip = dirty = vol_missing = 0
     failed_codes = list(failed) if failed else []
+    max_written_bar_idx = -1
 
     for code in codes:
         bars = coord_results.get(normalize_cn_code(code), [])
@@ -693,7 +710,7 @@ def _backfill_batch(
             skip += 1
             continue
 
-        # 只取当日 bar
+        # 只取当日 bar，不做额外时间过滤 — 以远端返回的数据为准
         bars = [b for b in bars if b.get("time", 0) >= today_start_ts]
         if not bars:
             skip += 1
@@ -713,12 +730,20 @@ def _backfill_batch(
         # 成功条件: 有清洗后的数据写入 且 无错误
         if cleaned_count > 0 and "error" not in result and result.get("errors", 0) == 0:
             success += 1
+            # 用实际写入的数据计算 bar index，而非调度表推断
+            for b in bars:
+                aligned_ts = _align_to_bar_schedule(int(b.get("time", 0)))
+                aligned_dt = datetime.fromtimestamp(aligned_ts, tz=_TZ_CN)
+                aligned_min = aligned_dt.hour * 60 + aligned_dt.minute
+                bar_idx = _ts_to_bar_index(aligned_min)
+                if bar_idx >= 0 and bar_idx > max_written_bar_idx:
+                    max_written_bar_idx = bar_idx
         else:
             skip += 1
             if "error" in result:
                 failed_codes.append(code)
 
-    return success, len(failed or []), skip, dirty, vol_missing, failed_codes
+    return success, len(failed or []), skip, dirty, vol_missing, failed_codes, max_written_bar_idx
 
 
 # ================================================================
@@ -883,9 +908,9 @@ def run_once() -> Dict[str, Any]:
       1. 非交易日 → 直接 skip
       2. 查 cn_last_update 获取上次进度（bar_index / failed_codes）
       3. 盘中 (9:44~15:00):
-         - 计算哪些 bar 已完成但未更新（bar_index 之后的）
+         - 从远端拉取当日 15m 数据（远端有什么就写什么）
          - 先重试 failed_codes 中的失败股票
-         - 再拉取新完成的 bar
+         - bar_index 按实际写入的最大 bar 推进（不依赖调度表推断）
          - 回写 cn_last_update（新的 bar_index + 失败列表）
       4. 收盘后 (15:00~17:00):
          - 拉最后一轮 15m（确保 15:00 的 bar 完整）
@@ -959,12 +984,12 @@ def run_once() -> Dict[str, Any]:
         last_bar_idx = state_15m["bar_index"] if state_15m else -1
         prev_failed = state_15m.get("failed_codes", []) if state_15m else []
 
-        # 检查是否有新 bar 或待重试
-        completed = _completed_bars_since(last_bar_idx, now_ts)
-        has_new_bars = len(completed) > 0
+        # 是否有待重试的失败股票
         has_retries = len(prev_failed) > 0
 
-        if has_new_bars or has_retries:
+        # 始终尝试拉取 — 以远端返回的数据为准，不再用调度表推断
+        # 远端有什么就写什么，没有就不写
+        if True:
             # 尝试拿锁（拿不到说明别人在跑）
             if not _acquire_lock(pool, "15m", today):
                 logger.info("[智能回填] 15m 已有进程在跑，跳过")
@@ -974,44 +999,44 @@ def run_once() -> Dict[str, Any]:
                 cb = get_realtime_circuit_breaker()
                 s_total = f_total = sk_total = d_total = vm_total = 0
                 all_failed_codes = []
+                actual_bar_idx = last_bar_idx  # 按实际写入推进
 
                 # ── Step 1: 重试上次失败的股票 ──
                 if has_retries:
                     logger.info(f"[智能回填] 重试 {len(prev_failed)} 只失败股票...")
                     retry_codes = [c for c in prev_failed if c in codes]
                     if retry_codes:
-                        s, f, sk, d, vm, fc = _backfill_batch(retry_codes, writer, cb, today_start)
+                        s, f, sk, d, vm, fc, w_idx = _backfill_batch(retry_codes, writer, cb, today_start)
                         s_total += s; f_total += f; sk_total += sk
                         d_total += d; vm_total += vm
                         all_failed_codes.extend(fc)
+                        if w_idx > actual_bar_idx:
+                            actual_bar_idx = w_idx
 
-                # ── Step 2: 拉取新完成的 bar ──
-                if has_new_bars:
-                    bar_names = [f"{_ALL_BAR_TIMES[i][0]}:{_ALL_BAR_TIMES[i][1]:02d}" for _, i in completed]
-                    logger.info(f"[智能回填] {len(completed)} 根新 bar: {', '.join(bar_names)}")
+                # ── Step 2: 拉取全市场数据 ──
+                pull_codes = codes
+                if has_retries:
+                    retry_set = set(prev_failed)
+                    pull_codes = [c for c in codes if c not in retry_set]
 
-                    # 排除已重试过的 codes，避免重复拉取
-                    pull_codes = codes
-                    if has_retries:
-                        retry_set = set(prev_failed)
-                        pull_codes = [c for c in codes if c not in retry_set]
+                for idx in range(0, len(pull_codes), BATCH_SIZE):
+                    batch = pull_codes[idx:idx + BATCH_SIZE]
+                    try:
+                        s, f, sk, d, vm, fc, w_idx = _backfill_batch(batch, writer, cb, today_start)
+                        s_total += s; f_total += f; sk_total += sk
+                        d_total += d; vm_total += vm
+                        all_failed_codes.extend(fc)
+                        if w_idx > actual_bar_idx:
+                            actual_bar_idx = w_idx
+                    except Exception as e:
+                        logger.error(f"[智能回填] 批次异常: {e}")
+                        f_total += len(batch)
+                        all_failed_codes.extend(batch)
+                    if idx + BATCH_SIZE < len(pull_codes):
+                        time.sleep(0.5)
 
-                    for idx in range(0, len(pull_codes), BATCH_SIZE):
-                        batch = pull_codes[idx:idx + BATCH_SIZE]
-                        try:
-                            s, f, sk, d, vm, fc = _backfill_batch(batch, writer, cb, today_start)
-                            s_total += s; f_total += f; sk_total += sk
-                            d_total += d; vm_total += vm
-                            all_failed_codes.extend(fc)
-                        except Exception as e:
-                            logger.error(f"[智能回填] 批次异常: {e}")
-                            f_total += len(batch)
-                            all_failed_codes.extend(batch)
-                        if idx + BATCH_SIZE < len(pull_codes):
-                            time.sleep(0.5)
-
-                # ── Step 3: 回写状态 ──
-                new_bar_idx = max(last_bar_idx, max(i for _, i in completed)) if completed else last_bar_idx
+                # ── Step 3: 回写状态（按实际写入的 bar index 推进）──
+                new_bar_idx = actual_bar_idx
                 status = "ok" if not all_failed_codes else "partial"
                 _release_lock(pool, "15m", today, status, new_bar_idx, all_failed_codes)
 
@@ -1032,8 +1057,6 @@ def run_once() -> Dict[str, Any]:
                 _release_lock(pool, "15m", today, "failed", last_bar_idx, prev_failed)
                 logger.error(f"[智能回填] 15m 异常: {e}")
                 raise
-        else:
-            logger.info("[智能回填] 15m 已是最新，无需更新")
 
     # ════════════════════════════════════════════════════════
     # 1D 更新（17:00 后）
