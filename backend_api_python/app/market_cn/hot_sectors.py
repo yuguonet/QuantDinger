@@ -15,10 +15,9 @@ import logging
 import requests
 import pandas as pd
 from datetime import datetime
+from functools import wraps
 import time
 import json
-
-from .utils import retry as _retry, safe_float as _safe_num, safe_str as _safe_str
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +25,44 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Referer": "https://data.eastmoney.com/",
 }
+
+# ═══════════════════════════════════════════════════
+#  工具函数
+# ═══════════════════════════════════════════════════
+
+def _retry(max_retries=2, delay=1):
+    """重试装饰器"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_err = None
+            for i in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_err = e
+                    if i < max_retries:
+                        time.sleep(delay)
+            raise last_err
+        return wrapper
+    return decorator
+
+
+def _safe_num(val, default=0):
+    """安全转数值：处理 '-', None, '' 等东方财富特殊值"""
+    if val is None or val == "" or val == "-":
+        return default
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_str(val, default=""):
+    """安全取字符串"""
+    if val is None or val == "-":
+        return default
+    return str(val)
 
 
 # ═══════════════════════════════════════════════════

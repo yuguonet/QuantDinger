@@ -1,18 +1,55 @@
 """
-market_cn — 国内市场宏观数据模块
+🇨🇳 china-market-tools — 中国金融市场分析工具箱
 
-统一入口: MacroCNBackend (macro_backend.py)
-
-模块结构:
-    macro_backend.py  — 统一入口类，惰性缓存 + 并行拉取
-    sentiment.py      — A股恐贪指数 (东方财富涨跌统计)
-    futures_vol.py    — 期货波动率 (新浪期货)
-    hot_sectors.py    — 热门板块 (东方财富板块行情)
-    china_market.py   — 政策新闻 (news_service)
-    utils.py          — 公共工具: HTTP session, 缓存, 重试
+宏观数据 / A股贪恐指数 / AI政策解读 / 热门板块分析 / 板块历史趋势+周期+预测
 
 用法:
-    from app.market_cn.macro_backend import MacroCNBackend
-    backend = MacroCNBackend()
-    data = backend.fetch_all()
+    from china_market_tools import ChinaData, fear_greed_index
+    from china_market_tools import get_hot_industry_boards, get_hot_concept_boards
+    from china_market_tools import SectorAnalyzer, SectorHistoryScheduler
+
+    data = ChinaData()
+    df = data.gdp()
+
+    result = fear_greed_index()
+    sectors = get_all_hot_sectors()
+
+    # 历史分析
+    analyzer = SectorAnalyzer(db)
+    trend = analyzer.full_analysis("industry")
+
+    # 统一入口（带缓存，推荐）
+    from app.market_cn import get_china_macro, get_fear_greed, get_policy
+    macro = get_china_macro()  # 自动缓存
+
+    # 需要原始版（无缓存）直接从子模块导入
+    from app.market_cn.sector_history import get_sector_trend
 """
+
+__version__ = "1.3.0"
+
+from .china_stock import ChinaData
+from .fear_greed_index import fear_greed_index
+from .hot_sectors import (
+    get_hot_industry_boards,
+    get_hot_concept_boards,
+    get_sector_detail,
+    get_all_hot_sectors,
+)
+from .sector_history import (
+    SectorAnalyzer,
+    SectorHistoryScheduler,
+)
+from .china_market import (
+    get_china_macro,
+    get_fear_greed,
+    get_policy,
+    get_hot_sectors,
+    get_sector_stocks,
+    get_sector_trend,
+    get_sector_prediction,
+    get_sector_history,
+    get_sector_cycle,
+    get_emotion_history,
+    refresh as refresh_cn,
+)
