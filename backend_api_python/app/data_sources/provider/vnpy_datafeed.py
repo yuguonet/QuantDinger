@@ -297,7 +297,7 @@ class VnpyDataSource:
             "previousClose": prev, "volume": _f("f47"), "amount": _f("f48"),
         }
 
-    def fetch_tickers(self, codes: List[str], timeout: int = 10) -> Dict[str, Dict[str, Any]]:
+    def fetch_batch_quotes(self, codes: List[str], timeout: int = 10) -> Dict[str, Dict[str, Any]]:
         """
         批量获取多只股票实时行情。
 

@@ -293,7 +293,7 @@ class AkShareDataSource:
         """单只行情 — AkShare 不支持，返回 None (由其他源提供)"""
         return None
 
-    def fetch_tickers(self, codes: List[str], timeout: int = 15) -> Dict[str, Dict[str, Any]]:
+    def fetch_batch_quotes(self, codes: List[str], timeout: int = 15) -> Dict[str, Dict[str, Any]]:
         """
         批量获取A股实时行情 — 通过全市场行情接口 (stock_zh_a_spot_em)。
 

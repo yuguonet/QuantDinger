@@ -292,7 +292,7 @@ class EastMoneyDataSource:
             "symbol": secid,
         }
 
-    def fetch_tickers(self, codes: List[str], timeout: int = 15) -> Dict[str, Dict[str, Any]]:
+    def fetch_batch_quotes(self, codes: List[str], timeout: int = 15) -> Dict[str, Dict[str, Any]]:
         """
         批量获取全市场实时行情 — 单次HTTP请求。
 

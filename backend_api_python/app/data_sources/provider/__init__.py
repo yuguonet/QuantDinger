@@ -13,7 +13,7 @@ A股数据源 Provider 框架 — 自注册 + 能力声明 + 统一接口
     上层代码不需要硬编码 import 列表，只需调用 get_providers() 获取可用源。
   - 能力声明: 每个 Provider 在 capabilities 字典中声明自己支持的能力（kline/quote/batch_quote）、
     支持的K线周期（kline_tf）、支持的市场（markets）。编排层按声明过滤，避免跨市场误调用。
-  - 统一接口: 所有 Provider 实现相同的 fetch_kline / fetch_ticker / fetch_tickers 方法签名，
+  - 统一接口: 所有 Provider 实现相同的 fetch_kline / fetch_ticker / fetch_batch_quotes 方法签名，
     编排层可以无差别地调用任何源。
 
 在架构中的位置:
@@ -114,7 +114,7 @@ class BaseDataSource(Protocol):
       1. fetch_kline       — 单只K线
       2. fetch_kline_batch  — 批量K线
       3. fetch_ticker       — 单只行情
-      4. fetch_tickers — 批量行情
+      4. fetch_batch_quotes — 批量行情
 
     不支持的接口返回 NotSupportedResult（而非 None 或抛异常），
     以便 Coordinator 快速识别并切换到其他数据源。
@@ -200,7 +200,7 @@ class BaseDataSource(Protocol):
         """
         ...
 
-    def fetch_tickers(self, codes: List[str], timeout: int = 10) -> Dict[str, Dict[str, Any]]:
+    def fetch_batch_quotes(self, codes: List[str], timeout: int = 10) -> Dict[str, Dict[str, Any]]:
         """
         批量获取实时行情（单次HTTP请求）。
 

@@ -374,8 +374,8 @@ class TwelveDataSource:
             "symbol": f"{symbol}.{exchange}",
         }
 
-    def fetch_tickers(
+    def fetch_batch_quotes(
         self, codes: List[str], timeout: int = 10,
     ) -> Dict[str, Dict[str, Any]]:
         """批量行情 — Twelve Data 不支持批量行情，返回 NotSupportedResult"""
-        return NotSupportedResult(self.name, "fetch_tickers")
+        return NotSupportedResult(self.name, "fetch_batch_quotes")

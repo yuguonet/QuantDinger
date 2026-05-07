@@ -936,7 +936,7 @@ class Coordinator:
         直接调用 — 不加任何并发/重试/熔断逻辑。
 
         使用场景: 当调用方已经知道自己要调什么、不需要 Coordinator 的调度能力时。
-        例如: CNStockDataSource.get_batch_quotes() 直接调用 Provider 的 fetch_tickers()。
+        例如: CNStockDataSource.get_batch_quotes() 直接调用 Provider 的 fetch_batch_quotes()。
 
         为什么不直接调 fn？
         保留统一入口，方便以后加日志/监控/限流等横切关注点。
@@ -1060,6 +1060,6 @@ def Coordinator_direct_call(fn: Callable, *args, **kwargs):
 
     示例:
         from app.data_sources.coordinator import Coordinator_direct_call
-        result = Coordinator_direct_call(provider.fetch_tickers, symbols)
+        result = Coordinator_direct_call(provider.fetch_batch_quotes, symbols)
     """
     return _coordinator.direct_call(fn, *args, **kwargs)
