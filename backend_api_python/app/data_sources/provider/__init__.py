@@ -42,6 +42,7 @@ import pkgutil
 import threading
 from typing import Any, Callable, Dict, List, Optional, Protocol, Set, Tuple, runtime_checkable
 
+from app.data_sources.normalizer import normalize_cn_code
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -314,7 +315,7 @@ def _all_market_kline_via_quotes(
             "turnover": 0,
             "timestamp": bar_ts,
         }
-        result[code] = [bar]
+        result[normalize_cn_code(code)] = [bar]
     return result
 
 
@@ -364,7 +365,7 @@ def _batch_fetch_kline_by_codes(
             )
             if bars:
                 with lock:
-                    result[code] = bars
+                    result[normalize_cn_code(code)] = bars
 
         max_workers = min(len(batch), 8)
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:

@@ -672,12 +672,13 @@ def _get_all_codes() -> List[str]:
 
 def _backfill_batch(
     codes: List[str], writer, cb, today_start_ts: int,
+    market_data: Dict[str, List[Dict]] = None,
     force: bool = False, preferred_source: str = "",
 ) -> Tuple[int, int, int, int, int, List[str], int]:
     """拉取一批股票的当日 15m 数据并写入 DB。
 
     流程:
-      1. 通过 Coordinator.direct_call 调用 provider.fetch_kline_batch 真批量拉取
+      1. 从预拉取的全市场数据中筛选本批次 codes
       2. 过滤出 today_start_ts 之后的 bar（只保留当日）
       3. 统计 volume 缺失情况
       4. _safe_upsert 写入 DB
@@ -688,6 +689,8 @@ def _backfill_batch(
         writer: MarketKlineWriter 实例
         cb: CircuitBreaker 实例（熔断器，远端不可用时快速失败）
         today_start_ts: 今天 00:00 的 Unix 时间戳
+        market_data: 预拉取的全市场 K 线数据（由 run_once 通过
+                     coordinate_market_kline 一次拉取，此处筛选使用）
         force: 强制模式，跳过时间窗口过滤（写入所有可用 bar）
         preferred_source: 锁定数据源名称，防止 coordinator 换源
 
@@ -695,48 +698,23 @@ def _backfill_batch(
         (成功数, coordinator失败数, 跳过数, 脏数据数, vol缺失数, 失败代码列表, 最大已写入bar序号)
         最大已写入bar序号: 实际写入 DB 的最大 bar index（-1 表示无有效数据写入）
     """
-    from app.data_sources.provider import get_providers_with_batch
-    from app.data_sources.coordinator import get_coordinator
-
-    coord = get_coordinator()
-    normalized = [normalize_cn_code(c) for c in codes]
-
-    # 查找支持批量 K 线的 provider
-    batch_providers = get_providers_with_batch(timeframe="15m", market="CNStock")
-    provider = None
-    for p, has_batch in batch_providers:
-        if not has_batch:
-            continue
-        if preferred_source and p.name != preferred_source:
-            continue
-        if not cb.is_available(p.name):
-            continue
-        provider = p
-        break
-
-    # 批量拉取
     coord_results: Dict[str, List[Dict]] = {}
     failed_codes: List[str] = []
 
-    if provider:
-        try:
-            coord_results = coord.direct_call(
-                provider.fetch_kline_batch, normalized, "15m", BARS_PER_STOCK, "qfq", COORD_TIMEOUT,
-            )
-            if not coord_results:
-                coord_results = {}
-            # 未返回数据的股票记为失败
-            for code in codes:
-                if normalize_cn_code(code) not in coord_results:
-                    failed_codes.append(code)
-            cb.record_success(provider.name)
-        except Exception as e:
-            logger.warning(f"[智能回填] fetch_kline_batch 失败: {e}")
-            cb.record_failure(provider.name, str(e))
-            failed_codes = list(codes)
+    if market_data:
+        # 从全市场数据中筛选本批次
+        for code in codes:
+            ncode = normalize_cn_code(code)
+            if ncode in market_data:
+                coord_results[ncode] = market_data[ncode]
+            else:
+                failed_codes.append(code)
     else:
-        # 无批量源，回退到逐只拉取
-        logger.info("[智能回填] 无批量源，回退 coordinate_kline")
+        # market_data 未传入时回退到逐只拉取（兼容旧调用路径）
+        from app.data_sources.coordinator import get_coordinator
+        coord = get_coordinator()
+        normalized = [normalize_cn_code(c) for c in codes]
+        logger.info("[智能回填] 无预拉取数据，回退 coordinate_kline")
         coord_results, failed = coord.coordinate_kline(
             symbols=normalized, timeframe="15m", limit=BARS_PER_STOCK,
             cb=cb, market="CNStock", timeout=COORD_TIMEOUT, adj="qfq",
@@ -885,23 +863,24 @@ def _upsert_daily(writer, symbol: str, bars: List[Dict[str, Any]]) -> bool:
         return False
 
 
-def _update_daily_bars(writer, codes: List[str], preferred_source: str = "") -> List[str]:
-    """从远端批量拉取当日 1D 数据并写入 DB。
+def _update_daily_bars(writer, codes: List[str],
+                       market_data: Dict[str, List[Dict]] = None,
+                       preferred_source: str = "") -> List[str]:
+    """从远端拉取当日 1D 数据并写入 DB。
 
-    通过 Coordinator.direct_call 调用 provider.fetch_kline_batch 真批量拉取，
+    通过 Coordinator.coordinate_market_kline 一次拉取全市场 1D 数据，
     比从 15m 聚合更可靠 — 数据源的官方日 OHLCV 不会有聚合误差。
 
     Args:
         writer: MarketKlineWriter 实例
         codes: 全市场股票代码列表
+        market_data: 预拉取的全市场 1D 数据（由 run_once 通过
+                     coordinate_market_kline 一次拉取，此处直接使用）
         preferred_source: 锁定数据源名称，防止 coordinator 换源
 
     Returns:
         失败的股票代码列表（用于写入 cn_last_update.failed_codes 重试）
     """
-    from app.data_sources.provider import get_providers_with_batch
-    from app.data_sources.coordinator import get_coordinator
-
     today_dt = datetime.fromtimestamp(_today_ts(), tz=_TZ_CN)
     year = today_dt.year
 
@@ -912,74 +891,24 @@ def _update_daily_bars(writer, codes: List[str], preferred_source: str = "") -> 
         logger.warning(f"[智能回填] 确保 1D 表失败: {e}")
         return codes
 
-    coord = get_coordinator()
-    cb = get_realtime_circuit_breaker()
+    coord_results = market_data or {}
     total = len(codes)
-    success = skip = fail = 0
-    all_failed_codes = []
+    success = skip = 0
+    all_failed_codes: List[str] = []
 
-    # 查找支持批量 K 线的 provider
-    batch_providers = get_providers_with_batch(timeframe="1D", market="CNStock")
-    provider = None
-    for p, has_batch in batch_providers:
-        if not has_batch:
-            continue
-        if preferred_source and p.name != preferred_source:
-            continue
-        if not cb.is_available(p.name):
-            continue
-        provider = p
-        break
+    logger.info(f"[智能回填] 开始远端 1D 写入: {total} 只 (数据源命中 {len(coord_results)} 只)")
 
-    logger.info(f"[智能回填] 开始远端 1D 拉取: {total} 只")
-
-    for i in range(0, total, BATCH_SIZE):
-        batch = codes[i:i + BATCH_SIZE]
-        batch_num = i // BATCH_SIZE + 1
-        total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
-        normalized = [normalize_cn_code(c) for c in batch]
-
-        coord_results: Dict[str, List[Dict]] = {}
-        batch_failed: List[str] = []
-
-        if provider:
-            try:
-                coord_results = coord.direct_call(
-                    provider.fetch_kline_batch, normalized, "1D", 5, "qfq", COORD_TIMEOUT,
-                )
-                if not coord_results:
-                    coord_results = {}
-                for code in batch:
-                    if normalize_cn_code(code) not in coord_results:
-                        batch_failed.append(code)
-                cb.record_success(provider.name)
-            except Exception as e:
-                logger.warning(f"[智能回填] 1D fetch_kline_batch 失败: {e}")
-                cb.record_failure(provider.name, str(e))
-                batch_failed = list(batch)
+    for code in codes:
+        bars = coord_results.get(normalize_cn_code(code), [])
+        if not bars:
+            skip += 1  # 远端无数据（停牌/退市等），不计入 failed，避免无意义重试
+        elif _upsert_daily(writer, code, bars):
+            success += 1
         else:
-            coord_results, failed = coord.coordinate_kline(
-                symbols=normalized, timeframe="1D", limit=5,
-                cb=cb, market="CNStock", timeout=COORD_TIMEOUT, adj="qfq",
-                preferred_source=preferred_source,
-            )
-            if failed:
-                batch_failed.extend(failed)
+            skip += 1
+            all_failed_codes.append(code)  # upsert 失败，下次重试
 
-        for code in batch:
-            bars = coord_results.get(normalize_cn_code(code), [])
-            if not bars:
-                skip += 1
-            elif _upsert_daily(writer, code, bars):
-                success += 1
-            else:
-                skip += 1
-
-        fail += len(batch_failed)
-        all_failed_codes.extend(batch_failed)
-        logger.info(f"[智能回填] 1D 批次 {batch_num}/{total_batches}: 成功={success} 失败={fail} 跳过={skip}")
-
-    logger.info(f"[智能回填] 1D 远端拉取完成: 成功={success} 失败={fail} 跳过={skip}")
+    logger.info(f"[智能回填] 1D 远端拉取完成: 成功={success} 失败={len(all_failed_codes)} 跳过={skip}")
     return all_failed_codes
 
 
@@ -1100,23 +1029,36 @@ def run_once(force: bool = False, preferred_source: str = "") -> Dict[str, Any]:
 
             try:
                 cb = get_realtime_circuit_breaker()
+                coord = get_coordinator()
                 s_total = f_total = sk_total = d_total = vm_total = 0
                 all_failed_codes = []
                 actual_bar_idx = last_bar_idx  # 按实际写入推进
+
+                # ── 全市场 15m 一次拉取 ──
+                logger.info("[智能回填] coordinate_market_kline 全市场 15m 拉取...")
+                market_data_15m = coord.coordinate_market_kline(
+                    cb=cb, market="CNStock", timeframe="15m",
+                    count=BARS_PER_STOCK, adj="qfq", timeout=COORD_TIMEOUT,
+                    preferred_source=preferred_source,
+                )
+                if market_data_15m:
+                    logger.info(f"[智能回填] 全市场 15m 命中 {len(market_data_15m)} 只")
+                else:
+                    logger.warning("[智能回填] 全市场 15m 拉取为空")
 
                 # ── Step 1: 重试上次失败的股票 ──
                 if has_retries:
                     logger.info(f"[智能回填] 重试 {len(prev_failed)} 只失败股票...")
                     retry_codes = [c for c in prev_failed if c in codes]
                     if retry_codes:
-                        s, f, sk, d, vm, fc, w_idx = _backfill_batch(retry_codes, writer, cb, today_start, force=force, preferred_source=preferred_source)
+                        s, f, sk, d, vm, fc, w_idx = _backfill_batch(retry_codes, writer, cb, today_start, market_data=market_data_15m, force=force, preferred_source=preferred_source)
                         s_total += s; f_total += f; sk_total += sk
                         d_total += d; vm_total += vm
                         all_failed_codes.extend(fc)
                         if w_idx > actual_bar_idx:
                             actual_bar_idx = w_idx
 
-                # ── Step 2: 拉取全市场数据 ──
+                # ── Step 2: 拉取全市场数据（使用已拉取的全市场数据）──
                 pull_codes = codes
                 if has_retries and not force:
                     retry_set = set(prev_failed)
@@ -1125,7 +1067,7 @@ def run_once(force: bool = False, preferred_source: str = "") -> Dict[str, Any]:
                 for idx in range(0, len(pull_codes), BATCH_SIZE):
                     batch = pull_codes[idx:idx + BATCH_SIZE]
                     try:
-                        s, f, sk, d, vm, fc, w_idx = _backfill_batch(batch, writer, cb, today_start, force=force, preferred_source=preferred_source)
+                        s, f, sk, d, vm, fc, w_idx = _backfill_batch(batch, writer, cb, today_start, market_data=market_data_15m, force=force, preferred_source=preferred_source)
                         s_total += s; f_total += f; sk_total += sk
                         d_total += d; vm_total += vm
                         all_failed_codes.extend(fc)
@@ -1135,9 +1077,6 @@ def run_once(force: bool = False, preferred_source: str = "") -> Dict[str, Any]:
                         logger.error(f"[智能回填] 批次异常: {e}")
                         f_total += len(batch)
                         all_failed_codes.extend(batch)
-                    if idx + BATCH_SIZE < len(pull_codes):
-                        time.sleep(0.5)
-
                 # ── Step 3: 回写状态（按实际写入的 bar index 推进）──
                 new_bar_idx = actual_bar_idx
                 status = "ok" if not all_failed_codes else "partial"
@@ -1176,18 +1115,33 @@ def run_once(force: bool = False, preferred_source: str = "") -> Dict[str, Any]:
                     action = "locked"
             else:
                 try:
+                    coord = get_coordinator()
+                    cb = get_realtime_circuit_breaker()
+
+                    # ── 全市场 1D 一次拉取 ──
+                    logger.info("[智能回填] coordinate_market_kline 全市场 1D 拉取...")
+                    market_data_1d = coord.coordinate_market_kline(
+                        cb=cb, market="CNStock", timeframe="1D",
+                        count=5, adj="qfq", timeout=COORD_TIMEOUT,
+                        preferred_source=preferred_source,
+                    )
+                    if market_data_1d:
+                        logger.info(f"[智能回填] 全市场 1D 命中 {len(market_data_1d)} 只")
+                    else:
+                        logger.warning("[智能回填] 全市场 1D 拉取为空")
+
                     # 合并重试列表和全量列表
                     retry_1d = [c for c in prev_failed_1d if c in codes]
                     pull_1d = codes
                     if retry_1d:
                         logger.info(f"[智能回填] 1D 重试 {len(retry_1d)} 只...")
                         pull_1d = list(set(codes) - set(retry_1d))
-                        retry_result = _update_daily_bars(writer, retry_1d, preferred_source=preferred_source)
+                        retry_result = _update_daily_bars(writer, retry_1d, market_data=market_data_1d, preferred_source=preferred_source)
                         # 重试成功的从失败列表移除
                         retry_failed_set = set(retry_result)
                         prev_failed_1d = [c for c in prev_failed_1d if c in retry_failed_set]
 
-                    failed_1d = _update_daily_bars(writer, pull_1d, preferred_source=preferred_source)
+                    failed_1d = _update_daily_bars(writer, pull_1d, market_data=market_data_1d, preferred_source=preferred_source)
                     all_failed_1d = list(set(prev_failed_1d + failed_1d))
 
                     status = "ok" if not all_failed_1d else "partial"

@@ -35,6 +35,10 @@
     1只股票 × 多个源 → 并发抢答 → 第一个返回有效价格的直接用
     场景: 获取实时报价、自选股价格刷新
 
+  模式 D — 全市场批量K线 (coordinate_market_kline):
+    全市场 × 单源批量请求 → 逐源 fallback → 第一个成功的直接用
+    场景: 全市场K线加载、全市场行情快照
+
 === 两种源指定方式 ===
 
   方式 1 — 自动发现（推荐）:
@@ -468,13 +472,17 @@ class Coordinator:
     """
     协助层 — 并发调度引擎。
 
-    提供两种调度模式:
-      - coordinate_kline:  K线批量获取（动态队列 + 多源 fallback）
-      - coordinate_ticker: 实时行情 Race（多源并发抢答）
+    提供三种调度模式:
+      - coordinate_kline:        K线批量获取（动态队列 + 多源 fallback）
+      - coordinate_ticker:       实时行情 Race（多源并发抢答）
+      - coordinate_market_kline: 全市场批量K线（单源批量请求 + 多源 fallback）
+      - coordinate_batch_quotes: 批量行情（单源批量请求 + 多源 fallback）
 
     两种模式的区别:
       coordinate_kline:  N只股票 × M个源 → 动态分配 → 每只股票只要有一个源成功就行
       coordinate_ticker: 1只股票 × M个源 → 并发抢答 → 第一个返回有效数据的直接用
+      coordinate_market_kline: 全市场 × 单源批量 → 逐源 fallback → 第一个成功的直接用
+      coordinate_batch_quotes: N只股票 × 单源批量 → 逐源 fallback → 第一个成功的直接用
     """
 
     def __init__(self):
@@ -1012,6 +1020,109 @@ class Coordinator:
                 logger.debug("[协助层] batch_quotes %s 失败: %s", p.name, e)
 
         logger.warning("[协助层] batch_quotes %d只 所有源失败", len(symbols))
+        return {}
+
+    # ================================================================
+    # 模式 D: 全市场批量K线 — 优先走 fetch_market_kline，逐源 fallback
+    # ================================================================
+
+    def coordinate_market_kline(
+        self,
+        cb: CircuitBreaker,
+        market: str = "",
+        timeframe: str = "1D",
+        count: int = 300,
+        adj: str = "qfq",
+        timeout: float = 15.0,
+        preferred_source: str = "",
+        start_date: str = "",
+        end_date: str = "",
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        全市场批量K线 — 优先走 fetch_market_kline，逐源 fallback。
+
+        和 coordinate_kline 的区别:
+          coordinate_kline:        N只股票 × M个源 → 动态队列逐只分配
+          coordinate_market_kline: 全市场 × 单源批量请求 × 多源 fallback
+
+        流程:
+          1. 从 Provider 层发现支持 kline_batch 的源（按 priority 排序）
+          2. 逐源尝试 fetch_market_kline(timeframe, count, ...)
+          3. 第一个成功返回非空结果的直接用
+          4. 全部失败返回空 dict
+
+        Args:
+            cb:      熔断器
+            market:  市场名称（"CNStock" / "HKStock" / ...）
+            timeframe: K线周期（"1D" / "5m" / ...）
+            count:   每只股票的数据条数（None 时走批量行情快照路径）
+            adj:     复权方式（"qfq" 前复权 / "hfq" 后复权 / "" 不复权）
+            timeout: 超时（秒）
+            preferred_source: 指定首选源（如 "tencent"），优先尝试
+            start_date: 起始日期（"YYYY-MM-DD"），提供时用交易日历反推 count
+            end_date:   结束日期（"YYYY-MM-DD"），为空则取今天
+
+        Returns:
+            {code: kline_bars} — 仅包含成功获取到数据的代码
+        """
+        from app.data_sources.provider import get_providers, NotSupportedResult
+
+        # 发现支持 kline_batch 的源（即实现了 fetch_market_kline 的 Provider）
+        providers = get_providers(capability="kline_batch", timeframe=timeframe, market=market)
+
+        # 非批量路线提醒：count 有值或 end_date 不是今天时，
+        # Provider 内部会走逐只并发而非单次批量行情快照
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        today_str = _dt.now(_tz(_td(hours=8))).strftime("%Y-%m-%d")
+        if count is not None or (end_date and end_date != today_str):
+            msg = (
+                f"[协助层] market_kline 非批量路线: count={count}, end_date={end_date or '(空)'}, "
+                f"today={today_str} → Provider 将走逐只并发 fetch_kline 而非批量行情快照"
+            )
+            logger.info(msg)
+            print(msg)
+        if not providers:
+            logger.warning("[协助层] market_kline market=%s tf=%s 无可用源", market, timeframe)
+            return {}
+
+        # 按 preferred_source 排序
+        if preferred_source:
+            preferred = [p for p in providers if p.name == preferred_source]
+            others = [p for p in providers if p.name != preferred_source]
+            providers = preferred + others
+
+        # 逐源尝试
+        for p in providers:
+            if not cb.is_available(p.name):
+                logger.debug("[协助层] market_kline %s 已熔断，跳过", p.name)
+                continue
+
+            cfg = get_source_config(p.name)
+            start = time.time()
+            try:
+                result = p.fetch_market_kline(
+                    timeframe=timeframe, count=count, adj=adj,
+                    timeout=timeout, start_date=start_date, end_date=end_date,
+                )
+                elapsed = time.time() - start
+
+                if result and not isinstance(result, NotSupportedResult):
+                    cb.record_success(p.name)
+                    cfg.record(True, elapsed)
+                    logger.info("[协助层] market_kline %d只 命中 %s (%.2fs)",
+                                len(result), p.name, elapsed)
+                    return result
+                else:
+                    cb.record_failure(p.name, "empty")
+                    cfg.record(False, elapsed)
+                    logger.debug("[协助层] market_kline %s 返回空", p.name)
+            except Exception as e:
+                elapsed = time.time() - start
+                cb.record_failure(p.name, str(e))
+                cfg.record(False, elapsed)
+                logger.debug("[协助层] market_kline %s 失败: %s", p.name, e)
+
+        logger.warning("[协助层] market_kline market=%s tf=%s 所有源失败", market, timeframe)
         return {}
 
     # ================================================================
