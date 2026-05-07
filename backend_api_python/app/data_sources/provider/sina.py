@@ -108,26 +108,7 @@ _SINA_TF_TO_SCALE = {
 
 
 def _parse_sina_quote(text: str) -> Optional[Dict[str, Any]]:
-    """
-    解析新浪行情响应文本。
-
-    新浪行情格式: var hq_str_sh600519="贵州茅台,开盘价,昨收,最新价,最高,最低,..."
-    字段以逗号分隔，至少32个字段，关键字段索引:
-      parts[0] = 名称
-      parts[1] = 开盘价
-      parts[2] = 昨收价
-      parts[3] = 最新价
-      parts[4] = 最高价
-      parts[5] = 最低价
-      parts[8] = 成交量（股）
-      parts[9] = 成交额（元）
-
-    Args:
-        text: 新浪行情API的原始响应文本
-
-    Returns:
-        行情字典，解析失败返回 None
-    """
+    """解析新浪行情响应文本"""
     m = re.search(r'\"(.+?)\"', text)
     if not m:
         return None
@@ -145,7 +126,6 @@ def _parse_sina_quote(text: str) -> Optional[Dict[str, Any]]:
         low = float(parts[5]) if parts[5] else 0.0
         volume = float(parts[8]) if parts[8] else 0.0
         amount = float(parts[9]) if parts[9] else 0.0
-        # 全零视为无效数据
         if last == 0 and prev_close == 0 and open_p == 0:
             return None
         return {
@@ -158,18 +138,7 @@ def _parse_sina_quote(text: str) -> Optional[Dict[str, Any]]:
 
 
 def _sina_kline_to_dicts(data: list, count: int) -> List[Dict[str, Any]]:
-    """
-    将新浪K线JSON数据转换为标准化字典列表。
-
-    新浪K线JSON格式: [{"day": "2024-01-01", "open": 100, "high": 105, "low": 98, "close": 103, "volume": 1000}, ...]
-
-    Args:
-        data:  新浪K线API返回的JSON数组
-        count: 请求的数据条数（用于截取最后N条）
-
-    Returns:
-        标准化K线字典列表，按时间升序排列
-    """
+    """将新浪K线JSON数据转换为标准化字典列表"""
     out: List[Dict[str, Any]] = []
     for item in data:
         try:
@@ -203,25 +172,7 @@ def _sina_kline_to_dicts(data: list, count: int) -> List[Dict[str, Any]]:
 
 
 def _fetch_sina_kline_hisdata(sc: str, count: int, timeout: int) -> List[Dict[str, Any]]:
-    """
-    通过新浪 hisdata 页面获取日线K线（兜底机制）。
-
-    当主API（vip.stock.finance.sina.com.cn）返回异常时，通过 hisdata 页面
-    的 JavaScript 变量获取历史K线数据。数据格式为:
-    "2024-01-01, 100.00, 103.00, 105.00, 98.00, 1000.00"
-    即: 日期, 开盘, 收盘, 最高, 最低, 成交量
-
-    注意: 这里的字段顺序是 日期,开盘,收盘,最高,最低,成交量
-    （与标准 OHLC 顺序不同，收盘在第2位）
-
-    Args:
-        sc:    新浪格式股票代码（如 "sh600519"）
-        count: 请求数据条数
-        timeout: 请求超时秒数
-
-    Returns:
-        K线数据列表
-    """
+    """通过新浪 hisdata 页面获取日线K线（兜底机制）"""
     url = f"https://finance.sina.com.cn/realstock/company/{sc}/hisdata/klc_kl.js"
     _sina_limiter.wait()
     resp = requests.get(
@@ -232,8 +183,6 @@ def _fetch_sina_kline_hisdata(sc: str, count: int, timeout: int) -> List[Dict[st
     resp.encoding = "gbk"
     text = resp.text or ""
 
-    # 正则匹配: "2024-01-01, 100.00, 103.00, 105.00, 98.00, 1000.00"
-    # 字段: 日期, 开盘, 收盘, 最高, 最低, 成交量
     pattern = re.compile(
         r"(\d{4}-\d{2}-\d{2}),\s*"
         r"([\d.]+),\s*([\d.]+),\s*([\d.]+),\s*([\d.]+),\s*"
@@ -268,11 +217,7 @@ class SinaDataSource:
       - K线: 日线（JSON API + hisdata 兜底）+ 分钟线（JSONP API）
       - 行情: 单只实时行情（hq.sinajs.cn）
       - 批量行情: 单次HTTP获取多只（最多500只/批）
-
-    特点:
-      - 国内直连，无需API Key
-      - 行情响应速度快
-      - K线数据通过正则解析 hisdata 页面作为兜底
+      - 全市场行情: 多批次拼接（每批500只，通过东财获取代码列表）
 
     线程安全性:
       - 实例方法无状态，线程安全
@@ -286,6 +231,7 @@ class SinaDataSource:
         "kline": True,
         "kline_priority": 10,
         "kline_tf": {"1m", "5m", "15m", "30m", "1H", "1D"},
+        "kline_batch": True,
         "quote": True,
         "quote_priority": 15,
         "batch_quote": True,
@@ -294,13 +240,25 @@ class SinaDataSource:
         "markets": {"CNStock"},
     }
 
-    def fetch_kline_batch(
-        self, codes: List[str], timeframe: str = "1D", count: int = 300,
+    def fetch_market_kline(
+        self, timeframe: str = "1D", count: int = None,
         adj: str = "qfq", timeout: int = 15,
+        start_date: str = "", end_date: str = "",
     ) -> Dict[str, List[Dict[str, Any]]]:
-        """批量K线 — 新浪不支持原生批量，返回 NotSupportedResult"""
-        from app.data_sources.provider import NotSupportedResult
-        return NotSupportedResult(self.name, "fetch_kline_batch")
+        """
+        全市场批量K线 — count=None 走批量行情（1 HTTP），count 有值走并发 K 线。
+        新浪单次HTTP限 ~500 只，自动分批并发获取。
+        """
+        # count=None 且无 start_date → 走 fetch_batch_quotes（1 HTTP 拿 N 只）
+        if count is None and (not start_date or _is_today(start_date)):
+            from app.data_sources.provider import _all_market_kline_via_quotes
+            return _all_market_kline_via_quotes(self, timeframe=timeframe, timeout=timeout)
+
+        from app.data_sources.provider import _batch_fetch_kline_by_codes
+        return _batch_fetch_kline_by_codes(
+            self, timeframe=timeframe, count=count, adj=adj, timeout=timeout,
+            start_date=start_date, end_date=end_date, batch_size=500,
+        )
 
     @retry_with_backoff(max_attempts=3, base_delay=1.5, max_delay=10.0, exceptions=(
         requests.exceptions.RequestException, ConnectionError, TimeoutError,
@@ -308,24 +266,12 @@ class SinaDataSource:
     def fetch_kline(
         self, code: str, timeframe: str = "1D", count: int = 300,
         adj: str = "qfq", timeout: int = 10,
+        start_date: str = "", end_date: str = "",
     ) -> List[Dict[str, Any]]:
-        """
-        获取单只股票K线数据。
+        if start_date:
+            from app.data_sources.provider import calc_kline_count
+            count = calc_kline_count(timeframe, start_date, end_date)
 
-        根据 timeframe 分流:
-          - 日线: _fetch_raw_daily_kline（JSON API + hisdata 兜底）
-          - 分钟线: _fetch_minute_kline（JSONP API）
-
-        Args:
-            code:      股票代码
-            timeframe: K线周期
-            count:     请求数据条数
-            adj:       复权方式（新浪日线通过东财除权数据计算复权因子）
-            timeout:   请求超时秒数
-
-        Returns:
-            K线数据列表
-        """
         sc = to_sina_code(code)
         if not sc:
             return []
@@ -338,17 +284,6 @@ class SinaDataSource:
         return self._fetch_raw_daily_kline(sc, count, timeout)
 
     def _fetch_raw_daily_kline(self, sc: str, count: int, timeout: int) -> List[Dict[str, Any]]:
-        """
-        获取日线K线 — 优先JSON API，失败则用 hisdata 页面兜底。
-
-        Args:
-            sc:    新浪格式股票代码
-            count: 请求数据条数
-            timeout: 请求超时秒数
-
-        Returns:
-            K线数据列表
-        """
         url = "https://vip.stock.finance.sina.com.cn/cn/api/json.php/CN_MarketDataService.getKLineData"
         params = {"symbol": sc, "scale": 240, "ma": "no", "datalen": min(int(count), 2000)}
         resp = requests.get(
@@ -362,25 +297,9 @@ class SinaDataSource:
             data = None
         if isinstance(data, list) and data:
             return _sina_kline_to_dicts(data, count)
-        # JSON API 失败，用 hisdata 页面兜底
         return _fetch_sina_kline_hisdata(sc, count, timeout)
 
     def _fetch_minute_kline(self, sc: str, scale: int, count: int, timeout: int) -> List[Dict[str, Any]]:
-        """
-        获取分钟级K线 — 通过新浪 JSONP API。
-
-        新浪分钟线API返回JSONP格式: var xxx=[{...}, {...}]
-        需要用正则提取JSON数组部分。
-
-        Args:
-            sc:    新浪格式股票代码
-            scale: 分钟数（1/5/15/30/60）
-            count: 请求数据条数
-            timeout: 请求超时秒数
-
-        Returns:
-            K线数据列表
-        """
         url = "https://quotes.sina.cn/cn/api/jsonp_v2.php/var/CN_MarketDataService.getKLineData"
         params = {"symbol": sc, "scale": scale, "ma": "no", "datalen": min(int(count), 2000)}
         resp = requests.get(
@@ -389,7 +308,6 @@ class SinaDataSource:
             params=params, timeout=timeout,
         )
         text = (resp.text or "").strip()
-        # 从JSONP响应中提取JSON数组
         m = re.search(r'\[.*\]', text, re.DOTALL)
         if not m:
             return []
@@ -403,19 +321,6 @@ class SinaDataSource:
         requests.exceptions.RequestException, ConnectionError, TimeoutError,
     ))
     def fetch_ticker(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
-        """
-        获取单只股票实时行情。
-
-        通过 hq.sinajs.cn 接口获取行情，响应格式:
-        var hq_str_sh600519="贵州茅台,开盘价,昨收,最新价,最高,最低,..."
-
-        Args:
-            code:    股票代码
-            timeout: 请求超时秒数
-
-        Returns:
-            行情字典，失败返回 None
-        """
         sc = to_sina_code(code)
         if not sc:
             return None
@@ -445,20 +350,6 @@ class SinaDataSource:
         }
 
     def fetch_batch_quotes(self, codes: List[str], timeout: int = 10) -> Dict[str, Dict[str, Any]]:
-        """
-        批量获取多只股票实时行情 — 单次HTTP请求。
-
-        通过逗号拼接多个新浪代码，一次请求获取所有行情。
-        每批最多500只。响应中每行一只股票，格式:
-        var hq_str_sh600519="贵州茅台,开盘价,昨收,..."
-
-        Args:
-            codes:   股票代码列表
-            timeout: 请求超时秒数
-
-        Returns:
-            {code: quote_dict} — 仅包含成功获取的代码
-        """
         if not codes:
             return {}
         sina_codes = [to_sina_code(c) for c in codes if c]
@@ -467,7 +358,6 @@ class SinaDataSource:
         batch_size = 500
         result: Dict[str, Dict[str, Any]] = {}
 
-        # 分批请求（每批500只）
         for i in range(0, len(sina_codes), batch_size):
             batch = sina_codes[i:i + batch_size]
             query = ",".join(batch)
@@ -483,10 +373,8 @@ class SinaDataSource:
                 logger.warning("[新浪批量行情] 请求失败: %s", e)
                 continue
 
-            # 逐行解析响应（每行一只股票）
             for line in (resp.text or "").strip().split("\n"):
                 line = line.strip().rstrip(";")
-                # 提取: var hq_str_sh600519="贵州茅台,开盘价,..."
                 m = re.search(r'hq_str_(\w+)="(.+?)"', line)
                 if not m:
                     continue
@@ -505,7 +393,6 @@ class SinaDataSource:
                     high = float(parts[4]) if parts[4] else 0.0
                     low = float(parts[5]) if parts[5] else 0.0
                     vol = float(parts[8]) if len(parts) > 8 and parts[8] else 0.0
-                    # 全零视为无效数据
                     if last == 0 and prev_close == 0 and open_p == 0:
                         continue
                     chg = round(last - prev_close, 4) if prev_close else 0.0
@@ -518,3 +405,5 @@ class SinaDataSource:
                 except (ValueError, IndexError):
                     continue
         return result
+
+

@@ -121,7 +121,7 @@ class EastMoneyDataSource:
         "kline": True,
         "kline_priority": 25,
         "kline_tf": {"1m", "5m", "15m", "30m", "1H", "1D", "1W"},
-        "kline_batch": False,   # 东财K线API是per-symbol，无原生批量
+        "kline_batch": True,
         "quote": True,
         "quote_priority": 20,
         "batch_quote": True,
@@ -130,13 +130,37 @@ class EastMoneyDataSource:
         "markets": {"CNStock"},
     }
 
-    def fetch_kline_batch(
-        self, codes: List[str], timeframe: str = "1D", count: int = 300,
+    def fetch_market_kline(
+        self, timeframe: str = "1D", count: int = None,
         adj: str = "qfq", timeout: int = 15,
+        start_date: str = "", end_date: str = "",
     ) -> Dict[str, List[Dict[str, Any]]]:
-        """批量K线 — 东财K线API是per-symbol，不支持原生批量，返回 NotSupportedResult"""
-        from app.data_sources.provider import NotSupportedResult
-        return NotSupportedResult(self.name, "fetch_kline_batch")
+        """全市场批量K线 — count=None 走批量行情（1 HTTP），count 有值走并发 K 线"""
+        # count=None 且无 start_date → 走 fetch_batch_quotes（1 HTTP 拿 N 只）
+        if count is None and (not start_date or _is_today(start_date)):
+            from app.data_sources.provider import _all_market_kline_via_quotes
+            return _all_market_kline_via_quotes(self, timeframe=timeframe, timeout=timeout)
+
+        from app.data_sources.provider import _fetch_all_cn_codes
+        codes = _fetch_all_cn_codes()
+        if not codes:
+            return {}
+        import concurrent.futures
+        result: Dict[str, List[Dict[str, Any]]] = {}
+        lock = threading.Lock()
+
+        def _fetch_one(code: str):
+            bars = self.fetch_kline(code, timeframe, count, adj=adj, timeout=timeout,
+                                    start_date=start_date, end_date=end_date)
+            if bars:
+                with lock:
+                    result[code] = bars
+
+        max_workers = min(len(codes), 8)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(_fetch_one, c) for c in codes]
+            concurrent.futures.wait(futures, timeout=timeout + 5)
+        return result
 
     @retry_with_backoff(max_attempts=3, base_delay=2.0, max_delay=12.0, exceptions=(
         requests.exceptions.RequestException, ConnectionError, TimeoutError,
@@ -144,23 +168,13 @@ class EastMoneyDataSource:
     def fetch_kline(
         self, code: str, timeframe: str = "1D", count: int = 300,
         adj: str = "qfq", timeout: int = 10,
+        start_date: str = "", end_date: str = "",
     ) -> List[Dict[str, Any]]:
-        """
-        获取单只股票K线数据。
+        if start_date:
+            from app.data_sources.provider import calc_kline_count
+            count = calc_kline_count(timeframe, start_date, end_date)
+        em_end = end_date.replace("-", "") if end_date else "20500101"
 
-        通过东财 kline/get API 获取，支持全周期。
-        响应格式: data.klines = ["2024-01-01 10:30,100.00,103.00,105.00,98.00,1000,100000,..."]
-
-        Args:
-            code:      股票代码
-            timeframe: K线周期
-            count:     请求数据条数
-            adj:       复权方式（通过 fqt 参数控制）
-            timeout:   请求超时秒数
-
-        Returns:
-            K线数据列表
-        """
         secid = _to_eastmoney_secid(code)
         if not secid:
             return []
@@ -172,14 +186,14 @@ class EastMoneyDataSource:
             "https://49.push2his.eastmoney.com/api/qt/stock/kline/get",
             headers=get_request_headers(referer=_em_quote_referers.next()),
             params={
-                "secid": secid,                    # 证券ID（如 "1.600519"）
-                "ut": "fa5fd1943c7b386f172d6893dbbd1835",  # 用户令牌（固定值）
-                "fields1": "f1,f2,f3",             # 基础字段: 代码/名称/最新价
-                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",  # K线字段: 日期/开/收/高/低/量/额/振幅/涨跌幅/涨跌额/换手率
-                "klt": klt,                        # K线周期类型
-                "fqt": 0,                          # 复权类型（0=不复权，复权在上层处理）
-                "end": "20500101",                 # 结束日期（设为未来日期取最新数据）
-                "lmt": min(int(count), 5000),      # 数据条数限制
+                "secid": secid,
+                "ut": "fa5fd1943c7b386f172d6893dbbd1835",
+                "fields1": "f1,f2,f3",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                "klt": klt,
+                "fqt": 0,
+                "end": em_end,
+                "lmt": min(int(count), 5000),
             },
             timeout=timeout,
         )
@@ -193,7 +207,6 @@ class EastMoneyDataSource:
         if not isinstance(klines_data, list):
             return []
 
-        # 解析K线数据: 每行格式 "日期,开盘,收盘,最高,最低,成交量,成交额,..."
         out = []
         for line in klines_data:
             parts = line.split(",")
@@ -213,7 +226,6 @@ class EastMoneyDataSource:
                 o, c, h, low, v = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5])
                 if o == 0 and c == 0:
                     continue
-                # 防御性修正: 如果最高价低于最低价，交换两者
                 if h > 0 and low > 0 and h < low:
                     h, low = low, h
                 out.append({
@@ -226,21 +238,6 @@ class EastMoneyDataSource:
         return out[-count:] if len(out) > count else out
 
     def fetch_ticker(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
-        """
-        获取单只股票实时行情。
-
-        通过东财 stock/get API 获取行情快照。
-        字段映射:
-          f43=最新价, f44=最高, f45=最低, f46=开盘, f47=成交量, f48=成交额
-          f57=代码, f58=名称, f60=昨收, f170=涨跌幅, f171=涨跌额
-
-        Args:
-            code:    股票代码
-            timeout: 请求超时秒数
-
-        Returns:
-            行情字典，失败返回 None
-        """
         secid = _to_eastmoney_secid(code)
         if not secid:
             return None
@@ -250,7 +247,7 @@ class EastMoneyDataSource:
             headers=get_request_headers(referer=_em_quote_referers.next()),
             params={
                 "secid": secid,
-                "ut": "fa5fd1943c7b386f172d6893dbfba10b",  # 用户令牌（固定值）
+                "ut": "fa5fd1943c7b386f172d6893dbfba10b",
                 "fields": "f43,f44,f45,f46,f47,f48,f57,f58,f60,f170,f171",
             },
             timeout=timeout,
@@ -266,7 +263,6 @@ class EastMoneyDataSource:
             return None
 
         def _f(key: str, default: float = 0.0) -> float:
-            """安全提取浮点字段，处理 None/"-" 等异常值"""
             v = d.get(key)
             if v is None or v == "-" or v == "":
                 return default
@@ -275,8 +271,8 @@ class EastMoneyDataSource:
             except (TypeError, ValueError):
                 return default
 
-        last = _f("f43")
-        prev = _f("f60")
+        last = _f("f43") / 100
+        prev = _f("f60") / 100
         if last == 0 and prev == 0:
             return None
         chg = round(last - prev, 4) if prev else 0.0
@@ -284,35 +280,17 @@ class EastMoneyDataSource:
             "last": last,
             "change": chg,
             "changePercent": round(chg / prev * 100, 2) if prev else 0.0,
-            "high": _f("f44"),
-            "low": _f("f45"),
-            "open": _f("f46"),
+            "high": _f("f44") / 100,
+            "low": _f("f45") / 100,
+            "open": _f("f46") / 100,
             "previousClose": prev,
             "name": str(d.get("f58", "")).strip(),
             "symbol": secid,
         }
 
     def fetch_batch_quotes(self, codes: List[str], timeout: int = 15) -> Dict[str, Dict[str, Any]]:
-        """
-        批量获取全市场实时行情 — 单次HTTP请求。
-
-        通过东财 clist/get API 获取全市场行情（最多6000只）。
-        从响应中筛选出请求的代码。
-
-        东财 clist API 参数说明:
-          - fs: 市场筛选条件（m:0+t:6=沪A, m:0+t:80=深A, m:1+t:2=沪B, m:1+t:23=深B）
-          - fields: 请求字段（f2=最新价, f5=成交量, f6=成交额, f12=代码, f15=最高, f16=最低, f17=开盘, f18=昨收）
-
-        Args:
-            codes:   股票代码列表
-            timeout: 请求超时秒数
-
-        Returns:
-            {code: quote_dict} — 仅包含请求代码中成功获取的部分
-        """
         if not codes:
             return {}
-        # 提取6位纯数字代码用于匹配
         code_set: Dict[str, str] = {}
         for sym in codes:
             raw = to_raw_digits(sym)
@@ -326,11 +304,11 @@ class EastMoneyDataSource:
                 "https://push2.eastmoney.com/api/qt/clist/get",
                 headers=get_request_headers(referer=_em_quote_referers.next()),
                 params={
-                    "pn": 1, "pz": 6000, "po": 1, "np": 1,  # 分页: 第1页, 每页6000条
-                    "ut": "bd1d9ddb04089700cf9c27f6f7426281",  # 用户令牌
-                    "fltt": 2, "invt": 2, "fid": "f3",       # 排序: 按涨跌幅降序
-                    "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",  # 市场: 沪A+深A+沪B+深B
-                    "fields": "f2,f5,f6,f12,f15,f16,f17,f18",  # 字段: 最新/量/额/代码/高/低/开/昨收
+                    "pn": 1, "pz": 6000, "po": 1, "np": 1,
+                    "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+                    "fltt": 2, "invt": 2, "fid": "f3",
+                    "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+                    "fields": "f2,f5,f6,f12,f15,f16,f17,f18",
                 },
                 timeout=timeout,
             )
@@ -340,7 +318,6 @@ class EastMoneyDataSource:
             logger.warning("[东财批量行情] clist 请求失败: %s", e)
             return {}
 
-        # 计算今日零点时间戳（东财行情不返回时间，手动补上）
         now = datetime.now(timezone(timedelta(hours=8)))
         today_ts = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
         result: Dict[str, Dict[str, Any]] = {}
@@ -370,5 +347,4 @@ class EastMoneyDataSource:
             except (ValueError, TypeError):
                 continue
         return result
-
 

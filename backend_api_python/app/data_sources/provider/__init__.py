@@ -73,7 +73,7 @@ class NotSupportedResult:
 
     Attributes:
         source: 不支持该接口的数据源名称
-        interface: 不支持的接口名称（如 "fetch_kline_batch"）
+        interface: 不支持的接口名称（如 "fetch_market_kline"）
         reason: 不支持的原因说明
     """
 
@@ -105,16 +105,221 @@ def is_not_supported(result: Any) -> bool:
     return isinstance(result, NotSupportedResult)
 
 
+# ================================================================
+# 批量K线辅助 — 交易日历推算 count
+# ================================================================
+
+# 每个交易日的 bar 数量（用于从天数反推 count）
+_BARS_PER_DAY = {
+    "1m": 240,   # 9:30-11:30 + 13:00-15:00 = 4h = 240min
+    "5m": 48,    # 240 / 5
+    "15m": 16,   # 240 / 15
+    "30m": 8,    # 240 / 30
+    "1H": 4,     # 240 / 60
+    "1D": 1,
+    "1W": 1,     # 近似，实际按周聚合
+}
+
+
+def calc_kline_count(timeframe: str, start_date: str, end_date: str = "") -> int:
+    """
+    根据交易日历推算需要拉取的 K 线条数。
+
+    用交易日历（非自然日）计算 start_date 到 end_date 之间的交易日数，
+    再乘以每个交易日对应的 bar 数量。
+
+    Args:
+        timeframe:  K 线周期（"15m", "1D", ...）
+        start_date: 起始日期（"YYYY-MM-DD"）
+        end_date:   结束日期（"YYYY-MM-DD"），为空则取今天
+
+    Returns:
+        需要拉取的 K 线条数（向上取整，留余量）
+    """
+    from app.utils.trading_calendar import trading_days_count
+    if not end_date:
+        from datetime import datetime
+        end_date = datetime.now().strftime("%Y-%m-%d")
+    days = trading_days_count(start_date, end_date)
+    bars_per_day = _BARS_PER_DAY.get(timeframe, 1)
+    return days * bars_per_day + bars_per_day  # 多算 1 天余量
+
+
+# ================================================================
+# 全市场公共辅助 — 供无原生全市场接口的 Provider 复用
+# ================================================================
+
+def _fetch_all_cn_codes() -> List[str]:
+    """
+    获取全市场 A 股代码列表（通过东财 clist API 一次拿完）。
+
+    Returns:
+        6 位纯数字代码列表，如 ["000001", "000002", ..., "688001", ...]
+    """
+    import requests as _requests
+    try:
+        from app.data_sources.rate_limiter import get_request_headers as _get_headers
+    except ImportError:
+        def _get_headers(**kw):
+            return {"User-Agent": "Mozilla/5.0"}
+    try:
+        resp = _requests.get(
+            "https://push2.eastmoney.com/api/qt/clist/get",
+            headers=_get_headers(referer="https://quote.eastmoney.com/"),
+            params={
+                "pn": 1, "pz": 6000, "po": 1, "np": 1,
+                "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+                "fltt": 2, "invt": 2, "fid": "f3",
+                "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+                "fields": "f12",
+            },
+            timeout=15,
+        )
+        diff = ((resp.json().get("data") or {}).get("diff")) or []
+        return [str(d["f12"]).strip() for d in diff if d.get("f12")]
+    except Exception:
+        return []
+
+
+
+def _batch_fetch_quotes_by_codes(
+    provider,
+    batch_size: int = 500,
+    timeout: int = 10,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    通过多次调用 fetch_batch_quotes 拼出全市场行情。
+    用于不支持原生全市场行情的 Provider（如新浪、腾讯）。
+    """
+    codes = _fetch_all_cn_codes()
+    if not codes:
+        return {}
+    result: Dict[str, Dict[str, Any]] = {}
+    for i in range(0, len(codes), batch_size):
+        batch = codes[i:i + batch_size]
+        try:
+            partial = provider.fetch_batch_quotes(batch, timeout=timeout)
+            if partial:
+                result.update(partial)
+        except Exception as e:
+            logger.warning("[全市场行情] %s 批次 %d 失败: %s", provider.name, i // batch_size, e)
+    return result
+
+
+def _is_today(date_str: str) -> bool:
+    """判断日期字符串是否为今天（支持 YYYY-MM-DD 和 YYYYMMDD）"""
+    from datetime import datetime, timezone, timedelta
+    today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+    normalized = date_str.replace("-", "") if len(date_str) == 10 else date_str
+    if len(normalized) == 8:
+        normalized = f"{normalized[:4]}-{normalized[4:6]}-{normalized[6:]}"
+    return normalized == today
+
+
+def _all_market_kline_via_quotes(
+    provider,
+    timeframe: str = "1D",
+    timeout: int = 15,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    count=None 路径：通过 fetch_batch_quotes 一次 HTTP 拿 N 只行情，转成单根 K 线 bar。
+    用于当日实时行情场景，避免并发 N 次 fetch_kline。
+    """
+    quotes = provider.fetch_batch_quotes(_fetch_all_cn_codes(), timeout=timeout)
+    if not quotes or isinstance(quotes, NotSupportedResult):
+        return {}
+    result: Dict[str, List[Dict[str, Any]]] = {}
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone(timedelta(hours=8)))
+    bar_ts = int(now.timestamp())
+    bar_dt = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    for code, q in quotes.items():
+        if not isinstance(q, dict):
+            continue
+        last = q.get("last", 0)
+        if not last or last <= 0:
+            continue
+        bar = {
+            "datetime": bar_dt,
+            "open": q.get("open", last),
+            "high": q.get("high", last),
+            "low": q.get("low", last),
+            "close": last,
+            "volume": q.get("volume", 0),
+            "turnover": 0,
+            "timestamp": bar_ts,
+        }
+        result[code] = [bar]
+    return result
+
+
+def _batch_fetch_kline_by_codes(
+    provider,
+    timeframe: str = "1D",
+    count: int = 300,
+    adj: str = "qfq",
+    timeout: int = 15,
+    start_date: str = "",
+    end_date: str = "",
+    batch_size: int = 500,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    通过多次并发调用 fetch_kline 拼出全市场K线。
+
+    用于不支持原生全市场K线的 Provider（如新浪、腾讯，单次HTTP限 ~500 只）。
+    自动从东财获取全市场代码列表，然后按 batch_size 分批并发拉取。
+
+    Args:
+        provider:    Provider 实例（需有 fetch_kline 方法）
+        timeframe:   K线周期
+        count:       每只股票的数据条数
+        adj:         复权方式
+        timeout:     单次请求超时秒数
+        start_date:  起始日期
+        end_date:    结束日期
+        batch_size:  每批并发的股票数量
+
+    Returns:
+        全市场K线字典 {code: kline_bars}
+    """
+    import concurrent.futures
+    codes = _fetch_all_cn_codes()
+    if not codes:
+        return {}
+    result: Dict[str, List[Dict[str, Any]]] = {}
+    lock = threading.Lock()
+
+    for i in range(0, len(codes), batch_size):
+        batch = codes[i:i + batch_size]
+
+        def _fetch_one(code: str):
+            bars = provider.fetch_kline(
+                code, timeframe, count, adj=adj, timeout=timeout,
+                start_date=start_date, end_date=end_date,
+            )
+            if bars:
+                with lock:
+                    result[code] = bars
+
+        max_workers = min(len(batch), 8)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(_fetch_one, c) for c in batch]
+            concurrent.futures.wait(futures, timeout=timeout + 5)
+
+    return result
+
+
 @runtime_checkable
 class BaseDataSource(Protocol):
     """
     A股数据源统一接口（Protocol 类型协议）。
 
     所有 Provider 必须实现此协议定义的4个标准接口:
-      1. fetch_kline       — 单只K线
-      2. fetch_kline_batch  — 批量K线
-      3. fetch_ticker       — 单只行情
-      4. fetch_batch_quotes — 批量行情
+      1. fetch_kline          — 单只K线
+      2. fetch_market_kline — 全市场批量K线（无需传入代码列表）
+      3. fetch_ticker          — 单只行情
+      4. fetch_batch_quotes    — 批量行情
 
     不支持的接口返回 NotSupportedResult（而非 None 或抛异常），
     以便 Coordinator 快速识别并切换到其他数据源。
@@ -127,7 +332,7 @@ class BaseDataSource(Protocol):
         capabilities: 能力声明字典，包含:
             - kline: bool        是否支持K线
             - kline_tf: set      支持的K线周期集合
-            - kline_batch: bool  是否支持批量K线
+            - kline_batch: bool  是否支持全市场批量K线（fetch_market_kline）
             - quote: bool        是否支持单只行情
             - batch_quote: bool  是否支持批量行情
             - hk: bool           是否支持港股
@@ -139,18 +344,25 @@ class BaseDataSource(Protocol):
     capabilities: Dict[str, Any]
 
     def fetch_kline(
-        self, code: str, timeframe: str, count: int,
+        self, code: str, timeframe: str, count: int = 300,
         adj: str = "qfq", timeout: int = 10,
+        start_date: str = "", end_date: str = "",
     ) -> List[Dict[str, Any]]:
         """
         获取单只股票K线数据 — 日/周/分钟共用同一接口。
 
+        支持两种指定数据量的方式:
+          1. count: 直接指定拉取的 bar 数
+          2. start_date/end_date: 通过交易日历反推 count（更精确）
+
         Args:
             code:      股票代码（如 "SH600519", "600519"）
             timeframe: K线周期（如 "1D", "5m", "1H"）
-            count:     请求数据条数
+            count:     请求数据条数（start_date 优先时忽略）
             adj:       复权方式（"qfq" 前复权 / "hfq" 后复权 / "" 不复权）
             timeout:   请求超时秒数
+            start_date: 起始日期（"YYYY-MM-DD"），提供时用交易日历反推 count
+            end_date:   结束日期（"YYYY-MM-DD"），部分数据源支持精确截断
 
         Returns:
             K线数据列表，每个元素包含 time/open/high/low/close/volume。
@@ -162,26 +374,28 @@ class BaseDataSource(Protocol):
         """
         ...
 
-    def fetch_kline_batch(
-        self, codes: List[str], timeframe: str, count: int,
+    def fetch_market_kline(
+        self, timeframe: str, count: int = 300,
         adj: str = "qfq", timeout: int = 15,
+        start_date: str = "", end_date: str = "",
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
-        批量K线（单次HTTP或单次API调用）。
+        全市场批量K线 — 无需传入代码列表，自动获取全市场股票。
 
-        能一次拉全市场的源（如东财 clist）应实现此方法。
-        不支持批量的源返回 NotSupportedResult，Coordinator 自动退化为逐只调用。
+        路由逻辑:
+          - count=None 且无 start_date → 走 fetch_batch_quotes（1 HTTP 拿 N 只行情，转单根 bar）
+          - count 有值或有 start_date → 并发调用 fetch_kline（每只 1 HTTP）
 
         Args:
-            codes:     股票代码列表
             timeframe: K线周期
-            count:     每只股票的数据条数
+            count:     每只股票的数据条数（None 时走批量行情快照路径）
             adj:       复权方式
             timeout:   请求超时秒数
+            start_date: 起始日期（"YYYY-MM-DD"），提供时用交易日历反推 count
+            end_date:   结束日期（"YYYY-MM-DD"），为空则取今天
 
         Returns:
             {code: kline_bars} — 仅包含成功获取的代码。
-            不支持返回 NotSupportedResult。
         """
         ...
 
@@ -213,7 +427,6 @@ class BaseDataSource(Protocol):
             不支持返回 NotSupportedResult。
         """
         ...
-
 
 # ================================================================
 # 注册表
@@ -326,9 +539,9 @@ def get_providers_with_batch(
     market: str = None,
 ) -> List[Tuple[BaseDataSource, bool]]:
     """
-    获取 Provider 列表，同时标记每个源是否支持批量K线。
+    获取 Provider 列表，同时标记每个源是否支持全市场批量K线。
 
-    用于 Coordinator 层判断是否可以调用 fetch_kline_batch。
+    用于 Coordinator 层判断是否可以调用 fetch_market_kline。
 
     Args:
         timeframe: 过滤K线周期
@@ -336,7 +549,7 @@ def get_providers_with_batch(
 
     Returns:
         [(provider, has_batch), ...] 按 priority 排序。
-        has_batch 为 True 表示该源支持 fetch_kline_batch。
+        has_batch 为 True 表示该源支持 fetch_market_kline。
     """
     providers = get_providers("kline", timeframe=timeframe, market=market)
     result = []
