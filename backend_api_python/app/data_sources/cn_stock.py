@@ -843,7 +843,7 @@ class DBKlineBridge:
         """将 K 线数据写入 DB。只存 15m，其余周期不存。
 
         写入保障:
-          1. 时间校准 — 对齐到 15m 边界（整除 900）
+          1. 时间标准化 — 使用 A 股 15m bar 精确时间表对齐
           2. 数据清洗 — OHLC > 0, high >= low, volume 缺失填 0
           3. 先删后写 — 删除该 symbol + 时间范围旧数据，再 upsert
           4. 删未来数据 — time > now 的错误数据一律清除
@@ -852,6 +852,8 @@ class DBKlineBridge:
         """
         if tf != "15m":
             return
+
+        from app.data_sources.backfill_db import _align_to_bar_schedule
 
         # 防重复: 查库中该 symbol 最新一条的时间，落在当前 15m 窗口内就跳过
         try:
@@ -869,13 +871,13 @@ class DBKlineBridge:
         _15M_SEC = 900
         now_ts = int(time.time())
 
-        # Step 1: 清洗 + 校验 + 对齐
+        # Step 1: 清洗 + 校验 + 标准化到 bar 时间表
         seen: Dict[int, Dict] = {}
         for b in bars:
             ts = b.get("time", 0)
             if not isinstance(ts, (int, float)) or ts <= 0:
                 continue
-            ts = int(ts) - (int(ts) % _15M_SEC)  # 对齐到 15m 边界
+            ts = _align_to_bar_schedule(int(ts))  # 标准化到精确 bar 时间
             if ts <= 0:
                 continue
 
@@ -945,74 +947,16 @@ class DBKlineBridge:
         except Exception as e:
             logger.debug(f"[DB桥接] 回填失败 {raw}/{tf}: {e}")
 
-    def backfill_all_market(self, batch_size: int = 400, bars_per_stock: int = 32):
-        """全市场 15m 后台回填。
+    def backfill_all_market(self, **kwargs):
+        """全市场 15m 回填 — 已委托给 backfill_db.py 的智能调度模块。
 
-        拉取全市场 A 股的 15m K 线，分批写入 DB。
-        盘中只写当日 bar，盘后写全量。
+        调用 start_backfill() 启动后台守护线程，按 bar 时间表智能调度，
+        只在每根 15m bar 完成后更新，收盘后自动聚合 1D。
 
-        Args:
-            batch_size: 每批股票数量（默认 400）
-            bars_per_stock: 每只拉取的 15m bar 数量（默认 32 ≈ 2 个交易日）
+        具体实现见 app.data_sources.backfill_db
         """
-        self._ensure_init()
-        if not self.available:
-            logger.error("[全量回填] DB 不可用")
-            return
-
-        # 获取全市场代码
-        try:
-            from app.data_sources.a_stock import AStockDataSource
-            ds = AStockDataSource()
-            raw_list = ds.get_all_stock_codes()
-            codes = [str(it.get("stock_code", "")).strip() for it in raw_list
-                     if str(it.get("stock_code", "")).strip() and len(str(it.get("stock_code", "")).strip()) == 6]
-        except Exception as e:
-            logger.error(f"[全量回填] 获取股票列表失败: {e}")
-            return
-
-        if not codes:
-            logger.warning("[全量回填] 无股票代码")
-            return
-
-        from app.data_sources.circuit_breaker import get_realtime_circuit_breaker
-        cb = get_realtime_circuit_breaker()
-        in_trading = _is_market_hours()
-        today_start = _today_ts() if in_trading else 0
-
-        total = len(codes)
-        success = fail = skip = 0
-        logger.info(f"[全量回填] 开始: {total} 只, 批次={batch_size}, {'盘中' if in_trading else '盘后'}")
-
-        for i in range(0, total, batch_size):
-            batch = codes[i:i + batch_size]
-            batch_num = i // batch_size + 1
-
-            normalized = [normalize_cn_code(c) for c in batch]
-            coord_results, failed = get_coordinator().coordinate_kline(
-                symbols=normalized, timeframe="15m", limit=bars_per_stock,
-                cb=cb, market="CNStock", timeout=25, adj="qfq",
-            )
-
-            for code in batch:
-                bars = coord_results.get(normalize_cn_code(code), [])
-                if not bars:
-                    skip += 1
-                    continue
-                if in_trading:
-                    bars = [b for b in bars if b.get("time", 0) >= today_start]
-                    if not bars:
-                        skip += 1
-                        continue
-                self._backfill_db(code, "15m", bars)
-                success += 1
-
-            fail += len(failed)
-            logger.info(f"[全量回填] 批次 {batch_num}: 成功={success} 失败={fail} 跳过={skip}")
-            if i + batch_size < total:
-                time.sleep(1)
-
-        logger.info(f"[全量回填] 完成: 总={total} 成功={success} 失败={fail} 跳过={skip}")
+        from app.data_sources.backfill_db import start_backfill
+        start_backfill()
 
 
 # ================================================================
