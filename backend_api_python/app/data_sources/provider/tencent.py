@@ -170,8 +170,9 @@ class TencentDataSource:
         全市场批量K线 — count=None 走批量行情（1 HTTP），count 有值走并发 K 线。
         腾讯单次HTTP限 ~500 只，自动分批并发获取。
         """
-        # count=None 且无 start_date → 走 fetch_batch_quotes（1 HTTP 拿 N 只）
-        if count is None and (not start_date or _is_today(start_date)):
+        from app.data_sources.provider import _resolve_market_kline_count
+        count = _resolve_market_kline_count(timeframe, count, start_date)
+        if count is None:
             from app.data_sources.provider import _all_market_kline_via_quotes
             return _all_market_kline_via_quotes(self, timeframe=timeframe, timeout=timeout)
 
@@ -203,7 +204,7 @@ class TencentDataSource:
         limiter.wait()
 
         if endpoint == "mkline":
-            url = "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/kline/mkline"
+            url = "https://ifzq.gtimg.cn/appstock/app/kline/mkline"
             params = {"param": f"{c},{tc_tf},{int(count)}"}
         else:
             url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"

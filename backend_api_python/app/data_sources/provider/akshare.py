@@ -171,7 +171,9 @@ class AkShareDataSource:
     ) -> Dict[str, List[Dict[str, Any]]]:
         """全市场批量K线 — count=None 走批量行情（1 HTTP），count 有值走并发 K 线"""
         # count=None 且无 start_date → 走 fetch_batch_quotes（1 HTTP 拿 N 只）
-        if count is None and (not start_date or _is_today(start_date)):
+        from app.data_sources.provider import _resolve_market_kline_count
+        count = _resolve_market_kline_count(timeframe, count, start_date)
+        if count is None:
             from app.data_sources.provider import _all_market_kline_via_quotes
             return _all_market_kline_via_quotes(self, timeframe=timeframe, timeout=timeout)
 
@@ -337,70 +339,6 @@ class AkShareDataSource:
                     "previousClose": prev,
                     "name": name,
                     "symbol": sym,
-                    "time": today_ts,
-                }
-            except (ValueError, TypeError):
-                continue
-        return result
-
-
-        cols = [str(c) for c in df.columns]
-        code_col = None
-        for c in ["代码", "code", "symbol"]:
-            if c in cols:
-                code_col = c
-                break
-        if not code_col:
-            return {}
-
-        def _find_col(candidates):
-            for c in candidates:
-                if c in cols:
-                    return c
-            return None
-
-        def _safe_float(val, default=0.0):
-            try:
-                v = float(val)
-                if math.isnan(v) or math.isinf(v):
-                    return default
-                return v
-            except (TypeError, ValueError):
-                return default
-
-        last_col = _find_col(["最新价", "close", "price"])
-        name_col = _find_col(["名称", "name"])
-        open_col = _find_col(["今开", "open"])
-        high_col = _find_col(["最高", "high"])
-        low_col = _find_col(["最低", "low"])
-        prev_col = _find_col(["昨收", "pre_close", "prev_close"])
-        if not last_col:
-            return {}
-
-        now = datetime.now(timezone(timedelta(hours=8)))
-        today_ts = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-        result: Dict[str, Dict[str, Any]] = {}
-        for _, row in df.iterrows():
-            try:
-                code = str(row[code_col]).strip().zfill(6)
-                if not code or len(code) != 6:
-                    continue
-                last = _safe_float(row.get(last_col))
-                if last <= 0:
-                    continue
-                prev = round(_safe_float(row.get(prev_col)), 4) if prev_col else 0
-                chg = round(last - prev, 4) if prev else 0.0
-                name = str(row.get(name_col, "")) if name_col else ""
-                result[code] = {
-                    "last": last,
-                    "change": chg,
-                    "changePercent": round(chg / prev * 100, 2) if prev else 0.0,
-                    "high": round(_safe_float(row.get(high_col, last)), 4) if high_col else last,
-                    "low": round(_safe_float(row.get(low_col, last)), 4) if low_col else last,
-                    "open": round(_safe_float(row.get(open_col, last)), 4) if open_col else last,
-                    "previousClose": prev,
-                    "name": name,
-                    "symbol": code,
                     "time": today_ts,
                 }
             except (ValueError, TypeError):

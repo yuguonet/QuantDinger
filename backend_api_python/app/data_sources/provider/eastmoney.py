@@ -136,8 +136,9 @@ class EastMoneyDataSource:
         start_date: str = "", end_date: str = "",
     ) -> Dict[str, List[Dict[str, Any]]]:
         """全市场批量K线 — count=None 走批量行情（1 HTTP），count 有值走并发 K 线"""
-        # count=None 且无 start_date → 走 fetch_batch_quotes（1 HTTP 拿 N 只）
-        if count is None and (not start_date or _is_today(start_date)):
+        from app.data_sources.provider import _resolve_market_kline_count
+        count = _resolve_market_kline_count(timeframe, count, start_date)
+        if count is None:
             from app.data_sources.provider import _all_market_kline_via_quotes
             return _all_market_kline_via_quotes(self, timeframe=timeframe, timeout=timeout)
 
@@ -173,7 +174,8 @@ class EastMoneyDataSource:
         if start_date:
             from app.data_sources.provider import calc_kline_count
             count = calc_kline_count(timeframe, start_date, end_date)
-        em_end = end_date.replace("-", "") if end_date else "20500101"
+        from datetime import date as _date
+        em_end = end_date.replace("-", "") if end_date else _date.today().strftime("%Y%m%d")
 
         secid = _to_eastmoney_secid(code)
         if not secid:
@@ -191,7 +193,7 @@ class EastMoneyDataSource:
                 "fields1": "f1,f2,f3",
                 "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
                 "klt": klt,
-                "fqt": 0,
+                "fqt": _EM_FQT.get(adj, 1),
                 "end": em_end,
                 "lmt": min(int(count), 5000),
             },

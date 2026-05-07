@@ -32,7 +32,9 @@ class HuaTaiDataSource:
     def fetch_market_kline(self, timeframe="1D", count=300, adj="qfq", timeout=15, start_date="", end_date=""):
         """全市场批量K线 — count=None 走批量行情（1 HTTP），count 有值走并发 K 线"""
         # count=None 且无 start_date → 走 fetch_batch_quotes（1 HTTP 拿 N 只）
-        if count is None and (not start_date or _is_today(start_date)):
+        from app.data_sources.provider import _resolve_market_kline_count
+        count = _resolve_market_kline_count(timeframe, count, start_date)
+        if count is None:
             from app.data_sources.provider import _all_market_kline_via_quotes
             return _all_market_kline_via_quotes(self, timeframe=timeframe, timeout=timeout)
 
@@ -87,12 +89,14 @@ class HuaTaiDataSource:
                 except (ValueError, TypeError, IndexError): continue
             out.sort(key=lambda x: x["time"]); return out[-count:] if len(out) > count else out
         else:
+            from datetime import date as _date
+            em_end = end_date.replace("-", "") if end_date else _date.today().strftime("%Y%m%d")
             try:
                 resp = requests.get("https://push2his.eastmoney.com/api/qt/stock/kline/get",
                     headers=get_request_headers(referer="https://open.hs.cn/"),
                     params={"secid": secid, "ut": "fa5fd1943c7b386f172d6893dbbd1835",
                             "fields1": "f1,f2,f3", "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-                            "klt": klt, "fqt": fqt, "end": "20500101", "lmt": min(int(count), 5000)}, timeout=timeout)
+                            "klt": klt, "fqt": fqt, "end": em_end, "lmt": min(int(count), 5000)}, timeout=timeout)
                 data = resp.json()
             except Exception as e: logger.warning("[华泰 分钟K线] 请求失败 %s: %s", code, e); return []
             if not isinstance(data, dict): return []

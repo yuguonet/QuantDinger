@@ -127,6 +127,7 @@ def calc_kline_count(timeframe: str, start_date: str, end_date: str = "") -> int
 
     用交易日历（非自然日）计算 start_date 到 end_date 之间的交易日数，
     再乘以每个交易日对应的 bar 数量。
+    end_date 为今天时，当天按盘中已产生的 bar 数计算（非满 bar）。
 
     Args:
         timeframe:  K 线周期（"15m", "1D", ...）
@@ -134,15 +135,30 @@ def calc_kline_count(timeframe: str, start_date: str, end_date: str = "") -> int
         end_date:   结束日期（"YYYY-MM-DD"），为空则取今天
 
     Returns:
-        需要拉取的 K 线条数（向上取整，留余量）
+        需要拉取的 K 线条数
     """
     from app.utils.trading_calendar import trading_days_count
+    from datetime import datetime, timezone, timedelta
+
+    today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
     if not end_date:
-        from datetime import datetime
-        end_date = datetime.now().strftime("%Y-%m-%d")
-    days = trading_days_count(start_date, end_date)
+        end_date = today
+
     bars_per_day = _BARS_PER_DAY.get(timeframe, 1)
-    return days * bars_per_day + bars_per_day  # 多算 1 天余量
+
+    # 日线/周线：每天 1 根，直接算天数
+    if timeframe in ("1D", "1W"):
+        return max(trading_days_count(start_date, end_date), 1)
+
+    # 分钟级 + end_date 是今天 → 最后一天按盘中时间算
+    if end_date == today:
+        past_days = trading_days_count(start_date, end_date) - 1  # 不含今天
+        today_bars = _bars_elapsed_today(timeframe)
+        return max(past_days * bars_per_day + today_bars, 1)
+
+    # 分钟级 + end_date 是过去的日期 → 全部满 bar
+    days = trading_days_count(start_date, end_date)
+    return max(days * bars_per_day, 1)
 
 
 # ================================================================
@@ -214,6 +230,54 @@ def _is_today(date_str: str) -> bool:
     if len(normalized) == 8:
         normalized = f"{normalized[:4]}-{normalized[4:6]}-{normalized[6:]}"
     return normalized == today
+
+
+def _bars_elapsed_today(timeframe: str) -> int:
+    """计算今天盘中已产生的 bar 数（按当前时间，不超过每日上限）"""
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone(timedelta(hours=8)))
+    h, m = now.hour, now.minute
+
+    bars_per_day = _BARS_PER_DAY.get(timeframe, 16)
+
+    # 盘前
+    if h < 9 or (h == 9 and m < 30):
+        return 0
+
+    # 盘中分钟数（午休跳过）
+    if h < 11 or (h == 11 and m <= 30):
+        minutes = (h - 9) * 60 + m - 30
+    elif h == 11 and m > 30:
+        minutes = 120  # 上午盘结束
+    elif h == 12:
+        minutes = 120
+    elif h < 15:
+        minutes = 120 + (h - 13) * 60 + m
+    else:
+        return bars_per_day  # 收盘后返回满 bar
+
+    tf_minutes = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1H": 60}
+    step = tf_minutes.get(timeframe, 15)
+    return min(minutes // step, bars_per_day)
+
+
+def _resolve_market_kline_count(
+    timeframe: str,
+    count: Optional[int],
+    start_date: str,
+) -> Optional[int]:
+    """
+    fetch_market_kline 统一路由：决定 count 值和是否走快照路径。
+
+    返回值:
+      - None: 走 _all_market_kline_via_quotes 快照路径
+      - int:  走并发 fetch_kline 路径，使用此 count 值
+    """
+    if count is not None:
+        return count
+    if not start_date:
+        return None
+    return calc_kline_count(timeframe, start_date)
 
 
 def _all_market_kline_via_quotes(

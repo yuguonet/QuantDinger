@@ -67,7 +67,9 @@ class TwelveDataSource:
     def fetch_market_kline(self, timeframe="1D", count=300, adj="qfq", timeout=15, start_date="", end_date=""):
         """全市场批量K线 — count=None 走批量行情，count 有值走并发 K 线"""
         # count=None 且无 start_date → 走 fetch_batch_quotes（1 HTTP 拿 N 只）
-        if count is None and (not start_date or _is_today(start_date)):
+        from app.data_sources.provider import _resolve_market_kline_count
+        count = _resolve_market_kline_count(timeframe, count, start_date)
+        if count is None:
             from app.data_sources.provider import _all_market_kline_via_quotes
             return _all_market_kline_via_quotes(self, timeframe=timeframe, timeout=timeout)
 
