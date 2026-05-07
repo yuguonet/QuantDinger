@@ -1,1166 +1,525 @@
 """
-backfill_db.py — 全市场 15m/1D K 线惰性回填
+backfill_db.py — 全盘批量回填 15m / 1D K 线到 MongoDB
 
 ═══════════════════════════════════════════════════════════════
-  职责: 被调用时智能判断该更新什么，执行完即退出，不驻留线程
+  核心职责: 全盘全量下载最近 N 根 K 线，少量 HTTP 写入 DB
 ═══════════════════════════════════════════════════════════════
 
-核心设计:
-  1. 真实 bar 时间表对齐 — (9,45), (10,0), ..., (15,0) 共 16 根
-     与 optimizer/check_continuity.py 一致，不是简单整除 900
-  2. cn_last_update 表 — 记录每轮更新状态（进度/锁/失败列表）
-     支持并发保护（乐观锁 + 超时抢占）和失败自动重试
-  3. 只更新当天 — 盘中只拉当日 15m bar，数据量小
-  4. 收盘后拉 1D — 17:00 后从远端拉取当日 1D（比 15m 聚合可靠）
-  5. volume 校验 — 缺失/零 volume 标记统计（部分源确实没有）
-  6. 用完即走 — 无常驻线程，调用方按需触发（cron / heartbeat / API）
+决策依据: cn_last_update 表
+  不靠猜时间，靠查表:
+    该不该干 → 查 last_updated，和当前时间比差距
+    干了什么  → 每次写完记录 tf / count / 写入条数
+    干得怎样  → 记录 status + report（成功/失败/异常信息）
+
+设计原则:
+  1. 只做全盘回填，不做单只回填
+  2. 从当前时间倒推计算 count，不按日期遍历
+  3. 每个数据源只需 1 次 HTTP 请求
+  4. 先删后写，保证数据干净
 
 数据流:
-  远端数据源 → Coordinator → _backfill_batch/_update_daily_bars
-    → _validate_bar（时间标准化 + OHLC 校验）
-    → _safe_upsert（先删后写，保证唯一性）
-    → cn_last_update（回写进度 + 失败列表）
-
-并发模型:
-  多个进程/线程可能同时调用 run_once()。
-  cn_last_update.status='running' 作为乐观锁：
-    - UPDATE ... RETURNING 原子操作，只有一个进程能拿到锁
-    - 拿到锁的进程执行更新，完成后 _release_lock 回写状态
-    - 超过 5 分钟的 running 视为死锁，可被抢占
-    - 异常时 _release_lock 标记 failed，下次自动重试
-
-对外接口:
-    run_once()        — 主入口，惰性智能回填，执行完退出
-    start_backfill()  — 兼容旧接口，等同 run_once()
-    stop_backfill()   — 无操作（惰性模式无常驻线程）
-
-内部也被 cn_stock.py 的 DBKlineBridge._backfill_db() 调用:
-    _align_to_bar_schedule(ts) — 时间标准化函数
-
-用法示例:
-    # 作为 cron 任务（推荐）
-    */15 9-15 * * 1-5  python -c "from app.data_sources.backfill_db import run_once; run_once()"
-
-    # 作为 heartbeat 任务
-    from app.data_sources.backfill_db import run_once
-    result = run_once()
-    # result = {"action": "15m", "15m": {...}, "1d": {...}, "elapsed": 3.2}
-
-    # 兼容旧代码（cn_stock.py 的 backfill_all_market）
-    from app.data_sources.backfill_db import start_backfill
-    start_backfill()
+  查 cn_last_update → 判断是否需要回填 → 删旧数据 → HTTP 拉取 → bulk_write → 写 cn_last_update
 """
 
-from __future__ import annotations
+import asyncio
+import logging
+import os
+from datetime import datetime, timedelta, timezone
 
-import bisect
-import json
-import time
-from datetime import datetime, timedelta, timezone, time as dt_time, date as dt_date
-from typing import Any, Dict, List, Optional, Tuple
+import aiohttp
+import certifi
+from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import UpdateOne
 
-from app.data_sources.circuit_breaker import get_realtime_circuit_breaker
-from app.data_sources.coordinator import get_coordinator
-from app.data_sources.normalizer import normalize_cn_code
-from app.utils.logger import get_logger
+from app.utils.trading_calendar import is_trading_day, prev_trading_day
 
-logger = get_logger(__name__)
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://root:123456@mongo:27017")
+DB_NAME = "quantData"
+client = AsyncIOMotorClient(MONGO_URI, tls=True, tlsCAFile=certifi.where())
+db = client[DB_NAME]
 
-# ================================================================
-# 配置
-# ================================================================
+API_KEY = os.getenv("DINGER_API_KEY", "")
+BASE_URL = "https://api.quantdinger.com/v1"
 
-# 每批拉取的股票数量（用于进度日志和批量写入分片）
-BATCH_SIZE = 400
+MAX_CONCURRENCY = 5
+MAX_RETRIES = 5
+RETRY_BACKOFF_BASE = 1.5
 
-# 每只股票拉取的 15m bar 数量（16 根 ≈ 1 个交易日全量）
-BARS_PER_STOCK = 16
+TZ_CN = timezone(timedelta(hours=8))
 
-# Coordinator 拉取超时（秒）
-COORD_TIMEOUT = 25
-
-# bar 完成后的更新延迟（秒）—— 给远端数据源留出写入时间
-# 例: 10:00 的 bar，会在 10:00:30 之后才去拉取
-_UPDATE_LAG_SECONDS = 30
-
-# 15m 周期秒数（用于 delete_range 的 end_ts 偏移）
-_15M_SEC = 900
-
-# 北京时间时区
-_TZ_CN = timezone(timedelta(hours=8))
+logger = logging.getLogger(__name__)
 
 
-# ================================================================
-# A 股 15m bar 真实时间表
-# ================================================================
-#
-# 上午 8 根: 9:45, 10:00, 10:15, 10:30, 10:45, 11:00, 11:15, 11:30
-# 下午 8 根: 13:15, 13:30, 13:45, 14:00, 14:15, 14:30, 14:45, 15:00
-#
-# 注意:
-#   - 9:30 的 bar 不存在（集合竞价，不计入）
-#   - 11:30~13:15 是午休，没有 bar
-#   - 与 optimizer/check_continuity.py 的 _ALL_BAR_TIMES 完全一致
-#   - bar 的 time 字段 = 该 15 分钟区间的结束时间（收盘时间）
+def _same_trading_day(dt1: datetime, dt2: datetime) -> bool:
+    """判断两个时间点是否在同一个交易日。使用交易日历，精确处理节假日。"""
+    d1 = dt1.strftime("%Y-%m-%d")
+    d2 = dt2.strftime("%Y-%m-%d")
 
-_MORNING_BARS = [
-    (9, 45), (10, 0), (10, 15), (10, 30),
-    (10, 45), (11, 0), (11, 15), (11, 30),
-]
-_AFTERNOON_BARS = [
-    (13, 15), (13, 30), (13, 45), (14, 0),
-    (14, 15), (14, 30), (14, 45), (15, 0),
-]
-_ALL_BAR_TIMES = _MORNING_BARS + _AFTERNOON_BARS  # 共 16 根
-
-# 从午夜算起的分钟数，用于 _align_to_bar_schedule 的二分查找
-_BAR_MINUTES = sorted(h * 60 + m for h, m in _ALL_BAR_TIMES)
-
-# 上午最后一根 bar 的分钟数（11:30 = 690）
-_MORNING_END_MIN = _MORNING_BARS[-1][0] * 60 + _MORNING_BARS[-1][1]
-
-# 下午第一根 bar 的分钟数（13:15 = 795）
-_AFTERNOON_START_MIN = _AFTERNOON_BARS[0][0] * 60 + _AFTERNOON_BARS[0][1]
-
-
-# ================================================================
-# cn_last_update 表 — 更新状态追踪
-# ================================================================
-#
-# 表结构:
-#   timeframe   — '15m' 或 '1D'
-#   trade_date  — 交易日（DATE 类型）
-#   bar_index   — 15m 专用：已更新到第几根 bar（0~15），-1 表示未开始
-#   status      — 状态机：idle → running → ok / partial / failed
-#   failed_codes — 失败的股票代码列表（JSONB 数组），下次 run_once 自动重试
-#   updated_at  — 最后更新时间（用于超时检测）
-#
-# 状态流转:
-#   首次:  无记录 → INSERT idle → UPDATE running → 执行 → ok/partial/failed
-#   重入:  ok/partial/failed → UPDATE running → 执行 → ok/partial/failed
-#   并发:  running（未超时）→ 拿锁失败，skip
-#   超时:  running（>5min）→ 抢占 → 执行
-
-_DDL_LAST_UPDATE = """
-CREATE TABLE IF NOT EXISTS cn_last_update (
-    id          SERIAL PRIMARY KEY,
-    timeframe   VARCHAR(10)  NOT NULL,
-    trade_date  DATE         NOT NULL,
-    bar_index   SMALLINT     DEFAULT -1,
-    status      VARCHAR(20)  DEFAULT 'ok',
-    failed_codes JSONB,
-    updated_at  TIMESTAMP    DEFAULT NOW(),
-    UNIQUE (timeframe, trade_date)
-)
-"""
-
-
-def _ensure_last_update_table(pool):
-    """确保 cn_last_update 表存在（幂等，可并发调用）。"""
-    with pool.connection() as conn:
-        cur = conn.cursor()
-        cur.execute(_DDL_LAST_UPDATE)
-        conn.commit()
-
-
-def _acquire_lock(pool, tf: str, trade_date: dt_date) -> bool:
-    """尝试获取更新锁（乐观锁，非阻塞）。
-
-    流程:
-      1. INSERT ... ON CONFLICT DO NOTHING — 确保记录存在
-      2. UPDATE ... SET status='running' WHERE status != 'running' RETURNING id
-         - 拿到 id → 拿锁成功
-         - 没拿到 → 检查是否超时
-      3. 超时抢占: WHERE status='running' AND updated_at < NOW() - 5min
-
-    Args:
-        pool: 数据库连接池
-        tf: 时间周期，'15m' 或 '1D'
-        trade_date: 交易日
-
-    Returns:
-        True = 拿到锁，可以执行更新
-        False = 别人正在跑，本次 skip
-    """
-    with pool.connection() as conn:
-        cur = conn.cursor()
-
-        # Step 1: 确保有记录（幂等）
-        cur.execute("""
-            INSERT INTO cn_last_update (timeframe, trade_date, bar_index, status)
-            VALUES (%s, %s, -1, 'idle')
-            ON CONFLICT (timeframe, trade_date) DO NOTHING
-        """, (tf, trade_date))
-        conn.commit()
-
-        # Step 2: 尝试拿锁（idle / ok / failed / partial 都可以拿）
-        cur.execute("""
-            UPDATE cn_last_update
-            SET status = 'running', updated_at = NOW()
-            WHERE timeframe = %s AND trade_date = %s
-              AND status != 'running'
-            RETURNING id
-        """, (tf, trade_date))
-        if cur.fetchone():
-            conn.commit()
-            return True
-
-        # Step 3: 超时抢占（running 超过 5 分钟视为死锁）
-        cur.execute("""
-            UPDATE cn_last_update
-            SET status = 'running', updated_at = NOW()
-            WHERE timeframe = %s AND trade_date = %s
-              AND status = 'running'
-              AND updated_at < NOW() - INTERVAL '5 minutes'
-            RETURNING id
-        """, (tf, trade_date))
-        if cur.fetchone():
-            conn.commit()
-            logger.warning(f"[智能回填] {tf} 锁超时，已抢占")
-            return True
-
-        conn.commit()
-        return False
-
-
-def _release_lock(pool, tf: str, trade_date: dt_date,
-                  status: str, bar_index: int = -1, failed_codes: list = None):
-    """释放锁并回写更新状态。
-
-    调用时机:
-      - 正常完成: status='ok'（无失败）或 'partial'（有失败待重试）
-      - 异常中断: status='failed'（保留上次的 failed_codes，下次重试）
-
-    Args:
-        pool: 数据库连接池
-        tf: 时间周期
-        trade_date: 交易日
-        status: 'ok' / 'partial' / 'failed'
-        bar_index: 15m 更新到的 bar 序号（1D 不关心，传 -1）
-        failed_codes: 失败的股票代码列表（存入 JSONB，下次 run_once 自动重试）
-    """
-    with pool.connection() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            UPDATE cn_last_update
-            SET status = %s, bar_index = %s, failed_codes = %s, updated_at = NOW()
-            WHERE timeframe = %s AND trade_date = %s
-        """, (status, bar_index,
-              json.dumps(failed_codes, ensure_ascii=False) if failed_codes else None,
-              tf, trade_date))
-        conn.commit()
-
-
-def _read_state(pool, tf: str, trade_date: dt_date) -> Optional[Dict[str, Any]]:
-    """读取 cn_last_update 的当前状态。
-
-    Returns:
-        None — 无记录（首次运行）
-        {"bar_index": int, "status": str, "failed_codes": list}
-    """
-    with pool.cursor() as cur:
-        cur.execute("""
-            SELECT bar_index, status, failed_codes
-            FROM cn_last_update
-            WHERE timeframe = %s AND trade_date = %s
-        """, (tf, trade_date))
-        row = cur.fetchone()
-        if not row:
-            return None
-        return {
-            "bar_index": row[0],
-            "status": row[1],
-            "failed_codes": json.loads(row[2]) if row[2] else [],
-        }
-
-
-# ================================================================
-# 工具函数
-# ================================================================
-
-def _cn_now() -> datetime:
-    """当前北京时间。"""
-    return datetime.now(_TZ_CN)
-
-
-def _is_trading_day() -> bool:
-    """判断今天是否是 A 股交易日。
-
-    优先使用 trading_calendar 模块（feather 文件 + akshare），
-    模块不可用时保守返回 True（避免漏更新）。
-    """
-    try:
-        from app.utils.trading_calendar import is_trading_day_today
-        return is_trading_day_today()
-    except Exception:
+    # 同一天自然同交易日
+    if d1 == d2:
         return True
 
+    # 不同天 → 各自找到所属的交易日，看是否同一个
+    def _own_trading_day(d: str) -> str:
+        if is_trading_day(d):
+            return d
+        # 非交易日 → 归到前一个交易日
+        return prev_trading_day(d)
 
-def _today_ts() -> int:
-    """今天 00:00:00 的 Unix 时间戳（秒，北京时间）。"""
-    dt = _cn_now().replace(hour=0, minute=0, second=0, microsecond=0)
-    return int(dt.timestamp())
+    return _own_trading_day(d1) == _own_trading_day(d2)
 
 
 # ================================================================
-# 时间标准化
+# cn_last_update 表 — 回填的唯一控制机制
 # ================================================================
+#
+# 防重防错全部交给这张表，不搞其他兼容逻辑。
+# 开发阶段可以随便改表结构，不考虑旧数据兼容。
+# 运行后以表为准，表里怎么写就怎么判断。
+#
+# 结构:
+#   _id           → "{source_name}_{tf}"  如 "stock_daily_k_15m"
+#   source_name   → 数据源名
+#   tf            → 周期（15m / 1D）
+#   last_updated  → 最后一次回填时间
+#   count         → 本次拉取的 bar 数量
+#   written       → 本次实际写入条数
+#   status        → ok / error
+#   report        → 描述信息
+#
 
-def _align_to_bar_schedule(ts: int) -> int:
-    """将任意时间戳标准化到最近的 A 股 15m bar 收盘时间。
+_last_update_col = db["cn_last_update"]
 
-    这是写入 DB 的时间 key 的唯一来源。保证同一个 15 分钟窗口内
-    的所有时间戳都映射到同一个 bar time，避免重复写入。
 
-    映射规则:
-      - 盘前 (< 9:45) → 9:45
-      - 交易时段 → 最近的 bar 收盘时间（二分查找）
-      - 午休 (11:30~13:15) → 11:30
-      - 盘后 (≥ 15:00) → 15:00
+def _should_run(source_name: str, tf: str) -> tuple[bool, str]:
+    """查 cn_last_update，判断是否需要回填。
 
-    例:
-      9:44:59 → 9:45    9:45:01 → 9:45
-      10:07:30 → 10:00  10:08:00 → 10:15
-      12:00:00 → 11:30  15:05:00 → 15:00
+    15m 和 1D 的"完成"定义不同:
+      1D → 一个交易日干一次就够了
+      15m → 盘中需要多次干，每次覆盖最新 bar
 
-    Args:
-        ts: Unix 时间戳（秒）
+    规则:
+      没记录 → 干
+      1D: ok 且同交易日 → 不干
+      1D: ok 但跨交易日 → 干
+      15m: ok 但距上次超过 5 分钟 → 干（盘中有新 bar）
+      15m: ok 且 5 分钟内 → 不干
+      error → 重干
 
     Returns:
-        标准化后的 Unix 时间戳（秒），对齐到 bar 收盘时间
+        (是否需要, 原因描述)
     """
-    dt = datetime.fromtimestamp(ts, tz=_TZ_CN)
-    total_min = dt.hour * 60 + dt.minute
+    doc = _last_update_col.find_one({"_id": f"{source_name}_{tf}"})
+    if not doc:
+        return True, "首次回填，无历史记录"
 
-    # 盘前 → 当天第一根 bar
-    if total_min < _BAR_MINUTES[0]:
-        target = _BAR_MINUTES[0]
-    # 午休区间 → 上午最后一根
-    elif _MORNING_END_MIN <= total_min < _AFTERNOON_START_MIN:
-        target = _MORNING_END_MIN
-    # 盘后 → 下午最后一根
-    elif total_min >= _BAR_MINUTES[-1]:
-        target = _BAR_MINUTES[-1]
-    else:
-        # 正常交易时段，二分查找最近的 bar
-        idx = bisect.bisect_right(_BAR_MINUTES, total_min)
-        if idx == 0:
-            target = _BAR_MINUTES[0]
-        elif idx >= len(_BAR_MINUTES):
-            target = _BAR_MINUTES[-1]
-        else:
-            # 取更接近的那个（相等时取前一个）
-            prev_diff = total_min - _BAR_MINUTES[idx - 1]
-            next_diff = _BAR_MINUTES[idx] - total_min
-            target = _BAR_MINUTES[idx - 1] if prev_diff <= next_diff else _BAR_MINUTES[idx]
+    status = doc.get("status", "")
 
-    target_h, target_m = divmod(target, 60)
-    aligned = dt.replace(hour=target_h, minute=target_m, second=0, microsecond=0)
-    return int(aligned.timestamp())
+    # 干得不好 → 重干
+    if status == "error":
+        return True, f"上次失败: {doc.get('report', '')}，重试"
+
+    if status != "ok":
+        return True, f"上次 status={status}，需要回填"
+
+    # ── 以下: status=ok ──
+
+    last = doc.get("last_updated")
+    if not last:
+        return True, "无 last_updated，重新回填"
+
+    # 1D: 同交易日不干，跨交易日干
+    if tf == "1D":
+        if _same_trading_day(last, datetime.utcnow()):
+            return False, f"本交易日 1D 已成功回填 (written={doc.get('written', 0)})，不再重复"
+        return True, f"上次 1D 成功是 {last:%Y-%m-%d}，跨交易日了，重新回填"
+
+    # 15m: 盘中需要多次干，5 分钟节流
+    elapsed = (datetime.utcnow() - last).total_seconds()
+    if elapsed < 300:
+        return False, f"15m 距上次回填 {elapsed:.0f}s < 300s，跳过"
+    return True, f"15m 距上次回填 {elapsed:.0f}s，盘中有新 bar，重新回填"
 
 
-def _ts_to_bar_index(total_min: int) -> int:
-    """将分钟数（从午夜算起）转换为 bar 序号（0~15）。
-
-    Args:
-        total_min: 从午夜算起的分钟数，如 14:45 → 885
-
-    Returns:
-        bar 序号（0~15），未找到返回 -1
-    """
-    try:
-        return _BAR_MINUTES.index(total_min)
-    except ValueError:
-        return -1
+def _record_update(
+    source_name: str,
+    tf: str,
+    count: int,
+    written: int,
+    status: str,
+    report: str,
+):
+    """写入回填记录到 cn_last_update。"""
+    _last_update_col.update_one(
+        {"_id": f"{source_name}_{tf}"},
+        {"$set": {
+            "source_name": source_name,
+            "tf": tf,
+            "last_updated": datetime.utcnow(),
+            "count": count,
+            "written": written,
+            "status": status,
+            "report": report,
+        }},
+        upsert=True,
+    )
 
 
 # ================================================================
-# 数据清洗
+# count 计算 — 从当前时间倒推
 # ================================================================
 
-def _validate_bar(bar: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """校验并清洗单根 15m K 线。
+def _calc_15m_count() -> int:
+    """从当前时间倒推，计算当前应有多少根完整的 15m bar。
 
-    校验流程:
-      1. time 字段必须是正数
-      2. _align_to_bar_schedule 标准化到 bar 收盘时间
-      3. OHLC 必须全部 > 0（缺失则丢弃整根 bar）
-      4. high/low 自动修正（high < low 时交换）
-      5. volume 缺失时填 0（部分数据源不提供 volume）
+    16 个节点: 9:45, 10:00, ..., 11:30, 13:15, ..., 15:00
+    盘前返回 0，盘中按已过的节点数计算，盘后返回 16。
+    """
+    now = datetime.now(TZ_CN)
+    h, m = now.hour, now.minute
 
-    Args:
-        bar: 原始 bar，至少包含 time/open/high/low/close，volume 可选
+    # 盘前: 第一根 bar 9:30-9:45，9:45 才完成
+    if h < 9 or (h == 9 and m < 45):
+        return 0
+
+    # 上午盘: 9:45 ~ 11:30，共 8 根
+    if h < 11 or (h == 11 and m <= 30):
+        minutes_since_open = (h - 9) * 60 + m - 30
+        return max(minutes_since_open // 15, 1)
+
+    # 午休: 11:31 ~ 13:14，上午盘 8 根已全部完成
+    if h < 13 or (h == 13 and m < 15):
+        return 8
+
+    # 下午盘: 13:15 ~ 15:00，共 8 根
+    if h < 15 or (h == 15 and m == 0):
+        minutes_since_afternoon = (h - 13) * 60 + m - 15
+        return 8 + max(minutes_since_afternoon // 15, 1)
+
+    # 收盘后: 16 根全部完成
+    return 16
+
+
+def _should_run(source_name: str, tf: str) -> tuple[bool, str]:
+    """查 cn_last_update，判断是否需要回填。
+
+    15m 和 1D 的"完成"定义不同:
+      1D → 一个交易日干一次就够了
+      15m → 盘中按节点触发，过了节点就有新 bar 可拉
+
+    判断依据: cn_last_update.count vs 当前应有 bar 数
+      count < 当前应有 → 有新 bar，干
+      count >= 当前应有 → 没新 bar，不干
 
     Returns:
-        清洗后的 bar dict，校验失败返回 None
+        (是否需要, 原因描述)
     """
-    ts = bar.get("time", 0)
-    if not isinstance(ts, (int, float)) or ts <= 0:
-        return None
+    doc = _last_update_col.find_one({"_id": f"{source_name}_{tf}"})
+    if not doc:
+        return True, "首次回填，无历史记录"
 
-    ts = _align_to_bar_schedule(int(ts))
-    if ts <= 0:
-        return None
+    status = doc.get("status", "")
 
-    o = bar.get("open", 0)
-    h = bar.get("high", 0)
-    l = bar.get("low", 0)
-    c = bar.get("close", 0)
-    v = bar.get("volume", 0)
+    # 干得不好 → 重干
+    if status == "error":
+        return True, f"上次失败: {doc.get('report', '')}，重试"
 
-    try:
-        o, h, l, c = float(o), float(h), float(l), float(c)
-        v = float(v) if v is not None and str(v).strip() not in ("", "-", "nan") else 0.0
-    except (TypeError, ValueError):
-        return None
+    if status != "ok":
+        return True, f"上次 status={status}，需要回填"
 
-    # OHLC 必须 > 0（真实股价不可能为零）
-    if o <= 0 or h <= 0 or l <= 0 or c <= 0:
-        return None
+    # ── 以下: status=ok ──
 
-    # 合理性修正（不丢弃，自动修正逻辑矛盾）
-    if h < l:
-        h, l = l, h
-    if h < max(o, c):
-        h = max(o, c)
-    if l > min(o, c):
-        l = min(o, c)
+    last = doc.get("last_updated")
+    if not last:
+        return True, "无 last_updated，重新回填"
 
-    return {
-        "time": ts,
-        "open": round(o, 4),
-        "high": round(h, 4),
-        "low": round(l, 4),
-        "close": round(c, 4),
-        "volume": round(max(v, 0), 2),  # volume 不能为负
-    }
+    # 1D: 同交易日不干，跨交易日干
+    if tf == "1D":
+        if _same_trading_day(last, datetime.utcnow()):
+            return False, f"本交易日 1D 已成功回填 (written={doc.get('written', 0)})，不再重复"
+        return True, f"上次 1D 成功是 {last:%Y-%m-%d}，跨交易日了，重新回填"
+
+    # 15m: 按节点判断 — 上次拉的 bar 数 < 当前应有 bar 数 → 有新 bar
+    last_count = doc.get("count", 0)
+    now_count = _calc_15m_count()
+
+    if now_count <= 0:
+        return False, "盘前，无需回填"
+
+    if last_count >= now_count:
+        return False, f"15m 已覆盖到第 {last_count} 根，当前应有 {now_count} 根，无新 bar"
+
+    return True, f"15m 上次 {last_count} 根，当前应有 {now_count} 根，有新 bar 可拉"
 
 
-def _clean_bars(bars: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """批量清洗 K 线: 校验 + 去重 + 排序。
-
-    去重策略: 同一 timestamp 出现多次，保留最后一条（后到的覆盖先到的）。
-    排序: 按 time 升序。
-
-    Args:
-        bars: 原始 bar 列表
-
-    Returns:
-        清洗后的 bar 列表（已排序、去重）
-    """
-    seen: Dict[int, Dict[str, Any]] = {}
-    for bar in bars:
-        cleaned = _validate_bar(bar)
-        if cleaned is None:
-            continue
-        seen[cleaned["time"]] = cleaned
-    return sorted(seen.values(), key=lambda b: b["time"])
+def _calc_1d_count() -> int:
+    """盘后回填 1D，覆盖最近 5 个交易日（含跨周/节假日缺口）。"""
+    return 5
 
 
 # ================================================================
-# DB 读写操作
+# 时间范围计算
 # ================================================================
 
-def _init_writer():
-    """惰性初始化 db_market writer。
+def _today_start() -> datetime:
+    """今天 00:00:00（北京时间）。"""
+    now = datetime.now(TZ_CN)
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    首次调用时创建 MarketDBManager + MarketKlineWriter，
-    确保 CNStock 库存在。失败返回 None。
 
-    Returns:
-        MarketKlineWriter 实例，或 None（初始化失败）
+def _range_start(days_back: int) -> datetime:
+    """往前推 days_back 天的 00:00:00。"""
+    return _today_start() - timedelta(days=days_back)
+
+
+# ================================================================
+# BackfillDB
+# ================================================================
+
+class BackfillDB:
+    """全盘批量回填工具 — 1 次 HTTP 拉全量标的。
+
+    决策依据是 cn_last_update 表，不靠猜时间。
+    每次回填结果写回 cn_last_update，形成闭环。
     """
-    try:
-        from app.utils.db_market import get_market_db_manager, get_market_kline_writer
-        mgr = get_market_db_manager()
-        mgr.ensure_market_db("CNStock")
-        return get_market_kline_writer()
-    except Exception as e:
-        logger.error(f"[智能回填] DB 初始化失败: {e}")
-        return None
 
+    def __init__(
+        self,
+        name: str,
+        collection_name: str,
+        url_template: str,
+        build_doc_id,
+        timestamp_field: str,
+    ):
+        """
+        Args:
+            name: 数据源名称（写入 cn_last_update 的标识，如 "stock_daily_k"）
+            collection_name: MongoDB 集合名
+            url_template: API URL 模板，支持 {tf} 和 {count} 占位
+            build_doc_id: (item) -> 文档 _id 的构造函数
+            timestamp_field: 文档中时间戳字段名
+        """
+        self.name = name
+        self.collection = db[collection_name]
+        self.url_template = url_template
+        self.build_doc_id = build_doc_id
+        self.timestamp_field = timestamp_field
 
-def _get_pool(writer):
-    """从 writer 获取 CNStock 连接池。"""
-    return writer._mgr._get_pool("CNStock")
+    @staticmethod
+    def _make_headers() -> dict:
+        return {"Authorization": f"Bearer {API_KEY}"}
 
-
-def _delete_range(writer, symbol: str, start_ts: int, end_ts: int):
-    """删除指定 symbol 在 [start_ts, end_ts) 时间范围内的 15m 旧数据。
-
-    写入前调用，确保不会有脏数据残留。可能跨年，按年分表删除。
-    表不存在时静默忽略。
-    """
-    pool = _get_pool(writer)
-    start_dt = datetime.fromtimestamp(start_ts)
-    end_dt = datetime.fromtimestamp(end_ts)
-    years = set(range(start_dt.year, end_dt.year + 1))
-
-    with pool.connection() as conn:
-        cur = conn.cursor()
-        for year in years:
-            table = f"kline_15m_{year}"
+    async def _fetch_with_retries(
+        self, session: aiohttp.ClientSession, url: str
+    ) -> dict | None:
+        for attempt in range(MAX_RETRIES):
             try:
-                cur.execute(f"""
-                    DELETE FROM "{table}"
-                    WHERE symbol = %s AND time >= %s AND time < %s
-                """, (symbol, start_dt, end_dt))
-            except Exception:
-                pass  # 表不存在
-        conn.commit()
-
-
-def _delete_future_data(writer, symbol: str):
-    """删除该 symbol 中 time > 当前时间的错误数据。
-
-    远端数据偶尔会返回未来时间戳（时区错误等），必须清理。
-    """
-    pool = _get_pool(writer)
-    now_dt = datetime.now()
-    years = set(range(now_dt.year - 1, now_dt.year + 2))
-
-    with pool.connection() as conn:
-        cur = conn.cursor()
-        for year in years:
-            table = f"kline_15m_{year}"
-            try:
-                cur.execute(f"""
-                    DELETE FROM "{table}"
-                    WHERE symbol = %s AND time > %s
-                """, (symbol, now_dt))
-            except Exception:
-                pass
-        conn.commit()
-
-
-def _safe_upsert(writer, symbol: str, bars: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """安全写入 15m K 线: 先删后写，保证唯一性和准确性。
-
-    流程:
-      1. _clean_bars 清洗 + 校验 + 标准化时间
-      2. _delete_range 删除该 symbol + 时间范围旧数据
-      3. _delete_future_data 删除未来时间的错误数据
-      4. writer.upsert 写入新数据（ON CONFLICT DO UPDATE）
-
-    Args:
-        writer: MarketKlineWriter 实例
-        symbol: 纯 6 位股票代码（如 "600519"）
-        bars: 原始 bar 列表
-
-    Returns:
-        {"inserted": int, "updated": int, "errors": int,
-         "cleaned": int, "raw": int, "error": str（可选）}
-    """
-    cleaned = _clean_bars(bars)
-    if not cleaned:
-        return {"inserted": 0, "cleaned": 0, "raw": len(bars)}
-
-    min_ts = cleaned[0]["time"]
-    max_ts = cleaned[-1]["time"]
-
-    records = [{
-        "time": datetime.fromtimestamp(b["time"]),
-        "open": b["open"], "high": b["high"],
-        "low": b["low"], "close": b["close"],
-        "volume": b["volume"],
-    } for b in cleaned]
-
-    _delete_range(writer, symbol, min_ts, max_ts + _15M_SEC)
-    _delete_future_data(writer, symbol)
-
-    try:
-        result = writer.upsert("CNStock", symbol, "15m", records)
-        return {
-            "inserted": result.get("inserted", 0),
-            "updated": result.get("updated", 0),
-            "errors": result.get("errors", 0),
-            "cleaned": len(cleaned), "raw": len(bars),
-        }
-    except Exception as e:
-        logger.warning(f"[智能回填] upsert 失败 {symbol}: {e}")
-        return {"inserted": 0, "cleaned": len(cleaned), "raw": len(bars), "error": str(e)}
-
-
-# ================================================================
-# 调度判断
-# ================================================================
-
-def _completed_bars_since(last_bar_idx: int, now_ts: int) -> List[Tuple[int, int]]:
-    """返回已完成但尚未更新的 15m bar 列表。
-
-    判断逻辑:
-      - bar 已完成 = 当前时间 >= bar 收盘时间 + _UPDATE_LAG_SECONDS
-      - 尚未更新 = bar 序号 > last_bar_idx
-
-    Args:
-        last_bar_idx: 上次更新到的 bar 序号（0~15），-1 表示未开始
-        now_ts: 当前 Unix 时间戳（秒）
-
-    Returns:
-        [(bar_time_ts, bar_index), ...] 按时间升序
-        例: [(1715040000, 2), (1715040900, 3)] 表示第 3、4 根 bar 需要更新
-    """
-    now_dt = datetime.fromtimestamp(now_ts, tz=_TZ_CN)
-    base = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
-
-    result = []
-    for i, (h, m) in enumerate(_ALL_BAR_TIMES):
-        if i <= last_bar_idx:
-            continue  # 已更新过，跳过
-        bar_ts = int(base.replace(hour=h, minute=m, tzinfo=_TZ_CN).timestamp())
-        effective_ts = bar_ts + _UPDATE_LAG_SECONDS
-        if now_ts >= effective_ts:
-            result.append((bar_ts, i))
-    return result
-
-
-# ================================================================
-# 全市场股票代码获取
-# ================================================================
-
-def _get_all_codes() -> List[str]:
-    """获取全市场 A 股纯 6 位数字代码列表。
-
-    优先级:
-      1. AStockDataSource（有 24h 缓存）
-      2. 东财 push2 API（fallback）
-
-    Returns:
-        ["600000", "000001", ...] 纯数字代码列表
-    """
-    try:
-        from app.data_sources.a_stock import AStockDataSource
-        ds = AStockDataSource()
-        raw_list = ds.get_all_stock_codes()
-        codes = [str(item.get("stock_code", "")).strip() for item in raw_list
-                 if len(str(item.get("stock_code", "")).strip()) == 6
-                 and str(item.get("stock_code", "")).strip().isdigit()]
-        if codes:
-            logger.info(f"[智能回填] 获取股票列表: {len(codes)} 只")
-            return codes
-    except Exception as e:
-        logger.warning(f"[智能回填] AStockDataSource 获取列表失败: {e}")
-
-    # fallback: 直接调东财
-    try:
-        import requests
-        resp = requests.get(
-            "https://push2.eastmoney.com/api/qt/clist/get",
-            params={
-                "pn": 1, "pz": 6000, "po": 1, "np": 1,
-                "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-                "fltt": 2, "invt": 2, "fid": "f3",
-                "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048",
-                "fields": "f12",
-            },
-            timeout=15,
-        )
-        items = ((resp.json() or {}).get("data") or {}).get("diff", [])
-        codes = [str(item.get("f12", "")).strip() for item in items
-                 if len(str(item.get("f12", "")).strip()) == 6
-                 and str(item.get("f12", "")).strip().isdigit()]
-        logger.info(f"[智能回填] 东财直接获取股票列表: {len(codes)} 只")
-        return codes
-    except Exception as e:
-        logger.error(f"[智能回填] 东财获取列表失败: {e}")
-        return []
-
-
-# ================================================================
-# 15m 批量拉取
-# ================================================================
-
-def _backfill_batch(
-    codes: List[str], writer, cb, today_start_ts: int,
-    market_data: Dict[str, List[Dict]] = None,
-    force: bool = False, preferred_source: str = "",
-) -> Tuple[int, int, int, int, int, List[str], int]:
-    """拉取一批股票的当日 15m 数据并写入 DB。
-
-    流程:
-      1. 从预拉取的全市场数据中筛选本批次 codes
-      2. 过滤出 today_start_ts 之后的 bar（只保留当日）
-      3. 统计 volume 缺失情况
-      4. _safe_upsert 写入 DB
-      5. 统计成功/失败/跳过
-
-    Args:
-        codes: 纯 6 位股票代码列表
-        writer: MarketKlineWriter 实例
-        cb: CircuitBreaker 实例（熔断器，远端不可用时快速失败）
-        today_start_ts: 今天 00:00 的 Unix 时间戳
-        market_data: 预拉取的全市场 K 线数据（由 run_once 通过
-                     coordinate_market_kline 一次拉取，此处筛选使用）
-        force: 强制模式，跳过时间窗口过滤（写入所有可用 bar）
-        preferred_source: 锁定数据源名称，防止 coordinator 换源
-
-    Returns:
-        (成功数, coordinator失败数, 跳过数, 脏数据数, vol缺失数, 失败代码列表, 最大已写入bar序号)
-        最大已写入bar序号: 实际写入 DB 的最大 bar index（-1 表示无有效数据写入）
-    """
-    coord_results: Dict[str, List[Dict]] = {}
-    failed_codes: List[str] = []
-
-    if market_data:
-        # 从全市场数据中筛选本批次
-        for code in codes:
-            ncode = normalize_cn_code(code)
-            if ncode in market_data:
-                coord_results[ncode] = market_data[ncode]
-            else:
-                failed_codes.append(code)
-    else:
-        # market_data 未传入时回退到逐只拉取（兼容旧调用路径）
-        from app.data_sources.coordinator import get_coordinator
-        coord = get_coordinator()
-        normalized = [normalize_cn_code(c) for c in codes]
-        logger.info("[智能回填] 无预拉取数据，回退 coordinate_kline")
-        coord_results, failed = coord.coordinate_kline(
-            symbols=normalized, timeframe="15m", limit=BARS_PER_STOCK,
-            cb=cb, market="CNStock", timeout=COORD_TIMEOUT, adj="qfq",
-            preferred_source=preferred_source,
-        )
-        if failed:
-            failed_codes.extend(failed)
-
-    success = skip = dirty = vol_missing = 0
-    max_written_bar_idx = -1
-
-    for code in codes:
-        bars = coord_results.get(normalize_cn_code(code), [])
-        if not bars:
-            skip += 1
-            continue
-
-        # 只取当日 bar
-        if force:
-            bars = [b for b in bars if b.get("time", 0) >= today_start_ts]
-        else:
-            now_ts_filter = int(time.time())
-            filtered = []
-            for b in bars:
-                bt = b.get("time", 0)
-                if bt < today_start_ts:
-                    continue
-                aligned_ts = _align_to_bar_schedule(int(bt))
-                aligned_dt = datetime.fromtimestamp(aligned_ts, tz=_TZ_CN)
-                bar_min = aligned_dt.hour * 60 + aligned_dt.minute
-                bar_idx = _ts_to_bar_index(bar_min)
-                if bar_idx < 0:
-                    continue
-                bar_h, bar_m = _ALL_BAR_TIMES[bar_idx]
-                bar_sched_ts = int(
-                    aligned_dt.replace(hour=bar_h, minute=bar_m, second=0, microsecond=0).timestamp()
-                )
-                if now_ts_filter < bar_sched_ts + _UPDATE_LAG_SECONDS:
-                    continue
-                filtered.append(b)
-            bars = filtered
-        if not bars:
-            skip += 1
-            continue
-
-        for b in bars:
-            v = b.get("volume", 0)
-            if v is None or str(v).strip() in ("", "-", "nan") or float(v or 0) <= 0:
-                vol_missing += 1
-
-        raw_count = len(bars)
-        result = _safe_upsert(writer, code, bars)
-        cleaned_count = result.get("cleaned", 0)
-        dirty += raw_count - cleaned_count
-
-        if cleaned_count > 0 and "error" not in result and result.get("errors", 0) == 0:
-            success += 1
-            for b in bars:
-                aligned_ts = _align_to_bar_schedule(int(b.get("time", 0)))
-                aligned_dt = datetime.fromtimestamp(aligned_ts, tz=_TZ_CN)
-                aligned_min = aligned_dt.hour * 60 + aligned_dt.minute
-                bar_idx = _ts_to_bar_index(aligned_min)
-                if bar_idx >= 0 and bar_idx > max_written_bar_idx:
-                    max_written_bar_idx = bar_idx
-        else:
-            skip += 1
-            if "error" in result:
-                failed_codes.append(code)
-
-    return success, len(failed_codes), skip, dirty, vol_missing, failed_codes, max_written_bar_idx
-
-
-# ================================================================
-# 1D 远端拉取
-# ================================================================
-
-def _upsert_daily(writer, symbol: str, bars: List[Dict[str, Any]]) -> bool:
-    """将单只股票的当日 1D bar 写入 DB。
-
-    流程:
-      1. 从 bars 中过滤出当日的 bar
-      2. 校验 OHLC > 0
-      3. 事务内先 DELETE 当日旧数据，再 INSERT 新数据
-
-    注意: DELETE + INSERT 在同一个 pool.connection() 事务内，
-    中间崩了会回滚，不会丢数据。
-
-    Args:
-        writer: MarketKlineWriter 实例
-        symbol: 纯 6 位股票代码
-        bars: 远端返回的 1D bar 列表（可能包含多日，只取当日）
-
-    Returns:
-        True = 写入成功，False = 无有效数据或写入失败
-    """
-    today_start = _today_ts()
-    today_dt = datetime.fromtimestamp(today_start, tz=_TZ_CN)
-    year = today_dt.year
-    today_midnight = today_dt.replace(tzinfo=None)
-
-    # 过滤当日 bar + 校验 OHLC
-    today_bars = []
-    for b in bars:
-        ts = b.get("time", 0)
-        if isinstance(ts, datetime):
-            ts = int(ts.timestamp())
-        if ts >= today_start:
-            try:
-                o, h, l, c = float(b.get("open", 0)), float(b.get("high", 0)), float(b.get("low", 0)), float(b.get("close", 0))
-                v = b.get("volume", 0)
-                v = float(v) if v is not None and str(v).strip() not in ("", "-", "nan") else 0.0
-            except (TypeError, ValueError):
-                continue
-            if o > 0 and h > 0 and l > 0 and c > 0:
-                if h < l:
-                    h, l = l, h
-                today_bars.append({
-                    "open": round(o, 4), "high": round(h, 4),
-                    "low": round(l, 4), "close": round(c, 4),
-                    "volume": round(max(v, 0), 2),
-                })
-
-    if not today_bars:
-        return False
-
-    # 远端 1D 通常只返回一根当日 bar
-    bar = today_bars[-1]
-
-    try:
-        pool = _get_pool(writer)
-        table = f"kline_1D_{year}"
-        with pool.connection() as conn:
-            cur = conn.cursor()
-            # 先删当日旧数据
-            cur.execute(f'DELETE FROM "{table}" WHERE symbol = %s AND time = %s',
-                        (symbol, today_midnight))
-            # 写入新数据
-            cur.execute(f"""
-                INSERT INTO "{table}" (symbol, time, open, high, low, close, volume)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """, (symbol, today_midnight,
-                  bar["open"], bar["high"], bar["low"], bar["close"], bar["volume"]))
-        return True
-    except Exception as e:
-        logger.debug(f"[智能回填] 1D 写入失败 {symbol}: {e}")
-        return False
-
-
-def _update_daily_bars(writer, codes: List[str],
-                       market_data: Dict[str, List[Dict]] = None,
-                       preferred_source: str = "") -> List[str]:
-    """从远端拉取当日 1D 数据并写入 DB。
-
-    通过 Coordinator.coordinate_market_kline 一次拉取全市场 1D 数据，
-    比从 15m 聚合更可靠 — 数据源的官方日 OHLCV 不会有聚合误差。
-
-    Args:
-        writer: MarketKlineWriter 实例
-        codes: 全市场股票代码列表
-        market_data: 预拉取的全市场 1D 数据（由 run_once 通过
-                     coordinate_market_kline 一次拉取，此处直接使用）
-        preferred_source: 锁定数据源名称，防止 coordinator 换源
-
-    Returns:
-        失败的股票代码列表（用于写入 cn_last_update.failed_codes 重试）
-    """
-    today_dt = datetime.fromtimestamp(_today_ts(), tz=_TZ_CN)
-    year = today_dt.year
-
-    try:
-        from app.utils.db_market import get_market_db_manager
-        get_market_db_manager().ensure_year_table("CNStock", "1D", year)
-    except Exception as e:
-        logger.warning(f"[智能回填] 确保 1D 表失败: {e}")
-        return codes
-
-    coord_results = market_data or {}
-    total = len(codes)
-    success = skip = 0
-    all_failed_codes: List[str] = []
-
-    logger.info(f"[智能回填] 开始远端 1D 写入: {total} 只 (数据源命中 {len(coord_results)} 只)")
-
-    for code in codes:
-        bars = coord_results.get(normalize_cn_code(code), [])
-        if not bars:
-            skip += 1  # 远端无数据（停牌/退市等），不计入 failed，避免无意义重试
-        elif _upsert_daily(writer, code, bars):
-            success += 1
-        else:
-            skip += 1
-            all_failed_codes.append(code)  # upsert 失败，下次重试
-
-    logger.info(f"[智能回填] 1D 远端拉取完成: 成功={success} 失败={len(all_failed_codes)} 跳过={skip}")
-    return all_failed_codes
-
-
-# ================================================================
-# 对外接口
-# ================================================================
-
-def run_once(force: bool = False, preferred_source: str = "") -> Dict[str, Any]:
-    """惰性智能回填 — 主入口。自动判断该更新什么，执行完即退出。
-
-    ═══════════════════════════════════════════════════════════
-      这是唯一的对外接口（除了兼容旧接口的 start_backfill）。
-      由 cron / heartbeat / API 调用，不需要关心内部细节。
-    ═══════════════════════════════════════════════════════════
-
-    执行逻辑:
-      1. 非交易日 → 直接 skip（force=True 时跳过此检查）
-      2. 查 cn_last_update 获取上次进度（bar_index / failed_codes）
-      3. 盘中 (9:44~15:00):
-         - 从远端拉取当日 15m 数据（远端有什么就写什么）
-         - 先重试 failed_codes 中的失败股票
-         - bar_index 按实际写入的最大 bar 推进（不依赖调度表推断）
-         - 回写 cn_last_update（新的 bar_index + 失败列表）
-      4. 收盘后 (15:00~17:00):
-         - 拉最后一轮 15m（确保 15:00 的 bar 完整）
-      5. 17:00 后:
-         - 从远端拉取当日 1D 数据
-         - 有失败记录则自动重试
-      6. 释放锁，退出
-
-    force 模式:
-      - 跳过交易日检查
-      - 跳过 bar 时间窗口过滤（写入所有可用 bar，包括"未来"的）
-      - 跳过 cn_last_update 状态检查（不看 status 是否 ok，直接拉取）
-      - 适用于: 手动全量回填、数据修复、首次建库
-
-    并发保护:
-      - cn_last_update.status='running' 乐观锁
-      - UPDATE ... RETURNING 原子操作，只有一个进程能拿到
-      - 超过 5 分钟的 running 视为死锁，可被抢占
-
-    Args:
-        force: 强制全量拉取，跳过增量逻辑和时间窗口过滤
-        preferred_source: 锁定数据源名称（如 "tencent"），force 模式下建议指定，
-                          防止 coordinator fallback 换源导致数据不一致
-
-    Returns:
-        {
-            "action": "15m" | "1d" | "both" | "skip" | "locked",
-            "15m": {                      # 15m 更新详情（如有）
-                "success": int,           # 成功写入的股票数
-                "failed": int,            # Coordinator 失败数
-                "skipped": int,           # 跳过数（无数据/upsert 失败）
-                "dirty": int,             # 清洗丢弃的 bar 数
-                "vol_missing": int,       # volume 缺失的 bar 数
-                "retried": int,           # 本次重试的失败股票数
-                "pending_failures": int,  # 仍失败待下次重试的股票数
-            },
-            "1d": {                       # 1D 更新详情（如有）
-                "done": True,
-                "pending_failures": int,
-            },
-            "elapsed": float,             # 总耗时（秒）
-        }
-    """
-    start_time = time.time()
-
-    # ── 非交易日直接跳过（force 模式不检查）──
-    if not force and not _is_trading_day():
-        logger.info("[智能回填] 非交易日，跳过")
-        return {"action": "skip", "elapsed": 0}
-
-    # ── 初始化 DB ──
-    writer = _init_writer()
-    if not writer:
-        logger.error("[智能回填] DB 不可用")
-        return {"action": "skip", "elapsed": 0}
-
-    pool = _get_pool(writer)
-    _ensure_last_update_table(pool)
-
-    # ── 获取全市场代码 ──
-    codes = _get_all_codes()
-    if not codes:
-        logger.warning("[智能回填] 无股票代码")
-        return {"action": "skip", "elapsed": 0}
-
-    now_ts = int(time.time())
-    now_dt = datetime.fromtimestamp(now_ts, tz=_TZ_CN)
-    now_total_min = now_dt.hour * 60 + now_dt.minute
-    today = now_dt.date()
-    today_start = _today_ts()
-
-    result_15m = None
-    result_1d = None
-    action = "skip"
-
-    # ════════════════════════════════════════════════════════
-    # 15m 更新（盘中 + 收盘后，或 force 模式）
-    # ════════════════════════════════════════════════════════
-    if force or now_total_min >= _BAR_MINUTES[0] - 1:
-        # 读取上次状态
-        state_15m = _read_state(pool, "15m", today)
-        # force 模式: 重置 bar_index，全量拉取
-        last_bar_idx = -1 if force else (state_15m["bar_index"] if state_15m else -1)
-        prev_failed = [] if force else (state_15m.get("failed_codes", []) if state_15m else [])
-
-        # 是否有待重试的失败股票
-        has_retries = len(prev_failed) > 0
-
-        # 始终尝试拉取 — 以远端返回的数据为准，不再用调度表推断
-        # 远端有什么就写什么，没有就不写
-        if True:
-            # 尝试拿锁（拿不到说明别人在跑）
-            if not _acquire_lock(pool, "15m", today):
-                logger.info("[智能回填] 15m 已有进程在跑，跳过")
-                return {"action": "locked", "elapsed": 0}
-
-            try:
-                cb = get_realtime_circuit_breaker()
-                coord = get_coordinator()
-                s_total = f_total = sk_total = d_total = vm_total = 0
-                all_failed_codes = []
-                actual_bar_idx = last_bar_idx  # 按实际写入推进
-
-                # ── 全市场 15m 一次拉取 ──
-                logger.info("[智能回填] coordinate_market_kline 全市场 15m 拉取...")
-                market_data_15m = coord.coordinate_market_kline(
-                    cb=cb, market="CNStock", timeframe="15m",
-                    count=BARS_PER_STOCK, adj="qfq", timeout=COORD_TIMEOUT,
-                    preferred_source=preferred_source,
-                )
-                if market_data_15m:
-                    logger.info(f"[智能回填] 全市场 15m 命中 {len(market_data_15m)} 只")
-                else:
-                    logger.warning("[智能回填] 全市场 15m 拉取为空")
-
-                # ── Step 1: 重试上次失败的股票 ──
-                if has_retries:
-                    logger.info(f"[智能回填] 重试 {len(prev_failed)} 只失败股票...")
-                    retry_codes = [c for c in prev_failed if c in codes]
-                    if retry_codes:
-                        s, f, sk, d, vm, fc, w_idx = _backfill_batch(retry_codes, writer, cb, today_start, market_data=market_data_15m, force=force, preferred_source=preferred_source)
-                        s_total += s; f_total += f; sk_total += sk
-                        d_total += d; vm_total += vm
-                        all_failed_codes.extend(fc)
-                        if w_idx > actual_bar_idx:
-                            actual_bar_idx = w_idx
-
-                # ── Step 2: 拉取全市场数据（使用已拉取的全市场数据）──
-                pull_codes = codes
-                if has_retries and not force:
-                    retry_set = set(prev_failed)
-                    pull_codes = [c for c in codes if c not in retry_set]
-
-                for idx in range(0, len(pull_codes), BATCH_SIZE):
-                    batch = pull_codes[idx:idx + BATCH_SIZE]
-                    try:
-                        s, f, sk, d, vm, fc, w_idx = _backfill_batch(batch, writer, cb, today_start, market_data=market_data_15m, force=force, preferred_source=preferred_source)
-                        s_total += s; f_total += f; sk_total += sk
-                        d_total += d; vm_total += vm
-                        all_failed_codes.extend(fc)
-                        if w_idx > actual_bar_idx:
-                            actual_bar_idx = w_idx
-                    except Exception as e:
-                        logger.error(f"[智能回填] 批次异常: {e}")
-                        f_total += len(batch)
-                        all_failed_codes.extend(batch)
-                # ── Step 3: 回写状态（按实际写入的 bar index 推进）──
-                new_bar_idx = actual_bar_idx
-                status = "ok" if not all_failed_codes else "partial"
-                _release_lock(pool, "15m", today, status, new_bar_idx, all_failed_codes)
-
-                result_15m = {
-                    "success": s_total, "failed": f_total,
-                    "skipped": sk_total, "dirty": d_total,
-                    "vol_missing": vm_total, "retried": len(prev_failed),
-                    "pending_failures": len(all_failed_codes),
-                }
-                action = "15m"
-                logger.info(
-                    f"[智能回填] 15m 完成: 成功={s_total} 失败={f_total} "
-                    f"脏数据={d_total} bar_idx={new_bar_idx} "
-                    f"待重试={len(all_failed_codes)}"
-                )
+                async with session.get(
+                    url, headers=self._make_headers()
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"请求失败 url={url}, status={resp.status}")
+                        return None
+                    return await resp.json()
             except Exception as e:
-                # 异常时释放锁，保留上次的 failed_codes 供下次重试
-                _release_lock(pool, "15m", today, "failed", last_bar_idx, prev_failed)
-                logger.error(f"[智能回填] 15m 异常: {e}")
-                raise
+                wait = RETRY_BACKOFF_BASE ** attempt
+                logger.warning(
+                    f"请求异常 url={url}, error={e}, {wait}s 后重试 ({attempt + 1}/{MAX_RETRIES})"
+                )
+                await asyncio.sleep(wait)
+        logger.error(f"放弃请求 url={url}, 已达最大重试次数")
+        return None
 
-    # ════════════════════════════════════════════════════════
-    # 1D 更新（17:00 后，或 force 模式）
-    # ════════════════════════════════════════════════════════
-    if force or now_total_min >= 17 * 60:
-        state_1d = _read_state(pool, "1D", today)
-        prev_failed_1d = state_1d.get("failed_codes", []) if state_1d else []
-        need_update = force or state_1d is None or state_1d["status"] != "ok"
+    async def _delete_range(self, since: datetime) -> int:
+        """删除时间范围内已有的文档（先删后写的"先删"部分）。"""
+        result = await self.collection.delete_many({"timestamp": {"$gte": since}})
+        deleted = result.deleted_count
+        if deleted > 0:
+            logger.info(f"[回填] {self.name} 清理旧数据: 删除 {deleted} 条 (since {since:%Y-%m-%d})")
+        return deleted
 
-        if need_update:
-            if not _acquire_lock(pool, "1D", today):
-                logger.info("[智能回填] 1D 已有进程在跑，跳过")
-                if action == "skip":
-                    action = "locked"
-            else:
-                try:
-                    coord = get_coordinator()
-                    cb = get_realtime_circuit_breaker()
+    async def _run(self, tf: str, count: int) -> int:
+        """完整回填流程: 删旧 → HTTP 拉取 → bulk_write。"""
+        url = self.url_template.format(tf=tf, count=count)
 
-                    # ── 全市场 1D 一次拉取 ──
-                    logger.info("[智能回填] coordinate_market_kline 全市场 1D 拉取...")
-                    market_data_1d = coord.coordinate_market_kline(
-                        cb=cb, market="CNStock", timeframe="1D",
-                        count=5, adj="qfq", timeout=COORD_TIMEOUT,
-                        preferred_source=preferred_source,
-                    )
-                    if market_data_1d:
-                        logger.info(f"[智能回填] 全市场 1D 命中 {len(market_data_1d)} 只")
-                    else:
-                        logger.warning("[智能回填] 全市场 1D 拉取为空")
-
-                    # 合并重试列表和全量列表
-                    retry_1d = [c for c in prev_failed_1d if c in codes]
-                    pull_1d = codes
-                    if retry_1d:
-                        logger.info(f"[智能回填] 1D 重试 {len(retry_1d)} 只...")
-                        pull_1d = list(set(codes) - set(retry_1d))
-                        retry_result = _update_daily_bars(writer, retry_1d, market_data=market_data_1d, preferred_source=preferred_source)
-                        # 重试成功的从失败列表移除
-                        retry_failed_set = set(retry_result)
-                        prev_failed_1d = [c for c in prev_failed_1d if c in retry_failed_set]
-
-                    failed_1d = _update_daily_bars(writer, pull_1d, market_data=market_data_1d, preferred_source=preferred_source)
-                    all_failed_1d = list(set(prev_failed_1d + failed_1d))
-
-                    status = "ok" if not all_failed_1d else "partial"
-                    _release_lock(pool, "1D", today, status, -1, all_failed_1d)
-
-                    result_1d = {
-                        "done": True,
-                        "pending_failures": len(all_failed_1d),
-                    }
-                    action = "both" if action == "15m" else "1d"
-                    logger.info(f"[智能回填] 1D 完成: 待重试={len(all_failed_1d)}")
-                except Exception as e:
-                    _release_lock(pool, "1D", today, "failed", -1, prev_failed_1d)
-                    logger.error(f"[智能回填] 1D 异常: {e}")
-                    raise
+        # 先删后写
+        if tf == "1D":
+            await self._delete_range(_range_start(count))
         else:
-            logger.info("[智能回填] 1D 已是最新，无需更新")
+            await self._delete_range(_today_start())
 
-    elapsed = round(time.time() - start_time, 1)
-    logger.info(f"[智能回填] 完成: action={action} 耗时={elapsed}s")
+        # HTTP 拉取
+        connector = aiohttp.TCPConnector(limit=MAX_CONCURRENCY)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            data = await self._fetch_with_retries(session, url)
 
-    return {"action": action, "15m": result_15m, "1d": result_1d, "elapsed": elapsed}
+        if not data:
+            return 0
+
+        items = data.get("data", [])
+        if not items:
+            return 0
+
+        # bulk_write
+        ops = []
+        for item in items:
+            doc_id = self.build_doc_id(item)
+            ts_str = item.get(self.timestamp_field)
+            if isinstance(ts_str, str):
+                try:
+                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                except ValueError:
+                    ts = datetime.now(TZ_CN)
+            else:
+                ts = datetime.now(TZ_CN)
+
+            doc = {
+                "_id": doc_id,
+                **item,
+                "timestamp": ts,
+                "fetched_at": datetime.utcnow(),
+            }
+            ops.append(UpdateOne({"_id": doc_id}, {"$set": doc}, upsert=True))
+
+        if ops:
+            await self.collection.bulk_write(ops, ordered=False)
+        return len(ops)
+
+    def run_once(
+        self,
+        tf: str | None = None,
+        count: int | None = None,
+    ) -> dict:
+        """执行一次全盘回填。
+
+        cn_last_update 是唯一控制机制:
+          ok 且同交易日 → 不干
+          error / 无记录 / 跨交易日 → 干
+
+        Args:
+            tf: "15m" / "1D"。None=自动判断（盘中 15m，盘后 1D）
+            count: bar 数量。None=自动计算。
+
+        Returns:
+            {"source": ..., "tf": ..., "count": ..., "written": ..., "status": ..., "report": ...}
+        """
+        # 自动判断周期
+        if tf is None:
+            now = datetime.now(TZ_CN)
+            if now.hour < 9 or (now.hour == 9 and now.minute < 30):
+                tf = "15m"
+            elif now.hour >= 15:
+                tf = "1D"
+            else:
+                tf = "15m"
+
+        # 查表: 该不该干
+        should, reason = _should_run(self.name, tf)
+        if not should:
+            return {
+                "source": self.name, "tf": tf, "count": 0,
+                "written": 0, "status": "ok", "report": reason,
+            }
+
+        # 计算 count
+        if count is None:
+            count = _calc_15m_count() if tf == "15m" else _calc_1d_count()
+
+        if count <= 0:
+            # 盘前不算失败，不写 error，保持表里上次的状态
+            return {
+                "source": self.name, "tf": tf, "count": 0,
+                "written": 0, "status": "ok", "report": "盘前，无需回填",
+            }
+
+        # 执行回填
+        try:
+            loop = asyncio.new_event_loop()
+            try:
+                written = loop.run_until_complete(self._run(tf, count))
+            finally:
+                loop.close()
+        except Exception as e:
+            report = f"回填异常: {e}"
+            logger.error(f"[回填] {self.name} tf={tf} {report}")
+            _record_update(self.name, tf, count, 0, "error", report)
+            return {
+                "source": self.name, "tf": tf, "count": count,
+                "written": 0, "status": "error", "report": report,
+            }
+
+        # 成功 → 写 ok，下次不再干
+        report = f"拉取 {count} 根，写入 {written} 条"
+        _record_update(self.name, tf, count, written, "ok", report)
+        logger.info(f"[回填] {self.name} tf={tf} {report}")
+
+        return {
+            "source": self.name, "tf": tf, "count": count,
+            "written": written, "status": "ok", "report": report,
+        }
+
+
+# ========== 预定义数据源实例 ==========
+
+stock_daily_k = BackfillDB(
+    name="stock_daily_k",
+    collection_name="stock_daily_k",
+    url_template=f"{BASE_URL}/stock/daily_k?tf={{tf}}&count={{count}}",
+    build_doc_id=lambda item: f"{item.get('symbol', '')}_{item.get('date', '')}",
+    timestamp_field="date",
+)
+
+fund_nav_daily = BackfillDB(
+    name="fund_nav_daily",
+    collection_name="fund_nav_daily",
+    url_template=f"{BASE_URL}/fund/nav_daily?tf={{tf}}&count={{count}}",
+    build_doc_id=lambda item: f"{item.get('symbol', '')}_{item.get('navDate', '')}",
+    timestamp_field="navDate",
+)
+
+bond_daily_k = BackfillDB(
+    name="bond_daily_k",
+    collection_name="bond_daily_k",
+    url_template=f"{BASE_URL}/bond/daily_k?tf={{tf}}&count={{count}}",
+    build_doc_id=lambda item: f"{item.get('symbol', '')}_{item.get('date', '')}",
+    timestamp_field="date",
+)
+
+
+# ========== 全盘回填入口 ==========
+
+
+def run_once(
+    tf: str | None = None,
+    count: int | None = None,
+) -> list[dict]:
+    """全盘回填入口 — 三个数据源依次执行。
+
+    每个数据源独立查 cn_last_update 判断是否需要干活:
+      干好了 → 同一天不干，发 1000 次也不干
+      干得不好 → 下次重干
+
+    Args:
+        tf: "15m" / "1D"。None=自动判断。
+        count: bar 数量。None=自动计算。
+
+    Returns:
+        [{"source": ..., "tf": ..., "count": ..., "written": ..., "status": ..., "report": ...}, ...]
+    """
+    results = []
+    for source in (stock_daily_k, fund_nav_daily, bond_daily_k):
+        try:
+            r = source.run_once(tf, count)
+            results.append(r)
+        except Exception as e:
+            logger.error(f"[全盘回填] {source.name} 异常: {e}")
+            results.append({
+                "source": source.name, "tf": tf or "?", "count": 0,
+                "written": 0, "status": "error", "report": str(e),
+            })
+
+    ok = sum(1 for r in results if r["status"] == "ok")
+    errors = sum(1 for r in results if r["status"] == "error")
+    logger.info(f"[全盘回填] 完成: {ok} 成功, {errors} 失败")
+
+    return results
