@@ -481,8 +481,13 @@ class Coordinator:
         self._lock = threading.Lock()
 
     # ================================================================
-    # 模式 A: K线批量获取 — 动态队列 + 多源 fallback
+    # 模式 A: K线获取 — 假批量，动态队列 + 多源 fallback
     # ================================================================
+    #
+    # 注意: 这里说的"批量"是假批量。
+    #   - 没有真正的批量 API，每个 symbol 都是逐只单独请求 Provider
+    #   - 所谓"批量"靠的是动态队列 + 多线程并发模拟出来的
+    #   - 真正的批量接口见 coordinate_batch_quotes（单次请求拿多只）
     #
     # 工作流程（以 3 只股票、2 个源为例）:
     #
@@ -925,6 +930,89 @@ class Coordinator:
 
         logger.warning("[协助层] ticker %s 所有源失败", symbol)
         return None
+
+    # ================================================================
+    # 模式 C: 批量行情 — 优先走 fetch_batch_quotes
+    # ================================================================
+
+    def coordinate_batch_quotes(
+        self,
+        symbols: List[str],
+        cb: CircuitBreaker,
+        market: str = "",
+        timeout: float = 15.0,
+        preferred_source: str = "",
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        批量行情获取 — 优先走 fetch_batch_quotes，逐源 fallback。
+
+        和 coordinate_ticker 的区别:
+          coordinate_ticker:       1只股票 × 多源并发抢答
+          coordinate_batch_quotes: N只股票 × 单源批量请求 × 多源 fallback
+
+        流程:
+          1. 从 Provider 层发现支持 batch_quote 的源（按 priority 排序）
+          2. 逐源尝试 fetch_batch_quotes(symbols)
+          3. 第一个成功返回非空结果的直接用
+          4. 全部失败返回空 dict
+
+        Args:
+            symbols: 股票代码列表
+            cb:      熔断器
+            market:  市场名称（"CNStock" / "HKStock" / ...）
+            timeout: 超时（秒）
+            preferred_source: 指定首选源（如 "tencent"），优先尝试
+
+        Returns:
+            {symbol: quote_dict} — 仅包含成功获取到的 symbol
+        """
+        if not symbols:
+            return {}
+
+        from app.data_sources.provider import get_providers
+
+        # 发现支持 batch_quote 的源
+        providers = get_providers(capability="batch_quote", market=market)
+        if not providers:
+            logger.warning("[协助层] batch_quotes market=%s 无可用源", market)
+            return {}
+
+        # 按 preferred_source 排序
+        if preferred_source:
+            preferred = [p for p in providers if p.name == preferred_source]
+            others = [p for p in providers if p.name != preferred_source]
+            providers = preferred + others
+
+        # 逐源尝试
+        for p in providers:
+            if not cb.is_available(p.name):
+                logger.debug("[协助层] batch_quotes %s 已熔断，跳过", p.name)
+                continue
+
+            cfg = get_source_config(p.name)
+            start = time.time()
+            try:
+                result = p.fetch_batch_quotes(symbols, timeout=timeout)
+                elapsed = time.time() - start
+
+                if result:
+                    cb.record_success(p.name)
+                    cfg.record(True, elapsed)
+                    logger.info("[协助层] batch_quotes %d只 命中 %s (%.2fs)",
+                                len(result), p.name, elapsed)
+                    return result
+                else:
+                    cb.record_failure(p.name, "empty")
+                    cfg.record(False, elapsed)
+                    logger.debug("[协助层] batch_quotes %s 返回空", p.name)
+            except Exception as e:
+                elapsed = time.time() - start
+                cb.record_failure(p.name, str(e))
+                cfg.record(False, elapsed)
+                logger.debug("[协助层] batch_quotes %s 失败: %s", p.name, e)
+
+        logger.warning("[协助层] batch_quotes %d只 所有源失败", len(symbols))
+        return {}
 
     # ================================================================
     # 透传模式 — 不加任何协调逻辑

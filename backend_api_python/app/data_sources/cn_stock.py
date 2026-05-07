@@ -48,7 +48,7 @@ from app.data_sources.base import BaseDataSource
 from app.data_sources.normalizer import normalize_cn_code
 from app.data_sources.asia_stock_kline import normalize_chart_timeframe
 from app.data_sources.circuit_breaker import get_realtime_circuit_breaker
-from app.data_sources.coordinator import get_coordinator, Coordinator_direct_call
+from app.data_sources.coordinator import get_coordinator
 from app.data_sources.kline_clean import clean_klines
 from app.utils.logger import get_logger
 
@@ -1007,26 +1007,26 @@ class CNStockDataSource(BaseDataSource):
         return {"last": 0, "symbol": raw}
 
     def _get_tickers(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
-        """批量获取实时行情。透传 Provider 层 batch_quote 接口，一次 HTTP 取多只。"""
-        from app.data_sources.provider import get_providers
+        """批量获取实时行情。走 Coordinator 批量行情调度，一次 HTTP 取多只。"""
+        from app.data_sources.coordinator import get_realtime_circuit_breaker
         normalized = [normalize_cn_code(s) for s in symbols if s]
         if not normalized:
             return {}
-        providers = get_providers(capability="batch_quote", market="CNStock")
-        if not providers:
+        raw_result = get_coordinator().coordinate_batch_quotes(
+            symbols=normalized,
+            cb=get_realtime_circuit_breaker(),
+            market="CNStock",
+        )
+        if not raw_result:
             return {}
-        for p in providers:
-            raw_result = Coordinator_direct_call(p.fetch_tickers, normalized)
-            if raw_result:
-                cleaned = {}
-                for k, v in raw_result.items():
-                    raw_key = _strip_cn_prefix(k)
-                    if isinstance(v, dict):
-                        v["symbol"] = raw_key
-                        self._db_bridge._quote_cache._put(raw_key, v)
-                    cleaned[raw_key] = v
-                return cleaned
-        return {}
+        cleaned = {}
+        for k, v in raw_result.items():
+            raw_key = _strip_cn_prefix(k)
+            if isinstance(v, dict):
+                v["symbol"] = raw_key
+                self._db_bridge._quote_cache._put(raw_key, v)
+            cleaned[raw_key] = v
+        return cleaned
 
     # ── get_kline: 负责发 K 线数据 ──
 
