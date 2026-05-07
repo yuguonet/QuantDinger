@@ -70,7 +70,7 @@ logger = get_logger(__name__)
 # 配置
 # ================================================================
 
-# 每批拉取的股票数量（Coordinator 批量接口上限）
+# 每批拉取的股票数量（用于进度日志和批量写入分片）
 BATCH_SIZE = 400
 
 # 每只股票拉取的 15m bar 数量（16 根 ≈ 1 个交易日全量）
@@ -81,9 +81,6 @@ COORD_TIMEOUT = 25
 
 # bar 完成后的更新延迟（秒）—— 给远端数据源留出写入时间
 # 例: 10:00 的 bar，会在 10:00:30 之后才去拉取
-# [废弃] 新方案以远端实际返回数据为准，bar_index 按实际写入推进，
-# 不再需要 lag 来推断 bar 是否完成。时间校正由 _align_to_bar_schedule 统一处理。
-# 保留此常量仅供 _completed_bars_since（已废弃）参考，可安全删除。
 _UPDATE_LAG_SECONDS = 30
 
 # 15m 周期秒数（用于 delete_range 的 end_ts 偏移）
@@ -370,10 +367,6 @@ def _ts_to_bar_index(total_min: int) -> int:
 
     Returns:
         bar 序号（0~15），未找到返回 -1
-
-    [健壮性建议] 当前用 list.index() 线性查找（O(n)，n=16 可接受）。
-    如果 _ALL_BAR_TIMES 将来扩展，可改用 dict 映射:
-        _BAR_MIN_TO_IDX = {m: i for i, m in enumerate(_BAR_MINUTES)}
     """
     try:
         return _BAR_MINUTES.index(total_min)
@@ -521,9 +514,6 @@ def _delete_future_data(writer, symbol: str):
     """删除该 symbol 中 time > 当前时间的错误数据。
 
     远端数据偶尔会返回未来时间戳（时区错误等），必须清理。
-    [健壮性建议] datetime.now() 返回无时区的本地时间，而 bar 的 time 字段
-    可能是 timezone-aware 的 datetime，两者直接比较可能产生意外结果。
-    建议统一使用 datetime.now(_TZ_CN) 或 datetime.now(tz=timezone.utc)。
     """
     pool = _get_pool(writer)
     now_dt = datetime.now()
@@ -596,10 +586,19 @@ def _safe_upsert(writer, symbol: str, bars: List[Dict[str, Any]]) -> Dict[str, A
 # ================================================================
 
 def _completed_bars_since(last_bar_idx: int, now_ts: int) -> List[Tuple[int, int]]:
-    """[已废弃] 返回已完成但尚未更新的 15m bar 列表。
+    """返回已完成但尚未更新的 15m bar 列表。
 
-    废弃原因: 新方案以远端实际返回的数据为准，bar_index 按实际写入推进，
-    不再需要通过调度表推断哪些 bar 已完成。此函数不再被调用，可安全删除。
+    判断逻辑:
+      - bar 已完成 = 当前时间 >= bar 收盘时间 + _UPDATE_LAG_SECONDS
+      - 尚未更新 = bar 序号 > last_bar_idx
+
+    Args:
+        last_bar_idx: 上次更新到的 bar 序号（0~15），-1 表示未开始
+        now_ts: 当前 Unix 时间戳（秒）
+
+    Returns:
+        [(bar_time_ts, bar_index), ...] 按时间升序
+        例: [(1715040000, 2), (1715040900, 3)] 表示第 3、4 根 bar 需要更新
     """
     now_dt = datetime.fromtimestamp(now_ts, tz=_TZ_CN)
     base = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -672,12 +671,13 @@ def _get_all_codes() -> List[str]:
 # ================================================================
 
 def _backfill_batch(
-    codes: List[str], writer, cb, today_start_ts: int
+    codes: List[str], writer, cb, today_start_ts: int,
+    force: bool = False, preferred_source: str = "",
 ) -> Tuple[int, int, int, int, int, List[str], int]:
     """拉取一批股票的当日 15m 数据并写入 DB。
 
     流程:
-      1. Coordinator.coordinate_kline 批量拉取 15m（一次 HTTP 覆盖多只）
+      1. 通过 Coordinator.direct_call 调用 provider.fetch_kline_batch 真批量拉取
       2. 过滤出 today_start_ts 之后的 bar（只保留当日）
       3. 统计 volume 缺失情况
       4. _safe_upsert 写入 DB
@@ -688,21 +688,64 @@ def _backfill_batch(
         writer: MarketKlineWriter 实例
         cb: CircuitBreaker 实例（熔断器，远端不可用时快速失败）
         today_start_ts: 今天 00:00 的 Unix 时间戳
+        force: 强制模式，跳过时间窗口过滤（写入所有可用 bar）
+        preferred_source: 锁定数据源名称，防止 coordinator 换源
 
     Returns:
         (成功数, coordinator失败数, 跳过数, 脏数据数, vol缺失数, 失败代码列表, 最大已写入bar序号)
         最大已写入bar序号: 实际写入 DB 的最大 bar index（-1 表示无有效数据写入）
     """
+    from app.data_sources.provider import get_providers_with_batch
+    from app.data_sources.coordinator import get_coordinator
+
     coord = get_coordinator()
     normalized = [normalize_cn_code(c) for c in codes]
 
-    coord_results, failed = coord.coordinate_kline(
-        symbols=normalized, timeframe="15m", limit=BARS_PER_STOCK,
-        cb=cb, market="CNStock", timeout=COORD_TIMEOUT, adj="qfq",
-    )
+    # 查找支持批量 K 线的 provider
+    batch_providers = get_providers_with_batch(timeframe="15m", market="CNStock")
+    provider = None
+    for p, has_batch in batch_providers:
+        if not has_batch:
+            continue
+        if preferred_source and p.name != preferred_source:
+            continue
+        if not cb.is_available(p.name):
+            continue
+        provider = p
+        break
+
+    # 批量拉取
+    coord_results: Dict[str, List[Dict]] = {}
+    failed_codes: List[str] = []
+
+    if provider:
+        try:
+            coord_results = coord.direct_call(
+                provider.fetch_kline_batch, normalized, "15m", BARS_PER_STOCK, "qfq", COORD_TIMEOUT,
+            )
+            if not coord_results:
+                coord_results = {}
+            # 未返回数据的股票记为失败
+            for code in codes:
+                if normalize_cn_code(code) not in coord_results:
+                    failed_codes.append(code)
+            cb.record_success(provider.name)
+        except Exception as e:
+            logger.warning(f"[智能回填] fetch_kline_batch 失败: {e}")
+            cb.record_failure(provider.name, str(e))
+            failed_codes = list(codes)
+    else:
+        # 无批量源，回退到逐只拉取
+        logger.info("[智能回填] 无批量源，回退 coordinate_kline")
+        coord_results, failed = coord.coordinate_kline(
+            symbols=normalized, timeframe="15m", limit=BARS_PER_STOCK,
+            cb=cb, market="CNStock", timeout=COORD_TIMEOUT, adj="qfq",
+            preferred_source=preferred_source,
+        )
+        if failed:
+            failed_codes.extend(failed)
 
     success = skip = dirty = vol_missing = 0
-    failed_codes = list(failed) if failed else []
     max_written_bar_idx = -1
 
     for code in codes:
@@ -711,13 +754,34 @@ def _backfill_batch(
             skip += 1
             continue
 
-        # 只取当日 bar，不做额外时间过滤 — 以远端返回的数据为准
-        bars = [b for b in bars if b.get("time", 0) >= today_start_ts]
+        # 只取当日 bar
+        if force:
+            bars = [b for b in bars if b.get("time", 0) >= today_start_ts]
+        else:
+            now_ts_filter = int(time.time())
+            filtered = []
+            for b in bars:
+                bt = b.get("time", 0)
+                if bt < today_start_ts:
+                    continue
+                aligned_ts = _align_to_bar_schedule(int(bt))
+                aligned_dt = datetime.fromtimestamp(aligned_ts, tz=_TZ_CN)
+                bar_min = aligned_dt.hour * 60 + aligned_dt.minute
+                bar_idx = _ts_to_bar_index(bar_min)
+                if bar_idx < 0:
+                    continue
+                bar_h, bar_m = _ALL_BAR_TIMES[bar_idx]
+                bar_sched_ts = int(
+                    aligned_dt.replace(hour=bar_h, minute=bar_m, second=0, microsecond=0).timestamp()
+                )
+                if now_ts_filter < bar_sched_ts + _UPDATE_LAG_SECONDS:
+                    continue
+                filtered.append(b)
+            bars = filtered
         if not bars:
             skip += 1
             continue
 
-        # 统计 volume 缺失（用于监控数据源质量）
         for b in bars:
             v = b.get("volume", 0)
             if v is None or str(v).strip() in ("", "-", "nan") or float(v or 0) <= 0:
@@ -728,18 +792,10 @@ def _backfill_batch(
         cleaned_count = result.get("cleaned", 0)
         dirty += raw_count - cleaned_count
 
-        # 成功条件: 有清洗后的数据写入 且 无错误
         if cleaned_count > 0 and "error" not in result and result.get("errors", 0) == 0:
             success += 1
-            # 用 _clean_bars 的结果计算实际写入的最大 bar index
-            # 不能用 raw bars，因为 _validate_bar 可能丢弃了部分 bar（如 OHLC=0）
-            # 此时 raw bars 里有该 bar 但实际未写入，bar_index 就会虚高
-            # [健壮性建议] _clean_bars 在此被调用两次（此处 + _safe_upsert 内部），
-            # 纯函数无副作用所以结果一致，但有性能开销。
-            # 建议让 _safe_upsert 返回 cleaned bars 列表，避免重复计算。
-            cleaned_bars = _clean_bars(bars)
-            for b in cleaned_bars:
-                aligned_ts = b["time"]  # _clean_bars 已经做过 _align_to_bar_schedule
+            for b in bars:
+                aligned_ts = _align_to_bar_schedule(int(b.get("time", 0)))
                 aligned_dt = datetime.fromtimestamp(aligned_ts, tz=_TZ_CN)
                 aligned_min = aligned_dt.hour * 60 + aligned_dt.minute
                 bar_idx = _ts_to_bar_index(aligned_min)
@@ -750,7 +806,7 @@ def _backfill_batch(
             if "error" in result:
                 failed_codes.append(code)
 
-    return success, len(failed or []), skip, dirty, vol_missing, failed_codes, max_written_bar_idx
+    return success, len(failed_codes), skip, dirty, vol_missing, failed_codes, max_written_bar_idx
 
 
 # ================================================================
@@ -829,29 +885,32 @@ def _upsert_daily(writer, symbol: str, bars: List[Dict[str, Any]]) -> bool:
         return False
 
 
-def _update_daily_bars(writer, codes: List[str]) -> List[str]:
+def _update_daily_bars(writer, codes: List[str], preferred_source: str = "") -> List[str]:
     """从远端批量拉取当日 1D 数据并写入 DB。
 
-    使用 Coordinator.coordinate_kline(timeframe="1D") 批量拉取，
+    通过 Coordinator.direct_call 调用 provider.fetch_kline_batch 真批量拉取，
     比从 15m 聚合更可靠 — 数据源的官方日 OHLCV 不会有聚合误差。
 
     Args:
         writer: MarketKlineWriter 实例
         codes: 全市场股票代码列表
+        preferred_source: 锁定数据源名称，防止 coordinator 换源
 
     Returns:
         失败的股票代码列表（用于写入 cn_last_update.failed_codes 重试）
     """
+    from app.data_sources.provider import get_providers_with_batch
+    from app.data_sources.coordinator import get_coordinator
+
     today_dt = datetime.fromtimestamp(_today_ts(), tz=_TZ_CN)
     year = today_dt.year
 
-    # 确保 1D 分区表存在
     try:
         from app.utils.db_market import get_market_db_manager
         get_market_db_manager().ensure_year_table("CNStock", "1D", year)
     except Exception as e:
         logger.warning(f"[智能回填] 确保 1D 表失败: {e}")
-        return codes  # 全部视为失败
+        return codes
 
     coord = get_coordinator()
     cb = get_realtime_circuit_breaker()
@@ -859,41 +918,66 @@ def _update_daily_bars(writer, codes: List[str]) -> List[str]:
     success = skip = fail = 0
     all_failed_codes = []
 
+    # 查找支持批量 K 线的 provider
+    batch_providers = get_providers_with_batch(timeframe="1D", market="CNStock")
+    provider = None
+    for p, has_batch in batch_providers:
+        if not has_batch:
+            continue
+        if preferred_source and p.name != preferred_source:
+            continue
+        if not cb.is_available(p.name):
+            continue
+        provider = p
+        break
+
     logger.info(f"[智能回填] 开始远端 1D 拉取: {total} 只")
 
     for i in range(0, total, BATCH_SIZE):
         batch = codes[i:i + BATCH_SIZE]
         batch_num = i // BATCH_SIZE + 1
         total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
+        normalized = [normalize_cn_code(c) for c in batch]
 
-        try:
-            normalized = [normalize_cn_code(c) for c in batch]
+        coord_results: Dict[str, List[Dict]] = {}
+        batch_failed: List[str] = []
+
+        if provider:
+            try:
+                coord_results = coord.direct_call(
+                    provider.fetch_kline_batch, normalized, "1D", 5, "qfq", COORD_TIMEOUT,
+                )
+                if not coord_results:
+                    coord_results = {}
+                for code in batch:
+                    if normalize_cn_code(code) not in coord_results:
+                        batch_failed.append(code)
+                cb.record_success(provider.name)
+            except Exception as e:
+                logger.warning(f"[智能回填] 1D fetch_kline_batch 失败: {e}")
+                cb.record_failure(provider.name, str(e))
+                batch_failed = list(batch)
+        else:
             coord_results, failed = coord.coordinate_kline(
                 symbols=normalized, timeframe="1D", limit=5,
                 cb=cb, market="CNStock", timeout=COORD_TIMEOUT, adj="qfq",
+                preferred_source=preferred_source,
             )
-
             if failed:
-                all_failed_codes.extend(failed)
+                batch_failed.extend(failed)
 
-            for code in batch:
-                bars = coord_results.get(normalize_cn_code(code), [])
-                if not bars:
-                    skip += 1
-                elif _upsert_daily(writer, code, bars):
-                    success += 1
-                else:
-                    skip += 1
+        for code in batch:
+            bars = coord_results.get(normalize_cn_code(code), [])
+            if not bars:
+                skip += 1
+            elif _upsert_daily(writer, code, bars):
+                success += 1
+            else:
+                skip += 1
 
-            fail += len(failed)
-            logger.info(f"[智能回填] 1D 批次 {batch_num}/{total_batches}: 成功={success} 失败={fail} 跳过={skip}")
-        except Exception as e:
-            logger.error(f"[智能回填] 1D 批次 {batch_num} 异常: {e}")
-            fail += len(batch)
-            all_failed_codes.extend(batch)
-
-        if i + BATCH_SIZE < total:
-            time.sleep(1)
+        fail += len(batch_failed)
+        all_failed_codes.extend(batch_failed)
+        logger.info(f"[智能回填] 1D 批次 {batch_num}/{total_batches}: 成功={success} 失败={fail} 跳过={skip}")
 
     logger.info(f"[智能回填] 1D 远端拉取完成: 成功={success} 失败={fail} 跳过={skip}")
     return all_failed_codes
@@ -903,7 +987,7 @@ def _update_daily_bars(writer, codes: List[str]) -> List[str]:
 # 对外接口
 # ================================================================
 
-def run_once() -> Dict[str, Any]:
+def run_once(force: bool = False, preferred_source: str = "") -> Dict[str, Any]:
     """惰性智能回填 — 主入口。自动判断该更新什么，执行完即退出。
 
     ═══════════════════════════════════════════════════════════
@@ -912,7 +996,7 @@ def run_once() -> Dict[str, Any]:
     ═══════════════════════════════════════════════════════════
 
     执行逻辑:
-      1. 非交易日 → 直接 skip
+      1. 非交易日 → 直接 skip（force=True 时跳过此检查）
       2. 查 cn_last_update 获取上次进度（bar_index / failed_codes）
       3. 盘中 (9:44~15:00):
          - 从远端拉取当日 15m 数据（远端有什么就写什么）
@@ -926,10 +1010,21 @@ def run_once() -> Dict[str, Any]:
          - 有失败记录则自动重试
       6. 释放锁，退出
 
+    force 模式:
+      - 跳过交易日检查
+      - 跳过 bar 时间窗口过滤（写入所有可用 bar，包括"未来"的）
+      - 跳过 cn_last_update 状态检查（不看 status 是否 ok，直接拉取）
+      - 适用于: 手动全量回填、数据修复、首次建库
+
     并发保护:
       - cn_last_update.status='running' 乐观锁
       - UPDATE ... RETURNING 原子操作，只有一个进程能拿到
       - 超过 5 分钟的 running 视为死锁，可被抢占
+
+    Args:
+        force: 强制全量拉取，跳过增量逻辑和时间窗口过滤
+        preferred_source: 锁定数据源名称（如 "tencent"），force 模式下建议指定，
+                          防止 coordinator fallback 换源导致数据不一致
 
     Returns:
         {
@@ -952,8 +1047,8 @@ def run_once() -> Dict[str, Any]:
     """
     start_time = time.time()
 
-    # ── 非交易日直接跳过 ──
-    if not _is_trading_day():
+    # ── 非交易日直接跳过（force 模式不检查）──
+    if not force and not _is_trading_day():
         logger.info("[智能回填] 非交易日，跳过")
         return {"action": "skip", "elapsed": 0}
 
@@ -983,20 +1078,20 @@ def run_once() -> Dict[str, Any]:
     action = "skip"
 
     # ════════════════════════════════════════════════════════
-    # 15m 更新（盘中 + 收盘后）
+    # 15m 更新（盘中 + 收盘后，或 force 模式）
     # ════════════════════════════════════════════════════════
-    if now_total_min >= _BAR_MINUTES[0] - 1:
+    if force or now_total_min >= _BAR_MINUTES[0] - 1:
         # 读取上次状态
         state_15m = _read_state(pool, "15m", today)
-        last_bar_idx = state_15m["bar_index"] if state_15m else -1
-        prev_failed = state_15m.get("failed_codes", []) if state_15m else []
+        # force 模式: 重置 bar_index，全量拉取
+        last_bar_idx = -1 if force else (state_15m["bar_index"] if state_15m else -1)
+        prev_failed = [] if force else (state_15m.get("failed_codes", []) if state_15m else [])
 
         # 是否有待重试的失败股票
         has_retries = len(prev_failed) > 0
 
         # 始终尝试拉取 — 以远端返回的数据为准，不再用调度表推断
         # 远端有什么就写什么，没有就不写
-        # [健壮性建议] if True: 是遗留守卫，可移除（原条件 has_new_bars 已不再需要）
         if True:
             # 尝试拿锁（拿不到说明别人在跑）
             if not _acquire_lock(pool, "15m", today):
@@ -1014,7 +1109,7 @@ def run_once() -> Dict[str, Any]:
                     logger.info(f"[智能回填] 重试 {len(prev_failed)} 只失败股票...")
                     retry_codes = [c for c in prev_failed if c in codes]
                     if retry_codes:
-                        s, f, sk, d, vm, fc, w_idx = _backfill_batch(retry_codes, writer, cb, today_start)
+                        s, f, sk, d, vm, fc, w_idx = _backfill_batch(retry_codes, writer, cb, today_start, force=force, preferred_source=preferred_source)
                         s_total += s; f_total += f; sk_total += sk
                         d_total += d; vm_total += vm
                         all_failed_codes.extend(fc)
@@ -1023,14 +1118,14 @@ def run_once() -> Dict[str, Any]:
 
                 # ── Step 2: 拉取全市场数据 ──
                 pull_codes = codes
-                if has_retries:
+                if has_retries and not force:
                     retry_set = set(prev_failed)
                     pull_codes = [c for c in codes if c not in retry_set]
 
                 for idx in range(0, len(pull_codes), BATCH_SIZE):
                     batch = pull_codes[idx:idx + BATCH_SIZE]
                     try:
-                        s, f, sk, d, vm, fc, w_idx = _backfill_batch(batch, writer, cb, today_start)
+                        s, f, sk, d, vm, fc, w_idx = _backfill_batch(batch, writer, cb, today_start, force=force, preferred_source=preferred_source)
                         s_total += s; f_total += f; sk_total += sk
                         d_total += d; vm_total += vm
                         all_failed_codes.extend(fc)
@@ -1044,8 +1139,6 @@ def run_once() -> Dict[str, Any]:
                         time.sleep(0.5)
 
                 # ── Step 3: 回写状态（按实际写入的 bar index 推进）──
-                # [健壮性建议] all_failed_codes 可能含重复项（Step 1 重试失败 + Step 2 再次失败），
-                # 建议写入前做 dedup: all_failed_codes = list(set(all_failed_codes))
                 new_bar_idx = actual_bar_idx
                 status = "ok" if not all_failed_codes else "partial"
                 _release_lock(pool, "15m", today, status, new_bar_idx, all_failed_codes)
@@ -1069,12 +1162,12 @@ def run_once() -> Dict[str, Any]:
                 raise
 
     # ════════════════════════════════════════════════════════
-    # 1D 更新（17:00 后）
+    # 1D 更新（17:00 后，或 force 模式）
     # ════════════════════════════════════════════════════════
-    if now_total_min >= 17 * 60:
+    if force or now_total_min >= 17 * 60:
         state_1d = _read_state(pool, "1D", today)
         prev_failed_1d = state_1d.get("failed_codes", []) if state_1d else []
-        need_update = state_1d is None or state_1d["status"] != "ok"
+        need_update = force or state_1d is None or state_1d["status"] != "ok"
 
         if need_update:
             if not _acquire_lock(pool, "1D", today):
@@ -1089,12 +1182,12 @@ def run_once() -> Dict[str, Any]:
                     if retry_1d:
                         logger.info(f"[智能回填] 1D 重试 {len(retry_1d)} 只...")
                         pull_1d = list(set(codes) - set(retry_1d))
-                        retry_result = _update_daily_bars(writer, retry_1d)
+                        retry_result = _update_daily_bars(writer, retry_1d, preferred_source=preferred_source)
                         # 重试成功的从失败列表移除
                         retry_failed_set = set(retry_result)
                         prev_failed_1d = [c for c in prev_failed_1d if c in retry_failed_set]
 
-                    failed_1d = _update_daily_bars(writer, pull_1d)
+                    failed_1d = _update_daily_bars(writer, pull_1d, preferred_source=preferred_source)
                     all_failed_1d = list(set(prev_failed_1d + failed_1d))
 
                     status = "ok" if not all_failed_1d else "partial"
@@ -1117,21 +1210,3 @@ def run_once() -> Dict[str, Any]:
     logger.info(f"[智能回填] 完成: action={action} 耗时={elapsed}s")
 
     return {"action": action, "15m": result_15m, "1d": result_1d, "elapsed": elapsed}
-
-
-def start_backfill():
-    """兼容旧接口 — 等同 run_once()。
-
-    原设计是启动后台常驻线程，现改为惰性一次性执行。
-    cn_stock.py 的 DBKlineBridge.backfill_all_market() 调用此函数。
-    """
-    return run_once()
-
-
-def stop_backfill():
-    """无操作。
-
-    惰性模式无常驻线程，无需 stop。
-    保留此函数是为了向后兼容（如果有外部代码调用 stop_backfill）。
-    """
-    pass
