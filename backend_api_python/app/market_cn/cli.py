@@ -43,8 +43,10 @@ def main():
         print("\n" + "▶" * 30)
         print("  模块 1: 国内宏观经济数据")
         print("▶" * 30)
-        from .macro_analysis import macro_dashboard
-        macro_dashboard()
+        from .china_market import get_china_macro
+        import json
+        data = get_china_macro()
+        print(json.dumps(data, ensure_ascii=False, indent=2))
 
     if args.fear_greed:
         print("\n" + "▶" * 30)
