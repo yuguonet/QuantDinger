@@ -457,12 +457,10 @@ class DBKlineBridge:
     # ────────────────────────────────────────────────────────────
 
     def _trigger_backfill_if_needed(self, raw: str, tf: str):
-        """触发 backfill_db.run_once()，由它自己查 cn_last_update 判断该不该干。
+        """触发后台同步。调度逻辑在 backfill_db.py 中。
 
-        桥接层不判断时间，只负责触发。backfill_db 查表决定:
-          该不该干 → cn_last_update.last_updated 距现在多久
-          干了什么  → 写入 count / written
-          干得怎样  → 写入 status / report
+        每次调用都触发 trigger_sync()，由 backfill_db 的 _sync_running 锁
+        保证同一时间只有一个线程在运行，不阻塞调用方。
         """
         self._backfill_db()
 
@@ -738,22 +736,12 @@ class DBKlineBridge:
         return out
 
     def _backfill_db(self):
-        """非阻塞触发全盘回填。fire-and-forget。
-
-        节流由 backfill_db._should_run() 控制（15m 按节点，1D 按交易日），
-        桥接层只管触发，不额外节流。
-        """
-        t = threading.Thread(target=self._run_once_bg, daemon=True)
-        t.start()
-
-    @staticmethod
-    def _run_once_bg():
-        from app.data_sources.backfill_db import run_once
+        """触发后台同步。由 backfill_db._sync_running 锁保证唯一。"""
         try:
-            result = run_once()
-            logger.info(f"[DB桥接] 全盘回填: {result}")
+            from app.data_sources.backfill_db import trigger_sync
+            trigger_sync()
         except Exception as e:
-            logger.warning(f"[DB桥接] 全盘回填异常: {e}")
+            logger.debug(f"[DB桥接] 触发同步异常: {e}")
 
     def backfill_all_market(self):
         """全市场回填 — 委托给 backfill_db.run_once()。"""

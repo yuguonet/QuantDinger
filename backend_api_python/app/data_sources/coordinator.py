@@ -105,7 +105,7 @@ class CircuitBreaker:
     def __init__(
         self,
         failure_threshold: int = 3,
-        cooldown_seconds: float = 300.0,
+        cooldown_seconds: float = 120.0,
         name: str = "default",
     ):
         self._failure_threshold = failure_threshold
@@ -163,7 +163,7 @@ class CircuitBreaker:
 
 
 # 全局熔断器实例
-_realtime_cb = CircuitBreaker(failure_threshold=3, cooldown_seconds=300, name="realtime")
+_realtime_cb = CircuitBreaker(failure_threshold=3, cooldown_seconds=120.0, name="realtime")
 
 
 def get_realtime_circuit_breaker() -> CircuitBreaker:
@@ -1031,7 +1031,7 @@ class Coordinator:
         cb: CircuitBreaker,
         market: str = "",
         timeframe: str = "1D",
-        count: int = 300,
+        count: int = 120,
         adj: str = "qfq",
         timeout: float = 15.0,
         preferred_source: str = "",
