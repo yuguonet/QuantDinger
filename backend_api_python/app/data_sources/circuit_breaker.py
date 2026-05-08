@@ -61,7 +61,7 @@ class CircuitBreaker:
         name: 熔断器名称，用于日志区分
 
     Examples:
-        >>> cb = CircuitBreaker(failure_threshold=3, cooldown_seconds=300)
+        >>> cb = CircuitBreaker(failure_threshold=3, cooldown_seconds=120)
         >>> if cb.is_available("tencent"):
         ...     try:
         ...         data = fetch()
@@ -73,7 +73,7 @@ class CircuitBreaker:
     def __init__(
         self,
         failure_threshold: int = 3,
-        cooldown_seconds: float = 300.0,
+        cooldown_seconds: float = 120.0,
         name: str = "default",
     ):
         """
@@ -177,9 +177,9 @@ class CircuitBreaker:
 # 全局熔断器实例
 # ================================================================
 
-# 实时行情熔断器：连续失败3次触发，冷却300秒（5分钟）
+# 实时行情熔断器：连续失败3次触发，冷却120秒（2分钟）
 # 实时行情对时效性要求高，冷却期不宜过长
-_realtime_cb = CircuitBreaker(failure_threshold=3, cooldown_seconds=300, name="realtime")
+_realtime_cb = CircuitBreaker(failure_threshold=3, cooldown_seconds=120.0, name="realtime")
 
 # 海外行情熔断器：连续失败2次触发，冷却900秒（15分钟）
 # 海外数据源访问更不稳定，阈值更低、冷却期更长
