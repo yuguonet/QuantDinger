@@ -312,6 +312,49 @@ SOURCE_CONFIGS: Dict[str, SourceConfig] = {
         batch_capable=False,
         batch_size=1,
     ),
+
+    # ── 新增源（从 akline_market.py 迁移）──
+
+    # 东方财富 trends2 极速源 — 最快的免费A股源
+    # 通过 push2.eastmoney.com trends2 API，1min聚合为15min
+    # max_workers=30（极速源，高并发）
+    "em_trends2": SourceConfig(
+        name="em_trends2",
+        max_workers=30,
+        markets={"CNStock"},
+        batch_capable=True,
+        batch_size=50,
+    ),
+
+    # 雪球 — 投资社区数据源
+    # max_workers=15（中等并发）
+    "xueqiu": SourceConfig(
+        name="xueqiu",
+        max_workers=15,
+        markets={"CNStock"},
+        batch_capable=True,
+        batch_size=50,
+    ),
+
+    # 搜狐财经 — 免费数据源
+    # max_workers=15（中等并发）
+    "sohu": SourceConfig(
+        name="sohu",
+        max_workers=15,
+        markets={"CNStock"},
+        batch_capable=True,
+        batch_size=50,
+    ),
+
+    # 百度股市通 — 免费数据源
+    # max_workers=15（中等并发）
+    "baidu": SourceConfig(
+        name="baidu",
+        max_workers=15,
+        markets={"CNStock"},
+        batch_capable=True,
+        batch_size=50,
+    ),
 }
 
 
