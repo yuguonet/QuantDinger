@@ -514,7 +514,7 @@ class BackfillDB:
             timeframe=tf,
             count=None,
             start_date=start_date,
-            end_date=end_date,
+            end_date= "",
             timeout=300,
         )
 

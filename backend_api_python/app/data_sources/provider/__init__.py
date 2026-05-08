@@ -266,19 +266,32 @@ def _resolve_market_kline_count(
     timeframe: str,
     count: Optional[int],
     start_date: str,
+    end_date: str = "",
 ) -> Optional[int]:
     """
     fetch_market_kline 统一路由：决定 count 值和是否走快照路径。
+
+    路由规则（用 end_date 判断，不用 count）:
+      - end_date 是今天（或为空，默认今天）→ 走批量行情快照路径（1 HTTP，1 bar/只）
+      - end_date 是过去日期 → 走并发 fetch_kline 路径，用日期范围推算 count
 
     返回值:
       - None: 走 _all_market_kline_via_quotes 快照路径
       - int:  走并发 fetch_kline 路径，使用此 count 值
     """
+    from datetime import datetime, timezone, timedelta
+    today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+    effective_end = end_date if end_date else today
+
+    if effective_end == today:
+        # 今日数据 → 走批量行情快照（单次 HTTP 拿全市场最新 bar）
+        return None
+
+    # 非今日 → 需要历史数据，推算 count 走并发 fetch_kline
     if count is not None:
         return count
-    if not start_date:
-        return None
-    return calc_kline_count(timeframe, start_date)
+    effective_start = start_date if start_date else effective_end
+    return calc_kline_count(timeframe, effective_start, effective_end)
 
 
 def _all_market_kline_via_quotes(
@@ -448,8 +461,8 @@ class BaseDataSource(Protocol):
         全市场批量K线 — 无需传入代码列表，自动获取全市场股票。
 
         路由逻辑:
-          - count=None 且无 start_date → 走 fetch_batch_quotes（1 HTTP 拿 N 只行情，转单根 bar）
-          - count 有值或有 start_date → 并发调用 fetch_kline（每只 1 HTTP）
+          - end_date 是今天（或为空）→ 走 fetch_batch_quotes（1 HTTP 拿 N 只行情，转单根 bar）
+          - end_date 是过去日期 → 并发调用 fetch_kline（每只 1 HTTP）
 
         Args:
             timeframe: K线周期

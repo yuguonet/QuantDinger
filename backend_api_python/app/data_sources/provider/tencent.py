@@ -171,7 +171,7 @@ class TencentDataSource:
         腾讯单次HTTP限 ~500 只，自动分批并发获取。
         """
         from app.data_sources.provider import _resolve_market_kline_count
-        count = _resolve_market_kline_count(timeframe, count, start_date)
+        count = _resolve_market_kline_count(timeframe, count, start_date, end_date)
         if count is None:
             from app.data_sources.provider import _all_market_kline_via_quotes
             return _all_market_kline_via_quotes(self, timeframe=timeframe, timeout=timeout)

@@ -1070,13 +1070,13 @@ class Coordinator:
         # 发现支持 kline_batch 的源（即实现了 fetch_market_kline 的 Provider）
         providers = get_providers(capability="kline_batch", timeframe=timeframe, market=market)
 
-        # 非批量路线提醒：count 有值或 end_date 不是今天时，
+        # 非批量路线提醒：end_date 不是今天时，
         # Provider 内部会走逐只并发而非单次批量行情快照
         from datetime import datetime as _dt, timezone as _tz, timedelta as _td
         today_str = _dt.now(_tz(_td(hours=8))).strftime("%Y-%m-%d")
-        if count is not None or (end_date and end_date != today_str):
+        if end_date and end_date != today_str:
             msg = (
-                f"[协助层] market_kline 非批量路线: count={count}, end_date={end_date or '(空)'}, "
+                f"[协助层] market_kline 非批量路线: end_date={end_date}, "
                 f"today={today_str} → Provider 将走逐只并发 fetch_kline 而非批量行情快照"
             )
             logger.info(msg)

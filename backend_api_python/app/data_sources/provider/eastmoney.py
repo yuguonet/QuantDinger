@@ -137,7 +137,7 @@ class EastMoneyDataSource:
     ) -> Dict[str, List[Dict[str, Any]]]:
         """全市场批量K线 — count=None 走批量行情（1 HTTP），count 有值走并发 K 线"""
         from app.data_sources.provider import _resolve_market_kline_count
-        count = _resolve_market_kline_count(timeframe, count, start_date)
+        count = _resolve_market_kline_count(timeframe, count, start_date, end_date)
         if count is None:
             from app.data_sources.provider import _all_market_kline_via_quotes
             return _all_market_kline_via_quotes(self, timeframe=timeframe, timeout=timeout)
