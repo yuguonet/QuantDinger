@@ -315,7 +315,7 @@ class TencentDataSource:
         import concurrent.futures
         result: Dict[str, Dict[str, Any]] = {}
         lock = threading.Lock()
-        max_workers = min(len(batches), 10)
+        max_workers = min(len(batches), 2)
 
         def _fetch_batch(batch):
             local: Dict[str, Dict[str, Any]] = {}
