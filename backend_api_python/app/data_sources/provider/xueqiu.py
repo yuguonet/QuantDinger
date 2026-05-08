@@ -7,7 +7,7 @@
   雪球是国内知名投资社区，数据接口稳定。
 
 能力:
-  - K线: 15m（前复权），通过 chart/kline.json API
+  - K线: 1m/5m/15m/30m/1H/1D/1W（前复权），通过 chart/kline.json API
   - 单只行情: 实时行情快照
   - 全市场批量: 并发获取全市场K线
 
@@ -116,11 +116,33 @@ def _to_xueqiu_symbol(code: str) -> str:
 # 数据获取
 # ================================================================
 
-def _fetch_kline_15m(code: str, limit: int = 200) -> Optional[List[Dict[str, Any]]]:
-    """获取单只股票15分钟K线（前复权）"""
+# 雪球 API period 参数映射
+# 分钟级: "1"=1m, "5"=5m, "15"=15m, "30"=30m, "60"=1H
+# 日线级: "day"=1D, "week"=1W, "month"=1M
+_XQ_TF_TO_PERIOD = {
+    "1m": "1",
+    "5m": "5",
+    "15m": "15",
+    "30m": "30",
+    "1H": "60",
+    "1D": "day",
+    "1W": "week",
+}
+
+
+def _fetch_xueqiu_kline(code: str, timeframe: str = "15m", limit: int = 200) -> Optional[List[Dict[str, Any]]]:
+    """获取单只股票K线数据（前复权），支持多周期。
+
+    支持的周期: 1m, 5m, 15m, 30m, 1H, 1D, 1W
+    雪球 API 原生支持这些周期，无需额外聚合。
+    """
     symbol = _to_xueqiu_symbol(code)
     if not symbol:
         return None
+
+    period = _XQ_TF_TO_PERIOD.get(timeframe)
+    if not period:
+        return None  # 不支持的周期
 
     _xueqiu_limiter.wait()
     try:
@@ -128,7 +150,7 @@ def _fetch_kline_15m(code: str, limit: int = 200) -> Optional[List[Dict[str, Any
         params = {
             "symbol": symbol,
             "begin": int(time.time() * 1000),
-            "period": "15",
+            "period": period,
             "type": "before",  # 前复权
             "count": f"-{limit}",
             "indicator": "kline",
@@ -160,7 +182,7 @@ def _fetch_kline_15m(code: str, limit: int = 200) -> Optional[List[Dict[str, Any
 
         return result if result else None
     except Exception as e:
-        logger.debug("[雪球] fetch_kline %s 失败: %s", code, e)
+        logger.debug("[雪球] fetch_kline %s %s 失败: %s", code, timeframe, e)
         return None
 
 
@@ -226,12 +248,13 @@ class XueqiuDataSource:
     capabilities = {
         "kline": True,
         "kline_priority": 40,
-        "kline_tf": {"15m"},
+        "kline_tf": {"1m", "5m", "15m", "30m", "1H", "1D", "1W"},
         "kline_batch": True,
         "kline_batch_priority": 40,
         "quote": True,
         "quote_priority": 40,
-        "batch_quote": False,
+        "batch_quote": True,
+        "batch_quote_priority": 40,
         "hk": False,
         "markets": {"CNStock"},
     }
@@ -248,11 +271,11 @@ class XueqiuDataSource:
         adj: str = "qfq", timeout: int = 10,
         start_date: str = "", end_date: str = "",
     ) -> List[Dict[str, Any]]:
-        """获取单只股票15分钟K线（前复权）"""
-        if timeframe != "15m":
+        """获取单只股票K线（前复权），支持 1m/5m/15m/30m/1H/1D/1W"""
+        if timeframe not in _XQ_TF_TO_PERIOD:
             return NotSupportedResult(self.name, "fetch_kline", f"不支持 {timeframe} 周期")
 
-        data = _fetch_kline_15m(code, count)
+        data = _fetch_xueqiu_kline(code, timeframe, count)
         return data if data else []
 
     def fetch_market_kline(
@@ -261,10 +284,11 @@ class XueqiuDataSource:
         start_date: str = "", end_date: str = "",
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
-        全市场批量15分钟K线 — 并发获取。
+        全市场批量K线 — 并发获取。
+        支持 1m/5m/15m/30m/1H/1D/1W。
         线程结构与 akline_market.py 保持一致: 每组50只，30线程并发。
         """
-        if timeframe != "15m":
+        if timeframe not in _XQ_TF_TO_PERIOD:
             return NotSupportedResult(self.name, "fetch_market_kline", f"不支持 {timeframe} 周期")
 
         from app.data_sources.provider import _fetch_all_cn_codes
@@ -287,7 +311,7 @@ class XueqiuDataSource:
 
         def _fetch_one(code):
             try:
-                data = _fetch_kline_15m(code, count)
+                data = _fetch_xueqiu_kline(code, timeframe, count)
                 if data:
                     with lock:
                         result[normalize_cn_code(code)] = data

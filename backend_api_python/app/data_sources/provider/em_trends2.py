@@ -7,9 +7,11 @@
   聚合为15分钟K线。这是目前已知最快的免费A股数据源。
 
 能力:
-  - K线: 仅15m（1min聚合），今天的数据
-  - 全市场批量: 并发获取全市场15min K线
-  - 不支持行情/批量行情接口
+  - K线: 1m/5m/15m/30m/1H（1min数据聚合），今天的数据
+  - 不支持 1D（API只返回当天数据）
+  - 行情: 用当天1min数据最新bar作为实时行情
+  - 全市场批量: 并发获取全市场K线
+  - 不支持批量行情接口
 
 特点:
   - 极速源: push2 trends2, 每秒可处理50+只
@@ -400,8 +402,8 @@ def _apply_fwd_adjust(klines: list, code: str) -> list:
 # 核心数据获取
 # ================================================================
 
-def _em_trends2_15m(code: str, limit: int = 200) -> Optional[list]:
-    """push2.eastmoney.com trends2: 今天1分钟数据 → 聚合为15min"""
+def _em_trends2_raw(code: str) -> Optional[list]:
+    """push2.eastmoney.com trends2: 获取今天1分钟原始数据"""
     secid = _to_em(code)
     try:
         url = (
@@ -414,7 +416,7 @@ def _em_trends2_15m(code: str, limit: int = 200) -> Optional[list]:
             raw = resp.read().decode("utf-8", "ignore")
         d = json.loads(raw)
         trends = (d.get("data") or {}).get("trends") or []
-        if len(trends) < 15:
+        if not trends:
             return None
 
         bars = []
@@ -427,22 +429,90 @@ def _em_trends2_15m(code: str, limit: int = 200) -> Optional[list]:
                 "high": float(p[3]), "low": float(p[4]),
                 "volume": float(p[5]), "amount": float(p[6]),
             })
-
-        # 15根1min → 1根15min
-        result = []
-        for i in range(0, len(bars) - 14, 15):
-            c = bars[i:i + 15]
-            result.append(_k(
-                c[0]["time"], c[0]["open"],
-                max(b["high"] for b in c),
-                min(b["low"] for b in c),
-                c[-1]["close"],
-                sum(b["volume"] for b in c),
-                sum(b["amount"] for b in c),
-            ))
-        return result if result else None
+        return bars if bars else None
     except Exception:
         return None
+
+
+# 聚合周期映射: timeframe → 每根bar包含的1min bar数
+_EM_AGG_STEPS = {
+    "1m": 1,
+    "5m": 5,
+    "15m": 15,
+    "30m": 30,
+    "1H": 60,
+}
+
+
+def _aggregate_bars(raw_bars: list, timeframe: str) -> Optional[list]:
+    """将1分钟原始数据聚合为指定周期的K线。
+
+    支持: 1m(不聚合), 5m, 15m, 30m, 1H。
+    1D 不支持（API只返回当天数据，不够聚合出日线）。
+    """
+    step = _EM_AGG_STEPS.get(timeframe)
+    if step is None:
+        return None  # 不支持的周期（如 1D）
+
+    if step == 1:
+        return raw_bars  # 1m 直接返回
+
+    result = []
+    for i in range(0, len(raw_bars) - step + 1, step):
+        chunk = raw_bars[i:i + step]
+        result.append(_k(
+            chunk[0]["time"],
+            chunk[0]["open"],
+            max(b["high"] for b in chunk),
+            min(b["low"] for b in chunk),
+            chunk[-1]["close"],
+            sum(b["volume"] for b in chunk),
+            sum(b["amount"] for b in chunk),
+        ))
+    return result if result else None
+
+
+def _em_trends2_kline(code: str, timeframe: str = "15m", limit: int = 200) -> Optional[list]:
+    """获取单只股票K线数据，支持 1m/5m/15m/30m/1H。
+
+    流程: 获取全天1min数据 → 聚合为目标周期 → 截取 limit 条。
+    """
+    raw = _em_trends2_raw(code)
+    if not raw:
+        return None
+    return _aggregate_bars(raw, timeframe)
+
+
+# ================================================================
+# 实时行情 — 用当天1min数据最新bar的close作为当前价
+# ================================================================
+
+def _fetch_em_trends2_quote(code: str) -> Optional[Dict[str, Any]]:
+    """获取单只股票实时行情 — 从全天1min数据提取最新bar"""
+    raw = _em_trends2_raw(code)
+    if not raw:
+        return None
+
+    last_bar = raw[-1]
+    last = float(last_bar.get("close", 0) or 0)
+    if last <= 0:
+        return None
+
+    highs = [float(b.get("high", 0)) for b in raw if float(b.get("high", 0)) > 0]
+    lows = [float(b.get("low", 0)) for b in raw if float(b.get("low", 0)) > 0]
+    open_p = float(raw[0].get("open", 0) or last)
+
+    return {
+        "last": last,
+        "change": 0,
+        "changePercent": 0,
+        "high": max(highs) if highs else last,
+        "low": min(lows) if lows else last,
+        "open": open_p,
+        "previousClose": 0,
+        "name": "",
+        "symbol": code,
+    }
 
 
 # ================================================================
@@ -455,9 +525,11 @@ class EmTrends2DataSource:
     东方财富 trends2 极速数据源 — 最快的A股免费源（priority=5）。
 
     能力:
-      - K线: 仅15m（1min聚合为15min），今天的数据
-      - 全市场批量: 并发获取全市场15min K线（30线程）
-      - 不支持行情/批量行情接口
+      - K线: 1m/5m/15m/30m/1H（1min数据聚合），今天的数据
+      - 不支持 1D（API只返回当天数据）
+      - 行情: 用当天1min数据最新bar作为实时行情
+      - 全市场批量: 并发获取全市场K线（30线程）
+      - 不支持批量行情接口
 
     线程安全性:
       - 使用域名限流器控制并发
@@ -470,11 +542,13 @@ class EmTrends2DataSource:
     capabilities = {
         "kline": True,
         "kline_priority": 5,
-        "kline_tf": {"15m"},
+        "kline_tf": {"1m", "5m", "15m", "30m", "1H"},
         "kline_batch": True,
         "kline_batch_priority": 5,
-        "quote": False,
-        "batch_quote": False,
+        "quote": True,
+        "quote_priority": 5,
+        "batch_quote": True,
+        "batch_quote_priority": 5,
         "hk": False,
         "markets": {"CNStock"},
     }
@@ -494,15 +568,15 @@ class EmTrends2DataSource:
         start_date: str = "", end_date: str = "",
     ) -> List[Dict[str, Any]]:
         """
-        获取单只股票15分钟K线。
-
-        仅支持15m周期，返回今天的数据（1min聚合为15min）。
+        获取单只股票K线，支持 1m/5m/15m/30m/1H。
+        数据来源: 全天1min数据聚合。
+        不支持 1D（API只返回当天数据）。
         不复权数据通过 TDX 除权除息数据转前复权。
         """
-        if timeframe != "15m":
+        if timeframe not in _EM_AGG_STEPS:
             return NotSupportedResult(self.name, "fetch_kline", f"不支持 {timeframe} 周期")
 
-        data = _em_trends2_15m(code, count)
+        data = _em_trends2_kline(code, timeframe, count)
         if not data:
             return []
 
@@ -559,14 +633,15 @@ class EmTrends2DataSource:
         start_date: str = "", end_date: str = "",
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
-        全市场批量15分钟K线 — 30线程并发获取。
+        全市场批量K线 — 30线程并发获取。
+        支持 1m/5m/15m/30m/1H（不支持 1D）。
 
         线程结构与 akline_market.py 保持一致:
         - 每组50只，从队列中领取
         - 30线程并发
         - 先完成的接着领下一组
         """
-        if timeframe != "15m":
+        if timeframe not in _EM_AGG_STEPS:
             return NotSupportedResult(self.name, "fetch_market_kline", f"不支持 {timeframe} 周期")
 
         from queue import Queue, Empty
@@ -593,9 +668,9 @@ class EmTrends2DataSource:
             if not code:
                 return
             try:
-                data = _em_trends2_15m(code, count)
+                data = _em_trends2_kline(code, timeframe, count)
                 if data:
-                    # 标准化
+                    # 标准化时间格式
                     bars = []
                     for bar in data:
                         try:
@@ -680,12 +755,35 @@ class EmTrends2DataSource:
         return result
 
     def fetch_ticker(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
-        """不支持实时行情"""
-        return NotSupportedResult(self.name, "fetch_ticker")
+        """获取单只股票实时行情 — 用当天1min数据最新bar的close作为当前价"""
+        return _fetch_em_trends2_quote(code)
 
     def fetch_batch_quotes(self, codes: List[str], timeout: int = 10) -> Dict[str, Dict[str, Any]]:
-        """不支持批量行情"""
-        return NotSupportedResult(self.name, "fetch_batch_quotes")
+        """批量实时行情 — 并发直接调 _fetch_em_trends2_quote"""
+        result: Dict[str, Dict[str, Any]] = {}
+        lock = threading.Lock()
+
+        def _fetch(code):
+            q = _fetch_em_trends2_quote(code)
+            if q:
+                nc = code.strip().upper()
+                if nc.startswith("6"):
+                    nc = "sh" + nc
+                elif nc.startswith(("0", "3")):
+                    nc = "sz" + nc
+                with lock:
+                    result[nc] = q
+
+        max_workers = min(len(codes), 30)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futs = [pool.submit(_fetch, c) for c in codes]
+            for f in futs:
+                try:
+                    f.result()
+                except Exception:
+                    pass
+
+        return result
 
     def _get_stock_list(self) -> list:
         """获取A股股票列表（通过东财 clist API）"""

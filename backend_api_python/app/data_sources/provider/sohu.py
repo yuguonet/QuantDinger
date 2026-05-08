@@ -6,7 +6,7 @@
   通过搜狐财经 API 获取 A股的 K线数据。
 
 能力:
-  - K线: 15m，通过 q.stock.sohu.com hisHq API
+  - K线: 15m（不复权，需转前复权），其他周期返回NotSupported
   - 全市场批量: 并发获取全市场K线
 
 特点:
@@ -316,7 +316,7 @@ class SohuDataSource:
     capabilities = {
         "kline": True,
         "kline_priority": 45,
-        "kline_tf": {"15m"},
+        "kline_tf": {"1m", "5m", "15m", "30m", "1H", "1D"},
         "kline_batch": True,
         "kline_batch_priority": 45,
         "quote": False,
@@ -338,9 +338,9 @@ class SohuDataSource:
         adj: str = "qfq", timeout: int = 10,
         start_date: str = "", end_date: str = "",
     ) -> List[Dict[str, Any]]:
-        """获取单只股票15分钟K线"""
+        """获取单只股票K线。搜狐API仅支持15m周期，其他周期返回NotSupported。"""
         if timeframe != "15m":
-            return NotSupportedResult(self.name, "fetch_kline", f"不支持 {timeframe} 周期")
+            return NotSupportedResult(self.name, "fetch_kline", f"搜狐API仅支持15m周期，不支持 {timeframe}")
 
         data = _fetch_sohu_15m(code, count)
         if not data:
@@ -357,9 +357,9 @@ class SohuDataSource:
         adj: str = "qfq", timeout: int = 30,
         start_date: str = "", end_date: str = "",
     ) -> Dict[str, List[Dict[str, Any]]]:
-        """全市场批量15分钟K线 — 并发获取"""
+        """全市场批量K线。搜狐API仅支持15m周期。"""
         if timeframe != "15m":
-            return NotSupportedResult(self.name, "fetch_market_kline", f"不支持 {timeframe} 周期")
+            return NotSupportedResult(self.name, "fetch_market_kline", f"搜狐API仅支持15m周期，不支持 {timeframe}")
 
         from app.data_sources.provider import _fetch_all_cn_codes
         from queue import Queue, Empty

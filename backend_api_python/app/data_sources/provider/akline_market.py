@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-A股全市场15min K线 — 极速并发拉取
+A股全市场多周期K线 — 极速并发拉取
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-push2.eastmoney.com trends2 → 1分钟数据聚合为15min (16bar)
-其它源: tencent / sina / baidu / sohu / xueqiu / ...
+push2.eastmoney.com trends2 → 1分钟数据聚合为多周期 (1m/5m/15m/30m/1H)
+其它源: tencent / sina / baidu / sohu / xueqiu / tdx / tdx_ex
 纯标准库
 """
 
@@ -262,9 +262,23 @@ def get_stock_list():
         with open(cache,"w") as f: json.dump(stocks,f,ensure_ascii=False)
     return stocks
 
-# ═══════════════ 极速源: push2 trends2 → 1min聚合15min ═══════════════
-def em_trends2_15m(code, limit=200):
-    """push2.eastmoney.com trends2: 今天1分钟数据 → 聚合为15min (16bar)"""
+# ═══════════════ 周期映射 ═══════════════
+# pytdx get_security_bars category (TdxHq_API)
+_TDX_HQ_CATEGORY = {
+    "1m": 7, "5m": 0, "15m": 1, "30m": 2, "1H": 3, "1D": 4, "1W": 5,
+}
+# pytdx get_instrument_bars category (TdxExHq_API) — 尝试多个值
+_TDX_EX_CATEGORY = {
+    "1m": [7, 8], "5m": [0], "15m": [8, 1, 9], "30m": [2],
+    "1H": [3], "1D": [4, 9], "1W": [5],
+}
+# 聚合步长: em_trends2 1min 数据聚合
+_EM_AGG_STEPS = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1H": 60}
+
+
+# ═══════════════ 极速源: push2 trends2 → 1min聚合多周期 ═══════════════
+def em_trends2_raw(code):
+    """push2.eastmoney.com trends2: 获取今天1分钟原始数据"""
     secid = to_em(code)
     try:
         url = (f"https://push2.eastmoney.com/api/qt/stock/trends2/get?"
@@ -275,8 +289,8 @@ def em_trends2_15m(code, limit=200):
             raw = resp.read().decode("utf-8", "ignore")
         d = json.loads(raw)
         trends = (d.get("data") or {}).get("trends") or []
-        if len(trends) < 15: return None
-        # "time,open,close,high,low,vol,amount,avg"
+        if not trends:
+            return None
         bars = []
         for t in trends:
             p = t.split(",")
@@ -284,35 +298,59 @@ def em_trends2_15m(code, limit=200):
             bars.append({"time":p[0],"open":float(p[1]),"close":float(p[2]),
                          "high":float(p[3]),"low":float(p[4]),
                          "volume":float(p[5]),"amount":float(p[6])})
-        # 15根1min → 1根15min
-        result = []
-        for i in range(0, len(bars)-14, 15):
-            c = bars[i:i+15]
-            result.append(_k(c[0]["time"], c[0]["open"],
-                             max(b["high"] for b in c),
-                             min(b["low"] for b in c),
-                             c[-1]["close"],
-                             sum(b["volume"] for b in c),
-                             sum(b["amount"] for b in c)))
-        return result if result else None
+        return bars if bars else None
     except:
         return None
 
-# ═══════════════ 其它15min数据源 (fallback) ═══════════════
-def em_15m(code, limit=200):
-    data = http_get_json(f"https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={to_em(code)}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61&klt=15&fqt=1&end=20500101&lmt={limit}")
+def em_trends2_kline(code, timeframe="15m", limit=200):
+    """em_trends2: 支持 1m/5m/15m/30m/1H（1min数据聚合），不支持 1D"""
+    step = _EM_AGG_STEPS.get(timeframe)
+    if step is None:
+        return None  # 不支持的周期（如 1D）
+    raw = em_trends2_raw(code)
+    if not raw:
+        return None
+    if step == 1:
+        return last_n_bars(raw, limit)
+    result = []
+    for i in range(0, len(raw) - step + 1, step):
+        c = raw[i:i+step]
+        result.append(_k(c[0]["time"], c[0]["open"],
+                         max(b["high"] for b in c),
+                         min(b["low"] for b in c),
+                         c[-1]["close"],
+                         sum(b["volume"] for b in c),
+                         sum(b["amount"] for b in c)))
+    return last_n_bars(result, limit) if result else None
+
+
+# ═══════════════ 其它多周期数据源 ═══════════════
+def em_kline(code, timeframe="15m", limit=200):
+    """东方财富历史K线 API: 支持所有周期"""
+    _EM_KLT = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1H": 60, "1D": 101, "1W": 102}
+    klt = _EM_KLT.get(timeframe)
+    if klt is None: return None
+    data = http_get_json(f"https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={to_em(code)}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61&klt={klt}&fqt=1&end=20500101&lmt={limit}")
     k = (data.get("data") or {}).get("klines") if data else None
     return last_n_bars([_k(*p[:7]) for p in (l.split(",") for l in k)]) if k else None
 
-def tx_15m(code, limit=200):
+def tx_kline(code, timeframe="15m", limit=200):
+    """腾讯K线: 支持 1m/5m/15m/30m/1H/1D"""
+    _TX_TF = {"1m": "m1", "5m": "m5", "15m": "m15", "30m": "m30", "1H": "m60", "1D": "day"}
+    tc_tf = _TX_TF.get(timeframe)
+    if tc_tf is None: return None
     tc = normalize(code)
-    data = http_get_json(f"https://web.ifzq.gtimg.cn/appstock/app/kline/mkline?param={tc},m15,,{limit}")
-    k = (data.get("data") or {}).get(tc, {}).get("m15", []) if data else []
+    data = http_get_json(f"https://web.ifzq.gtimg.cn/appstock/app/kline/mkline?param={tc},{tc_tf},,{limit}")
+    k = (data.get("data") or {}).get(tc, {}).get(tc_tf, []) if data else []
     return last_n_bars([_k(r[0],r[1],r[3],r[4],r[2],r[5]) for r in k if len(r)>=5]) if k else None
 
-def sina_15m(code, limit=200):
+def sina_kline(code, timeframe="15m", limit=200):
+    """新浪K线: 支持 5m/15m/30m/60m/1D"""
+    _SINA_SCALE = {"5m": 5, "15m": 15, "30m": 30, "1H": 60, "1D": 240}
+    scale = _SINA_SCALE.get(timeframe)
+    if scale is None: return None
     sc = normalize(code)
-    t = http_get(f"https://quotes.sina.cn/cn/api/jsonp_v2.php/var _={int(time.time()*1000)}/CN_MarketDataService.getKLineData?symbol={sc}&scale=15&ma=no&datalen={limit}")
+    t = http_get(f"https://quotes.sina.cn/cn/api/jsonp_v2.php/var _={int(time.time()*1000)}/CN_MarketDataService.getKLineData?symbol={sc}&scale={scale}&ma=no&datalen={limit}")
     if not t: return None
     m = re.search(r'\(\s*(\[.*\])\s*\)', t, re.DOTALL)
     if not m: return None
@@ -323,7 +361,9 @@ def sina_15m(code, limit=200):
         result = apply_fwd_adjust(result, code)
     return last_n_bars(result) if result else None
 
-def baidu_15m(code, limit=200):
+def baidu_kline(code, timeframe="15m", limit=200):
+    """百度K线: 仅支持 15m（API无period参数）"""
+    if timeframe != "15m": return None
     data = http_get_json(f"https://finance.pae.baidu.com/selfselect/getstockquotation?all=1&code={cn(code)}&is498=1&isBk=false&isBlock=false&isFutures=false&isStock=true&isIndex=false&market_type=ab&newFormat=1&group=quotation_kline_ab&finClientType=pc")
     if not data: return None
     r = data.get("Result") or []
@@ -332,7 +372,9 @@ def baidu_15m(code, limit=200):
     k = sd.get("kline") or sd.get("dayLine") or []
     return last_n_bars([_k(i.get("date",i.get("time","")),i.get("open",0),i.get("high",0),i.get("low",0),i.get("close",0),i.get("volume",0),i.get("amount",0)) for i in k if isinstance(i,dict)]) if k else None
 
-def sohu_15m(code, limit=200):
+def sohu_kline(code, timeframe="15m", limit=200):
+    """搜狐K线: 仅支持 15m（API period参数已废弃）"""
+    if timeframe != "15m": return None
     data = http_get_json(f"https://q.stock.sohu.com/hisHq?code=cn_{cn(code)}&start=20260101&end=20261231&period=15")
     if not data or not isinstance(data, list): return None
     hq = data[0].get("hq") or []
@@ -341,9 +383,13 @@ def sohu_15m(code, limit=200):
         result = apply_fwd_adjust(result, code)
     return last_n_bars(result) if result else None
 
-def xq_15m(code, limit=200):
+def xq_kline(code, timeframe="15m", limit=200):
+    """雪球K线: 支持 1m/5m/15m/30m/1H/1D/1W"""
+    _XQ_PERIOD = {"1m": "1", "5m": "5", "15m": "15", "30m": "30", "1H": "60", "1D": "day", "1W": "week"}
+    period = _XQ_PERIOD.get(timeframe)
+    if period is None: return None
     http_get("https://xueqiu.com/", timeout=5)
-    data = http_get_json(f"https://stock.xueqiu.com/v5/stock/chart/kline.json?symbol={normalize(code).upper()}&begin={int(time.time()*1000)}&period=15&type=before&count=-{limit}&indicator=kline", headers={"Referer":"https://xueqiu.com"})
+    data = http_get_json(f"https://stock.xueqiu.com/v5/stock/chart/kline.json?symbol={normalize(code).upper()}&begin={int(time.time()*1000)}&period={period}&type=before&count=-{limit}&indicator=kline", headers={"Referer":"https://xueqiu.com"})
     if not data: return None
     items = (data.get("data") or {}).get("item") or []
     return last_n_bars([_k(datetime.fromtimestamp(r[0]/1000).strftime("%Y-%m-%d %H:%M"),r[2],r[3],r[4],r[5],r[1]) for r in items]) if items else None
@@ -434,9 +480,12 @@ def _tdx_get_conn():
             continue
     return None
 
-def tdx_15m(code, limit=200):
-    """通达信 Level-1 行情: 15分钟K线"""
+def tdx_kline(code, timeframe="15m", limit=200):
+    """通达信 Level-1 行情: 支持 1m/5m/15m/30m/1H/1D/1W"""
     if not HAS_TDX or not _tdx_live_servers:
+        return None
+    cat = _TDX_HQ_CATEGORY.get(timeframe)
+    if cat is None:
         return None
     nc = normalize(code)
     if nc.startswith("sh"):
@@ -450,7 +499,7 @@ def tdx_15m(code, limit=200):
     if not api:
         return None
     try:
-        data = api.get_security_bars(1, market, symbol, 0, limit)
+        data = api.get_security_bars(cat, market, symbol, 0, limit)
         if not data or len(data) == 0:
             return None
         result = []
@@ -562,9 +611,12 @@ def _tdx_ex_get_conn():
             continue
     return None
 
-def tdx_ex_15m(code, limit=200):
-    """通达信扩展行情: 15分钟K线 (ExHQ协议, 不同服务器)"""
+def tdx_ex_kline(code, timeframe="15m", limit=200):
+    """通达信扩展行情: 支持 1m/5m/15m/30m/1H/1D/1W (ExHQ协议, 不同服务器)"""
     if not HAS_TDX or not _tdx_ex_live_servers:
+        return None
+    categories = _TDX_EX_CATEGORY.get(timeframe)
+    if not categories:
         return None
     nc = normalize(code)
     if nc.startswith("sh"):
@@ -578,9 +630,9 @@ def tdx_ex_15m(code, limit=200):
     if not api:
         return None
     try:
-        # category: 0=5min, 8=15min, 1=15min(部分服务器), 试多个
+        # 尝试多个 category（不同服务器支持可能不同）
         data = None
-        for cat in [8, 1, 9]:
+        for cat in categories:
             try:
                 data = api.get_instrument_bars(cat, market, symbol, 0, limit)
                 if data: break
@@ -605,28 +657,28 @@ def tdx_ex_15m(code, limit=200):
 
 # ═══════════════ 源注册表 ═══════════════
 ALL_SOURCES = [
-    ("em_trends2",   em_trends2_15m),   # 极速源: push2 trends2, 默认首选
-    ("tdx",          tdx_15m),           # 通达信 HQ: 专用协议, 速度快
-    ("tdx_ex",       tdx_ex_15m),        # 通达信 ExHQ: 扩展行情协议
-    ("eastmoney",    em_15m),
-    ("tencent",      tx_15m),
-    ("sina",         sina_15m),
-    ("baidu",        baidu_15m),
-    ("sohu",         sohu_15m),
-    ("xueqiu",       xq_15m),
+    ("em_trends2",   em_trends2_kline),  # 极速源: push2 trends2, 默认首选（仅分钟级）
+    ("tdx",          tdx_kline),          # 通达信 HQ: 专用协议, 速度快
+    ("tdx_ex",       tdx_ex_kline),       # 通达信 ExHQ: 扩展行情协议
+    ("eastmoney",    em_kline),
+    ("tencent",      tx_kline),
+    ("sina",         sina_kline),
+    ("baidu",        baidu_kline),
+    ("sohu",         sohu_kline),
+    ("xueqiu",       xq_kline),
 ]
 
 # ═══════════════ 源Worker ═══════════════
-def source_worker(name, fetch_fn, queue, stats, out_dir, threads):
+def source_worker(name, fetch_fn, queue, stats, out_dir, threads, timeframe="15m"):
     """每个源: 持久线程池, 每次领1组, 完成立即领下一组"""
-    subdir = os.path.join(out_dir, "15m")
+    subdir = os.path.join(out_dir, timeframe)
     os.makedirs(subdir, exist_ok=True)
     header = "time,open,high,low,close,volume,amount\n"
 
     def fetch_one(stock):
         code = stock["code"]
         try:
-            data = fetch_fn(code, 200)
+            data = fetch_fn(code, timeframe, 200)
             if data and len(data) > 0:
                 fp = os.path.join(subdir, f"{code}.csv")
                 with open(fp, "w", encoding="utf-8") as f:
@@ -698,16 +750,18 @@ def display(workers, total, stop):
 # ═══════════════ main ═══════════════
 def main():
     import argparse
-    p = argparse.ArgumentParser(description="A股15min 极速并发")
+    p = argparse.ArgumentParser(description="A股多周期 极速并发")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--group-size", type=int, default=GROUP_SIZE)
     p.add_argument("--threads", type=int, default=THREADS_PER_SOURCE)
     p.add_argument("--codes", type=str, default="")
+    p.add_argument("--timeframe", type=str, default="15m", help="K线周期: 1m/5m/15m/30m/1H/1D")
     p.add_argument("--sources", type=str, default="", help="源名,逗号分隔. 默认全部. 可选: em_trends2,tdx,tdx_ex,eastmoney,tencent,sina,baidu,sohu,xueqiu")
     args = p.parse_args()
 
+    timeframe = args.timeframe
     print("="*65)
-    print(f"  A股15min 极速并发 | {datetime.now():%Y-%m-%d %H:%M}")
+    print(f"  A股{timeframe} 极速并发 | {datetime.now():%Y-%m-%d %H:%M}")
     print(f"  每组{args.group_size}只 × 每源{args.threads}线程 | 先完成先领组")
     print("="*65)
 
@@ -752,7 +806,7 @@ def main():
     workers = []
     for name, fn in sources:
         st = SourceStats(name)
-        t = threading.Thread(target=source_worker, args=(name, fn, q, st, OUTPUT_DIR, args.threads), daemon=True)
+        t = threading.Thread(target=source_worker, args=(name, fn, q, st, OUTPUT_DIR, args.threads, timeframe), daemon=True)
         workers.append({"thread": t, "stats": st})
         t.start()
 
@@ -767,7 +821,7 @@ def main():
     elapsed = time.time() - t0
     tot_ok = sum(w["stats"].ok for w in workers)
     print(f"\n  ⏱ 耗时 {elapsed:.1f}s | 整体 {tot_ok/elapsed:.1f}只/秒" if elapsed > 0 else "")
-    print(f"  📁 {os.path.abspath(OUTPUT_DIR)}/15m/")
+    print(f"  📁 {os.path.abspath(OUTPUT_DIR)}/{timeframe}/")
 
 if __name__ == "__main__":
     main()

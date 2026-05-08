@@ -6,7 +6,8 @@
   通过百度财经 API 获取 A股的 K线数据。
 
 能力:
-  - K线: 15m，通过 finance.pae.baidu.com selfselect API
+  - K线: 15m（百度API原生），其他周期返回NotSupported
+  - 行情: 单只/批量实时行情
   - 全市场批量: 并发获取全市场K线
 
 特点:
@@ -153,6 +154,44 @@ def _fetch_baidu_15m(code: str, limit: int = 200) -> Optional[List[Dict[str, Any
     return result[-limit:] if len(result) > limit else result
 
 
+def _fetch_baidu_quote(code: str) -> Optional[Dict[str, Any]]:
+    """获取单只股票实时行情 — 百度 getstockquotation 同一接口"""
+    cn_code = _cn(code)
+    url = (
+        f"https://finance.pae.baidu.com/selfselect/getstockquotation?"
+        f"all=1&code={cn_code}&is498=1&isBk=false&isBlock=false"
+        f"&isFutures=false&isStock=true&isIndex=false"
+        f"&market_type=ab&newFormat=1&group=quotation_kline_ab&finClientType=pc"
+    )
+    data = _http_get_json(url)
+    if not data:
+        return None
+
+    r = data.get("Result") or []
+    if not r:
+        return None
+
+    sd = r[0] if isinstance(r, list) else r
+    last = float(sd.get("last", sd.get("price", 0)) or 0)
+    if last <= 0:
+        return None
+
+    prev = float(sd.get("prevClose", sd.get("preClose", 0)) or 0)
+    chg = round(last - prev, 4) if prev else 0
+
+    return {
+        "last": last,
+        "change": chg,
+        "changePercent": round(chg / prev * 100, 2) if prev else 0,
+        "high": float(sd.get("high", 0) or last),
+        "low": float(sd.get("low", 0) or last),
+        "open": float(sd.get("open", 0) or last),
+        "previousClose": prev,
+        "name": str(sd.get("name", sd.get("stockName", ""))),
+        "symbol": cn_code,
+    }
+
+
 # ================================================================
 # Provider 注册
 # ================================================================
@@ -176,11 +215,13 @@ class BaiduDataSource:
     capabilities = {
         "kline": True,
         "kline_priority": 50,
-        "kline_tf": {"15m"},
+        "kline_tf": {"1m", "5m", "15m", "30m", "1H", "1D"},
         "kline_batch": True,
         "kline_batch_priority": 50,
-        "quote": False,
-        "batch_quote": False,
+        "quote": True,
+        "quote_priority": 50,
+        "batch_quote": True,
+        "batch_quote_priority": 50,
         "hk": False,
         "markets": {"CNStock"},
     }
@@ -190,9 +231,9 @@ class BaiduDataSource:
         adj: str = "qfq", timeout: int = 10,
         start_date: str = "", end_date: str = "",
     ) -> List[Dict[str, Any]]:
-        """获取单只股票K线"""
+        """获取单只股票K线。百度API仅支持15m周期，其他周期返回NotSupported。"""
         if timeframe != "15m":
-            return NotSupportedResult(self.name, "fetch_kline", f"不支持 {timeframe} 周期")
+            return NotSupportedResult(self.name, "fetch_kline", f"百度API仅支持15m周期，不支持 {timeframe}")
 
         data = _fetch_baidu_15m(code, count)
         return data if data else []
@@ -202,9 +243,9 @@ class BaiduDataSource:
         adj: str = "qfq", timeout: int = 30,
         start_date: str = "", end_date: str = "",
     ) -> Dict[str, List[Dict[str, Any]]]:
-        """全市场批量K线 — 并发获取"""
+        """全市场批量K线。百度API仅支持15m周期。"""
         if timeframe != "15m":
-            return NotSupportedResult(self.name, "fetch_market_kline", f"不支持 {timeframe} 周期")
+            return NotSupportedResult(self.name, "fetch_market_kline", f"百度API仅支持15m周期，不支持 {timeframe}")
 
         from app.data_sources.provider import _fetch_all_cn_codes
         from queue import Queue, Empty
@@ -264,9 +305,27 @@ class BaiduDataSource:
         return result
 
     def fetch_ticker(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
-        """不支持实时行情"""
-        return NotSupportedResult(self.name, "fetch_ticker")
+        """获取单只股票实时行情"""
+        return _fetch_baidu_quote(code)
 
     def fetch_batch_quotes(self, codes: List[str], timeout: int = 10) -> Dict[str, Dict[str, Any]]:
-        """不支持批量行情"""
-        return NotSupportedResult(self.name, "fetch_batch_quotes")
+        """批量实时行情 — 并发逐只获取"""
+        result: Dict[str, Dict[str, Any]] = {}
+        lock = threading.Lock()
+
+        def _fetch(code):
+            q = _fetch_baidu_quote(code)
+            if q:
+                with lock:
+                    result[_cn(code)] = q
+
+        max_workers = min(len(codes), 10)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futs = [pool.submit(_fetch, c) for c in codes]
+            for f in futs:
+                try:
+                    f.result()
+                except Exception:
+                    pass
+
+        return result
