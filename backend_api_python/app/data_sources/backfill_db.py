@@ -294,7 +294,7 @@ def _should_run_15m() -> tuple[bool, str]:
     # 有记录但无 last_bar_time（旧格式）→ 按间隔判断
     if last_updated:
         elapsed = (now - (last_updated.astimezone(TZ_CN) if last_updated.tzinfo else last_updated.replace(tzinfo=TZ_CN))).total_seconds()
-        if elapsed < 120:
+        if elapsed < 300:
             return False, f"距上次 {elapsed:.0f}s，暂不更新"
         return True, f"距上次 {elapsed:.0f}s，检查新 bar"
 
@@ -515,7 +515,7 @@ class BackfillDB:
             count=None,
             start_date=start_date,
             end_date=end_date,
-            timeout=120,
+            timeout=300,
         )
 
         if not result:
