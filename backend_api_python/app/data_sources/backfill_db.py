@@ -501,7 +501,7 @@ class BackfillDB:
             logger.info(f"[同步] {self.source.name} tf={tf} 增量快照模式")
         else:
             # 历史回填: count=None + start_date=回溯日期 → 并发逐只
-            ref_time = last_bar_time or last_updated
+            ref_time = last_bar_time or last_updated增量快照模式
             start_date, end_date = _date_range_15m(ref_time)
             logger.info(
                 f"[同步] {self.source.name} tf={tf} "

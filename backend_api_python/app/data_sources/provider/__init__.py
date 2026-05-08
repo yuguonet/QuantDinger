@@ -271,23 +271,26 @@ def _resolve_market_kline_count(
     """
     fetch_market_kline 统一路由：决定 count 值和是否走快照路径。
 
-    路由规则（用 end_date 判断，不用 count）:
-      - end_date 是今天（或为空，默认今天）→ 走批量行情快照路径（1 HTTP，1 bar/只）
-      - end_date 是过去日期 → 走并发 fetch_kline 路径，用日期范围推算 count
+    路由规则（end_date 是唯一路由依据，count 和 start_date 不影响路径选择）:
+      - end_date >= today（或为空，默认今天）→ 锁定走批量行情快照路径（1 HTTP，1 bar/只）
+        此时 count 和 start_date 均可推算出 count，但被 end_date>=today 锁定覆盖，
+        返回 None 强制走 _all_market_kline_via_quotes 快照。
+      - end_date < today → 走并发 fetch_kline 路径
+        count 显式传入时直接使用；未传时从 start_date/end_date 推算。
 
     返回值:
-      - None: 走 _all_market_kline_via_quotes 快照路径
+      - None: 走 _all_market_kline_via_quotes 快照路径（end_date>=today 锁定）
       - int:  走并发 fetch_kline 路径，使用此 count 值
     """
     from datetime import datetime, timezone, timedelta
     today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
     effective_end = end_date if end_date else today
 
-    if effective_end == today:
-        # 今日数据 → 走批量行情快照（单次 HTTP 拿全市场最新 bar）
+    if effective_end >= today:
+        # end_date>=today → 走批量行情快照（单次 HTTP 拿全市场最新 bar）
         return None
 
-    # 非今日 → 需要历史数据，推算 count 走并发 fetch_kline
+    # end_date<today → 需要历史数据，推算 count 走并发 fetch_kline
     if count is not None:
         return count
     effective_start = start_date if start_date else effective_end
@@ -300,8 +303,13 @@ def _all_market_kline_via_quotes(
     timeout: int = 15,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
-    count=None 路径：通过 fetch_batch_quotes 一次 HTTP 拿 N 只行情，转成单根 K 线 bar。
-    用于当日实时行情场景，避免并发 N 次 fetch_kline。
+    批量行情快照路径（end_date=today 时锁定走此路径）。
+
+    通过 fetch_batch_quotes 一次 HTTP 拿全市场行情，将每只股票的实时行情
+    转换成单根 K 线 bar 格式返回。count 和 start_date 虽可推算出 count，
+    但被 end_date=today 锁定覆盖，统一走此快照路径。
+
+    返回格式与 fetch_kline 一致：{code: [bar_dict]}，每只股票 1 根 bar。
     """
     quotes = provider.fetch_batch_quotes(_fetch_all_cn_codes(), timeout=timeout)
     if not quotes or isinstance(quotes, NotSupportedResult):

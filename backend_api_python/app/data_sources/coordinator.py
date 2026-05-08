@@ -1055,12 +1055,12 @@ class Coordinator:
             cb:      熔断器
             market:  市场名称（"CNStock" / "HKStock" / ...）
             timeframe: K线周期（"1D" / "5m" / ...）
-            count:   每只股票的数据条数（None 时走批量行情快照路径）
+            count:   每只股票的数据条数（end_date>=today 时忽略，走批量行情快照）
             adj:     复权方式（"qfq" 前复权 / "hfq" 后复权 / "" 不复权）
             timeout: 超时（秒）
             preferred_source: 指定首选源（如 "tencent"），优先尝试
-            start_date: 起始日期（"YYYY-MM-DD"），提供时用交易日历反推 count
-            end_date:   结束日期（"YYYY-MM-DD"），为空则取今天
+            start_date: 起始日期（"YYYY-MM-DD"），end_date>=today 时忽略
+            end_date:   结束日期（"YYYY-MM-DD"），为空则取今天；>=today 走批量快照，<today 仅东财支持
 
         Returns:
             {code: kline_bars} — 仅包含成功获取到数据的代码
@@ -1070,14 +1070,14 @@ class Coordinator:
         # 发现支持 kline_batch 的源（即实现了 fetch_market_kline 的 Provider）
         providers = get_providers(capability="kline_batch", timeframe=timeframe, market=market)
 
-        # 非批量路线提醒：end_date 不是今天时，
-        # Provider 内部会走逐只并发而非单次批量行情快照
+        # 非批量路线提醒：end_date < today 时，
+        # 仅东财支持历史批量K线，其它 Provider 会返回 NotSupportedResult
         from datetime import datetime as _dt, timezone as _tz, timedelta as _td
         today_str = _dt.now(_tz(_td(hours=8))).strftime("%Y-%m-%d")
-        if end_date and end_date != today_str:
+        if end_date and end_date < today_str:
             msg = (
                 f"[协助层] market_kline 非批量路线: end_date={end_date}, "
-                f"today={today_str} → Provider 将走逐只并发 fetch_kline 而非批量行情快照"
+                f"today={today_str} → 仅东财支持历史批量K线，其它源将返回 NotSupportedResult"
             )
             logger.info(msg)
             print(msg)

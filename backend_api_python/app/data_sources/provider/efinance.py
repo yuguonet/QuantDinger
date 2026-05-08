@@ -20,7 +20,7 @@ from app.data_sources.normalizer import to_raw_digits, detect_market
 from app.data_sources.rate_limiter import (
     get_request_headers, retry_with_backoff, RateLimiter,
 )
-from app.data_sources.provider import register
+from app.data_sources.provider import register, NotSupportedResult
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -55,7 +55,13 @@ class EfinanceDataSource:
     }
 
     def fetch_market_kline(self, timeframe="1D", count=300, adj="qfq", timeout=15, start_date="", end_date=""):
-        """全市场批量K线 — count=None 走批量行情（1 HTTP），count 有值走并发 K 线"""
+        """全市场批量K线 — end_date=today 走批量行情快照（1 HTTP），end_date<today 不支持"""
+        from datetime import datetime, timezone, timedelta
+        _today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        effective_end = end_date if end_date else _today
+        if effective_end < _today:
+            return NotSupportedResult(self.name, "fetch_market_kline")
+
         from app.data_sources.provider import _resolve_market_kline_count
         count = _resolve_market_kline_count(timeframe, count, start_date, end_date)
         if count is None:
