@@ -87,9 +87,20 @@ def _refresh_cookie() -> Optional[str]:
         return None
 
 
+def _invalidate_cookie():
+    """清除缓存的 cookie，下次请求强制重新获取"""
+    global _cookie, _cookie_ts
+    with _cookie_lock:
+        _cookie = None
+        _cookie_ts = 0
+
+
 def _get_headers() -> dict:
-    """获取带 cookie 的请求头"""
+    """获取带 cookie 的请求头，cookie 为空时自动重试一次"""
     cookie = _refresh_cookie()
+    if not cookie:
+        _invalidate_cookie()
+        cookie = _refresh_cookie()
     return {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://xueqiu.com/",

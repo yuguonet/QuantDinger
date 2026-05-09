@@ -104,13 +104,14 @@ _discovered = False
 _discover_lock = threading.Lock()
 
 
-def _discover_servers():
-    """并行探测 ExHQ 服务器，按延迟排序"""
+def _discover_servers(force: bool = False):
+    """并行探测 ExHQ 服务器，按延迟排序。force=True 强制重新探测"""
     global _live_servers, _discovered
     with _discover_lock:
-        if _discovered:
+        if _discovered and not force:
             return
         _discovered = True
+        _live_servers = []
 
     results = []
 
@@ -173,6 +174,8 @@ def _get_conn():
                 pass
             _conn_pool.conn = None
 
+    if not _live_servers:
+        _discover_servers(force=True)
     if not _live_servers:
         return None
 
@@ -427,11 +430,6 @@ class TdxExDataSource:
         """启动时探测 ExHQ 服务器"""
         _discover_servers()
 
-
-# 仅在 pytdx 可用时注册，避免 capabilities 声明支持但实际全部 NotSupported
-if HAS_TDX:
-    register(priority=22)(TdxExDataSource)
-
     def fetch_kline(
         self, code: str, timeframe: str = "15m", count: int = 300,
         adj: str = "qfq", timeout: int = 10,
@@ -649,3 +647,8 @@ if HAS_TDX:
             _conn_pool.conn = None
 
         return result
+
+
+# 仅在 pytdx 可用时注册，避免 capabilities 声明支持但实际全部 NotSupported
+if HAS_TDX:
+    register(priority=22)(TdxExDataSource)

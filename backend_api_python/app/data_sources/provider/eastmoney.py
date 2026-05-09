@@ -37,7 +37,7 @@ import requests
 
 from app.data_sources.normalizer import to_raw_digits, detect_market
 from app.data_sources.rate_limiter import (
-    get_request_headers, retry_with_backoff, get_eastmoney_limiter,
+    get_request_headers, retry_with_backoff,
 )
 from app.data_sources.provider import register
 from app.utils.logger import get_logger
@@ -103,7 +103,6 @@ class EastMoneyDataSource:
 
     线程安全性:
       - 实例方法无状态，线程安全
-      - 通过 get_eastmoney_limiter() 进行全局限流
 
     API参数说明:
       - secid: 证券ID，格式为 "市场代码.股票代码"（如 "1.600519"）
@@ -183,7 +182,6 @@ class EastMoneyDataSource:
         klt = _EM_KLT.get(timeframe)
         if klt is None:
             return []
-        get_eastmoney_limiter().wait()
         resp = requests.get(
             "https://49.push2his.eastmoney.com/api/qt/stock/kline/get",
             headers=get_request_headers(referer=_em_quote_referers.next()),
@@ -243,7 +241,6 @@ class EastMoneyDataSource:
         secid = _to_eastmoney_secid(code)
         if not secid:
             return None
-        get_eastmoney_limiter().wait()
         resp = requests.get(
             "https://push2.eastmoney.com/api/qt/stock/get",
             headers=get_request_headers(referer=_em_quote_referers.next()),
@@ -301,7 +298,6 @@ class EastMoneyDataSource:
         if not code_set:
             return {}
         try:
-            get_eastmoney_limiter().wait()
             resp = requests.get(
                 "https://push2.eastmoney.com/api/qt/clist/get",
                 headers=get_request_headers(referer=_em_quote_referers.next()),

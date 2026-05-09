@@ -33,6 +33,97 @@ A股数据源 Provider 框架 — 自注册 + 能力声明 + 统一接口
   Crypto (加密)  → ccxt (binance/okx/bybit)
   Forex (外汇)   → twelvedata / tiingo
   Futures (期货) → ccxt / eastmoney
+
+
+===============================================================================
+Provider 前置依赖管理方案（重要设计决策）
+===============================================================================
+
+背景:
+  部分 Provider 在拉取数据前需要前置准备（如 cookie、服务器探测等）。
+  目前有两种方案，当前使用【方案 A】。
+
+-------------------------------------------------------------------------------
+方案 A — 各源自愈（当前方案）
+-------------------------------------------------------------------------------
+
+  思路: 不改上游 Coordinator，各 Provider 在 fetch 内部自动处理前置依赖。
+  原则: 前置依赖失败时自动重试，上游无感知。
+
+  已实现的自愈机制:
+    - xueqiu:   _get_headers() 中 cookie 为空时自动清除缓存并重试一次。
+                cookie TTL=1h，正常情况 0 开销。
+    - tdx_ex:   _get_conn() 中若 _live_servers 为空，触发 _discover_servers(force=True)
+                重新探测。探测结果缓存，后续请求 0 开销。
+    - eastmoney: 无限流器（已移除 get_eastmoney_limiter().wait()）。
+    - em_trends2: TDX 除权数据懒加载，不需要预热。只返回当天盘中数据是 API 限制。
+
+  最坏开销:
+    - xueqiu cookie 失败: ~700ms/请求，连续 5 次失败后源自动停用，总浪费 ~3.5s
+    - tdx_ex 服务器探测: ~5s（首次请求），后续 0 开销
+    - 对比 prepare() 方案: 最坏多 ~3s，正常情况 0 差距
+
+  优点:
+    - 不改上游 Coordinator，改动面最小
+    - 各源独立自治，互不影响
+    - 对 market_kline 多源并行场景无额外开销
+
+  缺点:
+    - 源首次请求可能有延迟（cookie/探测失败时）
+    - 无统一的"就绪状态"查询接口
+
+-------------------------------------------------------------------------------
+方案 B — 统一 prepare() 接口（备选方案，未实现）
+-------------------------------------------------------------------------------
+
+  思路: 在 BaseDataSource Protocol 中新增 prepare() 方法，上游在批量拉取前
+        统一调用，确保所有源就绪。
+
+  Protocol 定义:
+    class BaseDataSource(Protocol):
+        def prepare(self) -> bool:
+            \"\"\"前置准备（cookie、服务器探测等），返回是否就绪\"\"\"
+            ...
+
+  上游调用点（需改 Coordinator）:
+    1. _discover_sources() 中: 拿到 providers 列表后，逐个调 prepare()，过滤掉返回 False 的
+    2. _make_provider_fetch_fn() 中: fetch_fn 内部在首次调用前调一次 prepare()
+    3. coordinate_market_kline() 中: 启动 worker 前调一次 prepare()
+
+  各源实现:
+    - xueqiu:   prepare() 中刷新 cookie，返回 bool
+    - tdx_ex:   prepare() 中探测服务器（从 __init__ 移过来），返回 bool
+    - eastmoney: prepare() 直接返回 True（无需预热）
+    - em_trends2: prepare() 直接返回 True（除权数据懒加载）
+    - 其他源:    prepare() 默认返回 True
+
+  优点:
+    - 统一模式，上游可控制时机
+    - 失败时立即跳过，不浪费请求
+    - 可查询就绪状态
+
+  缺点:
+    - 需改 Coordinator 多处代码
+    - 多一次函数调用的开销（可忽略）
+    - 对 market_kline 场景，prepare() 本身会阻塞（串行探测所有源）
+
+-------------------------------------------------------------------------------
+切换指南
+-------------------------------------------------------------------------------
+
+  从方案 A 切换到方案 B:
+    1. 在 BaseDataSource Protocol 中添加 prepare() 方法（默认返回 True）
+    2. 各 Provider 实现 prepare():
+       - xueqiu:   调 _refresh_cookie()，返回 cookie 是否有效
+       - tdx_ex:   调 _discover_servers()，返回 _live_servers 是否非空
+       - 其他源:    pass; return True
+    3. 在 Coordinator._discover_sources() 中加入 prepare() 过滤:
+       providers = [p for p in providers if p.prepare()]
+    4. 在 Coordinator._make_provider_fetch_fn() 中加入懒 prepare:
+       if not provider._prepared: provider.prepare()
+    5. 移除各源的自愈逻辑（_get_headers 重试、_get_conn 重探测等）
+
+===============================================================================
 """
 
 from __future__ import annotations
