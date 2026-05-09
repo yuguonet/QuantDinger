@@ -59,7 +59,7 @@ basicinfo_db.py — A股全市场股票基本信息读写
   由 enrich_stock_info(code) 按需单只补充。
 
   UPSERT 冲突策略：
-    - stock_code 已存在 → 更新名称和交易所（这两个可能变）
+    - symbol 已存在 → 更新名称和交易所（这两个可能变）
     - 详情字段（industry/total_mv 等）→ 只在新值非空/非零时覆盖，
       避免"同步代码列表"时把已有的详情冲掉
 
@@ -85,9 +85,9 @@ basicinfo_db.py — A股全市场股票基本信息读写
 
   # 查询
   stock = db.get_stock("600519")
-  # → {"stock_code": "600519", "stock_name": "贵州茅台", "market": "SH", ...}
+  # → {"symbol": "600519", "name": "贵州茅台", "market_cn": "SH", ...}
 
-  all_sz = db.get_all_stocks(market="SZ")
+  all_sz = db.get_all_stocks(market_cn="SZ")
   results = db.search_stocks("茅台")
   count = db.get_stock_count()
 
@@ -127,9 +127,9 @@ MARKET = "CNStock"
 #   - updated_at 自动记录最后写入时间，用于判断数据新鲜度
 TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS stock_basic_info (
-    stock_code    VARCHAR(10)  PRIMARY KEY,   -- 6位纯数字代码，如 600519
-    stock_name    VARCHAR(50)  NOT NULL,       -- 股票简称，如 "贵州茅台"
-    market        VARCHAR(10)  NOT NULL,       -- 交易所：SH(沪) / SZ(深) / BJ(北)
+    symbol    VARCHAR(10)  PRIMARY KEY,   -- 6位纯数字代码，如 600519
+    name    VARCHAR(50)  NOT NULL,       -- 股票简称，如 "贵州茅台"
+    market_cn        VARCHAR(10)  NOT NULL,       -- 交易所：SH(沪) / SZ(深) / BJ(北)
     industry      VARCHAR(50)  DEFAULT '',     -- 所属行业（如 "白酒"），按需补充
     list_date     VARCHAR(20)  DEFAULT '',     -- 上市日期（如 "2001-08-27"），按需补充
     total_mv      DOUBLE PRECISION DEFAULT 0,  -- 总市值（元），按需补充，0 表示未知
@@ -142,11 +142,11 @@ CREATE TABLE IF NOT EXISTS stock_basic_info (
 """
 
 # 索引 DDL。
-# market 索引：按交易所筛选（SH/SZ/BJ）是常见查询
+# market_cn 索引：按交易所筛选（SH/SZ/BJ）是常见查询
 # industry 索引：按行业选股
 # status 索引：过滤退市/停牌股票
 INDEX_DDLS = [
-    "CREATE INDEX IF NOT EXISTS idx_stock_basic_market   ON stock_basic_info (market)",
+    "CREATE INDEX IF NOT EXISTS idx_stock_basic_market   ON stock_basic_info (market_cn)",
     "CREATE INDEX IF NOT EXISTS idx_stock_basic_industry ON stock_basic_info (industry)",
     "CREATE INDEX IF NOT EXISTS idx_stock_basic_status   ON stock_basic_info (status)",
 ]
@@ -279,9 +279,9 @@ class StockBasicDB:
           - 比逐条 execute 快 5-10 倍（减少网络往返）
           - page_size=1000：每 1000 条一批发送给 PostgreSQL
 
-        ON CONFLICT (stock_code) DO UPDATE：主键冲突时走更新逻辑。
+        ON CONFLICT (symbol) DO UPDATE：主键冲突时走更新逻辑。
         更新策略是"非空覆盖"：
-          - stock_name / market：直接覆盖（名称和交易所可能变更）
+          - name / market：直接覆盖（名称和交易所可能变更）
           - industry / list_date：新值非空时覆盖，否则保留旧值
           - total_mv / circ_mv / pe_ratio / pb_ratio：新值非零时覆盖
           - status / updated_at：直接覆盖
@@ -303,8 +303,8 @@ class StockBasicDB:
           正常数据仍走批量，最坏情况（每批都有脏数据）也只需 ~13 层递归。
 
         ── Args ──
-            stocks: 股票信息列表，每条至少包含 stock_code 和 stock_name
-                    可选字段: market, industry, list_date, total_mv, circ_mv,
+            stocks: 股票信息列表，每条至少包含 symbol 和 name
+                    可选字段: market_cn, industry, list_date, total_mv, circ_mv,
                               pe_ratio, pb_ratio, status
 
         ── Returns ──
@@ -331,22 +331,22 @@ class StockBasicDB:
         valid_rows = []
         skipped = 0
         for item in stocks:
-            code = (item.get("stock_code") or "").strip()
-            name = (item.get("stock_name") or "").strip()
+            code = (item.get("symbol") or "").strip()
+            name = (item.get("name") or "").strip()
             # 必须有代码和名称
             if not code or not name:
                 skipped += 1
                 continue
             # 必须能识别交易所（可以从输入取，也可以从代码推断）
-            market = item.get("market") or _detect_market(code)
-            if not market:
+            market_cn = item.get("market_cn") or _detect_market(code)
+            if not market_cn:
                 skipped += 1
                 continue
             # 组装 tuple，顺序与 INSERT 列顺序一致
             valid_rows.append((
-                code,                            # stock_code
-                name,                            # stock_name
-                market,                          # market
+                code,                            # symbol
+                name,                            # name
+                market_cn,                          # market_cn
                 item.get("industry", ""),        # industry（默认空串）
                 item.get("list_date", ""),       # list_date（默认空串）
                 float(item.get("total_mv", 0) or 0),   # total_mv（None → 0）
@@ -368,13 +368,13 @@ class StockBasicDB:
 
         sql = """
             INSERT INTO stock_basic_info
-                (stock_code, stock_name, market, industry, list_date,
+                (symbol, name, market_cn, industry, list_date,
                  total_mv, circ_mv, pe_ratio, pb_ratio, status, updated_at)
             VALUES %s
-            ON CONFLICT (stock_code) DO UPDATE SET
+            ON CONFLICT (symbol) DO UPDATE SET
                 -- 名称和交易所：直接覆盖（可能变更，如 ST 摘帽/更名）
-                stock_name = EXCLUDED.stock_name,
-                market     = EXCLUDED.market,
+                name = EXCLUDED.name,
+                market_cn     = EXCLUDED.market_cn,
                 -- 详情字段：只在新值有意义时覆盖，否则保留 DB 中已有的值
                 -- COALESCE(NULLIF(new, ''), old) 含义：
                 --   如果 new 是空串 → NULLIF 返回 NULL → COALESCE 返回 old
@@ -506,9 +506,9 @@ class StockBasicDB:
         pool = self._get_pool()
         with pool.cursor() as cur:
             cur.execute(
-                "SELECT stock_code, stock_name, market, industry, list_date, "
+                "SELECT symbol, name, market_cn, industry, list_date, "
                 "       total_mv, circ_mv, pe_ratio, pb_ratio, status, updated_at "
-                "FROM stock_basic_info WHERE stock_code = %s",
+                "FROM stock_basic_info WHERE symbol = %s",
                 (code,),
             )
             row = cur.fetchone()
@@ -519,28 +519,28 @@ class StockBasicDB:
 
     def get_all_stocks(
         self,
-        market: str = None,
+        market_cn: str = None,
         status: str = "active",
     ) -> List[Dict[str, Any]]:
         """
         查询全部股票（可按交易所和状态过滤）。
 
         Args:
-            market: 过滤交易所 "SH"/"SZ"/"BJ"，None 返回全部
+            market_cn: 过滤交易所 "SH"/"SZ"/"BJ"，None 返回全部
             status: 过滤状态，默认 "active"（只返回正常上市股票），
                     传 None 不过滤（含停牌/退市）
 
         Returns:
-            股票列表，按 stock_code 升序排列
+            股票列表，按 symbol 升序排列
         """
         self.ensure_table()
 
         # 动态拼接 WHERE 条件（参数化，无 SQL 注入风险）
         conditions = []
         params = []
-        if market:
-            conditions.append("market = %s")
-            params.append(market.upper())  # 统一大写，避免 "sh" 匹配不到
+        if market_cn:
+            conditions.append("market_cn = %s")
+            params.append(market_cn.upper())  # 统一大写，避免 "sh" 匹配不到
         if status:
             conditions.append("status = %s")
             params.append(status)
@@ -550,9 +550,9 @@ class StockBasicDB:
         pool = self._get_pool()
         with pool.cursor() as cur:
             cur.execute(
-                f"SELECT stock_code, stock_name, market, industry, list_date, "
+                f"SELECT symbol, name, market_cn, industry, list_date, "
                 f"       total_mv, circ_mv, pe_ratio, pb_ratio, status, updated_at "
-                f"FROM stock_basic_info {where} ORDER BY stock_code",
+                f"FROM stock_basic_info {where} ORDER BY symbol",
                 params,
             )
             rows = cur.fetchall()
@@ -563,7 +563,7 @@ class StockBasicDB:
         """
         按代码或名称模糊搜索股票。
 
-        使用 LIKE '%keyword%' 模式匹配，同时搜索 stock_code 和 stock_name。
+        使用 LIKE '%keyword%' 模式匹配，同时搜索 symbol 和 stock_name。
         只返回 status='active' 的正常上市股票。
 
         Args:
@@ -571,7 +571,7 @@ class StockBasicDB:
             limit:   最大返回条数，默认 20
 
         Returns:
-            匹配的股票列表，按 stock_code 升序
+            匹配的股票列表，按 symbol 升序
         """
         self.ensure_table()
 
@@ -584,35 +584,35 @@ class StockBasicDB:
         pool = self._get_pool()
         with pool.cursor() as cur:
             cur.execute(
-                "SELECT stock_code, stock_name, market, industry, list_date, "
+                "SELECT symbol, name, market_cn, industry, list_date, "
                 "       total_mv, circ_mv, pe_ratio, pb_ratio, status, updated_at "
                 "FROM stock_basic_info "
-                "WHERE (stock_code LIKE %s OR stock_name LIKE %s) AND status = 'active' "
-                "ORDER BY stock_code LIMIT %s",
+                "WHERE (symbol LIKE %s OR name LIKE %s) AND status = 'active' "
+                "ORDER BY symbol LIMIT %s",
                 (kw, kw, limit),
             )
             rows = cur.fetchall()
 
         return [self._row_to_dict(r) for r in rows]
 
-    def get_stock_count(self, market: str = None) -> int:
+    def get_stock_count(self, market_cn: str = None) -> int:
         """
         获取股票总数（只计 active 状态）。
 
         Args:
-            market: 按交易所过滤，None 返回全市场总数
+            market_cn: 按交易所过滤，None 返回全市场总数
 
         Returns:
             股票数量
         """
         self.ensure_table()
         pool = self._get_pool()
-        if market:
+        if market_cn:
             with pool.cursor() as cur:
                 cur.execute(
                     "SELECT COUNT(*) FROM stock_basic_info "
-                    "WHERE market = %s AND status = 'active'",
-                    (market.upper(),),
+                    "WHERE market_cn = %s AND status = 'active'",
+                    (market_cn.upper(),),
                 )
                 return cur.fetchone()[0]
         else:
@@ -646,7 +646,7 @@ class StockBasicDB:
 
         Returns:
             {
-                "market": str,          -- 所属市场 "CNStock"
+                "market_cn": str,          -- 所属市场 "CNStock"
                 "db_name": str,         -- 数据库名 "CNStock_db"
                 "total": int,           -- 总记录数（含 active + 非 active）
                 "active": int,          -- active 状态的记录数
@@ -667,8 +667,8 @@ class StockBasicDB:
             active = cur.fetchone()[0]
             # 按交易所分组统计
             cur.execute(
-                "SELECT market, COUNT(*) FROM stock_basic_info "
-                "WHERE status = 'active' GROUP BY market ORDER BY market"
+                "SELECT market_cn, COUNT(*) FROM stock_basic_info "
+                "WHERE status = 'active' GROUP BY market_cn ORDER BY market_cn"
             )
             by_market = {r[0]: r[1] for r in cur.fetchall()}
             # 最后更新时间
@@ -677,7 +677,7 @@ class StockBasicDB:
 
         from app.utils.db_multi import _market_db_name
         return {
-            "market": MARKET,
+            "market_cn": MARKET,
             "db_name": _market_db_name(MARKET),
             "total": total,
             "active": active,
@@ -775,7 +775,7 @@ class StockBasicDB:
         避免并发请求触发东财反爬。
 
         ── Returns ──
-            [{"stock_code": "600519", "stock_name": "贵州茅台", "market": "SH"}, ...]
+            [{"symbol": "600519", "name": "贵州茅台", "market_cn": "SH"}, ...]
             失败返回 []
         """
         try:
@@ -824,9 +824,9 @@ class StockBasicDB:
                 # 过滤无效数据：必须是 6 位纯数字
                 if code and name and len(code) == 6 and code.isdigit():
                     result.append({
-                        "stock_code": code,
-                        "stock_name": name,
-                        "market": _detect_market(code),  # 从代码推断交易所
+                        "symbol": code,
+                        "name": name,
+                        "market_cn": _detect_market(code),  # 从代码推断交易所
                     })
 
             logger.info(f"[东财] 获取 A 股列表: {len(result)} 只")
@@ -848,7 +848,7 @@ class StockBasicDB:
         AkShare 底层会发 HTTP 请求，需要限流避免被封。
 
         ── Returns ──
-            [{"stock_code": "600519", "stock_name": "贵州茅台", "market": "SH"}, ...]
+            [{"symbol": "600519", "name": "贵州茅台", "market_cn": "SH"}, ...]
             失败返回 []
         """
         try:
@@ -867,9 +867,9 @@ class StockBasicDB:
                 # 过滤无效数据
                 if code and name and len(code) == 6 and code.isdigit():
                     result.append({
-                        "stock_code": code,
-                        "stock_name": name,
-                        "market": _detect_market(code),
+                        "symbol": code,
+                        "name": name,
+                        "market_cn": _detect_market(code),
                     })
 
             logger.info(f"[AkShare] 获取 A 股列表: {len(result)} 只")
@@ -893,7 +893,7 @@ class StockBasicDB:
 
         数据来源：AStockDataSource.get_stock_info()
           - 内部走 AkShare → 东财 fallback 链
-          - 返回: stock_name, industry, listed_date, total_mv, circ_mv, pe_ratio, pb_ratio
+          - 返回: name, industry, listed_date, total_mv, circ_mv, pe_ratio, pb_ratio
 
         写入策略：UPDATE + 非空覆盖（与 upsert_stocks 一致）
           - 行业/上市日期：新值非空时覆盖
@@ -936,7 +936,7 @@ class StockBasicDB:
                     pe_ratio   = CASE WHEN %s != 0 THEN %s ELSE pe_ratio END,
                     pb_ratio   = CASE WHEN %s != 0 THEN %s ELSE pb_ratio END,
                     updated_at = %s
-                WHERE stock_code = %s
+                WHERE symbol = %s
             """, (
                 info.get("industry", ""),       # 新行业
                 info.get("listed_date", ""),     # 新上市日期
@@ -963,16 +963,16 @@ class StockBasicDB:
         将数据库行 tuple 转为字典。
 
         列顺序与 SELECT 语句一致：
-          0: stock_code, 1: stock_name, 2: market, 3: industry,
+          0: symbol, 1: name, 2: market_cn, 3: industry,
           4: list_date,  5: total_mv,   6: circ_mv, 7: pe_ratio,
           8: pb_ratio,   9: status,     10: updated_at
 
         注意：float(row[x] or 0) 处理 NULL → 0.0 的转换。
         """
         return {
-            "stock_code": row[0],
-            "stock_name": row[1],
-            "market":     row[2],
+            "symbol": row[0],
+            "name": row[1],
+            "market_cn":     row[2],
             "industry":   row[3],
             "list_date":  row[4],
             "total_mv":   float(row[5] or 0),
