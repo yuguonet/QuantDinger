@@ -162,25 +162,11 @@ class TencentDataSource:
     }
 
     def fetch_market_kline(
-        self, timeframe: str = "1D", count: int = None,
+        self, timeframe: str = "1D", count: int = 300,
         adj: str = "qfq", timeout: int = 15,
         start_date: str = "", end_date: str = "",
     ) -> Dict[str, List[Dict[str, Any]]]:
-        """
-        全市场批量K线 — end_date=today 走批量行情快照（1 HTTP），end_date<today 不支持。
-        """
-        from datetime import datetime, timezone, timedelta
-        _today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
-        effective_end = end_date if end_date else _today
-        if effective_end < _today:
-            return NotSupportedResult(self.name, "fetch_market_kline")
-
-        from app.data_sources.provider import _resolve_market_kline_count
-        count = _resolve_market_kline_count(timeframe, count, start_date, end_date)
-        if count is None:
-            from app.data_sources.provider import _all_market_kline_via_quotes
-            return _all_market_kline_via_quotes(self, timeframe=timeframe, timeout=timeout)
-
+        """全市场批量K线 — 并发 fetch_kline，支持历史数据"""
         from app.data_sources.provider import _batch_fetch_kline_by_codes
         return _batch_fetch_kline_by_codes(
             self, timeframe=timeframe, count=count, adj=adj, timeout=timeout,

@@ -208,6 +208,148 @@ def _fetch_sina_kline_hisdata(sc: str, count: int, timeout: int) -> List[Dict[st
     return out
 
 
+# ═══════════════ 前复权计算（从 TDX 获取除权除息数据）═══════════════
+_xdxr_cache: Dict[str, list] = {}
+_xdxr_lock = threading.Lock()
+HAS_TDX = False
+_tdx_live_servers: list = []
+
+try:
+    from pytdx.hq import TdxHq_API
+    HAS_TDX = True
+except ImportError:
+    pass
+
+if HAS_TDX:
+    _TDX_CANDIDATE_SERVERS = [
+        ("180.153.18.170", 7709), ("60.191.117.167", 7709), ("60.12.136.251", 7709),
+        ("60.12.136.250", 7709), ("115.238.90.165", 7709), ("218.75.126.9", 7709),
+        ("115.238.56.198", 7709), ("119.147.212.81", 7709), ("112.74.214.43", 7709),
+    ]
+
+    def _tdx_discover():
+        import socket
+        results = []
+        def _probe(host, port):
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(2)
+                s.connect((host, port))
+                s.close()
+                api = TdxHq_API()
+                api.connect(host, port, time_out=3)
+                api.get_security_bars(1, 0, '000001', 0, 1)
+                api.disconnect()
+                results.append((host, port))
+            except Exception:
+                pass
+        threads = [threading.Thread(target=_probe, args=(h, p), daemon=True)
+                   for h, p in _TDX_CANDIDATE_SERVERS]
+        for t in threads: t.start()
+        for t in threads: t.join(timeout=5)
+        return results
+
+    _tdx_live_servers = _tdx_discover()
+
+
+def _fetch_xdxr(code: str) -> list:
+    if not HAS_TDX or not _tdx_live_servers:
+        return []
+    nc = code.strip().upper()
+    if nc.startswith("6"):
+        market, symbol = 1, nc
+    else:
+        market, symbol = 0, nc
+    for host, port in _tdx_live_servers[:3]:
+        try:
+            api = TdxHq_API()
+            api.connect(host, port, time_out=3)
+            xdxr = api.get_xdxr_info(market, symbol)
+            api.disconnect()
+            if xdxr:
+                return xdxr
+            return []
+        except Exception:
+            continue
+    return []
+
+
+def _build_fwd_factor(code: str) -> list:
+    with _xdxr_lock:
+        if code in _xdxr_cache:
+            return _xdxr_cache[code]
+    xdxr = _fetch_xdxr(code)
+    if not xdxr:
+        with _xdxr_lock:
+            _xdxr_cache[code] = []
+        return []
+    events = []
+    for r in xdxr:
+        try:
+            if int(r.get('category', 0)) != 1:
+                continue
+            y = int(r.get('year', 0))
+            m = int(r.get('month', 0))
+            d = int(r.get('day', 0))
+            if y < 2000:
+                continue
+            date_str = f"{y:04d}-{m:02d}-{d:02d}"
+            fenhong = float(r.get('fenhong', 0) or 0)
+            songzhuangu = float(r.get('songzhuangu', 0) or 0)
+            peigujia = float(r.get('peigujia', 0) or 0)
+            peigu = float(r.get('peigu', 0) or 0)
+            if fenhong == 0 and songzhuangu == 0 and peigu == 0:
+                continue
+            events.append((date_str, fenhong, songzhuangu / 10.0, peigujia, peigu / 10.0))
+        except Exception:
+            continue
+    if not events:
+        with _xdxr_lock:
+            _xdxr_cache[code] = []
+        return []
+    events.sort(key=lambda x: x[0])
+    cum = 1.0
+    result = []
+    for date_str, fenhong, sg_ratio, pgj, pg_ratio in events:
+        divisor = 1.0 + sg_ratio + pg_ratio
+        if divisor > 0:
+            cum *= (1.0 / divisor)
+        if fenhong > 0:
+            cum *= (10.0 - fenhong) / 10.0
+        result.append((date_str, cum))
+    with _xdxr_lock:
+        _xdxr_cache[code] = result
+    return result
+
+
+def _apply_fwd_adjust(klines: list, code: str) -> list:
+    if not klines:
+        return klines
+    factors = _build_fwd_factor(code)
+    if not factors:
+        return klines
+    adjusted = []
+    factor_idx = 0
+    current_factor = 1.0
+    for bar in klines:
+        bar_date = bar["time"][:10]
+        while factor_idx < len(factors) and factors[factor_idx][0] <= bar_date:
+            current_factor = factors[factor_idx][1]
+            factor_idx += 1
+        if current_factor < 1.0:
+            adjusted.append({
+                "time": bar["time"],
+                "open": round(bar["open"] * current_factor, 4),
+                "high": round(bar["high"] * current_factor, 4),
+                "low": round(bar["low"] * current_factor, 4),
+                "close": round(bar["close"] * current_factor, 4),
+                "volume": bar["volume"],
+            })
+        else:
+            adjusted.append(bar)
+    return adjusted
+
+
 @register(priority=20)
 class SinaDataSource:
     """
@@ -241,25 +383,11 @@ class SinaDataSource:
     }
 
     def fetch_market_kline(
-        self, timeframe: str = "1D", count: int = None,
+        self, timeframe: str = "1D", count: int = 300,
         adj: str = "qfq", timeout: int = 15,
         start_date: str = "", end_date: str = "",
     ) -> Dict[str, List[Dict[str, Any]]]:
-        """
-        全市场批量K线 — end_date=today 走批量行情快照（1 HTTP），end_date<today 不支持。
-        """
-        from datetime import datetime, timezone, timedelta
-        _today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
-        effective_end = end_date if end_date else _today
-        if effective_end < _today:
-            return NotSupportedResult(self.name, "fetch_market_kline")
-
-        from app.data_sources.provider import _resolve_market_kline_count
-        count = _resolve_market_kline_count(timeframe, count, start_date, end_date)
-        if count is None:
-            from app.data_sources.provider import _all_market_kline_via_quotes
-            return _all_market_kline_via_quotes(self, timeframe=timeframe, timeout=timeout)
-
+        """全市场批量K线 — 并发 fetch_kline，支持历史数据"""
         from app.data_sources.provider import _batch_fetch_kline_by_codes
         return _batch_fetch_kline_by_codes(
             self, timeframe=timeframe, count=count, adj=adj, timeout=timeout,
@@ -286,8 +414,12 @@ class SinaDataSource:
             return []
         _sina_limiter.wait()
         if timeframe != "1D":
-            return self._fetch_minute_kline(sc, scale, count, timeout)
-        return self._fetch_raw_daily_kline(sc, count, timeout)
+            bars = self._fetch_minute_kline(sc, scale, count, timeout)
+        else:
+            bars = self._fetch_raw_daily_kline(sc, count, timeout)
+        if bars and adj in ("qfq", "hfq"):
+            bars = _apply_fwd_adjust(bars, code)
+        return bars
 
     def _fetch_raw_daily_kline(self, sc: str, count: int, timeout: int) -> List[Dict[str, Any]]:
         url = "https://vip.stock.finance.sina.com.cn/cn/api/json.php/CN_MarketDataService.getKLineData"

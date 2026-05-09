@@ -55,7 +55,7 @@ sys.modules["flask_cors"] = _fc
 _MOCKED_MODULES = [
     "ccxt", "yfinance", "yfinance.shared", "akshare",
     "finnhub", "ib_insync", "redis", "bcrypt", "bip_utils",
-    "gunicorn", "baostock", "efinance", "pytdx", "pytdx.hq",
+    "gunicorn", "baostock", "pytdx", "pytdx.hq",
     "pandas", "pyarrow", "pydantic",
     "jwt", "cryptography", "socks",
     "sqlalchemy", "sqlalchemy.orm", "sqlalchemy.ext",

@@ -253,26 +253,6 @@ SOURCE_CONFIGS: Dict[str, SourceConfig] = {
         batch_size=500,
     ),
 
-    # efinance — 封装东财接口，简洁高效
-    # max_workers=3，仅支持 A 股
-    "efinance": SourceConfig(
-        name="efinance",
-        max_workers=3,
-        markets={"CNStock"},
-        batch_capable=True,
-        batch_size=500,
-    ),
-
-    # 华泰证券 — 券商级别数据源
-    # max_workers=2（券商接口频率限制较严）
-    "huatai": SourceConfig(
-        name="huatai",
-        max_workers=2,
-        markets={"CNStock"},
-        batch_capable=True,
-        batch_size=500,
-    ),
-
     # BaoStock — TCP 协议直连，无需 API Key
     # max_workers=2（TCP 连接数有限）
     "baostock": SourceConfig(
@@ -281,26 +261,6 @@ SOURCE_CONFIGS: Dict[str, SourceConfig] = {
         markets={"CNStock"},
         batch_capable=False,
         batch_size=1,
-    ),
-
-    # vnpy — 量化交易框架数据服务
-    # max_workers=2
-    "vnpy": SourceConfig(
-        name="vnpy",
-        max_workers=2,
-        markets={"CNStock"},
-        batch_capable=False,
-        batch_size=1,
-    ),
-
-    # 聚宽 — 量化平台公开接口
-    # max_workers=2
-    "joinquant": SourceConfig(
-        name="joinquant",
-        max_workers=2,
-        markets={"CNStock"},
-        batch_capable=True,
-        batch_size=500,
     ),
 
     # 港股专用源 — 仅支持港股，不支持批量

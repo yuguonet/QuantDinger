@@ -169,40 +169,8 @@ class AkShareDataSource:
         adj: str = "qfq", timeout: int = 15,
         start_date: str = "", end_date: str = "",
     ) -> Dict[str, List[Dict[str, Any]]]:
-        """全市场批量K线 — end_date=today 走批量行情快照（1 HTTP），end_date<today 不支持"""
-        from datetime import datetime, timezone, timedelta
-        _today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
-        effective_end = end_date if end_date else _today
-        if effective_end < _today:
-            return NotSupportedResult(self.name, "fetch_market_kline")
-
-        from app.data_sources.provider import _resolve_market_kline_count
-        count = _resolve_market_kline_count(timeframe, count, start_date, end_date)
-        if count is None:
-            from app.data_sources.provider import _all_market_kline_via_quotes
-            return _all_market_kline_via_quotes(self, timeframe=timeframe, timeout=timeout)
-
-        from app.data_sources.provider import _fetch_all_cn_codes
-        codes = _fetch_all_cn_codes()
-        if not codes:
-            return {}
-        import concurrent.futures
-        result: Dict[str, List[Dict[str, Any]]] = {}
-
-        def _fetch_one(code: str):
-            return code, self.fetch_kline(code, timeframe, count, adj=adj, timeout=timeout, start_date=start_date, end_date=end_date)
-
-        max_workers = min(len(codes), 8)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = [pool.submit(_fetch_one, c) for c in codes]
-            for f in concurrent.futures.as_completed(futures):
-                try:
-                    code, bars = f.result()
-                    if bars:
-                        result[code] = bars
-                except Exception:
-                    pass
-        return result
+        """全市场批量K线 — 不支持"""
+        return NotSupportedResult(self.name, "fetch_market_kline")
 
     def fetch_kline(
         self, code: str, timeframe: str = "1D", count: int = 300,

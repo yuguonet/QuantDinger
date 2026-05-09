@@ -65,31 +65,8 @@ class TwelveDataSource:
                     "batch_quote": False, "batch_quote_priority": 100, "hk": True, "markets": {"CNStock", "HKStock"}}
 
     def fetch_market_kline(self, timeframe="1D", count=300, adj="qfq", timeout=15, start_date="", end_date=""):
-        """全市场批量K线 — end_date=today 走批量行情快照（1 HTTP），end_date<today 不支持"""
-        from datetime import datetime, timezone, timedelta
-        _today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
-        effective_end = end_date if end_date else _today
-        if effective_end < _today:
-            return NotSupportedResult(self.name, "fetch_market_kline")
-
-        from app.data_sources.provider import _resolve_market_kline_count
-        count = _resolve_market_kline_count(timeframe, count, start_date, end_date)
-        if count is None:
-            from app.data_sources.provider import _all_market_kline_via_quotes
-            return _all_market_kline_via_quotes(self, timeframe=timeframe, timeout=timeout)
-
-        from app.data_sources.provider import _fetch_all_cn_codes
-        codes = _fetch_all_cn_codes()
-        if not codes: return {}
-        import concurrent.futures; result = {}
-        def _f(c): return c, self.fetch_kline(c, timeframe, count, adj=adj, timeout=timeout, start_date=start_date, end_date=end_date)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(codes), 8)) as pool:
-            for fut in concurrent.futures.as_completed([pool.submit(_f, c) for c in codes]):
-                try:
-                    c, bars = fut.result()
-                    if bars: result[c] = bars
-                except Exception: pass
-        return result
+        """全市场批量K线 — 不支持"""
+        return NotSupportedResult(self.name, "fetch_market_kline")
 
     def fetch_kline(self, code, timeframe="1D", count=300, adj="qfq", timeout=15, start_date="", end_date=""):
         api_key = _get_api_key()
