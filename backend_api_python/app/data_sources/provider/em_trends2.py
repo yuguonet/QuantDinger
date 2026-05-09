@@ -190,212 +190,9 @@ def _last_n_bars(klines: list, n: int = BAR_LIMIT) -> Optional[list]:
 
 
 # ================================================================
-# 前复权计算（从 TDX 获取除权除息数据）
+# 前复权（共享模块）
 # ================================================================
-
-_xdxr_cache: Dict[str, list] = {}
-_xdxr_lock = threading.Lock()
-
-# TDX 候选服务器
-TDX_CANDIDATE_SERVERS = [
-    ("180.153.18.170", 7709), ("60.191.117.167", 7709), ("60.12.136.251", 7709),
-    ("60.12.136.250", 7709), ("115.238.90.165", 7709), ("218.75.126.9", 7709),
-    ("115.238.56.198", 7709), ("119.147.212.81", 7709), ("112.74.214.43", 7709),
-    ("221.231.141.60", 7709), ("101.227.73.20", 7709), ("101.227.77.254", 7709),
-]
-
-_tdx_live_servers: list = []
-_tdx_server_lock = threading.Lock()
-_tdx_server_idx = [0]
-HAS_TDX = False
-
-try:
-    from pytdx.hq import TdxHq_API
-    HAS_TDX = True
-except ImportError:
-    pass
-
-
-def _tdx_discover():
-    """并行探测 TDX 服务器，按延迟排序"""
-    global _tdx_live_servers
-    import socket
-    results = []
-
-    def _probe(host, port):
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(2)
-            t0 = time.time()
-            s.connect((host, port))
-            lat = time.time() - t0
-            s.close()
-            try:
-                api = TdxHq_API()
-                api.connect(host, port, time_out=3)
-                api.get_security_bars(1, 0, '000001', 0, 1)
-                api.disconnect()
-                results.append((host, port, lat))
-            except Exception:
-                pass
-        except Exception:
-            pass
-
-    threads = [threading.Thread(target=_probe, args=(h, p), daemon=True)
-               for h, p in TDX_CANDIDATE_SERVERS]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=5)
-    results.sort(key=lambda x: x[2])
-    _tdx_live_servers = [(h, p) for h, p, _ in results]
-    return _tdx_live_servers
-
-
-# TDX 连接池
-_tdx_conn_pool = threading.local()
-
-
-def _tdx_get_conn():
-    """获取当前线程的 TDX 连接"""
-    conn = getattr(_tdx_conn_pool, 'conn', None)
-    if conn:
-        try:
-            conn.get_security_count(0)
-            return conn
-        except Exception:
-            try:
-                conn.disconnect()
-            except Exception:
-                pass
-            _tdx_conn_pool.conn = None
-
-    if not _tdx_live_servers:
-        return None
-
-    n = len(_tdx_live_servers)
-    for _ in range(n):
-        with _tdx_server_lock:
-            idx = _tdx_server_idx[0] % n
-            _tdx_server_idx[0] += 1
-        host, port = _tdx_live_servers[idx]
-        try:
-            api = TdxHq_API()
-            api.connect(host, port, time_out=3)
-            _tdx_conn_pool.conn = api
-            return api
-        except Exception:
-            continue
-    return None
-
-
-def _fetch_xdxr(code: str) -> list:
-    """从 TDX 获取除权除息数据"""
-    if not HAS_TDX or not _tdx_live_servers:
-        return []
-    nc = _normalize(code)
-    market = 1 if nc.startswith("sh") else 0
-    symbol = nc[2:]
-    for host, port in _tdx_live_servers[:3]:
-        try:
-            api = TdxHq_API()
-            api.connect(host, port, time_out=3)
-            xdxr = api.get_xdxr_info(market, symbol)
-            api.disconnect()
-            if xdxr:
-                return xdxr
-            return []
-        except Exception:
-            continue
-    return []
-
-
-def _build_fwd_factor(code: str) -> list:
-    """构建前复权因子: 返回 [(date_str, cum_factor), ...] 按日期升序"""
-    with _xdxr_lock:
-        if code in _xdxr_cache:
-            return _xdxr_cache[code]
-
-    xdxr = _fetch_xdxr(code)
-    if not xdxr:
-        with _xdxr_lock:
-            _xdxr_cache[code] = []
-        return []
-
-    events = []
-    for r in xdxr:
-        try:
-            if int(r.get('category', 0)) != 1:
-                continue
-            y = int(r.get('year', 0))
-            m = int(r.get('month', 0))
-            d = int(r.get('day', 0))
-            if y < 2000:
-                continue
-            date_str = f"{y:04d}-{m:02d}-{d:02d}"
-            fenhong = float(r.get('fenhong', 0) or 0)
-            songzhuangu = float(r.get('songzhuangu', 0) or 0)
-            peigujia = float(r.get('peigujia', 0) or 0)
-            peigu = float(r.get('peigu', 0) or 0)
-            if fenhong == 0 and songzhuangu == 0 and peigu == 0:
-                continue
-            events.append((date_str, fenhong, songzhuangu / 10.0, peigujia, peigu / 10.0))
-        except Exception:
-            continue
-
-    if not events:
-        with _xdxr_lock:
-            _xdxr_cache[code] = []
-        return []
-
-    events.sort(key=lambda x: x[0])
-
-    cum = 1.0
-    result = []
-    for date_str, fenhong, sg_ratio, pgj, pg_ratio in events:
-        divisor = 1.0 + sg_ratio + pg_ratio
-        if divisor > 0:
-            cum *= (1.0 / divisor)
-        if fenhong > 0:
-            cum *= (10.0 - fenhong) / 10.0
-        result.append((date_str, cum))
-
-    with _xdxr_lock:
-        _xdxr_cache[code] = result
-    return result
-
-
-def _apply_fwd_adjust(klines: list, code: str) -> list:
-    """对不复权K线数据施加前复权"""
-    if not klines:
-        return klines
-    factors = _build_fwd_factor(code)
-    if not factors:
-        return klines
-
-    adjusted = []
-    factor_idx = 0
-    current_factor = 1.0
-
-    for bar in klines:
-        bar_date = str(bar.get("time", ""))[:10]
-        while factor_idx < len(factors) and factors[factor_idx][0] <= bar_date:
-            current_factor = factors[factor_idx][1]
-            factor_idx += 1
-
-        if current_factor < 1.0:
-            adjusted.append(_k(
-                bar["time"],
-                bar["open"] * current_factor,
-                bar["high"] * current_factor,
-                bar["low"] * current_factor,
-                bar["close"] * current_factor,
-                bar["volume"],
-                bar.get("amount", 0),
-            ))
-        else:
-            adjusted.append(bar)
-    return adjusted
+from app.data_sources.provider.adjustment import apply_fwd_adjust
 
 
 # ================================================================
@@ -554,13 +351,7 @@ class EmTrends2DataSource:
     }
 
     def __init__(self):
-        """初始化: 探测 TDX 服务器（用于前复权）"""
-        if HAS_TDX and not _tdx_live_servers:
-            try:
-                _tdx_discover()
-                logger.info("[EmTrends2] TDX 服务器探测完成: %d 个可用", len(_tdx_live_servers))
-            except Exception as e:
-                logger.warning("[EmTrends2] TDX 探测失败: %s", e)
+        pass
 
     def fetch_kline(
         self, code: str, timeframe: str = "15m", count: int = 200,
@@ -603,27 +394,7 @@ class EmTrends2DataSource:
 
         # 前复权处理
         if adj == "qfq" and result:
-            result = _apply_fwd_adjust(result, code)
-            # 转换回标准格式（_apply_fwd_adjust 返回 _k 格式）
-            converted = []
-            for bar in result:
-                try:
-                    ts_str = str(bar.get("time", ""))
-                    if "-" in ts_str and ":" in ts_str:
-                        ts = int(datetime.strptime(ts_str[:16], "%Y-%m-%d %H:%M").timestamp())
-                    else:
-                        ts = int(float(ts_str))
-                    converted.append({
-                        "time": ts,
-                        "open": round(float(bar["open"]), 4),
-                        "high": round(float(bar["high"]), 4),
-                        "low": round(float(bar["low"]), 4),
-                        "close": round(float(bar["close"]), 4),
-                        "volume": round(float(bar["volume"]), 2),
-                    })
-                except (ValueError, TypeError, KeyError):
-                    continue
-            result = converted
+            result = apply_fwd_adjust(result, code)
 
         return result[-count:] if len(result) > count else result
 
@@ -692,26 +463,7 @@ class EmTrends2DataSource:
 
                     # 前复权
                     if adj == "qfq" and bars:
-                        bars = _apply_fwd_adjust(bars, code)
-                        converted = []
-                        for bar in bars:
-                            try:
-                                ts_str = str(bar.get("time", ""))
-                                if "-" in ts_str and ":" in ts_str:
-                                    ts = int(datetime.strptime(ts_str[:16], "%Y-%m-%d %H:%M").timestamp())
-                                else:
-                                    ts = int(float(ts_str))
-                                converted.append({
-                                    "time": ts,
-                                    "open": round(float(bar["open"]), 4),
-                                    "high": round(float(bar["high"]), 4),
-                                    "low": round(float(bar["low"]), 4),
-                                    "close": round(float(bar["close"]), 4),
-                                    "volume": round(float(bar["volume"]), 2),
-                                })
-                            except (ValueError, TypeError, KeyError):
-                                continue
-                        bars = converted
+                        bars = apply_fwd_adjust(bars, code)
 
                     if bars:
                         with lock:
