@@ -424,7 +424,7 @@ class BackfillDB:
         self.source = source
         self._writer = get_market_kline_writer()
 
-    def run_once(self, tf: str | None = None) -> dict:
+    def run_once(self, tf: str | None = None, symbols: list | None = None) -> dict:
         """执行一次同步。tf 默认取 source.timeframe。"""
         tf = tf or self.source.timeframe
 
@@ -447,7 +447,7 @@ class BackfillDB:
             if self.source.dinger_url:
                 written = self._sync_via_api(tf)
             else:
-                written = self._sync_via_coordinator(tf)
+                written = self._sync_via_coordinator(tf, symbols=symbols)
         except Exception as e:
             report = f"同步异常: {e}"
             logger.error(f"[同步] {self.source.name} tf={tf} {report}")
@@ -478,7 +478,7 @@ class BackfillDB:
             "written": written, "status": "ok", "report": report,
         }
 
-    def _sync_via_coordinator(self, tf: str) -> int:
+    def _sync_via_coordinator(self, tf: str, symbols: list | None = None) -> int:
         """A 股: 通过 coordinator 全市场批量同步。
 
         关键: 区分"增量快照"和"历史回填"两种路径。
@@ -488,6 +488,13 @@ class BackfillDB:
         from app.data_sources.coordinator import get_coordinator
         from app.data_sources.circuit_breaker import get_realtime_circuit_breaker
         from app.data_sources.kline_clean import clean_klines
+
+        if not symbols:
+            from app.utils.basicinfo_db import get_stock_basic_db
+            symbols = get_stock_basic_db().market_all_codes(status="active")
+        if not symbols:
+            logger.warning(f"[同步] {self.source.name} 获取股票列表失败")
+            return 0
 
         coord = get_coordinator()
         cb = get_realtime_circuit_breaker()
@@ -520,6 +527,7 @@ class BackfillDB:
             start_date=start_date,
             end_date=end_date,
             timeout=300,
+            symbols=symbols,
         )
 
         if not result:
@@ -803,12 +811,12 @@ def _run_all_sync():
 # 全盘同步入口（保留兼容性）
 # ================================================================
 
-def run_once(tf: str | None = None) -> list[dict]:
+def run_once(tf: str | None = None, symbols: list | None = None) -> list[dict]:
     """全盘同步入口 — 三个数据源依次执行。"""
     results = []
     for source in (stock_daily_k, fund_nav_daily, bond_daily_k):
         try:
-            r = source.run_once(tf)
+            r = source.run_once(tf, symbols=symbols)
             results.append(r)
         except Exception as e:
             logger.error(f"[全盘同步] {source.source.name} 异常: {e}")

@@ -268,9 +268,6 @@ def _batch_fetch_quotes_by_codes(
     用于不支持原生全市场行情的 Provider（如新浪、腾讯）。
     """
     if not symbols:
-        from app.utils.basicinfo_db import get_stock_basic_db
-        symbols = get_stock_basic_db().market_all_codes(status="active")
-    if not symbols:
         return {}
     result: Dict[str, Dict[str, Any]] = {}
     for i in range(0, len(symbols), batch_size):
@@ -374,8 +371,7 @@ def _all_market_kline_via_quotes(
     返回格式与 fetch_kline 一致：{code: [bar_dict]}，每只股票 1 根 bar。
     """
     if not symbols:
-        from app.utils.basicinfo_db import get_stock_basic_db
-        symbols = get_stock_basic_db().market_all_codes(status="active")
+        return {}
     quotes = provider.fetch_batch_quotes(symbols, timeout=timeout)
     if not quotes or isinstance(quotes, NotSupportedResult):
         return {}
@@ -439,9 +435,6 @@ def _batch_fetch_kline_by_codes(
         全市场K线字典 {code: kline_bars}
     """
     import concurrent.futures
-    if not symbols:
-        from app.utils.basicinfo_db import get_stock_basic_db
-        symbols = get_stock_basic_db().market_all_codes(status="active")
     if not symbols:
         return {}
     result: Dict[str, List[Dict[str, Any]]] = {}

@@ -38,9 +38,6 @@ class TdxDataSource:
 
     def fetch_market_kline(self, timeframe="1D", count=300, adj="qfq", timeout=15, start_date="", end_date="", symbols=None):
         """全市场批量K线 — 并发 fetch_kline，支持历史数据"""
-        if not symbols:
-            from app.utils.basicinfo_db import get_stock_basic_db
-            symbols = get_stock_basic_db().market_all_codes(status="active")
         if not symbols: return {}
         if start_date:
             from app.data_sources.provider import calc_kline_count

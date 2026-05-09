@@ -370,9 +370,6 @@ class TdxExDataSource:
         from queue import Queue, Empty
 
         if not symbols:
-            from app.utils.basicinfo_db import get_stock_basic_db
-            symbols = get_stock_basic_db().market_all_codes(status="active")
-        if not symbols:
             return {}
 
         if start_date:

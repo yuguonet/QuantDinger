@@ -205,9 +205,6 @@ class EastMoneyDataSource:
             return _all_market_kline_via_quotes(self, timeframe=timeframe, timeout=timeout, symbols=symbols)
 
         if not symbols:
-            from app.utils.basicinfo_db import get_stock_basic_db
-            symbols = get_stock_basic_db().market_all_codes(status="active")
-        if not symbols:
             return {}
         import concurrent.futures
         result: Dict[str, List[Dict[str, Any]]] = {}

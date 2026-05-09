@@ -1134,9 +1134,6 @@ class Coordinator:
             available_providers = preferred + others
 
         # ── 第二步: 获取股票列表并分组 ──
-        if not symbols:
-            from app.utils.basicinfo_db import get_stock_basic_db
-            symbols = get_stock_basic_db().market_all_codes(status="active")
         all_codes = symbols
         if not all_codes:
             logger.warning("[协助层] market_kline 获取股票列表失败")
