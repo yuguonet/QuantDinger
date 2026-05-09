@@ -386,7 +386,6 @@ def _apply_fwd_adjust(klines: list, code: str) -> list:
 # Provider 注册
 # ================================================================
 
-@register(priority=22)
 class TdxExDataSource:
     """
     通达信扩展行情数据源 — ExHQ 协议（priority=22）。
@@ -402,6 +401,9 @@ class TdxExDataSource:
     线程安全性:
       - 线程本地连接池
       - 自动探测可用服务器
+
+    依赖:
+      - pytdx 未安装时不注册（避免 capabilities 与实际能力不匹配）
     """
 
     name = "tdx_ex"
@@ -423,11 +425,12 @@ class TdxExDataSource:
 
     def __init__(self):
         """启动时探测 ExHQ 服务器"""
-        if HAS_TDX:
-            try:
-                _discover_servers()
-            except Exception as e:
-                logger.warning("[TDX ExHQ] 服务器探测失败: %s", e)
+        _discover_servers()
+
+
+# 仅在 pytdx 可用时注册，避免 capabilities 声明支持但实际全部 NotSupported
+if HAS_TDX:
+    register(priority=22)(TdxExDataSource)
 
     def fetch_kline(
         self, code: str, timeframe: str = "15m", count: int = 300,

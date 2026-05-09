@@ -197,7 +197,7 @@ class TencentDataSource:
             from app.data_sources.provider import calc_kline_count
             count = calc_kline_count(timeframe, start_date, end_date)
 
-        c = _lower(code)
+        c = _lower(to_tencent_code(code))
         if not c:
             return []
 
@@ -220,9 +220,14 @@ class TencentDataSource:
             params=params, timeout=timeout,
         )
 
+        if resp.status_code != 200:
+            logger.warning("[tencent] %s %s HTTP %s", timeframe, c, resp.status_code)
+            return []
+
         try:
             data = resp.json()
         except Exception:
+            logger.warning("[tencent] %s %s JSON解析失败, body前100字: %s", timeframe, c, (resp.text or "")[:100])
             return []
 
         if not isinstance(data, dict) or int(data.get("code", 0)) != 0:
@@ -230,6 +235,7 @@ class TencentDataSource:
 
         root = (data.get("data") or {}).get(c)
         if not isinstance(root, dict):
+            logger.warning("[tencent] %s %s root不是dict, data.keys=%s", timeframe, c, list((data.get("data") or {}).keys()))
             return []
 
         rows = None
@@ -249,7 +255,7 @@ class TencentDataSource:
 
     @retry_with_backoff(max_attempts=3, base_delay=1.2, max_delay=8.0, exceptions=(Exception,))
     def fetch_ticker(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
-        c = _lower(code)
+        c = _lower(to_tencent_code(code))
         if not c:
             return None
 
@@ -298,7 +304,7 @@ class TencentDataSource:
     def fetch_batch_quotes(self, codes: List[str], timeout: int = 10) -> Dict[str, Dict[str, Any]]:
         if not codes:
             return {}
-        lowered = [_lower(c) for c in codes if c]
+        lowered = [_lower(to_tencent_code(c)) for c in codes if c]
         if not lowered:
             return {}
 

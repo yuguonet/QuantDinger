@@ -316,7 +316,7 @@ class SohuDataSource:
     capabilities = {
         "kline": True,
         "kline_priority": 45,
-        "kline_tf": {"1m", "5m", "15m", "30m", "1H", "1D"},
+        "kline_tf": {"15m"},
         "kline_batch": True,
         "kline_batch_priority": 45,
         "quote": False,
