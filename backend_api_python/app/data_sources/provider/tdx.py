@@ -6,7 +6,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 import requests
 from app.data_sources.normalizer import to_raw_digits, detect_market
-from app.data_sources.rate_limiter import get_request_headers, retry_with_backoff, RateLimiter
+from app.data_sources.rate_limiter import get_request_headers, retry_with_backoff, RateLimiter, get_shared_session
 from app.data_sources.provider import register, NotSupportedResult
 from app.utils.logger import get_logger
 logger = get_logger(__name__)
@@ -67,7 +67,7 @@ class TdxDataSource:
         if timeframe != "1D":
             url = "https://d.10jqka.com.cn/v6/line/hs_{}/0{}/last{}.js".format(digits, period, min(int(count), 800))
         try:
-            resp = requests.get(url, headers=get_request_headers(referer="https://stockpage.10jqka.com/"), timeout=timeout)
+            resp = get_shared_session().get(url, headers=get_request_headers(referer="https://stockpage.10jqka.com/"), timeout=timeout)
             resp.encoding = "utf-8"; text = resp.text or ""
         except Exception as e: logger.warning("[通达信K线] 请求失败 %s: %s", code, e); return []
         m = re.search(r'"data"\s*:\s*"([^"]+)"', text)
@@ -106,7 +106,7 @@ class TdxDataSource:
         mkt, digits = params
         _tdx_quote_limiter.wait()
         try:
-            resp = requests.get("https://d.10jqka.com.cn/v6/realtime/hs_{}/last.js".format(digits),
+            resp = get_shared_session().get("https://d.10jqka.com.cn/v6/realtime/hs_{}/last.js".format(digits),
                 headers=get_request_headers(referer="https://stockpage.10jqka.com/"), timeout=timeout)
             resp.encoding = "utf-8"; text = resp.text or ""
         except Exception as e: logger.warning("[通达信行情] 请求失败 %s: %s", code, e); return None

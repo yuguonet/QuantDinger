@@ -23,7 +23,7 @@ except ImportError:
 
 # ═══════════════ 配置 ═══════════════
 TIMEOUT = 10
-OUTPUT_DIR = "kline_data"
+OUTPUT_DIR = "data/kline_data"
 GROUP_SIZE = 100
 THREADS_PER_SOURCE = 30       # 默认线程数 (极速源用)
 PER_DOMAIN_CONCURRENT = 50    # push2域名并发上限

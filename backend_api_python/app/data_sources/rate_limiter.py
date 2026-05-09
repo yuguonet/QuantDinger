@@ -270,3 +270,55 @@ def get_tencent_limiter() -> RateLimiter:
 def get_akshare_limiter() -> RateLimiter:
     """获取 Akshare 限流器"""
     return _akshare_limiter
+
+
+# ============================================
+# 共享 requests Session（禁用 SSL 验证）
+# ============================================
+# 部分国内财经站点（新浪、同花顺/通达信、东财等）会对非浏览器 TLS 指纹
+# 做主动断连，导致 SSLEOFError。统一使用 verify=False + 自定义 SSL 适配器。
+
+import requests as _requests
+import ssl as _ssl
+import urllib3 as _urllib3
+from requests.adapters import HTTPAdapter as _HTTPAdapter
+from urllib3.util.ssl_ import create_urllib3_context as _create_urllib3_context
+
+# 抑制 InsecureRequestWarning
+_urllib3.disable_warnings(_urllib3.exceptions.InsecureRequestWarning)
+
+
+class _SSLAdapter(_HTTPAdapter):
+    """自定义 SSL 适配器：禁用证书验证 + 兼容更多 cipher suites"""
+
+    def init_poolmanager(self, *args, **kwargs):
+        ctx = _create_urllib3_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = _ssl.CERT_NONE
+        # 允许 TLS 1.2 + 1.3，兼容国内站点
+        ctx.minimum_version = _ssl.TLSVersion.TLSv1_2
+        # 加入更多 cipher 以匹配浏览器指纹
+        ctx.set_ciphers(
+            "DEFAULT:!aNULL:!eNULL:!MD5:!3DES:!DES:!RC4:!IDEA:!SEED"
+        )
+        kwargs["ssl_context"] = ctx
+        return super().init_poolmanager(*args, **kwargs)
+
+
+def get_shared_session() -> _requests.Session:
+    """
+    获取共享的 requests.Session（禁用 SSL 验证）。
+    用于国内财经数据源，避免 SSLEOFError。
+    """
+    if not hasattr(get_shared_session, "_session"):
+        s = _requests.Session()
+        s.verify = False
+        s.mount("https://", _SSLAdapter())
+        s.headers.update({
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate",
+            "Connection": "keep-alive",
+        })
+        get_shared_session._session = s
+    return get_shared_session._session

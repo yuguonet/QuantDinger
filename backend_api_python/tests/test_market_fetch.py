@@ -31,7 +31,7 @@ from app.data_sources.provider import get_providers, autodiscover, NotSupportedR
 
 
 # ═══════════════ 配置 ═══════════════
-OUTPUT_DIR = "kline_data"
+OUTPUT_DIR = "data/kline_data"
 GROUP_SIZE = 50
 THREADS_PER_SOURCE = 30
 
@@ -123,6 +123,8 @@ def create_market_fetch_fn(provider, timeframe="15m", count=200, adj="qfq"):
 def get_stock_list():
     """获取A股股票列表 — 新浪/东财 多源 fallback"""
     import requests as _requests
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     # 方式1: 新浪财经（国内可达、稳定）
     try:
@@ -133,10 +135,14 @@ def get_stock_list():
                 url = (
                     f"https://vip.stock.finance.sina.com.cn/quotes_service/api/"
                     f"json_v2.php/Market_Center.getHQNodeData?"
-                    f"page={page}&num=5000&sort=symbol&asc=1&node={node}"
+                    f"page={page}&num=80&sort=symbol&asc=1&node={node}"
                 )
-                resp = _requests.get(url, timeout=10, headers={
-                    "User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"
+                resp = _requests.get(url, timeout=10, verify=False, headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+                    "Referer": "https://finance.sina.com.cn/",
+                    "Accept": "application/json, text/plain, */*",
+                    "Accept-Language": "zh-CN,zh;q=0.9",
+                    "Accept-Encoding": "gzip, deflate",
                 })
                 items = resp.json()
                 if not items:
@@ -147,7 +153,7 @@ def get_stock_list():
                     name = item.get("name", "")
                     if sym and len(sym) >= 8:
                         stocks.append({"code": sym, "name": name})
-                if len(items) > 5000:
+                if len(items) < 80:
                     break
                 page += 1
         if stocks:

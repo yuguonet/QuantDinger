@@ -14,7 +14,7 @@
 
 缓存策略:
   - 内存缓存: {code: [(date_str, cum_factor), ...]}，进程生命周期有效
-  - 文件缓存: data/xdxr/{code}.json，TTL 7 天
+  - 文件缓存: data/xdxr.json（单文件，全量），TTL 7 天
   - 线程安全: threading.Lock 保护缓存读写
 """
 
@@ -35,8 +35,10 @@ logger = get_logger(__name__)
 # 配置
 # ================================================================
 
-_CACHE_DIR = os.environ.get("XDXR_CACHE_DIR", "data/xdxr")
+_CACHE_DIR = os.environ.get("XDXR_CACHE_DIR", "data")
+_CACHE_FILE = os.path.join(_CACHE_DIR, "xdxr.json")
 _CACHE_TTL = 7 * 24 * 3600  # 7 天
+_cache_loaded = False
 
 # ================================================================
 # TDX 服务器探测 & 连接
@@ -129,41 +131,72 @@ def _to_tdx_market_symbol(code: str) -> Optional[Tuple[int, str]]:
 
 
 # ================================================================
-# 文件缓存
+# 文件缓存（单文件 data/xdxr.json）
 # ================================================================
 
-def _cache_path(code: str) -> str:
-    nc = normalize_cn_code(code)
-    safe_code = nc.replace("/", "_").replace("\\", "_") if nc else code
-    return os.path.join(_CACHE_DIR, f"{safe_code}.json")
+_xdxr_file_cache: Dict[str, List[Tuple[str, float]]] = {}
+_xdxr_file_dirty = False
+_xdxr_file_lock = threading.Lock()
 
 
-def _load_file_cache(code: str) -> Optional[List[Tuple[str, float]]]:
-    path = _cache_path(code)
-    if not os.path.exists(path):
-        return None
-    try:
-        if _time.time() - os.path.getmtime(path) > _CACHE_TTL:
-            return None
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, list):
-            return [(str(item[0]), float(item[1])) for item in data if len(item) >= 2]
-    except Exception:
-        pass
-    return None
-
-
-def _save_file_cache(code: str, factors: List[Tuple[str, float]]):
-    if not factors:
+def _load_cache_file():
+    """从 data/xdxr.json 加载全部缓存到内存，仅执行一次。"""
+    global _cache_loaded, _xdxr_file_cache
+    if _cache_loaded:
         return
-    path = _cache_path(code)
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump([[d, c] for d, c in factors], f, ensure_ascii=False)
-    except Exception as e:
-        logger.debug("[adjustment] 文件缓存写入失败 %s: %s", code, e)
+    with _xdxr_file_lock:
+        if _cache_loaded:
+            return
+        _cache_loaded = True
+        if not os.path.exists(_CACHE_FILE):
+            return
+        try:
+            if _time.time() - os.path.getmtime(_CACHE_FILE) > _CACHE_TTL:
+                logger.info("[adjustment] 缓存文件过期，忽略")
+                return
+            with open(_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                for code, factors in data.items():
+                    if isinstance(factors, list):
+                        _xdxr_file_cache[code] = [
+                            (str(item[0]), float(item[1])) for item in factors if len(item) >= 2
+                        ]
+                logger.info("[adjustment] 从缓存加载 %d 只股票复权因子", len(_xdxr_file_cache))
+        except Exception as e:
+            logger.debug("[adjustment] 缓存文件读取失败: %s", e)
+
+
+def _flush_cache_file():
+    """将内存缓存写入 data/xdxr.json（仅脏数据时写入）。"""
+    global _xdxr_file_dirty
+    with _xdxr_file_lock:
+        if not _xdxr_file_dirty:
+            return
+        try:
+            os.makedirs(os.path.dirname(_CACHE_FILE), exist_ok=True)
+            out = {code: [[d, c] for d, c in factors] for code, factors in _xdxr_file_cache.items()}
+            with open(_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(out, f, ensure_ascii=False, separators=(",", ":"))
+            _xdxr_file_dirty = False
+            logger.debug("[adjustment] 缓存已写入 %d 只", len(_xdxr_file_cache))
+        except Exception as e:
+            logger.debug("[adjustment] 缓存文件写入失败: %s", e)
+
+
+def _get_file_cache(code: str) -> Optional[List[Tuple[str, float]]]:
+    """从单文件缓存读取指定股票的复权因子。"""
+    _load_cache_file()
+    return _xdxr_file_cache.get(code)
+
+
+def _put_file_cache(code: str, factors: List[Tuple[str, float]]):
+    """写入指定股票的复权因子，并标记脏数据。"""
+    global _xdxr_file_dirty
+    _load_cache_file()
+    _xdxr_file_cache[code] = factors
+    _xdxr_file_dirty = True
+    _flush_cache_file()
 
 
 # ================================================================
@@ -230,7 +263,7 @@ def build_fwd_factor(code: str, klines: list = None) -> List[Tuple[str, float]]:
 
     三级缓存:
       1. 内存缓存（最快）
-      2. JSON 文件缓存（data/xdxr/{code}.json，TTL 7 天）
+      2. JSON 文件缓存（data/xdxr.json 单文件，TTL 7 天）
       3. TDX 网络请求（最慢）
 
     Args:
@@ -247,8 +280,8 @@ def build_fwd_factor(code: str, klines: list = None) -> List[Tuple[str, float]]:
         if nc in _xdxr_cache:
             return _xdxr_cache[nc]
 
-    # 2. 文件缓存
-    file_factors = _load_file_cache(nc)
+    # 2. 文件缓存（单文件）
+    file_factors = _get_file_cache(nc)
     if file_factors is not None:
         with _xdxr_lock:
             _xdxr_cache[nc] = file_factors
@@ -320,7 +353,7 @@ def build_fwd_factor(code: str, klines: list = None) -> List[Tuple[str, float]]:
 
     with _xdxr_lock:
         _xdxr_cache[nc] = result
-    _save_file_cache(nc, result)
+    _put_file_cache(nc, result)
 
     return result
 

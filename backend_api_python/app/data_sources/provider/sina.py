@@ -39,7 +39,7 @@ import requests
 
 from app.data_sources.normalizer import normalize_cn_code as to_sina_code
 from app.data_sources.rate_limiter import (
-    get_request_headers, retry_with_backoff, RateLimiter,
+    get_request_headers, retry_with_backoff, RateLimiter, get_shared_session,
 )
 from app.data_sources.provider import register, NotSupportedResult
 from app.utils.logger import get_logger
@@ -175,7 +175,7 @@ def _fetch_sina_kline_hisdata(sc: str, count: int, timeout: int) -> List[Dict[st
     """通过新浪 hisdata 页面获取日线K线（兜底机制）"""
     url = f"https://finance.sina.com.cn/realstock/company/{sc}/hisdata/klc_kl.js"
     _sina_limiter.wait()
-    resp = requests.get(
+    resp = get_shared_session().get(
         url,
         headers=get_request_headers(referer=_sina_kline_referers.next()),
         timeout=timeout,
@@ -286,7 +286,7 @@ class SinaDataSource:
     def _fetch_raw_daily_kline(self, sc: str, count: int, timeout: int) -> List[Dict[str, Any]]:
         url = "https://vip.stock.finance.sina.com.cn/cn/api/json.php/CN_MarketDataService.getKLineData"
         params = {"symbol": sc, "scale": 240, "ma": "no", "datalen": min(int(count), 2000)}
-        resp = requests.get(
+        resp = get_shared_session().get(
             url,
             headers=get_request_headers(referer=_sina_kline_referers.next()),
             params=params, timeout=timeout,
@@ -302,7 +302,7 @@ class SinaDataSource:
     def _fetch_minute_kline(self, sc: str, scale: int, count: int, timeout: int) -> List[Dict[str, Any]]:
         url = "https://quotes.sina.cn/cn/api/jsonp_v2.php/var/CN_MarketDataService.getKLineData"
         params = {"symbol": sc, "scale": scale, "ma": "no", "datalen": min(int(count), 2000)}
-        resp = requests.get(
+        resp = get_shared_session().get(
             url,
             headers=get_request_headers(referer=_sina_kline_referers.next()),
             params=params, timeout=timeout,
@@ -325,7 +325,7 @@ class SinaDataSource:
         if not sc:
             return None
         _sina_quote_limiter.wait()
-        resp = requests.get(
+        resp = get_shared_session().get(
             f"https://hq.sinajs.cn/list={sc}",
             headers=get_request_headers(referer=_sina_quote_referers.next()),
             timeout=timeout,
@@ -391,7 +391,7 @@ class SinaDataSource:
         query = ",".join(batch)
         _sina_quote_limiter.wait()
         try:
-            resp = requests.get(
+            resp = get_shared_session().get(
                 f"https://hq.sinajs.cn/list={query}",
                 headers=get_request_headers(referer=_sina_quote_referers.next()),
                 timeout=timeout,
