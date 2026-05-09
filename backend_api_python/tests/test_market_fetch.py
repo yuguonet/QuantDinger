@@ -122,13 +122,6 @@ def create_market_fetch_fn(provider, timeframe="15m", count=200, adj="qfq"):
 # ═══════════════ 股票列表 ═══════════════
 def get_stock_list():
     """获取A股股票列表 — 新浪/东财 多源 fallback"""
-    cache = os.path.join(OUTPUT_DIR, "_stock_list.json")
-    if os.path.exists(cache) and time.time() - os.path.getmtime(cache) < 86400:
-        with open(cache) as f:
-            s = json.load(f)
-            if s:
-                return s
-
     import requests as _requests
 
     # 方式1: 新浪财经（国内可达、稳定）
@@ -154,14 +147,11 @@ def get_stock_list():
                     name = item.get("name", "")
                     if sym and len(sym) >= 8:
                         stocks.append({"code": sym, "name": name})
-                if len(items) < 5000:
+                if len(items) > 5000:
                     break
                 page += 1
         if stocks:
             print(f"  ✅ 新浪获取 {len(stocks)} 只股票")
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-            with open(cache, "w") as f:
-                json.dump(stocks, f, ensure_ascii=False)
             return stocks
     except Exception as e:
         print(f"  ⚠️ 新浪获取失败: {e}")
@@ -188,9 +178,6 @@ def get_stock_list():
                 stocks.append({"code": f"{'sh' if m == 1 else 'sz'}{c}", "name": n})
         if stocks:
             print(f"  ✅ 东财获取 {len(stocks)} 只股票")
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-            with open(cache, "w") as f:
-                json.dump(stocks, f, ensure_ascii=False)
             return stocks
     except Exception as e:
         print(f"  ⚠️ 东财获取失败: {e}")

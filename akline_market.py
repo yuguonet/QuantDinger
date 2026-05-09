@@ -238,29 +238,69 @@ def apply_fwd_adjust(klines, code):
 
 # ═══════════════ 股票列表 ═══════════════
 def get_stock_list():
-    cache = os.path.join(OUTPUT_DIR, "_stock_list.json")
-    if os.path.exists(cache) and time.time()-os.path.getmtime(cache)<86400:
-        with open(cache) as f:
-            s = json.load(f)
-            if s: return s
-    stocks, page = [], 1
-    while True:
-        data = http_get_json(
-            f"https://82.push2.eastmoney.com/api/qt/clist/get?pn={page}&pz=5000&po=1&np=1"
-            f"&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f3"
-            f"&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f12,f14,f13")
-        if not data: break
-        items = (data.get("data") or {}).get("diff") or []
-        if not items: break
-        for i in items:
-            c, n, m = i.get("f12",""), i.get("f14",""), i.get("f13",0)
-            if c: stocks.append({"code": f"{'sh' if m==1 else 'sz'}{c}", "name": n})
-        if len(stocks) >= ((data.get("data") or {}).get("total",0)): break
-        page += 1
-    if stocks:
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        with open(cache,"w") as f: json.dump(stocks,f,ensure_ascii=False)
-    return stocks
+    """获取A股股票列表 — 新浪/东财 多源 fallback"""
+    import requests as _requests
+
+    # 方式1: 新浪财经（国内可达、稳定）
+    try:
+        stocks = []
+        for node in ("sh_a", "sz_a"):
+            page = 1
+            while True:
+                url = (
+                    f"https://vip.stock.finance.sina.com.cn/quotes_service/api/"
+                    f"json_v2.php/Market_Center.getHQNodeData?"
+                    f"page={page}&num=5000&sort=symbol&asc=1&node={node}"
+                )
+                resp = _requests.get(url, timeout=10, headers={
+                    "User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"
+                })
+                items = resp.json()
+                if not items:
+                    break
+                for item in items:
+                    # symbol 已带前缀: "sh600000" / "sz000001"
+                    sym = item.get("symbol", "")
+                    name = item.get("name", "")
+                    if sym and len(sym) >= 8:
+                        stocks.append({"code": sym, "name": name})
+                if len(items) > 5000:
+                    break
+                page += 1
+        if stocks:
+            print(f"  ✅ 新浪获取 {len(stocks)} 只股票")
+            return stocks
+    except Exception as e:
+        print(f"  ⚠️ 新浪获取失败: {e}")
+
+    # 方式2: 东财（兜底）
+    try:
+        from app.data_sources.provider.eastmoney import _make_headers
+        host = "push2.eastmoney.com"
+        url = f"https://{host}/api/qt/clist/get"
+        params = {
+            "pn": 1, "pz": 6000, "po": 1, "np": 1,
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "fltt": 2, "invt": 2, "fid": "f3",
+            "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048",
+            "fields": "f12,f14,f13",
+        }
+        resp = _requests.get(url, headers=_make_headers(), params=params, timeout=15, verify=False)
+        data = resp.json()
+        diff = ((data.get("data") or {}).get("diff")) or []
+        stocks = []
+        for i in diff:
+            c, n, m = i.get("f12", ""), i.get("f14", ""), i.get("f13", 0)
+            if c:
+                stocks.append({"code": f"{'sh' if m == 1 else 'sz'}{c}", "name": n})
+        if stocks:
+            print(f"  ✅ 东财获取 {len(stocks)} 只股票")
+            return stocks
+    except Exception as e:
+        print(f"  ⚠️ 东财获取失败: {e}")
+
+    print("  ❌ 所有源获取失败")
+    return []
 
 # ═══════════════ 周期映射 ═══════════════
 # pytdx get_security_bars category (TdxHq_API)
