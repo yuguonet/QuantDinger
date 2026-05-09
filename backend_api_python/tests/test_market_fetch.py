@@ -121,16 +121,59 @@ def create_market_fetch_fn(provider, timeframe="15m", count=200, adj="qfq"):
 
 # ═══════════════ 股票列表 ═══════════════
 def get_stock_list():
-    """获取A股股票列表（通过东财 clist API）"""
-    import urllib.request
-    import ssl
-
+    """获取A股股票列表 — 优先走 provider 层的节点池，失败回退 urllib"""
     cache = os.path.join(OUTPUT_DIR, "_stock_list.json")
     if os.path.exists(cache) and time.time() - os.path.getmtime(cache) < 86400:
         with open(cache) as f:
             s = json.load(f)
             if s:
                 return s
+
+    # 方式1: 通过 provider.eastmoney 节点池获取（最可靠）
+    try:
+        from app.data_sources.provider.eastmoney import _quote_pool, _make_headers
+        import requests as _requests
+        host = _quote_pool.get_node()
+        url = f"https://{host}/api/qt/clist/get"
+        params = {
+            "pn": 1, "pz": 6000, "po": 1, "np": 1,
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "fltt": 2, "invt": 2, "fid": "f3",
+            "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048",
+            "fields": "f12,f14,f13",
+        }
+        resp = _requests.get(url, headers=_make_headers(), params=params, timeout=15, verify=False)
+        data = resp.json()
+        diff = ((data.get("data") or {}).get("diff")) or []
+        stocks = []
+        for i in diff:
+            c, n, m = i.get("f12", ""), i.get("f14", ""), i.get("f13", 0)
+            if c:
+                stocks.append({"code": f"{'sh' if m == 1 else 'sz'}{c}", "name": n})
+        if stocks:
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            with open(cache, "w") as f:
+                json.dump(stocks, f, ensure_ascii=False)
+            return stocks
+    except Exception as e:
+        print(f"  ⚠️ provider 节点池获取失败: {e}")
+
+    # 方式2: 通过 provider 层获取
+    try:
+        from app.data_sources.provider import _fetch_all_cn_codes
+        codes = _fetch_all_cn_codes()
+        if codes:
+            stocks = [{"code": c, "name": c} for c in codes]
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            with open(cache, "w") as f:
+                json.dump(stocks, f, ensure_ascii=False)
+            return stocks
+    except Exception as e:
+        print(f"  ⚠️ provider 层获取失败: {e}")
+
+    # 方式3: 回退到 urllib 直连（兜底）
+    import urllib.request
+    import ssl
 
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"}
     ctx = ssl.create_default_context()
@@ -141,7 +184,7 @@ def get_stock_list():
     page = 1
     while True:
         url = (
-            f"https://82.push2.eastmoney.com/api/qt/clist/get?pn={page}&pz=5000&po=1&np=1"
+            f"https://push2.eastmoney.com/api/qt/clist/get?pn={page}&pz=5000&po=1&np=1"
             f"&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f3"
             f"&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f12,f14,f13"
         )

@@ -128,10 +128,18 @@ def get_stock_list():
         with open(cache) as f:
             s = json.load(f)
             if s: return s
+
+    # 优先走 provider 节点池
+    try:
+        from app.data_sources.provider.eastmoney import _quote_pool as quote_pool
+        host = quote_pool.get_node()
+    except Exception:
+        host = "push2.eastmoney.com"
+
     stocks, page = [], 1
     while True:
         data = http_get_json(
-            f"https://82.push2.eastmoney.com/api/qt/clist/get?pn={page}&pz=5000&po=1&np=1"
+            f"https://{host}/api/qt/clist/get?pn={page}&pz=5000&po=1&np=1"
             f"&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f3"
             f"&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f12,f14,f13")
         if not data: break
@@ -163,10 +171,15 @@ _EM_AGG_STEPS = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1H": 60}
 
 # ═══════════════ 极速源: push2 trends2 → 1min聚合多周期 ═══════════════
 def em_trends2_raw(code):
-    """push2.eastmoney.com trends2: 获取今天1分钟原始数据"""
+    """push2.eastmoney.com trends2: 获取今天1分钟原始数据（走节点池轮换）"""
     secid = to_em(code)
     try:
-        url = (f"https://push2.eastmoney.com/api/qt/stock/trends2/get?"
+        from app.data_sources.provider.eastmoney import _quote_pool as quote_pool
+        host = quote_pool.get_node()
+    except Exception:
+        host = "push2.eastmoney.com"
+    try:
+        url = (f"https://{host}/api/qt/stock/trends2/get?"
                f"secid={secid}&fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13"
                f"&fields2=f51,f52,f53,f54,f55,f56,f57,f58&iscr=0&ndays=1")
         req = urllib.request.Request(url, headers=HEADERS)
@@ -211,13 +224,18 @@ def em_trends2_kline(code, timeframe="15m", limit=200):
 
 # ═══════════════ 其它多周期数据源 ═══════════════
 def em_kline(code, timeframe="15m", limit=200):
-    """东方财富历史K线 API: 支持所有周期"""
+    """东方财富历史K线 API: 支持所有周期（走节点池轮换）"""
     _EM_KLT = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1H": 60, "1D": 101, "1W": 102}
     klt = _EM_KLT.get(timeframe)
     if klt is None: return None
-    data = http_get_json(f"https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={to_em(code)}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61&klt={klt}&fqt=1&end=20500101&lmt={limit}")
+    try:
+        from app.data_sources.provider.eastmoney import _kline_pool as kline_pool
+        host = kline_pool.get_node()
+    except Exception:
+        host = "push2his.eastmoney.com"
+    data = http_get_json(f"https://{host}/api/qt/stock/kline/get?secid={to_em(code)}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61&klt={klt}&fqt=1&end=20500101&lmt={limit}")
     k = (data.get("data") or {}).get("klines") if data else None
-    return last_n_bars([_k(p[0],p[1],p[3],p[4],p[2],p[5],p[6]) for p in (l.split(",") for l in k) if len(p)>=7]) if k else None
+    return last_n_bars([_k(*p[:7]) for p in (l.split(",") for l in k)]) if k else None
 
 def tx_kline(code, timeframe="15m", limit=200):
     """腾讯K线: 支持 1m/5m/15m/30m/1H/1D"""

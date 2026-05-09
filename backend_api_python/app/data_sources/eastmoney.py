@@ -2,14 +2,15 @@
 东方财富直接数据源 — A股多周期K线 + 实时行情（免费、无需API Key）
 
 数据接口:
-- K线: 49.push2his.eastmoney.com/api/qt/stock/kline/get
-- 实时行情: push2.eastmoney.com/api/qt/stock/get
+- K线: push2his.eastmoney.com/api/qt/stock/kline/get (CDN节点自动探测轮换)
+- 实时行情: push2.eastmoney.com/api/qt/stock/get (CDN节点自动探测轮换)
 
 特点:
 - 国内最稳定的免费数据源之一
-- 支持多周期: 1m/5m/15m/30m/1H/1D/1W（注意: 49.push2his 节点不稳定，需重试）
+- 支持多周期: 1m/5m/15m/30m/1H/1D/1W
+- CDN 节点探测 + 轮换池（仿 TDX 模式），自动 failover
 - 支持前复权/后复权
-- 有频率限制，需要限流 + 随机 UA
+- Referer 轮换池，提高访问成功率
 """
 
 from __future__ import annotations
@@ -52,6 +53,23 @@ _EASTMONEY_FQT = {
 }
 
 
+# ---------- CDN 节点池 + Referer 池（从 provider.eastmoney 共享）----------
+from app.data_sources.provider.eastmoney import (
+    _kline_pool as _kline_node_pool,
+    _quote_pool as _quote_node_pool,
+    _make_headers as _probe_headers,
+    _RefererPool as _EMRefererPool,
+)
+
+_em_referers = _EMRefererPool([
+    "https://quote.eastmoney.com/",
+    "https://www.eastmoney.com/",
+    "https://stock.eastmoney.com/",
+    "https://data.eastmoney.com/",
+    "https://push2.eastmoney.com/",
+])
+
+
 # ---------- 代码转换 ----------
 
 def _em_secid_from_cn(symbol: str) -> str:
@@ -80,7 +98,7 @@ def _em_secid_from_cn(symbol: str) -> str:
 
 # ---------- K线数据 ----------
 
-@retry_with_backoff(max_attempts=1, exceptions=(
+@retry_with_backoff(max_attempts=3, base_delay=1.0, max_delay=8.0, exceptions=(
     requests.exceptions.RequestException,
     ConnectionError,
     TimeoutError,
@@ -94,6 +112,9 @@ def fetch_eastmoney_kline(
 ) -> List[Dict[str, Any]]:
     """
     从东方财富获取K线数据。
+
+    使用 CDN 节点池自动轮换 + Referer 轮换，提高成功率。
+    失败时自动标记坏节点并重试（最多3次）。
 
     返回字段顺序 (f51~f61):
       f51=日期, f52=开盘, f53=收盘, f54=最高, f55=最低,
@@ -110,10 +131,16 @@ def fetch_eastmoney_kline(
 
     fqt = _EASTMONEY_FQT.get(adj, 1)
 
+    # 从节点池获取 CDN 节点
+    if True:
+        host = _kline_node_pool.get_node()
+    else:
+        host = "push2his.eastmoney.com"
+    url = f"https://{host}/api/qt/stock/kline/get"
+
     limiter = get_eastmoney_limiter()
     limiter.wait()
 
-    url = "https://49.push2his.eastmoney.com/api/qt/stock/kline/get"
     params = {
         "secid": secid,
         "ut": "fa5fd1943c7b386f172d6893dbbd1835",
@@ -127,7 +154,7 @@ def fetch_eastmoney_kline(
 
     resp = requests.get(
         url,
-        headers=get_request_headers(referer="https://quote.eastmoney.com/"),
+        headers=_probe_headers(referer=_em_referers.next()),
         params=params,
         timeout=timeout,
     )
@@ -135,6 +162,8 @@ def fetch_eastmoney_kline(
     try:
         data = resp.json()
     except Exception:
+        if True:
+            _kline_node_pool.mark_bad(host)
         logger.warning("EastMoney kline: invalid JSON for %s", code)
         return []
 
@@ -195,13 +224,15 @@ def fetch_eastmoney_kline(
     out.sort(key=lambda x: x["time"])
     if len(out) > count:
         out = out[-count:]
+    if out and _kline_node_pool:
+        _kline_node_pool.mark_good(host)
     logger.debug("EastMoney kline: %d bars for %s (klt=%s)", len(out), code, klt)
     return out
 
 
 # ---------- 实时行情（单股）----------
 
-@retry_with_backoff(max_attempts=1, exceptions=(
+@retry_with_backoff(max_attempts=3, base_delay=1.0, max_delay=8.0, exceptions=(
     requests.exceptions.RequestException,
     ConnectionError,
     TimeoutError,
@@ -209,6 +240,8 @@ def fetch_eastmoney_kline(
 def fetch_eastmoney_quote(code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
     """
     从东方财富获取单股实时行情。
+
+    使用 CDN 节点池自动轮换 + Referer 轮换，提高成功率。
 
     Fields: f43=最新价, f44=最高, f45=最低, f46=开盘,
             f47=成交量, f48=成交额, f57=代码, f58=名称, f60=昨收,
@@ -222,10 +255,16 @@ def fetch_eastmoney_quote(code: str, timeout: int = 8) -> Optional[Dict[str, Any
     if not circuit.is_available("eastmoney_quote"):
         return None
 
+    # 从节点池获取 CDN 节点
+    if True:
+        host = _quote_node_pool.get_node()
+    else:
+        host = "push2.eastmoney.com"
+    url = f"https://{host}/api/qt/stock/get"
+
     limiter = get_eastmoney_limiter()
     limiter.wait()
 
-    url = "https://push2.eastmoney.com/api/qt/stock/get"
     params = {
         "secid": secid,
         "ut": "fa5fd1943c7b386f172d6893dbfba10b",
@@ -234,7 +273,7 @@ def fetch_eastmoney_quote(code: str, timeout: int = 8) -> Optional[Dict[str, Any
 
     resp = requests.get(
         url,
-        headers=get_request_headers(referer="https://quote.eastmoney.com/"),
+        headers=_probe_headers(referer=_em_referers.next()),
         params=params,
         timeout=timeout,
     )
@@ -242,6 +281,8 @@ def fetch_eastmoney_quote(code: str, timeout: int = 8) -> Optional[Dict[str, Any
     try:
         data = resp.json()
     except Exception:
+        if True:
+            _quote_node_pool.mark_bad(host)
         circuit.record_failure("eastmoney_quote", "invalid JSON")
         return None
 
@@ -288,6 +329,8 @@ def fetch_eastmoney_quote(code: str, timeout: int = 8) -> Optional[Dict[str, Any
         "amount": _f("f48"),
     }
 
+    if True:
+        _quote_node_pool.mark_good(host)
     circuit.record_success("eastmoney_quote")
     return quote
 
@@ -570,7 +613,13 @@ def fetch_eastmoney_batch_quotes(
         limiter = get_eastmoney_limiter()
         limiter.wait()
 
-        url = "https://push2.eastmoney.com/api/qt/clist/get"
+        # 从节点池获取 CDN 节点
+        if True:
+            host = _quote_node_pool.get_node()
+        else:
+            host = "push2.eastmoney.com"
+        url = f"https://{host}/api/qt/clist/get"
+
         params = {
             "pn": 1, "pz": 6000, "po": 1, "np": 1,
             "ut": "bd1d9ddb04089700cf9c27f6f7426281",
@@ -581,12 +630,14 @@ def fetch_eastmoney_batch_quotes(
         }
         resp = requests.get(
             url,
-            headers=get_request_headers(referer="https://quote.eastmoney.com/"),
+            headers=_probe_headers(referer=_em_referers.next()),
             timeout=timeout,
         )
         data = resp.json()
         diff = ((data.get("data") or {}).get("diff")) or []
     except Exception as e:
+        if True:
+            _quote_node_pool.mark_bad(host)
         logger.warning(f"[EastMoney] clist 批量行情请求失败: {e}")
         return {}
 
@@ -620,4 +671,6 @@ def fetch_eastmoney_batch_quotes(
         except (ValueError, TypeError):
             continue
 
+    if result and _quote_node_pool:
+        _quote_node_pool.mark_good(host)
     return result
