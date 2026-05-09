@@ -156,7 +156,7 @@ class EastMoneyDataSource:
                 with lock:
                     result[code] = bars
 
-        max_workers = min(len(codes), 8)
+        max_workers = min(len(codes), 15)
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = [pool.submit(_fetch_one, c) for c in codes]
             concurrent.futures.wait(futures, timeout=timeout + 5)
@@ -338,6 +338,8 @@ class EastMoneyDataSource:
                     "low": round(float(item.get("f16", 0)), 4),
                     "open": round(float(item.get("f17", 0)), 4),
                     "previousClose": prev,
+                    "volume": round(float(item.get("f5", 0)), 2),
+                    "amount": round(float(item.get("f6", 0)), 2),
                     "name": "",
                     "symbol": sym,
                     "time": today_ts,

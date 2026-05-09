@@ -418,16 +418,19 @@ def _all_market_kline_via_quotes(
         if not last or last <= 0:
             continue
         bar = {
-            "datetime": bar_dt,
+            "time": bar_ts,
             "open": q.get("open", last),
             "high": q.get("high", last),
             "low": q.get("low", last),
             "close": last,
             "volume": q.get("volume", 0),
-            "turnover": 0,
-            "timestamp": bar_ts,
+            "amount": q.get("amount", 0),
         }
         result[normalize_cn_code(code)] = [bar]
+    # 前复权处理
+    from app.data_sources.provider.adjustment import apply_fwd_adjust
+    for code, bars in result.items():
+        result[code] = apply_fwd_adjust(bars, code)
     return result
 
 

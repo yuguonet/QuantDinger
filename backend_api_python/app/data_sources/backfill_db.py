@@ -357,6 +357,10 @@ def _validate_bars(bars: list[dict]) -> list[dict]:
         if o == 0 and h == 0 and l == 0 and c == 0:
             continue
 
+        # 极端负数/零价 → 跳过
+        if c <= 0 or o <= 0:
+            continue
+
         # high < low → 交换
         if h > 0 and l > 0 and h < l:
             bar["high"], bar["low"] = l, h
@@ -501,7 +505,7 @@ class BackfillDB:
             logger.info(f"[同步] {self.source.name} tf={tf} 增量快照模式")
         else:
             # 历史回填: count=None + start_date=回溯日期 → 并发逐只
-            ref_time = last_bar_time or last_updated增量快照模式
+            ref_time = last_bar_time or last_updated
             start_date, end_date = _date_range_15m(ref_time)
             logger.info(
                 f"[同步] {self.source.name} tf={tf} "
@@ -514,7 +518,7 @@ class BackfillDB:
             timeframe=tf,
             count=None,
             start_date=start_date,
-            end_date= "",
+            end_date=end_date,
             timeout=300,
         )
 
@@ -549,6 +553,16 @@ class BackfillDB:
 
         if not all_records:
             return 0
+
+        # 记录成功获取的 symbol 数量 vs 总数
+        fetched_symbols = set(r["symbol"] for r in all_records)
+        total_symbols = len(result)
+        if len(fetched_symbols) < total_symbols:
+            missing = total_symbols - len(fetched_symbols)
+            logger.warning(
+                f"[同步] {self.source.name} tf={tf} "
+                f"部分失败: {total_symbols}只中{missing}只未获取到数据"
+            )
 
         try:
             r = self._writer.bulk_write(self.source.market, all_records)
@@ -643,6 +657,16 @@ class BackfillDB:
         ]
         if not all_records:
             return 0
+
+        # 记录成功获取的 symbol 数量 vs 总数
+        fetched_symbols = set(r["symbol"] for r in all_records)
+        total_symbols = len(result)
+        if len(fetched_symbols) < total_symbols:
+            missing = total_symbols - len(fetched_symbols)
+            logger.warning(
+                f"[同步] {self.source.name} tf={tf} "
+                f"部分失败: {total_symbols}只中{missing}只未获取到数据"
+            )
 
         try:
             r = self._writer.bulk_write(self.source.market, all_records)

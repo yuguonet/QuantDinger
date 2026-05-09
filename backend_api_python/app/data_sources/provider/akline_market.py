@@ -217,7 +217,7 @@ def em_kline(code, timeframe="15m", limit=200):
     if klt is None: return None
     data = http_get_json(f"https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={to_em(code)}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61&klt={klt}&fqt=1&end=20500101&lmt={limit}")
     k = (data.get("data") or {}).get("klines") if data else None
-    return last_n_bars([_k(*p[:7]) for p in (l.split(",") for l in k)]) if k else None
+    return last_n_bars([_k(p[0],p[1],p[3],p[4],p[2],p[5],p[6]) for p in (l.split(",") for l in k) if len(p)>=7]) if k else None
 
 def tx_kline(code, timeframe="15m", limit=200):
     """腾讯K线: 支持 1m/5m/15m/30m/1H/1D"""

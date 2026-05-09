@@ -1346,6 +1346,8 @@ class Coordinator:
         result: Dict[str, List[Dict[str, Any]]] = {}
         lock = threading.Lock()
 
+        from app.data_sources.kline_clean import clean_klines
+
         def _fetch_one(code):
             try:
                 bars = provider.fetch_kline(
@@ -1354,13 +1356,15 @@ class Coordinator:
                     start_date=start_date, end_date=end_date,
                 )
                 if bars and not isinstance(bars, NotSupportedResult):
+                    cleaned = clean_klines(bars, timeframe)
                     with lock:
-                        result[normalize_cn_code(code)] = bars
-            except Exception:
-                pass
+                        result[normalize_cn_code(code)] = cleaned or bars
+            except Exception as e:
+                logger.debug("[_fetch_group_kline] %s 获取 %s 失败: %s",
+                            provider.name, code, e)
 
         # 并发获取，线程数取 min(组大小, 30)
-        max_workers = min(len(codes), 30)
+        max_workers = min(len(codes), 15)
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {pool.submit(_fetch_one, c): c for c in codes}
             try:

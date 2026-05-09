@@ -89,6 +89,7 @@ class TdxDataSource:
                 v = float(parts[5]) if len(parts) > 5 else 0
                 if o > 10000 and c < 100: o, h, l, c = o/100, h/100, l/100, c/100
                 if o == 0 and c == 0: continue
+                if c <= 0 or o <= 0: continue  # 跳过极端负数/零价
                 out.append({"time": ts, "open": round(o, 4), "high": round(h, 4), "low": round(l, 4), "close": round(c, 4), "volume": round(v, 2)})
             except (ValueError, TypeError, IndexError): continue
         out.sort(key=lambda x: x["time"])
