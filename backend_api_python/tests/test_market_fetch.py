@@ -129,11 +129,11 @@ def get_stock_list():
             if s:
                 return s
 
-    # 方式1: 通过 provider.eastmoney 节点池获取（最可靠）
+    # 方式1: 直接通过东财默认域名获取
     try:
-        from app.data_sources.provider.eastmoney import _quote_pool, _make_headers
+        from app.data_sources.provider.eastmoney import _make_headers
         import requests as _requests
-        host = _quote_pool.get_node()
+        host = "push2.eastmoney.com"
         url = f"https://{host}/api/qt/clist/get"
         params = {
             "pn": 1, "pz": 6000, "po": 1, "np": 1,
