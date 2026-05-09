@@ -129,23 +129,55 @@ def get_stock_list():
             s = json.load(f)
             if s: return s
 
-    # 直接使用东财默认域名（不做 CDN 探测）
-    host = "push2.eastmoney.com"
+    stocks = []
 
-    stocks, page = [], 1
-    while True:
-        data = http_get_json(
-            f"https://{host}/api/qt/clist/get?pn={page}&pz=5000&po=1&np=1"
-            f"&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f3"
-            f"&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f12,f14,f13")
-        if not data: break
-        items = (data.get("data") or {}).get("diff") or []
-        if not items: break
-        for i in items:
-            c, n, m = i.get("f12",""), i.get("f14",""), i.get("f13",0)
-            if c: stocks.append({"code": f"{'sh' if m==1 else 'sz'}{c}", "name": n})
-        if len(stocks) >= ((data.get("data") or {}).get("total",0)): break
-        page += 1
+    # 方式1: 新浪财经（国内可达）
+    try:
+        for node in ("sh_a", "sz_a"):
+            page = 1
+            while True:
+                url = (
+                    f"https://vip.stock.finance.sina.com.cn/quotes_service/api/"
+                    f"json_v2.php/Market_Center.getHQNodeData?"
+                    f"page={page}&num=5000&sort=symbol&asc=1&node={node}"
+                )
+                items = http_get_json(url, headers={
+                    "User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"
+                })
+                if not items:
+                    break
+                for item in items:
+                    sym = item.get("symbol", "")
+                    name = item.get("name", "")
+                    if sym and len(sym) >= 8:
+                        stocks.append({"code": sym, "name": name})
+                if len(items) < 5000:
+                    break
+                page += 1
+    except Exception as e:
+        logger.warning("[股票列表] 新浪获取失败: %s", e)
+
+    # 方式2: 东财（兜底）
+    if not stocks:
+        try:
+            host = "push2.eastmoney.com"
+            page = 1
+            while True:
+                data = http_get_json(
+                    f"https://{host}/api/qt/clist/get?pn={page}&pz=5000&po=1&np=1"
+                    f"&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f3"
+                    f"&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f12,f14,f13")
+                if not data: break
+                items = (data.get("data") or {}).get("diff") or []
+                if not items: break
+                for i in items:
+                    c, n, m = i.get("f12",""), i.get("f14",""), i.get("f13",0)
+                    if c: stocks.append({"code": f"{'sh' if m==1 else 'sz'}{c}", "name": n})
+                if len(stocks) >= ((data.get("data") or {}).get("total",0)): break
+                page += 1
+        except Exception as e:
+            logger.warning("[股票列表] 东财获取失败: %s", e)
+
     if stocks:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         with open(cache,"w") as f: json.dump(stocks,f,ensure_ascii=False)
