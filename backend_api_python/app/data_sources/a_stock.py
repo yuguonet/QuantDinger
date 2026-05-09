@@ -626,102 +626,12 @@ class AStockDataSource:
 
     def get_all_stock_codes(self) -> List[Dict[str, str]]:
         """
-        获取全部A股代码和名称。缓存24小时。
-        fallback: 东财 direct → AkShare
+        获取全部A股代码和名称。从 basicinfo_db 读取。
         """
-        cache_key = "all_stock_codes"
-        cached = self._info_cache.get(cache_key)
-        if cached:
-            return cached
-
-        cb = self.circuit_breaker
-
-        # 东财 direct
-        if cb.is_available("eastmoney_stocklist"):
-            result, err = _fetch_with_timeout(
-                lambda: self._fetch_all_stock_codes_eastmoney(),
-                timeout=min(_get_timeout(), 20),
-                source_name="eastmoney_stocklist",
-            )
-            if result and len(result) > 100:
-                cb.record_success("eastmoney_stocklist")
-                self._info_cache.set(cache_key, result, ttl=86400)
-                return result
-            cb.record_failure("eastmoney_stocklist", err or f"only {len(result) if result else 0}")
-
-        # AkShare fallback
-        if cb.is_available("akshare_stocklist"):
-            result, err = _fetch_with_timeout(
-                lambda: self._fetch_all_stock_codes_akshare(),
-                timeout=min(_get_timeout(), 20),
-                source_name="akshare_stocklist",
-            )
-            if result and len(result) > 100:
-                cb.record_success("akshare_stocklist")
-                self._info_cache.set(cache_key, result, ttl=86400)
-                return result
-            cb.record_failure("akshare_stocklist", err or f"only {len(result) if result else 0}")
-
-        return []
-
-    def _fetch_all_stock_codes_akshare(self) -> List[Dict[str, str]]:
-        """通过 AkShare 获取全部A股代码和名称"""
-        import akshare as ak
-        get_akshare_limiter().wait()
-
-        df = ak.stock_info_a_code_name()
-        if df is None or df.empty:
-            return []
-
-        result = []
-        for _, row in df.iterrows():
-            code = str(row.get("code", "")).strip()
-            name = str(row.get("name", "")).strip()
-            if code and name and len(code) == 6:
-                result.append({"stock_code": code, "stock_name": name})
-
-        logger.info(f"[AkShare] 获取A股列表: {len(result)} 只")
-        return result
-
-    def _fetch_all_stock_codes_eastmoney(self) -> List[Dict[str, str]]:
-        """通过东财获取全部A股代码列表"""
-        limiter = get_eastmoney_limiter()
-        limiter.wait()
-
-        resp = requests.get(
-            "https://push2.eastmoney.com/api/qt/clist/get",
-            headers=get_request_headers(referer="https://quote.eastmoney.com/"),
-            params={
-                "pn": 1, "pz": 6000,
-                "po": 1, "np": 1,
-                "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-                "fltt": 2, "invt": 2,
-                "fid": "f3",
-                "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048",
-                "fields": "f12,f14",
-            },
-            timeout=15,
-        )
-
-        try:
-            items = ((resp.json() or {}).get("data") or {}).get("diff")
-        except Exception:
-            return []
-
-        if not items:
-            return []
-
-        result = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            code = str(item.get("f12", "")).strip()
-            name = str(item.get("f14", "")).strip()
-            if code and name and len(code) == 6:
-                result.append({"stock_code": code, "stock_name": name})
-
-        logger.info(f"获取A股列表: {len(result)} 只")
-        return result
+        from app.utils.basicinfo_db import get_stock_basic_db
+        db = get_stock_basic_db()
+        rows = db.get_all_stocks(status="active")
+        return [{"stock_code": r["symbol"], "stock_name": r["name"]} for r in rows]
 
     # ================================================================
     # 个股资金流向

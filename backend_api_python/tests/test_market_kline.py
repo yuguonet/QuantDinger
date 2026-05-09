@@ -74,7 +74,7 @@ def main():
     print("=" * 65)
 
     # ── 导入 & 初始化 ──
-    from app.data_sources.provider import autodiscover, _fetch_all_cn_codes
+    from app.data_sources.provider import autodiscover
     from app.data_sources.coordinator import get_coordinator
     from app.data_sources.circuit_breaker import get_realtime_circuit_breaker
 
@@ -88,7 +88,8 @@ def main():
         all_codes = [c.strip() for c in args.codes.split(",") if c.strip()]
     else:
         print("\n  📋 获取股票列表...")
-        all_codes = _fetch_all_cn_codes()
+        from app.utils.basicinfo_db import get_stock_basic_db
+        all_codes = get_stock_basic_db().market_all_codes(status="active")
         if not all_codes:
             print("  ❌ 获取股票列表失败")
             return
@@ -101,20 +102,19 @@ def main():
     # ── 调用 Coordinator ──
     t0 = time.time()
 
-    # 如果指定了 limit 或 codes，需要临时替换 _fetch_all_cn_codes 的返回
-    # 通过环境变量传递给 coordinator（它内部会调 _fetch_all_cn_codes）
-    # 这里直接用 coordinate_market_kline 但先手动注入股票列表
     if args.codes or args.limit > 0:
-        # 走自定义路径：直接构造任务
-        result = _run_with_custom_codes(
-            coord, cb, all_codes,
+        # 走自定义路径：传入指定的股票列表
+        result = coord.coordinate_market_kline(
+            cb=cb,
+            market="CNStock",
             timeframe=args.timeframe,
             count=args.count if not args.start_date else None,
             adj=args.adj,
             timeout=args.timeout,
+            preferred_source=args.preferred,
             start_date=args.start_date,
             end_date=args.end_date,
-            preferred_source=args.preferred,
+            symbols=all_codes,
         )
     else:
         result = coord.coordinate_market_kline(
@@ -149,39 +149,6 @@ def main():
     print(f"  ⚡ 速度 {speed:.1f}只/秒 | 平均 {avg_bars:.0f}条/只")
     print(f"  📁 {os.path.abspath(OUTPUT_DIR)}/{args.timeframe}/")
     print(f"  {'─' * 55}\n")
-
-
-def _run_with_custom_codes(
-    coord, cb, codes, *,
-    timeframe, count, adj, timeout, start_date, end_date, preferred_source,
-):
-    """
-    对指定股票列表运行 coordinate_market_kline 的逻辑。
-    因为 coordinate_market_kline 内部调 _fetch_all_cn_codes()，
-    这里用 monkey-patch 注入自定义列表。
-    """
-    import app.data_sources.provider as provider_mod
-
-    # monkey-patch: 让 _fetch_all_cn_codes 返回我们指定的列表
-    original_fetch = provider_mod._fetch_all_cn_codes
-    provider_mod._fetch_all_cn_codes = lambda: codes
-
-    try:
-        result = coord.coordinate_market_kline(
-            cb=cb,
-            market="CNStock",
-            timeframe=timeframe,
-            count=count,
-            adj=adj,
-            timeout=timeout,
-            preferred_source=preferred_source,
-            start_date=start_date,
-            end_date=end_date,
-        )
-    finally:
-        provider_mod._fetch_all_cn_codes = original_fetch
-
-    return result
 
 
 if __name__ == "__main__":

@@ -242,20 +242,22 @@ class BaiduDataSource:
         self, timeframe: str = "15m", count: int = 200,
         adj: str = "qfq", timeout: int = 30,
         start_date: str = "", end_date: str = "",
+        symbols: Optional[List[str]] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
         """全市场批量K线。百度API仅支持15m周期。"""
         if timeframe != "15m":
             return NotSupportedResult(self.name, "fetch_market_kline", f"百度API仅支持15m周期，不支持 {timeframe}")
 
-        from app.data_sources.provider import _fetch_all_cn_codes
         from queue import Queue, Empty
 
-        codes = _fetch_all_cn_codes()
-        if not codes:
+        if not symbols:
+            from app.utils.basicinfo_db import get_stock_basic_db
+            symbols = get_stock_basic_db().market_all_codes(status="active")
+        if not symbols:
             return {}
 
         group_size = 50
-        groups = [codes[i:i + group_size] for i in range(0, len(codes), group_size)]
+        groups = [symbols[i:i + group_size] for i in range(0, len(symbols), group_size)]
         q: Queue = Queue()
         for idx, g in enumerate(groups):
             q.put((idx, g))

@@ -293,6 +293,7 @@ class XueqiuDataSource:
         self, timeframe: str = "15m", count: int = 200,
         adj: str = "qfq", timeout: int = 30,
         start_date: str = "", end_date: str = "",
+        symbols: Optional[List[str]] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
         全市场批量K线 — 并发获取。
@@ -302,16 +303,17 @@ class XueqiuDataSource:
         if timeframe not in _XQ_TF_TO_PERIOD:
             return NotSupportedResult(self.name, "fetch_market_kline", f"不支持 {timeframe} 周期")
 
-        from app.data_sources.provider import _fetch_all_cn_codes
         from queue import Queue, Empty
 
-        codes = _fetch_all_cn_codes()
-        if not codes:
+        if not symbols:
+            from app.utils.basicinfo_db import get_stock_basic_db
+            symbols = get_stock_basic_db().market_all_codes(status="active")
+        if not symbols:
             logger.warning("[雪球] 获取股票列表失败")
             return {}
 
         group_size = 50
-        groups = [codes[i:i + group_size] for i in range(0, len(codes), group_size)]
+        groups = [symbols[i:i + group_size] for i in range(0, len(symbols), group_size)]
         q: Queue = Queue()
         for idx, g in enumerate(groups):
             q.put((idx, g))

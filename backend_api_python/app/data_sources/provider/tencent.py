@@ -165,12 +165,14 @@ class TencentDataSource:
         self, timeframe: str = "1D", count: int = 300,
         adj: str = "qfq", timeout: int = 15,
         start_date: str = "", end_date: str = "",
+        symbols: Optional[List[str]] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
         """全市场批量K线 — 并发 fetch_kline，支持历史数据"""
         from app.data_sources.provider import _batch_fetch_kline_by_codes
         return _batch_fetch_kline_by_codes(
             self, timeframe=timeframe, count=count, adj=adj, timeout=timeout,
             start_date=start_date, end_date=end_date, batch_size=500,
+            symbols=symbols,
         )
 
     @retry_with_backoff(max_attempts=3, base_delay=1.2, max_delay=8.0, exceptions=(Exception,))

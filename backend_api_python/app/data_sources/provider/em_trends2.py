@@ -402,6 +402,7 @@ class EmTrends2DataSource:
         self, timeframe: str = "15m", count: int = 200,
         adj: str = "qfq", timeout: int = 30,
         start_date: str = "", end_date: str = "",
+        symbols: Optional[List[str]] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
         全市场批量K线 — 30线程并发获取。
@@ -411,6 +412,10 @@ class EmTrends2DataSource:
         - 每组50只，从队列中领取
         - 30线程并发
         - 先完成的接着领下一组
+
+        Args:
+            symbols: 股票代码列表（带 sh/sz 前缀，如 ["sh600519", "sz000001"]），
+                     为 None 时自动获取全市场列表
         """
         if timeframe not in _EM_AGG_STEPS:
             return NotSupportedResult(self.name, "fetch_market_kline", f"不支持 {timeframe} 周期")
@@ -418,7 +423,10 @@ class EmTrends2DataSource:
         from queue import Queue, Empty
 
         # 获取股票列表
-        stocks = self._get_stock_list()
+        if symbols:
+            stocks = [{"code": c, "name": ""} for c in symbols]
+        else:
+            stocks = self._get_stock_list()
         if not stocks:
             logger.warning("[EmTrends2] 获取股票列表失败")
             return {}

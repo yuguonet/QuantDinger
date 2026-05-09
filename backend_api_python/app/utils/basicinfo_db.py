@@ -595,6 +595,76 @@ class StockBasicDB:
 
         return [self._row_to_dict(r) for r in rows]
 
+    def market_all_string(self, status: str = "active") -> str:
+        """
+        获取全市场所有股票代码，加上小写交易所前缀，以逗号拼接返回。
+
+        格式: "sh600519,sz000001,sh601398,..."
+
+        前缀规则:
+            SH → sh, SZ → sz, BJ → bj
+
+        Args:
+            status: 过滤状态，默认 "active"（只返回正常上市股票），
+                    传 None 不过滤
+
+        Returns:
+            逗号分隔的股票代码字符串，无数据返回空串 ""
+        """
+        self.ensure_table()
+
+        pool = self._get_pool()
+        if status:
+            with pool.cursor() as cur:
+                cur.execute(
+                    "SELECT symbol, market_cn FROM stock_basic_info "
+                    "WHERE status = %s ORDER BY symbol",
+                    (status,),
+                )
+                rows = cur.fetchall()
+        else:
+            with pool.cursor() as cur:
+                cur.execute(
+                    "SELECT symbol, market_cn FROM stock_basic_info ORDER BY symbol"
+                )
+                rows = cur.fetchall()
+
+        parts = []
+        for symbol, market_cn in rows:
+            prefix = (market_cn or "").strip().lower()
+            if prefix:
+                parts.append(f"{prefix}{symbol}")
+
+        return ",".join(parts)
+
+    def market_all_codes(self, status: str = "active") -> List[str]:
+        """
+        获取全市场所有股票代码（纯 6 位数字，无交易所前缀）。
+
+        Args:
+            status: 过滤状态，默认 "active"，传 None 不过滤
+
+        Returns:
+            代码列表，如 ["000001", "000002", ..., "688001"]
+        """
+        self.ensure_table()
+
+        pool = self._get_pool()
+        if status:
+            with pool.cursor() as cur:
+                cur.execute(
+                    "SELECT symbol FROM stock_basic_info "
+                    "WHERE status = %s ORDER BY symbol",
+                    (status,),
+                )
+                return [r[0] for r in cur.fetchall()]
+        else:
+            with pool.cursor() as cur:
+                cur.execute(
+                    "SELECT symbol FROM stock_basic_info ORDER BY symbol"
+                )
+                return [r[0] for r in cur.fetchall()]
+
     def get_stock_count(self, market_cn: str = None) -> int:
         """
         获取股票总数（只计 active 状态）。

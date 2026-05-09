@@ -195,17 +195,19 @@ class EastMoneyDataSource:
         self, timeframe: str = "1D", count: int = None,
         adj: str = "qfq", timeout: int = 15,
         start_date: str = "", end_date: str = "",
+        symbols: Optional[List[str]] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
         """全市场批量K线 — count=None 走批量行情（1 HTTP），count 有值走并发 K 线"""
         from app.data_sources.provider import _resolve_market_kline_count
         count = _resolve_market_kline_count(timeframe, count, start_date, end_date)
         if count is None:
             from app.data_sources.provider import _all_market_kline_via_quotes
-            return _all_market_kline_via_quotes(self, timeframe=timeframe, timeout=timeout)
+            return _all_market_kline_via_quotes(self, timeframe=timeframe, timeout=timeout, symbols=symbols)
 
-        from app.data_sources.provider import _fetch_all_cn_codes
-        codes = _fetch_all_cn_codes()
-        if not codes:
+        if not symbols:
+            from app.utils.basicinfo_db import get_stock_basic_db
+            symbols = get_stock_basic_db().market_all_codes(status="active")
+        if not symbols:
             return {}
         import concurrent.futures
         result: Dict[str, List[Dict[str, Any]]] = {}
@@ -218,9 +220,9 @@ class EastMoneyDataSource:
                 with lock:
                     result[code] = bars
 
-        max_workers = min(len(codes), 8)
+        max_workers = min(len(symbols), 8)
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = [pool.submit(_fetch_one, c) for c in codes]
+            futures = [pool.submit(_fetch_one, c) for c in symbols]
             concurrent.futures.wait(futures, timeout=timeout + 5)
         return result
 

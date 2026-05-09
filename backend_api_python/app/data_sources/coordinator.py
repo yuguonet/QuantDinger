@@ -1070,6 +1070,7 @@ class Coordinator:
         preferred_source: str = "",
         start_date: str = "",
         end_date: str = "",
+        symbols: Optional[List[str]] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
         全市场批量K线 — 分组多源并发模式。
@@ -1101,7 +1102,7 @@ class Coordinator:
         Returns:
             {code: kline_bars} — 合并所有源成功获取的数据
         """
-        from app.data_sources.provider import get_providers, NotSupportedResult, _fetch_all_cn_codes
+        from app.data_sources.provider import get_providers, NotSupportedResult
         from queue import Queue, Empty
 
         # ── 第一步: 发现支持 kline_batch 的源 ──
@@ -1133,7 +1134,10 @@ class Coordinator:
             available_providers = preferred + others
 
         # ── 第二步: 获取股票列表并分组 ──
-        all_codes = _fetch_all_cn_codes()
+        if not symbols:
+            from app.utils.basicinfo_db import get_stock_basic_db
+            symbols = get_stock_basic_db().market_all_codes(status="active")
+        all_codes = symbols
         if not all_codes:
             logger.warning("[协助层] market_kline 获取股票列表失败")
             return {}

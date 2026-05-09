@@ -36,18 +36,19 @@ class TdxDataSource:
                     "kline_batch": True, "quote": True, "quote_priority": 25,
                     "batch_quote": False, "batch_quote_priority": 30, "hk": False, "markets": {"CNStock"}}
 
-    def fetch_market_kline(self, timeframe="1D", count=300, adj="qfq", timeout=15, start_date="", end_date=""):
+    def fetch_market_kline(self, timeframe="1D", count=300, adj="qfq", timeout=15, start_date="", end_date="", symbols=None):
         """全市场批量K线 — 并发 fetch_kline，支持历史数据"""
-        from app.data_sources.provider import _fetch_all_cn_codes
-        codes = _fetch_all_cn_codes()
-        if not codes: return {}
+        if not symbols:
+            from app.utils.basicinfo_db import get_stock_basic_db
+            symbols = get_stock_basic_db().market_all_codes(status="active")
+        if not symbols: return {}
         if start_date:
             from app.data_sources.provider import calc_kline_count
             count = calc_kline_count(timeframe, start_date, end_date)
         import concurrent.futures; result = {}
         def _f(c): return c, self.fetch_kline(c, timeframe, count, adj=adj, timeout=timeout, start_date=start_date, end_date=end_date)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(codes), 8)) as pool:
-            for fut in concurrent.futures.as_completed([pool.submit(_f, c) for c in codes]):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(symbols), 8)) as pool:
+            for fut in concurrent.futures.as_completed([pool.submit(_f, c) for c in symbols]):
                 try:
                     c, bars = fut.result()
                     if bars: result[c] = bars

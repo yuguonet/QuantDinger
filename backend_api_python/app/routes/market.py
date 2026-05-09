@@ -591,7 +591,13 @@ def get_stock_name():
         stock_name = symbol  # 默认使用代码
         
         try:
-            if market == 'USStock':
+            if market == 'CNStock':
+                from app.utils.basicinfo_db import get_stock_basic_db
+                stock = get_stock_basic_db().get_stock(symbol)
+                if stock and stock.get("name"):
+                    stock_name = stock["name"]
+
+            elif market == 'USStock':
                 # 对于股票，尝试获取基本信息
                 import yfinance as yf
                 

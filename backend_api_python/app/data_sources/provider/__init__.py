@@ -257,54 +257,24 @@ def calc_kline_count(timeframe: str, start_date: str, end_date: str = "") -> int
 # 全市场公共辅助 — 供无原生全市场接口的 Provider 复用
 # ================================================================
 
-def _fetch_all_cn_codes() -> List[str]:
-    """
-    获取全市场 A 股代码列表（通过东财 clist API 一次拿完）。
-
-    Returns:
-        6 位纯数字代码列表，如 ["000001", "000002", ..., "688001", ...]
-    """
-    import requests as _requests
-    try:
-        from app.data_sources.rate_limiter import get_request_headers as _get_headers
-    except ImportError:
-        def _get_headers(**kw):
-            return {"User-Agent": "Mozilla/5.0"}
-    try:
-        resp = _requests.get(
-            "https://push2.eastmoney.com/api/qt/clist/get",
-            headers=_get_headers(referer="https://quote.eastmoney.com/"),
-            params={
-                "pn": 1, "pz": 6000, "po": 1, "np": 1,
-                "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-                "fltt": 2, "invt": 2, "fid": "f3",
-                "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
-                "fields": "f12",
-            },
-            timeout=15,
-        )
-        diff = ((resp.json().get("data") or {}).get("diff")) or []
-        return [str(d["f12"]).strip() for d in diff if d.get("f12")]
-    except Exception:
-        return []
-
-
-
 def _batch_fetch_quotes_by_codes(
     provider,
     batch_size: int = 500,
     timeout: int = 10,
+    symbols: Optional[List[str]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """
     通过多次调用 fetch_batch_quotes 拼出全市场行情。
     用于不支持原生全市场行情的 Provider（如新浪、腾讯）。
     """
-    codes = _fetch_all_cn_codes()
-    if not codes:
+    if not symbols:
+        from app.utils.basicinfo_db import get_stock_basic_db
+        symbols = get_stock_basic_db().market_all_codes(status="active")
+    if not symbols:
         return {}
     result: Dict[str, Dict[str, Any]] = {}
-    for i in range(0, len(codes), batch_size):
-        batch = codes[i:i + batch_size]
+    for i in range(0, len(symbols), batch_size):
+        batch = symbols[i:i + batch_size]
         try:
             partial = provider.fetch_batch_quotes(batch, timeout=timeout)
             if partial:
@@ -392,6 +362,7 @@ def _all_market_kline_via_quotes(
     provider,
     timeframe: str = "1D",
     timeout: int = 15,
+    symbols: Optional[List[str]] = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
     批量行情快照路径（end_date=today 时锁定走此路径）。
@@ -402,7 +373,10 @@ def _all_market_kline_via_quotes(
 
     返回格式与 fetch_kline 一致：{code: [bar_dict]}，每只股票 1 根 bar。
     """
-    quotes = provider.fetch_batch_quotes(_fetch_all_cn_codes(), timeout=timeout)
+    if not symbols:
+        from app.utils.basicinfo_db import get_stock_basic_db
+        symbols = get_stock_basic_db().market_all_codes(status="active")
+    quotes = provider.fetch_batch_quotes(symbols, timeout=timeout)
     if not quotes or isinstance(quotes, NotSupportedResult):
         return {}
     result: Dict[str, List[Dict[str, Any]]] = {}
@@ -443,12 +417,12 @@ def _batch_fetch_kline_by_codes(
     start_date: str = "",
     end_date: str = "",
     batch_size: int = 500,
+    symbols: Optional[List[str]] = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
     通过多次并发调用 fetch_kline 拼出全市场K线。
 
     用于不支持原生全市场K线的 Provider（如新浪、腾讯，单次HTTP限 ~500 只）。
-    自动从东财获取全市场代码列表，然后按 batch_size 分批并发拉取。
 
     Args:
         provider:    Provider 实例（需有 fetch_kline 方法）
@@ -459,19 +433,22 @@ def _batch_fetch_kline_by_codes(
         start_date:  起始日期
         end_date:    结束日期
         batch_size:  每批并发的股票数量
+        symbols:     股票代码列表，为 None 时自动从 DB 获取
 
     Returns:
         全市场K线字典 {code: kline_bars}
     """
     import concurrent.futures
-    codes = _fetch_all_cn_codes()
-    if not codes:
+    if not symbols:
+        from app.utils.basicinfo_db import get_stock_basic_db
+        symbols = get_stock_basic_db().market_all_codes(status="active")
+    if not symbols:
         return {}
     result: Dict[str, List[Dict[str, Any]]] = {}
     lock = threading.Lock()
 
-    for i in range(0, len(codes), batch_size):
-        batch = codes[i:i + batch_size]
+    for i in range(0, len(symbols), batch_size):
+        batch = symbols[i:i + batch_size]
 
         def _fetch_one(code: str):
             bars = provider.fetch_kline(
@@ -558,9 +535,10 @@ class BaseDataSource(Protocol):
         self, timeframe: str, count: int = 300,
         adj: str = "qfq", timeout: int = 15,
         start_date: str = "", end_date: str = "",
+        symbols: Optional[List[str]] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
-        全市场批量K线 — 无需传入代码列表，自动获取全市场股票。
+        全市场批量K线。
 
         路由逻辑:
           - end_date 是今天（或为空）→ 走 fetch_batch_quotes（1 HTTP 拿 N 只行情，转单根 bar）
@@ -573,6 +551,7 @@ class BaseDataSource(Protocol):
             timeout:   请求超时秒数
             start_date: 起始日期（"YYYY-MM-DD"），提供时用交易日历反推 count
             end_date:   结束日期（"YYYY-MM-DD"），为空则取今天
+            symbols:    股票代码列表，为 None 时自动从 DB 获取全市场 active 股票
 
         Returns:
             {code: kline_bars} — 仅包含成功获取的代码。

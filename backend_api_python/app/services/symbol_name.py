@@ -158,8 +158,25 @@ def resolve_symbol_name(market: str, symbol: str) -> Optional[str]:
         # otherwise fall back to yfinance.
         return _resolve_name_from_finnhub(s) or _resolve_name_from_yfinance(s)
 
-    # CN/HK stocks: try Tencent quote name first (no key), then yfinance best-effort.
-    if m in ('CNStock', 'HKStock'):
+    # CNStock: 优先从 basicinfo_db 查，无则 fallback 腾讯
+    if m == 'CNStock':
+        try:
+            from app.utils.basicinfo_db import get_stock_basic_db
+            stock = get_stock_basic_db().get_stock(s)
+            if stock and stock.get("name"):
+                return stock["name"]
+        except Exception:
+            pass
+        try:
+            parts = fetch_quote(s)
+            if parts and len(parts) > 1 and parts[1]:
+                return str(parts[1]).strip()
+        except Exception:
+            pass
+        return _resolve_name_from_yfinance(s)
+
+    # HK stocks: try Tencent quote name first (no key), then yfinance best-effort.
+    if m == 'HKStock':
         try:
             parts = fetch_quote(s)
             if parts and len(parts) > 1 and parts[1]:

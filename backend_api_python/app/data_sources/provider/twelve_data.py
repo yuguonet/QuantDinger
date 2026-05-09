@@ -64,7 +64,7 @@ class TwelveDataSource:
                     "kline_batch": True, "quote": True, "quote_priority": 100,
                     "batch_quote": False, "batch_quote_priority": 100, "hk": True, "markets": {"CNStock", "HKStock"}}
 
-    def fetch_market_kline(self, timeframe="1D", count=300, adj="qfq", timeout=15, start_date="", end_date=""):
+    def fetch_market_kline(self, timeframe="1D", count=300, adj="qfq", timeout=15, start_date="", end_date="", symbols=None):
         """全市场批量K线 — 不支持"""
         return NotSupportedResult(self.name, "fetch_market_kline")
 

@@ -358,6 +358,7 @@ class TdxExDataSource:
         self, timeframe: str = "1D", count: int = 300,
         adj: str = "qfq", timeout: int = 15,
         start_date: str = "", end_date: str = "",
+        symbols: Optional[List[str]] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
         """全市场批量K线 — 并发获取"""
         if timeframe not in _TDX_EX_TF_CATEGORY:
@@ -366,11 +367,12 @@ class TdxExDataSource:
         if not HAS_TDX or not _live_servers:
             return NotSupportedResult(self.name, "fetch_market_kline", "未安装 pytdx 或无可用服务器")
 
-        from app.data_sources.provider import _fetch_all_cn_codes
         from queue import Queue, Empty
 
-        codes = _fetch_all_cn_codes()
-        if not codes:
+        if not symbols:
+            from app.utils.basicinfo_db import get_stock_basic_db
+            symbols = get_stock_basic_db().market_all_codes(status="active")
+        if not symbols:
             return {}
 
         if start_date:
@@ -378,7 +380,7 @@ class TdxExDataSource:
             count = calc_kline_count(timeframe, start_date, end_date)
 
         group_size = 50
-        groups = [codes[i:i + group_size] for i in range(0, len(codes), group_size)]
+        groups = [symbols[i:i + group_size] for i in range(0, len(symbols), group_size)]
         q: Queue = Queue()
         for idx, g in enumerate(groups):
             q.put((idx, g))
