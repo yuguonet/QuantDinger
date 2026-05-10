@@ -39,7 +39,7 @@ import requests
 
 from app.data_sources.normalizer import normalize_cn_code as to_sina_code
 from app.data_sources.rate_limiter import (
-    get_request_headers, retry_with_backoff, RateLimiter, get_shared_session, throttled_get,
+    get_request_headers, retry_with_backoff, RateLimiter, get_shared_session,
 )
 from app.data_sources.provider import register, NotSupportedResult
 from app.utils.logger import get_logger
@@ -175,7 +175,7 @@ def _fetch_sina_kline_hisdata(sc: str, count: int, timeout: int) -> List[Dict[st
     """通过新浪 hisdata 页面获取日线K线（兜底机制）"""
     url = f"https://finance.sina.com.cn/realstock/company/{sc}/hisdata/klc_kl.js"
     _sina_limiter.wait()
-    resp = throttled_get(
+    resp = get_shared_session().get(
         url,
         headers=get_request_headers(referer=_sina_kline_referers.next()),
         timeout=timeout,
@@ -258,12 +258,14 @@ class SinaDataSource:
             symbols=symbols,
         )
 
-    def _raw_fetch_kline(
+    @retry_with_backoff(max_attempts=3, base_delay=1.5, max_delay=10.0, exceptions=(
+        requests.exceptions.RequestException, ConnectionError, TimeoutError,
+    ))
+    def fetch_kline(
         self, code: str, timeframe: str = "1D", count: int = 300,
         adj: str = "qfq", timeout: int = 10,
         start_date: str = "", end_date: str = "",
     ) -> List[Dict[str, Any]]:
-        """无限流无重试的原始 fetch_kline — 供 _batch_fetch_kline_by_codes 调用"""
         if start_date:
             from app.data_sources.provider import calc_kline_count
             count = calc_kline_count(timeframe, start_date, end_date)
@@ -274,6 +276,7 @@ class SinaDataSource:
         scale = _SINA_TF_TO_SCALE.get(timeframe)
         if scale is None:
             return []
+        _sina_limiter.wait()
         if timeframe != "1D":
             bars = self._fetch_minute_kline(sc, scale, count, timeout)
         else:
@@ -282,22 +285,10 @@ class SinaDataSource:
             bars = _apply_fwd_adjust(bars, code)
         return bars
 
-    @retry_with_backoff(max_attempts=3, base_delay=1.5, max_delay=10.0, exceptions=(
-        requests.exceptions.RequestException, ConnectionError, TimeoutError,
-    ))
-    def fetch_kline(
-        self, code: str, timeframe: str = "1D", count: int = 300,
-        adj: str = "qfq", timeout: int = 10,
-        start_date: str = "", end_date: str = "",
-    ) -> List[Dict[str, Any]]:
-        _sina_limiter.wait()
-        return self._raw_fetch_kline(code, timeframe, count, adj=adj, timeout=timeout,
-                                     start_date=start_date, end_date=end_date)
-
     def _fetch_raw_daily_kline(self, sc: str, count: int, timeout: int) -> List[Dict[str, Any]]:
         url = "https://vip.stock.finance.sina.com.cn/cn/api/json.php/CN_MarketDataService.getKLineData"
         params = {"symbol": sc, "scale": 240, "ma": "no", "datalen": min(int(count), 2000)}
-        resp = throttled_get(
+        resp = get_shared_session().get(
             url,
             headers=get_request_headers(referer=_sina_kline_referers.next()),
             params=params, timeout=timeout,
@@ -313,7 +304,7 @@ class SinaDataSource:
     def _fetch_minute_kline(self, sc: str, scale: int, count: int, timeout: int) -> List[Dict[str, Any]]:
         url = "https://quotes.sina.cn/cn/api/jsonp_v2.php/var/CN_MarketDataService.getKLineData"
         params = {"symbol": sc, "scale": scale, "ma": "no", "datalen": min(int(count), 2000)}
-        resp = throttled_get(
+        resp = get_shared_session().get(
             url,
             headers=get_request_headers(referer=_sina_kline_referers.next()),
             params=params, timeout=timeout,

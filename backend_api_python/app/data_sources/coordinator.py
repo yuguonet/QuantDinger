@@ -63,7 +63,6 @@ from __future__ import annotations
 
 import atexit
 import concurrent.futures
-from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -1074,200 +1073,241 @@ class Coordinator:
         symbols: Optional[List[str]] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
-        全市场批量K线 — 扁平并发模式（对齐 akline_market.py 架构）。
+        全市场批量K线 — 分组多源并发模式。
 
-        核心设计（与 akline_market.py 的 source_worker 完全一致）:
-          1. 每个 Provider 启动一个线程 + 持久 ThreadPoolExecutor
-          2. 共享队列分组，各 Provider 线程领组 → 组内逐只并发拉取
-          3. 先完成的 Provider 立即领下一组，不闲着
-          4. 直接调用 Provider 的原始 fetch 函数，跳过 fetch_market_kline 链路
-          5. 无 RateLimiter、无 retry_with_backoff、无 _fetch_group_kline 包装
-          6. 域名级并发限流（DomainThrottler）已提供反封禁保护
+        核心设计:
+          1. 股票按50只一组分组，放入共享队列
+          2. 每个支持 kline_batch 的 Provider 启动一个线程
+          3. 各 Provider 线程从队列中取组，并发拉取不同组的数据
+          4. 先完成的 Provider 立即取下一组，直到队列为空
+          5. 每组20s超时，超时的组放回队尾给其他源重试
+          6. 死源（连续超时）不参与后续任务分配（≥2个有效源时）
+          7. 全局超时后，合并所有已获取的数据返回
+
+        和旧版的区别:
+          旧版: 逐源 fallback → 第一个成功的整个返回（单源串行）
+          新版: 多源并发 → 每个源同时拉不同组 → 合并所有结果（多源并行）
 
         Args:
-            cb:      熔断器（保留接口兼容，批量路径不使用）
-            market:  市场名称
-            timeframe: K线周期
+            cb:      熔断器
+            market:  市场名称（"CNStock" / "HKStock" / ...）
+            timeframe: K线周期（"1D" / "5m" / ...）
             count:   每只股票的数据条数
-            adj:     复权方式
+            adj:     复权方式（"qfq" 前复权 / "hfq" 后复权 / "" 不复权）
             timeout: 全局超时（秒）
-            preferred_source: 指定首选源
-            start_date: 起始日期
-            end_date:   结束日期
-            symbols: 股票代码列表
+            preferred_source: 指定首选源（如 "tencent"），优先尝试
+            start_date: 起始日期（"YYYY-MM-DD"）
+            end_date:   结束日期（"YYYY-MM-DD"），为空则取今天
 
         Returns:
-            {code: kline_bars}
+            {code: kline_bars} — 合并所有源成功获取的数据
         """
         from app.data_sources.provider import get_providers, NotSupportedResult
         from queue import Queue, Empty
 
-        # ── 发现源 ──
+        # ── 第一步: 发现支持 kline_batch 的源 ──
         providers = get_providers(capability="kline_batch", timeframe=timeframe, market=market)
+
         if not providers:
             logger.warning("[协助层] market_kline market=%s tf=%s 无可用源", market, timeframe)
             return {}
 
-        if not symbols:
-            logger.warning("[协助层] market_kline 未传入 symbols")
+        # 过滤掉已熔断的源和死源
+        available_providers = []
+        for p in providers:
+            if not cb.is_available(p.name):
+                logger.debug("[协助层] market_kline %s 已熔断，跳过", p.name)
+                continue
+            if self._is_source_dead(p.name):
+                logger.debug("[协助层] market_kline %s 已标记为死源，跳过", p.name)
+                continue
+            available_providers.append(p)
+
+        if not available_providers:
+            logger.warning("[协助层] market_kline market=%s tf=%s 无可用源(全部熔断/死亡)", market, timeframe)
             return {}
 
         # 按 preferred_source 排序
         if preferred_source:
-            preferred = [p for p in providers if p.name == preferred_source]
-            others = [p for p in providers if p.name != preferred_source]
-            providers = preferred + others
+            preferred = [p for p in available_providers if p.name == preferred_source]
+            others = [p for p in available_providers if p.name != preferred_source]
+            available_providers = preferred + others
 
-        # ── 分组 ──
-        total = len(symbols)
-        group_size = 100 if total > 100 else total
-        groups = [symbols[i:i + group_size] for i in range(0, total, group_size)]
+        # ── 第二步: 获取股票列表并分组 ──
+        if not symbols:
+            from app.utils.basicinfo_db import get_stock_basic_db
+            symbols = get_stock_basic_db().market_all_codes(status="active")
+        all_codes = symbols
+        if not all_codes:
+            logger.warning("[协助层] market_kline 获取股票列表失败")
+            return {}
+
+        group_size = 50
+        groups = [all_codes[i:i + group_size] for i in range(0, len(all_codes), group_size)]
+        total_groups = len(groups)
 
         logger.info("[协助层] market_kline %d只 → %d组(每组%d) → %d源并发: %s",
-                    total, len(groups), group_size, len(providers),
-                    " | ".join(p.name for p in providers))
+                    len(all_codes), total_groups, group_size,
+                    len(available_providers),
+                    " | ".join(p.name for p in available_providers))
 
-        # ── 共享队列 ──
-        q: Queue = Queue()
-        for idx, g in enumerate(groups):
-            q.put((idx, g))
+        # ── 第三步: 共享任务队列 ──
+        task_queue: Queue = Queue()
+        for idx, group in enumerate(groups):
+            task_queue.put((idx, group))
 
-        # ── 共享结果 ──
+        # ── 第四步: 共享结果和状态 ──
         result: Dict[str, List[Dict[str, Any]]] = {}
-        lock = threading.Lock()
+        result_lock = threading.Lock()
 
         # 每个源的统计
-        stats: Dict[str, Dict[str, int]] = {}
+        source_stats: Dict[str, Dict[str, int]] = {}  # {name: {"ok": N, "fail": N, "groups": N}}
         stats_lock = threading.Lock()
 
-        # ── 获取每个 Provider 的原始 fetch 函数 ──
-        # 绕过 fetch_market_kline → _batch_fetch_kline_by_codes → RateLimiter 链路
-        # 直接调用 _raw_fetch_kline 或等效函数，与 akline_market.py 的 fetch_fn 对齐
-        def _get_raw_fn(provider):
-            """获取 Provider 的原始单只 fetch 函数（无限流无重试）"""
-            from datetime import datetime as _dt
+        # 超时的源（本轮超时，不参与下一轮取组）
+        timed_out_sources: Set[str] = set()
+        timed_out_lock = threading.Lock()
 
-            # em_trends2: 有独立的 _em_trends2_kline 函数
-            if provider.name == "em_trends2":
-                from app.data_sources.provider.em_trends2 import _em_trends2_kline, _EM_AGG_STEPS
-                from app.data_sources.provider.adjustment import apply_fwd_adjust as _fwd
+        # 全局超时事件
+        global_stop = threading.Event()
 
-                if timeframe not in _EM_AGG_STEPS:
-                    return None
+        per_task_timeout = 20.0  # 每组超时20s
 
-                def fn(code):
-                    data = _em_trends2_kline(code, timeframe, count)
-                    if not data:
-                        return None
-                    bars = []
-                    for bar in data:
-                        try:
-                            ts_str = str(bar.get("time", ""))
-                            if "-" in ts_str and ":" in ts_str:
-                                ts = int(_dt.strptime(ts_str[:16], "%Y-%m-%d %H:%M").timestamp())
-                            else:
-                                ts = int(float(ts_str))
-                            bars.append({
-                                "time": ts,
-                                "open": round(float(bar["open"]), 4),
-                                "high": round(float(bar["high"]), 4),
-                                "low": round(float(bar["low"]), 4),
-                                "close": round(float(bar["close"]), 4),
-                                "volume": round(float(bar["volume"]), 2),
-                            })
-                        except (ValueError, TypeError, KeyError):
-                            continue
-                    if adj == "qfq" and bars:
-                        bars = _fwd(bars, code)
-                    return bars if bars else None
-                return fn
+        # ── 第五步: 定义 Provider Worker ──
+        def _provider_worker(provider):
+            """单个 Provider 的 worker 线程主循环"""
+            name = provider.name
+            consecutive_timeout = 0
+            max_consecutive_timeout = 3  # 连续超时3次标记为死源
 
-            # 其它 Provider: 优先用 _raw_fetch_kline
-            raw = getattr(provider, '_raw_fetch_kline', None)
-            if callable(raw):
-                def fn(code):
-                    return raw(code, timeframe, count, adj=adj, timeout=10,
-                               start_date=start_date, end_date=end_date)
-                return fn
-
-            # fallback: fetch_kline（带限流，但总比没有好）
-            def fn(code):
-                return provider.fetch_kline(code, timeframe, count, adj=adj, timeout=10,
-                                            start_date=start_date, end_date=end_date)
-            return fn
-
-        # ── 定义 Source Worker（与 akline_market.py 的 source_worker 对齐）──
-        THREADS_PER_SOURCE = 8   # 每源并发线程数，与 akline_market.py 一致
-
-        def source_worker(name, fetch_fn):
-            """每个源: 持久线程池, 每次领1组, 完成立即领下一组"""
-            ok = fail = 0
             with stats_lock:
-                stats[name] = {"ok": 0, "fail": 0, "groups": 0}
+                source_stats[name] = {"ok": 0, "fail": 0, "groups": 0, "timeout": 0}
 
-            with ThreadPoolExecutor(max_workers=THREADS_PER_SOURCE) as pool:
-                while True:
-                    try:
-                        _, group_codes = q.get(timeout=5)
-                    except Empty:
+            while not global_stop.is_set():
+                # 检查是否被标记为超时源
+                with timed_out_lock:
+                    if name in timed_out_sources:
+                        logger.debug("[协助层] %s 被标记为超时源，停止取组", name)
                         break
 
-                    def fetch_one(code):
-                        nonlocal ok, fail
-                        # 跳过已有数据的 code
-                        with lock:
-                            if code in result:
-                                return
-                        try:
-                            data = fetch_fn(code)
-                            if data and len(data) > 0:
-                                with lock:
-                                    if code not in result:
-                                        result[code] = data
-                                        ok += 1
-                                        return
-                        except:
-                            pass
-                        fail += 1
+                # 从队列取一组
+                try:
+                    group_idx, group_codes = task_queue.get(timeout=2)
+                except Empty:
+                    break  # 队列为空，退出
 
-                    futs = [pool.submit(fetch_one, c) for c in group_codes]
-                    for f in futs:
-                        try:
-                            f.result()
-                        except:
-                            pass
+                # 检查是否已被其他源全部完成（组内所有代码已有数据）
+                with result_lock:
+                    remaining = [c for c in group_codes if c not in result]
+                if not remaining:
+                    task_queue.task_done()
+                    continue  # 这组已被其他源全部完成，跳过
 
+                # 尝试获取数据
+                with stats_lock:
+                    source_stats[name]["groups"] += 1
+
+                start_t = time.time()
+                try:
+                    # 调用 Provider 的 fetch_market_kline
+                    # 注意: 这里传入的是 remaining（只获取还没有数据的代码）
+                    # 但 Provider 的 fetch_market_kline 接口不接受 codes 参数
+                    # 所以我们直接调用 Provider 内部的批量获取逻辑
+                    # 通过 fetch_kline 逐只获取（保持线程结构）
+                    group_result = self._fetch_group_kline(
+                        provider, remaining, timeframe, count, adj, per_task_timeout,
+                        start_date, end_date,
+                    )
+                    elapsed = time.time() - start_t
+
+                    if group_result and not isinstance(group_result, NotSupportedResult):
+                        # 成功
+                        with result_lock:
+                            result.update(group_result)
+
+                        with stats_lock:
+                            source_stats[name]["ok"] += len(group_result)
+
+                        cb.record_success(name)
+                        self._mark_source_alive(name)
+                        consecutive_timeout = 0
+
+                        logger.debug("[协助层] %s 组%d 完成: %d只 (%.1fs)",
+                                    name, group_idx, len(group_result), elapsed)
+                    else:
+                        # 返回空或不支持
+                        with stats_lock:
+                            source_stats[name]["fail"] += 1
+                        cb.record_failure(name, "empty")
+
+                        # 不支持的源直接退出，不标记为死源
+                        if isinstance(group_result, NotSupportedResult):
+                            logger.debug("[协助层] %s 不支持 %s, 退出", name, timeframe)
+                            break
+
+                except Exception as e:
+                    elapsed = time.time() - start_t
                     with stats_lock:
-                        stats[name]["ok"] = ok
-                        stats[name]["fail"] = fail
-                        stats[name]["groups"] += 1
-                    q.task_done()
+                        source_stats[name]["fail"] += 1
+                    cb.record_failure(name, str(e))
+                    logger.debug("[协助层] %s 组%d 异常: %s (%.1fs)", name, group_idx, e, elapsed)
 
-        # ── 启动所有源 ──
+                # 检查是否超时
+                if elapsed > per_task_timeout:
+                    consecutive_timeout += 1
+                    with stats_lock:
+                        source_stats[name]["timeout"] += 1
+
+                    # 将未完成的代码放回队列（其他源重试）
+                    with result_lock:
+                        still_missing = [c for c in remaining if c not in result]
+                    if still_missing:
+                        # 放回队列
+                        task_queue.put((-1, still_missing))
+
+                    # 连续超时 → 标记为超时源，不参与下一轮
+                    if consecutive_timeout >= max_consecutive_timeout:
+                        # 如果有效源 ≥2，标记为死源
+                        if len(available_providers) >= 2:
+                            self._mark_source_dead(name)
+                        with timed_out_lock:
+                            timed_out_sources.add(name)
+                        logger.warning("[协助层] %s 连续超时%d次，停止参与", name, consecutive_timeout)
+                        break
+                else:
+                    consecutive_timeout = 0
+
+                task_queue.task_done()
+
+        # ── 第六步: 启动所有 Provider 线程并等待 ──
         threads = []
-        for p in providers:
-            fn = _get_raw_fn(p)
-            if fn is None:
-                logger.debug("[协助层] %s 不支持 %s, 跳过", p.name, timeframe)
-                continue
-            t = threading.Thread(target=source_worker, args=(p.name, fn),
-                                name=f"mkline-{p.name}", daemon=True)
+        for p in available_providers:
+            t = threading.Thread(target=_provider_worker, args=(p,), name=f"mkline-{p.name}", daemon=True)
             threads.append(t)
             t.start()
 
-        if not threads:
-            logger.warning("[协助层] market_kline 无可用源（全部不支持 %s）", timeframe)
-            return {}
-
-        # 等待完成
+        # 等待所有线程完成或全局超时
         for t in threads:
             t.join(timeout=timeout)
 
-        # ── 统计 ──
+        # 标记全局停止
+        global_stop.set()
+
+        # 等待剩余线程退出
+        for t in threads:
+            t.join(timeout=3)
+
+        # ── 第七步: 收集统计信息 ──
         stats_lines = []
         with stats_lock:
-            for name, st in stats.items():
-                stats_lines.append(f"{name}: ✅{st['ok']} ❌{st['fail']} {st['groups']}组")
+            for name, st in source_stats.items():
+                timed_out = name in timed_out_sources
+                dead = self._is_source_dead(name)
+                status = "💀死" if dead else ("⏱超时" if timed_out else "✅活")
+                stats_lines.append(
+                    f"{name}: {st['ok']}只成功 {st['fail']}组失败 "
+                    f"{st['groups']}组完成 {st['timeout']}次超时 {status}"
+                )
 
         logger.info("[协助层] market_kline 完成: %d只数据 | %s",
                     len(result), " | ".join(stats_lines))
@@ -1286,13 +1326,13 @@ class Coordinator:
         end_date: str = "",
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
-        为一组股票通过 provider.fetch_market_kline 批量获取K线数据。
+        为一组股票并发获取K线数据。
 
-        直接调用 Provider 的 fetch_market_kline 接口，由 Provider 内部
-        负责并发/批量逻辑，coordinator 只负责传参和超时控制。
+        通过并发调用 Provider 的 fetch_kline 接口获取数据。
+        保持与 akline_market.py 一致的线程结构。
 
         Args:
-            provider: Provider 实例（须支持 kline_batch 能力）
+            provider: Provider 实例
             codes: 股票代码列表（一组，最多50只）
             timeframe: K线周期
             count: 数据条数
@@ -1306,32 +1346,35 @@ class Coordinator:
         """
         from app.data_sources.provider import NotSupportedResult
         from app.data_sources.normalizer import normalize_cn_code
+
+        result: Dict[str, List[Dict[str, Any]]] = {}
+        lock = threading.Lock()
+
         from app.data_sources.kline_clean import clean_klines
 
-        try:
-            batch_result = provider.fetch_market_kline(
-                timeframe=timeframe,
-                count=count,
-                adj=adj,
-                timeout=min(timeout, 20),
-                start_date=start_date,
-                end_date=end_date,
-                symbols=codes,
-            )
-        except Exception as e:
-            logger.debug("[_fetch_group_kline] %s fetch_market_kline 异常: %s", provider.name, e)
-            return {}
+        def _fetch_one(code):
+            try:
+                bars = provider.fetch_kline(
+                    code, timeframe, count, adj=adj,
+                    timeout=min(timeout, 10),
+                    start_date=start_date, end_date=end_date,
+                )
+                if bars and not isinstance(bars, NotSupportedResult):
+                    cleaned = clean_klines(bars, timeframe)
+                    with lock:
+                        result[normalize_cn_code(code)] = cleaned or bars
+            except Exception as e:
+                logger.debug("[_fetch_group_kline] %s 获取 %s 失败: %s",
+                            provider.name, code, e)
 
-        if not batch_result or isinstance(batch_result, NotSupportedResult):
-            return {}
-
-        # 标准化 code + 清洗 K 线
-        result: Dict[str, List[Dict[str, Any]]] = {}
-        for code, bars in batch_result.items():
-            if not bars:
-                continue
-            cleaned = clean_klines(bars, timeframe)
-            result[normalize_cn_code(code)] = cleaned or bars
+        # 并发获取，线程数取 min(组大小, 30)
+        max_workers = min(len(codes), 15)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_fetch_one, c): c for c in codes}
+            try:
+                concurrent.futures.wait(futures, timeout=timeout)
+            except Exception:
+                pass
 
         return result
 
