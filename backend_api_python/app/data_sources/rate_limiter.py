@@ -322,3 +322,32 @@ def get_shared_session() -> _requests.Session:
         })
         get_shared_session._session = s
     return get_shared_session._session
+
+
+def throttled_get(
+    url: str,
+    headers: dict = None,
+    params: dict = None,
+    timeout: int = 10,
+    limiter: RateLimiter = None,
+) -> _requests.Response:
+    """
+    带限流的 HTTP GET 请求 — 使用共享 Session（连接复用 + 禁用 SSL 验证）。
+
+    供 Provider 层在 fetch_kline 等方法中使用，替代直接 requests.get。
+    如果传入 limiter，请求前会调用 limiter.wait() 进行限流。
+
+    Args:
+        url:     请求 URL
+        headers: 请求头（可选）
+        params:  URL 参数（可选）
+        timeout: 超时秒数
+        limiter: 限流器实例（可选），传入时请求前会 wait()
+
+    Returns:
+        requests.Response 对象
+    """
+    if limiter is not None:
+        limiter.wait()
+    session = get_shared_session()
+    return session.get(url, headers=headers, params=params, timeout=timeout)

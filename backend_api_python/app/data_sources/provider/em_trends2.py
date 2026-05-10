@@ -408,14 +408,7 @@ class EmTrends2DataSource:
         全市场批量K线 — 30线程并发获取。
         支持 1m/5m/15m/30m/1H（不支持 1D）。
 
-        线程结构与 akline_market.py 保持一致:
-        - 每组50只，从队列中领取
-        - 30线程并发
-        - 先完成的接着领下一组
-
-        Args:
-            symbols: 股票代码列表（带 sh/sz 前缀，如 ["sh600519", "sz000001"]），
-                     为 None 时自动获取全市场列表
+        线程结构: 持久线程池跨组复用，先完成先领下一组。
         """
         if timeframe not in _EM_AGG_STEPS:
             return NotSupportedResult(self.name, "fetch_market_kline", f"不支持 {timeframe} 周期")
@@ -483,33 +476,36 @@ class EmTrends2DataSource:
             with lock:
                 stats_fail[0] += 1
 
+        # 持久线程池 — 跨组复用，避免每组重建开销
+        # 两层并发: group-level workers 领组, 共享 stock_pool 处理个股
+        stock_pool = ThreadPoolExecutor(max_workers=THREADS_PER_SOURCE)
+
         def _worker():
             while True:
                 try:
                     _, stocks_group = q.get(timeout=5)
                 except Empty:
                     break
-                futs = []
-                with ThreadPoolExecutor(max_workers=min(len(stocks_group), THREADS_PER_SOURCE)) as pool:
-                    for s in stocks_group:
-                        futs.append(pool.submit(_fetch_one, s))
-                    for f in futs:
-                        try:
-                            f.result()
-                        except Exception:
-                            pass
+                futs = [stock_pool.submit(_fetch_one, s) for s in stocks_group]
+                for f in futs:
+                    try:
+                        f.result()
+                    except Exception:
+                        pass
                 q.task_done()
 
-        # 启动 worker 线程
+        num_workers = min(THREADS_PER_SOURCE, len(groups))
         workers = []
-        for _ in range(min(THREADS_PER_SOURCE, len(groups))):
+        for _ in range(num_workers):
             t = threading.Thread(target=_worker, daemon=True)
             workers.append(t)
             t.start()
 
-        # 等待完成
-        for t in workers:
-            t.join(timeout=timeout)
+        try:
+            for t in workers:
+                t.join(timeout=timeout)
+        finally:
+            stock_pool.shutdown(wait=False)
 
         logger.info("[EmTrends2] 全市场完成: %d成功 %d失败", stats_ok[0], stats_fail[0])
         return result

@@ -414,11 +414,15 @@ def _batch_fetch_kline_by_codes(
     end_date: str = "",
     batch_size: int = 500,
     symbols: Optional[List[str]] = None,
-) -> Dict[str, List[Dict[str, Any]]]:
+) -> Dict[str, List[ Dict[str, Any]]]:
     """
     通过多次并发调用 fetch_kline 拼出全市场K线。
 
     用于不支持原生全市场K线的 Provider（如新浪、腾讯，单次HTTP限 ~500 只）。
+
+    批量路径优化: 优先使用 _raw_fetch_kline（无限流无重试），
+    避免 RateLimiter + retry_with_backoff 拖慢全市场批量获取。
+    域名级并发限流（DomainThrottler）已提供足够的反封禁保护。
 
     Args:
         provider:    Provider 实例（需有 fetch_kline 方法）
@@ -440,20 +444,25 @@ def _batch_fetch_kline_by_codes(
     result: Dict[str, List[Dict[str, Any]]] = {}
     lock = threading.Lock()
 
-    for i in range(0, len(symbols), batch_size):
-        batch = symbols[i:i + batch_size]
+    # 批量路径优先用 _raw_fetch_kline（绕过 RateLimiter + retry）
+    raw_fetch = getattr(provider, '_raw_fetch_kline', None)
+    fetch_fn = raw_fetch if callable(raw_fetch) else provider.fetch_kline
 
-        def _fetch_one(code: str):
-            bars = provider.fetch_kline(
-                code, timeframe, count, adj=adj, timeout=timeout,
-                start_date=start_date, end_date=end_date,
-            )
-            if bars:
-                with lock:
-                    result[normalize_cn_code(code)] = bars
+    # 持久线程池 — 跨批次复用，避免每批重建线程
+    max_workers = min(len(symbols), 8)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for i in range(0, len(symbols), batch_size):
+            batch = symbols[i:i + batch_size]
 
-        max_workers = min(len(batch), 8)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            def _fetch_one(code: str):
+                bars = fetch_fn(
+                    code, timeframe, count, adj=adj, timeout=timeout,
+                    start_date=start_date, end_date=end_date,
+                )
+                if bars:
+                    with lock:
+                        result[normalize_cn_code(code)] = bars
+
             futures = [pool.submit(_fetch_one, c) for c in batch]
             concurrent.futures.wait(futures, timeout=timeout + 5)
 

@@ -211,8 +211,8 @@ class EastMoneyDataSource:
         lock = threading.Lock()
 
         def _fetch_one(code: str):
-            bars = self.fetch_kline(code, timeframe, count, adj=adj, timeout=timeout,
-                                    start_date=start_date, end_date=end_date)
+            bars = self._raw_fetch_kline(code, timeframe, count, adj=adj, timeout=timeout,
+                                         start_date=start_date, end_date=end_date)
             if bars:
                 with lock:
                     result[code] = bars
@@ -222,6 +222,82 @@ class EastMoneyDataSource:
             futures = [pool.submit(_fetch_one, c) for c in symbols]
             concurrent.futures.wait(futures, timeout=timeout + 5)
         return result
+
+    def _raw_fetch_kline(
+        self, code: str, timeframe: str = "1D", count: int = 300,
+        adj: str = "qfq", timeout: int = 10,
+        start_date: str = "", end_date: str = "",
+    ) -> List[Dict[str, Any]]:
+        """无限流无重试的原始 fetch_kline — 供 fetch_market_kline 调用"""
+        if start_date:
+            from app.data_sources.provider import calc_kline_count
+            count = calc_kline_count(timeframe, start_date, end_date)
+        from datetime import date as _date
+        em_end = end_date.replace("-", "") if end_date else _date.today().strftime("%Y%m%d")
+
+        secid = _to_eastmoney_secid(code)
+        if not secid:
+            return []
+        klt = _EM_KLT.get(timeframe)
+        if klt is None:
+            return []
+
+        url = f"https://{_EM_KLINE_HOST}/api/qt/stock/kline/get"
+
+        resp = requests.get(
+            url,
+            headers=_make_headers(referer=_em_referers.next()),
+            params={
+                "secid": secid,
+                "ut": "fa5fd1943c7b386f172d6893dbbd1835",
+                "fields1": "f1,f2,f3",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                "klt": klt,
+                "fqt": _EM_FQT.get(adj, 1),
+                "end": em_end,
+                "lmt": min(int(count), 5000),
+            },
+            timeout=timeout,
+        )
+        try:
+            data = resp.json()
+        except Exception:
+            return []
+        if not isinstance(data, dict):
+            return []
+        klines_data = (data.get("data") or {}).get("klines")
+        if not isinstance(klines_data, list):
+            return []
+
+        out = []
+        for line in klines_data:
+            parts = line.split(",")
+            if len(parts) < 7:
+                continue
+            try:
+                dt_str = parts[0].strip()
+                ts = None
+                for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+                    try:
+                        ts = int(datetime.strptime(dt_str, fmt).timestamp())
+                        break
+                    except ValueError:
+                        continue
+                if ts is None:
+                    continue
+                o, c, h, low, v = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5])
+                if o == 0 and c == 0:
+                    continue
+                if h > 0 and low > 0 and h < low:
+                    h, low = low, h
+                out.append({
+                    "time": ts, "open": round(o, 4), "high": round(h, 4),
+                    "low": round(low, 4), "close": round(c, 4), "volume": round(v, 2),
+                })
+            except (ValueError, TypeError, IndexError):
+                continue
+        out.sort(key=lambda x: x["time"])
+        return out[-count:] if len(out) > count else out
 
     @retry_with_backoff(max_attempts=3, base_delay=1.0, max_delay=8.0, exceptions=(
         requests.exceptions.RequestException, ConnectionError, TimeoutError,
