@@ -35,7 +35,7 @@ from app.data_sources.normalizer import (
     normalize_cn_code as to_tencent_code, normalize_hk_code,
 )
 from app.data_sources.rate_limiter import (
-    get_request_headers, retry_with_backoff, get_tencent_limiter,
+    get_request_headers, retry_with_backoff, get_tencent_limiter, throttled_get,
 )
 from app.data_sources.provider import register, NotSupportedResult
 from app.utils.logger import get_logger
@@ -175,12 +175,12 @@ class TencentDataSource:
             symbols=symbols,
         )
 
-    @retry_with_backoff(max_attempts=3, base_delay=1.2, max_delay=8.0, exceptions=(Exception,))
-    def fetch_kline(
+    def _raw_fetch_kline(
         self, code: str, timeframe: str = "1D", count: int = 300,
         adj: str = "qfq", timeout: int = 10,
         start_date: str = "", end_date: str = "",
     ) -> List[Dict[str, Any]]:
+        """无限流无重试的原始 fetch_kline — 供 _batch_fetch_kline_by_codes 调用"""
         if start_date:
             from app.data_sources.provider import calc_kline_count
             count = calc_kline_count(timeframe, start_date, end_date)
@@ -193,9 +193,6 @@ class TencentDataSource:
         if not endpoint:
             return []
 
-        limiter = get_tencent_limiter()
-        limiter.wait()
-
         if endpoint == "mkline":
             url = "https://ifzq.gtimg.cn/appstock/app/kline/mkline"
             params = {"param": f"{c},{tc_tf},{int(count)}"}
@@ -203,7 +200,7 @@ class TencentDataSource:
             url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
             params = {"param": f"{c},{tc_tf},,,{int(count)},{adj or 'qfq'}"}
 
-        resp = requests.get(
+        resp = throttled_get(
             url, headers=get_request_headers(referer=_tc_kline_referers.next()),
             params=params, timeout=timeout,
         )
@@ -240,6 +237,17 @@ class TencentDataSource:
                         break
 
         return _rows_to_dicts(rows) if isinstance(rows, list) else []
+
+    @retry_with_backoff(max_attempts=3, base_delay=1.2, max_delay=8.0, exceptions=(Exception,))
+    def fetch_kline(
+        self, code: str, timeframe: str = "1D", count: int = 300,
+        adj: str = "qfq", timeout: int = 10,
+        start_date: str = "", end_date: str = "",
+    ) -> List[Dict[str, Any]]:
+        limiter = get_tencent_limiter()
+        limiter.wait()
+        return self._raw_fetch_kline(code, timeframe, count, adj=adj, timeout=timeout,
+                                     start_date=start_date, end_date=end_date)
 
     @retry_with_backoff(max_attempts=3, base_delay=1.2, max_delay=8.0, exceptions=(Exception,))
     def fetch_ticker(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:

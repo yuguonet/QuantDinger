@@ -6,7 +6,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 import requests
 from app.data_sources.normalizer import to_raw_digits, detect_market
-from app.data_sources.rate_limiter import get_request_headers, retry_with_backoff, RateLimiter, get_shared_session
+from app.data_sources.rate_limiter import get_request_headers, retry_with_backoff, RateLimiter, get_shared_session, throttled_get
 from app.data_sources.provider import register, NotSupportedResult
 from app.utils.logger import get_logger
 logger = get_logger(__name__)
@@ -37,14 +37,14 @@ class TdxDataSource:
                     "batch_quote": False, "batch_quote_priority": 30, "hk": False, "markets": {"CNStock"}}
 
     def fetch_market_kline(self, timeframe="1D", count=300, adj="qfq", timeout=15, start_date="", end_date="", symbols=None):
-        """全市场批量K线 — 并发 fetch_kline，支持历史数据"""
+        """全市场批量K线 — 并发 _raw_fetch_kline，支持历史数据"""
         if not symbols: return {}
         if start_date:
             from app.data_sources.provider import calc_kline_count
             count = calc_kline_count(timeframe, start_date, end_date)
         import concurrent.futures; result = {}
-        def _f(c): return c, self.fetch_kline(c, timeframe, count, adj=adj, timeout=timeout, start_date=start_date, end_date=end_date)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(symbols), 8)) as pool:
+        def _f(c): return c, self._raw_fetch_kline(c, timeframe, count, adj=adj, timeout=timeout, start_date=start_date, end_date=end_date)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(symbols), 30)) as pool:
             for fut in concurrent.futures.as_completed([pool.submit(_f, c) for c in symbols]):
                 try:
                     c, bars = fut.result()
@@ -52,20 +52,19 @@ class TdxDataSource:
                 except Exception: pass
         return result
 
-    @retry_with_backoff(max_attempts=3, base_delay=1.5, max_delay=10.0, exceptions=(requests.exceptions.RequestException, ConnectionError, TimeoutError))
-    def fetch_kline(self, code, timeframe="1D", count=300, adj="qfq", timeout=10, start_date="", end_date=""):
+    def _raw_fetch_kline(self, code, timeframe="1D", count=300, adj="qfq", timeout=10, start_date="", end_date=""):
+        """无限流无重试的原始 fetch_kline — 供 fetch_market_kline 调用"""
         if start_date:
             from app.data_sources.provider import calc_kline_count; count = calc_kline_count(timeframe, start_date, end_date)
         params = _to_tdx_params(code)
         if not params: return []
         mkt, digits = params; period = _TDX_PERIOD.get(timeframe)
         if period is None: return []
-        _tdx_limiter.wait()
         url = "https://d.10jqka.com.cn/v6/line/hs_{}/01/last{}.js".format(digits, min(int(count), 800))
         if timeframe != "1D":
             url = "https://d.10jqka.com.cn/v6/line/hs_{}/0{}/last{}.js".format(digits, period, min(int(count), 800))
         try:
-            resp = get_shared_session().get(url, headers=get_request_headers(referer="https://stockpage.10jqka.com/"), timeout=timeout)
+            resp = throttled_get(url, headers=get_request_headers(referer="https://stockpage.10jqka.com/"), timeout=timeout)
             resp.encoding = "utf-8"; text = resp.text or ""
         except Exception as e: logger.warning("[通达信K线] 请求失败 %s: %s", code, e); return []
         m = re.search(r'"data"\s*:\s*"([^"]+)"', text)
@@ -96,6 +95,12 @@ class TdxDataSource:
         if adj in ("qfq", "hfq"):
             out = _apply_fwd_adjust(out, code)
         return out
+
+    @retry_with_backoff(max_attempts=3, base_delay=1.5, max_delay=10.0, exceptions=(requests.exceptions.RequestException, ConnectionError, TimeoutError))
+    def fetch_kline(self, code, timeframe="1D", count=300, adj="qfq", timeout=10, start_date="", end_date=""):
+        _tdx_limiter.wait()
+        return self._raw_fetch_kline(code, timeframe, count, adj=adj, timeout=timeout,
+                                     start_date=start_date, end_date=end_date)
 
     @retry_with_backoff(max_attempts=3, base_delay=1.0, max_delay=8.0, exceptions=(requests.exceptions.RequestException, ConnectionError, TimeoutError))
     def fetch_ticker(self, code, timeout=8):
