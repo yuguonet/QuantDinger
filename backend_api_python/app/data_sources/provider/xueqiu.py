@@ -277,6 +277,17 @@ class XueqiuDataSource:
         except Exception:
             pass
 
+    def prepare(self) -> bool:
+        """下载前准备: 刷新 cookie，失败则不可用"""
+        try:
+            cookie = _refresh_cookie()
+            if not cookie:
+                _invalidate_cookie()
+                cookie = _refresh_cookie()
+            return bool(cookie)
+        except Exception:
+            return False
+
     def fetch_kline(
         self, code: str, timeframe: str = "15m", count: int = 200,
         adj: str = "qfq", timeout: int = 10,

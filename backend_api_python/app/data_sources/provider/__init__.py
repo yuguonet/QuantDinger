@@ -44,7 +44,7 @@ Provider 前置依赖管理方案（重要设计决策）
   目前有两种方案，当前使用【方案 A】。
 
 -------------------------------------------------------------------------------
-方案 A — 各源自愈（当前方案）
+方案 A — 各源自愈（旧方案，已被方案 B 取代，自愈逻辑保留为兜底）
 -------------------------------------------------------------------------------
 
   思路: 不改上游 Coordinator，各 Provider 在 fetch 内部自动处理前置依赖。
@@ -73,55 +73,30 @@ Provider 前置依赖管理方案（重要设计决策）
     - 无统一的"就绪状态"查询接口
 
 -------------------------------------------------------------------------------
-方案 B — 统一 prepare() 接口（备选方案，未实现）
+方案 B — 统一 prepare() 接口（当前方案）
 -------------------------------------------------------------------------------
 
-  思路: 在 BaseDataSource Protocol 中新增 prepare() 方法，上游在批量拉取前
-        统一调用，确保所有源就绪。
-
-  Protocol 定义:
-    class BaseDataSource(Protocol):
-        def prepare(self) -> bool:
-            \"\"\"前置准备（cookie、服务器探测等），返回是否就绪\"\"\"
-            ...
-
-  上游调用点（需改 Coordinator）:
-    1. _discover_sources() 中: 拿到 providers 列表后，逐个调 prepare()，过滤掉返回 False 的
-    2. _make_provider_fetch_fn() 中: fetch_fn 内部在首次调用前调一次 prepare()
-    3. coordinate_market_kline() 中: 启动 worker 前调一次 prepare()
+  思路: 在 BaseDataSource Protocol 中定义 prepare() 方法，Coordinator 在批量拉取前
+        统一调用，确保所有源就绪。失败的源直接跳过，不浪费请求。
 
   各源实现:
-    - xueqiu:   prepare() 中刷新 cookie，返回 bool
-    - tdx_ex:   prepare() 中探测服务器（从 __init__ 移过来），返回 bool
-    - eastmoney: prepare() 直接返回 True（无需预热）
-    - em_trends2: prepare() 直接返回 True（除权数据懒加载）
-    - 其他源:    prepare() 默认返回 True
+    - xueqiu:   prepare() 中刷新 cookie，返回 cookie 是否有效
+    - tdx_ex:   prepare() 中探测服务器，返回 _live_servers 是否非空
+    - 其他源:    继承默认 prepare()，直接返回 True
 
-  优点:
-    - 统一模式，上游可控制时机
-    - 失败时立即跳过，不浪费请求
-    - 可查询就绪状态
-
-  缺点:
-    - 需改 Coordinator 多处代码
-    - 多一次函数调用的开销（可忽略）
-    - 对 market_kline 场景，prepare() 本身会阻塞（串行探测所有源）
+  Coordinator 调用点:
+    - coordinate_market_kline() 中: 过滤可用源后、启动 worker 前调 prepare()
 
 -------------------------------------------------------------------------------
-切换指南
+迁移记录（方案 A → 方案 B 已完成）
 -------------------------------------------------------------------------------
 
-  从方案 A 切换到方案 B:
-    1. 在 BaseDataSource Protocol 中添加 prepare() 方法（默认返回 True）
-    2. 各 Provider 实现 prepare():
-       - xueqiu:   调 _refresh_cookie()，返回 cookie 是否有效
-       - tdx_ex:   调 _discover_servers()，返回 _live_servers 是否非空
-       - 其他源:    pass; return True
-    3. 在 Coordinator._discover_sources() 中加入 prepare() 过滤:
-       providers = [p for p in providers if p.prepare()]
-    4. 在 Coordinator._make_provider_fetch_fn() 中加入懒 prepare:
-       if not provider._prepared: provider.prepare()
-    5. 移除各源的自愈逻辑（_get_headers 重试、_get_conn 重探测等）
+  已完成:
+    1. BaseDataSource Protocol 中添加了 prepare() 方法（默认返回 True）
+    2. xueqiu:   prepare() 调 _refresh_cookie()，返回 cookie 是否有效
+    3. tdx_ex:   prepare() 调 _discover_servers()，返回 _live_servers 是否非空
+    4. Coordinator.coordinate_market_kline() 中启动 worker 前调 prepare() 过滤
+    5. 各源保留自愈逻辑作为安全兜底（prepare 失败不影响 fetch 内部重试）
 
 ===============================================================================
 """
@@ -472,11 +447,12 @@ class BaseDataSource(Protocol):
     """
     A股数据源统一接口（Protocol 类型协议）。
 
-    所有 Provider 必须实现此协议定义的4个标准接口:
+    所有 Provider 必须实现此协议定义的5个标准接口:
+      0. prepare              — 下载前准备（cookie、服务器探测等）
       1. fetch_kline          — 单只K线
-      2. fetch_market_kline — 全市场批量K线（无需传入代码列表）
-      3. fetch_ticker          — 单只行情
-      4. fetch_batch_quotes    — 批量行情
+      2. fetch_market_kline   — 全市场批量K线（无需传入代码列表）
+      3. fetch_ticker         — 单只行情
+      4. fetch_batch_quotes   — 批量行情
 
     不支持的接口返回 NotSupportedResult（而非 None 或抛异常），
     以便 Coordinator 快速识别并切换到其他数据源。
@@ -499,6 +475,17 @@ class BaseDataSource(Protocol):
     name: str
     priority: int  # 越小越优先，默认 100
     capabilities: Dict[str, Any]
+
+    def prepare(self) -> bool:
+        """
+        下载前准备 — 由 Coordinator 在派发任务前统一调用。
+
+        各 Provider 在此方法中完成前置依赖（如 cookie 获取、服务器探测等）。
+        返回 True 表示就绪，False 表示不可用（Coordinator 跳过该源）。
+
+        默认实现直接返回 True（无需准备的源不需要覆盖）。
+        """
+        ...
 
     def fetch_kline(
         self, code: str, timeframe: str, count: int = 300,

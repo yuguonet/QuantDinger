@@ -325,6 +325,14 @@ class TdxExDataSource:
         """启动时探测 ExHQ 服务器"""
         _discover_servers()
 
+    def prepare(self) -> bool:
+        """下载前准备: 确保有可用的 ExHQ 服务器"""
+        if not HAS_TDX:
+            return False
+        if not _live_servers:
+            _discover_servers(force=True)
+        return bool(_live_servers)
+
     def fetch_kline(
         self, code: str, timeframe: str = "15m", count: int = 300,
         adj: str = "qfq", timeout: int = 10,
