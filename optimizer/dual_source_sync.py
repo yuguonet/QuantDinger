@@ -679,27 +679,41 @@ def batch_download_tdx(
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
     通达信批量下载，复用单个 TCP 连接。
+    每 RECONNECT_EVERY 只股票主动断开重连，防止连接老化/哑连接。
     返回 {code: [records, ...], ...}
     """
+    RECONNECT_EVERY = 50  # 每50只股票主动重连一次
+
     api = _connect_tdx(worker_id)
     results: Dict[str, List[Dict[str, Any]]] = {}
 
     try:
-        for market_code, code, name in stocks:
+        for idx, (market_code, code, name) in enumerate(stocks):
+            # 主动轮换连接，防止长时间使用后变哑
+            if idx > 0 and idx % RECONNECT_EVERY == 0:
+                try:
+                    api.disconnect()
+                except Exception:
+                    pass
+                try:
+                    api = _connect_tdx(worker_id)
+                except Exception as e:
+                    logger.warning("[TDX Worker-%d] 主动重连失败: %s", worker_id, e)
+
             try:
                 if timeframe == "1D":
                     results[code] = _download_tdx_1d(api, market_code, code, start_date, end_date)
                 else:
                     results[code] = _download_tdx_15m(api, market_code, code, start_date, end_date)
             except (ConnectionError, OSError, TimeoutError) as conn_err:
-                # 连接断了，重连一次，且把新 api 赋回同一变量
+                # 连接断了，重连一次
                 logger.debug("[TDX] %s 连接断开: %s，尝试重连...", code, conn_err)
                 try:
                     api.disconnect()
                 except Exception:
                     pass
                 try:
-                    api = _connect_tdx(worker_id)  # 赋回 api，后续循环继续用新连接
+                    api = _connect_tdx(worker_id)
                     if timeframe == "1D":
                         results[code] = _download_tdx_1d(api, market_code, code, start_date, end_date)
                     else:
@@ -708,7 +722,17 @@ def batch_download_tdx(
                     logger.debug("[TDX] %s 重连后仍失败: %s", code, e)
                     results[code] = []
             except Exception as e:
-                logger.debug("[TDX] %s 异常: %s", code, e)
+                # pytdx 可能抛非标准异常（如 IndexError、struct.error），
+                # 这也可能是连接坏了，主动重连
+                logger.debug("[TDX] %s 异常(%s): %s，重连...", code, type(e).__name__, e)
+                try:
+                    api.disconnect()
+                except Exception:
+                    pass
+                try:
+                    api = _connect_tdx(worker_id)
+                except Exception:
+                    pass
                 results[code] = []
     finally:
         try:

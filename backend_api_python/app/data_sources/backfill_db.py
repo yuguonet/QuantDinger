@@ -41,6 +41,12 @@ logger = get_logger(__name__)
 
 TZ_CN = timezone(timedelta(hours=8))
 
+# ── 功能开关 ──────────────────────────────────────────────
+# 设为 False 即关闭对应周期的下载-保存全流程（仅本文件内生效）
+ENABLE_15M = False   # 15 分钟线开关
+ENABLE_1D  = True   # 日线开关
+# ──────────────────────────────────────────────────────────
+
 # 首次同步（cn_last_update 无记录时）的最大回溯工作日数
 MAX_15M_DAYS = 3
 
@@ -230,6 +236,8 @@ def _same_trading_day(dt1: datetime, dt2: datetime) -> bool:
 
 def _should_run_15m() -> tuple[bool, str]:
     """15m 调度: 先查表 → 再看盘中 → 再看时间点。"""
+    if not ENABLE_15M:
+        return False, "15m 已关闭 (ENABLE_15M=False)"
     doc = _get_last_update("stock_daily_k", "15m")
 
     # ── 第一步: 查表 ──
@@ -296,6 +304,8 @@ def _should_run_15m() -> tuple[bool, str]:
 
 def _should_run_1d() -> tuple[bool, str]:
     """1D 调度: 先查表 → 没记录直接干 → 再看时间点。"""
+    if not ENABLE_1D:
+        return False, "1D 已关闭 (ENABLE_1D=False)"
     now = datetime.now(TZ_CN)
     doc = _get_last_update("stock_daily_k", "1D")
 
@@ -915,23 +925,29 @@ def _run_all_sync():
     now = datetime.now(TZ_CN)
 
     # ── 15m 同步 ──
-    # _should_run_15m() 内部已包含完整判断链:
-    #   查表 → 首次/失败直接干 → 跨交易日直接干 → 盘中按 bar 时间点判断
-    try:
-        result = stock_daily_k.run_once("15m")
-        if result.get("written", 0) > 0:
-            logger.info(f"[后台同步] 15m: {result.get('written')} 条 — {result.get('report', '')}")
-    except Exception as e:
-        logger.error(f"[后台同步] 15m 异常: {e}")
+    if not ENABLE_15M:
+        logger.info("[后台同步] 15m 已关闭 (ENABLE_15M=False)，跳过")
+    else:
+        # _should_run_15m() 内部已包含完整判断链:
+        #   查表 → 首次/失败直接干 → 跨交易日直接干 → 盘中按 bar 时间点判断
+        try:
+            result = stock_daily_k.run_once("15m")
+            if result.get("written", 0) > 0:
+                logger.info(f"[后台同步] 15m: {result.get('written')} 条 — {result.get('report', '')}")
+        except Exception as e:
+            logger.error(f"[后台同步] 15m 异常: {e}")
 
     # ── 1D 同步 ──
-    # _should_run_1d() 内部已包含完整判断: 首次立即干，之后 17:00 后每交易日一次
-    try:
-        result = stock_daily_k.run_once("1D")
-        if result.get("written", 0) > 0:
-            logger.info(f"[后台同步] 1D stock: {result.get('written')} 条")
-    except Exception as e:
-        logger.error(f"[后台同步] 1D stock 异常: {e}")
+    if not ENABLE_1D:
+        logger.info("[后台同步] 1D 已关闭 (ENABLE_1D=False)，跳过")
+    else:
+        # _should_run_1d() 内部已包含完整判断: 首次立即干，之后 17:00 后每交易日一次
+        try:
+            result = stock_daily_k.run_once("1D")
+            if result.get("written", 0) > 0:
+                logger.info(f"[后台同步] 1D stock: {result.get('written')} 条")
+        except Exception as e:
+            logger.error(f"[后台同步] 1D stock 异常: {e}")
 
     # fund + bond (Dinger API) — 只在 17:00 后跑
     if now.time() >= dt_time(17, 0):
@@ -952,6 +968,16 @@ def _run_all_sync():
 
 def run_once(tf: str | None = None, symbols: list | None = None) -> list[dict]:
     """全盘同步入口 — 三个数据源依次执行。"""
+    # 开关守卫: 跳过已关闭的周期
+    if tf == "15m" and not ENABLE_15M:
+        logger.info("[全盘同步] 15m 已关闭 (ENABLE_15M=False)，跳过")
+        return [{"source": s.source.name, "tf": "15m", "written": 0,
+                 "status": "ok", "report": "15m 已关闭"} for s in (stock_daily_k,)]
+    if tf == "1D" and not ENABLE_1D:
+        logger.info("[全盘同步] 1D 已关闭 (ENABLE_1D=False)，跳过")
+        return [{"source": s.source.name, "tf": "1D", "written": 0,
+                 "status": "ok", "report": "1D 已关闭"} for s in (stock_daily_k, fund_nav_daily, bond_daily_k)]
+
     results = []
     for source in (stock_daily_k, fund_nav_daily, bond_daily_k):
         try:
