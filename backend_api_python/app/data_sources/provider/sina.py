@@ -148,7 +148,7 @@ def _sina_kline_to_dicts(data: list, count: int) -> List[Dict[str, Any]]:
             ts = None
             for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
                 try:
-                    ts = int(datetime.strptime(dt_str, fmt).timestamp())
+                    ts = datetime.strptime(dt_str, fmt)
                     break
                 except ValueError:
                     continue

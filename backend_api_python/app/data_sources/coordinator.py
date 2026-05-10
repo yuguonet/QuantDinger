@@ -1157,6 +1157,17 @@ class Coordinator:
             logger.warning("[协助层] market_kline 获取股票列表失败")
             return {}
 
+        # ── 在 coordinator 层解析 count，始终为 int，不留给 provider 走旁路 ──
+        if count is None:
+            from app.data_sources.provider import calc_kline_count
+            from datetime import datetime, timezone, timedelta
+            today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+            effective_end = end_date if end_date else today
+            effective_start = start_date if start_date else effective_end
+            count = calc_kline_count(timeframe, effective_start, effective_end)
+            logger.info("[协助层] market_kline count 由 None 解析为 %d (start=%s end=%s)",
+                        count, effective_start, effective_end)
+
         group_size = 50
         groups = [all_codes[i:i + group_size] for i in range(0, len(all_codes), group_size)]
         total_groups = len(groups)
@@ -1185,6 +1196,9 @@ class Coordinator:
 
         per_task_timeout = 20.0  # 每组超时 20s
         max_group_retries = 3    # 单组最大重试次数，超过丢弃
+
+        # 全局停止信号
+        global_stop = threading.Event()
 
         # ── 第五步: 非阻塞调度 — Dispatcher + per-Provider executor ──
         #
@@ -1264,6 +1278,7 @@ class Coordinator:
               - 超时 → 标记失败 → 放回队列 → 派下一组
               - 全部空闲且队列为空 → 退出
             """
+            nonlocal pending_groups
             while not global_stop.is_set():
                 all_idle = True
 

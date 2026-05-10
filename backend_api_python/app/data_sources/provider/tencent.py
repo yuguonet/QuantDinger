@@ -91,19 +91,22 @@ _TF_MAP = {
 }
 
 
-def _parse_time(ds: str) -> Optional[int]:
-    """解析时间字符串为 Unix 时间戳"""
+def _parse_time(ds: str) -> Optional[datetime]:
+    """解析时间字符串为 datetime（原样返回，不做时区转换）"""
     raw = str(ds or "").strip()
     if not raw:
         return None
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%Y/%m/%d"):
         try:
-            return int(datetime.strptime(raw, fmt).timestamp())
+            return datetime.strptime(raw, fmt)
         except ValueError:
             continue
+    # 纯数字时间戳（毫秒/秒）
     try:
         ts = int(float(raw))
-        return int(ts / 1000) if ts > 10**12 else ts
+        if ts > 10**12:
+            ts = ts // 1000
+        return datetime.fromtimestamp(ts)
     except Exception:
         return None
 

@@ -12,9 +12,9 @@ backfill_db.py — A 股 K 线增量同步 + 后台调度
   4. 后台自动调度，不影响主线程
 
 数据流:
-  15m 盘中 → coordinator.coordinate_market_kline(count=None, start_date="") → 批量行情快照
-  15m 首次 → coordinator.coordinate_market_kline(count=None, start_date=回溯日期) → 并发逐只
-  1D 每日  → coordinator.coordinate_market_kline(count=None, start_date="") → 批量行情快照
+  15m 盘中 → coordinator.coordinate_market_kline(count=None, start_date="") → coordinator 解析 count → 并发逐只
+  15m 首次 → coordinator.coordinate_market_kline(count=None, start_date=回溯日期) → coordinator 解析 count → 并发逐只
+  1D 每日  → coordinator.coordinate_market_kline(count=None, start_date="") → coordinator 解析 count → 并发逐只
   ↓
   db_market.upsert() → PostgreSQL
   ↓

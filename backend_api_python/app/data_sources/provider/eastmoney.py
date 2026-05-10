@@ -197,12 +197,14 @@ class EastMoneyDataSource:
         start_date: str = "", end_date: str = "",
         symbols: Optional[List[str]] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
-        """全市场批量K线 — count=None 走批量行情（1 HTTP），count 有值走并发 K 线"""
-        from app.data_sources.provider import _resolve_market_kline_count
-        count = _resolve_market_kline_count(timeframe, count, start_date, end_date)
+        """全市场批量K线 — 并发逐只 fetch_kline"""
         if count is None:
-            from app.data_sources.provider import _all_market_kline_via_quotes
-            return _all_market_kline_via_quotes(self, timeframe=timeframe, timeout=timeout, symbols=symbols)
+            from app.data_sources.provider import calc_kline_count
+            from datetime import datetime, timezone, timedelta
+            today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+            effective_end = end_date if end_date else today
+            effective_start = start_date if start_date else effective_end
+            count = calc_kline_count(timeframe, effective_start, effective_end)
 
         if not symbols:
             from app.utils.basicinfo_db import get_stock_basic_db
@@ -284,7 +286,7 @@ class EastMoneyDataSource:
                 ts = None
                 for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
                     try:
-                        ts = int(datetime.strptime(dt_str, fmt).timestamp())
+                        ts = datetime.strptime(dt_str, fmt)
                         break
                     except ValueError:
                         continue
