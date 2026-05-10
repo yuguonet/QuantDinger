@@ -94,6 +94,21 @@ _load_env()
 TZ_SH = timezone(timedelta(hours=8))
 CONNECT_TIMEOUT = 5
 
+# ═══════════════════════════════════════════════════════
+# 单源切换开关 (Single-Source Toggle)
+# ═══════════════════════════════════════════════════════
+# 设置 FORCE_SINGLE_SOURCE 以跳过双源比对，只使用指定数据源:
+#   None      — 正常双源模式（默认）
+#   "TDX"     — 只用通达信
+#   "BaoStock" — 只用 BaoStock（仅 1D 有效）
+#   "AKShare"  — 只用 AKShare（仅 15m 有效）
+#
+# 设置后:
+#   1. 只从指定源下载，跳过比对，直接写库
+#   2. 连贯性检查（check_continuity_simple）自动关闭
+# ═══════════════════════════════════════════════════════
+FORCE_SINGLE_SOURCE: Optional[str] = "TDX"  # "TDX" / "BaoStock" / "AKShare"
+
 # 通达信服务器（可通过环境变量 TDX_SERVERS 覆盖，格式: ip1:port1,ip2:port2,...）
 _DEFAULT_TDX_SERVERS = [
     ('218.75.126.9', 7709),
@@ -645,7 +660,7 @@ def _apply_forward_adjust(records: List[Dict[str, Any]],
             for field in ('open', 'high', 'low', 'close'):
                 v = rec.get(field)
                 if v is not None and v > 0:
-                    adj_rec[field] = round(float(v) / cf, 4)
+                    adj_rec[field] = round(float(v) * cf, 4)
             adjusted.append(adj_rec)
 
     return adjusted
@@ -1616,34 +1631,39 @@ def _worker_batch(args: Tuple) -> Dict[str, Any]:
 
     # ── TDX 批量下载（复用连接） ──
     tdx_data: Dict[str, List[Dict[str, Any]]] = {}
-    try:
-        tdx_data = batch_download_tdx(stocks, timeframe, start_date, end_date, worker_id)
-    except Exception as e:
-        logger.warning("[TDX Worker-%d] 批量下载失败: %s", worker_id, e)
+    skip_tdx = (FORCE_SINGLE_SOURCE is not None and FORCE_SINGLE_SOURCE != "TDX")
+    if not skip_tdx:
+        try:
+            tdx_data = batch_download_tdx(stocks, timeframe, start_date, end_date, worker_id)
+        except Exception as e:
+            logger.warning("[TDX Worker-%d] 批量下载失败: %s", worker_id, e)
 
     # ── BaoStock/AKShare 下载 ──
     other_data: Dict[str, List[Dict[str, Any]]] = {}
-    if timeframe == "1D":
-        # BaoStock: 进程级单例，串行下载
-        try:
-            other_data = batch_download_baostock(stocks, start_date, end_date, worker_id)
-        except Exception as e:
-            logger.warning("[BaoStock Worker-%d] 批量下载失败: %s", worker_id, e)
-    else:
-        # AKShare: HTTP 无状态，可并发
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = {}
-            for market_code, code, name in stocks:
-                f = executor.submit(download_akshare_15m, market_code, code, start_date, end_date, worker_id)
-                futures[f] = code
-            for f in futures:
-                code = futures[f]
-                try:
-                    other_data[code] = f.result(timeout=180)
-                except Exception as e:
-                    logger.debug("[AKShare] %s 失败: %s", code, e)
-                    other_data[code] = []
+    skip_other = (FORCE_SINGLE_SOURCE is not None
+                  and FORCE_SINGLE_SOURCE != ("BaoStock" if timeframe == "1D" else "AKShare"))
+    if not skip_other:
+        if timeframe == "1D":
+            # BaoStock: 进程级单例，串行下载
+            try:
+                other_data = batch_download_baostock(stocks, start_date, end_date, worker_id)
+            except Exception as e:
+                logger.warning("[BaoStock Worker-%d] 批量下载失败: %s", worker_id, e)
+        else:
+            # AKShare: HTTP 无状态，可并发
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                futures = {}
+                for market_code, code, name in stocks:
+                    f = executor.submit(download_akshare_15m, market_code, code, start_date, end_date, worker_id)
+                    futures[f] = code
+                for f in futures:
+                    code = futures[f]
+                    try:
+                        other_data[code] = f.result(timeout=180)
+                    except Exception as e:
+                        logger.debug("[AKShare] %s 失败: %s", code, e)
+                        other_data[code] = []
 
     name_a = "TDX"
     name_b = "BaoStock" if timeframe == "1D" else "AKShare"
@@ -1654,6 +1674,48 @@ def _worker_batch(args: Tuple) -> Dict[str, Any]:
         try:
             recs_a = tdx_data.get(code, [])
             recs_b = other_data.get(code, [])
+
+            # ── 单源模式: 跳过比对，直接使用指定源 ──
+            if FORCE_SINGLE_SOURCE is not None:
+                src = FORCE_SINGLE_SOURCE
+                if src == "TDX":
+                    chosen_recs = recs_a
+                    fix_from = "TDX(单源)"
+                    src_count_a, src_count_b = len(recs_a), 0
+                elif src == "BaoStock" and timeframe == "1D":
+                    chosen_recs = recs_b
+                    fix_from = "BaoStock(单源)"
+                    src_count_a, src_count_b = 0, len(recs_b)
+                elif src == "AKShare" and timeframe == "15m":
+                    chosen_recs = recs_b
+                    fix_from = "AKShare(单源)"
+                    src_count_a, src_count_b = 0, len(recs_b)
+                else:
+                    # 不匹配的源配置，回退到双源
+                    logger.warning("FORCE_SINGLE_SOURCE=%s 不适用于 %s，回退双源", src, timeframe)
+                    chosen_recs = None
+                    fix_from = ""
+
+                if chosen_recs is not None:
+                    if chosen_recs:
+                        stats["single_source"] += 1
+                        n = write_to_db(writer, market, code, timeframe, chosen_recs, dry_run)
+                        stats["written"] += n
+                        # 连贯性检查已关闭（单源模式）
+                    else:
+                        stats["no_data"] += 1
+
+                    results.append({
+                        "code": code, "name": name,
+                        "source_a_count": src_count_a,
+                        "source_b_count": src_count_b,
+                        "merged_count": len(chosen_recs),
+                        "fix_from": fix_from,
+                        "price_mismatch": 0,
+                        "quality_issues": 0,
+                    })
+                    continue
+            # ── 单源模式结束，以下为正常双源逻辑 ──
 
             # 比对 & 校验
             cmp = compare_and_verify(
@@ -1676,7 +1738,7 @@ def _worker_batch(args: Tuple) -> Dict[str, Any]:
                 n = write_to_db(writer, market, code, timeframe, cmp["merged_records"], dry_run)
                 stats["written"] += n
 
-                # 连贯性检查
+                # 连贯性检查（仅双源模式执行）
                 gaps = check_continuity_simple(code, timeframe, cmp["merged_records"], today)
                 stats["gaps"] += len(gaps)
 
@@ -2092,6 +2154,9 @@ def main():
     batch_size = max(1, min(args.batch_size, total // n_workers + 1))
 
     source_label = "TDX+BaoStock" if args.type == "1D" else "TDX+AKShare"
+    if FORCE_SINGLE_SOURCE is not None:
+        source_label = f"⚠️  单源: {FORCE_SINGLE_SOURCE}"
+    mode_label = 'dry-run（只比对）' if args.dry_run else ('单源直写（无比对/无连贯检查）' if FORCE_SINGLE_SOURCE else '比对 + 写库')
     print(f"""
 ╔═══════════════════════════════════════════════════════╗
 ║  🔄 双源并发下载 + 实时比对 + 校验修复 + 写库          ║
@@ -2099,7 +2164,7 @@ def main():
 ║  类型: {args.type:<8}  数据源: {source_label:<20}       ║
 ║  日期: {start_date} → {end_date}                     ║
 ║  股票: {total} 只  进程: {n_workers}  容差: {args.tolerance*100:.1f}%     ║
-║  模式: {'dry-run（只比对）' if args.dry_run else '比对 + 写库':<40}║
+║  模式: {mode_label:<40}║
 ║  续传: {'是 (' + ckpt_path + ')' if args.resume else '否':<40}║
 ╚═══════════════════════════════════════════════════════╝
 """)
@@ -2224,7 +2289,11 @@ def main():
 
     # ── 数据清洗 ──
     if not args.dry_run and not args.symbol and not _INTERRUPTED:
-        clean_stats = post_process(market, args.type, start_date, end_date, args.tolerance)
+        if FORCE_SINGLE_SOURCE is not None:
+            print("\n  ⚠️  单源模式: 跳过 post_process 数据清洗（含双源重取逻辑）")
+            clean_stats = {}
+        else:
+            clean_stats = post_process(market, args.type, start_date, end_date, args.tolerance)
     else:
         clean_stats = {}
 

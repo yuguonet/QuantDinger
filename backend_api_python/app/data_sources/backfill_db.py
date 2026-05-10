@@ -481,7 +481,9 @@ class BackfillDB:
         """A 股: 通过 coordinator 全市场批量同步。
 
         关键: 区分"增量快照"和"历史回填"两种路径。
-          - 增量快照: count=None, start_date="" → 走 batch_quotes（1 HTTP，快）
+          - 增量快照:
+            - 1D → 走 batch_quotes（1 HTTP，快，今日快照）
+            - 其他周期 → 走 market_kline（1 HTTP，每只 1 bar）
           - 历史回填: count=None, start_date=过去日期 → 走并发 fetch_kline（N HTTP）
 
         返回: (写入条数, 失败symbols列表)
@@ -507,10 +509,16 @@ class BackfillDB:
         is_incremental = self._is_incremental(tf, last_bar_time, last_updated)
 
         if is_incremental:
-            # 增量快照: count=None + start_date="" → 批量行情（1 HTTP，每只 1 bar）
-            start_date = ""
-            end_date = ""
-            logger.info(f"[同步] {self.source.name} tf={tf} 增量快照模式")
+            # 增量快照模式
+            if tf == "1D":
+                # 1D 增量快照: 直接用 batch_quotes 下载今日快照（1 HTTP，快）
+                logger.info(f"[同步] {self.source.name} tf={tf} 增量快照模式 → batch_quotes")
+                return self._sync_1d_snapshot(coord, cb, symbols)
+            else:
+                # 其他周期: market_kline 增量快照
+                start_date = ""
+                end_date = ""
+                logger.info(f"[同步] {self.source.name} tf={tf} 增量快照模式 → market_kline")
         else:
             # 历史回填: count=None + start_date=回溯日期 → 并发逐只
             ref_time = last_bar_time or last_updated
@@ -586,6 +594,140 @@ class BackfillDB:
             return total, failed_symbols
         except Exception as e:
             logger.error(f"[同步] {self.source.name} 批量写入失败: {e}")
+            return 0, list(symbols)
+
+    def _sync_1d_snapshot(self, coord, cb, symbols: list) -> tuple[int, list[str]]:
+        """1D 增量快照: 使用 batch_quotes 直接下载今日快照。
+
+        batch_quotes 返回的是实时行情数据（quote），需要转换为 K 线格式（bar）。
+        time 字段: 优先使用 quote 中的 time，为空时使用当前日期。
+
+        返回: (写入条数, 失败symbols列表)
+        """
+        from app.data_sources.normalizer import strip_market_prefix
+
+        # 获取今日快照
+        quotes = coord.coordinate_batch_quotes(
+            symbols=symbols,
+            cb=cb,
+            market=self.source.market,
+            timeout=30.0,
+        )
+
+        if not quotes:
+            logger.warning(f"[同步] {self.source.name} batch_quotes 返回空数据")
+            return 0, list(symbols)
+
+        logger.info(f"[同步] {self.source.name} batch_quotes 拉到 {len(quotes)} 只标的")
+
+        # 今日日期（北京时间）— datetime 对象，供 time 字段使用
+        now_cn = datetime.now(TZ_CN)
+        today_dt = now_cn.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+
+        # 转换为 K 线记录
+        all_records = []
+        failed_symbols = []
+        success_digits = set()  # 成功获取到的纯数字代码（用于去重统计）
+
+        for symbol in symbols:
+            # 尝试从 quotes 中获取数据（symbol 可能是纯数字或带前缀）
+            quote = quotes.get(symbol)
+            if not quote:
+                # 尝试去前缀匹配
+                digits = strip_market_prefix(symbol)
+                quote = quotes.get(digits)
+
+            if not quote:
+                failed_symbols.append(symbol)
+                continue
+
+            # 提取 OHLCV
+            o = float(quote.get("open", 0) or 0)
+            h = float(quote.get("high", 0) or 0)
+            l = float(quote.get("low", 0) or 0)
+            c = float(quote.get("last", 0) or quote.get("close", 0) or 0)
+            v = float(quote.get("volume", 0) or 0)
+
+            # OHLC 全为 0 → 跳过
+            if o == 0 and h == 0 and l == 0 and c == 0:
+                failed_symbols.append(symbol)
+                continue
+
+            # 极端负数/零价 → 跳过
+            if c <= 0 or o <= 0:
+                failed_symbols.append(symbol)
+                continue
+
+            # high < low → 交换
+            if h > 0 and l > 0 and h < l:
+                h, l = l, h
+
+            # time 字段: 优先使用 quote 中的 time，为空时使用当前日期
+            bar_time = quote.get("time") or quote.get("timestamp")
+            if not bar_time:
+                bar_time = today_dt
+            elif isinstance(bar_time, str):
+                # 字符串 → 解析为 datetime 对象（bulk_write 要求 datetime）
+                if len(bar_time) == 10 and bar_time[4] == "-":
+                    # 纯日期 "2026-05-10"
+                    bar_time = datetime.strptime(bar_time, "%Y-%m-%d")
+                else:
+                    # 带时间 "2026-05-10 15:00:00" 等
+                    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S",
+                                "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"):
+                        try:
+                            bar_time = datetime.strptime(bar_time, fmt)
+                            break
+                        except ValueError:
+                            continue
+                    else:
+                        bar_time = today_dt
+            elif isinstance(bar_time, (int, float)):
+                # Unix timestamp → 转为 datetime
+                bar_time = datetime.fromtimestamp(bar_time, tz=TZ_CN).replace(tzinfo=None)
+
+            # 纯数字代码（去前缀）
+            clean_symbol = strip_market_prefix(symbol)
+
+            all_records.append({
+                "symbol": clean_symbol,
+                "timeframe": "1D",
+                "time": bar_time,
+                "open": o,
+                "high": h,
+                "low": l,
+                "close": c,
+                "volume": v,
+            })
+            success_digits.add(clean_symbol)
+
+        # quotes 中有但 symbols 中没有的也算失败
+        # 注意: symbols 可能带前缀 (SH600519)，quotes.keys() 是纯数字 (600519)
+        # 需要统一为纯数字比较
+        requested_digits = set(strip_market_prefix(s) for s in symbols)
+        fetched_set = set(quotes.keys())
+        # 只统计既没成功也没在循环中加入 failed 的缺失标的
+        missing_digits = requested_digits - fetched_set - success_digits
+        # 将缺失的纯数字代码转回原始 symbols
+        digit_to_symbol = {strip_market_prefix(s): s for s in symbols}
+        failed_symbols.extend(digit_to_symbol[d] for d in missing_digits if d in digit_to_symbol)
+
+        if failed_symbols:
+            logger.warning(
+                f"[同步] {self.source.name} 1D snapshot "
+                f"{len(failed_symbols)}/{len(symbols)} 只标的失败"
+            )
+
+        if not all_records:
+            return 0, failed_symbols
+
+        try:
+            r = self._writer.bulk_write(self.source.market, all_records)
+            total = r.get("inserted", 0) + r.get("skipped", 0)
+            logger.info(f"[同步] {self.source.name} 1D snapshot 批量写入 {total} 条")
+            return total, failed_symbols
+        except Exception as e:
+            logger.error(f"[同步] {self.source.name} 1D snapshot 批量写入失败: {e}")
             return 0, list(symbols)
 
     @staticmethod
