@@ -24,7 +24,7 @@
 #   python dual_source_sync.py -T 1D --symbol 600519          # 单只
 #   python dual_source_sync.py -T 1D --dry-run                # 只比对不写库
 #   python dual_source_sync.py -T 1D --tolerance 0.02         # 价格容差2%
-#   python dual_source_sync.py -T 1D --csv report.csv         # 导出报告
+#   python dual_source_sync.py -T 1D --resume                 # 断点续传
 #
 # 依赖:
 #   - db_market.py / db_multi.py（backend_api_python/app/utils/）
@@ -41,12 +41,14 @@ from __future__ import annotations
 import os
 import sys
 import csv
+import json
 import math
 import time
 import signal
 import logging
 import argparse
 import multiprocessing as mp
+from bisect import bisect_left, bisect_right
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Set
 from collections import defaultdict
@@ -92,8 +94,8 @@ _load_env()
 TZ_SH = timezone(timedelta(hours=8))
 CONNECT_TIMEOUT = 5
 
-# 通达信服务器
-TDX_SERVERS = [
+# 通达信服务器（可通过环境变量 TDX_SERVERS 覆盖，格式: ip1:port1,ip2:port2,...）
+_DEFAULT_TDX_SERVERS = [
     ('218.75.126.9', 7709),
     ('115.238.56.198', 7709),
     ('124.160.88.183', 7709),
@@ -102,6 +104,27 @@ TDX_SERVERS = [
     ('218.108.47.69', 7709),
     ('180.153.39.51', 7709),
 ]
+
+
+def _load_tdx_servers() -> List[Tuple[str, int]]:
+    """加载 TDX 服务器列表，支持环境变量覆盖"""
+    env = os.environ.get("TDX_SERVERS", "").strip()
+    if env:
+        servers = []
+        for item in env.split(","):
+            item = item.strip()
+            if ":" in item:
+                ip, port = item.rsplit(":", 1)
+                try:
+                    servers.append((ip.strip(), int(port)))
+                except ValueError:
+                    pass
+        if servers:
+            return servers
+    return _DEFAULT_TDX_SERVERS
+
+
+TDX_SERVERS = _load_tdx_servers()
 
 # 15m 标准 bar 时间（16 根，不含 9:30 开盘集合竞价）
 _BAR_TIMES_15M = [
@@ -112,42 +135,42 @@ _BAR_TIMES_15M = [
 ]
 _BAR_SET_15M: Set[Tuple[int, int]] = set(_BAR_TIMES_15M)
 
-# 交易日历缓存
-_TRADING_DAY_SET: frozenset[str] | None = None
-_TRADING_DAY_SILENT: bool = False
+# 交易日历：直接调用 backend_api_python/app/utils/trading_calendar.py
+# 内部用 pickle 缓存，内存中有 frozenset，O(1) 判断 + bisect 计算间隔
+_TRADING_DAYS_SORTED: List[str] = []  # 排序后的交易日列表，用于 bisect
+_TRADING_DAY_SET: Set[str] = set()    # O(1) 查找集合
 
 
-def _build_trading_day_cache(market: str = "CNStock", silent: bool = False):
-    global _TRADING_DAY_SET, _TRADING_DAY_SILENT
-    if _TRADING_DAY_SET is not None:
+def _init_trading_calendar(silent: bool = False):
+    """初始化交易日历（从 trading_calendar 模块加载）"""
+    global _TRADING_DAYS_SORTED, _TRADING_DAY_SET
+    if _TRADING_DAY_SET:
         return
-    from app.utils.trading_calendar import trade_date_range
-    end_year = datetime.now(TZ_SH).year + 1
-    dates = trade_date_range("2015-01-01", f"{end_year}-12-31")
-    _TRADING_DAY_SET = frozenset(dates)
+    from app.utils.trading_calendar import _load
+    _TRADING_DAY_SET = _load()
+    _TRADING_DAYS_SORTED = sorted(_TRADING_DAY_SET)
     if not silent:
         print(f"📅 交易日历: {len(_TRADING_DAY_SET)} 天")
 
 
 def _is_trading_day(d: str) -> bool:
-    if _TRADING_DAY_SET is None:
-        _build_trading_day_cache(silent=_TRADING_DAY_SILENT)
+    if not _TRADING_DAY_SET:
+        _init_trading_calendar(silent=True)
     return d in _TRADING_DAY_SET
 
 
 def _trading_days_between(d1: str, d2: str) -> int:
+    """用 bisect 计算 d1 和 d2 之间的交易日数量（不含两端），O(log n)"""
     if d1 >= d2:
         return 0
-    if _TRADING_DAY_SET is None:
-        _build_trading_day_cache(silent=True)
-    cur = datetime.strptime(d1, "%Y-%m-%d") + timedelta(days=1)
-    end = datetime.strptime(d2, "%Y-%m-%d")
-    count = 0
-    while cur < end:
-        if cur.strftime("%Y-%m-%d") in _TRADING_DAY_SET:
-            count += 1
-        cur += timedelta(days=1)
-    return count
+    if not _TRADING_DAY_SET:
+        _init_trading_calendar(silent=True)
+    # 从 d1 的下一天开始算（不含 d1 本身）
+    d1_next = (datetime.strptime(d1, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+    left = bisect_left(_TRADING_DAYS_SORTED, d1_next)
+    # 到 d2 为止（不含 d2 本身）
+    right = bisect_left(_TRADING_DAYS_SORTED, d2)
+    return max(0, right - left)
 
 
 def _ts_to_date(ts) -> str:
@@ -274,9 +297,16 @@ def normalize_record_time(rec: Dict[str, Any], timeframe: str) -> Optional[Dict[
         dt = dt.replace(tzinfo=TZ_SH)
 
     if timeframe == "15m":
+        orig_dt = dt
         dt = normalize_15m_time(dt)
         if dt is None:
             return None
+        # 标记：午休时段(11:30~13:00)归一化到 11:30 的记录
+        # _build_key_index 会用此标记决定是否覆盖真正的 11:30 bar
+        result = {**rec, "time": dt}
+        if orig_dt != dt:
+            result["_normalized_from_lunch"] = True
+        return result
 
     return {**rec, "time": dt}
 
@@ -288,7 +318,7 @@ def normalize_record_time(rec: Dict[str, Any], timeframe: str) -> Optional[Dict[
 def classify_bar(bar: Dict[str, Any]) -> str:
     """
     对单根 K 线做质量分类。
-    Returns: "ok" / "bad" / "suspended" / "incomplete"
+    Returns: "ok" / "bad" / "suspended" / "incomplete" / "bad_vol"
     """
     o = _safe_float(bar.get("open"))
     h = _safe_float(bar.get("high"))
@@ -300,6 +330,11 @@ def classify_bar(bar: Dict[str, Any]) -> str:
         return "bad"
     if v == 0 and o == h == l == c and o > 0:
         return "suspended"
+    # volume 为负或异常大（超过 1 亿手 = 1e10 股）视为脏数据
+    if v < 0:
+        return "bad_vol"
+    if v > 1e10:
+        return "bad_vol"
     if h > 0 and l > 0 and (h < l or (o > 0 and (o > h or o < l)) or (c > 0 and (c > h or c < l))):
         return "incomplete"
     if v == 0 and not (o == h == l == c):
@@ -351,81 +386,131 @@ def _connect_tdx(worker_id: int):
     raise ConnectionError(f"TDX Worker-{worker_id}: 所有服务器连接失败")
 
 
-def _fetch_security_list(api, market, offset):
-    """获取证券列表，自动处理 pytdx offset>=8000 解析失败的 bug"""
-    if not hasattr(_fetch_security_list, '_patched'):
+def _patch_pytdx_security_list():
+    """
+    Monkey-patch pytdx GetSecurityList.parseResponse，修复 offset>=8000 时解析崩溃的 bug。
+    仅在模块加载时执行一次，后续调用直接跳过。
+    """
+    if getattr(_patch_pytdx_security_list, '_done', False):
+        return
+    try:
         from pytdx.parser.get_security_list import GetSecurityList
         import struct as _struct
         from pytdx.helper import get_volume
+    except ImportError:
+        return  # pytdx 未安装，跳过 patch
 
-        _orig_parse = GetSecurityList.parseResponse
+    _orig_parse = GetSecurityList.parseResponse
 
-        def _robust_parse(self, body_buf):
-            result = None
-            try:
-                result = _orig_parse(self, body_buf)
-            except Exception:
-                pass
-            if result and len(result) > 0:
-                return result
-            try:
-                if len(body_buf) < 2:
-                    return None
-                num, = _struct.unpack("<H", body_buf[:2])
-                pos = 2
-                stocks = []
-                for _ in range(num):
-                    if pos + 29 > len(body_buf):
-                        break
-                    one_bytes = body_buf[pos:pos + 29]
-                    code_bytes, volunit, name_bytes, _, decimal_point, pre_close_raw, _ = \
-                        _struct.unpack("<6sH8s4sBI4s", one_bytes)
-                    code = code_bytes.decode("utf-8", errors="ignore").strip('\x00').strip()
-                    if not code:
-                        pos += 29
-                        continue
-                    name = name_bytes.decode("gbk", errors="ignore").rstrip("\x00")
-                    pre_close = get_volume(pre_close_raw)
-                    stocks.append({
-                        'code': code, 'volunit': volunit,
-                        'decimal_point': decimal_point, 'name': name,
-                        'pre_close': pre_close,
-                    })
-                    pos += 29
-                return stocks if stocks else None
-            except Exception:
-                pass
-            try:
-                num2, = _struct.unpack("<H", body_buf[:2])
-                stocks2 = []
-                scan = 2
-                while scan < len(body_buf) - 29 and len(stocks2) < num2:
-                    chunk = body_buf[scan:scan+6]
-                    code_try = chunk.decode("ascii", errors="ignore").strip('\x00').strip()
-                    if code_try.isdigit() and len(code_try) >= 4:
-                        name_chunk = body_buf[scan+8:scan+24]
-                        name_try = name_chunk.decode("gbk", errors="ignore").rstrip("\x00")
-                        if name_try:
-                            stocks2.append({
-                                'code': code_try, 'volunit': 100,
-                                'decimal_point': 2, 'name': name_try,
-                                'pre_close': 0,
-                            })
-                            scan += 29
-                            continue
-                    scan += 1
-                return stocks2 if stocks2 else None
-            except Exception:
+    def _robust_parse(self, body_buf):
+        """优先走原始解析，失败时用 fallback 手动拆包"""
+        result = None
+        try:
+            result = _orig_parse(self, body_buf)
+        except Exception:
+            pass
+        if result and len(result) > 0:
+            return result
+
+        # Fallback 1: 标准 29 字节结构
+        try:
+            if len(body_buf) < 2:
                 return None
+            num, = _struct.unpack("<H", body_buf[:2])
+            pos = 2
+            stocks = []
+            for _ in range(num):
+                if pos + 29 > len(body_buf):
+                    break
+                one_bytes = body_buf[pos:pos + 29]
+                code_bytes, volunit, name_bytes, _, decimal_point, pre_close_raw, _ = \
+                    _struct.unpack("<6sH8s4sBI4s", one_bytes)
+                code = code_bytes.decode("utf-8", errors="ignore").strip('\x00').strip()
+                if not code:
+                    pos += 29
+                    continue
+                name = name_bytes.decode("gbk", errors="ignore").rstrip("\x00")
+                pre_close = get_volume(pre_close_raw)
+                stocks.append({
+                    'code': code, 'volunit': volunit,
+                    'decimal_point': decimal_point, 'name': name,
+                    'pre_close': pre_close,
+                })
+                pos += 29
+            if stocks:
+                return stocks
+        except Exception:
+            pass
 
-        GetSecurityList.parseResponse = _robust_parse
-        _fetch_security_list._patched = True
+        # Fallback 2: 暴力扫描——逐字节找可识别的股票代码
+        try:
+            if len(body_buf) < 2:
+                return None
+            num2, = _struct.unpack("<H", body_buf[:2])
+            stocks2 = []
+            scan = 2
+            while scan < len(body_buf) - 29 and len(stocks2) < num2:
+                chunk = body_buf[scan:scan + 6]
+                code_try = chunk.decode("ascii", errors="ignore").strip('\x00').strip()
+                if code_try.isdigit() and len(code_try) >= 4:
+                    name_chunk = body_buf[scan + 8:scan + 24]
+                    name_try = name_chunk.decode("gbk", errors="ignore").rstrip("\x00")
+                    if name_try:
+                        stocks2.append({
+                            'code': code_try, 'volunit': 100,
+                            'decimal_point': 2, 'name': name_try,
+                            'pre_close': 0,
+                        })
+                        scan += 29
+                        continue
+                scan += 1
+            if stocks2:
+                return stocks2
+        except Exception:
+            pass
 
+        return None
+
+    GetSecurityList.parseResponse = _robust_parse
+    _patch_pytdx_security_list._done = True
+
+
+# 模块加载时立即 patch（只执行一次，避免每次函数调用时重复 import）
+_patch_pytdx_security_list()
+
+
+def _fetch_security_list(api, market, offset):
+    """获取证券列表（已 patch pytdx 解析 bug）"""
     return api.get_security_list(market, offset)
 
 
+def get_stock_list_from_db() -> List[Tuple[int, str, str]]:
+    """从 basicinfo_db 读取全市场 A 股列表（优先），TDX 兜底"""
+    try:
+        from app.utils.basicinfo_db import get_stock_basic_db
+        db = get_stock_basic_db()
+        stocks = db.get_all_stocks(status="active")
+        if stocks:
+            result = []
+            for s in stocks:
+                code = s["symbol"]
+                name = s["name"]
+                market_cn = s.get("market_cn", "")
+                # market_code: 0=深圳, 1=上海（兼容 TDX 格式）
+                market_code = 1 if market_cn == "SH" else 0
+                result.append((market_code, code, name))
+            print(f"  📦 从 basicinfo_db 读取: {len(result)} 只")
+            return result
+    except Exception as e:
+        logger.warning("basicinfo_db 读取失败，回退到 TDX: %s", e)
+
+    # TDX 兜底
+    print("  ⚠️  basicinfo_db 无数据，回退到通达信获取列表...")
+    return get_stock_list_tdx()
+
+
 def get_stock_list_tdx() -> List[Tuple[int, str, str]]:
-    """从通达信获取全部A股代码"""
+    """从通达信获取全部A股代码（basicinfo_db 的兜底方案）"""
     api = _connect_tdx(0)
     a_shares = []
 
@@ -619,27 +704,34 @@ def _lookup_market_code(code: str) -> int:
 
 # BaoStock 全局连接状态（进程级单例，非线程安全）
 _bs_logged_in: bool = False
-_bs_lock = None  # fork 后在 worker 中初始化
+_bs_pid: int = 0  # 记录登录时的 pid，用于检测 fork
 
 
 def _ensure_bs_login():
-    """确保 BaoStock 已登录（进程级单例，非线程安全）"""
-    global _bs_logged_in
+    """确保 BaoStock 已登录（进程级单例，非线程安全）。
+    fork/spawn 后自动检测 pid 变化，强制重新登录。
+    """
+    global _bs_logged_in, _bs_pid
+    current_pid = os.getpid()
+    # fork 后 pid 变化 → 旧连接已失效，强制重置
+    if _bs_logged_in and _bs_pid != current_pid:
+        _bs_logged_in = False
+        _bs_pid = 0
     if _bs_logged_in:
         return
     import baostock as bs
-    # 设置 socket 超时，防止单个请求卡死整个 worker
-    import socket as _sock
-    _sock.setdefaulttimeout(30)
+    # 不要设 socket.setdefaulttimeout —— 会干扰 BaoStock 内部 socket
+    # 不要在新进程中调 bs.logout() —— Windows spawn 模式下会搞坏连接状态
     lg = bs.login()
     if lg.error_code != '0':
         raise ConnectionError(f"BaoStock 登录失败: {lg.error_msg}")
     _bs_logged_in = True
+    _bs_pid = current_pid
 
 
 def _bs_logout():
     """登出 BaoStock"""
-    global _bs_logged_in
+    global _bs_logged_in, _bs_pid
     if not _bs_logged_in:
         return
     try:
@@ -648,6 +740,7 @@ def _bs_logout():
     except Exception:
         pass
     _bs_logged_in = False
+    _bs_pid = 0
 
 
 def _import_baostock():
@@ -715,6 +808,15 @@ def download_baostock_1d(market_code: int, code: str, start_date: str, end_date:
             if rs is None:
                 return []
             if rs.error_code != '0':
+                # "you don't login" → 强制重新登录
+                if 'login' in str(rs.error_msg).lower() or 'login' in str(getattr(rs, 'error_code', '')).lower():
+                    logger.warning("[BaoStock] %s 会话失效，重新登录...", code)
+                    _bs_logout()
+                    try:
+                        _ensure_bs_login()
+                    except Exception:
+                        pass
+                    continue
                 if retry == 2:
                     return []
                 continue
@@ -852,13 +954,26 @@ def download_akshare_15m(market_code: int, code: str, start_date: str, end_date:
 # ═══════════════════════════════════════════════════════
 
 def _build_key_index(records: List[Dict[str, Any]], timeframe: str) -> Dict:
-    """构建 key → record 的索引，自动去重（后出现的覆盖先出现的）"""
+    """构建 key → record 的索引，自动去重。
+
+    优先级规则（15m）：
+      - 真正的 11:30 bar 优先于午休归一化过来的 13:00 bar
+      - 标记了 _normalized_from_lunch 的记录不覆盖未标记的同 key 记录
+    """
     key_fn = _key_1d if timeframe == "1D" else _key_15m
     index: Dict = {}
     for r in records:
         k = key_fn(r)
-        if k and k != ("", 0, 0) and k != "":
-            index[k] = r  # 后出现的覆盖先出现的（去重）
+        if not k or k == ("", 0, 0) or k == "":
+            continue
+        if timeframe == "15m" and r.get("_normalized_from_lunch"):
+            # 午休归一化的记录：只在没有真正 11:30 时才写入
+            if k not in index:
+                index[k] = r
+            # 已有记录则跳过（不覆盖真正的 11:30 bar）
+        else:
+            # 正常记录或 1D：直接写入，后出现的覆盖先出现的
+            index[k] = r
     return index
 
 
@@ -963,26 +1078,49 @@ def compare_and_verify(
                     "quality": f"{quality_a}/{quality_b}",
                 })
             elif diff > tolerance:
-                # 价格偏差大 → 用前一根涨跌幅判断是否复权差异
+                # 价格偏差大 → 用前一根涨跌幅判断是真实错误还是复权差异
                 is_real_error = True
                 if prev_close_a is not None and prev_close_b is not None:
                     ret_a = _calc_return(prev_close_a, close_a)
                     ret_b = _calc_return(prev_close_b, close_b)
                     if abs(ret_a - ret_b) <= 0.005:
-                        is_real_error = False  # 复权差异
+                        is_real_error = False  # 复权差异：涨跌幅一致
 
                 if is_real_error:
+                    # 真实价格错误 → 记录并以质量更优者为准
                     result["price_mismatch"].append({
                         "key": str(k),
                         f"{name_a}_close": close_a,
                         f"{name_b}_close": close_b,
                         "diff_pct": round(diff * 100, 2),
                     })
-                    chosen = rb  # 以 B（BaoStock/AKShare）修正
-                    chosen_source = name_b
+                    # 两个源都有数据但价格不一致，优先选质量 ok 的
+                    if quality_a == "ok" and quality_b != "ok":
+                        chosen = ra
+                        chosen_source = name_a
+                    elif quality_b == "ok" and quality_a != "ok":
+                        chosen = rb
+                        chosen_source = name_b
+                    else:
+                        # 都 ok 或都有问题 → 取均值写入，减少单源偏差
+                        merged_rec = {k: v for k, v in rb.items() if not k.startswith("_")}
+                        merged_rec["open"] = round((_safe_float(ra.get("open")) + _safe_float(rb.get("open"))) / 2, 4)
+                        merged_rec["high"] = round(max(_safe_float(ra.get("high")), _safe_float(rb.get("high"))), 4)
+                        merged_rec["low"] = round(min(_safe_float(ra.get("low")), _safe_float(rb.get("low"))), 4)
+                        merged_rec["close"] = round((close_a + close_b) / 2, 4)
+                        merged_rec["volume"] = round((_safe_float(ra.get("volume")) + _safe_float(rb.get("volume"))) / 2, 2)
+                        chosen = merged_rec
+                        chosen_source = f"{name_a}+{name_b}(merged)"
                 else:
-                    chosen = rb  # 复权差异，以 B 为准
-                    chosen_source = name_b
+                    # 复权差异（涨跌幅一致但绝对价格不同）→ 取均值平滑
+                    merged_rec = {k: v for k, v in rb.items() if not k.startswith("_")}
+                    merged_rec["open"] = round((_safe_float(ra.get("open")) + _safe_float(rb.get("open"))) / 2, 4)
+                    merged_rec["high"] = round(max(_safe_float(ra.get("high")), _safe_float(rb.get("high"))), 4)
+                    merged_rec["low"] = round(min(_safe_float(ra.get("low")), _safe_float(rb.get("low"))), 4)
+                    merged_rec["close"] = round((close_a + close_b) / 2, 4)
+                    merged_rec["volume"] = round((_safe_float(ra.get("volume")) + _safe_float(rb.get("volume"))) / 2, 2)
+                    chosen = merged_rec
+                    chosen_source = f"{name_a}+{name_b}(adj_merged)"
             else:
                 chosen = ra  # 价格接近，取 A
                 chosen_source = name_a
@@ -995,7 +1133,7 @@ def compare_and_verify(
         for k in sorted(only_a):
             ra = a_by_key[k]
             quality = classify_bar(ra)
-            if quality == "bad":
+            if quality in ("bad", "bad_vol"):
                 result["quality_issues"].append({
                     "key": str(k), "source": name_a, "quality": "bad",
                 })
@@ -1006,7 +1144,7 @@ def compare_and_verify(
         for k in sorted(only_b):
             rb = b_by_key[k]
             quality = classify_bar(rb)
-            if quality == "bad":
+            if quality in ("bad", "bad_vol"):
                 result["quality_issues"].append({
                     "key": str(k), "source": name_b, "quality": "bad",
                 })
@@ -1022,7 +1160,7 @@ def compare_and_verify(
         for k in sorted(a_keys):
             ra = a_by_key[k]
             quality = classify_bar(ra)
-            if quality == "bad":
+            if quality in ("bad", "bad_vol"):
                 result["quality_issues"].append({
                     "key": str(k), "source": name_a, "quality": "bad",
                 })
@@ -1040,7 +1178,7 @@ def compare_and_verify(
         for k in sorted(b_keys):
             rb = b_by_key[k]
             quality = classify_bar(rb)
-            if quality == "bad":
+            if quality in ("bad", "bad_vol"):
                 result["quality_issues"].append({
                     "key": str(k), "source": name_b, "quality": "bad",
                 })
@@ -1072,7 +1210,12 @@ def write_to_db(
     records: List[Dict[str, Any]],
     dry_run: bool = False,
 ) -> int:
-    """将比对后的最终数据写入 db_market"""
+    """将比对后的最终数据写入 db_market。
+
+    注意: DB schema 仅有 (symbol, time, open, high, low, close, volume) 六列，
+    不含 amount（成交额）。下载时获取的 amount 仅用于本地校验，不入库。
+    如需 amount，需先 ALTER TABLE 添加该列。
+    """
     if not records or dry_run:
         return len(records)
 
@@ -1165,16 +1308,30 @@ def check_continuity_simple(
                 })
         last_date = dates[-1]
         if last_date < today:
-            trailing = _trading_days_between(last_date, today)
-            if _is_trading_day(today):
-                trailing += 1
-            if trailing > 0:
-                gaps.append({
-                    "symbol": code, "timeframe": "1D", "gap_type": "tail",
-                    "start_date": _next_day(last_date),
-                    "end_date": today,
-                    "skipped": trailing,
-                })
+            # 如果今天还在交易时间内（未收盘），不把今天算作尾部断裂
+            now_dt = datetime.now(TZ_SH)
+            if _is_trading_day(today) and now_dt.hour < 15:
+                # 今天未收盘，尾部只算到昨天
+                if last_date < _prev_day(today):
+                    trailing = _trading_days_between(last_date, _prev_day(today))
+                    if trailing > 0:
+                        gaps.append({
+                            "symbol": code, "timeframe": "1D", "gap_type": "tail",
+                            "start_date": _next_day(last_date),
+                            "end_date": _prev_day(today),
+                            "skipped": trailing,
+                        })
+            else:
+                trailing = _trading_days_between(last_date, today)
+                if _is_trading_day(today):
+                    trailing += 1
+                if trailing > 0:
+                    gaps.append({
+                        "symbol": code, "timeframe": "1D", "gap_type": "tail",
+                        "start_date": _next_day(last_date),
+                        "end_date": today,
+                        "skipped": trailing,
+                    })
     else:  # 15m
         # 按日期分组
         date_groups: Dict[str, Set[Tuple[int, int]]] = defaultdict(set)
@@ -1215,18 +1372,23 @@ def check_continuity_simple(
                                   f"{sorted_missing[-1][0]:02d}:{sorted_missing[-1][1]:02d}",
                     })
 
-        # 尾部
+        # 尾部（考虑当前时间：交易时间内不报告当天缺失）
         if sorted_dates:
             last_date = sorted_dates[-1]
-            if last_date < today:
-                trailing = _trading_days_between(last_date, today)
-                if _is_trading_day(today):
+            now_dt = datetime.now(TZ_SH)
+            effective_today = today
+            # 如果今天还在交易时间内（未收盘），尾部只算到昨天
+            if _is_trading_day(today) and now_dt.hour < 15:
+                effective_today = _prev_day(today)
+            if last_date < effective_today:
+                trailing = _trading_days_between(last_date, effective_today)
+                if _is_trading_day(effective_today):
                     trailing += 1
                 if trailing > 0:
                     gaps.append({
                         "symbol": code, "timeframe": "15m", "gap_type": "tail",
                         "start_date": _next_day(last_date),
-                        "end_date": today,
+                        "end_date": effective_today,
                         "skipped": trailing,
                     })
 
@@ -1239,16 +1401,16 @@ def check_continuity_simple(
 
 def _worker_init():
     import signal as _sig
-    import socket as _sock
     # 忽略 SIGINT，让主进程统一处理 Ctrl+C
     _sig.signal(_sig.SIGINT, _sig.SIG_IGN)
     # SIGTERM 保持默认（终止进程），这样 pool.terminate() 能生效
-    # 全局 socket 超时 30s，防止单个请求卡死 worker（TDX + BaoStock）
-    _sock.setdefaulttimeout(30)
+    # 不要设 socket.setdefaulttimeout —— TDX 有自己的 time_out 参数，
+    # BaoStock 内部管理自己的 socket，全局 timeout 会干扰它
 
     # fork 后 BaoStock 继承了父进程的 TCP 连接，已失效，强制重置
-    global _bs_logged_in
+    global _bs_logged_in, _bs_pid
     _bs_logged_in = False
+    _bs_pid = 0
 
 
 def _worker_batch(args: Tuple) -> Dict[str, Any]:
@@ -1275,10 +1437,9 @@ def _worker_batch(args: Tuple) -> Dict[str, Any]:
     from app.utils.db_market import get_market_kline_writer
     writer = get_market_kline_writer()
 
-    global _TRADING_DAY_SILENT
-    _TRADING_DAY_SILENT = True
-    if _TRADING_DAY_SET is None:
-        _build_trading_day_cache(market, silent=True)
+    global _TRADING_DAY_SET
+    if not _TRADING_DAY_SET:
+        _init_trading_calendar(silent=True)
 
     results = []
     errors = []
@@ -1416,6 +1577,266 @@ def _signal_handler(signum, frame):
 
 
 # ═══════════════════════════════════════════════════════
+# 数据清洗（下载完成后执行）
+# ═══════════════════════════════════════════════════════
+
+def post_process(
+    market: str,
+    timeframe: str,
+    start_date: str,
+    end_date: str,
+    tolerance: float = 0.01,
+) -> Dict[str, int]:
+    """
+    下载完成后的数据清洗步骤：
+      1. 删除非交易时间的 bar（非交易日的日线、非标准时间的 15m bar）
+      2. 删除最近 1 年无数据的股票（可能已退市）
+      3. 对有 0 值 OHLC 的股票，重新双源读取，取全非零版本
+    """
+    from app.utils.db_market import get_market_kline_writer, get_market_db_manager
+    mgr = get_market_db_manager()
+    writer = get_market_kline_writer()
+    pool = mgr._get_pool(market)
+
+    stats = {
+        "non_trading_deleted": 0,
+        "stale_deleted": 0,
+        "zero_refetched": 0,
+        "zero_fixed": 0,
+    }
+
+    _init_trading_calendar(silent=True)
+
+    # ── 发现所有分区表 ──
+    with pool.cursor() as cur:
+        cur.execute("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_type = 'BASE TABLE'
+              AND table_name LIKE %s
+            ORDER BY table_name
+        """, (f'kline_{timeframe}_%',))
+        tables = [r[0] for r in cur.fetchall()]
+
+    if not tables:
+        print("  ⚠️  未找到分区表，跳过清洗")
+        return stats
+
+    print(f"\n  数据清洗（{len(tables)} 张表）...")
+
+    # ── Step 1: 删除非交易时间的 bar ──
+    print("  [1/3] 清除非交易时间 bar...")
+    for tbl in tables:
+        with pool.connection() as conn:
+            cur = conn.cursor()
+            if timeframe == "1D":
+                # 日线：删除非交易日的 bar
+                # 取表中所有不重复日期，与交易日历比对
+                cur.execute(f"""
+                    SELECT DISTINCT TO_CHAR(time, 'YYYY-MM-DD') AS d
+                    FROM "{tbl}"
+                """)
+                all_dates = {r[0] for r in cur.fetchall()}
+                non_trading = sorted(all_dates - _TRADING_DAY_SET)
+                if non_trading:
+                    # 批量删除
+                    cur.execute(f"""
+                        DELETE FROM "{tbl}"
+                        WHERE TO_CHAR(time, 'YYYY-MM-DD') = ANY(%s)
+                    """, (non_trading,))
+                    stats["non_trading_deleted"] += cur.rowcount
+                    conn.commit()
+            else:
+                # 15m：删除非标准 bar 时间的记录
+                # 标准时间集合已在 _BAR_SET_15M
+                # 用 EXTRACT 提取 hour/minute，与标准时间比对
+                cur.execute(f"""
+                    SELECT DISTINCT
+                        EXTRACT(HOUR FROM time)::int AS h,
+                        EXTRACT(MINUTE FROM time)::int AS m
+                    FROM "{tbl}"
+                """)
+                all_hm = {(r[0], r[1]) for r in cur.fetchall()}
+                non_standard = sorted(all_hm - _BAR_SET_15M)
+                if non_standard:
+                    # 构建 OR 条件
+                    conditions = []
+                    params = []
+                    for h, m in non_standard:
+                        conditions.append(
+                            f"(EXTRACT(HOUR FROM time) = %s AND EXTRACT(MINUTE FROM time) = %s)"
+                        )
+                        params.extend([h, m])
+                    where = " OR ".join(conditions)
+                    cur.execute(f'DELETE FROM "{tbl}" WHERE {where}', params)
+                    stats["non_trading_deleted"] += cur.rowcount
+                    conn.commit()
+            cur.close()
+
+    print(f"    删除非交易 bar: {stats['non_trading_deleted']} 条")
+
+    # ── Step 2: 删除最近 1 年无数据的股票 ──
+    print("  [2/3] 清理长期无数据股票...")
+    one_year_ago = (datetime.now(TZ_SH) - timedelta(days=365)).strftime("%Y-%m-%d")
+    stale_symbols = set()
+
+    for tbl in tables:
+        with pool.cursor() as cur:
+            # 找出该表中最新数据在 1 年前之前的 symbol
+            cur.execute(f"""
+                SELECT symbol, MAX(time) AS last_time
+                FROM "{tbl}"
+                GROUP BY symbol
+                HAVING MAX(time) < %s
+            """, (one_year_ago,))
+            for row in cur.fetchall():
+                stale_symbols.add(row[0])
+
+    if stale_symbols:
+        for tbl in tables:
+            with pool.connection() as conn:
+                cur = conn.cursor()
+                cur.execute(f"""
+                    DELETE FROM "{tbl}" WHERE symbol = ANY(%s)
+                """, (sorted(stale_symbols),))
+                stats["stale_deleted"] += cur.rowcount
+                conn.commit()
+                cur.close()
+        print(f"    清理 {len(stale_symbols)} 只过期股票，删除 {stats['stale_deleted']} 条")
+    else:
+        print("    无过期股票")
+
+    # ── Step 3: 对有 0 值 OHLC 的股票重新双源读取 ──
+    print("  [3/3] 修复 0 值 OHLC...")
+    zero_symbols = set()
+
+    for tbl in tables:
+        with pool.cursor() as cur:
+            cur.execute(f"""
+                SELECT DISTINCT symbol FROM "{tbl}"
+                WHERE open = 0 OR high = 0 OR low = 0 OR close = 0
+            """)
+            for row in cur.fetchall():
+                zero_symbols.add(row[0])
+
+    if zero_symbols:
+        print(f"    发现 {len(zero_symbols)} 只有 0 值的股票，重新读取...")
+        zero_list = sorted(zero_symbols)
+
+        # 获取 market_code 映射
+        symbol_mc: Dict[str, int] = {}
+        for mc, code, name in get_stock_list_from_db():
+            if code in zero_symbols:
+                symbol_mc[code] = mc
+
+        name_a = "TDX"
+        name_b = "BaoStock" if timeframe == "1D" else "AKShare"
+
+        for code in zero_list:
+            mc = symbol_mc.get(code, 0)
+            try:
+                # 重新双源下载
+                if timeframe == "1D":
+                    recs_a = batch_download_tdx([(mc, code, code)], "1D", start_date, end_date, 0).get(code, [])
+                    recs_b = batch_download_baostock([(mc, code, code)], start_date, end_date, 0).get(code, [])
+                else:
+                    recs_a = batch_download_tdx([(mc, code, code)], "15m", start_date, end_date, 0).get(code, [])
+                    recs_b = download_akshare_15m(mc, code, start_date, end_date, 0)
+
+                if not recs_a and not recs_b:
+                    continue
+
+                # 比对
+                cmp = compare_and_verify(code, timeframe, recs_a, recs_b, name_a, name_b, tolerance)
+                merged = cmp["merged_records"]
+
+                if not merged:
+                    continue
+
+                # 检查合并后是否还有 0 值
+                has_zero = False
+                for r in merged:
+                    o = _safe_float(r.get("open"))
+                    h = _safe_float(r.get("high"))
+                    l = _safe_float(r.get("low"))
+                    c = _safe_float(r.get("close"))
+                    if o == 0 or h == 0 or l == 0 or c == 0:
+                        has_zero = True
+                        break
+
+                if not has_zero:
+                    # 全非零 → 覆盖写入
+                    n = write_to_db(writer, market, code, timeframe, merged)
+                    stats["zero_fixed"] += n
+                    stats["zero_refetched"] += 1
+                else:
+                    stats["zero_refetched"] += 1
+
+            except Exception as e:
+                logger.debug("[修复] %s 失败: %s", code, e)
+
+        print(f"    重新读取 {stats['zero_refetched']} 只，修复写入 {stats['zero_fixed']} 条")
+    else:
+        print("    无 0 值问题")
+
+    return stats
+
+
+# ═══════════════════════════════════════════════════════
+# 断点续传
+# ═══════════════════════════════════════════════════════
+
+def _checkpoint_path(timeframe: str, start_date: str, end_date: str) -> str:
+    """生成 checkpoint 文件路径"""
+    return os.path.join(
+        PROJECT_ROOT, "optimizer",
+        f".checkpoint_{timeframe}_{start_date}_{end_date}.json"
+    )
+
+
+def _load_checkpoint(path: str) -> Dict[str, Any]:
+    """加载断点，返回已处理的 code 集合和累计统计"""
+    if not os.path.isfile(path):
+        return {"processed_codes": set(), "stats": {}, "results": [], "errors": []}
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        data["processed_codes"] = set(data.get("processed_codes", []))
+        return data
+    except Exception as e:
+        logger.warning("checkpoint 加载失败，从头开始: %s", e)
+        return {"processed_codes": set(), "stats": {}, "results": [], "errors": []}
+
+
+def _save_checkpoint(path: str, processed_codes: set, stats: dict,
+                     results: list, errors: list):
+    """保存断点（原子写入）"""
+    data = {
+        "processed_codes": sorted(processed_codes),
+        "stats": stats,
+        "results": results[-200:],  # 只保留最近 200 条，避免文件过大
+        "errors": errors[-100:],
+        "saved_at": datetime.now(TZ_SH).isoformat(),
+    }
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception as e:
+        logger.debug("checkpoint 保存失败: %s", e)
+
+
+def _remove_checkpoint(path: str):
+    """任务完成后清理 checkpoint"""
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+# ═══════════════════════════════════════════════════════
 # 主程序
 # ═══════════════════════════════════════════════════════
 
@@ -1439,20 +1860,23 @@ def main():
         help="价格容差 (默认 0.01 = 1%%)")
     parser.add_argument("--dry-run", action="store_true",
         help="只比对不写库")
-    parser.add_argument("--csv", help="导出 CSV 报告路径")
     parser.add_argument("--batch-size", type=int, default=50,
         help="每个子进程一次处理的股票数 (默认 50)")
+    parser.add_argument("--resume", action="store_true",
+        help="断点续传：跳过已处理的股票，从上次中断处继续")
+    parser.add_argument("--checkpoint", default="",
+        help="自定义 checkpoint 文件路径（默认自动生成）")
 
     args = parser.parse_args()
 
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
-    # set_wakeup_fd: SIGINT handler 写 1 字节到 pipe，强制中断 C 层阻塞调用
-    # （pool.get(timeout=5) 底层是管道 select，收到 wakeup fd 的写入会立即返回）
-    _wakeup_r, _wakeup_w = os.pipe()
-    os.set_blocking(_wakeup_r, False)
-    signal.set_wakeup_fd(_wakeup_w)
+    # signal.set_wakeup_fd 需要 socket（Windows 不支持 pipe fd）
+    if sys.platform != 'win32':
+        _wakeup_r, _wakeup_w = os.pipe()
+        os.set_blocking(_wakeup_r, False)
+        signal.set_wakeup_fd(_wakeup_w)
 
     # 日期范围
     end_date = args.end or datetime.now().strftime('%Y-%m-%d')
@@ -1466,20 +1890,34 @@ def main():
     mgr = get_market_db_manager()
     market = args.market
 
-    # 确保 DB 存在
     if not args.dry_run:
         if not mgr.market_db_exists(market):
             mgr.ensure_market_db(market)
 
-    # 获取股票列表（统一格式: [(market_code, code, name), ...]）
+    # 获取股票列表
     if args.symbol:
         mc = _lookup_market_code(args.symbol)
         stocks = [(mc, args.symbol, args.symbol)]
-        print(f"\n[1/4] 单只模式: {args.symbol} (market={mc})")
+        print(f"\n[1/5] 单只模式: {args.symbol} (market={mc})")
     else:
-        print("\n[1/4] 获取A股列表 (通达信)...")
-        stocks = get_stock_list_tdx()
+        print("\n[1/5] 获取A股列表...")
+        stocks = get_stock_list_from_db()
         print(f"  共 {len(stocks)} 只A股")
+
+    # ── 断点续传 ──
+    ckpt_path = args.checkpoint or _checkpoint_path(args.type, start_date, end_date)
+    processed_codes: set = set()
+    if args.resume and not args.symbol:
+        ckpt = _load_checkpoint(ckpt_path)
+        processed_codes = ckpt["processed_codes"]
+        if processed_codes:
+            before = len(stocks)
+            stocks = [s for s in stocks if s[1] not in processed_codes]
+            print(f"  📂 断点续传: 已处理 {len(processed_codes)} 只，剩余 {len(stocks)} 只")
+            if not stocks:
+                print("  ✅ 所有股票已处理完毕，无需继续")
+                mgr.close_all_pools()
+                return 0
 
     total = len(stocks)
     n_workers = min(args.workers, 16, total)
@@ -1496,11 +1934,11 @@ def main():
 ║  日期: {start_date} → {end_date}                     ║
 ║  股票: {total} 只  进程: {n_workers}  容差: {args.tolerance*100:.1f}%     ║
 ║  模式: {'dry-run（只比对）' if args.dry_run else '比对 + 写库':<40}║
+║  续传: {'是 (' + ckpt_path + ')' if args.resume else '否':<40}║
 ╚═══════════════════════════════════════════════════════╝
 """)
 
-    _build_trading_day_cache(market)
-    assert _TRADING_DAY_SET is not None, "交易日缓存必须在 fork 前构建完成"
+    _init_trading_calendar()
 
     today = datetime.now(TZ_SH).strftime("%Y-%m-%d")
 
@@ -1514,12 +1952,11 @@ def main():
         "written": 0, "price_mismatch": 0, "quality_issues": 0, "gaps": 0,
     }
 
-    print(f"\n[2/4] 双源并发下载 + 比对...")
+    print(f"\n[2/5] 双源并发下载 + 比对...")
 
     t0 = time.time()
 
     if n_workers <= 1:
-        # 单进程模式
         for i, batch in enumerate(batches):
             if _INTERRUPTED:
                 break
@@ -1532,6 +1969,12 @@ def main():
             all_errors.extend(batch_result["errors"])
             for k in agg_stats:
                 agg_stats[k] += batch_result["stats"].get(k, 0)
+            # 记录已处理的 codes
+            for r in batch_result["results"]:
+                processed_codes.add(r["code"])
+            # 边下边保存 checkpoint
+            if not args.symbol:
+                _save_checkpoint(ckpt_path, processed_codes, agg_stats, all_results, all_errors)
             processed = min((i + 1) * batch_size, total)
             print(f"\r  [{processed}/{total}] "
                   f"双源={agg_stats['dual_ok']} 单源={agg_stats['single_source']} "
@@ -1540,7 +1983,6 @@ def main():
                   end='', flush=True)
         print()
     else:
-        # 多进程模式：Pool + apply_async（参考 tdx_download.py）
         task_args = [
             (batch, i % n_workers, args.type, start_date, end_date,
              market, args.tolerance, args.dry_run, today)
@@ -1570,12 +2012,17 @@ def main():
                             all_errors.extend(batch_result["errors"])
                             for k in agg_stats:
                                 agg_stats[k] += batch_result["stats"].get(k, 0)
+                            for r in batch_result["results"]:
+                                processed_codes.add(r["code"])
                         except Exception:
                             pass
                         done_set.add(idx)
 
                 done = len(done_set)
                 processed = min(done * batch_size, total)
+                # 有新 batch 完成时保存 checkpoint
+                if done_set and not args.symbol and done % max(1, len(batches) // 10) == 0:
+                    _save_checkpoint(ckpt_path, processed_codes, agg_stats, all_results, all_errors)
                 if done % max(1, len(batches) // 20) == 0 or done == len(batches):
                     elapsed_so_far = time.time() - t0
                     print(f"\r  [{processed}/{total}] "
@@ -1587,10 +2034,14 @@ def main():
             print()
         except KeyboardInterrupt:
             _INTERRUPTED = True
-            print("\n\n⚠️  收到中断信号，正在保存已处理的结果...")
+            print("\n\n⚠️  收到中断信号，正在保存 checkpoint...")
+            _save_checkpoint(ckpt_path, processed_codes, agg_stats, all_results, all_errors)
+            print(f"  📂 checkpoint 已保存: {ckpt_path}")
+            print(f"  💡 下次运行加 --resume 从断点继续")
         finally:
             pool.terminate()
             pool.join()
+            # 确保所有子进程已终止（SIGKILL 兜底）
             for p in pool._pool:
                 if p.is_alive():
                     try:
@@ -1598,17 +2049,21 @@ def main():
                         os.kill(p.pid, _sig.SIGKILL)
                     except (OSError, AttributeError):
                         pass
-            pool.join()
             if _INTERRUPTED:
-                print("❌ 已强制退出")
                 sys.exit(1)
 
     elapsed = time.time() - t0
 
+    # ── 数据清洗 ──
+    if not args.dry_run and not args.symbol and not _INTERRUPTED:
+        clean_stats = post_process(market, args.type, start_date, end_date, args.tolerance)
+    else:
+        clean_stats = {}
+
     # ── 汇总 ──
-    print(f"\n[3/4] 汇总统计")
+    print(f"\n[3/5] 汇总统计")
     status = "中断" if _INTERRUPTED else "完成"
-    print(f"处理{status}: {agg_stats['total']}/{total} 只  耗时: {elapsed:.1f}s ({elapsed/60:.1f}分钟)")
+    print(f"处理{status}: {agg_stats['total']}/{total + len(processed_codes)} 只  耗时: {elapsed:.1f}s ({elapsed/60:.1f}分钟)")
     print(f"  双源成功: {agg_stats['dual_ok']}")
     print(f"  单源回退: {agg_stats['single_source']}")
     print(f"  无数据:   {agg_stats['no_data']}")
@@ -1618,7 +2073,6 @@ def main():
     print(f"  连贯断裂: {agg_stats['gaps']} 条")
     print(f"  查询错误: {len(all_errors)} 只")
 
-    # 价格偏差 top 10
     mismatch_top = sorted(
         [r for r in all_results if r.get("price_mismatch", 0) > 0],
         key=lambda r: r["price_mismatch"],
@@ -1631,7 +2085,6 @@ def main():
                   f"A={r['source_a_count']} B={r['source_b_count']} → {r['merged_count']} | "
                   f"偏差={r['price_mismatch']} 质量={r['quality_issues']}")
 
-    # 无数据 top 10
     no_data_list = [r for r in all_results if r["merged_count"] == 0]
     if no_data_list:
         print(f"\n无数据股票 (前 10 只):")
@@ -1639,7 +2092,6 @@ def main():
             print(f"  {r['code']:>8} | {r['name']:<8} | "
                   f"A={r['source_a_count']} B={r['source_b_count']}")
 
-    # 错误
     if all_errors:
         print(f"\n⚠️  查询失败（前 10 只）:")
         for code, msg in all_errors[:10]:
@@ -1647,13 +2099,24 @@ def main():
         if len(all_errors) > 10:
             print(f"  ... 还有 {len(all_errors) - 10} 只")
 
-    # CSV 导出
-    print(f"\n[4/4] 导出报告")
-    if args.csv:
-        export_csv(all_results, args.csv)
-    else:
-        print("  未指定 --csv，跳过")
+    # 清洗统计
+    if clean_stats:
+        print(f"\n  数据清洗:")
+        print(f"    非交易 bar 删除: {clean_stats.get('non_trading_deleted', 0):,} 条")
+        print(f"    过期股票删除:    {clean_stats.get('stale_deleted', 0):,} 条")
+        print(f"    0 值修复:        {clean_stats.get('zero_fixed', 0):,} 条 ({clean_stats.get('zero_refetched', 0)} 只)")
 
+    # CSV 报告（必出）
+    print(f"\n[4/5] 导出报告")
+    csv_path = os.path.join(PROJECT_ROOT, "optimizer",
+                            f"report_{args.type}_{start_date}_{end_date}.csv")
+    export_csv(all_results, csv_path)
+
+    # 任务完成，清理 checkpoint
+    if not _INTERRUPTED and not args.symbol:
+        _remove_checkpoint(ckpt_path)
+
+    print(f"\n[5/5] 完成")
     print(f"\n{'='*60}")
     print(f"  ✅ 全部完成!")
     print(f"{'='*60}")
