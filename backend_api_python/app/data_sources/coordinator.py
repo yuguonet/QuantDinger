@@ -943,6 +943,45 @@ class Coordinator:
     # 模式 C: 批量行情 — 优先走 fetch_batch_quotes
     # ================================================================
 
+    _RACE_BATCH_THRESHOLD = 500   # ≤500 走 RACE，>500 走分组并发轮询
+    _BATCH_GROUP_SIZE = 500       # 大批量分组每组 500 只
+
+    @staticmethod
+    def _normalize_batch_quotes_result(
+        raw: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        标准化批量行情返回结果:
+          - key 统一为纯数字代码 (600519)
+          - quote["symbol"] 统一为纯数字代码
+          - quote["name"] 若与 symbol 重复则清空
+        """
+        from app.data_sources.normalizer import strip_market_prefix
+        out: Dict[str, Dict[str, Any]] = {}
+        for key, quote in raw.items():
+            digits = strip_market_prefix(key)
+            if isinstance(quote, dict):
+                quote["symbol"] = digits
+                raw_name = quote.get("name", "")
+                if raw_name and strip_market_prefix(raw_name) == digits:
+                    quote["name"] = ""
+            out[digits] = quote
+        return out
+
+    @staticmethod
+    def _normalize_market_kline_result(
+        raw: Dict[str, List[Dict[str, Any]]],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        标准化全市场K线返回结果:
+          - key 统一为纯数字代码
+        """
+        from app.data_sources.normalizer import strip_market_prefix
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for key, bars in raw.items():
+            out[strip_market_prefix(key)] = bars
+        return out
+
     def coordinate_batch_quotes(
         self,
         symbols: List[str],
@@ -952,32 +991,40 @@ class Coordinator:
         preferred_source: str = "",
     ) -> Dict[str, Dict[str, Any]]:
         """
-        批量行情获取 — 优先走 fetch_batch_quotes，逐源 fallback。
+        批量行情获取 — 自适应双模式调度。
 
-        和 coordinate_ticker 的区别:
-          coordinate_ticker:       1只股票 × 多源并发抢答
-          coordinate_batch_quotes: N只股票 × 单源批量请求 × 多源 fallback
+        输入: symbols 可以是纯数字 (600519) 或带前缀 (SH600519)，内部自动加前缀。
+        输出: key 统一为纯数字 (600519)，name/symbol 字段标准化。
 
-        流程:
-          1. 从 Provider 层发现支持 batch_quote 的源（按 priority 排序）
-          2. 逐源尝试 fetch_batch_quotes(symbols)
-          3. 第一个成功返回非空结果的直接用
-          4. 全部失败返回空 dict
+        模式选择:
+          ≤ 500 只: RACE 模式 — 多源并发抢答，第一个返回非空结果的直接用
+          > 500 只: 分组并发轮询 — 按 500 只一组分组，共享队列 + 多源并发消费
+                    (与 coordinate_market_kline 同一架构)
 
         Args:
-            symbols: 股票代码列表
+            symbols: 股票代码列表（纯数字或带前缀均可）
             cb:      熔断器
             market:  市场名称（"CNStock" / "HKStock" / ...）
             timeout: 超时（秒）
             preferred_source: 指定首选源（如 "tencent"），优先尝试
 
         Returns:
-            {symbol: quote_dict} — 仅包含成功获取到的 symbol
+            {纯数字代码: quote_dict} — 仅包含成功获取到的 symbol
         """
         if not symbols:
             return {}
 
         from app.data_sources.provider import get_providers
+        from app.data_sources.normalizer import add_market_prefix
+
+        # ── 输入标准化: 统一加前缀 (SH600519 / SZ000001) ──
+        seen: set = set()
+        normalized_symbols: List[str] = []
+        for s in symbols:
+            ns = add_market_prefix(s, market)
+            if ns and ns not in seen:
+                seen.add(ns)
+                normalized_symbols.append(ns)
 
         # 发现支持 batch_quote 的源
         providers = get_providers(capability="batch_quote", market=market)
@@ -991,36 +1038,294 @@ class Coordinator:
             others = [p for p in providers if p.name != preferred_source]
             providers = preferred + others
 
-        # 逐源尝试
-        for p in providers:
-            if not cb.is_available(p.name):
-                logger.debug("[协助层] batch_quotes %s 已熔断，跳过", p.name)
-                continue
+        # 过滤已熔断的源
+        available = [p for p in providers if cb.is_available(p.name)]
+        if not available:
+            logger.warning("[协助层] batch_quotes market=%s 所有源已熔断", market)
+            return {}
 
-            cfg = get_source_config(p.name)
+        # ── 调度获取 ──
+        if len(normalized_symbols) <= self._RACE_BATCH_THRESHOLD:
+            raw = self._batch_quotes_race(normalized_symbols, available, cb, timeout)
+        else:
+            raw = self._batch_quotes_dispatch(normalized_symbols, available, cb, timeout)
+
+        # ── 输出标准化: key 去前缀，name/symbol 统一 ──
+        return self._normalize_batch_quotes_result(raw)
+
+    # ── RACE 模式: 多源并发抢答（≤500 只） ──
+
+    def _batch_quotes_race(
+        self,
+        symbols: List[str],
+        available: list,
+        cb: CircuitBreaker,
+        timeout: float,
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        RACE 模式 — 所有源并发请求同一组 symbols，第一个返回非空结果的直接用。
+        适合中小批量（≤500 只），追求最低延迟。
+        """
+        done_event = threading.Event()
+        lock = threading.Lock()
+        winner: Dict[str, Dict[str, Any]] = {}
+
+        def _race_one(provider):
+            nonlocal winner
+            if done_event.is_set():
+                return
+            cfg = get_source_config(provider.name)
             start = time.time()
             try:
-                result = p.fetch_batch_quotes(symbols, timeout=timeout)
+                result = provider.fetch_batch_quotes(symbols, timeout=timeout)
                 elapsed = time.time() - start
-
-                if result:
-                    cb.record_success(p.name)
-                    cfg.record(True, elapsed)
-                    logger.info("[协助层] batch_quotes %d只 命中 %s (%.2fs)",
-                                len(result), p.name, elapsed)
-                    return result
-                else:
-                    cb.record_failure(p.name, "empty")
+                if result and not done_event.is_set():
+                    with lock:
+                        if not done_event.is_set():  # 双重检查，防止覆盖
+                            winner = result
+                            cb.record_success(provider.name)
+                            cfg.record(True, elapsed)
+                            done_event.set()
+                            logger.info("[协助层] batch_quotes RACE %d只 命中 %s (%.2fs)",
+                                        len(result), provider.name, elapsed)
+                elif not result:
                     cfg.record(False, elapsed)
-                    logger.debug("[协助层] batch_quotes %s 返回空", p.name)
+                    cb.record_failure(provider.name, "empty")
             except Exception as e:
                 elapsed = time.time() - start
-                cb.record_failure(p.name, str(e))
                 cfg.record(False, elapsed)
-                logger.debug("[协助层] batch_quotes %s 失败: %s", p.name, e)
+                cb.record_failure(provider.name, str(e))
+                logger.debug("[协助层] batch_quotes RACE %s 失败: %s", provider.name, e)
 
-        logger.warning("[协助层] batch_quotes %d只 所有源失败", len(symbols))
-        return {}
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(available), thread_name_prefix="bq-race"
+        ) as pool:
+            futures = [pool.submit(_race_one, p) for p in available]
+            done_event.wait(timeout=timeout)
+
+        if not winner:
+            logger.warning("[协助层] batch_quotes RACE %d只 所有源失败", len(symbols))
+        return winner
+
+    # ── 分组并发轮询模式（>500 只） ──
+
+    def _batch_quotes_dispatch(
+        self,
+        symbols: List[str],
+        available: list,
+        cb: CircuitBreaker,
+        timeout: float,
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        分组并发轮询 — 与 coordinate_market_kline 同一架构:
+          1. symbols 按 500 只一组分组，放入共享队列
+          2. 每个 Provider 启动一个 worker 线程
+          3. 各 worker 从队列取组 → fetch_batch_quotes → 合并结果
+          4. 先完成的 worker 立即取下一组，直到队列为空
+          5. 全局超时后合并所有已获取的数据返回
+        """
+        from queue import Queue, Empty
+
+        group_size = self._BATCH_GROUP_SIZE
+        groups = [symbols[i:i + group_size] for i in range(0, len(symbols), group_size)]
+        total_groups = len(groups)
+
+        logger.info("[协助层] batch_quotes %d只 → %d组(每组%d) → %d源并发轮询: %s",
+                    len(symbols), total_groups, group_size,
+                    len(available), " | ".join(p.name for p in available))
+
+        # 共享任务队列
+        task_queue: Queue = Queue()
+        for idx, group in enumerate(groups):
+            task_queue.put((idx, group, 0))
+
+        # 共享结果
+        result: Dict[str, Dict[str, Any]] = {}
+        result_lock = threading.Lock()
+
+        # 每组超时 & 重试
+        per_task_timeout = min(timeout, 20.0)
+        max_group_retries = 3
+
+        # 退出计数器
+        pending_groups = 0
+        pending_lock = threading.Lock()
+
+        # 全局停止信号
+        global_stop = threading.Event()
+
+        # 每个 Provider 一个单线程 executor + 状态追踪
+        provider_map = {p.name: p for p in available}
+        provider_executors = {}
+        provider_futures = {}       # name → (future, group_idx, remaining, retry_count)
+        provider_consecutive_timeout = {}
+        source_stats: Dict[str, Dict[str, int]] = {}
+        stats_lock = threading.Lock()
+
+        for p in available:
+            provider_executors[p.name] = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix=f"bq-disp-{p.name}"
+            )
+            provider_futures[p.name] = None
+            provider_consecutive_timeout[p.name] = 0
+            with stats_lock:
+                source_stats[p.name] = {"ok": 0, "fail": 0, "groups": 0, "timeout": 0}
+
+        def _fetch_group(provider, group_codes):
+            return provider.fetch_batch_quotes(group_codes, timeout=int(per_task_timeout))
+
+        def _timed_submit(executor, fn, *args):
+            """提交任务并记录提交时间（用于超时判断）"""
+            future = executor.submit(fn, *args)
+            future._submit_time = time.time()
+            return future
+
+        def _submit_next(name: str):
+            """给 Provider 派下一组（非阻塞）"""
+            while True:
+                try:
+                    group_idx, group_codes, retry_count = task_queue.get_nowait()
+                except Empty:
+                    return
+                with result_lock:
+                    remaining = [c for c in group_codes if c not in result]
+                if not remaining:
+                    continue
+                future = _timed_submit(
+                    provider_executors[name],
+                    _fetch_group,
+                    provider_map[name],
+                    remaining,
+                )
+                provider_futures[name] = (future, group_idx, remaining, retry_count)
+                with pending_lock:
+                    nonlocal pending_groups
+                    pending_groups += 1
+                with stats_lock:
+                    source_stats[name]["groups"] += 1
+                return
+
+        def _dispatcher():
+            """主调度线程 — 轮询所有 Provider future"""
+            nonlocal pending_groups
+
+            while not global_stop.is_set():
+                all_idle = True
+
+                for p in available:
+                    name = p.name
+                    if name not in provider_executors:
+                        continue
+
+                    entry = provider_futures.get(name)
+                    if entry is None:
+                        _submit_next(name)
+                        entry = provider_futures.get(name)
+                        if entry is None:
+                            continue
+
+                    future, group_idx, remaining, retry_count = entry
+
+                    if not future.done():
+                        all_idle = False
+                        # 检查单任务超时
+                        if hasattr(future, '_submit_time'):
+                            elapsed = time.time() - future._submit_time
+                            if elapsed > per_task_timeout:
+                                future.cancel()
+                                logger.debug("[协助层] batch_quotes 组%d %s 超时(%.1fs)",
+                                             group_idx, name, elapsed)
+                                with stats_lock:
+                                    source_stats[name]["timeout"] += 1
+                                provider_consecutive_timeout[name] = \
+                                    provider_consecutive_timeout.get(name, 0) + 1
+                                # 超时: 队列充裕则放回重试，否则丢弃
+                                with pending_lock:
+                                    pending_groups -= 1
+                                queued = task_queue.qsize()
+                                if retry_count < max_group_retries and queued > len(available):
+                                    task_queue.put((group_idx, remaining, retry_count + 1))
+                                    logger.debug("[协助层] batch_quotes 组%d 放回重试(%d)",
+                                                 group_idx, retry_count + 1)
+                                else:
+                                    logger.debug("[协助层] batch_quotes 组%d 丢弃", group_idx)
+                                provider_futures[name] = None
+                                _submit_next(name)
+                        continue
+
+                    # future 已完成
+                    try:
+                        task_result = future.result(timeout=0)
+                    except Exception as e:
+                        task_result = None
+                        logger.debug("[协助层] batch_quotes 组%d %s 异常: %s",
+                                     group_idx, name, e)
+
+                    provider_futures[name] = None
+                    provider_consecutive_timeout[name] = 0
+
+                    if task_result:
+                        with result_lock:
+                            merged_count = 0
+                            for sym, quote in task_result.items():
+                                if sym not in result:
+                                    result[sym] = quote
+                                    merged_count += 1
+                        with stats_lock:
+                            source_stats[name]["ok"] += merged_count
+                        logger.debug("[协助层] batch_quotes 组%d %s 成功 %d只",
+                                     group_idx, name, merged_count)
+                        with pending_lock:
+                            pending_groups -= 1
+                    else:
+                        with stats_lock:
+                            source_stats[name]["fail"] += 1
+                        with pending_lock:
+                            pending_groups -= 1
+                        # 失败: 放回队尾重试
+                        if retry_count < max_group_retries:
+                            task_queue.put((group_idx, remaining, retry_count + 1))
+                            logger.debug("[协助层] batch_quotes 组%d %s 失败，放回重试(%d)",
+                                         group_idx, name, retry_count + 1)
+
+                    _submit_next(name)
+
+                # 检查是否全部完成
+                with pending_lock:
+                    if pending_groups <= 0 and task_queue.empty():
+                        break
+
+                if all_idle:
+                    time.sleep(0.05)
+
+        # 启动所有 Provider worker（先各派一组）
+        for p in available:
+            _submit_next(p.name)
+
+        # 启动 dispatcher 线程
+        dispatch_thread = threading.Thread(
+            target=_dispatcher, name="bq-dispatcher", daemon=True
+        )
+        dispatch_thread.start()
+
+        # 等待全局超时
+        dispatch_thread.join(timeout=timeout)
+        global_stop.set()
+
+        # 关闭 executor
+        for name, executor in provider_executors.items():
+            executor.shutdown(wait=False)
+
+        # 统计日志
+        total_ok = sum(s["ok"] for s in source_stats.values())
+        stat_parts = []
+        for name, s in source_stats.items():
+            if s["groups"] > 0:
+                stat_parts.append(f"{name}: {s['ok']}只/{s['groups']}组")
+        logger.info("[协助层] batch_quotes 轮询完成 %d/%d只 | %s",
+                    total_ok, len(symbols), " | ".join(stat_parts))
+
+        return result
 
     # ================================================================
     # 模式 D: 全市场批量K线 — 优先走 fetch_market_kline，逐源 fallback
@@ -1152,9 +1457,21 @@ class Coordinator:
         if not symbols:
             from app.utils.basicinfo_db import get_stock_basic_db
             symbols = get_stock_basic_db().market_all_codes(status="active")
-        all_codes = symbols
-        if not all_codes:
+        if not symbols:
             logger.warning("[协助层] market_kline 获取股票列表失败")
+            return {}
+
+        # ── 输入标准化: 统一加前缀，Provider 需要带前缀的代码 ──
+        from app.data_sources.normalizer import add_market_prefix
+        seen_codes: set = set()
+        all_codes: List[str] = []
+        for s in symbols:
+            ns = add_market_prefix(s, market)
+            if ns and ns not in seen_codes:
+                seen_codes.add(ns)
+                all_codes.append(ns)
+        if not all_codes:
+            logger.warning("[协助层] market_kline 标准化后无有效代码")
             return {}
 
         # ── 在 coordinator 层解析 count，始终为 int，不留给 provider 走旁路 ──
@@ -1454,7 +1771,8 @@ class Coordinator:
         logger.info("[协助层] market_kline 完成: %d只数据 | %s",
                     len(result), " | ".join(stats_lines))
 
-        return result
+        # ── 输出标准化: key 去前缀，统一为纯数字代码 ──
+        return self._normalize_market_kline_result(result)
 
     # ================================================================
     # 透传模式 — 不加任何协调逻辑

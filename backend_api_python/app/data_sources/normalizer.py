@@ -476,6 +476,114 @@ def detect_market(symbol: str) -> tuple:
     return ("", "")
 
 
+def add_market_prefix(symbol: str, market: str = "") -> str:
+    """
+    给股票代码添加市场前缀，防止重复添加。
+
+    已有合法前缀 → 原样返回（不重复加）
+    纯数字 → 按规则推断市场并加前缀
+    带后缀 (.SH/.SZ/.HK) → 剥离后缀再加前缀
+
+    Args:
+        symbol: 股票代码（任意格式）
+        market:  "CNStock" / "HKStock"，为空时自动推断
+
+    Returns:
+        大写带前缀代码: SH600519 / SZ000001 / HK00700
+        无法识别返回原值
+    """
+    s = (symbol or "").strip()
+    if not s:
+        return s
+    upper = s.upper()
+
+    # ── 已有合法前缀，直接返回（防重复） ──
+    for prefix in ("SH", "SZ", "BJ"):
+        if upper.startswith(prefix):
+            digits = upper[len(prefix):]
+            if digits.isdigit() and len(digits) == 6:
+                return upper  # 已有前缀，原样返回
+    if upper.startswith("HK"):
+        digits = upper[2:]
+        if digits.isdigit() and len(digits) == 5:
+            return "HK" + digits.zfill(5)
+
+    # ── 带后缀 → 剥离后加前缀 ──
+    for suffix in (".SH", ".SS", ".SZ", ".BJ", ".HK"):
+        if upper.endswith(suffix):
+            core = upper[:-len(suffix)]
+            if suffix in (".SH", ".SS"):
+                return "SH" + core
+            if suffix == ".SZ":
+                return "SZ" + core
+            if suffix == ".BJ":
+                return "BJ" + core
+            if suffix == ".HK":
+                return "HK" + core.zfill(5)
+
+    # ── 纯数字 → 按市场推断 ──
+    digits = upper
+    if digits.isdigit():
+        is_hk = market == "HKStock" or (not market and len(digits) <= 5)
+        if is_hk:
+            return "HK" + digits.zfill(5)
+        if len(digits) == 6:
+            if digits.startswith(("600", "601", "603", "605", "688", "689", "900")):
+                return "SH" + digits
+            if digits.startswith(("000", "001", "002", "003", "300", "301", "200")):
+                return "SZ" + digits
+            if digits.startswith(("43", "82", "83", "87", "88")):
+                return "BJ" + digits
+
+    return s  # 无法识别，原样返回
+
+
+def strip_market_prefix(symbol: str) -> str:
+    """
+    去掉股票代码的市场前缀，返回纯数字代码。防止错误除去。
+
+    已知前缀 (SH/SZ/BJ/HK) → 验证数字长度后去掉
+    已知后缀 (.SH/.SZ/.HK) → 验证数字长度后去掉
+    纯数字 → 直接返回
+    无法识别 → 返回原值（不乱剥）
+
+    Returns:
+        纯数字代码: 600519 / 000001 / 00700
+        无法识别返回原值
+    """
+    s = (symbol or "").strip()
+    if not s:
+        return s
+    upper = s.upper()
+
+    # ── 前缀 ──
+    for prefix in ("SH", "SZ", "BJ"):
+        if upper.startswith(prefix):
+            digits = s[len(prefix):]
+            if digits.isdigit() and len(digits) == 6:
+                return digits
+            return s  # 前缀后不是 6 位数字，不剥
+    if upper.startswith("HK"):
+        digits = s[2:]
+        if digits.isdigit() and len(digits) == 5:
+            return digits
+        return s
+
+    # ── 后缀 ──
+    for suffix in (".SH", ".SS", ".SZ", ".BJ", ".HK"):
+        if upper.endswith(suffix):
+            digits = s[:-len(suffix)]
+            if digits.isdigit() and len(digits) in (5, 6):
+                return digits
+            return s
+
+    # ── 纯数字 ──
+    if s.isdigit() and len(s) in (5, 6):
+        return s
+
+    return s  # 无法识别，原样返回
+
+
 # ================================================================
 # 公开别名 — 供外部模块统一引用
 # ================================================================

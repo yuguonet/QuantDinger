@@ -544,6 +544,114 @@ def get_stock_list_tdx() -> List[Tuple[int, str, str]]:
 
 
 # ---------------------------------------------------------------------------
+# TDX 前复权（基于 xdxr 除权除息数据）
+# ---------------------------------------------------------------------------
+
+def _get_tdx_xdxr_factors(api, market_code: int, code: str,
+                           all_dates: List[str]) -> List[Tuple[str, float]]:
+    """
+    从 TDX 获取除权除息事件，计算每次事件的单次复权因子。
+    返回 [(event_date, single_factor), ...] 按日期升序。
+    """
+    xdxr = api.get_xdxr_info(market_code, code)
+    if not xdxr:
+        return []
+
+    events = sorted(
+        [x for x in xdxr if x.get('category') == 1],
+        key=lambda x: (x['year'], x['month'], x['day']),
+    )
+    if not events:
+        return []
+
+    # 构建 date -> close 映射（用于找除权日前收盘价）
+    date_set = set(all_dates)
+    sorted_dates = sorted(all_dates)
+
+    result = []
+    for e in events:
+        ed = f"{e['year']}-{e['month']:02d}-{e['day']:02d}"
+        fh = (e.get('fenhong') or 0) / 10.0   # 每股分红
+        sz = (e.get('songzhuangu') or 0) / 10.0  # 每股送转
+        pg = (e.get('peigu') or 0) / 10.0      # 每股配股
+        pj = e.get('peigujia') or 0             # 配股价
+
+        # 找除权日前一个交易日的收盘价
+        prev_dates = [d for d in sorted_dates if d < ed]
+        if not prev_dates:
+            continue
+        prev_close = 0.0
+        # 尝试从已有数据中取，如果不在范围内则跳过
+        # 这里只记录事件，实际价格在 apply 时传入
+        result.append((ed, fh, sz, pg, pj))
+
+    return result
+
+
+def _apply_forward_adjust(records: List[Dict[str, Any]],
+                           xdxr_events: List[Tuple],
+                           raw_close_map: Dict[str, float]) -> List[Dict[str, Any]]:
+    """
+    对记录应用前复权。
+    raw_close_map: {date_str: raw_close_price} 用于计算除权因子。
+    """
+    if not xdxr_events:
+        return records
+
+    # 计算每个事件的单次因子
+    event_factors = []
+    for ed, fh, sz, pg, pj in xdxr_events:
+        prev_dates = sorted(d for d in raw_close_map if d < ed)
+        if not prev_dates:
+            continue
+        pc = raw_close_map[prev_dates[-1]]
+        if pc <= 0:
+            continue
+        factor = (pc - fh + pj * pg) / (pc * (1 + sz + pg))
+        event_factors.append((ed, factor))
+
+    if not event_factors:
+        return records
+
+    # 累积因子: 从每个事件到最终的乘积
+    sorted_ef = sorted(event_factors)
+    cum_to_end = {}
+    cum = 1.0
+    for ed, f in reversed(sorted_ef):
+        cum *= f
+        cum_to_end[ed] = cum
+
+    # 对每条记录: 找该日期之后第一个除权日的累积因子
+    sorted_eds = sorted(cum_to_end.keys())
+
+    def _get_cf(d: str) -> float:
+        for ed in sorted_eds:
+            if ed > d:
+                return cum_to_end[ed]
+        return 1.0  # 无除权事件 → 不调整
+
+    adjusted = []
+    for rec in records:
+        ts = rec.get("time")
+        if isinstance(ts, datetime):
+            d = ts.strftime("%Y-%m-%d")
+        else:
+            d = str(rec.get("date", ""))[:10]
+        cf = _get_cf(d)
+        if cf == 1.0:
+            adjusted.append(rec)
+        else:
+            adj_rec = {**rec}
+            for field in ('open', 'high', 'low', 'close'):
+                v = rec.get(field)
+                if v is not None and v > 0:
+                    adj_rec[field] = round(float(v) / cf, 4)
+            adjusted.append(adj_rec)
+
+    return adjusted
+
+
+# ---------------------------------------------------------------------------
 # TDX 批量下载（复用连接，worker 级别）
 # ---------------------------------------------------------------------------
 
@@ -598,21 +706,25 @@ def batch_download_tdx(
 
 def _download_tdx_1d(api, market_code: int, code: str,
                       start_date: str, end_date: str) -> List[Dict[str, Any]]:
-    """从已连接的 TDX api 下载 1D 数据"""
+    """从已连接的 TDX api 下载 1D 数据（前复权）"""
     all_bars = []
     for offset in range(0, 800 * 10, 800):
         bars = api.get_security_bars(9, market_code, code, offset, 800)
         if not bars:
-            # 第一次请求就无数据 → 正常（可能是新股/停牌/代码错误）
             if offset == 0:
                 break
-            # 非首次请求无数据 → 可能是连接断了，抛异常触发重连
             raise ConnectionError(f"TDX {code} offset={offset} 返回空，疑似连接断开")
         all_bars = bars + all_bars
         if len(bars) < 800:
             break
         if bars[0]['datetime'][:10] <= start_date:
             break
+
+    # 构建原始收盘价映射（用于计算前复权因子）
+    raw_close_map = {b['datetime'][:10]: float(b['close']) for b in all_bars if float(b['close']) > 0}
+
+    # 获取除权除息事件
+    xdxr_events = _get_tdx_xdxr_factors(api, market_code, code, sorted(raw_close_map.keys()))
 
     records = []
     for b in all_bars:
@@ -627,16 +739,21 @@ def _download_tdx_1d(api, market_code: int, code: str,
                 "volume": float(b['vol']),
                 "amount": float(b['amount']),
             })
+
+    # 前复权
+    if xdxr_events and records:
+        records = _apply_forward_adjust(records, xdxr_events, raw_close_map)
+
     return records
 
 
 def _download_tdx_15m(api, market_code: int, code: str,
                        start_date: str, end_date: str) -> List[Dict[str, Any]]:
-    """从已连接的 TDX api 下载 15m 数据"""
+    """从已连接的 TDX api 下载 15m 数据（前复权）"""
     start_dt = datetime.strptime(start_date, '%Y-%m-%d')
     end_dt = datetime.strptime(end_date, '%Y-%m-%d')
-    span_days = (end_dt - start_dt).days
-    max_req = int(span_days / 33) + 3
+
+    max_req = 50
 
     all_bars = []
     for i in range(max_req):
@@ -655,6 +772,24 @@ def _download_tdx_15m(api, market_code: int, code: str,
         except Exception:
             pass
 
+    # 获取日线数据用于前复权因子计算（xdxr 基于日线收盘价）
+    daily_bars = api.get_security_bars(9, market_code, code, 0, 800)
+    raw_close_map = {}
+    if daily_bars:
+        for b in daily_bars:
+            d = b['datetime'][:10]
+            c = float(b['close'])
+            if c > 0:
+                raw_close_map[d] = c
+    # 补充15m数据中的日收盘价（取每天最后一根15m的close）
+    for b in all_bars:
+        d = b['datetime'][:10]
+        c = float(b['close'])
+        if d not in raw_close_map and c > 0:
+            raw_close_map[d] = c
+
+    xdxr_events = _get_tdx_xdxr_factors(api, market_code, code, sorted(raw_close_map.keys()))
+
     records = []
     for b in all_bars:
         dt_str = b['datetime'][:10]
@@ -672,6 +807,11 @@ def _download_tdx_15m(api, market_code: int, code: str,
                 "volume": float(b['vol']),
                 "amount": float(b['amount']),
             })
+
+    # 前复权
+    if xdxr_events and records:
+        records = _apply_forward_adjust(records, xdxr_events, raw_close_map)
+
     return records
 
 
@@ -1041,6 +1181,8 @@ def compare_and_verify(
         # 预计算前一根的 close，用于涨跌幅判断
         prev_close_a: Optional[float] = None
         prev_close_b: Optional[float] = None
+        # 跟踪两源价格比率，用于检测系统性复权差异
+        price_ratios: List[float] = []
 
         merged = []
         for k in sorted_common:
@@ -1078,13 +1220,34 @@ def compare_and_verify(
                     "quality": f"{quality_a}/{quality_b}",
                 })
             elif diff > tolerance:
-                # 价格偏差大 → 用前一根涨跌幅判断是真实错误还是复权差异
+                # 价格偏差大 → 判断是真实错误还是复权差异
                 is_real_error = True
+
+                # 方法1: 用涨跌幅比对（有前一根时）
                 if prev_close_a is not None and prev_close_b is not None:
                     ret_a = _calc_return(prev_close_a, close_a)
                     ret_b = _calc_return(prev_close_b, close_b)
                     if abs(ret_a - ret_b) <= 0.005:
                         is_real_error = False  # 复权差异：涨跌幅一致
+
+                # 方法2: 用价格比率一致性检测（无前一根或涨跌幅法不确定时）
+                if is_real_error and close_a > 0 and close_b > 0:
+                    ratio = close_a / close_b
+                    price_ratios.append(ratio)
+                    # 如果有足够样本(>=3)且比率稳定(标准差<1%)，判定为系统性复权差异
+                    if len(price_ratios) >= 3:
+                        avg_ratio = sum(price_ratios) / len(price_ratios)
+                        std_ratio = (sum((r - avg_ratio)**2 for r in price_ratios) / len(price_ratios)) ** 0.5
+                        if std_ratio / avg_ratio < 0.01:
+                            is_real_error = False
+                    # 即使样本不足，如果比率与已有样本一致也跳过
+                    elif len(price_ratios) >= 2:
+                        avg_ratio = sum(price_ratios[:-1]) / len(price_ratios[:-1])
+                        if abs(ratio - avg_ratio) / avg_ratio < 0.01:
+                            is_real_error = False
+                    # 样本太少(<=1)无法判断 → 先不报，等后面累积
+                    else:
+                        is_real_error = False
 
                 if is_real_error:
                     # 真实价格错误 → 记录并以质量更优者为准
@@ -1124,6 +1287,9 @@ def compare_and_verify(
             else:
                 chosen = ra  # 价格接近，取 A
                 chosen_source = name_a
+                # 即使价格接近也记录比率（用于检测系统性复权差异）
+                if close_a > 0 and close_b > 0 and diff > 0.001:
+                    price_ratios.append(close_a / close_b)
 
             merged.append(chosen)
             prev_close_a = close_a
@@ -1875,7 +2041,7 @@ def main():
     # signal.set_wakeup_fd 需要 socket（Windows 不支持 pipe fd）
     if sys.platform != 'win32':
         _wakeup_r, _wakeup_w = os.pipe()
-        os.set_blocking(_wakeup_r, False)
+        os.set_blocking(_wakeup_w, False)
         signal.set_wakeup_fd(_wakeup_w)
 
     # 日期范围
@@ -1941,6 +2107,8 @@ def main():
     _init_trading_calendar()
 
     today = datetime.now(TZ_SH).strftime("%Y-%m-%d")
+    # 如果用户指定了 --end 且早于今天，用 end_date 作为检查终点，避免假的尾部断裂
+    effective_today = min(today, end_date)
 
     # 分批
     batches = [stocks[i:i + batch_size] for i in range(0, total, batch_size)]
@@ -1962,7 +2130,7 @@ def main():
                 break
             batch_args = (
                 batch, 0, args.type, start_date, end_date,
-                market, args.tolerance, args.dry_run, today
+                market, args.tolerance, args.dry_run, effective_today
             )
             batch_result = _worker_batch(batch_args)
             all_results.extend(batch_result["results"])
@@ -1985,7 +2153,7 @@ def main():
     else:
         task_args = [
             (batch, i % n_workers, args.type, start_date, end_date,
-             market, args.tolerance, args.dry_run, today)
+             market, args.tolerance, args.dry_run, effective_today)
             for i, batch in enumerate(batches)
         ]
 

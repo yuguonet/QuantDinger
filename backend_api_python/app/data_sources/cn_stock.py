@@ -799,24 +799,21 @@ class CNStockDataSource(BaseDataSource):
     def _get_tickers(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
         """批量获取实时行情。走 Coordinator 批量行情调度，一次 HTTP 取多只。"""
         from app.data_sources.coordinator import get_realtime_circuit_breaker
-        normalized = [normalize_cn_code(s) for s in symbols if s]
-        if not normalized:
+        if not symbols:
             return {}
+        # coordinate_batch_quotes 内部会加前缀、返回时去前缀，直接透传即可
         raw_result = get_coordinator().coordinate_batch_quotes(
-            symbols=normalized,
+            symbols=symbols,
             cb=get_realtime_circuit_breaker(),
             market="CNStock",
         )
         if not raw_result:
             return {}
-        cleaned = {}
+        # raw_result key 已是纯数字，写入 ticker 缓存
         for k, v in raw_result.items():
-            raw_key = _strip_cn_prefix(k)
             if isinstance(v, dict):
-                v["symbol"] = raw_key
-                self._db_bridge._quote_cache._put(raw_key, v)
-            cleaned[raw_key] = v
-        return cleaned
+                self._db_bridge._quote_cache._put(k, v)
+        return raw_result
 
     # ── get_kline: 负责发 K 线数据 ──
 
