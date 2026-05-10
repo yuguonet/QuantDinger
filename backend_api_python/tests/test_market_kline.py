@@ -19,11 +19,13 @@ import os
 import sys
 import time
 from datetime import datetime
+from dotenv import load_dotenv
+load_dotenv()
 
 # 确保项目路径在 sys.path 中
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-OUTPUT_DIR = "data/kline_data"
+OUTPUT_DIR = "app/data/kline_data"
 
 
 def save_results(result: dict, out_dir: str, timeframe: str):
@@ -96,38 +98,23 @@ def main():
         if args.limit > 0:
             all_codes = all_codes[: args.limit]
 
-    total = len(all_codes)
     print(f"  🚀 开始下载...\n")
 
     # ── 调用 Coordinator ──
     t0 = time.time()
 
-    if args.codes or args.limit > 0:
-        # 走自定义路径：传入指定的股票列表
-        result = coord.coordinate_market_kline(
-            cb=cb,
-            market="CNStock",
-            timeframe=args.timeframe,
-            count=args.count if not args.start_date else None,
-            adj=args.adj,
-            timeout=args.timeout,
-            preferred_source=args.preferred,
-            start_date=args.start_date,
-            end_date=args.end_date,
-            symbols=all_codes,
-        )
-    else:
-        result = coord.coordinate_market_kline(
-            cb=cb,
-            market="CNStock",
-            timeframe=args.timeframe,
-            count=args.count if not args.start_date else None,
-            adj=args.adj,
-            timeout=args.timeout,
-            preferred_source=args.preferred,
-            start_date=args.start_date,
-            end_date=args.end_date,
-        )
+    result = coord.coordinate_market_kline(
+        cb=cb,
+        market="CNStock",
+        timeframe=args.timeframe,
+        count=args.count if not args.start_date else None,
+        adj=args.adj,
+        timeout=args.timeout,
+        preferred_source=args.preferred,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        symbols=all_codes,
+    )
 
     elapsed = time.time() - t0
 
@@ -137,6 +124,7 @@ def main():
 
     # ── 保存 ──
     print(f"\n  💾 保存 {len(result)} 只股票数据...")
+    saved = save_results(result, OUTPUT_DIR, args.timeframe)
 
     # ── 统计 ──
     total_bars = sum(len(bars) for bars in result.values())

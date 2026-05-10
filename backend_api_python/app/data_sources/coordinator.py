@@ -1134,17 +1134,22 @@ class Coordinator:
             available_providers = preferred + others
 
         # ── 第二步: 获取股票列表并分组 ──
-        all_codes = symbols
-        if not all_codes:
-            logger.warning("[协助层] market_kline 获取股票列表失败")
+        if not symbols:
+            logger.warning("[协助层] market_kline 未传入 symbols，无法获取股票列表")
             return {}
+        all_codes = symbols
 
-        group_size = 50
-        groups = [all_codes[i:i + group_size] for i in range(0, len(all_codes), group_size)]
-        total_groups = len(groups)
+        # 动态分组：根据总数自适应，最小50，最大400
+        total_codes = len(all_codes)
+        if total_codes <= 50:
+            group_size = total_codes
+        else:
+            # 目标约 15 组，clamp 到 [50, 400]
+            group_size = max(50, min(400, total_codes // 15))
+        groups = [all_codes[i:i + group_size] for i in range(0, total_codes, group_size)]
 
         logger.info("[协助层] market_kline %d只 → %d组(每组%d) → %d源并发: %s",
-                    len(all_codes), total_groups, group_size,
+                    total_codes, len(groups), group_size,
                     len(available_providers),
                     " | ".join(p.name for p in available_providers))
 
@@ -1323,13 +1328,13 @@ class Coordinator:
         end_date: str = "",
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
-        为一组股票并发获取K线数据。
+        为一组股票通过 provider.fetch_market_kline 批量获取K线数据。
 
-        通过并发调用 Provider 的 fetch_kline 接口获取数据。
-        保持与 akline_market.py 一致的线程结构。
+        直接调用 Provider 的 fetch_market_kline 接口，由 Provider 内部
+        负责并发/批量逻辑，coordinator 只负责传参和超时控制。
 
         Args:
-            provider: Provider 实例
+            provider: Provider 实例（须支持 kline_batch 能力）
             codes: 股票代码列表（一组，最多50只）
             timeframe: K线周期
             count: 数据条数
@@ -1343,35 +1348,32 @@ class Coordinator:
         """
         from app.data_sources.provider import NotSupportedResult
         from app.data_sources.normalizer import normalize_cn_code
-
-        result: Dict[str, List[Dict[str, Any]]] = {}
-        lock = threading.Lock()
-
         from app.data_sources.kline_clean import clean_klines
 
-        def _fetch_one(code):
-            try:
-                bars = provider.fetch_kline(
-                    code, timeframe, count, adj=adj,
-                    timeout=min(timeout, 10),
-                    start_date=start_date, end_date=end_date,
-                )
-                if bars and not isinstance(bars, NotSupportedResult):
-                    cleaned = clean_klines(bars, timeframe)
-                    with lock:
-                        result[normalize_cn_code(code)] = cleaned or bars
-            except Exception as e:
-                logger.debug("[_fetch_group_kline] %s 获取 %s 失败: %s",
-                            provider.name, code, e)
+        try:
+            batch_result = provider.fetch_market_kline(
+                timeframe=timeframe,
+                count=count,
+                adj=adj,
+                timeout=min(timeout, 20),
+                start_date=start_date,
+                end_date=end_date,
+                symbols=codes,
+            )
+        except Exception as e:
+            logger.debug("[_fetch_group_kline] %s fetch_market_kline 异常: %s", provider.name, e)
+            return {}
 
-        # 并发获取，线程数取 min(组大小, 30)
-        max_workers = min(len(codes), 15)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {pool.submit(_fetch_one, c): c for c in codes}
-            try:
-                concurrent.futures.wait(futures, timeout=timeout)
-            except Exception:
-                pass
+        if not batch_result or isinstance(batch_result, NotSupportedResult):
+            return {}
+
+        # 标准化 code + 清洗 K 线
+        result: Dict[str, List[Dict[str, Any]]] = {}
+        for code, bars in batch_result.items():
+            if not bars:
+                continue
+            cleaned = clean_klines(bars, timeframe)
+            result[normalize_cn_code(code)] = cleaned or bars
 
         return result
 
