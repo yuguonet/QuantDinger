@@ -41,9 +41,8 @@ logger = get_logger(__name__)
 
 TZ_CN = timezone(timedelta(hours=8))
 
-# 首次同步（cn_last_update 无记录时）的最大回溯天数
+# 首次同步（cn_last_update 无记录时）的最大回溯工作日数
 MAX_15M_DAYS = 3
-MAX_1D_DAYS = 10
 
 # 后台调度循环间隔（秒）
 _SCHEDULER_TICK = 30
@@ -77,28 +76,32 @@ def _ensure_cn_last_update_table():
                     cur.execute("""
                         CREATE TABLE IF NOT EXISTS cn_last_update (
                             id VARCHAR(64) PRIMARY KEY,
-                            source_name VARCHAR(64) NOT NULL,
                             tf VARCHAR(10) NOT NULL,
                             last_updated TIMESTAMP NOT NULL,
                             last_bar_time TIMESTAMP,
                             status VARCHAR(20) DEFAULT 'ok',
-                            report TEXT
+                            report TEXT,
+                            failed_count INT DEFAULT 0
                         )
                     """)
-                    # 兼容旧表: 加 last_bar_time 列（如果不存在）
-                    cur.execute("""
-                        DO $$
-                        BEGIN
-                            IF NOT EXISTS (
-                                SELECT 1 FROM information_schema.columns
-                                WHERE table_name = 'cn_last_update'
-                                  AND column_name = 'last_bar_time'
-                            ) THEN
-                                ALTER TABLE cn_last_update
-                                    ADD COLUMN last_bar_time TIMESTAMP;
-                            END IF;
-                        END $$;
-                    """)
+                    # 兼容旧表: 加缺失列（如果不存在）
+                    for col, col_def in [
+                        ("last_bar_time", "TIMESTAMP"),
+                        ("failed_count", "INT DEFAULT 0"),
+                    ]:
+                        cur.execute(f"""
+                            DO $$
+                            BEGIN
+                                IF NOT EXISTS (
+                                    SELECT 1 FROM information_schema.columns
+                                    WHERE table_name = 'cn_last_update'
+                                      AND column_name = '{col}'
+                                ) THEN
+                                    ALTER TABLE cn_last_update
+                                        ADD COLUMN {col} {col_def};
+                                END IF;
+                            END $$;
+                        """)
                     conn.commit()
             _table_ensured = True
         except Exception as e:
@@ -114,7 +117,7 @@ def _get_last_update(source_name: str, tf: str) -> dict | None:
         with pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT last_updated, last_bar_time, status, report "
+                    "SELECT last_updated, last_bar_time, status, report, failed_count "
                     "FROM cn_last_update WHERE id = %s",
                     (f"{source_name}_{tf}",),
                 )
@@ -126,6 +129,7 @@ def _get_last_update(source_name: str, tf: str) -> dict | None:
                     "last_bar_time": row[1],
                     "status": row[2],
                     "report": row[3],
+                    "failed_count": row[4] or 0,
                 }
     except Exception as e:
         logger.error(f"[同步] 查询 cn_last_update 失败: {e}")
@@ -143,14 +147,14 @@ def _record_update(source_name: str, tf: str, status: str, report: str,
             with conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO cn_last_update
-                        (id, source_name, tf, last_updated, last_bar_time, status, report)
-                    VALUES (%s, %s, %s, NOW(), %s, %s, %s)
+                        (id, tf, last_updated, last_bar_time, status, report)
+                    VALUES (%s, %s, NOW(), %s, %s, %s)
                     ON CONFLICT (id) DO UPDATE SET
                         last_updated  = NOW(),
                         last_bar_time = COALESCE(EXCLUDED.last_bar_time, cn_last_update.last_bar_time),
                         status        = EXCLUDED.status,
                         report        = EXCLUDED.report
-                """, (f"{source_name}_{tf}", source_name, tf, last_bar_time, status, report))
+                """, (f"{source_name}_{tf}", tf, last_bar_time, status, report))
                 conn.commit()
     except Exception as e:
         logger.error(f"[同步] 写入 cn_last_update 失败: {e}")
@@ -175,16 +179,6 @@ _BAR_END_TIMES = [
     (13, 15), (13, 30), (13, 45), (14, 0),
     (14, 15), (14, 30), (14, 45), (15, 0),
 ]
-
-
-def _bar_ready_times() -> list[datetime]:
-    """返回今天所有 15m bar 可供同步的时间点（bar 结束 + 延迟）。"""
-    today = datetime.now(TZ_CN).date()
-    return [
-        datetime(today.year, today.month, today.day, h, m, 0, tzinfo=TZ_CN)
-        + timedelta(seconds=_BAR_READY_DELAY)
-        for h, m in _BAR_END_TIMES
-    ]
 
 
 def _latest_available_bar_time() -> datetime | None:
@@ -271,7 +265,7 @@ def _should_run_15m() -> tuple[bool, str]:
             bar_time >= dt_time(h, m) and bar_time <= dt_time(h, m + 1)
             for h, m in _BAR_END_TIMES
         )
-        if not is_valid_bar_time and bar_time < dt_time(9, 30):
+        if not is_valid_bar_time:
             return True, f"last_bar_time={ref_cn:%H:%M} 不在交易时段，数据异常，重跑"
 
     # ── 第三步: 看时间点 ──
@@ -279,10 +273,9 @@ def _should_run_15m() -> tuple[bool, str]:
 
     # 盘前（9:45+70s 前）→ 没有可同步的 bar
     if not latest_bar:
-        # 但如果是首次同步（数据量可能不足），盘前也跑一次历史回填
-        report = doc.get("report", "")
-        if "首次" in report or "条" not in report:
-            return True, "盘前，首次/数据不足，执行历史回填"
+        # 从未成功同步过（无 last_bar_time）→ 盘前也跑历史回填
+        if not last_bar:
+            return True, "盘前，从未同步过，执行历史回填"
         return False, "盘前，无可同步 bar"
 
     # 有 last_bar_time → 精确比较
@@ -378,13 +371,13 @@ def _date_range_15m(last_bar_time: datetime | None) -> tuple[str, str]:
     """15m 增量同步的日期范围。
 
     有 last_bar → start_date = last_bar 所在交易日（从那天开始补）
-    无 last → start_date = 往前推 MAX_15M_DAYS 天
+    无 last → start_date = 往前推 MAX_15M_DAYS 个工作日
     end_date = 今天
     """
     end_date = datetime.now(TZ_CN).strftime("%Y-%m-%d")
 
     if not last_bar_time:
-        start = (datetime.now(TZ_CN) - timedelta(days=MAX_15M_DAYS)).strftime("%Y-%m-%d")
+        start = prev_trading_day(n=MAX_15M_DAYS)
     else:
         # last_bar_time 可能是带时区的
         if last_bar_time.tzinfo:
@@ -445,9 +438,9 @@ class BackfillDB:
         # 执行同步
         try:
             if self.source.dinger_url:
-                written = self._sync_via_api(tf)
+                written, failed = self._sync_via_api(tf)
             else:
-                written = self._sync_via_coordinator(tf, symbols=symbols)
+                written, failed = self._sync_via_coordinator(tf, symbols=symbols)
         except Exception as e:
             report = f"同步异常: {e}"
             logger.error(f"[同步] {self.source.name} tf={tf} {report}")
@@ -456,6 +449,12 @@ class BackfillDB:
                 "source": self.source.name, "tf": tf,
                 "written": 0, "status": "error", "report": report,
             }
+
+        if failed:
+            logger.warning(
+                f"[同步] {self.source.name} tf={tf} "
+                f"{len(failed)} 只标的失败，下次同步自然重试"
+            )
 
         if written == 0:
             # 没写入数据 → 不记录 ok，下次还会重试
@@ -478,12 +477,14 @@ class BackfillDB:
             "written": written, "status": "ok", "report": report,
         }
 
-    def _sync_via_coordinator(self, tf: str, symbols: list | None = None) -> int:
+    def _sync_via_coordinator(self, tf: str, symbols: list | None = None) -> tuple[int, list[str]]:
         """A 股: 通过 coordinator 全市场批量同步。
 
         关键: 区分"增量快照"和"历史回填"两种路径。
           - 增量快照: count=None, start_date="" → 走 batch_quotes（1 HTTP，快）
           - 历史回填: count=None, start_date=过去日期 → 走并发 fetch_kline（N HTTP）
+
+        返回: (写入条数, 失败symbols列表)
         """
         from app.data_sources.coordinator import get_coordinator
         from app.data_sources.circuit_breaker import get_realtime_circuit_breaker
@@ -494,7 +495,7 @@ class BackfillDB:
             symbols = get_stock_basic_db().market_all_codes(status="active")
         if not symbols:
             logger.warning(f"[同步] {self.source.name} 获取股票列表失败")
-            return 0
+            return 0, []
 
         coord = get_coordinator()
         cb = get_realtime_circuit_breaker()
@@ -526,26 +527,30 @@ class BackfillDB:
             count=None,
             start_date=start_date,
             end_date=end_date,
-            timeout=300,
+            timeout=1200,
             symbols=symbols,
         )
 
         if not result:
             logger.warning(f"[同步] {self.source.name} coordinator 返回空数据")
-            return 0
+            return 0, list(symbols)
 
         logger.info(f"[同步] {self.source.name} tf={tf} 拉到 {len(result)} 只标的")
 
         # 收集所有标的的数据，一次性批量写入
         all_records = []
+        failed_symbols = []
         for symbol, bars in result.items():
             if not bars:
+                failed_symbols.append(symbol)
                 continue
             cleaned = clean_klines(bars, tf)
             if not cleaned:
+                failed_symbols.append(symbol)
                 continue
             cleaned = _validate_bars(cleaned)
             if not cleaned:
+                failed_symbols.append(symbol)
                 continue
             for bar in cleaned:
                 all_records.append({
@@ -559,27 +564,29 @@ class BackfillDB:
                     "volume": bar.get("volume", 0),
                 })
 
-        if not all_records:
-            return 0
+        # coordinator 返回了但完全没数据的 symbol 也算失败
+        requested_set = set(symbols)
+        fetched_set = set(result.keys())
+        missing_from_source = list(requested_set - fetched_set)
+        failed_symbols.extend(missing_from_source)
 
-        # 记录成功获取的 symbol 数量 vs 总数
-        fetched_symbols = set(r["symbol"] for r in all_records)
-        total_symbols = len(result)
-        if len(fetched_symbols) < total_symbols:
-            missing = total_symbols - len(fetched_symbols)
+        if failed_symbols:
             logger.warning(
                 f"[同步] {self.source.name} tf={tf} "
-                f"部分失败: {total_symbols}只中{missing}只未获取到数据"
+                f"{len(failed_symbols)}/{len(symbols)} 只标的失败"
             )
+
+        if not all_records:
+            return 0, failed_symbols
 
         try:
             r = self._writer.bulk_write(self.source.market, all_records)
             total = r.get("inserted", 0) + r.get("skipped", 0)
             logger.info(f"[同步] {self.source.name} tf={tf} 批量写入 {total} 条")
-            return total
+            return total, failed_symbols
         except Exception as e:
             logger.error(f"[同步] {self.source.name} 批量写入失败: {e}")
-            return 0
+            return 0, list(symbols)
 
     @staticmethod
     def _is_incremental(tf: str, last_bar_time, last_updated) -> bool:
@@ -603,8 +610,8 @@ class BackfillDB:
         # 跨交易日 → 历史回填（需要补齐当天从开盘到现在的 bar）
         return False
 
-    def _sync_via_api(self, tf: str) -> int:
-        """基金/债: 通过 Dinger API 拉取并写入。"""
+    def _sync_via_api(self, tf: str) -> tuple[int, list[str]]:
+        """基金/债: 通过 Dinger API 拉取并写入。返回 (写入条数, 失败symbols列表)。"""
         import requests
 
         url = self.source.dinger_url.format(tf=tf, count=300)
@@ -620,7 +627,7 @@ class BackfillDB:
 
         items = data.get("data", [])
         if not items or not isinstance(items, list):
-            return 0
+            return 0, []
 
         # 按 symbol 分组
         ts_field = "navDate" if "fund" in self.source.name else "date"
@@ -657,33 +664,23 @@ class BackfillDB:
                 })
 
         if not all_records:
-            return 0
+            return 0, []
 
         all_records = [
             r for r in all_records
             if r["open"] != 0 or r["high"] != 0 or r["low"] != 0 or r["close"] != 0
         ]
         if not all_records:
-            return 0
-
-        # 记录成功获取的 symbol 数量 vs 总数
-        fetched_symbols = set(r["symbol"] for r in all_records)
-        total_symbols = len(result)
-        if len(fetched_symbols) < total_symbols:
-            missing = total_symbols - len(fetched_symbols)
-            logger.warning(
-                f"[同步] {self.source.name} tf={tf} "
-                f"部分失败: {total_symbols}只中{missing}只未获取到数据"
-            )
+            return 0, []
 
         try:
             r = self._writer.bulk_write(self.source.market, all_records)
             total = r.get("inserted", 0) + r.get("skipped", 0)
             logger.info(f"[同步] {self.source.name} tf={tf} 批量写入 {total} 条")
-            return total
+            return total, []
         except Exception as e:
             logger.error(f"[同步] {self.source.name} 批量写入失败: {e}")
-            return 0
+            return 0, []
 
 
 # ================================================================
@@ -717,7 +714,7 @@ def _should_run_generic(tf: str) -> tuple[bool, str]:
     if not doc:
         return True, "首次同步"
     status = doc.get("status", "")
-    if status == "error":
+    if status in ("error", "partial"):
         return True, f"上次失败，重试"
     last = doc.get("last_updated")
     if last and not _same_trading_day(last, datetime.now(TZ_CN)):

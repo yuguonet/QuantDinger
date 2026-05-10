@@ -31,8 +31,10 @@ import socket
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+
+_TZ_CN = timezone(timedelta(hours=8))
 
 from app.data_sources.provider import register, NotSupportedResult
 from app.data_sources.normalizer import normalize_cn_code
@@ -251,9 +253,9 @@ def _fetch_tdx_ex_kline(
         try:
             # pytdx 返回 "YYYY-MM-DD HH:MM" 格式
             if "-" in dt and ":" in dt:
-                ts = int(datetime.strptime(dt[:16], "%Y-%m-%d %H:%M").timestamp())
+                ts = int(datetime.strptime(dt[:16], "%Y-%m-%d %H:%M").replace(tzinfo=_TZ_CN).timestamp())
             elif len(dt) == 8 and dt.isdigit():
-                ts = int(datetime.strptime(dt, "%Y%m%d").timestamp())
+                ts = int(datetime.strptime(dt, "%Y%m%d").replace(tzinfo=_TZ_CN).timestamp())
             else:
                 ts = int(float(dt))
             result.append({

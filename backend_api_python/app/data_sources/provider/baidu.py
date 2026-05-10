@@ -33,8 +33,10 @@ import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+
+_TZ_CN = timezone(timedelta(hours=8))
 
 from app.data_sources.provider import register, NotSupportedResult
 from app.utils.logger import get_logger
@@ -125,9 +127,9 @@ def _fetch_baidu_15m(code: str, limit: int = 200) -> Optional[List[Dict[str, Any
                 continue
             # 百度返回的时间格式可能是 "2026-05-08 09:45" 或时间戳
             if "-" in dt_str and ":" in dt_str:
-                ts = int(datetime.strptime(dt_str[:16], "%Y-%m-%d %H:%M").timestamp())
+                ts = int(datetime.strptime(dt_str[:16], "%Y-%m-%d %H:%M").replace(tzinfo=_TZ_CN).timestamp())
             elif "-" in dt_str:
-                ts = int(datetime.strptime(dt_str[:10], "%Y-%m-%d").timestamp())
+                ts = int(datetime.strptime(dt_str[:10], "%Y-%m-%d").replace(tzinfo=_TZ_CN).timestamp())
             else:
                 ts = int(float(dt_str))
 

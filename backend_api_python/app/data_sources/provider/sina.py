@@ -32,8 +32,10 @@ import itertools
 import json
 import re
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+
+_TZ_CN = timezone(timedelta(hours=8))
 
 import requests
 
@@ -148,7 +150,7 @@ def _sina_kline_to_dicts(data: list, count: int) -> List[Dict[str, Any]]:
             ts = None
             for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
                 try:
-                    ts = datetime.strptime(dt_str, fmt)
+                    ts = datetime.strptime(dt_str, fmt).replace(tzinfo=_TZ_CN)
                     break
                 except ValueError:
                     continue
@@ -192,7 +194,7 @@ def _fetch_sina_kline_hisdata(sc: str, count: int, timeout: int) -> List[Dict[st
     for m in pattern.finditer(text):
         try:
             dt_str, o, c, h, low, v = m.groups()
-            ts = int(datetime.strptime(dt_str, "%Y-%m-%d").timestamp())
+            ts = int(datetime.strptime(dt_str, "%Y-%m-%d").replace(tzinfo=_TZ_CN).timestamp())
             o, c, h, low, v = float(o), float(c), float(h), float(low), float(v)
             if o == 0 and c == 0:
                 continue

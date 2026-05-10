@@ -38,7 +38,9 @@ import time
 import urllib.request
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+
+_TZ_CN = timezone(timedelta(hours=8))
 from typing import Any, Dict, List, Optional
 
 from app.data_sources.provider import register, NotSupportedResult
@@ -378,7 +380,7 @@ class EmTrends2DataSource:
                 ts_str = str(bar.get("time", ""))
                 if "-" in ts_str and ":" in ts_str:
                     # 字符串时间 → Unix timestamp
-                    ts = int(datetime.strptime(ts_str[:16], "%Y-%m-%d %H:%M").timestamp())
+                    ts = int(datetime.strptime(ts_str[:16], "%Y-%m-%d %H:%M").replace(tzinfo=_TZ_CN).timestamp())
                 else:
                     ts = int(float(ts_str))
                 result.append({
@@ -455,7 +457,7 @@ class EmTrends2DataSource:
                         try:
                             ts_str = str(bar.get("time", ""))
                             if "-" in ts_str and ":" in ts_str:
-                                ts = int(datetime.strptime(ts_str[:16], "%Y-%m-%d %H:%M").timestamp())
+                                ts = int(datetime.strptime(ts_str[:16], "%Y-%m-%d %H:%M").replace(tzinfo=_TZ_CN).timestamp())
                             else:
                                 ts = int(float(ts_str))
                             bars.append({

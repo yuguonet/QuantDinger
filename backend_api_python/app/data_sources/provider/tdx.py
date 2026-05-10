@@ -3,6 +3,8 @@
 from __future__ import annotations
 import json, re, threading
 from datetime import datetime, timezone, timedelta
+
+_TZ_CN = timezone(timedelta(hours=8))
 from typing import Any, Dict, List, Optional
 import requests
 from app.data_sources.normalizer import to_raw_digits, detect_market
@@ -83,8 +85,8 @@ class TdxDataSource:
             if len(parts) < 5: continue
             try:
                 dt_str = parts[0].strip()
-                if len(dt_str) == 8 and dt_str.isdigit(): ts = int(datetime.strptime(dt_str, "%Y%m%d").timestamp())
-                elif len(dt_str) >= 10: ts = int(datetime.strptime(dt_str[:10], "%Y-%m-%d").timestamp())
+                if len(dt_str) == 8 and dt_str.isdigit(): ts = int(datetime.strptime(dt_str, "%Y%m%d").replace(tzinfo=_TZ_CN).timestamp())
+                elif len(dt_str) >= 10: ts = int(datetime.strptime(dt_str[:10], "%Y-%m-%d").replace(tzinfo=_TZ_CN).timestamp())
                 else: continue
                 o, h, l, c = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
                 v = float(parts[5]) if len(parts) > 5 else 0
