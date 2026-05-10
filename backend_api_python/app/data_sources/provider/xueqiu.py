@@ -217,6 +217,7 @@ def _fetch_ticker(code: str) -> Optional[Dict[str, Any]]:
         last = float(quote.get("current", 0) or 0)
         prev = float(quote.get("last_close", 0) or 0)
         chg = round(last - prev, 4) if prev else 0
+        vol = float(quote.get("volume", 0) or 0)
 
         return {
             "last": last,
@@ -226,6 +227,8 @@ def _fetch_ticker(code: str) -> Optional[Dict[str, Any]]:
             "low": float(quote.get("low", 0) or last),
             "open": float(quote.get("open", 0) or last),
             "previousClose": prev,
+            "volume": vol,
+            "time": "",
             "name": quote.get("name", ""),
             "symbol": symbol,
         }

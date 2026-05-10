@@ -471,6 +471,7 @@ class TdxExDataSource:
             high = float(q.get("high", 0) or last)
             low = float(q.get("low", 0) or last)
             chg = round(last - prev, 4) if prev else 0
+            vol = float(q.get("vol", 0) or 0)
 
             return {
                 "last": last,
@@ -480,6 +481,7 @@ class TdxExDataSource:
                 "low": low,
                 "open": open_p,
                 "previousClose": prev,
+                "volume": vol, "time": "",
                 "name": "",
                 "symbol": symbol,
             }
@@ -534,6 +536,7 @@ class TdxExDataSource:
                     continue
                 prev = float(q.get("last_close", 0) or 0)
                 chg = round(last - prev, 4) if prev else 0
+                vol = float(q.get("vol", 0) or 0)
                 result[nc] = {
                     "last": last,
                     "change": chg,
@@ -542,6 +545,8 @@ class TdxExDataSource:
                     "low": float(q.get("low", 0) or last),
                     "open": float(q.get("open", 0) or last),
                     "previousClose": prev,
+                    "volume": vol,
+                    "time": "",
                     "name": "",
                     "symbol": nc[2:],
                 }

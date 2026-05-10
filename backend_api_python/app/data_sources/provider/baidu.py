@@ -180,6 +180,7 @@ def _fetch_baidu_quote(code: str) -> Optional[Dict[str, Any]]:
 
     prev = float(sd.get("prevClose", sd.get("preClose", 0)) or 0)
     chg = round(last - prev, 4) if prev else 0
+    vol = float(sd.get("volume", 0) or 0)
 
     return {
         "last": last,
@@ -189,6 +190,8 @@ def _fetch_baidu_quote(code: str) -> Optional[Dict[str, Any]]:
         "low": float(sd.get("low", 0) or last),
         "open": float(sd.get("open", 0) or last),
         "previousClose": prev,
+        "volume": vol,
+        "time": "",
         "name": str(sd.get("name", sd.get("stockName", ""))),
         "symbol": cn_code,
     }

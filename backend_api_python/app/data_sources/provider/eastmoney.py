@@ -347,6 +347,9 @@ class EastMoneyDataSource:
         if last == 0 and prev == 0:
             return None
         chg = round(last - prev, 4) if prev else 0.0
+        vol = _f("f47")
+        now = datetime.now(timezone(timedelta(hours=8)))
+        time_str = now.strftime("%Y-%m-%d %H:%M:%S")
         return {
             "last": last,
             "change": chg,
@@ -355,6 +358,7 @@ class EastMoneyDataSource:
             "low": _f("f45") / 100,
             "open": _f("f46") / 100,
             "previousClose": prev,
+            "volume": vol, "time": time_str,
             "name": str(d.get("f58", "")).strip(),
             "symbol": secid,
         }
@@ -393,6 +397,7 @@ class EastMoneyDataSource:
 
         now = datetime.now(timezone(timedelta(hours=8)))
         today_ts = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        today_str = now.strftime("%Y-%m-%d %H:%M:%S")
         result: Dict[str, Dict[str, Any]] = {}
         for item in diff:
             code = str(item.get("f12", "")).strip()
@@ -405,6 +410,7 @@ class EastMoneyDataSource:
                     continue
                 prev = float(item.get("f18", 0))
                 chg = round(last - prev, 4) if prev else 0.0
+                vol = float(item.get("f5", 0) or 0)
                 result[sym] = {
                     "last": last,
                     "change": chg,
@@ -413,9 +419,10 @@ class EastMoneyDataSource:
                     "low": round(float(item.get("f16", 0)), 4),
                     "open": round(float(item.get("f17", 0)), 4),
                     "previousClose": prev,
+                    "volume": vol,
+                    "time": today_str,
                     "name": "",
                     "symbol": sym,
-                    "time": today_ts,
                 }
             except (ValueError, TypeError):
                 continue

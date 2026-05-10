@@ -300,6 +300,7 @@ def _fetch_em_trends2_quote(code: str) -> Optional[Dict[str, Any]]:
     highs = [float(b.get("high", 0)) for b in raw if float(b.get("high", 0)) > 0]
     lows = [float(b.get("low", 0)) for b in raw if float(b.get("low", 0)) > 0]
     open_p = float(raw[0].get("open", 0) or last)
+    vol = sum(float(b.get("volume", 0) or 0) for b in raw)
 
     return {
         "last": last,
@@ -309,6 +310,8 @@ def _fetch_em_trends2_quote(code: str) -> Optional[Dict[str, Any]]:
         "low": min(lows) if lows else last,
         "open": open_p,
         "previousClose": 0,
+        "volume": vol,
+        "time": "",
         "name": "",
         "symbol": code,
     }

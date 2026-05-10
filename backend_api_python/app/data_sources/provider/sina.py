@@ -341,6 +341,13 @@ class SinaDataSource:
         last = quote["last"]
         prev = quote["prev_close"]
         chg = round(last - prev, 4) if prev else 0.0
+        vol = quote.get("volume", 0)
+        time_str = ""
+        parts_raw = re.search(r'\"(.+?)\"', resp.text)
+        if parts_raw:
+            p = parts_raw.group(1).split(",")
+            if len(p) > 31 and p[30] and p[31]:
+                time_str = f"{p[30].strip()} {p[31].strip()}"
         return {
             "last": last,
             "change": chg,
@@ -349,6 +356,7 @@ class SinaDataSource:
             "low": quote.get("low", last),
             "open": quote.get("open", last) or last,
             "previousClose": prev,
+            "volume": vol, "time": time_str,
             "name": quote.get("name", ""),
             "symbol": sc,
         }
@@ -428,11 +436,15 @@ class SinaDataSource:
                 if last == 0 and prev_close == 0 and open_p == 0:
                     continue
                 chg = round(last - prev_close, 4) if prev_close else 0.0
+                time_str = ""
+                if len(parts) > 31 and parts[30] and parts[31]:
+                    time_str = f"{parts[30].strip()} {parts[31].strip()}"
                 result[code_str] = {
                     "name": name, "last": last, "change": chg,
                     "changePercent": round(chg / prev_close * 100, 2) if prev_close else 0.0,
                     "open": open_p, "high": high, "low": low,
-                    "previousClose": prev_close, "volume": vol, "symbol": code_str,
+                    "previousClose": prev_close, "volume": vol, "time": time_str,
+                    "symbol": code_str,
                 }
             except (ValueError, IndexError):
                 continue

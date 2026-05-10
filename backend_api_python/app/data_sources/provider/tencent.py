@@ -283,11 +283,17 @@ class TencentDataSource:
 
         last, prev = _f(3), _f(4)
         chg = round(last - prev, 4) if prev else 0
+        vol = _f(6)
+        raw_time = parts[30].strip() if len(parts) > 30 and parts[30] else ""
+        time_str = ""
+        if len(raw_time) == 14 and raw_time.isdigit():
+            time_str = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]} {raw_time[8:10]}:{raw_time[10:12]}:{raw_time[12:14]}"
         return {
             "last": last, "change": chg,
             "changePercent": round(chg / prev * 100, 2) if prev else 0,
             "high": _f(33, last), "low": _f(34, last),
             "open": _f(5) or last, "previousClose": prev,
+            "volume": vol, "time": time_str,
             "name": (parts[1] or "").strip(),
             "symbol": (parts[2] or "").strip(),
         }
@@ -358,6 +364,12 @@ class TencentDataSource:
                             break
                         prev = float(parts[4]) if parts[4] else 0
                         chg = round(last - prev, 4) if prev else 0
+                        vol = float(parts[6]) if len(parts) > 6 and parts[6] else 0
+                        raw_time = parts[30].strip() if len(parts) > 30 and parts[30] else ""
+                        # 统一格式: "20260510150000" → "2026-05-10 15:00:00"
+                        time_str = ""
+                        if len(raw_time) == 14 and raw_time.isdigit():
+                            time_str = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]} {raw_time[8:10]}:{raw_time[10:12]}:{raw_time[12:14]}"
                         result[c] = {
                             "last": last, "change": chg,
                             "changePercent": round(chg / prev * 100, 2) if prev else 0,
@@ -365,6 +377,8 @@ class TencentDataSource:
                             "low": float(parts[34]) if len(parts) > 34 and parts[34] else last,
                             "open": float(parts[5]) if parts[5] else last,
                             "previousClose": prev,
+                            "volume": vol,
+                            "time": time_str,
                             "name": parts[1].strip(),
                             "symbol": parts[2].strip(),
                         }
