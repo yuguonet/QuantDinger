@@ -1835,6 +1835,123 @@ class Coordinator:
         return self._normalize_market_kline_result(result)
 
     # ================================================================
+    # 模式 E: 批量行情 — 记忆源优先，直调 Provider
+    # ================================================================
+
+    # 记忆源状态（跨调用持久，无 TTL）
+    _sticky_source: str = ""
+    _sticky_lock = threading.Lock()
+
+    def coordinate_batch_quotes_sticky(
+        self,
+        symbols: List[str],
+        market: str = "",
+        timeout: float = 10.0,
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        批量行情 — 记忆源优先，直调 Provider.fetch_batch_quotes。
+
+        与 coordinate_batch_quotes 的区别:
+          - 不走 Coordinator 的 RACE/分组轮询架构
+          - 直接调 Provider 层的 fetch_batch_quotes
+          - 自带记忆: 记住当前正常工作的源，下次直接命中
+          - 记忆永不失效，直到下次失败才轮换
+
+        调度逻辑:
+          1. 有记忆源 → 先试它，成功直接返回
+          2. 记忆源失败或无记忆 → 按 priority 轮询所有可用 Provider
+          3. 某 Provider 成功 → 记住它，下次直接命中
+          4. 全部失败 → 清除记忆，下次重新轮询
+
+        Args:
+            symbols: 股票代码列表（纯数字或带前缀均可）
+            market:  市场名称（"CNStock" / ...）
+            timeout: 单次 fetch 超时（秒）
+
+        Returns:
+            {纯数字代码: quote_dict}
+        """
+        from app.data_sources.provider import get_providers
+        from app.data_sources.normalizer import add_market_prefix, strip_market_prefix
+
+        if not symbols:
+            return {}
+
+        # 输入标准化: 加市场前缀
+        seen: set = set()
+        prefixed: List[str] = []
+        for s in symbols:
+            ns = add_market_prefix(s, market)
+            if ns and ns not in seen:
+                seen.add(ns)
+                prefixed.append(ns)
+        if not prefixed:
+            return {}
+
+        # 获取支持 batch_quote 的 Provider（已按 priority 排序）
+        providers = get_providers(capability="batch_quote", market=market)
+        if not providers:
+            logger.warning("[记忆行情] market=%s 无可用 Provider", market)
+            return {}
+
+        # 确定尝试顺序: 记忆源排第一
+        with Coordinator._sticky_lock:
+            sticky = Coordinator._sticky_source
+
+        ordered = []
+        if sticky:
+            sticky_p = [p for p in providers if p.name == sticky]
+            others = [p for p in providers if p.name != sticky]
+            ordered = sticky_p + others
+        else:
+            ordered = list(providers)
+
+        # 逐源尝试
+        for provider in ordered:
+            try:
+                result = provider.fetch_batch_quotes(prefixed, timeout=int(timeout))
+            except Exception as e:
+                logger.debug("[记忆行情] %s 异常: %s", provider.name, e)
+                continue
+
+            if not result:
+                continue
+
+            # 成功 — 记住这个源
+            with Coordinator._sticky_lock:
+                Coordinator._sticky_source = provider.name
+
+            if sticky and provider.name != sticky:
+                logger.info("[记忆行情] 记忆源 %s 失效，切换到 %s (%d只)",
+                            sticky, provider.name, len(result))
+            elif not sticky:
+                logger.info("[记忆行情] 命中 %s (%d只)", provider.name, len(result))
+
+            # 标准化输出: key 去前缀 → 纯数字
+            normalized: Dict[str, Dict[str, Any]] = {}
+            for k, v in result.items():
+                if not isinstance(v, dict):
+                    continue
+                digits = strip_market_prefix(k)
+                v["symbol"] = digits
+                raw_name = v.get("name", "")
+                if raw_name and strip_market_prefix(raw_name) == digits:
+                    v["name"] = ""
+                normalized[digits] = v
+
+            return normalized
+
+        # 全部失败 — 清除记忆，下次重新轮询
+        with Coordinator._sticky_lock:
+            if Coordinator._sticky_source:
+                logger.warning("[记忆行情] 记忆源 %s 及所有备选均失败，清除记忆",
+                               Coordinator._sticky_source)
+                Coordinator._sticky_source = ""
+
+        logger.warning("[记忆行情] 所有 Provider 均失败 (%d只)", len(prefixed))
+        return {}
+
+    # ================================================================
     # 透传模式 — 不加任何协调逻辑
     # ================================================================
 
