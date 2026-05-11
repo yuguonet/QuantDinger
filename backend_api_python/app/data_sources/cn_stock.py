@@ -176,101 +176,6 @@ class _QuoteCacheEntry:
         self.ts = now
 
 
-class RealtimeQuoteCache:
-    """全局 ticker 缓存（线程安全）。
-
-    key 是纯 6 位数字代码（如 "600000"），不含市场前缀。
-    由 get_ticker() 写入，由 _apply_ticker_to_last_bar() 读取。
-
-    容量: 最多 _CACHE_MAX_ENTRIES 条，满时淘汰 ts 最老的。
-    """
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._entries: Dict[str, _QuoteCacheEntry] = {}
-
-    def _evict_if_full(self):
-        """容量满时淘汰 ts 最老的条目。调用方需持锁。"""
-        if len(self._entries) < _CACHE_MAX_ENTRIES:
-            return
-        oldest_key = min(self._entries, key=lambda k: self._entries[k].ts or float('inf'))
-        del self._entries[oldest_key]
-
-    def _put(self, symbol: str, result: Dict[str, Any]):
-        """将 ticker 结果写入缓存。由 get_ticker / _get_tickers 调用。"""
-        raw = _strip_cn_prefix(symbol)
-        if not result or float(result.get('last', 0) or 0) <= 0:
-            return
-        with self._lock:
-            entry = self._entries.get(raw)
-            if entry is None:
-                self._evict_if_full()
-                entry = _QuoteCacheEntry()
-                self._entries[raw] = entry
-            entry.update_from_ticker(result)
-
-    def get_or_fetch(self, symbol: str, ds: 'CNStockDataSource') -> Optional[_QuoteCacheEntry]:
-        """获取缓存行情，无缓存则实时拉取。"""
-        raw = _strip_cn_prefix(symbol)
-        with self._lock:
-            entry = self._entries.get(raw)
-            if entry and entry.price > 0:
-                return entry
-
-        try:
-            ticker = ds.get_ticker(raw)
-            if not ticker or float(ticker.get('last', 0) or 0) <= 0:
-                return None
-        except Exception:
-            return None
-
-        with self._lock:
-            entry = self._entries.get(raw)
-            if entry is None:
-                self._evict_if_full()
-                entry = _QuoteCacheEntry()
-                self._entries[raw] = entry
-            entry.update_from_ticker(ticker)
-            return entry
-
-    def batch_fetch(self, symbols: List[str], ds: 'CNStockDataSource') -> Dict[str, _QuoteCacheEntry]:
-        """批量获取/刷新行情缓存。一次 batch_quote HTTP 调用覆盖多只。"""
-        need_refresh: List[str] = []
-        result: Dict[str, _QuoteCacheEntry] = {}
-
-        with self._lock:
-            for sym in symbols:
-                raw = _strip_cn_prefix(sym)
-                entry = self._entries.get(raw)
-                if entry and entry.price > 0:
-                    result[raw] = entry
-                else:
-                    need_refresh.append(raw)
-
-        if not need_refresh:
-            return result
-
-        try:
-            tickers = ds._get_tickers(need_refresh)
-        except Exception:
-            tickers = {}
-
-        with self._lock:
-            for raw in need_refresh:
-                ticker = tickers.get(raw)
-                if not ticker or float(ticker.get('last', 0) or 0) <= 0:
-                    continue
-                entry = self._entries.get(raw)
-                if entry is None:
-                    self._evict_if_full()
-                    entry = _QuoteCacheEntry()
-                    self._entries[raw] = entry
-                entry.update_from_ticker(ticker)
-                result[raw] = entry
-
-        return result
-
-
 # ================================================================
 # DB 行情桥接层
 # ================================================================
@@ -292,7 +197,6 @@ class DBKlineBridge:
         self._ds = ds
         self._mgr = None
         self._writer = None
-        self._quote_cache = RealtimeQuoteCache()
         self._init_lock = threading.Lock()
         self._init_attempted = False
 
@@ -529,39 +433,6 @@ class DBKlineBridge:
         """
         if not bars:
             return
-
-        with self._quote_cache._lock:
-            entry = self._quote_cache._entries.get(raw)
-            if not entry or entry.price <= 0:
-                return
-
-            last_bar = bars[-1]
-            bar_ts = last_bar.get("time", 0)
-
-            # 当前 15 分钟窗口的起始时间（向下取整到 900 秒）
-            now_ts = int(time.time())
-            current_window_start = (now_ts // 900) * 900
-
-            if bar_ts < current_window_start:
-                # 最后一根 bar 是上一个窗口的，ticker 已经进入新窗口
-                # → 追加一根临时 bar，等下次 backfill 会被全量数据覆盖
-                bars.append({
-                    "time": current_window_start,
-                    "open": entry.price,
-                    "high": entry.high,
-                    "low": entry.low,
-                    "close": entry.price,
-                    "volume": entry.volume,
-                })
-            else:
-                # 最后一根 bar 就是当前窗口 → 用 ticker 补充实时值
-                if entry.high > last_bar.get("high", 0):
-                    last_bar["high"] = round(entry.high, 4)
-                if entry.low > 0 and (last_bar.get("low", 0) <= 0 or entry.low < last_bar["low"]):
-                    last_bar["low"] = round(entry.low, 4)
-                last_bar["close"] = round(entry.price, 4)
-                if entry.volume > 0:
-                    last_bar["volume"] = round(entry.volume, 2)
 
     # ────────────────────────────────────────────────────────────
     # DB 读取 + 周期聚合
@@ -818,50 +689,27 @@ class CNStockDataSource(BaseDataSource):
         self.circuit_breaker = get_realtime_circuit_breaker()
         self._db_bridge = DBKlineBridge(self)
 
-    # ── get_ticker: 只负责取行情，取到后写入 ticker 缀存 ──
+    # ── get_ticker: 只负责取行情 ──
 
     def get_ticker(self, symbol: str) -> Dict[str, Any]:
-        """获取实时行情。取到后自动写入 ticker 缓存供 get_kline 使用。"""
-        if ',' in symbol:
-            symbols = [s.strip() for s in symbol.split(',') if s.strip()]
-            if not symbols:
-                return {"last": 0, "symbol": symbol}
-            return self._get_tickers(symbols)
-
+        """获取实时行情。单股/批量均由 Coordinator 统一调度。"""
         code = normalize_cn_code(symbol)
         raw = _strip_cn_prefix(code)
 
         result = get_coordinator().coordinate_ticker(
-            symbol=code,
+            symbols=code,
             cb=self.circuit_breaker,
             market="CNStock",
             timeout=8,
         )
 
-        if result:
-            result["symbol"] = raw
-            # 写入 ticker 缓存，供 get_kline 的 _apply_ticker_to_last_bar 使用
-            self._db_bridge._quote_cache._put(raw, result)
-            return result
+        if result and raw in result:
+            quote = result[raw]
+            quote["symbol"] = raw
+            return quote
 
         logger.warning(f"[行情] 所有数据源均失败: {symbol}")
         return {"last": 0, "symbol": raw}
-
-    def _get_tickers(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
-        """批量获取实时行情。走 Coordinator 记忆源调度，一次 HTTP 取多只。"""
-        if not symbols:
-            return {}
-        raw_result = get_coordinator().coordinate_batch_quotes_sticky(
-            symbols=symbols,
-            market="CNStock",
-        )
-        if not raw_result:
-            return {}
-        # 写入 ticker 缓存
-        for k, v in raw_result.items():
-            if isinstance(v, dict):
-                self._db_bridge._quote_cache._put(k, v)
-        return raw_result
 
     # ── get_kline: 负责发 K 线数据 ──
 

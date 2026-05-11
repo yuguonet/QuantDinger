@@ -278,8 +278,8 @@ class TestGetTicker:
 
     def test_coordinator_returns_quote(self, ds, mock_coordinator):
         """缓存 miss 时走 Coordinator race。"""
-        quote = {"last": 15.5, "symbol": "SZ000001", "change": 0.3}
-        mock_coordinator.coordinate_ticker.return_value = quote
+        quote = {"last": 15.5, "change": 0.3}
+        mock_coordinator.coordinate_ticker.return_value = {"SZ000001": quote}
 
         result = ds.get_ticker("000001")
         assert result["last"] == 15.5
@@ -289,15 +289,15 @@ class TestGetTicker:
 
     def test_coordinator_returns_none(self, ds, mock_coordinator):
         """所有源都失败时返回兜底值。"""
-        mock_coordinator.coordinate_ticker.return_value = None
+        mock_coordinator.coordinate_ticker.return_value = {}
 
         result = ds.get_ticker("600519")
         assert result == {"last": 0, "symbol": "SH600519"}
 
     def test_result_is_cached(self, ds, mock_coordinator):
         """Coordinator 成功后结果应写入缓存。"""
-        quote = {"last": 100.0, "symbol": "SH600519"}
-        mock_coordinator.coordinate_ticker.return_value = quote
+        quote = {"last": 100.0}
+        mock_coordinator.coordinate_ticker.return_value = {"SH600519": quote}
 
         ds.get_ticker("600519")
         cached = ds.realtime_cache.get("ticker:SH600519")
@@ -492,8 +492,8 @@ class TestTickerCacheExpiry:
         ds.realtime_cache.set("ticker:SH600519", old_quote, ttl=0.001)
         time.sleep(0.01)
 
-        new_quote = {"last": 20.0, "symbol": "SH600519"}
-        mock_coordinator.coordinate_ticker.return_value = new_quote
+        new_quote = {"last": 20.0}
+        mock_coordinator.coordinate_ticker.return_value = {"SH600519": new_quote}
 
         result = ds.get_ticker("600519")
         assert result["last"] == 20.0

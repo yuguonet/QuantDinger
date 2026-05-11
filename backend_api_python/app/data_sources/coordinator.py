@@ -477,13 +477,13 @@ class Coordinator:
 
     提供三种调度模式:
       - coordinate_kline:        K线批量获取（动态队列 + 多源 fallback）
-      - coordinate_ticker:       实时行情 Race（多源并发抢答）
+      - coordinate_ticker:       实时行情（单股Race抢答 / 多股记忆源+轮询）
       - coordinate_market_kline: 全市场批量K线（Coordinator分组 + 多Provider并发取组）
       - coordinate_batch_quotes: 批量行情（单源批量请求 + 多源 fallback）
 
     两种模式的区别:
       coordinate_kline:  N只股票 × M个源 → 动态分配 → 每只股票只要有一个源成功就行
-      coordinate_ticker: 1只股票 × M个源 → 并发抢答 → 第一个返回有效数据的直接用
+      coordinate_ticker: 单股 → Race抢答 / 多股 → 记忆源优先+轮询 → 自动路由
       coordinate_market_kline: 全市场 × Coordinator分组 → 多Provider并发取组 → Provider调自己的fetch_market_kline → 合并结果
       coordinate_batch_quotes: N只股票 × 单源批量 → 逐源 fallback → 第一个成功的直接用
     """
@@ -805,30 +805,42 @@ class Coordinator:
         return results, failed
 
     # ================================================================
-    # 模式 B: 实时行情 Race — 多源并发抢答
+    # 模式 B: 实时行情 — 单股Race抢答 / 多股记忆源+轮询
     # ================================================================
     #
     # 和 coordinate_kline 的区别:
     #   coordinate_kline:  N只股票，动态队列，每只股票可能被多个源依次尝试
-    #   coordinate_ticker: 1只股票，所有源同时开跑，第一个成功的直接返回
+    #   coordinate_ticker: 单股→Race并发抢答 / 多股→记忆源优先+轮询
     #
-    # 为什么用 Race？
+    # 单股为什么用 Race？
     #   实时行情对延迟敏感。与其等一个源超时再试下一个，不如同时发请求，
     #   谁先返回有效数据就用谁。网络好的源 100ms 就返回了，不用等慢的源 5 秒超时。
     #
+    # 多股为什么用记忆源？
+    #   批量行情走 fetch_batch_quotes（单次HTTP拿多只），不适合 Race。
+    #   记住上次成功的源，下次直接命中，省去轮询开销。
+    #
+
+    # 记忆源状态（ticker 批量专用，跨调用持久，无 TTL）
+    _ticker_sticky_source: str = ""
+    _ticker_sticky_lock = threading.Lock()
 
     def coordinate_ticker(
         self,
-        symbol: str,
+        symbols,
         sources: Optional[List[Tuple[str, Callable]]] = None,
         cb: CircuitBreaker = None,
         timeout: float = 8.0,
         preferred_source: str = "",
         market: str = "",
         max_race_sources: int = 3,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """
-        实时行情 Race 模式 — 所有源并发，第一个返回有效价格的直接用。
+        实时行情 — 统一入口，自动路由单股/批量。
+
+        路由规则:
+          单股 → Race 多源并发抢答，第一个返回有效价格的直接用
+          多股 → 记忆源优先，成功直接返回；失败则按 priority 轮询其他 Provider
 
         典型调用方:
           - CNStockDataSource.get_ticker()
@@ -836,21 +848,72 @@ class Coordinator:
           - 自选股价格刷新
 
         Args:
-            symbol: 股票代码（单只）
+            symbols: 股票代码，str 或 List[str]。str 可含逗号（自动拆分）。
             sources: [(name, fetch_fn), ...]。为 None 时自动发现。
                      fetch_fn 签名: fetch_fn(symbol) -> Dict | None
             cb:      熔断器
             timeout: 超时（秒）
-            preferred_source: 指定首选源。如果可用，优先 race 该源。
+            preferred_source: 指定首选源。如果可用，优先使用。
             market:  市场名称（"CNStock"），用于自动发现源
 
         Returns:
-            第一个成功获取到的有效 Dict（含 last/change/changePercent 等字段），
-            全部失败返回 None。
+            {symbol: quote_dict} — 仅包含成功获取到的 symbol。
+            全部失败返回空 dict。
         """
+        # ── 入口标准化 ──
+        if isinstance(symbols, str):
+            sym_list = [s.strip() for s in symbols.split(',') if s.strip()]
+        else:
+            sym_list = [s.strip() for s in symbols if s and s.strip()]
+
+        if not sym_list:
+            return {}
+
+        if len(sym_list) == 1:
+            # 单股 → Race 抢答
+            result = self._ticker_race(
+                symbol=sym_list[0],
+                sources=sources,
+                cb=cb,
+                timeout=timeout,
+                preferred_source=preferred_source,
+                market=market,
+                max_race_sources=max_race_sources,
+            )
+            return {sym_list[0]: result} if result else {}
+        else:
+            # 多股 → 记忆源 + 轮询批量调度（独立逻辑，不调用 coordinate_batch_quotes_sticky）
+            return self._ticker_batch(
+                symbols=sym_list,
+                market=market,
+                timeout=timeout,
+                cb=cb,
+            )
+
+    def _ticker_race(
+        self,
+        symbol: str,
+        sources: Optional[List[Tuple[str, Callable]]],
+        cb: CircuitBreaker,
+        timeout: float,
+        preferred_source: str,
+        market: str,
+        max_race_sources: int,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        单股 Race 抢答 — 所有源并发，第一个返回有效价格的直接用。
+
+        Args:
+            symbol: 股票代码（单只）
+
+        Returns:
+            第一个成功获取到的有效 Dict，全部失败返回 None。
+        """
+        if cb is None:
+            cb = _realtime_cb
+
         # ── 获取可用源 ──
         if sources is not None:
-            # 手动指定模式
             if not sources:
                 return None
             if preferred_source:
@@ -860,7 +923,6 @@ class Coordinator:
             else:
                 available = [(name, fn) for name, fn in sources if cb.is_available(name)]
         else:
-            # 自动发现模式 — race 模式跳过熔断过滤，所有源都尝试（快的先返回）
             discovered = _discover_sources(
                 market=market,
                 timeframe="",
@@ -878,46 +940,32 @@ class Coordinator:
             logger.warning("[协助层] ticker %s 无可用源", symbol)
             return None
 
-        # 限制抢答源数量 — 按 priority 排序（discovered 已排好序），取前 max_race_sources 个
         if max_race_sources > 0 and len(available) > max_race_sources:
             available = available[:max_race_sources]
 
-        # ── Race: 前 N 个源并发抢答，第一个成功的直接返回 ──
+        # ── Race: 并发抢答 ──
         result_holder: List[Tuple[str, Dict[str, Any]]] = []
-        done_event = threading.Event()  # 用于通知"已经有结果了，其他线程可以停了"
+        done_event = threading.Event()
         lock = threading.Lock()
 
         def _race_one(source_name: str, fetch_fn: Callable):
-            """
-            单个源的 race 任务。
-
-            注意: 即使 done_event 已经被设置（别的源已经成功了），
-            这个函数还是会执行完当前的 fetch 调用（无法中断正在进行的网络请求）。
-            但下次循环会提前返回。
-            """
             if done_event.is_set():
-                return  # 别的源已经成功了，不用再试
-
-            # 熔断检查：已熔断的源直接跳过
+                return
             if not cb.is_available(source_name):
                 return
-
             try:
                 start = time.time()
                 result = fetch_fn(symbol)
                 elapsed = time.time() - start
 
                 if result and ("last" in result or "price" in result):
-                    # 获取到有效数据
                     cb.record_success(source_name)
                     cfg = get_source_config(source_name)
                     cfg.record(True, elapsed)
-
                     with lock:
                         if not result_holder:
-                            # 第一个成功的结果
                             result_holder.append((source_name, result))
-                            done_event.set()  # 通知其他线程: 已有结果
+                            done_event.set()
                 else:
                     cb.record_failure(source_name, "empty")
                     cfg = get_source_config(source_name)
@@ -931,11 +979,7 @@ class Coordinator:
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=len(available), thread_name_prefix="ticker-race"
         ) as pool:
-            futures = [
-                pool.submit(_race_one, name, fn)
-                for name, fn in available
-            ]
-            # 等待第一个成功的结果，或超时
+            futures = [pool.submit(_race_one, name, fn) for name, fn in available]
             done_event.wait(timeout=timeout)
 
         if result_holder:
@@ -945,6 +989,117 @@ class Coordinator:
 
         logger.warning("[协助层] ticker %s 所有源失败", symbol)
         return None
+
+    def _ticker_batch(
+        self,
+        symbols: List[str],
+        market: str,
+        timeout: float,
+        cb: CircuitBreaker,
+    ) -> Dict[str, Any]:
+        """
+        批量行情 — 记忆源优先，独立调度（不调用 coordinate_batch_quotes_sticky）。
+
+        调度逻辑:
+          1. 有记忆源 → 直调 fetch_batch_quotes → 成功直接返回
+          2. 记忆源失败或无记忆 → 按 priority 轮询所有可用 Provider
+          3. 某 Provider 成功 → 记住它，下次直接命中
+          4. 全部失败 → 清除记忆，下次重新轮询
+
+        Args:
+            symbols: 股票代码列表（纯数字或带前缀均可）
+            market:  市场名称（"CNStock" / ...）
+            timeout: 单次 fetch 超时（秒）
+            cb:      熔断器
+
+        Returns:
+            {symbol: quote_dict} — 仅包含成功获取到的 symbol。
+        """
+        from app.data_sources.provider import get_providers
+        from app.data_sources.normalizer import add_market_prefix, strip_market_prefix
+
+        if cb is None:
+            cb = _realtime_cb
+
+        # 输入标准化: 加市场前缀
+        seen: set = set()
+        prefixed: List[str] = []
+        for s in symbols:
+            ns = add_market_prefix(s, market)
+            if ns and ns not in seen:
+                seen.add(ns)
+                prefixed.append(ns)
+        if not prefixed:
+            return {}
+
+        # 获取支持 batch_quote 的 Provider（已按 priority 排序）
+        providers = get_providers(capability="batch_quote", market=market)
+        if not providers:
+            logger.warning("[协助层] ticker_batch market=%s 无可用 Provider", market)
+            return {}
+
+        # 确定尝试顺序: 记忆源排第一
+        with Coordinator._ticker_sticky_lock:
+            sticky = Coordinator._ticker_sticky_source
+
+        ordered = []
+        if sticky:
+            sticky_p = [p for p in providers if p.name == sticky]
+            others = [p for p in providers if p.name != sticky]
+            ordered = sticky_p + others
+        else:
+            ordered = list(providers)
+
+        # 过滤已熔断的源
+        available = [p for p in ordered if cb.is_available(p.name)]
+        if not available:
+            logger.warning("[协助层] ticker_batch market=%s 所有源已熔断", market)
+            return {}
+
+        # 逐源尝试
+        for provider in available:
+            try:
+                result = provider.fetch_batch_quotes(prefixed, timeout=int(timeout))
+            except Exception as e:
+                logger.debug("[协助层] ticker_batch %s 异常: %s", provider.name, e)
+                continue
+
+            if not result:
+                continue
+
+            # 成功 — 记住这个源
+            with Coordinator._ticker_sticky_lock:
+                Coordinator._ticker_sticky_source = provider.name
+
+            if sticky and provider.name != sticky:
+                logger.info("[协助层] ticker_batch 记忆源 %s 失效，切换到 %s (%d只)",
+                            sticky, provider.name, len(result))
+            elif not sticky:
+                logger.info("[协助层] ticker_batch 命中 %s (%d只)", provider.name, len(result))
+
+            # 标准化输出: key 去前缀 → 纯数字
+            normalized: Dict[str, Dict[str, Any]] = {}
+            for k, v in result.items():
+                if not isinstance(v, dict):
+                    continue
+                digits = strip_market_prefix(k)
+                v["symbol"] = digits
+                raw_name = v.get("name", "")
+                if raw_name and strip_market_prefix(raw_name) == digits:
+                    v["name"] = ""
+                normalized[digits] = v
+
+            return normalized
+
+        # 全部失败 — 清除记忆
+        with Coordinator._ticker_sticky_lock:
+            if Coordinator._ticker_sticky_source:
+                logger.warning("[协助层] ticker_batch 记忆源 %s 及所有备选均失败，清除记忆",
+                               Coordinator._ticker_sticky_source)
+                Coordinator._ticker_sticky_source = ""
+
+        logger.warning("[协助层] ticker_batch 所有 Provider 均失败 (%d只)", len(prefixed))
+        return {}
 
     # ================================================================
     # 模式 C: 批量行情 — 优先走 fetch_batch_quotes
