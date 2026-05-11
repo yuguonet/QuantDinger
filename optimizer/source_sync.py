@@ -6,7 +6,7 @@
 #
 # 核心流程:
 #   1. 从 basicinfo_db 获取全市场股票列表
-#   2. 每批 200 只交给 Coordinator.coordinate_market_kline()
+#   2. 每批 50 只交给 Coordinator.coordinate_market_kline()
 #   3. 逐只做完整性校验:
 #      - 交易日历对比（缺失日检测）
 #      - 停复牌检测（vol=0 且 OHLC 相同）
@@ -93,13 +93,13 @@ _BAR_TIMES_15M = [
 ]
 _BAR_SET_15M: Set[Tuple[int, int]] = set(_BAR_TIMES_15M)
 
-# 涨跌幅限制（小数形式，0.11 = 11%）
+# 涨跌幅限制（小数形式，0.10 = 10%）
 _PRICE_LIMITS = {
-    "main_sh":   0.11,   # 沪市主板 600/601/603/605
-    "main_sz":   0.11,   # 深市主板 000/001/002/003
-    "gem":       0.21,   # 创业板 300/301
-    "star":      0.21,   # 科创板 688/689 (注册制后20%)
-    "bj":        0.31,   # 北交所 43/82/83/87/88 (30%)
+    "main_sh":   0.10,   # 沪市主板 600/601/603/605
+    "main_sz":   0.10,   # 深市主板 000/001/002/003
+    "gem":       0.20,   # 创业板 300/301
+    "star":      0.20,   # 科创板 688/689 (注册制后20%)
+    "bj":        0.30,   # 北交所 43/82/83/87/88 (30%)
 }
 
 # 复牌首日/起始日前几日不检查涨跌幅的天数
@@ -355,12 +355,13 @@ def validate_stock(
     for d in sorted_dates:
         day_records = date_records[d]
         is_suspend = d in suspension_dates
-        # 复牌日: 当天非停牌 且 前一个交易日是停牌日
+        # 复牌日: 当天非停牌 且 前一个交易日是停牌日或数据缺失
         is_resume = False
         if not is_suspend:
             prev_td = _prev_trading_day(d)
-            if prev_td and prev_td in suspension_dates:
-                is_resume = True
+            if prev_td and prev_td >= start_date:
+                if prev_td in suspension_dates or prev_td not in date_records:
+                    is_resume = True
         is_no_limit = is_resume or (d in no_limit_before)
 
         # ── 15m: 检查每天 bar 数 ──
@@ -414,11 +415,12 @@ def validate_stock(
                 day_close = day_agg["close"]
                 if day_close > 0:
                     change_pct = abs(day_close - prev_close) / prev_close
-                    if change_pct > price_limit + 0.005:  # 0.5% 容差
+                    if change_pct > price_limit + 0.015:  # 1.5% 容差
+                        direction = "+" if day_close >= prev_close else "-"
                         result.add_error(
                             f"涨跌幅超限: {d} "
                             f"prev={prev_close:.2f} cur={day_close:.2f} "
-                            f"pct={change_pct*100:.2f}% limit={price_limit*100:.0f}%"
+                            f"pct={direction}{change_pct*100:.2f}% limit={price_limit*100:.0f}%"
                         )
 
         # 更新 prev_close（用日级 close）
@@ -611,7 +613,7 @@ _INTERRUPTED = False
 def _signal_handler(signum, frame):
     global _INTERRUPTED
     if _INTERRUPTED:
-        print("\n⚡ 强制退出")
+        print("\n⚡ 再次收到中断，强制退出")
         sys.exit(1)
     _INTERRUPTED = True
     print("\n⚠️  收到中断信号，正在保存进度...")
@@ -761,8 +763,8 @@ def main():
         choices=["1D", "15m"], default="1D",
         help="数据类型: 1D(日线) / 15m(15分钟线)")
     parser.add_argument("--market", default="CNStock", help="市场（默认 CNStock）")
-    parser.add_argument("--batch-size", type=int, default=200,
-        help="每批处理股票数（默认 200）")
+    parser.add_argument("--batch-size", type=int, default=50,
+        help="每批处理股票数（默认 50）")
     parser.add_argument("--count", type=int, default=0,
         help="每只股票拉取条数（0=自动计算）")
     parser.add_argument("--timeout", type=float, default=600,
@@ -881,7 +883,7 @@ def main():
 ╚═══════════════════════════════════════════════════════╝
 """)
 
-    # ── 分批处理 ──
+    # ── 分批处理（支持中断后交互式续传）──
     print(f"\n[2/4] 拉取 + 校验 + 写入...")
 
     all_results: List[Dict[str, Any]] = []
@@ -893,74 +895,12 @@ def main():
     t0 = time.time()
     batches = [all_codes[i:i + batch_size] for i in range(0, len(all_codes), batch_size)]
 
-    for batch_idx, batch_codes in enumerate(batches):
-        if _INTERRUPTED:
-            break
-
-        batch_start = time.time()
-        results, stats = process_batch(
-            symbols=batch_codes,
-            coordinator=coordinator,
-            cb=cb,
-            writer=writer,
-            pool=pool,
-            market=market,
-            timeframe=args.type,
-            start_date=start_date,
-            end_date=end_date,
-            count=count,
-            timeout=args.timeout,
-            preferred_source=args.preferred_source,
-            adj=args.adj,
-            dry_run=args.dry_run,
-            retry_path=retry_path,
-        )
-
-        all_results.extend(results)
-        for k in agg_stats:
-            agg_stats[k] += stats.get(k, 0)
-
-        # 更新已处理列表
-        for code in batch_codes:
-            processed_set.add(code)
-
-        batch_elapsed = time.time() - batch_start
-        total_elapsed = time.time() - t0
-        done = min((batch_idx + 1) * batch_size, total)
-
-        print(f"\r  [{done}/{total}] "
-              f"拉取={agg_stats['fetched']} 通过={agg_stats['passed']} "
-              f"失败={agg_stats['failed']} 无数据={agg_stats['no_data']} "
-              f"写入={agg_stats['written']:,} "
-              f"耗时={total_elapsed:.0f}s",
-              end='', flush=True)
-
-        # 定期保存检查点
-        if (batch_idx + 1) % 5 == 0:
-            _save_checkpoint(ckpt_path, list(processed_set), agg_stats)
-
-    print()
-
-    # 保存检查点
-    if not _INTERRUPTED:
-        _save_checkpoint(ckpt_path, list(processed_set), agg_stats)
-
-    elapsed_main = time.time() - t0
-
-    # ── 最终重试 ──
-    retry_data = _load_retry_codes(retry_path)
-    retry_codes = sorted(retry_data.keys())
-
-    if retry_codes and not _INTERRUPTED and not args.dry_run:
-        print(f"\n[3/4] 最终重试: {len(retry_codes)} 只...")
-
-        retry_batches = [retry_codes[i:i + batch_size]
-                         for i in range(0, len(retry_codes), batch_size)]
-
-        for batch_idx, batch_codes in enumerate(retry_batches):
+    while True:
+        for batch_idx, batch_codes in enumerate(batches):
             if _INTERRUPTED:
                 break
 
+            batch_start = time.time()
             results, stats = process_batch(
                 symbols=batch_codes,
                 coordinator=coordinator,
@@ -975,24 +915,82 @@ def main():
                 timeout=args.timeout,
                 preferred_source=args.preferred_source,
                 adj=args.adj,
-                dry_run=False,
+                dry_run=args.dry_run,
                 retry_path=retry_path,
             )
 
             all_results.extend(results)
-            done = min((batch_idx + 1) * batch_size, len(retry_codes))
-            print(f"\r  重试 [{done}/{len(retry_codes)}] "
-                  f"通过={stats['passed']} 仍失败={stats['failed']}",
+            for k in agg_stats:
+                agg_stats[k] += stats.get(k, 0)
+
+            # 更新已处理列表
+            for code in batch_codes:
+                processed_set.add(code)
+
+            batch_elapsed = time.time() - batch_start
+            total_elapsed = time.time() - t0
+            done = min((batch_idx + 1) * batch_size, total)
+
+            print(f"\r  [{done}/{total}] "
+                  f"拉取={agg_stats['fetched']} 通过={agg_stats['passed']} "
+                  f"失败={agg_stats['failed']} 无数据={agg_stats['no_data']} "
+                  f"写入={agg_stats['written']:,} "
+                  f"耗时={total_elapsed:.0f}s",
                   end='', flush=True)
+
+            # 定期保存检查点
+            if (batch_idx + 1) % 5 == 0:
+                _save_checkpoint(ckpt_path, list(processed_set), agg_stats)
 
         print()
 
-        # 检查重传文件中剩余的
-        remaining = _load_retry_codes(retry_path)
-        if remaining:
-            print(f"  ⚠️  仍有 {len(remaining)} 只无法修复")
-        else:
-            print(f"  ✅ 所有重试股票已修复")
+        # 始终保存检查点（无论是否中断）
+        _save_checkpoint(ckpt_path, list(processed_set), agg_stats)
+
+        # 正常完成或 dry-run → 退出循环
+        if not _INTERRUPTED:
+            break
+
+        # ── 中断交互模式 ──
+        remaining_codes = [c for c in all_codes if c not in processed_set]
+        print(f"\n  ⏸️  已中断")
+        print(f"  已处理: {len(processed_set)}/{total}")
+        print(f"  剩余:   {len(remaining_codes)} 只")
+        print(f"  进度已保存至检查点文件")
+
+        while True:
+            try:
+                choice = input("\n  输入 'r' 续传 / 'q' 退出: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                choice = 'q'
+            if choice == 'r':
+                _INTERRUPTED = False
+                if not remaining_codes:
+                    print("  ✅ 所有股票已处理完毕")
+                    break
+                total = len(remaining_codes)
+                batches = [remaining_codes[i:i + batch_size]
+                           for i in range(0, len(remaining_codes), batch_size)]
+                print(f"  ▶️  续传: 剩余 {total} 只，{len(batches)} 批\n")
+                print(f"[2/4] 拉取 + 校验 + 写入（续传）...")
+                break  # 跳出内层 while，回到外层 for
+            elif choice == 'q':
+                break  # 跳出内层 while
+            else:
+                print("  无效输入，请输入 'r' 或 'q'")
+
+        if choice == 'q':
+            break
+        # choice == 'r' → 继续外层 while True 循环
+
+    elapsed_main = time.time() - t0
+
+    # ── 最终重试（已禁用，由用户通过 --retry-only 手动重试）──
+    retry_data = _load_retry_codes(retry_path)
+    retry_codes = sorted(retry_data.keys())
+
+    if retry_codes and not args.dry_run:
+        print(f"\n[3/4] 跳过自动重试: {len(retry_codes)} 只待修复（使用 --retry-only 手动重试）")
     else:
         print(f"\n[3/4] 无需重试")
 
@@ -1039,7 +1037,7 @@ def main():
                             f"report_source_{args.type}_{start_date}_{end_date}.csv")
     export_csv(all_results, csv_path)
 
-    # 清理检查点
+    # 清理检查点（仅全部完成且无错误时）
     remaining_retry = _load_retry_codes(retry_path)
     if not remaining_retry and not _INTERRUPTED:
         _remove_checkpoint(ckpt_path)
@@ -1053,6 +1051,8 @@ def main():
     print(f"\n{'='*60}")
     if remaining_retry:
         print(f"  ⚠️  {len(remaining_retry)} 只仍有错误，详见: {retry_path}")
+    elif _INTERRUPTED:
+        print(f"  ⏸️  已退出，进度已保存。下次用 --resume 继续")
     else:
         print(f"  ✅ 全部完成!")
     print(f"{'='*60}")
@@ -1065,5 +1065,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        print("\n\n⚠️  用户中断，退出。")
+        print("\n\n⚠️  用户中断，退出。进度已保存，下次用 --resume 继续。")
         sys.exit(1)

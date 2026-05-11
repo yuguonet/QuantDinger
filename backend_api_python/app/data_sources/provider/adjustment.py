@@ -381,19 +381,33 @@ def apply_fwd_adjust(klines: list, code: str) -> list:
     factor_idx = 0
     current_factor = 1.0
 
+    # 前复权: 历史价格 × (末尾累积因子 / 当前累积因子)
+    # 这样最末尾的价格不变，历史价格被调整到与末尾连续
+    last_factor = factors[-1][1] if factors else 1.0
+
     for bar in klines:
         bar_date = _extract_date_str(bar.get("time", ""))
+
+        # 推进因子: factor_date <= bar_date 时累积（除权日当天就切换）
         while factor_idx < len(factors) and factors[factor_idx][0] <= bar_date:
             current_factor = factors[factor_idx][1]
             factor_idx += 1
 
-        if current_factor < 1.0:
+        # 调整因子 = 末尾因子 / 当前因子
+        # 除权日之前: current_factor=1.0, adj=last_factor (<1, 调整)
+        # 除权日当天: current_factor=last_factor, adj=1.0 (不调整)
+        if current_factor > 0:
+            adj_factor = last_factor / current_factor
+        else:
+            adj_factor = 1.0
+
+        if adj_factor < 1.0:
             adjusted.append({
                 "time": bar["time"],
-                "open": round(bar["open"] * current_factor, 4),
-                "high": round(bar["high"] * current_factor, 4),
-                "low": round(bar["low"] * current_factor, 4),
-                "close": round(bar["close"] * current_factor, 4),
+                "open": round(bar["open"] * adj_factor, 4),
+                "high": round(bar["high"] * adj_factor, 4),
+                "low": round(bar["low"] * adj_factor, 4),
+                "close": round(bar["close"] * adj_factor, 4),
                 "volume": bar["volume"],
             })
         else:
