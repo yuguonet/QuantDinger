@@ -389,7 +389,7 @@ class _WorkQueue:
 
         行为:
           - 队列有任务 → 立刻返回
-          - 队列空但有 pending 任务 → 阻塞等待（最多 QUEUE_DRAIN_TIMEOUT 秒）
+          - 队列空但有 pending 任务 → 阻塞等待（有 pending 时最多等 60s，无 pending 时等 QUEUE_DRAIN_TIMEOUT）
           - 队列空且无 pending 任务 → 返回 None（worker 应退出）
 
         Returns:
@@ -399,7 +399,10 @@ class _WorkQueue:
             while not self._items:
                 if self._done:
                     return None
-                notified = self._cond.wait(timeout=QUEUE_DRAIN_TIMEOUT)
+                # 有 pending 任务时多等 — 其他 worker 可能失败后 put_back
+                # 无 pending 时快速退出 — 确实没活干了
+                wait_time = 60.0 if self._pending > 0 else QUEUE_DRAIN_TIMEOUT
+                notified = self._cond.wait(timeout=wait_time)
                 if not notified and not self._items:
                     return None
             self._pending += 1

@@ -380,6 +380,28 @@ class DBKlineBridge:
                 after_time=after_time, truncate=(after_time is None),
             )
             if out:
+                # ── 盘中: 检查 DB 数据是否覆盖今天 ──
+                if in_trading and not before_time:
+                    today_ts = _today_ts()
+                    latest_bar_ts = out[-1].get("time", 0) if out else 0
+                    # 最后一根 bar 不是今天 → DB 缺今天数据，远程补拉
+                    if latest_bar_ts < today_ts:
+                        remote_bars = self._ds._get_kline_remote(
+                            raw, tf, lim, adj=adj
+                        )
+                        if remote_bars:
+                            # 合并: DB 历史 + 远程今日，去重按时间排序
+                            seen = {b["time"] for b in out}
+                            for rb in remote_bars:
+                                if rb["time"] not in seen:
+                                    out.append(rb)
+                            out.sort(key=lambda b: b["time"])
+                            out = out[-lim:]
+                            logger.info(
+                                f"[DB桥接] {raw} tf={tf} DB+远程合并 "
+                                f"DB={len(cleaned)} remote补={len(remote_bars)} "
+                                f"合并后={len(out)}"
+                            )
                 logger.info(f"[DB桥接] {raw} tf={tf} DB命中 bars={len(out)}")
                 return out
 
@@ -415,6 +437,7 @@ class DBKlineBridge:
 
         result: Dict[str, List[Dict[str, Any]]] = {}
         need_remote: List[str] = []
+        today_ts = _today_ts() if in_trading else 0
 
         for sym in symbols:
             raw = _strip_cn_prefix(sym)
@@ -432,6 +455,14 @@ class DBKlineBridge:
                     after_time=after_time, truncate=(after_time is None),
                 )
                 if out:
+                    # 盘中: 检查 DB 数据是否覆盖今天
+                    if in_trading and not before_time:
+                        latest_bar_ts = out[-1].get("time", 0) if out else 0
+                        if latest_bar_ts < today_ts:
+                            # DB 缺今天数据，标记需要远程补拉
+                            need_remote.append(raw)
+                            result[raw] = out  # 先存 DB 历史，远程合并后覆盖
+                            continue
                     result[raw] = out
                     continue
 
@@ -444,7 +475,17 @@ class DBKlineBridge:
                     bars, limit=lim, before_time=before_time,
                     after_time=after_time, truncate=(after_time is None),
                 )
-                result[raw] = out
+                if out and raw in result and in_trading and not before_time:
+                    # 合并: DB 历史 + 远程今日，去重按时间排序
+                    existing = result[raw]
+                    seen = {b["time"] for b in existing}
+                    for rb in out:
+                        if rb["time"] not in seen:
+                            existing.append(rb)
+                    existing.sort(key=lambda b: b["time"])
+                    result[raw] = existing[-lim:]
+                else:
+                    result[raw] = out
             logger.info(
                 f"[DB桥接批量] tf={tf} 总={len(symbols)} "
                 f"DB命中={len(result) - len(need_remote)} 远程={len(need_remote)}"
