@@ -186,12 +186,6 @@ class DBKlineBridge:
     核心职责:
     1. 从 DB 读 15m，聚合成目标周期返回
     2. ticker 补充最后一根 bar（_apply_ticker_to_last_bar）
-    3. DB 缺 bar 时触发 backfill_db.run_once() 全盘补齐
-
-    回填策略:
-      不管下游怎么完成，只要缺 15m bar 就触发 backfill_db 找回来。
-      backfill_db 负责全盘拉取 + 先删后写，桥接层只管触发。
-    """
 
     def __init__(self, ds: 'CNStockDataSource'):
         self._ds = ds
@@ -244,7 +238,6 @@ class DBKlineBridge:
           30m~4h  → 从 15m 聚合
           1W / 1M → 15m → 日 → 周/月，两级聚合
 
-        缺 bar 就触发 backfill_db.run_once()，不管下游怎么补齐。
         """
         adj = "qfq"
         raw = _strip_cn_prefix(symbol)
@@ -262,9 +255,6 @@ class DBKlineBridge:
             return self._ds._get_kline_remote(
                 raw, tf, limit, before_time, after_time, adj
             )
-
-        # ── 缺 bar 就触发全盘回填 ──
-        self._trigger_backfill_if_needed(raw, tf)
 
         # ── 从 DB 取数据 ──
         db_bars = self._fetch_from_db(raw, tf, lim)
@@ -309,9 +299,6 @@ class DBKlineBridge:
                 logger.info(f"[DB桥接] {raw} tf={tf} DB命中 bars={len(out)}")
                 return out
 
-        # ── DB 无数据（历史首次查询）→ 远程全量拉取 ──
-        return self._remote_with_backfill(raw, tf, lim, before_time, after_time, adj)
-
     def get_kline_batch(
         self,
         symbols: List[str],
@@ -320,7 +307,7 @@ class DBKlineBridge:
         before_time: Optional[int] = None,
         after_time: Optional[int] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
-        """批量取 K 线。缺 bar 就触发 backfill_db 补齐。"""
+        """批量取 K 线。"""
         if not symbols:
             return {}
 
@@ -339,10 +326,6 @@ class DBKlineBridge:
 
         if not self.available:
             return self._ds._get_klines_remote(symbols, tf, lim, adj)
-
-        # ── 缺 bar 就触发全盘回填 ──
-        for sym in symbols:
-            self._trigger_backfill_if_needed(_strip_cn_prefix(sym), tf)
 
         result: Dict[str, List[Dict[str, Any]]] = {}
         need_remote: List[str] = []
@@ -407,18 +390,6 @@ class DBKlineBridge:
 
         return result
 
-    # ────────────────────────────────────────────────────────────
-    # 缺 bar 检测 + backfill 触发
-    # ────────────────────────────────────────────────────────────
-
-    def _trigger_backfill_if_needed(self, raw: str, tf: str):
-        """触发后台同步。调度逻辑在 backfill_db.py 中。
-
-        每次调用都触发 trigger_sync()，由 backfill_db 的 _sync_running 锁
-        保证同一时间只有一个线程在运行，不阻塞调用方。
-        """
-        self._backfill_db()
-
     def _apply_ticker_to_last_bar(self, raw: str, bars: List[Dict[str, Any]]):
         """盘中: 用 ticker 缓存补充最后一根 15m bar 的实时数据。
 
@@ -429,7 +400,6 @@ class DBKlineBridge:
         技巧: 判断最后一根 bar 是否属于"当前 15 分钟窗口"。
         - 属于当前窗口 → 用 ticker 更新 high/low/close/volume
         - 不属于（ticker 已进入新窗口但还没新 bar）→ 追加一根临时 bar
-          下次 backfill 会覆盖它。
         """
         if not bars:
             return
@@ -633,42 +603,6 @@ class DBKlineBridge:
                 "volume": round(sum(float(b.get("volume", 0)) for b in chunk), 2),
             })
         return result[-limit:] if len(result) > limit else result
-
-    # ────────────────────────────────────────────────────────────
-    # 远程拉取 + DB 回填
-    # ────────────────────────────────────────────────────────────
-
-    def _remote_with_backfill(
-        self, raw: str, tf: str, limit: int,
-        before_time: Optional[int], after_time: Optional[int], adj: str
-    ) -> List[Dict[str, Any]]:
-        """DB 无数据时的 fallback: 远程全量拉取，同时触发全盘回填补齐其他标的。"""
-        remote_bars = self._ds._get_kline_remote(raw, tf, limit, adj=adj)
-        if not remote_bars:
-            return []
-
-        # 触发全盘回填，让其他缺数据的标的也能补齐
-        self._backfill_db()
-
-        out = self._ds.filter_and_limit(
-            remote_bars, limit=limit, before_time=before_time,
-            after_time=after_time, truncate=(after_time is None),
-        )
-        logger.info(f"[DB桥接] {raw} tf={tf} 远程补充 bars={len(out)}")
-        return out
-
-    def _backfill_db(self):
-        """触发后台同步。由 backfill_db._sync_running 锁保证唯一。"""
-        try:
-            from app.data_sources.backfill_db import trigger_sync
-            trigger_sync()
-        except Exception as e:
-            logger.debug(f"[DB桥接] 触发同步异常: {e}")
-
-    def backfill_all_market(self):
-        """全市场回填 — 委托给 backfill_db.run_once()。"""
-        from app.data_sources.backfill_db import run_once
-        return run_once()
 
 
 # ================================================================
