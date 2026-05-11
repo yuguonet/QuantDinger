@@ -691,25 +691,46 @@ class CNStockDataSource(BaseDataSource):
 
     # ── get_ticker: 只负责取行情 ──
 
-    def get_ticker(self, symbol: str) -> Dict[str, Any]:
-        """获取实时行情。单股/批量均由 Coordinator 统一调度。"""
-        code = normalize_cn_code(symbol)
-        raw = _strip_cn_prefix(code)
+    def get_ticker(self, symbol) -> Dict[str, Any]:
+        """获取实时行情。支持单股 / 逗号拼接 / List[str]，均由 Coordinator 统一调度。"""
+        # ── 入口标准化：统一转为 List[str] ──
+        if isinstance(symbol, list):
+            raw_symbols = [s.strip() for s in symbol if s and s.strip()]
+        elif isinstance(symbol, str) and ',' in symbol:
+            raw_symbols = [s.strip() for s in symbol.split(',') if s.strip()]
+        else:
+            raw_symbols = [symbol] if symbol else []
+
+        if not raw_symbols:
+            return {"last": 0, "symbol": ""}
+
+        # 逐个 normalize（避免整串当一个 symbol 处理）
+        normalized = [normalize_cn_code(s) for s in raw_symbols]
+        raw_codes = [_strip_cn_prefix(c) for c in normalized]
 
         result = get_coordinator().coordinate_ticker(
-            symbols=code,
+            symbols=normalized,
             cb=self.circuit_breaker,
             market="CNStock",
             timeout=8,
         )
 
-        if result and raw in result:
-            quote = result[raw]
-            quote["symbol"] = raw
-            return quote
+        if not result:
+            logger.warning(f"[行情] 所有数据源均失败: {symbol}")
+            return {"last": 0, "symbol": raw_codes[0] if raw_codes else ""}
 
-        logger.warning(f"[行情] 所有数据源均失败: {symbol}")
-        return {"last": 0, "symbol": raw}
+        # 单股模式：返回第一个匹配
+        if len(raw_codes) == 1:
+            raw = raw_codes[0]
+            if raw in result:
+                quote = result[raw]
+                quote["symbol"] = raw
+                return quote
+            logger.warning(f"[行情] 所有数据源均失败: {symbol}")
+            return {"last": 0, "symbol": raw}
+
+        # 批量模式：返回整个 map（key = 纯数字代码）
+        return result
 
     # ── get_kline: 负责发 K 线数据 ──
 
