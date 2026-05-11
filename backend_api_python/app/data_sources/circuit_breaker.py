@@ -149,13 +149,14 @@ class CircuitBreaker:
         with self._lock:
             self._failures[source] = self._failures.get(source, 0) + 1
             if self._failures[source] >= self._failure_threshold:
-                # 达到阈值，触发熔断
-                self._tripped_at[source] = time.time()
-                logger.warning(
-                    "[熔断器:%s] %s 连续失败 %d 次，熔断 %ds (原因: %s)",
-                    self._name, source, self._failures[source],
-                    self._cooldown_seconds, reason,
-                )
+                # 仅首次触发时记录熔断时间，避免持续重置冷却期
+                if source not in self._tripped_at:
+                    self._tripped_at[source] = time.time()
+                    logger.warning(
+                        "[熔断器:%s] %s 连续失败 %d 次，熔断 %ds (原因: %s)",
+                        self._name, source, self._failures[source],
+                        self._cooldown_seconds, reason,
+                    )
 
     def reset(self, source: str = None):
         """

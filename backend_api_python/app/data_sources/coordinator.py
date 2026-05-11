@@ -895,6 +895,10 @@ class Coordinator:
             if done_event.is_set():
                 return  # 别的源已经成功了，不用再试
 
+            # 熔断检查：已熔断的源直接跳过
+            if not cb.is_available(source_name):
+                return
+
             try:
                 start = time.time()
                 result = fetch_fn(symbol)
@@ -1073,6 +1077,9 @@ class Coordinator:
         def _race_one(provider):
             nonlocal winner
             if done_event.is_set():
+                return
+            # 熔断检查：已熔断的源直接跳过
+            if not cb.is_available(provider.name):
                 return
             cfg = get_source_config(provider.name)
             start = time.time()

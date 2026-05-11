@@ -129,7 +129,7 @@ class CacheManager:
     def set(self, key: str, value: Any, ttl: int = 300):
         """设置缓存"""
         try:
-            self._client.setex(key, ttl, json.dumps(value))
+            self._client.setex(key, ttl, json.dumps(value, default=str))
         except Exception as e:
             logger.error(f"Cache write failed: {e}")
     
