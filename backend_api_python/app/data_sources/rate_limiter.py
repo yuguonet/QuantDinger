@@ -219,9 +219,16 @@ def retry_with_backoff(
                         f"等待 {delay:.1f}s 后重试..."
                     )
                     
+                    # 连接类异常 → 清理共享 Session 连接池，避免下次重试复用坏连接
+                    if isinstance(e, (ConnectionError, ConnectionResetError)):
+                        try:
+                            get_shared_session().close()
+                        except Exception:
+                            pass
+
                     if on_retry:
                         on_retry(attempt, e)
-                    
+
                     time.sleep(delay)
             
             # 不应该到达这里

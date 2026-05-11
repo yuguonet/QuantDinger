@@ -359,7 +359,8 @@ def validate_stock(
         is_resume = False
         if not is_suspend:
             prev_td = _prev_trading_day(d)
-            if prev_td and prev_td >= start_date:
+            if prev_td:
+                # 前一个交易日停牌 或 数据缺失 → 视为复牌首日，无涨跌幅限制
                 if prev_td in suspension_dates or prev_td not in date_records:
                     is_resume = True
         is_no_limit = is_resume or (d in no_limit_before)
@@ -410,8 +411,11 @@ def validate_stock(
 
             # ── 涨跌幅检查（基于日级 close） ──
             # 只用每天最后一根 bar 的 close 来检查涨跌幅
+            # 前一个交易日为空（数据缺失）→ 跳过涨跌幅检查，避免停复牌日历不准导致误报
+            prev_td = _prev_trading_day(d)
+            prev_td_has_data = prev_td is not None and prev_td in date_records
             day_agg = daily_agg.get(d)
-            if day_agg and not is_no_limit and prev_close is not None and prev_close > 0:
+            if day_agg and not is_no_limit and prev_td_has_data and prev_close is not None and prev_close > 0:
                 day_close = day_agg["close"]
                 if day_close > 0:
                     change_pct = abs(day_close - prev_close) / prev_close
