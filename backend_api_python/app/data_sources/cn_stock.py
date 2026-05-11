@@ -425,6 +425,11 @@ class DBKlineBridge:
         adj = "qfq"
         in_trading = _is_market_hours()
 
+        logger.info(
+            f"[DB桥接批量] 开始 tf={tf} limit={lim} "
+            f"标的数={len(symbols)} 盘中={in_trading}"
+        )
+
         if tf in ("1m", "5m"):
             return self._ds._get_klines_remote(symbols, tf, lim, adj)
 
@@ -467,6 +472,11 @@ class DBKlineBridge:
                     continue
 
             need_remote.append(raw)
+
+        logger.info(
+            f"[DB桥接批量] DB查询完成 tf={tf} "
+            f"总={len(symbols)} DB命中={len(result)} 待远程={len(need_remote)}"
+        )
 
         if need_remote:
             remote_results = self._ds._get_klines_remote(need_remote, tf, lim, adj)
@@ -932,6 +942,11 @@ class CNStockDataSource(BaseDataSource):
         if not symbols:
             return {}
 
+        logger.info(
+            f"[远程批量] 开始拉取 tf={timeframe} limit={limit} adj={adj} "
+            f"标的数={len(symbols)} 示例={symbols[:3]}"
+        )
+
         coord_results, failed = get_coordinator().coordinate_kline(
             symbols=[normalize_cn_code(s) for s in symbols],
             timeframe=timeframe,
@@ -943,11 +958,20 @@ class CNStockDataSource(BaseDataSource):
         )
 
         result: Dict[str, List[Dict[str, Any]]] = {}
+        total_bars = 0
         for sym, bars in coord_results.items():
-            result[_strip_cn_prefix(sym)] = clean_klines(bars, timeframe)
+            cleaned = clean_klines(bars, timeframe)
+            result[_strip_cn_prefix(sym)] = cleaned
+            total_bars += len(cleaned)
 
         if failed:
-            logger.warning(f"[远程批量] {len(failed)} 只失败: {failed[:5]}...")
+            logger.warning(f"[远程批量] {len(failed)}/{len(symbols)} 只失败: {failed[:10]}")
+
+        logger.info(
+            f"[远程批量] 完成 tf={timeframe} "
+            f"成功={len(coord_results)}/{len(symbols)} "
+            f"失败={len(failed)} 总bar数={total_bars}"
+        )
 
         return result
 

@@ -1071,17 +1071,17 @@ class Coordinator:
     ) -> Dict[str, Dict[str, Any]]:
         """
         RACE 模式 — 所有源并发请求同一组 symbols，第一个返回非空结果的直接用。
-        适合中小批量（≤500 只），追求最低延迟。
+        如果赢家未覆盖全部 symbols，剩余的从其他源补充。
         """
         done_event = threading.Event()
         lock = threading.Lock()
         winner: Dict[str, Dict[str, Any]] = {}
+        winner_name = ""
 
         def _race_one(provider):
-            nonlocal winner
+            nonlocal winner, winner_name
             if done_event.is_set():
                 return
-            # 熔断检查：已熔断的源直接跳过
             if not cb.is_available(provider.name):
                 return
             cfg = get_source_config(provider.name)
@@ -1091,8 +1091,9 @@ class Coordinator:
                 elapsed = time.time() - start
                 if result and not done_event.is_set():
                     with lock:
-                        if not done_event.is_set():  # 双重检查，防止覆盖
+                        if not done_event.is_set():
                             winner = result
+                            winner_name = provider.name
                             cb.record_success(provider.name)
                             cfg.record(True, elapsed)
                             done_event.set()
@@ -1115,6 +1116,55 @@ class Coordinator:
 
         if not winner:
             logger.warning("[协助层] batch_quotes RACE %d只 所有源失败", len(symbols))
+            return winner
+
+        # ── 赢家未覆盖全部 symbols → 从剩余源补充 ──
+        from app.data_sources.normalizer import add_market_prefix, strip_market_prefix
+        requested_set = set(add_market_prefix(s, "CNStock") for s in symbols)
+        # winner 的 key 可能带前缀也可能不带，统一为纯数字
+        covered = set()
+        for k in winner:
+            covered.add(strip_market_prefix(k))
+        requested_digits = set(strip_market_prefix(s) for s in requested_set)
+        missing_digits = requested_digits - covered
+
+        if not missing_digits:
+            return winner
+
+        logger.info(
+            "[协助层] batch_quotes RACE %s 覆盖 %d/%d，缺 %d 只，尝试补充",
+            winner_name, len(covered), len(requested_digits), len(missing_digits),
+        )
+
+        # 从剩余可用源逐个补充缺失 symbols
+        remaining = [p for p in available if p.name != winner_name and cb.is_available(p.name)]
+        for provider in remaining:
+            if not missing_digits:
+                break
+            # 将 missing_digits 转回带前缀形式
+            missing_symbols = [add_market_prefix(d, "CNStock") for d in missing_digits]
+            try:
+                result = provider.fetch_batch_quotes(missing_symbols, timeout=timeout)
+                if result:
+                    for k, v in result.items():
+                        digits = strip_market_prefix(k)
+                        if digits in missing_digits:
+                            winner[k] = v
+                            missing_digits.discard(digits)
+                    cb.record_success(provider.name)
+                    logger.info(
+                        "[协助层] batch_quotes 补充 %s 命中 %d 只，剩余 %d 只",
+                        provider.name, len(result), len(missing_digits),
+                    )
+            except Exception as e:
+                logger.debug("[协助层] batch_quotes 补充 %s 失败: %s", provider.name, e)
+
+        if missing_digits:
+            logger.warning(
+                "[协助层] batch_quotes RACE 补充后仍缺 %d 只: %s",
+                len(missing_digits), list(missing_digits)[:5],
+            )
+
         return winner
 
     # ── 分组并发轮询模式（>500 只） ──

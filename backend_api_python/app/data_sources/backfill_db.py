@@ -610,7 +610,7 @@ class BackfillDB:
         """1D 增量快照: 使用 batch_quotes 直接下载今日快照。
 
         batch_quotes 返回的是实时行情数据（quote），需要转换为 K 线格式（bar）。
-        time 字段: 优先使用 quote 中的 time，为空时使用当前日期。
+        time 字段: 快照模式强制使用当日日期（不取 quote 中的 time）。
 
         返回: (写入条数, 失败symbols列表)
         """
@@ -630,9 +630,14 @@ class BackfillDB:
 
         logger.info(f"[同步] {self.source.name} batch_quotes 拉到 {len(quotes)} 只标的")
 
-        # 今日日期（北京时间）— datetime 对象，供 time 字段使用
+        # 最后交易日 17:00:00（北京时间）— datetime 对象，供 time 字段使用
         now_cn = datetime.now(TZ_CN)
-        today_dt = now_cn.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+        today_str = now_cn.strftime("%Y-%m-%d")
+        if is_trading_day(today_str):
+            last_td_str = today_str
+        else:
+            last_td_str = prev_trading_day(today_str)
+        today_dt = datetime.strptime(last_td_str, "%Y-%m-%d").replace(hour=17, minute=0, second=0)
 
         # 转换为 K 线记录
         all_records = []
@@ -672,29 +677,8 @@ class BackfillDB:
             if h > 0 and l > 0 and h < l:
                 h, l = l, h
 
-            # time 字段: 优先使用 quote 中的 time，为空时使用当前日期
-            bar_time = quote.get("time") or quote.get("timestamp")
-            if not bar_time:
-                bar_time = today_dt
-            elif isinstance(bar_time, str):
-                # 字符串 → 解析为 datetime 对象（bulk_write 要求 datetime）
-                if len(bar_time) == 10 and bar_time[4] == "-":
-                    # 纯日期 "2026-05-10"
-                    bar_time = datetime.strptime(bar_time, "%Y-%m-%d")
-                else:
-                    # 带时间 "2026-05-10 15:00:00" 等
-                    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S",
-                                "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"):
-                        try:
-                            bar_time = datetime.strptime(bar_time, fmt)
-                            break
-                        except ValueError:
-                            continue
-                    else:
-                        bar_time = today_dt
-            elif isinstance(bar_time, (int, float)):
-                # Unix timestamp → 转为 datetime
-                bar_time = datetime.fromtimestamp(bar_time, tz=TZ_CN).replace(tzinfo=None)
+            # time 字段: 快照模式强制使用当日日期
+            bar_time = today_dt
 
             # 纯数字代码（去前缀）
             clean_symbol = strip_market_prefix(symbol)
