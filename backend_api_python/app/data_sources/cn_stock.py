@@ -186,6 +186,7 @@ class DBKlineBridge:
     核心职责:
     1. 从 DB 读 15m，聚合成目标周期返回
     2. ticker 补充最后一根 bar（_apply_ticker_to_last_bar）
+    """
 
     def __init__(self, ds: 'CNStockDataSource'):
         self._ds = ds
@@ -403,6 +404,64 @@ class DBKlineBridge:
         """
         if not bars:
             return
+
+        # 获取实时 ticker
+        try:
+            from app.data_sources.normalizer import normalize_cn_code
+            code = normalize_cn_code(raw)
+            ticker = get_coordinator().coordinate_ticker(
+                symbols=[code],
+                cb=self._ds.circuit_breaker,
+                market="CNStock",
+                timeout=5,
+            )
+            if not ticker or code not in ticker:
+                return
+            t = ticker[code]
+        except Exception:
+            return
+
+        last_price = float(t.get("last", 0) or 0)
+        if last_price <= 0:
+            return
+
+        now = time.time()
+        # 15m 窗口对齐（秒）
+        bucket_sec = 900
+        current_bucket = int(now) - (int(now) % bucket_sec)
+        last_bar = bars[-1]
+        last_bar_ts = last_bar.get("time", 0)
+        last_bar_bucket = last_bar_ts - (last_bar_ts % bucket_sec)
+
+        ticker_high = float(t.get("high", 0) or 0)
+        ticker_low = float(t.get("low", 0) or 0)
+        ticker_vol = float(t.get("volume", 0) or t.get("baseVolume", 0) or 0)
+
+        if last_bar_bucket == current_bucket:
+            # 最后一根 bar 属于当前窗口 → 原地更新
+            if ticker_high > 0:
+                last_bar["high"] = max(last_bar.get("high", 0), ticker_high, last_price)
+            else:
+                last_bar["high"] = max(last_bar.get("high", 0), last_price)
+            if ticker_low > 0:
+                cur_low = last_bar.get("low", 0)
+                if cur_low <= 0:
+                    last_bar["low"] = ticker_low
+                else:
+                    last_bar["low"] = min(cur_low, ticker_low)
+            last_bar["close"] = last_price
+            if ticker_vol > 0:
+                last_bar["volume"] = round(ticker_vol, 2)
+        else:
+            # ticker 已进入新窗口但还没有新 bar → 追加临时 bar
+            bars.append({
+                "time": current_bucket,
+                "open": last_price,
+                "high": ticker_high if ticker_high > 0 else last_price,
+                "low": ticker_low if ticker_low > 0 else last_price,
+                "close": last_price,
+                "volume": round(ticker_vol, 2) if ticker_vol > 0 else 0,
+            })
 
     # ────────────────────────────────────────────────────────────
     # DB 读取 + 周期聚合

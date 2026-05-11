@@ -51,87 +51,6 @@ def _now_ts() -> int:
 def _normalize_symbol(symbol: str) -> str:
     return (symbol or '').strip().upper()
 
-
-def _resolve_cn_symbols(symbols: list) -> dict:
-    """
-    批量解析 A 股自选股代码 — 支持中文名、纯数字、带后缀等多种格式。
-
-    解析策略（按优先级）:
-      1. 纯 6 位数字 → 直接推断市场前缀（SH/SZ/BJ）
-      2. 带后缀（600519.SH） → 去后缀加前缀
-      3. 中文名 → 查 stock_basic_info 表按 name 精确匹配 → 取 symbol + market_cn
-      4. 已有前缀（SH600519） → 原样返回
-
-    Args:
-        symbols: 原始符号列表（混合格式）
-
-    Returns:
-        {原始符号: "SH600519" 格式的前缀代码} 映射。
-        无法解析的符号不会出现在 dict 中。
-    """
-    from app.data_sources.normalizer import normalize_cn_code
-    from app.utils.basicinfo_db import get_stock_basic_db
-
-    result = {}
-    unresolved_names = []  # 需要查 DB 的中文名
-
-    for sym in symbols:
-        s = (sym or "").strip()
-        if not s:
-            continue
-        upper = s.upper()
-
-        # 已有合法前缀 → 直接用
-        if upper[:2] in ("SH", "SZ", "BJ") and len(upper) == 8 and upper[2:].isdigit():
-            result[s] = upper
-            continue
-
-        # 带后缀（600519.SH / 600519.SZ） → normalize_cn_code 处理
-        if upper.endswith((".SH", ".SS", ".SZ", ".BJ")):
-            code = normalize_cn_code(s)
-            if code and code[:2] in ("SH", "SZ", "BJ"):
-                result[s] = code
-                continue
-
-        # 纯 6 位数字 → 推断市场
-        if s.isdigit() and len(s) == 6:
-            code = normalize_cn_code(s)
-            if code and code[:2] in ("SH", "SZ", "BJ"):
-                result[s] = code
-                continue
-
-        # 其他情况（中文名、英文名等）→ 需要查 DB
-        unresolved_names.append(s)
-
-    # 批量查 DB 解析中文名
-    if unresolved_names:
-        try:
-            db = get_stock_basic_db()
-            for name in unresolved_names:
-                # 先精确匹配 name
-                rows = db.search_stocks(keyword=name, limit=5)
-                exact = [r for r in rows if r.get("name") == name]
-                if exact:
-                    stock = exact[0]
-                    symbol_code = stock.get("symbol", "")
-                    market_cn = (stock.get("market_cn") or "").upper()
-                    if symbol_code and market_cn in ("SH", "SZ", "BJ"):
-                        result[name] = f"{market_cn}{symbol_code}"
-                        continue
-                # 精确匹配不到 → 模糊搜索取第一个
-                if rows:
-                    stock = rows[0]
-                    symbol_code = stock.get("symbol", "")
-                    market_cn = (stock.get("market_cn") or "").upper()
-                    if symbol_code and market_cn in ("SH", "SZ", "BJ"):
-                        result[name] = f"{market_cn}{symbol_code}"
-                        logger.info(f"[自选股解析] 模糊匹配: {name} → {market_cn}{symbol_code} ({stock.get('name')})")
-        except Exception as e:
-            logger.warning(f"[自选股解析] DB 查询失败: {e}")
-
-    return result
-
-
 def _ensure_watchlist_table():
     # Table is created by db schema init; this is only a sanity hook.
     return True
@@ -512,42 +431,18 @@ def get_watchlist_prices():
         
         results = []
 
-        # 对每个市场，A股走批量解析+批量取价，其他市场逐只
+        # 对每个市场，A股批量逗号拼接一次调 get_ticker，其他市场逐只
         for market, symbols in market_groups.items():
             try:
                 if market == 'CNStock':
-                    # ── Step 1: 解析所有符号 → SH600519 格式 ──
-                    sym_map = _resolve_cn_symbols(symbols)
-                    # sym_map: {原始符号: "SH600519"} 映射
-                    # 未解析到的符号 sym_map 中无 key
+                    # A股: 所有自选股逗号拼接一次调 get_ticker（内部走 Provider 批量接口）
+                    # CNStockDataSource 已统一返回纯数字 key 和 symbol
+                    ticker_map = DataSourceFactory.get_ticker(market, ",".join(symbols))
+                    if not isinstance(ticker_map, dict):
+                        ticker_map = {}
 
-                    # ── Step 2: 去重后批量取价 ──
-                    resolved_codes = list(dict.fromkeys(sym_map.values()))  # 保序去重
-                    ticker_map = {}
-                    if resolved_codes:
-                        from app.data_sources.coordinator import get_coordinator, get_realtime_circuit_breaker
-                        cb = get_realtime_circuit_breaker()
-                        # coordinate_ticker 支持 List[str]，走 _ticker_batch 批量调度
-                        ticker_map = get_coordinator().coordinate_ticker(
-                            symbols=resolved_codes,
-                            cb=cb,
-                            market="CNStock",
-                            timeout=8,
-                        )
-                        if not isinstance(ticker_map, dict):
-                            ticker_map = {}
-
-                    # ── Step 3: 回映射到原始符号 ──
-                    # coordinate_ticker 返回的 key 是纯数字（如 "600519"），
-                    # sym_map 的 value 是带前缀的（如 "SH600519"），需要去前缀再查
-                    from app.data_sources.normalizer import strip_market_prefix
                     for sym in symbols:
-                        resolved = sym_map.get(sym)
-                        if resolved:
-                            raw_key = strip_market_prefix(resolved)
-                            ticker = ticker_map.get(raw_key, {})
-                        else:
-                            ticker = {}
+                        ticker = ticker_map.get(sym, {})
                         results.append({
                             'market': market,
                             'symbol': sym,
