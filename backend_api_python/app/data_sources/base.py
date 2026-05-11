@@ -103,6 +103,13 @@ class BaseDataSource(ABC):
         seconds_per_candle = TIMEFRAME_SECONDS.get(timeframe, 86400)
         return int(seconds_per_candle * limit * buffer_ratio)
     
+    @staticmethod
+    def _to_timestamp(t) -> int:
+        """将 datetime 或 int 统一转为 Unix 时间戳（秒），用于时间比较。"""
+        if isinstance(t, datetime):
+            return int(t.timestamp())
+        return int(t)
+
     def filter_and_limit(
         self,
         klines: List[Dict[str, Any]],
@@ -117,20 +124,26 @@ class BaseDataSource(ABC):
         Args:
             klines: K线数据列表
             limit: 最大数量
-            before_time: 过滤此时间之后的数据
-            after_time: 若设置，仅保留 time >= after_time
+            before_time: 过滤此时间之后的数据（Unix时间戳，秒）
+            after_time: 若设置，仅保留 time >= after_time（Unix时间戳，秒）
             truncate: 为 False 时不在末尾按 limit 截断（回测需整段 [after_time, before_time) 时避免误丢左端）
             
         Returns:
             处理后的K线数据
         """
+        # 统一将 k['time'] 转为 int 时间戳（部分 provider 返回 datetime 对象）
+        for k in klines:
+            k['time'] = self._to_timestamp(k['time'])
+
         # 按时间排序
         klines.sort(key=lambda x: x['time'])
         
         # 过滤时间
         if before_time:
+            before_time = self._to_timestamp(before_time)
             klines = [k for k in klines if k['time'] < before_time]
         if after_time is not None:
+            after_time = self._to_timestamp(after_time)
             klines = [k for k in klines if k['time'] >= after_time]
         
         # 限制数量（取最新的）
