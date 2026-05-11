@@ -6,7 +6,7 @@
 #
 # 核心流程:
 #   1. 从 basicinfo_db 获取全市场股票列表
-#   2. 每批 50 只交给 Coordinator.coordinate_market_kline()
+#   2. 每批 200 只交给 Coordinator.coordinate_market_kline()
 #   3. 逐只做完整性校验:
 #      - 交易日历对比（缺失日检测）
 #      - 停复牌检测（vol=0 且 OHLC 相同）
@@ -763,8 +763,8 @@ def main():
         choices=["1D", "15m"], default="1D",
         help="数据类型: 1D(日线) / 15m(15分钟线)")
     parser.add_argument("--market", default="CNStock", help="市场（默认 CNStock）")
-    parser.add_argument("--batch-size", type=int, default=50,
-        help="每批处理股票数（默认 50）")
+    parser.add_argument("--batch-size", type=int, default=200,
+        help="每批处理股票数（默认 200）")
     parser.add_argument("--count", type=int, default=0,
         help="每只股票拉取条数（0=自动计算）")
     parser.add_argument("--timeout", type=float, default=600,
