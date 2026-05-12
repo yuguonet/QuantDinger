@@ -105,10 +105,21 @@ class BaseDataSource(ABC):
     
     @staticmethod
     def _to_timestamp(t) -> int:
-        """将 datetime 或 int 统一转为 Unix 时间戳（秒），用于时间比较。"""
+        """将 datetime / int / str 统一转为 Unix 时间戳（秒），用于时间比较。"""
         if isinstance(t, datetime):
             return int(t.timestamp())
-        return int(t)
+        if isinstance(t, (int, float)):
+            return int(t)
+        if isinstance(t, str):
+            s = t.strip()
+            # 常见日期/日期时间格式
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
+                        "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M", "%Y/%m/%d"):
+                try:
+                    return int(datetime.strptime(s, fmt).timestamp())
+                except ValueError:
+                    continue
+        raise ValueError(f"无法将 {t!r} 转为时间戳")
 
     def filter_and_limit(
         self,

@@ -16,6 +16,8 @@
   - 国内最稳定的免费数据源
   - 批量行情支持全市场（一次HTTP获取所有A股行情）
   - K线API是 per-symbol 的，不支持原生批量
+  - 2026-05 更新: 东财加强反爬，直连 JSON 请求被拦截，
+    改用 JSONP callback (cb=jQuery...) 绕过，返回后自动剥离 wrapper。
 
 在架构中的位置:
   KlineService → DataSourceFactory → Coordinator → EastMoneyDataSource（本模块）
@@ -29,8 +31,10 @@
 from __future__ import annotations
 
 import itertools
+import json
 import logging
 import random
+import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -54,6 +58,46 @@ def _to_eastmoney_secid(symbol: str) -> str:
     if not market or not digits:
         return ""
     return f"1.{digits}" if market == "SH" else f"0.{digits}"
+
+
+# ================================================================
+# JSONP 解析 — 东财 2026 年起要求 cb= 参数，返回 jQuery callback 包裹
+# ================================================================
+
+_JSONP_RE = re.compile(r'[a-zA-Z_$][a-zA-Z0-9_$]*\s*\(\s*(.+)\s*\)\s*;?\s*$', re.DOTALL)
+
+
+def _jsonp_cb() -> str:
+    """生成随机 JSONP callback 名，模拟 jQuery 回调"""
+    return f"jQuery{random.randint(10000, 99999)}_{int(time.time() * 1000)}"
+
+
+def _parse_jsonp(text: str) -> Optional[dict]:
+    """
+    剥离 JSONP wrapper，提取内部 JSON 对象。
+
+    东财返回格式示例:
+      jQuery35100_1715498400000({"rc":0, "data":{...}});
+    或纯 JSON:
+      {"rc":0, "data":{...}}
+
+    成功返回 dict，失败返回 None。
+    """
+    if not text or not text.strip():
+        return None
+    text = text.strip()
+    # 尝试 JSONP 匹配
+    m = _JSONP_RE.match(text)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except (json.JSONDecodeError, ValueError):
+            return None
+    # 回退：当作纯 JSON
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
 
 
 # ================================================================
@@ -81,11 +125,15 @@ def _random_ua() -> str:
 
 
 def _make_headers(referer: str = "https://quote.eastmoney.com/") -> dict:
-    """随机 UA + 指定 Referer + 完整浏览器指纹"""
+    """随机 UA + 指定 Referer + 完整浏览器指纹
+
+    注意: Accept-Encoding 不带 br，因为 requests 原生不支持 Brotli 解压，
+    带了 br 服务端会返回 Brotli 压缩流导致 json 解析失败。
+    """
     return {
         "User-Agent": _random_ua(), "Referer": referer,
         "Accept": "*/*", "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br", "Connection": "keep-alive",
+        "Accept-Encoding": "gzip, deflate", "Connection": "keep-alive",
     }
 
 
@@ -173,6 +221,12 @@ class EastMoneyDataSource:
       - fields2: K线字段（f51=日期, f52=开盘, f53=收盘, f54=最高, f55=最低, f56=成交量...）
       - klt: K线周期类型
       - fqt: 复权类型
+      - cb: JSONP callback（2026年起必传，否则云服务器IP返回空响应）
+
+    反爬说明 (2026-05 更新):
+      东财 push2/push2his 域名对云服务器 IP 直接返回空响应。
+      必须在请求参数中带 cb=jQuery... 才能拿到 JSONP 包裹的有效数据。
+      响应通过 _parse_jsonp() 自动剥离 wrapper，对调用方完全透明。
     """
 
     name = "eastmoney"
@@ -263,13 +317,11 @@ class EastMoneyDataSource:
                 "fqt": _EM_FQT.get(adj, 1),
                 "end": em_end,
                 "lmt": min(int(count), 5000),
+                "cb": _jsonp_cb(),
             },
             timeout=timeout,
         )
-        try:
-            data = resp.json()
-        except Exception:
-            return []
+        data = _parse_jsonp(resp.text)
         if not isinstance(data, dict):
             return []
         klines_data = (data.get("data") or {}).get("klines")
@@ -315,13 +367,11 @@ class EastMoneyDataSource:
                 "secid": secid,
                 "ut": "fa5fd1943c7b386f172d6893dbfba10b",
                 "fields": "f43,f44,f45,f46,f47,f48,f57,f58,f60,f170,f171",
+                "cb": _jsonp_cb(),
             },
             timeout=timeout,
         )
-        try:
-            data = resp.json()
-        except Exception:
-            return None
+        data = _parse_jsonp(resp.text)
         if not isinstance(data, dict):
             return None
         d = data.get("data")
@@ -381,10 +431,14 @@ class EastMoneyDataSource:
                     "fltt": 2, "invt": 2, "fid": "f3",
                     "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
                     "fields": "f2,f5,f6,f12,f15,f16,f17,f18",
+                    "cb": _jsonp_cb(),
                 },
                 timeout=timeout,
             )
-            data = resp.json()
+            data = _parse_jsonp(resp.text)
+            if not isinstance(data, dict):
+                logger.warning("[东财批量行情] JSONP 解析失败，原始响应前200字符: %s", resp.text[:200])
+                return {}
             diff = ((data.get("data") or {}).get("diff")) or []
         except Exception as e:
             logger.warning("[东财批量行情] clist 请求失败: %s", e)
@@ -422,4 +476,3 @@ class EastMoneyDataSource:
             except (ValueError, TypeError):
                 continue
         return result
-

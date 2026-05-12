@@ -442,6 +442,23 @@ def create_app(config_name='default'):
                 logger.info(f"[StockBasic] 已有 {_stock_stats['active']} 只股票")
         except Exception as e:
             logger.warning(f"[StockBasic] 初始化跳过: {e}")
-    
+        
+        # ── A股K线增量同步调度 ──────────────────────────────────
+        try:
+            from app.data_sources.backfill_db import trigger_sync
+            import threading, time as _time
+            def _backfill_loop():
+                while True:
+                    try:
+                        trigger_sync()
+                    except Exception:
+                        pass
+                    _time.sleep(60)
+            threading.Thread(target=_backfill_loop, daemon=True, name="backfill-scheduler").start()
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.debug(f"[Backfill] A股K线增量调度器未启动: {e}")
+
     return app
 

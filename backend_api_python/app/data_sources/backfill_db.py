@@ -2,7 +2,7 @@
 backfill_db.py — A 股 K 线增量同步 + 后台调度
 
 ═══════════════════════════════════════════════════════════════
-  架构位置: cn_stock → backfill_db → coordinator → 数据源 API
+  架构位置: backfill_db → provider(15m直调) / coordinator(1D)
 ═══════════════════════════════════════════════════════════════
 
 核心职责:
@@ -12,7 +12,8 @@ backfill_db.py — A 股 K 线增量同步 + 后台调度
   4. 后台自动调度，不影响主线程
 
 数据流:
-  15m → coordinator.coordinate_batch_quotes() → 标准化 time → bulk_write
+  15m → get_providers("batch_quote") → _batch_fetch_quotes_by_codes(500/组)
+        → 多 provider 并发 → 合并去重 → bulk_write
   1D  → coordinator.coordinate_batch_quotes() → 重试+去重 → bulk_write
   ↓
   db_market.upsert() → PostgreSQL
@@ -42,7 +43,7 @@ TZ_CN = timezone(timedelta(hours=8))
 
 # ── 功能开关 ──────────────────────────────────────────────
 # 设为 False 即关闭对应周期的下载-保存全流程（仅本文件内生效）
-ENABLE_15M = False   # 15 分钟线开关
+ENABLE_15M = True   # 15 分钟线开关
 ENABLE_1D  = True   # 日线开关
 # ──────────────────────────────────────────────────────────
 
@@ -62,20 +63,19 @@ _1D_MAX_RETRIES = 5        # 最大重试次数
 # ================================================================
 
 _ensure_table_lock = threading.Lock()
-_table_ensured = False
+_tables_ensured: set[str] = set()
 
 
-def _ensure_cn_last_update_table():
+def _ensure_cn_last_update_table(pool_name: str = "CNStock"):
     """确保 cn_last_update 表存在。"""
-    global _table_ensured
-    if _table_ensured:
+    if pool_name in _tables_ensured:
         return
     with _ensure_table_lock:
-        if _table_ensured:
+        if pool_name in _tables_ensured:
             return
         try:
             mgr = get_market_db_manager()
-            pool = mgr._get_pool("CNStock")
+            pool = mgr._get_pool(pool_name)
             with pool.connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute("""
@@ -108,17 +108,17 @@ def _ensure_cn_last_update_table():
                             END $$;
                         """)
                     conn.commit()
-            _table_ensured = True
+            _tables_ensured.add(pool_name)
         except Exception as e:
             logger.error(f"[同步] 创建 cn_last_update 表失败: {e}")
 
 
-def _get_last_update(source_name: str, tf: str) -> dict | None:
+def _get_last_update(source_name: str, tf: str, pool_name: str = "CNStock") -> dict | None:
     """查询 cn_last_update 记录。"""
-    _ensure_cn_last_update_table()
+    _ensure_cn_last_update_table(pool_name)
     try:
         mgr = get_market_db_manager()
-        pool = mgr._get_pool("CNStock")
+        pool = mgr._get_pool(pool_name)
         with pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -142,12 +142,13 @@ def _get_last_update(source_name: str, tf: str) -> dict | None:
 
 
 def _record_update(source_name: str, tf: str, status: str, report: str,
-                   last_bar_time: datetime | None = None):
+                   last_bar_time: datetime | None = None,
+                   pool_name: str = "CNStock"):
     """写入同步记录到 cn_last_update。"""
-    _ensure_cn_last_update_table()
+    _ensure_cn_last_update_table(pool_name)
     try:
         mgr = get_market_db_manager()
-        pool = mgr._get_pool("CNStock")
+        pool = mgr._get_pool(pool_name)
         with pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -253,7 +254,7 @@ def _same_trading_day(dt1: datetime, dt2: datetime) -> bool:
     return _own_trading_day(d1) == _own_trading_day(d2)
 
 
-def _should_run_15m() -> tuple[bool, str]:
+def _should_run_15m(pool_name: str = "CNStock") -> tuple[bool, str]:
     """15m 调度: 非交易日不跑 → 查表 → 判断是否有新 bar 触发。"""
     if not ENABLE_15M:
         return False, "15m 已关闭 (ENABLE_15M=False)"
@@ -264,7 +265,7 @@ def _should_run_15m() -> tuple[bool, str]:
         return False, "非交易日"
 
     now = datetime.now(TZ_CN)
-    doc = _get_last_update("stock_daily_k", "15m")
+    doc = _get_last_update("stock_daily_k", "15m", pool_name=pool_name)
 
     # ── 首次同步 ──
     if not doc:
@@ -273,10 +274,7 @@ def _should_run_15m() -> tuple[bool, str]:
             return True, "首次同步，盘前执行历史回填"
         return True, "首次同步，无历史记录"
 
-    status = doc.get("status", "")
-    if status == "error":
-        return True, f"上次失败: {doc.get('report', '')}，重试"
-
+    # 15m 不重试: 无论成功/失败/空数据，只要本 bar 已尝试过就跳过
     last_bar = doc.get("last_bar_time")
     last_updated = doc.get("last_updated")
 
@@ -306,7 +304,7 @@ def _should_run_15m() -> tuple[bool, str]:
     return False, f"已同步到 {ref_cn:%H:%M}，最新可用 {latest_bar:%H:%M}"
 
 
-def _should_run_1d() -> tuple[bool, str]:
+def _should_run_1d(pool_name: str = "CNStock") -> tuple[bool, str]:
     """1D 调度: 非交易日不跑 → 查表 → 17:00 后判断。"""
     if not ENABLE_1D:
         return False, "1D 已关闭 (ENABLE_1D=False)"
@@ -322,7 +320,7 @@ def _should_run_1d() -> tuple[bool, str]:
     if now.time() < dt_time(17, 0):
         return False, "17:00 前不更新 1D"
 
-    doc = _get_last_update("stock_daily_k", "1D")
+    doc = _get_last_update("stock_daily_k", "1D", pool_name=pool_name)
 
     # 首次同步
     if not doc:
@@ -349,11 +347,13 @@ def _should_run_1d() -> tuple[bool, str]:
 class BackfillSource:
     """数据源配置。"""
 
-    def __init__(self, name: str, market: str, timeframe: str, dinger_url: str = ""):
+    def __init__(self, name: str, market: str, timeframe: str,
+                 dinger_url: str = "", db_pool: str = "CNStock"):
         self.name = name
         self.market = market
         self.timeframe = timeframe
         self.dinger_url = dinger_url
+        self.db_pool = db_pool
 
 
 # ================================================================
@@ -363,7 +363,8 @@ class BackfillSource:
 class BackfillDB:
     """全盘批量同步工具。
 
-    A 股 15m/1D: coordinator.coordinate_batch_quotes()
+    A 股 15m: 直调 provider.fetch_batch_quotes（透传，无重试）
+    A 股 1D: coordinator.coordinate_batch_quotes（含重试）
     基金/债: Dinger API
     """
 
@@ -376,12 +377,13 @@ class BackfillDB:
         tf = tf or self.source.timeframe
 
         # 查表: 该不该干
+        pool = self.source.db_pool
         if tf == "15m":
-            should, reason = _should_run_15m()
+            should, reason = _should_run_15m(pool_name=pool)
         elif tf == "1D":
-            should, reason = _should_run_1d()
+            should, reason = _should_run_1d(pool_name=pool)
         else:
-            should, reason = _should_run_generic(tf)
+            should, reason = _should_run_generic(tf, pool_name=pool)
 
         if not should:
             return {
@@ -390,6 +392,8 @@ class BackfillDB:
             }
 
         # 执行同步
+        latest_bar = _latest_finished_bar_time()
+
         try:
             if self.source.dinger_url:
                 written, failed = self._sync_via_api(tf)
@@ -402,7 +406,9 @@ class BackfillDB:
         except Exception as e:
             report = f"同步异常: {e}"
             logger.error(f"[同步] {self.source.name} tf={tf} {report}")
-            _record_update(self.source.name, tf, "error", report)
+            # 异常也记录 bar 时间，防止 15m 同一 bar 重试
+            _record_update(self.source.name, tf, "error", report,
+                           last_bar_time=latest_bar, pool_name=pool)
             return {
                 "source": self.source.name, "tf": tf,
                 "written": 0, "status": "error", "report": report,
@@ -417,15 +423,17 @@ class BackfillDB:
         if written == 0:
             report = "未获取到数据"
             logger.warning(f"[同步] {self.source.name} tf={tf} {report}")
+            # 即使无数据也要记录，防止同一 bar 被重复触发
+            _record_update(self.source.name, tf, "empty", report,
+                           last_bar_time=latest_bar, pool_name=pool)
             return {
                 "source": self.source.name, "tf": tf,
                 "written": 0, "status": "empty", "report": report,
             }
 
-        latest_bar = _latest_finished_bar_time()
         report = f"写入 {written} 条"
         _record_update(self.source.name, tf, "ok", report,
-                       last_bar_time=latest_bar)
+                       last_bar_time=latest_bar, pool_name=pool)
         logger.info(f"[同步] {self.source.name} tf={tf} {report}")
 
         return {
@@ -433,15 +441,19 @@ class BackfillDB:
             "written": written, "status": "ok", "report": report,
         }
 
-    # ── 15m 同步: batch_quotes + time 标准化 ──────────────────
+    # ── 15m 同步: 直调 provider.fetch_batch_quotes + 并发分组 + 合并去重 ──
 
     def _sync_15m(self, symbols: list | None = None) -> tuple[int, list[str]]:
-        """15m 同步: 调用 batch_quotes 下载行情快照，标准化 time 后写入 DB。
+        """15m 同步: 直接调用各 provider 的 fetch_batch_quotes，并发分组拉取，合并去重后写入 DB。
 
+        不经过 coordinator，直接透传 provider。
+        每个 provider 内部按 batch_size=500 分组并发（如新浪/腾讯每组500只，11组）。
+        多个 provider 之间也并发执行。
         返回: (写入条数, 失败symbols列表)
         """
-        from app.data_sources.coordinator import get_coordinator
+        import concurrent.futures
         from app.data_sources.normalizer import strip_market_prefix
+        from app.data_sources.provider import get_providers, _batch_fetch_quotes_by_codes
 
         if not symbols:
             from app.utils.basicinfo_db import get_stock_basic_db
@@ -450,21 +462,57 @@ class BackfillDB:
             logger.warning(f"[同步] {self.source.name} 获取股票列表失败")
             return 0, []
 
-        coord = get_coordinator()
-
-        logger.info(f"[同步] {self.source.name} tf=15m batch_quotes 开始，标的数={len(symbols)}")
-
-        quotes = coord.coordinate_batch_quotes(
-            symbols=symbols,
-            market=self.source.market,
-            timeout=float(_BATCH_TIMEOUT_15M),
-        )
-
-        if not quotes:
-            logger.warning(f"[同步] {self.source.name} batch_quotes 返回空数据")
+        # 获取所有支持 batch_quote 的 provider
+        providers = get_providers(capability="batch_quote", market=self.source.market)
+        if not providers:
+            logger.warning(f"[同步] {self.source.name} 无可用 batch_quote provider")
             return 0, list(symbols)
 
-        logger.info(f"[同步] {self.source.name} batch_quotes 拉到 {len(quotes)} 只标的")
+        provider_names = [getattr(p, "name", "?") for p in providers]
+        logger.info(
+            f"[同步] {self.source.name} tf=15m 直调 provider，"
+            f"标的数={len(symbols)}，providers={provider_names}"
+        )
+
+        # 多 provider 并发: 每个 provider 在独立线程中分组拉取
+        quotes: dict[str, dict] = {}
+        quotes_lock = threading.Lock()
+
+        def _fetch_provider(p):
+            pname = getattr(p, "name", p.__class__.__name__)
+            try:
+                prepare_fn = getattr(p, 'prepare', None)
+                if prepare_fn and not prepare_fn():
+                    logger.warning(f"[同步] {pname} prepare() 返回 False，跳过")
+                    return pname, {}
+                result = _batch_fetch_quotes_by_codes(
+                    p, batch_size=500,
+                    timeout=int(_BATCH_TIMEOUT_15M),
+                    symbols=list(symbols),
+                )
+                return pname, result or {}
+            except Exception as e:
+                logger.warning(f"[同步] {pname} 拉取失败: {e}")
+                return pname, {}
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(providers)) as pool:
+            futures = {pool.submit(_fetch_provider, p): p for p in providers}
+            for fut in concurrent.futures.as_completed(futures):
+                pname, result = fut.result()
+                if not result:
+                    logger.info(f"[同步] {pname} 返回 0 条")
+                    continue
+                # 合并去重: 已有数据的 symbol 不覆盖（先到先得，priority 高的先完成不保证）
+                with quotes_lock:
+                    new_count = sum(1 for s in result if s not in quotes)
+                    quotes.update(result)
+                logger.info(f"[同步] {pname} 返回 {len(result)} 条，新增 {new_count}")
+
+        if not quotes:
+            logger.warning(f"[同步] {self.source.name} 所有 provider 均返回空数据")
+            return 0, list(symbols)
+
+        logger.info(f"[同步] {self.source.name} 合并后共 {len(quotes)} 只标的")
 
         # 确定当前 bar 的标准结束时间
         now_cn = datetime.now(TZ_CN)
@@ -474,7 +522,7 @@ class BackfillDB:
             return 0, []
 
         all_records = []
-        failed_symbols = []
+        failed_set = set()       # 用 set 去重，避免同一 symbol 被记多次
         success_digits = set()
 
         for symbol in symbols:
@@ -484,7 +532,7 @@ class BackfillDB:
                 quote = quotes.get(digits)
 
             if not quote:
-                failed_symbols.append(symbol)
+                failed_set.add(symbol)
                 continue
 
             o = float(quote.get("open", 0) or 0)
@@ -494,10 +542,10 @@ class BackfillDB:
             v = float(quote.get("volume", 0) or 0)
 
             if o == 0 and h == 0 and l == 0 and c == 0:
-                failed_symbols.append(symbol)
+                failed_set.add(symbol)
                 continue
             if c <= 0 or o <= 0:
-                failed_symbols.append(symbol)
+                failed_set.add(symbol)
                 continue
             if h > 0 and l > 0 and h < l:
                 h, l = l, h
@@ -515,12 +563,16 @@ class BackfillDB:
             })
             success_digits.add(clean_symbol)
 
-        # 统计缺失
+        # 统计缺失（quotes 里没有、且未成功处理的）
         requested_digits = set(strip_market_prefix(s) for s in symbols)
         fetched_set = set(quotes.keys())
         missing_digits = requested_digits - fetched_set - success_digits
         digit_to_symbol = {strip_market_prefix(s): s for s in symbols}
-        failed_symbols.extend(digit_to_symbol[d] for d in missing_digits if d in digit_to_symbol)
+        for d in missing_digits:
+            if d in digit_to_symbol:
+                failed_set.add(digit_to_symbol[d])
+
+        failed_symbols = list(failed_set)
 
         if failed_symbols:
             logger.warning(
@@ -578,7 +630,6 @@ class BackfillDB:
 
         for attempt in range(1 + _1D_MAX_RETRIES):
             # 第一次 + 最多重试 5 次 = 最多 6 次调用
-            is_retry = attempt > 0
             label = f"第 {attempt + 1} 次" if attempt == 0 else f"重试 {attempt}/{_1D_MAX_RETRIES}"
 
             logger.info(
@@ -788,9 +839,10 @@ bond_daily_k = BackfillDB(BackfillSource(
 # 通用调度 fallback
 # ================================================================
 
-def _should_run_generic(tf: str) -> tuple[bool, str]:
+def _should_run_generic(tf: str, pool_name: str = "CNStock") -> tuple[bool, str]:
     """非 15m/1D 的通用调度逻辑（基金/债等）。"""
-    doc = _get_last_update("fund_nav_daily" if tf == "1D" else "unknown", tf)
+    doc = _get_last_update("fund_nav_daily" if tf == "1D" else "unknown", tf,
+                           pool_name=pool_name)
     if not doc:
         return True, "首次同步"
     status = doc.get("status", "")
@@ -803,35 +855,102 @@ def _should_run_generic(tf: str) -> tuple[bool, str]:
 
 
 # ================================================================
-# 触发式后台同步 — 保证唯一 + 自动结束
+# 15m 自驱动调度器 — 独立线程，按 bar 时间点自动触发
 # ================================================================
 #
 # 工作模式:
-#   1. cn_stock 调用 trigger_sync() → 新建线程
-#   2. 同一时间只允许一个线程运行（_sync_running 原子锁）
-#   3. 线程执行完所有同步逻辑后自动退出
-#   4. 下次 cn_stock 调用时再触发新线程
+#   1. start_scheduler() 启动守护线程
+#   2. 线程计算下一个 bar 触发时间（bar 结束前 30s），sleep 到点
+#   3. 到点 → 执行一次 run_once("15m") → 计算下一个 bar → 继续 sleep
+#   4. 完全自驱动，不依赖外部调用
 #
+
+_scheduler_started = False
+
+
+def _next_bar_trigger() -> datetime:
+    """返回下一个 15m bar 的触发时间（bar 结束前 30s）。"""
+    now = datetime.now(TZ_CN)
+    for h, m in _BAR_END_TIMES:
+        bar_end = datetime(now.year, now.month, now.day, h, m, 0, tzinfo=TZ_CN)
+        trigger = bar_end - timedelta(seconds=30)
+        if trigger > now:
+            return trigger
+    # 今天的 bar 都过了 → 明天第一个 bar
+    tomorrow = now + timedelta(days=1)
+    h, m = _BAR_END_TIMES[0]
+    return datetime(tomorrow.year, tomorrow.month, tomorrow.day, h, m, 0,
+                    tzinfo=TZ_CN) - timedelta(seconds=30)
+
+
+def _scheduler_15m_loop():
+    """15m 调度主循环 — 到点执行，永不退出。"""
+    while True:
+        try:
+            # 非交易日 → sleep 到明天开盘前
+            today_str = datetime.now(TZ_CN).strftime("%Y-%m-%d")
+            if not is_trading_day(today_str):
+                tomorrow = datetime.now(TZ_CN) + timedelta(days=1)
+                h, m = _BAR_END_TIMES[0]
+                wake = datetime(tomorrow.year, tomorrow.month, tomorrow.day,
+                                h, m, 0, tzinfo=TZ_CN) - timedelta(seconds=30)
+                sleep_sec = max((wake - datetime.now(TZ_CN)).total_seconds(), 60)
+                logger.info(f"[15m调度] 非交易日，sleep {sleep_sec/3600:.1f}h 到明天")
+                time.sleep(sleep_sec)
+                continue
+
+            trigger = _next_bar_trigger()
+            sleep_sec = max((trigger - datetime.now(TZ_CN)).total_seconds(), 0)
+            logger.info(f"[15m调度] 下次触发 {trigger:%H:%M:%S}，sleep {sleep_sec:.0f}s")
+            time.sleep(sleep_sec)
+
+            if not ENABLE_15M:
+                continue
+
+            logger.info("[15m调度] 到点，开始同步")
+            result = stock_daily_k.run_once("15m")
+            written = result.get("written", 0)
+            status = result.get("status", "")
+            logger.info(f"[15m调度] 完成: written={written} status={status}")
+
+        except Exception as e:
+            logger.error(f"[15m调度] 异常: {e}")
+            time.sleep(10)
+
+
+def start_scheduler():
+    """启动 15m 自驱动调度器（幂等，重复调用安全）。"""
+    global _scheduler_started
+    if _scheduler_started:
+        return
+    _scheduler_started = True
+    t = threading.Thread(target=_scheduler_15m_loop, daemon=True,
+                         name="scheduler-15m")
+    t.start()
+    logger.info("[15m调度] 守护线程已启动")
+
+
+# 模块加载时自动启动（幂等，重复 import 安全）
+start_scheduler()
+
+
+# ================================================================
+# 1D + 基金/债 触发式同步
+# ================================================================
 
 _sync_running = threading.Lock()
 
 
 def trigger_sync():
-    """由 cn_stock 调用，触发一次后台同步。
-
-    保证同一时间只有一个线程在运行:
-      - 已有线程在跑 → 立即返回（不阻塞调用方）
-      - 没有线程 → 新建一个，执行完自动退出
-    """
+    """触发 1D / 基金 / 债同步（不含 15m）。"""
     if not _sync_running.acquire(blocking=False):
-        return  # 已有线程在跑，跳过
+        return
 
     t = threading.Thread(target=_sync_worker, daemon=True, name="backfill-sync")
     t.start()
 
 
 def _sync_worker():
-    """同步工作线程 — 执行完所有同步逻辑后自动退出。"""
     try:
         _run_all_sync()
     except Exception as e:
@@ -841,36 +960,17 @@ def _sync_worker():
 
 
 def _run_all_sync():
-    """执行所有需要的同步任务。
-
-    调度逻辑:
-      1. 非交易日 → 全部跳过
-      2. 15m → 按 bar 触发时间点判断
-      3. 1D → 17:00 后执行，含重试
-      4. 基金/债 → 17:00 后执行
-    """
+    """1D + 基金/债同步（15m 由独立调度器处理）。"""
     now = datetime.now(TZ_CN)
     today_str = now.strftime("%Y-%m-%d")
 
-    # 非交易日不跑
     if not is_trading_day(today_str):
-        logger.info("[后台同步] 非交易日，跳过全部同步")
+        logger.info("[后台同步] 非交易日，跳过")
         return
-
-    # ── 15m 同步 ──
-    if not ENABLE_15M:
-        logger.info("[后台同步] 15m 已关闭 (ENABLE_15M=False)，跳过")
-    else:
-        try:
-            result = stock_daily_k.run_once("15m")
-            if result.get("written", 0) > 0:
-                logger.info(f"[后台同步] 15m: {result.get('written')} 条 — {result.get('report', '')}")
-        except Exception as e:
-            logger.error(f"[后台同步] 15m 异常: {e}")
 
     # ── 1D 同步 ──
     if not ENABLE_1D:
-        logger.info("[后台同步] 1D 已关闭 (ENABLE_1D=False)，跳过")
+        logger.info("[后台同步] 1D 已关闭，跳过")
     else:
         try:
             result = stock_daily_k.run_once("1D")
@@ -879,7 +979,7 @@ def _run_all_sync():
         except Exception as e:
             logger.error(f"[后台同步] 1D stock 异常: {e}")
 
-    # fund + bond (Dinger API) — 只在 17:00 后跑
+    # fund + bond — 17:00 后
     if now.time() >= dt_time(17, 0):
         for src in (fund_nav_daily, bond_daily_k):
             try:

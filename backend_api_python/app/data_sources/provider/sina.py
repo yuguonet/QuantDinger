@@ -278,8 +278,10 @@ class SinaDataSource:
         return bars
 
     def _fetch_raw_daily_kline(self, sc: str, count: int, timeout: int) -> List[Dict[str, Any]]:
-        url = "https://vip.stock.finance.sina.com.cn/cn/api/json.php/CN_MarketDataService.getKLineData"
+        # 主接口: money.finance（返回纯JSON，稳定）
+        url = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
         params = {"symbol": sc, "scale": 240, "ma": "no", "datalen": min(int(count), 2000)}
+        _sina_limiter.wait()
         resp = get_shared_session().get(
             url,
             headers=get_request_headers(referer=_sina_kline_referers.next()),
@@ -291,6 +293,22 @@ class SinaDataSource:
             data = None
         if isinstance(data, list) and data:
             return _sina_kline_to_dicts(data, count)
+
+        # 备选: vip.stock（URL已变更，保留作为备用）
+        url2 = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
+        try:
+            resp2 = get_shared_session().get(
+                url2,
+                headers=get_request_headers(referer=_sina_kline_referers.next()),
+                params=params, timeout=timeout,
+            )
+            data2 = resp2.json()
+        except Exception:
+            data2 = None
+        if isinstance(data2, list) and data2:
+            return _sina_kline_to_dicts(data2, count)
+
+        # 兜底: hisdata 页面解析
         return _fetch_sina_kline_hisdata(sc, count, timeout)
 
     def _fetch_minute_kline(self, sc: str, scale: int, count: int, timeout: int) -> List[Dict[str, Any]]:
@@ -319,9 +337,15 @@ class SinaDataSource:
         if not sc:
             return None
         _sina_quote_limiter.wait()
+        headers = get_request_headers(referer=_sina_quote_referers.next())
+        headers["User-Agent"] = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
         resp = get_shared_session().get(
             f"https://hq.sinajs.cn/list={sc}",
-            headers=get_request_headers(referer=_sina_quote_referers.next()),
+            headers=headers,
             timeout=timeout,
         )
         resp.encoding = "gbk"
@@ -392,10 +416,16 @@ class SinaDataSource:
         """单批次行情请求（内部辅助，供并发调用）"""
         query = ",".join(batch)
         _sina_quote_limiter.wait()
+        headers = get_request_headers(referer=_sina_quote_referers.next())
+        headers["User-Agent"] = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
         try:
             resp = get_shared_session().get(
                 f"https://hq.sinajs.cn/list={query}",
-                headers=get_request_headers(referer=_sina_quote_referers.next()),
+                headers=headers,
                 timeout=timeout,
             )
             resp.encoding = "gbk"
