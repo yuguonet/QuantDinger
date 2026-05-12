@@ -24,9 +24,9 @@ except ImportError:
 # ═══════════════ 配置 ═══════════════
 TIMEOUT = 10
 OUTPUT_DIR = "kline_data"
-GROUP_SIZE = 100
-THREADS_PER_SOURCE = 3       # 默认线程数 (极速源用)
-PER_DOMAIN_CONCURRENT = 50    # push2域名并发上限
+GROUP_SIZE = 50
+THREADS_PER_SOURCE = 8       # 默认线程数 (极速源用)
+PER_DOMAIN_CONCURRENT = 30    # push2域名并发上限
 PER_DOMAIN_INTERVAL = 0.01    # push2域名最小间隔
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36", "Accept": "*/*"}

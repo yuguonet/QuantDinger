@@ -33,7 +33,7 @@ from app.data_sources.provider import get_providers, autodiscover, NotSupportedR
 # ═══════════════ 配置 ═══════════════
 OUTPUT_DIR = "data/kline_data"
 GROUP_SIZE = 50
-THREADS_PER_SOURCE = 30
+THREADS_PER_SOURCE = 3
 
 
 # ═══════════════ 源统计 ═══════════════

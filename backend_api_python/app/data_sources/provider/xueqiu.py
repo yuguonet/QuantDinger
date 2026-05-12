@@ -334,7 +334,7 @@ class XueqiuDataSource:
 
         result: Dict[str, List[Dict[str, Any]]] = {}
         lock = threading.Lock()
-        threads_per_source = 30
+        threads_per_source = 8
 
         def _fetch_one(code):
             try:

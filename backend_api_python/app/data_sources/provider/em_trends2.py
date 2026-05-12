@@ -54,8 +54,8 @@ logger = get_logger(__name__)
 # ================================================================
 
 TIMEOUT = 10
-THREADS_PER_SOURCE = 30
-PER_DOMAIN_CONCURRENT = 50
+THREADS_PER_SOURCE = 15
+PER_DOMAIN_CONCURRENT = 30
 PER_DOMAIN_INTERVAL = 0.01
 
 HEADERS = {

@@ -49,7 +49,7 @@ logger = get_logger(__name__)
 # ================================================================
 
 TIMEOUT = 10
-THREADS_PER_SOURCE = 30
+THREADS_PER_SOURCE = 8
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
