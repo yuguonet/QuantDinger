@@ -177,7 +177,7 @@ def get_realtime_circuit_breaker() -> CircuitBreaker:
 # 单次 fetch 的超时上限（秒）。
 # Coordinator 层的兜底超时，防止某个源的 fetch_fn 卡死导致整个队列阻塞。
 # 比 SourceConfig 里的超时更严格 — 这是硬上限。
-PER_TASK_TIMEOUT = 20.0
+PER_TASK_TIMEOUT = 60.0
 
 # 队列为空后等待新任务的超时（秒）。
 # worker 线程取不到任务时会阻塞等待，超时后认为所有工作已完成，退出循环。
@@ -1244,7 +1244,7 @@ class Coordinator:
         result_lock = threading.Lock()
 
         # 每组超时 & 重试
-        per_task_timeout = min(timeout, 20.0)
+        per_task_timeout = min(timeout, 60.0)
         max_group_retries = 3
 
         # 退出计数器
@@ -1551,10 +1551,6 @@ class Coordinator:
             logger.warning("[协助层] market_kline market=%s tf=%s 无可用源(prepare全部失败)", market, timeframe)
             return {}
 
-        # ── 第二步: 获取股票列表并分组 ──
-        if not symbols:
-            from app.utils.basicinfo_db import get_stock_basic_db
-            symbols = get_stock_basic_db().market_all_codes(status="active")
         if not symbols:
             logger.warning("[协助层] market_kline 获取股票列表失败")
             return {}
@@ -1602,7 +1598,7 @@ class Coordinator:
         pending_groups = 0
         pending_lock = threading.Lock()
 
-        per_task_timeout = 20.0  # 每组超时 20s
+        per_task_timeout = 60.0  # 每组超时 60s
         max_group_retries = 3    # 单组最大重试次数，超过丢弃
 
         # 全局停止信号
