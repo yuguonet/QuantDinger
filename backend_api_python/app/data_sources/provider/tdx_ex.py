@@ -253,11 +253,14 @@ def _fetch_tdx_ex_kline(
         try:
             # pytdx 返回 "YYYY-MM-DD HH:MM" 格式
             if "-" in dt and ":" in dt:
-                ts = int(datetime.strptime(dt[:16], "%Y-%m-%d %H:%M").replace(tzinfo=_TZ_CN).timestamp())
+                ts = dt[:16]
             elif len(dt) == 8 and dt.isdigit():
-                ts = int(datetime.strptime(dt, "%Y%m%d").replace(tzinfo=_TZ_CN).timestamp())
+                ts = f"{dt[:4]}-{dt[4:6]}-{dt[6:8]}"
             else:
-                ts = int(float(dt))
+                try:
+                    ts = datetime.fromtimestamp(int(float(dt))).strftime("%Y-%m-%d %H:%M:%S")
+                except (ValueError, OSError):
+                    continue
             result.append({
                 "time": ts,
                 "open": round(float(bar.get("open", 0)), 4),

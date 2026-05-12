@@ -47,7 +47,6 @@ from typing import Any, Dict, List, Optional
 from app.data_sources.base import BaseDataSource
 from app.data_sources.normalizer import normalize_cn_code
 from app.data_sources.asia_stock_kline import normalize_chart_timeframe
-from app.data_sources.circuit_breaker import get_realtime_circuit_breaker
 from app.data_sources.coordinator import get_coordinator
 from app.data_sources.kline_clean import clean_klines
 from app.utils.logger import get_logger
@@ -411,7 +410,6 @@ class DBKlineBridge:
             code = normalize_cn_code(raw)
             ticker = get_coordinator().coordinate_ticker(
                 symbols=[code],
-                cb=self._ds.circuit_breaker,
                 market="CNStock",
                 timeout=5,
             )
@@ -679,7 +677,6 @@ class CNStockDataSource(BaseDataSource):
     name = "CNStock/multi-source"
 
     def __init__(self):
-        self.circuit_breaker = get_realtime_circuit_breaker()
         self._db_bridge = DBKlineBridge(self)
 
     # ── get_ticker: 只负责取行情 ──
@@ -703,7 +700,6 @@ class CNStockDataSource(BaseDataSource):
 
         result = get_coordinator().coordinate_ticker(
             symbols=normalized,
-            cb=self.circuit_breaker,
             market="CNStock",
             timeout=8,
         )
@@ -773,7 +769,6 @@ class CNStockDataSource(BaseDataSource):
             symbols=[code],
             timeframe=timeframe,
             limit=lim,
-            cb=self.circuit_breaker,
             market="CNStock",
             timeout=20,
             adj=adj,
@@ -810,7 +805,6 @@ class CNStockDataSource(BaseDataSource):
             symbols=[normalize_cn_code(s) for s in symbols],
             timeframe=timeframe,
             limit=limit,
-            cb=self.circuit_breaker,
             market="CNStock",
             timeout=20,
             adj=adj,
@@ -858,7 +852,6 @@ class CNStockDataSource(BaseDataSource):
                 symbols=[code],
                 timeframe=source_tf,
                 limit=source_limit,
-                cb=self.circuit_breaker,
                 market="CNStock",
                 timeout=20,
                 adj=adj,

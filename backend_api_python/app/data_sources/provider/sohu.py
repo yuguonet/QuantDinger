@@ -121,7 +121,7 @@ def _fetch_sohu_15m(code: str, limit: int = 200) -> Optional[List[Dict[str, Any]
         try:
             dt_str = str(r[0])
             # 解析时间 "2026-05-08 09:45"
-            ts = int(datetime.strptime(dt_str[:16], "%Y-%m-%d %H:%M").replace(tzinfo=_TZ_CN).timestamp())
+            ts = dt_str[:16]  # "YYYY-MM-DD HH:MM"
             result.append({
                 "time": ts,
                 "open": round(float(r[1]), 4),

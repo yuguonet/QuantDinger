@@ -12,9 +12,8 @@ backfill_db.py — A 股 K 线增量同步 + 后台调度
   4. 后台自动调度，不影响主线程
 
 数据流:
-  15m 盘中 → coordinator.coordinate_market_kline(count=None, start_date="") → coordinator 解析 count → 并发逐只
-  15m 首次 → coordinator.coordinate_market_kline(count=None, start_date=回溯日期) → coordinator 解析 count → 并发逐只
-  1D 每日  → coordinator.coordinate_market_kline(count=None, start_date="") → coordinator 解析 count → 并发逐只
+  15m → coordinator.coordinate_batch_quotes() → 标准化 time → bulk_write
+  1D  → coordinator.coordinate_batch_quotes() → 重试+去重 → bulk_write
   ↓
   db_market.upsert() → PostgreSQL
   ↓
@@ -22,9 +21,9 @@ backfill_db.py — A 股 K 线增量同步 + 后台调度
 
 设计原则:
   1. cn_last_update 是唯一的调度控制表
-  2. 15m 按 bar 完成时间精确调度，不用简单间隔
-  3. 1D 每个交易日只同步一次（17:00 后）
-  4. 数据校验: 缺 volume 时保留旧值
+  2. 15m 在 bar 结束前 30s 触发下载（如 9:44:30, 9:59:30 ...）
+  3. 1D 每个交易日 17:00 后同步一次，<90% 则重试（最多 5 次，两次比对去重）
+  4. 非交易日不执行
   5. 后台 daemon 线程自动运行，fire-and-forget
 """
 
@@ -47,15 +46,15 @@ ENABLE_15M = False   # 15 分钟线开关
 ENABLE_1D  = True   # 日线开关
 # ──────────────────────────────────────────────────────────
 
-# 首次同步（cn_last_update 无记录时）的最大回溯工作日数
-MAX_15M_DAYS = 3
+# 15m 下载超时（秒）
+_BATCH_TIMEOUT_15M = 300
 
-# 后台调度循环间隔（秒）
-_SCHEDULER_TICK = 30
+# 1D 下载超时（秒）
+_BATCH_TIMEOUT_1D = 300
 
-# 15m bar 完成后的延迟（秒）— 等数据源准备好
-# 16:00 的 bar 在 ~16:10~16:17 才能从源拿到
-_BAR_READY_DELAY = 70
+# 1D 重试配置
+_1D_MIN_RATIO = 0.9       # 90% 阈值
+_1D_MAX_RETRIES = 5        # 最大重试次数
 
 
 # ================================================================
@@ -167,15 +166,21 @@ def _record_update(source_name: str, tf: str, status: str, report: str,
 
 
 # ================================================================
-# 15m bar 时间表 — 固定时间点，不是简单间隔
+# 15m bar 时间表 — 固定时间点 + 提前 30s 触发
 # ================================================================
 #
 # A 股交易时段: 9:30-11:30, 13:00-15:00
 # 15m bar 的结束时间（北京时间）:
-#   09:45, 10:00, 10:15, 10:30, 10:45, 11:00, 11:15, 11:30,
-#   13:15, 13:30, 13:45, 14:00, 14:15, 14:30, 14:45, 15:00
+#   09:45, 10:00, 10:15, 10:30,
+#   10:45, 11:00, 11:15, 11:30,
+#   13:15, 13:30, 13:45, 14:00,
+#   14:15, 14:30, 14:45, 15:00
 #
-# 每根 bar 结束后需要等数据源准备好（~60-70s 延迟）才能同步。
+# 触发时间 = bar 结束前 30s:
+#   9:44:30, 9:59:30, 10:14:30, 10:29:30,
+#   10:44:30, 10:59:30, 11:14:30, 11:29:30,
+#   13:14:30, 13:29:30, 13:44:30, 13:59:30,
+#   14:14:30, 14:29:30, 14:44:30, 14:59:30
 #
 
 # 15m bar 结束时间（时, 分）— 北京时间
@@ -187,34 +192,48 @@ _BAR_END_TIMES = [
 ]
 
 
-def _latest_available_bar_time() -> datetime | None:
-    """返回当前时间之前最近一根已就绪的 15m bar 的结束时间。
+def _latest_finished_bar_time() -> datetime | None:
+    """返回当前时间之前最近一根已结束的 15m bar 的标准结束时间。
 
-    例: 现在 10:18, bar_ready_delay=70s
-      09:45 → ready 09:46:10  ✓ (已就绪)
-      10:00 → ready 10:01:10  ✓ (已就绪)
-      10:15 → ready 10:16:10  ✓ (已就绪)
-      10:30 → ready 10:31:10  ✗ (还没到)
-    → 返回 10:15 的 bar_end_time = 10:30 (这根 bar 覆盖 10:15-10:30)
-
-    Wait, 逻辑需要理清:
-    bar 结束时间是指 bar 覆盖的最后一分钟。
-    09:30-09:45 这根 bar，结束时间是 09:45。
-    数据源在 09:45 + delay 后才准备好。
-    所以 "最新可用 bar" = 结束时间 <= now - delay 的最大那根。
+    不用 delay，只看 bar 结束时间是否已过。
     """
     now = datetime.now(TZ_CN)
-    cutoff = now - timedelta(seconds=_BAR_READY_DELAY)
-
     latest = None
     for h, m in _BAR_END_TIMES:
         bar_end = datetime(now.year, now.month, now.day, h, m, 0, tzinfo=TZ_CN)
-        if bar_end <= cutoff:
+        if bar_end <= now:
             latest = bar_end
         else:
-            break  # 后面的都更大，不用看了
-
+            break
     return latest
+
+
+def _normalize_to_bar_time(dt_obj: datetime) -> datetime:
+    """将任意时间标准化到其所属 15m bar 的标准结束时间。
+
+    例: 10:05:00 → 属于 10:00~10:15 这根 bar → 返回 10:15
+        09:29:00 → 盘前，不属于任何 bar → 返回 None（由调用方处理）
+        12:00:00 → 午休，不属于任何 bar → 返回 None
+    """
+    t = dt_obj.astimezone(TZ_CN) if dt_obj.tzinfo else dt_obj.replace(tzinfo=TZ_CN)
+    t_time = t.time()
+
+    # 盘前 (09:30 前) → 不属于任何 bar
+    if t_time < dt_time(9, 30):
+        return None
+
+    # 午休 (11:30 ~ 13:00) → 不属于任何 bar
+    if dt_time(11, 30) < t_time < dt_time(13, 0):
+        return None
+
+    # 从 _BAR_END_TIMES 中找到第一个结束时间 >= t_time 的 bar
+    for h, m in _BAR_END_TIMES:
+        bar_end_time = dt_time(h, m)
+        if t_time <= bar_end_time:
+            return datetime(t.year, t.month, t.day, h, m, 0, tzinfo=TZ_CN)
+
+    # 超过 15:00 → 归到 15:00
+    return datetime(t.year, t.month, t.day, 15, 0, 0, tzinfo=TZ_CN)
 
 
 # ================================================================
@@ -235,13 +254,23 @@ def _same_trading_day(dt1: datetime, dt2: datetime) -> bool:
 
 
 def _should_run_15m() -> tuple[bool, str]:
-    """15m 调度: 先查表 → 再看盘中 → 再看时间点。"""
+    """15m 调度: 非交易日不跑 → 查表 → 判断是否有新 bar 触发。"""
     if not ENABLE_15M:
         return False, "15m 已关闭 (ENABLE_15M=False)"
+
+    # 非交易日不跑
+    today_str = datetime.now(TZ_CN).strftime("%Y-%m-%d")
+    if not is_trading_day(today_str):
+        return False, "非交易日"
+
+    now = datetime.now(TZ_CN)
     doc = _get_last_update("stock_daily_k", "15m")
 
-    # ── 第一步: 查表 ──
+    # ── 首次同步 ──
     if not doc:
+        latest_bar = _latest_finished_bar_time()
+        if not latest_bar:
+            return True, "首次同步，盘前执行历史回填"
         return True, "首次同步，无历史记录"
 
     status = doc.get("status", "")
@@ -254,62 +283,48 @@ def _should_run_15m() -> tuple[bool, str]:
     if not last_bar and not last_updated:
         return True, "无时间记录，重新同步"
 
-    # ── 第二步: 看是不是盘中 ──
-    now = datetime.now(TZ_CN)
     ref_time = last_bar or last_updated
-    if ref_time:
-        ref_cn = ref_time.astimezone(TZ_CN) if ref_time.tzinfo else ref_time.replace(tzinfo=TZ_CN)
-    else:
-        ref_cn = None
+    ref_cn = ref_time.astimezone(TZ_CN) if ref_time.tzinfo else ref_time.replace(tzinfo=TZ_CN)
 
     # 跨交易日 → 直接同步
-    if ref_cn and not _same_trading_day(ref_cn, now):
+    if not _same_trading_day(ref_cn, now):
         return True, f"上次 {ref_cn:%Y-%m-%d}，跨交易日"
 
-    # last_bar_time 异常检测: 不在交易时段的 bar 时间 → 数据有问题，重跑
-    if ref_cn:
-        bar_time = ref_cn.time()
-        is_valid_bar_time = any(
-            bar_time >= dt_time(h, m) and bar_time <= dt_time(h, m + 1)
-            for h, m in _BAR_END_TIMES
-        )
-        if not is_valid_bar_time:
-            return True, f"last_bar_time={ref_cn:%H:%M} 不在交易时段，数据异常，重跑"
+    # ── 看是否有新 bar 到了 ──
+    latest_bar = _latest_finished_bar_time()
 
-    # ── 第三步: 看时间点 ──
-    latest_bar = _latest_available_bar_time()
-
-    # 盘前（9:45+70s 前）→ 没有可同步的 bar
     if not latest_bar:
-        # 从未成功同步过（无 last_bar_time）→ 盘前也跑历史回填
+        # 盘前（9:45 前）→ 没有可同步的 bar
         if not last_bar:
             return True, "盘前，从未同步过，执行历史回填"
         return False, "盘前，无可同步 bar"
 
-    # 有 last_bar_time → 精确比较
-    if ref_cn:
-        if ref_cn >= latest_bar:
-            return False, f"已同步到 {ref_cn:%H:%M}，最新可用 {latest_bar:%H:%M}"
-        return True, f"last_bar={ref_cn:%H:%M}, 有新 bar 到 {latest_bar:%H:%M}"
+    # 精确比较: last_bar_time < 最新已结束 bar → 有新数据
+    if ref_cn < latest_bar:
+        return True, f"last_bar={ref_cn:%H:%M}, 新 bar 到 {latest_bar:%H:%M}"
 
-    # 有记录但无 last_bar_time（旧格式）→ 按间隔判断
-    if last_updated:
-        elapsed = (now - (last_updated.astimezone(TZ_CN) if last_updated.tzinfo else last_updated.replace(tzinfo=TZ_CN))).total_seconds()
-        if elapsed < 300:
-            return False, f"距上次 {elapsed:.0f}s，暂不更新"
-        return True, f"距上次 {elapsed:.0f}s，检查新 bar"
-
-    return True, "记录不完整，重新同步"
+    return False, f"已同步到 {ref_cn:%H:%M}，最新可用 {latest_bar:%H:%M}"
 
 
 def _should_run_1d() -> tuple[bool, str]:
-    """1D 调度: 先查表 → 没记录直接干 → 再看时间点。"""
+    """1D 调度: 非交易日不跑 → 查表 → 17:00 后判断。"""
     if not ENABLE_1D:
         return False, "1D 已关闭 (ENABLE_1D=False)"
+
     now = datetime.now(TZ_CN)
+    today_str = now.strftime("%Y-%m-%d")
+
+    # 非交易日不跑
+    if not is_trading_day(today_str):
+        return False, "非交易日"
+
+    # 17:00 前不跑
+    if now.time() < dt_time(17, 0):
+        return False, "17:00 前不更新 1D"
+
     doc = _get_last_update("stock_daily_k", "1D")
 
-    # ── 第一步: 查表 ──
+    # 首次同步
     if not doc:
         return True, "首次 1D 同步"
 
@@ -320,82 +335,11 @@ def _should_run_1d() -> tuple[bool, str]:
     last_updated = doc.get("last_updated")
     if last_updated:
         last_cn = last_updated.astimezone(TZ_CN) if last_updated.tzinfo else last_updated.replace(tzinfo=TZ_CN)
-        # 跨交易日 → 待同步
         if not _same_trading_day(last_cn, now):
             return True, f"上次 1D {last_cn:%Y-%m-%d}，跨交易日"
-        # 同交易日已同步 → 不重复
         return False, "本交易日 1D 已同步"
 
-    # ── 第二步: 看时间点（首次已处理，这里是有记录但无 last_updated 的异常情况）──
-    if now.time() < dt_time(17, 0):
-        return False, "17:00 前不更新 1D"
-
-    from app.utils.trading_calendar import is_trading_day_today
-    if not is_trading_day_today():
-        return False, "非交易日"
-
     return True, "本交易日 1D 待同步"
-
-
-# ================================================================
-# 数据校验
-# ================================================================
-
-def _validate_bars(bars: list[dict]) -> list[dict]:
-    """校验 K 线数据，修正明显问题。
-
-    规则:
-    - volume 缺失或为 0 → 保留（有的源确实没有 volume）
-    - OHLC 全为 0 → 丢弃（无效数据）
-    - high < low → 交换
-    """
-    validated = []
-    for bar in bars:
-        o = float(bar.get("open", 0))
-        h = float(bar.get("high", 0))
-        l = float(bar.get("low", 0))
-        c = float(bar.get("close", 0))
-
-        # OHLC 全为 0 → 跳过
-        if o == 0 and h == 0 and l == 0 and c == 0:
-            continue
-
-        # 极端负数/零价 → 跳过
-        if c <= 0 or o <= 0:
-            continue
-
-        # high < low → 交换
-        if h > 0 and l > 0 and h < l:
-            bar["high"], bar["low"] = l, h
-
-        validated.append(bar)
-
-    return validated
-
-
-# ================================================================
-# 日期范围计算
-# ================================================================
-
-def _date_range_15m(last_bar_time: datetime | None) -> tuple[str, str]:
-    """15m 增量同步的日期范围。
-
-    有 last_bar → start_date = last_bar 所在交易日（从那天开始补）
-    无 last → start_date = 往前推 MAX_15M_DAYS 个工作日
-    end_date = 今天
-    """
-    end_date = datetime.now(TZ_CN).strftime("%Y-%m-%d")
-
-    if not last_bar_time:
-        start = prev_trading_day(n=MAX_15M_DAYS)
-    else:
-        # last_bar_time 可能是带时区的
-        if last_bar_time.tzinfo:
-            start = last_bar_time.astimezone(TZ_CN).strftime("%Y-%m-%d")
-        else:
-            start = last_bar_time.strftime("%Y-%m-%d")
-
-    return start, end_date
 
 
 # ================================================================
@@ -419,7 +363,7 @@ class BackfillSource:
 class BackfillDB:
     """全盘批量同步工具。
 
-    A 股:  coordinator.coordinate_market_kline(count=None, ...)
+    A 股 15m/1D: coordinator.coordinate_batch_quotes()
     基金/债: Dinger API
     """
 
@@ -449,8 +393,12 @@ class BackfillDB:
         try:
             if self.source.dinger_url:
                 written, failed = self._sync_via_api(tf)
+            elif tf == "15m":
+                written, failed = self._sync_15m(symbols)
+            elif tf == "1D":
+                written, failed = self._sync_1d(symbols)
             else:
-                written, failed = self._sync_via_coordinator(tf, symbols=symbols)
+                written, failed = 0, []
         except Exception as e:
             report = f"同步异常: {e}"
             logger.error(f"[同步] {self.source.name} tf={tf} {report}")
@@ -467,7 +415,6 @@ class BackfillDB:
             )
 
         if written == 0:
-            # 没写入数据 → 不记录 ok，下次还会重试
             report = "未获取到数据"
             logger.warning(f"[同步] {self.source.name} tf={tf} {report}")
             return {
@@ -475,8 +422,7 @@ class BackfillDB:
                 "written": 0, "status": "empty", "report": report,
             }
 
-        # 有实际写入 → 记录成功
-        latest_bar = _latest_available_bar_time()
+        latest_bar = _latest_finished_bar_time()
         report = f"写入 {written} 条"
         _record_update(self.source.name, tf, "ok", report,
                        last_bar_time=latest_bar)
@@ -487,20 +433,15 @@ class BackfillDB:
             "written": written, "status": "ok", "report": report,
         }
 
-    def _sync_via_coordinator(self, tf: str, symbols: list | None = None) -> tuple[int, list[str]]:
-        """A 股: 通过 coordinator 全市场批量同步。
+    # ── 15m 同步: batch_quotes + time 标准化 ──────────────────
 
-        关键: 区分"增量快照"和"历史回填"两种路径。
-          - 增量快照:
-            - 1D → 走 batch_quotes（1 HTTP，快，今日快照）
-            - 其他周期 → 走 market_kline（1 HTTP，每只 1 bar）
-          - 历史回填: count=None, start_date=过去日期 → 走并发 fetch_kline（N HTTP）
+    def _sync_15m(self, symbols: list | None = None) -> tuple[int, list[str]]:
+        """15m 同步: 调用 batch_quotes 下载行情快照，标准化 time 后写入 DB。
 
         返回: (写入条数, 失败symbols列表)
         """
         from app.data_sources.coordinator import get_coordinator
-        from app.data_sources.circuit_breaker import get_realtime_circuit_breaker
-        from app.data_sources.kline_clean import clean_klines
+        from app.data_sources.normalizer import strip_market_prefix
 
         if not symbols:
             from app.utils.basicinfo_db import get_stock_basic_db
@@ -510,118 +451,13 @@ class BackfillDB:
             return 0, []
 
         coord = get_coordinator()
-        cb = get_realtime_circuit_breaker()
 
-        doc = _get_last_update(self.source.name, tf)
-        last_bar_time = doc.get("last_bar_time") if doc else None
-        last_updated = doc.get("last_updated") if doc else None
+        logger.info(f"[同步] {self.source.name} tf=15m batch_quotes 开始，标的数={len(symbols)}")
 
-        is_incremental = self._is_incremental(tf, last_bar_time, last_updated)
-
-        if is_incremental:
-            # 增量快照模式
-            if tf == "1D":
-                # 1D 增量快照: 直接用 batch_quotes 下载今日快照（1 HTTP，快）
-                logger.info(f"[同步] {self.source.name} tf={tf} 增量快照模式 → batch_quotes")
-                return self._sync_1d_snapshot(coord, cb, symbols)
-            else:
-                # 其他周期: market_kline 增量快照
-                start_date = ""
-                end_date = ""
-                logger.info(f"[同步] {self.source.name} tf={tf} 增量快照模式 → market_kline")
-        else:
-            # 历史回填: count=None + start_date=回溯日期 → 并发逐只
-            ref_time = last_bar_time or last_updated
-            start_date, end_date = _date_range_15m(ref_time)
-            logger.info(
-                f"[同步] {self.source.name} tf={tf} "
-                f"历史回填模式 {start_date} ~ {end_date}"
-            )
-
-        result = coord.coordinate_market_kline(
-            cb=cb,
-            market=self.source.market,
-            timeframe=tf,
-            count=None,
-            start_date=start_date,
-            end_date=end_date,
-            timeout=1200,
-            symbols=symbols,
-        )
-
-        if not result:
-            logger.warning(f"[同步] {self.source.name} coordinator 返回空数据")
-            return 0, list(symbols)
-
-        logger.info(f"[同步] {self.source.name} tf={tf} 拉到 {len(result)} 只标的")
-
-        # 收集所有标的的数据，一次性批量写入
-        all_records = []
-        failed_symbols = []
-        for symbol, bars in result.items():
-            if not bars:
-                failed_symbols.append(symbol)
-                continue
-            cleaned = clean_klines(bars, tf)
-            if not cleaned:
-                failed_symbols.append(symbol)
-                continue
-            cleaned = _validate_bars(cleaned)
-            if not cleaned:
-                failed_symbols.append(symbol)
-                continue
-            for bar in cleaned:
-                all_records.append({
-                    "symbol": symbol,
-                    "timeframe": tf,
-                    "time": bar["time"],
-                    "open": bar["open"],
-                    "high": bar["high"],
-                    "low": bar["low"],
-                    "close": bar["close"],
-                    "volume": bar.get("volume", 0),
-                })
-
-        # coordinator 返回了但完全没数据的 symbol 也算失败
-        requested_set = set(symbols)
-        fetched_set = set(result.keys())
-        missing_from_source = list(requested_set - fetched_set)
-        failed_symbols.extend(missing_from_source)
-
-        if failed_symbols:
-            logger.warning(
-                f"[同步] {self.source.name} tf={tf} "
-                f"{len(failed_symbols)}/{len(symbols)} 只标的失败"
-            )
-
-        if not all_records:
-            return 0, failed_symbols
-
-        try:
-            r = self._writer.bulk_write(self.source.market, all_records)
-            total = r.get("inserted", 0) + r.get("skipped", 0)
-            logger.info(f"[同步] {self.source.name} tf={tf} 批量写入 {total} 条")
-            return total, failed_symbols
-        except Exception as e:
-            logger.error(f"[同步] {self.source.name} 批量写入失败: {e}")
-            return 0, list(symbols)
-
-    def _sync_1d_snapshot(self, coord, cb, symbols: list) -> tuple[int, list[str]]:
-        """1D 增量快照: 使用 batch_quotes 直接下载今日快照。
-
-        batch_quotes 返回的是实时行情数据（quote），需要转换为 K 线格式（bar）。
-        time 字段: 快照模式强制使用当日日期（不取 quote 中的 time）。
-
-        返回: (写入条数, 失败symbols列表)
-        """
-        from app.data_sources.normalizer import strip_market_prefix
-
-        # 获取今日快照
         quotes = coord.coordinate_batch_quotes(
             symbols=symbols,
-            cb=cb,
             market=self.source.market,
-            timeout=30.0,
+            timeout=float(_BATCH_TIMEOUT_15M),
         )
 
         if not quotes:
@@ -630,25 +466,20 @@ class BackfillDB:
 
         logger.info(f"[同步] {self.source.name} batch_quotes 拉到 {len(quotes)} 只标的")
 
-        # 最后交易日 17:00:00（北京时间）— datetime 对象，供 time 字段使用
+        # 确定当前 bar 的标准结束时间
         now_cn = datetime.now(TZ_CN)
-        today_str = now_cn.strftime("%Y-%m-%d")
-        if is_trading_day(today_str):
-            last_td_str = today_str
-        else:
-            last_td_str = prev_trading_day(today_str)
-        today_dt = datetime.strptime(last_td_str, "%Y-%m-%d").replace(hour=17, minute=0, second=0)
+        bar_time = _normalize_to_bar_time(now_cn)
+        if bar_time is None:
+            logger.info(f"[同步] {self.source.name} 当前时间 {now_cn:%H:%M} 不在交易时段，跳过")
+            return 0, []
 
-        # 转换为 K 线记录
         all_records = []
         failed_symbols = []
-        success_digits = set()  # 成功获取到的纯数字代码（用于去重统计）
+        success_digits = set()
 
         for symbol in symbols:
-            # 尝试从 quotes 中获取数据（symbol 可能是纯数字或带前缀）
             quote = quotes.get(symbol)
             if not quote:
-                # 尝试去前缀匹配
                 digits = strip_market_prefix(symbol)
                 quote = quotes.get(digits)
 
@@ -656,36 +487,25 @@ class BackfillDB:
                 failed_symbols.append(symbol)
                 continue
 
-            # 提取 OHLCV
             o = float(quote.get("open", 0) or 0)
             h = float(quote.get("high", 0) or 0)
             l = float(quote.get("low", 0) or 0)
             c = float(quote.get("last", 0) or quote.get("close", 0) or 0)
             v = float(quote.get("volume", 0) or 0)
 
-            # OHLC 全为 0 → 跳过
             if o == 0 and h == 0 and l == 0 and c == 0:
                 failed_symbols.append(symbol)
                 continue
-
-            # 极端负数/零价 → 跳过
             if c <= 0 or o <= 0:
                 failed_symbols.append(symbol)
                 continue
-
-            # high < low → 交换
             if h > 0 and l > 0 and h < l:
                 h, l = l, h
 
-            # time 字段: 快照模式强制使用当日日期
-            bar_time = today_dt
-
-            # 纯数字代码（去前缀）
             clean_symbol = strip_market_prefix(symbol)
-
             all_records.append({
                 "symbol": clean_symbol,
-                "timeframe": "1D",
+                "timeframe": "15m",
                 "time": bar_time,
                 "open": o,
                 "high": h,
@@ -695,20 +515,16 @@ class BackfillDB:
             })
             success_digits.add(clean_symbol)
 
-        # quotes 中有但 symbols 中没有的也算失败
-        # 注意: symbols 可能带前缀 (SH600519)，quotes.keys() 是纯数字 (600519)
-        # 需要统一为纯数字比较
+        # 统计缺失
         requested_digits = set(strip_market_prefix(s) for s in symbols)
         fetched_set = set(quotes.keys())
-        # 只统计既没成功也没在循环中加入 failed 的缺失标的
         missing_digits = requested_digits - fetched_set - success_digits
-        # 将缺失的纯数字代码转回原始 symbols
         digit_to_symbol = {strip_market_prefix(s): s for s in symbols}
         failed_symbols.extend(digit_to_symbol[d] for d in missing_digits if d in digit_to_symbol)
 
         if failed_symbols:
             logger.warning(
-                f"[同步] {self.source.name} 1D snapshot "
+                f"[同步] {self.source.name} 15m "
                 f"{len(failed_symbols)}/{len(symbols)} 只标的失败"
             )
 
@@ -718,33 +534,163 @@ class BackfillDB:
         try:
             r = self._writer.bulk_write(self.source.market, all_records)
             total = r.get("inserted", 0) + r.get("skipped", 0)
-            logger.info(f"[同步] {self.source.name} 1D snapshot 批量写入 {total} 条")
+            logger.info(f"[同步] {self.source.name} 15m 批量写入 {total} 条")
             return total, failed_symbols
         except Exception as e:
-            logger.error(f"[同步] {self.source.name} 1D snapshot 批量写入失败: {e}")
+            logger.error(f"[同步] {self.source.name} 15m 批量写入失败: {e}")
             return 0, list(symbols)
 
-    @staticmethod
-    def _is_incremental(tf: str, last_bar_time, last_updated) -> bool:
-        """判断应该走增量快照还是历史回填。
+    # ── 1D 同步: batch_quotes + 重试 + 去重 ──────────────────
 
-        增量快照: count=None, start_date="" → batch_quotes（1 HTTP，1 bar/只）
-        历史回填: count=None, start_date=过去日期 → 并发 fetch_kline（多 bar/只）
+    def _sync_1d(self, symbols: list | None = None) -> tuple[int, list[str]]:
+        """1D 同步: batch_quotes 下载日线快照，<90% 则重试（最多 5 次），两次比对去重。
 
-        首次（无记录）→ False，走历史回填补齐数据
-        有记录且同交易日 → True，只拿最新 bar
-        有记录但跨交易日 → False，走历史回填补齐当天数据
+        返回: (写入条数, 失败symbols列表)
         """
-        ref_time = last_bar_time or last_updated
-        if not ref_time:
-            return False  # 首次 → 历史回填
+        from app.data_sources.coordinator import get_coordinator
+        from app.data_sources.normalizer import strip_market_prefix
 
-        now = datetime.now(TZ_CN)
-        if _same_trading_day(ref_time, now):
-            return True   # 同交易日 → 增量快照（只要最新 bar）
+        if not symbols:
+            from app.utils.basicinfo_db import get_stock_basic_db
+            symbols = get_stock_basic_db().market_all_codes(status="active")
+        if not symbols:
+            logger.warning(f"[同步] {self.source.name} 获取股票列表失败")
+            return 0, []
 
-        # 跨交易日 → 历史回填（需要补齐当天从开盘到现在的 bar）
-        return False
+        coord = get_coordinator()
+
+        # 日线 bar 时间: 当日 17:00:00 (北京时间)
+        now_cn = datetime.now(TZ_CN)
+        today_str = now_cn.strftime("%Y-%m-%d")
+        if is_trading_day(today_str):
+            last_td_str = today_str
+        else:
+            last_td_str = prev_trading_day(today_str)
+        bar_time = datetime.strptime(last_td_str, "%Y-%m-%d").replace(
+            hour=17, minute=0, second=0, tzinfo=TZ_CN
+        )
+
+        total_symbols = len(symbols)
+        threshold = int(total_symbols * _1D_MIN_RATIO)
+
+        # 收集所有成功记录（跨重试去重）
+        all_records_map: dict[str, dict] = {}  # symbol → record
+
+        for attempt in range(1 + _1D_MAX_RETRIES):
+            # 第一次 + 最多重试 5 次 = 最多 6 次调用
+            is_retry = attempt > 0
+            label = f"第 {attempt + 1} 次" if attempt == 0 else f"重试 {attempt}/{_1D_MAX_RETRIES}"
+
+            logger.info(
+                f"[同步] {self.source.name} 1D {label} batch_quotes 开始，"
+                f"标的数={total_symbols}"
+            )
+
+            quotes = coord.coordinate_batch_quotes(
+                symbols=symbols,
+                market=self.source.market,
+                timeout=float(_BATCH_TIMEOUT_1D),
+            )
+
+            if not quotes:
+                logger.warning(f"[同步] {self.source.name} 1D {label} batch_quotes 返回空数据")
+                if attempt >= _1D_MAX_RETRIES:
+                    break
+                continue
+
+            logger.info(f"[同步] {self.source.name} 1D {label} 拉到 {len(quotes)} 只标的")
+
+            # 转换本次结果
+            batch_records: dict[str, dict] = {}
+            batch_failed: list[str] = []
+
+            for symbol in symbols:
+                quote = quotes.get(symbol)
+                if not quote:
+                    digits = strip_market_prefix(symbol)
+                    quote = quotes.get(digits)
+                if not quote:
+                    batch_failed.append(symbol)
+                    continue
+
+                o = float(quote.get("open", 0) or 0)
+                h = float(quote.get("high", 0) or 0)
+                l = float(quote.get("low", 0) or 0)
+                c = float(quote.get("last", 0) or quote.get("close", 0) or 0)
+                v = float(quote.get("volume", 0) or 0)
+
+                if o == 0 and h == 0 and l == 0 and c == 0:
+                    batch_failed.append(symbol)
+                    continue
+                if c <= 0 or o <= 0:
+                    batch_failed.append(symbol)
+                    continue
+                if h > 0 and l > 0 and h < l:
+                    h, l = l, h
+
+                clean_symbol = strip_market_prefix(symbol)
+                record = {
+                    "symbol": clean_symbol,
+                    "timeframe": "1D",
+                    "time": bar_time,
+                    "open": o,
+                    "high": h,
+                    "low": l,
+                    "close": c,
+                    "volume": v,
+                }
+                batch_records[clean_symbol] = record
+
+            # 合并到总记录（去重: 同一 symbol 取最新一次）
+            all_records_map.update(batch_records)
+
+            success_count = len(all_records_map)
+            ratio = success_count / total_symbols if total_symbols else 0
+            logger.info(
+                f"[同步] {self.source.name} 1D {label} "
+                f"本次 {len(batch_records)}，累计去重 {success_count}/{total_symbols} "
+                f"({ratio:.1%})"
+            )
+
+            # 达到 90% → 不再重试
+            if success_count >= threshold:
+                logger.info(f"[同步] {self.source.name} 1D 已达 {ratio:.1%} ≥ {_1D_MIN_RATIO:.0%}，停止重试")
+                break
+
+            # 还没到最后一次 → 继续重试
+            if attempt < _1D_MAX_RETRIES:
+                logger.info(
+                    f"[同步] {self.source.name} 1D {ratio:.1%} < {_1D_MIN_RATIO:.0%}，"
+                    f"准备重试 ({attempt + 1}/{_1D_MAX_RETRIES})"
+                )
+                time.sleep(5)  # 等待 5s 后重试，给数据源恢复时间
+
+        # 最终统计
+        all_records = list(all_records_map.values())
+        if not all_records:
+            logger.warning(f"[同步] {self.source.name} 1D 所有尝试均无数据")
+            return 0, list(symbols)
+
+        final_count = len(all_records)
+        final_ratio = final_count / total_symbols if total_symbols else 0
+        failed_symbols = [s for s in symbols if strip_market_prefix(s) not in all_records_map]
+
+        logger.info(
+            f"[同步] {self.source.name} 1D 最终 "
+            f"{final_count}/{total_symbols} ({final_ratio:.1%})，"
+            f"失败 {len(failed_symbols)} 只"
+        )
+
+        try:
+            r = self._writer.bulk_write(self.source.market, all_records)
+            total = r.get("inserted", 0) + r.get("skipped", 0)
+            logger.info(f"[同步] {self.source.name} 1D 批量写入 {total} 条")
+            return total, failed_symbols
+        except Exception as e:
+            logger.error(f"[同步] {self.source.name} 1D 批量写入失败: {e}")
+            return 0, list(symbols)
+
+    # ── Dinger API (基金/债) ────────────────────────────────
 
     def _sync_via_api(self, tf: str) -> tuple[int, list[str]]:
         """基金/债: 通过 Dinger API 拉取并写入。返回 (写入条数, 失败symbols列表)。"""
@@ -765,16 +711,14 @@ class BackfillDB:
         if not items or not isinstance(items, list):
             return 0, []
 
-        # 按 symbol 分组
         ts_field = "navDate" if "fund" in self.source.name else "date"
-        by_symbol = {}
+        by_symbol: dict[str, list] = {}
         for item in items:
             sym = item.get("symbol", "")
             if not sym:
                 continue
             by_symbol.setdefault(sym, []).append(item)
 
-        # 收集所有数据，一次性批量写入
         all_records = []
         for symbol, records in by_symbol.items():
             for rec in records:
@@ -851,7 +795,7 @@ def _should_run_generic(tf: str) -> tuple[bool, str]:
         return True, "首次同步"
     status = doc.get("status", "")
     if status in ("error", "partial"):
-        return True, f"上次失败，重试"
+        return True, "上次失败，重试"
     last = doc.get("last_updated")
     if last and not _same_trading_day(last, datetime.now(TZ_CN)):
         return True, "跨交易日"
@@ -862,13 +806,11 @@ def _should_run_generic(tf: str) -> tuple[bool, str]:
 # 触发式后台同步 — 保证唯一 + 自动结束
 # ================================================================
 #
-# 工作模式（你提的方案）:
+# 工作模式:
 #   1. cn_stock 调用 trigger_sync() → 新建线程
 #   2. 同一时间只允许一个线程运行（_sync_running 原子锁）
 #   3. 线程执行完所有同步逻辑后自动退出
 #   4. 下次 cn_stock 调用时再触发新线程
-#
-# 不是常驻 daemon，没有轮询循环，用完即走。
 #
 
 _sync_running = threading.Lock()
@@ -901,19 +843,24 @@ def _sync_worker():
 def _run_all_sync():
     """执行所有需要的同步任务。
 
-    调度优先级（每个任务内部自行判断）:
-      1. 查 cn_last_update → 没记录就直接干（首次回填）
-      2. 有记录 → 看是不是盘中
-      3. 盘中 → 看是不是到了 bar 完成时间点
+    调度逻辑:
+      1. 非交易日 → 全部跳过
+      2. 15m → 按 bar 触发时间点判断
+      3. 1D → 17:00 后执行，含重试
+      4. 基金/债 → 17:00 后执行
     """
     now = datetime.now(TZ_CN)
+    today_str = now.strftime("%Y-%m-%d")
+
+    # 非交易日不跑
+    if not is_trading_day(today_str):
+        logger.info("[后台同步] 非交易日，跳过全部同步")
+        return
 
     # ── 15m 同步 ──
     if not ENABLE_15M:
         logger.info("[后台同步] 15m 已关闭 (ENABLE_15M=False)，跳过")
     else:
-        # _should_run_15m() 内部已包含完整判断链:
-        #   查表 → 首次/失败直接干 → 跨交易日直接干 → 盘中按 bar 时间点判断
         try:
             result = stock_daily_k.run_once("15m")
             if result.get("written", 0) > 0:
@@ -925,7 +872,6 @@ def _run_all_sync():
     if not ENABLE_1D:
         logger.info("[后台同步] 1D 已关闭 (ENABLE_1D=False)，跳过")
     else:
-        # _should_run_1d() 内部已包含完整判断: 首次立即干，之后 17:00 后每交易日一次
         try:
             result = stock_daily_k.run_once("1D")
             if result.get("written", 0) > 0:
@@ -935,15 +881,13 @@ def _run_all_sync():
 
     # fund + bond (Dinger API) — 只在 17:00 后跑
     if now.time() >= dt_time(17, 0):
-        from app.utils.trading_calendar import is_trading_day_today
-        if is_trading_day_today():
-            for src in (fund_nav_daily, bond_daily_k):
-                try:
-                    result = src.run_once("1D")
-                    if result.get("written", 0) > 0:
-                        logger.info(f"[后台同步] 1D {src.source.name}: {result.get('written')} 条")
-                except Exception as e:
-                    logger.error(f"[后台同步] 1D {src.source.name} 异常: {e}")
+        for src in (fund_nav_daily, bond_daily_k):
+            try:
+                result = src.run_once("1D")
+                if result.get("written", 0) > 0:
+                    logger.info(f"[后台同步] 1D {src.source.name}: {result.get('written')} 条")
+            except Exception as e:
+                logger.error(f"[后台同步] 1D {src.source.name} 异常: {e}")
 
 
 # ================================================================
@@ -952,7 +896,6 @@ def _run_all_sync():
 
 def run_once(tf: str | None = None, symbols: list | None = None) -> list[dict]:
     """全盘同步入口 — 三个数据源依次执行。"""
-    # 开关守卫: 跳过已关闭的周期
     if tf == "15m" and not ENABLE_15M:
         logger.info("[全盘同步] 15m 已关闭 (ENABLE_15M=False)，跳过")
         return [{"source": s.source.name, "tf": "15m", "written": 0,

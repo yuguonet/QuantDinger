@@ -196,36 +196,6 @@ atexit.register(_timeout_pool.shutdown, wait=False)
 
 
 # ================================================================
-# 输入标准化 — 统一的 symbols 去重+加前缀
-# ================================================================
-
-def _normalize_symbols(symbols, market: str) -> List[str]:
-    """
-    输入标准化: 给 symbols 加市场前缀 + 去重（保序）。
-
-    Args:
-        symbols: 股票代码列表或逗号分隔字符串
-        market:  市场名称（"CNStock" / "HKStock" / ...）
-
-    Returns:
-        去重后的带前缀代码列表（如 ["SH600519", "SZ000001"]）
-    """
-    from app.data_sources.normalizer import add_market_prefix
-
-    if isinstance(symbols, str):
-        symbols = [s.strip() for s in symbols.split(',') if s.strip()]
-
-    seen: set = set()
-    result: List[str] = []
-    for s in symbols:
-        ns = add_market_prefix(s, market)
-        if ns and ns not in seen:
-            seen.add(ns)
-            result.append(ns)
-    return result
-
-
-# ================================================================
 # Provider 适配器 — 统一接口签名
 # ================================================================
 #
@@ -293,6 +263,7 @@ def _make_provider_quote_fn(provider) -> Callable:
 def _discover_sources(
     market: str,
     timeframe: str,
+    cb: CircuitBreaker,
     preferred_source: str = "",
     capability: str = "kline",
     adj: str = "qfq",
@@ -306,13 +277,14 @@ def _discover_sources(
 
     流程:
       1. 调用 Provider 层的 get_providers() → 按 priority 排序的 Provider 列表
-      2. 过滤掉已熔断的源（_realtime_cb.is_available）
+      2. 过滤掉已熔断的源（cb.is_available）
       3. 用适配器把 Provider 的 fetch 方法转成 Coordinator 的 fetch_fn
       4. 如果指定了 preferred_source，将其排到第一位
 
     Args:
         market:    市场名称（"CNStock" / "HKStock" / "USStock" / ...）
         timeframe: K线周期（"1D" / "5m" / ...）。capability="quote" 时可为空。
+        cb:        熔断器实例
         preferred_source: 指定的首选源名称（如 "tencent"）
         capability: 能力类型
           - "kline"  → 获取K线数据（默认）
@@ -353,7 +325,7 @@ def _discover_sources(
 
     for p in providers:
         # 熔断检查 — 跳过已熔断的源（skip_cb_filter=True 时跳过此检查）
-        if not skip_cb_filter and not _realtime_cb.is_available(p.name):
+        if not skip_cb_filter and not cb.is_available(p.name):
             logger.debug("[协助层] Provider %s 已熔断，跳过", p.name)
             continue
 
@@ -435,6 +407,29 @@ class _WorkQueue:
                     return None
             self._pending += 1
             return self._items.pop(0)
+
+    def get_batch(self, batch_size: int) -> List[str]:
+        """批量取任务（用于 get_kline_batch 等批量场景）"""
+        with self._cond:
+            actual = min(batch_size, len(self._items))
+            if actual <= 0:
+                return []
+            batch = self._items[:actual]
+            del self._items[:actual]
+            self._pending += len(batch)
+            return batch
+
+    def batch_task_done(self, count: int):
+        """
+        批量标记任务完成 — 配合 get_batch() 使用。
+
+        当通过 get_batch() 一次取出 N 个任务时，处理完成后
+        需要调用 batch_task_done(N) 来正确递减 pending 计数。
+        """
+        with self._cond:
+            self._pending = max(0, self._pending - count)
+            if not self._items and self._pending == 0:
+                self._cond.notify_all()
 
     def put_back(self, sym: str):
         """
@@ -526,6 +521,7 @@ class Coordinator:
         symbols: List[str],
         timeframe: str,
         limit: int,
+        cb: CircuitBreaker,
         market: str = "",
         timeout: float = 15.0,
         preferred_source: str = "",
@@ -546,6 +542,7 @@ class Coordinator:
             symbols:   股票代码列表（1 只或多只均可）
             timeframe: K 线周期（"1D" / "5m" / "1H" / ...）
             limit:     K 线条数
+            cb:        熔断器
             market:    市场名称（"CNStock" / "HKStock"），用于自动发现源
             timeout:   总超时（秒），超时后未完成的 symbol 记为失败
             preferred_source: 指定首选源（如 "tencent"），优先使用，失败后回退
@@ -569,13 +566,13 @@ class Coordinator:
             source_map = {name: fn for name, fn in sources}
             if preferred_source and preferred_source in source_map:
                 available = self._get_preferred_available(
-                    preferred_source, market, source_map
+                    preferred_source, market, source_map, cb
                 )
             else:
-                available = self._get_available_sources(market, source_map)
+                available = self._get_available_sources(market, source_map, cb)
         else:
             # 自动发现模式 — 从 Provider 层获取源
-            discovered = _discover_sources(market, timeframe, preferred_source, adj=adj)
+            discovered = _discover_sources(market, timeframe, cb, preferred_source, adj=adj)
             if not discovered:
                 logger.warning("[协助层] 市场 %s 无可用源", market)
                 return {}, list(symbols)
@@ -715,7 +712,7 @@ class Coordinator:
 
                 if bars:
                     # 成功
-                    _realtime_cb.record_success(source_name)       # 通知熔断器
+                    cb.record_success(source_name)       # 通知熔断器
                     cfg.record(True, elapsed)            # 记录统计
                     is_first = _mark_success(sym, bars, source_name)
                     _reset_consecutive_fails(source_name)
@@ -724,7 +721,7 @@ class Coordinator:
                     return True
                 else:
                     # 失败（返回了空结果）
-                    _realtime_cb.record_failure(source_name, "empty")
+                    cb.record_failure(source_name, "empty")
                     cfg.record(False, elapsed)
                     _inc_consecutive_fails(source_name)
                     _mark_failed(sym, source_name)       # 可能放回队列
@@ -732,7 +729,7 @@ class Coordinator:
             except Exception as e:
                 # 失败（抛了异常）
                 elapsed = time.time() - start_time
-                _realtime_cb.record_failure(source_name, str(e))
+                cb.record_failure(source_name, str(e))
                 cfg.record(False, elapsed)
                 logger.debug("[协助层] %s 获取 %s 失败: %s", source_name, sym, e)
                 _inc_consecutive_fails(source_name)
@@ -746,13 +743,13 @@ class Coordinator:
             不断从队列取 symbol → 获取数据 → 成功/失败处理，直到:
               - 队列为空（get() 返回 None）
               - 连续失败过多（>= MAX_SOURCE_FAILS）
-              - 源被熔断（_realtime_cb.is_available 返回 False）
+              - 源被熔断（cb.is_available 返回 False）
             """
             while True:
                 # 检查是否应该退出
                 if _get_consecutive_fails(source_name) >= MAX_SOURCE_FAILS:
                     break
-                if not _realtime_cb.is_available(source_name):
+                if not cb.is_available(source_name):
                     break
 
                 # 从队列取下一个 symbol
@@ -824,10 +821,15 @@ class Coordinator:
     #   记住上次成功的源，下次直接命中，省去轮询开销。
     #
 
+    # 记忆源状态（ticker 批量专用，跨调用持久，无 TTL）
+    _ticker_sticky_source: str = ""
+    _ticker_sticky_lock = threading.Lock()
+
     def coordinate_ticker(
         self,
         symbols,
         sources: Optional[List[Tuple[str, Callable]]] = None,
+        cb: CircuitBreaker = None,
         timeout: float = 8.0,
         preferred_source: str = "",
         market: str = "",
@@ -849,6 +851,7 @@ class Coordinator:
             symbols: 股票代码，str 或 List[str]。str 可含逗号（自动拆分）。
             sources: [(name, fetch_fn), ...]。为 None 时自动发现。
                      fetch_fn 签名: fetch_fn(symbol) -> Dict | None
+            cb:      熔断器
             timeout: 超时（秒）
             preferred_source: 指定首选源。如果可用，优先使用。
             market:  市场名称（"CNStock"），用于自动发现源
@@ -871,6 +874,7 @@ class Coordinator:
             result = self._ticker_race(
                 symbol=sym_list[0],
                 sources=sources,
+                cb=cb,
                 timeout=timeout,
                 preferred_source=preferred_source,
                 market=market,
@@ -883,12 +887,14 @@ class Coordinator:
                 symbols=sym_list,
                 market=market,
                 timeout=timeout,
+                cb=cb,
             )
 
     def _ticker_race(
         self,
         symbol: str,
         sources: Optional[List[Tuple[str, Callable]]],
+        cb: CircuitBreaker,
         timeout: float,
         preferred_source: str,
         market: str,
@@ -903,20 +909,24 @@ class Coordinator:
         Returns:
             第一个成功获取到的有效 Dict，全部失败返回 None。
         """
+        if cb is None:
+            cb = _realtime_cb
+
         # ── 获取可用源 ──
         if sources is not None:
             if not sources:
                 return None
             if preferred_source:
-                preferred = [(n, fn) for n, fn in sources if n == preferred_source and _realtime_cb.is_available(n)]
-                others = [(n, fn) for n, fn in sources if n != preferred_source and _realtime_cb.is_available(n)]
+                preferred = [(n, fn) for n, fn in sources if n == preferred_source and cb.is_available(n)]
+                others = [(n, fn) for n, fn in sources if n != preferred_source and cb.is_available(n)]
                 available = preferred + others
             else:
-                available = [(name, fn) for name, fn in sources if _realtime_cb.is_available(name)]
+                available = [(name, fn) for name, fn in sources if cb.is_available(name)]
         else:
             discovered = _discover_sources(
                 market=market,
                 timeframe="",
+                cb=cb,
                 preferred_source=preferred_source,
                 capability="quote",
                 skip_cb_filter=True,
@@ -941,7 +951,7 @@ class Coordinator:
         def _race_one(source_name: str, fetch_fn: Callable):
             if done_event.is_set():
                 return
-            if not _realtime_cb.is_available(source_name):
+            if not cb.is_available(source_name):
                 return
             try:
                 start = time.time()
@@ -949,7 +959,7 @@ class Coordinator:
                 elapsed = time.time() - start
 
                 if result and ("last" in result or "price" in result):
-                    _realtime_cb.record_success(source_name)
+                    cb.record_success(source_name)
                     cfg = get_source_config(source_name)
                     cfg.record(True, elapsed)
                     with lock:
@@ -957,11 +967,11 @@ class Coordinator:
                             result_holder.append((source_name, result))
                             done_event.set()
                 else:
-                    _realtime_cb.record_failure(source_name, "empty")
+                    cb.record_failure(source_name, "empty")
                     cfg = get_source_config(source_name)
                     cfg.record(False, elapsed)
             except Exception as e:
-                _realtime_cb.record_failure(source_name, str(e))
+                cb.record_failure(source_name, str(e))
                 cfg = get_source_config(source_name)
                 cfg.record(False, 0)
                 logger.debug("[协助层] ticker %s %s 失败: %s", source_name, symbol, e)
@@ -985,15 +995,111 @@ class Coordinator:
         symbols: List[str],
         market: str,
         timeout: float,
+        cb: CircuitBreaker,
     ) -> Dict[str, Any]:
         """
-        批量行情 — 记忆源优先 + 熔断过滤。
+        批量行情 — 记忆源优先，独立调度（不调用 coordinate_batch_quotes_sticky）。
 
-        委托给 coordinate_batch_quotes_sticky（skip_cb_filter=False）。
+        调度逻辑:
+          1. 有记忆源 → 直调 fetch_batch_quotes → 成功直接返回
+          2. 记忆源失败或无记忆 → 按 priority 轮询所有可用 Provider
+          3. 某 Provider 成功 → 记住它，下次直接命中
+          4. 全部失败 → 清除记忆，下次重新轮询
+
+        Args:
+            symbols: 股票代码列表（纯数字或带前缀均可）
+            market:  市场名称（"CNStock" / ...）
+            timeout: 单次 fetch 超时（秒）
+            cb:      熔断器
+
+        Returns:
+            {symbol: quote_dict} — 仅包含成功获取到的 symbol。
         """
-        return self.coordinate_batch_quotes_sticky(
-            symbols=symbols, market=market, timeout=timeout, skip_cb_filter=False,
-        )
+        from app.data_sources.provider import get_providers
+        from app.data_sources.normalizer import add_market_prefix, strip_market_prefix
+
+        if cb is None:
+            cb = _realtime_cb
+
+        # 输入标准化: 加市场前缀
+        seen: set = set()
+        prefixed: List[str] = []
+        for s in symbols:
+            ns = add_market_prefix(s, market)
+            if ns and ns not in seen:
+                seen.add(ns)
+                prefixed.append(ns)
+        if not prefixed:
+            return {}
+
+        # 获取支持 batch_quote 的 Provider（已按 priority 排序）
+        providers = get_providers(capability="batch_quote", market=market)
+        if not providers:
+            logger.warning("[协助层] ticker_batch market=%s 无可用 Provider", market)
+            return {}
+
+        # 确定尝试顺序: 记忆源排第一
+        with Coordinator._ticker_sticky_lock:
+            sticky = Coordinator._ticker_sticky_source
+
+        ordered = []
+        if sticky:
+            sticky_p = [p for p in providers if p.name == sticky]
+            others = [p for p in providers if p.name != sticky]
+            ordered = sticky_p + others
+        else:
+            ordered = list(providers)
+
+        # 过滤已熔断的源
+        available = [p for p in ordered if cb.is_available(p.name)]
+        if not available:
+            logger.warning("[协助层] ticker_batch market=%s 所有源已熔断", market)
+            return {}
+
+        # 逐源尝试
+        for provider in available:
+            try:
+                result = provider.fetch_batch_quotes(prefixed, timeout=int(timeout))
+            except Exception as e:
+                logger.debug("[协助层] ticker_batch %s 异常: %s", provider.name, e)
+                continue
+
+            if not result:
+                continue
+
+            # 成功 — 记住这个源
+            with Coordinator._ticker_sticky_lock:
+                Coordinator._ticker_sticky_source = provider.name
+
+            if sticky and provider.name != sticky:
+                logger.info("[协助层] ticker_batch 记忆源 %s 失效，切换到 %s (%d只)",
+                            sticky, provider.name, len(result))
+            elif not sticky:
+                logger.info("[协助层] ticker_batch 命中 %s (%d只)", provider.name, len(result))
+
+            # 标准化输出: key 去前缀 → 纯数字
+            normalized: Dict[str, Dict[str, Any]] = {}
+            for k, v in result.items():
+                if not isinstance(v, dict):
+                    continue
+                digits = strip_market_prefix(k)
+                v["symbol"] = digits
+                raw_name = v.get("name", "")
+                if raw_name and strip_market_prefix(raw_name) == digits:
+                    v["name"] = ""
+                normalized[digits] = v
+
+            return normalized
+
+        # 全部失败 — 清除记忆
+        with Coordinator._ticker_sticky_lock:
+            if Coordinator._ticker_sticky_source:
+                logger.warning("[协助层] ticker_batch 记忆源 %s 及所有备选均失败，清除记忆",
+                               Coordinator._ticker_sticky_source)
+                Coordinator._ticker_sticky_source = ""
+
+        logger.warning("[协助层] ticker_batch 所有 Provider 均失败 (%d只)", len(prefixed))
+        return {}
 
     # ================================================================
     # 模式 C: 批量行情 — 优先走 fetch_batch_quotes
@@ -1041,6 +1147,7 @@ class Coordinator:
     def coordinate_batch_quotes(
         self,
         symbols: List[str],
+        cb: CircuitBreaker,
         market: str = "",
         timeout: float = 15.0,
         preferred_source: str = "",
@@ -1058,6 +1165,7 @@ class Coordinator:
 
         Args:
             symbols: 股票代码列表（纯数字或带前缀均可）
+            cb:      熔断器
             market:  市场名称（"CNStock" / "HKStock" / ...）
             timeout: 超时（秒）
             preferred_source: 指定首选源（如 "tencent"），优先尝试
@@ -1069,11 +1177,16 @@ class Coordinator:
             return {}
 
         from app.data_sources.provider import get_providers
+        from app.data_sources.normalizer import add_market_prefix
 
-        # ── 输入标准化 ──
-        normalized_symbols = _normalize_symbols(symbols, market)
-        if not normalized_symbols:
-            return {}
+        # ── 输入标准化: 统一加前缀 (SH600519 / SZ000001) ──
+        seen: set = set()
+        normalized_symbols: List[str] = []
+        for s in symbols:
+            ns = add_market_prefix(s, market)
+            if ns and ns not in seen:
+                seen.add(ns)
+                normalized_symbols.append(ns)
 
         # 发现支持 batch_quote 的源
         providers = get_providers(capability="batch_quote", market=market)
@@ -1088,16 +1201,16 @@ class Coordinator:
             providers = preferred + others
 
         # 过滤已熔断的源
-        available = [p for p in providers if _realtime_cb.is_available(p.name)]
+        available = [p for p in providers if cb.is_available(p.name)]
         if not available:
             logger.warning("[协助层] batch_quotes market=%s 所有源已熔断", market)
             return {}
 
         # ── 调度获取 ──
         if len(normalized_symbols) <= self._RACE_BATCH_THRESHOLD:
-            raw = self._batch_quotes_race(normalized_symbols, available, timeout)
+            raw = self._batch_quotes_race(normalized_symbols, available, cb, timeout)
         else:
-            raw = self._batch_quotes_dispatch(normalized_symbols, available, timeout)
+            raw = self._batch_quotes_dispatch(normalized_symbols, available, cb, timeout)
 
         # ── 输出标准化: key 去前缀，name/symbol 统一 ──
         return self._normalize_batch_quotes_result(raw)
@@ -1108,6 +1221,7 @@ class Coordinator:
         self,
         symbols: List[str],
         available: list,
+        cb: CircuitBreaker,
         timeout: float,
     ) -> Dict[str, Dict[str, Any]]:
         """
@@ -1123,7 +1237,7 @@ class Coordinator:
             nonlocal winner, winner_name
             if done_event.is_set():
                 return
-            if not _realtime_cb.is_available(provider.name):
+            if not cb.is_available(provider.name):
                 return
             cfg = get_source_config(provider.name)
             start = time.time()
@@ -1135,18 +1249,18 @@ class Coordinator:
                         if not done_event.is_set():
                             winner = result
                             winner_name = provider.name
-                            _realtime_cb.record_success(provider.name)
+                            cb.record_success(provider.name)
                             cfg.record(True, elapsed)
                             done_event.set()
                             logger.info("[协助层] batch_quotes RACE %d只 命中 %s (%.2fs)",
                                         len(result), provider.name, elapsed)
                 elif not result:
                     cfg.record(False, elapsed)
-                    _realtime_cb.record_failure(provider.name, "empty")
+                    cb.record_failure(provider.name, "empty")
             except Exception as e:
                 elapsed = time.time() - start
                 cfg.record(False, elapsed)
-                _realtime_cb.record_failure(provider.name, str(e))
+                cb.record_failure(provider.name, str(e))
                 logger.debug("[协助层] batch_quotes RACE %s 失败: %s", provider.name, e)
 
         with concurrent.futures.ThreadPoolExecutor(
@@ -1178,7 +1292,7 @@ class Coordinator:
         )
 
         # 从剩余可用源逐个补充缺失 symbols
-        remaining = [p for p in available if p.name != winner_name and _realtime_cb.is_available(p.name)]
+        remaining = [p for p in available if p.name != winner_name and cb.is_available(p.name)]
         for provider in remaining:
             if not missing_digits:
                 break
@@ -1192,7 +1306,7 @@ class Coordinator:
                         if digits in missing_digits:
                             winner[k] = v
                             missing_digits.discard(digits)
-                    _realtime_cb.record_success(provider.name)
+                    cb.record_success(provider.name)
                     logger.info(
                         "[协助层] batch_quotes 补充 %s 命中 %d 只，剩余 %d 只",
                         provider.name, len(result), len(missing_digits),
@@ -1214,6 +1328,7 @@ class Coordinator:
         self,
         symbols: List[str],
         available: list,
+        cb: CircuitBreaker,
         timeout: float,
     ) -> Dict[str, Dict[str, Any]]:
         """
@@ -1466,6 +1581,7 @@ class Coordinator:
 
     def coordinate_market_kline(
         self,
+        cb: CircuitBreaker,
         market: str = "",
         timeframe: str = "1D",
         count: int = 120,
@@ -1491,6 +1607,7 @@ class Coordinator:
         每个 Provider 内部自行决定并发策略和获取方式。
 
         Args:
+            cb:      熔断器
             market:  市场名称（"CNStock" / "HKStock" / ...）
             timeframe: K线周期（"1D" / "5m" / ...）
             count:   每只股票的数据条数
@@ -1516,7 +1633,7 @@ class Coordinator:
         # 过滤掉已熔断的源和死源
         available_providers = []
         for p in providers:
-            if not _realtime_cb.is_available(p.name):
+            if not cb.is_available(p.name):
                 logger.debug("[协助层] market_kline %s 已熔断，跳过", p.name)
                 continue
             if self._is_source_dead(p.name):
@@ -1559,8 +1676,15 @@ class Coordinator:
             logger.warning("[协助层] market_kline 获取股票列表失败")
             return {}
 
-        # ── 输入标准化 ──
-        all_codes = _normalize_symbols(symbols, market)
+        # ── 输入标准化: 统一加前缀，Provider 需要带前缀的代码 ──
+        from app.data_sources.normalizer import add_market_prefix
+        seen_codes: set = set()
+        all_codes: List[str] = []
+        for s in symbols:
+            ns = add_market_prefix(s, market)
+            if ns and ns not in seen_codes:
+                seen_codes.add(ns)
+                all_codes.append(ns)
         if not all_codes:
             logger.warning("[协助层] market_kline 标准化后无有效代码")
             return {}
@@ -1737,7 +1861,7 @@ class Coordinator:
                             pending_groups -= 1
                         with stats_lock:
                             source_stats[name]["ok"] += len(group_result)
-                        _realtime_cb.record_success(name)
+                        cb.record_success(name)
                         self._mark_source_alive(name)
                         provider_consecutive_timeout[name] = 0
                         logger.debug("[Dispatcher] %s 组%d 完成: %d只 (%.1fs)",
@@ -1764,7 +1888,7 @@ class Coordinator:
                         provider_consecutive_timeout[name] += 1
                         with stats_lock:
                             source_stats[name]["timeout"] += 1
-                        _realtime_cb.record_failure(name, "timeout")
+                        cb.record_failure(name, "timeout")
 
                         # 判断是否重试: 队列充裕 + 未超重试上限
                         queued = task_queue.qsize()
@@ -1814,7 +1938,7 @@ class Coordinator:
                             pending_groups -= 1
                         with stats_lock:
                             source_stats[name]["fail"] += 1
-                        _realtime_cb.record_failure(name, "empty")
+                        cb.record_failure(name, "empty")
 
                     # 完成/失败后立刻派下一组
                     _submit_next(name)
@@ -1884,7 +2008,6 @@ class Coordinator:
         symbols: List[str],
         market: str = "",
         timeout: float = 10.0,
-        skip_cb_filter: bool = False,
     ) -> Dict[str, Dict[str, Any]]:
         """
         批量行情 — 记忆源优先，直调 Provider.fetch_batch_quotes。
@@ -1905,19 +2028,24 @@ class Coordinator:
             symbols: 股票代码列表（纯数字或带前缀均可）
             market:  市场名称（"CNStock" / ...）
             timeout: 单次 fetch 超时（秒）
-            skip_cb_filter: True 时跳过熔断器过滤（默认 False）
 
         Returns:
             {纯数字代码: quote_dict}
         """
         from app.data_sources.provider import get_providers
-        from app.data_sources.normalizer import strip_market_prefix
+        from app.data_sources.normalizer import add_market_prefix, strip_market_prefix
 
         if not symbols:
             return {}
 
-        # 输入标准化
-        prefixed = _normalize_symbols(symbols, market)
+        # 输入标准化: 加市场前缀
+        seen: set = set()
+        prefixed: List[str] = []
+        for s in symbols:
+            ns = add_market_prefix(s, market)
+            if ns and ns not in seen:
+                seen.add(ns)
+                prefixed.append(ns)
         if not prefixed:
             return {}
 
@@ -1938,13 +2066,6 @@ class Coordinator:
             ordered = sticky_p + others
         else:
             ordered = list(providers)
-
-        # 熔断过滤
-        if not skip_cb_filter:
-            ordered = [p for p in ordered if _realtime_cb.is_available(p.name)]
-            if not ordered:
-                logger.warning("[记忆行情] market=%s 所有源已熔断", market)
-                return {}
 
         # 逐源尝试
         for provider in ordered:
@@ -1967,10 +2088,21 @@ class Coordinator:
             elif not sticky:
                 logger.info("[记忆行情] 命中 %s (%d只)", provider.name, len(result))
 
-            # 标准化输出
-            return self._normalize_batch_quotes_result(result)
+            # 标准化输出: key 去前缀 → 纯数字
+            normalized: Dict[str, Dict[str, Any]] = {}
+            for k, v in result.items():
+                if not isinstance(v, dict):
+                    continue
+                digits = strip_market_prefix(k)
+                v["symbol"] = digits
+                raw_name = v.get("name", "")
+                if raw_name and strip_market_prefix(raw_name) == digits:
+                    v["name"] = ""
+                normalized[digits] = v
 
-        # 全部失败 — 清除记忆
+            return normalized
+
+        # 全部失败 — 清除记忆，下次重新轮询
         with Coordinator._sticky_lock:
             if Coordinator._sticky_source:
                 logger.warning("[记忆行情] 记忆源 %s 及所有备选均失败，清除记忆",
@@ -2005,6 +2137,7 @@ class Coordinator:
         self,
         market: str,
         source_map: Dict[str, Callable],
+        cb: CircuitBreaker,
     ) -> List[Tuple[str, SourceConfig]]:
         """
         获取可用源列表（自动发现模式的 fallback）。
@@ -2018,6 +2151,7 @@ class Coordinator:
         Args:
             market:    市场名称
             source_map: {name: fetch_fn} — Provider 层注册的源
+            cb:        熔断器
 
         Returns:
             [(源名称, 源配置), ...] — 按权重降序排列
@@ -2031,7 +2165,7 @@ class Coordinator:
         for cfg in configs:
             if cfg.name not in source_map:
                 continue
-            if not _realtime_cb.is_available(cfg.name):
+            if not cb.is_available(cfg.name):
                 logger.debug("[协助层] 源 %s 已熔断，跳过", cfg.name)
                 continue
             available.append((cfg.name, cfg))
@@ -2043,6 +2177,7 @@ class Coordinator:
         preferred: str,
         market: str,
         source_map: Dict[str, Callable],
+        cb: CircuitBreaker,
     ) -> List[Tuple[str, SourceConfig]]:
         """
         获取可用源列表，但指定源排在第一位。
@@ -2052,7 +2187,7 @@ class Coordinator:
 
         如果指定源不可用（未注册或已熔断），回退到默认排序并打 warning。
         """
-        all_available = self._get_available_sources(market, source_map)
+        all_available = self._get_available_sources(market, source_map, cb)
 
         if not all_available:
             return []

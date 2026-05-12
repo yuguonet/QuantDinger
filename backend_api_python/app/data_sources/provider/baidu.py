@@ -127,11 +127,11 @@ def _fetch_baidu_15m(code: str, limit: int = 200) -> Optional[List[Dict[str, Any
                 continue
             # 百度返回的时间格式可能是 "2026-05-08 09:45" 或时间戳
             if "-" in dt_str and ":" in dt_str:
-                ts = int(datetime.strptime(dt_str[:16], "%Y-%m-%d %H:%M").replace(tzinfo=_TZ_CN).timestamp())
+                ts = dt_str[:16]
             elif "-" in dt_str:
-                ts = int(datetime.strptime(dt_str[:10], "%Y-%m-%d").replace(tzinfo=_TZ_CN).timestamp())
+                ts = dt_str[:10]
             else:
-                ts = int(float(dt_str))
+                ts = datetime.fromtimestamp(int(float(dt_str))).strftime("%Y-%m-%d %H:%M:%S")
 
             o = float(i.get("open", 0) or 0)
             h = float(i.get("high", 0) or 0)

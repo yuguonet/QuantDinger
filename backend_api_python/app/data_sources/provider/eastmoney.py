@@ -283,22 +283,17 @@ class EastMoneyDataSource:
                 continue
             try:
                 dt_str = parts[0].strip()
-                ts = None
-                for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
-                    try:
-                        ts = datetime.strptime(dt_str, fmt)
-                        break
-                    except ValueError:
-                        continue
-                if ts is None:
+                if not dt_str:
                     continue
+                # 标准化为字符串格式
+                ts_str = dt_str
                 o, c, h, low, v = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5])
                 if o == 0 and c == 0:
                     continue
                 if h > 0 and low > 0 and h < low:
                     h, low = low, h
                 out.append({
-                    "time": ts, "open": round(o, 4), "high": round(h, 4),
+                    "time": ts_str, "open": round(o, 4), "high": round(h, 4),
                     "low": round(low, 4), "close": round(c, 4), "volume": round(v, 2),
                 })
             except (ValueError, TypeError, IndexError):

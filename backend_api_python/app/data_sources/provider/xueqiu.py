@@ -179,9 +179,9 @@ def _fetch_xueqiu_kline(code: str, timeframe: str = "15m", limit: int = 200) -> 
             if len(r) < 6:
                 continue
             try:
-                ts = int(r[0]) / 1000  # 毫秒 → 秒
+                ts = datetime.fromtimestamp(int(r[0]) / 1000).strftime("%Y-%m-%d %H:%M:%S")  # 毫秒 → 字符串
                 result.append({
-                    "time": int(ts),
+                    "time": ts,
                     "open": round(float(r[2]), 4),
                     "high": round(float(r[3]), 4),
                     "low": round(float(r[4]), 4),

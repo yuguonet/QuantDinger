@@ -208,12 +208,8 @@ def _bars_to_records(bars: List[Dict[str, Any]], timeframe: str) -> List[Dict[st
             continue
         if timeframe == "15m":
             total_min = dt.hour * 60 + dt.minute
-            if total_min == 570:  # 9:30 丢弃
+            if total_min == 570:  # 9:30 丢弃（集合竞价）
                 continue
-            if 690 <= total_min < 780:  # 午休 → 11:30
-                dt = dt.replace(hour=11, minute=30, second=0, microsecond=0)
-            elif total_min >= 900:  # 15:00+
-                dt = dt.replace(hour=15, minute=0, second=0, microsecond=0)
         o = _safe_float(bar.get("open"))
         h = _safe_float(bar.get("high"))
         l = _safe_float(bar.get("low"))
@@ -299,7 +295,8 @@ def validate_stock(
             # 日 high/low = 所有 bar 的 max/min
             # 日 close = 最后一根 bar 的 close
             agg["high"] = max(agg["high"], h)
-            agg["low"] = min(agg["low"], l) if agg["low"] > 0 else l
+            if l > 0:
+                agg["low"] = min(agg["low"], l) if agg["low"] > 0 else l
             agg["close"] = c  # 后出现的覆盖，最终是最后一根
             agg["volume"] += v
             agg["bar_count"] += 1
@@ -350,9 +347,18 @@ def validate_stock(
     for i in range(1, _NO_LIMIT_DAYS_BEFORE_START + 1):
         no_limit_before.add((start_dt - timedelta(days=i)).strftime("%Y-%m-%d"))
 
+    # 15m 逐 bar 涨跌幅检查标记
+    is_15m_bar_check = (timeframe == "15m")
+
     prev_close: Optional[float] = None  # 前一个非停牌日的收盘价
 
+    # 15m: 最后一天不检查（数据可能不完整）
+    last_date = sorted_dates[-1] if is_15m_bar_check else None
+
     for d in sorted_dates:
+        # 15m: 跳过最后一天
+        if d == last_date:
+            continue
         day_records = date_records[d]
         is_suspend = d in suspension_dates
         # 复牌日: 当天非停牌 且 前一个交易日是停牌日或数据缺失
@@ -365,25 +371,23 @@ def validate_stock(
                     is_resume = True
         is_no_limit = is_resume or (d in no_limit_before)
 
-        # ── 15m: 检查每天 bar 数 ──
+        # ── 15m: 检查每天 bar 数，16 根则重新分配标准时间 ──
         if timeframe == "15m" and not is_suspend and _is_trading_day(d):
-            bar_times = set()
-            for rec in day_records:
-                dt = rec.get("time")
-                if isinstance(dt, datetime):
-                    bar_times.add((dt.hour, dt.minute))
-            missing_bars = _BAR_SET_15M - bar_times
-            if missing_bars:
-                result.add_warning(
-                    f"15m bar 缺失 {d}: {len(missing_bars)} 根 "
-                    f"({sorted(missing_bars)[:3]}...)"
-                )
+            if len(day_records) == 16:
+                # 按时间排序，重新分配 16 根标准 bar 时间
+                day_records.sort(key=lambda r: r["time"])
+                for rec, (h, m) in zip(day_records, _BAR_TIMES_15M):
+                    old_dt = rec["time"]
+                    rec["time"] = old_dt.replace(hour=h, minute=m, second=0, microsecond=0)
+            else:
+                # bar 数不是 16 根，跳过该天不做校验
+                continue
 
         # ── 停牌日跳过逐 bar 校验 ──
         if is_suspend:
             continue
 
-        # ── 逐 bar 校验 ──
+        # ── 逐 bar 校验（OHLC 合理性 + 涨跌幅） ──
         for rec in day_records:
             o = _safe_float(rec.get("open"))
             h = _safe_float(rec.get("high"))
@@ -409,13 +413,28 @@ def validate_stock(
             if c > 0 and h > 0 and (c > h or c < l):
                 result.add_error(f"close 越界: {d} C={c} H={h} L={l}")
 
-            # ── 涨跌幅检查（基于日级 close） ──
-            # 只用每天最后一根 bar 的 close 来检查涨跌幅
-            # 前一个交易日为空（数据缺失）→ 跳过涨跌幅检查，避免停复牌日历不准导致误报
+            # ── 逐 bar 涨跌幅检查（与前一交易日收盘价比较）──
+            # 15m: 每根 bar 的 OHLC 都不能超出涨跌幅限制
+            if is_15m_bar_check and not is_no_limit and prev_close is not None and prev_close > 0:
+                for label, price in [("open", o), ("high", h), ("low", l), ("close", c)]:
+                    if price > 0:
+                        pct = abs(price - prev_close) / prev_close
+                        if pct > price_limit + 0.015:  # 1.5% 容差
+                            dt = rec.get("time")
+                            bar_time = f"{dt.hour}:{dt.minute:02d}" if isinstance(dt, datetime) else "?"
+                            direction = "+" if price >= prev_close else "-"
+                            result.add_error(
+                                f"bar涨跌幅超限: {d} {bar_time} "
+                                f"{label}={price:.2f} prev={prev_close:.2f} "
+                                f"pct={direction}{pct*100:.2f}% limit={price_limit*100:.0f}%"
+                            )
+
+        # ── 日级涨跌幅检查（每天一次，bar 循环外） ──
+        day_agg = daily_agg.get(d)
+        if day_agg and not is_no_limit:
             prev_td = _prev_trading_day(d)
             prev_td_has_data = prev_td is not None and prev_td in date_records
-            day_agg = daily_agg.get(d)
-            if day_agg and not is_no_limit and prev_td_has_data and prev_close is not None and prev_close > 0:
+            if prev_td_has_data and prev_close is not None and prev_close > 0:
                 day_close = day_agg["close"]
                 if day_close > 0:
                     change_pct = abs(day_close - prev_close) / prev_close
@@ -427,9 +446,8 @@ def validate_stock(
                             f"pct={direction}{change_pct*100:.2f}% limit={price_limit*100:.0f}%"
                         )
 
-        # 更新 prev_close（用日级 close）
-        day_agg = daily_agg.get(d)
-        if day_agg and day_agg["close"] > 0:
+        # 更新 prev_close（用日级 close，停牌日不更新）
+        if not is_suspend and day_agg and day_agg["close"] > 0:
             prev_close = day_agg["close"]
 
     # ── 3. 尾部检查 ──
@@ -467,8 +485,10 @@ def write_stock_data(
     dry_run: bool = False,
 ) -> int:
     """先删旧数据，再写入新数据（同一事务）"""
-    if dry_run or not records:
-        return len(records)
+    if dry_run:
+        return 0  # dry-run 不应计入 written
+    if not records:
+        return 0
 
     # 转为 DB 格式
     db_records = []
@@ -496,11 +516,11 @@ def write_stock_data(
     if not db_records:
         return 0
 
-    # 同一事务: 先删旧数据，再写新数据
     start_year = int(start_date[:4])
     end_year = int(end_date[:4])
     years = list(range(start_year, end_year + 1))
 
+    # 同一事务: 先删旧数据，再写新数据（保证原子性）
     try:
         with pool.connection() as conn:
             cur = conn.cursor()
@@ -516,15 +536,32 @@ def write_stock_data(
                     """, (code, f"{start_date} 00:00:00", f"{end_date} 23:59:59"))
                 except Exception:
                     pass  # 表可能不存在
+
+            # 在同一事务内写入新数据（逐批 INSERT）
+            inserted = 0
+            for i in range(0, len(db_records), 5000):
+                batch = db_records[i:i + 5000]
+                for year in years:
+                    table = f"kline_{timeframe}_{year}"
+                    year_batch = [r for r in batch
+                                  if r["time"].year == year]
+                    if not year_batch:
+                        continue
+                    try:
+                        cur.executemany(
+                            f'INSERT INTO "{table}" '
+                            f'(symbol, timeframe, time, open, high, low, close, volume) '
+                            f'VALUES (%(symbol)s, %(timeframe)s, %(time)s, '
+                            f'%(open)s, %(high)s, %(low)s, %(close)s, %(volume)s)',
+                            year_batch,
+                        )
+                        inserted += len(year_batch)
+                    except Exception:
+                        pass  # 表可能不存在
+
             conn.commit()
             cur.close()
-    except Exception as e:
-        logger.warning("删旧数据失败 %s/%s: %s", code, timeframe, e)
-
-    # 写入新数据（bulk_write 内部有自己的事务管理）
-    try:
-        result = writer.bulk_write(market, db_records, batch_size=5000)
-        return result.get("inserted", 0)
+            return inserted
     except Exception as e:
         logger.warning("写库失败 %s/%s: %s", code, timeframe, e)
         return 0
@@ -666,7 +703,7 @@ def process_batch(
     Returns:
         (results_list, stats_dict)
     """
-    stats = {"fetched": 0, "passed": 0, "failed": 0, "written": 0, "no_data": 0}
+    stats = {"total": len(symbols), "fetched": 0, "passed": 0, "failed": 0, "written": 0, "no_data": 0}
     results = []
     to_retry: Dict[str, List[str]] = {}   # code → errors（待加入重传）
     to_remove: List[str] = []             # 成功的 code（待从重传移除）
@@ -674,7 +711,6 @@ def process_batch(
     # 拉取数据
     try:
         raw_data = coordinator.coordinate_market_kline(
-            cb=cb,
             market=market,
             timeframe=timeframe,
             count=count,
@@ -696,7 +732,7 @@ def process_batch(
         _batch_update_retry(retry_path, to_retry, [])
         return results, stats
 
-    # 逐只处理
+    # ── 第一轮: 逐只校验 ──
     for code in symbols:
         if _INTERRUPTED:
             break
@@ -714,6 +750,11 @@ def process_batch(
 
         # 转为标准记录（已去重）
         records = _bars_to_records(bars, timeframe)
+        # 丢弃早于 start_date 的数据（防护数据源返回超范围数据）
+        if records and start_date:
+            start_cutoff = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=TZ_SH)
+            records = [r for r in records
+                       if isinstance(r.get("time"), datetime) and r["time"] >= start_cutoff]
         if not records:
             stats["no_data"] += 1
             to_retry[code] = ["转换后无有效记录"]

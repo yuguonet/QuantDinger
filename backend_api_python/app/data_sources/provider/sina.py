@@ -147,15 +147,6 @@ def _sina_kline_to_dicts(data: list, count: int) -> List[Dict[str, Any]]:
             dt_str = str(item.get("day", "")).strip()
             if not dt_str:
                 continue
-            ts = None
-            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
-                try:
-                    ts = datetime.strptime(dt_str, fmt).replace(tzinfo=_TZ_CN)
-                    break
-                except ValueError:
-                    continue
-            if ts is None:
-                continue
             o = float(item.get("open", 0))
             h = float(item.get("high", 0))
             low = float(item.get("low", 0))
@@ -164,7 +155,7 @@ def _sina_kline_to_dicts(data: list, count: int) -> List[Dict[str, Any]]:
             if o == 0 and c == 0:
                 continue
             out.append({
-                "time": ts, "open": round(o, 4), "high": round(h, 4),
+                "time": dt_str, "open": round(o, 4), "high": round(h, 4),
                 "low": round(low, 4), "close": round(c, 4), "volume": round(v, 2),
             })
         except (ValueError, TypeError, KeyError):
@@ -194,12 +185,11 @@ def _fetch_sina_kline_hisdata(sc: str, count: int, timeout: int) -> List[Dict[st
     for m in pattern.finditer(text):
         try:
             dt_str, o, c, h, low, v = m.groups()
-            ts = int(datetime.strptime(dt_str, "%Y-%m-%d").replace(tzinfo=_TZ_CN).timestamp())
             o, c, h, low, v = float(o), float(c), float(h), float(low), float(v)
             if o == 0 and c == 0:
                 continue
             out.append({
-                "time": ts, "open": round(o, 4), "high": round(h, 4),
+                "time": dt_str, "open": round(o, 4), "high": round(h, 4),
                 "low": round(low, 4), "close": round(c, 4), "volume": round(v, 2),
             })
         except (ValueError, TypeError):
