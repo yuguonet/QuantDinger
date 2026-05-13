@@ -2,30 +2,24 @@
 """
 东方财富 trends2 极速数据源 Provider
 
-模块职责:
-  通过 push2.eastmoney.com trends2 API 获取 A股实时1分钟数据，
-  聚合为15分钟K线。这是目前已知最快的免费A股数据源。
+API来源 & 最新信息:
+  - 浏览器F12抓包 https://quote.eastmoney.com/ 找 trends2 请求
+  - 接口: push2.eastmoney.com/api/qt/stock/trends2/get
+  - 参数: secid(市场.代码), fields1, fields2, ndays=1
+  - 返回当天1分钟K线原始数据，需自行聚合为更大周期
+  - JSONP格式: jQuery({...});
 
-能力:
-  - K线: 1m/5m/15m/30m/1H（1min数据聚合），今天的数据
-  - 不支持 1D（API只返回当天数据）
-  - 行情: 用当天1min数据最新bar作为实时行情
-  - 全市场批量: 并发获取全市场K线
-  - 不支持批量行情接口
+支持的功能:
+  - K线: ✅ 1m/5m/15m/30m/1H（1m数据聚合，仅当天数据）
+  - K线 1D/1W: ❌ 不支持（API只返回当天数据，不够聚合）
+  - fetch_ticker: ✅ 用全天1m最新bar的close作为当前价
+  - fetch_batch_quotes: ⚠️ 逐只并发调_fetch_em_trends2_quote（非真批量）
+  - fetch_market_kline: ✅ 并发获取全市场K线
 
-特点:
-  - 极速源: push2 trends2, 每秒可处理50+只
-  - 纯标准库实现，无第三方依赖
-  - 域名限流保护
-
-数据标准化:
-  - time: Unix 时间戳
-  - open/high/low/close: OHLC 四价
-  - volume: 成交量
-  - 复权: 不复权 → 通过 TDX 除权除息数据转前复权
-
-在架构中的位置:
-  KlineService → DataSourceFactory → Coordinator → EmTrends2DataSource（本模块）
+单位注意（重要）:
+  - _em_trends2_raw: volume 返回的是原始值，代码中已×100转"股"
+  - 价格字段直接是"元"，不需要÷
+  - 复权: 不复权数据通过 TDX 除权除息数据(adjustment模块)转前复权
 """
 
 from __future__ import annotations
@@ -54,7 +48,6 @@ logger = get_logger(__name__)
 # ================================================================
 
 TIMEOUT = 10
-THREADS_PER_SOURCE = 15
 PER_DOMAIN_CONCURRENT = 30
 PER_DOMAIN_INTERVAL = 0.01
 
@@ -202,18 +195,23 @@ from app.data_sources.provider.adjustment import apply_fwd_adjust
 # ================================================================
 
 def _em_trends2_raw(code: str) -> Optional[list]:
-    """push2.eastmoney.com trends2: 获取今天1分钟原始数据"""
+    """push2.eastmoney.com trends2: 获取今天1分钟原始数据（JSONP）"""
     secid = _to_em(code)
     try:
         url = (
-            f"https://push2.eastmoney.com/api/qt/stock/trends2/get?"
-            f"secid={secid}&fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13"
+            f"https://82.push2.eastmoney.com/api/qt/stock/trends2/get?"
+            f"cb=jQuery&secid={secid}&fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13"
             f"&fields2=f51,f52,f53,f54,f55,f56,f57,f58&iscr=0&ndays=1"
         )
         req = urllib.request.Request(url, headers=HEADERS)
         with _fast_opener.open(req, timeout=TIMEOUT) as resp:
             raw = resp.read().decode("utf-8", "ignore")
-        d = json.loads(raw)
+        # JSONP: jQuery({...}); → 提取 JSON
+        m = re.search(r'[=(]\s*(\{[\s\S]*\})\s*[);]*$', raw)
+        if m:
+            d = json.loads(m.group(1))
+        else:
+            d = json.loads(raw)
         trends = (d.get("data") or {}).get("trends") or []
         if not trends:
             return None
@@ -226,7 +224,7 @@ def _em_trends2_raw(code: str) -> Optional[list]:
             bars.append({
                 "time": p[0], "open": float(p[1]), "close": float(p[2]),
                 "high": float(p[3]), "low": float(p[4]),
-                "volume": float(p[5]), "amount": float(p[6]),
+                "volume": float(p[5]) * 100, "amount": float(p[6]),
             })
         return bars if bars else None
     except Exception:
@@ -259,8 +257,15 @@ def _aggregate_bars(raw_bars: list, timeframe: str) -> Optional[list]:
     result = []
     for i in range(0, len(raw_bars) - step + 1, step):
         chunk = raw_bars[i:i + step]
+        # bar结束时间 = 最后一根1min bar的时间 + 1分钟
+        last_t = chunk[-1]["time"]
+        try:
+            _dt = datetime.strptime(str(last_t)[:16], "%Y-%m-%d %H:%M")
+            end_t = (_dt + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
+        except (ValueError, OverflowError, TypeError):
+            end_t = last_t
         result.append(_k(
-            chunk[0]["time"],
+            end_t,
             chunk[0]["open"],
             max(b["high"] for b in chunk),
             min(b["low"] for b in chunk),
@@ -340,6 +345,10 @@ class EmTrends2DataSource:
 
     name = "em_trends2"
     priority = 5
+    max_concurrency = 15
+    min_interval = 0.0
+    jitter_min = 0.0
+    jitter_max = 0.0
 
     capabilities = {
         "kline": True,
@@ -376,16 +385,16 @@ class EmTrends2DataSource:
         if not data:
             return []
 
-        # 标准化时间格式: "2026-05-08 09:45" → Unix timestamp
+        # 统一时间格式: "YYYY-MM-DD HH:MM" → "YYYY-MM-DD HH:MM:00"
         result = []
         for bar in data:
             try:
                 ts_str = str(bar.get("time", ""))
+                # 统一为 YYYY-MM-DD HH:MM:00 字符串格式
                 if "-" in ts_str and ":" in ts_str:
-                    # 字符串时间 → Unix timestamp
-                    ts = int(datetime.strptime(ts_str[:16], "%Y-%m-%d %H:%M").replace(tzinfo=_TZ_CN).timestamp())
+                    ts = ts_str[:16] + ":00"
                 else:
-                    ts = int(float(ts_str))
+                    ts = ts_str
                 result.append({
                     "time": ts,
                     "open": round(float(bar["open"]), 4),
@@ -403,122 +412,6 @@ class EmTrends2DataSource:
 
         return result[-count:] if len(result) > count else result
 
-    def fetch_market_kline(
-        self, timeframe: str = "15m", count: int = 200,
-        adj: str = "qfq", timeout: int = 30,
-        start_date: str = "", end_date: str = "",
-        symbols: Optional[List[str]] = None,
-    ) -> Dict[str, List[Dict[str, Any]]]:
-        """
-        全市场批量K线 — 30线程并发获取。
-        支持 1m/5m/15m/30m/1H（不支持 1D）。
-
-        线程结构与 akline_market.py 保持一致:
-        - 每组50只，从队列中领取
-        - 30线程并发
-        - 先完成的接着领下一组
-
-        Args:
-            symbols: 股票代码列表（带 sh/sz 前缀，如 ["sh600519", "sz000001"]），
-                     为 None 时自动获取全市场列表
-        """
-        if timeframe not in _EM_AGG_STEPS:
-            return NotSupportedResult(self.name, "fetch_market_kline", f"不支持 {timeframe} 周期")
-
-        from queue import Queue, Empty
-
-        # 获取股票列表
-        if symbols:
-            stocks = [{"code": c, "name": ""} for c in symbols]
-        else:
-            stocks = self._get_stock_list()
-        if not stocks:
-            logger.warning("[EmTrends2] 获取股票列表失败")
-            return {}
-
-        group_size = 50
-        groups = [stocks[i:i + group_size] for i in range(0, len(stocks), group_size)]
-        q: Queue = Queue()
-        for idx, g in enumerate(groups):
-            q.put((idx, g))
-
-        result: Dict[str, List[Dict[str, Any]]] = {}
-        lock = threading.Lock()
-        stats_ok = [0]
-        stats_fail = [0]
-
-        def _fetch_one(stock):
-            code = stock.get("code", "")
-            if not code:
-                return
-            try:
-                data = _em_trends2_kline(code, timeframe, count)
-                if data:
-                    # 标准化时间格式
-                    bars = []
-                    for bar in data:
-                        try:
-                            ts_str = str(bar.get("time", ""))
-                            if "-" in ts_str and ":" in ts_str:
-                                ts = int(datetime.strptime(ts_str[:16], "%Y-%m-%d %H:%M").replace(tzinfo=_TZ_CN).timestamp())
-                            else:
-                                ts = int(float(ts_str))
-                            bars.append({
-                                "time": ts,
-                                "open": round(float(bar["open"]), 4),
-                                "high": round(float(bar["high"]), 4),
-                                "low": round(float(bar["low"]), 4),
-                                "close": round(float(bar["close"]), 4),
-                                "volume": round(float(bar["volume"]), 2),
-                            })
-                        except (ValueError, TypeError, KeyError):
-                            continue
-
-                    # 前复权
-                    if adj == "qfq" and bars:
-                        bars = apply_fwd_adjust(bars, code)
-
-                    if bars:
-                        with lock:
-                            result[code] = bars
-                            stats_ok[0] += 1
-                        return
-            except Exception:
-                pass
-            with lock:
-                stats_fail[0] += 1
-
-        def _worker():
-            while True:
-                try:
-                    _, stocks_group = q.get(timeout=5)
-                except Empty:
-                    break
-                futs = []
-                with ThreadPoolExecutor(max_workers=min(len(stocks_group), THREADS_PER_SOURCE)) as pool:
-                    for s in stocks_group:
-                        futs.append(pool.submit(_fetch_one, s))
-                    for f in futs:
-                        try:
-                            f.result()
-                        except Exception:
-                            pass
-                q.task_done()
-
-        # 启动 worker 线程
-        workers = []
-        for _ in range(min(THREADS_PER_SOURCE, len(groups))):
-            t = threading.Thread(target=_worker, daemon=True)
-            workers.append(t)
-            t.start()
-
-        # 等待完成
-        for t in workers:
-            t.join(timeout=timeout)
-
-        logger.info("[EmTrends2] 全市场完成: %d成功 %d失败", stats_ok[0], stats_fail[0])
-        return result
-
     def fetch_ticker(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
         """获取单只股票实时行情 — 用当天1min数据最新bar的close作为当前价"""
         return _fetch_em_trends2_quote(code)
@@ -531,13 +424,10 @@ class EmTrends2DataSource:
         def _fetch(code):
             q = _fetch_em_trends2_quote(code)
             if q:
-                nc = code.strip().upper()
-                if nc.startswith("6"):
-                    nc = "sh" + nc
-                elif nc.startswith(("0", "3")):
-                    nc = "sz" + nc
+                # key 统一用纯数字代码（去掉 sh/sz 前缀）
+                digits = code.strip().upper().replace("SH", "").replace("SZ", "").replace("BJ", "")
                 with lock:
-                    result[nc] = q
+                    result[digits] = q
 
         max_workers = min(len(codes), 30)
         with ThreadPoolExecutor(max_workers=max_workers) as pool:

@@ -2,24 +2,26 @@
 """
 腾讯财经数据源 Provider
 
-模块职责:
-  通过腾讯财经 API 获取 A股/港股 的 K线和实时行情数据。
-  腾讯是国内访问速度最快、最稳定的数据源之一，作为 A股首选源（priority=10）。
+API来源 & 最新信息:
+  - 浏览器F12抓包 https://gu.qq.com/ 或 https://stockapp.finance.qq.com/
+  - 行情: qt.gtimg.cn/q=sh600519（经典接口，多年未变）
+  - K线分钟: ifzq.gtimg.cn/appstock/app/kline/mkline?param=sh600519,m15,300
+  - K线日周: web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600519,day,,,300,qfq
+  - mkline: 分钟线（m1/m5/m15/m30/m60），不支持复权
+  - fqkline: 日/周线（day/week），支持前/后复权
 
-能力:
-  - K线: 全周期（1m/5m/15m/30m/1H/1D/1W），支持前/后复权
-  - 单只行情: 实时行情快照（qt.gtimg.cn）
-  - 批量行情: 单次HTTP获取多只股票行情（每批最多500只）
-  - 全市场行情: 多批次拼接（每批500只，通过东财获取代码列表）
-  - 港股: 通过 fqkline API 获取港股K线
+支持的功能:
+  - K线: ✅ 全周期 1m/5m/15m/30m/1H/1D/1W
+  - fetch_ticker: ✅ 单只实时行情（qt.gtimg.cn）
+  - fetch_batch_quotes: ✅ 原生批量（qt.gtimg.cn/q=a,b,c 500只/批）
+  - fetch_market_kline: ✅ 逐只调用fetch_kline
+  - 港股: ✅ 支持港股K线和行情
 
-在架构中的位置:
-  KlineService → DataSourceFactory → Coordinator → TencentDataSource（本模块）
-
-关键依赖:
-  - requests: HTTP 请求
-  - app.data_sources.normalizer: 股票代码标准化
-  - app.data_sources.rate_limiter: 限流器 + 请求头 + 重试装饰器
+单位注意（重要）:
+  - fetch_ticker: parts[3]=最新价(元), parts[6]=成交量, 已×100转"股"
+  - fetch_batch_quotes: 同上，parts[6]已×100转"股"
+  - fetch_kline (_rows_to_dicts): volume(r[5])已×100转"股"
+  - 所有价格单位都是"元"，不需要÷
 """
 
 from __future__ import annotations
@@ -35,7 +37,7 @@ from app.data_sources.normalizer import (
     normalize_cn_code as to_tencent_code, normalize_hk_code,
 )
 from app.data_sources.rate_limiter import (
-    get_request_headers, retry_with_backoff, get_tencent_limiter,
+    get_request_headers, get_tencent_limiter,
 )
 from app.data_sources.provider import register, NotSupportedResult
 from app.utils.logger import get_logger
@@ -113,9 +115,10 @@ def _parse_time(ds: str) -> Optional[str]:
         return None
 
 
-def _rows_to_dicts(rows: list) -> List[Dict[str, Any]]:
+def _rows_to_dicts(rows: list, timeframe: str = "1D") -> List[Dict[str, Any]]:
     """将腾讯API返回的原始行数据转换为标准化K线字典列表"""
     out = []
+    _daily_tfs = {"1D", "1W"}
     for r in rows:
         if not isinstance(r, (list, tuple)) or len(r) < 6:
             continue
@@ -126,9 +129,18 @@ def _rows_to_dicts(rows: list) -> List[Dict[str, Any]]:
             o, c, h, low, vol = float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])
         except (TypeError, ValueError):
             continue
+        # 统一时间格式: 日线以上 YYYY-MM-DD, 分时线 YYYY-MM-DD HH:MM:00
+        if timeframe in _daily_tfs:
+            ts = ts[:10]
+        else:
+            try:
+                _dt = datetime.strptime(ts[:19], "%Y-%m-%d %H:%M:%S")
+                ts = _dt.strftime("%Y-%m-%d %H:%M") + ":00"
+            except (ValueError, TypeError):
+                ts = ts[:16] + ":00"
         out.append({
             "time": ts, "open": round(o, 4), "high": round(h, 4),
-            "low": round(low, 4), "close": round(c, 4), "volume": round(vol, 2),
+            "low": round(low, 4), "close": round(c, 4), "volume": round(vol * 100, 2),
         })
     return out
 
@@ -152,6 +164,10 @@ class TencentDataSource:
 
     name = "tencent"
     priority = 10
+    max_concurrency = 6
+    min_interval = 1.0
+    jitter_min = 0.5
+    jitter_max = 1.5
 
     capabilities = {
         "kline": True,
@@ -166,21 +182,6 @@ class TencentDataSource:
         "markets": {"CNStock", "HKStock"},
     }
 
-    def fetch_market_kline(
-        self, timeframe: str = "1D", count: int = 300,
-        adj: str = "qfq", timeout: int = 15,
-        start_date: str = "", end_date: str = "",
-        symbols: Optional[List[str]] = None,
-    ) -> Dict[str, List[Dict[str, Any]]]:
-        """全市场批量K线 — 并发 fetch_kline，支持历史数据"""
-        from app.data_sources.provider import _batch_fetch_kline_by_codes
-        return _batch_fetch_kline_by_codes(
-            self, timeframe=timeframe, count=count, adj=adj, timeout=timeout,
-            start_date=start_date, end_date=end_date, batch_size=500,
-            symbols=symbols,
-        )
-
-    @retry_with_backoff(max_attempts=3, base_delay=1.2, max_delay=8.0, exceptions=(Exception,))
     def fetch_kline(
         self, code: str, timeframe: str = "1D", count: int = 300,
         adj: str = "qfq", timeout: int = 10,
@@ -197,9 +198,6 @@ class TencentDataSource:
         endpoint, tc_tf = _TF_MAP.get(timeframe, (None, None))
         if not endpoint:
             return []
-
-        limiter = get_tencent_limiter()
-        limiter.wait()
 
         if endpoint == "mkline":
             url = "https://ifzq.gtimg.cn/appstock/app/kline/mkline"
@@ -244,9 +242,31 @@ class TencentDataSource:
                         rows = v
                         break
 
-        return _rows_to_dicts(rows) if isinstance(rows, list) else []
+        return _rows_to_dicts(rows, timeframe) if isinstance(rows, list) else []
 
-    @retry_with_backoff(max_attempts=3, base_delay=1.2, max_delay=8.0, exceptions=(Exception,))
+    def fetch_market_kline(
+        self, timeframe: str, count: int = 300,
+        adj: str = "qfq", timeout: int = 15,
+        start_date: str = "", end_date: str = "",
+        symbols: Optional[List[str]] = None,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """批量K线 — Coordinator 统管线程+限流，本方法逐只调用 fetch_kline"""
+        if not symbols:
+            return {}
+        result: Dict[str, List[Dict[str, Any]]] = {}
+        for code in symbols:
+            try:
+                bars = self.fetch_kline(
+                    code, timeframe, count,
+                    adj=adj, timeout=timeout,
+                    start_date=start_date, end_date=end_date,
+                )
+                if bars:
+                    result[code] = bars
+            except Exception as e:
+                logger.debug("[fetch_market_kline] %s 失败: %s", code, e)
+        return result
+
     def fetch_ticker(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
         c = _lower(to_tencent_code(code))
         if not c:
@@ -295,7 +315,7 @@ class TencentDataSource:
             "changePercent": round(chg / prev * 100, 2) if prev else 0,
             "high": _f(33, last), "low": _f(34, last),
             "open": _f(5) or last, "previousClose": prev,
-            "volume": vol, "time": time_str,
+            "volume": vol * 100, "time": time_str,
             "name": (parts[1] or "").strip(),
             "symbol": (parts[2] or "").strip(),
         }
@@ -379,7 +399,7 @@ class TencentDataSource:
                             "low": float(parts[34]) if len(parts) > 34 and parts[34] else last,
                             "open": float(parts[5]) if parts[5] else last,
                             "previousClose": prev,
-                            "volume": vol,
+                            "volume": vol * 100,
                             "time": time_str,
                             "name": parts[1].strip(),
                             "symbol": parts[2].strip(),

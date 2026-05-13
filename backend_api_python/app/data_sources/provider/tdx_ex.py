@@ -1,28 +1,32 @@
 # -*- coding: utf-8 -*-
 """
-通达信扩展行情数据源 Provider (ExHQ)
+通达信数据源 Provider (pytdx 二进制协议)
 
-模块职责:
-  通过 pytdx TdxExHq_API 获取 A股 K线数据。
-  使用 ExHQ 协议（端口 7727），与 tdx provider（d.10jqka.com.cn HTTP）完全独立。
+API来源 & 最新信息:
+  - pytdx开源库: https://github.com/rainx/pytdx
+  - 服务器列表: pytdx/config/hosts.py（本文件_CANDIDATE_SERVERS已复制）
+  - ExHQ协议端口7727, HQ协议端口7709
+  - 自动探测可用服务器，按延迟排序，首次探测约5秒
+  - prepare()方法确保有可用服务器
+  - category映射: 0=5m, 1=15m, 2=30m, 3=1H, 4=日线, 5=周线, 7=1m, 8=1m(备选)
 
-能力:
-  - K线: 1m/5m/15m/30m/1H/1D/1W
-  - 行情: 单只/批量实时行情（get_instrument_quotes）
-  - 全市场批量: 并发获取全市场K线
+与 10jqka 的区别:
+  - 10jqka:  同花顺HTTP接口 (d.10jqka.com.cn)，无需额外依赖
+  - tdx_ex:  pytdx二进制协议，通达信原生接口，需pip install pytdx
 
-特点:
-  - 纯 pytdx 二进制协议，速度快
-  - 需要安装 pytdx: pip install pytdx
-  - ExHQ 服务器通常在 7727 端口
-  - 自动探测可用服务器，按延迟排序
+支持的功能:
+  - K线: ✅ 全周期 1m/5m/15m/30m/1H/1D/1W
+  - fetch_ticker: ✅ 单只实时行情（get_security_quotes/get_instrument_quotes）
+  - fetch_batch_quotes: ✅ 原生批量（单次请求多只，pytdx协议）
+  - fetch_market_kline: ✅ 逐只调用fetch_kline
+  - 自动重连: 连接断了自动释放并重连
 
-与 tdx provider 的区别:
-  - tdx:       HTTP API (d.10jqka.com.cn)，同花顺 Web 接口
-  - tdx_ex:    pytdx ExHQ 二进制协议 (TdxExHq_API)，通达信原生接口
-
-在架构中的位置:
-  KlineService → DataSourceFactory → Coordinator → TdxExDataSource（本模块）
+单位注意（重要）:
+  - fetch_ticker: pytdx返回的vol单位是"手"，代码中已×100转"股"
+  - fetch_batch_quotes: 同上，vol已×100转"股"
+  - fetch_kline: pytdx返回的vol单位是"股"（注意:行情和K线的vol单位不同!）
+  - 价格字段直接是"元"，不需要÷
+  - 复权: 不复权数据通过 TDX 除权除息数据(adjustment模块)转前复权
 """
 
 from __future__ import annotations
@@ -32,7 +36,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 _TZ_CN = timezone(timedelta(hours=8))
 
@@ -47,59 +51,187 @@ logger = get_logger(__name__)
 # ================================================================
 
 HAS_TDX = False
+HAS_HQ = False
 try:
     from pytdx.exhq import TdxExHq_API
     HAS_TDX = True
 except ImportError:
     pass
 
+try:
+    from pytdx.hq import TdxHq_API
+    HAS_HQ = True
+except ImportError:
+    pass
+
 
 # ================================================================
-# ExHQ Category 映射
+# Category 映射 — ExHQ 与 HQ 共用
 # ================================================================
-# get_instrument_bars(category, market, symbol, start, count)
-# 注意: ExHQ 的 category 与 HQ (get_security_bars) 不同
-# 这里是基于 akline_market.py 中的实测验证
+# get_instrument_bars / get_security_bars 的 category 含义一致:
+#   0=5m, 1=15m, 2=30m, 3=1H, 4=日线, 5=周线, 6=月线, 7=1m, 8=1m(备选), 9=日线(备选)
 
-_TDX_EX_TF_CATEGORY = {
-    "1m":  [7, 8],       # 1分钟: 尝试 cat=7, 回退 cat=8
-    "5m":  [0],          # 5分钟: cat=0
-    "15m": [8, 1, 9],    # 15分钟: cat=8 优先, 回退 1, 9
-    "30m": [2],          # 30分钟: cat=2
-    "1H":  [3],          # 1小时:  cat=3
-    "1D":  [4, 9],       # 日线:   cat=4, 回退 9
-    "1W":  [5],          # 周线:   cat=5
+_TF_CATEGORIES = {
+    "1m":  [8, 7],
+    "5m":  [0],
+    "15m": [1, 8, 9],
+    "30m": [2],
+    "1H":  [3],
+    "1D":  [4, 9],
+    "1W":  [5],
 }
 
-# 支持的周期集合（从映射表自动生成）
-_TDX_EX_SUPPORTED_TF = set(_TDX_EX_TF_CATEGORY.keys())
+_SUPPORTED_TF = set(_TF_CATEGORIES.keys())
+
+# HQ market 映射: 0=深A, 1=沪A
+_HQ_MARKET = {"SH": 1, "SZ": 0, "BJ": 0}
+
+# ExHQ market 映射: 28=沪A, 33=深A
+_EXHQ_MARKET = {"SH": 28, "SZ": 33, "BJ": 33}
 
 
 # ================================================================
-# 候选服务器
+# 候选服务器 — ExHQ (7727) + HQ (7709)
 # ================================================================
 
-TDX_EX_CANDIDATE_SERVERS = [
-    ("112.74.214.43", 7727), ("180.153.18.170", 7727), ("180.153.18.171", 7727),
-    ("60.191.117.167", 7727), ("115.238.56.198", 7727), ("115.238.90.165", 7727),
-    ("218.75.126.9", 7727), ("60.12.136.251", 7727), ("60.12.136.250", 7727),
-    ("119.147.212.81", 7727), ("124.160.88.183", 7727), ("101.227.73.20", 7727),
-    ("101.227.77.254", 7727), ("14.215.128.18", 7727), ("59.173.18.140", 7727),
-    ("60.28.23.80", 7727), ("221.231.141.60", 7727), ("113.105.142.162", 7727),
-    ("218.108.98.244", 7727), ("61.152.107.171", 7727), ("61.153.144.66", 7727),
-    ("218.108.47.69", 7727), ("180.153.39.51", 7727), ("118.114.77.13", 7727),
-    ("61.135.142.88", 7727), ("218.85.139.19", 7727), ("202.108.253.130", 7727),
-    ("202.108.253.131", 7727),
-    # 也试 7709 端口（少数服务器支持 ExHQ 握手）
-    ("180.153.18.170", 7709), ("60.12.136.251", 7709), ("60.12.136.250", 7709),
-    ("115.238.90.165", 7709), ("218.75.126.9", 7709), ("115.238.56.198", 7709),
+# pytdx 官方 HQ 服务器列表（端口 7709）:
+#   https://github.com/rainx/pytdx/blob/master/pytdx/config/hosts.py
+# 更新时可从此地址获取最新列表
+
+_CANDIDATE_SERVERS: List[Tuple[str, int, str]] = [
+    # === ExHQ 端口 7727 ===
+    ("112.74.214.43", 7727, "exhq"),
+    ("180.153.18.170", 7727, "exhq"),
+    ("180.153.18.171", 7727, "exhq"),
+    ("60.191.117.167", 7727, "exhq"),
+    ("115.238.56.198", 7727, "exhq"),
+    ("115.238.90.165", 7727, "exhq"),
+    ("218.75.126.9", 7727, "exhq"),
+    ("60.12.136.251", 7727, "exhq"),
+    ("60.12.136.250", 7727, "exhq"),
+    ("119.147.212.81", 7727, "exhq"),
+    ("124.160.88.183", 7727, "exhq"),
+    ("101.227.73.20", 7727, "exhq"),
+    ("101.227.77.254", 7727, "exhq"),
+    ("14.215.128.18", 7727, "exhq"),
+    ("59.173.18.140", 7727, "exhq"),
+    ("60.28.23.80", 7727, "exhq"),
+    ("221.231.141.60", 7727, "exhq"),
+    ("113.105.142.162", 7727, "exhq"),
+    ("218.108.98.244", 7727, "exhq"),
+    ("61.152.107.171", 7727, "exhq"),
+    ("61.153.144.66", 7727, "exhq"),
+    ("218.108.47.69", 7727, "exhq"),
+    ("180.153.39.51", 7727, "exhq"),
+    ("118.114.77.13", 7727, "exhq"),
+    ("61.135.142.88", 7727, "exhq"),
+    ("218.85.139.19", 7727, "exhq"),
+    ("202.108.253.130", 7727, "exhq"),
+    ("202.108.253.131", 7727, "exhq"),
+    # === HQ 端口 7709（pytdx 官方列表）===
+    ("218.85.139.19", 7709, "hq"),
+    ("218.85.139.20", 7709, "hq"),
+    ("58.23.131.163", 7709, "hq"),
+    ("218.6.170.47", 7709, "hq"),
+    ("123.125.108.14", 7709, "hq"),
+    ("180.153.18.170", 7709, "hq"),
+    ("180.153.18.171", 7709, "hq"),
+    ("180.153.18.172", 7709, "hq"),
+    ("202.108.253.130", 7709, "hq"),
+    ("202.108.253.131", 7709, "hq"),
+    ("202.108.253.139", 7709, "hq"),
+    ("60.191.117.167", 7709, "hq"),
+    ("115.238.56.198", 7709, "hq"),
+    ("218.75.126.9", 7709, "hq"),
+    ("115.238.90.165", 7709, "hq"),
+    ("124.160.88.183", 7709, "hq"),
+    ("60.12.136.250", 7709, "hq"),
+    ("218.108.98.244", 7709, "hq"),
+    ("218.108.47.69", 7709, "hq"),
+    ("223.94.89.115", 7709, "hq"),
+    ("218.57.11.101", 7709, "hq"),
+    ("58.58.33.123", 7709, "hq"),
+    ("14.17.75.71", 7709, "hq"),
+    ("114.80.63.12", 7709, "hq"),
+    ("114.80.63.35", 7709, "hq"),
+    ("180.153.39.51", 7709, "hq"),
+    ("119.147.212.81", 7709, "hq"),
+    ("221.231.141.60", 7709, "hq"),
+    ("101.227.73.20", 7709, "hq"),
+    ("101.227.77.254", 7709, "hq"),
+    ("14.215.128.18", 7709, "hq"),
+    ("59.173.18.140", 7709, "hq"),
+    ("60.28.23.80", 7709, "hq"),
+    ("218.60.29.136", 7709, "hq"),
+    ("122.192.35.44", 7709, "hq"),
+    ("112.95.140.74", 7709, "hq"),
+    ("112.95.140.92", 7709, "hq"),
+    ("112.95.140.93", 7709, "hq"),
+    ("114.80.149.19", 7709, "hq"),
+    ("114.80.149.21", 7709, "hq"),
+    ("114.80.149.22", 7709, "hq"),
+    ("114.80.149.91", 7709, "hq"),
+    ("114.80.149.92", 7709, "hq"),
+    ("121.14.104.60", 7709, "hq"),
+    ("121.14.104.66", 7709, "hq"),
+    ("123.126.133.13", 7709, "hq"),
+    ("123.126.133.14", 7709, "hq"),
+    ("123.126.133.21", 7709, "hq"),
+    ("211.139.150.61", 7709, "hq"),
+    ("59.36.5.11", 7709, "hq"),
+    ("119.29.19.242", 7709, "hq"),
+    ("123.138.29.107", 7709, "hq"),
+    ("123.138.29.108", 7709, "hq"),
+    ("124.232.142.29", 7709, "hq"),
+    ("183.57.72.11", 7709, "hq"),
+    ("183.57.72.12", 7709, "hq"),
+    ("183.57.72.13", 7709, "hq"),
+    ("183.57.72.15", 7709, "hq"),
+    ("183.57.72.21", 7709, "hq"),
+    ("183.57.72.22", 7709, "hq"),
+    ("183.57.72.23", 7709, "hq"),
+    ("183.57.72.24", 7709, "hq"),
+    ("183.60.224.177", 7709, "hq"),
+    ("183.60.224.178", 7709, "hq"),
+    ("113.105.92.100", 7709, "hq"),
+    ("113.105.92.101", 7709, "hq"),
+    ("113.105.92.102", 7709, "hq"),
+    ("113.105.92.103", 7709, "hq"),
+    ("113.105.92.104", 7709, "hq"),
+    ("113.105.92.99", 7709, "hq"),
+    ("117.34.114.13", 7709, "hq"),
+    ("117.34.114.14", 7709, "hq"),
+    ("117.34.114.15", 7709, "hq"),
+    ("117.34.114.16", 7709, "hq"),
+    ("117.34.114.17", 7709, "hq"),
+    ("117.34.114.18", 7709, "hq"),
+    ("117.34.114.20", 7709, "hq"),
+    ("117.34.114.27", 7709, "hq"),
+    ("117.34.114.30", 7709, "hq"),
+    ("117.34.114.31", 7709, "hq"),
+    ("182.131.3.252", 7709, "hq"),
+    ("183.60.224.11", 7709, "hq"),
+    ("58.210.106.91", 7709, "hq"),
+    ("58.63.254.216", 7709, "hq"),
+    ("58.63.254.219", 7709, "hq"),
+    ("58.63.254.247", 7709, "hq"),
+    ("123.125.108.90", 7709, "hq"),
+    ("175.6.5.153", 7709, "hq"),
+    ("182.118.47.151", 7709, "hq"),
+    ("182.131.3.245", 7709, "hq"),
+    ("202.100.166.27", 7709, "hq"),
+    ("222.161.249.156", 7709, "hq"),
+    ("42.123.69.62", 7709, "hq"),
+    ("58.63.254.191", 7709, "hq"),
+    ("58.63.254.217", 7709, "hq"),
 ]
 
 # ================================================================
 # 服务器探测 & 连接池
 # ================================================================
 
-_live_servers: List[tuple] = []
+# _live_servers: [(host, port, proto), ...]  proto = "exhq" | "hq"
+_live_servers: List[Tuple[str, int, str]] = []
 _server_lock = threading.Lock()
 _server_idx = [0]
 _discovered = False
@@ -107,7 +239,7 @@ _discover_lock = threading.Lock()
 
 
 def _discover_servers(force: bool = False):
-    """并行探测 ExHQ 服务器，按延迟排序。force=True 强制重新探测"""
+    """并行探测 ExHQ + HQ 服务器，按延迟排序。force=True 强制重新探测"""
     global _live_servers, _discovered
     with _discover_lock:
         if _discovered and not force:
@@ -115,66 +247,89 @@ def _discover_servers(force: bool = False):
         _discovered = True
         _live_servers = []
 
-    results = []
+    results = []  # [(host, port, proto, latency)]
 
-    def _probe(host, port):
+    def _probe(host, port, proto):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(2)
             t0 = time.time()
             s.connect((host, port))
-            lat = time.time() - t0
+            latency = time.time() - t0
             s.close()
-            # 验证 ExHQ 握手 + 能拉数据
-            try:
-                api = TdxExHq_API()
-                api.connect(host, port, time_out=3)
-                data = None
-                for mkt in [28, 33, 0, 1]:
-                    try:
-                        data = api.get_instrument_bars(9, mkt, '000001', 0, 1)
-                        if data:
-                            break
-                    except Exception:
-                        continue
-                api.disconnect()
-                if data:
-                    results.append((host, port, lat))
-            except Exception:
-                pass
+
+            # 验证协议握手 + 能拉数据
+            if proto == "exhq" and HAS_TDX:
+                try:
+                    api = TdxExHq_API()
+                    api.connect(host, port, time_out=3)
+                    data = None
+                    for mkt in [28, 33, 0, 1]:
+                        try:
+                            data = api.get_instrument_bars(9, mkt, '000001', 0, 1)
+                            if data:
+                                break
+                        except Exception:
+                            continue
+                    api.disconnect()
+                    if data:
+                        results.append((host, port, "exhq", latency))
+                        return
+                except Exception:
+                    pass
+
+            if proto == "hq" and HAS_HQ:
+                try:
+                    api = TdxHq_API()
+                    api.connect(host, port, time_out=3)
+                    data = api.get_security_bars(9, 1, '600519', 0, 1)
+                    api.disconnect()
+                    if data:
+                        results.append((host, port, "hq", latency))
+                        return
+                except Exception:
+                    pass
         except Exception:
             pass
 
     threads = [
-        threading.Thread(target=_probe, args=(h, p), daemon=True)
-        for h, p in TDX_EX_CANDIDATE_SERVERS
+        threading.Thread(target=_probe, args=(h, p, proto), daemon=True)
+        for h, p, proto in _CANDIDATE_SERVERS
     ]
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=8)
-    results.sort(key=lambda x: x[2])
-    _live_servers = [(h, p) for h, p, _ in results]
-    logger.info("[TDX ExHQ] 服务器探测完成: %d 个可用", len(_live_servers))
+        t.join(timeout=10)
+    results.sort(key=lambda x: x[3])  # 按延迟排序
+    _live_servers = [(h, p, proto) for h, p, proto, _ in results]
+
+    exhq_count = sum(1 for _, _, p, _ in results if p == "exhq")
+    hq_count = sum(1 for _, _, p, _ in results if p == "hq")
+    logger.info("[TDX] 服务器探测完成: %d 个可用 (ExHQ=%d, HQ=%d)",
+                len(_live_servers), exhq_count, hq_count)
 
 
-# 线程本地连接池
+# 线程本地连接池: 存储 (api, proto)
 _conn_pool = threading.local()
 
 
-def _get_conn():
-    """获取当前线程的 ExHQ 连接，断了自动重连"""
-    conn = getattr(_conn_pool, 'conn', None)
-    if conn:
+def _get_conn() -> Optional[Tuple[Any, str]]:
+    """获取当前线程的连接 (api, proto)，断了自动重连"""
+    conn_info = getattr(_conn_pool, 'conn_info', None)
+    if conn_info:
+        api, proto = conn_info
         try:
-            conn.get_instrument_count(0)
-            return conn
+            if proto == "exhq":
+                api.get_instrument_count(0)
+            else:
+                api.get_security_count(0)
+            return conn_info
         except Exception:
             try:
-                conn.disconnect()
+                api.disconnect()
             except Exception:
                 pass
-            _conn_pool.conn = None
+            _conn_pool.conn_info = None
 
     if not _live_servers:
         _discover_servers(force=True)
@@ -186,22 +341,39 @@ def _get_conn():
         with _server_lock:
             idx = _server_idx[0] % n
             _server_idx[0] += 1
-        host, port = _live_servers[idx]
+        host, port, proto = _live_servers[idx]
         try:
-            api = TdxExHq_API()
-            api.connect(host, port, time_out=3)
-            _conn_pool.conn = api
-            return api
+            if proto == "exhq" and HAS_TDX:
+                api = TdxExHq_API()
+                api.connect(host, port, time_out=3)
+                _conn_pool.conn_info = (api, "exhq")
+                return _conn_pool.conn_info
+            elif proto == "hq" and HAS_HQ:
+                api = TdxHq_API()
+                api.connect(host, port, time_out=3)
+                _conn_pool.conn_info = (api, "hq")
+                return _conn_pool.conn_info
         except Exception:
             continue
     return None
+
+
+def _release_conn():
+    """释放当前线程的连接"""
+    conn_info = getattr(_conn_pool, 'conn_info', None)
+    if conn_info:
+        try:
+            conn_info[0].disconnect()
+        except Exception:
+            pass
+        _conn_pool.conn_info = None
 
 
 # ================================================================
 # 核心数据获取
 # ================================================================
 
-def _fetch_tdx_ex_kline(
+def _fetch_kline(
     code: str,
     timeframe: str = "15m",
     limit: int = 200,
@@ -209,56 +381,71 @@ def _fetch_tdx_ex_kline(
     """
     获取单只股票K线数据，支持 1m/5m/15m/30m/1H/1D/1W。
 
-    通过 ExHQ 协议获取，不同服务器可能对 category 支持不同，
-    所以每个周期尝试多个 category 值。
+    ExHQ 和 HQ 双协议自动切换。
     """
-    if not HAS_TDX or not _live_servers:
-        return None
-
-    categories = _TDX_EX_TF_CATEGORY.get(timeframe)
+    categories = _TF_CATEGORIES.get(timeframe)
     if not categories:
-        return None  # 不支持的周期
+        return None
 
     nc = normalize_cn_code(code)
-    if nc.startswith("sh"):
-        market = 28  # 沪A
-    elif nc.startswith("sz"):
-        market = 33  # 深A
-    else:
-        market = 33  # 北交所归深A
+    market_sh = nc.startswith("sh")
     symbol = nc[2:]
 
-    api = _get_conn()
-    if not api:
+    conn_info = _get_conn()
+    if not conn_info:
         return None
+
+    api, proto = conn_info
+
+    # 根据协议选择 market 映射
+    if proto == "exhq":
+        market = 28 if market_sh else 33
+        fetch_fn = lambda cat, mkt, sym, start, count: api.get_instrument_bars(cat, mkt, sym, start, count)
+    else:
+        market = 1 if market_sh else 0
+        fetch_fn = lambda cat, mkt, sym, start, count: api.get_security_bars(cat, mkt, sym, start, count)
 
     # 尝试多个 category
     data = None
     for cat in categories:
         try:
-            data = api.get_instrument_bars(cat, market, symbol, 0, limit)
+            data = fetch_fn(cat, market, symbol, 0, limit)
             if data:
                 break
         except Exception:
+            # 连接断了，释放后重试
+            _release_conn()
+            conn_info = _get_conn()
+            if not conn_info:
+                return None
+            api, proto = conn_info
+            if proto == "exhq":
+                market = 28 if market_sh else 33
+                fetch_fn = lambda cat, mkt, sym, start, count: api.get_instrument_bars(cat, mkt, sym, start, count)
+            else:
+                market = 1 if market_sh else 0
+                fetch_fn = lambda cat, mkt, sym, start, count: api.get_security_bars(cat, mkt, sym, start, count)
             continue
 
     if not data:
         return None
 
+    # 日线/周线只保留日期，分钟线保留完整时间
+    _daily_tfs = {"1D", "1W"}
     result = []
     for bar in data:
         dt = str(bar.get("datetime", ""))
         if not dt:
             continue
         try:
-            # pytdx 返回 "YYYY-MM-DD HH:MM" 格式
             if "-" in dt and ":" in dt:
-                ts = dt[:16]
+                ts = dt[:10] if timeframe in _daily_tfs else dt[:16] + ":00"
             elif len(dt) == 8 and dt.isdigit():
                 ts = f"{dt[:4]}-{dt[4:6]}-{dt[6:8]}"
             else:
                 try:
-                    ts = datetime.fromtimestamp(int(float(dt))).strftime("%Y-%m-%d %H:%M:%S")
+                    _dt = datetime.fromtimestamp(int(float(dt)))
+                    ts = _dt.strftime("%Y-%m-%d") if timeframe in _daily_tfs else _dt.strftime("%Y-%m-%d %H:%M") + ":00"
                 except (ValueError, OSError):
                     continue
             result.append({
@@ -279,6 +466,124 @@ def _fetch_tdx_ex_kline(
     return result[-limit:] if len(result) > limit else result
 
 
+def _fetch_quote(code: str) -> Optional[Dict[str, Any]]:
+    """获取单只股票实时行情"""
+    nc = normalize_cn_code(code)
+    market_sh = nc.startswith("sh")
+    symbol = nc[2:]
+
+    conn_info = _get_conn()
+    if not conn_info:
+        return None
+
+    api, proto = conn_info
+
+    try:
+        if proto == "exhq":
+            market = 28 if market_sh else 33
+            data = api.get_instrument_quotes([(market, symbol)])
+        else:
+            market = 1 if market_sh else 0
+            data = api.get_security_quotes([(market, symbol)])
+
+        if not data or len(data) == 0:
+            return None
+
+        q = data[0] if isinstance(data, list) else data
+        last = float(q.get("price", 0) or 0)
+        if last <= 0:
+            return None
+
+        prev = float(q.get("last_close", 0) or 0)
+        open_p = float(q.get("open", 0) or last)
+        high = float(q.get("high", 0) or last)
+        low = float(q.get("low", 0) or last)
+        chg = round(last - prev, 4) if prev else 0
+        vol = float(q.get("vol", 0) or 0) * 100  # pytdx 返回"手"，需 *100 转"股"
+
+        return {
+            "last": last,
+            "change": chg,
+            "changePercent": round(chg / prev * 100, 2) if prev else 0,
+            "high": high,
+            "low": low,
+            "open": open_p,
+            "previousClose": prev,
+            "volume": vol, "time": "",
+            "name": "",
+            "symbol": symbol,
+        }
+    except Exception as e:
+        logger.debug("[TDX] fetch_quote %s 失败: %s", code, e)
+        _release_conn()
+        return None
+
+
+def _fetch_batch_quotes(codes: List[str]) -> Dict[str, Dict[str, Any]]:
+    """批量实时行情"""
+    conn_info = _get_conn()
+    if not conn_info:
+        return {}
+
+    api, proto = conn_info
+
+    # 构建请求参数
+    pairs = []       # [(market, symbol), ...]
+    code_map = {}    # index → normalized code
+    for raw_code in codes:
+        nc = normalize_cn_code(raw_code)
+        market_sh = nc.startswith("sh")
+        symbol = nc[2:]
+        if proto == "exhq":
+            market = 28 if market_sh else 33
+        else:
+            market = 1 if market_sh else 0
+        pairs.append((market, symbol))
+        code_map[len(pairs) - 1] = nc
+
+    result: Dict[str, Dict[str, Any]] = {}
+
+    try:
+        if proto == "exhq":
+            data = api.get_instrument_quotes(pairs)
+        else:
+            data = api.get_security_quotes(pairs)
+
+        if not data:
+            return {}
+
+        for i, q in enumerate(data):
+            if not isinstance(q, dict):
+                continue
+            nc = code_map.get(i)
+            if not nc:
+                continue
+            last = float(q.get("price", 0) or 0)
+            if last <= 0:
+                continue
+            prev = float(q.get("last_close", 0) or 0)
+            chg = round(last - prev, 4) if prev else 0
+            vol = float(q.get("vol", 0) or 0) * 100  # pytdx 返回"手"，需 *100 转"股"
+            result[nc] = {
+                "last": last,
+                "change": chg,
+                "changePercent": round(chg / prev * 100, 2) if prev else 0,
+                "high": float(q.get("high", 0) or last),
+                "low": float(q.get("low", 0) or last),
+                "open": float(q.get("open", 0) or last),
+                "previousClose": prev,
+                "volume": vol,
+                "time": "",
+                "name": "",
+                "symbol": nc[2:],
+            }
+    except Exception as e:
+        logger.debug("[TDX] fetch_batch_quotes 失败: %s", e)
+        _release_conn()
+
+    return result
+
+
 # ================================================================
 # 前复权（共享模块）
 # ================================================================
@@ -291,14 +596,14 @@ from app.data_sources.provider.adjustment import apply_fwd_adjust as _apply_fwd_
 
 class TdxExDataSource:
     """
-    通达信扩展行情数据源 — ExHQ 协议（priority=22）。
+    通达信数据源 — pytdx 二进制协议（priority=22）。
 
-    与 tdx provider（d.10jqka.com.cn HTTP）完全独立。
-    使用 pytdx TdxExHq_API，端口 7727。
+    与 10jqka provider（d.10jqka.com.cn HTTP）完全独立。
+    自动探测 ExHQ (7727) 和 HQ (7709) 双协议服务器。
 
     能力:
       - K线: 1m/5m/15m/30m/1H/1D/1W
-      - 行情: 单只/批量实时行情（get_instrument_quotes）
+      - 行情: 单只/批量实时行情
       - 全市场批量: 并发获取
 
     线程安全性:
@@ -306,16 +611,20 @@ class TdxExDataSource:
       - 自动探测可用服务器
 
     依赖:
-      - pytdx 未安装时不注册（避免 capabilities 与实际能力不匹配）
+      - pytdx 未安装时不注册
     """
 
     name = "tdx_ex"
     priority = 22
+    max_concurrency = 8
+    min_interval = 0.0
+    jitter_min = 0.0
+    jitter_max = 0.0
 
     capabilities = {
         "kline": True,
         "kline_priority": 22,
-        "kline_tf": _TDX_EX_SUPPORTED_TF,
+        "kline_tf": _SUPPORTED_TF,
         "kline_batch": True,
         "kline_batch_priority": 22,
         "quote": True,
@@ -327,12 +636,12 @@ class TdxExDataSource:
     }
 
     def __init__(self):
-        """启动时探测 ExHQ 服务器"""
+        """启动时探测服务器"""
         _discover_servers()
 
     def prepare(self) -> bool:
-        """下载前准备: 确保有可用的 ExHQ 服务器"""
-        if not HAS_TDX:
+        """下载前准备: 确保有可用服务器"""
+        if not HAS_TDX and not HAS_HQ:
             return False
         if not _live_servers:
             _discover_servers(force=True)
@@ -344,226 +653,68 @@ class TdxExDataSource:
         start_date: str = "", end_date: str = "",
     ) -> List[Dict[str, Any]]:
         """获取单只股票K线，支持 1m/5m/15m/30m/1H/1D/1W"""
-        if timeframe not in _TDX_EX_TF_CATEGORY:
+        if timeframe not in _TF_CATEGORIES:
             return NotSupportedResult(self.name, "fetch_kline", f"不支持 {timeframe} 周期")
 
-        if not HAS_TDX:
+        if not HAS_TDX and not HAS_HQ:
             return NotSupportedResult(self.name, "fetch_kline", "未安装 pytdx")
 
         if not _live_servers:
-            return NotSupportedResult(self.name, "fetch_kline", "无可用 ExHQ 服务器")
+            return NotSupportedResult(self.name, "fetch_kline", "无可用服务器")
 
         if start_date:
             from app.data_sources.provider import calc_kline_count
             count = calc_kline_count(timeframe, start_date, end_date)
 
-        data = _fetch_tdx_ex_kline(code, timeframe, count)
+        data = _fetch_kline(code, timeframe, count)
         if not data:
             return []
 
-        # 前复权
         if adj == "qfq":
             data = _apply_fwd_adjust(data, code)
 
         return data
 
     def fetch_market_kline(
-        self, timeframe: str = "1D", count: int = 300,
+        self, timeframe: str, count: int = 300,
         adj: str = "qfq", timeout: int = 15,
         start_date: str = "", end_date: str = "",
         symbols: Optional[List[str]] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
-        """全市场批量K线 — 并发获取"""
-        if timeframe not in _TDX_EX_TF_CATEGORY:
-            return NotSupportedResult(self.name, "fetch_market_kline", f"不支持 {timeframe} 周期")
-
-        if not HAS_TDX or not _live_servers:
-            return NotSupportedResult(self.name, "fetch_market_kline", "未安装 pytdx 或无可用服务器")
-
-        from queue import Queue, Empty
-
-        if not symbols:
-            from app.utils.basicinfo_db import get_stock_basic_db
-            symbols = get_stock_basic_db().market_all_codes(status="active")
+        """批量K线 — Coordinator 统管线程+限流，本方法逐只调用 fetch_kline"""
         if not symbols:
             return {}
-
-        if start_date:
-            from app.data_sources.provider import calc_kline_count
-            count = calc_kline_count(timeframe, start_date, end_date)
-
-        group_size = 50
-        groups = [symbols[i:i + group_size] for i in range(0, len(symbols), group_size)]
-        q: Queue = Queue()
-        for idx, g in enumerate(groups):
-            q.put((idx, g))
-
         result: Dict[str, List[Dict[str, Any]]] = {}
-        lock = threading.Lock()
-
-        def _fetch_one(code):
+        for code in symbols:
             try:
-                data = _fetch_tdx_ex_kline(code, timeframe, count)
-                if data:
-                    if adj == "qfq":
-                        data = _apply_fwd_adjust(data, code)
-                    nc = normalize_cn_code(code)
-                    with lock:
-                        result[nc] = data
-            except Exception:
-                pass
-
-        def _worker():
-            while True:
-                try:
-                    _, stocks = q.get(timeout=5)
-                except Empty:
-                    break
-                with ThreadPoolExecutor(max_workers=min(len(stocks), 8)) as pool:
-                    futs = [pool.submit(_fetch_one, s) for s in stocks]
-                    for f in futs:
-                        try:
-                            f.result()
-                        except Exception:
-                            pass
-                q.task_done()
-
-        workers = []
-        for _ in range(min(30, len(groups))):
-            t = threading.Thread(target=_worker, daemon=True)
-            workers.append(t)
-            t.start()
-
-        for t in workers:
-            t.join(timeout=timeout)
-
-        logger.info("[TDX ExHQ] 全市场完成: %d只", len(result))
+                bars = self.fetch_kline(
+                    code, timeframe, count,
+                    adj=adj, timeout=timeout,
+                    start_date=start_date, end_date=end_date,
+                )
+                if bars:
+                    result[code] = bars
+            except Exception as e:
+                logger.debug("[fetch_market_kline] %s 失败: %s", code, e)
         return result
 
     def fetch_ticker(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
-        """获取单只股票实时行情 — 通过 ExHQ get_instrument_quotes"""
-        if not HAS_TDX or not _live_servers:
-            return NotSupportedResult(self.name, "fetch_ticker", "未安装 pytdx 或无可用服务器")
-
-        nc = normalize_cn_code(code)
-        if nc.startswith("sh"):
-            market = 28
-        elif nc.startswith("sz"):
-            market = 33
-        else:
-            market = 33
-        symbol = nc[2:]
-
-        api = _get_conn()
-        if not api:
-            return None
-
-        try:
-            # get_instrument_quotes: [(market, code), ...] → list of dicts
-            data = api.get_instrument_quotes([(market, symbol)])
-            if not data or len(data) == 0:
-                return None
-
-            q = data[0] if isinstance(data, list) else data
-            last = float(q.get("price", 0) or 0)
-            if last <= 0:
-                return None
-
-            prev = float(q.get("last_close", 0) or 0)
-            open_p = float(q.get("open", 0) or last)
-            high = float(q.get("high", 0) or last)
-            low = float(q.get("low", 0) or last)
-            chg = round(last - prev, 4) if prev else 0
-            vol = float(q.get("vol", 0) or 0)
-
-            return {
-                "last": last,
-                "change": chg,
-                "changePercent": round(chg / prev * 100, 2) if prev else 0,
-                "high": high,
-                "low": low,
-                "open": open_p,
-                "previousClose": prev,
-                "volume": vol, "time": "",
-                "name": "",
-                "symbol": symbol,
-            }
-        except Exception as e:
-            logger.debug("[TDX ExHQ] fetch_ticker %s 失败: %s", code, e)
-            try:
-                _conn_pool.conn.disconnect()
-            except Exception:
-                pass
-            _conn_pool.conn = None
-            return None
+        """获取单只股票实时行情"""
+        if not HAS_TDX and not HAS_HQ:
+            return NotSupportedResult(self.name, "fetch_ticker", "未安装 pytdx")
+        if not _live_servers:
+            return NotSupportedResult(self.name, "fetch_ticker", "无可用服务器")
+        return _fetch_quote(code)
 
     def fetch_batch_quotes(self, codes: List[str], timeout: int = 10) -> Dict[str, Dict[str, Any]]:
-        """批量实时行情 — 通过 ExHQ get_instrument_quotes 一次拿多只"""
-        if not HAS_TDX or not _live_servers:
-            return NotSupportedResult(self.name, "fetch_batch_quotes", "未安装 pytdx 或无可用服务器")
-
-        api = _get_conn()
-        if not api:
-            return NotSupportedResult(self.name, "fetch_batch_quotes", "无可用连接")
-
-        # 构建 [(market, code), ...]
-        pairs = []
-        code_map = {}  # index → normalized code
-        for raw_code in codes:
-            nc = normalize_cn_code(raw_code)
-            if nc.startswith("sh"):
-                market = 28
-            elif nc.startswith("sz"):
-                market = 33
-            else:
-                market = 33
-            pairs.append((market, nc[2:]))
-            code_map[len(pairs) - 1] = nc
-
-        result: Dict[str, Dict[str, Any]] = {}
-
-        try:
-            # get_instrument_quotes 一次可拿多只
-            data = api.get_instrument_quotes(pairs)
-            if not data:
-                return {}
-
-            for i, q in enumerate(data):
-                if not isinstance(q, dict):
-                    continue
-                nc = code_map.get(i)
-                if not nc:
-                    continue
-                last = float(q.get("price", 0) or 0)
-                if last <= 0:
-                    continue
-                prev = float(q.get("last_close", 0) or 0)
-                chg = round(last - prev, 4) if prev else 0
-                vol = float(q.get("vol", 0) or 0)
-                result[nc] = {
-                    "last": last,
-                    "change": chg,
-                    "changePercent": round(chg / prev * 100, 2) if prev else 0,
-                    "high": float(q.get("high", 0) or last),
-                    "low": float(q.get("low", 0) or last),
-                    "open": float(q.get("open", 0) or last),
-                    "previousClose": prev,
-                    "volume": vol,
-                    "time": "",
-                    "name": "",
-                    "symbol": nc[2:],
-                }
-        except Exception as e:
-            logger.debug("[TDX ExHQ] fetch_batch_quotes 失败: %s", e)
-            try:
-                _conn_pool.conn.disconnect()
-            except Exception:
-                pass
-            _conn_pool.conn = None
-
-        return result
+        """批量实时行情"""
+        if not HAS_TDX and not HAS_HQ:
+            return NotSupportedResult(self.name, "fetch_batch_quotes", "未安装 pytdx")
+        if not _live_servers:
+            return NotSupportedResult(self.name, "fetch_batch_quotes", "无可用服务器")
+        return _fetch_batch_quotes(codes)
 
 
-# 仅在 pytdx 可用时注册，避免 capabilities 声明支持但实际全部 NotSupported
-if HAS_TDX:
+# 仅在 pytdx 可用时注册
+if HAS_TDX or HAS_HQ:
     register(priority=22)(TdxExDataSource)

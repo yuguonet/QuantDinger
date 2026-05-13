@@ -2,15 +2,25 @@
 """
 前复权共享模块 — 统一 TDX 除权除息数据获取与前复权因子计算
 
-从 6 个 provider (tdx, sina, em_trends2, akline_market, tdx_ex, sohu) 中
-抽取的重复逻辑。对外暴露 3 个公开函数:
-  - fetch_xdxr(code)        — 获取 TDX 除权除息原始数据
+使用此模块的 Provider:
+  tdx_ex, sina, em_trends2, sohu, 10jqka（通过 from adjustment import apply_fwd_adjust）
+  注意: xueqiu 不需要（API原生返回前复权数据），baidu 不支持复权
+
+API来源:
+  - 除权除息数据来自 pytdx 的 get_xdxr_info(market, symbol)
+  - 需要 pytdx 库 + 可用TDX服务器（自动探测）
+  - 无pytdx时跳过复权，返回原始不复权数据
+
+对外暴露 3 个公开函数:
+  - fetch_xdxr(code)             — 获取 TDX 除权除息原始数据
   - build_fwd_factor(code, klines) — 构建前复权因子（内存缓存 + JSON 文件缓存）
   - apply_fwd_adjust(klines, code) — 对 K 线施加前复权
 
 前复权公式 (标准通达信算法):
-  对每次除权除息，因子 = (除权前收盘价 - 每股分红) / (除权前收盘价 * (1 + 送转比 + 配股比))
+  对每次除权除息事件:
+    factor = (除权前收盘价 - 每股分红) / (除权前收盘价 * (1 + 送转比 + 配股比))
   累乘所有事件的因子得到累积因子，用于乘以历史价格。
+  TDX原始数据: fenhong=每10股分红(元), songzhuangu=每10股送转(股), peigu=每10股配股(股)
 
 缓存策略:
   - 内存缓存: {code: [(date_str, cum_factor), ...]}，进程生命周期有效

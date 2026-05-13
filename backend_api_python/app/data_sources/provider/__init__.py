@@ -25,8 +25,26 @@ A股数据源 Provider 框架 — 自注册 + 能力声明 + 统一接口
   - pkgutil / importlib: 自动发现机制
 
 已实现 Provider:
-  CNStock (A股)  → tencent(10), sina(20), eastmoney(30), akshare(50)
-  CNStock (A股) → tencent(10), sina(20), eastmoney(30)
+  em_trends2(5)  — 东财trends2极速源，1m聚合，仅当天数据
+  tencent(10)    — 腾讯财经，A股首选，全周期K线+原生批量行情
+  sina(15)       — 新浪财经，A股第二选择，全周期K线+原生批量行情
+  10jqka(20)     — 同花顺HTTP接口，分钟级分时+日/周K线，无批量行情
+  tdx_ex(22)     — pytdx二进制协议，全周期K线+原生批量行情，需pytdx库
+  eastmoney(25)  — 东方财富，全周期K线+原生全市场批量行情(clist一次6000只)
+  xueqiu(40)     — 雪球，全周期K线(原生前复权)，需cookie
+  sohu(45)       — 搜狐，日/周/月线K线，无行情接口
+  baidu(50)      — 百度股市通，全周期K线(分钟级ktype命名:min1/min5/.../min60)，无复权
+
+各源单位速查（volume是否需要×100转"股"）:
+  tencent:    行情×100, K线×100  ← 原始返回"手"
+  sina:       行情不×,  K线不×   ← 原始返回"股"
+  eastmoney:  行情×100, K线不×   ← ticker/clist返回"手"，kline返回"股"
+  em_trends2: 已×100             ← trends2返回"手"，代码中已转
+  10jqka:     行情不×,  K线不×   ← 原始返回"股"
+  tdx_ex:     行情×100, K线不×   ← 行情返回"手"，K线返回"股"
+  xueqiu:     行情不×,  K线不×   ← 原始返回"股"
+  sohu:       K线×100            ← 原始返回"手"
+  baidu:      行情不×,  K线不×   ← 原始返回"股"
 
 待实现 Provider (仅预留常量，暂不注册):
   USStock (美股) → yfinance / twelvedata / finnhub
@@ -298,65 +316,6 @@ def _bars_elapsed_today(timeframe: str) -> int:
     return min(minutes // step, bars_per_day)
 
 
-def _batch_fetch_kline_by_codes(
-    provider,
-    timeframe: str = "1D",
-    count: int = 300,
-    adj: str = "qfq",
-    timeout: int = 15,
-    start_date: str = "",
-    end_date: str = "",
-    batch_size: int = 500,
-    symbols: Optional[List[str]] = None,
-) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    通过多次并发调用 fetch_kline 拼出全市场K线。
-
-    用于不支持原生全市场K线的 Provider（如新浪、腾讯，单次HTTP限 ~500 只）。
-
-    Args:
-        provider:    Provider 实例（需有 fetch_kline 方法）
-        timeframe:   K线周期
-        count:       每只股票的数据条数
-        adj:         复权方式
-        timeout:     单次请求超时秒数
-        start_date:  起始日期
-        end_date:    结束日期
-        batch_size:  每批并发的股票数量
-        symbols:     股票代码列表，为 None 时自动从 DB 获取
-
-    Returns:
-        全市场K线字典 {code: kline_bars}
-    """
-    import concurrent.futures
-    if not symbols:
-        from app.utils.basicinfo_db import get_stock_basic_db
-        symbols = get_stock_basic_db().market_all_codes(status="active")
-    if not symbols:
-        return {}
-    result: Dict[str, List[Dict[str, Any]]] = {}
-    lock = threading.Lock()
-
-    for i in range(0, len(symbols), batch_size):
-        batch = symbols[i:i + batch_size]
-
-        def _fetch_one(code: str):
-            bars = provider.fetch_kline(
-                code, timeframe, count, adj=adj, timeout=timeout,
-                start_date=start_date, end_date=end_date,
-            )
-            if bars:
-                with lock:
-                    result[normalize_cn_code(code)] = bars
-
-        max_workers = min(len(batch), 8)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = [pool.submit(_fetch_one, c) for c in batch]
-            concurrent.futures.wait(futures, timeout=timeout + 5)
-
-    return result
-
-
 @runtime_checkable
 class BaseDataSource(Protocol):
     """
@@ -385,11 +344,19 @@ class BaseDataSource(Protocol):
             - batch_quote: bool  是否支持批量行情
             - hk: bool           是否支持港股
             - markets: set       支持的市场集合
+        max_concurrency: 最大并发线程数（Coordinator 据此分配 worker）
+        min_interval:    最小请求间隔（秒），0 表示不限流
+        jitter_min:      抖动下限（秒）
+        jitter_max:      抖动上限（秒）
     """
 
     name: str
     priority: int  # 越小越优先，默认 100
     capabilities: Dict[str, Any]
+    max_concurrency: int  # Coordinator 分配线程数的上限
+    min_interval: float   # 最小请求间隔（秒），0 = 不限流
+    jitter_min: float     # 抖动下限（秒）
+    jitter_max: float     # 抖动上限（秒）
 
     def prepare(self) -> bool:
         """
@@ -593,31 +560,6 @@ def get_providers(
         providers.sort(key=lambda p: getattr(p, 'priority', 100))
 
     return providers
-
-
-def get_providers_with_batch(
-    timeframe: str = None,
-    market: str = None,
-) -> List[Tuple[BaseDataSource, bool]]:
-    """
-    获取 Provider 列表，同时标记每个源是否支持全市场批量K线。
-
-    用于 Coordinator 层判断是否可以调用 fetch_market_kline。
-
-    Args:
-        timeframe: 过滤K线周期
-        market:    过滤市场类型
-
-    Returns:
-        [(provider, has_batch), ...] 按 priority 排序。
-        has_batch 为 True 表示该源支持 fetch_market_kline。
-    """
-    providers = get_providers("kline", timeframe=timeframe, market=market)
-    result = []
-    for p in providers:
-        has_batch = p.capabilities.get("kline_batch", False)
-        result.append((p, has_batch))
-    return result
 
 
 def get_provider(name: str) -> Optional[BaseDataSource]:

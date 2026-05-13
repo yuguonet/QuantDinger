@@ -2,28 +2,26 @@
 """
 新浪财经数据源 Provider
 
-模块职责:
-  通过新浪财经 API 获取 A股的 K线和实时行情数据。
-  新浪是国内直连、无需API Key的数据源，速度较快，作为A股第二选择（priority=20）。
+API来源 & 最新信息:
+  - 浏览器F12抓包 https://finance.sina.com.cn/ 观察请求
+  - 行情: hq.sinajs.cn/list=sh600519（经典接口）
+  - K线日线(主): money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData
+  - K线日线(备): quotes.sina.cn/cn/api/json_v2.php (JSONP格式)
+  - K线分钟: 同上两个接口，scale参数(1/5/15/30/60)
+  - hisdata兜底: finance.sina.com.cn/realstock/company/{code}/hisdata/klc_kl.js（正则解析）
+  - 注意: money.finance 的1分钟返回null，必须用quotes.sina.cn
 
-能力:
-  - K线: 日线 + 分钟线（1m/5m/15m/30m/1H），支持前/后复权
-  - 单只行情: 实时行情快照（hq.sinajs.cn）
-  - 批量行情: 单次HTTP获取多只股票行情（每批最多500只）
+支持的功能:
+  - K线: ✅ 1m/5m/15m/30m/1H/1D（不含1W）
+  - fetch_ticker: ✅ 单只实时行情（hq.sinajs.cn）
+  - fetch_batch_quotes: ✅ 原生批量（hq.sinajs.cn/list=a,b,c 500只/批）
+  - fetch_market_kline: ✅ 逐只调用fetch_kline
 
-特点:
-  - 国内直连，无需API Key
-  - 行情响应速度快（hq.sinajs.cn 是经典接口）
-  - K线数据通过正则解析 hisdata 页面（兜底机制）
-
-在架构中的位置:
-  KlineService → DataSourceFactory → Coordinator → SinaDataSource（本模块）
-
-关键依赖:
-  - requests: HTTP 请求
-  - re: 正则表达式（解析 hisdata 页面）
-  - app.data_sources.normalizer: 股票代码标准化（to_sina_code）
-  - app.data_sources.rate_limiter: 限流器
+单位注意（重要）:
+  - fetch_ticker: parts[3]=最新价(元), parts[8]=成交量(股), 不需要×100
+  - fetch_batch_quotes: 同上，parts[8]已是"股"
+  - fetch_kline: volume字段直接是"股"，不需要×100
+  - 所有价格单位都是"元"，不需要÷
 """
 
 from __future__ import annotations
@@ -41,7 +39,7 @@ import requests
 
 from app.data_sources.normalizer import normalize_cn_code as to_sina_code
 from app.data_sources.rate_limiter import (
-    get_request_headers, retry_with_backoff, RateLimiter, get_shared_session,
+    get_request_headers, RateLimiter, get_shared_session,
 )
 from app.data_sources.provider import register, NotSupportedResult
 from app.utils.logger import get_logger
@@ -84,17 +82,10 @@ _sina_quote_referers = _RefererPool([
 
 
 # ================================================================
-# 限流器
+# 限流器 — 仅非 market_kline 路径使用（fetch_ticker/fetch_batch_quotes）
+# market_kline 路径的限流已移至 Coordinator 统一管理
 # ================================================================
 
-# K线请求限流器: 最小间隔1.5秒，抖动0.8-2.5秒
-_sina_limiter = RateLimiter(
-    min_interval=1.5,
-    jitter_min=0.8,
-    jitter_max=2.5,
-)
-
-# 行情请求限流器: 最小间隔0.8秒，抖动0.3-1.2秒（行情可以更快）
 _sina_quote_limiter = RateLimiter(
     min_interval=0.8,
     jitter_min=0.3,
@@ -139,7 +130,7 @@ def _parse_sina_quote(text: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _sina_kline_to_dicts(data: list, count: int) -> List[Dict[str, Any]]:
+def _sina_kline_to_dicts(data: list, count: int, scale: int = 0) -> List[Dict[str, Any]]:
     """将新浪K线JSON数据转换为标准化字典列表"""
     out: List[Dict[str, Any]] = []
     for item in data:
@@ -154,6 +145,15 @@ def _sina_kline_to_dicts(data: list, count: int) -> List[Dict[str, Any]]:
             v = float(item.get("volume", 0))
             if o == 0 and c == 0:
                 continue
+            # 统一时间格式: 日线 YYYY-MM-DD, 分时线 YYYY-MM-DD HH:MM:00
+            if scale and scale < 240 and " " in dt_str:
+                try:
+                    _dt = datetime.strptime(dt_str[:19], "%Y-%m-%d %H:%M:%S")
+                    dt_str = _dt.strftime("%Y-%m-%d %H:%M") + ":00"
+                except (ValueError, TypeError):
+                    dt_str = dt_str[:16] + ":00"
+            else:
+                dt_str = dt_str[:10]
             out.append({
                 "time": dt_str, "open": round(o, 4), "high": round(h, 4),
                 "low": round(low, 4), "close": round(c, 4), "volume": round(v, 2),
@@ -167,7 +167,6 @@ def _sina_kline_to_dicts(data: list, count: int) -> List[Dict[str, Any]]:
 def _fetch_sina_kline_hisdata(sc: str, count: int, timeout: int) -> List[Dict[str, Any]]:
     """通过新浪 hisdata 页面获取日线K线（兜底机制）"""
     url = f"https://finance.sina.com.cn/realstock/company/{sc}/hisdata/klc_kl.js"
-    _sina_limiter.wait()
     resp = get_shared_session().get(
         url,
         headers=get_request_headers(referer=_sina_kline_referers.next()),
@@ -217,11 +216,16 @@ class SinaDataSource:
 
     线程安全性:
       - 实例方法无状态，线程安全
-      - 使用独立的限流器（_sina_limiter / _sina_quote_limiter）
+      - 行情限流器（_sina_quote_limiter）用于 fetch_ticker/fetch_batch_quotes
+      - K线限流已移至 Coordinator 统一管理（min_interval=1.5）
     """
 
     name = "sina"
     priority = 15
+    max_concurrency = 4
+    min_interval = 1.5
+    jitter_min = 0.8
+    jitter_max = 2.5
 
     capabilities = {
         "kline": True,
@@ -236,23 +240,6 @@ class SinaDataSource:
         "markets": {"CNStock"},
     }
 
-    def fetch_market_kline(
-        self, timeframe: str = "1D", count: int = 300,
-        adj: str = "qfq", timeout: int = 15,
-        start_date: str = "", end_date: str = "",
-        symbols: Optional[List[str]] = None,
-    ) -> Dict[str, List[Dict[str, Any]]]:
-        """全市场批量K线 — 并发 fetch_kline，支持历史数据"""
-        from app.data_sources.provider import _batch_fetch_kline_by_codes
-        return _batch_fetch_kline_by_codes(
-            self, timeframe=timeframe, count=count, adj=adj, timeout=timeout,
-            start_date=start_date, end_date=end_date, batch_size=500,
-            symbols=symbols,
-        )
-
-    @retry_with_backoff(max_attempts=3, base_delay=1.5, max_delay=10.0, exceptions=(
-        requests.exceptions.RequestException, ConnectionError, TimeoutError,
-    ))
     def fetch_kline(
         self, code: str, timeframe: str = "1D", count: int = 300,
         adj: str = "qfq", timeout: int = 10,
@@ -268,7 +255,6 @@ class SinaDataSource:
         scale = _SINA_TF_TO_SCALE.get(timeframe)
         if scale is None:
             return []
-        _sina_limiter.wait()
         if timeframe != "1D":
             bars = self._fetch_minute_kline(sc, scale, count, timeout)
         else:
@@ -278,42 +264,83 @@ class SinaDataSource:
         return bars
 
     def _fetch_raw_daily_kline(self, sc: str, count: int, timeout: int) -> List[Dict[str, Any]]:
-        url = "https://vip.stock.finance.sina.com.cn/cn/api/json.php/CN_MarketDataService.getKLineData"
-        params = {"symbol": sc, "scale": 240, "ma": "no", "datalen": min(int(count), 2000)}
-        resp = get_shared_session().get(
-            url,
-            headers=get_request_headers(referer=_sina_kline_referers.next()),
-            params=params, timeout=timeout,
-        )
-        try:
-            data = resp.json()
-        except Exception:
-            data = None
-        if isinstance(data, list) and data:
-            return _sina_kline_to_dicts(data, count)
-        return _fetch_sina_kline_hisdata(sc, count, timeout)
+        # 优先 money.finance（纯 JSON，稳定），兜底 quotes.sina.cn（JSONP）
+        bars = self._fetch_money_finance_kline(sc, 240, count, timeout)
+        if bars:
+            return bars
+        return self._fetch_quotes_sina_kline(sc, 240, count, timeout)
 
     def _fetch_minute_kline(self, sc: str, scale: int, count: int, timeout: int) -> List[Dict[str, Any]]:
+        # 1分钟: money.finance 返回 null，必须用 quotes.sina.cn JSONP
+        # 5/15/30/60分钟: money.finance 可用且是纯 JSON，优先使用
+        if scale == 1:
+            bars = self._fetch_quotes_sina_kline(sc, scale, count, timeout)
+        else:
+            bars = self._fetch_money_finance_kline(sc, scale, count, timeout)
+            if not bars:
+                bars = self._fetch_quotes_sina_kline(sc, scale, count, timeout)
+        return bars
+
+    def _fetch_money_finance_kline(self, sc: str, scale: int, count: int, timeout: int) -> List[Dict[str, Any]]:
+        """money.finance.sina.com.cn — 纯 JSON，日线+5/15/30/60分钟可用，1分钟返回 null"""
+        url = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
+        params = {"symbol": sc, "scale": scale, "ma": "no", "datalen": min(int(count), 2000)}
+        try:
+            resp = get_shared_session().get(
+                url,
+                headers=get_request_headers(referer=_sina_kline_referers.next()),
+                params=params, timeout=timeout,
+            )
+            data = resp.json()
+            if isinstance(data, list) and data:
+                return _sina_kline_to_dicts(data, count, scale)
+        except Exception:
+            pass
+        return []
+
+    def _fetch_quotes_sina_kline(self, sc: str, scale: int, count: int, timeout: int) -> List[Dict[str, Any]]:
+        """quotes.sina.cn — JSONP 格式，全周期可用（含1分钟）"""
         url = "https://quotes.sina.cn/cn/api/jsonp_v2.php/var/CN_MarketDataService.getKLineData"
         params = {"symbol": sc, "scale": scale, "ma": "no", "datalen": min(int(count), 2000)}
-        resp = get_shared_session().get(
-            url,
-            headers=get_request_headers(referer=_sina_kline_referers.next()),
-            params=params, timeout=timeout,
-        )
-        text = (resp.text or "").strip()
-        m = re.search(r'\[.*\]', text, re.DOTALL)
-        if not m:
-            return []
         try:
-            data = json.loads(m.group())
+            resp = get_shared_session().get(
+                url,
+                headers=get_request_headers(referer=_sina_kline_referers.next()),
+                params=params, timeout=timeout,
+            )
+            text = (resp.text or "").strip()
+            m = re.search(r'\[.*\]', text, re.DOTALL)
+            if m:
+                data = json.loads(m.group())
+                if isinstance(data, list) and data:
+                    return _sina_kline_to_dicts(data, count, scale)
         except Exception:
-            return []
-        return _sina_kline_to_dicts(data, count) if isinstance(data, list) else []
+            pass
+        return []
 
-    @retry_with_backoff(max_attempts=3, base_delay=1.5, max_delay=10.0, exceptions=(
-        requests.exceptions.RequestException, ConnectionError, TimeoutError,
-    ))
+    def fetch_market_kline(
+        self, timeframe: str, count: int = 300,
+        adj: str = "qfq", timeout: int = 15,
+        start_date: str = "", end_date: str = "",
+        symbols: Optional[List[str]] = None,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """批量K线 — Coordinator 统管线程+限流，本方法逐只调用 fetch_kline"""
+        if not symbols:
+            return {}
+        result: Dict[str, List[Dict[str, Any]]] = {}
+        for code in symbols:
+            try:
+                bars = self.fetch_kline(
+                    code, timeframe, count,
+                    adj=adj, timeout=timeout,
+                    start_date=start_date, end_date=end_date,
+                )
+                if bars:
+                    result[code] = bars
+            except Exception as e:
+                logger.debug("[fetch_market_kline] %s 失败: %s", code, e)
+        return result
+
     def fetch_ticker(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
         sc = to_sina_code(code)
         if not sc:

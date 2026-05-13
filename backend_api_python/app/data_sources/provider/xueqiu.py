@@ -2,38 +2,37 @@
 """
 雪球数据源 Provider
 
-模块职责:
-  通过雪球 API 获取 A股的 K线和实时行情数据。
-  雪球是国内知名投资社区，数据接口稳定。
+API来源 & 最新信息:
+  - 浏览器F12抓包 https://xueqiu.com/ 观察请求
+  - K线: stock.xueqiu.com/v5/stock/chart/kline.json
+    参数: symbol(SH600519), period(day/week/1/5/15/30/60), type=before(前复权), count(-200)
+  - 行情: stock.xueqiu.com/v5/stock/quote.json?symbol=SH600519&extend=detail
+  - 需要cookie: 先访问 xueqiu.com 首页获取，TTL=1小时
+  - prepare()方法会预热cookie，失败则该源不可用
+  - cookie失效时自动清除缓存重试一次
 
-能力:
-  - K线: 1m/5m/15m/30m/1H/1D/1W（前复权），通过 chart/kline.json API
-  - 单只行情: 实时行情快照
-  - 全市场批量: 并发获取全市场K线
+支持的功能:
+  - K线: ✅ 全周期 1m/5m/15m/30m/1H/1D/1W（原生前复权）
+  - fetch_ticker: ✅ 单只实时行情（quote.json）
+  - fetch_batch_quotes: ⚠️ 逐只并发调_fetch_ticker（非真批量，限流较严）
+  - fetch_market_kline: ✅ 逐只调用fetch_kline
 
-特点:
-  - 需要先访问 xueqiu.com 获取 cookie
-  - 数据为前复权
-  - 15m 周期数据较全
-
-数据标准化:
-  - time: Unix 时间戳
-  - open/high/low/close: OHLC 四价
-  - volume: 成交量
-  - 复权: 原生前复权
-
-在架构中的位置:
-  KlineService → DataSourceFactory → Coordinator → XueqiuDataSource（本模块）
+单位注意（重要）:
+  - fetch_kline: r[1]=volume(股), 不需要×100
+  - fetch_ticker: quote.volume(股), 不需要×100
+  - 价格字段直接是"元"，不需要÷
+  - 数据原生前复权(type=before)，不需要额外复权处理
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -95,16 +94,46 @@ def _invalidate_cookie():
         _cookie_ts = 0
 
 
+def _load_config_token() -> str:
+    """从 provider/config.json 读取雪球 token，返回 cookie 字符串"""
+    try:
+        import json as _json
+        _cfg_path = os.path.join(os.path.dirname(__file__), "config.json")
+        if os.path.exists(_cfg_path):
+            with open(_cfg_path, "r", encoding="utf-8") as f:
+                xq = (_json.load(f).get("xueqiu") or {})
+            token = xq.get("xq_a_token", "")
+            uid = xq.get("u", "")
+            if token:
+                parts = [f"xq_a_token={token}"]
+                if uid:
+                    parts.append(f"u={uid}")
+                return "; ".join(parts)
+    except Exception:
+        pass
+    return ""
+
+
 def _get_headers() -> dict:
-    """获取带 cookie 的请求头，cookie 为空时自动重试一次"""
-    cookie = _refresh_cookie()
-    if not cookie:
+    """获取带 cookie 的请求头，优先使用 config.json 中的 token"""
+    # 优先用配置文件中的 token
+    config_cookie = _load_config_token()
+    # 兜底: 自动获取 cookie
+    auto_cookie = _refresh_cookie()
+    if not auto_cookie:
         _invalidate_cookie()
-        cookie = _refresh_cookie()
+        auto_cookie = _refresh_cookie()
+    # 合并: config token 在前
+    parts = []
+    if config_cookie:
+        parts.append(config_cookie)
+    if auto_cookie:
+        parts.append(auto_cookie)
+    cookie = "; ".join(parts) if parts else ""
     return {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://xueqiu.com/",
-        "Cookie": cookie or "",
+        "Cookie": cookie,
     }
 
 
@@ -155,7 +184,6 @@ def _fetch_xueqiu_kline(code: str, timeframe: str = "15m", limit: int = 200) -> 
     if not period:
         return None  # 不支持的周期
 
-    _xueqiu_limiter.wait()
     try:
         url = "https://stock.xueqiu.com/v5/stock/chart/kline.json"
         params = {
@@ -174,12 +202,23 @@ def _fetch_xueqiu_kline(code: str, timeframe: str = "15m", limit: int = 200) -> 
             return None
 
         # 雪球返回: [timestamp, volume, open, high, low, close, ...]
+        # 日线/周线只保留日期，分钟线保留完整时间
+        _daily_tfs = {"1D", "1W", "1M"}
+        # 计算分钟级周期对应的分钟数（用于统一为K线结束时间）
+        _tf_minutes = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1H": 60}
+        _add_min = _tf_minutes.get(timeframe, 0) if timeframe not in _daily_tfs else 0
         result = []
         for r in items:
             if len(r) < 6:
                 continue
             try:
-                ts = datetime.fromtimestamp(int(r[0]) / 1000).strftime("%Y-%m-%d %H:%M:%S")  # 毫秒 → 字符串
+                dt = datetime.fromtimestamp(int(r[0]) / 1000)  # 毫秒 → datetime
+                # 统一时间格式: 日线以上 YYYY-MM-DD, 分时线 YYYY-MM-DD HH:MM:00
+                if timeframe in _daily_tfs:
+                    ts = dt.strftime("%Y-%m-%d")
+                else:
+                    dt_end = dt + timedelta(minutes=_add_min)
+                    ts = dt_end.strftime("%Y-%m-%d %H:%M") + ":00"
                 result.append({
                     "time": ts,
                     "open": round(float(r[2]), 4),
@@ -258,6 +297,10 @@ class XueqiuDataSource:
 
     name = "xueqiu"
     priority = 40
+    max_concurrency = 8
+    min_interval = 0.5
+    jitter_min = 0.2
+    jitter_max = 0.8
 
     capabilities = {
         "kline": True,
@@ -304,72 +347,26 @@ class XueqiuDataSource:
         return data if data else []
 
     def fetch_market_kline(
-        self, timeframe: str = "15m", count: int = 200,
-        adj: str = "qfq", timeout: int = 30,
+        self, timeframe: str, count: int = 300,
+        adj: str = "qfq", timeout: int = 15,
         start_date: str = "", end_date: str = "",
         symbols: Optional[List[str]] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
-        """
-        全市场批量K线 — 并发获取。
-        支持 1m/5m/15m/30m/1H/1D/1W。
-        线程结构与 akline_market.py 保持一致: 每组50只，30线程并发。
-        """
-        if timeframe not in _XQ_TF_TO_PERIOD:
-            return NotSupportedResult(self.name, "fetch_market_kline", f"不支持 {timeframe} 周期")
-
-        from queue import Queue, Empty
-
+        """批量K线 — Coordinator 统管线程+限流，本方法逐只调用 fetch_kline"""
         if not symbols:
-            from app.utils.basicinfo_db import get_stock_basic_db
-            symbols = get_stock_basic_db().market_all_codes(status="active")
-        if not symbols:
-            logger.warning("[雪球] 获取股票列表失败")
             return {}
-
-        group_size = 50
-        groups = [symbols[i:i + group_size] for i in range(0, len(symbols), group_size)]
-        q: Queue = Queue()
-        for idx, g in enumerate(groups):
-            q.put((idx, g))
-
         result: Dict[str, List[Dict[str, Any]]] = {}
-        lock = threading.Lock()
-        threads_per_source = 8
-
-        def _fetch_one(code):
+        for code in symbols:
             try:
-                data = _fetch_xueqiu_kline(code, timeframe, count)
-                if data:
-                    with lock:
-                        result[normalize_cn_code(code)] = data
-            except Exception:
-                pass
-
-        def _worker():
-            while True:
-                try:
-                    _, stocks = q.get(timeout=5)
-                except Empty:
-                    break
-                with ThreadPoolExecutor(max_workers=min(len(stocks), threads_per_source)) as pool:
-                    futs = [pool.submit(_fetch_one, s) for s in stocks]
-                    for f in futs:
-                        try:
-                            f.result()
-                        except Exception:
-                            pass
-                q.task_done()
-
-        workers = []
-        for _ in range(min(threads_per_source, len(groups))):
-            t = threading.Thread(target=_worker, daemon=True)
-            workers.append(t)
-            t.start()
-
-        for t in workers:
-            t.join(timeout=timeout)
-
-        logger.info("[雪球] 全市场完成: %d只", len(result))
+                bars = self.fetch_kline(
+                    code, timeframe, count,
+                    adj=adj, timeout=timeout,
+                    start_date=start_date, end_date=end_date,
+                )
+                if bars:
+                    result[code] = bars
+            except Exception as e:
+                logger.debug("[fetch_market_kline] %s 失败: %s", code, e)
         return result
 
     def fetch_ticker(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:

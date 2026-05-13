@@ -2,45 +2,46 @@
 """
 东方财富数据源 Provider
 
-模块职责:
-  通过东方财富 API 获取 A股的 K线、实时行情以及市场数据（龙虎榜/热度/涨停池/跌停池/炸板池）。
-  东财是国内最稳定的免费数据源之一，作为A股第三选择（priority=30）。
+API来源 & 最新信息:
+  - 浏览器F12抓包 https://quote.eastmoney.com/ 观察请求
+  - K线: push2his.eastmoney.com/api/qt/stock/kline/get
+  - 单只行情: push2.eastmoney.com/api/qt/stock/get
+  - 批量行情: push2.eastmoney.com/api/qt/clist/get
+  - 关注f字段编号变化（f43=最新价, f47=成交量, f60=昨收 等）
+  - klt参数: 1=1m, 5=5m, 15=15m, 30=30m, 60=1H, 101=1D, 102=1W
+  - fqt参数: 0=不复权, 1=前复权, 2=后复权
 
-能力:
-  - K线: 全周期（1m/5m/15m/30m/1H/1D/1W），通过 kline/get API
-  - 单只行情: 实时行情快照（stock/get API）
-  - 批量行情: 单次HTTP获取全市场行情（clist/get API，最多6000只）
-  - 市场数据（龙虎榜/涨停池等）已迁移至 maket_cn/eastmoney_market.py
+支持的功能:
+  - K线: ✅ 全周期 1m/5m/15m/30m/1H/1D/1W（per-symbol，非原生批量）
+  - fetch_ticker: ✅ 单只实时行情
+  - fetch_batch_quotes: ✅ 原生全市场批量（clist API 一次6000只）
+  - fetch_market_kline: ✅ 逐只调用fetch_kline（Coordinator统管线程）
 
-特点:
-  - 国内最稳定的免费数据源
-  - 批量行情支持全市场（一次HTTP获取所有A股行情）
-  - K线API是 per-symbol 的，不支持原生批量
-
-在架构中的位置:
-  KlineService → DataSourceFactory → Coordinator → EastMoneyDataSource（本模块）
-
-关键依赖:
-  - requests: HTTP 请求
-  - app.data_sources.normalizer: 股票代码标准化（to_eastmoney_secid, to_raw_digits）
-  - app.data_sources.rate_limiter: 限流器
+单位注意（重要）:
+  - fetch_ticker: stock/get API 的价格字段(f43/f44/f45/f46/f60)返回"分"，需÷100
+  - fetch_ticker: 成交量f47返回"手"，需×100转"股"
+  - fetch_batch_quotes: clist API 的价格字段(f2/f15/f16/f17/f18)返回"元"，不需÷
+  - fetch_batch_quotes: 成交量f5返回"手"，需×100转"股"
+  - fetch_kline: kline API 的OHLC返回"元"，不需÷；volume返回"股"，不需×
 """
 
 from __future__ import annotations
 
 import itertools
+import json
 import logging
 import random
+import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
+from curl_cffi import requests as cffi_requests
 
 from app.data_sources.normalizer import to_raw_digits, detect_market
 from app.data_sources.rate_limiter import (
-    get_request_headers, retry_with_backoff,
+    get_request_headers,
 )
 from app.data_sources.provider import register
 from app.utils.logger import get_logger
@@ -89,6 +90,25 @@ def _make_headers(referer: str = "https://quote.eastmoney.com/") -> dict:
     }
 
 
+def _strip_jsonp(text: str) -> str:
+    """
+    去除 JSONP 回调包装，提取纯 JSON。
+
+    东财 API 可能返回以下格式:
+      - 纯 JSON: {"data": {...}}
+      - JSONP:   jQuery123456({"data": {...}})
+      - JSONP:   callback({"data": {...}})
+    """
+    text = text.strip()
+    if not text:
+        return text
+    # 匹配 callback({...}) 或 callback([...]) 格式
+    m = re.match(r'^[a-zA-Z_$][\w$]*\s*\((.+)\)\s*;?\s*$', text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return text
+
+
 class _RefererPool:
     """线程安全的 Referer 轮换池"""
     def __init__(self, referers: List[str]):
@@ -105,6 +125,11 @@ _em_referers = _RefererPool([
     "https://stock.eastmoney.com/",
     "https://data.eastmoney.com/",
     "https://push2.eastmoney.com/",
+    # 东财 push CDN 节点
+    "https://82.push2.eastmoney.com/",
+    "https://83.push2.eastmoney.com/",
+    "https://84.push2.eastmoney.com/",
+    "https://85.push2.eastmoney.com/",
     # 东财子站 / 频道
     "https://futures.eastmoney.com/",
     "https://fund.eastmoney.com/",
@@ -122,7 +147,6 @@ _em_referers = _RefererPool([
     "https://zlcndc.eastmoney.com/",
     "https://choice.eastmoney.com/",
     # 东财行情 push 域名
-    "https://push2.eastmoney.com/",
     "https://push2his.eastmoney.com/",
     # 东财其他产品
     "https://eastmoney.com/",
@@ -140,6 +164,59 @@ _em_referers = _RefererPool([
 # 东财固定域名（不做 CDN 探测，直接用默认域名）
 _EM_KLINE_HOST = "push2his.eastmoney.com"
 _EM_QUOTE_HOST = "push2.eastmoney.com"
+
+# ================================================================
+# curl_cffi 会话 — 绕过东财 TLS 指纹检测 (JA3)
+# ================================================================
+# 东财 push2 CDN 对 urllib/requests 的 TLS 指纹做了封锁，
+# curl_cffi 的 edge101 指纹实测可通过（需少量重试建立连接）。
+
+_EM_IMPERSONATE = "edge101"
+_em_session: Optional[cffi_requests.Session] = None
+_em_session_lock = threading.Lock()
+
+
+def _get_em_session() -> cffi_requests.Session:
+    """获取/创建东财专用 curl_cffi Session（单例，线程安全）"""
+    global _em_session
+    if _em_session is not None:
+        return _em_session
+    with _em_session_lock:
+        if _em_session is None:
+            _em_session = cffi_requests.Session()
+    return _em_session
+
+
+def _em_get(
+    url: str,
+    params: Optional[dict] = None,
+    referer: str = "https://quote.eastmoney.com/",
+    timeout: int = 10,
+    retries: int = 3,
+    retry_delay: float = 0.5,
+) -> Optional[str]:
+    """东财专用 GET：curl_cffi edge101 指纹 + Referer 轮换 + 自动重试。
+
+    返回响应文本，失败返回 None。
+    """
+    session = _get_em_session()
+    headers = _make_headers(referer=referer)
+    last_err = None
+    for attempt in range(retries):
+        try:
+            resp = session.get(
+                url, params=params, headers=headers,
+                impersonate=_EM_IMPERSONATE, timeout=timeout,
+            )
+            if resp.status_code == 200 and resp.text:
+                return resp.text
+            last_err = f"HTTP {resp.status_code}"
+        except Exception as e:
+            last_err = str(e).split(".")[0][:80]
+        if attempt < retries - 1:
+            time.sleep(retry_delay * (attempt + 1))
+    logger.debug("[东财] %s 请求失败 (%d次重试): %s", url.split("?")[0], retries, last_err)
+    return None
 
 
 
@@ -177,6 +254,10 @@ class EastMoneyDataSource:
 
     name = "eastmoney"
     priority = 25
+    max_concurrency = 6
+    min_interval = 0.0
+    jitter_min = 0.0
+    jitter_max = 0.0
 
     capabilities = {
         "kline": True,
@@ -191,46 +272,6 @@ class EastMoneyDataSource:
         "markets": {"CNStock"},
     }
 
-    def fetch_market_kline(
-        self, timeframe: str = "1D", count: int = None,
-        adj: str = "qfq", timeout: int = 15,
-        start_date: str = "", end_date: str = "",
-        symbols: Optional[List[str]] = None,
-    ) -> Dict[str, List[Dict[str, Any]]]:
-        """全市场批量K线 — 并发逐只 fetch_kline"""
-        if count is None:
-            from app.data_sources.provider import calc_kline_count
-            from datetime import datetime, timezone, timedelta
-            today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
-            effective_end = end_date if end_date else today
-            effective_start = start_date if start_date else effective_end
-            count = calc_kline_count(timeframe, effective_start, effective_end)
-
-        if not symbols:
-            from app.utils.basicinfo_db import get_stock_basic_db
-            symbols = get_stock_basic_db().market_all_codes(status="active")
-        if not symbols:
-            return {}
-        import concurrent.futures
-        result: Dict[str, List[Dict[str, Any]]] = {}
-        lock = threading.Lock()
-
-        def _fetch_one(code: str):
-            bars = self.fetch_kline(code, timeframe, count, adj=adj, timeout=timeout,
-                                    start_date=start_date, end_date=end_date)
-            if bars:
-                with lock:
-                    result[code] = bars
-
-        max_workers = min(len(symbols), 8)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = [pool.submit(_fetch_one, c) for c in symbols]
-            concurrent.futures.wait(futures, timeout=timeout + 5)
-        return result
-
-    @retry_with_backoff(max_attempts=3, base_delay=1.0, max_delay=8.0, exceptions=(
-        requests.exceptions.RequestException, ConnectionError, TimeoutError,
-    ))
     def fetch_kline(
         self, code: str, timeframe: str = "1D", count: int = 300,
         adj: str = "qfq", timeout: int = 10,
@@ -251,10 +292,10 @@ class EastMoneyDataSource:
 
         url = f"https://{_EM_KLINE_HOST}/api/qt/stock/kline/get"
 
-        resp = requests.get(
+        text = _em_get(
             url,
-            headers=_make_headers(referer=_em_referers.next()),
             params={
+                "cb": "jQuery",
                 "secid": secid,
                 "ut": "fa5fd1943c7b386f172d6893dbbd1835",
                 "fields1": "f1,f2,f3",
@@ -264,12 +305,22 @@ class EastMoneyDataSource:
                 "end": em_end,
                 "lmt": min(int(count), 5000),
             },
+            referer=_em_referers.next(),
             timeout=timeout,
         )
-        try:
-            data = resp.json()
-        except Exception:
+        if not text:
             return []
+        body = _strip_jsonp(text)
+        if not body:
+            return []
+        try:
+            data = json.loads(body)
+        except Exception:
+            # JSONP 解析失败，尝试直接解析 JSON
+            try:
+                data = resp.json()
+            except Exception:
+                return []
         if not isinstance(data, dict):
             return []
         klines_data = (data.get("data") or {}).get("klines")
@@ -287,6 +338,9 @@ class EastMoneyDataSource:
                     continue
                 # 标准化为字符串格式
                 ts_str = dt_str
+                # 统一时间格式: 日线 YYYY-MM-DD, 分时线 YYYY-MM-DD HH:MM:00
+                if len(ts_str) == 16 and " " in ts_str:
+                    ts_str = ts_str + ":00"
                 o, c, h, low, v = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5])
                 if o == 0 and c == 0:
                     continue
@@ -301,6 +355,29 @@ class EastMoneyDataSource:
         out.sort(key=lambda x: x["time"])
         return out[-count:] if len(out) > count else out
 
+    def fetch_market_kline(
+        self, timeframe: str, count: int = 300,
+        adj: str = "qfq", timeout: int = 15,
+        start_date: str = "", end_date: str = "",
+        symbols: Optional[List[str]] = None,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """批量K线 — Coordinator 统管线程+限流，本方法逐只调用 fetch_kline"""
+        if not symbols:
+            return {}
+        result: Dict[str, List[Dict[str, Any]]] = {}
+        for code in symbols:
+            try:
+                bars = self.fetch_kline(
+                    code, timeframe, count,
+                    adj=adj, timeout=timeout,
+                    start_date=start_date, end_date=end_date,
+                )
+                if bars:
+                    result[code] = bars
+            except Exception as e:
+                logger.debug("[fetch_market_kline] %s 失败: %s", code, e)
+        return result
+
     def fetch_ticker(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
         secid = _to_eastmoney_secid(code)
         if not secid:
@@ -308,20 +385,29 @@ class EastMoneyDataSource:
 
         url = f"https://{_EM_QUOTE_HOST}/api/qt/stock/get"
 
-        resp = requests.get(
+        text = _em_get(
             url,
-            headers=_make_headers(referer=_em_referers.next()),
             params={
+                "cb": "jQuery",
                 "secid": secid,
                 "ut": "fa5fd1943c7b386f172d6893dbfba10b",
                 "fields": "f43,f44,f45,f46,f47,f48,f57,f58,f60,f170,f171",
             },
+            referer=_em_referers.next(),
             timeout=timeout,
         )
-        try:
-            data = resp.json()
-        except Exception:
+        if not text:
             return None
+        body = _strip_jsonp(text)
+        if not body:
+            return None
+        try:
+            data = json.loads(body)
+        except Exception:
+            try:
+                data = resp.json()
+            except Exception:
+                return None
         if not isinstance(data, dict):
             return None
         d = data.get("data")
@@ -342,7 +428,7 @@ class EastMoneyDataSource:
         if last == 0 and prev == 0:
             return None
         chg = round(last - prev, 4) if prev else 0.0
-        vol = _f("f47")
+        vol = _f("f47") * 100  # f47返回"手"，×100转"股"
         now = datetime.now(timezone(timedelta(hours=8)))
         time_str = now.strftime("%Y-%m-%d %H:%M:%S")
         return {
@@ -376,6 +462,7 @@ class EastMoneyDataSource:
                 url,
                 headers=_make_headers(referer=_em_referers.next()),
                 params={
+                    "cb": "jQuery",
                     "pn": 1, "pz": 6000, "po": 1, "np": 1,
                     "ut": "bd1d9ddb04089700cf9c27f6f7426281",
                     "fltt": 2, "invt": 2, "fid": "f3",
@@ -384,14 +471,17 @@ class EastMoneyDataSource:
                 },
                 timeout=timeout,
             )
-            data = resp.json()
+            body = _strip_jsonp(resp.text)
+            if not body:
+                logger.warning("[东财批量行情] clist 响应为空")
+                return {}
+            data = json.loads(body)
             diff = ((data.get("data") or {}).get("diff")) or []
         except Exception as e:
             logger.warning("[东财批量行情] clist 请求失败: %s", e)
             return {}
 
         now = datetime.now(timezone(timedelta(hours=8)))
-        today_ts = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
         today_str = now.strftime("%Y-%m-%d %H:%M:%S")
         result: Dict[str, Dict[str, Any]] = {}
         for item in diff:
@@ -405,7 +495,7 @@ class EastMoneyDataSource:
                     continue
                 prev = float(item.get("f18", 0))
                 chg = round(last - prev, 4) if prev else 0.0
-                vol = float(item.get("f5", 0) or 0)
+                vol = float(item.get("f5", 0) or 0) * 100  # f5返回"手"，×100转"股"
                 result[sym] = {
                     "last": last,
                     "change": chg,

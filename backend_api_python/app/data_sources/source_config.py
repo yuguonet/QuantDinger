@@ -233,20 +233,10 @@ SOURCE_CONFIGS: Dict[str, SourceConfig] = {
         batch_size=5000,
     ),
 
-    # Twelve Data — 海外付费源，仅作降级兜底
-    # max_workers=1 较低（国内访问不稳定）
-    "twelvedata": SourceConfig(
-        name="twelvedata",
-        max_workers=1,
-        markets={"CNStock", "HKStock"},
-        batch_capable=False,
-        batch_size=1,
-    ),
-
-    # 通达信 — 老牌行情软件，HTTP 接口稳定
+    # 同花顺(10jqka) — HTTP 接口，分钟分时+日/周K线
     # max_workers=3，仅支持 A 股
-    "tdx": SourceConfig(
-        name="tdx",
+    "10jqka": SourceConfig(
+        name="10jqka",
         max_workers=3,
         markets={"CNStock"},
         batch_capable=True,

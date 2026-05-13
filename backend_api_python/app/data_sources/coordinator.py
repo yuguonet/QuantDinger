@@ -65,6 +65,7 @@ import atexit
 import concurrent.futures
 import threading
 import time
+from collections import deque
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from app.data_sources.source_config import (
@@ -223,6 +224,36 @@ def _normalize_symbols(symbols, market: str) -> List[str]:
             seen.add(ns)
             result.append(ns)
     return result
+
+
+def _is_valid_kline(bars) -> bool:
+    """
+    校验 K 线数据是否有效。
+
+    无效判定:
+      - None / 非 list
+      - 空 list
+      - list 内容不是 dict（如 ["error", "N/A"]）
+      - dict 里关键字段全为空/0/NaN
+
+    Returns:
+        True = 数据可用, False = 应丢弃并重试
+    """
+    if not bars or not isinstance(bars, list):
+        return False
+    if len(bars) == 0:
+        return False
+    # 至少第一个元素得是 dict
+    if not isinstance(bars[0], dict):
+        return False
+    # 检查是否有至少一个非空值（排除 {"code": "SH600519"} 这种只有 code 没行情的）
+    first = bars[0]
+    has_data = any(
+        v is not None and v != "" and v != 0 and v != "0"
+        for k, v in first.items()
+        if k not in ("code", "symbol", "name")  # 排除标识字段
+    )
+    return has_data
 
 
 # ================================================================
@@ -495,6 +526,64 @@ class Coordinator:
 
     def __init__(self):
         self._lock = threading.Lock()
+        # per-provider 限流器缓存（懒创建）
+        self._rate_limiters: Dict[str, Any] = {}
+        self._rate_limiters_lock = threading.Lock()
+        # per-provider EWMA 响应时间
+        self._ewma_rt: Dict[str, float] = {}
+        self._ewma_lock = threading.Lock()
+
+    # ── 限流器管理 ──
+
+    def _get_limiter(self, provider_name: str, provider) -> Optional[Any]:
+        """获取 per-provider 限流器（懒创建，线程安全）。min_interval=0 返回 None。"""
+        min_interval = getattr(provider, 'min_interval', 0.0)
+        if min_interval <= 0:
+            return None
+        with self._rate_limiters_lock:
+            if provider_name not in self._rate_limiters:
+                from app.data_sources.rate_limiter import RateLimiter
+                self._rate_limiters[provider_name] = RateLimiter(
+                    min_interval=min_interval,
+                    jitter_min=getattr(provider, 'jitter_min', 0.0),
+                    jitter_max=getattr(provider, 'jitter_max', 0.0),
+                )
+            return self._rate_limiters[provider_name]
+
+    # ── EWMA 响应时间追踪 ──
+
+    _EWMA_ALPHA = 0.3
+
+    def _update_ewma(self, provider_name: str, rt: float):
+        """更新 Provider 的 EWMA 响应时间。rt<=0 不更新。"""
+        if rt <= 0:
+            return
+        with self._ewma_lock:
+            old = self._ewma_rt.get(provider_name)
+            if old is None:
+                self._ewma_rt[provider_name] = rt
+            else:
+                self._ewma_rt[provider_name] = self._EWMA_ALPHA * rt + (1 - self._EWMA_ALPHA) * old
+
+    def allocate_threads(self, providers: list, global_budget: int = 32) -> Dict[str, int]:
+        """按 max_concurrency / EWMA 响应时间加权分配线程数。"""
+        if not providers:
+            return {}
+        weights = {}
+        for p in providers:
+            max_c = getattr(p, 'max_concurrency', 4)
+            with self._ewma_lock:
+                rt = self._ewma_rt.get(p.name, 1.0)
+            weights[p.name] = max_c / max(rt, 0.1)
+        total = sum(weights.values())
+        if total <= 0:
+            return {p.name: 1 for p in providers}
+        alloc = {}
+        for p in providers:
+            max_c = getattr(p, 'max_concurrency', 4)
+            raw = global_budget * weights[p.name] / total
+            alloc[p.name] = max(1, min(round(raw), max_c))
+        return alloc
 
     # ================================================================
     # 模式 A: K线获取 — 假批量，动态队列 + 多源 fallback
@@ -1477,44 +1566,30 @@ class Coordinator:
         symbols: Optional[List[str]] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
-        全市场批量K线 — Coordinator 分组 + 多 Provider 并发取组模式。
+        全市场批量K线 — 扁平共享队列 + EWMA 自适应喂料。
 
-        数据流:
-          1. 股票按50只一组分组，放入共享队列
-          2. 每个支持 kline_batch 的 Provider 启动一个 worker 线程
-          3. 各 Provider worker 从队列中取一组，调自己的 fetch_market_kline(symbols=组)
-          4. 先完成的 Provider 立即取下一组，直到队列为空
-          5. 超时的组放回队尾给其他源重试
-          6. 全局超时后，合并所有已获取的数据返回
+        核心设计:
+          - 扁平共享队列: 所有 symbols 放一个队列，所有 Provider 的 worker 共同消费
+          - EWMA 自适应喂料: 第一轮按静态权重分配，后续按 EWMA 吞吐动态调整 chunk 大小
+          - 线程数即并发度: 每个 Provider 开 N 个线程，不需要额外的 dispatcher
+          - 限流器: per-Provider 限流器控制请求间隔
+          - 死源/熔断: 连续超时标记死源，自动跳过
 
-        Coordinator 只负责分组和调度，不参与具体获取逻辑。
-        每个 Provider 内部自行决定并发策略和获取方式。
-
-        Args:
-            market:  市场名称（"CNStock" / "HKStock" / ...）
-            timeframe: K线周期（"1D" / "5m" / ...）
-            count:   每只股票的数据条数
-            adj:     复权方式（"qfq" 前复权 / "hfq" 后复权 / "" 不复权）
-            timeout: 全局超时（秒）
-            preferred_source: 指定首选源（如 "tencent"），优先尝试
-            start_date: 起始日期（"YYYY-MM-DD"）
-            end_date:   结束日期（"YYYY-MM-DD"），为空则取今天
-
-        Returns:
-            {code: kline_bars} — 合并所有源成功获取的数据
+        与旧版 per-Provider 队列的区别:
+          - 去掉 per-Provider Queue + dispatcher 轮询 → 一个共享队列搞定
+          - 去掉固定分组 → EWMA 驱动的动态 chunk（快的多吃，慢的少吃）
+          - 负载均衡由线程消费速度自然驱动，不需要手动调度
         """
         from app.data_sources.provider import get_providers, NotSupportedResult
-        from queue import Queue, Empty
 
         # ── 第一步: 发现支持 kline_batch 的源 ──
         providers = get_providers(capability="kline_batch", timeframe=timeframe, market=market)
-
         if not providers:
             logger.warning("[协助层] market_kline market=%s tf=%s 无可用源", market, timeframe)
             return {}
 
-        # 过滤掉已熔断的源和死源
-        available_providers = []
+        # 过滤熔断 + 死源
+        available = []
         for p in providers:
             if not _realtime_cb.is_available(p.name):
                 logger.debug("[协助层] market_kline %s 已熔断，跳过", p.name)
@@ -1522,46 +1597,48 @@ class Coordinator:
             if self._is_source_dead(p.name):
                 logger.debug("[协助层] market_kline %s 已标记为死源，跳过", p.name)
                 continue
-            available_providers.append(p)
+            available.append(p)
 
-        if not available_providers:
+        if not available:
             logger.warning("[协助层] market_kline market=%s tf=%s 无可用源(全部熔断/死亡)", market, timeframe)
             return {}
 
-        # 按 preferred_source 排序
+        # preferred_source 排第一
         if preferred_source:
-            preferred = [p for p in available_providers if p.name == preferred_source]
-            others = [p for p in available_providers if p.name != preferred_source]
-            available_providers = preferred + others
+            preferred = [p for p in available if p.name == preferred_source]
+            others = [p for p in available if p.name != preferred_source]
+            available = preferred + others
 
-        # ── 调用 prepare() 做下载前准备，失败的源直接剔除 ──
-        prepared_providers = []
-        for p in available_providers:
+        # prepare() 过滤
+        prepared = []
+        for p in available:
             try:
                 prepare_fn = getattr(p, 'prepare', None)
                 if prepare_fn and not prepare_fn():
-                    logger.warning("[协助层] market_kline %s prepare() 返回 False，跳过", p.name)
+                    logger.warning("[协助层] market_kline %s prepare() 失败，跳过", p.name)
                     continue
-                prepared_providers.append(p)
+                prepared.append(p)
             except Exception as e:
                 logger.warning("[协助层] market_kline %s prepare() 异常: %s，跳过", p.name, e)
-        available_providers = prepared_providers
-
-        if not available_providers:
+        available = prepared
+        if not available:
             logger.warning("[协助层] market_kline market=%s tf=%s 无可用源(prepare全部失败)", market, timeframe)
             return {}
 
+        # ── 第二步: 获取股票列表 + 标准化 ──
+        if not symbols:
+            from app.utils.basicinfo_db import get_stock_basic_db
+            symbols = get_stock_basic_db().market_all_codes(status="active")
         if not symbols:
             logger.warning("[协助层] market_kline 获取股票列表失败")
             return {}
 
-        # ── 输入标准化 ──
         all_codes = _normalize_symbols(symbols, market)
         if not all_codes:
             logger.warning("[协助层] market_kline 标准化后无有效代码")
             return {}
 
-        # ── 在 coordinator 层解析 count，始终为 int，不留给 provider 走旁路 ──
+        # count 解析
         if count is None:
             from app.data_sources.provider import calc_kline_count
             from datetime import datetime, timezone, timedelta
@@ -1569,302 +1646,392 @@ class Coordinator:
             effective_end = end_date if end_date else today
             effective_start = start_date if start_date else effective_end
             count = calc_kline_count(timeframe, effective_start, effective_end)
-            logger.info("[协助层] market_kline count 由 None 解析为 %d (start=%s end=%s)",
-                        count, effective_start, effective_end)
 
-        group_size = 50
-        groups = [all_codes[i:i + group_size] for i in range(0, len(all_codes), group_size)]
-        total_groups = len(groups)
+        # ── 第三步: 动态分配线程 ──
+        thread_alloc = self.allocate_threads(available)
+        logger.info("[协助层] market_kline %d只 → %d源: %s",
+                    len(all_codes), len(available),
+                    " | ".join(f"{p.name}:{thread_alloc[p.name]}" for p in available))
 
-        logger.info("[协助层] market_kline %d只 → %d组(每组%d) → %d源并发: %s",
-                    len(all_codes), total_groups, group_size,
-                    len(available_providers),
-                    " | ".join(p.name for p in available_providers))
+        # ── 第四步: 构建扁平共享队列 + 共享状态 ──
+        queue_lock = threading.Lock()
+        shared_queue: deque = deque(all_codes)   # O(1) popleft
+        total_initial = len(all_codes)
 
-        # ── 第三步: 共享任务队列 ──
-        task_queue: Queue = Queue()
-        for idx, group in enumerate(groups):
-            task_queue.put((idx, group, 0))  # (组号, 代码列表, 重试次数)
-
-        # ── 第四步: 共享结果和状态 ──
         result: Dict[str, List[Dict[str, Any]]] = {}
         result_lock = threading.Lock()
+
+        # 失败 symbol 追踪: 记录每个 symbol 被哪些源试过
+        # 试过所有源仍失败 → 移入 failed_symbols，不再放回池
+        available_names = [p.name for p in available]
+        symbol_tried: Dict[str, Set[str]] = {}     # symbol → {源名1, 源名2, ...}
+        symbol_tried_lock = threading.Lock()
+        failed_symbols: List[str] = []
+        failed_lock = threading.Lock()
 
         source_stats: Dict[str, Dict[str, int]] = {}
         stats_lock = threading.Lock()
 
-        # 退出条件计数器: 提交时 +1，完成/超时/丢弃时 -1
-        # 比 Queue.empty() 可靠 — 不受并发 get/put 竞态影响
-        pending_groups = 0
-        pending_lock = threading.Lock()
+        # per-Provider EWMA 吞吐（每秒处理的 symbol 数）— 用于动态 chunk
+        provider_throughput: Dict[str, float] = {}
+        throughput_lock = threading.Lock()
 
-        per_task_timeout = 60.0  # 每组超时 60s
-        max_group_retries = 3    # 单组最大重试次数，超过丢弃
+        # per-Provider 连续超时计数
+        provider_consecutive_timeout: Dict[str, int] = {}
+        timeout_state_lock = threading.Lock()
 
-        # 全局停止信号
         global_stop = threading.Event()
 
-        # ── 第五步: 非阻塞调度 — Dispatcher + per-Provider executor ──
-        #
-        # 超时重试策略:
-        #   队列充裕 (queued > num_providers) → 超时组放回重试，"多少搞点是点"
-        #   队列紧张 (queued ≤ num_providers) → 超时组直接丢弃，不浪费时间
-        #   超过 max_group_retries 次 → 无论如何丢弃
-        #
-        # TODO: Race 模式（第二步优化）
-        #   当队列紧张 + 有空闲 Provider 时，将超时组同时提交给多个 Provider，
-        #   谁先返回用谁的结果（类似 coordinate_ticker 的抢答模式）。
-        #   实现要点:
-        #     - _inflight 追踪: {group_idx: [future1, future2, ...]}
-        #     - Race 提交: 同一组提交到多个 executor future
-        #     - 结果去重: 第一个返回的合并结果，后续返回的丢弃
-        #     - 超时判定: 以最早提交时间为准，而非单个 future
+        _PER_TASK_TIMEOUT = 60.0
 
-        def _fetch_group(provider, group_codes):
-            """
-            单次获取: 调 Provider.fetch_market_kline，返回 {code: bars}。
-            非阻塞提交到 executor 后由 Dispatcher 轮询结果。
-            """
-            return provider.fetch_market_kline(
-                timeframe=timeframe,
-                count=count,
-                adj=adj,
-                timeout=int(per_task_timeout),
-                start_date=start_date,
-                end_date=end_date,
-                symbols=group_codes,
-            )
-
-        # 每个 Provider 一个单线程 executor + 状态追踪
-        provider_map = {p.name: p for p in available_providers}  # name → provider
-        provider_executors = {}
-        provider_futures = {}       # name → (future, group_idx, remaining)
-        provider_consecutive_timeout = {}
-
-        for p in available_providers:
-            provider_executors[p.name] = concurrent.futures.ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix=f"mkline-{p.name}"
-            )
-            provider_futures[p.name] = None  # 空闲
+        for p in available:
             provider_consecutive_timeout[p.name] = 0
             with stats_lock:
                 source_stats[p.name] = {"ok": 0, "fail": 0, "groups": 0, "timeout": 0}
 
-        def _submit_next(name: str):
-            """给 Provider 派下一组（非阻塞）"""
-            while True:
-                try:
-                    group_idx, group_codes, retry_count = task_queue.get_nowait()
-                except Empty:
-                    return  # 无任务
-                with result_lock:
-                    remaining = [c for c in group_codes if c not in result]
-                if not remaining:
-                    continue  # 已被其他源完成，跳过
-                future = _timed_submit(
-                    provider_executors[name],
-                    _fetch_group,
-                    provider_map[name],
-                    remaining,
-                )
-                provider_futures[name] = (future, group_idx, remaining, retry_count)
-                with pending_lock:
-                    nonlocal pending_groups
-                    pending_groups += 1
-                with stats_lock:
-                    source_stats[name]["groups"] += 1
+        def _try_put_back(codes: List[str], source_name: str):
+            """
+            将失败的 symbols 放回共享池。
+
+            核心逻辑: 记录该源已尝试过此 symbol。
+            - 还有未尝试的源 → 放回池
+            - 所有源都试过了 → 标记为失败，不再放回
+            """
+            if not codes:
                 return
+            to_retry = []
+            newly_failed = []
+            # 步骤1: 记录尝试，分类出 retry vs failed
+            with symbol_tried_lock:
+                for c in codes:
+                    tried = symbol_tried.setdefault(c, set())
+                    tried.add(source_name)
+                    if len(tried) < len(available_names):
+                        to_retry.append(c)
+                    else:
+                        newly_failed.append(c)
+            # 步骤2: 标记失败（独立锁，不嵌套）
+            if newly_failed:
+                with failed_lock:
+                    for c in newly_failed:
+                        if c not in failed_symbols:
+                            failed_symbols.append(c)
+            # 步骤3: 过滤已成功 + 放回池（独立锁）
+            if to_retry:
+                with result_lock:
+                    to_retry = [c for c in to_retry if c not in result]
+                if to_retry:
+                    with queue_lock:
+                        shared_queue.extend(to_retry)
 
-        def _dispatcher():
+        # ── 第五步: 自适应取量函数 ──
+
+        # 首轮静态权重（只算一次，所有 worker 共享）
+        _first_round_weights: Dict[str, int] = {}
+        _total_weight: int = 0
+        for p in available:
+            mc = getattr(p, 'max_concurrency', 4)
+            bs = getattr(p, 'batch_size', 50)
+            _first_round_weights[p.name] = mc * bs
+            _total_weight += mc * bs
+
+        def _calc_chunk_size(provider) -> int:
             """
-            主调度线程 — 轮询所有 Provider 的 future：
-              - 完成 → 合并结果 → 立刻派下一组
-              - 超时 → 标记失败 → 放回队列 → 派下一组
-              - 全部空闲且队列为空 → 退出
+            计算本次该从共享队列取多少只 symbols。
+
+            第一轮（无 EWMA 数据）: 按静态权重分配
+              weight = max_concurrency × batch_size（批量能力越强，初始分越多）
+            第二轮起: 按 EWMA 吞吐分配
+              每个 Provider 按其吞吐占总吞吐的比例 × 剩余 symbols 数
+
+            Returns:
+                本次应取的 symbol 数量（≥1）
             """
-            nonlocal pending_groups
+            name = provider.name
+            max_c = getattr(provider, 'max_concurrency', 4)
+            batch_sz = getattr(provider, 'batch_size', 50)
+
+            with queue_lock:
+                remaining = len(shared_queue)
+            if remaining <= 0:
+                return 0
+
+            # 单线程模式（非批量 Provider）: 每次取 1 只
+            if not getattr(provider, 'fetch_market_kline', None):
+                return 1
+
+            with throughput_lock:
+                tp = provider_throughput.get(name)
+
+            if tp is None or tp <= 0:
+                # 第一轮: 按预计算的静态权重分配
+                if _total_weight <= 0:
+                    return max(1, min(max_c, remaining))
+                share = _first_round_weights.get(name, max_c) / _total_weight
+                chunk = max(1, int(share * remaining))
+                return min(chunk, max_c, remaining)
+
+            # 第二轮起: 按 EWMA 吞吐分配
+            total_tp = 0.0
+            with throughput_lock:
+                for p in available:
+                    total_tp += provider_throughput.get(p.name, 0.0)
+
+            if total_tp <= 0:
+                return max(1, min(max_c, remaining))
+
+            share = tp / total_tp
+            chunk = max(1, int(share * remaining))
+            # 上限: batch_size（单次 API 物理上限）
+            return min(chunk, batch_sz, remaining)
+
+        # ── 第六步: Worker 函数 ──
+
+        def _worker(provider):
+            """
+            扁平化 worker — 从共享队列自适应取量，调 fetch_market_kline。
+
+            流程:
+              1. 限流等待
+              2. 按 EWMA 吞吐自适应取一批 symbols
+              3. 调 fetch_market_kline
+              4. 成功 → 合并结果 + 更新吞吐
+              5. 失败/超时 → symbols 立即放回共享池（别的源接手）
+              6. 连续超时 3 次 → 标记死源，退出
+              7. 重复直到队列为空或全局停止
+            """
+            name = provider.name
+            limiter = self._get_limiter(name, provider)
+
             while not global_stop.is_set():
-                all_idle = True
+                # 连续超时 3 次 → 标记死源，退出
+                with timeout_state_lock:
+                    if provider_consecutive_timeout[name] >= 3:
+                        if len(available) >= 2:
+                            self._mark_source_dead(name)
+                        logger.warning("[协助层] market_kline %s 连续超时3次，标记死源退出", name)
+                        return
 
-                for p in available_providers:
-                    name = p.name
-
-                    # 跳过已停止的源
-                    if name not in provider_executors:
-                        continue
-
-                    entry = provider_futures.get(name)
-                    if entry is None:
-                        # 空闲 → 派任务
-                        _submit_next(name)
-                        entry = provider_futures.get(name)
-                        if entry is None:
-                            continue  # 确实无任务
-
-                    future, group_idx, remaining, retry_count = entry
-
-                    # 还没完成 → 跳过，下轮再查
-                    if not future.done():
-                        all_idle = False
-                        continue
-
-                    all_idle = False
-                    elapsed = getattr(future, '_start_time', 0)
-                    elapsed = time.time() - elapsed if elapsed else 0
-                    provider_futures[name] = None  # 标记空闲
-
+                # 限流
+                if limiter is not None:
                     try:
-                        group_result = future.result(timeout=0)
-                    except Exception as e:
-                        group_result = None
-                        logger.debug("[Dispatcher] %s 组%d 异常: %s", name, group_idx, e)
+                        limiter.wait()
+                    except Exception:
+                        continue
 
-                    if group_result and not isinstance(group_result, NotSupportedResult):
-                        # 成功 — 按 start_date 截断（数据源 API 不支持按日期过滤）
-#                        if start_date:
-#                            for _code in list(group_result.keys()):
-#                                group_result[_code] = [
-#                                    b for b in group_result[_code]
-#                                    if str(b.get("time", "")) >= start_date
-#                                ]
-                        with result_lock:
-                            result.update(group_result)
-                        with pending_lock:
-                            pending_groups -= 1
-                        with stats_lock:
-                            source_stats[name]["ok"] += len(group_result)
-                        _realtime_cb.record_success(name)
-                        self._mark_source_alive(name)
-                        provider_consecutive_timeout[name] = 0
-                        logger.debug("[Dispatcher] %s 组%d 完成: %d只 (%.1fs)",
-                                    name, group_idx, len(group_result), elapsed)
+                # 自适应取量
+                chunk_size = _calc_chunk_size(provider)
+                if chunk_size <= 0:
+                    with result_lock:
+                        with failed_lock:
+                            done = len(result) + len(failed_symbols) >= total_initial
+                    if done:
+                        return
+                    # 队列空但别人还在处理 → 等久一点，减少空转
+                    time.sleep(1.0)
+                    continue
 
-                    elif isinstance(group_result, NotSupportedResult):
-                        # 不支持 → 放回队列给其他源 + 该源退出
-                        with pending_lock:
-                            pending_groups -= 1
-                        with result_lock:
-                            still_missing = [c for c in remaining if c not in result]
-                        if still_missing:
-                            task_queue.put((group_idx, still_missing, retry_count))
+                with queue_lock:
+                    chunk = shared_queue[:chunk_size]
+                    del shared_queue[:chunk_size]
+
+                if not chunk:
+                    time.sleep(0.3)
+                    continue
+
+                # 过滤已被其他源完成的
+                with result_lock:
+                    remaining = [c for c in chunk if c not in result]
+                if not remaining:
+                    continue
+
+                # ── 单次请求，不重试，失败立即放回共享池 ──
+                start = time.time()
+                elapsed = 0.0
+                put_back = False   # 标记是否已放回池（防重复）
+                try:
+                    task_result = provider.fetch_market_kline(
+                        timeframe=timeframe, count=count,
+                        adj=adj, timeout=int(_PER_TASK_TIMEOUT),
+                        start_date=start_date, end_date=end_date,
+                        symbols=remaining,
+                    )
+                    elapsed = time.time() - start
+                    self._update_ewma(name, elapsed)
+
+                    if isinstance(task_result, NotSupportedResult):
                         with stats_lock:
                             source_stats[name]["fail"] += 1
-                        logger.debug("[Dispatcher] %s 不支持 %s, 退出", name, timeframe)
-                        provider_executors[name].shutdown(wait=False)
-                        del provider_executors[name]
-                        del provider_futures[name]
-                        continue
+                        # 不支持的源，不计入 tried（没真正尝试），直接放回
+                        with queue_lock:
+                            shared_queue.extend(remaining)
+                        logger.debug("[协助层] market_kline %s 不支持，退出", name)
+                        return
 
-                    elif elapsed > per_task_timeout:
-                        # 超时 — 按策略决定重试或丢弃
-                        provider_consecutive_timeout[name] += 1
-                        with stats_lock:
-                            source_stats[name]["timeout"] += 1
-                        _realtime_cb.record_failure(name, "timeout")
-
-                        # 判断是否重试: 队列充裕 + 未超重试上限
-                        queued = task_queue.qsize()
-                        num_active = len(provider_executors)
-                        should_retry = (retry_count < max_group_retries
-                                        and queued > num_active)
-
-                        if should_retry:
-                            with result_lock:
-                                still_missing = [c for c in remaining if c not in result]
-                            if still_missing:
-                                task_queue.put((group_idx, still_missing, retry_count + 1))
-                                logger.debug("[Dispatcher] %s 组%d 超时，放回重试 (%d/%d, 队列%d)",
-                                            name, group_idx, retry_count + 1, max_group_retries, queued)
+                    if task_result:
+                        # 校验每个 symbol 的数据，过滤坏数据
+                        valid = {}       # 有效数据
+                        bad_codes = []   # 坏数据 → 放回池
+                        for code, bars in task_result.items():
+                            if _is_valid_kline(bars):
+                                valid[code] = bars
                             else:
-                                # 全部已被其他源完成，释放 pending
-                                with pending_lock:
-                                    pending_groups -= 1
-                        else:
-                            # 丢弃，释放 pending
-                            with pending_lock:
-                                pending_groups -= 1
-                            logger.debug("[Dispatcher] %s 组%d 超时，丢弃 (%d/%d, 队列%d)",
-                                        name, group_idx, retry_count, max_group_retries, queued)
+                                bad_codes.append(code)
 
-                        # 连续超时 → 停止该源
-                        if provider_consecutive_timeout[name] >= 3:
-                            if len(provider_executors) >= 2:
-                                self._mark_source_dead(name)
-                            logger.warning("[Dispatcher] %s 连续超时3次，停止参与", name)
-                            provider_executors[name].shutdown(wait=False)
-                            del provider_executors[name]
-                            del provider_futures[name]
-                        else:
-                            # 替换 executor: 旧线程还在跑（无法中断），
-                            # 新组提交到新 executor 不用等旧线程结束
-                            old_ex = provider_executors[name]
-                            provider_executors[name] = concurrent.futures.ThreadPoolExecutor(
-                                max_workers=1, thread_name_prefix=f"mkline-{name}"
-                            )
-                            old_ex.shutdown(wait=False)
-                        continue
+                        merged = 0
+                        with result_lock:
+                            for code, bars in valid.items():
+                                if code not in result:
+                                    result[code] = bars
+                                    merged += 1
 
+                        # 未返回 + 坏数据 → 放回池
+                        requested_set = set(remaining)
+                        returned_valid = set(valid.keys()) & requested_set
+                        not_returned = requested_set - set(task_result.keys())
+                        invalid_in_remaining = [c for c in bad_codes if c in requested_set]
+                        leftovers = list(not_returned) + invalid_in_remaining
+                        # 过滤已被其他源完成的
+                        if leftovers:
+                            with result_lock:
+                                leftovers = [c for c in leftovers if c not in result]
+                        if leftovers:
+                            # 坏数据: 记录该源已尝试 → 可能进入 failed
+                            if invalid_in_remaining:
+                                _try_put_back(invalid_in_remaining, name)
+                            # 未返回: 不记录尝试（源可能根本没处理这些）→ 直接放回
+                            if not_returned:
+                                with queue_lock:
+                                    shared_queue.extend(not_returned)
+                            logger.debug("[协助层] market_kline %s: %d有效 %d未返回 %d坏数据，%d只放回池",
+                                         name, len(returned_valid), len(not_returned),
+                                         len(invalid_in_remaining), len(leftovers))
+                        # 更新吞吐
+                        if elapsed > 0:
+                            with throughput_lock:
+                                old_tp = provider_throughput.get(name, 0.0)
+                                new_tp = merged / elapsed
+                                provider_throughput[name] = (
+                                    0.3 * new_tp + 0.7 * old_tp if old_tp > 0 else new_tp
+                                )
+                        with stats_lock:
+                            source_stats[name]["ok"] += merged
+                            source_stats[name]["groups"] += 1
+                        _realtime_cb.record_success(name)
+                        self._mark_source_alive(name)
+                        with timeout_state_lock:
+                            provider_consecutive_timeout[name] = 0
+                        logger.debug("[协助层] market_kline %s 完成: %d只 (%.1fs)",
+                                     name, merged, elapsed)
                     else:
-                        # 普通失败
-                        with pending_lock:
-                            pending_groups -= 1
+                        # 空结果 → 放回池（记录该源已尝试）
                         with stats_lock:
                             source_stats[name]["fail"] += 1
                         _realtime_cb.record_failure(name, "empty")
+                        _try_put_back(remaining, name)
+                        put_back = True
+                        logger.debug("[协助层] market_kline %s 空结果，%d只放回池",
+                                     name, len(remaining))
 
-                    # 完成/失败后立刻派下一组
-                    _submit_next(name)
+                except Exception as e:
+                    elapsed = time.time() - start
+                    self._update_ewma(name, elapsed)
+                    # 超时异常用 timeout 计数，其他用 fail 计数（不双计）
+                    if elapsed > _PER_TASK_TIMEOUT:
+                        with timeout_state_lock:
+                            provider_consecutive_timeout[name] += 1
+                        with stats_lock:
+                            source_stats[name]["timeout"] += 1
+                    else:
+                        with stats_lock:
+                            source_stats[name]["fail"] += 1
+                    _realtime_cb.record_failure(name, str(e))
+                    # 异常 → 放回池（记录该源已尝试）
+                    with result_lock:
+                        still_needed = [c for c in remaining if c not in result]
+                    if still_needed:
+                        _try_put_back(still_needed, name)
+                    put_back = True
+                    logger.debug("[Worker] %s 异常: %s，%d只放回池", name, e, len(remaining))
 
-                # 所有 Provider 空闲且无在飞任务 → 退出
-                if all_idle:
-                    with pending_lock:
-                        if pending_groups <= 0 and task_queue.empty():
-                            break
+                # 超时检测 → 连续计数
+                if elapsed > _PER_TASK_TIMEOUT:
+                    with timeout_state_lock:
+                        provider_consecutive_timeout[name] += 1
+                    with stats_lock:
+                        source_stats[name]["timeout"] += 1
+                    # 如果上面没放回过（比如正常返回但耗时过长），现在放回
+                    if not put_back and remaining:
+                        with result_lock:
+                            still_needed = [c for c in remaining if c not in result]
+                        if still_needed:
+                            _try_put_back(still_needed, name)
+                    logger.debug("[协助层] market_kline %s 超时(%.1fs)，连续超时 %d 次",
+                                 name, elapsed, provider_consecutive_timeout[name])
+                elif not put_back:
+                    # 非超时且未失败 → 重置连续超时计数
+                    with timeout_state_lock:
+                        provider_consecutive_timeout[name] = 0
 
-                time.sleep(0.1)  # 轮询间隔 100ms
+        # ── 第七步: 启动 Worker（临时池，用完即释放，零闲置）──
+        total_threads = sum(thread_alloc[p.name] for p in available)
 
-        # 给 future 打上提交时间戳（用于超时判断）
-        def _timed_submit(executor, fn, *args, **kwargs):
-            future = executor.submit(fn, *args, **kwargs)
-            future._start_time = time.time()
-            return future
-
-        # 启动 Dispatcher 线程
-        dispatcher_thread = threading.Thread(
-            target=_dispatcher, name="mkline-dispatcher", daemon=True
+        pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=total_threads, thread_name_prefix="mkline"
         )
-        dispatcher_thread.start()
+        futures = []
+        for p in available:
+            n = thread_alloc[p.name]
+            for _ in range(n):
+                futures.append(pool.submit(_worker, p))
 
-        # 等待 Dispatcher 完成或全局超时
-        dispatcher_thread.join(timeout=timeout)
+        # ── 第八步: 等待完成或全局超时 ──
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with queue_lock:
+                q_empty = len(shared_queue) == 0
+            if q_empty:
+                time.sleep(1.0)
+                with result_lock:
+                    with failed_lock:
+                        done_count = len(result) + len(failed_symbols)
+                if done_count >= total_initial:
+                    break
+                continue
+            time.sleep(0.5)
 
-        # 标记停止，清理 executor + 残留 future
+        # 超时 → 停止所有 worker
         global_stop.set()
-        for name, entry in list(provider_futures.items()):
-            if entry is not None:
-                future = entry[0]
-                future.cancel()  # 尝试取消（跑中的无法取消，但排队中的可以）
-        for name, ex in provider_executors.items():
-            ex.shutdown(wait=False, cancel_futures=True)  # Python 3.9+: 取消排队中的 future
 
-        dispatcher_thread.join(timeout=3)
+        # 等待 worker 收尾（不阻塞在长 fetch 上，最多等 5s）
+        concurrent.futures.wait(futures, timeout=5)
 
-        # ── 第七步: 收集统计信息 ──
+        # 关闭池（不等待 — 长 fetch 由 _PER_TASK_TIMEOUT 自行超时退出）
+        pool.shutdown(wait=False)
+
+        # ── 第九步: 统计 ──
         stats_lines = []
         with stats_lock:
             for name, st in source_stats.items():
                 dead = self._is_source_dead(name)
-                still_active = name in provider_executors
-                status = "💀死" if dead else ("⏱停" if not still_active else "✅活")
+                status = "💀死" if dead else "✅活"
+                with throughput_lock:
+                    tp = provider_throughput.get(name, 0.0)
                 stats_lines.append(
-                    f"{name}: {st['ok']}只成功 {st['fail']}组失败 "
-                    f"{st['groups']}组完成 {st['timeout']}次超时 {status}"
+                    f"{name}: {st['ok']}只成功 {st['fail']}次失败 "
+                    f"{st['groups']}组完成 {st['timeout']}次超时 "
+                    f"吞吐={tp:.1f}只/s {status}"
                 )
+        with failed_lock:
+            n_failed = len(failed_symbols)
+        logger.info("[协助层] market_kline 完成: %d成功 %d失败 %d只/%d只 | %s",
+                    len(result), n_failed, len(result) + n_failed, total_initial,
+                    " | ".join(stats_lines))
+        if n_failed > 0:
+            with failed_lock:
+                sample = failed_symbols[:10]
+            logger.info("[协助层] 失败 symbol 样本(前10): %s", sample)
 
-        logger.info("[协助层] market_kline 完成: %d只数据 | %s",
-                    len(result), " | ".join(stats_lines))
-
-        # ── 输出标准化: key 去前缀，统一为纯数字代码 ──
         return self._normalize_market_kline_result(result)
 
     # ================================================================
