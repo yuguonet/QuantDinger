@@ -148,9 +148,17 @@ _xdxr_file_cache: Dict[str, List[Tuple[str, float]]] = {}
 _xdxr_file_dirty = False
 _xdxr_file_lock = threading.Lock()
 
+# 写入策略: _put_file_cache 只更新内存+标记脏，不写磁盘。
+# 写入时机: 进程退出时 atexit 兜底写入一次。
+# 复权数据变化极低频（一年几次分红/送转），无需运行中频繁写入。
+
 
 def _load_cache_file():
-    """从 data/xdxr.json 加载全部缓存到内存，仅执行一次。"""
+    """从 data/xdxr.json 加载全部缓存到内存，仅执行一次。
+
+    文件格式: {"updated_at": 1715641234.5, "data": {code: [[date, factor], ...]}}
+    兼容旧格式: {code: [[date, factor], ...]}（无 updated_at 时按 mtime 判断过期）
+    """
     global _cache_loaded, _xdxr_file_cache
     if _cache_loaded:
         return
@@ -161,11 +169,24 @@ def _load_cache_file():
         if not os.path.exists(_CACHE_FILE):
             return
         try:
-            if _time.time() - os.path.getmtime(_CACHE_FILE) > _CACHE_TTL:
-                logger.info("[adjustment] 缓存文件过期，忽略")
-                return
             with open(_CACHE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
+                raw = json.load(f)
+
+            # 判断过期: 优先用文件内 updated_at，兜底用 mtime
+            file_mtime = os.path.getmtime(_CACHE_FILE)
+            updated_at = raw.get("updated_at") if isinstance(raw, dict) else None
+            ts_to_check = updated_at if isinstance(updated_at, (int, float)) else file_mtime
+            if _time.time() - ts_to_check > _CACHE_TTL:
+                logger.info("[adjustment] 缓存文件过期(%.1f天)，忽略",
+                            (_time.time() - ts_to_check) / 86400)
+                return
+
+            # 解析数据: 兼容新旧格式
+            if isinstance(raw, dict) and "data" in raw:
+                data = raw["data"]
+            else:
+                data = raw  # 旧格式: 顶层就是 {code: factors}
+
             if isinstance(data, dict):
                 for code, factors in data.items():
                     if isinstance(factors, list):
@@ -178,20 +199,48 @@ def _load_cache_file():
 
 
 def _flush_cache_file():
-    """将内存缓存写入 data/xdxr.json（仅脏数据时写入）。"""
-    global _xdxr_file_dirty
+    """将内存缓存写入 data/xdxr.json（仅脏数据时写入）。
+
+    正常情况下不主动调用 — 脏数据由 atexit 在进程退出时写入。
+    保留此函数供需要立即持久化的场景手动调用。
+    """
     with _xdxr_file_lock:
-        if not _xdxr_file_dirty:
-            return
-        try:
-            os.makedirs(os.path.dirname(_CACHE_FILE), exist_ok=True)
-            out = {code: [[d, c] for d, c in factors] for code, factors in _xdxr_file_cache.items()}
-            with open(_CACHE_FILE, "w", encoding="utf-8") as f:
-                json.dump(out, f, ensure_ascii=False, separators=(",", ":"))
-            _xdxr_file_dirty = False
-            logger.debug("[adjustment] 缓存已写入 %d 只", len(_xdxr_file_cache))
-        except Exception as e:
-            logger.debug("[adjustment] 缓存文件写入失败: %s", e)
+        if _xdxr_file_dirty:
+            _do_write()
+
+
+def _do_write():
+    """实际写入文件（调用时必须持有 _xdxr_file_lock）。"""
+    global _xdxr_file_dirty
+    try:
+        os.makedirs(os.path.dirname(_CACHE_FILE), exist_ok=True)
+        out = {
+            "updated_at": _time.time(),
+            "data": {code: [[d, c] for d, c in factors]
+                     for code, factors in _xdxr_file_cache.items()},
+        }
+        with open(_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, separators=(",", ":"))
+        _xdxr_file_dirty = False
+        logger.debug("[adjustment] 缓存已写入 %d 只", len(_xdxr_file_cache))
+    except Exception as e:
+        logger.debug("[adjustment] 缓存文件写入失败: %s", e)
+
+
+def _flush_on_exit():
+    """进程退出时兜底写入脏数据（atexit 注册）。"""
+    with _xdxr_file_lock:
+        if _xdxr_file_dirty:
+            _do_write()
+            if _xdxr_file_dirty:
+                # _do_write 失败（如磁盘满），最后一次尝试 stderr 提示
+                import sys
+                print("[adjustment] 警告: 复权因子缓存写入失败，下次启动将重新从 TDX 拉取",
+                      file=sys.stderr)
+
+
+import atexit as _atexit
+_atexit.register(_flush_on_exit)
 
 
 def _get_file_cache(code: str) -> Optional[List[Tuple[str, float]]]:
@@ -201,12 +250,17 @@ def _get_file_cache(code: str) -> Optional[List[Tuple[str, float]]]:
 
 
 def _put_file_cache(code: str, factors: List[Tuple[str, float]]):
-    """写入指定股票的复权因子，并标记脏数据。"""
+    """写入指定股票的复权因子到内存，标记脏数据。
+
+    不主动写磁盘 — 复权数据变化极低频（一年几次分红/送转），
+    批量加载时每只都写磁盘毫无意义。写入时机:
+      1. 进程退出时 atexit 兜底写入
+      2. 下次冷启动 _load_cache_file 时发现过期会忽略旧文件
+    """
     global _xdxr_file_dirty
     _load_cache_file()
     _xdxr_file_cache[code] = factors
     _xdxr_file_dirty = True
-    _flush_cache_file()
 
 
 # ================================================================

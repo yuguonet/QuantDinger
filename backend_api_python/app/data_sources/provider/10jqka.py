@@ -193,11 +193,17 @@ def _aggregate_tick_bars(tick_bars: List[Dict[str, Any]], timeframe: str) -> Lis
 from app.data_sources.provider.adjustment import apply_fwd_adjust as _apply_fwd_adjust
 
 
+# [并发常量] 最大并发线程数 — Coordinator.allocate_threads() 据此分配 worker。
+# ⚠️ 请勿删除或随意修改: 此常量直接影响调度层线程分配，改错会导致请求过载或资源浪费。
+# 选值依据: 同花顺HTTP接口，限流 min_interval=1.0s。
+# 同步位置: source_config.py max_workers 需与此值保持一致。
+MAX_CONCURRENCY = 4
+
 @register(priority=25)
 class ThsDataSource:
     """同花顺(10jqka)数据源 — HTTP接口，无需额外依赖。"""
     name = "10jqka"; priority = 20
-    max_concurrency = 4
+    max_concurrency = MAX_CONCURRENCY
     min_interval = 1.0
     jitter_min = 0.5
     jitter_max = 1.5

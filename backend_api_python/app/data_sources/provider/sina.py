@@ -203,6 +203,12 @@ def _fetch_sina_kline_hisdata(sc: str, count: int, timeout: int) -> List[Dict[st
 from app.data_sources.provider.adjustment import apply_fwd_adjust as _apply_fwd_adjust
 
 
+# [并发常量] 最大并发线程数 — Coordinator.allocate_threads() 据此分配 worker。
+# ⚠️ 请勿删除或随意修改: 此常量直接影响调度层线程分配，改错会导致请求过载或资源浪费。
+# 选值依据: 新浪反爬较严格，限流 min_interval=1.5s，4并发较保守。
+# 同步位置: source_config.py max_workers 需与此值保持一致。
+MAX_CONCURRENCY = 4
+
 @register(priority=20)
 class SinaDataSource:
     """
@@ -222,7 +228,7 @@ class SinaDataSource:
 
     name = "sina"
     priority = 15
-    max_concurrency = 4
+    max_concurrency = MAX_CONCURRENCY
     min_interval = 1.5
     jitter_min = 0.8
     jitter_max = 2.5

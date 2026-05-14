@@ -141,6 +141,9 @@ class CircuitBreaker:
 
     def record_failure(self, source: str, reason: str = ""):
         with self._lock:
+            # 已经在熔断中，不重复计数
+            if self._state.get(source) == self._OPEN:
+                return
             self._failures[source] = self._failures.get(source, 0) + 1
             if self._failures[source] >= self._failure_threshold:
                 self._state[source] = self._OPEN
@@ -526,29 +529,9 @@ class Coordinator:
 
     def __init__(self):
         self._lock = threading.Lock()
-        # per-provider 限流器缓存（懒创建）
-        self._rate_limiters: Dict[str, Any] = {}
-        self._rate_limiters_lock = threading.Lock()
         # per-provider EWMA 响应时间
         self._ewma_rt: Dict[str, float] = {}
         self._ewma_lock = threading.Lock()
-
-    # ── 限流器管理 ──
-
-    def _get_limiter(self, provider_name: str, provider) -> Optional[Any]:
-        """获取 per-provider 限流器（懒创建，线程安全）。min_interval=0 返回 None。"""
-        min_interval = getattr(provider, 'min_interval', 0.0)
-        if min_interval <= 0:
-            return None
-        with self._rate_limiters_lock:
-            if provider_name not in self._rate_limiters:
-                from app.data_sources.rate_limiter import RateLimiter
-                self._rate_limiters[provider_name] = RateLimiter(
-                    min_interval=min_interval,
-                    jitter_min=getattr(provider, 'jitter_min', 0.0),
-                    jitter_max=getattr(provider, 'jitter_max', 0.0),
-                )
-            return self._rate_limiters[provider_name]
 
     # ── EWMA 响应时间追踪 ──
 
@@ -565,8 +548,8 @@ class Coordinator:
             else:
                 self._ewma_rt[provider_name] = self._EWMA_ALPHA * rt + (1 - self._EWMA_ALPHA) * old
 
-    def allocate_threads(self, providers: list, global_budget: int = 32) -> Dict[str, int]:
-        """按 max_concurrency / EWMA 响应时间加权分配线程数。"""
+    def allocate_threads(self, providers: list, global_budget: int = 32, symbol_count: int = 0) -> Dict[str, int]:
+        """按 max_concurrency / EWMA 响应时间加权分配线程数。symbol_count > 0 时限制总线程数。"""
         if not providers:
             return {}
         weights = {}
@@ -583,6 +566,14 @@ class Coordinator:
             max_c = getattr(p, 'max_concurrency', 4)
             raw = global_budget * weights[p.name] / total
             alloc[p.name] = max(1, min(round(raw), max_c))
+        # 当 symbol 数量远少于线程数时，限制总线程避免无意义竞争
+        if symbol_count > 0:
+            total_alloc = sum(alloc.values())
+            max_useful = min(symbol_count * len(providers), total_alloc)
+            if total_alloc > max_useful and max_useful > 0:
+                scale = max_useful / total_alloc
+                for name in alloc:
+                    alloc[name] = max(1, round(alloc[name] * scale))
         return alloc
 
     # ================================================================
@@ -1648,7 +1639,7 @@ class Coordinator:
             count = calc_kline_count(timeframe, effective_start, effective_end)
 
         # ── 第三步: 动态分配线程 ──
-        thread_alloc = self.allocate_threads(available)
+        thread_alloc = self.allocate_threads(available, symbol_count=len(all_codes))
         logger.info("[协助层] market_kline %d只 → %d源: %s",
                     len(all_codes), len(available),
                     " | ".join(f"{p.name}:{thread_alloc[p.name]}" for p in available))
@@ -1801,7 +1792,6 @@ class Coordinator:
               7. 重复直到队列为空或全局停止
             """
             name = provider.name
-            limiter = self._get_limiter(name, provider)
 
             while not global_stop.is_set():
                 # 连续超时 3 次 → 标记死源，退出
@@ -1811,13 +1801,6 @@ class Coordinator:
                             self._mark_source_dead(name)
                         logger.warning("[协助层] market_kline %s 连续超时3次，标记死源退出", name)
                         return
-
-                # 限流
-                if limiter is not None:
-                    try:
-                        limiter.wait()
-                    except Exception:
-                        continue
 
                 # 自适应取量
                 chunk_size = _calc_chunk_size(provider)
@@ -1832,8 +1815,7 @@ class Coordinator:
                     continue
 
                 with queue_lock:
-                    chunk = shared_queue[:chunk_size]
-                    del shared_queue[:chunk_size]
+                    chunk = [shared_queue.popleft() for _ in range(min(chunk_size, len(shared_queue)))]
 
                 if not chunk:
                     time.sleep(0.3)
@@ -1896,13 +1878,9 @@ class Coordinator:
                             with result_lock:
                                 leftovers = [c for c in leftovers if c not in result]
                         if leftovers:
-                            # 坏数据: 记录该源已尝试 → 可能进入 failed
-                            if invalid_in_remaining:
-                                _try_put_back(invalid_in_remaining, name)
-                            # 未返回: 不记录尝试（源可能根本没处理这些）→ 直接放回
-                            if not_returned:
-                                with queue_lock:
-                                    shared_queue.extend(not_returned)
+                            # 坏数据 + 未返回: 统一走 _try_put_back 记录尝试
+                            # 所有源都试过 → 标记为 failed，不再循环
+                            _try_put_back(leftovers, name)
                             logger.debug("[协助层] market_kline %s: %d有效 %d未返回 %d坏数据，%d只放回池",
                                          name, len(returned_valid), len(not_returned),
                                          len(invalid_in_remaining), len(leftovers))

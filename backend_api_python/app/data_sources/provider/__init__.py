@@ -133,6 +133,19 @@ logger = get_logger(__name__)
 
 
 # ================================================================
+# 各数据源最大并发线程数 (max_concurrency)
+# ================================================================
+# 每个 Provider 文件定义自己的 MAX_CONCURRENCY 常量（模块级），
+# 类中通过 max_concurrency = MAX_CONCURRENCY 引用。
+# source_config.py 通过 import 各 Provider 模块的 MAX_CONCURRENCY 同步。
+#
+# 增减数据源只需增删 Provider 文件，无需修改本文件。
+#
+# Coordinator.allocate_threads() 读取 Provider.max_concurrency 作为线程分配上限。
+# source_config.py 中的 max_workers 从各 Provider 文件导入同一常量。
+# ================================================================
+
+# ================================================================
 # 市场类型常量
 # ================================================================
 # Provider 在 capabilities["markets"] 中声明支持的市场。

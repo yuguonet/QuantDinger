@@ -220,6 +220,12 @@ def _fetch_baidu_quote(code: str) -> Optional[Dict[str, Any]]:
 # Provider 注册
 # ================================================================
 
+# [并发常量] 最大并发线程数 — Coordinator.allocate_threads() 据此分配 worker。
+# ⚠️ 请勿删除或随意修改: 此常量直接影响调度层线程分配，改错会导致请求过载或资源浪费。
+# 选值依据: 百度HTTP接口，无限流。
+# 同步位置: source_config.py max_workers 需与此值保持一致。
+MAX_CONCURRENCY = 8
+
 @register(priority=50)
 class BaiduDataSource:
     """
@@ -239,7 +245,7 @@ class BaiduDataSource:
 
     name = "baidu"
     priority = 50
-    max_concurrency = 8
+    max_concurrency = MAX_CONCURRENCY
     min_interval = 0.0
     jitter_min = 0.0
     jitter_max = 0.0

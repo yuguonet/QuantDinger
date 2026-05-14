@@ -280,6 +280,12 @@ def _fetch_ticker(code: str) -> Optional[Dict[str, Any]]:
 # Provider 注册
 # ================================================================
 
+# [并发常量] 最大并发线程数 — Coordinator.allocate_threads() 据此分配 worker。
+# ⚠️ 请勿删除或随意修改: 此常量直接影响调度层线程分配，改错会导致请求过载或资源浪费。
+# 选值依据: 需cookie(TTL=1h)，限流 min_interval=0.5s。
+# 同步位置: source_config.py max_workers 需与此值保持一致。
+MAX_CONCURRENCY = 8
+
 @register(priority=40)
 class XueqiuDataSource:
     """
@@ -297,7 +303,7 @@ class XueqiuDataSource:
 
     name = "xueqiu"
     priority = 40
-    max_concurrency = 8
+    max_concurrency = MAX_CONCURRENCY
     min_interval = 0.5
     jitter_min = 0.2
     jitter_max = 0.8

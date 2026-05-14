@@ -39,6 +39,7 @@ import time
 import signal
 import logging
 import argparse
+import threading
 from bisect import bisect_left
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -77,6 +78,14 @@ def _load_env():
 
 
 _load_env()
+
+# ---------------------------------------------------------------------------
+# 全局 socket 超时 — 防止网络阻塞导致 Ctrl+C 失效
+# Python 信号只在字节码指令间检查；阻塞在 C 层 socket 时 SIGINT 会被挂起。
+# 设置默认超时后，socket 操作会在超时后抛 TimeoutError，回到 Python 层处理信号。
+# ---------------------------------------------------------------------------
+import socket as _socket
+_socket.setdefaulttimeout(120)  # 120s 兜底超时
 
 # ---------------------------------------------------------------------------
 # 时间常量
@@ -189,6 +198,12 @@ def _parse_bar_time(bar: Dict[str, Any]) -> Optional[datetime]:
         return ts if ts.tzinfo else ts.replace(tzinfo=TZ_SH)
     if isinstance(ts, (int, float)):
         return datetime.fromtimestamp(ts, tz=TZ_SH)
+    if isinstance(ts, str) and ts.strip():
+        for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%d'):
+            try:
+                return datetime.strptime(ts.strip(), fmt).replace(tzinfo=TZ_SH)
+            except ValueError:
+                continue
     dt_str = bar.get("date") or bar.get("datetime") or ""
     if dt_str:
         for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%d'):
@@ -215,12 +230,19 @@ def _bars_to_records(bars: List[Dict[str, Any]], timeframe: str) -> List[Dict[st
         l = _safe_float(bar.get("low"))
         c = _safe_float(bar.get("close"))
         v = _safe_float(bar.get("volume"))
-        # 去重: 同时间戳取后出现的（通常更完整）
+        # 去重: 同时间戳选质量更好的记录
         if dt in seen:
             prev = seen[dt]
-            # 如果已有记录 volume>0 而新的 volume=0，保留旧的
-            if _safe_float(prev.get("volume")) > 0 and v == 0:
+            prev_v = _safe_float(prev.get("volume"))
+            # 已有记录 volume>0 而新的 volume=0 → 保留旧的
+            if prev_v > 0 and v == 0:
                 continue
+            # 两边 volume 都 > 0 → 选 OHLC 更完整的（非零字段更多）
+            if prev_v > 0 and v > 0:
+                prev_nonzero = sum(1 for k in ("open", "high", "low", "close") if _safe_float(prev.get(k)) > 0)
+                new_nonzero = sum(1 for val in (o, h, l, c) if val > 0)
+                if new_nonzero < prev_nonzero:
+                    continue  # 新的不如旧的完整，保留旧的
         seen[dt] = {"time": dt, "open": o, "high": h, "low": l, "close": c, "volume": v}
     return sorted(seen.values(), key=lambda r: r["time"])
 
@@ -257,6 +279,7 @@ def validate_stock(
     timeframe: str,
     start_date: str,
     end_date: str,
+    price_tolerance: float = 0.02,
 ) -> ValidationResult:
     """对单只股票做完整性校验"""
     result = ValidationResult(code)
@@ -372,6 +395,7 @@ def validate_stock(
         is_no_limit = is_resume or (d in no_limit_before)
 
         # ── 15m: 检查每天 bar 数，16 根则重新分配标准时间 ──
+        skip_bar_check = False
         if timeframe == "15m" and not is_suspend and _is_trading_day(d):
             if len(day_records) == 16:
                 # 按时间排序，重新分配 16 根标准 bar 时间
@@ -380,11 +404,19 @@ def validate_stock(
                     old_dt = rec["time"]
                     rec["time"] = old_dt.replace(hour=h, minute=m, second=0, microsecond=0)
             else:
-                # bar 数不是 16 根，跳过该天不做校验
-                continue
+                # bar 数不是 16 根，跳过逐 bar 校验但仍更新 prev_close
+                result.add_warning(f"15m bar数异常: {d} count={len(day_records)} (期望16)")
+                skip_bar_check = True
 
         # ── 停牌日跳过逐 bar 校验 ──
         if is_suspend:
+            skip_bar_check = True
+
+        if skip_bar_check:
+            # 跳过逐 bar 校验，但仍需更新 prev_close 以保证后续日期检查基准正确
+            day_agg = daily_agg.get(d)
+            if not is_suspend and day_agg and day_agg["close"] > 0:
+                prev_close = day_agg["close"]
             continue
 
         # ── 逐 bar 校验（OHLC 合理性 + 涨跌幅） ──
@@ -419,7 +451,7 @@ def validate_stock(
                 for label, price in [("open", o), ("high", h), ("low", l), ("close", c)]:
                     if price > 0:
                         pct = abs(price - prev_close) / prev_close
-                        if pct > price_limit + 0.015:  # 1.5% 容差
+                        if pct > price_limit + price_tolerance:
                             dt = rec.get("time")
                             bar_time = f"{dt.hour}:{dt.minute:02d}" if isinstance(dt, datetime) else "?"
                             direction = "+" if price >= prev_close else "-"
@@ -438,7 +470,7 @@ def validate_stock(
                 day_close = day_agg["close"]
                 if day_close > 0:
                     change_pct = abs(day_close - prev_close) / prev_close
-                    if change_pct > price_limit + 0.015:  # 1.5% 容差
+                    if change_pct > price_limit + price_tolerance:
                         direction = "+" if day_close >= prev_close else "-"
                         result.add_error(
                             f"涨跌幅超限: {d} "
@@ -521,12 +553,17 @@ def write_stock_data(
     years = list(range(start_year, end_year + 1))
 
     # 同一事务: 先删旧数据，再写新数据（保证原子性）
+    _VALID_TABLES = {f"kline_{tf}_{y}" for tf in ("1D", "15m") for y in range(2000, 2035)}
+
     try:
         with pool.connection() as conn:
             cur = conn.cursor()
             # 删除旧数据
             for year in years:
                 table = f"kline_{timeframe}_{year}"
+                if table not in _VALID_TABLES:
+                    logger.warning("跳过非法表名: %s", table)
+                    continue
                 try:
                     cur.execute(f"""
                         DELETE FROM "{table}"
@@ -534,8 +571,12 @@ def write_stock_data(
                           AND time >= %s
                           AND time <= %s
                     """, (code, f"{start_date} 00:00:00", f"{end_date} 23:59:59"))
-                except Exception:
-                    pass  # 表可能不存在
+                except Exception as del_err:
+                    # 区分"表不存在"和其他错误
+                    if "does not exist" in str(del_err).lower() or "undefinedtable" in str(del_err).lower():
+                        pass  # 表不存在，正常跳过
+                    else:
+                        logger.error("删除数据失败 %s/%s/%s: %s", code, table, timeframe, del_err)
 
             # 在同一事务内写入新数据（逐批 INSERT）
             inserted = 0
@@ -543,6 +584,8 @@ def write_stock_data(
                 batch = db_records[i:i + 5000]
                 for year in years:
                     table = f"kline_{timeframe}_{year}"
+                    if table not in _VALID_TABLES:
+                        continue
                     year_batch = [r for r in batch
                                   if r["time"].year == year]
                     if not year_batch:
@@ -556,14 +599,17 @@ def write_stock_data(
                             year_batch,
                         )
                         inserted += len(year_batch)
-                    except Exception:
-                        pass  # 表可能不存在
+                    except Exception as ins_err:
+                        if "does not exist" in str(ins_err).lower() or "undefinedtable" in str(ins_err).lower():
+                            pass  # 表不存在，正常跳过
+                        else:
+                            logger.error("写入数据失败 %s/%s/%s: %s", code, table, timeframe, ins_err)
 
             conn.commit()
             cur.close()
             return inserted
     except Exception as e:
-        logger.warning("写库失败 %s/%s: %s", code, timeframe, e)
+        logger.error("写库事务失败 %s/%s: %s", code, timeframe, e)
         return 0
 
 
@@ -654,10 +700,34 @@ _INTERRUPTED = False
 def _signal_handler(signum, frame):
     global _INTERRUPTED
     if _INTERRUPTED:
-        print("\n⚡ 再次收到中断，强制退出")
-        sys.exit(1)
+        # 二次中断：直接强杀，不等任何线程
+        os._exit(130)
     _INTERRUPTED = True
     print("\n⚠️  收到中断信号，正在保存进度...")
+
+
+def _start_interrupt_watchdog():
+    """
+    看门狗线程：独立于主线程，每秒检查 _INTERRUPTED 标志。
+    首次中断给主线程 10 秒保存进度；二次中断立即强杀。
+    """
+    def _watch():
+        while True:
+            time.sleep(1)
+            if _INTERRUPTED:
+                # 给主线程 10 秒处理中断（保存检查点等）
+                for _ in range(10):
+                    time.sleep(1)
+                    if not _INTERRUPTED:
+                        break  # 主线程处理完毕，重置了标志
+                else:
+                    # 10 秒后仍未恢复，强制退出
+                    if _INTERRUPTED:
+                        print("\n⚡ 看门狗：主线程 10 秒未响应，强制退出")
+                        os._exit(130)
+    t = threading.Thread(target=_watch, daemon=True)
+    t.start()
+    return t
 
 
 # ═══════════════════════════════════════════════════════
@@ -694,6 +764,7 @@ def process_batch(
     timeout: float,
     preferred_source: str,
     adj: str,
+    price_tolerance: float,
     dry_run: bool,
     retry_path: str,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
@@ -708,26 +779,43 @@ def process_batch(
     to_retry: Dict[str, List[str]] = {}   # code → errors（待加入重传）
     to_remove: List[str] = []             # 成功的 code（待从重传移除）
 
-    # 拉取数据
-    try:
-        raw_data = coordinator.coordinate_market_kline(
-            market=market,
-            timeframe=timeframe,
-            count=count,
-            adj=adj,
-            timeout=timeout,
-            preferred_source=preferred_source,
-            start_date=start_date,
-            end_date=end_date,
-            symbols=symbols,
-        )
-    except Exception as e:
-        logger.error("Coordinator 调用失败: %s", e)
+    # 拉取数据 — 在守护线程中执行，主线程保持响应信号
+    raw_data: Dict[str, list] = {}
+    fetch_error: Optional[Exception] = None
+
+    def _do_fetch():
+        nonlocal raw_data, fetch_error
+        try:
+            raw_data = coordinator.coordinate_market_kline(
+                market=market,
+                timeframe=timeframe,
+                count=count,
+                adj=adj,
+                timeout=timeout,
+                preferred_source=preferred_source,
+                start_date=start_date,
+                end_date=end_date,
+                symbols=symbols,
+            )
+        except Exception as e:
+            fetch_error = e
+
+    t = threading.Thread(target=_do_fetch, daemon=True)
+    t.start()
+    # 主线程循环等待，每 1s 检查一次中断信号
+    while t.is_alive():
+        t.join(timeout=1.0)
+        if _INTERRUPTED:
+            # 主线程收到中断，守护线程是 daemon，进程退出时自动清理
+            raise KeyboardInterrupt("数据拉取被用户中断")
+
+    if fetch_error is not None:
+        logger.error("Coordinator 调用失败: %s", fetch_error)
         for code in symbols:
-            to_retry[code] = [f"Coordinator 异常: {e}"]
+            to_retry[code] = [f"Coordinator 异常: {fetch_error}"]
             results.append({"code": code, "board": _detect_board(code),
                            "bars": 0, "written": 0, "status": "error",
-                           "errors": f"Coordinator 异常: {e}"})
+                           "errors": f"Coordinator 异常: {fetch_error}"})
             stats["failed"] += 1
         _batch_update_retry(retry_path, to_retry, [])
         return results, stats
@@ -764,7 +852,7 @@ def process_batch(
             continue
 
         # 完整性校验
-        vr = validate_stock(code, records, timeframe, start_date, end_date)
+        vr = validate_stock(code, records, timeframe, start_date, end_date, price_tolerance)
 
         if vr.has_errors:
             stats["failed"] += 1
@@ -818,6 +906,8 @@ def main():
         help="指定首选数据源")
     parser.add_argument("--adj", default="qfq", choices=["qfq", "hfq", ""],
         help="复权方式")
+    parser.add_argument("--price-tolerance", type=float, default=0.02,
+        help="涨跌幅检查容差（小数形式，默认 0.02 = 2%%）")
     parser.add_argument("--dry-run", action="store_true",
         help="只拉取校验，不写库")
     parser.add_argument("--resume", action="store_true",
@@ -830,8 +920,12 @@ def main():
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
+    # 启动看门狗：独立线程，检测到中断后 2s 强制退出
+    _start_interrupt_watchdog()
+
     if sys.platform != 'win32':
         _wakeup_r, _wakeup_w = os.pipe()
+        os.close(_wakeup_r)  # 只需要写端用于 set_wakeup_fd
         os.set_blocking(_wakeup_w, False)
         signal.set_wakeup_fd(_wakeup_w)
 
@@ -946,23 +1040,28 @@ def main():
                 break
 
             batch_start = time.time()
-            results, stats = process_batch(
-                symbols=batch_codes,
-                coordinator=coordinator,
-                cb=cb,
-                writer=writer,
-                pool=pool,
-                market=market,
-                timeframe=args.type,
-                start_date=start_date,
-                end_date=end_date,
-                count=count,
-                timeout=args.timeout,
-                preferred_source=args.preferred_source,
-                adj=args.adj,
-                dry_run=args.dry_run,
-                retry_path=retry_path,
-            )
+            try:
+                results, stats = process_batch(
+                    symbols=batch_codes,
+                    coordinator=coordinator,
+                    cb=cb,
+                    writer=writer,
+                    pool=pool,
+                    market=market,
+                    timeframe=args.type,
+                    start_date=start_date,
+                    end_date=end_date,
+                    count=count,
+                    timeout=args.timeout,
+                    preferred_source=args.preferred_source,
+                    adj=args.adj,
+                    price_tolerance=args.price_tolerance,
+                    dry_run=args.dry_run,
+                    retry_path=retry_path,
+                )
+            except KeyboardInterrupt:
+                _INTERRUPTED = True
+                break
 
             all_results.extend(results)
             for k in agg_stats:
@@ -996,37 +1095,13 @@ def main():
         if not _INTERRUPTED:
             break
 
-        # ── 中断交互模式 ──
+        # ── 中断：保存进度，直接退出 ──
         remaining_codes = [c for c in all_codes if c not in processed_set]
         print(f"\n  ⏸️  已中断")
         print(f"  已处理: {len(processed_set)}/{total}")
         print(f"  剩余:   {len(remaining_codes)} 只")
-        print(f"  进度已保存至检查点文件")
-
-        while True:
-            try:
-                choice = input("\n  输入 'r' 续传 / 'q' 退出: ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                choice = 'q'
-            if choice == 'r':
-                _INTERRUPTED = False
-                if not remaining_codes:
-                    print("  ✅ 所有股票已处理完毕")
-                    break
-                total = len(remaining_codes)
-                batches = [remaining_codes[i:i + batch_size]
-                           for i in range(0, len(remaining_codes), batch_size)]
-                print(f"  ▶️  续传: 剩余 {total} 只，{len(batches)} 批\n")
-                print(f"[2/4] 拉取 + 校验 + 写入（续传）...")
-                break  # 跳出内层 while，回到外层 for
-            elif choice == 'q':
-                break  # 跳出内层 while
-            else:
-                print("  无效输入，请输入 'r' 或 'q'")
-
-        if choice == 'q':
-            break
-        # choice == 'r' → 继续外层 while True 循环
+        print(f"  进度已保存，下次用 --resume 继续")
+        break
 
     elapsed_main = time.time() - t0
 

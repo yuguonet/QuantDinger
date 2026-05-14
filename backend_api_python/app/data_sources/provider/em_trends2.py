@@ -65,6 +65,75 @@ _fast_opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=S
 
 
 # ================================================================
+# CDN 节点探测 + 锁定
+# ================================================================
+# 东财 push2 CDN 有多个节点（82~85.push2.eastmoney.com），但真正稳定的少。
+# 策略: 启动时探测，锁定最快的节点一直用，失败时自动切换到下一个可用节点。
+# 不做轮换 — 增加复杂性且收益不大。
+
+_CDN_CANDIDATES = [
+    "82.push2.eastmoney.com",
+    "83.push2.eastmoney.com",
+    "84.push2.eastmoney.com",
+    "85.push2.eastmoney.com",
+    "push2.eastmoney.com",
+]
+
+_cdn_host: str = "82.push2.eastmoney.com"  # 当前锁定的节点
+_cdn_lock = threading.Lock()
+_cdn_discovered = False
+
+
+def _probe_cdn() -> str:
+    """探测 CDN 节点，返回最快可用的域名。"""
+    import socket
+    results = []
+    for host in _CDN_CANDIDATES:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(2)
+            t0 = time.time()
+            s.connect((host, 443))
+            latency = time.time() - t0
+            s.close()
+            results.append((host, latency))
+        except Exception:
+            pass
+    if results:
+        results.sort(key=lambda x: x[1])
+        return results[0][0]
+    return "82.push2.eastmoney.com"  # 全部探测失败时的默认值
+
+
+def _get_cdn_host() -> str:
+    """获取当前锁定的 CDN 节点（首次调用时探测）。"""
+    global _cdn_host, _cdn_discovered
+    if _cdn_discovered:
+        return _cdn_host
+    with _cdn_lock:
+        if _cdn_discovered:
+            return _cdn_host
+        _cdn_host = _probe_cdn()
+        _cdn_discovered = True
+        logger.info("[em_trends2] CDN 节点锁定: %s", _cdn_host)
+        return _cdn_host
+
+
+def _switch_cdn():
+    """当前节点失败时，切换到下一个可用节点。"""
+    global _cdn_host, _cdn_discovered
+    with _cdn_lock:
+        try:
+            idx = _CDN_CANDIDATES.index(_cdn_host)
+            next_idx = (idx + 1) % len(_CDN_CANDIDATES)
+        except ValueError:
+            next_idx = 0
+        _cdn_host = _CDN_CANDIDATES[next_idx]
+        _cdn_discovered = True
+        logger.warning("[em_trends2] CDN 切换: → %s", _cdn_host)
+
+
+# ================================================================
 # 域名限流
 # ================================================================
 
@@ -198,8 +267,9 @@ def _em_trends2_raw(code: str) -> Optional[list]:
     """push2.eastmoney.com trends2: 获取今天1分钟原始数据（JSONP）"""
     secid = _to_em(code)
     try:
+        host = _get_cdn_host()
         url = (
-            f"https://82.push2.eastmoney.com/api/qt/stock/trends2/get?"
+            f"https://{host}/api/qt/stock/trends2/get?"
             f"cb=jQuery&secid={secid}&fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13"
             f"&fields2=f51,f52,f53,f54,f55,f56,f57,f58&iscr=0&ndays=1"
         )
@@ -228,6 +298,7 @@ def _em_trends2_raw(code: str) -> Optional[list]:
             })
         return bars if bars else None
     except Exception:
+        _switch_cdn()  # 请求失败，切换到下一个节点
         return None
 
 
@@ -326,6 +397,12 @@ def _fetch_em_trends2_quote(code: str) -> Optional[Dict[str, Any]]:
 # Provider 注册
 # ================================================================
 
+# [并发常量] 最大并发线程数 — Coordinator.allocate_threads() 据此分配 worker。
+# ⚠️ 请勿删除或随意修改: 此常量直接影响调度层线程分配，改错会导致请求过载或资源浪费。
+# 选值依据: trends2极速API，响应极快，15并发可充分利用。
+# 同步位置: source_config.py max_workers 需与此值保持一致。
+MAX_CONCURRENCY = 15
+
 @register(priority=5)
 class EmTrends2DataSource:
     """
@@ -345,7 +422,7 @@ class EmTrends2DataSource:
 
     name = "em_trends2"
     priority = 5
-    max_concurrency = 15
+    max_concurrency = MAX_CONCURRENCY
     min_interval = 0.0
     jitter_min = 0.0
     jitter_max = 0.0
@@ -445,8 +522,9 @@ class EmTrends2DataSource:
         try:
             stocks, page = [], 1
             while True:
+                host = _get_cdn_host()
                 data = _http_get_json(
-                    f"https://82.push2.eastmoney.com/api/qt/clist/get?pn={page}&pz=5000&po=1&np=1"
+                    f"https://{host}/api/qt/clist/get?pn={page}&pz=5000&po=1&np=1"
                     f"&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f3"
                     f"&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f12,f14,f13"
                 )

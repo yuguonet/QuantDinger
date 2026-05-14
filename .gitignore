@@ -93,3 +93,4 @@ optimizer_output/
 backend_api_python/cache/
 backend_api_python/app/utils/calendar/
 
+backend_api_python/app/data/

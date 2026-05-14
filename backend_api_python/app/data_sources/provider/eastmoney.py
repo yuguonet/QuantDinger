@@ -15,7 +15,7 @@ API来源 & 最新信息:
   - K线: ✅ 全周期 1m/5m/15m/30m/1H/1D/1W（per-symbol，非原生批量）
   - fetch_ticker: ✅ 单只实时行情
   - fetch_batch_quotes: ✅ 原生全市场批量（clist API 一次6000只）
-  - fetch_market_kline: ✅ 逐只调用fetch_kline（Coordinator统管线程）
+  - fetch_market_kline: ✅ 自动路由 — 今天日K走clist批量(1次HTTP) / 其他逐只调fetch_kline
 
 单位注意（重要）:
   - fetch_ticker: stock/get API 的价格字段(f43/f44/f45/f46/f60)返回"分"，需÷100
@@ -229,6 +229,12 @@ _EM_KLT = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1H": 60, "1D": 101, "1W": 10
 _EM_FQT = {"": 0, "qfq": 1, "hfq": 2}
 
 
+# [并发常量] 最大并发线程数 — Coordinator.allocate_threads() 据此分配 worker。
+# ⚠️ 请勿删除或随意修改: 此常量直接影响调度层线程分配，改错会导致请求过载或资源浪费。
+# 选值依据: 东财datacenter无限流，6并发稳健。
+# 同步位置: source_config.py max_workers 需与此值保持一致。
+MAX_CONCURRENCY = 6
+
 @register(priority=30)
 class EastMoneyDataSource:
     """
@@ -254,7 +260,7 @@ class EastMoneyDataSource:
 
     name = "eastmoney"
     priority = 25
-    max_concurrency = 6
+    max_concurrency = MAX_CONCURRENCY
     min_interval = 0.0
     jitter_min = 0.0
     jitter_max = 0.0
@@ -316,11 +322,7 @@ class EastMoneyDataSource:
         try:
             data = json.loads(body)
         except Exception:
-            # JSONP 解析失败，尝试直接解析 JSON
-            try:
-                data = resp.json()
-            except Exception:
-                return []
+            return []
         if not isinstance(data, dict):
             return []
         klines_data = (data.get("data") or {}).get("klines")
@@ -361,9 +363,55 @@ class EastMoneyDataSource:
         start_date: str = "", end_date: str = "",
         symbols: Optional[List[str]] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
-        """批量K线 — Coordinator 统管线程+限流，本方法逐只调用 fetch_kline"""
+        """
+        批量K线 — 自动选择最优路径。
+
+        路由逻辑:
+          1. 日线 + end_date 是今天（或为空）
+             → 走 clist/get 批量行情API，一次HTTP拿全市场，转单根K线bar
+             → 比逐只拉快几千倍（1次HTTP vs N次HTTP）
+          2. 其他情况
+             → 逐只调用 fetch_kline，由 Coordinator 统管线程和限流
+
+        为什么这样路由:
+          东财 kline/get 是单只接口，无原生批量K线端点。
+          但 clist/get 可一次拿6000只实时行情，转成单根日K bar 完全够用。
+          这是全市场日K快照的最优路径。
+        """
         if not symbols:
             return {}
+
+        # ── 快速路径: 今天日K → clist批量行情转K线 ──
+        # 东财 kline/get 是单只接口，逐只拉5000只要5000次HTTP。
+        # clist/get 一次HTTP拿全市场行情，转成单根日K bar，快几千倍。
+        # 适用场景: 全市场日K快照、当日行情加载、count=1的场景。
+        # 不适用: 历史多天K线（clist只返回当天快照）。
+        from datetime import date as _date
+        today_str = _date.today().strftime("%Y-%m-%d")
+        effective_end = end_date if end_date else today_str
+        is_today = effective_end.replace("-", "") == today_str.replace("-", "")
+
+        if timeframe == "1D" and is_today:
+            quotes = self.fetch_batch_quotes(symbols, timeout=timeout)
+            if not quotes:
+                return {}
+            result: Dict[str, List[Dict[str, Any]]] = {}
+            for sym, q in quotes.items():
+                bar = {
+                    "time": today_str,
+                    "open": q.get("open", 0),
+                    "high": q.get("high", 0),
+                    "low": q.get("low", 0),
+                    "close": q.get("last", 0),
+                    "volume": q.get("volume", 0),
+                }
+                if bar["close"] > 0:
+                    result[sym] = [bar]
+            logger.info("[东财] fetch_market_kline 快速路径: %d只日K走clist批量 (%d成功)",
+                        len(symbols), len(result))
+            return result
+
+        # ── 常规路径: 逐只调用 fetch_kline ──
         result: Dict[str, List[Dict[str, Any]]] = {}
         for code in symbols:
             try:
@@ -404,10 +452,7 @@ class EastMoneyDataSource:
         try:
             data = json.loads(body)
         except Exception:
-            try:
-                data = resp.json()
-            except Exception:
-                return None
+            return None
         if not isinstance(data, dict):
             return None
         d = data.get("data")
@@ -458,9 +503,8 @@ class EastMoneyDataSource:
         url = f"https://{_EM_QUOTE_HOST}/api/qt/clist/get"
 
         try:
-            resp = requests.get(
+            text = _em_get(
                 url,
-                headers=_make_headers(referer=_em_referers.next()),
                 params={
                     "cb": "jQuery",
                     "pn": 1, "pz": 6000, "po": 1, "np": 1,
@@ -469,9 +513,13 @@ class EastMoneyDataSource:
                     "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
                     "fields": "f2,f5,f6,f12,f15,f16,f17,f18",
                 },
+                referer=_em_referers.next(),
                 timeout=timeout,
             )
-            body = _strip_jsonp(resp.text)
+            if not text:
+                logger.warning("[东财批量行情] clist 响应为空")
+                return {}
+            body = _strip_jsonp(text)
             if not body:
                 logger.warning("[东财批量行情] clist 响应为空")
                 return {}

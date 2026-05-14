@@ -32,6 +32,10 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, Set, Tuple
 
+# 各 Provider 的 max_workers 与 Provider.MAX_CONCURRENCY 保持一致。
+# 每个 Provider 文件定义自己的 MAX_CONCURRENCY 常量（模块级），
+# 新增/删除数据源只需增删 Provider 文件 + 本表对应条目。
+
 
 @dataclass
 class SourceConfig:
@@ -194,70 +198,70 @@ class SourceConfig:
 SOURCE_CONFIGS: Dict[str, SourceConfig] = {
 
     # 腾讯实时行情 — 最稳定的免费源之一
-    # 支持 A股 + 港股，max_workers=5 适中（腾讯对频率敏感）
+    # 支持 A股 + 港股，与 Provider.max_concurrency 保持一致
     "tencent": SourceConfig(
         name="tencent",
-        max_workers=5,
+        max_workers=6,  # = provider/tencent.py MAX_CONCURRENCY
         markets={"CNStock", "HKStock"},
         batch_capable=True,
         batch_size=500,
     ),
 
     # 新浪行情 — 传统免费源，仅支持A股
-    # max_workers=3 较保守（新浪反爬较严格）
+    # 与 Provider.max_concurrency 保持一致
     "sina": SourceConfig(
         name="sina",
-        max_workers=3,
+        max_workers=4,  # = provider/sina.py MAX_CONCURRENCY
         markets={"CNStock"},
         batch_capable=True,
         batch_size=500,
     ),
 
     # 东财 datacenter — 数据最全，支持大批次
-    # max_workers=4，batch_size=6000（东财 API 单次支持大量数据）
+    # batch_size=6000（东财 API 单次支持大量数据）
     "eastmoney": SourceConfig(
         name="eastmoney",
-        max_workers=4,
+        max_workers=6,  # = provider/eastmoney.py MAX_CONCURRENCY
         markets={"CNStock"},
         batch_capable=True,
         batch_size=6000,
     ),
 
     # AKShare — Python 数据接口，支持 A股 + 港股
-    # max_workers=2 较低（AKShare 底层调用多个源，自身有限流）
+    # 较低并发（AKShare 底层调用多个源，自身有限流）
     "akshare": SourceConfig(
         name="akshare",
-        max_workers=2,
+        max_workers=2,  # AKShare 无对应 Provider 常量，保持原值
         markets={"CNStock", "HKStock"},
         batch_capable=True,
         batch_size=5000,
     ),
 
     # 同花顺(10jqka) — HTTP 接口，分钟分时+日/周K线
-    # max_workers=3，仅支持 A 股
+    # 仅支持 A 股
     "10jqka": SourceConfig(
         name="10jqka",
-        max_workers=3,
+        max_workers=4,  # = provider/10jqka.py MAX_CONCURRENCY
         markets={"CNStock"},
         batch_capable=True,
         batch_size=500,
     ),
 
     # BaoStock — TCP 协议直连，无需 API Key
-    # max_workers=2（TCP 连接数有限）
+    # TCP 连接数有限，无对应 Provider 常量
     "baostock": SourceConfig(
         name="baostock",
-        max_workers=2,
+        max_workers=2,  # BaoStock 无对应 Provider 常量，保持原值
         markets={"CNStock"},
         batch_capable=False,
         batch_size=1,
     ),
 
     # 港股专用源 — 仅支持港股，不支持批量
-    # max_workers=3，batch_size=1（逐个请求）
+    # batch_size=1（逐个请求），无对应 Provider 常量
     "hk_stock": SourceConfig(
         name="hk_stock",
-        max_workers=3,
+        max_workers=3,  # hk_stock 无对应 Provider 常量，保持原值
         markets={"HKStock"},
         batch_capable=False,
         batch_size=1,
@@ -267,40 +271,36 @@ SOURCE_CONFIGS: Dict[str, SourceConfig] = {
 
     # 东方财富 trends2 极速源 — 最快的免费A股源
     # 通过 push2.eastmoney.com trends2 API，1min聚合为15min
-    # max_workers=30（极速源，高并发）
     "em_trends2": SourceConfig(
         name="em_trends2",
-        max_workers=30,
+        max_workers=15,  # = provider/em_trends2.py MAX_CONCURRENCY
         markets={"CNStock"},
         batch_capable=True,
         batch_size=50,
     ),
 
     # 雪球 — 投资社区数据源
-    # max_workers=15（中等并发）
     "xueqiu": SourceConfig(
         name="xueqiu",
-        max_workers=15,
+        max_workers=8,  # = provider/xueqiu.py MAX_CONCURRENCY
         markets={"CNStock"},
         batch_capable=True,
         batch_size=50,
     ),
 
     # 搜狐财经 — 免费数据源
-    # max_workers=15（中等并发）
     "sohu": SourceConfig(
         name="sohu",
-        max_workers=15,
+        max_workers=8,  # = provider/sohu.py MAX_CONCURRENCY
         markets={"CNStock"},
         batch_capable=True,
         batch_size=50,
     ),
 
     # 百度股市通 — 免费数据源
-    # max_workers=15（中等并发）
     "baidu": SourceConfig(
         name="baidu",
-        max_workers=15,
+        max_workers=8,  # = provider/baidu.py MAX_CONCURRENCY
         markets={"CNStock"},
         batch_capable=True,
         batch_size=50,

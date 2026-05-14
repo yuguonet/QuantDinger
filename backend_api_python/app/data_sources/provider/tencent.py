@@ -145,6 +145,12 @@ def _rows_to_dicts(rows: list, timeframe: str = "1D") -> List[Dict[str, Any]]:
     return out
 
 
+# [并发常量] 最大并发线程数 — Coordinator.allocate_threads() 据此分配 worker。
+# ⚠️ 请勿删除或随意修改: 此常量直接影响调度层线程分配，改错会导致请求过载或资源浪费。
+# 选值依据: 腾讯HTTP接口，限流 min_interval=1.0s，6并发较稳健。
+# 同步位置: source_config.py max_workers 需与此值保持一致。
+MAX_CONCURRENCY = 6
+
 @register(priority=10)
 class TencentDataSource:
     """
@@ -164,7 +170,7 @@ class TencentDataSource:
 
     name = "tencent"
     priority = 10
-    max_concurrency = 6
+    max_concurrency = MAX_CONCURRENCY
     min_interval = 1.0
     jitter_min = 0.5
     jitter_max = 1.5
