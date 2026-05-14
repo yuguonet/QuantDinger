@@ -431,7 +431,7 @@ class EastMoneyDataSource:
         if not secid:
             return None
 
-        url = f"https://{_EM_QUOTE_HOST}/api/qt/stock/get"
+        url = f"http://{_EM_QUOTE_HOST}/api/qt/stock/get"
 
         text = _em_get(
             url,
@@ -500,7 +500,9 @@ class EastMoneyDataSource:
         if not code_set:
             return {}
 
-        url = f"https://{_EM_QUOTE_HOST}/api/qt/clist/get"
+        # ⚠️ 必须用 HTTP: push2.eastmoney.com 的 HTTPS 对非浏览器 TLS 指纹返回空响应
+        # curl_cffi edge101 模拟已失效(2025年起东财收紧JA3检测)，HTTP 不受影响
+        url = f"http://{_EM_QUOTE_HOST}/api/qt/clist/get"
 
         try:
             text = _em_get(
@@ -553,6 +555,7 @@ class EastMoneyDataSource:
                     "open": round(float(item.get("f17", 0)), 4),
                     "previousClose": prev,
                     "volume": vol,
+                    "amount": round(float(item.get("f6", 0) or 0), 2),  # 成交额(元)
                     "time": today_str,
                     "name": "",
                     "symbol": sym,

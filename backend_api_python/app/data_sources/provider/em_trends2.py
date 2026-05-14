@@ -72,37 +72,65 @@ _fast_opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=S
 # 不做轮换 — 增加复杂性且收益不大。
 
 _CDN_CANDIDATES = [
-    "82.push2.eastmoney.com",
-    "83.push2.eastmoney.com",
     "84.push2.eastmoney.com",
     "85.push2.eastmoney.com",
     "push2.eastmoney.com",
+    "82.push2.eastmoney.com",
+    "83.push2.eastmoney.com",
 ]
 
-_cdn_host: str = "82.push2.eastmoney.com"  # 当前锁定的节点
+_cdn_host: str = "84.push2.eastmoney.com"  # 当前锁定的节点（84/85 支持 HTTP）
 _cdn_lock = threading.Lock()
 _cdn_discovered = False
 
 
 def _probe_cdn() -> str:
-    """探测 CDN 节点，返回最快可用的域名。"""
+    """探测 CDN 节点，返回实际 HTTP 请求能拿到数据的最快节点。
+
+    东财 push2 CDN 各节点对 HTTP/HTTPS 支持不一致:
+    - 82/83.push2: HTTP 返回空（仅 HTTPS 可用，但被 TLS 指纹封锁）
+    - 84/85.push2: HTTP 正常
+    - push2 主域: 不稳定
+    必须用真实 HTTP 请求验证，不能只测 TCP 连接。
+    """
     import socket
-    results = []
+    # 先用 TCP 快速过滤不可达节点
+    reachable = []
     for host in _CDN_CANDIDATES:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(2)
             t0 = time.time()
-            s.connect((host, 443))
+            s.connect((host, 80))
             latency = time.time() - t0
             s.close()
-            results.append((host, latency))
+            reachable.append((host, latency))
         except Exception:
             pass
-    if results:
-        results.sort(key=lambda x: x[1])
-        return results[0][0]
-    return "82.push2.eastmoney.com"  # 全部探测失败时的默认值
+
+    # 再用真实 HTTP 请求验证能拿到数据的节点
+    test_url_suffix = "/api/qt/stock/trends2/get?cb=jQuery&secid=1.600519&fields1=f1,f2,f3&fields2=f51&iscr=0&ndays=1"
+    working = []
+    for host, latency in reachable:
+        try:
+            resp = urllib.request.urlopen(
+                urllib.request.Request(
+                    f"http://{host}{test_url_suffix}",
+                    headers=HEADERS,
+                ),
+                timeout=3,
+            )
+            body = resp.read().decode("utf-8", "ignore")
+            if "jQuery" in body and '"rc":0' in body:
+                working.append((host, latency))
+        except Exception:
+            pass
+
+    if working:
+        working.sort(key=lambda x: x[1])
+        return working[0][0]
+    # 全部探测失败时返回首选节点
+    return "84.push2.eastmoney.com"
 
 
 def _get_cdn_host() -> str:
@@ -268,8 +296,9 @@ def _em_trends2_raw(code: str) -> Optional[list]:
     secid = _to_em(code)
     try:
         host = _get_cdn_host()
+        # ⚠️ 必须用 HTTP: push2.eastmoney.com 的 HTTPS 对非浏览器 TLS 指纹返回空响应
         url = (
-            f"https://{host}/api/qt/stock/trends2/get?"
+            f"http://{host}/api/qt/stock/trends2/get?"
             f"cb=jQuery&secid={secid}&fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13"
             f"&fields2=f51,f52,f53,f54,f55,f56,f57,f58&iscr=0&ndays=1"
         )
@@ -523,8 +552,9 @@ class EmTrends2DataSource:
             stocks, page = [], 1
             while True:
                 host = _get_cdn_host()
+                # ⚠️ 必须用 HTTP（同 _em_trends2_raw 原因）
                 data = _http_get_json(
-                    f"https://{host}/api/qt/clist/get?pn={page}&pz=5000&po=1&np=1"
+                    f"http://{host}/api/qt/clist/get?pn={page}&pz=5000&po=1&np=1"
                     f"&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f3"
                     f"&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f12,f14,f13"
                 )

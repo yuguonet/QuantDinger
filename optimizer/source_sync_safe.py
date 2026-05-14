@@ -11,6 +11,9 @@
 #      - 交易日历对比（缺失日检测）
 #      - 停复牌检测（vol=0 且 OHLC 相同）
 #      - volume > 0（非停牌 bar）
+#      - 涨跌幅限制: 沪深主板<13%, 创业板<25%, 科创/北证<37%
+#      - 复牌首日/起始日前几日无涨跌幅限制
+#      - 新股上市前5天(创业板/科创板)/前3天(北交所)无涨跌幅限制
 #      - 15m: 每天 16 bar 检查
 #   4. 无错误 → 先删旧数据再写入
 #      有错误 → 写 log + 记录进重传文件
@@ -99,6 +102,27 @@ _BAR_TIMES_15M = [
     (14, 30), (14, 45), (15, 0),
 ]
 _BAR_SET_15M: Set[Tuple[int, int]] = set(_BAR_TIMES_15M)
+
+# 涨跌幅限制（小数形式，0.12 = 12%）—— 各板块原限制+2%容差
+_PRICE_LIMITS = {
+    "main_sh":   0.12,   # 沪市主板 600/601/603/605
+    "main_sz":   0.12,   # 深市主板 000/001/002/003
+    "gem":       0.24,   # 创业板 300/301
+    "star":      0.24,   # 科创板 688/689 (注册制后20%)
+    "bj":        0.36,   # 北交所 43/82/83/87/88 (30%)
+}
+
+# 复牌首日/起始日前几日不检查涨跌幅的天数
+_NO_LIMIT_DAYS_AFTER_RESUME = 1   # 复牌首日不限
+_NO_LIMIT_DAYS_BEFORE_START = 2   # 起始日前 2 天不限
+
+# 新股上市前N个交易日无涨跌幅限制
+_NO_LIMIT_DAYS_NEW_LISTING = {
+    "gem":  5,   # 创业板(注册制) 前5天不限
+    "star": 5,   # 科创板(注册制) 前5天不限
+    "bj":   3,   # 北交所 前3天不限
+    # 主板 IPO 首日44%上限，第2天起恢复正常限制 → 由 is_resume 处理首日即可
+}
 
 # 交易日历
 _TRADING_DAYS_SORTED: List[str] = []
@@ -269,7 +293,7 @@ def validate_stock(
     timeframe: str,
     start_date: str,
     end_date: str,
-    price_tolerance: float = 0.02,   # 保留参数兼容性，已不再使用
+    price_tolerance: float = 0.02,
 ) -> ValidationResult:
     """对单只股票做完整性校验"""
     result = ValidationResult(code)
@@ -280,8 +304,9 @@ def validate_stock(
         return result
 
     board = _detect_board(code)
+    price_limit = _PRICE_LIMITS.get(board, 0.13)
 
-    # ── 按日聚合: 用于停牌检测 ──
+    # ── 按日聚合: 用于停牌检测和涨跌幅检查 ──
     # daily_agg: {date: {open, high, low, close, volume, bar_count}}
     daily_agg: Dict[str, Dict[str, Any]] = {}
     date_records: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -354,10 +379,30 @@ def validate_stock(
                 result.add_warning(f"交易日缺失: {d}")
 
     # ── 2. 每日数据校验 ──
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    no_limit_before: Set[str] = set()
+    for i in range(1, _NO_LIMIT_DAYS_BEFORE_START + 1):
+        no_limit_before.add((start_dt - timedelta(days=i)).strftime("%Y-%m-%d"))
+
+    # 15m 逐 bar 涨跌幅检查标记
+    is_15m_bar_check = (timeframe == "15m")
+
+    prev_close: Optional[float] = None  # 前一个非停牌日的收盘价
+
+    # 新股上市前N天无涨跌幅限制: 检测首日交易
+    new_listing_limit = _NO_LIMIT_DAYS_NEW_LISTING.get(board, 0)
+    first_trading_day: Optional[str] = None
+    if sorted_dates and new_listing_limit > 0:
+        first_date = sorted_dates[0]
+        prev_td_of_first = _prev_trading_day(first_date)
+        if prev_td_of_first is None or prev_td_of_first not in date_records:
+            first_trading_day = first_date
 
     # 15m: 最后一天不检查（数据可能不完整）
-    is_15m_bar_check = (timeframe == "15m")
     last_date = sorted_dates[-1] if is_15m_bar_check else None
+
+    # 新股上市交易日计数（用于判断前N天不限）
+    new_listing_day_count = 0
 
     for d in sorted_dates:
         # 15m: 跳过最后一天
@@ -365,6 +410,21 @@ def validate_stock(
             continue
         day_records = date_records[d]
         is_suspend = d in suspension_dates
+        # 复牌日: 当天非停牌 且 前一个交易日是停牌日或数据缺失
+        is_resume = False
+        if not is_suspend:
+            prev_td = _prev_trading_day(d)
+            if prev_td:
+                # 前一个交易日停牌 或 数据缺失 → 视为复牌首日，无涨跌幅限制
+                if prev_td in suspension_dates or prev_td not in date_records:
+                    is_resume = True
+        # 新股上市前N天无涨跌幅限制
+        is_new_listing_no_limit = False
+        if first_trading_day is not None and d >= first_trading_day and not is_suspend:
+            new_listing_day_count += 1
+            if new_listing_day_count <= new_listing_limit:
+                is_new_listing_no_limit = True
+        is_no_limit = is_resume or is_new_listing_no_limit or (d in no_limit_before)
 
         # ── 15m: 检查每天 bar 数，16 根则重新分配标准时间 ──
         skip_bar_check = False
@@ -376,7 +436,7 @@ def validate_stock(
                     old_dt = rec["time"]
                     rec["time"] = old_dt.replace(hour=h, minute=m, second=0, microsecond=0)
             else:
-                # bar 数不是 16 根，跳过逐 bar 校验
+                # bar 数不是 16 根，跳过逐 bar 校验但仍更新 prev_close
                 result.add_warning(f"15m bar数异常: {d} count={len(day_records)} (期望16)")
                 skip_bar_check = True
 
@@ -385,9 +445,13 @@ def validate_stock(
             skip_bar_check = True
 
         if skip_bar_check:
+            # 跳过逐 bar 校验，但仍需更新 prev_close 以保证后续日期检查基准正确
+            day_agg = daily_agg.get(d)
+            if not is_suspend and day_agg and day_agg["close"] > 0:
+                prev_close = day_agg["close"]
             continue
 
-        # ── 逐 bar 校验（OHLC 合理性） ──
+        # ── 逐 bar 校验（OHLC 合理性 + 涨跌幅） ──
         for rec in day_records:
             o = _safe_float(rec.get("open"))
             h = _safe_float(rec.get("high"))
@@ -412,6 +476,43 @@ def validate_stock(
                 result.add_error(f"open 越界: {d} O={o} H={h} L={l}")
             if c > 0 and h > 0 and (c > h or c < l):
                 result.add_error(f"close 越界: {d} C={c} H={h} L={l}")
+
+            # ── 逐 bar 涨跌幅检查（与前一交易日收盘价比较）──
+            # 15m: 每根 bar 的 OHLC 都不能超出涨跌幅限制
+            if is_15m_bar_check and not is_no_limit and prev_close is not None and prev_close > 0:
+                for label, price in [("open", o), ("high", h), ("low", l), ("close", c)]:
+                    if price > 0:
+                        pct = abs(price - prev_close) / prev_close
+                        if pct > price_limit + price_tolerance:
+                            dt = rec.get("time")
+                            bar_time = f"{dt.hour}:{dt.minute:02d}" if isinstance(dt, datetime) else "?"
+                            direction = "+" if price >= prev_close else "-"
+                            result.add_error(
+                                f"bar涨跌幅超限: {d} {bar_time} "
+                                f"{label}={price:.2f} prev={prev_close:.2f} "
+                                f"pct={direction}{pct*100:.2f}% limit={price_limit*100:.0f}%"
+                            )
+
+        # ── 日级涨跌幅检查（每天一次，bar 循环外） ──
+        day_agg = daily_agg.get(d)
+        if day_agg and not is_no_limit:
+            prev_td = _prev_trading_day(d)
+            prev_td_has_data = prev_td is not None and prev_td in date_records
+            if prev_td_has_data and prev_close is not None and prev_close > 0:
+                day_close = day_agg["close"]
+                if day_close > 0:
+                    change_pct = abs(day_close - prev_close) / prev_close
+                    if change_pct > price_limit + price_tolerance:
+                        direction = "+" if day_close >= prev_close else "-"
+                        result.add_error(
+                            f"涨跌幅超限: {d} "
+                            f"prev={prev_close:.2f} cur={day_close:.2f} "
+                            f"pct={direction}{change_pct*100:.2f}% limit={price_limit*100:.0f}%"
+                        )
+
+        # 更新 prev_close（用日级 close，停牌日不更新）
+        if not is_suspend and day_agg and day_agg["close"] > 0:
+            prev_close = day_agg["close"]
 
     # ── 3. 尾部检查 ──
     if actual_end < end_date and _is_trading_day(end_date):
@@ -783,18 +884,6 @@ def process_batch(
             start_cutoff = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=TZ_SH)
             records = [r for r in records
                        if isinstance(r.get("time"), datetime) and r["time"] >= start_cutoff]
-        # 1D: 盘中时今天的K线未完成，丢弃今天的未完成数据
-        if records and timeframe == "1D":
-            today_str = datetime.now(TZ_SH).strftime("%Y-%m-%d")
-            today_dt = datetime.strptime(today_str, "%Y-%m-%d").replace(tzinfo=TZ_SH)
-            last_rec_time = records[-1].get("time")
-            if isinstance(last_rec_time, datetime) and last_rec_time >= today_dt:
-                # 检查今天是否还在盘中（15:00前视为盘中）
-                now_hm = datetime.now(TZ_SH).hour * 60 + datetime.now(TZ_SH).minute
-                if now_hm < 15 * 60:  # 15:00 前 → 盘中，丢弃今天的bar
-                    records = [r for r in records
-                               if not (isinstance(r.get("time"), datetime)
-                                       and r["time"].strftime("%Y-%m-%d") == today_str)]
         if not records:
             stats["no_data"] += 1
             to_retry[code] = ["转换后无有效记录"]
@@ -859,7 +948,7 @@ def main():
     parser.add_argument("--adj", default="qfq", choices=["qfq", "hfq", ""],
         help="复权方式")
     parser.add_argument("--price-tolerance", type=float, default=0.02,
-        help="(已废弃) 涨跌幅检查容差，涨跌幅校验已移除")
+        help="涨跌幅检查容差（小数形式，默认 0.02 = 2%%）")
     parser.add_argument("--dry-run", action="store_true",
         help="只拉取校验，不写库")
     parser.add_argument("--resume", action="store_true",
