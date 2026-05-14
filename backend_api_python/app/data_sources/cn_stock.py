@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from app.data_sources.base import BaseDataSource
@@ -27,6 +28,17 @@ from app.data_sources.kline_clean import clean_klines
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# DB 支持的原始周期（直接查表，效率最高）
+_RAW_TIMEFRAMES = {"15m", "1D"}
+
+# DB 聚合周期（从 15m 或 1D 实时 SQL 聚合）
+# 与 MarketKlineWriter._AGG_TARGETS 对齐
+_AGG_TIMEFRAMES = {"30m", "1h", "2h", "4h", "1W", "1M"}
+
+# DB 数据新鲜度阈值：最新bar时间距今不超过 N 秒视为有效
+# 1天=86400s，A股最长非交易间隔约3天(周末+节假日)，取4天兜底
+_DB_FRESHNESS_MAX_AGE = 4 * 86400
 
 
 # ================================================================
@@ -89,7 +101,12 @@ class CNStockDataSource(BaseDataSource):
         before_time: Optional[int] = None,
         after_time: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """获取 K 线数据。支持逗号分隔的批量模式。"""
+        """获取 K 线数据。支持逗号分隔的批量模式。
+
+        回测时优先从本地 DB 读取（15m/1D 直查，其余周期 SQL 聚合），
+        DB 无数据或数据不够新时自动降级走远程。
+        """
+        # 批量模式暂不走 DB，直接远程
         if ',' in symbol:
             symbols = [s.strip() for s in symbol.split(',') if s.strip()]
             if not symbols:
@@ -104,9 +121,129 @@ class CNStockDataSource(BaseDataSource):
                 truncate=False,
             )
 
+        # 单只：DB 优先
+        tf = timeframe.strip()
+        if tf in _RAW_TIMEFRAMES or tf in _AGG_TIMEFRAMES:
+            bars = self._get_kline_db(
+                symbol, tf, limit, before_time, after_time,
+            )
+            if bars:
+                return self.filter_and_limit(
+                    bars, limit=limit,
+                    before_time=before_time, after_time=after_time,
+                    truncate=(after_time is None),
+                )
+
+        # 降级：走远程（原路径完全不变）
         return self._get_kline_remote(
             symbol, timeframe, limit, before_time, after_time
         )
+
+    # ── DB 读取（内部方法，不影响外部接口）──
+
+    def _get_kline_db(
+        self,
+        symbol: str,
+        tf: str,
+        limit: int,
+        before_time: Optional[int] = None,
+        after_time: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        从本地 DB 读取 K 线，含最后时间判定。
+
+        返回标准格式列表，失败或数据不够新返回空列表。
+        """
+        try:
+            from app.utils.db_market import get_market_kline_writer
+            writer = get_market_kline_writer()
+        except Exception:
+            return []
+
+        # 计算时间范围
+        start_dt = datetime.fromtimestamp(after_time) if after_time else None
+        end_dt = datetime.fromtimestamp(before_time) if before_time else None
+
+        try:
+            if tf in _RAW_TIMEFRAMES:
+                rows = writer.query(
+                    "CNStock", symbol, tf,
+                    start_time=start_dt, end_time=end_dt,
+                    limit=limit,
+                )
+            else:
+                # _AGG_TIMEFRAMES
+                rows = writer.aggregate(
+                    "CNStock", symbol, tf,
+                    start_time=start_dt, end_time=end_dt,
+                    limit=limit,
+                )
+        except Exception:
+            return []
+
+        if not rows:
+            return []
+
+        # ── 最后时间判定 ──
+        latest_db_time = rows[-1].get("time")
+        if isinstance(latest_db_time, datetime):
+            latest_ts = latest_db_time.timestamp()
+        elif isinstance(latest_db_time, (int, float)):
+            latest_ts = float(latest_db_time)
+        else:
+            return []
+
+        now_ts = datetime.now().timestamp()
+
+        if before_time:
+            # 回测场景：DB 最新 bar 必须覆盖到 before_time 附近（允许1天误差）
+            if latest_ts < before_time - 86400:
+                logger.debug(
+                    f"[DB] {symbol}/{tf} 数据不够新: "
+                    f"最新={datetime.fromtimestamp(latest_ts):%Y-%m-%d} "
+                    f"需要>={datetime.fromtimestamp(before_time - 86400):%Y-%m-%d}"
+                )
+                return []
+        else:
+            # 非回测场景：DB 最新 bar 不能太旧
+            if now_ts - latest_ts > _DB_FRESHNESS_MAX_AGE:
+                logger.debug(
+                    f"[DB] {symbol}/{tf} 数据过期: "
+                    f"最新={datetime.fromtimestamp(latest_ts):%Y-%m-%d} "
+                    f"距今{int((now_ts - latest_ts) / 86400)}天"
+                )
+                return []
+
+        # ── 转换为标准格式（time 转 Unix 秒）──
+        bars = []
+        for row in rows:
+            t = row.get("time")
+            if isinstance(t, datetime):
+                ts = int(t.timestamp())
+            elif isinstance(t, (int, float)):
+                ts = int(t)
+            else:
+                continue
+            bars.append({
+                "time": ts,
+                "open": float(row.get("open", 0)),
+                "high": float(row.get("high", 0)),
+                "low": float(row.get("low", 0)),
+                "close": float(row.get("close", 0)),
+                "volume": float(row.get("volume", 0)),
+            })
+
+        # ── 数量判定：DB 返回条数不足请求数的一半，视为数据不完整 ──
+        min_required = max(limit // 2, 30)
+        if len(bars) < min_required:
+            logger.debug(
+                f"[DB] {symbol}/{tf} 条数不足: "
+                f"请求{limit}条, DB返回{len(bars)}条, 最低需要{min_required}条"
+            )
+            return []
+
+        logger.info(f"[DB] ✅ {symbol}/{tf} 命中 {len(bars)} 条")
+        return bars
 
     # ── 远程拉取（Coordinator 调度）──
 

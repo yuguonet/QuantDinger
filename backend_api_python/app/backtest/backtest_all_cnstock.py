@@ -96,6 +96,32 @@ from app.services.indicator_review import (
     BACKTEST_MIN_RETURN,
 )
 
+# ── 回测通过附加条件：买点时效性 ──
+BUY_RECENCY_DAYS = 2   # 买点必须在最近 N 天内
+
+
+def _is_buy_date_recent(buy_date_str: str, max_days: int = BUY_RECENCY_DAYS) -> bool:
+    """
+    检查买点日期是否在最近 N 天内（按日期比较，不含时分秒）。
+
+    例：今天 2025-05-15，max_days=2 → 买点 >= 2025-05-13 即有效。
+
+    Args:
+        buy_date_str: 买点日期字符串，支持 "YYYY-MM-DD" 或 "YYYY-MM-DD HH:MM"
+        max_days: 最大允许天数
+
+    Returns:
+        True 表示买点在有效期内，False 表示过期
+    """
+    if not buy_date_str:
+        return False
+    try:
+        buy_date = datetime.strptime(str(buy_date_str)[:10], "%Y-%m-%d").date()
+        cutoff = datetime.now().date() - timedelta(days=max_days)
+        return buy_date >= cutoff
+    except (ValueError, TypeError):
+        return False
+
 
 # ================================================================
 #  参数优化评分函数
@@ -105,38 +131,108 @@ def _score_bt_result(bt_result: Dict[str, Any]) -> float:
     """
     对单次回测结果计算综合评分（用于参数优化排序）。
 
-    评分公式（与 optimizer/strategy_optimizer.py 的 composite 对齐）：
-      score = sharpe*0.3 + return*0.3 + winRate*1.0 + min(profitFactor,5)*0.3 - maxDD*1.0
+    核心标准：以买入→卖出之间的收益率/时间为首要依据。
+    夏普比率、胜率作为重要参考。
+
+    评分公式：
+      1. 从 trades 中提取每笔完整交易（open → close）的持仓收益率和持仓天数
+      2. 计算 日均收益率（return_per_day）作为核心指标
+      3. 综合评分 = return_per_day*0.5 + winRate*0.3 + sharpe*0.2
 
     交易次数 < 3 时惩罚 -10。
     """
     if not bt_result:
         return -999.0
 
-    sharpe = float(bt_result.get("sharpeRatio", 0) or 0)
-    win_rate = float(bt_result.get("winRate", 0) or 0) / 100.0
-    max_dd = float(bt_result.get("maxDrawdown", 0) or 0) / 100.0
-    total_return = float(bt_result.get("totalReturn", 0) or 0) / 100.0
     total_trades = int(bt_result.get("totalTrades", 0) or 0)
-    profit_factor = float(bt_result.get("profitFactor", 0) or 0)
-
     if total_trades < 3:
         return -10.0
 
-    trade_penalty = 0.0
-    if total_trades < 10:
-        trade_penalty = (10 - total_trades) * 0.08
-    elif total_trades > 60:
-        trade_penalty = (total_trades - 60) * 0.03
+    # ── 从 trades 计算每笔持仓的收益率和持有时间 ──
+    trades = bt_result.get("trades") or []
+    holding_returns = []   # 每笔交易的收益率 (小数)
+    holding_days = []      # 每笔交易的持仓天数
 
-    return (
-        sharpe * 0.3
-        + total_return * 0.3
-        + win_rate * 1.0
-        + min(profit_factor, 5.0) * 0.3
-        - max_dd * 1.0
-        - trade_penalty
+    open_trade = None
+    for t in trades:
+        ttype = t.get("type", "")
+        if "open_long" in ttype or "open_short" in ttype:
+            open_trade = t
+        elif ("close_long" in ttype or "close_short" in ttype) and open_trade is not None:
+            entry_price = float(open_trade.get("price") or 0)
+            exit_price = float(t.get("price") or 0)
+            if entry_price > 0 and exit_price > 0:
+                if "long" in ttype:
+                    ret = (exit_price - entry_price) / entry_price
+                else:
+                    ret = (entry_price - exit_price) / entry_price
+                holding_returns.append(ret)
+
+                # 计算持仓天数
+                try:
+                    t_open = datetime.strptime(
+                        str(open_trade.get("time", ""))[:16], "%Y-%m-%d %H:%M"
+                    )
+                    t_close = datetime.strptime(
+                        str(t.get("time", ""))[:16], "%Y-%m-%d %H:%M"
+                    )
+                    days = max((t_close - t_open).total_seconds() / 86400.0, 0.1)
+                    holding_days.append(days)
+                except (ValueError, TypeError):
+                    holding_days.append(1.0)
+
+            open_trade = None
+
+    # ── 计算核心指标：日均收益率 ──
+    if not holding_returns:
+        # 无完整交易对，降级用 totalReturn / 持仓天数估算
+        # 用 equityCurve 首尾时间差估算总天数，避免除以交易次数导致亏损被稀释
+        total_return_pct = float(bt_result.get("totalReturn", 0) or 0) / 100.0
+        equity_curve = bt_result.get("equityCurve") or []
+        if len(equity_curve) >= 2:
+            try:
+                t_start = datetime.strptime(str(equity_curve[0].get("time", ""))[:10], "%Y-%m-%d")
+                t_end = datetime.strptime(str(equity_curve[-1].get("time", ""))[:10], "%Y-%m-%d")
+                est_days = max((t_end - t_start).days, 1)
+            except (ValueError, TypeError):
+                est_days = max(total_trades * 3, 1)  # 粗估每笔3天
+        else:
+            est_days = max(total_trades * 3, 1)
+        return_per_day = total_return_pct / est_days
+    else:
+        # 每笔交易的日均收益率，取平均
+        returns_per_day = []
+        for ret, days in zip(holding_returns, holding_days):
+            if days > 0:
+                returns_per_day.append(ret / days)
+        return_per_day = (
+            sum(returns_per_day) / len(returns_per_day) if returns_per_day else 0.0
+        )
+
+    # ── 其他参考指标 ──
+    win_rate = float(bt_result.get("winRate", 0) or 0)       # 0~100
+    sharpe = float(bt_result.get("sharpeRatio", 0) or 0)
+    max_dd = abs(float(bt_result.get("maxDrawdown", 0) or 0))  # 正数
+
+    # ── 综合评分 ──
+    # return_per_day 放大 100 倍使其与 win_rate/0~100 和 sharpe 量级可比
+    score = (
+        return_per_day * 100.0 * 0.5     # 日均收益率（核心，权重50%）
+        + win_rate * 0.3                  # 胜率（参考，权重30%）
+        + sharpe * 0.2                    # 夏普比率（参考，权重20%）
     )
+
+    # 持仓效率加分：短周期高收益优于长周期高收益
+    if holding_days:
+        avg_days = sum(holding_days) / len(holding_days)
+        if avg_days < 3 and return_per_day > 0:
+            score *= 1.1   # 3天内完成的高效交易加分 10%
+
+    # 最大回撤惩罚
+    if max_dd > 20:
+        score -= (max_dd - 20) * 0.5
+
+    return score
 
 
 def _score_bt_periods(bt_results: List[Dict[str, Any]]) -> float:
@@ -899,11 +995,17 @@ def _backtest_single_stock(
 
         win_rate = bt_result.get("winRate", 0) or 0
         total_return = bt_result.get("totalReturn", 0) or 0
+        buy_recent = _is_buy_date_recent(result.get("buy_date"))
 
-        period_ok = (win_rate >= BACKTEST_MIN_WIN_RATE and total_return > BACKTEST_MIN_RETURN)
+        period_ok = (
+            win_rate >= BACKTEST_MIN_WIN_RATE
+            and total_return > BACKTEST_MIN_RETURN
+            and buy_recent
+        )
         status_mark = "✓" if period_ok else "✗"
         bt_msg_parts.append(
             f"{label}:{status_mark} 收益{round(total_return, 2)}% 胜率{round(win_rate, 2)}%"
+            + ("" if buy_recent else " 买点超时")
         )
 
         # 写入 qd_backtest_runs（无论通过与否都写，方便后续分析）
@@ -935,6 +1037,8 @@ def _backtest_single_stock(
                     reasons.append(f"收益率{round(total_return, 2)}%≤0")
                 if win_rate < BACKTEST_MIN_WIN_RATE:
                     reasons.append(f"胜率{round(win_rate, 2)}%<{BACKTEST_MIN_WIN_RATE}%")
+                if not buy_recent:
+                    reasons.append(f"买点超过{BUY_RECENCY_DAYS}天")
                 bt_fail_reason = f"{label}: {', '.join(reasons)}"
 
     result["bt_summary"] = " | ".join(bt_msg_parts) if bt_msg_parts else "回测无结果"
@@ -1095,10 +1199,17 @@ def _backtest_single_stock_with_optimization(
 
         win_rate = bt_result.get("winRate", 0) or 0
         total_return = bt_result.get("totalReturn", 0) or 0
-        period_ok = (win_rate >= BACKTEST_MIN_WIN_RATE and total_return > BACKTEST_MIN_RETURN)
+        buy_recent = _is_buy_date_recent(result.get("buy_date"))
+
+        period_ok = (
+            win_rate >= BACKTEST_MIN_WIN_RATE
+            and total_return > BACKTEST_MIN_RETURN
+            and buy_recent
+        )
         status_mark = "✓" if period_ok else "✗"
         bt_msg_parts.append(
             f"{label}:{status_mark} 收益{round(total_return, 2)}% 胜率{round(win_rate, 2)}%"
+            + ("" if buy_recent else " 买点超时")
         )
 
         if save_to_db:

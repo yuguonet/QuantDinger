@@ -170,6 +170,27 @@ class CircuitBreaker:
 _realtime_cb = CircuitBreaker(failure_threshold=3, cooldown_seconds=120.0, name="realtime")
 
 
+# ================================================================
+# 模块级 EWMA 响应时间 — 进程存活期间持续累积，不随实例重建丢失
+# ================================================================
+
+_EWMA_ALPHA = 0.3
+_ewma_rt: Dict[str, float] = {}
+_ewma_lock = threading.Lock()
+
+
+def _update_ewma(provider_name: str, rt: float):
+    """内部: 更新 EWMA 响应时间。rt <= 0 跳过。"""
+    if rt <= 0:
+        return
+    with _ewma_lock:
+        old = _ewma_rt.get(provider_name)
+        if old is None:
+            _ewma_rt[provider_name] = rt
+        else:
+            _ewma_rt[provider_name] = _EWMA_ALPHA * rt + (1 - _EWMA_ALPHA) * old
+
+
 def get_realtime_circuit_breaker() -> CircuitBreaker:
     """获取实时行情熔断器实例"""
     return _realtime_cb
@@ -529,24 +550,6 @@ class Coordinator:
 
     def __init__(self):
         self._lock = threading.Lock()
-        # per-provider EWMA 响应时间
-        self._ewma_rt: Dict[str, float] = {}
-        self._ewma_lock = threading.Lock()
-
-    # ── EWMA 响应时间追踪 ──
-
-    _EWMA_ALPHA = 0.3
-
-    def _update_ewma(self, provider_name: str, rt: float):
-        """更新 Provider 的 EWMA 响应时间。rt<=0 不更新。"""
-        if rt <= 0:
-            return
-        with self._ewma_lock:
-            old = self._ewma_rt.get(provider_name)
-            if old is None:
-                self._ewma_rt[provider_name] = rt
-            else:
-                self._ewma_rt[provider_name] = self._EWMA_ALPHA * rt + (1 - self._EWMA_ALPHA) * old
 
     def allocate_threads(self, providers: list, global_budget: int = 32, symbol_count: int = 0) -> Dict[str, int]:
         """按 max_concurrency / EWMA 响应时间加权分配线程数。symbol_count > 0 时限制总线程数。"""
@@ -555,8 +558,8 @@ class Coordinator:
         weights = {}
         for p in providers:
             max_c = getattr(p, 'max_concurrency', 4)
-            with self._ewma_lock:
-                rt = self._ewma_rt.get(p.name, 1.0)
+            with _ewma_lock:
+                rt = _ewma_rt.get(p.name, 1.0)
             weights[p.name] = max_c / max(rt, 0.1)
         total = sum(weights.values())
         if total <= 0:
@@ -1856,7 +1859,7 @@ class Coordinator:
                         symbols=remaining,
                     )
                     elapsed = time.time() - start
-                    self._update_ewma(name, elapsed)
+                    _update_ewma(name, elapsed)
 
                     if isinstance(task_result, NotSupportedResult):
                         with stats_lock:
@@ -1930,7 +1933,7 @@ class Coordinator:
 
                 except Exception as e:
                     elapsed = time.time() - start
-                    self._update_ewma(name, elapsed)
+                    _update_ewma(name, elapsed)
                     # 超时异常用 timeout 计数，其他用 fail 计数（不双计）
                     if elapsed > _PER_TASK_TIMEOUT:
                         with timeout_state_lock:
