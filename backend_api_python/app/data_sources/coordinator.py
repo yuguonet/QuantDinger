@@ -167,7 +167,7 @@ class CircuitBreaker:
 
 
 # 全局熔断器实例
-_realtime_cb = CircuitBreaker(failure_threshold=3, cooldown_seconds=120.0, name="realtime")
+_realtime_cb = CircuitBreaker(failure_threshold=5, cooldown_seconds=120.0, name="realtime")
 
 
 def get_realtime_circuit_breaker() -> CircuitBreaker:
@@ -181,7 +181,8 @@ def get_realtime_circuit_breaker() -> CircuitBreaker:
 # 单次 fetch 的超时上限（秒）。
 # Coordinator 层的兜底超时，防止某个源的 fetch_fn 卡死导致整个队列阻塞。
 # 比 SourceConfig 里的超时更严格 — 这是硬上限。
-PER_TASK_TIMEOUT = 60.0
+# 10s 拉不回一只股票，这个源基本被墙了。
+PER_TASK_TIMEOUT = 10.0
 
 # 队列为空后等待新任务的超时（秒）。
 # worker 线程取不到任务时会阻塞等待，超时后认为所有工作已完成，退出循环。
@@ -1511,39 +1512,6 @@ class Coordinator:
     # 模式 D: 全市场批量K线 — 优先走 fetch_market_kline，逐源 fallback
     # ================================================================
 
-    # ================================================================
-    # 死源追踪器 — 内存方式，4小时有效期
-    # ================================================================
-
-    # _dead_sources: {source_name: last_dead_timestamp}
-    # 当 ≥2 个有效源时，超时的源标记为死源，不参与下一轮任务分配
-    _dead_sources: Dict[str, float] = {}
-    _dead_sources_lock = threading.Lock()
-    _DEAD_SOURCE_TTL = 4 * 3600  # 4小时
-
-    def _is_source_dead(self, source_name: str) -> bool:
-        """检查源是否被标记为死源（且未过期）"""
-        with self._dead_sources_lock:
-            ts = self._dead_sources.get(source_name)
-            if ts is None:
-                return False
-            if time.time() - ts > self._DEAD_SOURCE_TTL:
-                # 过期，自动恢复
-                del self._dead_sources[source_name]
-                return False
-            return True
-
-    def _mark_source_dead(self, source_name: str):
-        """标记源为死源"""
-        with self._dead_sources_lock:
-            self._dead_sources[source_name] = time.time()
-            logger.warning("[协助层] 标记 %s 为死源 (TTL=%dh)", source_name, self._DEAD_SOURCE_TTL // 3600)
-
-    def _mark_source_alive(self, source_name: str):
-        """标记源为活源（成功获取数据后调用）"""
-        with self._dead_sources_lock:
-            self._dead_sources.pop(source_name, None)
-
     def coordinate_market_kline(
         self,
         market: str = "",
@@ -1579,19 +1547,16 @@ class Coordinator:
             logger.warning("[协助层] market_kline market=%s tf=%s 无可用源", market, timeframe)
             return {}
 
-        # 过滤熔断 + 死源
+        # 过滤熔断
         available = []
         for p in providers:
             if not _realtime_cb.is_available(p.name):
                 logger.debug("[协助层] market_kline %s 已熔断，跳过", p.name)
                 continue
-            if self._is_source_dead(p.name):
-                logger.debug("[协助层] market_kline %s 已标记为死源，跳过", p.name)
-                continue
             available.append(p)
 
         if not available:
-            logger.warning("[协助层] market_kline market=%s tf=%s 无可用源(全部熔断/死亡)", market, timeframe)
+            logger.warning("[协助层] market_kline market=%s tf=%s 无可用源(全部熔断)", market, timeframe)
             return {}
 
         # preferred_source 排第一
@@ -1667,16 +1632,11 @@ class Coordinator:
         provider_throughput: Dict[str, float] = {}
         throughput_lock = threading.Lock()
 
-        # per-Provider 连续超时计数
-        provider_consecutive_timeout: Dict[str, int] = {}
-        timeout_state_lock = threading.Lock()
-
         global_stop = threading.Event()
 
-        _PER_TASK_TIMEOUT = 60.0
+        _PER_TASK_TIMEOUT = 10.0
 
         for p in available:
-            provider_consecutive_timeout[p.name] = 0
             with stats_lock:
                 source_stats[p.name] = {"ok": 0, "fail": 0, "groups": 0, "timeout": 0}
 
@@ -1687,6 +1647,9 @@ class Coordinator:
             核心逻辑: 记录该源已尝试过此 symbol。
             - 还有未尝试的源 → 放回池
             - 所有源都试过了 → 标记为失败，不再放回
+
+            使用场景: 源确实对该 symbol 做了请求但返回了无效数据（如坏数据、格式错误）。
+            不要用于批次级失败（超时/崩溃/空结果）— 这些无法区分"源失效"和"股票停牌"。
             """
             if not codes:
                 return
@@ -1714,6 +1677,25 @@ class Coordinator:
                 if to_retry:
                     with queue_lock:
                         shared_queue.extend(to_retry)
+
+        def _put_back_no_record(codes: List[str]):
+            """
+            将 symbols 放回共享池，不记录"该源已尝试"。
+
+            使用场景: 批次级失败（超时、异常、空结果），无法判断是源失效还是股票停牌。
+            放回后让其他源接手，不标记为该源的尝试，避免停牌股拖垮熔断器。
+
+            与 _try_put_back 的区别:
+              - _try_put_back: 记录尝试 → 所有源试过后进 failed 列表
+              - _put_back_no_record: 不记录 → symbol 会在所有源轮过后由 drain 超时收尾
+            """
+            if not codes:
+                return
+            with result_lock:
+                codes = [c for c in codes if c not in result]
+            if codes:
+                with queue_lock:
+                    shared_queue.extend(codes)
 
         # ── 第五步: 自适应取量函数 ──
 
@@ -1788,19 +1770,15 @@ class Coordinator:
               3. 调 fetch_market_kline
               4. 成功 → 合并结果 + 更新吞吐
               5. 失败/超时 → symbols 立即放回共享池（别的源接手）
-              6. 连续超时 3 次 → 标记死源，退出
-              7. 重复直到队列为空或全局停止
+              6. 重复直到队列为空或全局停止
             """
             name = provider.name
 
             while not global_stop.is_set():
-                # 连续超时 3 次 → 标记死源，退出
-                with timeout_state_lock:
-                    if provider_consecutive_timeout[name] >= 3:
-                        if len(available) >= 2:
-                            self._mark_source_dead(name)
-                        logger.warning("[协助层] market_kline %s 连续超时3次，标记死源退出", name)
-                        return
+                # 熔断检查 — 源被熔断则退出
+                if not _realtime_cb.is_available(name):
+                    logger.warning("[协助层] market_kline %s 已熔断，退出", name)
+                    return
 
                 # 自适应取量
                 chunk_size = _calc_chunk_size(provider)
@@ -1829,8 +1807,6 @@ class Coordinator:
 
                 # ── 单次请求，不重试，失败立即放回共享池 ──
                 start = time.time()
-                elapsed = 0.0
-                put_back = False   # 标记是否已放回池（防重复）
                 try:
                     task_result = provider.fetch_market_kline(
                         timeframe=timeframe, count=count,
@@ -1867,23 +1843,30 @@ class Coordinator:
                                     result[code] = bars
                                     merged += 1
 
-                        # 未返回 + 坏数据 → 放回池
+                        # 未返回 + 坏数据 → 分类处理
                         requested_set = set(remaining)
                         returned_valid = set(valid.keys()) & requested_set
                         not_returned = requested_set - set(task_result.keys())
                         invalid_in_remaining = [c for c in bad_codes if c in requested_set]
-                        leftovers = list(not_returned) + invalid_in_remaining
+
                         # 过滤已被其他源完成的
-                        if leftovers:
+                        if not_returned:
                             with result_lock:
-                                leftovers = [c for c in leftovers if c not in result]
-                        if leftovers:
-                            # 坏数据 + 未返回: 统一走 _try_put_back 记录尝试
-                            # 所有源都试过 → 标记为 failed，不再循环
-                            _try_put_back(leftovers, name)
-                            logger.debug("[协助层] market_kline %s: %d有效 %d未返回 %d坏数据，%d只放回池",
-                                         name, len(returned_valid), len(not_returned),
-                                         len(invalid_in_remaining), len(leftovers))
+                                not_returned = [c for c in not_returned if c not in result]
+                        if invalid_in_remaining:
+                            with result_lock:
+                                invalid_in_remaining = [c for c in invalid_in_remaining if c not in result]
+
+                        # 未返回的 symbol: 源没有尝试获取（可能是停牌），不记录尝试
+                        if not_returned:
+                            _put_back_no_record(not_returned)
+                            logger.debug("[协助层] market_kline %s: %d只未返回，放回池(不计尝试)",
+                                         name, len(not_returned))
+                        # 坏数据: 源确实尝试了但返回无效数据，记录尝试
+                        if invalid_in_remaining:
+                            _try_put_back(invalid_in_remaining, name)
+                            logger.debug("[协助层] market_kline %s: %d只坏数据，放回池(已计尝试)",
+                                         name, len(invalid_in_remaining))
                         # 更新吞吐
                         if elapsed > 0:
                             with throughput_lock:
@@ -1896,60 +1879,35 @@ class Coordinator:
                             source_stats[name]["ok"] += merged
                             source_stats[name]["groups"] += 1
                         _realtime_cb.record_success(name)
-                        self._mark_source_alive(name)
-                        with timeout_state_lock:
-                            provider_consecutive_timeout[name] = 0
                         logger.debug("[协助层] market_kline %s 完成: %d只 (%.1fs)",
                                      name, merged, elapsed)
                     else:
-                        # 空结果 → 放回池（记录该源已尝试）
+                        # 空结果 → 批次级失败，无法区分"源失效"还是"股票停牌"
+                        # 不调 record_failure（避免停牌股拖垮熔断器）
+                        # 不标记为已尝试（让其他源接手，而非直接进 failed 列表）
                         with stats_lock:
                             source_stats[name]["fail"] += 1
-                        _realtime_cb.record_failure(name, "empty")
-                        _try_put_back(remaining, name)
-                        put_back = True
-                        logger.debug("[协助层] market_kline %s 空结果，%d只放回池",
+                        _put_back_no_record(remaining)
+                        logger.debug("[协助层] market_kline %s 空结果，%d只放回池(不计尝试)",
                                      name, len(remaining))
 
                 except Exception as e:
                     elapsed = time.time() - start
                     self._update_ewma(name, elapsed)
-                    # 超时异常用 timeout 计数，其他用 fail 计数（不双计）
+                    # 异常（超时/崩溃）→ 熔断器记一次失败，连续 3 次自动熔断
+                    _realtime_cb.record_failure(name, str(e))
                     if elapsed > _PER_TASK_TIMEOUT:
-                        with timeout_state_lock:
-                            provider_consecutive_timeout[name] += 1
                         with stats_lock:
                             source_stats[name]["timeout"] += 1
                     else:
                         with stats_lock:
                             source_stats[name]["fail"] += 1
-                    _realtime_cb.record_failure(name, str(e))
-                    # 异常 → 放回池（记录该源已尝试）
+                    # 异常 → 放回池，不记录尝试（源可能根本没处理到这些 symbol）
                     with result_lock:
                         still_needed = [c for c in remaining if c not in result]
                     if still_needed:
-                        _try_put_back(still_needed, name)
-                    put_back = True
-                    logger.debug("[Worker] %s 异常: %s，%d只放回池", name, e, len(remaining))
-
-                # 超时检测 → 连续计数
-                if elapsed > _PER_TASK_TIMEOUT:
-                    with timeout_state_lock:
-                        provider_consecutive_timeout[name] += 1
-                    with stats_lock:
-                        source_stats[name]["timeout"] += 1
-                    # 如果上面没放回过（比如正常返回但耗时过长），现在放回
-                    if not put_back and remaining:
-                        with result_lock:
-                            still_needed = [c for c in remaining if c not in result]
-                        if still_needed:
-                            _try_put_back(still_needed, name)
-                    logger.debug("[协助层] market_kline %s 超时(%.1fs)，连续超时 %d 次",
-                                 name, elapsed, provider_consecutive_timeout[name])
-                elif not put_back:
-                    # 非超时且未失败 → 重置连续超时计数
-                    with timeout_state_lock:
-                        provider_consecutive_timeout[name] = 0
+                        _put_back_no_record(still_needed)
+                    logger.debug("[Worker] %s 异常: %s，%d只放回池(不计尝试)", name, e, len(remaining))
 
         # ── 第七步: 启动 Worker（临时池，用完即释放，零闲置）──
         total_threads = sum(thread_alloc[p.name] for p in available)
@@ -1991,8 +1949,8 @@ class Coordinator:
         stats_lines = []
         with stats_lock:
             for name, st in source_stats.items():
-                dead = self._is_source_dead(name)
-                status = "💀死" if dead else "✅活"
+                cb_ok = _realtime_cb.is_available(name)
+                status = "✅活" if cb_ok else "❌熔断"
                 with throughput_lock:
                     tp = provider_throughput.get(name, 0.0)
                 stats_lines.append(
