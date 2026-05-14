@@ -17,8 +17,9 @@ API来源 & 最新信息:
     分钟级约1000条: min1≈5日, min5≈1月, min15≈3月, min30≈6月, min60≈1年
     日/周/月线完整历史（day/week/month）
   - fetch_ticker: ✅ 单只实时行情（取日线最后一条）
-  - fetch_batch_quotes: ⚠️ 逐只并发调_fetch_baidu_quote（非真批量）
+  - fetch_batch_quotes: ❌ 已禁用（K线接口返回全量历史868KB/股，批量传输浪费巨大，推荐用腾讯/东方财富）
   - fetch_market_kline: ✅ 逐只调用fetch_kline
+  - ✨ 核心优势: 历史K线数据完整，日/周/月线全量可取
 
 单位注意（重要）:
   - fetch_kline: volume(parts[4])直接是"股"，不需要×100
@@ -231,10 +232,8 @@ class BaiduDataSource:
     """
     百度股市通数据源 — A股数据源（priority=50）。
 
-    能力:
-      - K线: 日线/周线/月线（完整历史）
-      - 行情: 单只/批量实时行情
-      - 全市场批量: 并发获取全市场K线
+    ✨ 核心能力: 历史K线（日/周/月线完整历史）
+    ❌ 已禁用: batch_quote（K线接口返回全量历史868KB/股，批量传输浪费巨大）
 
     API端点:
       /vapi/v1/getquotation（2026-05 更新，旧 /selfselect/getstockquotation 已失效）
@@ -258,8 +257,8 @@ class BaiduDataSource:
         "kline_batch_priority": 50,
         "quote": True,
         "quote_priority": 50,
-        "batch_quote": True,
-        "batch_quote_priority": 50,
+        "batch_quote": False,  # ← 已禁用: K线接口拉取全量历史(868KB/股)仅取最后一条,批量5000股=4.3GB浪费
+        "batch_quote_priority": 0,
         "hk": False,
         "markets": {"CNStock"},
     }
@@ -316,23 +315,37 @@ class BaiduDataSource:
         return _fetch_baidu_quote(code)
 
     def fetch_batch_quotes(self, codes: List[str], timeout: int = 10) -> Dict[str, Dict[str, Any]]:
-        """批量实时行情 — 并发逐只获取"""
-        result: Dict[str, Dict[str, Any]] = {}
-        lock = threading.Lock()
+        """批量实时行情 — 已禁用，详见下方说明。
 
-        def _fetch(code):
-            q = _fetch_baidu_quote(code)
-            if q:
-                with lock:
-                    result[_cn(code)] = q
+        ⚠️ 禁用原因:
+          百度API仅有K线接口(group=quotation_kline_ab)，每次返回完整历史数据(日线5917条≈868KB/股)，
+          仅取最后一条当实时行情。批量拉取5000只股票≈4.3GB无用数据传输，性价比极低。
 
-        max_workers = min(len(codes), 10)
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futs = [pool.submit(_fetch, c) for c in codes]
-            for f in futs:
-                try:
-                    f.result()
-                except Exception:
-                    pass
+        ✅ 推荐替代方案:
+          - 腾讯 qt.gtimg.cn: 单请求批量多股，5000只≈2.6MB
+          - 东方财富 push2: 单请求批量多股，5000只≈1.2MB
 
-        return result
+        💡 本Provider优势: 历史K线数据完整(日/周/月线全量)，建议仅用于 fetch_kline / fetch_market_kline。
+        """
+        # --- 原实现(保留供参考) ---
+        # result: Dict[str, Dict[str, Any]] = {}
+        # lock = threading.Lock()
+        #
+        # def _fetch(code):
+        #     q = _fetch_baidu_quote(code)
+        #     if q:
+        #         with lock:
+        #             result[_cn(code)] = q
+        #
+        # max_workers = min(len(codes), 10)
+        # with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        #     futs = [pool.submit(_fetch, c) for c in codes]
+        #     for f in futs:
+        #         try:
+        #             f.result()
+        #         except Exception:
+        #             pass
+        #
+        # return result
+        # --- 原实现结束 ---
+        return {}

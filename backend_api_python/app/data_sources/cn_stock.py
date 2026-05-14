@@ -275,10 +275,10 @@ class DBKlineBridge:
             )
             if out:
                 # ── 盘中: 检查 DB 数据是否覆盖今天 ──
-                if in_trading and not before_time:
+                # 日线及以上: _fetch_from_db 已通过 _replace_tail_from_remote 覆盖尾部，跳过
+                if in_trading and not before_time and tf not in ("1D", "1W", "1M"):
                     today_ts = _today_ts()
                     latest_bar_ts = out[-1].get("time", 0) if out else 0
-                    # 最后一根 bar 不是今天 → DB 缺今天数据，远程补拉
                     if latest_bar_ts < today_ts:
                         remote_bars = self._ds._get_kline_remote(
                             raw, tf, lim, adj=adj
@@ -348,7 +348,8 @@ class DBKlineBridge:
                 )
                 if out:
                     # 盘中: 检查 DB 数据是否覆盖今天
-                    if in_trading and not before_time:
+                    # 日线及以上: _fetch_from_db 已通过 _replace_tail_from_remote 覆盖尾部，跳过
+                    if in_trading and not before_time and tf not in ("1D", "1W", "1M"):
                         latest_bar_ts = out[-1].get("time", 0) if out else 0
                         if latest_bar_ts < today_ts:
                             # DB 缺今天数据，标记需要远程补拉
@@ -461,6 +462,45 @@ class DBKlineBridge:
                 "volume": round(ticker_vol, 2) if ticker_vol > 0 else 0,
             })
 
+    # ── 日线缺线检测 + 尾部覆盖 ──
+
+    _GAP_CHECK_TAIL = 200  # 检查最后 200 条
+
+    @staticmethod
+    def _has_daily_gaps(bars: List[Dict[str, Any]], tail: int = 200) -> bool:
+        """检测尾部日线是否有缺线。相邻 bar 间隔 > 3 天视为缺线。"""
+        check = bars[-tail:] if len(bars) > tail else bars
+        if len(check) < 2:
+            return False
+        _MAX_GAP = 86400 * 3
+        for i in range(1, len(check)):
+            if check[i]["time"] - check[i - 1]["time"] > _MAX_GAP:
+                return True
+        return False
+
+    def _replace_tail_from_remote(
+        self, raw: str, bars: List[Dict[str, Any]], limit: int, adj: str = "qfq"
+    ) -> List[Dict[str, Any]]:
+        """尾部有缺线时，远程拉取覆盖尾部，总条数不变。"""
+        tail = min(self._GAP_CHECK_TAIL, limit)
+        head = bars[:-tail] if len(bars) > tail else []
+        head_count = len(head)
+
+        logger.info(f"[日线覆盖] {raw} 尾部{tail}条有缺线，远程覆盖，保留头部{head_count}条")
+
+        remote = self._ds._get_kline_remote(raw, "1D", tail, adj=adj)
+        if not remote:
+            logger.warning(f"[日线覆盖] {raw} 远程拉取失败，沿用DB数据")
+            return bars
+
+        merged = {b["time"]: b for b in head}
+        for rb in remote:
+            merged[rb["time"]] = rb
+        result = sorted(merged.values(), key=lambda b: b["time"])
+        result = result[-limit:] if len(result) > limit else result
+        logger.info(f"[日线覆盖] {raw} 覆盖完成 head={head_count} remote={len(remote)} 合计={len(result)}")
+        return result
+
     # ────────────────────────────────────────────────────────────
     # DB 读取 + 周期聚合
     # ────────────────────────────────────────────────────────────
@@ -507,9 +547,14 @@ class DBKlineBridge:
         if tf == "15m":
             return bars
         elif tf == "1D":
-            return self._aggregate_15m_to_daily(bars, limit)
+            daily = self._aggregate_15m_to_daily(bars, limit)
+            if self._has_daily_gaps(daily):
+                daily = self._replace_tail_from_remote(raw, daily, limit)
+            return daily
         elif tf in ("1W", "1M"):
             daily = self._aggregate_15m_to_daily(bars, limit * 8)
+            if self._has_daily_gaps(daily):
+                daily = self._replace_tail_from_remote(raw, daily, limit * 8)
             if tf == "1W":
                 return self._aggregate_daily_to_weekly(daily, limit)
             else:

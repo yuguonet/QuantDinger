@@ -1093,7 +1093,9 @@ def _scheduler_15m_loop():
         except Exception as e:
             logger.error(f"[15m调度] 异常: {e}")
             time.sleep(10)
-
+        except BaseException as e:          # ← 加这个
+            logger.critical(f"[15m调度] 致命异常，线程退出: {type(e).__name__}: {e}")
+            raise
 
 def start_scheduler():
     """启动 15m 自驱动调度器（幂等，重复调用安全）。"""
