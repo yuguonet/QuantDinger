@@ -221,21 +221,13 @@ SOURCE_CONFIGS: Dict[str, SourceConfig] = {
     # batch_size=6000（东财 API 单次支持大量数据）
     "eastmoney": SourceConfig(
         name="eastmoney",
-        max_workers=6,  # = provider/eastmoney.py MAX_CONCURRENCY
+        max_workers=4,  # = provider/eastmoney.py MAX_CONCURRENCY
         markets={"CNStock"},
         batch_capable=True,
         batch_size=6000,
     ),
 
-    # AKShare — Python 数据接口，支持 A股 + 港股
-    # 较低并发（AKShare 底层调用多个源，自身有限流）
-    "akshare": SourceConfig(
-        name="akshare",
-        max_workers=2,  # AKShare 无对应 Provider 常量，保持原值
-        markets={"CNStock", "HKStock"},
-        batch_capable=True,
-        batch_size=5000,
-    ),
+
 
     # 同花顺(10jqka) — HTTP 接口，分钟分时+日/周K线
     # 仅支持 A 股
@@ -247,22 +239,15 @@ SOURCE_CONFIGS: Dict[str, SourceConfig] = {
         batch_size=500,
     ),
 
-    # BaoStock — TCP 协议直连，无需 API Key
-    # TCP 连接数有限，无对应 Provider 常量
-    "baostock": SourceConfig(
-        name="baostock",
-        max_workers=2,  # BaoStock 无对应 Provider 常量，保持原值
-        markets={"CNStock"},
-        batch_capable=False,
-        batch_size=1,
-    ),
 
-    # 港股专用源 — 仅支持港股，不支持批量
-    # batch_size=1（逐个请求），无对应 Provider 常量
-    "hk_stock": SourceConfig(
-        name="hk_stock",
-        max_workers=3,  # hk_stock 无对应 Provider 常量，保持原值
-        markets={"HKStock"},
+
+
+
+    # TwelveData — 国际数据源，支持 A股 + 港股
+    "twelvedata": SourceConfig(
+        name="twelvedata",
+        max_workers=2,  # = provider/twelve_data.py MAX_CONCURRENCY
+        markets={"CNStock", "HKStock"},
         batch_capable=False,
         batch_size=1,
     ),
@@ -273,7 +258,7 @@ SOURCE_CONFIGS: Dict[str, SourceConfig] = {
     # 通过 push2.eastmoney.com trends2 API，1min聚合为15min
     "em_trends2": SourceConfig(
         name="em_trends2",
-        max_workers=15,  # = provider/em_trends2.py MAX_CONCURRENCY
+        max_workers=6,  # = provider/em_trends2.py MAX_CONCURRENCY
         markets={"CNStock"},
         batch_capable=True,
         batch_size=50,

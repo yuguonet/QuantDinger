@@ -26,6 +26,7 @@ backfill_db.py — A 股 K 线增量同步 + 后台调度
   3. 1D 每个交易日 17:00 后同步一次，<90% 则重试（最多 5 次，两次比对去重）
   4. 非交易日不执行
   5. 后台 daemon 线程自动运行，fire-and-forget
+  6. 所有数据源走内联 provider，不依赖外部 API
 """
 
 import logging
@@ -382,6 +383,8 @@ def _should_run_1d(pool_name: str = "CNStock") -> tuple[bool, str]:
     status = doc.get("status", "")
     if status == "error":
         return True, f"上次 1D 失败: {doc.get('report', '')}，重试"
+    if status == "ok":
+        return False, "本交易日 1D 已完成 (status=ok)"
 
     last_updated = doc.get("last_updated")
     if last_updated:
@@ -391,20 +394,23 @@ def _should_run_1d(pool_name: str = "CNStock") -> tuple[bool, str]:
         if not _same_trading_day(last_cn, now):
             return True, f"上次 1D {last_cn:%Y-%m-%d}，跨交易日"
 
-        # 同一交易日内: 检查增量进度
-        if status == "partial":
-            synced = doc.get("synced_count", 0) or 0
-            return True, f"本交易日 1D 部分完成 ({synced} 只)，继续补拉"
+        # 同一交易日内: 检查增量进度（partial 和 ok 统一处理）
+        synced = doc.get("synced_count", 0) or 0
+        failed = doc.get("failed_count", 0) or 0
+        from app.utils.basicinfo_db import get_stock_basic_db
+        total = len(get_stock_basic_db().market_all_codes(status="active"))
 
-        if status == "ok":
-            synced = doc.get("synced_count", 0) or 0
-            from app.utils.basicinfo_db import get_stock_basic_db
-            total = len(get_stock_basic_db().market_all_codes(status="active"))
-            if synced < total:
-                return True, f"本交易日 1D 已同步 {synced}/{total}，继续补拉"
-            return False, "本交易日 1D 已全部同步"
+        if synced >= total:
+            return False, f"本交易日 1D 已全部同步 ({synced}/{total})"
 
-        return False, "本交易日 1D 已同步"
+        # synced + failed >= total 说明所有标的都已尝试过（成功或失败）
+        if synced + failed >= total:
+            if failed > 0:
+                return True, f"本交易日 1D 首轮完成，同步 {synced}，失败 {failed}，进入修复"
+            return False, f"本交易日 1D 已全部同步 ({synced}/{total})"
+
+        # 还有剩余标的未尝试 → 允许继续补拉
+        return True, f"本交易日 1D 已同步 {synced}/{total}，失败 {failed}，继续补拉"
 
     return True, "本交易日 1D 待同步"
 
@@ -417,11 +423,10 @@ class BackfillSource:
     """数据源配置。"""
 
     def __init__(self, name: str, market: str, timeframe: str,
-                 dinger_url: str = "", db_pool: str = "CNStock"):
+                 db_pool: str = "CNStock"):
         self.name = name
         self.market = market
         self.timeframe = timeframe
-        self.dinger_url = dinger_url
         self.db_pool = db_pool
 
 
@@ -452,7 +457,10 @@ class BackfillDB:
         elif tf == "1D":
             should, reason = _should_run_1d(pool_name=pool)
         else:
-            should, reason = _should_run_generic(tf, pool_name=pool)
+            return {
+                "source": self.source.name, "tf": tf,
+                "written": 0, "status": "ok", "report": f"不支持的周期: {tf}",
+            }
 
         if not should:
             return {
@@ -464,9 +472,7 @@ class BackfillDB:
         latest_bar = _latest_finished_bar_time()
 
         try:
-            if self.source.dinger_url:
-                written, failed = self._sync_via_api(tf)
-            elif tf == "15m":
+            if tf == "15m":
                 written, failed = self._sync_15m(symbols)
             elif tf == "1D":
                 # 判断是否当天首次运行
@@ -754,6 +760,8 @@ class BackfillDB:
                 logger.warning(
                     f"[同步] {self.source.name} 1D 第 {round_num} 轮返回空数据，停止"
                 )
+                for symbol in remaining:
+                    failed_reasons.setdefault(symbol, "provider 返回空数据")
                 break
 
             # 转换本轮结果
@@ -819,36 +827,121 @@ class BackfillDB:
             if len(synced_now) >= total_symbols:
                 break
 
-        # 最终统计 + 落盘 cn_last_update
+        # ── 阶段一统计 ──
         final_synced = self._get_synced_symbols(bar_time)
         final_count = len(final_synced)
         failed = [s for s in symbols if strip_market_prefix(s) not in final_synced]
 
-        # 构建失败报告: 原因分组统计 + 明细（最多 50 条）
+        # ── 阶段二: 失败修复 ──
+        # synced + failed >= total 且 failed > 0 → 重拉失败标的
+        if final_count < total_symbols and final_count + len(failed) >= total_symbols and len(failed) > 0:
+            repair_round = 0
+
+            while len(failed) > 0:
+                repair_round += 1
+
+                logger.info(
+                    f"[同步] {self.source.name} 1D 修复第 {repair_round} 轮，"
+                    f"重拉 {len(failed)} 只失败标的"
+                )
+
+                quotes = coord.coordinate_batch_quotes(
+                    symbols=failed,
+                    market=self.source.market,
+                    timeout=float(_BATCH_TIMEOUT_1D),
+                )
+
+                if not quotes:
+                    logger.info(f"[同步] {self.source.name} 1D 修复第 {repair_round} 轮返回空，停止")
+                    break
+
+                repair_records: list[dict] = []
+                for symbol in failed:
+                    quote = quotes.get(symbol)
+                    if not quote:
+                        quote = quotes.get(strip_market_prefix(symbol))
+                    if not quote:
+                        continue
+
+                    o = float(quote.get("open", 0) or 0)
+                    h = float(quote.get("high", 0) or 0)
+                    l = float(quote.get("low", 0) or 0)
+                    c = float(quote.get("last", 0) or quote.get("close", 0) or 0)
+                    v = float(quote.get("volume", 0) or 0)
+
+                    if o == 0 and h == 0 and l == 0 and c == 0:
+                        continue
+                    if c <= 0 or o <= 0:
+                        continue
+                    if h > 0 and l > 0 and h < l:
+                        h, l = l, h
+
+                    repair_records.append({
+                        "symbol": strip_market_prefix(symbol),
+                        "timeframe": "1D",
+                        "time": bar_time,
+                        "open": o,
+                        "high": h,
+                        "low": l,
+                        "close": c,
+                        "volume": v,
+                    })
+
+                # 拉不到有效数据 → 修不好了，不修了
+                if not repair_records:
+                    logger.info(f"[同步] {self.source.name} 1D 修复第 {repair_round} 轮 0 有效，停止")
+                    break
+
+                try:
+                    r = self._writer.bulk_write(self.source.market, repair_records)
+                    rw = r.get("inserted", 0) + r.get("skipped", 0)
+                    total_written += rw
+                except Exception as e:
+                    logger.error(f"[同步] {self.source.name} 1D 修复第 {repair_round} 轮写入失败: {e}")
+                    break
+
+                # 重新统计
+                final_synced = self._get_synced_symbols(bar_time)
+                final_count = len(final_synced)
+                failed = [s for s in symbols if strip_market_prefix(s) not in final_synced]
+
+                logger.info(
+                    f"[同步] {self.source.name} 1D 修复第 {repair_round} 轮 "
+                    f"写入 {rw}，累计 {final_count}/{total_symbols}，剩余失败 {len(failed)}"
+                )
+
+                # 写一轮落一次盘，重启可续
+                _record_update(
+                    self.source.name, "1D", "partial",
+                    f"修复中: {final_count}/{total_symbols}, 失败 {len(failed)}",
+                    last_bar_time=bar_time, synced_count=final_count,
+                    failed_count=len(failed), pool_name=pool,
+                )
+
+        # ── 最终落盘 cn_last_update ──
         report_parts = [f"已同步 {final_count}/{total_symbols}"]
         if failed:
-            # 按原因分组统计
             reason_counts: dict[str, int] = {}
             for sym in failed:
                 reason = failed_reasons.get(sym, "未返回行情")
                 reason_counts[reason] = reason_counts.get(reason, 0) + 1
             reason_summary = ", ".join(f"{r}({c})" for r, c in sorted(reason_counts.items(), key=lambda x: -x[1]))
             report_parts.append(f"失败原因: {reason_summary}")
-            # 明细: 最多 50 个 symbol
             sample = failed[:50]
             report_parts.append(f"失败标的({len(failed)}): {','.join(sample)}")
 
         report = "; ".join(report_parts)
 
-        if final_count >= total_symbols:
+        if final_count >= total_symbols or len(failed) == 0:
             _record_update(
                 self.source.name, "1D", "ok", report,
                 last_bar_time=bar_time, synced_count=final_count,
-                failed_count=len(failed), pool_name=pool,
+                failed_count=0, pool_name=pool,
             )
         else:
+            # 修复后仍有失败 → 设 ok，失败明细保留在 report
             _record_update(
-                self.source.name, "1D", "partial", report,
+                self.source.name, "1D", "ok", report,
                 last_bar_time=bar_time, synced_count=final_count,
                 failed_count=len(failed), pool_name=pool,
             )
@@ -859,7 +952,6 @@ class BackfillDB:
                 f"共 {round_num} 轮，写入 {total_written}，"
                 f"同步 {final_count}/{total_symbols}，失败 {len(failed)}"
             )
-            # 打印前 20 个失败 symbol 及原因，便于快速排查
             for sym in failed[:20]:
                 reason = failed_reasons.get(sym, "未返回行情")
                 logger.warning(f"  ✗ {sym}: {reason}")
@@ -879,10 +971,10 @@ class BackfillDB:
         return f'"kline_1D_{bar_time.year}"'
 
     def _delete_1d_bars(self, bar_time: datetime) -> int:
-        """删除指定 bar_time 的 1D 数据，返回删除条数。"""
+        """删除指定日期的 1D 数据，返回删除条数。按日期匹配，不依赖具体时间点。"""
         table = self._kline_table(bar_time)
-        # strip tzinfo: PG timestamp 列存储为 naive，aware datetime 匹配不到
-        naive_bar_time = bar_time.replace(tzinfo=None) if bar_time.tzinfo else bar_time
+        # 按日期匹配: 用 DATE() 比较，避免因时间部分不同导致漏删
+        target_date = bar_time.strftime("%Y-%m-%d")
         try:
             mgr = get_market_db_manager()
             pool = mgr._get_pool(self.source.db_pool)
@@ -890,8 +982,8 @@ class BackfillDB:
                 with conn.cursor() as cur:
                     cur.execute(f"""
                         DELETE FROM {table}
-                        WHERE time = %s
-                    """, (naive_bar_time,))
+                        WHERE time::date = %s::date
+                    """, (target_date,))
                     deleted = cur.rowcount
                     conn.commit()
                     return deleted
@@ -918,117 +1010,15 @@ class BackfillDB:
             logger.warning(f"[同步] {self.source.name} 1D 查询已同步 symbols 失败: {e}")
             return set()
 
-    # ── Dinger API (基金/债) ────────────────────────────────
-
-    def _sync_via_api(self, tf: str) -> tuple[int, list[str]]:
-        """基金/债: 通过 Dinger API 拉取并写入。返回 (写入条数, 失败symbols列表)。"""
-        import requests
-
-        url = self.source.dinger_url.format(tf=tf, count=300)
-        logger.info(f"[同步] {self.source.name} tf={tf} 请求 {url}")
-
-        try:
-            resp = requests.get(url, timeout=60)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            logger.error(f"[同步] {self.source.name} HTTP 请求失败: {e}")
-            raise
-
-        items = data.get("data", [])
-        if not items or not isinstance(items, list):
-            return 0, []
-
-        ts_field = "navDate" if "fund" in self.source.name else "date"
-        by_symbol: dict[str, list] = {}
-        for item in items:
-            sym = item.get("symbol", "")
-            if not sym:
-                continue
-            by_symbol.setdefault(sym, []).append(item)
-
-        all_records = []
-        for symbol, records in by_symbol.items():
-            for rec in records:
-                ts_str = rec.get(ts_field)
-                if not ts_str:
-                    continue
-                try:
-                    ts = (
-                        datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                        if isinstance(ts_str, str) else ts_str
-                    )
-                except ValueError:
-                    continue
-                all_records.append({
-                    "symbol": symbol,
-                    "timeframe": tf,
-                    "time": ts,
-                    "open": float(rec.get("open", 0)),
-                    "high": float(rec.get("high", 0)),
-                    "low": float(rec.get("low", 0)),
-                    "close": float(rec.get("close", 0)),
-                    "volume": float(rec.get("volume", 0)),
-                })
-
-        if not all_records:
-            return 0, []
-
-        all_records = [
-            r for r in all_records
-            if r["open"] != 0 or r["high"] != 0 or r["low"] != 0 or r["close"] != 0
-        ]
-        if not all_records:
-            return 0, []
-
-        try:
-            r = self._writer.bulk_write(self.source.market, all_records)
-            total = r.get("inserted", 0) + r.get("skipped", 0)
-            logger.info(f"[同步] {self.source.name} tf={tf} 批量写入 {total} 条")
-            return total, []
-        except Exception as e:
-            logger.error(f"[同步] {self.source.name} 批量写入失败: {e}")
-            return 0, []
 
 
 # ================================================================
 # 预定义数据源实例
 # ================================================================
 
-DINGER_BASE_URL = "https://api.quantdinger.com/v1"
-
 stock_daily_k = BackfillDB(BackfillSource(
     name="stock_daily_k", market="CNStock", timeframe="15m",
 ))
-
-fund_nav_daily = BackfillDB(BackfillSource(
-    name="fund_nav_daily", market="CNStock", timeframe="1D",
-    dinger_url=f"{DINGER_BASE_URL}/fund/nav_daily?tf={{tf}}&count={{count}}",
-))
-
-bond_daily_k = BackfillDB(BackfillSource(
-    name="bond_daily_k", market="CNStock", timeframe="1D",
-    dinger_url=f"{DINGER_BASE_URL}/bond/daily_k?tf={{tf}}&count={{count}}",
-))
-
-
-# ================================================================
-# 通用调度 fallback
-# ================================================================
-
-def _should_run_generic(tf: str, pool_name: str = "CNStock") -> tuple[bool, str]:
-    """非 15m/1D 的通用调度逻辑（基金/债等）。"""
-    doc = _get_last_update("fund_nav_daily" if tf == "1D" else "unknown", tf,
-                           pool_name=pool_name)
-    if not doc:
-        return True, "首次同步"
-    status = doc.get("status", "")
-    if status in ("error", "partial"):
-        return True, "上次失败，重试"
-    last = doc.get("last_updated")
-    if last and not _same_trading_day(last, datetime.now(TZ_CN)):
-        return True, "跨交易日"
-    return False, "同交易日已同步"
 
 
 # ================================================================
@@ -1109,8 +1099,9 @@ def start_scheduler():
     logger.info("[15m调度] 守护线程已启动")
 
 
-# 模块加载时自动启动（幂等，重复 import 安全）
-start_scheduler()
+# 注意：不再在模块加载时自动启动调度器
+# 由 app 启动流程在初始化完成后显式调用 start_scheduler()
+# start_scheduler()  ← 已移至 app 启动入口
 
 
 # ================================================================
@@ -1139,7 +1130,7 @@ def _sync_worker():
 
 
 def _run_all_sync():
-    """1D + 基金/债同步（15m 由独立调度器处理）。"""
+    """1D 同步（15m 由独立调度器处理）。"""
     now = datetime.now(TZ_CN)
     today_str = now.strftime("%Y-%m-%d")
 
@@ -1147,7 +1138,6 @@ def _run_all_sync():
         logger.info("[后台同步] 非交易日，跳过")
         return
 
-    # ── 1D 同步 ──
     if not ENABLE_1D:
         logger.info("[后台同步] 1D 已关闭，跳过")
     else:
@@ -1158,43 +1148,32 @@ def _run_all_sync():
         except Exception as e:
             logger.error(f"[后台同步] 1D stock 异常: {e}")
 
-    # fund + bond — 17:00 后
-    if now.time() >= dt_time(17, 0):
-        for src in (fund_nav_daily, bond_daily_k):
-            try:
-                result = src.run_once("1D")
-                if result.get("written", 0) > 0:
-                    logger.info(f"[后台同步] 1D {src.source.name}: {result.get('written')} 条")
-            except Exception as e:
-                logger.error(f"[后台同步] 1D {src.source.name} 异常: {e}")
-
 
 # ================================================================
 # 全盘同步入口（保留兼容性）
 # ================================================================
 
 def run_once(tf: str | None = None, symbols: list | None = None) -> list[dict]:
-    """全盘同步入口 — 三个数据源依次执行。"""
+    """全盘同步入口 — 依次执行。"""
     if tf == "15m" and not ENABLE_15M:
         logger.info("[全盘同步] 15m 已关闭 (ENABLE_15M=False)，跳过")
-        return [{"source": s.source.name, "tf": "15m", "written": 0,
-                 "status": "ok", "report": "15m 已关闭"} for s in (stock_daily_k,)]
+        return [{"source": stock_daily_k.source.name, "tf": "15m", "written": 0,
+                 "status": "ok", "report": "15m 已关闭"}]
     if tf == "1D" and not ENABLE_1D:
         logger.info("[全盘同步] 1D 已关闭 (ENABLE_1D=False)，跳过")
-        return [{"source": s.source.name, "tf": "1D", "written": 0,
-                 "status": "ok", "report": "1D 已关闭"} for s in (stock_daily_k, fund_nav_daily, bond_daily_k)]
+        return [{"source": stock_daily_k.source.name, "tf": "1D", "written": 0,
+                 "status": "ok", "report": "1D 已关闭"}]
 
     results = []
-    for source in (stock_daily_k, fund_nav_daily, bond_daily_k):
-        try:
-            r = source.run_once(tf, symbols=symbols)
-            results.append(r)
-        except Exception as e:
-            logger.error(f"[全盘同步] {source.source.name} 异常: {e}")
-            results.append({
-                "source": source.source.name, "tf": tf or "?",
-                "written": 0, "status": "error", "report": str(e),
-            })
+    try:
+        r = stock_daily_k.run_once(tf, symbols=symbols)
+        results.append(r)
+    except Exception as e:
+        logger.error(f"[全盘同步] {stock_daily_k.source.name} 异常: {e}")
+        results.append({
+            "source": stock_daily_k.source.name, "tf": tf or "?",
+            "written": 0, "status": "error", "report": str(e),
+        })
 
     ok = sum(1 for r in results if r["status"] == "ok")
     errors = sum(1 for r in results if r["status"] == "error")
