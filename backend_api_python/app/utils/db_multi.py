@@ -375,6 +375,8 @@ class MarketDBManager:
 
         if self.market_db_exists(market):
             logger.info(f"市场数据库已存在: {db_name}")
+            # DB 已存在，仍需确保当前年份的表存在（CREATE TABLE IF NOT EXISTS 幂等）
+            self._init_market_schema(resolved)
             return True
 
         conn = self._admin_conn()
@@ -474,8 +476,8 @@ class MarketDBManager:
         pool = self._get_pool(market)
 
         with pool.cursor() as cur:
-            # 15m 分区表：2 年（通达信 15m 数据只有 2 年）
-            for year in [current_year - 1, current_year]:
+            # 15m 分区表：5 年（source_sync 从 2024-01-01 起）
+            for year in range(current_year - 4, current_year + 1):
                 self._ensure_kline_table(cur, "15m", year)
 
             # 1D 分区表：5 年（日线数据需要 5 年）

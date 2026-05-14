@@ -220,6 +220,15 @@ def _bars_to_records(bars: List[Dict[str, Any]], timeframe: str) -> List[Dict[st
         l = _safe_float(bar.get("low"))
         c = _safe_float(bar.get("close"))
         v = _safe_float(bar.get("volume"))
+        # ── 自动修正 OHLC 越界（方案 A）──
+        # 数据源偶尔返回 open/close 超出 high/low 范围，
+        # 以 open/close 为准扩展 high/low（实际成交价一定在 high-low 范围内）
+        prices = [p for p in (o, h, l, c) if p > 0]
+        if prices:
+            if h > 0:
+                h = max(h, *prices)
+            if l > 0:
+                l = min(l, *prices)
         # 去重: 同时间戳选质量更好的记录
         if dt in seen:
             prev = seen[dt]
@@ -409,9 +418,9 @@ def validate_stock(
                 result.add_error(f"high<low: {d} H={h} L={l}")
                 continue
             if o > 0 and h > 0 and (o > h or o < l):
-                result.add_error(f"open 越界: {d} O={o} H={h} L={l}")
+                result.add_warning(f"open 越界(已写入): {d} O={o} H={h} L={l}")
             if c > 0 and h > 0 and (c > h or c < l):
-                result.add_error(f"close 越界: {d} C={c} H={h} L={l}")
+                result.add_warning(f"close 越界(已写入): {d} C={c} H={h} L={l}")
 
     # ── 3. 尾部检查 ──
     if actual_end < end_date and _is_trading_day(end_date):
@@ -539,6 +548,118 @@ def write_stock_data(
     except Exception as e:
         logger.error("写库事务失败 %s/%s: %s", code, timeframe, e)
         return 0
+
+
+def write_batch_data(
+    pool,
+    market: str,
+    timeframe: str,
+    stock_records: Dict[str, List[Dict[str, Any]]],
+    start_date: str,
+    end_date: str,
+    dry_run: bool = False,
+) -> Dict[str, int]:
+    """
+    批量写入: 整批股票一个事务，批量 DELETE + 批量 INSERT。
+    stock_records: {code: [records, ...]}
+    返回: {code: inserted_count}
+    """
+    if dry_run or not stock_records:
+        return {}
+
+    start_year = int(start_date[:4])
+    end_year = int(end_date[:4])
+    years = list(range(start_year, end_year + 1))
+    _VALID_TABLES = {f"kline_{tf}_{y}" for tf in ("1D", "15m") for y in range(2000, 2035)}
+
+    # ── 预构建全部 db_records，按 (year, code) 分组 ──
+    # records_by_year_table[year] = [db_record, ...]
+    records_by_year: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    code_row_counts: Dict[str, int] = {}
+
+    for code, records in stock_records.items():
+        count = 0
+        for rec in records:
+            ts = rec.get("time")
+            if isinstance(ts, datetime):
+                dt = ts
+            elif isinstance(ts, (int, float)):
+                dt = datetime.fromtimestamp(ts, tz=TZ_SH)
+            else:
+                continue
+            if dt.tzinfo:
+                dt = dt.replace(tzinfo=None)
+            records_by_year[dt.year].append({
+                "symbol": code,
+                "timeframe": timeframe,
+                "time": dt,
+                "open": _safe_float(rec.get("open")),
+                "high": _safe_float(rec.get("high")),
+                "low": _safe_float(rec.get("low")),
+                "close": _safe_float(rec.get("close")),
+                "volume": _safe_float(rec.get("volume")),
+            })
+            count += 1
+        code_row_counts[code] = count
+
+    all_codes = list(stock_records.keys())
+
+    try:
+        with pool.connection() as conn:
+            cur = conn.cursor()
+
+            # ── 批量 DELETE: 用 IN (...) 一次删一批 ──
+            for year in years:
+                table = f"kline_{timeframe}_{year}"
+                if table not in _VALID_TABLES:
+                    continue
+                try:
+                    # 分批 DELETE，每批 500 个 symbol（避免 SQL 过长）
+                    for i in range(0, len(all_codes), 500):
+                        chunk = all_codes[i:i + 500]
+                        placeholders = ",".join(["%s"] * len(chunk))
+                        cur.execute(f"""
+                            DELETE FROM "{table}"
+                            WHERE symbol IN ({placeholders})
+                              AND time >= %s AND time <= %s
+                        """, (*chunk, f"{start_date} 00:00:00", f"{end_date} 23:59:59"))
+                except Exception as del_err:
+                    if "does not exist" not in str(del_err).lower() and "undefinedtable" not in str(del_err).lower():
+                        logger.error("批量删除失败 %s: %s", table, del_err)
+
+            # ── 批量 INSERT ──
+            inserted_by_code: Dict[str, int] = defaultdict(int)
+            for year in years:
+                table = f"kline_{timeframe}_{year}"
+                if table not in _VALID_TABLES:
+                    continue
+                year_rows = records_by_year.get(year, [])
+                if not year_rows:
+                    continue
+                # 按 symbol 分组统计 inserted
+                for i in range(0, len(year_rows), 5000):
+                    batch = year_rows[i:i + 5000]
+                    try:
+                        cur.executemany(
+                            f'INSERT INTO "{table}" '
+                            f'(symbol, time, open, high, low, close, volume) '
+                            f'VALUES (%(symbol)s, %(time)s, '
+                            f'%(open)s, %(high)s, %(low)s, %(close)s, %(volume)s)',
+                            batch,
+                        )
+                    except Exception as ins_err:
+                        if "does not exist" not in str(ins_err).lower() and "undefinedtable" not in str(ins_err).lower():
+                            logger.error("批量写入失败 %s: %s", table, ins_err)
+
+            conn.commit()
+            cur.close()
+
+            # 返回每只股票的写入行数
+            return {code: code_row_counts.get(code, 0) for code in all_codes}
+
+    except Exception as e:
+        logger.error("批量写库事务失败: %s", e)
+        return {}
 
 
 # ═══════════════════════════════════════════════════════
@@ -760,6 +881,7 @@ def process_batch(
             _prefix_map[rk] = rk
 
     # ── 第一轮: 逐只校验 ──
+    code_records: Dict[str, Tuple[List[Dict[str, Any]], ValidationResult]] = {}
     for code in symbols:
         if _INTERRUPTED:
             break
@@ -818,13 +940,27 @@ def process_batch(
                            "errors": err_summary})
         else:
             stats["passed"] += 1
-            n = write_stock_data(writer, pool, market, code, timeframe,
-                                records, start_date, end_date, dry_run)
+            code_records[code] = (records, vr)
+
+    # ── 批量写库: 一个事务搞定整批 ──
+    if code_records and not dry_run:
+        stock_data = {c: recs for c, (recs, _vr) in code_records.items()}
+        written_map = write_batch_data(pool, market, timeframe,
+                                       stock_data, start_date, end_date, dry_run)
+        for code, (records, vr) in code_records.items():
+            n = written_map.get(code, 0)
             stats["written"] += n
             to_remove.append(code)
             warn_summary = "; ".join(vr.warnings[:3]) if vr.warnings else ""
             results.append({"code": code, "board": _detect_board(code),
                            "bars": len(records), "written": n, "status": "ok",
+                           "errors": warn_summary})
+    elif code_records and dry_run:
+        for code, (records, vr) in code_records.items():
+            to_remove.append(code)
+            warn_summary = "; ".join(vr.warnings[:3]) if vr.warnings else ""
+            results.append({"code": code, "board": _detect_board(code),
+                           "bars": len(records), "written": 0, "status": "ok",
                            "errors": warn_summary})
 
     # 批量更新重传文件（一次 IO）

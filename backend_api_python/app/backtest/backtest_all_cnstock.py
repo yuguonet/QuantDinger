@@ -1439,7 +1439,7 @@ def _save_results_csv(
         comment_lines.append(f"# 线程数: {params['max_workers']}")
     comment_lines.append(f"# 过滤规则: 胜率<0丢弃, 无买点丢弃")
     comment_lines.append(f"# 排序: 胜率↓ → 夏普比率↓")
-    comment_lines.append(f"# 自选阈值: 胜率>{AUTO_WATCHLIST_WIN_RATE}% 且 收益>{AUTO_WATCHLIST_RETURN}% 且 2日内买点")
+    comment_lines.append(f"# 自选阈值: 胜率>{AUTO_WATCHLIST_WIN_RATE}% 且 收益>{AUTO_WATCHLIST_RETURN}%")
     comment_lines.append(f"# 有效结果: {len(sorted_results)} 条")
     comment_lines.append(f"#")
 
@@ -1459,62 +1459,32 @@ def _save_results_csv(
     return csv_path
 
 
-def _strip_symbol_suffix(symbol: str) -> str:
-    """去掉 .SH / .SZ / .BJ / .SS 后缀"""
-    s = symbol.strip().upper()
-    for suffix in (".SZ", ".SH", ".BJ", ".SS"):
-        if s.endswith(suffix):
-            return s[:-len(suffix)]
-    return s
-
-
 def _auto_watchlist_check(
     valid_results: List[Dict[str, Any]],
     user_id: int,
 ) -> List[Dict[str, Any]]:
     """
-    检查有效结果，满足以下条件才加入自选股：
-      1. 胜率 > 90%
-      2. 收益 > 20%
-      3. 2 日内出现买进信号（buy_date 在近 2 天内）
+    检查有效结果，将胜率>90%且盈利>20%的股票加入自选股。
 
     Returns:
         被加入自选股的记录列表（用于 SSE 通知）
     """
-    now = datetime.now()
-    cutoff = now - timedelta(days=2)
-
     added = []
     for row in valid_results:
         wr = row.get("win_rate", 0)
         ret = row.get("total_return", 0)
-        if wr <= AUTO_WATCHLIST_WIN_RATE or ret <= AUTO_WATCHLIST_RETURN:
-            continue
-
-        # 检查买点时效性：buy_date 必须在 2 天内
-        buy_date_str = row.get("buy_date") or ""
-        if not buy_date_str:
-            continue
-        try:
-            buy_dt = datetime.strptime(buy_date_str[:10], "%Y-%m-%d")
-            if buy_dt < cutoff:
-                continue
-        except (ValueError, TypeError):
-            continue
-
-        symbol = row.get("symbol", "")
-        name = row.get("name", "")
-        clean_symbol = _strip_symbol_suffix(symbol)
-
-        try:
-            _add_to_watchlist(user_id, "CNStock", clean_symbol, name)
-            added.append(row)
-            logger.info(
-                f"[auto_watchlist] ✅ {clean_symbol} {name} "
-                f"胜率={wr}% 收益={ret}% 买点={buy_date_str} → 加入自选"
-            )
-        except Exception as e:
-            logger.warning(f"[auto_watchlist] {clean_symbol} 加入自选失败: {e}")
+        if wr > AUTO_WATCHLIST_WIN_RATE and ret > AUTO_WATCHLIST_RETURN:
+            symbol = row.get("symbol", "")
+            name = row.get("name", "")
+            try:
+                _add_to_watchlist(user_id, "CNStock", symbol, name)
+                added.append(row)
+                logger.info(
+                    f"[auto_watchlist] ✅ {symbol} {name} "
+                    f"胜率={wr}% 收益={ret}% → 加入自选"
+                )
+            except Exception as e:
+                logger.warning(f"[auto_watchlist] {symbol} 加入自选失败: {e}")
 
     return added
 
@@ -1868,7 +1838,7 @@ def backtest_all(
                     "type": "watchlist_summary",
                     "count": len(auto_added),
                     "msg": f"⭐ 共 {len(auto_added)} 只股票自动加入自选股 "
-                           f"(胜率>{AUTO_WATCHLIST_WIN_RATE}% 且 收益>{AUTO_WATCHLIST_RETURN}% 且 2日内买点)",
+                           f"(胜率>{AUTO_WATCHLIST_WIN_RATE}% 且 收益>{AUTO_WATCHLIST_RETURN}%)",
                 })
 
             # ── 参数优化结果持久化 ──

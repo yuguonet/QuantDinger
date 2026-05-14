@@ -1,15 +1,20 @@
 """
 Indicator Parameters Parser and Helper Functions
 
-支持两个核心功能：
+支持三个核心功能：
 1. 指标参数外部传递 - 解析指标代码中的 @param 声明
 2. 指标调用其他指标 - 提供 call_indicator() 函数
+3. 参数优化搜索 - 从 @param 声明中提取搜索范围，生成参数组合
 
-参数声明格式：
-# @param param_name type default_value 描述
-# @param ma_fast int 5 短期均线周期
-# @param ma_slow int 20 长期均线周期
-# @param threshold float 0.5 阈值
+参数声明格式（向后兼容）：
+  # @param param_name type default_value 描述
+  # @param param_name type default_value 描述 [min:max:step]
+
+示例：
+  # @param ma_fast int 5 短期均线周期              ← 仅默认值（无搜索范围）
+  # @param ma_slow int 20 长期均线周期 [10:200:1]  ← 带搜索范围，可用于参数优化
+  # @param threshold float 0.5 阈值 [0.1:0.9:0.05]
+  # @param use_filter bool true 是否启用过滤       ← bool 类型自动展开为 [True, False]
 
 支持的类型：int, float, bool, str
 """
@@ -117,19 +122,28 @@ class StrategyConfigParser:
 
 
 class IndicatorParamsParser:
-    """解析指标代码中的参数声明"""
-    
-    # 参数声明正则：# @param name type default description
+    """解析指标代码中的参数声明，支持搜索范围（用于参数优化）。"""
+
+    # 参数声明正则（向后兼容）：
+    #   # @param name type default description
+    #   # @param name type default description [min:max:step]
+    # range 内容只允许数字/冒号/空格/点/正负号，避免误匹配描述中的 [文字]
     PARAM_PATTERN = re.compile(
-        r'#\s*@param\s+(\w+)\s+(int|float|bool|str|string)\s+(\S+)\s*(.*)',
+        r'#\s*@param\s+(\w+)\s+(int|float|bool|str|string)\s+(\S+)\s*(.*?)'
+        r'(?:\[([\d\s:+.\-]+)\])?\s*$',
         re.IGNORECASE
     )
-    
+
+    # 搜索范围正则：min:max:step 或 min:max（step 默认 1）
+    RANGE_PATTERN = re.compile(
+        r'^([+-]?\d+\.?\d*)\s*:\s*([+-]?\d+\.?\d*)(?:\s*:\s*([+-]?\d+\.?\d*))?$'
+    )
+
     @classmethod
     def parse_params(cls, indicator_code: str) -> List[Dict[str, Any]]:
         """
-        解析指标代码中的参数声明
-        
+        解析指标代码中的参数声明。
+
         Returns:
             List of param definitions:
             [
@@ -137,7 +151,12 @@ class IndicatorParamsParser:
                     "name": "ma_fast",
                     "type": "int",
                     "default": 5,
-                    "description": "短期均线周期"
+                    "description": "短期均线周期",
+                    # 以下字段仅在声明了搜索范围时存在：
+                    "min": 3,
+                    "max": 50,
+                    "step": 1,
+                    "searchable": True,
                 },
                 ...
             ]
@@ -145,35 +164,76 @@ class IndicatorParamsParser:
         params = []
         if not indicator_code:
             return params
-        
+
         for line in indicator_code.split('\n'):
             line = line.strip()
             match = cls.PARAM_PATTERN.match(line)
-            if match:
-                name = match.group(1)
-                param_type = match.group(2).lower()
-                default_str = match.group(3)
-                description = match.group(4).strip() if match.group(4) else ''
-                
-                # 转换默认值类型
-                default = cls._convert_value(default_str, param_type)
-                
-                # 规范化类型名
-                if param_type == 'string':
-                    param_type = 'str'
-                
-                params.append({
-                    "name": name,
-                    "type": param_type,
-                    "default": default,
-                    "description": description
-                })
-        
+            if not match:
+                continue
+
+            name = match.group(1)
+            param_type = match.group(2).lower()
+            default_str = match.group(3)
+            description = (match.group(4) or '').strip()
+            range_str = (match.group(5) or '').strip()
+
+            # 规范化类型名
+            if param_type == 'string':
+                param_type = 'str'
+
+            # 转换默认值类型
+            default = cls._convert_value(default_str, param_type)
+
+            param_def: Dict[str, Any] = {
+                "name": name,
+                "type": param_type,
+                "default": default,
+                "description": description,
+            }
+
+            # 解析搜索范围 [min:max:step]
+            if range_str:
+                parsed = cls._parse_range(range_str, param_type)
+                if parsed is not None:
+                    param_def.update(parsed)
+                    param_def["searchable"] = True
+
+            # bool 类型：自动视为可搜索（展开为 [True, False]）
+            if param_type == 'bool' and 'searchable' not in param_def:
+                param_def["searchable"] = True
+
+            params.append(param_def)
+
         return params
-    
+
+    @classmethod
+    def _parse_range(cls, range_str: str, param_type: str) -> Optional[Dict[str, Any]]:
+        """解析 [min:max:step] 搜索范围字符串。"""
+        m = cls.RANGE_PATTERN.match(range_str.strip())
+        if not m:
+            return None
+
+        low = cls._convert_value(m.group(1), param_type)
+        high = cls._convert_value(m.group(2), param_type)
+        step_raw = m.group(3)
+
+        if low is None or high is None:
+            return None
+        if low >= high:
+            return None
+
+        if param_type == 'int':
+            step = int(step_raw) if step_raw else 1
+            return {"min": int(low), "max": int(high), "step": step}
+        elif param_type == 'float':
+            step = float(step_raw) if step_raw else 0.01
+            return {"min": float(low), "max": float(high), "step": step}
+
+        return None
+
     @classmethod
     def _convert_value(cls, value_str: str, param_type: str) -> Any:
-        """转换字符串值为对应类型"""
+        """转换字符串值为对应类型。"""
         try:
             param_type = param_type.lower()
             if param_type == 'int':
@@ -186,16 +246,16 @@ class IndicatorParamsParser:
                 return value_str
         except (ValueError, TypeError):
             return value_str
-    
+
     @classmethod
     def merge_params(cls, declared_params: List[Dict], user_params: Dict[str, Any]) -> Dict[str, Any]:
         """
-        合并声明的参数和用户提供的参数
-        
+        合并声明的参数和用户提供的参数。
+
         Args:
             declared_params: 从代码中解析的参数声明
             user_params: 用户提供的参数值
-            
+
         Returns:
             合并后的参数字典（使用用户值或默认值）
         """
@@ -204,15 +264,170 @@ class IndicatorParamsParser:
             name = param['name']
             param_type = param['type']
             default = param['default']
-            
+
             if name in user_params:
-                # 用户提供了值，转换为正确类型
                 result[name] = cls._convert_value(str(user_params[name]), param_type)
             else:
-                # 使用默认值
                 result[name] = default
-        
+
         return result
+
+    # ================================================================
+    # 参数优化：搜索空间 & 组合生成
+    # ================================================================
+
+    @classmethod
+    def get_searchable_params(cls, declared_params: List[Dict]) -> List[Dict[str, Any]]:
+        """返回所有声明了搜索范围的参数（searchable=True）。"""
+        return [p for p in declared_params if p.get("searchable")]
+
+    @classmethod
+    def generate_param_grid(
+        cls,
+        declared_params: List[Dict[str, Any]],
+        max_combinations: int = 5000,
+    ) -> List[Dict[str, Any]]:
+        """
+        从参数声明生成笛卡尔积搜索网格。
+
+        - 有搜索范围的参数（searchable=True）按 [min:max:step] 展开
+        - bool 参数展开为 [True, False]
+        - 无搜索范围的非 bool 参数保持默认值不变
+        - 超过 max_combinations 时自动加大 step 降采样
+
+        Returns:
+            参数组合列表，每组是一个 dict（可直接传入 merge_params 的 user_params）
+        """
+        from itertools import product
+
+        # 收集每个可搜索参数的候选值
+        axes: List[Tuple[str, List[Any]]] = []
+        fixed: Dict[str, Any] = {}
+
+        for p in declared_params:
+            name = p["name"]
+            ptype = p["type"]
+            default = p["default"]
+
+            if p.get("searchable"):
+                if ptype == "bool":
+                    axes.append((name, [True, False]))
+                elif "min" in p and "max" in p:
+                    low, high, step = p["min"], p["max"], p.get("step", 1)
+                    values = cls._range_values(low, high, step, ptype)
+                    if values:
+                        axes.append((name, values))
+                    else:
+                        fixed[name] = default
+                else:
+                    fixed[name] = default
+            else:
+                fixed[name] = default
+
+        if not axes:
+            return [fixed]
+
+        # 计算总组合数，超限则降采样
+        total = 1
+        for _, vals in axes:
+            total *= len(vals)
+
+        if total > max_combinations:
+            # 按比例缩减每个轴的采样数
+            ratio = (max_combinations / total) ** (1.0 / len(axes))
+            adjusted_axes = []
+            for name, vals in axes:
+                new_count = max(2, int(len(vals) * ratio))
+                if new_count >= len(vals):
+                    adjusted_axes.append((name, vals))
+                else:
+                    indices = [int(i * (len(vals) - 1) / (new_count - 1)) for i in range(new_count)]
+                    adjusted_axes.append((name, [vals[i] for i in indices]))
+            axes = adjusted_axes
+
+        # 笛卡尔积
+        combos = []
+        for values in product(*(vals for _, vals in axes)):
+            combo = dict(fixed)
+            for i, (name, _) in enumerate(axes):
+                combo[name] = values[i]
+            combos.append(combo)
+
+        return combos
+
+    @staticmethod
+    def _range_values(low: Any, high: Any, step: Any, ptype: str) -> List[Any]:
+        """生成 [low, high] 范围内的离散值列表。"""
+        if step is None or step <= 0:
+            step = 1
+
+        values = []
+        if ptype == "int":
+            step = max(1, int(step))
+            v = int(low)
+            while v <= int(high):
+                values.append(v)
+                v += step
+        else:  # float
+            import math
+            step = float(step)
+            n_steps = int(math.floor((float(high) - float(low)) / step)) + 1
+            for i in range(n_steps):
+                v = round(float(low) + i * step, 10)
+                if v > float(high):
+                    break
+                values.append(v)
+
+        return values if values else [low]
+
+    @classmethod
+    def generate_random_params(
+        cls,
+        declared_params: List[Dict[str, Any]],
+        n_samples: int = 100,
+        seed: int = 42,
+    ) -> List[Dict[str, Any]]:
+        """
+        随机采样 n 组参数（适合参数空间太大时用随机搜索代替网格搜索）。
+
+        Returns:
+            参数组合列表
+        """
+        import random as _random
+        _random.seed(seed)
+
+        searchable = []
+        fixed: Dict[str, Any] = {}
+
+        for p in declared_params:
+            if p.get("searchable"):
+                searchable.append(p)
+            else:
+                fixed[p["name"]] = p["default"]
+
+        if not searchable:
+            return [fixed]
+
+        combos = []
+        for _ in range(n_samples):
+            combo = dict(fixed)
+            for p in searchable:
+                name, ptype = p["name"], p["type"]
+                if ptype == "bool":
+                    combo[name] = _random.choice([True, False])
+                elif "min" in p and "max" in p:
+                    low, high, step = p["min"], p["max"], p.get("step", 1)
+                    if ptype == "int":
+                        n_steps = max(1, int((high - low) / step) + 1)
+                        combo[name] = int(low) + _random.randint(0, n_steps - 1) * int(step)
+                    else:
+                        n_steps = max(1, int((high - low) / step) + 1)
+                        combo[name] = round(low + _random.randint(0, n_steps - 1) * step, 10)
+                else:
+                    combo[name] = p["default"]
+            combos.append(combo)
+
+        return combos
 
 
 class IndicatorCaller:
