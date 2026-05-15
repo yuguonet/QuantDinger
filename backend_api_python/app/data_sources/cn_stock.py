@@ -26,6 +26,7 @@ from app.data_sources.asia_stock_kline import normalize_chart_timeframe
 from app.data_sources.coordinator import get_coordinator
 from app.data_sources.kline_clean import clean_klines
 from app.utils.logger import get_logger
+from app.utils.trading_calendar import prev_trading_day
 
 logger = get_logger(__name__)
 
@@ -36,9 +37,8 @@ _RAW_TIMEFRAMES = {"15m", "1D"}
 # 与 MarketKlineWriter._AGG_TARGETS 对齐
 _AGG_TIMEFRAMES = {"30m", "1h", "2h", "4h", "1W", "1M"}
 
-# DB 数据新鲜度阈值：最新bar时间距今不超过 N 秒视为有效
-# 1天=86400s，A股最长非交易间隔约3天(周末+节假日)，取4天兜底
-_DB_FRESHNESS_MAX_AGE = 4 * 86400
+# DB 数据新鲜度：最新 bar 的日期必须 >= 上一个交易日
+# 使用 trading_calendar 模块精确判断，不再依赖固定天数
 
 
 # ================================================================
@@ -205,12 +205,13 @@ class CNStockDataSource(BaseDataSource):
                 )
                 return []
         else:
-            # 非回测场景：DB 最新 bar 不能太旧
-            if now_ts - latest_ts > _DB_FRESHNESS_MAX_AGE:
+            # 非回测场景：DB 最新 bar 日期必须 >= 上一个交易日
+            latest_date = datetime.fromtimestamp(latest_ts).strftime("%Y-%m-%d")
+            cutoff = prev_trading_day(datetime.now().strftime("%Y-%m-%d"), n=1)
+            if latest_date < cutoff:
                 logger.debug(
                     f"[DB] {symbol}/{tf} 数据过期: "
-                    f"最新={datetime.fromtimestamp(latest_ts):%Y-%m-%d} "
-                    f"距今{int((now_ts - latest_ts) / 86400)}天"
+                    f"最新={latest_date}, 要求>={cutoff}"
                 )
                 return []
 
