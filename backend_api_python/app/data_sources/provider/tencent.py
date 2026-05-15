@@ -317,11 +317,11 @@ class TencentDataSource:
         if len(raw_time) == 14 and raw_time.isdigit():
             time_str = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]} {raw_time[8:10]}:{raw_time[10:12]}:{raw_time[12:14]}"
         return {
-            "last": last, "change": chg,
+            "last": last, "close": last, "change": chg,
             "changePercent": round(chg / prev * 100, 2) if prev else 0,
             "high": _f(33, last), "low": _f(34, last),
             "open": _f(5) or last, "previousClose": prev,
-            "volume": vol * 100, "time": time_str,
+            "volume": vol * 100, "amount": 0, "time": time_str,
             "name": (parts[1] or "").strip(),
             "symbol": (parts[2] or "").strip(),
         }
@@ -399,13 +399,14 @@ class TencentDataSource:
                         if len(raw_time) == 14 and raw_time.isdigit():
                             time_str = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]} {raw_time[8:10]}:{raw_time[10:12]}:{raw_time[12:14]}"
                         result[c] = {
-                            "last": last, "change": chg,
+                            "last": last, "close": last, "change": chg,
                             "changePercent": round(chg / prev * 100, 2) if prev else 0,
                             "high": float(parts[33]) if len(parts) > 33 and parts[33] else last,
                             "low": float(parts[34]) if len(parts) > 34 and parts[34] else last,
                             "open": float(parts[5]) if parts[5] else last,
                             "previousClose": prev,
                             "volume": vol * 100,
+                            "amount": 0,
                             "time": time_str,
                             "name": parts[1].strip(),
                             "symbol": parts[2].strip(),

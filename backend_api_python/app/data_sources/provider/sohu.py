@@ -54,7 +54,7 @@ API来源 & 最新信息:
   - fetch_kline: volume(r[7])返回"手"，代码中已×100转"股"
   - fetch_ticker / fetch_batch_quotes: volume 返回"股"（代码中总手×100）
   - 价格字段直接是"元"，不需要÷
-  - amount 字段单位为"万元"
+  - amount 字段单位为"元"（API返回万元，已×10000转换）
   - 复权: 不复权数据通过 TDX 除权除息数据(adjustment模块)转前复权
 """
 
@@ -367,14 +367,17 @@ def _parse_sohu_heartbeat(text: str) -> Optional[Dict[str, Any]]:
         "code": pa1[0],
         "name": pa1[1],
         "last": _float(pa1[2]),
+        "close": _float(pa1[2]),
         "open": _float(pa2[3]),
         "high": _float(pa2[5]),
         "low": _float(pa2[7]),
         "prev_close": _float(pa2[1]),
+        "previousClose": _float(pa2[1]),
         "change": _float(pa1[3]),
         "change_pct": _float(pa1[4]),
+        "changePercent": _float(pa1[4]),
         "volume": round(float(pa2[8]) * 100, 2) if _float(pa2[8]) else 0,  # 总手→股
-        "amount": _float(pa2[12]),  # 总金额(万)
+        "amount": round(_float(pa2[12]) * 10000, 2) if _float(pa2[12]) else 0,  # 万元→元
         "turnover_rate": _float(pa2[6]),
         "PE": _float(pa2[10]),
         "amplitude": _float(pa2[14]),
@@ -401,6 +404,18 @@ def _fetch_sohu_ticker(code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
     if not text:
         return None
     return _parse_sohu_heartbeat(text)
+
+
+def _normalize_sohu_time(raw) -> str:
+    """归一化 sohu 行情时间: 仅时间(HH:MM)补当日日期，其他原样返回。"""
+    s = str(raw or "").strip()
+    if not s or s == "None":
+        return ""
+    # "HH:MM" → "YYYY-MM-DD HH:MM:00"
+    if len(s) == 5 and s[2] == ":":
+        today = datetime.now(_TZ_CN).strftime("%Y-%m-%d")
+        return f"{today} {s}:00"
+    return s
 
 
 def _fetch_sohu_batch_quotes(codes: List[str], timeout: int = 10) -> Dict[str, Dict[str, Any]]:
@@ -445,21 +460,25 @@ def _fetch_sohu_batch_quotes(codes: List[str], timeout: int = 10) -> Dict[str, D
         if not isinstance(arr, list) or len(arr) < 15:
             continue
         try:
+            last_val = _float(arr[2])
             result[biz_code] = {
                 "code": arr[0],
                 "name": arr[1],
-                "last": _float(arr[2]),
+                "last": last_val,
+                "close": last_val,
                 "change_pct": _float(arr[3]),
+                "changePercent": _float(arr[3]),
                 "change": _float(arr[4]),
                 "volume": round(float(arr[5]) * 100, 2) if _float(arr[5]) else 0,  # 手→股
-                "amount": _float(arr[7]),  # 总金额(万)
+                "amount": round(_float(arr[7]) * 10000, 2) if _float(arr[7]) else 0,  # 万元→元
                 "turnover_rate": _float(arr[8]),
                 "high": _float(arr[10]),
                 "low": _float(arr[11]),
                 "PE": _float(arr[12]),
                 "prev_close": _float(arr[13]),
+                "previousClose": _float(arr[13]),
                 "open": _float(arr[14]),
-                "time": arr[17] if len(arr) > 17 else None,
+                "time": _normalize_sohu_time(arr[17] if len(arr) > 17 else None),
             }
         except (ValueError, TypeError, IndexError):
             continue
@@ -593,7 +612,7 @@ class SohuDataSource:
 
         通过 hq.stock.sohu.com/{market}/{code_last3}/{biz_code}-1.html 心跳接口。
         返回: code, name, last, open, high, low, prev_close, change, change_pct,
-              volume(股), amount(万), turnover_rate, PE, amplitude, limit_up/down, time
+              volume(股), amount(元), turnover_rate, PE, amplitude, limit_up/down, time
         """
         return _fetch_sohu_ticker(code, timeout=timeout)
 
@@ -602,6 +621,6 @@ class SohuDataSource:
 
         通过 hqm.stock.sohu.com/getqjson 批量接口（一次请求支持多只）。
         返回: {biz_code: {code, name, last, open, high, low, prev_close, change, change_pct,
-                         volume(股), amount(万), turnover_rate, PE, time}}
+                         volume(股), amount(元), turnover_rate, PE, time}}
         """
         return _fetch_sohu_batch_quotes(codes, timeout=timeout)

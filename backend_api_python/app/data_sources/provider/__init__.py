@@ -449,7 +449,7 @@ class BaseDataSource(Protocol):
             timeout: 请求超时秒数
 
         Returns:
-            行情字典，包含 last/change/changePercent/high/low/open/previousClose/name/symbol。
+            行情字典，字段与 fetch_batch_quotes 单条记录一致。
             失败返回 None。
             不支持返回 NotSupportedResult。
         """
@@ -466,6 +466,21 @@ class BaseDataSource(Protocol):
         Returns:
             {code: quote_dict} — 仅包含成功获取的代码。
             不支持返回 NotSupportedResult。
+
+        标准返回字段（与 K线格式统一）:
+            last:        最新价（元）
+            close:       = last（与 kline 统一）
+            open:        开盘价（元）
+            high:        最高价（元）
+            low:         最低价（元）
+            previousClose: 昨收（元）
+            change:      涨跌额
+            changePercent: 涨跌幅(%)
+            volume:      成交量（股）
+            amount:      成交额（元），无数据时为 0
+            time:        "YYYY-MM-DD HH:MM:SS" 或 "YYYY-MM-DD"
+            name:        股票名称
+            symbol:      代码
         """
         ...
 

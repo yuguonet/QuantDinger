@@ -260,6 +260,7 @@ def _fetch_ticker(code: str) -> Optional[Dict[str, Any]]:
 
         return {
             "last": last,
+            "close": last,
             "change": chg,
             "changePercent": round(chg / prev * 100, 2) if prev else 0,
             "high": float(quote.get("high", 0) or last),
@@ -267,6 +268,7 @@ def _fetch_ticker(code: str) -> Optional[Dict[str, Any]]:
             "open": float(quote.get("open", 0) or last),
             "previousClose": prev,
             "volume": vol,
+            "amount": 0,
             "time": "",
             "name": quote.get("name", ""),
             "symbol": symbol,

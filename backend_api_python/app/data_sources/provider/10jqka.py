@@ -319,9 +319,10 @@ class ThsDataSource:
             vol = float(parts[5]) if len(parts) > 5 else 0
         except (ValueError, IndexError): return None
         if last <= 0: return None
-        return {"last": last, "change": 0, "changePercent": 0,
+        return {"last": last, "close": last, "change": 0, "changePercent": 0,
                 "high": high, "low": low, "open": open_p, "previousClose": 0,
-                "volume": vol, "name": data.get("name", ""), "symbol": f"{digits}"}
+                "volume": vol, "amount": 0, "time": "",
+                "name": data.get("name", ""), "symbol": f"{digits}"}
 
     def fetch_batch_quotes(self, codes, timeout=10):
         return NotSupportedResult(self.name, "fetch_batch_quotes")

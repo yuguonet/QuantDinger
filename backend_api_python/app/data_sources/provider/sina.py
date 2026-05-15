@@ -122,9 +122,12 @@ def _parse_sina_quote(text: str) -> Optional[Dict[str, Any]]:
         if last == 0 and prev_close == 0 and open_p == 0:
             return None
         return {
-            "name": name, "open": open_p, "prev_close": prev_close,
-            "last": last, "high": high, "low": low,
-            "volume": volume, "amount": amount,
+            "name": name, "open": open_p, "previousClose": prev_close,
+            "last": last, "close": last, "high": high, "low": low,
+            "change": round(last - prev_close, 4) if prev_close else 0.0,
+            "changePercent": round((last - prev_close) / prev_close * 100, 2) if prev_close else 0.0,
+            "volume": volume, "amount": amount, "time": "",
+            "symbol": "",
         }
     except (ValueError, IndexError):
         return None
@@ -463,10 +466,12 @@ class SinaDataSource:
                 if len(parts) > 31 and parts[30] and parts[31]:
                     time_str = f"{parts[30].strip()} {parts[31].strip()}"
                 result[code_str] = {
-                    "name": name, "last": last, "change": chg,
+                    "name": name, "last": last, "close": last, "change": chg,
                     "changePercent": round(chg / prev_close * 100, 2) if prev_close else 0.0,
                     "open": open_p, "high": high, "low": low,
-                    "previousClose": prev_close, "volume": vol, "time": time_str,
+                    "previousClose": prev_close, "volume": vol,
+                    "amount": float(parts[9]) if len(parts) > 9 and parts[9] else 0.0,
+                    "time": time_str,
                     "symbol": code_str,
                 }
             except (ValueError, IndexError):

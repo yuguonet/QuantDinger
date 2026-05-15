@@ -248,6 +248,18 @@ class CNStockDataSource(BaseDataSource):
 
     # ── 远程拉取（Coordinator 调度）──
 
+    def _cache_to_db(self, symbol: str, timeframe: str, bars: List[Dict[str, Any]]):
+        """将 15m/1D K 线写入 DB，供后续请求走本地缓存。"""
+        if timeframe not in _RAW_TIMEFRAMES or not bars:
+            return
+        try:
+            from app.utils.db_market import get_market_kline_writer
+            writer = get_market_kline_writer()
+            writer.upsert("CNStock", symbol, timeframe, bars)
+            logger.debug(f"[DB写入] {symbol}/{timeframe} 缓存 {len(bars)} 条")
+        except Exception as e:
+            logger.debug(f"[DB写入] {symbol}/{timeframe} 缓存失败: {e}")
+
     def _get_kline_remote(
         self,
         symbol: str,
@@ -274,6 +286,8 @@ class CNStockDataSource(BaseDataSource):
 
         if bars:
             bars = clean_klines(bars, tf)
+            # 远程拿到 15m/1D 数据后回写 DB，下次可走本地缓存
+            self._cache_to_db(symbol, tf, bars)
 
         return self.filter_and_limit(
             bars, limit=lim, before_time=before_time,
@@ -314,6 +328,8 @@ class CNStockDataSource(BaseDataSource):
             cleaned = clean_klines(bars, tf)
             result[sym] = cleaned
             total_bars += len(cleaned)
+            # 批量远程也回写 DB（仅 15m/1D）
+            self._cache_to_db(sym, tf, cleaned)
 
         if failed:
             logger.warning(f"[远程批量] {len(failed)}/{len(symbols)} 只失败: {failed[:10]}")

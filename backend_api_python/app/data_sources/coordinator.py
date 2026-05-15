@@ -170,27 +170,6 @@ class CircuitBreaker:
 _realtime_cb = CircuitBreaker(failure_threshold=3, cooldown_seconds=120.0, name="realtime")
 
 
-# ================================================================
-# 模块级 EWMA 响应时间 — 进程存活期间持续累积，不随实例重建丢失
-# ================================================================
-
-_EWMA_ALPHA = 0.3
-_ewma_rt: Dict[str, float] = {}
-_ewma_lock = threading.Lock()
-
-
-def _update_ewma(provider_name: str, rt: float):
-    """内部: 更新 EWMA 响应时间。rt <= 0 跳过。"""
-    if rt <= 0:
-        return
-    with _ewma_lock:
-        old = _ewma_rt.get(provider_name)
-        if old is None:
-            _ewma_rt[provider_name] = rt
-        else:
-            _ewma_rt[provider_name] = _EWMA_ALPHA * rt + (1 - _EWMA_ALPHA) * old
-
-
 def get_realtime_circuit_breaker() -> CircuitBreaker:
     """获取实时行情熔断器实例"""
     return _realtime_cb
@@ -248,6 +227,42 @@ def _normalize_symbols(symbols, market: str) -> List[str]:
             seen.add(ns)
             result.append(ns)
     return result
+
+
+def _adjust_quotes(quotes: Dict[str, Dict[str, Any]]) -> None:
+    """
+    对批量行情做前复权（原地修改）。
+
+    将每个 quote 包装为单 bar kline，调用 apply_fwd_adjust 复权后回写 OHLC。
+    quote 需包含 close/open/high/low/volume/time 字段。
+    复权失败时保留原始不复权价格（不中断流程）。
+    """
+    from app.data_sources.provider.adjustment import apply_fwd_adjust
+
+    for code, q in quotes.items():
+        close = q.get("close", q.get("last", 0))
+        if not close:
+            continue
+        bar = {
+            "time": q.get("time", ""),
+            "open": q.get("open", 0),
+            "high": q.get("high", 0),
+            "low": q.get("low", 0),
+            "close": close,
+            "volume": q.get("volume", 0),
+        }
+        try:
+            adjusted = apply_fwd_adjust([bar], code)
+        except Exception as e:
+            logger.warning("[复权] %s 失败，保留不复权价格: %s", code, e)
+            continue
+        if adjusted and len(adjusted) == 1:
+            ab = adjusted[0]
+            q["open"] = ab["open"]
+            q["high"] = ab["high"]
+            q["low"] = ab["low"]
+            q["close"] = ab["close"]
+            q["last"] = ab["close"]
 
 
 def _is_valid_kline(bars) -> bool:
@@ -550,6 +565,24 @@ class Coordinator:
 
     def __init__(self):
         self._lock = threading.Lock()
+        # per-provider EWMA 响应时间
+        self._ewma_rt: Dict[str, float] = {}
+        self._ewma_lock = threading.Lock()
+
+    # ── EWMA 响应时间追踪 ──
+
+    _EWMA_ALPHA = 0.3
+
+    def _update_ewma(self, provider_name: str, rt: float):
+        """更新 Provider 的 EWMA 响应时间。rt<=0 不更新。"""
+        if rt <= 0:
+            return
+        with self._ewma_lock:
+            old = self._ewma_rt.get(provider_name)
+            if old is None:
+                self._ewma_rt[provider_name] = rt
+            else:
+                self._ewma_rt[provider_name] = self._EWMA_ALPHA * rt + (1 - self._EWMA_ALPHA) * old
 
     def allocate_threads(self, providers: list, global_budget: int = 32, symbol_count: int = 0) -> Dict[str, int]:
         """按 max_concurrency / EWMA 响应时间加权分配线程数。symbol_count > 0 时限制总线程数。"""
@@ -558,8 +591,8 @@ class Coordinator:
         weights = {}
         for p in providers:
             max_c = getattr(p, 'max_concurrency', 4)
-            with _ewma_lock:
-                rt = _ewma_rt.get(p.name, 1.0)
+            with self._ewma_lock:
+                rt = self._ewma_rt.get(p.name, 1.0)
             weights[p.name] = max_c / max(rt, 0.1)
         total = sum(weights.values())
         if total <= 0:
@@ -1094,8 +1127,10 @@ class Coordinator:
           - key 统一为纯数字代码 (600519)
           - quote["symbol"] 统一为纯数字代码
           - quote["name"] 若与 symbol 重复则清空
+          - OHLC 前复权（Provider 返回不复权原始价，此处统一做前复权）
         """
         from app.data_sources.normalizer import strip_market_prefix
+
         out: Dict[str, Dict[str, Any]] = {}
         for key, quote in raw.items():
             digits = strip_market_prefix(key)
@@ -1105,6 +1140,11 @@ class Coordinator:
                 if raw_name and strip_market_prefix(raw_name) == digits:
                     quote["name"] = ""
             out[digits] = quote
+
+        # ── 前复权: 将 quote 包装为单 bar kline 列表，批量复权后回写 ──
+        if out:
+            _adjust_quotes(out)
+
         return out
 
     @staticmethod
@@ -1132,7 +1172,7 @@ class Coordinator:
         批量行情获取 — 自适应双模式调度。
 
         输入: symbols 可以是纯数字 (600519) 或带前缀 (SH600519)，内部自动加前缀。
-        输出: key 统一为纯数字 (600519)，name/symbol 字段标准化。
+        输出: key 统一为纯数字 (600519)，name/symbol 字段标准化，OHLC 前复权。
 
         模式选择:
           ≤ 500 只: RACE 模式 — 多源并发抢答，第一个返回非空结果的直接用
@@ -1182,7 +1222,7 @@ class Coordinator:
         else:
             raw = self._batch_quotes_dispatch(normalized_symbols, available, timeout)
 
-        # ── 输出标准化: key 去前缀，name/symbol 统一 ──
+        # ── 输出标准化: key 去前缀，name/symbol 统一 + 前复权 ──
         return self._normalize_batch_quotes_result(raw)
 
     # ── RACE 模式: 多源并发抢答（≤500 只） ──
@@ -1859,7 +1899,7 @@ class Coordinator:
                         symbols=remaining,
                     )
                     elapsed = time.time() - start
-                    _update_ewma(name, elapsed)
+                    self._update_ewma(name, elapsed)
 
                     if isinstance(task_result, NotSupportedResult):
                         with stats_lock:
@@ -1933,7 +1973,7 @@ class Coordinator:
 
                 except Exception as e:
                     elapsed = time.time() - start
-                    _update_ewma(name, elapsed)
+                    self._update_ewma(name, elapsed)
                     # 超时异常用 timeout 计数，其他用 fail 计数（不双计）
                     if elapsed > _PER_TASK_TIMEOUT:
                         with timeout_state_lock:

@@ -409,6 +409,7 @@ def _fetch_em_trends2_quote(code: str) -> Optional[Dict[str, Any]]:
 
     return {
         "last": last,
+        "close": last,
         "change": 0,
         "changePercent": 0,
         "high": max(highs) if highs else last,
@@ -416,6 +417,7 @@ def _fetch_em_trends2_quote(code: str) -> Optional[Dict[str, Any]]:
         "open": open_p,
         "previousClose": 0,
         "volume": vol,
+        "amount": 0,
         "time": "",
         "name": "",
         "symbol": code,

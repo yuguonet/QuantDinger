@@ -1369,148 +1369,6 @@ def _run_stocks_parallel(
 
 
 # ================================================================
-#  小循环：单只股票 × 全部策略
-# ================================================================
-
-def _backtest_single_stock_all_strategies(
-    strategy_configs: List[Dict[str, Any]],
-    symbol: str,
-    name: str,
-    market: str,
-    save_to_db: bool,
-    cancelled: List[bool],
-) -> List[Dict[str, Any]]:
-    """
-    对单只股票串行跑所有策略，返回每个策略的结果列表。
-
-    与 _backtest_single_stock 接口对齐，但一次调用覆盖全部策略，
-    避免同一只股票被多个策略重复拉取 K 线。
-
-    Returns:
-        [{"indicator_id": int, "indicator_name": str, "result": dict}, ...]
-    """
-    results = []
-    for sc in strategy_configs:
-        if cancelled[0]:
-            break
-        bt_result = _backtest_single_stock(
-            indicator_code=sc["indicator_code"],
-            indicator_id=sc["indicator_id"],
-            indicator_name=sc["indicator_name"],
-            user_id=sc["user_id"],
-            symbol=symbol,
-            name=name,
-            market=market,
-            periods=sc["periods"],
-            user_params=sc["params"],
-            save_to_db=save_to_db,
-            cancelled=cancelled,
-            param_combos=sc.get("param_combos"),
-            searchable_params=sc.get("searchable_params"),
-        )
-        results.append({
-            "indicator_id": sc["indicator_id"],
-            "indicator_name": sc["indicator_name"],
-            "result": bt_result,
-        })
-    return results
-
-
-def _run_stocks_parallel_all_strategies(
-    stocks: List[Dict[str, Any]],
-    strategy_configs: List[Dict[str, Any]],
-    save_to_db: bool,
-    cancelled: List[bool],
-    max_workers: int = 4,
-    batch_size: int = 20,
-) -> Generator[Dict[str, Any], None, None]:
-    """
-    小循环并行引擎：外层股票并行，内层策略串行。
-
-    每只股票只拉取一次 K 线数据，然后对该股票串行跑所有策略。
-    相比原来的大循环（外层策略 × 内层股票），K 线拉取次数从
-    N策略 × M股票 降为 M股票。
-
-    Yields:
-        {"type": "progress"/"result", ...}
-    """
-    total = len(stocks)
-    logger.info(
-        f"[_run_stocks_parallel_all_strategies] workers={max_workers}, "
-        f"stocks={total}, strategies={len(strategy_configs)}"
-    )
-
-    completed = 0
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {}
-        for stock in stocks:
-            if cancelled[0]:
-                break
-            future = executor.submit(
-                _backtest_single_stock_all_strategies,
-                strategy_configs=strategy_configs,
-                symbol=stock["code"],
-                name=stock["name"],
-                market=stock["market"],
-                save_to_db=save_to_db,
-                cancelled=cancelled,
-            )
-            future_map[future] = stock
-
-        for future in as_completed(future_map):
-            if cancelled[0]:
-                for f in future_map:
-                    f.cancel()
-                break
-
-            completed += 1
-            stock = future_map[future]
-            try:
-                # 每只股票跑全部策略，超时按策略数线性放大
-                per_stock_timeout = max(120, len(strategy_configs) * 60)
-                all_results = future.result(timeout=per_stock_timeout)
-                for item in all_results:
-                    yield {
-                        "type": "result",
-                        "indicator_id": item["indicator_id"],
-                        "indicator_name": item["indicator_name"],
-                        "symbol": stock["code"],
-                        "name": stock["name"],
-                        **item["result"],
-                        "index": completed,
-                        "total": total,
-                    }
-            except Exception as e:
-                logger.error(f"[thread] {stock['code']} 异常: {e}")
-                for sc in strategy_configs:
-                    yield {
-                        "type": "result",
-                        "indicator_id": sc["indicator_id"],
-                        "indicator_name": sc["indicator_name"],
-                        "symbol": stock["code"],
-                        "name": stock["name"],
-                        "passed": False,
-                        "skip_reason": "future_error",
-                        "bt_summary": str(e),
-                        "saved_runs": [],
-                        "index": completed,
-                        "total": total,
-                    }
-
-            # 进度推送
-            if completed % batch_size == 0 or completed == total:
-                yield {
-                    "type": "progress",
-                    "status": "checking",
-                    "symbol": stock["code"],
-                    "name": stock["name"],
-                    "index": completed,
-                    "total": total,
-                    "msg": f"进度 {completed}/{total} ({round(completed/total*100, 1)}%)",
-                }
-
-
-# ================================================================
 #  结果过滤、排序、CSV 导出、自动加自选
 # ================================================================
 
@@ -1957,86 +1815,135 @@ def backtest_all(
     task_idx = 0
 
     try:
-        # ── 小循环：外层股票并行，内层策略串行 ──
-        # 每只股票只拉取一次 K 线，对该股票串行跑所有策略
-        for item in _run_stocks_parallel_all_strategies(
-            stocks=stocks,
-            strategy_configs=strategy_configs,
-            save_to_db=save_to_db,
-            cancelled=cancelled,
-            max_workers=max_workers,
-        ):
+        for sc in strategy_configs:
             if cancelled[0]:
                 break
 
-            item_type = item.get("type")
-
-            if item_type == "progress":
-                task_idx = item.get("index", task_idx)
-                item["total"] = total_tasks
-                yield _sse(item)
-
-            elif item_type == "result":
-                task_idx += 1
-                sid = item.get("indicator_id")
-                sname = item.get("indicator_name", "")
-                symbol = item.get("symbol", "")
-                name = item.get("name", "")
-                passed = item.get("passed", False)
-                bt_summary = item.get("bt_summary", "")
-
-                stats["runs_saved"] += len(item.get("saved_runs", []))
-
-                # ── 收集有效结果 ──
-                valid = _collect_valid_result(item, sname)
-                if valid:
-                    valid_results.append(valid)
-
-                if passed:
-                    stats["passed"] += 1
-                    stats["by_strategy"][sid]["passed"] += 1
-
-                    if item.get("best_params"):
-                        opt_passed_items.append(item)
-
-                    sse_msg = {
-                        "type": "result",
-                        "indicator_id": sid,
-                        "indicator_name": sname,
-                        "symbol": symbol,
-                        "name": name,
-                        "index": task_idx,
-                        "total": total_tasks,
-                        "added": True,
-                        "reason": "passed",
-                        "bt_summary": bt_summary,
-                        "msg": f"✅ [{sname}] {symbol} {name} 通过 | {bt_summary}",
-                    }
-                    bp = item.get("best_params")
-                    if bp:
-                        sse_msg["best_params"] = bp
-                    yield _sse(sse_msg)
-                else:
-                    stats["skipped"] += 1
-                    stats["by_strategy"][sid]["skipped"] += 1
-
-        # ── 各策略完成摘要 ──
-        for sc in strategy_configs:
             sid = sc["indicator_id"]
             sname = sc["indicator_name"]
-            s_stats = stats["by_strategy"][sid]
+            scode = sc["indicator_code"]
+            s_uid = sc["user_id"]
+            s_params = sc["params"]
+            s_periods = sc["periods"]
+            s_param_combos = sc.get("param_combos")
+            s_searchable = sc.get("searchable_params")
+
+            # 参数优化时调整任务总数（每只股票 × 参数组合数）
+            if s_param_combos and len(s_param_combos) > 1:
+                opt_total = total_stocks * len(s_param_combos)
+                yield _sse({
+                    "type": "progress",
+                    "status": "strategy_start",
+                    "indicator_id": sid,
+                    "indicator_name": sname,
+                    "msg": f"开始策略：{sname}（{len(s_periods)} 个周期 × {total_stocks} 只 × {len(s_param_combos)} 组参数）",
+                    "index": task_idx,
+                    "total": total_tasks,
+                })
+            else:
+                yield _sse({
+                    "type": "progress",
+                    "status": "strategy_start",
+                    "indicator_id": sid,
+                    "indicator_name": sname,
+                    "msg": f"开始策略：{sname}（{len(s_periods)} 个周期 × {total_stocks} 只）",
+                    "index": task_idx,
+                    "total": total_tasks,
+                })
+
+            passed_list = []
+
+            # ── 多线程并行执行 ──
+            for item in _run_stocks_parallel(
+                stocks=stocks,
+                indicator_code=scode,
+                indicator_id=sid,
+                indicator_name=sname,
+                user_id=s_uid,
+                periods=s_periods,
+                user_params=s_params,
+                save_to_db=save_to_db,
+                cancelled=cancelled,
+                max_workers=max_workers,
+                batch_size=20,
+                param_combos=s_param_combos,
+                searchable_params=s_searchable,
+            ):
+                if cancelled[0]:
+                    break
+
+                item_type = item.get("type")
+
+                if item_type == "progress":
+                    # 转发进度（补充策略信息）
+                    item["indicator_id"] = sid
+                    item["indicator_name"] = sname
+                    task_idx = item.get("index", task_idx)
+                    item["index"] = task_idx + (total_stocks * list(stats["by_strategy"].keys()).index(sid))
+                    item["total"] = total_tasks
+                    item["msg"] = f"[{sname}] {item.get('msg', '')}"
+                    yield _sse(item)
+
+                elif item_type == "result":
+                    task_idx += 1
+                    symbol = item.get("symbol", "")
+                    name = item.get("name", "")
+                    passed = item.get("passed", False)
+                    bt_summary = item.get("bt_summary", "")
+                    skip_reason = item.get("skip_reason", "")
+
+                    stats["runs_saved"] += len(item.get("saved_runs", []))
+
+                    # ── 收集有效结果（过滤：胜率<0 丢弃，无买点丢弃） ──
+                    valid = _collect_valid_result(item, sname)
+                    if valid:
+                        valid_results.append(valid)
+
+                    if passed:
+                        stats["passed"] += 1
+                        stats["by_strategy"][sid]["passed"] += 1
+                        passed_list.append(symbol)
+
+                        # 收集参数优化通过的结果
+                        if item.get("best_params"):
+                            opt_passed_items.append(item)
+
+                        sse_msg = {
+                            "type": "result",
+                            "indicator_id": sid,
+                            "indicator_name": sname,
+                            "symbol": symbol,
+                            "name": name,
+                            "index": task_idx,
+                            "total": total_tasks,
+                            "added": True,
+                            "reason": "passed",
+                            "bt_summary": bt_summary,
+                            "msg": f"✅ [{sname}] {symbol} {name} 通过 | {bt_summary}",
+                        }
+                        bp = item.get("best_params")
+                        if bp:
+                            sse_msg["best_params"] = bp
+                        yield _sse(sse_msg)
+                    else:
+                        stats["skipped"] += 1
+                        stats["by_strategy"][sid]["skipped"] += 1
+
+            # ── 单策略完成摘要 ──
             yield _sse({
                 "type": "strategy_done",
                 "indicator_id": sid,
                 "indicator_name": sname,
-                "passed": s_stats["passed"],
-                "skipped": s_stats["skipped"],
-                "msg": f"策略 {sname} 完成：通过 {s_stats['passed']} 只",
+                "passed": len(passed_list),
+                "skipped": stats["by_strategy"][sid]["skipped"],
+                "passed_list": passed_list,
+                "msg": f"策略 {sname} 完成：通过 {len(passed_list)} 只",
             })
 
         # ── CSV 导出 + 自动加自选 ──
         csv_path = ""
         if valid_results:
+            # 运行参数（写入 CSV 头部注释）
             run_params = {
                 "strategies": [
                     {"indicator_id": sc["indicator_id"], "indicator_name": sc["indicator_name"]}
@@ -2045,6 +1952,7 @@ def backtest_all(
                 "market_filters": resolved_filters,
                 "max_workers": max_workers,
             }
+            # 按胜率、夏普比率排序后保存 CSV
             csv_path = _save_results_csv(valid_results, run_params=run_params)
             yield _sse({
                 "type": "csv_saved",
@@ -2053,6 +1961,7 @@ def backtest_all(
                 "msg": f"📊 有效结果 {len(valid_results)} 条，已保存: {csv_path}",
             })
 
+            # 自动加自选：胜率>90% 且 盈利>20%
             auto_added = _auto_watchlist_check(valid_results, user_id)
             if auto_added:
                 for row in auto_added:
@@ -2075,6 +1984,7 @@ def backtest_all(
 
             # ── 参数优化结果持久化 ──
             if opt_passed_items:
+                # 按策略分组保存
                 opt_saved_total = 0
                 for sc in strategy_configs:
                     sc_combos = sc.get("param_combos")

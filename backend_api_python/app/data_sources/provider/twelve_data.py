@@ -298,12 +298,13 @@ class TwelveDataSource:
         chg = round(last - prev, 4) if prev else 0.0
 
         return {
-            "last": last, "change": chg,
+            "last": last, "close": last, "change": chg,
             "changePercent": round(chg / prev * 100, 2) if prev else 0.0,
             "high": float(data.get("high", 0) or 0),
             "low": float(data.get("low", 0) or 0),
             "open": float(data.get("open", 0) or 0),
             "previousClose": prev,
+            "volume": 0, "amount": 0, "time": "",
             "name": str(data.get("name", "") or ""),
             "symbol": f"{symbol}.{exchange}",
         }

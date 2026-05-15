@@ -262,6 +262,8 @@ class MarketDBManager:
         self._db_exists_cache: Dict[str, bool] = {}
         # 年份表存在性缓存（避免重复查 information_schema）
         self._year_table_cache: set[str] = set()
+        # schema 初始化缓存（避免每次写入都重建表结构和聚合 VIEW）
+        self._schema_initialized: set[str] = set()
         # 管理员连接复用（避免每次都新建连接到 postgres 系统库）
         self._admin_conn_instance = None
         self._admin_conn_lock = threading.Lock()
@@ -375,8 +377,10 @@ class MarketDBManager:
 
         if self.market_db_exists(market):
             logger.info(f"市场数据库已存在: {db_name}")
-            # DB 已存在，仍需确保当前年份的表存在（CREATE TABLE IF NOT EXISTS 幂等）
-            self._init_market_schema(resolved)
+            # 只在首次需要时初始化 schema（表+VIEW），后续写入跳过
+            if resolved not in self._schema_initialized:
+                self._init_market_schema(resolved)
+                self._schema_initialized.add(resolved)
             return True
 
         conn = self._admin_conn()
@@ -391,6 +395,7 @@ class MarketDBManager:
             raise
 
         self._init_market_schema(resolved)
+        self._schema_initialized.add(resolved)
         return True
 
     def ensure_market_db(self, market: str) -> bool:
@@ -411,6 +416,7 @@ class MarketDBManager:
             cur.execute(f'DROP DATABASE IF EXISTS "{db_name}"')
             cur.close()
             self._db_exists_cache.pop(resolved, None)  # 清除缓存
+            self._schema_initialized.discard(resolved)  # 清除 schema 缓存
             logger.warning(f"⚠️ 已删除市场数据库: {db_name}")
             return True
         except Exception as e:

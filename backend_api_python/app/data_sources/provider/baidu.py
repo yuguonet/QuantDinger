@@ -203,6 +203,7 @@ def _fetch_baidu_quote(code: str) -> Optional[Dict[str, Any]]:
 
     return {
         "last": last,
+        "close": last,
         "change": chg,
         "changePercent": round(chg / prev * 100, 2) if prev else 0,
         "high": high,
@@ -210,6 +211,7 @@ def _fetch_baidu_quote(code: str) -> Optional[Dict[str, Any]]:
         "open": open_p,
         "previousClose": prev,
         "volume": vol,
+        "amount": 0,
         "time": str(parts[1])[:10] if len(parts) > 1 else "",
         "name": "",
         "symbol": cn_code,
