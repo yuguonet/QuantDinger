@@ -122,12 +122,9 @@ def _parse_sina_quote(text: str) -> Optional[Dict[str, Any]]:
         if last == 0 and prev_close == 0 and open_p == 0:
             return None
         return {
-            "name": name, "open": open_p, "previousClose": prev_close,
-            "last": last, "close": last, "high": high, "low": low,
-            "change": round(last - prev_close, 4) if prev_close else 0.0,
-            "changePercent": round((last - prev_close) / prev_close * 100, 2) if prev_close else 0.0,
-            "volume": volume, "amount": amount, "time": "",
-            "symbol": "",
+            "name": name, "open": open_p, "prev_close": prev_close,
+            "last": last, "high": high, "low": low,
+            "volume": volume, "amount": amount,
         }
     except (ValueError, IndexError):
         return None
@@ -232,6 +229,7 @@ class SinaDataSource:
     name = "sina"
     priority = 15
     max_concurrency = MAX_CONCURRENCY
+    batch_size = 500       # 单次 fetch_batch_quotes 最多处理 500 只
     min_interval = 1.5
     jitter_min = 0.8
     jitter_max = 2.5
@@ -388,45 +386,15 @@ class SinaDataSource:
         }
 
     def fetch_batch_quotes(self, codes: List[str], timeout: int = 10) -> Dict[str, Dict[str, Any]]:
+        """单批行情请求 — 由 Coordinator 控制批量大小和并发，本方法不做分批。"""
         if not codes:
             return {}
         sina_codes = [to_sina_code(c) for c in codes if c]
         if not sina_codes:
             return {}
 
-        batch_size = 500
-        batches = [sina_codes[i:i + batch_size] for i in range(0, len(sina_codes), batch_size)]
-
-        if len(batches) <= 1:
-            # 只有 1 批，直接串行，没必要开线程池
-            result: Dict[str, Dict[str, Any]] = {}
-            self._fetch_single_quote_batch(batches[0], result, timeout)
-            return result
-
-        # 多批并发
-        import concurrent.futures
         result: Dict[str, Dict[str, Any]] = {}
-        lock = threading.Lock()
-        max_workers = min(len(batches), 2)
-
-        def _fetch_batch(batch):
-            local: Dict[str, Dict[str, Any]] = {}
-            self._fetch_single_quote_batch(batch, local, timeout)
-            if local:
-                with lock:
-                    result.update(local)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = [pool.submit(_fetch_batch, b) for b in batches]
-            concurrent.futures.wait(futures, timeout=timeout + 5)
-
-        return result
-
-    def _fetch_single_quote_batch(
-        self, batch: List[str], result: Dict[str, Dict[str, Any]], timeout: int
-    ):
-        """单批次行情请求（内部辅助，供并发调用）"""
-        query = ",".join(batch)
+        query = ",".join(sina_codes)
         _sina_quote_limiter.wait()
         try:
             resp = get_shared_session().get(
@@ -437,7 +405,7 @@ class SinaDataSource:
             resp.encoding = "gbk"
         except Exception as e:
             logger.warning("[新浪批量行情] 请求失败: %s", e)
-            return
+            return result
 
         for line in (resp.text or "").strip().split("\n"):
             line = line.strip().rstrip(";")
@@ -466,15 +434,15 @@ class SinaDataSource:
                 if len(parts) > 31 and parts[30] and parts[31]:
                     time_str = f"{parts[30].strip()} {parts[31].strip()}"
                 result[code_str] = {
-                    "name": name, "last": last, "close": last, "change": chg,
+                    "name": name, "last": last, "change": chg,
                     "changePercent": round(chg / prev_close * 100, 2) if prev_close else 0.0,
                     "open": open_p, "high": high, "low": low,
-                    "previousClose": prev_close, "volume": vol,
-                    "amount": float(parts[9]) if len(parts) > 9 and parts[9] else 0.0,
-                    "time": time_str,
+                    "previousClose": prev_close, "volume": vol, "time": time_str,
                     "symbol": code_str,
                 }
             except (ValueError, IndexError):
                 continue
+
+        return result
 
 

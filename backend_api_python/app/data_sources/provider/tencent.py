@@ -171,6 +171,7 @@ class TencentDataSource:
     name = "tencent"
     priority = 10
     max_concurrency = MAX_CONCURRENCY
+    batch_size = 500       # 单次 fetch_batch_quotes 最多处理 500 只
     min_interval = 1.0
     jitter_min = 0.5
     jitter_max = 1.5
@@ -317,64 +318,37 @@ class TencentDataSource:
         if len(raw_time) == 14 and raw_time.isdigit():
             time_str = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]} {raw_time[8:10]}:{raw_time[10:12]}:{raw_time[12:14]}"
         return {
-            "last": last, "close": last, "change": chg,
+            "last": last, "change": chg,
             "changePercent": round(chg / prev * 100, 2) if prev else 0,
             "high": _f(33, last), "low": _f(34, last),
             "open": _f(5) or last, "previousClose": prev,
-            "volume": vol * 100, "amount": 0, "time": time_str,
+            "volume": vol * 100, "time": time_str,
             "name": (parts[1] or "").strip(),
             "symbol": (parts[2] or "").strip(),
         }
 
     def fetch_batch_quotes(self, codes: List[str], timeout: int = 10) -> Dict[str, Dict[str, Any]]:
+        """单批行情请求 — 由 Coordinator 控制批量大小和并发，本方法不做分批。"""
         if not codes:
             return {}
         lowered = [_lower(to_tencent_code(c)) for c in codes if c]
         if not lowered:
             return {}
 
-        batch_size = 500
-        batches = [lowered[i:i + batch_size] for i in range(0, len(lowered), batch_size)]
-
-        if len(batches) <= 1:
-            # 只有 1 批，直接串行，没必要开线程池
-            result: Dict[str, Dict[str, Any]] = {}
-            self._fetch_single_quote_batch(batches[0], result, timeout)
-            return result
-
-        # 多批并发
-        import concurrent.futures
         result: Dict[str, Dict[str, Any]] = {}
-        lock = threading.Lock()
-        max_workers = min(len(batches), 5)
-
-        def _fetch_batch(batch):
-            local: Dict[str, Dict[str, Any]] = {}
-            self._fetch_single_quote_batch(batch, local, timeout)
-            if local:
-                with lock:
-                    result.update(local)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = [pool.submit(_fetch_batch, b) for b in batches]
-            concurrent.futures.wait(futures, timeout=timeout + 5)
-
-        return result
-
-    def _fetch_single_quote_batch(
-        self, batch: List[str], result: Dict[str, Dict[str, Any]], timeout: int
-    ):
-        """单批次行情请求（内部辅助，供并发调用）"""
         get_tencent_limiter().wait()
         try:
             resp = requests.get(
-                f"https://qt.gtimg.cn/q={','.join(batch)}",
+                f"https://qt.gtimg.cn/q={','.join(lowered)}",
                 headers=get_request_headers(referer=_tc_quote_referers.next()),
                 timeout=timeout,
             )
             resp.encoding = "gbk"
         except Exception:
-            return
+            return result
+
+        # 构建 code→原始输入 的反查，用于匹配
+        code_set = set(lowered)
 
         for line in (resp.text or "").strip().split("\n"):
             line = line.strip().rstrip(";")
@@ -385,34 +359,35 @@ class TencentDataSource:
                 parts = data.strip('"').split("~")
                 if len(parts) < 6 or not parts[1]:
                     continue
-                for c in batch:
-                    if c in var_name:
-                        last = float(parts[3]) if parts[3] else 0
-                        if last <= 0:
-                            break
-                        prev = float(parts[4]) if parts[4] else 0
-                        chg = round(last - prev, 4) if prev else 0
-                        vol = float(parts[6]) if len(parts) > 6 and parts[6] else 0
-                        raw_time = parts[30].strip() if len(parts) > 30 and parts[30] else ""
-                        # 统一格式: "20260510150000" → "2026-05-10 15:00:00"
-                        time_str = ""
-                        if len(raw_time) == 14 and raw_time.isdigit():
-                            time_str = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]} {raw_time[8:10]}:{raw_time[10:12]}:{raw_time[12:14]}"
-                        result[c] = {
-                            "last": last, "close": last, "change": chg,
-                            "changePercent": round(chg / prev * 100, 2) if prev else 0,
-                            "high": float(parts[33]) if len(parts) > 33 and parts[33] else last,
-                            "low": float(parts[34]) if len(parts) > 34 and parts[34] else last,
-                            "open": float(parts[5]) if parts[5] else last,
-                            "previousClose": prev,
-                            "volume": vol * 100,
-                            "amount": 0,
-                            "time": time_str,
-                            "name": parts[1].strip(),
-                            "symbol": parts[2].strip(),
-                        }
-                        break
+                # 从 var_name 中提取 code（如 v_sz000001 → sz000001）
+                matched_code = var_name.split("_")[-1].strip().lower()
+                if matched_code not in code_set:
+                    continue
+                last = float(parts[3]) if parts[3] else 0
+                if last <= 0:
+                    continue
+                prev = float(parts[4]) if parts[4] else 0
+                chg = round(last - prev, 4) if prev else 0
+                vol = float(parts[6]) if len(parts) > 6 and parts[6] else 0
+                raw_time = parts[30].strip() if len(parts) > 30 and parts[30] else ""
+                time_str = ""
+                if len(raw_time) == 14 and raw_time.isdigit():
+                    time_str = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]} {raw_time[8:10]}:{raw_time[10:12]}:{raw_time[12:14]}"
+                result[matched_code] = {
+                    "last": last, "change": chg,
+                    "changePercent": round(chg / prev * 100, 2) if prev else 0,
+                    "high": float(parts[33]) if len(parts) > 33 and parts[33] else last,
+                    "low": float(parts[34]) if len(parts) > 34 and parts[34] else last,
+                    "open": float(parts[5]) if parts[5] else last,
+                    "previousClose": prev,
+                    "volume": vol * 100,
+                    "time": time_str,
+                    "name": parts[1].strip(),
+                    "symbol": parts[2].strip(),
+                }
             except Exception:
                 continue
+
+        return result
 
 

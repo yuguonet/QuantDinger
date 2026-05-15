@@ -203,6 +203,108 @@ atexit.register(_timeout_pool.shutdown, wait=False)
 # 输入标准化 — 统一的 symbols 去重+加前缀
 # ================================================================
 
+def _is_valid_quote(quote: Any, strict: bool = False) -> bool:
+    """
+    OHLCV 校验 — 检查行情快照数据是否合理。
+
+    基础规则 (strict=False):
+      - 必须是 dict
+      - last > 0 (必须有有效价格)
+      - open/high/low ≥ 0 (可以等于0表示停牌/未成交)
+      - high ≥ low (当两者都 >0 时)
+      - volume ≥ 0
+
+    严格规则 (strict=True), 额外检查:
+      - open 在 [low, high] 区间内 (当三者都 >0 时)
+      - last 在 [low, high] 区间内 (当三者都 >0 时)
+      - 涨跌幅不超过 ±30% (考虑ST/北交所/新股等情况放宽)
+
+    Args:
+        quote: 行情字典
+        strict: 是否启用严格模式
+
+    Returns:
+        True = 数据可用, False = 应丢弃
+    """
+    if not isinstance(quote, dict):
+        return False
+    last = quote.get("last", 0)
+    if not last or last <= 0:
+        return False
+    high = quote.get("high", 0)
+    low = quote.get("low", 0)
+    open_p = quote.get("open", 0)
+
+    # 基础: 非负 + high ≥ low
+    if high < 0 or low < 0 or open_p < 0:
+        return False
+    if high > 0 and low > 0 and high < low:
+        return False
+    vol = quote.get("volume", 0)
+    if vol is not None and vol < 0:
+        return False
+
+    if not strict:
+        return True
+
+    # 严格: 区间校验 — open/last 必须在 [low, high] 内
+    if low > 0 and high > 0:
+        if open_p > 0 and (open_p < low * 0.99 or open_p > high * 1.01):
+            return False
+        if last < low * 0.99 or last > high * 1.01:
+            return False
+
+    # 严格: 涨跌幅校验 — prev_close > 0 时，变动不超过 ±30%
+    prev = quote.get("prev_close", 0) or quote.get("previousClose", 0)
+    if prev and prev > 0:
+        change_pct = abs(last - prev) / prev
+        if change_pct > 0.30:
+            return False
+
+    return True
+
+
+def _normalize_quote_key(key: str) -> str:
+    """
+    将行情结果的 key 归一化为纯 6 位数字代码。
+
+    处理各种前缀:
+      "sh600519" → "600519"
+      "sz000001" → "000001"
+      "SH600519" → "600519"
+      "cn_600519" → "600519"
+      "600519"   → "600519"
+    """
+    from app.data_sources.normalizer import strip_market_prefix
+    return strip_market_prefix(key)
+
+
+def _extract_ohlcv_stats(quotes: Dict[str, Dict[str, Any]]) -> Dict[str, int]:
+    """
+    统计 OHLCV 校验结果。
+
+    Returns:
+        {"total": N, "valid": N, "invalid": N, "reasons": {...}}
+    """
+    stats = {"total": 0, "valid": 0, "invalid": 0}
+    reasons: Dict[str, int] = {}
+    for k, v in quotes.items():
+        stats["total"] += 1
+        if _is_valid_quote(v):
+            stats["valid"] += 1
+        else:
+            stats["invalid"] += 1
+            # 归类失败原因
+            if not isinstance(v, dict):
+                reasons["not_dict"] = reasons.get("not_dict", 0) + 1
+            elif not v.get("last") or v.get("last", 0) <= 0:
+                reasons["no_last"] = reasons.get("no_last", 0) + 1
+            else:
+                reasons["ohlc_invalid"] = reasons.get("ohlc_invalid", 0) + 1
+    stats["reasons"] = reasons
+    return stats
+
+
 def _normalize_symbols(symbols, market: str) -> List[str]:
     """
     输入标准化: 给 symbols 加市场前缀 + 去重（保序）。
@@ -227,42 +329,6 @@ def _normalize_symbols(symbols, market: str) -> List[str]:
             seen.add(ns)
             result.append(ns)
     return result
-
-
-def _adjust_quotes(quotes: Dict[str, Dict[str, Any]]) -> None:
-    """
-    对批量行情做前复权（原地修改）。
-
-    将每个 quote 包装为单 bar kline，调用 apply_fwd_adjust 复权后回写 OHLC。
-    quote 需包含 close/open/high/low/volume/time 字段。
-    复权失败时保留原始不复权价格（不中断流程）。
-    """
-    from app.data_sources.provider.adjustment import apply_fwd_adjust
-
-    for code, q in quotes.items():
-        close = q.get("close", q.get("last", 0))
-        if not close:
-            continue
-        bar = {
-            "time": q.get("time", ""),
-            "open": q.get("open", 0),
-            "high": q.get("high", 0),
-            "low": q.get("low", 0),
-            "close": close,
-            "volume": q.get("volume", 0),
-        }
-        try:
-            adjusted = apply_fwd_adjust([bar], code)
-        except Exception as e:
-            logger.warning("[复权] %s 失败，保留不复权价格: %s", code, e)
-            continue
-        if adjusted and len(adjusted) == 1:
-            ab = adjusted[0]
-            q["open"] = ab["open"]
-            q["high"] = ab["high"]
-            q["low"] = ab["low"]
-            q["close"] = ab["close"]
-            q["last"] = ab["close"]
 
 
 def _is_valid_kline(bars) -> bool:
@@ -1082,11 +1148,14 @@ class Coordinator:
                 cfg.record(False, 0)
                 logger.debug("[协助层] ticker %s %s 失败: %s", source_name, symbol, e)
 
-        with concurrent.futures.ThreadPoolExecutor(
+        pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=len(available), thread_name_prefix="ticker-race"
-        ) as pool:
+        )
+        try:
             futures = [pool.submit(_race_one, name, fn) for name, fn in available]
             done_event.wait(timeout=timeout)
+        finally:
+            pool.shutdown(wait=False)
 
         if result_holder:
             source_name, result = result_holder[0]
@@ -1127,10 +1196,8 @@ class Coordinator:
           - key 统一为纯数字代码 (600519)
           - quote["symbol"] 统一为纯数字代码
           - quote["name"] 若与 symbol 重复则清空
-          - OHLC 前复权（Provider 返回不复权原始价，此处统一做前复权）
         """
         from app.data_sources.normalizer import strip_market_prefix
-
         out: Dict[str, Dict[str, Any]] = {}
         for key, quote in raw.items():
             digits = strip_market_prefix(key)
@@ -1140,11 +1207,6 @@ class Coordinator:
                 if raw_name and strip_market_prefix(raw_name) == digits:
                     quote["name"] = ""
             out[digits] = quote
-
-        # ── 前复权: 将 quote 包装为单 bar kline 列表，批量复权后回写 ──
-        if out:
-            _adjust_quotes(out)
-
         return out
 
     @staticmethod
@@ -1172,7 +1234,7 @@ class Coordinator:
         批量行情获取 — 自适应双模式调度。
 
         输入: symbols 可以是纯数字 (600519) 或带前缀 (SH600519)，内部自动加前缀。
-        输出: key 统一为纯数字 (600519)，name/symbol 字段标准化，OHLC 前复权。
+        输出: key 统一为纯数字 (600519)，name/symbol 字段标准化。
 
         模式选择:
           ≤ 500 只: RACE 模式 — 多源并发抢答，第一个返回非空结果的直接用
@@ -1222,7 +1284,7 @@ class Coordinator:
         else:
             raw = self._batch_quotes_dispatch(normalized_symbols, available, timeout)
 
-        # ── 输出标准化: key 去前缀，name/symbol 统一 + 前复权 ──
+        # ── 输出标准化: key 去前缀，name/symbol 统一 ──
         return self._normalize_batch_quotes_result(raw)
 
     # ── RACE 模式: 多源并发抢答（≤500 只） ──
@@ -1236,6 +1298,10 @@ class Coordinator:
         """
         RACE 模式 — 所有源并发请求同一组 symbols，第一个返回非空结果的直接用。
         如果赢家未覆盖全部 symbols，剩余的从其他源补充。
+
+        关键改动:
+          - 所有源返回结果统一归一化为纯数字 key 后再合并
+          - OHLCV 校验: 失败的 symbol 放回队列让其他源补充
         """
         done_event = threading.Event()
         lock = threading.Lock()
@@ -1254,15 +1320,24 @@ class Coordinator:
                 result = provider.fetch_batch_quotes(symbols, timeout=timeout)
                 elapsed = time.time() - start
                 if result and not done_event.is_set():
+                    # ── 归一化: 所有源的 key 统一为纯数字 ──
+                    normalized = {}
+                    for k, v in result.items():
+                        digits = _normalize_quote_key(k)
+                        if digits:
+                            normalized[digits] = v
+                    if not normalized:
+                        cfg.record(False, elapsed)
+                        return
                     with lock:
                         if not done_event.is_set():
-                            winner = result
+                            winner = normalized
                             winner_name = provider.name
                             _realtime_cb.record_success(provider.name)
                             cfg.record(True, elapsed)
                             done_event.set()
                             logger.info("[协助层] batch_quotes RACE %d只 命中 %s (%.2fs)",
-                                        len(result), provider.name, elapsed)
+                                        len(normalized), provider.name, elapsed)
                 elif not result:
                     cfg.record(False, elapsed)
                     _realtime_cb.record_failure(provider.name, "empty")
@@ -1272,25 +1347,38 @@ class Coordinator:
                 _realtime_cb.record_failure(provider.name, str(e))
                 logger.debug("[协助层] batch_quotes RACE %s 失败: %s", provider.name, e)
 
-        with concurrent.futures.ThreadPoolExecutor(
+        pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=len(available), thread_name_prefix="bq-race"
-        ) as pool:
+        )
+        try:
             futures = [pool.submit(_race_one, p) for p in available]
             done_event.wait(timeout=timeout)
+        finally:
+            pool.shutdown(wait=False)
 
         if not winner:
             logger.warning("[协助层] batch_quotes RACE %d只 所有源失败", len(symbols))
             return winner
 
-        # ── 赢家未覆盖全部 symbols → 从剩余源补充 ──
-        from app.data_sources.normalizer import add_market_prefix, strip_market_prefix
-        requested_set = set(add_market_prefix(s, "CNStock") for s in symbols)
-        # winner 的 key 可能带前缀也可能不带，统一为纯数字
-        covered = set()
-        for k in winner:
-            covered.add(strip_market_prefix(k))
-        requested_digits = set(strip_market_prefix(s) for s in requested_set)
-        missing_digits = requested_digits - covered
+        # ── 赢家结果 OHLCV 校验 — 失败的 symbol 放回补充队列 ──
+        valid_winner: Dict[str, Dict[str, Any]] = {}
+        invalid_digits: Set[str] = set()
+        for digits, quote in winner.items():
+            if _is_valid_quote(quote, strict=True):
+                valid_winner[digits] = quote
+            else:
+                invalid_digits.add(digits)
+        if invalid_digits:
+            logger.info("[协助层] batch_quotes RACE %s OHLCV校验失败 %d 只，将从其他源补充",
+                        winner_name, len(invalid_digits))
+        winner = valid_winner
+
+        # ── 覆盖检查 + 缺失补充 ──
+        from app.data_sources.normalizer import add_market_prefix
+        requested_digits = set(_normalize_quote_key(s) for s in symbols)
+        requested_digits = {d for d in requested_digits if d}  # 去空
+        covered = set(winner.keys())
+        missing_digits = (requested_digits - covered) | invalid_digits
 
         if not missing_digits:
             return winner
@@ -1305,15 +1393,15 @@ class Coordinator:
         for provider in remaining:
             if not missing_digits:
                 break
-            # 将 missing_digits 转回带前缀形式
+            # 转回带前缀形式供 Provider 查询
             missing_symbols = [add_market_prefix(d, "CNStock") for d in missing_digits]
             try:
                 result = provider.fetch_batch_quotes(missing_symbols, timeout=timeout)
                 if result:
                     for k, v in result.items():
-                        digits = strip_market_prefix(k)
-                        if digits in missing_digits:
-                            winner[k] = v
+                        digits = _normalize_quote_key(k)
+                        if digits in missing_digits and _is_valid_quote(v, strict=True):
+                            winner[digits] = v
                             missing_digits.discard(digits)
                     _realtime_cb.record_success(provider.name)
                     logger.info(
@@ -1410,8 +1498,9 @@ class Coordinator:
                     group_idx, group_codes, retry_count = task_queue.get_nowait()
                 except Empty:
                     return
+                # 过滤已完成的: result 用纯数字 key，group_codes 可能带前缀，统一比对
                 with result_lock:
-                    remaining = [c for c in group_codes if c not in result]
+                    remaining = [c for c in group_codes if _normalize_quote_key(c) not in result]
                 if not remaining:
                     continue
                 future = _timed_submit(
@@ -1488,14 +1577,28 @@ class Coordinator:
                     provider_consecutive_timeout[name] = 0
 
                     if task_result:
+                        # ── 归一化 + OHLCV 校验: 统一纯数字 key，过滤无效数据 ──
                         with result_lock:
                             merged_count = 0
+                            invalid_codes = []
                             for sym, quote in task_result.items():
-                                if sym not in result:
-                                    result[sym] = quote
+                                digits = _normalize_quote_key(sym)
+                                if not digits:
+                                    continue
+                                if digits in result:
+                                    continue  # 已被其他源完成
+                                if _is_valid_quote(quote, strict=True):
+                                    result[digits] = quote
                                     merged_count += 1
+                                else:
+                                    invalid_codes.append(digits)
                         with stats_lock:
                             source_stats[name]["ok"] += merged_count
+                        # OHLCV 校验失败的 symbol 放回队列重试
+                        if invalid_codes and retry_count < max_group_retries:
+                            task_queue.put((group_idx, invalid_codes, retry_count + 1))
+                            logger.debug("[协助层] batch_quotes 组%d %s %d只OHLCV失败，放回重试",
+                                         group_idx, name, len(invalid_codes))
                         logger.debug("[协助层] batch_quotes 组%d %s 成功 %d只",
                                      group_idx, name, merged_count)
                         with pending_lock:
@@ -2147,29 +2250,60 @@ class Coordinator:
                 logger.warning("[记忆行情] market=%s 所有源已熔断", market)
                 return {}
 
-        # 逐源尝试
-        for provider in ordered:
+        # ── 并发获取 + 归一化合并 ──
+        merged: Dict[str, Dict[str, Any]] = {}
+        merged_lock = threading.Lock()
+        source_hit = ""
+        any_done = threading.Event()
+        requested_count = len(prefixed)
+        _COVERAGE_THRESHOLD = 0.95
+
+        def _fetch_one(provider):
+            nonlocal source_hit
             try:
                 result = provider.fetch_batch_quotes(prefixed, timeout=int(timeout))
             except Exception as e:
                 logger.debug("[记忆行情] %s 异常: %s", provider.name, e)
-                continue
-
+                any_done.set()
+                return
             if not result:
-                continue
+                any_done.set()
+                return
+            normalized = self._normalize_batch_quotes_result(result)
+            with merged_lock:
+                if not source_hit:
+                    source_hit = provider.name
+                for k, v in normalized.items():
+                    if k not in merged:
+                        merged[k] = v
+            any_done.set()
 
-            # 成功 — 记住这个源
+        pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(ordered), thread_name_prefix="sticky-bq"
+        )
+        try:
+            futures = [pool.submit(_fetch_one, p) for p in ordered]
+            # 等第一个源完成
+            any_done.wait(timeout=min(timeout, 5.0))
+            # 覆盖率足够 → 早退
+            if len(merged) >= requested_count * _COVERAGE_THRESHOLD:
+                logger.info("[记忆行情] 并发早退 %d/%d只 (覆盖率 %.1f%%, 首选 %s)",
+                            len(merged), requested_count,
+                            len(merged) / requested_count * 100, source_hit)
+                with Coordinator._sticky_lock:
+                    Coordinator._sticky_source = source_hit
+                return merged
+            # 覆盖不足 → 继续等剩余源补充
+            concurrent.futures.wait(futures, timeout=timeout + 2)
+        finally:
+            pool.shutdown(wait=False)
+
+        if merged:
             with Coordinator._sticky_lock:
-                Coordinator._sticky_source = provider.name
-
-            if sticky and provider.name != sticky:
-                logger.info("[记忆行情] 记忆源 %s 失效，切换到 %s (%d只)",
-                            sticky, provider.name, len(result))
-            elif not sticky:
-                logger.info("[记忆行情] 命中 %s (%d只)", provider.name, len(result))
-
-            # 标准化输出
-            return self._normalize_batch_quotes_result(result)
+                Coordinator._sticky_source = source_hit
+            logger.info("[记忆行情] 并发合并 %d/%d只 (首选 %s)",
+                        len(merged), len(prefixed), source_hit)
+            return merged
 
         # 全部失败 — 清除记忆
         with Coordinator._sticky_lock:

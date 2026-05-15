@@ -17,7 +17,7 @@ API来源 & 最新信息:
     分钟级约1000条: min1≈5日, min5≈1月, min15≈3月, min30≈6月, min60≈1年
     日/周/月线完整历史（day/week/month）
   - fetch_ticker: ✅ 单只实时行情（取日线最后一条）
-  - fetch_batch_quotes: ⚠️ 逐只并发调_fetch_baidu_quote（非真批量）
+  - fetch_batch_quotes: ❌ 不支持（返回NotSupportedResult）
   - fetch_market_kline: ✅ 逐只调用fetch_kline
 
 单位注意（重要）:
@@ -203,7 +203,6 @@ def _fetch_baidu_quote(code: str) -> Optional[Dict[str, Any]]:
 
     return {
         "last": last,
-        "close": last,
         "change": chg,
         "changePercent": round(chg / prev * 100, 2) if prev else 0,
         "high": high,
@@ -211,7 +210,6 @@ def _fetch_baidu_quote(code: str) -> Optional[Dict[str, Any]]:
         "open": open_p,
         "previousClose": prev,
         "volume": vol,
-        "amount": 0,
         "time": str(parts[1])[:10] if len(parts) > 1 else "",
         "name": "",
         "symbol": cn_code,
@@ -260,8 +258,7 @@ class BaiduDataSource:
         "kline_batch_priority": 50,
         "quote": True,
         "quote_priority": 50,
-        "batch_quote": True,
-        "batch_quote_priority": 50,
+        "batch_quote": False,
         "hk": False,
         "markets": {"CNStock"},
     }
@@ -318,23 +315,4 @@ class BaiduDataSource:
         return _fetch_baidu_quote(code)
 
     def fetch_batch_quotes(self, codes: List[str], timeout: int = 10) -> Dict[str, Dict[str, Any]]:
-        """批量实时行情 — 并发逐只获取"""
-        result: Dict[str, Dict[str, Any]] = {}
-        lock = threading.Lock()
-
-        def _fetch(code):
-            q = _fetch_baidu_quote(code)
-            if q:
-                with lock:
-                    result[_cn(code)] = q
-
-        max_workers = min(len(codes), 10)
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futs = [pool.submit(_fetch, c) for c in codes]
-            for f in futs:
-                try:
-                    f.result()
-                except Exception:
-                    pass
-
-        return result
+        return NotSupportedResult(self.name, "fetch_batch_quotes")

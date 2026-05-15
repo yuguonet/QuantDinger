@@ -13,7 +13,7 @@ API来源 & 最新信息:
   - K线: ✅ 1m/5m/15m/30m/1H（1m数据聚合，仅当天数据）
   - K线 1D/1W: ❌ 不支持（API只返回当天数据，不够聚合）
   - fetch_ticker: ✅ 用全天1m最新bar的close作为当前价
-  - fetch_batch_quotes: ⚠️ 逐只并发调_fetch_em_trends2_quote（非真批量）
+  - fetch_batch_quotes: ❌ 不支持（返回NotSupportedResult）
   - fetch_market_kline: ✅ 并发获取全市场K线
 
 单位注意（重要）:
@@ -158,7 +158,6 @@ def _switch_cdn():
             next_idx = 0
         _cdn_host = _CDN_CANDIDATES[next_idx]
         _cdn_discovered = True
-        logger.warning("[em_trends2] CDN 切换: → %s", _cdn_host)
 
 
 # ================================================================
@@ -409,7 +408,6 @@ def _fetch_em_trends2_quote(code: str) -> Optional[Dict[str, Any]]:
 
     return {
         "last": last,
-        "close": last,
         "change": 0,
         "changePercent": 0,
         "high": max(highs) if highs else last,
@@ -417,7 +415,6 @@ def _fetch_em_trends2_quote(code: str) -> Optional[Dict[str, Any]]:
         "open": open_p,
         "previousClose": 0,
         "volume": vol,
-        "amount": 0,
         "time": "",
         "name": "",
         "symbol": code,
@@ -466,8 +463,7 @@ class EmTrends2DataSource:
         "kline_batch_priority": 5,
         "quote": True,
         "quote_priority": 5,
-        "batch_quote": True,
-        "batch_quote_priority": 5,
+        "batch_quote": False,
         "hk": False,
         "markets": {"CNStock"},
     }
@@ -525,28 +521,7 @@ class EmTrends2DataSource:
         return _fetch_em_trends2_quote(code)
 
     def fetch_batch_quotes(self, codes: List[str], timeout: int = 10) -> Dict[str, Dict[str, Any]]:
-        """批量实时行情 — 并发直接调 _fetch_em_trends2_quote"""
-        result: Dict[str, Dict[str, Any]] = {}
-        lock = threading.Lock()
-
-        def _fetch(code):
-            q = _fetch_em_trends2_quote(code)
-            if q:
-                # key 统一用纯数字代码（去掉 sh/sz 前缀）
-                digits = code.strip().upper().replace("SH", "").replace("SZ", "").replace("BJ", "")
-                with lock:
-                    result[digits] = q
-
-        max_workers = min(len(codes), 30)
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futs = [pool.submit(_fetch, c) for c in codes]
-            for f in futs:
-                try:
-                    f.result()
-                except Exception:
-                    pass
-
-        return result
+        return NotSupportedResult(self.name, "fetch_batch_quotes")
 
     def _get_stock_list(self) -> list:
         """获取A股股票列表（通过东财 clist API）"""

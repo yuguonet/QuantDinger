@@ -261,6 +261,7 @@ class EastMoneyDataSource:
     name = "eastmoney"
     priority = 25
     max_concurrency = MAX_CONCURRENCY
+    batch_size = 400      # clist API 一次可拿全市场
     min_interval = 0.0
     jitter_min = 0.0
     jitter_max = 0.0
@@ -478,14 +479,13 @@ class EastMoneyDataSource:
         time_str = now.strftime("%Y-%m-%d %H:%M:%S")
         return {
             "last": last,
-            "close": last,
             "change": chg,
             "changePercent": round(chg / prev * 100, 2) if prev else 0.0,
             "high": _f("f44") / 100,
             "low": _f("f45") / 100,
             "open": _f("f46") / 100,
             "previousClose": prev,
-            "volume": vol, "amount": 0, "time": time_str,
+            "volume": vol, "time": time_str,
             "name": str(d.get("f58", "")).strip(),
             "symbol": secid,
         }
@@ -549,7 +549,6 @@ class EastMoneyDataSource:
                 vol = float(item.get("f5", 0) or 0) * 100  # f5返回"手"，×100转"股"
                 result[sym] = {
                     "last": last,
-                    "close": last,
                     "change": chg,
                     "changePercent": round(chg / prev * 100, 2) if prev else 0.0,
                     "high": round(float(item.get("f15", 0)), 4),

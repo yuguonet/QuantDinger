@@ -14,7 +14,7 @@ API来源 & 最新信息:
 支持的功能:
   - K线: ✅ 全周期 1m/5m/15m/30m/1H/1D/1W（原生前复权）
   - fetch_ticker: ✅ 单只实时行情（quote.json）
-  - fetch_batch_quotes: ⚠️ 逐只并发调_fetch_ticker（非真批量，限流较严）
+  - fetch_batch_quotes: ❌ 不支持（返回NotSupportedResult）
   - fetch_market_kline: ✅ 逐只调用fetch_kline
 
 单位注意（重要）:
@@ -260,7 +260,6 @@ def _fetch_ticker(code: str) -> Optional[Dict[str, Any]]:
 
         return {
             "last": last,
-            "close": last,
             "change": chg,
             "changePercent": round(chg / prev * 100, 2) if prev else 0,
             "high": float(quote.get("high", 0) or last),
@@ -268,7 +267,6 @@ def _fetch_ticker(code: str) -> Optional[Dict[str, Any]]:
             "open": float(quote.get("open", 0) or last),
             "previousClose": prev,
             "volume": vol,
-            "amount": 0,
             "time": "",
             "name": quote.get("name", ""),
             "symbol": symbol,
@@ -318,8 +316,7 @@ class XueqiuDataSource:
         "kline_batch_priority": 40,
         "quote": True,
         "quote_priority": 40,
-        "batch_quote": True,
-        "batch_quote_priority": 40,
+        "batch_quote": False,
         "hk": False,
         "markets": {"CNStock"},
     }
@@ -382,23 +379,4 @@ class XueqiuDataSource:
         return _fetch_ticker(code)
 
     def fetch_batch_quotes(self, codes: List[str], timeout: int = 10) -> Dict[str, Dict[str, Any]]:
-        """不支持批量行情（逐个获取）"""
-        result: Dict[str, Dict[str, Any]] = {}
-        lock = threading.Lock()
-
-        def _fetch(code):
-            q = _fetch_ticker(code)
-            if q:
-                with lock:
-                    result[normalize_cn_code(code)] = q
-
-        max_workers = min(len(codes), 5)
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futs = [pool.submit(_fetch, c) for c in codes]
-            for f in futs:
-                try:
-                    f.result()
-                except Exception:
-                    pass
-
-        return result
+        return NotSupportedResult(self.name, "fetch_batch_quotes")
