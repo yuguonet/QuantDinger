@@ -37,6 +37,12 @@ _RAW_TIMEFRAMES = {"15m", "1D"}
 # 与 MarketKlineWriter._AGG_TARGETS 对齐
 _AGG_TIMEFRAMES = {"30m", "1h", "2h", "4h", "1W", "1M"}
 
+# 周期对应的秒数（用于 DB 数据时效性判断）
+_BAR_SECONDS = {
+    "15m": 900, "30m": 1800, "1h": 3600,
+    "2h": 7200, "4h": 14400, "1D": 86400,
+}
+
 # DB 数据新鲜度：最新 bar 的日期必须 >= 上一个交易日
 # 使用 trading_calendar 模块精确判断，不再依赖固定天数
 
@@ -214,6 +220,18 @@ class CNStockDataSource(BaseDataSource):
                     f"最新={latest_date}, 要求>={cutoff}"
                 )
                 return []
+
+            # 时效性判断：最新 bar 不能超过 2 个 bar 周期
+            bar_sec = _BAR_SECONDS.get(tf)
+            if bar_sec:
+                staleness = now_ts - latest_ts
+                if staleness > bar_sec * 2:
+                    logger.debug(
+                        f"[DB] {symbol}/{tf} 数据过旧: "
+                        f"最新bar={datetime.fromtimestamp(latest_ts):%Y-%m-%d %H:%M}, "
+                        f"距今{staleness/bar_sec:.1f}个bar周期, 超过2个"
+                    )
+                    return []
 
         # ── 转换为标准格式（time 转 Unix 秒）──
         bars = []

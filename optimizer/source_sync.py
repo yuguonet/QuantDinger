@@ -994,6 +994,8 @@ def main():
         help="指定首选数据源")
     parser.add_argument("--adj", default="qfq", choices=["qfq", "hfq", ""],
         help="复权方式")
+    parser.add_argument("--start-date", default="",
+        help="数据起始日期 (YYYY-MM-DD)，默认为当天")
     parser.add_argument("--price-tolerance", type=float, default=0.02,
         help="(已废弃) 涨跌幅检查容差，涨跌幅校验已移除")
     parser.add_argument("--dry-run", action="store_true",
@@ -1020,10 +1022,10 @@ def main():
     # 日期范围
     now_date = datetime.now(TZ_SH).strftime('%Y-%m-%d')
 
-    if args.type == "15m":
-        start_date = "2024-01-01"
+    if args.start_date:
+        start_date = args.start_date
     else:
-        start_date = "2021-01-01"
+        start_date = now_date
     end_date = now_date
 
     from app.utils.db_market import get_market_kline_writer, get_market_db_manager

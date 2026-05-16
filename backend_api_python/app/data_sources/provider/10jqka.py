@@ -62,6 +62,12 @@ _THS_MIN_TFS = {"1m", "5m", "15m", "30m", "1H"}
 
 def _to_ths_params(code):
     market, digits = detect_market(code)
+    # detect_market 无法识别无前缀代码(如 "999999")，尝试加前缀后再检测
+    if not market:
+        from app.data_sources.normalizer import add_market_prefix
+        prefixed = add_market_prefix(code, "CNStock")
+        if prefixed != code:
+            market, digits = detect_market(prefixed)
     if not market or not digits: return None
     mkt = _THS_MARKET.get(market)
     if mkt is None: return None
