@@ -14,7 +14,7 @@ API来源 & 最新信息:
   - K线: ✅ 全周期 1m/5m/15m/30m/1H/1D/1W
   - fetch_ticker: ✅ 单只实时行情（qt.gtimg.cn）
   - fetch_batch_quotes: ✅ 原生批量（qt.gtimg.cn/q=a,b,c 500只/批）
-  - fetch_market_kline: ✅ 逐只调用fetch_kline
+
   - 港股: ✅ 支持港股K线和行情
 
 单位注意（重要）:
@@ -171,7 +171,6 @@ class TencentDataSource:
     name = "tencent"
     priority = 10
     max_concurrency = MAX_CONCURRENCY
-    batch_size = 500       # 单次 fetch_batch_quotes 最多处理 500 只
     min_interval = 1.0
     jitter_min = 0.5
     jitter_max = 1.5
@@ -193,18 +192,18 @@ class TencentDataSource:
         self, code: str, timeframe: str = "1D", count: int = 300,
         adj: str = "qfq", timeout: int = 10,
         start_date: str = "", end_date: str = "",
-    ) -> List[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         if start_date:
             from app.data_sources.provider import calc_kline_count
             count = calc_kline_count(timeframe, start_date, end_date)
 
         c = _lower(to_tencent_code(code))
         if not c:
-            return []
+            return {}
 
         endpoint, tc_tf = _TF_MAP.get(timeframe, (None, None))
         if not endpoint:
-            return []
+            return {}
 
         if endpoint == "mkline":
             url = "https://ifzq.gtimg.cn/appstock/app/kline/mkline"
@@ -220,21 +219,21 @@ class TencentDataSource:
 
         if resp.status_code != 200:
             logger.warning("[tencent] %s %s HTTP %s", timeframe, c, resp.status_code)
-            return []
+            return {}
 
         try:
             data = resp.json()
         except Exception:
             logger.warning("[tencent] %s %s JSON解析失败, body前100字: %s", timeframe, c, (resp.text or "")[:100])
-            return []
+            return {}
 
         if not isinstance(data, dict) or int(data.get("code", 0)) != 0:
-            return []
+            return {}
 
         root = (data.get("data") or {}).get(c)
         if not isinstance(root, dict):
             logger.warning("[tencent] %s %s root不是dict, data.keys=%s", timeframe, c, list((data.get("data") or {}).keys()))
-            return []
+            return {}
 
         rows = None
         if endpoint == "mkline":
@@ -249,30 +248,10 @@ class TencentDataSource:
                         rows = v
                         break
 
-        return _rows_to_dicts(rows, timeframe) if isinstance(rows, list) else []
-
-    def fetch_market_kline(
-        self, timeframe: str, count: int = 300,
-        adj: str = "qfq", timeout: int = 15,
-        start_date: str = "", end_date: str = "",
-        symbols: Optional[List[str]] = None,
-    ) -> Dict[str, List[Dict[str, Any]]]:
-        """批量K线 — Coordinator 统管线程+限流，本方法逐只调用 fetch_kline"""
-        if not symbols:
+        bars = _rows_to_dicts(rows, timeframe) if isinstance(rows, list) else []
+        if not bars:
             return {}
-        result: Dict[str, List[Dict[str, Any]]] = {}
-        for code in symbols:
-            try:
-                bars = self.fetch_kline(
-                    code, timeframe, count,
-                    adj=adj, timeout=timeout,
-                    start_date=start_date, end_date=end_date,
-                )
-                if bars:
-                    result[code] = bars
-            except Exception as e:
-                logger.debug("[fetch_market_kline] %s 失败: %s", code, e)
-        return result
+        return {"bars": bars, "count": len(bars)}
 
     def fetch_ticker(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
         c = _lower(to_tencent_code(code))
@@ -328,27 +307,54 @@ class TencentDataSource:
         }
 
     def fetch_batch_quotes(self, codes: List[str], timeout: int = 10) -> Dict[str, Dict[str, Any]]:
-        """单批行情请求 — 由 Coordinator 控制批量大小和并发，本方法不做分批。"""
         if not codes:
             return {}
         lowered = [_lower(to_tencent_code(c)) for c in codes if c]
         if not lowered:
             return {}
 
+        batch_size = 500
+        batches = [lowered[i:i + batch_size] for i in range(0, len(lowered), batch_size)]
+
+        if len(batches) <= 1:
+            # 只有 1 批，直接串行，没必要开线程池
+            result: Dict[str, Dict[str, Any]] = {}
+            self._fetch_single_quote_batch(batches[0], result, timeout)
+            return result
+
+        # 多批并发
+        import concurrent.futures
         result: Dict[str, Dict[str, Any]] = {}
+        lock = threading.Lock()
+        max_workers = min(len(batches), 5)
+
+        def _fetch_batch(batch):
+            local: Dict[str, Dict[str, Any]] = {}
+            self._fetch_single_quote_batch(batch, local, timeout)
+            if local:
+                with lock:
+                    result.update(local)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(_fetch_batch, b) for b in batches]
+            concurrent.futures.wait(futures, timeout=timeout + 5)
+
+        return result
+
+    def _fetch_single_quote_batch(
+        self, batch: List[str], result: Dict[str, Dict[str, Any]], timeout: int
+    ):
+        """单批次行情请求（内部辅助，供并发调用）"""
         get_tencent_limiter().wait()
         try:
             resp = requests.get(
-                f"https://qt.gtimg.cn/q={','.join(lowered)}",
+                f"https://qt.gtimg.cn/q={','.join(batch)}",
                 headers=get_request_headers(referer=_tc_quote_referers.next()),
                 timeout=timeout,
             )
             resp.encoding = "gbk"
         except Exception:
-            return result
-
-        # 构建 code→原始输入 的反查，用于匹配
-        code_set = set(lowered)
+            return
 
         for line in (resp.text or "").strip().split("\n"):
             line = line.strip().rstrip(";")
@@ -359,35 +365,33 @@ class TencentDataSource:
                 parts = data.strip('"').split("~")
                 if len(parts) < 6 or not parts[1]:
                     continue
-                # 从 var_name 中提取 code（如 v_sz000001 → sz000001）
-                matched_code = var_name.split("_")[-1].strip().lower()
-                if matched_code not in code_set:
-                    continue
-                last = float(parts[3]) if parts[3] else 0
-                if last <= 0:
-                    continue
-                prev = float(parts[4]) if parts[4] else 0
-                chg = round(last - prev, 4) if prev else 0
-                vol = float(parts[6]) if len(parts) > 6 and parts[6] else 0
-                raw_time = parts[30].strip() if len(parts) > 30 and parts[30] else ""
-                time_str = ""
-                if len(raw_time) == 14 and raw_time.isdigit():
-                    time_str = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]} {raw_time[8:10]}:{raw_time[10:12]}:{raw_time[12:14]}"
-                result[matched_code] = {
-                    "last": last, "change": chg,
-                    "changePercent": round(chg / prev * 100, 2) if prev else 0,
-                    "high": float(parts[33]) if len(parts) > 33 and parts[33] else last,
-                    "low": float(parts[34]) if len(parts) > 34 and parts[34] else last,
-                    "open": float(parts[5]) if parts[5] else last,
-                    "previousClose": prev,
-                    "volume": vol * 100,
-                    "time": time_str,
-                    "name": parts[1].strip(),
-                    "symbol": parts[2].strip(),
-                }
+                for c in batch:
+                    if c in var_name:
+                        last = float(parts[3]) if parts[3] else 0
+                        if last <= 0:
+                            break
+                        prev = float(parts[4]) if parts[4] else 0
+                        chg = round(last - prev, 4) if prev else 0
+                        vol = float(parts[6]) if len(parts) > 6 and parts[6] else 0
+                        raw_time = parts[30].strip() if len(parts) > 30 and parts[30] else ""
+                        # 统一格式: "20260510150000" → "2026-05-10 15:00:00"
+                        time_str = ""
+                        if len(raw_time) == 14 and raw_time.isdigit():
+                            time_str = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]} {raw_time[8:10]}:{raw_time[10:12]}:{raw_time[12:14]}"
+                        result[c] = {
+                            "last": last, "change": chg,
+                            "changePercent": round(chg / prev * 100, 2) if prev else 0,
+                            "high": float(parts[33]) if len(parts) > 33 and parts[33] else last,
+                            "low": float(parts[34]) if len(parts) > 34 and parts[34] else last,
+                            "open": float(parts[5]) if parts[5] else last,
+                            "previousClose": prev,
+                            "volume": vol * 100,
+                            "time": time_str,
+                            "name": parts[1].strip(),
+                            "symbol": parts[2].strip(),
+                        }
+                        break
             except Exception:
                 continue
-
-        return result
 
 

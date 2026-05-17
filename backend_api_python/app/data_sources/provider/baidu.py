@@ -18,7 +18,7 @@ API来源 & 最新信息:
     日/周/月线完整历史（day/week/month）
   - fetch_ticker: ✅ 单只实时行情（取日线最后一条）
   - fetch_batch_quotes: ❌ 不支持（返回NotSupportedResult）
-  - fetch_market_kline: ✅ 逐只调用fetch_kline
+
 
 单位注意（重要）:
   - fetch_kline: volume(parts[4])直接是"股"，不需要×100
@@ -278,37 +278,16 @@ class BaiduDataSource:
         self, code: str, timeframe: str = "1D", count: int = 200,
         adj: str = "qfq", timeout: int = 10,
         start_date: str = "", end_date: str = "",
-    ) -> List[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """获取单只股票K线。支持 1D/1W/1M。"""
         ktype = self._TF_MAP.get(timeframe)
         if not ktype:
             return NotSupportedResult(self.name, "fetch_kline", f"百度API不支持 {timeframe}，仅支持 {set(self._TF_MAP.keys())}")
 
         data = _fetch_baidu_kline(code, ktype=ktype, limit=count)
-        return data if data else []
-
-    def fetch_market_kline(
-        self, timeframe: str, count: int = 300,
-        adj: str = "qfq", timeout: int = 15,
-        start_date: str = "", end_date: str = "",
-        symbols: Optional[List[str]] = None,
-    ) -> Dict[str, List[Dict[str, Any]]]:
-        """批量K线 — Coordinator 统管线程+限流，本方法逐只调用 fetch_kline"""
-        if not symbols:
+        if not data:
             return {}
-        result: Dict[str, List[Dict[str, Any]]] = {}
-        for code in symbols:
-            try:
-                bars = self.fetch_kline(
-                    code, timeframe, count,
-                    adj=adj, timeout=timeout,
-                    start_date=start_date, end_date=end_date,
-                )
-                if bars:
-                    result[code] = bars
-            except Exception as e:
-                logger.debug("[fetch_market_kline] %s 失败: %s", code, e)
-        return result
+        return {"bars": data, "count": len(data)}
 
     def fetch_ticker(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
         """获取单只股票实时行情"""

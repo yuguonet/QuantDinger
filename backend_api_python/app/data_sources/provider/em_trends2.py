@@ -14,7 +14,7 @@ API来源 & 最新信息:
   - K线 1D/1W: ❌ 不支持（API只返回当天数据，不够聚合）
   - fetch_ticker: ✅ 用全天1m最新bar的close作为当前价
   - fetch_batch_quotes: ❌ 不支持（返回NotSupportedResult）
-  - fetch_market_kline: ✅ 并发获取全市场K线
+
 
 单位注意（重要）:
   - _em_trends2_raw: volume 返回的是原始值，代码中已×100转"股"
@@ -475,7 +475,7 @@ class EmTrends2DataSource:
         self, code: str, timeframe: str = "15m", count: int = 200,
         adj: str = "qfq", timeout: int = 10,
         start_date: str = "", end_date: str = "",
-    ) -> List[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """
         获取单只股票K线，支持 1m/5m/15m/30m/1H。
         数据来源: 全天1min数据聚合。
@@ -487,7 +487,7 @@ class EmTrends2DataSource:
 
         data = _em_trends2_kline(code, timeframe, count)
         if not data:
-            return []
+            return {}
 
         # 统一时间格式: "YYYY-MM-DD HH:MM" → "YYYY-MM-DD HH:MM:00"
         result = []
@@ -514,7 +514,8 @@ class EmTrends2DataSource:
         if adj == "qfq" and result:
             result = apply_fwd_adjust(result, code)
 
-        return result[-count:] if len(result) > count else result
+        out = result[-count:] if len(result) > count else result
+        return {"bars": out, "count": len(out)} if out else {}
 
     def fetch_ticker(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
         """获取单只股票实时行情 — 用当天1min数据最新bar的close作为当前价"""

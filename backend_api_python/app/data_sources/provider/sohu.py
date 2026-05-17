@@ -48,7 +48,7 @@ API来源 & 最新信息:
   - K线 分钟线: ✅ 5m / 15m / 30m / 60m（历史分钟K线） + 当日1m分时
   - fetch_ticker: ✅ 通过 -1.html 心跳接口获取实时行情
   - fetch_batch_quotes: ✅ 通过 hqm getqjson 批量接口（一次请求多只）
-  - fetch_market_kline: ✅ 逐只调用fetch_kline
+
 
 单位注意（重要）:
   - fetch_kline: volume(r[7])返回"手"，代码中已×100转"股"
@@ -576,25 +576,25 @@ class SohuDataSource:
         self, code: str, timeframe: str = "1D", count: int = 200,
         adj: str = "qfq", timeout: int = 10,
         start_date: str = "", end_date: str = "",
-    ) -> List[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """获取单只股票K线。支持日/周/月线 + 5m/15m/30m/60m历史分钟线 + 当日1m分时。"""
         # 当日分时 (1m)
         if timeframe in self._INTRADAY_PERIODS:
             data = _fetch_sohu_intraday(code)
             if not data:
-                return []
+                return {}
             if count and len(data) > count:
                 data = data[-count:]  # 取最近 count 条
-            return data
+            return {"bars": data, "count": len(data)}
 
         # 历史分钟K线 (5m/15m/30m/60m)
         if timeframe in self._MINUTE_PERIODS:
             data = _fetch_sohu_minute_kline(code, timeframe, count)
             if not data:
-                return []
+                return {}
             if adj == "qfq":
                 data = _apply_fwd_adjust(data, code)
-            return data
+            return {"bars": data, "count": len(data)}
 
         # 日/周/月线 (原有逻辑)
         period = self._SOHU_PERIOD_MAP.get(timeframe)
@@ -603,36 +603,13 @@ class SohuDataSource:
 
         data = _fetch_sohu_kline(code, period, count)
         if not data:
-            return []
+            return {}
 
         # 前复权处理
         if adj == "qfq":
             data = _apply_fwd_adjust(data, code)
 
-        return data
-
-    def fetch_market_kline(
-        self, timeframe: str, count: int = 300,
-        adj: str = "qfq", timeout: int = 15,
-        start_date: str = "", end_date: str = "",
-        symbols: Optional[List[str]] = None,
-    ) -> Dict[str, List[Dict[str, Any]]]:
-        """批量K线 — Coordinator 统管线程+限流，本方法逐只调用 fetch_kline"""
-        if not symbols:
-            return {}
-        result: Dict[str, List[Dict[str, Any]]] = {}
-        for code in symbols:
-            try:
-                bars = self.fetch_kline(
-                    code, timeframe, count,
-                    adj=adj, timeout=timeout,
-                    start_date=start_date, end_date=end_date,
-                )
-                if bars:
-                    result[code] = bars
-            except Exception as e:
-                logger.debug("[fetch_market_kline] %s 失败: %s", code, e)
-        return result
+        return {"bars": data, "count": len(data)}
 
     def fetch_ticker(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
         """获取单只股票实时行情快照。

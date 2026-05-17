@@ -51,7 +51,7 @@
 ║    python -m app.services.backtest_all_cnstock --indicator-id 1   ║
 ║    python -m app.services.backtest_all_cnstock --indicator-id 1,2 --mode mid,long
 ║    python -m app.services.backtest_all_cnstock --indicator-id 1 --market 科创,创业板
-║    python -m app.services.backtest_all_cnstock --indicator-id 5,16 --workers 8 --market 沪深,创业板 --mode mid
+║    python -m app.services.backtest_all_cnstock --indicator-id 5,11,12,13,14,15,16 --workers 8 --market 沪深,创业板 --mode mid
 ║                                                                  ║
 ╚══════════════════════════════════════════════════════════════════╝
 """

@@ -15,7 +15,7 @@ API来源 & 最新信息:
   - K线: ✅ 1m/5m/15m/30m/1H/1D（不含1W）
   - fetch_ticker: ✅ 单只实时行情（hq.sinajs.cn）
   - fetch_batch_quotes: ✅ 原生批量（hq.sinajs.cn/list=a,b,c 500只/批）
-  - fetch_market_kline: ✅ 逐只调用fetch_kline
+
 
 单位注意（重要）:
   - fetch_ticker: parts[3]=最新价(元), parts[8]=成交量(股), 不需要×100
@@ -229,7 +229,6 @@ class SinaDataSource:
     name = "sina"
     priority = 15
     max_concurrency = MAX_CONCURRENCY
-    batch_size = 500       # 单次 fetch_batch_quotes 最多处理 500 只
     min_interval = 1.5
     jitter_min = 0.8
     jitter_max = 2.5
@@ -251,24 +250,26 @@ class SinaDataSource:
         self, code: str, timeframe: str = "1D", count: int = 300,
         adj: str = "qfq", timeout: int = 10,
         start_date: str = "", end_date: str = "",
-    ) -> List[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         if start_date:
             from app.data_sources.provider import calc_kline_count
             count = calc_kline_count(timeframe, start_date, end_date)
 
         sc = to_sina_code(code)
         if not sc:
-            return []
+            return {}
         scale = _SINA_TF_TO_SCALE.get(timeframe)
         if scale is None:
-            return []
+            return {}
         if timeframe != "1D":
             bars = self._fetch_minute_kline(sc, scale, count, timeout)
         else:
             bars = self._fetch_raw_daily_kline(sc, count, timeout)
         if bars and adj in ("qfq", "hfq"):
             bars = _apply_fwd_adjust(bars, code)
-        return bars
+        if not bars:
+            return {}
+        return {"bars": bars, "count": len(bars)}
 
     def _fetch_raw_daily_kline(self, sc: str, count: int, timeout: int) -> List[Dict[str, Any]]:
         # 优先 money.finance（纯 JSON，稳定），兜底 quotes.sina.cn（JSONP）
@@ -325,29 +326,6 @@ class SinaDataSource:
             pass
         return []
 
-    def fetch_market_kline(
-        self, timeframe: str, count: int = 300,
-        adj: str = "qfq", timeout: int = 15,
-        start_date: str = "", end_date: str = "",
-        symbols: Optional[List[str]] = None,
-    ) -> Dict[str, List[Dict[str, Any]]]:
-        """批量K线 — Coordinator 统管线程+限流，本方法逐只调用 fetch_kline"""
-        if not symbols:
-            return {}
-        result: Dict[str, List[Dict[str, Any]]] = {}
-        for code in symbols:
-            try:
-                bars = self.fetch_kline(
-                    code, timeframe, count,
-                    adj=adj, timeout=timeout,
-                    start_date=start_date, end_date=end_date,
-                )
-                if bars:
-                    result[code] = bars
-            except Exception as e:
-                logger.debug("[fetch_market_kline] %s 失败: %s", code, e)
-        return result
-
     def fetch_ticker(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
         sc = to_sina_code(code)
         if not sc:
@@ -386,15 +364,45 @@ class SinaDataSource:
         }
 
     def fetch_batch_quotes(self, codes: List[str], timeout: int = 10) -> Dict[str, Dict[str, Any]]:
-        """单批行情请求 — 由 Coordinator 控制批量大小和并发，本方法不做分批。"""
         if not codes:
             return {}
         sina_codes = [to_sina_code(c) for c in codes if c]
         if not sina_codes:
             return {}
 
+        batch_size = 500
+        batches = [sina_codes[i:i + batch_size] for i in range(0, len(sina_codes), batch_size)]
+
+        if len(batches) <= 1:
+            # 只有 1 批，直接串行，没必要开线程池
+            result: Dict[str, Dict[str, Any]] = {}
+            self._fetch_single_quote_batch(batches[0], result, timeout)
+            return result
+
+        # 多批并发
+        import concurrent.futures
         result: Dict[str, Dict[str, Any]] = {}
-        query = ",".join(sina_codes)
+        lock = threading.Lock()
+        max_workers = min(len(batches), 2)
+
+        def _fetch_batch(batch):
+            local: Dict[str, Dict[str, Any]] = {}
+            self._fetch_single_quote_batch(batch, local, timeout)
+            if local:
+                with lock:
+                    result.update(local)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(_fetch_batch, b) for b in batches]
+            concurrent.futures.wait(futures, timeout=timeout + 5)
+
+        return result
+
+    def _fetch_single_quote_batch(
+        self, batch: List[str], result: Dict[str, Dict[str, Any]], timeout: int
+    ):
+        """单批次行情请求（内部辅助，供并发调用）"""
+        query = ",".join(batch)
         _sina_quote_limiter.wait()
         try:
             resp = get_shared_session().get(
@@ -405,7 +413,7 @@ class SinaDataSource:
             resp.encoding = "gbk"
         except Exception as e:
             logger.warning("[新浪批量行情] 请求失败: %s", e)
-            return result
+            return
 
         for line in (resp.text or "").strip().split("\n"):
             line = line.strip().rstrip(";")
@@ -442,7 +450,5 @@ class SinaDataSource:
                 }
             except (ValueError, IndexError):
                 continue
-
-        return result
 
 

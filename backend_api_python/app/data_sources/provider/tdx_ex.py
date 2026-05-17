@@ -18,7 +18,7 @@ API来源 & 最新信息:
   - K线: ✅ 全周期 1m/5m/15m/30m/1H/1D/1W
   - fetch_ticker: ✅ 单只实时行情（get_security_quotes/get_instrument_quotes）
   - fetch_batch_quotes: ✅ 原生批量（单次请求多只，pytdx协议）
-  - fetch_market_kline: ✅ 逐只调用fetch_kline
+
   - 自动重连: 连接断了自动释放并重连
 
 单位注意（重要）:
@@ -686,7 +686,7 @@ class TdxExDataSource:
         self, code: str, timeframe: str = "15m", count: int = 300,
         adj: str = "qfq", timeout: int = 10,
         start_date: str = "", end_date: str = "",
-    ) -> List[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """获取单只股票K线，支持 1m/5m/15m/30m/1H/1D/1W"""
         if timeframe not in _TF_CATEGORIES:
             return NotSupportedResult(self.name, "fetch_kline", f"不支持 {timeframe} 周期")
@@ -703,35 +703,12 @@ class TdxExDataSource:
 
         data = self._fetch_kline_raw(code, timeframe, count)
         if not data:
-            return []
+            return {}
 
         if adj == "qfq":
             data = _apply_fwd_adjust(data, code)
 
-        return data
-
-    def fetch_market_kline(
-        self, timeframe: str, count: int = 300,
-        adj: str = "qfq", timeout: int = 15,
-        start_date: str = "", end_date: str = "",
-        symbols: Optional[List[str]] = None,
-    ) -> Dict[str, List[Dict[str, Any]]]:
-        """批量K线 — Coordinator 统管线程+限流，本方法逐只调用 fetch_kline"""
-        if not symbols:
-            return {}
-        result: Dict[str, List[Dict[str, Any]]] = {}
-        for code in symbols:
-            try:
-                bars = self.fetch_kline(
-                    code, timeframe, count,
-                    adj=adj, timeout=timeout,
-                    start_date=start_date, end_date=end_date,
-                )
-                if bars:
-                    result[code] = bars
-            except Exception as e:
-                logger.debug("[fetch_market_kline] %s 失败: %s", code, e)
-        return result
+        return {"bars": data, "count": len(data)}
 
     def fetch_ticker(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
         """获取单只股票实时行情"""

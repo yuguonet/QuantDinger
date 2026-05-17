@@ -25,15 +25,19 @@
   5. 指定源优先:     支持 preferred_source 直接指定数据源，失败后自动回退其他源
   6. Race 模式:      实时行情场景，所有源并发抢答，第一个成功的直接返回
 
-=== 四种调度模式 ===
+=== 五种调度模式 ===
 
-  模式 A — K线批量获取 (coordinate_kline):
-    多只股票 × 多个源 → 动态队列分配 → 每只股票只要有一个源成功就算成功
-    场景: 批量加载历史K线、回测数据准备、批量分析
+  模式 A — 单股K线 (coordinate_kline):
+    1只股票 × 多个源 → 顺序尝试 → 第一个成功的直接返回
+    场景: 单只股票历史K线加载
 
-  模式 B — 实时行情 Race (coordinate_ticker):
+  模式 B — 单股实时行情 Race (coordinate_ticker):
     1只股票 × 多个源 → 并发抢答 → 第一个返回有效价格的直接用
-    场景: 获取实时报价、自选股价格刷新
+    场景: 获取单只实时报价
+
+  模式 B2 — 批量实时行情 (coordinate_tickers):
+    多只股票 → 直接委托 coordinate_batch_quotes
+    场景: 自选股列表价格刷新
 
   模式 C — 批量行情 (coordinate_batch_quotes):
     长效线程 + 主池/重试池 + 硬超时 + 逐 symbol 失败追踪
@@ -43,7 +47,7 @@
   模式 D — 全市场批量K线 (coordinate_market_kline):
     长效线程 + 主池/重试池 + 硬超时 + 立即退出
     每个源按 max_concurrency 开线程，线程 cap 到实际任务量，循环取 symbol
-    场景: 全市场K线加载、全市场行情快照
+    场景: 全市场K线加载
 
 === 两种源指定方式 ===
 
@@ -58,11 +62,12 @@
 
 === 函数命名说明（容易混淆的）===
 
-  coordinate_kline  → 实际含义: "并发批量拉K线，动态队列分配多源"
-  coordinate_ticker → 实际含义: "实时行情多源Race，谁先返回用谁"
-  direct_call       → 实际含义: "直接调用，不加任何协调逻辑"
-  _mark_failed      → 实际含义: "标记某源对某symbol失败，放回队列尝试下一个源，或彻底放弃"
-  _mark_success     → 实际含义: "标记某symbol获取成功，从队列中移除"
+  coordinate_kline      → 实际含义: "单股K线，多源顺序尝试"
+  coordinate_ticker     → 实际含义: "单股实时行情Race，谁先返回用谁"
+  coordinate_tickers    → 实际含义: "批量实时行情，委托 batch_quotes"
+  coordinate_batch_quotes → 实际含义: "批量行情，多源并发消费"
+  coordinate_market_kline → 实际含义: "全市场批量K线"
+  direct_call           → 实际含义: "直接调用，不加任何协调逻辑"
 """
 
 from __future__ import annotations
@@ -189,10 +194,6 @@ def get_realtime_circuit_breaker() -> CircuitBreaker:
 # 比 SourceConfig 里的超时更严格 — 这是硬上限。
 PER_TASK_TIMEOUT = 8.0
 
-# 队列为空后等待新任务的超时（秒）。
-# worker 线程取不到任务时会阻塞等待，超时后认为所有工作已完成，退出循环。
-QUEUE_DRAIN_TIMEOUT = 3.0
-
 # 超时辅助线程池 — 长生命周期，避免每次 _fetch_with_timeout 都创建新线程池。
 # max_workers=8 足够覆盖并发的超时监控需求（实际 fetch 在主池执行，这里只是等待+取消）。
 _timeout_pool = concurrent.futures.ThreadPoolExecutor(
@@ -200,7 +201,7 @@ _timeout_pool = concurrent.futures.ThreadPoolExecutor(
 )
 atexit.register(_timeout_pool.shutdown, wait=False)
 
-# market_kline 专用硬超时池 — 防止 fetch_market_kline 卡死阻塞 worker 线程。
+# market_kline 专用硬超时池 — 防止 fetch_kline 卡死阻塞 worker 线程。
 # 独立于 _timeout_pool，避免 market_kline 大批量场景挤占 coordinate_kline 的超时监控。
 _mkline_timeout_pool = concurrent.futures.ThreadPoolExecutor(
     max_workers=12, thread_name_prefix="mkline-timeout"
@@ -282,13 +283,14 @@ def _make_provider_fetch_fn(provider, adj: str = "qfq") -> Callable:
     K线适配器: 把 Provider.fetch_kline 包装成 Coordinator 能用的 fetch_fn。
 
     签名转换:
-      Provider:  provider.fetch_kline(code, timeframe, count, adj="qfq") -> List[Dict] | NotSupportedResult
-      Coordinator 期望:  fetch_fn(symbol, timeframe, limit) -> List[Dict] | None
+      Provider:  provider.fetch_kline(code, timeframe, count, adj="qfq") -> Dict | NotSupportedResult
+      Coordinator 期望:  fetch_fn(symbol, timeframe, limit) -> Dict | None
 
     转换规则:
       - NotSupportedResult（布尔值为 False）→ 返回 None → Coordinator 跳过该源
-      - 空列表 → 返回 None → Coordinator 判定失败，尝试下一个源
-      - 非空列表 → 直接返回 → Coordinator 判定成功
+      - 空 dict {} → 返回 None → Coordinator 判定失败，尝试下一个源
+      - 非空 dict {"bars": [...], "count": n} → 直接返回 → Coordinator 判定成功
+      - 超时异常 → 重新抛出 → Coordinator 捕获 TimeoutError，触发熔断器
 
     Args:
         adj: 复权方式 — "qfq"(前复权,默认) / "hfq"(后复权) / ""(不复权)
@@ -296,10 +298,15 @@ def _make_provider_fetch_fn(provider, adj: str = "qfq") -> Callable:
     def fetch_fn(symbol: str, timeframe: str, limit: int):
         try:
             result = provider.fetch_kline(symbol, timeframe, limit, adj=adj)
-            if not result:  # None / [] / NotSupportedResult 都走这里
+            if not result:  # None / {} / NotSupportedResult 都走这里
                 return None
             return result
         except Exception as e:
+            # 超时/网络异常必须穿透，让 Coordinator 区分"无数据"和"超时"
+            # requests.exceptions.Timeout 继承自 ConnectionError(OSError)
+            # Python 的 socket.timeout 继承自 TimeoutError(OSError)
+            if isinstance(e, (TimeoutError, ConnectionError, OSError)):
+                raise
             logger.debug("[适配器] %s.fetch_kline(%s) 异常: %s",
                         provider.name, symbol, e)
             return None
@@ -325,6 +332,9 @@ def _make_provider_quote_fn(provider) -> Callable:
                 return None
             return result
         except Exception as e:
+            # 超时/网络异常穿透，让 Coordinator 的 Race 逻辑正确处理
+            if isinstance(e, (TimeoutError, ConnectionError, OSError)):
+                raise
             logger.debug("[适配器] %s.fetch_ticker(%s) 异常: %s",
                         provider.name, symbol, e)
             return None
@@ -426,96 +436,6 @@ def _discover_sources(
 
 
 # ================================================================
-# 线程安全的阻塞任务队列
-# ================================================================
-#
-# 为什么不用 queue.Queue？
-# 因为需要 put_back（放回队尾）功能 — 当一个源获取某 symbol 失败时，
-# 把这个 symbol 放回队列让其他源尝试。标准库的 Queue 没有这个语义。
-#
-
-class _WorkQueue:
-    """
-    阻塞任务队列 — 支持"取任务 → 失败放回 → 其他源接手"的工作模式。
-
-    典型流程:
-      1. worker A 从队列取到 symbol "AAPL"
-      2. worker A 用 tencent 源获取失败
-      3. 调用 put_back("AAPL") 放回队尾
-      4. worker B（sina 源）取到 "AAPL"，获取成功
-      5. 调用 task_done() 标记完成
-
-    线程安全: 所有操作都加了 threading.Condition 锁。
-    """
-
-    def __init__(self, items: List[str]):
-        self._items = list(items)
-        self._cond = threading.Condition()
-        self._done = False      # True 表示"所有工作已完成，不再接受新任务"
-        self._pending = 0       # 正在被 worker 处理中的任务数
-
-    def get(self) -> Optional[str]:
-        """
-        取下一个任务。
-
-        行为:
-          - 队列有任务 → 立刻返回
-          - 队列空但有 pending 任务 → 阻塞等待（有 pending 时最多等 60s，无 pending 时等 QUEUE_DRAIN_TIMEOUT）
-          - 队列空且无 pending 任务 → 返回 None（worker 应退出）
-
-        Returns:
-            symbol 字符串，或 None（表示可以退出了）
-        """
-        with self._cond:
-            while not self._items:
-                if self._done:
-                    return None
-                # 有 pending 任务时多等 — 其他 worker 可能失败后 put_back
-                # 无 pending 时快速退出 — 确实没活干了
-                wait_time = 60.0 if self._pending > 0 else QUEUE_DRAIN_TIMEOUT
-                notified = self._cond.wait(timeout=wait_time)
-                if not notified and not self._items:
-                    return None
-            self._pending += 1
-            return self._items.pop(0)
-
-    def put_back(self, sym: str):
-        """
-        放回队尾 — 当某源获取失败时，把 symbol 放回让其他源接手。
-
-        这是动态队列的核心: 一个源失败不代表 symbol 失败，放回去让别的源试。
-        """
-        with self._cond:
-            self._items.append(sym)
-            self._pending = max(0, self._pending - 1)
-            self._cond.notify()  # 唤醒一个等待的 worker
-
-    def task_done(self):
-        """
-        标记一个任务完成（成功，不再放回队列）。
-
-        当队列空且 pending 归零时，唤醒所有等待线程（让它们退出）。
-        """
-        with self._cond:
-            self._pending = max(0, self._pending - 1)
-            if not self._items and self._pending == 0:
-                self._cond.notify_all()
-
-    def drain_done(self):
-        """
-        强制标记所有工作完成 — 用于超时后强制唤醒所有等待的 worker 线程。
-        """
-        with self._cond:
-            self._done = True
-            self._cond.notify_all()
-
-    @property
-    def is_empty(self) -> bool:
-        with self._cond:
-            return len(self._items) == 0
-
-
-# ================================================================
 # 协助层主类
 # ================================================================
 
@@ -523,43 +443,24 @@ class Coordinator:
     """
     协助层 — 并发调度引擎。
 
-    提供三种调度模式:
-      - coordinate_kline:        K线批量获取（动态队列 + 多源 fallback）
-      - coordinate_ticker:       实时行情（单股Race抢答 / 多股走 coordinate_batch_quotes）
-      - coordinate_market_kline: 全市场批量K线（Coordinator分组 + 多Provider并发取组）
-      - coordinate_batch_quotes: 批量行情（共享队列 + 多源并发消费）
+    提供五种调度模式:
+      - coordinate_kline:          单股K线（多源顺序尝试）
+      - coordinate_ticker:         单股实时行情（Race 抢答）
+      - coordinate_tickers:        批量实时行情（委托 batch_quotes）
+      - coordinate_batch_quotes:   批量行情（多源并发消费）
+      - coordinate_market_kline:   全市场批量K线（多源并发）
     """
 
     def __init__(self):
         self._lock = threading.Lock()
 
     # ================================================================
-    # 模式 A: K线获取 — 假批量，动态队列 + 多源 fallback
+    # 模式 A: 单股K线 — 多源顺序尝试，第一个成功即返回
     # ================================================================
-    #
-    # 注意: 这里说的"批量"是假批量。
-    #   - 没有真正的批量 API，每个 symbol 都是逐只单独请求 Provider
-    #   - 所谓"批量"靠的是动态队列 + 多线程并发模拟出来的
-    #   - 真正的批量接口见 coordinate_batch_quotes（单次请求拿多只）
-    #
-    # 工作流程（以 3 只股票、2 个源为例）:
-    #
-    #   初始队列: [AAPL, TSLA, MSFT]
-    #   tencent worker 1 取到 AAPL → 获取成功 → 从队列移除
-    #   tencent worker 2 取到 TSLA → 获取失败 → put_back 放回队尾
-    #   sina worker 1 取到 MSFT → 获取成功 → 从队列移除
-    #   sina worker 2 空闲 → 取到 TSLA（被 tencent 放回的）→ 获取成功
-    #
-    #   结果: AAPL(tencent) MSFT(sina) TSLA(sina) — 全部成功
-    #
-    # 关键设计:
-    #   - 每个源的并发数由 SourceConfig.max_workers 控制
-    #   - 每个 symbol 会被所有可用源各试一次，全部失败才算失败
-    #
 
     def coordinate_kline(
         self,
-        symbols: List[str],
+        symbol: str,
         timeframe: str,
         limit: int,
         market: str = "",
@@ -567,23 +468,20 @@ class Coordinator:
         preferred_source: str = "",
         sources: Optional[List[Tuple[str, Callable]]] = None,
         adj: str = "qfq",
-    ) -> Tuple[Dict[str, List[Dict[str, Any]]], List[str]]:
+    ) -> Dict[str, Any]:
         """
-        K线批量获取 — 动态队列模式。
-
-        这是 Coordinator 最核心的方法。当需要批量拉取多只股票的K线时调用。
+        单股K线获取 — 多源顺序尝试，第一个成功即返回。
 
         典型调用方:
-          - CNStockDataSource.get_kline_batch()
-          - KlineService（批量分析场景）
-          - BacktestService（回测数据准备）
+          - CNStockDataSource.get_kline()
+          - KlineService（单股分析场景）
 
         Args:
-            symbols:   股票代码列表（1 只或多只均可）
+            symbol:    单只股票代码（如 "600519"）
             timeframe: K 线周期（"1D" / "5m" / "1H" / ...）
             limit:     K 线条数
             market:    市场名称（"CNStock" / "HKStock"），用于自动发现源
-            timeout:   总超时（秒），超时后未完成的 symbol 记为失败
+            timeout:   总超时（秒）
             preferred_source: 指定首选源（如 "tencent"），优先使用，失败后回退
             sources:   手动指定源列表（可选）。为 None 时自动从 Provider 层发现。
                        格式: [(name, fetch_fn), ...]
@@ -591,20 +489,20 @@ class Coordinator:
             adj:       复权方式 — "qfq"(前复权,默认) / "hfq"(后复权) / ""(不复权)
 
         Returns:
-            (results, failed)
-            - results: {symbol: [kline_bars]} — 仅包含成功获取到数据的 symbol
-            - failed:  [symbol, ...] — 所有源都尝试过但全部失败的 symbol
+            Dict — 成功时返回 {"symbol": str, "bars": List[Dict], "source": str}，
+                   失败时返回空 dict {}。
         """
-        if not symbols:
-            return {}, list(symbols)
+        if not symbol:
+            return {}
 
-        # ── 入口标准化: 加市场前缀 + 去重 ──
-        symbols = _normalize_symbols(symbols, market)
+        from app.data_sources.normalizer import add_market_prefix, strip_market_prefix
 
-        # ── 第一步: 获取可用源列表 ──
-        # 两种方式: 自动发现（推荐）或 手动指定（兼容旧代码）
+        # ── 入口标准化: 加市场前缀 ──
+        prefixed_symbol = add_market_prefix(symbol, market)
+        pure_symbol = strip_market_prefix(prefixed_symbol)
+
+        # ── 获取可用源列表 ──
         if sources is not None:
-            # 手动指定模式 — 调用方传入 [(name, fetch_fn), ...]
             source_map = {name: fn for name, fn in sources}
             if preferred_source and preferred_source in source_map:
                 available = self._get_preferred_available(
@@ -613,237 +511,58 @@ class Coordinator:
             else:
                 available = self._get_available_sources(market, source_map)
         else:
-            # 自动发现模式 — 从 Provider 层获取源
             discovered = _discover_sources(market, timeframe, preferred_source, adj=adj)
             if not discovered:
                 logger.warning("[协助层] 市场 %s 无可用源", market)
-                return {}, list(symbols)
+                return {}
             available = [(name, cfg) for name, _, cfg in discovered]
             source_map = {name: fn for name, fn, _ in discovered}
 
         if not available:
             logger.warning("[协助层] 市场 %s 无可用源", market)
-            return {}, list(symbols)
+            return {}
 
-        # ── 第二步: 初始化动态队列和共享状态 ──
-        wq = _WorkQueue(symbols)                    # 任务队列
-        results: Dict[str, List[Dict[str, Any]]] = {}  # 成功的结果
-        results_lock = threading.Lock()
-        failed: List[str] = []                       # 全部源都失败的 symbol
-        failed_lock = threading.Lock()
-
-        # 记录每个 symbol 已经被哪些源尝试过（避免重复尝试）
-        symbol_tried: Dict[str, Set[str]] = {}
-        symbol_tried_lock = threading.Lock()
-
-        # ── 第三步: 定义内部辅助函数 ──
-
-        def _mark_success(sym: str, bars: List[Dict[str, Any]], source_name: str):
-            """
-            标记某 symbol 获取成功。
-            成功后该 symbol 从队列中彻底移除（不再让其他源尝试）。
-
-            Returns:
-                True  = 首次成功（调用方应 task_done）
-                False = 已被其他源抢先成功（调用方不应 task_done，避免重复计数）
-            """
-            with results_lock:
-                if sym in results:
-                    return False  # 已被其他源成功获取，忽略重复
-                results[sym] = bars
-                return True
-
-        def _mark_failed(sym: str, source_name: str):
-            """
-            标记某源对某 symbol 获取失败。
-
-            行为:
-              - 如果还有未尝试的源 → 把 symbol 放回队列（让其他源接手）
-              - 如果所有源都试过了 → 标记为彻底失败，从队列中移除
-
-            这就是"动态队列"的核心: 一个源失败 ≠ symbol 失败，放回去让别的源试。
-            """
-            with results_lock:
-                if sym in results:
-                    return  # 已经被其他源成功获取了，忽略
-
-            with symbol_tried_lock:
-                tried = symbol_tried.setdefault(sym, set())
-                tried.add(source_name)
-                untried = [name for name, _ in available if name not in tried]
-
-            if untried:
-                # 二次检查: put_back 前再确认一次，避免已成功的 symbol 被重复放回
-                with results_lock:
-                    if sym in results:
-                        return
-                # 还有未尝试的源 → 放回队尾，让其他 worker 接手
-                wq.put_back(sym)
-            else:
-                # 所有源都试过了，全部失败 → 彻底放弃
-                with failed_lock:
-                    if sym not in failed:
-                        failed.append(sym)
-                wq.task_done()
-
-        def _fetch_with_timeout(fn: Callable, sym: str, tf: str, lim: int,
-                                timeout_s: float) -> Optional[List[Dict[str, Any]]]:
-            """
-            带超时的单次 fetch 调用。
-
-            使用全局共享的 _timeout_pool 执行 fetch_fn，超时后自动取消。
-            防止某个源的 fetch_fn 卡死（比如网络不通但不报错）导致整个队列阻塞。
-            """
-            future = _timeout_pool.submit(fn, sym, tf, lim)
-            try:
-                return future.result(timeout=timeout_s)
-            except concurrent.futures.TimeoutError:
-                logger.warning("[协助层] %s 获取 %s 超时 (%ss)", fn.__name__, sym, timeout_s)
-                future.cancel()
-                return None
-
-        def _process_symbol(sym: str, source_name: str, fetch_fn: Callable,
-                            cfg: SourceConfig) -> bool:
-            """
-            处理单个 symbol 的获取请求。
-
-            流程:
-              1. 检查是否已被其他源成功获取（避免重复工作）
-              2. 记录该源已尝试过此 symbol
-              3. 调用 fetch_fn 获取数据（带超时保护）
-              4. 成功 → 记录结果 + 重置连续失败计数
-              5. 失败 → 记录失败 + 递增连续失败计数 + 可能放回队列
-
-            Returns:
-                True = 获取成功, False = 获取失败
-            """
-            # 已被其他源成功获取，跳过
-            with results_lock:
-                if sym in results:
-                    wq.task_done()
-                    return True
-
-            # 记录"该源已尝试过此 symbol"
-            with symbol_tried_lock:
-                symbol_tried.setdefault(sym, set()).add(source_name)
-
-            start_time = time.time()
-            try:
-                # 调用 fetch_fn（带超时保护）
-                bars = _fetch_with_timeout(fetch_fn, sym, timeframe, limit, PER_TASK_TIMEOUT)
-                elapsed = time.time() - start_time
-
-                if bars:
-                    # 成功
-                    _realtime_cb.record_success(source_name)       # 通知熔断器
-                    cfg.record(True, elapsed)            # 记录统计
-                    is_first = _mark_success(sym, bars, source_name)
-                    if is_first:
-                        wq.task_done()
-                    return True
-                else:
-                    # 空结果 → 不算熔断失败，只放回队列让其他源试
-                    cfg.record(False, elapsed)
-                    _mark_failed(sym, source_name)       # 可能放回队列
-                    return False
-            except Exception as e:
-                # 失败（抛了异常）
-                elapsed = time.time() - start_time
-                _realtime_cb.record_failure(source_name, str(e))
-                cfg.record(False, elapsed)
-                logger.debug("[协助层] %s 获取 %s 失败: %s", source_name, sym, e)
-                _mark_failed(sym, source_name)
-                return False
-
-        def _worker(source_name: str, cfg: SourceConfig, fetch_fn: Callable):
-            """
-            单个源的 worker 线程主循环。
-
-            不断从队列取 symbol → 获取数据 → 成功/失败处理，直到:
-              - 队列为空（get() 返回 None）
-              - 源被熔断（_realtime_cb.is_available 返回 False）
-            """
-            while True:
-                # 检查是否应该退出
-                if not _realtime_cb.is_available(source_name):
-                    break
-
-                # 从队列取下一个 symbol
-                sym = wq.get()
-                if sym is None:
-                    break  # 队列为空，退出
-
-                _process_symbol(sym, source_name, fetch_fn, cfg)
-
-        # ── 第四步: 构建线程池并启动 ──
-        #
-        # 每个源分配 max_workers 个线程，所有源的线程放在同一个线程池里。
-        # 例如: tencent(max_workers=3) + sina(max_workers=2) → 总共 5 个线程
-        #
-        total_threads = 0
-        thread_plan = []
+        # ── 顺序尝试每个源，第一个成功即返回 ──
         for name, cfg in available:
-            fn = source_map[name]
-            # 线程数取 max_workers 和 symbols 数量的较小值（没必要开比 symbol 还多的线程）
-            tc = min(cfg.max_workers, len(symbols))
-            thread_plan.append((name, cfg, fn, tc))
-            total_threads += tc
+            fetch_fn = source_map[name]
+            start = time.time()
+            try:
+                future = _timeout_pool.submit(fetch_fn, prefixed_symbol, timeframe, limit)
+                result = future.result(timeout=PER_TASK_TIMEOUT)
+                elapsed = time.time() - start
 
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=total_threads, thread_name_prefix="coord"
-        ) as pool:
-            futures = []
-            for name, cfg, fn, tc in thread_plan:
-                for _ in range(tc):
-                    futures.append(pool.submit(_worker, name, cfg, fn))
+                if result:
+                    bars = result.get("bars", [])
+                    if bars:
+                        _realtime_cb.record_success(name)
+                        cfg.record(True, elapsed)
+                        logger.info("[协助层] kline %s 命中 %s (%d条)", pure_symbol, name, len(bars))
+                        return {"symbol": pure_symbol, "bars": bars, "source": name}
+                cfg.record(False, elapsed)
+                logger.debug("[协助层] kline %s %s 返回空", name, pure_symbol)
+            except concurrent.futures.TimeoutError:
+                elapsed = time.time() - start
+                _realtime_cb.record_failure(name, "timeout")
+                cfg.record(False, elapsed)
+                future.cancel()
+                logger.debug("[协助层] kline %s %s 超时 (%ss)", name, pure_symbol, elapsed)
+            except Exception as e:
+                elapsed = time.time() - start
+                _realtime_cb.record_failure(name, str(e))
+                cfg.record(False, elapsed)
+                logger.debug("[协助层] kline %s %s 失败: %s", name, pure_symbol, e)
 
-            # 等待所有 worker 完成（加 2 秒余量）
-            concurrent.futures.wait(futures, timeout=timeout + 2)
-
-        # ── 第五步: 清理 — 收集剩余未处理的 symbol ──
-        wq.drain_done()
-
-        while True:
-            sym = wq.get()
-            if sym is None:
-                break
-            with results_lock:
-                if sym in results:
-                    continue
-            with failed_lock:
-                if sym not in failed:
-                    failed.append(sym)
-
-        # 输出统计日志
-        stats = " | ".join(cfg.stats_summary() for _, cfg in available)
-        logger.info("[协助层] 完成: %d成功 %d失败 | %s", len(results), len(failed), stats)
-
-        # ── 出口标准化: 去掉市场前缀 ──
-        from app.data_sources.normalizer import strip_market_prefix
-        results = {strip_market_prefix(k): v for k, v in results.items()}
-        failed = [strip_market_prefix(s) for s in failed]
-        return results, failed
+        # 所有源都失败
+        logger.warning("[协助层] kline %s 所有源失败", pure_symbol)
+        return {}
 
     # ================================================================
-    # 模式 B: 实时行情 — 单股Race抢答 / 多股走批量接口
+    # 模式 B: 单股实时行情 — Race 抢答
     # ================================================================
-    #
-    # 和 coordinate_kline 的区别:
-    #   coordinate_kline:  N只股票，动态队列，每只股票可能被多个源依次尝试
-    #   coordinate_ticker: 单股→Race并发抢答 / 多股→coordinate_batch_quotes
-    #
-    # 单股为什么用 Race？
-    #   实时行情对延迟敏感。与其等一个源超时再试下一个，不如同时发请求，
-    #   谁先返回有效数据就用谁。网络好的源 100ms 就返回了，不用等慢的源 5 秒超时。
-    #
-    # 多股为什么用批量接口？
-    #   批量行情走 fetch_batch_quotes（单次HTTP拿多只），比逐只 Race 更高效。
-    #   preferred_source 参数天然保证首选源优先。
-    #
 
     def coordinate_ticker(
         self,
-        symbols,
+        symbol: str,
         sources: Optional[List[Tuple[str, Callable]]] = None,
         timeout: float = 8.0,
         preferred_source: str = "",
@@ -851,62 +570,37 @@ class Coordinator:
         max_race_sources: int = 3,
     ) -> Dict[str, Any]:
         """
-        实时行情 — 统一入口，自动路由单股/批量。
-
-        路由规则:
-          单股 → Race 多源并发抢答，第一个返回有效价格的直接用
-          多股 → coordinate_batch_quotes 共享队列批量调度
+        单股实时行情 — Race 多源并发抢答，第一个返回有效价格的直接用。
 
         典型调用方:
           - CNStockDataSource.get_ticker()
           - KlineService.get_realtime_price()
-          - 自选股价格刷新
 
         Args:
-            symbols: 股票代码，str 或 List[str]。str 可含逗号（自动拆分）。
-            sources: [(name, fetch_fn), ...]。为 None 时自动发现。
-                     fetch_fn 签名: fetch_fn(symbol) -> Dict | None
-            timeout: 超时（秒）
+            symbol:    单只股票代码（如 "600519"）
+            sources:   [(name, fetch_fn), ...]。为 None 时自动发现。
+                       fetch_fn 签名: fetch_fn(symbol) -> Dict | None
+            timeout:   超时（秒）
             preferred_source: 指定首选源。如果可用，优先使用。
-            market:  市场名称（"CNStock"），用于自动发现源
+            market:    市场名称（"CNStock"），用于自动发现源
+            max_race_sources: Race 模式最多几个源抢答
 
         Returns:
-            {symbol: quote_dict} — 仅包含成功获取到的 symbol。
-            全部失败返回空 dict。
+            quote_dict — 成功时返回行情字典，失败时返回空 dict。
         """
-        # ── 入口标准化 ──
-        if isinstance(symbols, str):
-            sym_list = [s.strip() for s in symbols.split(',') if s.strip()]
-        else:
-            sym_list = [s.strip() for s in symbols if s and s.strip()]
-
-        if not sym_list:
+        if not symbol:
             return {}
 
-        # ── 加市场前缀 ──
-        from app.data_sources.normalizer import add_market_prefix, strip_market_prefix
-        sym_list = [add_market_prefix(s, market) for s in sym_list]
-
-        if len(sym_list) == 1:
-            # 单股 → Race 抢答
-            result = self._ticker_race(
-                symbol=sym_list[0],
-                sources=sources,
-                timeout=timeout,
-                preferred_source=preferred_source,
-                market=market,
-                max_race_sources=max_race_sources,
-            )
-            return {strip_market_prefix(sym_list[0]): result} if result else {}
-        else:
-            # 多股 → 共享队列批量调度
-            raw = self._ticker_batch(
-                symbols=sym_list,
-                market=market,
-                timeout=timeout,
-                preferred_source=preferred_source,
-            )
-            return {strip_market_prefix(k): v for k, v in raw.items()}
+        from app.data_sources.normalizer import add_market_prefix
+        prefixed = add_market_prefix(symbol, market)
+        return self._ticker_race(
+            symbol=prefixed,
+            sources=sources,
+            timeout=timeout,
+            preferred_source=preferred_source,
+            market=market,
+            max_race_sources=max_race_sources,
+        ) or {}
 
     def _ticker_race(
         self,
@@ -1006,14 +700,33 @@ class Coordinator:
         logger.warning("[协助层] ticker %s 所有源失败", symbol)
         return None
 
-    def _ticker_batch(
+    # ================================================================
+    # 模式 B2: 批量实时行情 — 委托 coordinate_batch_quotes
+    # ================================================================
+
+    def coordinate_tickers(
         self,
         symbols: List[str],
-        market: str,
-        timeout: float,
+        market: str = "",
+        timeout: float = 60.0,
         preferred_source: str = "",
-    ) -> Dict[str, Any]:
-        """批量行情 — 委托给 coordinate_batch_quotes。"""
+    ) -> List[Dict[str, Any]]:
+        """
+        批量实时行情 — 直接委托 coordinate_batch_quotes。
+
+        典型调用方:
+          - 自选股列表价格刷新
+          - PortfolioMonitor 批量监控
+
+        Args:
+            symbols: 股票代码列表
+            market:  市场名称
+            timeout: 超时（秒）
+            preferred_source: 指定首选源
+
+        Returns:
+            List[Dict] — 行情字典列表，每个 dict 含 symbol 字段
+        """
         return self.coordinate_batch_quotes(
             symbols=symbols, market=market, timeout=timeout,
             preferred_source=preferred_source,
@@ -1026,27 +739,13 @@ class Coordinator:
 
     _BATCH_GROUP_SIZE = 500       # 分组每组 500 只
 
-    @staticmethod
-    def _normalize_market_kline_result(
-        raw: Dict[str, List[Dict[str, Any]]],
-    ) -> Dict[str, List[Dict[str, Any]]]:
-        """
-        标准化全市场K线返回结果:
-          - key 统一为纯数字代码
-        """
-        from app.data_sources.normalizer import strip_market_prefix
-        out: Dict[str, List[Dict[str, Any]]] = {}
-        for key, bars in raw.items():
-            out[strip_market_prefix(key)] = bars
-        return out
-
     def coordinate_batch_quotes(
         self,
         symbols: List[str],
         market: str = "",
         timeout: float = 60.0,
         preferred_source: str = "",
-    ) -> Dict[str, Dict[str, Any]]:
+    ) -> List[Dict[str, Any]]:
         """
         批量行情获取 — 长效线程 + 主池/重试池 + 硬超时 + 逐 symbol 失败追踪。
 
@@ -1070,10 +769,10 @@ class Coordinator:
             preferred_source: 指定首选源（如 "tencent"），优先尝试
 
         Returns:
-            {纯数字代码: quote_dict} — 仅包含成功获取到的数据
+            List[Dict] — 行情字典列表，每个 dict 含 symbol 字段。失败的 symbol 静默丢弃。
         """
         if not symbols:
-            return {}
+            return []
 
         from collections import deque
         from app.data_sources.provider import get_providers, NotSupportedResult
@@ -1086,7 +785,7 @@ class Coordinator:
         # 输入标准化
         normalized_symbols = _normalize_symbols(symbols, market)
         if not normalized_symbols:
-            return {}
+            return []
 
         total = len(normalized_symbols)
 
@@ -1094,7 +793,7 @@ class Coordinator:
         providers = get_providers(capability="batch_quote", market=market)
         if not providers:
             logger.warning("[batch_quotes] market=%s 无可用源", market)
-            return {}
+            return []
 
         # preferred_source 排序
         if preferred_source:
@@ -1106,13 +805,13 @@ class Coordinator:
         available = [p for p in providers if _realtime_cb.is_available(p.name)]
         if not available:
             logger.warning("[batch_quotes] market=%s 所有源已熔断", market)
-            return {}
+            return []
 
         # fetch_batch_quotes 方法检查
         available = [p for p in available if getattr(p, 'fetch_batch_quotes', None)]
         if not available:
             logger.warning("[batch_quotes] market=%s 无可用源(无 fetch_batch_quotes)", market)
-            return {}
+            return []
 
         num_sources = len(available)
         group_size = self._BATCH_GROUP_SIZE  # 500
@@ -1425,7 +1124,7 @@ class Coordinator:
                     len(results), permanent_fail_count[0], total,
                     " | ".join(stat_parts))
 
-        return {strip_market_prefix(k): v for k, v in results.items()}
+        return list(results.values())
 
     # ================================================================
     # ================================================================
@@ -1436,14 +1135,14 @@ class Coordinator:
         self,
         market: str = "",
         timeframe: str = "1D",
-        count: int = 120,
+        count: int = 500,
         adj: str = "qfq",
         timeout: float = 60.0,
         preferred_source: str = "",
         start_date: str = "",
         end_date: str = "",
         symbols: Optional[List[str]] = None,
-    ) -> Dict[str, List[Dict[str, Any]]]:
+    ) -> List[Dict[str, Any]]:
         """
         全市场批量K线 — 长效线程 + 主池/重试池 + 立即退出。
 
@@ -1456,7 +1155,7 @@ class Coordinator:
           4. 彻底失败: 重试池中某 symbol 所有源都试过了 → 删除并记彻底失败+1
           5. 立即退出: 成功数 + 彻底失败数 = 总数 → 立即返回
           6. 数据有效性: 以数据有效且谁先回的为准，后回的直接丢弃
-          7. 硬超时: fetch_market_kline 卡死不会阻塞 worker，超时后 abandon 底层线程，走失败→重试→熔断流程
+          7. 硬超时: fetch_kline 卡死不会阻塞 worker，超时后 abandon 底层线程，走失败→重试→熔断流程
 
         线程生命周期:
           - 长效: 不因单次失败退出，持续循环取下一个任务
@@ -1475,7 +1174,7 @@ class Coordinator:
             symbols: 股票代码列表，为 None 时自动获取全市场
 
         Returns:
-            {symbol: kline_bars} — 仅包含成功获取的数据
+            List[Dict] — K线数据列表，每个 dict 含 symbol 字段表示所属股票。
         """
         from collections import deque
         from app.data_sources.provider import get_providers, NotSupportedResult
@@ -1485,13 +1184,13 @@ class Coordinator:
         providers = get_providers(capability="kline_batch", timeframe=timeframe, market=market)
         if not providers:
             logger.warning("[market_kline] market=%s tf=%s 无可用源", market, timeframe)
-            return {}
+            return []
 
         # 熔断过滤
         available = [p for p in providers if _realtime_cb.is_available(p.name)]
         if not available:
             logger.warning("[market_kline] market=%s tf=%s 无可用源(全部熔断)", market, timeframe)
-            return {}
+            return []
 
         # preferred_source 排第一
         if preferred_source:
@@ -1511,11 +1210,8 @@ class Coordinator:
                 logger.warning("[market_kline] %s prepare() 异常: %s，跳过", p.name, e)
         available = prepared
 
-        # 过滤掉没有 fetch_market_kline 方法的源
-        available = [p for p in available if getattr(p, 'fetch_market_kline', None)]
-        if not available:
-            logger.warning("[market_kline] market=%s tf=%s 无可用源(无 fetch_market_kline)", market, timeframe)
-            return {}
+        # 过滤掉没有 fetch_kline 方法的源
+        available = [p for p in available if getattr(p, 'fetch_kline', None)]
 
         # ── 入口: dict → list ──
         if isinstance(symbols, dict):
@@ -1527,12 +1223,12 @@ class Coordinator:
             symbols = get_stock_basic_db().market_all_codes(status="active")
         if not symbols:
             logger.warning("[market_kline] 获取股票列表失败")
-            return {}
+            return []
 
         all_codes = _normalize_symbols(symbols, market)
         if not all_codes:
             logger.warning("[market_kline] 标准化后无有效代码")
-            return {}
+            return []
 
         total = len(all_codes)
 
@@ -1712,7 +1408,7 @@ class Coordinator:
 
             流程:
               1. 检查是否已被其他源完成（跳过）
-              2. 硬超时调用 fetch_market_kline(symbols=[sym])（卡死不会阻塞 worker）
+              2. 硬超时调用 fetch_kline(code=sym)（卡死不会阻塞 worker）
               3. 校验数据有效性 (_is_valid_kline)
               4. 有效 → _mark_success（首次成功才计入，后回丢弃）
               5. 硬超时/无效/空/异常 → _return_to_retry（标记源失败，放回重试池）
@@ -1729,16 +1425,15 @@ class Coordinator:
             start = time.time()
             try:
                 # ── 硬超时包装 ──
-                # 直接调用 fetch_market_kline 如果 socket 卡死，线程会永远阻塞。
+                # 直接调用 fetch_kline 如果 socket 卡死，线程会永远阻塞。
                 # 用 _mkline_timeout_pool 在独立线程中执行，超时后 abandon 该线程，
                 # worker 线程不再等待，立即走失败→重试→熔断流程。
                 _hard_timeout = _PER_TASK_TIMEOUT + 2  # 比 provider 自身 timeout 稍长
                 _fetch_future = _mkline_timeout_pool.submit(
-                    provider.fetch_market_kline,
-                    timeframe=timeframe, count=count,
+                    provider.fetch_kline,
+                    code=strip_market_prefix(sym), timeframe=timeframe, count=count,
                     adj=adj, timeout=int(_PER_TASK_TIMEOUT),
                     start_date=start_date, end_date=end_date,
-                    symbols=[sym],
                 )
                 try:
                     task_result = _fetch_future.result(timeout=_hard_timeout)
@@ -1764,10 +1459,7 @@ class Coordinator:
 
                 # 有返回数据 → 校验有效性
                 if task_result:
-                    # 兼容: 返回的 key 可能带前缀也可能不带
-                    bars = task_result.get(sym)
-                    if bars is None:
-                        bars = task_result.get(strip_market_prefix(sym))
+                    bars = task_result.get("bars", [])
                     if bars and _is_valid_kline(bars):
                         # 有效数据 → 尝试标记成功
                         _realtime_cb.record_success(source_name)
@@ -1867,7 +1559,15 @@ class Coordinator:
                     len(results), permanent_fail_count[0], total,
                     " | ".join(stats_lines))
 
-        return self._normalize_market_kline_result(results)
+        # 转为 List[dict]，每条 bar 加 symbol 字段
+        from app.data_sources.normalizer import strip_market_prefix
+        output: List[Dict[str, Any]] = []
+        for sym, bars in results.items():
+            pure = strip_market_prefix(sym)
+            for bar in bars:
+                bar["symbol"] = pure
+                output.append(bar)
+        return output
 
     # 透传模式 — 不加任何协调逻辑
     # ================================================================
