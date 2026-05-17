@@ -431,15 +431,24 @@ def get_watchlist_prices():
         
         results = []
 
-        # 对每个市场，A股批量逗号拼接一次调 get_ticker，其他市场逐只
+        # 对每个市场，A股直接走 Coordinator.coordinate_tickers，其他市场逐只
         for market, symbols in market_groups.items():
             try:
                 if market == 'CNStock':
-                    # A股: 所有自选股逗号拼接一次调 get_ticker（内部走 Provider 批量接口）
-                    # CNStockDataSource 已统一返回纯数字 key 和 symbol
-                    ticker_map = DataSourceFactory.get_ticker(market, ",".join(symbols))
-                    if not isinstance(ticker_map, dict):
-                        ticker_map = {}
+                    # A股: 直接走 Coordinator 批量接口
+                    from app.data_sources.coordinator import get_coordinator
+                    quotes_list = get_coordinator().coordinate_tickers(
+                        symbols=symbols,
+                        market="CNStock",
+                        timeout=8,
+                    )
+                    # List[Dict] → Dict[str, Dict] 按 symbol 索引
+                    ticker_map = {}
+                    if quotes_list:
+                        for q in quotes_list:
+                            sym = q.get("symbol", "")
+                            if sym:
+                                ticker_map[sym] = q
 
                     for sym in symbols:
                         ticker = ticker_map.get(sym, {})

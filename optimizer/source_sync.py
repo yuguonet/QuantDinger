@@ -872,8 +872,20 @@ def process_batch(
     # ── 构建查找映射: raw_data 的 key 可能带 SH./SZ. 前缀 ──
     # coordinator 会 normalize 代码（加前缀），但 symbols 是不带前缀的
     # 需要建立 code → raw_data_key 的映射
+    #
+    # 新接口 coordinate_market_kline 返回 List[Dict]（扁平 bar 列表，每条含 symbol 字段），
+    # 需先按 symbol 聚合为 Dict[str, List[Dict]] 供后续逐只校验。
+    from app.data_sources.normalizer import strip_market_prefix
+    raw_by_symbol: Dict[str, list] = {}
+    for bar in raw_data:
+        sym = bar.get("symbol", "")
+        if not sym:
+            continue
+        pure = strip_market_prefix(sym)
+        raw_by_symbol.setdefault(pure, []).append(bar)
+
     _prefix_map: Dict[str, str] = {}
-    for rk in raw_data:
+    for rk in raw_by_symbol:
         if "." in rk:
             pure = rk.split(".", 1)[1]
             _prefix_map[pure] = rk
@@ -887,7 +899,7 @@ def process_batch(
             break
 
         raw_key = _prefix_map.get(code, code)
-        bars = raw_data.get(raw_key, [])
+        bars = raw_by_symbol.get(raw_key, [])
         if not bars:
             stats["no_data"] += 1
             to_retry[code] = ["无数据"]

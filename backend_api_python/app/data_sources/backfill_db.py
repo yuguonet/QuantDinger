@@ -628,12 +628,15 @@ class BackfillDB:
                     failed_reasons.setdefault(symbol, "provider 返回空数据")
                 break
 
+            # List[Dict] → 按 symbol 索引（每条 quote 含 symbol 字段）
+            quote_map = {q["symbol"]: q for q in quotes if q.get("symbol")}
+
             # 转换本轮结果
             records: list[dict] = []
             for symbol in remaining:
-                quote = quotes.get(symbol)
+                quote = quote_map.get(symbol)
                 if not quote:
-                    quote = quotes.get(strip_market_prefix(symbol))
+                    quote = quote_map.get(strip_market_prefix(symbol))
 
                 if not quote:
                     failed_reasons.setdefault(symbol, "无行情数据")
@@ -709,21 +712,23 @@ class BackfillDB:
                     f"重拉 {len(failed)} 只失败标的"
                 )
 
-                quotes = coord.coordinate_batch_quotes(
+                raw_quotes = coord.coordinate_batch_quotes(
                     symbols=failed,
                     market=self.source.market,
                     timeout=float(_BATCH_TIMEOUT_1D),
                 )
 
-                if not quotes:
+                if not raw_quotes:
                     logger.info(f"[同步] {self.source.name} 1D 修复第 {repair_round} 轮返回空，停止")
                     break
 
+                quote_map = {q["symbol"]: q for q in raw_quotes if q.get("symbol")}
+
                 repair_records: list[dict] = []
                 for symbol in failed:
-                    quote = quotes.get(symbol)
+                    quote = quote_map.get(symbol)
                     if not quote:
-                        quote = quotes.get(strip_market_prefix(symbol))
+                        quote = quote_map.get(strip_market_prefix(symbol))
                     if not quote:
                         continue
 
