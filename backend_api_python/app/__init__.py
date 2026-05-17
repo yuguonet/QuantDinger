@@ -445,20 +445,8 @@ def create_app(config_name='default'):
         
         # ── A股K线增量同步调度 ──────────────────────────────────
         try:
-            from app.data_sources.backfill_db import trigger_sync, start_scheduler
-            import threading, time as _time
-
-            start_scheduler()  # ← 启动 15m 守护线程
-
-            def _backfill_loop():
-                while True:
-                    try:
-                        trigger_sync()
-                    except Exception:
-                        pass
-                    _time.sleep(60)
-
-            threading.Thread(target=_backfill_loop, daemon=True, name="backfill-scheduler").start()
+            from app.data_sources.backfill_db import start_scheduler
+            start_scheduler()  # ← 启动统一调度器（15m + 1D）
         except ImportError:
             pass
         except Exception as e:

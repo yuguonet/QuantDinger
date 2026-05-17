@@ -156,112 +156,178 @@ class CNStockDataSource(BaseDataSource):
         after_time: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
-        从本地 DB 读取 K 线，含最后时间判定。
+        从本地 DB 读取 K 线。
 
-        返回标准格式列表，失败或数据不够新返回空列表。
+        逻辑：
+          1. 查 DB → 条数足够且数据新鲜 → 直接返回
+          2. DB 空 / 过期 / 条数不足 → 远程补满最大年限 → 写入 DB → 重新查询返回
+             15m 最多 2 年，1D 最多 5 年
         """
         try:
             from app.utils.db_market import get_market_kline_writer
+            from app.data_sources.normalizer import strip_market_prefix
             writer = get_market_kline_writer()
         except Exception:
             return []
 
-        # 计算时间范围
-        start_dt = datetime.fromtimestamp(after_time) if after_time else None
-        end_dt = datetime.fromtimestamp(before_time) if before_time else None
+        # DB 存储使用纯数字代码（backfill 写入时 strip_market_prefix），
+        # 查询前必须统一格式，否则 "600519.SH" 查不到 "600519"
+        db_symbol = strip_market_prefix(symbol) if symbol else symbol
 
-        try:
-            if tf in _RAW_TIMEFRAMES:
-                rows = writer.query(
-                    "CNStock", symbol, tf,
-                    start_time=start_dt, end_time=end_dt,
-                    limit=limit,
-                )
-            else:
-                # _AGG_TIMEFRAMES
-                rows = writer.aggregate(
-                    "CNStock", symbol, tf,
-                    start_time=start_dt, end_time=end_dt,
-                    limit=limit,
-                )
-        except Exception:
-            return []
-
-        if not rows:
-            return []
-
-        # ── 最后时间判定 ──
-        latest_db_time = rows[-1].get("time")
-        if isinstance(latest_db_time, datetime):
-            latest_ts = latest_db_time.timestamp()
-        elif isinstance(latest_db_time, (int, float)):
-            latest_ts = float(latest_db_time)
-        else:
-            return []
-
-        now_ts = datetime.now().timestamp()
-
-        if before_time:
-            # 回测场景：DB 最新 bar 必须覆盖到 before_time 附近（允许1天误差）
-            if latest_ts < before_time - 86400:
-                logger.debug(
-                    f"[DB] {symbol}/{tf} 数据不够新: "
-                    f"最新={datetime.fromtimestamp(latest_ts):%Y-%m-%d} "
-                    f"需要>={datetime.fromtimestamp(before_time - 86400):%Y-%m-%d}"
-                )
-                return []
-        else:
-            # 非回测场景：DB 最新 bar 日期必须 >= 上一个交易日
-            latest_date = datetime.fromtimestamp(latest_ts).strftime("%Y-%m-%d")
-            cutoff = prev_trading_day(datetime.now().strftime("%Y-%m-%d"), n=1)
-            if latest_date < cutoff:
-                logger.debug(
-                    f"[DB] {symbol}/{tf} 数据过期: "
-                    f"最新={latest_date}, 要求>={cutoff}"
-                )
-                return []
-
-            # 时效性判断：最新 bar 不能超过 2 个 bar 周期
-            bar_sec = _BAR_SECONDS.get(tf)
-            if bar_sec:
-                staleness = now_ts - latest_ts
-                if staleness > bar_sec * 2:
-                    logger.debug(
-                        f"[DB] {symbol}/{tf} 数据过旧: "
-                        f"最新bar={datetime.fromtimestamp(latest_ts):%Y-%m-%d %H:%M}, "
-                        f"距今{staleness/bar_sec:.1f}个bar周期, 超过2个"
-                    )
-                    return []
-
-        # ── 转换为标准格式（time 转 Unix 秒）──
-        bars = []
-        for row in rows:
-            t = row.get("time")
-            if isinstance(t, datetime):
-                ts = int(t.timestamp())
-            elif isinstance(t, (int, float)):
-                ts = int(t)
-            else:
-                continue
-            bars.append({
-                "time": ts,
-                "open": float(row.get("open", 0)),
-                "high": float(row.get("high", 0)),
-                "low": float(row.get("low", 0)),
-                "close": float(row.get("close", 0)),
-                "volume": float(row.get("volume", 0)),
-            })
-
-        # ── 数量判定：DB 返回条数不足请求数的一半，视为数据不完整 ──
+        # ── 最大补满年限：15m 一年，1D 五年 ──
+        _BACKFILL_MAX_BARS = {
+            "15m": 4000,   # 1年 × 250天 × 16根/天
+            "1D":  1000,   # 5年 × 250天
+            "30m": 2000,
+            "1h":  1000,
+            "2h":  500,
+            "4h":  250,
+            "1W":  260,
+            "1M":  60,
+        }
         min_required = max(limit // 2, 30)
-        if len(bars) < min_required:
-            logger.debug(
-                f"[DB] {symbol}/{tf} 条数不足: "
-                f"请求{limit}条, DB返回{len(bars)}条, 最低需要{min_required}条"
-            )
-            return []
 
-        logger.info(f"[DB] ✅ {symbol}/{tf} 命中 {len(bars)} 条")
+        def _query_db() -> List[Dict[str, Any]]:
+            """查询 DB 并转为标准格式。"""
+            start_dt = datetime.fromtimestamp(after_time) if after_time else None
+            end_dt = datetime.fromtimestamp(before_time) if before_time else None
+            try:
+                if tf in _RAW_TIMEFRAMES:
+                    rows = writer.query(
+                        "CNStock", db_symbol, tf,
+                        start_time=start_dt, end_time=end_dt,
+                        limit=limit,
+                    )
+                else:
+                    rows = writer.aggregate(
+                        "CNStock", db_symbol, tf,
+                        start_time=start_dt, end_time=end_dt,
+                        limit=limit,
+                    )
+            except Exception:
+                return []
+            if not rows:
+                return []
+
+            bars = []
+            for row in rows:
+                t = row.get("time")
+                if isinstance(t, datetime):
+                    ts = int(t.timestamp())
+                elif isinstance(t, (int, float)):
+                    ts = int(t)
+                else:
+                    continue
+                bars.append({
+                    "time": ts,
+                    "open": float(row.get("open", 0)),
+                    "high": float(row.get("high", 0)),
+                    "low": float(row.get("low", 0)),
+                    "close": float(row.get("close", 0)),
+                    "volume": float(row.get("volume", 0)),
+                })
+            return bars
+
+        def _is_fresh(bars: List[Dict[str, Any]]) -> bool:
+            """检查 DB 数据是否足够新鲜。"""
+            if not bars:
+                return False
+            latest_ts = bars[-1].get("time", 0)
+            now_ts = datetime.now().timestamp()
+
+            if before_time:
+                return latest_ts >= before_time - 86400
+            else:
+                latest_date = datetime.fromtimestamp(latest_ts).strftime("%Y-%m-%d")
+                cutoff = prev_trading_day(datetime.now().strftime("%Y-%m-%d"), n=1)
+                if latest_date < cutoff:
+                    return False
+                bar_sec = _BAR_SECONDS.get(tf)
+                if bar_sec and (now_ts - latest_ts) > bar_sec * 2:
+                    return False
+            return True
+
+        def _backfill_from_remote() -> None:
+            """
+            远程补满最大年限 → 写入 DB。
+
+            条数不足时取最大年限归一化覆盖 DB，不是缺多少取多少。
+            每只 symbol 只在首次 miss 时触发一次，后续全走 DB 缓存。
+            """
+            from app.data_sources.coordinator import get_coordinator
+            from app.data_sources.kline_clean import clean_klines
+            from app.data_sources.asia_stock_kline import normalize_chart_timeframe
+
+            remote_tf = normalize_chart_timeframe(tf)
+            remote_limit = _BACKFILL_MAX_BARS.get(tf, 1000)
+
+            logger.info(
+                f"[DB补满] {db_symbol}/{tf} 开始远程补满: "
+                f"请求{remote_limit}条 (最大年限)"
+            )
+
+            try:
+                coord_results, failed = get_coordinator().coordinate_kline(
+                    symbols=[symbol],
+                    timeframe=remote_tf,
+                    limit=remote_limit,
+                    market="CNStock",
+                    timeout=30,
+                    adj="qfq",
+                )
+            except Exception as e:
+                logger.warning(f"[DB补满] {db_symbol}/{tf} 远程拉取异常: {e}")
+                return
+
+            bars = coord_results.get(symbol, [])
+            if not bars:
+                logger.warning(f"[DB补满] {db_symbol}/{tf} 远程返回空")
+                return
+
+            bars = clean_klines(bars, remote_tf)
+            try:
+                writer.upsert("CNStock", db_symbol, tf, bars)
+                logger.info(f"[DB补满] {db_symbol}/{tf} 写入 {len(bars)} 条")
+            except Exception as e:
+                logger.warning(f"[DB补满] {db_symbol}/{tf} 写入 DB 失败: {e}")
+
+        # ── 主流程 ──
+
+        # 1. 先查 DB
+        bars = _query_db()
+
+        # 2. 判断是否需要补满：空 / 不新鲜 / 条数不足
+        #
+        #    补满策略：条数不足时不是缺多少取多少，而是取最大年限归一化覆盖 DB。
+        #    这样每只 symbol 只在首次 miss 时慢一次远程拉取，后续全部命中本地 DB。
+        #    - 15m 最多补 2 年（8000 条）
+        #    - 1D  最多补 5 年（1250 条）
+        #
+        #    为什么不用"缺多少取多少"：
+        #    批量回测时 8 线程并发，每只 symbol 各自缺不同量，会导致大量碎片化远程请求，
+        #    远程源扛不住雪崩超时。一次补满最大年限，后续全走 DB，总请求量最小。
+        #
+        need_backfill = False
+        if not bars:
+            need_backfill = True
+            logger.debug(f"[DB] {db_symbol}/{tf} 无数据，触发补满")
+        elif not _is_fresh(bars):
+            need_backfill = True
+            logger.debug(f"[DB] {db_symbol}/{tf} 数据过期，触发补满")
+        elif len(bars) < min_required:
+            need_backfill = True
+            logger.debug(
+                f"[DB] {db_symbol}/{tf} 条数不足: "
+                f"{len(bars)} < {min_required}，触发补满"
+            )
+
+        # 3. 补满后重新查询
+        if need_backfill:
+            _backfill_from_remote()
+            bars = _query_db()
+
+        if bars:
+            logger.info(f"[DB] ✅ {db_symbol}/{tf} 返回 {len(bars)} 条")
         return bars
 
     # ── 远程拉取（Coordinator 调度）──
@@ -272,9 +338,12 @@ class CNStockDataSource(BaseDataSource):
             return
         try:
             from app.utils.db_market import get_market_kline_writer
+            from app.data_sources.normalizer import strip_market_prefix
             writer = get_market_kline_writer()
-            writer.upsert("CNStock", symbol, timeframe, bars)
-            logger.debug(f"[DB写入] {symbol}/{timeframe} 缓存 {len(bars)} 条")
+            # DB 统一使用纯数字代码存储（与 backfill_db 一致）
+            db_symbol = strip_market_prefix(symbol) if symbol else symbol
+            writer.upsert("CNStock", db_symbol, timeframe, bars)
+            logger.debug(f"[DB写入] {symbol}→{db_symbol}/{timeframe} 缓存 {len(bars)} 条")
         except Exception as e:
             logger.debug(f"[DB写入] {symbol}/{timeframe} 缓存失败: {e}")
 

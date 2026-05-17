@@ -295,126 +295,6 @@ def _same_trading_day(dt1: datetime, dt2: datetime) -> bool:
     return _own_trading_day(d1) == _own_trading_day(d2)
 
 
-def _should_run_15m(pool_name: str = "CNStock") -> tuple[bool, str]:
-    """15m 调度: 非交易日不跑 → 查表 → 判断是否有新 bar 触发。"""
-    if not ENABLE_15M:
-        return False, "15m 已关闭 (ENABLE_15M=False)"
-
-    # 非交易日不跑
-    today_str = datetime.now(TZ_CN).strftime("%Y-%m-%d")
-    if not is_trading_day(today_str):
-        return False, "非交易日"
-
-    now = datetime.now(TZ_CN)
-    doc = _get_last_update("stock_daily_k", "15m", pool_name=pool_name)
-
-    # ── 首次同步 ──
-    if not doc:
-        latest_bar = _latest_finished_bar_time()
-        if not latest_bar:
-            return True, "首次同步，盘前执行历史回填"
-        return True, "首次同步，无历史记录"
-
-    # 15m 不重试: 无论成功/失败/空数据，只要本 bar 已尝试过就跳过
-    last_bar = doc.get("last_bar_time")
-    last_updated = doc.get("last_updated")
-
-    if not last_bar and not last_updated:
-        return True, "无时间记录，重新同步"
-
-    ref_time = last_bar or last_updated
-    ref_cn = _parse_db_timestamp(ref_time)
-    if not ref_cn:
-        return True, "时间戳无法解析，重新同步"
-
-    # 跨交易日 → 直接同步
-    if not _same_trading_day(ref_cn, now):
-        return True, f"上次 {ref_cn:%Y-%m-%d}，跨交易日"
-
-    # ── 看是否有新 bar 到了 ──
-    latest_bar = _latest_finished_bar_time()
-
-    if not latest_bar:
-        # 盘前（9:45 前）→ 没有可同步的 bar
-        if not last_bar:
-            return True, "盘前，从未同步过，执行历史回填"
-        return False, "盘前，无可同步 bar"
-
-    # 精确比较: last_bar_time < 最新已结束 bar → 有新数据
-    if ref_cn < latest_bar:
-        return True, f"last_bar={ref_cn:%H:%M}, 新 bar 到 {latest_bar:%H:%M}"
-
-    return False, f"已同步到 {ref_cn:%H:%M}，最新可用 {latest_bar:%H:%M}"
-
-
-def _should_run_1d(pool_name: str = "CNStock") -> tuple[bool, str]:
-    """1D 调度: 交易日 17:00 ~ 下一个交易日 08:00 可更新。"""
-    if not ENABLE_1D:
-        return False, "1D 已关闭 (ENABLE_1D=False)"
-
-    now = datetime.now(TZ_CN)
-    today_str = now.strftime("%Y-%m-%d")
-
-    # 08:00-17:00 不更新
-    if dt_time(8, 0) <= now.time() < dt_time(17, 0):
-        return False, "不在 1D 更新窗口 (08:00-17:00)"
-
-    # 确定目标交易日 + 窗口校验
-    if now.time() >= dt_time(17, 0):
-        # 17:00 后: 目标=今天, 今天必须是交易日
-        if not is_trading_day(today_str):
-            return False, "今天非交易日"
-    else:
-        # 08:00 前: 目标=上一个交易日, 必须在下一个交易日 08:00 之前
-        prev_td = prev_trading_day(today_str)
-        next_td = next_trading_day(prev_td)
-        next_td_open = datetime.strptime(next_td, "%Y-%m-%d").replace(
-            hour=8, minute=0, second=0, tzinfo=TZ_CN
-        )
-        if now >= next_td_open:
-            return False, "已过下一个交易日 08:00，不在窗口内"
-
-    doc = _get_last_update("stock_daily_k", "1D", pool_name=pool_name)
-
-    # 首次同步
-    if not doc:
-        return True, "首次 1D 同步"
-
-    status = doc.get("status", "")
-    if status == "error":
-        return True, f"上次 1D 失败: {doc.get('report', '')}，重试"
-    if status == "ok":
-        return False, "本交易日 1D 已完成 (status=ok)"
-
-    last_updated = doc.get("last_updated")
-    if last_updated:
-        last_cn = _parse_db_timestamp(last_updated)
-        if not last_cn:
-            return True, "上次 1D 时间戳无法解析，重新同步"
-        if not _same_trading_day(last_cn, now):
-            return True, f"上次 1D {last_cn:%Y-%m-%d}，跨交易日"
-
-        # 同一交易日内: 检查增量进度（partial 和 ok 统一处理）
-        synced = doc.get("synced_count", 0) or 0
-        failed = doc.get("failed_count", 0) or 0
-        from app.utils.basicinfo_db import get_stock_basic_db
-        total = len(get_stock_basic_db().market_all_codes(status="active"))
-
-        if synced >= total:
-            return False, f"本交易日 1D 已全部同步 ({synced}/{total})"
-
-        # synced + failed >= total 说明所有标的都已尝试过（成功或失败）
-        if synced + failed >= total:
-            if failed > 0:
-                return True, f"本交易日 1D 首轮完成，同步 {synced}，失败 {failed}，进入修复"
-            return False, f"本交易日 1D 已全部同步 ({synced}/{total})"
-
-        # 还有剩余标的未尝试 → 允许继续补拉
-        return True, f"本交易日 1D 已同步 {synced}/{total}，失败 {failed}，继续补拉"
-
-    return True, "本交易日 1D 待同步"
-
-
 # ================================================================
 # 数据源配置
 # ================================================================
@@ -450,32 +330,14 @@ class BackfillDB:
         """执行一次同步。tf 默认取 source.timeframe。"""
         tf = tf or self.source.timeframe
 
-        # 查表: 该不该干
         pool = self.source.db_pool
-        if tf == "15m":
-            should, reason = _should_run_15m(pool_name=pool)
-        elif tf == "1D":
-            should, reason = _should_run_1d(pool_name=pool)
-        else:
-            return {
-                "source": self.source.name, "tf": tf,
-                "written": 0, "status": "ok", "report": f"不支持的周期: {tf}",
-            }
-
-        if not should:
-            return {
-                "source": self.source.name, "tf": tf,
-                "written": 0, "status": "ok", "report": reason,
-            }
-
-        # 执行同步
         latest_bar = _latest_finished_bar_time()
 
         try:
             if tf == "15m":
                 written, failed = self._sync_15m(symbols)
             elif tf == "1D":
-                # 判断是否当天首次运行
+                # 判断是否当天首次运行（用于决定是否清除当日旧 bar）
                 doc = _get_last_update(self.source.name, "1D", pool_name=pool)
                 is_first_run = True
                 if doc:
@@ -484,11 +346,13 @@ class BackfillDB:
                         is_first_run = False
                 written, failed = self._sync_1d(symbols, is_first_run=is_first_run)
             else:
-                written, failed = 0, []
+                return {
+                    "source": self.source.name, "tf": tf,
+                    "written": 0, "status": "ok", "report": f"不支持的周期: {tf}",
+                }
         except Exception as e:
             report = f"同步异常: {e}"
             logger.error(f"[同步] {self.source.name} tf={tf} {report}")
-            # 异常也记录 bar 时间，防止 15m 同一 bar 重试
             _record_update(self.source.name, tf, "error", report,
                            last_bar_time=latest_bar, pool_name=pool)
             return {
@@ -1022,20 +886,44 @@ stock_daily_k = BackfillDB(BackfillSource(
 
 
 # ================================================================
-# 15m 自驱动调度器 — 独立线程，按 bar 时间点自动触发
+# 统一调度器 — timer-based，同时管理 15m 和 1D 任务
 # ================================================================
 #
-# 工作模式:
-#   1. start_scheduler() 启动守护线程
-#   2. 线程计算下一个 bar 触发时间（bar 结束前 30s），sleep 到点
-#   3. 到点 → 执行一次 run_once("15m") → 计算下一个 bar → 继续 sleep
-#   4. 完全自驱动，不依赖外部调用
+# 设计模式: 与 emotion_scheduler / sector_history 一致
+#   - 单守护线程，sleep 到最近触发点 → 执行任务 → 计算下次触发 → 继续 sleep
+#   - 15m: 盘中每 15 分钟触发一次（bar 结束前 30s），交易日共 16 次
+#   - 1D:  每个交易日 17:05 触发一次（cn_last_update 内置重试/续传逻辑）
+#   - 非交易日: 整天 sleep，不执行任何任务
 #
 
 _scheduler_started = False
+_stop_event = threading.Event()
+
+# 15m 提前预热秒数（cookie/服务器探测等耗时操作提前执行）
+_PREPARE_LEAD_SECONDS = 60
 
 
-def _next_bar_trigger() -> datetime:
+def _pre_prepare_providers():
+    """提前调用所有 provider 的 prepare()（cookie 刷新、服务器探测等）。"""
+    try:
+        from app.data_sources.provider import get_providers
+        providers = get_providers(capability="batch_quote", market="CNStock")
+        if not providers:
+            return
+        for p in providers:
+            pname = getattr(p, "name", p.__class__.__name__)
+            try:
+                prepare_fn = getattr(p, 'prepare', None)
+                if prepare_fn:
+                    ok = prepare_fn()
+                    logger.info(f"[15m预热] {pname} prepare() → {ok}")
+            except Exception as e:
+                logger.warning(f"[15m预热] {pname} prepare() 失败（忽略）: {e}")
+    except Exception as e:
+        logger.warning(f"[15m预热] 获取 provider 失败（忽略）: {e}")
+
+
+def _next_bar_trigger_time() -> datetime:
     """返回下一个 15m bar 的触发时间（bar 结束前 30s）。"""
     now = datetime.now(TZ_CN)
     for h, m in _BAR_END_TIMES:
@@ -1050,133 +938,128 @@ def _next_bar_trigger() -> datetime:
                     tzinfo=TZ_CN) - timedelta(seconds=30)
 
 
-def _scheduler_15m_loop():
-    """15m 调度主循环 — 到点执行，永不退出。"""
-    while True:
+def _next_1d_trigger_time() -> datetime:
+    """返回下一个 1D 任务的触发时间（17:05，跳过非交易日）。"""
+    now = datetime.now(TZ_CN)
+    today_str = now.strftime("%Y-%m-%d")
+
+    # 今天是交易日且还没到 17:05 → 今天 17:05
+    if is_trading_day(today_str) and now.time() < dt_time(17, 5):
+        return datetime(now.year, now.month, now.day, 17, 5, 0, tzinfo=TZ_CN)
+
+    # 找下一个交易日的 17:05
+    from app.utils.trading_calendar import next_trading_day
+    if now.time() >= dt_time(17, 5):
+        next_td = next_trading_day(today_str)
+    else:
+        next_td = today_str if is_trading_day(today_str) else next_trading_day(today_str)
+
+    dt_obj = datetime.strptime(next_td, "%Y-%m-%d")
+    return datetime(dt_obj.year, dt_obj.month, dt_obj.day, 17, 5, 0, tzinfo=TZ_CN)
+
+
+def _scheduler_loop():
+    """统一调度主循环 — 一个线程管理 15m + 1D，sleep 到最近触发点执行。
+
+    每轮:
+      1. 非交易日 → sleep 到明天 09:00 重新判断
+      2. 计算 15m 和 1D 各自的下次触发时间，取较近者
+      3. sleep 到点 → 执行对应任务 → 计算新的触发时间 → 循环
+    """
+    # 确保 cn_last_update 表存在
+    _ensure_cn_last_update_table()
+
+    while not _stop_event.is_set():
         try:
-            # 非交易日 → sleep 到明天开盘前
-            today_str = datetime.now(TZ_CN).strftime("%Y-%m-%d")
+            now = datetime.now(TZ_CN)
+            today_str = now.strftime("%Y-%m-%d")
+
+            # ── 非交易日: sleep 到明天 09:00 ──
             if not is_trading_day(today_str):
-                tomorrow = datetime.now(TZ_CN) + timedelta(days=1)
-                h, m = _BAR_END_TIMES[0]
+                tomorrow = now + timedelta(days=1)
                 wake = datetime(tomorrow.year, tomorrow.month, tomorrow.day,
-                                h, m, 0, tzinfo=TZ_CN) - timedelta(seconds=30)
-                sleep_sec = max((wake - datetime.now(TZ_CN)).total_seconds(), 60)
-                logger.info(f"[15m调度] 非交易日，sleep {sleep_sec/3600:.1f}h 到明天")
-                time.sleep(sleep_sec)
+                                9, 0, 0, tzinfo=TZ_CN)
+                sleep_sec = max((wake - now).total_seconds(), 60)
+                logger.info(f"[调度] 非交易日，sleep {sleep_sec/3600:.1f}h 到明天 09:00")
+                _stop_event.wait(timeout=sleep_sec)
                 continue
 
-            trigger = _next_bar_trigger()
-            sleep_sec = max((trigger - datetime.now(TZ_CN)).total_seconds(), 0)
-            logger.info(f"[15m调度] 下次触发 {trigger:%H:%M:%S}，sleep {sleep_sec:.0f}s")
-            time.sleep(sleep_sec)
+            # ── 计算两个任务的下次触发时间 ──
+            next_15m = _next_bar_trigger_time()
+            next_1d = _next_1d_trigger_time()
 
-            if not ENABLE_15M:
-                continue
+            # 取较近者；15m 需要提前预热，所以用 (trigger - lead) 作为唤醒时间
+            if next_15m <= next_1d:
+                target_task = "15m"
+                trigger_time = next_15m
+                # 提前 _PREPARE_LEAD_SECONDS 唤醒做预热
+                wake_time = trigger_time - timedelta(seconds=_PREPARE_LEAD_SECONDS)
+                now = datetime.now(TZ_CN)
+                if wake_time <= now:
+                    # 已过了预热时间 → 直接触发
+                    wake_time = trigger_time
+            else:
+                target_task = "1D"
+                trigger_time = next_1d
+                wake_time = trigger_time
 
-            logger.info("[15m调度] 到点，开始同步")
-            result = stock_daily_k.run_once("15m")
-            written = result.get("written", 0)
-            status = result.get("status", "")
-            logger.info(f"[15m调度] 完成: written={written} status={status}")
+            sleep_sec = max((wake_time - datetime.now(TZ_CN)).total_seconds(), 0)
+            logger.info(
+                f"[调度] 下次触发: {target_task} @ {trigger_time:%H:%M:%S}，"
+                f"sleep {sleep_sec:.0f}s"
+            )
+
+            if _stop_event.wait(timeout=sleep_sec):
+                break  # 收到停止信号
+
+            # ── 执行对应任务 ──
+            if target_task == "15m":
+                # 两阶段: 如果提前醒来，先预热再等到点
+                now = datetime.now(TZ_CN)
+                if now < trigger_time:
+                    logger.info("[调度] 15m 预热: cookie/服务器探测")
+                    _pre_prepare_providers()
+                    remaining = max((trigger_time - datetime.now(TZ_CN)).total_seconds(), 0)
+                    if remaining > 0:
+                        logger.info(f"[调度] 15m 预热完成，sleep {remaining:.0f}s 到正式触发")
+                        if _stop_event.wait(timeout=remaining):
+                            break
+
+                logger.info("[调度] 15m 开始同步")
+                result = stock_daily_k.run_once("15m")
+                logger.info(
+                    f"[调度] 15m 完成: written={result.get("written", 0)} "
+                    f"status={result.get("status", "")}"
+                )
+            else:
+                logger.info("[调度] 1D 开始同步")
+                result = stock_daily_k.run_once("1D")
+                logger.info(
+                    f"[调度] 1D 完成: written={result.get("written", 0)} "
+                    f"status={result.get("status", "")}"
+                )
 
         except Exception as e:
-            logger.error(f"[15m调度] 异常: {e}")
-            time.sleep(10)
-        except BaseException as e:          # ← 加这个
-            logger.critical(f"[15m调度] 致命异常，线程退出: {type(e).__name__}: {e}")
-            raise
+            logger.error(f"[调度] 异常: {e}")
+            _stop_event.wait(timeout=10)
+
+    logger.info("[调度] 调度器已停止")
+
 
 def start_scheduler():
-    """启动 15m 自驱动调度器（幂等，重复调用安全）。"""
+    """启动统一调度器（幂等，重复调用安全）。"""
     global _scheduler_started
     if _scheduler_started:
         return
     _scheduler_started = True
-    t = threading.Thread(target=_scheduler_15m_loop, daemon=True,
-                         name="scheduler-15m")
+    _stop_event.clear()
+    t = threading.Thread(target=_scheduler_loop, daemon=True,
+                         name="backfill-scheduler")
     t.start()
-    logger.info("[15m调度] 守护线程已启动")
+    logger.info("[调度] 统一调度器已启动（15m + 1D）")
 
 
-# 注意：不再在模块加载时自动启动调度器
-# 由 app 启动流程在初始化完成后显式调用 start_scheduler()
-# start_scheduler()  ← 已移至 app 启动入口
-
-
-# ================================================================
-# 1D + 基金/债 触发式同步
-# ================================================================
-
-_sync_running = threading.Lock()
-
-
-def trigger_sync():
-    """触发 1D / 基金 / 债同步（不含 15m）。"""
-    if not _sync_running.acquire(blocking=False):
-        return
-
-    t = threading.Thread(target=_sync_worker, daemon=True, name="backfill-sync")
-    t.start()
-
-
-def _sync_worker():
-    try:
-        _run_all_sync()
-    except Exception as e:
-        logger.error(f"[后台同步] 异常: {e}")
-    finally:
-        _sync_running.release()
-
-
-def _run_all_sync():
-    """1D 同步（15m 由独立调度器处理）。"""
-    now = datetime.now(TZ_CN)
-    today_str = now.strftime("%Y-%m-%d")
-
-    if not is_trading_day(today_str):
-        logger.info("[后台同步] 非交易日，跳过")
-        return
-
-    if not ENABLE_1D:
-        logger.info("[后台同步] 1D 已关闭，跳过")
-    else:
-        try:
-            result = stock_daily_k.run_once("1D")
-            if result.get("written", 0) > 0:
-                logger.info(f"[后台同步] 1D stock: {result.get('written')} 条")
-        except Exception as e:
-            logger.error(f"[后台同步] 1D stock 异常: {e}")
-
-
-# ================================================================
-# 全盘同步入口（保留兼容性）
-# ================================================================
-
-def run_once(tf: str | None = None, symbols: list | None = None) -> list[dict]:
-    """全盘同步入口 — 依次执行。"""
-    if tf == "15m" and not ENABLE_15M:
-        logger.info("[全盘同步] 15m 已关闭 (ENABLE_15M=False)，跳过")
-        return [{"source": stock_daily_k.source.name, "tf": "15m", "written": 0,
-                 "status": "ok", "report": "15m 已关闭"}]
-    if tf == "1D" and not ENABLE_1D:
-        logger.info("[全盘同步] 1D 已关闭 (ENABLE_1D=False)，跳过")
-        return [{"source": stock_daily_k.source.name, "tf": "1D", "written": 0,
-                 "status": "ok", "report": "1D 已关闭"}]
-
-    results = []
-    try:
-        r = stock_daily_k.run_once(tf, symbols=symbols)
-        results.append(r)
-    except Exception as e:
-        logger.error(f"[全盘同步] {stock_daily_k.source.name} 异常: {e}")
-        results.append({
-            "source": stock_daily_k.source.name, "tf": tf or "?",
-            "written": 0, "status": "error", "report": str(e),
-        })
-
-    ok = sum(1 for r in results if r["status"] == "ok")
-    errors = sum(1 for r in results if r["status"] == "error")
-    logger.info(f"[全盘同步] 完成: {ok} 成功, {errors} 失败")
-
-    return results
+def stop_scheduler():
+    """停止调度器。"""
+    _stop_event.set()
+    logger.info("[调度] 调度器停止信号已发送")
