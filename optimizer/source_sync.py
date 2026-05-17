@@ -988,8 +988,8 @@ def main():
         help="每批处理股票数（默认 500）")
     parser.add_argument("--count", type=int, default=0,
         help="每只股票拉取条数（0=自动计算）")
-    parser.add_argument("--timeout", type=float, default=60,
-        help="Coordinator 全局超时秒数（默认 60）")
+    parser.add_argument("--timeout", type=float, default=120,
+        help="Coordinator 全局超时秒数（默认 120）")
     parser.add_argument("--preferred-source", default="",
         help="指定首选数据源")
     parser.add_argument("--adj", default="qfq", choices=["qfq", "hfq", ""],

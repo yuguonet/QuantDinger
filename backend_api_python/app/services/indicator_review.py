@@ -63,26 +63,25 @@ REVIEW_TIMEFRAMES = {
     "short": {
         "label": "短线",
         "periods": [
-            {"tf": "1D", "months": 6, "label": "6月线"},
-            {"tf": "1D", "months": 3, "label": "3月线"},
-            {"tf": "1D", "months": 1, "label": "1月线"},
-            {"tf": "1H", "months": 1, "label": "1h线"},
+            {"tf": "1D", "months": 6, "label": "6月"},
+            {"tf": "1D", "months": 3, "label": "3月"},
+            {"tf": "1H", "months": 1, "label": "1月"},
         ],
     },
     "mid": {
         "label": "中线",
         "periods": [
-            {"tf": "1W", "months": 12, "label": "年线"},
-            {"tf": "1D", "months": 6, "label": "6月线"},
-            {"tf": "1D", "months": 3, "label": "3月线"},
+            {"tf": "1D", "months": 12, "label": "1年"},
+            {"tf": "1D", "months": 6, "label": "6月"},
+            {"tf": "1D", "months": 3, "label": "3月"},
         ],
     },
     "long": {
         "label": "长线",
         "periods": [
-            {"tf": "1D", "months": 6, "label": "6M"},
+            {"tf": "1D", "months": 6, "label": "6月"},
             {"tf": "1D", "months": 12, "label": "1年"},
-            {"tf": "1M", "months": 36, "label": "3年"},
+            {"tf": "1W", "months": 36, "label": "3年"},
         ],
     },
 }
