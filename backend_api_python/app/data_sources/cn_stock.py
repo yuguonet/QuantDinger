@@ -1,116 +1,133 @@
 """
-中国A股数据源
+中国A股数据源 — 简化版
 
 ═══════════════════════════════════════════════════════════════
-  K 线流程:
-    1m/5m   → 直接读远端
-    15m/1D  → DB 表 + 远端补满
-    30m/1h/2h/4h → 从 15m DB 聚合
-    1W      → 计算起止日期，从 1D DB 聚合
-    lastbar → 交易时段内用批量快照+TTL(5m)替代，否则 None
-═══════════════════════════════════════════════════════════════
+  设计思路：
 
-设计原则:
-  - 15m/1D 有 DB 表，读 DB + 远端增量补满
-  - 1m/5m 无 DB，直接走 Coordinator 远程
-  - 30m/1h/2h/4h 从 15m DB 实时聚合（内存计算）
-  - 1W 计算起止日期，从 1D DB 聚合
-  - 交易时段(交易日 9:25~17:00) 用批量快照+TTL(5m) 代替 lastbar
-  - 非交易时段 lastbar=None
-  - 分时行情 volume 需减去当日 15m 累计量
+  1. 分时线（1m/5m/15m/30m/1h/2h/4h）盘中无法获取 HL 值，
+     所以不做 DB 缓存，全部直接走远端。
+
+  2. 只有 1D / 1W 走 DB + TTL 混合流程：
+     - 1W 先转成 1D 的 count，走完 1D 流程后再聚合回周线。
+
+  3. Ticker（实时行情）：
+     - 盘中（交易日 9:15~15:01）每次必拉，保证实时性
+     - 非盘中优先走 TTL 缓存，未命中再拉远端
+     - 合并当前股 + TTL 已有 symbols（归一化，最大 500）
+     - 拉取结果写入 TTL 内存（无有效期，最旧先丢弃）
+
+  4. Kline（1D / 1W）：
+     ① lastbar = TTL 中的实时快照转 OHLCV
+     ② 读 DB 中所有 1D bar
+     ③ 快速路径：DB 数据够新（≥前一交易日）且有 lastbar
+        → 去掉今日旧数据 + 拼 lastbar → 直接返回
+     ④ 慢路径：从远端拉 1D
+        → 合并 DB + 远端（远端优先覆盖）→ 归一化去重 → 写 DB
+        → 根据 source 是否含今日 / lastbar 是否命中，三分支构造 out_kline
+     ⑤ 1D 直接返回；1W 用日线聚合为 ISO 周线后返回
+
+═══════════════════════════════════════════════════════════════
 """
 
 from __future__ import annotations
 
 import threading
 import time as _time
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, time as dtime
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.data_sources.base import BaseDataSource
 from app.data_sources.asia_stock_kline import normalize_chart_timeframe
 from app.data_sources.coordinator import get_coordinator
 from app.data_sources.kline_clean import clean_klines
-from app.data_sources.normalizer import add_market_prefix, strip_market_prefix
+from app.data_sources.normalizer import strip_market_prefix
 from app.utils.logger import get_logger
 from app.utils.trading_calendar import is_trading_day, prev_trading_day
 
 logger = get_logger(__name__)
 
-# ── DB 支持的原始周期（直接查表）──
-_RAW_TIMEFRAMES = {"15m", "1D"}
-
-# ── 聚合周期（从 15m 或 1D 在内存中聚合）──
-# 15m → 30m/1h/2h/4h/1D; 1D → 1W
-_FROM_15M = {"30m", "1h", "2h", "4h"}
-_FROM_1D  = {"1W"}
-
-# ── 远端直读周期（不做 DB）──
-_REMOTE_ONLY = {"1m", "5m"}
-
-# ── 聚合间隔（秒）──
-_INTERVAL_SEC = {
-    "15m": 900, "30m": 1800, "1h": 3600,
-    "2h": 7200, "4h": 14400, "1D": 86400, "1W": 604800,
-}
-
-# ── DB 补满最大条数 ──
-_BACKFILL_MAX = {"15m": 2000, "1D": 1000}
-
-# ── 批量快照 TTL（秒）──
-_SNAPSHOT_TTL = 300  # 5 分钟
-
 
 # ================================================================
-# 批量快照缓存（进程级单例，5 分钟 TTL）
+# TTL 快照缓存（进程级单例，无有效期）
+#
+# 为什么需要 TTL：
+#   盘中 ticker 是实时价格，但远端接口有调用频率限制。
+#   TTL 缓存让同一批 symbols 的行情可以在多次 get_kline 调用间复用，
+#   避免每个股票单独拉一次 ticker。
+#
+# 淘汰策略：
+#   最大 500 条，超限按写入时间丢弃最旧的。
+#   没有固定有效期——盘中每次 get_tickers 会刷新，非盘中直接用缓存。
 # ================================================================
 
 class _SnapshotCache:
-    """批量行情快照缓存，5 分钟有效期。"""
+    """批量行情快照缓存，无有效期（TTL），最大 500 条，最旧先丢弃。"""
+
+    _MAX_SIZE = 500
 
     def __init__(self):
-        self._quotes: List[Dict[str, Any]] = []
-        self._ts: float = 0
+        # 同时存 pure symbol 和原始 symbol 两种 key，方便查找
+        self._quotes: Dict[str, Dict[str, Any]] = {}
+        self._ts: Dict[str, float] = {}  # 每个 key 的写入时间，用于淘汰
         self._lock = threading.Lock()
 
-    def get(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """获取当前 symbol 的快照行情，过期自动刷新。"""
-        now = _time.time()
+    def symbols(self) -> List[str]:
+        """返回 TTL 中所有去重后的 symbol（去市场前缀的纯代码）。"""
         with self._lock:
-            if now - self._ts < _SNAPSHOT_TTL and self._quotes:
-                return self._find(symbol)
+            seen = set()
+            result = []
+            for key in self._quotes:
+                pure = strip_market_prefix(key)
+                if pure not in seen:
+                    seen.add(pure)
+                    result.append(pure)
+            return result
 
-        # 需要刷新
-        return self._refresh(symbol)
-
-    def _refresh(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """从 Coordinator 批量拉取快照。"""
+    def refresh(self, symbols: List[str]) -> None:
+        """单股场景下的快捷拉取：调 coordinator_tickers 并写入 TTL。"""
+        if not symbols:
+            return
         coord = get_coordinator()
         try:
-            quotes = coord.coordinate_batch_quotes(
-                symbols=[symbol],
-                market="CNStock",
-                timeout=10,
+            quotes = coord.coordinate_tickers(
+                symbols=symbols, market="CNStock", timeout=10,
             )
         except Exception as e:
             logger.debug(f"[快照] 批量拉取异常: {e}")
-            quotes = []
+            return
+        if quotes:
+            self.write(quotes)
 
+    def write(self, quotes: List[Dict[str, Any]]) -> None:
+        """将行情数据写入 TTL 内存，超 500 条按最旧时间丢弃。"""
+        now = _time.time()
         with self._lock:
-            self._quotes = quotes or []
-            self._ts = _time.time()
-        return self._find(symbol)
+            for q in quotes:
+                sym = q.get("symbol", "")
+                if not sym:
+                    continue
+                pure = strip_market_prefix(sym)
+                # 同时写入 pure 和原始两个 key，查哪个都能命中
+                for key in (pure, sym):
+                    self._quotes[key] = q
+                    self._ts[key] = now
 
-    def _find(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """从缓存中查找指定 symbol。"""
+            # 超限淘汰：按写入时间排序，最旧的先删
+            if len(self._quotes) > self._MAX_SIZE:
+                sorted_keys = sorted(self._ts, key=lambda k: self._ts[k])
+                to_remove = len(self._quotes) - self._MAX_SIZE
+                for k in sorted_keys[:to_remove]:
+                    self._quotes.pop(k, None)
+                    self._ts.pop(k, None)
+
+    def get(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """从 TTL 内存中查找指定 symbol（pure 和原始 key 都尝试）。"""
         pure = strip_market_prefix(symbol) if symbol else symbol
-        for q in self._quotes:
-            qsym = q.get("symbol", "")
-            if strip_market_prefix(qsym) == pure or qsym == pure:
-                return q
-        return None
+        with self._lock:
+            return self._quotes.get(pure) or self._quotes.get(symbol)
 
 
+# 进程级单例，全局共享同一份 TTL 缓存
 _snapshot_cache = _SnapshotCache()
 
 
@@ -119,78 +136,85 @@ _snapshot_cache = _SnapshotCache()
 # ================================================================
 
 def _is_in_trading_hours() -> bool:
-    """交易日 9:25 ~ 17:00。"""
+    """判断当前是否在交易时段内（交易日 9:15 < t <= 15:01）。
+
+    为什么是 15:01：
+      A 股 15:00 收盘，但收盘瞬间最后一笔成交可能延迟几秒，
+      给 1 分钟缓冲确保能抓到收盘价。
+    """
     now = datetime.now()
     today_str = now.strftime("%Y-%m-%d")
     if not is_trading_day(today_str):
         return False
     t = now.time()
-    return dtime(9, 25) <= t <= dtime(17, 0)
+    return dtime(9, 15) < t <= dtime(15, 1)
 
 
-def _compute_tf_time(tf: str, ref_date: str) -> int:
-    """计算时间框架的时间点（Unix 秒）。
+def _prev_trading_day_ts() -> int:
+    """前一交易日的 1D 时间戳（当天 00:00:00）。
 
-    对于分时周期：ref_date + 当日时间地板点
-    对于 1D：ref_date 00:00
-    对于 1W：ref_date 00:00（周一起点）
-
-    Args:
-        tf: 时间框架
-        ref_date: 参考日期 YYYY-MM-DD
+    用途：判断 DB 数据是否足够新——如果 DB 最后一条 ≥ 前一交易日，
+    说明 DB 已经包含了上一个交易日的收盘数据，可以走快速路径。
     """
-    if tf in ("1D", "1W"):
-        return int(datetime.strptime(ref_date, "%Y-%m-%d").timestamp())
-
-    sec = _INTERVAL_SEC.get(tf, 900)
-    now = datetime.now()
-    today_str = now.strftime("%Y-%m-%d")
-
-    # 分时：当日时间地板点
-    if ref_date == today_str:
-        market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
-        elapsed = (now - market_open).total_seconds()
-        if elapsed < 0:
-            elapsed = 0
-        floored = int(elapsed) // sec * sec
-        dt = market_open + timedelta(seconds=floored)
-        return int(dt.timestamp())
-    else:
-        # 非当日：用最后一根 bar 的时间（收盘 15:00 的地板点）
-        dt = datetime.strptime(ref_date, "%Y-%m-%d").replace(hour=15, minute=0)
-        return int(dt.timestamp())
-
-
-def _today_15m_sum(symbol: str, tf: str) -> Tuple[float, float]:
-    """读取当日 15m DB 中的 volume/amount 累计和（分时 lastbar 减量用）。
-
-    Returns:
-        (volume_sum, amount_sum)
-    """
-    if tf in ("1D", "1W"):
-        return 0.0, 0.0  # 日线及以上不需要减量
-
-    try:
-        from app.utils.db_market import get_market_kline_writer
-        writer = get_market_kline_writer()
-    except Exception:
-        return 0.0, 0.0
-
-    db_symbol = strip_market_prefix(symbol) if symbol else symbol
     today_str = datetime.now().strftime("%Y-%m-%d")
-    start_dt = datetime.strptime(today_str, "%Y-%m-%d")
+    prev_td = prev_trading_day(today_str)
+    return int(datetime.strptime(prev_td, "%Y-%m-%d").timestamp())
 
-    try:
-        rows = writer.query(
-            "CNStock", db_symbol, "15m",
-            start_time=start_dt, end_time=None, limit=50,
-        )
-    except Exception:
-        return 0.0, 0.0
 
-    vol_sum = sum(float(r.get("volume", 0)) for r in rows)
-    amt_sum = sum(float(r.get("amount", 0)) for r in rows)
-    return vol_sum, amt_sum
+def _today_ts() -> int:
+    """今日的 1D 时间戳（00:00:00），用于过滤/拼接今日数据。"""
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    return int(datetime.strptime(today_str, "%Y-%m-%d").timestamp())
+
+
+def _normalize_1d_bars(bars: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """1D 归一化：每天只留一条 bar，按时间排序。
+
+    规则：同一日期出现多条时，后面的覆盖前面的。
+    这样当 DB 旧数据和远端新数据合并时，远端（排在后面）会覆盖 DB。
+    """
+    if not bars:
+        return bars
+    by_date: Dict[str, Dict[str, Any]] = {}
+    for bar in bars:
+        dt = datetime.fromtimestamp(bar["time"])
+        date_str = dt.strftime("%Y-%m-%d")
+        by_date[date_str] = bar
+    return sorted(by_date.values(), key=lambda b: b["time"])
+
+
+def _bar_from_ticker(quote: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """将 ticker/快照数据转为 1D OHLCV bar。
+
+    转换逻辑：
+      - close = 最新价（优先 last → close → price）
+      - open/high/low 如果快照里有就用，没有就用 close 填充
+      - time 固定为今日 00:00（1D 粒度）
+      - 价格为 0 或缺失则返回 None（无效数据）
+    """
+    if not quote:
+        return None
+    price = (
+        quote.get("last")
+        or quote.get("close")
+        or quote.get("price")
+        or 0
+    )
+    if not price or float(price) <= 0:
+        return None
+
+    price = float(price)
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    bar_ts = int(datetime.strptime(today_str, "%Y-%m-%d").timestamp())
+
+    return {
+        "time": bar_ts,
+        "open": float(quote.get("open", price)),
+        "high": float(quote.get("high", price)),
+        "low": float(quote.get("low", price)),
+        "close": price,
+        "volume": float(quote.get("volume", 0)),
+    }
 
 
 # ================================================================
@@ -198,51 +222,106 @@ def _today_15m_sum(symbol: str, tf: str) -> Tuple[float, float]:
 # ================================================================
 
 class CNStockDataSource(BaseDataSource):
-    """A股数据源 — DB + 远端 + 快照混合架构。"""
+    """A股数据源 — 简化版：仅 1D/1W 走 DB，其余直走远端。"""
 
     name = "CNStock/multi-source"
 
-    # ── get_ticker: 实时行情（保持不变）──
+    # ── get_tickers: 批量行情（自选股列表）──
 
-    def get_ticker(self, symbol) -> Dict[str, Any]:
-        """获取实时行情。支持单股 / 逗号拼接 / List[str]。"""
-        if isinstance(symbol, list):
-            symbols = [s.strip() for s in symbol if s and s.strip()]
-        elif isinstance(symbol, str) and ',' in symbol:
-            symbols = [s.strip() for s in symbol.split(',') if s.strip()]
-        else:
-            symbols = [symbol] if symbol else []
+    def get_tickers(self, symbols: List[str]) -> List[Dict[str, Any]]:
+        """批量获取实时行情，写入 TTL 缓存。
 
+        流程：
+          盘中 → 每次必拉（保证实时性），合并 TTL 已有一起拉
+          非盘中 → 先查 TTL，全命中直接返回；有缺失才拉远端
+
+        拉取时会把当前股 + TTL 已有 symbols 合并（归一化，最大 500），
+        一次批量拉取，结果写入 TTL，返回全部结果。
+
+        Args:
+            symbols: 自选股列表（已归一化的 symbol）
+        Returns:
+            行情列表，每项含 symbol/open/high/low/close/volume/last 等
+        """
+        symbols = [s.strip() for s in symbols if s and s.strip()]
         if not symbols:
-            return {"last": 0, "symbol": ""}
+            return []
 
+        # ── 非盘中：先查 TTL，全命中直接返回（省一次远端调用）──
+        if not _is_in_trading_hours():
+            cached_results: List[Dict[str, Any]] = []
+            all_hit = True
+            for sym in symbols:
+                cached = _snapshot_cache.get(sym)
+                if cached:
+                    cached["symbol"] = sym
+                    cached_results.append(cached)
+                else:
+                    all_hit = False
+            if all_hit:
+                return cached_results
+
+        # ── 盘中必拉 / 非盘中有缺失 → 合并 TTL 已有 symbols 一起拉 ──
+        # 合并的目的是：一次批量请求同时刷新自选股 + 之前缓存过的股票
+        all_symbols = list(set(symbols + _snapshot_cache.symbols()))[:500]
         coord = get_coordinator()
-
-        if len(symbols) == 1:
-            result = coord.coordinate_ticker(
-                symbol=symbols[0], market="CNStock", timeout=8,
-            )
-            if not result:
-                logger.warning(f"[行情] 所有数据源均失败: {symbol}")
-                return {"last": 0, "symbol": symbols[0]}
-            result["symbol"] = symbols[0]
-            return result
-
         quotes_list = coord.coordinate_tickers(
-            symbols=symbols, market="CNStock", timeout=8,
+            symbols=all_symbols, market="CNStock", timeout=10,
         )
         if not quotes_list:
-            logger.warning(f"[行情] 所有数据源均失败: {symbol}")
-            return {"last": 0, "symbol": symbols[0]}
+            logger.warning(f"[行情] 批量拉取失败: {symbols}")
+            # 非盘中降级：返回已有的缓存（有总比没有好）
+            if not _is_in_trading_hours():
+                return [q for q in [_snapshot_cache.get(s) for s in symbols] if q]
+            return []
 
-        result_map: Dict[str, Dict[str, Any]] = {}
-        for q in quotes_list:
-            sym = q.get("symbol", "")
-            if sym:
-                result_map[sym] = q
-        return result_map
+        # 写入 TTL（后续 get_kline 会用到 lastbar）
+        _snapshot_cache.write(quotes_list)
+        return quotes_list
 
-    # ── get_kline: K 线数据（核心重写）──
+    # ── get_ticker: 单股实时行情 ──
+
+    def get_ticker(self, symbol) -> Dict[str, Any]:
+        """获取单股实时行情。
+
+        优先走 TTL 缓存，未命中时合并 TTL 已有 symbols 一起拉（顺带刷新缓存）。
+        """
+        if not symbol:
+            return {"last": 0, "symbol": ""}
+
+        sym = symbol.strip() if isinstance(symbol, str) else str(symbol)
+        if not sym:
+            return {"last": 0, "symbol": ""}
+
+        # ── 先查 TTL ──
+        cached = _snapshot_cache.get(sym)
+        if cached:
+            cached["symbol"] = sym
+            return cached
+
+        # ── TTL 没有，合并 TTL 已有 symbols 一起拉（顺带刷新缓存）──
+        all_symbols = list(set([sym] + _snapshot_cache.symbols()))[:500]
+        coord = get_coordinator()
+        quotes_list = coord.coordinate_tickers(
+            symbols=all_symbols, market="CNStock", timeout=10,
+        )
+        if not quotes_list:
+            logger.warning(f"[行情] 所有数据源均失败: {sym}")
+            return {"last": 0, "symbol": sym}
+
+        # 写入 TTL
+        _snapshot_cache.write(quotes_list)
+
+        # 从 TTL 取当前股（write 时已按 pure/symbol 双 key 存入）
+        result = _snapshot_cache.get(sym)
+        if result:
+            result["symbol"] = sym
+            return result
+
+        logger.warning(f"[行情] 拉取成功但未找到当前股: {sym}")
+        return {"last": 0, "symbol": sym}
+
+    # ── get_kline: K 线数据入口 ──
 
     def get_kline(
         self,
@@ -254,221 +333,144 @@ class CNStockDataSource(BaseDataSource):
     ) -> List[Dict[str, Any]]:
         """获取 K 线数据。
 
-        流程:
-          1m/5m     → 直接走远端
-          15m/1D    → DB 读取 + 远端增量补满 + lastbar
-          30m/1h/2h/4h → 从 15m DB 聚合 + lastbar
-          1W        → 计算起止日期，从 1D DB 聚合 + lastbar
-
-        lastbar:
-          交易日 9:25~17:00 → 批量快照+TTL(5m) - 当日 15m 累计
-          其它时间 → None
+        分流逻辑：
+          1D / 1W → 走 DB + TTL 混合流程（有本地缓存，响应快）
+          其它    → 直接走远端（分时线盘中无 HL，不值得缓存）
         """
         tf = normalize_chart_timeframe(timeframe)
         limit = max(int(limit or 300), 1)
 
-        # ── 1m / 5m: 直接走远端 ──
-        if tf in _REMOTE_ONLY:
-            return self._get_kline_remote(symbol, tf, limit, before_time, after_time)
+        if tf == "1D":
+            return self._get_kline_1d(symbol, limit)
+        if tf == "1W":
+            return self._get_kline_weekly(symbol, limit)
 
-        # ── 15m / 1D: DB 读取 + 远端增量补满 + lastbar ──
-        if tf in _RAW_TIMEFRAMES:
-            return self._get_kline_db_flow(symbol, tf, limit)
-
-        # ── 30m / 1h / 2h / 4h: 从 15m 聚合 + lastbar ──
-        if tf in _FROM_15M:
-            return self._get_kline_agg_from_15m(symbol, tf, limit)
-
-        # ── 1W: 从 1D 聚合（含起止日期计算）+ lastbar ──
-        if tf in _FROM_1D:
-            return self._get_kline_weekly(symbol, tf, limit)
-
-        # 其它周期走远端
+        # 1m/5m/15m/30m/1h/2h/4h — 直接走远端，不做 DB
         return self._get_kline_remote(symbol, tf, limit, before_time, after_time)
 
     # ================================================================
-    # 15m / 1D: DB 读取 + 远端增量补满 + lastbar
+    # 1D 核心流程
+    #
+    # 两阶段策略：
+    #   快速路径（步骤 1-3）：DB 数据够新 + TTL 有实时快照 → 直接拼接返回
+    #   慢路径（步骤 4-6）：DB 数据不够或无 lastbar → 拉远端补满 → 合并写 DB
     # ================================================================
 
-    def _get_kline_db_flow(
-        self, symbol: str, tf: str, limit: int,
+    def _get_kline_1d(
+        self, symbol: str, limit: int,
     ) -> List[Dict[str, Any]]:
-        """15m / 1D: DB + 远端增量补满 + lastbar 替换/追加。"""
+        """1D: DB + 远端补满 + lastbar。"""
         in_trading = _is_in_trading_hours()
+        today_ts = _today_ts()
+        logger.debug(f"[kline_1d] {symbol} start, in_trading={in_trading}, limit={limit}")
 
-        # ── 1. 获取 lastbar ──
+        # ── 步骤 1：尝试获取 lastbar（从 TTL 实时快照转 OHLCV）──
+        # 只有盘中才有 lastbar，非盘中 lastbar = None
         lastbar = None
         if in_trading:
-            lastbar = self._fetch_lastbar(symbol, tf)
+            quote = _snapshot_cache.get(symbol)
+            if not quote:
+                # TTL 没有 → 拉一次（refresh 会写入 TTL）
+                _snapshot_cache.refresh([symbol])
+                quote = _snapshot_cache.get(symbol)
+            if quote:
+                lastbar = _bar_from_ticker(quote)
+        logger.debug(f"[kline_1d] {symbol} lastbar={'有' if lastbar else 'None'}")
 
-        # ── 2. 读取 DB ──
-        db_bars = self._read_db(symbol, tf)
-
-        # ── 3. 判断是否需要远端补满 ──
-        if tf == "1D":
-            ref_date = datetime.now().strftime("%Y-%m-%d")
-            compare_ts = _compute_tf_time(tf, ref_date)
-        else:
-            prev_td = prev_trading_day(datetime.now().strftime("%Y-%m-%d"))
-            compare_ts = _compute_tf_time(tf, prev_td)
-
+        # ── 步骤 2：读取 DB 中所有 1D bar ──
+        db_bars = self._read_db(symbol)
         db_last_ts = db_bars[-1]["time"] if db_bars else 0
-        if compare_ts > db_last_ts:
-            remote_bars = self._fetch_remote_bars(symbol, tf)
-            if remote_bars:
-                db_bars = self._merge_and_save(symbol, tf, db_bars, remote_bars)
+        prev_td_ts = _prev_trading_day_ts()
+        logger.debug(f"[kline_1d] {symbol} DB读取 {len(db_bars)} 条, "
+                      f"db_last_ts={db_last_ts}, prev_td_ts={prev_td_ts}")
 
-        # ── 4. lastbar 替换/追加 ──
-        if lastbar is not None:
-            lb_ts = lastbar["time"]
-            if db_bars and db_bars[-1]["time"] == lb_ts:
-                db_bars[-1] = lastbar
+        # ── 步骤 3：快速路径判断 ──
+        # 条件：DB 最后一条 ≥ 前一交易日（DB 够新）且 lastbar 命中（盘中有实时数据）
+        # 满足 → 去掉今日旧 bar + 拼 lastbar → 直接返回，不走远端
+        if db_last_ts >= prev_td_ts and lastbar is not None:
+            db_bars = [b for b in db_bars if b["time"] < today_ts]
+            db_bars.append(lastbar)
+            out = db_bars[-limit:] if len(db_bars) > limit else db_bars
+            logger.debug(f"[kline_1d] {symbol} 快速路径: 去今日+lastbar, 返回 {len(out)} 条")
+            return out
+
+        # ── 步骤 4：慢路径 — 从远端取 1D K 线 ──
+        source = self._fetch_remote_1d(symbol, limit)
+        source_last_ts = source[-1]["time"] if source else 0
+        logger.debug(f"[kline_1d] {symbol} 远端返回 {len(source)} 条, "
+                      f"source_last_ts={source_last_ts}")
+
+        # ── 步骤 5：合并 DB + 远端 ──
+        # 归一化去重：以 time 为 key，同一时间只保留一条
+        # 远端优先覆盖 DB（远端数据排在后面，_normalize_1d_bars 后面覆盖前面）
+        # 合并后写回 DB，DB 长度只会 ≥ 远端返回数，旧数据得以保留
+        if source:
+            db_bars = self._merge_bars(db_bars, source)
+            db_bars = _normalize_1d_bars(db_bars)
+            self._save_to_db(symbol, db_bars)
+            logger.debug(f"[kline_1d] {symbol} 合并后 {len(db_bars)} 条")
+
+        # ── 步骤 6：三分支构造 out_kline ──
+        if source_last_ts >= today_ts:
+            # 分支 A：远端包含今日数据 → 直接用合并后的 db_kline
+            out_kline = db_bars
+            logger.debug(f"[kline_1d] {symbol} source含今日, 直接用 db_kline")
+        elif lastbar is not None:
+            # 分支 B：远端不含今日，但 lastbar 命中 → 追加 lastbar
+            out_kline = db_bars + [lastbar]
+            logger.debug(f"[kline_1d] {symbol} 追加 lastbar")
+        else:
+            # 分支 C：远端不含今日，lastbar 也没有 → 尝试取 ticker 转 bar
+            quote = _snapshot_cache.get(symbol)
+            if not quote:
+                _snapshot_cache.refresh([symbol])
+                quote = _snapshot_cache.get(symbol)
+            ticker_bar = _bar_from_ticker(quote) if quote else None
+            if ticker_bar:
+                out_kline = db_bars + [ticker_bar]
+                logger.debug(f"[kline_1d] {symbol} ticker 转 bar 追加")
             else:
-                db_bars.append(lastbar)
+                # 都没有 → 只能用 DB 历史数据
+                out_kline = db_bars
+                logger.debug(f"[kline_1d] {symbol} ticker 也无数据, 只用 db")
 
-        # ── 5. 返回最新 limit 条 ──
-        if len(db_bars) > limit:
-            db_bars = db_bars[-limit:]
-        return db_bars
-
-    # ================================================================
-    # 30m / 1h / 2h / 4h: 从 15m DB 聚合 + lastbar
-    # ================================================================
-
-    def _get_kline_agg_from_15m(
-        self, symbol: str, tf: str, limit: int,
-    ) -> List[Dict[str, Any]]:
-        """30m/1h/2h/4h: 从 15m DB 聚合 + lastbar。"""
-        in_trading = _is_in_trading_hours()
-
-        # ── 1. 获取 lastbar ──
-        lastbar = None
-        if in_trading:
-            lastbar = self._fetch_lastbar(symbol, tf)
-
-        # ── 2. 读取 15m DB ──
-        raw_bars = self._read_db(symbol, "15m")
-
-        # ── 3. 判断是否需要远端补满 15m ──
-        prev_td = prev_trading_day(datetime.now().strftime("%Y-%m-%d"))
-        compare_ts = _compute_tf_time("15m", prev_td)
-        db_last_ts = raw_bars[-1]["time"] if raw_bars else 0
-        if compare_ts > db_last_ts:
-            remote_bars = self._fetch_remote_bars(symbol, "15m")
-            if remote_bars:
-                raw_bars = self._merge_and_save(symbol, "15m", raw_bars, remote_bars)
-
-        # ── 4. 聚合 ──
-        agg_bars = self._aggregate_bars(raw_bars, tf)
-
-        # ── 5. lastbar 替换/追加 ──
-        if lastbar is not None:
-            lb_ts = lastbar["time"]
-            if agg_bars and agg_bars[-1]["time"] == lb_ts:
-                agg_bars[-1] = lastbar
-            else:
-                agg_bars.append(lastbar)
-
-        # ── 6. 返回最新 limit 条 ──
-        if len(agg_bars) > limit:
-            agg_bars = agg_bars[-limit:]
-        return agg_bars
+        # 返回最新 limit 条（数量不够就全部返回）
+        out = out_kline[-limit:] if len(out_kline) > limit else out_kline
+        logger.debug(f"[kline_1d] {symbol} 最终返回 {len(out)} 条")
+        return out
 
     # ================================================================
-    # 1W: 计算起止日期，从 1D 聚合 + lastbar
+    # 1W: limit 转 1D count → 走 1D 流程 → ISO 周聚合
+    #
+    # 为什么先走 1D 再聚合：
+    #   1W 的数据本质是 5 个交易日的 OHLCV 聚合。
+    #   直接从远端取周线可能不含今日盘中数据，
+    #   但走 1D 流程可以利用 lastbar 拼出今日数据，聚合后周线也实时。
     # ================================================================
 
     def _get_kline_weekly(
-        self, symbol: str, tf: str, limit: int,
+        self, symbol: str, limit: int,
     ) -> List[Dict[str, Any]]:
-        """1W: 计算起止日期，从 1D DB 聚合 + lastbar。"""
-        in_trading = _is_in_trading_hours()
+        """1W: 转成 1D count → 走 1D 流程 → ISO 周聚合。"""
+        # 每周约 5 个交易日，×7 留冗余保证聚合后数量充足
+        daily_count = max(limit * 7, 60)
 
-        # ── 1. 获取 lastbar ──
-        lastbar = None
-        if in_trading:
-            lastbar = self._fetch_lastbar(symbol, tf)
+        # 复用 1D 流程（含 DB + lastbar 逻辑）
+        daily_bars = self._get_kline_1d(symbol, daily_count)
+        logger.debug(f"[kline_weekly] {symbol} 获取日线 {len(daily_bars)} 条")
 
-        # ── 2. 计算起止日期 ──
-        # 需要足够多天的日线来聚合出 limit 根周线
-        # 每根周线 ≈ 5 个交易日 ≈ 7 个自然日，留余量用 10
-        now = datetime.now()
-        today_str = now.strftime("%Y-%m-%d")
-        lookback_days = max(limit * 10, 60)
-        start_date = (now - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-        # 结束日期：交易中用今天，否则用上一个交易日
-        end_date = today_str if in_trading else prev_trading_day(today_str)
+        # 按 ISO 周聚合为周线
+        out_kline = self._aggregate_weekly(daily_bars)
 
-        # ── 3. 读取 1D DB（按日期范围）──
-        try:
-            from app.utils.db_market import get_market_kline_writer
-            writer = get_market_kline_writer()
-            db_symbol = strip_market_prefix(symbol) if symbol else symbol
-            start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-            end_dt = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
-            rows = writer.query(
-                "CNStock", db_symbol, "1D",
-                start_time=start_dt, end_time=end_dt, limit=500,
-            )
-        except Exception:
-            rows = []
-
-        daily_bars = []
-        for row in rows:
-            t = row.get("time")
-            ts = int(t.timestamp()) if isinstance(t, datetime) else int(t)
-            daily_bars.append({
-                "time": ts,
-                "open": float(row.get("open", 0)),
-                "high": float(row.get("high", 0)),
-                "low": float(row.get("low", 0)),
-                "close": float(row.get("close", 0)),
-                "volume": float(row.get("volume", 0)),
-            })
-
-        # ── 4. 如果 DB 没有足够数据，远端补满 ──
-        if not daily_bars:
-            remote_bars = self._fetch_remote_bars(symbol, "1D")
-            if remote_bars:
-                self._save_to_db(symbol, "1D", remote_bars)
-                # 重新查询
-                try:
-                    rows = writer.query(
-                        "CNStock", db_symbol, "1D",
-                        start_time=start_dt, end_time=end_dt, limit=500,
-                    )
-                    for row in rows:
-                        t = row.get("time")
-                        ts = int(t.timestamp()) if isinstance(t, datetime) else int(t)
-                        daily_bars.append({
-                            "time": ts,
-                            "open": float(row.get("open", 0)),
-                            "high": float(row.get("high", 0)),
-                            "low": float(row.get("low", 0)),
-                            "close": float(row.get("close", 0)),
-                            "volume": float(row.get("volume", 0)),
-                        })
-                except Exception:
-                    pass
-
-        # ── 5. 聚合为周线 ──
-        agg_bars = self._aggregate_bars(daily_bars, "1W")
-
-        # ── 6. lastbar 替换/追加 ──
-        if lastbar is not None:
-            lb_ts = lastbar["time"]
-            if agg_bars and agg_bars[-1]["time"] == lb_ts:
-                agg_bars[-1] = lastbar
-            else:
-                agg_bars.append(lastbar)
-
-        # ── 7. 返回最新 limit 条 ──
-        if len(agg_bars) > limit:
-            agg_bars = agg_bars[-limit:]
-        return agg_bars
+        out = out_kline[-limit:] if len(out_kline) > limit else out_kline
+        logger.debug(f"[kline_weekly] {symbol} 聚合后返回 {len(out)} 条")
+        return out
 
     # ================================================================
-    # 远端直读（1m / 5m）
+    # 远端直读（非 1D/1W 周期）
+    #
+    # 分时线盘中无法获取完整的 OHLCV（HL 值缺失），
+    # 做 DB 缓存没有意义，直接走远端拿最新数据即可。
     # ================================================================
 
     def _get_kline_remote(
@@ -479,7 +481,7 @@ class CNStockDataSource(BaseDataSource):
         before_time: Optional[int] = None,
         after_time: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """直接走 Coordinator 远程拉取（1m/5m 专用，不做 DB）。"""
+        """直接走 Coordinator 远程拉取（不做 DB 缓存）。"""
         remote_tf = normalize_chart_timeframe(tf)
         coord_result = get_coordinator().coordinate_kline(
             symbol=symbol,
@@ -500,11 +502,11 @@ class CNStockDataSource(BaseDataSource):
         )
 
     # ================================================================
-    # DB 操作
+    # DB 操作（仅 1D 使用）
     # ================================================================
 
-    def _read_db(self, symbol: str, tf: str) -> List[Dict[str, Any]]:
-        """从 DB 读取 K 线，按时间升序返回。"""
+    def _read_db(self, symbol: str) -> List[Dict[str, Any]]:
+        """从 DB 读取 1D K 线，按时间升序返回。"""
         try:
             from app.utils.db_market import get_market_kline_writer
             writer = get_market_kline_writer()
@@ -514,7 +516,7 @@ class CNStockDataSource(BaseDataSource):
         db_symbol = strip_market_prefix(symbol) if symbol else symbol
         try:
             rows = writer.query(
-                "CNStock", db_symbol, tf,
+                "CNStock", db_symbol, "1D",
                 start_time=None, end_time=None, limit=10000,
             )
         except Exception:
@@ -534,16 +536,14 @@ class CNStockDataSource(BaseDataSource):
             })
         return bars
 
-    def _save_to_db(self, symbol: str, tf: str, bars: List[Dict[str, Any]]) -> None:
-        """写入 DB（覆盖）。"""
+    def _save_to_db(self, symbol: str, bars: List[Dict[str, Any]]) -> None:
+        """写入 1D DB（upsert 覆盖同时间 bar）。"""
         if not bars:
             return
         try:
             from app.utils.db_market import get_market_kline_writer
             writer = get_market_kline_writer()
             db_symbol = strip_market_prefix(symbol) if symbol else symbol
-
-            # 转为 datetime（DB writer 需要）
             db_bars = []
             for b in bars:
                 bar = dict(b)
@@ -551,38 +551,17 @@ class CNStockDataSource(BaseDataSource):
                 if isinstance(t, (int, float)):
                     bar["time"] = datetime.fromtimestamp(t)
                 db_bars.append(bar)
-
-            writer.upsert("CNStock", db_symbol, tf, db_bars)
-            logger.debug(f"[DB写入] {db_symbol}/{tf} 写入 {len(db_bars)} 条")
+            writer.upsert("CNStock", db_symbol, "1D", db_bars)
+            logger.debug(f"[DB写入] {db_symbol}/1D 写入 {len(db_bars)} 条")
         except Exception as e:
-            logger.debug(f"[DB写入] {symbol}/{tf} 失败: {e}")
+            logger.debug(f"[DB写入] {symbol}/1D 失败: {e}")
 
-    def _merge_and_save(
-        self,
-        symbol: str,
-        tf: str,
-        db_bars: List[Dict[str, Any]],
-        remote_bars: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        """合并 DB + 远端 K 线（远端优先去重），写回 DB，返回合并结果。"""
-        merged = self._merge_bars(db_bars, remote_bars)
-        self._save_to_db(symbol, tf, merged)
-        return merged
-
-    # ================================================================
-    # 远端拉取 + 归一化
-    # ================================================================
-
-    def _fetch_remote_bars(
-        self, symbol: str, tf: str,
-    ) -> List[Dict[str, Any]]:
-        """从远端拉取 15m 或 1D K 线，归一化 + 去错。"""
-        remote_tf = normalize_chart_timeframe(tf)
-        max_count = _BACKFILL_MAX.get(tf, 1000)
+    def _fetch_remote_1d(self, symbol: str, count: int) -> List[Dict[str, Any]]:
+        """从远端拉取 1D K 线，归一化 time 为 int 时间戳。"""
         coord_result = get_coordinator().coordinate_kline(
             symbol=symbol,
-            timeframe=remote_tf,
-            limit=max_count,
+            timeframe="1D",
+            limit=count,
             market="CNStock",
             timeout=30,
             adj="qfq",
@@ -591,7 +570,7 @@ class CNStockDataSource(BaseDataSource):
         if not bars:
             return []
 
-        # 归一化 time 为 int 时间戳
+        # 归一化 time 为 int 时间戳（远端返回格式不统一，可能是 str/datetime/int）
         for bar in bars:
             t = bar.get("time")
             if isinstance(t, str):
@@ -605,12 +584,18 @@ class CNStockDataSource(BaseDataSource):
             elif isinstance(t, datetime):
                 bar["time"] = int(t.timestamp())
 
-        # 去错 + 补齐缺失
-        bars = clean_klines(bars, tf)
+        bars.sort(key=lambda b: b["time"])
+        bars = clean_klines(bars, "1D")
+        bars = _normalize_1d_bars(bars)
         return bars
 
     # ================================================================
-    # 合并去重
+    # 合并去重（远端优先覆盖 DB）
+    #
+    # 策略：以 time 字段为 key 做 dict 去重
+    #   - 先放 DB 数据
+    #   - 再放远端数据（同 time 的 bar 会被远端覆盖）
+    #   - 这样远端的修正会自动覆盖 DB 中的误差数据
     # ================================================================
 
     @staticmethod
@@ -618,61 +603,26 @@ class CNStockDataSource(BaseDataSource):
         db_bars: List[Dict[str, Any]],
         remote_bars: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        """合并 DB + 远端 K 线，远端优先，按时间去重，保留旧数据。"""
+        """合并 DB + 远端 K 线，远端优先，按时间去重。"""
         by_time: Dict[int, Dict[str, Any]] = {}
         for bar in db_bars:
             by_time[bar["time"]] = bar
         for bar in remote_bars:
             by_time[bar["time"]] = bar  # 远端覆盖 DB
-        merged = sorted(by_time.values(), key=lambda b: b["time"])
-        return merged
+        return sorted(by_time.values(), key=lambda b: b["time"])
 
     # ================================================================
-    # 聚合（内存计算）
+    # 聚合（周线专用）
+    #
+    # ISO 周聚合规则：
+    #   - 按 isocalendar() 的 (year, week) 分组
+    #   - open  = 该周第一条的 open
+    #   - high  = 该周所有 high 的最大值
+    #   - low   = 该周所有 low 的最小值
+    #   - close = 该周最后一条的 close
+    #   - volume = 该周所有 volume 之和
+    #   - time  = 该周周一 00:00 的时间戳
     # ================================================================
-
-    @staticmethod
-    def _aggregate_bars(
-        bars: List[Dict[str, Any]], target_tf: str,
-    ) -> List[Dict[str, Any]]:
-        """将原始 K 线聚合为目标周期（内存计算）。
-
-        15m → 30m/1h/2h/4h: 按时间间隔分桶
-        1D → 1W: 按 ISO 周分桶
-
-        聚合规则:
-          open   = 桶内第一根的 open
-          high   = 桶内所有 high 的最大值
-          low    = 桶内所有 low 的最小值
-          close  = 桶内最后一根的 close
-          volume = 桶内所有 volume 之和
-        """
-        if not bars:
-            return []
-
-        if target_tf == "1W":
-            return CNStockDataSource._aggregate_weekly(bars)
-
-        sec = _INTERVAL_SEC.get(target_tf, 3600)
-        buckets: Dict[int, List[Dict[str, Any]]] = {}
-
-        for bar in bars:
-            bucket_key = bar["time"] // sec * sec
-            buckets.setdefault(bucket_key, []).append(bar)
-
-        result = []
-        for bucket_ts in sorted(buckets.keys()):
-            group = buckets[bucket_ts]
-            group.sort(key=lambda b: b["time"])
-            result.append({
-                "time": bucket_ts,
-                "open": group[0]["open"],
-                "high": max(b["high"] for b in group),
-                "low": min(b["low"] for b in group),
-                "close": group[-1]["close"],
-                "volume": round(sum(b["volume"] for b in group), 2),
-            })
-        return result
 
     @staticmethod
     def _aggregate_weekly(bars: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -684,14 +634,13 @@ class CNStockDataSource(BaseDataSource):
         for bar in bars:
             dt = datetime.fromtimestamp(bar["time"])
             iso = dt.isocalendar()
-            key = (iso[0], iso[1])  # (year, week_number)
+            key = (iso[0], iso[1])
             weeks.setdefault(key, []).append(bar)
 
         result = []
         for key in sorted(weeks.keys()):
             group = weeks[key]
             group.sort(key=lambda b: b["time"])
-            # 周一起始时间
             year, week = key
             monday = datetime.fromisocalendar(year, week, 1)
             monday_ts = int(monday.replace(hour=0, minute=0, second=0).timestamp())
@@ -704,62 +653,3 @@ class CNStockDataSource(BaseDataSource):
                 "volume": round(sum(b["volume"] for b in group), 2),
             })
         return result
-
-    # ================================================================
-    # lastbar 计算
-    # ================================================================
-
-    def _fetch_lastbar(
-        self, symbol: str, tf: str,
-    ) -> Optional[Dict[str, Any]]:
-        """获取当前周期的 lastbar（批量快照 + 减当日 15m 累计）。
-
-        仅在交易时段内调用。
-        """
-        quote = _snapshot_cache.get(symbol)
-        if not quote:
-            return None
-
-        # 当前价格
-        price = (
-            quote.get("last")
-            or quote.get("close")
-            or quote.get("price")
-            or 0
-        )
-        if not price or float(price) <= 0:
-            return None
-
-        price = float(price)
-
-        # 时间地板点
-        now = datetime.now()
-        today_str = now.strftime("%Y-%m-%d")
-        if tf in ("1D", "1W"):
-            bar_ts = int(datetime.strptime(today_str, "%Y-%m-%d").timestamp())
-        else:
-            sec = _INTERVAL_SEC.get(tf, 900)
-            market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
-            elapsed = max(0, (now - market_open).total_seconds())
-            floored = int(elapsed) // sec * sec
-            dt = market_open + timedelta(seconds=floored)
-            bar_ts = int(dt.timestamp())
-
-        # 成交量：快照累计 - 当日 15m 累计
-        snap_vol = float(quote.get("volume", 0))
-        vol_15m_sum, _ = _today_15m_sum(symbol, tf)
-        volume = max(0, snap_vol - vol_15m_sum)
-
-        # 价格字段
-        open_p = float(quote.get("open", price))
-        high_p = float(quote.get("high", price))
-        low_p = float(quote.get("low", price))
-
-        return {
-            "time": bar_ts,
-            "open": open_p,
-            "high": high_p,
-            "low": low_p,
-            "close": price,
-            "volume": round(volume, 2),
-        }

@@ -2,18 +2,17 @@
 backfill_db.py — A 股 K 线增量同步 + 后台调度
 
 ═══════════════════════════════════════════════════════════════
-  架构位置: backfill_db → provider(15m直调) / coordinator(1D)
+  架构位置: backfill_db → coordinator(kline/15m) / coordinator(1D)
 ═══════════════════════════════════════════════════════════════
 
 核心职责:
-  1. 盘中增量同步当日 15m bar（精确到具体 bar 时间点）
-  2. 17:00 后同步当日 1D bar
+  1. 交易日 15:05 后同步当日 15m bar（16 条，走 kline API）
+  2. 交易日 17:05 后同步当日 1D bar
   3. 首次运行时做历史回填
   4. 后台自动调度，不影响主线程
 
 数据流:
-  15m → get_providers("batch_quote") → _batch_fetch_quotes_by_codes(500/组)
-        → 多 provider 并发 → 合并去重 → bulk_write
+  15m → coordinator.coordinate_batch_klines() → 16 bars/标的 → bulk_write
   1D  → coordinator.coordinate_batch_quotes() → 重试+去重 → bulk_write
   ↓
   db_market.upsert() → PostgreSQL
@@ -22,8 +21,9 @@ backfill_db.py — A 股 K 线增量同步 + 后台调度
 
 设计原则:
   1. cn_last_update 是唯一的调度控制表
-  2. 15m 在 bar 结束前 30s 触发下载（如 9:44:30, 9:59:30 ...）
-  3. 1D 每个交易日 17:00 后同步一次，<90% 则重试（最多 5 次，两次比对去重）
+  2. 15m 每个交易日 15:05 后同步一次（kline API，当天 16 条 bar）
+     盘中无法获取分时线 OHLCV 中的 HL 值，故不在盘中拉取
+  3. 1D 每个交易日 17:05 后同步一次
   4. 非交易日不执行
   5. 后台 daemon 线程自动运行，fire-and-forget
   6. 所有数据源走内联 provider，不依赖外部 API
@@ -31,7 +31,6 @@ backfill_db.py — A 股 K 线增量同步 + 后台调度
 
 import logging
 import threading
-import time
 from datetime import datetime, timedelta, timezone, time as dt_time
 
 from app.utils.db_market import get_market_db_manager, get_market_kline_writer
@@ -54,7 +53,21 @@ _BATCH_TIMEOUT_15M = 300
 # 1D 下载超时（秒）
 _BATCH_TIMEOUT_1D = 300
 
-# 1D 无需内部重试 — 调度器 17:00 后每轮自动重试
+# 15m 每个交易日拉取的 bar 数量（9:30-15:00 共 16 根 15m bar）
+_15M_BARS_PER_DAY = 16
+
+# 15m 标准 bar 结束时间集合（时, 分）— 用于过滤非标准 bar
+_VALID_15M_BAR_END_TIMES: set[tuple[int, int]] = {
+    (9, 45), (10, 0), (10, 15), (10, 30),
+    (10, 45), (11, 0),  (11, 15), (11, 30),
+    (13, 15), (13, 30), (13, 45), (14, 0),
+    (14, 15), (14, 30), (14, 45), (15, 0),
+}
+
+# 15m 标准 bar 结束时间有序列表（用于归一化查找）
+_VALID_15M_BAR_TIMES_SORTED = sorted(_VALID_15M_BAR_END_TIMES)
+
+# 1D 无需内部重试 — 调度器 17:05 后每轮自动重试
 # 增量同步: 首次全量拉取+写入，后续只补拉缺失 symbols
 
 
@@ -178,77 +191,6 @@ def _record_update(source_name: str, tf: str, status: str, report: str,
 
 
 # ================================================================
-# 15m bar 时间表 — 固定时间点 + 提前 30s 触发
-# ================================================================
-#
-# A 股交易时段: 9:30-11:30, 13:00-15:00
-# 15m bar 的结束时间（北京时间）:
-#   09:45, 10:00, 10:15, 10:30,
-#   10:45, 11:00, 11:15, 11:30,
-#   13:15, 13:30, 13:45, 14:00,
-#   14:15, 14:30, 14:45, 15:00
-#
-# 触发时间 = bar 结束前 30s:
-#   9:44:30, 9:59:30, 10:14:30, 10:29:30,
-#   10:44:30, 10:59:30, 11:14:30, 11:29:30,
-#   13:14:30, 13:29:30, 13:44:30, 13:59:30,
-#   14:14:30, 14:29:30, 14:44:30, 14:59:30
-#
-
-# 15m bar 结束时间（时, 分）— 北京时间
-_BAR_END_TIMES = [
-    (9, 45),  (10, 0),  (10, 15), (10, 30),
-    (10, 45), (11, 0),  (11, 15), (11, 30),
-    (13, 15), (13, 30), (13, 45), (14, 0),
-    (14, 15), (14, 30), (14, 45), (15, 0),
-]
-
-
-def _latest_finished_bar_time() -> datetime | None:
-    """返回当前时间之前最近一根已结束的 15m bar 的标准结束时间。
-
-    不用 delay，只看 bar 结束时间是否已过。
-    """
-    now = datetime.now(TZ_CN)
-    latest = None
-    for h, m in _BAR_END_TIMES:
-        bar_end = datetime(now.year, now.month, now.day, h, m, 0, tzinfo=TZ_CN)
-        if bar_end <= now:
-            latest = bar_end
-        else:
-            break
-    return latest
-
-
-def _normalize_to_bar_time(dt_obj: datetime) -> datetime:
-    """将任意时间标准化到其所属 15m bar 的标准结束时间。
-
-    例: 10:05:00 → 属于 10:00~10:15 这根 bar → 返回 10:15
-        09:29:00 → 盘前，不属于任何 bar → 返回 None（由调用方处理）
-        12:00:00 → 午休，不属于任何 bar → 返回 None
-    """
-    t = dt_obj.astimezone(TZ_CN) if dt_obj.tzinfo else dt_obj.replace(tzinfo=TZ_CN)
-    t_time = t.time()
-
-    # 盘前 (09:30 前) → 不属于任何 bar
-    if t_time < dt_time(9, 30):
-        return None
-
-    # 午休 (11:30 ~ 13:00) → 不属于任何 bar
-    if dt_time(11, 30) < t_time < dt_time(13, 0):
-        return None
-
-    # 从 _BAR_END_TIMES 中找到第一个结束时间 >= t_time 的 bar
-    for h, m in _BAR_END_TIMES:
-        bar_end_time = dt_time(h, m)
-        if t_time <= bar_end_time:
-            return datetime(t.year, t.month, t.day, h, m, 0, tzinfo=TZ_CN)
-
-    # 超过 15:00 → 归到 15:00
-    return datetime(t.year, t.month, t.day, 15, 0, 0, tzinfo=TZ_CN)
-
-
-# ================================================================
 # 判断逻辑
 # ================================================================
 
@@ -295,6 +237,45 @@ def _same_trading_day(dt1: datetime, dt2: datetime) -> bool:
     return _own_trading_day(d1) == _own_trading_day(d2)
 
 
+def _normalize_15m_bar_time(dt_obj: datetime) -> datetime | None:
+    """将任意时间标准化到其所属 15m bar 的标准结束时间。
+
+    规则:
+      - 盘前 (< 09:30) → None
+      - 午休 (11:30 ~ 13:00) → None
+      - 盘后 (> 15:00) → 归到 15:00
+      - 交易时段内 → 找到所属 bar 的标准结束时间
+
+    例: 09:30:00 → 09:45（第一根 bar）
+        09:44:59 → 09:45
+        09:45:00 → 09:45（精确命中 bar 结束时间）
+        09:45:01 → 10:00（属于 09:45~10:00 这根 bar）
+        10:05:00 → 10:15
+        12:00:00 → None（午休）
+        13:00:00 → 13:15（下午第一根 bar）
+        15:30:00 → 15:00（盘后归到最后一根 bar）
+    """
+    t = dt_obj.astimezone(TZ_CN) if dt_obj.tzinfo else dt_obj.replace(tzinfo=TZ_CN)
+    t_time = t.time()
+
+    # 盘前 (< 09:30) → 不属于任何 bar
+    if t_time < dt_time(9, 30):
+        return None
+
+    # 午休 (11:30 < t < 13:00) → 不属于任何 bar
+    if dt_time(11, 30) < t_time < dt_time(13, 0):
+        return None
+
+    # 从有序列表中找到第一个结束时间 >= t_time 的 bar
+    for h, m in _VALID_15M_BAR_TIMES_SORTED:
+        bar_end_time = dt_time(h, m)
+        if t_time <= bar_end_time:
+            return datetime(t.year, t.month, t.day, h, m, 0, tzinfo=TZ_CN)
+
+    # 超过 15:00 → 归到最后一根 bar (15:00)
+    return datetime(t.year, t.month, t.day, 15, 0, 0, tzinfo=TZ_CN)
+
+
 # ================================================================
 # 数据源配置
 # ================================================================
@@ -317,25 +298,74 @@ class BackfillSource:
 class BackfillDB:
     """全盘批量同步工具。
 
-    A 股 15m: 直调 provider.fetch_batch_quotes（透传，无重试）
-    A 股 1D: coordinator.coordinate_batch_quotes（含重试）
-    基金/债: Dinger API
+    A 股 15m: 15:05 后通过 coordinator.coordinate_batch_klines 拉取当天 16 条 bar
+    A 股 1D:  coordinator.coordinate_batch_quotes（含重试）
+    基金/债:  Dinger API
     """
 
     def __init__(self, source: BackfillSource):
         self.source = source
         self._writer = get_market_kline_writer()
 
+    # ── OHLCV 提取 + 校验（15m / 1D 共用） ──
+
+    @staticmethod
+    def _parse_ohlcv(record: dict, field_map: dict | None = None) -> tuple[float, float, float, float, float] | None:
+        """从 quote/bar dict 提取 OHLCV，校验后返回 (o, h, l, c, v)。
+
+        field_map: 自定义字段映射，默认 {"open":"open", "high":"high", "low":"low",
+                   "close":"close", "volume":"volume"}，1D 的 close 字段可传 "last"。
+        返回 None 表示数据无效（应跳过/记为失败）。
+        """
+        fm = field_map or {}
+        o = float(record.get(fm.get("open", "open"), 0) or 0)
+        h = float(record.get(fm.get("high", "high"), 0) or 0)
+        l = float(record.get(fm.get("low", "low"), 0) or 0)
+        c = float(record.get(fm.get("close", "close"), 0) or 0)
+        v = float(record.get(fm.get("volume", "volume"), 0) or 0)
+
+        # 1D 兼容: close 可能在 "last" 字段
+        if c <= 0:
+            c = float(record.get("last", 0) or 0)
+
+        if o == 0 and h == 0 and l == 0 and c == 0:
+            return None
+        if c <= 0 or o <= 0:
+            return None
+        if h > 0 and l > 0 and h < l:
+            h, l = l, h
+
+        return o, h, l, c, v
+
+    @staticmethod
+    def _parse_bar_time(bar: dict, fallback: datetime) -> datetime:
+        """从 kline bar dict 解析时间戳，失败则返回 fallback。"""
+        bt = bar.get("time")
+        if isinstance(bt, str):
+            try:
+                return datetime.strptime(bt, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ_CN)
+            except ValueError:
+                return fallback
+        if isinstance(bt, datetime):
+            return bt.astimezone(TZ_CN) if bt.tzinfo else bt.replace(tzinfo=TZ_CN)
+        return fallback
+
     def run_once(self, tf: str | None = None, symbols: list | None = None) -> dict:
         """执行一次同步。tf 默认取 source.timeframe。"""
         tf = tf or self.source.timeframe
 
         pool = self.source.db_pool
-        latest_bar = _latest_finished_bar_time()
 
         try:
             if tf == "15m":
-                written, failed = self._sync_15m(symbols)
+                # 判断是否当天首次运行（用于决定是否清除当日旧 bar）
+                doc = _get_last_update(self.source.name, "15m", pool_name=pool)
+                is_first_run = True
+                if doc:
+                    lu = _parse_db_timestamp(doc.get("last_updated"))
+                    if lu and _same_trading_day(lu, datetime.now(TZ_CN)):
+                        is_first_run = False
+                written, failed = self._sync_15m(symbols, is_first_run=is_first_run)
             elif tf == "1D":
                 # 判断是否当天首次运行（用于决定是否清除当日旧 bar）
                 doc = _get_last_update(self.source.name, "1D", pool_name=pool)
@@ -353,8 +383,7 @@ class BackfillDB:
         except Exception as e:
             report = f"同步异常: {e}"
             logger.error(f"[同步] {self.source.name} tf={tf} {report}")
-            _record_update(self.source.name, tf, "error", report,
-                           last_bar_time=latest_bar, pool_name=pool)
+            _record_update(self.source.name, tf, "error", report, pool_name=pool)
             return {
                 "source": self.source.name, "tf": tf,
                 "written": 0, "status": "error", "report": report,
@@ -366,50 +395,161 @@ class BackfillDB:
                 f"{len(failed)} 只标的失败，下次同步自然重试"
             )
 
-        # 1D: _sync_1d 内部已落盘 cn_last_update，直接读取返回
-        if tf == "1D":
-            doc = _get_last_update(self.source.name, "1D", pool_name=pool)
-            status = doc.get("status", "ok") if doc else "ok"
-            report = doc.get("report", f"写入 {written} 条") if doc else f"写入 {written} 条"
-            return {
-                "source": self.source.name, "tf": tf,
-                "written": written, "status": status, "report": report,
-            }
-
-        if written == 0:
-            report = "未获取到数据"
-            logger.warning(f"[同步] {self.source.name} tf={tf} {report}")
-            # 即使无数据也要记录，防止同一 bar 被重复触发
-            _record_update(self.source.name, tf, "empty", report,
-                           last_bar_time=latest_bar, pool_name=pool)
-            return {
-                "source": self.source.name, "tf": tf,
-                "written": 0, "status": "empty", "report": report,
-            }
-
-        report = f"写入 {written} 条"
-        _record_update(self.source.name, tf, "ok", report,
-                       last_bar_time=latest_bar, pool_name=pool)
-        logger.info(f"[同步] {self.source.name} tf={tf} {report}")
-
+        # _sync_15m / _sync_1d 内部已落盘 cn_last_update，直接读取返回
+        doc = _get_last_update(self.source.name, tf, pool_name=pool)
+        status = doc.get("status", "ok") if doc else "ok"
+        report = doc.get("report", f"写入 {written} 条") if doc else f"写入 {written} 条"
         return {
             "source": self.source.name, "tf": tf,
-            "written": written, "status": "ok", "report": report,
+            "written": written, "status": status, "report": report,
         }
 
-    # ── 15m 同步: 直调 provider.fetch_batch_quotes + 并发分组 + 合并去重 ──
+    # ── 15m kline 数据拉取 ──
 
-    def _sync_15m(self, symbols: list | None = None) -> tuple[int, list[str]]:
-        """15m 同步: 直接调用各 provider 的 fetch_batch_quotes，并发分组拉取，合并去重后写入 DB。
+    def _fetch_15m_klines(self, symbols: list) -> list[dict]:
+        """拉取 15m kline 数据。优先 coordinator，失败则回退到 provider 直调。"""
+        from app.data_sources.coordinator import get_coordinator
 
-        不经过 coordinator，直接透传 provider。
-        每个 provider 内部按 batch_size=500 分组并发（如新浪/腾讯每组500只，11组）。
-        多个 provider 之间也并发执行。
-        返回: (写入条数, 失败symbols列表)
-        """
+        coord = get_coordinator()
+        try:
+            klines = coord.coordinate_batch_klines(
+                symbols=symbols,
+                market=self.source.market,
+                timeframe="15m",
+                count=_15M_BARS_PER_DAY,
+                timeout=float(_BATCH_TIMEOUT_15M),
+            )
+            if klines:
+                return klines
+        except AttributeError:
+            logger.info(f"[同步] {self.source.name} coordinator 无 kline 方法，回退到 provider 直调")
+        except Exception as e:
+            logger.warning(f"[同步] {self.source.name} coordinator kline 失败: {e}，回退到 provider 直调")
+
+        return self._fetch_15m_via_provider(symbols)
+
+    def _fetch_15m_via_provider(self, symbols: list) -> list[dict]:
+        """回退方案: 直调 provider 的 kline 方法，逐 symbol 拉取 15m 数据。"""
         import concurrent.futures
         from app.data_sources.normalizer import strip_market_prefix
-        from app.data_sources.provider import get_providers, _batch_fetch_quotes_by_codes
+        from app.data_sources.provider import get_providers
+
+        providers = get_providers(capability="kline", market=self.source.market)
+        if not providers:
+            logger.warning(f"[同步] {self.source.name} 无可用 kline provider")
+            return []
+
+        provider = providers[0]
+        pname = getattr(provider, "name", provider.__class__.__name__)
+        logger.info(f"[同步] {self.source.name} 使用 provider={pname} 逐 symbol 拉取 15m kline")
+
+        all_bars: list[dict] = []
+        lock = threading.Lock()
+
+        def _fetch_one(symbol):
+            try:
+                bars = provider.fetch_kline(
+                    symbol=symbol,
+                    timeframe="15m",
+                    count=_15M_BARS_PER_DAY,
+                )
+                if bars:
+                    for bar in bars:
+                        bar["symbol"] = strip_market_prefix(symbol)
+                    return bars
+            except Exception as e:
+                logger.debug(f"[同步] {pname} kline {symbol} 失败: {e}")
+            return []
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [pool.submit(_fetch_one, s) for s in symbols]
+            for fut in concurrent.futures.as_completed(futures):
+                bars = fut.result()
+                if bars:
+                    with lock:
+                        all_bars.extend(bars)
+
+        logger.info(f"[同步] {pname} kline 共返回 {len(all_bars)} 条 bar")
+        return all_bars
+
+    def _klines_to_records(self, symbols: list, klines: list[dict],
+                           fallback_time: datetime, failed_reasons: dict[str, str]) -> list[dict]:
+        """将 kline 扁平列表转换为 bulk_write 记录。
+
+        处理:
+        1. 按 symbol 分组
+        2. 时间归一化: 将任意时间戳映射到标准 15m bar 结束时间
+        3. 过滤非交易时段（盘前、午休）
+        4. 按 (symbol, time) 去重，保留最后一条
+        5. OHLCV 校验
+
+        同时更新 failed_reasons（无数据 / 无有效 bar 的 symbol）。
+        """
+        from app.data_sources.normalizer import strip_market_prefix
+
+        kline_map: dict[str, list[dict]] = {}
+        for bar in klines:
+            sym = bar.get("symbol", "")
+            if sym:
+                kline_map.setdefault(sym, []).append(bar)
+
+        records: list[dict] = []
+        for symbol in symbols:
+            clean = strip_market_prefix(symbol)
+            bars = kline_map.get(symbol) or kline_map.get(clean) or []
+
+            if not bars:
+                failed_reasons.setdefault(symbol, "无 kline 数据")
+                continue
+
+            # 按 (symbol, normalized_time) 去重，保留最后一条
+            seen: dict[tuple[str, datetime], dict] = {}
+
+            for bar in bars:
+                # 时间归一化: kline 时间戳 → 标准 15m bar 结束时间
+                raw_time = self._parse_bar_time(bar, fallback_time)
+                bar_time_dt = _normalize_15m_bar_time(raw_time)
+                if bar_time_dt is None:
+                    # 盘前或午休，不属于任何 bar
+                    logger.debug(
+                        f"[同步] {clean} 过滤非交易时段 bar: {raw_time:%Y-%m-%d %H:%M}"
+                    )
+                    continue
+
+                ohlcv = self._parse_ohlcv(bar)
+                if ohlcv is None:
+                    continue
+                o, h, l, c, v = ohlcv
+
+                seen[(clean, bar_time_dt)] = {
+                    "symbol": clean,
+                    "timeframe": "15m",
+                    "time": bar_time_dt,
+                    "open": o, "high": h, "low": l, "close": c, "volume": v,
+                }
+
+            if not seen:
+                failed_reasons.setdefault(symbol, "无有效 15m bar")
+                continue
+
+            records.extend(seen.values())
+
+        return records
+
+    # ── 15m 同步主逻辑 ──
+
+    def _sync_15m(self, symbols: list | None = None, is_first_run: bool = True) -> tuple[int, list[str]]:
+        """15m 同步: 交易日 15:05 后通过 kline API 一次性拉取当天 16 条 15m bar。
+
+        逻辑与 _sync_1d 对齐:
+        1. 首次运行清除当日旧 15m bar
+        2. 通过 kline API 拉取（16 bars/标的）
+        3. 循环 + 修复，直到全部同步或无法继续
+        4. 最终落盘 cn_last_update
+
+        返回: (写入条数, 失败symbols列表)
+        """
+        from app.data_sources.normalizer import strip_market_prefix
 
         if not symbols:
             from app.utils.basicinfo_db import get_stock_basic_db
@@ -418,135 +558,169 @@ class BackfillDB:
             logger.warning(f"[同步] {self.source.name} 获取股票列表失败")
             return 0, []
 
-        # 获取所有支持 batch_quote 的 provider
-        providers = get_providers(capability="batch_quote", market=self.source.market)
-        if not providers:
-            logger.warning(f"[同步] {self.source.name} 无可用 batch_quote provider")
-            return 0, list(symbols)
+        total_symbols = len(symbols)
 
-        provider_names = [getattr(p, "name", "?") for p in providers]
-        logger.info(
-            f"[同步] {self.source.name} tf=15m 直调 provider，"
-            f"标的数={len(symbols)}，providers={provider_names}"
+        # 目标交易日: 15:05 后 → 今天, 之前 → 上一个交易日
+        now_cn = datetime.now(TZ_CN)
+        today_str = now_cn.strftime("%Y-%m-%d")
+        if now_cn.time() >= dt_time(15, 5) and is_trading_day(today_str):
+            target_td = today_str
+        else:
+            target_td = prev_trading_day(today_str)
+
+        # 15m 最后一根 bar 的结束时间: 15:00
+        bar_time = datetime.strptime(target_td, "%Y-%m-%d").replace(
+            hour=15, minute=0, second=0, tzinfo=TZ_CN
         )
 
-        # 多 provider 并发: 每个 provider 在独立线程中分组拉取
-        quotes: dict[str, dict] = {}
-        quotes_lock = threading.Lock()
+        pool = self.source.db_pool
 
-        def _fetch_provider(p):
-            pname = getattr(p, "name", p.__class__.__name__)
-            try:
-                prepare_fn = getattr(p, 'prepare', None)
-                if prepare_fn and not prepare_fn():
-                    logger.warning(f"[同步] {pname} prepare() 返回 False，跳过")
-                    return pname, {}
-                result = _batch_fetch_quotes_by_codes(
-                    p, batch_size=500,
-                    timeout=int(_BATCH_TIMEOUT_15M),
-                    symbols=list(symbols),
-                )
-                return pname, result or {}
-            except Exception as e:
-                logger.warning(f"[同步] {pname} 拉取失败: {e}")
-                return pname, {}
+        # ── 循环拉取 + 修复 ──
+        total_written = 0
+        round_num = 0
+        first_write_done = False
+        failed_reasons: dict[str, str] = {}
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(providers)) as pool:
-            futures = {pool.submit(_fetch_provider, p): p for p in providers}
-            for fut in concurrent.futures.as_completed(futures):
-                pname, result = fut.result()
-                if not result:
-                    logger.info(f"[同步] {pname} 返回 0 条")
-                    continue
-                # 合并去重: 已有数据的 symbol 不覆盖（先到先得，priority 高的先完成不保证）
-                with quotes_lock:
-                    new_count = sum(1 for s in result if s not in quotes)
-                    quotes.update(result)
-                logger.info(f"[同步] {pname} 返回 {len(result)} 条，新增 {new_count}")
+        while True:
+            round_num += 1
 
-        if not quotes:
-            logger.warning(f"[同步] {self.source.name} 所有 provider 均返回空数据")
-            return 0, list(symbols)
+            synced = self._get_synced_symbols(bar_time, tf="15m")
+            remaining = [s for s in symbols if strip_market_prefix(s) not in synced]
 
-        logger.info(f"[同步] {self.source.name} 合并后共 {len(quotes)} 只标的")
+            if not remaining:
+                logger.info(f"[同步] {self.source.name} 15m 所有 {total_symbols} 只已同步")
+                break
 
-        # 确定当前 bar 的标准结束时间
-        now_cn = datetime.now(TZ_CN)
-        bar_time = _normalize_to_bar_time(now_cn)
-        if bar_time is None:
-            logger.info(f"[同步] {self.source.name} 当前时间 {now_cn:%H:%M} 不在交易时段，跳过")
-            return 0, []
-
-        all_records = []
-        failed_set = set()       # 用 set 去重，避免同一 symbol 被记多次
-        success_digits = set()
-
-        for symbol in symbols:
-            quote = quotes.get(symbol)
-            if not quote:
-                digits = strip_market_prefix(symbol)
-                quote = quotes.get(digits)
-
-            if not quote:
-                failed_set.add(symbol)
-                continue
-
-            o = float(quote.get("open", 0) or 0)
-            h = float(quote.get("high", 0) or 0)
-            l = float(quote.get("low", 0) or 0)
-            c = float(quote.get("last", 0) or quote.get("close", 0) or 0)
-            v = float(quote.get("volume", 0) or 0)
-
-            if o == 0 and h == 0 and l == 0 and c == 0:
-                failed_set.add(symbol)
-                continue
-            if c <= 0 or o <= 0:
-                failed_set.add(symbol)
-                continue
-            if h > 0 and l > 0 and h < l:
-                h, l = l, h
-
-            clean_symbol = strip_market_prefix(symbol)
-            all_records.append({
-                "symbol": clean_symbol,
-                "timeframe": "15m",
-                "time": bar_time,
-                "open": o,
-                "high": h,
-                "low": l,
-                "close": c,
-                "volume": v,
-            })
-            success_digits.add(clean_symbol)
-
-        # 统计缺失（quotes 里没有、且未成功处理的）
-        requested_digits = set(strip_market_prefix(s) for s in symbols)
-        fetched_set = set(quotes.keys())
-        missing_digits = requested_digits - fetched_set - success_digits
-        digit_to_symbol = {strip_market_prefix(s): s for s in symbols}
-        for d in missing_digits:
-            if d in digit_to_symbol:
-                failed_set.add(digit_to_symbol[d])
-
-        failed_symbols = list(failed_set)
-
-        if failed_symbols:
-            logger.warning(
-                f"[同步] {self.source.name} 15m "
-                f"{len(failed_symbols)}/{len(symbols)} 只标的失败"
+            logger.info(
+                f"[同步] {self.source.name} 15m 第 {round_num} 轮，"
+                f"已同步 {len(synced)}/{total_symbols}，待拉取 {len(remaining)}"
             )
 
-        if not all_records:
-            return 0, failed_symbols
+            klines = self._fetch_15m_klines(remaining)
+            if not klines:
+                logger.warning(f"[同步] {self.source.name} 15m 第 {round_num} 轮返回空数据，停止")
+                for symbol in remaining:
+                    failed_reasons.setdefault(symbol, "kline 返回空数据")
+                break
 
-        try:
-            r = self._writer.bulk_write(self.source.market, all_records)
-            total = r.get("inserted", 0) + r.get("skipped", 0)
-            logger.info(f"[同步] {self.source.name} 15m 批量写入 {total} 条")
-            return total, failed_symbols
-        except Exception as e:
-            logger.error(f"[同步] {self.source.name} 15m 批量写入失败: {e}")
-            return 0, list(symbols)
+            records = self._klines_to_records(remaining, klines, bar_time, failed_reasons)
+
+            if not records:
+                logger.info(f"[同步] {self.source.name} 15m 第 {round_num} 轮 0 新增，停止")
+                break
+
+            # 首次运行: 写入前删除当日旧数据（删和写紧挨，最小化丢数据窗口）
+            if is_first_run and not first_write_done:
+                deleted = self._delete_bars(bar_time, tf="15m")
+                if deleted > 0:
+                    logger.info(f"[同步] {self.source.name} 15m 首次运行，已清除当日 {deleted} 条旧 bar")
+                first_write_done = True
+
+            try:
+                r = self._writer.bulk_write(self.source.market, records)
+                round_written = r.get("inserted", 0) + r.get("skipped", 0)
+            except Exception as e:
+                logger.error(f"[同步] {self.source.name} 15m 第 {round_num} 轮写入失败: {e}")
+                break
+
+            total_written += round_written
+            synced_now = self._get_synced_symbols(bar_time, tf="15m")
+            logger.info(
+                f"[同步] {self.source.name} 15m 第 {round_num} 轮 "
+                f"写入 {round_written}，累计 {len(synced_now)}/{total_symbols}"
+            )
+
+            if len(synced_now) >= total_symbols:
+                break
+
+        # ── 阶段一统计 ──
+        final_synced = self._get_synced_symbols(bar_time, tf="15m")
+        final_count = len(final_synced)
+        failed = [s for s in symbols if strip_market_prefix(s) not in final_synced]
+
+        # ── 阶段二: 失败修复 ──
+        if failed:
+            repair_round = 0
+            while failed:
+                repair_round += 1
+                logger.info(
+                    f"[同步] {self.source.name} 15m 修复第 {repair_round} 轮，"
+                    f"重拉 {len(failed)} 只失败标的"
+                )
+
+                repair_klines = self._fetch_15m_klines(failed)
+                if not repair_klines:
+                    logger.info(f"[同步] {self.source.name} 15m 修复第 {repair_round} 轮返回空，停止")
+                    break
+
+                repair_records = self._klines_to_records(failed, repair_klines, bar_time, failed_reasons)
+                if not repair_records:
+                    logger.info(f"[同步] {self.source.name} 15m 修复第 {repair_round} 轮 0 有效，停止")
+                    break
+
+                try:
+                    r = self._writer.bulk_write(self.source.market, repair_records)
+                    rw = r.get("inserted", 0) + r.get("skipped", 0)
+                    total_written += rw
+                except Exception as e:
+                    logger.error(f"[同步] {self.source.name} 15m 修复第 {repair_round} 轮写入失败: {e}")
+                    break
+
+                final_synced = self._get_synced_symbols(bar_time, tf="15m")
+                final_count = len(final_synced)
+                failed = [s for s in symbols if strip_market_prefix(s) not in final_synced]
+
+                logger.info(
+                    f"[同步] {self.source.name} 15m 修复第 {repair_round} 轮 "
+                    f"写入 {rw}，累计 {final_count}/{total_symbols}，剩余失败 {len(failed)}"
+                )
+
+                _record_update(
+                    self.source.name, "15m", "partial",
+                    f"修复中: {final_count}/{total_symbols}, 失败 {len(failed)}",
+                    last_bar_time=bar_time, synced_count=final_count,
+                    failed_count=len(failed), pool_name=pool,
+                )
+
+        # ── 最终落盘 cn_last_update ──
+        report_parts = [f"已同步 {final_count}/{total_symbols}"]
+        if failed:
+            reason_counts: dict[str, int] = {}
+            for sym in failed:
+                reason = failed_reasons.get(sym, "未返回 kline 数据")
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            reason_summary = ", ".join(f"{r}({c})" for r, c in sorted(reason_counts.items(), key=lambda x: -x[1]))
+            report_parts.append(f"失败原因: {reason_summary}")
+            sample = failed[:50]
+            report_parts.append(f"失败标的({len(failed)}): {','.join(sample)}")
+
+        report = "; ".join(report_parts)
+
+        _record_update(
+            self.source.name, "15m", "ok", report,
+            last_bar_time=bar_time, synced_count=final_count,
+            failed_count=len(failed), pool_name=pool,
+        )
+
+        if failed:
+            logger.warning(
+                f"[同步] {self.source.name} 15m 完成，"
+                f"共 {round_num} 轮，写入 {total_written}，"
+                f"同步 {final_count}/{total_symbols}，失败 {len(failed)}"
+            )
+            for sym in failed[:20]:
+                reason = failed_reasons.get(sym, "未返回 kline 数据")
+                logger.warning(f"  ✗ {sym}: {reason}")
+            if len(failed) > 20:
+                logger.warning(f"  ... 共 {len(failed)} 只失败，详见 cn_last_update.report")
+        else:
+            logger.info(
+                f"[同步] {self.source.name} 15m 完成，"
+                f"共 {round_num} 轮，写入 {total_written}，"
+                f"同步 {final_count}/{total_symbols}，无失败"
+            )
+
+        return total_written, failed
 
     # ── 1D 同步: batch_quotes + 重试 + 去重 ──────────────────
 
@@ -574,7 +748,7 @@ class BackfillDB:
         total_symbols = len(symbols)
 
         # 日线 bar 时间: 目标交易日 17:00:00 (北京时间)
-        # 17:00 后 → 今天, 08:00 前 → 上一个交易日
+        # 17:05 后 → 今天, 08:00 前 → 上一个交易日
         now_cn = datetime.now(TZ_CN)
         today_str = now_cn.strftime("%Y-%m-%d")
         if now_cn.time() >= dt_time(17, 0) and is_trading_day(today_str):
@@ -587,22 +761,17 @@ class BackfillDB:
 
         pool = self.source.db_pool
 
-        # ── 首次运行: 清除当日 bar，防止盘中数据污染 ──
-        if is_first_run:
-            deleted = self._delete_1d_bars(bar_time)
-            if deleted > 0:
-                logger.info(f"[同步] {self.source.name} 1D 首次运行，已清除当日 {deleted} 条旧 bar")
-
         # ── 循环拉取，直到全部同步或 0 新增 ──
         total_written = 0
         round_num = 0
+        first_write_done = False
         failed_reasons: dict[str, str] = {}  # symbol → 失败原因
 
         while True:
             round_num += 1
 
             # 查已同步 symbols，计算待拉取
-            synced = self._get_synced_symbols(bar_time)
+            synced = self._get_synced_symbols(bar_time, tf="1D")
             remaining = [s for s in symbols if strip_market_prefix(s) not in synced]
 
             if not remaining:
@@ -642,30 +811,17 @@ class BackfillDB:
                     failed_reasons.setdefault(symbol, "无行情数据")
                     continue
 
-                o = float(quote.get("open", 0) or 0)
-                h = float(quote.get("high", 0) or 0)
-                l = float(quote.get("low", 0) or 0)
-                c = float(quote.get("last", 0) or quote.get("close", 0) or 0)
-                v = float(quote.get("volume", 0) or 0)
-
-                if o == 0 and h == 0 and l == 0 and c == 0:
-                    failed_reasons.setdefault(symbol, "OHLCV 全零(停牌/退市)")
+                ohlcv = self._parse_ohlcv(quote)
+                if ohlcv is None:
+                    failed_reasons.setdefault(symbol, "OHLCV 无效(停牌/退市/价格异常)")
                     continue
-                if c <= 0 or o <= 0:
-                    failed_reasons.setdefault(symbol, f"价格异常(o={o},c={c})")
-                    continue
-                if h > 0 and l > 0 and h < l:
-                    h, l = l, h
+                o, h, l, c, v = ohlcv
 
                 records.append({
                     "symbol": strip_market_prefix(symbol),
                     "timeframe": "1D",
                     "time": bar_time,
-                    "open": o,
-                    "high": h,
-                    "low": l,
-                    "close": c,
-                    "volume": v,
+                    "open": o, "high": h, "low": l, "close": c, "volume": v,
                 })
 
             # 本轮 0 新增 → 剩余的拉不到了，停止
@@ -674,6 +830,13 @@ class BackfillDB:
                     f"[同步] {self.source.name} 1D 第 {round_num} 轮 0 新增，停止"
                 )
                 break
+
+            # 首次运行: 写入前删除当日旧数据（删和写紧挨，最小化丢数据窗口）
+            if is_first_run and not first_write_done:
+                deleted = self._delete_bars(bar_time, tf="1D")
+                if deleted > 0:
+                    logger.info(f"[同步] {self.source.name} 1D 首次运行，已清除当日 {deleted} 条旧 bar")
+                first_write_done = True
 
             # 写入
             try:
@@ -684,7 +847,7 @@ class BackfillDB:
                 break
 
             total_written += round_written
-            synced_now = self._get_synced_symbols(bar_time)
+            synced_now = self._get_synced_symbols(bar_time, tf="1D")
             logger.info(
                 f"[同步] {self.source.name} 1D 第 {round_num} 轮 "
                 f"写入 {round_written}，累计 {len(synced_now)}/{total_symbols}"
@@ -695,7 +858,7 @@ class BackfillDB:
                 break
 
         # ── 阶段一统计 ──
-        final_synced = self._get_synced_symbols(bar_time)
+        final_synced = self._get_synced_symbols(bar_time, tf="1D")
         final_count = len(final_synced)
         failed = [s for s in symbols if strip_market_prefix(s) not in final_synced]
 
@@ -732,28 +895,16 @@ class BackfillDB:
                     if not quote:
                         continue
 
-                    o = float(quote.get("open", 0) or 0)
-                    h = float(quote.get("high", 0) or 0)
-                    l = float(quote.get("low", 0) or 0)
-                    c = float(quote.get("last", 0) or quote.get("close", 0) or 0)
-                    v = float(quote.get("volume", 0) or 0)
-
-                    if o == 0 and h == 0 and l == 0 and c == 0:
+                    ohlcv = self._parse_ohlcv(quote)
+                    if ohlcv is None:
                         continue
-                    if c <= 0 or o <= 0:
-                        continue
-                    if h > 0 and l > 0 and h < l:
-                        h, l = l, h
+                    o, h, l, c, v = ohlcv
 
                     repair_records.append({
                         "symbol": strip_market_prefix(symbol),
                         "timeframe": "1D",
                         "time": bar_time,
-                        "open": o,
-                        "high": h,
-                        "low": l,
-                        "close": c,
-                        "volume": v,
+                        "open": o, "high": h, "low": l, "close": c, "volume": v,
                     })
 
                 # 拉不到有效数据 → 修不好了，不修了
@@ -770,7 +921,7 @@ class BackfillDB:
                     break
 
                 # 重新统计
-                final_synced = self._get_synced_symbols(bar_time)
+                final_synced = self._get_synced_symbols(bar_time, tf="1D")
                 final_count = len(final_synced)
                 failed = [s for s in symbols if strip_market_prefix(s) not in final_synced]
 
@@ -801,19 +952,11 @@ class BackfillDB:
 
         report = "; ".join(report_parts)
 
-        if final_count >= total_symbols or len(failed) == 0:
-            _record_update(
-                self.source.name, "1D", "ok", report,
-                last_bar_time=bar_time, synced_count=final_count,
-                failed_count=0, pool_name=pool,
-            )
-        else:
-            # 修复后仍有失败 → 设 ok，失败明细保留在 report
-            _record_update(
-                self.source.name, "1D", "ok", report,
-                last_bar_time=bar_time, synced_count=final_count,
-                failed_count=len(failed), pool_name=pool,
-            )
+        _record_update(
+            self.source.name, "1D", "ok", report,
+            last_bar_time=bar_time, synced_count=final_count,
+            failed_count=len(failed), pool_name=pool,
+        )
 
         if failed:
             logger.warning(
@@ -835,14 +978,15 @@ class BackfillDB:
 
         return total_written, failed
 
-    def _kline_table(self, bar_time: datetime) -> str:
-        """返回 kline_1D_{年} 表名（加引号保留大小写）。"""
-        return f'"kline_1D_{bar_time.year}"'
+    # ── 通用辅助方法 ──────────────────
 
-    def _delete_1d_bars(self, bar_time: datetime) -> int:
-        """删除指定日期的 1D 数据，返回删除条数。按日期匹配，不依赖具体时间点。"""
-        table = self._kline_table(bar_time)
-        # 按日期匹配: 用 DATE() 比较，避免因时间部分不同导致漏删
+    def _kline_table(self, bar_time: datetime, tf: str = "1D") -> str:
+        """返回 kline_{tf}_{年} 表名（加引号保留大小写）。"""
+        return f'"kline_{tf}_{bar_time.year}"'
+
+    def _delete_bars(self, bar_time: datetime, tf: str = "1D") -> int:
+        """删除指定日期的 bar 数据，返回删除条数。按日期匹配，不依赖具体时间点。"""
+        table = self._kline_table(bar_time, tf=tf)
         target_date = bar_time.strftime("%Y-%m-%d")
         try:
             mgr = get_market_db_manager()
@@ -857,12 +1001,16 @@ class BackfillDB:
                     conn.commit()
                     return deleted
         except Exception as e:
-            logger.warning(f"[同步] {self.source.name} 1D 清除旧 bar 失败 (可忽略): {e}")
+            logger.warning(f"[同步] {self.source.name} {tf} 清除旧 bar 失败 (可忽略): {e}")
             return 0
 
-    def _get_synced_symbols(self, bar_time: datetime) -> set[str]:
-        """查询指定 bar_time 已写入的 symbols 集合。"""
-        table = self._kline_table(bar_time)
+    def _get_synced_symbols(self, bar_time: datetime, tf: str = "1D") -> set[str]:
+        """查询指定 bar_time 已写入的 symbols 集合。
+
+        1D: 检查 bar_time (17:00) 对应的那条 bar
+        15m: 检查 bar_time (15:00, 最后一根 bar) 对应的那条 bar
+        """
+        table = self._kline_table(bar_time, tf=tf)
         # strip tzinfo: PG timestamp 列存储为 naive，aware datetime 匹配不到
         naive_bar_time = bar_time.replace(tzinfo=None) if bar_time.tzinfo else bar_time
         try:
@@ -876,7 +1024,7 @@ class BackfillDB:
                     """, (naive_bar_time,))
                     return {row[0] for row in cur.fetchall()}
         except Exception as e:
-            logger.warning(f"[同步] {self.source.name} 1D 查询已同步 symbols 失败: {e}")
+            logger.warning(f"[同步] {self.source.name} {tf} 查询已同步 symbols 失败: {e}")
             return set()
 
 
@@ -896,7 +1044,7 @@ stock_daily_k = BackfillDB(BackfillSource(
 #
 # 设计模式: 与 emotion_scheduler / sector_history 一致
 #   - 单守护线程，sleep 到最近触发点 → 执行任务 → 计算下次触发 → 继续 sleep
-#   - 15m: 盘中每 15 分钟触发一次（bar 结束前 30s），交易日共 16 次
+#   - 15m: 每个交易日 15:05 触发一次（盘后 kline 拉取当天 16 条 bar）
 #   - 1D:  每个交易日 17:05 触发一次（cn_last_update 内置重试/续传逻辑）
 #   - 非交易日: 整天 sleep，不执行任何任务
 #
@@ -904,63 +1052,80 @@ stock_daily_k = BackfillDB(BackfillSource(
 _scheduler_started = False
 _stop_event = threading.Event()
 
-# 15m 提前预热秒数（cookie/服务器探测等耗时操作提前执行）
-_PREPARE_LEAD_SECONDS = 60
 
+def _next_trigger_time(task: str) -> datetime:
+    """返回指定任务的下次触发时间，跳过非交易日。
 
-def _pre_prepare_providers():
-    """提前调用所有 provider 的 prepare()（cookie 刷新、服务器探测等）。"""
-    try:
-        from app.data_sources.provider import get_providers
-        providers = get_providers(capability="batch_quote", market="CNStock")
-        if not providers:
-            return
-        for p in providers:
-            pname = getattr(p, "name", p.__class__.__name__)
-            try:
-                prepare_fn = getattr(p, 'prepare', None)
-                if prepare_fn:
-                    ok = prepare_fn()
-                    logger.info(f"[15m预热] {pname} prepare() → {ok}")
-            except Exception as e:
-                logger.warning(f"[15m预热] {pname} prepare() 失败（忽略）: {e}")
-    except Exception as e:
-        logger.warning(f"[15m预热] 获取 provider 失败（忽略）: {e}")
-
-
-def _next_bar_trigger_time() -> datetime:
-    """返回下一个 15m bar 的触发时间（bar 结束前 30s）。"""
-    now = datetime.now(TZ_CN)
-    for h, m in _BAR_END_TIMES:
-        bar_end = datetime(now.year, now.month, now.day, h, m, 0, tzinfo=TZ_CN)
-        trigger = bar_end - timedelta(seconds=30)
-        if trigger > now:
-            return trigger
-    # 今天的 bar 都过了 → 明天第一个 bar
-    tomorrow = now + timedelta(days=1)
-    h, m = _BAR_END_TIMES[0]
-    return datetime(tomorrow.year, tomorrow.month, tomorrow.day, h, m, 0,
-                    tzinfo=TZ_CN) - timedelta(seconds=30)
-
-
-def _next_1d_trigger_time() -> datetime:
-    """返回下一个 1D 任务的触发时间（17:05，跳过非交易日）。"""
+    task: "15m" → 15:05, "1D" → 17:05
+    """
     now = datetime.now(TZ_CN)
     today_str = now.strftime("%Y-%m-%d")
 
-    # 今天是交易日且还没到 17:05 → 今天 17:05
-    if is_trading_day(today_str) and now.time() < dt_time(17, 5):
-        return datetime(now.year, now.month, now.day, 17, 5, 0, tzinfo=TZ_CN)
+    trigger_h, trigger_m = (15, 5) if task == "15m" else (17, 5)
 
-    # 找下一个交易日的 17:05
+    # 今天是交易日且还没到触发时间 → 今天
+    if is_trading_day(today_str) and now.time() < dt_time(trigger_h, trigger_m):
+        return datetime(now.year, now.month, now.day, trigger_h, trigger_m, 0, tzinfo=TZ_CN)
+
+    # 找下一个交易日
     from app.utils.trading_calendar import next_trading_day
-    if now.time() >= dt_time(17, 5):
+    if now.time() >= dt_time(trigger_h, trigger_m):
         next_td = next_trading_day(today_str)
     else:
         next_td = today_str if is_trading_day(today_str) else next_trading_day(today_str)
 
     dt_obj = datetime.strptime(next_td, "%Y-%m-%d")
-    return datetime(dt_obj.year, dt_obj.month, dt_obj.day, 17, 5, 0, tzinfo=TZ_CN)
+    return datetime(dt_obj.year, dt_obj.month, dt_obj.day, trigger_h, trigger_m, 0, tzinfo=TZ_CN)
+
+
+def _is_task_done_today(task: str) -> bool:
+    """检查指定任务今天是否已完成（通过 cn_last_update 判断）。"""
+    doc = _get_last_update("stock_daily_k", task, pool_name="CNStock")
+    if not doc:
+        return False
+    lu = _parse_db_timestamp(doc.get("last_updated"))
+    if not lu:
+        return False
+    return _same_trading_day(lu, datetime.now(TZ_CN))
+
+
+def _catchup_missed_tasks():
+    """启动时补跑: 交易日内已过触发时间但今天还没跑的任务，立即执行。
+
+    15m: 15:05 后未跑 → 补跑
+    1D:  17:05 后未跑 → 补跑
+    """
+    now = datetime.now(TZ_CN)
+    today_str = now.strftime("%Y-%m-%d")
+
+    if not is_trading_day(today_str):
+        return
+
+    now_time = now.time()
+
+    # 15m: 15:05 后且今天没跑过
+    if now_time >= dt_time(15, 5) and not _is_task_done_today("15m"):
+        logger.info("[调度] 启动补跑: 15m (已过 15:05 且今天未同步)")
+        try:
+            result = stock_daily_k.run_once("15m")
+            logger.info(
+                f"[调度] 补跑 15m 完成: written={result.get('written', 0)} "
+                f"status={result.get('status', '')}"
+            )
+        except Exception as e:
+            logger.error(f"[调度] 补跑 15m 异常: {e}")
+
+    # 1D: 17:05 后且今天没跑过
+    if now_time >= dt_time(17, 5) and not _is_task_done_today("1D"):
+        logger.info("[调度] 启动补跑: 1D (已过 17:05 且今天未同步)")
+        try:
+            result = stock_daily_k.run_once("1D")
+            logger.info(
+                f"[调度] 补跑 1D 完成: written={result.get('written', 0)} "
+                f"status={result.get('status', '')}"
+            )
+        except Exception as e:
+            logger.error(f"[调度] 补跑 1D 异常: {e}")
 
 
 def _scheduler_loop():
@@ -968,11 +1133,17 @@ def _scheduler_loop():
 
     每轮:
       1. 非交易日 → sleep 到明天 09:00 重新判断
-      2. 计算 15m 和 1D 各自的下次触发时间，取较近者
+      2. 计算 15m (15:05) 和 1D (17:05) 各自的下次触发时间，取较近者
       3. sleep 到点 → 执行对应任务 → 计算新的触发时间 → 循环
+
+    启动时:
+      - 检查今天已过触发时间但未执行的任务，立即补跑
     """
     # 确保 cn_last_update 表存在
     _ensure_cn_last_update_table()
+
+    # ── 启动补跑: 错过触发时间的任务 ──
+    _catchup_missed_tasks()
 
     while not _stop_event.is_set():
         try:
@@ -990,27 +1161,20 @@ def _scheduler_loop():
                 continue
 
             # ── 计算两个任务的下次触发时间 ──
-            next_15m = _next_bar_trigger_time()
-            next_1d = _next_1d_trigger_time()
+            next_15m = _next_trigger_time("15m")
+            next_1d = _next_trigger_time("1D")
 
-            # 取较近者；15m 需要提前预热，所以用 (trigger - lead) 作为唤醒时间
+            # 取较近者
             if next_15m <= next_1d:
                 target_task = "15m"
                 trigger_time = next_15m
-                # 提前 _PREPARE_LEAD_SECONDS 唤醒做预热
-                wake_time = trigger_time - timedelta(seconds=_PREPARE_LEAD_SECONDS)
-                now = datetime.now(TZ_CN)
-                if wake_time <= now:
-                    # 已过了预热时间 → 直接触发
-                    wake_time = trigger_time
             else:
                 target_task = "1D"
                 trigger_time = next_1d
-                wake_time = trigger_time
 
-            sleep_sec = max((wake_time - datetime.now(TZ_CN)).total_seconds(), 0)
+            sleep_sec = max((trigger_time - datetime.now(TZ_CN)).total_seconds(), 0)
             logger.info(
-                f"[调度] 下次触发: {target_task} @ {trigger_time:%H:%M:%S}，"
+                f"[调度] 下次触发: {target_task} @ {trigger_time:%Y-%m-%d %H:%M:%S}，"
                 f"sleep {sleep_sec:.0f}s"
             )
 
@@ -1019,29 +1183,18 @@ def _scheduler_loop():
 
             # ── 执行对应任务 ──
             if target_task == "15m":
-                # 两阶段: 如果提前醒来，先预热再等到点
-                now = datetime.now(TZ_CN)
-                if now < trigger_time:
-                    logger.info("[调度] 15m 预热: cookie/服务器探测")
-                    _pre_prepare_providers()
-                    remaining = max((trigger_time - datetime.now(TZ_CN)).total_seconds(), 0)
-                    if remaining > 0:
-                        logger.info(f"[调度] 15m 预热完成，sleep {remaining:.0f}s 到正式触发")
-                        if _stop_event.wait(timeout=remaining):
-                            break
-
                 logger.info("[调度] 15m 开始同步")
                 result = stock_daily_k.run_once("15m")
                 logger.info(
-                    f"[调度] 15m 完成: written={result.get("written", 0)} "
-                    f"status={result.get("status", "")}"
+                    f"[调度] 15m 完成: written={result.get('written', 0)} "
+                    f"status={result.get('status', '')}"
                 )
             else:
                 logger.info("[调度] 1D 开始同步")
                 result = stock_daily_k.run_once("1D")
                 logger.info(
-                    f"[调度] 1D 完成: written={result.get("written", 0)} "
-                    f"status={result.get("status", "")}"
+                    f"[调度] 1D 完成: written={result.get('written', 0)} "
+                    f"status={result.get('status', '')}"
                 )
 
         except Exception as e:
@@ -1061,7 +1214,7 @@ def start_scheduler():
     t = threading.Thread(target=_scheduler_loop, daemon=True,
                          name="backfill-scheduler")
     t.start()
-    logger.info("[调度] 统一调度器已启动（15m + 1D）")
+    logger.info("[调度] 统一调度器已启动（15m@15:05 + 1D@17:05）")
 
 
 def stop_scheduler():

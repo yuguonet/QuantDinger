@@ -741,6 +741,54 @@ def _sse(data: Dict[str, Any]) -> str:
 #  主入口：逐只审核（SSE Generator）
 # ================================================================
 
+def _get_latest_backtest_config(user_id: int, indicator_id: int) -> Dict[str, Any]:
+    """
+    从 qd_backtest_runs 表读取当前用户对该指标最近一次回测的配置。
+    找不到时返回空 dict（调用方用默认值兜底）。
+    """
+    try:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                """
+                SELECT initial_capital, commission, slippage, leverage,
+                       trade_direction, strategy_config
+                FROM qd_backtest_runs
+                WHERE user_id = %s AND indicator_id = %s AND status = 'success'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (user_id, indicator_id),
+            )
+            row = cur.fetchone()
+            cur.close()
+        if not row:
+            return {}
+        cfg: Dict[str, Any] = {}
+        if row.get("initial_capital") is not None:
+            cfg["initial_capital"] = float(row["initial_capital"])
+        if row.get("commission") is not None:
+            cfg["commission"] = float(row["commission"])
+        if row.get("slippage") is not None:
+            cfg["slippage"] = float(row["slippage"])
+        if row.get("leverage") is not None:
+            cfg["leverage"] = int(row["leverage"])
+        if row.get("trade_direction"):
+            cfg["trade_direction"] = str(row["trade_direction"])
+        raw_sc = row.get("strategy_config")
+        if raw_sc:
+            try:
+                parsed = json.loads(raw_sc) if isinstance(raw_sc, str) else raw_sc
+                if isinstance(parsed, dict) and parsed:
+                    cfg["strategy_config"] = parsed
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return cfg
+    except Exception as e:
+        logger.warning(f"_get_latest_backtest_config failed: {e}")
+        return {}
+
+
 def review_stocks(
     user_id: int,
     indicator_id: int,
@@ -838,7 +886,21 @@ def review_stocks(
         indicator_name = _extract_indicator_name(indicator_code)
     except Exception:
         indicator_name = None
-    logger.info(f"[review] 开始审核: indicator={indicator_name or '(unnamed)'}, stocks={total}")
+
+    # 从 DB 读取该用户对该指标最近一次成功回测的配置，保持审核与回测一致
+    _saved_cfg = _get_latest_backtest_config(user_id, indicator_id)
+    initial_capital = float(_saved_cfg.get("initial_capital", 10000))
+    commission = float(_saved_cfg.get("commission", 0.001))
+    slippage = float(_saved_cfg.get("slippage", 0.0))
+    leverage = int(_saved_cfg.get("leverage", 1))
+    trade_direction = str(_saved_cfg.get("trade_direction", "long"))
+    strategy_config = _saved_cfg.get("strategy_config") or {}
+
+    logger.info(
+        f"[review] 开始审核: indicator={indicator_name or '(unnamed)'}, stocks={total}, "
+        f"capital={initial_capital}, leverage={leverage}, direction={trade_direction}, "
+        f"has_strategy_config={bool(strategy_config)}"
+    )
 
     try:
         for idx, stock in enumerate(stocks):
@@ -1016,9 +1078,12 @@ def review_stocks(
                     indicator_code=indicator_code,
                     market=market,
                     symbol=symbol,
-                    initial_capital=100000.0,
-                    commission=0.001,
-                    trade_direction="long",
+                    initial_capital=initial_capital,
+                    commission=commission,
+                    slippage=slippage,
+                    leverage=leverage,
+                    trade_direction=trade_direction,
+                    strategy_config=strategy_config,
                     indicator_params=user_params,
                     user_id=user_id,
                     indicator_id=indicator_id,
