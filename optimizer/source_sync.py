@@ -20,6 +20,7 @@
 # 用法:
 # python optimizer/source_sync.py -T 1D                    # 1D: 2021-01 起
 # python optimizer/source_sync.py -T 15m                   # 15m: 2024-01-01 起
+# python optimizer/source_sync.py -T 1D --end-date 2026-05-17  # 指定截止日期
 # python optimizer/source_sync.py -T 1D --resume           # 断点续传
 # python optimizer/source_sync.py -T 1D --retry-only       # 只重试错误股票
 # python optimizer/source_sync.py -T 1D --dry-run          # 只校验不写库
@@ -356,11 +357,20 @@ def validate_stock(
             )
             return result  # 覆盖率太低，后续检查无意义
 
-    # ── 1. 交易日历对比: 检测缺失的交易日（仅 1D） ──
+    # ── 1. 交易日历对比: 检测缺失的交易日（仅 1D，允许 2% 缺失） ──
     if timeframe == "1D":
-        for d in expected_trading_days:
-            if d not in date_records and d not in suspension_dates:
-                result.add_warning(f"交易日缺失: {d}")
+        missing_days = [d for d in expected_trading_days
+                        if d not in date_records and d not in suspension_dates]
+        if missing_days:
+            missing_pct = len(missing_days) / expected_count if expected_count > 0 else 0
+            if missing_pct > 0.02:
+                result.add_error(
+                    f"交易日缺失过多: {len(missing_days)}/{expected_count} "
+                    f"({missing_pct*100:.1f}%) > 2%"
+                )
+            else:
+                for d in missing_days:
+                    result.add_warning(f"交易日缺失: {d}")
 
     # ── 2. 每日数据校验 ──
 
@@ -898,7 +908,10 @@ def process_batch(
         if _INTERRUPTED:
             break
 
-        raw_key = _prefix_map.get(code, code)
+        # symbols 格式 "sh600519"，coordinator 返回纯数字 "600519"
+        # 需要去掉前缀再查 _prefix_map
+        code_digits = strip_market_prefix(code)
+        raw_key = _prefix_map.get(code_digits, code_digits)
         bars = raw_by_symbol.get(raw_key, [])
         if not bars:
             stats["no_data"] += 1
@@ -996,8 +1009,8 @@ def main():
         choices=["1D", "15m"], default="1D",
         help="数据类型: 1D(日线) / 15m(15分钟线)")
     parser.add_argument("--market", default="CNStock", help="市场（默认 CNStock）")
-    parser.add_argument("--batch-size", type=int, default=500,
-        help="每批处理股票数（默认 500）")
+    parser.add_argument("--batch-size", type=int, default=100,
+        help="每批处理股票数（默认 100）")
     parser.add_argument("--count", type=int, default=0,
         help="每只股票拉取条数（0=自动计算）")
     parser.add_argument("--timeout", type=float, default=120,
@@ -1008,6 +1021,8 @@ def main():
         help="复权方式")
     parser.add_argument("--start-date", default="",
         help="数据起始日期 (YYYY-MM-DD)，默认为当天")
+    parser.add_argument("--end-date", default="",
+        help="数据截止日期 (YYYY-MM-DD)，默认为当天")
     parser.add_argument("--price-tolerance", type=float, default=0.02,
         help="(已废弃) 涨跌幅检查容差，涨跌幅校验已移除")
     parser.add_argument("--dry-run", action="store_true",
@@ -1038,7 +1053,10 @@ def main():
         start_date = args.start_date
     else:
         start_date = now_date
-    end_date = now_date
+    if args.end_date:
+        end_date = args.end_date
+    else:
+        end_date = now_date
 
     from app.utils.db_market import get_market_kline_writer, get_market_db_manager
     from app.data_sources.coordinator import get_coordinator, CircuitBreaker

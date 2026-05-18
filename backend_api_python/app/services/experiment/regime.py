@@ -104,10 +104,11 @@ class MarketRegimeService:
         ], axis=1).max(axis=1).fillna(0.0)
         atr_pct = float((tr.tail(14).mean() / max(close.iloc[-1], 1e-9)) * 100.0)
 
+        lookback = min(30, len(close) - 1)
         directional_efficiency = float(
-            abs(close.iloc[-1] - close.iloc[-30]) / max(close.diff().abs().tail(30).sum(), 1e-9)
+            abs(close.iloc[-1] - close.iloc[-lookback]) / max(close.diff().abs().tail(lookback).sum(), 1e-9)
         )
-
+        
         if not volume.empty and len(volume.dropna()) >= 20:
             volume_base = max(volume.tail(20).mean(), 1e-9)
             volume_ratio = float(volume.iloc[-1] / volume_base)

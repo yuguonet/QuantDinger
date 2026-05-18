@@ -352,8 +352,8 @@ class CNStockDataSource(BaseDataSource):
     # 1D 核心流程
     #
     # 两阶段策略：
-    #   快速路径（步骤 1-3）：DB 数据够新 + TTL 有实时快照 → 直接拼接返回
-    #   慢路径（步骤 4-6）：DB 数据不够或无 lastbar → 拉远端补满 → 合并写 DB
+    #   DB 够新（≥ 前一交易日）→ 快速路径，不走远端
+    #   DB 不够新 → 慢路径，从远端拉取后合并写 DB
     # ================================================================
 
     def _get_kline_1d(
@@ -362,48 +362,62 @@ class CNStockDataSource(BaseDataSource):
         """1D: DB + 远端补满 + lastbar。"""
         in_trading = _is_in_trading_hours()
         today_ts = _today_ts()
+        prev_td_ts = _prev_trading_day_ts()
         logger.debug(f"[kline_1d] {symbol} start, in_trading={in_trading}, limit={limit}")
 
-        # ── 步骤 1：尝试获取 lastbar（从 TTL 实时快照转 OHLCV）──
-        # 只有盘中才有 lastbar，非盘中 lastbar = None
+        # ── 步骤 1：lastbar = TTL 中的实时快照转 OHLCV ──
         lastbar = None
-        if in_trading:
-            quote = _snapshot_cache.get(symbol)
-            if not quote:
-                # TTL 没有 → 拉一次（refresh 会写入 TTL）
-                _snapshot_cache.refresh([symbol])
-                quote = _snapshot_cache.get(symbol)
-            if quote:
-                lastbar = _bar_from_ticker(quote)
+        quote = _snapshot_cache.get(symbol)
+        if quote:
+            lastbar = _bar_from_ticker(quote)
         logger.debug(f"[kline_1d] {symbol} lastbar={'有' if lastbar else 'None'}")
 
-        # ── 步骤 2：读取 DB 中所有 1D bar ──
+        # ── 步骤 2：读 DB 中所有 1D bar，按时间排序 ──
         db_bars = self._read_db(symbol)
         db_last_ts = db_bars[-1]["time"] if db_bars else 0
-        prev_td_ts = _prev_trading_day_ts()
         logger.debug(f"[kline_1d] {symbol} DB读取 {len(db_bars)} 条, "
                       f"db_last_ts={db_last_ts}, prev_td_ts={prev_td_ts}")
 
-        # ── 步骤 3：快速路径判断 ──
-        # 条件：DB 最后一条 ≥ 前一交易日（DB 够新）且 lastbar 命中（盘中有实时数据）
-        # 满足 → 去掉今日旧 bar + 拼 lastbar → 直接返回，不走远端
-        if db_last_ts >= prev_td_ts and lastbar is not None:
-            db_bars = [b for b in db_bars if b["time"] < today_ts]
-            db_bars.append(lastbar)
-            out = db_bars[-limit:] if len(db_bars) > limit else db_bars
-            logger.debug(f"[kline_1d] {symbol} 快速路径: 去今日+lastbar, 返回 {len(out)} 条")
-            return out
+        # ── 步骤 3：DB 够新（≥ 前一交易日）──
+        if db_last_ts >= prev_td_ts:
+            # 3a: 非盘中 + DB 已有今日数据 → 直接用 DB，不走远端
+            if not in_trading and db_last_ts >= today_ts:
+                out_kline = db_bars
+                out = out_kline[-limit:] if len(out_kline) > limit else out_kline
+                logger.debug(f"[kline_1d] {symbol} 非盘中+DB有今日, 直接返回 {len(out)} 条")
+                return out
 
-        # ── 步骤 4：慢路径 — 从远端取 1D K 线 ──
+            # 3b: 盘中 或 DB最后一条=前一交易日 → 尝试用 lastbar 拼接
+            if in_trading or db_last_ts == prev_td_ts:
+                if lastbar is None:
+                    # lastbar 没命中 → 调 get_ticker 走完整 ticker 流程
+                    self.get_ticker(symbol)
+                    quote = _snapshot_cache.get(symbol)
+                    if quote:
+                        lastbar = _bar_from_ticker(quote)
+
+                if lastbar is not None:
+                    # 去掉今日旧 bar，追加 lastbar
+                    db_bars = [b for b in db_bars if b["time"] < today_ts]
+                    db_bars.append(lastbar)
+                    out_kline = db_bars
+                    out = out_kline[-limit:] if len(out_kline) > limit else out_kline
+                    logger.debug(f"[kline_1d] {symbol} 去今日+lastbar, 返回 {len(out)} 条")
+                    return out
+                else:
+                    # lastbar 也没有 → 用 DB 历史数据
+                    out_kline = db_bars
+                    out = out_kline[-limit:] if len(out_kline) > limit else out_kline
+                    logger.debug(f"[kline_1d] {symbol} lastbar无数据, 只用DB返回 {len(out)} 条")
+                    return out
+
+        # ── 步骤 4：DB 不够新 → 慢路径，从远端取 1D ──
         source = self._fetch_remote_1d(symbol, limit)
         source_last_ts = source[-1]["time"] if source else 0
         logger.debug(f"[kline_1d] {symbol} 远端返回 {len(source)} 条, "
                       f"source_last_ts={source_last_ts}")
 
-        # ── 步骤 5：合并 DB + 远端 ──
-        # 归一化去重：以 time 为 key，同一时间只保留一条
-        # 远端优先覆盖 DB（远端数据排在后面，_normalize_1d_bars 后面覆盖前面）
-        # 合并后写回 DB，DB 长度只会 ≥ 远端返回数，旧数据得以保留
+        # ── 步骤 5：合并 DB + 远端，归一化去重，远端覆盖 DB，写 DB ──
         if source:
             db_bars = self._merge_bars(db_bars, source)
             db_bars = _normalize_1d_bars(db_bars)
@@ -412,29 +426,26 @@ class CNStockDataSource(BaseDataSource):
 
         # ── 步骤 6：三分支构造 out_kline ──
         if source_last_ts >= today_ts:
-            # 分支 A：远端包含今日数据 → 直接用合并后的 db_kline
+            # 远端包含今日数据 → 直接用合并后的 db_kline
             out_kline = db_bars
             logger.debug(f"[kline_1d] {symbol} source含今日, 直接用 db_kline")
         elif lastbar is not None:
-            # 分支 B：远端不含今日，但 lastbar 命中 → 追加 lastbar
+            # 远端不含今日，但 lastbar 命中 → 追加 lastbar
             out_kline = db_bars + [lastbar]
             logger.debug(f"[kline_1d] {symbol} 追加 lastbar")
         else:
-            # 分支 C：远端不含今日，lastbar 也没有 → 尝试取 ticker 转 bar
+            # 都没有 → 调 get_ticker 走完整 ticker 流程
+            self.get_ticker(symbol)
             quote = _snapshot_cache.get(symbol)
-            if not quote:
-                _snapshot_cache.refresh([symbol])
-                quote = _snapshot_cache.get(symbol)
             ticker_bar = _bar_from_ticker(quote) if quote else None
             if ticker_bar:
                 out_kline = db_bars + [ticker_bar]
                 logger.debug(f"[kline_1d] {symbol} ticker 转 bar 追加")
             else:
-                # 都没有 → 只能用 DB 历史数据
                 out_kline = db_bars
                 logger.debug(f"[kline_1d] {symbol} ticker 也无数据, 只用 db")
 
-        # 返回最新 limit 条（数量不够就全部返回）
+        # 返回最新 limit 条
         out = out_kline[-limit:] if len(out_kline) > limit else out_kline
         logger.debug(f"[kline_1d] {symbol} 最终返回 {len(out)} 条")
         return out
