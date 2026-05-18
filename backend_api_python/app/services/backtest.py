@@ -1759,13 +1759,13 @@ class BacktestService:
             
             # Try seconds first, if fails try milliseconds
             try:
-                df['time'] = pd.to_datetime(df['time'], unit='s')
+                df['time'] = pd.to_datetime(df['time'], unit='s', utc=True).dt.tz_convert('Asia/Shanghai').dt.tz_localize(None)
             except (ValueError, OverflowError):
                 # If seconds fails, try milliseconds
                 try:
-                    df['time'] = pd.to_datetime(df['time'], unit='ms')
+                    df['time'] = pd.to_datetime(df['time'], unit='ms', utc=True).dt.tz_convert('Asia/Shanghai').dt.tz_localize(None)
                 except (ValueError, OverflowError):
-                    # If both fail, try direct conversion
+                    # If both fail, try direct conversion (assume Beijing time)
                     df['time'] = pd.to_datetime(df['time'])
             
             df = df.set_index('time')

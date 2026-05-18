@@ -533,10 +533,19 @@ class CNStockDataSource(BaseDataSource):
         except Exception:
             return []
 
+        from zoneinfo import ZoneInfo
+        _beijing = ZoneInfo("Asia/Shanghai")
         bars = []
         for row in rows:
             t = row.get("time")
-            ts = int(t.timestamp()) if isinstance(t, datetime) else int(t)
+            if isinstance(t, datetime):
+                # DB timestamp is naive Beijing time; compute epoch accordingly
+                if t.tzinfo is None:
+                    ts = int(t.replace(tzinfo=_beijing).timestamp())
+                else:
+                    ts = int(t.timestamp())
+            else:
+                ts = int(t)
             bars.append({
                 "time": ts,
                 "open": float(row.get("open", 0)),
@@ -555,12 +564,15 @@ class CNStockDataSource(BaseDataSource):
             from app.utils.db_market import get_market_kline_writer
             writer = get_market_kline_writer()
             db_symbol = strip_market_prefix(symbol) if symbol else symbol
+            from zoneinfo import ZoneInfo
+            _beijing = ZoneInfo("Asia/Shanghai")
             db_bars = []
             for b in bars:
                 bar = dict(b)
                 t = bar.get("time")
                 if isinstance(t, (int, float)):
-                    bar["time"] = datetime.fromtimestamp(t)
+                    # Convert epoch to naive Beijing time for DB storage
+                    bar["time"] = datetime.fromtimestamp(t, tz=_beijing).replace(tzinfo=None)
                 db_bars.append(bar)
             writer.upsert("CNStock", db_symbol, "1D", db_bars)
             logger.debug(f"[DB写入] {db_symbol}/1D 写入 {len(db_bars)} 条")
