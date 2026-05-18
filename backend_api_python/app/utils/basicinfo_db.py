@@ -814,14 +814,79 @@ class StockBasicDB:
             logger.error("所有远程数据源均失败，无法同步股票列表")
             return {"source": "none", "fetched": 0, "upserted": {}}
 
-        # 批量写入 DB
+        # 批量写入 DB（这些是在市股票，status=active）
         logger.info(f"[同步] {source} 获取 {len(stocks)} 只股票，开始写入...")
         result = self.upsert_stocks(stocks)
         result["source"] = source
         result["fetched"] = len(stocks)
 
-        logger.info(f"[同步] 完成: 源={source} 获取={len(stocks)} 写入结果={result}")
+        # ── 停牌/退市检测 ──
+        # 东财 clist/get 只返回当前有交易的股票，停牌/退市的不会出现。
+        # 因此 DB 中原来 status='active' 但不在本次拉取列表里的，
+        # 说明已经停牌或退市，需要标记为 'suspended'。
+        fetched_codes = {s["symbol"] for s in stocks}
+        suspended_count = self._mark_missing_as_suspended(fetched_codes)
+        result["suspended"] = suspended_count
+
+        logger.info(f"[同步] 完成: 源={source} 获取={len(stocks)} "
+                    f"写入结果={result} 标记停牌/退市={suspended_count}")
         return result
+
+    def _mark_missing_as_suspended(self, fetched_codes: set) -> int:
+        """
+        将 DB 中 status='active' 但不在 fetched_codes 里的股票标记为 'suspended'。
+
+        原理：东财 clist/get 只返回当前可交易的股票。
+        停牌、退市、暂停上市的股票不会出现在返回列表中。
+        因此，如果一只股票 DB 里是 active 但本次拉取没出现，说明它已停牌或退市。
+
+        ── Args ──
+            fetched_codes: 本次从远程拉取到的所有股票代码集合
+
+        ── Returns ──
+            被标记为 suspended 的股票数量
+        """
+        if not fetched_codes:
+            return 0
+
+        pool = self._get_pool()
+        with pool.connection() as conn:
+            cur = conn.cursor()
+            try:
+                # 先查出所有 active 但不在本次拉取列表中的股票代码
+                # 用 NOT IN + 批量参数避免一次性传太多
+                # 分批处理，每批 2000 个 code（避免 SQL 参数过多）
+                all_active = []
+                cur.execute(
+                    "SELECT symbol FROM stock_basic_info WHERE status = 'active'"
+                )
+                all_active = [r[0] for r in cur.fetchall()]
+
+                to_suspend = [c for c in all_active if c not in fetched_codes]
+
+                if not to_suspend:
+                    return 0
+
+                # 批量更新（分批，每批 2000）
+                total_suspended = 0
+                for i in range(0, len(to_suspend), 2000):
+                    batch = to_suspend[i:i + 2000]
+                    cur.execute(
+                        "UPDATE stock_basic_info "
+                        "SET status = 'suspended', updated_at = NOW() "
+                        "WHERE status = 'active' AND symbol = ANY(%s)",
+                        (batch,),
+                    )
+                    total_suspended += cur.rowcount
+
+                conn.commit()
+                if total_suspended > 0:
+                    logger.info(f"[停牌检测] 标记 {total_suspended} 只股票为 suspended")
+                return total_suspended
+            except Exception as e:
+                conn.rollback()
+                logger.warning(f"[停牌检测] 标记 suspended 失败: {e}")
+                return 0
 
     def _fetch_eastmoney(self) -> List[Dict[str, Any]]:
         """
