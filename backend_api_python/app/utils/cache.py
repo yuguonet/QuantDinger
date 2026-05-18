@@ -81,39 +81,45 @@ class CacheManager:
     def __init__(self):
         if self._initialized:
             return
-            
-        self._initialized = True
-        self._client = None
-        self._use_redis = False
 
-        # Local-first: do NOT touch Redis unless explicitly enabled.
-        if not CacheConfig.ENABLED:
-            self._client = MemoryCache()
+        with self._lock:
+            if self._initialized:
+                return
+
+            self._client = None
             self._use_redis = False
-            return
 
-        # Try Redis only when enabled.
-        try:
-            import redis
-            from app.config import RedisConfig
+            # Local-first: do NOT touch Redis unless explicitly enabled.
+            if not CacheConfig.ENABLED:
+                self._client = MemoryCache()
+                self._use_redis = False
+                self._initialized = True
+                return
 
-            self._client = redis.Redis(
-                host=RedisConfig.HOST,
-                port=RedisConfig.PORT,
-                db=RedisConfig.DB,
-                password=RedisConfig.PASSWORD,
-                decode_responses=True,
-                socket_connect_timeout=RedisConfig.CONNECT_TIMEOUT,
-                socket_timeout=RedisConfig.SOCKET_TIMEOUT
-            )
-            self._client.ping()
-            self._use_redis = True
-            logger.info("Redis cache connected")
-        except Exception as e:
-            # Fall back silently (keep startup logs clean in local mode).
-            logger.info(f"Redis is enabled but unavailable; using in-memory cache instead: {e}")
-            self._client = MemoryCache()
-            self._use_redis = False
+            # Try Redis only when enabled.
+            try:
+                import redis
+                from app.config import RedisConfig
+
+                self._client = redis.Redis(
+                    host=RedisConfig.HOST,
+                    port=RedisConfig.PORT,
+                    db=RedisConfig.DB,
+                    password=RedisConfig.PASSWORD,
+                    decode_responses=True,
+                    socket_connect_timeout=RedisConfig.CONNECT_TIMEOUT,
+                    socket_timeout=RedisConfig.SOCKET_TIMEOUT
+                )
+                self._client.ping()
+                self._use_redis = True
+                logger.info("Redis cache connected")
+            except Exception as e:
+                # Fall back silently (keep startup logs clean in local mode).
+                logger.info(f"Redis is enabled but unavailable; using in-memory cache instead: {e}")
+                self._client = MemoryCache()
+                self._use_redis = False
+
+            self._initialized = True
     
     def get(self, key: str) -> Optional[Any]:
         """获取缓存"""

@@ -458,7 +458,11 @@ def _run_indicator_on_stock(
         return result
 
     # ── 2. 当前价格（实时优先，K线兜底） ──
-    current_price = _get_current_price_ticker(market, symbol, fallback_df=df)
+    # K线数据充足时直接用最后一条close，避免回测场景下无意义的远端实时行情请求
+    if df is not None and len(df) >= 100:
+        current_price = float(df.iloc[-1].get("close", 0) or 0)
+    else:
+        current_price = _get_current_price_ticker(market, symbol, fallback_df=df)
     result["current_price"] = current_price
 
     # ── 3. 解析指标参数 ──
