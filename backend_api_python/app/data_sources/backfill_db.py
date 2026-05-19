@@ -183,7 +183,7 @@ def _record_update(source_name: str, tf: str, status: str, report: str,
                         (id, tf, last_updated, last_bar_time, status, report,
                          synced_count, failed_count, written_count)
                     VALUES (%s, %s, NOW() AT TIME ZONE 'Asia/Shanghai', %s, %s, %s,
-                            %s, %s, %s, %s)
+                            %s, %s, %s)
                 """, (record_id, tf, last_bar_time, status, report,
                       synced_count, failed_count, written_count))
                 conn.commit()
