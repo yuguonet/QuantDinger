@@ -754,7 +754,7 @@ class BackfillDB:
         coord = get_coordinator()
         total_symbols = len(symbols)
 
-        # 日线 bar 时间: 目标交易日 17:00:00 (北京时间)
+        # 日线 bar 时间: 目标交易日 00:00:00 (北京时间)
         # 17:05 后 → 今天, 08:00 前 → 上一个交易日
         now_cn = datetime.now(TZ_CN)
         today_str = now_cn.strftime("%Y-%m-%d")
@@ -763,7 +763,7 @@ class BackfillDB:
         else:
             target_td = prev_trading_day(today_str)
         bar_time = datetime.strptime(target_td, "%Y-%m-%d").replace(
-            hour=17, minute=0, second=0, tzinfo=TZ_CN
+            hour=0, minute=0, second=0, tzinfo=TZ_CN
         )
 
         pool = self.source.db_pool
@@ -1020,7 +1020,7 @@ class BackfillDB:
     def _get_synced_symbols(self, bar_time: datetime, tf: str = "1D") -> set[str]:
         """查询指定 bar_time 已写入的 symbols 集合。
 
-        1D: 检查 bar_time (17:00) 对应的那条 bar
+        1D: 检查 bar_time (00:00) 对应的那条 bar
         15m: 检查 bar_time (15:00, 最后一根 bar) 对应的那条 bar
         """
         table = self._kline_table(bar_time, tf=tf)

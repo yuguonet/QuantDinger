@@ -168,10 +168,11 @@ def _today_ts() -> int:
 
 
 def _normalize_1d_bars(bars: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """1D 归一化：每天只留一条 bar，按时间排序。
+    """1D 归一化：每天只留一条 bar，time 统一归零到当天 00:00:00，按时间排序。
 
     规则：同一日期出现多条时，后面的覆盖前面的。
     这样当 DB 旧数据和远端新数据合并时，远端（排在后面）会覆盖 DB。
+    time 归零后，后续 _merge_bars 用精确时间戳做 key 也不会出现同一天多条的问题。
     """
     if not bars:
         return bars
@@ -179,6 +180,8 @@ def _normalize_1d_bars(bars: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for bar in bars:
         dt = datetime.fromtimestamp(bar["time"])
         date_str = dt.strftime("%Y-%m-%d")
+        # 归一化 time 到当天 00:00:00
+        bar["time"] = int(datetime.strptime(date_str, "%Y-%m-%d").timestamp())
         by_date[date_str] = bar
     return sorted(by_date.values(), key=lambda b: b["time"])
 

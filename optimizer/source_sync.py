@@ -231,9 +231,14 @@ def _bars_to_records(bars: List[Dict[str, Any]], timeframe: str) -> List[Dict[st
                 h = max(h, *prices)
             if l > 0:
                 l = min(l, *prices)
+        # 去重 key: 1D 按日期去重（同一天的不同时间戳视为同一条），15m 按精确时间戳去重
+        if timeframe == "1D":
+            dedup_key = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            dedup_key = dt
         # 去重: 同时间戳选质量更好的记录
-        if dt in seen:
-            prev = seen[dt]
+        if dedup_key in seen:
+            prev = seen[dedup_key]
             prev_v = _safe_float(prev.get("volume"))
             # 已有记录 volume>0 而新的 volume=0 → 保留旧的
             if prev_v > 0 and v == 0:
@@ -244,7 +249,9 @@ def _bars_to_records(bars: List[Dict[str, Any]], timeframe: str) -> List[Dict[st
                 new_nonzero = sum(1 for val in (o, h, l, c) if val > 0)
                 if new_nonzero < prev_nonzero:
                     continue  # 新的不如旧的完整，保留旧的
-        seen[dt] = {"time": dt, "open": o, "high": h, "low": l, "close": c, "volume": v}
+        # 存储时统一归零到当天 00:00:00，保证输出时间一致
+        store_dt = dedup_key if timeframe == "1D" else dt
+        seen[dedup_key] = {"time": store_dt, "open": o, "high": h, "low": l, "close": c, "volume": v}
     return sorted(seen.values(), key=lambda r: r["time"])
 
 
@@ -747,16 +754,24 @@ def query_batch_existing(
 def merge_records(
     remote_recs: List[Dict[str, Any]],
     db_recs: List[Dict[str, Any]],
+    timeframe: str = "1D",
 ) -> List[Dict[str, Any]]:
     """归一化合并远端和 DB 记录，按时间戳去重。
 
     策略:
       - 同时间戳: remote volume>0 → 用 remote; 否则保留 DB
       - 仅 remote 或仅 DB → 直接保留
+      - 1D 按日去重（同一天的不同时间戳视为同一条）
     """
     def _naive_dt(dt):
         if isinstance(dt, datetime) and dt.tzinfo:
             return dt.replace(tzinfo=None)
+        return dt
+
+    def _dedup_key(dt):
+        """去重 key: 1D 归零到当天 00:00:00，其他按原时间"""
+        if timeframe == "1D":
+            return dt.replace(hour=0, minute=0, second=0, microsecond=0)
         return dt
 
     by_time: Dict[datetime, Dict[str, Any]] = {}
@@ -765,24 +780,26 @@ def merge_records(
     for rec in db_recs:
         dt = _naive_dt(rec.get("time"))
         if dt is not None:
-            rec["time"] = dt
-            by_time[dt] = rec
+            key = _dedup_key(dt)
+            rec["time"] = key  # 统一存储为归零时间
+            by_time[key] = rec
 
     # 远端覆盖
     for rec in remote_recs:
         dt = _naive_dt(rec.get("time"))
         if dt is None:
             continue
-        rec["time"] = dt
-        if dt in by_time:
-            db_rec = by_time[dt]
+        key = _dedup_key(dt)
+        rec["time"] = key
+        if key in by_time:
+            db_rec = by_time[key]
             db_vol = _safe_float(db_rec.get("volume"))
             remote_vol = _safe_float(rec.get("volume"))
             if remote_vol > 0:
-                by_time[dt] = rec  # remote 有量 → 覆盖
+                by_time[key] = rec  # remote 有量 → 覆盖
             # remote volume=0 且 DB 有量 → 保留 DB（不覆盖）
         else:
-            by_time[dt] = rec  # DB 没有 → 直接用 remote
+            by_time[key] = rec  # DB 没有 → 直接用 remote
 
     return sorted(by_time.values(), key=lambda r: r["time"])
 
@@ -1080,7 +1097,7 @@ def process_batch(
             db_recs = db_existing[code]
             if db_recs:
                 before_cnt = len(records)
-                records = merge_records(records, db_recs)
+                records = merge_records(records, db_recs, timeframe)
                 logger.debug("[增量合并] %s: remote=%d + db=%d → merged=%d",
                              code, before_cnt, len(db_recs), len(records))
 
