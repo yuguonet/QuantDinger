@@ -469,7 +469,10 @@ def write_stock_data(
     if not records:
         return 0
 
-    # 转为 DB 格式
+    # 转为 DB 格式，只保留 start_date ~ end_date 范围内（与 DELETE 范围一致）
+    start_cutoff = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=None)
+    end_cutoff = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59, tzinfo=None)
+
     db_records = []
     for rec in records:
         ts = rec.get("time")
@@ -481,6 +484,9 @@ def write_stock_data(
             continue
         if dt.tzinfo:
             dt = dt.replace(tzinfo=None)
+        # 过滤超出 DELETE 范围的记录，避免主键冲突
+        if dt < start_cutoff or dt > end_cutoff:
+            continue
         db_records.append({
             "symbol": code,
             "timeframe": timeframe,
@@ -499,58 +505,56 @@ def write_stock_data(
     end_year = int(end_date[:4])
     years = list(range(start_year, end_year + 1))
 
+    # 只处理实际有数据的年份（避免 DELETE 了但没 INSERT 的年份）
+    data_years = {r["time"].year for r in db_records}
+    effective_years = [y for y in years if y in data_years]
+
     # 同一事务: 先删旧数据，再写新数据（保证原子性）
     _VALID_TABLES = {f"kline_{tf}_{y}" for tf in ("1D", "15m") for y in range(2000, 2035)}
 
     try:
         with pool.connection() as conn:
             cur = conn.cursor()
-            # 删除旧数据
-            for year in years:
+            inserted = 0
+
+            for year in effective_years:
                 table = f"kline_{timeframe}_{year}"
                 if table not in _VALID_TABLES:
                     logger.warning("跳过非法表名: %s", table)
                     continue
+
+                # 使用 savepoint: 某个年份失败不影响其他年份
+                sp_name = f"sp_{code}_{year}"
+                cur.execute(f"SAVEPOINT {sp_name}")
                 try:
+                    # 删除旧数据
                     cur.execute(f"""
                         DELETE FROM "{table}"
                         WHERE symbol = %s
                           AND time >= %s
                           AND time <= %s
                     """, (code, f"{start_date} 00:00:00", f"{end_date} 23:59:59"))
-                except Exception as del_err:
-                    # 区分"表不存在"和其他错误
-                    if "does not exist" in str(del_err).lower() or "undefinedtable" in str(del_err).lower():
-                        pass  # 表不存在，正常跳过
-                    else:
-                        logger.error("删除数据失败 %s/%s/%s: %s", code, table, timeframe, del_err)
 
-            # 在同一事务内写入新数据（逐批 INSERT）
-            inserted = 0
-            for i in range(0, len(db_records), 5000):
-                batch = db_records[i:i + 5000]
-                for year in years:
-                    table = f"kline_{timeframe}_{year}"
-                    if table not in _VALID_TABLES:
-                        continue
-                    year_batch = [r for r in batch
-                                  if r["time"].year == year]
-                    if not year_batch:
-                        continue
-                    try:
+                    # 写入新数据
+                    year_batch = [r for r in db_records if r["time"].year == year]
+                    for i in range(0, len(year_batch), 5000):
+                        batch = year_batch[i:i + 5000]
                         cur.executemany(
                             f'INSERT INTO "{table}" '
                             f'(symbol, time, open, high, low, close, volume) '
                             f'VALUES (%(symbol)s, %(time)s, '
                             f'%(open)s, %(high)s, %(low)s, %(close)s, %(volume)s)',
-                            year_batch,
+                            batch,
                         )
-                        inserted += len(year_batch)
-                    except Exception as ins_err:
-                        if "does not exist" in str(ins_err).lower() or "undefinedtable" in str(ins_err).lower():
-                            pass  # 表不存在，正常跳过
-                        else:
-                            logger.error("写入数据失败 %s/%s/%s: %s", code, table, timeframe, ins_err)
+                        inserted += len(batch)
+
+                    cur.execute(f"RELEASE SAVEPOINT {sp_name}")
+                except Exception as year_err:
+                    cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
+                    if "does not exist" in str(year_err).lower() or "undefinedtable" in str(year_err).lower():
+                        pass
+                    else:
+                        logger.error("写入失败 %s/%s/%s (已回滚该年份): %s", code, table, timeframe, year_err)
 
             conn.commit()
             cur.close()
@@ -582,10 +586,14 @@ def write_batch_data(
     years = list(range(start_year, end_year + 1))
     _VALID_TABLES = {f"kline_{tf}_{y}" for tf in ("1D", "15m") for y in range(2000, 2035)}
 
-    # ── 预构建全部 db_records，按 (year, code) 分组 ──
-    # records_by_year_table[year] = [db_record, ...]
-    records_by_year: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    # ── 预构建全部 db_records，按 (code, year) 分组 ──
+    # 只保留 start_date ~ end_date 范围内的记录（与 DELETE 范围一致）
+    # records_by_year_grouped[code][year] = [db_record, ...]
+    records_by_year_grouped: Dict[str, Dict[int, List[Dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
     code_row_counts: Dict[str, int] = {}
+
+    start_cutoff = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=None)
+    end_cutoff = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59, tzinfo=None)
 
     for code, records in stock_records.items():
         count = 0
@@ -599,7 +607,10 @@ def write_batch_data(
                 continue
             if dt.tzinfo:
                 dt = dt.replace(tzinfo=None)
-            records_by_year[dt.year].append({
+            # 过滤超出 DELETE 范围的记录，避免主键冲突
+            if dt < start_cutoff or dt > end_cutoff:
+                continue
+            records_by_year_grouped[code][dt.year].append({
                 "symbol": code,
                 "timeframe": timeframe,
                 "time": dt,
@@ -614,42 +625,37 @@ def write_batch_data(
 
     all_codes = list(stock_records.keys())
 
-    try:
-        with pool.connection() as conn:
-            cur = conn.cursor()
+    total_deleted = 0
+    total_inserted = 0
+    failed_codes: List[str] = []
+    no_data_codes: List[str] = []
 
-            # ── 批量 DELETE: 用 IN (...) 一次删一批 ──
-            for year in years:
-                table = f"kline_{timeframe}_{year}"
-                if table not in _VALID_TABLES:
-                    continue
-                try:
-                    # 分批 DELETE，每批 500 个 symbol（避免 SQL 过长）
-                    for i in range(0, len(all_codes), 500):
-                        chunk = all_codes[i:i + 500]
-                        placeholders = ",".join(["%s"] * len(chunk))
-                        cur.execute(f"""
-                            DELETE FROM "{table}"
-                            WHERE symbol IN ({placeholders})
-                              AND time >= %s AND time <= %s
-                        """, (*chunk, f"{start_date} 00:00:00", f"{end_date} 23:59:59"))
-                except Exception as del_err:
-                    if "does not exist" not in str(del_err).lower() and "undefinedtable" not in str(del_err).lower():
-                        logger.error("批量删除失败 %s: %s", table, del_err)
+    # ── 逐只股票: 每只独立事务，DELETE+INSERT+COMMIT ──
+    for code in all_codes:
+        code_rows = records_by_year_grouped.get(code, {})
+        if not code_rows:
+            # 过滤后无数据（超范围），标记为无数据
+            no_data_codes.append(code)
+            continue
 
-            # ── 批量 INSERT ──
-            inserted_by_code: Dict[str, int] = defaultdict(int)
-            for year in years:
-                table = f"kline_{timeframe}_{year}"
-                if table not in _VALID_TABLES:
-                    continue
-                year_rows = records_by_year.get(year, [])
-                if not year_rows:
-                    continue
-                # 按 symbol 分组统计 inserted
-                for i in range(0, len(year_rows), 5000):
-                    batch = year_rows[i:i + 5000]
-                    try:
+        try:
+            with pool.connection() as conn:
+                cur = conn.cursor()
+                for year, year_batch in code_rows.items():
+                    table = f"kline_{timeframe}_{year}"
+                    if table not in _VALID_TABLES:
+                        continue
+
+                    # DELETE → INSERT，紧挨着执行
+                    cur.execute(f"""
+                        DELETE FROM "{table}"
+                        WHERE symbol = %s
+                          AND time >= %s AND time <= %s
+                    """, (code, f"{start_date} 00:00:00", f"{end_date} 23:59:59"))
+                    total_deleted += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+                    for i in range(0, len(year_batch), 5000):
+                        batch = year_batch[i:i + 5000]
                         cur.executemany(
                             f'INSERT INTO "{table}" '
                             f'(symbol, time, open, high, low, close, volume) '
@@ -657,19 +663,25 @@ def write_batch_data(
                             f'%(open)s, %(high)s, %(low)s, %(close)s, %(volume)s)',
                             batch,
                         )
-                    except Exception as ins_err:
-                        if "does not exist" not in str(ins_err).lower() and "undefinedtable" not in str(ins_err).lower():
-                            logger.error("批量写入失败 %s: %s", table, ins_err)
+                        total_inserted += len(batch)
 
-            conn.commit()
-            cur.close()
+                conn.commit()
+                cur.close()
+        except Exception as stock_err:
+            # pool.connection() 上下文管理器退出时会自动 rollback
+            failed_codes.append(code)
+            logger.error("股票 %s 写入失败 (已回滚，旧数据保留): %s", code, stock_err)
 
-            # 返回每只股票的写入行数
-            return {code: code_row_counts.get(code, 0) for code in all_codes}
+    logger.info("批量写库完成: %d 只股票, 删除 %d 行, 插入 %d 行, 失败 %d 只, 无数据 %d 只",
+                len(all_codes), total_deleted, total_inserted, len(failed_codes), len(no_data_codes))
 
-    except Exception as e:
-        logger.error("批量写库事务失败: %s", e)
-        return {}
+    # 返回每只股票的写入行数（失败 -1，过滤后无数据 -2）
+    result = {code: code_row_counts.get(code, 0) for code in all_codes}
+    for fc in failed_codes:
+        result[fc] = -1
+    for nc in no_data_codes:
+        result[nc] = -2
+    return result
 
 
 # ═══════════════════════════════════════════════════════
@@ -974,12 +986,27 @@ def process_batch(
                                        stock_data, start_date, end_date, dry_run)
         for code, (records, vr) in code_records.items():
             n = written_map.get(code, 0)
-            stats["written"] += n
-            to_remove.append(code)
-            warn_summary = "; ".join(vr.warnings[:3]) if vr.warnings else ""
-            results.append({"code": code, "board": _detect_board(code),
-                           "bars": len(records), "written": n, "status": "ok",
-                           "errors": warn_summary})
+            if n == -2:
+                # 过滤后无数据（超范围），按无数据处理
+                stats["no_data"] += 1
+                to_retry[code] = [f"过滤后无数据（end_date={end_date}）"]
+                results.append({"code": code, "board": _detect_board(code),
+                                "bars": len(records), "written": 0, "status": "no_data",
+                                "errors": f"过滤后无数据（end_date={end_date}）"})
+            elif n < 0:
+                # 写入失败，保留在重传文件中
+                stats["failed"] += 1
+                to_retry[code] = ["写入失败（事务已回滚，旧数据保留）"]
+                results.append({"code": code, "board": _detect_board(code),
+                                "bars": len(records), "written": 0, "status": "error",
+                                "errors": "写入失败（事务已回滚）"})
+            else:
+                stats["written"] += n
+                to_remove.append(code)
+                warn_summary = "; ".join(vr.warnings[:3]) if vr.warnings else ""
+                results.append({"code": code, "board": _detect_board(code),
+                                "bars": len(records), "written": n, "status": "ok",
+                                "errors": warn_summary})
     elif code_records and dry_run:
         for code, (records, vr) in code_records.items():
             to_remove.append(code)

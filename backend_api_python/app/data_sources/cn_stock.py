@@ -387,8 +387,20 @@ class CNStockDataSource(BaseDataSource):
                 logger.debug(f"[kline_1d] {symbol} 非盘中+DB有今日, 直接返回 {len(out)} 条")
                 return out
 
-            # 3b: 盘中 或 DB最后一条=前一交易日 → 尝试用 lastbar 拼接
-            if in_trading or db_last_ts == prev_td_ts:
+            # 3b: 非盘中 + DB 最新就是前一交易日 → 直接返回
+            #   盘前：今日未开盘，DB 数据已最新
+            #   注意：盘后（交易日 15:01 后）不算——今日已收盘但 DB 未更新，
+            #       应走慢路径拉今日数据，否则当日 bar 丢失
+            now = datetime.now()
+            _today_str = now.strftime("%Y-%m-%d")
+            _post_close = (is_trading_day(_today_str) and now.time() > dtime(15, 1))
+            if not in_trading and db_last_ts == prev_td_ts and not _post_close:
+                out = db_bars[-limit:] if len(db_bars) > limit else db_bars
+                logger.debug(f"[kline_1d] {symbol} 非盘中+DB为前一交易日, 直接返回 {len(out)} 条")
+                return out
+
+            # 3c: 盘中 → 用 lastbar 拼出今日实时 bar
+            if in_trading:
                 if lastbar is None:
                     # lastbar 没命中 → 调 get_ticker 走完整 ticker 流程
                     self.get_ticker(symbol)
