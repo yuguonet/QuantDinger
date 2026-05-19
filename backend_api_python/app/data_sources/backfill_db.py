@@ -1052,46 +1052,23 @@ stock_daily_k = BackfillDB(BackfillSource(
 
 
 # ================================================================
-# 统一调度器 — timer-based，同时管理 15m 和 1D 任务
+# 统一调度器 — threading.Timer 自调度，15m / 1D 各自独立
 # ================================================================
 #
-# 设计模式: 与 emotion_scheduler / sector_history 一致
-#   - 单守护线程，sleep 到最近触发点 → 执行任务 → 计算下次触发 → 继续 sleep
-#   - 15m: 每个交易日 15:05 触发一次（盘后 kline 拉取当天 16 条 bar）
-#   - 1D:  每个交易日 17:05 触发一次（cn_last_update 内置重试/续传逻辑）
-#   - 非交易日: 整天 sleep，不执行任何任务
+# 设计模式: 与 SectorHistoryScheduler 一致
+#   - 每个任务一个 threading.Timer，到期 → 执行 → 自调度下次
+#   - 不用 while-loop + sleep，避免线程卡死无法恢复
+#   - 进程启动后延迟 _INITIAL_DELAY 秒再执行首次（等 DB/依赖就绪）
+#   - 非交易日不执行，跳到下一个交易日
+#   - 未完成的任务（partial）5 分钟后自动重试
 #
 
-_scheduler_started = False
-_stop_event = threading.Event()
+_INITIAL_DELAY = 120          # 进程启动后首次执行延迟（秒）
+_RETRY_INTERVAL = 300         # 未完成时重试间隔（秒）
+_MIN_DELAY = 30               # 最小调度延迟（秒），防止 0 延迟
 
-# ── 短间隔重试 ──
-_task_retries: dict[str, datetime] = {}   # task → 下次重试时间
-_RETRY_INTERVAL = timedelta(minutes=5)    # 未完成时重试间隔
-
-
-def _next_trigger_time(task: str) -> datetime:
-    """返回指定任务的下次触发时间，跳过非交易日。
-
-    task: "15m" → 15:05, "1D" → 17:05
-    """
-    now = datetime.now(TZ_CN)
-    today_str = now.strftime("%Y-%m-%d")
-
-    trigger_h, trigger_m = (15, 5) if task == "15m" else (17, 5)
-
-    # 今天是交易日且还没到触发时间 → 今天
-    if is_trading_day(today_str) and now.time() < dt_time(trigger_h, trigger_m):
-        return datetime(now.year, now.month, now.day, trigger_h, trigger_m, 0, tzinfo=TZ_CN)
-
-    # 找下一个交易日
-    if now.time() >= dt_time(trigger_h, trigger_m):
-        next_td = next_trading_day(today_str)
-    else:
-        next_td = today_str if is_trading_day(today_str) else next_trading_day(today_str)
-
-    dt_obj = datetime.strptime(next_td, "%Y-%m-%d")
-    return datetime(dt_obj.year, dt_obj.month, dt_obj.day, trigger_h, trigger_m, 0, tzinfo=TZ_CN)
+_timers: dict[str, threading.Timer] = {}
+_running = False
 
 
 def _is_task_done_today(task: str) -> bool:
@@ -1116,19 +1093,53 @@ def _is_task_done_today(task: str) -> bool:
     return synced / total >= 0.9 and written == 0
 
 
-def _run_task_and_schedule_retry(task: str):
-    """执行一次同步，根据 cn_last_update 的计数 + 本轮写入量决定是否安排重试。
+def _next_trigger_time(task: str) -> datetime:
+    """返回指定任务的下次触发时间，跳过非交易日。
 
-    完成条件（同时满足）:
-    - synced_count / (synced_count + failed_count) >= 90%
-    - 本轮 written = 0（数据源已无新数据）
+    task: "15m" → 15:05, "1D" → 17:05
     """
+    now = datetime.now(TZ_CN)
+    today_str = now.strftime("%Y-%m-%d")
+    trigger_h, trigger_m = (15, 5) if task == "15m" else (17, 5)
+
+    # 今天是交易日且还没到触发时间 → 今天
+    if is_trading_day(today_str) and now.time() < dt_time(trigger_h, trigger_m):
+        return datetime(now.year, now.month, now.day, trigger_h, trigger_m, 0, tzinfo=TZ_CN)
+
+    # 找下一个交易日
+    next_td = next_trading_day(today_str)
+    dt_obj = datetime.strptime(next_td, "%Y-%m-%d")
+    return datetime(dt_obj.year, dt_obj.month, dt_obj.day, trigger_h, trigger_m, 0, tzinfo=TZ_CN)
+
+
+def _run_task(task: str):
+    """执行一次同步，根据结果决定是否安排重试。"""
+    global _running
+    if not _running:
+        return
+
     try:
+        now = datetime.now(TZ_CN)
+        today_str = now.strftime("%Y-%m-%d")
+
+        # 非交易日 → 不执行，调度到下一个交易日
+        if not is_trading_day(today_str):
+            logger.info(f"[调度] {task} 非交易日，跳过")
+            _schedule_next(task, _next_trigger_time(task))
+            return
+
+        # 今天已完成 → 不再调度（等明天）
+        if _is_task_done_today(task):
+            logger.info(f"[调度] {task} 今天已完成")
+            _schedule_next(task, _next_trigger_time(task))
+            return
+
+        logger.info(f"[调度] {task} 开始同步")
         result = stock_daily_k.run_once(task)
         written = result.get("written", 0)
         logger.info(f"[调度] {task} 本轮写入: {written}")
 
-        # 从 cn_last_update 最新记录读取实际计数
+        # 读取 cn_last_update 判断完成度
         doc = _get_last_update("stock_daily_k", task, pool_name="CNStock")
         if doc:
             synced = doc.get("synced_count") or 0
@@ -1140,136 +1151,86 @@ def _run_task_and_schedule_retry(task: str):
             # 完成条件: 同步率 >= 90% 且本轮 0 条新数据
             if sync_rate >= 0.9 and written == 0:
                 logger.info(f"[调度] {task} 完成: 同步率 {sync_rate:.0%} 且无新数据")
-                _task_retries.pop(task, None)
+                # 完成 → 调度到下一个交易日
+                _schedule_next(task, _next_trigger_time(task))
                 return
 
-            # 未满足完成条件 → 5 分钟后重试
-            retry_at = datetime.now(TZ_CN) + _RETRY_INTERVAL
-            _task_retries[task] = retry_at
+            # 未完成 → 重试
             reason = []
             if sync_rate < 0.9:
                 reason.append(f"同步率 {sync_rate:.0%} < 90%")
             if written > 0:
                 reason.append(f"本轮仍有 {written} 条新数据")
-            logger.info(f"[调度] {task} 未完成 ({', '.join(reason)})，安排重试 @ {retry_at:%H:%M:%S}")
+            logger.info(f"[调度] {task} 未完成 ({', '.join(reason)})，{_RETRY_INTERVAL}s 后重试")
+            _schedule_next(task, delay_seconds=_RETRY_INTERVAL)
             return
 
-        # 无记录 → 清除重试
-        _task_retries.pop(task, None)
+        # 无记录 → 调度到下一个交易日
+        _schedule_next(task, _next_trigger_time(task))
+
     except Exception as e:
-        logger.error(f"[调度] {task} 异常: {e}")
+        logger.error(f"[调度] {task} 异常: {e}", exc_info=True)
+        # 异常后重试
+        _schedule_next(task, delay_seconds=_RETRY_INTERVAL)
 
 
-def _catchup_missed_tasks():
-    """启动时补跑: 交易日内已过触发时间但今天还没跑的任务，立即执行。
-    补跑后如果 status=partial，自动安排重试。
+def _schedule_next(task: str, trigger_at: datetime = None, delay_seconds: float = None):
+    """为指定任务安排下次执行。
 
-    15m: 15:05 后未跑 → 补跑
-    1D:  17:05 后未跑 → 补跑
+    两种模式:
+      - trigger_at: 绝对时间（datetime），计算 delay
+      - delay_seconds: 相对秒数
     """
-    now = datetime.now(TZ_CN)
-    today_str = now.strftime("%Y-%m-%d")
-
-    if not is_trading_day(today_str):
+    global _running
+    if not _running:
         return
 
-    now_time = now.time()
+    # 取消旧 timer
+    old = _timers.pop(task, None)
+    if old:
+        old.cancel()
 
-    # 15m: 15:05 后且今天没跑过（或上次跑是 partial）
-    if now_time >= dt_time(15, 5) and not _is_task_done_today("15m"):
-        logger.info("[调度] 启动补跑: 15m (已过 15:05 且今天未完成)")
-        _run_task_and_schedule_retry("15m")
+    if delay_seconds is not None:
+        delay = max(_MIN_DELAY, delay_seconds)
+    elif trigger_at is not None:
+        now = datetime.now(TZ_CN)
+        delay = max(_MIN_DELAY, (trigger_at - now).total_seconds())
+    else:
+        delay = _INITIAL_DELAY
 
-    # 1D: 17:05 后且今天没跑过（或上次跑是 partial）
-    if now_time >= dt_time(17, 5) and not _is_task_done_today("1D"):
-        logger.info("[调度] 启动补跑: 1D (已过 17:05 且今天未完成)")
-        _run_task_and_schedule_retry("1D")
+    timer = threading.Timer(delay, _run_task, args=[task])
+    timer.daemon = True
+    timer.name = f"backfill-{task}"
+    timer.start()
+    _timers[task] = timer
 
-
-def _scheduler_loop():
-    """统一调度主循环 — 一个线程管理 15m + 1D + 重试，sleep 到最近触发点执行。
-
-    每轮:
-      1. 非交易日 → 清除重试，sleep 到明天 09:00 重新判断
-      2. 计算 15m (15:05) 和 1D (17:05) 各自的下次触发时间
-      3. 检查是否有待执行的重试（5 分钟短间隔）
-      4. 取所有候选中最早的时间点 sleep 到 → 执行 → 根据结果决定是否安排重试
-    """
-    _ensure_cn_last_update_table()
-
-    # ── 启动补跑: 错过触发时间或上次 partial 的任务 ──
-    _catchup_missed_tasks()
-
-    while not _stop_event.is_set():
-        try:
-            now = datetime.now(TZ_CN)
-            today_str = now.strftime("%Y-%m-%d")
-
-            # ── 非交易日: 清除重试，sleep 到明天 09:00 ──
-            if not is_trading_day(today_str):
-                _task_retries.clear()
-                tomorrow = now + timedelta(days=1)
-                wake = datetime(tomorrow.year, tomorrow.month, tomorrow.day,
-                                9, 0, 0, tzinfo=TZ_CN)
-                sleep_sec = max((wake - now).total_seconds(), 60)
-                logger.info(f"[调度] 非交易日，sleep {sleep_sec/3600:.1f}h 到明天 09:00")
-                _stop_event.wait(timeout=sleep_sec)
-                continue
-
-            # ── 计算所有候选触发时间，取最早 ──
-            candidates: list[tuple[datetime, str]] = []  # (触发时间, 任务名)
-
-            # 常规触发时间
-            next_15m = _next_trigger_time("15m")
-            next_1d = _next_trigger_time("1D")
-            candidates.append((next_15m, "15m"))
-            candidates.append((next_1d, "1D"))
-
-            # 待执行的重试（直接加入候选，由 _run_task_and_schedule_retry 决定是否继续）
-            for task, retry_at in list(_task_retries.items()):
-                candidates.append((retry_at, f"{task}_retry"))
-
-            # 取最早
-            trigger_time, target = min(candidates, key=lambda x: x[0])
-            sleep_sec = max((trigger_time - datetime.now(TZ_CN)).total_seconds(), 0)
-
-            is_retry = target.endswith("_retry")
-            task_name = target.replace("_retry", "")
-            label = f"{task_name} (重试)" if is_retry else task_name
-
-            logger.info(
-                f"[调度] 下次触发: {label} @ {trigger_time:%Y-%m-%d %H:%M:%S}，"
-                f"sleep {sleep_sec:.0f}s"
-            )
-
-            if _stop_event.wait(timeout=sleep_sec):
-                break
-
-            # ── 执行 ──
-            logger.info(f"[调度] {label} 开始同步")
-            _run_task_and_schedule_retry(task_name)
-
-        except Exception as e:
-            logger.error(f"[调度] 异常: {e}")
-            _stop_event.wait(timeout=10)
-
-    logger.info("[调度] 调度器已停止")
+    run_at = datetime.now(TZ_CN) + timedelta(seconds=delay)
+    logger.info(f"[调度] {task} 下次执行: {run_at:%Y-%m-%d %H:%M:%S} (延迟 {delay:.0f}s)")
 
 
 def start_scheduler():
-    """启动统一调度器（幂等，重复调用安全）。"""
-    global _scheduler_started
-    if _scheduler_started:
+    """启动统一调度器（幂等，重复调用安全）。
+
+    进程启动后延迟 _INITIAL_DELAY 秒再执行首次，确保 DB 等依赖就绪。
+    """
+    global _running
+    if _running:
         return
-    _scheduler_started = True
-    _stop_event.clear()
-    t = threading.Thread(target=_scheduler_loop, daemon=True,
-                         name="backfill-scheduler")
-    t.start()
-    logger.info("[调度] 统一调度器已启动（15m@15:05 + 1D@17:05 + 5min 重试）")
+    _running = True
+    _ensure_cn_last_update_table()
+
+    logger.info(f"[调度] 启动，{_INITIAL_DELAY}s 后开始执行（15m@15:05 + 1D@17:05 + {_RETRY_INTERVAL}s 重试）")
+
+    # 两个任务各自独立调度，首次延迟执行
+    _schedule_next("15m", delay_seconds=_INITIAL_DELAY)
+    _schedule_next("1D", delay_seconds=_INITIAL_DELAY)
 
 
 def stop_scheduler():
-    """停止调度器。"""
-    _stop_event.set()
-    logger.info("[调度] 调度器停止信号已发送")
+    """停止调度器，取消所有待执行 timer。"""
+    global _running
+    _running = False
+    for task, timer in list(_timers.items()):
+        timer.cancel()
+    _timers.clear()
+    logger.info("[调度] 调度器已停止")

@@ -1,0 +1,164 @@
+"""
+东财智能选股搜索 — 后端代理
+
+将前端直接调东财 search-code 的请求收到后端，避免 CORS 限制。
+前端调用: GET /api/shichang/search?keyword=xxx&page_size=200
+"""
+
+import json
+import random
+import string
+import logging
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+# 东财智能选股接口
+_EM_SEARCH_URL = "https://np-tjxg-b.eastmoney.com/api/smart-tag/stock/v3/pw/search-code"
+
+
+def _gen_id(length: int = 32) -> str:
+    chars = string.ascii_lowercase + string.digits
+    return "".join(random.choice(chars) for _ in range(length))
+
+
+def _safe_float(val) -> Optional[float]:
+    if val is None or val == "" or val == "-" or val == "--":
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def search_stocks(
+    keyword: str,
+    page_size: int = 200,
+    page_no: int = 1,
+    timeout: int = 15,
+) -> Dict[str, Any]:
+    """
+    调东财智能选股接口，返回标准化结果。
+
+    Args:
+        keyword:   搜索关键词（自然语言，如 "市盈率低于20的科技股"）
+        page_size: 每页条数，最大 200
+        page_no:   页码
+        timeout:   请求超时秒数
+
+    Returns:
+        {
+            "code": 1,
+            "keyword": str,
+            "total": int,
+            "page_no": int,
+            "page_size": int,
+            "stocks": [
+                {
+                    "code": "600519",
+                    "name": "贵州茅台",
+                    "industry": "",
+                    "concept": "",
+                    "new_price": 1800.0,
+                    "change_rate": 1.25,
+                    "high_price": 1810.0,
+                    "low_price": 1790.0,
+                    "pre_close_price": 1780.0,
+                    "volume": 123456.0,
+                    "deal_amount": "223456789",
+                    "volume_ratio": 1.2,
+                    "turnoverrate": 0.35,
+                    "amplitude": 1.12,
+                    "pe9": 33.5,
+                    "pbnewmrq": 10.2,
+                    "total_market_cap": "2260000000000",
+                    "free_cap": "2260000000000",
+                },
+                ...
+            ]
+        }
+    """
+    if not keyword or not keyword.strip():
+        return {"code": 0, "msg": "keyword 不能为空", "stocks": []}
+
+    body = {
+        "needAmbiguousSuggest": True,
+        "pageSize": min(page_size, 200),
+        "pageNo": page_no,
+        "fingerprint": _gen_id(32),
+        "matchWord": "",
+        "shareToGuba": False,
+        "timestamp": str(int(datetime.now().timestamp() * 1000)),
+        "requestId": _gen_id(32) + str(int(datetime.now().timestamp() * 1000)),
+        "removedConditionIdList": [],
+        "ownSelectAll": False,
+        "needCorrect": True,
+        "client": "WEB",
+        "product": "",
+        "needShowStockNum": False,
+        "biz": "web_ai_select_stocks",
+        "xcId": "",
+        "gids": [],
+        "dxInfoNew": [],
+        "keyWordNew": keyword.strip(),
+        "customDataNew": json.dumps([{"type": "text", "value": keyword.strip(), "extra": ""}]),
+    }
+
+    try:
+        resp = requests.post(
+            _EM_SEARCH_URL,
+            json=body,
+            headers={"Content-Type": "application/json"},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as e:
+        logger.warning("[东财搜索] 请求失败: %s", e)
+        return {"code": 0, "msg": f"请求失败: {e}", "stocks": []}
+    except ValueError:
+        logger.warning("[东财搜索] 响应非 JSON")
+        return {"code": 0, "msg": "响应格式错误", "stocks": []}
+
+    if str(data.get("code")) != "100":
+        return {"code": 0, "msg": data.get("msg", "搜索失败"), "stocks": []}
+
+    res = (data.get("data") or {}).get("result") or {}
+    raw_list = res.get("dataList") or []
+
+    stocks: List[Dict[str, Any]] = []
+    for s in raw_list:
+        if not isinstance(s, dict):
+            continue
+        stocks.append({
+            "code": str(s.get("SECURITY_CODE", "")),
+            "name": str(s.get("SECURITY_SHORT_NAME", "")),
+            "industry": str(s.get("INDUSTRY", "")),
+            "concept": str(s.get("CONCEPT", "")),
+            "new_price": _safe_float(s.get("NEWEST_PRICE")),
+            "change_rate": _safe_float(s.get("CHG")),
+            "high_price": _safe_float(s.get("HIGH_PRICE")),
+            "low_price": _safe_float(s.get("LOW_PRICE")),
+            "pre_close_price": _safe_float(s.get("PRE_CLOSE_PRICE")),
+            "volume": _safe_float(s.get("TRADE_VOLUME")),
+            "deal_amount": s.get("TRADING_VOLUMES") or s.get("TRADE_AMOUNT"),
+            "volume_ratio": s.get("QRR"),
+            "turnoverrate": _safe_float(s.get("TURNOVER_RATE")),
+            "amplitude": _safe_float(s.get("AMPLITUDE")),
+            "pe9": s.get("PE_DYNAMIC") or s.get("PE9"),
+            "pbnewmrq": s.get("PB_NEW_MRQ"),
+            "total_market_cap": s.get("TOEAL_MARKET_VALUE") or s.get("TOTAL_MARKET_CAP"),
+            "free_cap": s.get("FREE_CAP"),
+        })
+
+    return {
+        "code": 1,
+        "keyword": keyword.strip(),
+        "total": res.get("total") or len(stocks),
+        "page_no": page_no,
+        "page_size": page_size,
+        "stocks": stocks,
+    }

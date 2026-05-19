@@ -1,5 +1,5 @@
-"""龙虎榜卡片"""
-from datetime import datetime, timedelta
+"""龙虎榜卡片 — 数据来源: 东财智能选股搜索"""
+from datetime import datetime
 from ._base import CardMeta, register
 
 meta = CardMeta(
@@ -8,39 +8,35 @@ meta = CardMeta(
     endpoint="/dragon-tiger",
     refresh_interval=120,
     order=70,
-    requires_hub=True,
+    requires_hub=False,
 )
+
+# 东财搜索关键词
+_KEYWORD = "龙虎榜"
 
 
 def fetch():
-    from app.market_cn.cards._hub_helper import get_hub
-    hub = get_hub()
-    if hub is None:
+    from app.market_cn.eastmoney_search import search_stocks
+    from app.data_sources.normalizer import safe_float
+
+    raw = search_stocks(keyword=_KEYWORD, page_size=100)
+    if raw.get("code") != 1:
         return _empty()
 
-    from app.data_sources.normalizer import safe_float, safe_int
     result = []
-    try:
-        today = datetime.now().strftime("%Y-%m-%d")
-        start = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
-        lhb = hub.dragon_tiger.get_history(start, today)
-        if lhb:
-            for item in lhb:
-                ch = safe_float(item.get("change_percent", 0))
-                result.append({
-                    "code": str(item.get("stock_code", "")),
-                    "name": str(item.get("stock_name", "")),
-                    "reason": str(item.get("reason", ""))[:50],
-                    "change": f"{'+' if ch >= 0 else ''}{ch:.2f}%",
-                    "trade_date": str(item.get("trade_date", "")),
-                    "buy_amount": safe_float(item.get("buy_amount", 0)),
-                    "sell_amount": safe_float(item.get("sell_amount", 0)),
-                    "net_amount": safe_float(item.get("net_amount", 0)),
-                    "buy_seat_count": safe_int(item.get("buy_seat_count", 0)),
-                    "sell_seat_count": safe_int(item.get("sell_seat_count", 0)),
-                })
-    except Exception:
-        pass
+    for s in raw.get("stocks", []):
+        ch = safe_float(s.get("change_rate"), 0)
+        price = safe_float(s.get("new_price"), 0)
+        result.append({
+            "code": s.get("code", ""),
+            "name": s.get("name", ""),
+            "industry": s.get("industry", ""),
+            "change": f"{'+' if ch >= 0 else ''}{ch:.2f}%",
+            "new_price": f"{price:.2f}",
+            "turnoverrate": f"{safe_float(s.get('turnoverrate'), 0):.2f}",
+            "deal_amount": s.get("deal_amount") or "",
+            "total_market_cap": s.get("total_market_cap") or "",
+        })
 
     return {"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "dragonTigerList": result}
 
