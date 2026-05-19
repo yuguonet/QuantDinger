@@ -87,7 +87,8 @@ export default {
     async refresh () {
       this.loading = true
       try {
-        const d = await request({ url: '/api/shichang/cards/dragon-tiger', method: 'GET' })
+        const resp = await request({ url: '/api/shichang/cards/dragon-tiger', method: 'GET' })
+        const d = resp.data || resp
         this.list = (d.dragonTigerList || []).map(item => {
           const full = (item.reason || '').replace(/成功率/g, '')
           return {

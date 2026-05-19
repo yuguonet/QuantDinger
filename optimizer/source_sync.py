@@ -765,6 +765,7 @@ def merge_records(
     for rec in db_recs:
         dt = _naive_dt(rec.get("time"))
         if dt is not None:
+            rec["time"] = dt
             by_time[dt] = rec
 
     # 远端覆盖
@@ -772,6 +773,7 @@ def merge_records(
         dt = _naive_dt(rec.get("time"))
         if dt is None:
             continue
+        rec["time"] = dt
         if dt in by_time:
             db_rec = by_time[dt]
             db_vol = _safe_float(db_rec.get("volume"))

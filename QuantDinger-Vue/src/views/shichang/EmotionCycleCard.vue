@@ -30,7 +30,8 @@ export default {
     async refresh () {
       this.loading = true
       try {
-        const d = await request({ url: '/api/shichang/cards/emotion-cycle', method: 'GET' })
+        const resp = await request({ url: '/api/shichang/cards/emotion-cycle', method: 'GET' })
+        const d = resp.data || resp
         this.history = d?.history || []
         this.renderChart()
       } catch (e) {

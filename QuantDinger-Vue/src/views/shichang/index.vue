@@ -190,7 +190,8 @@ export default {
     // 总览数据（涨停/跌停/北向/情绪）
     async fetchOverview () {
       try {
-        const d = await request({ url: '/api/shichang/cards/overview', method: 'GET' })
+        const resp = await request({ url: '/api/shichang/cards/overview', method: 'GET' })
+        const d = resp.data || resp
         if (!d || this.isDestroyed) return
         this.overview.limitUp = d.limitUp || 0
         this.overview.limitDown = d.limitDown || 0

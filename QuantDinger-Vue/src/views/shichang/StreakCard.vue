@@ -107,7 +107,8 @@ export default {
     async refresh () {
       this.loading = true
       try {
-        const d = await request({ url: '/api/shichang/cards/streak', method: 'GET' })
+        const resp = await request({ url: '/api/shichang/cards/streak', method: 'GET' })
+        const d = resp.data || resp
         this.streakStocks = d.streakStocks || []
         this.streakHeight = d.streakHeight || 0
         this.yesterdayStreakStocks = d.yesterdayStreakStocks || []

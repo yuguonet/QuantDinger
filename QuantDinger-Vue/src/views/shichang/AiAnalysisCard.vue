@@ -70,7 +70,8 @@ export default {
     async refresh () {
       this.loading = true
       try {
-        const d = await request({ url: '/api/shichang/cards/ai-analysis', method: 'GET' })
+        const resp = await request({ url: '/api/shichang/cards/ai-analysis', method: 'GET' })
+        const d = resp.data || resp
         if (d) Object.assign(this.data, d)
       } catch (e) {
         console.error('AI分析刷新失败:', e)

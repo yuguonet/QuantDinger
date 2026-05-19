@@ -88,7 +88,8 @@ export default {
     async refresh () {
       this.loading = true
       try {
-        const d = await request({ url: '/api/shichang/cards/hot-list', method: 'GET' })
+        const resp = await request({ url: '/api/shichang/cards/hot-list', method: 'GET' })
+        const d = resp.data || resp
         this.list = (d.hotList || []).map((item, i) => ({ ...item, rank: i + 1, change: String(item.change ?? '0') }))
       } catch (e) {
         console.error('热榜刷新失败:', e)

@@ -217,12 +217,24 @@ def _bar_from_ticker(quote: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
+def _merge_bars_group(group: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """将一组 bar 聚合为一根（open=首根open, high=最大, low=最小, close=末根close, volume=求和）。"""
+    return {
+        "time": group[0]["time"],
+        "open": group[0]["open"],
+        "high": max(b["high"] for b in group),
+        "low": min(b["low"] for b in group),
+        "close": group[-1]["close"],
+        "volume": round(sum(b["volume"] for b in group), 2),
+    }
+
+
 # ================================================================
 # 主数据源类
 # ================================================================
 
 class CNStockDataSource(BaseDataSource):
-    """A股数据源 — 简化版：仅 1D/1W 走 DB，其余直走远端。"""
+    """A股数据源: 1D/1W 走 DB + TTL, 15m/30m/1h/2h/4h 盘后走 DB, 其余走远端。"""
 
     name = "CNStock/multi-source"
 
@@ -335,7 +347,8 @@ class CNStockDataSource(BaseDataSource):
 
         分流逻辑：
           1D / 1W → 走 DB + TTL 混合流程（有本地缓存，响应快）
-          其它    → 直接走远端（分时线盘中无 HL，不值得缓存）
+          15m/30m/1h/2h/4h → 盘后走 DB（15m 直读，其余由 15m 聚合），盘中走远端
+          1m / 5m → 直接走远端（粒度太细，DB 无意义）
         """
         tf = normalize_chart_timeframe(timeframe)
         limit = max(int(limit or 300), 1)
@@ -345,7 +358,18 @@ class CNStockDataSource(BaseDataSource):
         if tf == "1W":
             return self._get_kline_weekly(symbol, limit)
 
-        # 1m/5m/15m/30m/1h/2h/4h — 直接走远端，不做 DB
+        # 15m/30m/1h/2h/4h — 盘后走 DB，盘中走远端
+        if tf in ("15m", "30m", "1h", "2h", "4h"):
+            if not _is_in_trading_hours():
+                result = self._get_kline_15m_based(symbol, tf, limit)
+                if result:
+                    return self.filter_and_limit(
+                        result, limit=limit,
+                        before_time=before_time, after_time=after_time,
+                        truncate=(after_time is None),
+                    )
+
+        # 1m/5m 或 DB 未命中 → 走远端
         return self._get_kline_remote(symbol, tf, limit, before_time, after_time)
 
     # ================================================================
@@ -488,6 +512,164 @@ class CNStockDataSource(BaseDataSource):
         out = out_kline[-limit:] if len(out_kline) > limit else out_kline
         logger.debug(f"[kline_weekly] {symbol} 聚合后返回 {len(out)} 条")
         return out
+
+    # ================================================================
+    # 15m DB + 聚合（盘后 15m/30m/1h/2h/4h）
+    #
+    # 盘后（非交易时段）15m 线从 DB 读取（由 source_sync.py 写入），
+    # 30m/1h/2h/4h 由 15m 线聚合而来。
+    # 盘中仍走远端（DB 数据不是实时的）。
+    # ================================================================
+
+    # 目标周期对应的 15m bar 数
+    _TF_BAR_COUNT = {"15m": 1, "30m": 2, "1h": 4, "2h": 8, "4h": 16}
+
+    def _get_kline_15m_based(
+        self, symbol: str, tf: str, limit: int,
+    ) -> List[Dict[str, Any]]:
+        """盘后: 15m 走 DB，30m/1h/2h/4h 由 15m 聚合。"""
+        # 1. 校验 DB 15m 数据是否足够新
+        if not self._check_15m_fresh(symbol):
+            return []
+
+        # 2. 计算需要读多少 15m bar
+        bar_count = self._TF_BAR_COUNT.get(tf, 1)
+        # 聚合需要 limit 组 × 每组 bar_count 根，多留 1 天余量
+        need_bars = limit * bar_count + 16
+
+        # 3. 从 DB 读 15m bar
+        raw_bars = self._read_db_15m(symbol, need_bars)
+        if not raw_bars:
+            return []
+
+        # 4. 15m 直接返回；其余聚合
+        if tf == "15m":
+            return raw_bars[-limit:]
+        return self._aggregate_from_15m(raw_bars, bar_count)[-limit:]
+
+    def _check_15m_fresh(self, symbol: str) -> bool:
+        """检查 DB 中 15m 线最后一条的时间是否足够新。
+
+        盘中走远端，盘前/盘后且 DB 最新才走 DB:
+          - 盘中（交易日 9:15~15:01）→ False
+          - 盘后（交易日 15:01 后）→ 最后 bar 必须是今日 15:00
+          - 盘前（交易日 9:15 前）→ 最后 bar 必须是前一交易日 15:00
+          - 非交易日全天 → 最后 bar 必须是最近交易日 15:00
+        """
+        now = datetime.now()
+        today_str = now.strftime("%Y-%m-%d")
+        t = now.time()
+
+        # 盘中 → 不走 DB
+        if _is_in_trading_hours():
+            return False
+
+        # 取 DB 最后一条 15m bar
+        db_symbol = strip_market_prefix(symbol) if symbol else symbol
+        try:
+            from app.utils.db_market import get_market_kline_writer
+            writer = get_market_kline_writer()
+            rows = writer.query(
+                "CNStock", db_symbol, "15m",
+                start_time=None, end_time=None, limit=1,
+            )
+        except Exception:
+            return False
+
+        if not rows:
+            return False
+
+        last_dt = rows[-1].get("time")
+        if not isinstance(last_dt, datetime):
+            return False
+
+        last_date_str = last_dt.strftime("%Y-%m-%d")
+        last_hm = last_dt.hour * 60 + last_dt.minute
+
+        # 最后一条必须是 15:00 收盘 bar
+        if last_hm < 15 * 60:
+            return False
+
+        # 判断最后 bar 的日期是否匹配
+        if is_trading_day(today_str):
+            if t > dtime(15, 1):
+                # 盘后 → 必须是今日
+                return last_date_str == today_str
+            else:
+                # 盘前 → 必须是前一交易日
+                return last_date_str == prev_trading_day(today_str)
+        else:
+            # 非交易日 → 必须是最近交易日
+            return last_date_str == prev_trading_day(today_str)
+
+    def _read_db_15m(self, symbol: str, limit: int) -> List[Dict[str, Any]]:
+        """从 DB 读取 15m K 线，按时间升序返回（最多 limit 条）。"""
+        db_symbol = strip_market_prefix(symbol) if symbol else symbol
+        try:
+            from app.utils.db_market import get_market_kline_writer
+            writer = get_market_kline_writer()
+            rows = writer.query(
+                "CNStock", db_symbol, "15m",
+                start_time=None, end_time=None, limit=limit,
+            )
+        except Exception:
+            return []
+
+        from zoneinfo import ZoneInfo
+        _beijing = ZoneInfo("Asia/Shanghai")
+        bars = []
+        for row in rows:
+            t = row.get("time")
+            if isinstance(t, datetime):
+                ts = int(t.replace(tzinfo=_beijing).timestamp()) if t.tzinfo is None else int(t.timestamp())
+            else:
+                ts = int(t)
+            bars.append({
+                "time": ts,
+                "open": float(row.get("open", 0)),
+                "high": float(row.get("high", 0)),
+                "low": float(row.get("low", 0)),
+                "close": float(row.get("close", 0)),
+                "volume": float(row.get("volume", 0)),
+            })
+        return bars
+
+    @staticmethod
+    def _aggregate_from_15m(
+        bars: List[Dict[str, Any]], bar_count: int,
+    ) -> List[Dict[str, Any]]:
+        """将 15m bar 按日期和固定数量聚合为更大周期。
+
+        bar_count: 每组 15m bar 数（30m=2, 1h=4, 2h=8, 4h=16）
+        按日期分组后，每 bar_count 根合并为一根。
+        """
+        if not bars or bar_count <= 1:
+            return bars
+
+        result = []
+        cur_date = None
+        group: List[Dict[str, Any]] = []
+
+        for bar in bars:
+            d = datetime.fromtimestamp(bar["time"]).strftime("%Y-%m-%d")
+            if d != cur_date:
+                # 日期切换：先 emit 上一组剩余
+                if group:
+                    result.append(_merge_bars_group(group))
+                cur_date = d
+                group = [bar]
+            else:
+                group.append(bar)
+            # 凑满一组就 emit
+            if len(group) == bar_count:
+                result.append(_merge_bars_group(group))
+                group = []
+
+        # 收尾
+        if group:
+            result.append(_merge_bars_group(group))
+
+        return result
 
     # ================================================================
     # 远端直读（非 1D/1W 周期）
