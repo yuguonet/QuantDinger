@@ -106,7 +106,7 @@ export default {
     async refresh () {
       this.loading = true
       try {
-        const d = await request({ url: '/api/shichang/strong', method: 'GET' })
+        const d = await request({ url: '/api/shichang/cards/strong-stocks', method: 'GET' })
         this.list = (d.strongStocks || []).map(item => ({ ...item, gain: String(item.gain ?? '0') }))
       } catch (e) {
         console.error('强势股刷新失败:', e)
