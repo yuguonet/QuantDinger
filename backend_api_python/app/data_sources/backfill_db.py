@@ -12,7 +12,7 @@ backfill_db.py — A 股 K 线增量同步 + 后台调度
   4. 后台自动调度，不影响主线程
 
 数据流:
-  15m → coordinator.coordinate_batch_klines() → 16 bars/标的 → bulk_write
+  15m → coordinator.coordinate_market_kline() → 16 bars/标的 → bulk_write
   1D  → coordinator.coordinate_batch_quotes() → 重试+去重 → bulk_write
   ↓
   db_market.upsert() → PostgreSQL
@@ -100,7 +100,8 @@ def _ensure_cn_last_update_table(pool_name: str = "CNStock"):
                             status VARCHAR(20) DEFAULT 'ok',
                             report TEXT,
                             failed_count INT DEFAULT 0,
-                            synced_count INT DEFAULT 0
+                            synced_count INT DEFAULT 0,
+                            written_count INT DEFAULT 0
                         )
                     """)
                     # 兼容旧表: 加缺失列（如果不存在）
@@ -108,6 +109,7 @@ def _ensure_cn_last_update_table(pool_name: str = "CNStock"):
                         ("last_bar_time", "TIMESTAMP"),
                         ("failed_count", "INT DEFAULT 0"),
                         ("synced_count", "INT DEFAULT 0"),
+                        ("written_count", "INT DEFAULT 0"),
                     ]:
                         cur.execute(f"""
                             DO $$
@@ -129,7 +131,7 @@ def _ensure_cn_last_update_table(pool_name: str = "CNStock"):
 
 
 def _get_last_update(source_name: str, tf: str, pool_name: str = "CNStock") -> dict | None:
-    """查询 cn_last_update 记录。"""
+    """查询 cn_last_update 最新记录（按 source_name + tf 匹配最新一条）。"""
     _ensure_cn_last_update_table(pool_name)
     try:
         mgr = get_market_db_manager()
@@ -137,9 +139,11 @@ def _get_last_update(source_name: str, tf: str, pool_name: str = "CNStock") -> d
         with pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT last_updated, last_bar_time, status, report, failed_count, synced_count "
-                    "FROM cn_last_update WHERE id = %s",
-                    (f"{source_name}_{tf}",),
+                    "SELECT last_updated, last_bar_time, status, report, failed_count, synced_count, written_count "
+                    "FROM cn_last_update "
+                    "WHERE id LIKE %s "
+                    "ORDER BY last_updated DESC LIMIT 1",
+                    (f"{source_name}_{tf}%",),
                 )
                 row = cur.fetchone()
                 if not row:
@@ -151,6 +155,7 @@ def _get_last_update(source_name: str, tf: str, pool_name: str = "CNStock") -> d
                     "report": row[3],
                     "failed_count": row[4] or 0,
                     "synced_count": row[5] or 0,
+                    "written_count": row[6] or 0,
                 }
     except Exception as e:
         logger.error(f"[同步] 查询 cn_last_update 失败: {e}")
@@ -161,30 +166,26 @@ def _record_update(source_name: str, tf: str, status: str, report: str,
                    last_bar_time: datetime | None = None,
                    synced_count: int | None = None,
                    failed_count: int | None = None,
-                   pool_name: str = "CNStock"):
-    """写入同步记录到 cn_last_update。synced_count/failed_count 用于增量同步进度追踪。"""
+                   pool_name: str = "CNStock",
+                   record_id: str | None = None,
+                   written_count: int | None = None):
+    """增量写入同步记录到 cn_last_update（每次 INSERT 新行，不覆盖历史）。"""
     _ensure_cn_last_update_table(pool_name)
     try:
+        if record_id is None:
+            record_id = f"{source_name}_{tf}_{int(datetime.now().timestamp() * 1000)}"
         mgr = get_market_db_manager()
         pool = mgr._get_pool(pool_name)
         with pool.connection() as conn:
             with conn.cursor() as cur:
-                # 使用北京时间存储，避免 PG 服务器时区不一致导致的比较错误
                 cur.execute("""
                     INSERT INTO cn_last_update
                         (id, tf, last_updated, last_bar_time, status, report,
-                         synced_count, failed_count)
+                         synced_count, failed_count, written_count)
                     VALUES (%s, %s, NOW() AT TIME ZONE 'Asia/Shanghai', %s, %s, %s,
-                            %s, %s)
-                    ON CONFLICT (id) DO UPDATE SET
-                        last_updated  = NOW() AT TIME ZONE 'Asia/Shanghai',
-                        last_bar_time = COALESCE(EXCLUDED.last_bar_time, cn_last_update.last_bar_time),
-                        status        = EXCLUDED.status,
-                        report        = EXCLUDED.report,
-                        synced_count  = COALESCE(EXCLUDED.synced_count, cn_last_update.synced_count),
-                        failed_count  = COALESCE(EXCLUDED.failed_count, cn_last_update.failed_count)
-                """, (f"{source_name}_{tf}", tf, last_bar_time, status, report,
-                      synced_count, failed_count))
+                            %s, %s, %s, %s)
+                """, (record_id, tf, last_bar_time, status, report,
+                      synced_count, failed_count, written_count))
                 conn.commit()
     except Exception as e:
         logger.error(f"[同步] 写入 cn_last_update 失败: {e}")
@@ -298,7 +299,7 @@ class BackfillSource:
 class BackfillDB:
     """全盘批量同步工具。
 
-    A 股 15m: 15:05 后通过 coordinator.coordinate_batch_klines 拉取当天 16 条 bar
+    A 股 15m: 15:05 后通过 coordinator.coordinate_market_kline 拉取当天 16 条 bar
     A 股 1D:  coordinator.coordinate_batch_quotes（含重试）
     基金/债:  Dinger API
     """
@@ -383,7 +384,7 @@ class BackfillDB:
         except Exception as e:
             report = f"同步异常: {e}"
             logger.error(f"[同步] {self.source.name} tf={tf} {report}")
-            _record_update(self.source.name, tf, "error", report, pool_name=pool)
+            _record_update(self.source.name, tf, "error", report, pool_name=pool, written_count=0)
             return {
                 "source": self.source.name, "tf": tf,
                 "written": 0, "status": "error", "report": report,
@@ -412,7 +413,7 @@ class BackfillDB:
 
         coord = get_coordinator()
         try:
-            klines = coord.coordinate_batch_klines(
+            klines = coord.coordinate_market_kline(
                 symbols=symbols,
                 market=self.source.market,
                 timeframe="15m",
@@ -680,6 +681,7 @@ class BackfillDB:
                     f"修复中: {final_count}/{total_symbols}, 失败 {len(failed)}",
                     last_bar_time=bar_time, synced_count=final_count,
                     failed_count=len(failed), pool_name=pool,
+                    written_count=rw,
                 )
 
         # ── 最终落盘 cn_last_update ──
@@ -696,10 +698,15 @@ class BackfillDB:
 
         report = "; ".join(report_parts)
 
+        # 90% 阈值: 同步率不足 90% → partial，不写 ok
+        sync_rate = final_count / total_symbols if total_symbols > 0 else 0
+        final_status = "ok" if sync_rate >= 0.9 and not failed else "partial"
+
         _record_update(
-            self.source.name, "15m", "ok", report,
+            self.source.name, "15m", final_status, report,
             last_bar_time=bar_time, synced_count=final_count,
             failed_count=len(failed), pool_name=pool,
+            written_count=total_written,
         )
 
         if failed:
@@ -936,6 +943,7 @@ class BackfillDB:
                     f"修复中: {final_count}/{total_symbols}, 失败 {len(failed)}",
                     last_bar_time=bar_time, synced_count=final_count,
                     failed_count=len(failed), pool_name=pool,
+                    written_count=rw,
                 )
 
         # ── 最终落盘 cn_last_update ──
@@ -952,10 +960,15 @@ class BackfillDB:
 
         report = "; ".join(report_parts)
 
+        # 90% 阈值: 同步率不足 90% → partial，不写 ok
+        sync_rate = final_count / total_symbols if total_symbols > 0 else 0
+        final_status = "ok" if sync_rate >= 0.9 and not failed else "partial"
+
         _record_update(
-            self.source.name, "1D", "ok", report,
+            self.source.name, "1D", final_status, report,
             last_bar_time=bar_time, synced_count=final_count,
             failed_count=len(failed), pool_name=pool,
+            written_count=total_written,
         )
 
         if failed:
@@ -1052,6 +1065,10 @@ stock_daily_k = BackfillDB(BackfillSource(
 _scheduler_started = False
 _stop_event = threading.Event()
 
+# ── 短间隔重试 ──
+_task_retries: dict[str, datetime] = {}   # task → 下次重试时间
+_RETRY_INTERVAL = timedelta(minutes=5)    # 未完成时重试间隔
+
 
 def _next_trigger_time(task: str) -> datetime:
     """返回指定任务的下次触发时间，跳过非交易日。
@@ -1068,7 +1085,6 @@ def _next_trigger_time(task: str) -> datetime:
         return datetime(now.year, now.month, now.day, trigger_h, trigger_m, 0, tzinfo=TZ_CN)
 
     # 找下一个交易日
-    from app.utils.trading_calendar import next_trading_day
     if now.time() >= dt_time(trigger_h, trigger_m):
         next_td = next_trading_day(today_str)
     else:
@@ -1079,18 +1095,74 @@ def _next_trigger_time(task: str) -> datetime:
 
 
 def _is_task_done_today(task: str) -> bool:
-    """检查指定任务今天是否已完成（通过 cn_last_update 判断）。"""
+    """检查指定任务今天是否已完成。
+
+    判定条件（同时满足）:
+    - synced_count / (synced_count + failed_count) >= 90%
+    - written_count = 0（最近一轮无新数据）
+    """
     doc = _get_last_update("stock_daily_k", task, pool_name="CNStock")
     if not doc:
         return False
     lu = _parse_db_timestamp(doc.get("last_updated"))
-    if not lu:
+    if not lu or not _same_trading_day(lu, datetime.now(TZ_CN)):
         return False
-    return _same_trading_day(lu, datetime.now(TZ_CN))
+    synced = doc.get("synced_count") or 0
+    failed = doc.get("failed_count") or 0
+    written = doc.get("written_count") or 0
+    total = synced + failed
+    if total <= 0 or synced <= 0:
+        return False
+    return synced / total >= 0.9 and written == 0
+
+
+def _run_task_and_schedule_retry(task: str):
+    """执行一次同步，根据 cn_last_update 的计数 + 本轮写入量决定是否安排重试。
+
+    完成条件（同时满足）:
+    - synced_count / (synced_count + failed_count) >= 90%
+    - 本轮 written = 0（数据源已无新数据）
+    """
+    try:
+        result = stock_daily_k.run_once(task)
+        written = result.get("written", 0)
+        logger.info(f"[调度] {task} 本轮写入: {written}")
+
+        # 从 cn_last_update 最新记录读取实际计数
+        doc = _get_last_update("stock_daily_k", task, pool_name="CNStock")
+        if doc:
+            synced = doc.get("synced_count") or 0
+            failed = doc.get("failed_count") or 0
+            total = synced + failed
+            sync_rate = synced / total if total > 0 else 0
+            logger.info(f"[调度] {task} 进度: {synced}/{total} ({sync_rate:.0%}), 失败 {failed}")
+
+            # 完成条件: 同步率 >= 90% 且本轮 0 条新数据
+            if sync_rate >= 0.9 and written == 0:
+                logger.info(f"[调度] {task} 完成: 同步率 {sync_rate:.0%} 且无新数据")
+                _task_retries.pop(task, None)
+                return
+
+            # 未满足完成条件 → 5 分钟后重试
+            retry_at = datetime.now(TZ_CN) + _RETRY_INTERVAL
+            _task_retries[task] = retry_at
+            reason = []
+            if sync_rate < 0.9:
+                reason.append(f"同步率 {sync_rate:.0%} < 90%")
+            if written > 0:
+                reason.append(f"本轮仍有 {written} 条新数据")
+            logger.info(f"[调度] {task} 未完成 ({', '.join(reason)})，安排重试 @ {retry_at:%H:%M:%S}")
+            return
+
+        # 无记录 → 清除重试
+        _task_retries.pop(task, None)
+    except Exception as e:
+        logger.error(f"[调度] {task} 异常: {e}")
 
 
 def _catchup_missed_tasks():
     """启动时补跑: 交易日内已过触发时间但今天还没跑的任务，立即执行。
+    补跑后如果 status=partial，自动安排重试。
 
     15m: 15:05 后未跑 → 补跑
     1D:  17:05 后未跑 → 补跑
@@ -1103,46 +1175,29 @@ def _catchup_missed_tasks():
 
     now_time = now.time()
 
-    # 15m: 15:05 后且今天没跑过
+    # 15m: 15:05 后且今天没跑过（或上次跑是 partial）
     if now_time >= dt_time(15, 5) and not _is_task_done_today("15m"):
-        logger.info("[调度] 启动补跑: 15m (已过 15:05 且今天未同步)")
-        try:
-            result = stock_daily_k.run_once("15m")
-            logger.info(
-                f"[调度] 补跑 15m 完成: written={result.get('written', 0)} "
-                f"status={result.get('status', '')}"
-            )
-        except Exception as e:
-            logger.error(f"[调度] 补跑 15m 异常: {e}")
+        logger.info("[调度] 启动补跑: 15m (已过 15:05 且今天未完成)")
+        _run_task_and_schedule_retry("15m")
 
-    # 1D: 17:05 后且今天没跑过
+    # 1D: 17:05 后且今天没跑过（或上次跑是 partial）
     if now_time >= dt_time(17, 5) and not _is_task_done_today("1D"):
-        logger.info("[调度] 启动补跑: 1D (已过 17:05 且今天未同步)")
-        try:
-            result = stock_daily_k.run_once("1D")
-            logger.info(
-                f"[调度] 补跑 1D 完成: written={result.get('written', 0)} "
-                f"status={result.get('status', '')}"
-            )
-        except Exception as e:
-            logger.error(f"[调度] 补跑 1D 异常: {e}")
+        logger.info("[调度] 启动补跑: 1D (已过 17:05 且今天未完成)")
+        _run_task_and_schedule_retry("1D")
 
 
 def _scheduler_loop():
-    """统一调度主循环 — 一个线程管理 15m + 1D，sleep 到最近触发点执行。
+    """统一调度主循环 — 一个线程管理 15m + 1D + 重试，sleep 到最近触发点执行。
 
     每轮:
-      1. 非交易日 → sleep 到明天 09:00 重新判断
-      2. 计算 15m (15:05) 和 1D (17:05) 各自的下次触发时间，取较近者
-      3. sleep 到点 → 执行对应任务 → 计算新的触发时间 → 循环
-
-    启动时:
-      - 检查今天已过触发时间但未执行的任务，立即补跑
+      1. 非交易日 → 清除重试，sleep 到明天 09:00 重新判断
+      2. 计算 15m (15:05) 和 1D (17:05) 各自的下次触发时间
+      3. 检查是否有待执行的重试（5 分钟短间隔）
+      4. 取所有候选中最早的时间点 sleep 到 → 执行 → 根据结果决定是否安排重试
     """
-    # 确保 cn_last_update 表存在
     _ensure_cn_last_update_table()
 
-    # ── 启动补跑: 错过触发时间的任务 ──
+    # ── 启动补跑: 错过触发时间或上次 partial 的任务 ──
     _catchup_missed_tasks()
 
     while not _stop_event.is_set():
@@ -1150,8 +1205,9 @@ def _scheduler_loop():
             now = datetime.now(TZ_CN)
             today_str = now.strftime("%Y-%m-%d")
 
-            # ── 非交易日: sleep 到明天 09:00 ──
+            # ── 非交易日: 清除重试，sleep 到明天 09:00 ──
             if not is_trading_day(today_str):
+                _task_retries.clear()
                 tomorrow = now + timedelta(days=1)
                 wake = datetime(tomorrow.year, tomorrow.month, tomorrow.day,
                                 9, 0, 0, tzinfo=TZ_CN)
@@ -1160,42 +1216,38 @@ def _scheduler_loop():
                 _stop_event.wait(timeout=sleep_sec)
                 continue
 
-            # ── 计算两个任务的下次触发时间 ──
+            # ── 计算所有候选触发时间，取最早 ──
+            candidates: list[tuple[datetime, str]] = []  # (触发时间, 任务名)
+
+            # 常规触发时间
             next_15m = _next_trigger_time("15m")
             next_1d = _next_trigger_time("1D")
+            candidates.append((next_15m, "15m"))
+            candidates.append((next_1d, "1D"))
 
-            # 取较近者
-            if next_15m <= next_1d:
-                target_task = "15m"
-                trigger_time = next_15m
-            else:
-                target_task = "1D"
-                trigger_time = next_1d
+            # 待执行的重试（直接加入候选，由 _run_task_and_schedule_retry 决定是否继续）
+            for task, retry_at in list(_task_retries.items()):
+                candidates.append((retry_at, f"{task}_retry"))
 
+            # 取最早
+            trigger_time, target = min(candidates, key=lambda x: x[0])
             sleep_sec = max((trigger_time - datetime.now(TZ_CN)).total_seconds(), 0)
+
+            is_retry = target.endswith("_retry")
+            task_name = target.replace("_retry", "")
+            label = f"{task_name} (重试)" if is_retry else task_name
+
             logger.info(
-                f"[调度] 下次触发: {target_task} @ {trigger_time:%Y-%m-%d %H:%M:%S}，"
+                f"[调度] 下次触发: {label} @ {trigger_time:%Y-%m-%d %H:%M:%S}，"
                 f"sleep {sleep_sec:.0f}s"
             )
 
             if _stop_event.wait(timeout=sleep_sec):
-                break  # 收到停止信号
+                break
 
-            # ── 执行对应任务 ──
-            if target_task == "15m":
-                logger.info("[调度] 15m 开始同步")
-                result = stock_daily_k.run_once("15m")
-                logger.info(
-                    f"[调度] 15m 完成: written={result.get('written', 0)} "
-                    f"status={result.get('status', '')}"
-                )
-            else:
-                logger.info("[调度] 1D 开始同步")
-                result = stock_daily_k.run_once("1D")
-                logger.info(
-                    f"[调度] 1D 完成: written={result.get('written', 0)} "
-                    f"status={result.get('status', '')}"
-                )
+            # ── 执行 ──
+            logger.info(f"[调度] {label} 开始同步")
+            _run_task_and_schedule_retry(task_name)
 
         except Exception as e:
             logger.error(f"[调度] 异常: {e}")
@@ -1214,7 +1266,7 @@ def start_scheduler():
     t = threading.Thread(target=_scheduler_loop, daemon=True,
                          name="backfill-scheduler")
     t.start()
-    logger.info("[调度] 统一调度器已启动（15m@15:05 + 1D@17:05）")
+    logger.info("[调度] 统一调度器已启动（15m@15:05 + 1D@17:05 + 5min 重试）")
 
 
 def stop_scheduler():

@@ -24,6 +24,7 @@
 # python optimizer/source_sync.py -T 1D --resume           # 断点续传
 # python optimizer/source_sync.py -T 1D --retry-only       # 只重试错误股票
 # python optimizer/source_sync.py -T 1D --dry-run          # 只校验不写库
+# python optimizer/source_sync.py -T 1D --incremental      # 增量: 与DB归一化合并后写入
 #
 # ============================================================================
 
@@ -685,6 +686,106 @@ def write_batch_data(
 
 
 # ═══════════════════════════════════════════════════════
+# 增量模式: 批量查询 DB 现有数据
+# ═══════════════════════════════════════════════════════
+
+def query_batch_existing(
+    pool,
+    symbols: List[str],
+    timeframe: str,
+    start_date: str,
+    end_date: str,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """批量查询 DB 中已有的 K 线数据，按 symbol 分组返回。
+
+    一次查一年表，批量 IN 查询，避免逐只查询的开销。
+    """
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+    start_year = start_dt.year
+    end_year = end_dt.year
+
+    result: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+
+    try:
+        with pool.connection() as conn:
+            cur = conn.cursor()
+            for year in range(start_year, end_year + 1):
+                table = f"kline_{timeframe}_{year}"
+                # 检查表是否存在
+                cur.execute("""
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = %s
+                """, (table,))
+                if cur.fetchone() is None:
+                    continue
+
+                # 批量查询
+                cur.execute(f"""
+                    SELECT symbol, time, open, high, low, close, volume
+                    FROM "{table}"
+                    WHERE symbol = ANY(%s)
+                      AND time >= %s AND time <= %s
+                """, (symbols, start_dt, end_dt))
+
+                for row in cur.fetchall():
+                    result[row[0]].append({
+                        "time": row[1],
+                        "open": float(row[2]) if row[2] is not None else 0.0,
+                        "high": float(row[3]) if row[3] is not None else 0.0,
+                        "low": float(row[4]) if row[4] is not None else 0.0,
+                        "close": float(row[5]) if row[5] is not None else 0.0,
+                        "volume": float(row[6]) if row[6] is not None else 0.0,
+                    })
+            cur.close()
+    except Exception as e:
+        logger.warning("批量查询 DB 现有数据失败: %s", e)
+
+    return dict(result)
+
+
+def merge_records(
+    remote_recs: List[Dict[str, Any]],
+    db_recs: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """归一化合并远端和 DB 记录，按时间戳去重。
+
+    策略:
+      - 同时间戳: remote volume>0 → 用 remote; 否则保留 DB
+      - 仅 remote 或仅 DB → 直接保留
+    """
+    def _naive_dt(dt):
+        if isinstance(dt, datetime) and dt.tzinfo:
+            return dt.replace(tzinfo=None)
+        return dt
+
+    by_time: Dict[datetime, Dict[str, Any]] = {}
+
+    # 先放 DB 记录
+    for rec in db_recs:
+        dt = _naive_dt(rec.get("time"))
+        if dt is not None:
+            by_time[dt] = rec
+
+    # 远端覆盖
+    for rec in remote_recs:
+        dt = _naive_dt(rec.get("time"))
+        if dt is None:
+            continue
+        if dt in by_time:
+            db_rec = by_time[dt]
+            db_vol = _safe_float(db_rec.get("volume"))
+            remote_vol = _safe_float(rec.get("volume"))
+            if remote_vol > 0:
+                by_time[dt] = rec  # remote 有量 → 覆盖
+            # remote volume=0 且 DB 有量 → 保留 DB（不覆盖）
+        else:
+            by_time[dt] = rec  # DB 没有 → 直接用 remote
+
+    return sorted(by_time.values(), key=lambda r: r["time"])
+
+
+# ═══════════════════════════════════════════════════════
 # 重传文件管理
 # ═══════════════════════════════════════════════════════
 
@@ -838,9 +939,12 @@ def process_batch(
     price_tolerance: float,
     dry_run: bool,
     retry_path: str,
+    incremental: bool = False,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """
     处理一批股票: 拉取 → 校验 → 写入/记录错误
+
+    incremental=True 时: 拉取远端数据后，先查 DB 现有数据，归一化合并再校验写入。
 
     Returns:
         (results_list, stats_dict)
@@ -914,6 +1018,13 @@ def process_batch(
         else:
             _prefix_map[rk] = rk
 
+    # ── 增量模式: 批量查 DB 现有数据 ──
+    db_existing: Dict[str, List[Dict[str, Any]]] = {}
+    if incremental:
+        db_existing = query_batch_existing(pool, symbols, timeframe, start_date, end_date)
+        if db_existing:
+            print(f"  📦 增量模式: 已查到 {len(db_existing)} 只股票的 DB 现有数据")
+
     # ── 第一轮: 逐只校验 ──
     code_records: Dict[str, Tuple[List[Dict[str, Any]], ValidationResult]] = {}
     for code in symbols:
@@ -961,6 +1072,15 @@ def process_batch(
                            "bars": len(bars), "written": 0, "status": "no_data",
                            "errors": "转换后无有效记录"})
             continue
+
+        # ── 增量模式: 与 DB 现有数据归一化合并 ──
+        if incremental and code in db_existing:
+            db_recs = db_existing[code]
+            if db_recs:
+                before_cnt = len(records)
+                records = merge_records(records, db_recs)
+                logger.debug("[增量合并] %s: remote=%d + db=%d → merged=%d",
+                             code, before_cnt, len(db_recs), len(records))
 
         # 完整性校验
         vr = validate_stock(code, records, timeframe, start_date, end_date, price_tolerance)
@@ -1058,6 +1178,8 @@ def main():
         help="断点续传：跳过已处理的股票")
     parser.add_argument("--retry-only", action="store_true",
         help="只重试重传文件中的股票")
+    parser.add_argument("--incremental", action="store_true",
+        help="增量模式: 拉取远端数据后先与 DB 现有数据归一化合并，再校验写入")
 
     args = parser.parse_args()
 
@@ -1099,6 +1221,12 @@ def main():
             mgr.ensure_market_db(market)
 
     pool = mgr._get_pool(market)
+
+    # 确保所需年份的 kline 表都存在（_init_market_schema 只建近 5 年）
+    start_year = int(start_date[:4])
+    end_year = int(end_date[:4])
+    for y in range(start_year, end_year + 1):
+        mgr.ensure_year_table(market, args.type, y)
 
     _init_trading_calendar()
 
@@ -1165,7 +1293,7 @@ def main():
 ║  日期: {start_date} → {end_date}                     ║
 ║  股票: {total} 只  批次: {batch_size}  条数: {count:<8}          ║
 ║  复权: {args.adj or '不复权':<8}  超时: {args.timeout:.0f}s                   ║
-║  模式: {'重试' if args.retry_only else '主循环'}{'  dry-run' if args.dry_run else ''}                         ║
+║  模式: {'重试' if args.retry_only else '主循环'}{'  dry-run' if args.dry_run else ''}{'  增量' if args.incremental else ''}                         ║
 ╚═══════════════════════════════════════════════════════╝
 """)
 
@@ -1205,6 +1333,7 @@ def main():
                     price_tolerance=args.price_tolerance,
                     dry_run=args.dry_run,
                     retry_path=retry_path,
+                    incremental=args.incremental,
                 )
             except KeyboardInterrupt:
                 _INTERRUPTED = True
