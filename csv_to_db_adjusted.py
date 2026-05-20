@@ -18,6 +18,7 @@ CSV → 前复权 → db_market 批量导入脚本
   python csv_to_db_adjusted.py --source baostock         # 从 baostock 下载前复权日线写库
   python csv_to_db_adjusted.py --source baostock --dry-run  # 只对比不写入
   python csv_to_db_adjusted.py --source baostock --codes 000001 000607  # 指定股票
+  python csv_to_db_adjusted.py --source baostock --start-index 300     # 从第301只开始（断点续传）
   python csv_to_db_adjusted.py --dry-run                 # 只看不动
 """
 
@@ -282,9 +283,24 @@ def get_baostock_codes() -> list:
     return []
 
 
+def _bs_relogin():
+    """重新登录 baostock（用于连接恢复）"""
+    import baostock as bs
+    try:
+        bs.logout()
+    except Exception:
+        pass
+    time.sleep(1)
+    rs = bs.login()
+    if rs.error_code != '0':
+        print(f"\n  ⚠️  baostock 重新登录失败: {rs.error_msg}")
+        return False
+    return True
+
+
 def download_baostock_klines(code: str, start_date: str, end_date: str,
-                             max_retries: int = 3) -> list:
-    """从 baostock 下载单只股票的前复权日线数据（带重试）"""
+                             max_retries: int = 5) -> list:
+    """从 baostock 下载单只股票的前复权日线数据（带重试 + 自动重连）"""
     import baostock as bs
 
     # 补全前缀
@@ -294,18 +310,30 @@ def download_baostock_klines(code: str, start_date: str, end_date: str,
         bs_code = f'sz.{code}'
 
     for attempt in range(max_retries):
-        rs = bs.query_history_k_data_plus(
-            bs_code,
-            "date,open,high,low,close,volume",
-            start_date=start_date,
-            end_date=end_date,
-            frequency="d",
-            adjustflag="2",  # 前复权
-        )
+        try:
+            rs = bs.query_history_k_data_plus(
+                bs_code,
+                "date,open,high,low,close,volume",
+                start_date=start_date,
+                end_date=end_date,
+                frequency="d",
+                adjustflag="2",  # 前复权
+            )
+        except Exception as e:
+            # 连接异常，重连
+            if attempt < max_retries - 1:
+                wait = 2 * (attempt + 1)
+                time.sleep(wait)
+                _bs_relogin()
+                continue
+            return []
 
         if rs.error_code != '0':
             if attempt < max_retries - 1:
-                time.sleep(1)
+                time.sleep(1.5 * (attempt + 1))
+                # 连续失败 2 次就重连
+                if attempt >= 1:
+                    _bs_relogin()
                 continue
             return []
 
@@ -332,17 +360,42 @@ def download_baostock_klines(code: str, start_date: str, end_date: str,
         if klines or attempt >= max_retries - 1:
             return klines
 
-        # 空结果但可能是限流，等一下重试
-        time.sleep(1.5)
+        # 空结果但可能是限流，指数退避
+        time.sleep(1.5 * (attempt + 1))
 
     return []
 
 
+def _bs_download_chunk(args):
+    """子进程: 独立登录 baostock，下载一批股票的前复权日线"""
+    import baostock as bs
+    chunk_codes, start_date, end_date, worker_id = args
+
+    rs = bs.login()
+    if rs.error_code != '0':
+        return chunk_codes, {}, chunk_codes  # 全部失败
+
+    results = {}
+    fails = []
+    for code in chunk_codes:
+        klines = download_baostock_klines(code, start_date, end_date)
+        if klines:
+            results[code] = klines
+        else:
+            fails.append(code)
+        time.sleep(0.15)  # 每个worker内部间隔
+
+    bs.logout()
+    return chunk_codes, results, fails
+
+
 def baostock_import(market: str, start_date: str, end_date: str,
-                    dry_run: bool = False, codes: list = None):
-    """从 baostock 下载前复权日线 → 对比/写入 db_market"""
+                    dry_run: bool = False, codes: list = None,
+                    start_index: int = 0, workers: int = 4):
+    """从 baostock 下载前复权日线 → 对比/写入 db_market（多进程）"""
     import baostock as bs
 
+    # 主进程登录一次，获取股票列表
     login_result = bs.login()
     if login_result.error_code != '0':
         print(f"  ❌ baostock 登录失败: {login_result.error_msg}")
@@ -362,6 +415,15 @@ def baostock_import(market: str, start_date: str, end_date: str,
             bs.logout()
             return
 
+    # 断点续传：跳过前面已处理的
+    if start_index > 0:
+        if start_index >= len(stock_list):
+            print(f"  ❌ start-index ({start_index}) >= 总数 ({len(stock_list)})，无数据可处理")
+            bs.logout()
+            return
+        print(f"  ⏩ 跳过前 {start_index} 只，从第 {start_index+1} 只开始")
+        stock_list = stock_list[start_index:]
+
     # 测试下载一只
     test_code = stock_list[0]
     test_klines = download_baostock_klines(test_code, start_date, end_date)
@@ -374,7 +436,42 @@ def baostock_import(market: str, start_date: str, end_date: str,
         bs.logout()
         return
 
-    # 初始化 DB
+    bs.logout()  # 主进程释放连接，子进程各自登录
+
+    # ── 多进程下载 ──
+    t0 = time.time()
+    total = len(stock_list)
+    workers = min(workers, total, 8)  # 最多8进程，避免baostock限流
+
+    print(f"\n  🚀 启动 {workers} 个进程并行下载 {total} 只股票...")
+
+    # 切分任务
+    chunk_size = (total + workers - 1) // workers
+    chunks = []
+    for w in range(workers):
+        start = w * chunk_size
+        end = min(start + chunk_size, total)
+        if start < end:
+            chunks.append((stock_list[start:end], start_date, end_date, w))
+
+    results_all = {}  # {code: klines}
+    fail_codes = []
+
+    with Pool(processes=workers) as pool:
+        for chunk_codes, chunk_results, chunk_fails in pool.imap_unordered(
+            _bs_download_chunk, chunks
+        ):
+            results_all.update(chunk_results)
+            fail_codes.extend(chunk_fails)
+            done = len(results_all) + len(fail_codes)
+            elapsed = time.time() - t0
+            print(f"\r  进度: {done}/{total}  ✅ {len(results_all)} ❌ {len(fail_codes)}  "
+                  f"耗时: {elapsed:.0f}s", end='', flush=True)
+
+    elapsed = time.time() - t0
+    print(f"\n  📥 下载完成: ✅ {len(results_all)} ❌ {len(fail_codes)}  耗时 {elapsed:.0f}s")
+
+    # ── 初始化 DB ──
     mgr = get_market_db_manager()
     writer = get_market_kline_writer()
     has_db = mgr.market_db_exists(market)
@@ -384,126 +481,64 @@ def baostock_import(market: str, start_date: str, end_date: str,
         else:
             mgr.ensure_market_db(market)
 
-    # 统计
-    success = 0
-    fail = 0
-    total_rows = 0
-    overlap_ok = 0
-    overlap_mismatch = 0
-    no_overlap = 0
-    max_diff_overall = 0
-    total_overlap_rows = 0
-    t0 = time.time()
-    total = len(stock_list)
+    # ── dry-run: 主进程逐一对比 ──
+    if dry_run:
+        overlap_ok = 0
+        overlap_mismatch = 0
+        no_overlap = 0
+        max_diff_overall = 0
+        total_overlap_rows = 0
 
-    for i, code in enumerate(stock_list):
-        try:
-            klines = download_baostock_klines(code, start_date, end_date)
-            if not klines:
-                fail += 1
-                continue
+        for idx, (code, klines) in enumerate(sorted(results_all.items())):
+            csv_start = klines[0]["time"]
+            csv_end = klines[-1]["time"]
+            close_range = f"{klines[0]['close']:.2f}~{klines[-1]['close']:.2f}"
 
-            if dry_run:
-                # 对比模式
-                csv_start = klines[0]["time"]
-                csv_end = klines[-1]["time"]
-                close_range = f"{klines[0]['close']:.2f}~{klines[-1]['close']:.2f}"
-
-                compare_info = ""
-                if has_db:
-                    try:
-                        db_data = query_db_klines(writer, market, code, '1D', csv_start, csv_end)
-                        if db_data:
-                            cmp = compare_overlap(klines, db_data, code)
-                            if cmp["overlap_rows"] > 0:
-                                total_overlap_rows += cmp["overlap_rows"]
-                                max_diff_overall = max(max_diff_overall, cmp["close_max_diff"])
-                                if cmp["close_max_diff"] < 0.02:
-                                    overlap_ok += 1
-                                    diff_tag = "✅"
-                                else:
-                                    overlap_mismatch += 1
-                                    diff_tag = "⚠️"
-                                compare_info = (
-                                    f"  重叠{cmp['overlap_rows']}行 "
-                                    f"close差: max={cmp['close_max_diff']:.4f} avg={cmp['close_avg_diff']:.4f} "
-                                    f"{diff_tag}"
-                                )
-                                if cmp["sample"]:
-                                    compare_info += "\n    差异TOP: "
-                                    for t, csv_c, db_c, d in cmp["sample"][:3]:
-                                        compare_info += f"{t.strftime('%m-%d')} csv={csv_c:.2f} db={db_c:.2f} Δ{d:.4f}  "
+            compare_info = ""
+            if has_db:
+                try:
+                    db_data = query_db_klines(writer, market, code, '1D', csv_start, csv_end)
+                    if db_data:
+                        cmp = compare_overlap(klines, db_data, code)
+                        if cmp["overlap_rows"] > 0:
+                            total_overlap_rows += cmp["overlap_rows"]
+                            max_diff_overall = max(max_diff_overall, cmp["close_max_diff"])
+                            if cmp["close_max_diff"] < 0.02:
+                                overlap_ok += 1
+                                diff_tag = "✅"
                             else:
-                                no_overlap += 1
-                                compare_info = "  DB有数据但无重叠时间点"
+                                overlap_mismatch += 1
+                                diff_tag = "⚠️"
+                            compare_info = (
+                                f"  重叠{cmp['overlap_rows']}行 "
+                                f"close差: max={cmp['close_max_diff']:.4f} avg={cmp['close_avg_diff']:.4f} "
+                                f"{diff_tag}"
+                            )
+                            if cmp["sample"]:
+                                compare_info += "\n    差异TOP: "
+                                for t, csv_c, db_c, d in cmp["sample"][:3]:
+                                    compare_info += f"{t.strftime('%m-%d')} csv={csv_c:.2f} db={db_c:.2f} Δ{d:.4f}  "
                         else:
                             no_overlap += 1
-                            compare_info = "  DB无此股票数据"
-                    except Exception as e:
-                        compare_info = f"  DB查询失败: {e}"
+                            compare_info = "  DB有数据但无重叠时间点"
+                    else:
+                        no_overlap += 1
+                        compare_info = "  DB无此股票数据"
+                except Exception as e:
+                    compare_info = f"  DB查询失败: {e}"
 
-                print(f"\n  [{i+1}/{total}] {code}.csv")
-                print(f"    {len(klines)} 行 | 已前复权 | close: {close_range}")
-                print(f"    日期: {klines[0]['time'].strftime('%Y-%m-%d')} ~ {klines[-1]['time'].strftime('%Y-%m-%d')}")
-                if compare_info:
-                    print(f"    {compare_info}")
-                success += 1
+            print(f"\n  [{idx+1}/{len(results_all)}] {code}.csv")
+            print(f"    {len(klines)} 行 | 已前复权 | close: {close_range}")
+            print(f"    日期: {klines[0]['time'].strftime('%Y-%m-%d')} ~ {klines[-1]['time'].strftime('%Y-%m-%d')}")
+            if compare_info:
+                print(f"    {compare_info}")
 
-            else:
-                # 正式写入模式
-                if not has_db:
-                    mgr.ensure_market_db(market)
-                    has_db = True
-
-                records = []
-                for bar in klines:
-                    dt = bar["time"]
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=_TZ_SH)
-                    dt = dt.replace(tzinfo=None)
-                    records.append({
-                        "symbol": code,
-                        "timeframe": "1D",
-                        "time": dt,
-                        "open": bar["open"],
-                        "high": bar["high"],
-                        "low": bar["low"],
-                        "close": bar["close"],
-                        "volume": bar.get("volume", 0),
-                    })
-
-                if records:
-                    result = writer.bulk_write(market, records, batch_size=5000)
-                    inserted = result.get("inserted", 0)
-                    total_rows += inserted
-                    success += 1
-                else:
-                    fail += 1
-
-        except Exception as e:
-            fail += 1
-            if fail <= 5:
-                print(f"  ❌ {code}: {e}")
-
-        # 请求间隔，避免 baostock 限流
-        time.sleep(0.25)
-
-        # 进度
-        if (i + 1) % 100 == 0 or (i + 1) == total:
-            elapsed = time.time() - t0
-            print(f"\r  进度: {i+1}/{total}  ✅ {success} ❌ {fail}  "
-                  f"行数: {total_rows:,}  耗时: {elapsed:.0f}s",
-                  end='', flush=True)
-
-    bs.logout()
-    elapsed = time.time() - t0
-
-    print(f"\n\n{'='*60}")
-    if dry_run:
+        print(f"\n\n{'='*60}")
         print(f"  📋 DRY RUN 汇总 (baostock 前复权日线)")
         print(f"{'='*60}")
         print(f"  总股票数:     {total}")
-        print(f"  成功下载:     {success}")
+        print(f"  成功下载:     {len(results_all)}")
+        print(f"  下载失败:     {len(fail_codes)}")
         if has_db:
             print(f"  ────────────────────────────────")
             print(f"  重叠段对比:")
@@ -512,11 +547,48 @@ def baostock_import(market: str, start_date: str, end_date: str,
             print(f"    无重叠/无数据:   {no_overlap} 只")
             print(f"    总重叠行数:     {total_overlap_rows:,}")
             print(f"    最大close差:    {max_diff_overall:.4f}")
-    else:
-        print(f"  ✅ 写入完成!")
-        print(f"  成功: {success}  失败: {fail}")
-        print(f"  总写入行数: {total_rows:,}")
-        print(f"  耗时: {elapsed:.1f}s ({elapsed/60:.1f}分钟)")
+        print(f"{'='*60}")
+        return
+
+    # ── 正式写入 ──
+    if not has_db:
+        mgr.ensure_market_db(market)
+
+    total_rows = 0
+    success = 0
+    fail = 0
+    for code, klines in results_all.items():
+        records = []
+        for bar in klines:
+            dt = bar["time"]
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_TZ_SH)
+            dt = dt.replace(tzinfo=None)
+            records.append({
+                "symbol": code,
+                "timeframe": "1D",
+                "time": dt,
+                "open": bar["open"],
+                "high": bar["high"],
+                "low": bar["low"],
+                "close": bar["close"],
+                "volume": bar.get("volume", 0),
+            })
+        if records:
+            result = writer.bulk_write(market, records, batch_size=5000)
+            total_rows += result.get("inserted", 0)
+            success += 1
+        else:
+            fail += 1
+
+    fail += len(fail_codes)
+    elapsed = time.time() - t0
+
+    print(f"\n\n{'='*60}")
+    print(f"  ✅ 写入完成!")
+    print(f"  成功: {success}  失败: {fail}")
+    print(f"  总写入行数: {total_rows:,}")
+    print(f"  耗时: {elapsed:.1f}s ({elapsed/60:.1f}分钟)")
     print(f"{'='*60}")
 
 
@@ -771,6 +843,8 @@ def main():
         help='并行进程数 (默认 4)')
     ap.add_argument('--dry-run', action='store_true',
         help='只检查不写入')
+    ap.add_argument('--start-index', type=int, default=0,
+        help='从第几只股票开始（用于断点续传，默认 0）')
     ap.add_argument('--db-url', type=str, default=None,
         help='数据库连接 URL (默认从 DATABASE_URL 环境变量读取)')
 
@@ -801,7 +875,8 @@ def main():
 
     if args.source == 'baostock':
         baostock_import(args.market, args.start_date, args.end_date,
-                        args.dry_run, args.codes)
+                        args.dry_run, args.codes, args.start_index,
+                        args.workers)
     else:
         if args.type == 'all':
             periods = ['1D', '1m', '5m', '15m', '30m', '60m']

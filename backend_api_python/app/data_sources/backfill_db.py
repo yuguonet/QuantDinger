@@ -131,7 +131,7 @@ def _ensure_cn_last_update_table(pool_name: str = "CNStock"):
 
 
 def _get_last_update(source_name: str, tf: str, pool_name: str = "CNStock") -> dict | None:
-    """查询 cn_last_update 最新记录（按 source_name + tf 匹配最新一条）。"""
+    """查询 cn_last_update 最新记录（按 tf 匹配最新一条）。"""
     _ensure_cn_last_update_table(pool_name)
     try:
         mgr = get_market_db_manager()
@@ -141,9 +141,9 @@ def _get_last_update(source_name: str, tf: str, pool_name: str = "CNStock") -> d
                 cur.execute(
                     "SELECT last_updated, last_bar_time, status, report, failed_count, synced_count, written_count "
                     "FROM cn_last_update "
-                    "WHERE id LIKE %s "
+                    "WHERE tf = %s "
                     "ORDER BY last_updated DESC LIMIT 1",
-                    (f"{source_name}_{tf}%",),
+                    (tf,),
                 )
                 row = cur.fetchone()
                 if not row:
@@ -362,20 +362,22 @@ class BackfillDB:
         try:
             if tf == "15m":
                 # 判断是否当天首次运行（用于决定是否清除当日旧 bar）
+                # 用 last_bar_time 判断数据所属交易日，避免跨夜运行导致误判
                 doc = _get_last_update(self.source.name, "15m", pool_name=pool)
                 is_first_run = True
                 if doc:
-                    lu = _parse_db_timestamp(doc.get("last_updated"))
-                    if lu and _same_trading_day(lu, datetime.now(TZ_CN)):
+                    lbt = _parse_db_timestamp(doc.get("last_bar_time"))
+                    if lbt and _same_trading_day(lbt, datetime.now(TZ_CN)):
                         is_first_run = False
                 written, failed = self._sync_15m(symbols, is_first_run=is_first_run)
             elif tf == "1D":
                 # 判断是否当天首次运行（用于决定是否清除当日旧 bar）
+                # 用 last_bar_time 判断数据所属交易日，避免跨夜运行导致误判
                 doc = _get_last_update(self.source.name, "1D", pool_name=pool)
                 is_first_run = True
                 if doc:
-                    lu = _parse_db_timestamp(doc.get("last_updated"))
-                    if lu and _same_trading_day(lu, datetime.now(TZ_CN)):
+                    lbt = _parse_db_timestamp(doc.get("last_bar_time"))
+                    if lbt and _same_trading_day(lbt, datetime.now(TZ_CN)):
                         is_first_run = False
                 written, failed = self._sync_1d(symbols, is_first_run=is_first_run)
             else:
@@ -1155,10 +1157,13 @@ def _run_task(task: str):
         doc = _get_last_update("stock_daily_k", task, pool_name="CNStock")
         last_status = doc.get("status", "") if doc else ""
         last_updated = _parse_db_timestamp(doc.get("last_updated")) if doc else None
+        last_bar_time = _parse_db_timestamp(doc.get("last_bar_time")) if doc else None
 
-        # 今天已完成 (status=ok + 同一交易日) → 正常退出
-        if last_status == "ok" and last_updated and _same_trading_day(last_updated, now):
-            logger.info(f"[调度] {task} 今天已完成 (status=ok, {last_updated:%m-%d %H:%M})")
+        # 今天已完成 (status=ok + 数据交易日=今天) → 正常退出
+        # 用 last_bar_time（数据所属交易日）判断，不用 last_updated（同步执行时间）
+        # 否则跨夜运行的同步（如昨日1D修复到今日凌晨完成）会导致今日1D被跳过
+        if last_status == "ok" and last_bar_time and _same_trading_day(last_bar_time, now):
+            logger.info(f"[调度] {task} 今天已完成 (status=ok, bar_time={last_bar_time:%m-%d %H:%M})")
             _schedule_next(task, _next_trigger_time(task))
             return
 
@@ -1335,6 +1340,7 @@ def start_scheduler():
     for task in ("15m", "1D"):
         doc = _get_last_update("stock_daily_k", task, pool_name="CNStock")
         last_updated = _parse_db_timestamp(doc.get("last_updated")) if doc else None
+        last_bar_time = _parse_db_timestamp(doc.get("last_bar_time")) if doc else None
 
         # 前一交易日 15:00 的北京时间
         prev_td = prev_trading_day(today_str)
@@ -1342,13 +1348,14 @@ def start_scheduler():
             hour=15, minute=0, second=0, tzinfo=TZ_CN
         )
 
-        if last_updated and last_updated > cutoff_startup:
-            # 上次更新 > 前一交易日 15:00 → 正常退出（不调度，等下一个交易日触发时间）
-            logger.info(f"[调度] {task} 启动检查: 上次更新 {last_updated:%m-%d %H:%M} > 前一交易日 15:00, 正常退出")
+        # 用 last_bar_time（数据所属交易日）判断，避免跨夜同步导致今日任务被跳过
+        if last_bar_time and last_bar_time > cutoff_startup:
+            # 数据交易日 > 前一交易日 15:00 → 正常退出（不调度，等下一个交易日触发时间）
+            logger.info(f"[调度] {task} 启动检查: 数据交易日 {last_bar_time:%m-%d %H:%M} > 前一交易日 15:00, 正常退出")
             _schedule_next(task, _next_trigger_time(task))
         else:
             # 否则 → 加 120s 后任务调度
-            logger.info(f"[调度] {task} 启动检查: 上次更新 {'无记录' if not last_updated else f'{last_updated:%m-%d %H:%M}'} <= 前一交易日 15:00, {_INITIAL_DELAY}s 后执行")
+            logger.info(f"[调度] {task} 启动检查: 数据交易日 {'无记录' if not last_bar_time else f'{last_bar_time:%m-%d %H:%M}'} <= 前一交易日 15:00, {_INITIAL_DELAY}s 后执行")
             _schedule_next(task, delay_seconds=_INITIAL_DELAY)
 
 
