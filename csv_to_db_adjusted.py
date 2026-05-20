@@ -50,69 +50,12 @@ try:
 except ImportError:
     pass
 
-# ── 绕过 app/__init__.py 的 Flask 导入 ──
-# adjustment.py 和 db_market.py 不直接依赖 Flask，
-# 但 import app 会触发 __init__.py。用 importlib 直接加载子模块。
-import types
-import importlib
-import importlib.util
-
-def _import_module_from_file(module_name, file_path):
-    """直接从文件加载模块，跳过包的 __init__.py"""
-    spec = importlib.util.spec_from_file_location(module_name, file_path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-# 预注册 app 包（空模块，避免触发 __init__.py）
-if 'app' not in sys.modules:
-    app_pkg = types.ModuleType('app')
-    app_pkg.__path__ = [os.path.join(_BACKEND_ROOT, 'app')]
-    sys.modules['app'] = app_pkg
-
-for sub in ('app.utils', 'app.data_sources', 'app.data_sources.provider'):
-    if sub not in sys.modules:
-        m = types.ModuleType(sub)
-        parts = sub.split('.')
-        m.__path__ = [os.path.join(_BACKEND_ROOT, *parts)]
-        parent = '.'.join(parts[:-1])
-        setattr(sys.modules[parent], parts[-1], m)
-        sys.modules[sub] = m
-
-# 加载 logger（被多个模块依赖）
-_import_module_from_file(
-    'app.utils.logger',
-    os.path.join(_BACKEND_ROOT, 'app', 'utils', 'logger.py')
-)
-
-# 加载 normalizer（adjustment.py 依赖）
-_import_module_from_file(
-    'app.data_sources.normalizer',
-    os.path.join(_BACKEND_ROOT, 'app', 'data_sources', 'normalizer.py')
-)
-
-# 加载 db_multi（db_market.py 依赖）
-_import_module_from_file(
-    'app.utils.db_multi',
-    os.path.join(_BACKEND_ROOT, 'app', 'utils', 'db_multi.py')
-)
-
-# 加载核心模块
-adjustment_mod = _import_module_from_file(
-    'app.data_sources.provider.adjustment',
-    os.path.join(_BACKEND_ROOT, 'app', 'data_sources', 'provider', 'adjustment.py')
-)
-db_market_mod = _import_module_from_file(
-    'app.utils.db_market',
-    os.path.join(_BACKEND_ROOT, 'app', 'utils', 'db_market.py')
-)
-
-apply_fwd_adjust = adjustment_mod.apply_fwd_adjust
-build_fwd_factor = adjustment_mod.build_fwd_factor
-get_market_kline_writer = db_market_mod.get_market_kline_writer
-get_market_db_manager = db_market_mod.get_market_db_manager
-
+# ── 模块级初始化（仅主进程执行，子进程通过 _init_backend() 懒加载）──
+_backend_initialized = False
+apply_fwd_adjust = None
+build_fwd_factor = None
+get_market_kline_writer = None
+get_market_db_manager = None
 _TZ_SH = timezone(timedelta(hours=8))
 
 # 周期目录映射
@@ -124,6 +67,68 @@ PERIOD_DIR = {
 # CSV 列名映射
 CSV_DT_COL = {'daily': 'date', '1m': 'datetime', '5m': 'datetime',
               '15m': 'datetime', '30m': 'datetime', '1h': 'datetime'}
+
+
+def _init_backend():
+    """懒加载后端模块（仅在需要时初始化，子进程不会触发）"""
+    global _backend_initialized, apply_fwd_adjust, build_fwd_factor
+    global get_market_kline_writer, get_market_db_manager
+    if _backend_initialized:
+        return
+
+    # ── 绕过 app/__init__.py 的 Flask 导入 ──
+    import types
+    import importlib
+    import importlib.util
+
+    def _import_module_from_file(module_name, file_path):
+        spec = importlib.util.spec_from_file_location(module_name, file_path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    if 'app' not in sys.modules:
+        app_pkg = types.ModuleType('app')
+        app_pkg.__path__ = [os.path.join(_BACKEND_ROOT, 'app')]
+        sys.modules['app'] = app_pkg
+
+    for sub in ('app.utils', 'app.data_sources', 'app.data_sources.provider'):
+        if sub not in sys.modules:
+            m = types.ModuleType(sub)
+            parts = sub.split('.')
+            m.__path__ = [os.path.join(_BACKEND_ROOT, *parts)]
+            parent = '.'.join(parts[:-1])
+            setattr(sys.modules[parent], parts[-1], m)
+            sys.modules[sub] = m
+
+    _import_module_from_file(
+        'app.utils.logger',
+        os.path.join(_BACKEND_ROOT, 'app', 'utils', 'logger.py')
+    )
+    _import_module_from_file(
+        'app.data_sources.normalizer',
+        os.path.join(_BACKEND_ROOT, 'app', 'data_sources', 'normalizer.py')
+    )
+    _import_module_from_file(
+        'app.utils.db_multi',
+        os.path.join(_BACKEND_ROOT, 'app', 'utils', 'db_multi.py')
+    )
+
+    adjustment_mod = _import_module_from_file(
+        'app.data_sources.provider.adjustment',
+        os.path.join(_BACKEND_ROOT, 'app', 'data_sources', 'provider', 'adjustment.py')
+    )
+    db_market_mod = _import_module_from_file(
+        'app.utils.db_market',
+        os.path.join(_BACKEND_ROOT, 'app', 'utils', 'db_market.py')
+    )
+
+    apply_fwd_adjust = adjustment_mod.apply_fwd_adjust
+    build_fwd_factor = adjustment_mod.build_fwd_factor
+    get_market_kline_writer = db_market_mod.get_market_kline_writer
+    get_market_db_manager = db_market_mod.get_market_db_manager
+    _backend_initialized = True
 
 
 def read_csv_klines(csv_path: str, timeframe: str) -> list:
@@ -283,25 +288,18 @@ def get_baostock_codes() -> list:
     return []
 
 
-def _bs_relogin():
-    """重新登录 baostock（用于连接恢复）"""
+def _worker_init():
+    """每个子进程启动时登录 baostock（只执行一次）"""
     import baostock as bs
-    try:
-        bs.logout()
-    except Exception:
-        pass
-    time.sleep(1)
     rs = bs.login()
     if rs.error_code != '0':
-        print(f"\n  ⚠️  baostock 重新登录失败: {rs.error_msg}")
-        return False
-    return True
+        print(f"  ⚠️  子进程 baostock 登录失败: {rs.error_msg}")
 
 
-def download_baostock_klines(code: str, start_date: str, end_date: str,
-                             max_retries: int = 5) -> list:
-    """从 baostock 下载单只股票的前复权日线数据（带重试 + 自动重连）"""
+def _worker_download(code_and_dates):
+    """子进程: 下载单只股票（进程级已登录，无需再 login）"""
     import baostock as bs
+    code, start_date, end_date = code_and_dates
 
     # 补全前缀
     if code.startswith('6'):
@@ -309,6 +307,7 @@ def download_baostock_klines(code: str, start_date: str, end_date: str,
     else:
         bs_code = f'sz.{code}'
 
+    max_retries = 3
     for attempt in range(max_retries):
         try:
             rs = bs.query_history_k_data_plus(
@@ -319,23 +318,28 @@ def download_baostock_klines(code: str, start_date: str, end_date: str,
                 frequency="d",
                 adjustflag="2",  # 前复权
             )
-        except Exception as e:
-            # 连接异常，重连
+        except Exception:
             if attempt < max_retries - 1:
-                wait = 2 * (attempt + 1)
-                time.sleep(wait)
-                _bs_relogin()
+                time.sleep(1 * (attempt + 1))
+                try:
+                    bs.logout()
+                    bs.login()
+                except Exception:
+                    pass
                 continue
-            return []
+            return {"code": code, "klines": [], "error": "连接异常"}
 
         if rs.error_code != '0':
             if attempt < max_retries - 1:
-                time.sleep(1.5 * (attempt + 1))
-                # 连续失败 2 次就重连
+                time.sleep(1 * (attempt + 1))
                 if attempt >= 1:
-                    _bs_relogin()
+                    try:
+                        bs.logout()
+                        bs.login()
+                    except Exception:
+                        pass
                 continue
-            return []
+            return {"code": code, "klines": [], "error": rs.error_msg}
 
         klines = []
         while rs.next():
@@ -356,43 +360,17 @@ def download_baostock_klines(code: str, start_date: str, end_date: str,
                 "close": c, "volume": v,
             })
 
-        # 正常返回数据，或者确实是空股票（退市等）
-        if klines or attempt >= max_retries - 1:
-            return klines
+        return {"code": code, "klines": klines, "error": None}
 
-        # 空结果但可能是限流，指数退避
-        time.sleep(1.5 * (attempt + 1))
-
-    return []
-
-
-def _bs_download_chunk(args):
-    """子进程: 独立登录 baostock，下载一批股票的前复权日线"""
-    import baostock as bs
-    chunk_codes, start_date, end_date, worker_id = args
-
-    rs = bs.login()
-    if rs.error_code != '0':
-        return chunk_codes, {}, chunk_codes  # 全部失败
-
-    results = {}
-    fails = []
-    for code in chunk_codes:
-        klines = download_baostock_klines(code, start_date, end_date)
-        if klines:
-            results[code] = klines
-        else:
-            fails.append(code)
-        time.sleep(0.15)  # 每个worker内部间隔
-
-    bs.logout()
-    return chunk_codes, results, fails
+    return {"code": code, "klines": [], "error": "重试耗尽"}
 
 
 def baostock_import(market: str, start_date: str, end_date: str,
                     dry_run: bool = False, codes: list = None,
-                    start_index: int = 0, workers: int = 4):
+                    start_index: int = 0, workers: int = 4,
+                    force: bool = False):
     """从 baostock 下载前复权日线 → 对比/写入 db_market（多进程）"""
+    _init_backend()
     import baostock as bs
 
     # 主进程登录一次，获取股票列表
@@ -424,52 +402,78 @@ def baostock_import(market: str, start_date: str, end_date: str,
         print(f"  ⏩ 跳过前 {start_index} 只，从第 {start_index+1} 只开始")
         stock_list = stock_list[start_index:]
 
-    # 测试下载一只
+    # 测试下载一只（在 logout 之前，用主进程连接验证）
     test_code = stock_list[0]
-    test_klines = download_baostock_klines(test_code, start_date, end_date)
-    print(f"  🔍 测试 {test_code}: 下载 {len(test_klines)} 行")
-    if test_klines:
-        print(f"     首行: {test_klines[0]['time']} close={test_klines[0]['close']}")
-        print(f"     末行: {test_klines[-1]['time']} close={test_klines[-1]['close']}")
+    print(f"  🔍 测试下载 {test_code}...")
+    if test_code.startswith('6'):
+        bs_test_code = f'sh.{test_code}'
     else:
+        bs_test_code = f'sz.{test_code}'
+    test_rs = bs.query_history_k_data_plus(
+        bs_test_code, "date,open,high,low,close,volume",
+        start_date=start_date, end_date=end_date,
+        frequency="d", adjustflag="2",
+    )
+    test_klines = []
+    if test_rs.error_code == '0':
+        while test_rs.next():
+            row = test_rs.get_row_data()
+            try:
+                dt = datetime.strptime(row[0], '%Y-%m-%d')
+                o, h, l, c = float(row[1]), float(row[2]), float(row[3]), float(row[4])
+                v = float(row[5]) if row[5] else 0
+            except (ValueError, TypeError, IndexError):
+                continue
+            if o == 0 and c == 0:
+                continue
+            test_klines.append({"time": dt, "open": o, "high": h, "low": l, "close": c, "volume": v})
+    if not test_klines:
         print(f"  ❌ 测试下载为空，baostock 数据接口可能有问题")
         bs.logout()
         return
+    print(f"     ✅ {len(test_klines)} 行 | {test_klines[0]['time']} ~ {test_klines[-1]['time']}")
 
     bs.logout()  # 主进程释放连接，子进程各自登录
 
     # ── 多进程下载 ──
     t0 = time.time()
     total = len(stock_list)
-    workers = min(workers, total, 8)  # 最多8进程，避免baostock限流
+    workers = min(workers, total, 8)  # 最多8进程
 
     print(f"\n  🚀 启动 {workers} 个进程并行下载 {total} 只股票...")
 
-    # 切分任务
-    chunk_size = (total + workers - 1) // workers
-    chunks = []
-    for w in range(workers):
-        start = w * chunk_size
-        end = min(start + chunk_size, total)
-        if start < end:
-            chunks.append((stock_list[start:end], start_date, end_date, w))
+    # 构造任务: [(code, start_date, end_date), ...]
+    tasks = [(code, start_date, end_date) for code in stock_list]
 
     results_all = {}  # {code: klines}
     fail_codes = []
+    fail_reasons = {}  # {code: error_msg}
 
-    with Pool(processes=workers) as pool:
-        for chunk_codes, chunk_results, chunk_fails in pool.imap_unordered(
-            _bs_download_chunk, chunks
-        ):
-            results_all.update(chunk_results)
-            fail_codes.extend(chunk_fails)
+    with Pool(processes=workers, initializer=_worker_init) as pool:
+        for result in pool.imap_unordered(_worker_download, tasks, chunksize=1):
+            code = result["code"]
+            if result["klines"]:
+                results_all[code] = result["klines"]
+            else:
+                fail_codes.append(code)
+                if result.get("error"):
+                    fail_reasons[code] = result["error"]
+
             done = len(results_all) + len(fail_codes)
             elapsed = time.time() - t0
-            print(f"\r  进度: {done}/{total}  ✅ {len(results_all)} ❌ {len(fail_codes)}  "
-                  f"耗时: {elapsed:.0f}s", end='', flush=True)
+            # 每 10 只或最后一只打印进度
+            if done % 10 == 0 or done == total:
+                print(f"\r  进度: {done}/{total}  ✅ {len(results_all)} ❌ {len(fail_codes)}  "
+                      f"耗时: {elapsed:.0f}s", end='', flush=True)
 
     elapsed = time.time() - t0
     print(f"\n  📥 下载完成: ✅ {len(results_all)} ❌ {len(fail_codes)}  耗时 {elapsed:.0f}s")
+
+    # 打印失败原因汇总（限前20条）
+    if fail_reasons:
+        print(f"\n  ❌ 失败明细 (前{min(20, len(fail_reasons))}条):")
+        for i, (c, err) in enumerate(list(fail_reasons.items())[:20]):
+            print(f"    {c}: {err}")
 
     # ── 初始化 DB ──
     mgr = get_market_db_manager()
@@ -554,7 +558,17 @@ def baostock_import(market: str, start_date: str, end_date: str,
     if not has_db:
         mgr.ensure_market_db(market)
 
+    # --force: 先删除库里同股票旧数据
+    if force and results_all:
+        print(f"\n  🗑️  --force 模式: 删除 {len(results_all)} 只股票的旧数据...")
+        for code in results_all:
+            try:
+                writer.delete(market, code, "1D")
+            except Exception:
+                pass  # 不存在也不报错
+
     total_rows = 0
+    total_records = 0
     success = 0
     fail = 0
     for code, klines in results_all.items():
@@ -575,9 +589,24 @@ def baostock_import(market: str, start_date: str, end_date: str,
                 "volume": bar.get("volume", 0),
             })
         if records:
-            result = writer.bulk_write(market, records, batch_size=5000)
-            total_rows += result.get("inserted", 0)
-            success += 1
+            try:
+                result = writer.bulk_write(market, records, batch_size=5000)
+                inserted = result.get("inserted", 0)
+                skipped = result.get("skipped", result.get("duplicates", len(records) - inserted))
+                total_rows += inserted
+                total_records += len(records)
+                success += 1
+                # 诊断日志：每只都打印
+                if inserted == 0:
+                    print(f"\n    {code}: ⚠️  传入{len(records)}条 写入0条 全部被跳过 | result={result}")
+                elif success <= 5 or inserted == 0:
+                    print(f"\n    {code}: 传入{len(records)}条 写入{inserted}条 跳过{skipped}条  "
+                          f"时间范围{klines[0]['time'].strftime('%Y-%m-%d')}~{klines[-1]['time'].strftime('%Y-%m-%d')}")
+            except Exception as e:
+                import traceback
+                print(f"\n    {code}: ❌ 写入失败: {e}")
+                traceback.print_exc()
+                fail += 1
         else:
             fail += 1
 
@@ -585,15 +614,19 @@ def baostock_import(market: str, start_date: str, end_date: str,
     elapsed = time.time() - t0
 
     print(f"\n\n{'='*60}")
-    print(f"  ✅ 写入完成!")
+    print(f"  ✅ 处理完成!")
     print(f"  成功: {success}  失败: {fail}")
-    print(f"  总写入行数: {total_rows:,}")
+    print(f"  总记录数: {total_records:,}  新写入: {total_rows:,}  去重跳过: {total_records - total_rows:,}")
     print(f"  耗时: {elapsed:.1f}s ({elapsed/60:.1f}分钟)")
+    if total_rows == 0 and total_records > 0:
+        print(f"\n  ⚠️  所有数据都已存在库里，没有新增。")
+        print(f"     如果需要强制覆盖，检查 bulk_write 的去重逻辑。")
     print(f"{'='*60}")
 
 
 def adjust_and_write(csv_dir: str, timeframe: str, market: str, dry_run: bool = False, workers: int = 4):
     """读取 CSV → 前复权 → 写入数据库"""
+    _init_backend()
     dir_name = PERIOD_DIR.get(timeframe, timeframe)
     full_dir = os.path.join(csv_dir, dir_name)
 
@@ -785,10 +818,16 @@ def adjust_and_write(csv_dir: str, timeframe: str, market: str, dry_run: bool = 
                 })
 
             if records:
-                result = writer.bulk_write(market, records, batch_size=5000)
-                inserted = result.get("inserted", 0)
-                total_rows += inserted
-                success += 1
+                try:
+                    result = writer.bulk_write(market, records, batch_size=5000)
+                    inserted = result.get("inserted", 0)
+                    total_rows += inserted
+                    success += 1
+                except Exception as e:
+                    import traceback
+                    print(f"\n  ❌ {fname}: 写入失败: {e}")
+                    traceback.print_exc()
+                    fail += 1
             else:
                 fail += 1
 
@@ -845,6 +884,8 @@ def main():
         help='只检查不写入')
     ap.add_argument('--start-index', type=int, default=0,
         help='从第几只股票开始（用于断点续传，默认 0）')
+    ap.add_argument('--force', action='store_true',
+        help='写入前先删除库中同股票旧数据（避免去重跳过）')
     ap.add_argument('--db-url', type=str, default=None,
         help='数据库连接 URL (默认从 DATABASE_URL 环境变量读取)')
 
@@ -876,7 +917,7 @@ def main():
     if args.source == 'baostock':
         baostock_import(args.market, args.start_date, args.end_date,
                         args.dry_run, args.codes, args.start_index,
-                        args.workers)
+                        args.workers, args.force)
     else:
         if args.type == 'all':
             periods = ['1D', '1m', '5m', '15m', '30m', '60m']

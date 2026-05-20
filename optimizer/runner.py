@@ -595,33 +595,34 @@ class BacktestObjective:
         win_rate = float(result.get("winRate", 0)) / 100.0
 
         if total_trades > 0 and self.initial_capital > 0:
-            # 平均每笔交易的收益（占初始资金百分比）
-            avg_profit_pct = (total_profit / total_trades) / self.initial_capital * 100
-            # 用胜率和总收益推算 avgProfit / avgLoss
             n_win = round(total_trades * win_rate)
             n_loss = total_trades - n_win
             if n_win > 0 and n_loss > 0:
-                # 总盈利 = avgProfit_abs * n_win, 总亏损 = avgLoss_abs * n_loss
-                # total_profit = 总盈利 - 总亏损（近似）
-                # 用 profitFactor 辅助: pf = 总盈利 / 总亏损
+                # 有赢有亏: 用 profitFactor 推算平均盈亏
+                # pf = 总盈利 / 总亏损, total_profit = 总盈利 - 总亏损
+                # → 总盈利 = total_profit * pf / (pf - 1)  (仅 pf > 1 且 total_profit > 0 时成立)
                 pf = float(result.get("profitFactor", 1))
-                if pf > 0 and pf < 100:
-                    # total_profit ≈ 总盈利 - 总盈利/pf = 总盈利 * (1 - 1/pf)
-                    # → 总盈利 ≈ total_profit / (1 - 1/pf)  当 pf > 1
-                    if pf > 1.01:
-                        total_wins_est = total_profit * pf / (pf - 1)
-                        avg_profit_abs = total_wins_est / n_win
-                        avg_loss_abs = (total_wins_est / pf) / n_loss
-                    else:
-                        avg_profit_abs = abs(total_profit) / total_trades
-                        avg_loss_abs = abs(total_profit) / total_trades
+                if pf > 1.01 and total_profit > 0:
+                    total_wins_est = total_profit * pf / (pf - 1)
+                    total_losses_est = total_wins_est / pf
+                    avg_profit_abs = total_wins_est / n_win
+                    avg_loss_abs = total_losses_est / n_loss
                 else:
+                    # 亏损策略或 pf 接近 1: 按笔均分绝对利润
                     avg_profit_abs = abs(total_profit) / total_trades
                     avg_loss_abs = abs(total_profit) / total_trades
                 avgProfit = avg_profit_abs / self.initial_capital * 100
                 avgLoss = avg_loss_abs / self.initial_capital * 100
+            elif n_win > 0:
+                # 全赢
+                avgProfit = abs(total_profit) / n_win / self.initial_capital * 100
+                avgLoss = 0.0
+            elif n_loss > 0:
+                # 全亏
+                avgProfit = 0.0
+                avgLoss = abs(total_profit) / n_loss / self.initial_capital * 100
             else:
-                avgProfit = abs(avg_profit_pct)
+                avgProfit = 0.0
                 avgLoss = 0.0
         else:
             avgProfit = 0.0
