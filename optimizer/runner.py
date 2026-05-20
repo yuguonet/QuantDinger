@@ -551,15 +551,22 @@ class BacktestObjective:
 
         # 3. 回测
         try:
-            # A 股模式: 通过 strategy_config 传递 T+1 和涨跌停规则
-            _strategy_config = None
+            # 构建 strategy_config
+            _strategy_config = {}
+
+            # A 股规则
             if self.is_ashare:
-                _strategy_config = {
-                    'ashare_rules': {
-                        't_plus_1': True,
-                        'limit_pct': 0.20 if self.symbol[:3] in ('300', '301', '688') else 0.10,
-                    }
+                _strategy_config['ashare_rules'] = {
+                    't_plus_1': True,
+                    'limit_pct': 0.20 if self.symbol[:3] in ('300', '301', '688') else 0.10,
                 }
+
+            # 仓位配置：从优化参数 position_pct 注入
+            position_pct = params.get('position_pct')
+            if position_pct is not None:
+                # position_pct 是百分比（如 50），转为小数（0.5）
+                _strategy_config['position'] = {'entryPct': position_pct / 100.0}
+
             result = self._backtest.run(
                 indicator_code=code,
                 market=self.market,
@@ -569,7 +576,7 @@ class BacktestObjective:
                 end_date=ed,
                 initial_capital=self.initial_capital,
                 commission=self.commission,
-                strategy_config=_strategy_config,
+                strategy_config=_strategy_config if _strategy_config else None,
             )
         except Exception as e:
             # 数据相关错误，标记后续试验全部跳过
@@ -580,15 +587,55 @@ class BacktestObjective:
         if self.is_ashare:
             result = self._apply_ashare_constraints(result)
 
+        # 推导 avgProfit/avgLoss（百分比），避免修改 backtest.py
+        # totalProfit 是绝对金额，转为占初始资金的百分比
+        total_trades = int(result.get("totalTrades", 0))
+        total_profit = float(result.get("totalProfit", 0))
+        total_return_pct = float(result.get("totalReturn", 0))
+        win_rate = float(result.get("winRate", 0)) / 100.0
+
+        if total_trades > 0 and self.initial_capital > 0:
+            # 平均每笔交易的收益（占初始资金百分比）
+            avg_profit_pct = (total_profit / total_trades) / self.initial_capital * 100
+            # 用胜率和总收益推算 avgProfit / avgLoss
+            n_win = round(total_trades * win_rate)
+            n_loss = total_trades - n_win
+            if n_win > 0 and n_loss > 0:
+                # 总盈利 = avgProfit_abs * n_win, 总亏损 = avgLoss_abs * n_loss
+                # total_profit = 总盈利 - 总亏损（近似）
+                # 用 profitFactor 辅助: pf = 总盈利 / 总亏损
+                pf = float(result.get("profitFactor", 1))
+                if pf > 0 and pf < 100:
+                    # total_profit ≈ 总盈利 - 总盈利/pf = 总盈利 * (1 - 1/pf)
+                    # → 总盈利 ≈ total_profit / (1 - 1/pf)  当 pf > 1
+                    if pf > 1.01:
+                        total_wins_est = total_profit * pf / (pf - 1)
+                        avg_profit_abs = total_wins_est / n_win
+                        avg_loss_abs = (total_wins_est / pf) / n_loss
+                    else:
+                        avg_profit_abs = abs(total_profit) / total_trades
+                        avg_loss_abs = abs(total_profit) / total_trades
+                else:
+                    avg_profit_abs = abs(total_profit) / total_trades
+                    avg_loss_abs = abs(total_profit) / total_trades
+                avgProfit = avg_profit_abs / self.initial_capital * 100
+                avgLoss = avg_loss_abs / self.initial_capital * 100
+            else:
+                avgProfit = abs(avg_profit_pct)
+                avgLoss = 0.0
+        else:
+            avgProfit = 0.0
+            avgLoss = 0.0
+
         return {
             "sharpeRatio": result.get("sharpeRatio", 0),
-            "totalReturn": result.get("totalReturn", 0),
+            "totalReturn": total_return_pct,
             "winRate": result.get("winRate", 0),
             "maxDrawdown": result.get("maxDrawdown", 0),
             "profitFactor": result.get("profitFactor", 0),
-            "totalTrades": result.get("totalTrades", 0),
-            "avgProfit": result.get("avgProfit", 0),
-            "avgLoss": result.get("avgLoss", 0),
+            "totalTrades": total_trades,
+            "avgProfit": round(avgProfit, 4),
+            "avgLoss": round(avgLoss, 4),
         }
 
     def _inject_ashare_rules(self, config: dict) -> dict:
@@ -674,6 +721,9 @@ def run_single_template(
         n_trials=n_trials,
         score_fn=score_fn,
         mode="auto",
+        patience=25,          # 早停：连续 25 轮无提升
+        min_trials=20,        # 最少跑 20 轮
+        bad_threshold=-1.0,   # 前 20 轮最高分 < -1 则策略不可行
     )
 
     # 3. 运行优化
@@ -691,13 +741,18 @@ def run_single_template(
     validation_result = None
     if do_validate:
         print(f"\n{'='*60}")
-        print(f"  Walk-Forward 验证 (最优参数)")
+        print(f"  Walk-Forward 验证（真正滚动优化）")
         print(f"{'='*60}")
 
-        validator = WalkForwardValidator(n_splits=3, train_ratio=0.7)
+        validator = WalkForwardValidator(
+            n_splits=3,
+            train_ratio=0.7,
+            fold_trials=max(30, n_trials // 3),  # 每 fold 优化轮数（比全量少）
+            fold_patience=15,
+        )
         validation_result = validator.validate(
             objective_fn=objective,
-            best_params=best.params,
+            template_key=template_key,
             start_date=start_date,
             end_date=end_date,
             score_fn=score_fn,
@@ -707,6 +762,7 @@ def run_single_template(
         print(f"  测试集平均得分: {validation_result['avg_test_score']}")
         print(f"  过拟合比率:     {validation_result['overfitting_ratio']}")
         print(f"  一致性:         {validation_result['consistency']}")
+        print(f"  参数稳定性:     {validation_result['param_stability']}")
         print(f"\n  结论: {validation_result['verdict']}")
 
     # 5. 保存结果 — 目录结构与 data_warehouse 对齐: {market}/{tf_dir}/{symbol}_{template}.json
@@ -729,6 +785,9 @@ def run_single_template(
         "initial_capital": initial_capital,
         "commission": commission,
         "elapsed_seconds": round(elapsed, 1),
+        "early_stopped": optimizer._early_stopped,
+        "early_stop_reason": optimizer._early_stop_reason,
+        "actual_trials": len(optimizer.results),
         "best": best.to_dict(),
         "validation": validation_result,
         "top_10": [r.to_dict() for r in optimizer.get_top_n(10)],

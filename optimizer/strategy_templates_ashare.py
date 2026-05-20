@@ -30,6 +30,10 @@ def _p_choice(choices: list) -> dict:
     return {"type": "choice", "choices": choices}
 
 
+# 小资金仓位档位
+POSITION_PCT = _p_choice([25, 33, 50, 100])
+
+
 # ============================================================
 # 1. ATR 波动率突破
 # ============================================================
@@ -445,6 +449,7 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "vol_ma_period":     _p_int(10, 30, 1),
             "use_trend_filter":  _p_choice([True, False]),
             "trend_ma_period":   _p_int(20, 120, 10),
+            "position_pct": POSITION_PCT,
         },
         "constraints": [],
         "build_config": _build_atr_breakout_config,
@@ -462,6 +467,7 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "rsi_period":       _p_int(7, 21, 1),
             "rsi_oversold":     _p_int(20, 40, 1),
             "stop_loss_pct":    _p_float(3.0, 8.0, 0.5),
+            "position_pct": POSITION_PCT,
         },
         "constraints": [],
         "build_config": _build_volume_price_divergence_config,
@@ -480,6 +486,7 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "vol_ma_period":  _p_int(10, 30, 1),
             "vol_ratio":      _p_float(1.2, 3.0, 0.1),
             "stop_loss_pct":  _p_float(3.0, 8.0, 0.5),
+            "position_pct": POSITION_PCT,
         },
         "constraints": [
             ("fast_period", "<", "slow_period"),
@@ -502,6 +509,7 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "use_ma_filter":   _p_choice([True, False]),
             "ma_filter_period": _p_int(20, 120, 10),
             "stop_loss_pct":   _p_float(3.0, 8.0, 0.5),
+            "position_pct": POSITION_PCT,
         },
         "constraints": [
             ("macd_fast", "<", "macd_slow"),
@@ -518,6 +526,7 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "entry_period":      _p_int(10, 60, 5),
             "exit_period":       _p_int(5, 30, 5),
             "use_volume_filter": _p_choice([True, False]),
+            "position_pct": POSITION_PCT,
         },
         "constraints": [
             ("exit_period", "<", "entry_period"),
@@ -538,6 +547,7 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "max_adds":           _p_int(1, 6, 1),
             "add_atr_mult":       _p_float(0.3, 1.0, 0.1),
             "initial_position_pct": _p_int(10, 50, 5),
+            "position_pct": POSITION_PCT,
         },
         "constraints": [
             ("exit_breakout", "<", "entry_breakout"),
@@ -555,6 +565,7 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "rsi_period":     _p_int(7, 21, 1),
             "rsi_level":      _p_int(25, 45, 1),
             "stop_loss_pct":  _p_float(2.0, 5.0, 0.5),
+            "position_pct": POSITION_PCT,
         },
         "constraints": [],
         "build_config": _build_vwap_deviation_config,
@@ -573,6 +584,7 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "vol_ratio":      _p_float(1.2, 3.0, 0.1),
             "stop_loss_pct":  _p_float(3.0, 8.0, 0.5),
             "trailing_pct":   _p_float(2.0, 5.0, 0.5),
+            "position_pct": POSITION_PCT,
         },
         "constraints": [],
         "build_config": _build_ema_rsi_volume_config,
@@ -592,6 +604,7 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "ma_period":     _p_int(10, 60, 5),
             "ma_type":       _p_choice(["sma", "ema"]),
             "stop_loss_pct": _p_float(3.0, 8.0, 0.5),
+            "position_pct": POSITION_PCT,
         },
         "constraints": [
             ("macd_fast", "<", "macd_slow"),

@@ -36,6 +36,10 @@ def _p_choice(choices: list) -> dict:
     return {"type": "choice", "choices": choices}
 
 
+# 小资金仓位档位
+POSITION_PCT = _p_choice([25, 33, 50, 100])
+
+
 # ============================================================
 # 1. 量价共振突破（超短 1-3 天）
 # ============================================================
@@ -424,6 +428,7 @@ MY_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "stop_loss_pct":      _p_float(3.0, 7.0, 0.5),
             "take_profit_pct":    _p_float(8.0, 15.0, 1.0),
             "trailing_pct":       _p_float(3.0, 7.0, 0.5),
+            "position_pct": POSITION_PCT,
         },
         "constraints": [
             ("min_change_pct", "<", "max_change_pct"),
@@ -453,6 +458,7 @@ MY_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "vol_shrink_ratio":   _p_float(0.3, 0.8, 0.1),
             "stop_loss_pct":      _p_float(3.0, 6.0, 0.5),
             "trailing_pct":       _p_float(3.0, 6.0, 0.5),
+            "position_pct": POSITION_PCT,
         },
         "constraints": [
             ("rsi_low", "<", "rsi_high"),
@@ -478,7 +484,7 @@ MY_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "use_vol_confirm":    _p_choice([True, False]),
             "vol_ma_period":      _p_int(10, 30, 1),
             "vol_ratio":          _p_float(0.8, 2.0, 0.1),
-            "position_pct":       _p_int(30, 70, 10),
+            "position_pct":       POSITION_PCT,
             "stop_loss_pct":      _p_float(3.0, 6.0, 0.5),
             "take_profit_pct":    _p_float(4.0, 10.0, 1.0),
         },
@@ -507,7 +513,7 @@ MY_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "ma_period":          _p_int(5, 20, 1),
             "rsi_period":         _p_int(7, 21, 1),
             "rsi_exit_oversold":  _p_int(25, 45, 1),
-            "position_pct":       _p_int(40, 80, 10),
+            "position_pct":       POSITION_PCT,
             "stop_loss_pct":      _p_float(4.0, 8.0, 0.5),
             "take_profit_pct":    _p_float(10.0, 20.0, 1.0),
             "trailing_pct":       _p_float(4.0, 8.0, 0.5),
@@ -544,7 +550,7 @@ MY_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "rsi_mode":           _p_choice(["cross_up", "below"]),  # cross_up=严格, below=宽松
             "use_trend_filter":   _p_choice([True, False]),
             "trend_ema_period":   _p_int(20, 60, 5),
-            "position_pct":       _p_int(60, 80, 5),        # WF+ median=75
+            "position_pct":       POSITION_PCT,
             "stop_loss_pct":      _p_float(4.0, 8.0, 0.5),
             "take_profit_pct":    _p_float(10.0, 20.0, 1.0),
             "trailing_pct":       _p_float(3.0, 8.0, 0.5),

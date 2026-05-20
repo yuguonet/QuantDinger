@@ -22,6 +22,10 @@ def _p_choice(choices: list) -> dict:
     return {"type": "choice", "choices": choices}
 
 
+# 小资金仓位档位：1/4、1/3、1/2、全仓
+POSITION_PCT = _p_choice([25, 33, 50, 100])
+
+
 # ============================================================
 # IndicatorStrategy 代码生成（新标准）
 # ============================================================
@@ -398,6 +402,7 @@ STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "oversold":    _p_int(20, 35, 1),
             "overbought":  _p_int(65, 80, 1),
             "use_confirm": _p_choice([True, False]),
+            "position_pct": POSITION_PCT,
         },
         "constraints": [("oversold", "<", "overbought")],
         "build_config":   _build_rsi_oversold_config,
@@ -413,6 +418,7 @@ STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "bb_period":    _p_int(10, 40, 1),
             "bb_std":       _p_float(1.0, 3.0, 0.1),
             "confirm_bars": _p_int(1, 5, 1),
+            "position_pct": POSITION_PCT,
         },
         "constraints": [],
         "build_config":   _build_bollinger_breakout_config,
@@ -430,6 +436,7 @@ STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "signal_period": _p_int(5, 15, 1),
             "use_histogram": _p_choice([True, False]),
             "hist_threshold": _p_float(-0.5, 0.5, 0.01),
+            "position_pct": POSITION_PCT,
         },
         "constraints": [("fast_period", "<", "slow_period")],
         "build_config":   _build_macd_crossover_config,
@@ -446,6 +453,7 @@ STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "st_multiplier":   _p_float(1.5, 5.0, 0.1),
             "use_ema_filter":  _p_choice([True, False]),
             "ema_filter_period": _p_int(50, 200, 10),
+            "position_pct": POSITION_PCT,
         },
         "constraints": [],
         "build_config":   _build_supertrend_config,
@@ -463,6 +471,7 @@ STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "use_j_filter": _p_choice([True, False]),
             "j_upper":     _p_int(80, 100, 5),
             "j_lower":     _p_int(-10, 20, 5),
+            "position_pct": POSITION_PCT,
         },
         "constraints": [],
         "build_config":   _build_kdj_crossover_config,
@@ -480,6 +489,7 @@ STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "entry_level": _p_int(25, 45, 1),
             "exit_level":  _p_int(55, 80, 1),
             "trend_level": _p_int(45, 60, 1),
+            "position_pct": POSITION_PCT,
         },
         "constraints": [
             ("fast_rsi", "<", "slow_rsi"),

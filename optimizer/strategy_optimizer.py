@@ -3,6 +3,11 @@
 内置两种搜索策略：
   1. Random Search（无额外依赖）
   2. Bayesian Optimization（需要 optuna，可选）
+
+早停机制：
+  - patience: 连续 N 轮无提升则停止（默认 25）
+  - min_trials: 最少跑多少轮再判断早停（默认 20）
+  - bad_threshold: 前 K 轮最高分仍低于此值则提前终止（默认 -1.0）
 """
 import json
 import math
@@ -14,6 +19,7 @@ from typing import Dict, Any, List, Optional, Callable
 import numpy as np
 
 from optimizer.param_space import STRATEGY_TEMPLATES, get_template
+from optimizer.scoring import compute_score
 
 
 class TrialResult:
@@ -35,7 +41,7 @@ class TrialResult:
 
 class StrategyOptimizer:
     """
-    策略参数优化器
+    策略参数优化器（带早停）
 
     用法:
         optimizer = StrategyOptimizer(
@@ -52,8 +58,11 @@ class StrategyOptimizer:
         objective_fn: Callable[[dict], dict],
         n_trials: int = 100,
         mode: str = "auto",       # "random" | "optuna" | "auto"
-        score_fn: str = "sharpe",  # "sharpe" | "return_dd_ratio" | "custom"
+        score_fn: str = "sharpe",  # "sharpe" | "return_dd_ratio" | "composite"
         seed: int = 42,
+        patience: int = 25,        # 早停：连续 N 轮无提升
+        min_trials: int = 20,      # 早停：最少跑多少轮
+        bad_threshold: float = -1.0,  # 早停：前 min_trials 轮最高分低于此值则终止
     ):
         self.template = get_template(template_key)
         self.template_key = template_key
@@ -62,9 +71,14 @@ class StrategyOptimizer:
         self.mode = mode
         self.score_fn = score_fn
         self.seed = seed
+        self.patience = patience
+        self.min_trials = min_trials
+        self.bad_threshold = bad_threshold
 
         self.results: List[TrialResult] = []
         self.best_result: Optional[TrialResult] = None
+        self._early_stopped = False
+        self._early_stop_reason = ""
 
     # ============================================================
     # 主入口
@@ -86,6 +100,7 @@ class StrategyOptimizer:
         print(f"  模板: {self.template['name']}")
         print(f"  搜索方式: {self.mode}")
         print(f"  试验次数: {self.n_trials}")
+        print(f"  早停: patience={self.patience}, min_trials={self.min_trials}")
         print(f"{'='*60}\n")
 
         if self.mode == "optuna":
@@ -93,7 +108,41 @@ class StrategyOptimizer:
         return self._run_random()
 
     # ============================================================
-    # Random Search + 智能采样
+    # 早停检查
+    # ============================================================
+
+    def _check_early_stop(self, trial_idx: int) -> bool:
+        """检查是否应该早停"""
+        # 1. 最少试验次数
+        if trial_idx < self.min_trials:
+            return False
+
+        # 2. 前 min_trials 轮全低于阈值 → 策略本身不行
+        if len(self.results) >= self.min_trials and self.best_result is not None:
+            if self.best_result.score < self.bad_threshold:
+                self._early_stopped = True
+                self._early_stop_reason = (
+                    f"前 {self.min_trials} 轮最高分 {self.best_result.score:.4f} "
+                    f"< 阈值 {self.bad_threshold}，策略不可行"
+                )
+                return True
+
+        # 3. 连续 patience 轮无提升
+        if self.best_result is not None:
+            best_trial = self.best_result.trial_id
+            trials_since_best = trial_idx - best_trial
+            if trials_since_best >= self.patience:
+                self._early_stopped = True
+                self._early_stop_reason = (
+                    f"连续 {trials_since_best} 轮无提升 "
+                    f"(best={self.best_result.score:.4f} @ trial {best_trial})"
+                )
+                return True
+
+        return False
+
+    # ============================================================
+    # Random Search + 早停
     # ============================================================
 
     def _run_random(self) -> Optional[TrialResult]:
@@ -127,6 +176,11 @@ class StrategyOptimizer:
                 print(f"  · Trial {i+1}/{self.n_trials} | score={score:.4f} | "
                       f"best={self.best_result.score:.4f}")
 
+            # 早停检查
+            if self._check_early_stop(i + 1):
+                print(f"\n  ⏹ 早停 @ Trial {i+1}: {self._early_stop_reason}")
+                break
+
         self._print_summary()
         return self.best_result
 
@@ -138,14 +192,12 @@ class StrategyOptimizer:
                 if spec["type"] == "int":
                     params[name] = random.randint(spec["low"], spec["high"])
                 elif spec["type"] == "float":
-                    # 量化到 step
                     raw = random.uniform(spec["low"], spec["high"])
                     step = spec.get("step", 0.001)
                     params[name] = round(round(raw / step) * step, 6)
                 elif spec["type"] == "choice":
                     params[name] = random.choice(spec["choices"])
 
-            # 检查约束
             if self._check_constraints(params, constraints):
                 return params
 
@@ -167,7 +219,7 @@ class StrategyOptimizer:
         return True
 
     # ============================================================
-    # Optuna（可选）
+    # Optuna + 早停
     # ============================================================
 
     def _run_optuna(self) -> Optional[TrialResult]:
@@ -210,7 +262,36 @@ class StrategyOptimizer:
             direction="maximize",
             sampler=optuna.samplers.TPESampler(seed=self.seed),
         )
-        study.optimize(optuna_objective, n_trials=self.n_trials, show_progress_bar=True)
+
+        # Optuna 内置早停：连续 N 轮无提升
+        early_stop_callback = None
+        if self.patience > 0:
+            class EarlyStopCallback:
+                def __init__(self, patience, min_trials, threshold):
+                    self.patience = patience
+                    self.min_trials = min_trials
+                    self.threshold = threshold
+                def __call__(self, study, trial):
+                    n = len(study.trials)
+                    if n < self.min_trials:
+                        return
+                    if study.best_trial.number < n - self.patience:
+                        study.stop()
+                    if study.best_value < self.threshold and n >= self.min_trials:
+                        study.stop()
+            early_stop_callback = EarlyStopCallback(self.patience, self.min_trials, self.bad_threshold)
+
+        study.optimize(
+            optuna_objective,
+            n_trials=self.n_trials,
+            show_progress_bar=True,
+            callbacks=[early_stop_callback] if early_stop_callback else None,
+        )
+
+        if len(study.trials) < self.n_trials:
+            self._early_stopped = True
+            self._early_stop_reason = f"Optuna 早停 @ {len(study.trials)} trials"
+            print(f"\n  ⏹ 早停 @ {len(study.trials)} trials")
 
         self._print_summary()
         return self.best_result
@@ -220,47 +301,8 @@ class StrategyOptimizer:
     # ============================================================
 
     def _compute_score(self, metrics: dict) -> float:
-        sharpe = float(metrics.get("sharpeRatio", 0))
-        win_rate = float(metrics.get("winRate", 0)) / 100.0
-        max_dd = float(metrics.get("maxDrawdown", 0)) / 100.0
-        total_return = float(metrics.get("totalReturn", 0)) / 100.0
-        total_trades = int(metrics.get("totalTrades", 0))
-        profit_factor = float(metrics.get("profitFactor", 0))
-
-        # 交易次数过少 → 惩罚（降低阈值，从5改为3）
-        if total_trades < 3:
-            return -10.0
-
-        if self.score_fn == "sharpe":
-            return sharpe
-
-        if self.score_fn == "return_dd_ratio":
-            if max_dd <= 0:
-                return total_return * 10
-            return total_return / max_dd
-
-        if self.score_fn == "composite":
-            # 改进的综合评分：
-            # - 收益权重提升（核心目标）
-            # - 胜率权重降低（避免偏好高胜率低收益）
-            # - 回撤惩罚降低（避免偏好低回撤低收益）
-            # - 增加交易次数惩罚（太少或太多都不好）
-            trade_penalty = 0.0
-            if total_trades < 10:
-                trade_penalty = (10 - total_trades) * 0.08
-            elif total_trades > 60:
-                trade_penalty = (total_trades - 60) * 0.03
-
-            return (
-                sharpe * 0.3
-                + total_return * 0.3
-                + win_rate * 1.0
-                + min(profit_factor, 5.0) * 0.3
-                - max_dd * 1.0
-                - trade_penalty
-            )
-
-        return sharpe
+        """调用统一评分模块"""
+        return compute_score(metrics, self.score_fn)
 
     # ============================================================
     # 输出
@@ -271,8 +313,14 @@ class StrategyOptimizer:
             print("\n  ❌ 没有有效的试验结果")
             return
 
+        actual = len(self.results)
+        planned = self.n_trials
+        stopped = " ⏹ 早停" if self._early_stopped else ""
+
         print(f"\n{'='*60}")
-        print(f"  优化完成 | 有效试验: {len(self.results)}/{self.n_trials}")
+        print(f"  优化完成 | 有效试验: {actual}/{planned}{stopped}")
+        if self._early_stopped:
+            print(f"  原因: {self._early_stop_reason}")
         print(f"{'='*60}")
 
         if self.best_result:
@@ -310,6 +358,8 @@ class StrategyOptimizer:
             "mode": self.mode,
             "score_fn": self.score_fn,
             "total_valid": len(self.results),
+            "early_stopped": self._early_stopped,
+            "early_stop_reason": self._early_stop_reason,
             "best": self.best_result.to_dict() if self.best_result else None,
             "top_10": [r.to_dict() for r in self.get_top_n(10)],
             "all_results": [r.to_dict() for r in sorted(self.results, key=lambda r: r.score, reverse=True)],

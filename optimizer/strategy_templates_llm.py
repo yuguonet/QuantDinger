@@ -39,6 +39,10 @@ def _p_choice(choices: list) -> dict:
     return {"type": "choice", "choices": choices}
 
 
+# 小资金仓位档位
+POSITION_PCT = _p_choice([25, 33, 50, 100])
+
+
 # ============================================================
 # 1. VWAP 偏离 + 放量确认
 # ============================================================
@@ -408,6 +412,7 @@ LLM_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "rsi_period":        _p_int(10, 18, 1),         # 原 7-21 → 10-18
             "rsi_level":         _p_int(28, 42, 1),         # 原 25-45 → 28-42
             "stop_loss_pct":     _p_float(2.0, 4.0, 0.5),   # 原 2-5 → 2-4
+            "position_pct": POSITION_PCT,
         },
         "constraints": [],
         "build_config": _build_vwap_volume_confirm_config,
@@ -433,6 +438,7 @@ LLM_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "use_ma_filter":    _p_choice([True, False]),
             "ma_period":        _p_int(20, 60, 10),     # 原 20-120 → 20-60，趋势过滤
             "stop_loss_pct":    _p_float(3.0, 5.0, 0.5), # 原 3-6 → 3-5，收窄
+            "position_pct": POSITION_PCT,
         },
         "constraints": [
             ("price_ma_period", "<", "lookback_period"),  # 价格MA必须短于回看期
@@ -458,6 +464,7 @@ LLM_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "rsi_trend_mid":  _p_int(42, 53, 1),       # 原 40-55 → 42-53
             "rsi_trend_slow": _p_int(42, 53, 1),       # 原 40-55 → 42-53
             "stop_loss_pct":  _p_float(2.5, 4.5, 0.5), # 原 2.5-5 → 2.5-4.5
+            "position_pct": POSITION_PCT,
         },
         "constraints": [
             ("rsi_fast", "<", "rsi_mid"),
@@ -483,6 +490,7 @@ LLM_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "use_squeeze_filter": _p_choice([True, False]),
             "squeeze_percentile": _p_int(10, 25, 5),         # 原 10-30 → 10-25
             "stop_loss_pct":      _p_float(2.0, 3.5, 0.5),   # 原 2-4 → 2-3.5
+            "position_pct": POSITION_PCT,
         },
         "constraints": [],
         "build_config": _build_vwap_bollinger_squeeze_config,
@@ -512,6 +520,7 @@ LLM_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "rsi_period":      _p_int(14, 14, 1),
             "rsi_level":       _p_int(30, 40, 1),        # 原 25-45 → 30-40
             "stop_loss_pct":   _p_float(3.0, 5.0, 0.5),
+            "position_pct": POSITION_PCT,
         },
         "constraints": [
             ("macd_fast", "<", "macd_slow"),
@@ -543,6 +552,7 @@ LLM_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "stop_loss_pct":    _p_float(2.0, 5.0, 0.5),     # 止损百分比
             "trailing_pct":     _p_float(3.0, 8.0, 0.5),     # 涨停持有期间追踪止损
             "limit_up_pct":     _p_float(0.09, 0.10, 0.01),  # 涨停阈值（主板9.9~10%）
+            "position_pct": POSITION_PCT,
         },
         "constraints": [],
         "build_config": _build_close_strength_overnight_config,
@@ -572,6 +582,7 @@ LLM_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "ma_period":         _p_int(10, 30, 1),         # 均线周期
             "stop_loss_pct":     _p_float(3.0, 6.0, 0.5),   # 止损
             "trailing_pct":      _p_float(2.0, 5.0, 0.5),   # 追踪止损
+            "position_pct": POSITION_PCT,
         },
         "constraints": [],
         "build_config": _build_limitup_continuation_config,
