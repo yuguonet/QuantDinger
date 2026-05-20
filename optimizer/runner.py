@@ -42,7 +42,7 @@ import signal
 import sys
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Any, List, Set, Tuple
 
 # 确保 backend_api_python 在 path 中（app 模块在那里）
@@ -79,7 +79,6 @@ def _patch_datasource_warehouse():
     """在 BacktestService 加载前，注入 kline_clean_db 数据读取逻辑"""
     from app.data_sources.factory import DataSourceFactory
     from app.utils.db_market import get_market_kline_writer
-    from optimizer.kline_clean_db import MarketDataProvider
     from datetime import datetime, timedelta
 
     _orig_get_kline = DataSourceFactory.get_kline.__func__
@@ -102,7 +101,6 @@ def _patch_datasource_warehouse():
     }
 
     _writer = get_market_kline_writer()
-    _provider = MarketDataProvider(_writer)
 
     def _to_dt(t):
         """将时间戳（int/float）或 datetime 统一转为 naive datetime（不加时区）"""
@@ -134,9 +132,10 @@ def _patch_datasource_warehouse():
 
             # DB 存储的 symbol 不带后缀（如 "000001"），需剥掉 .SZ/.SH
             db_symbol = _strip_suffix(symbol)
-            data = _provider.get_clean_klines(
-                market=market, symbol=db_symbol,
-                start=start, end=end, timeframe=timeframe,
+            # 直接查 db_market，跳过 kline_clean_db 前向填充
+            data = _writer.query(
+                market, db_symbol, timeframe,
+                start_time=start, end_time=end, limit=0,
             )
             if data and len(data) >= 10:
                 return data
@@ -881,8 +880,8 @@ stock_list.txt 格式（同 downloader）:
                         help="时间框架 (1m/5m/15m/30m/1H/4H/1D)")
     parser.add_argument("--start", type=str, default="2024-01-01",
                         help="回测开始日期 (YYYY-MM-DD)")
-    parser.add_argument("--end", type=str, default="2025-12-31",
-                        help="回测结束日期 (YYYY-MM-DD)")
+    parser.add_argument("--end", type=str, default=(datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d"),
+                        help="回测结束日期 (YYYY-MM-DD，默认昨天)")
     parser.add_argument("--trials", "-n", type=int, default=100, help="试验次数")
     parser.add_argument("--score", type=str, default="composite",
                         choices=["sharpe", "return_dd_ratio", "composite"], help="评分函数")
