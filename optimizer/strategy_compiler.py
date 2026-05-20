@@ -65,7 +65,11 @@ def get_val(arr, i, default=0):
         ts_enabled = trailing.get('enabled', False)
         ts_activation = trailing.get('activation_profit', 0) / 100.0
         ts_callback = trailing.get('callback_pct', 0) / 100.0
-        
+
+        # A 股涨跌停阈值
+        ashare_rules = risk_mgmt.get('ashare_rules', {})
+        limit_pct = 0.20 if ashare_rules.get('price_limit_20pct', False) else 0.10
+
         return f'''
 # ===========================
 # 1. Parameters
@@ -82,6 +86,9 @@ add_threshold_pct = {add_threshold}
 stop_loss_pct = {sl_pct}
 take_profit_activation = {ts_activation}
 trailing_callback = {ts_callback}
+
+# A 股涨跌停阈值（默认 10%，创业板/科创板 20%）
+limit_pct = {limit_pct}
 '''
 
     def _get_indicators_calculation(self, rules):
@@ -153,11 +160,11 @@ df['st_lower'] = final_lower
                 key = f"rsi_{period}"
                 if key not in calculated:
                     code += f"""
-# RSI ({period})
+# RSI ({period}) — Wilder's smoothing (ewm, 与 build_strategy 一致)
 delta = df['close'].diff()
-gain = (delta.where(delta > 0, 0)).rolling(window={period}).mean()
-loss = (-delta.where(delta < 0, 0)).rolling(window={period}).mean()
-rs = gain / loss
+gain = delta.clip(lower=0).ewm(alpha=1/{period}, adjust=False).mean()
+loss = (-delta.clip(upper=0)).ewm(alpha=1/{period}, adjust=False).mean()
+rs = gain / loss.replace(0, np.nan)
 df['rsi_{period}'] = 100 - (100 / (1 + rs))
 """
                     calculated.add(key)
@@ -278,16 +285,42 @@ df['vol_ratio_{period}'] = df['volume'] / df['vol_ma_{period}'].replace(0, np.na
                     calculated.add(key)
 
             elif ind == 'vwap':
-                # VWAP = cumsum(price * volume) / cumsum(volume)，按日重置
+                # VWAP: 日内框架用真实 VWAP（每日重置），日线用典型价格滚动均价
                 deviation_pct = params.get('deviation_pct', 2.0)
                 key = f"vwap_{deviation_pct}"
                 if key not in calculated:
                     code += f"""
 # VWAP + 偏离带 ({deviation_pct}%)
-# 用滚动 VWAP 近似（日线级别）
-df['vwap_cum_pv'] = (df['close'] * df['volume']).rolling(window=20).sum()
-df['vwap_cum_vol'] = df['volume'].rolling(window=20).sum()
-df['vwap'] = df['vwap_cum_pv'] / df['vwap_cum_vol'].replace(0, np.nan)
+# 自动检测时间框架: bar 间隔 > 20h → 日线（用典型价格滚动均价）
+#                  bar 间隔 <= 20h → 日内（用真实 VWAP，按日重置）
+_tp = (df['high'] + df['low'] + df['close']) / 3  # typical price
+if hasattr(df.index, 'to_series'):
+    _ts = df.index.to_series()
+elif 'time' in df.columns:
+    _ts = pd.to_datetime(df['time'])
+else:
+    _ts = pd.Series(range(len(df)))
+_td = _ts.diff().dt.total_seconds() if hasattr(_td := _ts.diff(), 'dt') else _ts.diff()
+_is_daily = _td.median() > 72000 if len(_td.dropna()) > 0 else True  # > 20h = 日线
+
+if _is_daily:
+    # 日线: 20 日滚动量价均价（每个 bar 是一个完整交易日）
+    _vol_ma = df['volume'].rolling(window=20, min_periods=1).sum()
+    df['vwap'] = (_tp * df['volume']).rolling(window=20, min_periods=1).sum() / _vol_ma.replace(0, np.nan)
+else:
+    # 日内: 真实 VWAP，按交易日重置
+    if 'time' in df.columns:
+        _dates = pd.to_datetime(df['time']).dt.date
+    elif hasattr(df.index, 'date'):
+        _dates = df.index.date
+    else:
+        _dates = pd.Series(range(len(df)))
+    _session_change = _dates != _dates.shift(1)
+    _session_id = _session_change.cumsum()
+    _cum_pv = (_tp * df['volume']).groupby(_session_id).cumsum()
+    _cum_vol = df['volume'].groupby(_session_id).cumsum()
+    df['vwap'] = _cum_pv / _cum_vol.replace(0, np.nan)
+
 df['vwap_upper'] = df['vwap'] * (1 + {deviation_pct} / 100)
 df['vwap_lower'] = df['vwap'] * (1 - {deviation_pct} / 100)
 """
@@ -843,6 +876,12 @@ df['raw_sell'] = False
 # ===========================
 # 4. Core Loop (Backtest)
 # ===========================
+# A 股规则:
+#   - 信号延迟执行: bar i close 产生信号 → bar i+1 open 成交
+#   - T+1: 买入当天不能卖出，最早 T+1 日卖出
+#   - 涨停封板: open 达涨停价 → 买入不成交，延迟到下一个交易日
+#   - 跌停封板: open 达跌停价 → 卖出不成交，延迟到下一个交易日
+
 open_long_signals = [False] * len(df)
 add_long_signals = [False] * len(df)
 close_long_signals = [False] * len(df)
@@ -866,155 +905,216 @@ close_short_text = [None] * len(df)
 open_short_text = [None] * len(df)
 add_short_text = [None] * len(df)
 
-position = 0 # 0, 1 (Long), -1 (Short)
+position = 0  # 0, 1 (Long), -1 (Short)
 position_count = 0
 avg_entry_price = 0.0
 last_add_price = 0.0
-highest_price = 0.0 # For Long: Highest High; For Short: Lowest Low
+highest_price = 0.0
 
 close_arr = df['close'].values
 high_arr = df['high'].values
 low_arr = df['low'].values
-raw_buy_arr = df['raw_buy'].values
-raw_sell_arr = df['raw_sell'].values
+open_arr = df['open'].values
+
+# 信号原始数组（不延迟，用于检测信号意图）
+raw_buy_arr = df['raw_buy'].values.astype(bool)
+raw_sell_arr = df['raw_sell'].values.astype(bool)
+
+# 延迟执行状态
+pending_entry = False   # 有未成交的买入意向（因涨停被阻）
+pending_exit = False    # 有未成交的卖出意向（因跌停被阻）
+entry_bar = -1          # 实际买入成交的 bar index（T+1 用）
+
+# A 股涨跌停阈值（默认 10%，创业板/科创板 20%）
+# 从 risk_management.ashare_rules 读取，或默认 0.10
+_limit_pct = limit_pct
 
 for i in range(len(df)):
     current_close = close_arr[i]
     current_high = high_arr[i]
     current_low = low_arr[i]
+    current_open = open_arr[i]
+
+    # ── 涨跌停判定 ──
+    if i > 0:
+        prev_close = close_arr[i - 1]
+    else:
+        prev_close = current_open
+    limit_up_price = prev_close * (1 + _limit_pct)
+    limit_down_price = prev_close * (1 - _limit_pct)
+    is_limit_up = current_open >= limit_up_price * 0.998   # 容忍 0.2% 误差
+    is_limit_down = current_open <= limit_down_price * 1.002
     
     if position == 1:
-        # Long Position
+        # ── 已持多仓 ──
         if current_high > highest_price:
             highest_price = current_high
-            
-        profit_pct = (highest_price - avg_entry_price) / avg_entry_price
-        current_profit_pct = (current_close - avg_entry_price) / avg_entry_price
-        
+
+        profit_pct = (highest_price - avg_entry_price) / avg_entry_price if avg_entry_price > 0 else 0
+        current_profit_pct = (current_close - avg_entry_price) / avg_entry_price if avg_entry_price > 0 else 0
+
         # 1. Trailing Stop
         if take_profit_activation > 0 and profit_pct >= take_profit_activation:
-            drawdown = (highest_price - current_close) / avg_entry_price
+            drawdown = (highest_price - current_close) / avg_entry_price if avg_entry_price > 0 else 0
             if drawdown >= trailing_callback:
                 close_long_signals[i] = True
                 close_long_price[i] = current_close
                 close_long_text[i] = "Trailing Stop"
                 position = 0
                 position_count = 0
+                pending_exit = False
                 continue
-                
+
         # 2. Stop Loss
         if stop_loss_pct > 0:
-            loss_pct = (avg_entry_price - current_low) / avg_entry_price
+            loss_pct = (avg_entry_price - current_low) / avg_entry_price if avg_entry_price > 0 else 0
             if loss_pct >= stop_loss_pct:
                 close_long_signals[i] = True
                 close_long_price[i] = avg_entry_price * (1 - stop_loss_pct)
                 close_long_text[i] = "Stop Loss"
                 position = 0
                 position_count = 0
+                pending_exit = False
                 continue
-                
-        # 3. Signal Exit (if enabled)
-        # Note: Code2 uses raw_sell_arr for exit
-        if raw_sell_arr[i]:
-             close_long_signals[i] = True
-             close_long_price[i] = current_close
-             close_long_text[i] = "Signal Exit"
-             position = 0
-             position_count = 0
-             
-             # Reverse to Short if trade_direction allows (simplified here)
-             # For now we just close.
-             continue
-             
-        # 4. Pyramiding (Add Long)
+
+        # 3. T+1 检查: 买入当天不能卖出
+        days_held = i - entry_bar
+        can_sell_today = days_held >= 1  # T+1: 至少持有 1 根 bar
+
+        # 4. 信号卖出（T+1 + 跌停检查）
+        if raw_sell_arr[i] or pending_exit:
+            if not can_sell_today:
+                # T+1 限制: 今天不能卖，保留信号到明天
+                pending_exit = True
+            elif is_limit_down:
+                # 跌停封板: 卖不出去，保留信号到明天
+                pending_exit = True
+            else:
+                # 可以卖出
+                exec_price = current_open  # 下一根 bar 的 open 成交
+                close_long_signals[i] = True
+                close_long_price[i] = exec_price
+                close_long_text[i] = "Signal Exit (T+1)" if days_held == 1 else "Signal Exit"
+                position = 0
+                position_count = 0
+                pending_exit = False
+                continue
+
+        # 5. Pyramiding (Add Long)
         if max_pyramiding > 0 and position_count < max_pyramiding + 1 and current_profit_pct > 0:
-             # Condition: Price rise by threshold
-             if add_threshold_pct > 0:
-                 target_price = last_add_price * (1 + add_threshold_pct)
-                 if current_high >= target_price:
-                     add_long_signals[i] = True
-                     add_long_price[i] = target_price
-                     add_long_text[i] = "Add Long"
-                     position_count += 1
-                     last_add_price = target_price
+            if add_threshold_pct > 0:
+                target_price = last_add_price * (1 + add_threshold_pct)
+                if current_high >= target_price and not is_limit_up:
+                    add_long_signals[i] = True
+                    add_long_price[i] = target_price
+                    add_long_text[i] = "Add Long"
+                    position_count += 1
+                    last_add_price = target_price
              
     elif position == -1:
-        # Short Position
-        # For Short, highest_price tracks the LOWEST price (best profit scenario)
+        # ── 已持空仓 ──
         if highest_price == 0: highest_price = avg_entry_price
         if current_low < highest_price:
             highest_price = current_low
-            
-        # Profit: (Entry - Lowest) / Entry
-        profit_pct = (avg_entry_price - highest_price) / avg_entry_price
-        current_profit_pct = (avg_entry_price - current_close) / avg_entry_price
-        
+
+        profit_pct = (avg_entry_price - highest_price) / avg_entry_price if avg_entry_price > 0 else 0
+        current_profit_pct = (avg_entry_price - current_close) / avg_entry_price if avg_entry_price > 0 else 0
+
         # 1. Trailing Stop
         if take_profit_activation > 0 and profit_pct >= take_profit_activation:
-            # Drawdown: (Current - Lowest) / Entry
-            drawdown = (current_close - highest_price) / avg_entry_price
+            drawdown = (current_close - highest_price) / avg_entry_price if avg_entry_price > 0 else 0
             if drawdown >= trailing_callback:
                 close_short_signals[i] = True
                 close_short_price[i] = current_close
                 close_short_text[i] = "Trailing Stop"
                 position = 0
                 position_count = 0
+                pending_exit = False
                 continue
 
         # 2. Stop Loss
         if stop_loss_pct > 0:
-            # Loss: Price went up. (High - Entry) / Entry
-            loss_pct = (current_high - avg_entry_price) / avg_entry_price
+            loss_pct = (current_high - avg_entry_price) / avg_entry_price if avg_entry_price > 0 else 0
             if loss_pct >= stop_loss_pct:
                 close_short_signals[i] = True
                 close_short_price[i] = avg_entry_price * (1 + stop_loss_pct)
                 close_short_text[i] = "Stop Loss"
                 position = 0
                 position_count = 0
+                pending_exit = False
                 continue
 
-        # 3. Signal Exit
-        if raw_buy_arr[i]:
-             close_short_signals[i] = True
-             close_short_price[i] = current_close
-             close_short_text[i] = "Signal Exit"
-             position = 0
-             position_count = 0
-             continue
+        # 3. T+1 + 涨停检查
+        days_held = i - entry_bar
+        can_sell_today = days_held >= 1
 
-        # 4. Pyramiding (Add Short)
+        # 4. 信号平仓（T+1 + 涨停检查: 空头平仓=买入，涨停买不到）
+        if raw_buy_arr[i] or pending_exit:
+            if not can_sell_today:
+                pending_exit = True
+            elif is_limit_up:
+                # 涨停封板: 空头平仓买不回来
+                pending_exit = True
+            else:
+                exec_price = current_open
+                close_short_signals[i] = True
+                close_short_price[i] = exec_price
+                close_short_text[i] = "Signal Exit (T+1)" if days_held == 1 else "Signal Exit"
+                position = 0
+                position_count = 0
+                pending_exit = False
+                continue
+
+        # 5. Pyramiding (Add Short)
         if max_pyramiding > 0 and position_count < max_pyramiding + 1 and current_profit_pct > 0:
-             # Condition: Price drop by threshold
-             if add_threshold_pct > 0:
-                 target_price = last_add_price * (1 - add_threshold_pct)
-                 if current_low <= target_price:
-                     add_short_signals[i] = True
-                     add_short_price[i] = target_price
-                     add_short_text[i] = "Add Short"
-                     position_count += 1
-                     last_add_price = target_price
+            if add_threshold_pct > 0:
+                target_price = last_add_price * (1 - add_threshold_pct)
+                if current_low <= target_price and not is_limit_down:
+                    add_short_signals[i] = True
+                    add_short_price[i] = target_price
+                    add_short_text[i] = "Add Short"
+                    position_count += 1
+                    last_add_price = target_price
 
     else:
-        # No Position
-        if raw_buy_arr[i]:
-            open_long_signals[i] = True
-            open_long_price[i] = current_close
-            open_long_text[i] = "Open Long"
-            position = 1
-            position_count = 1
-            avg_entry_price = current_close
-            last_add_price = current_close
-            highest_price = current_close
-            
-        elif raw_sell_arr[i]:
-            open_short_signals[i] = True
-            open_short_price[i] = current_close
-            open_short_text[i] = "Open Short"
-            position = -1
-            position_count = 1
-            avg_entry_price = current_close
-            last_add_price = current_close
-            highest_price = current_close # Init with Entry
+        # ── 空仓: 延迟入场 + 涨跌停检查 ──
+        # pending_entry: 前一根 bar 有买入信号但因涨停未成交，本 bar 继续尝试
+        if raw_buy_arr[i] and not pending_entry:
+            pending_entry = True  # 新的买入意向
+
+        if pending_entry:
+            if is_limit_up:
+                # 涨停封板: 买不进去，保留到下一个 bar
+                pending_entry = True
+            else:
+                # 可以买入: 以当前 bar 的 open 成交（= 信号 bar 的下一根 open）
+                open_long_signals[i] = True
+                open_long_price[i] = current_open
+                open_long_text[i] = "Open Long (Next Bar Open)"
+                position = 1
+                position_count = 1
+                avg_entry_price = current_open
+                last_add_price = current_open
+                highest_price = current_open
+                entry_bar = i
+                pending_entry = False
+                pending_exit = False
+        elif raw_sell_arr[i] and not pending_entry:
+            # 空头入场（做空）
+            if is_limit_down:
+                pending_entry = True  # 跌停: 做空开仓也受影响（用 pending_entry 复用逻辑）
+            else:
+                open_short_signals[i] = True
+                open_short_price[i] = current_open
+                open_short_text[i] = "Open Short (Next Bar Open)"
+                position = -1
+                position_count = 1
+                avg_entry_price = current_open
+                last_add_price = current_open
+                highest_price = current_open
+                entry_bar = i
+                pending_entry = False
+                pending_exit = False
 
 # Append columns
 df['open_long'] = open_long_signals
@@ -1098,12 +1198,15 @@ close_arr = df['close'].values
 high_arr = df['high'].values
 low_arr = df['low'].values
 open_arr = df['open'].values
-raw_buy_arr = df['raw_buy'].values
-raw_sell_arr = df['raw_sell'].values
+raw_buy_arr = df['raw_buy'].values.astype(bool)
+raw_sell_arr = df['raw_sell'].values.astype(bool)
 
 limit_up_pct = {limit_up_pct}
 stop_loss_pct = {sl_pct}
 trailing_pct = {ts_pct}
+
+# 延迟入场状态（涨停封板时买不进，延迟到下一个交易日）
+pending_entry = False
 
 for i in range(len(df)):
     current_open = open_arr[i]
@@ -1184,17 +1287,34 @@ for i in range(len(df)):
                 continue
 
     else:
-        # ── 空仓 ──
-        if raw_buy_arr[i]:
-            open_long_signals[i] = True
-            open_long_price[i] = current_close
-            open_long_text[i] = "Open Long (Close)"
-            position = 1
-            position_count = 1
-            avg_entry_price = current_close
-            entry_day = i
-            highest_since_entry = current_close
-            is_holding_limitup = False
+        # ── 空仓: 涨停检查 + 延迟入场 ──
+        if raw_buy_arr[i] and not pending_entry:
+            pending_entry = True
+
+        if pending_entry:
+            # 涨停封板判定: 当前 bar 的 close 接近涨停价
+            if i > 0:
+                prev_c = close_arr[i - 1]
+            else:
+                prev_c = current_open
+            limit_up_price = prev_c * (1 + limit_up_pct)
+            is_limit_up_now = current_close >= limit_up_price * 0.998
+
+            if is_limit_up_now:
+                # 涨停封板: 尾盘也买不进，保留到下一个 bar
+                pending_entry = True
+            else:
+                # 可以买入: 以当前 bar 的 close 成交（隔夜策略: 尾盘买入）
+                open_long_signals[i] = True
+                open_long_price[i] = current_close
+                open_long_text[i] = "Open Long (Close)"
+                position = 1
+                position_count = 1
+                avg_entry_price = current_close
+                entry_day = i
+                highest_since_entry = current_close
+                is_holding_limitup = False
+                pending_entry = False
 
 # Append columns
 df['open_long'] = open_long_signals

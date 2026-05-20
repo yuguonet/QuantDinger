@@ -69,7 +69,7 @@ def get_wf_positive_stocks(summary_path: str = None) -> list:
 
 
 def run_optimization(
-    template: str = "dragon_pullback_v2",
+    template: str = "dragon_pullback",
     symbols: list = None,
     timeframe: str = "1D",
     start: str = "2021-01-01",
@@ -177,8 +177,8 @@ def run_all_timeframes(args):
 
 def main():
     parser = argparse.ArgumentParser(description="龙回头 V2 优化版批量测试")
-    parser.add_argument("--template", "-t", default="dragon_pullback_v2",
-                        help="策略模板 (默认 dragon_pullback_v2)")
+    parser.add_argument("--template", "-t", default="dragon_pullback",
+                        help="策略模板 (默认 dragon_pullback)")
     parser.add_argument("--tf", default="1D", help="时间框架 (默认 1D)")
     parser.add_argument("--all-tf", action="store_true", help="测试全部时间框架 (1D/1H/30m/15m)")
     parser.add_argument("--start", default="2021-01-01", help="回测开始日期")

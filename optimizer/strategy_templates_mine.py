@@ -333,7 +333,13 @@ def _build_low_vol_reversal_config(p: dict) -> dict:
 #   - rsi_bounce 25-45: RSI 从超卖区回升
 
 def _build_dragon_pullback_config(p: dict) -> dict:
-    """龙回头"""
+    """龙回头（合并 V1 + V2）
+
+    rsi_mode="cross_up": RSI 从超卖区回升（严格，信号少但质量高）
+    rsi_mode="below":    RSI 处于低位区间（宽松，信号多，WF 验证更稳定）
+    """
+    rsi_mode = p.get("rsi_mode", "below")  # 默认用 V2 的宽松模式
+
     entry_rules = [
         # 大涨后回调到买入区间
         {
@@ -352,15 +358,15 @@ def _build_dragon_pullback_config(p: dict) -> dict:
             "operator": "volume_ratio_below",
             "threshold": p["vol_shrink_ratio"],
         },
-        # RSI 从超卖区回升
+        # RSI 信号（模式可选）
         {
             "indicator": "rsi",
             "params": {"period": p["rsi_period"], "threshold": p["rsi_bounce"]},
-            "operator": "cross_up",
+            "operator": rsi_mode,
         },
     ]
 
-    # 趋势过滤：价格在长期均线之上（避免在下跌趋势中买入）
+    # 可选趋势过滤（V1 特有，WF 验证默认关闭）
     if p.get("use_trend_filter"):
         entry_rules.append({
             "indicator": "ema",
@@ -368,67 +374,8 @@ def _build_dragon_pullback_config(p: dict) -> dict:
             "operator": "price_above",
         })
 
-    if p.get("use_ma_support"):
-        entry_rules.append({
-            "indicator": "ema",
-            "params": {"period": p["ma_support_period"]},
-            "operator": "price_near",
-            "threshold": p["ma_near_pct"],
-        })
-
     return {
         "name": f"DragonPB_{p['lookback_period']}_{p['pullback_min_pct']}",
-        "entry_rules": entry_rules,
-        "position_config": {
-            "initial_size_pct": p.get("position_pct", 70),
-            "leverage": 1,
-            "max_pyramiding": 0,
-        },
-        "pyramiding_rules": {"enabled": False},
-        "risk_management": {
-            "stop_loss": {"enabled": True, "type": "percentage", "value": p["stop_loss_pct"]},
-            "take_profit": {"enabled": True, "type": "percentage", "value": p["take_profit_pct"]},
-            "trailing_stop": {"enabled": True, "type": "trailing_pct", "activation_profit": p["take_profit_pct"], "callback_pct": p.get("trailing_pct", 5.0)},
-            "ashare_rules": {"t_plus_1": True, "price_limit": True, "min_lot": 100},
-        },
-    }
-
-
-def _build_dragon_pullback_v2_config(p: dict) -> dict:
-    """龙回头 V2 — 优化版，去掉无用过滤器，参数空间收窄
-
-    买入逻辑：大涨后回调到区间 + 缩量 + RSI 处于低位
-    RSI 用 '<' (区间) 而非 'cross_up' (穿越)，大幅提高信号频率
-    """
-    entry_rules = [
-        # 大涨后回调到买入区间
-        {
-            "indicator": "dragon_pullback",
-            "params": {
-                "high_lookback": p["lookback_period"],
-                "pullback_min": p["pullback_min_pct"] / 100.0,
-                "pullback_max": p["pullback_max_pct"] / 100.0,
-            },
-            "operator": "in_pullback_zone",
-        },
-        # 回调缩量
-        {
-            "indicator": "volume",
-            "params": {"period": p["vol_ma_period"]},
-            "operator": "volume_ratio_below",
-            "threshold": p["vol_shrink_ratio"],
-        },
-        # RSI 处于低位（超卖区域）
-        {
-            "indicator": "rsi",
-            "params": {"period": p["rsi_period"], "threshold": p["rsi_bounce"]},
-            "operator": "<",
-        },
-    ]
-    # 不加 trend_filter / ma_support — WF 验证证明它们降低样本外表现
-
-    return {
-        "name": f"DragonPBv2_{p['lookback_period']}_{p['pullback_min_pct']}",
         "entry_rules": entry_rules,
         "position_config": {
             "initial_size_pct": p.get("position_pct", 75),
@@ -438,6 +385,7 @@ def _build_dragon_pullback_v2_config(p: dict) -> dict:
         "pyramiding_rules": {"enabled": False},
         "risk_management": {
             "stop_loss": {"enabled": True, "type": "percentage", "value": p["stop_loss_pct"]},
+            "take_profit": {"enabled": True, "type": "percentage", "value": p["take_profit_pct"]},
             "trailing_stop": {
                 "enabled": True,
                 "type": "trailing_pct",
@@ -571,7 +519,10 @@ MY_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
         "build_config": _build_low_vol_reversal_config,
     },
 
-    # ── 5. 龙回头 ──
+    # ── 5. 龙回头（合并 V1 + V2）──
+    # V1: 趋势/均线过滤（可选），RSI cross_up（严格）
+    # V2: WF 验证优化参数范围，RSI < 区间（信号更多），去掉过拟合过滤器
+    # 合并: rsi_mode 参数切换 cross_up / below，可选趋势过滤
     "dragon_pullback": {
         "name": "龙回头",
         "description": (
@@ -579,64 +530,28 @@ MY_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "数据验证：limit_up_count>=30 的 1082 只龙头股，"
             "年化中位数 25.6%（全市场 12.3%），Sharpe 0.48。100% 盈利。"
             "⚠️ 回撤中位数 -68%，需严格止损。适合超短（2-5 天）。"
-            "增加趋势过滤：价格在长期均线之上才买入，避免下跌趋势中抄底。"
+            "rsi_mode=cross_up 严格但信号少，rsi_mode=below 宽松信号多（WF 验证更稳定）。"
         ),
         "indicators": ["dragon_pullback", "volume", "rsi", "ema"],
         "params": {
-            "lookback_period":    _p_int(10, 40, 5),
-            "pullback_min_pct":   _p_float(8.0, 15.0, 1.0),
-            "pullback_max_pct":   _p_float(20.0, 35.0, 5.0),
-            "vol_ma_period":      _p_int(10, 30, 1),
-            "vol_shrink_ratio":   _p_float(0.3, 0.7, 0.1),
-            "rsi_period":         _p_int(7, 21, 1),
-            "rsi_bounce":         _p_int(25, 45, 1),
+            "lookback_period":    _p_int(15, 35, 1),        # WF+ median=29
+            "pullback_min_pct":   _p_float(8.0, 12.0, 1.0), # WF+ median=10
+            "pullback_max_pct":   _p_float(25.0, 35.0, 1.0), # WF+ median=30
+            "vol_ma_period":      _p_int(15, 30, 1),        # WF+ median=25
+            "vol_shrink_ratio":   _p_float(0.4, 0.8, 0.05), # WF+ median=0.7
+            "rsi_period":         _p_int(10, 21, 1),        # WF+ median=14-16
+            "rsi_bounce":         _p_int(28, 40, 1),        # WF+ median=34
+            "rsi_mode":           _p_choice(["cross_up", "below"]),  # cross_up=严格, below=宽松
             "use_trend_filter":   _p_choice([True, False]),
             "trend_ema_period":   _p_int(20, 60, 5),
-            "use_ma_support":     _p_choice([True, False]),
-            "ma_support_period":  _p_int(10, 30, 5),
-            "ma_near_pct":        _p_float(1.0, 4.0, 0.5),
-            "position_pct":       _p_int(50, 80, 10),
-            "stop_loss_pct":      _p_float(4.0, 8.0, 0.5),
-            "take_profit_pct":    _p_float(8.0, 15.0, 1.0),
-            "trailing_pct":       _p_float(3.0, 7.0, 0.5),
-        },
-        "constraints": [
-            ("pullback_min_pct", "<", "pullback_max_pct"),
-            ("vol_shrink_ratio", "<", 0.8),
-        ],
-        "build_config": _build_dragon_pullback_config,
-    },
-
-    # ── 5b. 龙回头 V2（优化版）──
-    # 基于 4306 只全量测试 + Walk-Forward 验证结果优化：
-    #   - 去掉 use_trend_filter / use_ma_support（WF 验证显示反而降低样本外表现）
-    #   - 参数范围收窄到 WF>0 股票的中位数附近（减少搜索空间，降低过拟合）
-    #   - 放宽 vol_shrink_ratio（0.3→0.8）和 pullback 范围，增加信号频率
-    #   - 增加 take_profit / trailing_pct 范围，让利润奔跑
-    "dragon_pullback_v2": {
-        "name": "龙回头V2",
-        "description": (
-            "龙回头优化版。基于全量 WF 验证结果优化参数空间：去掉趋势/均线过滤器，"
-            "收窄搜索范围到 WF>0 中位数附近，放宽缩量/回调条件增加信号频率。"
-            "核心改进：减少过拟合风险，提升样本外稳定性。"
-        ),
-        "indicators": ["dragon_pullback", "volume", "rsi"],
-        "params": {
-            "lookback_period":    _p_int(15, 35, 1),       # WF+ median=29, 收窄
-            "pullback_min_pct":   _p_float(8.0, 12.0, 1.0), # WF+ median=10
-            "pullback_max_pct":   _p_float(25.0, 35.0, 1.0), # WF+ median=30, 放宽上限
-            "vol_ma_period":      _p_int(15, 30, 1),        # WF+ median=25
-            "vol_shrink_ratio":   _p_float(0.4, 0.8, 0.05), # WF+ median=0.7, 放宽
-            "rsi_period":         _p_int(10, 21, 1),        # WF+ median=14-16
-            "rsi_bounce":         _p_int(28, 40, 1),        # WF+ median=34, 收窄
             "position_pct":       _p_int(60, 80, 5),        # WF+ median=75
             "stop_loss_pct":      _p_float(4.0, 8.0, 0.5),
-            "take_profit_pct":    _p_float(10.0, 20.0, 1.0), # 扩大，让利润跑
+            "take_profit_pct":    _p_float(10.0, 20.0, 1.0),
             "trailing_pct":       _p_float(3.0, 8.0, 0.5),
         },
         "constraints": [
             ("pullback_min_pct", "<", "pullback_max_pct"),
         ],
-        "build_config": _build_dragon_pullback_v2_config,
+        "build_config": _build_dragon_pullback_config,
     },
 }

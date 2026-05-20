@@ -7,7 +7,7 @@
     python -m optimizer.runner --list-local
 
     # 跑单只股票
-    python -m optimizer.runner -t ma_crossover -s "000001.SZ" -tf 1D
+    python -m optimizer.runner -t dual_ma_volume -s "000001.SZ" -tf 1D
 
     # 跑本地仓库全部 A 股（多进程）
     python -m optimizer.runner --all -m CNStock -tf 1D --all-local -j 4
@@ -25,13 +25,13 @@ stock_list.txt 格式（同 downloader）:
     optimizer_output/
       CNStock/
         daily/
-          000001.SZ_ma_crossover.json
-          600000.SH_ma_crossover.json
+          000001.SZ_dual_ma_volume.json
+          600000.SH_dual_ma_volume.json
         weekly/
           000001.SZ_rsi_oversold.json
       Crypto/
         4h/
-          BTC_USDT_ma_crossover.json
+          BTC_USDT_dual_ma_volume.json
       _summary.json
 """
 import argparse
@@ -166,7 +166,7 @@ class ProgressTracker:
         "run_id": "20260505_071030",
         "started_at": "2026-05-05 07:10:30",
         "total_tasks": 500,
-        "completed": [["000001.SZ", "ma_crossover"], ...],
+        "completed": [["000001.SZ", "dual_ma_volume"], ...],
         "failed": [["000002.SZ", "rsi_oversold"], ...]
     }
     """
@@ -379,7 +379,7 @@ def get_all_template_keys() -> List[str]:
 
 
 def get_original_template_keys() -> List[str]:
-    """返回原始 7 个模板 key"""
+    """返回原始 6 个模板 key"""
     return list(STRATEGY_TEMPLATES.keys())
 
 
@@ -551,6 +551,15 @@ class BacktestObjective:
 
         # 3. 回测
         try:
+            # A 股模式: 通过 strategy_config 传递 T+1 和涨跌停规则
+            _strategy_config = None
+            if self.is_ashare:
+                _strategy_config = {
+                    'ashare_rules': {
+                        't_plus_1': True,
+                        'limit_pct': 0.20 if self.symbol[:3] in ('300', '301', '688') else 0.10,
+                    }
+                }
             result = self._backtest.run(
                 indicator_code=code,
                 market=self.market,
@@ -560,6 +569,7 @@ class BacktestObjective:
                 end_date=ed,
                 initial_capital=self.initial_capital,
                 commission=self.commission,
+                strategy_config=_strategy_config,
             )
         except Exception as e:
             # 数据相关错误，标记后续试验全部跳过
@@ -593,11 +603,13 @@ class BacktestObjective:
         return config
 
     def _apply_ashare_constraints(self, result: dict) -> dict:
-        """对回测结果应用 A 股约束修正"""
-        total_trades = result.get("totalTrades", 0)
-        if total_trades > 0 and self.timeframe in ("1m", "5m", "15m", "30m", "1H"):
-            result["totalTrades"] = max(1, total_trades // 2)
-            result["t1_adjusted"] = True
+        """对回测结果应用 A 股约束修正
+
+        T+1 和涨跌停已在 StrategyCompiler core loop 中实现，无需额外修正。
+        保留此方法以维持接口兼容性。
+        """
+        result["t1_enforced"] = True
+        result["limit_check"] = True
         return result
 
 
@@ -825,7 +837,7 @@ def main():
   python -m optimizer.runner --all -m CNStock -tf 1D --all-local
 
   # 跑单只股票
-  python -m optimizer.runner -t ma_crossover -s "000001.SZ" -tf 1D
+  python -m optimizer.runner -t dual_ma_volume -s "000001.SZ" -tf 1D
 
   # 跑多只股票（逗号分隔）
   python -m optimizer.runner --all -s "000001.SZ,600000.SH,300750.SZ" -tf 1D
@@ -843,7 +855,7 @@ def main():
   python -m optimizer.runner --all -m CNStock -tf 1D --random-sample 100
 
   # 加密市场
-  python -m optimizer.runner -t ma_crossover -m Crypto -s "BTC/USDT" -tf 4H
+  python -m optimizer.runner -t dual_ma_volume -m Crypto -s "BTC/USDT" -tf 4H
 
 stock_list.txt 格式（同 downloader）:
   000001.SZ
@@ -852,7 +864,7 @@ stock_list.txt 格式（同 downloader）:
   # 井号开头是注释
 
 可用模板:
-  原始 (7): """ + ", ".join(get_original_template_keys()) + """
+  原始 (6): """ + ", ".join(get_original_template_keys()) + """
   A股 (10): """ + ", ".join(get_ashare_template_keys()) + """
   LLM (5): """ + ", ".join(get_llm_template_keys()) + """
   自定义中短线 (5): """ + ", ".join(get_mine_template_keys()),
@@ -863,7 +875,7 @@ stock_list.txt 格式（同 downloader）:
     parser.add_argument("--all", action="store_true", help="运行所有模板")
     parser.add_argument("--set", type=str, default="all",
                         choices=["all", "original", "ashare", "llm", "mine"],
-                        help="模板集合: all=全部, original=原始7个, ashare=A股10个, llm=LLM生成5个")
+                        help="模板集合: all=全部, original=原始6个, ashare=A股9个, llm=LLM生成7个")
     parser.add_argument("--market", "-m", type=str, default="CNStock",
                         help="市场类型 (CNStock, Crypto, ...)")
     parser.add_argument("--symbol", "-s", type=str, default=None,

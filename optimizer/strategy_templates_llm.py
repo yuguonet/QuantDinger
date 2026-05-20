@@ -257,85 +257,8 @@ def _build_macd_vol_divergence_config(p: dict) -> dict:
 
 
 # ============================================================
-# 6. 龙回头策略（大涨后回调买入）
 # ============================================================
-# 设计思路:
-#   核心逻辑: 股票大涨后（尤其涨停），获利盘涌出导致回调
-#             但"龙"（主力资金）不会轻易撤退，回调缩量说明卖压衰竭
-#             二次启动概率高
-#
-#   买入条件:
-#     1. 近N天有过大涨（涨幅排名前M%）
-#     2. 从近期高点回调超过 X%（获利盘消化中）
-#     3. 回调时缩量（卖压衰竭，非主力出货）
-#     4. RSI 回落到合理区间（不超买也不超卖）
-#     5. 价格仍在中期均线上方（趋势未破）
-#
-#   卖出条件:
-#     - 反弹到前高附近止盈
-#     - 跌破中期均线止损（趋势破了就走）
-#     - 固定止损兜底
-#
-#   与 limitup_continuation 的区别:
-#     limitup_continuation: 涨停当天买（追涨）
-#     dragon_pullback:       涨停后回调买（低吸）→ 风险更低，胜率更高
-
-def _build_dragon_pullback_config(p: dict) -> dict:
-    """龙回头 — 大涨后回调缩量买入"""
-    entry_rules = [
-        # 1. 近N天有过大涨（检测近N天最大单日涨幅是否超阈值）
-        {
-            "indicator": "recent_surge",
-            "params": {"lookback": p["surge_lookback"], "min_pct": p["surge_min_pct"]},
-            "operator": "has_surge",
-        },
-        # 2. 从近期高点回调（dragon_pullback 指标）
-        {
-            "indicator": "dragon_pullback",
-            "params": {
-                "high_lookback": p["high_lookback"],
-                "pullback_min": p["pullback_min"],
-                "pullback_max": p["pullback_max"],
-            },
-            "operator": "in_pullback_zone",
-        },
-        # 3. 缩量确认（回调时成交量萎缩 = 卖压衰竭）
-        {
-            "indicator": "volume",
-            "params": {"period": p["vol_ma_period"]},
-            "operator": "volume_ratio_below",
-            "threshold": p["vol_shrink_ratio"],
-        },
-    ]
-    # 4. 可选: RSI 不超卖（避免接飞刀）
-    if p.get("use_rsi_filter"):
-        entry_rules.append({
-            "indicator": "rsi",
-            "params": {"period": p["rsi_period"], "threshold": p["rsi_min"]},
-            "operator": ">",
-        })
-    # 5. 可选: 价格在中期均线上方（趋势保护）
-    if p.get("use_ma_filter"):
-        entry_rules.append({
-            "indicator": "ma",
-            "params": {"period": p["ma_period"], "ma_type": "ema"},
-            "operator": "price_above",
-        })
-
-    return {
-        "name": f"DragonPB_{p['surge_min_pct']}pct_{p['pullback_min']}pb",
-        "entry_rules": entry_rules,
-        "position_config": {"initial_size_pct": 100, "leverage": 1, "max_pyramiding": 0},
-        "pyramiding_rules": {"enabled": False},
-        "risk_management": {
-            "stop_loss": {"enabled": True, "value": p.get("stop_loss_pct", 5.0)},
-            "trailing_stop": {"enabled": False},
-        },
-    }
-
-
-# ============================================================
-# 7. 尾盘抢筹隔夜溢价策略
+# 6. 尾盘抢筹隔夜溢价策略
 # ============================================================
 # 设计思路:
 #   买入: 尾盘确认收盘在当日最高位（close_position > 0.7）
@@ -597,40 +520,7 @@ LLM_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
         "build_config": _build_macd_vol_divergence_config,
     },
 
-    # ── 6. 龙回头（大涨后回调买入）──
-    # 大涨/涨停后回调缩量 → 卖压衰竭 → 二次启动
-    # 与 limitup_continuation 的区别: 追涨 vs 低吸
-    "dragon_pullback": {
-        "name": "龙回头",
-        "description": (
-            "大涨后回调缩量买入。大涨后获利盘涌出导致回调，但缩量说明卖压衰竭，"
-            "主力资金未撤退，二次启动概率高。"
-            "风险比追涨更低（回调后买入），收益潜力大（吃第二波拉升）。"
-        ),
-        "indicators": ["recent_surge", "dragon_pullback", "volume", "rsi", "ma"],
-        "params": {
-            "surge_lookback":   _p_int(5, 40, 1),
-            "surge_min_pct":    _p_float(2.0, 12.0, 0.5),
-            "high_lookback":    _p_int(5, 30, 1),
-            "pullback_min":     _p_float(0.01, 0.10, 0.01),
-            "pullback_max":     _p_float(0.08, 0.30, 0.01),
-            "vol_ma_period":    _p_int(3, 25, 1),
-            "vol_shrink_ratio": _p_float(0.3, 1.2, 0.05),
-            "use_rsi_filter":   _p_choice([True, False]),
-            "rsi_period":       _p_int(6, 25, 1),
-            "rsi_min":          _p_int(15, 50, 1),
-            "use_ma_filter":    _p_choice([True, False]),
-            "ma_period":        _p_int(10, 80, 5),
-            "stop_loss_pct":    _p_float(2.0, 12.0, 0.5),
-        },
-
-        "constraints": [
-            ("pullback_min", "<", "pullback_max"),  # 最小回撤 < 最大回撤
-        ],
-        "build_config": _build_dragon_pullback_config,
-    },
-
-    # ── 7. 尾盘抢筹隔夜溢价 ──
+    # ── 6. 尾盘抢筹隔夜溢价 ──
     # 尾盘确认强度 → 次日开盘卖出（除非涨停封板则持有）
     # 核心: 收盘在高位 + 放量 = 主力抢筹信号 → 次日高开概率大
     "close_strength_overnight": {

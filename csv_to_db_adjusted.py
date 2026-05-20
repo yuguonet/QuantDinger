@@ -3,9 +3,9 @@
 CSV → 前复权 → db_market 批量导入脚本
 
 功能:
-  1. 读取 optimizer_output/CNStock/ 下的 CSV 文件
-  2. 通过 TDX 除权除息数据构建前复权因子
-  3. 将不复权数据转为前复权后写入 PostgreSQL (db_market)
+  1. 读取 optimizer_output/CNStock/ 下的 CSV 文件 (source=csv)
+  2. 或直接从 baostock 下载前复权数据 (source=baostock)
+  3. 写入 PostgreSQL (db_market)
 
 支持:
   - 日线 (daily/*.csv) — 若已是前复权则直接写入，否则复权后写入
@@ -13,11 +13,11 @@ CSV → 前复权 → db_market 批量导入脚本
 
 用法:
   cd QuantDinger-main
-  python csv_to_db_adjusted.py                          # 默认导入所有周期
+  python csv_to_db_adjusted.py                          # 默认导入所有周期 (CSV)
   python csv_to_db_adjusted.py -T 1D                    # 只导日线
-  python csv_to_db_adjusted.py -T 15m                   # 只导15分钟线
-  python csv_to_db_adjusted.py -T all                   # 全部周期
-  python csv_to_db_adjusted.py -T 15m --csv-dir /path   # 指定CSV目录
+  python csv_to_db_adjusted.py --source baostock         # 从 baostock 下载前复权日线写库
+  python csv_to_db_adjusted.py --source baostock --dry-run  # 只对比不写入
+  python csv_to_db_adjusted.py --source baostock --codes 000001 000607  # 指定股票
   python csv_to_db_adjusted.py --dry-run                 # 只看不动
 """
 
@@ -127,18 +127,12 @@ CSV_DT_COL = {'daily': 'date', '1m': 'datetime', '5m': 'datetime',
 
 def read_csv_klines(csv_path: str, timeframe: str) -> list:
     """读取 CSV 文件，返回 kline 字典列表 [{"time", "open", "high", "low", "close", "volume"}, ...]"""
-    dt_col = CSV_DT_COL.get(timeframe, 'datetime')
+    dir_name = PERIOD_DIR.get(timeframe, timeframe)
+    dt_col = CSV_DT_COL.get(dir_name, 'datetime')
 
-    # 检测编码
-    try:
-        with open(csv_path, 'r', encoding='utf-8-sig') as f:
-            f.read(4096)
-        enc = 'utf-8-sig'
-    except (UnicodeDecodeError, UnicodeError):
-        enc = 'gbk'
-
+    # 统一用 utf-8-sig 打开（自动剥离 BOM，无 BOM 的文件也兼容）
     klines = []
-    with open(csv_path, 'r', encoding=enc) as f:
+    with open(csv_path, 'r', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f)
         for row in reader:
             dt_str = row.get(dt_col, '').strip()
@@ -181,34 +175,8 @@ def read_csv_klines(csv_path: str, timeframe: str) -> list:
 
 
 def is_likely_adjusted(klines: list, code: str) -> bool:
-    """启发式判断 CSV 数据是否已经是前复权。
-
-    平安银行(000001) 实际股价 ~10-12 元，前复权历史价格会到 1000+。
-    如果最新 close 远大于当前实际股价，大概率是前复权数据。
-
-    这里用简单规则: 最新 close > 100 → 认为是前复权（对银行股而言）。
-    更精确的做法是对比实时行情，但这里不需要那么复杂。
-    """
-    if not klines:
-        return False
-    latest = klines[-1]
-    # 大部分A股实际价格 < 100 元，前复权历史价经常 > 100
-    # 但这不是绝对的（茅台不复权也 > 1000），所以结合第一个 bar 的价格
-    # 如果第一个 bar 价格和最新 bar 差距不大（都在合理范围），可能是不复权
-    first_close = klines[0]["close"]
-    last_close = latest["close"]
-
-    # 如果价格看起来像真实股价（< 200），且波动合理，认为是不复权
-    # 如果价格很高（> 200），认为是前复权
-    if last_close > 200:
-        return True
-
-    # 对于价格在 100-200 之间的，看第一个 bar
-    # 前复权的 2021 年数据 close 通常 > 500（银行股）
-    if first_close > 300:
-        return True
-
-    return False
+    """CSV 文件统一为前复权数据，直接返回 True。"""
+    return True
 
 
 def query_db_klines(writer, market: str, code: str, timeframe: str,
@@ -282,6 +250,274 @@ def compare_overlap(csv_klines: list, db_data: dict, code: str) -> dict:
         "volume_max_diff_pct": max(vol_diffs) if vol_diffs else 0,
         "sample": samples,
     }
+
+
+def get_baostock_codes() -> list:
+    """获取全部沪深 A 股代码列表（纯数字，如 '000001'）"""
+    import baostock as bs
+
+    def _try_query(day_str: str) -> tuple:
+        """查询指定日期的股票列表，返回 (error_code, codes_list)"""
+        rs = bs.query_all_stock(day=day_str)
+        if rs.error_code != '0':
+            return rs.error_code, []
+        codes = []
+        while rs.next():
+            row = rs.get_row_data()
+            code = row[0]  # 格式: sh.600000 或 sz.000001
+            if code.startswith('sh.6') or code.startswith('sz.0') or code.startswith('sz.3'):
+                codes.append(code.split('.')[1])
+        return '0', codes
+
+    # 从今天开始往前找最近一个有数据的交易日（最多回溯30天）
+    for delta in range(0, 30):
+        d = datetime.now() - timedelta(days=delta)
+        day_str = d.strftime('%Y-%m-%d')
+        err, codes = _try_query(day_str)
+        if err == '0' and codes:
+            return codes
+        # 非交易日或无数据，继续往前
+
+    print(f"  ❌ 回溯30天均未获取到股票列表，baostock 接口可能异常")
+    return []
+
+
+def download_baostock_klines(code: str, start_date: str, end_date: str,
+                             max_retries: int = 3) -> list:
+    """从 baostock 下载单只股票的前复权日线数据（带重试）"""
+    import baostock as bs
+
+    # 补全前缀
+    if code.startswith('6'):
+        bs_code = f'sh.{code}'
+    else:
+        bs_code = f'sz.{code}'
+
+    for attempt in range(max_retries):
+        rs = bs.query_history_k_data_plus(
+            bs_code,
+            "date,open,high,low,close,volume",
+            start_date=start_date,
+            end_date=end_date,
+            frequency="d",
+            adjustflag="2",  # 前复权
+        )
+
+        if rs.error_code != '0':
+            if attempt < max_retries - 1:
+                time.sleep(1)
+                continue
+            return []
+
+        klines = []
+        while rs.next():
+            row = rs.get_row_data()
+            try:
+                dt = datetime.strptime(row[0], '%Y-%m-%d')
+                o = float(row[1])
+                h = float(row[2])
+                low = float(row[3])
+                c = float(row[4])
+                v = float(row[5]) if row[5] else 0
+            except (ValueError, TypeError, IndexError):
+                continue
+            if o == 0 and c == 0:
+                continue
+            klines.append({
+                "time": dt, "open": o, "high": h, "low": low,
+                "close": c, "volume": v,
+            })
+
+        # 正常返回数据，或者确实是空股票（退市等）
+        if klines or attempt >= max_retries - 1:
+            return klines
+
+        # 空结果但可能是限流，等一下重试
+        time.sleep(1.5)
+
+    return []
+
+
+def baostock_import(market: str, start_date: str, end_date: str,
+                    dry_run: bool = False, codes: list = None):
+    """从 baostock 下载前复权日线 → 对比/写入 db_market"""
+    import baostock as bs
+
+    login_result = bs.login()
+    if login_result.error_code != '0':
+        print(f"  ❌ baostock 登录失败: {login_result.error_msg}")
+        return
+    print(f"  ✅ baostock 登录成功")
+
+    # 获取股票列表
+    if codes:
+        stock_list = codes
+        print(f"  📊 指定股票: {stock_list}")
+    else:
+        print(f"  📊 获取全部 A 股代码...")
+        stock_list = get_baostock_codes()
+        print(f"     共 {len(stock_list)} 只")
+        if not stock_list:
+            print(f"  ❌ 获取股票列表为空，可能 baostock 接口异常")
+            bs.logout()
+            return
+
+    # 测试下载一只
+    test_code = stock_list[0]
+    test_klines = download_baostock_klines(test_code, start_date, end_date)
+    print(f"  🔍 测试 {test_code}: 下载 {len(test_klines)} 行")
+    if test_klines:
+        print(f"     首行: {test_klines[0]['time']} close={test_klines[0]['close']}")
+        print(f"     末行: {test_klines[-1]['time']} close={test_klines[-1]['close']}")
+    else:
+        print(f"  ❌ 测试下载为空，baostock 数据接口可能有问题")
+        bs.logout()
+        return
+
+    # 初始化 DB
+    mgr = get_market_db_manager()
+    writer = get_market_kline_writer()
+    has_db = mgr.market_db_exists(market)
+    if not has_db:
+        if dry_run:
+            print(f"  ⚠️  数据库 {market} 不存在，跳过对比")
+        else:
+            mgr.ensure_market_db(market)
+
+    # 统计
+    success = 0
+    fail = 0
+    total_rows = 0
+    overlap_ok = 0
+    overlap_mismatch = 0
+    no_overlap = 0
+    max_diff_overall = 0
+    total_overlap_rows = 0
+    t0 = time.time()
+    total = len(stock_list)
+
+    for i, code in enumerate(stock_list):
+        try:
+            klines = download_baostock_klines(code, start_date, end_date)
+            if not klines:
+                fail += 1
+                continue
+
+            if dry_run:
+                # 对比模式
+                csv_start = klines[0]["time"]
+                csv_end = klines[-1]["time"]
+                close_range = f"{klines[0]['close']:.2f}~{klines[-1]['close']:.2f}"
+
+                compare_info = ""
+                if has_db:
+                    try:
+                        db_data = query_db_klines(writer, market, code, '1D', csv_start, csv_end)
+                        if db_data:
+                            cmp = compare_overlap(klines, db_data, code)
+                            if cmp["overlap_rows"] > 0:
+                                total_overlap_rows += cmp["overlap_rows"]
+                                max_diff_overall = max(max_diff_overall, cmp["close_max_diff"])
+                                if cmp["close_max_diff"] < 0.02:
+                                    overlap_ok += 1
+                                    diff_tag = "✅"
+                                else:
+                                    overlap_mismatch += 1
+                                    diff_tag = "⚠️"
+                                compare_info = (
+                                    f"  重叠{cmp['overlap_rows']}行 "
+                                    f"close差: max={cmp['close_max_diff']:.4f} avg={cmp['close_avg_diff']:.4f} "
+                                    f"{diff_tag}"
+                                )
+                                if cmp["sample"]:
+                                    compare_info += "\n    差异TOP: "
+                                    for t, csv_c, db_c, d in cmp["sample"][:3]:
+                                        compare_info += f"{t.strftime('%m-%d')} csv={csv_c:.2f} db={db_c:.2f} Δ{d:.4f}  "
+                            else:
+                                no_overlap += 1
+                                compare_info = "  DB有数据但无重叠时间点"
+                        else:
+                            no_overlap += 1
+                            compare_info = "  DB无此股票数据"
+                    except Exception as e:
+                        compare_info = f"  DB查询失败: {e}"
+
+                print(f"\n  [{i+1}/{total}] {code}.csv")
+                print(f"    {len(klines)} 行 | 已前复权 | close: {close_range}")
+                print(f"    日期: {klines[0]['time'].strftime('%Y-%m-%d')} ~ {klines[-1]['time'].strftime('%Y-%m-%d')}")
+                if compare_info:
+                    print(f"    {compare_info}")
+                success += 1
+
+            else:
+                # 正式写入模式
+                if not has_db:
+                    mgr.ensure_market_db(market)
+                    has_db = True
+
+                records = []
+                for bar in klines:
+                    dt = bar["time"]
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=_TZ_SH)
+                    dt = dt.replace(tzinfo=None)
+                    records.append({
+                        "symbol": code,
+                        "timeframe": "1D",
+                        "time": dt,
+                        "open": bar["open"],
+                        "high": bar["high"],
+                        "low": bar["low"],
+                        "close": bar["close"],
+                        "volume": bar.get("volume", 0),
+                    })
+
+                if records:
+                    result = writer.bulk_write(market, records, batch_size=5000)
+                    inserted = result.get("inserted", 0)
+                    total_rows += inserted
+                    success += 1
+                else:
+                    fail += 1
+
+        except Exception as e:
+            fail += 1
+            if fail <= 5:
+                print(f"  ❌ {code}: {e}")
+
+        # 请求间隔，避免 baostock 限流
+        time.sleep(0.25)
+
+        # 进度
+        if (i + 1) % 100 == 0 or (i + 1) == total:
+            elapsed = time.time() - t0
+            print(f"\r  进度: {i+1}/{total}  ✅ {success} ❌ {fail}  "
+                  f"行数: {total_rows:,}  耗时: {elapsed:.0f}s",
+                  end='', flush=True)
+
+    bs.logout()
+    elapsed = time.time() - t0
+
+    print(f"\n\n{'='*60}")
+    if dry_run:
+        print(f"  📋 DRY RUN 汇总 (baostock 前复权日线)")
+        print(f"{'='*60}")
+        print(f"  总股票数:     {total}")
+        print(f"  成功下载:     {success}")
+        if has_db:
+            print(f"  ────────────────────────────────")
+            print(f"  重叠段对比:")
+            print(f"    ✅ 误差 < 0.02:  {overlap_ok} 只")
+            print(f"    ⚠️  误差 ≥ 0.02:  {overlap_mismatch} 只")
+            print(f"    无重叠/无数据:   {no_overlap} 只")
+            print(f"    总重叠行数:     {total_overlap_rows:,}")
+            print(f"    最大close差:    {max_diff_overall:.4f}")
+    else:
+        print(f"  ✅ 写入完成!")
+        print(f"  成功: {success}  失败: {fail}")
+        print(f"  总写入行数: {total_rows:,}")
+        print(f"  耗时: {elapsed:.1f}s ({elapsed/60:.1f}分钟)")
+    print(f"{'='*60}")
 
 
 def adjust_and_write(csv_dir: str, timeframe: str, market: str, dry_run: bool = False, workers: int = 4):
@@ -509,6 +745,18 @@ def main():
         description='CSV → 前复权 → db_market 批量导入',
         formatter_class=argparse.RawTextHelpFormatter,
     )
+    ap.add_argument('--source',
+        choices=['csv', 'baostock'],
+        default='csv',
+        help='数据源 (默认 csv; baostock=直接下载前复权日线)')
+    ap.add_argument('--start-date',
+        default='2021-01-01',
+        help='baostock 起始日期 (默认 2021-01-01)')
+    ap.add_argument('--end-date',
+        default=datetime.now().strftime('%Y-%m-%d'),
+        help='baostock 结束日期 (默认今天)')
+    ap.add_argument('--codes', nargs='+', default=None,
+        help='baostock 指定股票代码 (如 000001 000607)')
     ap.add_argument('--type', '-T',
         choices=['1D', '1m', '5m', '15m', '30m', '60m', 'all'],
         default='all',
@@ -544,20 +792,24 @@ def main():
 
     print(f"""
 ╔═══════════════════════════════════════════════════╗
-║  📦 CSV → 前复权 → db_market 批量导入              ║
+║  📦 前复权数据 → db_market 批量导入                ║
 ╠═══════════════════════════════════════════════════╣
-║  CSV目录: {csv_dir:<36}║
+║  数据源:  {args.source:<36}║
 ║  市场:    {args.market:<36}║
 ╚═══════════════════════════════════════════════════╝
 """)
 
-    if args.type == 'all':
-        periods = ['1D', '1m', '5m', '15m', '30m', '60m']
+    if args.source == 'baostock':
+        baostock_import(args.market, args.start_date, args.end_date,
+                        args.dry_run, args.codes)
     else:
-        periods = [args.type]
+        if args.type == 'all':
+            periods = ['1D', '1m', '5m', '15m', '30m', '60m']
+        else:
+            periods = [args.type]
 
-    for tf in periods:
-        adjust_and_write(csv_dir, tf, args.market, args.dry_run, args.workers)
+        for tf in periods:
+            adjust_and_write(csv_dir, tf, args.market, args.dry_run, args.workers)
 
     print(f"\n{'='*55}")
     print(f"  ✅ 全部完成!")

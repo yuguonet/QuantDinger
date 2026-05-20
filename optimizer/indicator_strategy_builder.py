@@ -205,6 +205,26 @@ raw_sell = ({sell_expr})
 df['buy'] = (raw_buy.fillna(False) & (~raw_buy.shift(1).fillna(False))).astype(bool)
 df['sell'] = (raw_sell.fillna(False) & (~raw_sell.shift(1).fillna(False))).astype(bool)
 
+# ── A 股 T+1 过滤: 买入后不能立即卖出 ──
+# 买入信号在 bar i 产生 → 回测引擎在 bar i+1 open 成交 → bar i+1 为 T+1 日不能卖
+# 需要屏蔽买入信号后 1 根 bar 内的 sell 信号
+_trade_dir = '{trade_direction}'
+if _trade_dir in ('long', 'both', ''):
+    _t1_mask = pd.Series(False, index=df.index)
+    _buy_positions = df.index[df['buy']]
+    for _bi in _buy_positions:
+        _pos = df.index.get_loc(_bi)
+        # 屏蔽 T+1 日（买入后 1 根 bar）的卖出信号
+        if isinstance(_pos, int):
+            _t1_end = min(_pos + 1 + 1, len(df))
+            _t1_mask.iloc[_pos + 1:_t1_end] = True
+        else:
+            # slice (MultiIndex)
+            _start = _pos.start + 1 if hasattr(_pos, 'start') else _pos + 1
+            _end = min(_start + 1, len(df))
+            _t1_mask.iloc[_start:_end] = True
+    df['sell'] = df['sell'] & ~_t1_mask
+
 # ── 图表标记 ──
 buy_marks = [df['low'].iloc[i] * 0.995 if df['buy'].iloc[i] else None for i in range(len(df))]
 sell_marks = [df['high'].iloc[i] * 1.005 if df['sell'].iloc[i] else None for i in range(len(df))]

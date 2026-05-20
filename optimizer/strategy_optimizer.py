@@ -39,7 +39,7 @@ class StrategyOptimizer:
 
     用法:
         optimizer = StrategyOptimizer(
-            template_key="ma_crossover",
+            template_key="dual_ma_volume",
             objective_fn=my_backtest_fn,
             n_trials=100,
         )

@@ -26,73 +26,6 @@ def _p_choice(choices: list) -> dict:
 # IndicatorStrategy 代码生成（新标准）
 # ============================================================
 
-def _build_ma_crossover_strategy(p: dict) -> str:
-    fast_type = p.get("fast_type", "ema")
-    slow_type = p.get("slow_type", "sma")
-    fast_period = int(p["fast_period"])
-    slow_period = int(p["slow_period"])
-    use_rsi = p.get("use_rsi_filter", False)
-    rsi_period = int(p.get("rsi_period", 14))
-    rsi_lower = int(p.get("rsi_lower", 30))
-
-    params_decl = [
-        f"@param fast_period int {fast_period} 快线周期",
-        f"@param slow_period int {slow_period} 慢线周期",
-        f"@param fast_type str {fast_type} 快线类型 (sma/ema)",
-        f"@param slow_type str {slow_type} 慢线类型 (sma/ema)",
-    ]
-    if use_rsi:
-        params_decl.append(f"@param rsi_period int {rsi_period} RSI 周期")
-        params_decl.append(f"@param rsi_lower int {rsi_lower} RSI 下限")
-
-    ind_code = f"""fast_len = int(params.get('fast_period', {fast_period}))
-slow_len = int(params.get('slow_period', {slow_period}))
-fast_type = str(params.get('fast_type', '{fast_type}'))
-slow_type = str(params.get('slow_type', '{slow_type}'))
-
-if fast_type == 'ema':
-    ma_fast = df['close'].ewm(span=fast_len, adjust=False).mean()
-else:
-    ma_fast = df['close'].rolling(window=fast_len).mean()
-
-if slow_type == 'ema':
-    ma_slow = df['close'].ewm(span=slow_len, adjust=False).mean()
-else:
-    ma_slow = df['close'].rolling(window=slow_len).mean()"""
-
-    buy_expr = "(ma_fast > ma_slow) & (ma_fast.shift(1) <= ma_slow.shift(1))"
-    sell_expr = "(ma_fast < ma_slow) & (ma_fast.shift(1) >= ma_slow.shift(1))"
-
-    if use_rsi:
-        ind_code += f"""
-rsi_period = int(params.get('rsi_period', {rsi_period}))
-rsi_lower = int(params.get('rsi_lower', {rsi_lower}))
-delta = df['close'].diff()
-gain = delta.clip(lower=0).ewm(alpha=1/rsi_period, adjust=False).mean()
-loss = (-delta.clip(upper=0)).ewm(alpha=1/rsi_period, adjust=False).mean()
-rs = gain / loss.replace(0, np.nan)
-rsi = 100 - (100 / (1 + rs))"""
-        buy_expr += " & (rsi > rsi_lower)"
-
-    plots = [
-        {"name": f"MA Fast ({fast_type} {fast_period})", "data": "ma_fast.fillna(0).tolist()", "color": "#1890ff"},
-        {"name": f"MA Slow ({slow_type} {slow_period})", "data": "ma_slow.fillna(0).tolist()", "color": "#faad14"},
-    ]
-
-    from optimizer.indicator_strategy_builder import render_indicator_strategy
-    return render_indicator_strategy(
-        name=f"MA_Cross_{fast_type}{fast_period}_{slow_type}{slow_period}",
-        description=f"均线交叉策略: {fast_type.upper()}{fast_period} 上穿 {slow_type.upper()}{slow_period} 做多，下穿做空。"
-                    + (f" RSI({rsi_period})>{rsi_lower} 过滤。" if use_rsi else ""),
-        params_decl=params_decl,
-        strategy_defaults={"stopLossPct": 0.05, "takeProfitPct": 0.10, "tradeDirection": "long"},
-        indicator_code=ind_code,
-        buy_expr=buy_expr,
-        sell_expr=sell_expr,
-        plots=plots,
-    )
-
-
 def _build_rsi_oversold_strategy(p: dict) -> str:
     rsi_period = int(p["rsi_period"])
     oversold = int(p["oversold"])
@@ -399,21 +332,6 @@ rsi_slow = 100 - (100 / (1 + rs2))"""
 # 向后兼容：JSON config → StrategyCompiler 格式（逐步废弃）
 # ============================================================
 
-def _build_ma_crossover_config(p: dict) -> dict:
-    fast_type = p.get("fast_type", "ema")
-    slow_type = p.get("slow_type", "sma")
-    use_rsi = p.get("use_rsi_filter", False)
-    entry_rules = [
-        {"indicator": "ma", "params": {"period": p["fast_period"], "ma_type": fast_type}, "operator": "cross_up"},
-        {"indicator": "ma", "params": {"period": p["slow_period"], "ma_type": slow_type}, "operator": "price_above"},
-    ]
-    if use_rsi:
-        entry_rules.append({"indicator": "rsi", "params": {"period": p.get("rsi_period", 14), "threshold": p.get("rsi_lower", 30)}, "operator": ">"})
-    return {"name": f"MA_Cross_{fast_type}{p['fast_period']}_{slow_type}{p['slow_period']}", "entry_rules": entry_rules,
-            "position_config": {"initial_size_pct": 100, "leverage": 1, "max_pyramiding": 0},
-            "pyramiding_rules": {"enabled": False},
-            "risk_management": {"stop_loss": {"enabled": False, "value": 0}, "trailing_stop": {"enabled": False}}}
-
 def _build_rsi_oversold_config(p: dict) -> dict:
     use_confirm = p.get("use_confirm", False)
     entry_rules = [{"indicator": "rsi", "params": {"period": p["rsi_period"], "threshold": p["oversold"]}, "operator": "cross_up"}]
@@ -470,27 +388,7 @@ def _build_dual_rsi_config(p: dict) -> dict:
 
 STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
 
-    # ── 1. 均线交叉 ──
-    "ma_crossover": {
-        "name": "均线交叉策略",
-        "description": "快线上穿慢线做多，下穿做空。可叠加 RSI 过滤。",
-        "indicators": ["ma", "rsi"],
-        "params": {
-            "fast_period":    _p_int(5, 50, 1),
-            "slow_period":    _p_int(20, 200, 1),
-            "fast_type":      _p_choice(["sma", "ema"]),
-            "slow_type":      _p_choice(["sma", "ema"]),
-            "use_rsi_filter": _p_choice([True, False]),
-            "rsi_period":     _p_int(7, 21, 1),
-            "rsi_lower":      _p_int(20, 40, 1),
-            "rsi_upper":      _p_int(60, 80, 1),
-        },
-        "constraints": [("fast_period", "<", "slow_period")],
-        "build_config":   _build_ma_crossover_config,
-        "build_strategy": _build_ma_crossover_strategy,
-    },
-
-    # ── 2. RSI 超卖反弹 ──
+    # ── 1. RSI 超卖反弹 ──
     "rsi_oversold": {
         "name": "RSI 超卖反弹",
         "description": "RSI 跌破超卖线后回升买入，超买时卖出。",

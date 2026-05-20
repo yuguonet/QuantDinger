@@ -10,8 +10,7 @@ A 股扩展策略模板
   1. atr_breakout        - ATR 波动率突破（海龟交易法变体）
   2. volume_price_div    - 量价背离策略
   3. dual_ma_volume      - 双均线+成交量确认
-  4. bollinger_rsi_squeeze - 布林带收缩+RSI 过滤
-  5. macd_kdj_resonance  - MACD+KDJ 共振
+  4. macd_kdj_resonance  - MACD+KDJ 共振
   6. price_channel        - 价格通道突破
   7. turtle_trading       - 海龟交易法（完整版）
   8. vwap_deviation       - VWAP 偏离策略
@@ -148,43 +147,68 @@ def _build_dual_ma_volume_config(p: dict) -> dict:
     }
 
 
-# ============================================================
-# 4. 布林带收缩 + RSI 过滤
-# ============================================================
+def _build_dual_ma_volume_strategy(p: dict) -> str:
+    """双均线量能确认 — IndicatorStrategy 标准格式"""
+    fast_type = p.get("fast_type", "ema")
+    slow_type = p.get("slow_type", "sma")
+    fast_period = int(p["fast_period"])
+    slow_period = int(p["slow_period"])
+    vol_ma_period = int(p.get("vol_ma_period", 20))
+    vol_ratio = float(p.get("vol_ratio", 1.5))
+    stop_loss = float(p.get("stop_loss_pct", 5.0))
 
-def _build_bollinger_rsi_squeeze_config(p: dict) -> dict:
-    """布林带带宽收窄到低位 + RSI 脱离超卖区 → 突破入场"""
-    entry_rules = [
-        {
-            "indicator": "bollinger_bandwidth",
-            "params": {
-                "period": p["bb_period"],           # 编译器期望 'period'
-                "std_dev": p["bb_std"],             # 编译器期望 'std_dev'
-                "squeeze_percentile": p["squeeze_percentile"],
-            },
-            "operator": "below_percentile",
-        },
-        {
-            "indicator": "rsi",
-            "params": {"period": p["rsi_period"], "threshold": p["rsi_exit_oversold"]},
-            "operator": "cross_up",
-        },
+    params_decl = [
+        f"@param fast_period int {fast_period} 快线周期",
+        f"@param slow_period int {slow_period} 慢线周期",
+        f"@param fast_type str {fast_type} 快线类型 (sma/ema)",
+        f"@param slow_type str {slow_type} 慢线类型 (sma/ema)",
+        f"@param vol_ma_period int {vol_ma_period} 量能均线周期",
+        f"@param vol_ratio float {vol_ratio} 量比阈值",
     ]
 
-    return {
-        "name": f"BB_RSI_Squeeze_{p['bb_period']}_{p['bb_std']}",
-        "entry_rules": entry_rules,
-        "position_config": {"initial_size_pct": 100, "leverage": 1, "max_pyramiding": 0},
-        "pyramiding_rules": {"enabled": False},
-        "risk_management": {
-            "stop_loss": {"enabled": True, "value": p.get("stop_loss_pct", 5.0)},
-            "trailing_stop": {"enabled": False},
-        },
-    }
+    ind_code = f"""fast_len = int(params.get('fast_period', {fast_period}))
+slow_len = int(params.get('slow_period', {slow_period}))
+fast_type = str(params.get('fast_type', '{fast_type}'))
+slow_type = str(params.get('slow_type', '{slow_type}'))
+vol_ma_period = int(params.get('vol_ma_period', {vol_ma_period}))
+vol_ratio = float(params.get('vol_ratio', {vol_ratio}))
+
+if fast_type == 'ema':
+    ma_fast = df['close'].ewm(span=fast_len, adjust=False).mean()
+else:
+    ma_fast = df['close'].rolling(window=fast_len).mean()
+
+if slow_type == 'ema':
+    ma_slow = df['close'].ewm(span=slow_len, adjust=False).mean()
+else:
+    ma_slow = df['close'].rolling(window=slow_len).mean()
+
+vol_ma = df['volume'].rolling(window=vol_ma_period).mean()
+vol_ratio_cur = df['volume'] / vol_ma.replace(0, np.nan)"""
+
+    buy_expr = "(ma_fast > ma_slow) & (ma_fast.shift(1) <= ma_slow.shift(1)) & (vol_ratio_cur > vol_ratio)"
+    sell_expr = "(ma_fast < ma_slow) & (ma_fast.shift(1) >= ma_slow.shift(1))"
+
+    plots = [
+        {"name": f"MA Fast ({fast_type} {fast_period})", "data": "ma_fast.fillna(0).tolist()", "color": "#1890ff"},
+        {"name": f"MA Slow ({slow_type} {slow_period})", "data": "ma_slow.fillna(0).tolist()", "color": "#faad14"},
+    ]
+
+    from optimizer.indicator_strategy_builder import render_indicator_strategy
+    return render_indicator_strategy(
+        name=f"DualMA_Vol_{fast_type}{fast_period}_{slow_type}{slow_period}",
+        description=f"双均线量能确认: {fast_type.upper()}{fast_period} 上穿 {slow_type.upper()}{slow_period} + 量比>{vol_ratio} 做多，下穿做空。",
+        params_decl=params_decl,
+        strategy_defaults={"stopLossPct": stop_loss / 100, "takeProfitPct": 0.10, "tradeDirection": "long"},
+        indicator_code=ind_code,
+        buy_expr=buy_expr,
+        sell_expr=sell_expr,
+        plots=plots,
+    )
 
 
 # ============================================================
-# 5. MACD + KDJ 共振
+# 4. MACD + KDJ 共振
 # ============================================================
 
 def _build_macd_kdj_resonance_config(p: dict) -> dict:
@@ -461,26 +485,10 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             ("fast_period", "<", "slow_period"),
         ],
         "build_config": _build_dual_ma_volume_config,
+        "build_strategy": _build_dual_ma_volume_strategy,
     },
 
-    # ── 4. 布林带收缩 + RSI ──
-    "bollinger_rsi_squeeze": {
-        "name": "布林带收缩+RSI 突破",
-        "description": "布林带带宽收窄至低位（蓄势），RSI 脱离超卖区时入场。A 股横盘突破常用形态。",
-        "indicators": ["bollinger", "rsi"],
-        "params": {
-            "bb_period":          _p_int(10, 30, 1),
-            "bb_std":             _p_float(1.5, 3.0, 0.1),
-            "squeeze_percentile": _p_int(10, 30, 5),
-            "rsi_period":         _p_int(7, 21, 1),
-            "rsi_exit_oversold":  _p_int(25, 45, 1),
-            "stop_loss_pct":      _p_float(3.0, 8.0, 0.5),
-        },
-        "constraints": [],
-        "build_config": _build_bollinger_rsi_squeeze_config,
-    },
-
-    # ── 5. MACD + KDJ 共振 ──
+    # ── 4. MACD + KDJ 共振 ──
     "macd_kdj_resonance": {
         "name": "MACD+KDJ 共振",
         "description": "MACD 金叉与 KDJ 金叉共振确认，双重指标过滤假信号。A 股技术派常用组合。",

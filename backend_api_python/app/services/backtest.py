@@ -711,6 +711,10 @@ class BacktestService:
         trailing_enabled = bool(trailing_cfg.get('enabled'))
         trailing_pct = float(trailing_cfg.get('pct') or 0.0)
         trailing_activation_pct = float(trailing_cfg.get('activationPct') or 0.0)
+
+        # A 股规则（用于最小交易单位）
+        _ashare = cfg.get('ashare_rules', {})
+        _ashare_t1 = bool(_ashare.get('t_plus_1', False))
         
         lev = max(int(leverage or 1), 1)
         stop_loss_pct_eff = stop_loss_pct / lev if stop_loss_pct > 0 else 0
@@ -1270,6 +1274,12 @@ class BacktestService:
                         use_capital = capital * entry_pct_cfg
                         if exec_price > 0:
                             shares = (use_capital * lev) / exec_price
+                            # A 股最小交易单位: 100 股为一手
+                            if _ashare_t1:
+                                shares = int(shares / 100) * 100
+                                if shares <= 0:
+                                    pending_signal = None
+                                    continue
                         else:
                             logger.warning(f"Invalid exec_price={exec_price} at {timestamp}, skipping open_long")
                             pending_signal = None
@@ -1361,6 +1371,12 @@ class BacktestService:
                         use_capital = capital * entry_pct_cfg
                         if exec_price > 0:
                             shares = (use_capital * lev) / exec_price
+                            # A 股最小交易单位: 100 股为一手
+                            if _ashare_t1:
+                                shares = int(shares / 100) * 100
+                                if shares <= 0:
+                                    pending_signal = None
+                                    continue
                         else:
                             logger.warning(f"Invalid exec_price={exec_price} at {timestamp}, skipping open_short")
                             pending_signal = None
@@ -2558,7 +2574,22 @@ class BacktestService:
         # Add position price (if indicator provides)
         add_long_price_arr = signals.get('add_long_price', pd.Series([0.0] * len(df))).values
         add_short_price_arr = signals.get('add_short_price', pd.Series([0.0] * len(df))).values
-        
+
+        # ── A 股规则: T+1 + 涨跌停（通过 strategy_config.ashare_rules 传入）──
+        _ashare = (strategy_config or {}).get('ashare_rules', {})
+        _ashare_t1 = bool(_ashare.get('t_plus_1', False))
+        _ashare_limit_pct = float(_ashare.get('limit_pct', 0.10))
+        _ashare_entry_bar = -1         # 实际成交的 bar index
+        _ashare_pending_exit = False   # 因 T+1 或跌停被阻的卖出意向
+
+        # 预计算涨跌停价（向量化）
+        _close_arr = df['close'].values
+        _open_arr = df['open'].values
+        _prev_close = np.roll(_close_arr, 1)
+        _prev_close[0] = _open_arr[0]
+        _limit_up_prices = _prev_close * (1 + _ashare_limit_pct)
+        _limit_down_prices = _prev_close * (1 - _ashare_limit_pct)
+
         for i, (timestamp, row) in enumerate(df.iterrows()):
             # 爆仓后直接停止回测，输出结果
             if is_liquidated:
@@ -2733,8 +2764,35 @@ class BacktestService:
                         equity_curve.append({'time': timestamp.strftime('%Y-%m-%d %H:%M'), 'value': round(capital, 2)})
                         continue
             
+            # ── A 股: 记录建仓 bar（用于 T+1）──
+            if _ashare_t1:
+                # 检测建仓：position 从 0 变为非 0
+                if position != 0 and _ashare_entry_bar < 0:
+                    _ashare_entry_bar = i
+                elif position == 0:
+                    _ashare_entry_bar = -1
+                    _ashare_pending_exit = False
+
+            # ── A 股: 涨跌停价格（用于本 bar 的检查）──
+            if _ashare_t1:
+                _is_limit_up = _open_arr[i] >= _limit_up_prices[i] * 0.998
+                _is_limit_down = _open_arr[i] <= _limit_down_prices[i] * 1.002
+
             # Handle exit signals (priority, SL/TP)
-            if position > 0 and close_long_arr[i]:
+            # A 股: T+1 + 涨跌停检查（预计算，不破坏 elif 链）
+            _exit_blocked = False
+            if _ashare_t1 and position != 0:
+                _days_held = i - _ashare_entry_bar if _ashare_entry_bar >= 0 else 999
+                if _days_held < 1:
+                    _exit_blocked = True
+                elif position > 0 and _is_limit_down:
+                    _exit_blocked = True  # 多头卖出: 跌停卖不出
+                elif position < 0 and _is_limit_up:
+                    _exit_blocked = True  # 空头平仓: 涨停买不回
+                if _exit_blocked:
+                    _ashare_pending_exit = True
+
+            if position > 0 and (close_long_arr[i] or _ashare_pending_exit) and not _exit_blocked:
                 # Close long: use indicator price or close
                 if signal_timing in ['next_bar_open', 'next_open', 'nextopen', 'next']:
                     target_price = open_
@@ -2746,10 +2804,6 @@ class BacktestService:
                 capital += profit
                 total_commission_paid += commission_fee
 
-                # NOTE:
-                # This is a "signal close" (not a forced stop-loss/take-profit/trailing exit).
-                # Do NOT label it as *_stop/*_profit based on PnL sign, otherwise it looks like a stop-loss happened
-                # even when risk controls are disabled (stopLossPct/takeProfitPct == 0).
                 trade_type = 'close_long'
 
                 trades.append({
@@ -2760,16 +2814,17 @@ class BacktestService:
                     'profit': round(profit, 2),
                     'balance': round(max(0, capital), 2)
                 })
-                
+
                 position = 0
                 position_type = None
                 liquidation_price = 0
                 highest_since_entry = None
                 lowest_since_entry = None
+                _ashare_entry_bar = -1
+                _ashare_pending_exit = False
                 trend_add_times = dca_add_times = trend_reduce_times = adverse_reduce_times = 0
                 last_trend_add_anchor = last_dca_add_anchor = last_trend_reduce_anchor = last_adverse_reduce_anchor = None
 
-                # Stop if balance too low after exit
                 if capital < min_capital_to_trade:
                     is_liquidated = True
                     liquidation_loss = self._liquidation_loss(capital)
@@ -2782,8 +2837,8 @@ class BacktestService:
                         'profit': liquidation_loss,
                         'balance': 0
                     })
-            
-            elif position < 0 and close_short_arr[i]:
+
+            elif position < 0 and (close_short_arr[i] or _ashare_pending_exit) and not _exit_blocked:
                 # Close short: use indicator price or close
                 if signal_timing in ['next_bar_open', 'next_open', 'nextopen', 'next']:
                     target_price = open_
@@ -2832,6 +2887,8 @@ class BacktestService:
                 liquidation_price = 0
                 highest_since_entry = None
                 lowest_since_entry = None
+                _ashare_entry_bar = -1
+                _ashare_pending_exit = False
                 trend_add_times = dca_add_times = trend_reduce_times = adverse_reduce_times = 0
                 last_trend_add_anchor = last_dca_add_anchor = last_trend_reduce_anchor = last_adverse_reduce_anchor = None
 
@@ -3145,20 +3202,24 @@ class BacktestService:
                     position_pct = position_size_arr[i] if position_size_arr[i] > 0 else 0.1
                     use_capital = capital * position_pct
                     shares = (use_capital * leverage) / exec_price
+                    if _ashare_t1:
+                        shares = int(shares / 100) * 100
+                        if shares <= 0:
+                            continue
                     commission_fee = shares * exec_price * commission
-                    
+
                     # Update average cost
                     total_cost_before = position * entry_price
                     total_cost_after = total_cost_before + shares * exec_price
                     position += shares
                     entry_price = total_cost_after / position
-                    
+
                     capital -= commission_fee
                     total_commission_paid += commission_fee
-                    
+
                     # Recalculate liquidation price
                     liquidation_price = entry_price * (1 - 1.0 / leverage)
-                    
+
                     trades.append({
                         'time': timestamp.strftime('%Y-%m-%d %H:%M'),
                         'type': 'add_long',
@@ -3167,16 +3228,20 @@ class BacktestService:
                         'profit': 0,
                         'balance': round(max(0, capital), 2)
                     })
-                
+
                 elif position < 0 and add_short_arr[i] and capital >= min_capital_to_trade:
                     # Add short: use indicator price or close
                     target_price = add_short_price_arr[i] if add_short_price_arr[i] > 0 else close
                     exec_price = target_price * (1 - slippage)
-                    
+
                     # Use specified pct to add
                     position_pct = position_size_arr[i] if position_size_arr[i] > 0 else 0.1
                     use_capital = capital * position_pct
                     shares = (use_capital * leverage) / exec_price
+                    if _ashare_t1:
+                        shares = int(shares / 100) * 100
+                        if shares <= 0:
+                            continue
                     commission_fee = shares * exec_price * commission
                     
                     # Update average cost
@@ -3207,7 +3272,9 @@ class BacktestService:
             both_mode_active = signals.get('_both_mode', False)
             
             # open_long: can execute when position==0, OR when both_mode and position<0 (auto-close short first)
-            if open_long_arr[i] and (position == 0 or (both_mode_active and position < 0)) and capital >= min_capital_to_trade:
+            # A 股: 涨停封板时买不进
+            _entry_blocked = _ashare_t1 and _is_limit_up
+            if open_long_arr[i] and not _entry_blocked and (position == 0 or (both_mode_active and position < 0)) and capital >= min_capital_to_trade:
                     # In both mode with short position, close it first
                     if both_mode_active and position < 0:
                         shares_to_close = abs(position)
@@ -3333,7 +3400,8 @@ class BacktestService:
                             continue
             
             # open_short: can execute when position==0, OR when both_mode and position>0 (auto-close long first)
-            elif open_short_arr[i] and (position == 0 or (both_mode_active and position > 0)) and capital >= min_capital_to_trade:
+            # A 股: 跌停封板时做空开仓也受影响
+            elif open_short_arr[i] and not (_ashare_t1 and _is_limit_down) and (position == 0 or (both_mode_active and position > 0)) and capital >= min_capital_to_trade:
                     # In both mode with long position, close it first
                     if both_mode_active and position > 0:
                         close_price = open_ * (1 - slippage)
