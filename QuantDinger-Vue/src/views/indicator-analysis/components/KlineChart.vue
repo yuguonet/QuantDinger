@@ -2193,7 +2193,7 @@ registerOverlay({
               market: props.market,
               symbol: props.symbol,
               timeframe: props.timeframe,
-              limit: 500
+              limit: 1000
             }
           })
 
@@ -2344,7 +2344,7 @@ registerOverlay({
             market: props.market,
             symbol: props.symbol,
             timeframe: props.timeframe,
-            limit: 500,
+            limit: 1000,
             before_time: beforeTime // 获取此时间之前的数据
           }
         })
@@ -2472,7 +2472,7 @@ registerOverlay({
             market: props.market,
             symbol: props.symbol,
             timeframe: props.timeframe,
-            limit: 500,
+            limit: 1000,
             before_time: earliestTime // 获取此时间之前的数据
           }
         })
