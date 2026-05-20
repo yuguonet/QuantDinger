@@ -490,10 +490,17 @@ class BacktestObjective:
 
     def _ensure_services(self):
         global _StrategyCompiler, _BacktestService
-        if _StrategyCompiler is None:
+        # BacktestService 始终需要
+        if _BacktestService is None:
             _lazy_import()
-        self._compiler = _StrategyCompiler()
         self._backtest = _BacktestService()
+        # StrategyCompiler 仅在旧路径（build_config）时需要
+        if "build_strategy" not in self.template:
+            if _StrategyCompiler is None:
+                _lazy_import()
+            self._compiler = _StrategyCompiler()
+        else:
+            self._compiler = None
 
     def _prefetch(self):
         """预检数据可用性，本地无数据则直接抛异常（不走网络、不重试）"""
@@ -526,18 +533,22 @@ class BacktestObjective:
         if sd is None or ed is None:
             raise ValueError("start_date and end_date are required")
 
-        # 1. 参数 → 策略配置
-        config = self.template["build_config"](params)
-
-        # A 股模式：注入 A 股特有规则到策略配置
-        if self.is_ashare:
-            config = self._inject_ashare_rules(config)
-
-        # 2. 编译为代码
-        try:
-            code = self._compiler.compile(config)
-        except Exception as e:
-            raise RuntimeError(f"编译失败: {e}")
+        # 1. 生成策略代码（优先 IndicatorStrategy 标准格式）
+        if "build_strategy" in self.template:
+            # 新路径：直接生成标准 IndicatorStrategy 代码
+            try:
+                code = self.template["build_strategy"](params)
+            except Exception as e:
+                raise RuntimeError(f"策略生成失败: {e}")
+        else:
+            # 旧路径：JSON config → StrategyCompiler（向后兼容未转换的模板）
+            config = self.template["build_config"](params)
+            if self.is_ashare:
+                config = self._inject_ashare_rules(config)
+            try:
+                code = self._compiler.compile(config)
+            except Exception as e:
+                raise RuntimeError(f"编译失败: {e}")
 
         # 3. 回测
         try:
