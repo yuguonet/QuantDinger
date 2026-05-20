@@ -3460,7 +3460,7 @@ class BacktestService:
             # Note: check after all active exit signals
             # If liquidation hit, check SL signal first
             if position != 0 and not is_liquidated:
-                if position_type == 'long' and low <= liquidation_price:
+                if position_type == 'long' and liquidation_price > 0 and low <= liquidation_price:
                     # Long触及爆仓线：检查是否有止损信号
                     has_stop_loss = close_long_arr[i] and close_long_price_arr[i] > 0
                     stop_loss_price = close_long_price_arr[i] if has_stop_loss else 0
@@ -3503,7 +3503,7 @@ class BacktestService:
                     equity_curve.append({'time': timestamp.strftime('%Y-%m-%d %H:%M'), 'value': capital})
                     continue
                     
-                elif position_type == 'short' and high >= liquidation_price:
+                elif position_type == 'short' and liquidation_price > 0 and high >= liquidation_price:
                     # Short触及爆仓线：检查是否有止损信号
                     has_stop_loss = close_short_arr[i] and close_short_price_arr[i] > 0
                     stop_loss_price = close_short_price_arr[i] if has_stop_loss else 0

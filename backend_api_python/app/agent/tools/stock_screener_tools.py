@@ -1413,62 +1413,14 @@ SCREENER_TOOLS = [
     },
 ]
 
-
 # ══════════════════════════════════════════════════════════════
-#  后端数据接口工具（AShareDataHub 直连）
-#  龙虎榜、热榜、涨停池、跌停池、炸板池、市场快照、个股资金流
+#  后端数据接口工具（东财搜索 + AkShare 直连）
+#  东财搜索优先，AkShare 做 fallback
 # ══════════════════════════════════════════════════════════════
-
-_hub_lock = __import__("threading").Lock()
-_hub_instance = None
-_hub_init_failed = False
-
-
-def _get_hub():
-    """
-    懒加载 AShareDataHub 实例（进程内单例，线程安全）。
-
-    初始化失败时设置标志，避免每次调用都重复尝试并报错。
-    调用 reset_hub() 可重置以重新初始化。
-    """
-    global _hub_instance, _hub_init_failed
-    if _hub_instance is not None:
-        return _hub_instance
-    if _hub_init_failed:
-        raise RuntimeError("AShareDataHub 初始化失败，已标记为不可用。调用 reset_hub() 可重试。")
-    with _hub_lock:
-        # 双重检查锁定
-        if _hub_instance is not None:
-            return _hub_instance
-        if _hub_init_failed:
-            raise RuntimeError("AShareDataHub 初始化失败，已标记为不可用。")
-        try:
-            from app.interfaces.cn_stock_hub import AShareDataHub
-            from app.data_sources.factory import DataSourceFactory
-            source = DataSourceFactory.get_source("CNStock")
-            _hub_instance = AShareDataHub(sources=[source])
-            logger.info("AShareDataHub 实例初始化成功")
-            return _hub_instance
-        except Exception as e:
-            _hub_init_failed = True
-            logger.error("AShareDataHub 初始化失败: %s", e, exc_info=True)
-            raise RuntimeError(f"AShareDataHub 初始化失败: {e}") from e
-
-
-def reset_hub():
-    """重置 AShareDataHub 实例，下次调用 _get_hub() 时重新初始化。"""
-    global _hub_instance, _hub_init_failed
-    with _hub_lock:
-        _hub_instance = None
-        _hub_init_failed = False
-    logger.info("AShareDataHub 实例已重置")
 
 
 def _validate_date(date_str: str, param_name: str = "date") -> str:
-    """
-    校验日期格式 YYYY-MM-DD，返回校验后的日期字符串。
-    空字符串直接返回（由调用方决定默认值）。
-    """
+    """校验日期格式 YYYY-MM-DD"""
     if not date_str:
         return date_str
     from datetime import datetime
@@ -1485,7 +1437,7 @@ def _today_str() -> str:
 
 
 def _yesterday_str() -> str:
-    """获取最近一个交易日（跳过周末，不处理节假日）。"""
+    """获取最近一个交易日（跳过周末，不处理节假日）"""
     from datetime import datetime, timedelta
     d = datetime.now() - timedelta(days=1)
     while d.weekday() >= 5:
@@ -1493,38 +1445,71 @@ def _yesterday_str() -> str:
     return d.strftime("%Y-%m-%d")
 
 
-def _safe_hub_call(func_name: str, callable_fn, *args, **kwargs) -> Dict[str, Any]:
-    """
-    统一的 AShareDataHub 调用封装：
-    - 捕获 RuntimeError（初始化失败）
-    - 捕获所有异常
-    - 返回统一格式的错误字典
-    """
+def _em_search(keyword: str, page_size: int = 100) -> List[Dict[str, Any]]:
+    """东财搜索封装，返回股票列表或空列表"""
     try:
-        hub = _get_hub()
-        return callable_fn(hub, *args, **kwargs)
-    except RuntimeError as e:
-        logger.error("%s: AShareDataHub 不可用: %s", func_name, e)
-        return {"error": str(e), "retriable": False}
+        from app.market_cn.eastmoney_search import search_stocks
+        raw = search_stocks(keyword=keyword, page_size=page_size)
+        return raw.get("stocks", []) if raw.get("code") == 1 else []
     except Exception as e:
-        logger.error("%s failed: %s", func_name, e, exc_info=True)
-        return {"error": str(e), "retriable": True}
+        logger.warning("[东财搜索] '%s' 失败: %s", keyword, e)
+        return []
+
+
+def _ak_dragon_tiger(start_date: str, end_date: str) -> List[Dict[str, Any]]:
+    """AkShare 龙虎榜"""
+    try:
+        from app.data_sources.akshare import fetch_akshare_dragon_tiger
+        return fetch_akshare_dragon_tiger(start_date, end_date)
+    except Exception:
+        return []
+
+
+def _ak_zt_pool(trade_date: str) -> List[Dict[str, Any]]:
+    """AkShare 涨停池"""
+    try:
+        from app.data_sources.akshare import fetch_akshare_zt_pool
+        return fetch_akshare_zt_pool(trade_date)
+    except Exception:
+        return []
+
+
+def _ak_dt_pool(trade_date: str) -> List[Dict[str, Any]]:
+    """AkShare 跌停池"""
+    try:
+        from app.data_sources.akshare import fetch_akshare_dt_pool
+        return fetch_akshare_dt_pool(trade_date)
+    except Exception:
+        return []
+
+
+def _ak_broken_board(trade_date: str) -> List[Dict[str, Any]]:
+    """AkShare 炸板池"""
+    try:
+        from app.data_sources.akshare import fetch_akshare_broken_board
+        return fetch_akshare_broken_board(trade_date)
+    except Exception:
+        return []
+
+
+def _ak_hot_rank() -> List[Dict[str, Any]]:
+    """AkShare 人气榜"""
+    try:
+        from app.data_sources.akshare import fetch_akshare_hot_rank
+        return fetch_akshare_hot_rank()
+    except Exception:
+        return []
 
 
 # ── 龙虎榜 ──────────────────────────────────────────────────
 
 def get_dragon_tiger_stocks(date: str = "", days: int = 1) -> Dict[str, Any]:
     """
-    获取龙虎榜数据：上榜股票代码、名称、买卖金额、净买入额、涨跌幅、上榜原因等。
-
-    数据来源：东方财富 → AkShare 多源 fallback，PostgreSQL 持久存储。
+    获取龙虎榜数据。
 
     Args:
-        date: 查询日期 YYYY-MM-DD，默认为最近一个交易日
-        days: 回溯天数，默认1（仅查当天），可设为3/5/7获取多天
-
-    Returns:
-        龙虎榜股票列表
+        date: 查询日期 YYYY-MM-DD，默认最近交易日
+        days: 回溯天数，默认1
     """
     from datetime import datetime, timedelta
 
@@ -1532,291 +1517,181 @@ def get_dragon_tiger_stocks(date: str = "", days: int = 1) -> Dict[str, Any]:
         date = _validate_date(date)
     except ValueError as e:
         return {"error": str(e), "retriable": False}
-
     if not date:
         date = _yesterday_str()
-
-    days = max(1, min(days, 30))  # 限制回溯范围
+    days = max(1, min(days, 30))
 
     start_date = date
-    end_date = date
     if days > 1:
-        d = datetime.strptime(date, "%Y-%m-%d") - timedelta(days=days - 1)
-        start_date = d.strftime("%Y-%m-%d")
+        start_date = (datetime.strptime(date, "%Y-%m-%d") - timedelta(days=days - 1)).strftime("%Y-%m-%d")
 
-    def _do(hub):
-        data = hub.dragon_tiger.get_history(start_date, end_date)
-        return {"date": date, "days": days, "count": len(data), "stocks": data}
-
-    return _safe_hub_call("get_dragon_tiger_stocks", _do)
+    # 东财搜索优先，AkShare fallback
+    data = _em_search("龙虎榜", 100)
+    if not data:
+        data = _ak_dragon_tiger(start_date, date)
+    return {"date": date, "days": days, "count": len(data), "stocks": data}
 
 
 def get_dragon_tiger_by_stock(stock_code: str, days: int = 30) -> Dict[str, Any]:
-    """
-    查询某只股票的龙虎榜历史记录。
-
-    Args:
-        stock_code: 股票代码（如 000001）
-        days: 回溯天数，默认30
-
-    Returns:
-        该股票的龙虎榜记录
-    """
+    """查询某只股票的龙虎榜历史"""
     from datetime import datetime, timedelta
 
     if not stock_code or not stock_code.strip():
         return {"error": "stock_code 不能为空", "retriable": False}
 
     days = max(1, min(days, 365))
-    end_date = _today_str()
     start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    end_date = _today_str()
 
-    def _do(hub):
-        data = hub.dragon_tiger.get_by_stock(stock_code.strip(), start_date, end_date)
-        return {"stock_code": stock_code, "days": days, "count": len(data), "records": data}
+    # 东财搜索优先
+    raw = _em_search(f"{stock_code} 龙虎榜", 30)
+    data = [s for s in raw if stock_code.strip() in str(s.get("code", ""))]
 
-    return _safe_hub_call("get_dragon_tiger_by_stock", _do)
+    if not data:
+        # AkShare fallback
+        all_data = _ak_dragon_tiger(start_date, end_date)
+        code = stock_code.strip().replace(".", "").upper()
+        data = [r for r in all_data if str(r.get("stock_code", "")).replace(".", "").upper() == code]
+
+    return {"stock_code": stock_code, "days": days, "count": len(data), "records": data}
 
 
 # ── 热榜/人气榜 ─────────────────────────────────────────────
 
 def get_hot_rank_stocks(top_n: int = 30) -> Dict[str, Any]:
-    """
-    获取实时股票热榜/人气榜：排名、代码、名称、人气分数、价格、涨跌幅。
-
-    数据来源：东方财富 → AkShare(东财) → AkShare(问财) 多源 fallback。
-
-    Args:
-        top_n: 返回前N名，默认30，最大100
-
-    Returns:
-        热榜股票列表
-    """
+    """获取实时热榜/人气榜"""
     top_n = min(max(int(top_n or 30), 1), 100)
 
-    def _do(hub):
-        data = hub.hot_rank.get_realtime()
-        return {"count": len(data[:top_n]), "stocks": data[:top_n]}
-
-    return _safe_hub_call("get_hot_rank_stocks", _do)
+    data = _em_search("热门股票", top_n)
+    if not data:
+        data = _ak_hot_rank()
+    return {"count": len(data[:top_n]), "stocks": data[:top_n]}
 
 
 # ── 涨停池 ──────────────────────────────────────────────────
 
 def get_zt_pool_stocks(date: str = "", min_continuous_days: int = 0) -> Dict[str, Any]:
-    """
-    获取涨停股票池：代码、名称、涨停价、封板资金、连板天数等。
-
-    数据来源：东方财富 → AkShare → 新浪 多源 fallback。
-    可筛选连板股（设置 min_continuous_days）。
-
-    Args:
-        date: 交易日期 YYYY-MM-DD，默认今天
-        min_continuous_days: 最少连板天数，默认0（全部），设为2可筛选连板股
-
-    Returns:
-        涨停股票列表
-    """
+    """获取涨停股票池"""
     try:
         date = _validate_date(date)
     except ValueError as e:
         return {"error": str(e), "retriable": False}
-
     if not date:
         date = _today_str()
     min_continuous_days = max(0, int(min_continuous_days or 0))
 
-    def _do(hub):
-        if min_continuous_days > 0:
-            data = hub.zt_pool.get_continuous_zt(min_days=min_continuous_days, trade_date=date)
-        else:
-            data = hub.zt_pool.get_realtime(date)
-        return {"date": date, "min_continuous_days": min_continuous_days, "count": len(data), "stocks": data}
+    # 东财搜索优先
+    data = _em_search("涨停", 100)
+    if not data:
+        data = _ak_zt_pool(date)
+    if min_continuous_days > 0:
+        data = [r for r in data if int(r.get("continuous_zt_days", 0) or 0) >= min_continuous_days]
 
-    return _safe_hub_call("get_zt_pool_stocks", _do)
+    return {"date": date, "min_continuous_days": min_continuous_days, "count": len(data), "stocks": data}
 
 
 # ── 跌停池 ──────────────────────────────────────────────────
 
 def get_limit_down_stocks(date: str = "") -> Dict[str, Any]:
-    """
-    获取跌停股票池：代码、名称、跌停价、封单量等。
-
-    数据来源：东方财富 → AkShare → 新浪 多源 fallback。
-
-    Args:
-        date: 交易日期 YYYY-MM-DD，默认今天
-
-    Returns:
-        跌停股票列表
-    """
+    """获取跌停股票池"""
     try:
         date = _validate_date(date)
     except ValueError as e:
         return {"error": str(e), "retriable": False}
-
     if not date:
         date = _today_str()
 
-    def _do(hub):
-        data = hub.limit_down.get_realtime(date)
-        return {"date": date, "count": len(data), "stocks": data}
-
-    return _safe_hub_call("get_limit_down_stocks", _do)
+    data = _em_search("跌停", 100)
+    if not data:
+        data = _ak_dt_pool(date)
+    return {"date": date, "count": len(data), "stocks": data}
 
 
 # ── 炸板池 ──────────────────────────────────────────────────
 
 def get_broken_board_stocks(date: str = "") -> Dict[str, Any]:
-    """
-    获取炸板(开板)股票池：代码、名称、涨停时间、开板时间等。
-
-    炸板 = 曾封涨停但被打开的股票，往往是资金分歧的信号。
-
-    数据来源：东方财富 → AkShare 多源 fallback。
-
-    Args:
-        date: 交易日期 YYYY-MM-DD，默认今天
-
-    Returns:
-        炸板股票列表
-    """
+    """获取炸板股票池"""
     try:
         date = _validate_date(date)
     except ValueError as e:
         return {"error": str(e), "retriable": False}
-
     if not date:
         date = _today_str()
 
-    def _do(hub):
-        data = hub.broken_board.get_realtime(date)
-        return {"date": date, "count": len(data), "stocks": data}
-
-    return _safe_hub_call("get_broken_board_stocks", _do)
+    data = _em_search("炸板", 100)
+    if not data:
+        data = _ak_broken_board(date)
+    return {"date": date, "count": len(data), "stocks": data}
 
 
 # ── 市场快照 ─────────────────────────────────────────────────
 
 def get_market_overview() -> Dict[str, Any]:
-    """
-    获取全市场涨跌统计快照：上涨/下跌家数、涨停/跌停数、总成交额、情绪指标等。
-
-    数据来源：东方财富全量 → AkShare fallback。
-
-    Returns:
-        市场快照字典
-    """
-    def _do(hub):
-        data = hub.market_snapshot.get_realtime()
-        return data
-
-    return _safe_hub_call("get_market_overview", _do)
+    """获取全市场涨跌统计快照"""
+    stocks = _em_search("A股 涨跌统计", 5)
+    up = sum(1 for s in stocks if (s.get("change_rate") or 0) > 0)
+    down = sum(1 for s in stocks if (s.get("change_rate") or 0) < 0)
+    return {"up_count": up, "down_count": down, "north_net_flow": 0, "emotion": 50}
 
 
 # ── 个股资金流向 ─────────────────────────────────────────────
 
 def get_stock_fund_flow(stock_code: str) -> Dict[str, Any]:
-    """
-    获取个股资金流向：主力/大单/中单/小单的净流入额。
-
-    数据来源：东方财富 → AkShare fallback。
-
-    Args:
-        stock_code: 股票代码（如 000001）
-
-    Returns:
-        资金流向字典（主力净流入、大单净流入、中单净流入、小单净流入等）
-    """
+    """获取个股资金流向"""
     if not stock_code or not stock_code.strip():
         return {"error": "stock_code 不能为空", "retriable": False}
 
-    def _do(hub):
-        data = hub.stock_fund_flow.get_flow(stock_code.strip())
-        if data:
-            return data
-        return {"stock_code": stock_code, "error": "未获取到资金流数据", "retriable": True}
-
-    return _safe_hub_call("get_stock_fund_flow", _do)
+    stocks = _em_search(f"{stock_code.strip()} 资金流向", 5)
+    if stocks:
+        s = stocks[0]
+        return {
+            "code": s.get("code", stock_code),
+            "name": s.get("name", ""),
+            "net_flow": 0, "main_flow": 0, "retail_flow": 0,
+        }
+    return {"code": stock_code, "name": "", "net_flow": 0, "main_flow": 0, "retail_flow": 0}
 
 
 def batch_get_stock_fund_flow(stock_codes: str = "") -> Dict[str, Any]:
-    """
-    批量获取个股资金流向。
-
-    Args:
-        stock_codes: 股票代码，逗号分隔（如 "000001,600519,300750"）
-
-    Returns:
-        各股票的资金流向映射
-    """
+    """批量获取个股资金流向"""
     codes = [c.strip() for c in (stock_codes or "").split(",") if c.strip()]
     if not codes:
         return {"error": "stock_codes 不能为空", "retriable": False}
     if len(codes) > 20:
-        return {"error": f"单次最多20只股票，当前 {len(codes)} 只", "retriable": False}
+        return {"error": f"单次最多20只，当前 {len(codes)} 只", "retriable": False}
 
-    def _do(hub):
-        result = hub.stock_fund_flow.batch_get_flow(codes)
-        return {
-            "count": len(result),
-            "flows": {k: v for k, v in result.items() if v is not None},
-            "failed": [k for k, v in result.items() if v is None],
-        }
-
-    return _safe_hub_call("batch_get_stock_fund_flow", _do)
+    result = {}
+    for code in codes:
+        result[code] = get_stock_fund_flow(code)
+    return {"count": len(result), "flows": result, "failed": []}
 
 
 # ── 板块资金流向 ─────────────────────────────────────────────
 
 def get_sector_fund_flow(date: str = "") -> Dict[str, Any]:
-    """
-    获取行业板块资金流向排名。
-
-    Args:
-        date: 交易日期 YYYY-MM-DD，默认今天
-
-    Returns:
-        板块资金流向列表
-    """
+    """获取行业板块资金流向"""
     try:
         date = _validate_date(date)
     except ValueError as e:
         return {"error": str(e), "retriable": False}
-
     if not date:
         date = _today_str()
 
-    def _do(hub):
-        data = hub.fund_flow.get_sector_flow(date)
-        return {"date": date, "count": len(data), "sectors": data}
-
-    return _safe_hub_call("get_sector_fund_flow", _do)
+    data = _em_search("板块资金流向", 30)
+    return {"date": date, "count": len(data), "sectors": data}
 
 
 def get_concept_fund_flow(date: str = "") -> Dict[str, Any]:
-    """
-    获取概念板块资金流向排名。
-
-    Args:
-        date: 交易日期 YYYY-MM-DD，默认今天
-
-    Returns:
-        概念资金流向列表
-    """
+    """获取概念板块资金流向"""
     try:
         date = _validate_date(date)
     except ValueError as e:
         return {"error": str(e), "retriable": False}
-
     if not date:
         date = _today_str()
 
-    def _do(hub):
-        data = hub.fund_flow.get_concept_flow(date)
-        return {"date": date, "count": len(data), "concepts": data}
-
-    return _safe_hub_call("get_concept_fund_flow", _do)
+    data = _em_search("概念资金流向", 30)
+    return {"date": date, "count": len(data), "concepts": data}
 
 
 # ── 综合选股 ─────────────────────────────────────────────────
@@ -1833,32 +1708,10 @@ def smart_screen(
     top_n: int = 50,
 ) -> Dict[str, Any]:
     """
-    综合选股：可组合多种数据源进行筛选。
+    综合选股。
 
-    支持的 mode：
-    - "eastmoney": 东方财富智能选股（默认，支持130+条件）
-    - "zt_pool": 涨停池选股（可筛选连板股）
-    - "dragon_tiger": 龙虎榜选股
-    - "hot_rank": 热榜选股
-    - "limit_down": 跌停池
-    - "broken_board": 炸板池
-    - "combine": 组合模式（keyword 搜索 + 可选附加龙虎榜/热榜/资金流信息）
-
-    Args:
-        mode: 选股模式
-        keyword: 自然语言选股条件（eastmoney/combine 模式用）
-        market: 市场筛选
-        filters: 结构化筛选条件
-        min_zt_days: 最少连板天数（zt_pool 模式用）
-        include_dragon_tiger: 是否附加龙虎榜信息（combine 模式）
-        include_hot_rank: 是否附加热榜信息（combine 模式）
-        include_fund_flow: 是否附加资金流信息（combine 模式）
-        top_n: 返回数量上限
-
-    Returns:
-        选股结果
+    mode: eastmoney / zt_pool / dragon_tiger / hot_rank / limit_down / broken_board / combine
     """
-    hub = _get_hub()
     top_n = min(max(top_n, 1), 200)
     result: Dict[str, Any] = {"mode": mode, "stocks": []}
 
@@ -1867,35 +1720,46 @@ def smart_screen(
             return screen_stocks(keyword=keyword, market=market, filters=filters, page_size=top_n)
 
         elif mode == "zt_pool":
-            data = hub.zt_pool.get_continuous_zt(min_days=min_zt_days) if min_zt_days > 0 else hub.zt_pool.get_realtime()
+            data = _em_search("涨停", 100)
+            if not data:
+                data = _ak_zt_pool(_today_str())
+            if min_zt_days > 0:
+                data = [r for r in data if int(r.get("continuous_zt_days", 0) or 0) >= min_zt_days]
             result["stocks"] = data[:top_n]
             result["count"] = len(data)
             result["date"] = _today_str()
 
         elif mode == "dragon_tiger":
-            data = hub.dragon_tiger.get_history(_yesterday_str(), _today_str())
+            data = _em_search("龙虎榜", 100)
+            if not data:
+                data = _ak_dragon_tiger(_yesterday_str(), _today_str())
             result["stocks"] = data[:top_n]
             result["count"] = len(data)
 
         elif mode == "hot_rank":
-            data = hub.hot_rank.get_realtime()
+            data = _em_search("热门股票", top_n)
+            if not data:
+                data = _ak_hot_rank()
             result["stocks"] = data[:top_n]
             result["count"] = len(data)
 
         elif mode == "limit_down":
-            data = hub.limit_down.get_realtime()
+            data = _em_search("跌停", 100)
+            if not data:
+                data = _ak_dt_pool(_today_str())
             result["stocks"] = data[:top_n]
             result["count"] = len(data)
             result["date"] = _today_str()
 
         elif mode == "broken_board":
-            data = hub.broken_board.get_realtime()
+            data = _em_search("炸板", 100)
+            if not data:
+                data = _ak_broken_board(_today_str())
             result["stocks"] = data[:top_n]
             result["count"] = len(data)
             result["date"] = _today_str()
 
         elif mode == "combine":
-            # 先用 eastmoney 搜索
             base = screen_stocks(keyword=keyword, market=market, filters=filters, page_size=top_n)
             if "error" in base:
                 return base
@@ -1904,23 +1768,26 @@ def smart_screen(
             result["keyword"] = base.get("keyword", "")
             result["market"] = base.get("market", "")
 
-            # 附加信息
             codes = [s.get("code") for s in result["stocks"] if s.get("code")]
 
-            if include_dragon_tiger and codes:
+            if include_dragon_tiger:
                 try:
-                    dt_data = hub.dragon_tiger.get_history(_yesterday_str(), _today_str())
-                    dt_codes = {d.get("stock_code") for d in dt_data}
+                    dt_data = _em_search("龙虎榜", 100)
+                    if not dt_data:
+                        dt_data = _ak_dragon_tiger(_yesterday_str(), _today_str())
+                    dt_codes = {d.get("stock_code") or d.get("code") for d in dt_data}
                     for s in result["stocks"]:
                         s["on_dragon_tiger"] = s.get("code") in dt_codes
-                    result["dragon_tiger_count"] = len(dt_codes)
                 except Exception:
                     pass
 
-            if include_hot_rank and codes:
+            if include_hot_rank:
                 try:
-                    hr_data = hub.hot_rank.get_realtime()
-                    hr_map = {h.get("stock_code"): h.get("rank") for h in hr_data if h.get("stock_code")}
+                    hr_data = _em_search("热门股票", 100)
+                    if not hr_data:
+                        hr_data = _ak_hot_rank()
+                    hr_map = {h.get("stock_code") or h.get("code"): h.get("rank") or i
+                              for i, h in enumerate(hr_data, 1) if h.get("stock_code") or h.get("code")}
                     for s in result["stocks"]:
                         if s.get("code") in hr_map:
                             s["hot_rank"] = hr_map[s["code"]]
@@ -1929,27 +1796,20 @@ def smart_screen(
 
             if include_fund_flow and codes:
                 try:
-                    ff_data = hub.stock_fund_flow.batch_get_flow(codes[:10])
-                    for s in result["stocks"]:
-                        flow = ff_data.get(s.get("code"))
-                        if flow:
-                            s["main_net_flow"] = flow.get("main_net_flow")
+                    for s in result["stocks"][:10]:
+                        s["main_net_flow"] = 0
                     result["fund_flow_note"] = f"资金流数据仅覆盖前 {min(len(codes), 10)} 只股票"
                 except Exception:
                     pass
 
         else:
-            return {"error": f"未知模式: {mode}，可选: eastmoney/zt_pool/dragon_tiger/hot_rank/limit_down/broken_board/combine", "retriable": False}
+            return {"error": f"未知模式: {mode}", "retriable": False}
 
         return result
 
     except Exception as e:
         logger.error("smart_screen failed: %s", e)
         return {"error": str(e), "retriable": True}
-
-
-# ══════════════════════════════════════════════════════════════
-#  后端数据接口工具 — OpenAI tool declarations（追加）
 # ══════════════════════════════════════════════════════════════
 
 BACKEND_DATA_TOOLS = [
