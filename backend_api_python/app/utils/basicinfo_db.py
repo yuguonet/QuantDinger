@@ -131,6 +131,7 @@ CREATE TABLE IF NOT EXISTS stock_basic_info (
     name    VARCHAR(50)  NOT NULL,       -- 股票简称，如 "贵州茅台"
     market_cn        VARCHAR(10)  NOT NULL,       -- 交易所：SH(沪) / SZ(深) / BJ(北)
     industry      VARCHAR(50)  DEFAULT '',     -- 所属行业（如 "白酒"），按需补充
+    concepts      TEXT         DEFAULT '',     -- 所属概念（逗号分隔，如 "锂电池,新能源"），按需补充
     list_date     VARCHAR(20)  DEFAULT '',     -- 上市日期（如 "2001-08-27"），按需补充
     total_mv      DOUBLE PRECISION DEFAULT 0,  -- 总市值（元），按需补充，0 表示未知
     circ_mv       DOUBLE PRECISION DEFAULT 0,  -- 流通市值（元），按需补充
@@ -348,6 +349,7 @@ class StockBasicDB:
                 name,                            # name
                 market_cn,                          # market_cn
                 item.get("industry", ""),        # industry（默认空串）
+                item.get("concepts", ""),        # concepts（默认空串，逗号分隔）
                 item.get("list_date", ""),       # list_date（默认空串）
                 float(item.get("total_mv", 0) or 0),   # total_mv（None → 0）
                 float(item.get("circ_mv", 0) or 0),    # circ_mv
@@ -368,7 +370,7 @@ class StockBasicDB:
 
         sql = """
             INSERT INTO stock_basic_info
-                (symbol, name, market_cn, industry, list_date,
+                (symbol, name, market_cn, industry, concepts, list_date,
                  total_mv, circ_mv, pe_ratio, pb_ratio, status, updated_at)
             VALUES %s
             ON CONFLICT (symbol) DO UPDATE SET
@@ -380,6 +382,7 @@ class StockBasicDB:
                 --   如果 new 是空串 → NULLIF 返回 NULL → COALESCE 返回 old
                 --   如果 new 非空   → NULLIF 返回 new → COALESCE 返回 new
                 industry   = COALESCE(NULLIF(EXCLUDED.industry, ''), stock_basic_info.industry),
+                concepts   = COALESCE(NULLIF(EXCLUDED.concepts, ''), stock_basic_info.concepts),
                 list_date  = COALESCE(NULLIF(EXCLUDED.list_date, ''), stock_basic_info.list_date),
                 -- 数值字段：只在新值 > 0 时覆盖（0 表示"未知"，不覆盖已知值）
                 total_mv   = CASE WHEN EXCLUDED.total_mv > 0 THEN EXCLUDED.total_mv ELSE stock_basic_info.total_mv END,
@@ -506,7 +509,7 @@ class StockBasicDB:
         pool = self._get_pool()
         with pool.cursor() as cur:
             cur.execute(
-                "SELECT symbol, name, market_cn, industry, list_date, "
+                "SELECT symbol, name, market_cn, industry, concepts, list_date, "
                 "       total_mv, circ_mv, pe_ratio, pb_ratio, status, updated_at "
                 "FROM stock_basic_info WHERE symbol = %s",
                 (code,),
@@ -550,7 +553,7 @@ class StockBasicDB:
         pool = self._get_pool()
         with pool.cursor() as cur:
             cur.execute(
-                f"SELECT symbol, name, market_cn, industry, list_date, "
+                f"SELECT symbol, name, market_cn, industry, concepts, list_date, "
                 f"       total_mv, circ_mv, pe_ratio, pb_ratio, status, updated_at "
                 f"FROM stock_basic_info {where} ORDER BY symbol",
                 params,
@@ -584,7 +587,7 @@ class StockBasicDB:
         pool = self._get_pool()
         with pool.cursor() as cur:
             cur.execute(
-                "SELECT symbol, name, market_cn, industry, list_date, "
+                "SELECT symbol, name, market_cn, industry, concepts, list_date, "
                 "       total_mv, circ_mv, pe_ratio, pb_ratio, status, updated_at "
                 "FROM stock_basic_info "
                 "WHERE (symbol LIKE %s OR name LIKE %s) AND status = 'active' "
@@ -707,6 +710,103 @@ class StockBasicDB:
                 "WHERE industry != '' AND status = 'active' ORDER BY industry"
             )
             return [r[0] for r in cur.fetchall()]
+
+    def get_all_concepts(self) -> List[str]:
+        """
+        获取所有不重复的概念标签（去重、排序）。
+
+        概念存储为逗号分隔的文本，需要拆分后去重。
+        只返回 active 股票的概念。
+        """
+        self.ensure_table()
+        pool = self._get_pool()
+        with pool.cursor() as cur:
+            cur.execute(
+                "SELECT concepts FROM stock_basic_info "
+                "WHERE concepts != '' AND status = 'active'"
+            )
+            rows = cur.fetchall()
+
+        concept_set = set()
+        for (concepts_str,) in rows:
+            for c in concepts_str.split(","):
+                c = c.strip()
+                if c:
+                    concept_set.add(c)
+        return sorted(concept_set)
+
+    def get_stocks_by_concept(self, concept: str, status: str = "active") -> List[Dict[str, Any]]:
+        """
+        按概念标签查询股票。
+
+        使用 LIKE 匹配逗号分隔的概念字段。
+        概念标签可能是"锂电池"或"锂电池,新能源,储能"的形式。
+
+        Args:
+            concept: 概念关键词（如 "锂电池"）
+            status:  过滤状态，默认 "active"
+
+        Returns:
+            匹配的股票列表
+        """
+        self.ensure_table()
+        pool = self._get_pool()
+        pattern = f"%{concept}%"
+        if status:
+            with pool.cursor() as cur:
+                cur.execute(
+                    "SELECT symbol, name, market_cn, industry, concepts, list_date, "
+                    "       total_mv, circ_mv, pe_ratio, pb_ratio, status, updated_at "
+                    "FROM stock_basic_info "
+                    "WHERE concepts LIKE %s AND status = %s ORDER BY symbol",
+                    (pattern, status),
+                )
+                rows = cur.fetchall()
+        else:
+            with pool.cursor() as cur:
+                cur.execute(
+                    "SELECT symbol, name, market_cn, industry, concepts, list_date, "
+                    "       total_mv, circ_mv, pe_ratio, pb_ratio, status, updated_at "
+                    "FROM stock_basic_info "
+                    "WHERE concepts LIKE %s ORDER BY symbol",
+                    (pattern,),
+                )
+                rows = cur.fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
+    def get_concept_stock_map(self, status: str = "active") -> Dict[str, List[str]]:
+        """
+        获取 概念→股票列表 的映射。
+
+        用于板块聚合统计：给定一个概念，返回所有属于该概念的股票代码。
+
+        Returns:
+            {"锂电池": ["300750", "002460", ...], "白酒": ["600519", ...], ...}
+        """
+        self.ensure_table()
+        pool = self._get_pool()
+        if status:
+            with pool.cursor() as cur:
+                cur.execute(
+                    "SELECT symbol, concepts FROM stock_basic_info "
+                    "WHERE concepts != '' AND status = %s",
+                    (status,),
+                )
+                rows = cur.fetchall()
+        else:
+            with pool.cursor() as cur:
+                cur.execute(
+                    "SELECT symbol, concepts FROM stock_basic_info WHERE concepts != ''"
+                )
+                rows = cur.fetchall()
+
+        concept_map: Dict[str, List[str]] = {}
+        for symbol, concepts_str in rows:
+            for c in concepts_str.split(","):
+                c = c.strip()
+                if c:
+                    concept_map.setdefault(c, []).append(symbol)
+        return concept_map
 
     def get_stats(self) -> Dict[str, Any]:
         """
@@ -1065,6 +1165,7 @@ class StockBasicDB:
             cur.execute("""
                 UPDATE stock_basic_info SET
                     industry   = COALESCE(NULLIF(%s, ''), industry),
+                    concepts   = COALESCE(NULLIF(%s, ''), concepts),
                     list_date  = COALESCE(NULLIF(%s, ''), list_date),
                     total_mv   = CASE WHEN %s > 0 THEN %s ELSE total_mv END,
                     circ_mv    = CASE WHEN %s > 0 THEN %s ELSE circ_mv  END,
@@ -1074,6 +1175,7 @@ class StockBasicDB:
                 WHERE symbol = %s
             """, (
                 info.get("industry", ""),       # 新行业
+                info.get("concepts", ""),        # 新概念
                 info.get("listed_date", ""),     # 新上市日期
                 float(info.get("total_mv", 0) or 0), float(info.get("total_mv", 0) or 0),
                 float(info.get("circ_mv", 0) or 0),  float(info.get("circ_mv", 0) or 0),
@@ -1098,9 +1200,9 @@ class StockBasicDB:
         将数据库行 tuple 转为字典。
 
         列顺序与 SELECT 语句一致：
-          0: symbol, 1: name, 2: market_cn, 3: industry,
-          4: list_date,  5: total_mv,   6: circ_mv, 7: pe_ratio,
-          8: pb_ratio,   9: status,     10: updated_at
+          0: symbol, 1: name, 2: market_cn, 3: industry, 4: concepts,
+          5: list_date,  6: total_mv,   7: circ_mv, 8: pe_ratio,
+          9: pb_ratio,   10: status,    11: updated_at
 
         注意：float(row[x] or 0) 处理 NULL → 0.0 的转换。
         """
@@ -1109,13 +1211,14 @@ class StockBasicDB:
             "name": row[1],
             "market_cn":     row[2],
             "industry":   row[3],
-            "list_date":  row[4],
-            "total_mv":   float(row[5] or 0),
-            "circ_mv":    float(row[6] or 0),
-            "pe_ratio":   float(row[7] or 0),
-            "pb_ratio":   float(row[8] or 0),
-            "status":     row[9],
-            "updated_at": row[10].isoformat() if row[10] else None,
+            "concepts":   row[4],
+            "list_date":  row[5],
+            "total_mv":   float(row[6] or 0),
+            "circ_mv":    float(row[7] or 0),
+            "pe_ratio":   float(row[8] or 0),
+            "pb_ratio":   float(row[9] or 0),
+            "status":     row[10],
+            "updated_at": row[11].isoformat() if row[11] else None,
         }
 
     def close(self):
