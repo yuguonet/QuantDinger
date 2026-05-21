@@ -567,6 +567,10 @@ class BacktestObjective:
                 # position_pct 是百分比（如 50），转为小数（0.5）
                 _strategy_config['position'] = {'entryPct': position_pct / 100.0}
 
+            # 从模板 strategy_defaults 读取 trade_direction
+            _tmpl_defaults = self.template.get('strategy_defaults') or {}
+            _trade_dir = _tmpl_defaults.get('tradeDirection', 'both')
+
             result = self._backtest.run(
                 indicator_code=code,
                 market=self.market,
@@ -577,6 +581,7 @@ class BacktestObjective:
                 initial_capital=self.initial_capital,
                 commission=self.commission,
                 strategy_config=_strategy_config if _strategy_config else None,
+                trade_direction=_trade_dir,
             )
         except Exception as e:
             # 数据相关错误，标记后续试验全部跳过
