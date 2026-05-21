@@ -10,6 +10,7 @@ class StrategyCompiler:
         # Extract configurations
         name = config.get('name', 'Generated Strategy')
         entry_rules = config.get('entry_rules', [])
+        exit_rules = config.get('exit_rules', [])   # 独立出场规则（可选）
         position_config = config.get('position_config', {})
         pyramiding_rules = config.get('pyramiding_rules', {})
         risk_management = config.get('risk_management', {})
@@ -21,11 +22,13 @@ class StrategyCompiler:
         # 2. Parameters (Variables)
         code += self._get_parameters(position_config, pyramiding_rules, risk_management)
         
-        # 3. Indicators Calculation
+        # 3. Indicators Calculation (entry + exit)
         code += self._get_indicators_calculation(entry_rules)
+        if exit_rules:
+            code += self._get_indicators_calculation(exit_rules)
         
-        # 4. Signal Logic (Entry Conditions)
-        code += self._get_entry_logic(entry_rules)
+        # 4. Signal Logic (Entry + Exit Conditions)
+        code += self._get_entry_logic(entry_rules, exit_rules=exit_rules)
         
         # 5. Core Loop (Position Management) - Based on code2.py
         code += self._get_core_loop(position_config, pyramiding_rules, risk_management, exit_mode)
@@ -499,10 +502,10 @@ df['drawdown_from_high_{lookback}'] = (df['close'] - df['ddfh_high_{lookback}'])
 
         return code
 
-    def _get_entry_logic(self, rules):
+    def _get_entry_logic(self, rules, exit_rules=None):
         code = """
 # ===========================
-# 3. Entry Signal Logic
+# 3. Entry / Exit Signal Logic
 # ===========================
 # Default False
 df['raw_buy'] = False
@@ -510,363 +513,205 @@ df['raw_sell'] = False
 """
         conditions_buy = []
         conditions_sell = []
-        
+
+        # ── 入场条件（只生成 raw_buy）──
         for rule in rules:
-            ind = rule.get('indicator')
-            params = rule.get('params', {})
-            
-            if ind == 'supertrend':
-                signal = rule.get('signal', 'trend_bullish')
-                if signal == 'trend_bullish':
-                    conditions_buy.append("(df['st_trend'] == 1) & (df['st_trend'].shift(1) == -1)")
-                    conditions_sell.append("(df['st_trend'] == -1) & (df['st_trend'].shift(1) == 1)")
-                elif signal == 'is_uptrend':
-                    conditions_buy.append("(df['st_trend'] == 1)")
-                    conditions_sell.append("(df['st_trend'] == -1)")
-            
-            elif ind == 'ema':
-                period = params.get('period', 20)
-                operator = rule.get('operator', 'price_above')
-                thresh = rule.get('threshold', 3.0)
-                col = f"df['ema_{period}']"
-                if operator == 'price_above':
-                    conditions_buy.append(f"(df['close'] > {col})")
-                    conditions_sell.append(f"(df['close'] < {col})")
-                elif operator == 'price_below':
-                    conditions_buy.append(f"(df['close'] < {col})")
-                    conditions_sell.append(f"(df['close'] > {col})")
-                elif operator == 'cross_up':
-                    conditions_buy.append(f"(df['close'] > {col}) & (df['close'].shift(1) <= {col}.shift(1))")
-                    conditions_sell.append(f"(df['close'] < {col}) & (df['close'].shift(1) >= {col}.shift(1))")
-                elif operator == 'cross_down':
-                    conditions_buy.append(f"(df['close'] < {col}) & (df['close'].shift(1) >= {col}.shift(1))")
-                    conditions_sell.append(f"(df['close'] > {col}) & (df['close'].shift(1) <= {col}.shift(1))")
-                elif operator == 'price_near':
-                    # 价格在 EMA 附近（偏离度 < 阈值%）
-                    conditions_buy.append(f"(abs(df['close'] - {col}) / {col} * 100 < {thresh})")
+            cond = self._rule_to_condition(rule)
+            if cond:
+                conditions_buy.append(cond)
 
-            elif ind == 'rsi':
-                period = params.get('period', 14)
-                operator = rule.get('operator', '<')
-                thresh = params.get('threshold', 30)
-                col = f"df['rsi_{period}']"
-                if operator == '<':
-                    conditions_buy.append(f"({col} < {thresh})")
-                    conditions_sell.append(f"({col} > {100-thresh})")
-                elif operator == '>':
-                    conditions_buy.append(f"({col} > {thresh})")
-                    conditions_sell.append(f"({col} < {100-thresh})")
-                elif operator == 'cross_up':
-                    conditions_buy.append(f"({col} > {thresh}) & ({col}.shift(1) <= {thresh})")
-                    conditions_sell.append(f"({col} < {100-thresh}) & ({col}.shift(1) >= {100-thresh})")
-                elif operator == 'cross_down':
-                    conditions_buy.append(f"({col} < {thresh}) & ({col}.shift(1) >= {thresh})")
-                    conditions_sell.append(f"({col} > {100-thresh}) & ({col}.shift(1) <= {100-thresh})")
-                elif operator == 'between':
-                    low, high = thresh
-                    conditions_buy.append(f"({col} >= {low}) & ({col} <= {high})")
-
-            elif ind == 'macd':
-                fast = params.get('fast_period', 12)
-                slow = params.get('slow_period', 26)
-                signal = params.get('signal_period', 9)
-                operator = rule.get('operator', 'diff_gt_dea')
-                line_col = f"df['macd_{fast}_{slow}_{signal}_line']"
-                sig_col = f"df['macd_{fast}_{slow}_{signal}_signal']"
-                hist_col = f"df['macd_{fast}_{slow}_{signal}_hist']"
-                
-                if operator == 'diff_gt_dea':
-                    conditions_buy.append(f"({line_col} > {sig_col})")
-                    conditions_sell.append(f"({line_col} < {sig_col})")
-                elif operator == 'diff_lt_dea':
-                    conditions_buy.append(f"({line_col} < {sig_col})")
-                    conditions_sell.append(f"({line_col} > {sig_col})")
-                elif operator == 'cross_up':
-                    conditions_buy.append(f"({line_col} > {sig_col}) & ({line_col}.shift(1) <= {sig_col}.shift(1))")
-                    conditions_sell.append(f"({line_col} < {sig_col}) & ({line_col}.shift(1) >= {sig_col}.shift(1))")
-                elif operator == 'cross_down':
-                    conditions_buy.append(f"({line_col} < {sig_col}) & ({line_col}.shift(1) >= {sig_col}.shift(1))")
-                    conditions_sell.append(f"({line_col} > {sig_col}) & ({line_col}.shift(1) <= {sig_col}.shift(1))")
-                elif operator == 'histogram_positive':
-                    conditions_buy.append(f"({hist_col} > 0) & ({hist_col}.shift(1) <= 0)")
-                    conditions_sell.append(f"({hist_col} < 0) & ({hist_col}.shift(1) >= 0)")
-                elif operator == 'histogram_negative':
-                    conditions_buy.append(f"({hist_col} < 0) & ({hist_col}.shift(1) >= 0)")
-                    conditions_sell.append(f"({hist_col} > 0) & ({hist_col}.shift(1) <= 0)")
-
-            elif ind == 'bollinger':
-                period = params.get('period', 20)
-                std_dev = params.get('std_dev', 2.0)
-                operator = rule.get('operator', 'price_above_upper')
-                upper = f"df['bb_{period}_{std_dev}_upper']"
-                lower = f"df['bb_{period}_{std_dev}_lower']"
-                mid = f"df['bb_{period}_{std_dev}_mid']"
-                
-                if operator == 'price_above_upper':
-                    conditions_buy.append(f"(df['close'] > {upper})")
-                    conditions_sell.append(f"(df['close'] < {lower})")
-                elif operator == 'price_below_lower':
-                    conditions_buy.append(f"(df['close'] < {lower})")
-                    conditions_sell.append(f"(df['close'] > {upper})")
-                elif operator == 'price_above_mid':
-                    conditions_buy.append(f"(df['close'] > {mid})")
-                    conditions_sell.append(f"(df['close'] < {mid})")
-                elif operator == 'price_below_mid':
-                    conditions_buy.append(f"(df['close'] < {mid})")
-                    conditions_sell.append(f"(df['close'] > {mid})")
-                elif operator == 'cross_up_lower':
-                    conditions_buy.append(f"(df['close'] > {lower}) & (df['close'].shift(1) <= {lower}.shift(1))")
-                    conditions_sell.append(f"(df['close'] < {upper}) & (df['close'].shift(1) >= {upper}.shift(1))")
-                elif operator == 'cross_down_upper':
-                    conditions_buy.append(f"(df['close'] < {upper}) & (df['close'].shift(1) >= {upper}.shift(1))")
-                    conditions_sell.append(f"(df['close'] > {lower}) & (df['close'].shift(1) <= {lower}.shift(1))")
-
-            elif ind == 'kdj':
-                period = params.get('period', 9)
-                signal_period = params.get('signal_period', 3)
-                operator = rule.get('operator', 'k_gt_d')
-                k_col = f"df['kdj_{period}_{signal_period}_k']"
-                d_col = f"df['kdj_{period}_{signal_period}_d']"
-                j_col = f"df['kdj_{period}_{signal_period}_j']"
-                
-                if operator == 'k_gt_d':
-                    conditions_buy.append(f"({k_col} > {d_col})")
-                    conditions_sell.append(f"({k_col} < {d_col})")
-                elif operator == 'k_lt_d':
-                    conditions_buy.append(f"({k_col} < {d_col})")
-                    conditions_sell.append(f"({k_col} > {d_col})")
-                elif operator == 'gold_cross':
-                    conditions_buy.append(f"({k_col} > {d_col}) & ({k_col}.shift(1) <= {d_col}.shift(1))")
-                    conditions_sell.append(f"({k_col} < {d_col}) & ({k_col}.shift(1) >= {d_col}.shift(1))")
-                elif operator == 'death_cross':
-                    conditions_buy.append(f"({k_col} < {d_col}) & ({k_col}.shift(1) >= {d_col}.shift(1))")
-                    conditions_sell.append(f"({k_col} > {d_col}) & ({k_col}.shift(1) <= {d_col}.shift(1))")
-
-            elif ind == 'ma':
-                period = params.get('period', 20)
-                ma_type = params.get('ma_type', 'sma')
-                operator = rule.get('operator', 'price_above')
-                col = f"df['ma_{ma_type}_{period}']"
-                
-                if operator == 'price_above':
-                    conditions_buy.append(f"(df['close'] > {col})")
-                    conditions_sell.append(f"(df['close'] < {col})")
-                elif operator == 'price_below':
-                    conditions_buy.append(f"(df['close'] < {col})")
-                    conditions_sell.append(f"(df['close'] > {col})")
-                elif operator == 'cross_up':
-                    conditions_buy.append(f"(df['close'] > {col}) & (df['close'].shift(1) <= {col}.shift(1))")
-                    conditions_sell.append(f"(df['close'] < {col}) & (df['close'].shift(1) >= {col}.shift(1))")
-                elif operator == 'cross_down':
-                    conditions_buy.append(f"(df['close'] < {col}) & (df['close'].shift(1) >= {col}.shift(1))")
-                    conditions_sell.append(f"(df['close'] > {col}) & (df['close'].shift(1) <= {col}.shift(1))")
-
-            # ============================================================
-            # NEW OPERATORS (修复补全)
-            # ============================================================
-
-            elif ind == 'donchian_channel':
-                upper_period = params.get('upper_period', 20)
-                lower_period = params.get('lower_period', 10)
-                operator = rule.get('operator', 'price_break_upper')
-                upper = f"df['dc_{upper_period}_{lower_period}_upper']"
-                lower = f"df['dc_{upper_period}_{lower_period}_lower']"
-                mid = f"df['dc_{upper_period}_{lower_period}_mid']"
-                
-                if operator == 'price_break_upper':
-                    # 价格突破N日高点（用前一根K线的通道，避免前瞻偏差）
-                    conditions_buy.append(f"(df['close'] > {upper}.shift(1))")
-                    conditions_sell.append(f"(df['close'] < {lower}.shift(1))")
-                elif operator == 'price_break_lower':
-                    conditions_buy.append(f"(df['close'] < {lower}.shift(1))")
-                    conditions_sell.append(f"(df['close'] > {upper}.shift(1))")
-                elif operator == 'price_above_upper':
-                    conditions_buy.append(f"(df['close'] > {upper})")
-                    conditions_sell.append(f"(df['close'] < {lower})")
-                elif operator == 'price_below_lower':
-                    conditions_buy.append(f"(df['close'] < {lower})")
-                    conditions_sell.append(f"(df['close'] > {upper})")
-
-            elif ind == 'atr_channel':
-                period = params.get('period', 14)
-                multiplier = params.get('multiplier', 2.0)
-                operator = rule.get('operator', 'price_above_upper')
-                upper = f"df['atr_ch_{period}_upper']"
-                lower = f"df['atr_ch_{period}_lower']"
-                
-                if operator == 'price_above_upper':
-                    conditions_buy.append(f"(df['close'] > {upper}.shift(1))")
-                    conditions_sell.append(f"(df['close'] < {lower}.shift(1))")
-                elif operator == 'price_below_lower':
-                    conditions_buy.append(f"(df['close'] < {lower}.shift(1))")
-                    conditions_sell.append(f"(df['close'] > {upper}.shift(1))")
-
-            elif ind == 'volume':
-                period = params.get('period', 20)
-                operator = rule.get('operator', 'volume_above_ma')
-                threshold = rule.get('threshold', params.get('threshold', 1.5))
-                vol_ma = f"df['vol_ma_{period}']"
-                vol_ratio = f"df['vol_ratio_{period}']"
-                
-                if operator == 'volume_above_ma':
-                    conditions_buy.append(f"(df['volume'] > {vol_ma})")
-                    conditions_sell.append(f"(df['volume'] < {vol_ma})")
-                elif operator == 'volume_ratio_above':
-                    conditions_buy.append(f"({vol_ratio} > {threshold})")
-                    conditions_sell.append(f"({vol_ratio} < {threshold})")
-                elif operator == 'volume_ratio_below':
-                    conditions_buy.append(f"({vol_ratio} < {threshold})")
-                    conditions_sell.append(f"({vol_ratio} > {threshold})")
-                elif operator == 'volume_shrink':
-                    conditions_buy.append(f"({vol_ratio} < 0.8)")
-                    conditions_sell.append(f"({vol_ratio} > 1.2)")
-
-            elif ind == 'vwap':
-                deviation_pct = params.get('deviation_pct', 2.0)
-                operator = rule.get('operator', 'price_below_vwap_by')
-                vwap_col = "df['vwap']"
-                vwap_upper = "df['vwap_upper']"
-                vwap_lower = "df['vwap_lower']"
-                
-                if operator == 'price_below_vwap_by':
-                    # 价格低于VWAP超过偏离阈值 → 均值回归做多
-                    conditions_buy.append(f"(df['close'] < {vwap_lower})")
-                    conditions_sell.append(f"(df['close'] > {vwap_upper})")
-                elif operator == 'price_above_vwap':
-                    conditions_buy.append(f"(df['close'] > {vwap_col})")
-                    conditions_sell.append(f"(df['close'] < {vwap_col})")
-                elif operator == 'cross_up_vwap':
-                    conditions_buy.append(f"(df['close'] > {vwap_col}) & (df['close'].shift(1) <= {vwap_col}.shift(1))")
-                    conditions_sell.append(f"(df['close'] < {vwap_col}) & (df['close'].shift(1) >= {vwap_col}.shift(1))")
-
-            elif ind == 'bollinger_bandwidth':
-                period = params.get('period', 20)
-                std_dev = params.get('std_dev', 2.0)
-                squeeze_percentile = params.get('squeeze_percentile', 20)
-                operator = rule.get('operator', 'below_percentile')
-                pctile_col = f"df['bbw_{period}_{std_dev}_{squeeze_percentile}_pctile']"
-                lower_col = f"df['bbw_lower_{period}']"
-                
-                if operator == 'below_percentile':
-                    # 带宽处于历史低位 → 收缩
-                    conditions_buy.append(f"({pctile_col} < {squeeze_percentile})")
-                    conditions_sell.append(f"({pctile_col} > {100 - squeeze_percentile})")
-
-            elif ind == 'recent_surge':
-                # 近期大涨检测
-                lookback = params.get('lookback', 10)
-                operator = rule.get('operator', 'has_surge')
-                if operator == 'has_surge':
-                    conditions_buy.append(f"(df['has_recent_surge_{lookback}'])")
-
-            elif ind == 'dragon_pullback':
-                # 龙回头: 大涨后回调到买入区间
-                high_lookback = params.get('high_lookback', 10)
-                operator = rule.get('operator', 'in_pullback_zone')
-                if operator == 'in_pullback_zone':
-                    conditions_buy.append(f"(df['dpb_in_zone_{high_lookback}'])")
-
-            elif ind == 'close_position':
-                # 收盘强度：收盘价在当日K线中的位置
-                operator = rule.get('operator', 'above')
-                threshold = rule.get('threshold', params.get('threshold', 0.7))
-                if operator == 'above':
-                    conditions_buy.append(f"(df['close_position'] > {threshold})")
-                elif operator == 'below':
-                    conditions_buy.append(f"(df['close_position'] < {threshold})")
-
-            elif ind == 'limitup_detect':
-                operator = rule.get('operator', 'is_limitup')
-                if operator == 'is_limitup':
-                    conditions_buy.append("(df['is_limitup'])")
-                    # 卖出由其他规则（RSI、止损等）提供
-
-            elif ind == 'price_volume_divergence':
-                operator = rule.get('operator', 'bullish_divergence')
-                lookback = params.get('lookback', 20)
-
-                if operator == 'bullish_divergence':
-                    # 买入: 经典动量底背离（价格新低但RSI没新低）
-                    conditions_buy.append("(df['pvd_bullish'])")
-                    # 卖出: 经典动量顶背离（价格新高但RSI没新高）
-                    conditions_sell.append("(df['pvd_bearish'])")
-
-            # ============================================================
-            # NEW INDICATORS / OPERATORS (自定义中短线策略所需)
-            # ============================================================
-
-            elif ind == 'change_pct':
-                # 当日涨幅
-                operator = rule.get('operator', '>=')
-                thresh = rule.get('threshold', 0)
-                col = "df['change_pct']"
-                if operator == '>=':
-                    conditions_buy.append(f"({col} >= {thresh})")
-                elif operator == '<=':
-                    conditions_buy.append(f"({col} <= {thresh})")
-                elif operator == '>':
-                    conditions_buy.append(f"({col} > {thresh})")
-                elif operator == '<':
-                    conditions_buy.append(f"({col} < {thresh})")
-                elif operator == 'between':
-                    low, high = thresh
-                    conditions_buy.append(f"({col} >= {low}) & ({col} <= {high})")
-
-            elif ind == 'open_gap':
-                # 开盘跳空
-                operator = rule.get('operator', '<')
-                thresh = rule.get('threshold', 0)
-                col = "df['open_gap']"
-                if operator == '<':
-                    conditions_buy.append(f"({col} < {thresh})")
-                elif operator == '>':
-                    conditions_buy.append(f"({col} > {thresh})")
-                elif operator == '<=':
-                    conditions_buy.append(f"({col} <= {thresh})")
-                elif operator == '>=':
-                    conditions_buy.append(f"({col} >= {thresh})")
-                elif operator == 'between':
-                    low, high = thresh
-                    conditions_buy.append(f"({col} >= {low}) & ({col} <= {high})")
-
-            elif ind == 'period_return':
-                # N 日累计涨幅
-                lookback = params.get('lookback', 5)
-                operator = rule.get('operator', '>=')
-                thresh = rule.get('threshold', 0)
-                col = f"df['period_return_{lookback}']"
-                if operator == '>=':
-                    conditions_buy.append(f"({col} >= {thresh})")
-                elif operator == '<=':
-                    conditions_buy.append(f"({col} <= {thresh})")
-                elif operator == '>':
-                    conditions_buy.append(f"({col} > {thresh})")
-                elif operator == '<':
-                    conditions_buy.append(f"({col} < {thresh})")
-                elif operator == 'between':
-                    low, high = thresh
-                    conditions_buy.append(f"({col} >= {low}) & ({col} <= {high})")
-
-            elif ind == 'drawdown_from_high':
-                # 从 N 日高点的回撤
-                lookback = params.get('lookback', 20)
-                operator = rule.get('operator', 'between')
-                thresh = rule.get('threshold', 0)
-                col = f"df['drawdown_from_high_{lookback}']"
-                if operator == 'between':
-                    low, high = thresh
-                    conditions_buy.append(f"({col} >= {low}) & ({col} <= {high})")
-                elif operator == '<=':
-                    conditions_buy.append(f"({col} <= {thresh})")
-                elif operator == '>=':
-                    conditions_buy.append(f"({col} >= {thresh})")
+        # ── 出场条件（生成 raw_sell）──
+        if exit_rules:
+            # 有独立出场规则：用 exit_rules 生成 raw_sell
+            for rule in exit_rules:
+                cond = self._rule_to_condition(rule)
+                if cond:
+                    conditions_sell.append(cond)
+        else:
+            # 无独立出场规则：反转入场条件（向后兼容）
+            for rule in rules:
+                cond = self._rule_to_condition(rule, invert=True)
+                if cond:
+                    conditions_sell.append(cond)
 
         if conditions_buy:
             code += f"\ndf['raw_buy'] = {' & '.join(conditions_buy)}\n"
+        # 出场条件用 OR：任一满足即出场（趋势破坏/动量反转都独立触发出场）
         if conditions_sell:
-            code += f"\ndf['raw_sell'] = {' & '.join(conditions_sell)}\n"
-            
+            code += f"\ndf['raw_sell'] = {' | '.join(conditions_sell)}\n"
+
         return code
+
+    def _rule_to_condition(self, rule, invert=False):
+        """将单条规则转为条件表达式。invert=True 时取反（用于无 exit_rules 时的向后兼容）。"""
+        ind = rule.get('indicator')
+        params = rule.get('params', {})
+        operator = rule.get('operator', '')
+        thresh = rule.get('threshold')
+
+        cond = None
+
+        if ind == 'supertrend':
+            signal = rule.get('signal', 'trend_bullish')
+            if signal == 'trend_bullish':
+                cond = "(df['st_trend'] == 1) & (df['st_trend'].shift(1) == -1)"
+            elif signal == 'is_uptrend':
+                cond = "(df['st_trend'] == 1)"
+
+        elif ind == 'ema':
+            period = params.get('period', 20)
+            col = f"df['ema_{period}']"
+            if operator == 'price_above':
+                cond = f"(df['close'] > {col})"
+            elif operator == 'price_below':
+                cond = f"(df['close'] < {col})"
+            elif operator == 'cross_up':
+                cond = f"(df['close'] > {col}) & (df['close'].shift(1) <= {col}.shift(1))"
+            elif operator == 'cross_down':
+                cond = f"(df['close'] < {col}) & (df['close'].shift(1) >= {col}.shift(1))"
+            elif operator == 'price_near':
+                cond = f"(abs(df['close'] - {col}) / {col} * 100 < {thresh})"
+
+        elif ind == 'rsi':
+            period = params.get('period', 14)
+            thresh = params.get('threshold', 30)
+            col = f"df['rsi_{period}']"
+            if operator == '<':
+                cond = f"({col} < {thresh})"
+            elif operator == '>':
+                cond = f"({col} > {thresh})"
+            elif operator == 'cross_up':
+                cond = f"({col} > {thresh}) & ({col}.shift(1) <= {thresh})"
+            elif operator == 'cross_down':
+                cond = f"({col} < {thresh}) & ({col}.shift(1) >= {thresh})"
+            elif operator == 'between':
+                low, high = thresh
+                cond = f"({col} >= {low}) & ({col} <= {high})"
+
+        elif ind == 'macd':
+            fast = params.get('fast_period', 12)
+            slow = params.get('slow_period', 26)
+            sig = params.get('signal_period', 9)
+            line_col = f"df['macd_{fast}_{slow}_{sig}_line']"
+            sig_col = f"df['macd_{fast}_{slow}_{sig}_signal']"
+            hist_col = f"df['macd_{fast}_{slow}_{sig}_hist']"
+            if operator == 'diff_gt_dea':
+                cond = f"({line_col} > {sig_col})"
+            elif operator == 'diff_lt_dea':
+                cond = f"({line_col} < {sig_col})"
+            elif operator == 'cross_up':
+                cond = f"({line_col} > {sig_col}) & ({line_col}.shift(1) <= {sig_col}.shift(1))"
+            elif operator == 'cross_down':
+                cond = f"({line_col} < {sig_col}) & ({line_col}.shift(1) >= {sig_col}.shift(1))"
+            elif operator == 'histogram_positive':
+                cond = f"({hist_col} > 0) & ({hist_col}.shift(1) <= 0)"
+            elif operator == 'histogram_negative':
+                cond = f"({hist_col} < 0) & ({hist_col}.shift(1) >= 0)"
+
+        elif ind == 'kdj':
+            period = params.get('period', 9)
+            signal_period = params.get('signal_period', 3)
+            k_col = f"df['kdj_{period}_{signal_period}_k']"
+            d_col = f"df['kdj_{period}_{signal_period}_d']"
+            if operator == 'k_gt_d':
+                cond = f"({k_col} > {d_col})"
+            elif operator == 'k_lt_d':
+                cond = f"({k_col} < {d_col})"
+            elif operator == 'gold_cross':
+                cond = f"({k_col} > {d_col}) & ({k_col}.shift(1) <= {d_col}.shift(1))"
+            elif operator == 'death_cross':
+                cond = f"({k_col} < {d_col}) & ({k_col}.shift(1) >= {d_col}.shift(1))"
+
+        elif ind == 'ma':
+            period = params.get('period', 20)
+            ma_type = params.get('ma_type', 'sma')
+            col = f"df['ma_{ma_type}_{period}']"
+            if operator == 'price_above':
+                cond = f"(df['close'] > {col})"
+            elif operator == 'price_below':
+                cond = f"(df['close'] < {col})"
+            elif operator == 'cross_up':
+                cond = f"(df['close'] > {col}) & (df['close'].shift(1) <= {col}.shift(1))"
+            elif operator == 'cross_down':
+                cond = f"(df['close'] < {col}) & (df['close'].shift(1) >= {col}.shift(1))"
+
+        elif ind == 'bollinger':
+            period = params.get('period', 20)
+            std_dev = params.get('std_dev', 2.0)
+            upper = f"df['bb_{period}_{std_dev}_upper']"
+            lower = f"df['bb_{period}_{std_dev}_lower']"
+            mid = f"df['bb_{period}_{std_dev}_mid']"
+            if operator == 'price_above_upper':
+                cond = f"(df['close'] > {upper})"
+            elif operator == 'price_below_lower':
+                cond = f"(df['close'] < {lower})"
+            elif operator == 'price_above_mid':
+                cond = f"(df['close'] > {mid})"
+            elif operator == 'price_below_mid':
+                cond = f"(df['close'] < {mid})"
+            elif operator == 'cross_up_lower':
+                cond = f"(df['close'] > {lower}) & (df['close'].shift(1) <= {lower}.shift(1))"
+            elif operator == 'cross_down_upper':
+                cond = f"(df['close'] < {upper}) & (df['close'].shift(1) >= {upper}.shift(1))"
+
+        elif ind == 'donchian_channel':
+            upper_period = params.get('upper_period', 20)
+            lower_period = params.get('lower_period', 10)
+            upper = f"df['dc_{upper_period}_{lower_period}_upper']"
+            lower = f"df['dc_{upper_period}_{lower_period}_lower']"
+            if operator == 'price_break_upper':
+                cond = f"(df['close'] > {upper}.shift(1))"
+            elif operator == 'price_break_lower':
+                cond = f"(df['close'] < {lower}.shift(1))"
+
+        elif ind == 'volume':
+            period = params.get('period', 20)
+            col = f"df['vol_ratio_{period}']"
+            if operator == 'volume_ratio_above':
+                cond = f"({col} > {thresh})"
+
+        elif ind == 'atr_channel':
+            period = params.get('period', 14)
+            multiplier = params.get('multiplier', 2.0)
+            upper = f"df['atr_upper_{period}_{multiplier}']"
+            lower = f"df['atr_lower_{period}_{multiplier}']"
+            if operator == 'price_above_upper':
+                cond = f"(df['close'] > {upper})"
+            elif operator == 'price_below_lower':
+                cond = f"(df['close'] < {lower})"
+
+        elif ind == 'adx':
+            period = params.get('period', 14)
+            thresh = params.get('threshold', 25)
+            col = f"df['adx_{period}']"
+            if operator == '>':
+                cond = f"({col} > {thresh})"
+            elif operator == '<':
+                cond = f"({col} < {thresh})"
+
+        elif ind == 'cci':
+            period = params.get('period', 20)
+            thresh = params.get('threshold', 100)
+            col = f"df['cci_{period}']"
+            if operator == '>':
+                cond = f"({col} > {thresh})"
+            elif operator == '<':
+                cond = f"({col} < {thresh})"
+            elif operator == 'cross_up':
+                cond = f"({col} > {thresh}) & ({col}.shift(1) <= {thresh})"
+            elif operator == 'cross_down':
+                cond = f"({col} < {thresh}) & ({col}.shift(1) >= {thresh})"
+
+        elif ind == 'custom_column':
+            col = rule.get('column', '')
+            if col and operator:
+                cond = f"(df['{col}'] {operator} {thresh})"
+
+        # 取反（用于无 exit_rules 时的向后兼容）
+        if cond and invert:
+            cond = f"~({cond})"
+
+        return cond
 
     def _get_core_loop(self, pos_config, pyr_rules, risk_mgmt, exit_mode=None):
         if exit_mode == "next_bar_open_exit":

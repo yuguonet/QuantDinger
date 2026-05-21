@@ -216,7 +216,7 @@ vol_ratio_cur = df['volume'] / vol_ma.replace(0, np.nan)"""
 # ============================================================
 
 def _build_macd_kdj_resonance_config(p: dict) -> dict:
-    """MACD 金叉 + KDJ 金叉共振，双重确认"""
+    """MACD 金叉 + KDJ 共振，双重确认入场 + 独立出场规则"""
     entry_rules = [
         {
             "indicator": "macd",
@@ -225,12 +225,12 @@ def _build_macd_kdj_resonance_config(p: dict) -> dict:
                 "slow_period": p["macd_slow"],
                 "signal_period": p["macd_signal"],
             },
-            "operator": "diff_gt_dea",  # MACD > signal（状态持续）
+            "operator": "cross_up",  # MACD 金叉（diff 上穿 DEA）
         },
         {
             "indicator": "kdj",
             "params": {"period": p["kdj_period"], "signal_period": p["kdj_signal"]},
-            "operator": "k_gt_d",  # K > D（状态持续）
+            "operator": "gold_cross",  # KDJ 金叉（K 上穿 D）
         },
     ]
     if p.get("use_ma_filter"):
@@ -240,9 +240,40 @@ def _build_macd_kdj_resonance_config(p: dict) -> dict:
             "operator": "price_above",
         })
 
+    # 独立出场规则：与入场逻辑解耦
+    # 设计原则：出场比入场宽松，不要被正常回调洗出去
+    #
+    # 出场条件1：价格跌破 EMA（趋势破坏确认）
+    #   - 用较长周期（默认30），过滤短期噪音
+    #   - 短EMA(20)在震荡市会被反复假突破
+    #
+    # 出场条件2：MACD 柱状线从正转负（动量反转）
+    #   - MACD hist 从红变绿 = 多头动量耗尽
+    #   - 与入场的 MACD diff>dea 呼应，但更灵敏
+    #
+    # 两个条件用 OR：任一满足即出场
+    exit_ema_period = p.get("exit_ema_period", 30)
+    exit_rules = [
+        {
+            "indicator": "ema",
+            "params": {"period": exit_ema_period},
+            "operator": "price_below",
+        },
+        {
+            "indicator": "macd",
+            "params": {
+                "fast_period": p["macd_fast"],
+                "slow_period": p["macd_slow"],
+                "signal_period": p["macd_signal"],
+            },
+            "operator": "histogram_negative",  # MACD柱状线从正转负
+        },
+    ]
+
     return {
         "name": f"MACD_KDJ_{p['macd_fast']}_{p['kdj_period']}",
         "entry_rules": entry_rules,
+        "exit_rules": exit_rules,
         "position_config": {"initial_size_pct": 100, "leverage": 1, "max_pyramiding": 0},
         "pyramiding_rules": {"enabled": False},
         "risk_management": {
@@ -252,7 +283,7 @@ def _build_macd_kdj_resonance_config(p: dict) -> dict:
                 "enabled": True,
                 "type": "trailing_pct",
                 "activation_profit": p.get("trailing_activation", 8.0),  # 盈利8%后激活
-                "callback_pct": p.get("trailing_callback", 8.0),         # 从最高点回撤5%出场
+                "callback_pct": p.get("trailing_callback", 8.0),         # 从最高点回撤8%出场
             },
             "ashare_rules": {"t_plus_1": True, "price_limit": True, "min_lot": 100},
         },
@@ -460,6 +491,7 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
         },
         "constraints": [],
         "build_config": _build_atr_breakout_config,
+        "strategy_defaults": {"tradeDirection": "long"},
     },
 
     # ── 2. 量价背离 ──
@@ -478,6 +510,7 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
         },
         "constraints": [],
         "build_config": _build_volume_price_divergence_config,
+        "strategy_defaults": {"tradeDirection": "long"},
     },
 
     # ── 3. 双均线 + 成交量 ──
@@ -500,6 +533,7 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
         ],
         "build_config": _build_dual_ma_volume_config,
         "build_strategy": _build_dual_ma_volume_strategy,
+        "strategy_defaults": {"tradeDirection": "long"},
     },
 
     # ── 4. MACD + KDJ 共振 ──
@@ -519,12 +553,14 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "take_profit_pct": _p_float(10.0, 30.0, 1.0),
             "trailing_activation": _p_float(5.0, 15.0, 1.0),
             "trailing_callback": _p_float(5.0, 12.0, 0.5),
+            "exit_ema_period": _p_int(15, 40, 5),
             "position_pct": POSITION_PCT,
         },
         "constraints": [
             ("macd_fast", "<", "macd_slow"),
         ],
         "build_config": _build_macd_kdj_resonance_config,
+        "strategy_defaults": {"tradeDirection": "long"},
     },
 
     # ── 6. 价格通道突破 ──
@@ -542,6 +578,7 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             ("exit_period", "<", "entry_period"),
         ],
         "build_config": _build_price_channel_config,
+        "strategy_defaults": {"tradeDirection": "long"},
     },
 
     # ── 7. 海龟交易法 ──
@@ -563,6 +600,7 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             ("exit_breakout", "<", "entry_breakout"),
         ],
         "build_config": _build_turtle_trading_config,
+        "strategy_defaults": {"tradeDirection": "long"},
     },
 
     # ── 8. VWAP 偏离 ──
@@ -579,6 +617,7 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
         },
         "constraints": [],
         "build_config": _build_vwap_deviation_config,
+        "strategy_defaults": {"tradeDirection": "long"},
     },
 
     # ── 9. EMA + RSI + 量能三重过滤 ──
@@ -598,6 +637,7 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
         },
         "constraints": [],
         "build_config": _build_ema_rsi_volume_config,
+        "strategy_defaults": {"tradeDirection": "long"},
     },
 
     # ── 10. KDJ + MACD + 均线三重共振 ──
@@ -620,5 +660,6 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             ("macd_fast", "<", "macd_slow"),
         ],
         "build_config": _build_kdj_macd_ma_triple_config,
+        "strategy_defaults": {"tradeDirection": "long"},
     },
 }

@@ -105,6 +105,15 @@ def _ensure_cn_last_update_table(pool_name: str = "CNStock"):
                         )
                     """)
                     # (tf, last_bar_time) 唯一约束: 同周期同交易日只保留一条
+                    # 先去重: 保留每个 (tf, last_bar_time) 最新的一行，删除旧的
+                    cur.execute("""
+                        DELETE FROM cn_last_update
+                        WHERE id NOT IN (
+                            SELECT DISTINCT ON (tf, last_bar_time) id
+                            FROM cn_last_update
+                            ORDER BY tf, last_bar_time, last_updated DESC
+                        );
+                    """)
                     cur.execute("""
                         DO $$
                         BEGIN
@@ -1196,12 +1205,13 @@ def _run_task(task: str):
             _schedule_next(task, _next_trigger_time(task))
             return
 
-        # ③ 判断: 上次数据交易日 > 前一交易日 cutoff → 全新拉取; 否则 → 修复
-        # 用 last_bar_time（数据所属交易日）判断，不用 last_updated（同步执行时间）
-        # 否则跨夜重试（如周五17:00开始重试到周六凌晨）会导致 last_updated 越过 cutoff 误判为全新拉取
-        cutoff = _prev_trading_day_cutoff(task)
-        if last_bar_time and last_bar_time > cutoff:
-            # ── 全新拉取 ──
+        # ③ 判断: 数据交易日 >= 前一交易日 → 已完成，不拉取; 否则 → 全新拉取或修复
+        # 统一用日期比较（15m 和 1D 都适用）
+        prev_td = prev_trading_day(today_str)
+        prev_td_date = datetime.strptime(prev_td, "%Y-%m-%d").date()
+        is_fresh = last_bar_time and last_bar_time.date() > prev_td_date
+        if is_fresh:
+            # ── 全新拉取 ──（数据交易日已超过前一交易日，说明是新交易日）
             _repair_attempts.pop(task, None)  # 新交易日，重置计数
             _run_fresh_pull(task, doc, last_status)
         else:
@@ -1410,13 +1420,16 @@ def start_scheduler():
         )
 
         # 用 last_bar_time（数据所属交易日）判断，避免跨夜同步导致今日任务被跳过
-        if last_bar_time and last_bar_time > cutoff_startup:
-            # 数据交易日 > 前一交易日 15:00 → 正常退出（不调度，等下一个交易日触发时间）
-            logger.info(f"[调度] {task} 启动检查: 数据交易日 {last_bar_time:%m-%d %H:%M} > 前一交易日 15:00, 正常退出")
+        # 直接比较数据交易日与前一交易日: 数据 >= 前一交易日 → 已同步，跳过
+        prev_td = prev_trading_day(today_str)
+        prev_td_date = datetime.strptime(prev_td, "%Y-%m-%d").date()
+        if last_bar_time and last_bar_time.date() >= prev_td_date:
+            # 数据交易日 >= 前一交易日 → 正常退出（不调度，等下一个交易日触发时间）
+            logger.info(f"[调度] {task} 启动检查: 数据交易日 {last_bar_time:%m-%d} >= 前一交易日 {prev_td}, 正常退出")
             _schedule_next(task, _next_trigger_time(task))
         else:
             # 否则 → 加 120s 后任务调度
-            logger.info(f"[调度] {task} 启动检查: 数据交易日 {'无记录' if not last_bar_time else f'{last_bar_time:%m-%d %H:%M}'} <= 前一交易日 15:00, {_INITIAL_DELAY}s 后执行")
+            logger.info(f"[调度] {task} 启动检查: 数据交易日 {'无记录' if not last_bar_time else f'{last_bar_time:%m-%d}'} < 前一交易日 {prev_td}, {_INITIAL_DELAY}s 后执行")
             _schedule_next(task, delay_seconds=_INITIAL_DELAY)
 
 
