@@ -394,6 +394,7 @@ class SectorAggregator:
             df = pd.DataFrame(kline_data)
             if "time" in df.columns:
                 df["time"] = pd.to_datetime(df["time"])
+                df = df.set_index("time")  # 关键：设置 time 为索引，与原始 _fetch_kline_data 保持一致
             return df
 
         # 过滤出本地有数据的股票

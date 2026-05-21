@@ -31,7 +31,7 @@ def _p_choice(choices: list) -> dict:
 
 
 # 小资金仓位档位
-POSITION_PCT = _p_choice([25, 33, 50, 100])
+POSITION_PCT = _p_choice([100, 75, 50, 25])
 
 
 # ============================================================
@@ -225,12 +225,12 @@ def _build_macd_kdj_resonance_config(p: dict) -> dict:
                 "slow_period": p["macd_slow"],
                 "signal_period": p["macd_signal"],
             },
-            "operator": "cross_up",
+            "operator": "diff_gt_dea",  # MACD > signal（状态持续）
         },
         {
             "indicator": "kdj",
             "params": {"period": p["kdj_period"], "signal_period": p["kdj_signal"]},
-            "operator": "gold_cross",
+            "operator": "k_gt_d",  # K > D（状态持续）
         },
     ]
     if p.get("use_ma_filter"):
@@ -246,8 +246,15 @@ def _build_macd_kdj_resonance_config(p: dict) -> dict:
         "position_config": {"initial_size_pct": 100, "leverage": 1, "max_pyramiding": 0},
         "pyramiding_rules": {"enabled": False},
         "risk_management": {
-            "stop_loss": {"enabled": True, "value": p.get("stop_loss_pct", 5.0)},
-            "trailing_stop": {"enabled": False},
+            "stop_loss": {"enabled": True, "type": "percentage", "value": p.get("stop_loss_pct", 10.0)},
+            "take_profit": {"enabled": True, "type": "percentage", "value": p.get("take_profit_pct", 20.0)},
+            "trailing_stop": {
+                "enabled": True,
+                "type": "trailing_pct",
+                "activation_profit": p.get("trailing_activation", 8.0),  # 盈利8%后激活
+                "callback_pct": p.get("trailing_callback", 8.0),         # 从最高点回撤5%出场
+            },
+            "ashare_rules": {"t_plus_1": True, "price_limit": True, "min_lot": 100},
         },
     }
 
@@ -396,12 +403,12 @@ def _build_ema_rsi_volume_config(p: dict) -> dict:
 # ============================================================
 
 def _build_kdj_macd_ma_triple_config(p: dict) -> dict:
-    """三重指标共振：KDJ 金叉 + MACD 柱状线翻红 + 价格在均线上方"""
+    """三重指标共振：KDJ K>D + MACD 柱状线翻红 + 价格在均线上方"""
     entry_rules = [
         {
             "indicator": "kdj",
             "params": {"period": p["kdj_period"], "signal_period": p["kdj_signal"]},
-            "operator": "gold_cross",
+            "operator": "k_gt_d",  # K > D（状态持续）
         },
         {
             "indicator": "macd",
@@ -466,7 +473,7 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "vol_ma_period":    _p_int(10, 30, 1),
             "rsi_period":       _p_int(7, 21, 1),
             "rsi_oversold":     _p_int(20, 40, 1),
-            "stop_loss_pct":    _p_float(3.0, 8.0, 0.5),
+            "stop_loss_pct":    _p_float(5.0, 15.0, 0.5),
             "position_pct": POSITION_PCT,
         },
         "constraints": [],
@@ -485,7 +492,7 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "slow_type":      _p_choice(["sma", "ema"]),
             "vol_ma_period":  _p_int(10, 30, 1),
             "vol_ratio":      _p_float(1.2, 3.0, 0.1),
-            "stop_loss_pct":  _p_float(3.0, 8.0, 0.5),
+            "stop_loss_pct":  _p_float(5.0, 15.0, 0.5),
             "position_pct": POSITION_PCT,
         },
         "constraints": [
@@ -508,7 +515,10 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "kdj_signal":      _p_int(2, 5, 1),
             "use_ma_filter":   _p_choice([True, False]),
             "ma_filter_period": _p_int(20, 120, 10),
-            "stop_loss_pct":   _p_float(3.0, 8.0, 0.5),
+            "stop_loss_pct":   _p_float(5.0, 15.0, 0.5),
+            "take_profit_pct": _p_float(10.0, 30.0, 1.0),
+            "trailing_activation": _p_float(5.0, 15.0, 1.0),
+            "trailing_callback": _p_float(5.0, 12.0, 0.5),
             "position_pct": POSITION_PCT,
         },
         "constraints": [
@@ -564,7 +574,7 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "deviation_pct":  _p_float(1.0, 5.0, 0.1),
             "rsi_period":     _p_int(7, 21, 1),
             "rsi_level":      _p_int(25, 45, 1),
-            "stop_loss_pct":  _p_float(2.0, 5.0, 0.5),
+            "stop_loss_pct":  _p_float(5.0, 12.0, 0.5),
             "position_pct": POSITION_PCT,
         },
         "constraints": [],
@@ -582,8 +592,8 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "rsi_entry":      _p_int(25, 45, 1),
             "vol_ma_period":  _p_int(10, 30, 1),
             "vol_ratio":      _p_float(1.2, 3.0, 0.1),
-            "stop_loss_pct":  _p_float(3.0, 8.0, 0.5),
-            "trailing_pct":   _p_float(2.0, 5.0, 0.5),
+            "stop_loss_pct":  _p_float(5.0, 15.0, 0.5),
+            "trailing_pct":   _p_float(5.0, 12.0, 0.5),
             "position_pct": POSITION_PCT,
         },
         "constraints": [],
@@ -603,7 +613,7 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "macd_signal":   _p_int(5, 12, 1),
             "ma_period":     _p_int(10, 60, 5),
             "ma_type":       _p_choice(["sma", "ema"]),
-            "stop_loss_pct": _p_float(3.0, 8.0, 0.5),
+            "stop_loss_pct": _p_float(5.0, 15.0, 0.5),
             "position_pct": POSITION_PCT,
         },
         "constraints": [
