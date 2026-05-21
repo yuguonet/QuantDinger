@@ -63,7 +63,11 @@ def get_val(arr, i, default=0):
         stop_loss = risk_mgmt.get('stop_loss', {})
         sl_enabled = stop_loss.get('enabled', False)
         sl_pct = stop_loss.get('value', 0) / 100.0 if sl_enabled else 0.0
-        
+
+        take_profit = risk_mgmt.get('take_profit', {})
+        tp_enabled = take_profit.get('enabled', False)
+        tp_pct = take_profit.get('value', 0) / 100.0 if tp_enabled else 0.0
+
         trailing = risk_mgmt.get('trailing_stop', {})
         ts_enabled = trailing.get('enabled', False)
         ts_activation = trailing.get('activation_profit', 0) / 100.0
@@ -87,6 +91,7 @@ add_threshold_pct = {add_threshold}
 
 # Risk Management
 stop_loss_pct = {sl_pct}
+take_profit_pct = {tp_pct}
 take_profit_activation = {ts_activation}
 trailing_callback = {ts_callback}
 
@@ -798,7 +803,17 @@ for i in range(len(df)):
         profit_pct = (highest_price - avg_entry_price) / avg_entry_price if avg_entry_price > 0 else 0
         current_profit_pct = (current_close - avg_entry_price) / avg_entry_price if avg_entry_price > 0 else 0
 
-        # 1. Trailing Stop
+        # 1. Fixed Take Profit
+        if take_profit_pct > 0 and current_profit_pct >= take_profit_pct:
+            close_long_signals[i] = True
+            close_long_price[i] = current_close
+            close_long_text[i] = "Take Profit"
+            position = 0
+            position_count = 0
+            pending_exit = False
+            continue
+
+        # 2. Trailing Stop
         if take_profit_activation > 0 and profit_pct >= take_profit_activation:
             drawdown = (highest_price - current_close) / avg_entry_price if avg_entry_price > 0 else 0
             if drawdown >= trailing_callback:
@@ -810,7 +825,7 @@ for i in range(len(df)):
                 pending_exit = False
                 continue
 
-        # 2. Stop Loss
+        # 3. Stop Loss
         if stop_loss_pct > 0:
             loss_pct = (avg_entry_price - current_low) / avg_entry_price if avg_entry_price > 0 else 0
             if loss_pct >= stop_loss_pct:
@@ -865,7 +880,17 @@ for i in range(len(df)):
         profit_pct = (avg_entry_price - highest_price) / avg_entry_price if avg_entry_price > 0 else 0
         current_profit_pct = (avg_entry_price - current_close) / avg_entry_price if avg_entry_price > 0 else 0
 
-        # 1. Trailing Stop
+        # 1. Fixed Take Profit
+        if take_profit_pct > 0 and current_profit_pct >= take_profit_pct:
+            close_short_signals[i] = True
+            close_short_price[i] = current_close
+            close_short_text[i] = "Take Profit"
+            position = 0
+            position_count = 0
+            pending_exit = False
+            continue
+
+        # 2. Trailing Stop
         if take_profit_activation > 0 and profit_pct >= take_profit_activation:
             drawdown = (current_close - highest_price) / avg_entry_price if avg_entry_price > 0 else 0
             if drawdown >= trailing_callback:
@@ -877,7 +902,7 @@ for i in range(len(df)):
                 pending_exit = False
                 continue
 
-        # 2. Stop Loss
+        # 3. Stop Loss
         if stop_loss_pct > 0:
             loss_pct = (current_high - avg_entry_price) / avg_entry_price if avg_entry_price > 0 else 0
             if loss_pct >= stop_loss_pct:

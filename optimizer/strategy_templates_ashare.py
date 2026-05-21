@@ -314,6 +314,7 @@ def _build_macd_kdj_resonance_config(p: dict) -> dict:
         "pyramiding_rules": {"enabled": False},
         "risk_management": {
             "stop_loss": {"enabled": True, "type": "percentage", "value": p.get("stop_loss_pct", 10.0)},
+            "take_profit": {"enabled": True, "type": "percentage", "value": p.get("take_profit_pct", 25.0)},
             "trailing_stop": {
                 "enabled": True,
                 "type": "trailing_pct",
@@ -638,12 +639,14 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "use_ma_filter":   _p_choice([True, False]),
             "ma_filter_period": _p_int(20, 120, 10),
             "stop_loss_pct":   _p_float(5.0, 15.0, 0.5),
+            "take_profit_pct": _p_float(15.0, 40.0, 1.0),
             "trailing_activation": _p_float(5.0, 15.0, 1.0),
             "trailing_callback": _p_float(5.0, 12.0, 0.5),
             "position_pct": POSITION_PCT,
         },
         "constraints": [
             ("macd_fast", "<", "macd_slow"),
+            ("trailing_callback", "<", "trailing_activation"),
         ],
         "build_config": _build_macd_kdj_resonance_config,
         "strategy_defaults": {"tradeDirection": "long"},

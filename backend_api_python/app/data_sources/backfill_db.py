@@ -184,24 +184,23 @@ def _get_last_update(source_name: str, tf: str, pool_name: str = "CNStock") -> d
         return None
 
 
-def _record_update(source_name: str, tf: str, status: str, report: str,
+def _insert_record(source_name: str, tf: str, status: str, report: str,
                    last_bar_time: datetime | None = None,
                    synced_count: int | None = None,
                    failed_count: int | None = None,
                    pool_name: str = "CNStock",
                    record_id: str | None = None,
                    written_count: int | None = None):
-    """写入/更新同步记录到 cn_last_update。
+    """INSERT 新行到 cn_last_update。
 
-    以 (tf, last_bar_time) 为去重键:
-      - 首次: INSERT 新行
-      - 同周期同交易日重试: UPDATE 已有行
-      - 新交易日: INSERT 新行（不覆盖历史）
+    用于: 新交易日首次写入（全新拉取），(tf, last_bar_time) 不存在时。
+    如果 (tf, last_bar_time) 已存在（唯一约束冲突），降级为 UPDATE。
     """
     _ensure_cn_last_update_table(pool_name)
     try:
         if record_id is None:
             record_id = f"{source_name}_{tf}_{int(datetime.now().timestamp() * 1000)}"
+        naive_lbt = last_bar_time.replace(tzinfo=None) if last_bar_time and last_bar_time.tzinfo else last_bar_time
         mgr = get_market_db_manager()
         pool = mgr._get_pool(pool_name)
         with pool.connection() as conn:
@@ -219,13 +218,62 @@ def _record_update(source_name: str, tf: str, status: str, report: str,
                         synced_count = EXCLUDED.synced_count,
                         failed_count = EXCLUDED.failed_count,
                         written_count = EXCLUDED.written_count
-                """, (record_id, tf,
-                      last_bar_time.replace(tzinfo=None) if last_bar_time and last_bar_time.tzinfo else last_bar_time,
-                      status, report,
+                """, (record_id, tf, naive_lbt, status, report,
                       synced_count, failed_count, written_count))
                 conn.commit()
     except Exception as e:
-        logger.error(f"[同步] 写入 cn_last_update 失败: {e}")
+        logger.error(f"[同步] INSERT cn_last_update 失败: {e}")
+
+
+def _update_record(source_name: str, tf: str, last_bar_time: datetime,
+                   status: str | None = None, report: str | None = None,
+                   synced_count: int | None = None,
+                   failed_count: int | None = None,
+                   written_count: int | None = None,
+                   pool_name: str = "CNStock"):
+    """UPDATE 已有行，按 (tf, last_bar_time) 定位。
+
+    用于: 同一交易日修复/重试后更新 status、report 等字段。
+    只更新传入的非 None 字段。
+    """
+    _ensure_cn_last_update_table(pool_name)
+    naive_lbt = last_bar_time.replace(tzinfo=None) if last_bar_time.tzinfo else last_bar_time
+    sets = ["last_updated = NOW() AT TIME ZONE 'Asia/Shanghai'"]
+    params: list = []
+    if status is not None:
+        sets.append("status = %s")
+        params.append(status)
+    if report is not None:
+        sets.append("report = %s")
+        params.append(report)
+    if synced_count is not None:
+        sets.append("synced_count = %s")
+        params.append(synced_count)
+    if failed_count is not None:
+        sets.append("failed_count = %s")
+        params.append(failed_count)
+    if written_count is not None:
+        sets.append("written_count = %s")
+        params.append(written_count)
+    if len(sets) == 1:
+        return  # 无字段需要更新
+    params.extend([tf, naive_lbt])
+    try:
+        mgr = get_market_db_manager()
+        pool = mgr._get_pool(pool_name)
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"""
+                    UPDATE cn_last_update
+                    SET {', '.join(sets)}
+                    WHERE tf = %s AND last_bar_time = %s
+                """, params)
+                updated = cur.rowcount
+                conn.commit()
+                if updated == 0:
+                    logger.warning(f"[同步] UPDATE cn_last_update 未匹配: tf={tf}, last_bar_time={naive_lbt}")
+    except Exception as e:
+        logger.error(f"[同步] UPDATE cn_last_update 失败: {e}")
 
 
 # ================================================================
@@ -394,26 +442,24 @@ class BackfillDB:
 
         pool = self.source.db_pool
 
+        # 提前读取已有记录，异常时用于 update
+        existing_doc = _get_last_update(self.source.name, tf, pool_name=pool)
+        existing_lbt = _parse_db_timestamp(existing_doc.get("last_bar_time")) if existing_doc else None
+
         try:
             if tf == "15m":
                 # 判断是否当天首次运行（用于决定是否清除当日旧 bar）
                 # 用 last_bar_time 判断数据所属交易日，避免跨夜运行导致误判
-                doc = _get_last_update(self.source.name, "15m", pool_name=pool)
                 is_first_run = True
-                if doc:
-                    lbt = _parse_db_timestamp(doc.get("last_bar_time"))
-                    if lbt and _same_trading_day(lbt, datetime.now(TZ_CN)):
-                        is_first_run = False
+                if existing_lbt and _same_trading_day(existing_lbt, datetime.now(TZ_CN)):
+                    is_first_run = False
                 written, failed = self._sync_15m(symbols, is_first_run=is_first_run)
             elif tf == "1D":
                 # 判断是否当天首次运行（用于决定是否清除当日旧 bar）
                 # 用 last_bar_time 判断数据所属交易日，避免跨夜运行导致误判
-                doc = _get_last_update(self.source.name, "1D", pool_name=pool)
                 is_first_run = True
-                if doc:
-                    lbt = _parse_db_timestamp(doc.get("last_bar_time"))
-                    if lbt and _same_trading_day(lbt, datetime.now(TZ_CN)):
-                        is_first_run = False
+                if existing_lbt and _same_trading_day(existing_lbt, datetime.now(TZ_CN)):
+                    is_first_run = False
                 written, failed = self._sync_1d(symbols, is_first_run=is_first_run)
             else:
                 return {
@@ -423,7 +469,17 @@ class BackfillDB:
         except Exception as e:
             report = f"同步异常: {e}"
             logger.error(f"[同步] {self.source.name} tf={tf} {report}")
-            _record_update(self.source.name, tf, "error", report, pool_name=pool, written_count=0)
+            if existing_lbt:
+                _update_record(self.source.name, tf, existing_lbt,
+                              status="error", report=report, pool_name=pool,
+                              failed_count=(existing_doc.get("failed_count") or 0) + 1 if existing_doc else None,
+                              synced_count=existing_doc.get("synced_count") if existing_doc else None,
+                              written_count=existing_doc.get("written_count") if existing_doc else None)
+            else:
+                # 无已有记录 → INSERT 一条 error 记录，避免错误被吞
+                _insert_record(self.source.name, tf, "error", report,
+                              last_bar_time=datetime.now(TZ_CN).replace(hour=0, minute=0, second=0, microsecond=0),
+                              synced_count=0, failed_count=1, pool_name=pool, written_count=0)
             return {
                 "source": self.source.name, "tf": tf,
                 "written": 0, "status": "error", "report": report,
@@ -615,6 +671,17 @@ class BackfillDB:
 
         pool = self.source.db_pool
 
+        # ── 新交易日首次写入: INSERT 初始记录 ──
+        existing = _get_last_update(self.source.name, "15m", pool_name=pool)
+        existing_lbt = _parse_db_timestamp(existing.get("last_bar_time")) if existing else None
+        if not existing_lbt or not _same_trading_day(existing_lbt, bar_time):
+            _insert_record(
+                self.source.name, "15m", "re",
+                f"开始同步 15m ({total_symbols} 只标的)",
+                last_bar_time=bar_time, synced_count=0,
+                failed_count=0, pool_name=pool, written_count=0,
+            )
+
         # ── 循环拉取 + 修复 ──
         total_written = 0
         round_num = 0
@@ -715,10 +782,11 @@ class BackfillDB:
                     f"写入 {rw}，累计 {final_count}/{total_symbols}，剩余失败 {len(failed)}"
                 )
 
-                _record_update(
-                    self.source.name, "15m", "re",
-                    f"修复中: {final_count}/{total_symbols}, 失败 {len(failed)}",
-                    last_bar_time=bar_time, synced_count=final_count,
+                _update_record(
+                    self.source.name, "15m", bar_time,
+                    status="re",
+                    report=f"修复中: {final_count}/{total_symbols}, 失败 {len(failed)}",
+                    synced_count=final_count,
                     failed_count=len(failed), pool_name=pool,
                     written_count=rw,
                 )
@@ -741,9 +809,10 @@ class BackfillDB:
         sync_rate = final_count / total_symbols if total_symbols > 0 else 0
         final_status = "ok" if sync_rate > 0.9 and not failed else "re"
 
-        _record_update(
-            self.source.name, "15m", final_status, report,
-            last_bar_time=bar_time, synced_count=final_count,
+        _update_record(
+            self.source.name, "15m", bar_time,
+            status=final_status, report=report,
+            synced_count=final_count,
             failed_count=len(failed), pool_name=pool,
             written_count=total_written,
         )
@@ -806,6 +875,17 @@ class BackfillDB:
         )
 
         pool = self.source.db_pool
+
+        # ── 新交易日首次写入: INSERT 初始记录 ──
+        existing = _get_last_update(self.source.name, "1D", pool_name=pool)
+        existing_lbt = _parse_db_timestamp(existing.get("last_bar_time")) if existing else None
+        if not existing_lbt or not _same_trading_day(existing_lbt, bar_time):
+            _insert_record(
+                self.source.name, "1D", "re",
+                f"开始同步 1D ({total_symbols} 只标的)",
+                last_bar_time=bar_time, synced_count=0,
+                failed_count=0, pool_name=pool, written_count=0,
+            )
 
         # ── 循环拉取，直到全部同步或 0 新增 ──
         total_written = 0
@@ -977,10 +1057,11 @@ class BackfillDB:
                 )
 
                 # 写一轮落一次盘，重启可续
-                _record_update(
-                    self.source.name, "1D", "re",
-                    f"修复中: {final_count}/{total_symbols}, 失败 {len(failed)}",
-                    last_bar_time=bar_time, synced_count=final_count,
+                _update_record(
+                    self.source.name, "1D", bar_time,
+                    status="re",
+                    report=f"修复中: {final_count}/{total_symbols}, 失败 {len(failed)}",
+                    synced_count=final_count,
                     failed_count=len(failed), pool_name=pool,
                     written_count=rw,
                 )
@@ -1003,9 +1084,10 @@ class BackfillDB:
         sync_rate = final_count / total_symbols if total_symbols > 0 else 0
         final_status = "ok" if sync_rate > 0.9 and not failed else "re"
 
-        _record_update(
-            self.source.name, "1D", final_status, report,
-            last_bar_time=bar_time, synced_count=final_count,
+        _update_record(
+            self.source.name, "1D", bar_time,
+            status=final_status, report=report,
+            synced_count=final_count,
             failed_count=len(failed), pool_name=pool,
             written_count=total_written,
         )
@@ -1225,6 +1307,7 @@ def _run_fresh_pull(task: str, doc: dict | None, last_status: str):
         total = synced + failed
         sync_rate = synced / total if total > 0 else 0
         status = doc.get("status", "ok")
+        lbt = _parse_db_timestamp(doc.get("last_bar_time"))
         logger.info(f"[调度] {task} 进度: {synced}/{total} ({sync_rate:.0%}), 失败 {failed}, status={status}")
 
         if status == "ok":
@@ -1234,11 +1317,14 @@ def _run_fresh_pull(task: str, doc: dict | None, last_status: str):
             _schedule_next(task, _next_trigger_time(task))
         elif written == 0 and sync_rate > 0.9:
             # 未完成(本次修复=0) → 完成度>90% → status=ok 正常退出
-            _record_update(
-                "stock_daily_k", task, "ok",
-                f"完成度 {sync_rate:.0%} > 90%, 无需继续修复",
-                pool_name="CNStock",
-            )
+            if lbt:
+                _update_record(
+                    "stock_daily_k", task, lbt,
+                    status="ok",
+                    report=f"完成度 {sync_rate:.0%} > 90%, 无需继续修复",
+                    synced_count=synced, failed_count=failed,
+                    written_count=doc.get("written_count"), pool_name="CNStock",
+                )
             _repair_attempts.pop(task, None)
             logger.info(f"[调度] {task} 完成度 {sync_rate:.0%} > 90%, 正常退出")
             _schedule_next(task, _next_trigger_time(task))
@@ -1248,11 +1334,14 @@ def _run_fresh_pull(task: str, doc: dict | None, last_status: str):
             _repair_attempts[task] = attempts
             if attempts >= _MAX_REPAIR_ATTEMPTS:
                 logger.info(f"[调度] {task} 连续 {attempts} 次未完成，标记 error 退出")
-                _record_update(
-                    "stock_daily_k", task, "error",
-                    f"连续 {attempts} 次未完成: {synced}/{total}, 失败 {failed}",
-                    pool_name="CNStock",
-                )
+                if lbt:
+                    _update_record(
+                        "stock_daily_k", task, lbt,
+                        status="error",
+                        report=f"连续 {attempts} 次未完成: {synced}/{total}, 失败 {failed}",
+                        synced_count=synced, failed_count=failed,
+                        written_count=doc.get("written_count"), pool_name="CNStock",
+                    )
                 _repair_attempts.pop(task, None)
                 _schedule_next(task, _next_trigger_time(task))
             else:
@@ -1306,6 +1395,7 @@ def _run_repair(task: str, doc: dict | None, last_status: str):
         total = synced + failed
         sync_rate = synced / total if total > 0 else 0
         status = doc.get("status", "")
+        lbt = _parse_db_timestamp(doc.get("last_bar_time"))
         logger.info(f"[调度] {task} 修复后: {synced}/{total} ({sync_rate:.0%}), 失败 {failed}")
 
         # 全部完成 或 (本次修复=0 且完成度>90%) → status=ok 正常退出
@@ -1318,11 +1408,14 @@ def _run_repair(task: str, doc: dict | None, last_status: str):
         # 本次修复=0 且未完成 → status=error 正常退出
         if written == 0 and failed >= pre_repair_failed:
             logger.info(f"[调度] {task} 修复无进展 (本次修复={written}), 标记 error, 正常退出")
-            _record_update(
-                "stock_daily_k", task, "error",
-                f"修复无进展: {synced}/{total}, 失败 {failed}",
-                pool_name="CNStock",
-            )
+            if lbt:
+                _update_record(
+                    "stock_daily_k", task, lbt,
+                    status="error",
+                    report=f"修复无进展: {synced}/{total}, 失败 {failed}",
+                    synced_count=synced, failed_count=failed,
+                    written_count=doc.get("written_count"), pool_name="CNStock",
+                )
             _repair_attempts.pop(task, None)
             _schedule_next(task, _next_trigger_time(task))
             return
@@ -1332,11 +1425,14 @@ def _run_repair(task: str, doc: dict | None, last_status: str):
         _repair_attempts[task] = attempts
         if attempts >= _MAX_REPAIR_ATTEMPTS:
             logger.info(f"[调度] {task} 循环 {attempts} 次修复仍未完成, 标记 error 退出")
-            _record_update(
-                "stock_daily_k", task, "error",
-                f"循环 {attempts} 次修复未完成: {synced}/{total}, 失败 {failed}",
-                pool_name="CNStock",
-            )
+            if lbt:
+                _update_record(
+                    "stock_daily_k", task, lbt,
+                    status="error",
+                    report=f"循环 {attempts} 次修复未完成: {synced}/{total}, 失败 {failed}",
+                    synced_count=synced, failed_count=failed,
+                    written_count=doc.get("written_count"), pool_name="CNStock",
+                )
             _repair_attempts.pop(task, None)
             _schedule_next(task, _next_trigger_time(task))
         else:
