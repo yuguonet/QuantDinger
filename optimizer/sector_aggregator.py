@@ -521,6 +521,7 @@ class SectorAggregator:
             # trades 是按顺序排列的 open/close 事件对
             filtered_trades = []
             removed_count = 0
+            regime_stats = {"up": 0, "flat": 0, "down": 0}
             # 按 _symbol 分组
             trades_by_symbol = {}
             for t in all_trades:
@@ -528,12 +529,20 @@ class SectorAggregator:
                 trades_by_symbol.setdefault(sym, []).append(t)
 
             for sym, sym_trades in trades_by_symbol.items():
+                # 构造带后缀的代码（用于市场判断）
+                code = sym.split(".")[0] if "." in sym else sym
+                if code.startswith("6"):
+                    sym_with_suffix = code + ".SH"
+                else:
+                    sym_with_suffix = code + ".SZ"
+
                 # 找出大盘下跌期间的开仓时间
                 bad_opens = set()
                 for t in sym_trades:
                     if t.get("type", "").startswith("open_"):
                         trade_date = t["time"][:10]  # 'YYYY-MM-DD'
-                        regime = mb.get_regime(sym + ".SZ", trade_date)  # 后缀不影响判断
+                        regime = mb.get_regime(sym_with_suffix, trade_date)
+                        regime_stats[regime["trend"]] += 1
                         if regime["trend"] == "down":
                             bad_opens.add(id(t))
                             removed_count += 1
@@ -559,6 +568,7 @@ class SectorAggregator:
 
             if removed_count > 0:
                 print(f"\n  🛡️ 大盘过滤: 剔除 {removed_count} 笔交易（大盘下跌趋势期间开仓）")
+                print(f"     大盘状态分布: up={regime_stats['up']}, flat={regime_stats['flat']}, down={regime_stats['down']}")
                 all_trades = filtered_trades
 
                 # 重新计算 per_stock_results
@@ -574,6 +584,9 @@ class SectorAggregator:
                         r["win_rate"] = round(wins / len(profits) * 100, 2) if profits else 0
                     else:
                         r["win_rate"] = 0
+            else:
+                print(f"\n  🛡️ 大盘过滤: 无交易被剔除")
+                print(f"     大盘状态分布: up={regime_stats['up']}, flat={regime_stats['flat']}, down={regime_stats['down']}")
 
         # ── 汇聚统计 ──
         if errors:

@@ -259,7 +259,7 @@ class EastMoneyDataSource:
     """
 
     name = "eastmoney"
-    priority = 61
+    priority = 25
     max_concurrency = MAX_CONCURRENCY
     min_interval = 0.0
     jitter_min = 0.0
@@ -267,13 +267,13 @@ class EastMoneyDataSource:
 
     capabilities = {
         "kline": True,
-        "kline_priority": 64,
+        "kline_priority": 25,
         "kline_tf": {"1m", "5m", "15m", "30m", "1H", "1D", "1W"},
         "kline_batch": True,
         "quote": True,
-        "quote_priority": 68,
+        "quote_priority": 20,
         "batch_quote": True,
-        "batch_quote_priority": 62,
+        "batch_quote_priority": 5,
         "hk": False,
         "markets": {"CNStock"},
     }
@@ -288,6 +288,7 @@ class EastMoneyDataSource:
             count = calc_kline_count(timeframe, start_date, end_date)
         from datetime import date as _date
         em_end = end_date.replace("-", "") if end_date else _date.today().strftime("%Y%m%d")
+        em_beg = start_date.replace("-", "") if start_date else "19900101"
 
         secid = _to_eastmoney_secid(code)
         if not secid:
@@ -308,6 +309,7 @@ class EastMoneyDataSource:
                 "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
                 "klt": klt,
                 "fqt": _EM_FQT.get(adj, 1),
+                "beg": em_beg,
                 "end": em_end,
                 "lmt": min(int(count), 5000),
             },

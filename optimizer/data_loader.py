@@ -48,7 +48,6 @@ def _get_writer():
     from app.utils.db_market import get_market_kline_writer
     return get_market_kline_writer()
 
-
 def _get_mgr():
     """延迟导入 db_market manager"""
     _load_env()
@@ -70,6 +69,22 @@ def guess_exchange(code: str) -> str:
         return f"{c}.SZ"
 
 
+def _ensure_datetime(series_or_val):
+    """
+    统一处理 time 字段：DB 中为 timestamp 类型，Python 读出已是 datetime，
+    但也兼容 unix 时间戳（int/float）的情况。
+    """
+    if isinstance(series_or_val, pd.Series):
+        sample = series_or_val.iloc[0] if len(series_or_val) > 0 else None
+        if isinstance(sample, datetime):
+            return series_or_val
+        return pd.to_datetime(series_or_val, unit="s")
+    else:
+        if isinstance(series_or_val, datetime):
+            return series_or_val
+        return datetime.fromtimestamp(series_or_val)
+
+
 def load_csv(code: str, timeframe: str = "daily") -> pd.DataFrame:
     """
     从 db_market 加载单只股票数据 → 标准化 DataFrame
@@ -89,7 +104,7 @@ def load_csv(code: str, timeframe: str = "daily") -> pd.DataFrame:
         raise FileNotFoundError(f"db_market 中无数据: {code} / {tf}")
 
     df = pd.DataFrame(data)
-    df["date"] = pd.to_datetime(df["time"], unit="s")
+    df["date"] = _ensure_datetime(df["time"])
     df = df.set_index("date").drop(columns=["time"])
     df = df.sort_index()
 
@@ -106,6 +121,39 @@ def list_all_codes(timeframe: str = "daily") -> list:
     if not stats.get("exists"):
         return []
     return stats.get("symbol_list", [])
+
+def load_csv_range(code: str, timeframe: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    从 db_market 加载指定日期范围的数据。
+
+    Args:
+        code: 股票代码（如 "000001"）
+        timeframe: "daily" / "15m"
+        start_date: "YYYY-MM-DD"
+        end_date: "YYYY-MM-DD"
+
+    Returns:
+        DataFrame with DatetimeIndex, columns: open, high, low, close, volume
+    """
+    tf_map = {"daily": "1D", "15m": "15m", "1D": "1D"}
+    tf = tf_map.get(timeframe, timeframe)
+
+    writer = _get_writer()
+    data = writer.query("CNStock", code, tf,
+                        start_time=start_date, end_time=end_date, limit=0)
+
+    if not data:
+        raise FileNotFoundError(f"db_market 中无数据: {code} / {tf} ({start_date}~{end_date})")
+
+    df = pd.DataFrame(data)
+    df["date"] = _ensure_datetime(df["time"])
+    df = df.set_index("date").drop(columns=["time"])
+    df = df.sort_index()
+
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df
 
 
 # ============================================================
@@ -139,7 +187,8 @@ def explore():
         if data:
             print(f"\n   📄 {sym} (前5条):")
             for d in data[:5]:
-                dt = datetime.fromtimestamp(d["time"]).strftime("%Y-%m-%d")
+                t = d["time"]
+                dt = t.strftime("%Y-%m-%d") if isinstance(t, datetime) else datetime.fromtimestamp(t).strftime("%Y-%m-%d")
                 print(f"      {dt}  O={d['open']:.2f}  H={d['high']:.2f}  "
                       f"L={d['low']:.2f}  C={d['close']:.2f}  V={d['volume']:.0f}")
 

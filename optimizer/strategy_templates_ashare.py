@@ -7,15 +7,14 @@ A 股扩展策略模板
   - 换手率、量比等 A 股特色指标
 
 策略清单：
-  1. atr_breakout        - ATR 波动率突破（海龟交易法变体）
+  1. atr_breakout        - ATR 波动率突破
   2. volume_price_div    - 量价背离策略
   3. dual_ma_volume      - 双均线+成交量确认
   4. macd_kdj_resonance  - MACD+KDJ 共振
   6. price_channel        - 价格通道突破
-  7. turtle_trading       - 海龟交易法（完整版）
-  8. vwap_deviation       - VWAP 偏离策略
-  9. ema_rsi_volume       - EMA+RSI+量能三重过滤
-  10. kdj_macd_ma_triple  - KDJ+MACD+均线三重共振
+  7. vwap_deviation       - VWAP 偏离策略
+  8. ema_rsi_volume       - EMA+RSI+量能三重过滤
+  9. kdj_macd_ma_triple  - KDJ+MACD+均线三重共振
 """
 from typing import Dict, Any, List
 
@@ -63,9 +62,22 @@ def _build_atr_breakout_config(p: dict) -> dict:
             "operator": "price_above",
         })
 
+    # 独立出场：价格跌破 ATR 下轨（趋势反转）
+    exit_rules = [
+        {
+            "indicator": "atr_channel",
+            "params": {
+                "period": p["atr_period"],
+                "multiplier": p["atr_multiplier"],
+            },
+            "operator": "price_below_lower",
+        },
+    ]
+
     return {
         "name": f"ATR_Breakout_{p['atr_period']}_{p['atr_multiplier']}",
         "entry_rules": entry_rules,
+        "exit_rules": exit_rules,
         "position_config": {"initial_size_pct": 100, "leverage": 1, "max_pyramiding": 0},
         "pyramiding_rules": {"enabled": False},
         "risk_management": {
@@ -99,14 +111,34 @@ def _build_volume_price_divergence_config(p: dict) -> dict:
         },
     ]
 
+    # 独立出场：RSI 超买（反弹到位）OR 价格跌破短期均线（趋势破坏）
+    exit_rules = [
+        {
+            "indicator": "rsi",
+            "params": {"period": p["rsi_period"], "threshold": p.get("exit_rsi_overbought", 65)},
+            "operator": ">",
+        },
+        {
+            "indicator": "ema",
+            "params": {"period": p.get("exit_ema_period", 20)},
+            "operator": "price_below",
+        },
+    ]
+
     return {
         "name": f"VolPriceDiv_{p['lookback_period']}_{p['rsi_period']}",
         "entry_rules": entry_rules,
+        "exit_rules": exit_rules,
         "position_config": {"initial_size_pct": 100, "leverage": 1, "max_pyramiding": 0},
         "pyramiding_rules": {"enabled": False},
         "risk_management": {
             "stop_loss": {"enabled": True, "value": p.get("stop_loss_pct", 5.0)},
-            "trailing_stop": {"enabled": False},
+            "trailing_stop": {
+                "enabled": True,
+                "type": "trailing_pct",
+                "activation_profit": p.get("trailing_activation", 8.0),
+                "callback_pct": p.get("trailing_callback", 5.0),
+            },
         },
     }
 
@@ -139,14 +171,29 @@ def _build_dual_ma_volume_config(p: dict) -> dict:
         },
     ]
 
+    # 独立出场：价格跌破慢线（趋势破坏）
+    exit_rules = [
+        {
+            "indicator": "ma",
+            "params": {"period": p["slow_period"], "ma_type": slow_type},
+            "operator": "price_below",
+        },
+    ]
+
     return {
         "name": f"DualMA_Vol_{fast_type}{p['fast_period']}_{slow_type}{p['slow_period']}",
         "entry_rules": entry_rules,
+        "exit_rules": exit_rules,
         "position_config": {"initial_size_pct": 100, "leverage": 1, "max_pyramiding": 0},
         "pyramiding_rules": {"enabled": False},
         "risk_management": {
             "stop_loss": {"enabled": True, "value": p.get("stop_loss_pct", 5.0)},
-            "trailing_stop": {"enabled": False},
+            "trailing_stop": {
+                "enabled": True,
+                "type": "trailing_pct",
+                "activation_profit": p.get("trailing_activation", 8.0),
+                "callback_pct": p.get("trailing_callback", 5.0),
+            },
         },
     }
 
@@ -246,7 +293,7 @@ def _build_macd_kdj_resonance_config(p: dict) -> dict:
     # 只保留 MACD 死叉状态作为信号出场（diff < DEA）
     # - 与入场的 diff_gt_dea 对称，趋势真正反转才出场
     # - 去掉 EMA 出场：震荡市 EMA 假突破太多，加了反而增加噪音
-    # - 风控（止损/止盈/追踪止损）兜底，不需要 EMA 再兜一层
+    # - 风控（止损/追踪止损）兜底，不需要 EMA 再兜一层
     exit_rules = [
         {
             "indicator": "macd",
@@ -267,7 +314,6 @@ def _build_macd_kdj_resonance_config(p: dict) -> dict:
         "pyramiding_rules": {"enabled": False},
         "risk_management": {
             "stop_loss": {"enabled": True, "type": "percentage", "value": p.get("stop_loss_pct", 10.0)},
-            "take_profit": {"enabled": True, "type": "percentage", "value": p.get("take_profit_pct", 20.0)},
             "trailing_stop": {
                 "enabled": True,
                 "type": "trailing_pct",
@@ -303,9 +349,27 @@ def _build_price_channel_config(p: dict) -> dict:
             "threshold": 1.5,
         })
 
+    # 独立出场：跌破 Donchian 下轨（趋势反转）OR 跌破 EMA 中轨
+    exit_rules = [
+        {
+            "indicator": "donchian_channel",
+            "params": {
+                "upper_period": p["entry_period"],
+                "lower_period": p["exit_period"],
+            },
+            "operator": "price_break_lower",
+        },
+        {
+            "indicator": "ema",
+            "params": {"period": p.get("exit_ema_period", 20)},
+            "operator": "price_below",
+        },
+    ]
+
     return {
         "name": f"PriceChannel_{p['entry_period']}_{p['exit_period']}",
         "entry_rules": entry_rules,
+        "exit_rules": exit_rules,
         "position_config": {"initial_size_pct": 100, "leverage": 1, "max_pyramiding": 0},
         "pyramiding_rules": {"enabled": False},
         "risk_management": {
@@ -316,42 +380,7 @@ def _build_price_channel_config(p: dict) -> dict:
 
 
 # ============================================================
-# 7. 海龟交易法（完整版）
-# ============================================================
-
-def _build_turtle_trading_config(p: dict) -> dict:
-    """经典海龟交易法：20日突破入场，10日突破出场，ATR 止损，金字塔加仓"""
-    entry_rules = [
-        {
-            "indicator": "donchian_channel",
-            "params": {"upper_period": p["entry_breakout"], "lower_period": p["exit_breakout"]},
-            "operator": "price_break_upper",
-        },
-    ]
-
-    return {
-        "name": f"Turtle_{p['entry_breakout']}_{p['exit_breakout']}",
-        "entry_rules": entry_rules,
-        "position_config": {
-            "initial_size_pct": p.get("initial_position_pct", 25),
-            "leverage": 1,
-            "max_pyramiding": p.get("max_adds", 4),
-            "add_atr_multiplier": p.get("add_atr_mult", 0.5),
-        },
-        "pyramiding_rules": {
-            "enabled": True,
-            "max_adds": p.get("max_adds", 4),
-            "add_interval_atr": p.get("add_atr_mult", 0.5),
-        },
-        "risk_management": {
-            "stop_loss": {"enabled": True, "type": "atr", "atr_period": p["atr_period"], "atr_multiplier": p["atr_stop_mult"]},
-            "trailing_stop": {"enabled": False},
-        },
-    }
-
-
-# ============================================================
-# 8. VWAP 偏离策略
+# 7. VWAP 偏离策略
 # ============================================================
 
 def _build_vwap_deviation_config(p: dict) -> dict:
@@ -369,14 +398,34 @@ def _build_vwap_deviation_config(p: dict) -> dict:
         },
     ]
 
+    # 独立出场：RSI 超买（均值回归完成）OR 价格回到 EMA 上方（趋势恢复）
+    exit_rules = [
+        {
+            "indicator": "rsi",
+            "params": {"period": p["rsi_period"], "threshold": p.get("exit_rsi_overbought", 60)},
+            "operator": ">",
+        },
+        {
+            "indicator": "ema",
+            "params": {"period": p.get("exit_ema_period", 20)},
+            "operator": "price_above",
+        },
+    ]
+
     return {
         "name": f"VWAP_Dev_{p['deviation_pct']}_{p['rsi_period']}",
         "entry_rules": entry_rules,
+        "exit_rules": exit_rules,
         "position_config": {"initial_size_pct": 100, "leverage": 1, "max_pyramiding": 0},
         "pyramiding_rules": {"enabled": False},
         "risk_management": {
             "stop_loss": {"enabled": True, "value": p.get("stop_loss_pct", 3.0)},
-            "trailing_stop": {"enabled": False},
+            "trailing_stop": {
+                "enabled": True,
+                "type": "trailing_pct",
+                "activation_profit": p.get("trailing_activation", 5.0),
+                "callback_pct": p.get("trailing_callback", 3.0),
+            },
         },
     }
 
@@ -406,14 +455,34 @@ def _build_ema_rsi_volume_config(p: dict) -> dict:
         },
     ]
 
+    # 独立出场：价格跌破 EMA（趋势破坏）OR RSI 跌破阈值（动量衰竭）
+    exit_rules = [
+        {
+            "indicator": "ema",
+            "params": {"period": p["ema_period"]},
+            "operator": "price_below",
+        },
+        {
+            "indicator": "rsi",
+            "params": {"period": p["rsi_period"], "threshold": p.get("exit_rsi_threshold", 35)},
+            "operator": "<",
+        },
+    ]
+
     return {
         "name": f"EMA_RSI_Vol_{p['ema_period']}_{p['rsi_period']}",
         "entry_rules": entry_rules,
+        "exit_rules": exit_rules,
         "position_config": {"initial_size_pct": 100, "leverage": 1, "max_pyramiding": 0},
         "pyramiding_rules": {"enabled": False},
         "risk_management": {
             "stop_loss": {"enabled": True, "value": p.get("stop_loss_pct", 5.0)},
-            "trailing_stop": {"enabled": True, "type": "trailing_pct", "value": p.get("trailing_pct", 3.0)},
+            "trailing_stop": {
+                "enabled": True,
+                "type": "trailing_pct",
+                "activation_profit": p.get("trailing_activation", 8.0),
+                "callback_pct": p.get("trailing_callback", 5.0),
+            },
         },
     }
 
@@ -446,14 +515,38 @@ def _build_kdj_macd_ma_triple_config(p: dict) -> dict:
         },
     ]
 
+    # 独立出场：KDJ 死叉 OR MACD 柱状线翻绿（动量反转）
+    exit_rules = [
+        {
+            "indicator": "kdj",
+            "params": {"period": p["kdj_period"], "signal_period": p["kdj_signal"]},
+            "operator": "k_lt_d",
+        },
+        {
+            "indicator": "macd",
+            "params": {
+                "fast_period": p["macd_fast"],
+                "slow_period": p["macd_slow"],
+                "signal_period": p["macd_signal"],
+            },
+            "operator": "histogram_negative",
+        },
+    ]
+
     return {
         "name": f"Triple_{p['kdj_period']}_{p['macd_fast']}_{p['ma_period']}",
         "entry_rules": entry_rules,
+        "exit_rules": exit_rules,
         "position_config": {"initial_size_pct": 100, "leverage": 1, "max_pyramiding": 0},
         "pyramiding_rules": {"enabled": False},
         "risk_management": {
             "stop_loss": {"enabled": True, "value": p.get("stop_loss_pct", 5.0)},
-            "trailing_stop": {"enabled": False},
+            "trailing_stop": {
+                "enabled": True,
+                "type": "trailing_pct",
+                "activation_profit": p.get("trailing_activation", 8.0),
+                "callback_pct": p.get("trailing_callback", 5.0),
+            },
         },
     }
 
@@ -495,6 +588,10 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "rsi_period":       _p_int(7, 21, 1),
             "rsi_oversold":     _p_int(20, 40, 1),
             "stop_loss_pct":    _p_float(5.0, 15.0, 0.5),
+            "exit_rsi_overbought": _p_int(55, 75, 1),
+            "exit_ema_period": _p_int(10, 30, 5),
+            "trailing_activation": _p_float(5.0, 15.0, 1.0),
+            "trailing_callback": _p_float(3.0, 8.0, 0.5),
             "position_pct": POSITION_PCT,
         },
         "constraints": [],
@@ -515,6 +612,8 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "vol_ma_period":  _p_int(10, 30, 1),
             "vol_ratio":      _p_float(1.2, 3.0, 0.1),
             "stop_loss_pct":  _p_float(5.0, 15.0, 0.5),
+            "trailing_activation": _p_float(5.0, 15.0, 1.0),
+            "trailing_callback": _p_float(3.0, 8.0, 0.5),
             "position_pct": POSITION_PCT,
         },
         "constraints": [
@@ -539,7 +638,6 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "use_ma_filter":   _p_choice([True, False]),
             "ma_filter_period": _p_int(20, 120, 10),
             "stop_loss_pct":   _p_float(5.0, 15.0, 0.5),
-            "take_profit_pct": _p_float(10.0, 30.0, 1.0),
             "trailing_activation": _p_float(5.0, 15.0, 1.0),
             "trailing_callback": _p_float(5.0, 12.0, 0.5),
             "position_pct": POSITION_PCT,
@@ -560,6 +658,7 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "entry_period":      _p_int(10, 60, 5),
             "exit_period":       _p_int(5, 30, 5),
             "use_volume_filter": _p_choice([True, False]),
+            "exit_ema_period": _p_int(10, 30, 5),
             "position_pct": POSITION_PCT,
         },
         "constraints": [
@@ -569,29 +668,7 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
         "strategy_defaults": {"tradeDirection": "long"},
     },
 
-    # ── 7. 海龟交易法 ──
-    "turtle_trading": {
-        "name": "海龟交易法",
-        "description": "经典海龟系统：20日突破入场，10日突破出场，ATR 止损，金字塔加仓。适合趋势明显的 A 股行情。",
-        "indicators": ["donchian_channel", "atr"],
-        "params": {
-            "entry_breakout":     _p_int(10, 40, 5),
-            "exit_breakout":      _p_int(5, 20, 5),
-            "atr_period":         _p_int(10, 30, 1),
-            "atr_stop_mult":      _p_float(1.5, 3.0, 0.1),
-            "max_adds":           _p_int(1, 6, 1),
-            "add_atr_mult":       _p_float(0.3, 1.0, 0.1),
-            "initial_position_pct": _p_int(10, 50, 5),
-            "position_pct": POSITION_PCT,
-        },
-        "constraints": [
-            ("exit_breakout", "<", "entry_breakout"),
-        ],
-        "build_config": _build_turtle_trading_config,
-        "strategy_defaults": {"tradeDirection": "long"},
-    },
-
-    # ── 8. VWAP 偏离 ──
+    # ── 7. VWAP 偏离 ──
     "vwap_deviation": {
         "name": "VWAP 偏离回归",
         "description": "价格偏离 VWAP 超过阈值时做均值回归。适合 A 股日内或短线交易，机构资金参考 VWAP 较多。",
@@ -601,6 +678,10 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "rsi_period":     _p_int(7, 21, 1),
             "rsi_level":      _p_int(25, 45, 1),
             "stop_loss_pct":  _p_float(5.0, 12.0, 0.5),
+            "exit_rsi_overbought": _p_int(50, 70, 1),
+            "exit_ema_period": _p_int(10, 30, 5),
+            "trailing_activation": _p_float(3.0, 10.0, 1.0),
+            "trailing_callback": _p_float(2.0, 6.0, 0.5),
             "position_pct": POSITION_PCT,
         },
         "constraints": [],
@@ -620,7 +701,9 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "vol_ma_period":  _p_int(10, 30, 1),
             "vol_ratio":      _p_float(1.2, 3.0, 0.1),
             "stop_loss_pct":  _p_float(5.0, 15.0, 0.5),
-            "trailing_pct":   _p_float(5.0, 12.0, 0.5),
+            "exit_rsi_threshold": _p_int(25, 40, 1),
+            "trailing_activation": _p_float(5.0, 15.0, 1.0),
+            "trailing_callback": _p_float(3.0, 8.0, 0.5),
             "position_pct": POSITION_PCT,
         },
         "constraints": [],
@@ -642,6 +725,8 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "ma_period":     _p_int(10, 60, 5),
             "ma_type":       _p_choice(["sma", "ema"]),
             "stop_loss_pct": _p_float(5.0, 15.0, 0.5),
+            "trailing_activation": _p_float(5.0, 15.0, 1.0),
+            "trailing_callback": _p_float(3.0, 8.0, 0.5),
             "position_pct": POSITION_PCT,
         },
         "constraints": [

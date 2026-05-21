@@ -477,9 +477,9 @@ class MarketBenchmark:
         cum_20 = self.get_benchmark_cumulative(symbol, date, 20)
         cum_5 = self.get_benchmark_cumulative(symbol, date, 5)
 
-        if cum_20 > 0.03:
+        if cum_20 > 0.02:
             trend = "up"
-        elif cum_20 < -0.03:
+        elif cum_20 < -0.015:
             trend = "down"
         else:
             trend = "flat"

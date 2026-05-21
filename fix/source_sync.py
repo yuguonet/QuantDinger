@@ -6,7 +6,7 @@
 #
 # 核心流程:
 #   1. 从 basicinfo_db 获取全市场股票列表
-#   2. 每批 500 只交给 Coordinator.coordinate_market_kline()
+#   2. 每批 N 只交给 Coordinator.coordinate_market_kline()
 #   3. 逐只做完整性校验:
 #      - 交易日历对比（缺失日检测）
 #      - 停复牌检测（vol=0 且 OHLC 相同）
@@ -17,10 +17,16 @@
 #   5. 循环直到全部完成
 #   6. 最后重试重传文件一次，正确的从中删除
 #
+# 日志:
+#   - 每只股票: logger.info 记录远端实际 bar 数、首条/末条 bar 时间
+#   - 每批汇总: print 输出远端数据总 bar 数、最早/最晚时间
+#   - 未指定 --start-date 时: 根据 timeframe 自动选择默认起始日
+#
 # 用法:
-# python optimizer/source_sync.py -T 1D                    # 1D: 2021-01 起
-# python optimizer/source_sync.py -T 15m                   # 15m: 2024-01-01 起
-# python optimizer/source_sync.py -T 1D --end-date 2026-05-17  # 指定截止日期
+# python optimizer/source_sync.py -T 1D                    # 1D: 默认 2021-01-04 起
+# python optimizer/source_sync.py -T 15m                   # 15m: 默认 2024-01-02 起
+# python optimizer/source_sync.py -T 1D --start-date 2023-01-01  # 指定起始日期
+# python optimizer/source_sync.py -T 1D --end-date 2026-05-17    # 指定截止日期
 # python optimizer/source_sync.py -T 1D --resume           # 断点续传
 # python optimizer/source_sync.py -T 1D --retry-only       # 只重试错误股票
 # python optimizer/source_sync.py -T 1D --dry-run          # 只校验不写库
@@ -928,7 +934,7 @@ def _start_interrupt_watchdog():
 def export_csv(results: List[Dict[str, Any]], path: str):
     if not results:
         return
-    fields = ["code", "board", "bars", "written", "status", "errors"]
+    fields = ["code", "board", "bars", "first_bar", "last_bar", "written", "status", "errors"]
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
@@ -1046,6 +1052,13 @@ def process_batch(
 
     # ── 第一轮: 逐只校验 ──
     code_records: Dict[str, Tuple[List[Dict[str, Any]], ValidationResult]] = {}
+    code_bar_times: Dict[str, Tuple[str, str]] = {}  # code → (first_bar, last_bar)
+    # 批次级远端数据统计
+    _batch_remote_total_bars = 0
+    _batch_earliest_dt: Optional[datetime] = None
+    _batch_latest_dt: Optional[datetime] = None
+    _batch_remote_count = 0
+
     for code in symbols:
         if _INTERRUPTED:
             break
@@ -1059,11 +1072,39 @@ def process_batch(
             stats["no_data"] += 1
             to_retry[code] = ["无数据"]
             results.append({"code": code, "board": _detect_board(code),
-                           "bars": 0, "written": 0, "status": "no_data",
+                           "bars": 0, "first_bar": "", "last_bar": "",
+                           "written": 0, "status": "no_data",
                            "errors": "无数据"})
             continue
 
         stats["fetched"] += 1
+
+        # ── 记录远端返回的实际 bar 数、首/末 bar 时间 ──
+        remote_bar_count = len(bars)
+        _first_bar_dt = None
+        _last_bar_dt = None
+        if bars:
+            _parsed_times = []
+            for _b in bars:
+                _dt = _parse_bar_time(_b)
+                if _dt is not None:
+                    _parsed_times.append(_dt)
+            if _parsed_times:
+                _parsed_times.sort()
+                _first_bar_dt = _parsed_times[0]
+                _last_bar_dt = _parsed_times[-1]
+        _first_str = _first_bar_dt.strftime("%Y-%m-%d %H:%M") if _first_bar_dt else "N/A"
+        _last_str = _last_bar_dt.strftime("%Y-%m-%d %H:%M") if _last_bar_dt else "N/A"
+        logger.info("[远端数据] %s (%s): bar数=%d, 首条=%s, 末条=%s",
+                    code, _detect_board(code), remote_bar_count, _first_str, _last_str)
+        code_bar_times[code] = (_first_str, _last_str)
+        # 累加批次统计
+        _batch_remote_total_bars += remote_bar_count
+        _batch_remote_count += 1
+        if _first_bar_dt and (_batch_earliest_dt is None or _first_bar_dt < _batch_earliest_dt):
+            _batch_earliest_dt = _first_bar_dt
+        if _last_bar_dt and (_batch_latest_dt is None or _last_bar_dt > _batch_latest_dt):
+            _batch_latest_dt = _last_bar_dt
 
         # 转为标准记录（已去重）
         records = _bars_to_records(bars, timeframe)
@@ -1088,7 +1129,8 @@ def process_batch(
             stats["no_data"] += 1
             to_retry[code] = ["转换后无有效记录"]
             results.append({"code": code, "board": _detect_board(code),
-                           "bars": len(bars), "written": 0, "status": "no_data",
+                           "bars": len(bars), "first_bar": _first_str, "last_bar": _last_str,
+                           "written": 0, "status": "no_data",
                            "errors": "转换后无有效记录"})
             continue
 
@@ -1112,11 +1154,19 @@ def process_batch(
                 err_summary += f" (+{len(vr.errors)-5})"
             logger.warning("[校验失败] %s (%s): %s", code, _detect_board(code), err_summary)
             results.append({"code": code, "board": _detect_board(code),
-                           "bars": len(records), "written": 0, "status": "error",
+                           "bars": len(records), "first_bar": _first_str, "last_bar": _last_str,
+                           "written": 0, "status": "error",
                            "errors": err_summary})
         else:
             stats["passed"] += 1
             code_records[code] = (records, vr)
+
+    # ── 批次级远端数据汇总 ──
+    _be = _batch_earliest_dt.strftime("%Y-%m-%d %H:%M") if _batch_earliest_dt else "N/A"
+    _bl = _batch_latest_dt.strftime("%Y-%m-%d %H:%M") if _batch_latest_dt else "N/A"
+    print(f"  📊 批次远端数据汇总: {_batch_remote_count} 只有数据, "
+          f"总bar数={_batch_remote_total_bars:,}, "
+          f"最早={_be}, 最晚={_bl}")
 
     # ── 批量写库: 一个事务搞定整批 ──
     if code_records and not dry_run:
@@ -1125,33 +1175,39 @@ def process_batch(
                                        stock_data, start_date, end_date, dry_run)
         for code, (records, vr) in code_records.items():
             n = written_map.get(code, 0)
+            _fb, _lb = code_bar_times.get(code, ("", ""))
             if n == -2:
                 # 过滤后无数据（超范围），按无数据处理
                 stats["no_data"] += 1
                 to_retry[code] = [f"过滤后无数据（end_date={end_date}）"]
                 results.append({"code": code, "board": _detect_board(code),
-                                "bars": len(records), "written": 0, "status": "no_data",
+                                "bars": len(records), "first_bar": _fb, "last_bar": _lb,
+                                "written": 0, "status": "no_data",
                                 "errors": f"过滤后无数据（end_date={end_date}）"})
             elif n < 0:
                 # 写入失败，保留在重传文件中
                 stats["failed"] += 1
                 to_retry[code] = ["写入失败（事务已回滚，旧数据保留）"]
                 results.append({"code": code, "board": _detect_board(code),
-                                "bars": len(records), "written": 0, "status": "error",
+                                "bars": len(records), "first_bar": _fb, "last_bar": _lb,
+                                "written": 0, "status": "error",
                                 "errors": "写入失败（事务已回滚）"})
             else:
                 stats["written"] += n
                 to_remove.append(code)
                 warn_summary = "; ".join(vr.warnings[:3]) if vr.warnings else ""
                 results.append({"code": code, "board": _detect_board(code),
-                                "bars": len(records), "written": n, "status": "ok",
+                                "bars": len(records), "first_bar": _fb, "last_bar": _lb,
+                                "written": n, "status": "ok",
                                 "errors": warn_summary})
     elif code_records and dry_run:
         for code, (records, vr) in code_records.items():
             to_remove.append(code)
+            _fb, _lb = code_bar_times.get(code, ("", ""))
             warn_summary = "; ".join(vr.warnings[:3]) if vr.warnings else ""
             results.append({"code": code, "board": _detect_board(code),
-                           "bars": len(records), "written": 0, "status": "ok",
+                           "bars": len(records), "first_bar": _fb, "last_bar": _lb,
+                           "written": 0, "status": "ok",
                            "errors": warn_summary})
 
     # 批量更新重传文件（一次 IO）
@@ -1186,7 +1242,7 @@ def main():
     parser.add_argument("--adj", default="qfq", choices=["qfq", "hfq", ""],
         help="复权方式")
     parser.add_argument("--start-date", default="",
-        help="数据起始日期 (YYYY-MM-DD)，默认为当天")
+        help="数据起始日期 (YYYY-MM-DD)，默认按 timeframe 自动选择 (1D→2021-01-04, 15m→2024-01-02)")
     parser.add_argument("--end-date", default="",
         help="数据截止日期 (YYYY-MM-DD)，默认为当天")
     parser.add_argument("--price-tolerance", type=float, default=0.02,
@@ -1217,10 +1273,17 @@ def main():
     # 日期范围
     now_date = datetime.now(TZ_SH).strftime('%Y-%m-%d')
 
+    # 根据 timeframe 设置默认起始日期（避免用户忘记传 --start-date 时只拉当天数据）
+    _DEFAULT_START = {
+        "1D": "2021-01-04",
+        "15m": "2024-01-02",
+    }
+
     if args.start_date:
         start_date = args.start_date
     else:
-        start_date = now_date
+        start_date = _DEFAULT_START.get(args.type, now_date)
+        print(f"  ℹ️  未指定 --start-date，使用默认起始日: {start_date} (timeframe={args.type})")
     if args.end_date:
         end_date = args.end_date
     else:
