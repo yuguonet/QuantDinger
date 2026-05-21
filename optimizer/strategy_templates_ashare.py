@@ -225,12 +225,12 @@ def _build_macd_kdj_resonance_config(p: dict) -> dict:
                 "slow_period": p["macd_slow"],
                 "signal_period": p["macd_signal"],
             },
-            "operator": "cross_up",  # MACD 金叉（diff 上穿 DEA）
+            "operator": "diff_gt_dea",  # MACD diff 在 DEA 上方（状态持续，信号更多）
         },
         {
             "indicator": "kdj",
             "params": {"period": p["kdj_period"], "signal_period": p["kdj_signal"]},
-            "operator": "gold_cross",  # KDJ 金叉（K 上穿 D）
+            "operator": "k_gt_d",  # K 值在 D 值上方（状态持续）
         },
     ]
     if p.get("use_ma_filter"):
@@ -243,22 +243,11 @@ def _build_macd_kdj_resonance_config(p: dict) -> dict:
     # 独立出场规则：与入场逻辑解耦
     # 设计原则：出场比入场宽松，不要被正常回调洗出去
     #
-    # 出场条件1：价格跌破 EMA（趋势破坏确认）
-    #   - 用较长周期（默认30），过滤短期噪音
-    #   - 短EMA(20)在震荡市会被反复假突破
-    #
-    # 出场条件2：MACD 柱状线从正转负（动量反转）
-    #   - MACD hist 从红变绿 = 多头动量耗尽
-    #   - 与入场的 MACD diff>dea 呼应，但更灵敏
-    #
-    # 两个条件用 OR：任一满足即出场
-    exit_ema_period = p.get("exit_ema_period", 30)
+    # 只保留 MACD 死叉状态作为信号出场（diff < DEA）
+    # - 与入场的 diff_gt_dea 对称，趋势真正反转才出场
+    # - 去掉 EMA 出场：震荡市 EMA 假突破太多，加了反而增加噪音
+    # - 风控（止损/止盈/追踪止损）兜底，不需要 EMA 再兜一层
     exit_rules = [
-        {
-            "indicator": "ema",
-            "params": {"period": exit_ema_period},
-            "operator": "price_below",
-        },
         {
             "indicator": "macd",
             "params": {
@@ -266,7 +255,7 @@ def _build_macd_kdj_resonance_config(p: dict) -> dict:
                 "slow_period": p["macd_slow"],
                 "signal_period": p["macd_signal"],
             },
-            "operator": "histogram_negative",  # MACD柱状线从正转负
+            "operator": "diff_lt_dea",  # MACD diff 跌破 DEA（状态持续）
         },
     ]
 
@@ -282,7 +271,7 @@ def _build_macd_kdj_resonance_config(p: dict) -> dict:
             "trailing_stop": {
                 "enabled": True,
                 "type": "trailing_pct",
-                "activation_profit": p.get("trailing_activation", 8.0),  # 盈利8%后激活
+                "activation_profit": p.get("trailing_activation", 10.0),  # 盈利10%后激活
                 "callback_pct": p.get("trailing_callback", 8.0),         # 从最高点回撤8%出场
             },
             "ashare_rules": {"t_plus_1": True, "price_limit": True, "min_lot": 100},
@@ -553,7 +542,6 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "take_profit_pct": _p_float(10.0, 30.0, 1.0),
             "trailing_activation": _p_float(5.0, 15.0, 1.0),
             "trailing_callback": _p_float(5.0, 12.0, 0.5),
-            "exit_ema_period": _p_int(15, 40, 5),
             "position_pct": POSITION_PCT,
         },
         "constraints": [

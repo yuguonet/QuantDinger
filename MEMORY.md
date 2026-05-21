@@ -33,18 +33,22 @@
 ## 2026-05-21 关键结论
 
 ### 测试结果（半导体，macd_kdj_resonance）
-- Sharpe: -1.08 → -0.274 → -0.006（逐步改善）
-- 胜率: ~43% → 48.72%
-- 平均收益: 亏损 → +4.7%
+- Sharpe: -1.08 → -0.274 → 0.033 → 0.023（逐步改善，但仍在零附近）
+- 胜率: ~43% → 48.65% → 47.91%
+- 平均收益: 亏损 → +4.64% → +4.86%
+- 交易数: 2 → 407 → 382
 
 ### 已修复
 - 9个模板加 tradeDirection="long"
 - strategy_compiler.py 新增 exit_rules + _rule_to_condition()
-- macd_kdj_resonance 出场：EMA30跌破 OR MACD柱状线翻绿
+- macd_kdj_resonance 入场: diff_gt_dea + k_gt_d（状态持续）
+- macd_kdj_resonance 出场: diff_lt_dea（去掉EMA出场）
+- sector_aggregator.py 新增 --market-filter 大盘过滤（待验证）
 
 ### 待做
+- 大盘过滤 debug（确认过滤逻辑是否生效）
+- 参数优化（trailing_activation/callback 已在搜索空间）
 - 其余8个策略加独立出场规则
-- 出场参数优化
 - 测试其他板块
 
 ## 技术记录
@@ -53,3 +57,4 @@
 - runner.py L572: `_trade_dir = _tmpl_defaults.get('tradeDirection', 'both')` — 没有 strategy_defaults 就默认 both
 - backtest.py 信号归一化：buy/sell 在 trade_direction='long' 时映射为 open_long/close_long
 - strategy_compiler.py 出场条件用 OR 连接（多个出场理由独立触发）
+- get_regime() 阈值：20日累计 < -3% 才算 down，可能太严
