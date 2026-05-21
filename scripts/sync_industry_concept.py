@@ -27,7 +27,7 @@ from pathlib import Path
 # ============================================================
 # 路径 & 环境
 # ============================================================
-_root = Path(__file__).resolve().parent
+_root = Path(__file__).resolve().parent.parent  # scripts/ → QuantDinger/
 sys.path.insert(0, str(_root / "backend_api_python"))
 
 try:
@@ -37,10 +37,10 @@ try:
 except ImportError:
     pass
 # 加入项目根目录，让 app 包可被 import
-_project_root = _root.parent  # scripts/ → QuantDinger/
-sys.path.insert(0, str(_project_root))
+# _root 已经是项目根目录（QuantDinger/），无需再 parent
+sys.path.insert(0, str(_root))
 # 如果 .env 在 backend_api_python/ 下，也需要显式加载
-sys.path.insert(0, str(_project_root / "backend_api_python"))
+sys.path.insert(0, str(_root / "backend_api_python"))
 
 CACHE_DIR = _root / "ths_data" / "cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -297,13 +297,47 @@ def fetch_em_concepts():
 # 归一化 + 合并
 # ============================================================
 
-def normalize_industry(sw_data, sina_data):
+def load_ths_data():
+    """加载同花顺缓存数据（ths_data/stock_concepts.json + stock_industry.json）
+
+    由 ths_fetch_fast.py 生成，格式:
+      concepts: {stock_code: ["概念1", "概念2", ...]}
+      industry: {stock_code: "行业名"}
     """
-    合并申万 + 新浪行业，输出 {code: "行业1,行业2,..."}
-    优先申万（更标准），新浪补充
+    ths_dir = _root / "ths_data"
+    ths_concepts = {}
+    ths_industry = {}
+
+    con_path = ths_dir / "stock_concepts.json"
+    if con_path.exists():
+        try:
+            with open(con_path, "r", encoding="utf-8") as f:
+                ths_concepts = json.load(f)
+            print(f"[缓存] 同花顺概念: {len(ths_concepts)} 只股票", file=sys.stderr)
+        except Exception as e:
+            print(f"[警告] 加载同花顺概念缓存失败: {e}", file=sys.stderr)
+
+    ind_path = ths_dir / "stock_industry.json"
+    if ind_path.exists():
+        try:
+            with open(ind_path, "r", encoding="utf-8") as f:
+                ths_industry = json.load(f)
+            print(f"[缓存] 同花顺行业: {len(ths_industry)} 只股票", file=sys.stderr)
+        except Exception as e:
+            print(f"[警告] 加载同花顺行业缓存失败: {e}", file=sys.stderr)
+
+    return ths_industry, ths_concepts
+
+
+def normalize_industry(sw_data, sina_data, ths_data=None):
+    """
+    合并申万 + 新浪 + 同花顺行业，输出 {code: "行业1,行业2,..."}
+    优先申万（更标准），新浪和同花顺补充
     """
     merged = {}
     all_codes = set(sw_data.keys()) | set(sina_data.keys())
+    if ths_data:
+        all_codes |= set(ths_data.keys())
 
     for code in all_codes:
         items = []
@@ -326,26 +360,54 @@ def normalize_industry(sw_data, sina_data):
                     seen.add(name)
                     items.append(name)
 
+        # 同花顺补充
+        if ths_data:
+            ths = ths_data.get(code, "")
+            if isinstance(ths, str) and ths:
+                for name in ths.split(","):
+                    name = name.strip()
+                    if name and name not in seen:
+                        seen.add(name)
+                        items.append(name)
+
         if items:
             merged[code] = ",".join(items)
 
     return merged
 
 
-def normalize_concepts(em_data):
+def normalize_concepts(em_data, ths_data=None):
     """
     归一化概念数据，输出 {code: "概念1,概念2,..."}
+    合并东财 + 同花顺，去重
     """
     merged = {}
-    for code, concepts in em_data.items():
-        if isinstance(concepts, list) and concepts:
-            # 去重保序
-            seen = set()
-            unique = []
-            for c in concepts:
-                if c not in seen:
+    all_codes = set(em_data.keys())
+    if ths_data:
+        all_codes |= set(ths_data.keys())
+
+    for code in all_codes:
+        seen = set()
+        unique = []
+
+        # 东财概念
+        em = em_data.get(code, [])
+        if isinstance(em, list):
+            for c in em:
+                if c and c not in seen:
                     seen.add(c)
                     unique.append(c)
+
+        # 同花顺概念补充
+        if ths_data:
+            ths = ths_data.get(code, [])
+            if isinstance(ths, list):
+                for c in ths:
+                    if c and c not in seen:
+                        seen.add(c)
+                        unique.append(c)
+
+        if unique:
             merged[code] = ",".join(unique)
     return merged
 
@@ -355,7 +417,13 @@ def normalize_concepts(em_data):
 # ============================================================
 
 def write_to_db(stock_industry: dict, stock_concepts: dict, dry_run=False):
-    """写入 stock_basic_info 表（PostgreSQL）"""
+    """写入 stock_basic_info 表（PostgreSQL）
+
+    流程:
+      1. 从 DB 读取已有的 industry 和 concepts
+      2. 与本次抓取的数据合并去重（union）
+      3. UPSERT 写回（INSERT ON CONFLICT UPDATE），新股票会自动插入
+    """
 
     # dry-run 不需要 DB 连接
     if dry_run:
@@ -376,62 +444,109 @@ def write_to_db(stock_industry: dict, stock_concepts: dict, dry_run=False):
 
     pool = db._get_pool()
 
-    # 读取已有数据（用于合并 concepts）
+    # ── 读取 DB 已有数据（industry + concepts 都要读） ──
+    existing_industry = {}
     existing_concepts = {}
     with pool.cursor() as cur:
-        cur.execute("SELECT symbol, concepts FROM stock_basic_info WHERE concepts IS NOT NULL AND concepts != ''")
-        existing_concepts = {row[0]: row[1] for row in cur.fetchall()}
+        cur.execute(
+            "SELECT symbol, industry, concepts FROM stock_basic_info "
+            "WHERE (industry IS NOT NULL AND industry != '') "
+            "   OR (concepts IS NOT NULL AND concepts != '')"
+        )
+        for row in cur.fetchall():
+            sym, ind, con = row[0], row[1] or "", row[2] or ""
+            if ind:
+                existing_industry[sym] = ind
+            if con:
+                existing_concepts[sym] = con
 
-    # 合并 concepts（新数据追加，不覆盖旧的）
-    merged_concepts = {}
-    for code, new_str in stock_concepts.items():
-        old = existing_concepts.get(code, "")
+    print(f"[DB] 已有行业: {len(existing_industry)} 只, 概念: {len(existing_concepts)} 只", file=sys.stderr)
+
+    # ── 合并去重: industry（DB ∪ 新抓取） ──
+    merged_industry = {}
+    all_ind_codes = set(existing_industry.keys()) | set(stock_industry.keys())
+    for code in all_ind_codes:
+        old = existing_industry.get(code, "")
+        new = stock_industry.get(code, "")
         old_set = set(c.strip() for c in old.split(",") if c.strip())
-        new_set = set(c.strip() for c in new_str.split(",") if c.strip())
+        new_set = set(c.strip() for c in new.split(",") if c.strip())
         combined = sorted(old_set | new_set)
-        merged_concepts[code] = ",".join(combined)
+        if combined:
+            merged_industry[code] = ",".join(combined)
 
-    # 收集所有需要更新的 symbol
-    all_codes = set(merged_concepts.keys()) | set(stock_industry.keys())
+    # ── 合并去重: concepts（DB ∪ 新抓取） ──
+    merged_concepts = {}
+    all_con_codes = set(existing_concepts.keys()) | set(stock_concepts.keys())
+    for code in all_con_codes:
+        old = existing_concepts.get(code, "")
+        new = stock_concepts.get(code, "")
+        old_set = set(c.strip() for c in old.split(",") if c.strip())
+        new_set = set(c.strip() for c in new.split(",") if c.strip())
+        combined = sorted(old_set | new_set)
+        if combined:
+            merged_concepts[code] = ",".join(combined)
 
-    # 批量写入（PG 用 ON CONFLICT 或直接 UPDATE）
-    print(f"\n[写库] 更新 {len(all_codes)} 只股票...", file=sys.stderr)
+    # ── 收集所有需要写入的 symbol ──
+    all_codes = set(merged_industry.keys()) | set(merged_concepts.keys())
+    print(f"[合并] 行业: {len(merged_industry)} 只, 概念: {len(merged_concepts)} 只, 总计: {len(all_codes)} 只", file=sys.stderr)
+
+    # ── 只更新 DB 中已存在的股票，不存在的跳过 ──
+    # 新股票的 symbol/name/market_cn 由 sync_from_remote 负责写入，
+    # 本脚本只补充 industry/concepts，不凭空创建空壳记录。
+    db_codes = set()
+    with pool.cursor() as cur:
+        cur.execute("SELECT symbol FROM stock_basic_info")
+        db_codes = {row[0] for row in cur.fetchall()}
+
+    skipped = all_codes - db_codes
+    target_codes = all_codes & db_codes
+    if skipped:
+        print(f"[跳过] {len(skipped)} 只股票不在 DB 中（需先运行 sync_from_remote）", file=sys.stderr)
+
+    print(f"\n[写库] 更新 {len(target_codes)} 只股票...", file=sys.stderr)
     now = datetime.datetime.now()
     updated = 0
     batch = []
 
+    for code in target_codes:
+        con = merged_concepts.get(code, "")
+        ind = merged_industry.get(code, "")
+        batch.append((code, ind, con, now))
+        if len(batch) >= 500:
+            u = _update_batch(pool, batch)
+            updated += u
+            batch = []
+    if batch:
+        u = _update_batch(pool, batch)
+        updated += u
+
+    print(f"✅ 已更新 {updated} 只（行业 {len(merged_industry)} 只，概念 {len(merged_concepts)} 只）", file=sys.stderr)
+
+
+def _update_batch(pool, batch):
+    """批量 UPDATE，返回更新条数
+
+    Python 层已完成合并去重，SQL 直接 SET 最终值。
+    只更新 DB 中已存在的记录（WHERE symbol = %s）。
+    """
+    updated = 0
     with pool.connection() as conn:
         cur = conn.cursor()
-        for code in all_codes:
-            con = merged_concepts.get(code, "")
-            ind = stock_industry.get(code, "")
-            batch.append((con, ind, now, code))
-            if len(batch) >= 500:
-                cur.executemany(
-                    "UPDATE stock_basic_info "
-                    "SET concepts = CASE WHEN %s != '' THEN %s ELSE concepts END, "
-                    "    industry = CASE WHEN %s != '' THEN %s ELSE industry END, "
-                    "    updated_at = %s "
-                    "WHERE symbol = %s",
-                    [(c, c, i, i, t, s) for c, i, t, s in batch],
-                )
-                updated += len(batch)
-                conn.commit()
-                batch = []
-        if batch:
-            cur.executemany(
-                "UPDATE stock_basic_info "
-                "SET concepts = CASE WHEN %s != '' THEN %s ELSE concepts END, "
-                "    industry = CASE WHEN %s != '' THEN %s ELSE industry END, "
-                "    updated_at = %s "
-                "WHERE symbol = %s",
-                [(c, c, i, i, t, s) for c, i, t, s in batch],
+        for code, ind, con, ts in batch:
+            cur.execute(
+                """
+                UPDATE stock_basic_info SET
+                    industry   = CASE WHEN %s != '' THEN %s ELSE industry END,
+                    concepts   = CASE WHEN %s != '' THEN %s ELSE concepts END,
+                    updated_at = %s
+                WHERE symbol = %s
+                """,
+                (ind, ind, con, con, ts, code),
             )
-            updated += len(batch)
-            conn.commit()
+            updated += cur.rowcount
+        conn.commit()
         cur.close()
-
-    print(f"✅ 已更新 {updated} 只股票（行业 {len(stock_industry)} 只，概念 {len(merged_concepts)} 只）", file=sys.stderr)
+    return updated
 
 
 # ============================================================
@@ -457,10 +572,13 @@ def main():
         sina_data = fetch_sina_industry()
         em_data = fetch_em_concepts()
 
-    # 2. 归一化
+    # 1.5 加载同花顺缓存（由 ths_fetch_fast.py 生成，需提前运行）
+    ths_industry, ths_concepts = load_ths_data()
+
+    # 2. 归一化（申万 + 新浪 + 同花顺 行业；东财 + 同花顺 概念）
     print("\n[归一化] 合并去重...", file=sys.stderr)
-    industry = normalize_industry(sw_data, sina_data)
-    concepts = normalize_concepts(em_data)
+    industry = normalize_industry(sw_data, sina_data, ths_industry)
+    concepts = normalize_concepts(em_data, ths_concepts)
 
     print(f"  行业: {len(industry)} 只股票", file=sys.stderr)
     print(f"  概念: {len(concepts)} 只股票", file=sys.stderr)
