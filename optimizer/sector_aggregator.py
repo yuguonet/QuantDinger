@@ -373,6 +373,28 @@ class SectorAggregator:
             _is_ashare_market, _get_ashare_initial_capital, _get_ashare_commission,
             parse_market_symbol, _list_local_symbols,
         )
+        import pandas as pd
+        from app.data_sources.factory import DataSourceFactory
+        from app.services.backtest import BacktestService
+
+        # ── Monkey-patch: 用正确的日期范围取数据，绕过 runner 的 limit*1.5 反算 ──
+        _original_fetch = BacktestService._fetch_kline_data
+
+        def _direct_fetch(self, market, symbol, timeframe, start_date, end_date):
+            """直接用 start_date/end_date 查 db_market，不做 limit 反算"""
+            from optimizer.data_warehouse.storage import _get_writer
+            writer = _get_writer()
+            db_symbol = symbol.split(".")[0] if "." in symbol else symbol
+            kline_data = writer.query(
+                market, db_symbol, timeframe,
+                start_time=start_date, end_time=end_date, limit=0,
+            )
+            if not kline_data:
+                return pd.DataFrame()
+            df = pd.DataFrame(kline_data)
+            if "time" in df.columns:
+                df["time"] = pd.to_datetime(df["time"])
+            return df
 
         # 过滤出本地有数据的股票
         # db_market 和 BacktestObjective 都用不带后缀的 symbol（如 "000009"）
@@ -434,6 +456,9 @@ class SectorAggregator:
         all_trades = []
         errors = []
 
+        # 应用 patch：让 BacktestService 用正确的日期范围取数据
+        BacktestService._fetch_kline_data = _direct_fetch
+
         for idx, symbol in enumerate(stocks):
             print(f"\r  [{idx+1}/{len(stocks)}] {symbol}...", end="", flush=True)
 
@@ -476,6 +501,9 @@ class SectorAggregator:
                 })
 
         print(f"\n  完成: {len(stocks)} 只股票, {len(errors)} 个错误")
+
+        # 还原 patch
+        BacktestService._fetch_kline_data = _original_fetch
 
         # ── 汇聚统计 ──
         if errors:
