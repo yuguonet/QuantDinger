@@ -667,6 +667,89 @@ class BacktestObjective:
 
 
 # ============================================================
+# 公共回测函数（sector_aggregator 等外部模块直接调用）
+# ============================================================
+
+def run_backtest(
+    template_key: str,
+    params: dict,
+    symbol: str,
+    market: str,
+    timeframe: str,
+    start_date: datetime,
+    end_date: datetime,
+    initial_capital: float = None,
+    commission: float = None,
+) -> Dict[str, Any]:
+    """
+    直接调用 BacktestService.run()，返回完整结果（含 trades）。
+
+    与 BacktestObjective 的区别：不做指标精简，保留全部字段。
+    sector_aggregator 等需要 trades 的模块应该用这个函数。
+    """
+    global _StrategyCompiler, _BacktestService
+    if _BacktestService is None:
+        _lazy_import()
+
+    template = get_template_unified(template_key)
+    is_ashare = _is_ashare_market(market)
+
+    if initial_capital is None:
+        initial_capital = _get_ashare_initial_capital() if is_ashare else 10000.0
+    if commission is None:
+        commission = _get_ashare_commission() if is_ashare else 0.001
+
+    # 1. 生成策略代码
+    if "build_strategy" in template:
+        code = template["build_strategy"](params)
+    else:
+        if _StrategyCompiler is None:
+            _lazy_import()
+        config = template["build_config"](params)
+        if is_ashare:
+            rm = config.get("risk_management", {})
+            rm["ashare_rules"] = {"t_plus_1": True, "price_limit": True, "min_lot": 100}
+            config["risk_management"] = rm
+        code = _StrategyCompiler().compile(config)
+
+    # 2. 构建 strategy_config
+    strategy_config = {}
+    if is_ashare:
+        strategy_config['ashare_rules'] = {
+            't_plus_1': True,
+            'limit_pct': 0.20 if symbol[:3] in ('300', '301', '688') else 0.10,
+        }
+    position_pct = params.get('position_pct')
+    if position_pct is not None:
+        strategy_config['position'] = {'entryPct': position_pct / 100.0}
+
+    tmpl_defaults = template.get('strategy_defaults') or {}
+    trade_dir = tmpl_defaults.get('tradeDirection', 'both')
+
+    # 3. 直接调 BacktestService.run()
+    backtest = _BacktestService()
+    result = backtest.run(
+        indicator_code=code,
+        market=market,
+        symbol=symbol,
+        timeframe=timeframe,
+        start_date=start_date,
+        end_date=end_date,
+        initial_capital=initial_capital,
+        commission=commission,
+        strategy_config=strategy_config if strategy_config else None,
+        trade_direction=trade_dir,
+    )
+
+    # 4. A 股后处理
+    if is_ashare:
+        result["t1_enforced"] = True
+        result["limit_check"] = True
+
+    return result
+
+
+# ============================================================
 # 单模板优化
 # ============================================================
 

@@ -375,7 +375,7 @@ class SectorAggregator:
         market_filter: 启用大盘过滤，剔除大盘下跌趋势期间开仓的交易
         """
         from optimizer.runner import (
-            get_template_unified, BacktestObjective,
+            get_template_unified, run_backtest,
             _is_ashare_market, _get_ashare_initial_capital, _get_ashare_commission,
             parse_market_symbol, _list_local_symbols,
         )
@@ -470,8 +470,9 @@ class SectorAggregator:
             print(f"\r  [{idx+1}/{len(stocks)}] {symbol}...", end="", flush=True)
 
             try:
-                objective = BacktestObjective(
+                result = run_backtest(
                     template_key=template_key,
+                    params=default_params,
                     symbol=symbol,
                     market=market,
                     timeframe=timeframe,
@@ -481,20 +482,17 @@ class SectorAggregator:
                     commission=commission,
                 )
 
-                metrics = objective(default_params)
-                trades = metrics.get("trades", [])
-
                 per_stock_results.append({
                     "symbol": symbol,
-                    "total_trades": metrics.get("totalTrades", 0),
-                    "win_rate": metrics.get("winRate", 0),
-                    "total_return": metrics.get("totalReturn", 0),
-                    "sharpe": metrics.get("sharpeRatio", 0),
-                    "max_drawdown": metrics.get("maxDrawdown", 0),
-                    "profit_factor": metrics.get("profitFactor", 0),
+                    "total_trades": result.get("totalTrades", 0),
+                    "win_rate": result.get("winRate", 0),
+                    "total_return": result.get("totalReturn", 0),
+                    "sharpe": result.get("sharpeRatio", 0),
+                    "max_drawdown": result.get("maxDrawdown", 0),
+                    "profit_factor": result.get("profitFactor", 0),
                 })
 
-                for trade in trades:
+                for trade in result.get("trades", []):
                     trade_copy = dict(trade)
                     trade_copy["_symbol"] = symbol
                     all_trades.append(trade_copy)
@@ -517,76 +515,100 @@ class SectorAggregator:
             from optimizer.market_sentiment import MarketBenchmark
             mb = MarketBenchmark()
 
-            # 按股票分组，识别需要剔除的开仓交易
-            # trades 是按顺序排列的 open/close 事件对
-            filtered_trades = []
-            removed_count = 0
-            regime_stats = {"up": 0, "flat": 0, "down": 0}
-            # 按 _symbol 分组
-            trades_by_symbol = {}
-            for t in all_trades:
-                sym = t.get("_symbol", "")
-                trades_by_symbol.setdefault(sym, []).append(t)
-
-            for sym, sym_trades in trades_by_symbol.items():
-                # 构造带后缀的代码（用于市场判断）
-                code = sym.split(".")[0] if "." in sym else sym
-                if code.startswith("6"):
-                    sym_with_suffix = code + ".SH"
+            # ── 前置检查：数据是否拉到了 ──
+            try:
+                _test_cum = mb.get_benchmark_cumulative("600519.SH", "2025-06-15", 20)
+                _test_dates = mb.get_all_dates()
+                if not _test_dates:
+                    print(f"\n  ⚠️ 大盘过滤: Sina API 未返回数据，跳过过滤")
+                    print(f"     请检查网络连接或代理设置")
                 else:
-                    sym_with_suffix = code + ".SZ"
+                    print(f"\n  📊 大盘数据加载成功: {len(_test_dates)} 个交易日")
 
-                # 找出大盘下跌期间的开仓时间
-                bad_opens = set()
-                for t in sym_trades:
-                    if t.get("type", "").startswith("open_"):
-                        trade_date = t["time"][:10]  # 'YYYY-MM-DD'
-                        regime = mb.get_regime(sym_with_suffix, trade_date)
-                        regime_stats[regime["trend"]] += 1
-                        if regime["trend"] == "down":
-                            bad_opens.add(id(t))
-                            removed_count += 1
+                    # 按股票分组，识别需要剔除的开仓交易
+                    filtered_trades = []
+                    removed_count = 0
+                    regime_stats = {"up": 0, "flat": 0, "down": 0}
+                    cum20_samples = []  # 收集样本用于 debug
+                    trades_by_symbol = {}
+                    for t in all_trades:
+                        sym = t.get("_symbol", "")
+                        trades_by_symbol.setdefault(sym, []).append(t)
 
-                if bad_opens:
-                    # 配对删除：开仓被删 → 对应的平仓也要删
-                    pending_close = None
-                    for t in sym_trades:
-                        if t.get("type", "").startswith("open_"):
-                            if id(t) in bad_opens:
-                                pending_close = True  # 标记下一个平仓要删
-                                continue
-                            else:
-                                pending_close = False
-                        elif t.get("type", "").startswith("close_"):
-                            if pending_close:
-                                removed_count += 1
-                                continue  # 跳过对应的平仓
+                    for sym, sym_trades in trades_by_symbol.items():
+                        # 构造带后缀的代码（用于市场判断）
+                        code = sym.split(".")[0] if "." in sym else sym
+                        if code.startswith("6"):
+                            sym_with_suffix = code + ".SH"
+                        else:
+                            sym_with_suffix = code + ".SZ"
+
+                        # 找出大盘下跌期间的开仓时间
+                        bad_opens = set()
+                        for t in sym_trades:
+                            if t.get("type", "").startswith("open_"):
+                                trade_date = t["time"][:10]  # 'YYYY-MM-DD'
+                                regime = mb.get_regime(sym_with_suffix, trade_date)
+                                cum20 = mb.get_benchmark_cumulative(sym_with_suffix, trade_date, 20)
+                                regime_stats[regime["trend"]] += 1
+                                if len(cum20_samples) < 10:
+                                    cum20_samples.append((sym, trade_date, cum20, regime["trend"]))
+                                if regime["trend"] == "down":
+                                    bad_opens.add(id(t))
+                                    removed_count += 1
+
+                        if bad_opens:
+                            # 配对删除：开仓被删 → 对应的平仓也要删
                             pending_close = None
-                        filtered_trades.append(t)
-                else:
-                    filtered_trades.extend(sym_trades)
+                            for t in sym_trades:
+                                if t.get("type", "").startswith("open_"):
+                                    if id(t) in bad_opens:
+                                        pending_close = True  # 标记下一个平仓要删
+                                        continue
+                                    else:
+                                        pending_close = False
+                                elif t.get("type", "").startswith("close_"):
+                                    if pending_close:
+                                        removed_count += 1
+                                        continue  # 跳过对应的平仓
+                                    pending_close = None
+                                filtered_trades.append(t)
+                        else:
+                            filtered_trades.extend(sym_trades)
 
-            if removed_count > 0:
-                print(f"\n  🛡️ 大盘过滤: 剔除 {removed_count} 笔交易（大盘下跌趋势期间开仓）")
-                print(f"     大盘状态分布: up={regime_stats['up']}, flat={regime_stats['flat']}, down={regime_stats['down']}")
-                all_trades = filtered_trades
+                    # Debug: 打印 cum20 样本
+                    if cum20_samples:
+                        print(f"     cum20 样本 (前 {len(cum20_samples)} 笔):")
+                        for sym_s, d, c20, trend in cum20_samples:
+                            print(f"       {sym_s} @ {d}: cum20={c20:+.4f} → {trend}")
 
-                # 重新计算 per_stock_results
-                for r in per_stock_results:
-                    sym = r["symbol"]
-                    sym_filtered = [t for t in all_trades if t.get("_symbol") == sym]
-                    opens = [t for t in sym_filtered if t.get("type", "").startswith("open_")]
-                    closes = [t for t in sym_filtered if t.get("type", "").startswith("close_")]
-                    r["total_trades"] = len(opens)
-                    if opens and closes:
-                        profits = [t.get("profit", 0) for t in closes]
-                        wins = sum(1 for p in profits if p > 0)
-                        r["win_rate"] = round(wins / len(profits) * 100, 2) if profits else 0
+                    if removed_count > 0:
+                        print(f"\n  🛡️ 大盘过滤: 剔除 {removed_count} 笔交易（大盘下跌趋势期间开仓）")
+                        print(f"     大盘状态分布: up={regime_stats['up']}, flat={regime_stats['flat']}, down={regime_stats['down']}")
+                        all_trades = filtered_trades
+
+                        # 重新计算 per_stock_results
+                        for r in per_stock_results:
+                            sym = r["symbol"]
+                            sym_filtered = [t for t in all_trades if t.get("_symbol") == sym]
+                            opens = [t for t in sym_filtered if t.get("type", "").startswith("open_")]
+                            closes = [t for t in sym_filtered if t.get("type", "").startswith("close_")]
+                            r["total_trades"] = len(opens)
+                            if opens and closes:
+                                profits = [t.get("profit", 0) for t in closes]
+                                wins = sum(1 for p in profits if p > 0)
+                                r["win_rate"] = round(wins / len(profits) * 100, 2) if profits else 0
+                            else:
+                                r["win_rate"] = 0
                     else:
-                        r["win_rate"] = 0
-            else:
-                print(f"\n  🛡️ 大盘过滤: 无交易被剔除")
-                print(f"     大盘状态分布: up={regime_stats['up']}, flat={regime_stats['flat']}, down={regime_stats['down']}")
+                        print(f"\n  🛡️ 大盘过滤: 无交易被剔除")
+                        print(f"     大盘状态分布: up={regime_stats['up']}, flat={regime_stats['flat']}, down={regime_stats['down']}")
+                        if regime_stats['down'] == 0 and regime_stats['flat'] > 0:
+                            print(f"     ⚠️ 所有交易都是 flat，可能是阈值太严或数据问题")
+                            print(f"     当前阈值: cum20 > +2% = up, cum20 < -1% = down, 其余 = flat")
+            except Exception as e:
+                print(f"\n  ⚠️ 大盘过滤初始化失败: {e}")
+                print(f"     跳过过滤，继续统计")
 
         # ── 汇聚统计 ──
         if errors:

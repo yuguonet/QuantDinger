@@ -471,7 +471,7 @@ class MarketBenchmark:
         """个股 alpha = 个股收益 - 对应市场基准收益"""
         return stock_return - self.get_benchmark_return(symbol, date)
 
-    def get_regime(self, symbol: str, date: str) -> Dict[str, Any]:
+    def get_regime(self, symbol: str, date: str, verbose: bool = False) -> Dict[str, Any]:
         """市场状态（基于对应市场基准）"""
         self._ensure_loaded()
         cum_20 = self.get_benchmark_cumulative(symbol, date, 20)
@@ -479,10 +479,13 @@ class MarketBenchmark:
 
         if cum_20 > 0.02:
             trend = "up"
-        elif cum_20 < -0.015:
+        elif cum_20 < -0.01:
             trend = "down"
         else:
             trend = "flat"
+
+        if verbose:
+            print(f"       [regime] {symbol} @ {date}: cum20={cum_20:+.4f} cum5={cum_5:+.4f} → {trend}")
 
         # 波动率
         returns = self.get_benchmark_returns(
