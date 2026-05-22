@@ -402,9 +402,12 @@ class MarketKlineWriter:
         end_dt = _ensure_datetime(end_time) if end_time is not None else None
 
         years = set()
-        if start_dt:
+        if start_dt and end_dt:
+            for y in range(start_dt.year, end_dt.year + 1):
+                years.add(y)
+        elif start_dt:
             years.add(start_dt.year)
-        if end_dt:
+        elif end_dt:
             years.add(end_dt.year)
 
         pool = self._mgr._get_pool(market)

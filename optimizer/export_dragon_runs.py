@@ -344,7 +344,7 @@ def scan_and_export(
                     sd = pd.Timestamp(start_date)
                     ed = pd.Timestamp(end_date)
                     df_scan = df[(df.index >= sd) & (df.index <= ed)]
-                    if len(df_scan) < 30:
+                    if len(df_scan) < 5:
                         continue
                     runs = detect_limit_up_runs(df_scan, code, min_streak=min_streak, max_gap=max_gap)
                     if not runs:
@@ -420,7 +420,7 @@ def scan_and_export(
                     sd = pd.Timestamp(start_date)
                     ed = pd.Timestamp(end_date)
                     df_scan = df[(df.index >= sd) & (df.index <= ed)]
-                    if len(df_scan) < 30:
+                    if len(df_scan) < 5:
                         continue
                     runs = detect_limit_up_runs(df_scan, code, min_streak=min_streak, max_gap=max_gap)
                     if not runs:
