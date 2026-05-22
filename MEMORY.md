@@ -74,6 +74,46 @@ python optimizer/strategy_dragon_v3.py --csv analysis_output/dragon_ohlcv.csv
 python optimizer/export_dragon_runs.py --min-streak=1 --max-gap=2 --start=2024-01-01 --end=2026-12-31
 ```
 
+## 2026-05-23 连板猎手V1 (最终版)
+
+### 核心发现: V3.1买入不可执行
+- V3.1在涨停日close买入, 实盘中涨停封死买不到
+- 修正为D+1 open后, 胜率从90%→50%, 溢价吃掉全部利润
+- **涨停日买入策略在实盘中根本不可行**
+
+### V1策略: 第一板识别→D+1开盘买入
+- 不追涨停板, 在涨停次日开盘买入
+- 核心筛选: 量比>2x + 上影线<0.5% + 排除一字板 + D+1涨幅<2%
+
+### 回测结果 (513笔)
+- 全市场: 95.1%胜率 +12.28%均收益 盈亏比1.65
+- 主板: 472笔 95.1% +10.91%
+- 创科: 41笔 95.1% +28.06%
+- 3板+: 100%胜率 +18~43%
+
+### 筛选因子重要性排序
+1. **D+1开盘涨幅** — 最核心, <2%最优(主板)
+2. **D0量比** — >2x从80%→92%胜率
+3. **D0上影线** — >0.5%直接排除(胜率<30%)
+4. **一字板** — 排除(买不到)
+5. 前5天特征 — 锦上添花, 区分度不大
+
+### 板块差异化
+- 主板: D+1涨幅<2% (85-92%胜率)
+- 创科: D+1涨幅<5% + 量比>2x (92-98%胜率)
+
+### 文件清单
+- `optimizer/strategy_dragon_v1_indicator.py` — V1 IndicatorStrategy
+- `optimizer/strategy_dragon_v1.py` — V1 独立回测
+- `optimizer/strategy_templates_ashare.py` — dragon_v1已注册
+- `analysis_backtest_next_open.py` — 买入时机修正分析
+- `analysis_entry_modes.py` — 入场方案对比
+- `analysis_v1_executable.py` — V1可执行分析
+- `analysis_v1_buyable.py` — 可买性分析
+- `analysis_v1_filter.py` — 第一板筛选因子
+- `analysis_v1_d0_factors.py` — D0深度筛选
+- `analysis_v1_pre5.py` — 前5天特征分析
+
 ## 技术记录
 - 新浪 HTTP API 零依赖可拉 5 大指数日线
 - runner.py ALL_TEMPLATES = STRATEGY_TEMPLATES + ASHARE_STRATEGY_TEMPLATES + LLM + MY + GENERATED
