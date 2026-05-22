@@ -443,11 +443,11 @@ def summarize_buy2(df: pd.DataFrame):
         # K线形态
         br_col = f"{label}_is_red"
         if br_col in df.columns:
-            red = df[br_col].dropna()
-            if len(red) > 0:
-                red_ret = df.loc[red[red].index, ret_col].dropna()
-                green_ret = df.loc[red[~red].index, ret_col].dropna() if (~red).any() else pd.Series()
-                print(f"     阴线日买入: {red.mean()*100:.0f}%")
+            red_mask = df[br_col].fillna(False).astype(bool)
+            if len(red_mask.dropna()) > 0:
+                red_ret = df.loc[red_mask, ret_col].dropna()
+                green_ret = df.loc[~red_mask, ret_col].dropna()
+                print(f"     阴线日买入: {red_mask.mean()*100:.0f}%")
                 if len(red_ret) > 0 and len(green_ret) > 0:
                     print(f"     阴线收益={red_ret.mean():+.1f}%  阳线收益={green_ret.mean():+.1f}%")
 

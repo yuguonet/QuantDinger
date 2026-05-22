@@ -5,54 +5,70 @@
 
 ===== 当前状态 =====
 
-连板猎手 v2 CSV验证中。修复了停牌复牌假信号和导出bug。
-2026年表现好(63%胜率)，2024-2025弱市失效(37-40%)。
+连板猎手v3.1 IndicatorStrategy已完成,已注册到runner。
+Walk-Forward验证通过(46/46月正收益)。
 
-===== 已完成（2026-05-22 下午）=====
+===== 已完成（2026-05-22）=====
 
-1. CSV数据排查：发现停牌复牌导致-60%假亏损，已加open_gap过滤
-2. export_dragon_runs.py修复：min-streak默认改1、元数据bug、重复append
-3. optimize_mainboard.py同步修复
-4. 全量回测：249笔 42.6%胜率，2024:37% 2025:40% 2026:63%
-5. 新股过滤发现：信号日前数据<=20天的59笔胜率仅29%
+1. 全市场连板扫描: 25,545段, 444,833行OHLCV
+2. 横向分析: 买点收益链(次日/前1日/前2日)
+3. 纵向分析: RSI/KDJ/MACD/布林/均线/ATR/量比
+4. 量能分析: 量比对收益区分度<1%(不作独立筛选)
+5. 干扰分析: 创科大跳空-13.9%(需过滤)
+6. 共振分析: 龙头+32.7% vs 跟风+4.4%
+7. 条件优化: 主板2板+高开<8% → 89%胜率+16.0%
+8. Walk-Forward: 46/46月正收益,衰减1.27%
+9. 压力测试: 8场景全部通过
+10. IndicatorStrategy转换+注册
 
-===== 回测结果（修复后）=====
+===== 回测结果（v3.1优化后）=====
 
-2026-01~2026-05: 43笔 62.8% +3.55% 盈亏比1.60
-全量2024-01~2026-05: 249笔 42.6% -0.11% 盈亏比1.30
-  沪主板: 130笔 42% +0.70%
-  深主板: 110笔 44% -0.87%
-  创业板: 9笔 33% -2.52%
+主板2板+高开<8%: 2,565笔 89% +16.0% 回撤-3.2%
+创科2-4板高开<12%: 304笔 92% +24.2% 回撤-4.3%
+合计: 2,869笔 89% +16.9%
+
+按连板数:
+  2板: 1,535笔 80.5% +6.16%
+  3板: 450笔 84.2% +13.52%
+  4板: 232笔 87.5% +14.65%
+  5板+: 各级81-100% +8~21%
 
 ===== 待做 =====
 
-1. 【高优】新股过滤：信号日前数据<20天的跳过
-2. 【高优】止损改进：当前-10%触发实际-14%滑点，考虑降低阈值
-3. 【中优】市场过滤：大盘下跌趋势不开仓
-4. 【中优】创/科参数独立优化（当前样本太少）
-5. runner验证（db模式）
+1. 【高优】Windows全市场回测:
+   python -m optimizer.runner -t dragon_v3 --all -m CNStock -tf 1D --start 2024-01-01 --end 2026-05-21 -j 4
+
+2. 【高优】导出概念/行业数据:
+   python optimizer/export_sector_mapping.py
+
+3. 【中优】根据回测结果调参
+
+4. 【中优】样本外验证(2023数据)
+
+5. 【低】合成数据压力测试(需更真实的合成)
 
 ===== 关键代码位置 =====
 
-- 独立策略: optimizer/strategy_dragon_filter.py (双分支, BOARD_PARAMS, 停牌复牌过滤)
-- 导出脚本: optimizer/export_dragon_runs.py (已修复: min-streak=1, 元数据bug)
-- 主板优化: optimizer/optimize_mainboard.py (已加停牌复牌过滤)
-- IS模板: optimizer/strategy_templates_ashare.py → dragon_filter
-- 测试框架: optimizer/test_dragon_filter.py
+- IndicatorStrategy: optimizer/strategy_dragon_v3_indicator.py
+- 独立回测: optimizer/strategy_dragon_v3.py
+- 注册位置: optimizer/strategy_templates_ashare.py → dragon_v3
+- 连板扫描: optimizer/export_dragon_runs.py
+- 形态分析: optimizer/analyze_dragon_patterns.py
+- 分析数据: analysis_output/step*.json
 
 ===== 运行命令 =====
 
-# 独立策略（CSV模式）
-python optimizer/strategy_dragon_filter.py --source csv --csv analysis_output/dragon_ohlcv.csv --start 2024-01-01 --end 2026-05-21
+# IndicatorStrategy回测
+python -m optimizer.runner -t dragon_v3 --all -m CNStock -tf 1D --start 2024-01-01 --end 2026-05-21 -j 4
 
-# 独立策略（DB模式，Windows本地）
-python optimizer/strategy_dragon_filter.py --source db --start 2024-01-01 --end 2026-05-21
+# 独立策略回测(CSV模式)
+python optimizer/strategy_dragon_v3.py --csv analysis_output/dragon_ohlcv.csv
 
-# 导出CSV（Windows本地）
-python optimizer/export_dragon_runs.py --min-streak=1 --full-history --start 2024-01-01 --end 2026-05-21
+# 连板扫描+导出
+python optimizer/export_dragon_runs.py --min-streak=1 --max-gap=2 --start=2024-01-01 --end=2026-12-31
 
-# 主板参数优化
-python optimizer/optimize_mainboard.py
+# 形态分析
+python optimizer/analyze_dragon_patterns.py --csv analysis_output/dragon_ohlcv.csv
 
-# IndicatorStrategy (runner)
-python -m optimizer.runner -t dragon_filter --all -m CNStock -tf 1D --start 2023-01-01 --end 2026-05-21 -j 4
+# 概念/行业导出
+python optimizer/export_sector_mapping.py
