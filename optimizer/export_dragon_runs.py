@@ -150,6 +150,13 @@ def detect_limit_up_runs(
     returns = df["close"].pct_change()
     is_lu = returns >= threshold
 
+    # 数据断层检查：排除相邻交易日间隔>5天的假信号
+    dates = df.index
+    for _gap_idx in range(1, len(dates)):
+        if hasattr(dates[_gap_idx], "value") and hasattr(dates[_gap_idx-1], "value"):
+            if (dates[_gap_idx] - dates[_gap_idx-1]).days > 5:
+                is_lu.iloc[_gap_idx] = False
+
     runs = []
     i = 0
     while i < len(is_lu):
@@ -268,17 +275,14 @@ def scan_and_export(
     end_date: str = "2026-05-21",
     pre_days: int = 10,
     output_path: str = "analysis_output/dragon_ohlcv.csv",
+    full_history: bool = False,
 ):
     """
     扫描全市场连板股，导出 OHLCV 到 CSV。
 
-    逻辑:
-      1. 找连板段（≥min_streak 板，允许 max_gap 天洗盘）
-      2. 向后 5 日搜索最高点 → 终止日
-      3. 起始日 = 第一板前一日
-      4. 数据起点 = 起始日前 pre_days 个交易日
-      5. 数据终点 = 终止日
-      6. 导出该区间 OHLCV
+    两种模式:
+      --full-history  导出每只股票的完整历史（正式回测用，无断层）
+      默认            仅导出涨停前后窗口（快速分析用，文件小）
     """
     print(f"\n{'='*70}")
     print(f"  连板股扫描 + OHLCV 导出")
@@ -301,75 +305,74 @@ def scan_and_export(
     stocks_with_runs = 0
     error_count = 0
 
-    for i, code in enumerate(codes):
-        if (i + 1) % 200 == 0 or i == 0:
-            print(f"\r   扫描中: {i+1}/{total}  已导出 {len(all_rows):,} 行  "
-                  f"连板段 {len(run_summaries)} 个", end="", flush=True)
-        try:
-            df = load_daily(code, query_start, query_end)
-            if df is None or len(df) < 60:
-                continue
-
-            # 限定扫描区间
-            sd = pd.Timestamp(start_date)
-            ed = pd.Timestamp(end_date)
-            df_scan = df[(df.index >= sd) & (df.index <= ed)]
-            if len(df_scan) < 30:
-                continue
-
-            runs = detect_limit_up_runs(df_scan, code, min_streak=min_streak, max_gap=max_gap)
-            if not runs:
-                continue
-
-            stocks_with_runs += 1
-            board = get_board(code)
-
-            for run in runs:
-                run_first_idx = df_scan.index.get_loc(run["first_limit_date"])
-                run_last_idx = df_scan.index.get_loc(run["last_limit_date"])
-
-                # 起始日 = 第一板前一日
-                if run_first_idx < 1:
-                    continue  # 前面没有数据，跳过
-                start_idx_scan = run_first_idx - 1
-                start_date_val = df_scan.index[start_idx_scan]
-
-                # 向后搜索最高点
-                peak = find_peak_after_run(df_scan, run_last_idx, lookahead=5)
-                end_date_val = peak["peak_date"]
-
-                # 在完整 df 中定位（用于向前取 pre_days 数据）
-                # 先把起止日期映射回完整 df
-                start_loc_in_full = df.index.get_loc(start_date_val) if start_date_val in df.index else None
-                end_loc_in_full = df.index.get_loc(end_date_val) if end_date_val in df.index else None
-
-                if start_loc_in_full is None or end_loc_in_full is None:
+    if full_history:
+        # ── 模式2: 完整历史导出（正式回测用）──
+        # 第一遍：扫描哪些股票有连板段
+        stock_runs = {}
+        for i, code in enumerate(codes):
+            if (i + 1) % 500 == 0 or i == 0:
+                print(f"\r   扫描中: {i+1}/{total}", end="", flush=True)
+            try:
+                df = load_daily(code, query_start, query_end)
+                if df is None or len(df) < 60:
                     continue
-
-                # 数据起点 = 起始日前 pre_days 个交易日
-                data_start_loc = max(0, start_loc_in_full - pre_days)
-                # 数据终点 = 最高点后 post_days 个交易日
-                post_days = 5
-                data_end_loc = min(len(df) - 1, end_loc_in_full + post_days)
-
-                # 提取数据
-                segment = df.iloc[data_start_loc:data_end_loc + 1].copy()
-                if len(segment) == 0:
+                sd = pd.Timestamp(start_date)
+                ed = pd.Timestamp(end_date)
+                df_scan = df[(df.index >= sd) & (df.index <= ed)]
+                if len(df_scan) < 30:
                     continue
-
-                # 标记元数据
-                for ts, row in segment.iterrows():
-                    all_rows.append({
-                        "code": code,
-                        "board": board,
-                        "run_n_limit_ups": run["n_limit_ups"],
-                        "run_max_consecutive": run["max_consecutive"],
-                        "run_first_limit_date": run["first_limit_date"].strftime("%Y-%m-%d"),
-                        "run_last_limit_date": run["last_limit_date"].strftime("%Y-%m-%d"),
+                runs = detect_limit_up_runs(df_scan, code, min_streak=min_streak, max_gap=max_gap)
+                if not runs:
+                    continue
+                stocks_with_runs += 1
+                board = get_board(code)
+                stock_data = []
+                for run in runs:
+                    run_first_idx = df_scan.index.get_loc(run["first_limit_date"])
+                    run_last_idx = df_scan.index.get_loc(run["last_limit_date"])
+                    if run_first_idx < 1:
+                        continue
+                    start_date_val = df_scan.index[run_first_idx - 1]
+                    peak = find_peak_after_run(df_scan, run_last_idx, lookahead=5)
+                    stock_data.append((run, peak, start_date_val, peak["peak_date"]))
+                    run_summaries.append({
+                        "code": code, "board": board,
+                        "n_limit_ups": run["n_limit_ups"],
+                        "max_consecutive": run["max_consecutive"],
+                        "first_limit": run["first_limit_date"].strftime("%Y-%m-%d"),
+                        "last_limit": run["last_limit_date"].strftime("%Y-%m-%d"),
+                        "start_date": start_date_val.strftime("%Y-%m-%d"),
                         "peak_date": peak["peak_date"].strftime("%Y-%m-%d"),
                         "peak_price": round(peak["peak_price"], 3),
-                        "start_date": start_date_val.strftime("%Y-%m-%d"),
-                        "end_date": end_date_val.strftime("%Y-%m-%d"),
+                        "days_to_peak": peak["days_to_peak"],
+                    })
+                if stock_data:
+                    stock_runs[code] = stock_data
+            except Exception:
+                error_count += 1
+        print(f"\r   扫描完成: {stocks_with_runs} 只股票有连板段, {len(run_summaries)} 个连板段")
+
+        # 第二遍：导出完整历史
+        print(f"   导出数据...")
+        for idx, (code, run_list) in enumerate(stock_runs.items()):
+            if (idx + 1) % 200 == 0:
+                print(f"\r   导出: {idx+1}/{len(stock_runs)}  {len(all_rows):,} 行", end="", flush=True)
+            try:
+                df = load_daily(code, query_start, query_end)
+                if df is None:
+                    continue
+                board = get_board(code)
+                for ts, row in df.iterrows():
+                    all_rows.append({
+                        "code": code, "board": board,
+                        "run_n_limit_ups": run_list[0][0]["n_limit_ups"],
+                        "run_max_consecutive": run_list[0][0]["max_consecutive"],
+                        "run_first_limit_date": run_list[0][0]["first_limit_date"].strftime("%Y-%m-%d"),
+                        "run_last_limit_date": run_list[0][0]["last_limit_date"].strftime("%Y-%m-%d"),
+                        "peak_date": run_list[0][1]["peak_date"].strftime("%Y-%m-%d"),
+                        "peak_price": round(run_list[0][1]["peak_price"], 3),
+                        "start_date": run_list[0][2].strftime("%Y-%m-%d"),
+                        "end_date": run_list[0][3].strftime("%Y-%m-%d"),
                         "time": ts.strftime("%Y-%m-%d"),
                         "open": round(float(row["open"]), 3),
                         "high": round(float(row["high"]), 3),
@@ -377,31 +380,85 @@ def scan_and_export(
                         "close": round(float(row["close"]), 3),
                         "volume": int(row["volume"]),
                     })
+            except Exception:
+                error_count += 1
+    else:
+        # ── 模式1: 窗口导出（快速分析用，默认）──
+        for i, code in enumerate(codes):
+            if (i + 1) % 200 == 0 or i == 0:
+                print(f"\r   扫描中: {i+1}/{total}  已导出 {len(all_rows):,} 行  "
+                      f"连板段 {len(run_summaries)} 个", end="", flush=True)
+            try:
+                df = load_daily(code, query_start, query_end)
+                if df is None or len(df) < 60:
+                    continue
+                sd = pd.Timestamp(start_date)
+                ed = pd.Timestamp(end_date)
+                df_scan = df[(df.index >= sd) & (df.index <= ed)]
+                if len(df_scan) < 30:
+                    continue
+                runs = detect_limit_up_runs(df_scan, code, min_streak=min_streak, max_gap=max_gap)
+                if not runs:
+                    continue
+                stocks_with_runs += 1
+                board = get_board(code)
+                for run in runs:
+                    run_first_idx = df_scan.index.get_loc(run["first_limit_date"])
+                    run_last_idx = df_scan.index.get_loc(run["last_limit_date"])
+                    if run_first_idx < 1:
+                        continue
+                    start_date_val = df_scan.index[run_first_idx - 1]
+                    peak = find_peak_after_run(df_scan, run_last_idx, lookahead=5)
+                    end_date_val = peak["peak_date"]
+                    start_loc_in_full = df.index.get_loc(start_date_val) if start_date_val in df.index else None
+                    end_loc_in_full = df.index.get_loc(end_date_val) if end_date_val in df.index else None
+                    if start_loc_in_full is None or end_loc_in_full is None:
+                        continue
+                    data_start_loc = max(0, start_loc_in_full - pre_days)
+                    post_days = 5
+                    data_end_loc = min(len(df) - 1, end_loc_in_full + post_days)
+                    segment = df.iloc[data_start_loc:data_end_loc + 1].copy()
+                    if len(segment) == 0:
+                        continue
+                    for ts, row in segment.iterrows():
+                        all_rows.append({
+                            "code": code, "board": board,
+                            "run_n_limit_ups": run["n_limit_ups"],
+                            "run_max_consecutive": run["max_consecutive"],
+                            "run_first_limit_date": run["first_limit_date"].strftime("%Y-%m-%d"),
+                            "run_last_limit_date": run["last_limit_date"].strftime("%Y-%m-%d"),
+                            "peak_date": peak["peak_date"].strftime("%Y-%m-%d"),
+                            "peak_price": round(peak["peak_price"], 3),
+                            "start_date": start_date_val.strftime("%Y-%m-%d"),
+                            "end_date": end_date_val.strftime("%Y-%m-%d"),
+                            "time": ts.strftime("%Y-%m-%d"),
+                            "open": round(float(row["open"]), 3),
+                            "high": round(float(row["high"]), 3),
+                            "low": round(float(row["low"]), 3),
+                            "close": round(float(row["close"]), 3),
+                            "volume": int(row["volume"]),
+                        })
+                    run_summaries.append({
+                        "code": code, "board": board,
+                        "n_limit_ups": run["n_limit_ups"],
+                        "max_consecutive": run["max_consecutive"],
+                        "first_limit": run["first_limit_date"].strftime("%Y-%m-%d"),
+                        "last_limit": run["last_limit_date"].strftime("%Y-%m-%d"),
+                        "start_date": start_date_val.strftime("%Y-%m-%d"),
+                        "peak_date": peak["peak_date"].strftime("%Y-%m-%d"),
+                        "peak_price": round(peak["peak_price"], 3),
+                        "days_to_peak": peak["days_to_peak"],
+                    })
+            except Exception:
+                error_count += 1
 
-                run_summaries.append({
-                    "code": code,
-                    "board": board,
-                    "n_limit_ups": run["n_limit_ups"],
-                    "max_consecutive": run["max_consecutive"],
-                    "first_limit": run["first_limit_date"].strftime("%Y-%m-%d"),
-                    "last_limit": run["last_limit_date"].strftime("%Y-%m-%d"),
-                    "start_date": start_date_val.strftime("%Y-%m-%d"),
-                    "peak_date": peak["peak_date"].strftime("%Y-%m-%d"),
-                    "peak_price": round(peak["peak_price"], 3),
-                    "days_to_peak": peak["days_to_peak"],
-                    "n_data_rows": len(segment),
-                })
-
-        except Exception as e:
-            error_count += 1
-            continue
-
-    # 写 CSV
+    # ── 按 (code, time) 去重 ──
     if all_rows:
         df_out = pd.DataFrame(all_rows)
+        df_out = df_out.drop_duplicates(subset=["code", "time"], keep="first")
         df_out.to_csv(output_path, index=False, encoding="utf-8-sig")
         print(f"\n\n✅ 导出完成: {output_path}")
-        print(f"   总行数: {len(df_out):,}")
+        print(f"   总行数: {len(df_out):,}（已去重）")
         print(f"   连板段: {len(run_summaries)} 个")
         print(f"   涉及股票: {stocks_with_runs} 只")
         print(f"   错误: {error_count} 个")
@@ -416,6 +473,11 @@ def scan_and_export(
             print(f"\n📊 板块分布:")
             for board, cnt in df_sum["board"].value_counts().items():
                 print(f"   {board}: {cnt} 个")
+            print(f"\n📊 去重统计:")
+            print(f"   股票数: {df_out['code'].nunique()}")
+            print(f"   日期范围: {df_out['time'].min()} ~ {df_out['time'].max()}")
+            avg_rows = df_out.groupby('code').size().mean()
+            print(f"   每只股票平均: {avg_rows:.0f} 天数据")
 
             # 保存摘要
             summary_path = output_path.replace(".csv", "_summary.csv")
@@ -441,6 +503,7 @@ def main():
     parser.add_argument("--quick", action="store_true", help="抽样 500 只")
     parser.add_argument("--sample", type=int, default=0, help="抽样 N 只 (0=全量)")
     parser.add_argument("--output", type=str, default="analysis_output/dragon_ohlcv.csv", help="输出 CSV 路径")
+    parser.add_argument("--full-history", action="store_true", help="导出完整历史（正式回测用，默认: 仅窗口导出）")
 
     args = parser.parse_args()
 
@@ -466,6 +529,7 @@ def main():
         end_date=args.end,
         pre_days=args.pre_days,
         output_path=args.output,
+        full_history=args.full_history,
     )
 
 

@@ -455,6 +455,12 @@ def run_strategy(
             dates = df_scan.index
 
             for i in range(1, len(close_arr)):
+                # 数据断层检查：相邻交易日间隔>5天则跳过（排除停牌/数据缺失）
+                if hasattr(dates[i], 'value') and hasattr(dates[i-1], 'value'):
+                    gap_days = (dates[i] - dates[i-1]).days
+                    if gap_days > 5:
+                        continue
+
                 day_ret = close_arr[i] / close_arr[i - 1] - 1
                 if day_ret < threshold * 0.98:  # 留 2% 容差
                     continue
