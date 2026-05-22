@@ -13,10 +13,20 @@
 """
 from __future__ import annotations
 import os, sys
+from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 
 import pandas as pd
 import numpy as np
+
+# 路径
+_optimizer_dir = os.path.dirname(os.path.abspath(__file__))
+_project_root = os.path.dirname(_optimizer_dir)
+_backend_root = os.path.join(_project_root, "backend_api_python")
+if _backend_root not in sys.path:
+    sys.path.insert(0, _backend_root)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
 # ================================================================
 # 板块 & 参数
@@ -88,6 +98,50 @@ def get_board_name(code: str) -> str:
 
 
 # ================================================================
+# 数据加载 — DB 接口 (参考 strategy_dragon_filter.py)
+# ================================================================
+
+def _load_env():
+    try:
+        from dotenv import load_dotenv
+        for p in [os.path.join(_backend_root, '.env'), os.path.join(_project_root, '.env')]:
+            if os.path.isfile(p):
+                load_dotenv(p, override=False)
+                break
+    except Exception:
+        pass
+
+
+def _get_writer():
+    _load_env()
+    from app.utils.db_market import get_market_kline_writer
+    return get_market_kline_writer()
+
+
+def get_all_codes_db() -> list:
+    writer = _get_writer()
+    stats = writer.stats("CNStock")
+    return stats.get("symbol_list", []) if stats.get("exists") else []
+
+
+def load_daily_db(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
+    """从 db_market 加载日线"""
+    writer = _get_writer()
+    data = writer.query("CNStock", code, "1D", start_time=start, end_time=end, limit=0)
+    if not data:
+        return None
+    df = pd.DataFrame(data)
+    if "time" in df.columns:
+        df["time"] = pd.to_datetime(df["time"])
+        df = df.sort_values("time").reset_index(drop=True)
+        df = df.set_index("time")
+    for c in ["open", "high", "low", "close", "volume"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+# ================================================================
 # 技术指标
 # ================================================================
 
@@ -146,12 +200,12 @@ class DragonHunterV3:
 
         Returns: {"buy": bool, "reasons": [...], "score": float}
         """
-        if idx < 2:
+        if idx < 1:
             return {"buy": False, "reasons": ["数据不足"], "score": 0}
 
         row = df.iloc[idx]
         prev = df.iloc[idx - 1]
-        prev2 = df.iloc[idx - 2]
+        prev2 = df.iloc[idx - 2] if idx >= 2 else None
 
         reasons = []
         score = 0
@@ -195,13 +249,14 @@ class DragonHunterV3:
         reasons.append(f"RSI{rsi:.1f}✓")
         score += 10
 
-        # 5. 前1日跌幅
-        prev_ret = (prev["close"] / prev2["close"] - 1) * 100
-        if prev_ret < self.p["buy_pre1_max_drop"]:
-            return {"buy": False, "reasons": [f"前1日大跌: {prev_ret:.2f}%"], "score": 0}
-        reasons.append(f"前1日{prev_ret:+.2f}%✓")
-        if prev_ret > 0:
-            score += 5  # 前1日涨加分
+        # 5. 前1日跌幅 (idx>=2 才有 prev2)
+        if prev2 is not None:
+            prev_ret = (prev["close"] / prev2["close"] - 1) * 100
+            if prev_ret < self.p["buy_pre1_max_drop"]:
+                return {"buy": False, "reasons": [f"前1日大跌: {prev_ret:.2f}%"], "score": 0}
+            reasons.append(f"前1日{prev_ret:+.2f}%✓")
+            if prev_ret > 0:
+                score += 5  # 前1日涨加分
 
         # 6. 买点日振幅
         day_range = (row["high"] - row["low"]) / row["open"] * 100
@@ -211,10 +266,11 @@ class DragonHunterV3:
         score += 10
 
         # 额外加分: 买点前缩量 (蓄势)
-        pre_vol_ratio = prev["volume"] / prev2["volume"] if prev2["volume"] > 0 else 1
-        if pre_vol_ratio < 0.8:
-            score += 10
-            reasons.append("前日缩量蓄势✓")
+        if prev2 is not None:
+            pre_vol_ratio = prev["volume"] / prev2["volume"] if prev2["volume"] > 0 else 1
+            if pre_vol_ratio < 0.8:
+                score += 10
+                reasons.append("前日缩量蓄势✓")
 
         return {"buy": True, "reasons": reasons, "score": score}
 
@@ -293,7 +349,7 @@ def backtest_single_run(
     trades = []
     position = None  # {"buy_price", "buy_date", "buy_idx", "highest"}
 
-    for i in range(2, len(df_run)):
+    for i in range(1, len(df_run)):
         row = df_run.iloc[i]
 
         if position is None:
@@ -386,12 +442,140 @@ def run_full_backtest(csv_path: str = "dragon_ohlcv.csv"):
 
     print(f"\r   回测完成: {total} 个连板段")
 
-    # 统计
     if not all_trades:
         print("❌ 无交易信号")
         return
 
     tdf = pd.DataFrame(all_trades)
+    _print_backtest_summary(tdf)
+    tdf.to_csv("backtest_v3_trades.csv", index=False, encoding="utf-8-sig")
+    print(f"\n💾 交易明细: backtest_v3_trades.csv")
+    return tdf
+
+
+def run_full_backtest_db(
+    start_date: str = "2024-01-01",
+    end_date: str = "2026-05-21",
+    quick: bool = False,
+    sample: int = 0,
+):
+    """全量回测 — DB 模式 (逐日扫描, 模拟真实交易)"""
+    print("📊 DB 模式: 从 db_market 加载数据...")
+    codes = get_all_codes_db()
+    print(f"   全市场: {len(codes)} 只股票")
+
+    if quick:
+        codes = codes[:500]
+    elif sample > 0:
+        codes = codes[:sample]
+
+    # 查询区间: 前置30天(计算RSI等), 后置20天(出场空间)
+    buffer_pre = 30
+    buffer_post = 20
+    query_start = (datetime.strptime(start_date, "%Y-%m-%d") - timedelta(days=buffer_pre)).strftime("%Y-%m-%d")
+    query_end = (datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=buffer_post)).strftime("%Y-%m-%d")
+    sd = pd.Timestamp(start_date)
+    ed = pd.Timestamp(end_date)
+
+    strategy_main = DragonHunterV3(BOARD_PARAMS["main"])
+    strategy_gem = DragonHunterV3(BOARD_PARAMS["gem_star"])
+
+    all_trades = []
+    total = len(codes)
+    loaded = 0
+    signal_count = 0
+
+    for code_idx, code in enumerate(codes):
+        if (code_idx + 1) % 500 == 0 or code_idx == 0:
+            print(f"\r   扫描: {code_idx+1}/{total}  已加载: {loaded}  信号: {signal_count}", end="", flush=True)
+        try:
+            df = load_daily_db(code, query_start, query_end)
+            if df is None or len(df) < 15:
+                continue
+            loaded += 1
+
+            board_type = get_board_type(code)
+            threshold = BOARD_PARAMS[board_type]["threshold"]
+            strategy = strategy_main if board_type == "main" else strategy_gem
+
+            close = df["close"].values
+            n = len(close)
+
+            # 逐日扫描: 找连板段起点(前一日非涨停 + 当日涨停)
+            i = 1
+            while i < n - 1:
+                ret = (close[i] / close[i - 1] - 1) if close[i - 1] > 0 else 0
+                if ret < threshold * 0.98:
+                    i += 1
+                    continue
+
+                # 找到涨停日, 检查是否为连板起点(前一日非涨停)
+                if i >= 2:
+                    prev_ret = (close[i - 1] / close[i - 2] - 1) if close[i - 2] > 0 else 0
+                    if prev_ret >= threshold * 0.98:
+                        i += 1
+                        continue  # 不是起点, 是连板中间
+
+                # 是连板起点, 向后数连板数
+                run_start = i
+                run_end = i
+                while run_end < n - 1:
+                    next_ret = (close[run_end + 1] / close[run_end] - 1) if close[run_end] > 0 else 0
+                    if next_ret >= threshold * 0.98:
+                        run_end += 1
+                    else:
+                        break
+                n_limit = run_end - run_start + 1
+
+                # 过滤: 连板数
+                min_streak = BOARD_PARAMS[board_type]["min_streak"]
+                max_streak = BOARD_PARAMS[board_type].get("max_streak", 999)
+                if n_limit < min_streak or n_limit > max_streak:
+                    i = run_end + 1
+                    continue
+
+                # 日期检查: 连板起点必须在回测区间内
+                run_start_date = df.index[run_start]
+                if run_start_date < sd or run_start_date > ed:
+                    i = run_end + 1
+                    continue
+
+                # 构建回测切片: 连板起点前2行 ~ 连板结束后20行
+                slice_start = max(0, run_start - 2)
+                slice_end = min(n, run_end + 21)
+                run_df = df.iloc[slice_start:slice_end].copy().reset_index()
+                run_df["run_n_limit_ups"] = n_limit
+                run_df["code"] = code
+
+                # 用 v3 策略回测这个连板段
+                result = backtest_single_run(run_df, strategy)
+                for trade in result.get("trades", []):
+                    trade["code"] = code
+                    trade["board"] = get_board_name(code)
+                    trade["board_type"] = board_type
+                    trade["n_limit"] = n_limit
+                    all_trades.append(trade)
+                    signal_count += 1
+
+                i = run_end + 1
+        except Exception:
+            continue
+
+    print(f"\r   扫描完成: {loaded}/{total} 只股票  交易信号: {signal_count}")
+
+    if not all_trades:
+        print("❌ 无交易信号")
+        return
+
+    tdf = pd.DataFrame(all_trades)
+    _print_backtest_summary(tdf)
+    tdf.to_csv("backtest_v3_trades.csv", index=False, encoding="utf-8-sig")
+    print(f"\n💾 交易明细: backtest_v3_trades.csv")
+    return tdf
+
+
+def _print_backtest_summary(tdf: pd.DataFrame):
+    """打印回测统计摘要 (CSV/DB 共用)"""
     print(f"\n{'='*70}")
     print(f"  连板猎手 v3 回测结果")
     print(f"{'='*70}")
@@ -399,9 +583,11 @@ def run_full_backtest(csv_path: str = "dragon_ohlcv.csv"):
     print(f"  胜率: {(tdf['return_pct'] > 0).mean() * 100:.1f}%")
     print(f"  平均收益: {tdf['return_pct'].mean():.2f}%")
     print(f"  中位收益: {tdf['return_pct'].median():.2f}%")
-    print(f"  盈亏比: {tdf[tdf['return_pct']>0]['return_pct'].mean() / abs(tdf[tdf['return_pct']<0]['return_pct'].mean()):.2f}" if (tdf['return_pct'] < 0).any() else "")
+    if (tdf['return_pct'] < 0).any():
+        win_avg = tdf[tdf['return_pct'] > 0]['return_pct'].mean()
+        loss_avg = abs(tdf[tdf['return_pct'] < 0]['return_pct'].mean())
+        print(f"  盈亏比: {win_avg / loss_avg:.2f}")
 
-    # 按板块
     for board_type in ["main", "gem_star"]:
         sub = tdf[tdf["board_type"] == board_type]
         if len(sub) == 0:
@@ -410,36 +596,48 @@ def run_full_backtest(csv_path: str = "dragon_ohlcv.csv"):
         print(f"\n  --- {label} ({len(sub)}笔) ---")
         print(f"    胜率: {(sub['return_pct'] > 0).mean() * 100:.1f}%")
         print(f"    平均收益: {sub['return_pct'].mean():.2f}%")
-        win_avg = sub[sub['return_pct']>0]['return_pct'].mean() if (sub['return_pct']>0).any() else 0
-        loss_avg = abs(sub[sub['return_pct']<0]['return_pct'].mean()) if (sub['return_pct']<0).any() else 1
-        print(f"    盈亏比: {win_avg/loss_avg:.2f}")
+        win_avg = sub[sub['return_pct'] > 0]['return_pct'].mean() if (sub['return_pct'] > 0).any() else 0
+        loss_avg = abs(sub[sub['return_pct'] < 0]['return_pct'].mean()) if (sub['return_pct'] < 0).any() else 1
+        print(f"    盈亏比: {win_avg / loss_avg:.2f}")
         print(f"    最大盈利: {sub['return_pct'].max():.2f}%")
         print(f"    最大亏损: {sub['return_pct'].min():.2f}%")
 
-    # 按卖出类型
     print(f"\n  --- 卖出类型分布 ---")
     for stype, cnt in tdf["sell_type"].value_counts().items():
         sub = tdf[tdf["sell_type"] == stype]
-        print(f"    {stype}: {cnt}笔 均收益{sub['return_pct'].mean():.2f}% 胜率{(sub['return_pct']>0).mean()*100:.1f}%")
+        print(f"    {stype}: {cnt}笔 均收益{sub['return_pct'].mean():.2f}% 胜率{(sub['return_pct'] > 0).mean() * 100:.1f}%")
 
-    # 按连板数
     print(f"\n  --- 按连板数 ---")
     for n in sorted(tdf["n_limit"].unique()):
         sub = tdf[tdf["n_limit"] == n]
         if len(sub) < 3:
             continue
-        print(f"    {n}板: {len(sub)}笔 胜率{(sub['return_pct']>0).mean()*100:.1f}% 均收益{sub['return_pct'].mean():.2f}%")
-
-    # 保存
-    tdf.to_csv("backtest_v3_trades.csv", index=False, encoding="utf-8-sig")
-    print(f"\n💾 交易明细: backtest_v3_trades.csv")
-
-    return tdf
+        print(f"    {n}板: {len(sub)}笔 胜率{(sub['return_pct'] > 0).mean() * 100:.1f}% 均收益{sub['return_pct'].mean():.2f}%")
 
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--csv", default="dragon_ohlcv.csv")
+    parser = argparse.ArgumentParser(description="连板猎手 v3 — 双分支策略 (支持 CSV/DB)")
+    parser.add_argument("--source", choices=["csv", "db"], default="csv",
+                        help="数据源: csv (默认) 或 db (PostgreSQL)")
+    parser.add_argument("--csv", default="dragon_ohlcv.csv",
+                        help="CSV 文件路径 (--source csv 时使用)")
+    parser.add_argument("--start", type=str, default="2024-01-01",
+                        help="回测开始日期 (--source db 时使用)")
+    parser.add_argument("--end", type=str, default="2026-05-21",
+                        help="回测结束日期 (--source db 时使用)")
+    parser.add_argument("--quick", action="store_true",
+                        help="抽样500只 (--source db 时使用)")
+    parser.add_argument("--sample", type=int, default=0,
+                        help="抽样N只 (--source db 时使用)")
     args = parser.parse_args()
-    run_full_backtest(args.csv)
+
+    if args.source == "db":
+        run_full_backtest_db(
+            start_date=args.start,
+            end_date=args.end,
+            quick=args.quick,
+            sample=args.sample,
+        )
+    else:
+        run_full_backtest(args.csv)

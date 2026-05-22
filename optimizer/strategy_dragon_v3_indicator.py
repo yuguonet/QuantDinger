@@ -60,8 +60,8 @@ df['streak_count'] = df.groupby(_groups)['is_limit_up'].cumsum()
 # ── 连板段标记: 当前处于>=min_streak的连板段中 ──
 df['in_streak'] = df['streak_count'] >= {min_streak}
 
-# ── 第一板位置: streak_count从0变1的那一天 ──
-df['first_board_today'] = (df['streak_count'] >= 1) & (df['streak_count'].shift(1).fillna(0) < 1)
+# ── 连板段第一天: streak_count刚达到min_streak的那天 ──
+df['streak_start'] = (df['streak_count'] >= {min_streak}) & (df['streak_count'].shift(1).fillna(0) < {min_streak})
 
 # ── 高开幅度: (open - prev_close) / prev_close * 100 ──
 df['gap_pct'] = (df['open'] / _prev_close - 1) * 100
@@ -122,9 +122,7 @@ df['vol_ratio_5d'] = df['volume'] / _vol_ma5.replace(0, np.nan)
     # 5. RSI < max_rsi
     # 6. 涨停日当天(第一板或连续涨停中)
     buy_expr = (
-        f"(df['is_limit_up'])"
-        f" & (df['streak_count'] >= {min_streak})"
-        f" & (df['streak_count'] <= {min_streak + 3})"
+        f"(df['streak_start'])"
         f" & (df['gap_pct'].between(-5, {max_gap_pct}))"
         f" & (df['seal_pct'] <= {max_seal_pct})"
         f" & (df['rsi_14'] <= {max_rsi})"
