@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
-连板猎手 v2 — 横向过滤 + 机械出场
+连板猎手 v2 — 双分支横向过滤 + 机械出场
 
 策略逻辑:
   ┌─────────────────────────────────────────────────────┐
   │ 信号（T日收盘前可观测）:                                │
   │   1. 当天涨停（非一字板，有实际交易）                     │
-  │   2. 第一板涨幅 ≥ min_return (默认 20%)                │
-  │   3. 封板强度 ≤ max_seal (默认 2.8%)                   │
-  │   4. 上影线 ≥ min_upper (默认 2.0%)  [排除一字板]       │
-  │   5. 上影线 ≤ max_upper (默认 8.0%)  [排除冲高回落]     │
-  │   6. 前5天波动率 ≤ max_volatility (默认 10%)            │
+  │   2. 双分支过滤（参数见 BOARD_PARAMS）:                  │
+  │      主板(10%): 涨幅≥9.8% 封板≤8% 波动≤3% 量比≤1      │
+  │      创/科(20%): 涨幅≥19.8% 封板≤2.8% 上影2~8% 波动≤10%│
   │                                                       │
   │ 买入: T+1 开盘价                                       │
   │ 持有: 涨停就拿着                                        │
@@ -183,9 +181,6 @@ def extract_limit_up_features(
     if is_yizi:
         return None  # 一字板无法买入，跳过
 
-    # 归一化系数: 主板×2, 创业板/科创板×1 → 统一到20%基准
-    scale = board_scale(code)
-
     # 当日涨幅（原始）
     fl_return = (fl_c / prev_c - 1) * 100
 
@@ -277,6 +272,7 @@ def simulate_trade(
     trailing_callback: float = 8.0,
     stop_loss: float = 10.0,
     max_hold: int = 20,
+    open_break_stop: float = 0.0,
 ) -> Dict[str, Any]:
     """
     逐日推进出场，不看未来数据。
@@ -336,6 +332,15 @@ def simulate_trade(
             # 开板了！检查止盈/追踪止损
             peak_ret = (peak / entry_price - 1) * 100
 
+            # 主板开板日大跌 → 直接出场
+            if open_break_stop < 0 and ret <= open_break_stop:
+                return {
+                    "exit_idx": pos,
+                    "pnl_pct": round(ret, 2),
+                    "hold_days": hold,
+                    "exit_reason": f"开板止损{ret:+.1f}%",
+                }
+
             # 止盈
             if ret >= take_profit:
                 return {
@@ -394,11 +399,6 @@ def run_strategy(
     codes: List[str],
     start_date: str = "2023-01-01",
     end_date: str = "2026-05-21",
-    min_return: float = 20.0,
-    max_seal: float = 2.8,
-    min_upper: float = 2.0,
-    max_upper: float = 8.0,
-    max_volatility: float = 10.0,
     take_profit: float = 15.0,
     trailing_activate: float = 5.0,
     trailing_callback: float = 8.0,
@@ -499,9 +499,7 @@ def run_strategy(
         signal_count += len(feats)
 
         # 应用过滤
-        passed = [f for f in feats if passes_filter(
-            f, min_return, max_seal, min_upper, max_upper, max_volatility
-        )]
+        passed = [f for f in feats if passes_filter(f)]
         filtered_count += len(passed)
 
         # 对通过过滤的信号模拟交易
@@ -529,11 +527,15 @@ def run_strategy(
                 continue
 
             # 模拟出场
+            # 主板开板止损
+            branch = feat.get("branch", "10pct" if not is_20pct_board(code) else "20pct")
+            obs = BOARD_PARAMS[branch].get("open_break_stop", 0.0)
+
             result = simulate_trade(
                 data["close"], data["high"], data["low"], data["open"],
                 buy_idx, entry_price, data["threshold"],
                 take_profit, trailing_activate, trailing_callback,
-                stop_loss, max_hold,
+                stop_loss, max_hold, open_break_stop=obs,
             )
 
             # 记录
@@ -554,6 +556,7 @@ def run_strategy(
                 "fl_seal": round(feat["fl_seal"], 1),
                 "fl_upper_shadow": round(feat["fl_upper_shadow"], 1),
                 "fl_amplitude": round(feat["fl_amplitude"], 1),
+                "fl_vol_ratio": round(feat.get("fl_vol_ratio", 0), 2),
                 "volatility": round(feat["volatility"], 1),
             })
 
@@ -584,6 +587,9 @@ def analyze_results(trades: List[Dict[str, Any]]):
     avg_loss = abs(sum(losses) / len(losses)) if losses else 0
     pf = avg_win / avg_loss if avg_loss > 0 else float("inf")
     wr = len(wins) / n * 100
+
+    bins = [(-999, -15), (-15, -10), (-10, -5), (-5, 0), (0, 5), (5, 10), (10, 15), (15, 20), (20, 999)]
+    labels = ["<-15%", "-15~-10%", "-10~-5%", "-5~0%", "0~5%", "5~10%", "10~15%", "15~20%", ">20%"]
 
     print(f"\n  交易数: {n}  盈利: {len(wins)}  亏损: {len(losses)}")
     print(f"  胜率: {wr:.1f}%")
@@ -644,8 +650,6 @@ def analyze_results(trades: List[Dict[str, Any]]):
 
     # 收益分布
     print(f"\n  收益分布:")
-    bins = [(-999, -15), (-15, -10), (-10, -5), (-5, 0), (0, 5), (5, 10), (10, 15), (15, 20), (20, 999)]
-    labels = ["<-15%", "-15~-10%", "-10~-5%", "-5~0%", "0~5%", "5~10%", "10~15%", "15~20%", ">20%"]
     for (lo, hi), label in zip(bins, labels):
         cnt = sum(1 for p in pnl if lo <= p < hi)
         bar = "█" * int(cnt / n * 40)
@@ -666,19 +670,14 @@ def analyze_results(trades: List[Dict[str, Any]]):
 
 
 def main():
+    print("🔖 REV: 20260522-1015  双分支+open_break_stop+vol_ratio导出")
     parser = argparse.ArgumentParser(description="连板猎手 v2 — 横向过滤 + 机械出场")
     parser.add_argument("--start", type=str, default="2023-01-01")
     parser.add_argument("--end", type=str, default="2026-05-21")
     parser.add_argument("--quick", action="store_true", help="抽样500只")
     parser.add_argument("--sample", type=int, default=0)
 
-    # 过滤参数
-    parser.add_argument("--min-return", type=float, default=20.0, help="第一板最小涨幅%")
-    parser.add_argument("--max-seal", type=float, default=2.8, help="封板强度上限%")
-    parser.add_argument("--min-upper", type=float, default=2.0, help="上影线下限%")
-    parser.add_argument("--max-upper", type=float, default=8.0, help="上影线上限%")
-    parser.add_argument("--max-volatility", type=float, default=10.0, help="前5天波动率上限%")
-
+    # 过滤参数（双分支参数在 BOARD_PARAMS 中定义）
     # 出场参数
     parser.add_argument("--tp", type=float, default=15.0, help="止盈%")
     parser.add_argument("--trail-activate", type=float, default=5.0, help="追踪止损激活%")
@@ -704,11 +703,6 @@ def main():
         codes=codes,
         start_date=args.start,
         end_date=args.end,
-        min_return=args.min_return,
-        max_seal=args.max_seal,
-        min_upper=args.min_upper,
-        max_upper=args.max_upper,
-        max_volatility=args.max_volatility,
         take_profit=args.tp,
         trailing_activate=args.trail_activate,
         trailing_callback=args.trail_callback,
@@ -722,7 +716,7 @@ def main():
         os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
         fields = ["code", "board", "branch", "signal_date", "buy_date", "exit_date",
                   "entry_price", "exit_price", "pnl_pct", "hold_days", "exit_reason",
-                  "fl_return", "fl_seal", "fl_upper_shadow", "fl_amplitude", "volatility"]
+                  "fl_return", "fl_seal", "fl_upper_shadow", "fl_amplitude", "fl_vol_ratio", "volatility"]
         with open(args.output, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.DictWriter(f, fieldnames=fields)
             w.writeheader()
