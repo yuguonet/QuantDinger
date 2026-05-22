@@ -88,6 +88,40 @@ def lim_thresh(code: str) -> float:
     return 0.198 if get_board(code) in ("创业板","科创板") else 0.098
 
 
+def board_scale(code: str) -> float:
+    """归一化系数: 主板10%→20%基准需×2, 创业板/科创板20%→20%基准×1"""
+    return 2.0 if get_board(code) in ("沪主板", "深主板") else 1.0
+
+
+def is_20pct_board(code: str) -> bool:
+    """创业板/科创板: 20%涨停"""
+    return get_board(code) in ("创业板", "科创板")
+
+
+# ── 分板块默认参数 ──
+# 主板10%涨停 vs 创业板/科创板20%涨停，物理特性不同，独立参数
+BOARD_PARAMS = {
+    "10pct": {  # 沪主板、深主板
+        "min_return": 9.8,       # 涨停即通过（10%板）
+        "max_seal": 8.0,         # 主板封板普遍偏大，放宽
+        "min_upper": 0.0,        # 主板99.8%上影<1%，不筛
+        "max_upper": 8.0,
+        "max_volatility": 3.0,   # 前5天低波动 → 突破更有效
+        "max_vol_ratio": 1.0,    # 关键！缩量涨停 >> 放量涨停
+        "open_break_stop": -5.0, # 开板日跌>5%直接出场
+    },
+    "20pct": {  # 创业板、科创板
+        "min_return": 19.8,
+        "max_seal": 2.8,
+        "min_upper": 2.0,
+        "max_upper": 8.0,
+        "max_volatility": 10.0,
+        # 注意: 振幅/实体比是连板窗口均值，首板日无法计算，暂不加入过滤
+        # 横向分析结论留待runner参数优化时使用
+    },
+}
+
+
 def load_daily(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     writer = _get_writer()
     data = writer.query("CNStock", code, "1D", start_time=start, end_time=end, limit=0)
@@ -149,11 +183,13 @@ def extract_limit_up_features(
     if is_yizi:
         return None  # 一字板无法买入，跳过
 
-    # 当日涨幅
+    # 归一化系数: 主板×2, 创业板/科创板×1 → 统一到20%基准
+    scale = board_scale(code)
+
+    # 当日涨幅（原始）
     fl_return = (fl_c / prev_c - 1) * 100
 
-    # 封板强度：收盘价与最低价的距离占收盘价的比例
-    # 封板越紧（值越小），说明涨停封得越死
+    # 封板强度：(close - low) / close * 100
     fl_seal = (fl_c - fl_l) / fl_c * 100 if fl_c > 0 else 999
 
     # 上影线
@@ -161,6 +197,10 @@ def extract_limit_up_features(
 
     # 振幅
     fl_amplitude = (fl_h - fl_l) / prev_c * 100
+
+    # 实体比: |close - open| / (high - low)
+    bar_range = fl_h - fl_l
+    fl_body_ratio = abs(fl_c - fl_o) / bar_range if bar_range > 0 else 1.0
 
     # 量比（vs 前5天均量）
     vol_window = volume[max(0, i - lookback):i]
@@ -183,12 +223,14 @@ def extract_limit_up_features(
     return {
         "code": code,
         "board": get_board(code),
+        "branch": "20pct" if is_20pct_board(code) else "10pct",
         "date": df.index[i],
         "date_str": df.index[i].strftime("%Y-%m-%d"),
         "fl_return": fl_return,
         "fl_seal": fl_seal,
         "fl_upper_shadow": fl_upper_shadow,
         "fl_amplitude": fl_amplitude,
+        "fl_body_ratio": fl_body_ratio,
         "fl_vol_ratio": fl_vol_ratio,
         "volatility": volatility,
         "prev5_return": prev5_return,
@@ -197,25 +239,24 @@ def extract_limit_up_features(
     }
 
 
-def passes_filter(
-    feat: Dict[str, Any],
-    min_return: float = 20.0,
-    max_seal: float = 2.8,
-    min_upper: float = 2.0,
-    max_upper: float = 8.0,
-    max_volatility: float = 10.0,
-) -> bool:
-    """检查是否通过过滤规则"""
-    if feat["fl_return"] < min_return:
+def passes_filter(feat: Dict[str, Any]) -> bool:
+    """检查是否通过过滤规则（自动选板块分支）"""
+    branch = "20pct" if is_20pct_board(feat["code"]) else "10pct"
+    p = BOARD_PARAMS[branch]
+    if feat["fl_return"] < p["min_return"]:
         return False
-    if feat["fl_seal"] > max_seal:
+    if feat["fl_seal"] > p["max_seal"]:
         return False
-    if feat["fl_upper_shadow"] < min_upper:
+    if feat["fl_upper_shadow"] < p["min_upper"]:
         return False
-    if feat["fl_upper_shadow"] > max_upper:
+    if feat["fl_upper_shadow"] > p["max_upper"]:
         return False
-    if feat["volatility"] > max_volatility:
+    if feat["volatility"] > p["max_volatility"]:
         return False
+    # 主板：量比
+    if branch == "10pct" and "max_vol_ratio" in p:
+        if feat["fl_vol_ratio"] > p["max_vol_ratio"]:
+            return False
     return True
 
 
@@ -368,10 +409,13 @@ def run_strategy(
     全市场逐日扫描，过滤 + 出场引擎。
     """
     print(f"\n{'='*70}")
-    print(f"  连板猎手 v2 — 横向过滤 + 机械出场")
+    print(f"  连板猎手 v2 — 双分支过滤 + 机械出场")
     print(f"{'='*70}")
     print(f"  区间: {start_date} ~ {end_date}")
-    print(f"  过滤: 涨幅≥{min_return}% 封板≤{max_seal}% 上影{min_upper}~{max_upper}% 波动≤{max_volatility}%")
+    print(f"  分支A (主板10%): 涨幅≥{BOARD_PARAMS['10pct']['min_return']}% 封板≤{BOARD_PARAMS['10pct']['max_seal']}% "
+          f"上影{BOARD_PARAMS['10pct']['min_upper']}~{BOARD_PARAMS['10pct']['max_upper']}% 波动≤{BOARD_PARAMS['10pct']['max_volatility']}%")
+    print(f"  分支B (创/科20%): 涨幅≥{BOARD_PARAMS['20pct']['min_return']}% 封板≤{BOARD_PARAMS['20pct']['max_seal']}% "
+          f"上影{BOARD_PARAMS['20pct']['min_upper']}~{BOARD_PARAMS['20pct']['max_upper']}% 波动≤{BOARD_PARAMS['20pct']['max_volatility']}%")
     print(f"  出场: 止盈{take_profit}% 追踪{trailing_activate}%→{trailing_callback}% 止损{stop_loss}% 最大{max_hold}天")
     print(f"  股票: {len(codes)} 只")
 
@@ -497,6 +541,7 @@ def run_strategy(
             all_trades.append({
                 "code": code,
                 "board": feat["board"],
+                "branch": feat.get("branch", "10pct"),
                 "signal_date": date_str,
                 "buy_date": data["dates"][buy_idx].strftime("%Y-%m-%d"),
                 "exit_date": exit_date.strftime("%Y-%m-%d"),
@@ -505,7 +550,6 @@ def run_strategy(
                 "pnl_pct": result["pnl_pct"],
                 "hold_days": result["hold_days"],
                 "exit_reason": result["exit_reason"],
-                # 特征（用于分析）
                 "fl_return": round(feat["fl_return"], 1),
                 "fl_seal": round(feat["fl_seal"], 1),
                 "fl_upper_shadow": round(feat["fl_upper_shadow"], 1),
@@ -563,7 +607,7 @@ def analyze_results(trades: List[Dict[str, Any]]):
         wr_r = sum(1 for p in pnls if p > 0) / len(pnls) * 100
         print(f"    {reason:40s}  {len(pnls):3d}笔  均值={avg_r:+.2f}%  胜率={wr_r:.0f}%")
 
-    # 按板块
+    # 按板块分支
     print(f"\n  按板块:")
     board_groups = defaultdict(list)
     for t in trades:
@@ -572,6 +616,21 @@ def analyze_results(trades: List[Dict[str, Any]]):
         avg_b = sum(pnls) / len(pnls)
         wr_b = sum(1 for p in pnls if p > 0) / len(pnls) * 100
         print(f"    {board:8s} ({len(pnls):3d}笔): 胜率={wr_b:.0f}%  均值={avg_b:+.2f}%")
+
+    # 收益分桶（按原始收益，标注板块）
+    print(f"\n  收益分桶（原始收益）:")
+    for (lo, hi), label in zip(bins, labels):
+        bucket = [t for t in trades if lo <= t["pnl_pct"] < hi]
+        cnt = len(bucket)
+        if cnt == 0:
+            boards_str = ""
+        else:
+            bc = defaultdict(int)
+            for t in bucket:
+                bc[t["board"]] += 1
+            boards_str = "  " + " ".join(f"{b}:{c}" for b, c in sorted(bc.items(), key=lambda x: -x[1]))
+        bar = "█" * int(cnt / n * 40)
+        print(f"    {label:12s}  {cnt:4d} ({cnt/n*100:5.1f}%)  {bar}{boards_str}")
 
     # 按年度
     print(f"\n  按年度:")
@@ -661,7 +720,7 @@ def main():
 
     if trades:
         os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-        fields = ["code", "board", "signal_date", "buy_date", "exit_date",
+        fields = ["code", "board", "branch", "signal_date", "buy_date", "exit_date",
                   "entry_price", "exit_price", "pnl_pct", "hold_days", "exit_reason",
                   "fl_return", "fl_seal", "fl_upper_shadow", "fl_amplitude", "volatility"]
         with open(args.output, "w", newline="", encoding="utf-8-sig") as f:
