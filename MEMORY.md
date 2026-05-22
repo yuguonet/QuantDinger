@@ -11,6 +11,7 @@
 - GitHub: https://github.com/yuguonet/QuantDinger
 - 后端 Python (Flask)，前端 Vue，PostgreSQL 数据库
 - optimizer/ 目录是策略优化器，sector_aggregator.py 做板块聚合回测
+- runner.py 串联所有模块，支持 IndicatorStrategy 和旧版 JSON config
 
 ## 核心方法论
 
@@ -30,57 +31,42 @@
 1. **做空污染**：A 股模板缺 tradeDirection="long"，回测偷偷做空 → 已修复
 2. **出场逻辑错误**：8/9 策略用入场条件取反做出场 → 小赚大亏 → 部分修复
 
-## 2026-05-21 关键结论
-
-### 测试结果（半导体，macd_kdj_resonance）
-- Sharpe: -1.08 → -0.274 → 0.033 → 0.023（逐步改善，但仍在零附近）
-- 胜率: ~43% → 48.65% → 47.91%
-- 平均收益: 亏损 → +4.64% → +4.86%
-- 交易数: 2 → 407 → 382
-
-### 已修复
-- 9个模板加 tradeDirection="long"
-- strategy_compiler.py 新增 exit_rules + _rule_to_condition()
-- macd_kdj_resonance 入场: diff_gt_dea + k_gt_d（状态持续）
-- macd_kdj_resonance 出场: diff_lt_dea（去掉EMA出场）
-- sector_aggregator.py 新增 --market-filter 大盘过滤（待验证）
-
-### 待做
-- 大盘过滤 debug（确认过滤逻辑是否生效）
-- 参数优化（trailing_activation/callback 已在搜索空间）
-- 其余8个策略加独立出场规则
-- 测试其他板块
-
-## 2026-05-22 连板策略研究
+## 2026-05-22 连板策略研究（完整）
 
 ### 新增文件
-- `optimizer/export_dragon_runs.py` — 连板股扫描 + OHLCV 导出（已修复 peak 后数据 bug）
-- `optimizer/analyze_dragon_patterns.py` — 连板形态横向分析（起涨/见顶窗口）
-- `optimizer/strategy_dragon_board.py` — 连板策略全市场回测
+- `optimizer/strategy_dragon_filter.py` — 连板猎手 v2 独立策略
+- `optimizer/validate_full_market.py` — 全市场假阳性验证
+- `optimizer/optimize_filter.py` — 过滤规则优化搜索
+- `optimizer/strategy_templates_ashare.py` — 新增 dragon_filter IndicatorStrategy 模板
 
-### 连板数据
-- dragon_ohlcv.csv: 905组连板（2-8板），15226行 OHLCV
-- 每组：起始日前10天 → 最高点（当前版本 peak 后缺5天数据，已修复代码待重新导出）
-- 板块分布：沪主板395、深主板384、创业板114、科创板12
+### 全市场数据（--min-streak=1）
+- dragon_ohlcv.csv: 4730组（单板3825 + 连板905），94737行
+- 日期范围：2026-01-06 ~ 2026-05-21（88个交易日）
+- 一字板：单板61 + 连板96（不可买入，需排除）
 
-### 买点发现
-- 涨停日买入有缺陷：封板买不到 / 高位接盘
-- 涨停前10天中，越早买收益越高（+71% → +42%），但回撤也越大（7.7% → 1.7%）
-- **阴线比阳线好**（+62% vs +56%）：涨停前蓄势阶段越安静越好
-- 量比/突破前高在已知连板股中反而降低收益（需要全市场数据验证假阳性率）
-- 全市场验证需运行 `export_dragon_runs.py --min-streak=1` 对比连板 vs 单板
+### 过滤规则（非一字板中验证）
+- 基准浓度：17.7%（807 multi / 4565 total）
+- **最优组合**：涨幅≥20% + 封板≤2.8% + 上影2~8% + 波动≤10%
+  - 39通过, 2FP, 精确率94.9%, 召回率4.6%
+- **严格组合**：涨幅≥20% + 封板≤2.8% + 振幅≥5% + 波动≤5%
+  - 32通过, 0FP, 精确率100%, 召回率4.0%
 
-### 卖点发现
-- **止盈15%最优**：胜率93.4%，大亏3%，均值+11.6%
-- 开板即卖：均值+16.4%但胜率82.4%，大亏7.7%
-- 回撤5%+止盈20%：大亏0%（最保守方案）
-- 核心规律：97%的最高点不是涨停日 → 涨停就拿着，开板就卖
+### 回测结果（db_market, 2026-01~2026-05）
+- 32笔交易, 81.2%胜率, 均值+14.90%, 盈亏比9.55
+- 追踪止损27笔, 止盈15% 5笔（超级大肉+36%~+205%）
+- 信号集中：04-28一天23笔, 05-07 4笔
 
-### 策略框架（待全市场验证）
+### IndicatorStrategy 转换
+- 模板 key: `dragon_filter`
+- Buy 信号与独立脚本 4710 组完全一致 ✅
+- Sell 信号差异：IS用固定8%阈值 vs 独立脚本用 threshold*0.95（实际影响极小）
+- 运行：`python -m optimizer.runner -t dragon_filter --all -m CNStock -tf 1D`
+
+### 策略框架
 ```
-买: 涨停前1-2天（信号待定，需全市场对照）
+买: 第一板涨停 + 涨幅≥20% + 封板≤2.8% + 上影2~8% + 波动≤10%（非一字板）
 持: 涨停就拿着
-卖: 止盈15%（或回撤5%+止盈20%）
+卖: 开板（当天涨幅<8%）/ 止损10% / 追踪止损 / 止盈15%
 ```
 
 ## 技术记录
@@ -90,3 +76,5 @@
 - backtest.py 信号归一化：buy/sell 在 trade_direction='long' 时映射为 open_long/close_long
 - strategy_compiler.py 出场条件用 OR 连接（多个出场理由独立触发）
 - get_regime() 阈值：20日累计 < -3% 才算 down，可能太严
+- IndicatorStrategy 模板用 `render_indicator_strategy` 生成代码，注册到 ASHARE_STRATEGY_TEMPLATES
+- runner 的 ALL_TEMPLATES = STRATEGY_TEMPLATES + ASHARE_STRATEGY_TEMPLATES + LLM + MY + GENERATED

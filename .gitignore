@@ -95,3 +95,4 @@ backend_api_python/app/utils/calendar/
 
 backend_api_python/app/data/
 *del/
+*.json

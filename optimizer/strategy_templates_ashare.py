@@ -17,6 +17,7 @@ A 股扩展策略模板
   9. kdj_macd_ma_triple  - KDJ+MACD+均线三重共振
 """
 from typing import Dict, Any, List
+from optimizer.indicator_strategy_builder import render_indicator_strategy
 
 # 复用基础参数构建函数
 def _p_int(low: int, high: int, step: int = 1) -> dict:
@@ -31,6 +32,81 @@ def _p_choice(choices: list) -> dict:
 
 # 小资金仓位档位
 POSITION_PCT = _p_choice([100, 75, 50, 25])
+
+
+# ============================================================
+# 连板猎手 — 横向过滤 + 开板出场 (IndicatorStrategy)
+# ============================================================
+
+def _build_dragon_filter_strategy(p: dict) -> str:
+    """连板猎手: 第一板涨停过滤 + 开板出场"""
+    min_return = float(p.get('min_return', 20.0))
+    max_seal = float(p.get('max_seal', 2.8))
+    min_upper = float(p.get('min_upper', 2.0))
+    max_upper = float(p.get('max_upper', 8.0))
+    max_volatility = float(p.get('max_volatility', 10.0))
+    stop_loss_pct = float(p.get('stop_loss_pct', 10.0))
+
+    params_decl = [
+        f"@param min_return float {min_return} 第一板最小涨幅%",
+        f"@param max_seal float {max_seal} 封板强度上限% (close距low)",
+        f"@param min_upper float {min_upper} 上影线下限% (排除一字板)",
+        f"@param max_upper float {max_upper} 上影线上限% (排除冲高回落)",
+        f"@param max_volatility float {max_volatility} 前5天波动率上限%",
+        f"@param stop_loss_pct float {stop_loss_pct} 固定止损%",
+    ]
+
+    indicator_code = f"""# ── 当日涨幅 ──
+df['change_pct'] = (df['close'] / df['close'].shift(1) - 1) * 100
+
+# ── 封板强度: (close - low) / close * 100 ──
+#   涨停封板: close ≈ high, low 接近 close → 值小(封得紧)
+#   值越小封得越紧
+_prev_close = df['close'].shift(1).replace(0, np.nan)
+df['seal_pct'] = (df['close'] - df['low']) / df['close'] * 100
+df['seal_pct'] = df['seal_pct'].fillna(999)
+
+# ── 上影线%: (high - close) / prev_close * 100 ──
+df['upper_shadow_pct'] = (df['high'] - df['close']) / _prev_close * 100
+
+# ── 实体比: |close - open| / (high - low) ──
+_bar_range = (df['high'] - df['low']).replace(0, np.nan)
+df['body_ratio'] = (df['close'] - df['open']).abs() / _bar_range
+df['body_ratio'] = df['body_ratio'].fillna(1.0)
+
+# ── 5天波动率 ──
+_ret = df['close'].pct_change()
+df['volatility_5'] = _ret.rolling(window=5, min_periods=3).std() * 100"""
+
+    # 买入: 第一板涨停 + 过滤条件
+    # change_pct >= 9.5% 覆盖所有板块(主板10%/创业板科创板20%)
+    buy_expr = (
+        f"(df['change_pct'] >= 9.5)"
+        f" & (df['change_pct'].shift(1) < 9.5)"       # 第一板（前一天不涨停）
+        f" & (df['change_pct'] >= {min_return})"        # 涨幅阈值
+        f" & (df['seal_pct'] <= {max_seal})"            # 封板强度
+        f" & (df['body_ratio'] < 0.95)"                 # 排除一字板
+        f" & (df['upper_shadow_pct'] >= {min_upper})"   # 上影线下限
+        f" & (df['upper_shadow_pct'] <= {max_upper})"   # 上影线上限
+        f" & (df['volatility_5'] <= {max_volatility})"  # 前5天波动
+    )
+
+    # 卖出: 开板（当天涨幅 < 8%，覆盖所有板块的非涨停状态）
+    sell_expr = "(df['change_pct'] < 8.0)"
+
+    plots = []
+
+    return render_indicator_strategy(
+        name="DragonFilter",
+        description=f"连板猎手: 涨幅≥{min_return}% 封板≤{max_seal}% 上影≥{min_upper}% 波动≤{max_volatility}% → 开板卖出",
+        params_decl=params_decl,
+        strategy_defaults={"stopLossPct": stop_loss_pct / 100, "tradeDirection": "long"},
+        indicator_code=indicator_code,
+        buy_expr=buy_expr,
+        sell_expr=sell_expr,
+        plots=plots,
+        trade_direction="long",
+    )
 
 
 # ============================================================
@@ -736,6 +812,25 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             ("macd_fast", "<", "macd_slow"),
         ],
         "build_config": _build_kdj_macd_ma_triple_config,
+        "strategy_defaults": {"tradeDirection": "long"},
+    },
+
+    # ── 11. 连板猎手 ──
+    "dragon_filter": {
+        "name": "连板猎手",
+        "description": "第一板涨停过滤(涨幅/封板/上影/波动) + 开板出场。横向过滤提纯连板信号。",
+        "indicators": ["change_pct", "close_position"],
+        "params": {
+            "min_return":      _p_float(10.0, 30.0, 1.0),
+            "max_seal":        _p_float(1.0, 5.0, 0.5),
+            "min_upper":       _p_float(0.5, 5.0, 0.5),
+            "max_upper":       _p_float(5.0, 15.0, 1.0),
+            "max_volatility":  _p_float(3.0, 15.0, 1.0),
+            "stop_loss_pct":   _p_float(5.0, 15.0, 0.5),
+            "position_pct": POSITION_PCT,
+        },
+        "constraints": [],
+        "build_strategy": _build_dragon_filter_strategy,
         "strategy_defaults": {"tradeDirection": "long"},
     },
 }
