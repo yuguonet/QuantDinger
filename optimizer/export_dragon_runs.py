@@ -1,7 +1,7 @@
 """
 连板股扫描 + OHLCV 数据导出
 
-扫描全市场 db_market，找出 ≥2板连板股（允许 1-2 天洗盘日），
+扫描全市场 db_market，找出 ≥1板连板股（允许 1-2 天洗盘日），
 向后搜索 5 日最高点确定终止日，第一板前一日为起始日，
 起始日再向前推 10 日为数据起点，导出完整 OHLCV 到 CSV。
 
@@ -515,7 +515,7 @@ def scan_and_export(
 
 def main():
     parser = argparse.ArgumentParser(description="连板股扫描 + OHLCV 导出")
-    parser.add_argument("--min-streak", type=int, default=2, help="最少涨停天数 (默认 2)")
+    parser.add_argument("--min-streak", type=int, default=1, help="最少涨停天数 (默认 1)")
     parser.add_argument("--max-gap", type=int, default=2, help="最大洗盘天数 (默认 2)")
     parser.add_argument("--start", type=str, default="2023-01-01", help="扫描起始日期")
     parser.add_argument("--end", type=str, default="2026-05-21", help="扫描结束日期")
