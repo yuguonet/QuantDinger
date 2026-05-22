@@ -33,6 +33,9 @@ for r in first:
     pc=float(cl[idx-1]['close'])
     fc=float(r['close']); fo=float(r['open']); fh=float(r['high']); fl=float(r['low'])
     if pc<=0: continue
+    # 停牌复牌过滤
+    open_gap=(fo/pc-1) if pc>0 else 0
+    if open_gap>0.196: continue  # 主板涨停阈值*2=9.8%*2
     lup=pc*1.098
     if abs(fo-lup)/lup<0.01 and (fh-fl)/pc<0.01: continue
     seal=(fc-fl)/fc*100 if fc>0 else 999

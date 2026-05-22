@@ -237,6 +237,11 @@ def extract_limit_up_features(
 
     threshold = lim_thresh(code)
 
+    # 停牌复牌检测：开盘相对前收盘跳空远超涨停阈值 → 不是正常涨停
+    open_gap = (fl_o / prev_c - 1) if prev_c > 0 else 0
+    if open_gap > threshold * 2:
+        return None
+
     # 一字板判定
     limit_up_price = prev_c * (1 + threshold)
     gap_to_limit = abs(fl_o - limit_up_price) / limit_up_price if limit_up_price > 0 else 999
