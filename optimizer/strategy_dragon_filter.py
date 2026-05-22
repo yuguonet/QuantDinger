@@ -20,11 +20,18 @@
   │   - 最大持仓 max_hold 天                               │
   └─────────────────────────────────────────────────────┘
 
+双数据源:
+    --source db     从 db_market 读取（本地 Windows，需 PostgreSQL）
+    --source csv    从 dragon_ohlcv.csv 读取（远程 Linux，无需数据库）
+
 用法:
-    python strategy_dragon_filter.py
-    python strategy_dragon_filter.py --min-return 25 --max-seal 2.0
-    python strategy_dragon_filter.py --quick
-    python strategy_dragon_filter.py --start 2024-01-01
+    # 数据库模式（Windows 本地）
+    python strategy_dragon_filter.py --source db
+    python strategy_dragon_filter.py --source db --start 2024-01-01
+
+    # CSV 模式（远程服务器 / CI）
+    python strategy_dragon_filter.py --source csv --csv analysis_output/dragon_ohlcv.csv
+    python strategy_dragon_filter.py --source csv --csv analysis_output/dragon_ohlcv.csv --start 2024-01-01
 """
 from __future__ import annotations
 
@@ -49,6 +56,53 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 
+# ================================================================
+# 板块 & 阈值
+# ================================================================
+
+def get_board(code: str) -> str:
+    c = code[:3]
+    if c.startswith("68"): return "科创板"
+    if c.startswith("30"): return "创业板"
+    if c.startswith(("8","4")): return "北交所"
+    if c.startswith("6"): return "沪主板"
+    if c.startswith(("0","2")): return "深主板"
+    return "未知"
+
+
+def lim_thresh(code: str) -> float:
+    return 0.198 if get_board(code) in ("创业板","科创板") else 0.098
+
+
+def is_20pct_board(code: str) -> bool:
+    return get_board(code) in ("创业板", "科创板")
+
+
+# ── 分板块默认参数 ──
+BOARD_PARAMS = {
+    "10pct": {  # 沪主板、深主板
+        "min_return": 9.8,
+        "max_seal": 8.0,
+        "min_upper": 0.0,
+        "max_upper": 8.0,
+        "max_volatility": 3.0,   # 前5天低波动 → 突破更有效
+        "max_vol_ratio": 1.0,    # 关键！缩量涨停 >> 放量涨停
+        "open_break_stop": -5.0,
+    },
+    "20pct": {  # 创业板、科创板
+        "min_return": 19.8,
+        "max_seal": 2.8,
+        "min_upper": 2.0,
+        "max_upper": 8.0,
+        "max_volatility": 10.0,
+    },
+}
+
+
+# ================================================================
+# 数据加载 — 双接口
+# ================================================================
+
 def _load_env():
     try:
         from dotenv import load_dotenv
@@ -66,61 +120,14 @@ def _get_writer():
     return get_market_kline_writer()
 
 
-def get_all_codes() -> list:
+def get_all_codes_db() -> list:
     writer = _get_writer()
     stats = writer.stats("CNStock")
     return stats.get("symbol_list", []) if stats.get("exists") else []
 
 
-def get_board(code: str) -> str:
-    c = code[:3]
-    if c.startswith("68"): return "科创板"
-    if c.startswith("30"): return "创业板"
-    if c.startswith(("8","4")): return "北交所"
-    if c.startswith("6"): return "沪主板"
-    if c.startswith(("0","2")): return "深主板"
-    return "未知"
-
-
-def lim_thresh(code: str) -> float:
-    return 0.198 if get_board(code) in ("创业板","科创板") else 0.098
-
-
-def board_scale(code: str) -> float:
-    """归一化系数: 主板10%→20%基准需×2, 创业板/科创板20%→20%基准×1"""
-    return 2.0 if get_board(code) in ("沪主板", "深主板") else 1.0
-
-
-def is_20pct_board(code: str) -> bool:
-    """创业板/科创板: 20%涨停"""
-    return get_board(code) in ("创业板", "科创板")
-
-
-# ── 分板块默认参数 ──
-# 主板10%涨停 vs 创业板/科创板20%涨停，物理特性不同，独立参数
-BOARD_PARAMS = {
-    "10pct": {  # 沪主板、深主板
-        "min_return": 9.8,       # 涨停即通过（10%板）
-        "max_seal": 8.0,         # 主板封板普遍偏大，放宽
-        "min_upper": 0.0,        # 主板99.8%上影<1%，不筛
-        "max_upper": 8.0,
-        "max_volatility": 3.0,   # 前5天低波动 → 突破更有效
-        "max_vol_ratio": 1.0,    # 关键！缩量涨停 >> 放量涨停
-        "open_break_stop": -5.0, # 开板日跌>5%直接出场
-    },
-    "20pct": {  # 创业板、科创板
-        "min_return": 19.8,
-        "max_seal": 2.8,
-        "min_upper": 2.0,
-        "max_upper": 8.0,
-        "max_volatility": 10.0,
-        # 注意: 振幅/实体比是连板窗口均值，首板日无法计算，暂不加入过滤
-        # 横向分析结论留待runner参数优化时使用
-    },
-}
-
-
-def load_daily(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
+def load_daily_db(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
+    """从 db_market 加载日线"""
     writer = _get_writer()
     data = writer.query("CNStock", code, "1D", start_time=start, end_time=end, limit=0)
     if not data:
@@ -136,30 +143,90 @@ def load_daily(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     return df
 
 
+def load_from_csv(csv_path: str, start_date: str, end_date: str):
+    """
+    从 CSV 加载数据，按 (code, first_limit_date) 分组。
+    返回: code_data[code] = {df, close, high, low, open, dates, threshold}
+          run_groups = [(code, fld, board, run_n_limit_ups, df_segment), ...]
+    """
+    print(f"  📂 加载 CSV: {csv_path}")
+    df_all = pd.read_csv(csv_path, dtype={"code": str})
+    df_all["code"] = df_all["code"].astype(str).str.zfill(6)
+    df_all["time"] = pd.to_datetime(df_all["time"])
+
+    # 过滤日期范围
+    sd = pd.Timestamp(start_date)
+    ed = pd.Timestamp(end_date)
+
+    code_data = {}
+    run_groups = []
+
+    # 按 (code, first_limit_date) 分组
+    grouped = df_all.groupby(["code", "run_first_limit_date"])
+
+    for (code, fld), gdf in grouped:
+        fld_ts = pd.Timestamp(fld)
+        if fld_ts < sd or fld_ts > ed:
+            continue
+
+        gdf = gdf.sort_values("time").reset_index(drop=True)
+        if len(gdf) < 6:
+            continue
+
+        board = gdf["board"].iloc[0]
+        run_n = int(gdf["run_n_limit_ups"].iloc[0])
+
+        # 设置 index 为 time
+        gdf_indexed = gdf.set_index("time")
+
+        if code not in code_data:
+            code_data[code] = {
+                "df_full": None,  # CSV 模式不用全量
+                "board": board,
+                "threshold": lim_thresh(code),
+            }
+
+        run_groups.append({
+            "code": code,
+            "board": board,
+            "fld": fld,
+            "fld_ts": fld_ts,
+            "run_n_limit_ups": run_n,
+            "df": gdf_indexed,
+            "close": gdf_indexed["close"].values.astype(float),
+            "high": gdf_indexed["high"].values.astype(float),
+            "low": gdf_indexed["low"].values.astype(float),
+            "open": gdf_indexed["open"].values.astype(float),
+            "volume": gdf_indexed["volume"].values.astype(float),
+            "dates": gdf_indexed.index,
+            "threshold": lim_thresh(code),
+        })
+
+    print(f"  ✅ {len(run_groups)} 个连板段, 涉及 {len(code_data)} 只股票")
+    return code_data, run_groups
+
+
 # ================================================================
 # 特征提取
 # ================================================================
 
 def extract_limit_up_features(
-    df: pd.DataFrame,
+    close: np.ndarray,
+    open_: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    volume: np.ndarray,
+    dates,
     code: str,
     i: int,
     lookback: int = 5,
 ) -> Optional[Dict[str, Any]]:
     """
     提取第 i 天涨停时的特征（只用 i 及之前数据）。
-
-    i 必须是涨停日的 index 位置。
-    返回 None 如果数据不足。
+    i 是涨停日在数组中的位置。
     """
     if i < lookback + 1:
         return None
-
-    close = df["close"].values
-    open_ = df["open"].values
-    high = df["high"].values
-    low = df["low"].values
-    volume = df["volume"].values.astype(float)
 
     fl_c = close[i]
     fl_o = open_[i]
@@ -168,48 +235,33 @@ def extract_limit_up_features(
     fl_v = volume[i]
     prev_c = close[i - 1]
 
-    # 涨停阈值
     threshold = lim_thresh(code)
 
-    # 判断是否一字板（开盘即涨停，振幅极小）
-    # 容差: 开盘价距涨停价 ≤1%，且振幅 ≤1%
+    # 一字板判定
     limit_up_price = prev_c * (1 + threshold)
-    gap_to_limit = abs(fl_o - limit_up_price) / limit_up_price
+    gap_to_limit = abs(fl_o - limit_up_price) / limit_up_price if limit_up_price > 0 else 999
     amp = (fl_h - fl_l) / prev_c if prev_c > 0 else 999
     is_yizi = gap_to_limit < 0.01 and amp < 0.01
-
     if is_yizi:
-        return None  # 一字板无法买入，跳过
+        return None
 
-    # 当日涨幅（原始）
     fl_return = (fl_c / prev_c - 1) * 100
-
-    # 封板强度：(close - low) / close * 100
     fl_seal = (fl_c - fl_l) / fl_c * 100 if fl_c > 0 else 999
-
-    # 上影线
     fl_upper_shadow = (fl_h - fl_c) / prev_c * 100
-
-    # 振幅
     fl_amplitude = (fl_h - fl_l) / prev_c * 100
-
-    # 实体比: |close - open| / (high - low)
     bar_range = fl_h - fl_l
     fl_body_ratio = abs(fl_c - fl_o) / bar_range if bar_range > 0 else 1.0
 
-    # 量比（vs 前5天均量）
     vol_window = volume[max(0, i - lookback):i]
     avg_vol = vol_window.mean() if len(vol_window) > 0 else fl_v
     fl_vol_ratio = fl_v / avg_vol if avg_vol > 0 else 0
 
-    # 前5天波动率（日收益率标准差）
     rets = []
     for j in range(i - lookback, i):
         if close[j - 1] > 0:
             rets.append(close[j] / close[j - 1] - 1)
     volatility = np.std(rets) * 100 if len(rets) >= 3 else 999
 
-    # 前5天累计涨幅
     if close[i - lookback - 1] > 0:
         prev5_return = (prev_c / close[i - lookback - 1] - 1) * 100
     else:
@@ -219,8 +271,8 @@ def extract_limit_up_features(
         "code": code,
         "board": get_board(code),
         "branch": "20pct" if is_20pct_board(code) else "10pct",
-        "date": df.index[i],
-        "date_str": df.index[i].strftime("%Y-%m-%d"),
+        "date": dates[i],
+        "date_str": dates[i].strftime("%Y-%m-%d") if hasattr(dates[i], 'strftime') else str(dates[i]),
         "fl_return": fl_return,
         "fl_seal": fl_seal,
         "fl_upper_shadow": fl_upper_shadow,
@@ -248,7 +300,6 @@ def passes_filter(feat: Dict[str, Any]) -> bool:
         return False
     if feat["volatility"] > p["max_volatility"]:
         return False
-    # 主板：量比
     if branch == "10pct" and "max_vol_ratio" in p:
         if feat["fl_vol_ratio"] > p["max_vol_ratio"]:
             return False
@@ -283,9 +334,6 @@ def simulate_trade(
       2. 开板判定（当天不涨停 → 收盘卖出）
       3. 止盈 / 追踪止损（开板后才生效，涨停封板期间不触发）
       4. 最大持仓天数
-
-    关键设计: 涨停封板期间只检查止损和开板，不检查止盈/追踪。
-    这样多板股可以持续持有直到开板。
     """
     n = len(close)
     if n == 0 or entry_idx >= n:
@@ -298,189 +346,133 @@ def simulate_trade(
         hold += 1
         c = close[pos]
         h = high[pos]
-        l = low[pos]
         prev_c = close[pos - 1]
 
-        # 更新最高价
         if h > peak:
             peak = h
 
         ret = (c / entry_price - 1) * 100
 
-        # 1. 固定止损（最高优先级，任何状态都生效）
-        #    加 0.01% 容差防止浮点精度问题
+        # 1. 固定止损
         if ret <= -stop_loss + 0.01:
-            return {
-                "exit_idx": pos,
-                "pnl_pct": round(ret, 2),
-                "hold_days": hold,
-                "exit_reason": f"止损{stop_loss}%",
-            }
+            return {"exit_idx": pos, "pnl_pct": round(ret, 2),
+                    "hold_days": hold, "exit_reason": f"止损{stop_loss}%"}
 
         # 2. 开板判定
-        #    核心逻辑: 涨停封板 = 收盘价 ≈ 前收×(1+涨停阈值)
-        #    用 close 而非 open 判定，因为 A 股 T+1：涨停封板时只能收盘才能确认
-        #    容差: 当天收盘距涨停价 > 2% → 认为开板
         if prev_c > 0:
             limit_price = prev_c * (1 + threshold)
             gap_from_limit = (limit_price - c) / limit_price
-            is_limit_up = gap_from_limit < 0.02  # 收盘距涨停<2% → 还在涨停
+            is_limit_up = gap_from_limit < 0.02
         else:
             is_limit_up = False
 
         if not is_limit_up:
-            # 开板了！检查止盈/追踪止损
             peak_ret = (peak / entry_price - 1) * 100
 
-            # 主板开板日大跌 → 直接出场
+            # 开板日大跌
             if open_break_stop < 0 and ret <= open_break_stop:
-                return {
-                    "exit_idx": pos,
-                    "pnl_pct": round(ret, 2),
-                    "hold_days": hold,
-                    "exit_reason": f"开板止损{ret:+.1f}%",
-                }
+                return {"exit_idx": pos, "pnl_pct": round(ret, 2),
+                        "hold_days": hold, "exit_reason": f"开板止损{ret:+.1f}%"}
 
             # 止盈
             if ret >= take_profit:
-                return {
-                    "exit_idx": pos,
-                    "pnl_pct": round(ret, 2),
-                    "hold_days": hold,
-                    "exit_reason": f"止盈{take_profit}%",
-                }
+                return {"exit_idx": pos, "pnl_pct": round(ret, 2),
+                        "hold_days": hold, "exit_reason": f"止盈{take_profit}%"}
 
             # 追踪止损
             if peak_ret >= trailing_activate:
                 dd = (peak - c) / entry_price * 100
                 if dd >= trailing_callback:
-                    return {
-                        "exit_idx": pos,
-                        "pnl_pct": round(ret, 2),
-                        "hold_days": hold,
-                        "exit_reason": f"追踪止损(峰+{peak_ret:.1f}%→回撤{dd:.1f}%)",
-                    }
+                    return {"exit_idx": pos, "pnl_pct": round(ret, 2),
+                            "hold_days": hold,
+                            "exit_reason": f"追踪止损(峰+{peak_ret:.1f}%→回撤{dd:.1f}%)"}
 
-            # 开板即卖（默认行为）
-            return {
-                "exit_idx": pos,
-                "pnl_pct": round(ret, 2),
-                "hold_days": hold,
-                "exit_reason": "开板卖出",
-            }
+            # 开板即卖
+            return {"exit_idx": pos, "pnl_pct": round(ret, 2),
+                    "hold_days": hold, "exit_reason": "开板卖出"}
 
         # 3. 涨停封板中：继续持有
-        #    不触发止盈/追踪（涨停封板期间卖不出去）
-
-        # 4. 最大持仓天数（防止极端情况）
         if hold >= max_hold:
-            return {
-                "exit_idx": pos,
-                "pnl_pct": round(ret, 2),
-                "hold_days": hold,
-                "exit_reason": f"持仓{max_hold}天",
-            }
+            return {"exit_idx": pos, "pnl_pct": round(ret, 2),
+                    "hold_days": hold, "exit_reason": f"持仓{max_hold}天"}
 
     # 数据结束
     ret = (close[-1] / entry_price - 1) * 100 if entry_price > 0 else 0
-    return {
-        "exit_idx": n - 1,
-        "pnl_pct": round(ret, 2),
-        "hold_days": hold,
-        "exit_reason": "数据结束",
-    }
+    return {"exit_idx": n - 1, "pnl_pct": round(ret, 2),
+            "hold_days": hold, "exit_reason": "数据结束"}
 
 
 # ================================================================
-# 主策略
+# 主策略 — DB 模式
 # ================================================================
 
-def run_strategy(
+def run_strategy_db(
     codes: List[str],
-    start_date: str = "2023-01-01",
-    end_date: str = "2026-05-21",
-    take_profit: float = 15.0,
-    trailing_activate: float = 5.0,
-    trailing_callback: float = 8.0,
-    stop_loss: float = 10.0,
-    max_hold: int = 20,
+    start_date: str,
+    end_date: str,
+    take_profit: float,
+    trailing_activate: float,
+    trailing_callback: float,
+    stop_loss: float,
+    max_hold: int,
 ) -> List[Dict[str, Any]]:
-    """
-    全市场逐日扫描，过滤 + 出场引擎。
-    """
+    """全市场逐日扫描，从 db_market 读取数据。"""
     print(f"\n{'='*70}")
-    print(f"  连板猎手 v2 — 双分支过滤 + 机械出场")
+    print(f"  连板猎手 v2 — DB 模式")
     print(f"{'='*70}")
     print(f"  区间: {start_date} ~ {end_date}")
-    print(f"  分支A (主板10%): 涨幅≥{BOARD_PARAMS['10pct']['min_return']}% 封板≤{BOARD_PARAMS['10pct']['max_seal']}% "
-          f"上影{BOARD_PARAMS['10pct']['min_upper']}~{BOARD_PARAMS['10pct']['max_upper']}% 波动≤{BOARD_PARAMS['10pct']['max_volatility']}%")
-    print(f"  分支B (创/科20%): 涨幅≥{BOARD_PARAMS['20pct']['min_return']}% 封板≤{BOARD_PARAMS['20pct']['max_seal']}% "
-          f"上影{BOARD_PARAMS['20pct']['min_upper']}~{BOARD_PARAMS['20pct']['max_upper']}% 波动≤{BOARD_PARAMS['20pct']['max_volatility']}%")
-    print(f"  出场: 止盈{take_profit}% 追踪{trailing_activate}%→{trailing_callback}% 止损{stop_loss}% 最大{max_hold}天")
+    _print_params(take_profit, trailing_activate, trailing_callback, stop_loss, max_hold)
     print(f"  股票: {len(codes)} 只")
 
-    # 加载范围多取一些
     buffer = max_hold + 15
     query_start = (datetime.strptime(start_date, "%Y-%m-%d") - timedelta(days=buffer * 2)).strftime("%Y-%m-%d")
     query_end = (datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=buffer)).strftime("%Y-%m-%d")
 
-    # 第一遍：加载所有股票数据，按日期收集涨停信号
     print(f"\n  [1/2] 扫描涨停信号...")
-    day_signals = defaultdict(list)  # date_str -> [features]
-    code_data = {}  # code -> (df, dates_arr, close_arr, ...)
+    day_signals = defaultdict(list)
+    code_data = {}
     total = len(codes)
     loaded = 0
 
     for idx, code in enumerate(codes):
         if (idx + 1) % 500 == 0 or idx == 0:
             print(f"\r   加载: {idx+1}/{total}  已加载: {loaded}", end="", flush=True)
-
         try:
-            df = load_daily(code, query_start, query_end)
+            df = load_daily_db(code, query_start, query_end)
             if df is None or len(df) < 30:
                 continue
-
-            # 限定扫描区间
             sd = pd.Timestamp(start_date)
             ed = pd.Timestamp(end_date)
             df_scan = df[(df.index >= sd) & (df.index <= ed)]
             if len(df_scan) < 10:
                 continue
-
             loaded += 1
             threshold = lim_thresh(code)
-
-            # 找涨停日
             close_arr = df_scan["close"].values
             dates = df_scan.index
 
             for i in range(1, len(close_arr)):
-                # 数据断层检查：相邻交易日间隔>5天则跳过（排除停牌/数据缺失）
                 if hasattr(dates[i], 'value') and hasattr(dates[i-1], 'value'):
-                    gap_days = (dates[i] - dates[i-1]).days
-                    if gap_days > 5:
+                    if (dates[i] - dates[i-1]).days > 5:
                         continue
-
                 day_ret = close_arr[i] / close_arr[i - 1] - 1
-                if day_ret < threshold * 0.98:  # 留 2% 容差
+                if day_ret < threshold * 0.98:
                     continue
-
-                # 涨停！提取特征
-                feat = extract_limit_up_features(df_scan, code, i)
+                feat = extract_limit_up_features(
+                    close_arr, df_scan["open"].values, df_scan["high"].values,
+                    df_scan["low"].values, df_scan["volume"].values.astype(float),
+                    dates, code, i,
+                )
                 if feat is None:
                     continue
-
-                # 检查是否是第一板（前一天不涨停）
-                if i >= 1:
-                    prev_ret = close_arr[i - 1] / close_arr[i - 2] - 1 if i >= 2 else 0
+                # 只要第一板
+                if i >= 2:
+                    prev_ret = close_arr[i - 1] / close_arr[i - 2] - 1
                     if prev_ret >= threshold * 0.98:
-                        continue  # 不是第一板，跳过
-
+                        continue
                 day_signals[feat["date_str"]].append(feat)
 
-            # 缓存数据（用于回测）
             code_data[code] = {
-                "df": df_scan,
                 "close": df_scan["close"].values,
                 "high": df_scan["high"].values,
                 "low": df_scan["low"].values,
@@ -488,13 +480,11 @@ def run_strategy(
                 "dates": df_scan.index,
                 "threshold": threshold,
             }
-
         except Exception:
             continue
 
     print(f"\r   加载完成: {loaded}/{total} 只股票  涨停信号日: {len(day_signals)} 天")
 
-    # 第二遍：逐日过滤 + 模拟交易
     print(f"\n  [2/2] 过滤 + 回测...")
     all_trades = []
     signal_count = 0
@@ -503,37 +493,26 @@ def run_strategy(
     for date_str in sorted(day_signals):
         feats = day_signals[date_str]
         signal_count += len(feats)
-
-        # 应用过滤
         passed = [f for f in feats if passes_filter(f)]
         filtered_count += len(passed)
 
-        # 对通过过滤的信号模拟交易
         for feat in passed:
             code = feat["code"]
             if code not in code_data:
                 continue
-
             data = code_data[code]
             dates = data["dates"]
-
-            # 找到信号日的位置
             signal_date = feat["date"]
             if signal_date not in dates:
                 continue
             signal_idx = dates.get_loc(signal_date)
-
-            # T+1 开盘买入
             buy_idx = signal_idx + 1
             if buy_idx >= len(data["close"]):
                 continue
-
             entry_price = data["open"][buy_idx]
             if entry_price <= 0:
                 continue
 
-            # 模拟出场
-            # 主板开板止损
             branch = feat.get("branch", "10pct" if not is_20pct_board(code) else "20pct")
             obs = BOARD_PARAMS[branch].get("open_break_stop", 0.0)
 
@@ -543,31 +522,157 @@ def run_strategy(
                 take_profit, trailing_activate, trailing_callback,
                 stop_loss, max_hold, open_break_stop=obs,
             )
-
-            # 记录
             exit_date = data["dates"][result["exit_idx"]]
-            all_trades.append({
-                "code": code,
-                "board": feat["board"],
-                "branch": feat.get("branch", "10pct"),
-                "signal_date": date_str,
-                "buy_date": data["dates"][buy_idx].strftime("%Y-%m-%d"),
-                "exit_date": exit_date.strftime("%Y-%m-%d"),
-                "entry_price": round(entry_price, 3),
-                "exit_price": round(data["close"][result["exit_idx"]], 3),
-                "pnl_pct": result["pnl_pct"],
-                "hold_days": result["hold_days"],
-                "exit_reason": result["exit_reason"],
-                "fl_return": round(feat["fl_return"], 1),
-                "fl_seal": round(feat["fl_seal"], 1),
-                "fl_upper_shadow": round(feat["fl_upper_shadow"], 1),
-                "fl_amplitude": round(feat["fl_amplitude"], 1),
-                "fl_vol_ratio": round(feat.get("fl_vol_ratio", 0), 2),
-                "volatility": round(feat["volatility"], 1),
-            })
+            all_trades.append(_trade_record(feat, code, data, buy_idx, entry_price, exit_date, result))
 
     print(f"   涨停信号: {signal_count}  通过过滤: {filtered_count}  交易: {len(all_trades)}")
     return all_trades
+
+
+# ================================================================
+# 主策略 — CSV 模式
+# ================================================================
+
+def run_strategy_csv(
+    csv_path: str,
+    start_date: str,
+    end_date: str,
+    take_profit: float,
+    trailing_activate: float,
+    trailing_callback: float,
+    stop_loss: float,
+    max_hold: int,
+) -> List[Dict[str, Any]]:
+    """从 CSV 读取数据，逐连板段回测。"""
+    print(f"\n{'='*70}")
+    print(f"  连板猎手 v2 — CSV 模式")
+    print(f"{'='*70}")
+    print(f"  区间: {start_date} ~ {end_date}")
+    _print_params(take_profit, trailing_activate, trailing_callback, stop_loss, max_hold)
+
+    code_data, run_groups = load_from_csv(csv_path, start_date, end_date)
+
+    print(f"\n  回测中...")
+    all_trades = []
+    signal_count = 0
+    filtered_count = 0
+
+    for rg in run_groups:
+        code = rg["code"]
+        close = rg["close"]
+        high = rg["high"]
+        low = rg["low"]
+        open_ = rg["open"]
+        volume = rg["volume"]
+        dates = rg["dates"]
+        threshold = rg["threshold"]
+        fld_ts = rg["fld_ts"]
+        fld_str = rg["fld"]
+
+        # 在 df 中找到 first_limit_date 的位置
+        fld_pos = None
+        for i, d in enumerate(dates):
+            d_str = d.strftime("%Y-%m-%d") if hasattr(d, 'strftime') else str(d)
+            if d_str == fld_str:
+                fld_pos = i
+                break
+        if fld_pos is None or fld_pos < 2:
+            continue
+
+        # 检查第一板：前一天不涨停
+        if fld_pos >= 2:
+            prev_ret = close[fld_pos - 1] / close[fld_pos - 2] - 1
+            if prev_ret >= threshold * 0.98:
+                continue  # 不是第一板
+
+        signal_count += 1
+
+        # 提取特征
+        feat = extract_limit_up_features(close, open_, high, low, volume, dates, code, fld_pos)
+        if feat is None:
+            continue
+
+        # 过滤
+        if not passes_filter(feat):
+            continue
+        filtered_count += 1
+
+        # T+1 开盘买入
+        buy_idx = fld_pos + 1
+        if buy_idx >= len(close):
+            continue
+        entry_price = open_[buy_idx]
+        if entry_price <= 0:
+            continue
+
+        branch = feat.get("branch", "10pct" if not is_20pct_board(code) else "20pct")
+        obs = BOARD_PARAMS[branch].get("open_break_stop", 0.0)
+
+        result = simulate_trade(
+            close, high, low, open_,
+            buy_idx, entry_price, threshold,
+            take_profit, trailing_activate, trailing_callback,
+            stop_loss, max_hold, open_break_stop=obs,
+        )
+        exit_date = dates[result["exit_idx"]]
+
+        all_trades.append({
+            "code": code,
+            "board": feat["board"],
+            "branch": feat.get("branch", "10pct"),
+            "signal_date": fld_str,
+            "buy_date": dates[buy_idx].strftime("%Y-%m-%d") if hasattr(dates[buy_idx], 'strftime') else str(dates[buy_idx]),
+            "exit_date": exit_date.strftime("%Y-%m-%d") if hasattr(exit_date, 'strftime') else str(exit_date),
+            "entry_price": round(entry_price, 3),
+            "exit_price": round(close[result["exit_idx"]], 3),
+            "pnl_pct": result["pnl_pct"],
+            "hold_days": result["hold_days"],
+            "exit_reason": result["exit_reason"],
+            "fl_return": round(feat["fl_return"], 1),
+            "fl_seal": round(feat["fl_seal"], 1),
+            "fl_upper_shadow": round(feat["fl_upper_shadow"], 1),
+            "fl_amplitude": round(feat["fl_amplitude"], 1),
+            "fl_vol_ratio": round(feat.get("fl_vol_ratio", 0), 2),
+            "volatility": round(feat["volatility"], 1),
+            "run_n_limit_ups": rg["run_n_limit_ups"],
+        })
+
+    print(f"   第一板信号: {signal_count}  通过过滤: {filtered_count}  交易: {len(all_trades)}")
+    return all_trades
+
+
+# ================================================================
+# 公共
+# ================================================================
+
+def _print_params(tp, ta, tc, sl, mh):
+    print(f"  分支A (主板10%): 涨幅≥{BOARD_PARAMS['10pct']['min_return']}% 封板≤{BOARD_PARAMS['10pct']['max_seal']}% "
+          f"波动≤{BOARD_PARAMS['10pct']['max_volatility']}% 量比≤{BOARD_PARAMS['10pct']['max_vol_ratio']}")
+    print(f"  分支B (创/科20%): 涨幅≥{BOARD_PARAMS['20pct']['min_return']}% 封板≤{BOARD_PARAMS['20pct']['max_seal']}% "
+          f"上影{BOARD_PARAMS['20pct']['min_upper']}~{BOARD_PARAMS['20pct']['max_upper']}% 波动≤{BOARD_PARAMS['20pct']['max_volatility']}%")
+    print(f"  出场: 止盈{tp}% 追踪{ta}%→{tc}% 止损{sl}% 最大{mh}天")
+
+
+def _trade_record(feat, code, data, buy_idx, entry_price, exit_date, result):
+    return {
+        "code": code,
+        "board": feat["board"],
+        "branch": feat.get("branch", "10pct"),
+        "signal_date": feat["date_str"],
+        "buy_date": data["dates"][buy_idx].strftime("%Y-%m-%d"),
+        "exit_date": exit_date.strftime("%Y-%m-%d"),
+        "entry_price": round(entry_price, 3),
+        "exit_price": round(data["close"][result["exit_idx"]], 3),
+        "pnl_pct": result["pnl_pct"],
+        "hold_days": result["hold_days"],
+        "exit_reason": result["exit_reason"],
+        "fl_return": round(feat["fl_return"], 1),
+        "fl_seal": round(feat["fl_seal"], 1),
+        "fl_upper_shadow": round(feat["fl_upper_shadow"], 1),
+        "fl_amplitude": round(feat["fl_amplitude"], 1),
+        "fl_vol_ratio": round(feat.get("fl_vol_ratio", 0), 2),
+        "volatility": round(feat["volatility"], 1),
+    }
 
 
 # ================================================================
@@ -605,11 +710,9 @@ def analyze_results(trades: List[Dict[str, Any]]):
     print(f"  期望值: {avg:+.2f}%/笔")
     print(f"  最大盈利: {max(pnl):+.2f}%  最大亏损: {min(pnl):+.2f}%")
 
-    # 持仓天数
     hd = [t["hold_days"] for t in trades]
     print(f"\n  持仓天数: 均值={sum(hd)/len(hd):.1f}  中位数={sorted(hd)[len(hd)//2]}")
 
-    # 出场原因
     print(f"\n  出场原因:")
     reason_groups = defaultdict(list)
     for t in trades:
@@ -619,7 +722,6 @@ def analyze_results(trades: List[Dict[str, Any]]):
         wr_r = sum(1 for p in pnls if p > 0) / len(pnls) * 100
         print(f"    {reason:40s}  {len(pnls):3d}笔  均值={avg_r:+.2f}%  胜率={wr_r:.0f}%")
 
-    # 按板块分支
     print(f"\n  按板块:")
     board_groups = defaultdict(list)
     for t in trades:
@@ -629,8 +731,7 @@ def analyze_results(trades: List[Dict[str, Any]]):
         wr_b = sum(1 for p in pnls if p > 0) / len(pnls) * 100
         print(f"    {board:8s} ({len(pnls):3d}笔): 胜率={wr_b:.0f}%  均值={avg_b:+.2f}%")
 
-    # 收益分桶（按原始收益，标注板块）
-    print(f"\n  收益分桶（原始收益）:")
+    print(f"\n  收益分桶:")
     for (lo, hi), label in zip(bins, labels):
         bucket = [t for t in trades if lo <= t["pnl_pct"] < hi]
         cnt = len(bucket)
@@ -644,7 +745,6 @@ def analyze_results(trades: List[Dict[str, Any]]):
         bar = "█" * int(cnt / n * 40)
         print(f"    {label:12s}  {cnt:4d} ({cnt/n*100:5.1f}%)  {bar}{boards_str}")
 
-    # 按年度
     print(f"\n  按年度:")
     year_groups = defaultdict(list)
     for t in trades:
@@ -654,36 +754,49 @@ def analyze_results(trades: List[Dict[str, Any]]):
         wr_y = sum(1 for p in pnls if p > 0) / len(pnls) * 100
         print(f"    {year} ({len(pnls):3d}笔): 胜率={wr_y:.0f}%  均值={avg_y:+.2f}%")
 
-    # 收益分布
-    print(f"\n  收益分布:")
-    for (lo, hi), label in zip(bins, labels):
-        cnt = sum(1 for p in pnl if lo <= p < hi)
-        bar = "█" * int(cnt / n * 40)
-        print(f"    {label:12s}  {cnt:4d} ({cnt/n*100:5.1f}%)  {bar}")
-
-    # 最差5笔
     sorted_trades = sorted(trades, key=lambda x: x["pnl_pct"])
     print(f"\n  亏损最多5笔:")
     for t in sorted_trades[:5]:
         print(f"    {t['code']:>8s} {t['signal_date']} → {t['exit_date']} "
               f"持仓{t['hold_days']}天 收益{t['pnl_pct']:+.2f}% {t['exit_reason']}")
-
-    # 最好5笔
     print(f"\n  盈利最多5笔:")
     for t in sorted_trades[-5:][::-1]:
         print(f"    {t['code']:>8s} {t['signal_date']} → {t['exit_date']} "
               f"持仓{t['hold_days']}天 收益{t['pnl_pct']:+.2f}% {t['exit_reason']}")
 
 
+def save_trades(trades: List[Dict[str, Any]], output: str):
+    if not trades:
+        return
+    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
+    fields = ["code", "board", "branch", "signal_date", "buy_date", "exit_date",
+              "entry_price", "exit_price", "pnl_pct", "hold_days", "exit_reason",
+              "fl_return", "fl_seal", "fl_upper_shadow", "fl_amplitude", "fl_vol_ratio",
+              "volatility", "run_n_limit_ups"]
+    with open(output, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        w.writeheader()
+        for t in trades:
+            w.writerow(t)
+    print(f"\n💾 交易明细已保存: {output}")
+
+
+# ================================================================
+# CLI
+# ================================================================
+
 def main():
-    print("🔖 REV: 20260522-1015  双分支+open_break_stop+vol_ratio导出")
-    parser = argparse.ArgumentParser(description="连板猎手 v2 — 横向过滤 + 机械出场")
+    print("🔖 REV: 20260522-1201  双数据源(db/csv)")
+    parser = argparse.ArgumentParser(description="连板猎手 v2 — 双分支过滤 + 机械出场")
+    parser.add_argument("--source", choices=["db", "csv"], required=True,
+                        help="数据源: db (PostgreSQL) 或 csv (dragon_ohlcv.csv)")
+    parser.add_argument("--csv", type=str, default="analysis_output/dragon_ohlcv.csv",
+                        help="CSV 文件路径（--source csv 时使用）")
     parser.add_argument("--start", type=str, default="2023-01-01")
     parser.add_argument("--end", type=str, default="2026-05-21")
-    parser.add_argument("--quick", action="store_true", help="抽样500只")
+    parser.add_argument("--quick", action="store_true", help="抽样500只（仅 db 模式）")
     parser.add_argument("--sample", type=int, default=0)
 
-    # 过滤参数（双分支参数在 BOARD_PARAMS 中定义）
     # 出场参数
     parser.add_argument("--tp", type=float, default=15.0, help="止盈%")
     parser.add_argument("--trail-activate", type=float, default=5.0, help="追踪止损激活%")
@@ -697,38 +810,30 @@ def main():
     args = parser.parse_args()
 
     print("🚀 连板猎手 v2")
-    codes = get_all_codes()
-    print(f"   全市场: {len(codes)} 只股票")
 
-    if args.quick:
-        codes = codes[:500]
-    elif args.sample > 0:
-        codes = codes[:args.sample]
-
-    trades = run_strategy(
-        codes=codes,
-        start_date=args.start,
-        end_date=args.end,
-        take_profit=args.tp,
-        trailing_activate=args.trail_activate,
-        trailing_callback=args.trail_callback,
-        stop_loss=args.stop_loss,
-        max_hold=args.max_hold,
-    )
+    if args.source == "db":
+        codes = get_all_codes_db()
+        print(f"   全市场: {len(codes)} 只股票")
+        if args.quick:
+            codes = codes[:500]
+        elif args.sample > 0:
+            codes = codes[:args.sample]
+        trades = run_strategy_db(
+            codes=codes, start_date=args.start, end_date=args.end,
+            take_profit=args.tp, trailing_activate=args.trail_activate,
+            trailing_callback=args.trail_callback, stop_loss=args.stop_loss,
+            max_hold=args.max_hold,
+        )
+    else:
+        trades = run_strategy_csv(
+            csv_path=args.csv, start_date=args.start, end_date=args.end,
+            take_profit=args.tp, trailing_activate=args.trail_activate,
+            trailing_callback=args.trail_callback, stop_loss=args.stop_loss,
+            max_hold=args.max_hold,
+        )
 
     analyze_results(trades)
-
-    if trades:
-        os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-        fields = ["code", "board", "branch", "signal_date", "buy_date", "exit_date",
-                  "entry_price", "exit_price", "pnl_pct", "hold_days", "exit_reason",
-                  "fl_return", "fl_seal", "fl_upper_shadow", "fl_amplitude", "fl_vol_ratio", "volatility"]
-        with open(args.output, "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.DictWriter(f, fieldnames=fields)
-            w.writeheader()
-            for t in trades:
-                w.writerow({k: t.get(k, "") for k in fields})
-        print(f"\n💾 交易明细已保存: {args.output}")
+    save_trades(trades, args.output)
 
 
 if __name__ == "__main__":

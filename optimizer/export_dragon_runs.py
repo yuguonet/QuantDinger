@@ -420,7 +420,10 @@ def scan_and_export(
                     segment = df.iloc[data_start_loc:data_end_loc + 1].copy()
                     if len(segment) == 0:
                         continue
+                    # 跳过停牌日（volume=0 或 OHLC 全相同）
                     for ts, row in segment.iterrows():
+                        if float(row.get("volume", 0)) == 0:
+                            continue
                         all_rows.append({
                             "code": code, "board": board,
                             "run_n_limit_ups": run["n_limit_ups"],
