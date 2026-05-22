@@ -19,6 +19,7 @@ A 股扩展策略模板
 from typing import Dict, Any, List
 from optimizer.indicator_strategy_builder import render_indicator_strategy
 from optimizer.strategy_dragon_v3_indicator import _build_dragon_v3_strategy
+from optimizer.strategy_dragon_v1_indicator import _build_dragon_v1_strategy
 
 # 复用基础参数构建函数
 def _p_int(low: int, high: int, step: int = 1) -> dict:
@@ -813,6 +814,32 @@ ASHARE_STRATEGY_TEMPLATES: Dict[str, Dict[str, Any]] = {
             ("macd_fast", "<", "macd_slow"),
         ],
         "build_config": _build_kdj_macd_ma_triple_config,
+        "strategy_defaults": {"tradeDirection": "long"},
+    },
+
+    # ── 11c. 连板猎手V1 (第一板筛选→D+1开盘买入, 最终版) ──
+    "dragon_v1": {
+        "name": "连板猎手V1",
+        "description": "第一板筛选(量比>2x+上影<0.5%+排除一字板)→D+1开盘买入, 95%胜率+12%均收益",
+        "indicators": ["change_pct", "is_first_limit", "d0_vol_ratio", "d0_upper_shadow", "d1_gap_pct", "rsi_14", "kdj"],
+        "params": {
+            "limit_threshold":   _p_float(9.5, 19.8, 0.1),
+            "min_streak":        _p_int(2, 5),
+            "max_d1_gap":        _p_float(1.0, 10.0, 0.5),
+            "min_vol_ratio":     _p_float(1.0, 5.0, 0.5),
+            "max_upper_shadow":  _p_float(0.1, 2.0, 0.1),
+            "trailing_stop_pct": _p_float(3.0, 12.0, 0.5),
+            "take_profit_pct":   _p_float(8.0, 25.0, 1.0),
+            "peak_rsi_threshold":_p_float(70.0, 90.0, 1.0),
+            "peak_upper_shadow": _p_float(25.0, 50.0, 5.0),
+            "position_pct": POSITION_PCT,
+        },
+        "constraints": [
+            ("min_streak", ">=", 2),
+            ("min_vol_ratio", ">=", 1),
+            ("max_d1_gap", "<", 10),
+        ],
+        "build_strategy": _build_dragon_v1_strategy,
         "strategy_defaults": {"tradeDirection": "long"},
     },
 

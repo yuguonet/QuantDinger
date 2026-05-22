@@ -678,7 +678,7 @@ class BackfillDB:
             _insert_record(
                 self.source.name, "15m", "re",
                 f"开始同步 15m ({total_symbols} 只标的)",
-                last_bar_time=bar_time, synced_count=0,
+                last_bar_time=bar_time, synced_count=total_symbols,
                 failed_count=0, pool_name=pool, written_count=0,
             )
 
@@ -786,9 +786,9 @@ class BackfillDB:
                     self.source.name, "15m", bar_time,
                     status="re",
                     report=f"修复中: {final_count}/{total_symbols}, 失败 {len(failed)}",
-                    synced_count=final_count,
+                    synced_count=total_symbols,
                     failed_count=len(failed), pool_name=pool,
-                    written_count=rw,
+                    written_count=total_symbols - len(failed),
                 )
 
         # ── 最终落盘 cn_last_update ──
@@ -812,9 +812,9 @@ class BackfillDB:
         _update_record(
             self.source.name, "15m", bar_time,
             status=final_status, report=report,
-            synced_count=final_count,
+            synced_count=total_symbols,
             failed_count=len(failed), pool_name=pool,
-            written_count=total_written,
+            written_count=total_symbols - len(failed),
         )
 
         if failed:
@@ -883,7 +883,7 @@ class BackfillDB:
             _insert_record(
                 self.source.name, "1D", "re",
                 f"开始同步 1D ({total_symbols} 只标的)",
-                last_bar_time=bar_time, synced_count=0,
+                last_bar_time=bar_time, synced_count=total_symbols,
                 failed_count=0, pool_name=pool, written_count=0,
             )
 
@@ -1061,9 +1061,9 @@ class BackfillDB:
                     self.source.name, "1D", bar_time,
                     status="re",
                     report=f"修复中: {final_count}/{total_symbols}, 失败 {len(failed)}",
-                    synced_count=final_count,
+                    synced_count=total_symbols,
                     failed_count=len(failed), pool_name=pool,
-                    written_count=rw,
+                    written_count=total_symbols - len(failed),
                 )
 
         # ── 最终落盘 cn_last_update ──
@@ -1087,9 +1087,9 @@ class BackfillDB:
         _update_record(
             self.source.name, "1D", bar_time,
             status=final_status, report=report,
-            synced_count=final_count,
+            synced_count=total_symbols,
             failed_count=len(failed), pool_name=pool,
-            written_count=total_written,
+            written_count=total_symbols - len(failed),
         )
 
         if failed:
@@ -1210,8 +1210,9 @@ _MIN_DELAY = 30               # 最小调度延迟（秒），防止 0 延迟
 
 _timers: dict[str, threading.Timer] = {}
 _running = False
-_repair_attempts: dict[str, int] = {}   # task → 连续修复尝试次数
-_MAX_REPAIR_ATTEMPTS = 10                # 循环<10次修复，超过标记 error 退出
+_fresh_attempts: dict[str, int] = {}    # task → 全新拉取后的重试次数（独立计数）
+_repair_attempts: dict[str, int] = {}   # task → 修复循环次数（独立计数）
+_MAX_REPAIR_ATTEMPTS = 9                 # 循环<10次修复（初始1次 + 最多9次重试），超过标记 error 退出
 
 
 def _next_trigger_time(task: str) -> datetime:
@@ -1238,15 +1239,16 @@ def _run_task(task: str):
 
     调度协议:
     1. 非交易日 → 跳过，调度下一个交易日
-    2. 今天已完成 (status=ok|error + 同一交易日) → 正常退出，调度下一个交易日
-    3. 读 cn_last_update 最后时间 > 前一交易日 15:05 (15m) / 17:00 (1D)
-       → 全新拉取 → 全部成功 status=ok 正常退出，否则写 status=re + report，等待120s后重试
-    4. 读 cn_last_update 最后时间 <= 前一交易日 15:05 (15m) / 17:00 (1D) 且 status=re
-       → report 修复 → 循环<10次:
-         全部完成 → status=ok 正常退出
-         部分完成(本次修复>0) → 修改 report + 等待120s
-         未完成(本次修复=0) → 完成度>90% → status=ok 正常退出
-         否则 → status=error 正常退出
+    2. 跨日保护: 调度时和执行时交易日不同 → 重新走启动检查
+    3. 今天已完成 (status=ok|error + 同一交易日) → 正常退出，调度下一个交易日
+    4. 数据交易日 == 当前交易日 → 修复循环（_run_repair）
+       - 全部完成 → status=ok 正常退出
+       - 部分完成(本次修复>0) → 修改 report + 等待120s
+       - 未完成(本次修复=0) → 完成度>90% → status=ok 正常退出
+       - 否则 → status=error 正常退出
+    5. 数据交易日 != 当前交易日（或无数据） → 全新拉取（_run_fresh_pull）
+       - 全部成功 status=ok → 正常退出
+       - 否则 status=re → 等待120s → 进入修复循环
     """
     global _running
     if not _running:
@@ -1262,31 +1264,49 @@ def _run_task(task: str):
             _schedule_next(task, _next_trigger_time(task))
             return
 
-        # ② 读 cn_last_update 最新记录
+        # ② 跨日保护: 调度时和执行时交易日不同 → 重新走启动检查
         doc = _get_last_update("stock_daily_k", task, pool_name="CNStock")
-        last_status = doc.get("status", "") if doc else ""
         last_bar_time = _parse_db_timestamp(doc.get("last_bar_time")) if doc else None
+        if last_bar_time:
+            # 如果数据交易日和当前交易日不同，可能跨日了，重新走启动检查
+            if not _same_trading_day(last_bar_time, now):
+                # 数据不是今天的 → 按当前时段重新判断是否需要执行
+                now_time = now.time()
+                if dt_time(0, 0) <= now_time < dt_time(9, 15):
+                    # 盘前: 数据>=前一交易日 → 已同步
+                    ref_date = datetime.strptime(prev_trading_day(today_str), "%Y-%m-%d").date()
+                    if last_bar_time.date() >= ref_date:
+                        logger.info(f"[调度] {task} 跨日后重新检查(盘前): 数据 {last_bar_time:%m-%d} >= 前一交易日, 正常退出")
+                        _schedule_next(task, _next_trigger_time(task))
+                        return
+                elif dt_time(15, 1) <= now_time <= dt_time(23, 59, 59):
+                    # 盘后: 数据==今天且status=ok|error → 已同步
+                    ref_date = now.date()
+                    last_status = doc.get("status", "")
+                    if last_bar_time.date() == ref_date and last_status in ("ok", "error"):
+                        logger.info(f"[调度] {task} 跨日后重新检查(盘后): 数据 {last_bar_time:%m-%d} == 今天, status={last_status}, 正常退出")
+                        _schedule_next(task, _next_trigger_time(task))
+                        return
+                # 其他情况: 继续执行
 
-        # 今天已完成 (status=ok|error + 数据交易日=今天) → 正常退出
-        # 用 last_bar_time（数据所属交易日）判断，不用 last_updated（同步执行时间）
-        # 否则跨夜运行的同步（如昨日1D修复到今日凌晨完成）会导致今日1D被跳过
+        # ③ 今天已完成 (status=ok|error + 数据交易日=今天) → 正常退出
+        # doc/last_bar_time 已在上面读取，复用
+        last_status = doc.get("status", "") if doc else ""
         if last_status in ("ok", "error") and last_bar_time and _same_trading_day(last_bar_time, now):
             logger.info(f"[调度] {task} 今天已完成 (status={last_status}, bar_time={last_bar_time:%m-%d %H:%M})")
             _schedule_next(task, _next_trigger_time(task))
             return
 
-        # ③ 判断: 数据交易日 > 前一交易日 → 全新拉取; 否则 → 修复
+        # ④ 判断: 数据交易日 == 当前交易日 → 修复; 否则 → 全新拉取
         # 统一用日期比较（15m 和 1D 都适用）
-        prev_td = prev_trading_day(today_str)
-        prev_td_date = datetime.strptime(prev_td, "%Y-%m-%d").date()
-        is_fresh = last_bar_time and last_bar_time.date() > prev_td_date
-        if is_fresh:
-            # ── 全新拉取 ──（数据交易日已超过前一交易日，说明是新交易日）
-            _repair_attempts.pop(task, None)  # 新交易日，重置计数
-            _run_fresh_pull(task, doc, last_status)
-        else:
-            # ── report 修复 ──
+        if last_bar_time and _same_trading_day(last_bar_time, now):
+            # 数据已是今天的 → 内循环修复（补拉失败标的）
             _run_repair(task, doc, last_status)
+        else:
+            # 无数据 或 数据是前一交易日及更早 → 全新拉取
+            _fresh_attempts.pop(task, None)
+            _repair_attempts.pop(task, None)
+            _run_fresh_pull(task, doc, last_status)
 
     except Exception as e:
         logger.error(f"[调度] {task} 异常: {e}", exc_info=True)
@@ -1294,66 +1314,40 @@ def _run_task(task: str):
 
 
 def _run_fresh_pull(task: str, doc: dict | None, last_status: str):
-    """全新拉取: 全部成功 → status=ok 正常退出; 否则 → status=re + report，等待120s后重试。"""
+    """全新拉取: 全部成功 → status=ok 正常退出; 否则 → status=re + report，等待120s后进入修复循环。"""
     logger.info(f"[调度] {task} 全新拉取 (上次状态={last_status or '无记录'})")
     result = stock_daily_k.run_once(task)
     written = result.get("written", 0)
     logger.info(f"[调度] {task} 本轮写入: {written}")
 
     doc = _get_last_update("stock_daily_k", task, pool_name="CNStock")
-    if doc:
-        synced = doc.get("synced_count") or 0
-        failed = doc.get("failed_count") or 0
-        total = synced + failed
-        sync_rate = synced / total if total > 0 else 0
-        status = doc.get("status", "ok")
-        lbt = _parse_db_timestamp(doc.get("last_bar_time"))
-        logger.info(f"[调度] {task} 进度: {synced}/{total} ({sync_rate:.0%}), 失败 {failed}, status={status}")
-
-        if status == "ok":
-            # 全部成功 → 正常退出，调度下一个交易日
-            _repair_attempts.pop(task, None)  # 重置计数
-            logger.info(f"[调度] {task} 全新拉取完成 (status=ok), 正常退出")
-            _schedule_next(task, _next_trigger_time(task))
-        elif written == 0 and sync_rate > 0.9:
-            # 未完成(本次修复=0) → 完成度>90% → status=ok 正常退出
-            if lbt:
-                _update_record(
-                    "stock_daily_k", task, lbt,
-                    status="ok",
-                    report=f"完成度 {sync_rate:.0%} > 90%, 无需继续修复",
-                    synced_count=synced, failed_count=failed,
-                    written_count=doc.get("written_count"), pool_name="CNStock",
-                )
-            _repair_attempts.pop(task, None)
-            logger.info(f"[调度] {task} 完成度 {sync_rate:.0%} > 90%, 正常退出")
-            _schedule_next(task, _next_trigger_time(task))
-        else:
-            # re → 等待120s后重试（带计数器保护，循环<10次）
-            attempts = _repair_attempts.get(task, 0) + 1
-            _repair_attempts[task] = attempts
-            if attempts >= _MAX_REPAIR_ATTEMPTS:
-                logger.info(f"[调度] {task} 连续 {attempts} 次未完成，标记 error 退出")
-                if lbt:
-                    _update_record(
-                        "stock_daily_k", task, lbt,
-                        status="error",
-                        report=f"连续 {attempts} 次未完成: {synced}/{total}, 失败 {failed}",
-                        synced_count=synced, failed_count=failed,
-                        written_count=doc.get("written_count"), pool_name="CNStock",
-                    )
-                _repair_attempts.pop(task, None)
-                _schedule_next(task, _next_trigger_time(task))
-            else:
-                logger.info(f"[调度] {task} 全新拉取未全部完成 (status={status}), {_RETRY_INTERVAL}s 后重试 (第{attempts}次)")
-                _schedule_next(task, delay_seconds=_RETRY_INTERVAL)
-    else:
+    if not doc:
         # 无记录 → 调度下一个交易日
         _schedule_next(task, _next_trigger_time(task))
+        return
+
+    synced = doc.get("synced_count") or 0
+    failed = doc.get("failed_count") or 0
+    written = doc.get("written_count") or 0
+    sync_rate = written / synced if synced > 0 else 0
+    status = doc.get("status", "ok")
+    lbt = _parse_db_timestamp(doc.get("last_bar_time"))
+    logger.info(f"[调度] {task} 进度: 写入{written}/同步{synced} ({sync_rate:.0%}), 失败 {failed}, status={status}")
+
+    if status == "ok":
+        # 全部成功 → 正常退出，调度下一个交易日
+        _fresh_attempts.pop(task, None)
+        logger.info(f"[调度] {task} 全新拉取完成 (status=ok), 正常退出")
+        _schedule_next(task, _next_trigger_time(task))
+    else:
+        # 未全部完成 → status=re + report（run_once 内部已写），等待120s后进入修复循环
+        _fresh_attempts.pop(task, None)  # 进入修复循环，不再用全新拉取计数
+        logger.info(f"[调度] {task} 全新拉取未全部完成 (status={status}), {_RETRY_INTERVAL}s 后进入修复循环")
+        _schedule_next(task, delay_seconds=_RETRY_INTERVAL)
 
 
 def _run_repair(task: str, doc: dict | None, last_status: str):
-    """report 修复流程。
+    """report 修复流程（内循环）。
 
     条件: 上次更新 <= 前一交易日 cutoff 且 status=re
     循环<10次:
@@ -1368,10 +1362,10 @@ def _run_repair(task: str, doc: dict | None, last_status: str):
         _run_fresh_pull(task, doc, last_status)
         return
 
-    synced = doc.get("synced_count") or 0
+    synced = doc.get("synced_count") or 0   # synced_count = 总股票数
     failed = doc.get("failed_count") or 0
-    total = synced + failed
-    sync_rate = synced / total if total > 0 else 0
+    written_db = doc.get("written_count") or 0  # 已写入数
+    sync_rate = written_db / synced if synced > 0 else 0
 
     # 已全部完成 → status=ok 正常退出
     if failed == 0 and synced > 0:
@@ -1380,66 +1374,88 @@ def _run_repair(task: str, doc: dict | None, last_status: str):
         _schedule_next(task, _next_trigger_time(task))
         return
 
-    logger.info(f"[调度] {task} 启动修复 (进度 {synced}/{total}, 失败 {failed})")
-
-    # 记录修复前的 failed 数量，用于判断本次是否有进展
-    pre_repair_failed = failed
+    logger.info(f"[调度] {task} 启动修复 (写入{written_db}/同步{synced}, 失败 {failed})")
 
     result = stock_daily_k.run_once(task)
     written = result.get("written", 0)
 
     doc = _get_last_update("stock_daily_k", task, pool_name="CNStock")
-    if doc:
-        synced = doc.get("synced_count") or 0
-        failed = doc.get("failed_count") or 0
-        total = synced + failed
-        sync_rate = synced / total if total > 0 else 0
-        status = doc.get("status", "")
-        lbt = _parse_db_timestamp(doc.get("last_bar_time"))
-        logger.info(f"[调度] {task} 修复后: {synced}/{total} ({sync_rate:.0%}), 失败 {failed}")
+    if not doc:
+        _schedule_next(task, _next_trigger_time(task))
+        return
 
-        # 全部完成 或 (本次修复=0 且完成度>90%) → status=ok 正常退出
-        if status == "ok" or (written == 0 and sync_rate > 0.9):
-            logger.info(f"[调度] {task} 修复完成, 正常退出")
-            _repair_attempts.pop(task, None)
-            _schedule_next(task, _next_trigger_time(task))
-            return
+    synced = doc.get("synced_count") or 0   # synced_count = 总股票数
+    failed = doc.get("failed_count") or 0
+    written_db = doc.get("written_count") or 0  # 已写入数
+    sync_rate = written_db / synced if synced > 0 else 0
+    status = doc.get("status", "")
+    lbt = _parse_db_timestamp(doc.get("last_bar_time"))
+    logger.info(f"[调度] {task} 修复后: 写入{written_db}/同步{synced} ({sync_rate:.0%}), 失败 {failed}")
 
-        # 本次修复=0 且未完成 → status=error 正常退出
-        if written == 0 and failed >= pre_repair_failed:
-            logger.info(f"[调度] {task} 修复无进展 (本次修复={written}), 标记 error, 正常退出")
+    # 全部完成 → status=ok 正常退出
+    if status == "ok" or (failed == 0 and synced > 0):
+        logger.info(f"[调度] {task} 修复完成, 正常退出")
+        _repair_attempts.pop(task, None)
+        _schedule_next(task, _next_trigger_time(task))
+        return
+
+    # 未完成(本次修复=0) → 完成度>90% → status=ok 正常退出; 否则 → status=error 正常退出
+    if written == 0:
+        if sync_rate > 0.9:
+            logger.info(f"[调度] {task} 修复无进展但完成度 {sync_rate:.0%} > 90%, 正常退出")
             if lbt:
                 _update_record(
                     "stock_daily_k", task, lbt,
-                    status="error",
-                    report=f"修复无进展: {synced}/{total}, 失败 {failed}",
+                    status="ok",
+                    report=f"完成度 {sync_rate:.0%} > 90%, 无需继续修复",
                     synced_count=synced, failed_count=failed,
-                    written_count=doc.get("written_count"), pool_name="CNStock",
-                )
-            _repair_attempts.pop(task, None)
-            _schedule_next(task, _next_trigger_time(task))
-            return
-
-        # 部分完成(本次修复>0) → 检查重试次数后决定继续或退出
-        attempts = _repair_attempts.get(task, 0) + 1
-        _repair_attempts[task] = attempts
-        if attempts >= _MAX_REPAIR_ATTEMPTS:
-            logger.info(f"[调度] {task} 循环 {attempts} 次修复仍未完成, 标记 error 退出")
-            if lbt:
-                _update_record(
-                    "stock_daily_k", task, lbt,
-                    status="error",
-                    report=f"循环 {attempts} 次修复未完成: {synced}/{total}, 失败 {failed}",
-                    synced_count=synced, failed_count=failed,
-                    written_count=doc.get("written_count"), pool_name="CNStock",
+                    written_count=written_db, pool_name="CNStock",
                 )
             _repair_attempts.pop(task, None)
             _schedule_next(task, _next_trigger_time(task))
         else:
-            logger.info(f"[调度] {task} 修复部分完成, {_RETRY_INTERVAL}s 后重试 (第{attempts}次)")
-            _schedule_next(task, delay_seconds=_RETRY_INTERVAL)
-    else:
+            logger.info(f"[调度] {task} 修复无进展且完成度 {sync_rate:.0%} <= 90%, 标记 error, 正常退出")
+            if lbt:
+                _update_record(
+                    "stock_daily_k", task, lbt,
+                    status="error",
+                    report=f"修复无进展: 写入{written_db}/同步{synced}, 失败 {failed}",
+                    synced_count=synced, failed_count=failed,
+                    written_count=written_db, pool_name="CNStock",
+                )
+            _repair_attempts.pop(task, None)
+            _schedule_next(task, _next_trigger_time(task))
+        return
+
+    # 部分完成(本次修复>0) → 修改 report + 检查重试次数后决定继续或退出
+    attempts = _repair_attempts.get(task, 0) + 1
+    _repair_attempts[task] = attempts
+
+    # 修改 report（设计要求: 部分完成 → 修改 report）
+    if lbt:
+        _update_record(
+            "stock_daily_k", task, lbt,
+            status="re",
+            report=f"修复中: 写入{written_db}/同步{synced}, 失败 {failed}",
+            synced_count=synced, failed_count=failed,
+            written_count=written_db, pool_name="CNStock",
+        )
+
+    if attempts >= _MAX_REPAIR_ATTEMPTS:
+        logger.info(f"[调度] {task} 循环 {attempts} 次修复仍未完成, 标记 error 退出")
+        if lbt:
+            _update_record(
+                "stock_daily_k", task, lbt,
+                status="error",
+                report=f"循环 {attempts} 次修复未完成: 写入{written_db}/同步{synced}, 失败 {failed}",
+                synced_count=synced, failed_count=failed,
+                written_count=written_db, pool_name="CNStock",
+            )
+        _repair_attempts.pop(task, None)
         _schedule_next(task, _next_trigger_time(task))
+    else:
+        logger.info(f"[调度] {task} 修复部分完成, {_RETRY_INTERVAL}s 后重试 (第{attempts}次)")
+        _schedule_next(task, delay_seconds=_RETRY_INTERVAL)
 
 
 def _schedule_next(task: str, trigger_at: datetime = None, delay_seconds: float = None):
@@ -1529,13 +1545,25 @@ def start_scheduler():
     for task in ("15m", "1D"):
         doc = _get_last_update("stock_daily_k", task, pool_name="CNStock")
         last_bar_time = _parse_db_timestamp(doc.get("last_bar_time")) if doc else None
+        last_status = doc.get("status", "") if doc else ""
 
-        if last_bar_time and check_fn(last_bar_time):
-            logger.info(f"[调度] {task} 启动检查({check_label}): 数据交易日 {last_bar_time:%m-%d} {exit_label}, 正常退出")
-            _schedule_next(task, _next_trigger_time(task))
+        if check_label == "盘后":
+            # 盘后: date==今天 且 status=ok|error → 正常退出; 否则 → 等待300s后核心启动
+            if last_bar_time and check_fn(last_bar_time) and last_status in ("ok", "error"):
+                logger.info(f"[调度] {task} 启动检查({check_label}): 数据交易日 {last_bar_time:%m-%d} {exit_label}, status={last_status}, 正常退出")
+                _schedule_next(task, _next_trigger_time(task))
+            else:
+                reason = "无记录" if not last_bar_time else f"{last_bar_time:%m-%d}, status={last_status}"
+                logger.info(f"[调度] {task} 启动检查({check_label}): {reason} {miss_label}, {_INITIAL_DELAY}s 后核心启动")
+                _schedule_next(task, delay_seconds=_INITIAL_DELAY)
         else:
-            logger.info(f"[调度] {task} 启动检查({check_label}): 数据交易日 {'无记录' if not last_bar_time else f'{last_bar_time:%m-%d}'} {miss_label}, {_INITIAL_DELAY}s 后执行")
-            _schedule_next(task, delay_seconds=_INITIAL_DELAY)
+            # 盘前: date>=前一交易日 → 正常退出; 否则 → 等待300s后核心启动
+            if last_bar_time and check_fn(last_bar_time):
+                logger.info(f"[调度] {task} 启动检查({check_label}): 数据交易日 {last_bar_time:%m-%d} {exit_label}, 正常退出")
+                _schedule_next(task, _next_trigger_time(task))
+            else:
+                logger.info(f"[调度] {task} 启动检查({check_label}): 数据交易日 {'无记录' if not last_bar_time else f'{last_bar_time:%m-%d}'} {miss_label}, {_INITIAL_DELAY}s 后核心启动")
+                _schedule_next(task, delay_seconds=_INITIAL_DELAY)
 
 
 def stop_scheduler():

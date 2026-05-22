@@ -259,7 +259,7 @@ class EastMoneyDataSource:
     """
 
     name = "eastmoney"
-    priority = 25
+    priority = 75
     max_concurrency = MAX_CONCURRENCY
     min_interval = 0.0
     jitter_min = 0.0
@@ -267,13 +267,13 @@ class EastMoneyDataSource:
 
     capabilities = {
         "kline": True,
-        "kline_priority": 25,
+        "kline_priority": 75,
         "kline_tf": {"1m", "5m", "15m", "30m", "1H", "1D", "1W"},
         "kline_batch": True,
         "quote": True,
-        "quote_priority": 20,
+        "quote_priority": 70,
         "batch_quote": True,
-        "batch_quote_priority": 5,
+        "batch_quote_priority": 65,
         "hk": False,
         "markets": {"CNStock"},
     }
