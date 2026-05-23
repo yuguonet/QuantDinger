@@ -90,6 +90,183 @@ def extract_features(group):
     return feat
 
 
+def extract_pre_daily_features(group, max_days=10):
+    """提取D0前逐日特征 (D-1, D-2, ... D-max_days 各自独立)"""
+    board = group[0].get("board", "")
+    threshold = 0.198 if board in ("创业板", "科创板") else 0.098
+    streak = int(group[0]["run_n_limit_ups"])
+
+    fld = group[0]["run_first_limit_date"]
+    fl_pos = None
+    for i, r in enumerate(group):
+        if r["time"] == fld:
+            fl_pos = i
+            break
+    if fl_pos is None or fl_pos < 1:
+        return None
+
+    daily = {}
+    for offset in range(1, max_days + 1):
+        idx = fl_pos - offset
+        if idx < 1:
+            break
+        row = group[idx]
+        prev = group[idx - 1]
+        close = float(row["close"])
+        prev_close = float(prev["close"])
+        vol = float(row["volume"])
+        prev_vol = float(prev["volume"])
+        high = float(row["high"])
+        low = float(row["low"])
+        if prev_close <= 0 or prev_vol <= 0:
+            continue
+
+        daily[offset] = {
+            "ret": (close / prev_close - 1) * 100,
+            "range": (high - low) / prev_close * 100,
+            "vol_ratio": vol / prev_vol,
+            "is_up": 1 if close > prev_close else 0,
+            "body_pct": abs(close - float(row["open"])) / prev_close * 100,
+        }
+    return {"code": group[0]["code"], "streak": streak, "daily": daily}
+
+
+def analyze_pre_daily(groups):
+    """D0前逐日分析: D-1, D-2, ... 各自独立统计, 续板vs断板"""
+    print(f"\n{'='*70}")
+    print(f"  D0前逐日分析 (续板D0 vs 断板D0)")
+    print(f"{'='*70}")
+
+    daily_data = defaultdict(lambda: {"cont": [], "stop": []})
+    for key, group in groups.items():
+        info = extract_pre_daily_features(group)
+        if not info:
+            continue
+        bucket = "cont" if info["streak"] >= 2 else "stop"
+        for offset, feat in info["daily"].items():
+            daily_data[offset][bucket].append(feat)
+
+    print(f"\n  {'日期':<8} {'续板均涨幅':>10} {'断板均涨幅':>10} {'差异':>8} {'续板上涨%':>10} {'断板上涨%':>10} {'续板量比':>10} {'断板量比':>10}")
+    print(f"  {'─'*76}")
+    for offset in sorted(daily_data.keys()):
+        data = daily_data[offset]
+        cont, stop = data["cont"], data["stop"]
+        if len(cont) < 10 or len(stop) < 10:
+            continue
+        c_ret = sum(x["ret"] for x in cont) / len(cont)
+        s_ret = sum(x["ret"] for x in stop) / len(stop)
+        c_up = sum(x["is_up"] for x in cont) / len(cont) * 100
+        s_up = sum(x["is_up"] for x in stop) / len(stop) * 100
+        c_vol = sum(x["vol_ratio"] for x in cont) / len(cont)
+        s_vol = sum(x["vol_ratio"] for x in stop) / len(stop)
+        diff = c_ret - s_ret
+        star = "⭐" if abs(diff) > 0.5 else "  "
+        print(f"  {star}D-{offset:<5} {c_ret:>+9.2f}% {s_ret:>+9.2f}% {diff:>+7.2f}% {c_up:>9.1f}% {s_up:>9.1f}% {c_vol:>10.2f} {s_vol:>10.2f}")
+
+    # 振幅
+    print(f"\n  振幅%对比:")
+    print(f"  {'日期':<8} {'续板均振幅':>10} {'断板均振幅':>10} {'差异':>8}")
+    print(f"  {'─'*38}")
+    for offset in sorted(daily_data.keys()):
+        data = daily_data[offset]
+        cont, stop = data["cont"], data["stop"]
+        if len(cont) < 10 or len(stop) < 10:
+            continue
+        c_rng = sum(x["range"] for x in cont) / len(cont)
+        s_rng = sum(x["range"] for x in stop) / len(stop)
+        diff = c_rng - s_rng
+        star = "⭐" if abs(diff) > 0.3 else "  "
+        print(f"  {star}D-{offset:<5} {c_rng:>9.2f}% {s_rng:>9.2f}% {diff:>+7.2f}%")
+
+
+def analyze_per_level(groups):
+    """逐板分析: 每个板数平台独立, 续板vs断板横向共性"""
+    print(f"\n{'='*70}")
+    print(f"  逐板横向共性分析")
+    print(f"{'='*70}")
+
+    # 按板数分组
+    platforms = defaultdict(lambda: {"cont": [], "stop": []})
+    for key, group in groups.items():
+        feat = extract_features(group)
+        if not feat:
+            continue
+        streak = feat["streak"]
+        # 续板 = streak >= 当前板数+1, 即还能继续
+        # 但这里我们只有最终streak, 需要按"如果在第N板, 是否会续板"来分析
+        # 简化: 对于每个板数level, streak > level = 续板, streak == level = 断板
+        for level in range(1, min(streak + 1, 8)):
+            continued = streak > level
+            bucket = "cont" if continued else "stop"
+            entry = dict(feat)
+            entry["at_level"] = level
+            platforms[level][bucket].append(entry)
+
+    bool_features = [
+        ("fl_gap_pct", "高开>=3%", lambda v: v >= 3),
+        ("fl_gap_pct", "高开>=5%", lambda v: v >= 5),
+        ("fl_gap_pct", "高开>=8%", lambda v: v >= 8),
+        ("fl_amplitude_pct", "窄幅(振幅<5%)", lambda v: v < 5),
+        ("fl_amplitude_pct", "窄幅(振幅<8%)", lambda v: v < 8),
+        ("fl_vol_ratio", "缩量(量比<1x)", lambda v: v < 1.0),
+        ("fl_vol_ratio", "缩量(量比<1.5x)", lambda v: v < 1.5),
+        ("fl_body_ratio", "小实体(<0.5)", lambda v: v < 0.5),
+        ("fl_body_ratio", "小实体(<0.7)", lambda v: v < 0.7),
+    ]
+
+    for level in sorted(platforms.keys()):
+        if level > 6:
+            break
+        cont = platforms[level]["cont"]
+        stop = platforms[level]["stop"]
+        if len(cont) < 10 or len(stop) < 10:
+            continue
+
+        total = len(cont) + len(stop)
+        cont_rate = len(cont) / total * 100
+
+        print(f"\n  ── 第{level}板 ──  续板={len(cont)}  断板={len(stop)}  续板率={cont_rate:.1f}%")
+        print(f"  {'特征':<22} {'续板中占比':>10} {'断板中占比':>10} {'差异':>8}")
+        print(f"  {'─'*52}")
+
+        results = []
+        for feat_name, label, fn in bool_features:
+            c_pct = sum(1 for x in cont if feat_name in x and fn(x[feat_name])) / len(cont) * 100
+            s_pct = sum(1 for x in stop if feat_name in x and fn(x[feat_name])) / len(stop) * 100
+            diff = c_pct - s_pct
+            results.append((label, c_pct, s_pct, diff))
+
+        results.sort(key=lambda x: -abs(x[3]))
+        for label, c_pct, s_pct, diff in results:
+            signal = "✅" if diff > 5 else "❌" if diff < -5 else "  "
+            print(f"  {signal} {label:<20} {c_pct:>9.1f}% {s_pct:>9.1f}% {diff:>+7.1f}%")
+
+        # 数值特征
+        num_features = [
+            ("fl_return_pct", "涨幅%"),
+            ("fl_gap_pct", "高开%"),
+            ("fl_amplitude_pct", "振幅%"),
+            ("fl_vol_ratio", "量比"),
+            ("prev5_return_pct", "前5日涨幅%"),
+        ]
+        print(f"\n  {'特征':<22} {'续板均值':>10} {'断板均值':>10} {'区分度':>8}")
+        print(f"  {'─'*52}")
+        from math import sqrt
+        for feat_name, label in num_features:
+            c_vals = [x[feat_name] for x in cont if feat_name in x and x[feat_name] is not None]
+            s_vals = [x[feat_name] for x in stop if feat_name in x and x[feat_name] is not None]
+            if len(c_vals) < 5 or len(s_vals) < 5:
+                continue
+            c_mean = sum(c_vals) / len(c_vals)
+            s_mean = sum(s_vals) / len(s_vals)
+            c_var = sum((v - c_mean) ** 2 for v in c_vals) / len(c_vals)
+            s_var = sum((v - s_mean) ** 2 for v in s_vals) / len(s_vals)
+            pooled = sqrt((c_var + s_var) / 2) if (c_var + s_var) > 0 else 1
+            d = (c_mean - s_mean) / pooled
+            star = "⭐" if abs(d) >= 0.3 else "  " if abs(d) >= 0.15 else "  "
+            print(f"  {star}{label:<20} {c_mean:>10.2f} {s_mean:>10.2f} {d:>+8.3f}")
+
+
 def analyze_day_groups(csv_path):
     """按日期分组，同一天涨停的股票横向比较"""
     print(f"\n{'='*70}")
@@ -319,9 +496,22 @@ def analyze_day_groups(csv_path):
 def main():
     parser = argparse.ArgumentParser(description="横向过滤分析")
     parser.add_argument("--csv", default="analysis_output/dragon_ohlcv.csv")
+    parser.add_argument("--pre-daily", action="store_true", help="D0前逐日分析")
+    parser.add_argument("--per-level", action="store_true", help="逐板横向共性分析")
+    parser.add_argument("--all", action="store_true", help="运行全部分析")
 
     args = parser.parse_args()
+
+    # 原有分析
     analyze_day_groups(args.csv)
+
+    # 新增分析
+    if args.pre_daily or args.per_level or args.all:
+        groups = load_groups(args.csv)
+        if args.pre_daily or args.all:
+            analyze_pre_daily(groups)
+        if args.per_level or args.all:
+            analyze_per_level(groups)
 
 
 if __name__ == "__main__":
