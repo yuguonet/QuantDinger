@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-龙回头 — 独立策略
+龙回头 - 独立策略
 
 逻辑:
   1. D-N: 股票涨停 (龙)
@@ -142,8 +142,8 @@ def run_backtest(bars, entry_idx, entry_price, hold_days=20, stop_loss=-10.0, tr
     }
 
 def strategy_dragon_callback(bars, code, min_pullback_days=2, min_rebound_pct=5.0,
-                             min_vol_ratio=2.0, max_upper_shadow=0.5,
-                             hold_days=20, stop_loss=-10.0, trailing_stop=-8.0,
+                             min_vol_ratio=1.5, max_upper_shadow=0.5,
+                             hold_days=20, stop_loss=-5.0, trailing_stop=-5.0,
                              use_preload_filter=True):
     """
     龙回头独立策略:
@@ -151,18 +151,18 @@ def strategy_dragon_callback(bars, code, min_pullback_days=2, min_rebound_pct=5.
     """
     board_type = get_board_type(code)
     threshold = 0.098 if board_type == "main" else 0.198
-    
+
     limit_ups = find_limit_ups(bars, board_type)
     trades = []
     used_ranges = []  # 避免同一段涨停重复触发
-    
+
     for lu_idx in limit_ups:
         # 从涨停日往后找: 回调期 + 弱转强日
         # 回调期: 至少min_pullback_days天, 期间收盘<涨停日收盘
         lu_close = bars[lu_idx]['close']
         lu_high = bars[lu_idx]['high']
         lu_vol = bars[lu_idx]['volume']
-        
+
         # 找回调期结束点
         pullback_end = None
         for j in range(lu_idx + 1, min(lu_idx + 20, len(bars))):
@@ -175,30 +175,30 @@ def strategy_dragon_callback(bars, code, min_pullback_days=2, min_rebound_pct=5.
             else:
                 # 涨停后直接继续涨, 不是龙回头
                 break
-        
+
         if pullback_end is None:
             continue
-        
+
         # 从回调结束后找弱转强日: 涨≥5%
         for j in range(pullback_end + 1, min(pullback_end + 10, len(bars))):
             prev_c = bars[j-1]['close']
             if prev_c <= 0: continue
             chg = (bars[j]['close'] / prev_c - 1) * 100
-            
+
             if chg >= min_rebound_pct:
                 # 弱转强日! 做V1质量检查
                 d0_idx = j
                 d0 = bars[d0_idx]
                 d0_prev = bars[d0_idx - 1]
                 d0_prev2 = bars[d0_idx - 2] if d0_idx >= 2 else None
-                
+
                 # 检查是否已被使用
                 skip = False
                 for (s, e) in used_ranges:
                     if abs(d0_idx - s) <= 2 or abs(d0_idx - e) <= 2:
                         skip = True; break
                 if skip: continue
-                
+
                 # V1质量检查 (用d0本身的涨停质量)
                 d0_close = d0['close']
                 d0_high = d0['high']
@@ -206,13 +206,13 @@ def strategy_dragon_callback(bars, code, min_pullback_days=2, min_rebound_pct=5.
                 d0_vol = d0['volume']
                 d0_prev_close = d0_prev['close']
                 d0_prev_vol = d0_prev['volume']
-                
+
                 if d0_prev_close <= 0: continue
-                
+
                 # 量比
                 vol_ratio = d0_vol / d0_prev_vol if d0_prev_vol > 0 else 0
                 if vol_ratio < min_vol_ratio: continue
-                
+
                 # 上影线
                 if d0_prev2:
                     ref = d0_prev2['close']
@@ -220,11 +220,11 @@ def strategy_dragon_callback(bars, code, min_pullback_days=2, min_rebound_pct=5.
                     ref = d0_prev_close
                 upper_shadow = (d0_high - d0_close) / ref * 100 if ref > 0 else 99
                 if upper_shadow >= max_upper_shadow: continue
-                
+
                 # 排除一字板
                 bar_range = (d0_high - d0_low) / ref * 100 if ref > 0 else 0
                 if bar_range < 0.2: continue
-                
+
                 # 预埋信号 (在涨停日和回调期间找)
                 has_preload = False
                 preload_type = None
@@ -236,26 +236,39 @@ def strategy_dragon_callback(bars, code, min_pullback_days=2, min_rebound_pct=5.
                         preload_type = sigs[0]
                         preload_date = bars[k]['time']
                         break
-                
+
                 if use_preload_filter and not has_preload:
                     continue
-                
+
                 # D1买入
                 if d0_idx + 1 >= len(bars): continue
                 d1 = bars[d0_idx + 1]
                 entry_price = d1['open']
                 if entry_price <= 0: continue
-                
+
                 # D1收阴排除 (龙回头的D1判断)
                 d1_change = (d1['close'] / d0_close - 1) * 100
                 if d1_change < 0:
                     continue
-                
+
                 result = run_backtest(bars, d0_idx + 1, entry_price, hold_days, stop_loss, trailing_stop)
                 if not result: continue
-                
+
+                # V1确认加分: D1/D2放量收阳
+                v1_score = 0
+                if d0_idx + 1 < len(bars):
+                    d1_bar = bars[d0_idx + 1]
+                    d1_vr = d1_bar['volume'] / bars[d0_idx]['volume'] if bars[d0_idx]['volume'] > 0 else 0
+                    if d1_vr >= 2.0 and d1_bar['close'] > d0_close:
+                        v1_score += 1
+                if d0_idx + 2 < len(bars):
+                    d2_bar = bars[d0_idx + 2]
+                    d2_vr = d2_bar['volume'] / bars[d0_idx + 1]['volume'] if bars[d0_idx + 1]['volume'] > 0 else 0
+                    if d2_vr >= 2.0 and d2_bar['close'] > bars[d0_idx + 1]['close']:
+                        v1_score += 1
+
                 used_ranges.append((lu_idx, d0_idx))
-                
+
                 trades.append({
                     'code': code, 'board': get_board_name(code),
                     'path': 'dragon_callback',
@@ -273,10 +286,11 @@ def strategy_dragon_callback(bars, code, min_pullback_days=2, min_rebound_pct=5.
                     'has_preload': has_preload,
                     'preload_type': preload_type,
                     'preload_date': preload_date,
+                    'v1_score': v1_score,
                     **result,
                 })
                 break  # 一个涨停日只触发一次
-    
+
     return trades
 
 # 同时跑V1作为对比
@@ -286,7 +300,7 @@ def strategy_v1(bars, code, min_vol_ratio=2.0, max_upper_shadow=0.5,
     """V1基线策略 (带D1收阴排除)"""
     board_type = get_board_type(code)
     threshold = 0.098 if board_type == "main" else 0.198
-    
+
     result = []
     for i in range(2, len(bars)):
         prev_c = bars[i-1]['close']
@@ -296,7 +310,7 @@ def strategy_v1(bars, code, min_vol_ratio=2.0, max_upper_shadow=0.5,
         prev2_c = bars[i-2]['close']
         if prev2_c > 0 and (bars[i-1]['close'] / prev2_c - 1) >= threshold * 0.98:
             continue
-        
+
         fl = bars[i]
         fl_close = fl['close']
         fl_high = fl['high']
@@ -304,16 +318,24 @@ def strategy_v1(bars, code, min_vol_ratio=2.0, max_upper_shadow=0.5,
         fl_prev_close = bars[i-1]['close']
         fl_prev_vol = bars[i-1]['volume']
         ref = bars[i-2]['close'] if i >= 2 else fl_prev_close
-        
+
         if ref <= 0: continue
-        
+
         bar_range = (fl_high - fl['low']) / ref * 100
         if bar_range < 0.2: continue
         vol_ratio = fl_vol / fl_prev_vol if fl_prev_vol > 0 else 0
         if vol_ratio < min_vol_ratio: continue
         upper_shadow = (fl_high - fl_close) / ref * 100
         if upper_shadow >= max_upper_shadow: continue
-        
+
+        # D0层过滤: 前5天振幅<3%
+        if i >= 7:
+            prev5_closes = [bars[j]['close'] for j in range(i-5, i)]
+            p5_max = max(prev5_closes); p5_min = min(prev5_closes)
+            prev5_range = (p5_max/p5_min - 1)*100 if p5_min > 0 else 99
+            if prev5_range > 3:
+                continue
+
         has_preload = False
         preload_type = None
         for k in range(max(0, i - 10), i):
@@ -322,21 +344,27 @@ def strategy_v1(bars, code, min_vol_ratio=2.0, max_upper_shadow=0.5,
                 has_preload = True
                 preload_type = sigs[0]
                 break
-        
+
         if use_preload_filter and not has_preload:
             continue
-        
+
         if i + 1 >= len(bars): continue
         d1 = bars[i + 1]
         entry_price = d1['open']
         if entry_price <= 0: continue
-        
+
+        # D1开盘涨幅过滤 (板块分离)
+        d1_gap = (entry_price / fl_close - 1) * 100
+        max_d1_gap = 2.0 if board_type == "main" else 5.0
+        if d1_gap > max_d1_gap:
+            continue
+
         d1_change = (d1['close'] / fl_close - 1) * 100
         if d1_change < 0: continue  # D1收阴排除
-        
+
         bt = run_backtest(bars, i + 1, entry_price, hold_days, stop_loss, trailing_stop)
         if not bt: continue
-        
+
         result.append({
             'code': code, 'board': get_board_name(code),
             'path': 'v1', 'path_label': 'V1',
@@ -349,7 +377,7 @@ def strategy_v1(bars, code, min_vol_ratio=2.0, max_upper_shadow=0.5,
             'preload_type': preload_type,
             **bt,
         })
-    
+
     return result
 
 # ================================================================
@@ -393,50 +421,50 @@ def main():
     parser.add_argument("--pullback", type=int, default=2, help="最少回调天数")
     parser.add_argument("--rebound", type=float, default=5.0, help="弱转强最低涨幅%")
     args = parser.parse_args()
-    
+
     codes = [c.strip() for c in args.codes.split(",") if c.strip()] if args.codes else TEST_CODES
     use_preload = not args.no_preload
-    
+
     print(f"{'=' * 80}")
     print(f"龙回头独立策略")
     print(f"{'=' * 80}")
     print(f"配置: 回调≥{args.pullback}天 | 弱转强≥{args.rebound}% | V2预埋: {'开' if use_preload else '关'}")
     print(f"股票: {len(codes)}只")
-    
+
     dc_trades = []
     v1_trades = []
     success = 0
-    
+
     for i, code in enumerate(codes):
         print(f"[{i+1}/{len(codes)}] {code} ({get_board_name(code)})", end=" ", flush=True)
         bars = fetch_kline(code, args.days)
         if not bars:
             print("❌"); continue
         print(f"✓{len(bars)}根", end=" ", flush=True)
-        
+
         dc = strategy_dragon_callback(bars, code,
                                        min_pullback_days=args.pullback,
                                        min_rebound_pct=args.rebound,
                                        use_preload_filter=use_preload)
         dc_trades.extend(dc)
-        
+
         v1 = strategy_v1(bars, code, use_preload_filter=use_preload)
         v1_trades.extend(v1)
-        
+
         print(f"→ 龙回头{len(dc)}笔 V1{len(v1)}笔")
         success += 1
         time.sleep(0.3)
-    
+
     # ===== 输出 =====
     print(f"\n{'=' * 80}")
     print(f"结果: {success}只")
     print(f"{'=' * 80}")
-    
+
     if dc_trades or v1_trades:
         print(f"\n📊 总览:")
         print_stats(dc_trades, "龙回头")
         print_stats(v1_trades, "V1(对比)")
-        
+
         # 龙回头信号分析
         if dc_trades:
             print(f"\n  龙回头预埋信号:")
@@ -446,44 +474,53 @@ def main():
                 by_sig[sig].append(t)
             for sig, ts in sorted(by_sig.items(), key=lambda x: -len(x[1])):
                 print_stats(ts, f"    {sig}")
-            
+
+            # V1确认得分
+            print(f"\n  V1确认(D1/D2放量收阳):")
+            for score in [2, 1, 0]:
+                seg = [t for t in dc_trades if t.get('v1_score', 0) == score]
+                if seg:
+                    stars = '⭐' * score if score else '  '
+                    print_stats(seg, f"    {stars} 得分{score}")
+
             # 回调天数分布
             print(f"\n  回调天数分布:")
             for lo, hi, label in [(2,4,"2-3天"), (4,7,"4-6天"), (7,14,"7-13天"), (14,20,"14-20天")]:
                 seg = [t for t in dc_trades if lo <= t['pullback_days'] < hi]
                 if seg:
                     print_stats(seg, f"    {label}")
-            
+
             # 弱转强涨幅分布
             print(f"\n  弱转强涨幅分布:")
             for lo, hi, label in [(5,8,"5-8%"), (8,10,"8-10%"), (10,20,"10-20%")]:
                 seg = [t for t in dc_trades if lo <= t['d0_change'] < hi]
                 if seg:
                     print_stats(seg, f"    {label}")
-            
+
             # TOP5
             print(f"\n  🏆 龙回头TOP5:")
             for t in sorted(dc_trades, key=lambda x: -x['peak_return_pct'])[:5]:
                 print(f"    {t['code']} 涨停{t['lu_date']} 回调{t['pullback_days']}天 → {t['d0_date']}弱转强{t['d0_change']:+.1f}% → {t['entry_date']}买 收益{t['return_pct']:+.1f}% 峰值{t['peak_return_pct']:+.1f}%")
-            
+
             print(f"\n  💀 龙回头BOTTOM5:")
             for t in sorted(dc_trades, key=lambda x: x['return_pct'])[:5]:
                 print(f"    {t['code']} 涨停{t['lu_date']} 回调{t['pullback_days']}天 → {t['d0_date']}弱转强{t['d0_change']:+.1f}% → {t['entry_date']}买 收益{t['return_pct']:+.1f}% 峰值{t['peak_return_pct']:+.1f}%")
-        
+
         # 合并统计
         all_trades = dc_trades + v1_trades
         if len(dc_trades) > 0 and len(v1_trades) > 0:
             print(f"\n📊 合并(龙回头+V1):")
             print_stats(all_trades, "合并")
-    
+
     # 交易明细
     if args.all_trades and dc_trades:
         print(f"\n📋 龙回头交易明细:")
         for t in sorted(dc_trades, key=lambda x: x['entry_date']):
-            print(f"  {t['code']:<8} {t['board']:<6} 涨停{t['lu_date']} → 回调{t['pullback_days']}天 → "
+            v1s = '⭐' * t.get('v1_score', 0)
+            print(f"  {v1s or '  '} {t['code']:<8} {t['board']:<6} 涨停{t['lu_date']} → 回调{t['pullback_days']}天 → "
                   f"{t['d0_date']}弱转强{t['d0_change']:>+5.1f}% → {t['entry_date']}买{t['entry_price']:>7.2f} "
                   f"收益{t['return_pct']:>+6.2f}% 峰值{t['peak_return_pct']:>+6.2f}%")
-    
+
     # 导出
     all_out = dc_trades + v1_trades
     if all_out:
