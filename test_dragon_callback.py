@@ -307,9 +307,14 @@ def strategy_v1(bars, code, min_vol_ratio=2.0, max_upper_shadow=0.5,
         if prev_c <= 0: continue
         ret = (bars[i]['close'] / prev_c - 1)
         if ret < threshold * 0.98: continue
-        prev2_c = bars[i-2]['close']
-        if prev2_c > 0 and (bars[i-1]['close'] / prev2_c - 1) >= threshold * 0.98:
-            continue
+        # 前10天不是涨停（排除连板中间板，只取第一板）
+        skip = False
+        for k in range(1, 11):
+            if i - k < 1: break
+            prev_k_c = bars[i-k-1]['close']
+            if prev_k_c > 0 and (bars[i-k]['close'] / prev_k_c - 1) >= threshold * 0.98:
+                skip = True; break
+        if skip: continue
 
         fl = bars[i]
         fl_close = fl['close']
@@ -321,20 +326,14 @@ def strategy_v1(bars, code, min_vol_ratio=2.0, max_upper_shadow=0.5,
 
         if ref <= 0: continue
 
-        bar_range = (fl_high - fl['low']) / ref * 100
-        if bar_range < 0.2: continue
         vol_ratio = fl_vol / fl_prev_vol if fl_prev_vol > 0 else 0
-        if vol_ratio < min_vol_ratio: continue
         upper_shadow = (fl_high - fl_close) / ref * 100
         if upper_shadow >= max_upper_shadow: continue
 
-        # D0层过滤: 前5天振幅<3%
-        if i >= 7:
-            prev5_closes = [bars[j]['close'] for j in range(i-5, i)]
-            p5_max = max(prev5_closes); p5_min = min(prev5_closes)
-            prev5_range = (p5_max/p5_min - 1)*100 if p5_min > 0 else 99
-            if prev5_range > 3:
-                continue
+        # 跳空>5% + 量比<1.5x
+        gap_pct = (fl['open'] / fl_prev_close - 1) * 100 if fl_prev_close > 0 else 0
+        if gap_pct <= 5.0 or vol_ratio >= 1.5:
+            continue
 
         has_preload = False
         preload_type = None
@@ -353,10 +352,10 @@ def strategy_v1(bars, code, min_vol_ratio=2.0, max_upper_shadow=0.5,
         entry_price = d1['open']
         if entry_price <= 0: continue
 
-        # D1开盘涨幅过滤 (板块分离)
+        # D1开盘涨幅过滤 (板块分离) - 低开不买
         d1_gap = (entry_price / fl_close - 1) * 100
-        max_d1_gap = 2.0 if board_type == "main" else 5.0
-        if d1_gap > max_d1_gap:
+        min_d1_gap = -2.0 if board_type == "main" else -5.0
+        if d1_gap < min_d1_gap:
             continue
 
         d1_change = (d1['close'] / fl_close - 1) * 100
