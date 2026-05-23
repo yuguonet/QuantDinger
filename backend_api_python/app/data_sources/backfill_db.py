@@ -477,8 +477,15 @@ class BackfillDB:
                     "written": 0, "status": "ok", "report": f"不支持的周期: {tf}",
                 }
         except Exception as e:
-            report = f"同步异常: {e}"
-            logger.error(f"[同步] {self.source.name} tf={tf} {report}")
+            error_msg = f"同步异常: {e}"
+            logger.error(f"[同步] {self.source.name} tf={tf} {error_msg}")
+            # 保留 report 中已有的失败标的，避免异常导致失败列表丢失
+            existing_report = existing_doc.get("report", "") if existing_doc else ""
+            existing_failed_syms = _extract_failed_symbols_from_report(existing_report)
+            if existing_failed_syms:
+                report = f"{error_msg}; 失败标的({len(existing_failed_syms)}): {','.join(existing_failed_syms[:50])}"
+            else:
+                report = error_msg
             if existing_lbt:
                 _update_record(self.source.name, tf, existing_lbt,
                               status="re", report=report, pool_name=pool,
@@ -810,7 +817,7 @@ class BackfillDB:
                     report=f"修复中: {final_count}/{total_symbols}, 失败 {len(failed)}",
                     synced_count=total_symbols,
                     failed_count=len(failed), pool_name=pool,
-                    written_count=total_symbols - len(failed),
+                    written_count=final_count,
                 )
 
         # ── 最终落盘 cn_last_update ──
@@ -836,7 +843,7 @@ class BackfillDB:
             status=final_status, report=report,
             synced_count=total_symbols,
             failed_count=len(failed), pool_name=pool,
-            written_count=total_symbols - len(failed),
+            written_count=final_count,
         )
 
         if failed:
@@ -1097,7 +1104,7 @@ class BackfillDB:
                     report=f"修复中: {final_count}/{total_symbols}, 失败 {len(failed)}",
                     synced_count=total_symbols,
                     failed_count=len(failed), pool_name=pool,
-                    written_count=total_symbols - len(failed),
+                    written_count=final_count,
                 )
 
         # ── 最终落盘 cn_last_update ──
@@ -1123,7 +1130,7 @@ class BackfillDB:
             status=final_status, report=report,
             synced_count=total_symbols,
             failed_count=len(failed), pool_name=pool,
-            written_count=total_symbols - len(failed),
+            written_count=final_count,
         )
 
         if failed:
@@ -1389,7 +1396,7 @@ def _run_fresh_pull(task: str, doc: dict | None, last_status: str):
     synced = doc.get("synced_count") or 0
     failed = doc.get("failed_count") or 0
     written = doc.get("written_count") or 0
-    sync_rate = written / synced if synced > 0 else 0
+    sync_rate = (synced - failed) / synced if synced > 0 else 0
     status = doc.get("status", "ok")
     lbt = _parse_db_timestamp(doc.get("last_bar_time"))
     logger.info(f"[调度] {task} 进度: 写入{written}/同步{synced} ({sync_rate:.0%}), 失败 {failed}, status={status}")
@@ -1443,7 +1450,7 @@ def _run_repair(task: str, doc: dict | None, last_status: str):
 
     if not failed_symbols:
         # report 中无失败标的 → 无法修复，判断完成度
-        sync_rate = written_db / synced_total if synced_total > 0 else 0
+        sync_rate = (synced_total - failed) / synced_total if synced_total > 0 else 0
         if sync_rate > 0.9:
             logger.info(f"[调度] {task} 无失败标的且完成度 {sync_rate:.0%} > 90%, status=ok, 正常退出")
             lbt = _parse_db_timestamp(doc.get("last_bar_time"))
@@ -1489,7 +1496,42 @@ def _run_repair(task: str, doc: dict | None, last_status: str):
         current_written = doc.get("written_count") or 0
         status = doc.get("status", "")
         lbt = _parse_db_timestamp(doc.get("last_bar_time"))
-        sync_rate = current_written / synced if synced > 0 else 0
+
+        # ── 合并 report: 本次 run_once 的失败 + 不在本次 batch 中的之前已知失败 ──
+        # run_once 只处理了 failed_symbols 子集，report 中只有该子集的失败。
+        # 不在本次 batch 中的 symbols（已跳过/未知）如果也没写入 kline 表，
+        # 必须保留在 report 中，确保下次修复循环能继续处理。
+        new_report_text = doc.get("report", "") or ""
+        new_failed_set = set(_extract_failed_symbols_from_report(new_report_text))
+        # 读取 kline 表确认哪些 symbols 实际已写入
+        final_synced = self._get_synced_symbols(lbt, tf=task) if lbt else set()
+        from app.data_sources.normalizer import strip_market_prefix
+        # 不在本次 batch 中、且不在 kline 表中的 symbols → 未写入，必须保留
+        for prev_sym in failed_symbols:
+            clean = strip_market_prefix(prev_sym)
+            if clean not in new_failed_set and clean not in final_synced:
+                new_failed_set.add(clean)
+        remaining_failed = sorted(new_failed_set)
+
+        # 用合并后的失败列表覆盖 report
+        if lbt and remaining_failed:
+            report_parts = [f"已同步 {len(final_synced)}/{synced}"]
+            report_parts.append(f"失败标的({len(remaining_failed)}): {','.join(remaining_failed[:50])}")
+            merged_report = "; ".join(report_parts)
+            _update_record(
+                "stock_daily_k", task, lbt, report=merged_report,
+                failed_count=len(remaining_failed),
+                written_count=len(final_synced), pool_name="CNStock",
+            )
+            current_failed = len(remaining_failed)
+            current_written = len(final_synced)
+        elif lbt and not remaining_failed:
+            # 无失败 → 清理 report
+            current_failed = 0
+            current_written = len(final_synced)
+
+        # 合并后重新计算 sync_rate
+        sync_rate = (synced - current_failed) / synced if synced > 0 else 0
 
         logger.info(f"[调度] {task} 修复第 {attempt} 轮后: 写入{current_written}/同步{synced} ({sync_rate:.0%}), 失败 {current_failed}")
 
@@ -1501,10 +1543,6 @@ def _run_repair(task: str, doc: dict | None, last_status: str):
             _repair_attempts.pop(task, None)
             _schedule_next(task, _next_trigger_time(task))
             return
-
-        # 读取最新 report，提取剩余失败标的
-        report_text = doc.get("report", "") or ""
-        remaining_failed = _extract_failed_symbols_from_report(report_text)
 
         # 本次修复>0（有进展）→ 删除report已写入的代码 --> 等待120s
         if remaining_failed and len(remaining_failed) < len(failed_symbols):
@@ -1555,10 +1593,10 @@ def _run_repair(task: str, doc: dict | None, last_status: str):
         synced = doc_final.get("synced_count") or synced_total
         written_db = doc_final.get("written_count") or 0
         current_failed = doc_final.get("failed_count") or 0
-        sync_rate = written_db / synced if synced > 0 else 0
+        sync_rate = (synced - current_failed) / synced if synced > 0 else 0
         lbt = _parse_db_timestamp(doc_final.get("last_bar_time"))
     else:
-        sync_rate = written_db / synced_total if synced_total > 0 else 0
+        sync_rate = 0
         lbt = None
 
     if sync_rate > 0.9:
