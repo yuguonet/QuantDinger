@@ -471,13 +471,13 @@ class BackfillDB:
             logger.error(f"[同步] {self.source.name} tf={tf} {report}")
             if existing_lbt:
                 _update_record(self.source.name, tf, existing_lbt,
-                              status="error", report=report, pool_name=pool,
+                              status="re", report=report, pool_name=pool,
                               failed_count=(existing_doc.get("failed_count") or 0) + 1 if existing_doc else None,
                               synced_count=existing_doc.get("synced_count") if existing_doc else None,
                               written_count=existing_doc.get("written_count") if existing_doc else None)
             else:
-                # 无已有记录 → INSERT 一条 error 记录，避免错误被吞
-                _insert_record(self.source.name, tf, "error", report,
+                # 无已有记录 → INSERT 一条 re 记录，等待修复循环处理
+                _insert_record(self.source.name, tf, "re", report,
                               last_bar_time=datetime.now(TZ_CN).replace(hour=0, minute=0, second=0, microsecond=0),
                               synced_count=0, failed_count=1, pool_name=pool, written_count=0)
             return {
