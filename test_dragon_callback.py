@@ -80,7 +80,7 @@ def find_limit_ups(bars, board_type):
             result.append(i)
     return result
 
-def run_backtest(bars, entry_idx, entry_price, hold_days=20, stop_loss=-10.0, trailing_stop=-8.0, board_type="main"):
+def run_backtest(bars, entry_idx, entry_price, hold_days=20, stop_loss=-10.0, trailing_stop=-8.0, board_type="main", peak_exit=False, is_v1=False):
     if entry_price <= 0 or entry_idx >= len(bars):
         return None
     limit_threshold = 0.098 if board_type == "main" else 0.198
@@ -101,29 +101,36 @@ def run_backtest(bars, entry_idx, entry_price, hold_days=20, stop_loss=-10.0, tr
             if d1_ret >= limit_threshold * 0.98:
                 d1_limit_up = True
 
-        # D1没涨停 → D+1快速离场: 高开>2%直接抛, 否则D1最高价-1%
-        if d == 2 and not d1_limit_up:
+        # V1专属: D1没涨停 → D+2快速离场
+        if is_v1 and d == 2 and not d1_limit_up:
             d1_bar = bars[entry_idx + 1]
             d1_high = d1_bar['high']
             d1_close = d1_bar['close']
             d1_change = (b['open'] / d1_close - 1) * 100 if d1_close > 0 else 0
-            # 止损优先
             if b['low'] <= entry_price * (1 + stop_loss / 100):
                 exit_p = entry_price * (1 + stop_loss / 100); exit_d = d; break
-            # 高开>2%直接抛
             if d1_change > 2.0:
                 exit_p = b['open']; exit_d = d; break
-            # D1最高价-1%追踪离场
             exit_trigger = d1_high * 0.99
             if b['low'] <= exit_trigger:
                 exit_p = exit_trigger; exit_d = d; break
             exit_p = b['close']; exit_d = d; break
 
-        # D1涨停 → 原有逻辑: 持仓20天+止损+追踪止损
+        # 通用出场: 追踪止损
         if d > 1 and b['low'] <= peak * (1 + trailing_stop / 100):
             exit_p = peak * (1 + trailing_stop / 100); exit_d = d; break
         if b['low'] <= entry_price * (1 + stop_loss / 100):
             exit_p = entry_price * (1 + stop_loss / 100); exit_d = d; break
+
+        # 峰值逃顶: 涨>10%后大上影线(>40%)→收盘逃顶
+        if peak_exit:
+            ret = (b['close'] / entry_price - 1) * 100
+            if ret > 10:
+                bar_range = b['high'] - b['low']
+                upper = (b['high'] - max(b['open'], b['close'])) / bar_range * 100 if bar_range > 0 else 0
+                if upper > 40 and b['close'] < b['high'] * 0.98:
+                    exit_p = b['close']; exit_d = d; break
+
         exit_p = b['close']; exit_d = d
 
     return {
@@ -135,10 +142,16 @@ def run_backtest(bars, entry_idx, entry_price, hold_days=20, stop_loss=-10.0, tr
 
 def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=11,
                              max_last_chg=3.0,
-                             hold_days=20, stop_loss=-5.0, trailing_stop=-5.0):
+                             hold_days=20, stop_loss=-5.0, trailing_stop=-5.0,
+                             buy_mode="next_open"):
     """
     龙回头v3:
-    D-N涨停 → 回调3-11天 → 末期十字星/小阳+量<0.8x(弱转强信号) → D+1买入
+    D-N涨停 → 回调3-11天 → 末期十字星/小阳+量<0.8x(弱转强信号) → 买入
+
+    buy_mode:
+      signal_close — 信号日收盘买
+      next_open    — D+1开盘买 (默认)
+      signal_low   — 信号日最低价买 (理想)
     """
     board_type = get_board_type(code)
     threshold = 0.098 if board_type == "main" else 0.198
@@ -192,20 +205,33 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
                 skip = True; break
         if skip: continue
 
-        # D+1买入
+        # D+1收阴排除 (所有模式通用)
         if pullback_end + 1 >= len(bars): continue
         d1 = bars[pullback_end + 1]
-        entry_price = d1['open']
-        if entry_price <= 0: continue
-
-        # D+1收阴排除
         d1_change = (d1['close'] / last_pb['close'] - 1) * 100
         if d1_change < 0:
             continue
 
+        # 根据buy_mode确定入场价
+        if buy_mode == "signal_close":
+            entry_price = last_pb['close']
+            entry_idx = pullback_end
+            entry_date = last_pb['time']
+        elif buy_mode == "next_open":
+            entry_price = d1['open']
+            entry_idx = pullback_end + 1
+            entry_date = d1['time']
+        elif buy_mode == "signal_low":
+            entry_price = last_pb['low']
+            entry_idx = pullback_end
+            entry_date = last_pb['time']
+        else:
+            continue
+        if entry_price <= 0: continue
+
         used_ranges.append((lu_idx, pullback_end))
 
-        result = run_backtest(bars, pullback_end + 1, entry_price, hold_days, stop_loss, trailing_stop, board_type)
+        result = run_backtest(bars, entry_idx, entry_price, hold_days, stop_loss, trailing_stop, board_type, peak_exit=True)
         if not result: continue
 
         trades.append({
@@ -217,8 +243,9 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
             'signal_date': last_pb['time'],
             'signal_chg': round(last_chg, 2),
             'signal_vol_r': round(last_vol_r, 2),
-            'entry_date': d1['time'],
+            'entry_date': entry_date,
             'entry_price': round(entry_price, 3),
+            'buy_mode': buy_mode,
             'd1_change': round(d1_change, 2),
             **result,
         })
@@ -227,8 +254,14 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
 
 def strategy_v1(bars, code, min_vol_ratio=2.0, max_upper_shadow=0.5,
                 hold_days=20, stop_loss=-10.0, trailing_stop=-8.0,
-                use_preload_filter=True):
-    """V1基线策略 (带D1收阴排除)"""
+                use_preload_filter=True, buy_mode="next_open"):
+    """V1基线策略
+
+    buy_mode:
+      signal_close — D0收盘买(涨停价, 可能买不到)
+      next_open    — D+1开盘买 (默认)
+      signal_low   — D0最低价买 (理想)
+    """
     board_type = get_board_type(code)
     threshold = 0.098 if board_type == "main" else 0.198
 
@@ -278,29 +311,47 @@ def strategy_v1(bars, code, min_vol_ratio=2.0, max_upper_shadow=0.5,
         if use_preload_filter and not has_preload:
             continue
 
+        # D1数据 (用于过滤和回测)
         if i + 1 >= len(bars): continue
         d1 = bars[i + 1]
-        entry_price = d1['open']
+
+        # 根据buy_mode确定入场价
+        if buy_mode == "signal_close":
+            entry_price = fl['close']
+            entry_idx = i
+            entry_date = fl['time']
+        elif buy_mode == "next_open":
+            entry_price = d1['open']
+            entry_idx = i + 1
+            entry_date = d1['time']
+        elif buy_mode == "signal_low":
+            entry_price = fl['low']
+            entry_idx = i
+            entry_date = fl['time']
+        else:
+            continue
         if entry_price <= 0: continue
 
-        # D1开盘涨幅过滤 (板块分离) - 低开不买
-        d1_gap = (entry_price / fl_close - 1) * 100
-        min_d1_gap = -2.0 if board_type == "main" else -5.0
-        if d1_gap < min_d1_gap:
-            continue
+        # D1过滤 (仅next_open模式)
+        if buy_mode == "next_open":
+            d1_gap = (entry_price / fl_close - 1) * 100
+            min_d1_gap = -2.0 if board_type == "main" else -5.0
+            if d1_gap < min_d1_gap:
+                continue
 
         d1_change = (d1['close'] / fl_close - 1) * 100
-        if d1_change < 0: continue  # D1收阴排除
+        if d1_change < 0: continue  # D1收阴排除 (所有模式通用, 信号质量过滤)
 
-        bt = run_backtest(bars, i + 1, entry_price, hold_days, stop_loss, trailing_stop, board_type)
+        bt = run_backtest(bars, entry_idx, entry_price, hold_days, stop_loss, trailing_stop, board_type, is_v1=True)
         if not bt: continue
 
         result.append({
             'code': code, 'board': get_board_name(code),
             'path': 'v1', 'path_label': 'V1',
             'd0_date': fl['time'],
-            'entry_date': d1['time'],
+            'entry_date': entry_date,
             'entry_price': round(entry_price, 3),
+            'buy_mode': buy_mode,
             'vol_ratio': round(vol_ratio, 2),
             'd1_change': round(d1_change, 2),
             'has_preload': has_preload,
@@ -319,8 +370,49 @@ BOARD_PARAMS = {
     "gem_star": {"stop_loss": -10.0, "trailing_stop": -8.0, "take_profit": 20.0, "hold_days": 15, "vol_max": 1.5, "drawdown_max": -15},
 }
 
+def run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=20, stop_loss=-8.0,
+                          trailing_stop=-6.0, board_type="main"):
+    """断板专用回测: 追踪止损 + 峰值逃顶信号"""
+    if entry_price <= 0 or entry_idx >= len(bars):
+        return None
+    peak = entry_price
+    exit_p = entry_price
+    exit_d = 0
+
+    for d in range(1, hold_days + 1):
+        idx = entry_idx + d
+        if idx >= len(bars): break
+        b = bars[idx]
+        if b['high'] > peak: peak = b['high']
+
+        ret = (b['close'] / entry_price - 1) * 100
+        ret_from_high = (b['close'] / peak - 1) * 100 if peak > 0 else 0
+
+        # 止损
+        if ret <= stop_loss:
+            exit_p = entry_price * (1 + stop_loss / 100); exit_d = d; break
+
+        # 追踪止损 (盈利时)
+        if ret_from_high <= trailing_stop and ret > 0:
+            exit_p = peak * (1 + trailing_stop / 100); exit_d = d; break
+
+        # 峰值信号: 涨>10%后大上影线(>40%)→收盘逃顶
+        if ret > 10:
+            bar_range = b['high'] - b['low']
+            upper = (b['high'] - max(b['open'], b['close'])) / bar_range * 100 if bar_range > 0 else 0
+            if upper > 40 and b['close'] < b['high'] * 0.98:
+                exit_p = b['close']; exit_d = d; break
+
+        exit_p = b['close']; exit_d = d
+
+    return {
+        'exit_price': round(exit_p, 3), 'exit_day': exit_d,
+        'return_pct': round((exit_p / entry_price - 1) * 100, 2),
+        'peak_return_pct': round((peak / entry_price - 1) * 100, 2),
+    }
+
 def strategy_break_buy(bars, code, min_streak=2, max_break_gap=5, buy_mode="break_close", override_params=None):
-    """断板买入: 连板≥2 → 断板 → 缩量不破位 → 买入"""
+    """断板买入: 连板≥2 → 断板 → 缩量不破位 → 买入 (带止盈+峰值逃顶)"""
     bt = get_board_type(code)
     threshold = 0.098 if bt == "main" else 0.198
     params = dict(BOARD_PARAMS[bt])
@@ -364,14 +456,17 @@ def strategy_break_buy(bars, code, min_streak=2, max_break_gap=5, buy_mode="brea
         elif buy_mode == "break_low": entry_price = bars[break_idx]['low']; entry_idx = break_idx
         else: i = streak_end + 1; continue
         if entry_price <= 0: i = streak_end + 1; continue
-        result = run_backtest(bars, entry_idx, entry_price, hold_days, stop_loss, trailing_stop, bt)
+        result = run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days, stop_loss, trailing_stop, bt)
         if not result: i = streak_end + 1; continue
         break_bar = bars[break_idx]; prev_bar = bars[break_idx - 1]
+        break_chg = (break_bar['close'] / prev_bar['close'] - 1) * 100
+        break_gap = (break_bar['open'] / prev_bar['close'] - 1) * 100
         trades.append({
             'code': code, 'board': get_board_name(code), 'path': 'break_buy', 'path_label': '断板',
             'streak_len': streak_len, 'streak_start': bars[streak_start]['time'], 'streak_end': bars[streak_end]['time'],
             'break_date': bars[break_idx]['time'],
-            'break_chg': round((break_bar['close'] / prev_bar['close'] - 1) * 100, 2),
+            'break_chg': round(break_chg, 2),
+            'break_gap': round(break_gap, 2),
             'break_vol_r': round(break_bar['volume'] / prev_bar['volume'] if prev_bar['volume'] > 0 else 0, 2),
             'entry_date': bars[entry_idx]['time'], 'entry_price': round(entry_price, 3), 'buy_mode': buy_mode, **result,
         })
@@ -431,6 +526,9 @@ def main():
     parser.add_argument("--max-last-chg", type=float, default=3.0, help="龙回头末期小阳最大涨幅%%")
     parser.add_argument("--strategy", default="all", choices=["all", "dragon", "v1", "break"],
                         help="运行策略: all=全部, dragon=龙回头, v1=V1, break=断板")
+    parser.add_argument("--buy-mode", default="next_open",
+                        choices=["signal_close", "next_open", "signal_low"],
+                        help="买入模式: signal_close=信号日收盘买, next_open=D+1开盘买(默认), signal_low=信号日最低价(理想)")
     args = parser.parse_args()
 
     codes = [c.strip() for c in args.codes.split(",") if c.strip()] if args.codes else TEST_CODES
@@ -438,13 +536,16 @@ def main():
     run_v1 = args.strategy in ("all", "v1")
     run_bb = args.strategy in ("all", "break")
 
+    mode_label = {"signal_close": "信号日收盘买", "next_open": "D+1开盘买", "signal_low": "信号日最低价(理想)"}[args.buy_mode]
+
     print(f"{'=' * 80}")
     print(f"龙回头 + V1 + 断板 三策略回测")
     print(f"{'=' * 80}")
+    print(f"买入模式: {mode_label}")
     labels = []
     if run_dc: labels.append(f"龙回头(回调{args.pullback}-{args.max_pullback}天)")
     if run_v1: labels.append("V1")
-    if run_bb: labels.append("断板(连板≥2)")
+    if run_bb: labels.append(f"断板(连板≥2)")
     print(f"运行: {' + '.join(labels)}")
     print(f"股票: {len(codes)}只\n")
 
@@ -463,15 +564,17 @@ def main():
             dc = strategy_dragon_callback(bars, code,
                                            min_pullback_days=args.pullback,
                                            max_pullback_days=args.max_pullback,
-                                           max_last_chg=args.max_last_chg)
+                                           max_last_chg=args.max_last_chg,
+                                           buy_mode=args.buy_mode)
             dc_trades.extend(dc)
             parts.append(f"龙回头{len(dc)}")
         if run_v1:
-            v1 = strategy_v1(bars, code, use_preload_filter=False)
+            v1 = strategy_v1(bars, code, use_preload_filter=False, buy_mode=args.buy_mode)
             v1_trades.extend(v1)
             parts.append(f"V1{len(v1)}")
         if run_bb:
-            bb = strategy_break_buy(bars, code, buy_mode="break_close")
+            bb_buy_mode = {"signal_close": "break_close", "next_open": "next_open", "signal_low": "break_low"}[args.buy_mode]
+            bb = strategy_break_buy(bars, code, buy_mode=bb_buy_mode)
             bb_trades.extend(bb)
             parts.append(f"断板{len(bb)}")
 
