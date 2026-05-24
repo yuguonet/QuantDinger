@@ -130,6 +130,15 @@ def next_trading_day(date: Optional[str] = None, n: int = 1) -> str:
     return result[-1]
 
 
+def last_trading_day(date: Optional[str] = None) -> str:
+    """最近的交易日（含当天）。当天是交易日则返回当天，否则回退到最近的交易日。"""
+    if date is None:
+        date = datetime.now().strftime("%Y-%m-%d")
+    if is_trading_day(date):
+        return date
+    return prev_trading_day(date)
+
+
 def trade_date_range(start_date: str, end_date: str) -> List[str]:
     """范围内的交易日列表"""
     return sorted(d for d in _load() if start_date <= d <= end_date)

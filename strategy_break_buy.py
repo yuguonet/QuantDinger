@@ -146,7 +146,8 @@ def run_backtest(bars, entry_idx, entry_price, hold_days=20, stop_loss=-8.0,
 
 def strategy_break_buy(bars, code, min_streak=2, max_break_gap=5,
                         hold_days=20, stop_loss=-8.0, trailing_stop=-6.0,
-                        take_profit=15.0, buy_mode="break_close"):
+                        take_profit=15.0, buy_mode="break_close",
+                        ideal_filter=False):
     """
     断板买入策略
 
@@ -154,6 +155,13 @@ def strategy_break_buy(bars, code, min_streak=2, max_break_gap=5,
       "break_close" — 断板日收盘价买入
       "next_open"   — 断板次日开盘价买入
       "break_low"   — 断板日最低价买入(理想化低吸)
+
+    ideal_filter: 启用理想化入场过滤
+      - 断板期不破涨停日开盘价
+      - 断板期日均量比<1.2x (缩量洗盘)
+      - 断板期最大回撤<10%
+      - 断板后必须创新高
+      - 断板最后一天振幅<5% (小实体/十字星)
     """
     bt = get_board_type(code)
     threshold = 0.098 if bt == "main" else 0.198
@@ -162,10 +170,15 @@ def strategy_break_buy(bars, code, min_streak=2, max_break_gap=5,
 
     i = 1
     while i < len(bars) - 1:
-        # 找连板起点: 当天涨停 + 前一天非涨停
+        # 找连板起点: 当天涨停 + 前10天非涨停（第一板）
         if not is_limit_up(bars[i]['close'], bars[i-1]['close'], bt):
             i += 1; continue
-        if i >= 2 and is_limit_up(bars[i-1]['close'], bars[i-2]['close'], bt):
+        # 前10天不能有涨停，确保是真正的第一板
+        is_first = True
+        for k in range(1, min(11, i + 1)):
+            if is_limit_up(bars[i-k]['close'], bars[i-k-1]['close'], bt) if (i-k-1) >= 0 else False:
+                is_first = False; break
+        if not is_first:
             i += 1; continue
 
         # 数连板
@@ -195,6 +208,62 @@ def strategy_break_buy(bars, code, min_streak=2, max_break_gap=5,
                 break
 
         # 断板后不要求必须再涨停, 只要连板断了就买
+
+        # ===== 理想化入场过滤 =====
+        if ideal_filter:
+            limit_bar = bars[streak_end]  # 涨停日(最后一板)
+            limit_open = float(limit_bar['open'])
+            limit_close = float(limit_bar['close'])
+            limit_vol = float(limit_bar['volume'])
+
+            # 断板期所有bar
+            break_bars = bars[break_idx:break_idx + break_days]
+            if not break_bars:
+                i = streak_end + 1; continue
+
+            # 1. 断板期不破涨停日开盘价
+            break_low = min(float(b['low']) for b in break_bars)
+            if break_low < limit_open:
+                i = streak_end + 1; continue
+
+            # 2. 断板期日均量比<1.2x (缩量洗盘)
+            break_vol_sum = sum(float(b['volume']) for b in break_bars)
+            break_vol_avg = break_vol_sum / len(break_bars) if break_bars else 0
+            if limit_vol > 0 and break_vol_avg / limit_vol >= 1.2:
+                i = streak_end + 1; continue
+
+            # 3. 断板期最大回撤<10% (vs涨停日收盘)
+            break_drawdown = (break_low / limit_close - 1) * 100 if limit_close > 0 else 0
+            if break_drawdown < -10:
+                i = streak_end + 1; continue
+
+            # 4. 断板后必须创新高
+            # 找断板后的涨停段
+            post_break_start = break_idx + break_days
+            if post_break_start >= len(bars):
+                i = streak_end + 1; continue
+            # 检查后续是否有涨停
+            has_post_limit = False
+            for j in range(post_break_start, min(post_break_start + 10, len(bars))):
+                if is_limit_up(bars[j]['close'], bars[j-1]['close'], bt):
+                    has_post_limit = True
+                    break
+            if not has_post_limit:
+                i = streak_end + 1; continue
+            # 创新高: 断板后最高价 > 涨停日最高价
+            pre_peak = float(limit_bar['high'])
+            post_high = max(float(bars[j]['high']) for j in range(post_break_start, min(post_break_start + 10, len(bars))))
+            if post_high <= pre_peak:
+                i = streak_end + 1; continue
+
+            # 5. 断板最后一天振幅<5% (小实体/十字星)
+            last_break_bar = bars[break_idx + break_days - 1]
+            lb_open = float(last_break_bar['open'])
+            lb_high = float(last_break_bar['high'])
+            lb_low = float(last_break_bar['low'])
+            lb_range = lb_high - lb_low
+            if lb_open > 0 and lb_range / lb_open >= 0.05:
+                i = streak_end + 1; continue
 
         # 防重复
         key = (bars[streak_start]['time'], bars[break_idx]['time'])
@@ -358,6 +427,40 @@ def main():
         ls = [t['return_pct'] for t in trades if t['return_pct'] <= 0]
         pl = (sum(ws)/len(ws)) / (abs(sum(ls))/len(ls)) if ws and ls else (999 if ws else 0)
         print(f"{label:>16} {len(trades):>6} {wr:>6.1f}% {avg:>+7.2f}% {peak:>+7.2f}% {pl:>7.2f}")
+
+    # ===== 理想化过滤 =====
+    print(f"\n{'=' * 80}")
+    print(f"🔒 理想化入场过滤 (不破涨停开盘+缩量+回撤<10%+创新高+小实体)")
+    print(f"{'=' * 80}")
+
+    ideal_by_mode = {}
+    for mode, label in [("break_close","断板日收盘"), ("next_open","断板次日开盘")]:
+        all_trades = []
+        success = 0
+        for idx, code in enumerate(CODES):
+            bars = fetch_kline(code, 300)
+            if not bars: continue
+            trades = strategy_break_buy(bars, code, buy_mode=mode, min_streak=2,
+                                         max_break_gap=5, hold_days=20,
+                                         stop_loss=-8.0, trailing_stop=-6.0, take_profit=15.0,
+                                         ideal_filter=True)
+            all_trades.extend(trades)
+            success += 1
+            time.sleep(0.15)
+
+        ideal_by_mode[mode] = all_trades
+
+        if not all_trades:
+            print(f"\n  {label}: 无信号"); continue
+
+        print(f"\n  {label}: {len(all_trades)}笔")
+        print_stats(all_trades, "    总览")
+
+        # 按连板数
+        for sl in sorted(set(t['streak_len'] for t in all_trades)):
+            seg = [t for t in all_trades if t['streak_len'] == sl]
+            if seg:
+                print_stats(seg, f"      {sl}板后断")
 
 
 if __name__ == "__main__":
