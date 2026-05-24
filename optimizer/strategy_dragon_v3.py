@@ -107,12 +107,12 @@ BOARD_PARAMS = {
         "min_streak": 2,          # 只做2板+ (1板信号太弱)
         "buy_vol_ratio": 1.5,     # 量比放宽(区分度弱,不作为核心条件)
         "buy_seal_max": 0.5,      # 封板强度 ≤0.5%
-        "buy_rsi_min": 40,        # RSI放宽(区分度弱)
-        "buy_rsi_max": 90,
+        "buy_rsi_min": 30,
+        "buy_rsi_max": 70,
         "buy_pre1_max_drop": -5,  # 前1日跌幅放宽
         "buy_max_range_pct": 12,
         "buy_max_gap_pct": 8.0,   # 高开<8% (核心过滤!)
-        "buy_min_score": 65,      # Score门槛
+        "buy_min_score": 0,       # Score门槛(已关闭)
         "stop_loss_pct": -8,
         "trailing_stop_pct": -10,
         "take_profit_pct": 120,
@@ -128,12 +128,12 @@ BOARD_PARAMS = {
         "max_streak": 4,          # 排除5板+(20%胜率陷阱)
         "buy_vol_ratio": 1.5,
         "buy_seal_max": 0.5,
-        "buy_rsi_min": 40,
-        "buy_rsi_max": 90,        # RSI<90
+        "buy_rsi_min": 30,
+        "buy_rsi_max": 70,        # RSI<70
         "buy_pre1_max_drop": -8,
         "buy_max_range_pct": 22,
         "buy_max_gap_pct": 12.0,  # 高开<12%
-        "buy_min_score": 65,      # Score门槛
+        "buy_min_score": 0,       # Score门槛(已关闭)
         "stop_loss_pct": -12,
         "trailing_stop_pct": -10,
         "take_profit_pct": 120,
@@ -372,8 +372,9 @@ class DragonHunterV3:
         # D0前20天无涨停 (排除近期已被炒作的股票)
         bt = get_board_type(code)
         threshold = BOARD_PARAMS[bt]["threshold"]
-        if idx >= 20:
-            for k in range(1, 21):
+        lookback = min(20, idx)  # 实际可用历史天数
+        if lookback >= 1:
+            for k in range(1, lookback + 1):
                 prev_k = df.iloc[idx - k]
                 prev_k2 = df.iloc[idx - k - 1] if idx - k - 1 >= 0 else None
                 if prev_k2 is not None and prev_k2["close"] > 0:
@@ -530,48 +531,17 @@ def backtest_single_run(
     params = BOARD_PARAMS[board_type]
 
     trades = []
-    position = None  # {"buy_price", "buy_date", "buy_idx", "highest", "buy_day_sealed"}
+    position = None  # {"buy_price", "buy_date", "buy_idx", "highest"}
+    pending_buy = None  # 信号日记录, 次日open买入
 
     for i in range(1, len(df_run)):
         row = df_run.iloc[i]
 
-        if position is None:
-            # 检查买点
-            signal = strategy.check_buy_signal(df_run, i)
-            if signal["buy"]:
-                # 判断买入当天是否封板: close >= high * 0.998
-                sealed = (row["close"] / row["high"] - 1) >= -0.002
-                position = {
-                    "buy_price": float(row["close"]),
-                    "buy_date": str(row["time"]),
-                    "buy_idx": i,
-                    "highest": float(row["close"]),
-                    "buy_day_sealed": sealed,
-                    "score": signal["score"],
-                    "reasons": signal["reasons"],
-                }
-        else:
+        # ── 有持仓: 先检查卖出 ──
+        if position is not None:
             # 更新最高价
             if float(row["high"]) > position["highest"]:
                 position["highest"] = float(row["high"])
-
-            # 买入当天没封板 → 次日开盘卖出
-            if not position["buy_day_sealed"] and i == position["buy_idx"] + 1:
-                trade = {
-                    "buy_date": position["buy_date"],
-                    "buy_price": position["buy_price"],
-                    "sell_date": str(row["time"]),
-                    "sell_price": float(row["open"]),
-                    "return_pct": round((float(row["open"]) / position["buy_price"] - 1) * 100, 2),
-                    "highest": position["highest"],
-                    "max_return_pct": round((position["highest"] / position["buy_price"] - 1) * 100, 2),
-                    "sell_type": "no_seal",
-                    "sell_reason": "买入日未封板,次日开盘出",
-                    "score": position["score"],
-                }
-                trades.append(trade)
-                position = None
-                continue
 
             # 检查卖点
             signal = strategy.check_sell_signal(
@@ -590,10 +560,57 @@ def backtest_single_run(
                     "max_return_pct": round((position["highest"] / position["buy_price"] - 1) * 100, 2),
                     "sell_type": signal["sell_type"],
                     "sell_reason": signal["reason"],
-                    "score": position["score"],
+                    "score": position.get("score", 0),
                 }
                 trades.append(trade)
                 position = None
+
+        # ── 待买入: 信号已触发, 本bar open买入 ──
+        if pending_buy is not None and position is None:
+            buy_price = float(row["open"])
+            position = {
+                "buy_price": buy_price,
+                "buy_date": str(row["time"]),
+                "buy_idx": i,
+                "highest": max(buy_price, float(row["high"])),
+                "score": pending_buy["score"],
+                "reasons": pending_buy["reasons"],
+            }
+            pending_buy = None
+            # 买入当天也检查卖出(以防开盘买完当天就触发止损)
+            if float(row["high"]) > position["highest"]:
+                position["highest"] = float(row["high"])
+            signal = strategy.check_sell_signal(
+                df_run, i,
+                position["buy_price"],
+                position["highest"],
+            )
+            if signal["sell"]:
+                trade = {
+                    "buy_date": position["buy_date"],
+                    "buy_price": position["buy_price"],
+                    "sell_date": str(row["time"]),
+                    "sell_price": float(row["close"]),
+                    "return_pct": round((float(row["close"]) / position["buy_price"] - 1) * 100, 2),
+                    "highest": position["highest"],
+                    "max_return_pct": round((position["highest"] / position["buy_price"] - 1) * 100, 2),
+                    "sell_type": signal["sell_type"],
+                    "sell_reason": signal["reason"],
+                    "score": position.get("score", 0),
+                }
+                trades.append(trade)
+                position = None
+            continue  # 买入bar不再检查新信号
+
+        # ── 无持仓无待买: 检查买点信号 ──
+        if position is None and pending_buy is None:
+            signal = strategy.check_buy_signal(df_run, i)
+            if signal["buy"]:
+                pending_buy = {
+                    "signal_idx": i,
+                    "score": signal["score"],
+                    "reasons": signal["reasons"],
+                }
 
     # 如果还有持仓，在数据结束时平仓
     if position is not None:
@@ -608,7 +625,7 @@ def backtest_single_run(
             "max_return_pct": round((position["highest"] / position["buy_price"] - 1) * 100, 2),
             "sell_type": "end_of_data",
             "sell_reason": "数据结束",
-            "score": position["score"],
+            "score": position.get("score", 0),
         }
         trades.append(trade)
 
