@@ -1,19 +1,17 @@
 """
-db_market.py — 多市场行情数据读写与聚合（上层）
+db_market.py — 多市场行情数据读写（上层）
 
 职责:
   1. 接口A: 增量写入（单条/小批量，UPSERT）
   2. 接口B: 大批量写入（自动分市场、分年存储）
   3. 接口C: 查询（按 symbol + 时间范围）
-  4. 接口D: SQL 实时聚合（15m→30m/1h/2h/4h/1D，1D→1W/1M）
-  5. 聚合 VIEW 创建（TIMESTAMP 兼容版本）
-  6. 全局单例管理（get_market_db_manager / get_market_kline_writer）
+  4. 全局单例管理（get_market_db_manager / get_market_kline_writer）
 
 依赖:
   - db_multi.py（下层）：连接池、MarketDBManager、共享常量
 
 用法:
-  from app.utils.db_market import get_market_kline_writer, get_market_db_manager, ensure_agg_views
+  from app.utils.db_market import get_market_kline_writer, get_market_db_manager
 
   mgr = get_market_db_manager()
   mgr.ensure_market_db("CNStock")
@@ -32,14 +30,10 @@ db_market.py — 多市场行情数据读写与聚合（上层）
 
   # 查询
   rows = writer.query("CNStock", "600519", "15m", start_time=..., end_time=...)
-
-  # 创建聚合 VIEW
-  ensure_agg_views("CNStock")
 """
 
 from __future__ import annotations
 
-import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
@@ -48,11 +42,8 @@ from psycopg2.extras import execute_values
 
 from app.utils.logger import get_logger
 from app.utils.db_multi import (
-    MarketDBManager, MarketPool,
-    KLINE_COLUMNS, POOL_MIN, POOL_MAX,
-    KNOWN_MARKETS, _MARKET_ALIASES,
+    MarketDBManager,
     _market_db_name, _resolve_market, _table_name,
-    _daily_view_name,
 )
 
 logger = get_logger(__name__)
@@ -60,21 +51,6 @@ logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
 # db_market 专属常量
 # ---------------------------------------------------------------------------
-
-TIMEFRAMES = ["1m", "5m", "15m", "30m", "1H", "4H", "1D", "1W"]
-
-# 聚合 VIEW 配置：目标周期 → (bucket 类型, 附加参数)
-# 从 db_multi.py 迁移至此（聚合 VIEW 是业务逻辑，不属于连接层）
-_AGG_VIEW_TFS = {
-    "30m": ("interval", 1800),
-    "1h":  ("interval", 3600),
-    "2h":  ("interval", 7200),
-    "4h":  ("interval", 14400),
-    "1D":  ("daily",    None),
-    "1W":  ("weekly",   None),
-    "1M":  ("monthly",  None),
-}
-
 
 def _year_from_ts(ts) -> int:
     """从 datetime 对象或整数时间戳提取年份"""
@@ -538,171 +514,6 @@ class MarketKlineWriter:
         }
 
     # ================================================================
-    # 聚合查询（SQL 在 PG 内计算，只读不落盘）
-    # ================================================================
-
-    # 15m → 目标周期的聚合配置
-    # "source": 数据源周期, "type": "interval"|"daily"|"weekly"|"monthly"
-    _AGG_TARGETS = {
-        "30m":  {"source": "15m", "type": "interval", "sec": 1800},
-        "1h":   {"source": "15m", "type": "interval", "sec": 3600},
-        "2h":   {"source": "15m", "type": "interval", "sec": 7200},
-        "4h":   {"source": "15m", "type": "interval", "sec": 14400},
-        "1D":   {"source": "15m", "type": "daily"},
-        "1W":   {"source": "1D",  "type": "weekly"},
-        "1M":   {"source": "1D",  "type": "monthly"},
-    }
-
-    # 向后兼容
-    _AGG_SECONDS = {k: v.get("sec", 0) for k, v in _AGG_TARGETS.items()}
-
-    def aggregate(
-        self,
-        market: str,
-        symbol: str,
-        target_tf: str,
-        start_time=None,
-        end_time=None,
-        limit: int = 500,
-        tz_offset: int = 28800,   # 默认 UTC+8 (A股)
-    ) -> List[Dict[str, Any]]:
-        """
-        将 15m/1D K线实时聚合成更大周期（SQL 在 PG 内计算，只读不落盘）。
-
-        数据源:
-          - 30m/1h/2h/4h: 从 15m 表聚合
-          - 1D:           从 15m 表聚合
-          - 1W:           从 1D 表聚合
-          - 1M:           从 1D 表聚合
-
-        聚合规则:
-          - open   = 该桶内第一根的 open
-          - high   = 该桶内所有 high 的最大值
-          - low    = 该桶内所有 low 的最小值
-          - close  = 该桶内最后一根的 close
-          - volume = 该桶内所有 volume 之和
-
-        start_time/end_time: datetime 对象、ISO 字符串或 Unix 时间戳（整数）均可。
-        """
-        target_tf = target_tf.strip()
-        if target_tf not in self._AGG_TARGETS:
-            raise ValueError(
-                f"不支持的目标周期: {target_tf}，"
-                f"可选: {', '.join(self._AGG_TARGETS.keys())}"
-            )
-
-        if not self._mgr.market_db_exists(market):
-            return []
-
-        target_cfg = self._AGG_TARGETS[target_tf]
-        source_tf = target_cfg["source"]
-        bucket_type = target_cfg["type"]
-
-        # 构造 TIMESTAMP 兼容的 bucket 表达式
-        # 使用 EXTRACT(EPOCH FROM time) 将 TIMESTAMP 转为整数秒进行分桶，
-        # 再用 to_timestamp() 转回 TIMESTAMP，确保 VIEW 列类型与源表一致。
-        if bucket_type == "interval":
-            sec = target_cfg["sec"]
-            bucket_expr = f"to_timestamp(EXTRACT(EPOCH FROM t.time) - MOD(EXTRACT(EPOCH FROM t.time)::bigint, {sec}))"
-        elif bucket_type == "daily":
-            bucket_expr = (
-                f"to_timestamp((EXTRACT(EPOCH FROM t.time + interval '{tz_offset}s')::bigint / 86400) * 86400 - {tz_offset})"
-            )
-        elif bucket_type == "weekly":
-            bucket_expr = (
-                f"to_timestamp("
-                f"(EXTRACT(EPOCH FROM t.time + interval '{tz_offset}s')::bigint / 86400) * 86400 - {tz_offset}"
-                f" - (EXTRACT(DOW FROM t.time AT TIME ZONE 'Asia/Shanghai')::int - 1 + 7)"
-                f" % 7 * 86400)"
-            )
-        elif bucket_type == "monthly":
-            bucket_expr = (
-                f"date_trunc('month', t.time AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai'"
-            )
-        else:
-            raise ValueError(f"未知 bucket 类型: {bucket_type}")
-
-        # 发现所有源周期分区表
-        pool = self._mgr._get_pool(market)
-        with pool.cursor() as cur:
-            cur.execute("""
-                SELECT table_name FROM information_schema.tables
-                WHERE table_schema = 'public'
-                  AND table_type = 'BASE TABLE'
-                  AND table_name LIKE %s
-                ORDER BY table_name
-            """, (f'kline_{source_tf}_%',))
-            tables = [r[0] for r in cur.fetchall()]
-
-        if not tables:
-            return []
-
-        # 拼接 UNION ALL 子查询
-        union_parts = []
-        for tbl in tables:
-            conditions = [f"t.symbol = %s"]
-            if start_time is not None:
-                conditions.append(f"t.time >= %s")
-            if end_time is not None:
-                conditions.append(f"t.time <= %s")
-
-            where = " AND ".join(conditions)
-            union_parts.append(f"""
-                SELECT
-                    {bucket_expr}                                  AS bucket,
-                    (ARRAY_AGG(t.open  ORDER BY t.time ASC))[1]    AS open,
-                    MAX(t.high)                                    AS high,
-                    MIN(t.low)                                     AS low,
-                    (ARRAY_AGG(t.close ORDER BY t.time DESC))[1]   AS close,
-                    SUM(t.volume)                                  AS volume
-                FROM "{tbl}" t
-                WHERE {where}
-                GROUP BY {bucket_expr}
-            """)
-
-        sql = f"""
-            SELECT bucket AS time, open, high, low, close, volume
-            FROM (
-                {' UNION ALL '.join(union_parts)}
-            ) agg
-            ORDER BY bucket ASC
-        """
-
-        # 构造参数：每个 UNION 子查询都要 symbol + 可选的 start/end
-        params = []
-        for _ in tables:
-            params.append(symbol)
-            if start_time is not None:
-                params.append(start_time)
-            if end_time is not None:
-                params.append(end_time)
-
-        if limit:
-            sql += f" LIMIT {int(limit)}"
-
-        with pool.cursor() as cur:
-            cur.execute(sql, params)
-            rows = cur.fetchall()
-
-        result = [
-            {
-                "time":   row[0],
-                "open":   float(row[1]),
-                "high":   float(row[2]),
-                "low":    float(row[3]),
-                "close":  float(row[4]),
-                "volume": float(row[5]),
-            }
-            for row in rows
-        ]
-
-        logger.debug(
-            f"SQL 聚合: {market}/{symbol} {source_tf}→{target_tf} "
-            f"表数={len(tables)} 输出={len(result)}条"
-        )
-        return result
-
-    # ================================================================
     # 内部工具
     # ================================================================
 
@@ -749,28 +560,15 @@ _manager: Optional[MarketDBManager] = None
 _writer: Optional[MarketKlineWriter] = None
 
 
-def _schema_init_hook(mgr: MarketDBManager, market: str):
-    """MarketDBManager 初始化新库后的回调：创建聚合 VIEW。
-
-    通过 MarketDBManager._on_schema_init 注册，避免 db_multi.py 反向调用 db_market.py。
-    """
-    try:
-        _create_agg_views_for_market(mgr, market)
-    except Exception as e:
-        logger.warning(f"聚合 VIEW 创建失败: {market}: {e}")
-
-
 def get_market_db_manager() -> MarketDBManager:
     """
     获取全局 MarketDBManager 实例。
 
     连接信息从 DATABASE_URL 解析，strategy_db 名从 STRATEGY_DB_NAME 或 URL 推导。
-    注册 _schema_init_hook，新建库时自动创建聚合 VIEW。
     """
     global _manager
     if _manager is None:
         _manager = MarketDBManager()
-        _manager._on_schema_init = _schema_init_hook
     return _manager
 
 
@@ -779,122 +577,3 @@ def get_market_kline_writer() -> MarketKlineWriter:
     if _writer is None:
         _writer = MarketKlineWriter(get_market_db_manager())
     return _writer
-
-
-# ---------------------------------------------------------------------------
-# 聚合 VIEW 创建（业务逻辑，从 db_multi.py 迁移）
-# ---------------------------------------------------------------------------
-
-# 聚合目标配置（与 _AGG_VIEW_TFS 对应，拆分为 source/type/sec 便于业务层使用）
-_AGG_VIEW_TARGETS = {
-    "30m": {"source": "15m", "type": "interval", "sec": 1800},
-    "1h":  {"source": "15m", "type": "interval", "sec": 3600},
-    "2h":  {"source": "15m", "type": "interval", "sec": 7200},
-    "4h":  {"source": "15m", "type": "interval", "sec": 14400},
-    "1D":  {"source": "15m", "type": "daily"},
-    "1W":  {"source": "1D",  "type": "weekly"},
-    "1M":  {"source": "1D",  "type": "monthly"},
-}
-
-
-def _create_agg_views_for_market(mgr: MarketDBManager, market: str):
-    """为指定市场创建所有聚合 VIEW（内部实现）。
-
-    按源周期分组，发现分区表后创建 VIEW。
-    被 ensure_agg_views() 和 _schema_init_hook() 共用。
-    """
-    pool = mgr._get_pool(market)
-    tz = 28800  # UTC+8
-
-    by_source: Dict[str, List[str]] = defaultdict(list)
-    for tf, cfg in _AGG_VIEW_TARGETS.items():
-        by_source[cfg["source"]].append(tf)
-
-    with pool.cursor() as cur:
-        for source_tf, target_tfs in by_source.items():
-            cur.execute("""
-                SELECT table_name FROM information_schema.tables
-                WHERE table_schema = 'public'
-                  AND table_type = 'BASE TABLE'
-                  AND table_name LIKE %s
-                ORDER BY table_name
-            """, (f'kline_{source_tf}_%',))
-            tables = [r[0] for r in cur.fetchall()]
-
-            if not tables:
-                logger.warning(f"无法创建聚合 VIEW：没有找到 {source_tf} 表")
-                continue
-
-            agg_prefixes = ('kline_30m_', 'kline_1h_', 'kline_2h_', 'kline_4h_',
-                            'kline_1d_', 'kline_1w_', 'kline_1m_')
-            tables = [t for t in tables if not any(t.startswith(p) for p in agg_prefixes)]
-
-            for tf in target_tfs:
-                cfg = _AGG_VIEW_TARGETS[tf]
-                bucket_type = cfg["type"]
-                view_name = f"kline_{tf}_from_{source_tf}"
-
-                if bucket_type == "interval":
-                    sec = cfg["sec"]
-                    bucket_expr = (
-                        f"to_timestamp(EXTRACT(EPOCH FROM time)"
-                        f" - MOD(EXTRACT(EPOCH FROM time)::bigint, {sec}))"
-                    )
-                elif bucket_type == "daily":
-                    bucket_expr = (
-                        f"to_timestamp("
-                        f"(EXTRACT(EPOCH FROM time + interval '{tz}s')::bigint / 86400) * 86400 - {tz})"
-                    )
-                elif bucket_type == "weekly":
-                    bucket_expr = (
-                        f"to_timestamp("
-                        f"(EXTRACT(EPOCH FROM time + interval '{tz}s')::bigint / 86400) * 86400 - {tz}"
-                        f" - (EXTRACT(DOW FROM time AT TIME ZONE 'Asia/Shanghai')::int - 1 + 7)"
-                        f" % 7 * 86400)"
-                    )
-                elif bucket_type == "monthly":
-                    bucket_expr = (
-                        f"(date_trunc('month', time AT TIME ZONE 'Asia/Shanghai')"
-                        f" AT TIME ZONE 'Asia/Shanghai')"
-                    )
-                else:
-                    continue
-
-                union_parts = []
-                for tbl in tables:
-                    union_parts.append(f'''
-                        SELECT
-                            symbol,
-                            {bucket_expr}                              AS bucket,
-                            (ARRAY_AGG(open  ORDER BY time ASC))[1]    AS open,
-                            MAX(high)                                  AS high,
-                            MIN(low)                                   AS low,
-                            (ARRAY_AGG(close ORDER BY time DESC))[1]   AS close,
-                            SUM(volume)                                AS volume
-                        FROM "{tbl}"
-                        GROUP BY symbol, {bucket_expr}
-                    ''')
-
-                query = f"""
-                    CREATE OR REPLACE VIEW "{view_name}" AS
-                    {' UNION ALL '.join(union_parts)}
-                """
-                cur.execute(query)
-                logger.info(f"✅ 已创建聚合 VIEW: {view_name}（源: {source_tf}）")
-
-    logger.info(f"✅ {market} 聚合 VIEW 全部创建完成")
-
-
-def ensure_agg_views(market: str, manager: MarketDBManager = None):
-    """为指定市场创建所有聚合 VIEW（TIMESTAMP 兼容版本）。
-
-    聚合目标:
-      15m → 30m, 1h, 2h, 4h, 1D
-      1D  → 1W, 1M
-
-    Args:
-        market: 市场标识，如 "CNStock"
-        manager: MarketDBManager 实例（可选，默认使用全局实例）
-    """
-    mgr = manager or get_market_db_manager()
-    _create_agg_views_for_market(mgr, market)
