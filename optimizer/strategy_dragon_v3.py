@@ -357,7 +357,8 @@ class DragonHunterV3:
             return {"buy": False, "reasons": ["数据不足"], "score": 0}
 
         # D0前20天无涨停 (排除近期已被炒作的股票)
-        bt = get_board_type(code)
+        code = str(df.iloc[idx].get("code", "")) if "code" in df.columns else ""
+        bt = get_board_type(code) if code else "main"
         threshold = BOARD_PARAMS[bt]["threshold"]
         lookback = min(20, idx)  # 实际可用历史天数
         if lookback >= 1:

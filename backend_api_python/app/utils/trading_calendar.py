@@ -9,7 +9,7 @@
 import os
 import pickle
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from typing import List, Optional, Set
 
 logger = logging.getLogger(__name__)
@@ -130,14 +130,28 @@ def next_trading_day(date: Optional[str] = None, n: int = 1) -> str:
     return result[-1]
 
 
-def last_trading_day(date: Optional[str] = None) -> str:
-    """最近的交易日（含当天）。当天是交易日则返回当天，否则回退到最近的交易日。"""
-    if date is None:
-        date = datetime.now().strftime("%Y-%m-%d")
-    if is_trading_day(date):
-        return date
-    return prev_trading_day(date)
+def last_finish_trading_day(time: Optional[str] = None) -> str:
+    """返回结束了的交易日。
 
+    time 之前: 返回上一个交易日（当天交易尚未结束）。
+    time 之后: 返回当天（当天交易已结束）。
+    无 time: 始终返回上一个交易日。
+
+    Args:
+        time: 业务截止时间，HH:MM 或 HH:MM:SS 格式，如 "15:05"、"17:00"。
+              默认 None（始终返回上一个交易日）。
+
+    Returns:
+        结束了的交易日日期字符串（YYYY-MM-DD）。
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    if time is not None:
+        parts = time.split(":")
+        h, m = int(parts[0]), int(parts[1])
+        s = int(parts[2]) if len(parts) > 2 else 0
+        if datetime.now().time() >= datetime.now().replace(hour=h, minute=m, second=s, microsecond=0).time() and is_trading_day(today):
+            return today
+    return prev_trading_day(today)
 
 def trade_date_range(start_date: str, end_date: str) -> List[str]:
     """范围内的交易日列表"""

@@ -174,14 +174,14 @@ def run_backtest(bars, entry_idx, entry_price, hold_days=20, stop_loss=-10.0, tr
 def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=11,
                              max_last_chg=3.0,
                              hold_days=20, stop_loss=-5.0, trailing_stop=-5.0,
-                             buy_mode="next_open"):
+                             buy_mode="signal_close"):
     """
     龙回头v3:
     D-N涨停 → 回调3-11天 → 末期十字星/小阳+量<0.8x(弱转强信号) → 买入
 
     buy_mode:
-      signal_close — 信号日收盘买
-      next_open    — D+1开盘买 (默认)
+      signal_close — 信号日收盘买 (默认)
+      next_open    — D+1开盘买
       signal_low   — 信号日最低价买 (理想)
     """
     board_type = get_board_type(code)
@@ -233,11 +233,11 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
         if not is_signal:
             continue
 
-        # RSI过滤: 45 < RSI < 75 (偏多但不超买)
+        # RSI过滤: 45 < RSI < 70 (偏多但不超买)
         if pullback_end >= 15:
             closes = [bars[j]['close'] for j in range(pullback_end - 15, pullback_end + 1)]
             r = rsi(closes, 14)
-            if r is not None and (r <= 45 or r >= 75):
+            if r is not None and (r <= 45 or r >= 70):
                 continue
 
         # 检查是否已被使用
@@ -247,12 +247,10 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
                 skip = True; break
         if skip: continue
 
-        # D+1收阴排除 (所有模式通用)
+        # D+1数据 (用于过滤和回测)
         if pullback_end + 1 >= len(bars): continue
         d1 = bars[pullback_end + 1]
         d1_change = (d1['close'] / last_pb['close'] - 1) * 100
-        if d1_change < 0:
-            continue
 
         # 根据buy_mode确定入场价
         if buy_mode == "signal_close":
@@ -263,6 +261,9 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
             entry_price = d1['open']
             entry_idx = pullback_end + 1
             entry_date = d1['time']
+            # D+1收阴排除 (仅next_open模式)
+            if d1_change < 0:
+                continue
         elif buy_mode == "signal_low":
             entry_price = last_pb['low']
             entry_idx = pullback_end
@@ -296,15 +297,15 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
 
 def strategy_v1(bars, code, min_vol_ratio=2.0, max_upper_shadow=0.5,
                 hold_days=20, stop_loss=-10.0, trailing_stop=-8.0,
-                use_preload_filter=True, buy_mode="next_open",
+                use_preload_filter=True, buy_mode="signal_close",
                 no_limit_lookback=10, use_ema_filter=True, use_rsi_filter=True):
     """V1基线策略
 
     no_limit_lookback: 前N日无涨停过滤 (默认10天, 排除近期有涨停的股票)
 
     buy_mode:
-      signal_close — D0收盘买(涨停价, 可能买不到)
-      next_open    — D+1开盘买 (默认)
+      signal_close — D0收盘买 (默认)
+      next_open    — D+1开盘买
       signal_low   — D0最低价买 (理想)
     """
     board_type = get_board_type(code)
@@ -392,15 +393,14 @@ def strategy_v1(bars, code, min_vol_ratio=2.0, max_upper_shadow=0.5,
             continue
         if entry_price <= 0: continue
 
-        # D1过滤 (仅next_open模式)
+        # D1过滤 (仅next_open模式, signal_close已买入不需要)
+        d1_change = (d1['close'] / fl_close - 1) * 100
         if buy_mode == "next_open":
             d1_gap = (entry_price / fl_close - 1) * 100
             min_d1_gap = -2.0 if board_type == "main" else -5.0
             if d1_gap < min_d1_gap:
                 continue
-
-        d1_change = (d1['close'] / fl_close - 1) * 100
-        if d1_change < 0: continue  # D1收阴排除 (所有模式通用, 信号质量过滤)
+            if d1_change < 0: continue  # D1收阴排除
 
         bt = run_backtest(bars, entry_idx, entry_price, hold_days, stop_loss, trailing_stop, board_type, is_v1=True)
         if not bt: continue
@@ -586,9 +586,9 @@ def main():
     parser.add_argument("--max-last-chg", type=float, default=3.0, help="龙回头末期小阳最大涨幅%%")
     parser.add_argument("--strategy", default="all", choices=["all", "dragon", "v1", "break"],
                         help="运行策略: all=全部, dragon=龙回头, v1=V1, break=断板")
-    parser.add_argument("--buy-mode", default="next_open",
+    parser.add_argument("--buy-mode", default="signal_close",
                         choices=["signal_close", "next_open", "signal_low"],
-                        help="买入模式: signal_close=信号日收盘买, next_open=D+1开盘买(默认), signal_low=信号日最低价(理想)")
+                        help="买入模式: signal_close=信号日收盘买(默认), next_open=D+1开盘买, signal_low=信号日最低价(理想)")
     parser.add_argument("--no-limit-lookback", type=int, default=10, help="V1: 前N日无涨停过滤 (默认10)")
     parser.add_argument("--min-vol-ratio", type=float, default=2.0, help="V1: 最小量比 (默认2.0)")
     parser.add_argument("--max-upper-shadow", type=float, default=0.5, help="V1: 最大上影线%% (默认0.5)")
