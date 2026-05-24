@@ -14,9 +14,9 @@
 from __future__ import annotations
 import os, sys
 from datetime import datetime, timedelta
-from typing import Dict, List, Any, Optional
+from typing import Dict, Any, Optional
 
-import json, time as _time
+import time as _time
 import pandas as pd
 import numpy as np
 import requests as _requests
@@ -46,7 +46,7 @@ def get_stock_name(code: str) -> str:
         name = parts[1] if len(parts) > 1 else ""
         _stock_name_cache[c] = name
         return name
-    except:
+    except Exception:
         _stock_name_cache[c] = ""
         return ""
 
@@ -82,7 +82,7 @@ def get_circ_shares(code: str) -> float:
             return shares
         _circ_shares_cache[c] = 0
         return 0
-    except:
+    except Exception:
         _circ_shares_cache[c] = 0
         return 0
 
@@ -216,9 +216,9 @@ def load_daily_db(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
 
 def _code_to_tencent(code: str) -> str:
     c = code.strip().replace(".", "").replace("SH", "").replace("SZ", "")
-    if c.startswith(("6", "5")): return f"sh{c}"
+    if c.startswith("68"): return f"sh{c}"
+    elif c.startswith(("6", "5")): return f"sh{c}"
     elif c.startswith(("0", "3", "2")): return f"sz{c}"
-    elif c.startswith("68"): return f"sh{c}"
     return ""
 
 def fetch_kline_tencent(code: str, count: int = 300) -> Optional[pd.DataFrame]:
@@ -246,13 +246,13 @@ def fetch_kline_tencent(code: str, count: int = 300) -> Optional[pd.DataFrame]:
                     "high": float(r[3]), "low": float(r[4]),
                     "close": float(r[2]), "volume": float(r[5]) * 100,
                 })
-            except: continue
+            except Exception: continue
         if not bars: return None
         df = pd.DataFrame(bars)
         df["time"] = pd.to_datetime(df["time"])
         df = df.sort_values("time").reset_index(drop=True)
         return df
-    except:
+    except Exception:
         return None
 
 def load_codes_from_csv(csv_path: str) -> list:
@@ -316,14 +316,6 @@ def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
-def calc_atr(high, low, close, period=14):
-    tr1 = high - low
-    tr2 = abs(high - close.shift(1))
-    tr3 = abs(low - close.shift(1))
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr.rolling(window=period, min_periods=1).mean()
-
-
 # ================================================================
 # 策略核心
 # ================================================================
@@ -364,23 +356,19 @@ class DragonHunterV3:
         if idx < 1:
             return {"buy": False, "reasons": ["数据不足"], "score": 0}
 
-        # ST过滤
-        code = str(df.iloc[0].get("code", "")).strip().zfill(6)
-        if is_st_stock(code):
-            return {"buy": False, "reasons": ["ST股排除"], "score": 0}
-
         # D0前20天无涨停 (排除近期已被炒作的股票)
         bt = get_board_type(code)
         threshold = BOARD_PARAMS[bt]["threshold"]
         lookback = min(20, idx)  # 实际可用历史天数
         if lookback >= 1:
             for k in range(1, lookback + 1):
+                if idx - k - 1 < 0:
+                    break
                 prev_k = df.iloc[idx - k]
-                prev_k2 = df.iloc[idx - k - 1] if idx - k - 1 >= 0 else None
-                if prev_k2 is not None and prev_k2["close"] > 0:
-                    ret_k = (prev_k["close"] / prev_k2["close"] - 1)
-                    if ret_k >= threshold * 0.98:
-                        return {"buy": False, "reasons": [f"D0前20天内有涨停"], "score": 0}
+                prev_k2 = df.iloc[idx - k - 1]
+                ret_k = (prev_k["close"] / prev_k2["close"] - 1)
+                if ret_k >= threshold * 0.98:
+                    return {"buy": False, "reasons": [f"D0前20天内有涨停"], "score": 0}
 
         row = df.iloc[idx]
         prev = df.iloc[idx - 1]
@@ -407,6 +395,8 @@ class DragonHunterV3:
             return {"buy": False, "reasons": [f"高开{gap_pct:.1f}%>阈值"], "score": 0}
 
         # 2. 封板强度 (close vs high)
+        if row["high"] <= 0:
+            return {"buy": False, "reasons": ["最高价异常"], "score": 0}
         seal = (row["close"] / row["high"] - 1) * 100
         if seal > self.p["buy_seal_max"]:
             return {"buy": False, "reasons": [f"封板不严: {seal:.2f}%"], "score": 0}
@@ -428,14 +418,17 @@ class DragonHunterV3:
         reasons.append(f"RSI{rsi:.1f}✓")
         score += 10
 
-        # 5. 前1日跌幅 (idx>=2 才有 prev2)
-        if prev2 is not None:
-            prev_ret = (prev["close"] / prev2["close"] - 1) * 100
-            if prev_ret < self.p["buy_pre1_max_drop"]:
-                return {"buy": False, "reasons": [f"前1日大跌: {prev_ret:.2f}%"], "score": 0}
-            reasons.append(f"前1日{prev_ret:+.2f}%✓")
-            if prev_ret > 0:
-                score += 5  # 前1日涨加分
+        # 5. 连板前1日跌幅 (D-1 vs D-2, 即连板段开始前那天不能大跌)
+        if idx >= 3:
+            d_minus1 = df.iloc[idx - 2]
+            d_minus2 = df.iloc[idx - 3]
+            if d_minus2["close"] > 0:
+                prev_ret = (d_minus1["close"] / d_minus2["close"] - 1) * 100
+                if prev_ret < self.p["buy_pre1_max_drop"]:
+                    return {"buy": False, "reasons": [f"连板前1日大跌: {prev_ret:.2f}%"], "score": 0}
+                reasons.append(f"连板前1日{prev_ret:+.2f}%✓")
+                if prev_ret > 0:
+                    score += 5  # 连板前1日涨加分
 
         # 6. 买点日振幅
         day_range = (row["high"] - row["low"]) / row["open"] * 100
@@ -492,7 +485,7 @@ class DragonHunterV3:
             rsi_series = calc_rsi(df["close"].iloc[:idx + 1])
             rsi = float(rsi_series.iloc[-1])
             day_range = row["high"] - row["low"]
-            upper_shadow = (row["high"] - max(row["open"], row["close"])) / day_range * 100 if day_range > 0 else 0
+            upper_shadow = (row["high"] - max(row["open"], row["close"])) / day_range * 100 if day_range != 0 else 0
 
             if rsi >= self.p["peak_sell_rsi"] and upper_shadow >= self.p["peak_sell_upper_shadow"]:
                 return {"sell": True, "reason": f"见顶信号: RSI{rsi:.1f}+上影{upper_shadow:.1f}%", "sell_type": "peak_signal"}
@@ -653,6 +646,12 @@ def run_full_backtest(csv_path: str = "stock_list_2000.csv"):
         if df is None or len(df) < 15:
             _time.sleep(0.15)
             continue
+
+        # ST过滤 (提前过滤, 避免回测循环内反复网络请求)
+        if is_st_stock(code):
+            _time.sleep(0.15)
+            continue
+
         success += 1
 
         board_type = get_board_type(code)
@@ -729,6 +728,11 @@ def run_full_backtest_db(
             df = load_daily_db(code, query_start, query_end)
             if df is None or len(df) < 15:
                 continue
+
+            # ST过滤 (提前过滤, 避免回测循环内反复网络请求)
+            if is_st_stock(code):
+                continue
+
             loaded += 1
 
             board_type = get_board_type(code)
@@ -823,7 +827,7 @@ def _print_backtest_summary(tdf: pd.DataFrame):
     if (tdf['return_pct'] < 0).any():
         win_avg = tdf[tdf['return_pct'] > 0]['return_pct'].mean()
         loss_avg = abs(tdf[tdf['return_pct'] < 0]['return_pct'].mean())
-        print(f"  盈亏比: {win_avg / loss_avg:.2f}")
+        print(f"  盈亏比: {win_avg / loss_avg:.2f}" if loss_avg > 0 else f"  盈亏比: ∞")
 
     for board_type in ["main", "gem_star"]:
         sub = tdf[tdf["board_type"] == board_type]
@@ -834,8 +838,8 @@ def _print_backtest_summary(tdf: pd.DataFrame):
         print(f"    胜率: {(sub['return_pct'] > 0).mean() * 100:.1f}%")
         print(f"    平均收益: {sub['return_pct'].mean():.2f}%")
         win_avg = sub[sub['return_pct'] > 0]['return_pct'].mean() if (sub['return_pct'] > 0).any() else 0
-        loss_avg = abs(sub[sub['return_pct'] < 0]['return_pct'].mean()) if (sub['return_pct'] < 0).any() else 1
-        print(f"    盈亏比: {win_avg / loss_avg:.2f}")
+        loss_avg = abs(sub[sub['return_pct'] < 0]['return_pct'].mean()) if (sub['return_pct'] < 0).any() else 0
+        print(f"    盈亏比: {win_avg / loss_avg:.2f}" if loss_avg > 0 else f"    盈亏比: ∞")
         print(f"    最大盈利: {sub['return_pct'].max():.2f}%")
         print(f"    最大亏损: {sub['return_pct'].min():.2f}%")
 

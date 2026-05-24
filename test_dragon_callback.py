@@ -16,6 +16,37 @@ import json, time, argparse, math
 from collections import defaultdict
 from kline_cache import fetch_kline
 
+def ema(values, period):
+    """计算EMA (指数移动平均)"""
+    if len(values) < period:
+        return None
+    k = 2 / (period + 1)
+    e = sum(values[:period]) / period  # 初始值用SMA
+    for v in values[period:]:
+        e = v * k + e * (1 - k)
+    return e
+
+def rsi(closes, period=14):
+    """计算RSI (相对强弱指数)"""
+    if len(closes) < period + 1:
+        return None
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i-1]
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
+    # 初始SMA
+    avg_g = sum(gains[:period]) / period
+    avg_l = sum(losses[:period]) / period
+    # EMA平滑
+    for i in range(period, len(gains)):
+        avg_g = (avg_g * (period - 1) + gains[i]) / period
+        avg_l = (avg_l * (period - 1) + losses[i]) / period
+    if avg_l == 0:
+        return 100.0
+    rs = avg_g / avg_l
+    return 100 - 100 / (1 + rs)
+
 def get_board_type(code):
     c = str(code)[:3]
     return "gem_star" if c.startswith("30") or c.startswith("68") else "main"
@@ -193,10 +224,21 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
         if last_chg < -3.0 or last_vol_r > 2.0:
             continue
 
+        # 末期量比过滤: 0.5x < 量比 < 0.8x (温和缩量, 筹码锁定)
+        if last_vol_r < 0.5 or last_vol_r >= 0.8:
+            continue
+
         # 十字星: |涨跌|<1.5%, 或小阳: 涨<max_last_chg%
         is_signal = abs(last_chg) < 1.5 or (0 < last_chg < max_last_chg)
         if not is_signal:
             continue
+
+        # RSI过滤: 45 < RSI < 75 (偏多但不超买)
+        if pullback_end >= 15:
+            closes = [bars[j]['close'] for j in range(pullback_end - 15, pullback_end + 1)]
+            r = rsi(closes, 14)
+            if r is not None and (r <= 45 or r >= 75):
+                continue
 
         # 检查是否已被使用
         skip = False
@@ -254,8 +296,11 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
 
 def strategy_v1(bars, code, min_vol_ratio=2.0, max_upper_shadow=0.5,
                 hold_days=20, stop_loss=-10.0, trailing_stop=-8.0,
-                use_preload_filter=True, buy_mode="next_open"):
+                use_preload_filter=True, buy_mode="next_open",
+                no_limit_lookback=10, use_ema_filter=True, use_rsi_filter=True):
     """V1基线策略
+
+    no_limit_lookback: 前N日无涨停过滤 (默认10天, 排除近期有涨停的股票)
 
     buy_mode:
       signal_close — D0收盘买(涨停价, 可能买不到)
@@ -271,9 +316,9 @@ def strategy_v1(bars, code, min_vol_ratio=2.0, max_upper_shadow=0.5,
         if prev_c <= 0: continue
         ret = (bars[i]['close'] / prev_c - 1)
         if ret < threshold * 0.98: continue
-        # 前10天不是涨停（排除连板中间板，只取第一板）
+        # 前N天不是涨停（排除连板中间板+近期有涨停的股票, 只取"干净"第一板）
         skip = False
-        for k in range(1, 11):
+        for k in range(1, no_limit_lookback + 1):
             if i - k < 1: break
             prev_k_c = bars[i-k-1]['close']
             if prev_k_c > 0 and (bars[i-k]['close'] / prev_k_c - 1) >= threshold * 0.98:
@@ -310,6 +355,21 @@ def strategy_v1(bars, code, min_vol_ratio=2.0, max_upper_shadow=0.5,
 
         if use_preload_filter and not has_preload:
             continue
+
+        # EMA趋势过滤: EMA10 > EMA20 (多头排列)
+        if use_ema_filter and i >= 20:
+            closes = [bars[j]['close'] for j in range(i - 20, i + 1)]
+            ema10 = ema(closes, 10)
+            ema20 = ema(closes, 20)
+            if ema10 is not None and ema20 is not None and ema10 <= ema20:
+                continue
+
+        # RSI过滤: 30 < RSI < 70 (排除超买超卖)
+        if use_rsi_filter and i >= 15:
+            closes = [bars[j]['close'] for j in range(i - 15, i + 1)]
+            r = rsi(closes, 14)
+            if r is not None and (r <= 30 or r >= 70):
+                continue
 
         # D1数据 (用于过滤和回测)
         if i + 1 >= len(bars): continue
@@ -529,6 +589,13 @@ def main():
     parser.add_argument("--buy-mode", default="next_open",
                         choices=["signal_close", "next_open", "signal_low"],
                         help="买入模式: signal_close=信号日收盘买, next_open=D+1开盘买(默认), signal_low=信号日最低价(理想)")
+    parser.add_argument("--no-limit-lookback", type=int, default=10, help="V1: 前N日无涨停过滤 (默认10)")
+    parser.add_argument("--min-vol-ratio", type=float, default=2.0, help="V1: 最小量比 (默认2.0)")
+    parser.add_argument("--max-upper-shadow", type=float, default=0.5, help="V1: 最大上影线%% (默认0.5)")
+    parser.add_argument("--v1-stop-loss", type=float, default=-10.0, help="V1: 止损%% (默认-10)")
+    parser.add_argument("--v1-trailing-stop", type=float, default=-8.0, help="V1: 追踪止损%% (默认-8)")
+    parser.add_argument("--no-ema-filter", action="store_true", help="V1: 禁用EMA10>EMA20过滤")
+    parser.add_argument("--no-rsi-filter", action="store_true", help="V1: 禁用RSI 30-70过滤")
     args = parser.parse_args()
 
     codes = [c.strip() for c in args.codes.split(",") if c.strip()] if args.codes else TEST_CODES
@@ -569,7 +636,14 @@ def main():
             dc_trades.extend(dc)
             parts.append(f"龙回头{len(dc)}")
         if run_v1:
-            v1 = strategy_v1(bars, code, use_preload_filter=False, buy_mode=args.buy_mode)
+            v1 = strategy_v1(bars, code, use_preload_filter=False, buy_mode=args.buy_mode,
+                             no_limit_lookback=args.no_limit_lookback,
+                             min_vol_ratio=args.min_vol_ratio,
+                             max_upper_shadow=args.max_upper_shadow,
+                             stop_loss=args.v1_stop_loss,
+                             trailing_stop=args.v1_trailing_stop,
+                             use_ema_filter=not args.no_ema_filter,
+                             use_rsi_filter=not args.no_rsi_filter)
             v1_trades.extend(v1)
             parts.append(f"V1{len(v1)}")
         if run_bb:
