@@ -13,46 +13,7 @@ V3断板买入策略: 在连板股断板位置买入
 from __future__ import annotations
 import time
 from collections import defaultdict
-import requests
-
-_SESSION = requests.Session()
-_SESSION.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
-
-def _code_to_sina(code):
-    c = code.strip().replace(".", "").replace("SH", "").replace("SZ", "")
-    if c.startswith(("6", "5")): return f"sh{c}"
-    elif c.startswith(("0", "3", "2")): return f"sz{c}"
-    elif c.startswith("68"): return f"sh{c}"
-    return ""
-
-def fetch_kline(code, count=300):
-    tc = _code_to_sina(code)
-    if not tc: return []
-    try:
-        resp = _SESSION.get(
-            "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
-            params={"param": f"{tc},day,,,{count},qfq"},
-            headers={"Referer": "https://gu.qq.com/"}, timeout=10,
-        )
-        data = resp.json()
-        if not isinstance(data, dict) or int(data.get("code", 0)) != 0: return []
-        root = (data.get("data") or {}).get(tc)
-        if not isinstance(root, dict): return []
-        rows = root.get("qfqday") or root.get("day") or []
-        bars = []
-        for r in rows:
-            if not isinstance(r, (list, tuple)) or len(r) < 6: continue
-            try:
-                bars.append({
-                    "time": str(r[0])[:10], "open": float(r[1]),
-                    "high": float(r[3]), "low": float(r[4]),
-                    "close": float(r[2]), "volume": float(r[5]) * 100,
-                })
-            except: continue
-        bars.sort(key=lambda x: x["time"])
-        return bars
-    except:
-        return []
+from kline_cache import fetch_kline
 
 def get_board_type(code):
     c = str(code)[:3]
@@ -72,27 +33,26 @@ def is_limit_up(close, prev_close, board_type):
     return (close / prev_close - 1) >= threshold * 0.98
 
 CODES = [
-    "600001","600002","600003","600004","600005","600006","600007","600008","600009","600010",
-    "600011","600012","600013","600014","600015","600016","600017","600018","600019","600020",
-    "600021","600022","600023","600024","600025","600026","600027","600028","600029","600030",
-    "600031","600032","600033","600034","600035","600036","600037","600038","600039","600040",
-    "600041","600042","600043","600044","600045","600046","600047","600048","600049",
-    "000001","000002","000003","000004","000005","000006","000007","000008","000009","000010",
-    "000011","000012","000013","000014","000015","000016","000017","000018","000019","000020",
-    "000021","000022","000023","000024","000025","000026","000027","000028","000029","000030",
-    "000031","000032","000033","000034","000035","000036","000037","000038","000039","000040",
-    "000041","000042","000043","000044","000045","000046","000047","000048","000049",
-    "002001","002002","002003","002004","002005","002006","002007","002008","002009","002010",
-    "002011","002012","002013","002014","002015","002016","002017","002018","002019","002020",
-    "002021","002022","002023","002024","002025","002026","002027","002028","002029","002030",
-    "002031","002032","002033","002034","002035","002036","002037","002038","002039","002040",
-    "002041","002042","002043","002044","002045","002046","002047","002048","002049",
-    "300001","300002","300003","300004","300005","300006","300007","300008","300009","300010",
-    "300011","300012","300013","300014","300015","300016","300017","300018","300019","300020",
-    "300021","300022","300023","300024","300025","300026","300027","300028","300029","300030",
-    "300031","300032","300033","300034","300035","300036","300037","300038","300039",
-    "688001","688002","688003","688004","688005","688006","688007","688008","688009","688010",
-    "688011","688012","688013","688014","688015","688016","688017","688018","688019","688020","688021",
+    "000066","000402","000553","000586","000601","000637","000720","000753","000767","000783",
+    "000925","000950","001208","001259","001316","002010","002011","002012","002013","002014",
+    "002015","002016","002017","002018","002019","002020","002021","002022","002023","002024",
+    "002025","002026","002027","002028","002029","002030","002031","002032","002033","002034",
+    "002035","002036","002037","002038","002039","002040","002041","002042","002043","002044",
+    "002045","002046","002047","002048","002049","002050","002055","002056","002063","002065",
+    "002074","002077","002079","002081","002084","002088","002092","002093","002095","002097",
+    "002100","002104","002106","002111","002115","002119","002120","002125","002127","002130",
+    "002131","002137","002139","002141","002146","002149","002150","002152","002153","002156",
+    "002158","002160","002163","002165","002169","002170","002172","002175","002177","002180",
+    "002183","002185","002188","002190","002191","002194","002196","002198","002200","002202",
+    "002208","002209","002211","002214","002218","002222","002227","002230","002232","002234",
+    "002236","002238","002240","002242","002244","002248","002249","002252","002253","002255",
+    "002258","002261","002263","002266","002268","002270","002272","002274","002276","002278",
+    "002280","002297","002366","002464","002468","002498","002510","002512","002535","002552",
+    "002560","002580","002640","002805","002858","002918","002989","300001","300002","300003",
+    "300004","300005","300006","300007","300008","300009","300010","300011","300012","300013",
+    "300014","300015","300016","300017","300018","300019","300020","300021","300022","300023",
+    "300024","300025","300026","300027","300028","300029","300030","300031","300032","300033",
+    "300034","300035","300036","300037","300038","300039","300059","300106","300124","300152",
 ]
 
 # ================================================================
@@ -144,27 +104,61 @@ def run_backtest(bars, entry_idx, entry_price, hold_days=20, stop_loss=-8.0,
     }
 
 
+# ===== 板块参数分离 =====
+BOARD_PARAMS = {
+    "main": {  # 沪主板 + 深主板
+        "stop_loss": -8.0,
+        "trailing_stop": -6.0,
+        "take_profit": 15.0,
+        "hold_days": 20,
+        "vol_max": 1.2,        # 断板期量比上限 (缩量洗盘)
+        "drawdown_max": -10,   # 断板期最大回撤%
+    },
+    "gem_star": {  # 创业板 + 科创板
+        "stop_loss": -10.0,    # 20cm波动大，止损放宽
+        "trailing_stop": -8.0, # 追踪止损放宽
+        "take_profit": 20.0,   # 止盈提高
+        "hold_days": 15,       # 持仓缩短，20cm波动快
+        "vol_max": 1.5,        # 20cm放量更常见，放宽
+        "drawdown_max": -15,   # 20cm回撤空间更大
+    },
+}
+
+
 def strategy_break_buy(bars, code, min_streak=2, max_break_gap=5,
-                        hold_days=20, stop_loss=-8.0, trailing_stop=-6.0,
-                        take_profit=15.0, buy_mode="break_close",
-                        ideal_filter=False):
+                        buy_mode="break_close",
+                        override_params=None):
     """
-    断板买入策略
+    断板买入策略 (板块参数自动分离)
+
+    入场规则:
+      1. 连板≥2 → 断板
+      2. 断板期不破涨停日开盘价
+      3. 断板期缩量 (量比<板块阈值)
+      4. 断板期回撤<板块阈值
 
     buy_mode:
       "break_close" — 断板日收盘价买入
       "next_open"   — 断板次日开盘价买入
       "break_low"   — 断板日最低价买入(理想化低吸)
 
-    ideal_filter: 启用理想化入场过滤
-      - 断板期不破涨停日开盘价
-      - 断板期日均量比<1.2x (缩量洗盘)
-      - 断板期最大回撤<10%
-      - 断板后必须创新高
-      - 断板最后一天振幅<5% (小实体/十字星)
+    override_params: 可覆盖板块默认参数
     """
     bt = get_board_type(code)
     threshold = 0.098 if bt == "main" else 0.198
+
+    # 合并参数
+    params = dict(BOARD_PARAMS[bt])
+    if override_params:
+        params.update(override_params)
+
+    stop_loss = params["stop_loss"]
+    trailing_stop = params["trailing_stop"]
+    take_profit = params["take_profit"]
+    hold_days = params["hold_days"]
+    vol_max = params["vol_max"]
+    drawdown_max = params["drawdown_max"]
+
     trades = []
     used = set()
 
@@ -207,63 +201,31 @@ def strategy_break_buy(bars, code, min_streak=2, max_break_gap=5,
             else:
                 break
 
-        # 断板后不要求必须再涨停, 只要连板断了就买
+        # ===== 入场过滤 (必须全部通过) =====
+        limit_bar = bars[streak_end]  # 涨停日(最后一板)
+        limit_open = float(limit_bar['open'])
+        limit_close = float(limit_bar['close'])
+        limit_vol = float(limit_bar['volume'])
 
-        # ===== 理想化入场过滤 =====
-        if ideal_filter:
-            limit_bar = bars[streak_end]  # 涨停日(最后一板)
-            limit_open = float(limit_bar['open'])
-            limit_close = float(limit_bar['close'])
-            limit_vol = float(limit_bar['volume'])
+        break_bars = bars[break_idx:break_idx + break_days]
+        if not break_bars:
+            i = streak_end + 1; continue
 
-            # 断板期所有bar
-            break_bars = bars[break_idx:break_idx + break_days]
-            if not break_bars:
-                i = streak_end + 1; continue
+        # 1. 断板期不破涨停日开盘价
+        break_low = min(float(b['low']) for b in break_bars)
+        if break_low < limit_open:
+            i = streak_end + 1; continue
 
-            # 1. 断板期不破涨停日开盘价
-            break_low = min(float(b['low']) for b in break_bars)
-            if break_low < limit_open:
-                i = streak_end + 1; continue
+        # 2. 断板期缩量 (量比<板块阈值)
+        break_vol_sum = sum(float(b['volume']) for b in break_bars)
+        break_vol_avg = break_vol_sum / len(break_bars) if break_bars else 0
+        if limit_vol > 0 and break_vol_avg / limit_vol >= vol_max:
+            i = streak_end + 1; continue
 
-            # 2. 断板期日均量比<1.2x (缩量洗盘)
-            break_vol_sum = sum(float(b['volume']) for b in break_bars)
-            break_vol_avg = break_vol_sum / len(break_bars) if break_bars else 0
-            if limit_vol > 0 and break_vol_avg / limit_vol >= 1.2:
-                i = streak_end + 1; continue
-
-            # 3. 断板期最大回撤<10% (vs涨停日收盘)
-            break_drawdown = (break_low / limit_close - 1) * 100 if limit_close > 0 else 0
-            if break_drawdown < -10:
-                i = streak_end + 1; continue
-
-            # 4. 断板后必须创新高
-            # 找断板后的涨停段
-            post_break_start = break_idx + break_days
-            if post_break_start >= len(bars):
-                i = streak_end + 1; continue
-            # 检查后续是否有涨停
-            has_post_limit = False
-            for j in range(post_break_start, min(post_break_start + 10, len(bars))):
-                if is_limit_up(bars[j]['close'], bars[j-1]['close'], bt):
-                    has_post_limit = True
-                    break
-            if not has_post_limit:
-                i = streak_end + 1; continue
-            # 创新高: 断板后最高价 > 涨停日最高价
-            pre_peak = float(limit_bar['high'])
-            post_high = max(float(bars[j]['high']) for j in range(post_break_start, min(post_break_start + 10, len(bars))))
-            if post_high <= pre_peak:
-                i = streak_end + 1; continue
-
-            # 5. 断板最后一天振幅<5% (小实体/十字星)
-            last_break_bar = bars[break_idx + break_days - 1]
-            lb_open = float(last_break_bar['open'])
-            lb_high = float(last_break_bar['high'])
-            lb_low = float(last_break_bar['low'])
-            lb_range = lb_high - lb_low
-            if lb_open > 0 and lb_range / lb_open >= 0.05:
-                i = streak_end + 1; continue
+        # 3. 断板期最大回撤<板块阈值 (vs涨停日收盘)
+        break_drawdown = (break_low / limit_close - 1) * 100 if limit_close > 0 else 0
+        if break_drawdown < drawdown_max:
+            i = streak_end + 1; continue
 
         # 防重复
         key = (bars[streak_start]['time'], bars[break_idx]['time'])
@@ -344,9 +306,12 @@ def print_stats(trades, label):
 
 def main():
     print(f"{'=' * 80}")
-    print(f"V3断板买入策略回测")
+    print(f"V3断板买入策略回测 (板块参数分离)")
     print(f"{'=' * 80}")
-    print(f"逻辑: 连板≥2 → 断板日买入 → 追踪止损/止盈")
+    print(f"入场: 连板≥2断板 + 不破涨停开盘 + 缩量 + 回撤限制")
+    for bt_name, p in BOARD_PARAMS.items():
+        label = "主板" if bt_name == "main" else "创/科"
+        print(f"  {label}: 止损{p['stop_loss']}% 追踪{p['trailing_stop']}% 止盈{p['take_profit']}% 持仓{p['hold_days']}天 量比<{p['vol_max']}x 回撤>{p['drawdown_max']}%")
     print(f"股票: {len(CODES)}只\n")
 
     all_by_mode = {}
@@ -364,8 +329,7 @@ def main():
             if not bars:
                 print("❌"); continue
             trades = strategy_break_buy(bars, code, buy_mode=mode, min_streak=2,
-                                         max_break_gap=5, hold_days=20,
-                                         stop_loss=-8.0, trailing_stop=-6.0, take_profit=15.0)
+                                         max_break_gap=5)
             all_trades.extend(trades)
             print(f"✓ → {len(trades)}笔")
             success += 1
@@ -427,40 +391,6 @@ def main():
         ls = [t['return_pct'] for t in trades if t['return_pct'] <= 0]
         pl = (sum(ws)/len(ws)) / (abs(sum(ls))/len(ls)) if ws and ls else (999 if ws else 0)
         print(f"{label:>16} {len(trades):>6} {wr:>6.1f}% {avg:>+7.2f}% {peak:>+7.2f}% {pl:>7.2f}")
-
-    # ===== 理想化过滤 =====
-    print(f"\n{'=' * 80}")
-    print(f"🔒 理想化入场过滤 (不破涨停开盘+缩量+回撤<10%+创新高+小实体)")
-    print(f"{'=' * 80}")
-
-    ideal_by_mode = {}
-    for mode, label in [("break_close","断板日收盘"), ("next_open","断板次日开盘")]:
-        all_trades = []
-        success = 0
-        for idx, code in enumerate(CODES):
-            bars = fetch_kline(code, 300)
-            if not bars: continue
-            trades = strategy_break_buy(bars, code, buy_mode=mode, min_streak=2,
-                                         max_break_gap=5, hold_days=20,
-                                         stop_loss=-8.0, trailing_stop=-6.0, take_profit=15.0,
-                                         ideal_filter=True)
-            all_trades.extend(trades)
-            success += 1
-            time.sleep(0.15)
-
-        ideal_by_mode[mode] = all_trades
-
-        if not all_trades:
-            print(f"\n  {label}: 无信号"); continue
-
-        print(f"\n  {label}: {len(all_trades)}笔")
-        print_stats(all_trades, "    总览")
-
-        # 按连板数
-        for sl in sorted(set(t['streak_len'] for t in all_trades)):
-            seg = [t for t in all_trades if t['streak_len'] == sl]
-            if seg:
-                print_stats(seg, f"      {sl}板后断")
 
 
 if __name__ == "__main__":

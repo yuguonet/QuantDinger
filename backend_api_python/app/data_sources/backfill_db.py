@@ -435,7 +435,7 @@ class BackfillDB:
     # ── 15m kline 数据拉取 ──
 
     def _fetch_15m_klines(self, symbols: list) -> list[dict]:
-        """拉取 15m kline 数据。优先 coordinator，失败则回退到 provider 直调。"""
+        """拉取 15m kline 数据。通过 Coordinator.coordinate_market_kline 批量拉取。"""
         from app.data_sources.coordinator import get_coordinator
 
         coord = get_coordinator()
@@ -450,55 +450,33 @@ class BackfillDB:
             if klines:
                 return klines
         except AttributeError:
-            logger.info(f"[同步] {self.source.name} coordinator 无 kline 方法，回退到 provider 直调")
+            logger.info(f"[同步] {self.source.name} coordinator 无 kline 方法，回退到逐 symbol 拉取")
         except Exception as e:
-            logger.warning(f"[同步] {self.source.name} coordinator kline 失败: {e}，回退到 provider 直调")
+            logger.warning(f"[同步] {self.source.name} coordinator kline 失败: {e}，回退到逐 symbol 拉取")
 
         return self._fetch_15m_via_provider(symbols)
 
     def _fetch_15m_via_provider(self, symbols: list) -> list[dict]:
-        """回退方案: 直调 provider 的 kline 方法，逐 symbol 拉取 15m 数据。"""
-        import concurrent.futures
-        from app.data_sources.normalizer import strip_market_prefix
-        from app.data_sources.provider import get_providers
+        """回退方案: 通过 Coordinator.coordinate_market_kline 批量拉取 15m 数据。"""
+        from app.data_sources.coordinator import get_coordinator
 
-        providers = get_providers(capability="kline", market=self.source.market)
-        if not providers:
-            logger.warning(f"[同步] {self.source.name} 无可用 kline provider")
-            return []
+        coord = get_coordinator()
+        logger.info(f"[同步] {self.source.name} 回退: 通过 Coordinator.coordinate_market_kline 批量拉取 15m kline")
 
-        provider = providers[0]
-        pname = getattr(provider, "name", provider.__class__.__name__)
-        logger.info(f"[同步] {self.source.name} 使用 provider={pname} 逐 symbol 拉取 15m kline")
+        try:
+            klines = coord.coordinate_market_kline(
+                symbols=symbols,
+                market=self.source.market,
+                timeframe="15m",
+                count=_15M_BARS_PER_DAY,
+                timeout=float(_BATCH_TIMEOUT),
+            )
+            if klines:
+                return klines
+        except Exception as e:
+            logger.warning(f"[同步] {self.source.name} coordinator market_kline 回退失败: {e}")
 
-        all_bars: list[dict] = []
-        lock = threading.Lock()
-
-        def _fetch_one(symbol):
-            try:
-                bars = provider.fetch_kline(
-                    symbol=symbol,
-                    timeframe="15m",
-                    count=_15M_BARS_PER_DAY,
-                )
-                if bars:
-                    for bar in bars:
-                        bar["symbol"] = strip_market_prefix(symbol)
-                    return bars
-            except Exception as e:
-                logger.debug(f"[同步] {pname} kline {symbol} 失败: {e}")
-            return []
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            futures = [pool.submit(_fetch_one, s) for s in symbols]
-            for fut in concurrent.futures.as_completed(futures):
-                bars = fut.result()
-                if bars:
-                    with lock:
-                        all_bars.extend(bars)
-
-        logger.info(f"[同步] {pname} kline 共返回 {len(all_bars)} 条 bar")
-        return all_bars
+        return []
 
     def _klines_to_records(self, symbols: list, klines: list[dict],
                            fallback_time: datetime, failed_reasons: dict[str, str]) -> list[dict]:
@@ -1098,9 +1076,12 @@ class BackfillDB:
         """删除指定日期+指定 symbols 的 bar 数据，返回删除条数。
 
         用于 force_refetch: 先删旧记录，再重新拉取，确保修复状态准确。
+        注意: kline 表存的是 strip 后的代码，入参加了前缀需先 strip。
         """
+        from app.data_sources.normalizer import strip_market_prefix
         table = self._kline_table(bar_time, tf=tf)
         naive_bar_time = bar_time.replace(tzinfo=None) if bar_time.tzinfo else bar_time
+        clean_symbols = [strip_market_prefix(s) for s in symbols]
         try:
             mgr = get_market_db_manager()
             pool = mgr._get_pool(self.source.db_pool)
@@ -1109,7 +1090,7 @@ class BackfillDB:
                     cur.execute(f"""
                         DELETE FROM {table}
                         WHERE time = %s AND symbol = ANY(%s)
-                    """, (naive_bar_time, symbols))
+                    """, (naive_bar_time, clean_symbols))
                     deleted = cur.rowcount
                     conn.commit()
                     return deleted
