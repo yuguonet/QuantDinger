@@ -168,26 +168,38 @@ def find_limit_ups(bars, board_type):
             result.append(i)
     return result
 
-def run_backtest(bars, entry_idx, entry_price, hold_days=20, stop_loss=-10.0, trailing_stop=-8.0, board_type="main", peak_exit=False, is_v1=False):
+def run_backtest(bars, entry_idx, entry_price, hold_days=20, stop_loss=-10.0, trailing_stop=-8.0, board_type="main", peak_exit=False, is_v1=False, d1_limit_up=None):
     if entry_price <= 0 or entry_idx >= len(bars):
         return None
     limit_threshold = 0.098 if board_type == "main" else 0.198
     peak = entry_price
     exit_p = entry_price
     exit_d = 0
-    d1_limit_up = False
+
+    # 如果外部未传入 d1_limit_up, 则在回测内计算 (兼容旧调用)
+    # 注意: next_open 模式下 entry_idx=pullback_end+1, d=1 访问的是 D2
+    # 因此推荐由调用方预计算并传入
+    if d1_limit_up is None:
+        d1_limit_up = False
+        for d in range(1, hold_days + 1):
+            idx = entry_idx + d
+            if idx >= len(bars): break
+            b = bars[idx]
+            if d == 1:
+                d1_ret = (b['close'] / entry_price - 1)
+                if d1_ret >= limit_threshold * 0.98:
+                    d1_limit_up = True
+            break  # 只需要 d=1 这一根
+        # 重新遍历正式回测
+        peak = entry_price
+        exit_p = entry_price
+        exit_d = 0
 
     for d in range(1, hold_days + 1):
         idx = entry_idx + d
         if idx >= len(bars): break
         b = bars[idx]
         if b['high'] > peak: peak = b['high']
-
-        # D1判断: 是否涨停
-        if d == 1:
-            d1_ret = (b['close'] / entry_price - 1)
-            if d1_ret >= limit_threshold * 0.98:
-                d1_limit_up = True
 
         # V1专属: D1没涨停 → D+2快速离场
         if is_v1 and d == 2 and not d1_limit_up:
@@ -233,8 +245,8 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
                              hold_days=15, stop_loss=-5.0, trailing_stop=-5.0,
                              buy_mode="signal_close"):
     """
-    龙回头v3 (优化版):
-    D-N涨停 → 回调3-11天 → 末期十字星/小阳+量<0.8x(弱转强信号) → 买入
+    龙回头v4 (优化版):
+    D-N涨停 → 回调3-11天 → 末期缩量小阴(-3%~-0.5%)+量比0.5~0.85 → 买入
 
     出场参数 (stop-5 + trail-5 + peak7/30):
       stop_loss    = -5%  (原-5%, 单笔最大亏损控制)
@@ -291,8 +303,8 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
         if last_vol_r < 0.5 or last_vol_r >= 0.8:
             continue
 
-        # 十字星: |涨跌|<1.5%, 或小阳: 涨<max_last_chg%
-        is_signal = abs(last_chg) < 1.5 or (0 < last_chg < max_last_chg)
+        # 末期小阴: -3% < 涨跌 < -0.5% (弱转强信号: 缩量下跌, 抛压枯竭)
+        is_signal = -3.0 < last_chg < -0.5
         if not is_signal:
             continue
 
@@ -337,7 +349,10 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
 
         used_ranges.append((lu_idx, pullback_end))
 
-        result = run_backtest(bars, entry_idx, entry_price, hold_days, stop_loss, trailing_stop, board_type, peak_exit=True)
+        # 预计算 d1_limit_up: 基于 D1 收盘 vs D0 收盘 (信号日)
+        d1_limit_up_val = is_limit_up(d1['close'], last_pb['close'], board_type)
+
+        result = run_backtest(bars, entry_idx, entry_price, hold_days, stop_loss, trailing_stop, board_type, peak_exit=True, d1_limit_up=d1_limit_up_val)
         if not result: continue
 
         trades.append({
@@ -465,7 +480,10 @@ def strategy_v1(bars, code, min_vol_ratio=2.0, max_upper_shadow=0.5,
                 continue
             if d1_change < 0: continue  # D1收阴排除
 
-        bt = run_backtest(bars, entry_idx, entry_price, hold_days, stop_loss, trailing_stop, board_type, is_v1=True)
+        # 预计算 d1_limit_up: 基于 D1 收盘 vs D0 收盘 (涨停日)
+        d1_limit_up_val = is_limit_up(d1['close'], fl_close, board_type)
+
+        bt = run_backtest(bars, entry_idx, entry_price, hold_days, stop_loss, trailing_stop, board_type, is_v1=True, d1_limit_up=d1_limit_up_val)
         if not bt: continue
 
         result.append({
@@ -646,7 +664,7 @@ def main():
     parser.add_argument("--source", choices=["manual", "db"], default="manual",
                         help="数据源: manual=手动指定codes(默认), db=从数据库加载全市场")
     parser.add_argument("--start", type=str, default="2024-01-01", help="DB模式回测开始日期")
-    parser.add_argument("--end", type=str, default="2026-05-22", help="DB模式回测结束日期")
+    parser.add_argument("--end", type=str, default="2026-05-25", help="DB模式回测结束日期")
     parser.add_argument("--all-trades", action="store_true")
     parser.add_argument("--pullback", type=int, default=3, help="龙回头最少回调天数")
     parser.add_argument("--max-pullback", type=int, default=11, help="龙回头最多回调天数")
