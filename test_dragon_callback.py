@@ -505,8 +505,8 @@ def strategy_v1(bars, code, min_vol_ratio=2.0, max_upper_shadow=0.5,
 # ================================================================
 
 BOARD_PARAMS = {
-    "main": {"stop_loss": -8.0, "trailing_stop": -6.0, "take_profit": 15.0, "hold_days": 20, "vol_max": 1.2, "drawdown_max": -10},
-    "gem_star": {"stop_loss": -10.0, "trailing_stop": -8.0, "take_profit": 20.0, "hold_days": 15, "vol_max": 1.5, "drawdown_max": -15},
+    "main": {"stop_loss": -8.0, "trailing_stop": -6.0, "take_profit": 15.0, "hold_days": 20, "vol_min": 1.2, "vol_max": 2.0, "drawdown_max": -10},
+    "gem_star": {"stop_loss": -10.0, "trailing_stop": -8.0, "take_profit": 20.0, "hold_days": 15, "vol_min": 1.2, "vol_max": 2.5, "drawdown_max": -15},
 }
 
 def run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=20, stop_loss=-8.0,
@@ -550,15 +550,23 @@ def run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=20, stop_loss=
         'peak_return_pct': round((peak / entry_price - 1) * 100, 2),
     }
 
-def strategy_break_buy(bars, code, min_streak=2, max_break_gap=5, buy_mode="break_close", override_params=None):
-    """断板买入: 连板≥2 → 断板 → 缩量不破位 → 买入 (带止盈+峰值逃顶)"""
+def strategy_break_buy(bars, code, min_streak=2, max_break_gap=5, buy_mode="break_close",
+                       override_params=None, use_relay=False, relay_window=7, relay_min_limits=2):
+    """断板买入: 连板≥2 → 断板 → 缩量不破位 → 买入 (带止盈+峰值逃顶)
+
+    新增接力模式 (use_relay=True):
+      N天M板 → 断板 → 缩量下跌不破位 → 买入
+      默认: 7天4板+
+    """
     bt = get_board_type(code)
     threshold = 0.098 if bt == "main" else 0.198
     params = dict(BOARD_PARAMS[bt])
     if override_params: params.update(override_params)
     stop_loss, trailing_stop, take_profit = params["stop_loss"], params["trailing_stop"], params["take_profit"]
-    hold_days, vol_max, drawdown_max = params["hold_days"], params["vol_max"], params["drawdown_max"]
+    hold_days, vol_min, vol_max, drawdown_max = params["hold_days"], params["vol_min"], params["vol_max"], params["drawdown_max"]
     trades, used = [], set()
+
+    # ===== 模式1: 连板后断板 (原有逻辑) =====
     i = 1
     while i < len(bars) - 1:
         if not is_limit_up(bars[i]['close'], bars[i-1]['close'], bt): i += 1; continue
@@ -582,7 +590,14 @@ def strategy_break_buy(bars, code, min_streak=2, max_break_gap=5, buy_mode="brea
         break_low = min(float(b['low']) for b in break_bars)
         if break_low < limit_open: i = streak_end + 1; continue
         break_vol_avg = sum(float(b['volume']) for b in break_bars) / len(break_bars)
-        if limit_vol > 0 and break_vol_avg / limit_vol >= vol_max: i = streak_end + 1; continue
+        break_vol_r = break_vol_avg / limit_vol if limit_vol > 0 else 0
+        if break_vol_r < vol_min or break_vol_r >= vol_max: i = streak_end + 1; continue
+        # 断板日涨跌过滤: 涨0-8% (高开低走但不破位)
+        break_chg = (bars[break_idx]['close'] / limit_close - 1) * 100 if limit_close > 0 else 0
+        if break_chg < 0 or break_chg >= 8: i = streak_end + 1; continue
+        # 断板日开盘过滤: 高开0-2%
+        break_gap = (bars[break_idx]['open'] / limit_close - 1) * 100 if limit_close > 0 else 0
+        if break_gap < 0 or break_gap >= 2: i = streak_end + 1; continue
         break_drawdown = (break_low / limit_close - 1) * 100 if limit_close > 0 else 0
         if break_drawdown < drawdown_max: i = streak_end + 1; continue
         key = (bars[streak_start]['time'], bars[break_idx]['time'])
@@ -602,6 +617,7 @@ def strategy_break_buy(bars, code, min_streak=2, max_break_gap=5, buy_mode="brea
         break_gap = (break_bar['open'] / prev_bar['close'] - 1) * 100
         trades.append({
             'code': code, 'board': get_board_name(code), 'path': 'break_buy', 'path_label': '断板',
+            'mode': 'streak_break',
             'streak_len': streak_len, 'streak_start': bars[streak_start]['time'], 'streak_end': bars[streak_end]['time'],
             'break_date': bars[break_idx]['time'],
             'break_chg': round(break_chg, 2),
@@ -610,6 +626,98 @@ def strategy_break_buy(bars, code, min_streak=2, max_break_gap=5, buy_mode="brea
             'entry_date': bars[entry_idx]['time'], 'entry_price': round(entry_price, 3), 'buy_mode': buy_mode, **result,
         })
         i = streak_end + 1
+
+    # ===== 模式2: N天M板接力 (新增) =====
+    if use_relay:
+        for idx in range(relay_window, len(bars) - 1):
+            # 统计窗口内涨停数
+            limit_count = 0
+            limit_indices = []
+            for j in range(idx - relay_window + 1, idx + 1):
+                if j >= 1 and is_limit_up(bars[j]['close'], bars[j-1]['close'], bt):
+                    limit_count += 1
+                    limit_indices.append(j)
+
+            if limit_count < relay_min_limits:
+                continue
+
+            last_limit = limit_indices[-1]
+
+            # 检查最后涨停后是否断板
+            if last_limit + 1 >= len(bars):
+                continue
+            next_is_limit = is_limit_up(bars[last_limit+1]['close'], bars[last_limit]['close'], bt)
+            if next_is_limit:
+                continue
+
+            break_bar = bars[last_limit + 1]
+            limit_bar = bars[last_limit]
+            limit_vol = float(limit_bar['volume'])
+            break_chg = (break_bar['close'] / limit_bar['close'] - 1) * 100
+            break_vol_r = break_bar['volume'] / limit_vol if limit_vol > 0 else 0
+
+            # 过滤1: 断板日必须跌，但不能跌>8%（洗盘但不破位）
+            if break_chg > 0:
+                continue
+            if break_chg < -8:
+                continue
+
+            # 过滤2: 断板日缩量<1.5x（抛压枯竭）
+            if break_vol_r > 1.5:
+                continue
+
+            # 过滤3: 不破前涨停开盘价（支撑有效）
+            if len(limit_indices) >= 2:
+                prev_limit = limit_indices[-2]
+                prev_open = bars[prev_limit]['open']
+                if break_bar['low'] < prev_open:
+                    continue
+
+            # 去重
+            key = (code, bars[last_limit]['time'])
+            if key in used:
+                continue
+            used.add(key)
+
+            # 买入
+            if buy_mode == "next_open":
+                if last_limit + 2 >= len(bars):
+                    continue
+                entry_bar = bars[last_limit + 2]
+                entry_price = entry_bar['open']
+                entry_idx = last_limit + 2
+                # D+1开盘不能高开>5%
+                gap = (entry_price / break_bar['close'] - 1) * 100
+                if gap > 5:
+                    continue
+            elif buy_mode == "break_close":
+                entry_price = break_bar['close']
+                entry_idx = last_limit + 1
+            elif buy_mode == "break_low":
+                entry_price = break_bar['low']
+                entry_idx = last_limit + 1
+            else:
+                continue
+
+            if entry_price <= 0:
+                continue
+
+            result = run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days, stop_loss, trailing_stop, bt)
+            if not result:
+                continue
+
+            trades.append({
+                'code': code, 'board': get_board_name(code), 'path': 'break_buy', 'path_label': '断板',
+                'mode': 'relay',
+                'relay_window': relay_window,
+                'relay_limits': limit_count,
+                'last_limit': bars[last_limit]['time'],
+                'break_date': break_bar['time'],
+                'break_chg': round(break_chg, 2),
+                'break_vol_r': round(break_vol_r, 2),
+                'entry_date': bars[entry_idx]['time'], 'entry_price': round(entry_price, 3), 'buy_mode': buy_mode, **result,
+            })
+
     return trades
 
 # ================================================================
@@ -784,10 +892,21 @@ def main():
         print(f"\n📊 断板:")
         print_stats(bb_trades, "断板")
         if bb_trades:
-            print(f"\n  按连板数:")
-            for sl in sorted(set(t['streak_len'] for t in bb_trades)):
-                seg = [t for t in bb_trades if t['streak_len'] == sl]
-                print_stats(seg, f"    {sl}板后断")
+            # 按模式分
+            streak_trades = [t for t in bb_trades if t.get('mode') == 'streak_break']
+            relay_trades = [t for t in bb_trades if t.get('mode') == 'relay']
+            if streak_trades:
+                print(f"\n  连板后断板 ({len(streak_trades)}笔):")
+                for sl in sorted(set(t['streak_len'] for t in streak_trades)):
+                    seg = [t for t in streak_trades if t['streak_len'] == sl]
+                    print_stats(seg, f"    {sl}板后断")
+            if relay_trades:
+                print(f"\n  接力断板 ({len(relay_trades)}笔):")
+                for w in sorted(set(t['relay_window'] for t in relay_trades)):
+                    seg = [t for t in relay_trades if t['relay_window'] == w]
+                    for m in sorted(set(t['relay_limits'] for t in seg), reverse=True):
+                        sub = [t for t in seg if t['relay_limits'] == m]
+                        print_stats(sub, f"    {w}天{m}板")
 
     # ===== 混合结果 =====
     all_trades = dc_trades + v1_trades + bb_trades
