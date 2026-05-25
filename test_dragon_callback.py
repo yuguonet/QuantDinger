@@ -306,7 +306,7 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
         # 检查是否已被使用
         skip = False
         for (s, e) in used_ranges:
-            if abs(pullback_end - s) <= 2 or abs(pullback_end - e) <= 2:
+            if abs(pullback_end - s) <= 4 or abs(pullback_end - e) <= 4:
                 skip = True; break
         if skip: continue
 
