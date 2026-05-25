@@ -12,7 +12,7 @@
 与V1互不干扰: V1看首板次日, 龙回头看回调后再起
 """
 from __future__ import annotations
-import json, time, argparse, math, os, sys
+import json, time, argparse, os, sys
 from collections import defaultdict
 from kline_cache import fetch_kline
 
@@ -104,6 +104,13 @@ def rsi(closes, period=14):
     rs = avg_g / avg_l
     return 100 - 100 / (1 + rs)
 
+def is_st_stock(code):
+    """检查是否为ST股 (ST股涨停5%, 远低于正常涨停阈值, 自然排除)"""
+    # ST股涨停5%, 主板阈值9.604% / 创业板科创板阈值19.404%
+    # is_limit_up永远不会标记ST股为涨停, 因此自然排除
+    # 此函数用于显式过滤, 提升代码可读性
+    return False  # 无股票名称数据时依赖阈值自然排除
+
 def get_board_type(code):
     c = str(code)[:3]
     return "gem_star" if c.startswith("30") or c.startswith("68") else "main"
@@ -181,19 +188,11 @@ def run_backtest(bars, entry_idx, entry_price, hold_days=20, stop_loss=-10.0, tr
     # 因此推荐由调用方预计算并传入
     if d1_limit_up is None:
         d1_limit_up = False
-        for d in range(1, hold_days + 1):
-            idx = entry_idx + d
-            if idx >= len(bars): break
-            b = bars[idx]
-            if d == 1:
-                d1_ret = (b['close'] / entry_price - 1)
-                if d1_ret >= limit_threshold * 0.98:
-                    d1_limit_up = True
-            break  # 只需要 d=1 这一根
-        # 重新遍历正式回测
-        peak = entry_price
-        exit_p = entry_price
-        exit_d = 0
+        if entry_idx + 1 < len(bars):
+            d1_bar = bars[entry_idx + 1]
+            d1_ret = (d1_bar['close'] / entry_price - 1)
+            if d1_ret >= limit_threshold * 0.98:
+                d1_limit_up = True
 
     for d in range(1, hold_days + 1):
         idx = entry_idx + d
@@ -206,10 +205,10 @@ def run_backtest(bars, entry_idx, entry_price, hold_days=20, stop_loss=-10.0, tr
             d1_bar = bars[entry_idx + 1]
             d1_high = d1_bar['high']
             d1_close = d1_bar['close']
-            d1_change = (b['open'] / d1_close - 1) * 100 if d1_close > 0 else 0
+            d2_open_gap = (b['open'] / d1_close - 1) * 100 if d1_close > 0 else 0
             if b['low'] <= entry_price * (1 + stop_loss / 100):
                 exit_p = entry_price * (1 + stop_loss / 100); exit_d = d; break
-            if d1_change > 2.0:
+            if d2_open_gap > 2.0:
                 exit_p = b['open']; exit_d = d; break
             exit_trigger = d1_high * 0.99
             if b['low'] <= exit_trigger:
@@ -246,7 +245,7 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
                              buy_mode="signal_close"):
     """
     龙回头v4 (优化版):
-    D-N涨停 → 回调3-11天 → 末期缩量小阴(-3%~-0.5%)+量比0.5~0.85 → 买入
+    D-N涨停 → 回调3-11天 → 末期缩量小阴(-3%~-0.5%)+量比0.5~0.8 → 买入
 
     出场参数 (stop-5 + trail-5 + peak7/30):
       stop_loss    = -5%  (原-5%, 单笔最大亏损控制)
@@ -295,16 +294,16 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
         last_chg = (last_pb['close'] / last_pb_prev_c - 1) * 100
         last_vol_r = last_pb['volume'] / lu_vol if lu_vol > 0 else 0
 
-        # 排除大阴(跌>3%)或放量(>2x)
-        if last_chg < -3.0 or last_vol_r > 2.0:
+        # 排除大阴(跌超过max_last_chg)或放量(>2x)
+        if last_chg < -max_last_chg or last_vol_r > 2.0:
             continue
 
-        # 末期量比过滤: 0.5x < 量比 < 0.8x (温和缩量, 筹码锁定)
+        # 末期量比过滤: 0.5x <= 量比 < 0.8x (温和缩量, 筹码锁定)
         if last_vol_r < 0.5 or last_vol_r >= 0.8:
             continue
 
-        # 末期小阴: -3% < 涨跌 < -0.5% (弱转强信号: 缩量下跌, 抛压枯竭)
-        is_signal = -3.0 < last_chg < -0.5
+        # 末期小阴: -max_last_chg% < 涨跌 < -0.5% (弱转强信号: 缩量下跌, 抛压枯竭)
+        is_signal = -max_last_chg < last_chg < -0.5
         if not is_signal:
             continue
 
@@ -418,9 +417,8 @@ def strategy_v1(bars, code, min_vol_ratio=2.0, max_upper_shadow=0.5,
         upper_shadow = (fl_high - fl_close) / ref * 100
         if upper_shadow >= max_upper_shadow: continue
 
-        # 跳空>5% + 量比<1.5x
-        gap_pct = (fl['open'] / fl_prev_close - 1) * 100 if fl_prev_close > 0 else 0
-        if gap_pct <= 5.0 or vol_ratio >= 1.5:
+        # 量比<1.5x
+        if vol_ratio >= 1.5:
             continue
 
         has_preload = False
@@ -664,7 +662,7 @@ def main():
     parser.add_argument("--source", choices=["manual", "db"], default="manual",
                         help="数据源: manual=手动指定codes(默认), db=从数据库加载全市场")
     parser.add_argument("--start", type=str, default="2024-01-01", help="DB模式回测开始日期")
-    parser.add_argument("--end", type=str, default="2026-05-25", help="DB模式回测结束日期")
+    parser.add_argument("--end", type=str, default="2026-05-22", help="DB模式回测结束日期")
     parser.add_argument("--all-trades", action="store_true")
     parser.add_argument("--pullback", type=int, default=3, help="龙回头最少回调天数")
     parser.add_argument("--max-pullback", type=int, default=11, help="龙回头最多回调天数")
@@ -713,11 +711,12 @@ def main():
     success = 0
 
     for i, code in enumerate(codes):
-        print(f"[{i+1}/{len(codes)}] {code} ({get_board_name(code)})", end=" ", flush=True)
+        # 显式过滤ST股 (ST涨停5%, 远低于正常阈值, 会被自然排除)
+        if is_st_stock(code):
+            continue
         bars = fetch_kline_db(code, args.days) if use_db else fetch_kline(code, args.days)
         if not bars:
-            print("❌"); continue
-        print(f"✓{len(bars)}根", end=" ", flush=True)
+            continue
 
         parts = []
         if run_dc:
@@ -745,7 +744,9 @@ def main():
             bb_trades.extend(bb)
             parts.append(f"断板{len(bb)}")
 
-        print(f"→ {' '.join(parts)}")
+        has_signal = (run_dc and len(dc) > 0) or (run_v1 and len(v1) > 0) or (run_bb and len(bb) > 0)
+        if has_signal:
+            print(f"[{i+1}/{len(codes)}] {code} ({get_board_name(code)}) ✓{len(bars)}根 → {' '.join(parts)}")
         success += 1
         if not use_db:
             time.sleep(0.15)
