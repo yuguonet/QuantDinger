@@ -129,29 +129,42 @@ def next_trading_day(date: Optional[str] = None, n: int = 1) -> str:
         dt += timedelta(days=1)
     return result[-1]
 
+def last_finish_trading_day(ref_dt: Optional[str] = None) -> str:
+    """返回已经结束的最近一个交易日。
 
-def last_finish_trading_day(time: Optional[str] = None) -> str:
-    """返回结束了的交易日。
-
-    time 之前: 返回上一个交易日（当天交易尚未结束）。
-    time 之后: 返回当天（当天交易已结束）。
-    无 time: 始终返回上一个交易日。
+    以 ref_dt 为参考点（默认当前时间）：
+      - ref_dt 所在日期是交易日，且时间 >= 15:00:00 → 返回该日期
+      - 否则（非交易日，或交易日但 < 15:00:00）→ 返回上一个交易日
 
     Args:
-        time: 业务截止时间，HH:MM 或 HH:MM:SS 格式，如 "15:05"、"17:00"。
-              默认 None（始终返回上一个交易日）。
+        ref_dt: 参考时刻字符串，支持以下格式：
+                - "YYYY-MM-DD HH:MM:SS"
+                - "YYYY-MM-DD HH:MM"
+                - "YYYY-MM-DD"（时间视为 00:00:00）
+                若为 None 则使用当前时间。
 
     Returns:
-        结束了的交易日日期字符串（YYYY-MM-DD）。
+        日期字符串（YYYY-MM-DD）。
     """
-    today = datetime.now().strftime("%Y-%m-%d")
-    if time is not None:
-        parts = time.split(":")
-        h, m = int(parts[0]), int(parts[1])
-        s = int(parts[2]) if len(parts) > 2 else 0
-        if datetime.now().time() >= datetime.now().replace(hour=h, minute=m, second=s, microsecond=0).time() and is_trading_day(today):
-            return today
-    return prev_trading_day(today)
+    if ref_dt is None:
+        dt = datetime.now()
+    else:
+        # 尝试完整日期时间格式，失败则按纯日期解析（时间默认 00:00:00）
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(ref_dt, fmt)
+                break
+            except ValueError:
+                continue
+        else:
+            raise ValueError(f"无法解析日期字符串: {ref_dt}")
+
+    ref_date = dt.strftime("%Y-%m-%d")
+    cutoff = dt.replace(hour=15, minute=0, second=0, microsecond=0)
+
+    if is_trading_day(ref_date) and dt >= cutoff:
+        return ref_date
+    return prev_trading_day(ref_date)
 
 def trade_date_range(start_date: str, end_date: str) -> List[str]:
     """范围内的交易日列表"""
