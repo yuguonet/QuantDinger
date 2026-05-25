@@ -204,20 +204,20 @@ def run_backtest(bars, entry_idx, entry_price, hold_days=20, stop_loss=-10.0, tr
                 exit_p = exit_trigger; exit_d = d; break
             exit_p = b['close']; exit_d = d; break
 
-        # 通用出场: 追踪止损
+        # ① 峰值逃顶(优先): 涨>7%后大上影线(>30%)→收盘逃顶
+        if peak_exit:
+            ret = (b['close'] / entry_price - 1) * 100
+            if ret > 7:
+                bar_range = b['high'] - b['low']
+                upper = (b['high'] - max(b['open'], b['close'])) / bar_range * 100 if bar_range > 0 else 0
+                if upper > 30 and b['close'] < b['high'] * 0.98:
+                    exit_p = b['close']; exit_d = d; break
+
+        # ② 追踪止损
         if d > 1 and b['low'] <= peak * (1 + trailing_stop / 100):
             exit_p = peak * (1 + trailing_stop / 100); exit_d = d; break
         if b['low'] <= entry_price * (1 + stop_loss / 100):
             exit_p = entry_price * (1 + stop_loss / 100); exit_d = d; break
-
-        # 峰值逃顶: 涨>10%后大上影线(>40%)→收盘逃顶
-        if peak_exit:
-            ret = (b['close'] / entry_price - 1) * 100
-            if ret > 10:
-                bar_range = b['high'] - b['low']
-                upper = (b['high'] - max(b['open'], b['close'])) / bar_range * 100 if bar_range > 0 else 0
-                if upper > 40 and b['close'] < b['high'] * 0.98:
-                    exit_p = b['close']; exit_d = d; break
 
         exit_p = b['close']; exit_d = d
 
@@ -230,11 +230,17 @@ def run_backtest(bars, entry_idx, entry_price, hold_days=20, stop_loss=-10.0, tr
 
 def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=11,
                              max_last_chg=3.0,
-                             hold_days=20, stop_loss=-5.0, trailing_stop=-5.0,
+                             hold_days=15, stop_loss=-5.0, trailing_stop=-5.0,
                              buy_mode="signal_close"):
     """
-    龙回头v3:
+    龙回头v3 (优化版):
     D-N涨停 → 回调3-11天 → 末期十字星/小阳+量<0.8x(弱转强信号) → 买入
+
+    出场参数 (stop-5 + trail-5 + peak7/30):
+      stop_loss    = -5%  (原-5%, 单笔最大亏损控制)
+      trailing_stop = -5% (原-5%, 更早锁利)
+      hold_days    = 10   (原15, 时间止损兜底)
+      peak_escape : 涨>7%后上影线>30%逃顶 (原10%/40%)
 
     buy_mode:
       signal_close — 信号日收盘买 (默认)
