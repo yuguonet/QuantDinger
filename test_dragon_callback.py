@@ -12,9 +12,66 @@
 与V1互不干扰: V1看首板次日, 龙回头看回调后再起
 """
 from __future__ import annotations
-import json, time, argparse, math
+import json, time, argparse, math, os, sys
 from collections import defaultdict
 from kline_cache import fetch_kline
+
+# ================================================================
+# DB 数据加载 (抄 optimizer/strategy_dragon_v3.py)
+# ================================================================
+_backend_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backend_api_python")
+if _backend_root not in sys.path:
+    sys.path.insert(0, _backend_root)
+
+def _load_env():
+    try:
+        from dotenv import load_dotenv
+        for p in [os.path.join(_backend_root, '.env'), os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')]:
+            if os.path.isfile(p):
+                load_dotenv(p, override=False)
+                break
+    except Exception:
+        pass
+
+_writer_cache = None
+def _get_writer():
+    global _writer_cache
+    if _writer_cache is not None:
+        return _writer_cache
+    _load_env()
+    from app.utils.db_market import get_market_kline_writer
+    _writer_cache = get_market_kline_writer()
+    return _writer_cache
+
+def get_all_codes_db():
+    writer = _get_writer()
+    stats = writer.stats("CNStock")
+    return stats.get("symbol_list", []) if stats.get("exists") else []
+
+def fetch_kline_db(code, days=300):
+    """从DB加载日线, 返回与fetch_kline兼容的格式(list[dict])"""
+    import pandas as pd
+    from datetime import datetime, timedelta
+    end = datetime.now().strftime("%Y-%m-%d")
+    start = (datetime.now() - timedelta(days=int(days * 1.5))).strftime("%Y-%m-%d")
+    try:
+        writer = _get_writer()
+        data = writer.query("CNStock", code, "1D", start_time=start, end_time=end, limit=0)
+        if not data:
+            return []
+        bars = []
+        for r in data:
+            bars.append({
+                "time": str(r["time"])[:10],
+                "open": float(r["open"]),
+                "high": float(r["high"]),
+                "low": float(r["low"]),
+                "close": float(r["close"]),
+                "volume": float(r["volume"]),
+            })
+        return bars
+    except Exception:
+        return []
 
 def ema(values, period):
     """计算EMA (指数移动平均)"""
@@ -580,6 +637,10 @@ def main():
     parser = argparse.ArgumentParser(description="龙回头 + V1 + 断板 三策略回测")
     parser.add_argument("--codes", default="")
     parser.add_argument("--days", type=int, default=300)
+    parser.add_argument("--source", choices=["manual", "db"], default="manual",
+                        help="数据源: manual=手动指定codes(默认), db=从数据库加载全市场")
+    parser.add_argument("--start", type=str, default="2024-01-01", help="DB模式回测开始日期")
+    parser.add_argument("--end", type=str, default="2026-05-22", help="DB模式回测结束日期")
     parser.add_argument("--all-trades", action="store_true")
     parser.add_argument("--pullback", type=int, default=3, help="龙回头最少回调天数")
     parser.add_argument("--max-pullback", type=int, default=11, help="龙回头最多回调天数")
@@ -599,6 +660,14 @@ def main():
     args = parser.parse_args()
 
     codes = [c.strip() for c in args.codes.split(",") if c.strip()] if args.codes else TEST_CODES
+
+    # DB模式: 从数据库加载全市场代码
+    use_db = args.source == "db"
+    if use_db:
+        print("📊 DB模式: 从数据库加载全市场股票...")
+        codes = get_all_codes_db()
+        print(f"   全市场: {len(codes)} 只股票")
+
     run_dc = args.strategy in ("all", "dragon")
     run_v1 = args.strategy in ("all", "v1")
     run_bb = args.strategy in ("all", "break")
@@ -621,7 +690,7 @@ def main():
 
     for i, code in enumerate(codes):
         print(f"[{i+1}/{len(codes)}] {code} ({get_board_name(code)})", end=" ", flush=True)
-        bars = fetch_kline(code, args.days)
+        bars = fetch_kline_db(code, args.days) if use_db else fetch_kline(code, args.days)
         if not bars:
             print("❌"); continue
         print(f"✓{len(bars)}根", end=" ", flush=True)
@@ -654,7 +723,8 @@ def main():
 
         print(f"→ {' '.join(parts)}")
         success += 1
-        time.sleep(0.15)
+        if not use_db:
+            time.sleep(0.15)
 
     # ===== 独立结果 =====
     print(f"\n{'=' * 80}")
