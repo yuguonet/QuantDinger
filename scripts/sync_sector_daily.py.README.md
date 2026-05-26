@@ -12,6 +12,7 @@ CREATE TABLE sector_daily_stats (
     sector_name VARCHAR(50)  NOT NULL,   -- 板块名
     stock_count     INT DEFAULT 0,       -- 板块内股票总数
     limit_up_count  INT DEFAULT 0,       -- 涨停数
+    limit_down_count  INT DEFAULT 0,     -- 跌停数    
     advance_count   INT DEFAULT 0,       -- 上涨数
     decline_count   INT DEFAULT 0,       -- 下跌数
     total_volume    DOUBLE PRECISION DEFAULT 0,  -- 总成交量
