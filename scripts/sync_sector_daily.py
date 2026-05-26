@@ -130,10 +130,10 @@ def load_stock_sector_map(pool) -> Tuple[Dict[str, List[str]], Dict[str, List[st
 # 获取某日全部股票 K 线
 # ============================================================
 
-def load_kline_for_date(target_date: str) -> Dict[str, dict]:
+def load_kline_for_date(target_date: str, symbols: List[str] = None, pool=None) -> Dict[str, dict]:
     """
     通过 MarketKlineWriter 读取指定日期的全部股票日K线。
-    模式与 cn_stock.py 的 _read_db 一致：全量读取，内存过滤。
+    全量查询后内存过滤（与原逻辑一致，避免 start_time/end_time 兼容问题）。
 
     返回: {symbol: {"open": float, "high": float, "low": float,
                      "close": float, "volume": float, "pre_close": float}}
@@ -143,25 +143,28 @@ def load_kline_for_date(target_date: str) -> Dict[str, dict]:
 
     writer = get_market_kline_writer()
 
-    # 从 stock_basic_info 拿全量 symbol
-    from app.utils.basicinfo_db import get_stock_basic_db
-    db = get_stock_basic_db()
-    pool = db._get_pool()
-    with pool.cursor() as cur:
-        cur.execute("SELECT symbol FROM stock_basic_info WHERE status = 'active'")
-        symbols = [row[0] for row in cur.fetchall()]
+    if symbols is None:
+        from app.utils.basicinfo_db import get_stock_basic_db
+        db = get_stock_basic_db()
+        pool = db._get_pool()
+        with pool.cursor() as cur:
+            cur.execute("SELECT symbol FROM stock_basic_info WHERE status = 'active'")
+            symbols = [row[0] for row in cur.fetchall()]
+
+    # 用交易日历取前一个交易日，只查两天
+    from app.utils.trading_calendar import prev_trading_day
+    prev_date = prev_trading_day(target_date, n=1)
 
     today_data = {}
-    pre_close_map = {}
 
     for sym in symbols:
         db_symbol = strip_market_prefix(sym)
         try:
             rows = writer.query("CNStock", db_symbol, "1D",
-                                start_time=None, end_time=None, limit=10000)
+                                start_time=prev_date, end_time=target_date, limit=5)
         except Exception:
             continue
-        if not rows:
+        if not rows or len(rows) < 2:
             continue
 
         # 内存里找 target_date 和前一日
@@ -169,7 +172,6 @@ def load_kline_for_date(target_date: str) -> Dict[str, dict]:
         prev_close = None
         for i, r in enumerate(rows):
             t = r.get("time")
-            # time 可能是 datetime 或 timestamp
             if hasattr(t, 'strftime'):
                 date_str = t.strftime("%Y-%m-%d")
             else:
@@ -193,6 +195,81 @@ def load_kline_for_date(target_date: str) -> Dict[str, dict]:
         }
 
     return today_data
+
+
+def load_kline_all_dates(start_date: str, end_date: str, symbols: List[str] = None) -> Dict[str, Dict[str, dict]]:
+    """
+    回填模式专用：一次性加载全部K线（start_time=None, end_time=None），
+    按日期索引返回。只查一次全量，避免回填 N 天重复查询。
+
+    返回: {target_date: {symbol: {"open": ..., "close": ..., "pre_close": ...}, ...}, ...}
+    """
+    from app.utils.db_market import get_market_kline_writer
+    from app.data_sources.normalizer import strip_market_prefix
+
+    writer = get_market_kline_writer()
+
+    if symbols is None:
+        from app.utils.basicinfo_db import get_stock_basic_db
+        db = get_stock_basic_db()
+        pool = db._get_pool()
+        with pool.cursor() as cur:
+            cur.execute("SELECT symbol FROM stock_basic_info WHERE status = 'active'")
+            symbols = [row[0] for row in cur.fetchall()]
+
+    # {symbol: [(date_str, bar_dict), ...]} 按时间有序
+    sym_bars: Dict[str, List[Tuple[str, dict]]] = {}
+
+    for sym in symbols:
+        db_symbol = strip_market_prefix(sym)
+        try:
+            rows = writer.query("CNStock", db_symbol, "1D",
+                                start_time=None, end_time=None, limit=10000)
+        except Exception:
+            continue
+        if not rows:
+            continue
+
+        bars = []
+        for r in rows:
+            t = r.get("time")
+            if hasattr(t, 'strftime'):
+                d = t.strftime("%Y-%m-%d")
+            else:
+                d = str(t)[:10]
+            bars.append((d, r))
+        if bars:
+            sym_bars[sym] = bars
+
+    # 按日期聚合（只保留 start_date ~ end_date 范围，但保留 start_date 前一天用于 pre_close）
+    result: Dict[str, Dict[str, dict]] = {}
+
+    for sym, bars in sym_bars.items():
+        for i, (date_str, bar) in enumerate(bars):
+            if date_str > end_date:
+                break
+            if date_str < start_date:
+                continue  # start_date 之前的 bar 不入库，但后续 bar 可以用它做 pre_close
+            if i == 0:
+                continue  # 没有前一天数据，无法算 pre_close
+
+            prev_close = float(bars[i - 1][1].get("close", 0))
+            if prev_close <= 0:
+                continue
+
+            if date_str not in result:
+                result[date_str] = {}
+
+            result[date_str][sym] = {
+                "open": float(bar.get("open", 0)),
+                "high": float(bar.get("high", 0)),
+                "low": float(bar.get("low", 0)),
+                "close": float(bar.get("close", 0)),
+                "volume": float(bar.get("volume", 0)),
+                "pre_close": prev_close,
+            }
+
+    return result
 
 
 # ============================================================
@@ -381,45 +458,24 @@ def _flush_batch(cur, batch):
 # ============================================================
 
 def get_trading_dates(start_date: str, end_date: str) -> List[str]:
-    """获取有数据的交易日列表（用一只股票采样）"""
-    from app.utils.db_market import get_market_kline_writer
-    from app.data_sources.normalizer import strip_market_prefix
-
-    writer = get_market_kline_writer()
-
-    from app.utils.basicinfo_db import get_stock_basic_db
-    db = get_stock_basic_db()
-    pool = db._get_pool()
-    with pool.cursor() as cur:
-        cur.execute("SELECT symbol FROM stock_basic_info WHERE status='active' LIMIT 1")
-        row = cur.fetchone()
-        if not row:
-            return []
-
-    db_symbol = strip_market_prefix(row[0])
-    rows = writer.query("CNStock", db_symbol, "1D",
-                        start_time=None, end_time=None, limit=10000)
-    dates = set()
-    for r in rows:
-        t = r.get("time")
-        if hasattr(t, 'strftime'):
-            d = t.strftime("%Y-%m-%d")
-        else:
-            d = str(t)[:10]
-        if d >= start_date and d <= end_date:
-            dates.add(d)
-    return sorted(dates)
+    """获取有数据的交易日列表（基于交易日历）"""
+    from app.utils.trading_calendar import trade_date_range
+    return trade_date_range(start_date, end_date)
 
 
 # ============================================================
 # 主流程
 # ============================================================
 
-def run_single_date(pool, target_date: str, industry_map, concept_map, dry_run=False):
-    """计算并写入单日统计"""
-    print(f"\n[{target_date}] 加载 K 线...", end="", flush=True)
-    kline_data = load_kline_for_date(target_date)
-    print(f" {len(kline_data)} 只股票", flush=True)
+def run_single_date(pool, target_date: str, industry_map, concept_map,
+                    dry_run=False, kline_data: Dict[str, dict] = None):
+    """计算并写入单日统计。kline_data 可外部传入（回填模式复用）"""
+    if kline_data is None:
+        print(f"\n[{target_date}] 加载 K 线...", end="", flush=True)
+        kline_data = load_kline_for_date(target_date, pool=pool)
+        print(f" {len(kline_data)} 只股票", flush=True)
+    else:
+        print(f"\n[{target_date}] 复用已加载 K 线 ({len(kline_data)} 只股票)", flush=True)
 
     if not kline_data:
         print(f"  ⚠️  无 K 线数据，跳过")
@@ -471,13 +527,19 @@ def main():
     print(f" 行业={len(industry_map)} 个, 概念={len(concept_map)} 个")
 
     if args.backfill:
-        # 回填模式
+        # 回填模式：一次性加载全部K线，按日期索引
         end_date = args.date or datetime.date.today().strftime("%Y-%m-%d")
         dates = get_trading_dates(args.backfill, end_date)
         print(f"[回填] {args.backfill} → {end_date}, 共 {len(dates)} 个交易日")
+        print(f"[加载] 一次性加载 {args.backfill}~{end_date} 全量 K 线...", end="", flush=True)
+        all_kline = load_kline_all_dates(args.backfill, end_date)
+        print(f" 覆盖 {len(all_kline)} 个交易日", flush=True)
+
         total = 0
         for d in dates:
-            n = run_single_date(pool, d, industry_map, concept_map, args.dry_run)
+            kline_data = all_kline.get(d, {})
+            n = run_single_date(pool, d, industry_map, concept_map,
+                                args.dry_run, kline_data=kline_data)
             total += n
         print(f"\n[完成] 共写入 {total} 条")
     else:
