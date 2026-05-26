@@ -7,7 +7,7 @@ basicinfo_db.py — A股全市场股票基本信息读写
 
   本模块负责 A 股全市场股票「基本信息」的持久化存储和查询。
 
-  "基本信息"指：代码、名称、交易所、行业、上市日期、市值、市盈率等——
+  "基本信息"指：代码、名称、交易所、行业、上市日期、股本、市盈率等——
   是选股、筛选、展示股票列表时需要的元数据，不是 K 线行情数据。
 
   K 线数据的读写由 db_market.py 的 MarketKlineWriter 负责，
@@ -55,12 +55,12 @@ basicinfo_db.py — A股全市场股票基本信息读写
     源1: 东财 push2 API（HTTP，~6000 只，快，优先）
     源2: AkShare stock_info_a_code_name()（兜底）
 
-  行业、市值、市盈率等「详情字段」不全量拉（6000 只逐个取太慢），
+  行业、股本、市盈率等「详情字段」不全量拉（6000 只逐个取太慢），
   由 enrich_stock_info(code) 按需单只补充。
 
   UPSERT 冲突策略：
     - symbol 已存在 → 更新名称和交易所（这两个可能变）
-    - 详情字段（industry/total_mv 等）→ 只在新值非空/非零时覆盖，
+    - 详情字段（industry/total_shares 等）→ 只在新值非空/非零时覆盖，
       避免"同步代码列表"时把已有的详情冲掉
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -133,8 +133,8 @@ CREATE TABLE IF NOT EXISTS stock_basic_info (
     industry      VARCHAR(50)  DEFAULT '',     -- 所属行业（如 "白酒"），按需补充
     concepts      TEXT         DEFAULT '',     -- 所属概念（逗号分隔，如 "锂电池,新能源"），按需补充
     list_date     VARCHAR(20)  DEFAULT '',     -- 上市日期（如 "2001-08-27"），按需补充
-    total_mv      DOUBLE PRECISION DEFAULT 0,  -- 总市值（元），按需补充，0 表示未知
-    circ_mv       DOUBLE PRECISION DEFAULT 0,  -- 流通市值（元），按需补充
+    total_shares  DOUBLE PRECISION DEFAULT 0,  -- 总股本（股），按需补充，0 表示未知
+    circ_shares   DOUBLE PRECISION DEFAULT 0,  -- 流通股本（股），按需补充
     pe_ratio      DOUBLE PRECISION DEFAULT 0,  -- 市盈率（动态），按需补充
     pb_ratio      DOUBLE PRECISION DEFAULT 0,  -- 市净率，按需补充
     status        VARCHAR(10)  DEFAULT 'active', -- 状态：active/suspended/delisted
@@ -284,7 +284,7 @@ class StockBasicDB:
         更新策略是"非空覆盖"：
           - name / market：直接覆盖（名称和交易所可能变更）
           - industry / list_date：新值非空时覆盖，否则保留旧值
-          - total_mv / circ_mv / pe_ratio / pb_ratio：新值非零时覆盖
+          - total_shares / circ_shares / pe_ratio / pb_ratio：新值非零时覆盖
           - status / updated_at：直接覆盖
 
         这样设计的原因：
@@ -305,7 +305,7 @@ class StockBasicDB:
 
         ── Args ──
             stocks: 股票信息列表，每条至少包含 symbol 和 name
-                    可选字段: market_cn, industry, list_date, total_mv, circ_mv,
+                    可选字段: market_cn, industry, list_date, total_shares, circ_shares,
                               pe_ratio, pb_ratio, status
 
         ── Returns ──
@@ -351,8 +351,8 @@ class StockBasicDB:
                 item.get("industry", ""),        # industry（默认空串）
                 item.get("concepts", ""),        # concepts（默认空串，逗号分隔）
                 item.get("list_date", ""),       # list_date（默认空串）
-                float(item.get("total_mv", 0) or 0),   # total_mv（None → 0）
-                float(item.get("circ_mv", 0) or 0),    # circ_mv
+                float(item.get("total_shares", 0) or 0),  # total_shares（None → 0）
+                float(item.get("circ_shares", 0) or 0),   # circ_shares
                 float(item.get("pe_ratio", 0) or 0),   # pe_ratio
                 float(item.get("pb_ratio", 0) or 0),   # pb_ratio
                 item.get("status", "active"),           # status
@@ -371,7 +371,7 @@ class StockBasicDB:
         sql = """
             INSERT INTO stock_basic_info
                 (symbol, name, market_cn, industry, concepts, list_date,
-                 total_mv, circ_mv, pe_ratio, pb_ratio, status, updated_at)
+                 total_shares, circ_shares, pe_ratio, pb_ratio, status, updated_at)
             VALUES %s
             ON CONFLICT (symbol) DO UPDATE SET
                 -- 名称和交易所：直接覆盖（可能变更，如 ST 摘帽/更名）
@@ -385,8 +385,8 @@ class StockBasicDB:
                 concepts   = COALESCE(NULLIF(EXCLUDED.concepts, ''), stock_basic_info.concepts),
                 list_date  = COALESCE(NULLIF(EXCLUDED.list_date, ''), stock_basic_info.list_date),
                 -- 数值字段：只在新值 > 0 时覆盖（0 表示"未知"，不覆盖已知值）
-                total_mv   = CASE WHEN EXCLUDED.total_mv > 0 THEN EXCLUDED.total_mv ELSE stock_basic_info.total_mv END,
-                circ_mv    = CASE WHEN EXCLUDED.circ_mv  > 0 THEN EXCLUDED.circ_mv  ELSE stock_basic_info.circ_mv  END,
+                total_shares = CASE WHEN EXCLUDED.total_shares > 0 THEN EXCLUDED.total_shares ELSE stock_basic_info.total_shares END,
+                circ_shares  = CASE WHEN EXCLUDED.circ_shares  > 0 THEN EXCLUDED.circ_shares  ELSE stock_basic_info.circ_shares  END,
                 -- pe_ratio/pb_ratio 可能为负数（亏损股），所以用 != 0 判断
                 pe_ratio   = CASE WHEN EXCLUDED.pe_ratio != 0 THEN EXCLUDED.pe_ratio ELSE stock_basic_info.pe_ratio END,
                 pb_ratio   = CASE WHEN EXCLUDED.pb_ratio != 0 THEN EXCLUDED.pb_ratio ELSE stock_basic_info.pb_ratio END,
@@ -510,7 +510,7 @@ class StockBasicDB:
         with pool.cursor() as cur:
             cur.execute(
                 "SELECT symbol, name, market_cn, industry, concepts, list_date, "
-                "       total_mv, circ_mv, pe_ratio, pb_ratio, status, updated_at "
+                "       total_shares, circ_shares, pe_ratio, pb_ratio, status, updated_at "
                 "FROM stock_basic_info WHERE symbol = %s",
                 (code,),
             )
@@ -554,7 +554,7 @@ class StockBasicDB:
         with pool.cursor() as cur:
             cur.execute(
                 f"SELECT symbol, name, market_cn, industry, concepts, list_date, "
-                f"       total_mv, circ_mv, pe_ratio, pb_ratio, status, updated_at "
+                f"       total_shares, circ_shares, pe_ratio, pb_ratio, status, updated_at "
                 f"FROM stock_basic_info {where} ORDER BY symbol",
                 params,
             )
@@ -588,7 +588,7 @@ class StockBasicDB:
         with pool.cursor() as cur:
             cur.execute(
                 "SELECT symbol, name, market_cn, industry, concepts, list_date, "
-                "       total_mv, circ_mv, pe_ratio, pb_ratio, status, updated_at "
+                "       total_shares, circ_shares, pe_ratio, pb_ratio, status, updated_at "
                 "FROM stock_basic_info "
                 "WHERE (symbol LIKE %s OR name LIKE %s) AND status = 'active' "
                 "ORDER BY symbol LIMIT %s",
@@ -756,7 +756,7 @@ class StockBasicDB:
             with pool.cursor() as cur:
                 cur.execute(
                     "SELECT symbol, name, market_cn, industry, concepts, list_date, "
-                    "       total_mv, circ_mv, pe_ratio, pb_ratio, status, updated_at "
+                    "       total_shares, circ_shares, pe_ratio, pb_ratio, status, updated_at "
                     "FROM stock_basic_info "
                     "WHERE concepts LIKE %s AND status = %s ORDER BY symbol",
                     (pattern, status),
@@ -766,7 +766,7 @@ class StockBasicDB:
             with pool.cursor() as cur:
                 cur.execute(
                     "SELECT symbol, name, market_cn, industry, concepts, list_date, "
-                    "       total_mv, circ_mv, pe_ratio, pb_ratio, status, updated_at "
+                    "       total_shares, circ_shares, pe_ratio, pb_ratio, status, updated_at "
                     "FROM stock_basic_info "
                     "WHERE concepts LIKE %s ORDER BY symbol",
                     (pattern,),
@@ -1128,7 +1128,7 @@ class StockBasicDB:
 
         数据来源：AStockDataSource.get_stock_info()
           - 内部走 AkShare → 东财 fallback 链
-          - 返回: name, industry, listed_date, total_mv, circ_mv, pe_ratio, pb_ratio
+          - 返回: name, industry, listed_date, total_shares, circ_shares, pe_ratio, pb_ratio
 
         写入策略：UPDATE + 非空覆盖（与 upsert_stocks 一致）
           - 行业/上市日期：新值非空时覆盖
@@ -1167,8 +1167,8 @@ class StockBasicDB:
                     industry   = COALESCE(NULLIF(%s, ''), industry),
                     concepts   = COALESCE(NULLIF(%s, ''), concepts),
                     list_date  = COALESCE(NULLIF(%s, ''), list_date),
-                    total_mv   = CASE WHEN %s > 0 THEN %s ELSE total_mv END,
-                    circ_mv    = CASE WHEN %s > 0 THEN %s ELSE circ_mv  END,
+                    total_shares = CASE WHEN %s > 0 THEN %s ELSE total_shares END,
+                    circ_shares  = CASE WHEN %s > 0 THEN %s ELSE circ_shares  END,
                     pe_ratio   = CASE WHEN %s != 0 THEN %s ELSE pe_ratio END,
                     pb_ratio   = CASE WHEN %s != 0 THEN %s ELSE pb_ratio END,
                     updated_at = %s
@@ -1177,8 +1177,8 @@ class StockBasicDB:
                 info.get("industry", ""),       # 新行业
                 info.get("concepts", ""),        # 新概念
                 info.get("listed_date", ""),     # 新上市日期
-                float(info.get("total_mv", 0) or 0), float(info.get("total_mv", 0) or 0),
-                float(info.get("circ_mv", 0) or 0),  float(info.get("circ_mv", 0) or 0),
+                float(info.get("total_shares", 0) or 0), float(info.get("total_shares", 0) or 0),
+                float(info.get("circ_shares", 0) or 0),  float(info.get("circ_shares", 0) or 0),
                 float(info.get("pe_ratio", 0) or 0),  float(info.get("pe_ratio", 0) or 0),
                 float(info.get("pb_ratio", 0) or 0),  float(info.get("pb_ratio", 0) or 0),
                 now,                                   # updated_at
@@ -1201,7 +1201,7 @@ class StockBasicDB:
 
         列顺序与 SELECT 语句一致：
           0: symbol, 1: name, 2: market_cn, 3: industry, 4: concepts,
-          5: list_date,  6: total_mv,   7: circ_mv, 8: pe_ratio,
+          5: list_date,  6: total_shares,  7: circ_shares, 8: pe_ratio,
           9: pb_ratio,   10: status,    11: updated_at
 
         注意：float(row[x] or 0) 处理 NULL → 0.0 的转换。
@@ -1213,8 +1213,8 @@ class StockBasicDB:
             "industry":   row[3],
             "concepts":   row[4],
             "list_date":  row[5],
-            "total_mv":   float(row[6] or 0),
-            "circ_mv":    float(row[7] or 0),
+            "total_shares":  float(row[6] or 0),
+            "circ_shares":   float(row[7] or 0),
             "pe_ratio":   float(row[8] or 0),
             "pb_ratio":   float(row[9] or 0),
             "status":     row[10],

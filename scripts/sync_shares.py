@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
 sync_shares.py
-从东财 push2 API 批量抓取全 A 股的 总股本 / 流通股本 / 总市值 / 流通市值，
+从东财 push2 API 批量抓取全 A 股的 总股本 / 流通股本，
 写入 stock_basic_info 表。
 
 数据源:
   东财 push2 API（批量分页，约 60 页，2~3 分钟完成）
   字段: f38=总股本, f20=总市值, f21=流通市值
-  流通股本 = 流通市值 ÷ (总市值 ÷ 总股本) 推算
+  流通股本 = 流通市值 ÷ 股价，股价 = 总市值 ÷ 总股本
+
+  注: 总股本/流通股本不会频繁变动，无需每日更新
 
 用法:
   python scripts/sync_shares.py              # 抓取 + 写库
@@ -70,14 +72,14 @@ def _safe_float(v):
 
 def fetch_eastmoney_shares():
     """
-    从东财 push2 API 分页拉取全 A 股的 股本/市值 数据。
+    从东财 push2 API 分页拉取全 A 股的 股本 数据。
 
     可靠字段:
       f12  = 股票代码
       f14  = 股票名称
       f38  = 总股本（股）—— 可靠
-      f20  = 总市值（元）—— 可靠
-      f21  = 流通市值（元）—— 可靠
+      f20  = 总市值（元）—— 用于推算股价
+      f21  = 流通市值（元）—— 用于推算流通股本
 
     流通股本 = 流通市值 ÷ 股价 = f21 ÷ (f20 ÷ f38)
     弃用字段: f84(流通股本, 大量负值) f116(返回"-") f85(比例非股数)
@@ -89,7 +91,7 @@ def fetch_eastmoney_shares():
     import urllib.request
     import urllib.parse
 
-    print("[抓取] 东财 push2 API 分页拉取股本/市值...", file=sys.stderr)
+    print("[抓取] 东财 push2 API 分页拉取股本...", file=sys.stderr)
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -104,7 +106,7 @@ def fetch_eastmoney_shares():
     page_size = 100  # 东财实际每页上限约 100
 
     while True:
-        # f38=总股本(可靠) f20=总市值(可靠) f21=流通市值(可靠)
+        # f38=总股本(可靠) f20=总市值(推算股价用) f21=流通市值(推算流通股本用)
         # 弃用: f84(流通股本,负值) f116(返回"-") f85(比例非股数)
         params = {
             "pn": page,
@@ -167,8 +169,8 @@ def fetch_eastmoney_shares():
             continue
 
         total_shares = _safe_float(item.get("f38"))
-        total_mv = _safe_float(item.get("f20"))
-        circ_mv = _safe_float(item.get("f21"))
+        total_mv = _safe_float(item.get("f20"))      # 总市值，仅用于推算股价
+        circ_mv = _safe_float(item.get("f21"))       # 流通市值，仅用于推算流通股本
 
         # 推算流通股本: 流通市值 ÷ 股价, 股价 = 总市值 ÷ 总股本
         circ_shares = 0.0
@@ -194,7 +196,7 @@ def fetch_eastmoney_shares():
 # ============================================================
 
 def write_to_db(stocks: list, dry_run=False):
-    """将总股本数据写入 stock_basic_info 表
+    """将总股本/流通股本数据写入 stock_basic_info 表
 
     逻辑:
       1. 读取 DB 已有数据，只更新 DB 中已存在的记录
@@ -207,7 +209,7 @@ def write_to_db(stocks: list, dry_run=False):
             ts = s["total_shares"]
             cs = s["circ_shares"]
             print(f"  {s['symbol']} {s['name']}: "
-                  f"总股本={ts/1e8:.2f}亿 流通股本={cs/1e8:.2f}亿",
+                  f"总股本={ts/1e8:.2f}亿股 流通股本={cs/1e8:.2f}亿股",
                   file=sys.stderr)
         print(f"  ... 共 {len(stocks)} 只", file=sys.stderr)
         return
@@ -217,7 +219,7 @@ def write_to_db(stocks: list, dry_run=False):
     db.ensure_table()
     pool = db._get_pool()
 
-    # ── 确保列存在 ──
+    # ── 确保列存在（total_shares / circ_shares） ──
     with pool.connection() as conn:
         cur = conn.cursor()
         for col, typ in [("total_shares", "float8"), ("circ_shares", "float8")]:
@@ -251,7 +253,7 @@ def write_to_db(stocks: list, dry_run=False):
         print("[完成] 无需更新（DB 中无匹配记录）", file=sys.stderr)
         return
 
-    # ── 3. 批量 UPDATE ──
+    # ── 3. 批量 UPDATE 总股本/流通股本 ──
     print(f"[写库] 更新 {len(target)} 只股票...", file=sys.stderr)
     now = datetime.datetime.now()
     updated = 0
@@ -272,7 +274,7 @@ def write_to_db(stocks: list, dry_run=False):
         conn.commit()
         cur.close()
 
-    print(f"✅ 已更新 {updated} 只股票的股本/市值数据", file=sys.stderr)
+    print(f"✅ 已更新 {updated} 只股票的股本数据", file=sys.stderr)
 
 
 # ============================================================
