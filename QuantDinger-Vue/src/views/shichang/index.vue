@@ -74,7 +74,8 @@ import request from '@/utils/request'
 
 // 卡片组件注册表 — 新增卡片只需在这里加一行
 import AiAnalysisCard from './AiAnalysisCard.vue'
-import EmotionCycleCard from './EmotionCycleCard.vue'
+// import EmotionCycleCard from './EmotionCycleCard.vue'
+import DailyScanCard from './DailyScanCard.vue'
 import MacroCard from './MacroCard.vue'
 import PeripheralMarketCard from './PeripheralMarketCard.vue'
 import StreakCard from './StreakCard.vue'
@@ -84,7 +85,8 @@ import StrongStocksCard from './StrongStocksCard.vue'
 
 const CARD_COMPONENTS = {
   'ai_analysis': AiAnalysisCard,
-  'emotion_cycle': EmotionCycleCard,
+//  'emotion_cycle': EmotionCycleCard,
+  'daily_scan': DailyScanCard,           // 板块每日扫描
   'macro': MacroCard,
   'peripheral': PeripheralMarketCard,
   'streak': StreakCard,

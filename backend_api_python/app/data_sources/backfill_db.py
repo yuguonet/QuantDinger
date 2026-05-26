@@ -42,7 +42,9 @@ cn_last_update 表结构:
   6. 所有数据源走内联 provider，不依赖外部 API
 """
 
+import os as _os
 import re as _re
+import subprocess
 import threading
 from datetime import datetime, timedelta, timezone, time as dt_time
 
@@ -1076,6 +1078,21 @@ def _compute_is_update(task: str, last_bar_time: datetime) -> bool:
     return (now - db_cutoff) > (next_td - today_dt)
 
 
+def _run_post_script(task: str):
+    script_dir = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))), "script")
+    script_map = {"15m": "after_15m.sh", "1D": "after_1d.sh"}
+    script_name = script_map.get(task)
+    if not script_name:
+        return
+    script_path = _os.path.join(script_dir, script_name)
+    if not _os.path.isfile(script_path):
+        return
+    try:
+        subprocess.Popen([script_path], cwd=script_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        logger.info(f"[同步] {task} 已启动批处理脚本: {script_path}")
+    except Exception as e:
+        logger.error(f"[同步] {task} 批处理脚本执行失败: {e}")
+
 def _run_task(task: str):
     """执行一次同步，按同步协议决定后续动作。
 
@@ -1115,22 +1132,22 @@ def _run_task(task: str):
 
         # 无记录 → 全新拉取
         if not last_bar_time:
-            _run_fresh_pull(task, doc, last_status)
-            return
-
-        # 计算 is_update
-        is_update = _compute_is_update(task, last_bar_time)
-
-        if is_update:
+            final_status = _run_fresh_pull(task, doc, last_status)
+        elif is_update:
             # is_update → 全新拉取
-            _run_fresh_pull(task, doc, last_status)
+            final_status = _run_fresh_pull(task, doc, last_status)
         elif last_status == "re":
             # status==re → 修复循环
-            _run_repair(task, doc, last_status)
+            final_status = _run_repair(task, doc, last_status)
         else:
-            # 正常退出
+            # 已是最新，无需操作
             logger.info(f"[同步] {task} is_update={is_update}, status={last_status}, 正常退出")
             _schedule_next(task, _next_trigger_time(task))
+            final_status = None
+
+        # 统一出口: status=ok 时触发批处理脚本
+        if final_status == "ok":
+            _run_post_script(task)
 
     except Exception as e:
         logger.error(f"[同步] {task} 异常: {e}", exc_info=True)
@@ -1148,7 +1165,7 @@ def _run_fresh_pull(task: str, doc: dict | None, last_status: str):
     if not doc:
         # 无记录 → 同步下一个交易日
         _schedule_next(task, _next_trigger_time(task))
-        return
+        return "unknown"
 
     synced = doc.get("synced_count") or 0
     failed = doc.get("failed_count") or 0
@@ -1166,6 +1183,8 @@ def _run_fresh_pull(task: str, doc: dict | None, last_status: str):
         # 未全部完成 → status=re + report（run_once 内部已写），等待120s后进入修复循环
         logger.info(f"[同步] {task} 全新拉取未全部完成 (status={status}), {_RETRY_INTERVAL}s 后进入修复循环")
         _schedule_next(task, delay_seconds=_RETRY_INTERVAL)
+
+    return status
 
 
 def _run_repair(task: str, doc: dict | None, last_status: str):
@@ -1185,12 +1204,11 @@ def _run_repair(task: str, doc: dict | None, last_status: str):
     if last_status == "error":
         logger.info(f"[同步] {task} status=error (终态), 不重试, 正常退出")
         _schedule_next(task, _next_trigger_time(task))
-        return
+        return "error"
     if last_status != "re":
         # 无记录等异常状态 → 视为需要全新拉取（兜底）
         logger.info(f"[同步] {task} 上次 status={last_status or '无记录'}, 尝试全新拉取")
-        _run_fresh_pull(task, doc, last_status)
-        return
+        return _run_fresh_pull(task, doc, last_status)
 
     synced_total = doc.get("synced_count") or 0
     failed = doc.get("failed_count") or 0
@@ -1200,7 +1218,7 @@ def _run_repair(task: str, doc: dict | None, last_status: str):
     if failed == 0 and synced_total > 0:
         logger.info(f"[同步] {task} 修复: 已全部完成, 正常退出")
         _schedule_next(task, _next_trigger_time(task))
-        return
+        return "ok"
 
     logger.info(f"[同步] {task} 启动修复 (写入{written_db}/同步{synced_total}, 失败 {failed})")
 
@@ -1217,13 +1235,14 @@ def _run_repair(task: str, doc: dict | None, last_status: str):
             if lbt:
                 _update_record(task, lbt, status="ok", pool_name="CNStock")
             _schedule_next(task, _next_trigger_time(task))
+            return "ok"
         else:
             logger.info(f"[同步] {task} 无失败标的且完成度 {sync_rate:.0%} <= 90%, status=error, 正常退出")
             lbt = _parse_db_timestamp(doc.get("last_bar_time"))
             if lbt:
                 _update_record(task, lbt, status="error", pool_name="CNStock")
             _schedule_next(task, _next_trigger_time(task))
-        return
+            return "error"
 
     # 修复循环: for<10次
     for attempt in range(1, _MAX_REPAIR_ATTEMPTS + 1):
@@ -1247,7 +1266,7 @@ def _run_repair(task: str, doc: dict | None, last_status: str):
         doc = _get_last_update(task, pool_name="CNStock")
         if not doc:
             _schedule_next(task, _next_trigger_time(task))
-            return
+            return "unknown"
 
         synced = doc.get("synced_count") or saved_synced_count
         current_failed = doc.get("failed_count") or 0
@@ -1312,7 +1331,7 @@ def _run_repair(task: str, doc: dict | None, last_status: str):
             if lbt and status != "ok":
                 _update_record(task, lbt, status="ok", pool_name="CNStock")
             _schedule_next(task, _next_trigger_time(task))
-            return
+            return "ok"
 
         # 本次修复>0（有进展）→ 删除report已写入的代码 --> 等待120s
         if remaining_failed and len(remaining_failed) < len(failed_symbols):
@@ -1327,7 +1346,7 @@ def _run_repair(task: str, doc: dict | None, last_status: str):
                     written_count=current_written, pool_name="CNStock",
                 )
             _schedule_next(task, delay_seconds=_RETRY_INTERVAL)
-            return
+            return "re"
 
         # 未完成(本次修复=0) → 完成度>90% → status=ok; 否则 → status=error
         logger.info(f"[同步] {task} 修复第 {attempt} 轮无进展 (本次修复=0)")
@@ -1341,7 +1360,7 @@ def _run_repair(task: str, doc: dict | None, last_status: str):
                     written_count=current_written, pool_name="CNStock",
                 )
             _schedule_next(task, _next_trigger_time(task))
-            return
+            return "ok"
         else:
             logger.info(f"[同步] {task} 完成度 {sync_rate:.0%} <= 90%, status=error, 正常退出")
             if lbt:
@@ -1352,7 +1371,7 @@ def _run_repair(task: str, doc: dict | None, last_status: str):
                     written_count=current_written, pool_name="CNStock",
                 )
             _schedule_next(task, _next_trigger_time(task))
-            return
+            return "error"
 
     # 循环<10次用尽仍未完成 → 完成度>90% → status=ok; 否则 → status=error
     doc_final = _get_last_update(task, pool_name="CNStock")
@@ -1384,6 +1403,7 @@ def _run_repair(task: str, doc: dict | None, last_status: str):
                 written_count=written_db, pool_name="CNStock",
             )
     _schedule_next(task, _next_trigger_time(task))
+    return "ok" if sync_rate > 0.9 else "error"
 
 
 def _schedule_next(task: str, trigger_at: datetime = None, delay_seconds: float = None):
