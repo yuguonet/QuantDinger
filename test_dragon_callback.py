@@ -827,7 +827,7 @@ def print_stats(trades, label):
     peak = sum(t['peak_return_pct'] for t in trades) / len(trades)
     ws = [t['return_pct'] for t in trades if t['return_pct'] > 0]
     ls = [t['return_pct'] for t in trades if t['return_pct'] <= 0]
-    if ws and ls:
+    if ws and ls and sum(ls) != 0:
         pl = (sum(ws)/len(ws)) / (abs(sum(ls))/len(ls))
     elif ws:
         pl = 999.0

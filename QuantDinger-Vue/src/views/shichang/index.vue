@@ -218,7 +218,7 @@ export default {
     async fetchCardList () {
       try {
         const resp = await request({ url: '/api/shichang/cards', method: 'GET' })
-        const list = resp || []
+        const list = (resp && resp.data) || []
         this.cardList = list
 
         // 合并：后端列表 ∩ 本地组件

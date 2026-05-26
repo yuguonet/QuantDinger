@@ -43,10 +43,10 @@ PROVINCES = [
 
 
 def _is_noise(name):
-    if any(kw in name for kw in NOISE_KEYWORDS):
-        return True
     if any(kw in name for kw in KEEP_KEYWORDS):
         return False
+    if any(kw in name for kw in NOISE_KEYWORDS):
+        return True
     if any(p in name for p in PROVINCES):
         return True
     return False
@@ -131,7 +131,8 @@ def _get_sector_status(lookup, dates, heat_quantile=0.70, max_gap=1):
         # 今天不在脉冲中
         if not is_hot[n - 1]:
             was_in_pulse = False
-            if n >= 2 and is_hot[n - 2]:
+            # 昨天hot且前天也hot（至少2天连续脉冲），才算真正结束
+            if n >= 3 and is_hot[n - 2] and is_hot[n - 3]:
                 was_in_pulse = True
             results[sname] = {
                 'type': stype,
@@ -172,7 +173,10 @@ def _get_sector_status(lookup, dates, heat_quantile=0.70, max_gap=1):
         else:
             phase = 'peak'
 
-        above_thresh = [h for h in heat_vals if h >= threshold]
+        # 历史均值排除当前脉冲期间
+        pulse_dates = set(recent_dates[pulse_start:n])
+        hist_vals = [v for d, v in heats_by_date.items() if v > 0 and d not in pulse_dates]
+        above_thresh = [h for h in hist_vals if h >= threshold]
         hist_avg_peak = __import__('numpy').mean(above_thresh) if above_thresh else threshold
 
         results[sname] = {
@@ -206,12 +210,13 @@ def _categorize(results):
         if r['is_active']:
             if r.get('just_started'):
                 new_hot.append((name, r))
-            if r['pulse_phase'] == 'rising' and r['pulse_day'] >= 2:
+            elif r['pulse_phase'] == 'rising' and r['pulse_day'] >= 2:
                 rising.append((name, r))
+            elif r['pulse_phase'] == 'decay':
+                decaying.append((name, r))
+            # anomalies 独立叠加，不限 phase
             if r['anomaly_ratio'] >= 1.3:
                 anomalies.append((name, r))
-            if r['pulse_phase'] == 'decay':
-                decaying.append((name, r))
         elif r.get('just_ended'):
             just_ended.append((name, r))
 
