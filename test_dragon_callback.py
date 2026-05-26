@@ -73,6 +73,75 @@ def fetch_kline_db(code, days=300):
     except Exception:
         return []
 
+# ================================================================
+# stock_basic_info 查询 (换手率 + 板块效应)
+# ================================================================
+def fetch_stock_info_db():
+    """加载全量stock_basic_info, 返回 {symbol: {name, industry, concepts, circ_shares, total_shares}}"""
+    from app.utils.basicinfo_db import get_stock_basic_db
+    db = get_stock_basic_db()
+    pool = db._get_pool()
+    with pool.cursor() as cur:
+        cur.execute(
+            "SELECT symbol, name, industry, concepts, circ_shares, total_shares "
+            "FROM stock_basic_info WHERE status='active'"
+        )
+        rows = cur.fetchall()
+    result = {}
+    for row in rows:
+        concepts = [c.strip() for c in (row[3] or '').split(',') if c.strip()]
+        result[row[0]] = {
+            'name': row[1] or '',
+            'industry': row[2] or '',
+            'concepts': concepts,
+            'circ_shares': float(row[4] or 0),
+            'total_shares': float(row[5] or 0),
+        }
+    return result
+
+def calc_sector_limits(bars_by_code, stock_info, target_date):
+    """统计target_date当天各板块涨停数, 返回 {(type, name): count}
+    type: 'industry' or 'concept'
+    """
+    sector_count = defaultdict(int)
+    for code, bars in bars_by_code.items():
+        if code not in stock_info:
+            continue
+        # 找到target_date对应的bar
+        bar = None
+        prev_close = None
+        for i, b in enumerate(bars):
+            if b['time'] == target_date:
+                bar = b
+                prev_close = bars[i-1]['close'] if i > 0 else None
+                break
+        if bar is None or prev_close is None or prev_close <= 0:
+            continue
+        ret = bar['close'] / prev_close - 1
+        bt = get_board_type(code)
+        threshold = 0.098 if bt == 'main' else 0.198
+        if ret < threshold * 0.98:
+            continue
+        # 这只股票今天涨停了, 计入板块
+        info = stock_info[code]
+        if info['industry']:
+            sector_count[('industry', info['industry'])] += 1
+        for concept in info['concepts']:
+            sector_count[('concept', concept)] += 1
+    return sector_count
+
+def get_stock_sector_limit_count(code, stock_info, sector_counts):
+    """获取该股票所属板块今日涨停数的最大值"""
+    if code not in stock_info:
+        return 0
+    info = stock_info[code]
+    max_count = 0
+    if info['industry']:
+        max_count = max(max_count, sector_counts.get(('industry', info['industry']), 0))
+    for concept in info['concepts']:
+        max_count = max(max_count, sector_counts.get(('concept', concept), 0))
+    return max_count
+
 def ema(values, period):
     """计算EMA (指数移动平均)"""
     if len(values) < period:
@@ -124,41 +193,6 @@ def get_board_name(code):
     return "未知"
 
 # ================================================================
-# 预埋信号 (仅保留有效的)
-# ================================================================
-
-def detect_signals(bars, idx):
-    signals = []
-    if idx >= 5:
-        avg5 = sum(b['volume'] for b in bars[idx-5:idx]) / 5
-        if avg5 > 0:
-            vr = bars[idx]['volume'] / avg5
-            prev_c = bars[idx-1]['close']
-            chg = (bars[idx]['close'] / prev_c - 1) * 100 if prev_c > 0 else 0
-            avg3 = sum(b['volume'] for b in bars[idx-3:idx]) / 3
-            if vr >= 1.5 and chg >= 1.0 and avg3 < avg5 * 0.9:
-                signals.append('volume_breakout')
-    if idx >= 5:
-        avg5 = sum(b['volume'] for b in bars[idx-5:idx]) / 5
-        if avg5 > 0:
-            vr = bars[idx]['volume'] / avg5
-            prev_c = bars[idx-1]['close']
-            chg = (bars[idx]['close'] / prev_c - 1) * 100 if prev_c > 0 else 0
-            c5 = bars[idx-5]['close']
-            prev5chg = (prev_c / c5 - 1) * 100 if c5 > 0 else 0
-            if vr >= 2.0 and chg >= 2.0 and abs(prev5chg) <= 5:
-                signals.append('bottom_volume')
-    if idx >= 5:
-        lb = min(10, idx)
-        max_c = max(b['close'] for b in bars[idx-lb:idx])
-        if bars[idx]['close'] > max_c * 1.005:
-            prev_c = bars[idx-1]['close']
-            chg = (bars[idx]['close'] / prev_c - 1) * 100 if prev_c > 0 else 0
-            if chg <= 5:
-                signals.append('break_high')
-    return signals
-
-# ================================================================
 # 核心逻辑
 # ================================================================
 
@@ -200,19 +234,23 @@ def run_backtest(bars, entry_idx, entry_price, hold_days=20, stop_loss=-10.0, tr
         b = bars[idx]
         if b['high'] > peak: peak = b['high']
 
-        # V1专属: D1没涨停 → D+2快速离场
+        # V1专属: D1没涨停 → D+2开盘跑路 (首板次日未封板=不及预期, 不恋战)
         if is_v1 and d == 2 and not d1_limit_up:
             d1_bar = bars[entry_idx + 1]
             d1_high = d1_bar['high']
             d1_close = d1_bar['close']
             d2_open_gap = (b['open'] / d1_close - 1) * 100 if d1_close > 0 else 0
+            # 止损优先
             if b['low'] <= entry_price * (1 + stop_loss / 100):
                 exit_p = entry_price * (1 + stop_loss / 100); exit_d = d; break
+            # D2高开>2%直接走 (趁高开跑路)
             if d2_open_gap > 2.0:
                 exit_p = b['open']; exit_d = d; break
+            # D2跌破D1高点×0.99走 (反弹无力)
             exit_trigger = d1_high * 0.99
             if b['low'] <= exit_trigger:
                 exit_p = exit_trigger; exit_d = d; break
+            # 以上都没触发 → D2收盘走 (无论如何D2了结)
             exit_p = b['close']; exit_d = d; break
 
         # ① 峰值逃顶(优先): 涨>7%后大上影线(>30%)→收盘逃顶
@@ -227,9 +265,11 @@ def run_backtest(bars, entry_idx, entry_price, hold_days=20, stop_loss=-10.0, tr
         # ② 追踪止损
         if d > 1 and b['low'] <= peak * (1 + trailing_stop / 100):
             exit_p = peak * (1 + trailing_stop / 100); exit_d = d; break
+        # ③ 止损
         if b['low'] <= entry_price * (1 + stop_loss / 100):
             exit_p = entry_price * (1 + stop_loss / 100); exit_d = d; break
 
+        # ④ 兜底: 持仓到期收盘走
         exit_p = b['close']; exit_d = d
 
     return {
@@ -374,8 +414,13 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
 
 def strategy_v1(bars, code, min_vol_ratio=2.0, max_upper_shadow=0.5,
                 hold_days=20, stop_loss=-10.0, trailing_stop=-8.0,
-                use_preload_filter=True, buy_mode="signal_close",
-                no_limit_lookback=10, use_ema_filter=True, use_rsi_filter=True):
+                buy_mode="signal_close",
+                no_limit_lookback=10, use_ema_filter=True, use_rsi_filter=True,
+                d1_min_change=2.0,
+                stock_info=None, sector_counts_by_date=None,
+                min_turnover=8.0, max_turnover=12.0,
+                max_d0_gap=5.0,
+                min_sector_limits=2):
     """V1基线策略
 
     no_limit_lookback: 前N日无涨停过滤 (默认10天, 排除近期有涨停的股票)
@@ -417,20 +462,8 @@ def strategy_v1(bars, code, min_vol_ratio=2.0, max_upper_shadow=0.5,
         upper_shadow = (fl_high - fl_close) / ref * 100
         if upper_shadow >= max_upper_shadow: continue
 
-        # 量比<1.5x
-        if vol_ratio >= 1.5:
-            continue
-
-        has_preload = False
-        preload_type = None
-        for k in range(max(0, i - 10), i):
-            sigs = detect_signals(bars, k)
-            if sigs:
-                has_preload = True
-                preload_type = sigs[0]
-                break
-
-        if use_preload_filter and not has_preload:
+        # 量比过滤
+        if vol_ratio >= min_vol_ratio:
             continue
 
         # EMA趋势过滤: EMA10 > EMA20 (多头排列)
@@ -448,9 +481,39 @@ def strategy_v1(bars, code, min_vol_ratio=2.0, max_upper_shadow=0.5,
             if r is not None and (r <= 30 or r >= 70):
                 continue
 
+        # 换手率过滤: D0成交量 / 流通股本 (8-12%共振区)
+        if stock_info:
+            if code not in stock_info:
+                continue  # 无数据, 排除
+            circ = stock_info[code]['circ_shares']
+            if circ > 0:
+                turnover = fl_vol / circ * 100
+                if turnover < min_turnover or turnover > max_turnover:
+                    continue  # 换手率不在共振区
+            else:
+                continue  # 流通股本为0, 排除
+
+        # D0跳空高开过滤: 排除跳空>5%的(消息刺激一字板/高开太多)
+        d0_gap_pct = (fl['open'] / bars[i-1]['close'] - 1) * 100 if bars[i-1]['close'] > 0 else 0
+        if d0_gap_pct > max_d0_gap:
+            continue
+
+        # 板块效应过滤: 同板块涨停数
+        if sector_counts_by_date and stock_info and code in stock_info:
+            fl_date = fl['time']
+            sc = sector_counts_by_date.get(fl_date, {})
+            sector_max = get_stock_sector_limit_count(code, stock_info, sc)
+            if sector_max < min_sector_limits:
+                continue  # 孤板, 板块没共振
+
         # D1数据 (用于过滤和回测)
         if i + 1 >= len(bars): continue
         d1 = bars[i + 1]
+        d1_change = (d1['close'] / fl_close - 1) * 100
+
+        # D1涨幅过滤: D1涨幅太小说明市场不认可首板, 排除弱信号
+        if d1_change < d1_min_change:
+            continue
 
         # 根据buy_mode确定入场价
         if buy_mode == "signal_close":
@@ -470,7 +533,6 @@ def strategy_v1(bars, code, min_vol_ratio=2.0, max_upper_shadow=0.5,
         if entry_price <= 0: continue
 
         # D1过滤 (仅next_open模式, signal_close已买入不需要)
-        d1_change = (d1['close'] / fl_close - 1) * 100
         if buy_mode == "next_open":
             d1_gap = (entry_price / fl_close - 1) * 100
             min_d1_gap = -2.0 if board_type == "main" else -5.0
@@ -480,6 +542,16 @@ def strategy_v1(bars, code, min_vol_ratio=2.0, max_upper_shadow=0.5,
 
         # 预计算 d1_limit_up: 基于 D1 收盘 vs D0 收盘 (涨停日)
         d1_limit_up_val = is_limit_up(d1['close'], fl_close, board_type)
+
+        # 计算换手率
+        turnover_rate = 0.0
+        if stock_info and code in stock_info:
+            circ = stock_info[code]['circ_shares']
+            if circ > 0:
+                turnover_rate = fl_vol / circ * 100
+
+        # D0跳空高开幅度
+        d0_gap = (fl['open'] / bars[i-1]['close'] - 1) * 100 if bars[i-1]['close'] > 0 else 0
 
         bt = run_backtest(bars, entry_idx, entry_price, hold_days, stop_loss, trailing_stop, board_type, is_v1=True, d1_limit_up=d1_limit_up_val)
         if not bt: continue
@@ -492,9 +564,9 @@ def strategy_v1(bars, code, min_vol_ratio=2.0, max_upper_shadow=0.5,
             'entry_price': round(entry_price, 3),
             'buy_mode': buy_mode,
             'vol_ratio': round(vol_ratio, 2),
+            'turnover_rate': round(turnover_rate, 2),
+            'd0_gap': round(d0_gap, 2),
             'd1_change': round(d1_change, 2),
-            'has_preload': has_preload,
-            'preload_type': preload_type,
             **bt,
         })
 
@@ -763,6 +835,83 @@ def print_stats(trades, label):
         pl = 0.0
     print(f"  {label}: {len(trades):>4}笔 胜率{wr:>5.1f}% 均收益{avg:>+6.2f}% 均峰值{peak:>+6.2f}% 盈亏比{pl:.2f}")
 
+def print_today_signals(all_trades, today_str):
+    """统计今日出现买点的股票"""
+    today_trades = [t for t in all_trades if t['entry_date'] == today_str]
+    if not today_trades:
+        print(f"\n{'=' * 80}")
+        print(f"📅 {today_str} 今日买点统计")
+        print(f"{'=' * 80}")
+        print(f"  今日无买点信号")
+        return today_trades
+
+    # 按策略分组
+    dc_today = [t for t in today_trades if t['path'] == 'dragon_callback']
+    v1_today = [t for t in today_trades if t['path'] == 'v1']
+    bb_today = [t for t in today_trades if t['path'] == 'break_buy']
+
+    # 按板块分组
+    main_today = [t for t in today_trades if t['board'] in ('沪主板', '深主板')]
+    gem_today = [t for t in today_trades if t['board'] == '创业板']
+    star_today = [t for t in today_trades if t['board'] == '科创板']
+
+    print(f"\n{'=' * 80}")
+    print(f"📅 {today_str} 今日买点统计")
+    print(f"{'=' * 80}")
+    print(f"  共 {len(today_trades)} 只股票出现买点信号")
+
+    # 策略分布
+    print(f"\n  📊 策略分布:")
+    if dc_today:
+        print(f"    🐉 龙回头: {len(dc_today)} 只")
+    if v1_today:
+        print(f"    🔥 V1: {len(v1_today)} 只")
+    if bb_today:
+        print(f"    💥 断板: {len(bb_today)} 只")
+
+    # 板块分布
+    print(f"\n  📊 板块分布:")
+    if main_today:
+        print(f"    🏛️  主板: {len(main_today)} 只")
+    if gem_today:
+        print(f"    💎 创业板: {len(gem_today)} 只")
+    if star_today:
+        print(f"    🚀 科创板: {len(star_today)} 只")
+
+    # 股票代码汇总
+    all_codes = sorted(set(t['code'] for t in today_trades))
+    print(f"\n  📋 今日买点股票代码汇总 ({len(all_codes)}只):")
+    print(f"    {', '.join(all_codes)}")
+
+    # 按策略列出股票
+    if dc_today:
+        print(f"\n  🐉 龙回头信号 ({len(dc_today)}只):")
+        for t in sorted(dc_today, key=lambda x: x.get('signal_vol_r', 0), reverse=True):
+            print(f"    {t['code']:<8} {t['board']:<6} 涨停{t['lu_date']} 回调{t['pullback_days']}天 "
+                  f"信号{t['signal_date']} {t['signal_chg']:+.1f}% 量{t['signal_vol_r']:.2f}x "
+                  f"买入{t['entry_price']:.2f}")
+
+    if v1_today:
+        print(f"\n  🔥 V1信号 ({len(v1_today)}只):")
+        for t in sorted(v1_today, key=lambda x: x.get('vol_ratio', 0), reverse=True):
+            print(f"    {t['code']:<8} {t['board']:<6} 涨停{t['d0_date']} "
+                  f"量比{t['vol_ratio']:.2f}x D1{t['d1_change']:+.1f}% "
+                  f"买入{t['entry_price']:.2f}")
+
+    if bb_today:
+        print(f"\n  💥 断板信号 ({len(bb_today)}只):")
+        for t in sorted(bb_today, key=lambda x: x.get('streak_len', x.get('relay_limits', 0)), reverse=True):
+            if t.get('mode') == 'relay':
+                print(f"    {t['code']:<8} {t['board']:<6} 接力{t['relay_window']}天{t['relay_limits']}板 "
+                      f"断板{t['break_date']} {t['break_chg']:+.1f}% 量{t['break_vol_r']:.2f}x "
+                      f"买入{t['entry_price']:.2f}")
+            else:
+                print(f"    {t['code']:<8} {t['board']:<6} {t['streak_len']}板连板 "
+                      f"断板{t['break_date']} {t['break_chg']:+.1f}% 量{t['break_vol_r']:.2f}x "
+                      f"买入{t['entry_price']:.2f}")
+
+    return today_trades
+
 def main():
     parser = argparse.ArgumentParser(description="龙回头 + V1 + 断板 三策略回测")
     parser.add_argument("--codes", default="")
@@ -785,8 +934,15 @@ def main():
     parser.add_argument("--max-upper-shadow", type=float, default=0.5, help="V1: 最大上影线%% (默认0.5)")
     parser.add_argument("--v1-stop-loss", type=float, default=-10.0, help="V1: 止损%% (默认-10)")
     parser.add_argument("--v1-trailing-stop", type=float, default=-8.0, help="V1: 追踪止损%% (默认-8)")
+    parser.add_argument("--d1-min-change", type=float, default=2.0, help="V1: D1最小涨幅%%, 低于此值排除 (默认2.0)")
+    parser.add_argument("--min-turnover", type=float, default=8.0, help="V1: 最小换手率%% (默认8)")
+    parser.add_argument("--max-turnover", type=float, default=12.0, help="V1: 最大换手率%% (默认12)")
+    parser.add_argument("--max-d0-gap", type=float, default=5.0, help="V1: D0跳空高开上限%%, 超过排除 (默认5)")
+    parser.add_argument("--min-sector-limits", type=int, default=2, help="V1: 同板块最少涨停数, 低于排除 (默认2, 即不是孤板)")
     parser.add_argument("--no-ema-filter", action="store_true", help="V1: 禁用EMA10>EMA20过滤")
     parser.add_argument("--no-rsi-filter", action="store_true", help="V1: 禁用RSI 30-70过滤")
+    parser.add_argument("--today", action="store_true", help="仅统计今日出现买点的股票")
+    parser.add_argument("--today-date", type=str, default="", help="指定日期(YYYY-MM-DD), 默认为今天")
     args = parser.parse_args()
 
     codes = [c.strip() for c in args.codes.split(",") if c.strip()] if args.codes else TEST_CODES
@@ -818,11 +974,52 @@ def main():
     dc_trades, v1_trades, bb_trades = [], [], []
     success = 0
 
+    # 加载stock_basic_info (换手率 + 板块效应)
+    stock_info = None
+    sector_counts_by_date = None
+    if run_v1 and (args.min_turnover > 0 or args.max_turnover < 100 or args.min_sector_limits > 0):
+        try:
+            stock_info = fetch_stock_info_db()
+            print(f"📊 加载stock_basic_info: {len(stock_info)}只")
+        except Exception as e:
+            print(f"⚠️  stock_basic_info加载失败({e}), 跳过换手率/板块过滤")
+
+    # 预加载所有K线, 计算板块涨停统计
+    all_bars = {}
+    if run_v1 and stock_info and args.min_sector_limits > 0:
+        print(f"📊 预加载K线计算板块效应...")
+        for code in codes:
+            bars = fetch_kline_db(code, args.days) if use_db else fetch_kline(code, args.days)
+            if bars:
+                all_bars[code] = bars
+        # 按日期统计板块涨停数
+        sector_counts_by_date = {}
+        for code, bars in all_bars.items():
+            if code not in stock_info:
+                continue
+            bt = get_board_type(code)
+            threshold = 0.098 if bt == 'main' else 0.198
+            for i in range(1, len(bars)):
+                prev_c = bars[i-1]['close']
+                if prev_c <= 0: continue
+                ret = bars[i]['close'] / prev_c - 1
+                if ret < threshold * 0.98:
+                    continue
+                d = bars[i]['time']
+                if d not in sector_counts_by_date:
+                    sector_counts_by_date[d] = defaultdict(int)
+                info = stock_info[code]
+                if info['industry']:
+                    sector_counts_by_date[d][('industry', info['industry'])] += 1
+                for concept in info['concepts']:
+                    sector_counts_by_date[d][('concept', concept)] += 1
+        print(f"   板块统计: {len(sector_counts_by_date)}个交易日")
+
     for i, code in enumerate(codes):
         # 显式过滤ST股 (ST涨停5%, 远低于正常阈值, 会被自然排除)
         if is_st_stock(code):
             continue
-        bars = fetch_kline_db(code, args.days) if use_db else fetch_kline(code, args.days)
+        bars = all_bars.get(code) if all_bars else (fetch_kline_db(code, args.days) if use_db else fetch_kline(code, args.days))
         if not bars:
             continue
 
@@ -836,14 +1033,23 @@ def main():
             dc_trades.extend(dc)
             parts.append(f"龙回头{len(dc)}")
         if run_v1:
-            v1 = strategy_v1(bars, code, use_preload_filter=False, buy_mode=args.buy_mode,
+            # 如果预加载了K线, 直接用; 否则单独加载
+            code_bars = all_bars.get(code) if all_bars else bars
+            v1 = strategy_v1(code_bars, code, buy_mode=args.buy_mode,
                              no_limit_lookback=args.no_limit_lookback,
                              min_vol_ratio=args.min_vol_ratio,
                              max_upper_shadow=args.max_upper_shadow,
                              stop_loss=args.v1_stop_loss,
                              trailing_stop=args.v1_trailing_stop,
                              use_ema_filter=not args.no_ema_filter,
-                             use_rsi_filter=not args.no_rsi_filter)
+                             use_rsi_filter=not args.no_rsi_filter,
+                             d1_min_change=args.d1_min_change,
+                             stock_info=stock_info,
+                             sector_counts_by_date=sector_counts_by_date,
+                             min_turnover=args.min_turnover,
+                             max_turnover=args.max_turnover,
+                             max_d0_gap=args.max_d0_gap,
+                             min_sector_limits=args.min_sector_limits)
             v1_trades.extend(v1)
             parts.append(f"V1{len(v1)}")
         if run_bb:
@@ -922,6 +1128,17 @@ def main():
             print(f"  ⚠️ 重叠信号: {len(overlap)}笔")
         else:
             print(f"  ✅ 零重叠, 三策略完全互补")
+
+    # ===== 今日买点统计 =====
+    if args.today:
+        from datetime import datetime, timedelta
+        today_str = args.today_date if args.today_date else datetime.now().strftime("%Y-%m-%d")
+        all_for_today = dc_trades + v1_trades + bb_trades
+        today_trades = print_today_signals(all_for_today, today_str)
+        if today_trades:
+            with open(f"today_signals_{today_str}.json", "w", encoding="utf-8") as f:
+                json.dump(today_trades, f, ensure_ascii=False, indent=2)
+            print(f"\n💾 today_signals_{today_str}.json ({len(today_trades)}笔)")
 
     # 交易明细
     if args.all_trades and dc_trades:
