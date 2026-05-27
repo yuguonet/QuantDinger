@@ -1133,7 +1133,10 @@ def _run_task(task: str):
         # 无记录 → 全新拉取
         if not last_bar_time:
             final_status = _run_fresh_pull(task, doc, last_status)
-        elif is_update:
+            return final_status
+        # 计算 is_update
+        is_update = _compute_is_update(task, last_bar_time)
+        if is_update:
             # is_update → 全新拉取
             final_status = _run_fresh_pull(task, doc, last_status)
         elif last_status == "re":
