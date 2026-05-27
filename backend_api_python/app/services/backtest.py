@@ -569,6 +569,8 @@ class BacktestService:
             'indicator_params': indicator_params or {},
             'user_id': user_id,
             'indicator_id': indicator_id,
+            'market': market,
+            'symbol': symbol,
         }
         signals = self._execute_indicator(indicator_code, df_signal, backtest_params)
         logger.info(f"Signals generated: {list(signals.keys()) if isinstance(signals, dict) else type(signals)}")
@@ -1703,6 +1705,8 @@ class BacktestService:
             'indicator_params': indicator_params or {},
             'user_id': user_id,
             'indicator_id': indicator_id,
+            'market': market,
+            'symbol': symbol,
         }
         signals = self._execute_indicator(indicator_code, df, backtest_params)
         
@@ -1924,7 +1928,17 @@ class BacktestService:
             indicator_id = (backtest_params or {}).get('indicator_id')
             indicator_caller = IndicatorCaller(user_id, indicator_id)
             local_vars['call_indicator'] = indicator_caller.call_indicator
-            
+
+            # === 扩展参数插件 ===
+            from app.services.ext_params import collect_extras
+            _ext_ctx = {
+                'symbol': (backtest_params or {}).get('symbol', ''),
+                'market': (backtest_params or {}).get('market', ''),
+                'df': df_for_exec,
+                'backtest_params': backtest_params,
+            }
+            local_vars.update(collect_extras(_ext_ctx))
+
             # Add technical indicator functions
             local_vars.update(self._get_indicator_functions())
             
