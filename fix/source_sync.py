@@ -31,6 +31,7 @@
 # python optimizer/source_sync.py -T 1D --retry-only       # 只重试错误股票
 # python optimizer/source_sync.py -T 1D --dry-run          # 只校验不写库
 # python optimizer/source_sync.py -T 1D --incremental      # 增量: 与DB归一化合并后写入
+# python optimizer/source_sync.py -T 1D --code 600519      # 单股票模式
 #
 # ============================================================================
 
@@ -1255,6 +1256,8 @@ def main():
         help="只重试重传文件中的股票")
     parser.add_argument("--incremental", action="store_true",
         help="增量模式: 拉取远端数据后先与 DB 现有数据归一化合并，再校验写入")
+    parser.add_argument("--code", default="",
+        help="单只股票代码 (如 600519)，指定后只处理该股票")
 
     args = parser.parse_args()
 
@@ -1322,17 +1325,23 @@ def main():
     ckpt_path = _checkpoint_path(args.type)
 
     # ── 获取股票列表 ──
-    print("\n[1/4] 获取股票列表...")
-    try:
-        from app.utils.basicinfo_db import get_stock_basic_db
-        db = get_stock_basic_db()
-        all_stocks = db.get_all_stocks(status="active")
-    except Exception as e:
-        logger.error("获取股票列表失败: %s", e)
-        return 1
+    if args.code:
+        # 单股票模式: 直接使用指定代码，跳过数据库查询
+        code = args.code.strip().replace("SH", "").replace("SZ", "").replace(".", "")
+        all_codes = [code]
+        print(f"\n[1/4] 单股票模式: {code}")
+    else:
+        print("\n[1/4] 获取股票列表...")
+        try:
+            from app.utils.basicinfo_db import get_stock_basic_db
+            db = get_stock_basic_db()
+            all_stocks = db.get_all_stocks(status="active")
+        except Exception as e:
+            logger.error("获取股票列表失败: %s", e)
+            return 1
 
-    all_codes = sorted(s["symbol"] for s in all_stocks)
-    print(f"  共 {len(all_codes)} 只A股")
+        all_codes = sorted(s["symbol"] for s in all_stocks)
+        print(f"  共 {len(all_codes)} 只A股")
 
     # ── 断点续传 ──
     processed_set: set = set()
