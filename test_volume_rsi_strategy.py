@@ -5,8 +5,10 @@
 入场规则:
   ① 今日成交量 > 前两日成交量之和
   ② 当前价格在20日均线之上
-  ③ 前40日到前5日有一日或多日的RSI<30
-  ④ 从最后一个RSI<30的日起到前一日区间涨幅在3%~8%之间
+  ②b 今日涨幅>3%
+  ②c 今日换手率>5%
+  ③ 前40日到前5日有一日或多日的RSI<25
+  ④ 从最后一个RSI<25的日起到前一日区间涨幅在3%~8%之间
 
 出场规则:
   ① RSI>75 且 量比>2.0
@@ -43,6 +45,26 @@ def _get_writer():
     from app.utils.db_market import get_market_kline_writer
     _writer_cache = get_market_kline_writer()
     return _writer_cache
+
+_circ_shares_cache = None
+def _get_circ_shares(code):
+    """从 stock_basic_info 表读取流通股本(股)"""
+    global _circ_shares_cache
+    if _circ_shares_cache is not None:
+        return _circ_shares_cache.get(code, 0.0)
+    _load_env()
+    try:
+        from app.utils.basicinfo_db import get_stock_basic_db
+        db = get_stock_basic_db()
+        db.ensure_table()
+        pool = db._get_pool()
+        with pool.cursor() as cur:
+            cur.execute("SELECT symbol, circ_shares FROM stock_basic_info WHERE circ_shares > 0")
+            _circ_shares_cache = {row[0]: float(row[1]) for row in cur.fetchall()}
+        return _circ_shares_cache.get(code, 0.0)
+    except Exception:
+        _circ_shares_cache = {}
+        return 0.0
 
 def get_all_codes_db():
     writer = _get_writer()
@@ -182,8 +204,12 @@ def run_backtest(bars, entry_idx, entry_price, exit_signals,
     peak = entry_price
     exit_p = entry_price
     exit_d = 0
-    exit_reason = ""
+    exit_reason = "data_end"
     max_d = len(bars) - entry_idx - 1
+
+    # 买入当天就是最后一天，无法回测
+    if max_d <= 0:
+        return None
 
     for d in range(1, max_d + 1):
         idx = entry_idx + d
@@ -230,17 +256,20 @@ def run_backtest(bars, entry_idx, entry_price, exit_signals,
 # ================================================================
 # 量价RSI策略信号生成 + 回测
 # ================================================================
-def strategy_volume_rsi(bars, code, rsi_len=14, rsi_oversold=30,
+def strategy_volume_rsi(bars, code, rsi_len=14, rsi_oversold=25,
                         rsi_overbought=75, rsi_extreme=82,
-                        max_hold_days=60, gain_threshold=8.0):
+                        max_hold_days=60, gain_threshold=8.0,
+                        circ_shares=0.0, min_turnover=5.0):
     """
     量价RSI策略:
 
     入场条件:
       ① 今日成交量 > 前两日成交量之和
       ② 当前价格在20日均线之上
-      ③ 前40日到前5日有一日或多日的RSI<30
-      ④ 从最后一个RSI<30的日起到前一日区间涨幅在3%~8%之间
+      ②b 今日涨幅>3%
+      ②c 今日换手率>5%
+      ③ 前40日到前5日有一日或多日的RSI<25
+      ④ 从最后一个RSI<25的日起到前一日区间涨幅在3%~8%之间
 
     出场条件:
       ① RSI>75 且 量比>2.0
@@ -276,8 +305,8 @@ def strategy_volume_rsi(bars, code, rsi_len=14, rsi_oversold=30,
 
     # ---- 入场信号检测 ----
     buy_signal = [False] * len(bars)
-    last_rsi30_date = [None] * len(bars)   # 最后一个RSI<30的日期
-    last_rsi30_idx_arr = [-1] * len(bars)  # 最后一个RSI<30的索引
+    last_rsi30_date = [None] * len(bars)   # 最后一个RSI<25的日期
+    last_rsi30_idx_arr = [-1] * len(bars)  # 最后一个RSI<25的索引
     gain_from_rsi30_arr = [0.0] * len(bars)
 
     for i in range(40, len(bars)):
@@ -290,7 +319,19 @@ def strategy_volume_rsi(bars, code, rsi_len=14, rsi_oversold=30,
         if ma20[i] <= 0 or closes[i] <= ma20[i]:
             continue
 
-        # 条件③: 前40日到前5日有RSI<30的日子(从近到远搜索, 取最后一个)
+        # 条件②b: 今日涨幅>3%
+        if i >= 1 and closes[i - 1] > 0:
+            today_gain = (closes[i] / closes[i - 1] - 1) * 100
+            if today_gain <= 3.0:
+                continue
+
+        # 条件②c: 今日换手率>min_turnover%
+        if circ_shares > 0:
+            turnover = volumes[i] / circ_shares * 100
+            if turnover < min_turnover:
+                continue
+
+        # 条件③: 前40日到前5日有RSI<25的日子(从近到远搜索, 取最后一个)
         last_rsi30_idx = -1
         for j in range(i - 5, max(i - 41, -1), -1):
             if j < 0:
@@ -302,7 +343,7 @@ def strategy_volume_rsi(bars, code, rsi_len=14, rsi_oversold=30,
         if last_rsi30_idx < 0:
             continue
 
-        # 条件④: 从最后一个RSI<30日到前一日区间涨幅在3%~8%之间
+        # 条件④: 从最后一个RSI<25日到前一日区间涨幅在3%~8%之间
         price_at_rsi30 = closes[last_rsi30_idx]
         if price_at_rsi30 <= 0:
             continue
@@ -347,6 +388,8 @@ def strategy_volume_rsi(bars, code, rsi_len=14, rsi_oversold=30,
         # 计算入场时的各项指标值
         vol_prev2 = volumes[i - 1] + volumes[i - 2]
         vol_ratio = volumes[i] / vol_prev2 if vol_prev2 > 0 else 0
+        today_gain = (closes[i] / closes[i - 1] - 1) * 100 if i >= 1 and closes[i - 1] > 0 else 0
+        turnover = volumes[i] / circ_shares * 100 if circ_shares > 0 else 0
 
         trades.append({
             'code': code,
@@ -361,6 +404,8 @@ def strategy_volume_rsi(bars, code, rsi_len=14, rsi_oversold=30,
             'signal_volume': volumes[i],
             'signal_vol_prev2': vol_prev2,
             'signal_vol_ratio': round(vol_ratio, 3),
+            'signal_today_gain': round(today_gain, 2),
+            'signal_turnover': round(turnover, 2),
             'last_rsi30_date': last_rsi30_date[i],
             'gain_from_rsi30': gain_from_rsi30_arr[i],
             'entry_date': entry_date,
@@ -405,21 +450,19 @@ def print_stats(trades, label):
         print(f"  {label}: 无信号")
         return
     n = len(trades)
-    wr = sum(1 for t in trades if t['return_pct'] > 0) / n * 100
-    avg = sum(t['return_pct'] for t in trades) / n
-    peak = sum(t['peak_return_pct'] for t in trades) / n
-    ws = [t['return_pct'] for t in trades if t['return_pct'] > 0]
-    ls = [t['return_pct'] for t in trades if t['return_pct'] <= 0]
-    if ws and ls and sum(ls) != 0:
-        pl = (sum(ws) / len(ws)) / (abs(sum(ls)) / len(ls))
-    elif ws:
-        pl = 999.0
-    else:
-        pl = 0.0
+    wins = [t for t in trades if t['return_pct'] > 0]
+    losses = [t for t in trades if t['return_pct'] < 0]
+    breakeven = [t for t in trades if t['return_pct'] == 0]
+    wr = len(wins) / n * 100 if n > 0 else 0
+    avg = sum(t['return_pct'] for t in trades) / n if n > 0 else 0
+    peak = sum(t['peak_return_pct'] for t in trades) / n if n > 0 else 0
+    avg_win = sum(t['return_pct'] for t in wins) / len(wins) if wins else 0
+    avg_loss = sum(t['return_pct'] for t in losses) / len(losses) if losses else 0
+    pl = avg_win / abs(avg_loss) if avg_loss != 0 else (999.0 if wins else 0.0)
     total_ret = sum(t['return_pct'] for t in trades)
-    max_dd = min(t['return_pct'] for t in trades)
+    worst = min(t['return_pct'] for t in trades) if trades else 0
     print(f"  {label}: {n:>4}笔 胜率{wr:>5.1f}% 均收益{avg:>+6.2f}% 均峰值{peak:>+6.2f}% "
-          f"盈亏比{pl:.2f} 总收益{total_ret:>+6.2f}% 最大单笔{max_dd:>+6.2f}%")
+          f"盈亏比{pl:.2f} 总收益{total_ret:>+6.2f}% 最大单笔{worst:>+6.2f}%")
 
 def print_today_signals(all_trades, today_str):
     today_trades = [t for t in all_trades if t['entry_date'] == today_str]
@@ -444,8 +487,8 @@ def print_today_signals(all_trades, today_str):
     print(f"\n  今日信号 ({len(today_trades)}只):")
     for t in sorted(today_trades, key=lambda x: x['signal_rsi']):
         print(f"    {t['code']:<8} {t['board']:<6} RSI={t['signal_rsi']:.1f} "
-              f"量比={t['signal_vol_ratio']:.2f} 买入{t['entry_price']:.2f} "
-              f"涨幅={t['gain_from_rsi30']:.1f}%")
+              f"量比={t['signal_vol_ratio']:.2f} 换手={t['signal_turnover']:.1f}% "
+              f"买入{t['entry_price']:.2f} 涨幅={t['gain_from_rsi30']:.1f}%")
 
     return today_trades
 
@@ -459,7 +502,7 @@ def main():
     parser.add_argument("--source", choices=["manual", "db"], default="manual",
                         help="数据源: manual(默认), db")
     parser.add_argument("--rsi-len", type=int, default=14, help="RSI 周期 (默认14)")
-    parser.add_argument("--rsi-oversold", type=float, default=30, help="RSI 超卖阈值 (默认30)")
+    parser.add_argument("--rsi-oversold", type=float, default=25, help="RSI 超卖阈值 (默认25)")
     parser.add_argument("--rsi-overbought", type=float, default=75, help="RSI 超买阈值 (默认75)")
     parser.add_argument("--rsi-extreme", type=float, default=82, help="RSI 极端超买阈值 (默认82)")
     parser.add_argument("--max-hold", type=int, default=60, help="最大持仓天数 (默认60, 0=不限制)")
@@ -468,6 +511,7 @@ def main():
     parser.add_argument("--today-date", type=str, default="", help="指定日期(YYYY-MM-DD)")
     parser.add_argument("--top", type=int, default=10, help="显示TOP N (默认10)")
     parser.add_argument("--gain-threshold", type=float, default=8.0, help="RSI30后涨幅阈值%% (默认8.0)")
+    parser.add_argument("--min-turnover", type=float, default=5.0, help="最小换手率%% (默认5.0)")
     args = parser.parse_args()
 
     codes = [c.strip() for c in args.codes.split(",") if c.strip()] if args.codes else TEST_CODES
@@ -484,8 +528,10 @@ def main():
     print(f"入场条件:")
     print(f"  ① 今日成交量 > 前两日成交量之和")
     print(f"  ② 当前价格在20日均线之上")
+    print(f"  ②b 今日涨幅>3%")
+    print(f"  ②c 今日换手率>{args.min_turnover}%")
     print(f"  ③ 前40日到前5日有RSI<{args.rsi_oversold}")
-    print(f"  ④ 从最后一个RSI<30日起到前一日区间涨幅在3%~{args.gain_threshold}%之间")
+    print(f"  ④ 从最后一个RSI<{args.rsi_oversold}日起到前一日区间涨幅在3%~{args.gain_threshold}%之间")
     print(f"出场条件:")
     print(f"  ① RSI>{args.rsi_overbought} 且 量比>2.0")
     print(f"  ② RSI>{args.rsi_extreme}")
@@ -510,6 +556,8 @@ def main():
             rsi_extreme=args.rsi_extreme,
             max_hold_days=args.max_hold,
             gain_threshold=args.gain_threshold,
+            circ_shares=_get_circ_shares(code),
+            min_turnover=args.min_turnover,
         )
         all_trades.extend(trades)
 
@@ -555,6 +603,15 @@ def main():
             if seg:
                 print_stats(seg, f"    {label}")
 
+        # 换手率分布
+        print(f"\n  信号换手率分布:")
+        for lo, hi, label in [(5, 10, "换手 5~10%"), (10, 15, "换手 10~15%"),
+                               (15, 20, "换手 15~20%"), (20, 30, "换手 20~30%"),
+                               (30, 999, "换手 >30%")]:
+            seg = [t for t in all_trades if lo <= t.get('signal_turnover', 0) < hi]
+            if seg:
+                print_stats(seg, f"    {label}")
+
         # 出场原因分布
         print(f"\n  出场原因分布:")
         for reason, label in [("signal_exit", "信号出场"), ("ema_cross", "EMA死叉"),
@@ -575,7 +632,7 @@ def main():
         print(f"\n  TOP{n} 盈利:")
         for t in sorted(all_trades, key=lambda x: -x['return_pct'])[:n]:
             print(f"    {t['code']:<8} {t['board']:<6} RSI={t['signal_rsi']:.1f} "
-                  f"量比={t['signal_vol_ratio']:.2f} "
+                  f"量比={t['signal_vol_ratio']:.2f} 换手={t['signal_turnover']:.1f}% "
                   f"{t['entry_date']}买{t['entry_price']:>7.2f} -> "
                   f"收益{t['return_pct']:>+6.2f}% 峰值{t['peak_return_pct']:>+6.2f}% "
                   f"持仓{t['exit_day']}天")
@@ -583,7 +640,7 @@ def main():
         print(f"\n  TOP{n} 亏损:")
         for t in sorted(all_trades, key=lambda x: x['return_pct'])[:n]:
             print(f"    {t['code']:<8} {t['board']:<6} RSI={t['signal_rsi']:.1f} "
-                  f"量比={t['signal_vol_ratio']:.2f} "
+                  f"量比={t['signal_vol_ratio']:.2f} 换手={t['signal_turnover']:.1f}% "
                   f"{t['entry_date']}买{t['entry_price']:>7.2f} -> "
                   f"收益{t['return_pct']:>+6.2f}% 峰值{t['peak_return_pct']:>+6.2f}% "
                   f"持仓{t['exit_day']}天")
@@ -604,7 +661,7 @@ def main():
         print(f"\n  全部交易明细:")
         for t in sorted(all_trades, key=lambda x: x['entry_date']):
             print(f"  {t['code']:<8} {t['board']:<6} "
-                  f"RSI={t['signal_rsi']:.1f} 量比={t['signal_vol_ratio']:.2f} -> "
+                  f"RSI={t['signal_rsi']:.1f} 量比={t['signal_vol_ratio']:.2f} 换手={t['signal_turnover']:.1f}% -> "
                   f"{t['entry_date']}买{t['entry_price']:>7.2f} "
                   f"-> 收益{t['return_pct']:>+6.2f}% 峰值{t['peak_return_pct']:>+6.2f}% "
                   f"持仓{t['exit_day']}天")
