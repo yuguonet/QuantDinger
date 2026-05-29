@@ -949,6 +949,7 @@ const locale = {
   'dashboard.analysis.modal.addStock.symbolRequired': 'Please enter symbol code',
   'dashboard.analysis.modal.addStock.searchPlaceholder': 'Search symbol code or name',
   'dashboard.analysis.modal.addStock.searchOrInputPlaceholder': 'Search or enter symbol code (e.g.: AAPL, BTC/USDT, EUR/USD)',
+  'dashboard.analysis.modal.addStock.searchPlaceholderCN': 'Search A-shares: code or name (e.g.: 600519, 茅台)',
   'dashboard.analysis.modal.addStock.searchOrInputHint': 'Search in database or enter code directly (name will be fetched automatically)',
   'dashboard.analysis.modal.addStock.search': 'Search',
   'dashboard.analysis.modal.addStock.searchResults': 'Search Results',

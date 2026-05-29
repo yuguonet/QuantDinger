@@ -1062,21 +1062,22 @@ def _extract_failed_symbols_from_report(report_text: str) -> list[str]:
 def _compute_is_update(task: str, last_bar_time: datetime) -> bool:
     """计算 is_update: 是否需要全新拉取。
 
-    is_update = ((当前时间 - (date(db最后时间)+cutoff)) > (下一交易日 - 当前交易日))
-    15m cutoff=15:05, 1D cutoff=17:00
+    # is_update = ((当前时间 - (date(db最后时间)+cutoff)) >= (下一交易日 - 最后交易日))
+    is_update = date(db最后时间) < 最后交易日
+    15m cutoff=15:00, 1D cutoff=17:00
     """
-    now = datetime.now(TZ_CN)
-    today_str = now.strftime("%Y-%m-%d")
-    cutoff_h, cutoff_m = (15, 5) if task == "15m" else (17, 0)
+#    now = datetime.now(TZ_CN)
+#    today_str = now.strftime("%Y-%m-%d")
+    cutoff_h, cutoff_m = (15, 0) if task == "15m" else (17, 0)
     db_date = last_bar_time.astimezone(TZ_CN).strftime("%Y-%m-%d") if last_bar_time.tzinfo else last_bar_time.strftime("%Y-%m-%d")
     db_cutoff = datetime.strptime(db_date, "%Y-%m-%d").replace(
         hour=cutoff_h, minute=cutoff_m, second=0, tzinfo=TZ_CN
     )
-    next_td = datetime.strptime(next_trading_day(today_str), "%Y-%m-%d").replace(tzinfo=TZ_CN)
+#    next_td = datetime.strptime(next_trading_day(today_str), "%Y-%m-%d").replace(tzinfo=TZ_CN)
     last_td = last_finish_trading_day()
     today_dt = datetime.strptime(last_td, "%Y-%m-%d").replace(tzinfo=TZ_CN)
-    return (now - db_cutoff) > (next_td - today_dt)
-
+#    return (now - db_cutoff) >= (next_td - today_dt)
+    return db_cutoff < today_dt
 
 def _run_post_script(task: str):
     script_dir = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))), "script")

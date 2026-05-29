@@ -99,7 +99,7 @@ def get_public_config():
 def get_market_types():
     """Return supported market types for the add-watchlist modal."""
     # Keep a stable UX order; add CN/HK stocks near US stocks.
-    desired_order = ['USStock', 'CNStock', 'HKStock', 'Crypto', 'Forex', 'Futures']
+    desired_order = ['CNStock', 'USStock', 'HKStock', 'Crypto', 'Forex', 'Futures']
     order_rank = {v: i for i, v in enumerate(desired_order)}
 
     def _normalize_item(x):
@@ -169,20 +169,24 @@ def get_menu_footer_config():
 def search_symbols():
     """
     Lightweight symbol search.
-    DB seed first; for Crypto, falls back to exchange market list when DB yields few results.
+    For CNStock: uses basicinfo_db (code + name + pinyin initials).
+    For others: DB seed first; Crypto falls back to exchange market list.
     """
     try:
         market = (request.args.get('market') or '').strip()
-        keyword = (request.args.get('keyword') or '').strip().upper()
+        keyword = (request.args.get('keyword') or '').strip()
         limit = int(request.args.get('limit') or 20)
 
         if not market or not keyword:
             return jsonify({'code': 1, 'msg': 'success', 'data': []})
 
-        out = seed_search_symbols(market=market, keyword=keyword, limit=limit)
+        if market == 'CNStock':
+            out = _search_cn_smart(keyword, limit)
+        else:
+            out = seed_search_symbols(market=market, keyword=keyword.upper(), limit=limit)
 
         if market == 'Crypto' and len(out) < 3:
-            extra = _search_crypto_exchange(keyword, limit - len(out), {r['symbol'] for r in out})
+            extra = _search_crypto_exchange(keyword.upper(), limit - len(out), {r['symbol'] for r in out})
             out.extend(extra)
 
         return jsonify({'code': 1, 'msg': 'success', 'data': out})
@@ -303,7 +307,7 @@ def get_watchlist():
 @market_bp.route('/watchlist/add', methods=['POST'])
 @login_required
 def add_watchlist():
-    """Add a symbol to watchlist for the current user."""
+    """Add a symbol to watchlist for the current user, with validation for CNStock."""
     try:
         user_id = g.user_id
         data = request.get_json() or {}
@@ -312,6 +316,27 @@ def add_watchlist():
         name_in = (data.get('name') or '').strip()
         if not market or not symbol:
             return jsonify({'code': 0, 'msg': 'Missing market or symbol', 'data': None}), 400
+
+        # Validate & normalize CNStock symbol via basicinfo_db
+        if market == 'CNStock':
+            from app.utils.basicinfo_db import get_stock_basic_db
+            db_info = get_stock_basic_db()
+            stock = db_info.get_stock(symbol)
+            if stock:
+                name_in = name_in or stock['name']
+            elif not symbol.isdigit():
+                # Non-digit input (name / pinyin) — try fuzzy search
+                matches = _search_cn_smart(symbol, limit=5)
+                if len(matches) == 1:
+                    symbol = matches[0]['symbol']
+                    name_in = name_in or matches[0]['name']
+                elif len(matches) > 1:
+                    return jsonify({'code': 0, 'msg': f'匹配到 {len(matches)} 个，请选择', 'data': {'candidates': matches}}), 200
+                else:
+                    return jsonify({'code': 0, 'msg': f'未找到股票: {symbol}', 'data': None}), 200
+            else:
+                # Digit code but not in basicinfo_db — reject
+                return jsonify({'code': 0, 'msg': f'无效股票代码: {symbol}', 'data': None}), 200
 
         # Prefer frontend-provided name (search results), otherwise resolve via seed/public sources.
         resolved = resolve_symbol_name(market, symbol) or seed_get_symbol_name(market, symbol)
@@ -535,6 +560,72 @@ def get_price():
             'msg': f'Failed: {str(e)}',
             'data': None
         }), 500
+
+
+def _search_cn_smart(keyword: str, limit: int = 20) -> list:
+    """
+    A-share search: code → name → pinyin initials, via basicinfo_db.
+    Returns list of {market: 'CNStock', symbol, name, market_cn}.
+    """
+    kw = keyword.strip()
+    if not kw:
+        return []
+
+    from app.utils.basicinfo_db import get_stock_basic_db
+    from app.utils.pinyin_initials import pinyin_initials
+    db = get_stock_basic_db()
+
+    seen = set()
+    results = []
+
+    # 1. Exact code lookup
+    if kw.isdigit():
+        stock = db.get_stock(kw)
+        if stock:
+            results.append({
+                'market': 'CNStock',
+                'symbol': stock['symbol'],
+                'name': stock['name'],
+                'market_cn': stock.get('market_cn', '')
+            })
+            seen.add(stock['symbol'])
+
+    # 2. Fuzzy search (code prefix + name LIKE)
+    if len(results) < limit:
+        for s in db.search_stocks(kw, limit=limit * 2):
+            if s['symbol'] not in seen:
+                results.append({
+                    'market': 'CNStock',
+                    'symbol': s['symbol'],
+                    'name': s['name'],
+                    'market_cn': s.get('market_cn', '')
+                })
+                seen.add(s['symbol'])
+                if len(results) >= limit:
+                    break
+
+    # 3. Pinyin initials match (e.g. 'gzmt' matches '贵州茅台')
+    if len(results) < limit and kw.isalpha():
+        kw_lower = kw.lower()
+        for s in db.get_all_stocks(status='active'):
+            if s['symbol'] in seen:
+                continue
+            name = s.get('name', '')
+            if not name:
+                continue
+            initials = pinyin_initials(name)
+            if initials and kw_lower in initials:
+                results.append({
+                    'market': 'CNStock',
+                    'symbol': s['symbol'],
+                    'name': s['name'],
+                    'market_cn': s.get('market_cn', '')
+                })
+                seen.add(s['symbol'])
+                if len(results) >= limit:
+                    break
+
+    return results
 
 
 @market_bp.route('/stock/name', methods=['POST'])

@@ -985,6 +985,7 @@ const locale = {
   'dashboard.analysis.modal.addStock.symbolRequired': '请输入股票代码',
   'dashboard.analysis.modal.addStock.searchPlaceholder': '搜索标的代码或名称',
   'dashboard.analysis.modal.addStock.searchOrInputPlaceholder': '搜索或输入标的代码（如：AAPL、BTC/USDT、EUR/USD）',
+  'dashboard.analysis.modal.addStock.searchPlaceholderCN': '搜索A股：输入代码、名称或拼音首字母（如：600519、茅台、gzmt）',
   'dashboard.analysis.modal.addStock.searchOrInputHint': '支持搜索数据库中的标的，或直接输入代码（系统将自动获取名称）',
   'dashboard.analysis.modal.addStock.search': '搜索',
   'dashboard.analysis.modal.addStock.searchResults': '搜索结果',
