@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-除权除息因子模块 — 独立模块，不依赖项目其他文件，仅支持不复权
+除权除息因子模块 — 独立模块，不依赖项目其他文件
 
 因子来源: 新浪财经 qfq.js / hfq.js
   - qfq (前复权): fwd_price = unadj_price / qfq_factor
@@ -13,9 +13,8 @@
   - unadj_to_hfq(klines, code) — 不复权 → 后复权
 
 缓存策略:
-  - 内存缓存: 进程生命周期有效（_qfq_cache）
-  - 文件缓存: cache/adjustment_factors.json，远端获取失败时使用文件缓存
-  - 启动时: 首次 fetch 自动从文件缓存预热，远端成功后更新文件缓存
+  - import 时从文件缓存一次性加载到内存
+  - 调用时内存未命中则请求远端，成功后同步写入文件缓存
 """
 
 from __future__ import annotations
@@ -79,63 +78,46 @@ def _to_sina_code(code: str) -> Optional[str]:
 
 
 # ================================================================
-# 文件缓存 — 远端获取失败时的兜底
+# 缓存 — import 时加载文件，运行时内存优先
 # ================================================================
 
-_file_cache: Dict[str, List[Tuple[str, float]]] = {}
-_file_cache_loaded = False
-_file_cache_lock = threading.Lock()
+_cache: Dict[str, List[Tuple[str, float]]] = {}
+_cache_lock = threading.Lock()
 
 
-def _load_file_cache() -> Dict[str, List[Tuple[str, float]]]:
-    """从文件缓存加载因子数据。"""
-    global _file_cache_loaded
-    if _file_cache_loaded:
-        return _file_cache
-    with _file_cache_lock:
-        if _file_cache_loaded:
-            return _file_cache
-        _file_cache_loaded = True
-        try:
-            if os.path.exists(_CACHE_FILE):
-                with open(_CACHE_FILE, "r", encoding="utf-8") as f:
-                    raw = json.load(f)
-                for code, factors in raw.items():
-                    _file_cache[code] = [(d, float(v)) for d, v in factors]
-        except Exception:
-            pass
-    return _file_cache
+def _load_cache_file():
+    """import 时调用，从文件缓存一次性加载到内存。"""
+    try:
+        if os.path.exists(_CACHE_FILE):
+            with open(_CACHE_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            for code, factors in raw.items():
+                _cache[code] = [(d, float(v)) for d, v in factors]
+    except Exception:
+        pass
 
 
-def _save_file_cache():
-    """将内存中的因子数据持久化到文件缓存。"""
+def _save_cache_file():
+    """将内存缓存全量写入文件缓存。"""
     try:
         os.makedirs(_CACHE_DIR, exist_ok=True)
-        with _file_cache_lock:
-            data = {code: list(factors) for code, factors in _file_cache.items()}
+        with _cache_lock:
+            data = {code: list(factors) for code, factors in _cache.items()}
         with open(_CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
     except Exception:
         pass
 
 
-def _update_file_cache_entry(sina_code: str, factors: List[Tuple[str, float]]):
-    """更新单个股票的文件缓存条目。"""
-    with _file_cache_lock:
-        _file_cache[sina_code] = factors
-    # 异步保存到文件（不阻塞当前请求）
-    threading.Thread(target=_save_file_cache, daemon=True).start()
+# 模块 import 时立即加载文件缓存
+_load_cache_file()
 
 
 # ================================================================
 # 因子获取
 # ================================================================
 
-_qfq_cache: Dict[str, List[Tuple[str, float]]] = {}
-_cache_lock = threading.Lock()
-
-
-def _parse_sina_factor(text: str, var_suffix: str) -> Optional[List[Tuple[str, float]]]:
+def _parse_sina_factor(text: str) -> Optional[List[Tuple[str, float]]]:
     """解析新浪因子 JS 返回。
 
     格式: var sz301128qfq={"total":N,"data":[{"d":"2026-05-19","f":"1.0000000000000000"},...]}
@@ -159,9 +141,9 @@ def fetch_qfq_factors(code: str) -> Optional[List[Tuple[str, float]]]:
       最新除权日 factor=1.0，越早的日期 factor 越大。
 
     缓存策略:
-      1. 内存缓存命中 → 直接返回
-      2. 远端获取成功 → 更新内存 + 文件缓存
-      3. 远端获取失败 → 尝试文件缓存兜底
+      1. 内存命中 → 直接返回
+      2. 远端获取成功 → 写入内存 + 文件缓存
+      3. 远端失败 → 返回 None
 
     Returns:
         [(date_str, factor), ...] 按日期降序，失败返回 None
@@ -172,30 +154,18 @@ def fetch_qfq_factors(code: str) -> Optional[List[Tuple[str, float]]]:
 
     # 1. 内存缓存命中
     with _cache_lock:
-        if sina_code in _qfq_cache:
-            return _qfq_cache[sina_code]
+        if sina_code in _cache:
+            return _cache[sina_code]
 
-    # 2. 确保文件缓存已加载（启动时预热）
-    _load_file_cache()
-
-    # 3. 远端获取
+    # 2. 远端获取
     text = _http_get(f"https://finance.sina.com.cn/realstock/company/{sina_code}/qfq.js")
     if text:
-        factors = _parse_sina_factor(text, "qfq")
+        factors = _parse_sina_factor(text)
         if factors:
             with _cache_lock:
-                _qfq_cache[sina_code] = factors
-            _update_file_cache_entry(sina_code, factors)
+                _cache[sina_code] = factors
+            threading.Thread(target=_save_cache_file, daemon=True).start()
             return factors
-
-    # 4. 远端失败 → 文件缓存兜底
-    with _file_cache_lock:
-        if sina_code in _file_cache:
-            cached = _file_cache[sina_code]
-            if cached:
-                with _cache_lock:
-                    _qfq_cache[sina_code] = cached
-                return cached
 
     return None
 
@@ -376,3 +346,38 @@ def unadj_to_hfq(klines: list, code: str) -> list:
         else:
             result.append(bar)
     return result
+
+
+# ================================================================
+# 全量更新 — 供 backfill_db 调度器调用
+# ================================================================
+
+def update_all_factors() -> int:
+    """全量更新所有股票的前复权因子，写入文件缓存。
+
+    Returns:
+        成功更新的股票数量
+    """
+    from app.utils.basicinfo_db import get_stock_basic_db
+
+    codes = get_stock_basic_db().market_all_codes(status="active")
+    if not codes:
+        return 0
+
+    updated = 0
+    for code in codes:
+        sina_code = _to_sina_code(code)
+        if not sina_code:
+            continue
+        text = _http_get(f"https://finance.sina.com.cn/realstock/company/{sina_code}/qfq.js")
+        if text:
+            factors = _parse_sina_factor(text)
+            if factors:
+                with _cache_lock:
+                    _cache[sina_code] = factors
+                updated += 1
+
+    if updated > 0:
+        _save_cache_file()
+
+    return updated

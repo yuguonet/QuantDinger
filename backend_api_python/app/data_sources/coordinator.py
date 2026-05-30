@@ -1230,8 +1230,8 @@ class Coordinator:
         for name, s in source_stats.items():
             if s["ok"] > 0 or s["fail"] > 0 or s["timeout"] > 0:
                 stat_parts.append(f"{name}: {s['ok']}只/{s['batches']}批 {s['fail']}失败 {s['timeout']}超时")
-        logger.info("[batch_quotes] 完成: %d成功 %d彻底失败 %d只 | %s",
-                    len(results), permanent_fail_count[0], total,
+        logger.info("[batch_quotes] 完成: %d成功 %d失败 | %s",
+                    len(results), permanent_fail_count[0],
                     " | ".join(stat_parts))
 
         return list(results.values())

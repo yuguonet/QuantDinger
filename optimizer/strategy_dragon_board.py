@@ -74,7 +74,7 @@ def lim_thresh(code: str) -> float:
 
 
 def load_daily(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
-    from adjust_utils import adjust_daily_df
+    from app.data_sources.provider.adjustment import unadj_to_qfq
     writer = _get_writer()
     data = writer.query("CNStock", code, "1D", start_time=start, end_time=end, limit=0)
     if not data:
@@ -87,7 +87,9 @@ def load_daily(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     for c in ["open","high","low","close","volume"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-    return adjust_daily_df(df, code)
+    klines = [{"time": t.strftime("%Y-%m-%d"), "open": r["open"], "high": r["high"], "low": r["low"], "close": r["close"], "volume": r["volume"]} for t, r in df.reset_index().iterrows()]
+    adj = unadj_to_qfq(klines, code)
+    return pd.DataFrame(adj).set_index("time")
 
 
 def run_strategy(
