@@ -11,7 +11,7 @@
      - 1W 先转成 1D 的 count，走完 1D 流程后再聚合回周线。
 
   3. Ticker（实时行情）：
-     - 盘中（交易日 9:30~15:01）每次必拉，保证实时性
+     - 盘中（交易日 9:15~15:01）每次必拉，保证实时性
      - 非盘中优先走 TTL 缓存，未命中再拉远端
      - 合并当前股 + TTL 已有 symbols（归一化，最大 500）
      - 拉取结果写入 TTL 内存（无有效期，最旧先丢弃）
@@ -41,6 +41,7 @@ from app.data_sources.asia_stock_kline import normalize_chart_timeframe
 from app.data_sources.coordinator import get_coordinator
 from app.data_sources.kline_clean import clean_klines
 from app.data_sources.normalizer import strip_market_prefix
+from app.data_sources.provider.adjustment import unadj_to_qfq
 from app.utils.logger import get_logger
 from app.utils.trading_calendar import is_trading_day, prev_trading_day
 
@@ -147,7 +148,7 @@ def _is_in_trading_hours() -> bool:
     if not is_trading_day(today_str):
         return False
     t = now.time()
-    return dtime(9, 30) < t <= dtime(15, 1)
+    return dtime(9, 15) < t <= dtime(15, 1)
 
 
 def _prev_trading_day_ts() -> int:
@@ -554,9 +555,9 @@ class CNStockDataSource(BaseDataSource):
         """检查 DB 中 15m 线最后一条的时间是否足够新。
 
         盘中走远端，盘前/盘后且 DB 最新才走 DB:
-          - 盘中（交易日 9:30~15:01）→ False
+          - 盘中（交易日 9:15~15:01）→ False
           - 盘后（交易日 15:01 后）→ 最后 bar 必须是今日 15:00
-          - 盘前（交易日 9:30 前）→ 最后 bar 必须是前一交易日 15:00
+          - 盘前（交易日 9:15 前）→ 最后 bar 必须是前一交易日 15:00
           - 非交易日全天 → 最后 bar 必须是最近交易日 15:00
         """
         now = datetime.now()
@@ -697,11 +698,11 @@ class CNStockDataSource(BaseDataSource):
             limit=limit,
             market="CNStock",
             timeout=20,
-            adj="qfq",
         )
         bars = coord_result.get("bars", []) if coord_result else []
         if bars:
-            bars = clean_klines(bars, remote_tf)
+            bars = unadj_to_qfq(bars, symbol)
+            # bars = clean_klines(bars, remote_tf)
 
         return self.filter_and_limit(
             bars, limit=limit,
@@ -784,7 +785,6 @@ class CNStockDataSource(BaseDataSource):
             limit=count,
             market="CNStock",
             timeout=30,
-            adj="qfq",
         )
         bars = coord_result.get("bars", []) if coord_result else []
         if not bars:

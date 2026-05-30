@@ -23,15 +23,15 @@
 #   - 未指定 --start-date 时: 根据 timeframe 自动选择默认起始日
 #
 # 用法:
-# python optimizer/source_sync.py -T 1D                    # 1D: 默认 2021-01-04 起
-# python optimizer/source_sync.py -T 15m                   # 15m: 默认 2024-01-02 起
-# python optimizer/source_sync.py -T 1D --start-date 2023-01-01  # 指定起始日期
-# python optimizer/source_sync.py -T 1D --end-date 2026-05-17    # 指定截止日期
-# python optimizer/source_sync.py -T 1D --resume           # 断点续传
-# python optimizer/source_sync.py -T 1D --retry-only       # 只重试错误股票
-# python optimizer/source_sync.py -T 1D --dry-run          # 只校验不写库
-# python optimizer/source_sync.py -T 1D --incremental      # 增量: 与DB归一化合并后写入
-# python optimizer/source_sync.py -T 1D --code 600519      # 单股票模式
+# python fix/source_sync.py -T 1D                    # 1D: 默认 2021-01-04 起
+# python fix/source_sync.py -T 15m                   # 15m: 默认 2024-01-02 起
+# python fix/source_sync.py -T 1D --start-date 2023-01-01  # 指定起始日期
+# python fix/source_sync.py -T 1D --end-date 2026-05-17    # 指定截止日期
+# python fix/source_sync.py -T 1D --resume           # 断点续传
+# python fix/source_sync.py -T 1D --retry-only       # 只重试错误股票
+# python fix/source_sync.py -T 1D --dry-run          # 只校验不写库
+# python fix/source_sync.py -T 1D --incremental      # 增量: 与DB归一化合并后写入
+# python fix/source_sync.py -T 1D --code 600519      # 单股票模式
 #
 # ============================================================================
 
@@ -991,7 +991,6 @@ def process_batch(
                 market=market,
                 timeframe=timeframe,
                 count=count,
-                adj=adj,
                 timeout=timeout,
                 preferred_source=preferred_source,
                 start_date=start_date,

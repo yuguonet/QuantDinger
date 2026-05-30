@@ -91,11 +91,9 @@ def main():
 
     if args.codes or args.limit > 0:
         result = coord.coordinate_market_kline(
-            cb=cb,
             market="CNStock",
             timeframe=args.timeframe,
             count=args.count if not args.start_date else None,
-            adj=args.adj,
             timeout=args.timeout,
             preferred_source=args.preferred,
             start_date=args.start_date,
@@ -104,11 +102,9 @@ def main():
         )
     else:
         result = coord.coordinate_market_kline(
-            cb=cb,
             market="CNStock",
             timeframe=args.timeframe,
             count=args.count if not args.start_date else None,
-            adj=args.adj,
             timeout=args.timeout,
             preferred_source=args.preferred,
             start_date=args.start_date,

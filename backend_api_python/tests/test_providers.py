@@ -247,7 +247,6 @@ def test_fetch_market_kline(providers, timeframes):
                 data = p.fetch_market_kline(
                     timeframe=tf,
                     count=KLINE_COUNT,
-                    adj="qfq",
                     timeout=30,
                     start_date=MARKET_START,
                 )
