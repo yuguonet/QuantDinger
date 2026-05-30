@@ -3,7 +3,7 @@
 RSI 超买超卖策略 - 独立回测文件
 
 出场规则:
-  - 止盈 / 止损 / RSI>70卖出 / 最大持仓天数
+  - 止盈 / 止损 / RSI>75+量比>2+未涨停 / RSI>85 / 最大持仓天数
 """
 from __future__ import annotations
 import json, time, argparse, os, sys
@@ -87,12 +87,12 @@ def get_board_name(code):
 # ================================================================
 # 回测引擎
 # ================================================================
-def run_backtest(bars, entry_idx, entry_price, sell_signals,
+def run_backtest(bars, entry_idx, entry_price, sell_signals, extreme_signals,
                  stop_loss=-12.0, take_profit=993.75, board_type="main",
                  max_hold_days=20):
     """
     出场规则:
-      ① 持仓天数上限  ② 止盈  ③ 止损  ④ RSI>70卖出  ⑤ 数据耗尽
+      ① 持仓天数上限  ② 止盈  ③ 止损  ④ RSI>75+量比>2+未涨停  ⑤ RSI>85  ⑥ 数据耗尽
     max_hold_days=0 表示不限制
     """
     if entry_price <= 0 or entry_idx >= len(bars):
@@ -133,11 +133,18 @@ def run_backtest(bars, entry_idx, entry_price, sell_signals,
             exit_reason = "stop_loss"
             break
 
-        # ④ RSI 卖出信号
+        # ④ RSI>75+量比>2+未涨停
         if sell_signals[idx]:
             exit_p = b['close']
             exit_d = d
             exit_reason = "rsi_sell"
+            break
+
+        # ⑤ RSI>85
+        if extreme_signals[idx]:
+            exit_p = b['close']
+            exit_d = d
+            exit_reason = "rsi_extreme"
             break
 
         exit_p = b['close']
@@ -230,11 +237,9 @@ def compute_ma_slope(closes, ma_len=60):
 # ================================================================
 # RSI 策略信号生成 + 回测
 # ================================================================
-def strategy_rsi(bars, code, rsi_len=14, rsi_buy=23, rsi_sell=70,
+def strategy_rsi(bars, code, rsi_len=14, rsi_buy=23,
                  stop_loss=-12.0, take_profit=993.75,
                  buy_mode="next_open",
-                 vol_ratio_threshold=1.4,
-                 vol_ratio_max=0,  # 量比上限, 0=不限制
                  ma_slope_threshold=-0.5,
                  ma_slope_len=60,
                  max_hold_days=20):
@@ -242,11 +247,9 @@ def strategy_rsi(bars, code, rsi_len=14, rsi_buy=23, rsi_sell=70,
     RSI 超卖策略:
 
     买入条件 (边缘触发):
-      ① RSI[i] < rsi_buy(23) 且 RSI[i-1] >= rsi_buy
-      ② 量比[i] > vol_ratio_threshold(1.4) 且 <= vol_ratio_max
-      ③ MA60斜率[i] >= ma_slope_threshold(-0.5%)
+      D0: RSI[i] < rsi_buy(23) 且 RSI[i-1] >= rsi_buy 且量比<1.0(缩量) 且 MA60斜率>=-0.5%
 
-    出场: 止盈 / 止损 / RSI>70 / 最大持仓天数
+    出场: 止盈 / 止损 / RSI>75+量比>2+未涨停 / RSI>85 / 最大持仓天数
     """
     if len(bars) < rsi_len + 2:
         return []
@@ -260,40 +263,35 @@ def strategy_rsi(bars, code, rsi_len=14, rsi_buy=23, rsi_sell=70,
     vol_ratios   = compute_volume_ratio(volumes, window=5)
     ma60_slopes  = compute_ma_slope(closes, ma_len=ma_slope_len)
 
-    # ---- 买入信号: D0检测 + D1~D3 RSI斜率转正 + 缩量 ----
-    # D0: RSI 下穿超卖线, D1~D3 窗口内等 RSI 拐头向上(rsi_slope>0)再买入
+    # ---- 买入信号: D0确认(RSI下穿+缩量+MA60斜率达标) ----
+    # D0: RSI 下穿超卖线 + 量比<1.4(缩量) + MA60斜率达标 → 当日买入
     buy_signal = [False] * len(bars)
-    turn_day = [0] * len(bars)        # 记录拐头发生在 D0 后第几天
     d0_date = [None] * len(bars)      # 记录 D0 日期
-    d0_idx = -1  # D0 所在 bar index, -1 表示无待确认信号
     for i in range(1, len(bars)):
-        # D0 检测: RSI 跌破买入阈值
-        if rsi_values[i] < rsi_buy and rsi_values[i - 1] >= rsi_buy:
-            d0_idx = i
-
-        # D0 窗口超时(D1~D3 共3天), D0 失效
-        if d0_idx >= 0 and i - d0_idx > 3:
-            d0_idx = -1
-
-        # D0 之后 D1~D3, 等 RSI 斜率转正 + 缩量(量比<1.0) 再触发买入
-        if d0_idx >= 0 and i > d0_idx and rsi_values[i] > rsi_values[i - 1]:
-            vol_shrink     = vol_ratios[i] < 1.0
-            slope_ok       = ma60_slopes[i] >= ma_slope_threshold
-            if vol_shrink and slope_ok:
-                buy_signal[i] = True
-                turn_day[i] = i - d0_idx
-                d0_date[i] = bars[d0_idx]['time']
-            d0_idx = -1  # 无论是否满足其他条件, D0 已处理
+        # D0: RSI 跌破买入阈值 + 缩量(量比<1.4) + MA60斜率达标
+        if (rsi_values[i] < rsi_buy and rsi_values[i - 1] >= rsi_buy
+                and vol_ratios[i] < 1.4
+                and ma60_slopes[i] >= ma_slope_threshold):
+            buy_signal[i] = True
+            d0_date[i] = bars[i]['time']
 
         # RSI 回到超卖线上方, D0 失效
-        if d0_idx >= 0 and rsi_values[i] >= rsi_buy:
-            d0_idx = -1
+        # (无需额外处理, 下次跌破会重新检测)
 
-    # ---- 卖出信号 (RSI>70 边缘触发) ----
+    # ---- 卖出信号 ----
     sell_signal = [False] * len(bars)
+    extreme_signal = [False] * len(bars)
     for i in range(1, len(bars)):
-        if rsi_values[i] > rsi_sell and rsi_values[i - 1] <= rsi_sell:
+        prev_close = bars[i - 1]['close']
+        # 涨停判断: 主板±10%, 创业板/科创板±20%
+        limit_pct = 20.0 if code.startswith("30") or code.startswith("68") else 10.0
+        is_limit_up = (bars[i]['close'] / prev_close - 1) * 100 >= limit_pct - 0.5 if prev_close > 0 else False
+        # ④ RSI>75 且量比>2.0 且未涨停
+        if rsi_values[i] > 75 and vol_ratios[i] > 2.0 and not is_limit_up:
             sell_signal[i] = True
+        # ⑤ RSI>85
+        if rsi_values[i] > 85:
+            extreme_signal[i] = True
 
     # ---- 生成交易记录 ----
     trades = []
@@ -318,10 +316,6 @@ def strategy_rsi(bars, code, rsi_len=14, rsi_buy=23, rsi_sell=70,
             entry_price = bars[i + 1]['open']
             entry_idx = i + 1
             entry_date = bars[i + 1]['time']
-        elif buy_mode == "signal_low":
-            entry_price = bars[i]['low']
-            entry_idx = i
-            entry_date = signal_date
         else:
             continue
 
@@ -338,7 +332,7 @@ def strategy_rsi(bars, code, rsi_len=14, rsi_buy=23, rsi_sell=70,
                 break
 
         # 回测
-        result = run_backtest(bars, entry_idx, entry_price, sell_signal,
+        result = run_backtest(bars, entry_idx, entry_price, sell_signal, extreme_signal,
                               stop_loss, take_profit, board_type, max_hold_days)
         if not result:
             continue
@@ -353,7 +347,7 @@ def strategy_rsi(bars, code, rsi_len=14, rsi_buy=23, rsi_sell=70,
             'signal_ma60_slope': round(ma60_slopes[i], 4),
             'signal_date': signal_date,
             'd0_date': d0_date[i],
-            'turn_day': turn_day[i],
+            'turn_day': 0,
             'entry_date': entry_date,
             'entry_price': round(entry_price, 3),
             'buy_mode': buy_mode,
@@ -455,12 +449,8 @@ def main():
     parser.add_argument("--stop-loss", type=float, default=-12.0, help="止损%% (默认-12.0)")
     parser.add_argument("--take-profit", type=float, default=993.75, help="止盈%% (默认993.75)")
     parser.add_argument("--buy-mode", default="next_open",
-                        choices=["signal_close", "next_open", "signal_low"],
+                        choices=["signal_close", "next_open"],
                         help="买入模式")
-    parser.add_argument("--vol-ratio", type=float, default=1.4,
-                        help="量比阈值 (默认1.4)")
-    parser.add_argument("--vol-ratio-max", type=float, default=0,
-                        help="量比上限, 超过视为恐慌盘不买 (默认0=不限制)")
     parser.add_argument("--ma-slope", type=float, default=-0.5,
                         help="MA60斜率阈值%% (默认-0.5)")
     parser.add_argument("--max-hold", type=int, default=20,
@@ -482,16 +472,14 @@ def main():
     mode_label = {
         "signal_close": "信号日收盘买",
         "next_open": "D+1开盘买",
-        "signal_low": "信号日最低价(理想)",
     }[args.buy_mode]
 
     print(f"{'=' * 80}")
     print(f"RSI 超卖策略 独立回测")
     print(f"{'=' * 80}")
-    print(f"买入条件: RSI({args.rsi_len})<{args.rsi_buy} + 量比>{args.vol_ratio}" +
-          (f"且<={args.vol_ratio_max}" if args.vol_ratio_max > 0 else "") +
-          f" + MA60斜率>={args.ma_slope}%")
+    print(f"买入条件: RSI({args.rsi_len})<{args.rsi_buy} + D0缩量(量比<1.4) + MA60斜率>={args.ma_slope}%")
     print(f"风控: 止损{args.stop_loss}% 止盈{args.take_profit}% 最大持仓{args.max_hold}天")
+    print(f"出场: RSI>75+量比>2+未涨停 / RSI>85")
     print(f"买入模式: {mode_label}")
     print(f"股票: {len(codes)}只\n")
 
@@ -507,12 +495,9 @@ def main():
             bars, code,
             rsi_len=args.rsi_len,
             rsi_buy=args.rsi_buy,
-            rsi_sell=args.rsi_sell,
             stop_loss=args.stop_loss,
             take_profit=args.take_profit,
             buy_mode=args.buy_mode,
-            vol_ratio_threshold=args.vol_ratio,
-            vol_ratio_max=args.vol_ratio_max,
             ma_slope_threshold=args.ma_slope,
             max_hold_days=args.max_hold,
         )
@@ -553,16 +538,10 @@ def main():
         # 出场原因分布
         print(f"\n  出场原因分布:")
         for reason, label in [("take_profit", "止盈"), ("stop_loss", "止损"),
-                               ("rsi_sell", "RSI>70卖出"), ("max_hold", "持仓到期"),
+                               ("rsi_sell", "RSI>75卖出"), ("rsi_extreme", "RSI>85卖出"),
+                               ("max_hold", "持仓到期"),
                                ("data_end", "数据耗尽")]:
             seg = [t for t in all_trades if t.get('exit_reason') == reason]
-            if seg:
-                print_stats(seg, f"    {label}")
-
-        # 拐头天数分布(D0后第几天反弹)
-        print(f"\n  拐头天数分布(D0后第几天反弹):")
-        for d, label in [(1, "D1 (最快)"), (2, "D2"), (3, "D3 (最慢)")]:
-            seg = [t for t in all_trades if t.get('turn_day') == d]
             if seg:
                 print_stats(seg, f"    {label}")
 

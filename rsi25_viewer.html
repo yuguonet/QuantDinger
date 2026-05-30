@@ -1,0 +1,691 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RSI&lt;25 信号 OHLCV 可视化</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0a0f; color: #e0e0e0; height: 100vh; overflow: hidden; }
+  .app { display: flex; height: 100vh; }
+
+  /* ===== 左侧面板 ===== */
+  .sidebar {
+    width: 280px; min-width: 280px; background: #111118; border-right: 1px solid #222;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  .sidebar-header { padding: 12px 14px; border-bottom: 1px solid #222; background: #16161e; }
+  .sidebar-header h2 { font-size: 14px; color: #aaa; margin-bottom: 8px; }
+  .toolbar { display: flex; gap: 6px; margin-bottom: 8px; }
+  .toolbar button {
+    flex: 1; padding: 4px 0; font-size: 11px; border: 1px solid #333;
+    background: #1a1a24; color: #aaa; border-radius: 3px; cursor: pointer;
+  }
+  .toolbar button:hover { background: #252530; color: #fff; }
+  .search-box {
+    width: 100%; padding: 6px 10px; font-size: 12px; border: 1px solid #333;
+    background: #0d0d14; color: #ddd; border-radius: 4px; outline: none;
+  }
+  .search-box:focus { border-color: #4a9eff; }
+  .symbol-count { font-size: 11px; color: #666; margin-top: 6px; }
+  .symbol-list { flex: 1; overflow-y: auto; padding: 6px 0; }
+  .symbol-list::-webkit-scrollbar { width: 6px; }
+  .symbol-list::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+  .symbol-item {
+    display: flex; align-items: center; padding: 4px 14px; cursor: pointer;
+    transition: background 0.15s;
+  }
+  .symbol-item:hover { background: #1a1a24; }
+  .symbol-item input[type="checkbox"] { margin-right: 8px; accent-color: #4a9eff; }
+  .symbol-item .sym-name { font-size: 13px; font-family: monospace; flex: 1; }
+  .symbol-item .sym-color { width: 12px; height: 12px; border-radius: 2px; margin-left: 6px; }
+  .symbol-item .sym-count { font-size: 10px; color: #555; margin-left: 4px; }
+  .symbol-item .sym-pct { font-size: 11px; font-family: monospace; margin-left: 6px; min-width: 48px; text-align: right; }
+
+  /* ===== 右侧主区域 ===== */
+  .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  .info-bar {
+    padding: 8px 16px; background: #111118; border-bottom: 1px solid #222;
+    display: flex; align-items: center; gap: 16px; min-height: 40px;
+  }
+  .info-bar .title { font-size: 13px; color: #888; }
+  .info-bar .signal-info { font-size: 12px; color: #4a9eff; }
+  .info-bar .nav-hint { font-size: 11px; color: #555; margin-left: auto; }
+  .signal-selector {
+    display: flex; align-items: center; gap: 8px; padding: 6px 16px;
+    background: #0e0e16; border-bottom: 1px solid #1a1a24;
+  }
+  .signal-selector label { font-size: 11px; color: #666; }
+  .signal-selector select {
+    padding: 3px 8px; font-size: 12px; background: #16161e; color: #ddd;
+    border: 1px solid #333; border-radius: 3px; outline: none;
+  }
+  .chart-container { flex: 1; position: relative; overflow: hidden; background: #0a0a0f; }
+  canvas#chart { display: block; width: 100%; height: 100%; }
+  .crosshair-label {
+    position: absolute; pointer-events: none; display: none;
+    background: rgba(20,20,30,0.92); border: 1px solid #333; border-radius: 4px;
+    padding: 6px 10px; font-size: 11px; line-height: 1.6; white-space: nowrap;
+    z-index: 10; color: #ccc;
+  }
+  .legend {
+    padding: 6px 16px; background: #111118; border-top: 1px solid #222;
+    display: flex; flex-wrap: wrap; gap: 12px; min-height: 30px;
+  }
+  .legend-item { display: flex; align-items: center; gap: 5px; font-size: 11px; color: #888; }
+  .legend-item .dot { width: 10px; height: 3px; border-radius: 1px; }
+  .empty-state {
+    position: absolute; inset: 0; display: flex; align-items: center;
+    justify-content: center; flex-direction: column; gap: 12px;
+  }
+  .empty-state .icon { font-size: 48px; opacity: 0.2; }
+  .empty-state .text { font-size: 14px; color: #444; }
+  .load-panel {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+    background: #16161e; border: 1px solid #333; border-radius: 8px;
+    padding: 30px 40px; text-align: center; z-index: 20;
+  }
+  .load-panel input[type="file"] { display: none; }
+  .load-panel .btn {
+    display: inline-block; padding: 10px 28px; margin: 8px;
+    font-size: 14px; border: 1px solid #4a9eff; background: #1a2a3a;
+    color: #4a9eff; border-radius: 6px; cursor: pointer; transition: 0.2s;
+  }
+  .load-panel .btn:hover { background: #2a3a4a; }
+  .load-panel .or { color: #555; font-size: 12px; margin: 4px 0; }
+  .load-panel .hint { font-size: 11px; color: #555; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="sidebar">
+    <div class="sidebar-header">
+      <h2>📊 RSI&lt;25 信号浏览器</h2>
+      <div class="toolbar">
+        <button onclick="selectAll()">全选</button>
+        <button onclick="selectNone()">清空</button>
+        <button onclick="invertSelect()">反选</button>
+      </div>
+      <input class="search-box" id="searchInput" placeholder="搜索代码..." oninput="filterSymbols()">
+      <div class="symbol-count" id="symbolCount">加载数据后显示</div>
+    </div>
+    <div class="symbol-list" id="symbolList"></div>
+  </div>
+  <div class="main">
+    <div class="info-bar">
+      <span class="title">RSI&lt;25 信号 — 百分比叠加视图（信号日=100%）</span>
+      <span class="signal-info" id="signalInfo"></span>
+      <span class="nav-hint">← → 切换信号 | 滚轮缩放 | 拖拽平移</span>
+    </div>
+    <div class="signal-selector">
+      <label>信号:</label>
+      <select id="signalSelect" onchange="onSignalChange()"></select>
+      <span id="signalMeta" style="font-size:11px;color:#555;margin-left:8px;"></span>
+    </div>
+    <div class="chart-container" id="chartContainer">
+      <canvas id="chart"></canvas>
+      <div class="crosshair-label" id="crosshairLabel"></div>
+      <div class="empty-state" id="emptyState" style="display:none;">
+        <div class="icon">📭</div>
+        <div class="text">请在左侧勾选 Symbol 查看曲线</div>
+      </div>
+    </div>
+    <div class="legend" id="legend"></div>
+  </div>
+</div>
+<div class="load-panel" id="loadPanel">
+  <div style="font-size:16px;margin-bottom:14px;">📂 加载 RSI&lt;25 信号数据</div>
+  <label class="btn" for="fileInput">选择 JSON 文件</label>
+  <input type="file" id="fileInput" accept=".json" onchange="onFileSelected(event)">
+  <div class="or">或</div>
+  <label class="btn" onclick="loadDemo()">加载示例数据</label>
+  <div class="hint">支持 collect_rsi25_signals.py 生成的 JSON 文件<br>也可直接拖拽文件到此窗口</div>
+</div>
+
+<script>
+// ================================================================
+// 全局状态
+// ================================================================
+let DATA = null;
+let SIGNALS_MAP = {};
+let ALL_SYMBOLS = [];
+let SELECTED = new Set();
+let CURRENT_SIGNAL_IDX = 0;
+let VIEW_BARS = [];        // 当前信号的原始bars
+let NORM_BARS = [];        // 归一化后的bars (百分比)
+let SIGNAL_BAR_IDX = 3;    // 信号日在bars数组中的索引 (before_days=3 → index 3)
+let BASE_PRICE = 0;        // 信号日收盘价
+let VIEW_START = 0;
+let VIEW_COUNT = 60;
+let HOVERED_BAR = -1;
+
+// 所有选中symbol的归一化数据
+let OVERLAY_SERIES = [];   // [{symbol, color, normBars, basePrice, rawBars, signal}, ...]
+
+const COLORS = [
+  '#4a9eff','#ff6b6b','#51cf66','#ffd43b','#cc5de8','#ff922b',
+  '#20c997','#f06595','#748ffc','#a9e34b','#e599f7','#66d9e8',
+  '#ffa8a8','#b2f2bb','#ffec99','#d0bfff','#99e9f2','#ffc078',
+  '#c0eb75','#eebefa','#a5d8ff','#d8f5a2','#ffe066','#e5dbff',
+];
+let symbolColorMap = {};
+
+// ================================================================
+// 归一化: 以信号日收盘价为基准 → 100%
+// ================================================================
+function normalizeBars(bars, signalDate) {
+  // 找信号日在bars中的位置
+  let baseIdx = bars.findIndex(b => b.time === signalDate);
+  if (baseIdx < 0) baseIdx = 0; // fallback
+  const base = bars[baseIdx]?.close || 1;
+  return {
+    baseIdx,
+    basePrice: base,
+    bars: bars.map(b => ({
+      time: b.time,
+      open:  (b.open  / base * 100),
+      high:  (b.high  / base * 100),
+      low:   (b.low   / base * 100),
+      close: (b.close / base * 100),
+      volume: b.volume,
+    }))
+  };
+}
+
+// ================================================================
+// 文件加载
+// ================================================================
+function onFileSelected(e) { const f = e.target.files[0]; if (f) loadFile(f); }
+function loadFile(file) {
+  const reader = new FileReader();
+  reader.onload = e => {
+    try { DATA = JSON.parse(e.target.result); initData(); }
+    catch(err) { alert('JSON解析失败: ' + err.message); }
+  };
+  reader.readAsText(file);
+}
+document.addEventListener('dragover', e => e.preventDefault());
+document.addEventListener('drop', e => {
+  e.preventDefault();
+  const f = e.dataTransfer.files[0];
+  if (f && f.name.endsWith('.json')) loadFile(f);
+});
+
+function loadDemo() { DATA = generateDemoData(); initData(); }
+
+function generateDemoData() {
+  const symbols = ['000001','000002','000066','000402','000553','300001','300014','688001'];
+  const signals = [];
+  for (const sym of symbols) {
+    const nSig = 1 + Math.floor(Math.random() * 3);
+    for (let s = 0; s < nSig; s++) {
+      const baseDate = new Date(2025, Math.floor(Math.random()*6), 1 + Math.floor(Math.random()*25));
+      const bars = [];
+      let price = 10 + Math.random() * 50;
+      for (let d = -3; d <= 80; d++) {
+        const dt = new Date(baseDate); dt.setDate(dt.getDate() + d);
+        if (dt.getDay()===0||dt.getDay()===6) continue;
+        const change = (Math.random()-0.48)*0.04;
+        const open = price, close = price*(1+change);
+        const high = Math.max(open,close)*(1+Math.random()*0.02);
+        const low = Math.min(open,close)*(1-Math.random()*0.02);
+        bars.push({
+          time: dt.toISOString().slice(0,10),
+          open:+open.toFixed(2), high:+high.toFixed(2),
+          low:+low.toFixed(2), close:+close.toFixed(2),
+          volume: Math.round(500000+Math.random()*5000000)
+        });
+        price = close;
+      }
+      signals.push({
+        symbol:sym, signal_date:baseDate.toISOString().slice(0,10),
+        signal_rsi:+(15+Math.random()*10).toFixed(1),
+        signal_close:bars[3]?.close||0, bars
+      });
+    }
+  }
+  return {
+    meta:{generated:new Date().toISOString(),rsi_threshold:25,start_date:'2025-01-01',before_days:3,after_days:80},
+    symbols:[...new Set(signals.map(s=>s.symbol))].sort(),
+    signals:signals.sort((a,b)=>a.signal_date.localeCompare(b.signal_date))
+  };
+}
+
+// ================================================================
+// 数据初始化
+// ================================================================
+function initData() {
+  document.getElementById('loadPanel').style.display = 'none';
+  ALL_SYMBOLS = DATA.symbols || [...new Set(DATA.signals.map(s=>s.symbol))].sort();
+  SIGNALS_MAP = {};
+  for (const s of DATA.signals) {
+    if (!SIGNALS_MAP[s.symbol]) SIGNALS_MAP[s.symbol] = [];
+    SIGNALS_MAP[s.symbol].push(s);
+  }
+  ALL_SYMBOLS.forEach((sym,i) => { symbolColorMap[sym] = COLORS[i%COLORS.length]; });
+
+  const sel = document.getElementById('signalSelect');
+  sel.innerHTML = '';
+  DATA.signals.forEach((s,i) => {
+    const opt = document.createElement('option');
+    opt.value = i;
+    opt.textContent = `${s.signal_date}  ${s.symbol}  RSI=${s.signal_rsi}`;
+    sel.appendChild(opt);
+  });
+
+  renderSymbolList();
+  updateSignalView();
+  document.getElementById('signalInfo').textContent =
+    `共 ${DATA.signals.length} 条信号, ${ALL_SYMBOLS.length} 个Symbol`;
+}
+
+// ================================================================
+// Symbol列表
+// ================================================================
+function renderSymbolList() {
+  const container = document.getElementById('symbolList');
+  const filter = document.getElementById('searchInput').value.trim().toUpperCase();
+  container.innerHTML = '';
+  const visible = ALL_SYMBOLS.filter(s => !filter || s.includes(filter));
+  document.getElementById('symbolCount').textContent = `${visible.length} / ${ALL_SYMBOLS.length} 个Symbol`;
+
+  for (const sym of visible) {
+    const count = (SIGNALS_MAP[sym]||[]).length;
+    // 计算当前信号下该symbol的最终涨跌幅
+    let pctText = '';
+    const curSig = DATA?.signals[CURRENT_SIGNAL_IDX];
+    if (curSig && OVERLAY_SERIES.length > 0) {
+      const os = OVERLAY_SERIES.find(o => o.symbol === sym);
+      if (os && os.normBars.length > 0) {
+        const last = os.normBars[os.normBars.length - 1].close;
+        const pct = last - 100;
+        pctText = `<span class="sym-pct" style="color:${pct>=0?'#ef5350':'#26a69a'}">${pct>=0?'+':''}${pct.toFixed(1)}%</span>`;
+      }
+    }
+    const div = document.createElement('div');
+    div.className = 'symbol-item';
+    div.innerHTML = `
+      <input type="checkbox" ${SELECTED.has(sym)?'checked':''} onchange="toggleSymbol('${sym}')">
+      <span class="sym-name">${sym}</span>
+      <span class="sym-count">${count}</span>
+      ${pctText}
+      <span class="sym-color" style="background:${symbolColorMap[sym]}"></span>
+    `;
+    container.appendChild(div);
+  }
+}
+
+function toggleSymbol(sym) {
+  if (SELECTED.has(sym)) SELECTED.delete(sym); else SELECTED.add(sym);
+  rebuildOverlay();
+  renderSymbolList();
+  drawChart();
+}
+function selectAll() {
+  const f = document.getElementById('searchInput').value.trim().toUpperCase();
+  ALL_SYMBOLS.forEach(s => { if(!f||s.includes(f)) SELECTED.add(s); });
+  rebuildOverlay(); renderSymbolList(); drawChart();
+}
+function selectNone() { SELECTED.clear(); rebuildOverlay(); renderSymbolList(); drawChart(); }
+function invertSelect() {
+  const ns = new Set(); ALL_SYMBOLS.forEach(s => { if(!SELECTED.has(s)) ns.add(s); });
+  SELECTED.clear(); ns.forEach(s=>SELECTED.add(s));
+  rebuildOverlay(); renderSymbolList(); drawChart();
+}
+function filterSymbols() { renderSymbolList(); }
+
+// ================================================================
+// 信号视图
+// ================================================================
+function onSignalChange() {
+  CURRENT_SIGNAL_IDX = parseInt(document.getElementById('signalSelect').value);
+  updateSignalView();
+}
+
+function updateSignalView() {
+  if (!DATA||!DATA.signals.length) return;
+  const signal = DATA.signals[CURRENT_SIGNAL_IDX];
+  VIEW_BARS = signal.bars || [];
+  SIGNAL_BAR_IDX = VIEW_BARS.findIndex(b => b.time === signal.signal_date);
+  if (SIGNAL_BAR_IDX < 0) SIGNAL_BAR_IDX = 0;
+  BASE_PRICE = VIEW_BARS[SIGNAL_BAR_IDX]?.close || 1;
+
+  // 归一化当前信号
+  const norm = normalizeBars(VIEW_BARS, signal.signal_date);
+  NORM_BARS = norm.bars;
+
+  VIEW_START = 0;
+  VIEW_COUNT = Math.min(VIEW_BARS.length, 84);
+
+  document.getElementById('signalMeta').textContent =
+    `${signal.symbol} | ${signal.signal_date} | RSI=${signal.rsi||signal.signal_rsi} | 基准价=${BASE_PRICE.toFixed(0)} | ${VIEW_BARS.length}根K线`;
+
+  rebuildOverlay();
+  renderSymbolList();
+  drawChart();
+}
+
+// ================================================================
+// 构建叠加数据
+// ================================================================
+function rebuildOverlay() {
+  OVERLAY_SERIES = [];
+  if (!DATA) return;
+  const curSignal = DATA.signals[CURRENT_SIGNAL_IDX];
+  if (!curSignal) return;
+
+  for (const sym of SELECTED) {
+    const sigs = SIGNALS_MAP[sym] || [];
+    // 找最匹配当前信号日期的那条
+    let bestSig = sigs.find(s => s === curSignal);
+    if (!bestSig && sigs.length > 0) {
+      bestSig = sigs.reduce((best, s) => {
+        if (!best) return s;
+        return Math.abs(new Date(s.signal_date)-new Date(curSignal.signal_date)) <
+               Math.abs(new Date(best.signal_date)-new Date(curSignal.signal_date)) ? s : best;
+      }, null);
+    }
+    if (!bestSig || !bestSig.bars || !bestSig.bars.length) continue;
+
+    const norm = normalizeBars(bestSig.bars, curSignal.signal_date);
+    OVERLAY_SERIES.push({
+      symbol: sym,
+      color: symbolColorMap[sym],
+      normBars: norm.bars,
+      baseIdx: norm.baseIdx,
+      basePrice: norm.basePrice,
+      rawBars: bestSig.bars,
+      signal: bestSig,
+    });
+  }
+}
+
+// ================================================================
+// 图表绘制 — 百分比坐标
+// ================================================================
+const canvas = document.getElementById('chart');
+const ctx = canvas.getContext('2d');
+let dpr = window.devicePixelRatio||1, W, H;
+
+function resizeCanvas() {
+  const rect = canvas.parentElement.getBoundingClientRect();
+  W = rect.width; H = rect.height;
+  canvas.width = W*dpr; canvas.height = H*dpr;
+  canvas.style.width = W+'px'; canvas.style.height = H+'px';
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+window.addEventListener('resize', ()=>{resizeCanvas();drawChart();});
+
+function drawChart() {
+  resizeCanvas();
+  ctx.clearRect(0,0,W,H);
+
+  const emptyEl = document.getElementById('emptyState');
+  if (OVERLAY_SERIES.length===0||VIEW_BARS.length===0) {
+    emptyEl.style.display='flex';
+    drawEmptyGrid(); updateLegend([]); return;
+  }
+  emptyEl.style.display='none';
+
+  const margin = {top:20, right:60, bottom:30, left:10};
+  const priceH = H*0.72;
+  const volH = H*0.18;
+  const volTop = priceH+margin.top+10;
+
+  // 用归一化后的bars计算视口范围
+  const viewNormBars = NORM_BARS.slice(VIEW_START, VIEW_START+VIEW_COUNT);
+  if (!viewNormBars.length) return;
+
+  // 价格范围 (百分比)
+  let pMin=Infinity, pMax=-Infinity, vMax=0;
+  for (const s of OVERLAY_SERIES) {
+    const vb = s.normBars.slice(VIEW_START, VIEW_START+VIEW_COUNT);
+    for (const b of vb) {
+      if (b.low<pMin) pMin=b.low;
+      if (b.high>pMax) pMax=b.high;
+      if (b.volume>vMax) vMax=b.volume;
+    }
+  }
+  const pPad = (pMax-pMin)*0.08||1;
+  pMin-=pPad; pMax+=pPad;
+  if (vMax===0) vMax=1;
+
+  const barW = (W-margin.left-margin.right)/viewNormBars.length;
+  const candleW = Math.max(1, barW*0.65);
+
+  function priceY(p) { return margin.top+(1-(p-pMin)/(pMax-pMin))*priceH; }
+  function volY(v) { return volTop+volH-(v/vMax)*volH; }
+  function barX(i) { return margin.left+i*barW+barW/2; }
+
+  // 网格 (百分比标签)
+  drawPctGrid(margin, priceH, volTop, volH, pMin, pMax, vMax, viewNormBars);
+
+  // 绘制叠加曲线
+  for (const s of OVERLAY_SERIES) {
+    const vb = s.normBars.slice(VIEW_START, VIEW_START+VIEW_COUNT);
+    if (OVERLAY_SERIES.length === 1) {
+      // 单symbol: 红绿K线 + 量柱
+      drawSingleCandles(vb, barX, priceY, volY, candleW);
+    } else {
+      // 多symbol: 折线 + 半透明量柱
+      drawOverlayLine(vb, s.color, barX, priceY, volY, candleW);
+    }
+  }
+
+  // 信号日标记线 (100%线)
+  const sigBarIdx = viewNormBars.findIndex((b,i) => {
+    const absIdx = VIEW_START+i;
+    return VIEW_BARS[absIdx]?.time === DATA.signals[CURRENT_SIGNAL_IDX]?.signal_date;
+  });
+  if (sigBarIdx>=0) {
+    const sx = barX(sigBarIdx);
+    ctx.save();
+    ctx.strokeStyle='rgba(255,100,100,0.6)';
+    ctx.lineWidth=1;
+    ctx.setLineDash([4,4]);
+    ctx.beginPath(); ctx.moveTo(sx,margin.top); ctx.lineTo(sx,volTop+volH); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle='rgba(255,80,80,0.9)';
+    ctx.font='bold 10px sans-serif';
+    ctx.textAlign='center';
+    ctx.fillText('信号日 (100%)', sx, margin.top-4);
+    ctx.restore();
+  }
+
+  // 100%基准线
+  const baseY = priceY(100);
+  if (baseY>margin.top && baseY<margin.top+priceH) {
+    ctx.save();
+    ctx.strokeStyle='rgba(255,200,60,0.3)';
+    ctx.lineWidth=1;
+    ctx.setLineDash([2,4]);
+    ctx.beginPath(); ctx.moveTo(margin.left,baseY); ctx.lineTo(W-margin.right,baseY); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle='rgba(255,200,60,0.5)';
+    ctx.font='9px monospace';
+    ctx.textAlign='left';
+    ctx.fillText('100%', W-margin.right+4, baseY+3);
+    ctx.restore();
+  }
+
+  // X轴日期
+  drawDateLabels(viewNormBars, barX, volTop+volH+4);
+
+  updateLegend(OVERLAY_SERIES);
+}
+
+function drawEmptyGrid() {
+  ctx.strokeStyle='#1a1a24'; ctx.lineWidth=1;
+  for(let y=0;y<H;y+=40){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();}
+  for(let x=0;x<W;x+=60){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke();}
+}
+
+function drawPctGrid(margin, priceH, volTop, volH, pMin, pMax, vMax, viewBars) {
+  ctx.save();
+  ctx.strokeStyle='#1a1a24'; ctx.lineWidth=0.5;
+  const steps=6;
+  for(let i=0;i<=steps;i++){
+    const y=margin.top+(i/steps)*priceH;
+    ctx.beginPath();ctx.moveTo(margin.left,y);ctx.lineTo(W-margin.right,y);ctx.stroke();
+    const p=pMax-(i/steps)*(pMax-pMin);
+    ctx.fillStyle='#444'; ctx.font='10px monospace'; ctx.textAlign='left';
+    ctx.fillText(p.toFixed(1)+'%', W-margin.right+4, y+3);
+  }
+  ctx.strokeStyle='#151520';
+  for(let i=0;i<=2;i++){
+    const y=volTop+(i/2)*volH;
+    ctx.beginPath();ctx.moveTo(margin.left,y);ctx.lineTo(W-margin.right,y);ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawSingleCandles(bars, barX, priceY, volY, candleW) {
+  for(let i=0;i<bars.length;i++){
+    const b=bars[i]; const x=barX(i);
+    const isUp=b.close>=b.open;
+    const color=isUp?'#ef5350':'#26a69a';
+    const bodyTop=priceY(Math.max(b.open,b.close));
+    const bodyBot=priceY(Math.min(b.open,b.close));
+    const bodyH=Math.max(1,bodyBot-bodyTop);
+    ctx.strokeStyle=color; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(x,priceY(b.high)); ctx.lineTo(x,priceY(b.low)); ctx.stroke();
+    ctx.fillStyle=color;
+    ctx.fillRect(x-candleW/2, bodyTop, candleW, bodyH);
+    ctx.fillStyle=isUp?'rgba(239,83,80,0.35)':'rgba(38,166,154,0.35)';
+    const vy=volY(b.volume);
+    ctx.fillRect(x-candleW/2, vy, candleW, volY(0)-vy);
+  }
+}
+
+function drawOverlayLine(bars, color, barX, priceY, volY, candleW) {
+  ctx.save();
+  // 折线
+  ctx.strokeStyle=color; ctx.lineWidth=1.8; ctx.globalAlpha=0.85;
+  ctx.beginPath();
+  for(let i=0;i<bars.length;i++){
+    const x=barX(i), y=priceY(bars[i].close);
+    if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  }
+  ctx.stroke(); ctx.globalAlpha=1;
+  // 高亮圆点
+  for(let i=0;i<bars.length;i++){
+    ctx.fillStyle=color;
+    ctx.beginPath(); ctx.arc(barX(i),priceY(bars[i].close),1.8,0,Math.PI*2); ctx.fill();
+  }
+  // 半透明量柱
+  ctx.globalAlpha=0.12; ctx.fillStyle=color;
+  for(let i=0;i<bars.length;i++){
+    const vy=volY(bars[i].volume);
+    ctx.fillRect(barX(i)-candleW/2, vy, candleW, volY(0)-vy);
+  }
+  ctx.globalAlpha=1;
+  ctx.restore();
+}
+
+function drawDateLabels(viewBars, barX, y) {
+  ctx.save(); ctx.fillStyle='#444'; ctx.font='9px monospace'; ctx.textAlign='center';
+  const step=Math.max(1,Math.floor(viewBars.length/10));
+  for(let i=0;i<viewBars.length;i+=step){
+    ctx.fillText(viewBars[i].time.slice(5), barX(i), y+10);
+  }
+  ctx.restore();
+}
+
+function updateLegend(series) {
+  const c=document.getElementById('legend'); c.innerHTML='';
+  for(const s of series){
+    const d=document.createElement('div'); d.className='legend-item';
+    const lastPct = s.normBars.length ? (s.normBars[s.normBars.length-1].close-100) : 0;
+    const sign = lastPct>=0?'+':'';
+    const pctColor = lastPct>=0?'#ef5350':'#26a69a';
+    d.innerHTML=`<span class="dot" style="background:${s.color}"></span>${s.symbol} <span style="color:${pctColor};font-family:monospace">${sign}${lastPct.toFixed(1)}%</span>`;
+    c.appendChild(d);
+  }
+}
+
+// ================================================================
+// 交互
+// ================================================================
+canvas.addEventListener('wheel', e=>{
+  e.preventDefault();
+  const delta=e.deltaY>0?1:-1;
+  const oldCount=VIEW_COUNT;
+  VIEW_COUNT=Math.max(10,Math.min(VIEW_BARS.length,VIEW_COUNT+delta*5));
+  const ratio=e.offsetX/W;
+  const pivot=VIEW_START+Math.floor(oldCount*ratio);
+  VIEW_START=Math.max(0,Math.min(VIEW_BARS.length-VIEW_COUNT,pivot-Math.floor(VIEW_COUNT*ratio)));
+  drawChart();
+});
+
+let isDragging=false, dragStartX=0, dragViewStart=0;
+canvas.addEventListener('mousedown',e=>{isDragging=true;dragStartX=e.clientX;dragViewStart=VIEW_START;});
+window.addEventListener('mousemove',e=>{
+  if(isDragging){
+    const dx=e.clientX-dragStartX;
+    const shift=Math.round(-dx/(W/VIEW_COUNT));
+    VIEW_START=Math.max(0,Math.min(VIEW_BARS.length-VIEW_COUNT,dragViewStart+shift));
+    drawChart();
+  }
+  updateCrosshair(e);
+});
+window.addEventListener('mouseup',()=>{isDragging=false;});
+
+function updateCrosshair(e) {
+  const rect=canvas.getBoundingClientRect();
+  const mx=e.clientX-rect.left, my=e.clientY-rect.top;
+  const label=document.getElementById('crosshairLabel');
+  if(mx<0||mx>W||my<0||my>H||!NORM_BARS.length){label.style.display='none';return;}
+
+  const margin={left:10,right:60};
+  const viewBars=NORM_BARS.slice(VIEW_START,VIEW_START+VIEW_COUNT);
+  const barW=(W-margin.left-margin.right)/viewBars.length;
+  const barIdx=Math.floor((mx-margin.left)/barW);
+  const absIdx=VIEW_START+barIdx;
+  if(barIdx<0||absIdx>=VIEW_BARS.length){label.style.display='none';return;}
+
+  const raw=VIEW_BARS[absIdx];
+  const norm=NORM_BARS[absIdx];
+  if(!raw){label.style.display='none';return;}
+
+  label.style.display='block';
+  label.style.left=(mx+15)+'px';
+  label.style.top=(my-10)+'px';
+
+  // 显示原始价格 + 百分比
+  let html=`<div style="color:#888">${raw.time}</div>`;
+  for (const s of OVERLAY_SERIES) {
+    const nb = s.normBars[absIdx];
+    const rb = s.rawBars[absIdx];
+    if (!nb||!rb) continue;
+    const pct = nb.close-100;
+    const pctStr = (pct>=0?'+':'')+pct.toFixed(2)+'%';
+    html+=`<div><span style="color:${s.color}">●</span> ${s.symbol} <span style="color:#aaa">${rb.close.toFixed(2)}</span> <span style="color:${pct>=0?'#ef5350':'#26a69a'}">${pctStr}</span></div>`;
+  }
+  if (OVERLAY_SERIES.length===0) {
+    html+=`<div>O ${raw.open.toFixed(2)} (${(norm.open-100).toFixed(2)}%)</div>`;
+    html+=`<div>H ${raw.high.toFixed(2)} (${(norm.high-100).toFixed(2)}%)</div>`;
+    html+=`<div>L ${raw.low.toFixed(2)} (${(norm.low-100).toFixed(2)}%)</div>`;
+    html+=`<div>C ${raw.close.toFixed(2)} (${(norm.close-100).toFixed(2)}%)</div>`;
+  }
+  html+=`<div>V ${(raw.volume/10000).toFixed(0)}万</div>`;
+  label.innerHTML=html;
+}
+canvas.addEventListener('mouseleave',()=>{document.getElementById('crosshairLabel').style.display='none';});
+
+document.addEventListener('keydown',e=>{
+  if(!DATA)return;
+  if(e.key==='ArrowRight'){
+    CURRENT_SIGNAL_IDX=Math.min(DATA.signals.length-1,CURRENT_SIGNAL_IDX+1);
+    document.getElementById('signalSelect').value=CURRENT_SIGNAL_IDX;
+    updateSignalView();
+  } else if(e.key==='ArrowLeft'){
+    CURRENT_SIGNAL_IDX=Math.max(0,CURRENT_SIGNAL_IDX-1);
+    document.getElementById('signalSelect').value=CURRENT_SIGNAL_IDX;
+    updateSignalView();
+  }
+});
+
+resizeCanvas(); drawChart();
+</script>
+</body>
+</html>

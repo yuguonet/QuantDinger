@@ -3,17 +3,13 @@
 量价RSI策略 - 独立回测文件
 
 入场规则:
-  ① 今日成交量 > 前两日成交量之和
-  ② 当前价格在20日均线之上
-  ②b 今日涨幅>3%
-  ②c 今日换手率>5%
-  ③ 前40日到前5日有一日或多日的RSI<25
-  ④ 从最后一个RSI<25的日起到前一日区间涨幅在3%~8%之间
+  ① MACD底背离 + SMA(18)斜率>0
+  ② 前40日到前5日有一日或多日的RSI<25
+  ③ 从最后一个RSI<25的日起到前一日区间涨幅在3%~10%之间
 
 出场规则:
   ① RSI>75 且 量比>2.0
   ② RSI>82
-  ③ EMA5<EMA10
 """
 from __future__ import annotations
 import json, time, argparse, os, sys
@@ -188,15 +184,37 @@ def compute_ma(closes, period):
     return ma
 
 # ================================================================
+# MACD 计算
+# ================================================================
+def compute_macd(closes, fast=12, slow=26, signal=9):
+    """
+    计算 MACD 指标
+    返回: (dif, dea, macd_hist)
+      - dif: 快线EMA - 慢线EMA
+      - dea: dif 的 signal 周期 EMA
+      - macd_hist: (dif - dea) * 2 (柱状图)
+    """
+    ema_fast = compute_ema(closes, fast)
+    ema_slow = compute_ema(closes, slow)
+    n = len(closes)
+    dif = [0.0] * n
+    for i in range(n):
+        dif[i] = ema_fast[i] - ema_slow[i]
+    dea = compute_ema(dif, signal)
+    macd_hist = [0.0] * n
+    for i in range(n):
+        macd_hist[i] = (dif[i] - dea[i]) * 2
+    return dif, dea, macd_hist
+
+# ================================================================
 # 回测引擎
 # ================================================================
 def run_backtest(bars, entry_idx, entry_price, exit_signals,
-                 max_hold_days=60, ema5=None, ema10=None):
+                 max_hold_days=60):
     """
     出场规则:
-      ① 出场信号触发  ② EMA5<EMA10  ③ 持仓天数上限  ④ 数据耗尽
+      ① 出场信号触发  ② 持仓天数上限  ③ 数据耗尽
     max_hold_days=0 表示不限制
-    ema5/ema10=None 表示不启用EMA出场
     """
     if entry_price <= 0 or entry_idx >= len(bars):
         return None
@@ -226,15 +244,7 @@ def run_backtest(bars, entry_idx, entry_price, exit_signals,
             exit_reason = "signal_exit"
             break
 
-        # ② EMA5 < EMA10 (死叉出场)
-        if ema5 is not None and ema10 is not None:
-            if ema5[idx] > 0 and ema10[idx] > 0 and ema5[idx] < ema10[idx]:
-                exit_p = b['close']
-                exit_d = d
-                exit_reason = "ema_cross"
-                break
-
-        # ③ 持仓天数上限
+        # ② 持仓天数上限
         if max_hold_days > 0 and d >= max_hold_days:
             exit_p = b['close']
             exit_d = d
@@ -256,25 +266,56 @@ def run_backtest(bars, entry_idx, entry_price, exit_signals,
 # ================================================================
 # 量价RSI策略信号生成 + 回测
 # ================================================================
+def _find_prev_dif_trough(dif, cur_idx, lookback=30):
+    """从cur_idx往前找DIF的局部低谷(波谷), 返回低谷索引, 找不到返回-1"""
+    if cur_idx < 2:
+        return -1
+    start = max(0, cur_idx - lookback)
+    # 从cur_idx-1往前扫描, 找到DIF开始上升的转折点(即波谷)
+    for j in range(cur_idx - 1, start, -1):
+        if j < 1:
+            break
+        # 波谷: dif[j] <= dif[j-1] 且 dif[j] <= dif[j+1]
+        # 简化: 从右往左找, 当dif开始上升时, j就是波谷
+        if dif[j] < dif[j - 1]:
+            continue
+        # dif[j] >= dif[j-1], 说明j是波谷
+        return j
+    return -1
+
+
+def _check_dif_bottom_divergence(closes, dif, cur_idx, lookback=30):
+    """
+    DIF底背离检测:
+      在cur_idx之前lookback根K线范围内, 寻找DIF的前一个波谷,
+      若该波谷处的价格 >= cur_idx处的价格, 但该波谷处的DIF < cur_idx处的DIF,
+      则判定为DIF底背离。
+    返回 (is_divergent, prev_trough_idx)
+    """
+    prev_idx = _find_prev_dif_trough(dif, cur_idx, lookback)
+    if prev_idx < 0:
+        return False, -1
+    # 前波谷价格(取close) >= 当前价格, 且 前波谷DIF < 当前DIF
+    if closes[prev_idx] >= closes[cur_idx] and dif[prev_idx] < dif[cur_idx]:
+        return True, prev_idx
+    return False, -1
+
+
 def strategy_volume_rsi(bars, code, rsi_len=14, rsi_oversold=25,
                         rsi_overbought=75, rsi_extreme=82,
-                        max_hold_days=60, gain_threshold=8.0,
-                        circ_shares=0.0, min_turnover=5.0):
+                        max_hold_days=60, gain_threshold=10.0,
+                        circ_shares=0.0):
     """
     量价RSI策略:
 
     入场条件:
-      ① 今日成交量 > 前两日成交量之和
-      ② 当前价格在20日均线之上
-      ②b 今日涨幅>3%
-      ②c 今日换手率>5%
-      ③ 前40日到前5日有一日或多日的RSI<25
-      ④ 从最后一个RSI<25的日起到前一日区间涨幅在3%~8%之间
+      ① MACD底背离 + SMA(18)斜率>0
+      ② 前40日到前5日有一日或多日的RSI<25
+      ③ 从最后一个RSI<25的日起到前一日区间涨幅在3%~10%之间
 
     出场条件:
       ① RSI>75 且 量比>2.0
       ② RSI>82
-      ③ EMA5<EMA10
     """
     if len(bars) < 45:  # 需要至少45根K线
         return []
@@ -288,15 +329,14 @@ def strategy_volume_rsi(bars, code, rsi_len=14, rsi_oversold=25,
     # ---- 计算指标 ----
     rsi_values = compute_rsi(closes, rsi_len)
     ma20 = compute_ma(closes, 20)
-    ema5 = compute_ema(closes, 5)
-    ema10 = compute_ema(closes, 10)
+    sma18 = compute_ma(closes, 18)
+    dif, dea, macd_hist = compute_macd(closes)
 
     # ---- 出场信号预计算 ----
     exit_signal = [False] * len(bars)
     for i in range(len(bars)):
-        # 条件①: RSI>75 且 量比>2.0 (今日成交量 / 前两日成交量之和)
-        vol_prev2 = volumes[i - 1] + volumes[i - 2] if i >= 2 else 0
-        vol_ratio_i = volumes[i] / vol_prev2 if vol_prev2 > 0 else 0
+        # 条件①: RSI>75 且 量比>2.0 (今日成交量 / 昨日成交量)
+        vol_ratio_i = volumes[i] / volumes[i - 1] if i >= 1 and volumes[i - 1] > 0 else 0
         if rsi_values[i] > rsi_overbought and vol_ratio_i > 2.0:
             exit_signal[i] = True
         # 条件②: RSI>82
@@ -309,29 +349,15 @@ def strategy_volume_rsi(bars, code, rsi_len=14, rsi_oversold=25,
     last_rsi30_idx_arr = [-1] * len(bars)  # 最后一个RSI<25的索引
     gain_from_rsi30_arr = [0.0] * len(bars)
 
-    for i in range(40, len(bars)):
-        # 条件①: 今日成交量 > 前两日成交量之和
-        vol_prev2 = volumes[i - 1] + volumes[i - 2]
-        if volumes[i] <= vol_prev2:
+    for i in range(30, len(bars)):
+        # 条件①: MACD底背离 + SMA(18)斜率>0
+        if sma18[i] <= sma18[i - 1]:
+            continue
+        is_div, _ = _check_dif_bottom_divergence(closes, dif, i, lookback=30)
+        if not is_div:
             continue
 
-        # 条件②: 当前价格在20日均线之上
-        if ma20[i] <= 0 or closes[i] <= ma20[i]:
-            continue
-
-        # 条件②b: 今日涨幅>3%
-        if i >= 1 and closes[i - 1] > 0:
-            today_gain = (closes[i] / closes[i - 1] - 1) * 100
-            if today_gain <= 3.0:
-                continue
-
-        # 条件②c: 今日换手率>min_turnover%
-        if circ_shares > 0:
-            turnover = volumes[i] / circ_shares * 100
-            if turnover < min_turnover:
-                continue
-
-        # 条件③: 前40日到前5日有RSI<25的日子(从近到远搜索, 取最后一个)
+        # 条件②: 前40日到前5日有RSI<25的日子(从近到远搜索, 取最后一个)
         last_rsi30_idx = -1
         for j in range(i - 5, max(i - 41, -1), -1):
             if j < 0:
@@ -343,7 +369,7 @@ def strategy_volume_rsi(bars, code, rsi_len=14, rsi_oversold=25,
         if last_rsi30_idx < 0:
             continue
 
-        # 条件④: 从最后一个RSI<25日到前一日区间涨幅在3%~8%之间
+        # 条件③: 从最后一个RSI<25日到前一日区间涨幅在3%~10%之间
         price_at_rsi30 = closes[last_rsi30_idx]
         if price_at_rsi30 <= 0:
             continue
@@ -381,13 +407,12 @@ def strategy_volume_rsi(bars, code, rsi_len=14, rsi_oversold=25,
         used_dates.add(signal_date)
 
         # 回测
-        result = run_backtest(bars, entry_idx, entry_price, exit_signal, max_hold_days, ema5, ema10)
+        result = run_backtest(bars, entry_idx, entry_price, exit_signal, max_hold_days)
         if not result:
             continue
 
         # 计算入场时的各项指标值
-        vol_prev2 = volumes[i - 1] + volumes[i - 2]
-        vol_ratio = volumes[i] / vol_prev2 if vol_prev2 > 0 else 0
+        vol_ratio = volumes[i] / volumes[i - 1] if i >= 1 and volumes[i - 1] > 0 else 0
         today_gain = (closes[i] / closes[i - 1] - 1) * 100 if i >= 1 and closes[i - 1] > 0 else 0
         turnover = volumes[i] / circ_shares * 100 if circ_shares > 0 else 0
 
@@ -400,9 +425,10 @@ def strategy_volume_rsi(bars, code, rsi_len=14, rsi_oversold=25,
             'signal_rsi': round(rsi_values[i], 2),
             'signal_close': closes[i],
             'signal_ma20': round(ma20[i], 3),
-            'signal_ema5': round(ema5[i], 3),
+            'signal_dif': round(dif[i], 4),
+            'signal_dea': round(dea[i], 4),
+            'signal_macd': round(macd_hist[i], 4),
             'signal_volume': volumes[i],
-            'signal_vol_prev2': vol_prev2,
             'signal_vol_ratio': round(vol_ratio, 3),
             'signal_today_gain': round(today_gain, 2),
             'signal_turnover': round(turnover, 2),
@@ -511,7 +537,6 @@ def main():
     parser.add_argument("--today-date", type=str, default="", help="指定日期(YYYY-MM-DD)")
     parser.add_argument("--top", type=int, default=10, help="显示TOP N (默认10)")
     parser.add_argument("--gain-threshold", type=float, default=8.0, help="RSI30后涨幅阈值%% (默认8.0)")
-    parser.add_argument("--min-turnover", type=float, default=5.0, help="最小换手率%% (默认5.0)")
     args = parser.parse_args()
 
     codes = [c.strip() for c in args.codes.split(",") if c.strip()] if args.codes else TEST_CODES
@@ -526,16 +551,12 @@ def main():
     print(f"量价RSI策略 独立回测")
     print(f"{'=' * 80}")
     print(f"入场条件:")
-    print(f"  ① 今日成交量 > 前两日成交量之和")
-    print(f"  ② 当前价格在20日均线之上")
-    print(f"  ②b 今日涨幅>3%")
-    print(f"  ②c 今日换手率>{args.min_turnover}%")
-    print(f"  ③ 前40日到前5日有RSI<{args.rsi_oversold}")
-    print(f"  ④ 从最后一个RSI<{args.rsi_oversold}日起到前一日区间涨幅在3%~{args.gain_threshold}%之间")
+    print(f"  ① MACD底背离 + SMA(18)斜率>0")
+    print(f"  ② 前40日到前5日有RSI<{args.rsi_oversold}")
+    print(f"  ③ 从最后一个RSI<{args.rsi_oversold}日起到前一日区间涨幅在3%~{args.gain_threshold}%之间")
     print(f"出场条件:")
     print(f"  ① RSI>{args.rsi_overbought} 且 量比>2.0")
     print(f"  ② RSI>{args.rsi_extreme}")
-    print(f"  ③ EMA5<EMA10")
     print(f"风控: 最大持仓{args.max_hold}天")
     print(f"买入模式: D+1开盘买")
     print(f"股票: {len(codes)}只\n")
@@ -557,7 +578,6 @@ def main():
             max_hold_days=args.max_hold,
             gain_threshold=args.gain_threshold,
             circ_shares=_get_circ_shares(code),
-            min_turnover=args.min_turnover,
         )
         all_trades.extend(trades)
 
@@ -587,7 +607,7 @@ def main():
                 print_stats(seg, f"    {label}")
 
         # 量比分布
-        print(f"\n  信号量比(今日/前2日)分布:")
+        print(f"\n  信号量比(今日/昨日)分布:")
         for lo, hi, label in [(1.0, 1.5, "量比 1.0~1.5"), (1.5, 2.0, "量比 1.5~2.0"),
                                (2.0, 3.0, "量比 2.0~3.0"), (3.0, 999, "量比 >3.0")]:
             seg = [t for t in all_trades if lo <= t['signal_vol_ratio'] < hi]
@@ -614,7 +634,7 @@ def main():
 
         # 出场原因分布
         print(f"\n  出场原因分布:")
-        for reason, label in [("signal_exit", "信号出场"), ("ema_cross", "EMA死叉"),
+        for reason, label in [("signal_exit", "信号出场"),
                                ("max_hold", "持仓到期"), ("data_end", "数据耗尽")]:
             seg = [t for t in all_trades if t.get('exit_reason') == reason]
             if seg:
