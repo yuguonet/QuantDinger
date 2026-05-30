@@ -412,6 +412,7 @@ class CNStockDataSource(BaseDataSource):
             if not in_trading and db_last_ts >= today_ts:
                 out_kline = db_bars
                 out = out_kline[-limit:] if len(out_kline) > limit else out_kline
+                out = unadj_to_qfq(out, symbol)
                 logger.debug(f"[kline_1d] {symbol} 非盘中+DB有今日, 直接返回 {len(out)} 条")
                 return out
 
@@ -424,6 +425,7 @@ class CNStockDataSource(BaseDataSource):
             _post_close = (is_trading_day(_today_str) and now.time() > dtime(15, 1))
             if not in_trading and db_last_ts == prev_td_ts and not _post_close:
                 out = db_bars[-limit:] if len(db_bars) > limit else db_bars
+                out = unadj_to_qfq(out, symbol)
                 logger.debug(f"[kline_1d] {symbol} 非盘中+DB为前一交易日, 直接返回 {len(out)} 条")
                 return out
 
@@ -442,12 +444,14 @@ class CNStockDataSource(BaseDataSource):
                     db_bars.append(lastbar)
                     out_kline = db_bars
                     out = out_kline[-limit:] if len(out_kline) > limit else out_kline
+                    out = unadj_to_qfq(out, symbol)
                     logger.debug(f"[kline_1d] {symbol} 去今日+lastbar, 返回 {len(out)} 条")
                     return out
                 else:
                     # lastbar 也没有 → 用 DB 历史数据
                     out_kline = db_bars
                     out = out_kline[-limit:] if len(out_kline) > limit else out_kline
+                    out = unadj_to_qfq(out, symbol)
                     logger.debug(f"[kline_1d] {symbol} lastbar无数据, 只用DB返回 {len(out)} 条")
                     return out
 
@@ -487,6 +491,7 @@ class CNStockDataSource(BaseDataSource):
 
         # 返回最新 limit 条
         out = out_kline[-limit:] if len(out_kline) > limit else out_kline
+        out = unadj_to_qfq(out, symbol)
         logger.debug(f"[kline_1d] {symbol} 最终返回 {len(out)} 条")
         return out
 

@@ -56,6 +56,7 @@ def get_all_codes_db():
 def fetch_kline_db(code, start_time, end_time):
     """从DB获取指定时间范围的K线"""
     try:
+        from app.data_sources.provider.adjustment import unadj_to_qfq
         writer = _get_writer()
         data = writer.query("CNStock", code, "1D",
                             start_time=start_time, end_time=end_time, limit=0)
@@ -71,7 +72,7 @@ def fetch_kline_db(code, start_time, end_time):
                 "close": float(r["close"]),
                 "volume": float(r["volume"]),
             })
-        return bars
+        return unadj_to_qfq(bars, code)
     except Exception as e:
         return []
 

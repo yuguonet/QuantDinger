@@ -138,6 +138,10 @@ def _patch_datasource_warehouse():
                 start_time=start, end_time=end, limit=0,
             )
             if data and len(data) >= 10:
+                # 1D 数据需要前复权转换（DB 存储不复权）
+                if timeframe in ("1D", "1W"):
+                    from app.data_sources.provider.adjustment import unadj_to_qfq
+                    data = unadj_to_qfq(data, db_symbol)
                 return data
 
             # 本地数据不足，直接跳过（不走外部 API）

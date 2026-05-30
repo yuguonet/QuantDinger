@@ -71,6 +71,7 @@ def fetch_kline_db(code, days=300):
     """从DB加载日线, 返回与fetch_kline兼容的格式(list[dict])"""
     import pandas as pd
     from datetime import datetime, timedelta
+    from app.data_sources.provider.adjustment import unadj_to_qfq
     end = datetime.now().strftime("%Y-%m-%d")
     start = (datetime.now() - timedelta(days=int(days * 1.5))).strftime("%Y-%m-%d")
     try:
@@ -88,7 +89,7 @@ def fetch_kline_db(code, days=300):
                 "close": float(r["close"]),
                 "volume": float(r["volume"]),
             })
-        return bars
+        return unadj_to_qfq(bars, code)
     except Exception:
         return []
 

@@ -116,6 +116,7 @@ def get_all_codes_db():
 
 def load_daily_db(code, start, end):
     import pandas as pd
+    from adjust_utils import adjust_daily_df
     writer = _get_writer()
     data = writer.query("CNStock", code, "1D", start_time=start, end_time=end, limit=0)
     if not data:
@@ -128,7 +129,7 @@ def load_daily_db(code, start, end):
     for c in ["open", "high", "low", "close", "volume"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
+    return adjust_daily_df(df, code)
 
 
 # ================================================================

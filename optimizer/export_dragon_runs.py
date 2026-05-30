@@ -92,6 +92,7 @@ def limit_up_threshold(code: str) -> float:
 
 def load_daily(code: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
     """从 db_market 加载日线数据"""
+    from adjust_utils import adjust_daily_df
     writer = _get_writer()
     data = writer.query("CNStock", code, "1D",
                         start_time=start_date, end_time=end_date, limit=0)
@@ -105,7 +106,7 @@ def load_daily(code: str, start_date: str, end_date: str) -> Optional[pd.DataFra
     for col in ["open", "high", "low", "close", "volume"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df
+    return adjust_daily_df(df, code)
 
 
 def get_all_codes() -> list:
