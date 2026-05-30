@@ -409,26 +409,19 @@ def create_app(config_name='default'):
         restore_running_strategies()
 
         # ── A股股票基本信息表初始化 ────────────────────────────
-        # 存放在 CNStock_db 库中（与 K 线数据共用），由 MarketDBManager 统一管理。
-        # 首次启动时表为空，后台自动同步全量股票列表（东财 ~5300 只）。
-        # 已有数据则跳过，不阻塞启动。
-        # 后续手动刷新: from app.utils.basicinfo_db import get_stock_basic_db
-        #               get_stock_basic_db().sync_from_remote()
+        # 每次启动后台同步一次（增量更新 name/status 等字段）。
+        # 拉取数量 >= 5200 视为数据完整，才执行停牌/退市标记。
         try:
             from app.utils.basicinfo_db import get_stock_basic_db
             _stock_db = get_stock_basic_db()
             _stock_db.ensure_table()
-            _stock_stats = _stock_db.get_stats()
-            if _stock_stats["active"] == 0:
-                import threading
-                threading.Thread(
-                    target=_stock_db.sync_from_remote,
-                    daemon=True,
-                    name="stock-basic-init-sync",
-                ).start()
-                logger.info("[StockBasic] 表为空，后台启动首次同步")
-            else:
-                logger.info(f"[StockBasic] 已有 {_stock_stats['active']} 只股票")
+            import threading
+            threading.Thread(
+                target=_stock_db.sync_from_remote,
+                daemon=True,
+                name="stock-basic-init-sync",
+            ).start()
+            logger.info("[StockBasic] 后台启动同步")
         except Exception as e:
             logger.warning(f"[StockBasic] 初始化跳过: {e}")
         

@@ -235,10 +235,10 @@ _EM_FQT = {"": 0, "qfq": 1, "hfq": 2}
 # 同步位置: source_config.py max_workers 需与此值保持一致。
 MAX_CONCURRENCY = 6
 
-@register(priority=30)
+@register(priority=70)
 class EastMoneyDataSource:
     """
-    东方财富数据源 — 国内最稳定的免费数据源之一（priority=30）。
+    东方财富数据源 — 国内最稳定的免费数据源之一（priority=70）。
 
     能力:
       - K线: 全周期（分钟/日/周），通过 kline/get API
@@ -259,7 +259,7 @@ class EastMoneyDataSource:
     """
 
     name = "eastmoney"
-    priority = 25
+    priority = 70
     max_concurrency = MAX_CONCURRENCY
     min_interval = 0.0
     jitter_min = 0.0
@@ -267,13 +267,13 @@ class EastMoneyDataSource:
 
     capabilities = {
         "kline": True,
-        "kline_priority": 25,
+        "kline_priority": 50,
         "kline_tf": {"1m", "5m", "15m", "30m", "1H", "1D", "1W"},
         "kline_batch": True,
         "quote": True,
-        "quote_priority": 20,
+        "quote_priority": 70,
         "batch_quote": True,
-        "batch_quote_priority": 5,
+        "batch_quote_priority": 70,
         "hk": False,
         "markets": {"CNStock"},
     }

@@ -4,7 +4,8 @@
 
 条件:
   - 最低价 < BB下轨 (SMA(20) - 3.0 * STD(20))
-  - D1开盘价 > 信号日最低价
+  - D1开盘价 > 信号日收盘价
+  - 信号后40天内无收盘价 > D1开盘价 * 1.1
 
 用法:
   python collect_rsi25_signals.py
@@ -52,6 +53,15 @@ def get_all_codes_db():
     writer = _get_writer()
     stats = writer.stats("CNStock")
     return stats.get("symbol_list", []) if stats.get("exists") else []
+
+
+def get_non_st_codes():
+    """获取全市场非ST股票代码（通过 basicinfo_db 的 name 字段过滤）。"""
+    _load_env()
+    from app.utils.basicinfo_db import get_stock_basic_db
+    db = get_stock_basic_db()
+    stocks = db.get_all_stocks(status="active")
+    return [s["symbol"] for s in stocks if "ST" not in (s.get("name") or "").upper()]
 
 def fetch_kline_db(code, start_time, end_time):
     """从DB获取指定时间范围的K线"""
@@ -105,8 +115,10 @@ def main():
     parser.add_argument("--start-date", default="2025-01-01", help="信号起始日期 (默认2025-01-01)")
     parser.add_argument("--bb-period", type=int, default=20, help="BB周期 (默认20)")
     parser.add_argument("--bb-std", type=float, default=3.0, help="BB标准差倍数 (默认3.0)")
-    parser.add_argument("--before", type=int, default=3, help="信号前N天 (默认3)")
+    parser.add_argument("--before", type=int, default=0, help="信号前N天 (默认0)")
     parser.add_argument("--after", type=int, default=80, help="信号后N天 (默认80)")
+    parser.add_argument("--check-days", type=int, default=40, help="检查突破的天数 (默认40)")
+    parser.add_argument("--check-ratio", type=float, default=1.1, help="突破比例 (默认1.1)")
     parser.add_argument("--prefix", default="bb", help="输出文件前缀 (默认bb)")
     parser.add_argument("--codes", default="", help="逗号分隔的股票代码(空=全市场)")
     args = parser.parse_args()
@@ -116,6 +128,8 @@ def main():
     bb_std = args.bb_std
     before_days = args.before
     after_days = args.after
+    check_days = args.check_days
+    check_ratio = args.check_ratio
     prefix = args.prefix
 
     # 计算数据加载范围: 需要足够历史来计算BB，加上信号后的窗口
@@ -123,9 +137,10 @@ def main():
                   - timedelta(days=bb_period + 10)).strftime("%Y-%m-%d")
     load_end = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    print(f"最低价<BB({bb_period},{bb_std})下轨 且D1开盘>昨日最低 信号采集")
+    print(f"最低价<BB({bb_period},{bb_std})下轨 且D1开盘>信号日收盘 信号采集")
     print(f"  信号范围: {start_date} ~ 今天")
     print(f"  数据窗口: 前{before_days}天 ~ 后{after_days}天")
+    print(f"  突破过滤: 信号后{check_days}天内无收盘>D1开盘×{check_ratio}")
     print(f"  数据加载: {load_start} ~ {load_end}")
     print()
 
@@ -133,9 +148,9 @@ def main():
     if args.codes:
         codes = [c.strip() for c in args.codes.split(",") if c.strip()]
     else:
-        print("  从DB获取全市场股票列表...")
-        codes = get_all_codes_db()
-    print(f"  共 {len(codes)} 只股票\n")
+        print("  从DB获取全市场非ST股票列表...")
+        codes = get_non_st_codes()
+    print(f"  共 {len(codes)} 只股票（已排除ST）\n")
 
     all_signals = []
     processed = 0
@@ -160,6 +175,11 @@ def main():
             # 条件2: D1开盘价 > 信号日收盘价
             d1_open = bars[i + 1]["open"]
             if d1_open <= closes[i]:
+                continue
+            # 条件3: 信号后check_days天内无收盘价 > D1开盘价 * check_ratio
+            d1_idx = i + 1
+            check_end = min(len(bars), d1_idx + check_days + 1)
+            if any(bars[j]["close"] > d1_open * check_ratio for j in range(d1_idx, check_end)):
                 continue
 
             signal_date = bars[i + 1]["time"]
@@ -229,6 +249,8 @@ def main():
             "start_date": start_date,
             "before_days": before_days,
             "after_days": after_days,
+            "check_days": check_days,
+            "check_ratio": check_ratio,
             "total_signals": len(all_signals),
             "total_symbols": len(all_symbols),
         },
