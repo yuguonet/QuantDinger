@@ -115,7 +115,7 @@
         <div class="symbol-search-section">
           <a-input-search
             v-model="symbolSearchKeyword"
-            :placeholder="$t('dashboard.analysis.modal.addStock.searchOrInputPlaceholder')"
+            :placeholder="selectedMarketTab === 'CNStock' ? $t('dashboard.analysis.modal.addStock.searchPlaceholderCN') : $t('dashboard.analysis.modal.addStock.searchOrInputPlaceholder')"
             @search="handleSearchOrInput"
             @change="handleSymbolSearchInput"
             :loading="searchingSymbols"
@@ -826,6 +826,7 @@ export default {
     async handleAddStock () {
       let market = ''; let symbol = ''; let name = ''
       if (this.selectedSymbolForAdd) {
+        // User picked from search results
         market = this.selectedSymbolForAdd.market; symbol = this.selectedSymbolForAdd.symbol.toUpperCase(); name = this.selectedSymbolForAdd.name || ''
       } else if (this.symbolSearchKeyword && this.symbolSearchKeyword.trim()) {
         if (!this.selectedMarketTab) { this.$message.warning(this.$t('dashboard.analysis.modal.addStock.pleaseSelectMarket')); return }
@@ -839,6 +840,10 @@ export default {
           this.handleCloseAddStockModal()
           await this.loadWatchlist()
           this.$emit('refresh')
+        } else if (res && res.data && res.data.candidates) {
+          // Backend returned multiple matches — show as search results for user to pick
+          this.symbolSearchResults = res.data.candidates.map(c => ({ market: c.market || market, symbol: c.symbol, name: c.name || c.symbol }))
+          this.$message.info(res.msg || this.$t('dashboard.analysis.modal.addStock.pleaseSelectOrEnterSymbol'))
         } else { this.$message.error(res?.msg || this.$t('dashboard.analysis.message.addStockFailed')) }
       } catch (error) { this.$message.error(error?.response?.data?.msg || error?.message || this.$t('dashboard.analysis.message.addStockFailed')) } finally { this.addingStock = false }
     },
@@ -854,6 +859,7 @@ export default {
       const keyword = e.target.value; this.symbolSearchKeyword = keyword
       if (this.searchTimer) clearTimeout(this.searchTimer)
       if (!keyword || keyword.trim() === '') { this.symbolSearchResults = []; this.hasSearched = false; this.selectedSymbolForAdd = null; return }
+      if (keyword.trim().length < 2) { this.symbolSearchResults = []; this.hasSearched = false; return }
       this.searchTimer = setTimeout(() => { this.searchSymbolsInModal(keyword) }, 500)
     },
     handleSearchOrInput (keyword) {
@@ -863,10 +869,11 @@ export default {
       if (this.hasSearched && this.symbolSearchResults.length === 0) { this.handleDirectAdd() } else { this.searchSymbolsInModal(keyword) }
     },
     async searchSymbolsInModal (keyword) {
-      if (!keyword || keyword.trim() === '') { this.symbolSearchResults = []; this.hasSearched = false; return }
+      if (!keyword || keyword.trim().length < 2) { this.symbolSearchResults = []; this.hasSearched = false; return }
       if (!this.selectedMarketTab) { this.$message.warning(this.$t('dashboard.analysis.modal.addStock.pleaseSelectMarket')); return }
       this.searchingSymbols = true; this.hasSearched = true
       try {
+        // Use smart search: supports pinyin, Chinese name, and code for CNStock
         const res = await searchSymbols({ market: this.selectedMarketTab, keyword: keyword.trim(), limit: 20 })
         if (res && res.code === 1 && res.data && res.data.length > 0) { this.symbolSearchResults = res.data } else {
           this.symbolSearchResults = []; this.selectedSymbolForAdd = { market: this.selectedMarketTab, symbol: keyword.trim().toUpperCase(), name: '' }
@@ -910,8 +917,8 @@ export default {
           this.marketTypes = res.data.map(item => ({ value: item.value, i18nKey: item.i18nKey || `dashboard.analysis.market.${item.value}` }))
         } else {
           this.marketTypes = [
-            { value: 'USStock', i18nKey: 'dashboard.analysis.market.USStock' },
             { value: 'CNStock', i18nKey: 'dashboard.analysis.market.CNStock' },
+            { value: 'USStock', i18nKey: 'dashboard.analysis.market.USStock' },
             { value: 'HKStock', i18nKey: 'dashboard.analysis.market.HKStock' },
             { value: 'Crypto', i18nKey: 'dashboard.analysis.market.Crypto' },
             { value: 'Forex', i18nKey: 'dashboard.analysis.market.Forex' },
@@ -920,8 +927,8 @@ export default {
         }
       } catch (error) {
         this.marketTypes = [
-          { value: 'USStock', i18nKey: 'dashboard.analysis.market.USStock' },
           { value: 'CNStock', i18nKey: 'dashboard.analysis.market.CNStock' },
+          { value: 'USStock', i18nKey: 'dashboard.analysis.market.USStock' },
           { value: 'HKStock', i18nKey: 'dashboard.analysis.market.HKStock' },
           { value: 'Crypto', i18nKey: 'dashboard.analysis.market.Crypto' },
           { value: 'Forex', i18nKey: 'dashboard.analysis.market.Forex' },
