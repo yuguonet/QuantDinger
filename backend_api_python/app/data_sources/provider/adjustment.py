@@ -25,6 +25,7 @@ import threading
 import time
 import urllib.request as _urllib
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 # ================================================================
@@ -245,7 +246,17 @@ def _build_factor_lookup(factors: Optional[List[Tuple[str, float]]]):
 
 
 def _extract_date(bar_time) -> str:
-    """从 bar['time'] 提取 YYYY-MM-DD。"""
+    """从 bar['time'] 提取 YYYY-MM-DD。
+
+    支持格式:
+      - int/float Unix 时间戳 (如 1717200000)
+      - datetime 对象
+      - 字符串 "YYYY-MM-DD" 或 "YYYY-MM-DD HH:MM:SS"
+    """
+    if isinstance(bar_time, (int, float)):
+        return datetime.fromtimestamp(bar_time).strftime("%Y-%m-%d")
+    if isinstance(bar_time, datetime):
+        return bar_time.strftime("%Y-%m-%d")
     t = str(bar_time or "")
     return t[:10]
 

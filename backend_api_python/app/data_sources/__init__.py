@@ -12,12 +12,13 @@ from app.data_sources.circuit_breaker import (
     CircuitBreaker,
     get_realtime_circuit_breaker
 )
-from app.data_sources.cache_manager import (
-    DataCache,
-    get_realtime_cache,
-    get_kline_cache,
-    get_stock_info_cache
-)
+
+# from app.data_sources.cache_manager import (
+#    DataCache,
+#    get_realtime_cache,
+#    get_kline_cache,
+#    get_stock_info_cache
+# )
 from app.data_sources.rate_limiter import (
     RateLimiter,
     get_random_user_agent,
@@ -32,10 +33,10 @@ __all__ = [
     'CircuitBreaker',
     'get_realtime_circuit_breaker',
     # 缓存
-    'DataCache',
-    'get_realtime_cache',
-    'get_kline_cache',
-    'get_stock_info_cache',
+#    'DataCache',
+#    'get_realtime_cache',
+#    'get_kline_cache',
+#    'get_stock_info_cache',
     # 限流器
     'RateLimiter',
     'get_random_user_agent',

@@ -377,9 +377,9 @@ def _discover_sources(
         capability: 能力类型
           - "kline"  → 获取K线数据（默认）
           - "quote"  → 获取实时行情
-          - "qfq"  → 前复权（默认）
+          - "qfq"  → 前复权
           - "hfq"  → 后复权
-          - ""     → 不复权
+          - ""     → 不复权（默认）
 
     Returns:
         [(源名称, fetch_fn, 源配置), ...]
