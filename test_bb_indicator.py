@@ -18,7 +18,7 @@ BB 超卖策略 - 全市场扫描回测
     ② 止盈（默认993.75%）
     ③ RSI>75 且 量比>2.0 且 未涨停 → 卖出
     ④ RSI>85 且 未涨停 → 极端超买卖出
-    ⑤ 最高价突破BB上轨且(上影线>3%或量比(五日)>1.5) → 卖出
+    ⑤ 最高价突破BB上轨且(上影线>3%或量比(五日)>2.5) → 卖出
     ⑥ 最大持仓天数（默认20天）
 
   数据源:
@@ -165,7 +165,7 @@ def run_backtest(bars, entry_idx, entry_price, sell_signals, extreme_signals,
     exit_reason = ""
     max_d = len(bars) - entry_idx - 1
 
-    for d in range(1, max_d + 1):
+    for d in range(0, max_d + 1):
         idx = entry_idx + d
         if idx >= len(bars):
             break
@@ -173,54 +173,59 @@ def run_backtest(bars, entry_idx, entry_price, sell_signals, extreme_signals,
         if b['high'] > peak:
             peak = b['high']
 
+        # 默认记录当前收盘价（循环结束时保留最后一根K线的收盘价）
+        exit_p = b['close']
+        exit_d = d
+        exit_reason = "持仓中"
+
+        # d=0 为入场当天(D+1)，只更新峰值和收盘价，不触发出场条件
+        if d == 0:
+            continue
+
         # ① 跟踪止损
         trailing_ref = peak * (1 + trailing_stop_pct / 100)
         if b['low'] <= trailing_ref:
             exit_p = trailing_ref
             exit_d = d
-            exit_reason = "trailing_stop"
+            exit_reason = "跟踪止损"
             break
 
         # ② 止盈
         if b['high'] >= entry_price * (1 + take_profit / 100):
             exit_p = entry_price * (1 + take_profit / 100)
             exit_d = d
-            exit_reason = "take_profit"
+            exit_reason = "止盈"
             break
 
         # ③ RSI>75+量比>2+未涨停
         if sell_signals[idx]:
             exit_p = b['close']
             exit_d = d
-            exit_reason = "rsi_sell"
+            exit_reason = "RSI超买"
             break
 
         # ④ RSI>85+未涨停
         if extreme_signals[idx]:
             exit_p = b['close']
             exit_d = d
-            exit_reason = "rsi_extreme"
+            exit_reason = "RSI极值"
             break
 
-        # ⑤ BB上轨突破（需上影线>3% 或 量比(五日)>1.5）
+        # ⑤ BB上轨突破（需上影线>3% 或 量比(五日)>2.5）
         bb_data = bb_breakout_data[idx]
         if bb_data is not None:
-            if bb_data['upper_shadow'] > 3.0 or bb_data['vol_ratio'] > 1.5:
+            if bb_data['upper_shadow'] > 3.0 or bb_data['vol_ratio'] > 2.5:
                 exit_p = b['close']
                 exit_d = d
-                exit_reason = "bb_breakout"
+                exit_reason = "BB上轨突破"
                 break
 
         # ⑥ 持仓天数上限
         if max_hold_days > 0 and d >= max_hold_days:
             exit_p = b['close']
             exit_d = d
-            exit_reason = "max_hold"
+            exit_reason = "持仓天数上限"
             break
-
-        exit_p = b['close']
-        exit_d = d
-        exit_reason = "data_end"
 
     return {
         'exit_price': round(exit_p, 3),
