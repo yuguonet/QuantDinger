@@ -12,12 +12,7 @@
   - unadj_to_qfq(klines, code) — 不复权 → 前复权
   - unadj_to_hfq(klines, code) — 不复权 → 后复权
 
-缓存策略 (增量):
-  - 因子是只增不减的历史数据，适合增量合并
-  - 缓存文件格式: {code: {"factors": [[date, factor], ...], "synced_at": ts}}
-  - synced_at 持久化到文件，重启后仍可判断是否需要刷新
-  - synced_at 未过期 → 直接返回内存缓存，不发网络请求
-  - synced_at 已过期或无缓存 → 远端获取 → 增量合并 → 更新 synced_at
+因子性质: 只增不改的历史档案 — 已有记录永远不变，只追加新除权日。
 """
 
 from __future__ import annotations
@@ -29,18 +24,18 @@ import ssl as _ssl
 import threading
 import time
 import urllib.request as _urllib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
 # ================================================================
-# 缓存配置
+# 配置
 # ================================================================
 
 _CACHE_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "..", "data")
 _CACHE_FILE = os.path.join(_CACHE_DIR, "adjustment_factors.json")
-_CACHE_TTL = 3600  # 缓存有效期（秒），1 小时
 
 # ================================================================
-# HTTP 工具
+# HTTP
 # ================================================================
 
 _SSL_CTX = _ssl.create_default_context()
@@ -50,6 +45,7 @@ _SSL_CTX.verify_mode = _ssl.CERT_NONE
 _HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
 }
+
 
 def _http_get(url: str, timeout: int = 6) -> Optional[str]:
     try:
@@ -82,74 +78,67 @@ def _to_sina_code(code: str) -> Optional[str]:
 
 
 # ================================================================
-# 缓存 — 增量式，带持久化的同步时间戳
+# 缓存
 # ================================================================
+#
+# 设计原则:
+#   - 文件是持久层，内存是快速层
+#   - 启动时: 文件 → 内存 (全量加载)
+#   - 新数据时: 内存 → 文件 (异步全量写入)
+#   - 读取只查内存，不碰磁盘
+#   - 因子只增不改，永不"过期"
 
-# 内存缓存: code → {"factors": [(date, factor), ...], "synced_at": float}
-_cache: Dict[str, dict] = {}
-_cache_lock = threading.Lock()
+# 内存缓存: sina_code → [(date, factor), ...]
+_mem: Dict[str, List[Tuple[str, float]]] = {}
+_mem_lock = threading.Lock()
 _write_lock = threading.Lock()
-_dirty: set = set()
 
 
-def _load_cache_file():
-    """import 时从文件加载到内存。"""
+def _load():
+    """启动时从文件全量加载到内存。"""
     try:
         if not os.path.exists(_CACHE_FILE):
             return
         with open(_CACHE_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
+        n = 0
         for code, entry in raw.items():
             if isinstance(entry, dict) and "factors" in entry:
-                _cache[code] = {
-                    "factors": [(d, float(v)) for d, v in entry["factors"]],
-                    "synced_at": float(entry.get("synced_at", 0)),
-                }
+                _mem[code] = [(d, float(v)) for d, v in entry["factors"]]
+                n += 1
             elif isinstance(entry, list):
-                # 兼容旧格式: {code: [[date, factor], ...]}
-                _cache[code] = {
-                    "factors": [(d, float(v)) for d, v in entry],
-                    "synced_at": 0,
-                }
+                _mem[code] = [(d, float(v)) for d, v in entry]
+                n += 1
     except Exception:
         pass
 
 
-def _save_cache_file():
-    """仅将有增量更新的股票写回文件。"""
+def _save():
+    """异步全量写入。调用方已在后台线程中。"""
     with _write_lock:
-        with _cache_lock:
-            to_save = list(_dirty)
-            _dirty.clear()
-        if not to_save:
-            return
+        with _mem_lock:
+            snapshot = dict(_mem)
         try:
             os.makedirs(_CACHE_DIR, exist_ok=True)
-            existing: Dict[str, dict] = {}
-            if os.path.exists(_CACHE_FILE):
-                try:
-                    with open(_CACHE_FILE, "r", encoding="utf-8") as f:
-                        existing = json.load(f)
-                except Exception:
-                    pass
-            with _cache_lock:
-                for code in to_save:
-                    if code in _cache:
-                        existing[code] = {
-                            "factors": list(_cache[code]["factors"]),
-                            "synced_at": _cache[code]["synced_at"],
-                        }
-            with open(_CACHE_FILE, "w", encoding="utf-8") as f:
-                json.dump(existing, f, ensure_ascii=False)
+            # 先写临时文件再原子替换，避免写入中途崩溃导致文件损坏
+            tmp = _CACHE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, ensure_ascii=False)
+            os.replace(tmp, _CACHE_FILE)
         except Exception:
             pass
 
 
-_load_cache_file()
+def _save_async():
+    """触发一次异步写盘。"""
+    threading.Thread(target=_save, daemon=True).start()
+
+
+_load()
 
 
 # ================================================================
-# 因子获取
+# 因子解析 & 合并
 # ================================================================
 
 def _parse_sina_factor(text: str) -> Optional[List[Tuple[str, float]]]:
@@ -167,38 +156,53 @@ def _parse_sina_factor(text: str) -> Optional[List[Tuple[str, float]]]:
     return factors if factors else None
 
 
-def _merge_factors(existing: List[Tuple[str, float]],
-                   remote: List[Tuple[str, float]]) -> Tuple[List[Tuple[str, float]], bool]:
-    """增量合并因子: 保留已有，仅追加新日期。
-
-    Returns:
-        (merged_factors, has_new_data)
-    """
-    existing_dates = {d for d, _ in existing}
-    new_items = [(d, f) for d, f in remote if d not in existing_dates]
-    if not new_items:
-        return existing, False
-    merged = list(existing) + new_items
+def _merge(existing: List[Tuple[str, float]],
+           remote: List[Tuple[str, float]]) -> List[Tuple[str, float]]:
+    """增量合并: 保留已有，追加新日期，按日期降序排列。"""
+    known = {d for d, _ in existing}
+    new = [(d, f) for d, f in remote if d not in known]
+    if not new:
+        return existing
+    merged = existing + new
     merged.sort(key=lambda x: x[0], reverse=True)
-    return merged, True
+    return merged
 
 
-def fetch_qfq_factors(code: str, force: bool = False) -> Optional[List[Tuple[str, float]]]:
-    """获取前复权因子 (从新浪 qfq.js)。
+# ================================================================
+# 因子获取
+# ================================================================
+
+def _fetch_remote(sina_code: str) -> Optional[List[Tuple[str, float]]]:
+    """从远端拉取因子，写入内存+触发异步写盘。"""
+    text = _http_get(f"https://finance.sina.com.cn/realstock/company/{sina_code}/qfq.js")
+    if not text:
+        return None
+    remote = _parse_sina_factor(text)
+    if not remote:
+        return None
+
+    with _mem_lock:
+        old = _mem.get(sina_code)
+        if old is None:
+            _mem[sina_code] = remote
+        else:
+            _mem[sina_code] = _merge(old, remote)
+    _save_async()
+    return _mem.get(sina_code)
+
+
+def fetch_qfq_factors(code: str) -> Optional[List[Tuple[str, float]]]:
+    """获取前复权因子。
 
     因子含义:
       fwd_price = unadj_price / qfq_factor
       unadj_price = fwd_price * qfq_factor
       最新除权日 factor=1.0，越早的日期 factor 越大。
 
-    缓存策略:
-      1. 缓存存在且 synced_at 未过期 → 直接返回
-      2. 缓存不存在或已过期 → 远端获取 → 增量合并 → 更新 synced_at
-      3. force=True → 跳过缓存，强制拉取
+    策略: 有缓存直接返回，无缓存同步拉取。
 
     Args:
-        code: 股票代码
-        force: 是否强制刷新（忽略缓存时效）
+        code: 股票代码 (任意格式)
 
     Returns:
         [(date_str, factor), ...] 按日期降序，失败返回 None
@@ -207,40 +211,12 @@ def fetch_qfq_factors(code: str, force: bool = False) -> Optional[List[Tuple[str
     if not sina_code:
         return None
 
-    # 1. 缓存命中且未过期
-    if not force:
-        with _cache_lock:
-            entry = _cache.get(sina_code)
-        if entry and (time.time() - entry["synced_at"] < _CACHE_TTL):
-            return entry["factors"]
+    with _mem_lock:
+        entry = _mem.get(sina_code)
+    if entry:
+        return entry
 
-    # 2. 远端获取 + 增量合并
-    text = _http_get(f"https://finance.sina.com.cn/realstock/company/{sina_code}/qfq.js")
-    if not text:
-        return None
-
-    remote_factors = _parse_sina_factor(text)
-    if not remote_factors:
-        return None
-
-    with _cache_lock:
-        entry = _cache.get(sina_code)
-        if entry is None:
-            _cache[sina_code] = {
-                "factors": remote_factors,
-                "synced_at": time.time(),
-            }
-            _dirty.add(sina_code)
-        else:
-            merged, has_new = _merge_factors(entry["factors"], remote_factors)
-            entry["factors"] = merged
-            entry["synced_at"] = time.time()
-            # synced_at 已更新，需要写回文件（即使无新因子数据）
-            _dirty.add(sina_code)
-
-    threading.Thread(target=_save_cache_file, daemon=True).start()
-    with _cache_lock:
-        return _cache.get(sina_code, {}).get("factors")
+    return _fetch_remote(sina_code)
 
 
 # ================================================================
@@ -249,11 +225,7 @@ def fetch_qfq_factors(code: str, force: bool = False) -> Optional[List[Tuple[str
 
 def _find_factor(sorted_dates: List[str], factor_map: Dict[str, float],
                  bar_date: str, latest_ex: Optional[str]) -> float:
-    """查找 bar_date 对应的因子。
-
-    - bar_date >= latest_ex → 返回 1.0 (无除权，无需调整)
-    - bar_date < latest_ex  → 返回 <= bar_date 的最大日期的因子
-    """
+    """查找 bar_date 对应的因子。"""
     if latest_ex and bar_date >= latest_ex:
         return 1.0
     for d in reversed(sorted_dates):
@@ -272,10 +244,6 @@ def _build_factor_lookup(factors: Optional[List[Tuple[str, float]]]):
     return factor_map, sorted_dates, latest_ex
 
 
-# ================================================================
-# K线时间提取
-# ================================================================
-
 def _extract_date(bar_time) -> str:
     """从 bar['time'] 提取 YYYY-MM-DD。"""
     t = str(bar_time or "")
@@ -287,18 +255,13 @@ def _extract_date(bar_time) -> str:
 # ================================================================
 
 def reverse_fwd_adjust(klines: list, code: str) -> list:
-    """将前复权K线还原为不复权。
-
-    公式: unadj_price = fwd_price * qfq_factor
-    """
+    """将前复权K线还原为不复权。公式: unadj_price = fwd_price * qfq_factor"""
     if not klines:
         return klines
-
     factors = fetch_qfq_factors(code)
     factor_map, sorted_dates, latest_ex = _build_factor_lookup(factors)
     if not factor_map:
         return klines
-
     result = []
     for bar in klines:
         bar_date = _extract_date(bar.get("time", ""))
@@ -318,18 +281,13 @@ def reverse_fwd_adjust(klines: list, code: str) -> list:
 
 
 def unadj_to_qfq(klines: list, code: str) -> list:
-    """不复权 → 前复权。
-
-    公式: fwd_price = unadj_price / qfq_factor
-    """
+    """不复权 → 前复权。公式: fwd_price = unadj_price / qfq_factor"""
     if not klines:
         return klines
-
     factors = fetch_qfq_factors(code)
     factor_map, sorted_dates, latest_ex = _build_factor_lookup(factors)
     if not factor_map:
         return klines
-
     result = []
     for bar in klines:
         bar_date = _extract_date(bar.get("time", ""))
@@ -349,21 +307,14 @@ def unadj_to_qfq(klines: list, code: str) -> list:
 
 
 def unadj_to_hfq(klines: list, code: str) -> list:
-    """不复权 → 后复权。
-
-    公式: hfq_price = unadj_price * hfq_factor
-    hfq_factor = earliest_qfq / qfq_factor (最早除权日基准=1.0)
-    """
+    """不复权 → 后复权。公式: hfq_price = unadj_price * hfq_factor"""
     if not klines:
         return klines
-
     factors = fetch_qfq_factors(code)
     factor_map, sorted_dates, latest_ex = _build_factor_lookup(factors)
     if not factor_map:
         return klines
-
     earliest_qfq = factor_map.get(sorted_dates[0], 1.0) if sorted_dates else 1.0
-
     result = []
     for bar in klines:
         bar_date = _extract_date(bar.get("time", ""))
@@ -387,13 +338,11 @@ def unadj_to_hfq(klines: list, code: str) -> list:
 # 全量更新 — 供 backfill_db 调度器调用
 # ================================================================
 
-def update_all_factors() -> int:
-    """增量更新所有股票的前复权因子。
-
-    复用 fetch_qfq_factors(force=True)，避免重复 fetch/merge 逻辑。
+def update_all_factors(max_workers: int = 16) -> int:
+    """拉取所有活跃股票的因子。已有缓存的跳过，只拉缺失的，16 并发。
 
     Returns:
-        有增量更新的股票数量
+        新增缓存的股票数量
     """
     from app.utils.basicinfo_db import get_stock_basic_db
 
@@ -401,21 +350,31 @@ def update_all_factors() -> int:
     if not codes:
         return 0
 
-    updated = 0
+    # 只收集内存中没有的
+    to_fetch = []
     for code in codes:
         sina_code = _to_sina_code(code)
         if not sina_code:
             continue
+        with _mem_lock:
+            if sina_code not in _mem:
+                to_fetch.append(code)
 
-        # 记录更新前的因子数量
-        with _cache_lock:
-            old_count = len(_cache.get(sina_code, {}).get("factors", []))
+    if not to_fetch:
+        return 0
 
-        factors = fetch_qfq_factors(code, force=True)
-        if factors:
-            with _cache_lock:
-                new_count = len(_cache.get(sina_code, {}).get("factors", []))
-            if new_count > old_count:
-                updated += 1
+    updated = 0
+
+    def _fetch_one(code):
+        return fetch_qfq_factors(code) is not None
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_fetch_one, code): code for code in to_fetch}
+        for future in as_completed(futures):
+            try:
+                if future.result():
+                    updated += 1
+            except Exception:
+                pass
 
     return updated

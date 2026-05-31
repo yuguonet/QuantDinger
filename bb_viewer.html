@@ -1,0 +1,830 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RSI信号回测可视化</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0a0f; color: #e0e0e0; height: 100vh; overflow: hidden; }
+  .app { display: flex; height: 100vh; }
+
+  .sidebar {
+    width: 300px; min-width: 300px; background: #111118; border-right: 1px solid #222;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  .sidebar-header { padding: 12px 14px; border-bottom: 1px solid #222; background: #16161e; }
+  .sidebar-header h2 { font-size: 14px; color: #aaa; margin-bottom: 8px; }
+  .toolbar { display: flex; gap: 6px; margin-bottom: 8px; }
+  .toolbar button {
+    flex: 1; padding: 4px 0; font-size: 11px; border: 1px solid #333;
+    background: #1a1a24; color: #aaa; border-radius: 3px; cursor: pointer;
+  }
+  .toolbar button:hover { background: #252530; color: #fff; }
+  .toolbar button.active { background: #1a2a3a; color: #4a9eff; border-color: #4a9eff; }
+  .search-box {
+    width: 100%; padding: 6px 10px; font-size: 12px; border: 1px solid #333;
+    background: #0d0d14; color: #ddd; border-radius: 4px; outline: none;
+  }
+  .search-box:focus { border-color: #4a9eff; }
+  .symbol-count { font-size: 11px; color: #666; margin-top: 6px; }
+  .symbol-list { flex: 1; overflow-y: auto; padding: 6px 0; }
+  .symbol-list::-webkit-scrollbar { width: 6px; }
+  .symbol-list::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+  .symbol-item {
+    display: flex; align-items: center; padding: 4px 14px; cursor: pointer;
+    transition: background 0.15s;
+  }
+  .symbol-item:hover { background: #1a1a24; }
+  .symbol-item.selected { background: #1a1a2a; }
+  .symbol-item input[type="checkbox"] { margin-right: 8px; accent-color: #4a9eff; }
+  .symbol-item .sym-name { font-size: 13px; font-family: monospace; flex: 1; }
+  .symbol-item .sym-color { width: 12px; height: 12px; border-radius: 2px; margin-left: 6px; }
+  .symbol-item .sym-ret { font-size: 11px; font-family: monospace; min-width: 52px; text-align: right; }
+  .symbol-item .sym-board { font-size: 10px; color: #555; margin-left: 4px; }
+
+  .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  .info-bar {
+    padding: 8px 16px; background: #111118; border-bottom: 1px solid #222;
+    display: flex; align-items: center; gap: 16px; min-height: 40px;
+  }
+  .info-bar .title { font-size: 13px; color: #888; }
+  .info-bar .stats { font-size: 12px; color: #4a9eff; }
+  .info-bar .nav-hint { font-size: 11px; color: #555; margin-left: auto; }
+
+  .chart-tabs {
+    display: flex; gap: 0; padding: 0 16px; background: #0e0e16; border-bottom: 1px solid #1a1a24;
+  }
+  .chart-tab {
+    padding: 8px 16px; font-size: 12px; color: #666; cursor: pointer;
+    border-bottom: 2px solid transparent; transition: 0.2s;
+  }
+  .chart-tab:hover { color: #aaa; }
+  .chart-tab.active { color: #4a9eff; border-bottom-color: #4a9eff; }
+
+  .chart-container { flex: 1; position: relative; overflow: hidden; background: #0a0a0f; }
+  canvas#chart { display: block; width: 100%; height: 100%; }
+  .crosshair-label {
+    position: absolute; pointer-events: none; display: none;
+    background: rgba(20,20,30,0.92); border: 1px solid #333; border-radius: 4px;
+    padding: 6px 10px; font-size: 11px; line-height: 1.6; white-space: nowrap;
+    z-index: 10; color: #ccc;
+  }
+  .legend {
+    padding: 6px 16px; background: #111118; border-top: 1px solid #222;
+    display: flex; flex-wrap: wrap; gap: 12px; min-height: 30px;
+  }
+  .legend-item { display: flex; align-items: center; gap: 5px; font-size: 11px; color: #888; }
+  .legend-item .dot { width: 10px; height: 3px; border-radius: 1px; }
+
+  .load-panel {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+    background: #16161e; border: 1px solid #333; border-radius: 8px;
+    padding: 30px 40px; text-align: center; z-index: 20;
+  }
+  .load-panel input[type="file"] { display: none; }
+  .load-panel .btn {
+    display: inline-block; padding: 10px 28px; margin: 8px;
+    font-size: 14px; border: 1px solid #4a9eff; background: #1a2a3a;
+    color: #4a9eff; border-radius: 6px; cursor: pointer; transition: 0.2s;
+  }
+  .load-panel .btn:hover { background: #2a3a4a; }
+  .load-panel .or { color: #555; font-size: 12px; margin: 4px 0; }
+  .load-panel .hint { font-size: 11px; color: #555; margin-top: 10px; }
+
+  .stats-panel {
+    position: absolute; top: 10px; right: 70px; z-index: 15;
+    background: rgba(22,22,30,0.95); border: 1px solid #333; border-radius: 6px;
+    padding: 12px 16px; font-size: 11px; line-height: 1.8; min-width: 200px;
+  }
+  .stats-panel .sp-title { color: #4a9eff; font-weight: bold; margin-bottom: 4px; }
+  .stats-panel .sp-row { display: flex; justify-content: space-between; gap: 12px; }
+  .stats-panel .sp-label { color: #666; }
+  .stats-panel .sp-val { font-family: monospace; }
+  .sp-pos { color: #ef5350; }
+  .sp-neg { color: #26a69a; }
+
+  .filter-bar {
+    display: flex; align-items: center; gap: 8px; padding: 6px 14px;
+    background: #0e0e16; border-bottom: 1px solid #1a1a24; flex-wrap: wrap;
+  }
+  .filter-bar label { font-size: 11px; color: #666; }
+  .filter-bar select, .filter-bar input {
+    padding: 3px 6px; font-size: 11px; background: #16161e; color: #ddd;
+    border: 1px solid #333; border-radius: 3px; outline: none;
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="sidebar">
+    <div class="sidebar-header">
+      <h2>📊 RSI回测信号浏览器</h2>
+      <div class="toolbar">
+        <button onclick="selectAll()">全选</button>
+        <button onclick="selectNone()">清空</button>
+        <button onclick="invertSelect()">反选</button>
+        <button onclick="toggleWinLoss('win')" id="btnWin" class="active">盈利</button>
+        <button onclick="toggleWinLoss('loss')" id="btnLoss" class="active">亏损</button>
+      </div>
+      <input class="search-box" id="searchInput" placeholder="搜索代码..." oninput="filterSymbols()">
+      <div class="symbol-count" id="symbolCount">加载数据后显示</div>
+    </div>
+    <div class="filter-bar">
+      <label>板块:</label>
+      <select id="filterBoard" onchange="applyFilters()">
+        <option value="">全部</option>
+      </select>
+      <label>退出:</label>
+      <select id="filterExit" onchange="applyFilters()">
+        <option value="">全部</option>
+      </select>
+      <label>RSI:</label>
+      <input id="filterRsiMin" type="number" placeholder="min" style="width:50px" onchange="applyFilters()">
+      <span style="color:#444">-</span>
+      <input id="filterRsiMax" type="number" placeholder="max" style="width:50px" onchange="applyFilters()">
+    </div>
+    <div class="symbol-list" id="symbolList"></div>
+  </div>
+  <div class="main">
+    <div class="info-bar">
+      <span class="title" id="chartTitle">RSI信号回测 — 收益曲线</span>
+      <span class="stats" id="globalStats"></span>
+      <span class="nav-hint">滚轮缩放 | 拖拽平移 | 点击查看详情</span>
+    </div>
+    <div class="chart-tabs">
+      <div class="chart-tab active" onclick="switchTab('cumreturn')" id="tabCumReturn">累计收益</div>
+      <div class="chart-tab" onclick="switchTab('scatter')" id="tabScatter">收益分布</div>
+      <div class="chart-tab" onclick="switchTab('dayreturn')" id="tabDayReturn">逐笔收益</div>
+      <div class="chart-tab" onclick="switchTab('peakvsfinal')" id="tabPeakVsFinal">峰值vs最终</div>
+    </div>
+    <div class="chart-container" id="chartContainer">
+      <canvas id="chart"></canvas>
+      <div class="crosshair-label" id="crosshairLabel"></div>
+      <div class="stats-panel" id="statsPanel"></div>
+    </div>
+    <div class="legend" id="legend"></div>
+  </div>
+</div>
+<div class="load-panel" id="loadPanel">
+  <div style="font-size:16px;margin-bottom:14px;">📂 加载回测数据</div>
+  <label class="btn" for="fileInput">选择 JSON 文件</label>
+  <input type="file" id="fileInput" accept=".json" onchange="onFileSelected(event)">
+  <div class="hint" style="margin-top:14px;">
+    支持格式：含 return_pct / peak_return_pct / exit_day 的回测结果 JSON<br>
+    可直接拖拽文件到此窗口
+  </div>
+</div>
+
+<script>
+// ================================================================
+// 全局状态
+// ================================================================
+let RAW_DATA = [];          // 原始JSON数组
+let FILTERED = [];          // 过滤后的数据
+let SELECTED = new Set();   // 选中的code集合
+let CURRENT_TAB = 'cumreturn';
+let SHOW_WIN = true, SHOW_LOSS = true;
+let VIEW_START = 0, VIEW_COUNT = 60;
+let HOVERED_IDX = -1;
+
+const COLORS = [
+  '#4a9eff','#ff6b6b','#51cf66','#ffd43b','#cc5de8','#ff922b',
+  '#20c997','#f06595','#748ffc','#a9e34b','#e599f7','#66d9e8',
+  '#ffa8a8','#b2f2bb','#ffec99','#d0bfff','#99e9f2','#ffc078',
+  '#c0eb75','#eebefa','#a5d8ff','#d8f5a2','#ffe066','#e5dbff',
+];
+let colorMap = {};
+
+// ================================================================
+// 文件加载
+// ================================================================
+function onFileSelected(e) { const f = e.target.files[0]; if (f) loadFile(f); }
+function loadFile(file) {
+  const reader = new FileReader();
+  reader.onload = e => {
+    try {
+      let parsed = JSON.parse(e.target.result);
+      // 支持两种格式: 直接数组 或 {signals:[...]} 或 {data:[...]}
+      if (Array.isArray(parsed)) RAW_DATA = parsed;
+      else if (parsed.signals) RAW_DATA = parsed.signals;
+      else if (parsed.data) RAW_DATA = parsed.data;
+      else { alert('无法识别的JSON格式'); return; }
+      initData();
+    } catch(err) { alert('JSON解析失败: ' + err.message); }
+  };
+  reader.readAsText(file);
+}
+document.addEventListener('dragover', e => e.preventDefault());
+document.addEventListener('drop', e => {
+  e.preventDefault();
+  const f = e.dataTransfer.files[0];
+  if (f && f.name.endsWith('.json')) loadFile(f);
+});
+
+// ================================================================
+// 数据初始化
+// ================================================================
+function initData() {
+  document.getElementById('loadPanel').style.display = 'none';
+
+  // 标准化字段
+  RAW_DATA.forEach((d, i) => {
+    d._idx = i;
+    d._code = d.code || d.symbol || '';
+    d._board = d.board || '';
+    d._rsi = d.signal_rsi || d.rsi || 0;
+    d._ret = d.return_pct != null ? d.return_pct : (d.return || 0);
+    d._peak = d.peak_return_pct != null ? d.peak_return_pct : (d.peak_return || 0);
+    d._exitDay = d.exit_day != null ? d.exit_day : (d.hold_days || 0);
+    d._exitReason = d.exit_reason || '';
+    d._entryPrice = d.entry_price || 0;
+    d._exitPrice = d.exit_price || 0;
+    d._signalDate = d.signal_date || d.date || '';
+    d._volRatio = d.signal_vol_ratio || 0;
+    d._ma60Slope = d.signal_ma60_slope || 0;
+    d._amplitude = d.signal_amplitude || 0;
+    d._lowerShadow = d.signal_lower_shadow || 0;
+  });
+
+  // 提取筛选选项
+  const boards = [...new Set(RAW_DATA.map(d => d._board).filter(Boolean))].sort();
+  const reasons = [...new Set(RAW_DATA.map(d => d._exitReason).filter(Boolean))].sort();
+  const boardSel = document.getElementById('filterBoard');
+  boardSel.innerHTML = '<option value="">全部</option>';
+  boards.forEach(b => { boardSel.innerHTML += `<option value="${b}">${b}</option>`; });
+  const exitSel = document.getElementById('filterExit');
+  exitSel.innerHTML = '<option value="">全部</option>';
+  reasons.forEach(r => { exitSel.innerHTML += `<option value="${r}">${r}</option>`; });
+
+  // 颜色映射
+  const codes = [...new Set(RAW_DATA.map(d => d._code))].sort();
+  codes.forEach((c, i) => { colorMap[c] = COLORS[i % COLORS.length]; });
+
+  applyFilters();
+}
+
+// ================================================================
+// 过滤
+// ================================================================
+function applyFilters() {
+  const boardF = document.getElementById('filterBoard').value;
+  const exitF = document.getElementById('filterExit').value;
+  const rsiMin = parseFloat(document.getElementById('filterRsiMin').value) || -Infinity;
+  const rsiMax = parseFloat(document.getElementById('filterRsiMax').value) || Infinity;
+  const search = document.getElementById('searchInput').value.trim().toUpperCase();
+
+  FILTERED = RAW_DATA.filter(d => {
+    if (boardF && d._board !== boardF) return false;
+    if (exitF && d._exitReason !== exitF) return false;
+    if (d._rsi < rsiMin || d._rsi > rsiMax) return false;
+    if (search && !d._code.includes(search)) return false;
+    if (!SHOW_WIN && d._ret > 0) return false;
+    if (!SHOW_LOSS && d._ret <= 0) return false;
+    return true;
+  });
+
+  renderSymbolList();
+  drawChart();
+  updateGlobalStats();
+}
+
+function toggleWinLoss(type) {
+  if (type === 'win') { SHOW_WIN = !SHOW_WIN; document.getElementById('btnWin').classList.toggle('active'); }
+  else { SHOW_LOSS = !SHOW_LOSS; document.getElementById('btnLoss').classList.toggle('active'); }
+  applyFilters();
+}
+
+// ================================================================
+// Symbol列表
+// ================================================================
+function renderSymbolList() {
+  const container = document.getElementById('symbolList');
+  container.innerHTML = '';
+  document.getElementById('symbolCount').textContent =
+    `${FILTERED.length} / ${RAW_DATA.length} 条信号 (选中 ${SELECTED.size})`;
+
+  for (const d of FILTERED) {
+    const div = document.createElement('div');
+    div.className = 'symbol-item' + (SELECTED.has(d._code) ? ' selected' : '');
+    const retColor = d._ret >= 0 ? '#ef5350' : '#26a69a';
+    const retSign = d._ret >= 0 ? '+' : '';
+    div.innerHTML = `
+      <input type="checkbox" ${SELECTED.has(d._code)?'checked':''} onchange="toggleSymbol('${d._code}')">
+      <span class="sym-name">${d._code}</span>
+      <span class="sym-board">${d._board}</span>
+      <span class="sym-ret" style="color:${retColor}">${retSign}${d._ret.toFixed(1)}%</span>
+      <span class="sym-color" style="background:${colorMap[d._code]||'#666'}"></span>
+    `;
+    div.onclick = (e) => { if (e.target.type !== 'checkbox') highlightSignal(d); };
+    container.appendChild(div);
+  }
+}
+
+function toggleSymbol(code) {
+  if (SELECTED.has(code)) SELECTED.delete(code); else SELECTED.add(code);
+  renderSymbolList();
+  drawChart();
+}
+function selectAll() { FILTERED.forEach(d => SELECTED.add(d._code)); renderSymbolList(); drawChart(); }
+function selectNone() { SELECTED.clear(); renderSymbolList(); drawChart(); }
+function invertSelect() {
+  const ns = new Set();
+  FILTERED.forEach(d => { if (!SELECTED.has(d._code)) ns.add(d._code); });
+  SELECTED.clear(); ns.forEach(c => SELECTED.add(c));
+  renderSymbolList(); drawChart();
+}
+function filterSymbols() { applyFilters(); }
+
+function highlightSignal(d) {
+  // 高亮单条信号，更新stats panel
+  updateStatsPanel([d]);
+}
+
+// ================================================================
+// 全局统计
+// ================================================================
+function updateGlobalStats() {
+  const data = SELECTED.size > 0 ? FILTERED.filter(d => SELECTED.has(d._code)) : FILTERED;
+  const n = data.length;
+  if (n === 0) { document.getElementById('globalStats').textContent = ''; return; }
+  const wins = data.filter(d => d._ret > 0).length;
+  const avgRet = data.reduce((s, d) => s + d._ret, 0) / n;
+  const avgPeak = data.reduce((s, d) => s + d._peak, 0) / n;
+  document.getElementById('globalStats').textContent =
+    `${n}笔 | 胜率 ${(wins/n*100).toFixed(1)}% | 均收益 ${avgRet>=0?'+':''}${avgRet.toFixed(2)}% | 均峰值 ${avgPeak>=0?'+':''}${avgPeak.toFixed(2)}%`;
+  updateStatsPanel(data);
+}
+
+function updateStatsPanel(data) {
+  const n = data.length;
+  if (n === 0) { document.getElementById('statsPanel').innerHTML = ''; return; }
+  const wins = data.filter(d => d._ret > 0);
+  const losses = data.filter(d => d._ret <= 0);
+  const avgRet = data.reduce((s, d) => s + d._ret, 0) / n;
+  const avgPeak = data.reduce((s, d) => s + d._peak, 0) / n;
+  const avgWin = wins.length ? wins.reduce((s, d) => s + d._ret, 0) / wins.length : 0;
+  const avgLoss = losses.length ? losses.reduce((s, d) => s + d._ret, 0) / losses.length : 0;
+  const maxWin = Math.max(...data.map(d => d._ret));
+  const maxLoss = Math.min(...data.map(d => d._ret));
+  const avgDay = data.reduce((s, d) => s + d._exitDay, 0) / n;
+  const pnlRatio = avgLoss !== 0 ? Math.abs(avgWin / avgLoss) : 0;
+
+  const sp = (v) => v >= 0 ? 'sp-pos' : 'sp-neg';
+  const sign = (v) => v >= 0 ? '+' : '';
+
+  document.getElementById('statsPanel').innerHTML = `
+    <div class="sp-title">📋 统计 (${n}笔)</div>
+    <div class="sp-row"><span class="sp-label">胜率</span><span class="sp-val">${(wins.length/n*100).toFixed(1)}%</span></div>
+    <div class="sp-row"><span class="sp-label">盈利/亏损</span><span class="sp-val">${wins.length}/${losses.length}</span></div>
+    <div class="sp-row"><span class="sp-label">平均收益</span><span class="sp-val ${sp(avgRet)}">${sign(avgRet)}${avgRet.toFixed(2)}%</span></div>
+    <div class="sp-row"><span class="sp-label">平均峰值</span><span class="sp-val ${sp(avgPeak)}">${sign(avgPeak)}${avgPeak.toFixed(2)}%</span></div>
+    <div class="sp-row"><span class="sp-label">平均盈利</span><span class="sp-val sp-pos">+${avgWin.toFixed(2)}%</span></div>
+    <div class="sp-row"><span class="sp-label">平均亏损</span><span class="sp-val sp-neg">${avgLoss.toFixed(2)}%</span></div>
+    <div class="sp-row"><span class="sp-label">最大单笔</span><span class="sp-val sp-pos">+${maxWin.toFixed(2)}%</span></div>
+    <div class="sp-row"><span class="sp-label">最大亏损</span><span class="sp-val sp-neg">${maxLoss.toFixed(2)}%</span></div>
+    <div class="sp-row"><span class="sp-label">盈亏比</span><span class="sp-val">${pnlRatio.toFixed(2)}:1</span></div>
+    <div class="sp-row"><span class="sp-label">平均持仓</span><span class="sp-val">${avgDay.toFixed(1)}天</span></div>
+  `;
+}
+
+// ================================================================
+// Tab切换
+// ================================================================
+function switchTab(tab) {
+  CURRENT_TAB = tab;
+  document.querySelectorAll('.chart-tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('tab' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.add('active');
+  drawChart();
+}
+
+// ================================================================
+// 图表绘制
+// ================================================================
+const canvas = document.getElementById('chart');
+const ctx = canvas.getContext('2d');
+let dpr = window.devicePixelRatio || 1, W, H;
+
+function resizeCanvas() {
+  const rect = canvas.parentElement.getBoundingClientRect();
+  W = rect.width; H = rect.height;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', () => { resizeCanvas(); drawChart(); });
+
+function getDrawData() {
+  if (SELECTED.size > 0) return FILTERED.filter(d => SELECTED.has(d._code));
+  return FILTERED;
+}
+
+function drawChart() {
+  resizeCanvas();
+  ctx.clearRect(0, 0, W, H);
+  const data = getDrawData();
+  if (!data.length) { drawEmpty(); return; }
+
+  switch (CURRENT_TAB) {
+    case 'cumreturn': drawCumReturn(data); break;
+    case 'scatter': drawScatter(data); break;
+    case 'dayreturn': drawDayReturn(data); break;
+    case 'peakvsfinal': drawPeakVsFinal(data); break;
+  }
+  updateLegendForData(data);
+}
+
+function drawEmpty() {
+  ctx.fillStyle = '#444';
+  ctx.font = '14px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('请加载JSON数据文件', W/2, H/2);
+}
+
+// ── 累计收益曲线 ──
+function drawCumReturn(data) {
+  // 按信号日期排序
+  const sorted = [...data].sort((a, b) => (a._signalDate || '').localeCompare(b._signalDate || ''));
+  const margin = { top: 30, right: 60, bottom: 30, left: 60 };
+  const cw = W - margin.left - margin.right;
+  const ch = H - margin.top - margin.bottom;
+
+  // 计算累计收益
+  let cumRet = 0;
+  const points = sorted.map((d, i) => {
+    cumRet += d._ret;
+    return { x: i, y: cumRet, d };
+  });
+
+  const yMin = Math.min(0, ...points.map(p => p.y));
+  const yMax = Math.max(0, ...points.map(p => p.y));
+  const yPad = (yMax - yMin) * 0.1 || 5;
+
+  function px(i) { return margin.left + (i / Math.max(1, sorted.length - 1)) * cw; }
+  function py(v) { return margin.top + (1 - (v - (yMin - yPad)) / ((yMax + yPad) - (yMin - yPad))) * ch; }
+
+  // 网格
+  drawGridLines(margin, cw, ch, yMin - yPad, yMax + yPad, sorted.length);
+
+  // 零线
+  const zeroY = py(0);
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255,200,60,0.4)';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath(); ctx.moveTo(margin.left, zeroY); ctx.lineTo(W - margin.right, zeroY); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+
+  // 累计曲线
+  ctx.save();
+  ctx.strokeStyle = '#4a9eff';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  points.forEach((p, i) => {
+    const x = px(i), y = py(p.y);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+
+  // 填充区域
+  ctx.lineTo(px(points.length - 1), py(0));
+  ctx.lineTo(px(0), py(0));
+  ctx.closePath();
+  ctx.fillStyle = points[points.length - 1].y >= 0 ? 'rgba(239,83,80,0.08)' : 'rgba(38,166,154,0.08)';
+  ctx.fill();
+  ctx.restore();
+
+  // 每个点标记
+  points.forEach((p, i) => {
+    const x = px(i), y = py(p.y);
+    const color = p.d._ret >= 0 ? '#ef5350' : '#26a69a';
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(x, y, 3, 0, Math.PI * 2);
+    ctx.fill();
+  });
+
+  // Y轴标签
+  drawYLabels(margin, ch, yMin - yPad, yMax + yPad, '%');
+
+  // X轴标签
+  ctx.save();
+  ctx.fillStyle = '#444';
+  ctx.font = '9px monospace';
+  ctx.textAlign = 'center';
+  const step = Math.max(1, Math.floor(sorted.length / 10));
+  for (let i = 0; i < sorted.length; i += step) {
+    ctx.fillText(sorted[i]._signalDate.slice(5), px(i), H - margin.bottom + 14);
+  }
+  ctx.restore();
+
+  // 标题
+  ctx.fillStyle = '#888';
+  ctx.font = '12px sans-serif';
+  ctx.textAlign = 'left';
+  const finalRet = points[points.length - 1].y;
+  ctx.fillText(`累计收益: ${finalRet >= 0 ? '+' : ''}${finalRet.toFixed(2)}%`, margin.left, margin.top - 10);
+}
+
+// ── 收益分布散点图 ──
+function drawScatter(data) {
+  const margin = { top: 30, right: 60, bottom: 40, left: 60 };
+  const cw = W - margin.left - margin.right;
+  const ch = H - margin.top - margin.bottom;
+
+  const xMin = 0, xMax = Math.max(...data.map(d => d._exitDay), 20);
+  const yMin = Math.min(...data.map(d => d._ret)) * 1.1;
+  const yMax = Math.max(...data.map(d => d._ret)) * 1.1;
+  const yPad = (yMax - yMin) * 0.1 || 5;
+
+  function px(v) { return margin.left + ((v - xMin) / (xMax - xMin || 1)) * cw; }
+  function py(v) { return margin.top + (1 - (v - (yMin - yPad)) / ((yMax + yPad) - (yMin - yPad))) * ch; }
+
+  drawGridLines(margin, cw, ch, yMin - yPad, yMax + yPad, 10);
+
+  // 零线
+  const zeroY = py(0);
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255,200,60,0.4)';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath(); ctx.moveTo(margin.left, zeroY); ctx.lineTo(W - margin.right, zeroY); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+
+  // 散点
+  data.forEach((d, i) => {
+    const x = px(d._exitDay);
+    const y = py(d._ret);
+    const color = d._ret >= 0 ? 'rgba(239,83,80,0.7)' : 'rgba(38,166,154,0.7)';
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(x, y, 5, 0, Math.PI * 2);
+    ctx.fill();
+    // 峰值连线
+    const peakY = py(d._peak);
+    ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+    ctx.lineWidth = 0.5;
+    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x, peakY); ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,0.2)';
+    ctx.beginPath(); ctx.arc(x, peakY, 2, 0, Math.PI * 2); ctx.fill();
+  });
+
+  drawYLabels(margin, ch, yMin - yPad, yMax + yPad, '%');
+
+  // X轴
+  ctx.save();
+  ctx.fillStyle = '#444';
+  ctx.font = '10px sans-serif';
+  ctx.textAlign = 'center';
+  for (let d = 0; d <= xMax; d += Math.max(1, Math.floor(xMax / 10))) {
+    ctx.fillText(`D${d}`, px(d), H - margin.bottom + 14);
+  }
+  ctx.fillText('持仓天数', W / 2, H - 4);
+  ctx.restore();
+
+  ctx.fillStyle = '#888';
+  ctx.font = '12px sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText('收益分布 (实心=最终收益, 空心=峰值)', margin.left, margin.top - 10);
+}
+
+// ── 逐笔收益柱状图 ──
+function drawDayReturn(data) {
+  const sorted = [...data].sort((a, b) => a._ret - b._ret);
+  const margin = { top: 30, right: 60, bottom: 30, left: 60 };
+  const cw = W - margin.left - margin.right;
+  const ch = H - margin.top - margin.bottom;
+
+  const yMin = Math.min(0, ...sorted.map(d => d._ret)) * 1.1;
+  const yMax = Math.max(0, ...sorted.map(d => d._ret)) * 1.1;
+  const yPad = (yMax - yMin) * 0.1 || 5;
+
+  function px(i) { return margin.left + (i / Math.max(1, sorted.length)) * cw; }
+  function py(v) { return margin.top + (1 - (v - (yMin - yPad)) / ((yMax + yPad) - (yMin - yPad))) * ch; }
+
+  drawGridLines(margin, cw, ch, yMin - yPad, yMax + yPad, 10);
+
+  const zeroY = py(0);
+  const barW = Math.max(1, cw / sorted.length - 1);
+
+  sorted.forEach((d, i) => {
+    const x = px(i) + 1;
+    const y = py(d._ret);
+    const color = d._ret >= 0 ? '#ef5350' : '#26a69a';
+    ctx.fillStyle = color;
+    if (d._ret >= 0) {
+      ctx.fillRect(x, y, barW, zeroY - y);
+    } else {
+      ctx.fillRect(x, zeroY, barW, y - zeroY);
+    }
+    // 峰值标记
+    const peakY = py(d._peak);
+    ctx.fillStyle = 'rgba(255,255,255,0.15)';
+    ctx.fillRect(x, peakY, barW, 1);
+  });
+
+  // 零线
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255,200,60,0.4)';
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(margin.left, zeroY); ctx.lineTo(W - margin.right, zeroY); ctx.stroke();
+  ctx.restore();
+
+  drawYLabels(margin, ch, yMin - yPad, yMax + yPad, '%');
+
+  ctx.fillStyle = '#888';
+  ctx.font = '12px sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText(`逐笔收益 (按收益排序, ${sorted.length}笔)`, margin.left, margin.top - 10);
+}
+
+// ── 峰值 vs 最终 ──
+function drawPeakVsFinal(data) {
+  const margin = { top: 30, right: 60, bottom: 40, left: 60 };
+  const cw = W - margin.left - margin.right;
+  const ch = H - margin.top - margin.bottom;
+
+  const allVals = data.flatMap(d => [d._ret, d._peak]);
+  const vMin = Math.min(0, ...allVals) * 1.1;
+  const vMax = Math.max(...allVals) * 1.1;
+  const pad = (vMax - vMin) * 0.1 || 5;
+
+  function px(v) { return margin.left + ((v - (vMin - pad)) / ((vMax + pad) - (vMin - pad))) * cw; }
+  function py(v) { return margin.top + (1 - (v - (vMin - pad)) / ((vMax + pad) - (vMin - pad))) * ch; }
+
+  drawGridLines(margin, cw, ch, vMin - pad, vMax + pad, 10);
+
+  // 对角线 (peak = final)
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath();
+  ctx.moveTo(px(vMin - pad), py(vMin - pad));
+  ctx.lineTo(px(vMax + pad), py(vMax + pad));
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+
+  // 零线
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255,200,60,0.3)';
+  ctx.lineWidth = 0.5;
+  ctx.beginPath(); ctx.moveTo(margin.left, py(0)); ctx.lineTo(W - margin.right, py(0)); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(px(0), margin.top); ctx.lineTo(px(0), margin.top + ch); ctx.stroke();
+  ctx.restore();
+
+  // 散点: x=peak, y=final
+  data.forEach(d => {
+    const x = px(d._peak);
+    const y = py(d._ret);
+    const color = d._ret >= 0 ? 'rgba(239,83,80,0.7)' : 'rgba(38,166,154,0.7)';
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(x, y, 4, 0, Math.PI * 2);
+    ctx.fill();
+    // 到对角线的连线
+    ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+    ctx.lineWidth = 0.5;
+    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(px(d._peak), py(d._peak)); ctx.stroke();
+  });
+
+  drawYLabels(margin, ch, vMin - pad, vMax + pad, '%');
+
+  ctx.save();
+  ctx.fillStyle = '#444';
+  ctx.font = '10px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('峰值收益 →', W / 2, H - margin.bottom + 14);
+  ctx.save();
+  ctx.translate(margin.left - 14, H / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.fillText('最终收益 →', 0, 0);
+  ctx.restore();
+  ctx.restore();
+
+  ctx.fillStyle = '#888';
+  ctx.font = '12px sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText('峰值收益 vs 最终收益 (对角线上方=盈利锁定)', margin.left, margin.top - 10);
+}
+
+// ── 通用绘图 ──
+function drawGridLines(margin, cw, ch, yMin, yMax, xSteps) {
+  ctx.save();
+  ctx.strokeStyle = '#1a1a24';
+  ctx.lineWidth = 0.5;
+  const steps = 8;
+  for (let i = 0; i <= steps; i++) {
+    const y = margin.top + (i / steps) * ch;
+    ctx.beginPath(); ctx.moveTo(margin.left, y); ctx.lineTo(W - margin.right, y); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawYLabels(margin, ch, yMin, yMax, suffix) {
+  ctx.save();
+  ctx.fillStyle = '#444';
+  ctx.font = '10px monospace';
+  ctx.textAlign = 'left';
+  const steps = 8;
+  for (let i = 0; i <= steps; i++) {
+    const y = margin.top + (i / steps) * ch;
+    const v = yMax - (i / steps) * (yMax - yMin);
+    ctx.fillText(v.toFixed(1) + suffix, W - margin.right + 4, y + 3);
+  }
+  ctx.restore();
+}
+
+function updateLegendForData(data) {
+  const c = document.getElementById('legend');
+  const n = data.length;
+  const wins = data.filter(d => d._ret > 0).length;
+  const avgRet = data.reduce((s, d) => s + d._ret, 0) / n;
+  c.innerHTML = `<span style="color:#666">${n}笔</span> | <span style="color:#ef5350">盈利${wins}</span> | <span style="color:#26a69a">亏损${n-wins}</span> | <span style="color:${avgRet>=0?'#ef5350':'#26a69a'}">均值${avgRet>=0?'+':''}${avgRet.toFixed(2)}%</span>`;
+}
+
+// ── 十字线 ──
+canvas.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  const label = document.getElementById('crosshairLabel');
+  const data = getDrawData();
+  if (!data.length || mx < 60 || mx > W - 60) { label.style.display = 'none'; return; }
+
+  const sorted = CURRENT_TAB === 'dayreturn' ? [...data].sort((a, b) => a._ret - b._ret) :
+                 CURRENT_TAB === 'cumreturn' ? [...data].sort((a, b) => (a._signalDate || '').localeCompare(b._signalDate || '')) :
+                 data;
+
+  if (CURRENT_TAB === 'scatter' || CURRENT_TAB === 'peakvsfinal') {
+    // 找最近的点
+    let minDist = Infinity, closest = null;
+    data.forEach(d => {
+      let x, y;
+      if (CURRENT_TAB === 'scatter') {
+        const xMax = Math.max(...data.map(dd => dd._exitDay), 20);
+        x = 60 + (d._exitDay / xMax) * (W - 120);
+        const yMin = Math.min(...data.map(dd => dd._ret)) * 1.1;
+        const yMax = Math.max(...data.map(dd => dd._ret)) * 1.1;
+        const pad = (yMax - yMin) * 0.1 || 5;
+        y = 30 + (1 - (d._ret - (yMin - pad)) / ((yMax + pad) - (yMin - pad))) * (H - 60);
+      } else {
+        const allVals = data.flatMap(dd => [dd._ret, dd._peak]);
+        const vMin = Math.min(0, ...allVals) * 1.1;
+        const vMax = Math.max(...allVals) * 1.1;
+        const pad = (vMax - vMin) * 0.1 || 5;
+        x = 60 + ((d._peak - (vMin - pad)) / ((vMax + pad) - (vMin - pad))) * (W - 120);
+        y = 30 + (1 - (d._ret - (vMin - pad)) / ((vMax + pad) - (vMin - pad))) * (H - 60);
+      }
+      const dist = Math.hypot(mx - x, my - y);
+      if (dist < minDist) { minDist = dist; closest = d; }
+    });
+    if (closest && minDist < 30) {
+      showTooltip(label, mx, my, closest);
+    } else {
+      label.style.display = 'none';
+    }
+  } else {
+    const margin = { left: 60, right: 60 };
+    const cw = W - margin.left - margin.right;
+    const idx = Math.floor(((mx - margin.left) / cw) * sorted.length);
+    if (idx >= 0 && idx < sorted.length) {
+      showTooltip(label, mx, my, sorted[idx]);
+    } else {
+      label.style.display = 'none';
+    }
+  }
+});
+
+function showTooltip(label, mx, my, d) {
+  const sp = (v) => v >= 0 ? '#ef5350' : '#26a69a';
+  const sign = (v) => v >= 0 ? '+' : '';
+  label.style.display = 'block';
+  label.style.left = (mx + 15) + 'px';
+  label.style.top = (my - 10) + 'px';
+  label.innerHTML = `
+    <div style="color:#888">${d._signalDate} | ${d._code} | ${d._board}</div>
+    <div>RSI: ${d._rsi} | 量比: ${d._volRatio} | MA60斜率: ${d._ma60Slope}</div>
+    <div>入场: ${d._entryPrice} | 退出: ${d._exitPrice} (Day${d._exitDay})</div>
+    <div>退出原因: ${d._exitReason}</div>
+    <div style="margin-top:4px">
+      收益: <span style="color:${sp(d._ret)}">${sign(d._ret)}${d._ret.toFixed(2)}%</span>
+      | 峰值: <span style="color:${sp(d._peak)}">${sign(d._peak)}${d._peak.toFixed(2)}%</span>
+    </div>
+  `;
+}
+canvas.addEventListener('mouseleave', () => { document.getElementById('crosshairLabel').style.display = 'none'; });
+
+// ── 滚轮缩放 ──
+canvas.addEventListener('wheel', e => {
+  // scatter/peakvsfinal 无缩放
+  if (CURRENT_TAB === 'scatter' || CURRENT_TAB === 'peakvsfinal') return;
+  e.preventDefault();
+});
+
+resizeCanvas(); drawChart();
+</script>
+</body>
+</html>
