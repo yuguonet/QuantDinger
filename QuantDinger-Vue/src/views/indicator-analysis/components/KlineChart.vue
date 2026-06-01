@@ -4810,7 +4810,21 @@ registerOverlay({
       activeDrawingTool,
       selectDrawingTool,
       clearAllDrawings,
-      addedSignalOverlayIds
+      addedSignalOverlayIds,
+      hideIndicatorSignals () {
+        if (addedSignalOverlayIds.value.length > 0 && chartRef.value) {
+          addedSignalOverlayIds.value.forEach(id => {
+            try {
+              if (typeof chartRef.value.removeOverlay === 'function') chartRef.value.removeOverlay(id)
+              else if (typeof chartRef.value.removeOverlayById === 'function') chartRef.value.removeOverlayById(id)
+            } catch (_) {}
+          })
+        }
+      },
+      showIndicatorSignals () {
+        // Re-trigger indicator signal rendering by re-running the indicator
+        // Caller should invoke updateActiveIndicators() or equivalent
+      }
     }
   }
 }

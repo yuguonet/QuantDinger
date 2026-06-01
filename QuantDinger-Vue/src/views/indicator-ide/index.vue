@@ -1788,6 +1788,10 @@ export default {
         })
         chart.addedSignalOverlayIds = []
       }
+      // Re-render indicator signals after clearing backtest overlays
+      if (!silent && typeof chart.updateIndicators === 'function') {
+        chart.updateIndicators()
+      }
       if (!silent) this.$message.success(this.$t('indicatorIde.clearSignalsDone'))
     },
 
@@ -2804,6 +2808,12 @@ export default {
       const chartInstance = chart.chartRef
 
       this.clearBacktestSignalOverlays({ silent: true })
+
+      // Hide indicator raw signals to avoid duplicate markers
+      // (indicator signals at bar i vs backtest trades at bar i+1)
+      if (typeof chart.hideIndicatorSignals === 'function') {
+        chart.hideIndicatorSignals()
+      }
 
       // Build sorted kline timestamp array for snap matching
       const klineData = (typeof chartInstance.getDataList === 'function') ? chartInstance.getDataList() : []

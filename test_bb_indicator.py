@@ -9,14 +9,15 @@ BB 超卖策略 - 全市场扫描回测
   入场规则:
     ① 非ST股（排除名称含"ST"的股票）
     ② 最低价 < BB(20, 3.0) 下轨
+    ②b 收盘价不高于BB下轨5%
     ③ 振幅>8% + 下影线占比<30%（有效波动且以实体为主）
     ④ MA60斜率 >= 0%（排除持续下跌趋势）
-    ⑤ D+1开盘价 > D0收盘价 → 次日开盘买入
+    ⑤ (D+1开盘价 > D0收盘价) 或者 D+1开盘价在BB下轨5%以下 → 次日开盘买入
 
   出场规则:
     ① 跟踪止损: 从持仓期间最高点回撤超过10% → 出场
-    ② 止盈（默认993.75%）
-    ③ RSI>75 且 量比>2.0 且 未涨停 → 卖出
+    ①b 持仓3天内亏损超过-5% → 早期止损
+    ② RSI>75 且 量比>2.0 且 未涨停 → 卖出
     ④ RSI>85 且 未涨停 → 极端超买卖出
     ⑤ 最高价突破BB上轨且(上影线>3%或量比(五日)>2.5) → 卖出
     ⑥ 最大持仓天数（默认20天）
@@ -190,12 +191,14 @@ def run_backtest(bars, entry_idx, entry_price, sell_signals, extreme_signals,
             exit_reason = "跟踪止损"
             break
 
-        # ② 止盈
-        if b['high'] >= entry_price * (1 + take_profit / 100):
-            exit_p = entry_price * (1 + take_profit / 100)
-            exit_d = d
-            exit_reason = "止盈"
-            break
+        # ①b 持仓3天内任意一天跌破-5%止损
+        if d <= 3 and entry_price > 0:
+            early_stop_price = entry_price * 0.95
+            if b['low'] <= early_stop_price:
+                exit_p = early_stop_price
+                exit_d = d
+                exit_reason = "早期止损"
+                break
 
         # ③ RSI>75+量比>2+未涨停
         if sell_signals[idx]:
@@ -347,6 +350,9 @@ def strategy_rsi(bars, code, rsi_len=14,
             continue
         if lows[i] >= bb_lower[i]:
             continue
+        # 收盘价不高于BB下轨5%
+        if closes[i] > bb_lower[i] * 1.05:
+            continue
         prev_close = bars[i - 1]['close'] if i > 0 else bars[i]['open']
         body_low = min(bars[i]['open'], bars[i]['close'])
         if prev_close > 0:
@@ -360,7 +366,9 @@ def strategy_rsi(bars, code, rsi_len=14,
         if ma60_slopes[i] != -999.0 and ma60_slopes[i] < ma_slope_threshold:
             continue
         d1_open = bars[i + 1]['open']
-        if d1_open <= closes[i]:
+        bb_lower_next = bb_lower[i + 1] if i + 1 < len(bb_lower) else bb_lower[i]
+        # ⑤ (D+1开盘价 > D0收盘价) 或者 D+1开盘价在BB下轨5%以下 → 次日开盘买入
+        if d1_open <= closes[i] and not (bb_lower_next is not None and d1_open < bb_lower_next * 0.95):
             continue
         buy_signal[i] = True
         d0_date[i] = bars[i]['time']
@@ -534,6 +542,9 @@ def check_today_entry(bars, code, rsi_len=14,
         return None
     if lows[i] >= bb_lower[i]:
         return None
+    # 收盘价不高于BB下轨5%
+    if closes[i] > bb_lower[i] * 1.05:
+        return None
 
     # ③ 振幅>8% + 下影线占比<30%
     prev_close = bars[i - 1]['close'] if i > 0 else bars[i]['open']
@@ -624,7 +635,7 @@ def main():
         print(f"BB 超卖策略 — 今日入场信号扫描")
         print(f"{'=' * 80}")
         print(f"股票来源: {stock_source} ({len(codes)}只)")
-        print(f"入场条件: 最低价 < BB({args.bb_period},{args.bb_std})下轨")
+        print(f"         + 收盘价<=BB下轨×1.05 + 振幅>8%% + 下影线占比<30%% + MA60斜率>={args.ma_slope}%%")
         print(f"         + 振幅>8%% + 下影线占比<30%% + MA60斜率>={args.ma_slope}%%")
         print(f"（跳过D+1入场规则）\n")
 
@@ -686,10 +697,10 @@ def main():
     print(f"BB 超卖策略回测")
     print(f"{'=' * 80}")
     print(f"股票来源: {stock_source} ({len(codes)}只)")
-    print(f"入场条件: 非ST股 + 最低价 < BB({args.bb_period},{args.bb_std})下轨")
+    print(f"入场条件: 非ST股 + 最低价<BB下轨 + 收盘价<=BB下轨×1.05")
     print(f"         + 振幅>8% + 下影线占比<30% + MA60斜率>={args.ma_slope}%")
-    print(f"         D1开盘 > D0收盘 → {mode_label}")
-    print(f"出场规则: 跟踪止损{args.trailing_stop}% / 止盈{args.take_profit}% / RSI+量比 / BB上轨突破(上影线>3%或量比>1.5) / 持仓{args.max_hold}天")
+    print(f"         (D1开盘>D0收盘) 或 (D1开盘<BB下轨×0.95) → {mode_label}")
+    print(f"出场规则: 跟踪止损{args.trailing_stop}% / 3天内-5%早期止损 / 止盈{args.take_profit}% / RSI+量比 / BB上轨突破 / 持仓{args.max_hold}天")
     print(f"数据天数: {args.days}天\n")
 
     all_trades = []

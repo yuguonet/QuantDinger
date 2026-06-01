@@ -957,7 +957,7 @@ export default {
 
   .panel-header {
     display: flex; align-items: center; justify-content: space-between;
-    padding: 12px 14px; border-bottom: 1px solid #f0f2f5; background: #fafbfc;
+    padding: 9px 14px; border-bottom: 1px solid #f0f2f5; background: #fafbfc;
     .panel-title { font-size: 13px; font-weight: 700; color: #333; letter-spacing: -0.1px; .anticon { color: #facc15; margin-right: 6px; } }
   }
 

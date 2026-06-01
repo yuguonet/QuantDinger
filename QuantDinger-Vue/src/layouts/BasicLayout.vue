@@ -502,9 +502,6 @@ export default {
           const siderChildren = sider.querySelector('.ant-layout-sider-children')
           if (siderChildren) {
             siderChildren.style.paddingBottom = `${footerHeight + 12}px`
-            siderChildren.style.overflowY = 'auto'
-            siderChildren.style.overflowX = 'hidden'
-            siderChildren.style.webkitOverflowScrolling = 'touch'
           }
           // 进一步限制菜单区域高度，避免 footer 遮挡
           const menuScroll = sider.querySelector('.ant-pro-sider-menu') ||
@@ -513,9 +510,6 @@ export default {
           if (menuScroll) {
             const availableHeight = Math.max(siderRect.height - footerHeight - 12, 120)
             menuScroll.style.maxHeight = `${availableHeight}px`
-            menuScroll.style.overflowY = 'auto'
-            menuScroll.style.overflowX = 'hidden'
-            menuScroll.style.webkitOverflowScrolling = 'touch'
           }
           } else {
             // 如果找不到菜单，使用默认位置
@@ -919,31 +913,13 @@ export default {
     overflow-y: auto;
     overflow-x: hidden;
     -webkit-overflow-scrolling: touch;
-    scrollbar-width: thin;
-    scrollbar-color: rgba(0, 0, 0, 0.15) transparent;
-
+    /* 隐藏滚动条但保持可滚动 */
+    scrollbar-width: none;
+    -ms-overflow-style: none;
     &::-webkit-scrollbar {
-      width: 6px;
-    }
-
-    &::-webkit-scrollbar-track {
-      background: transparent;
-    }
-
-    &::-webkit-scrollbar-thumb {
-      background: rgba(0, 0, 0, 0.15);
-      border-radius: 3px;
-    }
-
-    body.dark &,
-    body.realdark &,
-    .ant-pro-layout.dark &,
-    .ant-pro-layout.realdark & {
-      scrollbar-color: rgba(255, 255, 255, 0.25) transparent;
-
-      &::-webkit-scrollbar-thumb {
-        background: rgba(255, 255, 255, 0.25);
-      }
+      display: none;
+      width: 0;
+      height: 0;
     }
   }
 
@@ -969,6 +945,33 @@ export default {
       overflow-y: auto !important;
       overflow-x: hidden;
       -webkit-overflow-scrolling: touch;
+      /* 隐藏菜单区域滚动条 */
+      scrollbar-width: none;
+      -ms-overflow-style: none;
+      &::-webkit-scrollbar {
+        display: none;
+        width: 0;
+        height: 0;
+      }
+    }
+  }
+}
+
+/* 侧栏与内容区间距压缩至 2px */
+.basic-layout-wrapper {
+  .ant-pro-sider {
+    margin-right: 0 !important;
+    border-right: 1px solid #2a2a2a;
+  }
+  .ant-pro-layout > .ant-layout,
+  .ant-pro-layout > section {
+    margin-left: 2px !important;
+  }
+  /* 暗黑主题下侧栏右边框 */
+  &.dark,
+  &.realdark {
+    .ant-pro-sider {
+      border-right-color: #1c1c1c;
     }
   }
 }
