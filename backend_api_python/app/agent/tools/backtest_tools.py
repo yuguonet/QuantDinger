@@ -3,6 +3,7 @@
 Backtest tools — run backtests and query history.
 
 Wraps BacktestService into Agent-callable tools.
+依赖：app.services.strategy, app.services.backtest, app.services.strategy_snapshot
 """
 from __future__ import annotations
 
@@ -12,6 +13,18 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# ── 显式依赖检查 ──────────────────────────────────────────────
+try:
+    from app.services.strategy import StrategyService
+    from app.services.backtest import BacktestService
+    from app.services.strategy_snapshot import StrategySnapshotResolver
+    _BACKTEST_DEPS_OK = True
+    _BACKTEST_DEPS_ERROR = None
+except ImportError as _e:
+    _BACKTEST_DEPS_OK = False
+    _BACKTEST_DEPS_ERROR = str(_e)
+    logger.warning("[backtest_tools] 依赖缺失: %s — 回测功能不可用", _e)
 
 
 # ── Tool functions ────────────────────────────────────────────
@@ -36,9 +49,8 @@ def run_backtest(
         timeframe: K 线周期，默认 1D（可选 1H, 4H, 1W）
         user_id: 用户 ID，默认 1
     """
-    from app.services.strategy import StrategyService
-    from app.services.backtest import BacktestService
-    from app.services.strategy_snapshot import StrategySnapshotResolver
+    if not _BACKTEST_DEPS_OK:
+        return {"success": False, "error": f"回测依赖缺失: {_BACKTEST_DEPS_ERROR}"}
 
     # 参数校验
     try:
@@ -137,7 +149,8 @@ def get_backtest_history(
         user_id: 用户 ID，默认 1
         limit: 返回条数，默认 10
     """
-    from app.services.backtest import BacktestService
+    if not _BACKTEST_DEPS_OK:
+        return {"runs": [], "count": 0, "error": f"回测依赖缺失: {_BACKTEST_DEPS_ERROR}"}
 
     limit = min(max(limit, 1), 50)
 
@@ -225,7 +238,7 @@ BACKTEST_TOOLS = [
     {
         "fn": get_backtest_history,
         "name": "get_backtest_history",
-        "description": "查询策略的历史回测记录列表，返回每次回测的关键绩效指标。",
+        "description": "查询策略的历史回测记录列表（即过去跑过的回测任务结果）。注意：这不是获取K线数据的工具，获取K线请用 get_daily_history。",
         "parameters": {
             "type": "object",
             "properties": {

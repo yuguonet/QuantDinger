@@ -2,15 +2,14 @@
 """
 Python exec tool — execute arbitrary Python code in a sandboxed environment.
 
-Gives the agent the ability to run custom analysis code with pandas, numpy,
-and any installed Python library. Dramatically increases flexibility.
+v2: real timeout via multiprocessing, tightened sandbox, no filesystem access.
 """
 from __future__ import annotations
 
-import ast
 import io
 import json
 import logging
+import multiprocessing
 import sys
 import traceback
 from typing import Any, Dict, List, Optional
@@ -29,16 +28,23 @@ ALLOWED_MODULES = {
     "sklearn.metrics", "sklearn.model_selection", "sklearn.cluster",
     # 可视化
     "matplotlib", "matplotlib.pyplot", "seaborn",
-    # 文本/数据
+    # 文本/数据（安全子集）
     "json", "csv", "re", "collections", "itertools", "functools", "operator",
     "string", "textwrap", "unicodedata",
     # 日期时间
     "datetime", "time", "calendar",
-    # 文件系统（只读）
-    "pathlib", "glob", "fnmatch",
     # 其他安全模块
     "copy", "pprint", "enum", "dataclasses", "typing",
     "hashlib", "base64", "uuid",
+}
+
+# ── Explicitly blocked modules ────────────────────────────────
+BLOCKED_MODULES = {
+    "os", "sys", "subprocess", "shutil", "socket", "http", "urllib",
+    "requests", "ctypes", "signal", "threading", "multiprocessing",
+    "importlib", "code", "codeop", "compileall",
+    "pathlib", "glob", "fnmatch", "tempfile", "shelve", "dbm",
+    "sqlite3", "pickle", "shelve",
 }
 
 # ── Blocked builtins ─────────────────────────────────────────
@@ -47,6 +53,7 @@ _BLOCKED_BUILTINS = {
     "breakpoint", "input", "exit", "quit",
     "globals", "locals", "vars", "dir",
     "memoryview", "bytearray", "super",
+    "getattr", "setattr", "delattr",  # 防止通过 getattr 绕过
 }
 
 # ── Safe builtins ────────────────────────────────────────────
@@ -74,7 +81,14 @@ def _build_safe_builtins() -> Dict[str, Any]:
 
 def _safe_import(name: str, *args, **kwargs) -> Any:
     """Restricted import that only allows whitelisted modules."""
-    # Allow submodules if parent is allowed (e.g. sklearn.linear_model)
+    # 先检查黑名单
+    root_module = name.split(".")[0]
+    if root_module in BLOCKED_MODULES:
+        raise ImportError(
+            f"Import of '{name}' is blocked for security reasons."
+        )
+
+    # 允许子模块如果父模块在白名单中
     parts = name.split(".")
     for i in range(len(parts), 0, -1):
         prefix = ".".join(parts[:i])
@@ -149,6 +163,74 @@ def _serialize(obj: Any, _depth: int = 0) -> Any:
     return str(obj)[:2000]
 
 
+# ── Worker function (runs in subprocess) ─────────────────────
+
+def _exec_worker(code: str, context_data: Any, result_queue: multiprocessing.Queue):
+    """Execute code in a subprocess. Puts result dict into result_queue."""
+    import io as _io
+    import sys as _sys
+
+    try:
+        import pandas as pd
+    except ImportError:
+        pd = None
+    try:
+        import numpy as np
+    except ImportError:
+        np = None
+
+    safe_builtins = _build_safe_builtins()
+    global_ns = {"__builtins__": safe_builtins}
+    local_ns: Dict[str, Any] = {}
+
+    if pd is not None:
+        local_ns["pd"] = pd
+    if np is not None:
+        local_ns["np"] = np
+    local_ns["data"] = context_data
+
+    old_stdout = _sys.stdout
+    old_stderr = _sys.stderr
+    captured_out = _io.StringIO()
+    captured_err = _io.StringIO()
+
+    try:
+        _sys.stdout = captured_out
+        _sys.stderr = captured_err
+
+        compiled = compile(code, "<agent_code>", "exec")
+        exec(compiled, global_ns, local_ns)
+
+        result = local_ns.get("result")
+        user_vars = [
+            k for k in local_ns
+            if not k.startswith("_") and k not in ("pd", "np", "data", "__builtins__")
+        ]
+
+        result_queue.put({
+            "output": captured_out.getvalue()[:5000],
+            "result": _serialize(result),
+            "error": None,
+            "variables": user_vars[:30],
+        })
+
+    except ImportError as e:
+        result_queue.put({
+            "output": captured_out.getvalue()[:2000],
+            "result": None,
+            "error": f"Import error: {e}",
+        })
+    except Exception:
+        result_queue.put({
+            "output": captured_out.getvalue()[:2000],
+            "result": None,
+            "error": traceback.format_exc()[:3000],
+        })
+    finally:
+        _sys.stdout = old_stdout
+        _sys.stderr = old_stderr
+
+
 # ── Main tool function ───────────────────────────────────────
 
 def python_exec(
@@ -171,88 +253,50 @@ def python_exec(
     Args:
         code: Python code to execute
         context: JSON string injected as `data` variable
-        timeout: Execution timeout in seconds (default 30)
+        timeout: Execution timeout in seconds (default 30, max 60)
 
     Returns:
         {"output": str, "result": any, "error": str|None, "variables": list}
     """
-    # Lazy imports for startup speed
-    try:
-        import pandas as pd
-    except ImportError:
-        pd = None
+    timeout = min(max(timeout, 5), 60)  # clamp 5-60s
 
-    try:
-        import numpy as np
-    except ImportError:
-        np = None
-
-    # Build execution environment
-    safe_builtins = _build_safe_builtins()
-
-    global_ns = {"__builtins__": safe_builtins}
-    local_ns: Dict[str, Any] = {}
-
-    # Inject default libraries
-    if pd is not None:
-        local_ns["pd"] = pd
-    if np is not None:
-        local_ns["np"] = np
-
-    # Inject context data
+    # Parse context data
+    context_data = None
     if context:
         try:
-            local_ns["data"] = json.loads(context)
+            context_data = json.loads(context)
         except (json.JSONDecodeError, TypeError):
-            local_ns["data"] = context
-    else:
-        local_ns["data"] = None
+            context_data = context
 
-    # Capture stdout/stderr
-    old_stdout = sys.stdout
-    old_stderr = sys.stderr
-    captured_out = io.StringIO()
-    captured_err = io.StringIO()
+    # Run in subprocess with timeout
+    result_queue: multiprocessing.Queue = multiprocessing.Queue()
+    proc = multiprocessing.Process(
+        target=_exec_worker,
+        args=(code, context_data, result_queue),
+        daemon=True,
+    )
+    proc.start()
+    proc.join(timeout=timeout)
 
-    try:
-        sys.stdout = captured_out
-        sys.stderr = captured_err
-
-        # Compile and exec with timeout protection
-        compiled = compile(code, "<agent_code>", "exec")
-        exec(compiled, global_ns, local_ns)
-
-        # Extract result
-        result = local_ns.get("result")
-
-        # Collect user-defined variable names (for debugging)
-        user_vars = [
-            k for k in local_ns
-            if not k.startswith("_") and k not in ("pd", "np", "data", "__builtins__")
-        ]
-
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(timeout=2)
+        if proc.is_alive():
+            proc.kill()
         return {
-            "output": captured_out.getvalue()[:5000],  # cap output
-            "result": _serialize(result),
-            "error": None,
-            "variables": user_vars[:30],
-        }
-
-    except ImportError as e:
-        return {
-            "output": captured_out.getvalue()[:2000],
+            "output": "",
             "result": None,
-            "error": f"Import error: {e}",
+            "error": f"代码执行超时（{timeout}秒限制）。请优化代码或减少数据量。",
         }
-    except Exception:
-        return {
-            "output": captured_out.getvalue()[:2000],
-            "result": None,
-            "error": traceback.format_exc()[:3000],
-        }
-    finally:
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
+
+    if not result_queue.empty():
+        return result_queue.get()
+
+    return {
+        "output": "",
+        "result": None,
+        "error": "执行异常：未产生结果（可能内存溢出或被系统终止）",
+    }
 
 
 # ── Tool spec for registry ───────────────────────────────────
@@ -262,12 +306,14 @@ PYTHON_EXEC_TOOL = {
     "name": "python_exec",
     "description": (
         "执行 Python 代码进行自定义数据分析。"
-        "可以使用 pandas(pd)、numpy(np) 以及任何已安装的 Python 库。"
+        "可以使用 pandas(pd)、numpy(np) 以及白名单内的 Python 库。"
         "代码中可通过 `data` 变量接收上下文数据。"
         "将最终结果赋值给 `result` 变量返回，或用 `print()` 输出文本。"
         "\n\n"
         "适用场景：自定义回测、因子分析、统计计算、数据可视化、"
         "机器学习建模、任意复杂的数据处理逻辑。"
+        "\n\n"
+        "限制：执行时间 5-60 秒（默认30秒），禁止文件系统/网络/进程操作。"
         "\n\n"
         "示例：\n"
         "```python\n"
@@ -293,7 +339,7 @@ PYTHON_EXEC_TOOL = {
             },
             "timeout": {
                 "type": "integer",
-                "description": "执行超时秒数，默认 30",
+                "description": "执行超时秒数，默认30，最大60",
                 "default": 30,
             },
         },

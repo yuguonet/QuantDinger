@@ -3,6 +3,7 @@
 Trading tools — start/stop strategies, list strategies, get details.
 
 Wraps TradingExecutor and StrategyService into Agent-callable tools.
+依赖：app.services.strategy, app.TradingExecutor
 """
 from __future__ import annotations
 
@@ -11,6 +12,16 @@ import logging
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# ── 显式依赖检查 ──────────────────────────────────────────────
+try:
+    from app.services.strategy import StrategyService
+    _TRADING_DEPS_OK = True
+    _TRADING_DEPS_ERROR = None
+except ImportError as _e:
+    _TRADING_DEPS_OK = False
+    _TRADING_DEPS_ERROR = str(_e)
+    logger.warning("[trading_tools] 依赖缺失: %s — 交易功能不可用", _e)
 
 
 # ── Tool functions ────────────────────────────────────────────
@@ -23,7 +34,8 @@ def list_strategies(user_id: int = 1) -> Dict[str, Any]:
     Args:
         user_id: 用户 ID，默认 1
     """
-    from app.services.strategy import StrategyService
+    if not _TRADING_DEPS_OK:
+        return {"strategies": [], "count": 0, "error": f"交易依赖缺失: {_TRADING_DEPS_ERROR}"}
 
     try:
         svc = StrategyService()
@@ -57,7 +69,8 @@ def get_strategy_detail(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
         strategy_id: 策略 ID
         user_id: 用户 ID，默认 1
     """
-    from app.services.strategy import StrategyService
+    if not _TRADING_DEPS_OK:
+        return {"success": False, "error": f"交易依赖缺失: {_TRADING_DEPS_ERROR}"}
 
     try:
         svc = StrategyService()
@@ -86,7 +99,8 @@ def start_strategy(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
         strategy_id: 策略 ID
         user_id: 用户 ID，默认 1
     """
-    from app.services.strategy import StrategyService
+    if not _TRADING_DEPS_OK:
+        return {"success": False, "error": f"交易依赖缺失: {_TRADING_DEPS_ERROR}"}
 
     try:
         svc = StrategyService()
@@ -103,8 +117,12 @@ def start_strategy(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
         svc.update_strategy_status(strategy_id, "running", user_id=user_id)
 
         # 启动执行器
-        from app import get_trading_executor
-        executor = get_trading_executor()
+        try:
+            from app import get_trading_executor
+            executor = get_trading_executor()
+        except ImportError as ie:
+            svc.update_strategy_status(strategy_id, "stopped", user_id=user_id)
+            return {"success": False, "error": f"交易执行器不可用: {ie}"}
         success = executor.start_strategy(strategy_id)
 
         if not success:
@@ -129,7 +147,8 @@ def stop_strategy(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
         strategy_id: 策略 ID
         user_id: 用户 ID，默认 1
     """
-    from app.services.strategy import StrategyService
+    if not _TRADING_DEPS_OK:
+        return {"success": False, "error": f"交易依赖缺失: {_TRADING_DEPS_ERROR}"}
 
     try:
         svc = StrategyService()
@@ -142,8 +161,11 @@ def stop_strategy(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
             return {"success": False, "error": "AI 策略暂不支持"}
 
         # 停止执行器
-        from app import get_trading_executor
-        executor = get_trading_executor()
+        try:
+            from app import get_trading_executor
+            executor = get_trading_executor()
+        except ImportError as ie:
+            return {"success": False, "error": f"交易执行器不可用: {ie}"}
         executor.stop_strategy(strategy_id)
 
         # 更新状态

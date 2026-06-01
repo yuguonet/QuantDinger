@@ -6,7 +6,7 @@ Stock Screener tools — 选股器 Agent 工具（完整移植版）
 - getDefaultFilters() → 空筛选条件默认值（130+ 字段）
 - build_keyword_from_filters() ← updateAiQuery()（结构化条件 → 自然语言）
 - parse_filters_from_text() ← parseFilterFromText()（自然语言 → 结构化条件）
-- screen_stocks() — 调用东方财富 search-code API
+- _eastmoney_screen() — 内部函数，调用东方财富 search-code API
 - SLIDER_CONFIGS — 滑块配置常量
 - INDUSTRY_OPTIONS / CONCEPT_OPTIONS — 行业/概念选项
 
@@ -1124,85 +1124,6 @@ def _parse_stock_item(item: Dict[str, Any]) -> Dict[str, Any]:
 #  Agent Tool 函数
 # ══════════════════════════════════════════════════════════════
 
-def screen_stocks(
-    keyword: str = "",
-    market: str = "全部",
-    filters: Optional[Dict[str, Any]] = None,
-    page_size: int = 50,
-    page_no: int = 1,
-    proxy: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    智能选股：根据自然语言条件或结构化筛选条件搜索股票。
-
-    两种调用方式（二选一）：
-    1. keyword 模式：直接传自然语言，如 "市盈率低于20的科技股"
-    2. filters 模式：传结构化条件字典（get_default_filters() 的格式），内部自动拼接关键词
-
-    支持的筛选维度（与前端选股器完全一致）：
-    - 基本面：PE/PB/股息率/ROE/毛利率/净利增长/营收增长/每股收益等
-    - 技术面：均线突破(5/10/20/30/60日)/MACD金叉/KDJ金叉/K线形态等
-    - 资金面：主力资金净流入/量比/换手率/机构持股等
-    - 行业/概念：27个行业 + 12个概念板块
-    - 行情指标：成交额/振幅/委比/涨幅(今日/5日/10日/60日/年初至今)等
-    - 特殊筛选：新高新低/战胜大盘/连涨连跌/限价/定增/质押/板块标识等
-    - 筹码指标：成本价/获利比例/集中度/股东数等
-    - 龙虎榜：买卖额/净买/机构参与/营业部参与等
-
-    Args:
-        keyword: 自然语言选股条件（与 filters 二选一）
-        market: 市场筛选，可选：全部/A股/沪深300/中证500/科创板/创业板/港股/美股/ETF基金
-        filters: 结构化筛选条件字典（可选，优先级高于 keyword）
-        page_size: 返回数量，默认50，最大200
-        page_no: 页码，默认1
-        proxy: 可选代理地址
-
-    Returns:
-        匹配的股票列表及元信息
-    """
-    # 如果传了结构化条件，先转成关键词
-    if filters:
-        keyword = build_keyword_from_filters(filters)
-        # 从 filters 中提取市场（如果有）
-        if market == "全部" and filters.get("_market"):
-            market = filters["_market"]
-
-    if not keyword or not keyword.strip():
-        return {"error": "选股条件不能为空（keyword 或 filters 至少传一个）", "retriable": False}
-
-    search_keyword = keyword.strip()
-    if market and market != "全部" and market in MARKET_FILTER_MAP:
-        search_keyword = f"{market} {search_keyword}"
-
-    page_size = min(max(page_size, 1), 200)
-
-    raw = _call_eastmoney_api(search_keyword, page_size=page_size, page_no=page_no, proxy=proxy)
-
-    if str(raw.get("code")) != "100":
-        return {
-            "error": raw.get("msg", "选股搜索失败"),
-            "retriable": True,
-            "raw_code": raw.get("code"),
-        }
-
-    data = raw.get("data", {})
-    result = data.get("result", {})
-    stocks_raw = result.get("dataList", [])
-    total = result.get("total", len(stocks_raw))
-
-    stocks = [_parse_stock_item(s) for s in stocks_raw]
-
-    return {
-        "keyword": keyword,
-        "market": market,
-        "total": total,
-        "page": page_no,
-        "page_size": page_size,
-        "count": len(stocks),
-        "stocks": stocks,
-    }
-
-
 def get_screener_presets() -> Dict[str, Any]:
     """
     获取选股器支持的所有筛选条件分类和示例（与前端 FilterPanel 的 Tab 结构一致）。
@@ -1303,60 +1224,6 @@ def get_screener_presets() -> Dict[str, Any]:
 # ══════════════════════════════════════════════════════════════
 
 SCREENER_TOOLS = [
-    {
-        "fn": screen_stocks,
-        "name": "screen_stocks",
-        "description": (
-            "智能选股：根据自然语言条件筛选A股/港股/美股。"
-            "支持两大类调用方式：\n"
-            "1. keyword 模式：直接传自然语言，如 '市盈率低于20的科技股'\n"
-            "2. filters 模式：传结构化条件字典（参考 get_default_filters）\n"
-            "支持130+筛选维度：基本面(PE/PB/ROE/股息率/净利增长/毛利率等)、"
-            "技术面(均线突破/MACD/KDJ/K线形态等)、资金面(主力资金/量比/换手率/机构持股)、"
-            "行业(27个)/概念(12个)、行情指标(成交额/振幅/涨幅)、"
-            "特殊筛选(新高新低/战胜大盘/连涨连跌/限价/定增/质押/板块标识)、"
-            "筹码(成本/集中度/股东数)、龙虎榜(买卖/净买/机构参与)。"
-            "返回匹配股票列表（代码、名称、价格、涨跌幅、市值等）。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "keyword": {
-                    "type": "string",
-                    "description": (
-                        "自然语言选股条件。多个条件用分号分隔。"
-                        "示例：'市盈率低于20的科技股'、'PE在5到20之间; ROE不低于15%'、"
-                        "'近5日突破60日均线的银行股'。"
-                        "与 filters 参数二选一，keyword 优先。"
-                    ),
-                },
-                "market": {
-                    "type": "string",
-                    "description": "市场筛选",
-                    "default": "全部",
-                    "enum": ["全部", "A股", "沪深300", "中证500", "科创板", "创业板", "港股", "美股", "ETF基金"],
-                },
-                "filters": {
-                    "type": "object",
-                    "description": (
-                        "结构化筛选条件字典（可选）。格式参考 get_default_filters() 返回值。"
-                        "传入后内部自动拼接为自然语言关键词。与 keyword 二选一。"
-                    ),
-                },
-                "page_size": {
-                    "type": "integer",
-                    "description": "返回数量，默认50，最大200",
-                    "default": 50,
-                },
-                "page_no": {
-                    "type": "integer",
-                    "description": "页码，默认1",
-                    "default": 1,
-                },
-            },
-            "required": [],
-        },
-    },
     {
         "fn": get_screener_presets,
         "name": "get_screener_presets",
@@ -1696,6 +1563,37 @@ def get_concept_fund_flow(date: str = "") -> Dict[str, Any]:
 
 # ── 综合选股 ─────────────────────────────────────────────────
 
+def _eastmoney_screen(keyword: str, market: str = "全部", filters: Optional[Dict[str, Any]] = None,
+                      page_size: int = 50, page_no: int = 1) -> Dict[str, Any]:
+    """内部函数：调东财 API 选股（替代已删除的 screen_stocks）。"""
+    if filters:
+        keyword = build_keyword_from_filters(filters)
+        if market == "全部" and filters.get("_market"):
+            market = filters["_market"]
+
+    if not keyword or not keyword.strip():
+        return {"error": "选股条件不能为空", "retriable": False}
+
+    search_keyword = keyword.strip()
+    if market and market != "全部" and market in MARKET_FILTER_MAP:
+        search_keyword = f"{market} {search_keyword}"
+
+    page_size = min(max(page_size, 1), 200)
+    raw = _call_eastmoney_api(search_keyword, page_size=page_size, page_no=page_no)
+
+    if str(raw.get("code")) != "100":
+        return {"error": raw.get("msg", "选股搜索失败"), "retriable": True}
+
+    data = raw.get("data", {})
+    result = data.get("result", {})
+    stocks_raw = result.get("dataList", [])
+    total = result.get("total", len(stocks_raw))
+    stocks = [_parse_stock_item(s) for s in stocks_raw]
+
+    return {"keyword": keyword, "market": market, "total": total,
+            "page": page_no, "page_size": page_size, "count": len(stocks), "stocks": stocks}
+
+
 def smart_screen(
     mode: str = "eastmoney",
     keyword: str = "",
@@ -1717,7 +1615,7 @@ def smart_screen(
 
     try:
         if mode == "eastmoney":
-            return screen_stocks(keyword=keyword, market=market, filters=filters, page_size=top_n)
+            return _eastmoney_screen(keyword=keyword, market=market, filters=filters, page_size=top_n)
 
         elif mode == "zt_pool":
             data = _em_search("涨停", 100)
@@ -1760,7 +1658,7 @@ def smart_screen(
             result["date"] = _today_str()
 
         elif mode == "combine":
-            base = screen_stocks(keyword=keyword, market=market, filters=filters, page_size=top_n)
+            base = _eastmoney_screen(keyword=keyword, market=market, filters=filters, page_size=top_n)
             if "error" in base:
                 return base
             result["stocks"] = base.get("stocks", [])
