@@ -1035,56 +1035,6 @@ WORKSPACE_TOOLS = [
         "parameters": {"type": "object", "properties": {}},
     },
     {
-        "fn": workspace_write_file,
-        "name": "write_file",
-        "description": "向工作区写入文件（CSV、JSON、TXT等）。路径必须相对，自动创建父目录。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "相对路径，如 data/prices.csv"},
-                "content": {"type": "string", "description": "文件内容"},
-            },
-            "required": ["path", "content"],
-        },
-    },
-    {
-        "fn": workspace_read_file,
-        "name": "read_file",
-        "description": "读取工作区中的文件。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "相对路径"},
-                "max_chars": {"type": "integer", "description": "最大返回字符数", "default": 100000},
-            },
-            "required": ["path"],
-        },
-    },
-    {
-        "fn": workspace_exec_script,
-        "name": "exec_script",
-        "description": (
-            "在工作区执行 Python 脚本（增强版）。"
-            "\n\n与 python_exec 的区别："
-            "\n- 工作目录=工作区，可自由读写文件"
-            "\n- 自动注入 get_kline/get_ticker/get_stock_info（DataSourceFactory）"
-            "\n- 自动注入 WORKSPACE/SCRIPTS_DIR/DATA_DIR/OUTPUT_DIR/Path/pd/np"
-            "\n- 流式输出（实时查看执行进度）"
-            "\n- 超时上限 600 秒"
-            "\n\n适用：复杂分析、多步数据管道、需要文件I/O的场景。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "已保存脚本名（与 code 二选一）"},
-                "code": {"type": "string", "description": "直接执行的代码"},
-                "timeout": {"type": "integer", "description": "超时秒数（默认120，最大600）", "default": 120},
-                "save_as": {"type": "string", "description": "执行前自动保存为该文件名（可选，带版本号）"},
-            },
-            "required": [],
-        },
-    },
-    {
         "fn": run_background,
         "name": "run_background",
         "description": (

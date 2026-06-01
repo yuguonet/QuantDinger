@@ -1,13 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 /api/agent/* — AI Agent 聊天 & 流式接口
-v3 — 真正的 ReAct Tool-Calling Agent，基于 app/agent 模块。
-
-对标 daily_stock_analysis 的 Agent 架构：
-- OpenAI 原生 function calling（非文本模拟）
-- 多步 ReAct 循环（可配置 max_steps）
-- 工具并行执行
-- SSE 流式进度推送
+smolagents 内核 — CodeAgent + Planning + Managed Agents + Hub/MCP Tools
 """
 import os
 import json
@@ -15,20 +9,21 @@ import logging
 import uuid
 import threading
 import queue
-import time
-from typing import Any, Dict, List, Optional
+import tempfile
+from typing import Any, Dict, Optional
+from pathlib import Path
 
-from flask import Blueprint, request, jsonify, Response
+from flask import Blueprint, request, jsonify, Response, send_file
 from app.utils.auth import login_required
 
-# ── 输入限制 ────────────────────────────────────────────────
 MAX_MESSAGE_LENGTH = int(os.getenv("AGENT_MAX_MESSAGE_LENGTH", "4000"))
+AGENT_SAVE_DIR = os.getenv("AGENT_SAVE_DIR", os.path.join(tempfile.gettempdir(), "qd_agents"))
 
 logger = logging.getLogger(__name__)
 
-# ── 策略加载（基于指标IDE，轻量返回指标列表）────────────────
+
+# ── 策略加载 ─────────────────────────────────────────────────
 def _load_strategies(user_id: int = 1):
-    """从用户指标中加载策略列表（轻量，不跑沙箱）。"""
     try:
         from app.utils.db import get_db_connection
         with get_db_connection() as conn:
@@ -60,18 +55,13 @@ def _load_strategies(user_id: int = 1):
 # ── Blueprint ─────────────────────────────────────────────────
 agent_bp = Blueprint("agent", __name__, url_prefix="/api/agent")
 
-# ── 工具中文名映射（单一数据源）──────────────────────────────
-from app.agent.tools.labels import TOOL_DISPLAY_NAMES
 
+# ── 共享工具 ─────────────────────────────────────────────────
+from app.agent.utils import detect_market as _detect_market
+from app.agent.session_store import get_session_store
 
-# ── 共享市场检测 ─────────────────────────────────────────────
-from app.data_sources.market_detector import detect_market as _detect_market
-
-
-# ── 股票代码提取 ─────────────────────────────────────────────
 
 def _extract_stock_code(msg: str, ctx: Optional[Dict], session: Dict) -> Optional[str]:
-    """从上下文、消息中提取股票代码。"""
     import re
     if ctx and ctx.get("stock_code"):
         return ctx["stock_code"]
@@ -80,9 +70,6 @@ def _extract_stock_code(msg: str, ctx: Optional[Dict], session: Dict) -> Optiona
         return m.group(1)
     return session.get("stock_code")
 
-
-# ── 会话存储（Redis / 内存自动降级）──────────────────────────
-from app.agent.core.session_store import get_session_store
 
 MAX_HISTORY_TURNS = 20
 
@@ -96,28 +83,20 @@ def _get_session(session_id: str) -> Dict:
 
 
 def _touch_session(session_id: str, **fields):
-    store = get_session_store()
-    store.update_session(session_id, **fields)
+    get_session_store().update_session(session_id, **fields)
 
-
-# ── 预取数据（避免 Agent 重复调用工具）────────────────────────
 
 def _prefetch_context(stock_code: str, market: str) -> Dict[str, Any]:
-    """预先获取行情 + 筹码数据，注入 Agent 上下文避免重复工具调用。"""
     context = {}
     try:
         from app.data_sources.factory import DataSourceFactory
         ds = DataSourceFactory.get_source(market)
-
-        # 实时行情
         try:
             ticker = ds.get_ticker(stock_code)
             if isinstance(ticker, dict) and "error" not in ticker:
                 context["realtime_quote"] = ticker
         except Exception:
             pass
-
-        # 筹码分布（仅A股）
         if market == "CNStock" and hasattr(ds, "get_chip_distribution"):
             try:
                 chip = ds.get_chip_distribution(stock_code)
@@ -127,213 +106,163 @@ def _prefetch_context(stock_code: str, market: str) -> Dict[str, Any]:
                 pass
     except Exception as e:
         logger.debug("Prefetch failed for %s: %s", stock_code, e)
-
     return context
 
 
-# ── 路由 ──────────────────────────────────────────────────────
+def _build_context(data: Dict, session: Dict, message: str) -> tuple:
+    session_id = data.get("session_id") or str(uuid.uuid4())
+    context = data.get("context") or {}
+    stock_code = _extract_stock_code(message, context, session)
+    if stock_code:
+        market = _detect_market(stock_code)
+        prefetch = _prefetch_context(stock_code, market)
+        context.update(prefetch)
+        context["stock_code"] = stock_code
+        _touch_session(session_id, stock_code=stock_code)
+    return session_id, context, stock_code
+
+
+def _build_executor(skills, user_id):
+    from app.agent.agent import build_agent_executor
+    return build_agent_executor(
+        skills=skills,
+        user_id=user_id,
+        max_steps=int(os.getenv("AGENT_MAX_STEPS", "10")),
+        timeout_seconds=float(os.getenv("AGENT_TIMEOUT_SECONDS", "180")),
+    )
+
+
+def _parse_request(data: Dict) -> tuple:
+    message = data.get("message")
+    if not message or not isinstance(message, str):
+        return None, None, None, "Message is required and must be a string"
+    if len(message) > MAX_MESSAGE_LENGTH:
+        return None, None, None, f"Message too long (max {MAX_MESSAGE_LENGTH})"
+    session_id = data.get("session_id") or str(uuid.uuid4())
+    skills = data.get("skills")
+    if not skills:
+        strategy_id = data.get("strategy_id")
+        if strategy_id is not None:
+            skills = [str(strategy_id)]
+    return message, skills, session_id, None
+
+
+# ═══════════════════════════════════════════════════════════════
+# 路由: 策略列表
+# ═══════════════════════════════════════════════════════════════
 
 @agent_bp.route("/strategies", methods=["GET"])
 @login_required
 def get_strategies():
-    """获取可用 Agent 策略（用户指标列表，与指标IDE共用）。"""
     try:
         if os.getenv("AGENT_MODE", "true").lower() != "true":
             return jsonify({"error": "Agent mode is not enabled"}), 400
-
         from flask import g
-        user_id = g.user_id
-
-        strategies = _load_strategies(user_id=user_id)
-        result = [
-            {
-                "id": s["id"],
-                "name": s["name"],
-                "description": s.get("description", ""),
-                "category": s.get("category", "indicator"),
-            }
-            for s in strategies
-        ]
-        return jsonify({"strategies": result})
+        strategies = _load_strategies(user_id=g.user_id)
+        return jsonify({
+            "strategies": [
+                {"id": s["id"], "name": s["name"],
+                 "description": s.get("description", ""),
+                 "category": s.get("category", "indicator")}
+                for s in strategies
+            ]
+        })
     except Exception as e:
         logger.error("Get strategies failed: %s", e, exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 
+# ═══════════════════════════════════════════════════════════════
+# 路由: 同步聊天
+# ═══════════════════════════════════════════════════════════════
+
 @agent_bp.route("/chat", methods=["POST"])
 @login_required
 def agent_chat():
-    """普通聊天接口（同步，阻塞等待结果）。"""
     try:
         if os.getenv("AGENT_MODE", "true").lower() != "true":
             return jsonify({"error": "Agent mode is not enabled"}), 400
-
         data = request.get_json()
         if not data:
             return jsonify({"error": "Request body must be JSON"}), 400
 
-        message = data.get("message")
-        if not message:
-            return jsonify({"error": "Message is required"}), 400
-        if not isinstance(message, str):
-            return jsonify({"error": "Message must be a string"}), 400
-        if len(message) > MAX_MESSAGE_LENGTH:
-            return jsonify({"error": f"Message too long (max {MAX_MESSAGE_LENGTH} characters)"}), 400
+        message, skills, session_id, err = _parse_request(data)
+        if err:
+            return jsonify({"error": err}), 400
 
-        session_id = data.get("session_id") or str(uuid.uuid4())
-        if not isinstance(session_id, str) or len(session_id) > 128:
-            return jsonify({"error": "Invalid session_id"}), 400
-        skills = data.get("skills")
-        # 兼容前端 strategy_id 参数（指标ID）
-        if not skills:
-            strategy_id = data.get("strategy_id")
-            if strategy_id is not None:
-                skills = [str(strategy_id)]
-        if skills is not None and not isinstance(skills, (list, str)):
-            return jsonify({"error": "skills must be a list or string"}), 400
-        context = data.get("context")
-        if context is not None and not isinstance(context, dict):
-            return jsonify({"error": "context must be a dict"}), 400
-
-        # Build executor via factory
-        from app.agent.core.factory import build_agent_executor
         from flask import g
-        user_id = g.user_id
-
-        executor = build_agent_executor(
-            skills=skills,
-            user_id=user_id,
-            max_steps=int(os.getenv("AGENT_MAX_STEPS", "10")),
-            timeout_seconds=float(os.getenv("AGENT_TIMEOUT_SECONDS", "180")),
-        )
-
-        # Extract stock code and prefetch
         session = _get_session(session_id)
-        stock_code = _extract_stock_code(message, context, session)
-        if stock_code:
-            market = _detect_market(stock_code)
-            prefetch = _prefetch_context(stock_code, market)
-            if context:
-                context.update(prefetch)
-            else:
-                context = prefetch
-            context["stock_code"] = stock_code
-            _touch_session(session_id, stock_code=stock_code)
+        session_id, context, _ = _build_context(data, session, message)
 
+        executor = _build_executor(skills, g.user_id)
         result = executor.chat(
-            message=message,
-            session_id=session_id,
-            context=context,
-            user_id=user_id,
+            message=message, session_id=session_id,
+            context=context, user_id=g.user_id,
         )
 
         return jsonify({
-            "success": result.success,
-            "content": result.content,
-            "session_id": session_id,
-            "error": result.error,
-            "total_steps": result.total_steps,
-            "total_tokens": result.total_tokens,
-            "model": result.model,
-            "tool_calls_log": result.tool_calls_log,
+            "success": result.success, "content": result.content,
+            "session_id": session_id, "error": result.error,
+            "total_steps": result.total_steps, "total_tokens": result.total_tokens,
+            "model": result.model, "tool_calls_log": result.tool_calls_log,
         })
     except Exception as e:
         logger.error("Agent chat failed: %s", e, exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 
+# ═══════════════════════════════════════════════════════════════
+# 路由: 流式聊天 (SSE)
+# ═══════════════════════════════════════════════════════════════
+
 @agent_bp.route("/chat/stream", methods=["POST"])
 @login_required
 def agent_chat_stream():
-    """流式聊天（SSE），实时推送工具调用进度。"""
     try:
         if os.getenv("AGENT_MODE", "true").lower() != "true":
             return jsonify({"error": "Agent mode is not enabled"}), 400
-
         data = request.get_json()
         if not data:
             return jsonify({"error": "Request body must be JSON"}), 400
 
-        message = data.get("message")
-        if not message:
-            return jsonify({"error": "Message is required"}), 400
-        if not isinstance(message, str):
-            return jsonify({"error": "Message must be a string"}), 400
-        if len(message) > MAX_MESSAGE_LENGTH:
-            return jsonify({"error": f"Message too long (max {MAX_MESSAGE_LENGTH} characters)"}), 400
+        message, skills, session_id, err = _parse_request(data)
+        if err:
+            return jsonify({"error": err}), 400
 
-        session_id = data.get("session_id") or str(uuid.uuid4())
-        if not isinstance(session_id, str) or len(session_id) > 128:
-            return jsonify({"error": "Invalid session_id"}), 400
-        skills = data.get("skills")
-        # 兼容前端 strategy_id 参数（指标ID）
-        if not skills:
-            strategy_id = data.get("strategy_id")
-            if strategy_id is not None:
-                skills = [str(strategy_id)]
-        if skills is not None and not isinstance(skills, (list, str)):
-            return jsonify({"error": "skills must be a list or string"}), 400
-        context = data.get("context")
-        if context is not None and not isinstance(context, dict):
-            return jsonify({"error": "context must be a dict"}), 400
-
-        event_queue: queue.Queue = queue.Queue()
-
-        # Capture user_id for the background thread (request context not available)
         from flask import g
         user_id = g.user_id
-
-        def _cb(event: dict):
-            if event.get("type") in ("tool_start", "tool_done", "tool_stream", "tool_info"):
-                tool = event.get("tool", "")
-                event["display_name"] = TOOL_DISPLAY_NAMES.get(tool, tool)
-            event_queue.put(event)
-
-        def _run():
-            try:
-                from app.agent.core.factory import build_agent_executor
-
-                # Extract stock code and prefetch
-                session = _get_session(session_id)
-                stock_code = _extract_stock_code(message, context, session)
-                enriched_ctx = dict(context) if context else {}
-                if stock_code:
-                    market = _detect_market(stock_code)
-                    prefetch = _prefetch_context(stock_code, market)
-                    enriched_ctx.update(prefetch)
-                    enriched_ctx["stock_code"] = stock_code
-                    _touch_session(session_id, stock_code=stock_code)
-
-                executor = build_agent_executor(
-                    skills=skills,
-                    user_id=user_id,
-                    max_steps=int(os.getenv("AGENT_MAX_STEPS", "10")),
-                    timeout_seconds=float(os.getenv("AGENT_TIMEOUT_SECONDS", "180")),
-                )
-                r = executor.chat(
-                    message=message,
-                    session_id=session_id,
-                    context=enriched_ctx,
-                    progress_callback=_cb,
-                    user_id=user_id,
-                )
-                event_queue.put({
-                    "type": "done",
-                    "success": r.success,
-                    "content": r.content,
-                    "error": r.error,
-                    "total_steps": r.total_steps,
-                    "total_tokens": r.total_tokens,
-                    "model": r.model,
-                    "session_id": session_id,
-                })
-            except Exception as exc:
-                logger.error("Agent stream error: %s", exc, exc_info=True)
-                event_queue.put({"type": "error", "message": str(exc)})
+        session = _get_session(session_id)
+        session_id, context, _ = _build_context(data, session, message)
 
         def _sse():
+            event_queue: queue.Queue = queue.Queue()
+
+            def _run():
+                try:
+                    executor = _build_executor(skills, user_id)
+                    # Register for interrupt support
+                    from app.agent.agent import get_smolagent as _get_agent
+                    _agent = _get_agent(
+                        skills=skills, user_id=user_id,
+                        max_steps=int(os.getenv("AGENT_MAX_STEPS", "10")),
+                        user_message=message,
+                    )
+                    register_interrupt(session_id, _agent)
+                    try:
+                        for ev in executor.chat_stream(
+                            message=message, session_id=session_id,
+                            context=context, user_id=user_id,
+                        ):
+                            event_queue.put(ev)
+                    finally:
+                        unregister_interrupt(session_id)
+                except Exception as exc:
+                    logger.error("Agent stream error: %s", exc, exc_info=True)
+                    event_queue.put({"type": "error", "message": str(exc)})
+
             t = threading.Thread(target=_run, daemon=True)
             t.start()
+
             while True:
                 try:
                     ev = event_queue.get(timeout=300)
@@ -347,40 +276,37 @@ def agent_chat_stream():
         return Response(
             _sse(),
             mimetype="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-                "Connection": "keep-alive",
-            },
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
         )
     except Exception as e:
         logger.error("Agent stream failed: %s", e, exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 
+# ═══════════════════════════════════════════════════════════════
+# 路由: 会话管理
+# ═══════════════════════════════════════════════════════════════
+
 @agent_bp.route("/chat/sessions", methods=["GET"])
 @login_required
 def list_chat_sessions():
-    """获取会话列表。"""
     limit = int(request.args.get("limit", 50))
-    store = get_session_store()
-    raw = store.list_sessions(limit)
-    sessions = [{
-        "session_id": s["session_id"],
-        "created_at": s.get("created_at"),
-        "updated_at": s.get("updated_at"),
-        "message_count": len(s.get("messages", [])),
-        "stock_code": s.get("stock_code"),
-    } for s in raw]
-    return jsonify({"sessions": sessions})
+    raw = get_session_store().list_sessions(limit)
+    return jsonify({
+        "sessions": [
+            {"session_id": s["session_id"], "created_at": s.get("created_at"),
+             "updated_at": s.get("updated_at"),
+             "message_count": len(s.get("messages", [])),
+             "stock_code": s.get("stock_code")}
+            for s in raw
+        ]
+    })
 
 
 @agent_bp.route("/chat/sessions/<session_id>", methods=["GET"])
 @login_required
 def get_chat_session_messages(session_id: str):
-    """获取会话消息。"""
-    store = get_session_store()
-    session = store.get_session(session_id)
+    session = get_session_store().get_session(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
     return jsonify({
@@ -393,8 +319,253 @@ def get_chat_session_messages(session_id: str):
 @agent_bp.route("/chat/sessions/<session_id>", methods=["DELETE"])
 @login_required
 def delete_chat_session(session_id: str):
-    """删除会话。"""
     store = get_session_store()
     store.clear_history(session_id)
     deleted = store.delete_session(session_id)
     return jsonify({"deleted": 1 if deleted else 0})
+
+
+# ═══════════════════════════════════════════════════════════════
+# 路由: Agent 可视化 (visualize)
+# ═══════════════════════════════════════════════════════════════
+
+@agent_bp.route("/visualize", methods=["GET"])
+@login_required
+def visualize_agent():
+    """返回 Agent 结构树（工具列表、managed agents、配置）。
+
+    Query params:
+        skills: comma-separated indicator IDs
+    """
+    try:
+        from flask import g
+        skills_raw = request.args.get("skills", "")
+        skills = [s.strip() for s in skills_raw.split(",") if s.strip()] or None
+
+        from app.agent.agent import get_smolagent
+        agent = get_smolagent(skills=skills, user_id=g.user_id)
+
+        # Collect agent structure
+        tools_info = []
+        for name, tool in agent.tools.items():
+            tools_info.append({
+                "name": name,
+                "description": tool.description[:200],
+                "inputs": tool.inputs,
+                "output_type": tool.output_type,
+            })
+
+        managed_info = []
+        for name, ma in agent.managed_agents.items():
+            managed_info.append({
+                "name": name,
+                "description": ma.description,
+                "tools": list(ma.tools.keys()) if hasattr(ma, "tools") else [],
+            })
+
+        return jsonify({
+            "agent_type": type(agent).__name__,
+            "model": str(getattr(agent.model, "model_id", "")),
+            "max_steps": agent.max_steps,
+            "planning_interval": agent.planning_interval,
+            "tools_count": len(tools_info),
+            "tools": tools_info,
+            "managed_agents": managed_info,
+            "instructions_preview": (agent.instructions or "")[:500],
+        })
+    except Exception as e:
+        logger.error("Visualize failed: %s", e, exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+# ═══════════════════════════════════════════════════════════════
+# 路由: Agent 保存 (save)
+# ═══════════════════════════════════════════════════════════════
+
+@agent_bp.route("/save", methods=["POST"])
+@login_required
+def save_agent():
+    """保存当前 Agent 配置到磁盘（可复现部署）。
+
+    Body:
+        name (str): Agent 保存名称
+        skills (list[str]): 指标 ID 列表
+    """
+    try:
+        from flask import g
+        data = request.get_json() or {}
+        name = data.get("name", f"agent_{uuid.uuid4().hex[:8]}")
+        skills = data.get("skills")
+
+        from app.agent.agent import get_smolagent
+        agent = get_smolagent(skills=skills, user_id=g.user_id)
+
+        save_dir = os.path.join(AGENT_SAVE_DIR, name)
+        os.makedirs(save_dir, exist_ok=True)
+
+        agent.save(save_dir)
+
+        return jsonify({
+            "success": True,
+            "path": save_dir,
+            "files": os.listdir(save_dir),
+        })
+    except Exception as e:
+        logger.error("Save agent failed: %s", e, exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@agent_bp.route("/saved", methods=["GET"])
+@login_required
+def list_saved_agents():
+    """列出已保存的 Agent。"""
+    try:
+        if not os.path.exists(AGENT_SAVE_DIR):
+            return jsonify({"agents": []})
+        agents = []
+        for name in sorted(os.listdir(AGENT_SAVE_DIR)):
+            agent_dir = os.path.join(AGENT_SAVE_DIR, name)
+            if os.path.isdir(agent_dir):
+                meta = {}
+                agent_json = os.path.join(agent_dir, "agent.json")
+                if os.path.exists(agent_json):
+                    with open(agent_json) as f:
+                        meta = json.load(f)
+                agents.append({
+                    "name": name,
+                    "path": agent_dir,
+                    "tools_count": len(meta.get("tools", [])),
+                    "class": meta.get("class", ""),
+                    "model": meta.get("model", {}).get("data", {}).get("model_id", ""),
+                })
+        return jsonify({"agents": agents})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ═══════════════════════════════════════════════════════════════
+# 路由: Agent 回放 (replay)
+# ═══════════════════════════════════════════════════════════════
+
+@agent_bp.route("/replay/<session_id>", methods=["GET"])
+@login_required
+def replay_session(session_id: str):
+    """回放指定会话的 Agent 执行过程。
+
+    Query params:
+        detailed (bool): 是否包含每步的完整内存状态
+    """
+    try:
+        detailed = request.args.get("detailed", "false").lower() == "true"
+        store = get_session_store()
+        session = store.get_session(session_id)
+        if not session:
+            return jsonify({"error": "Session not found"}), 404
+
+        messages = session.get("messages", [])
+
+        replay = []
+        for i, msg in enumerate(messages):
+            entry = {
+                "step": i,
+                "role": msg.get("role"),
+                "content": msg.get("content", "")[:2000] if not detailed else msg.get("content", ""),
+            }
+            if detailed and msg.get("tool_calls"):
+                entry["tool_calls"] = msg["tool_calls"]
+            replay.append(entry)
+
+        return jsonify({
+            "session_id": session_id,
+            "stock_code": session.get("stock_code"),
+            "total_steps": len(replay),
+            "replay": replay,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ═══════════════════════════════════════════════════════════════
+# 路由: Agent 中断 (interrupt)
+# ═══════════════════════════════════════════════════════════════
+
+# Global interrupt registry: session_id → agent instance
+_interrupt_registry: Dict[str, Any] = {}
+_interrupt_lock = threading.Lock()
+
+
+def register_interrupt(session_id: str, agent):
+    with _interrupt_lock:
+        _interrupt_registry[session_id] = agent
+
+
+def unregister_interrupt(session_id: str):
+    with _interrupt_lock:
+        _interrupt_registry.pop(session_id, None)
+
+
+@agent_bp.route("/interrupt/<session_id>", methods=["POST"])
+@login_required
+def interrupt_agent(session_id: str):
+    """中断正在运行的 Agent。"""
+    with _interrupt_lock:
+        agent = _interrupt_registry.get(session_id)
+    if agent:
+        agent.interrupt()
+        return jsonify({"success": True, "message": "Agent interrupt signal sent"})
+    return jsonify({"success": False, "message": "No running agent found for this session"})
+
+
+# ═══════════════════════════════════════════════════════════════
+# 路由: 工具列表 (含 Hub/MCP 来源标记)
+# ═══════════════════════════════════════════════════════════════
+
+@agent_bp.route("/tools", methods=["GET"])
+@login_required
+def list_tools():
+    """列出所有可用工具（含来源分类）。"""
+    try:
+        from app.agent.tool_adapter import build_all_tools
+        tools = build_all_tools()
+
+        qd_tools = []
+        builtin_tools = []
+        hub_tools = []
+        mcp_tools = []
+
+        qd_names = set()
+        from app.agent.tools.data_tools import DATA_TOOLS
+        from app.agent.tools.analysis_tools import ANALYSIS_TOOLS
+        from app.agent.tools.search_tools import SEARCH_TOOLS
+        from app.agent.tools.market_tools import MARKET_TOOLS
+        from app.agent.tools.stock_screener_tools import SCREENER_TOOLS
+        from app.agent.tools.backtest_tools import BACKTEST_TOOLS
+        from app.agent.tools.indicator_tools import INDICATOR_TOOLS
+        from app.agent.tools.trading_tools import TRADING_TOOLS
+        from app.agent.tools.screening_tools import SCREENING_TOOLS
+        from app.agent.tools.code_workspace_tools import WORKSPACE_TOOLS
+
+        for lst in [DATA_TOOLS, ANALYSIS_TOOLS, SEARCH_TOOLS, MARKET_TOOLS,
+                    SCREENER_TOOLS, BACKTEST_TOOLS, INDICATOR_TOOLS, TRADING_TOOLS,
+                    SCREENING_TOOLS, WORKSPACE_TOOLS]:
+            for spec in lst:
+                qd_names.add(spec["name"])
+
+        for t in tools:
+            info = {"name": t.name, "description": t.description[:150]}
+            if t.name in qd_names:
+                qd_tools.append(info)
+            elif t.name in {"duckduckgo_search", "google_search", "web_search",
+                            "visit_webpage", "wikipedia_search", "user_input"}:
+                builtin_tools.append(info)
+            else:
+                hub_tools.append(info)
+
+        return jsonify({
+            "total": len(tools),
+            "quantdinger": qd_tools,
+            "builtin": builtin_tools,
+            "hub_mcp": hub_tools,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500

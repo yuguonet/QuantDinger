@@ -1710,7 +1710,143 @@ def smart_screen(
         return {"error": str(e), "retriable": True}
 # ══════════════════════════════════════════════════════════════
 
+def screen_stocks(
+    conditions: Optional[Dict[str, Any]] = None,
+    market: str = "CNStock",
+    limit: int = 50,
+    date: str = "",
+) -> Dict[str, Any]:
+    """根据条件从全市场筛选股票（初选）。
+
+    查询 cnstock_selection 表，支持按行业、概念、涨跌幅、换手率等条件过滤。
+    返回候选股票列表。
+
+    Args:
+        conditions: 筛选条件字典，可选键：
+            - industry (str): 行业名称
+            - concept (str): 概念关键词
+            - min_change_rate (float): 最低涨跌幅 %
+            - max_change_rate (float): 最高涨跌幅 %
+            - min_turnover (float): 最低换手率 %
+            - min_volume_ratio (float): 最低量比
+        market: 市场，默认 CNStock
+        limit: 返回数量上限，默认 50
+        date: 交易日期（YYYY-MM-DD），空则取最新
+    """
+    from app.utils.db import get_db_connection
+
+    conditions = conditions or {}
+    limit = min(max(limit, 1), 200)
+
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+
+            # 确定日期
+            if date:
+                target_date = date
+            else:
+                cur.execute("SELECT MAX(date) AS d FROM cnstock_selection")
+                row = cur.fetchone() or {}
+                target_date = str(row.get("d") or "")
+                if not target_date:
+                    return {"stocks": [], "count": 0, "message": "选股数据为空，请先同步数据"}
+
+            # 构建 WHERE 子句（列名容错：cnstock_selection 表结构由同步服务动态创建）
+            where_parts = ["date = %s"]
+            params: list = [target_date]
+
+            # 可选条件：列不存在时静默跳过
+            _optional_conditions = [
+                ("industry", "ILIKE", "LIKE"),
+                ("concept", "ILIKE", "LIKE"),
+            ]
+            for col, pg_op, fallback_op in _optional_conditions:
+                val = conditions.get(col)
+                if val:
+                    where_parts.append(f"{col} {pg_op} %s")
+                    params.append(f"%{val}%")
+
+            _numeric_conditions = [
+                ("min_change_rate", "change_rate", ">="),
+                ("max_change_rate", "change_rate", "<="),
+                ("min_turnover", "turnover_rate", ">="),
+                ("min_volume_ratio", "volume_ratio", ">="),
+            ]
+            for param_key, col, op in _numeric_conditions:
+                val = conditions.get(param_key)
+                if val is not None:
+                    try:
+                        where_parts.append(f"{col} {op} %s")
+                        params.append(float(val))
+                    except (ValueError, TypeError):
+                        pass
+
+            where_sql = " AND ".join(where_parts)
+            params.append(limit)
+
+            # 用 SELECT * 避免列名假设，结果按字典键取值
+            cur.execute(
+                f"SELECT * FROM cnstock_selection "
+                f"WHERE {where_sql} ORDER BY id DESC LIMIT %s",
+                tuple(params),
+            )
+            rows = cur.fetchall() or []
+            cur.close()
+
+        stocks = []
+        for r in rows:
+            d = dict(r)
+            # 安全转换数值字段（列可能不存在）
+            for k in ("change_rate", "turnover_rate", "volume_ratio", "new_price",
+                       "close", "open", "high", "low", "volume"):
+                if d.get(k) is not None:
+                    try:
+                        d[k] = float(d[k])
+                    except (ValueError, TypeError):
+                        pass
+            # 只保留需要的字段，去掉内部字段
+            stock = {}
+            for k in ("code", "name", "industry", "concept", "change_rate",
+                       "turnover_rate", "volume_ratio", "new_price", "close",
+                       "open", "high", "low", "volume", "market"):
+                if k in d:
+                    stock[k] = d[k]
+            stocks.append(stock)
+
+        return {
+            "date": target_date,
+            "stocks": stocks,
+            "count": len(stocks),
+        }
+    except Exception as e:
+        logger.error("screen_stocks failed: %s", e, exc_info=True)
+        return {"stocks": [], "count": 0, "error": str(e)}
+
+
+
 BACKEND_DATA_TOOLS = [
+    {
+        "fn": screen_stocks,
+        "name": "screen_stocks",
+        "description": (
+            "根据条件从全市场筛选股票（初选）。"
+            "查询 cnstock_selection 表，支持按行业、概念、涨跌幅、换手率等条件过滤。"
+            "返回候选股票列表。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "conditions": {
+                    "type": "object",
+                    "description": "筛选条件字典，可选键：industry(行业), concept(概念), min_change_rate(最低涨跌幅), max_change_rate(最高涨跌幅), min_turnover(最低换手率), min_volume_ratio(最低量比)",
+                },
+                "market": {"type": "string", "description": "市场，默认 CNStock", "default": "CNStock"},
+                "limit": {"type": "integer", "description": "返回数量上限，默认 50", "default": 50},
+                "date": {"type": "string", "description": "交易日期 YYYY-MM-DD，空则取最新"},
+            },
+        },
+    },
     {
         "fn": get_dragon_tiger_stocks,
         "name": "get_dragon_tiger_stocks",
