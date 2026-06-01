@@ -10,25 +10,30 @@
         </a-tag>
       </div>
       <div class="header-right">
-        <!-- 策略选择下拉菜单 -->
+        <!-- 指标策略选择下拉（与指标IDE共用） -->
         <!-- eslint-disable-next-line vue/no-v-model-argument -->
         <a-select
           v-model:value="selectedStrategy"
-          placeholder="选择策略"
-          style="width: 160px"
+          placeholder="选择指标策略"
+          style="width: 200px"
           allow-clear
+          show-search
+          option-filter-prop="children"
+          :loading="loadingIndicators"
           @change="onStrategyChange"
         >
-          <a-select-opt-group v-if="groupedStrategies.main.length > 0" label="分析策略">
-            <a-select-option v-for="s in groupedStrategies.main" :key="s.id" :value="s.id">
-              {{ s.name }}
-            </a-select-option>
-          </a-select-opt-group>
-          <a-select-opt-group v-if="groupedStrategies.other.length > 0" label="工具">
-            <a-select-option v-for="s in groupedStrategies.other" :key="s.id" :value="s.id">
-              {{ s.name }}
-            </a-select-option>
-          </a-select-opt-group>
+          <a-select-option
+            v-for="ind in indicators"
+            :key="ind.id"
+            :value="ind.id"
+          >
+            <span>{{ ind.name || ('Indicator #' + ind.id) }}</span>
+            <a-tag
+              v-if="Number(ind.is_buy) === 1"
+              color="purple"
+              style="margin-left: 6px; font-size: 10px; line-height: 16px; padding: 0 4px;"
+            >已购</a-tag>
+          </a-select-option>
         </a-select>
 
         <!-- 股票代码快速输入 -->
@@ -91,10 +96,10 @@
             </a-button>
           </div>
           <!-- 策略快捷选择 -->
-          <div v-if="strategies.length > 0" class="strategy-chips">
+          <div v-if="indicators.length > 0" class="strategy-chips">
             <span class="chip-label">策略：</span>
             <a-tag
-              v-for="s in strategies.slice(0, 6)"
+              v-for="s in indicators.slice(0, 6)"
               :key="s.id"
               :color="selectedStrategy === s.id ? 'blue' : 'default'"
               class="strategy-chip"
@@ -188,9 +193,9 @@ import {
   triggerAnalysis,
   getAnalysisTasks,
   createAgentStream,
-  createTaskStream,
-  getStrategies
+  createTaskStream
 } from '@/api/agent'
+import request from '@/utils/request'
 
 export default {
   name: 'AiAgent',
@@ -212,8 +217,9 @@ export default {
     const stockCode = ref('')
     const analyzing = ref(false)
 
-    // 策略
-    const strategies = ref([])
+    // 策略（复用指标IDE的指标列表）
+    const indicators = ref([])
+    const loadingIndicators = ref(false)
     const selectedStrategy = ref(null)
 
     // 任务
@@ -239,41 +245,23 @@ export default {
 
     const currentStrategyInfo = computed(() => {
       if (!selectedStrategy.value) return null
-      return strategies.value.find((s) => s.id === selectedStrategy.value) || null
+      return indicators.value.find((s) => s.id === selectedStrategy.value) || null
     })
 
-    const groupedStrategies = computed(() => {
-      const CATEGORY_MAP = {
-        analyze_trend: 'trend',
-        get_realtime_quote: 'quote',
-        get_daily_history: 'quote',
-        analyze_pattern: 'pattern'
-      }
+    // ── 指标策略（与指标IDE共用）────────────────────────
 
-      const main = []
-      const other = []
-
-      for (const s of strategies.value) {
-        const cat = s.category || CATEGORY_MAP[s.id] || ''
-        if (['trend', 'framework', 'pattern', 'reversal'].includes(cat)) {
-          main.push(s)
-        } else {
-          other.push(s)
-        }
-      }
-
-      return { main, other }
-    })
-
-    // ── 策略 ────────────────────────────────────────────
-
-    async function fetchStrategies () {
+    async function loadIndicators () {
+      loadingIndicators.value = true
       try {
-        const res = await getStrategies()
-        strategies.value = res?.data?.strategies || res?.strategies || []
+        const res = await request({ url: '/api/indicator/getIndicators', method: 'get' })
+        if (res && res.data && Array.isArray(res.data)) {
+          indicators.value = res.data
+        }
       } catch (e) {
-        console.warn('加载策略列表失败:', e)
-        strategies.value = []
+        console.warn('加载指标列表失败:', e)
+        indicators.value = []
+      } finally {
+        loadingIndicators.value = false
       }
     }
 
@@ -492,7 +480,7 @@ export default {
 
     sessionId.value = 'session_' + (crypto.randomUUID?.() || Date.now().toString(36) + Math.random().toString(36).slice(2))
     initTaskStream()
-    fetchStrategies()
+    loadIndicators()
 
     onBeforeUnmount(() => {
       streamController.value?.close()
@@ -507,7 +495,8 @@ export default {
       connected,
       stockCode,
       analyzing,
-      strategies,
+      indicators,
+      loadingIndicators,
       selectedStrategy,
       showTaskDrawer,
       taskLoading,
@@ -515,7 +504,6 @@ export default {
       quickActions,
       chatContainerRef,
       currentStrategyInfo,
-      groupedStrategies,
       selectStrategy,
       onStrategyChange,
       clearStrategy,

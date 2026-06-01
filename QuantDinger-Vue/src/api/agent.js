@@ -6,7 +6,7 @@ import request from '@/utils/request'
 // ── 策略 ──────────────────────────────────────────────────
 
 /**
- * 获取可用策略列表（从后端 YAML 文件加载）
+ * 获取可用策略列表（从用户指标加载）
  * GET /api/agent/strategies
  * 返回: { strategies: [{ id, name, description, category }] }
  */

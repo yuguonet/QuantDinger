@@ -4,6 +4,8 @@ Agent Factory — builds configured AgentExecutor instances.
 
 Centralises construction: ToolRegistry (cached), LLM adapter wiring,
 skill/strategy injection.
+
+策略来源：指标IDE（IndicatorAnalyzer 沙箱分析 + 真实K线数据）。
 """
 from __future__ import annotations
 
@@ -28,7 +30,6 @@ logger = logging.getLogger(__name__)
 # ── Module-level caches ───────────────────────────────────────
 
 _TOOL_REGISTRY: Optional[ToolRegistry] = None
-_STRATEGIES_CACHE: Optional[List[Dict]] = None
 
 
 def get_tool_registry() -> ToolRegistry:
@@ -55,39 +56,44 @@ def get_tool_registry() -> ToolRegistry:
     return _TOOL_REGISTRY
 
 
-def _get_skill_instructions(skills: Optional[List[str]] = None) -> str:
-    """Load YAML strategy instructions for activated skills."""
+def _get_skill_instructions(
+    skills: Optional[List[str]] = None,
+    user_id: int = 1,
+) -> str:
+    """
+    从指标IDE加载策略指令。
+
+    通过 IndicatorAnalyzer 沙箱运行用户指标（真实K线数据），
+    提取行为统计和回测预览，生成 LLM 可理解的策略上下文。
+
+    Args:
+        skills: 指标 ID 列表（字符串形式），None 则加载用户全部指标
+        user_id: 用户 ID
+    """
     if not skills:
         return ""
 
-    global _STRATEGIES_CACHE
-    if _STRATEGIES_CACHE is None:
+    # skills 可能是指标 ID 列表（字符串形式如 ["1", "2"]）
+    indicator_ids: Optional[List[int]] = None
+    if skills:
         try:
-            from app.services.strategy_loader import load_strategies
-            _STRATEGIES_CACHE = load_strategies()
-        except Exception as e:
-            logger.warning("[AgentFactory] Strategy loader unavailable: %s", e)
-            _STRATEGIES_CACHE = []
+            indicator_ids = [int(s) for s in skills if s.isdigit()]
+        except (ValueError, AttributeError):
+            indicator_ids = None
 
-    sections = []
-    for sid in skills:
-        strat = next((s for s in _STRATEGIES_CACHE if s.get("id") == sid), None)
-        if not strat:
-            continue
-        instructions = strat.get("instructions", "")
-        if not instructions:
-            continue
-        sections.append(
-            f"### 当前激活策略：{strat['name']}（{sid}）\n{instructions}"
-        )
+    if not indicator_ids and skills:
+        # skills 非空但无法解析为 ID，忽略
+        return ""
 
-    if sections:
-        return (
-            "\n## 当前激活的分析策略\n"
-            "用户已选择以下分析策略，请严格按照策略框架执行分析：\n\n"
-            + "\n\n".join(sections)
+    try:
+        from app.services.indicator_analyzer import build_agent_skill_instructions
+        return build_agent_skill_instructions(
+            user_id=user_id,
+            indicator_ids=indicator_ids,
         )
-    return ""
+    except Exception as e:
+        logger.warning("[AgentFactory] IndicatorAnalyzer unavailable: %s", e, exc_info=True)
+        return ""
 
 
 def _build_call_with_tools_fn(llm_service=None) -> Callable:
@@ -111,6 +117,7 @@ def _build_call_with_tools_fn(llm_service=None) -> Callable:
 
 def build_agent_executor(
     skills: Optional[List[str]] = None,
+    user_id: int = 1,
     llm_service=None,
     max_steps: int = 10,
     timeout_seconds: Optional[float] = None,
@@ -118,7 +125,8 @@ def build_agent_executor(
     """Build and return a configured AgentExecutor.
 
     Args:
-        skills: Skill/strategy IDs to activate.
+        skills: 指标 ID 列表（字符串形式）。
+        user_id: 用户 ID，用于加载该用户的指标策略。
         llm_service: Optional LLMService instance (created if None).
         max_steps: Max LLM round-trips.
         timeout_seconds: Overall timeout budget.
@@ -129,7 +137,7 @@ def build_agent_executor(
     from app.agent.executor import AgentExecutor
 
     registry = get_tool_registry()
-    skill_instructions = _get_skill_instructions(skills)
+    skill_instructions = _get_skill_instructions(skills, user_id=user_id)
     call_fn = _build_call_with_tools_fn(llm_service)
 
     return AgentExecutor(

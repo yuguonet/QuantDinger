@@ -19,17 +19,39 @@ import time
 from typing import Any, Dict, List, Optional
 
 from flask import Blueprint, request, jsonify, Response
+from app.utils.auth import login_required
 
 # ── 输入限制 ────────────────────────────────────────────────
 MAX_MESSAGE_LENGTH = int(os.getenv("AGENT_MAX_MESSAGE_LENGTH", "4000"))
 
 logger = logging.getLogger(__name__)
 
-# ── 策略加载 ──────────────────────────────────────────────────
-def _load_strategies():
+# ── 策略加载（基于指标IDE，轻量返回指标列表）────────────────
+def _load_strategies(user_id: int = 1):
+    """从用户指标中加载策略列表（轻量，不跑沙箱）。"""
     try:
-        from app.services.strategy_loader import load_strategies
-        return load_strategies()
+        from app.utils.db import get_db_connection
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, name, description, is_buy, publish_to_community "
+                "FROM qd_indicator_codes "
+                "WHERE user_id = ? OR publish_to_community = 1 "
+                "ORDER BY id DESC",
+                (user_id,),
+            )
+            rows = cur.fetchall() or []
+            cur.close()
+        return [
+            {
+                "id": str(r["id"]),
+                "name": r.get("name") or f"Indicator#{r['id']}",
+                "description": r.get("description") or "",
+                "category": "indicator",
+                "is_purchased": bool(r.get("is_buy")),
+            }
+            for r in rows
+        ]
     except Exception as e:
         logger.warning("策略加载器不可用: %s", e)
         return []
@@ -139,19 +161,23 @@ def _prefetch_context(stock_code: str, market: str) -> Dict[str, Any]:
 # ── 路由 ──────────────────────────────────────────────────────
 
 @agent_bp.route("/strategies", methods=["GET"])
+@login_required
 def get_strategies():
-    """获取可用 Agent 策略。"""
+    """获取可用 Agent 策略（用户指标列表，与指标IDE共用）。"""
     try:
         if os.getenv("AGENT_MODE", "true").lower() != "true":
             return jsonify({"error": "Agent mode is not enabled"}), 400
 
-        strategies = _load_strategies()
+        from flask import g
+        user_id = g.user_id
+
+        strategies = _load_strategies(user_id=user_id)
         result = [
             {
                 "id": s["id"],
                 "name": s["name"],
                 "description": s.get("description", ""),
-                "category": s.get("category", "general"),
+                "category": s.get("category", "indicator"),
             }
             for s in strategies
         ]
@@ -184,6 +210,11 @@ def agent_chat():
         if not isinstance(session_id, str) or len(session_id) > 128:
             return jsonify({"error": "Invalid session_id"}), 400
         skills = data.get("skills")
+        # 兼容前端 strategy_id 参数（指标ID）
+        if not skills:
+            strategy_id = data.get("strategy_id")
+            if strategy_id is not None:
+                skills = [str(strategy_id)]
         if skills is not None and not isinstance(skills, (list, str)):
             return jsonify({"error": "skills must be a list or string"}), 400
         context = data.get("context")
@@ -192,8 +223,12 @@ def agent_chat():
 
         # Build executor via factory
         from app.agent.factory import build_agent_executor
+        from flask import g
+        user_id = getattr(g, "user_id", None) or 1
+
         executor = build_agent_executor(
             skills=skills,
+            user_id=user_id,
             max_steps=int(os.getenv("AGENT_MAX_STEPS", "10")),
             timeout_seconds=float(os.getenv("AGENT_TIMEOUT_SECONDS", "180")),
         )
@@ -255,6 +290,11 @@ def agent_chat_stream():
         if not isinstance(session_id, str) or len(session_id) > 128:
             return jsonify({"error": "Invalid session_id"}), 400
         skills = data.get("skills")
+        # 兼容前端 strategy_id 参数（指标ID）
+        if not skills:
+            strategy_id = data.get("strategy_id")
+            if strategy_id is not None:
+                skills = [str(strategy_id)]
         if skills is not None and not isinstance(skills, (list, str)):
             return jsonify({"error": "skills must be a list or string"}), 400
         context = data.get("context")
@@ -262,6 +302,10 @@ def agent_chat_stream():
             return jsonify({"error": "context must be a dict"}), 400
 
         event_queue: queue.Queue = queue.Queue()
+
+        # Capture user_id for the background thread (request context not available)
+        from flask import g
+        user_id = getattr(g, "user_id", None) or 1
 
         def _cb(event: dict):
             if event.get("type") in ("tool_start", "tool_done"):
@@ -286,6 +330,7 @@ def agent_chat_stream():
 
                 executor = build_agent_executor(
                     skills=skills,
+                    user_id=user_id,
                     max_steps=int(os.getenv("AGENT_MAX_STEPS", "10")),
                     timeout_seconds=float(os.getenv("AGENT_TIMEOUT_SECONDS", "180")),
                 )
