@@ -2,6 +2,8 @@
 // @/api/agent.js — 完整版（含策略接口）
 // ══════════════════════════════════════════════════════════
 import request from '@/utils/request'
+import storage from 'store'
+import { ACCESS_TOKEN } from '@/store/mutation-types'
 
 // ── 策略 ──────────────────────────────────────────────────
 
@@ -57,11 +59,29 @@ export function agentChatStream (data) {
 export function createAgentStream (params, callbacks) {
   const controller = new AbortController()
 
+  // 获取认证 token（与 request.js 保持一致）
+  let token = storage.get(ACCESS_TOKEN)
+  if (token && typeof token === 'object') {
+    token = token.token || token.value || ''
+  }
+  const lang = storage.get('lang') || 'en-US'
+
   fetch('/api/agent/chat/stream', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? {
+        'Authorization': `Bearer ${token}`,
+        'Access-Token': token,
+        'token': token
+      } : {}),
+      'X-App-Lang': lang,
+      'Accept-Language': lang,
+      'Cache-Control': 'no-cache'
+    },
     body: JSON.stringify(params),
-    signal: controller.signal
+    signal: controller.signal,
+    credentials: 'include'
   }).then(async (response) => {
     if (!response.ok) {
       const err = await response.json().catch(() => ({}))
