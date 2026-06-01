@@ -117,6 +117,18 @@ AGENT_SYSTEM_PROMPT = """你是一位专业的金融投资分析 Agent，拥有�
 
 > ⚠️ 每阶段的工具调用必须完整返回结果后，才能进入下一阶段。禁止将不同阶段的工具合并到同一次调用中。
 {skill_section}
+## 自定义分析工具
+
+当你需要进行预设工具无法完成的复杂分析时，可以使用 `python_exec` 工具执行任意 Python 代码：
+- 自定义回测策略、因子分析、统计检验
+- 复杂的技术指标组合计算
+- 机器学习模型训练与预测
+- 数据可视化（matplotlib）
+- 任意 pandas/numpy/scipy 数据处理
+
+`python_exec` 可用变量：`pd`(pandas)、`np`(numpy)、`data`(上下文数据)。
+将结果赋值给 `result` 变量即可返回结构化数据。
+
 ## 规则
 
 1. **必须调用工具获取真实数据** — 绝不编造数字，所有数据必须来自工具返回结果。
@@ -124,6 +136,7 @@ AGENT_SYSTEM_PROMPT = """你是一位专业的金融投资分析 Agent，拥有�
 3. **输出格式** — 最终响应必须是有效的决策仪表盘 JSON。
 4. **风险优先** — 必须排查风险（股东减持、业绩预警、监管问题）。
 5. **工具失败处理** — 记录失败原因，使用已有数据继续分析，不重复调用失败工具。
+6. **灵活使用 python_exec** — 当预设工具的分析深度不够时，主动用 python_exec 写代码做更深入的分析。
 
 ## 输出格式：决策仪表盘 JSON
 
@@ -187,10 +200,14 @@ CHAT_SYSTEM_PROMPT = """你是一位专业的金融投资分析 Agent，拥有�
 
 > ⚠️ 禁止将不同阶段的工具合并到同一次调用中。
 {skill_section}
+## 自定义分析工具
+当预设工具无法满足分析需求时，使用 `python_exec` 执行自定义 Python 代码（pandas/numpy/scipy 等）进行深度分析。可用变量：`pd`、`np`、`data`(上下文数据)。
+
 ## 规则
 1. **必须调用工具获取真实数据** — 绝不编造数字。
 2. **自由对话** — 根据用户问题组织语言回答，不需要输出 JSON。
 3. **风险优先** — 必须排查风险。
+4. **灵活使用 python_exec** — 当需要自定义分析时主动使用。
 
 {language_section}"""
 
@@ -500,6 +517,21 @@ def _extract_tool_data(tool_calls_log: List[Dict], messages: List[Dict]) -> Dict
                 result_str = result_str[:2000] + "...(truncated)"
             data[tool_name] = result_str
 
+    # Save python_exec results (the most recent one with meaningful output)
+    if "python_exec" in tool_name_to_result:
+        pe = tool_name_to_result["python_exec"]
+        if isinstance(pe, dict):
+            pe_summary = {}
+            if pe.get("output"):
+                pe_summary["output"] = pe["output"][:1000]
+            if pe.get("result") is not None:
+                result_str = json.dumps(pe["result"], ensure_ascii=False) if isinstance(pe["result"], (dict, list)) else str(pe["result"])
+                pe_summary["result"] = result_str[:2000]
+            if pe.get("variables"):
+                pe_summary["variables"] = pe["variables"]
+            if pe_summary:
+                data["python_exec"] = pe_summary
+
     return data
 
 
@@ -527,10 +559,22 @@ def _inject_saved_tool_results(session_id: str, context: Optional[Dict]) -> str:
             "get_daily_history": "历史K线",
             "get_chip_distribution": "筹码分布",
             "search_stock_news": "新闻舆情",
+            "python_exec": "自定义分析结果",
         }
         for tool_name, result in results.items():
             label = tool_labels.get(tool_name, tool_name)
-            lines.append(f"【{label}】\n{result}")
+            # Special formatting for python_exec results
+            if tool_name == "python_exec" and isinstance(result, dict):
+                parts = []
+                if result.get("output"):
+                    parts.append(f"输出:\n{result['output']}")
+                if result.get("result") is not None:
+                    parts.append(f"结果:\n{result['result']}")
+                if result.get("variables"):
+                    parts.append(f"变量: {', '.join(result['variables'])}")
+                lines.append(f"【{label}】\n" + "\n".join(parts) if parts else f"【{label}】（无输出）")
+            else:
+                lines.append(f"【{label}】\n{result}")
 
         return "\n\n".join(lines)
     except Exception:

@@ -188,6 +188,7 @@ def get_strategies():
 
 
 @agent_bp.route("/chat", methods=["POST"])
+@login_required
 def agent_chat():
     """普通聊天接口（同步，阻塞等待结果）。"""
     try:
@@ -224,7 +225,7 @@ def agent_chat():
         # Build executor via factory
         from app.agent.factory import build_agent_executor
         from flask import g
-        user_id = getattr(g, "user_id", None) or 1
+        user_id = g.user_id
 
         executor = build_agent_executor(
             skills=skills,
@@ -268,6 +269,7 @@ def agent_chat():
 
 
 @agent_bp.route("/chat/stream", methods=["POST"])
+@login_required
 def agent_chat_stream():
     """流式聊天（SSE），实时推送工具调用进度。"""
     try:
@@ -305,7 +307,7 @@ def agent_chat_stream():
 
         # Capture user_id for the background thread (request context not available)
         from flask import g
-        user_id = getattr(g, "user_id", None) or 1
+        user_id = g.user_id
 
         def _cb(event: dict):
             if event.get("type") in ("tool_start", "tool_done"):

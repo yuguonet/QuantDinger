@@ -1150,7 +1150,7 @@ def _run_task(task: str):
         if is_update:
             # is_update → 全新拉取
             final_status = _run_fresh_pull(task, doc, last_status)
-        elif last_status == "re":
+        elif last_status == "re" and last_bar_time:
             # status==re → 修复循环
             final_status = _run_repair(task, doc, last_status)
         else:

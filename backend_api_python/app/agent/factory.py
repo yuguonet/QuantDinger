@@ -24,6 +24,7 @@ from app.agent.tools.backtest_tools import BACKTEST_TOOLS
 from app.agent.tools.indicator_tools import INDICATOR_TOOLS
 from app.agent.tools.trading_tools import TRADING_TOOLS
 from app.agent.tools.screening_tools import SCREENING_TOOLS
+from app.agent.tools.python_exec import PYTHON_EXEC_TOOL
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,7 @@ def get_tool_registry() -> ToolRegistry:
         + INDICATOR_TOOLS
         + TRADING_TOOLS
         + SCREENING_TOOLS
+        + [PYTHON_EXEC_TOOL]
     )
     registry.register_many(all_tools)
     _TOOL_REGISTRY = registry

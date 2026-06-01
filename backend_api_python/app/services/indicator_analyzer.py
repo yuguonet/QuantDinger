@@ -439,6 +439,7 @@ def analyze_indicator(
         signal_stats=signal_stats,
         backtest=backtest_result,
         indicator_values=indicator_values,
+        indicator_id=indicator_id,
     )
 
     return {
@@ -525,11 +526,16 @@ def _build_llm_summary(
     signal_stats: Dict[str, Any],
     backtest: Dict[str, Any],
     indicator_values: Dict[str, Any],
+    indicator_id: Optional[int] = None,
 ) -> str:
     """生成给 LLM 的中文策略摘要文本。"""
     parts: List[str] = []
 
-    parts.append(f"### 指标策略：{name}")
+    if indicator_id is not None:
+        parts.append(f"### 指标策略：{name}（ID: {indicator_id}）")
+        parts.append(f"**重要**：调用 `run_indicator_signal` 时请使用 `indicator_id={indicator_id}`。")
+    else:
+        parts.append(f"### 指标策略：{name}")
     if description:
         parts.append(f"**描述**：{description}")
 
@@ -641,9 +647,26 @@ def build_agent_skill_instructions(
     if not sections:
         return ""
 
+    # 用户指定了策略时，强调当前激活策略
+    if indicator_ids and len(valid) == 1:
+        active_id = valid[0].get("indicator_id")
+        active_name = valid[0].get("name", "")
+        header = (
+            f"\n## 当前激活策略（用户已选择）\n"
+            f"**策略名称**：{active_name}\n"
+            f"**指标 ID**：{active_id}\n\n"
+            f"⚠️ 用户已在界面上选择了此策略，请直接使用 `run_indicator_signal(indicator_id={active_id}, ...)` "
+            f"执行分析，无需再询问用户策略 ID。\n\n"
+            f"### 策略详情\n"
+        )
+    else:
+        header = (
+            "\n## 当前可用的交易策略（基于指标IDE沙箱分析）\n"
+            "以下策略已通过沙箱运行验证，包含真实K线数据的信号行为和回测预览：\n\n"
+        )
+
     return (
-        "\n## 当前可用的交易策略（基于指标IDE沙箱分析）\n"
-        "以下策略已通过沙箱运行验证，包含真实K线数据的信号行为和回测预览：\n\n"
+        header
         + "\n\n---\n\n".join(sections)
         + "\n\n**使用说明**：以上数据基于真实K线的沙箱运行结果，"
         "可使用 `run_indicator_signal` 工具对具体股票执行指标获取实时信号。"

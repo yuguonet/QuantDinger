@@ -40,6 +40,7 @@ _TOOL_LABELS: Dict[str, str] = {
     "search_comprehensive_intel": "综合情报搜索",
     "get_market_indices": "大盘指数",
     "get_sector_rankings": "板块排名",
+    "python_exec": "执行自定义分析代码",
 }
 
 
