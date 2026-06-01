@@ -44,7 +44,7 @@ BLOCKED_MODULES = {
     "requests", "ctypes", "signal", "threading", "multiprocessing",
     "importlib", "code", "codeop", "compileall",
     "pathlib", "glob", "fnmatch", "tempfile", "shelve", "dbm",
-    "sqlite3", "pickle", "shelve",
+    "sqlite3", "pickle",
 }
 
 # ── Blocked builtins ─────────────────────────────────────────
@@ -253,12 +253,15 @@ def python_exec(
     Args:
         code: Python code to execute
         context: JSON string injected as `data` variable
-        timeout: Execution timeout in seconds (default 30, max 60)
+        timeout: Execution timeout in seconds (default 30, max 600)
 
     Returns:
         {"output": str, "result": any, "error": str|None, "variables": list}
     """
-    timeout = min(max(timeout, 5), 60)  # clamp 5-60s
+    timeout = min(max(timeout, 5), 600)  # clamp 5-600s
+
+    if not code or not code.strip():
+        return {"output": "", "result": None, "error": "没有可执行的代码", "variables": []}
 
     # Parse context data
     context_data = None
@@ -313,7 +316,8 @@ PYTHON_EXEC_TOOL = {
         "适用场景：自定义回测、因子分析、统计计算、数据可视化、"
         "机器学习建模、任意复杂的数据处理逻辑。"
         "\n\n"
-        "限制：执行时间 5-60 秒（默认30秒），禁止文件系统/网络/进程操作。"
+        "限制：执行时间 5-600 秒（默认30秒），禁止文件系统/网络/进程操作。"
+        "如需文件读写，请使用 exec_script（工作区脚本执行）。"
         "\n\n"
         "示例：\n"
         "```python\n"
@@ -339,7 +343,7 @@ PYTHON_EXEC_TOOL = {
             },
             "timeout": {
                 "type": "integer",
-                "description": "执行超时秒数，默认30，最大60",
+                "description": "执行超时秒数，默认30，最大600",
                 "default": 30,
             },
         },

@@ -1,5 +1,5 @@
 // ══════════════════════════════════════════════════════════
-// @/api/agent.js — 完整版（含策略接口）
+// @/api/agent.js — 完整版（含策略接口 + 工作区）
 // ══════════════════════════════════════════════════════════
 import request from '@/utils/request'
 import storage from 'store'
@@ -10,13 +10,9 @@ import { ACCESS_TOKEN } from '@/store/mutation-types'
 /**
  * 获取可用策略列表（从用户指标加载）
  * GET /api/agent/strategies
- * 返回: { strategies: [{ id, name, description, category }] }
  */
 export function getStrategies () {
-  return request({
-    url: '/api/agent/strategies',
-    method: 'get'
-  })
+  return request({ url: '/api/agent/strategies', method: 'get' })
 }
 
 // ── 聊天 ──────────────────────────────────────────────────
@@ -24,20 +20,14 @@ export function getStrategies () {
 /**
  * 普通聊天
  * POST /api/agent/chat
- * @param {Object} data - { message, session_id, strategy_id?, context? }
  */
 export function agentChat (data) {
-  return request({
-    url: '/api/agent/chat',
-    method: 'post',
-    data
-  })
+  return request({ url: '/api/agent/chat', method: 'post', data })
 }
 
 /**
  * 流式聊天（SSE）
  * POST /api/agent/chat/stream
- * 返回 ReadableStream / EventSource
  */
 export function agentChatStream (data) {
   return request({
@@ -53,13 +43,16 @@ export function agentChatStream (data) {
 /**
  * 创建 Agent 流式连接（SSE）
  * @param {Object} params - { message, session_id, strategy_id?, context? }
- * @param {Object} callbacks - { onThinking, onToolStart, onToolDone, onGenerating, onDone, onError }
+ * @param {Object} callbacks - {
+ *   onThinking, onToolStart, onToolDone, onGenerating,
+ *   onToolStream, onToolInfo,   // 新增：流式输出 + 工具信息
+ *   onDone, onError
+ * }
  * @returns {{ close: Function }}
  */
 export function createAgentStream (params, callbacks) {
   const controller = new AbortController()
 
-  // 获取认证 token（与 request.js 保持一致）
   let token = storage.get(ACCESS_TOKEN)
   if (token && typeof token === 'object') {
     token = token.token || token.value || ''
@@ -112,6 +105,8 @@ export function createAgentStream (params, callbacks) {
             case 'thinking': callbacks.onThinking?.(event); break
             case 'tool_start': callbacks.onToolStart?.(event); break
             case 'tool_done': callbacks.onToolDone?.(event); break
+            case 'tool_stream': callbacks.onToolStream?.(event); break
+            case 'tool_info': callbacks.onToolInfo?.(event); break
             case 'generating': callbacks.onGenerating?.(event); break
             case 'done': callbacks.onDone?.(event); break
             case 'error': callbacks.onError?.(event); break
@@ -132,39 +127,16 @@ export function createAgentStream (params, callbacks) {
 
 // ── 分析任务 ──────────────────────────────────────────────
 
-/**
- * 触发股票分析
- * POST /api/agent-analysis/analyze
- * @param {Object} data - { stock_code, async_mode, strategy_id? }
- */
 export function triggerAnalysis (data) {
-  return request({
-    url: '/api/agent-analysis/analyze',
-    method: 'post',
-    data
-  })
+  return request({ url: '/api/agent-analysis/analyze', method: 'post', data })
 }
 
-/**
- * 获取分析任务列表
- * GET /api/agent-analysis/tasks
- */
 export function getAnalysisTasks (params) {
-  return request({
-    url: '/api/agent-analysis/tasks',
-    method: 'get',
-    params
-  })
+  return request({ url: '/api/agent-analysis/tasks', method: 'get', params })
 }
 
-/**
- * 创建任务状态 SSE 流
- * @param {Object} callbacks - { onConnected, onTaskCreated, onTaskProgress, onTaskCompleted }
- * @returns {{ close: Function }}
- */
 export function createTaskStream (callbacks) {
   const es = new EventSource('/api/agent-analysis/tasks/stream')
-
   es.addEventListener('connected', (e) => {
     try { callbacks.onConnected?.(JSON.parse(e.data)) } catch {}
   })
@@ -180,6 +152,5 @@ export function createTaskStream (callbacks) {
   es.addEventListener('error', (e) => {
     console.warn('Task SSE error:', e)
   })
-
   return { close: () => es.close() }
 }

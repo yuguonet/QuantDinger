@@ -23,36 +23,12 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from app.agent.tools.registry import ToolRegistry
+from app.agent.tools.tool_labels import TOOL_DISPLAY_NAMES
 
 logger = logging.getLogger(__name__)
 
-# Tool name → friendly label for progress messages
-_TOOL_LABELS: Dict[str, str] = {
-    "get_realtime_quote": "获取实时行情",
-    "get_daily_history": "获取历史K线",
-    "get_stock_info": "获取基本面",
-    "resolve_stock_name": "代码查名称",
-    "search_stock_by_name": "名称查代码",
-    "get_chip_distribution": "筹码分布分析",
-    "analyze_trend": "综合技术分析（MA+MACD+RSI+BOLL+KDJ）",
-    "calculate_ma": "均线计算",
-    "get_volume_analysis": "量能与量价分析",
-    "analyze_pattern": "K线形态识别（15+种）",
-    "get_indicator_snapshot": "指标快照",
-    "search_stock_news": "新闻搜索",
-    "search_comprehensive_intel": "综合情报搜索",
-    "get_market_indices": "大盘指数",
-    "get_sector_rankings": "板块排名",
-    "python_exec": "执行自定义分析代码",
-    "screen_stocks": "智能选股（本地DB）",
-    "review_stocks_with_indicator": "指标批量审核",
-    "get_dragon_tiger_stocks": "龙虎榜",
-    "get_hot_rank_stocks": "热榜",
-    "get_zt_pool_stocks": "涨停池",
-    "get_limit_down_stocks": "跌停池",
-    "get_broken_board_stocks": "炸板池",
-    "smart_screen": "综合选股",
-}
+# Alias for local use in progress events
+_TOOL_LABELS = TOOL_DISPLAY_NAMES
 
 
 @dataclass
@@ -340,9 +316,15 @@ def _execute_tools(
                                "display_name": _TOOL_LABELS.get(tc["name"], tc["name"])})
         tc_item, result_str, success, dur, cached = _exec_single(tc, registry, cache)
         if progress_callback:
+            _recovery = None
+            try:
+                _parsed = json.loads(result_str)
+                _recovery = _parsed.get("recovery")
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                pass
             progress_callback({"type": "tool_done", "step": step, "tool": tc["name"],
                                "display_name": _TOOL_LABELS.get(tc["name"], tc["name"]),
-                               "success": success, "duration": dur})
+                               "success": success, "duration": dur, "recovery": _recovery})
         tool_calls_log.append({
             "step": step, "tool": tc["name"], "arguments": tc["arguments"],
             "success": success, "duration": dur, "result_length": len(result_str), "cached": cached,
@@ -379,9 +361,15 @@ def _execute_tools(
                     cached = False
 
                 if progress_callback:
+                    _recovery = None
+                    try:
+                        _parsed = json.loads(result_str)
+                        _recovery = _parsed.get("recovery")
+                    except (json.JSONDecodeError, TypeError, AttributeError):
+                        pass
                     progress_callback({"type": "tool_done", "step": step, "tool": tc_item["name"],
                                        "display_name": _TOOL_LABELS.get(tc_item["name"], tc_item["name"]),
-                                       "success": success, "duration": dur})
+                                       "success": success, "duration": dur, "recovery": _recovery})
                 tool_calls_log.append({
                     "step": step, "tool": tc_item["name"], "arguments": tc_item["arguments"],
                     "success": success, "duration": dur, "result_length": len(result_str), "cached": cached,

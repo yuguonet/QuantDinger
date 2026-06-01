@@ -11,10 +11,22 @@
 
       <!-- 工具调用过程 -->
       <div v-if="message.toolEvents && message.toolEvents.length" class="tool-events">
-        <div v-for="(ev, i) in message.toolEvents" :key="i" class="tool-event">
-          <a-icon v-if="ev.status === 'done'" type="check-circle" class="done" />
-          <a-icon v-else type="loading" class="loading" />
-          <span class="tool-name">{{ ev.display_name || ev.tool }}</span>
+        <div v-for="(ev, i) in message.toolEvents" :key="i" class="tool-event" :class="{ 'has-stream': ev.streamOutput }">
+          <div class="tool-header">
+            <a-icon v-if="ev.status === 'done'" type="check-circle" class="done" />
+            <a-icon v-else-if="ev.status === 'error'" type="close-circle" class="error" />
+            <a-icon v-else type="loading" class="loading" />
+            <span class="tool-name">{{ ev.display_name || ev.tool }}</span>
+            <span v-if="ev.info" class="tool-info">{{ ev.info }}</span>
+          </div>
+          <!-- 流式输出面板 -->
+          <div v-if="ev.streamOutput" class="tool-stream-panel">
+            <pre class="stream-output">{{ ev.streamOutput }}</pre>
+          </div>
+          <!-- 错误恢复建议 -->
+          <div v-if="ev.recovery" class="tool-recovery">
+            <a-icon type="bulb" /> {{ ev.recovery }}
+          </div>
         </div>
       </div>
 
@@ -43,7 +55,7 @@ export default defineComponent({
   setup (props) {
     const renderedContent = computed(() => {
       const raw = props.message.content || ''
-      // Step 1: HTML entity encode (escape everything)
+      // Step 1: HTML entity encode
       let safe = raw
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
@@ -51,16 +63,26 @@ export default defineComponent({
         .replace(/"/g, '&quot;')
         .replace(/'/g, '&#x27;')
 
-      // Step 2: Apply allowed markdown transforms (safe because input is already escaped)
+      // Step 2: Apply allowed markdown transforms
       safe = safe
-        .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre class="code-block"><code>$2</code></pre>')
+        // Fenced code blocks (with optional language)
+        .replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
+          const langLabel = lang ? `<span class="code-lang">${lang}</span>` : ''
+          return `<div class="code-block-wrapper">${langLabel}<pre class="code-block"><code>${code}</code></pre></div>`
+        })
         .replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>')
         .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        // Headers (### / ## / #)
+        .replace(/^### (.+)$/gm, '<h4 class="md-h3">$1</h4>')
+        .replace(/^## (.+)$/gm, '<h3 class="md-h2">$1</h3>')
+        .replace(/^# (.+)$/gm, '<h2 class="md-h1">$1</h2>')
+        // Bullet lists
+        .replace(/^- (.+)$/gm, '<li>$1</li>')
+        .replace(/(<li>.*<\/li>)/gs, '<ul>$1</ul>')
         .replace(/\n/g, '<br>')
 
-      // Step 3: Strip any remaining raw HTML tags that may have survived
-      // (defense-in-depth — shouldn't be needed but belt-and-suspenders)
-      safe = safe.replace(/<(?!\/?(strong|code|pre|br)\b)[^>]+>/gi, '')
+      // Step 3: Strip disallowed HTML tags
+      safe = safe.replace(/<(?!\/?(strong|code|pre|br|h[2-4]|ul|li|div|span)\b)[^>]+>/gi, '')
 
       return safe
     })
@@ -128,6 +150,8 @@ export default defineComponent({
   display: flex;
   flex-direction: column;
   gap: 6px;
+  min-width: 0;
+  flex: 1;
 }
 
 .bubble-meta {
@@ -146,14 +170,33 @@ export default defineComponent({
   word-break: break-word;
   max-width: 100%;
 
-  :deep(pre.code-block) {
-    background: #1e1e1e;
-    color: #d4d4d4;
-    padding: 12px;
-    border-radius: 8px;
-    overflow-x: auto;
-    font-size: 13px;
+  :deep(.code-block-wrapper) {
+    position: relative;
     margin: 8px 0;
+
+    .code-lang {
+      position: absolute;
+      top: 4px;
+      right: 8px;
+      font-size: 11px;
+      color: #858585;
+      text-transform: uppercase;
+    }
+
+    pre.code-block {
+      background: #1e1e1e;
+      color: #d4d4d4;
+      padding: 12px;
+      border-radius: 8px;
+      overflow-x: auto;
+      font-size: 13px;
+      margin: 0;
+      max-height: 400px;
+
+      code {
+        font-family: 'Fira Code', 'Consolas', monospace;
+      }
+    }
   }
 
   :deep(code.inline-code) {
@@ -161,33 +204,99 @@ export default defineComponent({
     padding: 2px 6px;
     border-radius: 4px;
     font-size: 13px;
+    font-family: 'Fira Code', 'Consolas', monospace;
+  }
+
+  :deep(h2.md-h1), :deep(h3.md-h2), :deep(h4.md-h3) {
+    margin: 12px 0 6px;
+    font-weight: 600;
+  }
+
+  :deep(ul) {
+    padding-left: 20px;
+    margin: 4px 0;
   }
 }
+
+/* ── 工具调用事件 ─────────────────────────── */
 
 .tool-events {
   display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-bottom: 4px;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 6px;
+}
 
-  .tool-event {
+.tool-event {
+  background: #f8f9fa;
+  border: 1px solid #e8e8e8;
+  border-radius: 8px;
+  overflow: hidden;
+  transition: all 0.2s;
+
+  &.has-stream {
+    border-color: #d9d9d9;
+  }
+
+  .tool-header {
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: 6px;
     font-size: 12px;
-    color: #666;
-    background: #f5f5f5;
-    padding: 2px 8px;
-    border-radius: 12px;
+    color: #555;
+    padding: 6px 10px;
 
-    .done {
-      color: #52c41a;
+    .done { color: #52c41a; font-size: 14px; }
+    .error { color: #ff4d4f; font-size: 14px; }
+    .loading { color: #1890ff; font-size: 14px; }
+
+    .tool-name {
+      font-weight: 500;
     }
-    .loading {
-      color: #1890ff;
+
+    .tool-info {
+      color: #888;
+      font-size: 11px;
+      margin-left: auto;
+    }
+  }
+
+  .tool-stream-panel {
+    border-top: 1px solid #f0f0f0;
+    max-height: 200px;
+    overflow-y: auto;
+
+    .stream-output {
+      margin: 0;
+      padding: 8px 10px;
+      font-size: 12px;
+      font-family: 'Fira Code', 'Consolas', monospace;
+      line-height: 1.5;
+      color: #444;
+      background: #fafafa;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+  }
+
+  .tool-recovery {
+    display: flex;
+    align-items: flex-start;
+    gap: 4px;
+    padding: 6px 10px;
+    font-size: 12px;
+    color: #fa8c16;
+    background: #fffbe6;
+    border-top: 1px solid #ffe58f;
+
+    .anticon {
+      margin-top: 2px;
+      flex-shrink: 0;
     }
   }
 }
+
+/* ── 打字指示器 ───────────────────────────── */
 
 .typing-indicator {
   display: flex;
@@ -200,44 +309,23 @@ export default defineComponent({
     border-radius: 50%;
     background: #999;
     animation: bounce 1.4s infinite;
-    &:nth-child(2) {
-      animation-delay: 0.2s;
-    }
-    &:nth-child(3) {
-      animation-delay: 0.4s;
-    }
+    &:nth-child(2) { animation-delay: 0.2s; }
+    &:nth-child(3) { animation-delay: 0.4s; }
   }
 }
 
 @keyframes fadeInUp {
-  from {
-    opacity: 0;
-    transform: translateY(10px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 @keyframes bounce {
-  0%,
-  80%,
-  100% {
-    transform: scale(0);
-  }
-  40% {
-    transform: scale(1);
-  }
+  0%, 80%, 100% { transform: scale(0); }
+  40% { transform: scale(1); }
 }
 
 @keyframes blink {
-  0%,
-  100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0;
-  }
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
 }
 </style>

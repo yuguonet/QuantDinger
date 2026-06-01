@@ -60,38 +60,8 @@ def _load_strategies(user_id: int = 1):
 # ── Blueprint ─────────────────────────────────────────────────
 agent_bp = Blueprint("agent", __name__, url_prefix="/api/agent")
 
-# ── 工具中文名映射（前端显示用）───────────────────────────────
-TOOL_DISPLAY_NAMES: Dict[str, str] = {
-    "get_realtime_quote": "获取实时行情",
-    "get_daily_history": "获取历史K线",
-    "get_chip_distribution": "分析筹码分布",
-    "get_stock_info": "获取股票基本面",
-    "resolve_stock_name": "代码查名称",
-    "search_stock_by_name": "名称查代码",
-    "search_stock_news": "搜索股票新闻",
-    "search_comprehensive_intel": "综合情报搜索",
-    "analyze_trend": "综合技术分析（MA+MACD+RSI+BOLL+KDJ）",
-    "calculate_ma": "计算均线系统",
-    "get_volume_analysis": "分析量能与量价关系",
-    "analyze_pattern": "识别K线形态（15+种）",
-    "get_indicator_snapshot": "获取指标快照",
-    "get_market_indices": "获取市场指数",
-    "get_sector_rankings": "分析行业板块",
-    "screen_stocks": "智能选股",
-    "get_screener_presets": "获取选股条件",
-    "get_dragon_tiger_stocks": "获取龙虎榜",
-    "get_dragon_tiger_by_stock": "查询个股龙虎榜",
-    "get_hot_rank_stocks": "获取热榜",
-    "get_zt_pool_stocks": "获取涨停池",
-    "get_limit_down_stocks": "获取跌停池",
-    "get_broken_board_stocks": "获取炸板池",
-    "get_market_overview": "获取市场快照",
-    "get_stock_fund_flow": "获取个股资金流",
-    "batch_get_stock_fund_flow": "批量获取资金流",
-    "get_sector_fund_flow": "获取板块资金流",
-    "get_concept_fund_flow": "获取概念资金流",
-    "smart_screen": "综合选股",
-}
+# ── 工具中文名映射（单一数据源）──────────────────────────────
+from app.agent.tools.tool_labels import TOOL_DISPLAY_NAMES
 
 
 # ── 共享市场检测 ─────────────────────────────────────────────
@@ -254,6 +224,7 @@ def agent_chat():
             message=message,
             session_id=session_id,
             context=context,
+            user_id=user_id,
         )
 
         return jsonify({
@@ -313,7 +284,7 @@ def agent_chat_stream():
         user_id = g.user_id
 
         def _cb(event: dict):
-            if event.get("type") in ("tool_start", "tool_done"):
+            if event.get("type") in ("tool_start", "tool_done", "tool_stream", "tool_info"):
                 tool = event.get("tool", "")
                 event["display_name"] = TOOL_DISPLAY_NAMES.get(tool, tool)
             event_queue.put(event)
@@ -344,6 +315,7 @@ def agent_chat_stream():
                     session_id=session_id,
                     context=enriched_ctx,
                     progress_callback=_cb,
+                    user_id=user_id,
                 )
                 event_queue.put({
                     "type": "done",
@@ -387,6 +359,7 @@ def agent_chat_stream():
 
 
 @agent_bp.route("/chat/sessions", methods=["GET"])
+@login_required
 def list_chat_sessions():
     """获取会话列表。"""
     limit = int(request.args.get("limit", 50))
@@ -403,6 +376,7 @@ def list_chat_sessions():
 
 
 @agent_bp.route("/chat/sessions/<session_id>", methods=["GET"])
+@login_required
 def get_chat_session_messages(session_id: str):
     """获取会话消息。"""
     store = get_session_store()
@@ -417,6 +391,7 @@ def get_chat_session_messages(session_id: str):
 
 
 @agent_bp.route("/chat/sessions/<session_id>", methods=["DELETE"])
+@login_required
 def delete_chat_session(session_id: str):
     """删除会话。"""
     store = get_session_store()

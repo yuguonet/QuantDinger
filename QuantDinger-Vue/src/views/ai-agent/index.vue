@@ -335,12 +335,29 @@ export default {
             updateLastMessage('🤔 思考中...')
           },
           onToolStart: (ev) => {
-            toolEvents.push({ ...ev, status: 'loading' })
+            toolEvents.push({ ...ev, status: 'loading', streamOutput: '' })
             connected.value = true
           },
           onToolDone: (ev) => {
             const item = toolEvents.find((t) => t.tool === ev.tool && t.status === 'loading')
-            if (item) item.status = 'done'
+            if (item) {
+              item.status = ev.success === false ? 'error' : 'done'
+              if (ev.recovery) item.recovery = ev.recovery
+            }
+          },
+          onToolStream: (ev) => {
+            // Append streaming output to the matching tool event
+            const item = toolEvents.find((t) => t.tool === ev.tool && t.status === 'loading')
+            if (item) {
+              item.streamOutput = (item.streamOutput || '') + (ev.output || '')
+              // Auto-scroll
+              nextTick(() => scrollToBottom())
+            }
+          },
+          onToolInfo: (ev) => {
+            // Show info messages (e.g., "脚本已保存: xxx v2")
+            const item = toolEvents.find((t) => t.tool === ev.tool)
+            if (item) item.info = ev.message
           },
           onGenerating: () => {
             updateLastMessage('')

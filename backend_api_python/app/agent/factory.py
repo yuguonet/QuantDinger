@@ -25,6 +25,7 @@ from app.agent.tools.indicator_tools import INDICATOR_TOOLS
 from app.agent.tools.trading_tools import TRADING_TOOLS
 from app.agent.tools.screening_tools import SCREENING_TOOLS
 from app.agent.tools.python_exec import PYTHON_EXEC_TOOL
+from app.agent.tools.code_workspace_tools import WORKSPACE_TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ def get_tool_registry() -> ToolRegistry:
         + INDICATOR_TOOLS
         + TRADING_TOOLS
         + SCREENING_TOOLS
+        + WORKSPACE_TOOLS
         + [PYTHON_EXEC_TOOL]
     )
     registry.register_many(all_tools)

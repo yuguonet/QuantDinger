@@ -21,6 +21,7 @@ from app.agent.runner import (
     parse_dashboard_json,
 )
 from app.agent.tools.registry import ToolRegistry
+from app.agent.tool_context import set_tool_context
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -310,6 +311,39 @@ WORKFLOW_TEMPLATES = {
 **第四步 · 交易执行**
 - 使用 `start_strategy` 对通过验证的标的启动策略
 - 使用 `get_strategy_trades` 监控执行情况""",
+
+    "code_analysis": """## 迭代代码分析工作流程
+
+你拥有一个持久化的工作区，可以保存脚本、读写文件、执行代码并迭代优化。
+
+**核心循环（按需重复）：**
+
+1. **规划** — 明确分析目标，拆解为可执行的步骤
+2. **编写代码** — 用 `save_script` 保存脚本到工作区
+3. **执行** — 用 `exec_script` 执行（支持文件I/O，超时600秒）
+4. **检查结果** — 用 `read_file` 查看输出文件，分析执行结果
+5. **迭代优化** — 根据结果修改代码，重新保存和执行
+6. **沉淀** — 最终版本用 `save_script` 保存，附带清晰的 description
+
+**可用变量（在 exec_script 中自动注入）：**
+- `WORKSPACE` — 工作区根目录路径
+- `SCRIPTS_DIR` — 脚本目录
+- `DATA_DIR` — 数据目录
+- `OUTPUT_DIR` — 输出目录
+- `pd` — pandas
+- `np` — numpy
+- `Path` — pathlib.Path
+
+**文件组织建议：**
+- `scripts/` — 分析脚本
+- `data/` — 输入数据（K线、行情等）
+- `output/` — 分析结果（CSV、JSON、图表）
+
+**使用 shell_exec 的场景：**
+- 查看文件列表：`ls -la output/`
+- 安装依赖：`pip install xxx`
+- 数据处理：`head -20 data/raw.csv`
+- 调用外部工具""",
 }
 
 # Intent keywords -> workflow mapping
@@ -318,6 +352,8 @@ _INTENT_KEYWORDS = {
     "backtest": ["回测", "回验", "验证", "历史表现", "过去表现", "backtest", "test"],
     "trading": ["买入", "卖出", "交易", "下单", "启动策略", "执行", "buy", "sell", "trade", "execute"],
     "full_pipeline": ["全流程", "完整流程", "一站式", "从头到尾", "pipeline", "full"],
+    "code_analysis": ["写脚本", "写代码", "代码分析", "迭代", "工作区", "脚本", "数据分析",
+                      "write script", "code", "iterate", "workspace", "script"],
     "analysis": ["分析", "行情", "走势", "技术面", "基本面", "怎么看", "analyze", "analysis"],
 }
 
@@ -365,7 +401,26 @@ def build_dynamic_system_prompt(
 **回测工具**: run_backtest(跑回测), get_backtest_history(查历史回测记录)
 **交易工具**: list_strategies(列出策略), get_strategy_detail(策略详情), start_strategy(启动策略), stop_strategy(停止策略), get_strategy_trades(交易记录)
 **龙虎榜/热榜**: get_dragon_tiger_stocks, get_dragon_tiger_by_stock, get_hot_rank_stocks, get_zt_pool_stocks, get_limit_down_stocks, get_broken_board_stocks
-**自定义分析**: python_exec(执行任意Python代码，做深度量化分析)
+**自定义分析**: python_exec(执行任意Python代码，做深度量化分析，超时上限600秒)
+
+## 工作区工具（迭代分析核心）
+
+**文件操作**: save_script(保存脚本,自动版本), load_script(加载脚本), list_workspace(查看工作区), write_file(写文件), read_file(读文件)
+**版本管理**: list_versions(查看版本历史), diff_versions(对比版本差异)
+**执行工具**: exec_script(工作区脚本执行,自动注入DataSourceFactory,超时600秒), shell_exec(shell命令,流式输出)
+**后台执行**: run_background(后台执行,返回task_id), poll_task(查询任务状态)
+**项目模板**: apply_template(一键生成脚手架), list_templates(列出模板)
+
+**迭代分析工作流**: save_script → exec_script → read_file(查看输出) → 修改代码 → save_script → exec_script → ...
+
+工作区工具的优势：
+- 脚本持久化+自动版本管理，跨对话可复用
+- 可读写文件（CSV、JSON、图片等），构建多步骤数据管道
+- exec_script 自动注入 get_kline/get_ticker/get_stock_info（DataSourceFactory）
+- exec_script 自动注入 WORKSPACE/SCRIPTS_DIR/DATA_DIR/OUTPUT_DIR/Path/pd/np
+- shell_exec 支持流式输出，实时查看执行进度
+- run_background 支持后台长时间执行
+- apply_template 一键生成多因子选股/回测管道/数据清洗脚手架
 
 ⚠️ 注意区分：get_daily_history 是获取K线原始数据，get_backtest_history 是查询过去的回测记录。
 ⚠️ 当用户只给中文股票名称没给代码时，必须先用 search_stock_by_name 查到代码再分析。"""
@@ -633,6 +688,7 @@ class AgentExecutor:
 
     def run(self, task: str, context: Optional[Dict[str, Any]] = None) -> AgentResult:
         """Execute the agent loop for analysis (dashboard JSON output)."""
+        set_tool_context({"session_id": "__analysis__", "user_id": 1, "progress_callback": None})
         language = (context or {}).get("report_language", "zh")
         system_prompt = build_dynamic_system_prompt(
             user_message=task,
@@ -654,8 +710,14 @@ class AgentExecutor:
         session_id: str,
         context: Optional[Dict[str, Any]] = None,
         progress_callback: Optional[Callable] = None,
+        user_id: int = 1,
     ) -> AgentResult:
         """Execute the agent loop for free-form chat."""
+        set_tool_context({
+            "session_id": session_id,
+            "user_id": user_id,
+            "progress_callback": progress_callback,
+        })
         language = (context or {}).get("report_language", "zh")
         system_prompt = build_dynamic_system_prompt(
             user_message=message,
@@ -689,6 +751,16 @@ class AgentExecutor:
         saved_tools = _inject_saved_tool_results(session_id, context)
         if saved_tools:
             context_parts.append(f"[历史工具调用结果（可直接引用，无需重复调用）]:\n{saved_tools}")
+
+        # Inject workspace state
+        try:
+            from app.agent.workspace import get_workspace
+            ws = get_workspace(session_id)
+            ws_summary = ws.get_context_summary()
+            if ws_summary and ws_summary != "工作区为空":
+                context_parts.append(f"[当前工作区状态]:\n{ws_summary}")
+        except Exception:
+            pass
 
         if context_parts:
             ctx_msg = "[系统提供的历史分析上下文]\n" + "\n".join(context_parts)
