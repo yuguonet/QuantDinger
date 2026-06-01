@@ -15,13 +15,13 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
-from app.agent.runner import (
+from app.agent.core.runner import (
     RunLoopResult,
     run_agent_loop,
     parse_dashboard_json,
 )
-from app.agent.tools.registry import ToolRegistry
-from app.agent.tool_context import set_tool_context
+from app.agent.core.registry import ToolRegistry
+from app.agent.core.tool_context import set_tool_context
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -111,7 +111,6 @@ AGENT_SYSTEM_PROMPT = """你是一位专业的金融投资分析 Agent，拥有�
 **第二阶段 · 形态与量能**（等第一阶段结果返回后执行）
 - `analyze_pattern` 识别K线形态（15+ 种经典形态）
 - `get_volume_analysis` 分析量能与量价关系
-- `get_chip_distribution` 获取筹码分布（仅A股）
 
 **第三阶段 · 情报搜索**（等前两阶段完成后执行）
 - `search_stock_news` 搜索最新资讯、减持、业绩预告等风险信号
@@ -203,7 +202,7 @@ CHAT_SYSTEM_PROMPT = """你是一位专业的金融投资分析 Agent，拥有�
 - `get_realtime_quote` + `get_daily_history`(建议120天) + `analyze_trend`(五维技术分析)
 
 **第二阶段 · 形态与量能**
-- `analyze_pattern`(K线形态) + `get_volume_analysis`(量价关系) + `get_chip_distribution`(筹码)
+- `analyze_pattern`(K线形态) + `get_volume_analysis`(量价关系)
 
 **第三阶段 · 情报搜索**
 - `search_stock_news`
@@ -243,7 +242,6 @@ WORKFLOW_TEMPLATES = {
 **第二阶段 · 形态与量能**（等第一阶段结果返回后执行）
 - `analyze_pattern` 识别K线形态（15+ 种经典形态）
 - `get_volume_analysis` 分析量能与量价关系
-- `get_chip_distribution` 获取筹码分布（仅A股）
 
 **第三阶段 · 情报搜索**（等前两阶段完成后执行）
 - `search_stock_news` 搜索最新资讯、减持、业绩预告等风险信号
@@ -256,7 +254,7 @@ WORKFLOW_TEMPLATES = {
     "screening": """## 选股筛选工作流程
 
 **第一步 · 条件筛选**
-- 使用 `screen_stocks` 按行业、概念、涨跌幅、换手率等条件从全市场筛选候选股
+- 使用 `smart_screen` 按自然语言条件从全市场筛选候选股（支持130+维度）
 
 **第二步 · 指标验证**（对候选股逐只执行）
 - 使用 `list_indicators` 查看可用指标策略
@@ -298,7 +296,7 @@ WORKFLOW_TEMPLATES = {
     "full_pipeline": """## 完整量化交易流水线
 
 **第一步 · 选股初筛**
-- 使用 `screen_stocks` 从全市场筛选候选股
+- 使用 `smart_screen` 从全市场筛选候选股
 
 **第二步 · 指标精筛**
 - 使用 `run_indicator_signal` 对候选股执行指标策略
@@ -394,9 +392,9 @@ def build_dynamic_system_prompt(
 
 **名称/代码互查**: resolve_stock_name(代码→名称), search_stock_by_name(名称→代码，模糊搜索)
 **数据工具（获取原始数据）**: get_realtime_quote(实时行情), get_daily_history(历史K线/OHLCV), get_stock_info(基本面), get_market_indices(大盘指数), get_sector_rankings(板块排名)
-**分析工具（计算指标）**: analyze_trend(五维技术分析), calculate_ma(均线), get_volume_analysis(量价), analyze_pattern(15+形态), get_chip_distribution(筹码), get_indicator_snapshot(指标快照)
+**分析工具（计算指标）**: analyze_trend(五维技术分析), calculate_ma(均线), get_volume_analysis(量价), analyze_pattern(15+形态), get_indicator_snapshot(指标快照)
 **搜索工具**: search_stock_news(新闻), search_comprehensive_intel(综合情报)
-**选股工具**: screen_stocks(本地DB选股), smart_screen(综合选股), review_stocks_with_indicator(指标审核), list_user_selection_strategies(选股策略)
+**选股工具**: smart_screen(自然语言选股), review_stocks_with_indicator(指标审核), list_user_selection_strategies(选股策略)
 **指标工具**: list_indicators(列出指标), get_indicator_params(指标参数), run_indicator_signal(执行指标信号)
 **回测工具**: run_backtest(跑回测), get_backtest_history(查历史回测记录)
 **交易工具**: list_strategies(列出策略), get_strategy_detail(策略详情), start_strategy(启动策略), stop_strategy(停止策略), get_strategy_trades(交易记录)
@@ -416,14 +414,15 @@ def build_dynamic_system_prompt(
 工作区工具的优势：
 - 脚本持久化+自动版本管理，跨对话可复用
 - 可读写文件（CSV、JSON、图片等），构建多步骤数据管道
-- exec_script 自动注入 get_kline/get_ticker/get_stock_info（DataSourceFactory）
+- exec_script 自动注入 get_kline/get_ticker/get_stock_info/resolve_name（委托给已注册的 data_tools，与 agent 工具共用同一实现）
 - exec_script 自动注入 WORKSPACE/SCRIPTS_DIR/DATA_DIR/OUTPUT_DIR/Path/pd/np
 - shell_exec 支持流式输出，实时查看执行进度
 - run_background 支持后台长时间执行
 - apply_template 一键生成多因子选股/回测管道/数据清洗脚手架
 
 ⚠️ 注意区分：get_daily_history 是获取K线原始数据，get_backtest_history 是查询过去的回测记录。
-⚠️ 当用户只给中文股票名称没给代码时，必须先用 search_stock_by_name 查到代码再分析。"""
+⚠️ 当用户只给中文股票名称没给代码时，必须先用 search_stock_by_name 查到代码再分析。
+⚠️ 获取K线优先使用 get_daily_history 工具。exec_script 中的 get_kline 是便捷封装，签名：get_kline(code, period="1D", count=120)。"""
 
     if mode == "dashboard":
         return _DASHBOARD_PROMPT_TEMPLATE.format(
@@ -528,7 +527,7 @@ class _ConversationManager:
 
     def _get_store(self):
         try:
-            from app.agent.session_store import get_session_store
+            from app.agent.core.session_store import get_session_store
             return get_session_store()
         except Exception:
             return None
@@ -588,7 +587,7 @@ def _extract_tool_data(tool_calls_log: List[Dict], messages: List[Dict]) -> Dict
 
     # Keep compact versions of key results
     for tool_name in ("get_realtime_quote", "analyze_trend", "get_volume_analysis",
-                       "get_daily_history", "get_chip_distribution", "search_stock_news"):
+                       "get_daily_history", "search_stock_news"):
         if tool_name in tool_name_to_result:
             result = tool_name_to_result[tool_name]
             # Truncate large results
@@ -637,7 +636,6 @@ def _inject_saved_tool_results(session_id: str, context: Optional[Dict]) -> str:
             "analyze_trend": "技术趋势",
             "get_volume_analysis": "量能分析",
             "get_daily_history": "历史K线",
-            "get_chip_distribution": "筹码分布",
             "search_stock_news": "新闻舆情",
             "python_exec": "自定义分析结果",
         }
@@ -754,7 +752,7 @@ class AgentExecutor:
 
         # Inject workspace state
         try:
-            from app.agent.workspace import get_workspace
+            from app.agent.core.workspace import get_workspace
             ws = get_workspace(session_id)
             ws_summary = ws.get_context_summary()
             if ws_summary and ws_summary != "工作区为空":

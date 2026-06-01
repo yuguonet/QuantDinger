@@ -61,11 +61,11 @@ def _load_strategies(user_id: int = 1):
 agent_bp = Blueprint("agent", __name__, url_prefix="/api/agent")
 
 # ── 工具中文名映射（单一数据源）──────────────────────────────
-from app.agent.tools.tool_labels import TOOL_DISPLAY_NAMES
+from app.agent.tools.labels import TOOL_DISPLAY_NAMES
 
 
 # ── 共享市场检测 ─────────────────────────────────────────────
-from app.agent.utils import detect_market as _detect_market
+from app.data_sources.market_detector import detect_market as _detect_market
 
 
 # ── 股票代码提取 ─────────────────────────────────────────────
@@ -82,7 +82,7 @@ def _extract_stock_code(msg: str, ctx: Optional[Dict], session: Dict) -> Optiona
 
 
 # ── 会话存储（Redis / 内存自动降级）──────────────────────────
-from app.agent.session_store import get_session_store
+from app.agent.core.session_store import get_session_store
 
 MAX_HISTORY_TURNS = 20
 
@@ -196,7 +196,7 @@ def agent_chat():
             return jsonify({"error": "context must be a dict"}), 400
 
         # Build executor via factory
-        from app.agent.factory import build_agent_executor
+        from app.agent.core.factory import build_agent_executor
         from flask import g
         user_id = g.user_id
 
@@ -291,7 +291,7 @@ def agent_chat_stream():
 
         def _run():
             try:
-                from app.agent.factory import build_agent_executor
+                from app.agent.core.factory import build_agent_executor
 
                 # Extract stock code and prefetch
                 session = _get_session(session_id)

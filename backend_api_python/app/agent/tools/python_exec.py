@@ -233,6 +233,39 @@ def _exec_worker(code: str, context_data: Any, result_queue: multiprocessing.Que
 
 # ── Main tool function ───────────────────────────────────────
 
+def _normalize_code(code: str) -> str:
+    """Normalize code string from LLM output.
+
+    Some LLMs serialize newlines as literal '\\n' characters in function-call
+    arguments instead of actual newline characters. This causes Python's
+    compile() to fail with "unexpected character after line continuation
+    character". We fix by replacing literal '\\n' sequences with real newlines,
+    and unescaping '\\t' as well.
+
+    Also handles the case where the LLM wraps code in a markdown code fence.
+    """
+    if not code:
+        return code
+
+    # Strip markdown code fences if present
+    code = code.strip()
+    if code.startswith("```"):
+        # Remove opening fence (with optional language tag)
+        first_newline = code.find("\n")
+        if first_newline != -1:
+            code = code[first_newline + 1:]
+        # Remove closing fence
+        if code.rstrip().endswith("```"):
+            code = code.rstrip()[:-3].rstrip()
+
+    # Replace literal \\n / \\t with real chars (only if no real newlines exist)
+    # This avoids mangling code that intentionally has "\\n" in strings
+    if "\n" not in code and "\\n" in code:
+        code = code.replace("\\n", "\n").replace("\\t", "\t")
+
+    return code
+
+
 def python_exec(
     code: str,
     context: str = "",
@@ -259,6 +292,9 @@ def python_exec(
         {"output": str, "result": any, "error": str|None, "variables": list}
     """
     timeout = min(max(timeout, 5), 600)  # clamp 5-600s
+
+    # Normalize LLM-generated code (fix literal \\n, strip code fences, etc.)
+    code = _normalize_code(code)
 
     if not code or not code.strip():
         return {"output": "", "result": None, "error": "没有可执行的代码", "variables": []}
@@ -304,7 +340,7 @@ def python_exec(
 
 # ── Tool spec for registry ───────────────────────────────────
 
-PYTHON_EXEC_TOOL = {
+TOOL_SPEC = {
     "fn": python_exec,
     "name": "python_exec",
     "description": (

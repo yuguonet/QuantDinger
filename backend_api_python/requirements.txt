@@ -38,3 +38,4 @@ ib_insync>=0.9.86
 pyarrow>=14.0.0
 pydantic>=2.0.0
 PyYAML>=6.0
+openai-agents>=0.17.4

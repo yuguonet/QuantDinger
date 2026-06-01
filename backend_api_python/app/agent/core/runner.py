@@ -22,8 +22,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
-from app.agent.tools.registry import ToolRegistry
-from app.agent.tools.tool_labels import TOOL_DISPLAY_NAMES
+from app.agent.core.registry import ToolRegistry
+from app.agent.tools.labels import TOOL_DISPLAY_NAMES
 
 logger = logging.getLogger(__name__)
 

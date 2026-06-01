@@ -48,7 +48,7 @@ def search_stocks():
         "page_size": 50
       }
     """
-    from app.agent.tools.stock_screener_tools import screen_stocks
+    from app.agent.tools.screener import eastmoney_screen as screen_stocks
 
     data = request.get_json(silent=True) or {}
     keyword = (data.get("keyword") or "").strip()
@@ -95,7 +95,7 @@ def search_stocks():
 @stock_screener_bp.route("/presets", methods=["GET"])
 def get_presets():
     """获取选股器支持的所有筛选条件分类和示例。"""
-    from app.agent.tools.stock_screener_tools import get_screener_presets
+    from app.agent.tools.screener import get_screener_presets
     try:
         return jsonify({"code": 0, "data": get_screener_presets()})
     except Exception as e:
@@ -108,7 +108,7 @@ def get_presets():
 @stock_screener_bp.route("/filters", methods=["GET"])
 def get_filters():
     """获取筛选条件的完整结构（130+ 字段的默认值）。"""
-    from app.agent.tools.stock_screener_tools import get_default_filters
+    from app.agent.tools.screener import get_default_filters
     try:
         return jsonify({"code": 0, "data": get_default_filters()})
     except Exception as e:
@@ -126,7 +126,7 @@ def parse_text():
     Request: {"text": "PE在5到20之间; ROE不低于15%; 银行股"}
     Response: {"code": 0, "data": {"pe_min": 5, "pe_max": 20, "roe_min": 15, ...}}
     """
-    from app.agent.tools.stock_screener_tools import parse_filters_from_text
+    from app.agent.tools.screener import parse_filters_from_text
 
     data = request.get_json(silent=True) or {}
     text = (data.get("text") or "").strip()
@@ -151,7 +151,7 @@ def build_text():
     Request: {"filters": {"pe_min": 5, "pe_max": 20, "roe_min": 15}}
     Response: {"code": 0, "data": {"keyword": "PE在5到20之间; ROE不低于15%"}}
     """
-    from app.agent.tools.stock_screener_tools import build_keyword_from_filters
+    from app.agent.tools.screener import build_keyword_from_filters
 
     data = request.get_json(silent=True) or {}
     filters = data.get("filters")
@@ -180,7 +180,7 @@ def batch_screen():
       ]
     }
     """
-    from app.agent.tools.stock_screener_tools import screen_stocks
+    from app.agent.tools.screener import eastmoney_screen as screen_stocks
 
     data = request.get_json(silent=True) or {}
     queries = data.get("queries") or []
