@@ -1080,19 +1080,29 @@ def _compute_is_update(task: str, last_bar_time: datetime) -> bool:
     return db_cutoff < today_dt
 
 def _run_post_script(task: str):
-    script_dir = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))), "script")
-    script_map = {"15m": "after_15m.sh", "1D": "after_1d.sh"}
+    import sys as _sys
+
+    script_dir = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))), "scripts")
+    script_map = {"15m": "after_15m.py", "1D": "after_1d.py"}
     script_name = script_map.get(task)
     if not script_name:
         return
     script_path = _os.path.join(script_dir, script_name)
     if not _os.path.isfile(script_path):
+        logger.warning(f"[同步] {task} 批处理脚本不存在: {script_path}")
         return
     try:
-        subprocess.Popen([script_path], cwd=script_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        subprocess.Popen(
+            [_sys.executable, script_path],
+            cwd=script_dir,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
         logger.info(f"[同步] {task} 已启动批处理脚本: {script_path}")
     except Exception as e:
         logger.error(f"[同步] {task} 批处理脚本执行失败: {e}")
+
 
 def _run_task(task: str):
     """执行一次同步，按同步协议决定后续动作。
