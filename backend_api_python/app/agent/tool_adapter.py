@@ -54,6 +54,25 @@ def _make_tool_class(
     except Exception:
         pass
 
+    # Build a forward method with explicit parameter names matching inputs,
+    # so smolagents validation passes (it checks forward signature vs inputs keys).
+    param_names = list(props.keys())
+    # Dynamically create a function with the correct signature
+    def _make_forward(_fn, _param_names):
+        def forward(self, **kwargs):
+            return _fn(**kwargs)
+        # Build an explicit signature so smolagents can introspect it
+        import inspect as _inspect
+        params = [_inspect.Parameter("self", _inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+        for pname in _param_names:
+            params.append(_inspect.Parameter(pname, _inspect.Parameter.KEYWORD_ONLY, default=None))
+        forward.__signature__ = _inspect.Signature(params)
+        return forward
+
+    # Mark all params as nullable since the forward signature gives them default=None
+    for pname in inputs:
+        inputs[pname]["nullable"] = True
+
     tool_class = type(
         f"Tool_{name}",
         (Tool,),
@@ -62,7 +81,7 @@ def _make_tool_class(
             "description": description,
             "inputs": inputs,
             "output_type": output_type,
-            "forward": lambda self, **kwargs: fn(**kwargs),
+            "forward": _make_forward(fn, param_names),
         },
     )
     return tool_class
@@ -239,12 +258,15 @@ def _load_mcp_tools() -> List[Tool]:
             logger.info("[ToolAdapter] Auto-built PostgreSQL MCP from DATABASE_URL")
 
     # 3. Load MCP servers
+    #    In smolagents >=1.25, ToolCollection.from_mcp() is a generator/context manager.
+    #    We must use `with` to enter it, and keep the context manager alive so tools persist.
     if config and "mcpServers" in config:
         for server_name, server_params in config["mcpServers"].items():
             try:
-                collection = ToolCollection.from_mcp(server_params)
+                ctx = ToolCollection.from_mcp(server_params, trust_remote_code=True)
+                collection = ctx.__enter__()
                 tools.extend(collection.tools)
-                _mcp_collections.append(collection)
+                _mcp_collections.append(ctx)  # keep context manager alive
                 logger.info("[ToolAdapter] Loaded MCP server '%s': %d tools", server_name, len(collection.tools))
             except Exception as e:
                 logger.warning("[ToolAdapter] Failed to load MCP server '%s': %s", server_name, e)

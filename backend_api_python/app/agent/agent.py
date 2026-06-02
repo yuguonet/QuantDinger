@@ -581,6 +581,15 @@ def get_smolagent(
         _agent_cache.instructions = instructions
         return _agent_cache
 
+    # additional_authorized_imports is only supported by CodeAgent, not ToolCallingAgent.
+    # Passing it to ToolCallingAgent causes: MultiStepAgent.__init__() got an unexpected keyword argument
+    _extra_kwargs = {}
+    if AgentClass is CodeAgent:
+        _extra_kwargs["additional_authorized_imports"] = [
+            "pandas", "numpy", "json", "math", "statistics",
+            "datetime", "collections", "itertools", "re",
+        ]
+
     agent = AgentClass(
         tools=tools,
         model=smol_model,
@@ -592,10 +601,7 @@ def get_smolagent(
         planning_interval=3,               # Auto-plan every 3 steps
         managed_agents=managed_agents,     # Multi-agent dispatch
         final_answer_checks=[_check_dashboard_json],  # Validate output
-        additional_authorized_imports=[
-            "pandas", "numpy", "json", "math", "statistics",
-            "datetime", "collections", "itertools", "re",
-        ],
+        **_extra_kwargs,
     )
 
     _agent_cache = agent
