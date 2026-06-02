@@ -335,45 +335,6 @@ def workspace_load_script(
     return ws.load_script(name, version)
 
 
-def workspace_list_versions(
-    name: str,
-) -> Dict[str, Any]:
-    """List all versions of a script.
-
-    Args:
-        name: Script filename
-
-    Returns:
-        {"name": str, "versions": [{"version": int, "size": int, "saved_at": str}]}
-    """
-    from app.agent.workspace import get_workspace
-    from app.agent.tool_context import get_session_id
-    ws = get_workspace(get_session_id() or "default")
-    versions = ws.list_script_versions(name)
-    return {"name": name, "versions": versions}
-
-
-def workspace_diff_versions(
-    name: str,
-    v1: int,
-    v2: int,
-) -> Dict[str, Any]:
-    """Get a diff between two script versions.
-
-    Args:
-        name: Script filename
-        v1: First version
-        v2: Second version
-
-    Returns:
-        {"diff": str, "name": str, "v1": int, "v2": int}
-    """
-    from app.agent.workspace import get_workspace
-    from app.agent.tool_context import get_session_id
-    ws = get_workspace(get_session_id() or "default")
-    return ws.diff_versions(name, v1, v2)
-
-
 def workspace_list() -> Dict[str, Any]:
     """List all files in the workspace (scripts, data, outputs).
 
@@ -609,31 +570,6 @@ def poll_task(
         "duration": round(time.time() - task["started_at"], 1) if task["status"] == "running" else None,
         "result": task.get("result"),
     }
-
-
-def apply_template(
-    template: str,
-) -> Dict[str, Any]:
-    """Apply a project template to the workspace.
-
-    Templates: multi_factor, backtest_pipeline, data_pipeline
-
-    Args:
-        template: Template name
-
-    Returns:
-        {"template": str, "created_scripts": [...]}
-    """
-    from app.agent.workspace import apply_template as _apply
-    from app.agent.tool_context import get_session_id
-    return _apply(get_session_id() or "default", template)
-
-
-def list_templates() -> Dict[str, Any]:
-    """List available project templates."""
-    from app.agent.workspace import list_templates as _list
-    templates = _list()
-    return {"templates": templates}
 
 
 # ── Internal execution ─────────────────────────────────────────
@@ -1003,32 +939,6 @@ WORKSPACE_TOOLS = [
         },
     },
     {
-        "fn": workspace_list_versions,
-        "name": "list_versions",
-        "description": "列出脚本的所有版本历史。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "脚本文件名"},
-            },
-            "required": ["name"],
-        },
-    },
-    {
-        "fn": workspace_diff_versions,
-        "name": "diff_versions",
-        "description": "对比脚本两个版本的差异。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "脚本文件名"},
-                "v1": {"type": "integer", "description": "旧版本号"},
-                "v2": {"type": "integer", "description": "新版本号"},
-            },
-            "required": ["name", "v1", "v2"],
-        },
-    },
-    {
         "fn": workspace_list,
         "name": "list_workspace",
         "description": "列出工作区中所有文件。",
@@ -1064,24 +974,21 @@ WORKSPACE_TOOLS = [
         },
     },
     {
-        "fn": apply_template,
-        "name": "apply_template",
+        "fn": workspace_exec_script,
+        "name": "exec_script",
         "description": (
-            "应用项目模板到工作区，一键生成分析脚手架。"
-            "可用模板：multi_factor(多因子选股)、backtest_pipeline(回测管道)、data_pipeline(数据清洗)"
+            "在工作区中执行 Python 脚本，支持数据源注入（get_kline/get_ticker 等自动可用）。"
+            "可加载已保存脚本（传 name）或直接执行代码（传 code）。"
+            "支持流式输出和最长 600 秒超时。"
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "template": {"type": "string", "description": "模板名称"},
+                "name": {"type": "string", "description": "已保存的脚本名（与 code 二选一）", "default": ""},
+                "code": {"type": "string", "description": "Python 代码（与 name 二选一）", "default": ""},
+                "timeout": {"type": "integer", "description": "超时秒数，最大600", "default": 120},
+                "save_as": {"type": "string", "description": "执行前自动保存脚本的名称", "default": ""},
             },
-            "required": ["template"],
         },
-    },
-    {
-        "fn": list_templates,
-        "name": "list_templates",
-        "description": "列出可用的项目模板。",
-        "parameters": {"type": "object", "properties": {}},
     },
 ]
