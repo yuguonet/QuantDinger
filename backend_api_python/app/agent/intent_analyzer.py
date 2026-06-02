@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+
 """
 Intent Analyzer — 轻量级前置意图分析。
 
@@ -10,6 +11,7 @@ Intent Analyzer — 轻量级前置意图分析。
 - 输出严格 JSON，便于程序化处理
 - 失败时降级到默认流程（不阻塞主流程）
 """
+
 from __future__ import annotations
 
 import json
@@ -107,7 +109,10 @@ _INTENT_PROMPT = """# Role
 {history}
 
 # User Input
-{message}"""
+请分析以下用户消息的意图，严格按上述格式输出 JSON，不要输出其他内容：
+---
+{message}
+---"""
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -120,6 +125,7 @@ def analyze_intent(
     provider: str = None,
     history: List[Dict[str, str]] = None,
 ) -> IntentResult:
+    print(f"[DEBUG-INTENT] >>> analyze_intent loaded from: {__file__}", flush=True)
     """分析用户消息的意图。
 
     Args:
@@ -183,11 +189,37 @@ def analyze_intent(
             lines = [l for l in lines if not l.strip().startswith("```")]
             raw = "\n".join(lines).strip()
 
-        result = json.loads(raw)
+        logger.debug("[Intent] LLM raw response: %s", raw[:500])
+
+        # 尝试解析 JSON（兼容 LLM 在 JSON 前后加了废话的情况）
+        result = None
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError:
+            # 从响应中提取第一个 JSON 对象
+            import re as _re
+            match = _re.search(r'\{[^{}]*"domain"[^{}]*\}', raw, _re.DOTALL)
+            if match:
+                try:
+                    result = json.loads(match.group())
+                except json.JSONDecodeError:
+                    pass
+            if result is None:
+                raise  # 让外层 except 捕获
+
+        # 校验返回结构：必须是 dict 且包含 domain 字段
+        if not isinstance(result, dict):
+            logger.warning("[Intent] LLM 返回非 dict 类型: %s | raw: %s", type(result).__name__, raw[:200])
+            return IntentResult(domain="chat", intent="bad_format", confidence=0.0, raw_response=raw)
+
+        if "domain" not in result:
+            logger.warning("[Intent] LLM 返回缺少 'domain' 字段: %s", raw[:200])
+            return IntentResult(domain="chat", intent="no_domain", confidence=0.0, raw_response=raw)
+
         domain = result.get("domain", "chat")
         # 校验领域是否存在
         if domain not in get_all_domains():
-            logger.warning("[Intent] 未知领域 '%s'，降级到 chat", domain)
+            logger.warning("[Intent] 未知领域 '%s'，降级到 chat | raw: %s", domain, raw[:200])
             domain = "chat"
 
         return IntentResult(
@@ -199,7 +231,7 @@ def analyze_intent(
         )
 
     except json.JSONDecodeError as e:
-        logger.warning("[Intent] JSON 解析失败: %s | raw: %s", e, raw[:200])
+        logger.warning("[Intent] JSON 解析失败: %s | raw: %s", e, raw[:500])
         return IntentResult(domain="chat", intent="parse_error", confidence=0.0, raw_response=raw)
     except Exception as e:
         logger.warning("[Intent] 分析失败，降级到默认: %s", e)

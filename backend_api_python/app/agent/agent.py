@@ -53,11 +53,11 @@ def _get_agent_class():
         from app.services.llm import LLMService
         svc = LLMService()
         base_url = svc.get_base_url(svc.provider)
-        if "localhost:11434" in base_url or "127.0.0.1:11434" in base_url:
+        if any(k in base_url for k in ("localhost:11434", "127.0.0.1:11434", "ollama")):
             logger.info("[Agent] Detected Ollama endpoint (%s), using ToolCallingAgent", base_url)
             return ToolCallingAgent
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("[Agent] Ollama auto-detect failed: %s", e)
     return CodeAgent
 
 
