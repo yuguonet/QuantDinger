@@ -12,7 +12,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import time
 from typing import Any, Callable, Dict, List, Optional
 
@@ -46,151 +45,50 @@ def _get_agent_class():
 
 
 # ═══════════════════════════════════════════════════════════════
-# 1. Workflow Templates & Intent Detection
+# 1. Tool Catalog & Agent Instructions
 # ═══════════════════════════════════════════════════════════════
 
-INTENT_KEYWORDS = {
-    "screening": ["选股", "筛选", "选股票", "找股票", "初选", "股票池", "screen", "filter", "scan"],
-    "backtest": ["回测", "回验", "验证", "历史表现", "过去表现", "backtest", "test"],
-    "trading": ["买入", "卖出", "交易", "下单", "启动策略", "执行", "buy", "sell", "trade", "execute"],
-    "full_pipeline": ["全流程", "完整流程", "一站式", "从头到尾", "pipeline", "full"],
-    "code_analysis": ["写脚本", "写代码", "代码分析", "迭代", "工作区", "脚本", "数据分析",
-                      "write script", "code", "iterate", "workspace", "script"],
-    "analysis": ["分析", "行情", "走势", "技术面", "基本面", "怎么看", "analyze", "analysis"],
-}
-
-WORKFLOW_TEMPLATES = {
-    "analysis": """## 分析工作流程（必须严格按阶段执行，每阶段等工具结果返回后再进入下一阶段）
-
-**第一阶段 · 行情与技术面**（首先执行）
-- `get_realtime_quote` 获取实时行情
-- `agent_get_kline` 获取历史K线（建议 days=120，短线分析可用 15m/1H 等短周期）
-- `analyze_trend` 综合技术分析（MA + MACD + RSI + BOLL + KDJ 五维共振）
-
-**第二阶段 · 形态与量能**（等第一阶段结果返回后执行）
-- `analyze_pattern` 识别K线形态（15+ 种经典形态）
-- `get_volume_analysis` 分析量能与量价关系
-- `get_chip_distribution` 获取筹码分布（仅A股）
-
-**第三阶段 · 情报搜索**（等前两阶段完成后执行）
-- `search_stock_news` 搜索最新资讯、减持、业绩预告等风险信号
-
-**第四阶段 · 深度分析与报告**（所有数据就绪后，输出完整决策仪表盘 JSON）
-- 当预设工具分析深度不够时，直接写 Python 代码做量化分析
-- 可以用代码组合多个工具的返回值，做自定义计算和可视化""",
-
-    "screening": """## 选股筛选工作流程
-
-**第一步 · 条件筛选**
-- 使用 `screen_stocks` 按行业、概念、涨跌幅、换手率等条件从全市场筛选候选股
-
-**第二步 · 指标验证**（对候选股逐只执行）
-- 使用 `list_indicators` 查看可用指标策略
-- 使用 `run_indicator_signal` 对每只候选股执行指标策略，检查是否出现买入信号
-
-**第三步 · 综合推荐**
-- 汇总有买入信号的股票，分析信号强度
-- 给出推荐列表和理由""",
-
-    "backtest": """## 回测验证工作流程
-
-**第一步 · 发现策略**
-- 使用 `list_strategies` 列出用户所有交易策略
-- 使用 `list_indicators` 列出可用指标策略
-
-**第二步 · 执行回测**
-- 使用 `run_backtest` 对指定策略在指定股票和时间范围内跑回测
-
-**第三步 · 分析绩效**
-- 分析回测结果：收益率、胜率、最大回撤、夏普比率
-- 使用 `get_backtest_history` 查看历史回测记录做对比""",
-
-    "trading": """## 交易执行工作流程
-
-**第一步 · 确认信号**
-- 使用 `get_realtime_quote` 确认当前行情
-- 使用 `run_indicator_signal` 确认是否出现交易信号
-
-**第二步 · 确认策略**
-- 使用 `list_strategies` 列出可用策略
-- 使用 `get_strategy_detail` 确认策略配置
-
-**第三步 · 执行交易**
-- 使用 `start_strategy` 启动策略执行
-- 使用 `get_strategy_trades` 监控最近交易记录""",
-
-    "full_pipeline": """## 完整量化交易流水线
-
-**第一步 · 选股初筛**
-- 使用 `screen_stocks` 从全市场筛选候选股
-
-**第二步 · 指标精筛**
-- 使用 `run_indicator_signal` 对候选股执行指标策略
-
-**第三步 · 回测验证**
-- 使用 `run_backtest` 对筛选出的标的跑历史回测
-
-**第四步 · 交易执行**
-- 使用 `start_strategy` 对通过验证的标的启动策略""",
-
-    "code_analysis": """## 迭代代码分析工作流程
-
-你拥有一个持久化的工作区，可以保存脚本、读写文件、执行代码并迭代优化。
-
-**核心循环（按需重复）：**
-
-1. **规划** — 明确分析目标，拆解为可执行的步骤
-2. **编写代码** — 用 `save_script` 保存脚本到工作区
-3. **执行** — 用 Python 代码直接执行（支持文件I/O）
-4. **检查结果** — 用 Python 代码读取输出文件，分析执行结果
-5. **迭代优化** — 根据结果修改代码，重新保存和执行
-6. **沉淀** — 最终版本用 `save_script` 保存，附带清晰的 description
-
-**可用变量（自动注入）：**
-- `WORKSPACE` — 工作区根目录路径
-- `pd` — pandas, `np` — numpy, `Path` — pathlib.Path
-- `data` — 上下文数据（K线、行情等）
-
-CodeAgent 可以直接用 Python 代码读写文件、执行分析，无需额外工具。""",
-}
-
-TOOL_CATALOG = """## 可用工具分类
+TOOL_CATALOG = """## 可用工具
 
 **名称/代码互查**: resolve_stock_name(代码→名称), search_stock_by_name(名称→代码，模糊搜索)
-**数据工具**: get_realtime_quote(实时行情), agent_get_kline(多周期K线/OHLCV, 支持1m~1W, 可指定market), get_stock_info(基本面), get_market_indices(大盘指数), get_sector_rankings(板块排名)
-**分析工具**: analyze_trend(五维技术分析), calculate_ma(均线), get_volume_analysis(量价), analyze_pattern(15+形态), get_chip_distribution(筹码), get_indicator_snapshot(指标快照)
-**搜索工具**: search_stock_news(新闻), search_comprehensive_intel(综合情报)
-**选股工具**: screen_stocks(本地DB选股), smart_screen(综合选股), review_stocks_with_indicator(指标审核)
-**指标工具**: list_indicators(列出指标), get_indicator_params(指标参数), run_indicator_signal(执行指标信号)
-**回测工具**: run_backtest(跑回测), get_backtest_history(查历史回测记录)
-**交易工具**: list_strategies(列出策略), get_strategy_detail(策略详情), start_strategy(启动策略), stop_strategy(停止策略), get_strategy_trades(交易记录)
+**行情数据**: get_realtime_quote(实时行情), agent_get_kline(多周期K线/OHLCV, 支持1m~1W), get_stock_info(基本面), get_market_indices(大盘指数), get_sector_rankings(板块排名)
+**技术分析**: analyze_trend(五维技术分析:MA+MACD+RSI+BOLL+KDJ), calculate_ma(均线), get_volume_analysis(量价), analyze_pattern(15+K线形态), get_chip_distribution(筹码), get_indicator_snapshot(指标快照)
+**情报搜索**: search_stock_news(新闻), search_comprehensive_intel(综合情报)
+**选股**: screen_stocks(本地DB选股), smart_screen(综合选股), review_stocks_with_indicator(指标审核)
+**指标策略**: list_indicators(列出指标), get_indicator_params(指标参数), run_indicator_signal(执行指标信号)
+**回测**: run_backtest(跑回测), get_backtest_history(查历史回测记录)
+**交易**: list_strategies(列出策略), get_strategy_detail(策略详情), start_strategy(启动策略), stop_strategy(停止策略), get_strategy_trades(交易记录)
 **龙虎榜/热榜**: get_dragon_tiger_stocks, get_dragon_tiger_by_stock, get_hot_rank_stocks, get_zt_pool_stocks, get_limit_down_stocks, get_broken_board_stocks
-**内置工具**: web_search(DuckDuckGo搜索), visit_webpage(访问网页), wikipedia_search(维基百科)
-⚠️ user_input 工具已禁用（Web 环境不可用）。如需向用户提问，直接在回复文本中提问，用户会通过下一轮对话回答你。
-**自定义分析**: Agent 原生代码执行(LLM 直接写 Python 代码，仅 CodeAgent 模式)
-**工作区工具**: save_script, load_script, list_workspace, shell_exec, run_background, poll_task, apply_template, list_templates
-**源码扫描(只读)**: list_project_files(目录结构), read_project_file(读源码), grep_project(搜索代码)
-**自修改**: self_modify_list_dirs(目录列表), self_modify_read(读源码), self_modify_diff_head(快速预览), self_modify_write(修改文件), self_modify_create(新建文件), self_modify_diff(对比差异), self_modify_rollback(回滚), self_modify_log(修改日志)
+**搜索**: web_search(DuckDuckGo), visit_webpage(访问网页), wikipedia_search(维基百科)
+**代码执行**: Agent 原生 Python 代码（仅 CodeAgent），可组合多个工具返回值做自定义计算
+**工作区**: save_script, load_script, list_workspace, shell_exec, run_background, poll_task
+**源码扫描(只读)**: list_project_files, read_project_file, grep_project
+**自修改**: self_modify_list_dirs, self_modify_read, self_modify_write, self_modify_create, self_modify_diff, self_modify_rollback
 
-⚠️ 当用户只给中文股票名称没给代码时，必须先用 search_stock_by_name 查到代码再分析。
-⚠️ agent_get_kline 是获取K线原始数据，get_backtest_history 是查询过去的回测记录。
-⚠️ 你可以用 Python 代码组合多个工具的返回值，做自定义计算。例如：
-```python
-quote = get_realtime_quote("600519")
-history = agent_get_kline("600519", timeframe="1D", days=120)
-# 短线分析可以用分钟级周期
-# history_15m = agent_get_kline("600519", timeframe="15m", days=5)
-# 然后用 pandas 做自定义分析
-```"""
+**使用提示：**
+- 当用户只给中文股票名称没给代码时，必须先用 search_stock_by_name 查到代码再分析。
+- agent_get_kline 是获取K线原始数据，get_backtest_history 是查询过去的回测记录。
+- 你可以用 Python 代码组合多个工具的返回值，做自定义计算。
+- 如需向用户提问，直接在回复文本中提问，用户会通过下一轮对话回答你。
+"""
 
+GUIDANCE = """## 工作指引
 
-def _detect_intent(message: str) -> str:
-    msg_lower = message.lower()
-    for intent, keywords in INTENT_KEYWORDS.items():
-        for kw in keywords:
-            if kw in msg_lower:
-                return intent
-    return "analysis"
+根据用户消息的性质，自主判断该怎么做：
+
+**闲聊/打招呼** — 不需要调工具，直接友好回复。介绍自己是量化分析助手，提示用户可以问什么。
+
+**股票分析** — 按需调用工具获取数据，建议流程：行情→技术面→形态→量能→情报→综合判断。
+输出完整的分析结论和风险提示。当工具分析深度不够时，用 Python 代码做更深入的量化分析。
+
+**选股筛选** — 用 screen_stocks 按条件筛选，再用 run_indicator_signal 验证信号，汇总推荐。
+
+**回测验证** — 用 list_strategies/list_indicators 发现策略，用 run_backtest 执行，分析绩效指标。
+
+**交易执行** — 先确认行情和信号，再用 start_strategy 启动，用 get_strategy_trades 监控。
+
+**代码/数据分析** — 利用工作区工具保存和执行脚本，支持迭代优化。
+"""
 
 
 def _load_preamble() -> str:
@@ -220,9 +118,6 @@ def _load_preamble() -> str:
 
 
 def _build_instructions(user_message: str = "", skill_instructions: str = "", language: str = "zh") -> str:
-    intent = _detect_intent(user_message)
-    workflow = WORKFLOW_TEMPLATES.get(intent, WORKFLOW_TEMPLATES["analysis"])
-
     if str(language or "").lower().startswith("en"):
         lang_section = "\n## Output Language\n- Reply in English.\n- All JSON values in English.\n"
     else:
@@ -280,18 +175,18 @@ def _build_instructions(user_message: str = "", skill_instructions: str = "", la
     preamble = _load_preamble()
     return f"""{preamble}
 
-{workflow}
+{GUIDANCE}
 
 {TOOL_CATALOG}
 {skill_section}{scan_section}{modify_section}## 规则
 
 1. **必须调用工具获取真实数据** — 绝不编造数字，所有数据必须来自工具返回结果。
-2. **系统化分析** — 严格按工作流程分阶段执行。
-3. **深度优先** — 不要满足于工具的默认输出，当分析深度不够时直接写 Python 代码做更深入的量化分析。
-4. **风险优先** — 必须排查风险（股东减持、业绩预警、监管问题）。
-5. **工具失败处理** — 记录失败原因，使用已有数据继续分析，不重复调用失败工具。
-6. **多维验证** — 技术面结论应至少有 2 个以上指标相互验证，避免单一指标误判。
-7. **善用代码** — 你是 CodeAgent，可以用 Python 代码组合工具、做计算、处理数据。不要局限于单次工具调用。
+2. **深度优先** — 不要满足于工具的默认输出，当分析深度不够时直接写 Python 代码做更深入的量化分析。
+3. **风险优先** — 分析必须包含风险提示，投资决策前先排查风险（股东减持、业绩预警、监管问题）。
+4. **工具失败处理** — 记录失败原因，使用已有数据继续分析，不重复调用失败工具。
+5. **多维验证** — 技术面结论应至少有 2 个以上指标相互验证，避免单一指标误判。
+6. **善用代码** — 你是 CodeAgent，可以用 Python 代码组合工具、做计算、处理数据。不要局限于单次工具调用。
+7. **诚实透明** — 数据不足时明确告知，不猜测，不掩饰不确定性。
 {lang_section}"""
 
 
@@ -322,43 +217,14 @@ def _get_skill_instructions(skills: Optional[List[str]] = None, user_id: int = 1
 # ═══════════════════════════════════════════════════════════════
 
 def _check_dashboard_json(answer, memory, agent) -> bool:
-    """Validate that the final answer contains a valid dashboard JSON when in analysis mode.
+    """Validate that the final answer is non-empty.
 
-    Only enforces JSON structure when the intent is 'analysis' (dashboard mode).
-    For other intents (chat, screening, etc.), any non-empty answer is accepted.
+    Previously enforced JSON dashboard structure in analysis mode.
+    Now that the LLM decides its own approach, accept any non-empty answer.
     """
     if not answer or not isinstance(answer, str):
         return False
-
-    # Try to extract JSON from the answer
-    answer_stripped = answer.strip()
-
-    # Check if it's a JSON object (dashboard mode)
-    if answer_stripped.startswith("{"):
-        try:
-            obj = json.loads(answer_stripped)
-            # Validate required dashboard fields
-            required = ["stock_name", "sentiment_score", "trend_prediction", "operation_advice"]
-            missing = [f for f in required if f not in obj]
-            if missing:
-                logger.warning("[FinalAnswerCheck] Dashboard JSON missing fields: %s", missing)
-                # Don't reject — the agent might have a good reason for partial output
-                return True
-            return True
-        except json.JSONDecodeError:
-            pass
-
-    # Check markdown-wrapped JSON
-    json_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", answer_stripped, re.DOTALL)
-    if json_match:
-        try:
-            obj = json.loads(json_match.group(1))
-            return isinstance(obj, dict)
-        except json.JSONDecodeError:
-            pass
-
-    # Non-JSON answer is fine for chat/non-dashboard intents
-    return bool(answer_stripped)
+    return bool(answer.strip())
 
 
 # ═══════════════════════════════════════════════════════════════
