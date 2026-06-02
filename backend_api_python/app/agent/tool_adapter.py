@@ -213,8 +213,7 @@ _mcp_collections: list = []  # Keep references alive
 def _load_mcp_tools() -> List[Tool]:
     """Load tools from MCP servers.
 
-    Auto-builds PostgreSQL MCP from DATABASE_URL in .env if no explicit config given.
-    Explicit config via env vars overrides auto-detection:
+    Explicit config via env vars:
       - SMOLAGENTS_MCP_CONFIG: path to JSON config file
       - SMOLAGENTS_MCP_SERVERS: inline JSON string
     """
@@ -239,23 +238,9 @@ def _load_mcp_tools() -> List[Tool]:
         except Exception as e:
             logger.warning("[ToolAdapter] Failed to read MCP config '%s': %s", mcp_config_path, e)
 
-    # 2. Auto-detect: build PostgreSQL MCP from DATABASE_URL if no explicit config
-    if not config:
-        database_url = os.getenv("DATABASE_URL", "").strip()
-        if database_url:
-            config = {
-                "mcpServers": {
-                    "postgres": {
-                        "command": "npx",
-                        "args": ["mcp-postgres@latest"],
-                        "env": {
-                            "DATABASE_URL": database_url,
-                            "DB_READ_ONLY": os.getenv("DB_READ_ONLY", "true"),
-                        },
-                    }
-                }
-            }
-            logger.info("[ToolAdapter] Auto-built PostgreSQL MCP from DATABASE_URL")
+    # 2. Auto-detect: DISABLED — stdio-based MCP (npx) is incompatible with
+    #    smolagents >=1.25 ToolCollection.from_mcp() which expects HTTP transport.
+    #    Users should configure MCP explicitly via SMOLAGENTS_MCP_SERVERS or SMOLAGENTS_MCP_CONFIG.
 
     # 3. Load MCP servers
     #    In smolagents >=1.25, ToolCollection.from_mcp() is a generator/context manager.
@@ -278,8 +263,18 @@ def _load_mcp_tools() -> List[Tool]:
 # 4. Master loader
 # ═══════════════════════════════════════════════════════════════
 
+_tools_cache = None  # type: ignore
+
+
 def build_all_tools() -> List[Tool]:
-    """Load all tools: QuantDinger built-in + smolagents built-in + Hub + MCP."""
+    """Load all tools: QuantDinger built-in + smolagents built-in + Hub + MCP.
+
+    Results are cached after the first call to avoid repeated heavy imports.
+    """
+    global _tools_cache
+    if _tools_cache is not None:
+        return _tools_cache
+
     from app.agent.tools.data_tools import DATA_TOOLS
     from app.agent.tools.analysis_tools import ANALYSIS_TOOLS
     from app.agent.tools.search_tools import SEARCH_TOOLS
@@ -318,4 +313,5 @@ def build_all_tools() -> List[Tool]:
     tools.extend(mcp)
 
     logger.info("[ToolAdapter] Total tools loaded: %d", len(tools))
+    _tools_cache = tools
     return tools

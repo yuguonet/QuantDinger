@@ -4,8 +4,9 @@ Agent — smolagents Agent for QuantDinger.
 
 Supports both CodeAgent (LLM writes Python code) and ToolCallingAgent (OpenAI function calling).
 Agent type is configurable via AGENT_TYPE env var:
-  - "code" (default): CodeAgent — best for GPT-4o, Claude, DeepSeek etc.
+  - "code": CodeAgent — best for GPT-4o, Claude, DeepSeek etc.
   - "tool": ToolCallingAgent — best for local models (Ollama) that don't generate code blocks.
+  - (default): Auto-detect — uses ToolCallingAgent for Ollama, CodeAgent otherwise.
 """
 from __future__ import annotations
 
@@ -37,10 +38,26 @@ _cached_tools_signature: str = ""
 
 
 def _get_agent_class():
-    """Return the agent class based on AGENT_TYPE env var."""
-    agent_type = os.getenv("AGENT_TYPE", "code").strip().lower()
+    """Return the agent class based on AGENT_TYPE env var.
+
+    Auto-detection: if the model is served by Ollama (localhost:11434),
+    default to ToolCallingAgent since local models don't generate code blocks.
+    """
+    agent_type = os.getenv("AGENT_TYPE", "").strip().lower()
     if agent_type == "tool":
         return ToolCallingAgent
+    if agent_type == "code":
+        return CodeAgent
+    # Auto-detect: check if the LLM endpoint is Ollama
+    try:
+        from app.services.llm import LLMService
+        svc = LLMService()
+        base_url = svc.get_base_url(svc.provider)
+        if "localhost:11434" in base_url or "127.0.0.1:11434" in base_url:
+            logger.info("[Agent] Detected Ollama endpoint (%s), using ToolCallingAgent", base_url)
+            return ToolCallingAgent
+    except Exception:
+        pass
     return CodeAgent
 
 
@@ -74,23 +91,26 @@ TOOL_CATALOG = """## 可用工具
 
 GUIDANCE = """## 工作指引
 
-根据用户消息的性质，自主判断该怎么做：
+**⚠️ 最重要的规则：你必须使用 final_answer 工具来返回最终回复。不通过 final_answer 返回的回复不会被系统识别，会导致多余的执行步骤。**
 
-**⚠️ 重要：你必须使用 final_answer 工具来返回最终回复。不通过 final_answer 返回的回复不会被系统识别，会导致多余的执行步骤。**
+### 判断是否需要调用工具
 
-**闲聊/打招呼** — 不需要调其他工具，直接用 final_answer 返回友好回复。介绍自己是量化分析助手，提示用户可以问什么。
+收到用户消息后，先判断这条消息是否需要获取数据：
+- **不需要工具**（打招呼、闲聊、问你是谁、简单问题）→ **第一步直接调用 final_answer 返回回复，不调用任何其他工具。**
+- **需要工具**（股票分析、选股、回测、交易）→ 按下面的流程执行，完成后用 final_answer 返回。
+
+### 任务流程
 
 **股票分析** — 按需调用工具获取数据，建议流程：行情→技术面→形态→量能→情报→综合判断。
 输出完整的分析结论和风险提示。当工具分析深度不够时，用 Python 代码做更深入的量化分析。
-最后用 `final_answer(分析结果)` 返回。
 
-**选股筛选** — 用 screen_stocks 按条件筛选，再用 run_indicator_signal 验证信号，汇总推荐，最后用 `final_answer()` 返回。
+**选股筛选** — 用 screen_stocks 按条件筛选，再用 run_indicator_signal 验证信号，汇总推荐。
 
-**回测验证** — 用 list_strategies/list_indicators 发现策略，用 run_backtest 执行，分析绩效指标，最后用 `final_answer()` 返回。
+**回测验证** — 用 list_strategies/list_indicators 发现策略，用 run_backtest 执行，分析绩效指标。
 
-**交易执行** — 先确认行情和信号，再用 start_strategy 启动，用 get_strategy_trades 监控，最后用 `final_answer()` 返回。
+**交易执行** — 先确认行情和信号，再用 start_strategy 启动，用 get_strategy_trades 监控。
 
-**代码/数据分析** — 利用工作区工具保存和执行脚本，支持迭代优化，最后用 `final_answer()` 返回。
+**代码/数据分析** — 利用工作区工具保存和执行脚本，支持迭代优化。
 """
 
 
@@ -183,14 +203,15 @@ def _build_instructions(user_message: str = "", skill_instructions: str = "", la
 {TOOL_CATALOG}
 {skill_section}{scan_section}{modify_section}## 规则
 
-0. **⚠️ 必须用 final_answer() 返回结果** — 完成任务后，必须调用 `final_answer(你的回复)` 来结束。这是唯一能正确终止的方式。不要输出纯文本而不调用 final_answer，否则系统会继续执行多余的步骤。
-1. **必须调用工具获取真实数据** — 绝不编造数字，所有数据必须来自工具返回结果。
-2. **深度优先** — 不要满足于工具的默认输出，当分析深度不够时直接写 Python 代码做更深入的量化分析。
-3. **风险优先** — 分析必须包含风险提示，投资决策前先排查风险（股东减持、业绩预警、监管问题）。
-4. **工具失败处理** — 记录失败原因，使用已有数据继续分析，不重复调用失败工具。
-5. **多维验证** — 技术面结论应至少有 2 个以上指标相互验证，避免单一指标误判。
-6. **善用代码** — 你是 CodeAgent，可以用 Python 代码组合工具、做计算、处理数据。不要局限于单次工具调用。
-7. **诚实透明** — 数据不足时明确告知，不猜测，不掩饰不确定性。
+0. **⚠️ 必须用 final_answer() 返回结果** — 完成任务后，必须调用 `final_answer(你的回复)` 来结束。这是唯一能正确终止的方式。
+1. **不需要工具的消息，第一步就 final_answer** — 打招呼、闲聊等不需要数据的请求，直接调用 final_answer，不要调用其他工具。
+2. **必须调用工具获取真实数据** — 绝不编造数字，所有数据必须来自工具返回结果。
+3. **深度优先** — 不要满足于工具的默认输出，当分析深度不够时直接写 Python 代码做更深入的量化分析。
+4. **风险优先** — 分析必须包含风险提示，投资决策前先排查风险（股东减持、业绩预警、监管问题）。
+5. **工具失败处理** — 记录失败原因，使用已有数据继续分析，不重复调用失败工具。
+6. **多维验证** — 技术面结论应至少有 2 个以上指标相互验证，避免单一指标误判。
+7. **善用工具** — 可以用工具组合、做计算、处理数据。不要局限于单次工具调用。
+8. **诚实透明** — 数据不足时明确告知，不猜测，不掩饰不确定性。
 {lang_section}"""
 
 
@@ -449,6 +470,9 @@ def get_smolagent(
     sig = f"{len(tools)}_{model}_{provider}_{user_id}_{AgentClass.__name__}"
     if _agent_cache is not None and _cached_tools_signature == sig:
         _agent_cache.instructions = instructions
+        _agent_cache._setup_managed_agents(managed_agents)
+        _agent_cache.max_steps = max_steps
+        _agent_cache.planning_interval = None
         return _agent_cache
 
     # additional_authorized_imports is only supported by CodeAgent, not ToolCallingAgent.
@@ -468,7 +492,7 @@ def get_smolagent(
         verbosity_level=LogLevel.INFO,
         return_full_result=True,
         stream_outputs=True,               # LLM token-by-token streaming
-        planning_interval=3,               # Auto-plan every 3 steps
+        planning_interval=None,            # Don't auto-inject planning steps — let the LLM decide
         managed_agents=managed_agents,     # Multi-agent dispatch
         final_answer_checks=[_check_dashboard_json],  # Validate output
         **_extra_kwargs,
@@ -477,7 +501,7 @@ def get_smolagent(
     _agent_cache = agent
     _cached_tools_signature = sig
     logger.info(
-        "[Agent] Built %s: %d tools, %d managed agents, planning_interval=3, max_steps=%d",
+        "[Agent] Built %s: %d tools, %d managed agents, planning_interval=None, max_steps=%d",
         AgentClass.__name__, len(tools), len(managed_agents), max_steps,
     )
     return agent
