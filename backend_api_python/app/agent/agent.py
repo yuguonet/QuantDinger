@@ -157,6 +157,8 @@ TOOL_CATALOG = """## 可用工具分类
 **内置工具**: web_search(DuckDuckGo搜索), visit_webpage(访问网页), wikipedia_search(维基百科), user_input(询问用户)
 **自定义分析**: CodeAgent 原生代码执行(LLM 直接写 Python 代码)
 **工作区工具**: save_script, load_script, list_workspace, shell_exec, run_background, poll_task, apply_template, list_templates
+**源码扫描(只读)**: list_project_files(目录结构), read_project_file(读源码), grep_project(搜索代码)
+**自修改**: self_modify_list_dirs(目录列表), self_modify_read(读源码), self_modify_diff_head(快速预览), self_modify_write(修改文件), self_modify_create(新建文件), self_modify_diff(对比差异), self_modify_rollback(回滚), self_modify_log(修改日志)
 
 ⚠️ 当用户只给中文股票名称没给代码时，必须先用 search_stock_by_name 查到代码再分析。
 ⚠️ get_daily_history 是获取K线原始数据，get_backtest_history 是查询过去的回测记录。
@@ -190,13 +192,57 @@ def _build_instructions(user_message: str = "", skill_instructions: str = "", la
     if skill_instructions:
         skill_section = f"\n## 激活的交易技能\n\n{skill_instructions}\n"
 
+    # 源码扫描能力提示
+    scan_section = ""
+    if os.getenv("AGENT_SCAN_PROJECT_READONLY", "true").lower() == "true":
+        scan_section = """
+## 源码扫描能力（只读）
+
+你可以使用以下工具扫描项目源码，理解代码架构、查找 bug、分析数据流：
+- `list_project_files` — 列出项目目录结构
+- `read_project_file` — 读取源码文件内容
+- `grep_project` — 搜索代码片段（支持正则）
+
+这些工具是只读的，不会修改任何项目文件。
+当用户要求分析项目结构、查找代码问题、理解数据流时，优先使用这些工具。
+
+"""
+
+    # 工具自修改能力提示
+    modify_section = ""
+    if os.getenv("AGENT_TOOLS_SELF_MODIFY", "false").lower() == "true":
+        modify_paths = os.getenv("AGENT_SELF_MODIFY_PATHS", "backend_api_python/app/agent/tools")
+        modify_section = f"""
+## 自修改能力
+
+你可以读写以下目录中的文件，实现 bug 修复、功能升级、新模块扩充：
+允许的目录: {modify_paths}
+
+可用工具：
+- `self_modify_list_dirs` — 列出所有允许修改的目录及其文件
+- `self_modify_read` — 读取文件完整源码
+- `self_modify_diff_head` — 读取文件头部 N 行（快速预览）
+- `self_modify_write` — 修改现有文件（自动备份原文件到 .agent_backups/）
+- `self_modify_create` — 创建新文件
+- `self_modify_diff` — 对比修改差异
+- `self_modify_rollback` — 回滚到备份版本
+- `self_modify_log` — 查看修改历史
+
+安全约束：
+- 每次修改自动备份原文件
+- 只能修改配置的目录范围内的文件
+- 修改后可能需重启 Agent 生效
+- **先用 self_modify_read 理解现有代码，再做最小改动**
+- 路径使用相对于项目根目录的格式（如 backend_api_python/app/services/llm.py）
+
+"""
+
     return f"""你是一位专业的金融投资分析 Agent，拥有丰富的数据工具和交易技能。
 
 {workflow}
 
 {TOOL_CATALOG}
-{skill_section}
-## 规则
+{skill_section}{scan_section}{modify_section}## 规则
 
 1. **必须调用工具获取真实数据** — 绝不编造数字，所有数据必须来自工具返回结果。
 2. **系统化分析** — 严格按工作流程分阶段执行。

@@ -270,12 +270,15 @@ def build_all_tools() -> List[Tool]:
     from app.agent.tools.trading_tools import TRADING_TOOLS
     from app.agent.tools.screening_tools import SCREENING_TOOLS
     from app.agent.tools.code_workspace_tools import WORKSPACE_TOOLS
+    from app.agent.tools.scan_tools import SCAN_TOOLS
+    from app.agent.tools.self_modify_tools import SELF_MODIFY_TOOLS
 
     # 1. QuantDinger tools (dict-based → Tool)
     all_lists = [
         DATA_TOOLS, ANALYSIS_TOOLS, SEARCH_TOOLS, MARKET_TOOLS,
         SCREENER_TOOLS, BACKTEST_TOOLS, INDICATOR_TOOLS, TRADING_TOOLS,
         SCREENING_TOOLS, WORKSPACE_TOOLS,
+        SCAN_TOOLS, SELF_MODIFY_TOOLS,
     ]
     tools = []
     for lst in all_lists:
