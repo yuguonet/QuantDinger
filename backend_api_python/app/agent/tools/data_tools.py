@@ -128,7 +128,18 @@ def agent_get_kline(stock_code: str, timeframe: str = "1D", days: int = 60, mark
     ds = _get_ds(market)
     try:
         klines = ds.get_kline(stock_code, timeframe, days) or []
-        return klines
+        # 精简返回：缩短字段名、四舍五入价格，大幅减少 token 消耗
+        compact = []
+        for k in klines:
+            compact.append({
+                "t": k.get("date", k.get("timestamp", "")),
+                "o": round(k.get("open", 0), 2),
+                "h": round(k.get("high", 0), 2),
+                "l": round(k.get("low", 0), 2),
+                "c": round(k.get("close", 0), 2),
+                "v": k.get("volume", 0),
+            })
+        return compact
     except Exception as e:
         logger.error("get_kline(%s, %s, %d) failed: %s", stock_code, timeframe, days, e)
         return []
