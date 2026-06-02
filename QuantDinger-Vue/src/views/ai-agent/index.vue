@@ -126,15 +126,25 @@
           @keydown.enter.exact.prevent="sendMessage"
           :disabled="streaming"
         />
+        <!-- 发送 / 停止 二合一按钮 -->
         <a-button
+          v-if="!streaming"
           type="primary"
           shape="circle"
-          :loading="streaming"
-          :disabled="!inputText.trim() && !streaming"
+          :disabled="!inputText.trim()"
           @click="sendMessage"
           class="send-btn"
         >
           <template #icon><a-icon type="arrow-up" /></template>
+        </a-button>
+        <a-button
+          v-else
+          type="danger"
+          shape="circle"
+          @click="stopStream"
+          class="send-btn stop-btn"
+        >
+          <template #icon><a-icon type="stop" /></template>
         </a-button>
       </div>
       <div class="input-hint">
@@ -374,6 +384,21 @@ export default {
       )
     }
 
+    function stopStream () {
+      // 1. 前端立即中断 fetch 连接
+      if (streamController.value) {
+        streamController.value.close()
+        streamController.value = null
+      }
+      // 2. 通知后端中断 agent 执行（fire-and-forget）
+      if (sessionId.value) {
+        request({ url: `/api/agent/interrupt/${sessionId.value}`, method: 'post' }).catch(() => {})
+      }
+      // 3. 立即恢复 UI 状态
+      streaming.value = false
+      updateLastMessage('⏹ 已中断', false)
+    }
+
     function pushMessage (role, content, extra = {}) {
       const now = new Date()
       const time = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`
@@ -525,6 +550,7 @@ export default {
       onStrategyChange,
       clearStrategy,
       sendMessage,
+      stopStream,
       quickAsk,
       sendAnalysis,
       taskStatusColor,

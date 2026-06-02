@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Agent — smolagents CodeAgent for QuantDinger.
+Agent — smolagents Agent for QuantDinger.
 
-Uses CodeAgent (LLM writes Python code to call tools) instead of ToolCallingAgent.
-High-value features enabled: Planning, Managed Agents, Final Answer Checks, Step Callbacks.
+Supports both CodeAgent (LLM writes Python code) and ToolCallingAgent (OpenAI function calling).
+Agent type is configurable via AGENT_TYPE env var:
+  - "code" (default): CodeAgent — best for GPT-4o, Claude, DeepSeek etc.
+  - "tool": ToolCallingAgent — best for local models (Ollama) that don't generate code blocks.
 """
 from __future__ import annotations
 
@@ -16,6 +18,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from smolagents import (
     CodeAgent,
+    ToolCallingAgent,
     ActionStep,
     PlanningStep,
     FinalAnswerStep,
@@ -30,8 +33,16 @@ from app.agent.tool_context import set_tool_context
 logger = logging.getLogger(__name__)
 
 # ── Singleton cache ───────────────────────────────────────────
-_agent_cache: Optional[CodeAgent] = None
+_agent_cache = None  # type: ignore
 _cached_tools_signature: str = ""
+
+
+def _get_agent_class():
+    """Return the agent class based on AGENT_TYPE env var."""
+    agent_type = os.getenv("AGENT_TYPE", "code").strip().lower()
+    if agent_type == "tool":
+        return ToolCallingAgent
+    return CodeAgent
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -53,7 +64,7 @@ WORKFLOW_TEMPLATES = {
 
 **第一阶段 · 行情与技术面**（首先执行）
 - `get_realtime_quote` 获取实时行情
-- `get_daily_history` 获取历史K线（建议 days=120）
+- `agent_get_kline` 获取历史K线（建议 days=120，短线分析可用 15m/1H 等短周期）
 - `analyze_trend` 综合技术分析（MA + MACD + RSI + BOLL + KDJ 五维共振）
 
 **第二阶段 · 形态与量能**（等第一阶段结果返回后执行）
@@ -146,7 +157,7 @@ CodeAgent 可以直接用 Python 代码读写文件、执行分析，无需额�
 TOOL_CATALOG = """## 可用工具分类
 
 **名称/代码互查**: resolve_stock_name(代码→名称), search_stock_by_name(名称→代码，模糊搜索)
-**数据工具**: get_realtime_quote(实时行情), get_daily_history(历史K线/OHLCV), get_stock_info(基本面), get_market_indices(大盘指数), get_sector_rankings(板块排名)
+**数据工具**: get_realtime_quote(实时行情), agent_get_kline(多周期K线/OHLCV, 支持1m~1W, 可指定market), get_stock_info(基本面), get_market_indices(大盘指数), get_sector_rankings(板块排名)
 **分析工具**: analyze_trend(五维技术分析), calculate_ma(均线), get_volume_analysis(量价), analyze_pattern(15+形态), get_chip_distribution(筹码), get_indicator_snapshot(指标快照)
 **搜索工具**: search_stock_news(新闻), search_comprehensive_intel(综合情报)
 **选股工具**: screen_stocks(本地DB选股), smart_screen(综合选股), review_stocks_with_indicator(指标审核)
@@ -154,18 +165,21 @@ TOOL_CATALOG = """## 可用工具分类
 **回测工具**: run_backtest(跑回测), get_backtest_history(查历史回测记录)
 **交易工具**: list_strategies(列出策略), get_strategy_detail(策略详情), start_strategy(启动策略), stop_strategy(停止策略), get_strategy_trades(交易记录)
 **龙虎榜/热榜**: get_dragon_tiger_stocks, get_dragon_tiger_by_stock, get_hot_rank_stocks, get_zt_pool_stocks, get_limit_down_stocks, get_broken_board_stocks
-**内置工具**: web_search(DuckDuckGo搜索), visit_webpage(访问网页), wikipedia_search(维基百科), user_input(询问用户)
-**自定义分析**: CodeAgent 原生代码执行(LLM 直接写 Python 代码)
+**内置工具**: web_search(DuckDuckGo搜索), visit_webpage(访问网页), wikipedia_search(维基百科)
+⚠️ user_input 工具已禁用（Web 环境不可用）。如需向用户提问，直接在回复文本中提问，用户会通过下一轮对话回答你。
+**自定义分析**: Agent 原生代码执行(LLM 直接写 Python 代码，仅 CodeAgent 模式)
 **工作区工具**: save_script, load_script, list_workspace, shell_exec, run_background, poll_task, apply_template, list_templates
 **源码扫描(只读)**: list_project_files(目录结构), read_project_file(读源码), grep_project(搜索代码)
 **自修改**: self_modify_list_dirs(目录列表), self_modify_read(读源码), self_modify_diff_head(快速预览), self_modify_write(修改文件), self_modify_create(新建文件), self_modify_diff(对比差异), self_modify_rollback(回滚), self_modify_log(修改日志)
 
 ⚠️ 当用户只给中文股票名称没给代码时，必须先用 search_stock_by_name 查到代码再分析。
-⚠️ get_daily_history 是获取K线原始数据，get_backtest_history 是查询过去的回测记录。
+⚠️ agent_get_kline 是获取K线原始数据，get_backtest_history 是查询过去的回测记录。
 ⚠️ 你可以用 Python 代码组合多个工具的返回值，做自定义计算。例如：
 ```python
 quote = get_realtime_quote("600519")
-history = get_daily_history("600519", days=120)
+history = agent_get_kline("600519", timeframe="1D", days=120)
+# 短线分析可以用分钟级周期
+# history_15m = agent_get_kline("600519", timeframe="15m", days=5)
 # 然后用 pandas 做自定义分析
 ```"""
 
@@ -177,6 +191,32 @@ def _detect_intent(message: str) -> str:
             if kw in msg_lower:
                 return intent
     return "analysis"
+
+
+def _load_preamble() -> str:
+    """Load agent preamble from external .md file, with built-in fallback."""
+    import pathlib
+    # Try project root first, then backend_api_python/
+    candidates = [
+        pathlib.Path(__file__).resolve().parents[3] / "agent_preamble.md",
+        pathlib.Path(__file__).resolve().parents[2] / "agent_preamble.md",
+    ]
+    for p in candidates:
+        if p.is_file():
+            try:
+                return p.read_text(encoding="utf-8").strip()
+            except Exception:
+                pass
+    # Fallback — embedded default
+    return (
+        "你是 QuantDinger 量化分析助手。你的职责是基于真实数据为用户提供专业、客观、"
+        "可执行的金融分析与交易建议。\n\n"
+        "## 核心原则\n\n"
+        "- **数据驱动** — 所有结论必须有工具返回的数据支撑，绝不编造数字\n"
+        "- **风险优先** — 分析必须包含风险提示，投资决策前先排查风险\n"
+        "- **直接了当** — 跳过客套，直接给结论和依据\n"
+        "- **诚实透明** — 数据不足时明确告知，不猜测，不掩饰不确定性"
+    )
 
 
 def _build_instructions(user_message: str = "", skill_instructions: str = "", language: str = "zh") -> str:
@@ -237,7 +277,8 @@ def _build_instructions(user_message: str = "", skill_instructions: str = "", la
 
 """
 
-    return f"""你是一位专业的金融投资分析 Agent，拥有丰富的数据工具和交易技能。
+    preamble = _load_preamble()
+    return f"""{preamble}
 
 {workflow}
 
@@ -458,6 +499,7 @@ def _build_managed_agents(smol_model) -> list:
     tools = build_all_tools()
 
     # Shared kwargs for all managed agents
+    AgentClass = _get_agent_class()
     base_kwargs = dict(
         model=smol_model,
         max_steps=8,
@@ -468,12 +510,12 @@ def _build_managed_agents(smol_model) -> list:
 
     # Analysis specialist
     analysis_tools = [t for t in tools if t.name in {
-        "get_realtime_quote", "get_daily_history", "analyze_trend",
+        "get_realtime_quote", "agent_get_kline", "analyze_trend",
         "analyze_pattern", "get_volume_analysis", "get_chip_distribution",
         "get_indicator_snapshot", "search_stock_news", "search_comprehensive_intel",
         "resolve_stock_name", "search_stock_by_name", 
     }]
-    analysis_agent = CodeAgent(
+    analysis_agent = AgentClass(
         tools=analysis_tools,
         name="analysis_agent",
         description="股票技术分析专家。负责获取行情数据、技术指标分析、K线形态识别、新闻搜索。当用户询问某只股票的分析时调用此Agent。",
@@ -485,10 +527,10 @@ def _build_managed_agents(smol_model) -> list:
     screening_tools = [t for t in tools if t.name in {
         "screen_stocks", "smart_screen", "get_screener_presets",
         "list_indicators", "run_indicator_signal", "review_stocks_with_indicator",
-        "get_realtime_quote", "get_daily_history", "resolve_stock_name",
+        "get_realtime_quote", "agent_get_kline", "resolve_stock_name",
         "search_stock_by_name", 
     }]
-    screening_agent = CodeAgent(
+    screening_agent = AgentClass(
         tools=screening_tools,
         name="screening_agent",
         description="选股专家。负责从全市场筛选候选股、执行指标验证、给出推荐列表。当用户要求选股、筛选股票时调用此Agent。",
@@ -501,7 +543,7 @@ def _build_managed_agents(smol_model) -> list:
         "run_backtest", "get_backtest_history", "list_strategies",
         "list_indicators", "get_indicator_params", 
     }]
-    backtest_agent = CodeAgent(
+    backtest_agent = AgentClass(
         tools=backtest_tools,
         name="backtest_agent",
         description="回测专家。负责执行策略回测、分析历史绩效（收益率、胜率、最大回撤、夏普比率）。当用户要求回测、验证策略时调用此Agent。",
@@ -524,7 +566,7 @@ def get_smolagent(
     max_steps: int = 10,
     user_message: str = "",
     language: str = "zh",
-) -> CodeAgent:
+) -> "CodeAgent | ToolCallingAgent":
     global _agent_cache, _cached_tools_signature
 
     skill_instructions = _get_skill_instructions(skills, user_id)
@@ -532,13 +574,14 @@ def get_smolagent(
     smol_model = build_model(model=model, provider=provider)
     tools = build_all_tools()
     managed_agents = _build_managed_agents(smol_model)
+    AgentClass = _get_agent_class()
 
-    sig = f"{len(tools)}_{model}_{provider}_{user_id}"
+    sig = f"{len(tools)}_{model}_{provider}_{user_id}_{AgentClass.__name__}"
     if _agent_cache is not None and _cached_tools_signature == sig:
         _agent_cache.instructions = instructions
         return _agent_cache
 
-    agent = CodeAgent(
+    agent = AgentClass(
         tools=tools,
         model=smol_model,
         max_steps=max_steps,
@@ -558,8 +601,8 @@ def get_smolagent(
     _agent_cache = agent
     _cached_tools_signature = sig
     logger.info(
-        "[Agent] Built CodeAgent: %d tools, %d managed agents, planning_interval=3, max_steps=%d",
-        len(tools), len(managed_agents), max_steps,
+        "[Agent] Built %s: %d tools, %d managed agents, planning_interval=3, max_steps=%d",
+        AgentClass.__name__, len(tools), len(managed_agents), max_steps,
     )
     return agent
 

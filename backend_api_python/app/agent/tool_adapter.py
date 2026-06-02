@@ -134,13 +134,11 @@ def _load_builtin_tools() -> List[Tool]:
     except Exception as e:
         logger.debug("[ToolAdapter] WikipediaSearchTool unavailable: %s", e)
 
-    # User input — ask user a question mid-execution
-    try:
-        from smolagents import UserInputTool
-        tools.append(UserInputTool())
-        logger.info("[ToolAdapter] Loaded UserInputTool")
-    except Exception as e:
-        logger.debug("[ToolAdapter] UserInputTool unavailable: %s", e)
+    # UserInputTool — DISABLED: uses input() which blocks on stdin,
+    # hanging the agent in web/SSE contexts. The agent should ask
+    # clarifying questions in its output text instead (multi-turn chat).
+    # from smolagents import UserInputTool
+    # tools.append(UserInputTool())
 
     return tools
 

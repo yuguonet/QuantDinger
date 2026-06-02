@@ -238,7 +238,7 @@ BACKTEST_TOOLS = [
     {
         "fn": get_backtest_history,
         "name": "get_backtest_history",
-        "description": "查询策略的历史回测记录列表（即过去跑过的回测任务结果）。注意：这不是获取K线数据的工具，获取K线请用 get_daily_history。",
+        "description": "查询策略的历史回测记录列表（即过去跑过的回测任务结果）。注意：这不是获取K线数据的工具，获取K线请用 agent_get_kline。",
         "parameters": {
             "type": "object",
             "properties": {

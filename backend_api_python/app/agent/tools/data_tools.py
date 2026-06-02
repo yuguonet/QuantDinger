@@ -18,7 +18,7 @@ def _get_ds(market: str = "CNStock"):
 
 
 # ── Re-exported from shared utils (kept for backward compat) ──
-from app.agent.utils import detect_market as _detect_market
+from app.data_sources.market_detector import detect_market as _detect_market
 
 
 # ── Tool functions ────────────────────────────────────────────
@@ -29,7 +29,7 @@ def resolve_stock_name(stock_code: str) -> Dict[str, Any]:
     Args:
         stock_code: 股票代码（如 600519、000001）或交易对（如 BTC/USDT）
     """
-    market = _detect_market(stock_code)
+    market = _detect_market(stock_code) or "CNStock"
     try:
         from app.services.symbol_name import resolve_symbol_name
         name = resolve_symbol_name(market, stock_code)
@@ -91,7 +91,7 @@ def search_stock_by_name(keyword: str, market: str = "CNStock", limit: int = 10)
 
 def get_realtime_quote(stock_code: str) -> Dict[str, Any]:
     """获取股票/交易对的实时行情数据，包括最新价、涨跌幅、成交量、换手率等。"""
-    market = _detect_market(stock_code)
+    market = _detect_market(stock_code) or "CNStock"
     ds = _get_ds(market)
     try:
         result = ds.get_ticker(stock_code)
@@ -105,27 +105,38 @@ def get_realtime_quote(stock_code: str) -> Dict[str, Any]:
         return {"error": str(e)}
 
 
-def get_daily_history(stock_code: str, days: int = 60) -> List[Dict[str, Any]]:
-    """获取股票/交易对的历史日K线数据（OHLCV）。
-    
+def agent_get_kline(stock_code: str, timeframe: str = "1D", days: int = 60, market: str = "") -> List[Dict[str, Any]]:
+    """获取股票/交易对的K线数据（OHLCV）。
+
     Args:
         stock_code: 股票代码（如 000001, 600519）或交易对（如 BTC/USDT）
-        days: 获取天数，默认60天，最大250天
+        timeframe: K线周期，可选值: 1m, 5m, 15m, 30m, 1H, 4H, 1D, 1W。默认 1D（日线）
+        days: 获取天数，默认60天，最大250天（仅对日线及以上周期有意义）
+        market: 市场类型，可选值: CNStock, HKStock, Crypto, Forex, USStock, Futures, MOEX。
+                留空则自动推断（A股6位数字→CNStock, HK前缀→HKStock, USDT结尾→Crypto 等）。
+                当自动推断不准时（如美股代码、期货合约）需手动指定。
     """
+    valid_timeframes = {"1m", "5m", "15m", "30m", "1H", "4H", "1D", "1W"}
+    if timeframe not in valid_timeframes:
+        return []
     days = min(max(days, 1), 250)
-    market = _detect_market(stock_code)
+    if market:
+        from app.data_sources.factory import DataSourceFactory
+        market = DataSourceFactory.normalize_market(market)
+    else:
+        market = _detect_market(stock_code) or "CNStock"
     ds = _get_ds(market)
     try:
-        klines = ds.get_kline(stock_code, "1D", days) or []
+        klines = ds.get_kline(stock_code, timeframe, days) or []
         return klines
     except Exception as e:
-        logger.error("get_daily_history(%s, %d) failed: %s", stock_code, days, e)
-        return {"error": str(e)}
+        logger.error("get_kline(%s, %s, %d) failed: %s", stock_code, timeframe, days, e)
+        return []
 
 
 def get_stock_info(stock_code: str) -> Dict[str, Any]:
     """获取股票基本面信息（公司简介、行业、市值、PE、PB 等）。"""
-    market = _detect_market(stock_code)
+    market = _detect_market(stock_code) or "CNStock"
     ds = _get_ds(market)
     try:
         if hasattr(ds, "get_stock_info"):
@@ -211,9 +222,9 @@ DATA_TOOLS = [
         },
     },
     {
-        "fn": get_daily_history,
-        "name": "get_daily_history",
-        "description": "获取股票/交易对的历史日K线数据（OHLCV：开盘价/最高价/最低价/收盘价/成交量）。这是获取原始K线数据的核心工具，用于趋势分析和技术指标计算。当用户要求查看K线、行情数据、历史价格时必须使用此工具。",
+        "fn": agent_get_kline,
+        "name": "agent_get_kline",
+        "description": "获取股票/交易对的K线数据（OHLCV：开盘价/最高价/最低价/收盘价/成交量）。支持多周期：1m/5m/15m/30m/1H/4H/1D/1W。这是获取原始K线数据的核心工具，用于趋势分析和技术指标计算。当用户要求查看K线、行情数据、历史价格时必须使用此工具。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -221,10 +232,20 @@ DATA_TOOLS = [
                     "type": "string",
                     "description": "股票代码或交易对",
                 },
+                "timeframe": {
+                    "type": "string",
+                    "description": "K线周期：1m(1分钟), 5m(5分钟), 15m(15分钟), 30m(30分钟), 1H(1小时), 4H(4小时), 1D(日线), 1W(周线)。默认1D",
+                    "default": "1D",
+                },
                 "days": {
                     "type": "integer",
-                    "description": "获取天数，默认30，最大120",
-                    "default": 30,
+                    "description": "获取天数，默认60，最大250",
+                    "default": 60,
+                },
+                "market": {
+                    "type": "string",
+                    "description": "市场类型：CNStock(A股), HKStock(港股), Crypto(加密货币), Forex(外汇), USStock(美股), Futures(期货), MOEX(俄罗斯)。留空自动推断，推断不准时需手动指定。",
+                    "default": "",
                 },
             },
             "required": ["stock_code"],
