@@ -604,6 +604,10 @@ class _AgentExecutor:
         intent_context = ""
         domain = ""
         domain_instructions = ""
+        # skip_agent: 意图明确且不需要工具时（如打招呼），直接返回，不进 agent
+        skip_agent = False
+        skip_agent_reply = ""
+
         if os.getenv("INTENT_ANALYSIS_ENABLED", "true").lower() == "true":
             try:
                 from app.agent.intent_analyzer import analyze_intent, format_intent_for_agent
@@ -622,8 +626,31 @@ class _AgentExecutor:
                     "[Intent] domain=%s intent=%s confidence=%.2f",
                     intent.domain, intent.intent, intent.confidence,
                 )
+
+                # ── 闲聊/greeting 快速通道：跳过 agent，直接回复 ──
+                # 本地模型（如 gemma4）经常忽略 final_answer 指令，
+                # 把问候语包在 <code> 块里导致解析失败。
+                # 对于置信度 >= 0.6 的 chat 意图，直接构造回复，不走 agent。
+                if (domain == "chat"
+                        and intent.confidence >= 0.6
+                        and intent.intent in ("greeting", "farewell", "thanks", "empty")):
+                    skip_agent = True
+                    _quick_replies = {
+                        "greeting": "你好！我是 QuantDinger 量化分析助手，可以帮你做股票分析、选股筛选、策略回测等。有什么需要帮忙的？",
+                        "farewell": "再见！有问题随时找我。",
+                        "thanks": "不客气！有需要随时找我。",
+                        "empty": "请告诉我你需要什么帮助。",
+                    }
+                    skip_agent_reply = _quick_replies.get(intent.intent, "你好！有什么需要帮忙的？")
+                    logger.info("[Intent] Quick-reply for %s, skipping agent", intent.intent)
+
             except Exception as e:
                 logger.warning("[Intent] 分析失败，走默认流程: %s", e)
+
+        # ── 快速通道：不需要 agent 时直接返回 ────────────────
+        if skip_agent:
+            store.add_message(session_id, "user", message)
+            return store, None, message, {"skip_agent": True, "skip_agent_reply": skip_agent_reply}
 
         # ── 上下文拼接 ────────────────────────────────────────
         enriched = message
@@ -659,12 +686,24 @@ class _AgentExecutor:
         # 暂存当前 domain，供压缩线程读取
         if domain:
             store.save_context_summary(session_id, "", domain=domain)
-        return store, agent, enriched
+
+        return store, agent, enriched, {"skip_agent": False, "skip_agent_reply": ""}
 
     def chat(self, message, session_id, context=None,
              progress_callback=None, user_id=1) -> AgentResult:
         """Blocking chat — waits for full result."""
-        store, agent, enriched = self._prepare(message, session_id, context, user_id)
+        store, agent, enriched, meta = self._prepare(message, session_id, context, user_id)
+
+        # ── 快速通道：不需要 agent 的简单回复 ────────────────
+        if meta.get("skip_agent"):
+            reply = meta["skip_agent_reply"]
+            store.add_message(session_id, "assistant", reply)
+            return AgentResult(
+                success=True, content=reply,
+                tool_calls_log=[], total_steps=0, total_tokens=0,
+                model="intent-quick-reply", error=None,
+            )
+
         t0 = time.time()
         try:
             result = agent.run(enriched, max_steps=self.max_steps)
@@ -724,7 +763,28 @@ class _AgentExecutor:
     def chat_stream(self, message, session_id, context=None,
                     progress_callback=None, user_id=1):
         """Streaming chat — yields SSE event dicts as smolagents produces steps."""
-        store, agent, enriched = self._prepare(message, session_id, context, user_id)
+        store, agent, enriched, meta = self._prepare(message, session_id, context, user_id)
+
+        # ── 快速通道：不需要 agent 的简单回复 ────────────────
+        if meta.get("skip_agent"):
+            reply = meta["skip_agent_reply"]
+            store.add_message(session_id, "assistant", reply)
+            yield {
+                "type": "generating",
+                "step": 0,
+                "message": reply,
+            }
+            yield {
+                "type": "done",
+                "success": True,
+                "content": reply,
+                "error": None,
+                "total_steps": 0,
+                "model": "intent-quick-reply",
+                "session_id": session_id,
+            }
+            return
+
         t0 = time.time()
         try:
             for step in agent.run(enriched, max_steps=self.max_steps, stream=True):

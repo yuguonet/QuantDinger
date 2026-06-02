@@ -19,8 +19,6 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from app.agent.domain_registry import (
-    build_intent_prompt_domains,
-    build_intent_prompt_examples,
     get_domain,
     get_all_domains,
 )
@@ -60,33 +58,55 @@ class IntentResult:
 # ═══════════════════════════════════════════════════════════════
 # Prompt 模板
 # ═══════════════════════════════════════════════════════════════
+# 基于 Dify 生产级路由 Prompt 模式改造
+# 参考: https://dify.ai + 企业级 Agent 意图路由最佳实践
 
-_INTENT_PROMPT = """你是一个消息意图分析器。分析用户消息，输出 JSON。
+_INTENT_PROMPT = """# Role
+你是 QuantDinger 量化助手的意图分类器。核心职责：接收用户原始输入，精准匹配至预定义意图类别，仅输出分类结果 JSON，不额外解读或回答问题。
 
-## 可用领域
-{domains}
+# Intent Definitions（意图定义）
 
-{examples}
+## 1. [finance]（金融分析）
+定义：用户询问股票行情、技术分析、资金流向、龙虎榜、涨停池、选股、回测、交易策略、市场概览等金融相关需求。
+子意图与示例：
+- stock_analysis: "帮我看看贵州茅台最近怎么样"、"600519什么情况"、"比亚迪技术面分析"
+- market_scan: "今天涨停的股票有哪些"、"最近热门板块"、"龙虎榜数据"
+- backtest: "用双均线策略回测一下比亚迪"、"测试RSI策略的历史表现"
+- stock_screener: "帮我找低估值的银行股"、"筛选近5日涨幅超10%的股票"
+- fund_flow: "主力资金流向"、"北向资金今天买了什么"
+- indicator: "布林带指标怎么用"、"MACD金叉选股"
+- trading: "启动网格交易策略"、"查看持仓情况"
 
-## 对话历史
+## 2. [coding]（编程开发）
+定义：用户要求编写、修改、调试、重构代码，分析项目结构，或讨论技术方案。
+子意图与示例：
+- code_modify: "把 self_modify_tools.py 里的路径解析改成支持 Docker"
+- code_review: "看看 agent.py 有没有性能问题"
+- code_create: "写一个数据清洗脚本"
+- code_debug: "这段代码报错了，帮我看看"
+- project_scan: "项目结构分析一下"、"有哪些 Python 文件"
+
+## 3. [chat]（通用闲聊）
+定义：问候、寒暄、感谢、告别，或不属于上述两类的通用对话。
+子意图与示例：
+- greeting: "你好"、"hi"、"早上好"
+- farewell: "再见"、"拜拜"
+- thanks: "谢谢"、"感谢"
+- general: "你是谁"、"你会做什么"、"今天天气怎么样"
+
+# Constraints（输出约束）
+1. 严格输出一个 JSON 对象，不要 markdown 包裹，不要任何其他文字
+2. 输出格式：{"domain": "finance|coding|chat", "intent": "子意图", "params": {}, "confidence": 0.0~1.0}
+3. params 中提取关键参数：stock（股票代码）、stock_name（股票名称）、target（目标文件）、aspects（分析维度）、timeframe（时间范围）等
+4. 股票名称必须转为代码（贵州茅台→600519，比亚迪→002594），不确定就留空
+5. aspects 根据用户意图推断（如"最近怎么样"→["行情","技术面","资金流"]）
+6. 根据对话历史解析代词（如"它"="贵州茅台"、"上一只"=之前提到的股票）
+7. 无法判断时归 chat，confidence 给低值（<0.5）
+
+# Conversation History（对话历史）
 {history}
 
-## 输出格式
-严格输出一个 JSON 对象（不要 markdown 包裹），包含以下字段：
-- domain: 领域标识（必须是上面列出的之一）
-- intent: 具体意图（简短描述，如 stock_analysis、code_modify、greeting）
-- params: 提取的关键参数对象（可能包含 stock、stock_name、target、task、aspects、timeframe 等）
-- confidence: 置信度 0-1
-
-## 规则
-1. 股票名称必须转为代码（如 贵州茅台→600519），不确定就留空
-2. aspects 根据用户意图推断（如"最近怎么样"→["行情","技术面","资金流"]）
-3. 涉及代码/编程/修改/重构/调试的归 coding
-4. 无法判断时归 chat，confidence 给低值
-5. 根据对话历史解析代词和引用（如"它"="贵州茅台"、"上一只"=之前提到的股票）
-6. 只输出 JSON，不要任何其他文字
-
-## 用户消息
+# User Input
 {message}"""
 
 
@@ -124,12 +144,8 @@ def analyze_intent(
         if lines:
             history_text = "\n".join(lines)
 
-    # 构建 prompt
-    domains_text = build_intent_prompt_domains()
-    examples_text = build_intent_prompt_examples()
+    # 构建 prompt（模板已内置领域定义和示例，无需动态生成）
     prompt = _INTENT_PROMPT.format(
-        domains=domains_text,
-        examples=examples_text,
         history=history_text,
         message=message.strip(),
     )
