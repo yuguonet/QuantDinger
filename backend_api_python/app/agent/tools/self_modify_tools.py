@@ -28,10 +28,50 @@ from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent  # QuantDinger root
+def _find_roots() -> tuple:
+    """定位 backend 根目录和项目根目录。
+
+    返回 (BACKEND_ROOT, PROJECT_ROOT):
+      BACKEND_ROOT — backend_api_python/ 目录本身，始终可用
+      PROJECT_ROOT — 项目最外层（含 docker-compose.yml、QuantDinger-Vue/ 等）
+
+    本地: QuantDinger-main/backend_api_python/ 和 QuantDinger-main/
+    Docker: /app (= backend_api_python/) 和 /app/ (同级，因为 Docker 内没有更外层)
+    """
+    backend_root = Path(__file__).resolve().parents[3]  # → backend_api_python/
+    # 从 backend_root 的父目录往上找 docker-compose.yml
+    cur = backend_root.parent
+    for _ in range(5):
+        if (cur / "docker-compose.yml").exists():
+            return backend_root, cur
+        cur = cur.parent
+    # Docker 内：backend_api_python/ 就是最外层
+    return backend_root, backend_root
+
+
+BACKEND_ROOT, PROJECT_ROOT = _find_roots()
 BACKUP_DIR = PROJECT_ROOT / ".agent_backups"
 
 MODIFY_PATHS_DEFAULT = ["backend_api_python/app/agent/tools"]
+
+
+def _resolve_path(rel: str) -> Path:
+    """将路径解析为基于 BACKEND_ROOT 的绝对路径。
+
+    本地环境：PROJECT_ROOT = QuantDinger-main/，BACKEND_ROOT = backend_api_python/
+      "backend_api_python/app/agent/tools" → BACKEND_ROOT / "app/agent/tools"
+    Docker 环境：PROJECT_ROOT = BACKEND_ROOT = /app
+      "app/agent/tools"                     → BACKEND_ROOT / "app/agent/tools"
+    """
+    p = Path(rel)
+    # 已经是绝对路径直接返回
+    if p.is_absolute():
+        return p
+    # 以 backend_api_python/ 开头 → 去掉前缀，基于 BACKEND_ROOT 解析
+    parts = p.parts
+    if parts and parts[0] == "backend_api_python":
+        return BACKEND_ROOT / Path(*parts[1:]) if len(parts) > 1 else BACKEND_ROOT
+    return BACKEND_ROOT / p
 
 
 def is_self_modify_enabled() -> bool:
@@ -39,18 +79,23 @@ def is_self_modify_enabled() -> bool:
 
 
 def get_modify_paths() -> List[Path]:
-    """从配置读取可修改目录列表。"""
+    """从配置读取可修改目录列表。所有路径基于 BACKEND_ROOT 解析。"""
     raw = os.getenv("AGENT_SELF_MODIFY_PATHS", "")
     if raw:
-        paths = [PROJECT_ROOT / p.strip() for p in raw.split(",") if p.strip()]
+        paths = [_resolve_path(p.strip()) for p in raw.split(",") if p.strip()]
+        auto_create = True
     else:
-        paths = [PROJECT_ROOT / p for p in MODIFY_PATHS_DEFAULT]
-    # 安全检查 + 不存在的目录自动创建
+        paths = [_resolve_path(p) for p in MODIFY_PATHS_DEFAULT]
+        auto_create = False
     safe = []
     for p in paths:
         try:
-            p.resolve().relative_to(PROJECT_ROOT.resolve())
-            p.mkdir(parents=True, exist_ok=True)
+            p.resolve().relative_to(BACKEND_ROOT.resolve())
+            if auto_create:
+                p.mkdir(parents=True, exist_ok=True)
+            elif not p.exists():
+                logger.debug("[SelfModify] 路径不存在，跳过: %s", p)
+                continue
             safe.append(p)
         except ValueError:
             logger.warning("[SelfModify] 路径越界，跳过: %s", p)
@@ -67,10 +112,10 @@ def _validate_path(filepath: str) -> Any:
     if ".." in filepath:
         return {"error": f"不安全的路径: {filepath}（不允许 ..）"}
 
-    # 在所有允许的目录中查找匹配
-    target = (PROJECT_ROOT / filepath).resolve()
+    # 解析为基于 BACKEND_ROOT 的绝对路径
+    target = _resolve_path(filepath).resolve()
     try:
-        target.relative_to(PROJECT_ROOT.resolve())
+        target.relative_to(BACKEND_ROOT.resolve())
     except ValueError:
         return {"error": f"路径越界: {filepath}"}
 
@@ -81,7 +126,7 @@ def _validate_path(filepath: str) -> Any:
         for sr in modify_roots
     )
     if not in_scope:
-        allowed = ", ".join(str(r.relative_to(PROJECT_ROOT)) for r in modify_roots)
+        allowed = ", ".join(str(r.relative_to(BACKEND_ROOT)) for r in modify_roots)
         return {"error": f"路径不在允许修改的目录范围内: {filepath}\n允许的目录: {allowed}"}
 
     return target
@@ -93,7 +138,7 @@ def _validate_relative_path(filepath: str) -> Any:
     if isinstance(result, dict) and "error" in result:
         return result
     # result 是绝对 Path，返回相对路径
-    return str(result.relative_to(PROJECT_ROOT))
+    return str(result.relative_to(BACKEND_ROOT))
 
 
 def _append_modify_log(entry: dict):
@@ -115,12 +160,12 @@ def self_modify_list_dirs() -> Dict[str, Any]:
 
     result = {}
     for scan_root in get_modify_paths():
-        rel = str(scan_root.relative_to(PROJECT_ROOT))
+        rel = str(scan_root.relative_to(BACKEND_ROOT))
         files = []
         for p in sorted(scan_root.rglob("*")):
             if p.is_file() and not p.name.startswith("."):
                 files.append({
-                    "path": str(p.relative_to(PROJECT_ROOT)),
+                    "path": str(p.relative_to(BACKEND_ROOT)),
                     "size": p.stat().st_size,
                     "modified": time.ctime(p.stat().st_mtime),
                 })
@@ -183,11 +228,11 @@ def self_modify_write(filepath: str, content: str, reason: str = "") -> Dict[str
     # 备份现有文件
     backup_info = None
     if target.exists():
-        rel = str(target.relative_to(PROJECT_ROOT)).replace("/", "_").replace("\\", "_")
+        rel = str(target.relative_to(BACKEND_ROOT)).replace("/", "_").replace("\\", "_")
         backup_name = f"{rel}_{int(time.time())}.bak"
         backup_path = BACKUP_DIR / backup_name
         shutil.copy2(target, backup_path)
-        backup_info = str(backup_path.relative_to(PROJECT_ROOT))
+        backup_info = str(backup_path.relative_to(BACKEND_ROOT))
         logger.info("[SelfModify] Backed up %s → %s", filepath, backup_info)
 
     # 写入
@@ -271,7 +316,7 @@ def self_modify_diff(filepath: str) -> Dict[str, Any]:
         return {"error": f"文件不存在: {filepath}"}
 
     _ensure_backup_dir()
-    rel = str(target.relative_to(PROJECT_ROOT)).replace("/", "_").replace("\\", "_")
+    rel = str(target.relative_to(BACKEND_ROOT)).replace("/", "_").replace("\\", "_")
     backups = sorted(BACKUP_DIR.glob(f"{rel}_*.bak"), reverse=True)
     if not backups:
         return {"error": "没有备份文件可供对比"}
@@ -301,7 +346,7 @@ def self_modify_rollback(filepath: str) -> Dict[str, Any]:
         return {"error": f"文件不存在: {filepath}"}
 
     _ensure_backup_dir()
-    rel = str(target.relative_to(PROJECT_ROOT)).replace("/", "_").replace("\\", "_")
+    rel = str(target.relative_to(BACKEND_ROOT)).replace("/", "_").replace("\\", "_")
     backups = sorted(BACKUP_DIR.glob(f"{rel}_*.bak"), reverse=True)
     if not backups:
         return {"error": "没有备份文件可供回滚"}
@@ -318,7 +363,7 @@ def self_modify_rollback(filepath: str) -> Dict[str, Any]:
         "action": "rollback",
         "file": filepath,
         "reason": f"Rollback to {latest.name}",
-        "backup": str(current_backup.relative_to(PROJECT_ROOT)),
+        "backup": str(current_backup.relative_to(BACKEND_ROOT)),
     }
     _append_modify_log(log_entry)
 
@@ -538,7 +583,7 @@ def _register_self_modify_tools():
     ])
     logger.info("[SelfModifyTools] Registered %d self-modify tools (dirs: %s)",
                 len(SELF_MODIFY_TOOLS),
-                [str(p.relative_to(PROJECT_ROOT)) for p in get_modify_paths()])
+                [str(p.relative_to(BACKEND_ROOT)) for p in get_modify_paths()])
 
 
 _register_self_modify_tools()

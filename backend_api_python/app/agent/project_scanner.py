@@ -27,7 +27,18 @@ from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent  # QuantDinger root
+def _find_roots() -> tuple:
+    """定位 backend 根目录和项目根目录（与 self_modify_tools 保持一致）。"""
+    backend_root = Path(__file__).resolve().parents[3]  # → backend_api_python/
+    cur = backend_root.parent
+    for _ in range(5):
+        if (cur / "docker-compose.yml").exists():
+            return backend_root, cur
+        cur = cur.parent
+    return backend_root, backend_root
+
+
+BACKEND_ROOT, PROJECT_ROOT = _find_roots()
 
 SCAN_PATHS_DEFAULT = [
     "backend_api_python/app/agent/tools",
@@ -37,18 +48,29 @@ SCAN_PATHS_DEFAULT = [
 ]
 
 
+def _resolve_path(rel: str) -> Path:
+    """将路径解析为基于 BACKEND_ROOT 的绝对路径。"""
+    p = Path(rel)
+    if p.is_absolute():
+        return p
+    parts = p.parts
+    if parts and parts[0] == "backend_api_python":
+        return BACKEND_ROOT / Path(*parts[1:]) if len(parts) > 1 else BACKEND_ROOT
+    return BACKEND_ROOT / p
+
+
 def get_scan_paths() -> List[Path]:
     """从配置读取可扫描路径列表。"""
     raw = os.getenv("AGENT_SCAN_PATHS", "")
     if raw:
-        paths = [PROJECT_ROOT / p.strip() for p in raw.split(",") if p.strip()]
+        paths = [_resolve_path(p.strip()) for p in raw.split(",") if p.strip()]
     else:
-        paths = [PROJECT_ROOT / p for p in SCAN_PATHS_DEFAULT]
-    # 安全检查：确保路径在项目根目录内
+        paths = [_resolve_path(p) for p in SCAN_PATHS_DEFAULT]
+    # 安全检查 + 只保留存在的路径
     safe = []
     for p in paths:
         try:
-            p.resolve().relative_to(PROJECT_ROOT.resolve())
+            p.resolve().relative_to(BACKEND_ROOT.resolve())
             if p.exists():
                 safe.append(p)
         except ValueError:
@@ -67,7 +89,7 @@ def list_project_files(max_depth: int = 3) -> Dict[str, Any]:
 
     result = {}
     for scan_root in get_scan_paths():
-        rel = scan_root.relative_to(PROJECT_ROOT)
+        rel = scan_root.relative_to(BACKEND_ROOT)
         tree = {}
         for p in sorted(scan_root.rglob("*")):
             if p.is_file() and not p.name.startswith("."):
@@ -87,10 +109,10 @@ def read_project_file(path: str) -> Dict[str, Any]:
     if not is_scan_enabled():
         return {"error": "项目扫描未启用（AGENT_SCAN_PROJECT_READONLY=false）"}
 
-    target = (PROJECT_ROOT / path).resolve()
+    target = _resolve_path(path).resolve()
     # 安全检查
     try:
-        target.relative_to(PROJECT_ROOT.resolve())
+        target.relative_to(BACKEND_ROOT.resolve())
     except ValueError:
         return {"error": f"路径越界: {path}"}
 
@@ -144,7 +166,7 @@ def grep_project(pattern: str, max_results: int = 50) -> Dict[str, Any]:
                 for i, line in enumerate(content.splitlines(), 1):
                     if regex.search(line):
                         matches.append({
-                            "file": str(p.relative_to(PROJECT_ROOT)),
+                            "file": str(p.relative_to(BACKEND_ROOT)),
                             "line": i,
                             "text": line.strip()[:200],
                         })

@@ -144,6 +144,36 @@ class _InMemoryStore:
         with self._lock:
             self._tool_results.pop(session_id, None)
 
+    # ── Compressed context (跨轮上下文压缩) ──────────────────
+
+    def save_context_summary(self, session_id: str, summary: str, domain: str = "") -> None:
+        """保存压缩上下文摘要。按领域分别存储。"""
+        with self._lock:
+            if session_id not in self._sessions:
+                self._sessions[session_id] = {}
+            s = self._sessions[session_id]
+            if domain:
+                if "context_summaries" not in s:
+                    s["context_summaries"] = {}
+                if summary:
+                    s["context_summaries"][domain] = summary
+                s["current_domain"] = domain
+            elif summary:
+                cur = s.get("current_domain", "")
+                if cur:
+                    if "context_summaries" not in s:
+                        s["context_summaries"] = {}
+                    s["context_summaries"][cur] = summary
+            s["updated_at"] = time.time()
+
+    def get_context_summary(self, session_id: str, current_domain: str = "") -> str:
+        """获取指定领域的压缩上下文摘要。"""
+        with self._lock:
+            s = self._sessions.get(session_id, {})
+            if current_domain:
+                return s.get("context_summaries", {}).get(current_domain, "")
+            return ""
+
     # ── Maintenance ──────────────────────────────────────────
 
     def _maybe_cleanup(self):
@@ -270,6 +300,33 @@ class _RedisStore:
 
     def clear_tool_results(self, session_id: str) -> None:
         self._r.delete(self._tool_results_key(session_id))
+
+    # ── Compressed context ───────────────────────────────────
+
+    def _context_summaries_key(self, session_id: str) -> str:
+        return f"quantdinger:ctx_summaries:{session_id}"
+
+    def _context_domain_key(self, session_id: str) -> str:
+        return f"quantdinger:ctx_domain:{session_id}"
+
+    def save_context_summary(self, session_id: str, summary: str, domain: str = "") -> None:
+        if domain:
+            if summary:
+                self._r.hset(self._context_summaries_key(session_id), domain, summary)
+                self._r.expire(self._context_summaries_key(session_id), 3600)
+            self._r.set(self._context_domain_key(session_id), domain, ex=3600)
+        elif summary:
+            cur = self._r.get(self._context_domain_key(session_id))
+            cur = cur.decode() if isinstance(cur, bytes) else (cur or "")
+            if cur:
+                self._r.hset(self._context_summaries_key(session_id), cur, summary)
+                self._r.expire(self._context_summaries_key(session_id), 3600)
+
+    def get_context_summary(self, session_id: str, current_domain: str = "") -> str:
+        if not current_domain:
+            return ""
+        raw = self._r.hget(self._context_summaries_key(session_id), current_domain)
+        return raw.decode() if isinstance(raw, bytes) else (raw or "")
 
     # ── Maintenance (Redis handles TTL natively) ─────────────
 

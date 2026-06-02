@@ -166,7 +166,9 @@ def _load_preamble() -> str:
 
 
 def _build_instructions(user_message: str = "", skill_instructions: str = "",
-                        language: str = "zh", tools=None, managed_agents=None) -> str:
+                        language: str = "zh", tools=None, managed_agents=None,
+                        domain: str = "", domain_instructions: str = "",
+                        intent_context: str = "") -> str:
     if str(language or "").lower().startswith("en"):
         lang_section = "\n## Output Language\n- Reply in English.\n- All JSON values in English.\n"
     else:
@@ -205,11 +207,21 @@ def _build_instructions(user_message: str = "", skill_instructions: str = "",
     if tools is not None:
         tool_catalog = f"\n## 工具分类\n\n{_generate_tool_catalog(tools, managed_agents)}\n"
 
+    # 意图分析上下文（前置分析器的输出）
+    intent_section = ""
+    if intent_context:
+        intent_section = f"\n## 意图分析\n\n{intent_context}\n"
+
+    # 领域专属指令
+    domain_section = ""
+    if domain_instructions:
+        domain_section = f"\n## 当前领域: {domain}\n\n{domain_instructions}\n"
+
     return f"""{preamble}
 
 {GUIDANCE}
 {tool_catalog}
-{skill_section}{scan_section}{modify_section}## 规则
+{skill_section}{scan_section}{modify_section}{intent_section}{domain_section}## 规则
 
 0. **⚠️ 必须用 final_answer() 返回结果** — 完成任务后，必须调用 `final_answer(你的回复)` 来结束。
 1. **不需要工具的消息，第一步就 final_answer** — 打招呼、闲聊等直接调用 final_answer。
@@ -484,6 +496,9 @@ def get_smolagent(
     max_steps: int = 10,
     user_message: str = "",
     language: str = "zh",
+    domain: str = "",
+    domain_instructions: str = "",
+    intent_context: str = "",
 ) -> "CodeAgent | ToolCallingAgent":
     global _agent_cache, _cached_tools_signature
 
@@ -491,7 +506,11 @@ def get_smolagent(
     smol_model = build_model(model=model, provider=provider)
     tools = build_all_tools()
     managed_agents = _build_managed_agents(smol_model)
-    instructions = _build_instructions(user_message, skill_instructions, language, tools, managed_agents)
+    instructions = _build_instructions(
+        user_message, skill_instructions, language, tools, managed_agents,
+        domain=domain, domain_instructions=domain_instructions,
+        intent_context=intent_context,
+    )
     AgentClass = _get_agent_class()
 
     sig = f"{len(tools)}_{model}_{provider}_{user_id}_{AgentClass.__name__}"
@@ -581,8 +600,40 @@ class _AgentExecutor:
             "progress_callback": None,
         })
 
+        # ── 前置意图分析 ──────────────────────────────────────
+        intent_context = ""
+        domain = ""
+        domain_instructions = ""
+        if os.getenv("INTENT_ANALYSIS_ENABLED", "true").lower() == "true":
+            try:
+                from app.agent.intent_analyzer import analyze_intent, format_intent_for_agent
+                from app.agent.domain_registry import init_builtin_domains
+                init_builtin_domains()
+                # 取最近 3 轮对话历史，用于指代消解
+                history = store.get_history(session_id)[-6:]
+                intent = analyze_intent(
+                    message, model=self.model, provider=self.provider,
+                    history=history,
+                )
+                domain = intent.domain
+                domain_instructions = intent.domain_instructions
+                intent_context = format_intent_for_agent(intent, message)
+                logger.info(
+                    "[Intent] domain=%s intent=%s confidence=%.2f",
+                    intent.domain, intent.intent, intent.confidence,
+                )
+            except Exception as e:
+                logger.warning("[Intent] 分析失败，走默认流程: %s", e)
+
+        # ── 上下文拼接 ────────────────────────────────────────
         enriched = message
         ctx_parts = []
+
+        # 压缩上下文（上轮分析摘要，领域切换时自动丢弃）
+        context_summary = store.get_context_summary(session_id, current_domain=domain)
+        if context_summary:
+            ctx_parts.append(f"[上轮分析摘要]\n{context_summary}")
+
         if context:
             if context.get("stock_code"):
                 ctx_parts.append(f"股票代码: {context['stock_code']}")
@@ -600,9 +651,14 @@ class _AgentExecutor:
             model=self.model, provider=self.provider,
             max_steps=self.max_steps, user_message=message,
             language=(context or {}).get("report_language", "zh"),
+            domain=domain, domain_instructions=domain_instructions,
+            intent_context=intent_context,
         )
 
         store.add_message(session_id, "user", message)
+        # 暂存当前 domain，供压缩线程读取
+        if domain:
+            store.save_context_summary(session_id, "", domain=domain)
         return store, agent, enriched
 
     def chat(self, message, session_id, context=None,
@@ -636,6 +692,24 @@ class _AgentExecutor:
                 success = bool(content)
 
             store.add_message(session_id, "assistant", content)
+
+            # 异步压缩上下文（不阻塞返回）
+            if success and content:
+                try:
+                    from app.agent.context_compressor import compress_context
+                    import threading
+                    def _compress(c=content, tc=tool_calls_log, sid=session_id, m=self.model):
+                        try:
+                            summary = compress_context(c, tc, model=m)
+                        except Exception as e:
+                            logger.warning("[Compress] 压缩异常，降级截断: %s", e)
+                            summary = c[:500]
+                        if summary:
+                            store.save_context_summary(sid, summary)
+                    threading.Thread(target=_compress, daemon=True).start()
+                except Exception:
+                    pass
+
             return AgentResult(
                 success=success, content=content, tool_calls_log=tool_calls_log,
                 total_steps=total_steps, total_tokens=total_tokens,
@@ -663,6 +737,24 @@ class _AgentExecutor:
                 if isinstance(step, FinalAnswerStep):
                     content = str(step.output) if step.output else ""
                     store.add_message(session_id, "assistant", content)
+
+                    # 压缩上下文
+                    if content:
+                        try:
+                            from app.agent.context_compressor import compress_context
+                            import threading
+                            def _compress(c=content, sid=session_id, m=self.model):
+                                try:
+                                    summary = compress_context(c, model=m)
+                                except Exception as e:
+                                    logger.warning("[Compress] 压缩异常，降级截断: %s", e)
+                                    summary = c[:500]
+                                if summary:
+                                    store.save_context_summary(sid, summary)
+                            threading.Thread(target=_compress, daemon=True).start()
+                        except Exception:
+                            pass
+
                     yield {
                         "type": "done",
                         "success": bool(content),
