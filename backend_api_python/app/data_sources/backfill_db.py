@@ -368,7 +368,7 @@ class BackfillDB:
         # 提前读取已有记录，异常时用于 update
         existing_doc = _get_last_update(tf, pool_name=pool)
         existing_lbt = _parse_db_timestamp(existing_doc.get("last_bar_time")) if existing_doc else None
-
+        existing_status = existing_doc.get("status", "") if existing_doc else ""
         # 计算 bar_time（与 _sync_* 内部逻辑一致）
         now_cn = datetime.now(TZ_CN)
         today_str = now_cn.strftime("%Y-%m-%d")
@@ -398,6 +398,16 @@ class BackfillDB:
         is_first_run = True
         if existing_lbt and _same_trading_day(existing_lbt, now_cn):
             is_first_run = False
+
+        # ── 2. ok 保护：同交易日已完成 → 跳过 ──
+        if (existing_lbt and existing_status in ("ok", "error")
+                and _same_trading_day(existing_lbt, bar_time)
+                and not force_refetch):
+            return {
+                "source": self.source.name, "tf": tf,
+                "written": 0, "status": "ok",
+                "report": f"该交易日已同步完成(status=ok)，跳过",
+            }
 
         # ── 新交易日首次写入: INSERT 初始记录 ──
         if not existing_lbt or not _same_trading_day(existing_lbt, bar_time):

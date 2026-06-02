@@ -76,18 +76,21 @@ GUIDANCE = """## 工作指引
 
 根据用户消息的性质，自主判断该怎么做：
 
-**闲聊/打招呼** — 不需要调工具，直接友好回复。介绍自己是量化分析助手，提示用户可以问什么。
+**⚠️ 重要：你必须使用 final_answer 工具来返回最终回复。不通过 final_answer 返回的回复不会被系统识别，会导致多余的执行步骤。**
+
+**闲聊/打招呼** — 不需要调其他工具，直接用 final_answer 返回友好回复。介绍自己是量化分析助手，提示用户可以问什么。
 
 **股票分析** — 按需调用工具获取数据，建议流程：行情→技术面→形态→量能→情报→综合判断。
 输出完整的分析结论和风险提示。当工具分析深度不够时，用 Python 代码做更深入的量化分析。
+最后用 `final_answer(分析结果)` 返回。
 
-**选股筛选** — 用 screen_stocks 按条件筛选，再用 run_indicator_signal 验证信号，汇总推荐。
+**选股筛选** — 用 screen_stocks 按条件筛选，再用 run_indicator_signal 验证信号，汇总推荐，最后用 `final_answer()` 返回。
 
-**回测验证** — 用 list_strategies/list_indicators 发现策略，用 run_backtest 执行，分析绩效指标。
+**回测验证** — 用 list_strategies/list_indicators 发现策略，用 run_backtest 执行，分析绩效指标，最后用 `final_answer()` 返回。
 
-**交易执行** — 先确认行情和信号，再用 start_strategy 启动，用 get_strategy_trades 监控。
+**交易执行** — 先确认行情和信号，再用 start_strategy 启动，用 get_strategy_trades 监控，最后用 `final_answer()` 返回。
 
-**代码/数据分析** — 利用工作区工具保存和执行脚本，支持迭代优化。
+**代码/数据分析** — 利用工作区工具保存和执行脚本，支持迭代优化，最后用 `final_answer()` 返回。
 """
 
 
@@ -180,6 +183,7 @@ def _build_instructions(user_message: str = "", skill_instructions: str = "", la
 {TOOL_CATALOG}
 {skill_section}{scan_section}{modify_section}## 规则
 
+0. **⚠️ 必须用 final_answer() 返回结果** — 完成任务后，必须调用 `final_answer(你的回复)` 来结束。这是唯一能正确终止的方式。不要输出纯文本而不调用 final_answer，否则系统会继续执行多余的步骤。
 1. **必须调用工具获取真实数据** — 绝不编造数字，所有数据必须来自工具返回结果。
 2. **深度优先** — 不要满足于工具的默认输出，当分析深度不够时直接写 Python 代码做更深入的量化分析。
 3. **风险优先** — 分析必须包含风险提示，投资决策前先排查风险（股东减持、业绩预警、监管问题）。
