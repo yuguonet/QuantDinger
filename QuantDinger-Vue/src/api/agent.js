@@ -107,6 +107,7 @@ export function createAgentStream (params, callbacks) {
             case 'tool_done': callbacks.onToolDone?.(event); break
             case 'tool_stream': callbacks.onToolStream?.(event); break
             case 'tool_info': callbacks.onToolInfo?.(event); break
+            case 'chart': callbacks.onChart?.(event); break
             case 'generating': callbacks.onGenerating?.(event); break
             case 'done': callbacks.onDone?.(event); break
             case 'error': callbacks.onError?.(event); break

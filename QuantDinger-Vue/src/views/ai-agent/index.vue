@@ -393,6 +393,7 @@ export default {
           onToolDone: makeCb('onToolDone'),
           onToolStream: makeCb('onToolStream'),
           onToolInfo: makeCb('onToolInfo'),
+          onChart: makeCb('onChart'),
           onGenerating: makeCb('onGenerating'),
           onDone: makeCb('onDone'),
           onError: makeCb('onError')
@@ -425,6 +426,13 @@ export default {
         onToolInfo: (ev) => {
           const item = toolEvents.find((t) => t.tool === ev.tool)
           if (item) item.info = ev.message
+        },
+        onChart: (ev) => {
+          const last = messages.value[messages.value.length - 1]
+          if (last) {
+            if (!last.charts) last.charts = []
+            try { last.charts.push(atob(ev.b64)) } catch (e) { /* ignore */ }
+          }
         },
         onGenerating: () => {
           updateLastMessage('')
@@ -623,6 +631,13 @@ export default {
         onToolInfo: (ev) => {
           const item = toolEvents.find((t) => t.tool === ev.tool)
           if (item) item.info = ev.message
+        },
+        onChart: (ev) => {
+          const last = messages.value[messages.value.length - 1]
+          if (last) {
+            if (!last.charts) last.charts = []
+            try { last.charts.push(atob(ev.b64)) } catch (e) { /* ignore */ }
+          }
         },
         onGenerating: () => {
           updateLastMessage('')

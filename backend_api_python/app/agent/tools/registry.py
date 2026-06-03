@@ -46,6 +46,15 @@ except ImportError:
         return False
 
 
+def _is_optional(tp) -> bool:
+    """Check if a type is Optional[X] (i.e. Union[X, None])."""
+    import typing
+    origin = getattr(tp, "__origin__", None)
+    if origin is typing.Union:
+        return type(None) in tp.__args__
+    return False
+
+
 def _python_type_to_str(tp) -> str:
     """Convert a Python type annotation to smolagents type string."""
     if tp is inspect.Parameter.empty:
@@ -97,17 +106,26 @@ class ToolSpec:
             # Try to extract from docstring (Google-style)
             desc = _extract_param_desc(self.fn, pname)
             inputs[pname] = {"type": type_str, "description": desc}
-            if param.default is not inspect.Parameter.empty:
+            # Mark nullable when the original param has a default or is Optional
+            is_optional = _is_optional(tp)
+            has_default = param.default is not inspect.Parameter.empty
+            if has_default or is_optional:
                 inputs[pname]["nullable"] = True
 
         param_names = list(sig.parameters.keys())
 
-        def _make_forward(_fn, _param_names):
+        def _make_forward(_fn, _param_names, _sig):
             def forward(self, **kwargs):
                 return _fn(**kwargs)
             params = [inspect.Parameter("self", inspect.Parameter.POSITIONAL_OR_KEYWORD)]
             for pname in _param_names:
-                params.append(inspect.Parameter(pname, inspect.Parameter.KEYWORD_ONLY, default=None))
+                orig = _sig.parameters[pname]
+                # Preserve original default; use None only if the param is optional or has a default
+                if orig.default is not inspect.Parameter.empty:
+                    default = orig.default
+                else:
+                    default = inspect.Parameter.empty
+                params.append(inspect.Parameter(pname, inspect.Parameter.KEYWORD_ONLY, default=default))
             forward.__signature__ = inspect.Signature(params)
             return forward
 
@@ -119,7 +137,7 @@ class ToolSpec:
                 "description": self.description,
                 "inputs": inputs,
                 "output_type": self.output_type,
-                "forward": _make_forward(self.fn, param_names),
+                "forward": _make_forward(self.fn, param_names, sig),
             },
         )
         return tool_class()

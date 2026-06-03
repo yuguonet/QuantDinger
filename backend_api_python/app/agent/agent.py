@@ -256,11 +256,25 @@ def _step_to_events(step) -> List[Dict[str, Any]]:
         })
         tool_name = step.tool_call.name if step.tool_call else ""
         if step.observation:
-            events.append({
-                "type": "tool_info",
-                "tool": tool_name,
-                "message": step.observation[:2000],
-            })
+            import re
+            obs = step.observation
+            # 提取图表标记，单独发给前端
+            chart_match = re.search(r'__CHART_B64__([A-Za-z0-9+/=]+)__END_CHART__', obs)
+            if chart_match:
+                events.append({
+                    "type": "chart",
+                    "tool": tool_name,
+                    "b64": chart_match.group(1),
+                })
+                # 从模型可见的输出中移除图表标记
+                obs = obs[:chart_match.start()] + obs[chart_match.end():]
+                obs = obs.strip()
+            if obs:
+                events.append({
+                    "type": "tool_info",
+                    "tool": tool_name,
+                    "message": obs[:2000],
+                })
         return events
 
     # ActionOutput (step-level, skip — ActionStep follows with complete info)

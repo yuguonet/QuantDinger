@@ -162,7 +162,7 @@ def agent_get_kline(stock_code: str, timeframe: str = "1D", days: int = 60, mark
 
 
 @tool(
-    description="生成K线图（HTML交互式图表），返回文件路径。用浏览器打开可查看专业级蜡烛图+成交量+均线。当用户要求看K线、显示图表、K线图时，必须先调用 agent_get_kline 获取数据，再调用此工具生成图表。分析类请求不需要此工具。",
+    description="生成K线图（嵌入式交互图表）。当用户要求看K线、显示图表、K线图时，必须先调用 agent_get_kline 获取数据，再调用此工具生成图表。分析类请求不需要此工具。",
     category="行情数据",
 )
 def generate_kline_chart(
@@ -184,9 +184,6 @@ def generate_kline_chart(
         stock_name: 股票名称（可选，显示在标题上）
         indicators: 叠加指标，逗号分隔。可选: MA5,MA10,MA20,MA60。默认 MA5+MA10+MA20
     """
-    import os
-    import pathlib
-
     # 1) 拉取 K 线数据
     klines = agent_get_kline(stock_code, timeframe, days)
     if not klines:
@@ -318,21 +315,18 @@ window.addEventListener('resize', function() {{ chart.resize(); }});
 </body>
 </html>"""
 
-    # 6) 写文件
-    out_dir = pathlib.Path(os.getenv("WORKSPACE_DIR", ".")).resolve() / "chart_output"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"{stock_code.replace('/', '_')}_{timeframe}_{days}d.html"
-    out_path = out_dir / filename
-    out_path.write_text(chart_html, encoding="utf-8")
+    # 用 base64 编码 HTML，前端通过 __CHART_B64__ 标记检测并用 iframe 渲染
+    import base64
+    b64 = base64.b64encode(chart_html.encode("utf-8")).decode("ascii")
+    chart_marker = f"__CHART_B64__{b64}__END_CHART__"
 
     return {
-        "file_path": str(out_path),
         "stock_code": stock_code,
         "stock_name": stock_name,
         "timeframe": timeframe,
         "days": days,
         "kline_count": len(klines),
-        "message": f"K线图已生成: {out_path}",
+        "message": f"K线图已生成，共 {len(klines)} 根K线。\n{chart_marker}",
     }
 
 

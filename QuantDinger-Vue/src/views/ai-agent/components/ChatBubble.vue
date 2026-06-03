@@ -33,6 +33,11 @@
       <!-- 消息内容（支持简单 markdown） -->
       <div class="bubble-content" v-html="renderedContent"></div>
 
+      <!-- 图表渲染（来自 SSE chart 事件） -->
+      <div v-for="(chartHtml, ci) in (message.charts || [])" :key="'c'+ci" class="chart-container">
+        <iframe :srcdoc="chartHtml" frameborder="0" sandbox="allow-scripts" scrolling="no"></iframe>
+      </div>
+
       <!-- 打字指示器 -->
       <div v-if="message.streaming && !message.content" class="typing-indicator">
         <span></span><span></span><span></span>
@@ -55,8 +60,21 @@ export default defineComponent({
   setup (props) {
     const renderedContent = computed(() => {
       const raw = props.message.content || ''
+
+      // Step 0: 提取图表标记（在 HTML 转义之前）
+      const chartSlots = []
+      const text = raw.replace(/__CHART_B64__([A-Za-z0-9+/=]+)__END_CHART__/g, (_, b64) => {
+        const idx = chartSlots.length
+        try {
+          chartSlots.push(atob(b64))
+        } catch (e) {
+          chartSlots.push('')
+        }
+        return `%%CHART_${idx}%%`
+      })
+
       // Step 1: HTML entity encode
-      let safe = raw
+      let safe = text
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
@@ -82,7 +100,14 @@ export default defineComponent({
         .replace(/\n/g, '<br>')
 
       // Step 3: Strip disallowed HTML tags
-      safe = safe.replace(/<(?!\/?(strong|code|pre|br|h[2-4]|ul|li|div|span)\b)[^>]+>/gi, '')
+      safe = safe.replace(/<(?!\/?(strong|code|pre|br|h[2-4]|ul|li|div|span|iframe)\b)[^>]+>/gi, '')
+
+      // Step 4: 还原图表为 iframe
+      chartSlots.forEach((html, idx) => {
+        const srcdoc = html.replace(/"/g, '&quot;')
+        const iframe = `<div class="chart-container"><iframe srcdoc="${srcdoc}" frameborder="0" sandbox="allow-scripts" scrolling="no"></iframe></div>`
+        safe = safe.replace(`%%CHART_${idx}%%`, iframe)
+      })
 
       return safe
     })
@@ -293,6 +318,22 @@ export default defineComponent({
       margin-top: 2px;
       flex-shrink: 0;
     }
+  }
+}
+
+/* ── 图表容器 ─────────────────────────────── */
+:deep(.chart-container) {
+  margin: 10px 0;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid #e0e0e0;
+  background: #1a1a2e;
+
+  iframe {
+    width: 100%;
+    height: 420px;
+    border: none;
+    display: block;
   }
 }
 
