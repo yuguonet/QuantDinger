@@ -313,20 +313,21 @@ window.addEventListener('resize', function() {{ chart.resize(); }});
 
 
 @tool(
-    description="获取股票基本面信息（公司简介、行业分类、市值、PE、PB、ROE等）。",
+    description="获取股票基本面信息（行业、概念、市值、PE、PB等）。",
     category="行情数据",
 )
 def get_stock_info(stock_code: str) -> Dict[str, Any]:
-    """获取股票基本面信息（公司简介、行业、市值、PE、PB 等）。"""
+    """获取股票基本面信息（行业、概念、市值、PE、PB 等）。"""
     market = _detect_market(stock_code) or "CNStock"
     ds = _get_ds(market)
+
+    # 1) 尝试数据源原生 get_stock_info
     try:
         if hasattr(ds, "get_stock_info"):
             result = ds.get_stock_info(stock_code)
-            if isinstance(result, dict):
+            if isinstance(result, dict) and not result.get("error"):
                 return result
             if isinstance(result, str):
-                # 某些数据源返回字符串，尝试 JSON 解析
                 try:
                     import json as _json
                     parsed = _json.loads(result)
@@ -334,15 +335,56 @@ def get_stock_info(stock_code: str) -> Dict[str, Any]:
                         return parsed
                 except (ValueError, TypeError):
                     pass
-                # 解析失败，包装为 dict
                 return {"stock_code": stock_code, "info_text": result}
-            return {"stock_code": stock_code, "raw_result": str(result)[:2000] if result else None}
-        return {"error": f"数据源 {market} 不支持 get_stock_info", "retriable": False}
     except NotImplementedError:
-        return {"error": f"数据源 {market} 不支持 get_stock_info", "retriable": False}
+        pass
     except Exception as e:
-        logger.error("get_stock_info(%s) failed: %s", stock_code, e)
-        return {"error": str(e)}
+        logger.warning("get_stock_info(%s) datasource failed: %s", stock_code, e)
+
+    # 2) 兜底：HTTP 实时拉取（双源互补）
+    try:
+        from app.utils.cn_stock_info import get_cn_stock_info
+        info = get_cn_stock_info(stock_code)
+        if info and not info.get("error"):
+            return info
+    except Exception as e:
+        logger.warning("get_stock_info(%s) cn_stock_info failed: %s", stock_code, e)
+
+    # 3) 兜底：本地缓存 basicinfo_db
+    try:
+        from app.utils.basicinfo_db import get_stock_basic_db
+        from app.data_sources.normalizer import strip_market_prefix
+
+        sym = strip_market_prefix(stock_code)
+        db = get_stock_basic_db()
+        stock = db.get_stock(sym)
+        if stock:
+            out: Dict[str, Any] = {"stock_code": sym}
+            if stock.get("name"):
+                out["name"] = stock["name"]
+            if stock.get("industry"):
+                out["industry"] = stock["industry"]
+            concepts_str = stock.get("concepts", "")
+            if concepts_str:
+                out["concepts"] = [c.strip() for c in concepts_str.split(",") if c.strip()]
+            if stock.get("total_shares"):
+                out["total_shares"] = stock["total_shares"]
+            if stock.get("circ_shares"):
+                out["circ_shares"] = stock["circ_shares"]
+            if stock.get("pe_ratio"):
+                out["pe_ratio"] = stock["pe_ratio"]
+            if stock.get("pb_ratio"):
+                out["pb_ratio"] = stock["pb_ratio"]
+            if stock.get("market_cn"):
+                out["market_cn"] = stock["market_cn"]
+            if stock.get("list_date"):
+                out["list_date"] = stock["list_date"]
+            out["source"] = "basicinfo_db"
+            return out
+    except Exception as e:
+        logger.warning("get_stock_info(%s) basicinfo_db fallback failed: %s", stock_code, e)
+
+    return {"error": f"无法获取 {stock_code} 的基本面信息", "retriable": False}
 
 
 # Legacy list — kept for backward compat during migration; safe to remove later.

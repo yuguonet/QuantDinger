@@ -117,12 +117,13 @@ def _render_svg(
 
         # 影线
         parts.append(f'<line x1="{cx}" y1="{y_of(h)}" x2="{cx}" y2="{y_of(l)}" stroke="{color}" stroke-width="1"/>')
-        # 实体
+        # 实体（阳线空心、阴线实心）
         y_top = y_of(max(o, c))
         y_bot = y_of(min(o, c))
         body_h = max(1, y_bot - y_top)
+        fill = "none" if is_up else color
         parts.append(f'<rect x="{cx - body_w/2}" y="{y_top}" width="{body_w}" height="{body_h}" '
-                     f'fill="{color if is_up else color}" stroke="{color}" rx="0.5"/>')
+                     f'fill="{fill}" stroke="{color}" rx="0.5"/>')
 
         # 成交量
         if show_volume:
@@ -215,22 +216,33 @@ def render_candlestick(
         show_volume=show_volume,
     )
 
-    # 4) 同时保存文件（备用）
+    # 4) 保存文件（备用）
     out_dir = pathlib.Path(os.getenv("WORKSPACE_DIR", ".")).resolve() / "chart_output"
     out_dir.mkdir(parents=True, exist_ok=True)
     filename = f"{stock_code.replace('/', '_')}_{timeframe}_{days}d.svg"
     out_path = out_dir / filename
     out_path.write_text(svg, encoding="utf-8")
 
+    # 5) 将 SVG 包装为 HTML 并 base64 编码，复用 __CHART_B64__ 协议让前端 iframe 渲染
+    import base64
+    chart_html = (
+        '<!DOCTYPE html><html><head><meta charset="UTF-8">'
+        '<style>*{margin:0;padding:0}body{background:#1a1a2e;display:flex;justify-content:center;align-items:center;height:100vh}</style>'
+        "</head><body>"
+        f'{svg}'
+        "</body></html>"
+    )
+    b64 = base64.b64encode(chart_html.encode("utf-8")).decode("ascii")
+    chart_marker = f"__CHART_B64__{b64}__END_CHART__"
+
     return {
-        "svg": svg,
         "file_path": str(out_path),
         "stock_code": stock_code,
         "stock_name": stock_name,
         "timeframe": timeframe,
         "days": days,
         "kline_count": len(klines),
-        "message": f"蜡烛图（SVG，可直接嵌入对话）",
+        "message": f"蜡烛图已生成，共 {len(klines)} 根K线。\n{chart_marker}",
     }
 
 
