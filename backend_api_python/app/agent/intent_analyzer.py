@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional
 from app.agent.domain_registry import (
     get_domain,
     get_all_domains,
+    init_builtin_domains,
 )
 
 logger = logging.getLogger(__name__)
@@ -98,7 +99,7 @@ _INTENT_PROMPT = """# Role
 
 # Constraints（输出约束）
 1. 严格输出一个 JSON 对象，不要 markdown 包裹，不要任何其他文字
-2. 输出格式：{"domain": "finance|coding|chat", "intent": "子意图", "params": {}, "confidence": 0.0~1.0}
+2. 输出格式：{{"domain": "finance|coding|chat", "intent": "子意图", "params": {{}}, "confidence": 0.0~1.0}}
 3. params 中提取关键参数：stock（股票代码）、stock_name（股票名称）、target（目标文件）、aspects（分析维度）、timeframe（时间范围）等
 4. 股票名称必须转为代码（贵州茅台→600519，比亚迪→002594），不确定就留空
 5. aspects 根据用户意图推断（如"最近怎么样"→["行情","技术面","资金流"]）
@@ -136,6 +137,9 @@ def analyze_intent(
 
     失败时返回默认的 chat 领域（降级不阻塞）。
     """
+    # 确保内置领域已注册（幂等，多次调用无副作用）
+    init_builtin_domains()
+
     if not message or not message.strip():
         return IntentResult(domain="chat", intent="empty", confidence=1.0)
 
@@ -234,7 +238,8 @@ def analyze_intent(
         logger.warning("[Intent] JSON 解析失败: %s | raw: %s", e, raw[:500])
         return IntentResult(domain="chat", intent="parse_error", confidence=0.0, raw_response=raw)
     except Exception as e:
-        logger.warning("[Intent] 分析失败，降级到默认: %s", e)
+        import traceback
+        logger.warning("[Intent] 分析失败，降级到默认: %s\n%s", e, traceback.format_exc())
         return IntentResult(domain="chat", intent="error", confidence=0.0)
 
 

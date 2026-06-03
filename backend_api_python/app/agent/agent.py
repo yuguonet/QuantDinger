@@ -144,8 +144,8 @@ def _load_preamble() -> str:
     import pathlib
     # Try project root first, then backend_api_python/
     candidates = [
-        pathlib.Path(__file__).resolve().parents[3] / "agent_preamble.md",
-        pathlib.Path(__file__).resolve().parents[2] / "agent_preamble.md",
+        pathlib.Path(__file__).resolve().parent / "agent_preamble.md",
+        pathlib.Path(__file__).resolve().parents / "agent_preamble.md",
     ]
     for p in candidates:
         if p.is_file():
@@ -645,7 +645,8 @@ class _AgentExecutor:
                     logger.info("[Intent] Quick-reply for %s, skipping agent", intent.intent)
 
             except Exception as e:
-                logger.warning("[Intent] 分析失败，走默认流程: %s", e)
+                import traceback
+                logger.warning("[Intent] 分析失败，走默认流程: %s\n%s", e, traceback.format_exc())
 
         # ── 快速通道：不需要 agent 时直接返回 ────────────────
         if skip_agent:
