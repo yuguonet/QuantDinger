@@ -1,28 +1,34 @@
 # -*- coding: utf-8 -*-
 
 """
-Intent Analyzer — Ragent 风格的打分式意图分类。
+Intent Analyzer — 基于语义路由的意图分类（v2）。
 
-设计：
-- 从 domain_registry 加载所有场景（扁平化叶子节点）
-- LLM 对每个场景打分（选择题，不是填空题）
-- 过滤低分、取最高分
-- 支持上下文（对话历史）辅助判断
+架构：
+  1. SemanticIntentRouter（本地 embedding + cosine similarity）做首选路由
+     - 毫秒级响应，零 API 调用（使用 sentence-transformers 或降级 HashEncoder）
+     - 命中 → 直接返回 IntentResult
+  2. LLM 打分（原有逻辑）做降级方案
+     - 仅在语义路由置信度不足时触发
+     - 保留原有场景列表 + LLM 打分的完整流程
+
+上下文管理：
+  - ContextManager 跟踪每个 session 的对话历史
+  - 话题连续性加成：同一 domain 内的消息获得分数加成
+  - 话题切换检测：domain 突变时自动降低旧 domain 权重
+
+多用户支持：
+  - session_id 隔离，每个用户独立的上下文状态
+  - 线程安全，支持并发访问
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
-
-from app.agent.domain_registry import (
-    get_domain,
-    get_all_domains,
-    init_builtin_domains,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +41,18 @@ class IntentResult:
     params: Dict[str, Any] = field(default_factory=dict)
     confidence: float = 0.0
     raw_response: str = ""
+    # 新增：路由来源（"semantic" | "llm" | "quick"）
+    source: str = ""
+    # 新增：路由附带的元数据
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    # 新增：所有路由的得分（调试用）
+    all_scores: Dict[str, float] = field(default_factory=dict)
+    # 新增：路由耗时（毫秒）
+    elapsed_ms: float = 0.0
 
     @property
     def domain_config(self):
+        from app.agent.domain_registry import get_domain
         return get_domain(self.domain)
 
     @property
@@ -52,18 +67,182 @@ class IntentResult:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 场景目录（扁平化，供 LLM 打分）
+# 全局单例：语义路由器 + 上下文管理器
+# ═══════════════════════════════════════════════════════════════
+
+_router = None
+_context_mgr = None
+
+
+def _get_router():
+    """懒加载语义路由器单例。"""
+    global _router
+    if _router is not None:
+        return _router
+
+    from app.agent.router.core import SemanticIntentRouter
+    from app.agent.router.routes import build_default_routes
+
+    # 从环境变量读取配置
+    backend = os.getenv("INTENT_ROUTER_ENCODER", "auto")
+    threshold = float(os.getenv("INTENT_ROUTER_THRESHOLD", "0.45"))
+    context_boost = float(os.getenv("INTENT_ROUTER_CONTEXT_BOOST", "0.1"))
+
+    try:
+        routes = build_default_routes()
+        _router = SemanticIntentRouter(
+            routes=routes,
+            default_threshold=threshold,
+            context_boost=context_boost,
+            encoder_backend=backend,
+        )
+        logger.info("[Intent] 语义路由器初始化完成 (encoder=%s, threshold=%.2f)", backend, threshold)
+    except Exception as e:
+        logger.warning("[Intent] 语义路由器初始化失败: %s，将使用纯 LLM 模式", e)
+        _router = None
+
+    return _router
+
+
+def _get_context_manager():
+    """懒加载上下文管理器单例。"""
+    global _context_mgr
+    if _context_mgr is None:
+        from app.agent.router.context import ContextManager
+        ttl = int(os.getenv("INTENT_CONTEXT_TTL", "3600"))
+        _context_mgr = ContextManager(session_ttl=ttl)
+    return _context_mgr
+
+
+# ═══════════════════════════════════════════════════════════════
+# 快速通道（不需要 LLM，不需要 router）
+# ═══════════════════════════════════════════════════════════════
+
+def _quick_intent_check(message: str) -> Optional[IntentResult]:
+    """极低成本的关键词/正则快速匹配。
+
+    用于处理明显的闲聊和空消息，避免任何计算开销。
+    """
+    msg = message.strip()
+    if not msg:
+        return IntentResult(domain="chat", intent="empty", confidence=1.0, source="quick")
+
+    # 纯标点/符号
+    if re.match(r'^[\s\.\,\!\?\~\。\，\！\？\…]+$', msg):
+        return IntentResult(domain="chat", intent="empty", confidence=1.0, source="quick")
+
+    # 极短消息 + 常见问候词（<5 字符）
+    greetings = {"你好", "hi", "hello", "嗨", "hey", "在吗", "哈喽", "嘿", "yo"}
+    if len(msg) <= 5 and msg.lower() in greetings:
+        return IntentResult(domain="chat", intent="greeting", confidence=1.0, source="quick")
+
+    farewells = {"再见", "拜拜", "bye", "88", "886", "晚安", "回见"}
+    if len(msg) <= 5 and msg.lower() in farewells:
+        return IntentResult(domain="chat", intent="farewell", confidence=1.0, source="quick")
+
+    thanks = {"谢谢", "感谢", "多谢", "thanks", "thank you", "thx", "3q"}
+    if len(msg) <= 10 and msg.lower() in thanks:
+        return IntentResult(domain="chat", intent="thanks", confidence=1.0, source="quick")
+
+    return None  # 未命中快速通道
+
+
+# ═══════════════════════════════════════════════════════════════
+# 主入口
+# ═══════════════════════════════════════════════════════════════
+
+def analyze_intent(
+    message: str,
+    model: str = None,
+    provider: str = None,
+    history: List[Dict[str, str]] = None,
+    session_id: str = None,
+) -> IntentResult:
+    """分析用户消息的意图。
+
+    路由策略（三级降级）：
+    1. 快速通道 — 关键词匹配（<1ms，零开销）
+    2. 语义路由 — embedding + cosine similarity（<50ms，零 API 调用）
+    3. LLM 打分 — 传统方式（2-5s，消耗 token）
+
+    Args:
+        message: 用户消息
+        model: LLM 模型名（仅降级时使用）
+        provider: LLM provider（仅降级时使用）
+        history: 对话历史（仅 LLM 降级时使用）
+        session_id: 会话 ID（用于上下文管理）
+
+    Returns:
+        IntentResult
+    """
+    from app.agent.domain_registry import init_builtin_domains
+    init_builtin_domains()
+
+    if not message or not message.strip():
+        return IntentResult(domain="chat", intent="empty", confidence=1.0, source="quick")
+
+    # ── Level 1: 快速通道 ──────────────────────────────────────
+    quick = _quick_intent_check(message)
+    if quick:
+        logger.info("[Intent] 快速通道: %s/%s", quick.domain, quick.intent)
+        return quick
+
+    # ── Level 2: 语义路由 ──────────────────────────────────────
+    router = _get_router()
+    if router:
+        ctx_mgr = _get_context_manager()
+        context_domain = ctx_mgr.get_context_domain(session_id) if session_id else ""
+
+        result = router.route(
+            query=message,
+            session_id=session_id,
+            context_domain=context_domain,
+        )
+
+        if result.matched:
+            # 提取参数（股票代码等）
+            params = _extract_params(message)
+
+            # 记录到上下文
+            if session_id:
+                ctx_mgr.record_route(
+                    session_id=session_id,
+                    domain=result.domain,
+                    intent=result.intent,
+                    confidence=result.confidence,
+                    query=message,
+            )
+
+            intent_result = IntentResult(
+                domain=result.domain,
+                intent=result.intent,
+                params=params,
+                confidence=result.confidence,
+                metadata=result.metadata,
+                source="semantic",
+                all_scores=result.all_scores,
+                elapsed_ms=result.elapsed_ms,
+            )
+            logger.info(
+                "[Intent] 语义路由命中: %s/%s (%.3f) %.0fms",
+                result.domain, result.intent, result.confidence, result.elapsed_ms,
+            )
+            return intent_result
+
+    # ── Level 3: LLM 打分降级 ──────────────────────────────────
+    logger.info("[Intent] 语义路由未命中，降级到 LLM 打分")
+    return _llm_fallback(message, model, provider, history)
+
+
+# ═══════════════════════════════════════════════════════════════
+# LLM 降级（保留原有逻辑）
 # ═══════════════════════════════════════════════════════════════
 
 def _build_scene_list() -> List[Dict[str, str]]:
-    """从 domain_registry 提取所有场景，生成扁平列表供 LLM 打分。
-
-    每个场景 = 一个可路由的意图单元，包含 id、domain、intent、description。
-    """
+    """从 domain_registry 提取所有场景，生成扁平列表供 LLM 打分。"""
     scenes = []
     idx = 1
 
-    # finance 领域场景
     finance_scenes = [
         ("stock_analysis", "股票分析", "个股分析、技术面分析、行情研判、趋势判断、综合诊断"),
         ("market_scan", "市场扫描", "涨停池、跌停池、龙虎榜、热门板块、市场概览"),
@@ -76,16 +255,9 @@ def _build_scene_list() -> List[Dict[str, str]]:
         ("concept_explain", "概念解释", "金融概念解释、术语答疑、投资知识问答"),
     ]
     for intent, name, desc in finance_scenes:
-        scenes.append({
-            "id": str(idx),
-            "domain": "finance",
-            "intent": intent,
-            "name": name,
-            "description": desc,
-        })
+        scenes.append({"id": str(idx), "domain": "finance", "intent": intent, "name": name, "description": desc})
         idx += 1
 
-    # coding 领域场景
     coding_scenes = [
         ("code_modify", "代码修改", "修改代码、修复bug、重构优化"),
         ("code_review", "代码审查", "审查代码质量、分析潜在问题、性能评估"),
@@ -94,30 +266,12 @@ def _build_scene_list() -> List[Dict[str, str]]:
         ("project_scan", "项目分析", "项目结构分析、文件梳理、依赖关系"),
     ]
     for intent, name, desc in coding_scenes:
-        scenes.append({
-            "id": str(idx),
-            "domain": "coding",
-            "intent": intent,
-            "name": name,
-            "description": desc,
-        })
+        scenes.append({"id": str(idx), "domain": "coding", "intent": intent, "name": name, "description": desc})
         idx += 1
 
-    # chat 领域场景
-    scenes.append({
-        "id": str(idx),
-        "domain": "chat",
-        "intent": "chat",
-        "name": "闲聊",
-        "description": "问候、寒暄、感谢、告别、通用对话",
-    })
-
+    scenes.append({"id": str(idx), "domain": "chat", "intent": "chat", "name": "闲聊", "description": "问候、寒暄、感谢、告别、通用对话"})
     return scenes
 
-
-# ═══════════════════════════════════════════════════════════════
-# Prompt 模板（Ragent 风格：选择题 + 打分）
-# ═══════════════════════════════════════════════════════════════
 
 _INTENT_PROMPT = """# Role
 你是一个意图分类器。根据用户输入，对每个分类打分。
@@ -141,55 +295,22 @@ _INTENT_PROMPT = """# Role
 {message}"""
 
 
-# ═══════════════════════════════════════════════════════════════
-# 分析器
-# ═══════════════════════════════════════════════════════════════
-
-# 阈值配置
-MIN_SCORE = 0.35      # 低于此分数的分类被过滤
-MAX_RESULTS = 3       # 最多保留的分类数
-
-# 场景列表缓存
-_scenes_cache: List[Dict[str, str]] = []
+MIN_SCORE = 0.35
+MAX_RESULTS = 3
 
 
-def _get_scenes() -> List[Dict[str, str]]:
-    global _scenes_cache
-    if not _scenes_cache:
-        _scenes_cache = _build_scene_list()
-    return _scenes_cache
-
-
-def analyze_intent(
+def _llm_fallback(
     message: str,
     model: str = None,
     provider: str = None,
     history: List[Dict[str, str]] = None,
 ) -> IntentResult:
-    """分析用户消息的意图（Ragent 风格打分模式）。
+    """LLM 打分降级方案（原有逻辑）。"""
+    scenes = _build_scene_list()
 
-    流程：
-    1. 加载场景列表
-    2. 构造 prompt（场景列表 + 对话历史 + 用户输入）
-    3. LLM 对每个场景打分
-    4. 过滤低分、取最高分
-    5. 返回 IntentResult
-    """
-    print(f"[DEBUG-INTENT] >>> analyze_intent loaded from: {__file__}", flush=True)
-    init_builtin_domains()
-
-    if not message or not message.strip():
-        return IntentResult(domain="chat", intent="empty", confidence=1.0)
-
-    scenes = _get_scenes()
-
-    # 构造场景列表文本
-    scene_lines = []
-    for s in scenes:
-        scene_lines.append(f"- id={s['id']}，{s['domain']}/{s['name']}，{s['description']}")
+    scene_lines = [f"- id={s['id']}，{s['domain']}/{s['name']}，{s['description']}" for s in scenes]
     scene_list_text = "\n".join(scene_lines)
 
-    # 格式化对话历史
     history_text = "（无）"
     if history:
         lines = []
@@ -200,13 +321,8 @@ def analyze_intent(
         if lines:
             history_text = "\n".join(lines)
 
-    prompt = _INTENT_PROMPT.format(
-        scene_list=scene_list_text,
-        history=history_text,
-        message=message.strip(),
-    )
+    prompt = _INTENT_PROMPT.format(scene_list=scene_list_text, history=history_text, message=message.strip())
 
-    # 调 LLM
     try:
         from app.services.llm import LLMService
         svc = LLMService(provider=provider)
@@ -217,77 +333,52 @@ def analyze_intent(
         import requests
         resp = requests.post(
             f"{base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model_id,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1,
-                "max_tokens": 500,
-            },
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": model_id, "messages": [{"role": "user", "content": prompt}], "temperature": 0.1, "max_tokens": 500},
             timeout=120.0,
         )
         resp.raise_for_status()
         raw = resp.json()["choices"][0]["message"]["content"].strip()
 
-        # 清理 markdown 包裹
         if raw.startswith("```"):
             lines = raw.split("\n")
             lines = [l for l in lines if not l.strip().startswith("```")]
             raw = "\n".join(lines).strip()
 
-        logger.debug("[Intent] LLM raw response: %s", raw[:500])
-
-        # 解析 JSON 数组
         scores = _parse_scores(raw, scenes)
         if not scores:
-            logger.warning("[Intent] 无法解析打分结果，降级到 chat | raw: %s", raw[:300])
-            return IntentResult(domain="chat", intent="parse_error", confidence=0.0, raw_response=raw)
+            return IntentResult(domain="chat", intent="parse_error", confidence=0.0, raw_response=raw, source="llm")
 
-        # 过滤低分、排序
         filtered = [s for s in scores if s["score"] >= MIN_SCORE]
         filtered.sort(key=lambda x: x["score"], reverse=True)
         top = filtered[:MAX_RESULTS]
 
         if not top:
-            logger.info("[Intent] 所有分类分数 < %.2f，归为 chat", MIN_SCORE)
-            return IntentResult(domain="chat", intent="low_confidence", confidence=0.0, raw_response=raw)
+            return IntentResult(domain="chat", intent="low_confidence", confidence=0.0, raw_response=raw, source="llm")
 
-        # 取最高分
         best = top[0]
         scene = best["scene"]
-        confidence = best["score"]
-
         return IntentResult(
             domain=scene["domain"],
             intent=scene["intent"],
             params=_extract_params(message, scene),
-            confidence=confidence,
+            confidence=best["score"],
             raw_response=raw,
+            source="llm",
         )
-
-    except json.JSONDecodeError as e:
-        logger.warning("[Intent] JSON 解析失败: %s | raw: %s", e, raw[:500])
-        return IntentResult(domain="chat", intent="parse_error", confidence=0.0, raw_response=raw)
     except Exception as e:
-        import traceback
-        logger.warning("[Intent] 分析失败，降级到默认: %s\n%s", e, traceback.format_exc())
-        return IntentResult(domain="chat", intent="error", confidence=0.0)
+        logger.warning("[Intent] LLM 降级也失败: %s", e)
+        return IntentResult(domain="chat", intent="error", confidence=0.0, source="llm")
 
 
 def _parse_scores(raw: str, scenes: List[Dict]) -> List[Dict]:
     """解析 LLM 返回的打分 JSON 数组。"""
-    # 尝试直接解析
     try:
         arr = json.loads(raw)
         if isinstance(arr, list):
             return _match_scores_to_scenes(arr, scenes)
     except json.JSONDecodeError:
         pass
-
-    # 从文本中提取 JSON 数组
     match = re.search(r'\[.*?\]', raw, re.DOTALL)
     if match:
         try:
@@ -296,12 +387,10 @@ def _parse_scores(raw: str, scenes: List[Dict]) -> List[Dict]:
                 return _match_scores_to_scenes(arr, scenes)
         except json.JSONDecodeError:
             pass
-
     return []
 
 
 def _match_scores_to_scenes(arr: List[Dict], scenes: List[Dict]) -> List[Dict]:
-    """将 LLM 返回的 [{id, score}] 匹配到场景列表。"""
     scene_map = {s["id"]: s for s in scenes}
     results = []
     for item in arr:
@@ -319,20 +408,12 @@ def _match_scores_to_scenes(arr: List[Dict], scenes: List[Dict]) -> List[Dict]:
     return results
 
 
-def _extract_params(message: str, scene: Dict) -> Dict[str, Any]:
-    """从用户消息中提取基础参数（股票代码等）。
-
-    这是轻量级提取，不调 LLM。复杂参数由 agent 自行处理。
-    """
-    import re as _re
+def _extract_params(message: str, scene: Dict = None) -> Dict[str, Any]:
+    """从用户消息中提取基础参数（股票代码等）。"""
     params = {}
-
-    # 提取 6 位股票代码
-    code_match = _re.search(r'\b(\d{6})\b', message)
+    code_match = re.search(r'\b(\d{6})\b', message)
     if code_match:
         params["stock"] = code_match.group(1)
-
-    # 提取股票名称关键词（简单匹配）
     name_map = {
         "茅台": "600519", "比亚迪": "002594", "平安": "000001",
         "宁德": "300750", "招商银行": "600036", "中芯": "688981",
@@ -342,7 +423,6 @@ def _extract_params(message: str, scene: Dict) -> Dict[str, Any]:
             params.setdefault("stock", code)
             params["stock_name"] = name
             break
-
     return params
 
 
@@ -350,13 +430,14 @@ def format_intent_for_agent(intent: IntentResult, original_message: str) -> str:
     """将意图分析结果格式化为 agent 可用的上下文。"""
     if intent.domain == "chat" and intent.confidence < 0.5:
         return ""
-
     if intent.domain == "chat":
         return f"[意图] {intent.intent}（直接回复即可，无需调用工具）"
 
     parts = [f"[意图] domain={intent.domain}, intent={intent.intent}"]
+    if intent.source:
+        parts.append(f"[路由] {intent.source}")
     if intent.params:
         parts.append(f"[参数] {json.dumps(intent.params, ensure_ascii=False)}")
     if intent.confidence < 0.6:
-        parts.append(f"⚠️ 置信度较低({intent.confidence})，请结合原始消息判断")
+        parts.append(f"⚠️ 置信度较低({intent.confidence:.2f})，请结合原始消息判断")
     return "\n".join(parts)
