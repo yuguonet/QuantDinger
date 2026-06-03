@@ -193,7 +193,7 @@
 </template>
 
 <script>
-import { ref, computed, nextTick, onBeforeUnmount } from 'vue'
+import { ref, computed, nextTick, onBeforeUnmount, watch } from 'vue'
 import { message } from 'ant-design-vue'
 // icons: using <a-icon type="xxx" /> (ant-design-vue 1.x pattern)
 
@@ -206,6 +206,22 @@ import {
   createTaskStream
 } from '@/api/agent'
 import request from '@/utils/request'
+
+// ── 模块级流式连接（跨组件生命周期存活）────────────────
+let _activeStream = null          // 当前活跃的流式连接 { close() }
+let _pendingToolEvents = []       // 流式进行中的工具事件（累积）
+let _streamActive = false         // 后端是否正在流式输出
+let _currentCallbacks = {}        // 当前组件注册的回调（可热替换）
+
+function _detachComponent () {
+  // 组件卸载时：清空回调，但连接继续跑
+  _currentCallbacks = {}
+}
+
+function _reattachComponent (callbacks) {
+  // 组件重新挂载：注册新回调
+  _currentCallbacks = callbacks
+}
 
 export default {
   name: 'AiAgent',
@@ -246,8 +262,6 @@ export default {
       { label: '💡 问问题', text: '什么是MACD指标？怎么用？' }
     ]
 
-    const streamController = ref(null)
-
     // 模板引用
     const chatContainerRef = ref(null)
 
@@ -257,6 +271,34 @@ export default {
       if (!selectedStrategy.value) return null
       return indicators.value.find((s) => s.id === selectedStrategy.value) || null
     })
+
+    // ── 消息持久化 ────────────────────────────────────
+
+    const STORAGE_KEY = 'ai_agent_messages'
+    const SESSION_KEY = 'ai_agent_session_id'
+
+    function saveMessages () {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(messages.value))
+        localStorage.setItem(SESSION_KEY, sessionId.value)
+      } catch (_) {}
+    }
+
+    function restoreMessages () {
+      try {
+        const saved = localStorage.getItem(STORAGE_KEY)
+        const savedSession = localStorage.getItem(SESSION_KEY)
+        if (saved) {
+          const parsed = JSON.parse(saved)
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            messages.value = parsed
+          }
+        }
+        if (savedSession) {
+          sessionId.value = savedSession
+        }
+      } catch (_) {}
+    }
 
     // ── 指标策略（与指标IDE共用）────────────────────────
 
@@ -330,10 +372,15 @@ export default {
 
     async function sendStream (text) {
       streaming.value = true
+      _streamActive = true
       const toolEvents = []
+      _pendingToolEvents = toolEvents
       pushMessage('assistant', '', { streaming: true, toolEvents })
 
-      streamController.value = createAgentStream(
+      // 注册模块级回调（通过 _currentCallbacks 代理，组件卸载也不中断）
+      const makeCb = (name) => (...args) => _currentCallbacks[name]?.(...args)
+
+      _activeStream = createAgentStream(
         {
           message: text,
           session_id: sessionId.value,
@@ -341,61 +388,77 @@ export default {
           context: stockCode.value ? { stock_code: stockCode.value } : undefined
         },
         {
-          onThinking: () => {
-            updateLastMessage('🤔 思考中...')
-          },
-          onToolStart: (ev) => {
-            toolEvents.push({ ...ev, status: 'loading', streamOutput: '' })
-            connected.value = true
-          },
-          onToolDone: (ev) => {
-            const item = toolEvents.find((t) => t.tool === ev.tool && t.status === 'loading')
-            if (item) {
-              item.status = ev.success === false ? 'error' : 'done'
-              if (ev.recovery) item.recovery = ev.recovery
-            }
-          },
-          onToolStream: (ev) => {
-            // Append streaming output to the matching tool event
-            const item = toolEvents.find((t) => t.tool === ev.tool && t.status === 'loading')
-            if (item) {
-              item.streamOutput = (item.streamOutput || '') + (ev.output || '')
-              // Auto-scroll
-              nextTick(() => scrollToBottom())
-            }
-          },
-          onToolInfo: (ev) => {
-            // Show info messages (e.g., "脚本已保存: xxx v2")
-            const item = toolEvents.find((t) => t.tool === ev.tool)
-            if (item) item.info = ev.message
-          },
-          onGenerating: () => {
-            updateLastMessage('')
-          },
-          onDone: (ev) => {
-            updateLastMessage(ev.content || '完成')
-            streaming.value = false
-          },
-          onError: (ev) => {
-            updateLastMessage('❌ ' + (ev.message || '流式连接错误'), true)
-            streaming.value = false
-          }
+          onThinking: makeCb('onThinking'),
+          onToolStart: makeCb('onToolStart'),
+          onToolDone: makeCb('onToolDone'),
+          onToolStream: makeCb('onToolStream'),
+          onToolInfo: makeCb('onToolInfo'),
+          onGenerating: makeCb('onGenerating'),
+          onDone: makeCb('onDone'),
+          onError: makeCb('onError')
         }
       )
+
+      // 绑定实际回调
+      _currentCallbacks = {
+        onThinking: () => {
+          updateLastMessage('🤔 思考中...')
+        },
+        onToolStart: (ev) => {
+          toolEvents.push({ ...ev, status: 'loading', streamOutput: '' })
+          connected.value = true
+        },
+        onToolDone: (ev) => {
+          const item = toolEvents.find((t) => t.tool === ev.tool && t.status === 'loading')
+          if (item) {
+            item.status = ev.success === false ? 'error' : 'done'
+            if (ev.recovery) item.recovery = ev.recovery
+          }
+        },
+        onToolStream: (ev) => {
+          const item = toolEvents.find((t) => t.tool === ev.tool && t.status === 'loading')
+          if (item) {
+            item.streamOutput = (item.streamOutput || '') + (ev.output || '')
+            nextTick(() => scrollToBottom())
+          }
+        },
+        onToolInfo: (ev) => {
+          const item = toolEvents.find((t) => t.tool === ev.tool)
+          if (item) item.info = ev.message
+        },
+        onGenerating: () => {
+          updateLastMessage('')
+        },
+        onDone: (ev) => {
+          updateLastMessage(ev.content || '完成')
+          streaming.value = false
+          _streamActive = false
+          _activeStream = null
+          _pendingToolEvents = []
+          saveMessages()
+        },
+        onError: (ev) => {
+          updateLastMessage('❌ ' + (ev.message || '流式连接错误'), true)
+          streaming.value = false
+          _streamActive = false
+          _activeStream = null
+          _pendingToolEvents = []
+          saveMessages()
+        }
+      }
     }
 
     function stopStream () {
-      // 1. 前端立即中断 fetch 连接
-      if (streamController.value) {
-        streamController.value.close()
-        streamController.value = null
+      if (_activeStream) {
+        _activeStream.close()
+        _activeStream = null
       }
-      // 2. 通知后端中断 agent 执行（fire-and-forget）
+      _streamActive = false
+      _pendingToolEvents = []
+      streaming.value = false
       if (sessionId.value) {
         request({ url: `/api/agent/interrupt/${sessionId.value}`, method: 'post' }).catch(() => {})
       }
-      // 3. 立即恢复 UI 状态
-      streaming.value = false
       updateLastMessage('⏹ 已中断', false)
     }
 
@@ -520,13 +583,74 @@ export default {
 
     // ── 生命周期 ────────────────────────────────────────
 
-    sessionId.value = 'session_' + (crypto.randomUUID?.() || Date.now().toString(36) + Math.random().toString(36).slice(2))
+    sessionId.value = localStorage.getItem(SESSION_KEY) ||
+      'session_' + (crypto.randomUUID?.() || Date.now().toString(36) + Math.random().toString(36).slice(2))
     initTaskStream()
     loadIndicators()
+    restoreMessages()
+
+    // 消息变化时自动保存
+    watch(messages, saveMessages, { deep: true })
+
+    // 如果有正在进行的流式输出，续接回调
+    if (_streamActive) {
+      streaming.value = true
+      // 找到最后一条 assistant 消息的 toolEvents
+      const lastMsg = messages.value[messages.value.length - 1]
+      const toolEvents = (lastMsg && lastMsg.role === 'assistant' && lastMsg.toolEvents) || _pendingToolEvents || []
+      _reattachComponent({
+        onThinking: () => {
+          updateLastMessage('🤔 思考中...')
+        },
+        onToolStart: (ev) => {
+          toolEvents.push({ ...ev, status: 'loading', streamOutput: '' })
+          connected.value = true
+        },
+        onToolDone: (ev) => {
+          const item = toolEvents.find((t) => t.tool === ev.tool && t.status === 'loading')
+          if (item) {
+            item.status = ev.success === false ? 'error' : 'done'
+            if (ev.recovery) item.recovery = ev.recovery
+          }
+        },
+        onToolStream: (ev) => {
+          const item = toolEvents.find((t) => t.tool === ev.tool && t.status === 'loading')
+          if (item) {
+            item.streamOutput = (item.streamOutput || '') + (ev.output || '')
+            nextTick(() => scrollToBottom())
+          }
+        },
+        onToolInfo: (ev) => {
+          const item = toolEvents.find((t) => t.tool === ev.tool)
+          if (item) item.info = ev.message
+        },
+        onGenerating: () => {
+          updateLastMessage('')
+        },
+        onDone: (ev) => {
+          updateLastMessage(ev.content || '完成')
+          streaming.value = false
+          _streamActive = false
+          _activeStream = null
+          _pendingToolEvents = []
+          saveMessages()
+        },
+        onError: (ev) => {
+          updateLastMessage('❌ ' + (ev.message || '流式连接错误'), true)
+          streaming.value = false
+          _streamActive = false
+          _activeStream = null
+          _pendingToolEvents = []
+          saveMessages()
+        }
+      })
+    }
 
     onBeforeUnmount(() => {
-      streamController.value?.close()
+      // 不关闭流式连接！只断开回调，后端继续跑
+      _detachComponent()
       taskStream.value?.close()
+      saveMessages()
     })
 
     return {

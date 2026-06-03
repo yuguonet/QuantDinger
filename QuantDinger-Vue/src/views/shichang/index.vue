@@ -253,6 +253,28 @@ export default {
     }, 10000)
   },
 
+  activated () {
+    // keep-alive: 从其它页面切回来时重启定时器
+    this.isDestroyed = false
+    if (!this.indexTimer) {
+      this.fetchIndex()
+      this.fetchOverview()
+      this.indexTimer = setInterval(() => {
+        this.fetchIndex()
+        this.fetchOverview()
+      }, 10000)
+    }
+  },
+
+  deactivated () {
+    // keep-alive: 离开页面时暂停定时器
+    this.isDestroyed = true
+    if (this.indexTimer) {
+      clearInterval(this.indexTimer)
+      this.indexTimer = null
+    }
+  },
+
   beforeDestroy () {
     this.isDestroyed = true
     if (this.indexTimer) clearInterval(this.indexTimer)

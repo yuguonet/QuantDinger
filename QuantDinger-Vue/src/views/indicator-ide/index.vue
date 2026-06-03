@@ -1401,6 +1401,32 @@ export default {
       this.ensureChartReady()
     })
   },
+  activated () {
+    // keep-alive: 从其它页面切回来时，重新绑定 resize 监听
+    if (this._onResize) {
+      window.addEventListener('resize', this._onResize)
+    }
+  },
+  deactivated () {
+    // keep-alive: 离开页面时暂停定时器、移除 resize 监听、中断进行中的请求
+    if (this._persistIdeUiTimer) {
+      clearTimeout(this._persistIdeUiTimer)
+      this._persistIdeUiTimer = null
+    }
+    clearInterval(this.elapsedTimer)
+    this.elapsedTimer = null
+    clearTimeout(this.addSearchTimer)
+    this.addSearchTimer = null
+    if (this.ideAiTipTimer) {
+      clearInterval(this.ideAiTipTimer)
+      this.ideAiTipTimer = null
+    }
+    if (this.experimentAbortController) {
+      try { this.experimentAbortController.abort() } catch (_) {}
+      this.experimentAbortController = null
+    }
+    window.removeEventListener('resize', this._onResize)
+  },
   beforeDestroy () {
     if (this._persistIdeUiTimer) {
       clearTimeout(this._persistIdeUiTimer)

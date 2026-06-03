@@ -1465,6 +1465,21 @@ export default {
     this.aiQuery = ''
     this.startWatchlistPriceRefresh()
   },
+  activated () {
+    // keep-alive: 从其它页面切回来时
+    this.startWatchlistPriceRefresh()
+  },
+  deactivated () {
+    // keep-alive: 离开页面时清理进行中的请求和定时器
+    if (this._cancelForceTimer) {
+      clearTimeout(this._cancelForceTimer)
+      this._cancelForceTimer = null
+    }
+    if (this.reviewAbortController) {
+      this.reviewAbortController.abort()
+      this.reviewAbortController = null
+    }
+  },
   beforeDestroy () {
     if (this._cancelForceTimer) {
       clearTimeout(this._cancelForceTimer)
