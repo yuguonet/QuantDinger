@@ -118,6 +118,13 @@ def _get_context_manager():
 # 快速通道（不需要 LLM，不需要 router）
 # ═══════════════════════════════════════════════════════════════
 
+# 快速通道正则（编译一次，全局复用）
+_PUNCT_TAIL = r'[\s\?\?\.\,\!\~\。\，\！\？\…]*'
+_GREETING_RE = re.compile(r'^(你好|hi|hello|嗨|hey|在吗|哈喽|嘿|yo)' + _PUNCT_TAIL + '$', re.IGNORECASE)
+_FAREWELL_RE = re.compile(r'^(再见|拜拜|bye|88|886|晚安|回见)' + _PUNCT_TAIL + '$', re.IGNORECASE)
+_THANKS_RE  = re.compile(r'^(谢谢|感谢|多谢|thanks|thank\s*you|thx|3q)' + _PUNCT_TAIL + '$', re.IGNORECASE)
+
+
 def _quick_intent_check(message: str) -> Optional[IntentResult]:
     """极低成本的关键词/正则快速匹配。
 
@@ -131,17 +138,14 @@ def _quick_intent_check(message: str) -> Optional[IntentResult]:
     if re.match(r'^[\s\.\,\!\?\~\。\，\！\？\…]+$', msg):
         return IntentResult(domain="chat", intent="empty", confidence=1.0, source="quick")
 
-    # 极短消息 + 常见问候词（<5 字符）
-    greetings = {"你好", "hi", "hello", "嗨", "hey", "在吗", "哈喽", "嘿", "yo"}
-    if len(msg) <= 5 and msg.lower() in greetings:
+    # 极短消息 + 常见问候词（正则匹配，忽略末尾标点和大小写）
+    if len(msg) <= 10 and _GREETING_RE.match(msg):
         return IntentResult(domain="chat", intent="greeting", confidence=1.0, source="quick")
 
-    farewells = {"再见", "拜拜", "bye", "88", "886", "晚安", "回见"}
-    if len(msg) <= 5 and msg.lower() in farewells:
+    if len(msg) <= 10 and _FAREWELL_RE.match(msg):
         return IntentResult(domain="chat", intent="farewell", confidence=1.0, source="quick")
 
-    thanks = {"谢谢", "感谢", "多谢", "thanks", "thank you", "thx", "3q"}
-    if len(msg) <= 10 and msg.lower() in thanks:
+    if len(msg) <= 15 and _THANKS_RE.match(msg):
         return IntentResult(domain="chat", intent="thanks", confidence=1.0, source="quick")
 
     return None  # 未命中快速通道
@@ -273,26 +277,26 @@ def _build_scene_list() -> List[Dict[str, str]]:
     return scenes
 
 
-_INTENT_PROMPT = """# Role
-你是一个意图分类器。根据用户输入，对每个分类打分。
+_INTENT_PROMPT = """你是意图分类器。根据用户输入，对以下分类打分。
 
-# 分类列表
+分类列表：
 {scene_list}
 
-# Rules
-1. 对每个分类给出 0.0~1.0 的匹配分数
-2. 高度匹配 ≥ 0.7，中度匹配 0.4~0.7，低度匹配 < 0.4
-3. 只输出 JSON 数组，不要任何其他文字
-4. 每个元素包含 id 和 score
+规则：
+- 对每个分类给出 0.0~1.0 的匹配分数
+- 高度匹配 ≥ 0.7，中度 0.4~0.7，低度 < 0.4
+- 只输出 JSON 数组，不要输出任何其他内容（不要解释、不要思考过程）
 
-# Output Format
+输出格式（严格遵守）：
 [{{"id": "1", "score": 0.95}}, {{"id": "2", "score": 0.1}}, ...]
 
-# Conversation History
+对话历史：
 {history}
 
-# User Input
-{message}"""
+用户输入：
+{message}
+
+JSON 数组："""
 
 
 MIN_SCORE = 0.35
@@ -340,6 +344,8 @@ def _llm_fallback(
         resp.raise_for_status()
         raw = resp.json()["choices"][0]["message"]["content"].strip()
 
+        # 清理：去除 <think> 块、markdown 代码块
+        raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
         if raw.startswith("```"):
             lines = raw.split("\n")
             lines = [l for l in lines if not l.strip().startswith("```")]
@@ -372,14 +378,22 @@ def _llm_fallback(
 
 
 def _parse_scores(raw: str, scenes: List[Dict]) -> List[Dict]:
-    """解析 LLM 返回的打分 JSON 数组。"""
+    """解析 LLM 返回的打分 JSON 数组。支持多种格式容错。"""
+    # 预处理：去除 <think>...</think> 块、markdown 代码块、多余空白
+    cleaned = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
+    cleaned = re.sub(r'```(?:json)?\s*', '', cleaned).strip()
+    cleaned = re.sub(r'```\s*$', '', cleaned).strip()
+
+    # 尝试 1: 直接解析清理后的文本
     try:
-        arr = json.loads(raw)
+        arr = json.loads(cleaned)
         if isinstance(arr, list):
             return _match_scores_to_scenes(arr, scenes)
     except json.JSONDecodeError:
         pass
-    match = re.search(r'\[.*?\]', raw, re.DOTALL)
+
+    # 尝试 2: 贪婪匹配 [...] （处理前后有多余文本的情况）
+    match = re.search(r'\[.*\]', cleaned, re.DOTALL)
     if match:
         try:
             arr = json.loads(match.group())
@@ -387,6 +401,21 @@ def _parse_scores(raw: str, scenes: List[Dict]) -> List[Dict]:
                 return _match_scores_to_scenes(arr, scenes)
         except json.JSONDecodeError:
             pass
+
+    # 尝试 3: 逐行提取 {"id": ..., "score": ...} 对象
+    pairs = re.findall(r'\{[^{}]*"id"\s*:\s*"[^"]*"[^{}]*"score"\s*:\s*[0-9.]+[^{}]*\}', cleaned)
+    if not pairs:
+        pairs = re.findall(r'\{[^{}]*"score"\s*:\s*[0-9.]+[^{}]*"id"\s*:\s*"[^"]*"[^{}]*\}', cleaned)
+    if pairs:
+        arr = []
+        for p in pairs:
+            try:
+                arr.append(json.loads(p))
+            except json.JSONDecodeError:
+                continue
+        if arr:
+            return _match_scores_to_scenes(arr, scenes)
+
     return []
 
 

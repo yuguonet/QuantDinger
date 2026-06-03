@@ -120,32 +120,54 @@ class RemoteEmbeddingEncoder(BaseEncoder):
     def _resolve_embedding_url(self) -> str:
         """构造 embedding API 的完整 URL。
 
-        Ollama: base_url 可能是 http://localhost:11434，需要拼 /v1/embeddings
+        Ollama: 优先 /v1/embeddings（OpenAI 兼容），不可用时降级 /api/embeddings（原生）
         其他:   base_url 通常已含 /v1，直接拼 /embeddings
         """
         url = self.base_url.lower()
-        # Ollama: 确保有 /v1 前缀
+        # Ollama: 优先 OpenAI 兼容接口
         if any(k in url for k in ("localhost:11434", "127.0.0.1:11434", "ollama")):
             if not url.endswith("/v1") and not url.endswith("/v1/"):
                 return f"{self.base_url}/v1/embeddings"
         return f"{self.base_url}/embeddings"
 
+    def _resolve_embedding_url_native(self) -> str:
+        """Ollama 原生 embedding 接口 /api/embed（新）和 /api/embeddings（旧）。"""
+        url = self.base_url.lower()
+        if any(k in url for k in ("localhost:11434", "127.0.0.1:11434", "ollama")):
+            base = self.base_url.rstrip("/")
+            if base.endswith("/v1"):
+                base = base[:-3]
+            return f"{base}/api/embed"
+        return self._resolve_embedding_url()
+
+    def _resolve_embedding_url_legacy(self) -> str:
+        """Ollama 旧版接口 /api/embeddings。"""
+        url = self.base_url.lower()
+        if any(k in url for k in ("localhost:11434", "127.0.0.1:11434", "ollama")):
+            base = self.base_url.rstrip("/")
+            if base.endswith("/v1"):
+                base = base[:-3]
+            return f"{base}/api/embeddings"
+        return self._resolve_embedding_url()
+
     def _detect_provider(self) -> str:
-        """检测当前 provider。"""
+        """检测当前 provider。优先从 URL 判断（避免 LLMService 将 Ollama 误判为 openai）。"""
+        url = self.base_url.lower()
+        # 优先：URL 特征匹配（Ollama 等本地服务必须先识别，否则会被 LLMService 归为 openai）
+        if any(k in url for k in ("localhost:11434", "127.0.0.1:11434", "ollama")):
+            return "ollama"
+        if "deepseek" in url:
+            return "deepseek"
+        if "openrouter" in url:
+            return "openrouter"
+        if "google" in url or "generativelanguage" in url:
+            return "google"
+        # 其次：LLMService 判断
         try:
             from app.services.llm import LLMService
             svc = LLMService()
             return svc.provider.value if hasattr(svc.provider, 'value') else str(svc.provider)
         except Exception:
-            url = self.base_url.lower()
-            if any(k in url for k in ("localhost:11434", "127.0.0.1:11434", "ollama")):
-                return "ollama"
-            if "deepseek" in url:
-                return "deepseek"
-            if "openrouter" in url:
-                return "openrouter"
-            if "google" in url or "generativelanguage" in url:
-                return "google"
             return "openai"
 
     def _detect_model(self) -> str:
@@ -160,27 +182,99 @@ class RemoteEmbeddingEncoder(BaseEncoder):
         defaults = _PROVIDER_EMBED_DEFAULTS.get(provider, _PROVIDER_EMBED_DEFAULTS["openai"])
         return int(os.getenv("EMBEDDING_DIMENSION", str(defaults["dimension"])))
 
-    def encode(self, texts: List[str]) -> np.ndarray:
-        """调用 /v1/embeddings 接口。支持自动分批（API 通常限制 2048 条/次）。"""
-        all_embeddings = []
-        batch_size = 512
-        url = self._resolve_embedding_url()
+    def _is_ollama(self) -> bool:
+        url = self.base_url.lower()
+        return any(k in url for k in ("localhost:11434", "127.0.0.1:11434", "ollama"))
 
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i + batch_size]
+    def _call_embedding_api(self, url: str, batch: List[str], is_native: bool = False) -> List[List[float]]:
+        """调用一次 embedding API，返回 embedding 列表。"""
+        if is_native:
+            # Ollama /api/embed：支持批量，字段用 input，响应为 embeddings
+            # Ollama /api/embeddings（旧）：逐条调用，字段用 prompt，响应为 embedding
+            is_new_api = "/api/embed" in url and "/api/embeddings" not in url
+            if is_new_api:
+                # /api/embed 支持数组，直接批量调用
+                resp = self._requests.post(
+                    url,
+                    headers={"Content-Type": "application/json"},
+                    json={"model": self.model, "input": batch},
+                    timeout=30.0,
+                )
+                resp.raise_for_status()
+                return resp.json()["embeddings"]
+            else:
+                # /api/embeddings（旧）逐条调用
+                embeddings = []
+                for text in batch:
+                    resp = self._requests.post(
+                        url,
+                        headers={"Content-Type": "application/json"},
+                        json={"model": self.model, "prompt": text},
+                        timeout=30.0,
+                    )
+                    resp.raise_for_status()
+                    embeddings.append(resp.json()["embedding"])
+                return embeddings
+        else:
+            # OpenAI 兼容接口
+            headers = {"Content-Type": "application/json"}
+            if self.api_key and self.api_key != "ollama":
+                headers["Authorization"] = f"Bearer {self.api_key}"
             resp = self._requests.post(
                 url,
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
+                headers=headers,
                 json={"model": self.model, "input": batch},
                 timeout=30.0,
             )
             resp.raise_for_status()
             data = resp.json()["data"]
             data.sort(key=lambda x: x["index"])
-            all_embeddings.extend(item["embedding"] for item in data)
+            return [item["embedding"] for item in data]
+
+    def encode(self, texts: List[str]) -> np.ndarray:
+        """调用 embedding 接口。Ollama 自动降级：/v1/embeddings → /api/embeddings。"""
+        all_embeddings = []
+        batch_size = 512
+        url = self._resolve_embedding_url()
+        use_native = False
+
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            try:
+                embeddings = self._call_embedding_api(url, batch, is_native=False)
+            except self._requests.exceptions.HTTPError as e:
+                if self._is_ollama() and e.response is not None and e.response.status_code == 404:
+                    # 降级 1: /api/embed（Ollama 新版接口）
+                    native_url = self._resolve_embedding_url_native()
+                    logger.warning("[Encoder] %s 返回 404，降级到 %s", url, native_url)
+                    url = native_url
+                    try:
+                        embeddings = self._call_embedding_api(url, batch, is_native=True)
+                    except self._requests.exceptions.HTTPError as e2:
+                        if e2.response is not None and e2.response.status_code == 404:
+                            # 降级 2: /api/embeddings（Ollama 旧版接口）
+                            legacy_url = self._resolve_embedding_url_legacy()
+                            logger.warning("[Encoder] %s 也返回 404，降级到 %s", url, legacy_url)
+                            url = legacy_url
+                            try:
+                                embeddings = self._call_embedding_api(url, batch, is_native=True)
+                            except Exception as e3:
+                                logger.error(
+                                    "[Encoder] 所有 Ollama embedding 接口均失败: %s。"
+                                    "请确认: 1) Ollama 已运行  2) 已安装 embedding 模型: ollama pull %s",
+                                    e3, self.model,
+                                )
+                                raise
+                        else:
+                            logger.error(
+                                "[Encoder] Ollama embedding 失败: %s。"
+                                "请确认: 1) Ollama 已运行  2) 已安装 embedding 模型: ollama pull %s",
+                                e2, self.model,
+                            )
+                            raise
+                else:
+                    raise
+            all_embeddings.extend(embeddings)
 
         emb = np.array(all_embeddings, dtype=np.float32)
         # L2 归一化（与 HashEncoder 一致，方便统一 cosine similarity 计算）

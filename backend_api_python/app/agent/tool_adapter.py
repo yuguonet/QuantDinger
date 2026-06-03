@@ -270,6 +270,8 @@ def build_all_tools() -> List[Tool]:
     # 新拆分的文件
     from app.agent.tools.screener_tools import SCREENER_TOOLS
     from app.agent.tools.market_data_tools import MARKET_DATA_TOOLS
+    # 蜡烛图展示工具
+    from app.agent.tools.chart_tools import CHART_TOOLS
 
     # 1. QuantDinger tools (dict-based → Tool)
     all_lists = [
@@ -278,6 +280,7 @@ def build_all_tools() -> List[Tool]:
         SCREENING_TOOLS, WORKSPACE_TOOLS,
         SCAN_TOOLS, SELF_MODIFY_TOOLS,
         SCREENER_TOOLS, MARKET_DATA_TOOLS,
+        CHART_TOOLS,
     ]
     tools = []
     for lst in all_lists:
