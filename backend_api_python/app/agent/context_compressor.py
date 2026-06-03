@@ -17,6 +17,7 @@ agent.run() 结束后，把本轮结果（分析内容 + 工具调用）压缩�
 from __future__ import annotations
 
 import logging
+import os
 from typing import List, Dict
 
 logger = logging.getLogger(__name__)
@@ -73,7 +74,7 @@ def compress_context(
         svc = LLMService(provider=None)
         api_key = svc.get_api_key()
         base_url = svc.get_base_url()
-        model_id = model or svc.get_default_model()
+        compress_model = model or os.getenv("AGENT_COMPRESS_MODEL", "").strip() or svc.get_default_model()
 
         resp = requests.post(
             f"{base_url}/chat/completions",
@@ -82,12 +83,12 @@ def compress_context(
                 "Content-Type": "application/json",
             },
             json={
-                "model": model_id,
+                "model": compress_model,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.1,
                 "max_tokens": 600,
             },
-            timeout=20.0,
+            timeout=60.0,
         )
         resp.raise_for_status()
         summary = resp.json()["choices"][0]["message"]["content"].strip()

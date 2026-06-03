@@ -47,7 +47,7 @@ def build_model(
         )
 
     base_url = svc.get_base_url(active_provider)
-    model_id = model or svc.get_default_model(active_provider)
+    model_id = model or os.getenv("AGENT_LLM_MODEL", "").strip() or svc.get_default_model(active_provider)
 
     # Normalize model name: strip provider prefix if it matches
     # e.g. "openai/gpt-4o" -> "gpt-4o" for OpenAI provider

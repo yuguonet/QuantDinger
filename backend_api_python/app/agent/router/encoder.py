@@ -174,7 +174,7 @@ class RemoteEmbeddingEncoder(BaseEncoder):
         """检测默认 embedding 模型。"""
         provider = self._detect_provider()
         defaults = _PROVIDER_EMBED_DEFAULTS.get(provider, _PROVIDER_EMBED_DEFAULTS["openai"])
-        return os.getenv("EMBEDDING_MODEL", defaults["model"])
+        return os.getenv("AGENT_EMBED_MODEL", "").strip() or os.getenv("EMBEDDING_MODEL", defaults["model"])
 
     def _detect_dimension(self) -> int:
         """检测默认维度。"""

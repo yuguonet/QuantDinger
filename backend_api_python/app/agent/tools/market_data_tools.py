@@ -249,7 +249,27 @@ def get_zt_pool(date: str = "", min_continuous_days: int = 0) -> Dict[str, Any]:
     if min_continuous_days > 0:
         data = [r for r in data if int(r.get("continuous_zt_days", 0) or 0) >= min_continuous_days]
 
-    return {"date": date, "min_continuous_days": min_continuous_days, "count": len(data), "stocks": data}
+    # ── 文字表格输出 ──
+    lines = [f"涨停池 {date}  共{len(data)}只"]
+    if min_continuous_days > 0:
+        lines[0] += f"  (连板≥{min_continuous_days})"
+    lines.append("")
+    lines.append(f"{'代码':<8} {'名称':<8} {'连板':>4} {'涨停时间':<10} {'封板资金(万)':>12} {'换手率%':>7} {'涨停原因'}")
+    lines.append("-" * 80)
+    for s in data:
+        code = s.get("stock_code", "")
+        name = s.get("stock_name", "")
+        days = s.get("continuous_zt_days", 1) or 1
+        zt_t = s.get("zt_time", "") or ""
+        seal = s.get("seal_amount", 0) or 0
+        seal_wan = f"{seal / 10000:.1f}" if seal else "-"
+        turnover = s.get("turnover_rate", 0) or 0
+        to_str = f"{turnover:.1f}" if turnover else "-"
+        reason = s.get("reason", "") or ""
+        lines.append(f"{code:<8} {name:<8} {days:>4} {zt_t:<10} {seal_wan:>12} {to_str:>7} {reason}")
+    text_table = "\n".join(lines)
+
+    return {"date": date, "min_continuous_days": min_continuous_days, "count": len(data), "stocks": data, "text": text_table}
 
 
 @tool(

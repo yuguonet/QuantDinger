@@ -32,9 +32,9 @@ from app.agent.tool_context import set_tool_context
 
 logger = logging.getLogger(__name__)
 
-# ── Singleton cache ───────────────────────────────────────────
-_agent_cache = None  # type: ignore
-_cached_tools_signature: str = ""
+# ── Per-user agent cache ──────────────────────────────────────
+_agent_cache: Dict[str, Any] = {}  # key: user_id
+_cached_signatures: Dict[str, str] = {}  # key: user_id → sig
 
 
 def _get_agent_class():
@@ -408,7 +408,13 @@ def get_smolagent(
     domain_instructions: str = "",
     intent_context: str = "",
 ) -> "CodeAgent | ToolCallingAgent":
-    global _agent_cache, _cached_tools_signature
+    """Build or retrieve an agent instance per user.
+
+    Cache key = user_id, so different users get isolated agents.
+    Same user's concurrent requests share the agent (instructions are
+    updated per-call, which is acceptable for single-tab usage).
+    """
+    global _agent_cache, _cached_signatures
 
     skill_instructions = get_indicator_skill_instructions(skills, user_id)
     smol_model = build_model(model=model, provider=provider)
@@ -421,16 +427,20 @@ def get_smolagent(
     )
     AgentClass = _get_agent_class()
 
+    cache_key = str(user_id)
     sig = f"{len(tools)}_{model}_{provider}_{user_id}_{AgentClass.__name__}"
-    if _agent_cache is not None and _cached_tools_signature == sig:
-        _agent_cache.instructions = instructions
-        _agent_cache._setup_managed_agents(managed_agents)
-        _agent_cache.max_steps = max_steps
-        _agent_cache.planning_interval = None
-        return _agent_cache
 
-    # additional_authorized_imports is only supported by CodeAgent, not ToolCallingAgent.
-    # Passing it to ToolCallingAgent causes: MultiStepAgent.__init__() got an unexpected keyword argument
+    # ── Cache hit: update instructions only ───────────────────
+    if cache_key in _agent_cache and _cached_signatures.get(cache_key) == sig:
+        agent = _agent_cache[cache_key]
+        agent.instructions = instructions
+        agent.max_steps = max_steps
+        agent.planning_interval = None
+        if hasattr(agent, "_setup_managed_agents"):
+            agent._setup_managed_agents(managed_agents)
+        return agent
+
+    # ── Cache miss: build new agent ───────────────────────────
     _extra_kwargs = {}
     if AgentClass is CodeAgent:
         _extra_kwargs["additional_authorized_imports"] = [
@@ -445,18 +455,18 @@ def get_smolagent(
         instructions=instructions,
         verbosity_level=LogLevel.INFO,
         return_full_result=True,
-        stream_outputs=True,               # LLM token-by-token streaming
-        planning_interval=None,            # Don't auto-inject planning steps — let the LLM decide
-        managed_agents=managed_agents,     # Multi-agent dispatch
-        final_answer_checks=[_check_dashboard_json],  # Validate output
+        stream_outputs=True,
+        planning_interval=None,
+        managed_agents=managed_agents,
+        final_answer_checks=[_check_dashboard_json],
         **_extra_kwargs,
     )
 
-    _agent_cache = agent
-    _cached_tools_signature = sig
+    _agent_cache[cache_key] = agent
+    _cached_signatures[cache_key] = sig
     logger.info(
-        "[Agent] Built %s: %d tools, %d managed agents, planning_interval=None, max_steps=%d",
-        AgentClass.__name__, len(tools), len(managed_agents), max_steps,
+        "[Agent] Built %s for user=%s: %d tools, %d managed agents, max_steps=%d",
+        AgentClass.__name__, user_id, len(tools), len(managed_agents), max_steps,
     )
     return agent
 

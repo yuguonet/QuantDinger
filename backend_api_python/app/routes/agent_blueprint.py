@@ -55,6 +55,29 @@ def _load_strategies(user_id: int = 1):
 # ── Blueprint ─────────────────────────────────────────────────
 agent_bp = Blueprint("agent", __name__, url_prefix="/api/agent")
 
+# ── Per-user 互斥锁：同一用户同时只能有一个 agent 在跑 ────────
+_user_agent_locks: Dict[str, threading.Lock] = {}
+_user_locks_guard = threading.Lock()
+
+
+def _acquire_user_lock(user_id: int) -> bool:
+    """尝试获取用户锁，已占用则返回 False。"""
+    key = str(user_id)
+    with _user_locks_guard:
+        if key not in _user_agent_locks:
+            _user_agent_locks[key] = threading.Lock()
+        lock = _user_agent_locks[key]
+    return lock.acquire(blocking=False)
+
+
+def _release_user_lock(user_id: int):
+    """释放用户锁。"""
+    key = str(user_id)
+    with _user_locks_guard:
+        lock = _user_agent_locks.get(key)
+    if lock and lock.locked():
+        lock.release()
+
 
 # ── 共享工具 ─────────────────────────────────────────────────
 from app.agent.utils import detect_market as _detect_market
@@ -191,21 +214,27 @@ def agent_chat():
             return jsonify({"error": err}), 400
 
         from flask import g
-        session = _get_session(session_id)
-        session_id, context, _ = _build_context(data, session, message)
+        if not _acquire_user_lock(g.user_id):
+            return jsonify({"error": "当前有分析任务运行中，请等待完成后再试", "code": "BUSY"}), 429
 
-        executor = _build_executor(skills, g.user_id)
-        result = executor.chat(
-            message=message, session_id=session_id,
-            context=context, user_id=g.user_id,
-        )
+        try:
+            session = _get_session(session_id)
+            session_id, context, _ = _build_context(data, session, message)
 
-        return jsonify({
-            "success": result.success, "content": result.content,
-            "session_id": session_id, "error": result.error,
-            "total_steps": result.total_steps, "total_tokens": result.total_tokens,
-            "model": result.model, "tool_calls_log": result.tool_calls_log,
-        })
+            executor = _build_executor(skills, g.user_id)
+            result = executor.chat(
+                message=message, session_id=session_id,
+                context=context, user_id=g.user_id,
+            )
+
+            return jsonify({
+                "success": result.success, "content": result.content,
+                "session_id": session_id, "error": result.error,
+                "total_steps": result.total_steps, "total_tokens": result.total_tokens,
+                "model": result.model, "tool_calls_log": result.tool_calls_log,
+            })
+        finally:
+            _release_user_lock(g.user_id)
     except Exception as e:
         logger.error("Agent chat failed: %s", e, exc_info=True)
         return jsonify({"error": str(e)}), 500
@@ -231,6 +260,9 @@ def agent_chat_stream():
 
         from flask import g
         user_id = g.user_id
+        if not _acquire_user_lock(user_id):
+            return jsonify({"error": "当前有分析任务运行中，请等待完成后再试", "code": "BUSY"}), 429
+
         session = _get_session(session_id)
         session_id, context, _ = _build_context(data, session, message)
 
@@ -263,15 +295,18 @@ def agent_chat_stream():
             t = threading.Thread(target=_run, daemon=True)
             t.start()
 
-            while True:
-                try:
-                    ev = event_queue.get(timeout=300)
-                    yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
-                    if ev.get("type") in ("done", "error"):
+            try:
+                while True:
+                    try:
+                        ev = event_queue.get(timeout=300)
+                        yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                        if ev.get("type") in ("done", "error"):
+                            break
+                    except queue.Empty:
+                        yield f"data: {json.dumps({'type': 'error', 'message': '分析超时'}, ensure_ascii=False)}\n\n"
                         break
-                except queue.Empty:
-                    yield f"data: {json.dumps({'type': 'error', 'message': '分析超时'}, ensure_ascii=False)}\n\n"
-                    break
+            finally:
+                _release_user_lock(user_id)
 
         return Response(
             _sse(),

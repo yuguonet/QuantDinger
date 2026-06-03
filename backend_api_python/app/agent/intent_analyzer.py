@@ -443,15 +443,23 @@ def _extract_params(message: str, scene: Dict = None) -> Dict[str, Any]:
     code_match = re.search(r'\b(\d{6})\b', message)
     if code_match:
         params["stock"] = code_match.group(1)
-    name_map = {
-        "茅台": "600519", "比亚迪": "002594", "平安": "000001",
-        "宁德": "300750", "招商银行": "600036", "中芯": "688981",
-    }
-    for name, code in name_map.items():
-        if name in message:
-            params.setdefault("stock", code)
-            params["stock_name"] = name
-            break
+        return params
+
+    # 提取中文股票名称（2-6个连续中文字符）
+    _stopwords = {"帮我", "分析", "查看", "看看", "查询", "怎么样", "什么", "如何",
+                  "的", "了", "吗", "吧", "呢", "啊", "一下", "最近", "今天", "昨天"}
+    name_match = re.search(r'[\u4e00-\u9fff]{2,6}', message)
+    if name_match:
+        candidate = name_match.group(0)
+        if candidate not in _stopwords:
+            try:
+                from app.routes.market import _search_cn_smart
+                matches = _search_cn_smart(candidate, limit=1)
+                if matches:
+                    params["stock"] = matches[0]["symbol"]
+                    params["stock_name"] = matches[0].get("name", candidate)
+            except Exception:
+                pass
     return params
 
 

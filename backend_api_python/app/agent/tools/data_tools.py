@@ -64,33 +64,15 @@ def search_stock_by_name(keyword: str, market: str = "CNStock", limit: int = 10)
 
     limit = min(max(limit, 1), 50)
     try:
-        from app.data.market_symbols_seed import search_symbols
-        results = search_symbols(market, keyword.strip(), limit)
-        if results:
+        from app.routes.market import _search_cn_smart
+        matches = _search_cn_smart(keyword.strip(), limit=limit)
+        if matches:
             return {
                 "keyword": keyword,
                 "market": market,
-                "results": [{"code": r["symbol"], "name": r.get("name", ""), "market": r.get("market", market)} for r in results],
-                "count": len(results),
+                "results": [{"code": m["symbol"], "name": m.get("name", ""), "market": m.get("market", market)} for m in matches],
+                "count": len(matches),
             }
-
-        # Fallback: 从 basicinfo_db 查（A股）
-        if market == "CNStock":
-            try:
-                from app.utils.basicinfo_db import get_stock_basic_db
-                db = get_stock_basic_db()
-                # 尝试按名称搜
-                stocks = db.search_stocks(keyword.strip(), limit=limit)
-                if stocks:
-                    return {
-                        "keyword": keyword,
-                        "market": market,
-                        "results": [{"code": s.get("symbol", ""), "name": s.get("name", ""), "market": "CNStock"} for s in stocks],
-                        "count": len(stocks),
-                    }
-            except Exception:
-                pass
-
         return {"keyword": keyword, "market": market, "results": [], "count": 0, "message": "未找到匹配的股票"}
     except Exception as e:
         logger.error("search_stock_by_name(%s) failed: %s", keyword, e)

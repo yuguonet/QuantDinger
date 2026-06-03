@@ -97,10 +97,50 @@ export default defineComponent({
         // Bullet lists
         .replace(/^- (.+)$/gm, '<li>$1</li>')
         .replace(/(<li>.*<\/li>)/gs, '<ul>$1</ul>')
+
+      // Markdown tables: parse before \n → <br>
+      const nonTableLines = []
+      const lines = safe.split('\n')
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim()
+        if (line.startsWith('|') && line.endsWith('|')) {
+          // Check if next line is separator (|---|---|)
+          const next = (lines[i + 1] || '').trim()
+          if (/^\|[\s\-:|]+\|$/.test(next)) {
+            // This is a table header, collect entire table
+            const tableRows = []
+            tableRows.push(lines[i]) // header
+            i++ // skip separator
+            tableRows.push(lines[i]) // separator
+            while (i + 1 < lines.length && (lines[i + 1] || '').trim().startsWith('|')) {
+              i++
+              tableRows.push(lines[i])
+            }
+            // Build HTML table
+            const parseCells = (row) => row.replace(/^\||\|$/g, '').split('|').map(c => c.trim())
+            const headerCells = parseCells(tableRows[0])
+            const bodyRows = tableRows.slice(2) // skip separator
+            let tbl = '<div class="md-table-wrapper"><table class="md-table"><thead><tr>'
+            headerCells.forEach(c => { tbl += `<th>${c}</th>` })
+            tbl += '</tr></thead><tbody>'
+            bodyRows.forEach(row => {
+              const cells = parseCells(row)
+              tbl += '<tr>'
+              cells.forEach(c => { tbl += `<td>${c}</td>` })
+              tbl += '</tr>'
+            })
+            tbl += '</tbody></table></div>'
+            nonTableLines.push(tbl)
+            continue
+          }
+        }
+        nonTableLines.push(lines[i])
+      }
+      safe = nonTableLines.join('\n')
         .replace(/\n/g, '<br>')
 
       // Step 3: Strip disallowed HTML tags
-      safe = safe.replace(/<(?!\/?(strong|code|pre|br|h[2-4]|ul|li|div|span|iframe)\b)[^>]+>/gi, '')
+      safe = safe.replace(/<(?!\/?(strong|code|pre|br|h[2-4]|ul|li|div|span|iframe|table|thead|tbody|tr|th|td)\b)[^>]+>/gi, '')
 
       // Step 4: 还原图表为 iframe
       chartSlots.forEach((html, idx) => {
@@ -240,6 +280,42 @@ export default defineComponent({
   :deep(ul) {
     padding-left: 20px;
     margin: 4px 0;
+  }
+
+  :deep(.md-table-wrapper) {
+    overflow-x: auto;
+    margin: 8px 0;
+    border-radius: 8px;
+    border: 1px solid #e8e8e8;
+  }
+
+  :deep(table.md-table) {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+    line-height: 1.6;
+
+    th, td {
+      padding: 6px 12px;
+      text-align: left;
+      border-bottom: 1px solid #f0f0f0;
+      white-space: nowrap;
+    }
+
+    th {
+      background: #fafafa;
+      font-weight: 600;
+      color: #333;
+      border-bottom: 2px solid #e8e8e8;
+    }
+
+    tr:hover td {
+      background: #f5f7fa;
+    }
+
+    tr:last-child td {
+      border-bottom: none;
+    }
   }
 }
 
