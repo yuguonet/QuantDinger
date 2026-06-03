@@ -7,6 +7,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List
 
+from app.agent.tools.registry import tool
+
 logger = logging.getLogger(__name__)
 
 
@@ -15,6 +17,10 @@ def _get_ds(market: str = "CNStock"):
     return DataSourceFactory.get_source(market)
 
 
+@tool(
+    description="获取大盘指数实时行情（上证指数、深证成指、创业板指）。",
+    category="行情数据",
+)
 def get_market_indices() -> Dict[str, Any]:
     """获取大盘指数行情（上证指数、深证成指、创业板指）。"""
     ds = _get_ds("CNStock")
@@ -30,6 +36,10 @@ def get_market_indices() -> Dict[str, Any]:
         return {"error": str(e)}
 
 
+@tool(
+    description="获取行业板块涨跌排名和资金流向。",
+    category="行情数据",
+)
 def get_sector_rankings() -> Dict[str, Any]:
     """获取行业板块涨跌排名和资金流向。"""
     ds = _get_ds("CNStock")
@@ -48,19 +58,5 @@ def get_sector_rankings() -> Dict[str, Any]:
         return {"error": str(e)}
 
 
-# ── OpenAI tool declarations ─────────────────────────────────
-
-MARKET_TOOLS = [
-    {
-        "fn": get_market_indices,
-        "name": "get_market_indices",
-        "description": "获取大盘指数实时行情（上证指数、深证成指、创业板指）。",
-        "parameters": {"type": "object", "properties": {}},
-    },
-    {
-        "fn": get_sector_rankings,
-        "name": "get_sector_rankings",
-        "description": "获取行业板块涨跌排名和资金流向。",
-        "parameters": {"type": "object", "properties": {}},
-    },
-]
+# Legacy list — kept for backward compat during migration; safe to remove later.
+MARKET_TOOLS = []

@@ -9,6 +9,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List
 
+from app.agent.tools.registry import tool
+
 logger = logging.getLogger(__name__)
 
 
@@ -29,6 +31,10 @@ def _extract_news_items(resp: Dict) -> List[Dict[str, Any]]:
     return items
 
 
+@tool(
+    description="搜索股票相关新闻、公告、研报。用于获取最新消息面信息。",
+    category="情报搜索",
+)
 def search_stock_news(stock_code: str, keyword: str = "") -> Dict[str, Any]:
     """搜索股票相关新闻、公告、研报。
 
@@ -73,9 +79,12 @@ def search_stock_news(stock_code: str, keyword: str = "") -> Dict[str, Any]:
         }
 
 
+@tool(
+    description="综合情报搜索：最新消息 + 风险排查 + 业绩预期，多维度获取情报。",
+    category="情报搜索",
+)
 def search_comprehensive_intel(stock_code: str) -> Dict[str, Any]:
-    """综合情报搜索：最新消息 + 风险排查 + 业绩预期。
-    一次调用获取多维度情报。"""
+    """综合情报搜索：最新消息 + 风险排查 + 业绩预期。一次调用获取多维度情报。"""
     try:
         from app.services.news_service import fetch_financial_news
 
@@ -103,32 +112,5 @@ def search_comprehensive_intel(stock_code: str) -> Dict[str, Any]:
         return {"stock_code": stock_code, "error": str(e), "retriable": True}
 
 
-# ── OpenAI tool declarations ─────────────────────────────────
-
-SEARCH_TOOLS = [
-    {
-        "fn": search_stock_news,
-        "name": "search_stock_news",
-        "description": "搜索股票相关新闻、公告、研报。用于获取最新消息面信息。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "stock_code": {"type": "string", "description": "股票代码"},
-                "keyword": {"type": "string", "description": "搜索关键词（可选）"},
-            },
-            "required": ["stock_code"],
-        },
-    },
-    {
-        "fn": search_comprehensive_intel,
-        "name": "search_comprehensive_intel",
-        "description": "综合情报搜索：最新消息 + 风险排查 + 业绩预期，多维度获取情报。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "stock_code": {"type": "string", "description": "股票代码"},
-            },
-            "required": ["stock_code"],
-        },
-    },
-]
+# Legacy list — kept for backward compat during migration; safe to remove later.
+SEARCH_TOOLS = []

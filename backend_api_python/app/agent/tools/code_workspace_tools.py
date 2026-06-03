@@ -28,6 +28,7 @@ import subprocess
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
+from app.agent.tools.registry import tool
 
 logger = logging.getLogger(__name__)
 
@@ -262,6 +263,10 @@ except Exception as _ds_err:
 
 # ── Tool implementations ───────────────────────────────────────
 
+@tool(
+    description="在工作区目录中执行 shell 命令（支持流式输出）。命令的 cwd 自动设为当前会话的工作区。可用环境变量 WORKSPACE 获取工作区绝对路径。适用场景：pip install、python、文件操作、数据处理、调用外部工具。",
+    category="工作区",
+)
 def shell_exec(
     command: str,
     timeout: int = SHELL_TIMEOUT,
@@ -292,6 +297,10 @@ def shell_exec(
     return _stream_exec(command, str(ws.session_dir), timeout, emit, "shell_exec")
 
 
+@tool(
+    description="保存 Python 脚本到工作区，支持自动版本管理。",
+    category="工作区",
+)
 def workspace_save_script(
     name: str,
     code: str,
@@ -316,6 +325,10 @@ def workspace_save_script(
     return ws.save_script(name, code, description)
 
 
+@tool(
+    description="从工作区加载 Python 脚本。",
+    category="工作区",
+)
 def workspace_load_script(
     name: str,
     version: int = 0,
@@ -335,6 +348,10 @@ def workspace_load_script(
     return ws.load_script(name, version)
 
 
+@tool(
+    description="列出工作区中的所有脚本和文件。",
+    category="工作区",
+)
 def workspace_list() -> Dict[str, Any]:
     """List all files in the workspace (scripts, data, outputs).
 
@@ -414,6 +431,10 @@ def workspace_read_file(
     return {"path": str(full_path), "content": content, "size": len(content)}
 
 
+@tool(
+    description="在工作区中执行 Python 脚本，支持数据源注入（get_kline/get_ticker 等自动可用）。可加载已保存脚本（传 name）或直接执行代码（传 code）。支持流式输出和最长 600 秒超时。",
+    category="工作区",
+)
 def workspace_exec_script(
     name: str = "",
     code: str = "",
@@ -486,6 +507,10 @@ def workspace_exec_script(
         }
 
 
+@tool(
+    description="后台执行脚本，立即返回 task_id。用 poll_task 查询结果。适合长时间任务（大数据处理、全市场扫描等）。",
+    category="工作区",
+)
 def run_background(
     code: str = "",
     name: str = "",
@@ -549,6 +574,10 @@ def run_background(
     return {"task_id": task_id, "status": "running", "timeout": timeout}
 
 
+@tool(
+    description="查询后台任务状态和结果。",
+    category="工作区",
+)
 def poll_task(
     task_id: str,
 ) -> Dict[str, Any]:
@@ -884,111 +913,5 @@ def _serialize_for_workspace(obj: Any, _depth: int = 0) -> Any:
 
 # ── Tool specs for registry ────────────────────────────────────
 
-WORKSPACE_TOOLS = [
-    {
-        "fn": shell_exec,
-        "name": "shell_exec",
-        "description": (
-            "在工作区目录中执行 shell 命令（支持流式输出）。"
-            "命令的 cwd 自动设为当前会话的工作区。"
-            "可用环境变量 WORKSPACE 获取工作区绝对路径。"
-            "\n\n适用场景：pip install、python、文件操作、数据处理、调用外部工具。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "description": "要执行的 shell 命令"},
-                "timeout": {
-                    "type": "integer",
-                    "description": f"超时秒数（默认 {SHELL_TIMEOUT}，最大 600）",
-                    "default": SHELL_TIMEOUT,
-                },
-            },
-            "required": ["command"],
-        },
-    },
-    {
-        "fn": workspace_save_script,
-        "name": "save_script",
-        "description": (
-            "保存 Python 脚本到工作区（自动版本管理）。"
-            "每次保存自动递增版本号（v1, v2, ...），历史版本可查可回溯。"
-            "支持迭代开发：保存(v1) → 执行 → 修改 → 保存(v2) → ..."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "脚本文件名"},
-                "code": {"type": "string", "description": "Python 源代码"},
-                "description": {"type": "string", "description": "脚本用途说明"},
-            },
-            "required": ["name", "code"],
-        },
-    },
-    {
-        "fn": workspace_load_script,
-        "name": "load_script",
-        "description": "加载工作区中的脚本。可指定版本号（默认最新版本）。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "脚本文件名"},
-                "version": {"type": "integer", "description": "版本号（0=最新）", "default": 0},
-            },
-            "required": ["name"],
-        },
-    },
-    {
-        "fn": workspace_list,
-        "name": "list_workspace",
-        "description": "列出工作区中所有文件。",
-        "parameters": {"type": "object", "properties": {}},
-    },
-    {
-        "fn": run_background,
-        "name": "run_background",
-        "description": (
-            "后台执行脚本，立即返回 task_id。用 poll_task 查询结果。"
-            "适合长时间任务（大数据处理、全市场扫描等）。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "code": {"type": "string", "description": "Python 代码"},
-                "name": {"type": "string", "description": "已保存脚本名"},
-                "timeout": {"type": "integer", "description": "最大执行时间", "default": 600},
-            },
-            "required": [],
-        },
-    },
-    {
-        "fn": poll_task,
-        "name": "poll_task",
-        "description": "查询后台任务状态和结果。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "task_id": {"type": "string", "description": "任务ID（来自 run_background）"},
-            },
-            "required": ["task_id"],
-        },
-    },
-    {
-        "fn": workspace_exec_script,
-        "name": "exec_script",
-        "description": (
-            "在工作区中执行 Python 脚本，支持数据源注入（get_kline/get_ticker 等自动可用）。"
-            "可加载已保存脚本（传 name）或直接执行代码（传 code）。"
-            "支持流式输出和最长 600 秒超时。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "已保存的脚本名（与 code 二选一）", "default": ""},
-                "code": {"type": "string", "description": "Python 代码（与 name 二选一）", "default": ""},
-                "timeout": {"type": "integer", "description": "超时秒数，最大600", "default": 120},
-                "save_as": {"type": "string", "description": "执行前自动保存脚本的名称", "default": ""},
-            },
-        },
-    },
-]
+# Legacy list — kept for backward compat during migration; safe to remove later.
+WORKSPACE_TOOLS = []

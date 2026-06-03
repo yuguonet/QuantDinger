@@ -19,6 +19,7 @@ from app.agent.tools.screener_filters import (
     build_keyword_from_filters,
     get_screener_presets,
 )
+from app.agent.tools.registry import tool
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +121,10 @@ def _em_search(keyword: str, page_size: int = 100) -> List[Dict[str, Any]]:
 #  核心选股工具
 # ══════════════════════════════════════════════════════════════
 
+@tool(
+    description="统一选股工具：根据条件从全市场筛选股票。支持自然语言条件（如 'PE<20 半导体'、'净利增长>15%'）和结构化 filters。source='eastmoney' 使用东财智能选股（130+条件），'local_db' 查本地数据库，'auto' 自动选择。当用户要求选股、筛选股票时使用此工具。",
+    category="选股",
+)
 def search_stocks(
     query: str = "",
     source: str = "auto",
@@ -228,53 +233,5 @@ def _search_local_db(keyword: str, market: str = "CNStock", limit: int = 50) -> 
 #  工具声明
 # ══════════════════════════════════════════════════════════════
 
-SCREENER_TOOLS = [
-    {
-        "fn": search_stocks,
-        "name": "search_stocks",
-        "description": (
-            "统一选股工具：根据条件从全市场筛选股票。"
-            "支持自然语言条件（如 'PE<20 半导体'、'净利增长>15%'）和结构化 filters。"
-            "source='eastmoney' 使用东财智能选股（130+条件），'local_db' 查本地数据库，'auto' 自动选择。"
-            "当用户要求选股、筛选股票时使用此工具。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "自然语言选股条件，如 '半导体 净利增长>15%'、'PE在5到20之间'",
-                    "default": "",
-                },
-                "source": {
-                    "type": "string",
-                    "description": "数据源：auto(自动) / eastmoney(东财) / local_db(本地DB)",
-                    "default": "auto",
-                },
-                "filters": {
-                    "type": "object",
-                    "description": "结构化筛选条件字典（可选，与 query 互补）",
-                },
-                "market": {
-                    "type": "string",
-                    "description": "市场筛选：全部/A股/科创板/创业板/港股/美股/ETF基金",
-                    "default": "全部",
-                },
-                "top_n": {
-                    "type": "integer",
-                    "description": "返回数量上限，默认50，最大200",
-                    "default": 50,
-                },
-            },
-        },
-    },
-    {
-        "fn": get_screener_presets,
-        "name": "get_screener_presets",
-        "description": (
-            "获取选股器支持的所有筛选条件分类和示例。"
-            "当用户不确定该用什么条件选股时调用此工具了解可用选项。"
-        ),
-        "parameters": {"type": "object", "properties": {}},
-    },
-]
+# Legacy list — kept for backward compat during migration; safe to remove later.
+SCREENER_TOOLS = []

@@ -10,12 +10,17 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any, Dict, List, Optional
+from app.agent.tools.registry import tool
 
 logger = logging.getLogger(__name__)
 
 
 # ── Tool functions ────────────────────────────────────────────
 
+@tool(
+    description="用指标策略批量审核股票。对每只股票执行指标代码，检查是否出现买入信号。返回每只股票的 buy/sell 信号状态和价格。",
+    category="选股",
+)
 def review_stocks_with_indicator(
     stock_codes: List[str],
     indicator_id: int,
@@ -163,6 +168,10 @@ def review_stocks_with_indicator(
     }
 
 
+@tool(
+    description="列出用户收藏的选股策略列表。",
+    category="选股",
+)
 def list_user_selection_strategies(user_id: int = 1) -> Dict[str, Any]:
     """列出用户收藏的选股策略。
 
@@ -201,52 +210,5 @@ def list_user_selection_strategies(user_id: int = 1) -> Dict[str, Any]:
 
 # ── OpenAI tool declarations ─────────────────────────────────
 
-SCREENING_TOOLS = [
-    {
-        "fn": review_stocks_with_indicator,
-        "name": "review_stocks_with_indicator",
-        "description": (
-            "用指标策略批量审核股票。对每只股票执行指标代码，检查是否出现买入信号。"
-            "返回每只股票的 buy/sell 信号状态和价格。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "stock_codes": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "股票代码列表，如 ['600519', '000001']",
-                },
-                "indicator_id": {
-                    "type": "integer",
-                    "description": "指标策略 ID",
-                },
-                "user_id": {
-                    "type": "integer",
-                    "description": "用户 ID，默认 1",
-                    "default": 1,
-                },
-                "params": {
-                    "type": "object",
-                    "description": "指标参数覆盖（可选）",
-                },
-            },
-            "required": ["stock_codes", "indicator_id"],
-        },
-    },
-    {
-        "fn": list_user_selection_strategies,
-        "name": "list_user_selection_strategies",
-        "description": "列出用户收藏的选股策略列表。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "user_id": {
-                    "type": "integer",
-                    "description": "用户 ID，默认 1",
-                    "default": 1,
-                },
-            },
-        },
-    },
-]
+# Legacy list — kept for backward compat during migration; safe to remove later.
+SCREENING_TOOLS = []

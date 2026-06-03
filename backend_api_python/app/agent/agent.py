@@ -66,77 +66,36 @@ def _get_agent_class():
 # ═══════════════════════════════════════════════════════════════
 
 def _generate_tool_catalog(tools, managed_agents) -> str:
-    """从工具对象自动生成分类目录，替代硬编码 TOOL_CATALOG。"""
-    categories = {
-        "名称查询": ["resolve_stock_name", "search_stock_by_name"],
-        "行情数据": ["get_realtime_quote", "agent_get_kline", "get_stock_info",
-                    "get_market_indices", "get_sector_rankings", "generate_kline_chart"],
-        "技术分析": ["analyze_trend", "get_indicator_snapshot", "calculate_ma",
-                    "get_volume_analysis", "analyze_pattern", "get_chip_distribution"],
-        "情报搜索": ["search_stock_news", "search_comprehensive_intel"],
-        "选股": ["search_stocks", "get_screener_presets"],
-        "指标策略": ["list_indicators", "get_indicator_params", "run_indicator_signal"],
-        "回测": ["run_backtest", "get_backtest_history"],
-        "交易": ["list_strategies", "get_strategy_detail", "start_strategy",
-                "stop_strategy", "get_strategy_trades"],
-        "龙虎榜/热榜": ["get_dragon_tiger", "get_hot_rank", "get_zt_pool",
-                      "get_limit_down", "get_broken_board"],
-        "资金流向": ["get_fund_flow", "get_sector_fund_flow", "get_concept_fund_flow"],
-        "市场快照": ["get_market_overview"],
-        "搜索": ["web_search", "visit_webpage", "wikipedia_search"],
-        "工作区": ["save_script", "load_script", "list_workspace",
-                  "shell_exec", "exec_script", "run_background", "poll_task"],
-        "源码扫描(只读)": ["list_project_files", "read_project_file", "grep_project"],
-        "自修改": ["self_modify_list_dirs", "self_modify_read", "self_modify_write",
-                  "self_modify_create", "self_modify_diff", "self_modify_rollback"],
-    }
+    """从工具对象自动生成分类目录。优先用 @tool 的 category 属性，fallback 到名称匹配。"""
+    # 从 registry 读分类（@tool 装饰器已注册）
+    from app.agent.tools.registry import registry as tool_registry
+
     tool_names = {t.name for t in tools}
+    cat_map = tool_registry.categories  # {category: [tool_names]}
+
     lines = []
-    for cat, names in categories.items():
+    categorized = set()
+    for cat, names in cat_map.items():
         available = [n for n in names if n in tool_names]
         if available:
             lines.append(f"**{cat}**: {', '.join(available)}")
-    # 列出未分类的工具
-    categorized = set()
-    for names in categories.values():
-        categorized.update(names)
+            categorized.update(available)
+
+    # 未分类的工具
     uncategorized = tool_names - categorized - {"final_answer"}
     if uncategorized:
         lines.append(f"**其他**: {', '.join(sorted(uncategorized))}")
 
     # Managed agents
     if managed_agents:
-        ma_info = []
-        for ma in managed_agents:
-            ma_info.append(f"{ma.name}({ma.description[:30]})")
+        ma_info = [f"{ma.name}({ma.description[:30]})" for ma in managed_agents]
         lines.append(f"\n**子Agent**: {', '.join(ma_info)}")
 
     return "\n".join(lines)
 
 
-GUIDANCE = """## 核心规则
-
-0. **⚠️ 必须用 final_answer() 返回结果** — 这是唯一能正确终止的方式。
-1. **不需要工具的消息，第一步就 final_answer** — 打招呼、闲聊等直接回复。
-2. **必须调用工具获取真实数据** — 绝不编造数字。
-3. **深度优先** — 分析深度不够时用 Python 代码做更深入的量化分析。
-4. **风险优先** — 分析必须包含风险提示。
-5. **工具失败处理** — 记录失败原因，用已有数据继续，不重复调用。
-6. **多维验证** — 技术面结论至少 2 个指标相互验证。
-7. **诚实透明** — 数据不足时明确告知。
-
-### 任务流程
-
-**股票分析** — 行情→技术面→形态→量能→情报→综合判断。用 final_answer 返回。
-**选股筛选** — 用 search_stocks 按条件筛选，再用 run_indicator_signal 验证。
-**回测验证** — 用 list_strategies 发现策略，用 run_backtest 执行，分析绩效。
-**交易执行** — 先确认行情和信号，再用 start_strategy 启动。
-
-**重要提示：**
-- 当用户只给中文名称没给代码时，必须先用 search_stock_by_name 查到代码。
-- get_indicator_snapshot 一次获取全部技术指标，比多次调用 analyze_trend 更高效。
-- search_stocks 支持自然语言条件，无需手动构建 filters 字典。
-"""
+# ── GUIDANCE loaded from skills.guidance ──
+from app.agent.skills.guidance import GUIDANCE
 
 
 def _load_preamble() -> str:
@@ -239,22 +198,8 @@ def _build_instructions(user_message: str = "", skill_instructions: str = "",
 # 2. Skill Instructions (from indicator IDE)
 # ═══════════════════════════════════════════════════════════════
 
-def _get_skill_instructions(skills: Optional[List[str]] = None, user_id: int = 1) -> str:
-    if not skills:
-        return ""
-    indicator_ids = None
-    try:
-        indicator_ids = [int(s) for s in skills if str(s).isdigit()]
-    except (ValueError, AttributeError):
-        pass
-    if not indicator_ids:
-        return ""
-    try:
-        from app.services.indicator_analyzer import build_agent_skill_instructions
-        return build_agent_skill_instructions(user_id=user_id, indicator_ids=indicator_ids)
-    except Exception as e:
-        logger.warning("[Agent] IndicatorAnalyzer unavailable: %s", e)
-        return ""
+# ── Indicator skills loaded from skills.indicator_skills ──
+from app.agent.skills.indicator_skills import get_indicator_skill_instructions
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -402,16 +347,15 @@ def _step_to_events(step) -> List[Dict[str, Any]]:
 # ═══════════════════════════════════════════════════════════════
 
 def _build_managed_agents(smol_model) -> list:
-    """Build specialized sub-agents for different domains.
+    """Build specialized sub-agents from skill registry.
 
-    Each managed agent focuses on one domain and is called by the main agent
-    when the task falls into that domain.
+    Skills are auto-discovered from app/agent/skills/*.py modules
+    that use the @skill decorator. No hardcoded agent definitions here.
     """
+    from app.agent.skills.registry import skill_registry
+
     tools = build_all_tools()
     tool_map = {t.name: t for t in tools}
-
-    def pick(*names):
-        return [tool_map[n] for n in names if n in tool_map]
 
     AgentClass = _get_agent_class()
     base_kwargs = dict(
@@ -422,67 +366,16 @@ def _build_managed_agents(smol_model) -> list:
         provide_run_summary=True,
     )
 
-    # 1. Analysis specialist — 个股分析全流程
-    analysis_agent = AgentClass(
-        tools=pick(
-            "get_realtime_quote", "agent_get_kline", "get_stock_info",
-            "generate_kline_chart",
-            "analyze_trend", "get_indicator_snapshot",
-            "calculate_ma", "get_volume_analysis", "analyze_pattern",
-            "get_chip_distribution", "search_stock_news", "search_comprehensive_intel",
-            "resolve_stock_name", "search_stock_by_name",
-            "get_market_indices", "get_sector_rankings",
-            "get_fund_flow",
-        ),
-        name="analysis_agent",
-        description="股票分析专家。负责个股分析：行情→技术面→形态→量能→情报→综合判断。当用户询问某只股票的分析时调用。",
-        instructions="你是技术分析专家。按行情→形态→情报→分析流程执行。优先用 get_indicator_snapshot 一次获取全部指标。必须调用工具获取真实数据。",
-        **base_kwargs,
+    # Discover and build from registry
+    skill_registry.discover()
+    agents = skill_registry.build_managed_agents(
+        smol_model=smol_model,
+        tool_map=tool_map,
+        agent_class=AgentClass,
+        base_kwargs=base_kwargs,
     )
-
-    # 2. Screening specialist — 选股和推荐
-    screening_agent = AgentClass(
-        tools=pick(
-            "search_stocks", "get_screener_presets",
-            "get_zt_pool", "get_dragon_tiger", "get_hot_rank",
-            "get_limit_down", "get_broken_board",
-            "list_indicators", "run_indicator_signal", "review_stocks_with_indicator",
-            "get_realtime_quote", "agent_get_kline",
-            "resolve_stock_name", "search_stock_by_name",
-        ),
-        name="screening_agent",
-        description="选股专家。负责全市场筛选：条件选股→龙虎榜→涨停池→热榜→指标验证。当用户要求选股、筛选股票时调用。",
-        instructions="你是选股专家。用 search_stocks 按条件筛选，再用 run_indicator_signal 验证信号。优先使用自然语言条件。",
-        **base_kwargs,
-    )
-
-    # 3. Backtest specialist — 策略验证
-    backtest_agent = AgentClass(
-        tools=pick(
-            "run_backtest", "get_backtest_history",
-            "list_strategies", "get_strategy_detail",
-            "list_indicators", "get_indicator_params", "run_indicator_signal",
-        ),
-        name="backtest_agent",
-        description="回测专家。负责执行策略回测、分析历史绩效（收益率、胜率、最大回撤、夏普比率）。当用户要求回测、验证策略时调用。",
-        instructions="你是回测专家。发现策略→执行回测→分析绩效。重点分析风险调整后收益。",
-        **base_kwargs,
-    )
-
-    # 4. Data engineering specialist — 代码执行和数据处理
-    data_agent = AgentClass(
-        tools=pick(
-            "save_script", "load_script", "list_workspace",
-            "shell_exec", "exec_script", "run_background", "poll_task",
-            "agent_get_kline", "get_realtime_quote",
-        ),
-        name="data_agent",
-        description="数据工程专家。负责代码执行、数据清洗、自定义分析脚本、批量数据处理。当用户要求写代码、跑脚本、处理数据时调用。",
-        instructions="你是数据工程专家。用工作区工具保存和执行脚本，支持迭代优化。长时间任务用 run_background 后台执行。",
-        **base_kwargs,
-    )
-
-    return [analysis_agent, screening_agent, backtest_agent, data_agent]
+    logger.info("[Agent] Built %d managed agents from skill registry", len(agents))
+    return agents
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -503,7 +396,7 @@ def get_smolagent(
 ) -> "CodeAgent | ToolCallingAgent":
     global _agent_cache, _cached_tools_signature
 
-    skill_instructions = _get_skill_instructions(skills, user_id)
+    skill_instructions = get_indicator_skill_instructions(skills, user_id)
     smol_model = build_model(model=model, provider=provider)
     tools = build_all_tools()
     managed_agents = _build_managed_agents(smol_model)

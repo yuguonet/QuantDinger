@@ -534,23 +534,8 @@ def list_tools():
         mcp_tools = []
 
         qd_names = set()
-        from app.agent.tools.data_tools import DATA_TOOLS
-        from app.agent.tools.analysis_tools import ANALYSIS_TOOLS
-        from app.agent.tools.search_tools import SEARCH_TOOLS
-        from app.agent.tools.market_tools import MARKET_TOOLS
-        from app.agent.tools.screener_tools import SCREENER_TOOLS
-        from app.agent.tools.market_data_tools import MARKET_DATA_TOOLS
-        from app.agent.tools.backtest_tools import BACKTEST_TOOLS
-        from app.agent.tools.indicator_tools import INDICATOR_TOOLS
-        from app.agent.tools.trading_tools import TRADING_TOOLS
-        from app.agent.tools.screening_tools import SCREENING_TOOLS
-        from app.agent.tools.code_workspace_tools import WORKSPACE_TOOLS
-
-        for lst in [DATA_TOOLS, ANALYSIS_TOOLS, SEARCH_TOOLS, MARKET_TOOLS,
-                    SCREENER_TOOLS, MARKET_DATA_TOOLS, BACKTEST_TOOLS, INDICATOR_TOOLS,
-                    TRADING_TOOLS, SCREENING_TOOLS, WORKSPACE_TOOLS]:
-            for spec in lst:
-                qd_names.add(spec["name"])
+        from app.agent.tools.registry import registry as tool_registry
+        qd_names.update(tool_registry.all_names)
 
         for t in tools:
             info = {"name": t.name, "description": t.description[:150]}

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any, Dict, List, Optional
+from app.agent.tools.registry import tool
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,10 @@ except ImportError as _e:
 
 # ── Tool functions ────────────────────────────────────────────
 
+@tool(
+    description="列出用户的所有交易策略（含运行状态）。返回策略 ID、名称、类型、状态、交易对、时间框架。用于发现可用策略。",
+    category="交易",
+)
 def list_strategies(user_id: int = 1) -> Dict[str, Any]:
     """列出用户的所有交易策略（含运行状态）。
 
@@ -60,6 +65,10 @@ def list_strategies(user_id: int = 1) -> Dict[str, Any]:
         return {"strategies": [], "count": 0, "error": str(e)}
 
 
+@tool(
+    description="获取策略的详细配置信息（类型、交易对、指标、参数、状态等）。",
+    category="交易",
+)
 def get_strategy_detail(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
     """获取策略的详细配置信息。
 
@@ -90,6 +99,10 @@ def get_strategy_detail(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
         return {"success": False, "error": str(e)}
 
 
+@tool(
+    description="启动一个交易策略，开始按指标信号自动执行买卖操作。",
+    category="交易",
+)
 def start_strategy(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
     """启动一个交易策略（开始实盘运行）。
 
@@ -140,6 +153,10 @@ def start_strategy(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
         return {"success": False, "error": f"启动失败: {e}"}
 
 
+@tool(
+    description="停止一个正在运行的交易策略。",
+    category="交易",
+)
 def stop_strategy(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
     """停止一个正在运行的交易策略。
 
@@ -182,6 +199,10 @@ def stop_strategy(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
         return {"success": False, "error": f"停止失败: {e}"}
 
 
+@tool(
+    description="获取策略的最近交易记录，包含买卖价格、数量、盈亏等。",
+    category="交易",
+)
 def get_strategy_trades(
     strategy_id: int,
     user_id: int = 1,
@@ -228,108 +249,5 @@ def get_strategy_trades(
 
 # ── OpenAI tool declarations ─────────────────────────────────
 
-TRADING_TOOLS = [
-    {
-        "fn": list_strategies,
-        "name": "list_strategies",
-        "description": (
-            "列出用户的所有交易策略（含运行状态）。返回策略 ID、名称、类型、"
-            "状态、交易对、时间框架。用于发现可用策略。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "user_id": {
-                    "type": "integer",
-                    "description": "用户 ID，默认 1",
-                    "default": 1,
-                },
-            },
-        },
-    },
-    {
-        "fn": get_strategy_detail,
-        "name": "get_strategy_detail",
-        "description": "获取策略的详细配置信息（类型、交易对、指标、参数、状态等）。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "strategy_id": {
-                    "type": "integer",
-                    "description": "策略 ID",
-                },
-                "user_id": {
-                    "type": "integer",
-                    "description": "用户 ID，默认 1",
-                    "default": 1,
-                },
-            },
-            "required": ["strategy_id"],
-        },
-    },
-    {
-        "fn": start_strategy,
-        "name": "start_strategy",
-        "description": "启动一个交易策略，开始按指标信号自动执行买卖操作。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "strategy_id": {
-                    "type": "integer",
-                    "description": "策略 ID",
-                },
-                "user_id": {
-                    "type": "integer",
-                    "description": "用户 ID，默认 1",
-                    "default": 1,
-                },
-            },
-            "required": ["strategy_id"],
-        },
-    },
-    {
-        "fn": stop_strategy,
-        "name": "stop_strategy",
-        "description": "停止一个正在运行的交易策略。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "strategy_id": {
-                    "type": "integer",
-                    "description": "策略 ID",
-                },
-                "user_id": {
-                    "type": "integer",
-                    "description": "用户 ID，默认 1",
-                    "default": 1,
-                },
-            },
-            "required": ["strategy_id"],
-        },
-    },
-    {
-        "fn": get_strategy_trades,
-        "name": "get_strategy_trades",
-        "description": "获取策略的最近交易记录，包含买卖价格、数量、盈亏等。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "strategy_id": {
-                    "type": "integer",
-                    "description": "策略 ID",
-                },
-                "user_id": {
-                    "type": "integer",
-                    "description": "用户 ID，默认 1",
-                    "default": 1,
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "返回条数，默认 20",
-                    "default": 20,
-                },
-            },
-            "required": ["strategy_id"],
-        },
-    },
-]
+# Legacy list — kept for backward compat during migration; safe to remove later.
+TRADING_TOOLS = []

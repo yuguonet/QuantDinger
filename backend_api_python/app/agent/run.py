@@ -46,44 +46,14 @@ def _print_agent_info():
 
     # Tools
     try:
-        from app.agent.tools.data_tools import DATA_TOOLS
-        from app.agent.tools.analysis_tools import ANALYSIS_TOOLS
-        from app.agent.tools.search_tools import SEARCH_TOOLS
-        from app.agent.tools.market_tools import MARKET_TOOLS
-        from app.agent.tools.screener_tools import SCREENER_TOOLS
-        from app.agent.tools.market_data_tools import MARKET_DATA_TOOLS
-        from app.agent.tools.backtest_tools import BACKTEST_TOOLS
-        from app.agent.tools.indicator_tools import INDICATOR_TOOLS
-        from app.agent.tools.trading_tools import TRADING_TOOLS
-        from app.agent.tools.screening_tools import SCREENING_TOOLS
-        from app.agent.tools.code_workspace_tools import WORKSPACE_TOOLS
-        from app.agent.tools.scan_tools import SCAN_TOOLS
-        from app.agent.tools.self_modify_tools import SELF_MODIFY_TOOLS
-
-        all_tool_lists = [
-            ("data", DATA_TOOLS),
-            ("analysis", ANALYSIS_TOOLS),
-            ("search", SEARCH_TOOLS),
-            ("market", MARKET_TOOLS),
-            ("screener", SCREENER_TOOLS),
-            ("market_data", MARKET_DATA_TOOLS),
-            ("backtest", BACKTEST_TOOLS),
-            ("indicator", INDICATOR_TOOLS),
-            ("trading", TRADING_TOOLS),
-            ("screening", SCREENING_TOOLS),
-            ("workspace", WORKSPACE_TOOLS),
-            ("scan", SCAN_TOOLS),
-            ("self_modify", SELF_MODIFY_TOOLS),
-        ]
-
-        total = 0
-        for category, tools in all_tool_lists:
-            names = [t["name"] for t in tools]
-            total += len(names)
-            print(f"\n  [{category}] ({len(tools)} tools)")
+        from app.agent.tools.registry import registry as tool_registry
+        tool_registry.discover()
+        categories = tool_registry.categories
+        total = len(tool_registry)
+        for cat, names in categories.items():
+            print(f"\n  [{cat}] ({len(names)} tools)")
             for name in names:
                 print(f"    - {name}")
-
         print(f"\n  总计: {total} 个工具")
     except Exception as e:
         print(f"\n  [!] 工具加载失败: {e}")

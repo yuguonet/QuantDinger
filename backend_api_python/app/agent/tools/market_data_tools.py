@@ -14,6 +14,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 import requests
+from app.agent.tools.registry import tool
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +156,10 @@ def _ak_hot_rank() -> List[Dict[str, Any]]:
 #  工具函数
 # ══════════════════════════════════════════════════════════════
 
+@tool(
+    description="获取龙虎榜数据。stock_code为空返回全市场龙虎榜，非空返回该股票的历史龙虎榜。包含上榜股票代码、名称、买卖金额、净买入额、涨跌幅、上榜原因。",
+    category="行情数据",
+)
 def get_dragon_tiger(stock_code: str = "", date: str = "", days: int = 30) -> Dict[str, Any]:
     """获取龙虎榜数据。
 
@@ -202,6 +207,10 @@ def get_dragon_tiger(stock_code: str = "", date: str = "", days: int = 30) -> Di
         return {"date": date, "days": days, "count": len(data), "stocks": data}
 
 
+@tool(
+    description="获取实时股票热榜/人气榜：排名、代码、名称、人气分数、价格、涨跌幅。反映市场关注度最高的个股。",
+    category="行情数据",
+)
 def get_hot_rank(top_n: int = 30) -> Dict[str, Any]:
     """获取实时股票热榜/人气榜。
 
@@ -215,6 +224,10 @@ def get_hot_rank(top_n: int = 30) -> Dict[str, Any]:
     return {"count": len(data[:top_n]), "stocks": data[:top_n]}
 
 
+@tool(
+    description="获取涨停股票池：代码、名称、涨停价、封板资金、连板天数。可筛选连板股（设 min_continuous_days>=2）。",
+    category="行情数据",
+)
 def get_zt_pool(date: str = "", min_continuous_days: int = 0) -> Dict[str, Any]:
     """获取涨停股票池。
 
@@ -239,6 +252,10 @@ def get_zt_pool(date: str = "", min_continuous_days: int = 0) -> Dict[str, Any]:
     return {"date": date, "min_continuous_days": min_continuous_days, "count": len(data), "stocks": data}
 
 
+@tool(
+    description="获取跌停股票池：代码、名称、跌停价、封单量。",
+    category="行情数据",
+)
 def get_limit_down(date: str = "") -> Dict[str, Any]:
     """获取跌停股票池。
 
@@ -258,6 +275,10 @@ def get_limit_down(date: str = "") -> Dict[str, Any]:
     return {"date": date, "count": len(data), "stocks": data}
 
 
+@tool(
+    description="获取炸板(开板)股票池。炸板=曾封涨停但被打开，是资金分歧信号。",
+    category="龙虎榜/热榜",
+)
 def get_broken_board(date: str = "") -> Dict[str, Any]:
     """获取炸板(开板)股票池。炸板=曾封涨停但被打开，是资金分歧信号。
 
@@ -277,6 +298,10 @@ def get_broken_board(date: str = "") -> Dict[str, Any]:
     return {"date": date, "count": len(data), "stocks": data}
 
 
+@tool(
+    description="获取全市场涨跌统计快照：上涨/下跌家数、情绪指标。",
+    category="行情数据",
+)
 def get_market_overview() -> Dict[str, Any]:
     """获取全市场涨跌统计快照：上涨/下跌家数、情绪指标。"""
     stocks = _em_search("A股 涨跌统计", 5)
@@ -285,6 +310,10 @@ def get_market_overview() -> Dict[str, Any]:
     return {"up_count": up, "down_count": down, "north_net_flow": 0, "emotion": 50}
 
 
+@tool(
+    description="获取个股资金流向：主力/大单/中单/小单的净流入额。支持单只（传一个代码）或批量（逗号分隔，最多20只）。",
+    category="行情数据",
+)
 def get_fund_flow(stock_codes: str = "") -> Dict[str, Any]:
     """获取个股资金流向。支持单只或批量（逗号分隔），单次最多20只。
 
@@ -327,6 +356,10 @@ def get_fund_flow(stock_codes: str = "") -> Dict[str, Any]:
         return {"count": len(result), "flows": result, "failed": []}
 
 
+@tool(
+    description="获取行业板块资金流向排名。",
+    category="行情数据",
+)
 def get_sector_fund_flow(date: str = "") -> Dict[str, Any]:
     """获取行业板块资金流向排名。
 
@@ -344,6 +377,10 @@ def get_sector_fund_flow(date: str = "") -> Dict[str, Any]:
     return {"date": date, "count": len(data), "sectors": data}
 
 
+@tool(
+    description="获取概念板块资金流向排名。",
+    category="行情数据",
+)
 def get_concept_fund_flow(date: str = "") -> Dict[str, Any]:
     """获取概念板块资金流向排名。
 
@@ -365,118 +402,5 @@ def get_concept_fund_flow(date: str = "") -> Dict[str, Any]:
 #  工具声明
 # ══════════════════════════════════════════════════════════════
 
-MARKET_DATA_TOOLS = [
-    {
-        "fn": get_dragon_tiger,
-        "name": "get_dragon_tiger",
-        "description": (
-            "获取龙虎榜数据。stock_code为空返回全市场龙虎榜，非空返回该股票的历史龙虎榜。"
-            "包含上榜股票代码、名称、买卖金额、净买入额、涨跌幅、上榜原因。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "stock_code": {"type": "string", "description": "股票代码（可选，空=全市场）", "default": ""},
-                "date": {"type": "string", "description": "查询日期 YYYY-MM-DD，默认最近交易日"},
-                "days": {"type": "integer", "description": "回溯天数，默认30", "default": 30},
-            },
-        },
-    },
-    {
-        "fn": get_hot_rank,
-        "name": "get_hot_rank",
-        "description": (
-            "获取实时股票热榜/人气榜：排名、代码、名称、人气分数、价格、涨跌幅。"
-            "反映市场关注度最高的个股。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "top_n": {"type": "integer", "description": "返回前N名，默认30，最大100", "default": 30},
-            },
-        },
-    },
-    {
-        "fn": get_zt_pool,
-        "name": "get_zt_pool",
-        "description": (
-            "获取涨停股票池：代码、名称、涨停价、封板资金、连板天数。"
-            "可筛选连板股（设 min_continuous_days>=2）。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "date": {"type": "string", "description": "交易日期 YYYY-MM-DD，默认今天"},
-                "min_continuous_days": {"type": "integer", "description": "最少连板天数，0=全部", "default": 0},
-            },
-        },
-    },
-    {
-        "fn": get_limit_down,
-        "name": "get_limit_down",
-        "description": "获取跌停股票池：代码、名称、跌停价、封单量。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "date": {"type": "string", "description": "交易日期 YYYY-MM-DD，默认今天"},
-            },
-        },
-    },
-    {
-        "fn": get_broken_board,
-        "name": "get_broken_board",
-        "description": (
-            "获取炸板(开板)股票池：代码、名称、涨停时间、开板时间。"
-            "炸板=曾封涨停但被打开，往往是资金分歧信号。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "date": {"type": "string", "description": "交易日期 YYYY-MM-DD，默认今天"},
-            },
-        },
-    },
-    {
-        "fn": get_market_overview,
-        "name": "get_market_overview",
-        "description": "获取全市场涨跌统计快照：上涨/下跌家数、情绪指标。用于判断市场整体氛围。",
-        "parameters": {"type": "object", "properties": {}},
-    },
-    {
-        "fn": get_fund_flow,
-        "name": "get_fund_flow",
-        "description": (
-            "获取个股资金流向：主力/大单/中单/小单的净流入额。"
-            "支持单只（传一个代码）或批量（逗号分隔，最多20只）。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "stock_codes": {"type": "string", "description": "股票代码，如 '000001' 或 '000001,600519'"},
-            },
-            "required": ["stock_codes"],
-        },
-    },
-    {
-        "fn": get_sector_fund_flow,
-        "name": "get_sector_fund_flow",
-        "description": "获取行业板块资金流向排名。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "date": {"type": "string", "description": "交易日期 YYYY-MM-DD，默认今天"},
-            },
-        },
-    },
-    {
-        "fn": get_concept_fund_flow,
-        "name": "get_concept_fund_flow",
-        "description": "获取概念板块资金流向排名。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "date": {"type": "string", "description": "交易日期 YYYY-MM-DD，默认今天"},
-            },
-        },
-    },
-]
+# Legacy list — kept for backward compat during migration; safe to remove later.
+MARKET_DATA_TOOLS = []

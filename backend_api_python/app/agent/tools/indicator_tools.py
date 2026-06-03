@@ -10,12 +10,17 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any, Dict, List, Optional
+from app.agent.tools.registry import tool
 
 logger = logging.getLogger(__name__)
 
 
 # ── Tool functions ────────────────────────────────────────────
 
+@tool(
+    description="列出用户的所有指标策略（自建 + 购买的），返回指标 ID、名称、描述。",
+    category="指标策略",
+)
 def list_indicators(user_id: int = 1) -> Dict[str, Any]:
     """列出用户的所有指标策略（自建 + 购买的）。
 
@@ -56,6 +61,10 @@ def list_indicators(user_id: int = 1) -> Dict[str, Any]:
         return {"indicators": [], "count": 0, "error": str(e)}
 
 
+@tool(
+    description="获取指标策略声明的可配置参数。解析代码中的 # @param 注释，返回参数名称、类型、默认值和描述。",
+    category="指标策略",
+)
 def get_indicator_params(indicator_id: int, user_id: int = 1) -> Dict[str, Any]:
     """获取指标策略声明的可配置参数。
 
@@ -97,6 +106,10 @@ def get_indicator_params(indicator_id: int, user_id: int = 1) -> Dict[str, Any]:
         return {"params": [], "error": str(e)}
 
 
+@tool(
+    description="对单只股票执行指标策略，返回最新的 buy/sell 信号、当前价格、指标图表数据。用于判断某只股票当前是否出现交易信号。",
+    category="指标策略",
+)
 def run_indicator_signal(
     indicator_id: int,
     stock_code: str,
@@ -275,84 +288,5 @@ def run_indicator_signal(
 
 # ── OpenAI tool declarations ─────────────────────────────────
 
-INDICATOR_TOOLS = [
-    {
-        "fn": list_indicators,
-        "name": "list_indicators",
-        "description": "列出用户的所有指标策略（自建 + 购买的），返回指标 ID、名称、描述。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "user_id": {
-                    "type": "integer",
-                    "description": "用户 ID，默认 1",
-                    "default": 1,
-                },
-            },
-        },
-    },
-    {
-        "fn": get_indicator_params,
-        "name": "get_indicator_params",
-        "description": (
-            "获取指标策略声明的可配置参数。解析代码中的 # @param 注释，"
-            "返回参数名称、类型、默认值和描述。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "indicator_id": {
-                    "type": "integer",
-                    "description": "指标 ID",
-                },
-                "user_id": {
-                    "type": "integer",
-                    "description": "用户 ID，默认 1",
-                    "default": 1,
-                },
-            },
-            "required": ["indicator_id"],
-        },
-    },
-    {
-        "fn": run_indicator_signal,
-        "name": "run_indicator_signal",
-        "description": (
-            "对单只股票执行指标策略，返回最新的 buy/sell 信号、当前价格、"
-            "指标图表数据。用于判断某只股票当前是否出现交易信号。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "indicator_id": {
-                    "type": "integer",
-                    "description": "指标策略 ID",
-                },
-                "stock_code": {
-                    "type": "string",
-                    "description": "股票代码（如 600519, 000001）或交易对（如 BTC/USDT）",
-                },
-                "timeframe": {
-                    "type": "string",
-                    "description": "K线周期，默认 1D（可选 1H, 4H, 1W）",
-                    "default": "1D",
-                },
-                "days": {
-                    "type": "integer",
-                    "description": "获取K线天数，默认 60",
-                    "default": 60,
-                },
-                "user_id": {
-                    "type": "integer",
-                    "description": "用户 ID，默认 1",
-                    "default": 1,
-                },
-                "params": {
-                    "type": "object",
-                    "description": "指标参数覆盖（可选）",
-                },
-            },
-            "required": ["indicator_id", "stock_code"],
-        },
-    },
-]
+# Legacy list — kept for backward compat during migration; safe to remove later.
+INDICATOR_TOOLS = []

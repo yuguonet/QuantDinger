@@ -12,6 +12,8 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from app.agent.tools.registry import tool
+
 logger = logging.getLogger(__name__)
 
 # ── 显式依赖检查 ──────────────────────────────────────────────
@@ -29,6 +31,13 @@ except ImportError as _e:
 
 # ── Tool functions ────────────────────────────────────────────
 
+@tool(
+    description=(
+        "对指定策略在指定股票上跑历史回测。执行策略代码模拟交易，返回收益率、"
+        "胜率、最大回撤、夏普比率等绩效指标和最近交易明细。"
+    ),
+    category="回测",
+)
 def run_backtest(
     strategy_id: int,
     stock_code: str,
@@ -38,8 +47,6 @@ def run_backtest(
     user_id: int = 1,
 ) -> Dict[str, Any]:
     """对指定策略在指定股票上跑历史回测，返回绩效指标。
-
-    执行策略代码在历史 K 线上模拟交易，计算收益率、胜率、最大回撤等。
 
     Args:
         strategy_id: 策略 ID
@@ -137,6 +144,10 @@ def run_backtest(
         return {"success": False, "error": f"回测执行失败: {e}"}
 
 
+@tool(
+    description="查询策略的历史回测记录列表（即过去跑过的回测任务结果）。注意：这不是获取K线数据的工具，获取K线请用 agent_get_kline。",
+    category="回测",
+)
 def get_backtest_history(
     strategy_id: int,
     user_id: int = 1,
@@ -192,72 +203,5 @@ def get_backtest_history(
         return {"runs": [], "count": 0, "error": str(e)}
 
 
-# ── OpenAI tool declarations ─────────────────────────────────
-
-BACKTEST_TOOLS = [
-    {
-        "fn": run_backtest,
-        "name": "run_backtest",
-        "description": (
-            "对指定策略在指定股票上跑历史回测。执行策略代码模拟交易，返回收益率、"
-            "胜率、最大回撤、夏普比率等绩效指标和最近交易明细。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "strategy_id": {
-                    "type": "integer",
-                    "description": "策略 ID",
-                },
-                "stock_code": {
-                    "type": "string",
-                    "description": "股票代码（如 600519）或交易对（如 BTC/USDT）",
-                },
-                "start_date": {
-                    "type": "string",
-                    "description": "回测开始日期 YYYY-MM-DD",
-                },
-                "end_date": {
-                    "type": "string",
-                    "description": "回测结束日期 YYYY-MM-DD",
-                },
-                "timeframe": {
-                    "type": "string",
-                    "description": "K线周期，默认 1D",
-                    "default": "1D",
-                },
-                "user_id": {
-                    "type": "integer",
-                    "description": "用户 ID，默认 1",
-                    "default": 1,
-                },
-            },
-            "required": ["strategy_id", "stock_code", "start_date", "end_date"],
-        },
-    },
-    {
-        "fn": get_backtest_history,
-        "name": "get_backtest_history",
-        "description": "查询策略的历史回测记录列表（即过去跑过的回测任务结果）。注意：这不是获取K线数据的工具，获取K线请用 agent_get_kline。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "strategy_id": {
-                    "type": "integer",
-                    "description": "策略 ID",
-                },
-                "user_id": {
-                    "type": "integer",
-                    "description": "用户 ID，默认 1",
-                    "default": 1,
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "返回条数，默认 10",
-                    "default": 10,
-                },
-            },
-            "required": ["strategy_id"],
-        },
-    },
-]
+# Legacy list — kept for backward compat during migration; safe to remove later.
+BACKTEST_TOOLS = []

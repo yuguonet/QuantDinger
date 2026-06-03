@@ -221,92 +221,99 @@ def _load_mcp_tools() -> List[Tool]:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 4. 工具排除列表 — 内部实现工具，不暴露给 Agent
+# 4. Master loader (registry-based)
 # ═══════════════════════════════════════════════════════════════
 
+# Legacy excluded tool names — migrated from hardcoded set.
+# Prefer using registry.build({"deny": [...]}) from config instead.
 _EXCLUDED_TOOL_NAMES = {
-    # 旧的重叠工具（已被 search_stocks 合并）
-    "screen_stocks",
-    "smart_screen",
-    # 旧的合并工具
-    "get_stock_fund_flow",
-    "batch_get_stock_fund_flow",
-    "get_dragon_tiger_stocks",
-    "get_dragon_tiger_by_stock",
-    "get_hot_rank_stocks",
-    "get_zt_pool_stocks",
-    "get_limit_down_stocks",
-    "get_broken_board_stocks",
+    "screen_stocks", "smart_screen",
+    "get_stock_fund_flow", "batch_get_stock_fund_flow",
+    "get_dragon_tiger_stocks", "get_dragon_tiger_by_stock",
+    "get_hot_rank_stocks", "get_zt_pool_stocks",
+    "get_limit_down_stocks", "get_broken_board_stocks",
 }
-
-
-# ═══════════════════════════════════════════════════════════════
-# 5. Master loader
-# ═══════════════════════════════════════════════════════════════
 
 _tools_cache = None  # type: ignore
 
 
-def build_all_tools() -> List[Tool]:
+def _load_quantdinger_tools(config: Dict = None) -> List[Tool]:
+    """Load QuantDinger tools via registry (@tool decorators) + legacy _TOOLS lists.
+
+    Phase 1 (now): registry.discover() triggers @tool registrations AND imports
+    modules so legacy _TOOLS lists are populated. Both paths produce Tool instances.
+    Phase 2 (after full migration): remove legacy fallback, keep only registry.build().
+    """
+    from app.agent.tools.registry import registry
+
+    # Discover @tool-decorated functions (also imports all tool modules)
+    registry.discover()
+
+    # Registry tools (decorated functions)
+    registry_config = dict(config or {})
+    if _EXCLUDED_TOOL_NAMES:
+        extra_deny = set(registry_config.get("deny", []))
+        extra_deny.update(_EXCLUDED_TOOL_NAMES)
+        registry_config["deny"] = list(extra_deny)
+    tools = registry.build(registry_config)
+    logger.info("[ToolAdapter] Registry tools: %d", len(tools))
+
+    # Legacy fallback: collect *_TOOLS lists from modules that haven't migrated yet
+    registered_names = set(registry.all_names)
+    import importlib
+    import pathlib
+    tools_dir = pathlib.Path(__file__).resolve().parent / "tools"
+    for py_file in sorted(tools_dir.glob("*.py")):
+        if py_file.name.startswith("_"):
+            continue
+        try:
+            mod = importlib.import_module(f"app.agent.tools.{py_file.stem}")
+        except Exception:
+            continue
+        for attr in dir(mod):
+            if attr.endswith("_TOOLS") and attr[0].isupper():
+                val = getattr(mod, attr)
+                if isinstance(val, list):
+                    for spec in val:
+                        tool_name = spec.get("name", "")
+                        if tool_name and tool_name not in registered_names:
+                            if tool_name not in _EXCLUDED_TOOL_NAMES:
+                                try:
+                                    tools.append(load_tools_from_module([spec])[0])
+                                    registered_names.add(tool_name)
+                                except Exception:
+                                    pass
+                    break
+
+    return tools
+
+
+def build_all_tools(config: Dict = None) -> List[Tool]:
     """Load all tools: QuantDinger built-in + smolagents built-in + Hub + MCP.
 
     Results are cached after the first call to avoid repeated heavy imports.
+
+    Args:
+        config: Optional policy config for registry.build():
+            {"allow": [...], "deny": [...]}
     """
     global _tools_cache
     if _tools_cache is not None:
         return _tools_cache
 
-    from app.agent.tools.data_tools import DATA_TOOLS
-    from app.agent.tools.analysis_tools import ANALYSIS_TOOLS
-    from app.agent.tools.search_tools import SEARCH_TOOLS
-    from app.agent.tools.market_tools import MARKET_TOOLS
-    from app.agent.tools.backtest_tools import BACKTEST_TOOLS
-    from app.agent.tools.indicator_tools import INDICATOR_TOOLS
-    from app.agent.tools.trading_tools import TRADING_TOOLS
-    from app.agent.tools.screening_tools import SCREENING_TOOLS
-    from app.agent.tools.code_workspace_tools import WORKSPACE_TOOLS
-    from app.agent.tools.scan_tools import SCAN_TOOLS
-    from app.agent.tools.self_modify_tools import SELF_MODIFY_TOOLS
-    # 新拆分的文件
-    from app.agent.tools.screener_tools import SCREENER_TOOLS
-    from app.agent.tools.market_data_tools import MARKET_DATA_TOOLS
-    # 蜡烛图展示工具
-    from app.agent.tools.chart_tools import CHART_TOOLS
-
-    # 1. QuantDinger tools (dict-based → Tool)
-    all_lists = [
-        DATA_TOOLS, ANALYSIS_TOOLS, SEARCH_TOOLS, MARKET_TOOLS,
-        BACKTEST_TOOLS, INDICATOR_TOOLS, TRADING_TOOLS,
-        SCREENING_TOOLS, WORKSPACE_TOOLS,
-        SCAN_TOOLS, SELF_MODIFY_TOOLS,
-        SCREENER_TOOLS, MARKET_DATA_TOOLS,
-        CHART_TOOLS,
-    ]
-    tools = []
-    for lst in all_lists:
-        tools.extend(load_tools_from_module(lst))
+    # 1. QuantDinger tools (registry + legacy fallback)
+    tools = _load_quantdinger_tools(config)
     logger.info("[ToolAdapter] QuantDinger tools: %d", len(tools))
 
     # 2. smolagents built-in tools
-    builtin = _load_builtin_tools()
-    tools.extend(builtin)
+    tools.extend(_load_builtin_tools())
 
     # 3. Hub tools
-    hub = _load_hub_tools()
-    tools.extend(hub)
+    tools.extend(_load_hub_tools())
 
     # 4. MCP tools
-    mcp = _load_mcp_tools()
-    tools.extend(mcp)
+    tools.extend(_load_mcp_tools())
 
-    # 5. 过滤掉排除列表中的工具
-    before_count = len(tools)
-    tools = [t for t in tools if t.name not in _EXCLUDED_TOOL_NAMES]
-    excluded_count = before_count - len(tools)
-    if excluded_count:
-        logger.info("[ToolAdapter] Excluded %d tools: %s", excluded_count,
-                     _EXCLUDED_TOOL_NAMES & {t.name for t in tools} | _EXCLUDED_TOOL_NAMES)
-
-    logger.info("[ToolAdapter] Total tools loaded: %d (excluded %d)", len(tools), excluded_count)
+    logger.info("[ToolAdapter] Total tools loaded: %d", len(tools))
     _tools_cache = tools
     return tools

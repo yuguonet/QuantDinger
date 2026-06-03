@@ -11,6 +11,7 @@ import logging
 import os
 import pathlib
 from typing import Any, Dict, List
+from app.agent.tools.registry import tool
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +166,10 @@ def _render_svg(
     return "\n".join(parts)
 
 
+@tool(
+    description="渲染K线蜡烛图（SVG），返回 SVG 字符串。支持均线叠加和成交量柱状图。",
+    category="行情数据",
+)
 def render_candlestick(
     stock_code: str,
     timeframe: str = "1D",
@@ -229,6 +234,10 @@ def render_candlestick(
     }
 
 
+@tool(
+    description="生成迷你蜡烛图（快速预览版），60天日线+MA5/10/20+成交量。",
+    category="行情数据",
+)
 def render_candlestick_mini(
     stock_code: str,
     timeframe: str = "1D",
@@ -250,75 +259,5 @@ def render_candlestick_mini(
 
 # ── OpenAI tool declarations ─────────────────────────────────
 
-CHART_TOOLS = [
-    {
-        "fn": render_candlestick,
-        "name": "render_candlestick",
-        "description": "生成蜡烛图 SVG，可直接嵌入对话展示，零依赖。支持缩放、均线叠加。当用户要看K线图、蜡烛图、行情图时使用此工具。返回的 svg 字段可直接嵌入 HTML 展示。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "stock_code": {
-                    "type": "string",
-                    "description": "股票代码（如 600519、000001）或交易对（如 BTC/USDT）",
-                },
-                "timeframe": {
-                    "type": "string",
-                    "description": "K线周期：1m/5m/15m/30m/1H/4H/1D/1W。默认 1D",
-                    "default": "1D",
-                },
-                "days": {
-                    "type": "integer",
-                    "description": "获取天数，默认 120，最大 250",
-                    "default": 120,
-                },
-                "stock_name": {
-                    "type": "string",
-                    "description": "股票中文名称（如 贵州茅台），显示在标题上",
-                    "default": "",
-                },
-                "ma_periods": {
-                    "type": "string",
-                    "description": "均线周期，逗号分隔。默认 5,10,20",
-                    "default": "5,10,20",
-                },
-                "show_volume": {
-                    "type": "boolean",
-                    "description": "是否显示成交量，默认 true",
-                    "default": True,
-                },
-                "market": {
-                    "type": "string",
-                    "description": "市场类型，留空自动推断",
-                    "default": "",
-                },
-            },
-            "required": ["stock_code"],
-        },
-    },
-    {
-        "fn": render_candlestick_mini,
-        "name": "render_candlestick_mini",
-        "description": "生成迷你蜡烛图（快速预览版），60天日线+MA5/10/20+成交量。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "stock_code": {
-                    "type": "string",
-                    "description": "股票代码或交易对",
-                },
-                "stock_name": {
-                    "type": "string",
-                    "description": "股票中文名称",
-                    "default": "",
-                },
-                "market": {
-                    "type": "string",
-                    "description": "市场类型，留空自动推断",
-                    "default": "",
-                },
-            },
-            "required": ["stock_code"],
-        },
-    },
-]
+# Legacy list — kept for backward compat during migration; safe to remove later.
+CHART_TOOLS = []
