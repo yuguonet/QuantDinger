@@ -93,39 +93,12 @@ _BUILTIN_DOMAINS = [
         managed_agent=None,  # 由主 agent 根据复杂度决定是否委派给子 agent
         instructions="你是量化分析助手。所有金融数据必须通过工具获取，绝不编造。分析必须包含风险提示。",
         examples=[
-            {
-                "message": "帮我看看贵州茅台最近怎么样",
-                "output": {
-                    "domain": "finance",
-                    "intent": "stock_analysis",
-                    "stock": "600519",
-                    "stock_name": "贵州茅台",
-                    "aspects": ["行情", "技术面", "资金流"],
-                    "timeframe": "近期",
-                },
-            },
-            {
-                "message": "今天涨停的股票有哪些",
-                "output": {
-                    "domain": "finance",
-                    "intent": "market_scan",
-                    "scan_type": "涨停池",
-                    "aspects": [],
-                    "timeframe": "今日",
-                },
-            },
-            {
-                "message": "用双均线策略回测一下比亚迪",
-                "output": {
-                    "domain": "finance",
-                    "intent": "backtest",
-                    "stock": "002594",
-                    "stock_name": "比亚迪",
-                    "strategy_hint": "双均线",
-                    "aspects": ["回测"],
-                    "timeframe": "历史",
-                },
-            },
+            {"message": "帮我看看贵州茅台最近怎么样", "output": {"domain": "finance", "intent": "stock_analysis", "confidence": 0.9}},
+            {"message": "看000001K线", "output": {"domain": "finance", "intent": "stock_analysis", "confidence": 0.95}},
+            {"message": "今天涨停的股票有哪些", "output": {"domain": "finance", "intent": "market_scan", "confidence": 0.95}},
+            {"message": "用双均线策略回测比亚迪", "output": {"domain": "finance", "intent": "backtest", "confidence": 0.95}},
+            {"message": "什么是MACD金叉", "output": {"domain": "finance", "intent": "concept_explain", "confidence": 0.9}},
+            {"message": "修改xxx文件的bug", "output": {"domain": "coding", "intent": "code_modify", "confidence": 0.9}},
         ],
     ),
     DomainConfig(

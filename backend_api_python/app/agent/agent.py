@@ -70,7 +70,7 @@ def _generate_tool_catalog(tools, managed_agents) -> str:
     categories = {
         "名称查询": ["resolve_stock_name", "search_stock_by_name"],
         "行情数据": ["get_realtime_quote", "agent_get_kline", "get_stock_info",
-                    "get_market_indices", "get_sector_rankings"],
+                    "get_market_indices", "get_sector_rankings", "generate_kline_chart"],
         "技术分析": ["analyze_trend", "get_indicator_snapshot", "calculate_ma",
                     "get_volume_analysis", "analyze_pattern", "get_chip_distribution"],
         "情报搜索": ["search_stock_news", "search_comprehensive_intel"],
@@ -426,6 +426,7 @@ def _build_managed_agents(smol_model) -> list:
     analysis_agent = AgentClass(
         tools=pick(
             "get_realtime_quote", "agent_get_kline", "get_stock_info",
+            "generate_kline_chart",
             "analyze_trend", "get_indicator_snapshot",
             "calculate_ma", "get_volume_analysis", "analyze_pattern",
             "get_chip_distribution", "search_stock_news", "search_comprehensive_intel",

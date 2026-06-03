@@ -145,6 +145,177 @@ def agent_get_kline(stock_code: str, timeframe: str = "1D", days: int = 60, mark
         return []
 
 
+def generate_kline_chart(
+    stock_code: str,
+    timeframe: str = "1D",
+    days: int = 60,
+    stock_name: str = "",
+    indicators: str = "",
+) -> Dict[str, Any]:
+    """生成K线图（HTML 交互式图表），返回文件路径。
+
+    用 ECharts 渲染专业级蜡烛图 + 成交量柱状图，支持 MA 均线叠加。
+    生成的 HTML 文件用浏览器打开即可交互（缩放、拖动、悬停看详情）。
+
+    Args:
+        stock_code: 股票代码（如 000001、600519）或交易对（如 BTC/USDT）
+        timeframe: K线周期，可选: 1m/5m/15m/30m/1H/4H/1D/1W。默认 1D
+        days: 获取天数，默认 60，最大 250
+        stock_name: 股票名称（可选，显示在标题上）
+        indicators: 叠加指标，逗号分隔。可选: MA5,MA10,MA20,MA60。默认 MA5+MA10+MA20
+    """
+    import os
+    import pathlib
+
+    # 1) 拉取 K 线数据
+    klines = agent_get_kline(stock_code, timeframe, days)
+    if not klines:
+        return {"error": f"无法获取 {stock_code} 的K线数据", "retriable": False}
+
+    # 2) 解析指标参数
+    ma_list = []
+    if indicators:
+        for item in indicators.split(","):
+            item = item.strip().upper()
+            if item.startswith("MA") and item[2:].isdigit():
+                ma_list.append(int(item[2:]))
+    if not ma_list:
+        ma_list = [5, 10, 20]
+
+    # 3) 计算均线数据
+    closes = [k["c"] for k in klines]
+    ma_data = {}
+    for period in ma_list:
+        ma_vals = []
+        for i in range(len(closes)):
+            if i < period - 1:
+                ma_vals.append(None)
+            else:
+                ma_vals.append(round(sum(closes[i - period + 1 : i + 1]) / period, 2))
+        ma_data[f"MA{period}"] = ma_vals
+
+    # 4) 构建 ECharts 数据
+    dates = [k["t"] for k in klines]
+    ohlc = [[k["o"], k["c"], k["l"], k["h"]] for k in klines]
+    volumes = [k["v"] for k in klines]
+    vol_colors = []
+    for k in klines:
+        vol_colors.append("#ef5350" if k["c"] < k["o"] else "#26a69a")
+
+    title = f"{stock_name or stock_code} {timeframe} K线"
+    ma_colors = ["#ff9800", "#2196f3", "#e91e63", "#4caf50", "#9c27b0"]
+
+    # 5) 生成 HTML
+    ma_series_js = ""
+    for idx, (name, vals) in enumerate(ma_data.items()):
+        color = ma_colors[idx % len(ma_colors)]
+        ma_series_js += f""",
+        {{
+            name: '{name}',
+            type: 'line',
+            data: {json.dumps(vals)},
+            smooth: true,
+            lineStyle: {{ width: 1 }},
+            symbol: 'none',
+            itemStyle: {{ color: '{color}' }}
+        }}"""
+
+    chart_html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>{title}</title>
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ background: #1a1a2e; color: #e0e0e0; font-family: -apple-system, sans-serif; }}
+  #chart {{ width: 100vw; height: 100vh; }}
+</style>
+</head>
+<body>
+<div id="chart"></div>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<script>
+var chart = echarts.init(document.getElementById('chart'), 'dark');
+var option = {{
+    backgroundColor: '#1a1a2e',
+    title: {{ text: '{title}', left: 'center', top: 10, textStyle: {{ color: '#eee', fontSize: 16 }} }},
+    tooltip: {{
+        trigger: 'axis',
+        axisPointer: {{ type: 'cross' }},
+        backgroundColor: 'rgba(20,20,40,0.9)',
+        borderColor: '#555',
+        textStyle: {{ color: '#eee' }}
+    }},
+    legend: {{
+        data: ['K线'{', '.join(repr(f"MA{p}") for p in ma_list)}],
+        top: 40, textStyle: {{ color: '#aaa' }}
+    }},
+    grid: [
+        {{ left: '8%', right: '3%', top: 80, height: '55%' }},
+        {{ left: '8%', right: '3%', top: '78%', height: '15%' }}
+    ],
+    xAxis: [
+        {{ type: 'category', data: {json.dumps(dates)}, gridIndex: 0, axisLabel: {{ color: '#888' }}, axisLine: {{ lineStyle: {{ color: '#444' }} }} }},
+        {{ type: 'category', data: {json.dumps(dates)}, gridIndex: 1, axisLabel: {{ show: false }}, axisLine: {{ lineStyle: {{ color: '#444' }} }} }}
+    ],
+    yAxis: [
+        {{ scale: true, gridIndex: 0, splitLine: {{ lineStyle: {{ color: '#333' }} }}, axisLabel: {{ color: '#888' }} }},
+        {{ scale: true, gridIndex: 1, splitLine: {{ show: false }}, axisLabel: {{ show: false }} }}
+    ],
+    dataZoom: [
+        {{ type: 'inside', xAxisIndex: [0, 1], start: 30, end: 100 }},
+        {{ type: 'slider', xAxisIndex: [0, 1], start: 30, end: 100, bottom: 10,
+           borderColor: '#555', textStyle: {{ color: '#aaa' }},
+           fillerColor: 'rgba(60,60,120,0.3)' }}
+    ],
+    series: [
+        {{
+            name: 'K线',
+            type: 'candlestick',
+            data: {json.dumps(ohlc)},
+            xAxisIndex: 0, yAxisIndex: 0,
+            itemStyle: {{
+                color: '#ef5350',
+                color0: '#26a69a',
+                borderColor: '#ef5350',
+                borderColor0: '#26a69a'
+            }}
+        }}{ma_series_js},
+        {{
+            name: '成交量',
+            type: 'bar',
+            data: {json.dumps(volumes)},
+            xAxisIndex: 1, yAxisIndex: 1,
+            itemStyle: {{
+                color: function(p) {{ return {json.dumps(vol_colors)}[p.dataIndex]; }}
+            }}
+        }}
+    ]
+}};
+chart.setOption(option);
+window.addEventListener('resize', function() {{ chart.resize(); }});
+</script>
+</body>
+</html>"""
+
+    # 6) 写文件
+    out_dir = pathlib.Path(os.getenv("WORKSPACE_DIR", ".")).resolve() / "chart_output"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"{stock_code.replace('/', '_')}_{timeframe}_{days}d.html"
+    out_path = out_dir / filename
+    out_path.write_text(chart_html, encoding="utf-8")
+
+    return {
+        "file_path": str(out_path),
+        "stock_code": stock_code,
+        "stock_name": stock_name,
+        "timeframe": timeframe,
+        "days": days,
+        "kline_count": len(klines),
+        "message": f"K线图已生成: {out_path}",
+    }
+
+
 def get_stock_info(stock_code: str) -> Dict[str, Any]:
     """获取股票基本面信息（公司简介、行业、市值、PE、PB 等）。"""
     market = _detect_market(stock_code) or "CNStock"
@@ -256,6 +427,41 @@ DATA_TOOLS = [
                 "market": {
                     "type": "string",
                     "description": "市场类型：CNStock(A股), HKStock(港股), Crypto(加密货币), Forex(外汇), USStock(美股), Futures(期货), MOEX(俄罗斯)。留空自动推断，推断不准时需手动指定。",
+                    "default": "",
+                },
+            },
+            "required": ["stock_code"],
+        },
+    },
+    {
+        "fn": generate_kline_chart,
+        "name": "generate_kline_chart",
+        "description": "生成K线图（HTML交互式图表），返回文件路径。用浏览器打开可查看专业级蜡烛图+成交量+均线。当用户要求看K线、显示图表、K线图时，必须先调用 agent_get_kline 获取数据，再调用此工具生成图表。分析类请求不需要此工具。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "stock_code": {
+                    "type": "string",
+                    "description": "股票代码（如 000001、600519）或交易对（如 BTC/USDT）",
+                },
+                "timeframe": {
+                    "type": "string",
+                    "description": "K线周期：1m/5m/15m/30m/1H/4H/1D/1W。默认1D",
+                    "default": "1D",
+                },
+                "days": {
+                    "type": "integer",
+                    "description": "获取天数，默认60，最大250",
+                    "default": 60,
+                },
+                "stock_name": {
+                    "type": "string",
+                    "description": "股票中文名称（如 平安银行），显示在图表标题上",
+                    "default": "",
+                },
+                "indicators": {
+                    "type": "string",
+                    "description": "叠加指标，逗号分隔。可选: MA5,MA10,MA20,MA60。默认 MA5,MA10,MA20",
                     "default": "",
                 },
             },
