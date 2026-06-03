@@ -66,25 +66,32 @@ def _get_agent_class():
 # ═══════════════════════════════════════════════════════════════
 
 def _generate_tool_catalog(tools, managed_agents) -> str:
-    """从工具对象自动生成分类目录。优先用 @tool 的 category 属性，fallback 到名称匹配。"""
-    # 从 registry 读分类（@tool 装饰器已注册）
+    """从工具对象自动生成分类目录。按 layer → category 二级分组。"""
     from app.agent.tools.registry import registry as tool_registry
 
     tool_names = {t.name for t in tools}
-    cat_map = tool_registry.categories  # {category: [tool_names]}
+    layered = tool_registry.layered_categories  # {layer: {category: [tool_names]}}
 
     lines = []
     categorized = set()
-    for cat, names in cat_map.items():
-        available = [n for n in names if n in tool_names]
-        if available:
-            lines.append(f"**{cat}**: {', '.join(available)}")
-            categorized.update(available)
+    for layer, cats in layered.items():
+        layer_tools = []
+        for cat, names in cats.items():
+            available = [n for n in names if n in tool_names]
+            if available:
+                if len(cats) > 1:
+                    layer_tools.append(f"  {cat}: {', '.join(available)}")
+                else:
+                    layer_tools.append(f"  {', '.join(available)}")
+                categorized.update(available)
+        if layer_tools:
+            lines.append(f"**{layer}**")
+            lines.extend(layer_tools)
 
     # 未分类的工具
     uncategorized = tool_names - categorized - {"final_answer"}
     if uncategorized:
-        lines.append(f"**其他**: {', '.join(sorted(uncategorized))}")
+        lines.append(f"**未分层**: {', '.join(sorted(uncategorized))}")
 
     # Managed agents
     if managed_agents:

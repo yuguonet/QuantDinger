@@ -314,6 +314,7 @@ def _calc_kdj(highs: List[float], lows: List[float], closes: List[float],
 @tool(
     description="综合技术趋势分析（MA + MACD + RSI + BOLL + KDJ 五维共振），返回均线排列、趋势评分、买卖信号和所有子指标详情。这是最核心的分析工具，一次调用获取全部技术面数据。",
     category="技术分析",
+    layer="分析层",
 )
 def analyze_trend(stock_code: str) -> Dict[str, Any]:
     """综合技术趋势分析：均线排列 + MACD + RSI + BOLL + KDJ，给出多维度趋势评分和买卖信号。"""
@@ -490,6 +491,7 @@ def analyze_trend(stock_code: str) -> Dict[str, Any]:
 @tool(
     description="计算指定周期的移动平均线数值及斜率（趋势方向）。",
     category="技术分析",
+    layer="分析层",
 )
 def calculate_ma(stock_code: str, periods: str = "5,10,20,60,120") -> Dict[str, Any]:
     """计算指定周期的均线数值，同时返回均线斜率（趋势方向）。"""
@@ -524,6 +526,7 @@ def calculate_ma(stock_code: str, periods: str = "5,10,20,60,120") -> Dict[str, 
 @tool(
     description="分析量能变化：量比、成交量趋势、放量/缩量判断、量价关系（量价齐升/缩量上涨/放量下跌等）。",
     category="技术分析",
+    layer="分析层",
 )
 def get_volume_analysis(stock_code: str) -> Dict[str, Any]:
     """分析量能变化：量比、成交量趋势、放量/缩量判断、量价关系。"""
@@ -597,6 +600,7 @@ def get_volume_analysis(stock_code: str) -> Dict[str, Any]:
 @tool(
     description="识别K线形态（增强版）：锤子线、十字星、吞没、早晨/黄昏之星、三连阳/阴、红三兵/黑三鸦、长上下影线、缺口等 15+ 种形态。",
     category="技术分析",
+    layer="分析层",
 )
 def analyze_pattern(stock_code: str) -> Dict[str, Any]:
     """识别K线形态（增强版）：锤子线、十字星、吞没、早晨/晚星、三连阳/阴、长上影/下影、缺口等。"""
@@ -744,6 +748,7 @@ def analyze_pattern(stock_code: str) -> Dict[str, Any]:
 @tool(
     description="分析筹码分布：获利比例、平均成本、集中度（仅A股支持）。",
     category="技术分析",
+    layer="分析层",
 )
 def get_chip_distribution(stock_code: str) -> Dict[str, Any]:
     """分析筹码分布：获利比例、平均成本、集中度。
@@ -768,6 +773,7 @@ def get_chip_distribution(stock_code: str) -> Dict[str, Any]:
 @tool(
     description="一次性获取所有主要技术指标快照（MA/MACD/RSI/BOLL/KDJ/量比），减少多轮工具调用。适合需要快速全面了解技术面的场景。",
     category="技术分析",
+    layer="分析层",
 )
 def get_indicator_snapshot(stock_code: str) -> Dict[str, Any]:
     """一次性返回所有主要技术指标的最新值，供 Agent 全局研判。

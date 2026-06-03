@@ -58,6 +58,37 @@ def build_default_routes() -> List[Route]:
             },
         ),
 
+        # ── 金融: K线图表 ──────────────────────────────────────
+        Route(
+            name="finance/chart_view",
+            description="K线图表：看K线、蜡烛图、走势图、K线图可视化",
+            utterances=[
+                "看看K线",
+                "K线图",
+                "给我看看K线图",
+                "显示蜡烛图",
+                "看走势",
+                "看看走势图",
+                "K线长什么样",
+                "画个K线图",
+                "显示K线",
+                "看看日K",
+                "看看周K",
+                "看60分钟K线",
+                "出个图",
+                "给我出个K线图",
+                "看看002031的K线",
+                "茅台K线图",
+                "看K线走势",
+                "蜡烛图看一下",
+                "走势图看看",
+            ],
+            score_threshold=0.40,
+            metadata={
+                "tools_hint": "render_candlestick, render_candlestick_mini",
+            },
+        ),
+
         # ── 金融: 市场扫描 ──────────────────────────────────────
         Route(
             name="finance/market_scan",
@@ -183,6 +214,9 @@ def build_default_routes() -> List[Route]:
                 "换手率多少",
             ],
             score_threshold=0.40,
+            metadata={
+                "tools_hint": "get_indicator_snapshot, analyze_trend, agent_get_kline",
+            },
         ),
 
         # ── 金融: 交易执行 ──────────────────────────────────────
@@ -229,6 +263,9 @@ def build_default_routes() -> List[Route]:
                 "净利润多少",
             ],
             score_threshold=0.40,
+            metadata={
+                "tools_hint": "get_stock_info, get_realtime_quote, resolve_stock_name",
+            },
         ),
 
         # ── 金融: 概念解释 ────────────────────────────────────
@@ -250,6 +287,9 @@ def build_default_routes() -> List[Route]:
                 "怎么理解市净率",
             ],
             score_threshold=0.45,
+            metadata={
+                "tools_hint": "final_answer",
+            },
         ),
 
         # ── 编程 ────────────────────────────────────────────────
@@ -271,6 +311,9 @@ def build_default_routes() -> List[Route]:
                 "帮我修复一下",
             ],
             score_threshold=0.40,
+            metadata={
+                "tools_hint": "workspace_read_file, workspace_write_file, workspace_exec_script",
+            },
         ),
 
         Route(
@@ -289,6 +332,9 @@ def build_default_routes() -> List[Route]:
                 "帮我写段代码",
             ],
             score_threshold=0.40,
+            metadata={
+                "tools_hint": "workspace_write_file, workspace_save_script",
+            },
         ),
 
         Route(
@@ -305,6 +351,9 @@ def build_default_routes() -> List[Route]:
                 "帮我看看代码组织",
             ],
             score_threshold=0.40,
+            metadata={
+                "tools_hint": "workspace_list, workspace_read_file, shell_exec",
+            },
         ),
 
         # ── 闲聊 ────────────────────────────────────────────────

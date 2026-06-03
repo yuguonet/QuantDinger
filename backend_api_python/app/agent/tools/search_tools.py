@@ -34,6 +34,7 @@ def _extract_news_items(resp: Dict) -> List[Dict[str, Any]]:
 @tool(
     description="搜索股票相关新闻、公告、研报。用于获取最新消息面信息。",
     category="情报搜索",
+    layer="分析层",
 )
 def search_stock_news(stock_code: str, keyword: str = "") -> Dict[str, Any]:
     """搜索股票相关新闻、公告、研报。
@@ -82,6 +83,7 @@ def search_stock_news(stock_code: str, keyword: str = "") -> Dict[str, Any]:
 @tool(
     description="综合情报搜索：最新消息 + 风险排查 + 业绩预期，多维度获取情报。",
     category="情报搜索",
+    layer="分析层",
 )
 def search_comprehensive_intel(stock_code: str) -> Dict[str, Any]:
     """综合情报搜索：最新消息 + 风险排查 + 业绩预期。一次调用获取多维度情报。"""

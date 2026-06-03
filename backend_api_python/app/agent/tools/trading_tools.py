@@ -30,6 +30,7 @@ except ImportError as _e:
 @tool(
     description="列出用户的所有交易策略（含运行状态）。返回策略 ID、名称、类型、状态、交易对、时间框架。用于发现可用策略。",
     category="交易",
+    layer="执行层",
 )
 def list_strategies(user_id: int = 1) -> Dict[str, Any]:
     """列出用户的所有交易策略（含运行状态）。
@@ -68,6 +69,7 @@ def list_strategies(user_id: int = 1) -> Dict[str, Any]:
 @tool(
     description="获取策略的详细配置信息（类型、交易对、指标、参数、状态等）。",
     category="交易",
+    layer="执行层",
 )
 def get_strategy_detail(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
     """获取策略的详细配置信息。
@@ -102,6 +104,7 @@ def get_strategy_detail(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
 @tool(
     description="启动一个交易策略，开始按指标信号自动执行买卖操作。",
     category="交易",
+    layer="执行层",
 )
 def start_strategy(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
     """启动一个交易策略（开始实盘运行）。
@@ -156,6 +159,7 @@ def start_strategy(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
 @tool(
     description="停止一个正在运行的交易策略。",
     category="交易",
+    layer="执行层",
 )
 def stop_strategy(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
     """停止一个正在运行的交易策略。
@@ -202,6 +206,7 @@ def stop_strategy(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
 @tool(
     description="获取策略的最近交易记录，包含买卖价格、数量、盈亏等。",
     category="交易",
+    layer="执行层",
 )
 def get_strategy_trades(
     strategy_id: int,

@@ -84,6 +84,7 @@ class ToolSpec:
     name: str
     description: str
     category: str = ""
+    layer: str = ""          # 架构分层：显示层/数据层/分析层/决策层/执行层/支撑层
     output_type: str = "string"
     meta: Dict[str, Any] = field(default_factory=dict)
 
@@ -189,11 +190,11 @@ class ToolRegistry:
         self._discovered = False
 
     def register(self, fn: Callable, name: str, description: str,
-                 category: str = "", output_type: str = "string", **meta):
+                 category: str = "", layer: str = "", output_type: str = "string", **meta):
         """Register a tool function. Called by the @tool decorator."""
         spec = ToolSpec(
             fn=fn, name=name, description=description,
-            category=category, output_type=output_type, meta=meta,
+            category=category, layer=layer, output_type=output_type, meta=meta,
         )
         self._tools[name] = spec
 
@@ -247,6 +248,16 @@ class ToolRegistry:
         return cats
 
     @property
+    def layered_categories(self) -> Dict[str, Dict[str, List[str]]]:
+        """Return {layer: {category: [tool_names]}} mapping."""
+        layers: Dict[str, Dict[str, List[str]]] = {}
+        for spec in self._tools.values():
+            layer = spec.layer or "未分层"
+            cat = spec.category or "其他"
+            layers.setdefault(layer, {}).setdefault(cat, []).append(spec.name)
+        return layers
+
+    @property
     def all_names(self) -> List[str]:
         return list(self._tools.keys())
 
@@ -272,15 +283,24 @@ def tool(
     description: str,
     name: str = "",
     category: str = "",
+    layer: str = "",
     output_type: str = "string",
     **meta,
 ):
     """Decorator to register a function as a QuantDinger tool.
 
     Usage:
-        @tool(description="搜索股票", category="名称查询")
+        @tool(description="搜索股票", category="名称查询", layer="数据层")
         def search_stock_by_name(keyword: str, market: str = "CNStock"):
             ...
+
+    layer: 架构分层，可选值:
+        显示层 — 图表/可视化输出
+        数据层 — 名称查询、行情数据获取
+        分析层 — 技术分析、指标策略、情报搜索
+        决策层 — 选股、回测
+        执行层 — 交易
+        支撑层 — 工作区、自修改
 
     The decorated function remains callable as normal — the decorator
     only registers it in the global registry, it does NOT wrap it.
@@ -292,6 +312,7 @@ def tool(
             name=tool_name,
             description=description,
             category=category,
+            layer=layer,
             output_type=output_type,
             **meta,
         )

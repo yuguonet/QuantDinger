@@ -37,6 +37,7 @@ except ImportError as _e:
         "胜率、最大回撤、夏普比率等绩效指标和最近交易明细。"
     ),
     category="回测",
+    layer="决策层",
 )
 def run_backtest(
     strategy_id: int,
@@ -147,6 +148,7 @@ def run_backtest(
 @tool(
     description="查询策略的历史回测记录列表（即过去跑过的回测任务结果）。注意：这不是获取K线数据的工具，获取K线请用 agent_get_kline。",
     category="回测",
+    layer="决策层",
 )
 def get_backtest_history(
     strategy_id: int,

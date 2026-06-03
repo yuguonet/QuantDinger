@@ -168,8 +168,13 @@ def _render_svg(
 
 
 @tool(
-    description="渲染K线蜡烛图（SVG），返回 SVG 字符串。支持均线叠加和成交量柱状图。",
-    category="行情数据",
+    description=(
+        "渲染K线蜡烛图（SVG），返回可视化图表。支持均线叠加和成交量柱状图。"
+        "当用户说「看K线」「K线图」「蜡烛图」「看走势」「看行情」时，必须用此工具生成图表，"
+        "不要用 python_interpreter 打印文字版数据。"
+    ),
+    category="K线图表",
+    layer="显示层",
 )
 def render_candlestick(
     stock_code: str,
@@ -248,7 +253,8 @@ def render_candlestick(
 
 @tool(
     description="生成迷你蜡烛图（快速预览版），60天日线+MA5/10/20+成交量。",
-    category="行情数据",
+    category="K线图表",
+    layer="显示层",
 )
 def render_candlestick_mini(
     stock_code: str,

@@ -249,6 +249,7 @@ def _build_scene_list() -> List[Dict[str, str]]:
 
     finance_scenes = [
         ("stock_analysis", "股票分析", "个股分析、技术面分析、行情研判、趋势判断、综合诊断"),
+        ("chart_view", "K线图表", "看K线、K线图、蜡烛图、走势图、图表可视化"),
         ("market_scan", "市场扫描", "涨停池、跌停池、龙虎榜、热门板块、市场概览"),
         ("backtest", "策略回测", "策略回测验证、历史绩效分析、收益率胜率回撤"),
         ("stock_screener", "选股筛选", "条件选股、指标选股、智能筛选"),
