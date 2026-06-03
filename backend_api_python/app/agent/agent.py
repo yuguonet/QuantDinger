@@ -145,7 +145,7 @@ def _load_preamble() -> str:
     # Try project root first, then backend_api_python/
     candidates = [
         pathlib.Path(__file__).resolve().parent / "agent_preamble.md",
-        pathlib.Path(__file__).resolve().parents / "agent_preamble.md",
+        pathlib.Path(__file__).resolve().parent / "agent_preamble.md",
     ]
     for p in candidates:
         if p.is_file():
