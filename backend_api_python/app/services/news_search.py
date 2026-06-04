@@ -17,7 +17,6 @@ Search service v2.3 - 搜索引擎调度器
 10. 新浪财经新闻
 11. AKShare 财经新闻 (降级备选)
 
-注意: 新闻缓存、情感评分、search_cn_stock_news 已迁移至 app/data_providers/news.py
 """
 import requests
 import time
@@ -27,11 +26,13 @@ from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from difflib import SequenceMatcher
 from typing import List, Dict, Any, Optional
 from itertools import cycle
 from urllib.parse import urlparse
 
 from app.utils.logger import get_logger
+from app.utils.db import get_db_connection
 from app.utils.config_loader import load_addon_config
 from app.services.news_provider import (
     # 旧接口 (向后兼容, search.py Provider 类使用)
@@ -1404,3 +1405,540 @@ def reset_search_service() -> None:
     """重置搜索服务（用于测试或配置更新后）"""
     global _search_service
     _search_service = None
+
+
+# ═══════════════════════════════════════════════════════════════
+# 新闻缓存 + 统一入口 (原 news.py)
+# ═══════════════════════════════════════════════════════════════
+
+POLICY_NEWS_SYMBOL = "POLICY"
+GENERAL_NEWS_SYMBOL = "GENERAL_NEWS"
+
+NEWS_CACHE_DEDUP_HOURS = 24
+NEWS_CACHE_EXPIRY_DAYS = 12
+
+# 所有时间均为 UTC，括号内注释为对应本地时间
+_MARKET_TRADING_WINDOWS = {
+    "CNStock":  {"pre_open": (23, 30, 1, 30),  "midday": (4, 0, 5, 0)},    # 北京 7:30-9:30 / 12:00-13:00
+    "USStock":  {"pre_open": (12, 30, 13, 30), "midday": (17, 0, 18, 0)},  # 北京 20:30-21:30 / 次日 1:00-2:00
+    "Crypto":   {"pre_open": None, "midday": None},
+    "Forex":    {"pre_open": (21, 30, 22, 0),  "midday": (4, 0, 5, 0)},    # 北京 5:30-6:00 / 12:00-13:00
+}
+
+_MACRO_MARKET_MAP = {
+    "MacroCN": "CNStock",
+    "MacroIntl": "USStock",
+}
+
+
+def get_news_type(symbol: str, market: str) -> str:
+    """通过 symbol 判断新闻类型 (用于选择评分策略)"""
+    if symbol == POLICY_NEWS_SYMBOL:
+        return "policy"
+    if symbol == GENERAL_NEWS_SYMBOL:
+        return "general"
+    if symbol == market:
+        return "market"
+    return "stock"
+
+
+def _in_time_window(hour: int, minute: int, window: tuple) -> bool:
+    """判断当前时间是否在 [start, end) 窗口内，支持跨午夜"""
+    sh, sm, eh, em = window
+    cur = hour * 60 + minute
+    start = sh * 60 + sm
+    end = eh * 60 + em
+    if start <= end:
+        return start <= cur < end
+    else:
+        return cur >= start or cur < end
+
+
+# ── 标题去重工具 (归一化 hash + 模糊匹配) ──
+
+_PUNCT_RE = re.compile(r'[^\w\u4e00-\u9fff]')
+
+
+def _normalize_title(title: str) -> str:
+    """归一化标题：去标点、空白，统一小写"""
+    t = (title or "").strip().lower()
+    t = _PUNCT_RE.sub('', t)
+    return t
+
+
+def _title_hash(title: str) -> str:
+    """归一化后取 MD5，用于精确匹配"""
+    return hashlib.md5(_normalize_title(title).encode()).hexdigest()
+
+
+def _is_dup(new_title: str, existing: List[Dict[str, str]], threshold: float = 0.85) -> bool:
+    """两层去重：归一化 hash 精确匹配 + 模糊匹配"""
+    new_norm = _normalize_title(new_title)
+    if not new_norm:
+        return False
+    new_hash = hashlib.md5(new_norm.encode()).hexdigest()
+    for item in existing:
+        if item["hash"] == new_hash:
+            return True
+        if abs(len(new_norm) - len(item["norm"])) > max(len(new_norm), len(item["norm"])) * 0.3:
+            continue
+        if SequenceMatcher(None, new_norm, item["norm"]).ratio() >= threshold:
+            return True
+    return False
+
+
+# ═══════════════════════════════════════════════════════════════
+# PostgreSQL 新闻缓存管理器
+# ═══════════════════════════════════════════════════════════════
+
+
+class NewsCacheManager:
+    """
+    新闻缓存管理器 (纯 DB 比对, 无内存状态)
+
+    存储: qd_news_cache_items (每条一行, UNIQUE(symbol, market, title))
+    策略: 24h去重, 15天过期, 自选股时间窗口, 评分写入, 标题模糊去重
+    """
+
+    def __init__(self):
+        pass
+
+    def _purge_expired(self, conn) -> int:
+        """清除超过 NEWS_CACHE_EXPIRY_DAYS 天的过期记录"""
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"DELETE FROM qd_news_cache_items WHERE created_at < NOW() - INTERVAL '{NEWS_CACHE_EXPIRY_DAYS} days'"
+            )
+            deleted = cursor.rowcount
+            if deleted > 0:
+                logger.info(f"[过期清理] 已清除 {deleted} 条超过 {NEWS_CACHE_EXPIRY_DAYS} 天的新闻缓存")
+            return deleted
+        except Exception as e:
+            logger.warning(f"过期清理异常(非致命): {e}")
+            return 0
+
+    def _get_last_search_time(self, symbol: str, market: str) -> Optional[datetime]:
+        """从 DB 查询该 symbol 最后一条缓存的入库时间"""
+        try:
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT MAX(created_at) AS last_time FROM qd_news_cache_items WHERE symbol = %s AND market = %s",
+                    (symbol, market)
+                )
+                row = cursor.fetchone()
+                if row and row.get('last_time'):
+                    return row['last_time']
+                return None
+        except Exception as e:
+            logger.warning(f"查询最后搜索时间异常: {e}")
+            return None
+
+    def get_items(self, symbol: str, market: str = "CNStock") -> List[Dict[str, Any]]:
+        """从 DB 查询缓存新闻, 同时清理过期记录"""
+        try:
+            with get_db_connection() as conn:
+                self._purge_expired(conn)
+                conn.commit()
+                cursor = conn.cursor()
+                cursor.execute(
+                    """SELECT title, snippet, url, source, published_date, sentiment, sentiment_score
+                       FROM qd_news_cache_items
+                       WHERE symbol = %s AND market = %s
+                         AND title NOT LIKE '__empty_%%__'
+                       ORDER BY published_date DESC""",
+                    (symbol, market)
+                )
+                return [dict(r) for r in cursor.fetchall()] or []
+        except Exception as e:
+            logger.warning(f"查询新闻缓存异常: {e}")
+            return []
+
+    def should_search(self, symbol: str, market: str = "CNStock",
+                      is_watchlist: bool = False) -> tuple:
+        """判断是否需要搜索"""
+        last_search = self._get_last_search_time(symbol, market)
+        now = datetime.utcnow()
+
+        if is_watchlist:
+            windows = _MARKET_TRADING_WINDOWS.get(market)
+            if windows:
+                pre = windows.get("pre_open")
+                if pre and _in_time_window(now.hour, now.minute, pre):
+                    if last_search and last_search.date() == now.date():
+                        return False, f"自选股今日已搜({last_search.strftime('%H:%M')}), 开盘前无需重复"
+                    else:
+                        return True, f"自选股开盘前刷新({market}, 今日未搜索)"
+                mid = windows.get("midday")
+                if mid and _in_time_window(now.hour, now.minute, mid):
+                    if last_search and last_search.date() == now.date() and last_search.hour >= mid[0]:
+                        return False, f"自选股午间已搜({last_search.strftime('%H:%M')})"
+                    else:
+                        return True, f"自选股午间刷新({market})"
+
+        if last_search:
+            hours_since = (now - last_search).total_seconds() / 3600
+            if hours_since < NEWS_CACHE_DEDUP_HOURS:
+                return False, f"距上次搜索仅{hours_since:.1f}h(<24h), 使用缓存"
+
+        return True, "需要搜索" if not last_search else f"距上次搜索超过{NEWS_CACHE_DEDUP_HOURS}h"
+
+    def calc_dynamic_days(self, symbol: str, market: str, default_days: int = 3) -> int:
+        """根据最后搜索时间动态缩减搜索天数"""
+        last_search = self._get_last_search_time(symbol, market)
+        if not last_search:
+            return default_days
+        hours_since = (datetime.utcnow() - last_search).total_seconds() / 3600
+        if hours_since < 1:
+            return 1
+        elif hours_since < 6:
+            return 2
+        elif hours_since < 12:
+            return 3
+        elif hours_since < 24:
+            return 4
+        return default_days
+
+    def save_items(self, symbol: str, market: str, results: List[SearchResult],
+                   name: str = "") -> bool:
+        """将搜索结果写入明细表, ON CONFLICT 更新。中性评分(score=0)也入库。"""
+        if not symbol or not market or not results:
+            return False
+        try:
+            with get_db_connection() as conn:
+                self._purge_expired(conn)
+                cursor = conn.cursor()
+
+                news_type = get_news_type(symbol, market)
+                from app.services.news_analysis import keyword_score_article, ai_analyze_article
+
+                # ── 查库去重：归一化 hash + 模糊匹配 ──
+                cursor.execute(
+                    "SELECT title FROM qd_news_cache_items WHERE symbol=%s AND market=%s",
+                    (symbol, market)
+                )
+                existing = [
+                    {"title": row["title"], "norm": _normalize_title(row["title"]),
+                     "hash": _title_hash(row["title"])}
+                    for row in cursor.fetchall()
+                ]
+                before_count = len(results)
+                results = [r for r in results if not _is_dup(r.title, existing)]
+                dup_count = before_count - len(results)
+                if dup_count > 0:
+                    logger.info(f"[去重] {symbol}({market}) 过滤 {dup_count} 条重复标题 (库中已有 {len(existing)} 条)")
+
+                if not results:
+                    logger.info(f"[去重] {symbol}({market}) 全部重复, 跳过写入")
+                    return True
+
+                # ── 相关性过滤 (仅个股) ──
+                if news_type == "stock" and symbol:
+                    before_relv = len(results)
+                    patterns = [re.escape(symbol)]
+                    if name:
+                        patterns.append(re.escape(name))
+                    relv_re = re.compile("|".join(patterns), re.IGNORECASE)
+                    results = [r for r in results
+                               if relv_re.search(r.title or "") or relv_re.search(r.snippet or "")]
+                    relv_filtered = before_relv - len(results)
+                    if relv_filtered > 0:
+                        logger.info(f"[相关性] {symbol}({market}) 过滤 {relv_filtered} 条不相关文章")
+                    if not results:
+                        logger.info(f"[相关性] {symbol}({market}) 无相关文章, 跳过写入")
+                        return True
+
+                rows = []
+                for r in results:
+                    title = _safe_encode(r.title, 500)
+                    snippet = _safe_encode(r.snippet, 2000)
+                    url = _safe_encode(r.url, 1000)
+                    source = _safe_encode(r.source, 100)
+                    pub_date = _safe_encode(r.published_date or '', 40)
+
+                    if news_type == "policy":
+                        ai_result = ai_analyze_article(
+                            title=title, snippet=snippet,
+                            source=source, published_date=pub_date,
+                        )
+                        if ai_result:
+                            score = ai_result["score"]
+                            sentiment = ai_result["sentiment"]
+                            simplified = ai_result.get("simplified_text", "")
+                            if simplified:
+                                snippet = _safe_encode(simplified, 2000)
+                        else:
+                            kw_result = keyword_score_article(title, snippet, news_type=news_type)
+                            score = kw_result["score"]
+                            sentiment = kw_result["sentiment"]
+                    else:
+                        kw_result = keyword_score_article(title, snippet, news_type=news_type)
+                        if kw_result["veto"]:
+                            score = -999.0
+                            sentiment = "negative"
+                            logger.warning(f"[一票否决] 检测到重大负面: {title[:60]}")
+                        else:
+                            score = kw_result["score"]
+                            sentiment = kw_result["sentiment"]
+
+                    # 中性评分(score=0)也入库，不跳过
+                    rows.append((symbol, market, title, snippet, url, source,
+                                 pub_date, sentiment, score))
+
+                if not rows:
+                    return True
+
+                cursor.executemany(
+                    """INSERT INTO qd_news_cache_items
+                       (symbol, market, title, snippet, url, source, published_date, sentiment, sentiment_score)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                       ON CONFLICT (symbol, market, title) DO UPDATE SET
+                           snippet = EXCLUDED.snippet,
+                           url = EXCLUDED.url,
+                           source = EXCLUDED.source,
+                           published_date = EXCLUDED.published_date,
+                           sentiment = EXCLUDED.sentiment,
+                           sentiment_score = EXCLUDED.sentiment_score,
+                           created_at = NOW()""",
+                    rows
+                )
+                conn.commit()
+                logger.info(f"新闻缓存已保存: {symbol}({market}) {news_type} {len(rows)}条")
+                return True
+        except Exception as e:
+            logger.error(f"保存新闻缓存异常: {e}")
+            return False
+
+    @staticmethod
+    def calc_score(symbol: str, market: str) -> Dict[str, Any]:
+        """综合评分 — 委托 news_analysis.composite_score()"""
+        from app.services.news_analysis import composite_score as _composite_score
+
+        try:
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """SELECT sentiment_score, created_at
+                       FROM qd_news_cache_items
+                       WHERE symbol = %s AND market = %s
+                         AND title NOT LIKE '__empty_%%__'""",
+                    (symbol, market)
+                )
+                rows = cursor.fetchall()
+        except Exception as e:
+            logger.warning(f"calc_score 查询异常: {e}")
+            rows = []
+
+        if not rows:
+            return {"composite_score": 0.0, "direction": "中性",
+                    "positive": 0, "negative": 0, "neutral": 0,
+                    "veto": False, "veto_count": 0}
+
+        articles = []
+        for row in rows:
+            raw_score = row.get("sentiment_score")
+            created_at = row.get("created_at")
+            articles.append({
+                "score": float(raw_score) if raw_score is not None else 0.0,
+                "published_date": created_at.isoformat() if created_at else "",
+            })
+
+        result = _composite_score(articles)
+        return {
+            "composite_score": result["composite_score"],
+            "direction": result["direction"],
+            "positive": result.get("positive_count", 0),
+            "negative": result.get("negative_count", 0),
+            "neutral": result.get("neutral_count", 0),
+            "veto": result.get("veto", False),
+            "veto_count": 1 if result.get("veto") else 0,
+        }
+
+
+_news_cache_manager: Optional[NewsCacheManager] = None
+
+
+def get_news_cache_manager() -> NewsCacheManager:
+    """获取新闻缓存管理器单例"""
+    global _news_cache_manager
+    if _news_cache_manager is None:
+        _news_cache_manager = NewsCacheManager()
+    return _news_cache_manager
+
+
+# ── 格式化工具 ──
+
+def _results_to_list(results: List[SearchResult], lang: str, category: str) -> List[Dict[str, Any]]:
+    """SearchResult → 统一 dict 格式"""
+    return [
+        {
+            "title": r.title, "link": r.url,
+            "snippet": r.snippet, "source": r.source,
+            "published": r.published_date or "",
+            "sentiment": r.sentiment, "sentiment_score": r.sentiment_score,
+            "category": category, "lang": lang,
+        }
+        for r in results
+    ]
+
+
+def _detect_lang(results: List[SearchResult], default: str = "cn") -> str:
+    """根据结果内容推断实际语言"""
+    sample = " ".join(r.title for r in results[:5])
+    if not sample:
+        return default
+    cn_chars = len(re.findall(r'[\u4e00-\u9fff]', sample))
+    total = len(sample) or 1
+    return "cn" if cn_chars / total > 0.15 else "en"
+
+
+def _detect_lang_from_text(text: str, default: str = "cn") -> str:
+    """根据文本推断语言：中文字符占比 >15% 视为中文"""
+    if not text:
+        return default
+    cn_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
+    return "cn" if cn_chars / max(len(text), 1) > 0.15 else "en"
+
+
+def _format_cached(items: List[Dict[str, Any]], lang: str) -> Dict[str, List[Dict[str, Any]]]:
+    """缓存命中 → 格式化为 {"cn": [...], "en": [...]}"""
+    result: Dict[str, List[Dict[str, Any]]] = {"cn": [], "en": []}
+    for item in items:
+        title = item.get("title", "")
+        lang_key = _detect_lang_from_text(title, "cn")
+        result[lang_key].append({
+            "title": title, "link": item.get("url", ""),
+            "snippet": item.get("snippet", ""), "source": item.get("source", ""),
+            "published": item.get("published_date", ""),
+            "sentiment": item.get("sentiment", "neutral"),
+            "sentiment_score": item.get("sentiment_score"),
+            "category": "", "lang": lang_key,
+        })
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
+# 统一入口 — 缓存 → search → 评分 → 返回
+# ═══════════════════════════════════════════════════════════════
+
+def fetch_financial_news(
+    lang: str = "all",
+    market: str = "all",
+    symbol: str = "",
+    name: str = "",
+    keywords: str = "",
+) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    财经新闻统一入口 — 唯一对外接口
+
+    内部流程:
+      1. 规范化 (MacroCN/MacroIntl → POLICY)
+      2. 缓存检查 (NewsCacheManager.should_search)
+      3. 缓存命中 → 直接返回
+      4. 缓存未命中 → search_news_dispatch()
+      5. 评分 + 写缓存 (NewsCacheManager.save_items)
+      6. 格式化返回
+
+    Args:
+        lang:      "cn"/"en"/"all"
+        market:    "CNStock"/"USStock"/"Crypto"/"Forex"/"all"/"MacroCN"/"MacroIntl"
+        symbol:    股票代码 ("600519") 或 "POLICY" 或 ""
+        name:      股票名称 (仅个股, 提升搜索精度)
+        keywords:  自定义搜索关键词 (可选, symbol+market 都为空时必须非空)
+
+    Returns:
+        {"cn": [...], "en": [...], "_meta": {...}(仅个股)}
+    """
+    result: Dict[str, List[Dict[str, Any]]] = {"cn": [], "en": []}
+
+    try:
+        effective_market = market if market != "all" else "CNStock"
+        is_watchlist = False
+
+        if market in _MACRO_MARKET_MAP:
+            symbol = "POLICY"
+            effective_market = _MACRO_MARKET_MAP[market]
+
+        cache_symbol = symbol or (effective_market if market != "all" else GENERAL_NEWS_SYMBOL)
+        cache_market = effective_market
+        if not symbol and market == "all":
+            cache_market = "General"
+
+        # ── 缓存检查 ──
+        cache_mgr = get_news_cache_manager()
+        should, reason = cache_mgr.should_search(cache_symbol, cache_market, is_watchlist)
+
+        if not should:
+            cached = cache_mgr.get_items(cache_symbol, cache_market)
+            if cached:
+                logger.info(f"[缓存命中] {cache_symbol}({cache_market}): {reason}, {len(cached)}条")
+                return _format_cached(cached, lang)
+            logger.info(f"[缓存降级] {cache_symbol}({cache_market}): {reason}, 但无数据, 重新搜索")
+
+        logger.info(f"[需要搜索] {cache_symbol}({cache_market}): {reason}")
+
+        # ── 动态缩减搜索天数 ──
+        is_stock = bool(symbol) and symbol not in ("POLICY", GENERAL_NEWS_SYMBOL) and symbol != effective_market
+        if is_stock:
+            days = cache_mgr.calc_dynamic_days(symbol, effective_market, default_days=3)
+        elif symbol == "POLICY":
+            days = 1
+        else:
+            days = 1
+
+        # ── 调 search ──
+        svc = get_search_service()
+        resp = svc.search_news_dispatch(
+            symbol=symbol, market=effective_market, lang=lang,
+            days=days, max_web_results=5, name=name, keywords=keywords,
+        )
+
+        # ── 评分 + 写缓存 ──
+        if resp.results:
+            cache_mgr.save_items(cache_symbol, cache_market, resp.results, name=name)
+        else:
+            logger.info(f"[搜索无结果] {cache_symbol}({cache_market}), 记录空搜索")
+            cache_mgr.save_items(cache_symbol, cache_market, [
+                SearchResult(
+                    title=f"__empty_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}__",
+                    snippet="", url="", source="system",
+                    published_date=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                )
+            ], name=name)
+
+        if not resp.results:
+            return result
+
+        # ── 格式化返回 ──
+        news_type = resp.metadata.get("news_type", "stock")
+        actual_lang = _detect_lang(resp.results, "cn" if effective_market == "CNStock" else "en")
+        target_lang = lang if lang != "all" else actual_lang
+
+        category_map = {
+            "policy": f"政策/宏观:{effective_market}",
+            "general": "通用",
+            "market": f"市场:{effective_market}",
+            "stock": f"个股:{symbol}",
+        }
+        category = category_map.get(news_type, "")
+
+        items = _results_to_list(resp.results, target_lang, category)
+        result[target_lang].extend(items)
+
+        if news_type == "stock" and symbol:
+            score_info = cache_mgr.calc_score(cache_symbol, cache_market)
+            result["_meta"] = {
+                "composite_score": score_info.get("composite_score", 0),
+                "direction": score_info.get("direction", "中性"),
+                "from_cache": False,
+                "total": len(resp.results),
+            }
+
+        logger.info(f"[完成] {cache_symbol}({cache_market}) {news_type}: {len(resp.results)}条")
+        return result
+
+    except Exception as e:
+        logger.error("Failed to fetch financial news: %s", e)
+
+    return result

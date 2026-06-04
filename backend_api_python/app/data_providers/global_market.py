@@ -269,7 +269,7 @@ def _heatmap_fetch():
 
 
 def _news_fetch(lang="all"):
-    from app.services.news_service import fetch_financial_news
+    from app.services.news_search import fetch_financial_news
     return fetch_financial_news(lang)
 
 

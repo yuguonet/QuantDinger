@@ -459,7 +459,7 @@ def _fetch_sector_cycle(board_type="industry"):
 
 
 def _fetch_policy() -> dict:
-    from app.services.news_service import fetch_financial_news, get_news_cache_manager
+    from app.services.news_search import fetch_financial_news, get_news_cache_manager
     from app.services.news_analysis import composite_score
 
     news_list = []
