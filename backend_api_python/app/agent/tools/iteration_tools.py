@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -217,15 +218,37 @@ def question(
 # 3. Auto-snapshot integration helper
 # ═══════════════════════════════════════════════════════════════
 
+# Debounce: skip snapshot if last one was within this many seconds.
+# Prevents rapid-fire edits (e.g. 3 edits in 1s) from creating redundant commits.
+_SNAPSHOT_DEBOUNCE_SECS = 3
+
+# Per-session last snapshot timestamp: {session_id: epoch_seconds}
+_last_snapshot_time: Dict[str, float] = {}
+_last_snapshot_lock = threading.Lock()
+
+
 def auto_snapshot_before_edit(reason: str = "") -> Optional[Dict[str, Any]]:
     """Auto-snapshot before file edits. Call from edit/patch tools.
 
-    Returns snapshot result or None if git unavailable.
+    Debounced: skips if last snapshot for this session was < 3s ago.
+    Returns snapshot result or None if skipped/unavailable.
     """
     try:
         from app.agent.workspace import get_workspace
         from app.agent.tool_context import get_session_id
-        ws = get_workspace(get_session_id() or "default")
+        session_id = get_session_id() or "default"
+        ws = get_workspace(session_id)
+
+        # ── Debounce check ───────────────────────────────────
+        now = time.time()
+        with _last_snapshot_lock:
+            last = _last_snapshot_time.get(session_id, 0)
+            if now - last < _SNAPSHOT_DEBOUNCE_SECS:
+                logger.debug(
+                    "[AutoSnapshot] Debounced for session %s (%.1fs ago)",
+                    session_id, now - last,
+                )
+                return None
 
         git_dir = ws.session_dir / ".git"
         if not git_dir.exists():
@@ -255,6 +278,9 @@ def auto_snapshot_before_edit(reason: str = "") -> Optional[Dict[str, Any]]:
             cwd=str(ws.session_dir), capture_output=True, text=True, timeout=5,
         )
         if result.returncode == 0:
+            # Update debounce timestamp
+            with _last_snapshot_lock:
+                _last_snapshot_time[session_id] = time.time()
             log = subprocess.run(
                 ["git", "log", "--oneline", "-1"],
                 cwd=str(ws.session_dir), capture_output=True, text=True, timeout=5,

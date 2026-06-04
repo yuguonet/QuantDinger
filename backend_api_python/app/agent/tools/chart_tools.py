@@ -26,7 +26,6 @@ def _compute_ma(closes: List[float], period: int) -> list:
             result.append(round(sum(closes[i - period + 1 : i + 1]) / period, 2))
     return result
 
-
 def _render_svg(
     klines: list,
     stock_name: str = "",
@@ -166,7 +165,6 @@ def _render_svg(
     parts.append("</svg>")
     return "\n".join(parts)
 
-
 @tool(
     description=(
         "渲染K线蜡烛图（SVG），返回可视化图表。支持均线叠加和成交量柱状图。"
@@ -251,7 +249,6 @@ def render_candlestick(
         "message": f"蜡烛图已生成，共 {len(klines)} 根K线。\n{chart_marker}",
     }
 
-
 @tool(
     description="生成迷你蜡烛图（快速预览版），60天日线+MA5/10/20+成交量。",
     category="K线图表",
@@ -276,8 +273,6 @@ def render_candlestick_mini(
         market=market,
     )
 
-
 # ── OpenAI tool declarations ─────────────────────────────────
 
 # Legacy list — kept for backward compat during migration; safe to remove later.
-CHART_TOOLS = []

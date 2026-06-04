@@ -50,7 +50,6 @@ BG_MAX_CONCURRENT = int(os.getenv("AGENT_BG_MAX_CONCURRENT", "3"))
 _bg_tasks: Dict[str, Dict[str, Any]] = {}
 _bg_lock = threading.Lock()
 
-
 # ── Safety helpers ─────────────────────────────────────────────
 
 def _check_shell_safety(cmd: str) -> dict:
@@ -66,7 +65,6 @@ def _check_shell_safety(cmd: str) -> dict:
                 "blocked": True,
             }
     return {}
-
 
 def _recovery_suggestion(tool: str, error: str) -> str:
     """Generate actionable recovery suggestions based on error context."""
@@ -105,7 +103,6 @@ def _recovery_suggestion(tool: str, error: str) -> str:
         suggestions.append("检查错误详情，修正代码后重试")
 
     return "💡 建议: " + "; ".join(suggestions[:3])
-
 
 # ── Streaming execution helpers ────────────────────────────────
 
@@ -206,7 +203,6 @@ def _stream_exec(cmd: str, cwd: str, timeout: int,
         result["recovery"] = _recovery_suggestion(tool_name, full_output)
 
     return result
-
 
 # ── Data source injection ──────────────────────────────────────
 
@@ -474,7 +470,6 @@ for _pfx, _label in _prefix_labels.items():
         print(f"  {_pfx:<8} → {_label} ({_cnt})")
 '''
 
-
 # ── Tool implementations ───────────────────────────────────────
 
 @tool(
@@ -512,7 +507,6 @@ def shell_exec(
 
     return _stream_exec(command, str(ws.session_dir), timeout, emit, "shell_exec")
 
-
 @tool(
     description="保存 Python 脚本到工作区，支持自动版本管理。",
     category="工作区",
@@ -542,7 +536,6 @@ def workspace_save_script(
     ws = get_workspace(get_session_id() or "default")
     return ws.save_script(name, code, description)
 
-
 @tool(
     description="从工作区加载 Python 脚本。",
     category="工作区",
@@ -567,7 +560,6 @@ def workspace_load_script(
     ws = get_workspace(get_session_id() or "default")
     return ws.load_script(name, version)
 
-
 @tool(
     description="列出工作区中的所有脚本和文件。",
     category="工作区",
@@ -584,7 +576,6 @@ def workspace_list() -> Dict[str, Any]:
     from app.agent.tool_context import get_session_id
     ws = get_workspace(get_session_id() or "default")
     return ws.info()
-
 
 @tool(
     description="写入文件到工作区。用于创建新文件、保存脚本、写入数据等。修改代码时先用 workspace_read_file 读取，再用此工具写回。",
@@ -621,7 +612,6 @@ def workspace_write_file(
     full_path.parent.mkdir(parents=True, exist_ok=True)
     full_path.write_text(content, encoding="utf-8")
     return {"path": str(full_path), "name": safe, "size": len(content)}
-
 
 @tool(
     description="读取工作区中的文件内容。用于查看代码、读取数据、分析文件等。修改代码前先用此工具读取当前内容。",
@@ -663,7 +653,6 @@ def workspace_read_file(
         content = content[:max_chars] + f"\n... (截断, 共 {len(content)} 字符)"
 
     return {"path": str(full_path), "content": content, "size": len(content)}
-
 
 @tool(
     description="精确编辑工作区文件：支持精确文本替换和正则表达式替换。比全量重写更安全高效。先用 workspace_read_file 读取内容，找到要修改的部分，再用此工具精确替换。",
@@ -766,7 +755,6 @@ def workspace_edit_file(
         "new_size": len(content),
         "message": f"已完成 {n} 处替换",
     }
-
 
 @tool(
     description="对工作区中的 Python 代码进行静态审查：语法检查、AST分析、常见问题检测。在执行代码前调用可提前发现错误。",
@@ -920,7 +908,6 @@ def workspace_code_review(
         "summary": f"✅ 语法正确 | {info['lines']}行 | {info['functions']}个函数 | {info['classes']}个类 | {len(warnings)}个警告",
     }
 
-
 @tool(
     description="在工作区中执行 Python 脚本，支持数据源注入（get_kline/get_ticker 等自动可用）。可加载已保存脚本（传 name）或直接执行代码（传 code）。支持流式输出和最长 600 秒超时。",
     category="工作区",
@@ -998,7 +985,6 @@ def workspace_exec_script(
             "recovery": _recovery_suggestion("exec_script", str(e)),
         }
 
-
 @tool(
     description="后台执行脚本，立即返回 task_id。用 poll_task 查询结果。适合长时间任务（大数据处理、全市场扫描等）。",
     category="工作区",
@@ -1067,7 +1053,6 @@ def run_background(
 
     return {"task_id": task_id, "status": "running", "timeout": timeout}
 
-
 @tool(
     description="查询后台任务状态和结果。",
     category="工作区",
@@ -1095,7 +1080,6 @@ def poll_task(
         "duration": round(time.time() - task["started_at"], 1) if task["status"] == "running" else None,
         "result": task.get("result"),
     }
-
 
 # ── Internal execution ─────────────────────────────────────────
 
@@ -1176,7 +1160,6 @@ def _exec_in_workspace_streaming(
         "result": None,
         "error": "执行异常：未产生结果",
     }
-
 
 def _workspace_exec_worker(
     code: str,
@@ -1304,7 +1287,6 @@ def _workspace_exec_worker(
         sys.stdout = old_stdout
         sys.stderr = old_stderr
 
-
 def _safe_import_for_workspace(name: str, *args, **kwargs):
     """Restricted import for workspace execution.
 
@@ -1356,7 +1338,6 @@ def _safe_import_for_workspace(name: str, *args, **kwargs):
 
     return importlib.import_module(name, *args, **kwargs)
 
-
 def _serialize_for_workspace(obj: Any, _depth: int = 0) -> Any:
     """Serialize result for JSON transport."""
     if _depth > 10:
@@ -1393,8 +1374,6 @@ def _serialize_for_workspace(obj: Any, _depth: int = 0) -> Any:
         pass
     return str(obj)[:2000]
 
-
 # ── Tool specs for registry ────────────────────────────────────
 
 # Legacy list — kept for backward compat during migration; safe to remove later.
-WORKSPACE_TOOLS = []

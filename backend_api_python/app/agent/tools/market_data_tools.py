@@ -20,7 +20,6 @@ logger = logging.getLogger(__name__)
 
 _EASTMONEY_SEARCH_URL = "https://np-tjxg-b.eastmoney.com/api/smart-tag/stock/v3/pw/search-code"
 
-
 # ══════════════════════════════════════════════════════════════
 #  通用辅助
 # ══════════════════════════════════════════════════════════════
@@ -35,11 +34,9 @@ def _validate_date(date_str: str, param_name: str = "date") -> str:
     except ValueError:
         raise ValueError(f"参数 {param_name} 格式错误: '{date_str}'，应为 YYYY-MM-DD")
 
-
 def _today_str() -> str:
     from datetime import datetime
     return datetime.now().strftime("%Y-%m-%d")
-
 
 def _yesterday_str() -> str:
     from datetime import datetime, timedelta
@@ -48,11 +45,9 @@ def _yesterday_str() -> str:
         d -= timedelta(days=1)
     return d.strftime("%Y-%m-%d")
 
-
 def _gen_id(length: int = 32) -> str:
     chars = string.ascii_lowercase + string.digits
     return "".join(random.choice(chars) for _ in range(length))
-
 
 def _safe_float(val) -> Optional[float]:
     if val is None or val == "" or val == "-" or val == "--":
@@ -61,7 +56,6 @@ def _safe_float(val) -> Optional[float]:
         return float(val)
     except (ValueError, TypeError):
         return None
-
 
 def _call_eastmoney_api(keyword: str, page_size: int = 200, page_no: int = 1) -> Dict[str, Any]:
     """调用东方财富 search-code API。"""
@@ -98,7 +92,6 @@ def _call_eastmoney_api(keyword: str, page_size: int = 200, page_no: int = 1) ->
         logger.error("EastMoney API request failed: %s", e)
         return {"code": -1, "msg": f"请求东方财富API失败: {e}"}
 
-
 def _em_search(keyword: str, page_size: int = 100) -> List[Dict[str, Any]]:
     """东财搜索封装，返回股票列表或空列表。"""
     try:
@@ -109,7 +102,6 @@ def _em_search(keyword: str, page_size: int = 100) -> List[Dict[str, Any]]:
         logger.warning("[东财搜索] '%s' 失败: %s", keyword, e)
         return []
 
-
 # ── AkShare fallback ──
 
 def _ak_dragon_tiger(start_date: str, end_date: str) -> List[Dict[str, Any]]:
@@ -119,14 +111,12 @@ def _ak_dragon_tiger(start_date: str, end_date: str) -> List[Dict[str, Any]]:
     except Exception:
         return []
 
-
 def _ak_zt_pool(trade_date: str) -> List[Dict[str, Any]]:
     try:
         from app.data_sources.akshare import fetch_akshare_zt_pool
         return fetch_akshare_zt_pool(trade_date)
     except Exception:
         return []
-
 
 def _ak_dt_pool(trade_date: str) -> List[Dict[str, Any]]:
     try:
@@ -135,7 +125,6 @@ def _ak_dt_pool(trade_date: str) -> List[Dict[str, Any]]:
     except Exception:
         return []
 
-
 def _ak_broken_board(trade_date: str) -> List[Dict[str, Any]]:
     try:
         from app.data_sources.akshare import fetch_akshare_broken_board
@@ -143,14 +132,12 @@ def _ak_broken_board(trade_date: str) -> List[Dict[str, Any]]:
     except Exception:
         return []
 
-
 def _ak_hot_rank() -> List[Dict[str, Any]]:
     try:
         from app.data_sources.akshare import fetch_akshare_hot_rank
         return fetch_akshare_hot_rank()
     except Exception:
         return []
-
 
 # ══════════════════════════════════════════════════════════════
 #  工具函数
@@ -208,7 +195,6 @@ def get_dragon_tiger(stock_code: str = "", date: str = "", days: int = 30) -> Di
             data = _ak_dragon_tiger(start_date, date)
         return {"date": date, "days": days, "count": len(data), "stocks": data}
 
-
 @tool(
     description="获取实时股票热榜/人气榜：排名、代码、名称、人气分数、价格、涨跌幅。反映市场关注度最高的个股。",
     category="行情数据",
@@ -226,7 +212,6 @@ def get_hot_rank(top_n: int = 30) -> Dict[str, Any]:
     if not data:
         data = _ak_hot_rank()
     return {"count": len(data[:top_n]), "stocks": data[:top_n]}
-
 
 @tool(
     description="获取涨停股票池：代码、名称、涨停价、封板资金、连板天数。可筛选连板股（设 min_continuous_days>=2）。",
@@ -277,7 +262,6 @@ def get_zt_pool(date: str = "", min_continuous_days: int = 0) -> Dict[str, Any]:
 
     return {"date": date, "min_continuous_days": min_continuous_days, "count": len(data), "stocks": data, "text": text_table}
 
-
 @tool(
     description="获取跌停股票池：代码、名称、跌停价、封单量。",
     category="行情数据",
@@ -301,7 +285,6 @@ def get_limit_down(date: str = "") -> Dict[str, Any]:
     if not data:
         data = _ak_dt_pool(date)
     return {"date": date, "count": len(data), "stocks": data}
-
 
 @tool(
     description="获取炸板(开板)股票池。炸板=曾封涨停但被打开，是资金分歧信号。",
@@ -327,7 +310,6 @@ def get_broken_board(date: str = "") -> Dict[str, Any]:
         data = _ak_broken_board(date)
     return {"date": date, "count": len(data), "stocks": data}
 
-
 @tool(
     description="获取全市场涨跌统计快照：上涨/下跌家数、情绪指标。",
     category="行情数据",
@@ -340,7 +322,6 @@ def get_market_overview() -> Dict[str, Any]:
     up = sum(1 for s in stocks if (s.get("change_rate") or 0) > 0)
     down = sum(1 for s in stocks if (s.get("change_rate") or 0) < 0)
     return {"up_count": up, "down_count": down, "north_net_flow": 0, "emotion": 50}
-
 
 @tool(
     description="获取个股资金流向：主力/大单/中单/小单的净流入额。支持单只（传一个代码）或批量（逗号分隔，最多20只）。",
@@ -389,7 +370,6 @@ def get_fund_flow(stock_codes: str = "") -> Dict[str, Any]:
                 result[code] = {"code": code, "name": "", "net_flow": 0, "main_flow": 0, "retail_flow": 0}
         return {"count": len(result), "flows": result, "failed": []}
 
-
 @tool(
     description="获取行业板块资金流向排名。",
     category="行情数据",
@@ -411,7 +391,6 @@ def get_sector_fund_flow(date: str = "") -> Dict[str, Any]:
 
     data = _em_search("板块资金流向", 30)
     return {"date": date, "count": len(data), "sectors": data}
-
 
 @tool(
     description="获取概念板块资金流向排名。",
@@ -435,10 +414,8 @@ def get_concept_fund_flow(date: str = "") -> Dict[str, Any]:
     data = _em_search("概念资金流向", 30)
     return {"date": date, "count": len(data), "concepts": data}
 
-
 # ══════════════════════════════════════════════════════════════
 #  工具声明
 # ══════════════════════════════════════════════════════════════
 
 # Legacy list — kept for backward compat during migration; safe to remove later.
-MARKET_DATA_TOOLS = []

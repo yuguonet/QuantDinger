@@ -14,7 +14,6 @@ from app.agent.tools.registry import tool
 
 logger = logging.getLogger(__name__)
 
-
 # ── Tool functions ────────────────────────────────────────────
 
 @tool(
@@ -62,7 +61,6 @@ def list_indicators(user_id: int = 1) -> Dict[str, Any]:
         logger.error("list_indicators failed: %s", e, exc_info=True)
         return {"indicators": [], "count": 0, "error": str(e)}
 
-
 @tool(
     description="获取指标策略声明的可配置参数。解析代码中的 # @param 注释，返回参数名称、类型、默认值和描述。",
     category="指标策略",
@@ -108,7 +106,6 @@ def get_indicator_params(indicator_id: int, user_id: int = 1) -> Dict[str, Any]:
     except Exception as e:
         logger.error("get_indicator_params failed: %s", e, exc_info=True)
         return {"params": [], "error": str(e)}
-
 
 @tool(
     description="对单只股票执行指标策略，返回最新的 buy/sell 信号、当前价格、指标图表数据。用于判断某只股票当前是否出现交易信号。",
@@ -291,8 +288,6 @@ def run_indicator_signal(
         "data_points": len(executed_df),
     }
 
-
 # ── OpenAI tool declarations ─────────────────────────────────
 
 # Legacy list — kept for backward compat during migration; safe to remove later.
-INDICATOR_TOOLS = []

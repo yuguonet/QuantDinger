@@ -57,8 +57,28 @@ class _InMemoryStore:
         self._conversations: Dict[str, List[Dict]] = {}
         self._tool_results: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
+        self._session_locks: Dict[str, threading.Lock] = {}
+        self._session_locks_master = threading.Lock()
         self._max_sessions = max_sessions
         self._session_ttl = session_ttl
+
+    def _get_session_lock(self, session_id: str) -> threading.Lock:
+        """Get or create a per-session lock."""
+        with self._session_locks_master:
+            if session_id not in self._session_locks:
+                self._session_locks[session_id] = threading.Lock()
+            return self._session_locks[session_id]
+
+    def session_lock(self, session_id: str):
+        """Return a context manager that locks a specific session.
+
+        Usage:
+            with store.session_lock(sid):
+                history = store.get_history(sid)
+                # ... process ...
+                store.add_message(sid, "assistant", reply)
+        """
+        return self._get_session_lock(session_id)
 
     # ── Session CRUD ─────────────────────────────────────────
 
@@ -203,9 +223,56 @@ class _InMemoryStore:
 class _RedisStore:
     """Redis-backed session store."""
 
+    # Lua script: atomic read-append-trim for conversation history.
+    # KEYS[1] = conversation key
+    # ARGV[1] = message JSON (role+content)
+    # ARGV[2] = max messages to keep
+    # ARGV[3] = TTL seconds
+    _LUA_ADD_MESSAGE = """
+    local key = KEYS[1]
+    local msg = ARGV[1]
+    local max_msgs = tonumber(ARGV[2])
+    local ttl = tonumber(ARGV[3])
+    local raw = redis.call('GET', key)
+    local history = {}
+    if raw then
+        history = cjson.decode(raw)
+    end
+    table.insert(history, cjson.decode(msg))
+    if #history > max_msgs then
+        local trimmed = {}
+        for i = #history - max_msgs + 1, #history do
+            trimmed[#trimmed + 1] = history[i]
+        end
+        history = trimmed
+    end
+    local out = cjson.encode(history)
+    redis.call('SETEX', key, ttl, out)
+    return out
+    """
+
     def __init__(self, redis_client, session_ttl: int = 7200):
         self._r = redis_client
         self._ttl = session_ttl
+        self._session_locks: Dict[str, threading.Lock] = {}
+        self._session_locks_master = threading.Lock()
+        # Register Lua script
+        self._lua_add = self._r.register_script(self._LUA_ADD_MESSAGE)
+
+    def _get_session_lock(self, session_id: str) -> threading.Lock:
+        """Get or create a per-session lock for this worker process."""
+        with self._session_locks_master:
+            if session_id not in self._session_locks:
+                self._session_locks[session_id] = threading.Lock()
+            return self._session_locks[session_id]
+
+    def session_lock(self, session_id: str):
+        """Return a context manager that locks a specific session.
+
+        Note: This is per-process locking. For multi-worker deployments,
+        Redis Lua scripts provide atomicity for add_message().
+        """
+        return self._get_session_lock(session_id)
 
     def _session_key(self, session_id: str) -> str:
         return f"{_SESSION_PREFIX}{session_id}"
@@ -270,14 +337,20 @@ class _RedisStore:
         return []
 
     def add_message(self, session_id: str, role: str, content: str, max_turns: int = 20):
+        """Atomically append a message using Lua script (no TOCTOU race)."""
         key = self._conv_key(session_id)
-        raw = self._r.get(key)
-        history = json.loads(raw) if raw else []
-        history.append({"role": role, "content": content})
+        msg = json.dumps({"role": role, "content": content}, ensure_ascii=False)
         max_msgs = max_turns * 2
-        if len(history) > max_msgs:
-            history = history[-max_msgs:]
-        self._r.setex(key, self._ttl, json.dumps(history, ensure_ascii=False))
+        try:
+            self._lua_add(keys=[key], args=[msg, max_msgs, self._ttl])
+        except Exception:
+            # Fallback: non-atomic (Lua script failure, e.g. Redis < 2.6)
+            raw = self._r.get(key)
+            history = json.loads(raw) if raw else []
+            history.append({"role": role, "content": content})
+            if len(history) > max_msgs:
+                history = history[-max_msgs:]
+            self._r.setex(key, self._ttl, json.dumps(history, ensure_ascii=False))
 
     def clear_history(self, session_id: str):
         self._r.delete(self._conv_key(session_id))
@@ -365,6 +438,19 @@ class _FileStore:
         self._ttl = session_ttl
         self._max = max_sessions
         self._lock = threading.Lock()
+        self._session_locks: Dict[str, threading.Lock] = {}
+        self._session_locks_master = threading.Lock()
+
+    def _get_session_lock(self, session_id: str) -> threading.Lock:
+        """Get or create a per-session lock."""
+        with self._session_locks_master:
+            if session_id not in self._session_locks:
+                self._session_locks[session_id] = threading.Lock()
+            return self._session_locks[session_id]
+
+    def session_lock(self, session_id: str):
+        """Return a context manager that locks a specific session."""
+        return self._get_session_lock(session_id)
 
     def _path(self, session_id: str) -> Path:
         return self._dir / f"{session_id}.json"

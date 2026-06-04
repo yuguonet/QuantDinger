@@ -11,11 +11,9 @@ from app.agent.tools.registry import tool
 
 logger = logging.getLogger(__name__)
 
-
 def _get_ds(market: str = "CNStock"):
     from app.data_sources.factory import DataSourceFactory
     return DataSourceFactory.get_source(market)
-
 
 @tool(
     description="获取大盘指数实时行情（上证指数、深证成指、创业板指）。",
@@ -36,7 +34,6 @@ def get_market_indices() -> Dict[str, Any]:
     except Exception as e:
         logger.error("get_market_indices failed: %s", e)
         return {"error": str(e)}
-
 
 @tool(
     description="获取行业板块涨跌排名和资金流向。",
@@ -61,6 +58,4 @@ def get_sector_rankings() -> Dict[str, Any]:
         logger.error("get_sector_rankings failed: %s", e)
         return {"error": str(e)}
 
-
 # Legacy list — kept for backward compat during migration; safe to remove later.
-MARKET_TOOLS = []

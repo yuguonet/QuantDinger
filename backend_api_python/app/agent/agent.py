@@ -472,37 +472,12 @@ def get_smolagent(
             else:
                 tools = tool_registry.build({"deny": list(_EXCLUDED_TOOL_NAMES)})
 
-            # Legacy fallback: collect tools not yet migrated to registry
-            import importlib, pathlib as _pl
-            registered_names = set(tool_registry.all_names)
-            tools_dir = _pl.Path(__file__).resolve().parent / "tools"
-            for py_file in sorted(tools_dir.glob("*.py")):
-                if py_file.name.startswith("_"):
-                    continue
-                try:
-                    mod = importlib.import_module(f"app.agent.tools.{py_file.stem}")
-                except Exception:
-                    continue
-                for attr in dir(mod):
-                    if attr.endswith("_TOOLS") and attr[0].isupper():
-                        val = getattr(mod, attr)
-                        if isinstance(val, list):
-                            for spec in val:
-                                tool_name = spec.get("name", "")
-                                if tool_name and tool_name not in registered_names and tool_name not in _EXCLUDED_TOOL_NAMES:
-                                    try:
-                                        from app.agent.tool_adapter import load_tools_from_module
-                                        tools.append(load_tools_from_module([spec])[0])
-                                        registered_names.add(tool_name)
-                                    except Exception:
-                                        pass
-                            break
             _tools_cache_by_domain[domain_key] = tools
         else:
             tools = _tools_cache_by_domain[domain_key]
 
-    # Managed agents（按 model+provider 缓存）
-    ma_key = f"{model}_{provider}"
+    # Managed agents（按 model+provider+domain 缓存，避免不同领域互相污染）
+    ma_key = f"{model}_{provider}_{domain_key}"
     if ma_key not in _managed_agents_cache:
         _managed_agents_cache[ma_key] = _build_managed_agents(smol_model)
     managed_agents = _managed_agents_cache[ma_key]
@@ -717,7 +692,17 @@ class _AgentExecutor:
 
     def chat(self, message, session_id, context=None,
              progress_callback=None, user_id=1) -> AgentResult:
-        """Blocking chat — waits for full result."""
+        """Blocking chat — waits for full result.
+
+        Per-session lock prevents concurrent requests on the same session
+        from interleaving get_history / add_message calls.
+        """
+        store = get_session_store()
+        with store.session_lock(session_id):
+            return self._chat_locked(message, session_id, context, progress_callback, user_id)
+
+    def _chat_locked(self, message, session_id, context, progress_callback, user_id) -> AgentResult:
+        """Internal chat implementation — assumes session lock is held."""
         store, agent, enriched, meta = self._prepare(message, session_id, context, user_id)
 
         # ── 快速通道：不需要 agent 的简单回复 ────────────────
@@ -828,7 +813,17 @@ class _AgentExecutor:
 
     def chat_stream(self, message, session_id, context=None,
                     progress_callback=None, user_id=1):
-        """Streaming chat — yields SSE event dicts as smolagents produces steps."""
+        """Streaming chat — yields SSE event dicts as smolagents produces steps.
+
+        Per-session lock prevents concurrent requests on the same session
+        from interleaving get_history / add_message calls.
+        """
+        store = get_session_store()
+        with store.session_lock(session_id):
+            yield from self._chat_stream_locked(message, session_id, context, progress_callback, user_id)
+
+    def _chat_stream_locked(self, message, session_id, context, progress_callback, user_id):
+        """Internal streaming chat — assumes session lock is held."""
         store, agent, enriched, meta = self._prepare(message, session_id, context, user_id)
 
         # ── 快速通道：不需要 agent 的简单回复 ────────────────

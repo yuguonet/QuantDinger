@@ -14,7 +14,6 @@ from app.agent.tools.registry import tool
 
 logger = logging.getLogger(__name__)
 
-
 # ── Tool functions ────────────────────────────────────────────
 
 @tool(
@@ -169,7 +168,6 @@ def review_stocks_with_indicator(
         "buy_count": buy_count,
     }
 
-
 @tool(
     description="列出用户收藏的选股策略列表。",
     category="选股",
@@ -211,8 +209,6 @@ def list_user_selection_strategies(user_id: int = 1) -> Dict[str, Any]:
         logger.error("list_user_selection_strategies failed: %s", e)
         return {"strategies": [], "count": 0, "error": str(e)}
 
-
 # ── OpenAI tool declarations ─────────────────────────────────
 
 # Legacy list — kept for backward compat during migration; safe to remove later.
-SCREENING_TOOLS = []

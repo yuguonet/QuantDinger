@@ -13,16 +13,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-
 def _get_ds(market: str = "CNStock"):
     from app.data_sources.factory import DataSourceFactory
     return DataSourceFactory.get_source(market)
 
-
 # ── Re-exported from shared utils (kept for backward compat) ──
 from app.agent.utils import detect_market as _detect_market
 from app.agent.tools.registry import tool
-
 
 # ═══════════════════════════════════════════════════════════════
 # 数据获取辅助
@@ -34,12 +31,10 @@ def _fetch_klines(stock_code: str, days: int = 120) -> List[Dict[str, Any]]:
     ds = _get_ds(market)
     return ds.get_kline(stock_code, "1D", days) or []
 
-
 def _fetch_closes(stock_code: str, days: int = 120) -> List[float]:
     """Fetch close prices from data source."""
     klines = _fetch_klines(stock_code, days)
     return [float(k.get("close", 0)) for k in klines if k.get("close")]
-
 
 def _fetch_ohlcv(stock_code: str, days: int = 120) -> Dict[str, List[float]]:
     """获取 OHLCV 五组数据序列。"""
@@ -53,12 +48,10 @@ def _fetch_ohlcv(stock_code: str, days: int = 120) -> Dict[str, List[float]]:
         v.append(float(k.get("volume", 0)))
     return {"open": o, "high": h, "low": l, "close": c, "volume": v}
 
-
 def _safe_round(v: float, n: int = 4) -> float:
     if v is None or math.isnan(v) or math.isinf(v):
         return 0.0
     return round(v, n)
-
 
 # ═══════════════════════════════════════════════════════════════
 # 指标计算核心（纯 Python，无外部依赖）
@@ -74,7 +67,6 @@ def _ema(data: List[float], period: int) -> List[float]:
         result.append(data[i] * k + result[-1] * (1 - k))
     return result
 
-
 def _sma(data: List[float], period: int) -> List[float]:
     """简单移动平均（返回与 data 等长序列，前 period-1 个用已有数据均值填充）"""
     if not data:
@@ -85,7 +77,6 @@ def _sma(data: List[float], period: int) -> List[float]:
         window = data[start:i + 1]
         result.append(sum(window) / len(window))
     return result
-
 
 def _calc_macd(closes: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Dict[str, Any]:
     """MACD 指标计算，返回最新值 + 趋势判断。"""
@@ -133,7 +124,6 @@ def _calc_macd(closes: List[float], fast: int = 12, slow: int = 26, signal: int 
         "position": position,
         "signals": signals,
     }
-
 
 def _calc_rsi(closes: List[float], periods: List[int] = None) -> Dict[str, Any]:
     """RSI 指标计算（Wilder 平滑法）。"""
@@ -199,7 +189,6 @@ def _calc_rsi(closes: List[float], periods: List[int] = None) -> Dict[str, Any]:
     result["signals"] = signals
     return result
 
-
 def _calc_boll(closes: List[float], period: int = 20, std_dev: float = 2.0) -> Dict[str, Any]:
     """布林带计算。"""
     if len(closes) < period:
@@ -248,7 +237,6 @@ def _calc_boll(closes: List[float], period: int = 20, std_dev: float = 2.0) -> D
         "latest_price": _safe_round(latest),
         "signals": signals,
     }
-
 
 def _calc_kdj(highs: List[float], lows: List[float], closes: List[float],
               n: int = 9, m1: int = 3, m2: int = 3) -> Dict[str, Any]:
@@ -305,7 +293,6 @@ def _calc_kdj(highs: List[float], lows: List[float], closes: List[float],
         "j": latest_j,
         "signals": signals,
     }
-
 
 # ═══════════════════════════════════════════════════════════════
 # Tool 函数（注册给 Agent 调用）
@@ -488,7 +475,6 @@ def analyze_trend(stock_code: str) -> Dict[str, Any]:
         logger.error("analyze_trend(%s) failed: %s", stock_code, e)
         return {"error": str(e)}
 
-
 @tool(
     description="计算指定周期的移动平均线数值及斜率（趋势方向）。",
     category="技术分析",
@@ -523,7 +509,6 @@ def calculate_ma(stock_code: str, periods: str = "5,10,20,60,120") -> Dict[str, 
     except Exception as e:
         logger.error("calculate_ma(%s) failed: %s", stock_code, e)
         return {"error": str(e)}
-
 
 @tool(
     description="分析量能变化：量比、成交量趋势、放量/缩量判断、量价关系（量价齐升/缩量上涨/放量下跌等）。",
@@ -598,7 +583,6 @@ def get_volume_analysis(stock_code: str) -> Dict[str, Any]:
     except Exception as e:
         logger.error("get_volume_analysis(%s) failed: %s", stock_code, e)
         return {"error": str(e)}
-
 
 @tool(
     description="识别K线形态（增强版）：锤子线、十字星、吞没、早晨/黄昏之星、三连阳/阴、红三兵/黑三鸦、长上下影线、缺口等 15+ 种形态。",
@@ -748,7 +732,6 @@ def analyze_pattern(stock_code: str) -> Dict[str, Any]:
         logger.error("analyze_pattern(%s) failed: %s", stock_code, e)
         return {"error": str(e)}
 
-
 @tool(
     description="分析筹码分布：获利比例、平均成本、集中度（仅A股支持）。",
     category="技术分析",
@@ -773,7 +756,6 @@ def get_chip_distribution(stock_code: str) -> Dict[str, Any]:
     except Exception as e:
         logger.error("get_chip_distribution(%s) failed: %s", stock_code, e)
         return {"error": str(e)}
-
 
 @tool(
     description="一次性获取所有主要技术指标快照（MA/MACD/RSI/BOLL/KDJ/量比），减少多轮工具调用。适合需要快速全面了解技术面的场景。",
@@ -831,8 +813,6 @@ def get_indicator_snapshot(stock_code: str) -> Dict[str, Any]:
         logger.error("get_indicator_snapshot(%s) failed: %s", stock_code, e)
         return {"error": str(e)}
 
-
 # ── OpenAI tool declarations ─────────────────────────────────
 
 # Legacy list — kept for backward compat during migration; safe to remove later.
-ANALYSIS_TOOLS = []

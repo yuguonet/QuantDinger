@@ -24,7 +24,6 @@ except ImportError as _e:
     _TRADING_DEPS_ERROR = str(_e)
     logger.warning("[trading_tools] 依赖缺失: %s — 交易功能不可用", _e)
 
-
 # ── Tool functions ────────────────────────────────────────────
 
 @tool(
@@ -66,7 +65,6 @@ def list_strategies(user_id: int = 1) -> Dict[str, Any]:
         logger.error("list_strategies failed: %s", e, exc_info=True)
         return {"strategies": [], "count": 0, "error": str(e)}
 
-
 @tool(
     description="获取策略的详细配置信息（类型、交易对、指标、参数、状态等）。",
     category="交易",
@@ -101,7 +99,6 @@ def get_strategy_detail(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
     except Exception as e:
         logger.error("get_strategy_detail failed: %s", e, exc_info=True)
         return {"success": False, "error": str(e)}
-
 
 @tool(
     description="启动一个交易策略，开始按指标信号自动执行买卖操作。",
@@ -158,7 +155,6 @@ def start_strategy(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
         logger.error("start_strategy failed: %s", e, exc_info=True)
         return {"success": False, "error": f"启动失败: {e}"}
 
-
 @tool(
     description="停止一个正在运行的交易策略。",
     category="交易",
@@ -205,7 +201,6 @@ def stop_strategy(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
     except Exception as e:
         logger.error("stop_strategy failed: %s", e, exc_info=True)
         return {"success": False, "error": f"停止失败: {e}"}
-
 
 @tool(
     description="获取策略的最近交易记录，包含买卖价格、数量、盈亏等。",
@@ -256,8 +251,6 @@ def get_strategy_trades(
         logger.error("get_strategy_trades failed: %s", e, exc_info=True)
         return {"trades": [], "count": 0, "error": str(e)}
 
-
 # ── OpenAI tool declarations ─────────────────────────────────
 
 # Legacy list — kept for backward compat during migration; safe to remove later.
-TRADING_TOOLS = []

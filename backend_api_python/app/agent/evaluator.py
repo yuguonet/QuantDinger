@@ -192,11 +192,145 @@ def evaluate(
     result.chain_tools = [s["tool"] for s in tool_chain] if tool_chain else []
     result.chain_length = len(tool_chain)
 
-    # ── Coding domain 专用评估 ────────────────────────────────
+    # ── 领域专用评估 ──────────────────────────────────────────
     if domain == "coding":
         return _evaluate_coding(agent_result, result, tool_chain, verb, noun)
+    if domain in ("finance", "trading"):
+        return _evaluate_finance(agent_result, result, tool_chain, verb, noun, domain)
 
-    # ── 提取实际调用的工具 ────────────────────────────────────
+    # ── 通用评估（无领域或未知领域） ──────────────────────────
+    return _evaluate_generic(agent_result, result, tool_chain, verb, noun)
+
+
+def _evaluate_finance(agent_result, result, tool_chain, verb, noun, domain) -> EvalResult:
+    """Finance / Trading 域专用评估逻辑。
+
+    评估信号：
+      1. 工具调用成功率
+      2. 数据获取完整性 — 是否调用了行情/指标类工具获取真实数据
+      3. 分析链路完整度 — 数据→分析→决策 的流程是否合理
+      4. final_answer 是否生成
+      5. 响应是否包含实际市场数据
+    """
+    actual_tools = []
+    tool_successes = 0
+    tool_failures = 0
+    data_tools_used = set()
+    analysis_tools_used = set()
+    trading_tools_used = set()
+
+    # 金融域工具分类
+    _DATA_TOOLS = {
+        "get_realtime_quote", "agent_get_kline", "get_stock_info",
+        "get_market_indices", "get_sector_rankings", "get_fund_flow",
+        "get_chip_distribution", "get_market_overview", "get_hot_sectors",
+        "resolve_stock_name", "search_stock_by_name",
+    }
+    _ANALYSIS_TOOLS = {
+        "analyze_trend", "get_indicator_snapshot", "calculate_ma",
+        "get_volume_analysis", "analyze_pattern", "generate_kline_chart",
+        "search_stock_news", "search_comprehensive_intel",
+        "get_dragon_tiger_stocks", "get_polymarket_analysis",
+    }
+    _TRADING_TOOLS = {
+        "execute_trade", "place_order", "cancel_order",
+        "get_positions", "get_account_balance", "get_order_status",
+        "run_backtest", "run_quick_backtest",
+    }
+
+    if agent_result.tool_calls_log:
+        for tc in agent_result.tool_calls_log:
+            tool_name = tc.get("tool", "")
+            if tool_name and tool_name != "final_answer":
+                actual_tools.append(tool_name)
+                if tc.get("success", True):
+                    tool_successes += 1
+                else:
+                    tool_failures += 1
+                if tool_name in _DATA_TOOLS:
+                    data_tools_used.add(tool_name)
+                if tool_name in _ANALYSIS_TOOLS:
+                    analysis_tools_used.add(tool_name)
+                if tool_name in _TRADING_TOOLS:
+                    trading_tools_used.add(tool_name)
+
+    result.actual_tools = actual_tools
+    result.steps_taken = agent_result.total_steps or 0
+    result.has_final_answer = bool(agent_result.content and agent_result.content.strip())
+    result._tool_calls_log = list(agent_result.tool_calls_log or [])
+
+    # ── 信号 1: 工具调用成功率 ────────────────────────────────
+    total_calls = tool_successes + tool_failures
+    if total_calls > 0:
+        result.tool_success_rate = tool_successes / total_calls
+    else:
+        result.tool_success_rate = 1.0
+
+    score_tool_success = 0
+    if result.tool_success_rate >= 0.8:
+        score_tool_success = 2
+    elif result.tool_success_rate >= 0.5:
+        score_tool_success = 0
+    else:
+        score_tool_success = -2
+
+    # ── 信号 2: 数据获取完整性 ────────────────────────────────
+    # 金融分析必须先拿到行情数据
+    score_data = 0
+    if data_tools_used:
+        score_data = 2  # 拿到了行情数据
+    elif total_calls > 0 and not data_tools_used:
+        score_data = -1  # 有工具调用但没拿数据
+
+    # ── 信号 3: 分析链路完整度 ────────────────────────────────
+    # 数据→分析 是基本模式；交易域还需要 分析→执行
+    score_workflow = 0
+    if data_tools_used and analysis_tools_used:
+        score_workflow = 2  # 拿数据+做分析，流程完整
+    elif data_tools_used and not analysis_tools_used:
+        score_workflow = 1  # 拿了数据但没分析（可能简单查询）
+    elif analysis_tools_used and not data_tools_used:
+        score_workflow = -1  # 没数据就分析，可能用的假数据
+    if domain == "trading" and trading_tools_used:
+        score_workflow += 1  # 交易域有执行动作，加分
+
+    # ── 信号 4: final_answer ──────────────────────────────────
+    score_answer = 2 if result.has_final_answer else -2
+
+    # ── 信号 5: 响应是否包含实际市场数据 ──────────────────────
+    content = agent_result.content or ""
+    result.has_real_data = _contains_real_data(content)
+    score_real = 1 if result.has_real_data else 0
+
+    # ── 综合评分 ──────────────────────────────────────────────
+    result.score = score_tool_success + score_data + score_workflow + score_answer + score_real
+
+    # ── 判定 ─────────────────────────────────────────────────
+    if result.score >= 3:
+        result.verdict = "success"
+    elif result.score <= -2:
+        result.verdict = "failure"
+    else:
+        result.verdict = "grey"
+
+    result.details = (
+        f"tools={score_tool_success} data={score_data} workflow={score_workflow} "
+        f"answer={score_answer} real={score_real} → total={result.score} "
+        f"(data_tools={data_tools_used} analysis_tools={analysis_tools_used} "
+        f"trading_tools={trading_tools_used})"
+    )
+
+    logger.info(
+        "[Eval] %s/%s+%s verdict=%s score=%d steps=%d tools=%d/%d %s",
+        domain, verb, noun, result.verdict, result.score,
+        result.steps_taken, tool_successes, total_calls,
+        result.details,
+    )
+    return result
+
+
+def _evaluate_generic(agent_result, result, tool_chain, verb, noun) -> EvalResult:
+    """通用评估逻辑（无特定领域）。"""
     actual_tools = []
     tool_successes = 0
     tool_failures = 0
@@ -221,7 +355,7 @@ def evaluate(
     if total_calls > 0:
         result.tool_success_rate = tool_successes / total_calls
     else:
-        result.tool_success_rate = 1.0  # 没调工具不算失败
+        result.tool_success_rate = 1.0
 
     score_tool_success = 0
     if result.tool_success_rate >= 0.8:
@@ -238,11 +372,11 @@ def evaluate(
         covered = chain_set & actual_set
         result.chain_coverage = len(covered) / len(chain_set)
     else:
-        result.chain_coverage = 1.0  # 没有 chain 不扣分
+        result.chain_coverage = 1.0
 
     score_chain = 0
     if not chain_set:
-        score_chain = 0  # 无 chain，不评分
+        score_chain = 0
     elif result.chain_coverage >= 0.8:
         score_chain = 1
     elif result.chain_coverage >= 0.5:
@@ -254,21 +388,21 @@ def evaluate(
     if result.chain_length > 0:
         result.step_efficiency = result.steps_taken / result.chain_length
     else:
-        result.step_efficiency = 0  # 无 chain，不评分
+        result.step_efficiency = 0
 
     score_steps = 0
     if result.chain_length == 0:
-        score_steps = 0  # 无 chain，不评分
+        score_steps = 0
     elif result.steps_taken <= result.chain_length + 1:
-        score_steps = 2  # 精准执行
+        score_steps = 2
     elif result.steps_taken <= result.chain_length * 1.5:
-        score_steps = 1  # 略有探索
+        score_steps = 1
     elif result.steps_taken <= result.chain_length * 2:
-        score_steps = 0  # 效率一般
+        score_steps = 0
     elif result.steps_taken <= result.chain_length * 3:
-        score_steps = -2  # 严重低效
+        score_steps = -2
     else:
-        score_steps = -3  # chain 基本没用
+        score_steps = -3
 
     # ── 信号 4: final_answer ──────────────────────────────────
     score_answer = 2 if result.has_final_answer else -2

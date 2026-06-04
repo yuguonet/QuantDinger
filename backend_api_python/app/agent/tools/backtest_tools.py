@@ -28,7 +28,6 @@ except ImportError as _e:
     _BACKTEST_DEPS_ERROR = str(_e)
     logger.warning("[backtest_tools] 依赖缺失: %s — 回测功能不可用", _e)
 
-
 # ── Tool functions ────────────────────────────────────────────
 
 @tool(
@@ -145,7 +144,6 @@ def run_backtest(
         logger.error("run_backtest failed: %s", e, exc_info=True)
         return {"success": False, "error": f"回测执行失败: {e}"}
 
-
 @tool(
     description="查询策略的历史回测记录列表（即过去跑过的回测任务结果）。注意：这不是获取K线数据的工具，获取K线请用 agent_get_kline。",
     category="回测",
@@ -206,6 +204,4 @@ def get_backtest_history(
         logger.error("get_backtest_history failed: %s", e, exc_info=True)
         return {"runs": [], "count": 0, "error": str(e)}
 
-
 # Legacy list — kept for backward compat during migration; safe to remove later.
-BACKTEST_TOOLS = []

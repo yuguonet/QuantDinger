@@ -240,18 +240,17 @@ _TOOLS_CACHE_TTL = int(os.getenv("TOOLS_CACHE_TTL", "300"))  # 5 minutes default
 
 
 def _load_quantdinger_tools(config: Dict = None) -> List[Tool]:
-    """Load QuantDinger tools via registry (@tool decorators) + legacy _TOOLS lists.
+    """Load QuantDinger tools via registry (@tool decorators).
 
-    Phase 1 (now): registry.discover() triggers @tool registrations AND imports
-    modules so legacy _TOOLS lists are populated. Both paths produce Tool instances.
-    Phase 2 (after full migration): remove legacy fallback, keep only registry.build().
+    All tools are registered through the @tool decorator in registry.py.
+    Legacy _TOOLS lists have been fully migrated.
     """
     from app.agent.tools.registry import registry
 
     # Discover @tool-decorated functions (also imports all tool modules)
     registry.discover()
 
-    # Registry tools (decorated functions)
+    # Build tools with policy filtering
     registry_config = dict(config or {})
     if _EXCLUDED_TOOL_NAMES:
         extra_deny = set(registry_config.get("deny", []))
@@ -259,33 +258,6 @@ def _load_quantdinger_tools(config: Dict = None) -> List[Tool]:
         registry_config["deny"] = list(extra_deny)
     tools = registry.build(registry_config)
     logger.info("[ToolAdapter] Registry tools: %d", len(tools))
-
-    # Legacy fallback: collect *_TOOLS lists from modules that haven't migrated yet
-    registered_names = set(registry.all_names)
-    import importlib
-    import pathlib
-    tools_dir = pathlib.Path(__file__).resolve().parent / "tools"
-    for py_file in sorted(tools_dir.glob("*.py")):
-        if py_file.name.startswith("_"):
-            continue
-        try:
-            mod = importlib.import_module(f"app.agent.tools.{py_file.stem}")
-        except Exception:
-            continue
-        for attr in dir(mod):
-            if attr.endswith("_TOOLS") and attr[0].isupper():
-                val = getattr(mod, attr)
-                if isinstance(val, list):
-                    for spec in val:
-                        tool_name = spec.get("name", "")
-                        if tool_name and tool_name not in registered_names:
-                            if tool_name not in _EXCLUDED_TOOL_NAMES:
-                                try:
-                                    tools.append(load_tools_from_module([spec])[0])
-                                    registered_names.add(tool_name)
-                                except Exception:
-                                    pass
-                    break
 
     return tools
 

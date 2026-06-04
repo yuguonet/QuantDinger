@@ -14,7 +14,6 @@ from app.agent.tools.registry import tool
 
 logger = logging.getLogger(__name__)
 
-
 # ═══════════════════════════════════════════════════════════════
 # 转接适配层 — 对齐原 fetch_financial_news() 接口
 # ═══════════════════════════════════════════════════════════════
@@ -25,7 +24,6 @@ def _detect_lang_from_text(text: str, default: str = "cn") -> str:
         return default
     cn_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
     return "cn" if cn_chars / max(len(text), 1) > 0.15 else "en"
-
 
 def fetch_financial_news(
     lang: str = "all",
@@ -80,7 +78,6 @@ def fetch_financial_news(
 
     return result
 
-
 # ═══════════════════════════════════════════════════════════════
 # 工具函数 — 无需改动
 # ═══════════════════════════════════════════════════════════════
@@ -100,7 +97,6 @@ def _extract_news_items(resp: Dict) -> List[Dict[str, Any]]:
                 "sentiment_score": item.get("sentiment_score", 0),
             })
     return items
-
 
 @tool(
     description="搜索股票相关新闻、公告、研报。用于获取最新消息面信息。",
@@ -145,7 +141,6 @@ def search_stock_news(stock_code: str, keyword: str = "") -> Dict[str, Any]:
             "retriable": True,
         }
 
-
 @tool(
     description="综合情报搜索：最新消息 + 风险排查 + 业绩预期，多维度获取情报。",
     category="情报搜索",
@@ -177,6 +172,3 @@ def search_comprehensive_intel(stock_code: str) -> Dict[str, Any]:
     except Exception as e:
         logger.error("search_comprehensive_intel(%s) failed: %s", stock_code, e)
         return {"stock_code": stock_code, "error": str(e), "retriable": True}
-
-
-NEWS_SEARCH_TOOLS = []
