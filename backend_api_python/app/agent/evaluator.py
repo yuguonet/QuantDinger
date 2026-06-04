@@ -50,6 +50,7 @@ class EvalResult:
     steps_taken: int = 0              # 实际步数
     chain_length: int = 0             # chain 长度
     details: str = ""                 # 评估说明
+    _tool_calls_log: List[Dict] = field(default_factory=list)  # 原始工具调用日志
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -95,6 +96,7 @@ def evaluate(
     result.actual_tools = actual_tools
     result.steps_taken = agent_result.total_steps or 0
     result.has_final_answer = bool(agent_result.content and agent_result.content.strip())
+    result._tool_calls_log = list(agent_result.tool_calls_log or [])
 
     # ── 信号 1: 工具调用成功率 ────────────────────────────────
     total_calls = tool_successes + tool_failures
@@ -277,24 +279,26 @@ def _record_failure(eval_result: EvalResult, verb: str, noun: str):
     data = _load_failures()
     key = f"{verb}+{noun}"
 
-    # 找出失败的工具
+    # 找出失败的工具（从 tool_calls_log 中提取 success=False 的）
     failed_tools = []
-    if eval_result.actual_tools:
-        for tc_name in eval_result.actual_tools:
-            # 通过 tool_calls_log 找失败的
-            pass  # 简化：直接记录整个 actual_tools
+    if hasattr(eval_result, '_tool_calls_log') and eval_result._tool_calls_log:
+        for tc in eval_result._tool_calls_log:
+            if not tc.get("success", True):
+                failed_tools.append(tc.get("tool", ""))
 
     entry = data.get(key, {"chain": eval_result.actual_tools, "fail_count": 0, "failed_tools": []})
     entry["fail_count"] = entry.get("fail_count", 0) + 1
     entry["last_fail_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
     entry["chain"] = eval_result.actual_tools
     entry["score"] = eval_result.score
+    entry["failed_tools"] = failed_tools or entry.get("failed_tools", [])
     data[key] = entry
 
     _save_failures(data)
     logger.info(
-        "[Learn] %s+%s: 记录失败 (count=%d, score=%d)",
+        "[Learn] %s+%s: 记录失败 (count=%d, score=%d, failed=%s)",
         verb, noun, entry["fail_count"], eval_result.score,
+        failed_tools or "unknown",
     )
 
 

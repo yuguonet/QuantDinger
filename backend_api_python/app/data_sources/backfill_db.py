@@ -602,18 +602,16 @@ class BackfillDB:
 
     # ── 15m 同步主逻辑 ──
 
-    _MAX_SYNC_ROUNDS = 20  # 主循环上限
-
     def _sync_15m(self, symbols: list | None = None, is_first_run: bool = True,
                   force_refetch: bool = False) -> tuple[int, list[str], int, dict[str, str]]:
-        """15m 同步: 只负责拉数据 + 写 kline 表，不操作 cn_last_update。
+        """15m 同步: 单次拉取 + 写 kline 表，不操作 cn_last_update。
 
         1. 首次运行清除当日旧 15m bar
-        2. 通过 kline API 拉取（16 bars/标的）
-        3. 循环拉取，直到全部同步或达到轮次上限
-        4. 返回 (写入条数, 失败symbols列表, 最终同步数, 失败原因dict)
+        2. 通过 kline API 单次拉取（16 bars/标的）
+        3. 返回 (写入条数, 失败symbols列表, 最终同步数, 失败原因dict)
 
         force_refetch=True: 跳过"已同步"检查，强制重新拉取所有传入的 symbols。
+        未覆盖的 symbols 由外层 _run_repair 循环补齐。
         """
         from app.data_sources.normalizer import strip_market_prefix
 
@@ -641,85 +639,67 @@ class BackfillDB:
 
         pool = self.source.db_pool
 
-        # ── 循环拉取 ──
-        total_written = 0
-        round_num = 0
-        first_write_done = False
         failed_reasons: dict[str, str] = {}
 
-        while round_num < self._MAX_SYNC_ROUNDS:
-            round_num += 1
+        # ── 确定待拉取 symbols ──
+        if force_refetch:
+            remaining = list(symbols)
+            deleted = self._delete_symbols_bars(bar_time, remaining, tf="15m")
+            if deleted > 0:
+                logger.info(f"[同步] {self.source.name} 15m force_refetch: 已清除 {deleted} 条旧 bar")
+        else:
+            synced = self._get_synced_symbols(bar_time, tf="15m")
+            remaining = [s for s in symbols if strip_market_prefix(s) not in synced]
 
-            if force_refetch:
-                # force_refetch: 跳过"已同步"检查，强制拉取所有传入的 symbols
-                # 先删除旧记录，确保修复状态准确（不会因旧记录存在而误判为"已同步"）
-                remaining = list(symbols)
-                deleted = self._delete_symbols_bars(bar_time, remaining, tf="15m")
-                if deleted > 0:
-                    logger.info(f"[同步] {self.source.name} 15m force_refetch: 已清除 {deleted} 条旧 bar")
-                force_refetch = False  # 只在第一轮执行
-            else:
-                synced = self._get_synced_symbols(bar_time, tf="15m")
-                remaining = [s for s in symbols if strip_market_prefix(s) not in synced]
+        if not remaining:
+            logger.info(f"[同步] {self.source.name} 15m 所有 {total_symbols} 只已同步")
+            return 0, [], total_symbols, {}
 
-            if not remaining:
-                logger.info(f"[同步] {self.source.name} 15m 所有 {total_symbols} 只已同步")
-                break
+        logger.info(f"[同步] {self.source.name} 15m 待拉取 {len(remaining)}")
 
-            logger.info(
-                f"[同步] {self.source.name} 15m 第 {round_num} 轮，"
-                f"待拉取 {len(remaining)}"
-            )
+        # ── 单次拉取 ──
+        klines = self._fetch_15m_klines(remaining)
+        if not klines:
+            logger.warning(f"[同步] {self.source.name} 15m 拉取返回空数据")
+            for symbol in remaining:
+                failed_reasons.setdefault(symbol, "kline 返回空数据")
+            final_synced = self._get_synced_symbols(bar_time, tf="15m")
+            failed = [s for s in symbols if strip_market_prefix(s) not in final_synced]
+            return 0, failed, len(final_synced), failed_reasons
 
-            klines = self._fetch_15m_klines(remaining)
-            if not klines:
-                logger.warning(f"[同步] {self.source.name} 15m 第 {round_num} 轮返回空数据，停止")
-                for symbol in remaining:
-                    failed_reasons.setdefault(symbol, "kline 返回空数据")
-                break
+        records = self._klines_to_records(remaining, klines, bar_time, failed_reasons)
 
-            records = self._klines_to_records(remaining, klines, bar_time, failed_reasons)
+        if not records:
+            logger.info(f"[同步] {self.source.name} 15m 无有效记录")
+            final_synced = self._get_synced_symbols(bar_time, tf="15m")
+            failed = [s for s in symbols if strip_market_prefix(s) not in final_synced]
+            return 0, failed, len(final_synced), failed_reasons
 
-            if not records:
-                logger.info(f"[同步] {self.source.name} 15m 第 {round_num} 轮 0 新增，停止")
-                break
+        # 首次运行: 写入前删除当日旧数据（删和写紧挨，最小化丢数据窗口）
+        if is_first_run:
+            deleted = self._delete_bars(bar_time, tf="15m")
+            if deleted > 0:
+                logger.info(f"[同步] {self.source.name} 15m 首次运行，已清除当日 {deleted} 条旧 bar")
 
-            # 首次运行: 写入前删除当日旧数据（删和写紧挨，最小化丢数据窗口）
-            if is_first_run and not first_write_done:
-                deleted = self._delete_bars(bar_time, tf="15m")
-                if deleted > 0:
-                    logger.info(f"[同步] {self.source.name} 15m 首次运行，已清除当日 {deleted} 条旧 bar")
-                first_write_done = True
-
-            try:
-                r = self._writer.bulk_write(self.source.market, records)
-                round_written = r.get("inserted", 0) + r.get("skipped", 0)
-            except Exception as e:
-                logger.error(f"[同步] {self.source.name} 15m 第 {round_num} 轮写入失败: {e}")
-                break
-
-            total_written += round_written
-            synced_now = self._get_synced_symbols(bar_time, tf="15m")
-            logger.info(
-                f"[同步] {self.source.name} 15m 第 {round_num} 轮 "
-                f"写入 {round_written}，累计 {len(synced_now)}/{total_symbols}"
-            )
-
-            if len(synced_now) >= total_symbols:
-                break
+        # 写入
+        try:
+            r = self._writer.bulk_write(self.source.market, records)
+            total_written = r.get("inserted", 0) + r.get("skipped", 0)
+        except Exception as e:
+            logger.error(f"[同步] {self.source.name} 15m 写入失败: {e}")
+            final_synced = self._get_synced_symbols(bar_time, tf="15m")
+            failed = [s for s in symbols if strip_market_prefix(s) not in final_synced]
+            return 0, failed, len(final_synced), failed_reasons
 
         # ── 统计 ──
         final_synced = self._get_synced_symbols(bar_time, tf="15m")
         final_count = len(final_synced)
         failed = [s for s in symbols if strip_market_prefix(s) not in final_synced]
 
-        if round_num >= self._MAX_SYNC_ROUNDS and failed:
-            logger.warning(f"[同步] {self.source.name} 15m 达到轮次上限 {self._MAX_SYNC_ROUNDS}，剩余 {len(failed)} 只未同步")
-
         if failed:
             logger.warning(
                 f"[同步] {self.source.name} 15m 完成，"
-                f"共 {round_num} 轮，写入 {total_written}，"
+                f"写入 {total_written}，"
                 f"同步 {final_count}/{total_symbols}，失败 {len(failed)}"
             )
             for sym in failed[:20]:
@@ -730,24 +710,24 @@ class BackfillDB:
         else:
             logger.info(
                 f"[同步] {self.source.name} 15m 完成，"
-                f"共 {round_num} 轮，写入 {total_written}，"
+                f"写入 {total_written}，"
                 f"同步 {final_count}/{total_symbols}，无失败"
             )
 
         return total_written, failed, final_count, failed_reasons
 
-    # ── 1D 同步: batch_quotes + 重试 + 去重 ──────────────────
+    # ── 1D 同步: batch_quotes 单次拉取 ──────────────────
 
     def _sync_1d(self, symbols: list | None = None, is_first_run: bool = True,
                  force_refetch: bool = False) -> tuple[int, list[str], int, dict[str, str]]:
-        """1D 同步: 只负责拉数据 + 写 kline 表，不操作 cn_last_update。
+        """1D 同步: 单次拉取 + 写 kline 表，不操作 cn_last_update。
 
         - 首次运行 (is_first_run=True):  删除当日 bar → 全量拉取 → 写入
         - 后续重试 (is_first_run=False): 跳过已写入 symbols → 只补拉缺失部分
-        - 循环拉取，直到全部同步或达到轮次上限
         - 返回 (写入条数, 失败symbols列表, 最终同步数, 失败原因dict)
 
         force_refetch=True: 跳过"已同步"检查，强制重新拉取所有传入的 symbols。
+        未覆盖的 symbols 由外层 _run_repair 循环补齐。
         """
         from app.data_sources.coordinator import get_coordinator
         from app.data_sources.normalizer import strip_market_prefix
@@ -776,123 +756,97 @@ class BackfillDB:
 
         pool = self.source.db_pool
 
-        # ── 循环拉取，直到全部同步或 0 新增 ──
-        total_written = 0
-        round_num = 0
-        first_write_done = False
-        failed_reasons: dict[str, str] = {}  # symbol → 失败原因
+        failed_reasons: dict[str, str] = {}
 
-        while round_num < self._MAX_SYNC_ROUNDS:
-            round_num += 1
+        # ── 确定待拉取 symbols ──
+        if force_refetch:
+            remaining = list(symbols)
+            deleted = self._delete_symbols_bars(bar_time, remaining, tf="1D")
+            if deleted > 0:
+                logger.info(f"[同步] {self.source.name} 1D force_refetch: 已清除 {deleted} 条旧 bar")
+        else:
+            synced = self._get_synced_symbols(bar_time, tf="1D")
+            remaining = [s for s in symbols if strip_market_prefix(s) not in synced]
 
-            # 查已同步 symbols，计算待拉取
-            if force_refetch:
-                # force_refetch: 跳过"已同步"检查，强制拉取所有传入的 symbols
-                # 先删除旧记录，确保修复状态准确（不会因旧记录存在而误判为"已同步"）
-                remaining = list(symbols)
-                deleted = self._delete_symbols_bars(bar_time, remaining, tf="1D")
-                if deleted > 0:
-                    logger.info(f"[同步] {self.source.name} 1D force_refetch: 已清除 {deleted} 条旧 bar")
-                force_refetch = False  # 只在第一轮执行
-            else:
-                synced = self._get_synced_symbols(bar_time, tf="1D")
-                remaining = [s for s in symbols if strip_market_prefix(s) not in synced]
+        if not remaining:
+            logger.info(f"[同步] {self.source.name} 1D 所有 {total_symbols} 只已同步")
+            return 0, [], total_symbols, {}
 
-            if not remaining:
-                logger.info(f"[同步] {self.source.name} 1D 所有 {total_symbols} 只已同步")
-                break
+        logger.info(f"[同步] {self.source.name} 1D 待拉取 {len(remaining)}")
 
-            logger.info(
-                f"[同步] {self.source.name} 1D 第 {round_num} 轮，"
-                f"待拉取 {len(remaining)}"
-            )
+        # ── 单次拉取 ──
+        quotes = coord.coordinate_batch_quotes(
+            symbols=remaining,
+            market=self.source.market,
+            timeout=float(_BATCH_TIMEOUT),
+        )
 
-            quotes = coord.coordinate_batch_quotes(
-                symbols=remaining,
-                market=self.source.market,
-                timeout=float(_BATCH_TIMEOUT),
-            )
-
-            if not quotes:
-                logger.warning(
-                    f"[同步] {self.source.name} 1D 第 {round_num} 轮返回空数据，停止"
-                )
-                for symbol in remaining:
-                    failed_reasons.setdefault(symbol, "provider 返回空数据")
-                break
-
-            # List[Dict] → 按 symbol 索引（每条 quote 含 symbol 字段）
-            quote_map = {q["symbol"]: q for q in quotes if q.get("symbol")}
-
-            # 转换本轮结果
-            records: list[dict] = []
+        if not quotes:
+            logger.warning(f"[同步] {self.source.name} 1D 拉取返回空数据")
             for symbol in remaining:
-                quote = quote_map.get(symbol)
-                if not quote:
-                    quote = quote_map.get(strip_market_prefix(symbol))
+                failed_reasons.setdefault(symbol, "provider 返回空数据")
+            final_synced = self._get_synced_symbols(bar_time, tf="1D")
+            failed = [s for s in symbols if strip_market_prefix(s) not in final_synced]
+            return 0, failed, len(final_synced), failed_reasons
 
-                if not quote:
-                    failed_reasons.setdefault(symbol, "无行情数据")
-                    continue
+        # List[Dict] → 按 symbol 索引
+        quote_map = {q["symbol"]: q for q in quotes if q.get("symbol")}
 
-                ohlcv = self._parse_ohlcv(quote)
-                if ohlcv is None:
-                    failed_reasons.setdefault(symbol, "OHLCV 无效(停牌/退市/价格异常)")
-                    continue
-                o, h, l, c, v = ohlcv
+        # 转换
+        records: list[dict] = []
+        for symbol in remaining:
+            quote = quote_map.get(symbol)
+            if not quote:
+                quote = quote_map.get(strip_market_prefix(symbol))
 
-                records.append({
-                    "symbol": strip_market_prefix(symbol),
-                    "timeframe": "1D",
-                    "time": bar_time,
-                    "open": o, "high": h, "low": l, "close": c, "volume": v,
-                })
+            if not quote:
+                failed_reasons.setdefault(symbol, "无行情数据")
+                continue
 
-            # 本轮 0 新增 → 剩余的拉不到了，停止
-            if not records:
-                logger.info(
-                    f"[同步] {self.source.name} 1D 第 {round_num} 轮 0 新增，停止"
-                )
-                break
+            ohlcv = self._parse_ohlcv(quote)
+            if ohlcv is None:
+                failed_reasons.setdefault(symbol, "OHLCV 无效(停牌/退市/价格异常)")
+                continue
+            o, h, l, c, v = ohlcv
 
-            # 首次运行: 写入前删除当日旧数据（删和写紧挨，最小化丢数据窗口）
-            if is_first_run and not first_write_done:
-                deleted = self._delete_bars(bar_time, tf="1D")
-                if deleted > 0:
-                    logger.info(f"[同步] {self.source.name} 1D 首次运行，已清除当日 {deleted} 条旧 bar")
-                first_write_done = True
+            records.append({
+                "symbol": strip_market_prefix(symbol),
+                "timeframe": "1D",
+                "time": bar_time,
+                "open": o, "high": h, "low": l, "close": c, "volume": v,
+            })
 
-            # 写入
-            try:
-                r = self._writer.bulk_write(self.source.market, records)
-                round_written = r.get("inserted", 0) + r.get("skipped", 0)
-            except Exception as e:
-                logger.error(f"[同步] {self.source.name} 1D 第 {round_num} 轮写入失败: {e}")
-                break
+        if not records:
+            logger.info(f"[同步] {self.source.name} 1D 无有效记录")
+            final_synced = self._get_synced_symbols(bar_time, tf="1D")
+            failed = [s for s in symbols if strip_market_prefix(s) not in final_synced]
+            return 0, failed, len(final_synced), failed_reasons
 
-            total_written += round_written
-            synced_now = self._get_synced_symbols(bar_time, tf="1D")
-            logger.info(
-                f"[同步] {self.source.name} 1D 第 {round_num} 轮 "
-                f"写入 {round_written}，累计 {len(synced_now)}/{total_symbols}"
-            )
+        # 首次运行: 写入前删除当日旧数据
+        if is_first_run:
+            deleted = self._delete_bars(bar_time, tf="1D")
+            if deleted > 0:
+                logger.info(f"[同步] {self.source.name} 1D 首次运行，已清除当日 {deleted} 条旧 bar")
 
-            # 全部完成
-            if len(synced_now) >= total_symbols:
-                break
+        # 写入
+        try:
+            r = self._writer.bulk_write(self.source.market, records)
+            total_written = r.get("inserted", 0) + r.get("skipped", 0)
+        except Exception as e:
+            logger.error(f"[同步] {self.source.name} 1D 写入失败: {e}")
+            final_synced = self._get_synced_symbols(bar_time, tf="1D")
+            failed = [s for s in symbols if strip_market_prefix(s) not in final_synced]
+            return 0, failed, len(final_synced), failed_reasons
 
         # ── 统计 ──
         final_synced = self._get_synced_symbols(bar_time, tf="1D")
         final_count = len(final_synced)
         failed = [s for s in symbols if strip_market_prefix(s) not in final_synced]
 
-        if round_num >= self._MAX_SYNC_ROUNDS and failed:
-            logger.warning(f"[同步] {self.source.name} 1D 达到轮次上限 {self._MAX_SYNC_ROUNDS}，剩余 {len(failed)} 只未同步")
-
         if failed:
             logger.warning(
                 f"[同步] {self.source.name} 1D 完成，"
-                f"共 {round_num} 轮，写入 {total_written}，"
+                f"写入 {total_written}，"
                 f"同步 {final_count}/{total_symbols}，失败 {len(failed)}"
             )
             for sym in failed[:20]:
@@ -903,7 +857,7 @@ class BackfillDB:
         else:
             logger.info(
                 f"[同步] {self.source.name} 1D 完成，"
-                f"共 {round_num} 轮，写入 {total_written}，"
+                f"写入 {total_written}，"
                 f"同步 {final_count}/{total_symbols}，无失败"
             )
 
@@ -1063,7 +1017,7 @@ def _extract_failed_symbols_from_report(report_text: str) -> list[str]:
     """
     if not report_text:
         return []
-    m = _re.search(r"失败标的\(\d+\):\s*([^\s;]+)", report_text)
+    m = _re.search(r"失败标的$$\d+$$:\s*([^\s;]+)", report_text)
     if m:
         return [s.strip() for s in m.group(1).split(",") if s.strip()]
     return []

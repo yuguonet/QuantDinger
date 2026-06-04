@@ -10,6 +10,7 @@ import uuid
 import threading
 import queue
 import tempfile
+import time
 from typing import Any, Dict, Optional
 from pathlib import Path
 
@@ -273,14 +274,8 @@ def agent_chat_stream():
             def _run():
                 try:
                     executor = _build_executor(skills, user_id)
-                    # Register for interrupt support
-                    from app.agent.agent import get_smolagent as _get_agent
-                    _agent = _get_agent(
-                        skills=skills, user_id=user_id,
-                        max_steps=int(os.getenv("AGENT_MAX_STEPS", "10")),
-                        user_message=message,
-                    )
-                    register_interrupt(session_id, _agent)
+                    # Store executor for interrupt support
+                    _run._executor = executor
                     try:
                         for ev in executor.chat_stream(
                             message=message, session_id=session_id,
@@ -293,8 +288,23 @@ def agent_chat_stream():
                     logger.error("Agent stream error: %s", exc, exc_info=True)
                     event_queue.put({"type": "error", "message": str(exc)})
 
+            _run._executor = None
             t = threading.Thread(target=_run, daemon=True)
             t.start()
+
+            # Wait for agent to be ready, then register interrupt
+            try:
+                # Poll for executor to be set (thread may not have started yet)
+                for _ in range(50):
+                    if _run._executor is not None:
+                        break
+                    time.sleep(0.05)
+                executor_ref = _run._executor
+                if executor_ref and executor_ref._agent_ready_event.wait(timeout=30):
+                    if executor_ref._current_agent:
+                        register_interrupt(session_id, executor_ref._current_agent)
+            except Exception as e:
+                logger.debug("Interrupt registration failed (non-fatal): %s", e)
 
             try:
                 while True:
@@ -304,6 +314,13 @@ def agent_chat_stream():
                         if ev.get("type") in ("done", "error"):
                             break
                     except queue.Empty:
+                        # Timeout — try to interrupt the running agent
+                        try:
+                            executor_ref = _run._executor
+                            if executor_ref and executor_ref._current_agent:
+                                executor_ref._current_agent.interrupt()
+                        except Exception:
+                            pass
                         yield f"data: {json.dumps({'type': 'error', 'message': '分析超时'}, ensure_ascii=False)}\n\n"
                         break
             finally:

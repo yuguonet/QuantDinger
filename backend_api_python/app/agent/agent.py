@@ -41,9 +41,10 @@ _EXCLUDED_TOOL_NAMES = {
     "get_limit_down_stocks", "get_broken_board_stocks",
 }
 
-# ── Per-user agent cache ──────────────────────────────────────
-_agent_cache: Dict[str, Any] = {}  # key: user_id
-_cached_signatures: Dict[str, str] = {}  # key: user_id → sig
+# ── Per-user agent cache (tools + managed agents only) ────────
+_tools_cache_by_domain: Dict[str, List] = {}       # key: domain → tools list
+_managed_agents_cache: Dict[str, list] = {}         # key: model_provider → managed agents
+_tools_cache_lock = __import__("threading").Lock()
 
 
 def _get_agent_class():
@@ -117,10 +118,9 @@ from app.agent.skills.guidance import GUIDANCE
 def _load_preamble() -> str:
     """Load agent preamble from external .md file, with built-in fallback."""
     import pathlib
-    # Try project root first, then backend_api_python/
     candidates = [
         pathlib.Path(__file__).resolve().parent / "agent_preamble.md",
-        pathlib.Path(__file__).resolve().parent / "agent_preamble.md",
+        pathlib.Path(__file__).resolve().parent.parent.parent / "agent_preamble.md",
     ]
     for p in candidates:
         if p.is_file():
@@ -453,51 +453,60 @@ def get_smolagent(
     intent_context: str = "",
     tool_categories: Optional[List[str]] = None,
 ) -> "CodeAgent | ToolCallingAgent":
-    """Build or retrieve an agent instance per user.
+    """Build a fresh agent instance per call.
 
-    Cache key = user_id + domain, so different domains get
-    optimally-filtered tool sets cached independently.
+    Caches only the expensive parts (tools discovery, managed agents).
+    Agent instance is always rebuilt to avoid cross-session state pollution.
     """
-    global _agent_cache, _cached_signatures
-
     skill_instructions = get_indicator_skill_instructions(skills, user_id)
     smol_model = build_model(model=model, provider=provider)
 
-    # ── 按领域过滤工具 ────────────────────────────────────────
-    from app.agent.tools.registry import registry as tool_registry
-    tool_registry.discover()
-    if domain:
-        tools = tool_registry.build({"domain": domain, "deny": list(_EXCLUDED_TOOL_NAMES)})
-    else:
-        tools = tool_registry.build({"deny": list(_EXCLUDED_TOOL_NAMES)})
+    # ── 按领域过滤工具（缓存） ────────────────────────────────
+    domain_key = domain or "all"
+    with _tools_cache_lock:
+        if domain_key not in _tools_cache_by_domain:
+            from app.agent.tools.registry import registry as tool_registry
+            tool_registry.discover()
+            if domain:
+                tools = tool_registry.build({"domain": domain, "deny": list(_EXCLUDED_TOOL_NAMES)})
+            else:
+                tools = tool_registry.build({"deny": list(_EXCLUDED_TOOL_NAMES)})
 
-    # Legacy fallback: collect tools not yet migrated to registry
-    import importlib, pathlib as _pl
-    registered_names = set(tool_registry.all_names)
-    tools_dir = _pl.Path(__file__).resolve().parent / "tools"
-    for py_file in sorted(tools_dir.glob("*.py")):
-        if py_file.name.startswith("_"):
-            continue
-        try:
-            mod = importlib.import_module(f"app.agent.tools.{py_file.stem}")
-        except Exception:
-            continue
-        for attr in dir(mod):
-            if attr.endswith("_TOOLS") and attr[0].isupper():
-                val = getattr(mod, attr)
-                if isinstance(val, list):
-                    for spec in val:
-                        tool_name = spec.get("name", "")
-                        if tool_name and tool_name not in registered_names and tool_name not in _EXCLUDED_TOOL_NAMES:
-                            try:
-                                from app.agent.tool_adapter import load_tools_from_module
-                                tools.append(load_tools_from_module([spec])[0])
-                                registered_names.add(tool_name)
-                            except Exception:
-                                pass
-                    break
+            # Legacy fallback: collect tools not yet migrated to registry
+            import importlib, pathlib as _pl
+            registered_names = set(tool_registry.all_names)
+            tools_dir = _pl.Path(__file__).resolve().parent / "tools"
+            for py_file in sorted(tools_dir.glob("*.py")):
+                if py_file.name.startswith("_"):
+                    continue
+                try:
+                    mod = importlib.import_module(f"app.agent.tools.{py_file.stem}")
+                except Exception:
+                    continue
+                for attr in dir(mod):
+                    if attr.endswith("_TOOLS") and attr[0].isupper():
+                        val = getattr(mod, attr)
+                        if isinstance(val, list):
+                            for spec in val:
+                                tool_name = spec.get("name", "")
+                                if tool_name and tool_name not in registered_names and tool_name not in _EXCLUDED_TOOL_NAMES:
+                                    try:
+                                        from app.agent.tool_adapter import load_tools_from_module
+                                        tools.append(load_tools_from_module([spec])[0])
+                                        registered_names.add(tool_name)
+                                    except Exception:
+                                        pass
+                            break
+            _tools_cache_by_domain[domain_key] = tools
+        else:
+            tools = _tools_cache_by_domain[domain_key]
 
-    managed_agents = _build_managed_agents(smol_model)
+    # Managed agents（按 model+provider 缓存）
+    ma_key = f"{model}_{provider}"
+    if ma_key not in _managed_agents_cache:
+        _managed_agents_cache[ma_key] = _build_managed_agents(smol_model)
+    managed_agents = _managed_agents_cache[ma_key]
+
     instructions = _build_instructions(
         user_message, skill_instructions, language, tools, managed_agents,
         domain=domain, domain_instructions=domain_instructions,
@@ -505,21 +514,7 @@ def get_smolagent(
     )
     AgentClass = _get_agent_class()
 
-    # 缓存键 = user_id + domain
-    cache_key = f"{user_id}_{domain or 'all'}"
-    sig = f"{len(tools)}_{model}_{provider}_{cache_key}_{AgentClass.__name__}"
-
-    # ── Cache hit: update instructions only ───────────────────
-    if cache_key in _agent_cache and _cached_signatures.get(cache_key) == sig:
-        agent = _agent_cache[cache_key]
-        agent.instructions = instructions
-        agent.max_steps = max_steps
-        agent.planning_interval = None
-        if hasattr(agent, "_setup_managed_agents"):
-            agent._setup_managed_agents(managed_agents)
-        return agent
-
-    # ── Cache miss: build new agent ───────────────────────────
+    # ── Always build fresh agent (avoid cross-session state pollution) ──
     _extra_kwargs = {}
     if AgentClass is CodeAgent:
         _extra_kwargs["additional_authorized_imports"] = [
@@ -541,11 +536,9 @@ def get_smolagent(
         **_extra_kwargs,
     )
 
-    _agent_cache[cache_key] = agent
-    _cached_signatures[cache_key] = sig
     logger.info(
-        "[Agent] Built %s for user=%s: %d tools, %d managed agents, max_steps=%d",
-        AgentClass.__name__, user_id, len(tools), len(managed_agents), max_steps,
+        "[Agent] Built %s for user=%s domain=%s: %d tools, %d managed agents, max_steps=%d",
+        AgentClass.__name__, user_id, domain_key, len(tools), len(managed_agents), max_steps,
     )
     return agent
 
@@ -588,6 +581,10 @@ class _AgentExecutor:
         self.timeout_seconds = timeout_seconds
         self.model = model
         self.provider = provider
+        # Agent instance — set by _prepare(), used for interrupt support
+        self._current_agent = None
+        import threading as _threading
+        self._agent_ready_event = _threading.Event()
 
     def _prepare(self, message, session_id, context, user_id):
         from app.agent.session_store import get_session_store
@@ -658,6 +655,8 @@ class _AgentExecutor:
         # ── 快速通道：不需要 agent 时直接返回 ────────────────
         if skip_agent:
             store.add_message(session_id, "user", message)
+            # Signal "ready" with no agent (skip path)
+            self._agent_ready_event.set()
             return store, None, message, {"skip_agent": True, "skip_agent_reply": skip_agent_reply}
 
         # ── 提取意图信息，供后置评估使用 ──────────────────────
@@ -704,6 +703,10 @@ class _AgentExecutor:
         # 暂存当前 domain，供压缩线程读取
         if domain:
             store.save_context_summary(session_id, "", domain=domain)
+
+        # Expose agent for interrupt support (set before agent.run starts)
+        self._current_agent = agent
+        self._agent_ready_event.set()
 
         return store, agent, enriched, {
             "skip_agent": False, "skip_agent_reply": "",
@@ -763,6 +766,12 @@ class _AgentExecutor:
                 total_steps = total_tokens = 0
                 tool_calls_log = []
                 charts_b64 = []
+                # Extract chart markers from content even in fallback path
+                import re as _re_fallback
+                if content:
+                    for _cm in _re_fallback.finditer(r'__CHART_B64__([A-Za-z0-9+/=]+)__END_CHART__', content):
+                        charts_b64.append(_cm.group(1))
+                    content = _re_fallback.sub(r'__CHART_B64__[A-Za-z0-9+/=]+__END_CHART__', '', content).strip()
                 success = bool(content)
 
             store.add_message(session_id, "assistant", content)
@@ -842,6 +851,8 @@ class _AgentExecutor:
 
         t0 = time.time()
         _stream_tool_calls = []  # 收集流式执行中的工具调用
+        _stream_tool_call_counter = 0  # Unique ID for each tool call
+        _pending_tool_ids: Dict[str, int] = {}  # tool_name → most recent index
         try:
             for step in agent.run(enriched, max_steps=self.max_steps, stream=True):
                 events = _step_to_events(step)
@@ -854,13 +865,19 @@ class _AgentExecutor:
                         _stream_tool_calls.append({
                             "tool": ev.get("tool", ""),
                             "success": True,  # 先假设成功
+                            "_id": _stream_tool_call_counter,
                         })
+                        _pending_tool_ids[ev.get("tool", "")] = _stream_tool_call_counter
+                        _stream_tool_call_counter += 1
                     elif ev.get("type") == "tool_done":
-                        # 更新最后同名工具的成功状态
-                        for tc in reversed(_stream_tool_calls):
-                            if tc["tool"] == ev.get("tool", ""):
-                                tc["success"] = ev.get("success", True)
-                                break
+                        # Update by unique ID, not name
+                        tool_name = ev.get("tool", "")
+                        pending_id = _pending_tool_ids.pop(tool_name, None)
+                        if pending_id is not None:
+                            for tc in _stream_tool_calls:
+                                if tc.get("_id") == pending_id:
+                                    tc["success"] = ev.get("success", True)
+                                    break
 
                 if isinstance(step, FinalAnswerStep):
                     content = str(step.output) if step.output else ""
@@ -884,9 +901,9 @@ class _AgentExecutor:
                         try:
                             from app.agent.context_compressor import compress_context
                             import threading
-                            def _compress(c=content, sid=session_id, m=self.model):
+                            def _compress(c=content, tc=_stream_tool_calls, sid=session_id, m=self.model):
                                 try:
-                                    summary = compress_context(c, model=m)
+                                    summary = compress_context(c, tc, model=m)
                                 except Exception as e:
                                     logger.warning("[Compress] 压缩异常，降级截断: %s", e)
                                     summary = c[:500]

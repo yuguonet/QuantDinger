@@ -235,6 +235,8 @@ _EXCLUDED_TOOL_NAMES = {
 }
 
 _tools_cache = None  # type: ignore
+_tools_cache_time = 0  # epoch seconds
+_TOOLS_CACHE_TTL = int(os.getenv("TOOLS_CACHE_TTL", "300"))  # 5 minutes default
 
 
 def _load_quantdinger_tools(config: Dict = None) -> List[Tool]:
@@ -291,14 +293,16 @@ def _load_quantdinger_tools(config: Dict = None) -> List[Tool]:
 def build_all_tools(config: Dict = None) -> List[Tool]:
     """Load all tools: QuantDinger built-in + smolagents built-in + Hub + MCP.
 
-    Results are cached after the first call to avoid repeated heavy imports.
+    Results are cached with TTL to allow periodic refresh.
 
     Args:
         config: Optional policy config for registry.build():
             {"allow": [...], "deny": [...]}
     """
-    global _tools_cache
-    if _tools_cache is not None:
+    global _tools_cache, _tools_cache_time
+    import time as _time
+    now = _time.time()
+    if _tools_cache is not None and (now - _tools_cache_time) < _TOOLS_CACHE_TTL:
         return _tools_cache
 
     # 1. QuantDinger tools (registry + legacy fallback)
@@ -316,4 +320,5 @@ def build_all_tools(config: Dict = None) -> List[Tool]:
 
     logger.info("[ToolAdapter] Total tools loaded: %d", len(tools))
     _tools_cache = tools
+    _tools_cache_time = _time.time()
     return tools

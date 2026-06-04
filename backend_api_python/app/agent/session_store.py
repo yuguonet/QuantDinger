@@ -244,6 +244,8 @@ class _RedisStore:
         pipe.delete(self._session_key(session_id))
         pipe.delete(self._conv_key(session_id))
         pipe.delete(self._tool_results_key(session_id))
+        pipe.delete(self._context_summaries_key(session_id))
+        pipe.delete(self._context_domain_key(session_id))
         results = pipe.execute()
         return results[0] > 0
 
