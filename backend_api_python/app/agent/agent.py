@@ -27,10 +27,19 @@ from smolagents import (
 from smolagents.memory import ToolCall
 
 from app.agent.model import build_model
-from app.agent.tool_adapter import build_all_tools
+from app.agent.tool_adapter import build_all_tools, load_tools_from_module
 from app.agent.tool_context import set_tool_context
 
 logger = logging.getLogger(__name__)
+
+# ── Legacy excluded tool names ────────────────────────────────
+_EXCLUDED_TOOL_NAMES = {
+    "screen_stocks", "smart_screen",
+    "get_stock_fund_flow", "batch_get_stock_fund_flow",
+    "get_dragon_tiger_stocks", "get_dragon_tiger_by_stock",
+    "get_hot_rank_stocks", "get_zt_pool_stocks",
+    "get_limit_down_stocks", "get_broken_board_stocks",
+}
 
 # ── Per-user agent cache ──────────────────────────────────────
 _agent_cache: Dict[str, Any] = {}  # key: user_id
@@ -424,10 +433,9 @@ def _build_managed_agents(smol_model) -> list:
 # ═══════════════════════════════════════════════════════════════
 
 def _filter_tools_by_categories(all_tools: List, categories: List[str]) -> List:
-    """按工具分类过滤工具列表（当前未启用，保留供后续使用）。
+    """按工具分类过滤工具列表（已废弃，保留向后兼容）。
 
-    注意：目前分类仅作为 prompt 引导，不过滤工具。
-    agent 始终拥有全部工具，分类帮助它更快定位目标。
+    新方案使用 domain 过滤，见 get_smolagent() 中的 registry.build({"domain": ...})。
     """
     return all_tools
 
@@ -447,20 +455,47 @@ def get_smolagent(
 ) -> "CodeAgent | ToolCallingAgent":
     """Build or retrieve an agent instance per user.
 
-    Cache key = user_id + tool_categories, so different intents get
+    Cache key = user_id + domain, so different domains get
     optimally-filtered tool sets cached independently.
     """
     global _agent_cache, _cached_signatures
 
     skill_instructions = get_indicator_skill_instructions(skills, user_id)
     smol_model = build_model(model=model, provider=provider)
-    all_tools = build_all_tools()
 
-    # ── 按分类过滤工具 ────────────────────────────────────────
-    if tool_categories:
-        tools = _filter_tools_by_categories(all_tools, tool_categories)
+    # ── 按领域过滤工具 ────────────────────────────────────────
+    from app.agent.tools.registry import registry as tool_registry
+    tool_registry.discover()
+    if domain:
+        tools = tool_registry.build({"domain": domain, "deny": list(_EXCLUDED_TOOL_NAMES)})
     else:
-        tools = all_tools
+        tools = tool_registry.build({"deny": list(_EXCLUDED_TOOL_NAMES)})
+
+    # Legacy fallback: collect tools not yet migrated to registry
+    import importlib, pathlib as _pl
+    registered_names = set(tool_registry.all_names)
+    tools_dir = _pl.Path(__file__).resolve().parent / "tools"
+    for py_file in sorted(tools_dir.glob("*.py")):
+        if py_file.name.startswith("_"):
+            continue
+        try:
+            mod = importlib.import_module(f"app.agent.tools.{py_file.stem}")
+        except Exception:
+            continue
+        for attr in dir(mod):
+            if attr.endswith("_TOOLS") and attr[0].isupper():
+                val = getattr(mod, attr)
+                if isinstance(val, list):
+                    for spec in val:
+                        tool_name = spec.get("name", "")
+                        if tool_name and tool_name not in registered_names and tool_name not in _EXCLUDED_TOOL_NAMES:
+                            try:
+                                from app.agent.tool_adapter import load_tools_from_module
+                                tools.append(load_tools_from_module([spec])[0])
+                                registered_names.add(tool_name)
+                            except Exception:
+                                pass
+                    break
 
     managed_agents = _build_managed_agents(smol_model)
     instructions = _build_instructions(
@@ -470,9 +505,8 @@ def get_smolagent(
     )
     AgentClass = _get_agent_class()
 
-    # 缓存键包含工具数量（分类过滤后数量不同 → 不同 agent 实例）
-    cat_key = ",".join(sorted(tool_categories)) if tool_categories else "all"
-    cache_key = f"{user_id}_{cat_key}"
+    # 缓存键 = user_id + domain
+    cache_key = f"{user_id}_{domain or 'all'}"
     sig = f"{len(tools)}_{model}_{provider}_{cache_key}_{AgentClass.__name__}"
 
     # ── Cache hit: update instructions only ───────────────────
@@ -572,6 +606,7 @@ class _AgentExecutor:
         # skip_agent: 意图明确且不需要工具时（如打招呼），直接返回，不进 agent
         skip_agent = False
         skip_agent_reply = ""
+        intent = None  # 供后置评估提取 verb/noun
 
         if os.getenv("INTENT_ANALYSIS_ENABLED", "true").lower() == "true":
             try:
@@ -625,6 +660,15 @@ class _AgentExecutor:
             store.add_message(session_id, "user", message)
             return store, None, message, {"skip_agent": True, "skip_agent_reply": skip_agent_reply}
 
+        # ── 提取意图信息，供后置评估使用 ──────────────────────
+        _eval_verb = ""
+        _eval_noun = ""
+        _eval_tool_chain = []
+        if intent is not None:
+            _eval_verb = getattr(intent, 'verb', '') or ""
+            _eval_noun = getattr(intent, 'noun', '') or ""
+            _eval_tool_chain = (getattr(intent, 'metadata', None) or {}).get("tool_chain", [])
+
         # ── 上下文拼接 ────────────────────────────────────────
         enriched = message
         ctx_parts = []
@@ -661,7 +705,11 @@ class _AgentExecutor:
         if domain:
             store.save_context_summary(session_id, "", domain=domain)
 
-        return store, agent, enriched, {"skip_agent": False, "skip_agent_reply": ""}
+        return store, agent, enriched, {
+            "skip_agent": False, "skip_agent_reply": "",
+            "intent_verb": _eval_verb, "intent_noun": _eval_noun,
+            "tool_chain": _eval_tool_chain,
+        }
 
     def chat(self, message, session_id, context=None,
              progress_callback=None, user_id=1) -> AgentResult:
@@ -677,6 +725,11 @@ class _AgentExecutor:
                 tool_calls_log=[], total_steps=0, total_tokens=0,
                 model="intent-quick-reply", error=None,
             )
+
+        # 保存意图信息，供后置评估使用
+        _intent_verb = meta.get("intent_verb", "")
+        _intent_noun = meta.get("intent_noun", "")
+        _tool_chain = meta.get("tool_chain", [])
 
         t0 = time.time()
         try:
@@ -714,6 +767,13 @@ class _AgentExecutor:
 
             store.add_message(session_id, "assistant", content)
 
+            # ── 后置评估 + 工具链学习闭环 ─────────────────────
+            agent_result_for_eval = AgentResult(
+                success=success, content=content, tool_calls_log=tool_calls_log,
+                total_steps=total_steps, total_tokens=total_tokens,
+            )
+            self._post_evaluate(agent_result_for_eval, _tool_chain, _intent_verb, _intent_noun)
+
             # 异步压缩上下文（不阻塞返回）
             if success and content:
                 try:
@@ -743,6 +803,18 @@ class _AgentExecutor:
             store.add_message(session_id, "assistant", f"[分析失败] {e}")
             return AgentResult(success=False, error=str(e))
 
+    @staticmethod
+    def _post_evaluate(agent_result, tool_chain, verb, noun):
+        """后置评估 + 工具链学习闭环（纯规则，不消耗 agent 步数）。"""
+        if not verb and not noun:
+            return  # 无意图信息，跳过评估
+        try:
+            from app.agent.evaluator import evaluate, learn_from_execution
+            eval_result = evaluate(agent_result, tool_chain, verb, noun)
+            learn_from_execution(eval_result, verb, noun)
+        except Exception as e:
+            logger.warning("[PostEval] 评估异常，不影响返回: %s", e)
+
     def chat_stream(self, message, session_id, context=None,
                     progress_callback=None, user_id=1):
         """Streaming chat — yields SSE event dicts as smolagents produces steps."""
@@ -769,6 +841,7 @@ class _AgentExecutor:
             return
 
         t0 = time.time()
+        _stream_tool_calls = []  # 收集流式执行中的工具调用
         try:
             for step in agent.run(enriched, max_steps=self.max_steps, stream=True):
                 events = _step_to_events(step)
@@ -776,10 +849,35 @@ class _AgentExecutor:
                     if progress_callback:
                         progress_callback(ev)
                     yield ev
+                    # 收集工具调用信息
+                    if ev.get("type") == "tool_start":
+                        _stream_tool_calls.append({
+                            "tool": ev.get("tool", ""),
+                            "success": True,  # 先假设成功
+                        })
+                    elif ev.get("type") == "tool_done":
+                        # 更新最后同名工具的成功状态
+                        for tc in reversed(_stream_tool_calls):
+                            if tc["tool"] == ev.get("tool", ""):
+                                tc["success"] = ev.get("success", True)
+                                break
 
                 if isinstance(step, FinalAnswerStep):
                     content = str(step.output) if step.output else ""
                     store.add_message(session_id, "assistant", content)
+
+                    # ── 后置评估 + 工具链学习闭环 ─────────────
+                    _eval_result = AgentResult(
+                        success=bool(content), content=content,
+                        tool_calls_log=_stream_tool_calls,
+                        total_steps=agent.step_number,
+                    )
+                    self._post_evaluate(
+                        _eval_result,
+                        meta.get("tool_chain", []),
+                        meta.get("intent_verb", ""),
+                        meta.get("intent_noun", ""),
+                    )
 
                     # 压缩上下文
                     if content:

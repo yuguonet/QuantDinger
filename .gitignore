@@ -96,3 +96,6 @@ backend_api_python/app/utils/calendar/
 backend_api_python/app/data/
 *del/
 *.json
+# 工具链学习闭环数据（需要提交）
+!backend_api_python/app/agent/router/tool_chains.json
+!backend_api_python/app/agent/router/tool_chain_failures.json

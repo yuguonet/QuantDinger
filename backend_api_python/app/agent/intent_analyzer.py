@@ -41,16 +41,19 @@ class IntentResult:
     params: Dict[str, Any] = field(default_factory=dict)
     confidence: float = 0.0
     raw_response: str = ""
-    # 新增：路由来源（"semantic" | "llm" | "quick"）
+    # 路由来源（"semantic" | "llm" | "quick"）
     source: str = ""
-    # 新增：路由附带的元数据
+    # 路由附带的元数据
     metadata: Dict[str, Any] = field(default_factory=dict)
-    # 新增：所有路由的得分（调试用）
+    # 所有路由的得分（调试用）
     all_scores: Dict[str, float] = field(default_factory=dict)
-    # 新增：路由耗时（毫秒）
+    # 路由耗时（毫秒）
     elapsed_ms: float = 0.0
-    # 新增：该意图需要的工具分类（对应 @tool(category=...)）
+    # 该意图需要的工具分类（对应 @tool(category=...)）
     tool_categories: List[str] = field(default_factory=list)
+    # 动作-对象路由的原始 verb/noun（供评估器使用）
+    verb: str = ""
+    noun: str = ""
 
     @property
     def domain_config(self):
@@ -253,6 +256,8 @@ def analyze_intent(
                 all_scores=result.all_scores,
                 elapsed_ms=result.elapsed_ms,
                 tool_categories=tool_cats,
+                verb=result.verb,
+                noun=result.noun,
             )
             logger.info(
                 "[Intent] 动作-对象路由命中: %s/%s (%.2f) verb=%s noun=%s %.0fms",
@@ -520,6 +525,8 @@ def format_intent_for_agent(intent: IntentResult, original_message: str) -> str:
     parts = [f"[意图] domain={intent.domain}, intent={intent.intent}"]
     if intent.source:
         parts.append(f"[路由] {intent.source}")
+    if intent.verb or intent.noun:
+        parts.append(f"[动作-对象] verb={intent.verb or '-'}, noun={intent.noun or '-'}")
     if intent.params:
         parts.append(f"[参数] {json.dumps(intent.params, ensure_ascii=False)}")
     if intent.tool_categories:

@@ -1,0 +1,320 @@
+# -*- coding: utf-8 -*-
+"""
+Agent Evaluator — 执行后自动评估 + 工具链学习闭环。
+
+流程：
+  agent.run() 结束后，Evaluator 分析执行日志，给出评分。
+  - 成功 → 把实际使用的工具链写回 tool_chains.json（学习新链 or 强化旧链）
+  - 失败 → 记录到 tool_chain_failures.json（下次避开）
+  - 灰色 → 可选 LLM 评估
+
+评估信号（纯规则，<1ms）：
+  1. 工具调用成功率
+  2. 工具链遵循度
+  3. 步骤效率（实际步数 vs 链长度）
+  4. final_answer 是否生成
+  5. 响应内容是否包含实际数据
+"""
+from __future__ import annotations
+
+import json
+import logging
+import pathlib
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+# ── 存储路径 ─────────────────────────────────────────────────
+_ROUTER_DIR = pathlib.Path(__file__).resolve().parent / "router"
+_FAILURES_PATH = _ROUTER_DIR / "tool_chain_failures.json"
+
+
+# ═══════════════════════════════════════════════════════════════
+# 1. 评估结果
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class EvalResult:
+    """评估结果。"""
+    verdict: str = "unknown"          # "success" | "failure" | "grey"
+    score: int = 0                    # 综合得分
+    tool_success_rate: float = 0.0    # 工具成功率 (0~1)
+    chain_coverage: float = 0.0       # chain 工具被调用的比例 (0~1)
+    step_efficiency: float = 0.0      # 步骤效率 (实际步数 / chain长度)
+    has_final_answer: bool = False    # 是否有 final_answer
+    has_real_data: bool = False       # 响应是否包含实际数据
+    actual_tools: List[str] = field(default_factory=list)  # 实际调用的工具
+    chain_tools: List[str] = field(default_factory=list)   # chain 中的工具
+    steps_taken: int = 0              # 实际步数
+    chain_length: int = 0             # chain 长度
+    details: str = ""                 # 评估说明
+
+
+# ═══════════════════════════════════════════════════════════════
+# 2. 核心评估逻辑
+# ═══════════════════════════════════════════════════════════════
+
+def evaluate(
+    agent_result,
+    tool_chain: List[Dict[str, str]],
+    verb: str = "",
+    noun: str = "",
+) -> EvalResult:
+    """评估 agent 执行结果。
+
+    Args:
+        agent_result: AgentResult 实例（来自 _AgentExecutor.chat/chat_stream）
+        tool_chain: 本次使用的工具链 [{"tool": "xxx", "desc": "xxx"}, ...]
+        verb: 动作类别
+        noun: 对象类别
+
+    Returns:
+        EvalResult
+    """
+    result = EvalResult()
+    result.chain_tools = [s["tool"] for s in tool_chain] if tool_chain else []
+    result.chain_length = len(tool_chain)
+
+    # ── 提取实际调用的工具 ────────────────────────────────────
+    actual_tools = []
+    tool_successes = 0
+    tool_failures = 0
+
+    if agent_result.tool_calls_log:
+        for tc in agent_result.tool_calls_log:
+            tool_name = tc.get("tool", "")
+            if tool_name and tool_name not in ("final_answer",):
+                actual_tools.append(tool_name)
+                if tc.get("success", True):
+                    tool_successes += 1
+                else:
+                    tool_failures += 1
+
+    result.actual_tools = actual_tools
+    result.steps_taken = agent_result.total_steps or 0
+    result.has_final_answer = bool(agent_result.content and agent_result.content.strip())
+
+    # ── 信号 1: 工具调用成功率 ────────────────────────────────
+    total_calls = tool_successes + tool_failures
+    if total_calls > 0:
+        result.tool_success_rate = tool_successes / total_calls
+    else:
+        result.tool_success_rate = 1.0  # 没调工具不算失败
+
+    score_tool_success = 0
+    if result.tool_success_rate >= 0.8:
+        score_tool_success = 2
+    elif result.tool_success_rate >= 0.5:
+        score_tool_success = 0
+    else:
+        score_tool_success = -2
+
+    # ── 信号 2: 工具链遵循度 ──────────────────────────────────
+    chain_set = set(result.chain_tools)
+    actual_set = set(actual_tools)
+    if chain_set:
+        covered = chain_set & actual_set
+        result.chain_coverage = len(covered) / len(chain_set)
+    else:
+        result.chain_coverage = 1.0  # 没有 chain 不扣分
+
+    score_chain = 0
+    if not chain_set:
+        score_chain = 0  # 无 chain，不评分
+    elif result.chain_coverage >= 0.8:
+        score_chain = 1
+    elif result.chain_coverage >= 0.5:
+        score_chain = 0
+    else:
+        score_chain = -1
+
+    # ── 信号 3: 步骤效率 ─────────────────────────────────────
+    if result.chain_length > 0:
+        result.step_efficiency = result.steps_taken / result.chain_length
+    else:
+        result.step_efficiency = 0  # 无 chain，不评分
+
+    score_steps = 0
+    if result.chain_length == 0:
+        score_steps = 0  # 无 chain，不评分
+    elif result.steps_taken <= result.chain_length + 1:
+        score_steps = 2  # 精准执行
+    elif result.steps_taken <= result.chain_length * 1.5:
+        score_steps = 1  # 略有探索
+    elif result.steps_taken <= result.chain_length * 2:
+        score_steps = 0  # 效率一般
+    elif result.steps_taken <= result.chain_length * 3:
+        score_steps = -2  # 严重低效
+    else:
+        score_steps = -3  # chain 基本没用
+
+    # ── 信号 4: final_answer ──────────────────────────────────
+    score_answer = 2 if result.has_final_answer else -2
+
+    # ── 信号 5: 响应内容是否包含实际数据 ──────────────────────
+    content = agent_result.content or ""
+    result.has_real_data = _contains_real_data(content)
+    score_data = 1 if result.has_real_data else 0
+
+    # ── 综合评分 ──────────────────────────────────────────────
+    result.score = score_tool_success + score_chain + score_steps + score_answer + score_data
+
+    # ── 判定 ─────────────────────────────────────────────────
+    if result.score >= 3:
+        result.verdict = "success"
+    elif result.score <= -2:
+        result.verdict = "failure"
+    else:
+        result.verdict = "grey"
+
+    result.details = (
+        f"tools={score_tool_success} chain={score_chain} steps={score_steps} "
+        f"answer={score_answer} data={score_data} → total={result.score}"
+    )
+
+    logger.info(
+        "[Eval] %s/%s verdict=%s score=%d steps=%d/%d tools=%d/%d %s",
+        verb, noun, result.verdict, result.score,
+        result.steps_taken, result.chain_length,
+        tool_successes, total_calls,
+        result.details,
+    )
+    return result
+
+
+def _contains_real_data(content: str) -> bool:
+    """判断响应是否包含实际数据（数字、代码块、表格等）。"""
+    import re
+    if not content:
+        return False
+    # 包含数字（价格、百分比、指标值等）
+    if re.search(r'\d+[.,]?\d*[%元万亿手]', content):
+        return True
+    # 包含代码块
+    if '```' in content:
+        return True
+    # 包含表格
+    if '|' in content and '-|-' in content:
+        return True
+    # 内容足够长（超过 200 字通常有实质内容）
+    if len(content) > 200:
+        return True
+    return False
+
+
+# ═══════════════════════════════════════════════════════════════
+# 3. 闭环动作：写回链 / 记录失败
+# ═══════════════════════════════════════════════════════════════
+
+def learn_from_execution(
+    eval_result: EvalResult,
+    verb: str,
+    noun: str,
+):
+    """根据评估结果执行闭环动作。
+
+    - success → 写回/强化 tool_chains.json
+    - failure → 记录到 tool_chain_failures.json
+    - grey → 不操作
+    """
+    if eval_result.verdict == "success":
+        _writeback_chain(eval_result, verb, noun)
+    elif eval_result.verdict == "failure":
+        _record_failure(eval_result, verb, noun)
+    # grey → 不操作
+
+
+def _writeback_chain(eval_result: EvalResult, verb: str, noun: str):
+    """成功 → 写回工具链。
+
+    策略：
+    - 如果 agent 完全遵循了 chain → 不需要更新（chain 已验证有效）
+    - 如果 agent 偏离了 chain 但仍然成功 → 用 agent 实际使用的工具链替换旧 chain
+      （说明 agent 找到了更好的路径）
+    """
+    from app.agent.router.tool_chains import get_tool_chain, save_tool_chain
+
+    if not eval_result.actual_tools:
+        return
+
+    actual_set = set(eval_result.actual_tools)
+    chain_set = set(eval_result.chain_tools)
+
+    # agent 完全遵循 chain，chain 已验证有效，不需要改
+    if chain_set and actual_set >= chain_set:
+        logger.info(
+            "[Learn] %s+%s: chain 已验证有效，保持不变", verb, noun,
+        )
+        return
+
+    # agent 偏离了 chain 但成功了 → 用实际路径替换
+    # 去重保序
+    seen = set()
+    new_chain = []
+    for t in eval_result.actual_tools:
+        if t not in seen:
+            seen.add(t)
+            new_chain.append({"tool": t, "desc": ""})
+
+    if new_chain:
+        save_tool_chain(verb, noun, new_chain)
+        logger.info(
+            "[Learn] %s+%s: 学习新链 → %s",
+            verb, noun, [s["tool"] for s in new_chain],
+        )
+
+
+def _record_failure(eval_result: EvalResult, verb: str, noun: str):
+    """失败 → 记录到 failures.json。
+
+    记录内容：
+    - 失败的工具链
+    - 哪些工具失败了
+    - 失败次数（同一链累计）
+    """
+    data = _load_failures()
+    key = f"{verb}+{noun}"
+
+    # 找出失败的工具
+    failed_tools = []
+    if eval_result.actual_tools:
+        for tc_name in eval_result.actual_tools:
+            # 通过 tool_calls_log 找失败的
+            pass  # 简化：直接记录整个 actual_tools
+
+    entry = data.get(key, {"chain": eval_result.actual_tools, "fail_count": 0, "failed_tools": []})
+    entry["fail_count"] = entry.get("fail_count", 0) + 1
+    entry["last_fail_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    entry["chain"] = eval_result.actual_tools
+    entry["score"] = eval_result.score
+    data[key] = entry
+
+    _save_failures(data)
+    logger.info(
+        "[Learn] %s+%s: 记录失败 (count=%d, score=%d)",
+        verb, noun, entry["fail_count"], eval_result.score,
+    )
+
+
+def get_failure_record(verb: str, noun: str) -> Optional[Dict]:
+    """查询某场景的失败记录（供路由决策参考）。"""
+    data = _load_failures()
+    return data.get(f"{verb}+{noun}")
+
+
+def _load_failures() -> Dict:
+    if not _FAILURES_PATH.exists():
+        return {}
+    try:
+        return json.loads(_FAILURES_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_failures(data: Dict):
+    _FAILURES_PATH.write_text(
+        json.dumps(data, ensure_ascii=False, indent=4),
+        encoding="utf-8",
+    )

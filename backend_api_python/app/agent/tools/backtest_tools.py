@@ -38,6 +38,7 @@ except ImportError as _e:
     ),
     category="回测",
     layer="决策层",
+    domain=["finance","trading"],
 )
 def run_backtest(
     strategy_id: int,
@@ -149,6 +150,7 @@ def run_backtest(
     description="查询策略的历史回测记录列表（即过去跑过的回测任务结果）。注意：这不是获取K线数据的工具，获取K线请用 agent_get_kline。",
     category="回测",
     layer="决策层",
+    domain=["finance","trading"],
 )
 def get_backtest_history(
     strategy_id: int,

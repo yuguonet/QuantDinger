@@ -85,6 +85,7 @@ class ToolSpec:
     description: str
     category: str = ""
     layer: str = ""          # 架构分层：显示层/数据层/分析层/决策层/执行层/支撑层
+    domain: List[str] = field(default_factory=list)  # 领域标签：["finance"] / ["coding"] / ["finance","coding"] / []=通用
     output_type: str = "string"
     meta: Dict[str, Any] = field(default_factory=dict)
 
@@ -190,11 +191,13 @@ class ToolRegistry:
         self._discovered = False
 
     def register(self, fn: Callable, name: str, description: str,
-                 category: str = "", layer: str = "", output_type: str = "string", **meta):
+                 category: str = "", layer: str = "", domain: List[str] = None,
+                 output_type: str = "string", **meta):
         """Register a tool function. Called by the @tool decorator."""
         spec = ToolSpec(
             fn=fn, name=name, description=description,
-            category=category, layer=layer, output_type=output_type, meta=meta,
+            category=category, layer=layer, domain=domain or [],
+            output_type=output_type, meta=meta,
         )
         self._tools[name] = spec
 
@@ -221,10 +224,15 @@ class ToolRegistry:
         config keys:
             allow: list[str] — if set, only these tools are included
             deny: list[str] — these tools are excluded
+            domain: str — if set, filter by domain:
+                - tools with matching domain tag → included
+                - tools with domain=[] (universal) → included (lower priority)
+                - tools with non-matching domain → excluded
         """
         config = config or {}
         allow = set(config.get("allow", []))
         deny = set(config.get("deny", []))
+        domain = config.get("domain", "")
 
         tools = []
         for spec in self._tools.values():
@@ -232,10 +240,20 @@ class ToolRegistry:
                 continue
             if allow and spec.name not in allow:
                 continue
+            # Domain filtering
+            if domain:
+                if spec.domain and domain not in spec.domain:
+                    continue  # 工具指定了领域但不匹配 → 排除
+                # spec.domain 为空（通用）或包含当前领域 → 保留
             try:
                 tools.append(spec.to_smolagents_tool())
             except Exception as e:
                 logger.warning("[ToolRegistry] Failed to build tool '%s': %s", spec.name, e)
+
+        # 排序：领域匹配的工具在前，通用工具在后
+        if domain:
+            tools.sort(key=lambda t: 0 if self._tools.get(t.name) and domain in self._tools[t.name].domain else 1)
+
         return tools
 
     @property
@@ -284,13 +302,14 @@ def tool(
     name: str = "",
     category: str = "",
     layer: str = "",
+    domain: List[str] = None,
     output_type: str = "string",
     **meta,
 ):
     """Decorator to register a function as a QuantDinger tool.
 
     Usage:
-        @tool(description="搜索股票", category="名称查询", layer="数据层")
+        @tool(description="搜索股票", category="名称查询", layer="数据层", domain=["finance"])
         def search_stock_by_name(keyword: str, market: str = "CNStock"):
             ...
 
@@ -301,6 +320,12 @@ def tool(
         决策层 — 选股、回测
         执行层 — 交易
         支撑层 — 工作区、自修改
+
+    domain: 领域标签，可选值:
+        ["finance"] — 仅金融分析
+        ["coding"]  — 仅代码开发
+        ["finance", "coding"] — 多领域
+        [] 或 None — 通用工具（所有领域可用，优先级较低）
 
     The decorated function remains callable as normal — the decorator
     only registers it in the global registry, it does NOT wrap it.
@@ -313,6 +338,7 @@ def tool(
             description=description,
             category=category,
             layer=layer,
+            domain=domain,
             output_type=output_type,
             **meta,
         )

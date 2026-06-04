@@ -125,6 +125,7 @@ def _em_search(keyword: str, page_size: int = 100) -> List[Dict[str, Any]]:
     description="统一选股工具：根据条件从全市场筛选股票。支持自然语言条件（如 'PE<20 半导体'、'净利增长>15%'）和结构化 filters。source='eastmoney' 使用东财智能选股（130+条件），'local_db' 查本地数据库，'auto' 自动选择。当用户要求选股、筛选股票时使用此工具。",
     category="选股",
     layer="决策层",
+    domain=["finance"],
 )
 def search_stocks(
     query: str = "",

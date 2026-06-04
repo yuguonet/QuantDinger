@@ -481,6 +481,7 @@ for _pfx, _label in _prefix_labels.items():
     description="在工作区目录中执行 shell 命令（支持流式输出）。命令的 cwd 自动设为当前会话的工作区。可用环境变量 WORKSPACE 获取工作区绝对路径。适用场景：pip install、python、文件操作、数据处理、调用外部工具。",
     category="工作区",
     layer="支撑层",
+    domain=["coding"],
 )
 def shell_exec(
     command: str,
@@ -516,6 +517,7 @@ def shell_exec(
     description="保存 Python 脚本到工作区，支持自动版本管理。",
     category="工作区",
     layer="支撑层",
+    domain=["coding"],
 )
 def workspace_save_script(
     name: str,
@@ -545,6 +547,7 @@ def workspace_save_script(
     description="从工作区加载 Python 脚本。",
     category="工作区",
     layer="支撑层",
+    domain=["coding"],
 )
 def workspace_load_script(
     name: str,
@@ -569,6 +572,7 @@ def workspace_load_script(
     description="列出工作区中的所有脚本和文件。",
     category="工作区",
     layer="支撑层",
+    domain=["coding"],
 )
 def workspace_list() -> Dict[str, Any]:
     """List all files in the workspace (scripts, data, outputs).
@@ -586,6 +590,7 @@ def workspace_list() -> Dict[str, Any]:
     description="写入文件到工作区。用于创建新文件、保存脚本、写入数据等。修改代码时先用 workspace_read_file 读取，再用此工具写回。",
     category="工作区",
     layer="支撑层",
+    domain=["coding"],
 )
 def workspace_write_file(
     path: str,
@@ -622,6 +627,7 @@ def workspace_write_file(
     description="读取工作区中的文件内容。用于查看代码、读取数据、分析文件等。修改代码前先用此工具读取当前内容。",
     category="工作区",
     layer="支撑层",
+    domain=["coding"],
 )
 def workspace_read_file(
     path: str,
@@ -663,6 +669,7 @@ def workspace_read_file(
     description="精确编辑工作区文件：支持精确文本替换和正则表达式替换。比全量重写更安全高效。先用 workspace_read_file 读取内容，找到要修改的部分，再用此工具精确替换。",
     category="工作区",
     layer="支撑层",
+    domain=["coding"],
 )
 def workspace_edit_file(
     path: str,
@@ -758,6 +765,7 @@ def workspace_edit_file(
     description="对工作区中的 Python 代码进行静态审查：语法检查、AST分析、常见问题检测。在执行代码前调用可提前发现错误。",
     category="工作区",
     layer="支撑层",
+    domain=["coding"],
 )
 def workspace_code_review(
     path: str = "",
@@ -910,6 +918,7 @@ def workspace_code_review(
     description="在工作区中执行 Python 脚本，支持数据源注入（get_kline/get_ticker 等自动可用）。可加载已保存脚本（传 name）或直接执行代码（传 code）。支持流式输出和最长 600 秒超时。",
     category="工作区",
     layer="支撑层",
+    domain=["coding"],
 )
 def workspace_exec_script(
     name: str = "",
@@ -987,6 +996,7 @@ def workspace_exec_script(
     description="后台执行脚本，立即返回 task_id。用 poll_task 查询结果。适合长时间任务（大数据处理、全市场扫描等）。",
     category="工作区",
     layer="支撑层",
+    domain=["coding"],
 )
 def run_background(
     code: str = "",
@@ -1055,6 +1065,7 @@ def run_background(
     description="查询后台任务状态和结果。",
     category="工作区",
     layer="支撑层",
+    domain=["coding"],
 )
 def poll_task(
     task_id: str,

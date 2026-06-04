@@ -160,6 +160,7 @@ def _ak_hot_rank() -> List[Dict[str, Any]]:
     description="获取龙虎榜数据。stock_code为空返回全市场龙虎榜，非空返回该股票的历史龙虎榜。包含上榜股票代码、名称、买卖金额、净买入额、涨跌幅、上榜原因。",
     category="行情数据",
     layer="数据层",
+    domain=["finance"],
 )
 def get_dragon_tiger(stock_code: str = "", date: str = "", days: int = 30) -> Dict[str, Any]:
     """获取龙虎榜数据。
@@ -212,6 +213,7 @@ def get_dragon_tiger(stock_code: str = "", date: str = "", days: int = 30) -> Di
     description="获取实时股票热榜/人气榜：排名、代码、名称、人气分数、价格、涨跌幅。反映市场关注度最高的个股。",
     category="行情数据",
     layer="数据层",
+    domain=["finance"],
 )
 def get_hot_rank(top_n: int = 30) -> Dict[str, Any]:
     """获取实时股票热榜/人气榜。
@@ -230,6 +232,7 @@ def get_hot_rank(top_n: int = 30) -> Dict[str, Any]:
     description="获取涨停股票池：代码、名称、涨停价、封板资金、连板天数。可筛选连板股（设 min_continuous_days>=2）。",
     category="行情数据",
     layer="数据层",
+    domain=["finance"],
 )
 def get_zt_pool(date: str = "", min_continuous_days: int = 0) -> Dict[str, Any]:
     """获取涨停股票池。
@@ -279,6 +282,7 @@ def get_zt_pool(date: str = "", min_continuous_days: int = 0) -> Dict[str, Any]:
     description="获取跌停股票池：代码、名称、跌停价、封单量。",
     category="行情数据",
     layer="数据层",
+    domain=["finance"],
 )
 def get_limit_down(date: str = "") -> Dict[str, Any]:
     """获取跌停股票池。
@@ -303,6 +307,7 @@ def get_limit_down(date: str = "") -> Dict[str, Any]:
     description="获取炸板(开板)股票池。炸板=曾封涨停但被打开，是资金分歧信号。",
     category="龙虎榜/热榜",
     layer="数据层",
+    domain=["finance"],
 )
 def get_broken_board(date: str = "") -> Dict[str, Any]:
     """获取炸板(开板)股票池。炸板=曾封涨停但被打开，是资金分歧信号。
@@ -327,6 +332,7 @@ def get_broken_board(date: str = "") -> Dict[str, Any]:
     description="获取全市场涨跌统计快照：上涨/下跌家数、情绪指标。",
     category="行情数据",
     layer="数据层",
+    domain=["finance"],
 )
 def get_market_overview() -> Dict[str, Any]:
     """获取全市场涨跌统计快照：上涨/下跌家数、情绪指标。"""
@@ -340,6 +346,7 @@ def get_market_overview() -> Dict[str, Any]:
     description="获取个股资金流向：主力/大单/中单/小单的净流入额。支持单只（传一个代码）或批量（逗号分隔，最多20只）。",
     category="行情数据",
     layer="数据层",
+    domain=["finance"],
 )
 def get_fund_flow(stock_codes: str = "") -> Dict[str, Any]:
     """获取个股资金流向。支持单只或批量（逗号分隔），单次最多20只。
@@ -387,6 +394,7 @@ def get_fund_flow(stock_codes: str = "") -> Dict[str, Any]:
     description="获取行业板块资金流向排名。",
     category="行情数据",
     layer="数据层",
+    domain=["finance"],
 )
 def get_sector_fund_flow(date: str = "") -> Dict[str, Any]:
     """获取行业板块资金流向排名。
@@ -409,6 +417,7 @@ def get_sector_fund_flow(date: str = "") -> Dict[str, Any]:
     description="获取概念板块资金流向排名。",
     category="行情数据",
     layer="数据层",
+    domain=["finance"],
 )
 def get_concept_fund_flow(date: str = "") -> Dict[str, Any]:
     """获取概念板块资金流向排名。

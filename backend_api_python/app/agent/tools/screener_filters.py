@@ -355,6 +355,7 @@ from app.agent.tools.registry import tool
     description="获取选股器支持的所有筛选条件分类和示例。",
     category="选股",
     layer="决策层",
+    domain=["finance"],
 )
 def get_screener_presets() -> Dict[str, Any]:
     """获取选股器支持的所有筛选条件分类和示例。"""

@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
     description="用指标策略批量审核股票。对每只股票执行指标代码，检查是否出现买入信号。返回每只股票的 buy/sell 信号状态和价格。",
     category="选股",
     layer="决策层",
+    domain=["finance"],
 )
 def review_stocks_with_indicator(
     stock_codes: List[str],
@@ -173,6 +174,7 @@ def review_stocks_with_indicator(
     description="列出用户收藏的选股策略列表。",
     category="选股",
     layer="决策层",
+    domain=["finance"],
 )
 def list_user_selection_strategies(user_id: int = 1) -> Dict[str, Any]:
     """列出用户收藏的选股策略。

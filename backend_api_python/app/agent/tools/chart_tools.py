@@ -175,6 +175,7 @@ def _render_svg(
     ),
     category="K线图表",
     layer="显示层",
+    domain=["finance"],
 )
 def render_candlestick(
     stock_code: str,
@@ -255,6 +256,7 @@ def render_candlestick(
     description="生成迷你蜡烛图（快速预览版），60天日线+MA5/10/20+成交量。",
     category="K线图表",
     layer="显示层",
+    domain=["finance"],
 )
 def render_candlestick_mini(
     stock_code: str,

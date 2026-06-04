@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
     description="列出用户的所有指标策略（自建 + 购买的），返回指标 ID、名称、描述。",
     category="指标策略",
     layer="分析层",
+    domain=["finance","trading"],
 )
 def list_indicators(user_id: int = 1) -> Dict[str, Any]:
     """列出用户的所有指标策略（自建 + 购买的）。
@@ -66,6 +67,7 @@ def list_indicators(user_id: int = 1) -> Dict[str, Any]:
     description="获取指标策略声明的可配置参数。解析代码中的 # @param 注释，返回参数名称、类型、默认值和描述。",
     category="指标策略",
     layer="分析层",
+    domain=["finance","trading"],
 )
 def get_indicator_params(indicator_id: int, user_id: int = 1) -> Dict[str, Any]:
     """获取指标策略声明的可配置参数。
@@ -112,6 +114,7 @@ def get_indicator_params(indicator_id: int, user_id: int = 1) -> Dict[str, Any]:
     description="对单只股票执行指标策略，返回最新的 buy/sell 信号、当前价格、指标图表数据。用于判断某只股票当前是否出现交易信号。",
     category="指标策略",
     layer="分析层",
+    domain=["finance","trading"],
 )
 def run_indicator_signal(
     indicator_id: int,

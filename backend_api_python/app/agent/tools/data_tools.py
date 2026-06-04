@@ -29,6 +29,7 @@ from app.data_sources.market_detector import detect_market as _detect_market
     description="根据股票代码获取中文名称。如输入 600519 返回贵州茅台。",
     category="名称查询",
     layer="数据层",
+    domain=[],
 )
 def resolve_stock_name(stock_code: str) -> Dict[str, Any]:
     """根据股票代码获取中文名称。
@@ -52,6 +53,7 @@ def resolve_stock_name(stock_code: str) -> Dict[str, Any]:
     description="根据中文名称或关键词搜索股票代码。支持模糊匹配，如输入茅台可找到贵州茅台(600519)。当用户提供中文股票名称但没有代码时，必须先用此工具查到代码再进行后续分析。",
     category="名称查询",
     layer="数据层",
+    domain=[],
 )
 def search_stock_by_name(keyword: str, market: str = "CNStock", limit: int = 10) -> Dict[str, Any]:
     """根据中文名称或关键词搜索股票代码。
@@ -85,6 +87,7 @@ def search_stock_by_name(keyword: str, market: str = "CNStock", limit: int = 10)
     description="获取股票或交易对的实时行情（最新价、涨跌幅、成交量、换手率、量比、PE/PB等）。",
     category="行情数据",
     layer="数据层",
+    domain=["finance"],
 )
 def get_realtime_quote(stock_code: str) -> Dict[str, Any]:
     """获取股票/交易对的实时行情数据，包括最新价、涨跌幅、成交量、换手率等。"""
@@ -106,6 +109,7 @@ def get_realtime_quote(stock_code: str) -> Dict[str, Any]:
     description="获取股票/交易对的K线数据（OHLCV：开盘价/最高价/最低价/收盘价/成交量）。支持多周期：1m/5m/15m/30m/1H/4H/1D/1W。这是获取原始K线数据的核心工具，用于趋势分析和技术指标计算。当用户要求查看K线、行情数据、历史价格时必须使用此工具。",
     category="行情数据",
     layer="数据层",
+    domain=["finance"],
 )
 def agent_get_kline(stock_code: str, timeframe: str = "1D", days: int = 60, market: str = "") -> List[Dict[str, Any]]:
     """获取股票/交易对的K线数据（OHLCV）。
@@ -151,6 +155,7 @@ def agent_get_kline(stock_code: str, timeframe: str = "1D", days: int = 60, mark
     description="生成K线图（嵌入式交互图表）。当用户要求看K线、显示图表、K线图时，必须先调用 agent_get_kline 获取数据，再调用此工具生成图表。分析类请求不需要此工具。",
     category="行情数据",
     layer="数据层",
+    domain=["finance"],
 )
 def generate_kline_chart(
     stock_code: str,
@@ -321,6 +326,7 @@ window.addEventListener('resize', function() {{ chart.resize(); }});
     description="获取股票基本面信息（行业、概念、市值、PE、PB等）。",
     category="行情数据",
     layer="数据层",
+    domain=["finance"],
 )
 def get_stock_info(stock_code: str) -> Dict[str, Any]:
     """获取股票基本面信息（行业、概念、市值、PE、PB 等）。"""
