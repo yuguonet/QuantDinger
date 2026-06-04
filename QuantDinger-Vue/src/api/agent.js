@@ -126,6 +126,16 @@ export function createAgentStream (params, callbacks) {
   return { close: () => controller.abort() }
 }
 
+// ── 会话管理 ──────────────────────────────────────────────
+
+/**
+ * 删除会话（清空后端上下文）
+ * DELETE /api/agent/chat/sessions/:sessionId
+ */
+export function deleteChatSession (sessionId) {
+  return request({ url: `/api/agent/chat/sessions/${sessionId}`, method: 'delete' })
+}
+
 // ── 分析任务 ──────────────────────────────────────────────
 
 export function triggerAnalysis (data) {

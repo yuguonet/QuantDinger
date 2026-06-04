@@ -403,6 +403,15 @@ def _build_managed_agents(smol_model) -> list:
 # 6. Agent Builder
 # ═══════════════════════════════════════════════════════════════
 
+def _filter_tools_by_categories(all_tools: List, categories: List[str]) -> List:
+    """按工具分类过滤工具列表（当前未启用，保留供后续使用）。
+
+    注意：目前分类仅作为 prompt 引导，不过滤工具。
+    agent 始终拥有全部工具，分类帮助它更快定位目标。
+    """
+    return all_tools
+
+
 def get_smolagent(
     skills: Optional[List[str]] = None,
     user_id: int = 1,
@@ -414,18 +423,25 @@ def get_smolagent(
     domain: str = "",
     domain_instructions: str = "",
     intent_context: str = "",
+    tool_categories: Optional[List[str]] = None,
 ) -> "CodeAgent | ToolCallingAgent":
     """Build or retrieve an agent instance per user.
 
-    Cache key = user_id, so different users get isolated agents.
-    Same user's concurrent requests share the agent (instructions are
-    updated per-call, which is acceptable for single-tab usage).
+    Cache key = user_id + tool_categories, so different intents get
+    optimally-filtered tool sets cached independently.
     """
     global _agent_cache, _cached_signatures
 
     skill_instructions = get_indicator_skill_instructions(skills, user_id)
     smol_model = build_model(model=model, provider=provider)
-    tools = build_all_tools()
+    all_tools = build_all_tools()
+
+    # ── 按分类过滤工具 ────────────────────────────────────────
+    if tool_categories:
+        tools = _filter_tools_by_categories(all_tools, tool_categories)
+    else:
+        tools = all_tools
+
     managed_agents = _build_managed_agents(smol_model)
     instructions = _build_instructions(
         user_message, skill_instructions, language, tools, managed_agents,
@@ -434,8 +450,10 @@ def get_smolagent(
     )
     AgentClass = _get_agent_class()
 
-    cache_key = str(user_id)
-    sig = f"{len(tools)}_{model}_{provider}_{user_id}_{AgentClass.__name__}"
+    # 缓存键包含工具数量（分类过滤后数量不同 → 不同 agent 实例）
+    cat_key = ",".join(sorted(tool_categories)) if tool_categories else "all"
+    cache_key = f"{user_id}_{cat_key}"
+    sig = f"{len(tools)}_{model}_{provider}_{cache_key}_{AgentClass.__name__}"
 
     # ── Cache hit: update instructions only ───────────────────
     if cache_key in _agent_cache and _cached_signatures.get(cache_key) == sig:
@@ -529,6 +547,7 @@ class _AgentExecutor:
         intent_context = ""
         domain = ""
         domain_instructions = ""
+        tool_categories = None
         # skip_agent: 意图明确且不需要工具时（如打招呼），直接返回，不进 agent
         skip_agent = False
         skip_agent_reply = ""
@@ -546,10 +565,12 @@ class _AgentExecutor:
                 )
                 domain = intent.domain
                 domain_instructions = intent.domain_instructions
+                tool_categories = intent.tool_categories or None
                 intent_context = format_intent_for_agent(intent, message)
                 logger.info(
-                    "[Intent] domain=%s intent=%s confidence=%.2f",
+                    "[Intent] domain=%s intent=%s confidence=%.2f categories=%s",
                     intent.domain, intent.intent, intent.confidence,
+                    intent.tool_categories or [],
                 )
 
                 # ── 闲聊/greeting 快速通道：跳过 agent，直接回复 ──
@@ -606,6 +627,7 @@ class _AgentExecutor:
             language=(context or {}).get("report_language", "zh"),
             domain=domain, domain_instructions=domain_instructions,
             intent_context=intent_context,
+            tool_categories=tool_categories,
         )
 
         store.add_message(session_id, "user", message)

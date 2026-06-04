@@ -203,7 +203,8 @@ import {
   triggerAnalysis,
   getAnalysisTasks,
   createAgentStream,
-  createTaskStream
+  createTaskStream,
+  deleteChatSession
 } from '@/api/agent'
 import request from '@/utils/request'
 
@@ -568,9 +569,21 @@ export default {
 
     // ── 其它 ────────────────────────────────────────────
 
-    function handleMenuClick ({ key }) {
+    async function handleMenuClick ({ key }) {
       if (key === 'clear') {
+        // 1. 调后端清除 session 上下文（对话历史 + 工具结果 + 意图路由上下文）
+        const oldSessionId = sessionId.value
+        try {
+          await deleteChatSession(oldSessionId)
+        } catch (_) {}
+        // 2. 生成新 session_id（避免残留的 ContextManager 状态影响新对话）
+        sessionId.value = 'session_' + (crypto.randomUUID?.() || Date.now().toString(36) + Math.random().toString(36).slice(2))
+        // 3. 清本地
         messages.value = []
+        try {
+          localStorage.removeItem(STORAGE_KEY)
+          localStorage.setItem(SESSION_KEY, sessionId.value)
+        } catch (_) {}
       } else if (key === 'sessions') {
         showTaskDrawer.value = true
         loadTasks()

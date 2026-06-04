@@ -356,7 +356,15 @@ def get_chat_session_messages(session_id: str):
 def delete_chat_session(session_id: str):
     store = get_session_store()
     store.clear_history(session_id)
+    store.clear_tool_results(session_id)
     deleted = store.delete_session(session_id)
+    # 清除意图路由上下文（domain 连续性加成）
+    try:
+        from app.agent.intent_analyzer import _get_context_manager
+        ctx_mgr = _get_context_manager()
+        ctx_mgr.clear_session(session_id)
+    except Exception:
+        pass
     return jsonify({"deleted": 1 if deleted else 0})
 
 

@@ -49,6 +49,8 @@ class IntentResult:
     all_scores: Dict[str, float] = field(default_factory=dict)
     # 新增：路由耗时（毫秒）
     elapsed_ms: float = 0.0
+    # 新增：该意图需要的工具分类（对应 @tool(category=...)）
+    tool_categories: List[str] = field(default_factory=list)
 
     @property
     def domain_config(self):
@@ -217,6 +219,9 @@ def analyze_intent(
                     query=message,
             )
 
+            # 从路由元数据提取工具分类
+            tool_cats = result.metadata.get("tool_categories", [])
+
             intent_result = IntentResult(
                 domain=result.domain,
                 intent=result.intent,
@@ -226,6 +231,7 @@ def analyze_intent(
                 source="semantic",
                 all_scores=result.all_scores,
                 elapsed_ms=result.elapsed_ms,
+                tool_categories=tool_cats,
             )
             logger.info(
                 "[Intent] 语义路由命中: %s/%s (%.3f) %.0fms",
@@ -365,6 +371,22 @@ def _llm_fallback(
 
         best = top[0]
         scene = best["scene"]
+        # LLM 降级时从意图名映射工具分类
+        _INTENT_TOOL_CATEGORIES = {
+            "stock_analysis": ["名称查询", "行情数据", "技术分析", "情报搜索"],
+            "chart_view": ["名称查询", "行情数据", "K线图表"],
+            "market_scan": ["行情数据", "龙虎榜/热榜"],
+            "screener": ["名称查询", "选股", "指标策略"],
+            "backtest": ["名称查询", "行情数据", "回测", "指标策略"],
+            "fund_flow": ["名称查询", "行情数据"],
+            "indicator": ["名称查询", "行情数据", "技术分析", "指标策略"],
+            "trading": ["交易", "指标策略"],
+            "stock_info": ["名称查询", "行情数据"],
+            "concept_explain": [],
+            "code_modify": ["工作区"],
+            "code_create": ["工作区"],
+            "project_scan": ["工作区"],
+        }
         return IntentResult(
             domain=scene["domain"],
             intent=scene["intent"],
@@ -372,6 +394,7 @@ def _llm_fallback(
             confidence=best["score"],
             raw_response=raw,
             source="llm",
+            tool_categories=_INTENT_TOOL_CATEGORIES.get(scene["intent"], []),
         )
     except Exception as e:
         logger.warning("[Intent] LLM 降级也失败: %s", e)
@@ -476,6 +499,8 @@ def format_intent_for_agent(intent: IntentResult, original_message: str) -> str:
         parts.append(f"[路由] {intent.source}")
     if intent.params:
         parts.append(f"[参数] {json.dumps(intent.params, ensure_ascii=False)}")
+    if intent.tool_categories:
+        parts.append(f"[工具分类] {', '.join(intent.tool_categories)}")
     if intent.confidence < 0.6:
         parts.append(f"⚠️ 置信度较低({intent.confidence:.2f})，请结合原始消息判断")
     return "\n".join(parts)

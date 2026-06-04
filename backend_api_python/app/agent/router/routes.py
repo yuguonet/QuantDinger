@@ -6,7 +6,9 @@ Routes — QuantDinger 意图路由定义。
 - name: "domain/intent" 格式的唯一标识
 - utterances: 10~20 条覆盖不同表达方式的示例语句
 - description: 给人看的描述
-- metadata: 附带给 agent 的上下文（如工具提示）
+- metadata: 附带给 agent 的上下文
+  - tool_categories: 该意图需要的工具分类（对应 @tool(category=...)）
+  - tools_hint: 具体工具名（调试/提示用）
 
 添加新场景只需在这里加一个 Route，重启后自动生效。
 
@@ -14,6 +16,7 @@ Routes — QuantDinger 意图路由定义。
 - utterances 要覆盖口语化、书面化、简写、全称等不同表达
 - 每个 intent 至少 8 条 utterance，热门 intent 15~20 条
 - 避免 utterance 跨 intent 重叠（会导致误分类）
+- tool_categories 与 @tool 装饰器的 category 字段对齐
 """
 from __future__ import annotations
 
@@ -54,6 +57,7 @@ def build_default_routes() -> List[Route]:
             ],
             score_threshold=0.40,
             metadata={
+                "tool_categories": ["名称查询", "行情数据", "技术分析", "情报搜索"],
                 "tools_hint": "get_realtime_quote, get_indicator_snapshot, search_stock_news",
             },
         ),
@@ -85,6 +89,7 @@ def build_default_routes() -> List[Route]:
             ],
             score_threshold=0.40,
             metadata={
+                "tool_categories": ["名称查询", "行情数据", "K线图表"],
                 "tools_hint": "render_candlestick, render_candlestick_mini",
             },
         ),
@@ -113,6 +118,7 @@ def build_default_routes() -> List[Route]:
             ],
             score_threshold=0.40,
             metadata={
+                "tool_categories": ["行情数据", "龙虎榜/热榜"],
                 "tools_hint": "get_market_overview, get_zt_pool, get_dragon_tiger, get_hot_rank",
             },
         ),
@@ -140,6 +146,7 @@ def build_default_routes() -> List[Route]:
             ],
             score_threshold=0.40,
             metadata={
+                "tool_categories": ["名称查询", "选股", "指标策略"],
                 "tools_hint": "search_stocks, get_screener_presets, run_indicator_signal",
             },
         ),
@@ -166,6 +173,7 @@ def build_default_routes() -> List[Route]:
             ],
             score_threshold=0.40,
             metadata={
+                "tool_categories": ["名称查询", "行情数据", "回测", "指标策略"],
                 "tools_hint": "run_backtest, get_backtest_history, list_strategies",
             },
         ),
@@ -190,6 +198,7 @@ def build_default_routes() -> List[Route]:
             ],
             score_threshold=0.40,
             metadata={
+                "tool_categories": ["名称查询", "行情数据"],
                 "tools_hint": "get_fund_flow, get_sector_fund_flow",
             },
         ),
@@ -215,6 +224,7 @@ def build_default_routes() -> List[Route]:
             ],
             score_threshold=0.40,
             metadata={
+                "tool_categories": ["名称查询", "行情数据", "技术分析", "指标策略"],
                 "tools_hint": "get_indicator_snapshot, analyze_trend, agent_get_kline",
             },
         ),
@@ -240,6 +250,7 @@ def build_default_routes() -> List[Route]:
             ],
             score_threshold=0.40,
             metadata={
+                "tool_categories": ["交易", "指标策略"],
                 "tools_hint": "list_strategies, start_strategy, stop_strategy, get_strategy_trades",
             },
         ),
@@ -264,6 +275,7 @@ def build_default_routes() -> List[Route]:
             ],
             score_threshold=0.40,
             metadata={
+                "tool_categories": ["名称查询", "行情数据"],
                 "tools_hint": "get_stock_info, get_realtime_quote, resolve_stock_name",
             },
         ),
@@ -288,6 +300,7 @@ def build_default_routes() -> List[Route]:
             ],
             score_threshold=0.45,
             metadata={
+                "tool_categories": [],
                 "tools_hint": "final_answer",
             },
         ),
@@ -312,6 +325,7 @@ def build_default_routes() -> List[Route]:
             ],
             score_threshold=0.40,
             metadata={
+                "tool_categories": ["工作区"],
                 "tools_hint": "workspace_read_file, workspace_write_file, workspace_exec_script",
             },
         ),
@@ -333,6 +347,7 @@ def build_default_routes() -> List[Route]:
             ],
             score_threshold=0.40,
             metadata={
+                "tool_categories": ["工作区"],
                 "tools_hint": "workspace_write_file, workspace_save_script",
             },
         ),
@@ -352,6 +367,7 @@ def build_default_routes() -> List[Route]:
             ],
             score_threshold=0.40,
             metadata={
+                "tool_categories": ["工作区"],
                 "tools_hint": "workspace_list, workspace_read_file, shell_exec",
             },
         ),
