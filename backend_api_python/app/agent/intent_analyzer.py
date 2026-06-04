@@ -69,30 +69,55 @@ class IntentResult:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 全局单例：语义路由器 + 上下文管理器
+# 全局单例：动作-对象路由器 + 语义路由器 + 上下文管理器
 # ═══════════════════════════════════════════════════════════════
 
-_router = None
+_verb_noun_router = None
+_semantic_router = None
 _context_mgr = None
 
 
-def _get_router():
-    """懒加载语义路由器单例。"""
-    global _router
-    if _router is not None:
-        return _router
+def _get_verb_noun_router():
+    """懒加载动作-对象路由器单例（主路由）。"""
+    global _verb_noun_router, _semantic_router
+    if _verb_noun_router is not None:
+        return _verb_noun_router
+
+    from app.agent.router.verb_noun_router import VerbNounRouter
+
+    # 语义路由器作为降级方案
+    semantic = _get_semantic_router()
+    context_boost = float(os.getenv("INTENT_ROUTER_CONTEXT_BOOST", "0.1"))
+
+    try:
+        _verb_noun_router = VerbNounRouter(
+            semantic_router=semantic,
+            context_boost=context_boost,
+        )
+        logger.info("[Intent] 动作-对象路由器初始化完成")
+    except Exception as e:
+        logger.warning("[Intent] 动作-对象路由器初始化失败: %s", e)
+        _verb_noun_router = None
+
+    return _verb_noun_router
+
+
+def _get_semantic_router():
+    """懒加载语义路由器单例（降级方案）。"""
+    global _semantic_router
+    if _semantic_router is not None:
+        return _semantic_router
 
     from app.agent.router.core import SemanticIntentRouter
     from app.agent.router.routes import build_default_routes
 
-    # 从环境变量读取配置
     backend = os.getenv("INTENT_ROUTER_ENCODER", "auto")
     threshold = float(os.getenv("INTENT_ROUTER_THRESHOLD", "0.45"))
     context_boost = float(os.getenv("INTENT_ROUTER_CONTEXT_BOOST", "0.1"))
 
     try:
         routes = build_default_routes()
-        _router = SemanticIntentRouter(
+        _semantic_router = SemanticIntentRouter(
             routes=routes,
             default_threshold=threshold,
             context_boost=context_boost,
@@ -101,9 +126,9 @@ def _get_router():
         logger.info("[Intent] 语义路由器初始化完成 (encoder=%s, threshold=%.2f)", backend, threshold)
     except Exception as e:
         logger.warning("[Intent] 语义路由器初始化失败: %s，将使用纯 LLM 模式", e)
-        _router = None
+        _semantic_router = None
 
-    return _router
+    return _semantic_router
 
 
 def _get_context_manager():
@@ -168,8 +193,8 @@ def analyze_intent(
 
     路由策略（三级降级）：
     1. 快速通道 — 关键词匹配（<1ms，零开销）
-    2. 语义路由 — embedding + cosine similarity（<50ms，零 API 调用）
-    3. LLM 打分 — 传统方式（2-5s，消耗 token）
+    2. 动作-对象路由 — 先识别动作（看/分析/修改...），再识别对象（股票/代码/项目...）
+    3. 语义路由 — embedding + cosine similarity 降级兜底
 
     Args:
         message: 用户消息
@@ -193,12 +218,12 @@ def analyze_intent(
         logger.info("[Intent] 快速通道: %s/%s", quick.domain, quick.intent)
         return quick
 
-    # ── Level 2: 语义路由 ──────────────────────────────────────
-    router = _get_router()
-    if router:
-        ctx_mgr = _get_context_manager()
-        context_domain = ctx_mgr.get_context_domain(session_id) if session_id else ""
+    # ── Level 2: 动作-对象路由（主路由）────────────────────────
+    ctx_mgr = _get_context_manager()
+    context_domain = ctx_mgr.get_context_domain(session_id) if session_id else ""
 
+    router = _get_verb_noun_router()
+    if router:
         result = router.route(
             query=message,
             session_id=session_id,
@@ -206,9 +231,6 @@ def analyze_intent(
         )
 
         if result.matched:
-            # 提取参数（股票代码等）
-            params = _extract_params(message)
-
             # 记录到上下文
             if session_id:
                 ctx_mgr.record_route(
@@ -217,34 +239,30 @@ def analyze_intent(
                     intent=result.intent,
                     confidence=result.confidence,
                     query=message,
-            )
+                )
 
-            # 从路由元数据提取工具分类
             tool_cats = result.metadata.get("tool_categories", [])
 
             intent_result = IntentResult(
                 domain=result.domain,
                 intent=result.intent,
-                params=params,
+                params=result.params,
                 confidence=result.confidence,
                 metadata=result.metadata,
-                source="semantic",
+                source=result.source,
                 all_scores=result.all_scores,
                 elapsed_ms=result.elapsed_ms,
                 tool_categories=tool_cats,
             )
             logger.info(
-                "[Intent] 语义路由命中: %s/%s (%.3f) %.0fms",
-                result.domain, result.intent, result.confidence, result.elapsed_ms,
+                "[Intent] 动作-对象路由命中: %s/%s (%.2f) verb=%s noun=%s %.0fms",
+                result.domain, result.intent, result.confidence,
+                result.verb, result.noun, result.elapsed_ms,
             )
             return intent_result
 
-    # ── Level 3: LLM 打分降级（已禁用）─────────────────────────
-    # 暂时跳过 LLM 打分，语义路由未命中时默认走 chat
-    # 如需恢复，取消下面两行注释即可：
-    # logger.info("[Intent] 语义路由未命中，降级到 LLM 打分")
-    # return _llm_fallback(message, model, provider, history)
-    logger.info("[Intent] 语义路由未命中，LLM 降级已禁用，走默认 chat")
+    # ── Level 3: 语义路由兜底（已禁用 LLM 降级）────────────────
+    logger.info("[Intent] 动作-对象路由未命中，走默认 chat")
     params = _extract_params(message)
     return IntentResult(domain="chat", intent="unmatched", confidence=0.0, params=params, source="fallback")
 
@@ -506,6 +524,15 @@ def format_intent_for_agent(intent: IntentResult, original_message: str) -> str:
         parts.append(f"[参数] {json.dumps(intent.params, ensure_ascii=False)}")
     if intent.tool_categories:
         parts.append(f"[工具分类] {', '.join(intent.tool_categories)}")
+
+    # 工具链：建议执行步骤
+    tool_chain = intent.metadata.get("tool_chain", [])
+    if tool_chain:
+        parts.append("[工具链] 建议执行步骤（按优先级，遇到失败可自行调整）:")
+        for i, step in enumerate(tool_chain, 1):
+            parts.append(f"  {i}. {step['tool']} — {step['desc']}")
+        parts.append("  以上为建议顺序，可自行调整。")
+
     if intent.confidence < 0.6:
         parts.append(f"⚠️ 置信度较低({intent.confidence:.2f})，请结合原始消息判断")
     return "\n".join(parts)
