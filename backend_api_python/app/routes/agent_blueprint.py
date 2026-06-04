@@ -232,6 +232,7 @@ def agent_chat():
                 "session_id": session_id, "error": result.error,
                 "total_steps": result.total_steps, "total_tokens": result.total_tokens,
                 "model": result.model, "tool_calls_log": result.tool_calls_log,
+                "charts": result.charts,
             })
         finally:
             _release_user_lock(g.user_id)

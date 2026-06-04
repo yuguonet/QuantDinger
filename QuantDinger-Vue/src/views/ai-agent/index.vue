@@ -362,6 +362,16 @@ export default {
           strategy_id: selectedStrategy.value || undefined,
           context: stockCode.value ? { stock_code: stockCode.value } : undefined
         })
+        // 处理后端返回的图表数据（非流式模式）
+        if (data.charts && data.charts.length > 0) {
+          const last = messages.value[messages.value.length - 1]
+          if (last) {
+            if (!last.charts) last.charts = []
+            data.charts.forEach(b64 => {
+              try { last.charts.push(atob(b64)) } catch (e) { /* ignore */ }
+            })
+          }
+        }
         updateLastMessage(data.content || '无响应')
         connected.value = true
       } catch (e) {

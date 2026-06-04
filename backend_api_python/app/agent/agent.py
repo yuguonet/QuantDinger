@@ -265,6 +265,12 @@ def _step_to_events(step) -> List[Dict[str, Any]]:
         if step.observation:
             import re
             obs = step.observation
+            # smolagents 可能返回 dict 而非 str
+            if isinstance(obs, dict):
+                # 优先取 message 字段（工具返回值的标准字段）
+                obs = obs.get("message", "") or str(obs)
+            elif not isinstance(obs, str):
+                obs = str(obs)
             # 提取图表标记，单独发给前端
             chart_match = re.search(r'__CHART_B64__([A-Za-z0-9+/=]+)__END_CHART__', obs)
             if chart_match:
@@ -326,11 +332,25 @@ def _step_to_events(step) -> List[Dict[str, Any]]:
                 })
 
         if step.observations:
-            events.append({
-                "type": "tool_info",
-                "tool": step.tool_calls[0].name if step.tool_calls else "",
-                "message": step.observations[:2000],
-            })
+            import re as _re
+            obs_text = step.observations
+            if not isinstance(obs_text, str):
+                obs_text = str(obs_text)
+            # ActionStep 也可能携带图表标记（code-based tool call 场景）
+            _chart_m = _re.search(r'__CHART_B64__([A-Za-z0-9+/=]+)__END_CHART__', obs_text)
+            if _chart_m:
+                events.append({
+                    "type": "chart",
+                    "tool": step.tool_calls[0].name if step.tool_calls else "",
+                    "b64": _chart_m.group(1),
+                })
+                obs_text = (obs_text[:_chart_m.start()] + obs_text[_chart_m.end():]).strip()
+            if obs_text:
+                events.append({
+                    "type": "tool_info",
+                    "tool": step.tool_calls[0].name if step.tool_calls else "",
+                    "message": obs_text[:2000],
+                })
 
         if step.error:
             events.append({
@@ -502,7 +522,7 @@ def get_smolagent(
 
 class AgentResult:
     def __init__(self, success=False, content="", tool_calls_log=None,
-                 total_steps=0, total_tokens=0, model="", error=None):
+                 total_steps=0, total_tokens=0, model="", error=None, charts=None):
         self.success = success
         self.content = content
         self.tool_calls_log = tool_calls_log or []
@@ -510,6 +530,7 @@ class AgentResult:
         self.total_tokens = total_tokens
         self.model = model
         self.error = error
+        self.charts = charts or []
 
 
 def build_agent_executor(
@@ -663,6 +684,8 @@ class _AgentExecutor:
                 total_tokens = (tu.input_tokens + tu.output_tokens) if tu else 0
                 success = result.state == "success"
                 tool_calls_log = []
+                charts_b64 = []
+                import re as _re_chat
                 for sd in result.steps:
                     if sd.get("type") == "action":
                         for tc in sd.get("tool_calls", []):
@@ -672,10 +695,16 @@ class _AgentExecutor:
                                 "success": sd.get("error") is None,
                                 "duration": sd.get("timing", {}).get("duration", 0),
                             })
+                    # 从所有步骤的 observations 中提取图表标记
+                    obs = sd.get("observations") or sd.get("observation") or ""
+                    if obs and isinstance(obs, str):
+                        for _cm in _re_chat.finditer(r'__CHART_B64__([A-Za-z0-9+/=]+)__END_CHART__', obs):
+                            charts_b64.append(_cm.group(1))
             else:
                 content = str(result) if result else ""
                 total_steps = total_tokens = 0
                 tool_calls_log = []
+                charts_b64 = []
                 success = bool(content)
 
             store.add_message(session_id, "assistant", content)
@@ -702,6 +731,7 @@ class _AgentExecutor:
                 total_steps=total_steps, total_tokens=total_tokens,
                 model=str(getattr(agent.model, "model_id", "")),
                 error=None if success else "Agent did not produce a final answer",
+                charts=charts_b64,
             )
         except Exception as e:
             logger.error("[Agent] chat failed: %s", e, exc_info=True)

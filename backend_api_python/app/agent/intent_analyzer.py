@@ -239,9 +239,14 @@ def analyze_intent(
             )
             return intent_result
 
-    # ── Level 3: LLM 打分降级 ──────────────────────────────────
-    logger.info("[Intent] 语义路由未命中，降级到 LLM 打分")
-    return _llm_fallback(message, model, provider, history)
+    # ── Level 3: LLM 打分降级（已禁用）─────────────────────────
+    # 暂时跳过 LLM 打分，语义路由未命中时默认走 chat
+    # 如需恢复，取消下面两行注释即可：
+    # logger.info("[Intent] 语义路由未命中，降级到 LLM 打分")
+    # return _llm_fallback(message, model, provider, history)
+    logger.info("[Intent] 语义路由未命中，LLM 降级已禁用，走默认 chat")
+    params = _extract_params(message)
+    return IntentResult(domain="chat", intent="unmatched", confidence=0.0, params=params, source="fallback")
 
 
 # ═══════════════════════════════════════════════════════════════
