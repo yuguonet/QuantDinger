@@ -35,6 +35,11 @@ def get_user_id() -> int:
     return _tool_context.get({}).get("user_id", 1)
 
 
+def get_domain() -> str:
+    """Get current domain from context."""
+    return _tool_context.get({}).get("domain", "default")
+
+
 def get_progress_callback() -> Optional[Callable]:
     """Get current progress_callback from context (for real-time streaming)."""
     return _tool_context.get({}).get("progress_callback")

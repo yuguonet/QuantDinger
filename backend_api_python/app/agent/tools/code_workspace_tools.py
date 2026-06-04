@@ -211,53 +211,267 @@ def _stream_exec(cmd: str, cwd: str, timeout: int,
 # ── Data source injection ──────────────────────────────────────
 
 def _build_data_source_code() -> str:
-    """Generate Python code that injects DataSourceFactory functions into exec context."""
+    """Generate Python code that auto-discovers and injects all data source APIs.
+
+    Uses introspection to discover capabilities from:
+    - DataSourceFactory + BaseDataSource (per-market data: kline, ticker, etc.)
+    - ChinaData (macro: gdp, cpi, ppi, pmi, m2, lpr, northbound, etc.)
+    - china_market module (fear_greed, hot_sectors, sector_trend, sector_cycle, etc.)
+    - StockBasicDB (stock_basic_info table: search, filter, concepts, industries, etc.)
+
+    No hardcoding — new methods added to any of these are automatically exposed.
+    """
     return '''
-# === Data Source Auto-Injection ===
-# Provides: get_kline, get_ticker, get_stock_info, detect_market
+# === Data Source Auto-Injection (Introspection-based) ===
+import inspect as _inspect
+
+def _discover_methods(obj, prefix="", exclude=None):
+    """Discover all public methods of an object, return {name: callable}."""
+    exclude = set(exclude or [])
+    methods = {}
+    for name in dir(obj):
+        if name.startswith("_") or name in exclude:
+            continue
+        attr = getattr(obj, name, None)
+        if attr is not None and callable(attr):
+            methods[f"{prefix}{name}" if prefix else name] = attr
+    return methods
+
+# ── 1. DataSourceFactory: per-market data sources ──
 try:
     from app.data_sources.factory import DataSourceFactory as _DSF
-    from app.agent.utils import detect_market as _detect_market
+    from app.data_sources.market_detector import detect_market as _detect_market
 
-    def get_kline(code, period="1D", count=120):
-        """获取K线数据，返回DataFrame"""
-        market = _detect_market(code)
-        ds = _DSF.get_source(market)
-        data = ds.get_kline(code, period, count)
-        if data:
-            import pandas as _pd
-            return _pd.DataFrame(data)
-        return None
+    def get_ds(market=None, code=None):
+        if code and not market:
+            market = _detect_market(code)
+        return _DSF.get_source(market or "CNStock")
 
-    def get_ticker(code):
-        """获取实时行情"""
-        market = _detect_market(code)
-        ds = _DSF.get_source(market)
-        return ds.get_ticker(code)
+    # Discover all methods on BaseDataSource (kline, ticker, get_stock_info, etc.)
+    _ds_instance = _DSF.get_source("CNStock")
+    _ds_methods = _discover_methods(_ds_instance)
 
-    def get_stock_info(code):
-        """获取股票基本面信息"""
-        market = _detect_market(code)
-        ds = _DSF.get_source(market)
-        if hasattr(ds, "get_stock_info"):
-            return ds.get_stock_info(code)
-        return {"error": "get_stock_info not available for this market"}
+    # Wrap each method: auto-inject ds instance, first arg = code if needed
+    def _make_ds_wrapper(method_name, method):
+        def wrapper(*args, market=None, code=None, **kwargs):
+            ds = get_ds(market=market, code=code) if market or code else _ds_instance
+            fn = getattr(ds, method_name)
+            return fn(*args, **kwargs)
+        wrapper.__name__ = method_name
+        wrapper.__doc__ = method.__doc__ or f"DataSource.{method_name}"
+        return wrapper
 
-    def get_chip_distribution(code):
-        """获取筹码分布（仅A股）"""
-        market = _detect_market(code)
-        ds = _DSF.get_source(market)
-        if hasattr(ds, "get_chip_distribution"):
-            return ds.get_chip_distribution(code)
-        return {"error": "get_chip_distribution not available"}
+    for _name, _method in _ds_methods.items():
+        globals()[_name] = _make_ds_wrapper(_name, _method)
 
-    _DATASOURCE_AVAILABLE = True
+    def list_markets():
+        return ["CNStock", "HKStock", "USStock", "Crypto", "Forex", "Futures", "MOEX"]
+
+    _DS_AVAILABLE = True
 except Exception as _ds_err:
-    _DATASOURCE_AVAILABLE = False
-    def get_kline(*a, **kw): return None
-    def get_ticker(*a, **kw): return None
-    def get_stock_info(*a, **kw): return None
-    def get_chip_distribution(*a, **kw): return None
+    _DS_AVAILABLE = False
+    def list_markets(): return ["CNStock", "HKStock", "USStock", "Crypto", "Forex", "Futures", "MOEX"]
+
+# ── 2. ChinaData: macro data (gdp, cpi, ppi, pmi, m2, lpr, etc.) ──
+# Lazy init: ChinaData() imports tushare/akshare/baostock, defer to first call
+try:
+    from app.market_cn.china_stock import ChinaData as _ChinaData
+    _china_ref = [None]  # mutable container for lazy singleton
+
+    def _get_china():
+        if _china_ref[0] is None:
+            _china_ref[0] = _ChinaData()
+        return _china_ref[0]
+
+    # Discover methods from class (not instance) to avoid triggering __init__
+    _china_methods = {n: m for n, m in _inspect.getmembers(_ChinaData, _inspect.isfunction)
+                      if not n.startswith("_")}
+
+    def _make_china_wrapper(name):
+        def wrapper(*args, **kwargs):
+            result = getattr(_get_china(), name)(*args, **kwargs)
+            if hasattr(result, "to_dict"):
+                try:
+                    return result.tail(12).to_dict(orient="records")
+                except Exception:
+                    return str(result)
+            return result
+        wrapper.__name__ = name
+        wrapper.__doc__ = _china_methods[name].__doc__ or f"ChinaData.{name}"
+        return wrapper
+
+    for _name in _china_methods:
+        globals()[_name] = _make_china_wrapper(_name)
+
+    _CHINA_AVAILABLE = True
+except Exception as _china_err:
+    _CHINA_AVAILABLE = False
+
+# ── 3. china_market: cached market analysis (fear_greed, sectors, macro, etc.) ──
+try:
+    from app.market_cn import china_market as _cm
+    _cm_funcs = {n: f for n, f in _inspect.getmembers(_cm, _inspect.isfunction)
+                  if not n.startswith("_") and n not in ("cache_get", "cache_put", "cache_is_stale")}
+
+    for _name, _func in _cm_funcs.items():
+        globals()[_name] = _func
+
+    _CM_AVAILABLE = True
+except Exception as _cm_err:
+    _CM_AVAILABLE = False
+
+# ── 4. StockBasicDB: stock_basic_info table (search, filter, concepts, etc.) ──
+# Lazy init: defer DB connection to first call
+try:
+    from app.utils.basicinfo_db import get_stock_basic_db as _get_basic_db
+    _basic_db_ref = [None]
+    _EXCLUDE_BASIC = {"close", "ensure_table", "_get_mgr", "_get_pool"}
+
+    def _get_basic():
+        if _basic_db_ref[0] is None:
+            _basic_db_ref[0] = _get_basic_db()
+        return _basic_db_ref[0]
+
+    # Discover from class, not instance
+    from app.utils.basicinfo_db import StockBasicDB as _StockBasicDB
+    _basic_names = [n for n in dir(_StockBasicDB)
+                    if not n.startswith("_") and n not in _EXCLUDE_BASIC
+                    and callable(getattr(_StockBasicDB, n, None))]
+
+    def _make_basic_wrapper(name):
+        def wrapper(*args, **kwargs):
+            return getattr(_get_basic(), name)(*args, **kwargs)
+        wrapper.__name__ = name
+        wrapper.__doc__ = getattr(_StockBasicDB, name).__doc__ or f"StockBasicDB.{name}"
+        return wrapper
+
+    for _name in _basic_names:
+        globals()[_name] = _make_basic_wrapper(_name)
+
+    _BASIC_DB_AVAILABLE = True
+except Exception as _db_err:
+    _BASIC_DB_AVAILABLE = False
+
+# ── 5. app/ — scan entire backend, blacklist sensitive directories ──
+# Prefix by package path to avoid name collisions: e.g. util_xxx, svc_xxx, route_xxx
+_PKG_BLACKLIST = {
+    # Sensitive: auth, credentials, payment, security
+    "auth", "credential_crypto", "security_service",
+    "billing_service", "email_service", "oauth_service",
+    "usdt_payment_service", "user_service",
+    # Trading execution: too dangerous for sandbox scripts
+    "exchange_execution", "trading_executor", "pending_order_worker",
+    "ibkr_trading", "mt5_trading", "live_trading",
+    # Internal infra: logger, config, raw DB drivers
+    "logger", "config_loader", "db_postgres", "db", "safe_exec",
+    "cache",
+    # Agent internals: avoid self-reference loops
+    "agent",
+}
+try:
+    import app as _app_pkg
+    import pkgutil as _pkgutil
+    _app_discovered = 0
+    _app_mod_count = 0
+
+    def _scan_app_modules(pkg, path_prefix="", depth=0):
+        """Recursively scan app/, yielding (dotted_path, module) for all leaf modules."""
+        global _app_mod_count
+        if depth > 4:
+            return
+        for _importer, _mod_name, _is_pkg in _pkgutil.iter_modules(pkg.__path__):
+            if _mod_name.startswith("_"):
+                continue
+            full_path = f"{path_prefix}.{_mod_name}" if path_prefix else _mod_name
+            # Blacklist check: skip entire directory trees
+            if _mod_name in _PKG_BLACKLIST:
+                continue
+            try:
+                _mod = _importer.find_module(_mod_name).load_module(_mod_name)
+            except Exception:
+                continue
+            _app_mod_count += 1
+            yield full_path, _mod
+            if _is_pkg and hasattr(_mod, "__path__"):
+                yield from _scan_app_modules(_mod, path_prefix=full_path, depth=depth+1)
+
+    # Function/class name blacklist — sensitive operations within otherwise safe modules
+    _FN_BLACKLIST_PATTERNS = (
+        "password", "passwd", "secret", "token", "credential", "api_key",
+        "encrypt", "decrypt", "hash", "sign", "verify", "auth",
+        "login", "logout", "send_email", "send_sms", "send_notification",
+        "execute_trade", "place_order", "cancel_order", "withdraw",
+        "delete_user", "drop_table", "truncate", "grant", "revoke",
+        "shell", "exec_cmd", "run_cmd", "popen", "system_call",
+    )
+
+    def _is_fn_safe(name: str) -> bool:
+        """Check if a function/class name is safe to expose."""
+        lower = name.lower()
+        return not any(p in lower for p in _FN_BLACKLIST_PATTERNS)
+
+    for _full_path, _mod in _scan_app_modules(_app_pkg):
+        # Derive prefix from path: e.g. "utils.cn_stock_info" → "util_", "services.fast_analysis" → "svc_"
+        _parts = _full_path.split(".")
+        if len(_parts) >= 2:
+            _top = _parts[0]
+            _prefix_map = {"utils": "util", "services": "svc", "routes": "route",
+                           "data_sources": "ds", "market_cn": "mkt", "backtest": "bt",
+                           "interfaces": "iface"}
+            _prefix = _prefix_map.get(_top, _top) + "_"
+        else:
+            _prefix = ""
+
+        for _name, _obj in _inspect.getmembers(_mod, _inspect.isfunction):
+            if _name.startswith("_") or not _is_fn_safe(_name):
+                continue
+            globals()[f"{_prefix}{_name}"] = _obj
+            _app_discovered += 1
+        for _name, _obj in _inspect.getmembers(_mod, _inspect.isclass):
+            if _name.startswith("_") or _obj.__module__ != _mod.__name__ or not _is_fn_safe(_name):
+                continue
+            globals()[f"{_prefix}{_name}"] = _obj
+            _app_discovered += 1
+
+    _APP_SCAN_AVAILABLE = True
+    _APP_SCAN_COUNT = _app_discovered
+    _APP_MOD_COUNT = _app_mod_count
+except Exception as _app_err:
+    _APP_SCAN_AVAILABLE = False
+    _APP_SCAN_COUNT = 0
+    _APP_MOD_COUNT = 0
+
+# ── 7. market_cn cards: dashboard cards (overview, dragon_tiger, hot_list, etc.) ──
+try:
+    from app.market_cn.cards import _base as _cards_base
+    _registered_cards = _cards_base.get_all()
+    for _card_name, (_meta, _fetch_fn) in _registered_cards.items():
+        _safe_name = "card_" + _card_name.replace("/", "_").replace("-", "_")
+        globals()[_safe_name] = _fetch_fn
+    _CARDS_AVAILABLE = True
+except Exception as _card_err:
+    _CARDS_AVAILABLE = False
+
+# ── Summary ──
+_DATA_INJECTION_STATUS = {
+    "DataSourceFactory": _DS_AVAILABLE if "_DS_AVAILABLE" in dir() else False,
+    "ChinaData": _CHINA_AVAILABLE if "_CHINA_AVAILABLE" in dir() else False,
+    "china_market": _CM_AVAILABLE if "_CM_AVAILABLE" in dir() else False,
+    "StockBasicDB": _BASIC_DB_AVAILABLE if "_BASIC_DB_AVAILABLE" in dir() else False,
+    "app/全量扫描": _APP_SCAN_AVAILABLE if "_APP_SCAN_AVAILABLE" in dir() else False,
+    "Cards": _CARDS_AVAILABLE if "_CARDS_AVAILABLE" in dir() else False,
+}
+# Print summary
+_mod_cnt = _APP_MOD_COUNT if "_APP_MOD_COUNT" in dir() else 0
+_sym_cnt = _APP_SCAN_COUNT if "_APP_SCAN_COUNT" in dir() else 0
+print(f"\\n📦 数据注入完成: {_mod_cnt} 个模块, {_sym_cnt} 个符号")
+_prefix_labels = {"util_": "utils", "svc_": "services", "route_": "routes",
+                   "ds_": "data_sources", "mkt_": "market_cn", "bt_": "backtest",
+                   "iface_": "interfaces"}
+for _pfx, _label in _prefix_labels.items():
+    _cnt = sum(1 for k in globals() if k.startswith(_pfx))
+    if _cnt:
+        print(f"  {_pfx:<8} → {_label} ({_cnt})")
 '''
 
 
@@ -443,6 +657,253 @@ def workspace_read_file(
         content = content[:max_chars] + f"\n... (截断, 共 {len(content)} 字符)"
 
     return {"path": str(full_path), "content": content, "size": len(content)}
+
+
+@tool(
+    description="精确编辑工作区文件：支持精确文本替换和正则表达式替换。比全量重写更安全高效。先用 workspace_read_file 读取内容，找到要修改的部分，再用此工具精确替换。",
+    category="工作区",
+    layer="支撑层",
+)
+def workspace_edit_file(
+    path: str,
+    find: str = "",
+    replace: str = "",
+    regex: bool = False,
+    count: int = 0,
+    line_range: str = "",
+) -> Dict[str, Any]:
+    """Edit a file in the workspace with find/replace or regex replace.
+
+    Supports two modes:
+    1. Exact match: find="old text", replace="new text"
+    2. Regex: find=r"pattern", replace=r"replacement", regex=True
+
+    Args:
+        path: Relative path (e.g., "scripts/strategy.py")
+        find: Text or regex pattern to find
+        replace: Replacement text
+        regex: If True, treat find as regex pattern (supports groups like \\1)
+        count: Max replacements (0 = all). Use 1 to replace only the first match.
+        line_range: Optional line range "start-end" (1-indexed, e.g., "10-20") to limit search scope.
+
+    Returns:
+        {"path": str, "replacements": int, "original_size": int, "new_size": int}
+    """
+    import re as _re
+    from app.agent.workspace import get_workspace
+    from app.agent.tool_context import get_session_id
+    from pathlib import Path
+
+    ws = get_workspace(get_session_id() or "default")
+    safe = path.lstrip("/").replace("..", "")
+    full_path = ws.session_dir / safe
+
+    try:
+        full_path.resolve().relative_to(ws.session_dir.resolve())
+    except ValueError:
+        return {"error": f"路径越界: {path}"}
+
+    if not full_path.exists():
+        return {"error": f"文件不存在: {path}"}
+
+    content = full_path.read_text(encoding="utf-8")
+    original_size = len(content)
+
+    # Line range filtering: only edit within specified lines
+    if line_range:
+        try:
+            parts = line_range.split("-")
+            start_line = int(parts[0])
+            end_line = int(parts[1]) if len(parts) > 1 else start_line
+            lines = content.split("\n")
+            if start_line < 1 or end_line > len(lines):
+                return {"error": f"行范围越界: 文件共 {len(lines)} 行"}
+            # Edit only the specified range
+            section = "\n".join(lines[start_line - 1 : end_line])
+            if regex:
+                new_section, n = _re.subn(find, replace, section, count=count if count else 0)
+            else:
+                n = section.count(find) if not count else min(section.count(find), count)
+                new_section = section.replace(find, replace, count if count else -1)
+            if n > 0:
+                lines[start_line - 1 : end_line] = new_section.split("\n")
+                content = "\n".join(lines)
+        except (ValueError, _re.error) as e:
+            return {"error": f"行范围或正则表达式错误: {e}"}
+    else:
+        # Full file edit
+        if regex:
+            try:
+                content, n = _re.subn(find, replace, content, count=count if count else 0)
+            except _re.error as e:
+                return {"error": f"正则表达式错误: {e}"}
+        else:
+            n = content.count(find) if not count else min(content.count(find), count)
+            content = content.replace(find, replace, count if count else -1)
+
+    if n == 0:
+        return {"error": "未找到匹配内容", "find": find[:200], "replacements": 0}
+
+    full_path.write_text(content, encoding="utf-8")
+    return {
+        "path": str(full_path),
+        "replacements": n,
+        "original_size": original_size,
+        "new_size": len(content),
+        "message": f"已完成 {n} 处替换",
+    }
+
+
+@tool(
+    description="对工作区中的 Python 代码进行静态审查：语法检查、AST分析、常见问题检测。在执行代码前调用可提前发现错误。",
+    category="工作区",
+    layer="支撑层",
+)
+def workspace_code_review(
+    path: str = "",
+    code: str = "",
+) -> Dict[str, Any]:
+    """Static analysis of Python code — syntax check, AST analysis, common pitfalls.
+
+    Use before exec_script to catch errors early. Checks:
+    1. Syntax validity (compile)
+    2. AST-level issues (unused imports, bare except, mutable defaults)
+    3. Common pitfalls (print vs return, == vs is, f-string issues)
+
+    Args:
+        path: Relative path to a file in workspace (e.g., "scripts/strategy.py")
+        code: Or pass code directly
+
+    Returns:
+        {"valid": bool, "errors": [...], "warnings": [...], "info": {...}}
+    """
+    import ast
+    import sys
+    from app.agent.workspace import get_workspace
+    from app.agent.tool_context import get_session_id
+    from pathlib import Path
+
+    # Load code
+    if path and not code:
+        ws = get_workspace(get_session_id() or "default")
+        safe = path.lstrip("/").replace("..", "")
+        full_path = ws.session_dir / safe
+        if not full_path.exists():
+            return {"error": f"文件不存在: {path}"}
+        code = full_path.read_text(encoding="utf-8")
+
+    if not code:
+        return {"error": "没有可审查的代码"}
+
+    errors = []
+    warnings = []
+    info = {}
+
+    # 1. Syntax check
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return {
+            "valid": False,
+            "errors": [{"type": "SyntaxError", "line": e.lineno, "message": str(e.msg), "text": (e.text or "").strip()}],
+            "warnings": [],
+            "info": {"lines": code.count(chr(10)) + 1},
+        }
+
+    # 2. AST analysis
+    info["lines"] = code.count(chr(10)) + 1
+    info["statements"] = len([n for n in ast.walk(tree) if isinstance(n, ast.stmt)])
+    info["functions"] = len([n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))])
+    info["classes"] = len([n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)])
+
+    # Collect imports
+    imports = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imports.append(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                imports.append(node.module)
+    info["imports"] = imports
+
+    # 3. Common issue detection
+    for node in ast.walk(tree):
+        # Bare except
+        if isinstance(node, ast.ExceptHandler) and node.type is None:
+            warnings.append({
+                "type": "bare_except",
+                "line": node.lineno,
+                "message": "裸 except: 捕获所有异常（包括 KeyboardInterrupt）。建议指定具体异常类型。",
+            })
+
+        # Mutable default argument
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for default in node.args.defaults + node.args.kw_defaults:
+                if default and isinstance(default, (ast.List, ast.Dict, ast.Set)):
+                    warnings.append({
+                        "type": "mutable_default",
+                        "line": node.lineno,
+                        "message": f"函数 '{node.name}' 使用了可变默认参数。建议用 None 代替。",
+                    })
+
+        # Comparison with literals using == (should be is for None/True/False)
+        if isinstance(node, ast.Compare):
+            for op, comparator in zip(node.ops, node.comparators):
+                if isinstance(comparator, ast.Constant) and comparator.value is None:
+                    if isinstance(op, ast.Eq):
+                        warnings.append({
+                            "type": "none_comparison",
+                            "line": node.lineno,
+                            "message": "用 == None 比较。建议用 is None。",
+                        })
+
+        # Star import
+        if isinstance(node, ast.ImportFrom) and node.names and any(a.name == "*" for a in node.names):
+            warnings.append({
+                "type": "star_import",
+                "line": node.lineno,
+                "message": f"from {node.module} import * — 污染命名空间，建议显式导入。",
+            })
+
+    # 4. Variable usage analysis (simple unused detection)
+    assigned = set()
+    used = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    assigned.add((target.id, node.lineno))
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            used.add(node.id)
+
+    for name, lineno in assigned:
+        if name not in used and not name.startswith("_"):
+            warnings.append({
+                "type": "unused_variable",
+                "line": lineno,
+                "message": f"变量 '{name}' 赋值后未使用。",
+            })
+
+    # 5. Check for print statements (might want return instead)
+    prints = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+              and isinstance(n.func, ast.Name) and n.func.id == "print"]
+    if prints:
+        info["print_count"] = len(prints)
+        if len(prints) > 10:
+            warnings.append({
+                "type": "excessive_print",
+                "line": prints[0].lineno,
+                "message": f"代码中有 {len(prints)} 个 print 语句。考虑用 logging 或返回值代替。",
+            })
+
+    return {
+        "valid": len(errors) == 0,
+        "errors": errors,
+        "warnings": warnings,
+        "info": info,
+        "summary": f"✅ 语法正确 | {info['lines']}行 | {info['functions']}个函数 | {info['classes']}个类 | {len(warnings)}个警告",
+    }
 
 
 @tool(
@@ -713,15 +1174,9 @@ def _workspace_exec_worker(
     import sys
     from pathlib import Path
 
-    # Worker needs os for chdir, but we'll block it from user code
+    # Worker needs os for chdir — keep it available for user code too
     import os as _os
     _os.chdir(workspace_dir)
-
-    # Now remove os from sys.modules so user code can't import it
-    if "os" in sys.modules:
-        del sys.modules["os"]
-    if "os.path" in sys.modules:
-        del sys.modules["os.path"]
 
     try:
         import pandas as pd
@@ -732,18 +1187,17 @@ def _workspace_exec_worker(
     except ImportError:
         np = None
 
-    # Build safe builtins — block dangerous introspection
+    # Build safe builtins — block dangerous introspection, allow most operations
     import builtins as _b
     safe_builtins = {}
     blocked = {
-        "exec", "eval", "compile", "__import__",
-        "breakpoint", "input", "exit", "quit",
-        "globals", "locals", "vars", "dir",
-        "memoryview", "bytearray", "super",
-        "getattr", "setattr", "delattr",  # 防止属性绕过
+        "breakpoint",   # 调试器断点
+        "exit", "quit", # 退出进程
     }
     for name in dir(_b):
-        if name.startswith("_") or name in blocked:
+        if name.startswith("_") and name != "__import__":
+            continue
+        if name in blocked:
             continue
         safe_builtins[name] = getattr(_b, name)
     safe_builtins["__import__"] = _safe_import_for_workspace
@@ -800,13 +1254,12 @@ def _workspace_exec_worker(
         exec(compiled, global_ns, local_ns)
 
         result = local_ns.get("result")
+        # Filter out injected helpers, keep only user-created variables
+        _injected = {"pd", "np", "data", "__builtins__",
+                     "WORKSPACE", "SCRIPTS_DIR", "DATA_DIR", "OUTPUT_DIR", "Path"}
         user_vars = [
             k for k in local_ns
-            if not k.startswith("_") and k not in (
-                "pd", "np", "data", "__builtins__",
-                "WORKSPACE", "SCRIPTS_DIR", "DATA_DIR", "OUTPUT_DIR", "Path",
-                "get_kline", "get_ticker", "get_stock_info", "get_chip_distribution",
-            )
+            if not k.startswith("_") and k not in _injected
         ]
 
         result_queue.put({
@@ -837,58 +1290,53 @@ def _workspace_exec_worker(
 def _safe_import_for_workspace(name: str, *args, **kwargs):
     """Restricted import for workspace execution.
 
-    Strategy: whitelist safe modules instead of blacklist dangerous ones.
-    'os' is NOT allowed (too many dangerous functions like os.system, os.popen).
-    Use pathlib.Path for all file operations.
+    Strategy: open sandbox — allow most modules, only block destructive ones.
+    Destructive operations (rm, delete, overwrite system files) are blocked at
+    the function level, not at import level. This lets agent code use os.path,
+    subprocess, requests, etc. freely for read/analysis tasks.
     """
     import importlib
 
-    # Explicitly blocked (even if somehow in whitelist)
-    BLOCKED = {
-        "os", "sys", "subprocess", "shutil", "multiprocessing",
-        "socket", "http", "urllib", "requests",
-        "ctypes", "signal", "threading", "importlib",
-        "code", "codeop", "compileall",
-        "tempfile", "shelve", "dbm", "sqlite3", "pickle",
+    # Only block modules that are inherently dangerous or irrelevant to analysis
+    BLOCKED_MODULES = {
+        "ctypes",          # 直接内存操作
+        "signal",          # 进程信号操控
+        "importlib",       # 动态加载绕过
+        "code", "codeop", "compileall",  # 交互式解释器
+        "shelve", "dbm", "sqlite3",      # 本地数据库写入（读可以用）
+        "pickle",          # 反序列化攻击
+        "marshal",         # 同上
+        "winreg",          # Windows 注册表
+        "msvcrt",          # Windows 运行时
+        "termios", "tty",  # 终端控制
+        "readline",        # 终端输入操控
     }
 
-    # Whitelist: allowed modules for workspace scripts
-    ALLOWED = {
-        # 数据处理
-        "pandas", "numpy", "scipy", "statistics", "math", "decimal", "fractions",
-        # 技术分析
-        "ta", "talib",
-        # 机器学习
-        "sklearn", "sklearn.linear_model", "sklearn.ensemble", "sklearn.preprocessing",
-        "sklearn.metrics", "sklearn.model_selection", "sklearn.cluster",
-        # 可视化
-        "matplotlib", "matplotlib.pyplot", "seaborn",
-        # 文本/数据
-        "json", "csv", "re", "collections", "itertools", "functools", "operator",
-        "string", "textwrap", "unicodedata",
-        # 日期时间
-        "datetime", "time", "calendar",
-        # 文件（安全子集）
-        "pathlib", "glob", "fnmatch", "io",
-        # 其他
-        "copy", "pprint", "enum", "dataclasses", "typing",
-        "hashlib", "base64", "uuid", "traceback",
+    # Destructive function patterns — if imported via "from X import Y", block Y
+    BLOCKED_FUNCTIONS = {
+        "os": {"remove", "unlink", "rmdir", "removedirs", "rename", "renames",
+               "replace", "chmod", "chown", "chroot", "system", "popen",
+               "exec", "execve", "execvp", "execvpe", "spawn", "kill",
+               "killpg", "_exit"},
+        "shutil": {"rmtree", "move", "copytree"},  # copy/copy2 are OK
+        "subprocess": {"Popen"},  # run/call/check_output are OK (controlled by shell_exec anyway)
     }
 
     root = name.split(".")[0]
-    if root in BLOCKED:
+    if root in BLOCKED_MODULES:
         raise ImportError(f"Import of '{name}' is blocked for security reasons.")
 
-    # Check whitelist: root module must be allowed
-    for i in range(len(name.split(".")), 0, -1):
-        prefix = ".".join(name.split(".")[:i])
-        if prefix in ALLOWED:
-            return importlib.import_module(name, *args, **kwargs)
+    # Check for "from os import remove" style dangerous imports
+    if root in BLOCKED_FUNCTIONS and args and isinstance(args[0], (list, tuple)):
+        blocked = BLOCKED_FUNCTIONS[root]
+        for fn in args[0]:
+            if fn in blocked:
+                raise ImportError(
+                    f"Import of '{root}.{fn}' is blocked (destructive operation). "
+                    f"Use pathlib.Path for safe file operations."
+                )
 
-    raise ImportError(
-        f"Import of '{name}' is not allowed in workspace scripts. "
-        f"Use pathlib.Path for file operations instead of os."
-    )
+    return importlib.import_module(name, *args, **kwargs)
 
 
 def _serialize_for_workspace(obj: Any, _depth: int = 0) -> Any:

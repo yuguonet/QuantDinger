@@ -771,9 +771,45 @@ _workspaces: Dict[str, CodeWorkspace] = {}
 _lock = threading.Lock()
 
 
-def get_workspace(session_id: str) -> CodeWorkspace:
-    """Get or create a workspace for the given session."""
+def get_workspace(session_id: str = "", user_id: int = 0, domain: str = "") -> CodeWorkspace:
+    """Get or create a workspace with per-user, per-domain isolation.
+
+    Composite key: {user_id}:{domain}:{session_id}
+    - user_id: isolates different users' workspaces
+    - domain: isolates different analysis domains (analysis, backtest, screening, etc.)
+    - session_id: isolates different sessions within same user+domain
+
+    If user_id/domain not provided, falls back to tool_context auto-detection.
+    Directory structure: workspaces/{user_id}/{domain}/{session_id}/
+    """
+    # Auto-detect from context if not provided
+    if not user_id or not domain:
+        try:
+            from app.agent.tool_context import get_user_id, get_tool_context
+            if not user_id:
+                user_id = get_user_id()
+            if not domain:
+                ctx = get_tool_context()
+                domain = ctx.get("domain", "default")
+        except Exception:
+            pass
+
+    user_id = user_id or 0
+    domain = (domain or "default").replace("/", "_").replace("\\", "_")
+    session_id = session_id or "default"
+
+    # Composite key for in-memory cache
+    cache_key = f"{user_id}:{domain}:{session_id}"
+
     with _lock:
-        if session_id not in _workspaces:
-            _workspaces[session_id] = CodeWorkspace(session_id)
-        return _workspaces[session_id]
+        if cache_key not in _workspaces:
+            # Directory structure: workspaces/{user_id}/{domain}/{session_id}/
+            ws = CodeWorkspace(session_id)
+            # Override session_dir to include user_id and domain
+            ws.session_dir = ws.root / str(user_id) / domain / _safe_session_id(session_id)
+            ws.scripts_dir = ws.session_dir / "scripts"
+            ws.data_dir = ws.session_dir / "data"
+            ws.output_dir = ws.session_dir / "output"
+            ws._ensure_dirs()
+            _workspaces[cache_key] = ws
+        return _workspaces[cache_key]

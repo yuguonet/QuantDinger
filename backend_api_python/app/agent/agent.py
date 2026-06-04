@@ -593,6 +593,11 @@ class _AgentExecutor:
                     intent.domain, intent.intent, intent.confidence,
                     intent.tool_categories or [],
                 )
+                # Update tool context with domain for per-domain workspace isolation
+                from app.agent.tool_context import get_tool_context
+                _ctx = get_tool_context()
+                _ctx["domain"] = domain
+                set_tool_context(_ctx)
 
                 # ── 闲聊/greeting 快速通道：跳过 agent，直接回复 ──
                 # 本地模型（如 gemma4）经常忽略 final_answer 指令，
