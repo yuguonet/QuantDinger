@@ -2622,10 +2622,10 @@ registerOverlay({
                 const internalData = convertToInternalFormat(klineData.value)
                 updatePricePanel(internalData, { force: true })
 
-                // 更新 KLineChart - 使用 applyMoreData 保持滚动位置
-                if (chartRef.value && typeof chartRef.value.applyMoreData === 'function') {
-                  // 追加新K线，使用 applyMoreData 保持滚动位置
-                  chartRef.value.applyMoreData(uniqueNewData)
+                // 更新 KLineChart - v9.8.0+ 已移除 applyMoreData，改用 applyNewData
+                if (chartRef.value && typeof chartRef.value.applyNewData === 'function') {
+                  // 追加新K线，使用 applyNewData（合并后整体刷新）
+                  chartRef.value.applyNewData(klineData.value)
                   // 新K线出现时强制刷新一次指标
                   maybeUpdateIndicators(true)
                 } else if (chartRef.value) {
@@ -2747,8 +2747,8 @@ registerOverlay({
 
         updatePricePanelFromLastBars(arr, true)
 
-        if (chartRef.value && typeof chartRef.value.applyMoreData === 'function') {
-          chartRef.value.applyMoreData([bar])
+        if (chartRef.value && typeof chartRef.value.applyNewData === 'function') {
+          chartRef.value.applyNewData(klineData.value)
         } else if (chartRef.value) {
           chartRef.value.applyNewData(klineData.value)
         }
