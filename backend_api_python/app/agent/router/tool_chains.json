@@ -1,126 +1,306 @@
 {
     "analyze+stock": [
-        {"tool": "resolve_stock_name", "desc": "解析股票代码对应名称"},
-        {"tool": "get_realtime_quote", "desc": "获取实时行情数据"},
-        {"tool": "get_indicator_snapshot", "desc": "获取技术指标快照"},
-        {"tool": "search_stock_news", "desc": "搜索相关情报和新闻"}
+        {
+            "tool": "python_interpreter",
+            "desc": ""
+        }
     ],
     "analyze+chart": [
-        {"tool": "resolve_stock_name", "desc": "解析股票代码"},
-        {"tool": "render_candlestick", "desc": "生成K线图"},
-        {"tool": "get_indicator_snapshot", "desc": "叠加技术指标分析"}
+        {
+            "tool": "resolve_stock_name",
+            "desc": "解析股票代码"
+        },
+        {
+            "tool": "render_candlestick",
+            "desc": "生成K线图"
+        },
+        {
+            "tool": "get_indicator_snapshot",
+            "desc": "叠加技术指标分析"
+        }
     ],
     "analyze+market": [
-        {"tool": "get_market_indices", "desc": "获取大盘指数行情"},
-        {"tool": "get_zt_pool", "desc": "获取涨停池数据"},
-        {"tool": "get_dragon_tiger", "desc": "获取龙虎榜数据"}
+        {
+            "tool": "get_market_indices",
+            "desc": "获取大盘指数行情"
+        },
+        {
+            "tool": "get_zt_pool",
+            "desc": "获取涨停池数据"
+        },
+        {
+            "tool": "get_dragon_tiger",
+            "desc": "获取龙虎榜数据"
+        }
     ],
     "analyze+indicator": [
-        {"tool": "resolve_stock_name", "desc": "解析股票代码"},
-        {"tool": "get_indicator_snapshot", "desc": "获取指标快照"},
-        {"tool": "analyze_trend", "desc": "趋势分析"}
+        {
+            "tool": "resolve_stock_name",
+            "desc": "解析股票代码"
+        },
+        {
+            "tool": "get_indicator_snapshot",
+            "desc": "获取指标快照"
+        },
+        {
+            "tool": "analyze_trend",
+            "desc": "趋势分析"
+        }
     ],
     "analyze+fund_flow": [
-        {"tool": "resolve_stock_name", "desc": "解析股票代码"},
-        {"tool": "get_fund_flow", "desc": "获取个股资金流向"},
-        {"tool": "get_sector_fund_flow", "desc": "获取板块资金流向"}
+        {
+            "tool": "resolve_stock_name",
+            "desc": "解析股票代码"
+        },
+        {
+            "tool": "get_fund_flow",
+            "desc": "获取个股资金流向"
+        },
+        {
+            "tool": "get_sector_fund_flow",
+            "desc": "获取板块资金流向"
+        }
     ],
     "analyze+strategy": [
-        {"tool": "list_strategies", "desc": "列出可用策略"},
-        {"tool": "get_strategy_trades", "desc": "获取策略交易记录"},
-        {"tool": "get_backtest_history", "desc": "获取历史回测结果"}
+        {
+            "tool": "list_strategies",
+            "desc": "列出可用策略"
+        },
+        {
+            "tool": "get_strategy_trades",
+            "desc": "获取策略交易记录"
+        },
+        {
+            "tool": "get_backtest_history",
+            "desc": "获取历史回测结果"
+        }
     ],
     "analyze+project": [
-        {"tool": "list_project_files", "desc": "列出项目文件结构"},
-        {"tool": "read_project_file", "desc": "读取关键文件"}
+        {
+            "tool": "list_project_files",
+            "desc": "列出项目文件结构"
+        },
+        {
+            "tool": "read_project_file",
+            "desc": "读取关键文件"
+        }
     ],
     "analyze+code": [
-        {"tool": "workspace_read_file", "desc": "读取代码文件"},
-        {"tool": "grep_project", "desc": "搜索相关代码"}
+        {
+            "tool": "workspace_read_file",
+            "desc": "读取代码文件"
+        },
+        {
+            "tool": "grep_project",
+            "desc": "搜索相关代码"
+        }
     ],
     "analyze+screener": [
-        {"tool": "search_stocks", "desc": "按条件筛选股票"},
-        {"tool": "get_realtime_quote", "desc": "获取筛选结果行情"}
+        {
+            "tool": "search_stocks",
+            "desc": "按条件筛选股票"
+        },
+        {
+            "tool": "get_realtime_quote",
+            "desc": "获取筛选结果行情"
+        }
     ],
     "analyze+trading": [
-        {"tool": "get_positions", "desc": "获取当前持仓"},
-        {"tool": "get_trade_history", "desc": "获取交易历史"}
+        {
+            "tool": "get_positions",
+            "desc": "获取当前持仓"
+        },
+        {
+            "tool": "get_trade_history",
+            "desc": "获取交易历史"
+        }
     ],
     "view+chart": [
-        {"tool": "resolve_stock_name", "desc": "解析股票代码"},
-        {"tool": "render_candlestick", "desc": "生成K线图"}
+        {
+            "tool": "resolve_stock_name",
+            "desc": "解析股票代码"
+        },
+        {
+            "tool": "render_candlestick",
+            "desc": "生成K线图"
+        }
     ],
     "view+market": [
-        {"tool": "get_market_indices", "desc": "获取大盘指数"},
-        {"tool": "get_zt_pool", "desc": "获取涨停池"},
-        {"tool": "get_sector_rankings", "desc": "获取板块排名"}
+        {
+            "tool": "get_market_indices",
+            "desc": "获取大盘指数"
+        },
+        {
+            "tool": "get_zt_pool",
+            "desc": "获取涨停池"
+        },
+        {
+            "tool": "get_sector_rankings",
+            "desc": "获取板块排名"
+        }
     ],
     "view+fund_flow": [
-        {"tool": "get_fund_flow", "desc": "获取资金流向"}
+        {
+            "tool": "get_fund_flow",
+            "desc": "获取资金流向"
+        }
     ],
     "view+indicator": [
-        {"tool": "resolve_stock_name", "desc": "解析股票代码"},
-        {"tool": "get_indicator_snapshot", "desc": "获取指标快照"}
+        {
+            "tool": "resolve_stock_name",
+            "desc": "解析股票代码"
+        },
+        {
+            "tool": "get_indicator_snapshot",
+            "desc": "获取指标快照"
+        }
     ],
     "view+stock": [
-        {"tool": "resolve_stock_name", "desc": "解析股票代码"},
-        {"tool": "get_realtime_quote", "desc": "获取实时行情"}
+        {
+            "tool": "resolve_stock_name",
+            "desc": "解析股票代码"
+        },
+        {
+            "tool": "get_realtime_quote",
+            "desc": "获取实时行情"
+        }
     ],
     "view+project": [
-        {"tool": "list_project_files", "desc": "列出项目文件"}
+        {
+            "tool": "list_project_files",
+            "desc": "列出项目文件"
+        }
     ],
     "view+code": [
-        {"tool": "workspace_read_file", "desc": "读取代码文件"}
+        {
+            "tool": "workspace_read_file",
+            "desc": "读取代码文件"
+        }
     ],
     "view+trading": [
-        {"tool": "get_positions", "desc": "获取当前持仓"},
-        {"tool": "get_trade_history", "desc": "获取交易记录"}
+        {
+            "tool": "get_positions",
+            "desc": "获取当前持仓"
+        },
+        {
+            "tool": "get_trade_history",
+            "desc": "获取交易记录"
+        }
     ],
     "modify+code": [
-        {"tool": "workspace_read_file", "desc": "读取待修改文件"},
-        {"tool": "workspace_write_file", "desc": "写入修改"}
+        {
+            "tool": "workspace_read_file",
+            "desc": "读取待修改文件"
+        },
+        {
+            "tool": "workspace_write_file",
+            "desc": "写入修改"
+        }
     ],
     "modify+project": [
-        {"tool": "list_project_files", "desc": "列出项目结构"},
-        {"tool": "workspace_read_file", "desc": "读取相关文件"},
-        {"tool": "workspace_write_file", "desc": "写入修改"}
+        {
+            "tool": "list_project_files",
+            "desc": "列出项目结构"
+        },
+        {
+            "tool": "workspace_read_file",
+            "desc": "读取相关文件"
+        },
+        {
+            "tool": "workspace_write_file",
+            "desc": "写入修改"
+        }
     ],
     "modify+strategy": [
-        {"tool": "list_strategies", "desc": "列出策略"},
-        {"tool": "update_strategy_params", "desc": "修改策略参数"}
+        {
+            "tool": "list_strategies",
+            "desc": "列出策略"
+        },
+        {
+            "tool": "update_strategy_params",
+            "desc": "修改策略参数"
+        }
     ],
     "create+code": [
-        {"tool": "workspace_write_file", "desc": "创建新文件并写入代码"}
+        {
+            "tool": "workspace_write_file",
+            "desc": "创建新文件并写入代码"
+        }
     ],
     "create+project": [
-        {"tool": "workspace_write_file", "desc": "创建新文件"}
+        {
+            "tool": "workspace_write_file",
+            "desc": "创建新文件"
+        }
     ],
     "filter+stock": [
-        {"tool": "search_stocks", "desc": "按条件筛选"},
-        {"tool": "get_realtime_quote", "desc": "获取筛选结果行情"}
+        {
+            "tool": "search_stocks",
+            "desc": "按条件筛选"
+        },
+        {
+            "tool": "get_realtime_quote",
+            "desc": "获取筛选结果行情"
+        }
     ],
     "filter+screener": [
-        {"tool": "search_stocks", "desc": "筛选股票"}
+        {
+            "tool": "search_stocks",
+            "desc": "筛选股票"
+        }
     ],
     "backtest+strategy": [
-        {"tool": "run_backtest", "desc": "执行回测"},
-        {"tool": "get_backtest_history", "desc": "查看历史回测"}
+        {
+            "tool": "run_backtest",
+            "desc": "执行回测"
+        },
+        {
+            "tool": "get_backtest_history",
+            "desc": "查看历史回测"
+        }
     ],
     "execute+strategy": [
-        {"tool": "list_strategies", "desc": "列出策略"},
-        {"tool": "start_strategy", "desc": "启动策略"}
+        {
+            "tool": "list_strategies",
+            "desc": "列出策略"
+        },
+        {
+            "tool": "start_strategy",
+            "desc": "启动策略"
+        }
     ],
     "execute+trading": [
-        {"tool": "get_positions", "desc": "查看持仓"},
-        {"tool": "place_order", "desc": "下单"}
+        {
+            "tool": "get_positions",
+            "desc": "查看持仓"
+        },
+        {
+            "tool": "place_order",
+            "desc": "下单"
+        }
     ],
     "query+stock": [
-        {"tool": "resolve_stock_name", "desc": "解析股票代码"},
-        {"tool": "get_stock_info", "desc": "获取公司基本面"},
-        {"tool": "get_realtime_quote", "desc": "获取实时行情"}
+        {
+            "tool": "resolve_stock_name",
+            "desc": "解析股票代码"
+        },
+        {
+            "tool": "get_stock_info",
+            "desc": "获取公司基本面"
+        },
+        {
+            "tool": "get_realtime_quote",
+            "desc": "获取实时行情"
+        }
     ],
     "query+trading": [
-        {"tool": "get_positions", "desc": "查看持仓"},
-        {"tool": "get_account_balance", "desc": "查看账户余额"}
+        {
+            "tool": "get_positions",
+            "desc": "查看持仓"
+        },
+        {
+            "tool": "get_account_balance",
+            "desc": "查看账户余额"
+        }
     ]
 }
