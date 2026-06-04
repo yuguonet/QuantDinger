@@ -1,18 +1,89 @@
 # -*- coding: utf-8 -*-
 """
-Search tools — news search, comprehensive intelligence.
+news Search tools — news search, comprehensive intelligence.
 
-数据源统一走 app.data_providers.news → fetch_financial_news()
+数据源统一走 app.services.news_search → SearchService.search_news_dispatch()
 """
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List
 
 from app.agent.tools.registry import tool
 
 logger = logging.getLogger(__name__)
 
+
+# ═══════════════════════════════════════════════════════════════
+# 转接适配层 — 对齐原 fetch_financial_news() 接口
+# ═══════════════════════════════════════════════════════════════
+
+def _detect_lang_from_text(text: str, default: str = "cn") -> str:
+    """根据文本推断语言：中文字符占比 >15% 视为中文"""
+    if not text:
+        return default
+    cn_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
+    return "cn" if cn_chars / max(len(text), 1) > 0.15 else "en"
+
+
+def fetch_financial_news(
+    lang: str = "all",
+    market: str = "all",
+    symbol: str = "",
+    name: str = "",
+    keywords: str = "",
+) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    转接适配函数 — 调用 news_search.SearchService.search_news_dispatch()
+    返回格式与原 fetch_financial_news() 完全一致:
+    {"cn": [...], "en": [...]}
+    """
+    from app.services.news_search import get_search_service
+
+    result: Dict[str, List[Dict[str, Any]]] = {"cn": [], "en": []}
+
+    try:
+        effective_market = market if market != "all" else "CNStock"
+
+        svc = get_search_service()
+        resp = svc.search_news_dispatch(
+            symbol=symbol,
+            market=effective_market,
+            lang=lang,
+            days=3,
+            max_web_results=5,
+            name=name,
+            keywords=keywords,
+        )
+
+        if not resp.results:
+            return result
+
+        for r in resp.results:
+            title = r.title or ""
+            detected = _detect_lang_from_text(title, "cn" if effective_market == "CNStock" else "en")
+            target = lang if lang != "all" else detected
+
+            result[target].append({
+                "title": title,
+                "link": r.url or "",
+                "snippet": r.snippet or "",
+                "source": r.source or "",
+                "published": r.published_date or "",
+                "sentiment": r.sentiment,
+                "sentiment_score": r.sentiment_score,
+            })
+
+    except Exception as e:
+        logger.error("转接 fetch_financial_news 失败: %s", e)
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
+# 工具函数 — 无需改动
+# ═══════════════════════════════════════════════════════════════
 
 def _extract_news_items(resp: Dict) -> List[Dict[str, Any]]:
     """从 fetch_financial_news 返回的 {"cn":[...], "en":[...]} 中提取扁平列表。"""
@@ -38,15 +109,9 @@ def _extract_news_items(resp: Dict) -> List[Dict[str, Any]]:
     domain=["finance"],
 )
 def search_stock_news(stock_code: str, keyword: str = "") -> Dict[str, Any]:
-    """搜索股票相关新闻、公告、研报。
-
-    Args:
-        stock_code: 股票代码
-        keyword: 搜索关键词（可选，不填则用股票代码）
-    """
+    """搜索股票相关新闻、公告、研报。"""
     try:
-        from app.services.news_service import fetch_financial_news
-
+        # 直接调用本文件内的转接函数，不再依赖 news_service
         resp = fetch_financial_news(
             lang="all",
             market="CNStock",
@@ -88,11 +153,9 @@ def search_stock_news(stock_code: str, keyword: str = "") -> Dict[str, Any]:
     domain=["finance"],
 )
 def search_comprehensive_intel(stock_code: str) -> Dict[str, Any]:
-    """综合情报搜索：最新消息 + 风险排查 + 业绩预期。一次调用获取多维度情报。"""
+    """综合情报搜索：最新消息 + 风险排查 + 业绩预期。"""
     try:
-        from app.services.news_service import fetch_financial_news
-
-        # 多维度：个股新闻 + 政策/宏观
+        # 直接调用本文件内的转接函数，不再依赖 news_service
         stock_resp = fetch_financial_news(lang="all", market="CNStock", symbol=stock_code)
         policy_resp = fetch_financial_news(lang="all", market="CNStock", symbol="POLICY")
 
@@ -116,5 +179,4 @@ def search_comprehensive_intel(stock_code: str) -> Dict[str, Any]:
         return {"stock_code": stock_code, "error": str(e), "retriable": True}
 
 
-# Legacy list — kept for backward compat during migration; safe to remove later.
-SEARCH_TOOLS = []
+NEWS_SEARCH_TOOLS = []

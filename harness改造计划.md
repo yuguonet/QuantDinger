@@ -27,7 +27,7 @@ QuantDinger/
 │       │       ├── backtest_tools.py # 回测引擎
 │       │       ├── market_tools.py  # 指数/板块
 │       │       ├── indicator_tools.py # 指标信号
-│       │       ├── search_tools.py  # 新闻/舆情
+│       │       ├── news_search_tools.py  # 新闻/舆情
 │       │       ├── screening_tools.py # 选股筛选
 │       │       ├── trading_tools.py # 策略启停/交易
 │       │       ├── python_exec.py   # Python沙箱

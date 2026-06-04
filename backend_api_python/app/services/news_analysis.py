@@ -40,27 +40,17 @@ from app.services.rule_engine import rule_engine_score as _rule_engine_score
 def keyword_score_article(title: str, snippet: str = "", news_type: str = "stock") -> Dict[str, Any]:
     """
     单篇规则引擎评分 (纯算法, -10 ~ +10)
-
-    已从扁平字典匹配升级为声明式规则引擎:
-      - 正则模式匹配 (非子串)
-      - 标题权重 ×2, 摘要权重 ×1
-      - 按 category 去重取最强信号
-      - 一票否决: veto 规则命中 → score = -999
+    ... (其他注释不变) ...
 
     Args:
         title: 文章标题
-        snippet: 文章摘要/正文片段 (可选)
+        snippet: 文章摘要/正文 (可选)
         news_type: "policy" / "stock" / "market" / "general"
 
     Returns:
         {
             "score": 7.5,              # 评分 (-10 ~ +10, 一票否决时为 -999)
-            "sentiment": "positive",    # positive / negative / neutral
-            "keywords": ["涨停", ...],  # 命中的规则标签
-            "veto": False,             # 是否触发一票否决
-            "veto_keyword": None,      # 一票否决的规则标签
-            "bullish_hits": {"涨停": 8.0},  # 命中的利好规则及分值
-            "bearish_hits": {},        # 命中的利空规则及分值
+            ...
         }
     """
     return _rule_engine_score(title=title, snippet=snippet, news_type=news_type)
