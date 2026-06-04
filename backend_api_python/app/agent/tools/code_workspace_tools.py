@@ -751,6 +751,13 @@ def workspace_edit_file(
     if n == 0:
         return {"error": "未找到匹配内容", "find": find[:200], "replacements": 0}
 
+    # Auto-snapshot before edit
+    try:
+        from app.agent.tools.iteration_tools import auto_snapshot_before_edit
+        auto_snapshot_before_edit(f"before edit {safe}")
+    except Exception:
+        pass
+
     full_path.write_text(content, encoding="utf-8")
     return {
         "path": str(full_path),

@@ -712,6 +712,7 @@ class _AgentExecutor:
             "skip_agent": False, "skip_agent_reply": "",
             "intent_verb": _eval_verb, "intent_noun": _eval_noun,
             "tool_chain": _eval_tool_chain,
+            "domain": domain,
         }
 
     def chat(self, message, session_id, context=None,
@@ -733,6 +734,7 @@ class _AgentExecutor:
         _intent_verb = meta.get("intent_verb", "")
         _intent_noun = meta.get("intent_noun", "")
         _tool_chain = meta.get("tool_chain", [])
+        _eval_domain = meta.get("domain", "")
 
         t0 = time.time()
         try:
@@ -781,7 +783,7 @@ class _AgentExecutor:
                 success=success, content=content, tool_calls_log=tool_calls_log,
                 total_steps=total_steps, total_tokens=total_tokens,
             )
-            self._post_evaluate(agent_result_for_eval, _tool_chain, _intent_verb, _intent_noun)
+            self._post_evaluate(agent_result_for_eval, _tool_chain, _intent_verb, _intent_noun, domain=_eval_domain)
 
             # 异步压缩上下文（不阻塞返回）
             if success and content:
@@ -813,13 +815,13 @@ class _AgentExecutor:
             return AgentResult(success=False, error=str(e))
 
     @staticmethod
-    def _post_evaluate(agent_result, tool_chain, verb, noun):
+    def _post_evaluate(agent_result, tool_chain, verb, noun, domain=""):
         """后置评估 + 工具链学习闭环（纯规则，不消耗 agent 步数）。"""
         if not verb and not noun:
             return  # 无意图信息，跳过评估
         try:
             from app.agent.evaluator import evaluate, learn_from_execution
-            eval_result = evaluate(agent_result, tool_chain, verb, noun)
+            eval_result = evaluate(agent_result, tool_chain, verb, noun, domain=domain)
             learn_from_execution(eval_result, verb, noun)
         except Exception as e:
             logger.warning("[PostEval] 评估异常，不影响返回: %s", e)
@@ -894,6 +896,7 @@ class _AgentExecutor:
                         meta.get("tool_chain", []),
                         meta.get("intent_verb", ""),
                         meta.get("intent_noun", ""),
+                        domain=meta.get("domain", ""),
                     )
 
                     # 压缩上下文

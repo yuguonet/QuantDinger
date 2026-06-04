@@ -57,11 +57,125 @@ class EvalResult:
 # 2. 核心评估逻辑
 # ═══════════════════════════════════════════════════════════════
 
+def _evaluate_coding(agent_result, result, tool_chain, verb, noun) -> EvalResult:
+    """Coding domain 专用评估逻辑。
+
+    评估信号：
+      1. 工具调用成功率（同通用逻辑）
+      2. 代码修改质量 — 是否使用了 lint/diagnostics 验证
+      3. 工作流完整度 — 读→改→验证 的流程是否合理
+      4. final_answer 是否生成
+      5. 错误恢复 — 遇到错误后是否重试成功
+    """
+    actual_tools = []
+    tool_successes = 0
+    tool_failures = 0
+    lint_used = False
+    diagnostics_used = False
+    edit_count = 0
+    read_count = 0
+    error_then_success = False
+    had_error = False
+
+    if agent_result.tool_calls_log:
+        for i, tc in enumerate(agent_result.tool_calls_log):
+            tool_name = tc.get("tool", "")
+            if tool_name and tool_name != "final_answer":
+                actual_tools.append(tool_name)
+                if tc.get("success", True):
+                    tool_successes += 1
+                    if had_error:
+                        error_then_success = True
+                else:
+                    tool_failures += 1
+                    had_error = True
+
+                # Track coding-specific patterns
+                if tool_name in ("code_lint",):
+                    lint_used = True
+                if tool_name in ("lsp_diagnostics",):
+                    diagnostics_used = True
+                if tool_name in ("workspace_edit_file", "apply_patch", "workspace_write_file"):
+                    edit_count += 1
+                if tool_name in ("workspace_read_file", "read_lines", "grep_code", "glob_files"):
+                    read_count += 1
+
+    result.actual_tools = actual_tools
+    result.steps_taken = agent_result.total_steps or 0
+    result.has_final_answer = bool(agent_result.content and agent_result.content.strip())
+    result._tool_calls_log = list(agent_result.tool_calls_log or [])
+
+    # ── 信号 1: 工具调用成功率 ────────────────────────────────
+    total_calls = tool_successes + tool_failures
+    if total_calls > 0:
+        result.tool_success_rate = tool_successes / total_calls
+    else:
+        result.tool_success_rate = 1.0
+
+    score_tool_success = 0
+    if result.tool_success_rate >= 0.8:
+        score_tool_success = 2
+    elif result.tool_success_rate >= 0.5:
+        score_tool_success = 0
+    else:
+        score_tool_success = -2
+
+    # ── 信号 2: 代码验证 ──────────────────────────────────────
+    # 用了 lint 或 diagnostics 验证 → 加分
+    score_validation = 0
+    if lint_used or diagnostics_used:
+        score_validation = 2
+    elif edit_count > 0 and not lint_used:
+        score_validation = -1  # 改了代码但没验证
+
+    # ── 信号 3: 工作流完整度 ──────────────────────────────────
+    # 读→改 是基本模式
+    score_workflow = 0
+    if edit_count > 0 and read_count > 0:
+        score_workflow = 2  # 先读后改，流程正确
+    elif edit_count > 0 and read_count == 0:
+        score_workflow = -1  # 没读就改，可能出错
+    elif edit_count == 0 and read_count > 0:
+        score_workflow = 1  # 只读不改，可能是分析任务
+
+    # ── 信号 4: final_answer ──────────────────────────────────
+    score_answer = 2 if result.has_final_answer else -2
+
+    # ── 信号 5: 错误恢复 ──────────────────────────────────────
+    score_recovery = 1 if error_then_success else 0
+
+    # ── 综合评分 ──────────────────────────────────────────────
+    result.score = score_tool_success + score_validation + score_workflow + score_answer + score_recovery
+
+    # ── 判定 ─────────────────────────────────────────────────
+    if result.score >= 3:
+        result.verdict = "success"
+    elif result.score <= -2:
+        result.verdict = "failure"
+    else:
+        result.verdict = "grey"
+
+    result.details = (
+        f"tools={score_tool_success} validation={score_validation} "
+        f"workflow={score_workflow} answer={score_answer} recovery={score_recovery} "
+        f"→ total={result.score} (edits={edit_count} reads={read_count} lint={lint_used})"
+    )
+
+    logger.info(
+        "[Eval] coding/%s+%s verdict=%s score=%d steps=%d tools=%d/%d %s",
+        verb, noun, result.verdict, result.score,
+        result.steps_taken, tool_successes, total_calls,
+        result.details,
+    )
+    return result
+
+
 def evaluate(
     agent_result,
     tool_chain: List[Dict[str, str]],
     verb: str = "",
     noun: str = "",
+    domain: str = "",
 ) -> EvalResult:
     """评估 agent 执行结果。
 
@@ -77,6 +191,10 @@ def evaluate(
     result = EvalResult()
     result.chain_tools = [s["tool"] for s in tool_chain] if tool_chain else []
     result.chain_length = len(tool_chain)
+
+    # ── Coding domain 专用评估 ────────────────────────────────
+    if domain == "coding":
+        return _evaluate_coding(agent_result, result, tool_chain, verb, noun)
 
     # ── 提取实际调用的工具 ────────────────────────────────────
     actual_tools = []
