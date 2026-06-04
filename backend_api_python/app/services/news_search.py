@@ -248,11 +248,14 @@ class TavilySearchProvider(BaseSearchProvider):
                 query=query, search_depth="advanced", max_results=max_results,
                 include_answer=False, include_raw_content=False, days=days,
             )
+            from app.services.news_compressor import compress_news
             results = []
             for item in response.get('results', []):
+                title = _safe_encode(item.get('title', ''))
+                snippet = compress_news(_safe_encode(item.get('content', '')), max_len=300, title=title)
                 results.append(SearchResult(
-                    title=_safe_encode(item.get('title', '')),
-                    snippet=_safe_encode(item.get('content', ''))[:500],
+                    title=title,
+                    snippet=snippet,
                     url=_safe_encode(item.get('url', '')),
                     source=self._extract_domain(item.get('url', '')),
                     published_date=item.get('published_date'),
@@ -266,6 +269,7 @@ class TavilySearchProvider(BaseSearchProvider):
 
     def _do_search_rest(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
         try:
+            from app.services.news_compressor import compress_news
             url = "https://api.tavily.com/search"
             headers = {'Content-Type': 'application/json'}
             payload = {
@@ -279,9 +283,11 @@ class TavilySearchProvider(BaseSearchProvider):
             data = response.json()
             results = []
             for item in data.get('results', []):
+                title = _safe_encode(item.get('title', ''))
+                snippet = compress_news(_safe_encode(item.get('content', '')), max_len=300, title=title)
                 results.append(SearchResult(
-                    title=_safe_encode(item.get('title', '')),
-                    snippet=_safe_encode(item.get('content', ''))[:500],
+                    title=title,
+                    snippet=snippet,
                     url=_safe_encode(item.get('url', '')),
                     source=self._extract_domain(item.get('url', '')),
                     published_date=item.get('published_date'),
@@ -303,6 +309,7 @@ class SerpAPISearchProvider(BaseSearchProvider):
         except ImportError:
             return self._do_search_rest(query, api_key, max_results, days)
         try:
+            from app.services.news_compressor import compress_news
             tbs = "qdr:w"
             if days <= 1:
                 tbs = "qdr:d"
@@ -321,9 +328,11 @@ class SerpAPISearchProvider(BaseSearchProvider):
             response = search.get_dict()
             results = []
             for item in response.get('organic_results', [])[:max_results]:
+                title = _safe_encode(item.get('title', ''))
+                snippet = compress_news(_safe_encode(item.get('snippet', '')), max_len=300, title=title)
                 results.append(SearchResult(
-                    title=_safe_encode(item.get('title', '')),
-                    snippet=_safe_encode(item.get('snippet', ''))[:500],
+                    title=title,
+                    snippet=snippet,
                     url=_safe_encode(item.get('link', '')),
                     source=item.get('source', self._extract_domain(item.get('link', ''))),
                     published_date=item.get('date'),
@@ -334,6 +343,7 @@ class SerpAPISearchProvider(BaseSearchProvider):
 
     def _do_search_rest(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
         try:
+            from app.services.news_compressor import compress_news
             tbs = "qdr:w"
             if days <= 1:
                 tbs = "qdr:d"
@@ -353,9 +363,11 @@ class SerpAPISearchProvider(BaseSearchProvider):
             data = response.json()
             results = []
             for item in data.get('organic_results', [])[:max_results]:
+                title = _safe_encode(item.get('title', ''))
+                snippet = compress_news(_safe_encode(item.get('snippet', '')), max_len=300, title=title)
                 results.append(SearchResult(
-                    title=_safe_encode(item.get('title', '')),
-                    snippet=_safe_encode(item.get('snippet', ''))[:500],
+                    title=title,
+                    snippet=snippet,
                     url=_safe_encode(item.get('link', '')),
                     source=item.get('source', self._extract_domain(item.get('link', ''))),
                     published_date=item.get('date'),
@@ -394,12 +406,15 @@ class GoogleSearchProvider(BaseSearchProvider):
                                       error_message="Google API 配额已用尽")
             response.raise_for_status()
             data = response.json()
+            from app.services.news_compressor import compress_news
             results = []
             if 'items' in data:
                 for item in data['items']:
+                    title = _safe_encode(item.get('title', ''))
+                    snippet = compress_news(_safe_encode(item.get('snippet', '')), max_len=300, title=title)
                     results.append(SearchResult(
-                        title=_safe_encode(item.get('title', '')),
-                        snippet=_safe_encode(item.get('snippet', '')),
+                        title=title,
+                        snippet=snippet,
                         url=_safe_encode(item.get('link', '')),
                         source='Google',
                         published_date=item.get('pagemap', {}).get('metatags', [{}])[0].get('article:published_time', ''),
@@ -423,12 +438,15 @@ class BingSearchProvider(BaseSearchProvider):
             response = requests.get(url, headers=headers, params=params, timeout=10)
             response.raise_for_status()
             data = response.json()
+            from app.services.news_compressor import compress_news
             results = []
             if 'webPages' in data and 'value' in data['webPages']:
                 for item in data['webPages']['value']:
+                    title = _safe_encode(item.get('name', ''))
+                    snippet = compress_news(_safe_encode(item.get('snippet', '')), max_len=300, title=title)
                     results.append(SearchResult(
-                        title=_safe_encode(item.get('name', '')),
-                        snippet=_safe_encode(item.get('snippet', '')),
+                        title=title,
+                        snippet=snippet,
                         url=_safe_encode(item.get('url', '')),
                         source='Bing',
                         published_date=item.get('datePublished', ''),
@@ -459,11 +477,14 @@ class BaiduSearchProvider(BaseSearchProvider):
             resp = requests.post(url, headers=headers, json=payload, timeout=15)
             resp.raise_for_status()
             data = resp.json()
+            from app.services.news_compressor import compress_news
             results = []
             for item in (data.get("result") or {}).get("results", [])[:max_results]:
+                title = _safe_encode(item.get("title", ""))
+                snippet = compress_news(_safe_encode(item.get("content", "")), max_len=300, title=title)
                 results.append(SearchResult(
-                    title=_safe_encode(item.get("title", "")),
-                    snippet=_safe_encode(item.get("content", ""))[:500],
+                    title=title,
+                    snippet=snippet,
                     url=_safe_encode(item.get("url", "")),
                     source="百度",
                     published_date=item.get("publish_time"),
@@ -507,11 +528,14 @@ class BochaAISearchProvider(BaseSearchProvider):
             resp.raise_for_status()
             data = resp.json()
             results = []
+            from app.services.news_compressor import compress_news
             webpages = (data.get("data") or {}).get("webPages", {}).get("value", [])
             for item in webpages[:max_results]:
+                title = _safe_encode(item.get("name", ""))
+                snippet = compress_news(_safe_encode(item.get("snippet", "")), max_len=300, title=title)
                 results.append(SearchResult(
-                    title=_safe_encode(item.get("name", "")),
-                    snippet=_safe_encode(item.get("snippet", ""))[:500],
+                    title=title,
+                    snippet=snippet,
                     url=_safe_encode(item.get("url", "")),
                     source=self._extract_domain(item.get("url", "")),
                     published_date=item.get("datePublished"),
@@ -623,7 +647,8 @@ class _BaseNewsProvider(BaseSearchProvider):
         super().__init__(['free'], name)
 
     def _news_to_results(self, items: List[Dict]) -> List[SearchResult]:
-        """将新闻 dict 列表转为 SearchResult 列表"""
+        """将新闻 dict 列表转为 SearchResult 列表 (snippet 压缩)"""
+        from app.services.news_compressor import compress_news
         if not items:
             return []
         results = []
@@ -633,9 +658,13 @@ class _BaseNewsProvider(BaseSearchProvider):
             title = _safe_encode(item.get("title", ""))
             if not title:
                 continue
+            # 新闻源优先用 content/description，压缩到 300 字
+            raw_snippet = item.get("content") or item.get("description") or item.get("title") or ""
+            snippet = _safe_encode(raw_snippet)
+            snippet = compress_news(snippet, max_len=300, title=title)
             results.append(SearchResult(
                 title=title,
-                snippet=title,
+                snippet=snippet,
                 url=_safe_encode(item.get("url", "")),
                 source=item.get("source", self.name),
                 published_date=item.get("time", ""),
@@ -957,14 +986,20 @@ class SearchService:
         return True
 
     def _dicts_to_results(self, items: List[Dict[str, Any]]) -> List[SearchResult]:
-        """将 news_provider 返回的 dict 列表转为 SearchResult 列表"""
+        """将 news_provider 返回的 dict 列表转为 SearchResult 列表 (snippet 入口压缩)"""
+        from app.services.news_compressor import compress_news
         results = []
         for item in items:
             if not isinstance(item, dict) or not item.get("title"):
                 continue
+            title = _safe_encode(item.get("title", ""))
+            # 优先用 content/description 作为 snippet，压缩到 300 字以内
+            raw_snippet = item.get("content") or item.get("description") or item.get("title") or ""
+            snippet = _safe_encode(raw_snippet)
+            snippet = compress_news(snippet, max_len=300, title=title)
             results.append(SearchResult(
-                title=_safe_encode(item.get("title", "")),
-                snippet=_safe_encode(item.get("title", "")),
+                title=title,
+                snippet=snippet,
                 url=_safe_encode(item.get("url", "")),
                 source=item.get("source", ""),
                 published_date=item.get("time", ""),
@@ -1611,7 +1646,7 @@ class NewsCacheManager:
                 cursor = conn.cursor()
 
                 news_type = get_news_type(symbol, market)
-                from app.services.news_analysis import keyword_score_article, ai_analyze_article
+                from app.services.news_analysis import keyword_score_article
 
                 # ── 查库去重：归一化 hash + 模糊匹配 ──
                 cursor.execute(
@@ -1649,38 +1684,27 @@ class NewsCacheManager:
                         logger.info(f"[相关性] {symbol}({market}) 无相关文章, 跳过写入")
                         return True
 
+                from app.services.news_compressor import compress_news
+
                 rows = []
                 for r in results:
                     title = _safe_encode(r.title, 500)
                     snippet = _safe_encode(r.snippet, 2000)
+                    # 入库前兜底压缩：确保 snippet 不超过 300 字
+                    snippet = compress_news(snippet, max_len=300, title=title)
                     url = _safe_encode(r.url, 1000)
                     source = _safe_encode(r.source, 100)
                     pub_date = _safe_encode(r.published_date or '', 40)
 
-                    if news_type == "policy":
-                        ai_result = ai_analyze_article(
-                            title=title, snippet=snippet,
-                            source=source, published_date=pub_date,
-                        )
-                        if ai_result:
-                            score = ai_result["score"]
-                            sentiment = ai_result["sentiment"]
-                            simplified = ai_result.get("simplified_text", "")
-                            if simplified:
-                                snippet = _safe_encode(simplified, 2000)
-                        else:
-                            kw_result = keyword_score_article(title, snippet, news_type=news_type)
-                            score = kw_result["score"]
-                            sentiment = kw_result["sentiment"]
+                    # 统一走规则引擎评分（含 policy，不再调 LLM）
+                    kw_result = keyword_score_article(title, snippet, news_type=news_type)
+                    if kw_result["veto"]:
+                        score = -999.0
+                        sentiment = "negative"
+                        logger.warning(f"[一票否决] 检测到重大负面: {title[:60]}")
                     else:
-                        kw_result = keyword_score_article(title, snippet, news_type=news_type)
-                        if kw_result["veto"]:
-                            score = -999.0
-                            sentiment = "negative"
-                            logger.warning(f"[一票否决] 检测到重大负面: {title[:60]}")
-                        else:
-                            score = kw_result["score"]
-                            sentiment = kw_result["sentiment"]
+                        score = kw_result["score"]
+                        sentiment = kw_result["sentiment"]
 
                     # 中性评分(score=0)也入库，不跳过
                     rows.append((symbol, market, title, snippet, url, source,

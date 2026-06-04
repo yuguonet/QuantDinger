@@ -1,27 +1,22 @@
+# -*- coding: utf-8 -*-
 """
 新闻分析评分引擎 — news_analysis.py
 
 职责:
   1. keyword_score_article()  → 单篇规则引擎评分 (-10 ~ +10, 纯算法, 无外部依赖)
-  2. ai_analyze_article()     → 单篇 AI 分析评分 (LLM, 允许改写/降级/加关键词)
-  3. composite_score()        → 多篇综合评分 (RMS 聚合 + 非对称时间衰减)
+  2. composite_score()        → 多篇综合评分 (RMS 聚合 + 非对称时间衰减)
 
 调用方:
-  - news.py NewsCacheManager.calc_score() → composite_score()
-  - news_processor.py → 可被本模块替代
+  - news_search.py NewsCacheManager.calc_score() → composite_score()
   - 上层路由/服务 → 直接调用单篇评分
 
 设计原则:
   - 单篇评分: 每篇文章独立打分, 范围 -10 ~ +10, 0 = 中性, -999 = 一票否决
   - 规则引擎: 声明式规则 (正则/分类/权重/上下文), 替代原扁平字典匹配
-  - AI 分析: 允许 LLM 改写文章内容, 增加关键词, 降级为通俗易懂版本
   - 综合评分: RMS 聚合 (强信号不被弱/中性稀释), 非对称时间衰减
     好消息 10 天衰减至 0, 坏消息 15 天衰减至 0
 """
-import json
 import math
-import re
-import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -40,7 +35,6 @@ from app.services.rule_engine import rule_engine_score as _rule_engine_score
 def keyword_score_article(title: str, snippet: str = "", news_type: str = "stock") -> Dict[str, Any]:
     """
     单篇规则引擎评分 (纯算法, -10 ~ +10)
-    ... (其他注释不变) ...
 
     Args:
         title: 文章标题
@@ -50,212 +44,19 @@ def keyword_score_article(title: str, snippet: str = "", news_type: str = "stock
     Returns:
         {
             "score": 7.5,              # 评分 (-10 ~ +10, 一票否决时为 -999)
-            ...
+            "sentiment": "positive",   # 情感标签
+            "veto": False,             # 是否一票否决
+            "veto_keyword": None,      # 否决关键词
+            "bullish_hits": {...},     # 利好命中
+            "bearish_hits": {...},     # 利空命中
+            "keywords": [...],         # 命中关键词
         }
     """
     return _rule_engine_score(title=title, snippet=snippet, news_type=news_type)
 
 
 # ═══════════════════════════════════════════════════════════════
-#  2. AI 分析评分 (单篇, LLM, 允许改写/降级/加关键词)
-# ═══════════════════════════════════════════════════════════════
-
-_ARTICLE_ANALYSIS_SYSTEM_PROMPT = """金融分析师。分析财经新闻，输出JSON：
-- score: -10~+10（负=利空，0=中性，正=利好）
-- sentiment: positive/negative/neutral
-- keywords: 金融关键词列表
-- simplified_text: 通俗改写（100字内）
-- impact_level: high/medium/low
-- reasoning: 评分理由（20字内）"""
-
-
-def _extract_key_sentences(text: str, max_chars: int = 300) -> str:
-    """
-    从文本中提取含金融关键词的关键句，压缩到 max_chars 以内。
-
-    策略: 按句切分 → 含关键词的句子优先保留 → 按原文顺序拼接 → 截断
-    """
-    if not text or len(text) <= max_chars:
-        return text or ""
-
-    # 切句（中文句号/问号/叹号/分号，英文句号/问号/叹号）
-    sentences = re.split(r'(?<=[。！？；.!?])\s*', text)
-    sentences = [s.strip() for s in sentences if s.strip()]
-
-    if len(sentences) <= 1:
-        return text[:max_chars]
-
-    # 金融关键词集合（复用评分关键词 + 常见财经术语）
-    _KEY_PATTERNS = re.compile(
-        r'降[准息]|LPR|央行|货币政策|财政|减税|补贴|利好|利空|'
-        r'涨停|跌停|大涨|暴跌|闪崩|暴雷|业绩|净利润|营收|'
-        r'增持|减持|回购|分红|配股|IPO|定增|'
-        r'利率|汇率|GDP|CPI|PPI|PMI|M2|社融|'
-        r'新能源|芯片|半导体|AI|人工智能|碳中和|'
-        r'监管|制裁|关税|退市|破产|造假|调查|'
-        r'突破|新高|新低|放量|缩量|金叉|死叉'
-    )
-
-    # 给每个句子打分：含关键词的句子优先
-    scored = []
-    for i, s in enumerate(sentences):
-        hits = len(_KEY_PATTERNS.findall(s))
-        scored.append((hits, i, s))
-
-    # 先按关键词命中数降序，再按原文顺序
-    scored.sort(key=lambda x: (-x[0], x[1]))
-
-    # 贪心拼接，不超过 max_chars
-    selected = []
-    total = 0
-    for _, orig_idx, s in scored:
-        if total + len(s) + 1 > max_chars:
-            # 如果一句话太长，截取前 max_chars - total 字符
-            remaining = max_chars - total - 1
-            if remaining > 20 and s:
-                selected.append((orig_idx, s[:remaining]))
-            break
-        selected.append((orig_idx, s))
-        total += len(s) + 1
-
-    # 按原文顺序排列
-    selected.sort(key=lambda x: x[0])
-    return " ".join(s for _, s in selected)
-
-
-def ai_analyze_article(
-    title: str,
-    snippet: str = "",
-    source: str = "",
-    published_date: str = "",
-    timeout: float = 30.0,
-) -> Optional[Dict[str, Any]]:
-    """
-    用 LLM 对单篇文章做深度分析评分
-
-    特性:
-      - 评分 -10 ~ +10 (0 = 中性, 正 = 利好, 负 = 利空)
-      - 允许 LLM 改写文章为通俗版本 (simplified_text)
-      - 允许补充关键词 (added_keywords)
-      - 返回结构化 JSON
-
-    Args:
-        title: 文章标题
-        snippet: 文章摘要/正文
-        source: 来源 (如 "东方财富")
-        published_date: 发布时间
-        timeout: LLM 调用超时秒数
-
-    Returns:
-        {
-            "score": 7.5,
-            "sentiment": "positive",
-            "keywords": [...],
-            "original_summary": "...",
-            "simplified_text": "通俗易懂版本",
-            "added_keywords": [...],
-            "impact_level": "high/medium/low",
-            "reasoning": "...",
-            "llm_provider": "deepseek",
-            "analysis_time": 2.3,
-        }
-        或 None (LLM 不可用时)
-    """
-    if not title:
-        return None
-
-    # 构建文章信息 — 提取关键句压缩 token
-    article_info = f"标题: {title}"
-    if snippet:
-        condensed = _extract_key_sentences(snippet, max_chars=300)
-        article_info += f"\n摘要: {condensed}"
-    if source:
-        article_info += f"\n来源: {source}"
-    if published_date:
-        article_info += f"\n时间: {published_date}"
-
-    messages = [
-        {"role": "system", "content": _ARTICLE_ANALYSIS_SYSTEM_PROMPT},
-        {"role": "user", "content": f"请分析以下财经新闻：\n\n{article_info}"},
-    ]
-
-    t0 = time.time()
-    try:
-        from app.services.llm import LLMService
-        llm = LLMService()
-        content = llm.call_llm_api(
-            messages=messages,
-            temperature=0.3,
-            use_json_mode=True,
-        )
-    except ValueError:
-        logger.info("[AI分析] 无可用 LLM API Key, 跳过")
-        return None
-    except Exception as e:
-        logger.error("[AI分析] LLM 调用失败: %s", e)
-        return None
-
-    elapsed = round(time.time() - t0, 1)
-    result = _parse_json(content)
-    if result:
-        # 标准化字段: 评分范围 -10 ~ +10
-        result["score"] = max(-10.0, min(10.0, float(result.get("score", 0.0))))
-        result["sentiment"] = _score_to_sentiment(result["score"])
-        result["keywords"] = result.get("keywords", [])
-        result["simplified_text"] = _safe_truncate(result.get("simplified_text", ""), 200)
-        result["impact_level"] = result.get("impact_level", "medium")
-        result["reasoning"] = result.get("reasoning", "")
-        result["llm_provider"] = getattr(llm.provider, "value", "unknown")
-        result["analysis_time"] = elapsed
-        logger.info(f"[AI分析] 完成, 评分={result['score']}, 耗时={elapsed}s")
-    return result
-
-
-# ═══════════════════════════════════════════════════════════════
-#  工具函数
-# ═══════════════════════════════════════════════════════════════
-
-def _safe_truncate(text: str, max_len: int) -> str:
-    """安全截断，不在词中间断开"""
-    if not text or len(text) <= max_len:
-        return text or ""
-    return text[:max_len].rstrip() + "…"
-
-
-def _score_to_sentiment(score: float) -> str:
-    """评分 → 情感标签 (适用于 -10 ~ +10 分制)"""
-    if score > 1.0:
-        return "positive"
-    elif score < -1.0:
-        return "negative"
-    return "neutral"
-
-
-
-def _parse_json(content: str) -> Optional[Dict]:
-    """解析 LLM 返回的 JSON, 兼容 markdown 包裹"""
-    if not content:
-        return None
-    json_str = content
-    if "```json" in content:
-        json_str = content.split("```json")[1].split("```")[0]
-    elif "```" in content:
-        json_str = content.split("```")[1].split("```")[0]
-    try:
-        return json.loads(json_str.strip())
-    except json.JSONDecodeError:
-        pass
-    try:
-        match = re.search(r'\{.*\}', content, re.DOTALL)
-        if match:
-            return json.loads(match.group())
-    except Exception:
-        pass
-    return None
-
-
-# ═══════════════════════════════════════════════════════════════
-#  3. 综合评分 (多篇聚合, RMS + 非对称时间衰减)
+#  2. 综合评分 (多篇聚合, RMS + 非对称时间衰减)
 # ═══════════════════════════════════════════════════════════════
 
 # ── 衰减参数 ──
@@ -302,12 +103,6 @@ def composite_score(
       4. 线性映射到 [-5, +5] 输出范围
       5. 一票否决文章单独处理 (score=-999 触发否决)
 
-    特性:
-      - 一篇 10 分 + 五篇 2 分 → 满分 5 (强信号主导, 弱信号不稀释)
-      - 一篇 -10 分 + 五篇 -2 分 → -5 (对称)
-      - 中性文章 (0 分) 不影响结果 (权重为 0)
-      - 好消息 10 天归零, 坏消息 15 天归零
-
     Args:
         articles: 文章列表, 每个元素需包含:
             - "score": float  (单篇评分, -10 ~ +10 或 -999)
@@ -316,7 +111,7 @@ def composite_score(
 
     Returns:
         {
-            "composite_score": 3.7,     # 综合评分 (-5 ~ +5, 一票否决时为 -5)
+            "composite_score": 3.7,     # 综合评分 (-5 ~ +5)
             "direction": "利好",        # 利好/偏利好/中性/偏利空/利空
             "positive_count": 5,        # 利好文章数
             "negative_count": 2,        # 利空文章数
@@ -331,8 +126,8 @@ def composite_score(
     if now is None:
         now = datetime.utcnow()
 
-    pos_weighted: List[float] = []   # 正分 (已衰减)
-    neg_weighted: List[float] = []   # 负分 (已衰减, 取绝对值)
+    pos_weighted: List[float] = []
+    neg_weighted: List[float] = []
     pos_count = 0
     neg_count = 0
     neu_count = 0
@@ -341,7 +136,7 @@ def composite_score(
     for art in articles:
         score = art.get("score", 0.0)
         if score is None:
-            score = 0.0  # 无评分视为中性
+            score = 0.0
         pub_date_str = art.get("published_date", "")
 
         # ── 一票否决检测 ──
@@ -362,7 +157,6 @@ def composite_score(
         decay = _time_decay_factor(hours_old, is_neg)
         weighted = score * decay
 
-        # ── 分组 ──
         if weighted > 0.01:
             pos_weighted.append(weighted)
             pos_count += 1
@@ -388,10 +182,6 @@ def composite_score(
         }
 
     # ── 加权 RMS 聚合 (quartic weighting, n=4) ──
-    # 公式: sqrt(sum(x^2 * |x|^4) / sum(|x|^4))
-    # 特性: 强信号自权重极高, 微弱信号几乎不影响结果
-    #   例: score=10 权重=10000, score=2 权重=16 → 强信号完全主导
-    #   10 + 5×2 → 4.98 ≈ 5.0 (满分)
     def _weighted_rms(values: List[float]) -> float:
         if not values:
             return 0.0
@@ -401,18 +191,13 @@ def composite_score(
             return 0.0
         return math.sqrt(sum(v * v * w for v, w in zip(values, weights)) / total_weight)
 
-    pos_rms = _weighted_rms(pos_weighted)  # ∈ [0, 10]
-    neg_rms = _weighted_rms(neg_weighted)  # ∈ [0, 10]
+    pos_rms = _weighted_rms(pos_weighted)
+    neg_rms = _weighted_rms(neg_weighted)
 
-    # ── 合成: 正分 RMS - 负分 RMS → raw ∈ [-10, +10] ──
     raw_composite = pos_rms - neg_rms
-
-    # ── 映射到 [-5, +5] ──
-    # 线性映射: raw ∈ [-10, +10] → composite ∈ [-5, +5]
     composite = raw_composite * 0.5
     composite = round(max(COMPOSITE_MIN, min(COMPOSITE_MAX, composite)), 1)
 
-    # ── 方向标签 ──
     if composite >= 3.0:
         direction = "利好"
     elif composite >= 1.0:

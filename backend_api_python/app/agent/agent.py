@@ -697,6 +697,7 @@ class _AgentExecutor:
         Per-session lock prevents concurrent requests on the same session
         from interleaving get_history / add_message calls.
         """
+        from app.agent.session_store import get_session_store
         store = get_session_store()
         with store.session_lock(session_id):
             return self._chat_locked(message, session_id, context, progress_callback, user_id)
@@ -818,6 +819,7 @@ class _AgentExecutor:
         Per-session lock prevents concurrent requests on the same session
         from interleaving get_history / add_message calls.
         """
+        from app.agent.session_store import get_session_store
         store = get_session_store()
         with store.session_lock(session_id):
             yield from self._chat_stream_locked(message, session_id, context, progress_callback, user_id)
