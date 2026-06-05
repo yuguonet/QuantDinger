@@ -564,69 +564,22 @@ def get_price():
 
 def _search_cn_smart(keyword: str, limit: int = 20) -> list:
     """
-    A-share search: code → name → pinyin initials, via basicinfo_db.
-    Returns list of {market: 'CNStock', symbol, name, market_cn}.
+    A股搜索薄壳，逻辑已下沉到 basicinfo_db.StockBasicDB.search_stocks。
+    返回 list of {market, symbol, name, market_cn}。
     """
-    kw = keyword.strip()
-    if not kw:
-        return []
-
     from app.utils.basicinfo_db import get_stock_basic_db
-    from app.utils.pinyin_initials import pinyin_initials
     db = get_stock_basic_db()
+    raw = db.search_stocks(keyword, limit)
 
-    seen = set()
     results = []
-
-    # 1. Exact code lookup
-    if kw.isdigit():
-        stock = db.get_stock(kw)
-        if stock:
-            results.append({
-                'market': 'CNStock',
-                'symbol': stock['symbol'],
-                'name': stock['name'],
-                'market_cn': stock.get('market_cn', '')
-            })
-            seen.add(stock['symbol'])
-
-    # 2. Fuzzy search (code prefix + name LIKE)
-    if len(results) < limit:
-        for s in db.search_stocks(kw, limit=limit * 2):
-            if s['symbol'] not in seen:
-                results.append({
-                    'market': 'CNStock',
-                    'symbol': s['symbol'],
-                    'name': s['name'],
-                    'market_cn': s.get('market_cn', '')
-                })
-                seen.add(s['symbol'])
-                if len(results) >= limit:
-                    break
-
-    # 3. Pinyin initials match (e.g. 'gzmt' matches '贵州茅台')
-    if len(results) < limit and kw.isalpha():
-        kw_lower = kw.lower()
-        for s in db.get_all_stocks(status='active'):
-            if s['symbol'] in seen:
-                continue
-            name = s.get('name', '')
-            if not name:
-                continue
-            initials = pinyin_initials(name)
-            if initials and kw_lower in initials:
-                results.append({
-                    'market': 'CNStock',
-                    'symbol': s['symbol'],
-                    'name': s['name'],
-                    'market_cn': s.get('market_cn', '')
-                })
-                seen.add(s['symbol'])
-                if len(results) >= limit:
-                    break
-
-    return results
-
+    for s in raw:
+        results.append({
+            "market": "CNStock",
+            "symbol": s["symbol"],
+            "name": s["name"],
+            "market_cn": s.get("market_cn", ""),
+        })
+    return results[:limit]
 
 @market_bp.route('/stock/name', methods=['POST'])
 def get_stock_name():

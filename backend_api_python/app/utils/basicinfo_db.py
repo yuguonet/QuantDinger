@@ -492,34 +492,65 @@ class StockBasicDB:
     # 读取接口
     # ────────────────────────────────────────────────────────────────────
 
-    def get_stock(self, code: str) -> Optional[Dict[str, Any]]:
+    def get_stock(self, code_or_name: str) -> Optional[Dict[str, Any]]:
         """
-        查询单只股票的基本信息。
+        根据代码或名称精确查询单只股票，返回全部字段。
+
+        查询优先级：
+        1. 按 symbol 精确匹配（6位数字代码）
+        2. 按 name 精确匹配（股票简称）
 
         Args:
-            code: 6 位数字代码（如 "600519"），自动 strip
+            code_or_name: 6位数字代码（如 "600519"）或股票名称（如 "贵州茅台"）
 
         Returns:
-            字典（见 _row_to_dict），未找到返回 None
+            包含全部字段的字典：
+            {
+                "symbol": str,          -- 6位代码，如 "600519"
+                "name": str,            -- 股票简称，如 "贵州茅台"
+                "market_cn": str,       -- 交易所：SH / SZ / BJ
+                "industry": str,        -- 所属行业，如 "白酒"
+                "concepts": str,        -- 所属概念（逗号分隔），如 "锂电池,新能源"
+                "list_date": str,       -- 上市日期，如 "2001-08-27"
+                "total_shares": float,  -- 总股本（股），0 表示未知
+                "circ_shares": float,   -- 流通股本（股）
+                "pe_ratio": float,      -- 市盈率（动态），可为负数
+                "pb_ratio": float,      -- 市净率，可为负数
+                "status": str,          -- 状态：active / suspended / delisted
+                "updated_at": str       -- 最后更新时间（ISO 格式），无数据返回 None
+            }
+            未找到返回 None
         """
         self.ensure_table()
-        code = (code or "").strip()
-        if not code:
+        keyword = (code_or_name or "").strip()
+        if not keyword:
             return None
 
         pool = self._get_pool()
         with pool.cursor() as cur:
+            # 优先级1: 按 symbol 精确匹配
             cur.execute(
                 "SELECT symbol, name, market_cn, industry, concepts, list_date, "
                 "       total_shares, circ_shares, pe_ratio, pb_ratio, status, updated_at "
                 "FROM stock_basic_info WHERE symbol = %s",
-                (code,),
+                (keyword,),
             )
             row = cur.fetchone()
+            if row:
+                return self._row_to_dict(row)
 
-        if not row:
-            return None
-        return self._row_to_dict(row)
+            # 优先级2: 按 name 精确匹配
+            cur.execute(
+                "SELECT symbol, name, market_cn, industry, concepts, list_date, "
+                "       total_shares, circ_shares, pe_ratio, pb_ratio, status, updated_at "
+                "FROM stock_basic_info WHERE name = %s",
+                (keyword,),
+            )
+            row = cur.fetchone()
+            if row:
+                return self._row_to_dict(row)
+
+        return None
 
     def get_all_stocks(
         self,
@@ -565,39 +596,58 @@ class StockBasicDB:
 
     def search_stocks(self, keyword: str, limit: int = 20) -> List[Dict[str, Any]]:
         """
-        按代码或名称模糊搜索股票。
+        A股智能搜索：精确代码 → 代码/名称模糊匹配 → 拼音首字母匹配。
 
-        使用 LIKE '%keyword%' 模式匹配，同时搜索 symbol 和 stock_name。
-        只返回 status='active' 的正常上市股票。
+        返回结果按优先级排序，每条包含完整的 stock_basic_info 字段。
 
         Args:
-            keyword: 搜索关键词（如 "茅台"、"600"、"银行"）
+            keyword: 搜索关键词（代码、名称或拼音首字母，如 "600519"、"茅台"、"gzmt"）
             limit:   最大返回条数，默认 20
 
         Returns:
-            匹配的股票列表，按 symbol 升序
+            股票列表（字典），按优先级顺序排列，字段与 _row_to_dict 一致
         """
-        self.ensure_table()
+        from app.utils.pinyin_initials import pinyin_initials
 
-        # 构造 LIKE 模式：前后加 % 通配符
-        kw = f"%{(keyword or '').strip()}%"
-        # 空关键词或只有通配符 → 不搜索（避免全表扫描）
-        if not kw or kw == "%%":
+        kw = (keyword or "").strip()
+        if not kw:
             return []
 
-        pool = self._get_pool()
-        with pool.cursor() as cur:
-            cur.execute(
-                "SELECT symbol, name, market_cn, industry, concepts, list_date, "
-                "       total_shares, circ_shares, pe_ratio, pb_ratio, status, updated_at "
-                "FROM stock_basic_info "
-                "WHERE (symbol LIKE %s OR name LIKE %s) AND status = 'active' "
-                "ORDER BY symbol LIMIT %s",
-                (kw, kw, limit),
-            )
-            rows = cur.fetchall()
+        seen = set()
+        results = []
 
-        return [self._row_to_dict(r) for r in rows]
+        # 1. 精确代码匹配
+        if kw.isdigit():
+            stock = self.get_stock(kw)
+            if stock:
+                results.append(stock)
+                seen.add(stock["symbol"])
+
+        # 2. 代码/名称模糊匹配（LIKE）
+        if len(results) < limit:
+            for s in self.search_stocks(kw, limit=limit * 2):
+                if s["symbol"] not in seen:
+                    results.append(s)
+                    seen.add(s["symbol"])
+                    if len(results) >= limit:
+                        break
+
+        # 3. 拼音首字母匹配（如 'gzmt' → '贵州茅台'）
+        if len(results) < limit and kw.isalpha():
+            kw_lower = kw.lower()
+            for s in self.get_all_stocks(status="active"):
+                if s["symbol"] in seen:
+                    continue
+                name = s.get("name", "")
+                if name:
+                    initials = pinyin_initials(name)
+                    if initials and kw_lower in initials:
+                        results.append(s)
+                        seen.add(s["symbol"])
+                        if len(results) >= limit:
+                            break
+
+        return results
 
     def market_all_string(self, status: str = "active") -> str:
         """

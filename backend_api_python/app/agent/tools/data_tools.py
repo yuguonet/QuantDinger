@@ -28,6 +28,7 @@ from app.data_sources.market_detector import detect_market as _detect_market
     layer="数据层",
     domain=[],
 )
+
 def resolve_stock_name(stock_code: str) -> Dict[str, Any]:
     """根据股票代码获取中文名称。
 
@@ -36,10 +37,11 @@ def resolve_stock_name(stock_code: str) -> Dict[str, Any]:
     """
     market = _detect_market(stock_code) or "CNStock"
     try:
-        from app.services.symbol_name import resolve_symbol_name
-        name = resolve_symbol_name(market, stock_code)
-        if name:
-            return {"stock_code": stock_code, "name": name, "market": market}
+        from app.utils.basicinfo_db import get_stock_basic_db
+        db = get_stock_basic_db()
+        results = db.search_stocks(stock_code, limit=1)
+        if results:
+            return {"stock_code": stock_code, "name": results[0]["name"], "market": market}
         return {"stock_code": stock_code, "name": None, "market": market, "message": "未找到对应名称"}
     except Exception as e:
         logger.error("resolve_stock_name(%s) failed: %s", stock_code, e)
