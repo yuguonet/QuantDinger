@@ -7,7 +7,7 @@
     ],
     "analyze+chart": [
         {
-            "tool": "resolve_stock_name",
+            "tool": "search_stock_by_name",
             "desc": "解析股票代码"
         },
         {
@@ -35,7 +35,7 @@
     ],
     "analyze+indicator": [
         {
-            "tool": "resolve_stock_name",
+            "tool": "search_stock_by_name",
             "desc": "解析股票代码"
         },
         {
@@ -49,7 +49,7 @@
     ],
     "analyze+fund_flow": [
         {
-            "tool": "resolve_stock_name",
+            "tool": "search_stock_by_name",
             "desc": "解析股票代码"
         },
         {
@@ -113,7 +113,7 @@
     ],
     "view+chart": [
         {
-            "tool": "resolve_stock_name",
+            "tool": "search_stock_by_name",
             "desc": "解析股票代码"
         },
         {
@@ -143,7 +143,7 @@
     ],
     "view+indicator": [
         {
-            "tool": "resolve_stock_name",
+            "tool": "search_stock_by_name",
             "desc": "解析股票代码"
         },
         {
@@ -153,7 +153,7 @@
     ],
     "view+stock": [
         {
-            "tool": "resolve_stock_name",
+            "tool": "search_stock_by_name",
             "desc": "解析股票代码"
         },
         {
@@ -277,7 +277,7 @@
     ],
     "query+stock": [
         {
-            "tool": "resolve_stock_name",
+            "tool": "search_stock_by_name",
             "desc": "解析股票代码"
         },
         {
@@ -306,6 +306,12 @@
         }
     ],
     "analyze+": [
+        {
+            "tool": "python_interpreter",
+            "desc": ""
+        }
+    ],
+    "+stock": [
         {
             "tool": "python_interpreter",
             "desc": ""

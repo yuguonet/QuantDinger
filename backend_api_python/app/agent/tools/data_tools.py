@@ -23,59 +23,36 @@ from app.data_sources.market_detector import detect_market as _detect_market
 # ── Tool functions ────────────────────────────────────────────
 
 @tool(
-    description="根据股票代码获取中文名称。如输入 600519 返回贵州茅台。",
-    category="名称查询",
-    layer="数据层",
-    domain=[],
-)
-
-def resolve_stock_name(stock_code: str) -> Dict[str, Any]:
-    """根据股票代码获取中文名称。
-
-    Args:
-        stock_code: 股票代码（如 600519、000001）或交易对（如 BTC/USDT）
-    """
-    market = _detect_market(stock_code) or "CNStock"
-    try:
-        from app.utils.basicinfo_db import get_stock_basic_db
-        db = get_stock_basic_db()
-        results = db.search_stocks(stock_code, limit=1)
-        if results:
-            return {"stock_code": stock_code, "name": results[0]["name"], "market": market}
-        return {"stock_code": stock_code, "name": None, "market": market, "message": "未找到对应名称"}
-    except Exception as e:
-        logger.error("resolve_stock_name(%s) failed: %s", stock_code, e)
-        return {"stock_code": stock_code, "error": str(e)}
-
-@tool(
     description="根据中文名称或关键词搜索股票代码。支持模糊匹配，如输入茅台可找到贵州茅台(600519)。当用户提供中文股票名称但没有代码时，必须先用此工具查到代码再进行后续分析。",
     category="名称查询",
     layer="数据层",
     domain=[],
 )
 def search_stock_by_name(keyword: str, market: str = "CNStock", limit: int = 10) -> Dict[str, Any]:
-    """根据中文名称或关键词搜索股票代码。
+    """根据中文名称或关键词搜索股票代码,支持模糊搜索。
 
     Args:
         keyword: 搜索关键词（中文股票名称、代码片段等）
         market: 市场，默认 CNStock（可选：CNStock、HKStock、Crypto、USStock）
         limit: 返回数量上限，默认10
     """
-    if not keyword or not keyword.strip():
+    keyword = (keyword or "").strip()
+    if not keyword:
         return {"error": "搜索关键词不能为空", "retriable": False}
 
     limit = min(max(limit, 1), 50)
     try:
-        from app.routes.market import _search_cn_smart
-        matches = _search_cn_smart(keyword.strip(), limit=limit)
-        if matches:
-            return {
-                "keyword": keyword,
-                "market": market,
-                "results": [{"code": m["symbol"], "name": m.get("name", ""), "market": m.get("market", market)} for m in matches],
-                "count": len(matches),
-            }
-        return {"keyword": keyword, "market": market, "results": [], "count": 0, "message": "未找到匹配的股票"}
+        from app.utils.basicinfo_db import get_stock_basic_db
+        matches = get_stock_basic_db().search_stocks(keyword, limit=limit)
+        return {
+            "keyword": keyword,
+            "market": market,
+            "results": [
+                {"code": m["symbol"], "name": m.get("name", ""), "market": m.get("market_cn", market)}
+                for m in matches
+            ],
+            "count": len(matches),
+        }
     except Exception as e:
         logger.error("search_stock_by_name(%s) failed: %s", keyword, e)
         return {"keyword": keyword, "results": [], "count": 0, "error": str(e)}

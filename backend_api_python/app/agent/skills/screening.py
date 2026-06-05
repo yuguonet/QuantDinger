@@ -38,7 +38,7 @@ from app.agent.skills.registry import skill
         "get_limit_down", "get_broken_board", "get_market_overview",
         "list_indicators", "run_indicator_signal", "review_stocks_with_indicator",
         "get_realtime_quote", "agent_get_kline",
-        "resolve_stock_name", "search_stock_by_name",
+        "search_stock_by_name", "search_stock_by_name",
     ],
     priority=8,
 )

@@ -224,7 +224,7 @@ def _evaluate_finance(agent_result, result, tool_chain, verb, noun, domain) -> E
         "get_realtime_quote", "agent_get_kline", "get_stock_info",
         "get_market_indices", "get_sector_rankings", "get_fund_flow",
         "get_chip_distribution", "get_market_overview", "get_hot_sectors",
-        "resolve_stock_name", "search_stock_by_name",
+        "search_stock_by_name", 
     }
     _ANALYSIS_TOOLS = {
         "analyze_trend", "get_indicator_snapshot", "calculate_ma",

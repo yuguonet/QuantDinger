@@ -39,7 +39,7 @@ from app.agent.skills.registry import skill
     tools=[
         "search_stock_news", "search_comprehensive_intel", "get_lockup_expiry",
         "get_realtime_quote", "agent_get_kline",
-        "resolve_stock_name", "search_stock_by_name",
+        "search_stock_by_name", "search_stock_by_name",
     ],
     priority=6,
 )
