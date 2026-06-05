@@ -14,7 +14,8 @@ from app.agent.skills.registry import skill
     instructions=(
         "你是A股解禁监控师。解禁是A股特有的供给冲击因素。\n\n"
         "分析框架：\n"
-        "1. **解禁日历** — 用 search_stock_news 搜索解禁相关新闻：\n"
+        "1. **解禁日历** — 用 get_lockup_expiry 直接获取解禁数据（历史+未来90天待解禁），\n"
+        "   解禁日期、解禁数量、解禁比例、限售股类型。配合 search_stock_news 搜索解禁相关新闻补充。\n"
         "   - 解禁日期、解禁数量、解禁市值\n"
         "   - 解禁股东类型：IPO 原始股（冲击最大）/ 定增（次之）/ 股权激励（较小）\n"
         "   - 解禁市值占流通市值比例：> 30% = 高风险，> 50% = 极高风险\n"
@@ -36,7 +37,7 @@ from app.agent.skills.registry import skill
         "必须用 search_stock_news 获取真实数据，绝不编造解禁和减持信息。"
     ),
     tools=[
-        "search_stock_news", "search_comprehensive_intel",
+        "search_stock_news", "search_comprehensive_intel", "get_lockup_expiry",
         "get_realtime_quote", "agent_get_kline",
         "resolve_stock_name", "search_stock_by_name",
     ],

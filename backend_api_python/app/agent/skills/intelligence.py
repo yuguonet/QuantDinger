@@ -14,7 +14,10 @@ from app.agent.skills.registry import skill
     instructions=(
         "你是A股情报分析专家，专注事件驱动和概念催化。\n\n"
         "分析流程：\n"
-        "1. **新闻搜索** — 用 search_stock_news 搜索个股相关新闻。\n"
+        "1. **新闻搜索** — 用 search_stock_news 搜索个股新闻（news_service），\n"
+        "   用 get_eastmoney_stock_news 补充东财直连新闻，\n"
+        "   用 get_global_finance_news 获取7×24全球快讯（突发事件监控），\n"
+        "   用 get_stock_filings 获取巨潮公告（业绩预告/减持/增持等）。\n"
         "2. **综合情报** — 用 search_comprehensive_intel 做深度情报分析。\n"
         "3. **事件分类** — 对新闻按影响类型分类：\n"
         "   - **政策事件**：行业监管、产业扶持、新规出台 → 影响板块级别\n"

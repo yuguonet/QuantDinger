@@ -14,9 +14,11 @@ from app.agent.skills.registry import skill
     instructions=(
         "你是A股行情数据专家。\n\n"
         "数据获取流程：\n"
-        "1. **大盘环境** — 用 get_market_indices 看上证/深证/创业板/科创50走势。\n"
+        "1. **大盘环境** — 用 get_market_indices 看大盘指数，用 get_index_etf_quote 获取更多指数+ETF行情（支持沪深300/创业板/上证50ETF等）。\n"
         "   - 大盘方向决定仓位上限（下跌市轻仓，上涨市可重仓）\n"
-        "2. **板块轮动** — 用 get_sector_rankings 看板块涨跌排名。\n"
+        "2. **板块轮动** — 用 get_hot_sectors 获取实时热门板块（涨停数/领涨股/强度标签/情绪判断），\n"
+        "   用 get_sector_trend_analysis 查板块趋势分析（持续走强/走弱+季节性规律），\n"
+        "   用 get_sector_history_data 获取板块历史排名走势。\n"
         "   - 今日领涨板块 = 短期资金偏好\n"
         "   - 连续领涨板块 = 中期主线\n"
         "3. **概念热度** — 关注概念板块的涨停数量和连板高度。\n"
