@@ -302,5 +302,11 @@
             "tool": "get_account_balance",
             "desc": "查看账户余额"
         }
+    ],
+    "filter+market": [
+        {
+            "tool": "python_interpreter",
+            "desc": ""
+        }
     ]
 }
