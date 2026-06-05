@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS qd_chain_steps (
     conclusion      TEXT DEFAULT '',
     direction       VARCHAR(10) DEFAULT 'neutral',
     confidence      FLOAT DEFAULT 0,
-    tools_called    TEXT DEFAULT '',
+    tools_called    TEXT DEFAULT '',       -- JSON array: ["run_backtest", "get_kline"]
+    tools_detail    TEXT DEFAULT '',       -- JSON: [{"name":"run_backtest","ok":true,"ms":1200},...]
     created_at      TIMESTAMP DEFAULT NOW(),
     UNIQUE(execution_id, step_name)
 );
@@ -80,7 +81,9 @@ CREATE TABLE IF NOT EXISTS qd_chain_eval_summary (
     overall_accuracy_1d FLOAT DEFAULT 0,
     overall_accuracy_3d FLOAT DEFAULT 0,
     overall_accuracy_5d FLOAT DEFAULT 0,
-    step_accuracies TEXT DEFAULT '',  -- JSON: {"screening": 0.6, "intelligence": 0.55, ...}
+    step_accuracies TEXT DEFAULT '',       -- JSON: {"screening": 0.6, "intelligence": 0.55}
+    skill_accuracies TEXT DEFAULT '',      -- JSON: {"technical_agent": 0.7, "screening_agent": 0.5}
+    tool_stats      TEXT DEFAULT '',       -- JSON: {"run_backtest":{"calls":10,"ok":9,"useful":7}}
     created_at      TIMESTAMP DEFAULT NOW(),
     UNIQUE(eval_date, chain_id)
 );

@@ -34,6 +34,7 @@ class StepResult:
         self.direction = "neutral"  # bullish / bearish / neutral
         self.confidence = 0.0
         self.tools_called: List[str] = []
+        self.tools_detail: List[Dict[str, Any]] = []  # [{name, success, latency_ms, error}]
         self.raw_output = ""
         self.error = ""
         self.elapsed_ms = 0.0
@@ -48,6 +49,7 @@ class StepResult:
             "direction": self.direction,
             "confidence": self.confidence,
             "tools_called": self.tools_called,
+            "tools_detail": self.tools_detail,
             "error": self.error,
             "elapsed_ms": self.elapsed_ms,
         }
@@ -123,6 +125,58 @@ def _extract_confidence(text: str) -> float:
     return 0.5  # 默认中等置信度
 
 
+def _parse_tool_details(text: str) -> List[Dict[str, Any]]:
+    """从 agent 输出中解析工具调用详情。
+
+    支持多种 agent 输出格式：
+    - smolagents: "工具: xxx" 或 "Calling tool: xxx"
+    - 通用格式: "```tool_call\nxxx\n```"
+    - JSON 块: {"tool": "xxx", "success": true}
+    """
+    import re
+    details = []
+    seen = set()
+
+    # 模式1: JSON 工具调用块
+    for m in re.finditer(r'\{[^{}]*"tool"\s*:\s*"([^"]+)"[^{}]*\}', text):
+        try:
+            # 尝试解析完整 JSON
+            start = text.rfind('{', 0, m.start())
+            end = text.find('}', m.end()) + 1
+            obj = json.loads(text[start:end])
+            name = obj.get("tool", "")
+            if name and name not in seen:
+                seen.add(name)
+                details.append({
+                    "name": name,
+                    "ok": obj.get("success", obj.get("ok", True)),
+                    "ms": obj.get("ms", obj.get("latency_ms", 0)),
+                })
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # 模式2: "工具: xxx" 或 "Calling tool: xxx" 或 "Used tool: xxx"
+    if not details:
+        for m in re.finditer(
+            r'(?:工具|Calling tool|Used tool|调用工具)[：:]\s*(\w+)', text
+        ):
+            name = m.group(1)
+            if name not in seen:
+                seen.add(name)
+                details.append({"name": name, "ok": True, "ms": 0})
+
+    # 模式3: 从 tools_called 列表推断（兜底）
+    if not details:
+        for m in re.finditer(r'`(\w+)`', text):
+            name = m.group(1)
+            # 只接受看起来像工具名的（包含下划线或以 get/run 开头）
+            if ('_' in name or name.startswith(('get_', 'run_', 'list_', 'search'))) and name not in seen:
+                seen.add(name)
+                details.append({"name": name, "ok": True, "ms": 0})
+
+    return details
+
+
 # ═══════════════════════════════════════════════════════════════
 # 链路执行器
 # ═══════════════════════════════════════════════════════════════
@@ -153,6 +207,19 @@ class ChainExecutor:
         self.chain_def = get_chain(chain_id)
         if not self.chain_def:
             raise ValueError(f"Unknown chain: {chain_id}")
+        # 历史准确率权重（从评估系统加载）
+        self._step_weights = self._load_step_weights()
+
+    def _load_step_weights(self) -> Dict[str, float]:
+        """从评估系统加载历史步骤准确率权重。"""
+        try:
+            from app.agent.chain.evaluator import get_step_weights
+            weights = get_step_weights(self.chain_id)
+            if weights:
+                logger.info("[ChainExecutor] 加载历史权重 %s: %s", self.chain_id, weights)
+            return weights
+        except Exception:
+            return {}
 
     def execute(
         self,
@@ -196,6 +263,11 @@ class ChainExecutor:
                 step_result.direction = _extract_direction(output)
                 step_result.confidence = _extract_confidence(output)
                 step_result.raw_output = output
+
+                # 解析工具调用详情
+                tool_details = _parse_tool_details(output)
+                step_result.tools_detail = tool_details
+                step_result.tools_called = [t["name"] for t in tool_details]
 
             except Exception as e:
                 logger.warning("[ChainExecutor] 步骤 %s 失败: %s", step.name, e)
@@ -257,13 +329,14 @@ class ChainExecutor:
             result.summary = "所有步骤均失败，无法给出判断。"
             return
 
-        # 加权投票：各步骤按置信度加权
+        # 加权投票：历史准确率 × 置信度
         bull_score = 0.0
         bear_score = 0.0
         total_weight = 0.0
 
         for s in successful:
-            weight = s.confidence
+            hist_weight = self._step_weights.get(s.step.name, 0.5)
+            weight = hist_weight * s.confidence
             if s.direction == "bullish":
                 bull_score += weight
             elif s.direction == "bearish":
@@ -333,12 +406,14 @@ class ChainExecutor:
                     cur.execute("""
                         INSERT INTO qd_chain_steps
                             (execution_id, step_name, step_order, agent_name,
-                             conclusion, direction, confidence, tools_called)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                             conclusion, direction, confidence, tools_called, tools_detail)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """, (
                         execution_id, sr.step.name, sr.step.order,
                         sr.step.agent, sr.conclusion, sr.direction,
-                        sr.confidence, ",".join(sr.tools_called),
+                        sr.confidence,
+                        json.dumps(sr.tools_called, ensure_ascii=False),
+                        json.dumps(sr.tools_detail, ensure_ascii=False),
                     ))
 
                 conn.commit()

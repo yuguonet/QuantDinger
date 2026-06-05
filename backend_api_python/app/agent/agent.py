@@ -118,25 +118,13 @@ from app.agent.skills.guidance import GUIDANCE
 def _load_preamble() -> str:
     """Load agent preamble from external .md file, with built-in fallback."""
     import pathlib
-    candidates = [
-        pathlib.Path(__file__).resolve().parent / "agent_preamble.md",
-    ]
-    for p in candidates:
-        if p.is_file():
-            try:
-                return p.read_text(encoding="utf-8").strip()
-            except Exception:
-                pass
-    # Fallback — embedded default
-    return (
-        "你是 QuantDinger 量化分析助手。你的职责是基于真实数据为用户提供专业、客观、"
-        "可执行的金融分析与交易建议。\n\n"
-        "## 核心原则\n\n"
-        "- **数据驱动** — 所有结论必须有工具返回的数据支撑，绝不编造数字\n"
-        "- **风险优先** — 分析必须包含风险提示，投资决策前先排查风险\n"
-        "- **直接了当** — 跳过客套，直接给结论和依据\n"
-        "- **诚实透明** — 数据不足时明确告知，不猜测，不掩饰不确定性"
-    )
+    p = pathlib.Path(__file__).resolve().parent / "agent_preamble.md"
+    if p.is_file():
+        try:
+            return p.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+    return "你是 QuantDinger 量化分析助手。"
 
 
 def _build_instructions(user_message: str = "", skill_instructions: str = "",
