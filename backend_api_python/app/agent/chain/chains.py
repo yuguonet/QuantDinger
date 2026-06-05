@@ -71,48 +71,102 @@ def list_chains() -> List[ChainDef]:
 # 内置链路定义
 # ═══════════════════════════════════════════════════════════════
 
-# ── 综合评估链 ──
+# ── 综合评估链（A股中短线特化：政策/资金/情绪优先，辩论收尾）──
 register_chain(ChainDef(
     chain_id="evaluate+stock",
     name="股票综合评估",
-    description="对个股进行全面评估：指标选股→新闻情报→资金流向→回测验证→技术面→综合判断",
+    description="政策面→游资追踪→解禁监控→概念追踪→动量分析→情报→技术面→选股→资金流向→回测→多空辩论→综合判断",
     trigger_verbs=["analyze", "evaluate"],
     trigger_nouns=["stock"],
     steps=[
+        # ── 第一优先级：能不能做（环境判断）──
         ChainStep(
-            name="screening",
-            agent="screening_agent",
+            name="policy",
+            agent="policy_analyst",
             order=1,
-            description="指标选股，筛选候选池",
+            description="政策面分析：监管政策、产业政策对个股的影响（A股第一驱动力）",
             required=False,
         ),
+        ChainStep(
+            name="hot_money",
+            agent="hot_money_tracker",
+            order=2,
+            description="游资追踪：龙虎榜、主力资金动态、游资席位动向（短线定价核心）",
+            required=False,
+        ),
+        ChainStep(
+            name="lockup",
+            agent="lockup_watcher",
+            order=3,
+            description="解禁监控：限售股解禁、减持预警、质押风险（供给端风险）",
+            required=False,
+        ),
+        ChainStep(
+            name="concept",
+            agent="concept_tracker",
+            order=4,
+            description="概念追踪：题材生命周期、板块轮动方向、龙头识别（A股核心盈利模式）",
+            required=False,
+        ),
+        ChainStep(
+            name="momentum",
+            agent="momentum_tracker",
+            order=5,
+            description="动量分析：趋势强度、突破判断、短线择时（中短线交易核心）",
+            required=False,
+        ),
+        # ── 第二优先级：怎么做（细节验证）──
         ChainStep(
             name="intelligence",
             agent="intelligence_agent",
-            order=2,
-            description="新闻搜索，综合情报分析",
-            required=False,
-        ),
-        ChainStep(
-            name="fund_flow",
-            agent="market_data_agent",
-            order=3,
-            description="资金流向分析，板块动向",
-            required=False,
-        ),
-        ChainStep(
-            name="backtest",
-            agent="backtest_agent",
-            order=4,
-            description="策略回测验证",
+            order=6,
+            description="情报分析：新闻搜索、事件驱动、概念催化",
             required=False,
         ),
         ChainStep(
             name="technical",
             agent="technical_agent",
-            order=5,
-            description="技术面综合判断",
+            order=7,
+            description="技术面综合判断：指标、形态、量能、筹码",
             required=True,
+        ),
+        ChainStep(
+            name="screening",
+            agent="screening_agent",
+            order=8,
+            description="选股验证：条件筛选、指标信号验证",
+            required=False,
+        ),
+        ChainStep(
+            name="fund_flow",
+            agent="market_data_agent",
+            order=9,
+            description="资金流向分析：板块资金、概念资金、主力态度",
+            required=False,
+        ),
+        ChainStep(
+            name="backtest",
+            agent="backtest_agent",
+            order=10,
+            description="策略回测验证：历史绩效、胜率、盈亏比、最大回撤",
+            required=False,
+        ),
+        # ── 第三优先级：多空辩论（决策收尾）──
+        ChainStep(
+            name="bull_bear_debate",
+            agent="bull_researcher",
+            order=11,
+            description="多空辩论：多头研究员基于所有报告构建看涨论据",
+            required=False,
+            extract_fn="extract_bull_args",
+        ),
+        ChainStep(
+            name="bear_rebuttal",
+            agent="bear_researcher",
+            order=12,
+            description="多空辩论：空头研究员反驳多头论据并构建看跌论据",
+            required=False,
+            extract_fn="extract_bear_args",
         ),
     ],
 ))

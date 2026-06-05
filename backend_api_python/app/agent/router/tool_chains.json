@@ -77,12 +77,8 @@
     ],
     "analyze+project": [
         {
-            "tool": "list_project_files",
-            "desc": "列出项目文件结构"
-        },
-        {
-            "tool": "read_project_file",
-            "desc": "读取关键文件"
+            "tool": "python_interpreter",
+            "desc": ""
         }
     ],
     "analyze+code": [
