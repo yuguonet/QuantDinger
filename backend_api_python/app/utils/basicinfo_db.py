@@ -625,12 +625,27 @@ class StockBasicDB:
 
         # 2. 代码/名称模糊匹配（LIKE）
         if len(results) < limit:
-            for s in self.search_stocks(kw, limit=limit * 2):
-                if s["symbol"] not in seen:
-                    results.append(s)
-                    seen.add(s["symbol"])
-                    if len(results) >= limit:
-                        break
+            try:
+                pool = self._get_pool()
+                with pool.cursor() as cur:
+                    cur.execute(
+                        "SELECT symbol, name, market_cn, industry, concepts, list_date, "
+                        "       total_shares, circ_shares, pe_ratio, pb_ratio, status, updated_at "
+                        "FROM stock_basic_info "
+                        "WHERE (symbol LIKE %s OR name LIKE %s) AND status = 'active' "
+                        "ORDER BY symbol LIMIT %s",
+                        (f"%{kw}%", f"%{kw}%", limit * 2),
+                    )
+                    rows = cur.fetchall() or []
+                for r in rows:
+                    s = self._row_to_dict(r)
+                    if s["symbol"] not in seen:
+                        results.append(s)
+                        seen.add(s["symbol"])
+                        if len(results) >= limit:
+                            break
+            except Exception as e:
+                logger.debug("search_stocks LIKE query failed: %s", e)
 
         # 3. 拼音首字母匹配（如 'gzmt' → '贵州茅台'）
         if len(results) < limit and kw.isalpha():

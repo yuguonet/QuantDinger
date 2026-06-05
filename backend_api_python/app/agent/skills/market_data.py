@@ -35,7 +35,7 @@ from app.agent.skills.registry import skill
     ),
     tools=[
         "get_realtime_quote", "agent_get_kline", "get_stock_info",
-        "search_stock_by_name", "search_stock_by_name",
+        "search_stock_by_name",
         "get_market_indices", "get_sector_rankings",
         "get_market_overview",
         "get_fund_flow", "get_sector_fund_flow", "get_concept_fund_flow",

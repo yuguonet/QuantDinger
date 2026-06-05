@@ -41,7 +41,7 @@ from app.agent.skills.registry import skill
         "get_concept_fund_flow", "get_zt_pool", "get_limit_down",
         "get_hot_rank", "get_broken_board", "get_market_overview",
         "get_realtime_quote", "agent_get_kline",
-        "search_stock_by_name", "search_stock_by_name",
+        "search_stock_by_name",
     ],
     priority=7,
 )

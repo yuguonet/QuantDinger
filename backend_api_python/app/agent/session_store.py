@@ -169,7 +169,7 @@ class _InMemoryStore:
     # ── Compressed context (跨轮上下文压缩) ──────────────────
 
     def save_context_summary(self, session_id: str, summary: str, domain: str = "") -> None:
-        """保存压缩上下文摘要。按领域分别存储。"""
+        """保存压缩上下文摘要。按领域分别存储，同时记录年龄（轮次计数）。"""
         with self._lock:
             if session_id not in self._sessions:
                 self._sessions[session_id] = {}
@@ -177,23 +177,47 @@ class _InMemoryStore:
             if domain:
                 if "context_summaries" not in s:
                     s["context_summaries"] = {}
+                if "_summary_ages" not in s:
+                    s["_summary_ages"] = {}
                 if summary:
                     s["context_summaries"][domain] = summary
+                    # 新摘要 → 重置年龄为 0；后续 get 时会递增
+                    s["_summary_ages"][domain] = 0
                 s["current_domain"] = domain
             elif summary:
                 cur = s.get("current_domain", "")
                 if cur:
                     if "context_summaries" not in s:
                         s["context_summaries"] = {}
+                    if "_summary_ages" not in s:
+                        s["_summary_ages"] = {}
                     s["context_summaries"][cur] = summary
+                    s["_summary_ages"][cur] = 0
             s["updated_at"] = time.time()
 
-    def get_context_summary(self, session_id: str, current_domain: str = "") -> str:
-        """获取指定领域的压缩上下文摘要。"""
+    def get_context_summary(self, session_id: str, current_domain: str = "", with_age: bool = False):
+        """获取指定领域的压缩上下文摘要。
+
+        Args:
+            with_age: 如果 True，返回 (summary, age_turns) 元组；
+                      默认 False，只返回 summary 字符串。
+                      age_turns 表示该摘要已存活多少轮（每调用一次 get 自增 1）。
+        """
         with self._lock:
             s = self._sessions.get(session_id, {})
             if current_domain:
-                return s.get("context_summaries", {}).get(current_domain, "")
+                summary = s.get("context_summaries", {}).get(current_domain, "")
+                ages = s.get("_summary_ages", {})
+                age = ages.get(current_domain, 0)
+                if summary:
+                    # 每次读取 → 年龄 +1（表示又过了一轮）
+                    ages[current_domain] = age + 1
+                    s["_summary_ages"] = ages
+                if with_age:
+                    return summary, age
+                return summary
+            if with_age:
+                return "", 0
             return ""
 
     # ── Maintenance ──────────────────────────────────────────
@@ -391,6 +415,9 @@ class _RedisStore:
             if summary:
                 self._r.hset(self._context_summaries_key(session_id), domain, summary)
                 self._r.expire(self._context_summaries_key(session_id), 3600)
+                # 重置年龄为 0
+                self._r.hset(self._context_ages_key(session_id), domain, "0")
+                self._r.expire(self._context_ages_key(session_id), 3600)
             self._r.set(self._context_domain_key(session_id), domain, ex=3600)
         elif summary:
             cur = self._r.get(self._context_domain_key(session_id))
@@ -398,12 +425,25 @@ class _RedisStore:
             if cur:
                 self._r.hset(self._context_summaries_key(session_id), cur, summary)
                 self._r.expire(self._context_summaries_key(session_id), 3600)
+                self._r.hset(self._context_ages_key(session_id), cur, "0")
+                self._r.expire(self._context_ages_key(session_id), 3600)
 
-    def get_context_summary(self, session_id: str, current_domain: str = "") -> str:
+    def _context_ages_key(self, session_id: str) -> str:
+        return f"quantdinger:ctx_ages:{session_id}"
+
+    def get_context_summary(self, session_id: str, current_domain: str = "", with_age: bool = False):
         if not current_domain:
-            return ""
+            return ("", 0) if with_age else ""
         raw = self._r.hget(self._context_summaries_key(session_id), current_domain)
-        return raw.decode() if isinstance(raw, bytes) else (raw or "")
+        summary = raw.decode() if isinstance(raw, bytes) else (raw or "")
+        # 读取并递增年龄
+        age_raw = self._r.hget(self._context_ages_key(session_id), current_domain)
+        age = int(age_raw) if age_raw else 0
+        if summary:
+            self._r.hincrby(self._context_ages_key(session_id), current_domain, 1)
+        if with_age:
+            return summary, age
+        return summary
 
     # ── Maintenance (Redis handles TTL natively) ─────────────
 
@@ -627,23 +667,37 @@ class _FileStore:
                 if summary:
                     summaries = data.setdefault("context_summaries", {})
                     summaries[domain] = summary
+                    ages = data.setdefault("_summary_ages", {})
+                    ages[domain] = 0  # 新摘要，重置年龄
                 data["current_domain"] = domain
             elif summary:
                 cur = data.get("current_domain", "")
                 if cur:
                     summaries = data.setdefault("context_summaries", {})
                     summaries[cur] = summary
+                    ages = data.setdefault("_summary_ages", {})
+                    ages[cur] = 0
             data.setdefault("session", {})["updated_at"] = time.time()
             self._write(session_id, data)
 
-    def get_context_summary(self, session_id: str, current_domain: str = "") -> str:
+    def get_context_summary(self, session_id: str, current_domain: str = "", with_age: bool = False):
         if not current_domain:
-            return ""
+            return ("", 0) if with_age else ""
         with self._lock:
             data = self._read(session_id)
             if not data:
-                return ""
-            return data.get("context_summaries", {}).get(current_domain, "")
+                return ("", 0) if with_age else ""
+            summary = data.get("context_summaries", {}).get(current_domain, "")
+            ages = data.get("_summary_ages", {})
+            age = ages.get(current_domain, 0)
+            # 读取后递增年龄
+            if summary:
+                ages[current_domain] = age + 1
+                data["_summary_ages"] = ages
+                self._write(session_id, data)
+            if with_age:
+                return summary, age
+            return summary
 
     # ── Maintenance ──────────────────────────────────────────
 

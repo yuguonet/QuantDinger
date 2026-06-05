@@ -647,9 +647,10 @@ class _AgentExecutor:
         ctx_parts = []
 
         # 压缩上下文（上轮分析摘要，领域切换时自动丢弃）
-        context_summary = store.get_context_summary(session_id, current_domain=domain)
+        context_summary, summary_age = store.get_context_summary(session_id, current_domain=domain, with_age=True)
         if context_summary:
-            ctx_parts.append(f"[上轮分析摘要]\n{context_summary}")
+            age_hint = f" (已存{summary_age}轮)" if summary_age > 0 else ""
+            ctx_parts.append(f"[上轮分析摘要{age_hint}]\n{context_summary}")
 
         if context:
             if context.get("stock_code"):
@@ -785,14 +786,16 @@ class _AgentExecutor:
                 try:
                     from app.agent.context_compressor import compress_context
                     import threading
-                    def _compress(c=content, tc=tool_calls_log, sid=session_id, m=self.model):
+                    _compress_domain = _eval_domain
+                    def _compress(c=content, tc=tool_calls_log, sid=session_id, m=self.model, d=_compress_domain):
                         try:
-                            summary = compress_context(c, tc, model=m)
+                            _, age = store.get_context_summary(sid, current_domain=d, with_age=True)
+                            summary = compress_context(c, tc, model=m, domain=d, age_turns=age)
                         except Exception as e:
                             logger.warning("[Compress] 压缩异常，降级截断: %s", e)
                             summary = c[:500]
                         if summary:
-                            store.save_context_summary(sid, summary)
+                            store.save_context_summary(sid, summary, domain=d)
                     threading.Thread(target=_compress, daemon=True).start()
                 except Exception:
                     pass
@@ -985,14 +988,16 @@ class _AgentExecutor:
                         try:
                             from app.agent.context_compressor import compress_context
                             import threading
-                            def _compress(c=content, tc=_stream_tool_calls, sid=session_id, m=self.model):
+                            _stream_domain = meta.get("domain", "")
+                            def _compress(c=content, tc=_stream_tool_calls, sid=session_id, m=self.model, d=_stream_domain):
                                 try:
-                                    summary = compress_context(c, tc, model=m)
+                                    _, age = store.get_context_summary(sid, current_domain=d, with_age=True)
+                                    summary = compress_context(c, tc, model=m, domain=d, age_turns=age)
                                 except Exception as e:
                                     logger.warning("[Compress] 压缩异常，降级截断: %s", e)
                                     summary = c[:500]
                                 if summary:
-                                    store.save_context_summary(sid, summary)
+                                    store.save_context_summary(sid, summary, domain=d)
                             threading.Thread(target=_compress, daemon=True).start()
                         except Exception:
                             pass

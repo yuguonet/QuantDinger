@@ -13,10 +13,6 @@ const marketApi = {
   GetAnalysisHistoryList: '/api/analysis/getHistoryList',
   DeleteAnalysisTask: '/api/analysis/deleteTask',
   ReflectAnalysis: '/api/analysis/reflect',
-  // AI chat (optional)
-  ChatMessage: '/api/ai/chat/message',
-  GetChatHistory: '/api/ai/chat/history',
-  SaveChatHistory: '/api/ai/chat/history/save',
   // Public config
   GetConfig: '/api/market/config',
   GetMenuFooterConfig: '/api/market/menuFooterConfig',
@@ -78,45 +74,6 @@ export function getWatchlistPrices (parameter) {
     params: {
       watchlist: JSON.stringify(parameter.watchlist || [])
     }
-  })
-}
-
-/**
- * 发送 AI 聊天消息
- * @param parameter { userid: number, message: string, chatId?: string }
- * @returns {*}
- */
-export function chatMessage (parameter) {
-  return request({
-    url: marketApi.ChatMessage,
-    method: 'post',
-    data: parameter
-  })
-}
-
-/**
- * 获取聊天历史
- * @param parameter { userid: number }
- * @returns {*}
- */
-export function getChatHistory (parameter) {
-  return request({
-    url: marketApi.GetChatHistory,
-    method: 'get',
-    params: parameter
-  })
-}
-
-/**
- * 保存聊天历史
- * @param parameter { userid: number, chatHistory: array }
- * @returns {*}
- */
-export function saveChatHistory (parameter) {
-  return request({
-    url: marketApi.SaveChatHistory,
-    method: 'post',
-    data: parameter
   })
 }
 

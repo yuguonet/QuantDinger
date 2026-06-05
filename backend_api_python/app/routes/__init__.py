@@ -13,7 +13,6 @@ def register_routes(app: Flask):
     from app.routes.strategy import strategy_bp
     from app.routes.credentials import credentials_bp
     from app.routes.auth import auth_bp
-    from app.routes.ai_chat import ai_chat_bp
     from app.routes.indicator import indicator_bp
     from app.routes.dashboard import dashboard_bp
     from app.routes.settings import settings_bp
@@ -44,7 +43,6 @@ def register_routes(app: Flask):
     app.register_blueprint(kline_bp, url_prefix='/api/indicator')
     app.register_blueprint(backtest_bp, url_prefix='/api/indicator')
     app.register_blueprint(market_bp, url_prefix='/api/market')
-    app.register_blueprint(ai_chat_bp, url_prefix='/api/ai')
     app.register_blueprint(indicator_bp, url_prefix='/api/indicator')
     app.register_blueprint(strategy_bp, url_prefix='/api')
     app.register_blueprint(credentials_bp, url_prefix='/api/credentials')
