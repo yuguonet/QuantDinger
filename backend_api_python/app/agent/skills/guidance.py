@@ -19,10 +19,15 @@ GUIDANCE = """## 核心规则
 
 ### 任务流程
 
-**股票分析** — 行情→技术面→形态→量能→情报→综合判断。用 final_answer 返回。
-**选股筛选** — 用 search_stocks 按条件筛选，再用 run_indicator_signal 验证。
-**回测验证** — 用 list_strategies 发现策略，用 run_backtest 执行，分析绩效。
-**交易执行** — 先确认行情和信号，再用 start_strategy 启动。
+**行情查询** → market_data_agent：实时报价、K线、指数、板块、资金流向。
+**技术分析** → technical_agent：指标计算、趋势判断、形态识别、量能分析。
+**选股筛选** → screening_agent：条件选股、龙虎榜、涨停池、热榜、指标验证。
+**情报分析** → intelligence_agent：新闻搜索、综合情报、舆情分析。
+**策略回测** → backtest_agent：回测执行、绩效分析（收益率、胜率、最大回撤、夏普比率）。
+**交易执行** → trading_agent：策略启停、持仓管理、交易记录。
+**数据处理** → data_agent：代码执行、数据清洗、批量处理。
+
+**综合个股分析** — 协调多个专家：market_data（行情）→ technical（技术面）→ intelligence（情报）→ 综合判断。用 final_answer 返回。
 
 **重要提示：**
 - 当用户只给中文名称没给代码时，必须先用 search_stock_by_name 查到代码。

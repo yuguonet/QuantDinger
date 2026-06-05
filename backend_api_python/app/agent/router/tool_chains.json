@@ -308,5 +308,11 @@
             "tool": "python_interpreter",
             "desc": ""
         }
+    ],
+    "analyze+": [
+        {
+            "tool": "python_interpreter",
+            "desc": ""
+        }
     ]
 }

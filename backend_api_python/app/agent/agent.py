@@ -716,6 +716,16 @@ class _AgentExecutor:
                 model="intent-quick-reply", error=None,
             )
 
+        # ── 链路执行：检测是否有匹配的编排链路 ───────────────
+        _intent_verb = meta.get("intent_verb", "")
+        _intent_noun = meta.get("intent_noun", "")
+        chain_result = self._try_chain(
+            _intent_verb, _intent_noun, message, session_id, context, user_id,
+        )
+        if chain_result is not None:
+            store.add_message(session_id, "assistant", chain_result.content)
+            return chain_result
+
         # 保存意图信息，供后置评估使用
         _intent_verb = meta.get("intent_verb", "")
         _intent_noun = meta.get("intent_noun", "")
@@ -811,6 +821,81 @@ class _AgentExecutor:
             learn_from_execution(eval_result, verb, noun)
         except Exception as e:
             logger.warning("[PostEval] 评估异常，不影响返回: %s", e)
+
+    def _try_chain(self, verb, noun, message, session_id, context, user_id):
+        """尝试链路执行。匹配到链路时执行并返回 AgentResult，否则返回 None。"""
+        if not verb:
+            return None
+
+        try:
+            from app.agent.chain.chains import get_chain_for_intent
+            chain_def = get_chain_for_intent(verb, noun)
+            if not chain_def:
+                return None
+        except Exception:
+            return None
+
+        # 提取股票代码
+        stock_code = ""
+        stock_name = ""
+        if context:
+            stock_code = context.get("stock_code", "")
+            stock_name = context.get("stock_name", "")
+        if not stock_code:
+            import re
+            match = re.search(r'\b(\d{6})\b', message)
+            if match:
+                stock_code = match.group(1)
+        if not stock_code:
+            logger.info("[Chain] 链路 %s 匹配但未找到股票代码，跳过链路", chain_def.chain_id)
+            return None
+
+        logger.info("[Chain] 触发链路 %s | 股票=%s", chain_def.chain_id, stock_code)
+
+        # 构建 managed agents 映射
+        from app.agent.session_store import get_session_store
+        store = get_session_store()
+
+        try:
+            smol_model = build_model(self.model, self.provider)
+            managed_agents = _build_managed_agents(smol_model)
+            agent_map = {ma.name: ma for ma in managed_agents}
+        except Exception as e:
+            logger.warning("[Chain] 构建 managed agents 失败: %s", e)
+            return None
+
+        # run_agent_fn：调用指定的子 agent
+        def run_agent_fn(agent_name: str, msg: str, ctx: dict) -> str:
+            sub_agent = agent_map.get(agent_name)
+            if not sub_agent:
+                raise ValueError(f"Unknown agent: {agent_name}")
+            result = sub_agent.run(msg, max_steps=8)
+            return str(result.output) if hasattr(result, "output") else str(result)
+
+        # 执行链路
+        from app.agent.chain.executor import ChainExecutor
+        executor = ChainExecutor(
+            chain_id=chain_def.chain_id,
+            stock_code=stock_code,
+            stock_name=stock_name,
+            user_id=user_id,
+        )
+        chain_result = executor.execute(
+            run_agent_fn=run_agent_fn,
+            context={"user_query": message},
+        )
+
+        # 转换为 AgentResult
+        content = chain_result.summary
+        return AgentResult(
+            success=chain_result.success,
+            content=content,
+            tool_calls_log=[],
+            total_steps=len(chain_result.step_results),
+            total_tokens=0,
+            model="chain-orchestrator",
+            error=None if chain_result.success else "链路执行失败",
+        )
 
     def chat_stream(self, message, session_id, context=None,
                     progress_callback=None, user_id=1):
