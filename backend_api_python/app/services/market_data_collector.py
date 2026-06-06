@@ -647,26 +647,6 @@ class MarketDataCollector:
             if market == 'USStock':
                 return self._get_us_fundamental(symbol)
             if market in ('CNStock', 'HKStock'):
-                # CNStock: 先走 CNStockExtent 缓存，命中则直接返回
-                if market == 'CNStock':
-                    try:
-                        from app.data_sources.a_stock import AStockDataSource
-                        from app.data_sources.normalizer import normalize_cn_code
-                        ext = AStockDataSource()
-                        code = normalize_cn_code(symbol)
-                        if code:
-                            info = ext.get_stock_info(code)
-                            if info and info.get("stock_name"):
-                                return {
-                                    "pe_ratio": info.get("pe_ratio"),
-                                    "pb_ratio": info.get("pb_ratio"),
-                                    "market_cap": info.get("total_mv"),
-                                    "industry": info.get("industry"),
-                                    "source": "a_stock/cached",
-                                }
-                    except Exception as e:
-                        logger.debug(f"CNStockExtent cache miss for {symbol}: {e}")
-                # 缓存未命中或 HKStock: 走完整多层降级
                 return self._get_cn_hk_fundamental(market, symbol)
         except Exception as e:
             logger.warning(f"Fundamental data fetch failed for {market}:{symbol}: {e}")
@@ -1321,24 +1301,14 @@ class MarketDataCollector:
             factors["sources"]["fear_greed_error"] = str(e)
 
         # 2. 个股主力资金流向 (补充因子)
-        try:
-            if symbol:
-                from app.data_sources.a_stock import AStockDataSource
-                from app.data_sources.normalizer import normalize_cn_code
-                ext = AStockDataSource()
-                code = normalize_cn_code(symbol)
-                if code:
-                    flow = ext.get_stock_fund_flow(code)
-                    if flow:
-                        mf = flow.get("main_net_inflow")
-                        if mf is None:
-                            mf = flow.get("net_inflow")
-                        factors["main_fund_netflow"] = _safe_float(mf)
-                        factors["turnover_rate"] = _safe_float(flow.get("turnover_rate"))
-                        if factors["main_fund_netflow"] is not None or factors["turnover_rate"] is not None:
-                            factors["sources"]["fund_flow"] = "eastmoney/akshare"
-        except Exception as e:
-            logger.debug(f"A-share fund flow fetch failed: {e}")
+        # 原 AStockDataSource.get_stock_fund_flow 已移除，返回 main_net_inflow(主力净流入) + turnover_rate(换手率)
+        # 可用替换: eastmoney_extra_tools.get_fund_flow_120d (push2his API, 返回近120日主力净流入)
+        #           或 cn_hk_fundamentals.py 中新增 fetch_cn_fund_flow_akshare
+        logger.warning(
+            "[market_data_collector] 个股资金流向功能缺失，需补充: "
+            "main_net_inflow(主力净流入, 单位:万) + turnover_rate(换手率, 单位:%)。"
+            "参考: eastmoney push2his API 或 akshare stock_individual_fund_flow"
+        )
 
         # 3. 摘要
         summary_parts = []
@@ -1817,25 +1787,6 @@ class MarketDataCollector:
                         'market_cap': profile.get('marketCapitalization'),
                         'website': profile.get('weburl'),
                     }
-            if market == 'CNStock':
-                # 先走 CNStockExtent 缓存
-                try:
-                    from app.data_sources.a_stock import AStockDataSource
-                    from app.data_sources.normalizer import normalize_cn_code
-                    ext = AStockDataSource()
-                    code = normalize_cn_code(symbol)
-                    if code:
-                        info = ext.get_stock_info(code)
-                        if info and info.get("stock_name"):
-                            return {
-                                'name': info.get("stock_name"),
-                                'industry': info.get("industry"),
-                                'country': 'CN',
-                                'exchange': 'SSE/SZSE',
-                                'source': 'a_stock/cached',
-                            }
-                except Exception as e:
-                    logger.debug(f"CNStockExtent company cache miss for {symbol}: {e}")
             if market in ('CNStock', 'HKStock'):
                 return self._get_cn_hk_company(market, symbol)
             

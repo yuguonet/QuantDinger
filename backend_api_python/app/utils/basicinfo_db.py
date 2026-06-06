@@ -57,7 +57,7 @@ basicinfo_db.py — A股全市场股票基本信息读写
     源3: AkShare stock_info_a_code_name()（兜底）
 
   行业、股本、市盈率等「详情字段」不全量拉（6000 只逐个取太慢），
-  由 enrich_stock_info(code) 按需单只补充。
+  详情字段（行业、股本等）按需单只补充。
 
   UPSERT 冲突策略：
     - symbol 已存在 → 更新名称和交易所（这两个可能变）
@@ -92,8 +92,7 @@ basicinfo_db.py — A股全市场股票基本信息读写
   results = db.search_stocks("茅台")
   count = db.get_stock_count()
 
-  # 按需补充详情
-  db.enrich_stock_info("600519")
+  # 按需补充详情（已移除 enrich_stock_info，该方法已删除）
 
   # 统计
   stats = db.get_stats()
@@ -201,7 +200,7 @@ class StockBasicDB:
       - 批量写入/更新（upsert_stocks）
       - 查询/搜索（get_stock / get_all_stocks / search_stocks）
       - 远程同步（sync_from_remote）
-      - 详情补充（enrich_stock_info）
+      - 详情补充
 
     连接池复用 db_market.py 的 MarketDBManager，不自建连接。
     所有方法都是线程安全的，可从多个协程/线程并发调用。
@@ -290,7 +289,7 @@ class StockBasicDB:
 
         这样设计的原因：
           sync_from_remote() 只拉代码+名称，详情字段为空/零。
-          如果直接覆盖，会把之前 enrich_stock_info() 补充的详情冲掉。
+          如果直接覆盖，会把已有的详情冲掉。
           用 COALESCE(NULLIF(...)) 实现"有值才覆盖"。
 
         ── 容错策略 ──
@@ -933,7 +932,7 @@ class StockBasicDB:
 
         只同步「代码 + 名称 + 交易所」这三个基础字段。
         行业、市值、市盈率等详情字段不在此同步（太慢），
-        由 enrich_stock_info() 按需单只补充。
+        按需单只补充。
 
         ── 数据源 fallback 链 ──
 
@@ -1237,79 +1236,6 @@ class StockBasicDB:
     # ────────────────────────────────────────────────────────────────────
     # 详情补充（按需单只，非全量同步）
     # ────────────────────────────────────────────────────────────────────
-
-    def enrich_stock_info(self, code: str) -> Optional[Dict[str, Any]]:
-        """
-        补充单只股票的详情字段（行业、市值、市盈率等）。
-
-        ── 设计思路 ──
-
-        sync_from_remote() 只拉代码+名称，详情字段为空/零。
-        需要详情时（比如用户点开某只股票），调用此方法按需补充。
-
-        数据来源：AStockDataSource.get_stock_info()
-          - 内部走 AkShare → 东财 fallback 链
-          - 返回: name, industry, listed_date, total_shares, circ_shares, pe_ratio, pb_ratio
-
-        写入策略：UPDATE + 非空覆盖（与 upsert_stocks 一致）
-          - 行业/上市日期：新值非空时覆盖
-          - 市值/市盈率：新值非零时覆盖
-
-        ── 适用场景 ──
-
-        - 用户查看某只股票详情时触发
-        - 选股结果需要行业/市值信息时批量触发
-        - 定时任务逐只补充（注意限流，避免请求过快）
-
-        ── Args ──
-            code: 6 位数字代码（如 "600519"）
-
-        ── Returns ──
-            更新后的完整记录字典，失败返回 None
-        """
-        # 延迟导入：避免循环依赖（a_stock.py → basicinfo_db.py 的潜在路径）
-        from app.data_sources.a_stock import AStockDataSource
-        ds = AStockDataSource()
-        info = ds.get_stock_info(code)
-        if not info:
-            return None
-
-        self.ensure_table()
-        now = datetime.now()
-
-        pool = self._get_pool()
-        with pool.connection() as conn:
-            cur = conn.cursor()
-            # UPDATE 而非 INSERT：记录必须已存在（sync_from_remote 已写入基础信息）
-            # COALESCE(NULLIF(new, ''), old)：空串不覆盖
-            # CASE WHEN new > 0 THEN new ELSE old END：零值不覆盖
-            cur.execute("""
-                UPDATE stock_basic_info SET
-                    industry   = COALESCE(NULLIF(%s, ''), industry),
-                    concepts   = COALESCE(NULLIF(%s, ''), concepts),
-                    list_date  = COALESCE(NULLIF(%s, ''), list_date),
-                    total_shares = CASE WHEN %s > 0 THEN %s ELSE total_shares END,
-                    circ_shares  = CASE WHEN %s > 0 THEN %s ELSE circ_shares  END,
-                    pe_ratio   = CASE WHEN %s != 0 THEN %s ELSE pe_ratio END,
-                    pb_ratio   = CASE WHEN %s != 0 THEN %s ELSE pb_ratio END,
-                    updated_at = %s
-                WHERE symbol = %s
-            """, (
-                info.get("industry", ""),       # 新行业
-                info.get("concepts", ""),        # 新概念
-                info.get("listed_date", ""),     # 新上市日期
-                float(info.get("total_shares", 0) or 0), float(info.get("total_shares", 0) or 0),
-                float(info.get("circ_shares", 0) or 0),  float(info.get("circ_shares", 0) or 0),
-                float(info.get("pe_ratio", 0) or 0),  float(info.get("pe_ratio", 0) or 0),
-                float(info.get("pb_ratio", 0) or 0),  float(info.get("pb_ratio", 0) or 0),
-                now,                                   # updated_at
-                code,                                  # WHERE 条件
-            ))
-            conn.commit()
-            cur.close()
-
-        # 返回更新后的完整记录
-        return self.get_stock(code)
 
     # ────────────────────────────────────────────────────────────────────
     # 内部工具

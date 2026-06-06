@@ -293,13 +293,11 @@ def get_sector_stocks(board_code: str, limit=15) -> dict:
 
 
 def get_sector_history(board_type="industry", days=30) -> dict:
-    """板块历史排名数据（无缓存，每次直接读 feather）"""
+    """板块历史排名数据"""
     days = min(max(days, 1), 200)
     try:
-        from app.interfaces.cache_file import cache_db
         from .sector_history import get_sector_history as _get_history
-        db = cache_db()
-        rows = _get_history(db, board_type=board_type, days=days)
+        rows = _get_history(board_type=board_type, days=days)
         return {"code": 1, "msg": "success", "count": len(rows), "data": rows}
     except Exception as e:
         logger.error("sector-history 失败: %s", e)
@@ -307,16 +305,9 @@ def get_sector_history(board_type="industry", days=30) -> dict:
 
 
 def get_emotion_history(hours=None, date=None) -> dict:
-    """情绪指数历史数据（无缓存，每次直接读 feather）"""
-    try:
-        from app.interfaces.cache_file import cache_db
-        from app.interfaces.emotion_scheduler import query_emotion_history
-        db = cache_db()
-        history = query_emotion_history(db, date=date, hours=hours)
-        return {"code": 1, "msg": "success", "history": history}
-    except Exception as e:
-        logger.error("查询情绪历史失败: %s", e)
-        return {"code": 0, "msg": str(e), "history": []}
+    """情绪指数历史数据（定时采集已移除，返回空）"""
+    logger.warning("情绪指数定时采集已移除，emotion_history 不再可用")
+    return {"code": 1, "msg": "情绪采集已停用", "history": []}
 
 
 def get_policy() -> dict:
@@ -392,15 +383,13 @@ def _fetch_hot_sectors():
 
 
 def _fetch_sector_trend(board_type="industry"):
-    from app.interfaces.cache_file import cache_db
     from .sector_history import get_sector_trend as _get_trend
-    return _get_trend(cache_db(), board_type=board_type)
+    return _get_trend(board_type=board_type)
 
 
 def _fetch_sector_prediction():
-    from app.interfaces.cache_file import cache_db
     from .sector_history import SectorAnalyzer
-    analyzer = SectorAnalyzer(cache_db())
+    analyzer = SectorAnalyzer()
     industry = analyzer.full_analysis("industry")
     concept = analyzer.full_analysis("concept")
     return {
@@ -414,9 +403,8 @@ def _fetch_sector_prediction():
 
 
 def _fetch_sector_cycle(board_type="industry"):
-    from app.interfaces.cache_file import cache_db
     from .sector_history import SectorAnalyzer
-    analyzer = SectorAnalyzer(cache_db())
+    analyzer = SectorAnalyzer()
     result = analyzer.full_analysis(board_type)
     return {
         "code": 1, "msg": "success",

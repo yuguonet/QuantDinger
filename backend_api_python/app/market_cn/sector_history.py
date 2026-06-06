@@ -2,17 +2,18 @@
 """
 板块历史存储 + 趋势/周期/预测分析
 
-存储: 每日收盘后采集行业板块 & 概念板块排名，存入 feather
+存储: 每日收盘后采集行业板块 & 概念板块排名，存入 JSON
 分析:
   - 1个月排名变化趋势（哪些板块持续走强/走弱）
   - 6个月周期分析（季节性规律、轮动模式）
   - 今日热门预测（基于历史模式匹配）
 
 数据源: 东方财富 API → hot_sectors.py
-存储: cache_db (feather) → cnd_sector_history / cnd_concept_history
 """
 
+import json
 import os
+import shutil
 import logging
 import threading
 from datetime import datetime, timedelta
@@ -34,8 +35,91 @@ COLLECT_MINUTE = int(os.getenv("SECTOR_COLLECT_MINUTE", "30"))
 RETENTION_DAYS = int(os.getenv("SECTOR_RETENTION_DAYS", "200"))
 TOP_N = int(os.getenv("SECTOR_TOP_N", "30"))
 
-SECTOR_TABLE = "cnd_sector_history"
-CONCEPT_TABLE = "cnd_concept_history"
+_DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data", "sector_history")
+_SECTOR_FILE = os.path.join(_DATA_DIR, "sector_history.json")
+_CONCEPT_FILE = os.path.join(_DATA_DIR, "concept_history.json")
+
+
+# ═══════════════════════════════════════════════════
+#  JSON 缓存
+# ═══════════════════════════════════════════════════
+
+def _ensure_dir():
+    os.makedirs(_DATA_DIR, exist_ok=True)
+
+
+def _read_json(path: str) -> List[Dict]:
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("[SectorHistory] 读取 %s 失败: %s", path, e)
+        # 尝试从备份恢复
+        bak = path + ".bak"
+        if os.path.exists(bak):
+            try:
+                with open(bak, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return []
+
+
+def _write_json(path: str, data: List[Dict]):
+    """原子写入: 先写 .tmp 再 rename，写前备份"""
+    _ensure_dir()
+    bak = path + ".bak"
+    tmp = path + ".tmp"
+    try:
+        if os.path.exists(path):
+            shutil.copy2(path, bak)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=None)
+        os.replace(tmp, path)
+    except Exception as e:
+        logger.error("[SectorHistory] 写入 %s 失败: %s", path, e)
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+
+
+def _get_path(table: str) -> str:
+    return _SECTOR_FILE if "sector" in table and "concept" not in table else _CONCEPT_FILE
+
+
+def _load(table: str) -> List[Dict]:
+    return _read_json(_get_path(table))
+
+
+def _save(table: str, rows: List[Dict]):
+    _write_json(_get_path(table), rows)
+
+
+def _append(table: str, new_rows: List[Dict]):
+    """追加数据（按主键去重）"""
+    existing = _load(table)
+    seen = {(r.get("trade_date"), r.get("name"), r.get("board_type")) for r in existing}
+    for r in new_rows:
+        key = (r.get("trade_date"), r.get("name"), r.get("board_type"))
+        if key not in seen:
+            existing.append(r)
+            seen.add(key)
+    _save(table, existing)
+
+
+def _query_date_range(table: str, start: str, end: str, reverse: bool = False) -> List[Dict]:
+    """按日期范围查询"""
+    rows = _load(table)
+    result = [r for r in rows if start <= r.get("trade_date", "") <= end]
+    result.sort(key=lambda r: r.get("trade_date", ""), reverse=reverse)
+    return result
+
+
+def _has_date(table: str, date: str) -> bool:
+    """检查某天是否已有数据"""
+    return any(r.get("trade_date") == date for r in _load(table))
 
 
 # ═══════════════════════════════════════════════════
@@ -45,8 +129,7 @@ CONCEPT_TABLE = "cnd_concept_history"
 class SectorHistoryScheduler:
     """每日收盘后采集板块排名数据"""
 
-    def __init__(self, db):
-        self.db = db
+    def __init__(self):
         self._timer = None
         self._running = False
 
@@ -74,7 +157,7 @@ class SectorHistoryScheduler:
         target = now.replace(hour=COLLECT_HOUR, minute=COLLECT_MINUTE, second=0, microsecond=0)
         if target <= now:
             target += timedelta(days=1)
-        delay = max(60, (target - now).total_seconds())  # 最少 60s，防止 0 延迟
+        delay = max(60, (target - now).total_seconds())
         self._timer = threading.Timer(delay, self._tick)
         self._timer.daemon = True
         self._timer.start()
@@ -99,9 +182,7 @@ class SectorHistoryScheduler:
         today = datetime.now().strftime("%Y-%m-%d")
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # 检查今天是否已采集
-        existing = self.db.query_dates_exist(SECTOR_TABLE, "trade_date", today, today)
-        if existing:
+        if _has_date(_SECTOR_FILE, today) and _has_date(_CONCEPT_FILE, today):
             logger.info("[SectorHistory] %s 已采集，跳过", today)
             return
 
@@ -109,7 +190,7 @@ class SectorHistoryScheduler:
 
         collected_any = False
 
-        def _collect_one(board_type, table):
+        def _collect_one(board_type, filepath):
             """采集单个板块类型"""
             raw = _fetch_board_list(board_type, sort_by="f3", sort_dir="desc", limit=TOP_N)
             if not raw:
@@ -138,15 +219,15 @@ class SectorHistoryScheduler:
                 })
 
             if rows:
-                self.db.insert_batch(table, rows)
+                _append(filepath, rows)
                 logger.info("[SectorHistory] %s: %d 条", board_type, len(rows))
                 return True
             return False
 
         # 并行采集行业+概念
         with ThreadPoolExecutor(max_workers=2) as pool:
-            f_industry = pool.submit(_collect_one, "industry", SECTOR_TABLE)
-            f_concept = pool.submit(_collect_one, "concept", CONCEPT_TABLE)
+            f_industry = pool.submit(_collect_one, "industry", _SECTOR_FILE)
+            f_concept = pool.submit(_collect_one, "concept", _CONCEPT_FILE)
 
             try:
                 if f_industry.result(timeout=30):
@@ -160,25 +241,25 @@ class SectorHistoryScheduler:
             except Exception as e:
                 logger.error("[SectorHistory] 概念板块采集失败: %s", e)
 
-        # 只有采集到数据才裁剪
         if collected_any:
             cutoff = (datetime.now() - timedelta(days=RETENTION_DAYS)).strftime("%Y-%m-%d")
-            self._prune(SECTOR_TABLE, cutoff)
-            self._prune(CONCEPT_TABLE, cutoff)
+            _prune(_SECTOR_FILE, cutoff)
+            _prune(_CONCEPT_FILE, cutoff)
 
-    def _prune(self, table: str, cutoff: str):
-        """裁剪过期数据（使用 cache_db 公开 API）"""
-        try:
-            all_rows = self.db.query(table)
-            if not all_rows:
-                return
-            keep = [r for r in all_rows if r.get("trade_date", "") >= cutoff]
-            removed = len(all_rows) - len(keep)
-            if removed > 0:
-                self.db.replace_rows(table, keep)
-                logger.info("[SectorHistory] 裁剪 %s: 删除 %d 条过期数据", table, removed)
-        except Exception as e:
-            logger.error("[SectorHistory] 裁剪 %s 失败: %s", table, e)
+
+def _prune(filepath: str, cutoff: str):
+    """裁剪过期数据"""
+    try:
+        all_rows = _read_json(filepath)
+        if not all_rows:
+            return
+        keep = [r for r in all_rows if r.get("trade_date", "") >= cutoff]
+        removed = len(all_rows) - len(keep)
+        if removed > 0:
+            _write_json(filepath, keep)
+            logger.info("[SectorHistory] 裁剪 %s: 删除 %d 条过期数据", os.path.basename(filepath), removed)
+    except Exception as e:
+        logger.error("[SectorHistory] 裁剪 %s 失败: %s", filepath, e)
 
 
 # ═══════════════════════════════════════════════════
@@ -209,22 +290,16 @@ class SectorAnalyzer:
       3. 今日预测 — 基于历史模式匹配
     """
 
-    def __init__(self, db):
-        self.db = db
-
     def full_analysis(self, board_type="industry") -> Dict[str, Any]:
         """完整分析报告"""
-        table = SECTOR_TABLE if board_type == "industry" else CONCEPT_TABLE
+        filepath = _SECTOR_FILE if board_type == "industry" else _CONCEPT_FILE
         board_label = "行业板块" if board_type == "industry" else "概念板块"
 
         today = datetime.now().strftime("%Y-%m-%d")
         six_months_ago = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
         one_month_ago = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
 
-        # 加载历史数据
-        all_data = self.db.query_between_dates(
-            table, "trade_date", six_months_ago, today, order_by="trade_date"
-        )
+        all_data = _query_date_range(filepath, six_months_ago, today)
 
         if not all_data:
             return {
@@ -241,7 +316,6 @@ class SectorAnalyzer:
         df["rank"] = pd.to_numeric(df["rank"], errors="coerce").fillna(999)
         df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
 
-        # 过滤无效 name
         df = df[df["name"].apply(_is_valid_name)].copy()
 
         dates = sorted(df["trade_date"].unique())
@@ -285,7 +359,6 @@ class SectorAnalyzer:
             pct_values = name_df["change_pct"].values.astype(float)
             amounts = name_df["amount"].values.astype(float)
 
-            # 跳过全 NaN
             if np.all(np.isnan(ranks)):
                 continue
 
@@ -311,7 +384,6 @@ class SectorAnalyzer:
                 recent_amt = early_amt = valid_amt[0] if len(valid_amt) > 0 else 0
             amt_change = (recent_amt / early_amt - 1) * 100 if early_amt > 0 else 0
 
-            # 综合评分
             score = 50.0
             score += np.clip(rank_change * 2, -20, 20)
             score += np.clip(avg_pct * 3, -15, 15)
@@ -319,7 +391,6 @@ class SectorAnalyzer:
             score += np.clip(amt_change / 10, -5, 5)
             score = float(np.clip(score, 0, 100))
 
-            # 趋势方向
             if rank_change > 5 and avg_pct > 0.5:
                 direction = "🔥 持续走强"
             elif rank_change > 2 and avg_pct > 0:
@@ -385,7 +456,6 @@ class SectorAnalyzer:
                     "total_amount": round(float(mg["amount"].sum()) / 1e8, 2),
                 }
 
-            # 放宽到 1 个月也保留（数据初期）
             if not month_stats:
                 continue
 
@@ -405,7 +475,6 @@ class SectorAnalyzer:
 
         patterns.sort(key=lambda x: x["total_appearances"], reverse=True)
 
-        # 季节性规律
         current_month = datetime.now().strftime("%Y-%m")
         seasonal_candidates = []
         for p in patterns:
@@ -438,7 +507,6 @@ class SectorAnalyzer:
         candidates = {}
 
         def _add_candidate(name, source_score, source_key, reason, weight):
-            """安全添加候选板块，处理 NaN/重复"""
             if not _is_valid_name(name):
                 return
             key = str(name)
@@ -454,13 +522,11 @@ class SectorAnalyzer:
                     "reasons": [reason],
                     "composite_score": source_score * weight,
                 }
-            # 更新来源评分
             if source_key == "trend_score":
                 candidates[key]["trend_score"] = max(candidates[key]["trend_score"], source_score)
             elif source_key == "cycle_score":
                 candidates[key]["cycle_score"] = max(candidates[key]["cycle_score"], source_score)
 
-        # 来源1: 趋势强势板块（权重 40%）
         for item in trend.get("items", [])[:10]:
             score = item.get("score", 0) or 0
             if score > 55:
@@ -468,11 +534,9 @@ class SectorAnalyzer:
                     item.get("name"), score, "trend_score",
                     f"近1月趋势: {item.get('direction', '')} (评分{score})", 0.4
                 )
-                # 保留方向
                 if item.get("name") and _is_valid_name(item["name"]):
                     candidates[str(item["name"])]["trend_direction"] = item.get("direction", "")
 
-        # 来源2: 季节性板块（权重 35%）
         for item in cycle.get("seasonal_candidates", [])[:10]:
             avg_pct = item.get("historical_avg_pct", 0) or 0
             appearances = item.get("historical_appearances", 0) or 0
@@ -482,7 +546,6 @@ class SectorAnalyzer:
                 f"历史同期: 出现{appearances}次，平均涨{avg_pct:.2f}%", 0.35
             )
 
-        # 来源3: 最新排名 Top（权重 25%）
         if dates:
             latest_date = dates[-1]
             latest_df = df[df["trade_date"] == latest_date]
@@ -499,12 +562,10 @@ class SectorAnalyzer:
                     f"最新排名: 第{rank_int}位", 0.25
                 )
 
-        # 归一化: composite_score 最高 100
         ranked = sorted(candidates.values(), key=lambda x: x["composite_score"], reverse=True)
         max_score = max((c["composite_score"] for c in ranked), default=1) or 1
         for i, c in enumerate(ranked, 1):
             c["rank"] = i
-            # 归一化到 0-100
             c["composite_score"] = round(min(100, (c["composite_score"] / max_score) * 100), 1)
 
         top3 = [c["name"] for c in ranked[:3]]
@@ -521,15 +582,14 @@ class SectorAnalyzer:
 #  便捷函数
 # ═══════════════════════════════════════════════════
 
-def get_sector_trend(db, board_type="industry") -> Dict:
+def get_sector_trend(board_type="industry") -> Dict:
     """获取板块趋势分析"""
-    analyzer = SectorAnalyzer(db)
-    return analyzer.full_analysis(board_type)
+    return SectorAnalyzer().full_analysis(board_type)
 
 
-def get_sector_history(db, board_type="industry", days=30) -> List[Dict]:
+def get_sector_history(board_type="industry", days=30) -> List[Dict]:
     """获取板块历史排名（供前端图表使用）"""
-    table = SECTOR_TABLE if board_type == "industry" else CONCEPT_TABLE
+    filepath = _SECTOR_FILE if board_type == "industry" else _CONCEPT_FILE
     since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     today = datetime.now().strftime("%Y-%m-%d")
-    return db.query_between_dates(table, "trade_date", since, today, order_by="-trade_date")
+    return _query_date_range(filepath, since, today, reverse=True)

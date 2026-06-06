@@ -152,40 +152,6 @@ def start_usdt_order_worker():
         logger.error(f"Failed to start USDT order worker: {e}")
 
 
-def start_emotion_scheduler():
-    """启动情绪采集调度器（仅在 EMOTION_COLLECTOR_ENABLED=true 时）
-
-    交易日判断使用 app.interfaces.trading_calendar 模块，
-    调度器内部 _tick() 每次执行前也会校验是否为交易日+交易时段。
-    """
-    import os
-    if os.getenv("EMOTION_COLLECTOR_ENABLED", "false").lower() != "true":
-        logger.info("Emotion scheduler is disabled. Set EMOTION_COLLECTOR_ENABLED=true to enable.")
-        return
-
-    # Avoid running twice with Flask reloader
-    debug = os.getenv("PYTHON_API_DEBUG", "false").lower() == "true"
-    if debug and os.environ.get("WERKZEUG_RUN_MAIN") != "true":
-        return
-
-    try:
-        from app.interfaces.cache_file import cache_db
-        from app.interfaces.emotion_scheduler import EmotionScheduler
-        from app.utils.trading_calendar import is_trading_day_today
-
-        if is_trading_day_today():
-            logger.info("[EmotionScheduler] 今日为交易日，启动采集调度器")
-        else:
-            logger.info("[EmotionScheduler] 今日非交易日，调度器启动后将自动跳过采集")
-
-        # AShareDataHub 已移除，hub 传 None（情绪采集将使用默认值）
-        db = cache_db()
-        scheduler = EmotionScheduler(None, db)
-        scheduler.start()
-    except Exception as e:
-        logger.error(f"Failed to start emotion scheduler: {e}")
-
-
 def start_sector_history_scheduler():
     """启动板块历史采集调度器（仅在 SECTOR_HISTORY_ENABLED=true 时）
 
@@ -202,11 +168,9 @@ def start_sector_history_scheduler():
         return
 
     try:
-        from app.interfaces.cache_file import cache_db
         from app.market_cn.sector_history import SectorHistoryScheduler
 
-        db = cache_db()
-        scheduler = SectorHistoryScheduler(db)
+        scheduler = SectorHistoryScheduler()
         scheduler.start()
     except Exception as e:
         logger.error(f"Failed to start sector history scheduler: {e}")
@@ -400,7 +364,6 @@ def create_app(config_name='default'):
         start_portfolio_monitor()
         start_usdt_order_worker()
 #        start_polymarket_worker()
-        start_emotion_scheduler()
         # Offline calibration to make AI thresholds self-tuning.
         restore_running_strategies()
 

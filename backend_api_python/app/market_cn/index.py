@@ -3,7 +3,6 @@ import logging
 from typing import List, Dict, Any, Optional
 
 from app.data_sources.base import BaseDataSource
-from .cache_file import cache_db
 
 logger = logging.getLogger(__name__)
 
@@ -25,17 +24,13 @@ class IndexInterface:
 
     获取上证指数(000001)、深证成指(399001)、创业板指(399006)、
     北证50(899050)、科创50(000688) 的实时行情。
-    缓存由 AStockDataSource._info_cache (TTL=120s) 负责。
     """
 
-    def __init__(self, sources: List[BaseDataSource], db: cache_db):
+    def __init__(self, sources: List[BaseDataSource]):
         self.sources = sources
-        self.db = db
 
     def get_realtime(self, codes: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """获取指数实时行情
-
-        缓存由数据源层 (AStockDataSource._info_cache) 负责。
 
         Args:
             codes: 指数代码列表，默认使用配置中的列表
