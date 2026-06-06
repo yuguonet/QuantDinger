@@ -239,7 +239,16 @@ SOURCE_CONFIGS: Dict[str, SourceConfig] = {
         batch_size=500,
     ),
 
-
+    # 通达信 pytdx 二进制协议 — 最快的免费A股实时源
+    # 自动探测 ExHQ(7727) + HQ(7709) 双协议服务器
+    # 行情延迟 ~100ms，无需开户/入金，全平台支持
+    "tdx_ex": SourceConfig(
+        name="tdx_ex",
+        max_workers=8,  # = provider/tdx_ex.py MAX_CONCURRENCY
+        markets={"CNStock"},
+        batch_capable=True,
+        batch_size=80,  # pytdx 单次请求硬限 80 只
+    ),
 
 
 

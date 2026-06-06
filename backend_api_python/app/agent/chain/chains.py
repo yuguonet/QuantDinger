@@ -75,7 +75,7 @@ def list_chains() -> List[ChainDef]:
 register_chain(ChainDef(
     chain_id="evaluate+stock",
     name="股票综合评估",
-    description="政策面→游资追踪→解禁监控→概念追踪→动量分析→情报→技术面→选股→资金流向→回测→多空辩论→综合判断",
+    description="政策面→游资追踪→解禁监控→概念追踪→动量分析→情报→技术面→指标信号→选股→资金流向→回测→多空辩论→综合判断",
     trigger_verbs=["analyze", "evaluate"],
     trigger_nouns=["stock"],
     steps=[
@@ -131,23 +131,30 @@ register_chain(ChainDef(
             required=True,
         ),
         ChainStep(
+            name="indicator",
+            agent="indicator_agent",
+            order=8,
+            description="用户指标信号验证：执行指标 IDE 中的自定义策略，获取 buy/sell 信号",
+            required=False,
+        ),
+        ChainStep(
             name="screening",
             agent="screening_agent",
-            order=8,
+            order=9,
             description="选股验证：条件筛选、指标信号验证",
             required=False,
         ),
         ChainStep(
             name="fund_flow",
             agent="market_data_agent",
-            order=9,
+            order=10,
             description="资金流向分析：板块资金、概念资金、主力态度",
             required=False,
         ),
         ChainStep(
             name="backtest",
             agent="backtest_agent",
-            order=10,
+            order=11,
             description="策略回测验证：历史绩效、胜率、盈亏比、最大回撤",
             required=False,
         ),
@@ -155,7 +162,7 @@ register_chain(ChainDef(
         ChainStep(
             name="bull_bear_debate",
             agent="bull_researcher",
-            order=11,
+            order=12,
             description="多空辩论：多头研究员基于所有报告构建看涨论据",
             required=False,
             extract_fn="extract_bull_args",
@@ -163,7 +170,7 @@ register_chain(ChainDef(
         ChainStep(
             name="bear_rebuttal",
             agent="bear_researcher",
-            order=12,
+            order=13,
             description="多空辩论：空头研究员反驳多头论据并构建看跌论据",
             required=False,
             extract_fn="extract_bear_args",
