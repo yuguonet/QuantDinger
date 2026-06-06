@@ -47,10 +47,7 @@
             <div class="macro-name">{{ item.name }}</div>
             <div class="macro-detail">
               <span class="macro-value-text">{{ item.value }}{{ item.unit }}</span>
-              <span v-if="item.change !== null" class="macro-change" :class="item.changeClass">
-                {{ item.changePrefix }}{{ item.changeText }}
-              </span>
-              <span v-else-if="item.period" class="macro-period">{{ item.period }}</span>
+              <span v-if="item.sub" class="macro-period">{{ item.sub }}</span>
             </div>
           </div>
           <div class="macro-score-col">
@@ -91,43 +88,33 @@
           <button class="modal-close" @click="showDetail = false">&times;</button>
         </header>
         <div class="modal-body">
-          <!-- 宏观数据完整展示 -->
-          <div v-if="activeTab === 'macroData'" class="tab-content">
-            <div v-if="loading && !hasMacroData" class="loading-state">加载中...</div>
-            <div v-else class="macro-detail-wrap">
-              <div
-                v-for="ind in macroIndicators"
-                :key="ind.key"
-                class="macro-detail-section"
-              >
+          <!-- 情绪数据完整展示 -->
+          <div v-if="activeTab === 'emotionData'" class="tab-content">
+            <div v-if="loading && !hasEmotionData" class="loading-state">加载中...</div>
+            <div v-else-if="hasEmotionData" class="macro-detail-wrap">
+              <div class="macro-detail-section">
                 <div class="macro-detail-header">
-                  <span class="macro-detail-icon">{{ ind.icon }}</span>
-                  <span class="macro-detail-name">{{ ind.name }}</span>
-                  <span v-if="getMacroLatestValue(ind) !== null" class="macro-detail-latest">
-                    {{ formatMacroValue(getMacroLatestValue(ind), ind) }}{{ ind.unit }}
-                  </span>
-                  <span v-else class="macro-detail-latest macro-detail-na">--</span>
+                  <span class="macro-detail-icon">📊</span>
+                  <span class="macro-detail-name">市场情绪周期</span>
+                  <span v-if="emotionTimestamp" class="macro-detail-latest">{{ emotionTimestamp }}</span>
                 </div>
-                <div v-if="getMacroRecords(ind).length > 0" class="macro-detail-table-wrap">
+                <div class="macro-detail-table-wrap">
                   <table class="data-table">
                     <thead>
-                      <tr>
-                        <th v-for="col in getMacroColumns(ind)" :key="col">{{ col }}</th>
-                      </tr>
+                      <tr><th>指标</th><th>数值</th><th>评分</th></tr>
                     </thead>
                     <tbody>
-                      <tr v-for="(row, ri) in getMacroRecords(ind)" :key="ri">
-                        <td v-for="col in getMacroColumns(ind)" :key="col"
-                            :class="isNumericCol(col, row) ? getNumericClass(row[col]) : ''">
-                          {{ formatTableCell(row[col], col) }}
-                        </td>
+                      <tr v-for="item in emotionDetailItems" :key="item.key">
+                        <td>{{ item.name }}</td>
+                        <td>{{ item.value }}</td>
+                        <td :class="getSentimentClass(item.score)">{{ item.score }}</td>
                       </tr>
                     </tbody>
                   </table>
                 </div>
-                <div v-else class="macro-detail-empty">暂无数据</div>
               </div>
             </div>
+            <div v-else class="empty-state">暂无情绪数据</div>
           </div>
 
           <!-- 贪婪恐惧指数 -->
@@ -276,78 +263,30 @@
 <script>
 import request from '@/utils/request'
 
-/**
- * 每个指标的配置：尝试多种列名，兼容 Tushare / AKShare / 国家统计局
- */
-const INDICATORS = [
-  {
-    key: 'gdp', name: 'GDP 同比', icon: '🏛️', unit: '%',
-    valueCols: ['gdp_yoy', 'GDP同比增长(%)', '同比', 'yoy', 'gdp_yoy_yoy', 'value', 'GDP增速'],
-    periodCols: ['quarter', '季度', 'period', 'date'],
-    trend: 'higher_better'
-  },
-  {
-    key: 'cpi', name: 'CPI 同比', icon: '🛒', unit: '%',
-    valueCols: ['cpi_yoy', '全国', '同比', 'yoy', 'cpi', 'value', '全国-同比'],
-    periodCols: ['month', '月份', 'period', 'date'],
-    trend: 'lower_better_2_3'
-  },
-  {
-    key: 'ppi', name: 'PPI 同比', icon: '🏭', unit: '%',
-    valueCols: ['ppi_yoy', '当月同比', '当月', '同比', 'yoy', 'ppi', 'value'],
-    periodCols: ['month', '月份', 'period', 'date'],
-    trend: 'higher_better'
-  },
-  {
-    key: 'pmi', name: '制造业PMI', icon: '⚙️', unit: '',
-    valueCols: ['pmi', '制造业-指数', '制造业', '指数', 'value', '制造业PMI'],
-    periodCols: ['month', '月份', 'period', 'date'],
-    trend: 'higher_better_50'
-  },
-  {
-    key: 'm2', name: 'M2 同比', icon: '💰', unit: '%',
-    valueCols: ['m2_yoy', '货币和准货币(M2)-同比增长(%)', 'm2', 'yoy', 'value', '同比增长(%)'],
-    periodCols: ['month', '月份', 'period', 'date'],
-    trend: 'neutral'
-  },
-  {
-    key: 'lpr', name: 'LPR 1Y', icon: '🏦', unit: '%',
-    valueCols: ['lpr_1y', '1Y', '1年', 'lpr1y', 'lpr', 'value'],
-    periodCols: ['date', '日期', 'month', 'period'],
-    trend: 'lower_better'
-  },
-  {
-    key: 'social_financing', name: '社融增量', icon: '📈', unit: '万亿',
-    valueCols: ['increment', '社会融资规模增量(亿元)', '社会融资规模增量', 'value', 'shrzgm', 'total', '当月值(亿元)'],
-    periodCols: ['month', '月份', 'period', 'date'],
-    trend: 'higher_better', divisor: 10000
-  },
-  {
-    key: 'trade', name: '贸易差额', icon: '🚢', unit: '亿美元',
-    valueCols: ['balance', '差额(亿元)', '贸易差额', '贸易差额(亿元)', 'value', '当月差额'],
-    periodCols: ['month', '月份', 'period', 'date'],
-    trend: 'higher_better'
-  }
-]
-
 export default {
   name: 'MacroCard',
   data () {
     return {
       loading: false,
       lastUpdate: null,
-      macroData: {},
       isDestroyed: false,
 
       // 详情弹窗
       showDetail: false,
-      activeTab: 'macroData',
+      activeTab: 'emotionData',
       tabs: [
-        { key: 'macroData', label: '宏观数据' },
+        { key: 'emotionData', label: '情绪数据' },
         { key: 'fearGreed', label: '贪婪恐惧' },
         { key: 'policy', label: '政策解读' },
         { key: 'sectorHistory', label: '板块历史' }
       ],
+
+      // 情绪数据
+      emotionData: {},
+      emotionDisplayItems: [],
+      emotionDetailItems: [],
+      emotionOverallScore: 50,
+      emotionTimestamp: '',
 
       // 贪婪恐惧
       fgLoading: false,
@@ -371,14 +310,11 @@ export default {
     }
   },
   computed: {
-    macroIndicators () {
-      return INDICATORS
-    },
-    hasMacroData () {
-      return this.macroData && Object.keys(this.macroData).length > 0
+    hasEmotionData () {
+      return this.emotionData && Object.keys(this.emotionData).length > 0
     },
     displayItems () {
-      // 第一个固定为 A股贪恐指数，后两个为宏观指标 Top2
+      // 第一个固定为 A股贪恐指数，后两个为情绪指标 Top2
       const items = []
 
       // 贪恐指数
@@ -390,67 +326,26 @@ export default {
           icon: score > 60 ? '🔥' : score < 40 ? '😱' : '😐',
           value: String(score),
           unit: '',
-          change: null,
-          changeText: '',
-          changePrefix: '',
-          changeClass: '',
+          sub: this.fgCached.label || '',
           trendClass: score >= 60 ? 'trend-up' : score <= 40 ? 'trend-down' : 'trend-neutral',
           trendText: this.fgCached.label || '',
-          period: '',
           score: score
         })
       }
 
-      // 宏观指标 Top2
-      const macroTop = [...this.macroItems]
-        .sort((a, b) => b.score - a.score)
-        .slice(0, 3 - items.length)
-
-      return [...items, ...macroTop]
-    },
-    macroItems () {
-      const items = []
-      for (const ind of INDICATORS) {
-        const data = this.macroData[ind.key]
-        if (!data || !data.latest || data.latest.length === 0) continue
-
-        const latest = data.latest[data.latest.length - 1]
-        const value = this.pickValue(latest, ind.valueCols)
-        if (value === null) continue
-
-        let change = null
-        let changeText = ''
-        let changePrefix = ''
-        let changeClass = ''
-        if (data.latest.length >= 2) {
-          const prev = data.latest[data.latest.length - 2]
-          const prevVal = this.pickValue(prev, ind.valueCols)
-          if (prevVal !== null) {
-            change = value - prevVal
-            changeText = Math.abs(change).toFixed(2)
-            changePrefix = change >= 0 ? '+' : '-'
-            changeClass = change >= 0 ? 'change-up' : 'change-down'
-          }
-        }
-
-        const period = this.pickPeriod(latest, ind.periodCols)
-        const { trendClass, trendText } = this.getTrend(ind.trend, value, change)
-        const displayValue = ind.divisor ? (value / ind.divisor).toFixed(2) : this.formatDisplay(value, ind.key)
-        const score = this.calcIndicatorScore(ind.trend, value, change)
-
-        items.push({
-          key: ind.key, name: ind.name, icon: ind.icon,
-          value: displayValue, unit: ind.unit,
-          change, changeText, changePrefix, changeClass,
-          trendClass, trendText, period, score
-        })
-      }
-      return items
+      // 情绪指标 Top2
+      const top = this.emotionDisplayItems.slice(0, 3 - items.length)
+      return [...items, ...top]
     },
     overallScore () {
-      if (this.macroItems.length === 0) return 50
-      const total = this.macroItems.reduce((sum, i) => sum + i.score, 0)
-      return Math.round(total / this.macroItems.length)
+      if (this.emotionDisplayItems.length === 0 && (!this.fgCached || this.fgCached.composite_score === undefined)) return 50
+      let total = this.emotionOverallScore * Math.max(1, this.emotionDisplayItems.length)
+      let count = Math.max(1, this.emotionDisplayItems.length)
+      if (this.fgCached && this.fgCached.composite_score !== undefined) {
+        total += this.fgCached.composite_score
+        count += 1
+      }
+      return Math.round(total / count)
     },
     policyItems () {
       const d = this.policyData
@@ -490,13 +385,28 @@ export default {
         const body = res?.data || res
         if (this.isDestroyed) return
         if (body?.code === 1 && body.data) {
-          this.macroData = body.data
+          // 优先取 emotion 子对象，没有则从 data 中排除元数据字段后使用
+          const emotion = body.data.emotion
+          if (emotion && typeof emotion === 'object' && Object.keys(emotion).length > 0) {
+            this.emotionData = emotion
+          } else {
+            // 从 body.data 中去掉非情绪数据的字段
+            // eslint-disable-next-line camelcase
+            const { emotion: _, history_days: __, timestamp: ___, ...rest } = body.data
+            this.emotionData = rest
+          }
+          this.emotionTimestamp = body.data.timestamp || ''
+          this._processEmotion()
         } else if (body && typeof body === 'object') {
-          this.macroData = body
+          // 过滤掉非数据字段
+          // eslint-disable-next-line camelcase
+          const { code, msg, history_days, timestamp, ...rest } = body
+          this.emotionData = rest
+          this._processEmotion()
         }
         this.lastUpdate = new Date().toLocaleTimeString()
       } catch (e) {
-        console.error('[宏观数据] 获取失败:', e)
+        console.error('[情绪数据] 获取失败:', e)
       }
     },
 
@@ -521,7 +431,6 @@ export default {
       if (key === 'fearGreed' && this.fgData.composite_score === undefined) this.fetchFearGreed()
       if (key === 'policy' && !this.policyData.data) this.fetchPolicy()
       if (key === 'sectorHistory' && this.shData.length === 0) this.fetchSectorHistory()
-      // macroData tab uses already-loaded data, no extra fetch needed
     },
 
     async fetchFearGreedCard () {
@@ -584,87 +493,120 @@ export default {
       }
     },
 
-    // ====== 工具方法 ======
+    // ====== 情绪数据处理 ======
 
-    pickValue (record, candidates) {
-      for (const col of candidates) {
-        if (record[col] !== undefined && record[col] !== null && record[col] !== '') {
-          const v = parseFloat(record[col])
-          if (!isNaN(v)) return v
+    _processEmotion () {
+      const data = this.emotionData
+      if (!data || typeof data !== 'object') {
+        this.emotionDisplayItems = []
+        this.emotionDetailItems = []
+        this.emotionOverallScore = 50
+        return
+      }
+
+      const skip = new Set(['date', '日期', 'time', '时间', 'period', '周期', 'name', '名称', 'count', '数量', 'timestamp', 'code', '代码', 'history_days', 'emotion', 'msg'])
+      const icons = ['📈', '📊', '📉', '💹', '🔢', '📋', '🎯', '⚡']
+
+      // StockApi emotionalCycle 字段名 → 中文映射
+      const NAME_MAP = {
+        'szbl': '上涨比例', 'lbjs': '连板家数', 'ylgd': '月度高点',
+        'zxgd': '周新高点', 'dmqx': '大面情绪', 'drqx': '大肉情绪',
+        'ztjs': '涨停家数', 'dbcgl': '打板成功率', 'dtjs': '跌停家数',
+        'ygmc': '预告名称', 'zbjs': '炸板家数', 'date1': '日期',
+      }
+
+      // 提取所有数值字段
+      const fields = []
+      for (const [key, val] of Object.entries(data)) {
+        if (key.startsWith('__')) continue
+        if (skip.has(key.toLowerCase())) continue
+        if (key === 'ygmc') continue  // 预告名称是文本，跳过
+        const num = parseFloat(val)
+        if (isNaN(num) || String(val).length > 20) continue
+        fields.push({ key, value: num })
+      }
+
+      // 计算每个字段的评分和展示
+      const items = fields.map((f, i) => {
+        const score = this._calcEmotionScore(f.key, f.value)
+        const { trendClass, trendText } = this._getEmotionTrend(score)
+        const display = this._formatEmotionValue(f.key, f.value)
+        const name = NAME_MAP[f.key] || f.key
+
+        return {
+          key: f.key,
+          name,
+          icon: icons[i % icons.length],
+          value: display,
+          unit: '',
+          sub: '',
+          score,
+          trendClass,
+          trendText
         }
+      })
+
+      // 按评分排序
+      items.sort((a, b) => b.score - a.score)
+
+      this.emotionDetailItems = items
+      this.emotionDisplayItems = items
+
+      // 整体评分
+      if (items.length > 0) {
+        this.emotionOverallScore = Math.round(items.reduce((s, i) => s + i.score, 0) / items.length)
       }
-      const keywords = candidates.map(c => c.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]/g, ''))
-      for (const [key, val] of Object.entries(record)) {
-        if (key === 'name' || key === 'columns' || key === 'count') continue
-        const clean = String(key).toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]/g, '')
-        for (const kw of keywords) {
-          if (kw && clean.includes(kw)) {
-            const v = parseFloat(val)
-            if (!isNaN(v)) return v
-          }
-        }
-      }
-      for (const [, val] of Object.entries(record)) {
-        const v = parseFloat(val)
-        if (!isNaN(v) && String(val).length < 20) return v
-      }
-      return null
     },
 
-    pickPeriod (record, candidates) {
-      for (const col of candidates) {
-        if (record[col] !== undefined && record[col] !== null && record[col] !== '') {
-          return String(record[col])
-        }
+    _calcEmotionScore (key, value) {
+      const lk = key.toLowerCase()
+      // 百分比类指标（上涨占比等）
+      if (/比例|占比|rate|ratio|pct|percent/i.test(lk) && value >= 0 && value <= 100) {
+        return Math.round(value)
       }
-      return ''
+      // 涨停/跌停比
+      if (/涨停|跌停|limit/i.test(lk)) {
+        if (value >= 0 && value <= 100) return Math.round(value)
+        return Math.round(Math.max(10, Math.min(90, 50 + value * 5)))
+      }
+      // 涨跌差值
+      if (/差|diff|net|spread/i.test(lk)) {
+        return Math.round(Math.max(10, Math.min(90, 50 + value * 0.5)))
+      }
+      // 比率类（量比等，通常1附近为中性）
+      if (/比|ratio/i.test(lk) && Math.abs(value) < 100) {
+        return Math.round(Math.max(10, Math.min(90, 50 + (value - 1) * 40)))
+      }
+      // 0-100 范围直接用
+      if (value >= 0 && value <= 100) return Math.round(value)
+      // 大数值：按百分位估算
+      if (value > 100) return Math.round(Math.max(30, Math.min(80, 40 + Math.log10(value) * 15)))
+      // 负值
+      return Math.round(Math.max(10, Math.min(50, 50 + value)))
     },
 
-    formatDisplay (value, key) {
-      if (key === 'trade') return value.toFixed(0)
+    _getEmotionTrend (score) {
+      if (score >= 70) return { trendClass: 'trend-up', trendText: '偏强' }
+      if (score >= 40) return { trendClass: 'trend-neutral', trendText: '中性' }
+      return { trendClass: 'trend-down', trendText: '偏弱' }
+    },
+
+    _formatEmotionValue (key, value) {
+      if (Math.abs(value) >= 1e8) return (value / 1e8).toFixed(2) + '亿'
+      if (Math.abs(value) >= 1e4) return (value / 1e4).toFixed(2) + '万'
+      if (Number.isInteger(value)) return String(value)
       return value.toFixed(2)
     },
 
-    getTrend (logic, value, change) {
-      switch (logic) {
-        case 'higher_better':
-          if (change !== null && change > 0) return { trendClass: 'trend-up', trendText: '↑' }
-          if (change !== null && change < 0) return { trendClass: 'trend-down', trendText: '↓' }
-          return { trendClass: 'trend-neutral', trendText: '→' }
-        case 'lower_better':
-          if (change !== null && change < 0) return { trendClass: 'trend-up', trendText: '↑' }
-          if (change !== null && change > 0) return { trendClass: 'trend-down', trendText: '↓' }
-          return { trendClass: 'trend-neutral', trendText: '→' }
-        case 'higher_better_50':
-          if (value >= 50) return { trendClass: 'trend-up', trendText: '扩张' }
-          return { trendClass: 'trend-down', trendText: '收缩' }
-        case 'lower_better_2_3':
-          if (value >= 2 && value <= 3) return { trendClass: 'trend-neutral', trendText: '温和' }
-          if (value < 2) return { trendClass: 'trend-down', trendText: '偏低' }
-          return { trendClass: 'trend-up', trendText: '偏高' }
-        default:
-          return { trendClass: 'trend-neutral', trendText: '' }
-      }
+    getOverallDesc (score) {
+      if (score >= 70) return '市场情绪整体偏强，多头氛围较好'
+      if (score >= 55) return '市场情绪中性偏强，关注量能变化'
+      if (score >= 45) return '市场情绪中性，方向不明'
+      if (score >= 30) return '市场情绪偏弱，注意风险控制'
+      return '市场情绪低迷，建议观望'
     },
 
-    calcIndicatorScore (logic, value, change) {
-      switch (logic) {
-        case 'higher_better':
-          if (change !== null) return Math.round(Math.max(10, Math.min(90, 50 + change * 20)))
-          return Math.round(Math.max(10, Math.min(90, value > 0 ? 60 : 40)))
-        case 'lower_better':
-          if (change !== null) return Math.round(Math.max(10, Math.min(90, 50 - change * 20)))
-          return 50
-        case 'higher_better_50':
-          return Math.round(Math.max(10, Math.min(90, 50 + (value - 50) * 2)))
-        case 'lower_better_2_3':
-          if (value >= 2 && value <= 3) return 70
-          if (value < 2) return Math.round(Math.max(20, 60 - (2 - value) * 20))
-          return Math.round(Math.max(20, 60 - (value - 3) * 20))
-        default:
-          return 50
-      }
-    },
+    // ====== 通用工具 ======
 
     getScoreClass (score) {
       if (score >= 70) return 'score-high'
@@ -678,13 +620,6 @@ export default {
       if (score >= 45) return '中性'
       if (score >= 30) return '中性偏弱'
       return '偏弱'
-    },
-    getOverallDesc (score) {
-      if (score >= 70) return '宏观经济指标整体向好，政策环境偏暖，有利于资本市场'
-      if (score >= 55) return '宏观经济运行平稳，主要指标处于合理区间'
-      if (score >= 45) return '宏观数据方向不明，关注后续政策发力'
-      if (score >= 30) return '部分宏观指标走弱，关注逆周期调节政策'
-      return '宏观经济面临压力，期待政策加码托底'
     },
     getSentimentClass (score) {
       if (score >= 70) return 'sentiment-bull'
@@ -711,66 +646,6 @@ export default {
       if (Math.abs(v) >= 1e8) return (v / 1e8).toFixed(2) + '亿'
       if (Math.abs(v) >= 1e4) return (v / 1e4).toFixed(2) + '万'
       return v.toFixed(2)
-    },
-
-    // ====== 宏观数据详情 Tab 工具方法 ======
-
-    getMacroRecords (ind) {
-      const data = this.macroData[ind.key]
-      if (!data || !data.latest) return []
-      return data.latest
-    },
-
-    getMacroColumns (ind) {
-      const data = this.macroData[ind.key]
-      if (!data || !data.columns || data.columns.length === 0) return []
-      return data.columns
-    },
-
-    getMacroLatestValue (ind) {
-      const records = this.getMacroRecords(ind)
-      if (records.length === 0) return null
-      const latest = records[records.length - 1]
-      return this.pickValue(latest, ind.valueCols)
-    },
-
-    formatMacroValue (value, ind) {
-      if (value === null || value === undefined) return '--'
-      if (ind.divisor) return (value / ind.divisor).toFixed(2)
-      return this.formatDisplay(value, ind.key)
-    },
-
-    isNumericCol (col, row) {
-      const v = row[col]
-      if (v === null || v === undefined || v === '') return false
-      const num = parseFloat(v)
-      return !isNaN(num) && String(v).length < 20
-    },
-
-    getNumericClass (val) {
-      const v = parseFloat(val)
-      if (isNaN(v)) return ''
-      if (v > 0) return 'up'
-      if (v < 0) return 'down'
-      return ''
-    },
-
-    formatTableCell (val, col) {
-      if (val === null || val === undefined) return ''
-      const s = String(val)
-      // 日期列直接返回
-      if (/date|month|quarter|period|日期|月份|季度/i.test(col)) return s
-      // 数值列格式化
-      const v = parseFloat(s)
-      if (!isNaN(v) && s.length < 20) {
-        // 大额资金
-        if (/amount|净流入|增量|融资|差额|balance|increment/i.test(col)) {
-          if (Math.abs(v) >= 1e8) return (v / 1e8).toFixed(2) + '亿'
-          if (Math.abs(v) >= 1e4) return (v / 1e4).toFixed(2) + '万'
-        }
-        return v.toFixed(2)
-      }
-      return s
     }
   }
 }

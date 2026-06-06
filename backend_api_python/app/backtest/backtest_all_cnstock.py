@@ -415,8 +415,8 @@ def _get_all_cnstocks(market_filters: List[str] = None) -> List[Dict[str, Any]]:
 
     # 方案2：AKShare 降级（不支持精确市场筛选，只能按交易所粗分）
     try:
-        from app.market_cn.china_stock import ak_stock_basic
-        df = ak_stock_basic()
+        import akshare as ak
+        df = ak.stock_zh_a_spot_em()
         if df is not None and len(df) > 0:
             code_col = "代码" if "代码" in df.columns else "code"
             name_col = "名称" if "名称" in df.columns else "name"

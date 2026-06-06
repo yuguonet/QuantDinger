@@ -127,22 +127,6 @@ def ts_index_daily(symbol="000300.SH"):
     return df.sort_values("trade_date")
 
 
-@retry()
-def ts_stock_daily(ts_code):
-    """Tushare: 个股日线"""
-    pro = _tushare_api()
-    end = datetime.now().strftime("%Y%m%d")
-    start = (datetime.now() - pd.Timedelta(days=200)).strftime("%Y%m%d")
-    df = pro.daily(ts_code=ts_code, start_date=start, end_date=end)
-    return df.sort_values("trade_date")
-
-
-@retry()
-def ts_stock_basic():
-    """Tushare: 全部A股列表"""
-    pro = _tushare_api()
-    return pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,industry,market')
-
 
 @retry()
 def ts_northbound():
@@ -167,18 +151,6 @@ def ak_index_daily(code="sh000300"):
     """AKShare: 指数日线"""
     import akshare as ak
     return ak.stock_zh_index_daily(symbol=code)
-
-@retry()
-def ak_stock_daily(code="sh600519"):
-    """AKShare: 个股日线"""
-    import akshare as ak
-    return ak.stock_zh_a_hist(symbol=code.replace("sh","").replace("sz",""), period="daily", adjust="qfq")
-
-@retry()
-def ak_stock_basic():
-    """AKShare: A股列表"""
-    import akshare as ak
-    return ak.stock_zh_a_spot_em()
 
 @retry()
 def ak_northbound():
@@ -271,27 +243,6 @@ def bs_index_daily(code="sh.000300"):
         bs.logout()
 
 
-@retry()
-def bs_stock_daily(code="sh.600519"):
-    """BaoStock: 个股日线"""
-    return bs_index_daily(code)
-
-
-@retry()
-def bs_stock_basic():
-    """BaoStock: A股列表"""
-    import baostock as bs
-    bs.login()
-    try:
-        rs = bs.query_stock_basic()
-        data = []
-        while rs.next():
-            data.append(rs.get_row_data())
-        return pd.DataFrame(data, columns=rs.fields)
-    finally:
-        bs.logout()
-
-
 # ═══════════════════════════════════════════════════
 #  直接爬官方数据 (最稳定)
 # ═══════════════════════════════════════════════════
@@ -352,26 +303,6 @@ class ChinaData:
             ("baostock", lambda: bs_index_daily(bs_code)),
         )()
 
-    def stock_daily(self, code="600519.SH"):
-        """个股日线"""
-        print(f"\n📊 个股日线: {code}")
-        bs_code = ("sh." if code.endswith(".SH") else "sz.") + code[:6]
-        ak_code = code[:6].lower()
-        return fallback(
-            ("tushare", lambda: ts_stock_daily(code)),
-            ("akshare", lambda: ak_stock_daily("sh" + ak_code if code.endswith(".SH") else "sz" + ak_code)),
-            ("baostock", lambda: bs_stock_daily(bs_code)),
-        )()
-
-    def stock_list(self):
-        """全A股列表"""
-        print("\n📊 A股列表")
-        return fallback(
-            ("tushare", ts_stock_basic),
-            ("akshare", ak_stock_basic),
-            ("baostock", bs_stock_basic),
-        )()
-
     def northbound(self):
         """北向资金"""
         print("\n📊 北向资金")
@@ -401,10 +332,8 @@ if __name__ == "__main__":
 
     # 测试各接口
     tests = [
-        ("GDP", data.gdp),
-        ("CPI", data.cpi),
-        ("PMI", data.pmi),
         ("沪深300", lambda: data.index_daily("000300.SH")),
+        ("北向资金", data.northbound),
     ]
 
     for name, func in tests:

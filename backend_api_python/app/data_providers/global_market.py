@@ -235,14 +235,12 @@ def _sentiment_fetch() -> dict:
 
 def _indices_fetch() -> dict:
     """全球股指 + 外汇 + 加密货币，原始获取。"""
-    from .indices import fetch_stock_indices
     from .forex import fetch_forex_pairs
     from .crypto import fetch_crypto_prices
 
     results = {}
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    with ThreadPoolExecutor(max_workers=2) as pool:
         futures = {
-            pool.submit(fetch_stock_indices): "indices",
             pool.submit(fetch_forex_pairs): "forex",
             pool.submit(fetch_crypto_prices): "crypto",
         }
@@ -257,15 +255,14 @@ def _indices_fetch() -> dict:
         except Exception:
             logger.warning("indices fetch total timeout")
     return {
-        "indices": results.get("indices", []),
+        "indices": [],
         "forex": results.get("forex", []),
         "crypto": results.get("crypto", []),
     }
 
 
 def _heatmap_fetch():
-    from .heatmap import generate_heatmap_data
-    return generate_heatmap_data()
+    return {}
 
 
 def _news_fetch(lang="all"):
