@@ -279,39 +279,9 @@ def get_hot_stocks_with_reason(date: str = "") -> Dict[str, Any]:
 )
 def get_northbound_flow() -> Dict[str, Any]:
     """获取北向资金实时分钟流向（同花顺 hsgtApi）。"""
-    url = "https://data.hexin.cn/market/hsgtApi/method/dayChart/"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/117.0.0.0 Safari/537.36",
-        "Host": "data.hexin.cn",
-        "Referer": "https://data.hexin.cn/",
-    }
     try:
-        r = requests.get(url, headers=headers, timeout=10)
-        d = r.json()
-        times = d.get("time", [])
-        hgt = d.get("hgt", [])
-        sgt = d.get("sgt", [])
-
-        n = len(times)
-        points = []
-        for i in range(n):
-            points.append({
-                "time": times[i],
-                "hgt_yi": hgt[i] if i < len(hgt) else None,
-                "sgt_yi": sgt[i] if i < len(sgt) else None,
-            })
-
-        # 取最新值
-        hgt_latest = next((p["hgt_yi"] for p in reversed(points) if p["hgt_yi"] is not None), 0)
-        sgt_latest = next((p["sgt_yi"] for p in reversed(points) if p["sgt_yi"] is not None), 0)
-
-        return {
-            "points": len(points),
-            "hgt_latest_yi": hgt_latest,
-            "sgt_latest_yi": sgt_latest,
-            "total_latest_yi": round((hgt_latest or 0) + (sgt_latest or 0), 2),
-            "data": points[-10:],  # 最近10个点
-        }
+        from app.market_cn.china_stock import hexin_northbound
+        return hexin_northbound()
     except Exception as e:
         logger.warning("get_northbound_flow failed: %s", e)
         return {"error": str(e)}

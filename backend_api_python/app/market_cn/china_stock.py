@@ -266,6 +266,54 @@ def ak_northbound():
     import akshare as ak
     return ak.stock_hsgt_north_net_flow_in_em(symbol="北上")
 
+
+def hexin_northbound() -> dict:
+    """同花顺: 北向资金实时分钟流向 (hsgtApi)。
+
+    沪股通/深股通当日分钟级净买入（~262个时间点），盘中实时更新。
+    与 ts_northbound/ak_northbound（日级历史）互补。
+    """
+    url = "https://data.hexin.cn/market/hsgtApi/method/dayChart/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/117.0.0.0 Safari/537.36",
+        "Host": "data.hexin.cn",
+        "Referer": "https://data.hexin.cn/",
+    }
+    r = requests.get(url, headers=headers, timeout=10)
+    d = r.json()
+    times = d.get("time", [])
+    hgt = d.get("hgt", [])
+    sgt = d.get("sgt", [])
+
+    n = len(times)
+    points = []
+    for i in range(n):
+        points.append({
+            "time": times[i],
+            "hgt_yi": hgt[i] if i < len(hgt) else None,
+            "sgt_yi": sgt[i] if i < len(sgt) else None,
+        })
+
+    hgt_latest = next((p["hgt_yi"] for p in reversed(points) if p["hgt_yi"] is not None), 0)
+    sgt_latest = next((p["sgt_yi"] for p in reversed(points) if p["sgt_yi"] is not None), 0)
+
+    return {
+        "points": len(points),
+        "hgt_latest_yi": hgt_latest,
+        "sgt_latest_yi": sgt_latest,
+        "total_latest_yi": round((hgt_latest or 0) + (sgt_latest or 0), 2),
+        "data": points[-10:],
+    }
+
+
+def northbound_daily():
+    """北向资金日级数据（Tushare → AKShare fallback）。返回 DataFrame。"""
+    return fallback(
+        ("tushare", ts_northbound),
+        ("akshare", ak_northbound),
+    )()
+
+
 @retry()
 def ak_lpr():
     """AKShare: LPR"""

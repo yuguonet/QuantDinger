@@ -8,7 +8,7 @@ A股市场贪婪恐惧指数 — 简化版
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from .china_stock import ChinaData, fallback, ak_index_daily, ak_northbound
+from .china_stock import ChinaData, fallback, ak_index_daily
 
 
 # ── 工具 ──────────────────────────────────────────
@@ -120,8 +120,8 @@ def _volume():
 def _northbound():
     """5. 近5日北向净流入 (亿)"""
     try:
-        from .china_stock import ts_northbound
-        df = fallback(("tushare", ts_northbound), ("akshare", ak_northbound))()
+        from .china_stock import northbound_daily
+        df = northbound_daily()
         if df is None or df.empty:
             return 50, "数据不可用"
         num = df.select_dtypes(include=[np.number])

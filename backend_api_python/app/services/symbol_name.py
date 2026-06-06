@@ -25,55 +25,6 @@ from app.data_sources.normalizer import normalize_cn_code, normalize_hk_code
 
 logger = get_logger(__name__)
 
-
-def fetch_quote(code: str, timeout: int = 8) -> Optional[list]:
-    """
-    通过腾讯 qt.gtimg.cn 接口获取单只股票/指数实时行情。
-
-    返回 ``~`` 分隔的原始字段列表（list[str]），调用方按索引取值。
-    失败时返回 ``None``。
-
-    Args:
-        code:    腾讯格式代码，如 ``sh600519`` / ``sz000001`` / ``hk00700``
-        timeout: 请求超时秒数
-    """
-    c = (code or "").strip().lower()
-    if not c:
-        return None
-
-    try:
-        resp = requests.get(
-            f"https://qt.gtimg.cn/q={c}",
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                              "AppleWebKit/537.36 (KHTML, like Gecko) "
-                              "Chrome/120.0.0.0 Safari/537.36",
-                "Referer": "https://finance.qq.com",
-            },
-            timeout=timeout,
-        )
-        try:
-            resp.encoding = "gbk"
-        except Exception:
-            pass
-
-        text = (resp.text or "").strip()
-        if not text or "~" not in text:
-            return None
-
-        start = text.index('="') + 2
-        end = text.rindex('"')
-        parts = text[start:end].split("~")
-
-        if len(parts) < 5:
-            return None
-
-        return parts
-    except Exception as e:
-        logger.debug(f"fetch_quote({code}) failed: {e}")
-        return None
-
-
 def _normalize_symbol_for_market(market: str, symbol: str) -> str:
     m = (market or '').strip()
     s = (symbol or '').strip().upper()
@@ -159,28 +110,12 @@ def resolve_symbol_name(market: str, symbol: str) -> Optional[str]:
         return _resolve_name_from_finnhub(s) or _resolve_name_from_yfinance(s)
 
     # CNStock: 优先从 basicinfo_db 查，无则 fallback 腾讯
-    if m == 'CNStock':
+    if m in ('CNStock', 'HKStock'):
         try:
             from app.utils.basicinfo_db import get_stock_basic_db
             stock = get_stock_basic_db().get_stock(s)
             if stock and stock.get("name"):
                 return stock["name"]
-        except Exception:
-            pass
-        try:
-            parts = fetch_quote(s)
-            if parts and len(parts) > 1 and parts[1]:
-                return str(parts[1]).strip()
-        except Exception:
-            pass
-        return _resolve_name_from_yfinance(s)
-
-    # HK stocks: try Tencent quote name first (no key), then yfinance best-effort.
-    if m == 'HKStock':
-        try:
-            parts = fetch_quote(s)
-            if parts and len(parts) > 1 and parts[1]:
-                return str(parts[1]).strip()
         except Exception:
             pass
         return _resolve_name_from_yfinance(s)
