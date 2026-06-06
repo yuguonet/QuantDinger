@@ -4,12 +4,19 @@
 市场情绪 / A股贪恐指数 / AI政策解读 / 热门板块分析 / 板块历史趋势+周期+预测
 
 用法:
-    from china_market_tools import ChinaData, fear_greed_index
+    from china_market_tools import fear_greed_index
     from china_market_tools import get_hot_industry_boards, get_hot_concept_boards
     from china_market_tools import SectorAnalyzer, SectorHistoryScheduler
 
-    data = ChinaData()
-    df = data.index_daily("000300.SH")
+    # 指数数据 (index.py)
+    from china_market_tools import get_index_realtime, get_index_daily_kline
+    data = get_index_realtime()  # 全部指数实时行情
+    kline = get_index_daily_kline("000300", 200)  # 沪深300日K线
+
+    # 北向资金
+    from china_market_tools import get_northbound_realtime, get_northbound_daily
+    nb = get_northbound_realtime()  # 实时分钟流向
+    nb_daily = get_northbound_daily(30)  # 近30日净流入
 
     result = fear_greed_index()
     sectors = get_all_hot_sectors()
@@ -28,7 +35,7 @@
 
 __version__ = "1.3.0"
 
-from .china_stock import ChinaData
+from .index import get_index_realtime, get_index_daily_kline, get_index_kline
 from .fear_greed_index import fear_greed_index
 from .hot_sectors import (
     get_hot_industry_boards,

@@ -54,43 +54,27 @@ def _fetch_money_flow_kline(symbol: str, days: int = 10) -> list:
     if cache_key in _cache:
         return _cache[cache_key]
 
-    secid = _to_secid(symbol)
-    if not secid:
-        return []
-
     try:
-        url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
-        params = {
-            "lmt": days,
-            "klt": 101,
-            "secid": secid,
-            "fields1": "f1,f2,f3,f7",
-            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
-            "ut": "b2884a393a59ad64002292a3e90d46a5",
-            "_": "1",
-        }
-        resp = requests.get(url, params=params, headers=HEADERS, timeout=10)
-        data = resp.json()
-
-        klines = (data.get("data") or {}).get("klines") or []
+        from app.market_cn.tape import get_fund_flow_daily
+        result = get_fund_flow_daily(symbol, days)
+        if "error" in result:
+            _cache[cache_key] = []
+            return []
+        data = result.get("data", [])
+        # 转换字段名以兼容旧格式
         results = []
-        for line in klines:
-            parts = line.split(',')
-            if len(parts) < 7:
-                continue
+        for item in data:
             results.append({
-                "date": parts[0],
-                "main_net_inflow": _safe_float(parts[1]),      # 主力净流入 (元)
-                "small_net_inflow": _safe_float(parts[2]),     # 小单净流入 (元)
-                "mid_net_inflow": _safe_float(parts[3]),       # 中单净流入 (元)
-                "big_net_inflow": _safe_float(parts[4]),       # 大单净流入 (元)
-                "super_net_inflow": _safe_float(parts[5]),     # 超大单净流入 (元)
+                "date": item.get("date", ""),
+                "main_net_inflow": item.get("main_net", 0),
+                "small_net_inflow": item.get("small_net", 0),
+                "mid_net_inflow": item.get("mid_net", 0),
+                "big_net_inflow": item.get("large_net", 0),
+                "super_net_inflow": item.get("super_net", 0),
             })
-
         _cache[cache_key] = results
         logger.info("money_flow(%s): 获取 %d 日资金流向", symbol, len(results))
         return results
-
     except Exception as e:
         logger.debug("money_flow(%s) 获取失败: %s", symbol, e)
         _cache[cache_key] = []
@@ -99,30 +83,19 @@ def _fetch_money_flow_kline(symbol: str, days: int = 10) -> list:
 
 def _fetch_realtime_flow(symbol: str) -> dict:
     """获取个股实时资金流向。"""
-    secid = _to_secid(symbol)
-    if not secid:
-        return {}
-
     try:
-        url = "https://push2.eastmoney.com/api/qt/stock/get"
-        params = {
-            "secid": secid,
-            "fields": "f62,f66,f69,f70,f72,f184,f66,f69",
-            "ut": "b2884a393a59ad64002292a3e90d46a5",
-        }
-        resp = requests.get(url, params=params, headers=HEADERS, timeout=10)
-        data = resp.json()
-        d = data.get("data") or {}
-
+        from app.market_cn.tape import get_fund_flow_realtime
+        result = get_fund_flow_realtime(symbol)
+        if "error" in result:
+            return {}
         return {
-            "main_net_inflow": _safe_float(d.get("f62")),      # 主力净流入 (元)
-            "super_net_inflow": _safe_float(d.get("f66")),     # 超大单净流入 (元)
-            "big_net_inflow": _safe_float(d.get("f69")),       # 大单净流入 (元)
-            "mid_net_inflow": _safe_float(d.get("f70")),       # 中单净流入 (元)
-            "small_net_inflow": _safe_float(d.get("f72")),     # 小单净流入 (元)
-            "main_net_pct": _safe_float(d.get("f184")),        # 主力净占比 (%)
+            "main_net_inflow": result.get("main_net", 0),
+            "super_net_inflow": result.get("super_net", 0),
+            "big_net_inflow": result.get("large_net", 0),
+            "mid_net_inflow": result.get("mid_net", 0),
+            "small_net_inflow": result.get("small_net", 0),
+            "main_net_pct": result.get("main_pct", 0),
         }
-
     except Exception as e:
         logger.debug("money_flow realtime(%s) 失败: %s", symbol, e)
         return {}

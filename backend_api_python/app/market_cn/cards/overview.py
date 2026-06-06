@@ -13,17 +13,13 @@ meta = CardMeta(
 
 
 def fetch():
-    from app.market_cn.cards._hub_helper import get_hub
-    hub = get_hub()
-    if hub is None:
-        return _empty()
-
     from app.data_sources.normalizer import safe_float, safe_int
+    from app.market_cn.index import get_index_realtime
 
     # 指数
     sse = sse_c = szse = szse_c = cyse = cyse_c = bzse = bzse_c = 0.0
     try:
-        indices = hub.index.get_realtime()
+        indices = get_index_realtime(["000001", "399001", "399006", "899050"])
         code_map = {item["code"]: item for item in (indices or [])}
         idx_conf = {
             "000001": ("sse", "sse_c"), "399001": ("szse", "szse_c"),
@@ -40,7 +36,8 @@ def fetch():
     # 涨停池
     limit_up = streak_height = 0
     try:
-        zt = hub.zt_pool.get_realtime()
+        from app.market_cn.dragon_limit import get_limit_up_pool
+        zt = get_limit_up_pool()
         if zt:
             limit_up = len(zt)
             streak_height = max((safe_int(i.get("continuous_zt_days", 1)) for i in zt), default=0)
@@ -50,11 +47,13 @@ def fetch():
     # 跌停 / 炸板
     limit_down = broken_board = 0
     try:
-        limit_down = hub.limit_down.get_count()
+        from app.market_cn.dragon_limit import get_limit_down_count
+        limit_down = get_limit_down_count()
     except Exception:
         pass
     try:
-        broken_board = hub.broken_board.get_count()
+        from app.market_cn.dragon_limit import get_broken_board_count
+        broken_board = get_broken_board_count()
     except Exception:
         pass
 
@@ -62,11 +61,15 @@ def fetch():
     north_net = emotion = 0.0
     up_count = down_count = 0
     try:
-        snap = hub.market_snapshot.get_realtime()
-        north_net = safe_float(snap.get("north_net_flow", 0))
-        emotion = safe_int(snap.get("emotion", 50))
-        up_count = safe_int(snap.get("up_count", 0))
-        down_count = safe_int(snap.get("down_count", 0))
+        from app.market_cn.index import get_northbound_realtime
+        nb = get_northbound_realtime()
+        north_net = safe_float(nb.get("total_latest_yi", 0))
+    except Exception:
+        pass
+    try:
+        from app.market_cn.fear_greed_index import fear_greed_index
+        fg = fear_greed_index()
+        emotion = safe_int(fg.get("composite_score", 50))
     except Exception:
         pass
 

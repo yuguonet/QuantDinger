@@ -1300,15 +1300,22 @@ class MarketDataCollector:
             logger.warning(f"A-share fear_greed fetch failed: {e}")
             factors["sources"]["fear_greed_error"] = str(e)
 
-        # 2. 个股主力资金流向 (补充因子)
-        # 原 AStockDataSource.get_stock_fund_flow 已移除，返回 main_net_inflow(主力净流入) + turnover_rate(换手率)
-        # 可用替换: eastmoney_extra_tools.get_fund_flow_120d (push2his API, 返回近120日主力净流入)
-        #           或 cn_hk_fundamentals.py 中新增 fetch_cn_fund_flow_akshare
-        logger.warning(
-            "[market_data_collector] 个股资金流向功能缺失，需补充: "
-            "main_net_inflow(主力净流入, 单位:万) + turnover_rate(换手率, 单位:%)。"
-            "参考: eastmoney push2his API 或 akshare stock_individual_fund_flow"
-        )
+        # 2. 个股主力资金流向 + 换手率 (tape.py)
+        try:
+            from app.market_cn.tape import get_fund_flow_realtime, get_realtime_turnover
+            # 主力净流入
+            flow = get_fund_flow_realtime(symbol)
+            if flow and "error" not in flow:
+                main_net = flow.get("main_net", 0)
+                factors["main_fund_netflow"] = round(main_net / 10000, 2)  # 转为万
+                factors["sources"]["fund_flow"] = "tape"
+            # 换手率
+            turnover = get_realtime_turnover(symbol)
+            if turnover and "error" not in turnover:
+                factors["turnover_rate"] = turnover.get("turnover_rate", 0)
+                factors["sources"]["turnover"] = "tape"
+        except Exception as e:
+            logger.debug(f"个股资金/换手率获取失败: {e}")
 
         # 3. 摘要
         summary_parts = []

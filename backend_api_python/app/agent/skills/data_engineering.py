@@ -22,7 +22,7 @@ from app.agent.skills.registry import skill
 执行时自动注入整个后端 app/ 的公开 API（introspection 动态发现，无需手动导入）。
 
 按目录自动加前缀避免命名冲突：
-  无前缀  → DataSourceFactory 方法（get_kline, get_ticker 等）、ChinaData（gdp, cpi 等）、china_market（get_fear_greed 等）、StockBasicDB（search_stocks 等）
+  无前缀  → DataSourceFactory 方法（get_kline, get_ticker 等）、index（get_index_realtime, get_northbound_daily 等）、china_market（get_fear_greed 等）、StockBasicDB（search_stocks 等）
   util_   → app/utils/ （cn_stock_info, trading_calendar 等）
   svc_    → app/services/ （fast_analyze, search_stock_news, indicator_analyzer 等）
   route_  → app/routes/ （路由层函数）

@@ -8,7 +8,7 @@ A股市场贪婪恐惧指数 — 简化版
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from .china_stock import ChinaData, fallback, ak_index_daily
+from .index import get_index_daily_kline, get_northbound_daily
 
 
 # ── 工具 ──────────────────────────────────────────
@@ -36,12 +36,10 @@ def _col(df, *names):
 
 def _index_df():
     """沪深300日线 (多源降级)"""
-    from .china_stock import ts_index_daily, bs_index_daily
-    return fallback(
-        ("tushare", lambda: ts_index_daily("000300.SH")),
-        ("akshare",  lambda: ak_index_daily("sh000300")),
-        ("baostock", lambda: bs_index_daily("sh.000300")),
-    )()
+    data = get_index_daily_kline("000300", 200)
+    if data:
+        return pd.DataFrame(data)
+    return None
 
 def _spot_df():
     """全A实时行情"""
@@ -120,13 +118,11 @@ def _volume():
 def _northbound():
     """5. 近5日北向净流入 (亿)"""
     try:
-        from .china_stock import northbound_daily
-        df = northbound_daily()
-        if df is None or df.empty:
+        data = get_northbound_daily(5)
+        if not data:
             return 50, "数据不可用"
-        num = df.select_dtypes(include=[np.number])
-        net = num.iloc[:, -1].tail(5).sum()
-        return _map(net, -200, 200), f"5日净流入{net:.0f}亿"
+        total = sum(d.get("total_yi", 0) for d in data)
+        return _map(total, -200, 200), f"5日净流入{total:.0f}亿"
     except Exception as e:
         return 50, str(e)
 

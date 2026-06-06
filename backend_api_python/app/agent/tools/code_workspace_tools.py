@@ -211,7 +211,7 @@ def _build_data_source_code() -> str:
 
     Uses introspection to discover capabilities from:
     - DataSourceFactory + BaseDataSource (per-market data: kline, ticker, etc.)
-    - ChinaData (macro: gdp, cpi, ppi, pmi, m2, lpr, northbound, etc.)
+    - index module (index realtime, kline, northbound, etc.)
     - china_market module (fear_greed, hot_sectors, sector_trend, sector_cycle, etc.)
     - StockBasicDB (stock_basic_info table: search, filter, concepts, industries, etc.)
 
@@ -268,40 +268,34 @@ except Exception as _ds_err:
     _DS_AVAILABLE = False
     def list_markets(): return ["CNStock", "HKStock", "USStock", "Crypto", "Forex", "Futures", "MOEX"]
 
-# ── 2. ChinaData: macro data (gdp, cpi, ppi, pmi, m2, lpr, etc.) ──
-# Lazy init: ChinaData() imports tushare/akshare/baostock, defer to first call
+# ── 2. index: market index data (realtime, kline, northbound) ──
 try:
-    from app.market_cn.china_stock import ChinaData as _ChinaData
-    _china_ref = [None]  # mutable container for lazy singleton
+    from app.market_cn.index import (
+        get_index_realtime as _get_index_realtime,
+        get_index_daily_kline as _get_index_daily_kline,
+        get_northbound_realtime as _get_northbound_realtime,
+        get_northbound_daily as _get_northbound_daily,
+    )
 
-    def _get_china():
-        if _china_ref[0] is None:
-            _china_ref[0] = _ChinaData()
-        return _china_ref[0]
+    def get_index_realtime(codes=None):
+        """获取指数实时行情"""
+        return _get_index_realtime(codes)
 
-    # Discover methods from class (not instance) to avoid triggering __init__
-    _china_methods = {n: m for n, m in _inspect.getmembers(_ChinaData, _inspect.isfunction)
-                      if not n.startswith("_")}
+    def get_index_daily_kline(code="000001", days=200):
+        """获取指数日K线"""
+        return _get_index_daily_kline(code, days)
 
-    def _make_china_wrapper(name):
-        def wrapper(*args, **kwargs):
-            result = getattr(_get_china(), name)(*args, **kwargs)
-            if hasattr(result, "to_dict"):
-                try:
-                    return result.tail(12).to_dict(orient="records")
-                except Exception:
-                    return str(result)
-            return result
-        wrapper.__name__ = name
-        wrapper.__doc__ = _china_methods[name].__doc__ or f"ChinaData.{name}"
-        return wrapper
+    def get_northbound_realtime():
+        """获取北向资金实时流向"""
+        return _get_northbound_realtime()
 
-    for _name in _china_methods:
-        globals()[_name] = _make_china_wrapper(_name)
+    def get_northbound_daily(days=120):
+        """获取北向资金日级数据"""
+        return _get_northbound_daily(days)
 
-    _CHINA_AVAILABLE = True
-except Exception as _china_err:
-    _CHINA_AVAILABLE = False
+    _INDEX_AVAILABLE = True
+except Exception as _index_err:
+    _INDEX_AVAILABLE = False
 
 # ── 3. china_market: cached market analysis (fear_greed, sectors, macro, etc.) ──
 try:
@@ -451,7 +445,7 @@ except Exception as _card_err:
 # ── Summary ──
 _DATA_INJECTION_STATUS = {
     "DataSourceFactory": _DS_AVAILABLE if "_DS_AVAILABLE" in dir() else False,
-    "ChinaData": _CHINA_AVAILABLE if "_CHINA_AVAILABLE" in dir() else False,
+    "Index": _INDEX_AVAILABLE if "_INDEX_AVAILABLE" in dir() else False,
     "china_market": _CM_AVAILABLE if "_CM_AVAILABLE" in dir() else False,
     "StockBasicDB": _BASIC_DB_AVAILABLE if "_BASIC_DB_AVAILABLE" in dir() else False,
     "app/全量扫描": _APP_SCAN_AVAILABLE if "_APP_SCAN_AVAILABLE" in dir() else False,

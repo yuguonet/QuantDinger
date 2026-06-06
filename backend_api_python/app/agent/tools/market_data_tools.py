@@ -274,29 +274,42 @@ def get_fund_flow(stock_codes: str = "") -> Dict[str, Any]:
     if len(codes) > 20:
         return {"error": f"单次最多20只，当前 {len(codes)} 只", "retriable": False}
 
+    try:
+        from app.market_cn.tape import get_fund_flow_realtime
+    except ImportError:
+        return {"error": "tape 模块不可用", "retriable": False}
+
     if len(codes) == 1:
         code = codes[0]
-        stocks = _em_search(f"{code.strip()} 资金流向", 5)
-        if stocks:
-            s = stocks[0]
+        try:
+            result = get_fund_flow_realtime(code)
+            if "error" in result:
+                return {"code": code, "name": "", "net_flow": 0, "main_flow": 0, "retail_flow": 0}
             return {
-                "code": s.get("code", code),
-                "name": s.get("name", ""),
-                "net_flow": 0, "main_flow": 0, "retail_flow": 0,
+                "code": code,
+                "name": result.get("name", ""),
+                "net_flow": result.get("net_flow", 0),
+                "main_flow": result.get("main_net", 0),
+                "retail_flow": result.get("retail_net", 0),
             }
-        return {"code": code, "name": "", "net_flow": 0, "main_flow": 0, "retail_flow": 0}
+        except Exception:
+            return {"code": code, "name": "", "net_flow": 0, "main_flow": 0, "retail_flow": 0}
     else:
         result = {}
         for code in codes:
-            stocks = _em_search(f"{code.strip()} 资金流向", 5)
-            if stocks:
-                s = stocks[0]
-                result[code] = {
-                    "code": s.get("code", code),
-                    "name": s.get("name", ""),
-                    "net_flow": 0, "main_flow": 0, "retail_flow": 0,
-                }
-            else:
+            try:
+                r = get_fund_flow_realtime(code)
+                if "error" in r:
+                    result[code] = {"code": code, "name": "", "net_flow": 0, "main_flow": 0, "retail_flow": 0}
+                else:
+                    result[code] = {
+                        "code": code,
+                        "name": r.get("name", ""),
+                        "net_flow": r.get("net_flow", 0),
+                        "main_flow": r.get("main_net", 0),
+                        "retail_flow": r.get("retail_net", 0),
+                    }
+            except Exception:
                 result[code] = {"code": code, "name": "", "net_flow": 0, "main_flow": 0, "retail_flow": 0}
         return {"count": len(result), "flows": result, "failed": []}
 

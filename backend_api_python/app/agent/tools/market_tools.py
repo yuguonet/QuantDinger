@@ -23,21 +23,18 @@ def _get_ds(market: str = "CNStock"):
 )
 def get_market_indices() -> Dict[str, Any]:
     """获取大盘指数行情（上证指数、深证成指、创业板指）。"""
-    # 走腾讯财经（不封IP，稳定）
     try:
-        from app.agent.tools.eastmoney_extra_tools import _tencent_quote_raw
-        data = _tencent_quote_raw(["000001", "399001", "399006"])
+        from app.market_cn.index import get_index_realtime
+        data = get_index_realtime(["000001", "399001", "399006"])
         indices = []
-        for code in ["000001", "399001", "399006"]:
-            q = data.get(code)
-            if q:
-                indices.append({
-                    "code": code,
-                    "name": q["name"],
-                    "price": q["price"],
-                    "change_pct": q["change_pct"],
-                    "amount_wan": q["amount_wan"],
-                })
+        for item in data:
+            indices.append({
+                "code": item.get("code", ""),
+                "name": item.get("name", ""),
+                "price": item.get("price", 0),
+                "change_pct": item.get("change_percent", 0),
+                "amount_wan": round(item.get("amount", 0) / 10000, 2),
+            })
         return {"indices": indices} if indices else {"error": "未获取到指数数据"}
     except Exception as e:
         logger.error("get_market_indices failed: %s", e)
@@ -62,14 +59,14 @@ def get_sector_rankings() -> Dict[str, Any]:
         logger.warning("get_sector_rankings via hot_sectors failed: %s", e)
         # fallback: 东财直连
         try:
-            from app.agent.tools.eastmoney_extra_tools import _em_get
+            import requests
             url = "https://push2.eastmoney.com/api/qt/clist/get"
             params = {
                 "pn": "1", "pz": "20", "po": "1", "np": "1",
                 "fltt": "2", "invt": "2", "fs": "m:90+t:2",
                 "fields": "f2,f3,f4,f12,f14,f104,f105,f128,f136",
             }
-            r = _em_get(url, params=params, timeout=15)
+            r = requests.get(url, params=params, timeout=15)
             d = r.json()
             items = d.get("data", {}).get("diff", [])
             sectors = []

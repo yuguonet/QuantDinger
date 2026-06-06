@@ -280,8 +280,8 @@ def get_hot_stocks_with_reason(date: str = "") -> Dict[str, Any]:
 def get_northbound_flow() -> Dict[str, Any]:
     """获取北向资金实时分钟流向（同花顺 hsgtApi）。"""
     try:
-        from app.market_cn.china_stock import hexin_northbound
-        return hexin_northbound()
+        from app.market_cn.index import get_northbound_realtime
+        return get_northbound_realtime()
     except Exception as e:
         logger.warning("get_northbound_flow failed: %s", e)
         return {"error": str(e)}
@@ -674,51 +674,22 @@ def get_dividend_history(stock_code: str) -> Dict[str, Any]:
     domain=["finance"],
 )
 def get_fund_flow_120d(stock_code: str) -> Dict[str, Any]:
-    """获取个股资金流120日日级数据（东财 push2his）。
+    """获取个股资金流120日日级数据。
 
     Args:
         stock_code: 股票代码（如 600519）
     """
     code = _stock_code_normalize(stock_code)
-    market_code = 1 if code.startswith("6") else 0
-    url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
-    params = {
-        "secid": f"{market_code}.{code}",
-        "fields1": "f1,f2,f3,f7",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
-        "lmt": "120",
-    }
-    headers = {
-        "User-Agent": _UA,
-        "Referer": "https://quote.eastmoney.com/",
-        "Origin": "https://quote.eastmoney.com",
-    }
     try:
-        r = _em_get(url, params=params, headers=headers, timeout=15)
-        d = r.json()
-        klines = d.get("data", {}).get("klines", [])
-        rows = []
-        for line in klines:
-            parts = line.split(",")
-            if len(parts) >= 7:
-                rows.append({
-                    "date": parts[0],
-                    "main_net": _safe_float(parts[1]),
-                    "small_net": _safe_float(parts[2]),
-                    "mid_net": _safe_float(parts[3]),
-                    "large_net": _safe_float(parts[4]),
-                    "super_net": _safe_float(parts[5]),
-                })
-
-        # 统计近20日
-        recent = rows[-20:] if len(rows) >= 20 else rows
-        total_main = sum(r["main_net"] for r in recent)
-
+        from app.market_cn.tape import get_fund_flow_daily
+        result = get_fund_flow_daily(code, 120)
+        if "error" in result:
+            return {"stock_code": code, "error": result["error"]}
         return {
             "stock_code": code,
-            "total_days": len(rows),
-            "recent_20d_main_net": round(total_main, 2),
-            "data": rows[-30:],  # 返回最近30天
+            "total_days": result.get("total_days", 0),
+            "recent_20d_main_net": result.get("recent_20d_main_net", 0),
+            "data": result.get("data", [])[-30:],
         }
     except Exception as e:
         logger.warning("get_fund_flow_120d(%s) failed: %s", code, e)
@@ -732,46 +703,22 @@ def get_fund_flow_120d(stock_code: str) -> Dict[str, Any]:
     domain=["finance"],
 )
 def get_fund_flow_minute(stock_code: str) -> Dict[str, Any]:
-    """获取个股资金流向分钟级（东财 push2）。
+    """获取个股资金流向分钟级。
 
     Args:
         stock_code: 股票代码（如 000858）
     """
     code = _stock_code_normalize(stock_code)
-    secid = f"1.{code}" if code.startswith("6") else f"0.{code}"
-    url = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
-    params = {
-        "secid": secid, "klt": 1,
-        "fields1": "f1,f2,f3,f7",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57",
-    }
-    headers = {
-        "User-Agent": _UA,
-        "Referer": "https://quote.eastmoney.com/",
-        "Origin": "https://quote.eastmoney.com",
-    }
     try:
-        r = _em_get(url, params=params, headers=headers, timeout=10)
-        d = r.json()
-        rows = []
-        for line in d.get("data", {}).get("klines", []):
-            parts = line.split(",")
-            if len(parts) >= 6:
-                rows.append({
-                    "time": parts[0],
-                    "main_net": _safe_float(parts[1]),
-                    "small_net": _safe_float(parts[2]),
-                    "mid_net": _safe_float(parts[3]),
-                    "large_net": _safe_float(parts[4]),
-                    "super_net": _safe_float(parts[5]),
-                })
-
-        total_main = sum(r["main_net"] for r in rows)
+        from app.market_cn.tape import get_fund_flow_realtime
+        result = get_fund_flow_realtime(code)
+        if "error" in result:
+            return {"stock_code": code, "error": result["error"]}
         return {
             "stock_code": code,
-            "points": len(rows),
-            "total_main_net": round(total_main, 2),
-            "data": rows,
+            "points": result.get("points", 0),
+            "total_main_net": result.get("total_main_net", 0),
+            "data": result.get("data", []),
         }
     except Exception as e:
         logger.warning("get_fund_flow_minute(%s) failed: %s", code, e)
@@ -1101,43 +1048,18 @@ def _tencent_quote_raw(codes: list) -> dict:
     domain=["finance"],
 )
 def get_order_book(stock_code: str) -> Dict[str, Any]:
-    """获取五档盘口+实时行情（腾讯财经）。
+    """获取五档盘口+实时行情。
 
     Args:
         stock_code: 股票代码（如 600519）
     """
     code = _stock_code_normalize(stock_code)
     try:
-        data = _tencent_quote_raw([code])
-        q = data.get(code)
-        if not q:
-            return {"stock_code": code, "error": "未获取到数据"}
-        return {
-            "stock_code": code,
-            "name": q["name"],
-            "price": q["price"],
-            "last_close": q["last_close"],
-            "open": q["open"],
-            "high": q["high"],
-            "low": q["low"],
-            "change_pct": q["change_pct"],
-            "bid": {
-                "bid1": {"price": q["bid1_price"], "vol": q["bid1_vol"]},
-                "bid2": {"price": q["bid2_price"], "vol": q["bid2_vol"]},
-                "bid3": {"price": q["bid3_price"], "vol": q["bid3_vol"]},
-                "bid4": {"price": q["bid4_price"], "vol": q["bid4_vol"]},
-                "bid5": {"price": q["bid5_price"], "vol": q["bid5_vol"]},
-            },
-            "ask": {
-                "ask1": {"price": q["ask1_price"], "vol": q["ask1_vol"]},
-                "ask2": {"price": q["ask2_price"], "vol": q["ask2_vol"]},
-                "ask3": {"price": q["ask3_price"], "vol": q["ask3_vol"]},
-                "ask4": {"price": q["ask4_price"], "vol": q["ask4_vol"]},
-                "ask5": {"price": q["ask5_price"], "vol": q["ask5_vol"]},
-            },
-            "buy_vol": q["buy_vol"],
-            "sell_vol": q["sell_vol"],
-        }
+        from app.market_cn.tape import get_order_book as _get_order_book
+        result = _get_order_book(code)
+        if "error" in result:
+            return {"stock_code": code, "error": result["error"]}
+        return result
     except Exception as e:
         logger.warning("get_order_book(%s) failed: %s", code, e)
         return {"stock_code": code, "error": str(e)}

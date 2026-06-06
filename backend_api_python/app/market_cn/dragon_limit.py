@@ -15,7 +15,13 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from app.data_sources.rate_limiter import get_akshare_limiter
-from app.data_sources.normalizer import _sf, _si, _ss
+from app.data_sources.normalizer import safe_float as _sf, safe_int as _si
+
+def _ss(v, default="") -> str:
+    """safe str"""
+    if v is None:
+        return default
+    return str(v).strip() if v else default
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)

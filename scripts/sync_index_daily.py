@@ -133,28 +133,28 @@ def fetch_bs(symbol_cfg: dict, start: str = "", end: str = "") -> Optional[pd.Da
 # ============================================================
 
 def fetch_ts(symbol: str, start: str = "", end: str = "") -> Optional[pd.DataFrame]:
-    """tushare 指数日线。返回 DataFrame[date, open, high, low, close, volume]"""
+    """通过 index.py 获取指数日线。返回 DataFrame[date, open, high, low, close, volume]"""
     try:
-        from app.market_cn.china_stock import _tushare_api
-        pro = _tushare_api()
-        today = datetime.date.today().strftime("%Y%m%d")
-        s = start.replace("-", "") or (datetime.date.today() - datetime.timedelta(days=3650)).strftime("%Y%m%d")
-        e = end.replace("-", "") or today
-        df = pro.index_daily(ts_code=symbol, start_date=s, end_date=e)
-        if df is None or df.empty:
+        from app.market_cn.index import get_index_daily_kline
+        # 转换 symbol 格式: "000001.SH" -> "000001"
+        code = symbol.split(".")[0]
+        data = get_index_daily_kline(code, 800)
+        if not data:
             return None
-        df = df.rename(columns={"trade_date": "date"})
+        df = pd.DataFrame(data)
         df["date"] = pd.to_datetime(df["date"])
-        for col in ["open", "high", "low", "close", "vol"]:
+        for col in ["open", "high", "low", "close", "volume"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
-        if "vol" in df.columns:
-            df = df.rename(columns={"vol": "volume"})
         df = df[["date", "open", "high", "low", "close", "volume"]].dropna(subset=["close"])
         df = df.sort_values("date").reset_index(drop=True)
+        if start:
+            df = df[df["date"] >= start]
+        if end:
+            df = df[df["date"] <= end]
         return df
     except Exception as e:
-        print(f"    [tushare] 失败: {e}")
+        print(f"    [index.py] 失败: {e}")
         return None
 
 

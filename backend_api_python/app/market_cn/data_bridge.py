@@ -137,7 +137,7 @@ def fetch_overview() -> Dict[str, Any]:
     indices:      A股主要指数（上证/深证/创业板/沪深300）— 取最新日线收盘
     forex/crypto/commodities: A股无直接对应，返回空列表
     """
-    from .china_stock import ChinaData, fallback, ak_index_daily, bs_index_daily
+    from .index import get_index_realtime
 
     result: Dict[str, Any] = {
         "indices": [],
@@ -146,36 +146,29 @@ def fetch_overview() -> Dict[str, Any]:
         "commodities": [],
     }
 
-    # 主要指数 — 取最新日线
+    # 主要指数 — 取实时行情
     try:
         index_map = [
-            ("000001.SH", "sh000001", "sh.000001", "上证指数"),
-            ("399001.SZ", "sz399001", "sz.399001", "深证成指"),
-            ("399006.SZ", "sz399006", "sz.399006", "创业板指"),
-            ("000300.SH", "sh000300", "sh.000300", "沪深300"),
+            ("000001", "上证指数"),
+            ("399001", "深证成指"),
+            ("399006", "创业板指"),
+            ("000300", "沪深300"),
         ]
-        data = ChinaData()
-        for ts_code, ak_code, bs_code, name in index_map:
-            try:
-                df = fallback(
-                    ("tushare", lambda c=ts_code: data.index_daily(c)),
-                    ("akshare", lambda c=ak_code: ak_index_daily(c)),
-                    ("baostock", lambda c=bs_code: bs_index_daily(c)),
-                )()
-                if df is not None and len(df) > 0:
-                    last = df.iloc[-1]
-                    close = float(last.get("close", last.get("收盘", 0)) or 0)
-                    prev = float(df.iloc[-2].get("close", df.iloc[-2].get("收盘", 0)) or 0) if len(df) > 1 else close
-                    change = ((close - prev) / prev * 100) if prev else 0
-                    result["indices"].append({
-                        "symbol": ts_code,
-                        "name": name,
-                        "name_cn": name,
-                        "price": close,
-                        "change": round(change, 2),
-                    })
-            except Exception:
-                pass
+        codes = [c for c, _ in index_map]
+        data = get_index_realtime(codes)
+        if data:
+            code_to_name = dict(index_map)
+            for item in data:
+                code = item.get("code", "")
+                price = item.get("price", 0)
+                change_pct = item.get("change_percent", 0)
+                result["indices"].append({
+                    "symbol": f"{code}.SH" if code[:3] in ("000", "88", "99") else f"{code}.SZ",
+                    "name": code_to_name.get(code, item.get("name", code)),
+                    "name_cn": code_to_name.get(code, item.get("name", code)),
+                    "price": price,
+                    "change": round(change_pct, 2),
+                })
     except Exception as e:
         logger.warning("market_cn indices failed: %s", e)
 

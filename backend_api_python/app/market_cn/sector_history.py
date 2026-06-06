@@ -177,7 +177,7 @@ class SectorHistoryScheduler:
 
     def _collect(self):
         """采集板块数据并存储（行业+概念并行）"""
-        from app.market_cn.hot_sectors import _fetch_board_list, _analyze_continuity
+        from app.market_cn.hot_sectors import get_hot_industry_boards, get_hot_concept_boards
 
         today = datetime.now().strftime("%Y-%m-%d")
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -192,14 +192,16 @@ class SectorHistoryScheduler:
 
         def _collect_one(board_type, filepath):
             """采集单个板块类型"""
-            raw = _fetch_board_list(board_type, sort_by="f3", sort_dir="desc", limit=TOP_N)
+            if board_type == "industry":
+                raw = get_hot_industry_boards(limit=TOP_N)
+            else:
+                raw = get_hot_concept_boards(limit=TOP_N)
             if not raw:
                 logger.warning("[SectorHistory] %s 返回空数据", board_type)
                 return False
 
-            analyzed = _analyze_continuity(raw)
             rows = []
-            for rank, b in enumerate(analyzed, 1):
+            for rank, b in enumerate(raw, 1):
                 rows.append({
                     "trade_date": today,
                     "board_type": board_type,
