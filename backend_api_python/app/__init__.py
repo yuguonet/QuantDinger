@@ -169,22 +169,18 @@ def start_emotion_scheduler():
         return
 
     try:
-        from app.interfaces.cn_stock_hub import AShareDataHub
         from app.interfaces.cache_file import cache_db
         from app.interfaces.emotion_scheduler import EmotionScheduler
         from app.utils.trading_calendar import is_trading_day_today
-        from app.data_sources.factory import DataSourceFactory
 
         if is_trading_day_today():
             logger.info("[EmotionScheduler] 今日为交易日，启动采集调度器")
         else:
             logger.info("[EmotionScheduler] 今日非交易日，调度器启动后将自动跳过采集")
 
-        # 通过 DataSourceFactory 获取数据源，与路线 B 统一
-        source = DataSourceFactory.get_source("CNStock")
-        hub = AShareDataHub(sources=[source])
+        # AShareDataHub 已移除，hub 传 None（情绪采集将使用默认值）
         db = cache_db()
-        scheduler = EmotionScheduler(hub, db)
+        scheduler = EmotionScheduler(None, db)
         scheduler.start()
     except Exception as e:
         logger.error(f"Failed to start emotion scheduler: {e}")

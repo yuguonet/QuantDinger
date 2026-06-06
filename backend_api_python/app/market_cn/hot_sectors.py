@@ -312,23 +312,30 @@ def _fetch_sina_industry_boards(limit=30):
 
 
 def get_all_hot_sectors(industry_limit=15, concept_limit=15):
-    """获取全部热门板块数据（供 API 使用）"""
+    """获取全部热门板块数据（供 API 使用）
+
+    优先使用新浪（稳定，无反爬），东财作为兜底。
+    """
     logger.info("热门板块分析: %d 行业 + %d 概念", industry_limit, concept_limit)
 
     industry = []
     concept = []
 
-    # 并行采集行业和概念（独立异常处理）
+    # ① 优先新浪（稳定，无反爬）
     try:
-        industry = get_hot_industry_boards(industry_limit)
-    except Exception as e:
-        logger.error("行业板块获取失败: %s", e)
-
-    # 东财失败时降级到新浪
-    if not industry:
-        logger.info("东财行业板块为空，降级到新浪")
         industry = _fetch_sina_industry_boards(industry_limit)
+    except Exception as e:
+        logger.error("新浪行业板块获取失败: %s", e)
 
+    # ② 新浪失败时降级到东财
+    if not industry:
+        logger.info("新浪行业板块为空，降级到东财")
+        try:
+            industry = get_hot_industry_boards(industry_limit)
+        except Exception as e:
+            logger.error("东财行业板块获取失败: %s", e)
+
+    # 概念板块：新浪无此接口，只能走东财
     try:
         concept = get_hot_concept_boards(concept_limit)
     except Exception as e:

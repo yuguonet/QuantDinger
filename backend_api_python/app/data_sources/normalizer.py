@@ -301,3 +301,64 @@ def strip_market_prefix(symbol: str) -> str:
 # ================================================================
 safe_float = _sf
 safe_int = _si
+
+
+# ================================================================
+# 指数/ETF 代码识别 — 供行情接口区分市场前缀
+# ================================================================
+
+# 上交所指数代码 (000xxx 中的指数)
+_SH_INDEX_CODES = {
+    "000001", "000016", "000300", "000510", "000688", "000852", "000905", "000906",
+}
+
+# 上交所 ETF 前缀
+_SH_ETF_PREFIXES = ("510", "511", "512", "513", "515", "516", "517", "518", "519")
+
+# 深交所 ETF 前缀
+_SZ_ETF_PREFIXES = ("159",)
+
+
+def is_index_or_etf(code: str) -> bool:
+    """判断代码是否为指数或 ETF（而非普通个股）。"""
+    c = strip_market_prefix(code)
+    if not c.isdigit() or len(c) != 6:
+        return False
+    return (
+        c in _SH_INDEX_CODES
+        or c.startswith(_SH_ETF_PREFIXES)
+        or c.startswith(_SZ_ETF_PREFIXES)
+        or c.startswith("399")  # 深证指数
+    )
+
+
+def market_prefix_for_quote(code: str) -> str:
+    """
+    为行情接口推断市场前缀，正确处理指数/ETF。
+
+    与 add_market_prefix 的区别:
+      - add_market_prefix("000300") → "SZ000300" (按个股规则，错误)
+      - market_prefix_for_quote("000300") → "SH000300" (识别为上证指数，正确)
+
+    Returns:
+        带前缀代码: SH000300 / SZ399001 / SZ000002 / SH510050
+    """
+    c = strip_market_prefix(code)
+    if not c.isdigit() or len(c) != 6:
+        return add_market_prefix(code)  # 无法识别，走默认
+
+    # 上证指数
+    if c in _SH_INDEX_CODES:
+        return "SH" + c
+    # 上交所 ETF
+    if c.startswith(_SH_ETF_PREFIXES):
+        return "SH" + c
+    # 深交所 ETF
+    if c.startswith(_SZ_ETF_PREFIXES):
+        return "SZ" + c
+    # 深证指数
+    if c.startswith("399"):
+        return "SZ" + c
+
+    # 普通个股，走默认规则
+    return add_market_prefix(code)
