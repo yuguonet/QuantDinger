@@ -120,24 +120,6 @@ def cache_put(endpoint, data):
 
 
 # ============================================================
-#  数据源单例
-# ============================================================
-
-_china_data = None
-_china_data_lock = threading.Lock()
-
-
-def _get_china_data():
-    global _china_data
-    if _china_data is None:
-        with _china_data_lock:
-            if _china_data is None:
-                from .china_stock import ChinaData
-                _china_data = ChinaData()
-    return _china_data
-
-
-# ============================================================
 #  后台刷新
 # ============================================================
 
@@ -374,41 +356,29 @@ def refresh(target="all") -> dict:
 # ============================================================
 
 def _fetch_china_macro() -> dict:
-    data = _get_china_data()
-    fetchers = [
-        ("gdp", data.gdp), ("cpi", data.cpi), ("ppi", data.ppi),
-        ("pmi", data.pmi), ("m2", data.m2), ("lpr", data.lpr),
-        ("social_financing", data.social_financing), ("trade", data.trade),
-    ]
-    macro = {}
-
-    def _fetch_one(name, fn):
-        try:
-            df = fn()
-            if df is not None and len(df) > 0:
-                records = df.tail(6).fillna("").to_dict(orient="records")
-                return name, {"columns": list(df.columns), "latest": records, "count": len(df)}
-            return name, {"columns": [], "latest": [], "count": 0}
-        except Exception as e:
-            logger.error("china-macro %s 失败: %s", name, e)
-            return name, {"columns": [], "latest": [], "count": 0, "error": str(e)}
-
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futs = {pool.submit(_fetch_one, n, f): n for n, f in fetchers}
-        done, not_done = futures_wait(futs, timeout=60)
-        for fut in done:
-            name, result = fut.result(timeout=0)
-            macro[name] = result
-        for fut in not_done:
-            name = futs[fut]
-            logger.warning("china-macro %s 超时", name)
-            macro[name] = {"columns": [], "latest": [], "count": 0, "error": "timeout"}
-
-    return {
-        "code": 1, "msg": "success",
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "data": macro,
-    }
+    """市场情绪 — StockApi 情绪周期（涨跌停/大面大肉/上涨比例）"""
+    import requests as _req
+    url = "https://www.stockapi.com.cn/v1/base/emotionalCycle"
+    try:
+        r = _req.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        d = r.json()
+        if d.get("code") != 20000:
+            return {"code": 0, "msg": d.get("msg", "接口错误"), "data": {}}
+        cols = d["data"]["colNameList"]
+        rows = d["data"]["contentList"]
+        latest = rows[-1] if rows else []
+        row_dict = dict(zip(cols, latest)) if cols and latest else {}
+        return {
+            "code": 1, "msg": "success",
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "data": {
+                "emotion": row_dict,
+                "history_days": len(rows),
+            },
+        }
+    except Exception as e:
+        logger.error("StockApi 情绪数据失败: %s", e)
+        return {"code": 0, "msg": str(e), "data": {}}
 
 
 def _fetch_fear_greed():

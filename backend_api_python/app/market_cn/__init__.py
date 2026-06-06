@@ -1,7 +1,7 @@
 """
 🇨🇳 china-market-tools — 中国金融市场分析工具箱
 
-宏观数据 / A股贪恐指数 / AI政策解读 / 热门板块分析 / 板块历史趋势+周期+预测
+市场情绪 / A股贪恐指数 / AI政策解读 / 热门板块分析 / 板块历史趋势+周期+预测
 
 用法:
     from china_market_tools import ChinaData, fear_greed_index
@@ -9,7 +9,7 @@
     from china_market_tools import SectorAnalyzer, SectorHistoryScheduler
 
     data = ChinaData()
-    df = data.gdp()
+    df = data.index_daily("000300.SH")
 
     result = fear_greed_index()
     sectors = get_all_hot_sectors()
