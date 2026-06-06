@@ -53,6 +53,11 @@ from .china_market import (
     get_emotion_history,
     refresh as refresh_cn,
 )
+from .index import (
+    get_northbound_realtime,
+    get_northbound_daily,
+    get_northbound_holdings,
+)
 from .data_bridge import (
     get_macro_data,
     fetch_sentiment,
