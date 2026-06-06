@@ -1,79 +1,32 @@
 """
-A股数据标准化层 — 统一不同数据源的字段命名和数据格式
+龙虎榜 / 涨跌停池 / 炸板池 — 统一数据层
 
-不同数据源返回的字段名、格式、精度都不同:
-- 东财: stock_code, stock_name, trade_date, buy_amount ...
-- AkShare: 代码, 名称, 上榜日, 龙虎榜买入额 ...
-- 新浪: code, name, changepercent ...
+4 个核心接口:
+  - get_dragon_tiger(start_date, end_date)  龙虎榜
+  - get_zt_pool(trade_date)                 涨停池
+  - get_dt_pool(trade_date)                 跌停池
+  - get_broken_board(trade_date)            炸板池
 
-标准化层确保:
-  1. 所有数据源返回统一的字段名
-  2. 类型安全 (float/int/str)
-  3. 缺失字段有合理默认值
-  4. 数据校验 (合理性检查)
+数据源优先级: HTTP 东财搜索 → AkShare 兜底
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
+
+from app.data_sources.rate_limiter import get_akshare_limiter
+from app.data_sources.normalizer import _sf, _si, _ss
+from app.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
-def _sf(v, default=0.0) -> float:
-    """safe float"""
-    if v is None or v == "-" or v == "" or str(v).strip() == "nan":
-        return default
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return default
+# ══════════════════════════════════════════════════════════════
+#  数据标准化函数 (正本: market_schema.py)
+# ══════════════════════════════════════════════════════════════
 
-
-def _si(v, default=0) -> int:
-    """safe int"""
-    if v is None or v == "-" or v == "":
-        return default
-    try:
-        return int(float(v))
-    except (TypeError, ValueError):
-        return default
-
-
-def _ss(v, default="") -> str:
-    """safe str"""
-    if v is None:
-        return default
-    return str(v).strip()
-
-
-# ================================================================
-# 龙虎榜
-# ================================================================
-
-DRAGON_TIGER_SCHEMA = {
-    "stock_code": str,        # 股票代码 6位
-    "stock_name": str,        # 股票名称
-    "trade_date": str,        # 上榜日期 YYYY-MM-DD
-    "reason": str,            # 上榜原因
-    "buy_amount": float,      # 买入金额 (元)
-    "sell_amount": float,     # 卖出金额 (元)
-    "net_amount": float,      # 净买入额 (元)
-    "change_percent": float,  # 涨跌幅 %
-    "close_price": float,     # 收盘价
-    "turnover_rate": float,   # 换手率 %
-    "amount": float,          # 成交额 (元)
-    "buy_seat_count": int,    # 买入席位数
-    "sell_seat_count": int,   # 卖出席位数
-}
-
-
-def normalize_dragon_tiger(raw: Dict[str, Any], source: str = "") -> Dict[str, Any]:
-    """
-    标准化一条龙虎榜记录。
-
-    支持的源字段映射:
-    - eastmoney: 直接使用标准字段
-    - akshare: 代码/名称/上榜日/解读 → stock_code/stock_name/trade_date/reason
-    """
+def _normalize_dragon_tiger(raw: Dict[str, Any], source: str = "") -> Dict[str, Any]:
+    """标准化一条龙虎榜记录（内部用）"""
     if source == "akshare" or "代码" in raw:
         return {
             "stock_code": _ss(raw.get("代码", raw.get("code", raw.get("stock_code")))),
@@ -90,8 +43,6 @@ def normalize_dragon_tiger(raw: Dict[str, Any], source: str = "") -> Dict[str, A
             "buy_seat_count": _si(raw.get("买入席位数", raw.get("buy_seat_count", raw.get("BUYER_NUM", 0)))),
             "sell_seat_count": _si(raw.get("卖出席位数", raw.get("sell_seat_count", raw.get("SELLER_NUM", 0)))),
         }
-
-    # eastmoney / default: 直接取标准字段
     return {
         "stock_code": _ss(raw.get("stock_code", raw.get("SECURITY_CODE"))),
         "stock_name": _ss(raw.get("stock_name", raw.get("SECURITY_NAME_ABBR"))),
@@ -109,27 +60,12 @@ def normalize_dragon_tiger(raw: Dict[str, Any], source: str = "") -> Dict[str, A
     }
 
 
-def normalize_dragon_tiger_list(raw_list: List[Dict], source: str = "") -> List[Dict[str, Any]]:
-    """批量标准化龙虎榜数据"""
-    return [normalize_dragon_tiger(r, source) for r in raw_list if isinstance(r, dict)]
+def _normalize_dragon_tiger_list(raw_list: List[Dict], source: str = "") -> List[Dict[str, Any]]:
+    """批量标准化龙虎榜数据（内部用）"""
+    return [_normalize_dragon_tiger(r, source) for r in raw_list if isinstance(r, dict)]
 
 
-# ================================================================
-# 热榜
-# ================================================================
-
-HOT_RANK_SCHEMA = {
-    "rank": int,              # 排名
-    "stock_code": str,        # 股票代码
-    "stock_name": str,        # 股票名称
-    "price": float,           # 最新价
-    "change_percent": float,  # 涨跌幅 %
-    "popularity_score": float,  # 人气分数
-    "current_rank_change": str, # 排名变化
-}
-
-
-def normalize_hot_rank(raw: Dict[str, Any], source: str = "") -> Dict[str, Any]:
+def _normalize_hot_rank(raw: Dict[str, Any], source: str = "") -> Dict[str, Any]:
     """标准化一条热榜记录"""
     if source == "akshare" or "股票代码" in raw:
         return {
@@ -141,7 +77,6 @@ def normalize_hot_rank(raw: Dict[str, Any], source: str = "") -> Dict[str, Any]:
             "popularity_score": _sf(raw.get("人气值", raw.get("popularity", raw.get("HOT_NUM", raw.get("SCORE"))))),
             "current_rank_change": _ss(raw.get("排名变化", raw.get("rank_change", raw.get("RANK_CHANGE")))),
         }
-
     return {
         "rank": _si(raw.get("rank", raw.get("RANK"))),
         "stock_code": _ss(raw.get("stock_code", raw.get("SECURITY_CODE"))),
@@ -153,29 +88,7 @@ def normalize_hot_rank(raw: Dict[str, Any], source: str = "") -> Dict[str, Any]:
     }
 
 
-# ================================================================
-# 涨停池 / 跌停池 / 炸板池
-# ================================================================
-
-ZT_POOL_SCHEMA = {
-    "stock_code": str,
-    "stock_name": str,
-    "trade_date": str,
-    "price": float,
-    "change_percent": float,
-    "continuous_zt_days": int,   # 连板天数
-    "zt_time": str,              # 涨停时间
-    "seal_amount": float,        # 封板资金
-    "turnover_rate": float,
-    "volume": float,
-    "amount": float,
-    "sector": str,               # 所属板块
-    "reason": str,               # 涨停原因
-    "open_count": int,           # 炸板次数
-}
-
-
-def normalize_zt_pool(raw: Dict[str, Any], source: str = "", trade_date: str = "") -> Dict[str, Any]:
+def _normalize_zt_pool(raw: Dict[str, Any], source: str = "", trade_date: str = "") -> Dict[str, Any]:
     """标准化涨停池记录"""
     if source == "akshare" or "代码" in raw:
         return {
@@ -194,7 +107,6 @@ def normalize_zt_pool(raw: Dict[str, Any], source: str = "", trade_date: str = "
             "reason": _ss(raw.get("涨停原因", raw.get("reason"))),
             "open_count": _si(raw.get("炸板次数", raw.get("open_count", 0))),
         }
-
     return {
         "stock_code": _ss(raw.get("stock_code", raw.get("SECURITY_CODE"))),
         "stock_name": _ss(raw.get("stock_name", raw.get("SECURITY_NAME_ABBR"))),
@@ -213,7 +125,7 @@ def normalize_zt_pool(raw: Dict[str, Any], source: str = "", trade_date: str = "
     }
 
 
-def normalize_dt_pool(raw: Dict[str, Any], source: str = "", trade_date: str = "") -> Dict[str, Any]:
+def _normalize_dt_pool(raw: Dict[str, Any], source: str = "", trade_date: str = "") -> Dict[str, Any]:
     """标准化跌停池记录"""
     if source == "akshare" or "代码" in raw:
         return {
@@ -226,7 +138,6 @@ def normalize_dt_pool(raw: Dict[str, Any], source: str = "", trade_date: str = "
             "turnover_rate": _sf(raw.get("换手率", raw.get("turnover_rate"))),
             "amount": _sf(raw.get("成交额", raw.get("amount"))),
         }
-
     return {
         "stock_code": _ss(raw.get("stock_code", raw.get("SECURITY_CODE"))),
         "stock_name": _ss(raw.get("stock_name", raw.get("SECURITY_NAME_ABBR"))),
@@ -239,7 +150,7 @@ def normalize_dt_pool(raw: Dict[str, Any], source: str = "", trade_date: str = "
     }
 
 
-def normalize_broken_board(raw: Dict[str, Any], source: str = "", trade_date: str = "") -> Dict[str, Any]:
+def _normalize_broken_board(raw: Dict[str, Any], source: str = "", trade_date: str = "") -> Dict[str, Any]:
     """标准化炸板池记录"""
     if source == "akshare" or "代码" in raw:
         return {
@@ -253,7 +164,6 @@ def normalize_broken_board(raw: Dict[str, Any], source: str = "", trade_date: st
             "turnover_rate": _sf(raw.get("换手率", raw.get("turnover_rate"))),
             "amount": _sf(raw.get("成交额", raw.get("amount"))),
         }
-
     return {
         "stock_code": _ss(raw.get("stock_code", raw.get("SECURITY_CODE"))),
         "stock_name": _ss(raw.get("stock_name", raw.get("SECURITY_NAME_ABBR"))),
@@ -267,75 +177,178 @@ def normalize_broken_board(raw: Dict[str, Any], source: str = "", trade_date: st
     }
 
 
-# ================================================================
-# 市场快照
-# ================================================================
+# ══════════════════════════════════════════════════════════════
+#  HTTP 东财搜索 — 主数据源 (正本: eastmoney_search.py)
+# ══════════════════════════════════════════════════════════════
 
-MARKET_SNAPSHOT_SCHEMA = {
-    "up_count": int,          # 上涨家数
-    "down_count": int,        # 下跌家数
-    "flat_count": int,        # 平盘家数
-    "limit_up": int,          # 涨停家数
-    "limit_down": int,        # 跌停家数
-    "total_amount": float,    # 总成交额 (亿元)
-    "emotion": int,           # 情绪指标 0-100
-    "north_net_flow": float,  # 北向净流入 (亿元)
-}
-
-
-def normalize_market_snapshot(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """标准化市场快照"""
-    up = _si(raw.get("up_count", 0))
-    down = _si(raw.get("down_count", 0))
-    total = up + down
-    emotion = _si(raw.get("emotion", -1))
-    if emotion < 0:
-        emotion = int(up / total * 100) if total > 0 else 50
-
-    return {
-        "up_count": up,
-        "down_count": down,
-        "flat_count": _si(raw.get("flat_count", 0)),
-        "limit_up": _si(raw.get("limit_up", 0)),
-        "limit_down": _si(raw.get("limit_down", 0)),
-        "total_amount": _sf(raw.get("total_amount", 0)),
-        "emotion": emotion,
-        "north_net_flow": _sf(raw.get("north_net_flow", 0)),
-    }
+def _em_search(keyword: str, page_size: int = 200) -> List[Dict[str, Any]]:
+    """调东财智能选股搜索，返回股票列表（失败返回空列表）"""
+    from app.market_cn.eastmoney_search import search_stocks
+    try:
+        raw = search_stocks(keyword=keyword, page_size=page_size)
+        return raw.get("stocks", []) if raw.get("code") == 1 else []
+    except Exception as e:
+        logger.warning("[东财搜索] '%s' 失败: %s", keyword, e)
+        return []
 
 
-# ================================================================
-# 数据校验
-# ================================================================
+# ══════════════════════════════════════════════════════════════
+#  AkShare — 兜底数据源
+# ══════════════════════════════════════════════════════════════
 
-def validate_dragon_tiger(item: Dict) -> bool:
-    """校验龙虎榜记录是否有效"""
-    return bool(item.get("stock_code")) and bool(item.get("trade_date"))
-
-
-def validate_hot_rank(item: Dict) -> bool:
-    """校验热榜记录是否有效"""
-    return bool(item.get("stock_code"))
+def _import_akshare():
+    import akshare as ak
+    return ak
 
 
-def validate_zt_pool(item: Dict) -> bool:
-    """校验涨停池记录是否有效"""
-    return bool(item.get("stock_code")) and item.get("change_percent", 0) > 0
+def _ak_dragon_tiger(start_date: str, end_date: str) -> List[Dict[str, Any]]:
+    ak = _import_akshare()
+    get_akshare_limiter().wait()
+    try:
+        df = ak.stock_dragon_tiger_em(start_date=start_date, end_date=end_date)
+    except Exception as e:
+        logger.debug("[AkShare] dragon_tiger failed: %s", e)
+        return []
+    if df is None or df.empty:
+        return []
+    raw_list = df.to_dict("records")
+    result = [r for r in _normalize_dragon_tiger_list(raw_list, source="akshare")
+              if r.get("stock_code") and r.get("trade_date")]
+    logger.info("[AkShare] dragon_tiger %s~%s: %d records", start_date, end_date, len(result))
+    return result
 
 
-def validate_dt_pool(item: Dict) -> bool:
-    """校验跌停池记录是否有效"""
-    return bool(item.get("stock_code")) and item.get("change_percent", 0) < 0
+def _ak_zt_pool(trade_date: str) -> List[Dict[str, Any]]:
+    ak = _import_akshare()
+    get_akshare_limiter().wait()
+    try:
+        df = ak.stock_zt_pool_em(date=trade_date.replace("-", ""))
+    except Exception as e:
+        logger.debug("[AkShare] zt_pool failed: %s", e)
+        return []
+    if df is None or df.empty:
+        return []
+    result = []
+    for _, row in df.iterrows():
+        raw = row.to_dict()
+        item = _normalize_zt_pool(raw, source="akshare", trade_date=trade_date)
+        if item.get("stock_code"):
+            result.append(item)
+    logger.info("[AkShare] zt_pool %s: %d stocks", trade_date, len(result))
+    return result
 
 
-def validate_broken_board(item: Dict) -> bool:
-    """校验炸板池记录是否有效"""
-    return bool(item.get("stock_code"))
+def _ak_dt_pool(trade_date: str) -> List[Dict[str, Any]]:
+    ak = _import_akshare()
+    get_akshare_limiter().wait()
+    try:
+        df = ak.stock_zt_pool_dtgc_em(date=trade_date.replace("-", ""))
+    except Exception as e:
+        logger.debug("[AkShare] dt_pool failed: %s", e)
+        return []
+    if df is None or df.empty:
+        return []
+    result = []
+    for _, row in df.iterrows():
+        raw = row.to_dict()
+        item = _normalize_dt_pool(raw, source="akshare", trade_date=trade_date)
+        if item.get("stock_code"):
+            result.append(item)
+    logger.info("[AkShare] dt_pool %s: %d stocks", trade_date, len(result))
+    return result
 
 
-# ================================================================
-# 公开别名 — 供外部模块统一引用
-# ================================================================
-safe_float = _sf
-safe_int = _si
-safe_str = _ss
+def _ak_broken_board(trade_date: str) -> List[Dict[str, Any]]:
+    ak = _import_akshare()
+    get_akshare_limiter().wait()
+    try:
+        df = ak.stock_zt_pool_zbgc_em(date=trade_date.replace("-", ""))
+    except Exception as e:
+        logger.debug("[AkShare] broken_board failed: %s", e)
+        return []
+    if df is None or df.empty:
+        return []
+    result = []
+    for _, row in df.iterrows():
+        raw = row.to_dict()
+        item = _normalize_broken_board(raw, source="akshare", trade_date=trade_date)
+        if item.get("stock_code"):
+            result.append(item)
+    logger.info("[AkShare] broken_board %s: %d stocks", trade_date, len(result))
+    return result
+
+
+def _ak_hot_rank() -> List[Dict[str, Any]]:
+    ak = _import_akshare()
+    get_akshare_limiter().wait()
+    try:
+        df = ak.stock_hot_rank_em()
+    except Exception as e:
+        logger.debug("[AkShare] hot_rank_em failed: %s", e)
+        return []
+    if df is None or df.empty:
+        return []
+    result = []
+    for _, row in df.iterrows():
+        raw = row.to_dict()
+        item = _normalize_hot_rank(raw, source="akshare")
+        if item.get("stock_code"):
+            result.append(item)
+    logger.info("[AkShare] hot_rank: %d stocks", len(result))
+    return result
+
+
+# ══════════════════════════════════════════════════════════════
+#  统一接口 — HTTP 优先，AkShare 兜底
+# ══════════════════════════════════════════════════════════════
+
+def get_dragon_tiger(start_date: str = "", end_date: str = "") -> List[Dict[str, Any]]:
+    """获取龙虎榜数据。HTTP 东财搜索优先，AkShare 兜底。"""
+    # HTTP 优先
+    data = _em_search("龙虎榜", 200)
+    if data:
+        logger.info("[HTTP] dragon_tiger: %d stocks", len(data))
+        return data
+    # AkShare 兜底
+    logger.info("[HTTP] dragon_tiger 无结果，回退 AkShare")
+    return _ak_dragon_tiger(start_date, end_date)
+
+
+def get_zt_pool(trade_date: str = "") -> List[Dict[str, Any]]:
+    """获取涨停池。HTTP 东财搜索优先，AkShare 兜底。"""
+    data = _em_search("涨停", 200)
+    if data:
+        logger.info("[HTTP] zt_pool: %d stocks", len(data))
+        return data
+    logger.info("[HTTP] zt_pool 无结果，回退 AkShare")
+    return _ak_zt_pool(trade_date)
+
+
+def get_dt_pool(trade_date: str = "") -> List[Dict[str, Any]]:
+    """获取跌停池。HTTP 东财搜索优先，AkShare 兜底。"""
+    data = _em_search("跌停", 200)
+    if data:
+        logger.info("[HTTP] dt_pool: %d stocks", len(data))
+        return data
+    logger.info("[HTTP] dt_pool 无结果，回退 AkShare")
+    return _ak_dt_pool(trade_date)
+
+
+def get_broken_board(trade_date: str = "") -> List[Dict[str, Any]]:
+    """获取炸板池。HTTP 东财搜索优先，AkShare 兜底。"""
+    data = _em_search("炸板", 200)
+    if data:
+        logger.info("[HTTP] broken_board: %d stocks", len(data))
+        return data
+    logger.info("[HTTP] broken_board 无结果，回退 AkShare")
+    return _ak_broken_board(trade_date)
+
+
+def get_hot_rank() -> List[Dict[str, Any]]:
+    """获取热榜。HTTP 东财搜索优先，AkShare 兜底。"""
+    data = _em_search("热门股票", 100)
+    if data:
+        logger.info("[HTTP] hot_rank: %d stocks", len(data))
+        return data
+    logger.info("[HTTP] hot_rank 无结果，回退 AkShare")
+    return _ak_hot_rank()

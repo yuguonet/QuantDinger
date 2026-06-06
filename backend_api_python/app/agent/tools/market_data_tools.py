@@ -3,22 +3,16 @@
 Market Data Tools — 龙虎榜、热榜、涨跌停池、资金流向。
 
 从 stock_screener_tools.py 拆分而来，专注于市场数据查询工具。
-数据源：东方财富搜索 API + AkShare fallback。
+数据源：东财搜索 (eastmoney_search) + dragon_limit (HTTP+AkShare)。
 """
 from __future__ import annotations
 
 import logging
-import random
-import string
-import time
 from typing import Any, Dict, List, Optional
 
-import requests
 from app.agent.tools.registry import tool
 
 logger = logging.getLogger(__name__)
-
-_EASTMONEY_SEARCH_URL = "https://np-tjxg-b.eastmoney.com/api/smart-tag/stock/v3/pw/search-code"
 
 # ══════════════════════════════════════════════════════════════
 #  通用辅助
@@ -45,99 +39,37 @@ def _yesterday_str() -> str:
         d -= timedelta(days=1)
     return d.strftime("%Y-%m-%d")
 
-def _gen_id(length: int = 32) -> str:
-    chars = string.ascii_lowercase + string.digits
-    return "".join(random.choice(chars) for _ in range(length))
-
-def _safe_float(val) -> Optional[float]:
-    if val is None or val == "" or val == "-" or val == "--":
-        return None
-    try:
-        return float(val)
-    except (ValueError, TypeError):
-        return None
-
-def _call_eastmoney_api(keyword: str, page_size: int = 200, page_no: int = 1) -> Dict[str, Any]:
-    """调用东方财富 search-code API。"""
-    body = {
-        "needAmbiguousSuggest": True,
-        "pageSize": page_size,
-        "pageNo": page_no,
-        "fingerprint": _gen_id(32),
-        "matchWord": "",
-        "shareToGuba": False,
-        "timestamp": str(int(time.time() * 1000)),
-        "requestId": _gen_id(32) + str(int(time.time() * 1000)),
-        "removedConditionIdList": [],
-        "ownSelectAll": False,
-        "needCorrect": True,
-        "client": "WEB",
-        "product": "",
-        "needShowStockNum": False,
-        "biz": "web_ai_select_stocks",
-        "xcId": "",
-        "gids": [],
-        "dxInfoNew": [],
-        "keyWordNew": keyword,
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    }
-    try:
-        resp = requests.post(_EASTMONEY_SEARCH_URL, json=body, headers=headers, timeout=15)
-        resp.raise_for_status()
-        return resp.json()
-    except requests.RequestException as e:
-        logger.error("EastMoney API request failed: %s", e)
-        return {"code": -1, "msg": f"请求东方财富API失败: {e}"}
-
 def _em_search(keyword: str, page_size: int = 100) -> List[Dict[str, Any]]:
     """东财搜索封装，返回股票列表或空列表。"""
+    from app.market_cn.eastmoney_search import search_stocks
     try:
-        from app.market_cn.eastmoney_search import search_stocks
         raw = search_stocks(keyword=keyword, page_size=page_size)
         return raw.get("stocks", []) if raw.get("code") == 1 else []
     except Exception as e:
         logger.warning("[东财搜索] '%s' 失败: %s", keyword, e)
         return []
 
-# ── AkShare fallback ──
+# ── 统一数据源: dragon_limit (HTTP 优先, AkShare 兜底) ──
 
-def _ak_dragon_tiger(start_date: str, end_date: str) -> List[Dict[str, Any]]:
-    try:
-        from app.data_sources.akshare import fetch_akshare_dragon_tiger
-        return fetch_akshare_dragon_tiger(start_date, end_date)
-    except Exception:
-        return []
+def _dl_dragon_tiger(start_date: str, end_date: str) -> List[Dict[str, Any]]:
+    from app.market_cn.dragon_limit import get_dragon_tiger
+    return get_dragon_tiger(start_date, end_date)
 
-def _ak_zt_pool(trade_date: str) -> List[Dict[str, Any]]:
-    try:
-        from app.data_sources.akshare import fetch_akshare_zt_pool
-        return fetch_akshare_zt_pool(trade_date)
-    except Exception:
-        return []
+def _dl_zt_pool(trade_date: str) -> List[Dict[str, Any]]:
+    from app.market_cn.dragon_limit import get_zt_pool
+    return get_zt_pool(trade_date)
 
-def _ak_dt_pool(trade_date: str) -> List[Dict[str, Any]]:
-    try:
-        from app.data_sources.akshare import fetch_akshare_dt_pool
-        return fetch_akshare_dt_pool(trade_date)
-    except Exception:
-        return []
+def _dl_dt_pool(trade_date: str) -> List[Dict[str, Any]]:
+    from app.market_cn.dragon_limit import get_dt_pool
+    return get_dt_pool(trade_date)
 
-def _ak_broken_board(trade_date: str) -> List[Dict[str, Any]]:
-    try:
-        from app.data_sources.akshare import fetch_akshare_broken_board
-        return fetch_akshare_broken_board(trade_date)
-    except Exception:
-        return []
+def _dl_broken_board(trade_date: str) -> List[Dict[str, Any]]:
+    from app.market_cn.dragon_limit import get_broken_board
+    return get_broken_board(trade_date)
 
-def _ak_hot_rank() -> List[Dict[str, Any]]:
-    try:
-        from app.data_sources.akshare import fetch_akshare_hot_rank
-        return fetch_akshare_hot_rank()
-    except Exception:
-        return []
+def _dl_hot_rank() -> List[Dict[str, Any]]:
+    from app.market_cn.dragon_limit import get_hot_rank
+    return get_hot_rank()
 
 # ══════════════════════════════════════════════════════════════
 #  工具函数
@@ -173,12 +105,10 @@ def get_dragon_tiger(stock_code: str = "", date: str = "", days: int = 30) -> Di
         days = max(1, min(days, 365))
         start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
 
-        raw = _em_search(f"{stock_code.strip()} 龙虎榜", 30)
-        data = [s for s in raw if stock_code.strip() in str(s.get("code", ""))]
-        if not data:
-            all_data = _ak_dragon_tiger(start_date, date)
-            code = stock_code.strip().replace(".", "").upper()
-            data = [r for r in all_data if str(r.get("stock_code", "")).replace(".", "").upper() == code]
+        all_data = _dl_dragon_tiger(start_date, date)
+        code = stock_code.strip().replace(".", "").upper()
+        data = [r for r in all_data if str(r.get("stock_code", "")).replace(".", "").upper() == code
+                or stock_code.strip() in str(r.get("code", ""))]
 
         return {"stock_code": stock_code, "days": days, "count": len(data), "records": data}
     else:
@@ -190,9 +120,7 @@ def get_dragon_tiger(stock_code: str = "", date: str = "", days: int = 30) -> Di
         if days > 1:
             start_date = (datetime.strptime(date, "%Y-%m-%d") - timedelta(days=days - 1)).strftime("%Y-%m-%d")
 
-        data = _em_search("龙虎榜", 100)
-        if not data:
-            data = _ak_dragon_tiger(start_date, date)
+        data = _dl_dragon_tiger(start_date, date)
         return {"date": date, "days": days, "count": len(data), "stocks": data}
 
 @tool(
@@ -208,9 +136,7 @@ def get_hot_rank(top_n: int = 30) -> Dict[str, Any]:
         top_n: 返回前N名，默认30，最大100
     """
     top_n = min(max(int(top_n or 30), 1), 100)
-    data = _em_search("热门股票", top_n)
-    if not data:
-        data = _ak_hot_rank()
+    data = _dl_hot_rank()
     return {"count": len(data[:top_n]), "stocks": data[:top_n]}
 
 @tool(
@@ -234,9 +160,7 @@ def get_zt_pool(date: str = "", min_continuous_days: int = 0) -> Dict[str, Any]:
         date = _today_str()
     min_continuous_days = max(0, int(min_continuous_days or 0))
 
-    data = _em_search("涨停", 100)
-    if not data:
-        data = _ak_zt_pool(date)
+    data = _dl_zt_pool(date)
     if min_continuous_days > 0:
         data = [r for r in data if int(r.get("continuous_zt_days", 0) or 0) >= min_continuous_days]
 
@@ -281,9 +205,7 @@ def get_limit_down(date: str = "") -> Dict[str, Any]:
     if not date:
         date = _today_str()
 
-    data = _em_search("跌停", 100)
-    if not data:
-        data = _ak_dt_pool(date)
+    data = _dl_dt_pool(date)
     return {"date": date, "count": len(data), "stocks": data}
 
 @tool(
@@ -305,9 +227,7 @@ def get_broken_board(date: str = "") -> Dict[str, Any]:
     if not date:
         date = _today_str()
 
-    data = _em_search("炸板", 100)
-    if not data:
-        data = _ak_broken_board(date)
+    data = _dl_broken_board(date)
     return {"date": date, "count": len(data), "stocks": data}
 
 @tool(
@@ -343,7 +263,6 @@ def get_fund_flow(stock_codes: str = "") -> Dict[str, Any]:
         return {"error": f"单次最多20只，当前 {len(codes)} 只", "retriable": False}
 
     if len(codes) == 1:
-        # 单只
         code = codes[0]
         stocks = _em_search(f"{code.strip()} 资金流向", 5)
         if stocks:
@@ -355,7 +274,6 @@ def get_fund_flow(stock_codes: str = "") -> Dict[str, Any]:
             }
         return {"code": code, "name": "", "net_flow": 0, "main_flow": 0, "retail_flow": 0}
     else:
-        # 批量
         result = {}
         for code in codes:
             stocks = _em_search(f"{code.strip()} 资金流向", 5)
@@ -413,9 +331,3 @@ def get_concept_fund_flow(date: str = "") -> Dict[str, Any]:
 
     data = _em_search("概念资金流向", 30)
     return {"date": date, "count": len(data), "concepts": data}
-
-# ══════════════════════════════════════════════════════════════
-#  工具声明
-# ══════════════════════════════════════════════════════════════
-
-# Legacy list — kept for backward compat during migration; safe to remove later.

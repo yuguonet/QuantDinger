@@ -3,16 +3,12 @@
 Screener Tools — Agent 选股工具。
 
 合并原 screen_stocks + smart_screen 为统一的 search_stocks。
-数据源：东方财富智能选股 API + 本地 DB fallback。
+数据源：eastmoney_search.search_stocks (东财智能选股) + 本地 DB fallback。
 """
 from __future__ import annotations
 
-import json
 import logging
-import time
 from typing import Any, Dict, List, Optional
-
-import requests
 
 from app.agent.tools.screener_config import MARKET_FILTER_MAP
 from app.agent.tools.screener_filters import (
@@ -23,93 +19,83 @@ from app.agent.tools.registry import tool
 
 logger = logging.getLogger(__name__)
 
-_EASTMONEY_SEARCH_URL = "https://np-tjxg-b.eastmoney.com/api/smart-tag/stock/v3/pw/search-code"
-
 # ══════════════════════════════════════════════════════════════
-#  东方财富 API 调用
+#  东方财富 API 调用 (正本: eastmoney_search.py)
 # ══════════════════════════════════════════════════════════════
-
-def _gen_id(length: int = 32) -> str:
-    import random, string
-    chars = string.ascii_lowercase + string.digits
-    return "".join(random.choice(chars) for _ in range(length))
-
-def _safe_float(val) -> Optional[float]:
-    if val is None or val == "" or val == "-" or val == "--":
-        return None
-    try:
-        return float(val)
-    except (ValueError, TypeError):
-        return None
-
-def _call_eastmoney_api(keyword: str, page_size: int = 200, page_no: int = 1) -> Dict[str, Any]:
-    """调用东方财富 search-code API。"""
-    body = {
-        "needAmbiguousSuggest": True,
-        "pageSize": page_size,
-        "pageNo": page_no,
-        "fingerprint": _gen_id(32),
-        "matchWord": "",
-        "shareToGuba": False,
-        "timestamp": str(int(time.time() * 1000)),
-        "requestId": _gen_id(32) + str(int(time.time() * 1000)),
-        "removedConditionIdList": [],
-        "ownSelectAll": False,
-        "needCorrect": True,
-        "client": "WEB",
-        "product": "",
-        "needShowStockNum": False,
-        "biz": "web_ai_select_stocks",
-        "xcId": "",
-        "gids": [],
-        "dxInfoNew": [],
-        "keyWordNew": keyword,
-        "customDataNew": json.dumps([{"type": "text", "value": keyword, "extra": ""}]),
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    }
-    try:
-        resp = requests.post(_EASTMONEY_SEARCH_URL, json=body, headers=headers, timeout=15)
-        resp.raise_for_status()
-        return resp.json()
-    except requests.RequestException as e:
-        logger.error("EastMoney API request failed: %s", e)
-        return {"code": -1, "msg": f"请求东方财富API失败: {e}"}
-
-def _parse_stock_item(item: Dict[str, Any]) -> Dict[str, Any]:
-    """将东方财富返回的单只股票解析为标准格式。"""
-    return {
-        "code": item.get("SECURITY_CODE", ""),
-        "name": item.get("SECURITY_SHORT_NAME", ""),
-        "industry": item.get("INDUSTRY", ""),
-        "concept": item.get("CONCEPT", ""),
-        "new_price": _safe_float(item.get("NEWEST_PRICE")),
-        "change_rate": _safe_float(item.get("CHG")),
-        "high_price": _safe_float(item.get("HIGH_PRICE")),
-        "low_price": _safe_float(item.get("LOW_PRICE")),
-        "pre_close_price": _safe_float(item.get("PRE_CLOSE_PRICE")),
-        "volume": _safe_float(item.get("TRADE_VOLUME")),
-        "deal_amount": item.get("TRADING_VOLUMES") or item.get("TRADE_AMOUNT"),
-        "volume_ratio": item.get("QRR"),
-        "turnover_rate": _safe_float(item.get("TURNOVER_RATE")),
-        "amplitude": _safe_float(item.get("AMPLITUDE")),
-        "pe_dynamic": item.get("PE_DYNAMIC") or item.get("PE9"),
-        "pb_mrq": item.get("PB_NEW_MRQ"),
-        "total_market_cap": item.get("TOEAL_MARKET_VALUE") or item.get("TOTAL_MARKET_CAP"),
-        "free_cap": item.get("FREE_CAP"),
-    }
 
 def _em_search(keyword: str, page_size: int = 100) -> List[Dict[str, Any]]:
-    """东财搜索封装。"""
+    """东财搜索封装，返回股票列表或空列表。"""
+    from app.market_cn.eastmoney_search import search_stocks
     try:
-        from app.market_cn.eastmoney_search import search_stocks
         raw = search_stocks(keyword=keyword, page_size=page_size)
         return raw.get("stocks", []) if raw.get("code") == 1 else []
     except Exception as e:
         logger.warning("[东财搜索] '%s' 失败: %s", keyword, e)
         return []
+
+def _call_eastmoney_api(keyword: str, page_size: int = 200, page_no: int = 1) -> Dict[str, Any]:
+    """调东财搜索，返回原始 API 响应（code=100 格式）。供 search_stocks 的 eastmoney 模式使用。"""
+    from app.market_cn.eastmoney_search import search_stocks
+    # eastmoney_search.search_stocks 返回 code=1 格式，需要转换回原始 API 格式
+    result = search_stocks(keyword=keyword, page_size=page_size, page_no=page_no)
+    if result.get("code") == 1:
+        # 转换为原始东财 API 响应格式
+        return {
+            "code": "100",
+            "data": {
+                "result": {
+                    "dataList": [
+                        {
+                            "SECURITY_CODE": s.get("code", ""),
+                            "SECURITY_SHORT_NAME": s.get("name", ""),
+                            "INDUSTRY": s.get("industry", ""),
+                            "CONCEPT": s.get("concept", ""),
+                            "NEWEST_PRICE": s.get("new_price"),
+                            "CHG": s.get("change_rate"),
+                            "HIGH_PRICE": s.get("high_price"),
+                            "LOW_PRICE": s.get("low_price"),
+                            "PRE_CLOSE_PRICE": s.get("pre_close_price"),
+                            "TRADE_VOLUME": s.get("volume"),
+                            "TRADING_VOLUMES": s.get("deal_amount"),
+                            "QRR": s.get("volume_ratio"),
+                            "TURNOVER_RATE": s.get("turnoverrate"),
+                            "AMPLITUDE": s.get("amplitude"),
+                            "PE_DYNAMIC": s.get("pe9"),
+                            "PB_NEW_MRQ": s.get("pbnewmrq"),
+                            "TOEAL_MARKET_VALUE": s.get("total_market_cap"),
+                            "FREE_CAP": s.get("free_cap"),
+                        }
+                        for s in result.get("stocks", [])
+                    ],
+                    "total": result.get("total", 0),
+                },
+            },
+        }
+    return {"code": "0", "msg": result.get("msg", "搜索失败")}
+
+def _parse_stock_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    """将东方财富返回的单只股票解析为标准格式。"""
+    from app.data_sources.normalizer import safe_float as _sf
+    return {
+        "code": item.get("SECURITY_CODE", ""),
+        "name": item.get("SECURITY_SHORT_NAME", ""),
+        "industry": item.get("INDUSTRY", ""),
+        "concept": item.get("CONCEPT", ""),
+        "new_price": _sf(item.get("NEWEST_PRICE")),
+        "change_rate": _sf(item.get("CHG")),
+        "high_price": _sf(item.get("HIGH_PRICE")),
+        "low_price": _sf(item.get("LOW_PRICE")),
+        "pre_close_price": _sf(item.get("PRE_CLOSE_PRICE")),
+        "volume": _sf(item.get("TRADE_VOLUME")),
+        "deal_amount": item.get("TRADING_VOLUMES") or item.get("TRADE_AMOUNT"),
+        "volume_ratio": item.get("QRR"),
+        "turnover_rate": _sf(item.get("TURNOVER_RATE")),
+        "amplitude": _sf(item.get("AMPLITUDE")),
+        "pe_dynamic": item.get("PE_DYNAMIC") or item.get("PE9"),
+        "pb_mrq": item.get("PB_NEW_MRQ"),
+        "total_market_cap": item.get("TOEAL_MARKET_VALUE") or item.get("TOTAL_MARKET_CAP"),
+        "free_cap": item.get("FREE_CAP"),
+    }
 
 # ══════════════════════════════════════════════════════════════
 #  核心选股工具

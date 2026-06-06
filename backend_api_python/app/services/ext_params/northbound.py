@@ -18,6 +18,7 @@ import logging
 import requests
 
 from . import provider
+from app.data_sources.normalizer import safe_float as _safe_float
 
 logger = logging.getLogger(__name__)
 
@@ -39,13 +40,6 @@ def _to_secid(symbol: str) -> str:
     return f'0.{s}'
 
 
-def _safe_float(val, default=0.0):
-    try:
-        if val is None or val == '' or val == '-':
-            return default
-        return float(val)
-    except (TypeError, ValueError):
-        return default
 
 
 def _fetch_north_hold(symbol: str, days: int = 10) -> list:

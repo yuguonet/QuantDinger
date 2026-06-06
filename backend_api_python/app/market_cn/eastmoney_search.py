@@ -1,18 +1,24 @@
 """
-东财智能选股搜索 — 后端代理
+东财智能选股搜索 — 正本 (single source of truth)
 
-将前端直接调东财 search-code 的请求收到后端，避免 CORS 限制。
+所有东财 search-code API 调用统一经此模块。
+被以下模块引用:
+  - app.market_cn.dragon_limit (龙虎榜/涨跌停池)
+  - app.market_cn.cards.* (前端卡片)
+  - app.agent.tools.market_data_tools (Agent 工具)
+  - app.agent.tools.screener_tools (选股工具)
+
 前端调用: GET /api/shichang/search?keyword=xxx&page_size=200
 """
 
 import json
-import random
-import string
 import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import requests
+
+from app.data_sources.normalizer import safe_float as _safe_float
 
 logger = logging.getLogger(__name__)
 
@@ -21,17 +27,8 @@ _EM_SEARCH_URL = "https://np-tjxg-b.eastmoney.com/api/smart-tag/stock/v3/pw/sear
 
 
 def _gen_id(length: int = 32) -> str:
-    chars = string.ascii_lowercase + string.digits
-    return "".join(random.choice(chars) for _ in range(length))
-
-
-def _safe_float(val) -> Optional[float]:
-    if val is None or val == "" or val == "-" or val == "--":
-        return None
-    try:
-        return float(val)
-    except (ValueError, TypeError):
-        return None
+    import random, string
+    return "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(length))
 
 
 def search_stocks(

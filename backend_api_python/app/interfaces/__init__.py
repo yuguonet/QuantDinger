@@ -1,18 +1,8 @@
 """
 A股接口层 (interfaces)
 
-统一数据访问入口，包含:
-- AShareDataHub: 主入口 (cn_stock_hub.py) — 组合所有 Interface 对象
-- AStockDataSource: 多源 A股数据源 (data_sources/a_stock.py)
-- IndexInterface: 指数行情
-- MarketSnapshotInterface: 市场快照
-- StockInfoInterface: 个股信息
-- StockFundFlowInterface: 个股资金流
-- FundFlowInterface: 板块资金流
-- DragonTigerInterface: 龙虎榜 (多源)
-- HotRankInterface: 热榜 (多源)
-- ZTPoolInterface: 涨停池 (多源)
-- LimitDownInterface: 跌停池 (多源)
-- BrokenBoardInterface: 炸板池 (多源)
-"""
+缓存文件、情绪调度器等辅助模块。
 
+龙虎榜/涨跌停池/热榜 → app.market_cn.dragon_limit
+资金流向/市场数据     → app.agent.tools.market_data_tools
+"""

@@ -163,69 +163,9 @@ class BaseDataSource(ABC):
         
         return klines
     
-    # ── A-Share specific methods (for market dashboard / stock picker) ──
-    # Default implementations return empty or raise NotImplementedError.
-    # Equant data sources (akshare, eastmoney, tushare) override these.
-
-    def get_index_quotes(self, codes: List[str]) -> List[Dict[str, Any]]:
-        """获取指数实时行情"""
-        raise NotImplementedError
-
-    def get_dragon_tiger(self, start_date: str, end_date: str) -> List[Dict[str, Any]]:
-        """获取龙虎榜数据"""
-        raise NotImplementedError
-
-    def get_hot_rank(self) -> List[Dict[str, Any]]:
-        """获取热榜/人气榜"""
-        raise NotImplementedError
-
-    def get_zt_pool(self, trade_date: str = None) -> List[Dict[str, Any]]:
-        """获取涨停池数据"""
-        raise NotImplementedError
-
-    def get_dt_pool(self, trade_date: str = None) -> List[Dict[str, Any]]:
-        """获取跌停池数据"""
-        raise NotImplementedError
-
-    def get_zt_pool_zbgc(self, trade_date: str = None) -> List[Dict[str, Any]]:
-        """获取炸板池数据"""
-        raise NotImplementedError
-
-    def get_fund_flow(self) -> List[Dict[str, Any]]:
-        """获取板块资金流向"""
-        raise NotImplementedError
-
-    def get_stock_info(self, stock_code: str) -> Dict[str, Any]:
-        """获取个股基本面信息"""
-        raise NotImplementedError
-
-    def get_sector_fund_flow(self) -> List[Dict[str, Any]]:
-        """获取行业板块资金流向"""
-        raise NotImplementedError
-
-    def get_concept_fund_flow(self) -> List[Dict[str, Any]]:
-        """获取概念板块资金流向"""
-        raise NotImplementedError
-
-    def get_all_stock_codes(self) -> List[Dict[str, str]]:
-        """获取所有A股代码列表"""
-        raise NotImplementedError
-
-    def get_limit_down(self, trade_date: str = None) -> List[Dict[str, Any]]:
-        """获取跌停数据"""
-        raise NotImplementedError
-
-    def get_broken_board(self, trade_date: str = None) -> List[Dict[str, Any]]:
-        """获取炸板数据"""
-        raise NotImplementedError
-
-    def get_market_snapshot(self) -> Dict[str, Any]:
-        """获取市场快照（涨跌家数、北向资金、情绪等）"""
-        raise NotImplementedError
-
-    def get_stock_fund_flow(self, stock_code: str) -> Dict[str, Any]:
-        """获取个股资金流向"""
-        raise NotImplementedError
+    # ── A-Share 数据已迁移至独立模块 ──
+    # 龙虎榜/涨跌停池/热榜 → app.market_cn.dragon_limit
+    # 资金流向/市场数据     → app.agent.tools.market_data_tools
 
     def log_result(
         self,

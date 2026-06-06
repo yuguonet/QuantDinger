@@ -23,6 +23,7 @@ import logging
 import requests
 
 from . import provider
+from app.data_sources.normalizer import safe_float as _safe_float
 
 logger = logging.getLogger(__name__)
 
@@ -37,13 +38,6 @@ HEADERS = {
 }
 
 
-def _safe_float(val, default=0.0):
-    try:
-        if val is None or val == '' or val == '-':
-            return default
-        return float(val)
-    except (TypeError, ValueError):
-        return default
 
 
 def _get_hot_concepts(limit=50):

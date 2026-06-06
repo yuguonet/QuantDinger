@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+from app.data_sources.normalizer import safe_float as _safe_float
 from app.agent.tools.registry import tool
 
 logger = logging.getLogger(__name__)
@@ -71,15 +72,6 @@ def _em_datacenter(report_name: str, columns: str = "ALL",
     if d.get("result") and d["result"].get("data"):
         return d["result"]["data"]
     return []
-
-
-def _safe_float(val, default: float = 0.0) -> float:
-    if val is None or val == "" or val == "-" or val == "--":
-        return default
-    try:
-        return float(val)
-    except (ValueError, TypeError):
-        return default
 
 
 def _stock_code_normalize(code: str) -> str:
