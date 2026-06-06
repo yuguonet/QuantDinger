@@ -473,6 +473,11 @@ def learn_from_execution(
     - failure → 记录到 tool_chain_failures.json
     - grey → 不操作
     """
+    # verb 或 noun 为空时跳过学习，避免生成残缺键（如 "analyze+", "+stock"）
+    if not verb or not noun:
+        logger.debug("[Learn] verb 或 noun 为空，跳过学习: verb=%s noun=%s", verb, noun)
+        return
+
     if eval_result.verdict == "success":
         _writeback_chain(eval_result, verb, noun)
     elif eval_result.verdict == "failure":

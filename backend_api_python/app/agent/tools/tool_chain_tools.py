@@ -54,6 +54,9 @@ def write_tool_chain(verb: str, noun: str, chain: List[Dict[str, str]]) -> Dict[
         noun: 对象类别
         chain: 工具列表，格式 [{"tool": "工具名", "desc": "用途"}, ...]
     """
+    if not verb or not noun:
+        return {"error": "verb 和 noun 不能为空", "saved": False}
+
     from app.agent.router.tool_chains import save_tool_chain
     save_tool_chain(verb, noun, chain)
     return {

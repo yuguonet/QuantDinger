@@ -417,8 +417,12 @@ class ChainExecutor:
                     ))
 
                 conn.commit()
+                logger.info(
+                    "[ChainExecutor] 已保存到数据库: execution_id=%d chain=%s stock=%s steps=%d",
+                    execution_id, self.chain_id, self.stock_code, len(result.step_results),
+                )
                 return execution_id
 
         except Exception as e:
-            logger.error("[ChainExecutor] 保存执行记录失败: %s", e)
+            logger.error("[ChainExecutor] 保存执行记录失败: %s", e, exc_info=True)
             return None

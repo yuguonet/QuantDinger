@@ -19,9 +19,21 @@ logger = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════
 
 def _validate_date(date_str: str, param_name: str = "date") -> str:
+    """验证日期格式，支持 'today'/'yesterday' 快捷写法。"""
     if not date_str:
         return date_str
-    from datetime import datetime
+    from datetime import datetime, timedelta
+
+    # 支持快捷写法
+    lower = date_str.strip().lower()
+    if lower in ("today", "今天", "今日"):
+        return datetime.now().strftime("%Y-%m-%d")
+    if lower in ("yesterday", "昨天", "昨日"):
+        d = datetime.now() - timedelta(days=1)
+        while d.weekday() >= 5:
+            d -= timedelta(days=1)
+        return d.strftime("%Y-%m-%d")
+
     try:
         datetime.strptime(date_str, "%Y-%m-%d")
         return date_str

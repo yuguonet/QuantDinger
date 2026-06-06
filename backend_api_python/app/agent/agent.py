@@ -815,14 +815,17 @@ class _AgentExecutor:
     def _try_chain(self, verb, noun, message, session_id, context, user_id):
         """尝试链路执行。匹配到链路时执行并返回 AgentResult，否则返回 None。"""
         if not verb:
+            logger.debug("[Chain] verb 为空，跳过链路")
             return None
 
         try:
             from app.agent.chain.chains import get_chain_for_intent
             chain_def = get_chain_for_intent(verb, noun)
             if not chain_def:
+                logger.debug("[Chain] 未匹配链路: verb=%s noun=%s", verb, noun)
                 return None
-        except Exception:
+        except Exception as e:
+            logger.warning("[Chain] 查找链路异常: %s", e)
             return None
 
         # 提取股票代码

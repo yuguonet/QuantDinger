@@ -49,6 +49,9 @@ def get_tool_chain(verb: str, noun: str) -> List[Dict[str, str]]:
 
 def save_tool_chain(verb: str, noun: str, chain: List[Dict[str, str]]):
     """保存工具链（agent 自主学习后调用）。"""
+    if not verb or not noun:
+        logger.warning("[ToolChains] 拒绝保存残缺键: verb=%s noun=%s", verb, noun)
+        return
     data = _load()
     key = f"{verb}+{noun}"
     data[key] = chain

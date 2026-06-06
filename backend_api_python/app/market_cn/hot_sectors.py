@@ -106,22 +106,35 @@ def _fetch_board_list(board_type="industry", sort_by="f3", sort_dir="desc", limi
         "fields": _INDUSTRY_FIELDS,
     }
 
-    resp = requests.get(url, params=params, headers=HEADERS, timeout=15)
+    try:
+        resp = requests.get(url, params=params, headers=HEADERS, timeout=15)
+    except requests.exceptions.Timeout:
+        logger.error("东方财富 API 请求超时 (15s)")
+        raise
+    except requests.exceptions.ConnectionError as e:
+        logger.error("东方财富 API 连接失败: %s", e)
+        raise
 
     # 检查 HTTP 状态码
     if resp.status_code != 200:
+        logger.error("东方财富 API 返回 HTTP %d, body=%s", resp.status_code, resp.text[:200])
         raise ConnectionError(f"东方财富 API 返回 {resp.status_code}")
 
-    data = resp.json()
+    try:
+        data = resp.json()
+    except Exception as e:
+        logger.error("东方财富 API 返回非 JSON: %s, body=%s", e, resp.text[:200])
+        raise
 
     # 防御 data 或 diff 为 None 的情况
     data_node = data.get("data")
     if not data_node or not isinstance(data_node, dict):
-        logger.warning(f"东方财富 API 返回无 data 节点: {str(data)[:200]}")
+        logger.warning("东方财富 API 返回无 data 节点: rc=%s, msg=%s", data.get("rc"), data.get("msg"))
         return []
 
     items = data_node.get("diff")
     if not items:
+        logger.warning("东方财富 API 返回空 diff: data keys=%s", list(data_node.keys()))
         return []
 
     results = []
@@ -249,6 +262,55 @@ def get_sector_detail(board_code, limit=10):
     return _fetch_sector_stocks(board_code, limit=limit)
 
 
+def _fetch_sina_industry_boards(limit=30):
+    """新浪行业板块（备用数据源）
+
+    数据格式 (13字段):
+      [0]code,[1]name,[2]stock_count,[3]avg_price,[4]change_pct,[5]change_ratio,
+      [6]volume,[7]amount,[8]lead_code,[9]lead_pct,[10]lead_price,[11]lead_change,[12]lead_name
+
+    注意:
+      - change_pct [4] 是小数 (0.05 = 5%)，需要 *100
+      - lead_pct [9] 已经是百分比 (10.084 = 10.08%)，不需要转换
+    """
+    url = "https://vip.stock.finance.sina.com.cn/q/view/newSinaHy.php"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp.encoding = "gbk"
+        text = resp.text
+        # 解析 JS 变量: var S_Finance_bankuai_sinaindustry = {...}
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start < 0 or end <= 0:
+            logger.warning("新浪板块接口返回格式异常")
+            return []
+        import json
+        data = json.loads(text[start:end])
+        results = []
+        for key, val in data.items():
+            parts = val.split(",")
+            if len(parts) < 13:
+                continue
+            change_pct = _safe_num(parts[4]) * 100  # 小数→百分比
+            results.append({
+                "name": parts[1],
+                "code": parts[0],
+                "change_pct": round(change_pct, 2),
+                "price": _safe_num(parts[3]),
+                "amount": _safe_num(parts[7]),
+                "up_count": 0,
+                "down_count": 0,
+                "lead_stock": parts[12],
+                "lead_stock_pct": round(_safe_num(parts[9]), 2),  # 已是百分比
+                "limit_up_count": 0,
+            })
+        results.sort(key=lambda x: -x["change_pct"])
+        return results[:limit]
+    except Exception as e:
+        logger.error("新浪行业板块获取失败: %s", e)
+        return []
+
+
 def get_all_hot_sectors(industry_limit=15, concept_limit=15):
     """获取全部热门板块数据（供 API 使用）"""
     logger.info("热门板块分析: %d 行业 + %d 概念", industry_limit, concept_limit)
@@ -261,6 +323,11 @@ def get_all_hot_sectors(industry_limit=15, concept_limit=15):
         industry = get_hot_industry_boards(industry_limit)
     except Exception as e:
         logger.error("行业板块获取失败: %s", e)
+
+    # 东财失败时降级到新浪
+    if not industry:
+        logger.info("东财行业板块为空，降级到新浪")
+        industry = _fetch_sina_industry_boards(industry_limit)
 
     try:
         concept = get_hot_concept_boards(concept_limit)

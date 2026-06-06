@@ -301,26 +301,16 @@
     ],
     "filter+market": [
         {
-            "tool": "python_interpreter",
-            "desc": ""
-        }
-    ],
-    "analyze+": [
+            "tool": "get_market_indices",
+            "desc": "获取大盘指数"
+        },
         {
-            "tool": "python_interpreter",
-            "desc": ""
-        }
-    ],
-    "+stock": [
+            "tool": "get_hot_sectors",
+            "desc": "获取热门板块"
+        },
         {
-            "tool": "python_interpreter",
-            "desc": ""
-        }
-    ],
-    "+project": [
-        {
-            "tool": "python_interpreter",
-            "desc": ""
+            "tool": "get_zt_pool",
+            "desc": "获取涨停池"
         }
     ]
 }
