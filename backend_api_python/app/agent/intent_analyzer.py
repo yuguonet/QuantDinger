@@ -505,8 +505,8 @@ def _extract_params(message: str, scene: Dict = None) -> Dict[str, Any]:
         candidate = name_match.group(0)
         if candidate not in _stopwords:
             try:
-                from app.routes.market import _search_cn_smart
-                matches = _search_cn_smart(candidate, limit=1)
+                from app.utils.basicinfo_db import get_stock_basic_db
+                matches = get_stock_basic_db().search_stocks(candidate, limit=1)
                 if matches:
                     params["stock"] = matches[0]["symbol"]
                     params["stock_name"] = matches[0].get("name", candidate)

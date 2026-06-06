@@ -507,8 +507,8 @@ def _extract_stock_name(message: str) -> Optional[str]:
         candidate = match.group(0)
         if candidate not in stopwords:
             try:
-                from app.routes.market import _search_cn_smart
-                matches = _search_cn_smart(candidate, limit=1)
+                from app.utils.basicinfo_db import get_stock_basic_db
+                matches = get_stock_basic_db().search_stocks(candidate, limit=1)
                 if matches:
                     return matches[0].get("symbol")
             except Exception:
