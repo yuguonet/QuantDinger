@@ -50,24 +50,14 @@ _tools_cache_lock = __import__("threading").Lock()
 def _get_agent_class():
     """Return the agent class based on AGENT_TYPE env var.
 
-    Auto-detection: if the model is served by Ollama (localhost:11434),
-    default to ToolCallingAgent since local models don't generate code blocks.
+    ⚠️ 确定性修复：不再自动检测。默认使用 CodeAgent，避免同一问题
+    因 CodeAgent/ToolCallingAgent 切换导致结果不一致。
+    用户可通过 AGENT_TYPE=tool 显式切换。
     """
-    agent_type = os.getenv("AGENT_TYPE", "").strip().lower()
+    agent_type = os.getenv("AGENT_TYPE", "code").strip().lower()
     if agent_type == "tool":
         return ToolCallingAgent
-    if agent_type == "code":
-        return CodeAgent
-    # Auto-detect: check if the LLM endpoint is Ollama
-    try:
-        from app.services.llm import LLMService
-        svc = LLMService()
-        base_url = svc.get_base_url(svc.provider)
-        if any(k in base_url for k in ("localhost:11434", "127.0.0.1:11434", "ollama")):
-            logger.info("[Agent] Detected Ollama endpoint (%s), using ToolCallingAgent", base_url)
-            return ToolCallingAgent
-    except Exception as e:
-        logger.debug("[Agent] Ollama auto-detect failed: %s", e)
+    # 默认 CodeAgent，不再自动检测 Ollama
     return CodeAgent
 
 
@@ -179,11 +169,15 @@ def _build_instructions(user_message: str = "", skill_instructions: str = "",
     if domain_instructions:
         domain_section = f"\n## 当前领域: {domain}\n\n{domain_instructions}\n"
 
+    # 客观评分校准注入（如果有）
+    calibration_section = ""
+    # calibration_context 通过外部注入到 user_message 前部
+
     return f"""{preamble}
 
 {GUIDANCE}
 {tool_catalog}
-{skill_section}{scan_section}{modify_section}{intent_section}{domain_section}## 规则
+{skill_section}{scan_section}{modify_section}{intent_section}{domain_section}{calibration_section}## 规则
 
 0. **⚠️ 必须用 final_answer() 返回结果** — 完成任务后，必须调用 `final_answer(你的回复)` 来结束。
 1. **不需要工具的消息，第一步就 final_answer** — 打招呼、闲聊等直接调用 final_answer。
@@ -194,6 +188,10 @@ def _build_instructions(user_message: str = "", skill_instructions: str = "",
 6. **多维验证** — 技术面结论至少 2 个指标相互验证。
 7. **善用工具** — 可以组合工具做计算、处理数据。
 8. **诚实透明** — 数据不足时明确告知，不猜测。
+9. **⚠️ 数据完整性** — 如果某个工具调用失败（返回 error），必须在结论中说明
+   "XX数据缺失，以下结论仅供参考"。绝不用想象填补缺失数据。
+10. **⚠️ 确定性输出** — 你的分析必须基于工具返回的客观数据，不能因为"感觉"
+    或"可能"而改变方向性判断。同样的数据必须得出同样的结论。
 {lang_section}"""
 
 
@@ -649,6 +647,20 @@ class _AgentExecutor:
                 ctx_parts.append(f"[已获取的实时行情]\n{json.dumps(context['realtime_quote'], ensure_ascii=False)[:2000]}")
             if context.get("chip_distribution"):
                 ctx_parts.append(f"[已获取的筹码分布]\n{json.dumps(context['chip_distribution'], ensure_ascii=False)[:2000]}")
+
+        # 数据完整性预检：标记缺失的数据维度
+        _missing_data_hints = []
+        if context:
+            if not context.get("realtime_quote"):
+                _missing_data_hints.append("实时行情")
+            if not context.get("chip_distribution"):
+                _missing_data_hints.append("筹码分布")
+        if _missing_data_hints:
+            ctx_parts.append(
+                f"[数据完整性提示] 以下数据在请求时尚未提供，你需要在分析时主动获取: "
+                f"{', '.join(_missing_data_hints)}。如果工具调用失败，必须在结论中说明。"
+            )
+
         if ctx_parts:
             enriched = "\n".join(ctx_parts) + "\n\n" + message
 

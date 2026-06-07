@@ -398,6 +398,31 @@ def _clean_output(text: str) -> str:
     return text.strip()
 
 
+# ── 方向性关键词净化（防止跨轮次结论污染）──────────────────
+_DIRECTIONAL_PATTERNS = re.compile(
+    r'(?:建议|推荐|操作建议|短线建议|最终建议)\s*[:：]\s*(?:买入|卖出|加仓|减仓|观望|持有)',
+    re.IGNORECASE,
+)
+_VERDICT_LINE = re.compile(
+    r'^\s*[-*]\s*(?:方向|结论|判断|建议|操作)\s*[:：]\s*.*(?:买入|卖出|看多|看空|加仓|减仓|观望)',
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _strip_directional_bias(text: str) -> str:
+    """从压缩摘要中移除方向性结论，防止污染下一轮分析。
+
+    保留数据事实（价格、指标值），移除主观判断（买入/卖出/看多/看空）。
+    """
+    # 移除"建议: 买入/卖出"这类结论行
+    text = _VERDICT_LINE.sub('', text)
+    # 移除行内的方向性建议
+    text = _DIRECTIONAL_PATTERNS.sub('', text)
+    # 清理多余空行
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
 def _smart_truncate(text: str, max_len: int) -> str:
     if len(text) <= max_len:
         return text
@@ -575,6 +600,8 @@ def compress_context(
 
     if is_high_quality:
         result = _combine_struct_and_body(struct_block, rule_result)
+        # 移除方向性结论，防止跨轮次污染
+        result = _strip_directional_bias(result)
         logger.info(
             "[Compress:Rule] 原始 %d 字 → 压缩 %d 字 (高质量, age=%d)",
             len(output), len(result), age_turns,
@@ -592,6 +619,7 @@ def compress_context(
 
     if llm_result and len(llm_result) >= 50:
         result = _combine_struct_and_body(struct_block, llm_result)
+        result = _strip_directional_bias(result)
         logger.info(
             "[Compress:LLM] 原始 %d 字 → 压缩 %d 字 (age=%d)",
             len(output), len(result), age_turns,
@@ -601,6 +629,7 @@ def compress_context(
     # ── Step 5: 最终降级 ─────────────────────────────────────
     fallback = rule_result if rule_result else _smart_truncate(cleaned, body_max_len)
     result = _combine_struct_and_body(struct_block, fallback)
+    result = _strip_directional_bias(result)
     logger.warning("[Compress] LLM 也失败, 降级截断: %d 字 (age=%d)", len(result), age_turns)
     return result
 

@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 def build_model(
     model: str = None,
     provider: str = None,
-    temperature: float = 0.3,
+    temperature: float = 0.05,
     **kwargs,
 ) -> OpenAIModel:
     """Build a smolagents OpenAIModel using QuantDinger's LLM config.
@@ -30,7 +30,8 @@ def build_model(
         model: Model ID (e.g. "gpt-4o", "deepseek-chat").
                If None, uses the provider's default model.
         provider: Provider name override (openrouter/openai/google/deepseek/grok).
-        temperature: Sampling temperature.
+        temperature: Sampling temperature. Default 0.05 for deterministic analysis.
+                     (Previously 0.3 caused inconsistent BUY/SELL/HOLD on same input.)
         **kwargs: Extra kwargs passed to OpenAIModel.
 
     Returns:
