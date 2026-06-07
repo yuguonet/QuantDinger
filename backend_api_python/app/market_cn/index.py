@@ -107,8 +107,8 @@ def _get_client():
 
     # 从 provider 层获取已探测的可用服务器
     try:
-        from app.data_sources.provider.tdx_ex import TdxExProvider
-        provider = TdxExProvider()
+        from app.data_sources.provider.tdx_ex import TdxExDataSource
+        provider = TdxExDataSource()
         servers = [(h, p) for h, p, proto in provider._live_servers if proto == "hq"]
         if not servers:
             logger.warning("[mootdx] 无可用 HQ 服务器")
@@ -587,6 +587,7 @@ def get_index_daily_kline(code: str = "000001", days: int = 200) -> List[Dict[st
     for fetcher in (_kline_mootdx, _kline_tencent, _kline_sina, _kline_baostock):
         df = fetcher(code, days)
         if df is not None and not df.empty:
+            df = df.loc[:, ~df.columns.duplicated()]
             return df.to_dict(orient="records")
 
     logger.error("所有数据源获取指数日K线均失败: %s", code)
@@ -645,6 +646,7 @@ def get_index_kline(code: str = "000001", frequency: str = "1D", days: int = 200
             # 分钟级别保留时分秒
             df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d %H:%M:%S")
 
+        df = df.loc[:, ~df.columns.duplicated()]
         cols = [c for c in ["date", "open", "high", "low", "close", "volume", "amount"] if c in df.columns]
         return df[cols].tail(days).to_dict(orient="records")
     except Exception as e:
@@ -1286,10 +1288,16 @@ def _mkt_flow_eastmoney_realtime() -> Optional[Dict[str, Any]]:
         return None
 
 
+_fund_flow_cache: Dict[str, Any] = {}
+_fund_flow_cache_ts: float = 0
+_FUND_FLOW_TTL: int = 120  # 秒
+
+
 def get_market_fund_flow_realtime() -> Dict[str, Any]:
     """获取实时大盘资金流向（沪深两市主力资金净流入/流出）。
 
     多源降级: 新浪(行业汇总) → 东财 push2(兜底)
+    接口级缓存: 30秒 TTL，所有调用方共享。
 
     数据含义:
       - main_net = 主力净流入（新浪: 行业板块净额汇总; 东财: 超大单+大单）
@@ -1315,10 +1323,18 @@ def get_market_fund_flow_realtime() -> Dict[str, Any]:
         >>> if flow.get("main_net", 0) > 0:
         ...     print(f"主力净流入 {flow['main_net']/1e8:.2f} 亿")
     """
+    global _fund_flow_cache, _fund_flow_cache_ts
+    import time
+    now = time.time()
+    if _fund_flow_cache and (now - _fund_flow_cache_ts) < _FUND_FLOW_TTL:
+        return _fund_flow_cache
+
     for fetcher in (_mkt_flow_sina_realtime, _mkt_flow_tencent_realtime,
                     _mkt_flow_ths_realtime, _mkt_flow_eastmoney_realtime):
         data = fetcher()
         if data:
+            _fund_flow_cache = data
+            _fund_flow_cache_ts = now
             return data
 
     logger.error("所有数据源获取大盘实时资金流均失败")

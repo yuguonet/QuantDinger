@@ -233,9 +233,17 @@ def _try_sina_yield(timeout: float = 5) -> Dict[str, Any]:
 
 def _parse_tencent_response(text: str, label: str) -> float:
     parts = text.split("~")
-    if len(parts) < 5:
-        raise ValueError(f"Tencent {label}: unexpected format ({len(parts)} fields)")
-    val = _safe_float(parts[3])
+    # 兼容不同格式: VIX有5+字段, VXN/DXY可能只有1-4字段
+    if len(parts) >= 5:
+        val = _safe_float(parts[3])
+    elif len(parts) >= 2:
+        # 尝试从第2个字段取值（部分指数格式不同）
+        val = _safe_float(parts[1]) if _safe_float(parts[1]) > 0 else _safe_float(parts[0])
+    else:
+        # 单字段: 尝试直接解析整个响应中的数字
+        import re
+        nums = re.findall(r'[\d.]+', text)
+        val = _safe_float(nums[0]) if nums else 0
     if val <= 0:
         raise ValueError(f"Tencent {label}: invalid value {val}")
     return val
@@ -424,8 +432,17 @@ def fetch_vix() -> Dict[str, Any]:
                 ak = _get_ak()
                 if ak is None:
                     raise ImportError("akshare not installed")
-                df = ak.index_vix()
-                val = float(df.iloc[-1]["close"])
+                # 兼容不同版本: index_vix → stock_us_vix → index_vix_en
+                for fn_name in ("index_vix", "stock_us_vix", "index_vix_en"):
+                    fn = getattr(ak, fn_name, None)
+                    if fn:
+                        df = fn()
+                        if df is not None and not df.empty:
+                            col = "close" if "close" in df.columns else df.columns[-1]
+                            val = float(df.iloc[-1][col])
+                            break
+                else:
+                    raise ValueError("akshare: no VIX function found")
             elif src == "yfinance":
                 yf = _get_yf()
                 if yf is None:
@@ -499,10 +516,25 @@ def fetch_dollar_index() -> Dict[str, Any]:
                 ak = _get_ak()
                 if ak is None:
                     raise ImportError("akshare not installed")
-                df = ak.futures_foreign_hist(symbol="DINI")
-                if df is None or df.empty:
-                    raise ValueError("akshare DXY: empty data")
-                val = float(df.iloc[-1]["close"])
+                # 兼容不同版本 akshare
+                val = 0
+                for fn_name, kwargs in [
+                    ("futures_foreign_hist", {"symbol": "DINI"}),
+                    ("currency_boc_safe", {"symbol": "美元指数", "start_date": "20260101", "end_date": "20261231"}),
+                ]:
+                    fn = getattr(ak, fn_name, None)
+                    if fn:
+                        try:
+                            df = fn(**kwargs)
+                            if df is not None and not df.empty:
+                                col = "close" if "close" in df.columns else df.columns[-1]
+                                val = float(df.iloc[-1][col])
+                                if val > 0:
+                                    break
+                        except Exception:
+                            continue
+                if val <= 0:
+                    raise ValueError("akshare DXY: no data")
             elif src == "yfinance":
                 yf = _get_yf()
                 if yf is None:
@@ -557,12 +589,21 @@ def fetch_yield_curve() -> Dict[str, Any]:
                     raise ValueError("akshare bond: empty data")
                 last = df.iloc[-1]
                 y10 = y2 = 0
+                # 优先匹配美国国债列（避免误取中国国债收益率）
                 for col in last.index:
-                    cl = str(col).lower()
-                    if "10" in cl and ("年" in cl or "y" in cl):
+                    cl = str(col)
+                    if "美国" in cl and "10" in cl:
                         y10 = _safe_float(str(last[col]))
-                    elif "2" in cl and ("年" in cl or "y" in cl):
+                    elif "美国" in cl and "2" in cl:
                         y2 = _safe_float(str(last[col]))
+                # 回退: 不含"美国"但含"10Y"/"2Y"的列
+                if y10 <= 0 or y2 <= 0:
+                    for col in last.index:
+                        cl = str(col).lower()
+                        if "10" in cl and ("y" in cl or "美国" in cl) and y10 <= 0:
+                            y10 = _safe_float(str(last[col]))
+                        elif "2" in cl and ("y" in cl or "美国" in cl) and y2 <= 0:
+                            y2 = _safe_float(str(last[col]))
                 if y10 <= 0 or y2 <= 0:
                     raise ValueError(f"akshare bond: could not extract 10Y/2Y")
             elif src == "yfinance":
@@ -691,10 +732,16 @@ def fetch_put_call_ratio() -> Dict[str, Any]:
                 ak = _get_ak()
                 if ak is None:
                     raise ImportError("akshare not installed")
-                df = ak.index_vix()
-                if df is None or df.empty:
-                    raise ValueError("akshare VIX: empty")
-                vix_val = float(df.iloc[-1]["close"])
+                for fn_name in ("index_vix", "stock_us_vix", "index_vix_en"):
+                    fn = getattr(ak, fn_name, None)
+                    if fn:
+                        df = fn()
+                        if df is not None and not df.empty:
+                            col = "close" if "close" in df.columns else df.columns[-1]
+                            vix_val = float(df.iloc[-1][col])
+                            break
+                else:
+                    raise ValueError("akshare: no VIX function found")
                 vix3m_val = vix_val * 0.85
                 used_source = "akshare(estimated_vix3m)"
 

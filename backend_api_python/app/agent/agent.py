@@ -926,6 +926,30 @@ class _AgentExecutor:
             }
             return
 
+        # ── 链路执行：检测是否有匹配的编排链路 ───────────────
+        _intent_verb = meta.get("intent_verb", "")
+        _intent_noun = meta.get("intent_noun", "")
+        chain_result = self._try_chain(
+            _intent_verb, _intent_noun, message, session_id, context, user_id,
+        )
+        if chain_result is not None:
+            store.add_message(session_id, "assistant", chain_result.content)
+            yield {
+                "type": "generating",
+                "step": 0,
+                "message": chain_result.content,
+            }
+            yield {
+                "type": "done",
+                "success": chain_result.success,
+                "content": chain_result.content,
+                "error": chain_result.error,
+                "total_steps": chain_result.total_steps,
+                "model": chain_result.model,
+                "session_id": session_id,
+            }
+            return
+
         t0 = time.time()
         _stream_tool_calls = []  # 收集流式执行中的工具调用
         _stream_tool_call_counter = 0  # Unique ID for each tool call

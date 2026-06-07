@@ -52,13 +52,21 @@ def get_chain(chain_id: str) -> Optional[ChainDef]:
 
 def get_chain_for_intent(verb: str, noun: str) -> Optional[ChainDef]:
     """根据动词+对象查找匹配的链路。"""
-    key = f"{verb}+{noun}"
-    if key in _CHAIN_REGISTRY:
-        return _CHAIN_REGISTRY[key]
-    # 降级：只按 verb 匹配
-    for chain in _CHAIN_REGISTRY.values():
-        if verb in chain.trigger_verbs and not chain.trigger_nouns:
-            return chain
+    # 1. 精确匹配 verb+noun
+    if verb and noun:
+        for chain in _CHAIN_REGISTRY.values():
+            if verb in chain.trigger_verbs and noun in chain.trigger_nouns:
+                return chain
+    # 2. 只按 verb 匹配（noun 为空或未匹配到）
+    if verb:
+        for chain in _CHAIN_REGISTRY.values():
+            if verb in chain.trigger_verbs and not chain.trigger_nouns:
+                return chain
+    # 3. 只按 noun 匹配（verb 为空或未匹配到）
+    if noun:
+        for chain in _CHAIN_REGISTRY.values():
+            if noun in chain.trigger_nouns and not chain.trigger_verbs:
+                return chain
     return None
 
 

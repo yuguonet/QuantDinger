@@ -31,24 +31,12 @@ def _make_resp(data):
 
 @shichang_bp.route('/overview')
 def overview():
-    # 路由级缓存: 10秒内重复请求直接返回上次结果，避免前端高频轮询打爆后端
-    import time
-    now = time.time()
-    cache = overview._cache
-    if cache is not None and (now - overview._cache_ts) < overview._TTL:
-        return _make_resp(cache)
     try:
         from app.market_cn.cards.overview import fetch
-        result = fetch()
-        overview._cache = result
-        overview._cache_ts = now
-        return _make_resp(result)
+        return _make_resp(fetch())
     except Exception as e:
         logger.error("overview 失败: %s", e)
         return _make_resp({})
-overview._cache = None
-overview._cache_ts = 0
-overview._TTL = 60
 
 
 @shichang_bp.route('/streak')
