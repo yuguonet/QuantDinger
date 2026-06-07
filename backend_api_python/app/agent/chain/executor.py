@@ -101,13 +101,29 @@ class ChainExecutor:
         self._step_weights = self._load_step_weights()
 
     def _load_step_weights(self) -> Dict[str, float]:
-        """从评估系统加载历史步骤准确率权重。"""
+        """从评估系统加载历史步骤准确率权重。
+
+        合并两个来源：
+        1. 步骤级权重（get_step_weights）— 基于步骤方向预测的 3 日准确率
+        2. 因子级权重（qd_factor_weights）— 基于因子信息增益，取该步骤下因子的均值
+        取两者中较大值，让高确信因子能拉高步骤权重。
+        """
         try:
-            from app.agent.chain.evaluator import get_step_weights
-            weights = get_step_weights(self.chain_id)
-            if weights:
-                logger.info("[ChainExecutor] 加载历史权重 %s: %s", self.chain_id, weights)
-            return weights
+            from app.agent.chain.evaluator import get_step_weights, get_factor_weights_for_chain
+            step_w = get_step_weights(self.chain_id) or {}
+            factor_w = get_factor_weights_for_chain(self.chain_id) or {}
+
+            # 合并：取 max(step_weight, factor_weight)
+            merged = dict(step_w)
+            for step_name, fw in factor_w.items():
+                if step_name in merged:
+                    merged[step_name] = round(max(merged[step_name], fw), 3)
+                else:
+                    merged[step_name] = round(fw, 3)
+
+            if merged:
+                logger.info("[ChainExecutor] 加载历史权重 %s: %s", self.chain_id, merged)
+            return merged
         except Exception:
             return {}
 
@@ -270,11 +286,8 @@ class ChainExecutor:
 
         for step_out in result.step_outputs:
             cn_name = get_step_cn_name(step_out.step_name)
-            weight = self._step_weights.get(step_out.step_name, 1.0)
-
-            # 从 chain def 获取默认权重
-            chain_step = self._find_chain_step(step_out.step_name)
-            base_weight = 1.0  # 默认权重
+            # 使用评估系统加载的权重（默认 1.0）
+            base_weight = self._step_weights.get(step_out.step_name, 1.0)
 
             item = BreakdownItem(
                 name=cn_name,

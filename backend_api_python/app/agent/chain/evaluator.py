@@ -435,6 +435,67 @@ def get_step_weights(chain_id: str, days: int = 30) -> Dict[str, float]:
     return weights
 
 
+def get_factor_weights_for_chain(chain_id: str) -> Dict[str, float]:
+    """获取链路各步骤的因子级权重。
+
+    从 qd_factor_weights 表读取该链路下所有因子的 accuracy_3d，
+    按 step_name（通过因子名前缀推断）聚合为步骤级权重。
+    返回 {step_name: avg_accuracy_3d}，仅包含 sample_count >= 5 的因子。
+    """
+    from app.utils.db import get_db_connection
+
+    weights = {}
+
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            # 直接从 qd_factor_weights 取因子准确率
+            cur.execute("""
+                SELECT factor_name, accuracy_3d, sample_count
+                FROM qd_factor_weights
+                WHERE chain_id = %s AND sample_count >= 5
+            """, (chain_id,))
+
+            # 因子名 → 步骤名的映射（基于 chain 定义中的步骤名前缀）
+            _STEP_PREFIXES = {
+                "policy": "policy", "hot_money": "hot_money", "lockup": "lockup",
+                "concept": "concept", "momentum": "momentum", "intelligence": "intelligence",
+                "technical": "technical", "indicator": "indicator", "screening": "screening",
+                "fund_flow": "fund_flow", "backtest": "backtest",
+                "bull": "bull_bear_debate", "bear": "bear_rebuttal",
+                "market": "market_overview", "hotspot": "hotspots",
+            }
+
+            # 按步骤聚合
+            step_accs: Dict[str, List[float]] = {}
+            for factor_name, acc_3d, sample_count in cur.fetchall():
+                if acc_3d is None:
+                    continue
+                # 推断步骤名
+                step_name = None
+                for prefix, sname in _STEP_PREFIXES.items():
+                    if factor_name.lower().startswith(prefix):
+                        step_name = sname
+                        break
+                if not step_name:
+                    # 无法推断的因子归入 technical（通用技术因子）
+                    step_name = "technical"
+
+                if step_name not in step_accs:
+                    step_accs[step_name] = []
+                step_accs[step_name].append(acc_3d)
+
+            # 取每个步骤下因子准确率的均值
+            for step_name, accs in step_accs.items():
+                if accs:
+                    weights[step_name] = round(sum(accs) / len(accs), 3)
+
+    except Exception as e:
+        logger.warning("[Evaluator] 获取因子权重失败: %s", e)
+
+    return weights
+
+
 def get_weight_adjustments(chain_id: str, days: int = 30) -> Dict[str, Any]:
     """输出权重调整建议（供 executor 自动应用）。"""
     from app.utils.db import get_db_connection
