@@ -249,11 +249,55 @@ def get_broken_board(date: str = "") -> Dict[str, Any]:
     domain=["finance"],
 )
 def get_market_overview() -> Dict[str, Any]:
-    """获取全市场涨跌统计快照：上涨/下跌家数、情绪指标。"""
-    stocks = _em_search("A股 涨跌统计", 5)
-    up = sum(1 for s in stocks if (s.get("change_rate") or 0) > 0)
-    down = sum(1 for s in stocks if (s.get("change_rate") or 0) < 0)
-    return {"up_count": up, "down_count": down, "north_net_flow": 0, "emotion": 50}
+    """获取全市场涨跌统计快照：上涨/下跌家数、资金流向、情绪指标。"""
+    up = down = 0
+    north_net = 0.0
+    emotion = 50
+    main_net_yi = 0.0
+    main_pct = 0.0
+
+    # 涨跌家数: 从指数实时行情获取
+    try:
+        from app.market_cn.index import get_index_realtime
+        indices = get_index_realtime(["000001", "399001"])
+        for item in (indices or []):
+            if item.get("change_percent", 0) > 0:
+                up += 1
+            elif item.get("change_percent", 0) < 0:
+                down += 1
+    except Exception:
+        pass
+
+    # 北向资金
+    try:
+        from app.market_cn.index import get_northbound_realtime
+        nb = get_northbound_realtime()
+        north_net = round(nb.get("total_latest_yi", 0), 2)
+    except Exception:
+        pass
+
+    # 情绪指数
+    try:
+        from app.market_cn.fear_greed_index import fear_greed_index
+        fg = fear_greed_index()
+        emotion = int(fg.get("composite_score", 50))
+    except Exception:
+        pass
+
+    # 大盘资金流向
+    try:
+        from app.market_cn.index import get_market_fund_flow_realtime
+        mf = get_market_fund_flow_realtime()
+        main_net_yi = round(mf.get("main_net", 0) / 1e8, 2)
+        main_pct = round(mf.get("main_pct", 0), 2)
+    except Exception:
+        pass
+
+    return {
+        "up_count": up, "down_count": down,
+        "north_net_flow": north_net, "emotion": emotion,
+        "main_net_yi": main_net_yi, "main_pct": main_pct,
+    }
 
 @tool(
     description="获取个股资金流向：主力/大单/中单/小单的净流入额。支持单只（传一个代码）或批量（逗号分隔，最多20只）。",
@@ -332,7 +376,8 @@ def get_sector_fund_flow(date: str = "") -> Dict[str, Any]:
     if not date:
         date = _today_str()
 
-    data = _em_search("板块资金流向", 30)
+    from app.market_cn.index import get_sector_fund_flow as _get_sector_flow
+    data = _get_sector_flow("今日")
     return {"date": date, "count": len(data), "sectors": data}
 
 @tool(
@@ -354,5 +399,6 @@ def get_concept_fund_flow(date: str = "") -> Dict[str, Any]:
     if not date:
         date = _today_str()
 
-    data = _em_search("概念资金流向", 30)
+    from app.market_cn.index import get_sector_fund_flow as _get_sector_flow
+    data = _get_sector_flow("今日")  # 概念板块同源
     return {"date": date, "count": len(data), "concepts": data}

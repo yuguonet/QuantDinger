@@ -73,6 +73,17 @@ def fetch():
     except Exception:
         pass
 
+    # 大盘资金流向
+    main_net_yi = 0.0
+    main_pct = 0.0
+    try:
+        from app.market_cn.index import get_market_fund_flow_realtime
+        mf = get_market_fund_flow_realtime()
+        main_net_yi = round(safe_float(mf.get("main_net", 0)) / 1e8, 2)  # 元→亿
+        main_pct = safe_float(mf.get("main_pct", 0))
+    except Exception:
+        pass
+
     if -0.3 <= sse_c <= 0.3:
         heat = "平淡"
     elif sse_c > 0.8:
@@ -93,6 +104,7 @@ def fetch():
         "limitUp": limit_up, "limitDown": limit_down,
         "streakHeight": streak_height, "brokenBoard": broken_board,
         "northBound": north_net, "emotionIndex": emotion,
+        "mainNetFlow": main_net_yi, "mainNetPct": main_pct,
     }
 
 
@@ -106,6 +118,7 @@ def _empty():
         "heat": "—", "upCount": 0, "downCount": 0,
         "limitUp": 0, "limitDown": 0, "streakHeight": 0,
         "brokenBoard": 0, "northBound": 0, "emotionIndex": 50,
+        "mainNetFlow": 0, "mainNetPct": 0,
     }
 
 

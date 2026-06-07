@@ -92,47 +92,30 @@ def _get_hot_concepts(limit=50):
 
 
 def _get_concept_fund_flow(limit=50):
-    """从东方财富获取概念板块资金流向（带缓存）。"""
+    """获取概念板块资金流向（通过 index.py 多源接口）。"""
     global _concept_flow_cache
     if _concept_flow_cache is not None:
         return _concept_flow_cache
 
     try:
-        url = "https://push2.eastmoney.com/api/qt/clist/get"
-        params = {
-            "pn": 1,
-            "pz": limit,
-            "po": 1,
-            "np": 1,
-            "fltt": 2,
-            "invt": 2,
-            "fid": "f62",       # 按主力净流入排序
-            "fs": "b:BK0815",   # 概念板块
-            "fields": "f12,f14,f62,f184,f66,f69,f70,f72",
-            # f12=代码 f14=名称 f62=主力净流入 f184=主力净占比
-            # f66=超大单净流入 f69=大单净流入 f70=中单净流入 f72=小单净流入
-        }
-        resp = requests.get(url, params=params, headers=HEADERS, timeout=15)
-        data = resp.json()
-        items = (data.get("data") or {}).get("diff") or []
+        from app.market_cn.index import get_sector_fund_flow
+        raw = get_sector_fund_flow("今日")
 
         results = {}
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            code = str(item.get("f12") or "").strip()
-            name = str(item.get("f14") or "").strip()
+        for item in raw[:limit]:
+            code = item.get("code", "")
+            name = item.get("name", "")
             if not code or not name:
                 continue
             results[code] = {
                 "name": name,
                 "code": code,
-                "main_net_inflow": _safe_float(item.get("f62")),       # 主力净流入 (元)
-                "main_net_pct": _safe_float(item.get("f184")),         # 主力净占比 (%)
-                "super_net_inflow": _safe_float(item.get("f66")),      # 超大单净流入
-                "big_net_inflow": _safe_float(item.get("f69")),        # 大单净流入
-                "mid_net_inflow": _safe_float(item.get("f70")),        # 中单净流入
-                "small_net_inflow": _safe_float(item.get("f72")),      # 小单净流入
+                "main_net_inflow": item.get("main_net", 0),
+                "main_net_pct": item.get("main_pct", 0),
+                "super_net_inflow": item.get("super_net", 0),
+                "big_net_inflow": item.get("large_net", 0),
+                "mid_net_inflow": item.get("mid_net", 0),
+                "small_net_inflow": item.get("small_net", 0),
             }
 
         _concept_flow_cache = results

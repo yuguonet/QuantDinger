@@ -970,8 +970,18 @@ def _tencent_quote_raw(codes: list) -> dict:
     prefixed = []
     for c in codes:
         c = _stock_code_normalize(c)
-        if c.startswith(("6", "9")):
-            prefixed.append(f"sh{c}")
+        # 指数: 000xxx(上证指数系列) → sh, 399xxx(深证指数系列) → sz
+        # ETF:  510xxx/515xxx/513xxx → sh, 159xxx → sz
+        # 股票: 60xxxx → sh, 00xxxx/30xxxx → sz, 8xxxxx → bj
+        if c.startswith(("6", "9", "5", "000")):
+            # 000开头: 指数(000001/000300)→sh, 股票(000858)→sz
+            # 通过长度和范围区分: 000xxx指数(sh) vs 000xxx股票(sz)
+            if c.startswith("000") and not c.startswith(("002", "003")):
+                prefixed.append(f"sh{c}")  # 000xxx 指数 → 上海
+            elif c.startswith(("6", "9", "5")):
+                prefixed.append(f"sh{c}")
+            else:
+                prefixed.append(f"sz{c}")
         elif c.startswith("8"):
             prefixed.append(f"bj{c}")
         else:

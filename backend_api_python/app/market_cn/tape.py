@@ -728,6 +728,10 @@ def get_fund_flow_realtime(code: str) -> Dict[str, Any]:
             "code": code,
             "points": len(rows),
             "total_main_net": round(total_main, 2),
+            "main_net": round(total_main, 2),  # 别名，兼容 tools 层
+            "net_flow": round(sum(r["main_net"] + r["small_net"] + r["mid_net"] for r in rows), 2),
+            "retail_net": round(sum(r["small_net"] + r["mid_net"] for r in rows), 2),
+            "name": "",
             "data": rows,
         }
     except Exception as e:

@@ -79,7 +79,7 @@ def _fetch_board_list(board_type="industry", limit=200):
 
 
 def _fetch_board_fund_flow(board_code: str) -> dict:
-    """获取单个板块的资金流向数据。"""
+    """获取单个板块的资金流向数据（通过 index.py 多源接口）。"""
     if not board_code:
         return {}
 
@@ -87,39 +87,25 @@ def _fetch_board_fund_flow(board_code: str) -> dict:
         return _flow_cache[board_code]
 
     try:
-        url = "https://push2.eastmoney.com/api/qt/stock/fflow/daykline/get"
-        params = {
-            "lmt": 1,
-            "klt": 101,
-            "secid": f"90.{board_code}",
-            "fields1": "f1,f2,f3,f7",
-            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
-            "ut": "b2884a393a59ad64002292a3e90d46a5",
-        }
-        resp = requests.get(url, params=params, headers=HEADERS, timeout=10)
-        data = resp.json()
+        from app.market_cn.index import get_sector_fund_flow
+        raw = get_sector_fund_flow("今日")
 
-        klines = (data.get("data") or {}).get("klines") or []
-        if not klines:
-            _flow_cache[board_code] = {}
-            return {}
+        # 按板块代码查找
+        for item in raw:
+            if item.get("code") == board_code:
+                result = {
+                    "date": "",
+                    "main_net_inflow": item.get("main_net", 0),
+                    "small_net_inflow": item.get("small_net", 0),
+                    "mid_net_inflow": item.get("mid_net", 0),
+                    "big_net_inflow": item.get("large_net", 0),
+                    "super_net_inflow": item.get("super_net", 0),
+                }
+                _flow_cache[board_code] = result
+                return result
 
-        parts = klines[-1].split(',')
-        if len(parts) < 7:
-            _flow_cache[board_code] = {}
-            return {}
-
-        result = {
-            "date": parts[0],
-            "main_net_inflow": _safe_float(parts[1]),       # 主力净流入 (元)
-            "small_net_inflow": _safe_float(parts[2]),      # 小单净流入
-            "mid_net_inflow": _safe_float(parts[3]),        # 中单净流入
-            "big_net_inflow": _safe_float(parts[4]),        # 大单净流入
-            "super_net_inflow": _safe_float(parts[5]),      # 超大单净流入
-        }
-
-        _flow_cache[board_code] = result
-        return result
+        _flow_cache[board_code] = {}
+        return {}
 
     except Exception as e:
         logger.debug("sector_flow: 获取 %s 资金流向失败: %s", board_code, e)

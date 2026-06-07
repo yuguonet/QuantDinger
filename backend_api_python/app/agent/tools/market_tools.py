@@ -48,41 +48,51 @@ def get_market_indices() -> Dict[str, Any]:
 )
 def get_sector_rankings() -> Dict[str, Any]:
     """获取行业板块涨跌排名和资金流向。"""
-    # 走 china_market（带缓存+自动刷新）
     try:
-        from app.market_cn.china_market import get_hot_sectors
-        result = get_hot_sectors(industry_limit=20, concept_limit=0)
-        data = result.get("data", {})
-        sectors = data.get("industry", []) if isinstance(data, dict) else []
-        return {"sectors": sectors}
-    except Exception as e:
-        logger.warning("get_sector_rankings via hot_sectors failed: %s", e)
-        # fallback: 东财直连
-        try:
-            import requests
-            url = "https://push2.eastmoney.com/api/qt/clist/get"
-            params = {
-                "pn": "1", "pz": "20", "po": "1", "np": "1",
-                "fltt": "2", "invt": "2", "fs": "m:90+t:2",
-                "fields": "f2,f3,f4,f12,f14,f104,f105,f128,f136",
-            }
-            r = requests.get(url, params=params, timeout=15)
-            d = r.json()
-            items = d.get("data", {}).get("diff", [])
+        from app.market_cn.index import get_sector_fund_flow
+        data = get_sector_fund_flow("今日")
+        if data:
             sectors = []
-            for i, item in enumerate(items):
+            for i, item in enumerate(data[:20]):
                 sectors.append({
                     "rank": i + 1,
-                    "name": item.get("f14", ""),
-                    "change_pct": item.get("f3", 0),
-                    "code": item.get("f12", ""),
-                    "up_count": item.get("f104", 0),
-                    "down_count": item.get("f105", 0),
-                    "lead_stock": item.get("f128", ""),
+                    "name": item.get("name", ""),
+                    "change_pct": item.get("change_pct", 0),
+                    "code": item.get("code", ""),
+                    "main_net": item.get("main_net", 0),
+                    "main_pct": item.get("main_pct", 0),
+                    "lead_stock": item.get("lead_stock", ""),
                 })
             return {"sectors": sectors}
-        except Exception as e2:
-            logger.error("get_sector_rankings fallback also failed: %s", e2)
-            return {"error": str(e2)}
+    except Exception as e:
+        logger.warning("get_sector_rankings via index failed: %s", e)
+
+    # fallback: 东财直连
+    try:
+        import requests
+        url = "https://push2.eastmoney.com/api/qt/clist/get"
+        params = {
+            "pn": "1", "pz": "20", "po": "1", "np": "1",
+            "fltt": "2", "invt": "2", "fs": "m:90+t:2",
+            "fields": "f2,f3,f4,f12,f14,f104,f105,f128,f136",
+        }
+        r = requests.get(url, params=params, timeout=15)
+        d = r.json()
+        items = d.get("data", {}).get("diff", [])
+        sectors = []
+        for i, item in enumerate(items):
+            sectors.append({
+                "rank": i + 1,
+                "name": item.get("f14", ""),
+                "change_pct": item.get("f3", 0),
+                "code": item.get("f12", ""),
+                "up_count": item.get("f104", 0),
+                "down_count": item.get("f105", 0),
+                "lead_stock": item.get("f128", ""),
+            })
+        return {"sectors": sectors}
+    except Exception as e2:
+        logger.error("get_sector_rankings fallback also failed: %s", e2)
+        return {"error": str(e2)}
 
 # Legacy list — kept for backward compat during migration; safe to remove later.
