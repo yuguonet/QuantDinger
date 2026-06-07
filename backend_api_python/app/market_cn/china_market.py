@@ -305,9 +305,9 @@ def get_sector_history(board_type="industry", days=30) -> dict:
 
 
 def get_emotion_history(hours=None, date=None) -> dict:
-    """情绪指数历史数据（定时采集已移除，返回空）"""
-    logger.warning("情绪指数定时采集已移除，emotion_history 不再可用")
-    return {"code": 1, "msg": "情绪采集已停用", "history": []}
+    """情绪指数历史数据（当天快照）"""
+    from .emotion import get_emotion_history as _get
+    return _get(hours=hours)
 
 
 def get_policy() -> dict:
@@ -348,28 +348,10 @@ def refresh(target="all") -> dict:
 
 def _fetch_china_macro() -> dict:
     """市场情绪 — StockApi 情绪周期（涨跌停/大面大肉/上涨比例）"""
-    import requests as _req
-    url = "https://www.stockapi.com.cn/v1/base/emotionalCycle"
-    try:
-        r = _req.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        d = r.json()
-        if d.get("code") != 20000:
-            return {"code": 0, "msg": d.get("msg", "接口错误"), "data": {}}
-        cols = d["data"]["colNameList"]
-        rows = d["data"]["contentList"]
-        latest = rows[-1] if rows else []
-        row_dict = dict(zip(cols, latest)) if cols and latest else {}
-        return {
-            "code": 1, "msg": "success",
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "data": {
-                "emotion": row_dict,
-                "history_days": len(rows),
-            },
-        }
-    except Exception as e:
-        logger.error("StockApi 情绪数据失败: %s", e)
-        return {"code": 0, "msg": str(e), "data": {}}
+    from .emotion import fetch_emotion_cycle
+    result = fetch_emotion_cycle()
+    # fetch_emotion_cycle 已完成快照采集，直接透传
+    return result
 
 
 def _fetch_fear_greed():

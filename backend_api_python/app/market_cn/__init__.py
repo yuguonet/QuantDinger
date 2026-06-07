@@ -60,6 +60,11 @@ from .china_market import (
     get_emotion_history,
     refresh as refresh_cn,
 )
+from .emotion import (
+    fetch_emotion_cycle,
+    get_emotion_history as get_emotion_snapshots,
+    get_emotion_latest,
+)
 from .index import (
     get_northbound_realtime,
     get_northbound_daily,

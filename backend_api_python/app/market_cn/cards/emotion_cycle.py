@@ -14,11 +14,9 @@ meta = CardMeta(
 
 def fetch():
     try:
-        from app.interfaces.cache_file import cache_db
-        from app.interfaces.emotion_scheduler import query_emotion_history
-        db = cache_db()
-        history = query_emotion_history(db, hours=4)
-        return {"history": history or []}
+        from app.market_cn.emotion import get_emotion_history
+        result = get_emotion_history()
+        return {"history": result.get("history", [])}
     except Exception:
         return {"history": []}
 
