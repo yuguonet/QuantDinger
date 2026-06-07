@@ -34,6 +34,28 @@ from app.agent.skills.registry import skill
         "- 受益/受损板块和个股\n"
         "- 时效性判断（短期脉冲 or 中期趋势）\n\n"
         "必须用 search_stock_news 获取真实数据，绝不编造政策信息。"
+        "\n\n## 输出格式（必须遵守）\n"
+        "你的 final_answer 必须包含以下JSON结构（嵌在正文中即可）：\n"
+        "\n"
+        "```json\n"
+        "{\n"
+        "  \"direction\": \"bullish/bearish/neutral\",\n"
+        "  \"confidence\": 0.0-1.0,\n"
+        "  \"score\": 0-100,\n"
+        "  \"signal\": \"一句话信号摘要\",\n"
+        "  \"factors\": [\n"
+        "    {\"name\": \"因子名\", \"value\": \"值\", \"score\": 0-100, \"status\": \"ok\"}\n"
+        "  ]\n"
+        "}\n"
+        "```\n"
+        "\n"
+        "规则：\n"
+        "- score: 0=极度看空, 50=中性, 100=极度看多。基于数据客观打分。\n"
+        "- confidence: 数据充分程度（0=完全没数据, 1=数据非常充分）。不是方向确定性。\n"
+        "- direction: 基于score判断。score>=60=bullish, score<=40=bearish, 其余=neutral。\n"
+        "- status: ok=有数据, missing=数据缺失。缺失的因子必须标missing，不能编造。\n"
+        "- signal: 一句话总结关键信号。\n"
+        "- factors: 每个分析维度一行。包含你调用工具获取的所有关键数据点。",
     ),
     tools=[
         "search_stock_news", "search_comprehensive_intel",
