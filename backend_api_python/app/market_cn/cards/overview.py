@@ -14,24 +14,10 @@ meta = CardMeta(
 
 def fetch():
     from app.data_sources.normalizer import safe_float, safe_int
-    from app.market_cn.index import get_index_realtime
 
-    # 指数
+    # 指数行情由前端直连腾讯获取，后端不再重复拉取
+    # 前端 fetchIndex() → qt.gtimg.cn 每60秒刷新
     sse = sse_c = szse = szse_c = cyse = cyse_c = bzse = bzse_c = 0.0
-    try:
-        indices = get_index_realtime(["000001", "399001", "399006", "899050"])
-        code_map = {item["code"]: item for item in (indices or [])}
-        idx_conf = {
-            "000001": ("sse", "sse_c"), "399001": ("szse", "szse_c"),
-            "399006": ("cyse", "cyse_c"), "899050": ("bzse", "bzse_c"),
-        }
-        for code, item in code_map.items():
-            if code in idx_conf:
-                price_key, pct_key = idx_conf[code]
-                locals()[price_key] = safe_float(item.get("price"))
-                locals()[pct_key] = safe_float(item.get("change_percent"))
-    except Exception:
-        pass
 
     # 涨停池
     limit_up = streak_height = 0

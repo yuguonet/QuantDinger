@@ -7,8 +7,14 @@ A股市场贪婪恐惧指数 — 简化版
 
 import pandas as pd
 import numpy as np
+import time
 from datetime import datetime
 from .index import get_index_daily_kline, get_northbound_daily
+
+# ── 简单 TTL 缓存 ──────────────────────────────────
+_fg_cache = None
+_fg_cache_ts = 0
+_FG_TTL = 300  # 5分钟缓存
 
 
 # ── 工具 ──────────────────────────────────────────
@@ -179,7 +185,12 @@ _CALC = [
 
 
 def fear_greed_index():
-    """计算综合贪恐指数，返回结构化结果"""
+    """计算综合贪恐指数，返回结构化结果（5分钟缓存）"""
+    global _fg_cache, _fg_cache_ts
+    now = time.time()
+    if _fg_cache is not None and (now - _fg_cache_ts) < _FG_TTL:
+        return _fg_cache
+
     indicators = []
     scores = []
     for name, fn in _CALC:
@@ -190,9 +201,12 @@ def fear_greed_index():
 
     avg = round(float(np.mean(scores)), 1) if scores else 50.0
 
-    return {
+    result = {
         "timestamp": datetime.now().isoformat(),
         "composite_score": avg,
         "label": _label(avg),
         "indicators": indicators,
     }
+    _fg_cache = result
+    _fg_cache_ts = now
+    return result

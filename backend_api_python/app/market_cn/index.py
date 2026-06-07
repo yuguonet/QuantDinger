@@ -10,8 +10,8 @@
   6. 行业资金流向  — 行业板块资金流入/流出排名
 
 数据源优先级:
-  实时行情: mootdx(TCP直连通达信服务器) → 腾讯财经(HTTP API) → AKShare(东方财富)
-  日K线:    mootdx(TCP) → AKShare → BaoStock(证券宝)
+  实时行情: 腾讯财经(HTTP API) → AKShare(东方财富)
+  日K线:    腾讯财经 → 新浪财经 → BaoStock(证券宝)
   北向资金: AKShare(东财) → 同花顺 hexin
   大盘资金流: 新浪财经(行业汇总) → 同花顺(行业汇总) → 东财 push2(兜底)
   行业资金流: 新浪财经 → 同花顺 → 东财 push2(兜底)
@@ -84,11 +84,12 @@ _CLIENT_TTL = 3600   # 连接有效期: 3600秒 = 1小时，超时后自动重�
 
 
 def _get_client():
-    """获取 mootdx 客户端单例。
+    """获取 mootdx 客户端单例（复用 provider 层 TDX 服务器探测结果）。
 
     策略:
-      1. 如果已有连接且未过期（< 1小时）且未关闭 → 直接复用
-      2. 否则重新创建连接（TCP 连接通达信行情服务器）
+      1. 已有连接且未过期且未关闭 → 直接复用
+      2. 从 provider 层获取已探测的可用 HQ 服务器，逐个尝试连接
+      3. 无可用服务器 → 返回 None
 
     Returns:
         mootdx.quotes.Quotes 实例，或 None（连接失败时）
@@ -102,22 +103,34 @@ def _get_client():
                 return _client
         except Exception:
             pass
-        _client = None  # 连接已关闭，标记为无效
-
-    # 创建新连接
-    try:
-        from mootdx.quotes import Quotes
-        # market='std' 使用标准行情服务器
-        # timeout=10 连接/读取超时10秒
-        # heartbeat=True 启用心跳包，防止长连接被服务端断开
-        _client = Quotes.factory(market='std', timeout=10, heartbeat=True)
-        _client_ts = time.time()
-        logger.info("[mootdx] 连接成功")
-        return _client
-    except Exception as e:
-        logger.warning("[mootdx] 连接失败: %s", e)
         _client = None
+
+    # 从 provider 层获取已探测的可用服务器
+    try:
+        from app.data_sources.provider.tdx_ex import TdxExProvider
+        provider = TdxExProvider()
+        servers = [(h, p) for h, p, proto in provider._live_servers if proto == "hq"]
+        if not servers:
+            logger.warning("[mootdx] 无可用 HQ 服务器")
+            return None
+    except Exception as e:
+        logger.warning("[mootdx] 获取服务器列表失败: %s", e)
         return None
+
+    from mootdx.quotes import Quotes
+    for host, port in servers:
+        try:
+            _client = Quotes.factory(market='std', timeout=10,
+                                     heartbeat=True, server=(host, port))
+            _client_ts = time.time()
+            logger.info("[mootdx] 连接成功 %s:%d", host, port)
+            return _client
+        except Exception:
+            continue
+
+    logger.warning("[mootdx] 所有服务器连接失败")
+    _client = None
+    return None
 
 
 def _idx_market(code: str) -> int:
@@ -344,45 +357,119 @@ def _kline_mootdx(code: str, days: int) -> Optional[pd.DataFrame]:
         return None
 
 
-def _kline_akshare(code: str, days: int) -> Optional[pd.DataFrame]:
-    """数据源2: AKShare 获取指数日K线。
+def _idx_prefix(code: str) -> str:
+    """指数代码加 sh/sz 前缀。"""
+    return "sh" if code[:3] in ("000", "88", "99") else "sz"
 
-    通过 AKShare 调用东方财富的历史行情接口。
-    会多请求 60 天数据以确保节假日等情况下能凑够 days 条。
+
+def _kline_tencent(code: str, days: int) -> Optional[pd.DataFrame]:
+    """数据源2: 腾讯财经 获取指数日K线。
+
+    接口: web.ifzq.gtimg.cn/appstock/app/fqkline/get
+    返回 JSON: data.{code}.day = [[date, open, close, high, low, volume], ...]
+    volume 单位为手(lots)。
 
     Args:
-        code: 指数代码
+        code: 指数代码，如 "000001"
         days: 需要的K线条数
 
     Returns:
-        成功: DataFrame [date, open, high, low, close, volume, amount]
+        成功: DataFrame [date, open, high, low, close, volume]
         失败: None
     """
+    import urllib.request
     try:
-        import akshare as ak
-    except ImportError:
-        return None
-    try:
-        # 多请求 60 天缓冲，防止节假日导致数据不足
-        end = datetime.now().strftime("%Y%m%d")
-        start = (datetime.now() - timedelta(days=days + 60)).strftime("%Y%m%d")
+        sc = _idx_prefix(code) + code
+        url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+        params = f"param={sc},day,,,{days},"
+        full_url = f"{url}?{params}"
+        req = urllib.request.Request(full_url)
+        req.add_header("User-Agent", "Mozilla/5.0")
+        req.add_header("Referer", "https://web.ifzq.gtimg.cn/")
+        raw = urllib.request.urlopen(req, timeout=10).read()
+        data = json.loads(raw)
 
-        # index_zh_a_hist: 东方财富指数历史行情接口
-        df = ak.index_zh_a_hist(symbol=code, period="daily", start_date=start, end_date=end)
-        if df is None or df.empty:
+        root = (data.get("data") or {}).get(sc)
+        if not isinstance(root, dict):
             return None
 
-        # AKShare 返回中文列名，需要映射为英文
-        df = df.rename(columns={
-            "日期": "date", "开盘": "open", "最高": "high",
-            "最低": "low", "收盘": "close", "成交量": "volume", "成交额": "amount",
-        })
-        df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
-        cols = [c for c in ["date", "open", "high", "low", "close", "volume", "amount"] if c in df.columns]
-        logger.info("[akshare] 日K线 %s: %d 条", code, len(df))
-        return df[cols].tail(days)
+        rows = root.get("day") or root.get("qfqday") or []
+        if not rows:
+            return None
+
+        out = []
+        for r in rows:
+            if len(r) < 6:
+                continue
+            out.append({
+                "date": str(r[0]),
+                "open": float(r[1]),
+                "high": float(r[3]),
+                "low": float(r[4]),
+                "close": float(r[2]),
+                "volume": float(r[5]),  # 已是手(lots)
+            })
+
+        if out:
+            logger.info("[tencent] 日K线 %s: %d 条", code, len(out))
+        return pd.DataFrame(out) if out else None
     except Exception as e:
-        logger.warning("[akshare] 日K线失败(%s): %s", code, e)
+        logger.warning("[tencent] 日K线失败(%s): %s", code, e)
+        return None
+
+
+def _kline_sina(code: str, days: int) -> Optional[pd.DataFrame]:
+    """数据源3: 新浪财经 获取指数日K线。
+
+    接口: quotes.sina.cn/cn/api/jsonp_v2.php/CN_MarketDataService.getKLineData
+    scale=240 表示日线，返回 JSONP 格式。
+
+    Args:
+        code: 指数代码，如 "000001"
+        days: 需要的K线条数
+
+    Returns:
+        成功: DataFrame [date, open, high, low, close, volume]
+        失败: None
+    """
+    import urllib.request, re
+    try:
+        sc = _idx_prefix(code) + code
+        url = (
+            f"https://quotes.sina.cn/cn/api/jsonp_v2.php"
+            f"/var%20_{sc}=/CN_MarketDataService.getKLineData"
+            f"?symbol={sc}&scale=240&ma=no&datalen={days}"
+        )
+        req = urllib.request.Request(url)
+        req.add_header("User-Agent", "Mozilla/5.0")
+        req.add_header("Referer", "https://finance.sina.com.cn/")
+        raw = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", errors="replace")
+
+        # 去掉可能的 <script> 标签和注释
+        clean = re.sub(r"/\*.*?\*/", "", raw, flags=re.DOTALL)
+        clean = re.sub(r"<[^>]+>", "", clean)
+        # 匹配 JSON 数组: var _xxx=([...]) 或 =([...])
+        m = re.search(r"=\s*\(?\s*(\[.*\])\s*\)?\s*;?\s*$", clean, re.DOTALL)
+        if not m:
+            return None
+
+        arr = json.loads(m.group(1))
+        out = []
+        for r in arr:
+            out.append({
+                "date": str(r.get("day", "")),
+                "open": float(r.get("open", 0)),
+                "high": float(r.get("high", 0)),
+                "low": float(r.get("low", 0)),
+                "close": float(r.get("close", 0)),
+                "volume": float(r.get("volume", 0)) / 100,  # 股→手
+            })
+
+        if out:
+            logger.info("[sina] 日K线 %s: %d 条", code, len(out))
+        return pd.DataFrame(out) if out else None
+    except Exception as e:
+        logger.warning("[sina] 日K线失败(%s): %s", code, e)
         return None
 
 
@@ -497,7 +584,7 @@ def get_index_daily_kline(code: str = "000001", days: int = 200) -> List[Dict[st
     Example:
         >>> get_index_daily_kline("000300", 60)  # 沪深300最近60个交易日
     """
-    for fetcher in (_kline_mootdx, _kline_akshare, _kline_baostock):
+    for fetcher in (_kline_mootdx, _kline_tencent, _kline_sina, _kline_baostock):
         df = fetcher(code, days)
         if df is not None and not df.empty:
             return df.to_dict(orient="records")
@@ -616,8 +703,16 @@ def get_northbound_realtime() -> Dict[str, Any]:
         req = urllib.request.Request(url)
         for k, v in headers.items():
             req.add_header(k, v)
-        raw = urllib.request.urlopen(req, timeout=10).read()
-        d = json.loads(raw)
+        resp = urllib.request.urlopen(req, timeout=10)
+        raw = resp.read()
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw.decode("gbk", errors="replace")
+        d = json.loads(text)
+    except json.JSONDecodeError as e:
+        logger.warning("[hexin] 北向实时JSON解析失败: %s", e)
+        return {"error": f"JSON解析失败: {e}"}
     except Exception as e:
         logger.warning("[hexin] 北向实时失败: %s", e)
         return {"error": str(e)}
@@ -674,35 +769,74 @@ def get_northbound_daily(days: int = 120) -> List[Dict[str, Any]]:
         ...     print(f"{d['date']}: 合计 {d['total_yi']:.2f} 亿")
     """
     # 数据源1: AKShare
+    # 注意: stock_hsgt_north_net_flow_in_em 已在 akshare >=1.14 中移除
+    # 改用 stock_hsgt_hist_em 分别获取沪股通/深股通历史数据后合并
     try:
         import akshare as ak
-        df = ak.stock_hsgt_north_net_flow_in_em(symbol="北上")
-        if df is not None and not df.empty:
-            # AKShare 返回列名: 日期, 沪股通净流入, 深股通净流入, 北向资金净流入
-            # 或英文列名，需要兼容处理
-            cols = df.columns.tolist()
-            out = []
-            for _, row in df.tail(days).iterrows():
-                date_val = str(row.iloc[0])[:10] if len(cols) > 0 else ""
-                # 尝试中文列名，再试英文
-                hgt = 0.0
-                sgt = 0.0
-                total = 0.0
-                if len(cols) >= 4:
-                    hgt = float(row.iloc[1]) if row.iloc[1] else 0
-                    sgt = float(row.iloc[2]) if row.iloc[2] else 0
-                    total = float(row.iloc[3]) if row.iloc[3] else 0
-                elif len(cols) >= 2:
-                    total = float(row.iloc[1]) if row.iloc[1] else 0
+        out = []
+        # 获取沪股通历史
+        hgt_df = ak.stock_hsgt_hist_em(symbol="沪股通")
+        # 获取深股通历史
+        sgt_df = ak.stock_hsgt_hist_em(symbol="深股通")
 
+        if hgt_df is not None and not hgt_df.empty:
+            hgt_map = {}
+            for _, row in hgt_df.iterrows():
+                date_val = str(row.get("日期", ""))[:10]
+                net = row.get("当日成交净买额")
+                if pd.notna(net):
+                    hgt_map[date_val] = float(net)
+
+            sgt_map = {}
+            if sgt_df is not None and not sgt_df.empty:
+                for _, row in sgt_df.iterrows():
+                    date_val = str(row.get("日期", ""))[:10]
+                    net = row.get("当日成交净买额")
+                    if pd.notna(net):
+                        sgt_map[date_val] = float(net)
+
+            # 合并所有日期
+            all_dates = sorted(set(list(hgt_map.keys()) + list(sgt_map.keys())))
+            for date_val in all_dates[-days:]:
+                hgt = hgt_map.get(date_val, 0.0)
+                sgt = sgt_map.get(date_val, 0.0)
                 out.append({
                     "date": date_val,
                     "hgt_yi": round(hgt, 2),
                     "sgt_yi": round(sgt, 2),
-                    "total_yi": round(total, 2),
+                    "total_yi": round(hgt + sgt, 2),
                 })
-            logger.info("[akshare] 北向日级: %d 条", len(out))
-            return out
+
+            if out:
+                logger.info("[akshare] 北向日级: %d 条", len(out))
+                return out
+
+        # fallback: 用 stock_hsgt_fund_flow_summary_em 获取最新一天
+        summary = ak.stock_hsgt_fund_flow_summary_em()
+        if summary is not None and not summary.empty:
+            hgt_val = 0.0
+            sgt_val = 0.0
+            date_val = ""
+            for _, row in summary.iterrows():
+                board = str(row.get("板块", ""))
+                direction = str(row.get("资金方向", ""))
+                if direction == "北向":
+                    date_val = str(row.get("交易日", ""))[:10]
+                    net = row.get("成交净买额", 0)
+                    if pd.notna(net):
+                        if "沪" in board:
+                            hgt_val = float(net)
+                        elif "深" in board:
+                            sgt_val = float(net)
+            if date_val:
+                out.append({
+                    "date": date_val,
+                    "hgt_yi": round(hgt_val, 2),
+                    "sgt_yi": round(sgt_val, 2),
+                    "total_yi": round(hgt_val + sgt_val, 2),
+                })
+                logger.info("[akshare] 北向日级(summary): %d 条", len(out))
+                return out
     except ImportError:
         pass  # akshare 未安装，降级
     except Exception as e:
@@ -715,8 +849,14 @@ def get_northbound_daily(days: int = 120) -> List[Dict[str, Any]]:
         req = urllib.request.Request(url)
         req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/117.0.0.0")
         req.add_header("Referer", "https://data.hexin.cn/")
-        raw = urllib.request.urlopen(req, timeout=10).read()
-        d = json.loads(raw)
+        resp = urllib.request.urlopen(req, timeout=10)
+        raw = resp.read()
+        # hexin 返回的数据可能是 GBK 或含非法 UTF-8 字节，需容错解码
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw.decode("gbk", errors="replace")
+        d = json.loads(text)
         chart = d.get("chart", {})
         times = chart.get("time", [])
         hgt = chart.get("hgt", [])
@@ -734,6 +874,8 @@ def get_northbound_daily(days: int = 120) -> List[Dict[str, Any]]:
             })
         logger.info("[hexin] 北向日级: %d 条", len(out))
         return out[-days:]
+    except json.JSONDecodeError as e:
+        logger.warning("[hexin] 北向日级JSON解析失败: %s", e)
     except Exception as e:
         logger.warning("[hexin] 北向日级失败: %s", e)
 
@@ -778,8 +920,13 @@ def get_northbound_holdings(top: int = 50) -> List[Dict[str, Any]]:
         req = urllib.request.Request(url)
         for k, v in headers.items():
             req.add_header(k, v)
-        raw = urllib.request.urlopen(req, timeout=10).read()
-        d = json.loads(raw)
+        resp = urllib.request.urlopen(req, timeout=10)
+        raw = resp.read()
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw.decode("gbk", errors="replace")
+        d = json.loads(text)
         lst = d.get("list", [])
 
         out = []
