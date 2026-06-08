@@ -367,7 +367,14 @@ def update_verify_results(
 
 
 def update_skill_verify(root_id: int, actual_direction_3d: str):
-    """回溯时逐层验证：更新每个 skill 子节点的 correct_3d。"""
+    """回溯时逐层验证：更新每个 skill 子节点的 correct_3d。
+
+    三值逻辑：
+      - neutral 预测 → correct_3d = NULL（不参与统计，不惩罚不奖励）
+      - correct/wrong → 正常写入
+    """
+    from app.agent.chain.schema import is_direction_correct
+
     from app.utils.db import get_db_connection
 
     try:
@@ -385,7 +392,21 @@ def update_skill_verify(root_id: int, actual_direction_3d: str):
                 if not direction:
                     continue
 
-                correct = direction == actual_direction_3d
+                verdict = is_direction_correct(direction, actual_direction_3d)
+
+                # neutral 预测 → 不参与统计
+                if verdict == "neutral":
+                    cur.execute("""
+                        UPDATE qd_evaluations SET
+                            actual_direction_3d = %s,
+                            correct_3d = NULL,
+                            calibration = 1.0
+                        WHERE id = %s
+                    """, (actual_direction_3d, step_id))
+                    continue
+
+                # correct / wrong → 正常写入
+                correct = verdict == "correct"
 
                 # 校准因子：score 越偏离50（越自信），权重更新幅度越大
                 calibration = 1.0

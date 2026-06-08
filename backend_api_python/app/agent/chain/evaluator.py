@@ -136,7 +136,13 @@ def evaluate_pending(days_old: int = 1, market: str = "CNStock") -> Dict[str, An
             }
             predicted_dir = action_to_dir.get(action, Direction.NEUTRAL.value)
             actual_dir_3d = actuals.get("direction_3d", "")
-            correct_3d = is_direction_correct(predicted_dir, actual_dir_3d)
+            verdict = is_direction_correct(predicted_dir, actual_dir_3d)
+
+            # 根节点：neutral 预测 → correct_3d = NULL
+            if verdict == "neutral":
+                correct_3d = None
+            else:
+                correct_3d = verdict == "correct"
 
             # 写入根节点验证结果
             store.update_verify_results(
@@ -236,7 +242,7 @@ def update_factor_weights(days: int = 60, decay_half_life_days: int = 30) -> Dic
         with get_db_connection() as conn:
             cur = conn.cursor()
 
-            # 获取已验证的 skill 节点
+            # 获取已验证的 skill 节点（跳过 neutral 预测，correct_3d IS NULL）
             cur.execute("""
                 SELECT e.root_id, e.name, e.factors, e.direction,
                        e.correct_3d, e.calibration, r.exec_date, r.name as chain_id

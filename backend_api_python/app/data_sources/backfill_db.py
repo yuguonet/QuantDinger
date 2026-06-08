@@ -443,7 +443,7 @@ class BackfillDB:
             existing_report = existing_doc.get("report", "") if existing_doc else ""
             existing_failed_syms = _extract_failed_symbols_from_report(existing_report)
             if existing_failed_syms:
-                report = f"{error_msg}; 失败标的({len(existing_failed_syms)}): {','.join(existing_failed_syms[:50])}"
+                report = f"{error_msg}; 失败标的({len(existing_failed_syms)}): {','.join(existing_failed_syms)}"
             else:
                 report = error_msg
             if existing_lbt:
@@ -471,7 +471,7 @@ class BackfillDB:
                 reason_counts[reason] = reason_counts.get(reason, 0) + 1
             reason_summary = ", ".join(f"{r}({c})" for r, c in sorted(reason_counts.items(), key=lambda x: -x[1]))
             report_parts.append(f"失败原因: {reason_summary}")
-            report_parts.append(f"失败标的({len(failed)}): {','.join(failed[:50])}")
+            report_parts.append(f"失败标的({len(failed)}): {','.join(failed)}")
 
         report = "; ".join(report_parts)
         sync_rate = final_count / total_symbols if total_symbols > 0 else 0
@@ -1017,7 +1017,7 @@ def _extract_failed_symbols_from_report(report_text: str) -> list[str]:
     """
     if not report_text:
         return []
-    m = _re.search(r"失败标的$$\d+$$:\s*([^\s;]+)", report_text)
+    m = _re.search(r"失败标的\(\d+\):\s*([^\s;]+)", report_text)
     if m:
         return [s.strip() for s in m.group(1).split(",") if s.strip()]
     return []

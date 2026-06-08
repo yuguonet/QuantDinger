@@ -404,14 +404,16 @@ def _step_to_events(step) -> List[Dict[str, Any]]:
 # ═══════════════════════════════════════════════════════════════
 
 def _build_managed_agents(smol_model) -> list:
-    """Build smolagents ManagedAgents from BaseSkill registry.
+    """Build smolagents managed agents from BaseSkill registry.
 
-    每个 BaseSkill → 一个 smolagents ManagedAgent。
+    每个 BaseSkill → 一个 smolagents 子 Agent（通过 managed_agents 机制）。
     BaseSkill 的 instructions 作为 agent 的 instructions，
     BaseSkill 的 tools 作为 agent 的工具集。
+
+    注意: smolagents >= 1.27 移除了 ManagedAgent 类，
+    改为直接在 Agent 构造时传 name/description，再把 agent 列表传给 managed_agents。
     """
     from app.agent.skills.registry import skill_registry
-    from smolagents import ManagedAgent
 
     all_tools = build_all_tools()
     tool_map = {t.name: t for t in all_tools}
@@ -437,14 +439,10 @@ def _build_managed_agents(smol_model) -> list:
             instructions=instructions,
             verbosity_level=LogLevel.INFO,
             stream_outputs=True,
-        )
-
-        managed = ManagedAgent(
-            agent=sub_agent,
             name=skill_inst.name,
             description=skill_inst.description,
         )
-        agents.append(managed)
+        agents.append(sub_agent)
 
     logger.info("[Agent] Built %d managed agents from skill registry", len(agents))
     return agents

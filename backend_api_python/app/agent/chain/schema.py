@@ -392,8 +392,20 @@ def classify_return(ret: float, threshold: float = DIRECTION_THRESHOLD) -> str:
     return Direction.NEUTRAL.value
 
 
-def is_direction_correct(predicted: str, actual: str) -> Optional[bool]:
-    """判断方向预测是否正确。"""
+def is_direction_correct(predicted: str, actual: str) -> Optional[str]:
+    """判断方向预测是否正确（三值）。
+
+    返回:
+        "correct" — 方向一致
+        "wrong"   — 方向相反（bullish→bearish 或 bearish→bullish）
+        "neutral" — 预测为 neutral（放弃判断），不参与奖惩
+        None      — 数据缺失，无法判断
+    """
     if not predicted or not actual:
         return None
-    return predicted == actual
+    # neutral = 放弃判断，不参与奖惩
+    if predicted == Direction.NEUTRAL.value:
+        return "neutral"
+    if predicted == actual:
+        return "correct"
+    return "wrong"
