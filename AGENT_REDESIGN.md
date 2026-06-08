@@ -434,6 +434,7 @@ Tool 权重含义不同于 Skill/Chain——不是"评分贡献"，而是"数据
 - 只有 `technical.py` 迁移到了 BaseSkill
 - **`agent.py` 的 `_try_chain` 还在用旧的 `run_agent_fn`**（调 smolagents ManagedAgent），没有适配 `BaseSkill.run()`
 - executor 期望 `run_skill_fn → (SkillReport, EvalNode)`，agent.py 传入的是旧签名
+答:我倾向用@skill装饰器的方式
 
 #### 2. async/sync 不匹配
 - `BaseSkill.run()` 和 `BaseSkill.analyze()` 是 `async def`
@@ -444,14 +445,14 @@ Tool 权重含义不同于 Skill/Chain——不是"评分贡献"，而是"数据
 - `chain/skill_contract.py` — 旧版解析器，已被 `chain/contract.py` 替代，还留着
 - `evaluator.py`（agent 根目录）— 旧版在线评估器（598行），引用旧5表 schema，和 `chain/evaluator.py` 功能重叠
 - 旧 skills 目录下的 `@skill` 装饰器 class 没清理
-
+答:清理
 ### P1（应该修）
 
 #### 4. 两套 evaluator 职责混乱
 - `agent/evaluator.py` — 在线执行质量评估（每次 agent.run() 后 <1ms）
 - `agent/chain/evaluator.py` — 盘后回溯评估（T+N 验证 + 因子权重更新）
 - 名字一样，职责完全不同；agent/evaluator.py 引用旧5表 schema，已不兼容
-我倾向用
+答:不太懂如何实现在线执行质量评估
 #### 5. guidance.py / context_compressor.py 没接入新架构
 - `guidance.py` — 数据优先框架 + 数据陷阱警告，没注入到 BaseSkill 的 prompt
 - `context_compressor.py` — 方向性关键词净化，没接入新的 Skill 执行流
