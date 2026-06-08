@@ -43,6 +43,7 @@ from app.agent.skills.registry import skill
         "get_realtime_quote",
     ],
     priority=5,
+    default_weight=1.0,
 )
 class TradingSkill:
     """交易执行专家子 Agent。"""

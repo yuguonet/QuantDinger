@@ -63,6 +63,7 @@ from app.agent.skills.registry import skill
         "get_fund_flow", "get_sector_fund_flow", "get_concept_fund_flow",
     ],
     priority=10,
+    default_weight=0.9,
 )
 class MarketDataSkill:
     """行情数据专家子 Agent。"""

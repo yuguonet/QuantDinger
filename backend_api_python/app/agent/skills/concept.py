@@ -74,6 +74,7 @@ from app.agent.skills.registry import skill
         "search_stock_by_name",
     ],
     priority=8,
+    default_weight=0.9,
 )
 class ConceptTrackerSkill:
     """A股概念/题材追踪师子 Agent。"""

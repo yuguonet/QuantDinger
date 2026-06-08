@@ -69,6 +69,7 @@ from app.agent.skills.registry import skill
         "agent_get_kline", "get_realtime_quote",
     ],
     priority=4,
+    default_weight=0.8,
 )
 class DataEngineeringSkill:
     """数据工程专家子 Agent。"""

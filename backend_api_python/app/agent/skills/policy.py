@@ -62,6 +62,7 @@ from app.agent.skills.registry import skill
         "search_stock_by_name",
     ],
     priority=7,
+    default_weight=0.7,
 )
 class PolicyAnalystSkill:
     """A股政策分析师子 Agent。"""

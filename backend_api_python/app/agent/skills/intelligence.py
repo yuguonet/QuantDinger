@@ -64,6 +64,7 @@ from app.agent.skills.registry import skill
         "search_stock_by_name",
     ],
     priority=7,
+    default_weight=0.8,
 )
 class IntelligenceSkill:
     """情报分析专家子 Agent。"""

@@ -72,6 +72,7 @@ from app.agent.skills.registry import skill
         "generate_kline_chart",
     ],
     priority=9,
+    default_weight=1.1,
 )
 class MomentumTrackerSkill:
     """A股动量追踪师子 Agent。"""

@@ -59,6 +59,7 @@ from app.agent.skills.registry import skill
         "list_indicators", "get_indicator_params", "run_indicator_signal",
     ],
     priority=6,
+    default_weight=1.0,
 )
 class BacktestSkill:
     """回测专家子 Agent。"""

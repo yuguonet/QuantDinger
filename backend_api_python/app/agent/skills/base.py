@@ -1,28 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-BaseSkill — Skill 层基类。
+BaseSkill — Skill 层基类 + 默认分析流程。
 
-职责：
-  - 定义 Skill 的标准接口（analyze → SkillReport）
-  - call_tool 自动记录入参出参到 EvalNode 子树
-  - 从 LLM 输出中解析 SkillReport
+使用方式（二选一，都是同一个 BaseSkill 体系）：
 
-使用：
-  class MySkill(BaseSkill):
-      name = "my_skill"
-      description = "..."
-      tools = ["tool_a", "tool_b"]
+  方式 1: @skill 装饰器（推荐，简洁）
+    @skill(name="xxx", description="...", tools=[...], instructions="...", priority=5)
+    class MySkill:
+        pass
+    → 装饰器自动生成 BaseSkill 子类，使用 instructions 作为 prompt
 
-      def build_prompt(self, stock_code, stock_name, context):
-          return f"分析 {stock_name} 的..."
-
-      async def analyze(self, stock_code, stock_name, context) -> SkillReport:
-          data = await self.call_tool("tool_a", stock_code=stock_code)
-          ...
-          return SkillReport(...)
+  方式 2: 直接继承（需要自定义分析逻辑时）
+    class MySkill(BaseSkill):
+        name = "xxx"
+        tools = [...]
+        def analyze(self, stock_code, stock_name, context, call_llm, call_tool_fn):
+            ...  # 自定义逻辑
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 from abc import ABC, abstractmethod
@@ -38,28 +35,31 @@ logger = logging.getLogger(__name__)
 class BaseSkill(ABC):
     """Skill 基类。
 
-    子类必须定义：
-      name: str — 技能名（唯一标识）
+    属性（子类或装饰器定义）：
+      name: str — 技能唯一标识
       description: str — 技能描述
       tools: list[str] — 依赖的工具名列表
+      instructions: str — 给 LLM 的指令（装饰器方式使用）
+      priority: int — 优先级（越高越先执行）
 
-    子类可选覆盖：
-      build_prompt() — 构造给 LLM 的 prompt
-      analyze() — 执行分析（如果覆盖，需自行返回 SkillReport）
+    方法：
+      run() — 执行 Skill，返回 (SkillReport, EvalNode)
+      analyze() — 执行分析（可覆盖，默认走 build_prompt + call_llm + parse）
+      build_prompt() — 构造 prompt（可覆盖）
+      call_tool() — 调用工具并自动记录入参出参
     """
 
     name: str = ""
     description: str = ""
     tools: List[str] = []
+    instructions: str = ""   # @skill 装饰器注入的 LLM 指令
     priority: int = 0
+    default_weight: float = 1.0  # 出厂权重，无历史数据时 fallback
 
     def __init__(self):
-        self._tool_calls: List[str] = []
-        self._tool_nodes: List[EvalNode] = []
-        self._missing_data: List[str] = []
-        self._start_time: float = 0.0
+        pass  # 无实例状态，run() 使用局部变量
 
-    async def run(
+    def run(
         self,
         stock_code: str,
         stock_name: str = "",
@@ -69,7 +69,7 @@ class BaseSkill(ABC):
     ) -> tuple[SkillReport, EvalNode]:
         """执行 Skill，返回 (SkillReport, EvalNode)。
 
-        EvalNode 包含该 Skill 的完整执行信息及其 tool 子节点。
+        注意：使用局部状态而非实例变量，避免单例并发问题。
 
         Args:
             stock_code: 股票代码
@@ -81,14 +81,14 @@ class BaseSkill(ABC):
         Returns:
             (SkillReport, EvalNode)
         """
-        self._tool_calls = []
-        self._tool_nodes = []
-        self._missing_data = []
-        self._start_time = time.time()
+        # 局部状态，不污染实例
+        tool_calls: List[str] = []
+        tool_nodes: List[EvalNode] = []
+        missing_data: List[str] = []
+        start_time = time.time()
 
         context = context or {}
 
-        # 创建 Skill 层 EvalNode
         skill_node = EvalNode(
             layer=Layer.SKILL.value,
             name=self.name,
@@ -98,23 +98,24 @@ class BaseSkill(ABC):
         )
 
         try:
-            report = await self.analyze(
+            report = self.analyze(
                 stock_code=stock_code,
                 stock_name=stock_name,
                 context=context,
                 call_llm=call_llm,
                 call_tool_fn=call_tool_fn,
+                _tool_calls=tool_calls,
+                _tool_nodes=tool_nodes,
+                _missing_data=missing_data,
             )
         except Exception as e:
             logger.error("[Skill:%s] 执行失败: %s", self.name, e)
             report = SkillReport(
-                skill_name=self.name,
-                status="failed",
-                error=str(e),
+                skill_name=self.name, status="failed", error=str(e),
             )
 
         # 填充 EvalNode
-        elapsed = (time.time() - self._start_time) * 1000
+        elapsed = (time.time() - start_time) * 1000
         skill_node.score = report.score
         skill_node.direction = report.direction
         skill_node.signal = report.signal
@@ -122,50 +123,105 @@ class BaseSkill(ABC):
         skill_node.factors = report.factors
         skill_node.analysis = report.analysis
         skill_node.output_data = report.output_data
-        skill_node.tools_called = self._tool_calls
-        skill_node.missing_data = self._missing_data
+        skill_node.tools_called = tool_calls
+        skill_node.missing_data = missing_data
         skill_node.status = report.status
         skill_node.error = report.error
         skill_node.elapsed_ms = elapsed
 
-        # 挂载 tool 子节点
-        for tool_node in self._tool_nodes:
+        for tool_node in tool_nodes:
             skill_node.add_child(tool_node)
 
         return report, skill_node
 
-    @abstractmethod
-    async def analyze(
+    def analyze(
         self,
         stock_code: str,
         stock_name: str,
         context: Dict[str, Any],
         call_llm: Callable = None,
         call_tool_fn: Callable = None,
+        _tool_calls: List[str] = None,
+        _tool_nodes: List[EvalNode] = None,
+        _missing_data: List[str] = None,
     ) -> SkillReport:
-        """执行分析，返回 SkillReport。
+        """默认分析流程：调用工具获取数据 → 构造 prompt → 调用 LLM → 解析输出。
 
-        子类实现此方法，使用 self.call_tool() 调用工具。
+        子类可覆盖此方法实现自定义逻辑。
         """
-        ...
+        if not call_tool_fn or not call_llm:
+            return SkillReport(
+                skill_name=self.name, status="failed",
+                error="call_tool_fn 或 call_llm 未提供",
+            )
 
-    async def call_tool(
+        # Step 1: 调用工具获取数据
+        tool_results = {}
+        for tool_name in self.tools:
+            try:
+                result = self.call_tool(
+                    tool_name=tool_name,
+                    call_tool_fn=call_tool_fn,
+                    stock_code=stock_code,
+                    _tool_calls=_tool_calls,
+                    _tool_nodes=_tool_nodes,
+                    _missing_data=_missing_data,
+                )
+                if result is not None:
+                    tool_results[tool_name] = result
+            except Exception as e:
+                logger.warning("[Skill:%s] 工具 %s 调用失败: %s", self.name, tool_name, e)
+
+        if not tool_results:
+            return SkillReport(
+                skill_name=self.name, status="missing",
+                signal="所有工具均无数据",
+                missing_data=self.tools[:],
+            )
+
+        # Step 2: 构造 prompt（含工具数据 + 前序结果）
+        prompt = self.build_prompt(
+            stock_code, stock_name, context,
+            tool_results=tool_results,
+        )
+
+        # Step 3: 调用 LLM
+        try:
+            raw_output = call_llm(prompt)
+        except Exception as e:
+            return SkillReport(
+                skill_name=self.name, status="failed",
+                error=f"LLM 调用失败: {e}",
+            )
+
+        # Step 4: 解析输出
+        from app.agent.chain.contract import parse_skill_output, extract_tools_called
+        report = parse_skill_output(raw_output, skill_name=self.name)
+
+        extra_tools = extract_tools_called(raw_output)
+        if _tool_calls is not None:
+            for t in extra_tools:
+                if t not in _tool_calls:
+                    _tool_calls.append(t)
+
+        if not report.analysis:
+            report.analysis = raw_output[:2000]
+
+        return report
+
+    def call_tool(
         self,
         tool_name: str,
         call_tool_fn: Callable,
+        _tool_calls: List[str] = None,
+        _tool_nodes: List[EvalNode] = None,
+        _missing_data: List[str] = None,
         **kwargs,
     ) -> Any:
-        """调用工具并自动记录。
+        """调用工具并自动记录入参出参到 EvalNode 子树。
 
-        记录入参出参到 EvalNode 子树，供回溯时验证数据准确率。
-
-        Args:
-            tool_name: 工具名
-            call_tool_fn: 工具调用函数
-            **kwargs: 工具参数
-
-        Returns:
-            工具返回值
+        注意：返回值是完整数据（给 LLM 分析用），
+        但 EvalNode.output_data 只存摘要（1~10 条样本，给回溯/审查用）。
         """
         tool_node = EvalNode(
             layer=Layer.TOOL.value,
@@ -181,20 +237,18 @@ class BaseSkill(ABC):
             tool_node.elapsed_ms = elapsed
             tool_node.status = Status.OK.value
 
-            # 记录输出（工具返回的是原始数据，1~10 条 dict）
-            if isinstance(result, (list, dict)):
-                tool_node.output_data = result if isinstance(result, dict) else {"items": result}
-            elif result is None:
-                tool_node.output_data = {}
+            # 存摘要到 EvalNode（1~10条样本 + 元数据），不是全量
+            tool_node.output_data = self._summarize_for_storage(result)
+
+            if result is None:
                 tool_node.status = Status.MISSING.value
-                self._missing_data.append(tool_name)
-            else:
-                tool_node.output_data = {"raw": str(result)[:1000]}
+                if _missing_data is not None:
+                    _missing_data.append(tool_name)
 
-            if tool_name not in self._tool_calls:
-                self._tool_calls.append(tool_name)
-
-            self._tool_nodes.append(tool_node)
+            if _tool_calls is not None and tool_name not in _tool_calls:
+                _tool_calls.append(tool_name)
+            if _tool_nodes is not None:
+                _tool_nodes.append(tool_node)
             return result
 
         except Exception as e:
@@ -203,13 +257,90 @@ class BaseSkill(ABC):
             tool_node.status = Status.FAILED.value
             tool_node.error = str(e)
 
-            if tool_name not in self._tool_calls:
-                self._tool_calls.append(tool_name)
-            self._tool_nodes.append(tool_node)
+            if _tool_calls is not None and tool_name not in _tool_calls:
+                _tool_calls.append(tool_name)
+            if _tool_nodes is not None:
+                _tool_nodes.append(tool_node)
 
             logger.warning("[Skill:%s] 工具 %s 调用失败: %s", self.name, tool_name, e)
             return None
 
-    def build_prompt(self, stock_code: str, stock_name: str, context: Dict[str, Any]) -> str:
-        """构造给 LLM 的 prompt。子类可覆盖。"""
-        return f"请分析 {stock_name or stock_code}（{stock_code}）的{self.description}。"
+    @staticmethod
+    def _summarize_for_storage(data: Any, max_items: int = 10) -> Dict[str, Any]:
+        """将工具返回数据压缩为摘要，用于 EvalNode 存储。
+
+        规则：
+          - dict: 直接保留（已经是摘要结构）
+          - list: 取前 max_items 条 + 总数
+          - 其他: 转字符串截断
+        """
+        if data is None:
+            return {}
+        if isinstance(data, dict):
+            # 如果 dict 内含大列表（如 records/stocks/items），截断它们
+            summary = {}
+            for k, v in data.items():
+                if isinstance(v, list) and len(v) > max_items:
+                    summary[k] = v[:max_items]
+                    summary[f"{k}_total"] = len(v)
+                else:
+                    summary[k] = v
+            return summary
+        if isinstance(data, list):
+            return {"items": data[:max_items], "total": len(data)}
+        return {"raw": str(data)[:1000]}
+
+    def build_prompt(
+        self,
+        stock_code: str,
+        stock_name: str,
+        context: Dict[str, Any],
+        tool_results: Dict[str, Any] = None,
+    ) -> str:
+        """构造给 LLM 的 prompt。
+
+        优先使用 self.instructions（@skill 装饰器注入），
+        否则用 description 生成简单 prompt。
+
+        Args:
+            stock_code: 股票代码
+            stock_name: 股票名称
+            context: 上下文（含 previous_results）
+            tool_results: 工具返回数据（注入到 prompt 中）
+        """
+        parts = []
+
+        # 主指令
+        if self.instructions:
+            parts.append(self.instructions)
+        else:
+            parts.append(f"请分析 {stock_name or stock_code}（{stock_code}）的{self.description}。")
+
+        # 分析目标
+        parts.append(f"\n## 分析目标\n股票: {stock_name or stock_code}（{stock_code}）")
+
+        # 前序 Skill 结果摘要（如果有）
+        prev = context.get("previous_results", [])
+        if prev:
+            parts.append("\n## 前序分析摘要\n")
+            for r in prev:
+                parts.append(f"- **{r.get('skill', '?')}**: {r.get('direction', '?')} | {r.get('signal', '')}")
+
+        # 工具返回数据（控制总量）
+        if tool_results:
+            parts.append("\n## 工具返回数据\n")
+            total_chars = 0
+            max_total = 12000  # 工具数据总量上限
+            for tool_name, data in tool_results.items():
+                data_str = json.dumps(data, ensure_ascii=False, default=str)
+                remaining = max_total - total_chars
+                if remaining <= 0:
+                    parts.append(f"### {tool_name}\n(数据量超限，已跳过)\n")
+                    continue
+                if len(data_str) > remaining:
+                    data_str = data_str[:remaining] + "...(截断)"
+                parts.append(f"### {tool_name}\n```json\n{data_str}\n```\n")
+                total_chars += len(data_str)
+
+        parts.append("\n必须调用工具获取真实数据，绝不编造。")
+        return "\n".join(parts)

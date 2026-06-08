@@ -66,6 +66,7 @@ from app.agent.skills.registry import skill
         "search_stock_by_name",
     ],
     priority=7,
+    default_weight=0.7,
 )
 class HotMoneyTrackerSkill:
     """A股游资追踪师子 Agent。"""

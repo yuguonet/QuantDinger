@@ -158,12 +158,30 @@ class ChainExecutor:
         self._skill_weights = self._load_skill_weights()
 
     def _load_skill_weights(self) -> Dict[str, float]:
-        """从评估系统加载历史 skill 准确率权重。"""
+        """从评估系统加载历史 skill 准确率权重。
+
+        优先用历史评估数据，无历史时用 skill 的 default_weight（出厂权重）。
+        """
         try:
             weights = store.get_skill_weights(self.chain_id)
             if weights:
                 logger.info("[ChainExecutor] 加载历史权重 %s: %s", self.chain_id, weights)
-            return weights
+                return weights
+        except Exception:
+            pass
+
+        # 无历史数据，从 skill 的出厂权重构建
+        try:
+            from app.agent.skills.registry import skill_registry
+            skill_registry.discover()
+            defaults = {}
+            for step in self.chain_def.steps:
+                sk = skill_registry.get(step.agent)
+                if sk and hasattr(sk, "default_weight"):
+                    defaults[step.agent] = sk.default_weight
+            if defaults:
+                logger.info("[ChainExecutor] 使用出厂权重 %s: %s", self.chain_id, defaults)
+            return defaults
         except Exception:
             return {}
 

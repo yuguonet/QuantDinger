@@ -63,6 +63,7 @@ from app.agent.skills.registry import skill
         "search_stock_by_name",
     ],
     priority=8,
+    default_weight=1.0,
 )
 class ScreeningSkill:
     """选股专家子 Agent。"""

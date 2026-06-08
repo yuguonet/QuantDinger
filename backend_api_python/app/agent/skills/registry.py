@@ -1,31 +1,119 @@
 # -*- coding: utf-8 -*-
 """
-Skill Registry — BaseSkill 子类自动发现 + 注册。
+Skill Registry — 统一 Skill 注册中心。
+
+支持两种注册方式（殊途同归，最终都是 BaseSkill 子类）：
+
+  方式 1: @skill 装饰器（推荐，简洁）
+    @skill(name="xxx", description="...", tools=[...], priority=5)
+    class MySkill:
+        pass
+
+  方式 2: 直接继承 BaseSkill（灵活，可覆盖 build_prompt/analyze）
+    class MySkill(BaseSkill):
+        name = "xxx"
+        description = "..."
+        tools = [...]
 
 生命周期：
-  1. 各 skill 模块定义 BaseSkill 子类（technical.py, momentum.py 等）
-  2. registry.discover() 导入 skills/ 包下所有模块
-  3. registry.get(name) → BaseSkill 实例
-  4. registry.all_skills → 按 priority 排序的 Skill 列表
-
-与旧版区别：
-  - 旧版：@skill 装饰器注册 → build_managed_agents() 构建 smolagents ManagedAgent
-  - 新版：BaseSkill 子类自动发现 → 直接实例化，不依赖 smolagents
+  1. 模块加载时 @skill 装饰器自动注册，或 BaseSkill 子类被 discover() 发现
+  2. skill_registry.discover() 导入 skills/ 包下所有模块
+  3. skill_registry.get(name) → BaseSkill 实例
+  4. skill_registry.all_skills → 按 priority 排序的 Skill 列表
 """
 from __future__ import annotations
 
 import importlib
 import logging
 import pkgutil
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Callable, Dict, List, Optional, Type
 
 from app.agent.skills.base import BaseSkill
 
 logger = logging.getLogger(__name__)
 
 
+# ═══════════════════════════════════════════════════════════════
+# @skill 装饰器
+# ═══════════════════════════════════════════════════════════════
+
+def skill(
+    name: str,
+    description: str = "",
+    tools: List[str] = None,
+    instructions: str = "",
+    priority: int = 0,
+    default_weight: float = 1.0,
+) -> Callable:
+    """装饰器：将普通类转换为 BaseSkill 子类并自动注册。
+
+    使用示例：
+        @skill(
+            name="momentum_tracker",
+            description="A股动量追踪师",
+            tools=["analyze_trend", "get_indicator_snapshot"],
+            priority=9,
+        )
+        class MomentumTrackerSkill:
+            pass
+
+    装饰后：
+        - MomentumTrackerSkill 变成 BaseSkill 的子类
+        - 自动注册到全局 skill_registry
+        - instructions 存储在类属性中，由 BaseSkill.build_prompt() 使用
+
+    Args:
+        name: 技能唯一标识
+        description: 技能描述
+        tools: 依赖的工具名列表
+        instructions: 给 LLM 的指令（注入到 prompt 中）
+        priority: 优先级（越高越先执行）
+
+    Returns:
+        装饰器函数
+    """
+    tools = tools or []
+
+    def decorator(cls) -> Type[BaseSkill]:
+        # 从装饰的类中提取 analyze 方法（如果有）
+        custom_analyze = cls.__dict__.get("analyze")
+
+        # 动态创建 BaseSkill 子类
+        skill_cls = type(cls.__name__, (BaseSkill,), {
+            "name": name,
+            "description": description,
+            "tools": list(tools),
+            "instructions": instructions,
+            "priority": priority,
+            "default_weight": default_weight,
+            # 保留原始类的模块和限定名
+            "__module__": cls.__module__,
+            "__qualname__": cls.__qualname__,
+        })
+
+        # 如果原始类定义了 analyze 方法，覆盖默认实现
+        if custom_analyze is not None:
+            skill_cls.analyze = custom_analyze
+
+        # 自动注册到全局 registry
+        skill_registry.register(skill_cls)
+
+        return skill_cls
+
+    return decorator
+
+
+# ═══════════════════════════════════════════════════════════════
+# Skill Registry
+# ═══════════════════════════════════════════════════════════════
+
 class SkillRegistry:
-    """BaseSkill 子类注册中心。"""
+    """BaseSkill 子类注册中心。
+
+    支持两种来源：
+      1. @skill 装饰器自动注册（模块加载时发生）
+      2. BaseSkill 子类自动发现（discover() 时扫描）
+    """
 
     def __init__(self):
         self._skills: Dict[str, Type[BaseSkill]] = {}
@@ -37,11 +125,18 @@ class SkillRegistry:
         if not hasattr(cls, "name") or not cls.name:
             logger.warning("[SkillRegistry] 跳过无 name 的类: %s", cls)
             return
+        if cls.name in self._skills:
+            logger.debug("[SkillRegistry] 覆盖注册: %s", cls.name)
         self._skills[cls.name] = cls
-        logger.debug("[SkillRegistry] 注册: %s", cls.name)
+        # 清除旧实例缓存（如果覆盖注册）
+        self._instances.pop(cls.name, None)
+        logger.debug("[SkillRegistry] 注册: %s (priority=%s)", cls.name, getattr(cls, "priority", 0))
 
     def discover(self, package: str = "app.agent.skills"):
-        """导入包下所有模块，自动发现 BaseSkill 子类并注册。"""
+        """导入包下所有模块，自动发现 BaseSkill 子类并注册。
+
+        @skill 装饰器在模块加载时已自动注册，这里补充发现直接继承 BaseSkill 的类。
+        """
         if self._discovered:
             return
 
@@ -53,7 +148,7 @@ class SkillRegistry:
                 continue
             try:
                 mod = importlib.import_module(f"{package}.{mod_name}")
-                # 扫描模块中的 BaseSkill 子类
+                # 扫描模块中的 BaseSkill 子类（排除 BaseSkill 自身）
                 for attr_name in dir(mod):
                     attr = getattr(mod, attr_name)
                     if (

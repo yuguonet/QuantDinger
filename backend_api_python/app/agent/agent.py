@@ -404,33 +404,48 @@ def _step_to_events(step) -> List[Dict[str, Any]]:
 # ═══════════════════════════════════════════════════════════════
 
 def _build_managed_agents(smol_model) -> list:
-    """Build specialized sub-agents from skill registry.
+    """Build smolagents ManagedAgents from BaseSkill registry.
 
-    Skills are auto-discovered from app/agent/skills/*.py modules
-    that use the @skill decorator. No hardcoded agent definitions here.
+    每个 BaseSkill → 一个 smolagents ManagedAgent。
+    BaseSkill 的 instructions 作为 agent 的 instructions，
+    BaseSkill 的 tools 作为 agent 的工具集。
     """
     from app.agent.skills.registry import skill_registry
+    from smolagents import ManagedAgent
 
-    tools = build_all_tools()
-    tool_map = {t.name: t for t in tools}
+    all_tools = build_all_tools()
+    tool_map = {t.name: t for t in all_tools}
 
     AgentClass = _get_agent_class()
-    base_kwargs = dict(
-        model=smol_model,
-        max_steps=8,
-        verbosity_level=LogLevel.INFO,
-        stream_outputs=True,
-        provide_run_summary=True,
-    )
-
-    # Discover and build from registry
     skill_registry.discover()
-    agents = skill_registry.build_managed_agents(
-        smol_model=smol_model,
-        tool_map=tool_map,
-        agent_class=AgentClass,
-        base_kwargs=base_kwargs,
-    )
+
+    agents = []
+    for skill_inst in skill_registry.all_skills:
+        # 从 tool_map 中筛选该 skill 需要的工具
+        skill_tools = [tool_map[t] for t in skill_inst.tools if t in tool_map]
+        if not skill_tools:
+            # 没有可用工具的 skill 不作为 managed agent（走 chain 路径）
+            continue
+
+        # 用 BaseSkill 的 instructions 作为 agent 指令
+        instructions = skill_inst.instructions or skill_inst.description
+
+        sub_agent = AgentClass(
+            tools=skill_tools,
+            model=smol_model,
+            max_steps=8,
+            instructions=instructions,
+            verbosity_level=LogLevel.INFO,
+            stream_outputs=True,
+        )
+
+        managed = ManagedAgent(
+            agent=sub_agent,
+            name=skill_inst.name,
+            description=skill_inst.description,
+        )
+        agents.append(managed)
+
     logger.info("[Agent] Built %d managed agents from skill registry", len(agents))
     return agents
 
@@ -879,25 +894,48 @@ class _AgentExecutor:
 
         logger.info("[Chain] 触发链路 %s | 股票=%s", chain_def.chain_id, stock_code)
 
-        # 构建 managed agents 映射
+        # 构建 Skill 实例（BaseSkill 统一体系）
         from app.agent.session_store import get_session_store
         store = get_session_store()
 
         try:
+            from app.agent.skills.registry import skill_registry
+            skill_registry.discover()
             smol_model = build_model(self.model, self.provider)
-            managed_agents = _build_managed_agents(smol_model)
-            agent_map = {ma.name: ma for ma in managed_agents}
         except Exception as e:
-            logger.warning("[Chain] 构建 managed agents 失败: %s", e)
+            logger.warning("[Chain] 初始化失败: %s", e)
             return None
 
-        # run_agent_fn：调用指定的子 agent
-        def run_agent_fn(agent_name: str, msg: str, ctx: dict) -> str:
-            sub_agent = agent_map.get(agent_name)
-            if not sub_agent:
-                raise ValueError(f"Unknown agent: {agent_name}")
-            result = sub_agent.run(msg, max_steps=8)
-            return str(result.output) if hasattr(result, "output") else str(result)
+        # 工具只构建一次，所有 skill 共享
+        from app.agent.tool_adapter import build_all_tools
+        _all_tools = build_all_tools()
+        _tool_map = {t.name: t for t in _all_tools}
+
+        # run_skill_fn：调用指定的 BaseSkill
+        def run_skill_fn(skill_name: str, scode: str, sname: str, ctx: dict) -> tuple:
+            sk = skill_registry.get(skill_name)
+            if not sk:
+                raise ValueError(f"Unknown skill: {skill_name}")
+
+            def call_llm(prompt: str) -> str:
+                # smolagents OpenAIModel 接口: model(messages) → ChatMessage
+                messages = [{"role": "user", "content": prompt}]
+                response = smol_model(messages)
+                return response.content if hasattr(response, "content") else str(response)
+
+            def call_tool_fn(tool_name: str, **kwargs):
+                t = _tool_map.get(tool_name)
+                if not t:
+                    raise ValueError(f"Unknown tool: {tool_name}")
+                return t(**kwargs)
+
+            return sk.run(
+                stock_code=scode,
+                stock_name=sname,
+                context=ctx,
+                call_llm=call_llm,
+                call_tool_fn=call_tool_fn,
+            )
 
         # 执行链路
         from app.agent.chain.executor import ChainExecutor
@@ -908,7 +946,7 @@ class _AgentExecutor:
             user_id=user_id,
         )
         chain_result = executor.execute(
-            run_skill_fn=run_agent_fn,
+            run_skill_fn=run_skill_fn,
             context={"user_query": message},
         )
 

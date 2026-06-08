@@ -63,6 +63,7 @@ from app.agent.skills.registry import skill
         "run_indicator_signal",
     ],
     priority=7,
+    default_weight=1.1,
 )
 class IndicatorAgent:
     """用户自定义指标策略执行 Agent。"""

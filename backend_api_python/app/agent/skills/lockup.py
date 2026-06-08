@@ -64,6 +64,7 @@ from app.agent.skills.registry import skill
         "search_stock_by_name",
     ],
     priority=6,
+    default_weight=0.8,
 )
 class LockupWatcherSkill:
     """A股解禁监控师子 Agent。"""

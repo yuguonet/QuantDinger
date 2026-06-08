@@ -69,6 +69,7 @@ from app.agent.skills.registry import skill
         "analyze_trend", "get_volume_analysis",
     ],
     priority=5,
+    default_weight=1.0,
 )
 class BearResearcherSkill:
     """空头研究员子 Agent。"""
