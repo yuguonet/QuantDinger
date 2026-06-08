@@ -505,6 +505,12 @@ def _extract_stock_name(message: str) -> Optional[str]:
     match = re.search(r'[\u4e00-\u9fff]{2,6}', message)
     if match:
         candidate = match.group(0)
+        # 剥离动词前缀
+        for _vp in ["分析", "查看", "看看", "查询", "评估", "判断", "研究", "解读",
+                    "帮我看看", "帮我分析", "帮我查"]:
+            if candidate.startswith(_vp) and len(candidate) > len(_vp):
+                candidate = candidate[len(_vp):]
+                break
         if candidate not in stopwords:
             try:
                 from app.utils.basicinfo_db import get_stock_basic_db
@@ -557,6 +563,40 @@ class VerbNounRouter:
 
         # ── Step 2: 匹配对象 ──
         noun = _match_noun(message)
+
+        # ── Step 2.5: 中文股票名数据库兜底 ──
+        # _match_noun 只能匹配硬编码的股票名（茅台/比亚迪等）和数字代码，
+        # 用户输入"分析宇通客车"时 noun 为 None，导致链路无法触发。
+        # 这里用 DB 查询兜底：提取中文词 → search_stocks → 命中则 noun="stock"
+        if not noun:
+            _stock_stopwords = {
+                "帮我", "分析", "查看", "看看", "查询", "怎么样", "什么", "如何",
+                "的", "了", "吗", "吧", "呢", "啊", "一下", "最近", "今天", "昨天",
+                "修改", "修复", "创建", "写", "生成", "筛选", "选择", "回测", "启动",
+                "停止", "显示", "展示", "项目", "代码", "文件", "目录", "评估",
+                "判断", "研究", "解读", "情况", "状态", "走势", "趋势", "行情",
+                "策略", "指标", "信号", "买入", "卖出", "持有", "观望", "建议",
+                "推荐", "潜力", "风险", "机会", "分析一下", "怎么样",
+            }
+            _cn_match = re.search(r'[\u4e00-\u9fff]{2,8}', message)
+            if _cn_match:
+                _candidate = _cn_match.group(0)
+                # 剥离动词前缀："分析金帝股份" → "金帝股份"
+                for _vp in ["分析", "查看", "看看", "查询", "评估", "判断", "研究", "解读",
+                            "帮我看看", "帮我分析", "帮我查"]:
+                    if _candidate.startswith(_vp) and len(_candidate) > len(_vp):
+                        _candidate = _candidate[len(_vp):]
+                        break
+                if _candidate not in _stock_stopwords:
+                    try:
+                        from app.utils.basicinfo_db import get_stock_basic_db
+                        _matches = get_stock_basic_db().search_stocks(_candidate, limit=1)
+                        if _matches:
+                            noun = "stock"
+                            logger.info("[VerbNoun] 中文名 '%s' → noun=stock (code=%s)",
+                                        _candidate, _matches[0].get("symbol", ""))
+                    except Exception:
+                        pass
 
         # ── Step 3: 组合 ──
         result = None
