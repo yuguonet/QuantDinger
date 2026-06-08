@@ -6,6 +6,11 @@ Skill 层输出标准化：
   每个 Skill 的 final_answer 必须包含 JSON 结构（direction/confidence/score/signal/factors）
   本模块负责从 LLM 原始输出中解析出 SkillReport。
 
+核心规则 — Skill 层职责边界：
+  ✅ 允许输出：score / direction / confidence / signal / factors / analysis（事实描述）
+  ❌ 禁止输出：action（buy/sell/hold/skip）— 这是 Chain 层的权力
+  Skill 只负责"打分+描述事实"，不负责"给操作建议"
+
 解析策略（三重降级）：
   1. JSON 块 — 直接提取 ```json ... ``` 中的结构化数据
   2. 关键词匹配 — 从文本中提取 direction/score/signal
@@ -28,6 +33,10 @@ def parse_skill_output(raw_output: str, skill_name: str = "") -> SkillReport:
 
     三重降级：JSON 块 → 关键词匹配 → 兜底 neutral。
 
+    Skill 层职责边界：
+      ✅ 输出: score / direction / confidence / signal / factors / analysis（事实描述）
+      ❌ 禁止: action（buy/sell/hold/skip）— 由 Chain 层决定
+
     Args:
         raw_output: LLM 的原始 final_answer 文本
         skill_name: 技能名
@@ -41,16 +50,16 @@ def parse_skill_output(raw_output: str, skill_name: str = "") -> SkillReport:
     # 策略 1: JSON 块
     report = _try_parse_json_block(raw_output, skill_name)
     if report:
-        return report
+        return _sanitize_report(report)
 
     # 策略 2: 关键词匹配
     report = _try_parse_keywords(raw_output, skill_name)
     if report:
-        return report
+        return _sanitize_report(report)
 
     # 策略 3: 兜底
     logger.warning("[Contract] 无法解析 skill 输出，兜底 neutral: %s", skill_name)
-    return SkillReport(
+    return _sanitize_report(SkillReport(
         skill_name=skill_name,
         score=50.0,
         confidence=0.0,
@@ -58,7 +67,47 @@ def parse_skill_output(raw_output: str, skill_name: str = "") -> SkillReport:
         signal="输出格式不规范，无法解析",
         analysis=raw_output[:2000],
         status="ok",
-    )
+    ))
+
+
+def _sanitize_report(report: SkillReport) -> SkillReport:
+    """清理 SkillReport，确保 Skill 层不越权。
+
+    - 移除 output_data 中的 action 字段（Skill 无权决定操作）
+    - 清理 analysis 中的操作建议语句
+    """
+    # 移除 output_data 中的 action
+    if report.output_data and "action" in report.output_data:
+        del report.output_data["action"]
+
+    # 清理 analysis 中的操作建议（替换为事实描述）
+    if report.analysis:
+        report.analysis = _strip_action_advice(report.analysis)
+
+    return report
+
+
+# 操作建议关键词 → 替换为事实描述
+_ACTION_PATTERNS = [
+    # 中文操作建议
+    (r'建议[适量分批]*(买入|建仓|加仓|抄底|补仓)', r'技术面显示偏多信号'),
+    (r'建议[适量]*(卖出|减仓|清仓|离场|止损)', r'技术面显示偏空信号'),
+    (r'可以[适量分批]*(买入|建仓|加仓|抄底)', r'技术面显示偏多信号'),
+    (r'可以[适量]*(卖出|减仓|清仓)', r'技术面显示偏空信号'),
+    (r'[可建议]*(持有|观望|等待)', r'技术面显示中性信号'),
+    (r'[操作建议：：]*\s*(买入|卖出|持有|观望)', r'方向：\1'),
+    # 英文操作建议
+    (r'[Ss]uggest\w*\s+(buy|sell|hold)', r'technical signal: \1'),
+    (r'[Rr]ecommend\w*\s+(buy|sell|hold)', r'technical signal: \1'),
+]
+
+
+def _strip_action_advice(text: str) -> str:
+    """从分析文本中移除操作建议语句，保留事实描述。"""
+    import re
+    for pattern, replacement in _ACTION_PATTERNS:
+        text = re.sub(pattern, replacement, text)
+    return text
 
 
 def _try_parse_json_block(raw: str, skill_name: str) -> Optional[SkillReport]:

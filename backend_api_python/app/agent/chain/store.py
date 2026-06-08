@@ -89,7 +89,7 @@ def _save_node(cur, node: EvalNode, parent_id: Optional[int], root_id: Optional[
             node.human_reviewed, node.human_verdict,
             node.id,
         ))
-        node_id = cur.fetchone()[0]
+        node_id = cur.fetchone()['id']
     else:
         # INSERT
         cur.execute("""
@@ -125,7 +125,7 @@ def _save_node(cur, node: EvalNode, parent_id: Optional[int], root_id: Optional[
             node.actual_direction_3d, node.correct_3d, node.calibration,
             node.human_reviewed, node.human_verdict,
         ))
-        node_id = cur.fetchone()[0]
+        node_id = cur.fetchone()['id']
 
     node.id = node_id
     if root_id is None:
@@ -290,12 +290,12 @@ def query_roots(
 
             return [
                 {
-                    "id": row[0], "exec_date": row[1].isoformat() if row[1] else None,
-                    "stock_code": row[2], "stock_name": row[3],
-                    "chain_id": row[4], "score": row[5], "action": row[6],
-                    "direction": row[7], "confidence": row[8],
-                    "status": row[9],
-                    "created_at": row[10].isoformat() if row[10] else None,
+                    "id": row['id'], "exec_date": row['exec_date'].isoformat() if row['exec_date'] else None,
+                    "stock_code": row['stock_code'], "stock_name": row['stock_name'],
+                    "chain_id": row['name'], "score": row['score'], "action": row['action'],
+                    "direction": row['direction'], "confidence": row['confidence'],
+                    "status": row['status'],
+                    "created_at": row['created_at'].isoformat() if row['created_at'] else None,
                 }
                 for row in cur.fetchall()
             ]
@@ -325,9 +325,9 @@ def query_pending_verify(days_old: int = 1, limit: int = 100) -> List[Dict[str, 
 
             return [
                 {
-                    "id": row[0], "exec_date": row[1],
-                    "stock_code": row[2], "stock_name": row[3],
-                    "chain_id": row[4], "action": row[5],
+                    "id": row['id'], "exec_date": row['exec_date'],
+                    "stock_code": row['stock_code'], "stock_name": row['stock_name'],
+                    "chain_id": row['name'], "action": row['action'],
                 }
                 for row in cur.fetchall()
             ]
@@ -500,25 +500,26 @@ def get_eval_stats(chain_id: str = None) -> Dict[str, Any]:
             params = [chain_id] if chain_id else []
 
             cur.execute(f"""
-                SELECT COUNT(*), COUNT(CASE WHEN correct_3d IS NOT NULL THEN 1 END)
+                SELECT COUNT(*) as total,
+                       COUNT(CASE WHEN correct_3d IS NOT NULL THEN 1 END) as evaluated
                 FROM qd_evaluations
                 WHERE parent_id IS NULL {chain_filter}
             """, params)
 
             row = cur.fetchone()
             if row:
-                result["total_decisions"] = row[0]
-                result["evaluated_decisions"] = row[1]
+                result["total_decisions"] = row['total']
+                result["evaluated_decisions"] = row['evaluated']
 
             if result["evaluated_decisions"] > 0:
                 cur.execute(f"""
-                    SELECT AVG(CASE WHEN correct_3d THEN 1.0 ELSE 0.0 END)
+                    SELECT AVG(CASE WHEN correct_3d THEN 1.0 ELSE 0.0 END) as acc
                     FROM qd_evaluations
                     WHERE parent_id IS NULL AND correct_3d IS NOT NULL {chain_filter}
                 """, params)
                 acc = cur.fetchone()
-                if acc and acc[0] is not None:
-                    result["overall_accuracy_3d"] = round(float(acc[0]), 3)
+                if acc and acc['acc'] is not None:
+                    result["overall_accuracy_3d"] = round(float(acc['acc']), 3)
 
             result["ready_for_decision"] = result["evaluated_decisions"] >= 10
 

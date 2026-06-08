@@ -30,25 +30,32 @@ from app.agent.skills.registry import skill
         "A股特别注意：涨停板是极强信号，连板高度代表市场情绪强度，"
         "换手率>15%要警惕，量比>3说明有异动。\n\n"
         "必须调用工具获取真实数据，绝不编造。\n\n"
+        "## ⚠️ 职责边界\n"
+        "你是分析层，只描述事实，不给操作建议。\n"
+        "❌ 禁止说：建议买入/卖出/持有/观望/建仓/减仓\n"
+        "✅ 应该说：当前趋势为XX、指标显示XX、均线排列为XX\n\n"
         "## 输出格式（必须遵守）\n"
-        "你的 final_answer 必须包含以下JSON结构：\n\n"
+        "只输出JSON，不要输出分析文字。数据都在JSON里体现。\n\n"
         "```json\n"
         "{\n"
         '  "direction": "bullish/bearish/neutral",\n'
         '  "confidence": 0.0-1.0,\n'
         '  "score": 0-100,\n'
-        '  "signal": "一句话信号摘要",\n'
+        '  "signal": "一句话事实描述，如：空头排列,RSI29超卖,触及布林下轨",\n'
         '  "factors": [\n'
-        '    {"name": "因子名", "value": "值", "score": 0-100, "status": "ok"}\n'
+        '    {"name": "趋势", "value": "下跌趋势|主升浪|底部吸筹|顶部派发", "score": 0-100},\n'
+        '    {"name": "量价", "value": "缩量下跌|放量突破|...", "score": 0-100},\n'
+        '    {"name": "均线", "value": "空头排列|多头排列|...", "score": 0-100},\n'
+        '    {"name": "指标", "value": "RSI29超卖|MACD死叉|...", "score": 0-100},\n'
+        '    {"name": "形态", "value": "破位|支撑|...", "score": 0-100}\n'
         "  ]\n"
         "}\n"
         "```\n\n"
         "规则：\n"
-        "- score: 0=极度看空, 50=中性, 100=极度看多\n"
-        "- confidence: 数据充分程度（0=完全没数据, 1=数据非常充分）\n"
+        "- score: 0=极度看空, 50=中性, 100=极度看多（方向强度，不是操作信号）\n"
         "- direction: score>=60=bullish, score<=40=bearish, 其余=neutral\n"
-        "- status: ok=有数据, missing=数据缺失\n"
-        "- factors: 每个分析维度一行"
+        "- signal: 用逗号分隔的关键事实，不超过30字\n"
+        "- factors.value: 用最简短的词组描述状态，不要写句子"
     ),
 )
 class TechnicalSkill:

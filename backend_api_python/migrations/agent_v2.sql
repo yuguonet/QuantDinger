@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS qd_evaluations (
     -- 正向: 内容 (全量记录)
     factors         JSONB,                          -- skill: [{name, value, score, weight, status}]
     output_data     JSONB,                          -- chain: 决策卡+建议, skill: 分析报告, tool: 1~10条dict
+    analysis        TEXT,                           -- 分析文字（内容主体）
 
     -- 正向: 调用信息
     input_params    JSONB,                          -- 入口参数 (chain: 用户消息+意图, skill: 分析对象, tool: 完整参数)

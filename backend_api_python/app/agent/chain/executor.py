@@ -82,50 +82,65 @@ class DecisionResult:
 
     @property
     def content(self) -> str:
-        """返回可读的决策报告。"""
+        """返回可读的决策报告（精简版）。"""
         if not self.root_node:
             return "链路执行未产生决策。"
-        return self._to_markdown()
+        return self._to_compact()
 
-    def _to_markdown(self) -> str:
-        lines = []
-        action_cn = {
-            "buy": "建议买入", "sell": "建议卖出",
-            "hold": "建议观望", "skip": "建议跳过",
-        }
-        lines.append(f"## {action_cn.get(self.action, '建议观望')}: {self.stock_name}({self.stock_code})")
-        lines.append(f"**综合评分**: {self.score:.1f}/100 | **置信度**: {self.confidence}")
-        lines.append(f"**理由**: {self.reason}")
-        lines.append("")
+    def _to_compact(self) -> str:
+        """精简输出：只输出核心决策数据 + 分项明细表。"""
+        action_cn = {"buy": "买入", "sell": "卖出", "hold": "观望", "skip": "跳过"}
+        lines = [
+            f"**{action_cn.get(self.action, '观望')}** {self.stock_name}({self.stock_code})",
+            f"评分:{self.score:.0f} 方向:{self.direction} 置信:{self.confidence}",
+        ]
 
+        # 分项明细（紧凑格式）
         if self.root_node and self.root_node.children:
-            lines.append("### 分项明细")
-            lines.append("| 维度 | 评分 | 方向 | 信号 |")
-            lines.append("|------|------|------|------|")
+            parts = []
             for child in self.root_node.children:
                 if child.layer == Layer.SKILL.value:
                     cn = get_skill_cn_name(child.name)
-                    score_str = f"{child.score:.0f}" if child.score is not None else "—"
-                    lines.append(f"| {cn} | {score_str} | {child.direction} | {child.signal} |")
-            lines.append("")
+                    s = f"{child.score:.0f}" if child.score is not None else "—"
+                    parts.append(f"{cn}:{s}/{child.direction}")
+            if parts:
+                lines.append(" | ".join(parts))
 
         if self.human_note:
-            lines.append(f"> 💡 **人工复核提示**: {self.human_note}")
+            lines.append(f"⚠ {self.human_note}")
 
         return "\n".join(lines)
 
+    def _to_markdown(self) -> str:
+        """兼容旧接口，实际调用精简版。"""
+        return self._to_compact()
+
     def to_dict(self) -> Dict[str, Any]:
         d = {
-            "chain_id": self.chain_id, "stock_code": self.stock_code,
-            "stock_name": self.stock_name, "action": self.action,
-            "score": self.score, "confidence": self.confidence,
-            "direction": self.direction, "reason": self.reason,
-            "recommendation": self.recommendation,
-            "success": self.success, "execution_id": self.execution_id,
+            "action": self.action,
+            "score": self.score,
+            "direction": self.direction,
+            "confidence": self.confidence,
+            "reason": self.reason,
+            "success": self.success,
             "elapsed_ms": self.elapsed_ms,
         }
-        if self.root_node:
-            d["root_node"] = self.root_node.to_dict()
+        # 分项明细（精简）
+        if self.root_node and self.root_node.children:
+            d["breakdown"] = [
+                {
+                    "skill": get_skill_cn_name(c.name),
+                    "score": c.score,
+                    "direction": c.direction,
+                    "signal": c.signal,
+                }
+                for c in self.root_node.children
+                if c.layer == Layer.SKILL.value
+            ]
+        if self.human_note:
+            d["human_note"] = self.human_note
+        if self.execution_id:
+            d["execution_id"] = self.execution_id
         return d
 
 

@@ -343,4 +343,14 @@ class BaseSkill(ABC):
                 total_chars += len(data_str)
 
         parts.append("\n必须调用工具获取真实数据，绝不编造。")
+
+        # Skill 层职责约束 — 只输出数据，不输出建议
+        parts.append(
+            "\n## ⚠️ 输出规范（必须遵守）\n"
+            "你是分析层，不是决策层。只输出JSON，不输出分析文字。\n"
+            "✅ 允许: score / direction / confidence / signal / factors（数据事实）\n"
+            "❌ 禁止: 操作建议（买入/卖出/持有/观望）/ 冗长分析文字 / action 字段\n"
+            "signal 和 factors.value 用最简短的词组，不要写句子。\n"
+        )
+
         return "\n".join(parts)

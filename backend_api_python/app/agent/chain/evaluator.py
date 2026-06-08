@@ -354,8 +354,8 @@ def get_eval_report(chain_id: str = None, days: int = 30) -> Dict[str, Any]:
             row = cur.fetchone()
             if row:
                 result["overall"] = {
-                    "chain_id": row[0], "total": row[1],
-                    "accuracy_3d": round(row[2], 3) if row[2] else 0,
+                    "chain_id": row['name'], "total": row['total'],
+                    "accuracy_3d": round(row['acc_3d'], 3) if row['acc_3d'] else 0,
                 }
 
             # 各 skill 准确率
@@ -372,8 +372,8 @@ def get_eval_report(chain_id: str = None, days: int = 30) -> Dict[str, Any]:
             """, params)
 
             result["skills"] = [
-                {"name": row[0], "count": row[1],
-                 "accuracy_3d": round(row[2], 3) if row[2] else 0}
+                {"name": row['name'], "count": row['cnt'],
+                 "accuracy_3d": round(row['acc_3d'], 3) if row['acc_3d'] else 0}
                 for row in cur.fetchall()
             ]
 
@@ -387,8 +387,8 @@ def get_eval_report(chain_id: str = None, days: int = 30) -> Dict[str, Any]:
                 """, (chain_id,))
 
                 result["factors"] = [
-                    {"factor_name": row[0], "accuracy_3d": round(row[1], 3) if row[1] else 0,
-                     "sample_count": row[2]}
+                    {"factor_name": row['factor_name'], "accuracy_3d": round(row['accuracy_3d'], 3) if row['accuracy_3d'] else 0,
+                     "sample_count": row['sample_count']}
                     for row in cur.fetchall()
                 ]
 
