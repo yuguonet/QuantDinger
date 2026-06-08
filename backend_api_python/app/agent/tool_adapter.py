@@ -1,7 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-Tool Adapter — converts QuantDinger's dict-based tool definitions
-into smolagents Tool subclasses. Also loads built-in, Hub, and MCP tools.
+Tool Adapter — 工具适配器。
+
+将 QuantDinger 的 @tool 装饰器注册的函数转换为 smolagents Tool 子类。
+同时加载 smolagents 内置工具、Hub 工具、MCP 工具。
+
+被调用方：
+  agent.py → build_all_tools() → get_smolagent() 构建工具列表
+  agent.py → _build_managed_agents() → 构建子 Agent 的工具列表
+
+公开接口：
+  build_all_tools() → List[Tool]（所有工具）
+  load_tools_from_module(module) → List[Tool]（从模块加载旧式 dict 工具）
 """
 from __future__ import annotations
 

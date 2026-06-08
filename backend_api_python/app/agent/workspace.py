@@ -1,19 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-Code Workspace — persistent per-session file storage for iterative code analysis.
+Code Workspace — 每会话隔离的持久化文件存储。
 
-Each session gets an isolated workspace directory where scripts, data files,
-and execution results persist across tool calls. This enables the agent to:
-- Save scripts for later reuse
-- Build multi-file analysis pipelines
-- Iterate on code with full history
-- Generate reproducible analysis reports
+每个 session 拥有独立的工作空间目录，脚本/数据文件/执行结果跨工具调用持久化。
+支持：保存脚本复用、多文件分析管道、代码迭代、可复现分析报告。
 
-Env configuration:
-    AGENT_WORKSPACE_ROOT       — root directory for all workspaces (default: ./workspaces)
-    AGENT_WORKSPACE_MAX_FILES  — max files per session (default: 100)
-    AGENT_WORKSPACE_MAX_AGE_HOURS — auto-cleanup age in hours (default: 72)
-    AGENT_WORKSPACE_CLEANUP_INTERVAL — cleanup check interval in seconds (default: 3600)
+环境变量：
+  AGENT_WORKSPACE_ROOT         — 工作空间根目录（默认 ./workspaces）
+  AGENT_WORKSPACE_MAX_FILES    — 每 session 最大文件数（默认 100）
+  AGENT_WORKSPACE_MAX_AGE_HOURS — 自动清理年龄（默认 72 小时）
+
+被调用方：
+  tools/code_workspace_tools.py → 所有文件操作工具
+  tools/self_modify_tools.py → 自修改工具
+
+公开接口：
+  get_workspace(session_id, domain) → CodeWorkspace
+  CodeWorkspace.path → Path
+  CodeWorkspace.write_file(name, content) → Path
+  CodeWorkspace.read_file(name) → str
+  CodeWorkspace.list_files() → List[dict]
+  CodeWorkspace.run_script(name, args) → dict
 """
 from __future__ import annotations
 

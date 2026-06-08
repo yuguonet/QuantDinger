@@ -1,24 +1,38 @@
 # -*- coding: utf-8 -*-
 """
-Skill Registry — decorator-based self-registration for QuantDinger skills.
+Skill Registry — @skill 装饰器自注册 + 自动发现 + Managed Agent 构建。
 
-Usage:
-    from app.agent.skills.registry import skill, skill_registry
+生命周期：
+  1. 各 skill 模块用 @skill(...) 装饰器注册（technical.py, momentum.py 等）
+  2. skill_registry.discover() 导入 skills/ 包下所有模块，触发注册
+  3. skill_registry.build_managed_agents() 构建 smolagents Managed Agent 列表
 
-    @skill(
-        name="analysis_agent",
-        description="股票分析专家。负责个股分析。",
-        instructions="你是技术分析专家。按行情→形态→情报→分析流程执行。",
-        tools=["get_realtime_quote", "agent_get_kline", "analyze_trend"],
-    )
-    class AnalysisAgent:
-        ...
+已注册的 15 个 Skill：
+  technical_agent    — 技术分析（趋势/量价/均线/指标/形态）
+  momentum_tracker   — 动量追踪（趋势强度/突破/择时）
+  intelligence_agent — 情报分析（新闻/事件驱动/概念催化）
+  screening_agent    — 选股筛选（条件/动量/概念/龙虎榜）
+  backtest_agent     — 策略回测（A股规则：T+1/涨跌停/印花税）
+  trading_agent      — 交易执行（策略启停/持仓管理）
+  policy_analyst     — 政策面分析
+  hot_money_tracker  — 游资追踪
+  lockup_watcher     — 解禁监控
+  concept_tracker    — 概念追踪
+  market_data_agent  — 市场数据
+  indicator_agent    — 指标信号
+  bull_researcher    — 多头论证
+  bear_researcher    — 空头反驳
+  data_engineer      — 数据工程
 
-    # Discover all skills
-    skill_registry.discover()
+被调用方：
+  agent.py → _build_managed_agents() → skill_registry.discover() + build_managed_agents()
 
-    # Build managed agents
-    agents = skill_registry.build_managed_agents(smol_model, tool_map)
+公开接口：
+  skill_registry.discover(package) → None
+  skill_registry.build_managed_agents(smol_model, tool_map, agent_class, base_kwargs) → list
+  skill_registry.get(name) → Optional[SkillSpec]
+  skill_registry.all_names → List[str]
+  @skill(name, description, instructions, tools, max_steps, priority, **extra_kwargs) → decorator
 """
 from __future__ import annotations
 

@@ -1,8 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Tool Context — inject runtime context (session_id, user_id, progress_callback, etc.)
+Tool Context — 运行时上下文注入。
 
-Uses contextvars for thread-safe, async-safe context propagation.
+使用 contextvars 实现线程安全、异步安全的上下文传播。
+工具执行时可读取 session_id / user_id / progress_callback / domain 等信息。
+
+被调用方：
+  agent.py → set_tool_context() → 注入 session_id, user_id, domain
+  tools/*.py → get_tool_context() → 读取当前上下文
+
+公开接口：
+  set_tool_context(ctx: Dict) → None
+  get_tool_context() → Dict
+  get_tool_context_value(key, default) → Any
 """
 from __future__ import annotations
 

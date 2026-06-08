@@ -616,3 +616,67 @@ def list_tools():
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ═══════════════════════════════════════════════════════════════
+# 路由: Chain 决策评估（手动触发 + 状态查询）
+# ═══════════════════════════════════════════════════════════════
+
+@agent_bp.route("/chain/evaluate", methods=["POST"])
+@login_required
+def trigger_chain_evaluation():
+    """手动触发 Chain 决策评估闭环。
+
+    Body (JSON, all optional):
+        days_old: int = 1       — 只评估至少 N 天前的决策
+        market: str = "CNStock" — 市场类型
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        days_old = int(data.get("days_old", 1))
+        market = data.get("market", "CNStock")
+
+        from app.agent.chain.evaluator import auto_evaluate_and_update
+        result = auto_evaluate_and_update(days_old=days_old, market=market)
+        return jsonify(result)
+    except Exception as e:
+        logger.error("[API] 手动评估失败: %s", e, exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@agent_bp.route("/chain/eval-stats", methods=["GET"])
+@login_required
+def get_chain_eval_status():
+    """查询 Chain 决策评估统计。
+
+    Query params:
+        chain_id: str (optional) — 指定链路 ID
+    """
+    try:
+        chain_id = request.args.get("chain_id")
+        from app.agent.chain.evaluator import get_chain_eval_stats
+        stats = get_chain_eval_stats(chain_id)
+        return jsonify(stats)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@agent_bp.route("/chain/worker-health", methods=["GET"])
+@login_required
+def get_chain_worker_health():
+    """查询 Chain 评估 Worker 健康状态。
+
+    返回：
+        is_alive: bool — worker 线程是否存活
+        last_run_at: str — 上次运行时间
+        last_success_at: str — 上次成功时间
+        last_error: str — 上次错误信息
+        consecutive_failures: int — 连续失败次数
+        total_runs / total_successes / total_failures — 累计统计
+        current_interval: int — 当前等待间隔（秒）
+    """
+    try:
+        from app.agent.chain.evaluator import get_worker_health
+        return jsonify(get_worker_health())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500

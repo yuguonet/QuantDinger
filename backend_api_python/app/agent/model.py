@@ -1,9 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Model adapter — bridges QuantDinger's LLMService config to smolagents OpenAIModel.
+Model Adapter — 桥接 QuantDinger LLM 配置到 smolagents OpenAIModel。
 
-Reads provider/API key/base URL from the existing LLMService configuration
-so there's zero config duplication.
+读取 LLMService 的 provider/API key/base URL，零配置重复。
+
+被调用方：
+  agent.py → build_model() → get_smolagent() 构建 Agent 实例
+  agent.py → _build_managed_agents() → 构建子 Agent 实例
+
+公开接口：
+  build_model(model, provider, temperature, **kwargs) → OpenAIModel
 """
 from __future__ import annotations
 

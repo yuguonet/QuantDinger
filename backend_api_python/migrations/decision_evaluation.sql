@@ -4,7 +4,7 @@
 -- =============================================================================
 -- 1. 决策执行记录
 -- =============================================================================
-CREATE TABLE IF NOT EXISTS qd_decisions (
+CREATE TABLE IF NOT EXISTS qd_agent_decisions (
     id              SERIAL PRIMARY KEY,
     exec_date       DATE NOT NULL,
     stock_code      VARCHAR(20) NOT NULL,
@@ -20,17 +20,17 @@ CREATE TABLE IF NOT EXISTS qd_decisions (
     UNIQUE(exec_date, stock_code, chain_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_decisions_date ON qd_decisions(exec_date);
-CREATE INDEX IF NOT EXISTS idx_decisions_stock ON qd_decisions(stock_code);
-CREATE INDEX IF NOT EXISTS idx_decisions_chain ON qd_decisions(chain_id);
-CREATE INDEX IF NOT EXISTS idx_decisions_action ON qd_decisions(action);
+CREATE INDEX IF NOT EXISTS idx_decisions_date ON qd_agent_decisions(exec_date);
+CREATE INDEX IF NOT EXISTS idx_decisions_stock ON qd_agent_decisions(stock_code);
+CREATE INDEX IF NOT EXISTS idx_decisions_chain ON qd_agent_decisions(chain_id);
+CREATE INDEX IF NOT EXISTS idx_decisions_action ON qd_agent_decisions(action);
 
 -- =============================================================================
 -- 2. 步骤详情
 -- =============================================================================
-CREATE TABLE IF NOT EXISTS qd_decision_steps (
+CREATE TABLE IF NOT EXISTS qd_agent_decision_steps (
     id              SERIAL PRIMARY KEY,
-    decision_id     INTEGER NOT NULL REFERENCES qd_decisions(id) ON DELETE CASCADE,
+    decision_id     INTEGER NOT NULL REFERENCES qd_agent_decisions(id) ON DELETE CASCADE,
     step_name       VARCHAR(50) NOT NULL,
     step_order      INTEGER NOT NULL,
     agent_name      VARCHAR(50) DEFAULT '',
@@ -47,14 +47,14 @@ CREATE TABLE IF NOT EXISTS qd_decision_steps (
     UNIQUE(decision_id, step_name)
 );
 
-CREATE INDEX IF NOT EXISTS idx_decision_steps_id ON qd_decision_steps(decision_id);
+CREATE INDEX IF NOT EXISTS idx_decision_steps_id ON qd_agent_decision_steps(decision_id);
 
 -- =============================================================================
 -- 3. 事后验证（T+N 实际涨跌）
 -- =============================================================================
-CREATE TABLE IF NOT EXISTS qd_decision_results (
+CREATE TABLE IF NOT EXISTS qd_agent_decision_results (
     id                  SERIAL PRIMARY KEY,
-    decision_id         INTEGER NOT NULL REFERENCES qd_decisions(id) ON DELETE CASCADE,
+    decision_id         INTEGER NOT NULL REFERENCES qd_agent_decisions(id) ON DELETE CASCADE,
     actual_return_1d    FLOAT,
     actual_return_3d    FLOAT,
     actual_return_5d    FLOAT,
@@ -68,12 +68,12 @@ CREATE TABLE IF NOT EXISTS qd_decision_results (
     UNIQUE(decision_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_decision_results_id ON qd_decision_results(decision_id);
+CREATE INDEX IF NOT EXISTS idx_decision_results_id ON qd_agent_decision_results(decision_id);
 
 -- =============================================================================
 -- 4. 因子权重（可迭代）
 -- =============================================================================
-CREATE TABLE IF NOT EXISTS qd_factor_weights (
+CREATE TABLE IF NOT EXISTS qd_agent_factor_weights (
     id              SERIAL PRIMARY KEY,
     chain_id        VARCHAR(50) NOT NULL,
     factor_name     VARCHAR(50) NOT NULL,
@@ -82,16 +82,17 @@ CREATE TABLE IF NOT EXISTS qd_factor_weights (
     accuracy_3d     FLOAT DEFAULT 0,
     accuracy_5d     FLOAT DEFAULT 0,
     sample_count    INTEGER DEFAULT 0,
+    decay_half_life INTEGER DEFAULT 30,   -- 因子级衰减半衰期（天），由 evaluator 自动推断
     last_updated    TIMESTAMP DEFAULT NOW(),
     UNIQUE(chain_id, factor_name)
 );
 
-CREATE INDEX IF NOT EXISTS idx_factor_weights_chain ON qd_factor_weights(chain_id);
+CREATE INDEX IF NOT EXISTS idx_factor_weights_chain ON qd_agent_factor_weights(chain_id);
 
 -- =============================================================================
 -- 5. 工具评估
 -- =============================================================================
-CREATE TABLE IF NOT EXISTS qd_tool_eval (
+CREATE TABLE IF NOT EXISTS qd_agent_tool_eval (
     id              SERIAL PRIMARY KEY,
     tool_name       VARCHAR(50) NOT NULL,
     chain_id        VARCHAR(50) NOT NULL,
@@ -103,4 +104,20 @@ CREATE TABLE IF NOT EXISTS qd_tool_eval (
     UNIQUE(tool_name, chain_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_tool_eval_chain ON qd_tool_eval(chain_id);
+CREATE INDEX IF NOT EXISTS idx_tool_eval_chain ON qd_agent_tool_eval(chain_id);
+
+-- =============================================================================
+-- 迁移：已存在的表添加新字段
+-- =============================================================================
+
+-- qd_agent_factor_weights 添加 decay_half_life 列（P1-1: 因子级独立衰减半衰期）
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'qd_agent_factor_weights' AND column_name = 'decay_half_life'
+    ) THEN
+        ALTER TABLE qd_agent_factor_weights ADD COLUMN decay_half_life INTEGER DEFAULT 30;
+        RAISE NOTICE 'Added decay_half_life column to qd_agent_factor_weights';
+    END IF;
+END $$;

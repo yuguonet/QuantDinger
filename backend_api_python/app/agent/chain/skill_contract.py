@@ -2,12 +2,38 @@
 """
 Skill Output Contract — Skill 输出契约。
 
-定义每个 skill 应该输出的格式模板，以及从原始文本中解析结构化数据的函数。
+定义每个 skill 应该输出的 JSON 格式，以及从原始文本中解析结构化数据的函数。
+
+输出格式（注入到 skill instructions 末尾）：
+  {
+    "direction": "bullish/bearish/neutral",
+    "confidence": 0.0-1.0,
+    "score": 0-100,
+    "signal": "一句话信号摘要",
+    "factors": [
+      {"name": "因子名", "value": "值", "score": 0-100, "status": "ok/missing"}
+    ]
+  }
+
+规则：
+  - score: 0=极度看空, 50=中性, 100=极度看多
+  - confidence: 基于数据充分程度（不是方向确定性）
+  - status: "ok"=有数据, "missing"=数据缺失（必须标记，不能编造）
+  - factors 中每个因子对应一个分析维度
 
 解析策略（按优先级）：
-1. 尝试从 skill 输出中提取 JSON 块（```json...``` 或直接的 {}）
-2. 提取 direction, confidence, score, signal, factors
-3. 如果是纯文本，回退到关键词匹配（兼容过渡期）
+  1. JSON 块提取（```json...``` 或直接的 {}）
+  2. 关键词匹配（兼容过渡期，无 factors）
+  3. 兜底返回 neutral + confidence=0（parse_method="fallback"）
+
+被调用方：
+  chain/executor.py → parse_skill_output() 解析子 Agent 输出
+  chain/executor.py → parse_tool_details() 提取工具调用列表
+
+公开接口：
+  SKILL_OUTPUT_TEMPLATE — 输出模板字符串（注入 skill instructions）
+  parse_skill_output(raw_text) → Dict（direction/confidence/score/signal/factors/parse_method）
+  parse_tool_details(raw_text) → List[Dict]（[{name, ok, ms}]）
 """
 from __future__ import annotations
 

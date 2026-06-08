@@ -1,19 +1,36 @@
 # -*- coding: utf-8 -*-
 """
-Agent Evaluator — 执行后自动评估 + 工具链学习闭环。
+Agent Evaluator — 在线执行质量评估 + 工具链学习。
 
-流程：
-  agent.run() 结束后，Evaluator 分析执行日志，给出评分。
-  - 成功 → 把实际使用的工具链写回 tool_chains.json（学习新链 or 强化旧链）
-  - 失败 → 记录到 tool_chain_failures.json（下次避开）
-  - 灰色 → 可选 LLM 评估
+⚠️ 注意区分：
+  本文件（evaluator.py）   — 在线评估，每次 agent.run() 后立即执行
+  chain/evaluator.py       — 离线评估，T+N 验证决策准确性，定时运行
 
-评估信号（纯规则，<1ms）：
-  1. 工具调用成功率
-  2. 工具链遵循度
-  3. 步骤效率（实际步数 vs 链长度）
+触发时机：
+  agent.py → _post_evaluate() → evaluate() + learn_from_execution()
+  每次 Agent 执行完毕后自动调用，不消耗 Agent 步数。
+
+评估维度（纯规则，<1ms，无 LLM 调用）：
+  1. 工具调用成功率 — 成功/失败比率
+  2. 工具链遵循度 — 实际调用 vs 预期 chain 的匹配度
+  3. 步骤效率 — 实际步数 vs chain 长度的比值
   4. final_answer 是否生成
-  5. 响应内容是否包含实际数据
+  5. 响应是否包含实际数据（数字/代码块/表格）
+
+闭环动作：
+  success → _writeback_chain() — 更新 tool_chains.json（学习新链 or 强化旧链）
+  failure → _record_failure()  — 写入 tool_chain_failures.json（下次避开）
+  grey    → 不操作
+
+领域专用评估：
+  coding  — 代码修改质量、lint/diagnostics 使用、读→改工作流
+  finance — 数据获取完整性、分析链路完整度、实际市场数据
+  trading — 同 finance + 交易执行工具检查
+
+公开接口：
+  evaluate(agent_result, tool_chain, verb, noun, domain) → EvalResult
+  learn_from_execution(eval_result, verb, noun) → None
+  get_failure_record(verb, noun) → Optional[Dict]
 """
 from __future__ import annotations
 

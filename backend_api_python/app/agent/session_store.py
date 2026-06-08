@@ -1,12 +1,32 @@
 # -*- coding: utf-8 -*-
 """
-Session Store — Redis-backed session storage with in-memory fallback.
+Session Store — 会话持久化存储。
 
-Provides thread-safe session management with:
-- Redis persistence (survives process restarts, enables multi-worker)
-- In-memory fallback (single-worker / no-Redis environments)
-- TTL-based auto-cleanup
-- Thread-safe conversation history
+存储方式：Redis 优先 + 内存降级
+  - Redis：进程重启不丢失，支持多 worker
+  - 内存：单 worker / 无 Redis 环境自动降级
+
+功能：
+  - 会话 CRUD（create/get/clear/list）
+  - 对话历史管理（add_message/get_history）
+  - 上下文摘要（save_context_summary/get_context_summary）
+  - 领域隔离（domain 切换时自动丢弃旧领域上下文）
+  - TTL 自动清理
+  - 线程安全（per-session lock）
+
+被调用方：
+  agent.py → get_session_store() → 所有会话操作
+  agent.py → store.session_lock(session_id) → 防止并发交错
+
+公开接口：
+  get_session_store() → SessionStore（单例）
+  SessionStore.create_session(session_id, metadata) → dict
+  SessionStore.get_session(session_id) → Optional[dict]
+  SessionStore.add_message(session_id, role, content) → None
+  SessionStore.get_history(session_id, limit) → List[dict]
+  SessionStore.save_context_summary(session_id, summary, domain) → None
+  SessionStore.get_context_summary(session_id, current_domain, with_age) → str | tuple
+  SessionStore.session_lock(session_id) → context manager
 """
 from __future__ import annotations
 

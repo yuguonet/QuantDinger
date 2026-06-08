@@ -1,28 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Agent 独立调试入口
+Agent 独立调试入口。
 
-用法:
-    # 交互式聊天
-    python -m app.agent.run
+用法：
+  python -m app.agent.run                          # 交互式聊天
+  python -m app.agent.run "帮我分析一下贵州茅台"    # 单次调用
+  python -m app.agent.run --session test "600519"   # 指定 session
+  python -m app.agent.run --info                    # 查看 agent 结构
+  python -m app.agent.run --stream "600519 技术面"  # 流式输出
 
-    # 单次调用
-    python -m app.agent.run "帮我分析一下贵州茅台"
-
-    # 指定 session
-    python -m app.agent.run --session test-001 "600519 技术面怎么样"
-
-    # 查看 agent 结构
-    python -m app.agent.run --info
-
-环境变量:
-    LLM_PROVIDER    — LLM 供应商 (openai/deepseek/ollama/...)
-    LLM_BASE_URL    — 自定义 base URL
-    LLM_MODEL       — 模型名
-    OPENAI_API_KEY  — OpenAI key (或 DEEPSEEK_API_KEY 等)
-    AGENT_TYPE      — auto | code | tool
-    AGENT_MAX_STEPS — 最大步数 (默认 10)
+环境变量：
+  LLM_PROVIDER / LLM_BASE_URL / LLM_MODEL — LLM 配置
+  AGENT_TYPE=code|tool                     — Agent 类型
+  AGENT_MAX_STEPS=10                       — 最大步数
 """
 from __future__ import annotations
 

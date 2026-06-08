@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Shared agent utilities — market detection, code parsing, etc.
+Agent Utils — 共享工具函数。
+
+公开接口：
+  detect_market(stock_code) → str（CNStock/HKStock/Forex/Crypto）
 """
 from __future__ import annotations
 

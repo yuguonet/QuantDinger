@@ -6,14 +6,21 @@ agent.run() 结束后，把本轮结果（分析内容 + 工具调用）压缩�
 存入 session store，下一轮作为上下文注入。
 
 策略：规则引擎优先 + LLM 降级
-  1. 规则引擎提取结构化字段 (<1ms, 零 LLM 调用)
+  1. 规则引擎提取结构化字段（<1ms, 零 LLM 调用）
   2. 质量检查：提取结果 >= 80字 且 含关键信息 → 直接用
   3. 质量不足 → LLM 降级压缩
 
-改进点：
+特性：
   - 结构化股票信息：提取 analyzed_stocks / last_stock / domain / key_conclusions
   - 短内容跳过压缩：低于阈值直接返回原文
-  - 老摘要更激进压缩：基于 age_turns 衰减 max_len
+  - 领域切换时自动丢弃旧领域上下文
+  - 方向性关键词净化（防止上轮结论污染本轮判断）
+
+被调用方：
+  agent.py → _chat_locked() / _chat_stream_locked() → compress_context()（异步线程）
+
+公开接口：
+  compress_context(content, tool_calls_log, model, domain, age_turns) → str
 """
 from __future__ import annotations
 

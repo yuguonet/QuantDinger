@@ -1,19 +1,41 @@
 # -*- coding: utf-8 -*-
 """
-Tool Registry — decorator-based self-registration for QuantDinger tools.
+Tool Registry — @tool 装饰器自注册 + 自动发现 + smolagents Tool 构建。
 
-Usage:
-    from app.agent.tools.registry import tool, registry
+生命周期：
+  1. 各工具模块用 @tool(...) 装饰器注册函数（data_tools.py, analysis_tools.py 等）
+  2. registry.discover() 导入 tools/ 包下所有模块，触发注册
+  3. registry.build(config) 过滤 + 转换为 smolagents Tool 列表
 
-    @tool(description="根据中文名称搜索股票代码", category="名称查询")
-    def search_stock_by_name(keyword: str, market: str = "CNStock", limit: int = 10):
-        ...
+架构分层（layer 参数）：
+  显示层 — 图表/可视化输出
+  数据层 — 名称查询、行情数据获取
+  分析层 — 技术分析、指标策略、情报搜索
+  决策层 — 选股、回测
+  执行层 — 交易
+  支撑层 — 工作区、自修改
 
-    # Auto-discover all tools in the package
-    registry.discover()
+领域过滤（domain 参数）：
+  ["finance"]  — 仅金融分析
+  ["coding"]   — 仅代码开发
+  []           — 通用工具（所有领域可用，优先级较低）
 
-    # Build smolagents Tool list with optional policy filtering
-    tools = registry.build({"deny": ["shell_exec"]})
+自动分页：
+  列表 > 20 条 → 自动缓存 + 分页（pagination.py）
+  文本 > 2000 字符 → 自动截断
+
+被调用方：
+  tool_adapter.py → build_all_tools() → registry.discover() + registry.build()
+  agent.py → _generate_tool_catalog() → registry.layered_categories
+
+公开接口：
+  registry.discover(package) → None
+  registry.build(config) → List[Tool]（config: allow/deny/domain）
+  registry.get(name) → Optional[ToolSpec]
+  registry.all_names → List[str]
+  registry.categories → Dict[str, List[str]]
+  registry.layered_categories → Dict[str, Dict[str, List[str]]]
+  @tool(description, name, category, layer, domain, output_type, **meta) → decorator
 """
 from __future__ import annotations
 

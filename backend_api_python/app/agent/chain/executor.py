@@ -2,14 +2,43 @@
 """
 Chain Executor — 链路决策执行器。
 
-核心设计：
-1. 每步调用 skill 后解析结构化输出（JSON），同时保留自由文本兼容
-2. 构建 DecisionCard — 可执行的决策建议
-3. 缺失步骤从权重池剔除，剩余项归一化
-4. 覆盖度 < 0.4 → hold
-5. 有 veto → skip
-6. 多空冲突 → hold
-7. 输出包含 gaps + human_note
+职责：按链路定义依次调度子 Agent，解析结构化输出，构建 DecisionCard。
+
+核心流程：
+  execute() → 遍历 ChainStep → _execute_step() → _build_decision_card()
+
+每步执行：
+  1. 构造消息（含前序步骤输出作为上下文）
+  2. 调用子 Agent（run_agent_fn）
+  3. parse_skill_output() 解析 JSON → direction/confidence/score/factors
+  4. 判断状态：OK / MISSING / FAILED / VETO
+
+决策卡构建（_build_decision_card）：
+  1. 分项打分 → 每步的 score × weight
+  2. 覆盖度计算 → valid_steps / total_steps
+  3. 加权评分 → 缺失项从权重池剔除，剩余归一化
+  4. 门控检查（三重阻断）：
+     - has_veto → SKIP（一票否决）
+     - coverage_too_low → HOLD（覆盖度 < 40%）
+     - sample_too_low → HOLD（已评估决策 < 10 条）
+  5. 方向判断 → 多空冲突检测
+  6. 输出 DecisionCard（含 breakdown/gaps/blockers/human_note）
+
+权重来源：
+  _load_step_weights() 从 evaluator 读取：
+    - get_step_weights() → 步骤级 3d 准确率
+    - get_factor_weights_for_chain() → 因子级准确率
+  取两者 max，让高确信因子拉高步骤权重。
+  首次运行时权重全为默认值 1.0（qd_agent_decision_results 为空）。
+
+数据库依赖（decision_evaluation.sql）：
+  qd_agent_decisions      ← 本模块写入（UPSERT）
+  qd_agent_decision_steps ← 本模块写入（覆盖更新）
+  qd_agent_factor_weights ← 本模块读取（_load_step_weights）
+
+公开接口：
+  ChainExecutor(chain_id, stock_code, stock_name, user_id)
+    .execute(run_agent_fn, context) → ChainResult
 """
 from __future__ import annotations
 
@@ -29,6 +58,39 @@ from app.agent.chain.schema import (
 from app.agent.chain.skill_contract import parse_skill_output, parse_tool_details
 
 logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 渐进门控：基于样本量的置信度折扣
+# ═══════════════════════════════════════════════════════════════
+
+def _sample_confidence(evaluated_count: int) -> float:
+    """根据已评估决策数返回置信度乘数（0.0 ~ 1.0）。
+
+    样本越少，置信度越低，分数越趋近50（中性）。
+    这是渐进门控的核心：避免低样本量时输出极端 BUY/SELL。
+
+    梯度：
+      0 条   → 0.0（完全不可信，分数固定为50）
+      5 条   → 0.5（半可信，分数向50收缩一半）
+      10 条  → 0.7（基本可信）
+      20 条  → 0.85（较可信）
+      50 条+ → 1.0（完全可信）
+
+    Args:
+        evaluated_count: 已评估的决策数量
+
+    Returns:
+        0.0 ~ 1.0 的置信度乘数
+    """
+    if evaluated_count <= 0:
+        return 0.0
+    if evaluated_count >= 50:
+        return 1.0
+    # 对数增长：前期增长快，后期趋缓
+    # f(n) = 0.2 + 0.8 * (1 - e^(-n/15))
+    import math
+    return round(0.2 + 0.8 * (1 - math.exp(-evaluated_count / 15)), 3)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -105,7 +167,7 @@ class ChainExecutor:
 
         合并两个来源：
         1. 步骤级权重（get_step_weights）— 基于步骤方向预测的 3 日准确率
-        2. 因子级权重（qd_factor_weights）— 基于因子信息增益，取该步骤下因子的均值
+        2. 因子级权重（qd_agent_factor_weights）— 基于因子信息增益，取该步骤下因子的均值
         取两者中较大值，让高确信因子能拉高步骤权重。
         """
         try:
@@ -338,12 +400,20 @@ class ChainExecutor:
         )
         card.summary.coverage = coverage.label
 
+        # ── 样本量统计（供渐进门控）──
+        eval_stats = self._get_eval_stats()
+        evaluated_count = eval_stats.get("evaluated_decisions", 0)
+
         # ── 加权评分（缺失项从权重池剔除，剩余归一化）──
         if valid_items:
             total_weight = sum(w for _, w in valid_items)
             if total_weight > 0:
                 weighted_score = sum(s * w for s, w in valid_items) / total_weight
-                card.summary.score = round(weighted_score, 1)
+                # 渐进门控：样本量不足时对分数打折
+                # 样本越少，分数越趋近50（中性），避免低样本量时极端判断
+                confidence_mult = _sample_confidence(evaluated_count)
+                adjusted_score = 50 + (weighted_score - 50) * confidence_mult
+                card.summary.score = round(adjusted_score, 1)
             else:
                 card.summary.score = 0.0
         else:
@@ -355,10 +425,17 @@ class ChainExecutor:
         # ── 关键信号 ──
         card.summary.key_signal = self._extract_key_signal(result.step_outputs)
 
+        # ── 样本量门控（渐进式）──
+        # evaluated_count 已在上面获取（用于 confidence_mult）
+        # 渐进门控：confidence_mult 已将分数拉向50（中性）
+        # 硬门控：仅在完全无数据时阻断（evaluated=0 时 confidence_mult=0.0，分数已固定为50）
+        sample_no_data = evaluated_count == 0
+
         # ── 阻断器 ──
         blockers = Blockers(
             has_veto=has_veto,
             coverage_too_low=coverage.ratio < COVERAGE_THRESHOLD,
+            sample_too_low=sample_no_data,
         )
         card.blockers = blockers
 
@@ -376,6 +453,11 @@ class ChainExecutor:
             decision.execute = False
             decision.action = Action.HOLD
             decision.reason = f"覆盖度不足（{coverage.label}），数据不充分"
+            decision.fallback_action = Action.HOLD
+        elif blockers.sample_too_low:
+            decision.execute = False
+            decision.action = Action.HOLD
+            decision.reason = "无评估历史数据，系统尚未运行过评估闭环"
             decision.fallback_action = Action.HOLD
         elif direction == "conflict":
             decision.execute = False
@@ -416,6 +498,14 @@ class ChainExecutor:
             if s.name == step_name:
                 return s
         return None
+
+    def _get_eval_stats(self) -> Dict[str, Any]:
+        """获取链路评估统计（供门控使用）。"""
+        try:
+            from app.agent.chain.evaluator import get_chain_eval_stats
+            return get_chain_eval_stats(self.chain_id)
+        except Exception:
+            return {"evaluated_decisions": 0, "ready_for_decision": False}
 
     def _calc_confidence(
         self,
@@ -541,7 +631,7 @@ class ChainExecutor:
 
                 # UPSERT 主记录
                 cur.execute("""
-                    INSERT INTO qd_decisions
+                    INSERT INTO qd_agent_decisions
                         (exec_date, stock_code, stock_name, chain_id,
                          action, score, coverage, confidence, decision_card)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
@@ -565,14 +655,14 @@ class ChainExecutor:
 
                 # 删除旧步骤（覆盖更新）
                 cur.execute(
-                    "DELETE FROM qd_decision_steps WHERE decision_id = %s",
+                    "DELETE FROM qd_agent_decision_steps WHERE decision_id = %s",
                     (decision_id,)
                 )
 
                 # 插入步骤详情
                 for i, step_out in enumerate(result.step_outputs):
                     cur.execute("""
-                        INSERT INTO qd_decision_steps
+                        INSERT INTO qd_agent_decision_steps
                             (decision_id, step_name, step_order, agent_name,
                              status, direction, confidence, score, signal,
                              factors, tools_called, raw_output, elapsed_ms, error)

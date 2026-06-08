@@ -2,8 +2,24 @@
 """
 Domain Registry — 领域注册与管理。
 
-每个 domain 定义一组专属指令和可选的工具过滤器，
-意图分析器根据识别出的 domain 注入对应的系统提示。
+每个 domain 定义一组专属指令和可选的工具过滤器。
+意图分析器（intent_analyzer）根据识别出的 domain 注入对应的系统提示。
+
+内置领域：
+  finance  — 金融分析（A股中短线特化）
+  trading  — 交易执行（策略启停/持仓管理）
+  coding   — 代码开发（项目扫描/文件操作）
+  chat     — 闲聊/问候（跳过 agent 直接回复）
+
+被调用方：
+  intent_analyzer.py → init_builtin_domains() + get_domain()
+  agent.py → _build_instructions() → domain_instructions 注入
+
+公开接口：
+  init_builtin_domains() → None
+  get_domain(name) → Optional[DomainConfig]
+  get_all_domains() → Dict[str, DomainConfig]
+  register_domain(config) → None
 """
 from __future__ import annotations
 

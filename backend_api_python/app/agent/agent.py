@@ -2,11 +2,33 @@
 """
 Agent — smolagents Agent for QuantDinger.
 
-Supports both CodeAgent (LLM writes Python code) and ToolCallingAgent (OpenAI function calling).
-Agent type is configurable via AGENT_TYPE env var:
-  - "code": CodeAgent — best for GPT-4o, Claude, DeepSeek etc.
-  - "tool": ToolCallingAgent — best for local models (Ollama) that don't generate code blocks.
-  - (default): Auto-detect — uses ToolCallingAgent for Ollama, CodeAgent otherwise.
+核心入口：build_agent_executor() → _AgentExecutor → chat() / chat_stream()
+
+架构：
+  smolagents CodeAgent（默认）或 ToolCallingAgent（AGENT_TYPE=tool）
+  + 15 个 Managed Agents（skills/ 目录，@skill 装饰器自动发现）
+  + 40+ 工具（tools/ 目录，@tool 装饰器自动发现）
+  + Chain 链路编排（chain/ 目录，verb+noun 触发）
+
+执行流程：
+  1. _prepare() — 意图分析 → 领域路由 → 工具过滤 → 上下文拼接
+  2. 快速通道 — 闲聊/greeting 直接回复，不走 agent
+  3. 链路触发 — _try_chain() 匹配 verb+noun → ChainExecutor 执行
+  4. Agent 执行 — smolagents CodeAgent.run()（流式/阻塞）
+  5. 后置评估 — _post_evaluate() → evaluator.learn_from_execution()
+  6. 上下文压缩 — compress_context() 异步线程
+
+配置：
+  AGENT_TYPE=code|tool     — Agent 类型（默认 code）
+  AGENT_MAX_STEPS=10       — 最大步数
+  AGENT_TIMEOUT_SECONDS=180 — 超时
+  INTENT_ANALYSIS_ENABLED=true — 意图分析开关
+
+公开接口：
+  build_agent_executor(skills, user_id, max_steps, timeout_seconds, model, provider) → _AgentExecutor
+  _AgentExecutor.chat(message, session_id, context, progress_callback, user_id) → AgentResult
+  _AgentExecutor.chat_stream(...) → Generator[dict]
+  AgentResult(success, content, tool_calls_log, total_steps, total_tokens, model, error, charts)
 """
 from __future__ import annotations
 

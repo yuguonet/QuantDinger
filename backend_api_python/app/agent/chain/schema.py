@@ -8,6 +8,34 @@ Decision Schema — 链路决策评估系统的标准化数据结构。
 3. 缺失≠0 — 缺失项从权重池剔除，剩余项归一化
 4. 决策输出 — 最终输出是可执行的决策建议，不是报告
 5. 每个组件可验证可迭代 — 工具/步骤/链路都有闭环评估
+
+数据流：
+  executor._execute_step() → StepOutput（每步结果）
+  executor._build_decision_card() → DecisionCard（最终决策卡）
+  evaluator.evaluate_pending() → qd_agent_decision_results（T+N 验证）
+  evaluator.update_factor_weights() → qd_agent_factor_weights（因子权重）
+
+枚举：
+  StepStatus  — 步骤执行状态（ok/missing/failed/skipped/veto）
+  Action      — 决策动作（buy/sell/hold/skip）
+  Confidence  — 置信等级（high/medium/low/reject）
+  Direction   — 方向判断（bullish/bearish/neutral）
+
+核心数据结构：
+  FactorScore     — 单因子评分
+  StepOutput      — 步骤标准化输出（从 skill 解析）
+  Coverage        — 覆盖度指标
+  BreakdownItem   — 决策卡分项明细
+  Gap             — 缺失项描述
+  Blockers        — 决策阻断器（has_veto / coverage_too_low / sample_too_low）
+  Decision        — 最终决策（execute / action / reason）
+  DecisionSummary — 决策摘要（score / coverage / confidence）
+  DecisionCard    — 完整决策卡（汇总所有结构）
+
+常量：
+  VETO_SCORE = -1000         — 否决阈值
+  COVERAGE_THRESHOLD = 0.4   — 覆盖度最低阈值
+  STEP_NAME_CN               — 步骤名→中文名映射
 """
 from __future__ import annotations
 
@@ -189,18 +217,28 @@ class Gap:
 
 @dataclass
 class Blockers:
-    """决策阻断器。"""
+    """决策阻断器。
+
+    三重门控（优先级从高到低）：
+      1. has_veto — 一票否决（SKIP）
+      2. coverage_too_low — 覆盖度 < 40%（HOLD）
+      3. sample_too_low — 无评估历史数据（HOLD）
+         注意：低样本量不再硬阻断，改为通过 confidence_multiplier 渐进打折。
+         仅当 evaluated_count == 0 时才触发此阻断。
+    """
     has_veto: bool = False              # 是否有否决项
     coverage_too_low: bool = False      # 覆盖度是否过低
+    sample_too_low: bool = False        # 是否完全无评估历史数据
 
     @property
     def blocked(self) -> bool:
-        return self.has_veto or self.coverage_too_low
+        return self.has_veto or self.coverage_too_low or self.sample_too_low
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "has_veto": self.has_veto,
             "coverage_too_low": self.coverage_too_low,
+            "sample_too_low": self.sample_too_low,
         }
 
 

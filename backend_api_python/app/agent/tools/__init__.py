@@ -1,9 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-Agent tools subpackage.
+Tools — 工具包。
 
-Tool implementations live here as dict-based specs.
-Conversion to smolagents Tool objects is handled by app.agent.tool_adapter.
+40+ 工具通过 @tool 装饰器自动注册，agent.py 运行时自动发现。
+转换为 smolagents Tool 对象由 tool_adapter.py 处理。
+
+工具分层（layer）：
+  数据层 — data_tools / quote_tools / market_tools / market_data_tools
+  分析层 — analysis_tools / indicator_tools / signal_tools / news_search_tools / research_tools / sector_analysis_tools
+  决策层 — screening_tools / screener_tools / backtest_tools / capital_tools
+  执行层 — trading_tools
+  显示层 — chart_tools
+  支撑层 — code_workspace_tools / self_modify_tools / iteration_tools / tool_chain_tools / scan_tools
 """
 # 注册翻页工具
 try:

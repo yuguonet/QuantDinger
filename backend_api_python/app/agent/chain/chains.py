@@ -2,8 +2,26 @@
 """
 Chain Definitions — 链路定义。
 
-每条链路由多个步骤组成，每个步骤对应一个技能 Agent。
-链路由 verb+noun 组合触发。
+每条链路由多个步骤组成，每个步骤对应一个 Skill Agent。
+链路由 intent_analyzer 的 verb+noun 组合触发。
+
+数据结构：
+  ChainStep — 链路中的一个步骤（name/agent/order/required）
+  ChainDef  — 链路定义（chain_id/name/steps/trigger_verbs/trigger_nouns）
+
+内置链路：
+  evaluate+stock  — 股票综合评估（13步：政策→游资→解禁→概念→动量→情报→技术→指标→选股→资金→回测→多空辩论）
+  screen+stock    — 选股筛选（3步：条件选股→指标验证→情报过滤）
+  scan+market     — 市场全景扫描（3步：大盘指数→涨停池→资金流向）
+
+触发方式：
+  agent._try_chain(verb, noun) → get_chain_for_intent() → ChainExecutor.execute()
+
+公开接口：
+  register_chain(chain_def) → None
+  get_chain(chain_id) → Optional[ChainDef]
+  get_chain_for_intent(verb, noun) → Optional[ChainDef]
+  list_chains() → List[ChainDef]
 """
 from __future__ import annotations
 
