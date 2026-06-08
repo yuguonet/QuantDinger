@@ -183,14 +183,18 @@ id=6  parent=5    root=1  layer=tool    name=get_indicator_snapshot
 - `factors JSONB` — skill: [{name, value, score, weight, status}]
 - `output_data JSONB` — chain: 决策卡, skill: 分析报告, tool: 1~10条dict
 - `analysis TEXT` — 分析文字（内容主体）
-- `correct_3d BOOLEAN` — 回溯验证结果
+- `exit_date DATE` — 实际出场日期
+- `exit_reason VARCHAR(20)` — 出场原因：take_profit / stop_loss / max_hold / signal_change
+- `pnl_pct REAL` — 盈亏率（%）
+- `hold_days INTEGER` — 实际持有天数
+- `correct BOOLEAN` — 回溯验证结果（pnl > 0 = true）
 - `calibration REAL` — 校准因子 1.00~1.05
 
 #### qd_factor_weights（因子权重表）
 ```sql
 PRIMARY KEY (chain_id, skill_name, factor_name)
 weight REAL DEFAULT 1.0
-accuracy_3d REAL
+accuracy REAL        -- 盈亏率准确率（替代旧 accuracy_3d）
 sample_count INTEGER DEFAULT 0
 decay_half_life INTEGER DEFAULT 30  -- 因子级半衰期
 ```
@@ -259,14 +263,57 @@ backend_api_python/app/agent/
 
 | 层 | 它"交"了什么 | 回测时验证什么 | 奖惩依据 |
 |---|---|---|---|
-| **Chain** | action (buy/sell/hold) | 实际涨跌方向 | 方向准确率 → Skill 权重调整 |
-| **Skill** | score + direction | 实际涨跌方向 | 因子级方向准确率 → 因子权重调整 |
+| **Chain** | action (buy/sell/hold) | 实际盈亏 | 盈亏率 → Skill 权重调整 |
+| **Skill** | score + direction | 实际盈亏 | 因子级盈亏率 → 因子权重调整 |
 | **Tool** | 数据 (隐含状态) | 历史数据偏差 | 数据准确率 → 数据源权重调整（TODO） |
 
 - **三层都没有"特权"在正向链路中自我验证**，都得等回测才知道对错
 - **各负其责**: 数据错了不怪 Chain, 决策错了不怪 Skill, 各管各的准确率
 - **缺失如实**: 下层没上班（missing），上层如实报告，回溯时跳过它（不奖不惩）
 - **A股只能做多**: 只有 Chain 层的决策和盈亏有直接关系，但评判标准仍然是方向准确率
+
+### 验证方式：按实际出场规则，不按固定天数（设计目标，代码未对齐）
+
+> ⚠️ **当前代码实际使用 T+1/T+3/T+5 固定窗口**（actual_return_1d/3d/5d + correct_3d）。
+> 以下为设计目标，SQL schema + schema.py + store.py + evaluator.py 均未改。
+
+**不用固定 T+1/T+3/T+5 窗口**，按实际交易结果验证：
+
+| 字段 | 说明 |
+|------|------|
+| `exit_date` | 实际出场日期 |
+| `exit_reason` | 出场原因：`take_profit` / `stop_loss` / `max_hold` / `signal_change` |
+| `pnl_pct` | 盈亏率（%） |
+| `hold_days` | 实际持有天数 |
+
+**为什么不用固定天数：**
+- 实际交易是止盈/止损/信号转变时退出，不是等固定天数
+- T+3 涨了但 T+5 又跌回去，固定窗口会误判
+- 同一个 skill 不同股票持有天数不同，固定窗口不公平
+
+**验证逻辑：**
+- `action=buy` + `pnl_pct > 0` → `correct=true`
+- `action=buy` + `pnl_pct <= 0` → `correct=false`
+- `action=hold/skip` → 不验证（没有实际仓位）
+- 方向判定阈值: 0.3%（A股日均波动2-3%，0.3%是有效信号下限）
+
+### 回测设计：入参一致 + 路径一致 + 时间不同 = 自动回测
+
+**核心思路：数据库本身就是回测历史，不需要额外回测引擎。**
+
+```
+第一次: "分析600519" → chain → technical_agent(score=75, direction=bullish) → 写库
+第二次: "分析600519" → 自由推理 → 调了 analyze_trend+calculate_ma → 反查 → technical_agent → 写库
+```
+
+两次入参一样（stock_code=600519），skill 名一样（technical_agent），日期不同 →
+盘后自动拿实际出场数据写回 → technical_agent 在 600519 上的胜率自动统计出来。
+
+**关键规则：**
+- 不关心"谁调的它"（chain 还是自由推理），只关心"它叫什么名字"
+- 自由推理路径通过 `_infer_skill_name()` 从 tool_calls 反查 skill 名，写和 chain 路径一致的名字
+- stock_code 可为空（大盘/行业分析），有就记没有就空着
+- 同一 skill + 同一标的 + 不同日期 = 不同采样点
 
 ### 回溯流程示例
 
@@ -278,14 +325,14 @@ T日: 用户问"600519能不能买"
   → intelligence 调用 search_stock_news → 拿到3条新闻 → 交报告 score=45, direction=neutral
   → Chain 汇总: score=68, action=buy
 
-T+1/T+3/T+5: 获取 600519 实际涨跌
-  → 实际 direction_3d = bearish (-3.2%)
+T+N: 实际出场（止盈/止损/信号转变/最大持有天数）
+  → exit_date=2026-06-12, exit_reason=take_profit, pnl_pct=+5.2%, hold_days=4
 
 回溯:
-  Chain 层: predicted=buy, actual=bearish → ❌ 错误 → 权重 -
-  technical: predicted=bullish, actual=bearish → ❌ 错误 → 权重 -
-  momentum: predicted=bullish, actual=bearish → ❌ 错误 → 权重 -
-  intelligence: predicted=neutral, actual=bearish → ❌ 错误 (但差距较小) → 轻微 -
+  Chain 层: predicted=buy, pnl=+5.2% → ✅ 正确 → 权重 +
+  technical: predicted=bullish, pnl=+5.2% → ✅ 正确 → 权重 +
+  momentum: predicted=bullish, pnl=+5.2% → ✅ 正确 → 权重 +
+  intelligence: predicted=neutral, pnl=+5.2% → ⚠️ 偏差 → 轻微 -
 
 深层回溯 (数据偏差检测 — TODO):
   agent_get_kline: 本次数据 vs 历史数据 → 偏差 500% → ⚠️ 数据源异常!
@@ -294,29 +341,17 @@ T+1/T+3/T+5: 获取 600519 实际涨跌
     → 可能需要人工介入确认
 ```
 
-### 评估时间窗口
-
-| 窗口 | 用途 | 说明 |
-|------|------|------|
-| T+1 | 短线验证 | 次日涨跌 |
-| T+3 | 中线验证 | 3日涨跌（**主验证基准**） |
-| T+5 | 中线验证 | 5日涨跌 |
-
-方向判定阈值: 0.3%（A股日均波动2-3%，0.3%是有效信号下限）
-中性结果: actual == neutral 仍参与计分（避免震荡市样本流失）
-校准因子: score 越偏离50（越自信），权重更新幅度越大（±5%）
-
 ### 评估流程（每日盘后自动运行）
 
 ```
 1. evaluate_pending():
-   - 查找 correct_3d IS NULL 的根节点
-   - 获取 T+1/3/5 实际涨跌
-   - 写回根节点 + skill 子节点的 correct_3d + calibration
+   - 查找 exit_date IS NULL 的根节点
+   - 获取实际出场数据（止盈/止损/信号转变）
+   - 写回 exit_date / exit_reason / pnl_pct / hold_days / correct
 
 2. update_factor_weights():
    - 从已验证的 skill 节点提取因子（factors JSONB）
-   - 带时间衰减聚合准确率（因子级半衰期）
+   - 带时间衰减聚合盈亏率（因子级半衰期）
    - 校准因子微调（±5%）
    - 写入 qd_factor_weights
 

@@ -63,6 +63,48 @@ _EXCLUDED_TOOL_NAMES = {
     "get_limit_down_stocks", "get_broken_board_stocks",
 }
 
+
+def _score_to_action(score: float) -> str:
+    """分数 → 决策动作（与 chain/executor.py 逻辑一致）。"""
+    if score is None:
+        return "hold"
+    if score >= 60:
+        return "buy"
+    if score <= 40:
+        return "sell"
+    return "hold"
+
+
+def _infer_skill_name(tool_calls_log: list) -> str:
+    """从 tool_calls 反查 skill 名（与 chain 路径写一致的名字，回测才能对上）。"""
+    if not tool_calls_log:
+        return "freeform_agent"
+
+    try:
+        from app.agent.skills.registry import skill_registry
+        skill_registry.discover()
+    except Exception:
+        return "freeform_agent"
+
+    # 收集被调用的工具名
+    called_tools = {tc.get("tool", "") for tc in tool_calls_log if tc.get("tool")}
+    if not called_tools:
+        return "freeform_agent"
+
+    # 找包含最多被调用工具的 skill
+    best_skill = "freeform_agent"
+    best_overlap = 0
+    for sk in skill_registry.all_skills:
+        if not sk or not sk.tools:
+            continue
+        overlap = len(called_tools & set(sk.tools))
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_skill = sk.name
+
+    return best_skill
+
+
 # ── Per-user agent cache (tools + managed agents only) ────────
 _tools_cache_by_domain: Dict[str, List] = {}       # key: domain → tools list
 _managed_agents_cache: Dict[str, list] = {}         # key: model_provider → managed agents
@@ -809,6 +851,22 @@ class _AgentExecutor:
 
             store.add_message(session_id, "assistant", content)
 
+            # ── 自由推理路径写库（财经领域 + 有股票代码时）──────
+            if success and content and _eval_domain == "finance":
+                try:
+                    self._save_freeform_to_db(
+                        content=content,
+                        message=message,
+                        context=context,
+                        session_id=session_id,
+                        verb=_intent_verb,
+                        noun=_intent_noun,
+                        tool_calls_log=tool_calls_log,
+                        total_steps=total_steps,
+                    )
+                except Exception as e:
+                    logger.warning("[Agent] 自由推理写库失败（不影响返回）: %s", e)
+
             # ── 后置评估 + 工具链学习闭环 ─────────────────────
             agent_result_for_eval = AgentResult(
                 success=success, content=content, tool_calls_log=tool_calls_log,
@@ -859,6 +917,87 @@ class _AgentExecutor:
         except Exception as e:
             logger.warning("[PostEval] 评估异常，不影响返回: %s", e)
 
+    @staticmethod
+    def _save_freeform_to_db(
+        content: str,
+        message: str,
+        context: dict,
+        session_id: str,
+        verb: str,
+        noun: str,
+        tool_calls_log: list,
+        total_steps: int,
+    ):
+        """自由推理路径写库 — 从 agent 输出中解析结构化数据，保存到 qd_evaluations。
+
+        复用 chain/contract.py 的 parse_skill_output 解析 LLM 输出，
+        构建一棵迷你 EvalNode 树（chain 根 + 1个 skill 子节点），
+        通过 chain/store.py 的 save_tree 写入数据库。
+        """
+        import re
+        from datetime import date
+        from app.agent.chain.contract import parse_skill_output
+        from app.agent.chain.schema import EvalNode, Layer
+        from app.agent.chain import store as chain_store
+
+        # 提取股票代码（有就记，没有就空着）
+        stock_code = ""
+        stock_name = ""
+        if context:
+            stock_code = context.get("stock_code", "")
+            stock_name = context.get("stock_name", "")
+        if not stock_code:
+            match = re.search(r'\b(\d{6})\b', message)
+            if match:
+                stock_code = match.group(1)
+
+        # 从 tool_calls 反查 skill 名（和 chain 路径写一致的名字）
+        skill_name = _infer_skill_name(tool_calls_log)
+
+        # 解析 agent 输出为 SkillReport
+        report = parse_skill_output(content, skill_name=skill_name)
+
+        # 构建根节点（chain 层）
+        root = EvalNode(
+            layer=Layer.CHAIN.value,
+            name=f"{verb}+{noun}" if verb and noun else "freeform",
+            exec_date=date.today(),
+            stock_code=stock_code,
+            stock_name=stock_name,
+            score=report.score,
+            direction=report.direction,
+            action=_score_to_action(report.score),
+            signal=report.signal,
+            confidence=report.confidence,
+            analysis=report.analysis or content[:2000],
+            input_params={"user_query": message},
+        )
+
+        # 构建 skill 子节点（名字和 chain 路径一致，回测才能对上）
+        skill_node = EvalNode(
+            layer=Layer.SKILL.value,
+            name=skill_name,
+            stock_code=stock_code,
+            stock_name=stock_name,
+            score=report.score,
+            direction=report.direction,
+            signal=report.signal,
+            confidence=report.confidence,
+            factors=report.factors,
+            analysis=report.analysis or content[:2000],
+            tools_called=[tc.get("tool", "") for tc in tool_calls_log if tc.get("tool")],
+            status=report.status,
+        )
+        root.add_child(skill_node)
+
+        # 写库
+        root_id = chain_store.save_tree(root)
+        if root_id:
+            logger.info("[Agent] 自由推理写库成功 root_id=%d stock=%s score=%.1f action=%s",
+                        root_id, stock_code, report.score, root.action)
+        else:
+            logger.warning("[Agent] 自由推理写库失败 stock=%s", stock_code)
+
     def _try_chain(self, verb, noun, message, session_id, context, user_id):
         """尝试链路执行。匹配到链路时执行并返回 AgentResult，否则返回 None。"""
         if not verb:
@@ -886,9 +1025,14 @@ class _AgentExecutor:
             match = re.search(r'\b(\d{6})\b', message)
             if match:
                 stock_code = match.group(1)
+
+        # 非个股链路（如 scan+market）不需要股票代码
         if not stock_code:
-            logger.info("[Chain] 链路 %s 匹配但未找到股票代码，跳过链路", chain_def.chain_id)
-            return None
+            if chain_def.chain_id == "scan+market":
+                stock_code = ""
+            else:
+                logger.info("[Chain] 链路 %s 匹配但未找到股票代码，跳过链路", chain_def.chain_id)
+                return None
 
         logger.info("[Chain] 触发链路 %s | 股票=%s", chain_def.chain_id, stock_code)
 
@@ -1061,6 +1205,23 @@ class _AgentExecutor:
                 if isinstance(step, FinalAnswerStep):
                     content = str(step.output) if step.output else ""
                     store.add_message(session_id, "assistant", content)
+
+                    # ── 自由推理路径写库（财经领域 + 有股票代码时）──
+                    _stream_domain = meta.get("domain", "")
+                    if content and _stream_domain == "finance":
+                        try:
+                            self._save_freeform_to_db(
+                                content=content,
+                                message=message,
+                                context=context,
+                                session_id=session_id,
+                                verb=meta.get("intent_verb", ""),
+                                noun=meta.get("intent_noun", ""),
+                                tool_calls_log=_stream_tool_calls,
+                                total_steps=agent.step_number,
+                            )
+                        except Exception as e:
+                            logger.warning("[Agent] 流式写库失败（不影响返回）: %s", e)
 
                     # ── 后置评估 + 工具链学习闭环 ─────────────
                     _eval_result = AgentResult(

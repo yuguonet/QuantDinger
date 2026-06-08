@@ -310,7 +310,7 @@ NOUN_PATTERNS: List[Tuple[str, List[str]]] = [
     # ── 个股/股票 ──
     ("stock", [
         r"\d{6}",           # 6位股票代码
-        r"股[票市]",
+        r"股[票市份]",
         r"个股",
         r"自选",
         r"沪深",
