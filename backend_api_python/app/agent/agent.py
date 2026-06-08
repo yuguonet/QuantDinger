@@ -908,26 +908,25 @@ class _AgentExecutor:
             user_id=user_id,
         )
         chain_result = executor.execute(
-            run_agent_fn=run_agent_fn,
+            run_skill_fn=run_agent_fn,
             context={"user_query": message},
         )
 
-        # 转换为 AgentResult — 用 decision_card 替代旧的 summary 文本
-        card = chain_result.decision_card
-        if card:
-            # 优先用 Markdown 格式（前端可直接渲染），同时把决策卡 JSON
-            # 附在 content 末尾供前端结构化解析
-            md = card.to_markdown()
-            card_json = card.to_json()
-            content = md + "\n\n<!-- decision_card:\n" + card_json + "\n-->"
-        else:
-            content = "链路执行未产生决策卡。"
+        # 转换为 AgentResult — 用 DecisionResult 的 content 属性
+        content = chain_result.content
+        if not content:
+            content = "链路执行未产生决策。"
+
+        # 附加结构化 JSON 供前端解析
+        import json as _json
+        result_dict = chain_result.to_dict()
+        content += "\n\n<!-- decision_result:\n" + _json.dumps(result_dict, ensure_ascii=False, indent=2) + "\n-->"
 
         return AgentResult(
             success=chain_result.success,
             content=content,
             tool_calls_log=[],
-            total_steps=len(chain_result.step_outputs),
+            total_steps=len(chain_result.root_node.children) if chain_result.root_node else 0,
             total_tokens=0,
             model="chain-orchestrator",
             error=None if chain_result.success else "链路执行失败",

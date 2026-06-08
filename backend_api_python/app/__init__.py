@@ -407,8 +407,8 @@ def create_app(config_name='default'):
         except Exception as e:
             logger.warning(f"Reflection worker not started: {e}")
         try:
-            from app.agent.chain.evaluator import start_chain_eval_worker
-            start_chain_eval_worker()
+            from app.agent.chain.evaluator import start_eval_worker
+            start_eval_worker()
         except Exception as e:
             logger.warning(f"Chain eval worker not started: {e}")
     return app

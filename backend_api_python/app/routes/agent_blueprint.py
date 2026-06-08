@@ -636,8 +636,8 @@ def trigger_chain_evaluation():
         days_old = int(data.get("days_old", 1))
         market = data.get("market", "CNStock")
 
-        from app.agent.chain.evaluator import auto_evaluate_and_update
-        result = auto_evaluate_and_update(days_old=days_old, market=market)
+        from app.agent.chain.evaluator import auto_evaluate
+        result = auto_evaluate(days_old=days_old, market=market)
         return jsonify(result)
     except Exception as e:
         logger.error("[API] 手动评估失败: %s", e, exc_info=True)
@@ -654,8 +654,8 @@ def get_chain_eval_status():
     """
     try:
         chain_id = request.args.get("chain_id")
-        from app.agent.chain.evaluator import get_chain_eval_stats
-        stats = get_chain_eval_stats(chain_id)
+        from app.agent.chain.store import get_eval_stats
+        stats = get_eval_stats(chain_id)
         return jsonify(stats)
     except Exception as e:
         return jsonify({"error": str(e)}), 500

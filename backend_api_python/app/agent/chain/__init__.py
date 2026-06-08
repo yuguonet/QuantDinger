@@ -1,24 +1,35 @@
 # -*- coding: utf-8 -*-
 """
-Chain Orchestration — 链路决策评估系统。
+Chain — 编排/决策层。
 
-架构：skill 输出 → 结构化解析 → 决策卡 → T+N 验证 → 权重迭代 → 门控决策
-
-模块：
-  chains.py          — 链路定义（ChainDef/ChainStep，verb+noun 触发）
-  executor.py        — 链路执行器（ChainExecutor → DecisionCard）
-  evaluator.py       — 闭环评估器（evaluate_pending → 因子权重 → 工具评估）
-  schema.py          — 数据结构（DecisionCard/StepOutput/Blockers/...）
-  skill_contract.py  — Skill 输出契约（JSON 格式 + 解析函数）
-
-数据流：
-  agent._try_chain() → ChainExecutor.execute() → 子 Agent × N 步
-    → parse_skill_output() → StepOutput → DecisionCard
-    → qd_agent_decisions + qd_agent_decision_steps（持久化）
-    → [定时] evaluate_pending() → qd_agent_decision_results
-    → [定时] update_factor_weights() → qd_agent_factor_weights
-    → [下次执行] _load_step_weights() 读取新权重
+核心模块：
+  schema.py    — EvalNode 三层统一数据结构 + SkillReport
+  store.py     — qd_evaluations 持久化（save_tree / load_tree）
+  contract.py  — SkillReport 解析契约（从 LLM 输出提取结构化数据）
+  chains.py    — 链路定义
+  executor.py  — 链路执行器（按链路定义调度 Skill，构建决策树）
+  evaluator.py — 回溯评估引擎（T+N 验证 → 因子权重更新）
 """
-from app.agent.chain.schema import DecisionCard, StepOutput, StepStatus, Action, Confidence
-from app.agent.chain.executor import ChainExecutor, ChainResult
-from app.agent.chain.skill_contract import parse_skill_output
+from app.agent.chain.schema import (
+    EvalNode, SkillReport, FactorItem,
+    Layer, Status, Action, Direction,
+    VETO_SCORE, COVERAGE_THRESHOLD, DIRECTION_THRESHOLD,
+    get_skill_cn_name, classify_return, is_direction_correct,
+)
+from app.agent.chain.store import (
+    save_tree, load_tree, query_roots, query_pending_verify,
+    update_verify_results, update_skill_verify,
+    get_factor_weights, get_skill_weights, get_eval_stats,
+)
+from app.agent.chain.contract import parse_skill_output, extract_tools_called
+
+__all__ = [
+    "EvalNode", "SkillReport", "FactorItem",
+    "Layer", "Status", "Action", "Direction",
+    "VETO_SCORE", "COVERAGE_THRESHOLD", "DIRECTION_THRESHOLD",
+    "get_skill_cn_name", "classify_return", "is_direction_correct",
+    "save_tree", "load_tree", "query_roots", "query_pending_verify",
+    "update_verify_results", "update_skill_verify",
+    "get_factor_weights", "get_skill_weights", "get_eval_stats",
+    "parse_skill_output", "extract_tools_called",
+]
