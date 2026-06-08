@@ -274,29 +274,37 @@ def _evaluate_single(
         correct_1d, correct_3d, correct_5d,
     ))
 
-    # 更新步骤级别的因子准确率
+    # 子项级验证：每个步骤独立跟实际方向对比，写回数据库
+    # 这是分项记分制的核心——每个子项的正确率远比决策整体正确率重要
     cur.execute("""
-        SELECT id, step_name, factors, direction
+        SELECT id, step_name, direction, status, score
         FROM qd_agent_decision_steps
         WHERE decision_id = %s
     """, (decision_id,))
 
-    for step_id, step_name, factors_json, step_dir in cur.fetchall():
-        step_correct_3d = _is_correct(step_dir, actuals.get("direction_3d"))
-        if step_correct_3d is None:
+    for step_id, step_name, step_dir, step_status, step_score in cur.fetchall():
+        # 只验证有效步骤（status=ok 且有方向）
+        if step_status != "ok" or not step_dir:
             continue
 
-        # 解析因子
-        try:
-            factors = json.loads(factors_json) if factors_json else []
-        except (json.JSONDecodeError, TypeError):
-            factors = []
+        # 用 3 日方向作为主要验证基准（中短线交易周期）
+        actual_dir = actuals.get("direction_3d")
+        step_correct = _is_correct(step_dir, actual_dir)
 
-        for factor in factors:
-            fname = factor.get("name", "")
-            if not fname:
-                continue
-            # 更新因子权重表（在 update_factor_weights 中统一处理）
+        # 校准因子：score 越偏离50（越自信），奖惩幅度越大
+        # confidence = |score - 50| / 50  → 0~1
+        # multiplier = 1 + confidence × 0.05  → 1.00~1.05
+        # 作用：微调权重更新速度，不是主驱动力
+        calibration_factor = 1.0
+        if step_score is not None:
+            confidence = abs(step_score - 50) / 50.0  # 0~1
+            calibration_factor = 1.0 + confidence * 0.05  # 1.00~1.05
+
+        cur.execute("""
+            UPDATE qd_agent_decision_steps
+            SET actual_direction = %s, step_correct = %s, calibration_factor = %s
+            WHERE id = %s
+        """, (actual_dir, step_correct, round(calibration_factor, 4), step_id))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -411,27 +419,29 @@ def update_factor_weights(days: int = 60, decay_half_life_days: int = 30) -> Dic
                 pass  # 列不存在时忽略（首次运行或未迁移）
 
             # 获取所有已评估的决策及其步骤因子（包含决策日期用于衰减计算）
+            # 核心改动：用子项级正确率（ds.step_correct）替代决策级正确率（r.correct_3d）
+            # 分项记分制下，每个子项独立跟实际方向对比，谁对谁加分，谁错谁扣分
             cur.execute("""
                 SELECT d.chain_id, ds.step_name, ds.factors, ds.direction,
-                       r.correct_1d, r.correct_3d, r.correct_5d, d.exec_date
+                       ds.step_correct, ds.calibration_factor, d.exec_date
                 FROM qd_agent_decisions d
                 JOIN qd_agent_decision_steps ds ON ds.decision_id = d.id
-                JOIN qd_agent_decision_results r ON r.decision_id = d.id
                 WHERE d.exec_date >= %s
-                  AND r.correct_1d IS NOT NULL
                   AND ds.status = 'ok'
+                  AND ds.step_correct IS NOT NULL
             """, (since,))
 
             # 聚合: (chain_id, factor_name) → {weighted_correct, weighted_total}
             factor_stats: Dict[Tuple[str, str], Dict[str, float]] = {}
 
-            for chain_id, step_name, factors_json, direction, c1d, c3d, c5d, exec_date in cur.fetchall():
+            for chain_id, step_name, factors_json, direction, step_correct, cal_factor, exec_date in cur.fetchall():
                 try:
                     factors = json.loads(factors_json) if factors_json else []
                 except (json.JSONDecodeError, TypeError):
                     continue
 
                 days_ago = (today - exec_date).days
+                cal = cal_factor or 1.0  # 校准因子：1.00~1.05
 
                 for factor in factors:
                     fname = factor.get("name", "")
@@ -450,19 +460,17 @@ def update_factor_weights(days: int = 60, decay_half_life_days: int = 30) -> Dic
 
                     if key not in factor_stats:
                         factor_stats[key] = {
-                            "weighted_correct_1d": 0.0, "weighted_correct_3d": 0.0,
-                            "weighted_correct_5d": 0.0, "weighted_total": 0.0,
+                            "weighted_correct": 0.0,
+                            "weighted_total": 0.0,
                             "raw_total": 0, "half_life": hl,
                         }
 
-                    factor_stats[key]["weighted_total"] += decay_weight
+                    # 校准因子调节衰减权重：自信+对了/不自信+错了 → 微调幅度 ±5%
+                    effective_weight = decay_weight * cal
+                    factor_stats[key]["weighted_total"] += effective_weight
                     factor_stats[key]["raw_total"] += 1
-                    if c1d:
-                        factor_stats[key]["weighted_correct_1d"] += decay_weight
-                    if c3d:
-                        factor_stats[key]["weighted_correct_3d"] += decay_weight
-                    if c5d:
-                        factor_stats[key]["weighted_correct_5d"] += decay_weight
+                    if step_correct:
+                        factor_stats[key]["weighted_correct"] += effective_weight
 
             # UPSERT
             for (chain_id, fname), s in factor_stats.items():
@@ -470,6 +478,9 @@ def update_factor_weights(days: int = 60, decay_half_life_days: int = 30) -> Dic
                 raw_total = s["raw_total"]
                 if total < 0.5:  # 衰减后有效样本太少，跳过
                     continue
+
+                # 子项级正确率：基于每个步骤独立验证的结果
+                step_accuracy = round(s["weighted_correct"] / total, 4)
 
                 cur.execute("""
                     INSERT INTO qd_agent_factor_weights
@@ -486,9 +497,9 @@ def update_factor_weights(days: int = 60, decay_half_life_days: int = 30) -> Dic
                         last_updated = NOW()
                 """, (
                     chain_id, fname,
-                    round(s["weighted_correct_1d"] / total, 4),
-                    round(s["weighted_correct_3d"] / total, 4),
-                    round(s["weighted_correct_5d"] / total, 4),
+                    step_accuracy,   # 1d 暂用子项级（后续可拆分）
+                    step_accuracy,   # 3d — 主验证基准
+                    step_accuracy,   # 5d 暂用子项级
                     raw_total,
                     s["half_life"],
                 ))
@@ -519,20 +530,21 @@ def update_tool_eval(days: int = 60) -> Dict[str, Any]:
             cur = conn.cursor()
 
             # 获取所有已评估的决策及其工具调用
+            # 用子项级正确率（ds.step_correct）替代决策级正确率
             cur.execute("""
                 SELECT d.chain_id, ds.tools_called, ds.elapsed_ms,
-                       r.correct_3d
+                       ds.step_correct
                 FROM qd_agent_decisions d
                 JOIN qd_agent_decision_steps ds ON ds.decision_id = d.id
-                JOIN qd_agent_decision_results r ON r.decision_id = d.id
                 WHERE d.exec_date >= %s
-                  AND r.correct_3d IS NOT NULL
+                  AND ds.status = 'ok'
+                  AND ds.step_correct IS NOT NULL
             """, (since,))
 
             # 聚合: (chain_id, tool_name) → {calls, successes, useful_count, total_latency}
             tool_stats: Dict[Tuple[str, str], Dict[str, float]] = {}
 
-            for chain_id, tools_json, elapsed_ms, correct_3d in cur.fetchall():
+            for chain_id, tools_json, elapsed_ms, step_correct in cur.fetchall():
                 try:
                     tools = json.loads(tools_json) if tools_json else []
                 except (json.JSONDecodeError, TypeError):
@@ -548,7 +560,7 @@ def update_tool_eval(days: int = 60) -> Dict[str, Any]:
                     tool_stats[key]["calls"] += 1
                     tool_stats[key]["successes"] += 1  # tools_called 中的都是成功的
                     tool_stats[key]["latency"] += elapsed_ms or 0
-                    if correct_3d:
+                    if step_correct:
                         tool_stats[key]["useful"] += 1
 
             # UPSERT

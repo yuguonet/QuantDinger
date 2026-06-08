@@ -44,6 +44,10 @@ CREATE TABLE IF NOT EXISTS qd_agent_decision_steps (
     raw_output      TEXT DEFAULT '',
     elapsed_ms      FLOAT DEFAULT 0,
     error           TEXT DEFAULT '',
+    -- 子项级验证：每个步骤独立跟实际方向对比
+    actual_direction VARCHAR(10) DEFAULT NULL,  -- 实际方向 (bullish/bearish/neutral)
+    step_correct    BOOLEAN DEFAULT NULL,        -- 该步骤方向是否正确
+    calibration_factor FLOAT DEFAULT NULL,       -- 校准因子: 正确+自信=大奖, 正确+不自信=小奖, 错误+自信=重罚
     UNIQUE(decision_id, step_name)
 );
 
