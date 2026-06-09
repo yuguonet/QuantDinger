@@ -57,10 +57,11 @@ class CallSkillTool(Tool):
     }
     output_type = "string"
 
-    def __init__(self, model, user_id: int = 1):
+    def __init__(self, model, user_id: int = 1, collector=None):
         super().__init__()
         self._model = model
         self._user_id = user_id
+        self._collector = collector  # TraceCollector（可选，金融领域注入）
 
     def forward(self, skill_name: str, stock_code: str, stock_name: str = None) -> str:
         """调用指定的 BaseSkill，返回结构化报告。"""
@@ -107,32 +108,36 @@ class CallSkillTool(Tool):
             logger.error("[CallSkill] Skill %s 执行异常: %s", skill_name, e)
             return f"技能 {skill_name} 执行失败: {e}"
 
-        # 持久化 EvalNode（如果有 store）
-        try:
-            from app.agent.chain import store as chain_store
-            from datetime import date
-            from app.agent.chain.schema import EvalNode, Layer
+        # 通知 TraceCollector（如果注入了的话）
+        if self._collector:
+            self._collector.on_skill_call(skill_name, report, eval_node)
 
-            # 构建 chain 根节点
-            root = EvalNode(
-                layer=Layer.CHAIN.value,
-                name=f"call_skill+{skill_name}",
-                exec_date=date.today(),
-                stock_code=stock_code,
-                stock_name=stock_name or "",
-                score=report.score,
-                direction=report.direction,
-                action=_score_to_action(report.score),
-                signal=report.signal,
-                confidence=report.confidence,
-            )
-            root.add_child(eval_node)
-            root_id = chain_store.save_tree(root)
-            if root_id:
-                logger.info("[CallSkill] 写库成功 root_id=%d skill=%s stock=%s",
-                            root_id, skill_name, stock_code)
-        except Exception as e:
-            logger.warning("[CallSkill] 写库失败（不影响返回）: %s", e)
+        # 持久化 EvalNode（仅非金融领域，金融领域由 TraceCollector 统一持久化）
+        if not self._collector:
+            try:
+                from app.agent.chain import store as chain_store
+                from datetime import date
+                from app.agent.chain.schema import EvalNode, Layer
+
+                root = EvalNode(
+                    layer=Layer.CHAIN.value,
+                    name=f"call_skill+{skill_name}",
+                    exec_date=date.today(),
+                    stock_code=stock_code,
+                    stock_name=stock_name or "",
+                    score=report.score,
+                    direction=report.direction,
+                    action=_score_to_action(report.score),
+                    signal=report.signal,
+                    confidence=report.confidence,
+                )
+                root.add_child(eval_node)
+                root_id = chain_store.save_tree(root)
+                if root_id:
+                    logger.info("[CallSkill] 写库成功 root_id=%d skill=%s stock=%s",
+                                root_id, skill_name, stock_code)
+            except Exception as e:
+                logger.warning("[CallSkill] 写库失败（不影响返回）: %s", e)
 
         # 格式化返回给 Agent
         return self._format_report(report)

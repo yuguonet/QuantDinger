@@ -1,22 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-Evaluator — 回溯评估引擎。
+Evaluator — 回溯评估引擎（重写版）。
 
-基于 qd_evaluations 单表 + qd_factor_weights 因子权重表。
+基于 qd_traces 表 + qd_skill_weights + qd_factor_weights。
 
 核心流程（每日盘后自动运行）：
-  evaluate_pending()      → 获取 T+1/3/5 实际涨跌，写回 qd_evaluations
-  update_factor_weights() → 带时间衰减聚合因子准确率，写入 qd_factor_weights
-  auto_evaluate()         → 自动闭环（评估→权重→报告）
+  evaluate_pending()      → 按 timeframe 取实际行情，写回 qd_traces
+  update_skill_weights()  → 按单位时间收益率聚合 Skill 权重
+  update_factor_weights() → 按单位时间收益率聚合因子权重（带时间衰减）
+  auto_evaluate()         → 自动闭环
 
-三层评估原则：
-  Chain — 预测方向 vs 实际方向 → 决策准确率
-  Skill — 每个 skill 独立方向 vs 实际方向 → 因子准确率
-  Tool  — 数据偏差检测（TODO，回溯时才有意义）
+核心指标：单位时间期望收益率（不是胜率）
+  return_per_day = (win_rate × avg_win - loss_rate × avg_loss) / avg_hold_days
 
-与旧版区别：
-  - 旧版：5 张表（decisions/steps/results/factor_weights/tool_eval）
-  - 新版：1 棵树（qd_evaluations）+ 1 张因子权重表（qd_factor_weights）
+纯 SQL + 数学，0 token 消耗，不涉及 agent。
 """
 from __future__ import annotations
 
@@ -24,7 +21,7 @@ import json
 import logging
 import math
 from datetime import date, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from app.agent.chain.schema import (
     DIRECTION_THRESHOLD, Direction, classify_return, is_direction_correct,
@@ -35,21 +32,54 @@ logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════
-# 实际涨跌数据获取
+# timeframe → 验证窗口映射
 # ═══════════════════════════════════════════════════════════════
 
-def _get_actual_returns(
+_TIMEFRAME_DAYS = {
+    "T+1": 1,
+    "T+3": 3,
+    "T+5": 5,
+    "1W": 5,
+    "1M": 22,
+    "3M": 66,
+    "1Y": 252,
+}
+
+_DEFAULT_HOLD_DAYS = 3  # timeframe 缺失时的默认值
+
+
+def _get_hold_days(timeframe: str) -> int:
+    """timeframe → 验证用持有天数。"""
+    return _TIMEFRAME_DAYS.get(timeframe, _DEFAULT_HOLD_DAYS)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 实际行情获取
+# ═══════════════════════════════════════════════════════════════
+
+def _get_actual_return(
     stock_code: str,
     from_date: date,
+    hold_days: int,
     market: str = "CNStock",
-) -> Dict[str, Any]:
-    """获取股票实际涨跌数据。"""
+) -> Optional[Dict[str, Any]]:
+    """获取股票实际涨跌数据。
+
+    Args:
+        stock_code: 股票代码
+        from_date: 决策日期
+        hold_days: 持有天数
+        market: 市场类型
+
+    Returns:
+        {"pnl_pct": float, "hold_days": int, "direction": str} 或 None
+    """
     try:
         from app.agent.tools.data_tools import agent_get_kline
 
-        klines = agent_get_kline(stock_code, timeframe="1D", days=10, market=market)
+        klines = agent_get_kline(stock_code, timeframe="1D", days=hold_days + 10, market=market)
         if not klines or len(klines) < 2:
-            return {}
+            return None
 
         from_str = from_date.strftime("%Y-%m-%d")
         base_idx = None
@@ -60,34 +90,28 @@ def _get_actual_returns(
                 break
 
         if base_idx is None:
-            return {}
+            return None
 
         base_close = klines[base_idx]["c"]
-        result = {}
+        exit_idx = min(base_idx + hold_days, len(klines) - 1)
+        if exit_idx <= base_idx:
+            return None
 
-        if base_idx + 1 < len(klines):
-            close_1d = klines[base_idx + 1]["c"]
-            ret_1d = (close_1d - base_close) / base_close
-            result["return_1d"] = round(ret_1d, 4)
-            result["direction_1d"] = classify_return(ret_1d)
+        exit_close = klines[exit_idx]["c"]
+        pnl_pct = round((exit_close - base_close) / base_close * 100, 2)
+        actual_hold = exit_idx - base_idx
+        direction = classify_return(pnl_pct / 100)
 
-        if base_idx + 3 < len(klines):
-            close_3d = klines[base_idx + 3]["c"]
-            ret_3d = (close_3d - base_close) / base_close
-            result["return_3d"] = round(ret_3d, 4)
-            result["direction_3d"] = classify_return(ret_3d)
-
-        if base_idx + 5 < len(klines):
-            close_5d = klines[base_idx + 5]["c"]
-            ret_5d = (close_5d - base_close) / base_close
-            result["return_5d"] = round(ret_5d, 4)
-            result["direction_5d"] = classify_return(ret_5d)
-
-        return result
+        return {
+            "pnl_pct": pnl_pct,
+            "hold_days": actual_hold,
+            "direction": direction,
+            "exit_date": klines[exit_idx].get("t", "")[:10],
+        }
 
     except Exception as e:
         logger.warning("[Evaluator] 获取实际涨跌失败 %s: %s", stock_code, e)
-        return {}
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -97,12 +121,8 @@ def _get_actual_returns(
 def evaluate_pending(days_old: int = 1, market: str = "CNStock") -> Dict[str, Any]:
     """评估所有待验证的决策记录。
 
-    查找 qd_evaluations 中 correct_3d IS NULL 的根节点，
-    获取 T+1/3/5 实际涨跌，写回验证结果。
-
-    三层验证：
-      1. 根节点（chain）— action vs 实际方向 → correct_3d
-      2. 子节点（skill）— direction vs 实际方向 → correct_3d + calibration
+    查找 qd_traces 中 exit_date IS NULL 的根节点，
+    按 timeframe 取实际行情，写回验证结果。
 
     Args:
         days_old: 只评估至少 N 天前的决策
@@ -120,10 +140,12 @@ def evaluate_pending(days_old: int = 1, market: str = "CNStock") -> Dict[str, An
         exec_date = item["exec_date"]
         stock_code = item["stock_code"]
         action = item["action"]
+        timeframe = item.get("timeframe", "")
 
         try:
-            actuals = _get_actual_returns(stock_code, exec_date, market)
-            if not actuals:
+            hold_days = _get_hold_days(timeframe)
+            actual = _get_actual_return(stock_code, exec_date, hold_days, market)
+            if not actual:
                 continue
 
             # 方向映射
@@ -134,33 +156,39 @@ def evaluate_pending(days_old: int = 1, market: str = "CNStock") -> Dict[str, An
                 "skip": Direction.NEUTRAL.value,
             }
             predicted_dir = action_to_dir.get(action, Direction.NEUTRAL.value)
-            actual_dir_3d = actuals.get("direction_3d", "")
-            verdict = is_direction_correct(predicted_dir, actual_dir_3d)
+            actual_dir = actual["direction"]
+            verdict = is_direction_correct(predicted_dir, actual_dir)
 
-            # 根节点：neutral 预测 → correct_3d = NULL
             if verdict == "neutral":
-                correct_3d = None
+                correct = None
             else:
-                correct_3d = verdict == "correct"
+                correct = verdict == "correct"
 
-            # 写入根节点验证结果
+            from datetime import datetime
+            exit_date = None
+            if actual.get("exit_date"):
+                try:
+                    exit_date = date.fromisoformat(actual["exit_date"])
+                except (ValueError, TypeError):
+                    pass
+
             store.update_verify_results(
                 root_id=root_id,
-                actual_return_1d=actuals.get("return_1d"),
-                actual_return_3d=actuals.get("return_3d"),
-                actual_return_5d=actuals.get("return_5d"),
-                actual_direction_3d=actual_dir_3d,
-                correct_3d=correct_3d,
+                exit_date=exit_date or exec_date + timedelta(days=hold_days),
+                exit_reason="max_hold",
+                pnl_pct=actual["pnl_pct"],
+                hold_days=actual["hold_days"],
+                correct=correct,
             )
 
             # 写入 skill 子节点验证结果
-            store.update_skill_verify(root_id, actual_dir_3d)
+            store.update_skill_verify(root_id, actual_dir)
 
             stats["evaluated"] += 1
             stats["details"].append({
                 "root_id": root_id, "stock": stock_code,
-                "action": action, "actual_dir": actual_dir_3d,
-                "correct": correct_3d,
+                "action": action, "timeframe": timeframe,
+                "pnl_pct": actual["pnl_pct"], "correct": correct,
             })
 
         except Exception as e:
@@ -174,21 +202,145 @@ def evaluate_pending(days_old: int = 1, market: str = "CNStock") -> Dict[str, An
     logger.info("[Evaluator] 评估完成: %d 条已评估, %d 条失败",
                 stats["evaluated"], stats["errors"])
 
-    # 评估后自动更新因子权重
+    # 评估后自动更新权重
     if stats["evaluated"] > 0:
         try:
+            update_skill_weights()
             update_factor_weights()
         except Exception as e:
-            logger.warning("[Evaluator] 自动更新因子权重失败: %s", e)
+            logger.warning("[Evaluator] 自动更新权重失败: %s", e)
 
     return stats
 
 
 # ═══════════════════════════════════════════════════════════════
-# 因子权重更新
+# Skill 权重更新（按单位时间收益率）
 # ═══════════════════════════════════════════════════════════════
 
-# 因子名关键词 → 半衰期（天）
+def _calc_skill_weight_from_trades(trades: List[Dict]) -> Dict[str, float]:
+    """从历史交易记录计算 Skill 权重。
+
+    核心指标：单位时间期望收益率
+      return_per_day = (win_rate × avg_win - loss_rate × avg_loss) / avg_hold_days
+
+    Returns:
+        {"weight": float, "win_rate": float, "avg_pnl_pct": float,
+         "avg_hold_days": float, "return_per_day": float, "sample_count": int}
+    """
+    if not trades:
+        return {"weight": 1.0, "win_rate": 0, "avg_pnl_pct": 0,
+                "avg_hold_days": 1, "return_per_day": 0, "sample_count": 0}
+
+    correct_trades = [t for t in trades if t.get("correct") is True]
+    wrong_trades = [t for t in trades if t.get("correct") is False]
+    total = len(correct_trades) + len(wrong_trades)
+
+    if total == 0:
+        return {"weight": 1.0, "win_rate": 0, "avg_pnl_pct": 0,
+                "avg_hold_days": 1, "return_per_day": 0, "sample_count": 0}
+
+    win_rate = len(correct_trades) / total
+    avg_win = (sum(t["pnl_pct"] for t in correct_trades) / len(correct_trades)) if correct_trades else 0
+    avg_loss = abs(sum(t["pnl_pct"] for t in wrong_trades) / len(wrong_trades)) if wrong_trades else 0
+    avg_hold = sum(t.get("hold_days", 3) for t in trades) / len(trades)
+    avg_hold = max(avg_hold, 1)
+
+    expected_return = win_rate * avg_win - (1 - win_rate) * avg_loss
+    return_per_day = expected_return / avg_hold
+
+    # 映射到权重（0.5~2.0）
+    weight = max(0.5, min(2.0, 1.0 + return_per_day * 20))
+
+    return {
+        "weight": round(weight, 3),
+        "win_rate": round(win_rate, 3),
+        "avg_pnl_pct": round(expected_return, 2),
+        "avg_hold_days": round(avg_hold, 1),
+        "return_per_day": round(return_per_day, 4),
+        "sample_count": total,
+    }
+
+
+def update_skill_weights(days: int = 90) -> Dict[str, Any]:
+    """更新 qd_skill_weights 表。
+
+    从 qd_traces 中读取已验证的 skill 节点，
+    按 skill_name 聚合带时间衰减的交易记录，
+    计算单位时间收益率，写入 qd_skill_weights。
+    """
+    from app.utils.db import get_db_connection
+
+    stats = {"updated": 0}
+    since = date.today() - timedelta(days=days)
+    today = date.today()
+
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+
+            # 获取已验证的 skill 节点
+            cur.execute("""
+                SELECT t.name as skill_name, t.pnl_pct, t.hold_days, t.correct,
+                       r.exec_date
+                FROM qd_traces t
+                JOIN qd_traces r ON r.id = t.root_id
+                WHERE t.layer = 'skill'
+                  AND t.status = 'ok'
+                  AND t.correct IS NOT NULL
+                  AND r.exec_date >= %s
+            """, (since,))
+
+            # 按 skill_name 聚合
+            skill_trades: Dict[str, List[Dict]] = {}
+            for row in cur.fetchall():
+                skill_name = row['skill_name']
+                if skill_name not in skill_trades:
+                    skill_trades[skill_name] = []
+                skill_trades[skill_name].append({
+                    "pnl_pct": row['pnl_pct'],
+                    "hold_days": row['hold_days'] or 3,
+                    "correct": row['correct'],
+                    "exec_date": row['exec_date'],
+                })
+
+            # 计算权重并写入
+            for skill_name, trades in skill_trades.items():
+                result = _calc_skill_weight_from_trades(trades)
+
+                cur.execute("""
+                    INSERT INTO qd_skill_weights
+                        (skill_name, weight, win_rate, avg_pnl_pct, avg_hold_days,
+                         return_per_day, sample_count, last_updated)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (skill_name)
+                    DO UPDATE SET
+                        weight = EXCLUDED.weight,
+                        win_rate = EXCLUDED.win_rate,
+                        avg_pnl_pct = EXCLUDED.avg_pnl_pct,
+                        avg_hold_days = EXCLUDED.avg_hold_days,
+                        return_per_day = EXCLUDED.return_per_day,
+                        sample_count = EXCLUDED.sample_count,
+                        last_updated = NOW()
+                """, (
+                    skill_name, result["weight"], result["win_rate"],
+                    result["avg_pnl_pct"], result["avg_hold_days"],
+                    result["return_per_day"], result["sample_count"],
+                ))
+                stats["updated"] += 1
+
+            conn.commit()
+
+    except Exception as e:
+        logger.error("[Evaluator] 更新 Skill 权重失败: %s", e)
+
+    logger.info("[Evaluator] Skill 权重已更新: %d 个", stats["updated"])
+    return stats
+
+
+# ═══════════════════════════════════════════════════════════════
+# 因子权重更新（带时间衰减）
+# ═══════════════════════════════════════════════════════════════
+
 _FACTOR_HALF_LIFE_RULES = [
     (["政策", "policy", "监管", "新规"], 7),
     (["新闻", "news", "公告", "消息", "舆情"], 7),
@@ -211,7 +363,6 @@ _DEFAULT_HALF_LIFE = 30
 
 
 def _get_factor_half_life(factor_name: str) -> int:
-    """根据因子名推断衰减半衰期。"""
     name_lower = factor_name.lower()
     for keywords, hl in _FACTOR_HALF_LIFE_RULES:
         for kw in keywords:
@@ -220,16 +371,11 @@ def _get_factor_half_life(factor_name: str) -> int:
     return _DEFAULT_HALF_LIFE
 
 
-def update_factor_weights(days: int = 60, decay_half_life_days: int = 30) -> Dict[str, Any]:
-    """更新因子权重表。
+def update_factor_weights(days: int = 90) -> Dict[str, Any]:
+    """更新 qd_factor_weights 表。
 
-    从 qd_evaluations 中读取已验证的 skill 节点及其 factors，
-    按 (chain_id, factor_name) 聚合带时间衰减的准确率。
-
-    核心改动（vs 旧版）：
-      - 用 qd_evaluations.layer='skill' 的 correct_3d 替代旧的 qd_agent_decision_steps
-      - 每个 skill 节点的 factors JSONB 中提取因子名
-      - 校准因子微调：score 越偏离50，权重更新幅度越大（±5%）
+    从 qd_traces 中读取已验证的 skill 节点及其 factors，
+    按 (skill_name, factor_name) 聚合带时间衰减的准确率。
     """
     from app.utils.db import get_db_connection
 
@@ -241,39 +387,41 @@ def update_factor_weights(days: int = 60, decay_half_life_days: int = 30) -> Dic
         with get_db_connection() as conn:
             cur = conn.cursor()
 
-            # 获取已验证的 skill 节点（跳过 neutral 预测，correct_3d IS NULL）
             cur.execute("""
-                SELECT e.root_id, e.name, e.factors, e.direction,
-                       e.correct_3d, e.calibration, r.exec_date, r.name as chain_id
-                FROM qd_evaluations e
-                JOIN qd_evaluations r ON r.id = e.root_id
-                WHERE e.layer = 'skill'
-                  AND e.status = 'ok'
-                  AND e.correct_3d IS NOT NULL
+                SELECT t.name as skill_name, t.factors, t.correct,
+                       r.exec_date
+                FROM qd_traces t
+                JOIN qd_traces r ON r.id = t.root_id
+                WHERE t.layer = 'skill'
+                  AND t.status = 'ok'
+                  AND t.correct IS NOT NULL
                   AND r.exec_date >= %s
             """, (since,))
 
-            # 聚合: (chain_id, factor_name) → {weighted_correct, weighted_total}
-            factor_stats: Dict[Tuple[str, str], Dict[str, float]] = {}
+            # 聚合: (skill_name, factor_name) → {weighted_correct, weighted_total}
+            factor_stats: Dict[tuple, Dict[str, float]] = {}
 
-            for root_id, skill_name, factors_json, direction, step_correct, cal_factor, exec_date, chain_id in cur.fetchall():
+            for row in cur.fetchall():
+                skill_name = row['skill_name']
+                factors_json = row['factors']
+                correct = row['correct']
+                exec_date = row['exec_date']
+
                 try:
                     factors_raw = json.loads(factors_json) if isinstance(factors_json, str) else (factors_json or [])
                 except (json.JSONDecodeError, TypeError):
                     factors_raw = []
 
                 days_ago = (today - exec_date).days
-                cal = cal_factor or 1.0
 
                 for factor in factors_raw:
-                    if isinstance(factor, dict):
-                        fname = factor.get("name", "")
-                    else:
+                    if not isinstance(factor, dict):
                         continue
+                    fname = factor.get("name", "")
                     if not fname:
                         continue
 
-                    key = (chain_id, fname)
+                    key = (skill_name, fname)
                     hl = _get_factor_half_life(fname)
                     decay_weight = math.pow(0.5, days_ago / max(hl, 1))
 
@@ -283,33 +431,34 @@ def update_factor_weights(days: int = 60, decay_half_life_days: int = 30) -> Dic
                             "raw_total": 0, "half_life": hl,
                         }
 
-                    effective_weight = decay_weight * cal
-                    factor_stats[key]["weighted_total"] += effective_weight
+                    factor_stats[key]["weighted_total"] += decay_weight
                     factor_stats[key]["raw_total"] += 1
-                    if step_correct:
-                        factor_stats[key]["weighted_correct"] += effective_weight
+                    if correct:
+                        factor_stats[key]["weighted_correct"] += decay_weight
 
-            # UPSERT 到 qd_factor_weights
-            for (chain_id, fname), s in factor_stats.items():
+            # UPSERT
+            for (skill_name, fname), s in factor_stats.items():
                 total = s["weighted_total"]
                 if total < 0.5:
                     continue
 
                 accuracy = round(s["weighted_correct"] / total, 4)
+                weight = max(0.5, min(2.0, accuracy * 2))
 
                 cur.execute("""
                     INSERT INTO qd_factor_weights
-                        (chain_id, skill_name, factor_name, weight, accuracy_3d,
-                         sample_count, decay_half_life, last_updated)
-                    VALUES (%s, %s, %s, 1.0, %s, %s, %s, NOW())
-                    ON CONFLICT (chain_id, skill_name, factor_name)
+                        (skill_name, factor_name, weight, win_rate, sample_count,
+                         decay_half_life, last_updated)
+                    VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (skill_name, factor_name)
                     DO UPDATE SET
-                        accuracy_3d = EXCLUDED.accuracy_3d,
+                        weight = EXCLUDED.weight,
+                        win_rate = EXCLUDED.win_rate,
                         sample_count = EXCLUDED.sample_count,
                         decay_half_life = EXCLUDED.decay_half_life,
                         last_updated = NOW()
-                """, (chain_id, skill_name if 'skill_name' in dir() else "", fname,
-                      accuracy, int(s["raw_total"]), s["half_life"]))
+                """, (skill_name, fname, weight, accuracy,
+                      int(s["raw_total"]), s["half_life"]))
                 stats["updated"] += 1
 
             conn.commit()
@@ -317,7 +466,7 @@ def update_factor_weights(days: int = 60, decay_half_life_days: int = 30) -> Dic
     except Exception as e:
         logger.error("[Evaluator] 更新因子权重失败: %s", e)
 
-    logger.info("[Evaluator] 因子权重已更新: %d 个因子", stats["updated"])
+    logger.info("[Evaluator] 因子权重已更新: %d 个", stats["updated"])
     return stats
 
 
@@ -325,7 +474,7 @@ def update_factor_weights(days: int = 60, decay_half_life_days: int = 30) -> Dic
 # 评估报告
 # ═══════════════════════════════════════════════════════════════
 
-def get_eval_report(chain_id: str = None, days: int = 30) -> Dict[str, Any]:
+def get_eval_report(days: int = 30) -> Dict[str, Any]:
     """获取评估报告。"""
     from app.utils.db import get_db_connection
 
@@ -336,60 +485,56 @@ def get_eval_report(chain_id: str = None, days: int = 30) -> Dict[str, Any]:
         with get_db_connection() as conn:
             cur = conn.cursor()
 
-            chain_filter = "AND r.name = %s" if chain_id else ""
-            params = [since] + ([chain_id] if chain_id else [])
-
             # 总体准确率
-            cur.execute(f"""
-                SELECT r.name,
-                       COUNT(*) as total,
-                       AVG(CASE WHEN r.correct_3d THEN 1.0 ELSE 0.0 END) as acc_3d
-                FROM qd_evaluations r
-                WHERE r.parent_id IS NULL AND r.exec_date >= %s
-                  AND r.correct_3d IS NOT NULL {chain_filter}
-                GROUP BY r.name
-            """, params)
+            cur.execute("""
+                SELECT COUNT(*) as total,
+                       AVG(CASE WHEN correct THEN 1.0 ELSE 0.0 END) as acc
+                FROM qd_traces
+                WHERE parent_id IS NULL AND correct IS NOT NULL
+                  AND exec_date >= %s
+            """, (since,))
 
             row = cur.fetchone()
-            if row:
+            if row and row['total']:
                 result["overall"] = {
-                    "chain_id": row['name'], "total": row['total'],
-                    "accuracy_3d": round(row['acc_3d'], 3) if row['acc_3d'] else 0,
+                    "total": row['total'],
+                    "accuracy": round(row['acc'], 3) if row['acc'] else 0,
                 }
 
             # 各 skill 准确率
-            cur.execute(f"""
-                SELECT e.name,
+            cur.execute("""
+                SELECT t.name,
                        COUNT(*) as cnt,
-                       AVG(CASE WHEN e.correct_3d THEN 1.0 ELSE 0.0 END) as acc_3d
-                FROM qd_evaluations e
-                JOIN qd_evaluations r ON r.id = e.root_id
-                WHERE e.layer = 'skill' AND e.correct_3d IS NOT NULL
-                  AND r.exec_date >= %s {chain_filter}
-                GROUP BY e.name
-                ORDER BY acc_3d DESC
-            """, params)
+                       AVG(CASE WHEN t.correct THEN 1.0 ELSE 0.0 END) as acc
+                FROM qd_traces t
+                JOIN qd_traces r ON r.id = t.root_id
+                WHERE t.layer = 'skill' AND t.correct IS NOT NULL
+                  AND r.exec_date >= %s
+                GROUP BY t.name
+                ORDER BY acc DESC
+            """, (since,))
 
             result["skills"] = [
                 {"name": row['name'], "count": row['cnt'],
-                 "accuracy_3d": round(row['acc_3d'], 3) if row['acc_3d'] else 0}
+                 "accuracy": round(row['acc'], 3) if row['acc'] else 0}
                 for row in cur.fetchall()
             ]
 
             # 因子准确率
-            if chain_id:
-                cur.execute("""
-                    SELECT factor_name, accuracy_3d, sample_count
-                    FROM qd_factor_weights
-                    WHERE chain_id = %s AND sample_count >= 3
-                    ORDER BY accuracy_3d DESC
-                """, (chain_id,))
+            cur.execute("""
+                SELECT skill_name, factor_name, win_rate, weight, sample_count
+                FROM qd_factor_weights
+                WHERE sample_count >= 3
+                ORDER BY win_rate DESC
+                LIMIT 30
+            """)
 
-                result["factors"] = [
-                    {"factor_name": row['factor_name'], "accuracy_3d": round(row['accuracy_3d'], 3) if row['accuracy_3d'] else 0,
-                     "sample_count": row['sample_count']}
-                    for row in cur.fetchall()
-                ]
+            result["factors"] = [
+                {"skill": row['skill_name'], "factor": row['factor_name'],
+                 "accuracy": round(row['win_rate'], 3) if row['win_rate'] else 0,
+                 "weight": row['weight'], "samples": row['sample_count']}
+                for row in cur.fetchall()
+            ]
 
     except Exception as e:
         logger.error("[Evaluator] 获取评估报告失败: %s", e)
@@ -402,10 +547,9 @@ def get_eval_report(chain_id: str = None, days: int = 30) -> Dict[str, Any]:
 # ═══════════════════════════════════════════════════════════════
 
 def auto_evaluate(days_old: int = 1, market: str = "CNStock") -> Dict[str, Any]:
-    """自动评估闭环：评估待验证决策 → 更新因子权重 → 生成报告。"""
+    """自动评估闭环：评估待验证决策 → 更新权重 → 生成报告。"""
     result = {}
 
-    # Step 1: 评估
     try:
         eval_stats = evaluate_pending(days_old=days_old, market=market)
         result["evaluation"] = eval_stats
@@ -413,7 +557,6 @@ def auto_evaluate(days_old: int = 1, market: str = "CNStock") -> Dict[str, Any]:
         logger.error("[AutoEval] 评估失败: %s", e)
         result["evaluation"] = {"evaluated": 0, "errors": 1, "error": str(e)}
 
-    # Step 2: 报告
     try:
         report = get_eval_report()
         result["report"] = report

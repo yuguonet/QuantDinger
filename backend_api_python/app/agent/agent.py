@@ -235,11 +235,61 @@ def _build_instructions(user_message: str = "", skill_instructions: str = "",
     calibration_section = ""
     # calibration_context 通过外部注入到 user_message 前部
 
+    # 金融领域 JSON 标准化输出规范
+    finance_json_section = ""
+    if domain == "finance":
+        finance_json_section = """
+## ⚠️ 输出格式（必须遵守）
+
+你的 final_answer 必须是以下 JSON 格式，否则系统无法解析：
+
+```json
+{
+  "action": "buy/sell/hold/skip",
+  "score": 0-100,
+  "direction": "bullish/bearish/neutral",
+  "confidence": "high/medium/low",
+  "timeframe": "T+1/T+3/T+5/1W/1M/3M/1Y",
+  "timeframe_reason": "为什么选这个时间维度",
+  "stock_code": "6位代码",
+  "stock_name": "股票名称",
+  "signal": "一句话信号摘要",
+  "factors": [
+    {"name": "维度名", "score": 0-100, "direction": "bullish/bearish/neutral"}
+  ],
+  "analysis": "你的完整分析文字"
+}
+```
+
+**timeframe 规则**：
+- 用户给了时间（"明天"/"这周"）→ 按用户的来
+- 用户没给时间 → 你必须声明分析维度，不能含糊
+- direction 和 score 只在你声明的时间维度内有效
+- 不同时间维度方向可能相反，必须明确
+
+不要输出任何 JSON 以外的文字。格式不对会被系统拒绝并要求重写。
+
+"""
+
+    # 金融领域权重注入
+    weight_section = ""
+    if domain == "finance":
+        try:
+            from app.agent.chain.store import get_skill_weights_from_db
+            weights = get_skill_weights_from_db()
+            if weights:
+                weight_lines = ["| 技能 | 权重 |", "|------|------|"]
+                for name, w in sorted(weights.items(), key=lambda x: -x[1]):
+                    weight_lines.append(f"| {name} | {w:.2f} |")
+                weight_section = f"\n## 技能权重（历史回溯数据）\n\n{'chr(10)'.join(weight_lines)}\n\n权重越高，该技能的历史预测越准确。\n"
+        except Exception:
+            pass  # 权重注入失败不影响主流程
+
     return f"""{preamble}
 
 {GUIDANCE}
 {tool_catalog}
-{skill_section}{scan_section}{modify_section}{intent_section}{domain_section}{calibration_section}## 规则
+{skill_section}{scan_section}{modify_section}{intent_section}{domain_section}{calibration_section}{weight_section}## 规则
 
 0. **⚠️ 必须用 final_answer() 返回结果** — 完成任务后，必须调用 `final_answer(你的回复)` 来结束。
 1. **不需要工具的消息，第一步就 final_answer** — 打招呼、闲聊等直接调用 final_answer。
@@ -254,7 +304,7 @@ def _build_instructions(user_message: str = "", skill_instructions: str = "",
    "XX数据缺失，以下结论仅供参考"。绝不用想象填补缺失数据。
 10. **⚠️ 确定性输出** — 你的分析必须基于工具返回的客观数据，不能因为"感觉"
     或"可能"而改变方向性判断。同样的数据必须得出同样的结论。
-{lang_section}"""
+{finance_json_section}{lang_section}"""
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -278,6 +328,97 @@ def _check_dashboard_json(answer, memory, agent) -> bool:
     if not answer or not isinstance(answer, str):
         return False
     return bool(answer.strip())
+
+
+def _check_output_json(answer, memory, agent) -> bool:
+    """校验金融领域 agent 输出是否为合法 JSON 且字段完整。
+
+    仅 domain=finance 时使用。不通过时 agent 会收到错误提示并重写 final_answer。
+    """
+    import json as _json
+    import re as _re
+
+    if not answer or not isinstance(answer, str):
+        return False
+
+    # 提取 JSON 块
+    patterns = [
+        r'```json\s*\n?(.*?)\n?\s*```',
+        r'(\{[^{}]*"action"[^{}]*"score"[^{}]*\})',
+    ]
+    for pat in patterns:
+        m = _re.search(pat, answer, _re.DOTALL)
+        if m:
+            try:
+                data = _json.loads(m.group(1).strip())
+            except (_json.JSONDecodeError, TypeError):
+                continue
+
+            if not isinstance(data, dict):
+                continue
+
+            # 校验必填字段
+            required = {"action", "score", "direction", "confidence", "signal", "factors", "analysis"}
+            missing = required - set(data.keys())
+            if missing:
+                return False
+
+            # 校验 action 值
+            if data["action"] not in ("buy", "sell", "hold", "skip"):
+                return False
+
+            # 校验 score 范围
+            if not (0 <= data["score"] <= 100):
+                return False
+
+            # 校验 direction 值
+            if data["direction"] not in ("bullish", "bearish", "neutral"):
+                return False
+
+            return True
+
+    return False  # 没找到 JSON 块
+
+
+# ═══════════════════════════════════════════════════════════════
+# 3b. Finance Domain — Decision Card Formatter
+# ═══════════════════════════════════════════════════════════════
+
+TIMEFRAME_CN = {
+    "T+1": "1天", "T+3": "3天", "T+5": "5天",
+    "1W": "1周", "1M": "1月", "3M": "3月", "1Y": "1年",
+}
+
+
+def format_decision_card(data: dict) -> str:
+    """将 agent 输出的 JSON 格式化为用户可见的标准卡片。"""
+    action_cn = {"buy": "买入", "sell": "卖出", "hold": "观望", "skip": "跳过"}
+    conf_cn = {"high": "高", "medium": "中", "low": "低"}
+    dir_cn = {"bullish": "看多", "bearish": "看空", "neutral": "中性"}
+    tf = TIMEFRAME_CN.get(data.get("timeframe", ""), data.get("timeframe", ""))
+
+    lines = [
+        f"**{action_cn.get(data['action'], '观望')}** {data.get('stock_name', '')}({data.get('stock_code', '')})",
+        f"维度:{tf} 评分:{data['score']:.0f} 方向:{dir_cn.get(data['direction'], '中性')} 置信:{conf_cn.get(data['confidence'], '中')}",
+    ]
+
+    # 因子明细
+    if data.get("factors"):
+        parts = []
+        for f in data["factors"]:
+            s = f"{f['score']:.0f}" if f.get("score") is not None else "—"
+            parts.append(f"{f['name']}:{s}")
+        lines.append(" | ".join(parts))
+
+    # 信号
+    if data.get("signal"):
+        lines.append(f"信号: {data['signal']}")
+
+    # 详细分析（折叠）
+    if data.get("analysis"):
+        lines.append(f"\n<details><summary>详细分析</summary>\n\n{data['analysis']}\n</details>")
+
+    return "\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -469,6 +610,7 @@ def get_smolagent(
     domain_instructions: str = "",
     intent_context: str = "",
     tool_categories: Optional[List[str]] = None,
+    collector=None,  # TraceCollector（金融领域注入）
 ) -> "CodeAgent | ToolCallingAgent":
     """Build a fresh agent instance per call.
 
@@ -491,12 +633,17 @@ def get_smolagent(
 
             _tools_cache_by_domain[domain_key] = tools
         else:
-            tools = _tools_cache_by_domain[domain_key]
+            tools = list(_tools_cache_by_domain[domain_key])  # copy to avoid mutation
 
     # ── CallSkillTool（替代 managed_agents）──
     from app.agent.skills.call_skill_tool import CallSkillTool
-    call_skill = CallSkillTool(model=smol_model, user_id=user_id)
+    call_skill = CallSkillTool(model=smol_model, user_id=user_id, collector=collector)
     tools.append(call_skill)
+
+    # ── 金融领域：用 TracedTool 包装所有工具 ──────────────────
+    if collector:
+        from app.agent.traced_tool import TracedTool
+        tools = [TracedTool(t, collector) for t in tools]
 
     instructions = _build_instructions(
         user_message, skill_instructions, language, tools, managed_agents=None,
@@ -513,6 +660,9 @@ def get_smolagent(
             "datetime", "collections", "itertools", "re",
         ]
 
+    # 金融领域用 JSON 校验，其他领域用宽松校验
+    checks = [_check_output_json] if domain == "finance" else [_check_dashboard_json]
+
     agent = AgentClass(
         tools=tools,
         model=smol_model,
@@ -522,13 +672,14 @@ def get_smolagent(
         return_full_result=True,
         stream_outputs=True,
         planning_interval=None,
-        final_answer_checks=[_check_dashboard_json],
+        final_answer_checks=checks,
         **_extra_kwargs,
     )
 
     logger.info(
-        "[Agent] Built %s for user=%s domain=%s: %d tools, max_steps=%d",
+        "[Agent] Built %s for user=%s domain=%s: %d tools, max_steps=%d, collector=%s",
         AgentClass.__name__, user_id, domain_key, len(tools), max_steps,
+        "yes" if collector else "no",
     )
     return agent
 

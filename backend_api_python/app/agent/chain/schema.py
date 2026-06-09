@@ -178,6 +178,7 @@ class EvalNode:
     action: str = ""                   # buy / sell / hold / skip（仅 chain 层）
     signal: str = ""                   # 一句话信号
     confidence: Optional[float] = None # 0.0-1.0 叠加buff
+    timeframe: str = ""                # T+1 / T+3 / T+5 / 1W / 1M / 3M / 1Y（仅 chain 层）
 
     # 正向: 内容（全量记录）
     factors: List[FactorItem] = field(default_factory=list)
@@ -195,13 +196,13 @@ class EvalNode:
     error: str = ""
     elapsed_ms: float = 0.0
 
-    # 反向: 回测验证（回溯时写入）
-    actual_return_1d: Optional[float] = None
-    actual_return_3d: Optional[float] = None
-    actual_return_5d: Optional[float] = None
-    actual_direction_3d: str = ""
-    correct_3d: Optional[bool] = None
-    calibration: float = 1.0
+    # 反向: 回溯验证（盘后写入，按 timeframe 取行情验证）
+    exit_date: Optional[date] = None
+    exit_reason: str = ""              # take_profit / stop_loss / max_hold / signal_change
+    pnl_pct: Optional[float] = None   # 盈亏率（%）
+    hold_days: Optional[int] = None    # 实际持有天数
+    correct: Optional[bool] = None     # 方向是否正确
+    calibration: float = 1.0           # 校准因子 1.00~1.05
 
     # 人工介入
     human_reviewed: bool = False
@@ -286,17 +287,17 @@ class EvalNode:
             "stock_code": self.stock_code, "stock_name": self.stock_name,
             "score": self.score, "direction": self.direction, "action": self.action,
             "signal": self.signal, "confidence": self.confidence,
+            "timeframe": self.timeframe,
             "factors": [f.to_dict() for f in self.factors],
             "output_data": self.output_data, "analysis": self.analysis,
             "input_params": self.input_params,
             "tools_called": self.tools_called,
             "missing_data": self.missing_data, "data_source": self.data_source,
             "status": self.status, "error": self.error, "elapsed_ms": self.elapsed_ms,
-            "actual_return_1d": self.actual_return_1d,
-            "actual_return_3d": self.actual_return_3d,
-            "actual_return_5d": self.actual_return_5d,
-            "actual_direction_3d": self.actual_direction_3d,
-            "correct_3d": self.correct_3d, "calibration": self.calibration,
+            "exit_date": self.exit_date.isoformat() if self.exit_date else None,
+            "exit_reason": self.exit_reason,
+            "pnl_pct": self.pnl_pct, "hold_days": self.hold_days,
+            "correct": self.correct, "calibration": self.calibration,
             "human_reviewed": self.human_reviewed, "human_verdict": self.human_verdict,
         }
         if self.children:
@@ -317,6 +318,14 @@ class EvalNode:
             except (ValueError, TypeError):
                 exec_date = None
 
+        exit_date = d.get("exit_date")
+        if isinstance(exit_date, str):
+            from datetime import date as _date2
+            try:
+                exit_date = _date2.fromisoformat(exit_date)
+            except (ValueError, TypeError):
+                exit_date = None
+
         return cls(
             id=d.get("id"), parent_id=d.get("parent_id"), root_id=d.get("root_id"),
             layer=d.get("layer", Layer.CHAIN.value),
@@ -325,7 +334,7 @@ class EvalNode:
             stock_code=d.get("stock_code", ""), stock_name=d.get("stock_name", ""),
             score=d.get("score"), direction=d.get("direction", ""),
             action=d.get("action", ""), signal=d.get("signal", ""),
-            confidence=d.get("confidence"),
+            confidence=d.get("confidence"), timeframe=d.get("timeframe", ""),
             factors=[FactorItem.from_dict(f) for f in d.get("factors", [])],
             output_data=d.get("output_data", {}), analysis=d.get("analysis", ""),
             input_params=d.get("input_params", {}),
@@ -334,11 +343,9 @@ class EvalNode:
             data_source=d.get("data_source", ""),
             status=d.get("status", Status.OK.value),
             error=d.get("error", ""), elapsed_ms=d.get("elapsed_ms", 0.0),
-            actual_return_1d=d.get("actual_return_1d"),
-            actual_return_3d=d.get("actual_return_3d"),
-            actual_return_5d=d.get("actual_return_5d"),
-            actual_direction_3d=d.get("actual_direction_3d", ""),
-            correct_3d=d.get("correct_3d"), calibration=d.get("calibration", 1.0),
+            exit_date=exit_date, exit_reason=d.get("exit_reason", ""),
+            pnl_pct=d.get("pnl_pct"), hold_days=d.get("hold_days"),
+            correct=d.get("correct"), calibration=d.get("calibration", 1.0),
             human_reviewed=d.get("human_reviewed", False),
             human_verdict=d.get("human_verdict", ""),
         )
