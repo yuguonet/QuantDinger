@@ -1,8 +1,9 @@
 # Agent + 可追责 架构设计
 
 > 日期: 2026-06-09
-> 状态: 设计中
-> 替代: DESIGN_RESTRUCTURE.md（算法化路线，已废弃）
+> 状态: 设计完成，Phase 1 待实施
+> 适用范围: 仅 domain="finance" 金融领域，其他领域保持 DESIGN_RESTRUCTURE.md 架构
+> 替代: DESIGN_RESTRUCTURE.md（算法化路线，已废弃，保留只读参考）
 > 继承: AGENT_REDESIGN.md（三层追责体系）+ 现有 agent.py（smolagents CodeAgent）
 
 ## 一、设计原则
@@ -71,6 +72,10 @@
 
 在 agent 执行过程中自动收集信息，构建 EvalNode 树。**对 agent 透明**，agent 不需要知道它的存在。
 
+**提取策略：JSON 优先，正则降级。**
+
+Agent 的 final_answer 被强制要求输出标准 JSON（见第六章），TraceCollector 直接 `json.loads` 取字段，100% 可靠。正则匹配仅作为 fallback——万一 Agent 违规输出非 JSON 时兜底，不作为主路径。
+
 ```python
 class TraceCollector:
     """Agent 执行过程中的自动追踪器。
@@ -80,6 +85,10 @@ class TraceCollector:
     2. 拦截 call_skill，自动创建 Skill 层 EvalNode + SkillReport
     3. Agent 结束时，创建 Chain 层根节点，组装完整 EvalNode 树
     4. 存库
+
+    提取策略：
+    - 优先从 Agent 输出的 JSON 中直接取 score/action/direction/timeframe（100% 可靠）
+    - 仅当 JSON 解析失败时，降级到正则匹配自由文本（fallback）
     """
     
     def __init__(self, session_id: str, user_query: str):
@@ -124,15 +133,26 @@ class TraceCollector:
     def on_agent_finish(self, final_answer: str, total_steps: int, 
                         total_tokens: int, model: str) -> EvalNode:
         """Agent 结束，构建完整 EvalNode 树并存库。"""
+        # 从 JSON 提取结构化数据（优先），正则 fallback
+        extracted = self._extract_from_json(final_answer)
+
         # 构建根节点
         root = EvalNode(
             layer=Layer.CHAIN.value,
             name=f"{self.intent_verb}+{self.intent_noun}" if self.intent_verb else "agent",
             exec_date=date.today(),
-            stock_code=self.stock_code,
-            stock_name=self.stock_name,
+            stock_code=self.stock_code or (extracted.get("stock_code", "")),
+            stock_name=self.stock_name or (extracted.get("stock_name", "")),
             input_params={"user_query": self.user_query},
-            analysis=final_answer[:2000],
+            analysis=extracted.get("analysis", final_answer[:2000]),
+            # 从 JSON 直接取（100% 可靠）
+            score=extracted.get("score"),
+            direction=extracted.get("direction", ""),
+            action=extracted.get("action", ""),
+            signal=extracted.get("signal", ""),
+            confidence=extracted.get("confidence") if isinstance(extracted.get("confidence"), (int, float))
+                       else {"high": 0.8, "medium": 0.5, "low": 0.3}.get(extracted.get("confidence", ""), 0.5),
+            timeframe=extracted.get("timeframe", ""),
         )
         
         # 挂载 skill 节点
@@ -149,15 +169,16 @@ class TraceCollector:
         for tool_node in orphan_tools:
             root.add_child(tool_node)
         
-        # 计算 chain 层汇总
-        valid_reports = [r for r in self.skill_reports 
-                         if r.status == "ok" and r.score is not None]
-        if valid_reports:
-            # 用 agent 的最终结论作为 chain 层决策
-            # （不重新计算，agent 本身就是决策者）
+        # JSON 提取失败时，降级到正则提取（fallback）
+        if root.score is None:
             root.score = self._extract_score_from_answer(final_answer)
+        if not root.direction:
             root.direction = self._extract_direction_from_answer(final_answer)
+        if not root.action:
             root.action = self._extract_action_from_answer(final_answer)
+        if not root.signal:
+            root.signal = extracted.get("signal", "")
+        if root.confidence is None:
             root.confidence = self._extract_confidence_from_answer(final_answer)
         
         root.elapsed_ms = (time.time() - self.start_time) * 1000
@@ -168,29 +189,83 @@ class TraceCollector:
         
         return root
     
+    def _extract_from_json(self, answer: str) -> dict:
+        """优先从 Agent 输出的 JSON 中直接提取字段（100% 可靠）。
+
+        返回 dict，字段缺失时返回空 dict（触发 fallback）。
+        """
+        import json as _json
+        import re as _re
+
+        # 提取 JSON 块
+        patterns = [
+            r'```json\s*\n?(.*?)\n?\s*```',
+            r'(\{[^{}]*"action"[^{}]*"score"[^{}]*\})',
+        ]
+        for pat in patterns:
+            m = _re.search(pat, answer, _re.DOTALL)
+            if m:
+                try:
+                    data = _json.loads(m.group(1).strip())
+                    if isinstance(data, dict) and "action" in data:
+                        return data
+                except (_json.JSONDecodeError, TypeError):
+                    continue
+        return {}
+
     def _extract_score_from_answer(self, answer: str) -> float:
-        """从 agent 最终回复中提取评分。"""
-        # 尝试从结构化输出中提取
+        """从 agent 最终回复中提取评分。
+
+        优先级：JSON 直接取 > 正则 fallback > 从 action 推断
+        """
+        # 1. JSON 优先
+        data = self._extract_from_json(answer)
+        if data and "score" in data:
+            return max(0, min(100, float(data["score"])))
+
+        # 2. 正则 fallback
         import re
-        # 匹配 "评分:75" 或 "score: 75" 等模式
         m = re.search(r'(?:评分|score)[：:\s]*(\d+(?:\.\d+)?)', answer, re.I)
         if m:
             return max(0, min(100, float(m.group(1))))
-        # 从 action 推断
+
+        # 3. 从 action 推断
         action = self._extract_action_from_answer(answer)
         return {"buy": 70, "sell": 30, "hold": 50, "skip": 20}.get(action, 50)
-    
+
     def _extract_direction_from_answer(self, answer: str) -> str:
-        """从 agent 最终回复中提取方向。"""
+        """从 agent 最终回复中提取方向。
+
+        优先级：JSON 直接取 > 正则 fallback
+        """
+        # 1. JSON 优先
+        data = self._extract_from_json(answer)
+        if data and "direction" in data:
+            d = data["direction"]
+            if d in ("bullish", "bearish", "neutral"):
+                return d
+
+        # 2. 正则 fallback
         answer_lower = answer.lower()
         if any(kw in answer_lower for kw in ["买入", "buy", "看多", "bullish", "建议买"]):
             return "bullish"
         if any(kw in answer_lower for kw in ["卖出", "sell", "看空", "bearish", "建议卖"]):
             return "bearish"
         return "neutral"
-    
+
     def _extract_action_from_answer(self, answer: str) -> str:
-        """从 agent 最终回复中提取动作。"""
+        """从 agent 最终回复中提取动作。
+
+        优先级：JSON 直接取 > 正则 fallback
+        """
+        # 1. JSON 优先
+        data = self._extract_from_json(answer)
+        if data and "action" in data:
+            a = data["action"]
+            if a in ("buy", "sell", "hold", "skip"):
+                return a
+
+        # 2. 正则 fallback
         answer_lower = answer.lower()
         if any(kw in answer_lower for kw in ["买入", "buy", "建议买"]):
             return "buy"
@@ -199,9 +274,22 @@ class TraceCollector:
         if any(kw in answer_lower for kw in ["跳过", "skip", "回避"]):
             return "skip"
         return "hold"
-    
+
     def _extract_confidence_from_answer(self, answer: str) -> float:
-        """从 agent 最终回复中提取置信度。"""
+        """从 agent 最终回复中提取置信度。
+
+        优先级：JSON 直接取 > 正则 fallback
+        """
+        # 1. JSON 优先
+        data = self._extract_from_json(answer)
+        if data and "confidence" in data:
+            c = data["confidence"]
+            if isinstance(c, (int, float)):
+                return max(0.0, min(1.0, float(c)))
+            if isinstance(c, str):
+                return {"high": 0.8, "medium": 0.5, "low": 0.3}.get(c, 0.5)
+
+        # 2. 正则 fallback
         answer_lower = answer.lower()
         if any(kw in answer_lower for kw in ["高度确信", "非常确定", "high confidence"]):
             return 0.8
@@ -586,30 +674,39 @@ def apply_decay(trades: list, half_life_days: int = 30) -> list:
 
 ## 五、与现有代码的关系
 
+> **适用范围**：本设计只改 `domain="finance"` 的金融领域。其他领域保持 DESIGN_RESTRUCTURE.md 的 ChainExecutor 架构不变，通过 domain 装饰器隔离。
+
 ### 保留不变
 - `agent.py` 的整体结构（_AgentExecutor、chat/chat_stream）
 - `smolagents CodeAgent` 作为 agent 引擎
 - `intent_analyzer.py` 意图分析
 - `tools/` 目录下 80+ 工具
-- `chain/schema.py` EvalNode/SkillReport/FactorItem
-- `chain/store.py` 持久化
-- `chain/evaluator.py` 回溯评估（重写，按 timeframe + 收益率）
+- `chain/schema.py` EvalNode/SkillReport/FactorItem（加 timeframe 字段）
+- `chain/store.py` 持久化（新建 qd_traces，废弃 qd_evaluations）
 - `skills/base.py` BaseSkill 基类
 - `skills/registry.py` 自动发现
 
 ### 需要修改
-- `agent.py`: 注入 TraceCollector，工具带追踪包装
+- `agent.py`: 金融领域注入 TraceCollector，工具带追踪包装；非金融领域走原 _try_chain 路径
 - `skills/call_skill_tool.py`: 适配 TraceCollector
-- `_build_instructions`: 注入历史权重信息到 agent prompt
+- `_build_instructions`: 金融领域注入 JSON 输出规范 + 历史权重信息
+- `chain/schema.py`: EvalNode 加 timeframe 字段
+- `chain/store.py`: 新增 qd_traces 表的 save_tree / load_tree（新表结构）
 
 ### 需要新增
-- `agent/trace_collector.py`: TraceCollector 类
+- `agent/trace_collector.py`: TraceCollector 类（仅金融领域使用）
 - `agent/traced_tool.py`: TracedTool 包装类
+- `migrations/qd_traces.sql`: 新表 DDL + 出厂权重 INSERT
 
 ### 可以删除
 - `planner.py`: 不再需要独立规划器（agent 自己规划）
 - `agent/chain/executor.py`: 不再需要独立执行器（agent 自己执行）
-- `DESIGN_RESTRUCTURE.md`: 算法化路线已废弃
+- `DESIGN_RESTRUCTURE.md`: 标记废弃，保留只读参考
+
+### 旧数据处理
+- `qd_evaluations` 旧表保留只读，不迁移数据到 qd_traces
+- 冷启动期间权重使用出厂值，有回测数据后自动迭代
+- 详见第九章 9.6 节
 
 ## 六、标准化输出
 
@@ -859,62 +956,69 @@ Agent 的 instructions 中注入以下信息，帮助它做出更好的决策：
 
 ## 八、实施计划
 
-### Phase 0: 数据库重建（半天）
-- [ ] 新建 `qd_traces` 表（替代 qd_evaluations）
-- [ ] 新建 `qd_factor_weights` 表（含出厂权重）
-- [ ] 新建 `qd_skill_weights` 表（新增）
-- [ ] 新建 `chain/store.py` 的 `save_tree` / `load_tree` / `query`（适配新表）
+> **Phase 1 一趟水完成**：以下所有改动在一个 Phase 中交付，不做分批。预计 3~5 天。
+> 
+> 适用范围：仅 `domain="finance"` 金融领域。其他领域保持 DESIGN_RESTRUCTURE.md 架构不变。
 
-### Phase 1: 标准化输出（1天）
-- [ ] `agent.py` — `_build_instructions` 加 JSON 输出规范
+### Phase 1: 全量交付（3~5 天）
+
+#### 1.1 数据库（半天）
+- [ ] 新建 `qd_traces` 表（替代 qd_evaluations，新结构含 timeframe / exit_date / pnl_pct / hold_days）
+- [ ] 新建 `qd_skill_weights` 表（含出厂权重 INSERT）
+- [ ] 重建 `qd_factor_weights` 表（含出厂权重 INSERT，按单位时间收益率设计）
+- [ ] 旧表 `qd_evaluations` 保留只读，不迁移数据
+
+#### 1.2 Schema 改动（半天）
+- [ ] `chain/schema.py` — EvalNode 加 `timeframe` 字段
+- [ ] `chain/schema.py` — EvalNode 加 `exit_date` / `exit_reason` / `pnl_pct` / `hold_days` 字段（替代旧 actual_return_* 系列）
+- [ ] `chain/schema.py` — 删除旧 `actual_return_1d/3d/5d` / `actual_direction_3d` / `correct_3d` 字段
+
+#### 1.3 TraceCollector + TracedTool（1天）
+- [ ] 新建 `agent/trace_collector.py` — TraceCollector 类（JSON 优先提取，正则 fallback）
+- [ ] 新建 `agent/traced_tool.py` — TracedTool 包装类
+
+#### 1.4 标准化输出（半天）
+- [ ] `agent.py` — `_build_instructions` 加 JSON 输出规范（仅 domain=finance）
 - [ ] `agent.py` — `_check_output_json` 校验函数（替换旧 `_check_dashboard_json`）
 - [ ] `agent.py` — `format_decision_card` 格式化函数
 - [ ] `agent.py` — final_answer → JSON 校验 → 格式化卡片 → 返回用户
 - [ ] 删除 agent.py 中的"金融领域标准化输出"事后硬解析代码
-- [ ] 验证：agent 输出始终为标准卡片
 
-### Phase 2: 追踪层（1~2天）
-- [ ] `trace_collector.py` — TraceCollector 类
-- [ ] `traced_tool.py` — TracedTool 包装
-- [ ] `agent.py` — 注入 collector，工具包装
-- [ ] TraceCollector 从 agent 输出 JSON 直接提取 score/action/direction（不解析自由文本）
-- [ ] 验证：agent 执行后自动生成 EvalNode 树
+#### 1.5 Agent 注入（1天）
+- [ ] `agent.py` — 金融领域注入 TraceCollector，工具用 TracedTool 包装
+- [ ] `agent.py` — 非金融领域走原 `_try_chain` 路径（不动）
+- [ ] `agent.py` — `_build_instructions` 注入历史权重信息（仅 domain=finance）
+- [ ] `skills/call_skill_tool.py` — 适配 TraceCollector
 
-### Phase 3: call_skill 适配（1天）
-- [ ] `call_skill_tool.py` — 适配 TraceCollector
-- [ ] Skill 内部工具调用也被追踪
-- [ ] 验证：call_skill 后 Skill 层和 Tool 层 EvalNode 正确
-
-### Phase 4: 指令注入（1天）
-- [ ] 历史权重注入到 agent instructions
-- [ ] 数据陷阱警告注入
-- [ ] 可用技能列表注入（含准确率）
-
-### Phase 5: 清理旧代码（半天）
-- [ ] 删除 `planner.py`
-- [ ] 删除 `chain/executor.py`
-- [ ] 删除旧 `qd_evaluations` 表相关代码
-- [ ] 清理 `agent.py` 中的 `_try_chain`、`_save_freeform_to_db`、`_infer_skill_name`
-- [ ] 清理 `agent.py` 中的"金融领域标准化输出"事后硬解析代码
-- [ ] 更新 DESIGN_RESTRUCTURE.md → 标记废弃
-- [ ] 删除 planner.py
-- [ ] 删除 chain/executor.py
-- [ ] 清理 agent.py 中的 _try_chain 逻辑
-- [ ] 更新 DESIGN_RESTRUCTURE.md → 标记废弃
-
-### Phase 6: 回溯评估引擎（1~2天）
+#### 1.6 回溯评估引擎（1天）
 - [ ] `chain/evaluator.py` — 重写，纯 SQL + 数学，0 token，不涉及 agent
 - [ ] `chain/evaluator.py` — `evaluate_pending()` 按 timeframe 取行情验证
 - [ ] `chain/evaluator.py` — `calc_skill_weight()` 按单位时间收益率计算权重
 - [ ] `chain/evaluator.py` — `calc_factor_weight()` 同逻辑
 - [ ] `chain/evaluator.py` — 时间衰减（近期交易权重更高）
 - [ ] 盘后定时任务：evaluate_pending → update_weights
-- [ ] 验证权重迭代闭环
+- [ ] `chain/store.py` — 新增 qd_traces 的 save_tree / load_tree / query
 
-### Phase 7: 端到端验证（1天）
-- [ ] agent 执行 → JSON 输出 → 格式化卡片 → 用户看到
-- [ ] EvalNode 树存库 → 盘后回溯 → 权重更新
-- [ ] 权重注入到 agent instructions → 下次执行生效
+#### 1.7 清理旧代码（半天）
+- [ ] 删除 `agent/planner.py`
+- [ ] 删除 `agent/chain/executor.py`
+- [ ] 清理 `agent.py` 中的 `_try_chain`（仅金融领域分支，非金融保留）
+- [ ] 清理 `agent.py` 中的 `_save_freeform_to_db`、`_infer_skill_name`
+- [ ] 清理 `agent.py` 中的"金融领域标准化输出"事后硬解析代码
+- [ ] 更新 DESIGN_RESTRUCTURE.md → 标记废弃
+
+#### 1.8 端到端验证（半天）
+- [ ] 金融领域：agent 执行 → JSON 输出 → 格式化卡片 → 用户看到
+- [ ] 金融领域：EvalNode 树存库 → 盘后回溯 → 权重更新
+- [ ] 金融领域：权重注入到 agent instructions → 下次执行生效
+- [ ] 非金融领域：回归测试，确认原 _try_chain 路径不受影响
+
+### Phase 2+（后续迭代）
+- [ ] Skill 层 algo_analyze 实现（8 个可纯算法 Skill）
+- [ ] Tool 层数据源可靠度追踪
+- [ ] 前端 DecisionCard 可视化（含 timeframe 维度切换）
+- [ ] 回测结果可视化
+- [ ] Skill 权重可视化（各 Skill 的 return_per_day 趋势图）
 
 ## 九、数据库设计（全新）
 
@@ -948,6 +1052,7 @@ CREATE TABLE qd_traces (
     action          VARCHAR(10),             -- buy / sell / hold / skip（仅 chain 层）
     signal          TEXT,                    -- 一句话信号
     confidence      REAL,                    -- 0.0-1.0
+    timeframe       VARCHAR(10),             -- T+1 / T+3 / T+5 / 1W / 1M / 3M / 1Y（仅 chain 层）
     analysis        TEXT,                    -- 分析文字（截断到 2000 字符）
     factors         JSONB,                   -- [{name, value, score, weight, status}]
 
@@ -1109,9 +1214,16 @@ intelligence_agent 历史 60 笔交易:
 
 | 旧表 | 新表 | 关系 |
 |------|------|------|
-| qd_evaluations | qd_traces | 替代，字段精简，去掉旧兼容字段 |
-| qd_factor_weights | qd_factor_weights | 重建，按单位时间收益率计算权重 |
+| qd_evaluations | qd_traces | **废弃不迁移**，旧表保留只读，新表从零开始 |
+| qd_factor_weights | qd_factor_weights | 重建，按单位时间收益率计算权重，出厂 INSERT 覆盖旧数据 |
 | 无 | qd_skill_weights | 新增，按单位时间收益率计算权重 |
+
+**旧数据不迁移，冷启动策略：**
+- qd_evaluations 旧表保留只读（历史查询用），不迁移数据到 qd_traces
+- qd_traces 从零开始，盘后定时任务跑 `evaluate_pending()` + `update_weights()` 逐步积累
+- 冷启动期间所有 Skill/因子权重使用出厂值（qd_skill_weights / qd_factor_weights 的 INSERT）
+- 有回测数据后自动迭代，权重生效周期取决于用户使用频率和回溯窗口（T+3~T+5）
+- 预计积累 50+ 笔已验证决策后，权重开始有统计意义
 
 ### 9.7 数据量控制
 
@@ -1167,3 +1279,82 @@ def _enforce_size_limit(root: EvalNode):
 | TraceCollector 的 on_tool_call 性能 | 每次工具调用多 ~1ms | 可接受，纯内存操作 |
 | agent 输出 JSON 格式不合规 | final_answer_checks 拒绝，需要重写 | instructions 明确格式 + 重试最多 2 次 |
 | agent JSON 中 score/action 和实际分析矛盾 | 数据不准 | 回溯时以 SkillReport 为准校验 |
+| 冷启动期权重全为出厂值 | 无个性化，所有 Skill 等权 | 出厂值已有差异（technical=1.2, policy=0.7）；积累 50+ 笔后生效 |
+| 非金融领域 domain 路由错误 | 走错路径（应该走 ChainExecutor 却走了 TraceCollector） | domain 判断在 agent.py 入口处，明确分支 |
+
+## 十一、设计决议
+
+> 以下为设计评审中确认的 4 项关键决策，记录备查。
+
+### 11.1 Domain 隔离方案：装饰器模式
+
+**决策**：金融领域与其他领域共享同一个 agent.py 入口，通过 domain 字段路由不同逻辑。
+
+**依据**：工具层（tools/registry.py）已有 `domain` 标识和过滤机制（`tool_registry.build({"domain": ...})`），Skill、Chain、Agent 配置层复用同一套模式即可，不需要分支隔离。
+
+**实现方式**：
+- tools/ 按 domain 注册（已有）
+- skills/ 按 domain 注册（`@skill` 装饰器加 `domain` 参数）
+- agent.py 的 `_build_instructions()` 按 domain 注入不同 instructions
+- AGENT_ACCOUNTABLE 的改动（TraceCollector / JSON 标准化输出 / 权重迭代）只在 `domain="finance"` 生效
+- 其他 domain 保持 DESIGN_RESTRUCTURE.md 的 ChainExecutor 架构不变
+
+### 11.2 TraceCollector 提取策略：JSON 优先
+
+**决策**：TraceCollector 的 `_extract_*` 方法优先从 Agent 输出的 JSON 中直接取字段，正则匹配仅作 fallback。
+
+**依据**：
+- 用户端需要快速判断做决策，结构化数据比自由文本更可靠
+- Agent 被强制输出标准 JSON（instructions + final_answer_checks），JSON 直接取字段 = 100% 可靠
+- 正则匹配自由文本存在漏匹配风险（"75分" vs "评分：75" vs "score of 75"）
+- JSON 提取失败 = Agent 违规输出，应记录异常日志，而非静默降级
+
+**实现**：
+- `_extract_from_json(answer)` → 尝试 `json.loads` 提取 JSON 块
+- 各 `_extract_*` 方法：JSON 直接取 → 正则 fallback → 推断默认值
+- JSON 解析失败时记录 warning 日志（`logger.warning("[TraceCollector] JSON 解析失败，降级正则")`）
+
+### 11.3 Phase 1 范围：一趟水完成
+
+**决策**：Phase 1 包含所有核心改动，不做分批交付。
+
+**Phase 1 改动清单**：
+
+| 改动 | 涉及文件 | 类型 |
+|------|---------|------|
+| 新建 qd_traces 表 | migrations/qd_traces.sql | 新增 |
+| 新建 qd_skill_weights 表 | migrations/qd_traces.sql | 新增 |
+| 重建 qd_factor_weights 表 | migrations/qd_traces.sql | 重建 |
+| EvalNode 加 timeframe 字段 | chain/schema.py | 修改 |
+| TraceCollector | agent/trace_collector.py | 新增 |
+| TracedTool 包装 | agent/traced_tool.py | 新增 |
+| JSON 标准化输出（instructions + checks + format） | agent.py | 修改 |
+| agent.py 注入 TraceCollector | agent.py | 修改 |
+| call_skill_tool 适配 TraceCollector | skills/call_skill_tool.py | 修改 |
+| evaluator 重写（按 timeframe 取行情 + 单位时间收益率） | chain/evaluator.py | 重写 |
+| instructions 注入权重信息 | agent.py | 修改 |
+| 删除 planner.py | agent/planner.py | 删除 |
+| 删除 chain/executor.py | agent/chain/executor.py | 删除 |
+| 删除旧 qd_evaluations 相关代码 | agent/agent.py, chain/store.py | 清理 |
+| DB 初始化脚本更新 | chain/store.py | 修改 |
+
+**Phase 2+（后续迭代）**：
+- Skill 层 algo_analyze 实现（8 个可纯算法 Skill）
+- Tool 层数据源可靠度追踪
+- 前端 DecisionCard 可视化
+- 回测结果可视化
+
+### 11.4 旧数据策略：废弃不迁移
+
+**决策**：qd_evaluations 旧数据不迁移到 qd_traces，新表从零开始。
+
+**依据**：
+- 旧表结构与新表不兼容（无 timeframe、无 hold_days、无 exit_reason）
+- 旧数据中 freeform 路径的迷你树质量低（事后硬解析，字段不全）
+- 迁移成本高于收益，且迁移后数据一致性无法保证
+
+**冷启动策略**：
+- 出厂权重直接 INSERT（qd_skill_weights / qd_factor_weights）
+- 盘后定时任务 `evaluate_pending()` + `update_weights()` 逐步积累
+- 预计 50+ 笔已验证决策后权重有统计意义
+- 旧表 qd_evaluations 保留只读，仅作历史查询参考
