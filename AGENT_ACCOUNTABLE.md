@@ -1,7 +1,7 @@
 # Agent + 可追责 架构设计
 
 > 日期: 2026-06-09
-> 状态: 设计完成，Phase 1 待实施
+> 状态: Phase 1 实施中（已修复 5 个集成缺陷）
 > 适用范围: 仅 domain="finance" 金融领域，其他领域保持 DESIGN_RESTRUCTURE.md 架构
 > 替代: DESIGN_RESTRUCTURE.md（算法化路线，已废弃，保留只读参考）
 > 继承: AGENT_REDESIGN.md（三层追责体系）+ 现有 agent.py（smolagents CodeAgent）
@@ -963,46 +963,46 @@ Agent 的 instructions 中注入以下信息，帮助它做出更好的决策：
 ### Phase 1: 全量交付（3~5 天）
 
 #### 1.1 数据库（半天）
-- [ ] 新建 `qd_traces` 表（替代 qd_evaluations，新结构含 timeframe / exit_date / pnl_pct / hold_days）
-- [ ] 新建 `qd_skill_weights` 表（含出厂权重 INSERT）
-- [ ] 重建 `qd_factor_weights` 表（含出厂权重 INSERT，按单位时间收益率设计）
-- [ ] 旧表 `qd_evaluations` 保留只读，不迁移数据
+- [x] 新建 `qd_traces` 表（替代 qd_evaluations，新结构含 timeframe / exit_date / pnl_pct / hold_days）
+- [x] 新建 `qd_skill_weights` 表（含出厂权重 INSERT）
+- [x] 重建 `qd_factor_weights` 表（含出厂权重 INSERT，按单位时间收益率设计）
+- [x] 旧表 `qd_evaluations` 保留只读，不迁移数据
 
 #### 1.2 Schema 改动（半天）
-- [ ] `chain/schema.py` — EvalNode 加 `timeframe` 字段
-- [ ] `chain/schema.py` — EvalNode 加 `exit_date` / `exit_reason` / `pnl_pct` / `hold_days` 字段（替代旧 actual_return_* 系列）
-- [ ] `chain/schema.py` — 删除旧 `actual_return_1d/3d/5d` / `actual_direction_3d` / `correct_3d` 字段
+- [x] `chain/schema.py` — EvalNode 加 `timeframe` 字段
+- [x] `chain/schema.py` — EvalNode 加 `exit_date` / `exit_reason` / `pnl_pct` / `hold_days` 字段（替代旧 actual_return_* 系列）
+- [x] `chain/schema.py` — 删除旧 `actual_return_1d/3d/5d` / `actual_direction_3d` / `correct_3d` 字段
 
 #### 1.3 TraceCollector + TracedTool（1天）
-- [ ] 新建 `agent/trace_collector.py` — TraceCollector 类（JSON 优先提取，正则 fallback）
-- [ ] 新建 `agent/traced_tool.py` — TracedTool 包装类
+- [x] 新建 `agent/trace_collector.py` — TraceCollector 类（JSON 优先提取，正则 fallback）
+- [x] 新建 `agent/traced_tool.py` — TracedTool 包装类
 
 #### 1.4 标准化输出（半天）
-- [ ] `agent.py` — `_build_instructions` 加 JSON 输出规范（仅 domain=finance）
-- [ ] `agent.py` — `_check_output_json` 校验函数（替换旧 `_check_dashboard_json`）
-- [ ] `agent.py` — `format_decision_card` 格式化函数
-- [ ] `agent.py` — final_answer → JSON 校验 → 格式化卡片 → 返回用户
+- [x] `agent.py` — `_build_instructions` 加 JSON 输出规范（仅 domain=finance）
+- [x] `agent.py` — `_check_output_json` 校验函数（替换旧 `_check_dashboard_json`）
+- [x] `agent.py` — `format_decision_card` 格式化函数
+- [x] `agent.py` — final_answer → JSON 校验 → 格式化卡片 → 返回用户
 - [ ] 删除 agent.py 中的"金融领域标准化输出"事后硬解析代码
 
 #### 1.5 Agent 注入（1天）
-- [ ] `agent.py` — 金融领域注入 TraceCollector，工具用 TracedTool 包装
-- [ ] `agent.py` — 非金融领域走原 `_try_chain` 路径（不动）
-- [ ] `agent.py` — `_build_instructions` 注入历史权重信息（仅 domain=finance）
-- [ ] `skills/call_skill_tool.py` — 适配 TraceCollector
+- [x] `agent.py` — 金融领域注入 TraceCollector，工具用 TracedTool 包装
+- [x] `agent.py` — 非金融领域走原 `_try_chain` 路径（不动）
+- [x] `agent.py` — `_build_instructions` 注入历史权重信息（仅 domain=finance）
+- [x] `skills/call_skill_tool.py` — 适配 TraceCollector
 
 #### 1.6 回溯评估引擎（1天）
-- [ ] `chain/evaluator.py` — 重写，纯 SQL + 数学，0 token，不涉及 agent
-- [ ] `chain/evaluator.py` — `evaluate_pending()` 按 timeframe 取行情验证
-- [ ] `chain/evaluator.py` — `calc_skill_weight()` 按单位时间收益率计算权重
-- [ ] `chain/evaluator.py` — `calc_factor_weight()` 同逻辑
-- [ ] `chain/evaluator.py` — 时间衰减（近期交易权重更高）
-- [ ] 盘后定时任务：evaluate_pending → update_weights
-- [ ] `chain/store.py` — 新增 qd_traces 的 save_tree / load_tree / query
+- [x] `chain/evaluator.py` — 重写，纯 SQL + 数学，0 token，不涉及 agent
+- [x] `chain/evaluator.py` — `evaluate_pending()` 按 timeframe 取行情验证
+- [x] `chain/evaluator.py` — `calc_skill_weight()` 按单位时间收益率计算权重
+- [x] `chain/evaluator.py` — `calc_factor_weight()` 同逻辑
+- [x] `chain/evaluator.py` — 时间衰减（近期交易权重更高）
+- [x] 盘后定时任务：evaluate_pending → update_weights
+- [x] `chain/store.py` — 新增 qd_traces 的 save_tree / load_tree / query
 
 #### 1.7 清理旧代码（半天）
-- [ ] 删除 `agent/planner.py`
-- [ ] 删除 `agent/chain/executor.py`
-- [ ] 清理 `agent.py` 中的 `_try_chain`（仅金融领域分支，非金融保留）
+- [x] 删除 `agent/planner.py`
+- [x] 删除 `agent/chain/executor.py`
+- [x] 清理 `agent.py` 中的 `_try_chain`（仅金融领域分支，非金融保留）
 - [ ] 清理 `agent.py` 中的 `_save_freeform_to_db`、`_infer_skill_name`
 - [ ] 清理 `agent.py` 中的"金融领域标准化输出"事后硬解析代码
 - [ ] 更新 DESIGN_RESTRUCTURE.md → 标记废弃
@@ -1012,6 +1012,13 @@ Agent 的 instructions 中注入以下信息，帮助它做出更好的决策：
 - [ ] 金融领域：EvalNode 树存库 → 盘后回溯 → 权重更新
 - [ ] 金融领域：权重注入到 agent instructions → 下次执行生效
 - [ ] 非金融领域：回归测试，确认原 _try_chain 路径不受影响
+
+#### 1.9 集成缺陷修复（2026-06-09 已完成）
+- [x] `traced_tool.py` — 添加 `to_code_prompt()` / `to_tool_calling_prompt()` 代理
+- [x] `chain/__init__.py` — 修复 `get_skill_weights` 导入名不匹配
+- [x] `agent.py` — 金融域跳过 `_try_chain`（避免引用已删除的 planner/executor）
+- [x] `agent.py` — 工具缓存浅拷贝修复（防止 call_skill 重复）
+- [x] `agent.py` — 默认 timeframe 改为 T+3，禁止 1Y+ 作为默认值
 
 ### Phase 2+（后续迭代）
 - [ ] Skill 层 algo_analyze 实现（8 个可纯算法 Skill）
@@ -1358,3 +1365,82 @@ def _enforce_size_limit(root: EvalNode):
 - 盘后定时任务 `evaluate_pending()` + `update_weights()` 逐步积累
 - 预计 50+ 笔已验证决策后权重有统计意义
 - 旧表 qd_evaluations 保留只读，仅作历史查询参考
+
+## 十二、Phase 1 实施缺陷记录
+
+> 日期: 2026-06-09
+> 以下是 Phase 1 集成测试中发现的设计遗漏和实现缺陷，已全部修复。
+
+### 12.1 TracedTool 缺少 to_code_prompt 代理
+
+**现象**：`'TracedTool object' has no attribute 'to_code_prompt'`
+
+**根因**：smolagents Jinja 模板渲染系统提示词时调用 `tool.to_code_prompt()`，`TracedTool` 不继承 `Tool`（因为 `Tool.__init__` 会校验 `forward` 签名），也未代理此方法。
+
+**修复**：`traced_tool.py` 添加 `to_code_prompt()` 和 `to_tool_calling_prompt()` 代理方法。
+
+**设计补充**：`TracedTool` 应使用 `__getattr__` 兜底代理，防止 smolagents 升级后新增方法再次断裂：
+
+```python
+def __getattr__(self, name):
+    return getattr(self._tool, name)
+```
+
+### 12.2 chain/__init__.py 导入名不匹配
+
+**现象**：`cannot import name 'get_skill_weights' from 'app.agent.chain.store'`
+
+**根因**：`store.py` 中函数名为 `get_skill_weights_from_db`，但 `__init__.py` 导入时使用旧名 `get_skill_weights`。
+
+**修复**：`__init__.py` 添加别名 `get_skill_weights = get_skill_weights_from_db`。
+
+### 12.3 金融域 _try_chain 引用已删除模块
+
+**现象**：`No module named 'app.agent.planner'`
+
+**根因**：Phase 1 删除了 `planner.py` 和 `executor.py`，但 `_try_chain` 方法仍在引用。金融域按设计应由 agent 自规划，不走 Planner/ChainExecutor 路径。
+
+**修复**：`_chat_locked` 和 `_chat_stream_locked` 中，`domain == "finance"` 时跳过 `_try_chain`。
+
+**注意**：非金融域的 `_try_chain` 路径仍然断裂（planner/executor 已删除），需要后续决策：
+- 方案 A：恢复 planner/executor（保留非金融域的链路编排能力）
+- 方案 B：所有域统一走 agent 自规划（彻底删除 `_try_chain`）
+
+### 12.4 工具缓存污染导致 call_skill 重复
+
+**现象**：`Each tool or managed_agent should have a unique name! You passed these duplicate names: ['call_skill', 'call_skill']`
+
+**根因**：`get_smolagent` 中，首次调用时 `tools` 直接引用缓存列表（非拷贝），`tools.append(call_skill)` 修改了缓存原始列表。后续调用时 `list()` 拷贝出的列表已含 `call_skill`，再 append 一个就重复了。
+
+```python
+# 缺陷代码
+_tools_cache_by_domain[domain_key] = tools  # 缓存引用
+tools.append(call_skill)                     # 修改了缓存！
+# 第二次调用
+tools = list(_tools_cache_by_domain[...])    # 已含 call_skill
+tools.append(call_skill)                     # 重复！
+```
+
+**修复**：`list()` 拷贝移到 `if` 块外，每次调用都用独立副本。
+
+### 12.5 默认 timeframe 缺失导致 agent 选择超长周期
+
+**现象**：agent 对"分析宇通客车"输出 `timeframe: "1Y+"`，等于没分析。
+
+**根因**：instructions 中 timeframe 规则只说"必须声明"，未约束默认值。agent 选最安全的超长周期以避免"预测错误"。
+
+**修复**：instructions 中明确：
+- 用户未指定时间 → **默认 T+3**（3个交易日短线）
+- 禁止 1Y/1Y+ 作为默认值
+- 用户明确问中长期时才用 1M/3M/1Y
+
+### 12.6 已知遗留问题（待后续迭代）
+
+| 问题 | 严重度 | 说明 |
+|------|--------|------|
+| Skill 内部工具调用未被追踪 | 中 | `CallSkillTool` 内部的 `call_tool_fn` 走裸工具，不经过 `TracedTool`，Tool 层追踪缺失 |
+| `save_tree` 未写入 session_id/user_query | 中 | `TraceCollector` 构建的元数据在存库时丢失 |
+| `_extract_from_json` 正则太窄 | 低 | 裸 JSON（无 ```json 包裹）且含嵌套 `{}` 时可能漏匹配 |
+| 权重注入静默失败 | 低 | 数据库异常时 agent 无权重信息运行，应至少 `logger.warning` |
+| `_check_output_json` 无降级路径 | 低 | 重试 2 次仍失败则直接报错，应降级为自由文本输出 |
+| 非金融域 `_try_chain` 断裂 | 中 | planner/executor 已删除，非金融域链路编排不可用 |

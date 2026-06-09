@@ -1,7 +1,15 @@
 {
     "analyze+stock": [
         {
-            "tool": "python_interpreter",
+            "tool": "get_realtime_quote",
+            "desc": ""
+        },
+        {
+            "tool": "get_indicator_snapshot",
+            "desc": ""
+        },
+        {
+            "tool": "get_chip_distribution",
             "desc": ""
         }
     ],

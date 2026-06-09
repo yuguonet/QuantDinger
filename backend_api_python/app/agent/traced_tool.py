@@ -22,6 +22,9 @@ from app.agent.trace_collector import TraceCollector
 class TracedTool:
     """包装原始工具，自动记录调用信息。"""
 
+    # smolagents 框架附加在所有工具调用上的参数，需剥离后才传给底层工具
+    _FRAMEWORK_KWARGS = {"sanitize_inputs_outputs"}
+
     def __init__(self, original_tool, collector: TraceCollector):
         self._tool = original_tool
         self._collector = collector
@@ -31,12 +34,17 @@ class TracedTool:
         self.inputs = getattr(original_tool, 'inputs', {})
         self.output_type = getattr(original_tool, 'output_type', 'text')
 
+    @staticmethod
+    def _strip_framework_kwargs(kwargs: dict) -> dict:
+        """移除 smolagens 框架附加参数，只保留工具真实参数。"""
+        return {k: v for k, v in kwargs.items() if k not in TracedTool._FRAMEWORK_KWARGS}
+
     def forward(self, **kwargs) -> Any:
         t0 = time.time()
         error = None
         result = None
         try:
-            result = self._tool.forward(**kwargs)
+            result = self._tool.forward(**self._strip_framework_kwargs(kwargs))
         except Exception as e:
             error = str(e)
             raise
@@ -50,6 +58,23 @@ class TracedTool:
                 error=error,
             )
         return result
+
+    def __call__(self, **kwargs) -> Any:
+        """让 TracedTool 可以直接像函数一样调用。
+
+        外部代码（测试/调试/直接调用）可以写：
+            get_realtime_quote(stock_code="600066")
+        而不需要先解包内部工具。
+        """
+        return self.forward(**kwargs)
+
+    def to_code_prompt(self) -> str:
+        """代理原始工具的 to_code_prompt，smolagents Jinja 模板渲染系统提示词时需要。"""
+        return self._tool.to_code_prompt()
+
+    def to_tool_calling_prompt(self) -> str:
+        """代理原始工具的 to_tool_calling_prompt。"""
+        return self._tool.to_tool_calling_prompt()
 
     def __repr__(self):
         return f"TracedTool({self.name})"

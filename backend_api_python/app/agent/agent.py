@@ -201,33 +201,36 @@ def _build_instructions(user_message: str = "", skill_instructions: str = "",
         finance_json_section = """
 ## ⚠️ 输出格式（必须遵守）
 
-你的 final_answer 必须是以下 JSON 格式，否则系统无法解析：
+你的最终答案必须通过 Python 代码调用 `final_answer()` 函数来返回一个包含以下字段的字典。
 
-```json
-{
-  "action": "buy/sell/hold/skip",
-  "score": 0-100,
-  "direction": "bullish/bearish/neutral",
-  "confidence": "high/medium/low",
-  "timeframe": "T+1/T+3/T+5/1W/1M/3M/1Y",
-  "timeframe_reason": "为什么选这个时间维度",
-  "stock_code": "6位代码",
-  "stock_name": "股票名称",
-  "signal": "一句话信号摘要",
-  "factors": [
-    {"name": "维度名", "score": 0-100, "direction": "bullish/bearish/neutral"}
-  ],
-  "analysis": "你的完整分析文字"
-}
+在代码块的最后一行加上：
+
+```py
+final_answer({
+    "action": "buy/sell/hold/skip",
+    "score": 0-100,
+    "direction": "bullish/bearish/neutral",
+    "confidence": "high/medium/low",
+    "timeframe": "T+1/T+3/T+5/1W/1M/3M/1Y",
+    "timeframe_reason": "为什么选这个时间维度",
+    "stock_code": "6位代码",
+    "stock_name": "股票名称",
+    "signal": "一句话信号摘要",
+    "factors": [
+        {"name": "维度名", "score": 0-100, "direction": "bullish/bearish/neutral"}
+    ],
+    "analysis": "你的完整分析文字"
+})
 ```
 
 **timeframe 规则**：
 - 用户给了时间（"明天"/"这周"）→ 按用户的来
-- 用户没给时间 → 你必须声明分析维度，不能含糊
+- 用户没给时间 → **默认 T+3**（3个交易日短线），除非用户明确问中长期
+- 禁止使用 1Y/1Y+ 等超长周期作为默认值，那等于没分析
 - direction 和 score 只在你声明的时间维度内有效
 - 不同时间维度方向可能相反，必须明确
 
-不要输出任何 JSON 以外的文字。格式不对会被系统拒绝并要求重写。
+不要输出任何 ````json` 代码块。必须用 Python 的 `final_answer()` 返回。格式不对会被系统拒绝并要求重写。
 
 """
 
@@ -285,59 +288,84 @@ def _check_dashboard_json(answer, memory, agent) -> bool:
     Previously enforced JSON dashboard structure in analysis mode.
     Now that the LLM decides its own approach, accept any non-empty answer.
     """
-    if not answer or not isinstance(answer, str):
+    if not answer:
         return False
-    return bool(answer.strip())
+    if isinstance(answer, dict):
+        return True
+    if isinstance(answer, str):
+        return bool(answer.strip())
+    return True
 
 
 def _check_output_json(answer, memory, agent) -> bool:
     """校验金融领域 agent 输出是否为合法 JSON 且字段完整。
+
+    兼容两种输入：
+    - ToolCallingAgent → answer 是 dict（final_answer 工具调用的返回值）
+    - CodeAgent → answer 是包含 ```json 块的字符串
 
     仅 domain=finance 时使用。不通过时 agent 会收到错误提示并重写 final_answer。
     """
     import json as _json
     import re as _re
 
-    if not answer or not isinstance(answer, str):
+    if not answer:
         return False
 
-    # 提取 JSON 块
-    patterns = [
-        r'```json\s*\n?(.*?)\n?\s*```',
-        r'(\{[^{}]*"action"[^{}]*"score"[^{}]*\})',
-    ]
-    for pat in patterns:
-        m = _re.search(pat, answer, _re.DOTALL)
-        if m:
+    data = None
+
+    # 情况 1：answer 已经是 dict（ToolCallingAgent 的 final_answer 工具调用）
+    if isinstance(answer, dict):
+        data = answer
+
+    # 情况 2：answer 是字符串，尝试从中提取 JSON 块
+    elif isinstance(answer, str):
+        patterns = [
+            r'```json\s*\n?(.*?)\n?\s*```',
+            r'(\{[^{}]*"action"[^{}]*"score"[^{}]*\})',
+        ]
+        for pat in patterns:
+            m = _re.search(pat, answer, _re.DOTALL)
+            if m:
+                try:
+                    data = _json.loads(m.group(1).strip())
+                except (_json.JSONDecodeError, TypeError):
+                    continue
+                if isinstance(data, dict):
+                    break
+
+    if not isinstance(data, dict):
+        return False
+
+    # 校验必填字段
+    required = {"action", "score", "direction", "confidence", "timeframe", "signal", "factors", "analysis"}
+    missing = required - set(data.keys())
+    if missing:
+        return False
+
+    try:
+        # 校验 action 值
+        if data["action"] not in ("buy", "sell", "hold", "skip"):
+            return False
+
+        # 校验 score 范围（可能为字符串如 "75" 或 None）
+        score = data["score"]
+        if not isinstance(score, (int, float)):
             try:
-                data = _json.loads(m.group(1).strip())
-            except (_json.JSONDecodeError, TypeError):
-                continue
-
-            if not isinstance(data, dict):
-                continue
-
-            # 校验必填字段
-            required = {"action", "score", "direction", "confidence", "timeframe", "signal", "factors", "analysis"}
-            missing = required - set(data.keys())
-            if missing:
+                score = float(score)
+            except (TypeError, ValueError):
                 return False
+        if not (0 <= score <= 100):
+            return False
 
-            # 校验 action 值
-            if data["action"] not in ("buy", "sell", "hold", "skip"):
-                return False
+        # 校验 direction 值
+        if data["direction"] not in ("bullish", "bearish", "neutral"):
+            return False
 
-            # 校验 score 范围
-            if not (0 <= data["score"] <= 100):
-                return False
-
-            # 校验 direction 值
-            if data["direction"] not in ("bullish", "bearish", "neutral"):
-                return False
-
-            return True
-
-    return False  # 没找到 JSON 块
+        return True
+    except Exception:
+        # 任何校验异常 → 视为校验不通过
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -592,8 +620,8 @@ def get_smolagent(
                 tools = tool_registry.build({"deny": list(_EXCLUDED_TOOL_NAMES)})
 
             _tools_cache_by_domain[domain_key] = tools
-        else:
-            tools = list(_tools_cache_by_domain[domain_key])  # copy to avoid mutation
+        # 始终拷贝，避免修改缓存原始列表
+        tools = list(_tools_cache_by_domain[domain_key])
 
     # ── CallSkillTool（替代 managed_agents）──
     from app.agent.skills.call_skill_tool import CallSkillTool
@@ -610,6 +638,7 @@ def get_smolagent(
         domain=domain, domain_instructions=domain_instructions,
         intent_context=intent_context,
     )
+
     AgentClass = _get_agent_class()
 
     # ── Always build fresh agent (avoid cross-session state pollution) ──
@@ -760,6 +789,54 @@ class _AgentExecutor:
             self._agent_ready_event.set()
             return store, None, message, {"skip_agent": True, "skip_agent_reply": skip_agent_reply}
 
+        # ── 金融域：从消息中提取 stock_code（_try_chain 被跳过，需要在此提取）──
+        if domain == "finance" and not (context and context.get("stock_code")):
+            import re as _re_stock
+            # 1. 6位数字代码
+            _m = _re_stock.search(r'\b(\d{6})\b', message)
+            if _m:
+                _stock_code = _m.group(1)
+                if not (context and context.get("stock_code")):
+                    context = context or {}
+                    context["stock_code"] = _stock_code
+                    logger.info("[Prepare] 从消息提取股票代码: %s", _stock_code)
+            else:
+                # 2. 中文名查找
+                _name_match = _re_stock.search(r'[\u4e00-\u9fff]{2,6}', message)
+                if _name_match:
+                    _candidate = _name_match.group(0)
+                    _stopwords = {"分析", "查看", "看看", "查询", "怎么样", "什么", "如何",
+                                  "帮我", "一下", "最近", "今天", "昨天", "修改", "修复",
+                                  "创建", "筛选", "回测", "启动", "停止", "显示", "展示",
+                                  "评估", "判断", "研究", "解读", "情况", "状态",
+                                  "买入", "卖出", "持有", "跳过", "短线", "中线", "长线"}
+                    # 先检查完整匹配是否在停用词中
+                    if _candidate in _stopwords:
+                        _candidate = None
+                    # 如果完整匹配含停用词前缀，去掉前缀再试（如 "分析宇通客车" → "宇通客车"）
+                    if _candidate:
+                        for _sw in sorted(_stopwords, key=len, reverse=True):
+                            if _candidate.startswith(_sw) and len(_candidate) > len(_sw):
+                                _candidate = _candidate[len(_sw):]
+                                break
+                    if _candidate and _candidate not in _stopwords and len(_candidate) >= 2:
+                        try:
+                            from app.utils.basicinfo_db import get_stock_basic_db
+                            _matches = get_stock_basic_db().search_stocks(_candidate, limit=1)
+                            if _matches:
+                                context = context or {}
+                                context["stock_code"] = _matches[0].get("symbol", "")
+                                context["stock_name"] = _matches[0].get("name", "")
+                                logger.info("[Prepare] 中文名 '%s' → 代码 %s", _candidate, context["stock_code"])
+                            else:
+                                context = context or {}
+                                context["stock_name"] = _candidate
+                                logger.info("[Prepare] 中文名 '%s' 未匹配代码，作为 stock_name", _candidate)
+                        except Exception as e:
+                            context = context or {}
+                            context["stock_name"] = _candidate
+                            logger.warning("[Prepare] 股票名查询失败: %s", e)
+
         # ── 提取意图信息，供后置评估使用 ──────────────────────
         _eval_verb = ""
         _eval_noun = ""
@@ -776,6 +853,11 @@ class _AgentExecutor:
             collector.intent_verb = _eval_verb
             collector.intent_noun = _eval_noun
             collector.domain = domain
+            # 同步从消息中提取的 stock_code
+            if context and context.get("stock_code"):
+                collector.stock_code = context["stock_code"]
+            if context and context.get("stock_name"):
+                collector.stock_name = context["stock_name"]
 
         # ── 上下文拼接 ────────────────────────────────────────
         enriched = message
@@ -868,14 +950,17 @@ class _AgentExecutor:
             )
 
         # ── 链路执行：检测是否有匹配的编排链路 ───────────────
+        # 金融领域跳过 _try_chain：agent 自规划 + call_skill 自执行
         _intent_verb = meta.get("intent_verb", "")
         _intent_noun = meta.get("intent_noun", "")
-        chain_result = self._try_chain(
-            _intent_verb, _intent_noun, message, session_id, context, user_id,
-        )
-        if chain_result is not None:
-            store.add_message(session_id, "assistant", chain_result.content)
-            return chain_result
+        _eval_domain = meta.get("domain", "")
+        if _eval_domain != "finance":
+            chain_result = self._try_chain(
+                _intent_verb, _intent_noun, message, session_id, context, user_id,
+            )
+            if chain_result is not None:
+                store.add_message(session_id, "assistant", chain_result.content)
+                return chain_result
 
         # 保存意图信息，供后置评估使用
         _intent_verb = meta.get("intent_verb", "")
@@ -1261,26 +1346,29 @@ class _AgentExecutor:
             return
 
         # ── 链路执行：检测是否有匹配的编排链路 ───────────────
+        # 金融领域跳过 _try_chain：agent 自规划 + call_skill 自执行
         _intent_verb = meta.get("intent_verb", "")
         _intent_noun = meta.get("intent_noun", "")
-        chain_result = self._try_chain(
-            _intent_verb, _intent_noun, message, session_id, context, user_id,
-        )
-        if chain_result is not None:
-            store.add_message(session_id, "assistant", chain_result.content)
-            yield {
-                "type": "generating",
-                "step": 0,
-                "message": chain_result.content,
-            }
-            yield {
-                "type": "done",
-                "success": chain_result.success,
-                "content": chain_result.content,
-                "error": chain_result.error,
-                "total_steps": chain_result.total_steps,
-                "model": chain_result.model,
-                "session_id": session_id,
+        _stream_domain_check = meta.get("domain", "")
+        if _stream_domain_check != "finance":
+            chain_result = self._try_chain(
+                _intent_verb, _intent_noun, message, session_id, context, user_id,
+            )
+            if chain_result is not None:
+                store.add_message(session_id, "assistant", chain_result.content)
+                yield {
+                    "type": "generating",
+                    "step": 0,
+                    "message": chain_result.content,
+                }
+                yield {
+                    "type": "done",
+                    "success": chain_result.success,
+                    "content": chain_result.content,
+                    "error": chain_result.error,
+                    "total_steps": chain_result.total_steps,
+                    "model": chain_result.model,
+                    "session_id": session_id,
             }
             return
 
