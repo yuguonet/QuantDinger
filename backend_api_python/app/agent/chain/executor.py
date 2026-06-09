@@ -153,7 +153,7 @@ class ChainExecutor:
 
     Usage:
         executor = ChainExecutor(chain_id="evaluate+stock", stock_code="600519")
-        result = executor.execute(run_skill_fn=my_run_skill)
+        result = executor.execute(run_skill_fn=my_run_skill, call_llm=my_llm)
     """
 
     def __init__(
@@ -204,6 +204,7 @@ class ChainExecutor:
         self,
         run_skill_fn: Callable[[str, str, str, dict], tuple],
         context: Dict[str, Any] = None,
+        call_llm: Callable[[str], str] = None,
     ) -> DecisionResult:
         """执行链路。
 
@@ -211,6 +212,8 @@ class ChainExecutor:
             run_skill_fn: 调用 Skill 的函数。
                 签名: run_skill_fn(skill_name, stock_code, stock_name, context) -> (SkillReport, EvalNode)
             context: 传递给每个 skill 的上下文。
+            call_llm: LLM 调用函数，Chain 层跨维度推理用。
+                签名: call_llm(prompt: str) -> str
 
         Returns:
             DecisionResult
@@ -248,8 +251,8 @@ class ChainExecutor:
                 logger.warning("[ChainExecutor] 必须步骤 %s 被否决，终止", step.name)
                 break
 
-        # 构建决策
-        result = self._build_decision(root, skill_reports)
+        # 构建决策（用 LLM 跨维度推理）
+        result = self._build_decision(root, skill_reports, call_llm=call_llm)
         result.elapsed_ms = (time.time() - t0) * 1000
         result.success = any(s.status == "ok" for s in skill_reports)
 
@@ -302,157 +305,339 @@ class ChainExecutor:
         self,
         root: EvalNode,
         skill_reports: List[SkillReport],
+        call_llm: Callable[[str], str] = None,
     ) -> DecisionResult:
-        """构建决策。"""
+        """构建决策 — LLM 跨维度推理。
+
+        Chain 层的核心价值：把各 Skill 的报告放在一起，让 LLM 做跨维度综合研判。
+        不是加权求和，而是理解"MACD看多 + RSI超买 + 游资出货 = 什么"。
+
+        流程：
+          1. 检查前置条件（覆盖度、否决项）
+          2. 格式化各 Skill 报告
+          3. LLM 跨维度推理
+          4. 解析 LLM 输出 → DecisionResult
+          5. 回退：LLM 失败时降级为加权计算
+        """
         result = DecisionResult(
             chain_id=self.chain_id,
             stock_code=self.stock_code,
             stock_name=self.stock_name,
         )
 
-        # ── 分项打分 ──
-        valid_items = []  # (score, weight)
-        has_veto = False
+        # ── 前置检查 ──
+        valid_reports = [r for r in skill_reports if r.status == "ok" and r.score is not None]
         total_steps = len(skill_reports)
-        valid_steps = 0
-        missing_steps = 0
-        gaps = []
-
-        for report in skill_reports:
-            if report.status == "ok" and report.score is not None:
-                # 有效数据
-                weight = self._skill_weights.get(report.skill_name, 1.0)
-                valid_items.append((report.score, weight))
-                valid_steps += 1
-
-                # 否决检测
-                if report.score <= VETO_SCORE:
-                    has_veto = True
-            elif report.status == "missing":
-                missing_steps += 1
-                gaps.append(f"{get_skill_cn_name(report.skill_name)}: 数据缺失")
-            elif report.status == "failed":
-                missing_steps += 1
-                gaps.append(f"{get_skill_cn_name(report.skill_name)}: {report.error}")
-
-        # ── 覆盖度 ──
+        valid_steps = len(valid_reports)
+        has_veto = any(r.score <= VETO_SCORE for r in valid_reports)
         coverage_ratio = valid_steps / total_steps if total_steps > 0 else 0
+        gaps = []
+        for r in skill_reports:
+            if r.status == "missing":
+                gaps.append(f"{get_skill_cn_name(r.skill_name)}: 数据缺失")
+            elif r.status == "failed":
+                gaps.append(f"{get_skill_cn_name(r.skill_name)}: {r.error}")
 
-        # ── 样本量 ──
-        eval_stats = store.get_eval_stats(self.chain_id)
-        evaluated_count = eval_stats.get("evaluated_decisions", 0)
-
-        # ── 加权评分 ──
-        if valid_items:
-            total_weight = sum(w for _, w in valid_items)
-            if total_weight > 0:
-                weighted_score = sum(s * w for s, w in valid_items) / total_weight
-                confidence_mult = _sample_confidence(evaluated_count)
-                adjusted_score = 50 + (weighted_score - 50) * confidence_mult
-                result.score = round(adjusted_score, 1)
-            else:
-                result.score = 50.0
-        else:
-            result.score = 50.0
-
-        # ── 置信等级 ──
-        if has_veto:
-            result.confidence = "reject"
-        elif coverage_ratio < 0.4:
-            result.confidence = "low"
-        else:
-            valid_dirs = [r.direction for r in skill_reports
-                          if r.status == "ok" and r.direction != "neutral"]
-            if valid_dirs:
-                bull = sum(1 for d in valid_dirs if d == "bullish")
-                bear = sum(1 for d in valid_dirs if d == "bearish")
-                consistency = max(bull, bear) / len(valid_dirs)
-            else:
-                consistency = 0
-
-            if coverage_ratio >= 0.7 and consistency >= 0.7:
-                result.confidence = "high"
-            elif coverage_ratio >= 0.5 and consistency >= 0.5:
-                result.confidence = "medium"
-            else:
-                result.confidence = "low"
-
-        # ── 方向判断 ──
-        direction = self._determine_direction(skill_reports, result.score)
-
-        # ── 决策 ──
+        # 否决 → 直接 skip
         if has_veto:
             result.action = "skip"
+            result.direction = "neutral"
+            result.score = 0.0
+            result.confidence = "reject"
             result.reason = "存在否决项，不执行"
-        elif coverage_ratio < COVERAGE_THRESHOLD:
-            result.action = "hold"
-            result.reason = f"覆盖度不足（{valid_steps}/{total_steps}），数据不充分"
-        elif evaluated_count == 0:
-            result.action = "hold"
-            result.reason = "无评估历史数据，系统尚未运行过评估闭环"
-        elif direction == "conflict":
-            result.action = "hold"
-            result.reason = "多空信号冲突，建议观望"
-        elif direction == "bullish":
-            result.action = "buy"
-            result.reason = f"综合评分 {result.score:.1f}，方向看多"
-        elif direction == "bearish":
-            result.action = "sell"
-            result.reason = f"综合评分 {result.score:.1f}，方向看空"
-        else:
-            result.action = "hold"
-            result.reason = f"综合评分 {result.score:.1f}，方向中性"
+            root.score = 0.0
+            root.direction = "neutral"
+            root.action = "skip"
+            root.confidence = 0.0
+            result.human_note = f"否决项: {', '.join(gaps[:3])}" if gaps else ""
+            return result
 
-        result.direction = direction if direction != "conflict" else "neutral"
+        # 覆盖度不足 → hold
+        if coverage_ratio < COVERAGE_THRESHOLD:
+            result.action = "hold"
+            result.direction = "neutral"
+            result.score = 50.0
+            result.confidence = "low"
+            result.reason = f"覆盖度不足（{valid_steps}/{total_steps}），数据不充分"
+            root.score = 50.0
+            root.direction = "neutral"
+            root.action = "hold"
+            root.confidence = 0.2
+            result.human_note = f"缺失: {', '.join(gaps[:3])}" if gaps else ""
+            return result
+
+        # ── 加权计算（作为 LLM 推理的参考基线）──
+        weighted_result = self._weighted_fallback(valid_reports)
+
+        # ── LLM 跨维度推理 ──
+        llm_decision = None
+        if call_llm:
+            try:
+                llm_decision = self._llm_synthesize(
+                    valid_reports, call_llm, weighted_baseline=weighted_result,
+                )
+            except Exception as e:
+                logger.warning("[ChainExecutor] LLM 推理失败，使用加权结果: %s", e)
+
+        # ── 回退：LLM 不可用时用加权结果 ──
+        if llm_decision is None:
+            llm_decision = weighted_result
+
+        # ── 填充结果 ──
+        result.action = llm_decision.get("action", "hold")
+        result.score = max(0, min(100, float(llm_decision.get("score", 50))))
+        result.direction = llm_decision.get("direction", "neutral")
+        result.reason = llm_decision.get("reasoning", "")
         result.recommendation = {
             "buy": "建议买入", "sell": "建议卖出",
             "hold": "建议观望", "skip": "建议跳过",
         }.get(result.action, "建议观望")
 
+        # 置信等级
+        confidence_val = llm_decision.get("confidence", 0.5)
+        if isinstance(confidence_val, str):
+            result.confidence = confidence_val
+        else:
+            if confidence_val >= 0.7:
+                result.confidence = "high"
+            elif confidence_val >= 0.4:
+                result.confidence = "medium"
+            else:
+                result.confidence = "low"
+
         # 填充根节点
         root.score = result.score
         root.direction = result.direction
         root.action = result.action
-        root.confidence = 0.8 if result.confidence == "high" else (0.5 if result.confidence == "medium" else 0.2)
+        root.confidence = confidence_val if isinstance(confidence_val, float) else 0.5
+        root.analysis = result.reason
 
-        # ── 人工复核提示 ──
+        # 人工复核提示
         notes = []
         if gaps:
             notes.append(f"缺失数据: {', '.join(gaps[:3])}")
         if coverage_ratio < 0.6:
             notes.append(f"覆盖度仅 {valid_steps}/{total_steps}，结论可靠性较低")
-        if direction == "conflict":
-            notes.append("多空信号冲突，建议结合盘面判断")
         result.human_note = "；".join(notes) if notes else ""
 
         return result
 
-    def _determine_direction(
+    def _llm_synthesize(
         self,
         skill_reports: List[SkillReport],
-        score: float,
-    ) -> str:
-        """判断综合方向。"""
-        valid = [r for r in skill_reports if r.status == "ok" and r.direction != "neutral"]
+        call_llm: Callable[[str], str],
+        weighted_baseline: Dict[str, Any] = None,
+    ) -> Dict[str, Any]:
+        """LLM 跨维度综合研判。
 
-        if not valid:
-            if score >= 65:
-                return "bullish"
-            elif score <= 35:
-                return "bearish"
-            return "neutral"
+        把各 Skill 的结构化报告格式化后交给 LLM，让 LLM 做跨维度推理。
+        加权基线分数作为参考点提供给 LLM，LLM 可以同意或修正。
 
-        bull = sum(1 for r in valid if r.direction == "bullish")
-        bear = sum(1 for r in valid if r.direction == "bearish")
+        Args:
+            skill_reports: 各 Skill 的标准化报告
+            call_llm: LLM 调用函数
+            weighted_baseline: 加权计算的基线结果（action/score/direction）
+        """
+        # 格式化各 skill 报告
+        reports_text = self._format_reports_for_llm(skill_reports)
 
-        total = bull + bear
-        if total > 0:
-            bull_ratio = bull / total
-            if 0.4 <= bull_ratio <= 0.6:
-                return "conflict"
+        # 加权基线参考
+        baseline_section = ""
+        if weighted_baseline:
+            baseline_section = (
+                f"\n## 量化基线（加权计算，仅供参考）\n"
+                f"- 加权评分: {weighted_baseline.get('score', 50):.1f}\n"
+                f"- 加权方向: {weighted_baseline.get('direction', 'neutral')}\n"
+                f"- 加权建议: {weighted_baseline.get('action', 'hold')}\n"
+                f"- 各维度: {weighted_baseline.get('reasoning', '')}\n\n"
+                "你可以同意基线判断，也可以基于跨维度关联修正它。"
+                "如果修正，必须在 reasoning 中解释为什么基线不够准确。\n"
+            )
+
+        prompt = (
+            "你是 A 股量化决策分析师。基于以下各维度分析报告，做跨维度综合研判。\n\n"
+            "## 核心原则\n"
+            "- 价格折扣一切：技术面是地基，其他维度用来验证和解释\n"
+            "- 数据陷阱：龙虎榜(盘后+游资一日游)、资金流向(滞后)、新闻(你看到时市场已反应)\n"
+            "- 多维度矛盾时，优先相信量价关系\n"
+            "- A股只能做多，空头信号意味着回避而非做空\n\n"
+            f"## 分析目标\n股票: {self.stock_name or self.stock_code}（{self.stock_code}）\n\n"
+            f"## 各维度分析报告\n{reports_text}\n"
+            f"{baseline_section}\n"
+            "## 输出格式（只输出 JSON，不要其他文字）\n"
+            "```json\n"
+            "{\n"
+            '  "action": "buy/sell/hold/skip",\n'
+            '  "score": 0-100,\n'
+            '  "direction": "bullish/bearish/neutral",\n'
+            '  "confidence": 0.0-1.0,\n'
+            '  "reasoning": "你的跨维度推理过程（50-200字）",\n'
+            '  "key_factors": ["最关键的1-3个因素"],\n'
+            '  "baseline_override": false\n'
+            "}\n"
+            "```\n\n"
+            "规则：\n"
+            "- action: buy=建议买入, sell=建议卖出, hold=建议观望, skip=建议跳过\n"
+            "- score: 0=极度看空, 50=中性, 100=极度看多\n"
+            "- direction: score>=60=bullish, score<=40=bearish, 其余=neutral\n"
+            "- confidence: 你对这个判断的确信程度（0-1），不是数据充分度\n"
+            "- reasoning: 必须解释为什么各维度综合后得出这个结论\n"
+            "- baseline_override: 是否修正了基线判断（true=修正，false=同意基线）\n"
+        )
+
+        raw = call_llm(prompt)
+        return self._parse_llm_decision(raw)
+
+    def _format_reports_for_llm(self, skill_reports: List[SkillReport]) -> str:
+        """将各 Skill 报告格式化为 LLM 可读的文本。"""
+        parts = []
+        for r in skill_reports:
+            cn_name = get_skill_cn_name(r.skill_name)
+            direction_cn = {"bullish": "看多", "bearish": "看空", "neutral": "中性"}.get(r.direction, "中性")
+
+            part = f"### {cn_name}（{r.skill_name}）\n"
+            part += f"- 方向: {direction_cn} | 评分: {r.score:.0f} | 置信: {r.confidence:.2f}\n"
+
+            if r.signal:
+                part += f"- 信号: {r.signal}\n"
+
+            if r.factors:
+                factor_lines = []
+                for f in r.factors:
+                    s = f"{f.score:.0f}" if f.score is not None else "—"
+                    factor_lines.append(f"  - {f.name}: {f.value} ({s}分)")
+                part += "- 因子:\n" + "\n".join(factor_lines) + "\n"
+
+            if r.analysis:
+                # 截断过长的分析文字
+                analysis = r.analysis[:500]
+                if len(r.analysis) > 500:
+                    analysis += "..."
+                part += f"- 分析: {analysis}\n"
+
+            parts.append(part)
+
+        return "\n".join(parts)
+
+    def _parse_llm_decision(self, raw: str) -> Dict[str, Any]:
+        """解析 LLM 输出的决策 JSON。"""
+        import json as _json
+        import re as _re
+
+        # 尝试提取 JSON 块
+        patterns = [
+            r'```json\s*\n?(.*?)\n?\s*```',
+            r'```\s*\n?(.*?)\n?\s*```',
+            r'(\{[^{}]*"action"[^{}]*"score"[^{}]*\})',
+            r'(\{[^{}]*"score"[^{}]*"action"[^{}]*\})',
+        ]
+
+        for pattern in patterns:
+            match = _re.search(pattern, raw, _re.DOTALL | _re.IGNORECASE)
+            if match:
+                try:
+                    data = _json.loads(match.group(1).strip())
+                    if isinstance(data, dict) and "action" in data:
+                        # 校验 action
+                        if data["action"] not in ("buy", "sell", "hold", "skip"):
+                            data["action"] = "hold"
+                        # 校验 score
+                        data["score"] = max(0, min(100, float(data.get("score", 50))))
+                        # 校验 direction
+                        if data.get("direction") not in ("bullish", "bearish", "neutral"):
+                            data["direction"] = "neutral"
+                        return data
+                except (_json.JSONDecodeError, TypeError, ValueError):
+                    continue
+
+        # JSON 解析失败 → 关键词匹配
+        logger.warning("[ChainExecutor] LLM 输出解析失败，尝试关键词匹配")
+        return self._keyword_fallback(raw)
+
+    def _keyword_fallback(self, raw: str) -> Dict[str, Any]:
+        """关键词匹配兜底。"""
+        raw_lower = raw.lower()
+
+        # action
+        action = "hold"
+        if any(kw in raw_lower for kw in ["买入", "buy", "建议买"]):
+            action = "buy"
+        elif any(kw in raw_lower for kw in ["卖出", "sell", "建议卖"]):
+            action = "sell"
+        elif any(kw in raw_lower for kw in ["跳过", "skip", "回避"]):
+            action = "skip"
+
+        # direction
+        direction = "neutral"
+        if any(kw in raw_lower for kw in ["看多", "bullish", "偏多"]):
+            direction = "bullish"
+        elif any(kw in raw_lower for kw in ["看空", "bearish", "偏空"]):
+            direction = "bearish"
+
+        # score（从 direction 推断）
+        if direction == "bullish":
+            score = 65.0
+        elif direction == "bearish":
+            score = 35.0
+        else:
+            score = 50.0
+
+        return {
+            "action": action,
+            "score": score,
+            "direction": direction,
+            "confidence": 0.3,
+            "reasoning": raw[:300],
+            "key_factors": [],
+        }
+
+    def _weighted_fallback(self, skill_reports: List[SkillReport]) -> Dict[str, Any]:
+        """加权计算回退（LLM 不可用时）。"""
+        total_weight = 0.0
+        weighted_score = 0.0
+
+        for r in skill_reports:
+            weight = self._skill_weights.get(r.skill_name, 1.0)
+            weighted_score += r.score * weight
+            total_weight += weight
+
+        if total_weight > 0:
+            score = round(weighted_score / total_weight, 1)
+        else:
+            score = 50.0
+
+        # 方向
+        valid_dirs = [r.direction for r in skill_reports if r.direction != "neutral"]
+        bull = sum(1 for d in valid_dirs if d == "bullish")
+        bear = sum(1 for d in valid_dirs if d == "bearish")
 
         if bull > bear:
-            return "bullish"
+            direction = "bullish"
         elif bear > bull:
-            return "bearish"
-        return "neutral"
+            direction = "bearish"
+        else:
+            direction = "neutral"
+
+        # action
+        if score >= 60:
+            action = "buy"
+        elif score <= 40:
+            action = "sell"
+        else:
+            action = "hold"
+
+        # 构造推理摘要
+        parts = []
+        for r in skill_reports:
+            cn = get_skill_cn_name(r.skill_name)
+            parts.append(f"{cn}:{r.direction}/{r.score:.0f}")
+        reasoning = f"加权评分 {score:.1f}。各维度: {', '.join(parts)}"
+
+        return {
+            "action": action,
+            "score": score,
+            "direction": direction,
+            "confidence": 0.4,
+            "reasoning": reasoning,
+            "key_factors": [],
+        }

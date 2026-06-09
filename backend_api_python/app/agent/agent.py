@@ -1170,17 +1170,17 @@ class _AgentExecutor:
         _all_tools = build_all_tools()
         _tool_map = {t.name: t for t in _all_tools}
 
+        # call_llm：Skill 层和 Chain 层共用的 LLM 调用函数
+        def call_llm(prompt: str) -> str:
+            messages = [{"role": "user", "content": prompt}]
+            response = smol_model(messages)
+            return response.content if hasattr(response, "content") else str(response)
+
         # run_skill_fn：调用指定的 BaseSkill
         def run_skill_fn(skill_name: str, scode: str, sname: str, ctx: dict) -> tuple:
             sk = skill_registry.get(skill_name)
             if not sk:
                 raise ValueError(f"Unknown skill: {skill_name}")
-
-            def call_llm(prompt: str) -> str:
-                # smolagents OpenAIModel 接口: model(messages) → ChatMessage
-                messages = [{"role": "user", "content": prompt}]
-                response = smol_model(messages)
-                return response.content if hasattr(response, "content") else str(response)
 
             def call_tool_fn(tool_name: str, **kwargs):
                 t = _tool_map.get(tool_name)
@@ -1207,6 +1207,7 @@ class _AgentExecutor:
         chain_result = executor.execute(
             run_skill_fn=run_skill_fn,
             context={"user_query": message},
+            call_llm=call_llm,
         )
 
         # 转换为 AgentResult — 用 DecisionResult 的 content 属性
