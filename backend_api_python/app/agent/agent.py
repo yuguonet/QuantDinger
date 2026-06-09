@@ -195,10 +195,56 @@ def _build_instructions(user_message: str = "", skill_instructions: str = "",
     calibration_section = ""
     # calibration_context 通过外部注入到 user_message 前部
 
-    # 金融领域 JSON 标准化输出规范
+    # 金融领域 JSON 标准化输出规范（按 AGENT_TYPE 区分格式）
     finance_json_section = ""
     if domain == "finance":
-        finance_json_section = """
+        _agent_cls = _get_agent_class()
+        _json_fields = (
+            '"action": "buy/sell/hold/skip",\n'
+            '    "score": 0-100,\n'
+            '    "direction": "bullish/bearish/neutral",\n'
+            '    "confidence": "high/medium/low",\n'
+            '    "timeframe": "T+1/T+3/T+5/1W/1M/3M/1Y",\n'
+            '    "timeframe_reason": "为什么选这个时间维度",\n'
+            '    "stock_code": "6位代码",\n'
+            '    "stock_name": "股票名称",\n'
+            '    "signal": "一句话信号摘要",\n'
+            '    "factors": [\n'
+            '        {"name": "维度名", "score": 0-100, "direction": "bullish/bearish/neutral"}\n'
+            '    ],\n'
+            '    "analysis": "你的完整分析文字"'
+        )
+        _timeframe_rules = """**timeframe 规则**：
+- 用户给了时间（"明天"/"这周"）→ 按用户的来
+- 用户没给时间 → **默认 T+3**（3个交易日短线），除非用户明确问中长期
+- 禁止使用 1Y/1Y+ 等超长周期作为默认值，那等于没分析
+- direction 和 score 只在你声明的时间维度内有效
+- 不同时间维度方向可能相反，必须明确"""
+
+        if _agent_cls is ToolCallingAgent:
+            # ToolCallingAgent：输出 JSON tool call 格式
+            finance_json_section = f"""
+## ⚠️ 输出格式（必须遵守）
+
+你必须调用 final_answer 工具来返回结果。工具调用的 JSON 格式如下：
+
+```json
+{{
+    "name": "final_answer",
+    "arguments": {{
+{_json_fields}
+    }}
+}}
+```
+
+{_timeframe_rules}
+
+不要输出任何其他文字，只输出上述 JSON 工具调用。格式不对会被系统拒绝并要求重写。
+
+"""
+        else:
+            # CodeAgent：输出 Python 代码调用 final_answer()
+            finance_json_section = f"""
 ## ⚠️ 输出格式（必须遵守）
 
 你的最终答案必须通过 Python 代码调用 `final_answer()` 函数来返回一个包含以下字段的字典。
@@ -206,29 +252,12 @@ def _build_instructions(user_message: str = "", skill_instructions: str = "",
 在代码块的最后一行加上：
 
 ```py
-final_answer({
-    "action": "buy/sell/hold/skip",
-    "score": 0-100,
-    "direction": "bullish/bearish/neutral",
-    "confidence": "high/medium/low",
-    "timeframe": "T+1/T+3/T+5/1W/1M/3M/1Y",
-    "timeframe_reason": "为什么选这个时间维度",
-    "stock_code": "6位代码",
-    "stock_name": "股票名称",
-    "signal": "一句话信号摘要",
-    "factors": [
-        {"name": "维度名", "score": 0-100, "direction": "bullish/bearish/neutral"}
-    ],
-    "analysis": "你的完整分析文字"
-})
+final_answer({{
+{_json_fields}
+}})
 ```
 
-**timeframe 规则**：
-- 用户给了时间（"明天"/"这周"）→ 按用户的来
-- 用户没给时间 → **默认 T+3**（3个交易日短线），除非用户明确问中长期
-- 禁止使用 1Y/1Y+ 等超长周期作为默认值，那等于没分析
-- direction 和 score 只在你声明的时间维度内有效
-- 不同时间维度方向可能相反，必须明确
+{_timeframe_rules}
 
 不要输出任何 ````json` 代码块。必须用 Python 的 `final_answer()` 返回。格式不对会被系统拒绝并要求重写。
 
@@ -974,7 +1003,12 @@ class _AgentExecutor:
             result = agent.run(enriched, max_steps=self.max_steps)
 
             if hasattr(result, "output"):
-                content = str(result.output) if result.output else ""
+                # ToolCallingAgent 返回 dict，直接保留（后续 JSON 提取需要）
+                _raw_output = result.output
+                if isinstance(_raw_output, dict):
+                    content = _raw_output  # 保留 dict，不转 str
+                else:
+                    content = str(_raw_output) if _raw_output else ""
                 total_steps = len(result.steps) if result.steps else 0
                 tu = result.token_usage
                 total_tokens = (tu.input_tokens + tu.output_tokens) if tu else 0
@@ -1009,31 +1043,36 @@ class _AgentExecutor:
                     content = _re_fallback.sub(r'__CHART_B64__[A-Za-z0-9+/=]+__END_CHART__', '', content).strip()
                 success = bool(content)
 
-            store.add_message(session_id, "assistant", content)
+            store.add_message(session_id, "assistant", content if isinstance(content, str) else str(content))
 
             # ── 金融领域：JSON → TraceCollector 存库 → format_decision_card ──
             if success and content and collector and _eval_domain == "finance":
                 try:
                     import json as _json_card
                     import re as _re_card
-                    # 提取 JSON 块
+                    # 提取 JSON 块：content 可能已是 dict（ToolCallingAgent）或 str（CodeAgent）
                     _card_data = None
-                    for _pat in [r'```json\s*\n?(.*?)\n?\s*```',
-                                 r'(\{[^{}]*"action"[^{}]*"score"[^{}]*\})']:
-                        _m = _re_card.search(_pat, content, _re_card.DOTALL)
-                        if _m:
-                            try:
-                                _card_data = _json_card.loads(_m.group(1).strip())
-                                if isinstance(_card_data, dict) and "action" in _card_data:
-                                    break
-                            except (_json_card.JSONDecodeError, TypeError):
-                                _card_data = None
+                    if isinstance(content, dict) and "action" in content:
+                        _card_data = content
+                    elif isinstance(content, str):
+                        for _pat in [r'```json\s*\n?(.*?)\n?\s*```',
+                                     r'(\{[^{}]*"action"[^{}]*"score"[^{}]*\})']:
+                            _m = _re_card.search(_pat, content, _re_card.DOTALL)
+                            if _m:
+                                try:
+                                    _card_data = _json_card.loads(_m.group(1).strip())
+                                    if isinstance(_card_data, dict) and "action" in _card_data:
+                                        break
+                                except (_json_card.JSONDecodeError, TypeError):
+                                    _card_data = None
 
                     # 先用原始 JSON 内容调用 on_agent_finish（提取字段 + 存库）
+                    # TraceCollector 需要字符串输入，dict 转 JSON 字符串
+                    _tc_answer = _json_card.dumps(content, ensure_ascii=False) if isinstance(content, dict) else content
                     tu = result.token_usage if hasattr(result, 'token_usage') else None
                     total_tok = (tu.input_tokens + tu.output_tokens) if tu else 0
                     root = collector.on_agent_finish(
-                        final_answer=content,
+                        final_answer=_tc_answer,
                         total_steps=total_steps,
                         total_tokens=total_tok,
                         model=str(getattr(agent.model, "model_id", "")),
@@ -1403,8 +1442,13 @@ class _AgentExecutor:
                                     break
 
                 if isinstance(step, FinalAnswerStep):
-                    content = str(step.output) if step.output else ""
-                    store.add_message(session_id, "assistant", content)
+                    # ToolCallingAgent 返回 dict，直接保留
+                    _raw_stream_output = step.output
+                    if isinstance(_raw_stream_output, dict):
+                        content = _raw_stream_output
+                    else:
+                        content = str(_raw_stream_output) if _raw_stream_output else ""
+                    store.add_message(session_id, "assistant", content if isinstance(content, str) else str(content))
 
                     # ── 金融领域：JSON → TraceCollector 存库 → format_decision_card ──
                     _stream_domain = meta.get("domain", "")
@@ -1413,19 +1457,25 @@ class _AgentExecutor:
                         try:
                             import json as _json_sc
                             import re as _re_sc
+                            # 提取 JSON 块：content 可能已是 dict（ToolCallingAgent）或 str（CodeAgent）
                             _sc_data = None
-                            for _pat in [r'```json\s*\n?(.*?)\n?\s*```',
-                                         r'(\{[^{}]*"action"[^{}]*"score"[^{}]*\})']:
-                                _m = _re_sc.search(_pat, content, _re_sc.DOTALL)
-                                if _m:
-                                    try:
-                                        _sc_data = _json_sc.loads(_m.group(1).strip())
-                                        if isinstance(_sc_data, dict) and "action" in _sc_data:
-                                            break
-                                    except (_json_sc.JSONDecodeError, TypeError):
-                                        _sc_data = None
+                            if isinstance(content, dict) and "action" in content:
+                                _sc_data = content
+                            elif isinstance(content, str):
+                                for _pat in [r'```json\s*\n?(.*?)\n?\s*```',
+                                             r'(\{[^{}]*"action"[^{}]*"score"[^{}]*\})']:
+                                    _m = _re_sc.search(_pat, content, _re_sc.DOTALL)
+                                    if _m:
+                                        try:
+                                            _sc_data = _json_sc.loads(_m.group(1).strip())
+                                            if isinstance(_sc_data, dict) and "action" in _sc_data:
+                                                break
+                                        except (_json_sc.JSONDecodeError, TypeError):
+                                            _sc_data = None
 
                             # 先用原始 JSON 内容调用 on_agent_finish（提取字段 + 存库）
+                            # TraceCollector 需要字符串输入，dict 转 JSON 字符串
+                            _tc_stream_answer = _json_sc.dumps(content, ensure_ascii=False) if isinstance(content, dict) else content
                             _tu = None
                             try:
                                 _tu = agent.token_usage
@@ -1433,7 +1483,7 @@ class _AgentExecutor:
                                 pass
                             _total_tok = (_tu.input_tokens + _tu.output_tokens) if _tu else 0
                             _root = _stream_collector.on_agent_finish(
-                                final_answer=content,
+                                final_answer=_tc_stream_answer,
                                 total_steps=agent.step_number,
                                 total_tokens=_total_tok,
                                 model=str(getattr(agent.model, "model_id", "")),
