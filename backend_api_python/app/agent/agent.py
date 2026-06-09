@@ -849,15 +849,14 @@ class _AgentExecutor:
                     content = _re_fallback.sub(r'__CHART_B64__[A-Za-z0-9+/=]+__END_CHART__', '', content).strip()
                 success = bool(content)
 
+            store.add_message(session_id, "assistant", content)
+
             # ── 金融领域标准化输出 ───────────────────────────
             # 无论链路是否触发，只要 domain=finance，强制输出 DecisionCard 格式
-            # ⚠️ 必须在 store.add_message 之前，否则前端收到的是原始散文
-            _standardized = False
-            logger.info("[标准化诊断] domain=%s success=%s content_len=%s",
-                        _eval_domain, success, len(content) if content else 0)
             if success and content and _eval_domain == "finance":
                 try:
                     from app.agent.chain.contract import parse_skill_output
+                    from app.agent.chain.schema import EvalNode, Layer, get_skill_cn_name
                     import re as _re_std
 
                     # 提取股票代码/名称
@@ -877,14 +876,6 @@ class _AgentExecutor:
                                    "一下", "最近", "今天", "昨天", "评估", "判断",
                                    "研究", "解读", "走势", "趋势", "行情"}
                             _c = _nm.group(0)
-                            # 剥离动词前缀："分析金帝股份" → "金帝股份"
-                            _verb_prefixes = ["分析", "查看", "看看", "查询", "评估",
-                                              "判断", "研究", "解读", "帮我看看",
-                                              "帮我分析", "帮我查"]
-                            for _vp in _verb_prefixes:
-                                if _c.startswith(_vp) and len(_c) > len(_vp):
-                                    _c = _c[len(_vp):]
-                                    break
                             if _c not in _sw:
                                 try:
                                     from app.utils.basicinfo_db import get_stock_basic_db
@@ -892,14 +883,15 @@ class _AgentExecutor:
                                     if _mx:
                                         _std_code = _mx[0].get("symbol", "")
                                         _std_name = _mx[0].get("name", "")
-                                        logger.info("[标准化] 中文名 '%s' → %s", _c, _std_code)
                                 except Exception:
                                     pass
 
                     if _std_code:
+                        # 解析 LLM 输出为 SkillReport
                         _report = parse_skill_output(content, skill_name="freeform_agent")
                         _score = max(0, min(100, _report.score))
 
+                        # 分数 → 决策
                         if _score >= 60:
                             _action = "buy"
                         elif _score <= 40:
@@ -909,11 +901,13 @@ class _AgentExecutor:
 
                         _action_cn = {"buy": "买入", "sell": "卖出", "hold": "观望", "skip": "跳过"}
 
+                        # 构建标准化输出
                         _std_lines = [
                             f"**{_action_cn.get(_action, '观望')}** {_std_name or '未知'}({_std_code})",
                             f"评分:{_score:.0f} 方向:{_report.direction} 置信:{'high' if _report.confidence >= 0.7 else ('medium' if _report.confidence >= 0.4 else 'low')}",
                         ]
 
+                        # 因子明细
                         if _report.factors:
                             _parts = []
                             for _f in _report.factors:
@@ -922,22 +916,19 @@ class _AgentExecutor:
                             if _parts:
                                 _std_lines.append(" | ".join(_parts))
 
+                        # 信号摘要
                         if _report.signal:
                             _std_lines.append(f"信号: {_report.signal}")
 
+                        # 原始分析折叠
                         _std_lines.append(f"\n<details><summary>详细分析</summary>\n\n{content}\n</details>")
 
                         content = "\n".join(_std_lines)
-                        _standardized = True
+                        store.add_message(session_id, "assistant", content)
                         logger.info("[Agent] 金融领域标准化输出: %s score=%.1f action=%s",
                                     _std_code, _score, _action)
                 except Exception as e:
-                    logger.warning("[Agent] 标准化输出失败，保留原始输出: %s", e, exc_info=True)
-            elif success and content and _eval_domain != "finance":
-                logger.info("[标准化诊断] domain=%s 非金融，跳过标准化", _eval_domain)
-
-            # 写入会话（标准化后的内容或原始内容）
-            store.add_message(session_id, "assistant", content)
+                    logger.warning("[Agent] 标准化输出失败，保留原始输出: %s", e)
 
             # ── 自由推理路径写库（财经领域 + 有股票代码时）──────
             if success and content and _eval_domain == "finance":
@@ -1045,12 +1036,6 @@ class _AgentExecutor:
                 _stopwords = {"分析", "查看", "看看", "查询", "怎么样", "帮我", "一下",
                               "最近", "今天", "昨天", "评估", "判断", "研究", "解读"}
                 candidate = name_match.group(0)
-                # 剥离动词前缀
-                for _vp in ["分析", "查看", "看看", "查询", "评估", "判断", "研究", "解读",
-                            "帮我看看", "帮我分析", "帮我查"]:
-                    if candidate.startswith(_vp) and len(candidate) > len(_vp):
-                        candidate = candidate[len(_vp):]
-                        break
                 if candidate not in _stopwords:
                     try:
                         from app.utils.basicinfo_db import get_stock_basic_db
@@ -1142,12 +1127,6 @@ class _AgentExecutor:
             name_match = re.search(r'[\u4e00-\u9fff]{2,6}', message)
             if name_match:
                 candidate = name_match.group(0)
-                # 剥离动词前缀："分析金帝股份" → "金帝股份"
-                for _vp in ["分析", "查看", "看看", "查询", "评估", "判断", "研究", "解读",
-                            "帮我看看", "帮我分析", "帮我查"]:
-                    if candidate.startswith(_vp) and len(candidate) > len(_vp):
-                        candidate = candidate[len(_vp):]
-                        break
                 # 排除动词/虚词，避免"分析一下"误匹配
                 _stopwords = {"分析", "查看", "看看", "查询", "怎么样", "什么", "如何",
                               "帮我", "一下", "最近", "今天", "昨天", "修改", "修复",
@@ -1342,12 +1321,10 @@ class _AgentExecutor:
 
                 if isinstance(step, FinalAnswerStep):
                     content = str(step.output) if step.output else ""
-                    _stream_domain = meta.get("domain", "")
-                    logger.info("[流式标准化诊断] domain=%s content_len=%s",
-                                _stream_domain, len(content) if content else 0)
+                    store.add_message(session_id, "assistant", content)
 
                     # ── 金融领域标准化输出（流式路径）──────────────
-                    # ⚠️ 必须在 store.add_message 之前，否则前端收到原始散文
+                    _stream_domain = meta.get("domain", "")
                     if content and _stream_domain == "finance":
                         try:
                             from app.agent.chain.contract import parse_skill_output
@@ -1369,14 +1346,6 @@ class _AgentExecutor:
                                            "一下", "最近", "今天", "昨天", "评估", "判断",
                                            "研究", "解读", "走势", "趋势", "行情"}
                                     _c = _nm.group(0)
-                                    # 剥离动词前缀："分析金帝股份" → "金帝股份"
-                                    _verb_prefixes = ["分析", "查看", "看看", "查询", "评估",
-                                                      "判断", "研究", "解读", "帮我看看",
-                                                      "帮我分析", "帮我查"]
-                                    for _vp in _verb_prefixes:
-                                        if _c.startswith(_vp) and len(_c) > len(_vp):
-                                            _c = _c[len(_vp):]
-                                            break
                                     if _c not in _sw:
                                         try:
                                             from app.utils.basicinfo_db import get_stock_basic_db
@@ -1384,7 +1353,6 @@ class _AgentExecutor:
                                             if _mx:
                                                 _std_code = _mx[0].get("symbol", "")
                                                 _std_name = _mx[0].get("name", "")
-                                                logger.info("[流式标准化] 中文名 '%s' → %s", _c, _std_code)
                                         except Exception:
                                             pass
 
@@ -1413,13 +1381,11 @@ class _AgentExecutor:
                                     _std_lines.append(f"信号: {_report.signal}")
                                 _std_lines.append(f"\n<details><summary>详细分析</summary>\n\n{content}\n</details>")
                                 content = "\n".join(_std_lines)
+                                store.add_message(session_id, "assistant", content)
                                 logger.info("[Agent] 流式金融标准化: %s score=%.1f action=%s",
                                             _std_code, _score, _action)
                         except Exception as e:
                             logger.warning("[Agent] 流式标准化失败，保留原始输出: %s", e)
-
-                    # 写入会话（标准化后的内容或原始内容）
-                    store.add_message(session_id, "assistant", content)
 
                     # ── 自由推理路径写库（财经领域 + 有股票代码时）──
                     if content and _stream_domain == "finance":

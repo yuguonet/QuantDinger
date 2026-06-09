@@ -505,12 +505,6 @@ def _extract_stock_name(message: str) -> Optional[str]:
     match = re.search(r'[\u4e00-\u9fff]{2,6}', message)
     if match:
         candidate = match.group(0)
-        # 剥离动词前缀
-        for _vp in ["分析", "查看", "看看", "查询", "评估", "判断", "研究", "解读",
-                    "帮我看看", "帮我分析", "帮我查"]:
-            if candidate.startswith(_vp) and len(candidate) > len(_vp):
-                candidate = candidate[len(_vp):]
-                break
         if candidate not in stopwords:
             try:
                 from app.utils.basicinfo_db import get_stock_basic_db
@@ -581,12 +575,6 @@ class VerbNounRouter:
             _cn_match = re.search(r'[\u4e00-\u9fff]{2,8}', message)
             if _cn_match:
                 _candidate = _cn_match.group(0)
-                # 剥离动词前缀："分析金帝股份" → "金帝股份"
-                for _vp in ["分析", "查看", "看看", "查询", "评估", "判断", "研究", "解读",
-                            "帮我看看", "帮我分析", "帮我查"]:
-                    if _candidate.startswith(_vp) and len(_candidate) > len(_vp):
-                        _candidate = _candidate[len(_vp):]
-                        break
                 if _candidate not in _stock_stopwords:
                     try:
                         from app.utils.basicinfo_db import get_stock_basic_db
