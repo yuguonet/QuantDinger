@@ -3,11 +3,18 @@
 TracedTool — 包装原始工具，自动记录调用信息到 TraceCollector。
 
 对 agent 透明：工具行为完全不变，只是每次调用自动触发 collector.on_tool_call()。
+
+注意：不能直接继承 smolagents.Tool（其 __init__ 会校验 forward 签名必须和 inputs 一致，
+TracedTool 的 forward 用 **kwargs 无法通过校验）。改用 BaseTool.register() 让
+isinstance(tool, BaseTool) 检查通过。
 """
 from __future__ import annotations
 
 import time
 from typing import Any
+
+from smolagents import Tool
+from smolagents.tools import BaseTool
 
 from app.agent.trace_collector import TraceCollector
 
@@ -44,13 +51,9 @@ class TracedTool:
             )
         return result
 
-    # 兼容 smolagents 的 __call__ 接口
-    def __call__(self, *args, **kwargs) -> Any:
-        # 如果是位置参数调用，转成关键字参数
-        if args and not kwargs:
-            # smolagents 有时用位置参数调用
-            return self.forward(**kwargs)
-        return self.forward(**kwargs)
-
     def __repr__(self):
         return f"TracedTool({self.name})"
+
+
+# 让 isinstance(traced_tool, BaseTool) 返回 True，通过 smolagents 的类型检查
+BaseTool.register(TracedTool)

@@ -51,6 +51,7 @@ from smolagents.memory import ToolCall
 from app.agent.model import build_model
 from app.agent.tool_adapter import build_all_tools, load_tools_from_module
 from app.agent.tool_context import set_tool_context
+from app.agent.trace_collector import TraceCollector
 
 logger = logging.getLogger(__name__)
 
@@ -62,47 +63,6 @@ _EXCLUDED_TOOL_NAMES = {
     "get_hot_rank_stocks", "get_zt_pool_stocks",
     "get_limit_down_stocks", "get_broken_board_stocks",
 }
-
-
-def _score_to_action(score: float) -> str:
-    """分数 → 决策动作（与 chain/executor.py 逻辑一致）。"""
-    if score is None:
-        return "hold"
-    if score >= 60:
-        return "buy"
-    if score <= 40:
-        return "sell"
-    return "hold"
-
-
-def _infer_skill_name(tool_calls_log: list) -> str:
-    """从 tool_calls 反查 skill 名（与 chain 路径写一致的名字，回测才能对上）。"""
-    if not tool_calls_log:
-        return "freeform_agent"
-
-    try:
-        from app.agent.skills.registry import skill_registry
-        skill_registry.discover()
-    except Exception:
-        return "freeform_agent"
-
-    # 收集被调用的工具名
-    called_tools = {tc.get("tool", "") for tc in tool_calls_log if tc.get("tool")}
-    if not called_tools:
-        return "freeform_agent"
-
-    # 找包含最多被调用工具的 skill
-    best_skill = "freeform_agent"
-    best_overlap = 0
-    for sk in skill_registry.all_skills:
-        if not sk or not sk.tools:
-            continue
-        overlap = len(called_tools & set(sk.tools))
-        if overlap > best_overlap:
-            best_overlap = overlap
-            best_skill = sk.name
-
-    return best_skill
 
 
 # ── Per-user agent cache (tools + managed agents only) ────────
@@ -358,7 +318,7 @@ def _check_output_json(answer, memory, agent) -> bool:
                 continue
 
             # 校验必填字段
-            required = {"action", "score", "direction", "confidence", "signal", "factors", "analysis"}
+            required = {"action", "score", "direction", "confidence", "timeframe", "signal", "factors", "analysis"}
             missing = required - set(data.keys())
             if missing:
                 return False
@@ -809,6 +769,14 @@ class _AgentExecutor:
             _eval_noun = getattr(intent, 'noun', '') or ""
             _eval_tool_chain = (getattr(intent, 'metadata', None) or {}).get("tool_chain", [])
 
+        # ── 创建 TraceCollector（金融领域注入）─────────────────
+        collector = None
+        if domain == "finance":
+            collector = TraceCollector(session_id=session_id, user_query=message)
+            collector.intent_verb = _eval_verb
+            collector.intent_noun = _eval_noun
+            collector.domain = domain
+
         # ── 上下文拼接 ────────────────────────────────────────
         enriched = message
         ctx_parts = []
@@ -853,6 +821,7 @@ class _AgentExecutor:
             domain=domain, domain_instructions=domain_instructions,
             intent_context=intent_context,
             tool_categories=tool_categories,
+            collector=collector,
         )
 
         store.add_message(session_id, "user", message)
@@ -869,6 +838,7 @@ class _AgentExecutor:
             "intent_verb": _eval_verb, "intent_noun": _eval_noun,
             "tool_chain": _eval_tool_chain,
             "domain": domain,
+            "collector": collector,
         }
 
     def chat(self, message, session_id, context=None,
@@ -912,6 +882,7 @@ class _AgentExecutor:
         _intent_noun = meta.get("intent_noun", "")
         _tool_chain = meta.get("tool_chain", [])
         _eval_domain = meta.get("domain", "")
+        collector = meta.get("collector")
 
         t0 = time.time()
         try:
@@ -955,108 +926,46 @@ class _AgentExecutor:
 
             store.add_message(session_id, "assistant", content)
 
-            # ── 金融领域标准化输出 ───────────────────────────
-            # 无论链路是否触发，只要 domain=finance，强制输出 DecisionCard 格式
-            if success and content and _eval_domain == "finance":
+            # ── 金融领域：JSON → TraceCollector 存库 → format_decision_card ──
+            if success and content and collector and _eval_domain == "finance":
                 try:
-                    from app.agent.chain.contract import parse_skill_output
-                    from app.agent.chain.schema import EvalNode, Layer, get_skill_cn_name
-                    import re as _re_std
-
-                    # 提取股票代码/名称
-                    _std_code = ""
-                    _std_name = ""
-                    if context:
-                        _std_code = context.get("stock_code", "")
-                        _std_name = context.get("stock_name", "")
-                    if not _std_code:
-                        _m = _re_std.search(r'\b(\d{6})\b', message)
+                    import json as _json_card
+                    import re as _re_card
+                    # 提取 JSON 块
+                    _card_data = None
+                    for _pat in [r'```json\s*\n?(.*?)\n?\s*```',
+                                 r'(\{[^{}]*"action"[^{}]*"score"[^{}]*\})']:
+                        _m = _re_card.search(_pat, content, _re_card.DOTALL)
                         if _m:
-                            _std_code = _m.group(1)
-                    if not _std_code:
-                        _nm = _re_std.search(r'[\u4e00-\u9fff]{2,8}', message)
-                        if _nm:
-                            _sw = {"分析", "查看", "看看", "查询", "怎么样", "帮我",
-                                   "一下", "最近", "今天", "昨天", "评估", "判断",
-                                   "研究", "解读", "走势", "趋势", "行情"}
-                            _c = _nm.group(0)
-                            # 去掉停用词前缀（如 "分析宇通客车" → "宇通客车"）
-                            if _c in _sw:
-                                _c = None
-                            if _c:
-                                for _s in sorted(_sw, key=len, reverse=True):
-                                    if _c.startswith(_s) and len(_c) > len(_s):
-                                        _c = _c[len(_s):]
-                                        break
-                            if _c and _c not in _sw and len(_c) >= 2:
-                                try:
-                                    from app.utils.basicinfo_db import get_stock_basic_db
-                                    _mx = get_stock_basic_db().search_stocks(_c, limit=1)
-                                    if _mx:
-                                        _std_code = _mx[0].get("symbol", "")
-                                        _std_name = _mx[0].get("name", "")
-                                except Exception:
-                                    pass
+                            try:
+                                _card_data = _json_card.loads(_m.group(1).strip())
+                                if isinstance(_card_data, dict) and "action" in _card_data:
+                                    break
+                            except (_json_card.JSONDecodeError, TypeError):
+                                _card_data = None
 
-                    if _std_code:
-                        # 解析 LLM 输出为 SkillReport
-                        _report = parse_skill_output(content, skill_name="freeform_agent")
-                        _score = max(0, min(100, _report.score))
-
-                        # 分数 → 决策
-                        if _score >= 60:
-                            _action = "buy"
-                        elif _score <= 40:
-                            _action = "sell"
-                        else:
-                            _action = "hold"
-
-                        _action_cn = {"buy": "买入", "sell": "卖出", "hold": "观望", "skip": "跳过"}
-
-                        # 构建标准化输出
-                        _std_lines = [
-                            f"**{_action_cn.get(_action, '观望')}** {_std_name or '未知'}({_std_code})",
-                            f"评分:{_score:.0f} 方向:{_report.direction} 置信:{'high' if _report.confidence >= 0.7 else ('medium' if _report.confidence >= 0.4 else 'low')}",
-                        ]
-
-                        # 因子明细
-                        if _report.factors:
-                            _parts = []
-                            for _f in _report.factors:
-                                _s = f"{_f.score:.0f}" if _f.score is not None else "—"
-                                _parts.append(f"{_f.name}:{_s}")
-                            if _parts:
-                                _std_lines.append(" | ".join(_parts))
-
-                        # 信号摘要
-                        if _report.signal:
-                            _std_lines.append(f"信号: {_report.signal}")
-
-                        # 原始分析折叠
-                        _std_lines.append(f"\n<details><summary>详细分析</summary>\n\n{content}\n</details>")
-
-                        content = "\n".join(_std_lines)
-                        store.add_message(session_id, "assistant", content)
-                        logger.info("[Agent] 金融领域标准化输出: %s score=%.1f action=%s",
-                                    _std_code, _score, _action)
-                except Exception as e:
-                    logger.warning("[Agent] 标准化输出失败，保留原始输出: %s", e)
-
-            # ── 自由推理路径写库（财经领域 + 有股票代码时）──────
-            if success and content and _eval_domain == "finance":
-                try:
-                    self._save_freeform_to_db(
-                        content=content,
-                        message=message,
-                        context=context,
-                        session_id=session_id,
-                        verb=_intent_verb,
-                        noun=_intent_noun,
-                        tool_calls_log=tool_calls_log,
+                    # 先用原始 JSON 内容调用 on_agent_finish（提取字段 + 存库）
+                    tu = result.token_usage if hasattr(result, 'token_usage') else None
+                    total_tok = (tu.input_tokens + tu.output_tokens) if tu else 0
+                    root = collector.on_agent_finish(
+                        final_answer=content,
                         total_steps=total_steps,
+                        total_tokens=total_tok,
+                        model=str(getattr(agent.model, "model_id", "")),
                     )
+                    logger.info("[Agent] TraceCollector 存库 root_id=%s stock=%s",
+                                root.id, root.stock_code)
+
+                    # 再用 JSON 格式化为 DecisionCard 给用户
+                    if _card_data:
+                        content = format_decision_card(_card_data)
+                        store.add_message(session_id, "assistant", content)
+                        logger.info("[Agent] DecisionCard: %s score=%s action=%s",
+                                    _card_data.get("stock_code", ""),
+                                    _card_data.get("score", ""),
+                                    _card_data.get("action", ""))
                 except Exception as e:
-                    logger.warning("[Agent] 自由推理写库失败（不影响返回）: %s", e)
+                    logger.warning("[Agent] DecisionCard/存库失败，保留原始输出: %s", e)
 
             # ── 后置评估 + 工具链学习闭环 ─────────────────────
             agent_result_for_eval = AgentResult(
@@ -1107,111 +1016,6 @@ class _AgentExecutor:
             learn_from_execution(eval_result, verb, noun)
         except Exception as e:
             logger.warning("[PostEval] 评估异常，不影响返回: %s", e)
-
-    @staticmethod
-    def _save_freeform_to_db(
-        content: str,
-        message: str,
-        context: dict,
-        session_id: str,
-        verb: str,
-        noun: str,
-        tool_calls_log: list,
-        total_steps: int,
-    ):
-        """自由推理路径写库 — 从 agent 输出中解析结构化数据，保存到 qd_evaluations。
-
-        复用 chain/contract.py 的 parse_skill_output 解析 LLM 输出，
-        构建一棵迷你 EvalNode 树（chain 根 + 1个 skill 子节点），
-        通过 chain/store.py 的 save_tree 写入数据库。
-        """
-        import re
-        from datetime import date
-        from app.agent.chain.contract import parse_skill_output
-        from app.agent.chain.schema import EvalNode, Layer
-        from app.agent.chain import store as chain_store
-
-        # 提取股票代码（有就记，没有就空着）
-        stock_code = ""
-        stock_name = ""
-        if context:
-            stock_code = context.get("stock_code", "")
-            stock_name = context.get("stock_name", "")
-        if not stock_code:
-            match = re.search(r'\b(\d{6})\b', message)
-            if match:
-                stock_code = match.group(1)
-        # 中文名 → 代码
-        if not stock_code:
-            name_match = re.search(r'[\u4e00-\u9fff]{2,6}', message)
-            if name_match:
-                _stopwords = {"分析", "查看", "看看", "查询", "怎么样", "帮我", "一下",
-                              "最近", "今天", "昨天", "评估", "判断", "研究", "解读"}
-                candidate = name_match.group(0)
-                # 去掉停用词前缀（如 "分析宇通客车" → "宇通客车"）
-                if candidate in _stopwords:
-                    candidate = None
-                if candidate:
-                    for sw in sorted(_stopwords, key=len, reverse=True):
-                        if candidate.startswith(sw) and len(candidate) > len(sw):
-                            candidate = candidate[len(sw):]
-                            break
-                if candidate and candidate not in _stopwords and len(candidate) >= 2:
-                    try:
-                        from app.utils.basicinfo_db import get_stock_basic_db
-                        matches = get_stock_basic_db().search_stocks(candidate, limit=1)
-                        if matches:
-                            stock_code = matches[0].get("symbol", "")
-                            stock_name = matches[0].get("name", "")
-                    except Exception:
-                        pass
-
-        # 从 tool_calls 反查 skill 名（和 chain 路径写一致的名字）
-        skill_name = _infer_skill_name(tool_calls_log)
-
-        # 解析 agent 输出为 SkillReport
-        report = parse_skill_output(content, skill_name=skill_name)
-
-        # 构建根节点（chain 层）
-        root = EvalNode(
-            layer=Layer.CHAIN.value,
-            name=f"{verb}+{noun}" if verb and noun else "freeform",
-            exec_date=date.today(),
-            stock_code=stock_code,
-            stock_name=stock_name,
-            score=report.score,
-            direction=report.direction,
-            action=_score_to_action(report.score),
-            signal=report.signal,
-            confidence=report.confidence,
-            analysis=report.analysis or content[:2000],
-            input_params={"user_query": message},
-        )
-
-        # 构建 skill 子节点（名字和 chain 路径一致，回测才能对上）
-        skill_node = EvalNode(
-            layer=Layer.SKILL.value,
-            name=skill_name,
-            stock_code=stock_code,
-            stock_name=stock_name,
-            score=report.score,
-            direction=report.direction,
-            signal=report.signal,
-            confidence=report.confidence,
-            factors=report.factors,
-            analysis=report.analysis or content[:2000],
-            tools_called=[tc.get("tool", "") for tc in tool_calls_log if tc.get("tool")],
-            status=report.status,
-        )
-        root.add_child(skill_node)
-
-        # 写库
-        root_id = chain_store.save_tree(root)
-        if root_id:
-            logger.info("[Agent] 自由推理写库成功 root_id=%d stock=%s score=%.1f action=%s",
-                        root_id, stock_code, report.score, root.action)
-        else:
-            logger.warning("[Agent] 自由推理写库失败 stock=%s", stock_code)
 
     def _try_chain(self, verb, noun, message, session_id, context, user_id):
         """尝试链路执行。匹配到链路时执行并返回 AgentResult，否则返回 None。
@@ -1514,93 +1318,51 @@ class _AgentExecutor:
                     content = str(step.output) if step.output else ""
                     store.add_message(session_id, "assistant", content)
 
-                    # ── 金融领域标准化输出（流式路径）──────────────
+                    # ── 金融领域：JSON → TraceCollector 存库 → format_decision_card ──
                     _stream_domain = meta.get("domain", "")
-                    if content and _stream_domain == "finance":
+                    _stream_collector = meta.get("collector")
+                    if content and _stream_collector and _stream_domain == "finance":
                         try:
-                            from app.agent.chain.contract import parse_skill_output
-                            import re as _re_std_s
-
-                            _std_code = ""
-                            _std_name = ""
-                            if context:
-                                _std_code = context.get("stock_code", "")
-                                _std_name = context.get("stock_name", "")
-                            if not _std_code:
-                                _m = _re_std_s.search(r'\b(\d{6})\b', message)
+                            import json as _json_sc
+                            import re as _re_sc
+                            _sc_data = None
+                            for _pat in [r'```json\s*\n?(.*?)\n?\s*```',
+                                         r'(\{[^{}]*"action"[^{}]*"score"[^{}]*\})']:
+                                _m = _re_sc.search(_pat, content, _re_sc.DOTALL)
                                 if _m:
-                                    _std_code = _m.group(1)
-                            if not _std_code:
-                                _nm = _re_std_s.search(r'[\u4e00-\u9fff]{2,8}', message)
-                                if _nm:
-                                    _sw = {"分析", "查看", "看看", "查询", "怎么样", "帮我",
-                                           "一下", "最近", "今天", "昨天", "评估", "判断",
-                                           "研究", "解读", "走势", "趋势", "行情"}
-                                    _c = _nm.group(0)
-                                    # 去掉停用词前缀（如 "分析宇通客车" → "宇通客车"）
-                                    if _c in _sw:
-                                        _c = None
-                                    if _c:
-                                        for _s in sorted(_sw, key=len, reverse=True):
-                                            if _c.startswith(_s) and len(_c) > len(_s):
-                                                _c = _c[len(_s):]
-                                                break
-                                    if _c and _c not in _sw and len(_c) >= 2:
-                                        try:
-                                            from app.utils.basicinfo_db import get_stock_basic_db
-                                            _mx = get_stock_basic_db().search_stocks(_c, limit=1)
-                                            if _mx:
-                                                _std_code = _mx[0].get("symbol", "")
-                                                _std_name = _mx[0].get("name", "")
-                                        except Exception:
-                                            pass
+                                    try:
+                                        _sc_data = _json_sc.loads(_m.group(1).strip())
+                                        if isinstance(_sc_data, dict) and "action" in _sc_data:
+                                            break
+                                    except (_json_sc.JSONDecodeError, TypeError):
+                                        _sc_data = None
 
-                            if _std_code:
-                                _report = parse_skill_output(content, skill_name="freeform_agent")
-                                _score = max(0, min(100, _report.score))
-                                if _score >= 60:
-                                    _action = "buy"
-                                elif _score <= 40:
-                                    _action = "sell"
-                                else:
-                                    _action = "hold"
-                                _action_cn = {"buy": "买入", "sell": "卖出", "hold": "观望", "skip": "跳过"}
-                                _std_lines = [
-                                    f"**{_action_cn.get(_action, '观望')}** {_std_name or '未知'}({_std_code})",
-                                    f"评分:{_score:.0f} 方向:{_report.direction} 置信:{'high' if _report.confidence >= 0.7 else ('medium' if _report.confidence >= 0.4 else 'low')}",
-                                ]
-                                if _report.factors:
-                                    _parts = []
-                                    for _f in _report.factors:
-                                        _s = f"{_f.score:.0f}" if _f.score is not None else "—"
-                                        _parts.append(f"{_f.name}:{_s}")
-                                    if _parts:
-                                        _std_lines.append(" | ".join(_parts))
-                                if _report.signal:
-                                    _std_lines.append(f"信号: {_report.signal}")
-                                _std_lines.append(f"\n<details><summary>详细分析</summary>\n\n{content}\n</details>")
-                                content = "\n".join(_std_lines)
-                                store.add_message(session_id, "assistant", content)
-                                logger.info("[Agent] 流式金融标准化: %s score=%.1f action=%s",
-                                            _std_code, _score, _action)
-                        except Exception as e:
-                            logger.warning("[Agent] 流式标准化失败，保留原始输出: %s", e)
-
-                    # ── 自由推理路径写库（财经领域 + 有股票代码时）──
-                    if content and _stream_domain == "finance":
-                        try:
-                            self._save_freeform_to_db(
-                                content=content,
-                                message=message,
-                                context=context,
-                                session_id=session_id,
-                                verb=meta.get("intent_verb", ""),
-                                noun=meta.get("intent_noun", ""),
-                                tool_calls_log=_stream_tool_calls,
+                            # 先用原始 JSON 内容调用 on_agent_finish（提取字段 + 存库）
+                            _tu = None
+                            try:
+                                _tu = agent.token_usage
+                            except Exception:
+                                pass
+                            _total_tok = (_tu.input_tokens + _tu.output_tokens) if _tu else 0
+                            _root = _stream_collector.on_agent_finish(
+                                final_answer=content,
                                 total_steps=agent.step_number,
+                                total_tokens=_total_tok,
+                                model=str(getattr(agent.model, "model_id", "")),
                             )
+                            logger.info("[Agent] 流式TraceCollector 存库 root_id=%s stock=%s",
+                                        _root.id, _root.stock_code)
+
+                            # 再用 JSON 格式化为 DecisionCard 给用户
+                            if _sc_data:
+                                content = format_decision_card(_sc_data)
+                                store.add_message(session_id, "assistant", content)
+                                logger.info("[Agent] 流式DecisionCard: %s score=%s action=%s",
+                                            _sc_data.get("stock_code", ""),
+                                            _sc_data.get("score", ""),
+                                            _sc_data.get("action", ""))
                         except Exception as e:
-                            logger.warning("[Agent] 流式写库失败（不影响返回）: %s", e)
+                            logger.warning("[Agent] 流式DecisionCard/存库失败，保留原始输出: %s", e)
 
                     # ── 后置评估 + 工具链学习闭环 ─────────────
                     _eval_result = AgentResult(
