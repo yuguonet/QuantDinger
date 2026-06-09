@@ -1,4 +1,4 @@
-# QuantDinger 架构重构设计方案
+# QuantDinger Agent架构重构设计方案
 
 > 日期: 2026-06-09
 > 状态: 设计完成，Phase 1 待实施
