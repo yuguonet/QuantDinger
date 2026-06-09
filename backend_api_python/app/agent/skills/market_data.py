@@ -227,7 +227,7 @@ class MarketDataSkill:
         valid_count = sum(1 for f in factors if f.status == "ok")
         confidence = round(min(valid_count / 4, 1.0), 2)
 
-        signal_text = ",".join(signals[:5]) if signals else "市场平稳"
+        signal_text = ",".join(str(s) for s in signals[:5]) if signals else "市场平稳"
 
         return SkillReport(
             skill_name=self.name,

@@ -249,7 +249,7 @@ class MomentumTrackerSkill:
         valid_count = sum(1 for f in factors if "缺失" not in str(f.value))
         confidence = round(min(valid_count / 4, 1.0), 2)
 
-        signal_text = ",".join(signals[:5]) if signals else "无明显动量信号"
+        signal_text = ",".join(str(s) for s in signals[:5]) if signals else "无明显动量信号"
 
         # 动量评级
         if final_score >= 80:

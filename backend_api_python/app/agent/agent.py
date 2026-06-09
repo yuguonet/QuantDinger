@@ -829,7 +829,15 @@ class _AgentExecutor:
                                    "一下", "最近", "今天", "昨天", "评估", "判断",
                                    "研究", "解读", "走势", "趋势", "行情"}
                             _c = _nm.group(0)
-                            if _c not in _sw:
+                            # 去掉停用词前缀（如 "分析宇通客车" → "宇通客车"）
+                            if _c in _sw:
+                                _c = None
+                            if _c:
+                                for _s in sorted(_sw, key=len, reverse=True):
+                                    if _c.startswith(_s) and len(_c) > len(_s):
+                                        _c = _c[len(_s):]
+                                        break
+                            if _c and _c not in _sw and len(_c) >= 2:
                                 try:
                                     from app.utils.basicinfo_db import get_stock_basic_db
                                     _mx = get_stock_basic_db().search_stocks(_c, limit=1)
@@ -989,7 +997,15 @@ class _AgentExecutor:
                 _stopwords = {"分析", "查看", "看看", "查询", "怎么样", "帮我", "一下",
                               "最近", "今天", "昨天", "评估", "判断", "研究", "解读"}
                 candidate = name_match.group(0)
-                if candidate not in _stopwords:
+                # 去掉停用词前缀（如 "分析宇通客车" → "宇通客车"）
+                if candidate in _stopwords:
+                    candidate = None
+                if candidate:
+                    for sw in sorted(_stopwords, key=len, reverse=True):
+                        if candidate.startswith(sw) and len(candidate) > len(sw):
+                            candidate = candidate[len(sw):]
+                            break
+                if candidate and candidate not in _stopwords and len(candidate) >= 2:
                     try:
                         from app.utils.basicinfo_db import get_stock_basic_db
                         matches = get_stock_basic_db().search_stocks(candidate, limit=1)
@@ -1074,7 +1090,16 @@ class _AgentExecutor:
                               "帮我", "一下", "最近", "今天", "昨天", "修改", "修复",
                               "创建", "筛选", "回测", "启动", "停止", "显示", "展示",
                               "评估", "判断", "研究", "解读", "怎么样", "情况", "状态"}
-                if candidate not in _stopwords:
+                # 先检查完整匹配是否在停用词中
+                if candidate in _stopwords:
+                    candidate = None
+                # 如果完整匹配含停用词前缀，去掉前缀再试
+                if candidate:
+                    for sw in sorted(_stopwords, key=len, reverse=True):
+                        if candidate.startswith(sw) and len(candidate) > len(sw):
+                            candidate = candidate[len(sw):]
+                            break
+                if candidate and candidate not in _stopwords and len(candidate) >= 2:
                     try:
                         from app.utils.basicinfo_db import get_stock_basic_db
                         matches = get_stock_basic_db().search_stocks(candidate, limit=1)
@@ -1082,8 +1107,13 @@ class _AgentExecutor:
                             stock_code = matches[0].get("symbol", "")
                             stock_name = matches[0].get("name", "")
                             logger.info("[Chain] 中文名 '%s' → 代码 %s", candidate, stock_code)
+                        else:
+                            # DB 查不到，至少把中文名传给 Planner，让 LLM 有上下文
+                            stock_name = candidate
+                            logger.info("[Chain] 中文名 '%s' 未匹配到代码，作为 stock_name 传递", candidate)
                     except Exception as e:
-                        logger.warning("[Chain] 股票名查询失败: %s", e)
+                        stock_name = candidate
+                        logger.warning("[Chain] 股票名查询失败: %s, 作为 stock_name 传递", e)
 
         # ── Layer 0: 固定链路匹配 ──
         chain_def = None
@@ -1356,7 +1386,15 @@ class _AgentExecutor:
                                            "一下", "最近", "今天", "昨天", "评估", "判断",
                                            "研究", "解读", "走势", "趋势", "行情"}
                                     _c = _nm.group(0)
-                                    if _c not in _sw:
+                                    # 去掉停用词前缀（如 "分析宇通客车" → "宇通客车"）
+                                    if _c in _sw:
+                                        _c = None
+                                    if _c:
+                                        for _s in sorted(_sw, key=len, reverse=True):
+                                            if _c.startswith(_s) and len(_c) > len(_s):
+                                                _c = _c[len(_s):]
+                                                break
+                                    if _c and _c not in _sw and len(_c) >= 2:
                                         try:
                                             from app.utils.basicinfo_db import get_stock_basic_db
                                             _mx = get_stock_basic_db().search_stocks(_c, limit=1)

@@ -235,10 +235,18 @@ def _dict_to_report(data: Dict[str, Any], skill_name: str, raw: str) -> SkillRep
     factors = []
     for f in data.get("factors", []):
         if isinstance(f, dict):
+            f_name = f.get("name", "")
+            f_value = f.get("value", "")
+            # 防御：确保 value 是字符串，不是 tuple/list 等
+            if not isinstance(f_value, str):
+                f_value = str(f_value)
+            f_score = f.get("score")
+            if isinstance(f_score, (tuple, list)):
+                f_score = None
             factors.append(FactorItem(
-                name=f.get("name", ""),
-                value=str(f.get("value", "")),
-                score=f.get("score"),
+                name=f_name,
+                value=f_value,
+                score=f_score,
                 weight=f.get("weight", 1.0),
                 status=f.get("status", "ok"),
             ))

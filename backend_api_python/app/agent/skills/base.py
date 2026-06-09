@@ -237,7 +237,16 @@ class BaseSkill(ABC):
             )
 
         from app.agent.chain.contract import parse_skill_output, extract_tools_called
-        report = parse_skill_output(raw_output, skill_name=self.name)
+        try:
+            report = parse_skill_output(raw_output, skill_name=self.name)
+        except Exception as e:
+            logger.warning("[Skill:%s] parse_skill_output 异常: %s, 兜底 neutral", self.name, e)
+            from app.agent.chain.schema import SkillReport as _SR
+            report = _SR(
+                skill_name=self.name, score=50.0, confidence=0.0,
+                direction="neutral", signal="解析异常",
+                analysis=str(raw_output)[:2000], status="ok",
+            )
 
         extra_tools = extract_tools_called(raw_output)
         if _tool_calls is not None:
@@ -271,27 +280,19 @@ class BaseSkill(ABC):
         )
 
         t0 = time.time()
+        result = None
         try:
             result = call_tool_fn(tool_name, **kwargs)
-            elapsed = (time.time() - t0) * 1000
-
-            tool_node.elapsed_ms = elapsed
-            tool_node.status = Status.OK.value
-
-            # 存摘要到 EvalNode（1~10条样本 + 元数据），不是全量
-            tool_node.output_data = self._summarize_for_storage(result)
-
-            if result is None:
-                tool_node.status = Status.MISSING.value
-                if _missing_data is not None:
-                    _missing_data.append(tool_name)
-
-            if _tool_calls is not None and tool_name not in _tool_calls:
-                _tool_calls.append(tool_name)
-            if _tool_nodes is not None:
-                _tool_nodes.append(tool_node)
-            return result
-
+        except TypeError as te:
+            # 工具不接受某些参数（如 stock_code），去掉后重试
+            if "stock_code" in kwargs and "stock_code" in str(te):
+                kwargs.pop("stock_code")
+                try:
+                    result = call_tool_fn(tool_name, **kwargs)
+                except TypeError:
+                    result = call_tool_fn(tool_name)
+            else:
+                raise
         except Exception as e:
             elapsed = (time.time() - t0) * 1000
             tool_node.elapsed_ms = elapsed
@@ -305,6 +306,25 @@ class BaseSkill(ABC):
 
             logger.warning("[Skill:%s] 工具 %s 调用失败: %s", self.name, tool_name, e)
             return None
+
+        elapsed = (time.time() - t0) * 1000
+
+        tool_node.elapsed_ms = elapsed
+        tool_node.status = Status.OK.value
+
+        # 存摘要到 EvalNode（1~10条样本 + 元数据），不是全量
+        tool_node.output_data = self._summarize_for_storage(result)
+
+        if result is None:
+            tool_node.status = Status.MISSING.value
+            if _missing_data is not None:
+                _missing_data.append(tool_name)
+
+        if _tool_calls is not None and tool_name not in _tool_calls:
+            _tool_calls.append(tool_name)
+        if _tool_nodes is not None:
+            _tool_nodes.append(tool_node)
+        return result
 
     @staticmethod
     def _summarize_for_storage(data: Any, max_items: int = 10) -> Dict[str, Any]:
@@ -349,6 +369,24 @@ class BaseSkill(ABC):
             context: 上下文（含 previous_results）
             tool_results: 工具返回数据（注入到 prompt 中）
         """
+        try:
+            return self._build_prompt_inner(stock_code, stock_name, context, tool_results)
+        except Exception as e:
+            # 构建 prompt 失败时返回最小可用 prompt
+            logger.warning("[Skill:%s] build_prompt 异常: %s, 使用最小 prompt", self.name, e)
+            return (
+                f"{self.instructions or self.description}\n\n"
+                f"## 分析目标\n股票: {stock_name or stock_code}（{stock_code}）\n\n"
+                f"请基于你的专业知识进行分析，输出 JSON 格式结果。"
+            )
+
+    def _build_prompt_inner(
+        self,
+        stock_code: str,
+        stock_name: str,
+        context: Dict[str, Any],
+        tool_results: Dict[str, Any] = None,
+    ) -> str:
         parts = []
 
         # 主指令
@@ -365,7 +403,13 @@ class BaseSkill(ABC):
         if prev:
             parts.append("\n## 前序分析摘要\n")
             for r in prev:
-                parts.append(f"- **{r.get('skill', '?')}**: {r.get('direction', '?')} | {r.get('signal', '')}")
+                try:
+                    skill_name = str(r.get('skill', '?'))
+                    direction = str(r.get('direction', '?'))
+                    signal = str(r.get('signal', ''))
+                    parts.append(f"- **{skill_name}**: {direction} | {signal}")
+                except Exception:
+                    continue  # 跳过异常的前序结果
 
         # 工具返回数据（控制总量）
         if tool_results:
@@ -373,7 +417,11 @@ class BaseSkill(ABC):
             total_chars = 0
             max_total = 12000  # 工具数据总量上限
             for tool_name, data in tool_results.items():
-                data_str = json.dumps(data, ensure_ascii=False, default=str)
+                try:
+                    data_str = json.dumps(data, ensure_ascii=False, default=str)
+                except (TypeError, ValueError) as e:
+                    data_str = str(data)[:2000]
+                    logger.warning("[Skill:%s] 工具 %s 数据序列化失败: %s", self.name, tool_name, e)
                 remaining = max_total - total_chars
                 if remaining <= 0:
                     parts.append(f"### {tool_name}\n(数据量超限，已跳过)\n")

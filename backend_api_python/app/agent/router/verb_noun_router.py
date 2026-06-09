@@ -505,7 +505,15 @@ def _extract_stock_name(message: str) -> Optional[str]:
     match = re.search(r'[\u4e00-\u9fff]{2,6}', message)
     if match:
         candidate = match.group(0)
-        if candidate not in stopwords:
+        # 去掉停用词前缀（如 "分析宇通客车" → "宇通客车"）
+        if candidate in stopwords:
+            candidate = None
+        if candidate:
+            for sw in sorted(stopwords, key=len, reverse=True):
+                if candidate.startswith(sw) and len(candidate) > len(sw):
+                    candidate = candidate[len(sw):]
+                    break
+        if candidate and candidate not in stopwords and len(candidate) >= 2:
             try:
                 from app.utils.basicinfo_db import get_stock_basic_db
                 matches = get_stock_basic_db().search_stocks(candidate, limit=1)
@@ -575,7 +583,16 @@ class VerbNounRouter:
             _cn_match = re.search(r'[\u4e00-\u9fff]{2,8}', message)
             if _cn_match:
                 _candidate = _cn_match.group(0)
-                if _candidate not in _stock_stopwords:
+                # 先检查完整匹配是否在停用词中
+                if _candidate in _stock_stopwords:
+                    _candidate = None
+                # 如果完整匹配含停用词前缀，去掉前缀再试（如 "分析宇通客车" → "宇通客车"）
+                if _candidate:
+                    for _sw in sorted(_stock_stopwords, key=len, reverse=True):
+                        if _candidate.startswith(_sw) and len(_candidate) > len(_sw):
+                            _candidate = _candidate[len(_sw):]
+                            break
+                if _candidate and _candidate not in _stock_stopwords and len(_candidate) >= 2:
                     try:
                         from app.utils.basicinfo_db import get_stock_basic_db
                         _matches = get_stock_basic_db().search_stocks(_candidate, limit=1)
@@ -583,8 +600,10 @@ class VerbNounRouter:
                             noun = "stock"
                             logger.info("[VerbNoun] 中文名 '%s' → noun=stock (code=%s)",
                                         _candidate, _matches[0].get("symbol", ""))
-                    except Exception:
-                        pass
+                        else:
+                            logger.info("[VerbNoun] 中文名 '%s' 未匹配到DB，跳过", _candidate)
+                    except Exception as _e:
+                        logger.warning("[VerbNoun] 股票名查询异常: %s", _e)
 
         # ── Step 3: 组合 ──
         result = None

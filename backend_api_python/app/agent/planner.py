@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from app.agent.chain.chains import ChainDef, ChainStep
+from app.agent.chain.chains import ChainDef, ChainStep, register_chain
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +162,7 @@ class Planner:
 
         # 3. 校验
         validated = self._validate(plan_data)
-        if not validated:
+        if validated is not None:
             return self._degrade(f"规划校验失败: {validated}", t0)
 
         # 4. 构建 ChainDef
@@ -307,7 +307,7 @@ class Planner:
 
         chain_id = f"planned+{hashlib.md5(json.dumps(plan_data, sort_keys=True).encode()).hexdigest()[:8]}"
 
-        return ChainDef(
+        chain_def = ChainDef(
             chain_id=chain_id,
             name="LLM 规划链路",
             description=plan_data.get("reasoning", ""),
@@ -315,6 +315,8 @@ class Planner:
             trigger_verbs=[],
             trigger_nouns=[],
         )
+        register_chain(chain_def)  # 动态链路必须注册才能被 ChainExecutor 找到
+        return chain_def
 
     # ── 缓存 ──
 
@@ -531,7 +533,7 @@ class Planner:
             return None
 
         chain_id = f"cached+{data.get('query_hash', '')[:8]}"
-        return ChainDef(
+        chain_def = ChainDef(
             chain_id=chain_id,
             name="缓存规划链路",
             description=data.get("reasoning", ""),
@@ -539,6 +541,8 @@ class Planner:
             trigger_verbs=[],
             trigger_nouns=[],
         )
+        register_chain(chain_def)  # 动态链路必须注册才能被 ChainExecutor 找到
+        return chain_def
 
     # ── 文件 IO ──
 
@@ -639,6 +643,7 @@ class Planner:
             trigger_verbs=[],
             trigger_nouns=[],
         )
+        register_chain(chain_def)  # 动态链路必须注册才能被 ChainExecutor 找到
 
         return PlanResult(
             success=True,  # 降级也算成功（有链路可执行）
@@ -660,7 +665,7 @@ def get_default_fallback_chain() -> ChainDef:
         ChainStep(name=skill, agent=skill, order=i + 1, required=(i == 0))
         for i, skill in enumerate(DEFAULT_FALLBACK_SKILLS)
     ]
-    return ChainDef(
+    chain_def = ChainDef(
         chain_id="degrade+default",
         name="降级默认链路",
         description="规划失败时的保底链路",
@@ -668,3 +673,5 @@ def get_default_fallback_chain() -> ChainDef:
         trigger_verbs=[],
         trigger_nouns=[],
     )
+    register_chain(chain_def)  # 动态链路必须注册才能被 ChainExecutor 找到
+    return chain_def

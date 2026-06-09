@@ -169,7 +169,7 @@ class IndicatorAgent:
         final_score = max(0, min(100, final_score))
         confidence = round(min(total_run / 3, 1.0), 2)
 
-        signal_text = ",".join(signals[:5]) if signals else "无信号"
+        signal_text = ",".join(str(s) for s in signals[:5]) if signals else "无信号"
 
         return SkillReport(
             skill_name=self.name,

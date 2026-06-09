@@ -503,7 +503,15 @@ def _extract_params(message: str, scene: Dict = None) -> Dict[str, Any]:
     name_match = re.search(r'[\u4e00-\u9fff]{2,6}', message)
     if name_match:
         candidate = name_match.group(0)
-        if candidate not in _stopwords:
+        # 去掉停用词前缀（如 "分析宇通客车" → "宇通客车"）
+        if candidate in _stopwords:
+            candidate = None
+        if candidate:
+            for sw in sorted(_stopwords, key=len, reverse=True):
+                if candidate.startswith(sw) and len(candidate) > len(sw):
+                    candidate = candidate[len(sw):]
+                    break
+        if candidate and candidate not in _stopwords and len(candidate) >= 2:
             try:
                 from app.utils.basicinfo_db import get_stock_basic_db
                 matches = get_stock_basic_db().search_stocks(candidate, limit=1)

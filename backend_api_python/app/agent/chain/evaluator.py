@@ -47,7 +47,7 @@ def _get_actual_returns(
     try:
         from app.data_sources.factory import DataSourceFactory
 
-        ds = DataSourceFactory.get(market)
+        ds = DataSourceFactory.get_source(market)
         klines = ds.get_kline(stock_code, timeframe="1D", days=10)
         if not klines or len(klines) < 2:
             return {}

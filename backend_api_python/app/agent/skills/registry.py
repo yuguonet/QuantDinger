@@ -75,8 +75,9 @@ def skill(
     tools = tools or []
 
     def decorator(cls) -> Type[BaseSkill]:
-        # 从装饰的类中提取 analyze 方法（如果有）
+        # 从装饰的类中提取 analyze 和 algo_analyze 方法（如果有）
         custom_analyze = cls.__dict__.get("analyze")
+        custom_algo_analyze = cls.__dict__.get("algo_analyze")
 
         # 动态创建 BaseSkill 子类
         skill_cls = type(cls.__name__, (BaseSkill,), {
@@ -94,6 +95,10 @@ def skill(
         # 如果原始类定义了 analyze 方法，覆盖默认实现
         if custom_analyze is not None:
             skill_cls.analyze = custom_analyze
+
+        # 如果原始类定义了 algo_analyze 方法，覆盖默认实现
+        if custom_algo_analyze is not None:
+            skill_cls.algo_analyze = custom_algo_analyze
 
         # 自动注册到全局 registry
         skill_registry.register(skill_cls)
