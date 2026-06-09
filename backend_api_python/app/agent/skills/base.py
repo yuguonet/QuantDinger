@@ -45,6 +45,7 @@ class BaseSkill(ABC):
     方法：
       run() — 执行 Skill，返回 (SkillReport, EvalNode)
       analyze() — 执行分析（可覆盖，默认走 build_prompt + call_llm + parse）
+      algo_analyze() — 纯算法分析（覆盖此方法实现算法逻辑，返回 None 则走 LLM）
       build_prompt() — 构造 prompt（可覆盖）
       call_tool() — 调用工具并自动记录入参出参
     """
@@ -134,6 +135,27 @@ class BaseSkill(ABC):
 
         return report, skill_node
 
+    def algo_analyze(
+        self,
+        stock_code: str,
+        stock_name: str,
+        tool_results: Dict[str, Any],
+    ) -> Optional["SkillReport"]:
+        """纯算法分析。返回 SkillReport 则跳过 LLM，返回 None 走 LLM。
+
+        子类覆盖此方法实现算法逻辑。
+        默认返回 None（全部走 LLM，向后兼容）。
+
+        Args:
+            stock_code: 股票代码
+            stock_name: 股票名称
+            tool_results: 工具返回数据 {tool_name: result}
+
+        Returns:
+            SkillReport 或 None
+        """
+        return None
+
     def analyze(
         self,
         stock_code: str,
@@ -145,14 +167,19 @@ class BaseSkill(ABC):
         _tool_nodes: List[EvalNode] = None,
         _missing_data: List[str] = None,
     ) -> SkillReport:
-        """默认分析流程：调用工具获取数据 → 构造 prompt → 调用 LLM → 解析输出。
+        """默认分析流程：算法优先，LLM 补位。
 
-        子类可覆盖此方法实现自定义逻辑。
+        执行顺序：
+          1. 调用工具获取数据
+          2. algo_analyze（纯算法，0 token）
+          3. 若 algo 返回 None → build_prompt + call_llm + parse
+
+        子类可覆盖 analyze() 实现完全自定义逻辑（跳过 algo 和默认流程）。
         """
-        if not call_tool_fn or not call_llm:
+        if not call_tool_fn:
             return SkillReport(
                 skill_name=self.name, status="failed",
-                error="call_tool_fn 或 call_llm 未提供",
+                error="call_tool_fn 未提供",
             )
 
         # Step 1: 调用工具获取数据
@@ -179,13 +206,28 @@ class BaseSkill(ABC):
                 missing_data=self.tools[:],
             )
 
-        # Step 2: 构造 prompt（含工具数据 + 前序结果）
+        # Step 2: 算法引擎（algo 优先，0 token）
+        algo_report = self.algo_analyze(stock_code, stock_name, tool_results)
+        if algo_report is not None:
+            # 算法搞定，跳过 LLM
+            algo_report.tools_called = list(tool_results.keys())
+            algo_report.missing_data = list(_missing_data or [])
+            logger.info("[Skill:%s] 算法分析完成 score=%.1f direction=%s",
+                        self.name, algo_report.score, algo_report.direction)
+            return algo_report
+
+        # Step 3: LLM 补位（算法无法处理时）
+        if not call_llm:
+            return SkillReport(
+                skill_name=self.name, status="failed",
+                error="algo_analyze 返回 None 且 call_llm 未提供",
+            )
+
         prompt = self.build_prompt(
             stock_code, stock_name, context,
             tool_results=tool_results,
         )
 
-        # Step 3: 调用 LLM
         try:
             raw_output = call_llm(prompt)
         except Exception as e:
@@ -194,7 +236,6 @@ class BaseSkill(ABC):
                 error=f"LLM 调用失败: {e}",
             )
 
-        # Step 4: 解析输出
         from app.agent.chain.contract import parse_skill_output, extract_tools_called
         report = parse_skill_output(raw_output, skill_name=self.name)
 

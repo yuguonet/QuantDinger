@@ -107,7 +107,6 @@ def _infer_skill_name(tool_calls_log: list) -> str:
 
 # ── Per-user agent cache (tools + managed agents only) ────────
 _tools_cache_by_domain: Dict[str, List] = {}       # key: domain → tools list
-_managed_agents_cache: Dict[str, list] = {}         # key: model_provider → managed agents
 _tools_cache_lock = __import__("threading").Lock()
 
 
@@ -157,10 +156,9 @@ def _generate_tool_catalog(tools, managed_agents) -> str:
     if uncategorized:
         lines.append(f"**未分层**: {', '.join(sorted(uncategorized))}")
 
-    # Managed agents
-    if managed_agents:
-        ma_info = [f"{ma.name}({ma.description[:30]})" for ma in managed_agents]
-        lines.append(f"\n**子Agent**: {', '.join(ma_info)}")
+    # 技能调用工具
+    if any(t.name == "call_skill" for t in (tools or [])):
+        lines.append("\n**技能调用**: call_skill — 调用专业分析技能（技术面/动量/情报/政策等）")
 
     return "\n".join(lines)
 
@@ -441,53 +439,10 @@ def _step_to_events(step) -> List[Dict[str, Any]]:
     return events
 
 
-# ═══════════════════════════════════════════════════════════════
-# 5. Managed Agents (专业子 Agent)
-# ═══════════════════════════════════════════════════════════════
-
-def _build_managed_agents(smol_model) -> list:
-    """Build smolagents managed agents from BaseSkill registry.
-
-    每个 BaseSkill → 一个 smolagents 子 Agent（通过 managed_agents 机制）。
-    BaseSkill 的 instructions 作为 agent 的 instructions，
-    BaseSkill 的 tools 作为 agent 的工具集。
-
-    注意: smolagents >= 1.27 移除了 ManagedAgent 类，
-    改为直接在 Agent 构造时传 name/description，再把 agent 列表传给 managed_agents。
-    """
-    from app.agent.skills.registry import skill_registry
-
-    all_tools = build_all_tools()
-    tool_map = {t.name: t for t in all_tools}
-
-    AgentClass = _get_agent_class()
-    skill_registry.discover()
-
-    agents = []
-    for skill_inst in skill_registry.all_skills:
-        # 从 tool_map 中筛选该 skill 需要的工具
-        skill_tools = [tool_map[t] for t in skill_inst.tools if t in tool_map]
-        if not skill_tools:
-            # 没有可用工具的 skill 不作为 managed agent（走 chain 路径）
-            continue
-
-        # 用 BaseSkill 的 instructions 作为 agent 指令
-        instructions = skill_inst.instructions or skill_inst.description
-
-        sub_agent = AgentClass(
-            tools=skill_tools,
-            model=smol_model,
-            max_steps=8,
-            instructions=instructions,
-            verbosity_level=LogLevel.INFO,
-            stream_outputs=True,
-            name=skill_inst.name,
-            description=skill_inst.description,
-        )
-        agents.append(sub_agent)
-
-    logger.info("[Agent] Built %d managed agents from skill registry", len(agents))
-    return agents
+# ── Managed Agents 已移除 ────────────────────────────────────
+# 旧机制：每个 Skill → smolagents ManagedAgent（双轨制，BaseSkill 未被调用）
+# 新机制：CallSkillTool 统一调用 BaseSkill.run()（单轨制）
+# 见 agent/skills/call_skill_tool.py
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -538,14 +493,13 @@ def get_smolagent(
         else:
             tools = _tools_cache_by_domain[domain_key]
 
-    # Managed agents（按 model+provider+domain 缓存，避免不同领域互相污染）
-    ma_key = f"{model}_{provider}_{domain_key}"
-    if ma_key not in _managed_agents_cache:
-        _managed_agents_cache[ma_key] = _build_managed_agents(smol_model)
-    managed_agents = _managed_agents_cache[ma_key]
+    # ── CallSkillTool（替代 managed_agents）──
+    from app.agent.skills.call_skill_tool import CallSkillTool
+    call_skill = CallSkillTool(model=smol_model, user_id=user_id)
+    tools.append(call_skill)
 
     instructions = _build_instructions(
-        user_message, skill_instructions, language, tools, managed_agents,
+        user_message, skill_instructions, language, tools, managed_agents=None,
         domain=domain, domain_instructions=domain_instructions,
         intent_context=intent_context,
     )
@@ -568,14 +522,13 @@ def get_smolagent(
         return_full_result=True,
         stream_outputs=True,
         planning_interval=None,
-        managed_agents=managed_agents,
         final_answer_checks=[_check_dashboard_json],
         **_extra_kwargs,
     )
 
     logger.info(
-        "[Agent] Built %s for user=%s domain=%s: %d tools, %d managed agents, max_steps=%d",
-        AgentClass.__name__, user_id, domain_key, len(tools), len(managed_agents), max_steps,
+        "[Agent] Built %s for user=%s domain=%s: %d tools, max_steps=%d",
+        AgentClass.__name__, user_id, domain_key, len(tools), max_steps,
     )
     return agent
 
@@ -1094,22 +1047,14 @@ class _AgentExecutor:
             logger.warning("[Agent] 自由推理写库失败 stock=%s", stock_code)
 
     def _try_chain(self, verb, noun, message, session_id, context, user_id):
-        """尝试链路执行。匹配到链路时执行并返回 AgentResult，否则返回 None。"""
-        if not verb:
-            logger.debug("[Chain] verb 为空，跳过链路")
-            return None
+        """尝试链路执行。匹配到链路时执行并返回 AgentResult，否则返回 None。
 
-        try:
-            from app.agent.chain.chains import get_chain_for_intent
-            chain_def = get_chain_for_intent(verb, noun)
-            if not chain_def:
-                logger.debug("[Chain] 未匹配链路: verb=%s noun=%s", verb, noun)
-                return None
-        except Exception as e:
-            logger.warning("[Chain] 查找链路异常: %s", e)
-            return None
-
-        # 提取股票代码
+        流程：
+          1. 查固定链路（verb+noun 精确匹配）
+          2. 未匹配 → Planner 规划（LLM 选 Skill）
+          3. 规划失败 → 降级默认链路（必须告知用户）
+        """
+        # ── 提取股票代码（固定链路和规划都需要）──
         stock_code = ""
         stock_name = ""
         if context:
@@ -1120,14 +1065,11 @@ class _AgentExecutor:
             match = re.search(r'\b(\d{6})\b', message)
             if match:
                 stock_code = match.group(1)
-
-        # 中文股票名 → 代码转换（用户输入"分析北京文化"而非"分析000802"）
         if not stock_code:
             import re
             name_match = re.search(r'[\u4e00-\u9fff]{2,6}', message)
             if name_match:
                 candidate = name_match.group(0)
-                # 排除动词/虚词，避免"分析一下"误匹配
                 _stopwords = {"分析", "查看", "看看", "查询", "怎么样", "什么", "如何",
                               "帮我", "一下", "最近", "今天", "昨天", "修改", "修复",
                               "创建", "筛选", "回测", "启动", "停止", "显示", "展示",
@@ -1143,17 +1085,75 @@ class _AgentExecutor:
                     except Exception as e:
                         logger.warning("[Chain] 股票名查询失败: %s", e)
 
-        # 非个股链路（如 scan+market）不需要股票代码
+        # ── Layer 0: 固定链路匹配 ──
+        chain_def = None
+        degraded = False
+        degrade_reason = ""
+
+        try:
+            from app.agent.chain.chains import get_chain_for_intent
+            chain_def = get_chain_for_intent(verb, noun)
+        except Exception as e:
+            logger.warning("[Chain] 查找链路异常: %s", e)
+
+        # ── Layer 1: Planner 规划（无固定链路时）──
+        if not chain_def:
+            logger.info("[Chain] 无固定链路匹配 (verb=%s noun=%s)，尝试 Planner", verb, noun)
+            try:
+                from app.agent.planner import Planner
+                smol_model = build_model(self.model, self.provider)
+
+                def planner_llm(prompt: str) -> str:
+                    messages = [{"role": "user", "content": prompt}]
+                    response = smol_model(messages)
+                    return response.content if hasattr(response, "content") else str(response)
+
+                planner = Planner(call_llm=planner_llm)
+                plan_result = planner.plan(
+                    query=message,
+                    stock_code=stock_code,
+                    stock_name=stock_name,
+                    verb=verb,
+                    noun=noun,
+                )
+
+                if plan_result.success and plan_result.chain_def:
+                    chain_def = plan_result.chain_def
+                    degraded = plan_result.degraded
+                    degrade_reason = plan_result.degrade_reason
+
+                    if plan_result.from_cache:
+                        logger.info("[Planner] 缓存命中: %s", chain_def.chain_id)
+                    elif degraded:
+                        logger.warning("[Planner] 降级: %s", degrade_reason)
+                    else:
+                        logger.info("[Planner] 规划成功: %d 步, reasoning=%s",
+                                    len(chain_def.steps), plan_result.reasoning[:80])
+                else:
+                    logger.warning("[Planner] 规划失败")
+            except Exception as e:
+                logger.warning("[Planner] 规划异常: %s", e)
+
+        # ── Layer 2: 最终兜底 ──
+        if not chain_def:
+            from app.agent.planner import get_default_fallback_chain
+            chain_def = get_default_fallback_chain()
+            degraded = True
+            degrade_reason = "规划器异常，使用默认链路"
+            logger.warning("[Chain] 最终兜底: %s", chain_def.chain_id)
+
+        # 非个股链路不需要股票代码
         if not stock_code:
             if chain_def.chain_id == "scan+market":
                 stock_code = ""
-            else:
-                logger.info("[Chain] 链路 %s 匹配但未找到股票代码，跳过链路", chain_def.chain_id)
+            elif not degraded:
+                logger.info("[Chain] 链路 %s 匹配但未找到股票代码，跳过", chain_def.chain_id)
                 return None
 
-        logger.info("[Chain] 触发链路 %s | 股票=%s", chain_def.chain_id, stock_code)
+        logger.info("[Chain] 执行链路 %s | 股票=%s | degraded=%s",
+                     chain_def.chain_id, stock_code, degraded)
 
-        # 构建 Skill 实例（BaseSkill 统一体系）
+        # ── 构建 Skill 实例并执行 ──
         from app.agent.session_store import get_session_store
         store = get_session_store()
 
@@ -1215,9 +1215,18 @@ class _AgentExecutor:
         if not content:
             content = "链路执行未产生决策。"
 
+        # 降级告知用户（必须告知）
+        if degraded:
+            degrade_msg = f"⚠️ 当前为降级模式（{degrade_reason}），仅执行基础分析，结果可能不完整。"
+            content = degrade_msg + "\n\n" + content
+            logger.warning("[Chain] 降级告知: %s", degrade_reason)
+
         # 附加结构化 JSON 供前端解析
         import json as _json
         result_dict = chain_result.to_dict()
+        if degraded:
+            result_dict["degraded"] = True
+            result_dict["degrade_reason"] = degrade_reason
         content += "\n\n<!-- decision_result:\n" + _json.dumps(result_dict, ensure_ascii=False, indent=2) + "\n-->"
 
         return AgentResult(

@@ -5,6 +5,11 @@ Indicator Agent — 用户自定义指标策略执行器。
 从指标 IDE 中加载用户创建的策略代码，对目标股票执行，
 提取 buy/sell 信号，作为链路中的一环供后续步骤参考。
 """
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
+from app.agent.chain.schema import FactorItem, SkillReport
 from app.agent.skills.registry import skill
 
 
@@ -67,4 +72,112 @@ from app.agent.skills.registry import skill
 )
 class IndicatorAgent:
     """用户自定义指标策略执行 Agent。"""
-    pass
+
+    def algo_analyze(
+        self,
+        stock_code: str,
+        stock_name: str,
+        tool_results: Dict[str, Any],
+    ) -> Optional[SkillReport]:
+        """纯算法指标信号分析。
+
+        流程：
+          1. list_indicators 获取用户指标列表
+          2. 逐个 run_indicator_signal 执行（最多 3 个）
+          3. 汇总 buy/sell 信号
+        """
+        factors = []
+        signals = []
+        buy_count = 0
+        sell_count = 0
+        total_run = 0
+
+        # 获取指标列表
+        indicators = tool_results.get("list_indicators", {})
+        indicator_list = []
+        if isinstance(indicators, dict):
+            indicator_list = indicators.get("indicators", [])
+        elif isinstance(indicators, list):
+            indicator_list = indicators
+
+        if not indicator_list:
+            return SkillReport(
+                skill_name=self.name,
+                score=50.0,
+                direction="neutral",
+                signal="无用户自定义指标",
+                confidence=0.0,
+                factors=[FactorItem(name="指标", value="无自定义指标", score=50, status="missing")],
+                status="ok",
+            )
+
+        # 执行指标（最多 3 个）
+        for ind in indicator_list[:3]:
+            ind_id = ind.get("id")
+            ind_name = ind.get("name", f"指标{ind_id}")
+
+            # run_indicator_signal 已经在 tool_results 中（由 BaseSkill 调用）
+            # 但 indicator_agent 的 tools 只有 list_indicators, get_indicator_params, run_indicator_signal
+            # run_indicator_signal 需要 indicator_id 参数，BaseSkill 默认调用时没有传
+            # 所以这里需要检查 tool_results 中是否有 run_indicator_signal 的结果
+            signal_result = tool_results.get("run_indicator_signal", {})
+            if isinstance(signal_result, dict) and "error" not in signal_result:
+                latest_signal = signal_result.get("latest_signal", "")
+                signal_type = signal_result.get("signal_type", "")
+
+                if signal_type == "buy" or "买入" in str(latest_signal):
+                    buy_count += 1
+                    score = 75
+                    signals.append(f"{ind_name}:买入")
+                elif signal_type == "sell" or "卖出" in str(latest_signal):
+                    sell_count += 1
+                    score = 25
+                    signals.append(f"{ind_name}:卖出")
+                else:
+                    score = 50
+
+                total_run += 1
+                factors.append(FactorItem(
+                    name=ind_name,
+                    value=str(latest_signal or "无信号"),
+                    score=score,
+                    status="ok",
+                ))
+
+        if total_run == 0:
+            return SkillReport(
+                skill_name=self.name,
+                score=50.0,
+                direction="neutral",
+                signal="指标执行未产生结果",
+                confidence=0.1,
+                factors=[FactorItem(name="指标", value="执行失败", score=50, status="missing")],
+                status="ok",
+            )
+
+        # 综合评分
+        if buy_count > sell_count:
+            final_score = 50 + (buy_count - sell_count) * 15
+            direction = "bullish"
+        elif sell_count > buy_count:
+            final_score = 50 - (sell_count - buy_count) * 15
+            direction = "bearish"
+        else:
+            final_score = 50
+            direction = "neutral"
+
+        final_score = max(0, min(100, final_score))
+        confidence = round(min(total_run / 3, 1.0), 2)
+
+        signal_text = ",".join(signals[:5]) if signals else "无信号"
+
+        return SkillReport(
+            skill_name=self.name,
+            score=float(final_score),
+            direction=direction,
+            signal=signal_text,
+            confidence=confidence,
+            factors=factors,
+            analysis=f"执行{total_run}个指标，买入信号{buy_count}个，卖出信号{sell_count}个",
+            status="ok",
+        )
