@@ -7,10 +7,13 @@ Indicator Agent — 用户自定义指标策略执行器。
 """
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
 
 from app.agent.chain.schema import FactorItem, SkillReport
 from app.agent.skills.registry import skill
+
+logger = logging.getLogger(__name__)
 
 
 @skill(
@@ -64,8 +67,8 @@ from app.agent.skills.registry import skill
     ),
     tools=[
         "list_indicators",
-        "get_indicator_params",
-        "run_indicator_signal",
+        # get_indicator_params / run_indicator_signal 由 algo_analyze 自行调用
+        #（需要先 list_indicators 获取 indicator_id）
     ],
     priority=7,
     default_weight=1.1,
@@ -78,6 +81,7 @@ class IndicatorAgent:
         stock_code: str,
         stock_name: str,
         tool_results: Dict[str, Any],
+        **kwargs,
     ) -> Optional[SkillReport]:
         """纯算法指标信号分析。
 
@@ -86,6 +90,11 @@ class IndicatorAgent:
           2. 逐个 run_indicator_signal 执行（最多 3 个）
           3. 汇总 buy/sell 信号
         """
+        call_tool_fn = kwargs.get("call_tool_fn")
+        _tool_calls = kwargs.get("_tool_calls")
+        _tool_nodes = kwargs.get("_tool_nodes")
+        _missing_data = kwargs.get("_missing_data")
+
         factors = []
         signals = []
         buy_count = 0
@@ -116,11 +125,28 @@ class IndicatorAgent:
             ind_id = ind.get("id")
             ind_name = ind.get("name", f"指标{ind_id}")
 
-            # run_indicator_signal 已经在 tool_results 中（由 BaseSkill 调用）
-            # 但 indicator_agent 的 tools 只有 list_indicators, get_indicator_params, run_indicator_signal
-            # run_indicator_signal 需要 indicator_id 参数，BaseSkill 默认调用时没有传
-            # 所以这里需要检查 tool_results 中是否有 run_indicator_signal 的结果
-            signal_result = tool_results.get("run_indicator_signal", {})
+            if not ind_id:
+                continue
+
+            # 自己调 run_indicator_signal，传入正确的 indicator_id
+            signal_result = None
+            if call_tool_fn:
+                try:
+                    signal_result = self.call_tool(
+                        "run_indicator_signal",
+                        call_tool_fn=call_tool_fn,
+                        indicator_id=ind_id,
+                        stock_code=stock_code,
+                        _tool_calls=_tool_calls,
+                        _tool_nodes=_tool_nodes,
+                        _missing_data=_missing_data,
+                    )
+                except Exception as e:
+                    logger.warning("[Skill:%s] run_indicator_signal(%d, %s) 失败: %s",
+                                   self.name, ind_id, stock_code, e)
+            else:
+                signal_result = tool_results.get("run_indicator_signal", {})
+
             if isinstance(signal_result, dict) and "error" not in signal_result:
                 latest_signal = signal_result.get("latest_signal", "")
                 signal_type = signal_result.get("signal_type", "")

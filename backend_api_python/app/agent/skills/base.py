@@ -140,6 +140,7 @@ class BaseSkill(ABC):
         stock_code: str,
         stock_name: str,
         tool_results: Dict[str, Any],
+        **kwargs,
     ) -> Optional["SkillReport"]:
         """纯算法分析。返回 SkillReport 则跳过 LLM，返回 None 走 LLM。
 
@@ -150,6 +151,7 @@ class BaseSkill(ABC):
             stock_code: 股票代码
             stock_name: 股票名称
             tool_results: 工具返回数据 {tool_name: result}
+            **kwargs: 预留参数（如 call_tool_fn，供需要自行调工具的子类使用）
 
         Returns:
             SkillReport 或 None
@@ -207,7 +209,13 @@ class BaseSkill(ABC):
             )
 
         # Step 2: 算法引擎（algo 优先，0 token）
-        algo_report = self.algo_analyze(stock_code, stock_name, tool_results)
+        algo_report = self.algo_analyze(
+            stock_code, stock_name, tool_results,
+            call_tool_fn=call_tool_fn,
+            _tool_calls=_tool_calls,
+            _tool_nodes=_tool_nodes,
+            _missing_data=_missing_data,
+        )
         if algo_report is not None:
             # 算法搞定，跳过 LLM
             algo_report.tools_called = list(tool_results.keys())
@@ -259,6 +267,57 @@ class BaseSkill(ABC):
 
         return report
 
+    @staticmethod
+    def _resolve_tool_kwargs(tool_name: str, call_tool_fn: Callable, kwargs: dict) -> dict:
+        """过滤 stock_code：只传给真正需要它的工具。
+
+        三类工具的处理策略：
+          1. 有 stock_code / stock / symbol / code 参数 → 直接传（无需映射）
+          2. 第一参数是 keyword / query 且有 stock_code → 映射 stock_code → keyword/query
+          3. 其他（date / strategy_id / user_id 等市场级工具）→ 去掉 stock_code
+        """
+        if "stock_code" not in kwargs:
+            return kwargs
+
+        # 获取工具签名
+        param_names = []
+        try:
+            # call_tool_fn 闭包中提取 tool_map
+            for cell in getattr(call_tool_fn, '__closure__', None) or []:
+                try:
+                    tm = cell.cell_contents
+                    if isinstance(tm, dict):
+                        tool_obj = tm.get(tool_name)
+                        if tool_obj and hasattr(tool_obj, "forward"):
+                            import inspect
+                            sig = inspect.signature(tool_obj.forward)
+                            param_names = [p for p in sig.parameters if p != "self"]
+                            break
+                except (ValueError, TypeError):
+                    continue
+        except Exception:
+            pass
+
+        if not param_names:
+            return kwargs
+
+        mapped = dict(kwargs)
+
+        # 策略 1: 工具直接接受 stock_code 系列参数 → 保留
+        stock_aliases = {"stock_code", "stock", "symbol", "code", "stock_codes"}
+        if stock_aliases & set(param_names):
+            return mapped
+
+        # 策略 2: 第一参数是 keyword / query → 映射
+        first = param_names[0]
+        if first in ("keyword", "query", "search_query"):
+            mapped[first] = mapped.pop("stock_code")
+            return mapped
+
+        # 策略 3: 其他工具（市场级/date/strategy_id 等）→ 不传 stock_code
+        mapped.pop("stock_code", None)
+        return mapped
+
     def call_tool(
         self,
         tool_name: str,
@@ -273,6 +332,9 @@ class BaseSkill(ABC):
         注意：返回值是完整数据（给 LLM 分析用），
         但 EvalNode.output_data 只存摘要（1~10 条样本，给回溯/审查用）。
         """
+        # 参数名映射：stock_code → 工具实际参数名
+        kwargs = self._resolve_tool_kwargs(tool_name, call_tool_fn, kwargs)
+
         tool_node = EvalNode(
             layer=Layer.TOOL.value,
             name=tool_name,
@@ -284,7 +346,7 @@ class BaseSkill(ABC):
         try:
             result = call_tool_fn(tool_name, **kwargs)
         except TypeError as te:
-            # 工具不接受某些参数（如 stock_code），去掉后重试
+            # 工具不接受某些参数，去掉后重试
             if "stock_code" in kwargs and "stock_code" in str(te):
                 kwargs.pop("stock_code")
                 try:
@@ -374,8 +436,11 @@ class BaseSkill(ABC):
         except Exception as e:
             # 构建 prompt 失败时返回最小可用 prompt
             logger.warning("[Skill:%s] build_prompt 异常: %s, 使用最小 prompt", self.name, e)
+            instructions = self.instructions or self.description
+            if isinstance(instructions, (list, tuple)):
+                instructions = "\n".join(str(x) for x in instructions)
             return (
-                f"{self.instructions or self.description}\n\n"
+                f"{instructions}\n\n"
                 f"## 分析目标\n股票: {stock_name or stock_code}（{stock_code}）\n\n"
                 f"请基于你的专业知识进行分析，输出 JSON 格式结果。"
             )

@@ -74,6 +74,10 @@ def skill(
     """
     tools = tools or []
 
+    # normalize: 如果 instructions 因尾部逗号变成 tuple，还原为 str
+    if isinstance(instructions, (list, tuple)):
+        instructions = "\n".join(str(x) for x in instructions)
+
     def decorator(cls) -> Type[BaseSkill]:
         # 从装饰的类中提取 analyze 和 algo_analyze 方法（如果有）
         custom_analyze = cls.__dict__.get("analyze")

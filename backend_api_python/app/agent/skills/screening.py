@@ -58,7 +58,9 @@ from app.agent.skills.registry import skill
         "search_stocks", "get_screener_presets",
         "get_zt_pool", "get_dragon_tiger", "get_hot_rank",
         "get_limit_down", "get_broken_board", "get_market_overview",
-        "list_indicators", "run_indicator_signal", "review_stocks_with_indicator",
+        "list_indicators",
+        # run_indicator_signal / review_stocks_with_indicator 需要 indicator_id，
+        # 不适合 BaseSkill 默认的 stock_code 调用流程，由 indicator_agent 单独处理
         "get_realtime_quote", "agent_get_kline",
         "search_stock_by_name",
     ],

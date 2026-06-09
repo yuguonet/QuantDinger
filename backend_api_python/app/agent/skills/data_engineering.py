@@ -62,10 +62,10 @@ from app.agent.skills.registry import skill
 - signal: 一句话总结关键信号。
 - factors: 每个分析维度一行。包含你调用工具获取的所有关键数据点。""",
     tools=[
-        "workspace_save_script", "workspace_load_script", "workspace_list",
-        "workspace_write_file", "workspace_read_file", "workspace_edit_file",
-        "workspace_code_review", "workspace_exec_script",
-        "shell_exec", "run_background", "poll_task",
+        "workspace_list",
+        # workspace_save_script / workspace_write_file / workspace_edit_file 等
+        # 需要 path/name/content 等参数，不兼容 stock_code 调用模式。
+        # 由 algo_analyze 根据上下文自行调用。
         "agent_get_kline", "get_realtime_quote",
     ],
     priority=4,

@@ -78,6 +78,7 @@ class MarketDataSkill:
         stock_code: str,
         stock_name: str,
         tool_results: Dict[str, Any],
+        **kwargs,
     ) -> Optional[SkillReport]:
         """纯算法行情数据汇总。
 

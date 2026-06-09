@@ -45,10 +45,9 @@ def _get_actual_returns(
 ) -> Dict[str, Any]:
     """获取股票实际涨跌数据。"""
     try:
-        from app.data_sources.factory import DataSourceFactory
+        from app.agent.tools.data_tools import agent_get_kline
 
-        ds = DataSourceFactory.get_source(market)
-        klines = ds.get_kline(stock_code, timeframe="1D", days=10)
+        klines = agent_get_kline(stock_code, timeframe="1D", days=10, market=market)
         if not klines or len(klines) < 2:
             return {}
 

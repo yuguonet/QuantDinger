@@ -87,6 +87,7 @@ class MomentumTrackerSkill:
         stock_code: str,
         stock_name: str,
         tool_results: Dict[str, Any],
+        **kwargs,
     ) -> Optional[SkillReport]:
         """纯算法动量分析。
 
