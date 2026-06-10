@@ -696,6 +696,10 @@ class BackfillDB:
         final_count = len(final_synced)
         failed = [s for s in symbols if strip_market_prefix(s) not in final_synced]
 
+        # 补全 failed_reasons: 没被 _klines_to_records 处理到的 symbol 也要记录原因
+        for sym in failed:
+            failed_reasons.setdefault(sym, "未返回 kline 数据")
+
         if failed:
             logger.warning(
                 f"[同步] {self.source.name} 15m 完成，"
@@ -703,8 +707,7 @@ class BackfillDB:
                 f"同步 {final_count}/{total_symbols}，失败 {len(failed)}"
             )
             for sym in failed[:20]:
-                reason = failed_reasons.get(sym, "未返回 kline 数据")
-                logger.warning(f"  ✗ {sym}: {reason}")
+                logger.warning(f"  ✗ {sym}: {failed_reasons.get(sym, '未知')}")
             if len(failed) > 20:
                 logger.warning(f"  ... 共 {len(failed)} 只失败")
         else:
@@ -843,6 +846,10 @@ class BackfillDB:
         final_count = len(final_synced)
         failed = [s for s in symbols if strip_market_prefix(s) not in final_synced]
 
+        # 补全 failed_reasons: 没被处理到的 symbol 也要记录原因
+        for sym in failed:
+            failed_reasons.setdefault(sym, "未返回行情数据")
+
         if failed:
             logger.warning(
                 f"[同步] {self.source.name} 1D 完成，"
@@ -850,8 +857,7 @@ class BackfillDB:
                 f"同步 {final_count}/{total_symbols}，失败 {len(failed)}"
             )
             for sym in failed[:20]:
-                reason = failed_reasons.get(sym, "未返回行情")
-                logger.warning(f"  ✗ {sym}: {reason}")
+                logger.warning(f"  ✗ {sym}: {failed_reasons.get(sym, '未知')}")
             if len(failed) > 20:
                 logger.warning(f"  ... 共 {len(failed)} 只失败")
         else:

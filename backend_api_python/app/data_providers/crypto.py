@@ -229,3 +229,24 @@ def fetch_crypto_heatmap_coincap() -> List[Dict[str, Any]]:
     except Exception as e:
         logger.debug("CoinCap failed: %s", e)
         return []
+
+
+# ═══ 内存缓存 + refresh（scheduler 调用）═══
+
+_rt_crypto_prices = None
+_rt_crypto_heatmap = None
+
+def refresh_crypto_prices():
+    global _rt_crypto_prices
+    try:
+        _rt_crypto_prices = fetch_crypto_prices()
+    except Exception as e:
+        logger.warning("[refresh] refresh_crypto_prices 失败: %s", e)
+
+def refresh_crypto_heatmap():
+    global _rt_crypto_heatmap
+    try:
+        _rt_crypto_heatmap = fetch_crypto_heatmap_coingecko()
+    except Exception as e:
+        logger.warning("[refresh] refresh_crypto_heatmap 失败: %s", e)
+

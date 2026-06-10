@@ -8,9 +8,9 @@
     双刷新: 超时自动刷新 + refresh() 强制刷新
 
 用法:
-    from app.market_cn.china_market import get_china_macro, get_fear_greed
-    data = get_china_macro()
-    fg   = get_fear_greed()
+    from app.market_cn.china_market import get_fear_greed, get_hot_sectors
+    fg = get_fear_greed()
+    sectors = get_hot_sectors()
 """
 import pickle
 import os as _os
@@ -28,14 +28,11 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 _CACHE_CONFIG = {
-    "china_fg":                {"ttl": 1800,  "refresh": 1440},
-    "hot_sectors":             {"ttl": 600,   "refresh": 480},
     "sector_trend_industry":   {"ttl": 1800,  "refresh": 1440},
     "sector_trend_concept":    {"ttl": 1800,  "refresh": 1440},
     "sector_prediction":       {"ttl": 1800,  "refresh": 1440},
     "sector_cycle_industry":   {"ttl": 3600,  "refresh": 2880},
     "sector_cycle_concept":    {"ttl": 3600,  "refresh": 2880},
-    "china_macro":             {"ttl": 86400, "refresh": 72000},
 }
 
 _DEFAULT_CFG = {"ttl": 120, "refresh": 90}
@@ -137,9 +134,6 @@ def _get_lock(endpoint):
 def _do_fetch(endpoint):
     """根据 endpoint 调用对应的数据源拉取函数。"""
     fetchers = {
-        "china_macro":              _fetch_china_macro,
-        "china_fg":                 _fetch_fear_greed,
-        "hot_sectors":              _fetch_hot_sectors,
         "sector_trend_industry":    lambda: _fetch_sector_trend("industry"),
         "sector_trend_concept":     lambda: _fetch_sector_trend("concept"),
         "sector_prediction":        _fetch_sector_prediction,
@@ -218,65 +212,54 @@ def _warmup():
 #  对外 API — 上层直接拿缓存
 # ============================================================
 
-def get_china_macro() -> dict:
-    """国内宏观经济: GDP, CPI, PPI, PMI, M2, 社融, 进出口, LPR"""
-    data = cache_get("china_macro")
-    if data is not None:
-        return data
-    _refresh("china_macro", force=True)
-    return cache_get("china_macro") or {"code": 0, "msg": "获取失败", "data": {}}
-
-
 def get_fear_greed() -> dict:
     """A股市场贪婪恐惧指数 (7维度综合)"""
-    data = cache_get("china_fg")
-    if data is not None:
-        return data
-    _refresh("china_fg", force=True)
-    data = cache_get("china_fg")
-    return {"code": 1 if data else 0, "msg": "success", "data": data or {}}
+    if _rt_fear_greed is not None:           # ① 内存缓存
+        return _rt_fear_greed
+    try:                                      # ② 远端拉取
+        data = _fetch_fear_greed()
+        return {"code": 1 if data else 0, "msg": "success", "data": data or {}}
+    except Exception as e:
+        logger.error("fear_greed 失败: %s", e)
+        return {"code": 0, "msg": "获取失败", "data": {}}
 
 
 def get_hot_sectors(industry_limit=15, concept_limit=15) -> dict:
     """热门板块 & 概念板块实时分析"""
-    data = cache_get("hot_sectors")
-    if data is not None:
-        return data
-    _refresh("hot_sectors", force=True)
-    data = cache_get("hot_sectors")
-    return {"code": 1 if data else 0, "msg": "success", "data": data or {}}
+    if _rt_hot_sectors is not None:          # ① 内存缓存
+        return _rt_hot_sectors
+    try:                                      # ② 远端拉取
+        data = _fetch_hot_sectors()
+        return {"code": 1 if data else 0, "msg": "success", "data": data or {}}
+    except Exception as e:
+        logger.error("hot_sectors 失败: %s", e)
+        return {"code": 0, "msg": "获取失败", "data": {}}
 
 
 def get_sector_trend(board_type="industry") -> dict:
     """板块1个月趋势 + 6个月周期 + 预测"""
-    key = f"sector_trend_{board_type}"
-    data = cache_get(key)
-    if data is not None:
-        return data
-    _refresh(key, force=True)
-    data = cache_get(key)
-    return {"code": 1 if data else 0, "msg": "success", "data": data or {}}
+    _rt_max_sector_trend_days[board_type] = max(_rt_max_sector_trend_days.get(board_type, 0), 30)  # ① 峰值
+    cached = _rt_sector_trend.get(board_type)                          # ② 内存缓存
+    if cached:
+        return cached
+    data = _fetch_sector_trend(board_type)                             # ③ 远端 fallback
+    return {"code": 1, "msg": "success", "data": data or {}}
 
 
 def get_sector_prediction() -> dict:
     """今日热门板块预测"""
-    data = cache_get("sector_prediction")
-    if data is not None:
-        return data
-    _refresh("sector_prediction", force=True)
-    data = cache_get("sector_prediction")
-    return data or {"code": 0, "msg": "获取失败", "data": {}}
+    if _rt_sector_prediction is not None:    # ① 内存缓存
+        return _rt_sector_prediction
+    return _fetch_sector_prediction()        # ② 远端 fallback（已包装）
 
 
 def get_sector_cycle(board_type="industry") -> dict:
     """板块6个月周期分析"""
-    key = f"sector_cycle_{board_type}"
-    data = cache_get(key)
-    if data is not None:
-        return data
-    _refresh(key, force=True)
-    data = cache_get(key)
-    return data or {"code": 0, "msg": "获取失败", "data": {}}
+    _rt_max_sector_cycle_days[board_type] = max(_rt_max_sector_cycle_days.get(board_type, 0), 180)  # ① 峰值
+    cached = _rt_sector_cycle.get(board_type)                          # ② 内存缓存
+    if cached:
+        return cached
+    return _fetch_sector_cycle(board_type)                             # ③ 远端 fallback（已包装）
 
 
 def get_sector_stocks(board_code: str, limit=15) -> dict:
@@ -294,7 +277,12 @@ def get_sector_stocks(board_code: str, limit=15) -> dict:
 
 def get_sector_history(board_type="industry", days=30) -> dict:
     """板块历史排名数据"""
-    days = min(max(days, 1), 200)
+    global _rt_max_sector_history_days
+    _rt_max_sector_history_days = max(_rt_max_sector_history_days, days)  # ① 峰值
+    cached = _rt_sector_history.get(board_type)                           # ② 内存缓存
+    if cached:
+        return {"code": 1, "msg": "success", "count": len(cached), "data": cached}
+    days = min(max(days, 1), 200)                                         # ③ 原有逻辑
     try:
         from .sector_history import get_sector_history as _get_history
         rows = _get_history(board_type=board_type, days=days)
@@ -306,13 +294,20 @@ def get_sector_history(board_type="industry", days=30) -> dict:
 
 def get_emotion_history(hours=None, date=None) -> dict:
     """情绪指数历史数据（当天快照）"""
-    from .emotion import get_emotion_history as _get
+    if hours:
+        global _rt_max_emotion_history_hours
+        _rt_max_emotion_history_hours = max(_rt_max_emotion_history_hours, hours)  # ① 峰值
+    if _rt_emotion_history is not None:                                           # ② 内存缓存
+        return _rt_emotion_history
+    from .emotion import get_emotion_history as _get                              # ③ 原有逻辑
     return _get(hours=hours)
 
 
 def get_policy() -> dict:
     """AI政策解读 — 直接调用，由 news.py PostgreSQL 缓存管理"""
-    return _fetch_policy()
+    if _rt_policy is not None:               # ① 内存缓存
+        return _rt_policy
+    return _fetch_policy()                   # ② 原有逻辑
 
 
 # ============================================================
@@ -320,7 +315,7 @@ def get_policy() -> dict:
 # ============================================================
 
 def refresh(target="all") -> dict:
-    """强制刷新: 立即从远端拉取并更新缓存。"""
+    """强制刷新: 立即从远端拉取并更新文件缓存。"""
     all_endpoints = list(_CACHE_CONFIG.keys())
     targets = all_endpoints if target == "all" else [target]
     results = {}
@@ -345,14 +340,6 @@ def refresh(target="all") -> dict:
 # ============================================================
 #  数据源拉取函数（纯拉取，无缓存逻辑）
 # ============================================================
-
-def _fetch_china_macro() -> dict:
-    """市场情绪 — StockApi 情绪周期（涨跌停/大面大肉/上涨比例）"""
-    from .emotion import fetch_emotion_cycle
-    result = fetch_emotion_cycle()
-    # fetch_emotion_cycle 已完成快照采集，直接透传
-    return result
-
 
 def _fetch_fear_greed():
     from .fear_greed_index import fear_greed_index
@@ -468,3 +455,82 @@ def _fetch_policy() -> dict:
 
 # threading.Thread(target=_warmup, daemon=True).start()
 # threading.Thread(target=_bg_watchdog, daemon=True).start()
+
+
+# ═══ 内存缓存 + refresh（scheduler 调用）═══
+
+_rt_fear_greed = None
+_rt_hot_sectors = None
+_rt_sector_trend = {}       # {board_type: data}
+_rt_sector_prediction = None
+_rt_sector_cycle = {}       # {board_type: data}
+_rt_sector_history = {}     # {board_type: data}
+_rt_emotion_history = None
+_rt_policy = None
+
+_rt_max_sector_trend_days = {}    # {board_type: days}
+_rt_max_sector_cycle_days = {}    # {board_type: days}
+_rt_max_sector_history_days = 0   # 峰值记录
+_rt_max_emotion_history_hours = 0 # 峰值记录
+
+def refresh_fear_greed():
+    global _rt_fear_greed
+    try:
+        data = _fetch_fear_greed()
+        _rt_fear_greed = {"code": 1 if data else 0, "msg": "success", "data": data or {}}
+    except Exception as e:
+        logger.warning("[refresh] refresh_fear_greed 失败: %s", e)
+
+def refresh_hot_sectors():
+    global _rt_hot_sectors
+    try:
+        data = _fetch_hot_sectors()
+        _rt_hot_sectors = {"code": 1 if data else 0, "msg": "success", "data": data or {}}
+    except Exception as e:
+        logger.warning("[refresh] refresh_hot_sectors 失败: %s", e)
+
+def refresh_sector_trend(board_type="industry"):
+    global _rt_sector_trend
+    try:
+        data = _fetch_sector_trend(board_type)
+        _rt_sector_trend[board_type] = {"code": 1, "msg": "success", "data": data or {}}
+    except Exception as e:
+        logger.warning("[refresh] refresh_sector_trend(%s) 失败: %s", board_type, e)
+
+def refresh_sector_prediction():
+    global _rt_sector_prediction
+    try:
+        _rt_sector_prediction = _fetch_sector_prediction()
+    except Exception as e:
+        logger.warning("[refresh] refresh_sector_prediction 失败: %s", e)
+
+def refresh_sector_cycle(board_type="industry"):
+    global _rt_sector_cycle
+    try:
+        _rt_sector_cycle[board_type] = _fetch_sector_cycle(board_type)
+    except Exception as e:
+        logger.warning("[refresh] refresh_sector_cycle(%s) 失败: %s", board_type, e)
+
+def refresh_sector_history(board_type="industry"):
+    global _rt_sector_history, _rt_max_sector_history_days
+    try:
+        fetch_days = max(250, int(_rt_max_sector_history_days * 1.5))
+        _rt_sector_history[board_type] = get_sector_history(board_type, fetch_days)
+    except Exception as e:
+        logger.warning("[refresh] sector_history(%s) 失败: %s", board_type, e)
+
+def refresh_emotion_history():
+    global _rt_emotion_history, _rt_max_emotion_history_hours
+    try:
+        fetch_hours = max(48, int(_rt_max_emotion_history_hours * 1.5)) if _rt_max_emotion_history_hours > 0 else 48
+        _rt_emotion_history = get_emotion_history(hours=fetch_hours)
+    except Exception as e:
+        logger.warning("[refresh] emotion_history 失败: %s", e)
+
+def refresh_policy():
+    global _rt_policy
+    try:
+        _rt_policy = _fetch_policy()
+    except Exception as e:
+        logger.warning("[refresh] refresh_policy 失败: %s", e)
+

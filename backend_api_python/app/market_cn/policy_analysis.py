@@ -218,3 +218,24 @@ def policy_dashboard():
 
 if __name__ == "__main__":
     policy_dashboard()
+
+
+# ═══ 内存缓存 + refresh（scheduler 调用）═══
+
+_rt_financial_news = None
+_rt_macro_news = None
+
+def refresh_financial_news():
+    global _rt_financial_news
+    try:
+        _rt_financial_news = get_financial_news()
+    except Exception as e:
+        logger.warning("[refresh] refresh_financial_news 失败: %s", e)
+
+def refresh_macro_news():
+    global _rt_macro_news
+    try:
+        _rt_macro_news = get_macro_news()
+    except Exception as e:
+        logger.warning("[refresh] refresh_macro_news 失败: %s", e)
+

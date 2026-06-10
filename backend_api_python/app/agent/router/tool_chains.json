@@ -21,11 +21,8 @@
     ],
     "analyze+market": [
         {
-            "tool": "call_skill",
-            "args": {
-                "skill_name": "market_data_agent"
-            },
-            "desc": "行情数据专家（大盘/板块/资金流向）"
+            "tool": "python_interpreter",
+            "desc": ""
         }
     ],
     "analyze+indicator": [

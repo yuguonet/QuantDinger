@@ -411,5 +411,13 @@ def create_app(config_name='default'):
             start_eval_worker()
         except Exception as e:
             logger.warning(f"Chain eval worker not started: {e}")
+
+        # ── market_cn 数据刷新调度器 ─────────────────────────
+        try:
+            from app.market_cn.scheduler import start as start_market_cn_scheduler
+            start_market_cn_scheduler()
+        except Exception as e:
+            logger.warning(f"market_cn scheduler not started: {e}")
+
     return app
 

@@ -26,8 +26,8 @@
     trend = analyzer.full_analysis("industry")
 
     # 统一入口（带缓存，推荐）
-    from app.market_cn import get_china_macro, get_fear_greed, get_policy
-    macro = get_china_macro()  # 自动缓存
+    from app.market_cn import get_fear_greed, get_policy
+    fg = get_fear_greed()  # 自动缓存
 
     # 需要原始版（无缓存）直接从子模块导入
     from app.market_cn.sector_history import get_sector_trend
@@ -48,7 +48,6 @@ from .sector_history import (
     SectorHistoryScheduler,
 )
 from .china_market import (
-    get_china_macro,
     get_fear_greed,
     get_policy,
     get_hot_sectors,

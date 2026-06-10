@@ -1,4 +1,4 @@
-"""国内宏观数据卡片 — GDP/CPI/PPI/PMI/M2 + 贪婪恐惧 + 政策解读"""
+"""国内市场数据卡片 — 贪婪恐惧指数 + AI政策解读 + 板块历史趋势"""
 from ._base import CardMeta, register
 
 meta = CardMeta(
@@ -12,18 +12,13 @@ meta = CardMeta(
 
 
 def fetch():
-    from app.market_cn.china_market import get_china_macro, get_fear_greed, get_policy
+    from app.market_cn.china_market import get_fear_greed, get_policy
     from app.market_cn.sector_history import get_sector_history as _get_sector_history
 
-    macro = {}
     fear_greed = {}
     policy = {}
     sector_history = {}
 
-    try:
-        macro = get_china_macro() or {}
-    except Exception:
-        pass
     try:
         fear_greed = get_fear_greed() or {}
     except Exception:
@@ -38,7 +33,6 @@ def fetch():
         pass
 
     return {
-        "macro": macro,
         "fearGreed": fear_greed,
         "policy": policy,
         "sectorHistory": sector_history,

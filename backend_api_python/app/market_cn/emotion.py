@@ -72,12 +72,10 @@ def _clean_old():
 # ══════════════════════════════════════════════════════════════
 
 def fetch_emotion_cycle() -> Dict[str, Any]:
-    """拉取最新情绪数据 + 追加快照到当天缓存。
-
-    Returns:
-        {"code": 1, "data": {"emotion": {...}, "history_days": N}, "snapshots": [...]}
-    """
-    try:
+    """拉取最新情绪数据 + 追加快照到当天缓存。"""
+    if _rt_emotion_cycle is not None:        # ① 内存缓存
+        return _rt_emotion_cycle
+    try:                                      # ② 远端 fallback
         r = requests.get(_SOURCE_URL, headers={"User-Agent": _UA}, timeout=10)
         d = r.json()
         if d.get("code") != 20000:
@@ -149,10 +147,25 @@ def get_emotion_history(days: int = 1, hours: Optional[int] = None) -> Dict[str,
 
 def get_emotion_latest() -> Dict[str, Any]:
     """获取当天最新一条情绪快照。"""
-    today = datetime.now().strftime("%Y-%m-%d")
+    if _rt_emotion_cycle is not None:        # ① 内存缓存
+        return {"code": 1, "emotion": _rt_emotion_cycle, "count": 1}
+    today = datetime.now().strftime("%Y-%m-%d")  # ② 原有逻辑
     with _lock:
         _load()
         day_list = _snapshots.get(today, [])
         if day_list:
             return {"code": 1, "emotion": day_list[-1], "count": len(day_list)}
     return {"code": 0, "msg": "暂无数据", "emotion": {}, "count": 0}
+
+
+# ═══ 内存缓存 + refresh（scheduler 调用）═══
+
+_rt_emotion_cycle = None
+
+def refresh_emotion_cycle():
+    global _rt_emotion_cycle
+    try:
+        _rt_emotion_cycle = fetch_emotion_cycle()
+    except Exception as e:
+        logger.warning("[refresh] refresh_emotion_cycle 失败: %s", e)
+

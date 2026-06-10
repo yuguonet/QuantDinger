@@ -426,3 +426,16 @@ def fetch_commodities() -> List[Dict[str, Any]]:
             output.append(_make_default(c))
 
     return output
+
+
+# ═══ 内存缓存 + refresh（scheduler 调用）═══
+
+_rt_commodities = None
+
+def refresh_commodities():
+    global _rt_commodities
+    try:
+        _rt_commodities = fetch_commodities()
+    except Exception as e:
+        logger.warning("[refresh] refresh_commodities 失败: %s", e)
+

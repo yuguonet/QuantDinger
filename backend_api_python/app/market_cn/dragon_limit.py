@@ -310,19 +310,21 @@ def _ak_hot_rank() -> List[Dict[str, Any]]:
 
 def get_dragon_tiger(start_date: str = "", end_date: str = "") -> List[Dict[str, Any]]:
     """获取龙虎榜数据。HTTP 东财搜索优先，AkShare 兜底。"""
-    # HTTP 优先
-    data = _em_search("龙虎榜", 200)
+    if _rt_dragon_tiger is not None:         # ① 内存缓存
+        return _rt_dragon_tiger
+    data = _em_search("龙虎榜", 200)        # ② 远端 fallback
     if data:
         logger.info("[HTTP] dragon_tiger: %d stocks", len(data))
         return data
-    # AkShare 兜底
     logger.info("[HTTP] dragon_tiger 无结果，回退 AkShare")
     return _ak_dragon_tiger(start_date, end_date)
 
 
 def get_zt_pool(trade_date: str = "") -> List[Dict[str, Any]]:
     """获取涨停池。HTTP 东财搜索优先，AkShare 兜底。"""
-    data = _em_search("涨停", 200)
+    if _rt_zt_pool is not None:              # ① 内存缓存
+        return _rt_zt_pool
+    data = _em_search("涨停", 200)          # ② 远端 fallback
     if data:
         logger.info("[HTTP] zt_pool: %d stocks", len(data))
         return data
@@ -332,7 +334,9 @@ def get_zt_pool(trade_date: str = "") -> List[Dict[str, Any]]:
 
 def get_dt_pool(trade_date: str = "") -> List[Dict[str, Any]]:
     """获取跌停池。HTTP 东财搜索优先，AkShare 兜底。"""
-    data = _em_search("跌停", 200)
+    if _rt_dt_pool is not None:              # ① 内存缓存
+        return _rt_dt_pool
+    data = _em_search("跌停", 200)          # ② 远端 fallback
     if data:
         logger.info("[HTTP] dt_pool: %d stocks", len(data))
         return data
@@ -342,7 +346,9 @@ def get_dt_pool(trade_date: str = "") -> List[Dict[str, Any]]:
 
 def get_broken_board(trade_date: str = "") -> List[Dict[str, Any]]:
     """获取炸板池。HTTP 东财搜索优先，AkShare 兜底。"""
-    data = _em_search("炸板", 200)
+    if _rt_broken_board is not None:         # ① 内存缓存
+        return _rt_broken_board
+    data = _em_search("炸板", 200)          # ② 远端 fallback
     if data:
         logger.info("[HTTP] broken_board: %d stocks", len(data))
         return data
@@ -352,9 +358,56 @@ def get_broken_board(trade_date: str = "") -> List[Dict[str, Any]]:
 
 def get_hot_rank() -> List[Dict[str, Any]]:
     """获取热榜。HTTP 东财搜索优先，AkShare 兜底。"""
-    data = _em_search("热门股票", 100)
+    if _rt_hot_rank is not None:             # ① 内存缓存
+        return _rt_hot_rank
+    data = _em_search("热门股票", 100)       # ② 远端 fallback
     if data:
         logger.info("[HTTP] hot_rank: %d stocks", len(data))
         return data
     logger.info("[HTTP] hot_rank 无结果，回退 AkShare")
     return _ak_hot_rank()
+
+
+# ═══ 内存缓存 + refresh（scheduler 调用）═══
+
+_rt_dragon_tiger = None
+_rt_zt_pool = None
+_rt_dt_pool = None
+_rt_broken_board = None
+_rt_hot_rank = None
+
+def refresh_dragon_tiger():
+    global _rt_dragon_tiger
+    try:
+        _rt_dragon_tiger = get_dragon_tiger()
+    except Exception as e:
+        logger.warning("[refresh] refresh_dragon_tiger 失败: %s", e)
+
+def refresh_zt_pool():
+    global _rt_zt_pool
+    try:
+        _rt_zt_pool = get_zt_pool()
+    except Exception as e:
+        logger.warning("[refresh] refresh_zt_pool 失败: %s", e)
+
+def refresh_dt_pool():
+    global _rt_dt_pool
+    try:
+        _rt_dt_pool = get_dt_pool()
+    except Exception as e:
+        logger.warning("[refresh] refresh_dt_pool 失败: %s", e)
+
+def refresh_broken_board():
+    global _rt_broken_board
+    try:
+        _rt_broken_board = get_broken_board()
+    except Exception as e:
+        logger.warning("[refresh] refresh_broken_board 失败: %s", e)
+
+def refresh_hot_rank():
+    global _rt_hot_rank
+    try:
+        _rt_hot_rank = get_hot_rank()
+    except Exception as e:
+        logger.warning("[refresh] refresh_hot_rank 失败: %s", e)
+

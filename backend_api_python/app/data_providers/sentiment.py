@@ -845,3 +845,56 @@ def get_sentiment_data(timeout: int = 10) -> Dict[str, Any]:
         "vix_term":    results.get("vix_term")    or {"value": 1.0, "level": "unknown", "source": "default"},
         "fetched_at":  now,
     }
+
+
+# ═══ 内存缓存 + refresh（scheduler 调用）═══
+
+_rt_vix = None
+_rt_dollar_index = None
+_rt_yield_curve = None
+_rt_fear_greed_index = None
+_rt_put_call_ratio = None
+_rt_sentiment_data = None
+
+def refresh_vix():
+    global _rt_vix
+    try:
+        _rt_vix = fetch_vix()
+    except Exception as e:
+        logger.warning("[refresh] refresh_vix 失败: %s", e)
+
+def refresh_dollar_index():
+    global _rt_dollar_index
+    try:
+        _rt_dollar_index = fetch_dollar_index()
+    except Exception as e:
+        logger.warning("[refresh] refresh_dollar_index 失败: %s", e)
+
+def refresh_yield_curve():
+    global _rt_yield_curve
+    try:
+        _rt_yield_curve = fetch_yield_curve()
+    except Exception as e:
+        logger.warning("[refresh] refresh_yield_curve 失败: %s", e)
+
+def refresh_fear_greed_index():
+    global _rt_fear_greed_index
+    try:
+        _rt_fear_greed_index = fetch_fear_greed_index()
+    except Exception as e:
+        logger.warning("[refresh] refresh_fear_greed_index 失败: %s", e)
+
+def refresh_put_call_ratio():
+    global _rt_put_call_ratio
+    try:
+        _rt_put_call_ratio = fetch_put_call_ratio()
+    except Exception as e:
+        logger.warning("[refresh] refresh_put_call_ratio 失败: %s", e)
+
+def refresh_sentiment_data():
+    global _rt_sentiment_data
+    try:
+        _rt_sentiment_data = get_sentiment_data()
+    except Exception as e:
+        logger.warning("[refresh] refresh_sentiment_data 失败: %s", e)
+

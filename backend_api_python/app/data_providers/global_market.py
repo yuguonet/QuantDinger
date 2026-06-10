@@ -352,3 +352,40 @@ def refresh(target="all") -> dict:
                 results[key] = f"error: {e}"
 
     return results
+
+
+# ═══ 内存缓存 + refresh（scheduler 调用）═══
+
+_rt_global_sentiment = None
+_rt_global_indices = None
+_rt_global_heatmap = None
+_rt_global_news = None
+
+def refresh_global_sentiment():
+    global _rt_global_sentiment
+    try:
+        _rt_global_sentiment = get_sentiment()
+    except Exception as e:
+        logger.warning("[refresh] refresh_global_sentiment 失败: %s", e)
+
+def refresh_global_indices():
+    global _rt_global_indices
+    try:
+        _rt_global_indices = get_indices()
+    except Exception as e:
+        logger.warning("[refresh] refresh_global_indices 失败: %s", e)
+
+def refresh_global_heatmap():
+    global _rt_global_heatmap
+    try:
+        _rt_global_heatmap = get_heatmap()
+    except Exception as e:
+        logger.warning("[refresh] refresh_global_heatmap 失败: %s", e)
+
+def refresh_global_news():
+    global _rt_global_news
+    try:
+        _rt_global_news = get_news()
+    except Exception as e:
+        logger.warning("[refresh] refresh_global_news 失败: %s", e)
+

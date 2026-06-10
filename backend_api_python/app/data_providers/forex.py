@@ -462,3 +462,16 @@ def fetch_forex_pairs() -> List[Dict[str, Any]]:
             })
 
     return output
+
+
+# ═══ 内存缓存 + refresh（scheduler 调用）═══
+
+_rt_forex_pairs = None
+
+def refresh_forex_pairs():
+    global _rt_forex_pairs
+    try:
+        _rt_forex_pairs = fetch_forex_pairs()
+    except Exception as e:
+        logger.warning("[refresh] refresh_forex_pairs 失败: %s", e)
+

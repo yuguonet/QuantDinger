@@ -311,6 +311,57 @@ def _fetch_sina_industry_boards(limit=30):
         return []
 
 
+def _fetch_sina_concept_boards(limit=30):
+    """新浪概念板块（备用数据源）
+
+    数据来源: https://money.finance.sina.com.cn/q/view/newFLJK.php?param=class
+    返回 gn_ 前缀的概念板块，共约 175 个。
+
+    数据格式 (13字段):
+      [0]code,[1]name,[2]stock_count,[3]avg_price,[4]change_pct,[5]change_ratio,
+      [6]volume,[7]amount,[8]lead_code,[9]lead_pct,[10]lead_price,[11]lead_change,[12]lead_name
+
+    注意: change_pct[4] 和 lead_pct[9] 已经是百分比，不需要乘100。
+    """
+    url = "https://money.finance.sina.com.cn/q/view/newFLJK.php?param=class"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp.encoding = "gbk"
+        text = resp.text
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start < 0 or end <= 0:
+            logger.warning("新浪概念板块接口返回格式异常")
+            return []
+        data = json.loads(text[start:end])
+        results = []
+        for key, val in data.items():
+            if not key.startswith("gn_"):
+                continue
+            parts = val.split(",")
+            if len(parts) < 13:
+                continue
+            change_pct = _safe_num(parts[4])  # 已是百分比
+            results.append({
+                "name": parts[1],
+                "code": parts[0],
+                "change_pct": round(change_pct, 2),
+                "price": _safe_num(parts[3]),
+                "amount": _safe_num(parts[7]),
+                "up_count": 0,
+                "down_count": 0,
+                "lead_stock": parts[12],
+                "lead_stock_pct": round(_safe_num(parts[9]), 2),
+                "limit_up_count": 0,
+                "stock_count": int(_safe_num(parts[2])),
+            })
+        results.sort(key=lambda x: -x["change_pct"])
+        return results[:limit]
+    except Exception as e:
+        logger.error("新浪概念板块获取失败: %s", e)
+        return []
+
+
 def get_all_hot_sectors(industry_limit=15, concept_limit=15):
     """获取全部热门板块数据（供 API 使用）
 
@@ -335,11 +386,19 @@ def get_all_hot_sectors(industry_limit=15, concept_limit=15):
         except Exception as e:
             logger.error("东财行业板块获取失败: %s", e)
 
-    # 概念板块：新浪无此接口，只能走东财
+    # ③ 概念板块：优先新浪
     try:
-        concept = get_hot_concept_boards(concept_limit)
+        concept = _fetch_sina_concept_boards(concept_limit)
     except Exception as e:
-        logger.error("概念板块获取失败: %s", e)
+        logger.error("新浪概念板块获取失败: %s", e)
+
+    # ④ 新浪概念失败时降级到东财
+    if not concept:
+        logger.info("新浪概念板块为空，降级到东财")
+        try:
+            concept = get_hot_concept_boards(concept_limit)
+        except Exception as e:
+            logger.error("东财概念板块获取失败: %s", e)
 
     # 综合分析
     analysis = _build_sector_analysis(industry, concept)

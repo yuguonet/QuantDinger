@@ -6,7 +6,7 @@ market_cn 数据桥接层 — 对外输出格式与 global_market 完全一致
   - fetch_sentiment()       → plugin_api._fetch_sentiment_inproc() 的输出格式
   - fetch_overview()        → plugin_api._fetch_overview_inproc() 的输出格式
 
-数据源: market_cn 内部的 get_fear_greed / get_china_macro / get_hot_sectors
+数据源: market_cn 内部的 get_fear_greed / get_hot_sectors
 缓存:   复用 china_market.py 的文件缓存，不再额外建缓存层
 """
 
@@ -25,14 +25,13 @@ logger = logging.getLogger(__name__)
 
 def get_macro_data() -> Dict[str, Any]:
     """
-    A股宏观数据 → 与 global_market.get_sentiment() 同格式输出
+    A股市场数据 → 与 global_market.get_sentiment() 同格式输出
 
     映射关系:
       A股贪恐指数  → FEAR_GREED
-      宏观经济     → CN_MACRO
       热门板块     → CN_HOT_SECTORS
     """
-    from .china_market import get_fear_greed, get_china_macro, get_hot_sectors
+    from .china_market import get_fear_greed, get_hot_sectors
 
     result: Dict[str, Any] = {}
 
@@ -51,22 +50,6 @@ def get_macro_data() -> Dict[str, Any]:
             }
     except Exception as e:
         logger.warning("market_cn fear_greed failed: %s", e)
-
-    # 宏观经济 → CN_MACRO
-    try:
-        macro_resp = get_china_macro()
-        macro = macro_resp.get("data") or {}
-        if macro:
-            result["CN_MACRO"] = {
-                "name": "中国宏观经济",
-                "description": "GDP/CPI/PPI/PMI/M2/LPR/社融/进出口",
-                "price": 0,
-                "change": 0,
-                "changePercent": 0,
-                "data": macro,
-            }
-    except Exception as e:
-        logger.warning("market_cn china_macro failed: %s", e)
 
     # 热门板块 → CN_HOT_SECTORS
     try:

@@ -110,7 +110,6 @@ def market_data():
 # ############################################################
 
 from app.market_cn.china_market import (
-    get_china_macro,
     get_fear_greed,
     get_policy,
     get_hot_sectors as _get_hot_sectors,
@@ -122,15 +121,6 @@ from app.market_cn.china_market import (
     get_emotion_history as _get_emotion_history,
     refresh as refresh_cn,
 )
-
-
-@shichang_bp.route('/china-macro')
-def china_macro():
-    try:
-        return _make_resp(get_china_macro())
-    except Exception as e:
-        logger.error("china-macro 失败: %s", e)
-        return _make_resp({"code": 0, "msg": "获取失败", "data": {}})
 
 
 @shichang_bp.route('/china-fear-greed')

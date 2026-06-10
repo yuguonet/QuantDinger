@@ -538,26 +538,12 @@ def _kline_baostock(code: str, days: int) -> Optional[pd.DataFrame]:
 # ══════════════════════════════════════════════════════════════
 
 def get_index_realtime(codes: Optional[List[str]] = None) -> List[Dict[str, Any]]:
-    """获取指数实时行情（自动降级）
-
-    依次尝试 mootdx → 腾讯 → AKShare，第一个成功即返回。
-
-    Args:
-        codes: 指数代码列表。默认为 None 时查询 INDEX_CODES 中全部 11 个指数。
-
-    Returns:
-        成功: [{code, name, price, open, high, low, last_close,
-                change, change_percent, volume, amount}, ...]
-        失败: []（空列表，所有数据源都失败）
-
-    Example:
-        >>> get_index_realtime()  # 查询全部指数
-        >>> get_index_realtime(["000001", "000300"])  # 只查上证和沪深300
-    """
-    if codes is None:
+    """获取指数实时行情（自动降级）"""
+    if _rt_idx_realtime is not None:         # ① 内存缓存
+        return _rt_idx_realtime
+    if codes is None:                        # ② 原有逻辑
         codes = list(INDEX_CODES.keys())
 
-    # 三级降级: mootdx → 腾讯 → AKShare
     for fetcher in (_rt_mootdx, _rt_tencent, _rt_akshare):
         data = fetcher(codes)
         if data:
@@ -584,7 +570,12 @@ def get_index_daily_kline(code: str = "000001", days: int = 200) -> List[Dict[st
     Example:
         >>> get_index_daily_kline("000300", 60)  # 沪深300最近60个交易日
     """
-    for fetcher in (_kline_mootdx, _kline_tencent, _kline_sina, _kline_baostock):
+    global _rt_max_idx_daily_days
+    _rt_max_idx_daily_days = max(_rt_max_idx_daily_days, days)       # ① 峰值
+    cached = _rt_idx_daily.get(code)                 # ② 内存缓存
+    if cached and len(cached) >= days:
+        return cached[:days]
+    for fetcher in (_kline_mootdx, _kline_tencent, _kline_sina, _kline_baostock):  # ③ 远端 fallback
         df = fetcher(code, days)
         if df is not None and not df.empty:
             df = df.loc[:, ~df.columns.duplicated()]
@@ -693,6 +684,8 @@ def get_northbound_realtime() -> Dict[str, Any]:
         >>> nb = get_northbound_realtime()
         >>> print(f"北向合计: {nb['total_latest_yi']:.2f} 亿")
     """
+    if _rt_nb_realtime is not None:          # ① 内存缓存
+        return _rt_nb_realtime
     import urllib.request
 
     url = "https://data.hexin.cn/market/hsgtApi/method/dayChart/"
@@ -770,6 +763,11 @@ def get_northbound_daily(days: int = 120) -> List[Dict[str, Any]]:
         >>> for d in data[-5:]:
         ...     print(f"{d['date']}: 合计 {d['total_yi']:.2f} 亿")
     """
+    global _rt_max_nb_daily_days
+    _rt_max_nb_daily_days = max(_rt_max_nb_daily_days, days)
+    if _rt_nb_daily and len(_rt_nb_daily) >= days:
+        return _rt_nb_daily[:days]
+
     # 数据源1: AKShare
     # 注意: stock_hsgt_north_net_flow_in_em 已在 akshare >=1.14 中移除
     # 改用 stock_hsgt_hist_em 分别获取沪股通/深股通历史数据后合并
@@ -911,6 +909,11 @@ def get_northbound_holdings(top: int = 50) -> List[Dict[str, Any]]:
         >>> for h in top10:
         ...     print(f"{h['name']}: {h['hold_market']/1e8:.0f}亿 占比{h['hold_ratio']}%")
     """
+    global _rt_max_nb_holdings_top
+    _rt_max_nb_holdings_top = max(_rt_max_nb_holdings_top, top)
+    if _rt_nb_holdings and len(_rt_nb_holdings) >= top:
+        return _rt_nb_holdings[:top]
+
     import urllib.request
 
     url = "https://data.hexin.cn/market/hsgtApi/dayKline/"
@@ -1323,6 +1326,8 @@ def get_market_fund_flow_realtime() -> Dict[str, Any]:
         >>> if flow.get("main_net", 0) > 0:
         ...     print(f"主力净流入 {flow['main_net']/1e8:.2f} 亿")
     """
+    if _rt_mf_realtime is not None:          # ① 内存缓存
+        return _rt_mf_realtime
     global _fund_flow_cache, _fund_flow_cache_ts
     import time
     now = time.time()
@@ -1428,7 +1433,11 @@ def get_market_fund_flow_daily(days: int = 120) -> List[Dict[str, Any]]:
         >>> for d in data[-5:]:
         ...     print(f"{d['date']}: 主力 {d['main_net']/1e8:.2f} 亿")
     """
-    data = _mkt_flow_daily_eastmoney(days)
+    global _rt_max_mf_daily_days
+    _rt_max_mf_daily_days = max(_rt_max_mf_daily_days, days)  # ① 峰值
+    if _rt_mf_daily and len(_rt_mf_daily) >= days:            # ② 内存缓存
+        return _rt_mf_daily[:days]
+    data = _mkt_flow_daily_eastmoney(days)                    # ③ 远端 fallback
     if data:
         return data
 
@@ -1649,6 +1658,8 @@ def get_sector_fund_flow(indicator: str = "今日") -> List[Dict[str, Any]]:
         >>> for s in sectors[:5]:
         ...     print(f"{s['name']}: 主力 {s['main_net']/1e8:.2f} 亿")
     """
+    if _rt_sector_flow is not None:          # ① 内存缓存
+        return _rt_sector_flow
     if indicator not in ("今日", "3日", "5日", "10日"):
         logger.warning("不支持的统计周期: %s，使用'今日'", indicator)
         indicator = "今日"
@@ -1667,3 +1678,84 @@ def get_sector_fund_flow(indicator: str = "今日") -> List[Dict[str, Any]]:
 
     logger.error("所有数据源获取行业资金流均失败")
     return []
+
+
+# ═══ 内存缓存 + refresh（scheduler 调用）═══
+
+_rt_idx_realtime = None
+_rt_idx_daily = {}            # {code: [kline_data]}
+_rt_nb_realtime = None
+_rt_nb_daily = None
+_rt_nb_holdings = None
+_rt_mf_realtime = None
+_rt_mf_daily = None
+_rt_sector_flow = None
+
+_rt_max_idx_daily_days = 0
+_rt_max_nb_daily_days = 0
+_rt_max_nb_holdings_top = 0
+_rt_max_mf_daily_days = 0
+
+def refresh_index_realtime():
+    global _rt_idx_realtime
+    try:
+        _rt_idx_realtime = get_index_realtime()
+    except Exception as e:
+        logger.warning("[refresh] refresh_index_realtime 失败: %s", e)
+
+def refresh_index_daily_kline():
+    global _rt_idx_daily, _rt_max_idx_daily_days
+    try:
+        fetch_days = max(500, int(_rt_max_idx_daily_days * 1.5))
+        for code in INDEX_CODES:
+            data = get_index_daily_kline(code, fetch_days)
+            if data:
+                _rt_idx_daily[code] = data
+    except Exception as e:
+        logger.warning("[refresh] index_daily_kline 失败: %s", e)
+
+def refresh_northbound_realtime():
+    global _rt_nb_realtime
+    try:
+        _rt_nb_realtime = get_northbound_realtime()
+    except Exception as e:
+        logger.warning("[refresh] refresh_northbound_realtime 失败: %s", e)
+
+def refresh_northbound_daily():
+    global _rt_nb_daily, _rt_max_nb_daily_days
+    try:
+        fetch_days = max(250, int(_rt_max_nb_daily_days * 1.5))
+        _rt_nb_daily = get_northbound_daily(fetch_days)
+    except Exception as e:
+        logger.warning("[refresh] northbound_daily 失败: %s", e)
+
+def refresh_northbound_holdings():
+    global _rt_nb_holdings, _rt_max_nb_holdings_top
+    try:
+        fetch_top = max(100, int(_rt_max_nb_holdings_top * 1.5))
+        _rt_nb_holdings = get_northbound_holdings(fetch_top)
+    except Exception as e:
+        logger.warning("[refresh] northbound_holdings 失败: %s", e)
+
+def refresh_market_fund_flow_realtime():
+    global _rt_mf_realtime
+    try:
+        _rt_mf_realtime = get_market_fund_flow_realtime()
+    except Exception as e:
+        logger.warning("[refresh] refresh_market_fund_flow_realtime 失败: %s", e)
+
+def refresh_market_fund_flow_daily():
+    global _rt_mf_daily, _rt_max_mf_daily_days
+    try:
+        fetch_days = max(250, int(_rt_max_mf_daily_days * 1.5))
+        _rt_mf_daily = get_market_fund_flow_daily(fetch_days)
+    except Exception as e:
+        logger.warning("[refresh] market_fund_flow_daily 失败: %s", e)
+
+def refresh_sector_fund_flow():
+    global _rt_sector_flow
+    try:
+        _rt_sector_flow = get_sector_fund_flow()
+    except Exception as e:
+        logger.warning("[refresh] refresh_sector_fund_flow 失败: %s", e)
+
