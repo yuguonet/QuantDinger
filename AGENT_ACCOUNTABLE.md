@@ -1,10 +1,12 @@
 # Agent + 可追责 架构设计
 
-> 日期: 2026-06-09
-> 状态: Phase 1 实施中（已修复 5 个集成缺陷）
+> 日期: 2026-06-09（初版）→ 2026-06-10（补充关键设计细节）
 > 适用范围: 仅 domain="finance" 金融领域，其他领域保持 DESIGN_RESTRUCTURE.md 架构
 > 替代: DESIGN_RESTRUCTURE.md（算法化路线，已废弃，保留只读参考）
-> 继承: AGENT_REDESIGN.md（三层追责体系）+ 现有 agent.py（smolagents CodeAgent）
+> 继承: AGENT_REDESIGN.md（三层追责体系）+ 现有 agent.py（smolagents）
+> 
+> ⚠️ 本文档定位：**设计蓝图**。实施状态见 Git 提交记录。
+> 万一调坏了，从本文档恢复设计意图，不依赖代码注释。
 
 ## 一、设计原则
 
@@ -960,65 +962,14 @@ Agent 的 instructions 中注入以下信息，帮助它做出更好的决策：
 > 
 > 适用范围：仅 `domain="finance"` 金融领域。其他领域保持 DESIGN_RESTRUCTURE.md 架构不变。
 
-### Phase 1: 全量交付（3~5 天）
+### Phase 1 实施状态
 
-#### 1.1 数据库（半天）
-- [x] 新建 `qd_traces` 表（替代 qd_evaluations，新结构含 timeframe / exit_date / pnl_pct / hold_days）
-- [x] 新建 `qd_skill_weights` 表（含出厂权重 INSERT）
-- [x] 重建 `qd_factor_weights` 表（含出厂权重 INSERT，按单位时间收益率设计）
-- [x] 旧表 `qd_evaluations` 保留只读，不迁移数据
+全部组件已实现，集成缺陷已修复。
 
-#### 1.2 Schema 改动（半天）
-- [x] `chain/schema.py` — EvalNode 加 `timeframe` 字段
-- [x] `chain/schema.py` — EvalNode 加 `exit_date` / `exit_reason` / `pnl_pct` / `hold_days` 字段（替代旧 actual_return_* 系列）
-- [x] `chain/schema.py` — 删除旧 `actual_return_1d/3d/5d` / `actual_direction_3d` / `correct_3d` 字段
-
-#### 1.3 TraceCollector + TracedTool（1天）
-- [x] 新建 `agent/trace_collector.py` — TraceCollector 类（JSON 优先提取，正则 fallback）
-- [x] 新建 `agent/traced_tool.py` — TracedTool 包装类
-
-#### 1.4 标准化输出（半天）
-- [x] `agent.py` — `_build_instructions` 加 JSON 输出规范（仅 domain=finance）
-- [x] `agent.py` — `_check_output_json` 校验函数（替换旧 `_check_dashboard_json`）
-- [x] `agent.py` — `format_decision_card` 格式化函数
-- [x] `agent.py` — final_answer → JSON 校验 → 格式化卡片 → 返回用户
-- [ ] 删除 agent.py 中的"金融领域标准化输出"事后硬解析代码
-
-#### 1.5 Agent 注入（1天）
-- [x] `agent.py` — 金融领域注入 TraceCollector，工具用 TracedTool 包装
-- [x] `agent.py` — 非金融领域走原 `_try_chain` 路径（不动）
-- [x] `agent.py` — `_build_instructions` 注入历史权重信息（仅 domain=finance）
-- [x] `skills/call_skill_tool.py` — 适配 TraceCollector
-
-#### 1.6 回溯评估引擎（1天）
-- [x] `chain/evaluator.py` — 重写，纯 SQL + 数学，0 token，不涉及 agent
-- [x] `chain/evaluator.py` — `evaluate_pending()` 按 timeframe 取行情验证
-- [x] `chain/evaluator.py` — `calc_skill_weight()` 按单位时间收益率计算权重
-- [x] `chain/evaluator.py` — `calc_factor_weight()` 同逻辑
-- [x] `chain/evaluator.py` — 时间衰减（近期交易权重更高）
-- [x] 盘后定时任务：evaluate_pending → update_weights
-- [x] `chain/store.py` — 新增 qd_traces 的 save_tree / load_tree / query
-
-#### 1.7 清理旧代码（半天）
-- [x] 删除 `agent/planner.py`
-- [x] 删除 `agent/chain/executor.py`
-- [x] 清理 `agent.py` 中的 `_try_chain`（仅金融领域分支，非金融保留）
-- [ ] 清理 `agent.py` 中的 `_save_freeform_to_db`、`_infer_skill_name`
-- [ ] 清理 `agent.py` 中的"金融领域标准化输出"事后硬解析代码
-- [ ] 更新 DESIGN_RESTRUCTURE.md → 标记废弃
-
-#### 1.8 端到端验证（半天）
-- [ ] 金融领域：agent 执行 → JSON 输出 → 格式化卡片 → 用户看到
+**未完成（3项端到端验证）**：
 - [ ] 金融领域：EvalNode 树存库 → 盘后回溯 → 权重更新
 - [ ] 金融领域：权重注入到 agent instructions → 下次执行生效
 - [ ] 非金融领域：回归测试，确认原 _try_chain 路径不受影响
-
-#### 1.9 集成缺陷修复（2026-06-09 已完成）
-- [x] `traced_tool.py` — 添加 `to_code_prompt()` / `to_tool_calling_prompt()` 代理
-- [x] `chain/__init__.py` — 修复 `get_skill_weights` 导入名不匹配
-- [x] `agent.py` — 金融域跳过 `_try_chain`（避免引用已删除的 planner/executor）
-- [x] `agent.py` — 工具缓存浅拷贝修复（防止 call_skill 重复）
-- [x] `agent.py` — 默认 timeframe 改为 T+3，禁止 1Y+ 作为默认值
 
 ### Phase 2+（后续迭代）
 - [ ] Skill 层 algo_analyze 实现（8 个可纯算法 Skill）
@@ -1366,7 +1317,149 @@ def _enforce_size_limit(root: EvalNode):
 - 预计 50+ 笔已验证决策后权重有统计意义
 - 旧表 qd_evaluations 保留只读，仅作历史查询参考
 
-## 十二、Phase 1 实施缺陷记录
+## 十二、关键实施设计（恢复/重写参考）
+
+> 以下设计细节在 Phase 1 实施过程中确定，是代码实现的依据。
+> 如果代码被改坏，按这里的设计恢复。
+
+### 12.1 Agent 类型双格式输出
+
+**背景**：smolagents 有两种 Agent 类型，输出格式完全不同。
+
+| Agent 类型 | 环境变量 | 输出格式 | final_answer 调用方式 |
+|-----------|---------|---------|---------------------|
+| CodeAgent | `AGENT_TYPE=code`（默认） | Python 代码 | `final_answer({...})` |
+| ToolCallingAgent | `AGENT_TYPE=tool` | JSON tool call | `{"name":"final_answer","arguments":{...}}` |
+
+**`env.example` 默认 `AGENT_TYPE=tool`**，即生产环境用 ToolCallingAgent。
+
+**设计决策**：`_build_instructions` 根据 `_get_agent_class()` 返回值注入不同格式的指令。
+
+**ToolCallingAgent 格式**：
+```json
+{
+    "name": "final_answer",
+    "arguments": {
+        "action": "buy/sell/hold/skip",
+        "score": 0-100,
+        "direction": "bullish/bearish/neutral",
+        "confidence": "high/medium/low",
+        "timeframe": "T+1/T+3/T+5/1W/1M/3M/1Y",
+        "timeframe_reason": "为什么选这个时间维度",
+        "stock_code": "6位代码",
+        "stock_name": "股票名称",
+        "signal": "一句话信号摘要",
+        "factors": [
+            {"name": "维度名", "score": 0-100, "direction": "bullish/bearish/neutral"}
+        ],
+        "analysis": "完整分析文字"
+    }
+}
+```
+
+**CodeAgent 格式**：
+```py
+final_answer({
+    "action": "buy/sell/hold/skip",
+    ...同上...
+})
+```
+
+**数据流**：
+```
+agent.run() → result.output
+  ├─ ToolCallingAgent: output 是 dict（final_answer 工具的返回值）
+  │   → 直接保留 dict，不转 str
+  │   → format_decision_card(dict) 格式化给用户
+  │   → json.dumps(dict) 传给 TraceCollector.on_agent_finish()
+  │
+  └─ CodeAgent: output 是 str（Python 代码执行结果）
+      → 正则提取 JSON 块
+      → json.loads → dict
+      → format_decision_card(dict)
+      → 原始 str 传给 TraceCollector.on_agent_finish()
+```
+
+**⚠️ 关键陷阱**：
+- `str(dict)` 会转成 Python repr（单引号），JSON 正则匹配不上
+- 所以 ToolCallingAgent 的 dict **不能** `str()` 转换
+- `store.add_message()` 需要 str，所以统一 `str(content)` 存储
+- `TraceCollector.on_agent_finish()` 需要 str，dict 用 `json.dumps()` 转换
+
+### 12.2 筹码分布计算算法
+
+**背景**：`CNStockDataSource` 没有原生筹码分布接口，需要从日K线计算。
+
+**算法：衰减成本分布模型**
+
+```
+输入: 120 根日K线 (time, open, high, low, close, volume)
+参数: decay_half_life = 30 天
+
+1. 确定价格区间 [min(low), max(high)]
+2. 分档: step = (max - min) * 0.5%, 至少100档
+3. 逐日处理:
+   - days_ago = (today - bar.time) / 86400
+   - weight = exp(-ln(2) / half_life * days_ago)    # 衰减
+   - low_idx = (bar.low - min) / step
+   - high_idx = (bar.high - min) / step
+   - chips[low_idx..high_idx] += bar.volume * weight / spread
+4. 汇总计算:
+   - profit_ratio = sum(chips[i] where price[i] <= current_price) / total
+   - avg_cost = sum(chips[i] * price[i]) / total
+   - 90%区间 = 去掉上下各5%筹码后的价格范围
+   - concentration = 90%区间宽度 / avg_cost * 100
+   - peak_price = chips 最大值对应的价格
+```
+
+**返回字段**：
+```python
+{
+    "stock_code": str,
+    "current_price": float,
+    "profit_ratio": float,      # 获利比例 %
+    "trapped_ratio": float,     # 套牢比例 % = 100 - profit_ratio
+    "avg_cost": float,          # 平均成本
+    "peak_price": float,        # 筹码密集峰值价
+    "chip_range_90": float,     # 90%筹码价格区间宽度
+    "concentration": float,     # 集中度 %（越小越集中）
+    "support_1": float,         # 90%筹码下沿（支撑位）
+    "resistance_1": float,      # 90%筹码上沿（压力位）
+    "lookback_days": int,
+    "data_source": "kline_calc" # 标记为计算值
+}
+```
+
+**调用路径**：`get_chip_distribution(stock_code)` → 数据源原生接口优先 → 不支持时自动走 `_calc_chip_from_kline()`。
+
+### 12.3 format_decision_card 标准卡片
+
+**代码控制格式，agent 只填数据。**
+
+```python
+def format_decision_card(data: dict) -> str:
+    """
+    输入: agent 输出的 JSON dict（必须包含 action/score/direction/confidence/timeframe/signal/factors/analysis）
+    输出: 用户可见的标准卡片文本
+    """
+    # 格式:
+    # **买入** 贵州茅台(600519)
+    # 维度:3天 评分:72 方向:看多 置信:高
+    # 技术面:75 | 动量:80 | 情报:45
+    # 信号: 技术面+动量双多，情报面中性
+    #
+    # <details><summary>详细分析</summary>
+    # ...analysis...
+    # </details>
+```
+
+**中英文映射**：
+- action: buy→买入, sell→卖出, hold→观望, skip→跳过
+- direction: bullish→看多, bearish→看空, neutral→中性
+- confidence: high→高, medium→中, low→低
+- timeframe: T+1→1天, T+3→3天, T+5→5天, 1W→1周, 1M→1月, 3M→3月, 1Y→1年
+
+## 十三、Phase 1 实施缺陷记录
 
 > 日期: 2026-06-09
 > 以下是 Phase 1 集成测试中发现的设计遗漏和实现缺陷，已全部修复。
@@ -1444,3 +1537,100 @@ tools.append(call_skill)                     # 重复！
 | 权重注入静默失败 | 低 | 数据库异常时 agent 无权重信息运行，应至少 `logger.warning` |
 | `_check_output_json` 无降级路径 | 低 | 重试 2 次仍失败则直接报错，应降级为自由文本输出 |
 | 非金融域 `_try_chain` 断裂 | 中 | planner/executor 已删除，非金融域链路编排不可用 |
+
+## 十四、回测引擎设计（待实施）
+
+> 日期: 2026-06-10
+> 状态: 设计方案，待当前 bug 修复后实施
+
+### 目标
+用历史数据快速回测 agent 收益率，迭代因子权重和评分规则，让 agent 处于最佳工作状态。
+
+### 核心矛盾
+agent 调一次要烧 token，120 天逐天跑 = 120 倍成本。需要分层设计。
+
+### 三层回测方案
+
+#### 第一层：指标快照回测（0 token，秒级）
+
+**不跑 agent，只跑指标。** 预计算每天的技术指标快照，用规则模拟 agent 的因子评分。
+
+```
+历史每天:
+  → 计算 MA/MACD/RSI/BOLL/KDJ 等指标
+  → 按 agent 的评分规则算 factors 分数
+  → 加权得出 score → direction → action
+  → 对比 T+3 实际涨跌
+```
+
+扩展 evaluator.py 的"验证已有决策"为"全量扫描"，回测任意时间段内 agent 会做哪些决策。
+
+**用途**：快速验证因子权重、评分规则是否有效，筛选最优参数组合。
+
+**实现要点**：
+- 从 `cn_stock.get_kline()` 拉取历史日K线
+- 逐天计算技术指标（纯 numpy/pandas，不调工具）
+- 按 `qd_factor_weights` 的权重加权评分
+- 对比 T+3/T+5 实际涨跌，统计胜率/收益率/回撤
+- 支持网格搜索：批量跑不同权重组合，找最优
+
+#### 第二层：Skill 级回测（少量 token，分钟级）
+
+只跑 `call_skill`，不跑完整 agent。
+
+```
+历史关键节点（金叉/放量/突破等信号日）:
+  → 调 technical_agent / momentum_tracker 等 Skill
+  → 拿到 SkillReport（score/direction/factors）
+  → 对比实际盈亏
+```
+
+**用途**：验证每个 Skill 的预测能力，迭代 `qd_skill_weights`。
+
+#### 第三层：全量 Agent 回测（大量 token，小时级）
+
+完整跑 agent，但只挑高价值节点：
+
+```
+筛选条件:
+  - 技术面出现重大信号（金叉/死叉/突破/放量）
+  - 多因子评分出现极端值（>75 或 <25）
+  - 市场情绪转折点
+```
+
+**用途**：端到端验证 agent 决策质量，成本可控。
+
+### 与现有组件的关系
+
+| 已有组件 | 回测中的角色 |
+|---------|------------|
+| evaluator.py | 盘后验证已有决策（回测的子集） |
+| qd_skill_weights | 回测的目标优化对象 |
+| qd_factor_weights | 回测的权重参数 |
+| qd_traces | 存储回测结果 |
+| cn_stock.get_kline() | 历史数据源 |
+| 技术指标工具 | 第一层回测的指标计算引擎 |
+
+### 需要新增
+
+| 组件 | 说明 |
+|------|------|
+| `chain/backtester.py` | 回测引擎主模块 |
+| `qd_backtest_runs` 表 | 回测运行记录（参数/结果/耗时） |
+| `qd_backtest_trades` 表 | 回测交易明细（每笔决策+实际盈亏） |
+| 回测 API | `POST /api/backtest/run` 触发回测 |
+| 回测可视化 | 前端展示回测曲线/统计指标 |
+
+### 关键指标
+
+```
+总收益率、年化收益率、最大回撤、夏普比率
+胜率、盈亏比、单位时间收益率
+按 Skill/因子维度拆解贡献度
+```
+
+### 实施优先级
+
+1. **第一层先行**：0 token，纯数学，能快速验证权重迭代逻辑
+2. 第二层补充：验证 Skill 层预测能力
+3. 第三层收尾：端到端验证

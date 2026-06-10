@@ -1,7 +1,7 @@
 # QuantDinger Agent架构重构设计方案
 
 > 日期: 2026-06-09
-> 状态: 设计完成，Phase 1 待实施
+> 状态: ⚠️ 已废弃，被 AGENT_ACCOUNTABLE.md 替代。保留只读参考。
 
 ## 一、现状问题
 
