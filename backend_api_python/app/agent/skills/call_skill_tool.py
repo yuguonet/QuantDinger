@@ -38,6 +38,7 @@ class CallSkillTool(Tool):
             "description": (
                 "技能名。可选值: "
                 "technical_agent(技术面+动量), indicator_agent(指标), "
+                "bb_screener(BB超卖全市场扫描+深入分析), "
                 "intelligence_agent(情报+政策), hot_money_tracker(游资), "
                 "lockup_watcher(解禁), market_data_agent(行情+概念+资金), "
                 "screening_agent(选股), backtest_agent(回测), "

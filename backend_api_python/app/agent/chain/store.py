@@ -56,7 +56,8 @@ def save_tree(root: EvalNode) -> Optional[int]:
     try:
         with get_db_connection() as conn:
             cur = conn.cursor()
-            root_id = _save_node(cur, root, parent_id=None, root_id=None)
+            root_id = _save_node(cur, root, parent_id=None, root_id=None,
+                                 root_exec_date=root.exec_date or date.today())
             conn.commit()
             logger.info("[Store] 保存决策树 root_id=%d stock=%s chain=%s children=%d",
                         root_id, root.stock_code, root.name, len(root.children))
@@ -66,8 +67,12 @@ def save_tree(root: EvalNode) -> Optional[int]:
         return None
 
 
-def _save_node(cur, node: EvalNode, parent_id: Optional[int], root_id: Optional[int]) -> int:
+def _save_node(cur, node: EvalNode, parent_id: Optional[int], root_id: Optional[int],
+               root_exec_date: Optional[date] = None) -> int:
     """递归保存单个节点及其子节点。"""
+    # 子节点继承根节点的 exec_date，避免 NOT NULL 约束报错
+    if node.exec_date is None:
+        node.exec_date = root_exec_date or date.today()
     factors_json = json.dumps([f.to_dict() for f in node.factors], ensure_ascii=False)
     output_json = json.dumps(node.output_data, ensure_ascii=False) if node.output_data else None
     input_json = json.dumps(node.input_params, ensure_ascii=False) if node.input_params else None
@@ -140,10 +145,11 @@ def _save_node(cur, node: EvalNode, parent_id: Optional[int], root_id: Optional[
         root_id = node_id
         cur.execute("UPDATE qd_traces SET root_id=%s WHERE id=%s", (root_id, node_id))
 
-    # 递归保存子节点
+    # 递归保存子节点（传递 root_exec_date 保证子节点有 exec_date）
     for i, child in enumerate(node.children):
         child.step_order = i + 1
-        _save_node(cur, child, parent_id=node_id, root_id=root_id)
+        _save_node(cur, child, parent_id=node_id, root_id=root_id,
+                   root_exec_date=node.exec_date)
 
     return node_id
 

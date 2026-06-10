@@ -733,28 +733,32 @@ def analyze_pattern(stock_code: str) -> Dict[str, Any]:
         return {"error": str(e)}
 
 @tool(
-    description="分析筹码分布：获利比例、平均成本、集中度（仅A股支持）。",
+    description="分析筹码分布：获利比例、平均成本、集中度、支撑压力位（仅A股支持）。基于120根日K线衰减成本分布模型计算。",
     category="技术分析",
     layer="分析层",
     domain=["finance"],
 )
-def get_chip_distribution(stock_code: str) -> Dict[str, Any]:
-    """分析筹码分布：获利比例、平均成本、集中度。
-    仅A股支持，其他市场返回提示。
+def get_chip_distribution(stock_code: str, lookback_days: int = 120) -> Dict[str, Any]:
+    """筹码分布分析（衰减成本分布模型）。
+
+    从日K线计算筹码分布，不依赖数据源原生接口。
+    算法：按日K线的 high/low 区间分配成交量到价格档位，
+    用指数衰减加权（近期筹码权重更高），汇总计算各维度指标。
+
+    Args:
+        stock_code: 股票代码
+        lookback_days: 回看天数，默认120天
     """
     market = _detect_market(stock_code)
     if market != "CNStock":
         return {"error": f"筹码分布分析仅支持A股，当前市场: {market}", "retriable": False}
 
-    ds = _get_ds(market)
     try:
-        if hasattr(ds, "get_chip_distribution"):
-            return ds.get_chip_distribution(stock_code)
-        return {"error": "当前数据源不支持筹码分布分析", "retriable": False}
-    except NotImplementedError:
-        return {"error": "当前数据源不支持筹码分布分析", "retriable": False}
+        klines = _fetch_klines(stock_code, lookback_days)
+        from app.agent.tools.chip_distribution import calc_chip_distribution
+        return calc_chip_distribution(klines, stock_code=stock_code, lookback_days=lookback_days)
     except Exception as e:
-        logger.error("get_chip_distribution(%s) failed: %s", stock_code, e)
+        logger.error("get_chip_distribution(%s) failed: %s", stock_code, e, exc_info=True)
         return {"error": str(e)}
 
 @tool(
