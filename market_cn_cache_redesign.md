@@ -98,7 +98,16 @@ def refresh_index_daily_kline():
 
 ## 二、数据分类
 
-### 日级档 — 启动加载 + 盘后 15:30 自动刷新
+### 日级档 — 启动加载 + 非盘中自动刷新（仅盘后才出的数据）
+
+| 函数 | 模块 | 说明 |
+|------|------|------|
+| `get_dragon_tiger` | dragon_limit | 龙虎榜 |
+| `get_northbound_daily` | index | 北向日级历史 |
+| `get_market_fund_flow_daily` | index | 资金流日级 |
+| `get_emotion_history` | emotion | 情绪历史 |
+
+### 日常档 — 启动加载 + 盘中慢档 30 分钟
 
 | 函数 | 模块 | 说明 |
 |------|------|------|
@@ -107,14 +116,7 @@ def refresh_index_daily_kline():
 | `get_sector_prediction` | china_market | 板块预测 |
 | `get_sector_cycle` | china_market | 板块周期分析 |
 | `get_index_daily_kline` | index | 指数日K |
-| `get_northbound_daily` | index | 北向日级历史 |
 | `get_northbound_holdings` | index | 北向持股明细 |
-| `get_market_fund_flow_daily` | index | 资金流日级 |
-| `get_dragon_tiger` | dragon_limit | 龙虎榜 |
-| `get_zt_pool` | dragon_limit | 涨停池 |
-| `get_dt_pool` | dragon_limit | 跌停池 |
-| `get_broken_board` | dragon_limit | 炸板池 |
-| `get_emotion_history` | emotion | 情绪历史 |
 | `get_sector_history` | china_market | 板块历史趋势 |
 | `fetch_vix` | data_providers/sentiment | VIX 恐慌指数 |
 | `fetch_dollar_index` | data_providers/sentiment | 美元指数 |
@@ -817,210 +819,39 @@ def refresh_forex_pairs():
 
 ## 四、定时任务 — market_cn/scheduler.py（新增）
 
+> 完整代码见 `backend_api_python/app/market_cn/scheduler.py`
+
+**职责分离：**
+
+| 层 | 位置 | 职责 |
+|----|------|------|
+| `refresh_xxx()` | 各模块（china_market / index / emotion / ...） | 纯拉数据，不关心时机 |
+| `_refresh_xxx()` | scheduler.py | 编排调用，把各模块的 refresh 组合成分组 |
+| `_xxx_tick()` | scheduler.py | 调度层，控制时段和条件 |
+| `_schedule()` | scheduler.py | Timer 自调度，只管间隔 |
+
+**三档刷新：**
+
+| 档位 | 周期 | 时段 | 内容 |
+|------|------|------|------|
+| 快档 | 5min | 盘中 | 指数实时/北向实时/资金流实时/热门板块/人气/全球指数 |
+| 慢档 | 30min | 盘中 | 贪恐/情绪/政策/新闻/加密 + 日级宏观/板块/国际 |
+| 盘后 | 10min | 非盘中 | 龙虎榜/北向日级/情绪历史/资金流日级（日期到了就停） |
+
+**盘后日期判断逻辑：**
+
 ```python
-"""
-market_cn 数据刷新调度器
+from app.utils.trading_calendar import last_finish_trading_day
+target = last_finish_trading_day()  # 最近一个已收盘的交易日
 
-三档刷新:
-  - 日级: 盘后启动加载 1 次
-  - 盘中慢: 30 分钟
-  - 盘中快: 5 分钟
-
-复用 backfill_db 的 Timer 自调度模式。
-"""
-import threading
-import time
-import logging
-
-logger = logging.getLogger(__name__)
-
-
-def _is_trading_time():
-    """粗略判断是否在交易时段（9:00-15:30）"""
-    from datetime import datetime
-    now = datetime.now()
-    if now.weekday() >= 5:  # 周末
-        return False
-    t = now.hour * 100 + now.minute
-    return 900 <= t <= 1530
-
-
-# ═══ 日级刷新 ═══
-
-def refresh_daily_all():
-    """日级数据: 宏观/板块趋势/北向日级/龙虎榜/情绪历史/国际宏观"""
-    from app.market_cn.china_market import (
-        refresh_china_macro, refresh_sector_trend,
-        refresh_sector_prediction, refresh_sector_cycle,
-        refresh_sector_history, refresh_emotion_history,
-    )
-    from app.market_cn.index import (
-        refresh_index_daily_kline, refresh_northbound_daily,
-        refresh_northbound_holdings, refresh_market_fund_flow_daily,
-    )
-    from app.market_cn.dragon_limit import (
-        refresh_dragon_tiger, refresh_zt_pool,
-        refresh_dt_pool, refresh_broken_board,
-    )
-    from app.data_providers.sentiment import (
-        refresh_vix, refresh_dollar_index, refresh_yield_curve,
-        refresh_put_call_ratio,
-    )
-    from app.data_providers.commodities import refresh_commodities
-    from app.data_providers.forex import refresh_forex_pairs
-
-    fns = [
-        # A 股日级
-        refresh_china_macro, refresh_sector_trend,
-        refresh_sector_prediction, refresh_sector_cycle,
-        refresh_sector_history, refresh_emotion_history,
-        refresh_index_daily_kline, refresh_northbound_daily,
-        refresh_northbound_holdings, refresh_market_fund_flow_daily,
-        refresh_dragon_tiger, refresh_zt_pool,
-        refresh_dt_pool, refresh_broken_board,
-        # 国际宏观日级
-        refresh_vix, refresh_dollar_index, refresh_yield_curve,
-        refresh_put_call_ratio, refresh_commodities, refresh_forex_pairs,
-    ]
-    for fn in fns:
-        try:
-            fn()
-        except Exception as e:
-            logger.warning("[daily] %s 失败: %s", fn.__name__, e)
-
-
-# ═══ 盘中慢档 ═══
-
-def refresh_slow_all():
-    """盘中慢档: 贪恐/情绪/政策/新闻/全球情绪/加密"""
-    from app.market_cn.china_market import refresh_fear_greed, refresh_policy
-    from app.market_cn.emotion import refresh_emotion_cycle
-    from app.market_cn.policy_analysis import refresh_financial_news, refresh_macro_news
-    from app.data_providers.sentiment import refresh_fear_greed_index, refresh_sentiment_data
-    from app.data_providers.global_market import refresh_global_sentiment, refresh_global_news
-    from app.data_providers.crypto import refresh_crypto_prices, refresh_crypto_heatmap
-
-    fns = [refresh_fear_greed, refresh_policy, refresh_emotion_cycle,
-           refresh_financial_news, refresh_macro_news,
-           refresh_fear_greed_index, refresh_sentiment_data,
-           refresh_global_sentiment, refresh_global_news,
-           refresh_crypto_prices, refresh_crypto_heatmap]
-    for fn in fns:
-        try:
-            fn()
-        except Exception as e:
-            logger.warning("[slow] %s 失败: %s", fn.__name__, e)
-
-
-# ═══ 盘中快档 ═══
-
-def refresh_fast_all():
-    """盘中快档: 指数实时/北向实时/资金流/热门板块/人气/全球指数"""
-    from app.market_cn.index import (
-        refresh_index_realtime, refresh_northbound_realtime,
-        refresh_market_fund_flow_realtime, refresh_sector_fund_flow,
-    )
-    from app.market_cn.china_market import refresh_hot_sectors
-    from app.market_cn.dragon_limit import refresh_hot_rank
-    from app.data_providers.global_market import refresh_global_indices, refresh_global_heatmap
-
-    fns = [
-        refresh_index_realtime, refresh_northbound_realtime,
-        refresh_market_fund_flow_realtime, refresh_sector_fund_flow,
-        refresh_hot_sectors, refresh_hot_rank,
-        refresh_global_indices, refresh_global_heatmap,
-    ]
-    for fn in fns:
-        try:
-            fn()
-        except Exception as e:
-            logger.warning("[fast] %s 失败: %s", fn.__name__, e)
-
-
-# ═══ Timer 自调度 ═══
-
-_timers = {}
-
-
-def _schedule(name, fn, interval):
-    def _run():
-        try:
-            fn()
-        except Exception as e:
-            logger.error("[scheduler] %s 异常: %s", name, e)
-        # 自调度下次
-        t = threading.Timer(interval, _run)
-        t.daemon = True
-        t.start()
-        _timers[name] = t
-
-    t = threading.Timer(interval, _run)
-    t.daemon = True
-    t.start()
-    _timers[name] = t
-
-
-def _is_post_market():
-    """判断是否在盘后时段（15:30-16:30）"""
-    from datetime import datetime
-    now = datetime.now()
-    if now.weekday() >= 5:
-        return False
-    t = now.hour * 100 + now.minute
-    return 1530 <= t <= 1630
-
-
-def start():
-    """应用启动时调用（在 Flask app.run 之前或 after_fork）
-
-    冷启动流程：全部从远端拉取到内存，不读本地缓存文件。
-    """
-    logger.info("[scheduler] market_cn 冷启动: 从远端拉取全部数据")
-
-    # 1. 从远端拉取全部数据到内存（不读本地缓存文件）
-    refresh_daily_all()
-    refresh_slow_all()
-    refresh_fast_all()
-
-    logger.info("[scheduler] 冷启动完成，数据已加载到内存")
-
-    # 2. 启动定时刷新
-    # 盘中快档 5 分钟
-    _schedule("fast", lambda: refresh_fast_all() if _is_trading_time() else None, 300)
-    # 盘中慢档 30 分钟
-    _schedule("slow", lambda: refresh_slow_all() if _is_trading_time() else None, 1800)
-    # 盘后日级 20 分钟（15:30-16:30 检测一次，刷到就停）
-    _schedule("post_market", _post_market_refresh, 1200)
-
-    logger.info("[scheduler] 定时刷新已启动: fast=5min, slow=30min, post_market=10min")
-
-
-_post_market_done_today = False
-
-
-def _post_market_refresh():
-    """盘后刷新：收盘后拉取日级数据（龙虎榜/涨跌停/北向日级等）"""
-    global _post_market_done_today
-    from datetime import datetime
-    now = datetime.now()
-
-    # 新的一天重置标记
-    if now.hour < 8:
-        _post_market_done_today = False
-        return
-
-    # 已完成或不在盘后时段，跳过
-    if _post_market_done_today or not _is_post_market():
-        return
-
-    logger.info("[scheduler] 盘后刷新开始")
-    try:
-        refresh_daily_all()
-        _post_market_done_today = True
-        logger.info("[scheduler] 盘后刷新完成")
-    except Exception as e:
-        logger.error("[scheduler] 盘后刷新失败: %s", e)
+# 对比关键数据源日期，≥ target 才算完成
+dt_date = (_rt_dragon_tiger or {}).get("date", "")
+nb_date = (_rt_nb_daily or [{}])[0].get("date", "")
+if dt_date >= target and nb_date >= target:
+    _post_market_done_today = True
 ```
+
+**冷启动：** 四个分组全跑一遍，不读本地缓存文件。
 
 ---
 
@@ -1032,13 +863,14 @@ def _post_market_refresh():
   ▼
 scheduler.start()
   │
-  ├── refresh_daily_all()   ← 全部从远端拉取到内存（不读本地缓存文件）
-  ├── refresh_slow_all()    ← 全部从远端拉取到内存
-  ├── refresh_fast_all()    ← 全部从远端拉取到内存
+  ├── _refresh_daily()       ← 宏观/板块/国际（盘中也能更新）
+  ├── _refresh_post_market() ← 龙虎榜/北向日级/情绪历史/资金流日级
+  ├── _refresh_slow()        ← 贪恐/情绪/政策/新闻/加密（含日级）
+  ├── _refresh_fast()        ← 指数实时/北向实时/资金流/热门板块
   │
-  ├── _schedule("fast", ..., 300)        ← 盘中快档 5min
-  ├── _schedule("slow", ..., 1800)       ← 盘中慢档 30min
-  └── _schedule("post_market", ..., 600) ← 盘后日级 10min（15:30-16:30）
+  ├── _schedule("fast", _fast_tick, 300)
+  ├── _schedule("slow", _slow_tick, 1800)
+  └── _schedule("post_market", _post_market_tick, 600)
 ```
 
 **关键原则：冷启动不从本地缓存文件读取，全部从远端拉取到内存。**
@@ -1046,8 +878,8 @@ scheduler.start()
 - 不调用 `china_market._warmup()`（它从文件加载缓存）
 - 不读任何 `.json` 缓存文件
 - 启动时直接从远端 API 拉取最新数据，保证内存中是最新的
-- 盘中：快档 5min + 慢档 30min（`_is_trading_time()` 控制）
-- 盘后：15:30-16:30 自动刷新日级数据（龙虎榜/涨跌停/北向日级等盘后才出的数据）
+- 盘中（9:00~11:31, 13:00~15:01）：快档 5min + 慢档 30min（慢档含日级宏观/板块/国际数据）
+- 盘后：10 分钟检测盘后数据（龙虎榜/北向日级/情绪历史/资金流日级），对比 `last_finish_trading_day()`，数据日期到了才标记完成，否则持续重试
 - 非交易时段：定时任务空转不拉数据
 
 ---
@@ -1110,9 +942,12 @@ start_market_cn_scheduler()
 3. **冷启动不读本地缓存文件** — 全部从远端拉取到内存，保证数据新鲜
 4. **scheduler.py 是独立调度层** — 不替代 china_market.py 原有的 `_bg_watchdog` / `_warmup` 机制，两者并存
 5. **远端拉取最大化** — refresh 用 `max(默认最大值, 峰值)` 拉取，峰值由 get_xxx() 记录
-6. **emotion.py 的文件缓存保留** — 它已有 emotion.json 持久化，refresh 只更新内存
-7. **data_bridge.py 不改** — 它调的是 china_market 的 get_xxx()，接口不变自然无感
-8. **data_providers 同理** — sentiment/commodities/crypto/forex 的 fetch_xxx() 逻辑不改，只加 refresh
+6. **盘中时段定义** — 9:00~11:31, 13:00~15:01（不含集合竞价和盘后），其余为非盘中
+7. **盘后刷新靠日期判断** — 用 `last_finish_trading_day()` 获取目标日，对比龙虎榜/北向日级的日期字段，≥ 目标日才算完成，否则持续重试
+8. **日级数据拆分** — 宏观/板块/国际数据并入慢档（盘中30min），龙虎榜/北向日级/情绪历史/资金流日级走盘后刷新（非盘中10min + 日期判断）
+9. **emotion.py 的文件缓存保留** — 它已有 emotion.json 持久化，refresh 只更新内存
+10. **data_bridge.py 不改** — 它调的是 china_market 的 get_xxx()，接口不变自然无感
+11. **data_providers 同理** — sentiment/commodities/crypto/forex 的 fetch_xxx() 逻辑不改，只加 refresh
 
 ---
 
