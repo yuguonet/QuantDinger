@@ -37,12 +37,14 @@ class CallSkillTool(Tool):
             "type": "string",
             "description": (
                 "技能名。可选值: "
-                "technical_agent(技术面), momentum_tracker(动量), indicator_agent(指标), "
-                "intelligence_agent(情报), policy_analyst(政策), hot_money_tracker(游资), "
-                "lockup_watcher(解禁), concept_tracker(概念), market_data_agent(行情), "
+                "technical_agent(技术面+动量), indicator_agent(指标), "
+                "intelligence_agent(情报+政策), hot_money_tracker(游资), "
+                "lockup_watcher(解禁), market_data_agent(行情+概念+资金), "
                 "screening_agent(选股), backtest_agent(回测), "
                 "bull_researcher(多头), bear_researcher(空头), "
-                "data_agent(数据工程), trading_agent(交易)"
+                "data_agent(数据工程), trading_agent(交易)。"
+                "兼容别名: momentum_tracker→technical_agent, "
+                "policy_analyst→intelligence_agent, concept_tracker→market_data_agent"
             ),
         },
         "stock_code": {

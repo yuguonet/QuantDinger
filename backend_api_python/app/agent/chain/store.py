@@ -25,6 +25,19 @@ from app.agent.chain.schema import EvalNode, FactorItem, Layer, Status
 logger = logging.getLogger(__name__)
 
 
+def _list_to_pg_array(items: list) -> str:
+    """将 Python list 转为 PostgreSQL TEXT[] 格式。
+
+    ['a', 'b', 'c'] → '{a,b,c}'
+    需要转义的字符会被正确处理。
+    """
+    escaped = []
+    for item in items:
+        s = str(item).replace("\\", "\\\\").replace('"', '\\"')
+        escaped.append(f'"{s}"')
+    return "{" + ",".join(escaped) + "}"
+
+
 # ═══════════════════════════════════════════════════════════════
 # 写入
 # ═══════════════════════════════════════════════════════════════
@@ -58,8 +71,9 @@ def _save_node(cur, node: EvalNode, parent_id: Optional[int], root_id: Optional[
     factors_json = json.dumps([f.to_dict() for f in node.factors], ensure_ascii=False)
     output_json = json.dumps(node.output_data, ensure_ascii=False) if node.output_data else None
     input_json = json.dumps(node.input_params, ensure_ascii=False) if node.input_params else None
-    tools_json = json.dumps(node.tools_called, ensure_ascii=False) if node.tools_called else None
-    missing_json = json.dumps(node.missing_data, ensure_ascii=False) if node.missing_data else None
+    # TEXT[] 列需要 PG 数组格式 '{a,b,c}'，不能用 JSON 格式 '["a","b","c"]'
+    tools_pg_array = _list_to_pg_array(node.tools_called) if node.tools_called else None
+    missing_pg_array = _list_to_pg_array(node.missing_data) if node.missing_data else None
 
     if node.id is not None:
         # UPDATE
@@ -80,7 +94,7 @@ def _save_node(cur, node: EvalNode, parent_id: Optional[int], root_id: Optional[
             node.exec_date, node.stock_code, node.stock_name,
             node.score, node.direction, node.action, node.signal, node.confidence,
             node.timeframe, factors_json, output_json, node.analysis,
-            input_json, tools_json, missing_json, node.data_source,
+            input_json, tools_pg_array, missing_pg_array, node.data_source,
             node.status, node.error, node.elapsed_ms,
             node.exit_date, node.exit_reason, node.pnl_pct, node.hold_days,
             node.correct, node.calibration,
@@ -114,7 +128,7 @@ def _save_node(cur, node: EvalNode, parent_id: Optional[int], root_id: Optional[
             node.exec_date, node.stock_code, node.stock_name,
             node.score, node.direction, node.action, node.signal, node.confidence,
             node.timeframe, factors_json, output_json, node.analysis,
-            input_json, tools_json, missing_json, node.data_source,
+            input_json, tools_pg_array, missing_pg_array, node.data_source,
             node.status, node.error, node.elapsed_ms,
             node.exit_date, node.exit_reason, node.pnl_pct, node.hold_days,
             node.correct, node.calibration,

@@ -80,13 +80,12 @@ GUIDANCE = """## 核心规则
 
 | 子Agent | 何时使用 | 何时不用 |
 |---------|---------|---------|
-| policy_analyst | 大盘系统性异常、连续暴跌/暴涨 | 日常个股分析 |
+| intelligence_agent | 大盘系统性异常、连续暴跌/暴涨；技术面异常需解释原因 | 日常个股分析（已含政策分析） |
 | hot_money_tracker | **仅作风险警示**：查看哪些游资在出货 | 当买入信号用（游资一日游，追买=接盘） |
 | lockup_watcher | 中长线分析、近期有解禁 | 短线交易 |
-| concept_tracker | 板块异动、寻找联动标的 | 个股深度分析 |
-| momentum_tracker | 判断趋势强度、突破真伪 | 已有明确信号时 |
-| intelligence_agent | 技术面出现异常信号需要解释 | 正常走势 |
-| technical_agent | 多指标交叉验证 | 已用 get_indicator_snapshot |
+| market_data_agent | 板块异动、概念热度、资金流向、寻找联动标的 | 个股深度分析（已含概念追踪） |
+| technical_agent | 判断趋势强度、突破真伪、动量评估、短线择时 | 已有明确信号时（已含动量追踪） |
+| indicator_agent | 验证用户自定义指标信号 | 无自定义指标时 |
 | bull/bear_researcher | 需要多空辩论的重大决策 | 简单分析 |
 
 ### 辩论规则

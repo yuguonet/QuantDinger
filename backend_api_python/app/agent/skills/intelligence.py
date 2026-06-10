@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Intelligence skill — 情报分析专家（A股事件驱动特化）。
+Intelligence Skill — 情报分析专家（A股事件驱动 + 政策分析特化）。
 
-负责：新闻搜索、事件驱动分析、概念催化、公告解读。
+合并原 intelligence_agent + policy_analyst：
+  新闻搜索、事件驱动分析、概念催化、公告解读、政策分析。
 A股弱有效市场下，信息不对称是核心alpha来源。
 """
 from app.agent.skills.registry import skill
@@ -10,9 +11,9 @@ from app.agent.skills.registry import skill
 
 @skill(
     name="intelligence_agent",
-    description="情报分析专家。负责新闻搜索、事件驱动分析、概念催化识别、公告解读、舆情监控。A股信息不对称是核心alpha来源。当用户问新闻、消息面、情报、舆情、事件时调用。",
+    description="情报分析专家。负责新闻搜索、事件驱动分析、概念催化识别、公告解读、舆情监控、政策分析。A股信息不对称是核心alpha来源。当用户问新闻、消息面、情报、舆情、事件、政策面时调用。",
     instructions=(
-        "你是A股情报分析专家，专注事件驱动和概念催化。\n\n"
+        "你是A股情报分析专家，专注事件驱动、概念催化和政策分析。\n\n"
         "分析流程：\n"
         "1. **新闻搜索** — 用 search_stock_news 搜索个股新闻（news_service），\n"
         "   用 get_eastmoney_stock_news 补充东财直连新闻，\n"
@@ -24,11 +25,15 @@ from app.agent.skills.registry import skill
         "   - **公司事件**：业绩预告、并购重组、股权激励、定增 → 影响个股\n"
         "   - **行业事件**：供需变化、技术突破、突发事件 → 影响产业链\n"
         "   - **资金事件**：举牌、大宗交易、大宗减持 → 影响短期供需\n"
-        "4. **催化强度评估** — 判断事件对股价的驱动力：\n"
+        "4. **政策分析** — 区分政策类型和时效：\n"
+        "   - 突发型政策（当日催化，短线脉冲 1-3 天）\n"
+        "   - 趋势型政策（持续影响，驱动中期行情 1-3 个月）\n"
+        "   - 政策传导链：政策→板块→个股（直接受益/间接受益/受损）\n"
+        "5. **催化强度评估** — 判断事件对股价的驱动力：\n"
         "   - 强催化：突发利好/利空，市场未充分反应\n"
         "   - 中催化：已有预期但未完全 price in\n"
         "   - 弱催化：已充分反应，边际效应递减\n"
-        "5. **时效性判断** — 事件影响是短期脉冲还是持续趋势？\n\n"
+        "6. **时效性判断** — 事件影响是短期脉冲还是持续趋势？\n\n"
         "A股特别注意：\n"
         "- 公告时间点很重要（盘后公告次日反应）\n"
         "- 业绩预告/快报是重要催化\n"
@@ -67,5 +72,5 @@ from app.agent.skills.registry import skill
     default_weight=0.8,
 )
 class IntelligenceSkill:
-    """情报分析专家子 Agent。"""
+    """情报分析专家（含政策分析）。"""
     pass

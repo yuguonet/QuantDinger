@@ -45,7 +45,7 @@ MAX_STEPS = 5
 REQUIRED_SKILLS = {"technical_agent"}
 
 # 默认降级链路
-DEFAULT_FALLBACK_SKILLS = ["technical_agent", "momentum_tracker"]
+DEFAULT_FALLBACK_SKILLS = ["technical_agent"]
 
 # 缓存相似度阈值（query hash 前缀匹配位数）
 CACHE_HASH_PREFIX_LEN = 8
@@ -90,21 +90,20 @@ class PlanResult:
 SKILL_CATALOG = """
 可用技能（从下列中选择 1~5 个，按执行顺序排列）：
 
-1. technical_agent — 技术面综合（趋势/均线/量价/形态/筹码）。地基，大多数场景必须包含。
-2. momentum_tracker — 动量/趋势强度/突破判断。短线择时核心。
-3. indicator_agent — 技术指标信号（MACD/KDJ/RSI/BOLL）。指标验证。
-4. intelligence_agent — 新闻/事件/舆情/公告。信息面分析。
-5. policy_analyst — 政策面（监管/产业/货币政策）。政策驱动场景。
-6. hot_money_tracker — 游资/龙虎榜/主力资金。短线资金面。
-7. lockup_watcher — 解禁/减持/质押。供给端风险。
-8. concept_tracker — 概念/题材/板块轮动。A股题材炒作。
-9. market_data_agent — 行情/指数/板块排名。市场概览。
-10. screening_agent — 条件选股/指标筛选。选股场景。
-11. backtest_agent — 策略回测。验证历史绩效。
-12. bull_researcher — 多头论据构建。多空辩论看涨方。
-13. bear_researcher — 空头论据构建。多空辩论看跌方。
-14. data_agent — 数据工程/脚本执行。数据处理。
-15. trading_agent — 交易执行/策略启停。交易场景。
+1. technical_agent — 技术面+动量综合（趋势/均线/量价/形态/筹码/突破/择时）。地基，大多数场景必须包含。
+2. indicator_agent — 用户自定义指标信号（指标IDE策略执行）。指标验证。
+3. intelligence_agent — 情报+政策分析（新闻/事件/舆情/公告/政策面）。信息面分析。
+4. hot_money_tracker — 游资/龙虎榜/主力资金。短线资金面。
+5. lockup_watcher — 解禁/减持/质押。供给端风险。
+6. market_data_agent — 行情+概念+资金（指数/板块/概念热度/涨停池/资金流向）。市场概览。
+7. screening_agent — 条件选股/指标筛选。选股场景。
+8. backtest_agent — 策略回测。验证历史绩效。
+9. bull_researcher — 多头论据构建。多空辩论看涨方。
+10. bear_researcher — 空头论据构建。多空辩论看跌方。
+11. data_agent — 数据工程/脚本执行。数据处理。
+12. trading_agent — 交易执行/策略启停。交易场景。
+
+兼容别名（旧名仍可调用）：momentum_tracker→technical_agent, policy_analyst→intelligence_agent, concept_tracker→market_data_agent
 """.strip()
 
 
@@ -213,7 +212,7 @@ class Planner:
             "{\n"
             '  "steps": [\n'
             '    {"agent": "technical_agent"},\n'
-            '    {"agent": "momentum_tracker"}\n'
+            '    {"agent": "intelligence_agent"}\n'
             "  ],\n"
             '  "stocks": ["600519"],\n'
             '  "reasoning": "选择理由（50字以内）"\n'

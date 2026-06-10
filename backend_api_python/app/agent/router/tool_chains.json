@@ -1,8 +1,9 @@
 {
     "analyze+stock": [
         {
-            "tool": "python_interpreter",
-            "desc": ""
+            "tool": "call_skill",
+            "args": {"skill_name": "technical_agent"},
+            "desc": "技术面+动量综合分析（趋势/量价/均线/指标/形态/筹码/突破/择时）"
         }
     ],
     "analyze+chart": [
@@ -21,58 +22,30 @@
     ],
     "analyze+market": [
         {
-            "tool": "get_market_indices",
-            "desc": "获取大盘指数行情"
-        },
-        {
-            "tool": "get_zt_pool",
-            "desc": "获取涨停池数据"
-        },
-        {
-            "tool": "get_dragon_tiger",
-            "desc": "获取龙虎榜数据"
+            "tool": "call_skill",
+            "args": {"skill_name": "market_data_agent"},
+            "desc": "行情数据专家（大盘/板块/资金流向）"
         }
     ],
     "analyze+indicator": [
         {
-            "tool": "search_stock_by_name",
-            "desc": "解析股票代码"
-        },
-        {
-            "tool": "get_indicator_snapshot",
-            "desc": "获取指标快照"
-        },
-        {
-            "tool": "analyze_trend",
-            "desc": "趋势分析"
+            "tool": "call_skill",
+            "args": {"skill_name": "indicator_agent"},
+            "desc": "指标分析专家（MACD/KDJ/RSI/BOLL多维共振）"
         }
     ],
     "analyze+fund_flow": [
         {
-            "tool": "search_stock_by_name",
-            "desc": "解析股票代码"
-        },
-        {
-            "tool": "get_fund_flow",
-            "desc": "获取个股资金流向"
-        },
-        {
-            "tool": "get_sector_fund_flow",
-            "desc": "获取板块资金流向"
+            "tool": "call_skill",
+            "args": {"skill_name": "hot_money_tracker"},
+            "desc": "游资追踪师（龙虎榜/大单/主力资金动态）"
         }
     ],
     "analyze+strategy": [
         {
-            "tool": "list_strategies",
-            "desc": "列出可用策略"
-        },
-        {
-            "tool": "get_strategy_trades",
-            "desc": "获取策略交易记录"
-        },
-        {
-            "tool": "get_backtest_history",
-            "desc": "获取历史回测结果"
+            "tool": "call_skill",
+            "args": {"skill_name": "backtest_agent"},
+            "desc": "回测专家（策略回测/历史绩效分析）"
         }
     ],
     "analyze+project": [
@@ -93,22 +66,16 @@
     ],
     "analyze+screener": [
         {
-            "tool": "search_stocks",
-            "desc": "按条件筛选股票"
-        },
-        {
-            "tool": "get_realtime_quote",
-            "desc": "获取筛选结果行情"
+            "tool": "call_skill",
+            "args": {"skill_name": "screening_agent"},
+            "desc": "选股专家（条件选股/概念选股/涨停池/热榜）"
         }
     ],
     "analyze+trading": [
         {
-            "tool": "get_positions",
-            "desc": "获取当前持仓"
-        },
-        {
-            "tool": "get_trade_history",
-            "desc": "获取交易历史"
+            "tool": "call_skill",
+            "args": {"skill_name": "trading_agent"},
+            "desc": "交易执行专家（持仓/策略/交易记录）"
         }
     ],
     "view+chart": [
@@ -231,28 +198,23 @@
     ],
     "filter+stock": [
         {
-            "tool": "search_stocks",
-            "desc": "按条件筛选"
-        },
-        {
-            "tool": "get_realtime_quote",
-            "desc": "获取筛选结果行情"
+            "tool": "call_skill",
+            "args": {"skill_name": "screening_agent"},
+            "desc": "选股专家"
         }
     ],
     "filter+screener": [
         {
-            "tool": "search_stocks",
-            "desc": "筛选股票"
+            "tool": "call_skill",
+            "args": {"skill_name": "screening_agent"},
+            "desc": "选股专家"
         }
     ],
     "backtest+strategy": [
         {
-            "tool": "run_backtest",
-            "desc": "执行回测"
-        },
-        {
-            "tool": "get_backtest_history",
-            "desc": "查看历史回测"
+            "tool": "call_skill",
+            "args": {"skill_name": "backtest_agent"},
+            "desc": "回测专家"
         }
     ],
     "execute+strategy": [

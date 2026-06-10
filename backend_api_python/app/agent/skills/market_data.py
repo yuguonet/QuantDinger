@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Market Data skill — 行情数据专家（A股板块轮动特化）。
+Market Data Skill — 行情数据专家（A股板块轮动 + 概念追踪特化）。
 
-负责：实时行情、K线数据、指数、板块排名、资金流向、概念板块。
+合并原 market_data_agent + concept_tracker：
+  实时行情、K线数据、指数、板块排名、资金流向、概念板块热度、
+  涨停池、热榜、题材生命周期判断、龙头识别。
 A股板块轮动是核心特征，行情分析必须关注板块和概念维度。
 """
 from __future__ import annotations
@@ -15,22 +17,33 @@ from app.agent.skills.registry import skill
 
 @skill(
     name="market_data_agent",
-    description="行情数据专家。负责实时行情、K线数据、大盘指数、板块排名、概念板块热度、资金流向。A股板块轮动是核心特征。当用户问行情、报价、指数、板块、资金流向时调用。",
+    description="行情数据专家。负责实时行情、K线数据、大盘指数、板块排名、概念板块热度、资金流向、涨停池、热榜、题材追踪。A股板块轮动是核心特征。当用户问行情、报价、指数、板块、资金流向、概念、题材、热点时调用。",
     instructions=(
-        "你是A股行情数据专家。\n\n"
+        "你是A股行情数据专家，兼概念/题材追踪。\n\n"
         "数据获取流程：\n"
-        "1. **大盘环境** — 用 get_market_indices 看大盘指数，用 get_index_etf_quote 获取更多指数+ETF行情（支持沪深300/创业板/上证50ETF等）。\n"
+        "1. **大盘环境** — 用 get_market_indices 看大盘指数，用 get_index_etf_quote 获取更多指数+ETF行情。\n"
         "   - 大盘方向决定仓位上限（下跌市轻仓，上涨市可重仓）\n"
         "2. **板块轮动** — 用 get_hot_sectors 获取实时热门板块（涨停数/领涨股/强度标签/情绪判断），\n"
         "   用 get_sector_trend_analysis 查板块趋势分析（持续走强/走弱+季节性规律），\n"
         "   用 get_sector_history_data 获取板块历史排名走势。\n"
         "   - 今日领涨板块 = 短期资金偏好\n"
         "   - 连续领涨板块 = 中期主线\n"
-        "3. **概念热度** — 关注概念板块的涨停数量和连板高度。\n"
+        "3. **概念热度** — 用 get_hot_stocks_with_reason 看当日强势股+题材归因，\n"
+        "   用 get_concept_fund_flow 看概念资金流向，\n"
+        "   用 get_stock_concept_blocks 查个股所属板块。\n"
+        "   - 连续 2 天以上领涨的板块 = 当前主线\n"
+        "   - 今日新出现的领涨板块 = 新题材启动\n"
         "4. **资金流向** — 用 get_fund_flow / get_sector_fund_flow / get_concept_fund_flow。\n"
         "   - 主力净流入方向 = 聪明钱态度\n"
         "   - 板块资金流向 = 轮动方向\n"
-        "5. **个股行情** — 用 get_realtime_quote 获取实时报价，agent_get_kline 获取K线。\n\n"
+        "5. **涨停池/热榜** — 用 get_zt_pool 看涨停池识别龙头，\n"
+        "   用 get_hot_rank 看市场关注度排名，\n"
+        "   用 get_limit_down / get_broken_board 看情绪面。\n"
+        "   - 最先涨停 = 先手龙\n"
+        "   - 连板最多 = 高度龙\n"
+        "   - 成交额最大 = 人气龙\n"
+        "   - 龙头不倒，题材不死\n"
+        "6. **个股行情** — 用 get_realtime_quote 获取实时报价，agent_get_kline 获取K线。\n\n"
         "A股特别注意：\n"
         "- 两市成交额 < 8000 亿 = 缩量，短线难做\n"
         "- 两市成交额 > 1.5 万亿 = 放量，活跃度高\n"
@@ -66,12 +79,14 @@ from app.agent.skills.registry import skill
         "get_market_indices", "get_sector_rankings",
         "get_market_overview",
         "get_fund_flow", "get_sector_fund_flow", "get_concept_fund_flow",
+        "get_zt_pool", "get_hot_rank", "get_limit_down", "get_broken_board",
+        "get_hot_sectors",
     ],
     priority=10,
     default_weight=0.9,
 )
 class MarketDataSkill:
-    """行情数据专家子 Agent。"""
+    """行情数据专家（含概念追踪）。"""
 
     def algo_analyze(
         self,
@@ -80,22 +95,22 @@ class MarketDataSkill:
         tool_results: Dict[str, Any],
         **kwargs,
     ) -> Optional[SkillReport]:
-        """纯算法行情数据汇总。
+        """纯算法行情数据 + 概念追踪汇总。
 
         核心逻辑：
           1. 大盘指数涨跌 → 市场环境评分
           2. 板块排名 → 板块强度
           3. 资金流向 → 主力态度
-          4. 实时报价 → 个股状态
+          4. 涨停池/热榜 → 情绪面 + 概念热度
+          5. 实时报价 → 个股状态
         """
         factors = []
         signals = []
 
-        # ── 1. 大盘指数（权重 30%）──
+        # ── 1. 大盘指数（权重 25%）──
         indices = tool_results.get("get_market_indices", {})
         idx_score = 50
         if isinstance(indices, dict) and "error" not in indices:
-            # 取上证指数涨跌幅
             sh_index = None
             for idx in indices.get("indices", []):
                 if "上证" in str(idx.get("name", "")):
@@ -122,15 +137,14 @@ class MarketDataSkill:
                 factors.append(FactorItem(
                     name="大盘",
                     value=f"{sh_index.get('name', '')} {change_pct:+.2f}%",
-                    score=idx_score,
-                    status="ok",
+                    score=idx_score, status="ok",
                 ))
             else:
                 factors.append(FactorItem(name="大盘", value="数据缺失", score=50, status="missing"))
         else:
             factors.append(FactorItem(name="大盘", value="数据缺失", score=50, status="missing"))
 
-        # ── 2. 板块排名（权重 25%）──
+        # ── 2. 板块排名（权重 20%）──
         sectors = tool_results.get("get_sector_rankings", {})
         sec_score = 50
         if isinstance(sectors, dict) and "error" not in sectors:
@@ -150,15 +164,14 @@ class MarketDataSkill:
                 factors.append(FactorItem(
                     name="板块",
                     value=f"{sec_name} {sec_change:+.2f}%",
-                    score=sec_score,
-                    status="ok",
+                    score=sec_score, status="ok",
                 ))
             else:
                 factors.append(FactorItem(name="板块", value="无数据", score=50, status="missing"))
         else:
             factors.append(FactorItem(name="板块", value="数据缺失", score=50, status="missing"))
 
-        # ── 3. 资金流向（权重 25%）──
+        # ── 3. 资金流向（权重 20%）──
         fund_flow = tool_results.get("get_fund_flow", {})
         flow_score = 50
         if isinstance(fund_flow, dict) and "error" not in fund_flow:
@@ -173,13 +186,36 @@ class MarketDataSkill:
             factors.append(FactorItem(
                 name="资金",
                 value=f"净{'流入' if net_inflow > 0 else '流出'}{abs(net_inflow)/10000:.1f}万",
-                score=flow_score,
-                status="ok",
+                score=flow_score, status="ok",
             ))
         else:
             factors.append(FactorItem(name="资金", value="数据缺失", score=50, status="missing"))
 
-        # ── 4. 个股行情（权重 20%）──
+        # ── 4. 涨停池/情绪面（权重 15%）──
+        zt_pool = tool_results.get("get_zt_pool", {})
+        emotion_score = 50
+        if isinstance(zt_pool, dict) and "error" not in zt_pool:
+            zt_count = zt_pool.get("count", 0) or len(zt_pool.get("stocks", []))
+            if zt_count > 50:
+                emotion_score = 80
+                signals.append(f"涨停{zt_count}家情绪高涨")
+            elif zt_count > 20:
+                emotion_score = 65
+                signals.append(f"涨停{zt_count}家")
+            elif zt_count > 5:
+                emotion_score = 50
+            else:
+                emotion_score = 35
+
+            factors.append(FactorItem(
+                name="情绪",
+                value=f"涨停{zt_count}家",
+                score=emotion_score, status="ok",
+            ))
+        else:
+            factors.append(FactorItem(name="情绪", value="数据缺失", score=50, status="missing"))
+
+        # ── 5. 个股行情（权重 20%）──
         quote = tool_results.get("get_realtime_quote", {})
         quote_score = 50
         if isinstance(quote, dict) and "error" not in quote:
@@ -203,17 +239,17 @@ class MarketDataSkill:
             factors.append(FactorItem(
                 name="行情",
                 value=f"{change_pct:+.2f}% 量比{volume_ratio:.1f}",
-                score=quote_score,
-                status="ok",
+                score=quote_score, status="ok",
             ))
         else:
             factors.append(FactorItem(name="行情", value="数据缺失", score=50, status="missing"))
 
         # ── 综合 ──
         final_score = int(
-            idx_score * 0.30 +
-            sec_score * 0.25 +
-            flow_score * 0.25 +
+            idx_score * 0.25 +
+            sec_score * 0.20 +
+            flow_score * 0.20 +
+            emotion_score * 0.15 +
             quote_score * 0.20
         )
         final_score = max(0, min(100, final_score))
@@ -226,7 +262,7 @@ class MarketDataSkill:
             direction = "neutral"
 
         valid_count = sum(1 for f in factors if f.status == "ok")
-        confidence = round(min(valid_count / 4, 1.0), 2)
+        confidence = round(min(valid_count / 5, 1.0), 2)
 
         signal_text = ",".join(str(s) for s in signals[:5]) if signals else "市场平稳"
 
@@ -237,6 +273,6 @@ class MarketDataSkill:
             signal=signal_text,
             confidence=confidence,
             factors=factors,
-            analysis=f"行情综合评分:{final_score}/100。大盘:{idx_score} 板块:{sec_score} 资金:{flow_score} 行情:{quote_score}",
+            analysis=f"行情综合评分:{final_score}/100。大盘:{idx_score} 板块:{sec_score} 资金:{flow_score} 情绪:{emotion_score} 行情:{quote_score}",
             status="ok",
         )

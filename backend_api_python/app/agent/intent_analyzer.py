@@ -545,7 +545,13 @@ def format_intent_for_agent(intent: IntentResult, original_message: str) -> str:
     if tool_chain:
         parts.append("[工具链] 建议执行步骤（按优先级，遇到失败可自行调整）:")
         for i, step in enumerate(tool_chain, 1):
-            parts.append(f"  {i}. {step['tool']} — {step['desc']}")
+            tool = step['tool']
+            desc = step.get('desc', '')
+            args = step.get('args', {})
+            if tool == 'call_skill' and 'skill_name' in args:
+                parts.append(f"  {i}. call_skill(skill_name=\"{args['skill_name']}\") — {desc}")
+            else:
+                parts.append(f"  {i}. {tool} — {desc}")
         parts.append("  以上为建议顺序，可自行调整。")
 
     if intent.confidence < 0.6:

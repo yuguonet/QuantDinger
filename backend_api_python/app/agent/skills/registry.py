@@ -49,12 +49,12 @@ def skill(
 
     使用示例：
         @skill(
-            name="momentum_tracker",
-            description="A股动量追踪师",
+            name="technical_agent",
+            description="A股技术面+动量分析专家",
             tools=["analyze_trend", "get_indicator_snapshot"],
             priority=9,
         )
-        class MomentumTrackerSkill:
+        class TechnicalSkill:
             pass
 
     装饰后：

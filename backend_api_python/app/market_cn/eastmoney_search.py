@@ -159,3 +159,38 @@ def search_stocks(
         "page_size": page_size,
         "stocks": stocks,
     }
+
+
+def _em_get(
+    url: str,
+    params: Optional[Dict[str, Any]] = None,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: int = 15,
+) -> requests.Response:
+    """东财通用 GET 请求封装。
+
+    被 research_tools / signal_tools 等模块调用。
+    返回原始 Response 对象，由调用方自行 .json() 解析。
+
+    Args:
+        url:     请求地址
+        params:  URL 参数
+        headers: 请求头
+        timeout: 超时秒数
+
+    Returns:
+        requests.Response
+
+    Raises:
+        requests.RequestException: 网络/HTTP 错误
+    """
+    default_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
+    if headers:
+        default_headers.update(headers)
+
+    resp = requests.get(url, params=params, headers=default_headers, timeout=timeout)
+    resp.raise_for_status()
+    return resp
