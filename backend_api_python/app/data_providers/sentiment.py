@@ -162,11 +162,13 @@ def _safe_get_json(url: str, params: Optional[Dict] = None, timeout: int = 5) ->
         return {}
 
 # ============================================================================
-# 新浪系列
+# 新浪系列 — 需要 Referer 头，否则 hq.sinajs.cn 会拒绝/超时
 # ============================================================================
 
+_SINA_HEADERS = {"Referer": "https://finance.sina.com.cn"}
+
 def _try_sina_vix(timeout: float = 5) -> Dict[str, Any]:
-    r = requests.get("http://hq.sinajs.cn/list=int_vix", timeout=timeout)
+    r = requests.get("http://hq.sinajs.cn/list=int_vix", timeout=timeout, headers=_SINA_HEADERS)
     r.raise_for_status()
     parts = r.text.split(",")
     if len(parts) < 3:
@@ -178,7 +180,7 @@ def _try_sina_vix(timeout: float = 5) -> Dict[str, Any]:
 
 
 def _try_sina_vxn(timeout: float = 5) -> Dict[str, Any]:
-    r = requests.get("http://hq.sinajs.cn/list=int_vxn", timeout=timeout)
+    r = requests.get("http://hq.sinajs.cn/list=int_vxn", timeout=timeout, headers=_SINA_HEADERS)
     r.raise_for_status()
     parts = r.text.split(",")
     if len(parts) < 3:
@@ -190,7 +192,7 @@ def _try_sina_vxn(timeout: float = 5) -> Dict[str, Any]:
 
 
 def _try_sina_gvz(timeout: float = 5) -> Dict[str, Any]:
-    r = requests.get("http://hq.sinajs.cn/list=int_gvz", timeout=timeout)
+    r = requests.get("http://hq.sinajs.cn/list=int_gvz", timeout=timeout, headers=_SINA_HEADERS)
     r.raise_for_status()
     parts = r.text.split(",")
     if len(parts) < 3:
@@ -202,7 +204,7 @@ def _try_sina_gvz(timeout: float = 5) -> Dict[str, Any]:
 
 
 def _try_sina_dxy(timeout: float = 5) -> Dict[str, Any]:
-    r = requests.get("http://hq.sinajs.cn/list=fx_susdind", timeout=timeout)
+    r = requests.get("http://hq.sinajs.cn/list=fx_susdind", timeout=timeout, headers=_SINA_HEADERS)
     r.raise_for_status()
     parts = r.text.split(",")
     if len(parts) < 2:
@@ -214,7 +216,7 @@ def _try_sina_dxy(timeout: float = 5) -> Dict[str, Any]:
 
 
 def _try_sina_yield(timeout: float = 5) -> Dict[str, Any]:
-    r = requests.get("http://hq.sinajs.cn/list=bond_us02y,bond_us10y", timeout=timeout)
+    r = requests.get("http://hq.sinajs.cn/list=bond_us02y,bond_us10y", timeout=timeout, headers=_SINA_HEADERS)
     r.raise_for_status()
     lines = r.text.strip().split("\n")
     if len(lines) < 2:
@@ -708,7 +710,7 @@ def fetch_put_call_ratio() -> Dict[str, Any]:
         used_source = src
         try:
             if src == "sina":
-                r1 = requests.get("http://hq.sinajs.cn/list=int_vix", timeout=to)
+                r1 = requests.get("http://hq.sinajs.cn/list=int_vix", timeout=to, headers=_SINA_HEADERS)
                 r1.raise_for_status()
                 vix_val = _safe_float(r1.text.split(",")[2])
                 if vix_val <= 0:
