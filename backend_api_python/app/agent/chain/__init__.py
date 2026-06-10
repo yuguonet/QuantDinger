@@ -19,11 +19,8 @@ from app.agent.chain.schema import (
 from app.agent.chain.store import (
     save_tree, load_tree, query_roots, query_pending_verify,
     update_verify_results, update_skill_verify,
-    get_factor_weights, get_skill_weights_from_db, get_eval_stats,
+    get_skill_weights, get_factor_weights, get_eval_stats,
 )
-
-# 兼容别名：旧代码可能引用 get_skill_weights
-get_skill_weights = get_skill_weights_from_db
 from app.agent.chain.contract import parse_skill_output, extract_tools_called
 
 __all__ = [
@@ -33,6 +30,7 @@ __all__ = [
     "get_skill_cn_name", "classify_return", "is_direction_correct",
     "save_tree", "load_tree", "query_roots", "query_pending_verify",
     "update_verify_results", "update_skill_verify",
-    "get_factor_weights", "get_skill_weights", "get_skill_weights_from_db", "get_eval_stats",
+    "get_skill_weights", "get_factor_weights",
+    "get_eval_stats",
     "parse_skill_output", "extract_tools_called",
 ]

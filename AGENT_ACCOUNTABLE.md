@@ -1,6 +1,6 @@
 # Agent + 可追责 架构设计
 
-> 日期: 2026-06-09（初版）→ 2026-06-10（补充关键设计细节）
+> 日期: 2026-06-09（初版）→ 2026-06-10（补充关键设计细节 + Skill 自注册 + 因子清理）
 > 适用范围: 仅 domain="finance" 金融领域，其他领域保持 DESIGN_RESTRUCTURE.md 架构
 > 替代: DESIGN_RESTRUCTURE.md（算法化路线，已废弃，保留只读参考）
 > 继承: AGENT_REDESIGN.md（三层追责体系）+ 现有 agent.py（smolagents）
@@ -670,9 +670,18 @@ def apply_decay(trades: list, half_life_days: int = 30) -> list:
 盘后自动运行:
   1. 查找 exit_date IS NULL 的 chain 层记录
   2. 按 timeframe 取实际行情，写回 pnl_pct / hold_days / correct
-  3. 聚合每个 Skill 的历史交易 → calc_skill_weight → 写入 qd_skill_weights
-  4. 聚合每个因子的历史交易 → calc_factor_weight → 写入 qd_factor_weights
+  3. update_skill_weights():
+     3a. 自动同步 registry（新 Skill → INSERT 工厂默认值，旧 Skill 保留）
+     3b. 聚合每个 Skill 的历史交易 → calc_skill_weight → UPSERT qd_skill_weights
+  4. update_factor_weights():
+     4a. 聚合每个因子的历史交易 → calc_factor_weight → UPSERT qd_factor_weights
+     4b. 清理过期因子（近 N 天内未出现的 → DELETE）
   5. 下次 agent 执行时，权重自动注入到 instructions
+```
+
+**Skill 自注册**：新增 `skills/xxx.py` + `@skill` 装饰器 → 进程重启 → `skill_registry.discover()` 自动注册 → `update_skill_weights()` 首次运行时自动 INSERT 到 `qd_skill_weights`。增删 Skill 文件无需手动改表。
+
+**因子自动清理**：`update_factor_weights()` 每次运行时记录 `active_keys`（近 N 天内实际出现的因子），DELETE 不在 `active_keys` 中的旧因子，防止表无限膨胀。
 
 ## 五、与现有代码的关系
 
@@ -1128,6 +1137,8 @@ CREATE TABLE qd_skill_weights (
 );
 
 -- 出厂权重（无历史数据时的默认值）
+-- ⚠️ 注意：出厂 INSERT 仅作参考。实际运行时 evaluator.update_skill_weights()
+-- 会自动从 skill_registry 发现新 Skill 并 INSERT，无需手动维护此表。
 INSERT INTO qd_skill_weights (skill_name, weight) VALUES
 ('technical_agent', 1.2),
 ('momentum_tracker', 1.1),
@@ -1180,6 +1191,7 @@ intelligence_agent 历史 60 笔交易:
 - qd_evaluations 旧表保留只读（历史查询用），不迁移数据到 qd_traces
 - qd_traces 从零开始，盘后定时任务跑 `evaluate_pending()` + `update_weights()` 逐步积累
 - 冷启动期间所有 Skill/因子权重使用出厂值（qd_skill_weights / qd_factor_weights 的 INSERT）
+- **新增 Skill 自动注册**：`update_skill_weights()` 每次运行时自动同步 `skill_registry`，新 Skill 首次出现时自动 INSERT 工厂默认值，无需手动改表
 - 有回测数据后自动迭代，权重生效周期取决于用户使用频率和回溯窗口（T+3~T+5）
 - 预计积累 50+ 笔已验证决策后，权重开始有统计意义
 
@@ -1242,7 +1254,7 @@ def _enforce_size_limit(root: EvalNode):
 
 ## 十一、设计决议
 
-> 以下为设计评审中确认的 4 项关键决策，记录备查。
+> 以下为设计评审中确认的 6 项关键决策，记录备查。
 
 ### 11.1 Domain 隔离方案：装饰器模式
 
@@ -1316,6 +1328,42 @@ def _enforce_size_limit(root: EvalNode):
 - 盘后定时任务 `evaluate_pending()` + `update_weights()` 逐步积累
 - 预计 50+ 笔已验证决策后权重有统计意义
 - 旧表 qd_evaluations 保留只读，仅作历史查询参考
+
+### 11.5 Skill 自注册：evaluator 自动同步 registry
+
+**决策**：增删 Skill 文件无需手动改 `qd_skill_weights` 表，由 `evaluator.update_skill_weights()` 自动同步。
+
+**依据**：
+- Skill 通过 `@skill` 装饰器自动注册到 `skill_registry`（`discover()` 扫描 `skills/` 包）
+- `update_skill_weights()` 运行时先查表中已有 Skill，再和 `skill_registry.all_names` 对比
+- 新 Skill → `INSERT (skill_name, weight=default_weight, sample_count=0)`
+- 旧 Skill → 保留（不删除，避免丢失历史权重数据）
+
+**效果**：加 `skills/xxx.py` → 重启 → 自动到位。零维护。
+
+**实现**（`evaluator.py` `update_skill_weights()` 开头）：
+```python
+cur.execute("SELECT skill_name FROM qd_skill_weights")
+existing = {row['skill_name'] for row in cur.fetchall()}
+for name in skill_registry.all_names:
+    if name not in existing:
+        cls = skill_registry.get_class(name)
+        default_w = getattr(cls, "default_weight", 1.0) if cls else 1.0
+        cur.execute("INSERT INTO qd_skill_weights ... ON CONFLICT DO NOTHING", (name, default_w))
+```
+
+### 11.6 因子权重自动清理
+
+**决策**：`update_factor_weights()` 每次运行时自动清理近 N 天内未出现的过期因子。
+
+**依据**：
+- 因子名由 Skill 的 `analyze()` 动态产出（如 "趋势"、"量价"、"MACD"），不是固定的
+- Skill 重构后可能不再产出某些因子，旧因子残留在 `qd_factor_weights` 表中成为垃圾
+- 不清理 → 表只增不减，长期积累无效数据
+
+**实现**：更新时记录 `active_keys = {(skill_name, factor_name)}`，写入完成后 DELETE 不在 `active_keys` 中的记录。
+
+**效果**：因子随 Skill 实际产出自动增减，无需手动清理。
 
 ## 十二、关键实施设计（恢复/重写参考）
 

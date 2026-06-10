@@ -265,8 +265,8 @@ final_answer({{
     weight_section = ""
     if domain == "finance":
         try:
-            from app.agent.chain.store import get_skill_weights_from_db
-            weights = get_skill_weights_from_db()
+            from app.agent.chain.store import get_skill_weights
+            weights = get_skill_weights()
             if weights:
                 weight_lines = ["| 技能 | 权重 |", "|------|------|"]
                 for name, w in sorted(weights.items(), key=lambda x: -x[1]):

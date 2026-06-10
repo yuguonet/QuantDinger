@@ -1,9 +1,8 @@
 {
     "analyze+stock": [
         {
-            "tool": "call_skill",
-            "args": {"skill_name": "technical_agent"},
-            "desc": "技术面+动量综合分析（趋势/量价/均线/指标/形态/筹码/突破/择时）"
+            "tool": "python_interpreter",
+            "desc": ""
         }
     ],
     "analyze+chart": [
@@ -23,28 +22,36 @@
     "analyze+market": [
         {
             "tool": "call_skill",
-            "args": {"skill_name": "market_data_agent"},
+            "args": {
+                "skill_name": "market_data_agent"
+            },
             "desc": "行情数据专家（大盘/板块/资金流向）"
         }
     ],
     "analyze+indicator": [
         {
             "tool": "call_skill",
-            "args": {"skill_name": "indicator_agent"},
+            "args": {
+                "skill_name": "indicator_agent"
+            },
             "desc": "指标分析专家（MACD/KDJ/RSI/BOLL多维共振）"
         }
     ],
     "analyze+fund_flow": [
         {
             "tool": "call_skill",
-            "args": {"skill_name": "hot_money_tracker"},
+            "args": {
+                "skill_name": "hot_money_tracker"
+            },
             "desc": "游资追踪师（龙虎榜/大单/主力资金动态）"
         }
     ],
     "analyze+strategy": [
         {
             "tool": "call_skill",
-            "args": {"skill_name": "backtest_agent"},
+            "args": {
+                "skill_name": "backtest_agent"
+            },
             "desc": "回测专家（策略回测/历史绩效分析）"
         }
     ],
@@ -67,14 +74,18 @@
     "analyze+screener": [
         {
             "tool": "call_skill",
-            "args": {"skill_name": "screening_agent"},
+            "args": {
+                "skill_name": "screening_agent"
+            },
             "desc": "选股专家（条件选股/概念选股/涨停池/热榜）"
         }
     ],
     "analyze+trading": [
         {
             "tool": "call_skill",
-            "args": {"skill_name": "trading_agent"},
+            "args": {
+                "skill_name": "trading_agent"
+            },
             "desc": "交易执行专家（持仓/策略/交易记录）"
         }
     ],
@@ -199,21 +210,27 @@
     "filter+stock": [
         {
             "tool": "call_skill",
-            "args": {"skill_name": "screening_agent"},
+            "args": {
+                "skill_name": "screening_agent"
+            },
             "desc": "选股专家"
         }
     ],
     "filter+screener": [
         {
             "tool": "call_skill",
-            "args": {"skill_name": "screening_agent"},
+            "args": {
+                "skill_name": "screening_agent"
+            },
             "desc": "选股专家"
         }
     ],
     "backtest+strategy": [
         {
             "tool": "call_skill",
-            "args": {"skill_name": "backtest_agent"},
+            "args": {
+                "skill_name": "backtest_agent"
+            },
             "desc": "回测专家"
         }
     ],
@@ -263,16 +280,8 @@
     ],
     "filter+market": [
         {
-            "tool": "get_market_indices",
-            "desc": "获取大盘指数"
-        },
-        {
-            "tool": "get_hot_sectors",
-            "desc": "获取热门板块"
-        },
-        {
-            "tool": "get_zt_pool",
-            "desc": "获取涨停池"
+            "tool": "python_interpreter",
+            "desc": ""
         }
     ]
 }

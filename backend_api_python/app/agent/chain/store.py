@@ -415,12 +415,19 @@ def update_skill_verify(root_id: int, actual_direction: str):
 
 # ═══════════════════════════════════════════════════════════════
 # 权重查询
+#
+# Skill 权重：qd_skill_weights 表
+# 因子权重：qd_factor_weights 表
+#
+# evaluator.update_skill_weights() 自动同步 registry：
+#   - 新 Skill 自动 INSERT 工厂默认值
+#   - registry 删除的 Skill 保留但标记
+#   - 增删 Skill 零维护
 # ═══════════════════════════════════════════════════════════════
 
-def get_skill_weights_from_db() -> Dict[str, float]:
+def get_skill_weights() -> Dict[str, float]:
     """从 qd_skill_weights 获取 Skill 权重。"""
     from app.utils.db import get_db_connection
-
     weights = {}
     try:
         with get_db_connection() as conn:
@@ -436,7 +443,6 @@ def get_skill_weights_from_db() -> Dict[str, float]:
 def get_factor_weights(skill_name: str = None) -> Dict[str, float]:
     """从 qd_factor_weights 获取因子权重。"""
     from app.utils.db import get_db_connection
-
     weights = {}
     try:
         with get_db_connection() as conn:

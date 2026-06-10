@@ -6,8 +6,8 @@ Evaluator — 回溯评估引擎（重写版）。
 
 核心流程（每日盘后自动运行）：
   evaluate_pending()      → 按 timeframe 取实际行情，写回 qd_traces
-  update_skill_weights()  → 按单位时间收益率聚合 Skill 权重
-  update_factor_weights() → 按单位时间收益率聚合因子权重（带时间衰减）
+  update_skill_weights()  → 按单位时间收益率聚合 Skill 权重 + 自动同步 registry
+  update_factor_weights() → 按单位时间收益率聚合因子权重（带时间衰减）+ 清理过期因子
   auto_evaluate()         → 自动闭环
 
 核心指标：单位时间期望收益率（不是胜率）
@@ -264,21 +264,40 @@ def _calc_skill_weight_from_trades(trades: List[Dict]) -> Dict[str, float]:
 def update_skill_weights(days: int = 90) -> Dict[str, Any]:
     """更新 qd_skill_weights 表。
 
-    从 qd_traces 中读取已验证的 skill 节点，
-    按 skill_name 聚合带时间衰减的交易记录，
-    计算单位时间收益率，写入 qd_skill_weights。
+    自动同步 registry：
+      1. 从 registry 读当前所有 Skill
+      2. 新 Skill → INSERT 工厂默认值
+      3. 已有 Skill + 有回测数据 → 更新权重
+      4. registry 删除的 Skill → 保留（不删，避免丢失历史）
     """
     from app.utils.db import get_db_connection
+    from app.agent.skills.registry import skill_registry
+    skill_registry.discover()
 
-    stats = {"updated": 0}
+    stats = {"synced": 0, "updated": 0}
     since = date.today() - timedelta(days=days)
-    today = date.today()
 
     try:
         with get_db_connection() as conn:
             cur = conn.cursor()
 
-            # 获取已验证的 skill 节点
+            # ① 同步 registry：新 Skill 自动 INSERT 工厂默认值
+            cur.execute("SELECT skill_name FROM qd_skill_weights")
+            existing = {row['skill_name'] for row in cur.fetchall()}
+
+            for name in skill_registry.all_names:
+                if name not in existing:
+                    cls = skill_registry.get_class(name)
+                    default_w = getattr(cls, "default_weight", 1.0) if cls else 1.0
+                    cur.execute("""
+                        INSERT INTO qd_skill_weights (skill_name, weight, sample_count)
+                        VALUES (%s, %s, 0)
+                        ON CONFLICT (skill_name) DO NOTHING
+                    """, (name, default_w))
+                    stats["synced"] += 1
+                    logger.info("[Evaluator] 新 Skill 注册: %s (weight=%.2f)", name, default_w)
+
+            # ② 从 qd_traces 读已验证的 skill 节点
             cur.execute("""
                 SELECT t.name as skill_name, t.pnl_pct, t.hold_days, t.correct,
                        r.exec_date
@@ -290,7 +309,6 @@ def update_skill_weights(days: int = 90) -> Dict[str, Any]:
                   AND r.exec_date >= %s
             """, (since,))
 
-            # 按 skill_name 聚合
             skill_trades: Dict[str, List[Dict]] = {}
             for row in cur.fetchall():
                 skill_name = row['skill_name']
@@ -303,7 +321,7 @@ def update_skill_weights(days: int = 90) -> Dict[str, Any]:
                     "exec_date": row['exec_date'],
                 })
 
-            # 计算权重并写入
+            # ③ 计算权重并 UPSERT
             for skill_name, trades in skill_trades.items():
                 result = _calc_skill_weight_from_trades(trades)
 
@@ -333,7 +351,7 @@ def update_skill_weights(days: int = 90) -> Dict[str, Any]:
     except Exception as e:
         logger.error("[Evaluator] 更新 Skill 权重失败: %s", e)
 
-    logger.info("[Evaluator] Skill 权重已更新: %d 个", stats["updated"])
+    logger.info("[Evaluator] Skill 权重: 同步 %d 个新 Skill, 更新 %d 个", stats["synced"], stats["updated"])
     return stats
 
 
@@ -375,11 +393,12 @@ def update_factor_weights(days: int = 90) -> Dict[str, Any]:
     """更新 qd_factor_weights 表。
 
     从 qd_traces 中读取已验证的 skill 节点及其 factors，
-    按 (skill_name, factor_name) 聚合带时间衰减的准确率。
+    按 (skill_name, factor_name) 聚合带时间衰减的准确率，UPSERT 到表。
+    同时清理近 days 天内未出现的过期因子。
     """
     from app.utils.db import get_db_connection
 
-    stats = {"updated": 0}
+    stats = {"updated": 0, "cleaned": 0}
     since = date.today() - timedelta(days=days)
     today = date.today()
 
@@ -398,7 +417,6 @@ def update_factor_weights(days: int = 90) -> Dict[str, Any]:
                   AND r.exec_date >= %s
             """, (since,))
 
-            # 聚合: (skill_name, factor_name) → {weighted_correct, weighted_total}
             factor_stats: Dict[tuple, Dict[str, float]] = {}
 
             for row in cur.fetchall():
@@ -436,12 +454,14 @@ def update_factor_weights(days: int = 90) -> Dict[str, Any]:
                     if correct:
                         factor_stats[key]["weighted_correct"] += decay_weight
 
-            # UPSERT
+            # UPSERT 有效因子
+            active_keys = set()
             for (skill_name, fname), s in factor_stats.items():
                 total = s["weighted_total"]
                 if total < 0.5:
                     continue
 
+                active_keys.add((skill_name, fname))
                 accuracy = round(s["weighted_correct"] / total, 4)
                 weight = max(0.5, min(2.0, accuracy * 2))
 
@@ -461,12 +481,27 @@ def update_factor_weights(days: int = 90) -> Dict[str, Any]:
                       int(s["raw_total"]), s["half_life"]))
                 stats["updated"] += 1
 
+            # 清理过期因子：近 days 天内未出现的
+            if active_keys:
+                placeholders = []
+                params = []
+                for sname, fname in active_keys:
+                    placeholders.append(f"NOT (skill_name = %s AND factor_name = %s)")
+                    params.extend([sname, fname])
+                if placeholders:
+                    cur.execute(f"""
+                        DELETE FROM qd_factor_weights
+                        WHERE sample_count > 0
+                          AND ({' AND '.join(placeholders)})
+                    """, params)
+                    stats["cleaned"] = cur.rowcount
+
             conn.commit()
 
     except Exception as e:
         logger.error("[Evaluator] 更新因子权重失败: %s", e)
 
-    logger.info("[Evaluator] 因子权重已更新: %d 个", stats["updated"])
+    logger.info("[Evaluator] 因子权重: 更新 %d 个, 清理 %d 个过期", stats["updated"], stats["cleaned"])
     return stats
 
 

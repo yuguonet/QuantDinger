@@ -178,7 +178,7 @@ class ChainExecutor:
         优先用历史评估数据，无历史时用 skill 的 default_weight（出厂权重）。
         """
         try:
-            weights = store.get_skill_weights(self.chain_id)
+            weights = store.get_skill_weights()
             if weights:
                 logger.info("[ChainExecutor] 加载历史权重 %s: %s", self.chain_id, weights)
                 return weights
