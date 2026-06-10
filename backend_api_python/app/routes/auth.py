@@ -174,21 +174,22 @@ def login():
         if user.get('status') == 'pending':
             return jsonify({'code': 0, 'msg': 'Account is pending activation', 'data': None}), 403
         
-        # Step 4: Increment token_version (invalidates old sessions for single-client login)
+        # Step 4: 获取 token_version（不再每次登录递增，避免重启后旧 token 失效）
+        # token_version 仅在以下场景递增：修改密码、"登出所有设备"
         user_id = user.get('id') or user.get('user_id', 1)
         try:
             from app.services.user_service import get_user_service
-            new_token_version = get_user_service().increment_token_version(user_id)
+            token_version = get_user_service().get_token_version(user_id)
         except Exception as e:
-            logger.warning(f"Failed to increment token_version: {e}")
-            new_token_version = 1
+            logger.warning(f"Failed to get token_version: {e}")
+            token_version = 1
         
-        # Step 5: Generate token with new token_version
+        # Step 5: Generate token
         token = generate_token(
             user_id=user_id,
             username=user.get('username', username),
             role=user.get('role', 'admin'),
-            token_version=new_token_version  # 包含新的 token_version
+            token_version=token_version
         )
         
         if not token:
@@ -368,14 +369,14 @@ def login_with_code():
                                        {'reason': 'account_disabled'})
             return jsonify({'code': 0, 'msg': 'Account is disabled', 'data': None}), 403
         
-        # Increment token_version (invalidates old sessions for single-client login)
+        # 获取 token_version（不再每次登录递增）
         try:
-            new_token_version = user_service.increment_token_version(user['id'])
+            new_token_version = user_service.get_token_version(user['id'])
         except Exception as e:
-            logger.warning(f"Failed to increment token_version: {e}")
+            logger.warning(f"Failed to get token_version: {e}")
             new_token_version = 1
         
-        # Generate token with new token_version
+        # Generate token
         token = generate_token(
             user_id=user['id'],
             username=user['username'],
@@ -897,13 +898,13 @@ def oauth_google_callback():
             error_msg = user_result.get('error', 'user_creation_failed')
             return redirect(_build_frontend_login_redirect(frontend_url, oauth_error=error_msg))
         
-        # Increment token_version (invalidates old sessions for single-client login)
+        # 获取 token_version（不再每次登录递增）
         from app.services.user_service import get_user_service
         user_service = get_user_service()
         try:
-            new_token_version = user_service.increment_token_version(user_result['id'])
+            new_token_version = user_service.get_token_version(user_result['id'])
         except Exception as e:
-            logger.warning(f"Failed to increment token_version: {e}")
+            logger.warning(f"Failed to get token_version: {e}")
             new_token_version = 1
         
         # Generate token with new token_version
@@ -983,13 +984,13 @@ def oauth_github_callback():
             error_msg = user_result.get('error', 'user_creation_failed')
             return redirect(_build_frontend_login_redirect(frontend_url, oauth_error=error_msg))
         
-        # Increment token_version (invalidates old sessions for single-client login)
+        # 获取 token_version（不再每次登录递增）
         from app.services.user_service import get_user_service
         user_service = get_user_service()
         try:
-            new_token_version = user_service.increment_token_version(user_result['id'])
+            new_token_version = user_service.get_token_version(user_result['id'])
         except Exception as e:
-            logger.warning(f"Failed to increment token_version: {e}")
+            logger.warning(f"Failed to get token_version: {e}")
             new_token_version = 1
         
         # Generate token with new token_version

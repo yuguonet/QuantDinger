@@ -355,23 +355,20 @@ class EvalNode:
 # 辅助函数
 # ═══════════════════════════════════════════════════════════════
 
-# 技能中文名映射
+# 技能中文名映射（与 skills/ 注册名一一对应，无别名）
 SKILL_NAME_CN: Dict[str, str] = {
     "technical_agent": "技术面/动量",
-    "momentum_tracker": "技术面/动量",  # 已合并到 technical_agent
     "indicator_agent": "指标信号",
     "intelligence_agent": "情报/政策",
-    "policy_analyst": "情报/政策",  # 已合并到 intelligence_agent
     "hot_money_tracker": "游资追踪",
     "lockup_watcher": "解禁监控",
-    "concept_tracker": "行情/概念",  # 已合并到 market_data_agent
     "market_data_agent": "行情/概念/资金",
     "screening_agent": "选股验证",
     "backtest_agent": "策略回测",
     "bull_researcher": "多头论证",
     "bear_researcher": "空头反驳",
     "trading_agent": "交易执行",
-    "data_engineer": "数据工程",
+    "data_agent": "数据工程",
     "analysis_agent": "综合分析",
 }
 

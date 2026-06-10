@@ -222,7 +222,6 @@ def _build_instructions(user_message: str = "", skill_instructions: str = "",
 - 不同时间维度方向可能相反，必须明确"""
 
         if _agent_cls is ToolCallingAgent:
-            # ToolCallingAgent：输出 JSON tool call 格式
             finance_json_section = f"""
 ## ⚠️ 输出格式（必须遵守）
 
@@ -243,7 +242,6 @@ def _build_instructions(user_message: str = "", skill_instructions: str = "",
 
 """
         else:
-            # CodeAgent：输出 Python 代码调用 final_answer()
             finance_json_section = f"""
 ## ⚠️ 输出格式（必须遵守）
 
@@ -286,6 +284,7 @@ final_answer({{
 0. **⚠️ 必须用 final_answer() 返回结果** — 完成任务后，必须调用 `final_answer(你的回复)` 来结束。
 1. **不需要工具的消息，第一步就 final_answer** — 打招呼、闲聊等直接调用 final_answer。
 2. **必须调用工具获取真实数据** — 绝不编造数字。
+3. **⚠️ 分析股票必须先调 call_skill** — 不要直接调底层工具（get_realtime_quote、analyze_trend 等），先用 `call_skill(skill_name="technical_agent", stock_code="代码")` 获取标准化报告，再按需调其他 skill。
 3. **深度优先** — 分析深度不够时用 Python 代码做量化分析。
 4. **风险优先** — 分析必须包含风险提示。
 5. **工具失败处理** — 记录失败原因，用已有数据继续，不重复调用。
@@ -1065,6 +1064,35 @@ class _AgentExecutor:
                                         break
                                 except (_json_card.JSONDecodeError, TypeError):
                                     _card_data = None
+
+                    # ── fallback：自由文本 → skip JSON ──
+                    # agent 输出了非 JSON 内容，构造兜底结构化响应
+                    if _card_data is None and isinstance(content, str) and content.strip():
+                        _stock_code = ""
+                        _stock_name = ""
+                        if context:
+                            _stock_code = context.get("stock_code", "")
+                            _stock_name = context.get("stock_name", "")
+                        if not _stock_code:
+                            for _k in ("stock_code", "stock", "symbol", "code"):
+                                if _k in (meta or {}) and meta[_k]:
+                                    _stock_code = str(meta[_k])
+                                    break
+                        _card_data = {
+                            "action": "skip",
+                            "score": 0,
+                            "direction": "neutral",
+                            "confidence": "low",
+                            "timeframe": "T+3",
+                            "timeframe_reason": "agent未输出结构化JSON",
+                            "stock_code": _stock_code or collector.stock_code if collector else "",
+                            "stock_name": _stock_name or collector.stock_name if collector else "",
+                            "signal": "分析未完成，输出格式异常",
+                            "factors": [],
+                            "analysis": content[:2000],
+                        }
+                        logger.warning("[Agent] JSON提取失败，fallback → skip。原始内容前200字: %s",
+                                       content[:200])
 
                     # 先用原始 JSON 内容调用 on_agent_finish（提取字段 + 存库）
                     # TraceCollector 需要字符串输入，dict 转 JSON 字符串

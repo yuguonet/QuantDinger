@@ -1,7 +1,21 @@
 -- QuantDinger Agent 可追责架构 — 数据库迁移
--- 日期: 2026-06-09
+-- 日期: 2026-06-09（初版）→ 2026-06-10（清理别名，统一注册名）
 -- 适用: domain="finance" 金融领域
 -- 旧表 qd_evaluations 保留只读，不迁移数据
+--
+-- Skill 清单（12个，无别名）：
+--   technical_agent    技术面+动量（合并原 momentum_tracker）
+--   indicator_agent    指标信号
+--   intelligence_agent 情报+政策（合并原 policy_analyst）
+--   hot_money_tracker  游资追踪
+--   lockup_watcher     解禁监控
+--   market_data_agent  行情+概念+资金（合并原 concept_tracker）
+--   screening_agent    选股筛选
+--   backtest_agent     策略回测
+--   bull_researcher    多头论证
+--   bear_researcher    空头反驳
+--   trading_agent      交易执行
+--   data_agent         数据工程（原 data_engineer，注册名为 data_agent）
 
 -- ═══════════════════════════════════════════════════════════
 -- 1. qd_traces — 执行追踪表（替代 qd_evaluations）
@@ -65,79 +79,3 @@ CREATE INDEX IF NOT EXISTS idx_traces_layer ON qd_traces(layer);
 CREATE INDEX IF NOT EXISTS idx_traces_stock ON qd_traces(stock_code, exec_date);
 CREATE INDEX IF NOT EXISTS idx_traces_skill ON qd_traces(name, exec_date) WHERE layer = 'skill';
 CREATE INDEX IF NOT EXISTS idx_traces_pending ON qd_traces(id) WHERE layer = 'chain' AND exit_date IS NULL;
-
--- ═══════════════════════════════════════════════════════════
--- 2. qd_skill_weights — Skill 权重表
--- ═══════════════════════════════════════════════════════════
-
-CREATE TABLE IF NOT EXISTS qd_skill_weights (
-    skill_name      VARCHAR(100) PRIMARY KEY,
-    weight          REAL DEFAULT 1.0,
-    win_rate        REAL,
-    avg_pnl_pct     REAL,
-    avg_hold_days   REAL,
-    return_per_day  REAL,
-    profit_loss_ratio REAL,
-    sample_count    INTEGER DEFAULT 0,
-    decay_half_life INTEGER DEFAULT 30,
-    last_updated    TIMESTAMPTZ
-);
-
-INSERT INTO qd_skill_weights (skill_name, weight) VALUES
-('technical_agent', 1.2),
-('momentum_tracker', 1.1),
-('indicator_agent', 1.1),
-('backtest_agent', 1.0),
-('screening_agent', 1.0),
-('bull_researcher', 1.0),
-('bear_researcher', 1.0),
-('trading_agent', 1.0),
-('market_data_agent', 0.9),
-('concept_tracker', 0.9),
-('lockup_watcher', 0.8),
-('intelligence_agent', 0.8),
-('data_engineer', 0.8),
-('policy_analyst', 0.7),
-('hot_money_tracker', 0.7)
-ON CONFLICT (skill_name) DO NOTHING;
-
--- ═══════════════════════════════════════════════════════════
--- 3. qd_factor_weights — 因子权重表（重建）
--- ═══════════════════════════════════════════════════════════
-
-DROP TABLE IF EXISTS qd_factor_weights CASCADE;
-
-CREATE TABLE qd_factor_weights (
-    id              SERIAL PRIMARY KEY,
-    skill_name      VARCHAR(100) NOT NULL,
-    factor_name     VARCHAR(100) NOT NULL,
-    weight          REAL DEFAULT 1.0,
-    win_rate        REAL,
-    avg_pnl_pct     REAL,
-    avg_hold_days   REAL,
-    return_per_day  REAL,
-    sample_count    INTEGER DEFAULT 0,
-    decay_half_life INTEGER DEFAULT 30,
-    last_updated    TIMESTAMPTZ,
-    UNIQUE(skill_name, factor_name)
-);
-
-INSERT INTO qd_factor_weights (skill_name, factor_name, weight, decay_half_life) VALUES
-('technical_agent', '趋势', 1.0, 60),
-('technical_agent', '量价', 1.0, 60),
-('technical_agent', '指标', 1.0, 30),
-('technical_agent', '形态', 1.0, 30),
-('technical_agent', '筹码', 1.0, 60),
-('momentum_tracker', '趋势强度', 1.0, 30),
-('momentum_tracker', '动量指标', 1.0, 30),
-('momentum_tracker', '突破检测', 1.0, 14),
-('indicator_agent', 'MACD', 1.0, 30),
-('indicator_agent', 'KDJ', 1.0, 30),
-('indicator_agent', 'RSI', 1.0, 30),
-('indicator_agent', 'BOLL', 1.0, 30),
-('intelligence_agent', '新闻情绪', 0.8, 7),
-('intelligence_agent', '事件催化', 0.8, 7),
-('policy_analyst', '产业政策', 0.7, 7),
-('policy_analyst', '货币政策', 0.7, 14),
-('hot_money_tracker', '龙虎榜', 0.7, 7),
-('hot_money_tracker', '游资动向', 0.7, 7);

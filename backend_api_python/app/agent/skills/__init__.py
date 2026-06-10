@@ -7,7 +7,7 @@ Skills — 领域专用分析技能。
   - 分析数据并输出标准化 SkillReport
   - 自动记录入参出参到 EvalNode 子树
 
-12 个内置 Skill（合并后）：
+12 个内置 Skill（合并后，无别名）：
   technical_agent    — 技术面+动量（趋势/量价/均线/指标/形态/突破/择时）
   indicator_agent    — 指标信号（用户自定义指标策略）
   intelligence_agent — 情报+政策（新闻/事件驱动/概念催化/政策分析）
@@ -19,12 +19,7 @@ Skills — 领域专用分析技能。
   bull_researcher    — 多头论证
   bear_researcher    — 空头反驳
   trading_agent      — 交易执行
-  data_engineer      — 数据工程
-
-兼容别名（旧名仍可调用，自动路由到合并后的 Skill）：
-  momentum_tracker   → technical_agent
-  policy_analyst     → intelligence_agent
-  concept_tracker    → market_data_agent
+  data_agent         — 数据工程
 
 使用：
   from app.agent.skills.registry import skill_registry

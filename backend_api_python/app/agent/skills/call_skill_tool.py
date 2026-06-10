@@ -42,9 +42,7 @@ class CallSkillTool(Tool):
                 "lockup_watcher(解禁), market_data_agent(行情+概念+资金), "
                 "screening_agent(选股), backtest_agent(回测), "
                 "bull_researcher(多头), bear_researcher(空头), "
-                "data_agent(数据工程), trading_agent(交易)。"
-                "兼容别名: momentum_tracker→technical_agent, "
-                "policy_analyst→intelligence_agent, concept_tracker→market_data_agent"
+                "data_agent(数据工程), trading_agent(交易)"
             ),
         },
         "stock_code": {
