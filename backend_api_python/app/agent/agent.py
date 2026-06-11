@@ -116,9 +116,11 @@ def _generate_tool_catalog(tools, managed_agents) -> str:
     if uncategorized:
         lines.append(f"**未分层**: {', '.join(sorted(uncategorized))}")
 
-    # 技能调用工具
-    if any(t.name == "call_skill" for t in (tools or [])):
-        lines.append("\n**技能调用**: call_skill — 调用专业分析技能（技术面/动量/情报/政策等）")
+    # 子 agent 列表
+    if managed_agents and managed_agents is not None:
+        lines.append("\n**可用子 agent**")
+        for ma in managed_agents:
+            lines.append(f"  {ma.name} — {ma.description}")
 
     return "\n".join(lines)
 
@@ -283,17 +285,18 @@ final_answer({{
 
 0. **⚠️ 必须用 final_answer() 返回结果** — 完成任务后，必须调用 `final_answer(你的回复)` 来结束。
 1. **不需要工具的消息，第一步就 final_answer** — 打招呼、闲聊等直接调用 final_answer。
-2. **必须调用工具获取真实数据** — 绝不编造数字。
-3. **⚠️ 分析股票必须先调 call_skill** — 不要直接调底层工具（get_realtime_quote、analyze_trend 等），先用 `call_skill(skill_name="technical_agent", stock_code="代码")` 获取标准化报告，再按需调其他 skill。
-3. **深度优先** — 分析深度不够时用 Python 代码做量化分析。
-4. **风险优先** — 分析必须包含风险提示。
-5. **工具失败处理** — 记录失败原因，用已有数据继续，不重复调用。
-6. **多维验证** — 技术面结论至少 2 个指标相互验证。
-7. **善用工具** — 可以组合工具做计算、处理数据。
-8. **诚实透明** — 数据不足时明确告知，不猜测。
-9. **⚠️ 数据完整性** — 如果某个工具调用失败（返回 error），必须在结论中说明
-   "XX数据缺失，以下结论仅供参考"。绝不用想象填补缺失数据。
-10. **⚠️ 确定性输出** — 你的分析必须基于工具返回的客观数据，不能因为"感觉"
+2. **必须调用子 agent 获取真实数据** — 你只能调子 agent（如 technical_agent），绝不直接调底层数据工具。
+3. **⚠️ 分析股票必须先调子 agent** — 不要直接调底层工具。先用 `technical_agent(task="分析600519技术面")` 获取标准化报告，再按需调其他子 agent。
+4. **子 agent 返回 JSON** — 所有子 agent 返回 **JSON 字符串**，用 `json.loads()` 解析后访问 `score`/`direction`/`signal`/`confidence` 等字段。不要按文本格式逐行解析。
+5. **深度优先** — 各子 agent 会完成深度分析，你负责综合评估。
+6. **风险优先** — 分析必须包含风险提示。
+7. **工具失败处理** — 子 agent 返回失败时，在结论中说明，继续用已有数据做判断。
+8. **多维验证** — 综合至少 2 个不同维度的子 agent 报告做交叉验证。
+9. **善用编排** — 按需调多个子 agent，收集所有报告后做加权综合。
+10. **诚实透明** — 数据不足时明确告知，不猜测。
+11. **⚠️ 数据完整性** — 如果某个子 agent 返回失败，必须在结论中说明
+    "XX数据缺失，以下结论仅供参考"。绝不用想象填补缺失数据。
+12. **⚠️ 确定性输出** — 你的分析必须基于子 agent 返回的客观数据，不能因为"感觉"
     或"可能"而改变方向性判断。同样的数据必须得出同样的结论。
 {finance_json_section}{lang_section}"""
 
@@ -596,10 +599,84 @@ def _step_to_events(step) -> List[Dict[str, Any]]:
     return events
 
 
-# ── Managed Agents 已移除 ────────────────────────────────────
-# 旧机制：每个 Skill → smolagents ManagedAgent（双轨制，BaseSkill 未被调用）
-# 新机制：CallSkillTool 统一调用 BaseSkill.run()（单轨制）
-# 见 agent/skills/call_skill_tool.py
+# ═══════════════════════════════════════════════════════════════
+# 5b. Managed Agent Builder
+# ═══════════════════════════════════════════════════════════════
+
+def _build_managed_agents(
+    skill_registry,
+    model,
+    collector=None,
+    user_id: int = 1,
+) -> list:
+    """从 SkillRegistry 构建所有子 agent（smolagents Managed Agent）。
+
+    每个 @skill 注册的 skill 构造一个独立的 CodeAgent：
+      - 只有 1 个 tool: SkillExecutionTool（包装 BaseSkill.run()）
+      - max_steps 从 SkillSpec 读取
+      - 返回结构化报告给主 agent
+
+    Returns:
+        list[CodeAgent]: 作为 managed_agents 传给主 agent
+    """
+    from smolagents import CodeAgent, LogLevel
+    from app.agent.skills.skill_executor import SkillExecutionTool
+
+    managed_agents = []
+
+    for spec in skill_registry.all_specs:
+        # 构造子 agent 的唯一工具
+        skill_tool = SkillExecutionTool(
+            skill=skill_registry.get(spec.name),
+            model=model,
+            collector=collector,
+        )
+
+        # 子 agent 指令：调用 execute_skill 后 final_answer
+        sub_instructions = (
+            f"你是一个专业的 {spec.description}。\n\n"
+            f"你的任务是对指定股票进行 {spec.description}。\n\n"
+            "执行流程（**必须严格按照下面两步，不要多写代码**）：\n"
+            "1. 调用 execute_skill(stock_code=代码, stock_name=名称)\n"
+            "   — 这步内部会自动获取数据并进行全面分析\n"
+            "2. 用 final_answer() 原样返回 execute_skill 返回的字符串，不要修改、不要格式化、不要提取字段\n\n"
+            "正确示例（直接照抄这个模式）：\n"
+            "```python\n"
+            "result = execute_skill(stock_code=\"600519\", stock_name=\"贵州茅台\")\n"
+            "final_answer(result)\n"
+            "```\n\n"
+            "⚠️ 常见错误（禁止）：\n"
+            "- ❌ 不要用 result['score'] / result.get('score') / result.xxx — result 是 JSON 字符串，不是字典\n"
+            "- ❌ 不要用 f-string 重新格式化输出\n"
+            "- ❌ 不要自己调用底层数据工具\n"
+            "- ❌ 不要修改报告内容\n"
+            "- ✅ 直接 final_answer(result)，一步到位"
+        )
+
+        sub_agent = CodeAgent(
+            tools=[skill_tool],
+            model=model,
+            max_steps=spec.max_steps,
+            instructions=sub_instructions,
+            name=spec.name,
+            description=spec.description,
+            provide_run_summary=spec.run_summary,
+            verbosity_level=LogLevel.INFO,
+            return_full_result=True,
+            executor_kwargs={"timeout_seconds": int(os.getenv("AGENT_EXEC_TIMEOUT", "180"))},
+        )
+
+        managed_agents.append(sub_agent)
+        logger.debug(
+            "[ManagedAgent] 构建 %s: max_steps=%d, run_summary=%s",
+            spec.name, spec.max_steps, spec.run_summary,
+        )
+
+    logger.info(
+        "[ManagedAgent] 共构建 %d 个子 agent: %s",
+        len(managed_agents), [ma.name for ma in managed_agents],
+    )
+    return managed_agents
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -651,18 +728,26 @@ def get_smolagent(
         # 始终拷贝，避免修改缓存原始列表
         tools = list(_tools_cache_by_domain[domain_key])
 
-    # ── CallSkillTool（替代 managed_agents）──
-    from app.agent.skills.call_skill_tool import CallSkillTool
-    call_skill = CallSkillTool(model=smol_model, user_id=user_id, collector=collector)
-    tools.append(call_skill)
+    # ── 构建子 agent（Managed Agents）──
+    from app.agent.skills.registry import skill_registry as _skill_registry
+    _skill_registry.discover()
+    managed_agents = _build_managed_agents(
+        skill_registry=_skill_registry,
+        model=smol_model,
+        collector=collector,
+        user_id=user_id,
+    )
 
-    # ── 金融领域：用 TracedTool 包装所有工具 ──────────────────
-    if collector:
-        from app.agent.traced_tool import TracedTool
-        tools = [TracedTool(t, collector) for t in tools]
+    # 主 agent 只保留路由层工具
+    _ROUTER_KEEP = {"final_answer", "search_stock_by_name"}
+    router_tools = [t for t in tools if t.name in _ROUTER_KEEP]
+    # 保底：final_answer 一定有
+    if not any(t.name == "final_answer" for t in router_tools):
+        from smolagents import FinalAnswerTool
+        router_tools.append(FinalAnswerTool())
 
     instructions = _build_instructions(
-        user_message, skill_instructions, language, tools, managed_agents=None,
+        user_message, skill_instructions, language, router_tools, managed_agents=managed_agents,
         domain=domain, domain_instructions=domain_instructions,
         intent_context=intent_context,
     )
@@ -676,12 +761,13 @@ def get_smolagent(
             "pandas", "numpy", "json", "math", "statistics",
             "datetime", "collections", "itertools", "re",
         ]
+        _extra_kwargs["executor_kwargs"] = {"timeout_seconds": int(os.getenv("AGENT_EXEC_TIMEOUT", "300"))}
 
     # 金融领域用 JSON 校验，其他领域用宽松校验
     checks = [_check_output_json] if domain == "finance" else [_check_dashboard_json]
 
     agent = AgentClass(
-        tools=tools,
+        tools=router_tools,
         model=smol_model,
         max_steps=max_steps,
         instructions=instructions,
@@ -690,12 +776,13 @@ def get_smolagent(
         stream_outputs=True,
         planning_interval=None,
         final_answer_checks=checks,
+        managed_agents=managed_agents,
         **_extra_kwargs,
     )
 
     logger.info(
-        "[Agent] Built %s for user=%s domain=%s: %d tools, max_steps=%d, collector=%s",
-        AgentClass.__name__, user_id, domain_key, len(tools), max_steps,
+        "[Agent] Built %s for user=%s domain=%s: %d router tools + %d managed agents, max_steps=%d, collector=%s",
+        AgentClass.__name__, user_id, domain_key, len(router_tools), len(managed_agents), max_steps,
         "yes" if collector else "no",
     )
     return agent

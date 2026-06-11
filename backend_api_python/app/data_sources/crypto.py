@@ -55,12 +55,6 @@ class CryptoDataSource(BaseDataSource):
             }
 
         exchange_id = CCXTConfig.DEFAULT_EXCHANGE
-
-        # 动态加载交易所类
-        if not hasattr(ccxt, exchange_id):
-            logger.warning(f"CCXT exchange '{exchange_id}' not found, falling back to 'coinbase'")
-            exchange_id = 'coinbase'
-
         exchange_class = getattr(ccxt, exchange_id)
         self.exchange = exchange_class(config)
 
