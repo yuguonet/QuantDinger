@@ -157,6 +157,13 @@ def _safe_get_json(url: str, params: Optional[Dict] = None, timeout: int = 5) ->
         r = requests.get(url, params=params, timeout=timeout)
         r.raise_for_status()
         return r.json()
+    except requests.exceptions.HTTPError as e:
+        # 保留 API 错误信息（如 401 Unauthorized）
+        logger.debug("HTTP GET %s failed: %s", url, e)
+        try:
+            return r.json()
+        except Exception:
+            return {"error": str(e)}
     except Exception as e:
         logger.debug("HTTP GET %s failed: %s", url, e)
         return {}
@@ -170,7 +177,10 @@ _SINA_HEADERS = {"Referer": "https://finance.sina.com.cn"}
 def _try_sina_vix(timeout: float = 5) -> Dict[str, Any]:
     r = requests.get("http://hq.sinajs.cn/list=int_vix", timeout=timeout, headers=_SINA_HEADERS)
     r.raise_for_status()
-    parts = r.text.split(",")
+    text = r.text.strip()
+    if not text or '=""' in text:
+        raise ValueError("Sina VIX: empty response (API may be blocked)")
+    parts = text.split(",")
     if len(parts) < 3:
         raise ValueError(f"Sina VIX: unexpected format ({len(parts)} fields)")
     val = _safe_float(parts[2])
@@ -182,7 +192,10 @@ def _try_sina_vix(timeout: float = 5) -> Dict[str, Any]:
 def _try_sina_vxn(timeout: float = 5) -> Dict[str, Any]:
     r = requests.get("http://hq.sinajs.cn/list=int_vxn", timeout=timeout, headers=_SINA_HEADERS)
     r.raise_for_status()
-    parts = r.text.split(",")
+    text = r.text.strip()
+    if not text or '=""' in text:
+        raise ValueError("Sina VXN: empty response (API may be blocked)")
+    parts = text.split(",")
     if len(parts) < 3:
         raise ValueError("Sina VXN: unexpected format")
     val = _safe_float(parts[2])
@@ -194,7 +207,10 @@ def _try_sina_vxn(timeout: float = 5) -> Dict[str, Any]:
 def _try_sina_gvz(timeout: float = 5) -> Dict[str, Any]:
     r = requests.get("http://hq.sinajs.cn/list=int_gvz", timeout=timeout, headers=_SINA_HEADERS)
     r.raise_for_status()
-    parts = r.text.split(",")
+    text = r.text.strip()
+    if not text or '=""' in text:
+        raise ValueError("Sina GVZ: empty response (API may be blocked)")
+    parts = text.split(",")
     if len(parts) < 3:
         raise ValueError("Sina GVZ: unexpected format")
     val = _safe_float(parts[2])
@@ -206,7 +222,10 @@ def _try_sina_gvz(timeout: float = 5) -> Dict[str, Any]:
 def _try_sina_dxy(timeout: float = 5) -> Dict[str, Any]:
     r = requests.get("http://hq.sinajs.cn/list=fx_susdind", timeout=timeout, headers=_SINA_HEADERS)
     r.raise_for_status()
-    parts = r.text.split(",")
+    text = r.text.strip()
+    if not text or "Forbidden" in text or '=""' in text:
+        raise ValueError("Sina DXY: blocked or empty response")
+    parts = text.split(",")
     if len(parts) < 2:
         raise ValueError("Sina DXY: unexpected format")
     val = _safe_float(parts[1])
@@ -218,7 +237,10 @@ def _try_sina_dxy(timeout: float = 5) -> Dict[str, Any]:
 def _try_sina_yield(timeout: float = 5) -> Dict[str, Any]:
     r = requests.get("http://hq.sinajs.cn/list=bond_us02y,bond_us10y", timeout=timeout, headers=_SINA_HEADERS)
     r.raise_for_status()
-    lines = r.text.strip().split("\n")
+    text = r.text.strip()
+    if not text or "Forbidden" in text:
+        raise ValueError("Sina Yield: blocked or empty response")
+    lines = text.split("\n")
     if len(lines) < 2:
         raise ValueError(f"Sina Yield: expected 2 lines, got {len(lines)}")
     y2_parts = lines[0].split(",")
@@ -234,6 +256,9 @@ def _try_sina_yield(timeout: float = 5) -> Dict[str, Any]:
 # ============================================================================
 
 def _parse_tencent_response(text: str, label: str) -> float:
+    # 检查空响应
+    if "pv_none_match" in text or not text.strip():
+        raise ValueError(f"Tencent {label}: no data available")
     parts = text.split("~")
     # 兼容不同格式: VIX有5+字段, VXN/DXY可能只有1-4字段
     if len(parts) >= 5:
@@ -264,9 +289,16 @@ def _try_tencent_vxn(timeout: float = 5) -> Dict[str, Any]:
 
 
 def _try_tencent_dxy(timeout: float = 5) -> Dict[str, Any]:
-    r = requests.get("https://qt.gtimg.cn/q=fx_susdind", timeout=timeout)
-    r.raise_for_status()
-    return {"value": _parse_tencent_response(r.text, "DXY"), "source": "tencent"}
+    # 尝试多个端点
+    for endpoint in ("fx_susdind", "usDXY", "usDX_Y"):
+        r = requests.get(f"https://qt.gtimg.cn/q={endpoint}", timeout=timeout)
+        r.raise_for_status()
+        if "pv_none_match" not in r.text:
+            val = _parse_tencent_response(r.text, "DXY")
+            # 合理性校验：美元指数正常范围 80-120
+            if 80 <= val <= 120:
+                return {"value": val, "source": "tencent"}
+    raise ValueError("Tencent DXY: no valid data from any endpoint")
 
 # ============================================================================
 # 东方财富系列
@@ -305,15 +337,21 @@ def set_twelvedata_key(key: str) -> None:
 
 
 def _try_twelvedata(symbol: str, timeout: float = 8) -> Dict[str, Any]:
-    if not _TD_KEY:
+    import os as _os
+    key = _TD_KEY or _os.getenv("TWELVE_DATA_API_KEY", "").strip()
+    if not key:
         raise ValueError("TwelveData: API key not set")
     d = _safe_get_json(
         "https://api.twelvedata.com/quote",
-        params={"symbol": symbol, "apikey": _TD_KEY},
+        params={"symbol": symbol, "apikey": key},
         timeout=timeout,
     )
-    if not d or "close" not in d:
-        raise ValueError(f"TwelveData {symbol}: {d.get('message', 'empty response')}")
+    if not d:
+        raise ValueError(f"TwelveData {symbol}: no response")
+    if "close" not in d:
+        # 保留 API 错误信息
+        msg = d.get("message", d.get("error", "no 'close' field"))
+        raise ValueError(f"TwelveData {symbol}: {msg}")
     val = _safe_float(d["close"])
     if val <= 0:
         raise ValueError(f"TwelveData {symbol}: invalid value {val}")
@@ -550,6 +588,10 @@ def fetch_dollar_index() -> Dict[str, Any]:
 
             if val <= 0:
                 continue
+            # 合理性校验：美元指数正常范围 80-120，过滤脏数据
+            if src in ("tencent", "sina") and not (80 <= val <= 120):
+                logger.warning("DXY source %s returned implausible value %.2f, skipping", src, val)
+                continue
             level, cn, en = _dxy_level(val)
             logger.info("DXY: %.2f from %s", val, src)
             return {"value": round(val, 2), "change": 0, "level": level, "interpretation": cn, "interpretation_en": en, "source": src}
@@ -712,7 +754,13 @@ def fetch_put_call_ratio() -> Dict[str, Any]:
             if src == "sina":
                 r1 = requests.get("http://hq.sinajs.cn/list=int_vix", timeout=to, headers=_SINA_HEADERS)
                 r1.raise_for_status()
-                vix_val = _safe_float(r1.text.split(",")[2])
+                text1 = r1.text.strip()
+                if not text1 or '=""' in text1:
+                    raise ValueError("Sina VIX: empty response (API may be blocked)")
+                parts1 = text1.split(",")
+                if len(parts1) < 3:
+                    raise ValueError(f"Sina VIX: unexpected format ({len(parts1)} fields)")
+                vix_val = _safe_float(parts1[2])
                 if vix_val <= 0:
                     raise ValueError("Sina VIX: invalid")
                 try:

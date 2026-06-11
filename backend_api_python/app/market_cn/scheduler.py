@@ -159,8 +159,18 @@ def _post_market_tick():
     from app.market_cn.dragon_limit import _rt_dragon_tiger
     from app.market_cn.index import _rt_nb_daily
 
-    dt_date = (_rt_dragon_tiger or {}).get("date", "")
-    nb_date = (_rt_nb_daily or [{}])[0].get("date", "") if _rt_nb_daily else ""
+    # _rt_dragon_tiger 是 list[dict]，取第一条的 date
+    dt_date = ""
+    if _rt_dragon_tiger and isinstance(_rt_dragon_tiger, list) and len(_rt_dragon_tiger) > 0:
+        dt_date = _rt_dragon_tiger[0].get("date", "") if isinstance(_rt_dragon_tiger[0], dict) else ""
+    elif isinstance(_rt_dragon_tiger, dict):
+        dt_date = _rt_dragon_tiger.get("date", "")
+
+    # _rt_nb_daily 是 list[dict]，取最后一条的 date（最新日期）
+    nb_date = ""
+    if _rt_nb_daily and isinstance(_rt_nb_daily, list) and len(_rt_nb_daily) > 0:
+        last = _rt_nb_daily[-1]
+        nb_date = last.get("date", "") if isinstance(last, dict) else ""
 
     if dt_date >= target and nb_date >= target:
         _post_market_done_today = True

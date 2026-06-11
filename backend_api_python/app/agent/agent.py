@@ -148,7 +148,22 @@ def _build_instructions(user_message: str = "", skill_instructions: str = "",
     if str(language or "").lower().startswith("en"):
         lang_section = "\n## Output Language\n- Reply in English.\n- All JSON values in English.\n"
     else:
-        lang_section = "\n## 输出语言\n- 使用中文回答。\n- 所有面向用户的文本值使用中文。\n"
+        lang_section = (
+            "\n## 输出语言\n"
+            "- 使用中文回答。所有输出内容（包括思考过程、代码注释）必须使用中文。\n"
+            "- JSON 中以下字段**必须用英文枚举值**（代码解析需要）：\n"
+            "  action: buy/sell/hold/skip\n"
+            "  direction: bullish/bearish/neutral\n"
+            "  confidence: high/medium/low\n"
+            "  timeframe: T+1/T+3/T+5/1W/1M/3M/1Y\n"
+            "- JSON 中以下字段**必须用中文**（给用户看）：\n"
+            "  signal: 一句话信号摘要，如「多头排列,MACD金叉,放量突破」\n"
+            "  factors[].name: 维度名，如「趋势」「量价」「指标」「形态」「筹码」\n"
+            "  factors[].value: 状态描述，如「主升浪」「缩量回调」「RSI超买」\n"
+            "  analysis: 完整分析文字，全部中文\n"
+            "  timeframe_reason: 为什么选这个时间维度，中文\n"
+            "- 专有名词（MACD/RSI/KDJ/BOLL/MA 等）保持英文即可。\n"
+        )
 
     skill_section = ""
     if skill_instructions:
@@ -293,13 +308,14 @@ final_answer({{
 7. **工具失败处理** — 子 agent 返回失败时，在结论中说明，继续用已有数据做判断。
 8. **多维验证** — 综合至少 2 个不同维度的子 agent 报告做交叉验证。
 9. **善用编排** — 按需调多个子 agent，收集所有报告后做加权综合。
-10. **⚠️ 禁止重复调用** — 同一只股票的同一个子 agent 只调一次。technical_agent 已包含趋势/指标/量价/形态/筹码全维度分析，不要拆成"技术指标快照"和"K线形态"两次调用。
-11. **诚实透明** — 数据不足时明确告知，不猜测。
-11. **⚠️ 数据完整性** — 如果某个子 agent 返回失败，必须在结论中说明
+10. **⚠️ 绝对禁止重复调用** — 同一只股票的同一个子 agent **绝对只能调一次**。调完直接用结果，不满意也不能重调。technical_agent 已包含趋势/指标/量价/形态/筹码全维度分析，不要拆成"技术指标快照"和"K线形态"两次调用。违反此规则会导致超时。
+11. **⚠️ 标准调用流程** — 个股分析的标准流程：先调 technical_agent，再按需调 1-2 个其他子 agent（如 intelligence_agent），收集完所有报告后立即 final_answer。总共不超过 3 个子 agent 调用。
+12. **诚实透明** — 数据不足时明确告知，不猜测。
+13. **⚠️ 数据完整性** — 如果某个子 agent 返回失败，必须在结论中说明
     "XX数据缺失，以下结论仅供参考"。绝不用想象填补缺失数据。
-12. **⚠️ 确定性输出** — 你的分析必须基于子 agent 返回的客观数据，不能因为"感觉"
+14. **⚠️ 确定性输出** — 你的分析必须基于子 agent 返回的客观数据，不能因为"感觉"
     或"可能"而改变方向性判断。同样的数据必须得出同样的结论。
-13. **⚠️ 数据获取** — 消息中的"[已获取的实时行情摘要]"仅供参考。如需使用行情数据，必须调用 get_realtime_quote 工具获取完整数据。不要尝试解析消息中的文本为数据对象。
+15. **⚠️ 数据获取** — 消息中的"[已获取的实时行情摘要]"仅供参考。如需使用行情数据，必须调用 get_realtime_quote 工具获取完整数据。不要尝试解析消息中的文本为数据对象。
 {finance_json_section}{lang_section}"""
 
 
@@ -652,7 +668,8 @@ def _build_managed_agents(
             "- ❌ 不要用 f-string 重新格式化输出\n"
             "- ❌ 不要自己调用底层数据工具\n"
             "- ❌ 不要修改报告内容\n"
-            "- ✅ 直接 final_answer(result)，一步到位"
+            "- ✅ 直接 final_answer(result)，一步到位\n\n"
+            "⚠️ 语言要求：所有输出必须使用中文，包括思考过程和代码注释。"
         )
 
         sub_agent = CodeAgent(
@@ -662,10 +679,14 @@ def _build_managed_agents(
             instructions=sub_instructions,
             name=spec.name,
             description=spec.description,
-            provide_run_summary=spec.run_summary,
+            provide_run_summary=False,
             verbosity_level=LogLevel.INFO,
             return_full_result=True,
-            executor_kwargs={"timeout_seconds": int(os.getenv("AGENT_EXEC_TIMEOUT", "180"))},
+            additional_authorized_imports=[
+                "json", "pandas", "numpy", "math", "statistics",
+                "datetime", "collections", "itertools", "re",
+            ],
+            executor_kwargs={"timeout_seconds": int(os.getenv("SUB_AGENT_EXEC_TIMEOUT", "360"))},
         )
 
         managed_agents.append(sub_agent)

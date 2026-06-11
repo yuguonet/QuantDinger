@@ -60,8 +60,14 @@ class SkillExecutionTool(Tool):
         self._model = model
         self._collector = collector
 
+    # 工具集缓存（避免每次 forward() 重建 96 个工具）
+    _tool_cache = None
+    _tool_cache_time = 0
+    _TOOL_CACHE_TTL = 300  # 5 分钟刷新一次
+
     def forward(self, stock_code: str, stock_name: str = None) -> str:
         """执行 skill 分析，返回格式化报告。"""
+        import time as _time
         from app.agent.skills.registry import skill_registry
         from app.agent.tool_adapter import build_all_tools
 
@@ -74,9 +80,12 @@ class SkillExecutionTool(Tool):
         if not sk:
             return f"技能 {self._skill.name} 不可用"
 
-        # 构建工具集
-        all_tools = build_all_tools()
-        tool_map = {t.name: t for t in all_tools}
+        # 构建工具集（带缓存）
+        now = _time.time()
+        if SkillExecutionTool._tool_cache is None or (now - SkillExecutionTool._tool_cache_time) > SkillExecutionTool._TOOL_CACHE_TTL:
+            SkillExecutionTool._tool_cache = build_all_tools()
+            SkillExecutionTool._tool_cache_time = now
+        tool_map = {t.name: t for t in SkillExecutionTool._tool_cache}
 
         # LLM 调用函数
         def call_llm(prompt: str) -> str:
