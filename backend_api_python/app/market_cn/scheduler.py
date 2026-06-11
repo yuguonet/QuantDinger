@@ -80,11 +80,11 @@ def _refresh_post_market():
     """盘后数据: 龙虎榜/北向日级/情绪历史/资金流日级（非盘中才跑）"""
     from app.market_cn.dragon_limit import refresh_dragon_tiger
     from app.market_cn.index import refresh_northbound_daily, refresh_market_fund_flow_daily
-    from app.market_cn.emotion import refresh_emotion_history
+    from app.market_cn.emotion import refresh_emotion_cycle
 
     _run_all("post_market", [
         refresh_dragon_tiger, refresh_northbound_daily,
-        refresh_market_fund_flow_daily, refresh_emotion_history,
+        refresh_market_fund_flow_daily, refresh_emotion_cycle,
     ])
 
 
@@ -204,19 +204,26 @@ def _schedule(name, fn, interval):
 def start():
     """应用启动时调用（在 Flask app.run 之前或 after_fork）
 
-    冷启动：全部从远端拉取到内存，不读本地缓存文件。
+    冷启动：后台线程拉取，不阻塞主线程。
+    定时器立即启动，按各自间隔逐步填充数据。
     """
-    logger.info("[scheduler] market_cn 冷启动: 从远端拉取全部数据")
+    logger.info("[scheduler] market_cn 调度器启动")
 
-    _refresh_daily()
-    _refresh_post_market()
-    _refresh_slow()
-    _refresh_fast()
-
-    logger.info("[scheduler] 冷启动完成，数据已加载到内存")
-
+    # 定时器立即注册（不阻塞主线程）
     _schedule("fast", _fast_tick, 300)
     _schedule("slow", _slow_tick, 1800)
     _schedule("post_market", _post_market_tick, 600)
 
     logger.info("[scheduler] 定时刷新已启动: fast=5min, slow=30min, post_market=10min")
+
+    # 冷启动：后台线程拉取，不阻塞主线程
+    def _cold_start():
+        logger.info("[scheduler] 冷启动: 后台拉取全部数据")
+        _refresh_daily()
+        _refresh_post_market()
+        _refresh_slow()
+        _refresh_fast()
+        logger.info("[scheduler] 冷启动完成，数据已加载到内存")
+
+    t = threading.Thread(target=_cold_start, daemon=True)
+    t.start()

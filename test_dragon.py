@@ -1275,7 +1275,7 @@ def main():
     parser.add_argument("--no-ema-filter", action="store_true", help="V1: 禁用EMA10>EMA20过滤")
     parser.add_argument("--no-rsi-filter", action="store_true", help="V1: 禁用RSI 30-70过滤")
     parser.add_argument("--today", action="store_true", help="仅统计今日出现买点的股票")
-    parser.add_argument("--today-date", type=str, default="", help="指定日期(YYYY-MM-DD), 默认为今天")
+    parser.add_argument("--today-date", type=str, default="", help="指定日期(YYYY-MM-DD), 默认为 --end 日期")
     args = parser.parse_args()
 
     codes = [c.strip() for c in args.codes.split(",") if c.strip()] if args.codes else TEST_CODES
@@ -1485,8 +1485,7 @@ def main():
 
     # ===== 今日买点统计 =====
     if args.today:
-        from datetime import datetime, timedelta
-        today_str = args.today_date if args.today_date else datetime.now().strftime("%Y-%m-%d")
+        today_str = args.today_date if args.today_date else args.end
         all_for_today = dc_trades + v1_trades + bb_trades + f4in1_trades
         today_trades = print_today_signals(all_for_today, today_str)
         if today_trades:

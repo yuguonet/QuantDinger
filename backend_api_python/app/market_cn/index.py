@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import threading
 import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -36,6 +38,10 @@ import pandas as pd
 from app.utils.logger import get_logger
 
 logger = logging.getLogger(__name__)
+
+# 北向日级数据文件缓存（JSON，保留最近 500 个交易日）
+_NB_DAILY_CACHE_FILE = os.path.join(os.getcwd(), "data", "market_cn_cache", "northbound_daily.json")
+_nb_daily_lock = threading.Lock()
 
 # ══════════════════════════════════════════════════════════════
 #  常量 — 核心指数代码映射
@@ -739,7 +745,7 @@ def get_northbound_realtime() -> Dict[str, Any]:
     }
 
 
-def get_northbound_daily(days: int = 120) -> List[Dict[str, Any]]:
+def get_northbound_daily(days: int = 120, force: bool = False) -> List[Dict[str, Any]]:
     """获取北向资金日级净流入历史数据。
 
     数据源优先级:
@@ -748,6 +754,7 @@ def get_northbound_daily(days: int = 120) -> List[Dict[str, Any]]:
 
     Args:
         days: 获取天数，默认 120
+        force: 强制从数据源拉取（跳过缓存），默认 False
 
     Returns:
         成功: [{
@@ -763,10 +770,19 @@ def get_northbound_daily(days: int = 120) -> List[Dict[str, Any]]:
         >>> for d in data[-5:]:
         ...     print(f"{d['date']}: 合计 {d['total_yi']:.2f} 亿")
     """
-    global _rt_max_nb_daily_days
+    global _rt_max_nb_daily_days, _rt_nb_daily
     _rt_max_nb_daily_days = max(_rt_max_nb_daily_days, days)
-    if _rt_nb_daily and len(_rt_nb_daily) >= days:
-        return _rt_nb_daily[:days]
+
+    # 首次调用时从文件缓存加载
+    if _rt_nb_daily is None:
+        cached = _load_nb_daily_cache()
+        if cached:
+            _rt_nb_daily = cached
+            logger.info("[cache] 加载北向日级文件缓存: %d 条", len(cached))
+
+    # 缓存足够且非强制刷新 → 直接返回
+    if not force and _rt_nb_daily and len(_rt_nb_daily) >= days:
+        return _rt_nb_daily[-days:]
 
     # 数据源1: AKShare
     # 注意: stock_hsgt_north_net_flow_in_em 已在 akshare >=1.14 中移除
@@ -809,7 +825,7 @@ def get_northbound_daily(days: int = 120) -> List[Dict[str, Any]]:
 
             if out:
                 logger.info("[akshare] 北向日级: %d 条", len(out))
-                return out
+                return _merge_and_cache_nb_daily(out, days)
 
         # fallback: 用 stock_hsgt_fund_flow_summary_em 获取最新一天
         summary = ak.stock_hsgt_fund_flow_summary_em()
@@ -836,7 +852,7 @@ def get_northbound_daily(days: int = 120) -> List[Dict[str, Any]]:
                     "total_yi": round(hgt_val + sgt_val, 2),
                 })
                 logger.info("[akshare] 北向日级(summary): %d 条", len(out))
-                return out
+                return _merge_and_cache_nb_daily(out, days)
     except ImportError:
         pass  # akshare 未安装，降级
     except Exception as e:
@@ -873,7 +889,7 @@ def get_northbound_daily(days: int = 120) -> List[Dict[str, Any]]:
                 "total_yi": round((float(h) if h else 0) + (float(s) if s else 0), 2),
             })
         logger.info("[hexin] 北向日级: %d 条", len(out))
-        return out[-days:]
+        return _merge_and_cache_nb_daily(out, days)
     except json.JSONDecodeError as e:
         logger.warning("[hexin] 北向日级JSON解析失败: %s", e)
     except Exception as e:
@@ -1696,6 +1712,58 @@ _rt_max_nb_daily_days = 0
 _rt_max_nb_holdings_top = 0
 _rt_max_mf_daily_days = 0
 
+
+def _load_nb_daily_cache() -> List[Dict[str, Any]]:
+    """从 JSON 文件加载北向日级缓存数据 (最多 250 天，按日期升序)。"""
+    with _nb_daily_lock:
+        if not os.path.exists(_NB_DAILY_CACHE_FILE):
+            return []
+        try:
+            with open(_NB_DAILY_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return data
+        except Exception as e:
+            logger.warning("读取北向日级缓存文件失败: %s", e)
+    return []
+
+
+def _save_nb_daily_cache(data: List[Dict[str, Any]]) -> None:
+    """合并数据并写入北向日级缓存文件（最多 250 条，按日期去重排序）。"""
+    with _nb_daily_lock:
+        seen: Dict[str, Dict[str, Any]] = {}
+        for item in data:
+            date_key = item.get("date", "")
+            if date_key:
+                seen[date_key] = item
+        merged = sorted(seen.values(), key=lambda x: x.get("date", ""), reverse=True)
+        merged = merged[:250]
+        merged.sort(key=lambda x: x.get("date", ""))  # 升序
+        try:
+            os.makedirs(os.path.dirname(_NB_DAILY_CACHE_FILE), exist_ok=True)
+            with open(_NB_DAILY_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(merged, f, ensure_ascii=False)
+            logger.info("[cache] 北向日级缓存已保存: %d 条", len(merged))
+        except Exception as e:
+            logger.warning("保存北向日级缓存文件失败: %s", e)
+
+
+def _merge_and_cache_nb_daily(new_data: List[Dict[str, Any]], days: int) -> List[Dict[str, Any]]:
+    """合并新获取的数据到缓存，写入文件，更新 _rt_nb_daily，返回截取后的结果。"""
+    global _rt_nb_daily
+    combined = (_rt_nb_daily or []) + new_data
+    seen: Dict[str, Dict[str, Any]] = {}
+    for item in combined:
+        date_key = item.get("date", "")
+        if date_key:
+            seen[date_key] = item
+    merged = sorted(seen.values(), key=lambda x: x.get("date", ""))
+    merged = merged[-250:]  # 保留最近 250 天
+    _rt_nb_daily = merged
+    _save_nb_daily_cache(merged)
+    return merged[-days:]
+
+
 def refresh_index_realtime():
     global _rt_idx_realtime
     try:
@@ -1706,7 +1774,7 @@ def refresh_index_realtime():
 def refresh_index_daily_kline():
     global _rt_idx_daily, _rt_max_idx_daily_days
     try:
-        fetch_days = max(500, int(_rt_max_idx_daily_days * 1.5))
+        fetch_days = max(500, _rt_max_idx_daily_days)
         for code in INDEX_CODES:
             data = get_index_daily_kline(code, fetch_days)
             if data:
@@ -1724,15 +1792,15 @@ def refresh_northbound_realtime():
 def refresh_northbound_daily():
     global _rt_nb_daily, _rt_max_nb_daily_days
     try:
-        fetch_days = max(250, int(_rt_max_nb_daily_days * 1.5))
-        _rt_nb_daily = get_northbound_daily(fetch_days)
+        fetch_days = max(250, _rt_max_nb_daily_days)
+        _rt_nb_daily = get_northbound_daily(fetch_days, force=True)
     except Exception as e:
         logger.warning("[refresh] northbound_daily 失败: %s", e)
 
 def refresh_northbound_holdings():
     global _rt_nb_holdings, _rt_max_nb_holdings_top
     try:
-        fetch_top = max(100, int(_rt_max_nb_holdings_top * 1.5))
+        fetch_top = max(100, _rt_max_nb_holdings_top)
         _rt_nb_holdings = get_northbound_holdings(fetch_top)
     except Exception as e:
         logger.warning("[refresh] northbound_holdings 失败: %s", e)
@@ -1747,7 +1815,7 @@ def refresh_market_fund_flow_realtime():
 def refresh_market_fund_flow_daily():
     global _rt_mf_daily, _rt_max_mf_daily_days
     try:
-        fetch_days = max(250, int(_rt_max_mf_daily_days * 1.5))
+        fetch_days = max(500, _rt_max_mf_daily_days)
         _rt_mf_daily = get_market_fund_flow_daily(fetch_days)
     except Exception as e:
         logger.warning("[refresh] market_fund_flow_daily 失败: %s", e)

@@ -160,12 +160,8 @@
     ],
     "modify+code": [
         {
-            "tool": "workspace_read_file",
-            "desc": "读取待修改文件"
-        },
-        {
-            "tool": "workspace_write_file",
-            "desc": "写入修改"
+            "tool": "python_interpreter",
+            "desc": ""
         }
     ],
     "modify+project": [
@@ -206,11 +202,8 @@
     ],
     "filter+stock": [
         {
-            "tool": "call_skill",
-            "args": {
-                "skill_name": "screening_agent"
-            },
-            "desc": "选股专家"
+            "tool": "python_interpreter",
+            "desc": ""
         }
     ],
     "filter+screener": [
@@ -276,6 +269,12 @@
         }
     ],
     "filter+market": [
+        {
+            "tool": "python_interpreter",
+            "desc": ""
+        }
+    ],
+    "scan+market": [
         {
             "tool": "python_interpreter",
             "desc": ""
