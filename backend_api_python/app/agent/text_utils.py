@@ -110,26 +110,6 @@ def extract_stock_from_message(message: str) -> Tuple[Optional[str], Optional[st
     return None, None
 
 
-def has_stock_context(message: str) -> bool:
-    """判断消息是否包含股票相关内容。
-
-    只检查高置信信号：6 位代码、DB 名称命中。
-    不维护关键词列表 — 交给语义路由。
-    """
-    if extract_stock_code(message):
-        return True
-
-    candidate = strip_stopwords_prefix(message)
-    if not candidate:
-        return False
-
-    try:
-        from app.utils.basicinfo_db import get_stock_basic_db
-        matches = get_stock_basic_db().search_stocks(candidate, limit=1)
-        return bool(matches)
-    except Exception:
-        return False
-
 
 # ═══════════════════════════════════════════════════════════════
 # Ollama URL 检测

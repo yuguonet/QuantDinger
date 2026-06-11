@@ -1,24 +1,25 @@
 # -*- coding: utf-8 -*-
 
 """
-Intent Analyzer — 基于语义路由的意图分类（v2）。
+Intent Analyzer — 基于语义路由的意图分类（v3，精简版）。
 
-架构：
-  1. SemanticIntentRouter（本地 embedding + cosine similarity）做首选路由
-     - 毫秒级响应，零 API 调用（使用 sentence-transformers 或降级 HashEncoder）
-     - 命中 → 直接返回 IntentResult
-  2. LLM 打分（原有逻辑）做降级方案
-     - 仅在语义路由置信度不足时触发
-     - 保留原有场景列表 + LLM 打分的完整流程
+架构（v3 变更）：
+  1. 快速通道 — 正则匹配闲聊（<1ms，零开销）
+  2. 语义路由 — embedding + cosine similarity 一步到位
+     → domain（finance/coding/chat）
+     → verb（analyze/view/filter/...）
+     → noun（stock/chart/market/...）
+     → intent + tool_categories
+  3. LLM 降级 — 语义路由置信度不足时
+
+已移除：
+  - VerbNounRouter（正则硬编码）— verb/noun 现在由语义路由直接产出
+  - 金融域精排阶段 — 不再需要，语义路由已覆盖
 
 上下文管理：
   - ContextManager 跟踪每个 session 的对话历史
   - 话题连续性加成：同一 domain 内的消息获得分数加成
   - 话题切换检测：domain 突变时自动降低旧 domain 权重
-
-多用户支持：
-  - session_id 隔离，每个用户独立的上下文状态
-  - 线程安全，支持并发访问
 """
 
 from __future__ import annotations
@@ -72,40 +73,15 @@ class IntentResult:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 全局单例：动作-对象路由器 + 语义路由器 + 上下文管理器
+# 全局单例：语义路由器 + 上下文管理器
 # ═══════════════════════════════════════════════════════════════
 
-_verb_noun_router = None
 _semantic_router = None
 _context_mgr = None
 
 
-def _get_verb_noun_router():
-    """懒加载动作-对象路由器单例（主路由）。"""
-    global _verb_noun_router, _semantic_router
-    if _verb_noun_router is not None:
-        return _verb_noun_router
-
-    from app.agent.router.verb_noun_router import VerbNounRouter
-
-    # 语义路由器作为降级方案
-    semantic = _get_semantic_router()
-    context_boost = float(os.getenv("INTENT_ROUTER_CONTEXT_BOOST", "0.1"))
-
-    try:
-        _verb_noun_router = VerbNounRouter(
-            context_boost=context_boost,
-        )
-        logger.info("[Intent] 动作-对象路由器初始化完成")
-    except Exception as e:
-        logger.warning("[Intent] 动作-对象路由器初始化失败: %s", e)
-        _verb_noun_router = None
-
-    return _verb_noun_router
-
-
 def _get_semantic_router():
-    """懒加载语义路由器单例（降级方案）。"""
+    """懒加载语义路由器单例。"""
     global _semantic_router
     if _semantic_router is not None:
         return _semantic_router
@@ -193,10 +169,10 @@ def analyze_intent(
 ) -> IntentResult:
     """分析用户消息的意图。
 
-    路由策略：
+    路由策略（v3 精简版）：
     1. 快速通道 — 关键词匹配（<1ms，零开销）
-    2. 语义路由 — embedding 确定领域（finance/coding/chat）
-    3. 金融域精排 — verb_noun_router 做 verb+noun 精确匹配
+    2. 语义路由 — embedding 一步到位（domain + verb + noun）
+    3. LLM 降级 — 语义路由置信度不足时
 
     Args:
         message: 用户消息
@@ -223,84 +199,68 @@ def analyze_intent(
     ctx_mgr = _get_context_manager()
     context_domain = ctx_mgr.get_context_domain(session_id) if session_id else ""
 
-    # ── Level 2: 语义路由 — 先定领域 ───────────────────────────
+    # ── Level 2: 语义路由 — 一步到位 ───────────────────────────
     semantic = _get_semantic_router()
-    semantic_result = None
     if semantic:
-        semantic_result = semantic.route(
+        result = semantic.route(
             query=message,
             session_id=session_id,
             context_domain=context_domain,
         )
 
-    # 语义路由命中 → 确定领域
-    if semantic_result and semantic_result.matched:
-        domain = semantic_result.domain
-        intent = semantic_result.intent
-        confidence = semantic_result.confidence
-        metadata = semantic_result.metadata
-        tool_cats = metadata.get("tool_categories", [])
-        logger.info(
-            "[Intent] 语义路由命中: %s/%s (%.2f) %.0fms | %s",
-            domain, intent, confidence, semantic_result.elapsed_ms, message[:50],
-        )
-    else:
-        domain = "chat"
-        intent = "unmatched"
-        confidence = 0.0
-        metadata = {}
-        tool_cats = []
-        logger.info("[Intent] 语义路由未命中，走默认 chat | %s", message[:50])
+        if result.matched:
+            # verb/noun 直接从 Route metadata 中取
+            verb = result.metadata.get("verb", "")
+            noun = result.metadata.get("noun", "")
+            tool_cats = result.metadata.get("tool_categories", [])
 
-    # ── Level 3: 金融域精排 — verb_noun_router ─────────────────
-    # 只有金融域才需要 verb+noun 精确匹配（股票名词 DB 查询等）
-    verb = ""
-    noun = ""
-    params = _extract_params(message)
+            # 补充 tool_chain（从 tool_chains.json 查，供评估器使用）
+            tool_chain = []
+            if verb and noun:
+                try:
+                    from app.agent.router.tool_chains import get_tool_chain
+                    tool_chain = get_tool_chain(verb, noun)
+                except Exception:
+                    pass
 
-    if domain == "finance":
-        router = _get_verb_noun_router()
-        if router:
-            result = router.route(
-                query=message,
-                session_id=session_id,
-                context_domain=context_domain,
-            )
-            if result.matched:
-                domain = result.domain
-                intent = result.intent
-                confidence = result.confidence
-                metadata = result.metadata
-                tool_cats = result.metadata.get("tool_categories", [])
-                verb = result.verb
-                noun = result.noun
-                params = result.params
-                logger.info(
-                    "[Intent] 金融精排命中: %s/%s (%.2f) verb=%s noun=%s %.0fms | %s",
-                    domain, intent, confidence, verb, noun, result.elapsed_ms, message[:50],
+            # 记录到上下文
+            if session_id:
+                ctx_mgr.record_route(
+                    session_id=session_id,
+                    domain=result.domain,
+                    intent=result.intent,
+                    confidence=result.confidence,
+                    query=message,
                 )
 
-    # 记录到上下文
-    if session_id:
-        ctx_mgr.record_route(
-            session_id=session_id,
-            domain=domain,
-            intent=intent,
-            confidence=confidence,
-            query=message,
-        )
+            # 合并 tool_chain 到 metadata
+            enriched_metadata = dict(result.metadata)
+            if tool_chain:
+                enriched_metadata["tool_chain"] = tool_chain
 
-    return IntentResult(
-        domain=domain,
-        intent=intent,
-        params=params,
-        confidence=confidence,
-        metadata=metadata,
-        source="semantic" if not verb else "verb_noun",
-        tool_categories=tool_cats,
-        verb=verb,
-        noun=noun,
-    )
+            logger.info(
+                "[Intent] 语义路由命中: %s/%s (%.2f) verb=%s noun=%s %.0fms | %s",
+                result.domain, result.intent, result.confidence,
+                verb, noun, result.elapsed_ms, message[:50],
+            )
+
+            return IntentResult(
+                domain=result.domain,
+                intent=result.intent,
+                params=_extract_params(message),
+                confidence=result.confidence,
+                metadata=enriched_metadata,
+                source="semantic",
+                tool_categories=tool_cats,
+                verb=verb,
+                noun=noun,
+                all_scores=result.all_scores,
+                elapsed_ms=result.elapsed_ms,
+            )
+
+    # ── Level 3: LLM 降级 ─────────────────────────────────────
+    logger.info("[Intent] 语义路由未命中，走 LLM 降级 | %s", message[:50])
+    return _llm_fallback(message, model, provider, history)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -368,6 +328,43 @@ JSON 数组："""
 MIN_SCORE = 0.35
 MAX_RESULTS = 3
 
+# LLM 降级时的 verb/noun 映射（场景 → verb/noun）
+_SCENE_VERB_NOUN = {
+    "stock_analysis": ("analyze", "stock"),
+    "chart_view": ("view", "chart"),
+    "market_scan": ("view", "market"),
+    "backtest": ("backtest", "stock"),
+    "stock_screener": ("filter", "stock"),
+    "fund_flow": ("view", "fund_flow"),
+    "indicator": ("view", "indicator"),
+    "trading": ("execute", "trading"),
+    "stock_info": ("query", "stock"),
+    "concept_explain": ("explain", "concept"),
+    "code_modify": ("modify", "code"),
+    "code_review": ("analyze", "code"),
+    "code_create": ("create", "code"),
+    "code_debug": ("modify", "code"),
+    "project_scan": ("view", "project"),
+    "chat": ("", ""),
+}
+
+# LLM 降级时的工具分类映射
+_INTENT_TOOL_CATEGORIES = {
+    "stock_analysis": ["名称查询", "行情数据", "技术分析", "情报搜索"],
+    "chart_view": ["名称查询", "行情数据", "K线图表"],
+    "market_scan": ["行情数据", "龙虎榜/热榜"],
+    "stock_screener": ["名称查询", "选股", "指标策略"],
+    "backtest": ["名称查询", "行情数据", "回测", "指标策略"],
+    "fund_flow": ["名称查询", "行情数据"],
+    "indicator": ["名称查询", "行情数据", "技术分析", "指标策略"],
+    "trading": ["交易", "指标策略"],
+    "stock_info": ["名称查询", "行情数据"],
+    "concept_explain": [],
+    "code_modify": ["工作区"],
+    "code_create": ["工作区"],
+    "project_scan": ["工作区"],
+}
+
 
 def _llm_fallback(
     message: str,
@@ -375,7 +372,7 @@ def _llm_fallback(
     provider: str = None,
     history: List[Dict[str, str]] = None,
 ) -> IntentResult:
-    """LLM 打分降级方案（原有逻辑）。"""
+    """LLM 打分降级方案。"""
     scenes = _build_scene_list()
 
     scene_lines = [f"- id={s['id']}，{s['domain']}/{s['name']}，{s['description']}" for s in scenes]
@@ -430,30 +427,19 @@ def _llm_fallback(
 
         best = top[0]
         scene = best["scene"]
-        # LLM 降级时从意图名映射工具分类
-        _INTENT_TOOL_CATEGORIES = {
-            "stock_analysis": ["名称查询", "行情数据", "技术分析", "情报搜索"],
-            "chart_view": ["名称查询", "行情数据", "K线图表"],
-            "market_scan": ["行情数据", "龙虎榜/热榜"],
-            "screener": ["名称查询", "选股", "指标策略"],
-            "backtest": ["名称查询", "行情数据", "回测", "指标策略"],
-            "fund_flow": ["名称查询", "行情数据"],
-            "indicator": ["名称查询", "行情数据", "技术分析", "指标策略"],
-            "trading": ["交易", "指标策略"],
-            "stock_info": ["名称查询", "行情数据"],
-            "concept_explain": [],
-            "code_modify": ["工作区"],
-            "code_create": ["工作区"],
-            "project_scan": ["工作区"],
-        }
+        scene_intent = scene["intent"]
+        verb, noun = _SCENE_VERB_NOUN.get(scene_intent, ("", ""))
+
         return IntentResult(
             domain=scene["domain"],
-            intent=scene["intent"],
-            params=_extract_params(message, scene),
+            intent=scene_intent,
+            params=_extract_params(message),
             confidence=best["score"],
             raw_response=raw,
             source="llm",
-            tool_categories=_INTENT_TOOL_CATEGORIES.get(scene["intent"], []),
+            tool_categories=_INTENT_TOOL_CATEGORIES.get(scene_intent, []),
+            verb=verb,
+            noun=noun,
         )
     except Exception as e:
         logger.warning("[Intent] LLM 降级也失败: %s", e)
@@ -520,7 +506,7 @@ def _match_scores_to_scenes(arr: List[Dict], scenes: List[Dict]) -> List[Dict]:
     return results
 
 
-def _extract_params(message: str, scene: Dict = None) -> Dict[str, Any]:
+def _extract_params(message: str) -> Dict[str, Any]:
     """从用户消息中提取基础参数（股票代码等）。"""
     params = {}
     from app.agent.text_utils import extract_stock_from_message
