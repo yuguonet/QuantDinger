@@ -33,8 +33,8 @@ logger = get_logger(__name__)
 # 超时配置
 # ============================================================================
 
-_FIRST_TIMEOUT = 5       # 首个源的超时（秒）
-_FALLBACK_TIMEOUT = 1.5  # 降级源的超时（秒）
+_FIRST_TIMEOUT = 8       # 首个源的超时（秒）
+_FALLBACK_TIMEOUT = 3    # 降级源的超时（秒）
 
 # ============================================================================
 # 源优先级（固定顺序，按国内直连 → 海外 API → Python 库排列）
@@ -790,7 +790,7 @@ def fetch_put_call_ratio() -> Dict[str, Any]:
 # 统一入口
 # ============================================================================
 
-def get_sentiment_data(timeout: int = 10) -> Dict[str, Any]:
+def get_sentiment_data(timeout: int = 15) -> Dict[str, Any]:
     """返回全部 7 个指标，每个独立缓存 + 独立降级链。"""
     timeout = max(1, min(timeout, 60))
 
@@ -822,7 +822,7 @@ def get_sentiment_data(timeout: int = 10) -> Dict[str, Any]:
                 for f in as_completed(futures, timeout=timeout):
                     key = futures[f]
                     try:
-                        data = f.result(timeout=5)
+                        data = f.result(timeout=10)
                         results[key] = data
                         _set_cached_indicator(key, data)
                     except Exception as e:

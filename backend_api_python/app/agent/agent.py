@@ -273,7 +273,7 @@ final_answer({{
                 weight_lines = ["| 技能 | 权重 |", "|------|------|"]
                 for name, w in sorted(weights.items(), key=lambda x: -x[1]):
                     weight_lines.append(f"| {name} | {w:.2f} |")
-                weight_section = f"\n## 技能权重（历史回溯数据）\n\n{'chr(10)'.join(weight_lines)}\n\n权重越高，该技能的历史预测越准确。\n"
+                weight_section = f"\n## 技能权重（历史回溯数据）\n\n{'\\n'.join(weight_lines)}\n\n权重越高，该技能的历史预测越准确。\n"
         except Exception:
             pass  # 权重注入失败不影响主流程
 
@@ -293,11 +293,13 @@ final_answer({{
 7. **工具失败处理** — 子 agent 返回失败时，在结论中说明，继续用已有数据做判断。
 8. **多维验证** — 综合至少 2 个不同维度的子 agent 报告做交叉验证。
 9. **善用编排** — 按需调多个子 agent，收集所有报告后做加权综合。
-10. **诚实透明** — 数据不足时明确告知，不猜测。
+10. **⚠️ 禁止重复调用** — 同一只股票的同一个子 agent 只调一次。technical_agent 已包含趋势/指标/量价/形态/筹码全维度分析，不要拆成"技术指标快照"和"K线形态"两次调用。
+11. **诚实透明** — 数据不足时明确告知，不猜测。
 11. **⚠️ 数据完整性** — 如果某个子 agent 返回失败，必须在结论中说明
     "XX数据缺失，以下结论仅供参考"。绝不用想象填补缺失数据。
 12. **⚠️ 确定性输出** — 你的分析必须基于子 agent 返回的客观数据，不能因为"感觉"
     或"可能"而改变方向性判断。同样的数据必须得出同样的结论。
+13. **⚠️ 数据获取** — 消息中的"[已获取的实时行情摘要]"仅供参考。如需使用行情数据，必须调用 get_realtime_quote 工具获取完整数据。不要尝试解析消息中的文本为数据对象。
 {finance_json_section}{lang_section}"""
 
 
@@ -915,6 +917,16 @@ class _AgentExecutor:
                     context = context or {}
                     context["stock_code"] = _stock_code
                     logger.info("[Prepare] 从消息提取股票代码: %s", _stock_code)
+                # 查股票名称（避免 LLM 瞎编）
+                if not (context and context.get("stock_name")):
+                    try:
+                        from app.utils.basicinfo_db import get_stock_basic_db
+                        _matches = get_stock_basic_db().search_stocks(_stock_code, limit=1)
+                        if _matches:
+                            context["stock_name"] = _matches[0].get("name", "")
+                            logger.info("[Prepare] 代码→名称: %s → %s", _stock_code, context["stock_name"])
+                    except Exception:
+                        pass
             else:
                 # 2. 中文名查找
                 from app.agent.text_utils import extract_stock_from_message
@@ -964,9 +976,12 @@ class _AgentExecutor:
             if context.get("stock_name"):
                 ctx_parts.append(f"股票名称: {context['stock_name']}")
             if context.get("realtime_quote"):
-                ctx_parts.append(f"[已获取的实时行情]\n{json.dumps(context['realtime_quote'], ensure_ascii=False)[:2000]}")
+                # 只注入摘要，不注入原始 JSON（避免 LLM 尝试 json.loads()）
+                _q = context["realtime_quote"]
+                _q_summary = f"最新价:{_q.get('price', _q.get('last', '?'))} 涨跌幅:{_q.get('change_pct', _q.get('pct_change', '?'))}%"
+                ctx_parts.append(f"[已获取的实时行情摘要] {_q_summary}（如需完整数据请调用 get_realtime_quote）")
             if context.get("chip_distribution"):
-                ctx_parts.append(f"[已获取的筹码分布]\n{json.dumps(context['chip_distribution'], ensure_ascii=False)[:2000]}")
+                ctx_parts.append(f"[已获取的筹码分布数据]（如需完整数据请调用 get_chip_distribution）")
 
         # 数据完整性预检：标记缺失的数据维度
         _missing_data_hints = []

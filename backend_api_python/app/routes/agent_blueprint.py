@@ -142,6 +142,15 @@ def _build_context(data: Dict, session: Dict, message: str) -> tuple:
         prefetch = _prefetch_context(stock_code, market)
         context.update(prefetch)
         context["stock_code"] = stock_code
+        # 查股票名称（避免 LLM 瞎编）
+        if not context.get("stock_name"):
+            try:
+                from app.utils.basicinfo_db import get_stock_basic_db
+                _matches = get_stock_basic_db().search_stocks(stock_code, limit=1)
+                if _matches:
+                    context["stock_name"] = _matches[0].get("name", "")
+            except Exception:
+                pass
         _touch_session(session_id, stock_code=stock_code)
     return session_id, context, stock_code
 

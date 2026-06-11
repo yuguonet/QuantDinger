@@ -65,6 +65,10 @@ class SkillExecutionTool(Tool):
         from app.agent.skills.registry import skill_registry
         from app.agent.tool_adapter import build_all_tools
 
+        # 防御：子 agent 可能传入字符串 "None" 而非 Python None
+        if stock_name in (None, "None", "null", "undefined"):
+            stock_name = ""
+
         skill_registry.discover()
         sk = skill_registry.get(self._skill.name)
         if not sk:
