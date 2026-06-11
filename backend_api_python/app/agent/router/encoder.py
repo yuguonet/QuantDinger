@@ -21,6 +21,9 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+from app.agent.text_utils import is_ollama_url
+
+
 class BaseEncoder:
     """编码器基类。"""
     dimension: int = 384
@@ -78,7 +81,7 @@ class RemoteEmbeddingEncoder(BaseEncoder):
             raise ValueError(
                 "RemoteEmbeddingEncoder 需要 api_key。"
                 "请设置 OPENAI_API_KEY / DEEPSEEK_API_KEY，"
-                "或确保 Ollama 在 localhost:11434 运行。"
+                "或确保 Ollama 服务已启动。"
             )
 
         logger.info(
@@ -90,7 +93,7 @@ class RemoteEmbeddingEncoder(BaseEncoder):
         """从环境变量检测 API key。Ollama 不需要 key，返回占位值。"""
         # Ollama 不需要 API key
         url = self.base_url.lower()
-        if any(k in url for k in ("localhost:11434", "127.0.0.1:11434", "ollama")):
+        if is_ollama_url(url):
             return "ollama"  # 占位值，Ollama 不校验
         for key in ["OPENAI_API_KEY", "DEEPSEEK_API_KEY", "OPENROUTER_API_KEY"]:
             val = os.getenv(key, "")
@@ -125,7 +128,7 @@ class RemoteEmbeddingEncoder(BaseEncoder):
         """
         url = self.base_url.lower()
         # Ollama: 优先 OpenAI 兼容接口
-        if any(k in url for k in ("localhost:11434", "127.0.0.1:11434", "ollama")):
+        if is_ollama_url(url):
             if not url.endswith("/v1") and not url.endswith("/v1/"):
                 return f"{self.base_url}/v1/embeddings"
         return f"{self.base_url}/embeddings"
@@ -133,7 +136,7 @@ class RemoteEmbeddingEncoder(BaseEncoder):
     def _resolve_embedding_url_native(self) -> str:
         """Ollama 原生 embedding 接口 /api/embed（新）和 /api/embeddings（旧）。"""
         url = self.base_url.lower()
-        if any(k in url for k in ("localhost:11434", "127.0.0.1:11434", "ollama")):
+        if is_ollama_url(url):
             base = self.base_url.rstrip("/")
             if base.endswith("/v1"):
                 base = base[:-3]
@@ -143,7 +146,7 @@ class RemoteEmbeddingEncoder(BaseEncoder):
     def _resolve_embedding_url_legacy(self) -> str:
         """Ollama 旧版接口 /api/embeddings。"""
         url = self.base_url.lower()
-        if any(k in url for k in ("localhost:11434", "127.0.0.1:11434", "ollama")):
+        if is_ollama_url(url):
             base = self.base_url.rstrip("/")
             if base.endswith("/v1"):
                 base = base[:-3]
@@ -154,7 +157,7 @@ class RemoteEmbeddingEncoder(BaseEncoder):
         """检测当前 provider。优先从 URL 判断（避免 LLMService 将 Ollama 误判为 openai）。"""
         url = self.base_url.lower()
         # 优先：URL 特征匹配（Ollama 等本地服务必须先识别，否则会被 LLMService 归为 openai）
-        if any(k in url for k in ("localhost:11434", "127.0.0.1:11434", "ollama")):
+        if is_ollama_url(url):
             return "ollama"
         if "deepseek" in url:
             return "deepseek"
@@ -184,7 +187,7 @@ class RemoteEmbeddingEncoder(BaseEncoder):
 
     def _is_ollama(self) -> bool:
         url = self.base_url.lower()
-        return any(k in url for k in ("localhost:11434", "127.0.0.1:11434", "ollama"))
+        return is_ollama_url(url)
 
     def _call_embedding_api(self, url: str, batch: List[str], is_native: bool = False) -> List[List[float]]:
         """调用一次 embedding API，返回 embedding 列表。"""
@@ -355,9 +358,21 @@ def create_encoder(
 
     if backend in ("auto", "remote"):
         try:
-            return RemoteEmbeddingEncoder(
+            encoder = RemoteEmbeddingEncoder(
                 api_key=api_key, base_url=base_url, model=model_name,
             )
+            # 连接预检：发一条空文本验证 embedding 接口是否可用
+            # 避免 init 成功但 encode() 时连接失败（如 Ollama 未启动）
+            try:
+                encoder.encode(["test"])
+            except Exception as conn_err:
+                if backend == "remote":
+                    raise
+                logger.warning(
+                    "[Encoder] 远程 embedding 连接失败 (%s)，降级到 HashEncoder", conn_err
+                )
+                return HashEncoder()
+            return encoder
         except (ValueError, ImportError) as e:
             if backend == "remote":
                 raise

@@ -94,7 +94,6 @@ def _get_verb_noun_router():
 
     try:
         _verb_noun_router = VerbNounRouter(
-            semantic_router=semantic,
             context_boost=context_boost,
         )
         logger.info("[Intent] 动作-对象路由器初始化完成")
@@ -194,10 +193,10 @@ def analyze_intent(
 ) -> IntentResult:
     """分析用户消息的意图。
 
-    路由策略（三级降级）：
+    路由策略：
     1. 快速通道 — 关键词匹配（<1ms，零开销）
-    2. 动作-对象路由 — 先识别动作（看/分析/修改...），再识别对象（股票/代码/项目...）
-    3. 语义路由 — embedding + cosine similarity 降级兜底
+    2. 语义路由 — embedding 确定领域（finance/coding/chat）
+    3. 金融域精排 — verb_noun_router 做 verb+noun 精确匹配
 
     Args:
         message: 用户消息
@@ -221,55 +220,87 @@ def analyze_intent(
         logger.info("[Intent] 快速通道: %s/%s", quick.domain, quick.intent)
         return quick
 
-    # ── Level 2: 动作-对象路由（主路由）────────────────────────
     ctx_mgr = _get_context_manager()
     context_domain = ctx_mgr.get_context_domain(session_id) if session_id else ""
 
-    router = _get_verb_noun_router()
-    if router:
-        result = router.route(
+    # ── Level 2: 语义路由 — 先定领域 ───────────────────────────
+    semantic = _get_semantic_router()
+    semantic_result = None
+    if semantic:
+        semantic_result = semantic.route(
             query=message,
             session_id=session_id,
             context_domain=context_domain,
         )
 
-        if result.matched:
-            # 记录到上下文
-            if session_id:
-                ctx_mgr.record_route(
-                    session_id=session_id,
-                    domain=result.domain,
-                    intent=result.intent,
-                    confidence=result.confidence,
-                    query=message,
+    # 语义路由命中 → 确定领域
+    if semantic_result and semantic_result.matched:
+        domain = semantic_result.domain
+        intent = semantic_result.intent
+        confidence = semantic_result.confidence
+        metadata = semantic_result.metadata
+        tool_cats = metadata.get("tool_categories", [])
+        logger.info(
+            "[Intent] 语义路由命中: %s/%s (%.2f) %.0fms | %s",
+            domain, intent, confidence, semantic_result.elapsed_ms, message[:50],
+        )
+    else:
+        domain = "chat"
+        intent = "unmatched"
+        confidence = 0.0
+        metadata = {}
+        tool_cats = []
+        logger.info("[Intent] 语义路由未命中，走默认 chat | %s", message[:50])
+
+    # ── Level 3: 金融域精排 — verb_noun_router ─────────────────
+    # 只有金融域才需要 verb+noun 精确匹配（股票名词 DB 查询等）
+    verb = ""
+    noun = ""
+    params = _extract_params(message)
+
+    if domain == "finance":
+        router = _get_verb_noun_router()
+        if router:
+            result = router.route(
+                query=message,
+                session_id=session_id,
+                context_domain=context_domain,
+            )
+            if result.matched:
+                domain = result.domain
+                intent = result.intent
+                confidence = result.confidence
+                metadata = result.metadata
+                tool_cats = result.metadata.get("tool_categories", [])
+                verb = result.verb
+                noun = result.noun
+                params = result.params
+                logger.info(
+                    "[Intent] 金融精排命中: %s/%s (%.2f) verb=%s noun=%s %.0fms | %s",
+                    domain, intent, confidence, verb, noun, result.elapsed_ms, message[:50],
                 )
 
-            tool_cats = result.metadata.get("tool_categories", [])
+    # 记录到上下文
+    if session_id:
+        ctx_mgr.record_route(
+            session_id=session_id,
+            domain=domain,
+            intent=intent,
+            confidence=confidence,
+            query=message,
+        )
 
-            intent_result = IntentResult(
-                domain=result.domain,
-                intent=result.intent,
-                params=result.params,
-                confidence=result.confidence,
-                metadata=result.metadata,
-                source=result.source,
-                all_scores=result.all_scores,
-                elapsed_ms=result.elapsed_ms,
-                tool_categories=tool_cats,
-                verb=result.verb,
-                noun=result.noun,
-            )
-            logger.info(
-                "[Intent] 动作-对象路由命中: %s/%s (%.2f) verb=%s noun=%s %.0fms",
-                result.domain, result.intent, result.confidence,
-                result.verb, result.noun, result.elapsed_ms,
-            )
-            return intent_result
-
-    # ── Level 3: 语义路由兜底（已禁用 LLM 降级）────────────────
-    logger.info("[Intent] 动作-对象路由未命中，走默认 chat")
-    params = _extract_params(message)
-    return IntentResult(domain="chat", intent="unmatched", confidence=0.0, params=params, source="fallback")
+    return IntentResult(
+        domain=domain,
+        intent=intent,
+        params=params,
+        confidence=confidence,
+        metadata=metadata,
+        source="semantic" if not verb else "verb_noun",
+        tool_categories=tool_cats,
+        verb=verb,
+        noun=noun,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -492,34 +523,12 @@ def _match_scores_to_scenes(arr: List[Dict], scenes: List[Dict]) -> List[Dict]:
 def _extract_params(message: str, scene: Dict = None) -> Dict[str, Any]:
     """从用户消息中提取基础参数（股票代码等）。"""
     params = {}
-    code_match = re.search(r'\b(\d{6})\b', message)
-    if code_match:
-        params["stock"] = code_match.group(1)
-        return params
-
-    # 提取中文股票名称（2-6个连续中文字符）
-    _stopwords = {"帮我", "分析", "查看", "看看", "查询", "怎么样", "什么", "如何",
-                  "的", "了", "吗", "吧", "呢", "啊", "一下", "最近", "今天", "昨天"}
-    name_match = re.search(r'[\u4e00-\u9fff]{2,6}', message)
-    if name_match:
-        candidate = name_match.group(0)
-        # 去掉停用词前缀（如 "分析宇通客车" → "宇通客车"）
-        if candidate in _stopwords:
-            candidate = None
-        if candidate:
-            for sw in sorted(_stopwords, key=len, reverse=True):
-                if candidate.startswith(sw) and len(candidate) > len(sw):
-                    candidate = candidate[len(sw):]
-                    break
-        if candidate and candidate not in _stopwords and len(candidate) >= 2:
-            try:
-                from app.utils.basicinfo_db import get_stock_basic_db
-                matches = get_stock_basic_db().search_stocks(candidate, limit=1)
-                if matches:
-                    params["stock"] = matches[0]["symbol"]
-                    params["stock_name"] = matches[0].get("name", candidate)
-            except Exception:
-                pass
+    from app.agent.text_utils import extract_stock_from_message
+    code, name = extract_stock_from_message(message)
+    if code:
+        params["stock"] = code
+    if name:
+        params["stock_name"] = name
     return params
 
 

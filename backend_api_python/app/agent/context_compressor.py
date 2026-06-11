@@ -5,10 +5,10 @@ Context Compressor — 跨轮上下文压缩。
 agent.run() 结束后，把本轮结果（分析内容 + 工具调用）压缩成结构化 markdown，
 存入 session store，下一轮作为上下文注入。
 
-策略：规则引擎优先 + LLM 降级
+策略：规则引擎 + 截断兜底
   1. 规则引擎提取结构化字段（<1ms, 零 LLM 调用）
   2. 质量检查：提取结果 >= 80字 且 含关键信息 → 直接用
-  3. 质量不足 → LLM 降级压缩
+  3. 质量不足 → 智能截断
 
 特性：
   - 结构化股票信息：提取 analyzed_stocks / last_stock / domain / key_conclusions
@@ -269,6 +269,88 @@ _LINE_MARKER = re.compile(r'^\s*(?:[-*\u2022]\s*|\d+[.\u3001\uff09\uff09]\s*|#{1
 _EMPTY_LINE = re.compile(r'^\s*$|^\s*[-=*_]{3,}\s*$')
 
 
+def _compress_structured_json(output: str, max_len: int = 300) -> Optional[str]:
+    """识别并压缩结构化 JSON 输出（agent 的 DecisionCard）。
+
+    agent 输出格式：
+      **买入** 贵州茅台(600519)
+      维度:3天 评分:72 方向:看多 置信:高
+      技术面:75 | 动量:80 | 情报:45
+      信号: xxx
+      <details><summary>详细分析</summary>...</details>
+
+    或原始 JSON：
+      {"action": "buy", "score": 72, "direction": "bullish", ...}
+
+    Returns:
+        压缩后的结构化摘要，或 None（非结构化输出）
+    """
+    import json as _json
+
+    # 尝试 1：从 DecisionCard 格式提取
+    card_match = re.search(
+        r'\*\*(买入|卖出|观望|跳过)\*\*\s*(.+?)$.*?维度:(\S+)\s+评分:(\d+)\s+方向:(\S+)\s+置信:(\S+)'
+        r'.*?信号:\s*(.+?)$',
+        output, re.MULTILINE | re.DOTALL,
+    )
+    if card_match:
+        action, stock, tf, score, direction, confidence, signal = (
+            card_match.group(1), card_match.group(2).strip(),
+            card_match.group(3), card_match.group(4),
+            card_match.group(5), card_match.group(6),
+            card_match.group(7).strip(),
+        )
+        # 提取因子明细
+        factors_match = re.search(r'((?:\S+:\d+\s*\|?\s*)+)', output[card_match.start():])
+        factors_line = factors_match.group(1).strip() if factors_match else ""
+        # 提取 analysis（details 块内）
+        analysis_match = re.search(r'<details>.*?<summary>详细分析</summary>\s*(.*?)\s*</details>',
+                                   output, re.DOTALL)
+        analysis = analysis_match.group(1).strip()[:200] if analysis_match else ""
+
+        parts = [f"{action} {stock} | {tf} 评分{score} {direction} 置信{confidence}"]
+        if factors_line:
+            parts.append(f"因子: {factors_line}")
+        if signal:
+            parts.append(f"信号: {signal}")
+        if analysis:
+            parts.append(f"分析: {analysis}")
+        return "\n".join(parts)
+
+    # 尝试 2：从 JSON 块提取
+    json_patterns = [
+        r'```json\s*\n?(.*?)\n?\s*```',
+        r'(\{[^{}]*"action"[^{}]*"score"[^{}]*\})',
+    ]
+    for pat in json_patterns:
+        m = re.search(pat, output, re.DOTALL)
+        if m:
+            try:
+                data = _json.loads(m.group(1).strip())
+                if isinstance(data, dict) and "action" in data and "score" in data:
+                    parts = [
+                        f"{data.get('action', '?')} {data.get('stock_name', '')}({data.get('stock_code', '')})"
+                        f" | {data.get('timeframe', '?')} 评分{data.get('score', '?')}"
+                        f" {data.get('direction', '?')} 置信{data.get('confidence', '?')}",
+                    ]
+                    if data.get("signal"):
+                        parts.append(f"信号: {data['signal']}")
+                    # 因子摘要
+                    factors = data.get("factors", [])
+                    if factors:
+                        factor_strs = [f"{f.get('name', '?')}:{f.get('score', '?')}" for f in factors[:5]]
+                        parts.append(f"因子: {' | '.join(factor_strs)}")
+                    # 分析截断
+                    analysis = data.get("analysis", "")
+                    if analysis:
+                        parts.append(f"分析: {analysis[:150]}")
+                    return "\n".join(parts)
+            except (_json.JSONDecodeError, TypeError):
+                continue
+
+    return None
+
+
 def compress_context_rule(
     output: str,
     tool_calls: List[Dict] = None,
@@ -277,11 +359,23 @@ def compress_context_rule(
     """
     规则引擎压缩 agent 输出。
 
+    优先识别结构化 JSON/DecisionCard 输出，直接解析压缩（0 token）。
+    非结构化输出走逐行打分。
+
     Returns:
         (压缩文本, 是否高质量)
     """
     if not output:
         return "", False
+
+    # ── 优先：结构化输出压缩 ─────────────────────────────────
+    structured = _compress_structured_json(output, max_len=max_len)
+    if structured:
+        # 追加工具名
+        tool_names = _extract_tool_names(tool_calls)
+        if tool_names and len(structured) + len(tool_names) + 10 <= max_len:
+            structured = structured + "\n工具: " + ", ".join(tool_names)
+        return structured, True
 
     text = _clean_output(output)
     if len(text) <= max_len:
@@ -442,83 +536,7 @@ def _smart_truncate(text: str, max_len: int) -> str:
 
 
 # ============================================================
-# LLM 降级压缩
-# ============================================================
-
-_COMPRESS_PROMPT = """将以下 Agent 分析结果压缩为结构化 markdown 摘要。
-
-## 要求
-1. 保留关键数据（价格、涨跌幅、指标值、结论）
-2. 保留涉及的股票代码和名称
-3. 保留调用过的工具名列表
-4. 去掉冗余描述，只留要点
-5. 如果是代码相关任务，保留修改了哪些文件、做了什么改动
-6. 控制在 {max_len} 字以内
-7. 只输出 markdown，不要其他文字
-
-## Agent 输出
-{output}
-
-## 工具调用记录
-{tool_calls}
-"""
-
-
-def _compress_context_llm(
-    output: str,
-    tool_calls: List[Dict] = None,
-    model: str = None,
-    max_len: int = 300,
-) -> str:
-    """LLM 降级压缩"""
-    tool_text = ""
-    if tool_calls:
-        names = [tc.get("tool", "") for tc in tool_calls if tc.get("tool")]
-        tool_text = ", ".join(names) if names else "（无）"
-    else:
-        tool_text = "（无）"
-
-    prompt = _COMPRESS_PROMPT.format(
-        output=output[:3000],
-        tool_calls=tool_text,
-        max_len=max_len,
-    )
-
-    try:
-        from app.services.llm import LLMService
-        import requests
-
-        svc = LLMService(provider=None)
-        api_key = svc.get_api_key()
-        base_url = svc.get_base_url()
-        compress_model = model or os.getenv("AGENT_COMPRESS_MODEL", "").strip() or svc.get_default_model()
-
-        resp = requests.post(
-            f"{base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": compress_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1,
-                "max_tokens": 600,
-            },
-            timeout=60.0,
-        )
-        resp.raise_for_status()
-        summary = resp.json()["choices"][0]["message"]["content"].strip()
-        logger.info("[Compress:LLM] 原始 %d 字 → 压缩 %d 字", len(output), len(summary))
-        return summary
-
-    except Exception as e:
-        logger.warning("[Compress:LLM] 调用失败: %s", e)
-        return ""
-
-
-# ============================================================
-# 主入口：规则引擎优先 + LLM 降级 + 结构化信息 + 老摘要衰减
+# 主入口：规则引擎 + 截断兜底 + 结构化信息 + 老摘要衰减
 # ============================================================
 
 def compress_context(
@@ -535,8 +553,7 @@ def compress_context(
       2. 提取结构化股票信息（代码/名称/方向/结论）
       3. 规则引擎压缩（按 age_turns 衰减目标长度）
       4. 质量足够 → 返回 结构化信息 + 压缩正文
-      5. 质量不足 → LLM 降级
-      6. LLM 也失败 → 截断
+      5. 质量不足 → 智能截断
 
     Args:
         output: agent 本轮完整输出
@@ -615,29 +632,14 @@ def compress_context(
         )
         return result
 
-    # ── Step 4: LLM 降级 ─────────────────────────────────────
-    logger.info(
-        "[Compress] 规则引擎质量不足 (len=%d), 降级到 LLM (target=%d)",
-        len(rule_result), body_max_len,
-    )
-    llm_result = _compress_context_llm(
-        output, tool_calls, model=model, max_len=body_max_len,
-    )
-
-    if llm_result and len(llm_result) >= 50:
-        result = _combine_struct_and_body(struct_block, llm_result)
-        result = _strip_directional_bias(result)
-        logger.info(
-            "[Compress:LLM] 原始 %d 字 → 压缩 %d 字 (age=%d)",
-            len(output), len(result), age_turns,
-        )
-        return result
-
-    # ── Step 5: 最终降级 ─────────────────────────────────────
-    fallback = rule_result if rule_result else _smart_truncate(cleaned, body_max_len)
+    # ── Step 4: 规则引擎质量不足 → 智能截断 ──────────────────
+    fallback = _smart_truncate(cleaned, body_max_len)
     result = _combine_struct_and_body(struct_block, fallback)
     result = _strip_directional_bias(result)
-    logger.warning("[Compress] LLM 也失败, 降级截断: %d 字 (age=%d)", len(result), age_turns)
+    logger.info(
+        "[Compress:Truncate] 原始 %d 字 → 截断 %d 字 (age=%d)",
+        len(output), len(result), age_turns,
+    )
     return result
 
 

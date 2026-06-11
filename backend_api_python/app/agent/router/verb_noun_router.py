@@ -1,18 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-VerbNoun Router — 动作-对象 两阶段意图路由。
+VerbNoun Router — 动作-对象 两阶段意图路由（仅金融域精排）。
 
-设计思路：
-  旧结构：平铺式 Route（finance/stock_analysis, coding/code_modify...），
-         "分析"在多个 Route 的 utterance 中重叠，导致误分类。
-  新结构：先识别动作（看/分析/修改/创建...），再识别对象（股票/代码/项目...），
-         组合得到 domain/intent，消除歧义。
-
-路由流程：
-  1. 动作层（verb）：正则/关键词匹配，识别用户要做什么
-  2. 对象层（noun）：正则/关键词匹配，识别用户要对什么做
-  3. 组合层：verb + noun → domain/intent
-  4. 降级：未命中时走语义路由兜底
+调用约定：
+  analyze_intent() 先通过语义路由确定领域，
+  只有 domain=finance 时才调用本路由器做 verb+noun 精确匹配。
 """
 from __future__ import annotations
 
@@ -77,11 +69,11 @@ VERB_PATTERNS: List[Tuple[str, List[str]]] = [
         r"解读",
         r"剖析",
         r"梳理",
-        r"怎么样",
-        r"什么(情况|状态|位置)",
+        # ⚠️ "怎么样"/"什么情况" 太泛，所有疑问句都会命中，移除
+        # 这些交给语义路由处理（"大盘怎么样" → finance, "天气怎么样" → chat）
         r"能(买|卖|持有)吗",
         r"(涨|跌)了吗",
-        r"走势(如何|怎么样|分析)",
+        r"走势(如何|分析)",
     ]),
 
     # ── 修改类 ──
@@ -488,40 +480,23 @@ def _match_noun(message: str) -> Optional[str]:
     return None
 
 
+def _has_stock_context(message: str) -> bool:
+    """判断消息是否包含股票相关内容。委托 text_utils。"""
+    from app.agent.text_utils import has_stock_context
+    return has_stock_context(message)
+
+
 def _extract_stock_code(message: str) -> Optional[str]:
-    """提取股票代码。"""
-    match = re.search(r'\b(\d{6})\b', message)
-    if match:
-        return match.group(1)
-    return None
+    """提取股票代码。委托 text_utils。"""
+    from app.agent.text_utils import extract_stock_code
+    return extract_stock_code(message)
 
 
 def _extract_stock_name(message: str) -> Optional[str]:
-    """提取股票名称（通过市场接口验证）。"""
-    stopwords = {"帮我", "分析", "查看", "看看", "查询", "怎么样", "什么", "如何",
-                 "的", "了", "吗", "吧", "呢", "啊", "一下", "最近", "今天", "昨天",
-                 "修改", "修复", "创建", "写", "生成", "筛选", "选择", "回测", "启动",
-                 "停止", "看看", "显示", "展示", "项目", "代码", "文件", "目录"}
-    match = re.search(r'[\u4e00-\u9fff]{2,6}', message)
-    if match:
-        candidate = match.group(0)
-        # 去掉停用词前缀（如 "分析宇通客车" → "宇通客车"）
-        if candidate in stopwords:
-            candidate = None
-        if candidate:
-            for sw in sorted(stopwords, key=len, reverse=True):
-                if candidate.startswith(sw) and len(candidate) > len(sw):
-                    candidate = candidate[len(sw):]
-                    break
-        if candidate and candidate not in stopwords and len(candidate) >= 2:
-            try:
-                from app.utils.basicinfo_db import get_stock_basic_db
-                matches = get_stock_basic_db().search_stocks(candidate, limit=1)
-                if matches:
-                    return matches[0].get("symbol")
-            except Exception:
-                pass
-    return None
+    """提取股票名称（通过 DB 验证）。委托 text_utils。"""
+    from app.agent.text_utils import extract_stock_from_message
+    code, name = extract_stock_from_message(message)
+    return code  # 返回 code（verb_noun_router 只需要 code 作为 params["stock"]）
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -529,21 +504,19 @@ def _extract_stock_name(message: str) -> Optional[str]:
 # ═══════════════════════════════════════════════════════════════
 
 class VerbNounRouter:
-    """动作-对象两阶段路由器。
+    """动作-对象两阶段路由器（仅金融域精排用）。
+
+    调用方（analyze_intent）已通过语义路由确定领域，
+    只有 domain=finance 时才调用本路由器做 verb+noun 精确匹配。
 
     优先级：
     1. verb + noun 组合匹配（最精确）
     2. 只有 verb（降级到 verb 默认）
     3. 只有 noun（降级到 noun 默认）
-    4. 都没命中 → 语义路由兜底
-
-    工具链：
-    路由命中后，自动查 tool_chains 配置获取建议执行步骤，
-    注入到结果的 metadata 中，agent 会优先按此顺序执行。
+    4. 都没命中 → 返回 unmatched
     """
 
-    def __init__(self, semantic_router=None, context_boost: float = 0.1):
-        self.semantic_router = semantic_router
+    def __init__(self, context_boost: float = 0.1):
         self.context_boost = context_boost
         logger.info("[VerbNounRouter] 初始化完成")
 
@@ -571,39 +544,10 @@ class VerbNounRouter:
         # 用户输入"分析宇通客车"时 noun 为 None，导致链路无法触发。
         # 这里用 DB 查询兜底：提取中文词 → search_stocks → 命中则 noun="stock"
         if not noun:
-            _stock_stopwords = {
-                "帮我", "分析", "查看", "看看", "查询", "怎么样", "什么", "如何",
-                "的", "了", "吗", "吧", "呢", "啊", "一下", "最近", "今天", "昨天",
-                "修改", "修复", "创建", "写", "生成", "筛选", "选择", "回测", "启动",
-                "停止", "显示", "展示", "项目", "代码", "文件", "目录", "评估",
-                "判断", "研究", "解读", "情况", "状态", "走势", "趋势", "行情",
-                "策略", "指标", "信号", "买入", "卖出", "持有", "观望", "建议",
-                "推荐", "潜力", "风险", "机会", "分析一下", "怎么样",
-            }
-            _cn_match = re.search(r'[\u4e00-\u9fff]{2,8}', message)
-            if _cn_match:
-                _candidate = _cn_match.group(0)
-                # 先检查完整匹配是否在停用词中
-                if _candidate in _stock_stopwords:
-                    _candidate = None
-                # 如果完整匹配含停用词前缀，去掉前缀再试（如 "分析宇通客车" → "宇通客车"）
-                if _candidate:
-                    for _sw in sorted(_stock_stopwords, key=len, reverse=True):
-                        if _candidate.startswith(_sw) and len(_candidate) > len(_sw):
-                            _candidate = _candidate[len(_sw):]
-                            break
-                if _candidate and _candidate not in _stock_stopwords and len(_candidate) >= 2:
-                    try:
-                        from app.utils.basicinfo_db import get_stock_basic_db
-                        _matches = get_stock_basic_db().search_stocks(_candidate, limit=1)
-                        if _matches:
-                            noun = "stock"
-                            logger.info("[VerbNoun] 中文名 '%s' → noun=stock (code=%s)",
-                                        _candidate, _matches[0].get("symbol", ""))
-                        else:
-                            logger.info("[VerbNoun] 中文名 '%s' 未匹配到DB，跳过", _candidate)
-                    except Exception as _e:
-                        logger.warning("[VerbNoun] 股票名查询异常: %s", _e)
+            from app.agent.text_utils import has_stock_context
+            if has_stock_context(message):
+                noun = "stock"
+                logger.info("[VerbNoun] DB 名称匹配 → noun=stock | %s", message[:50])
 
         # ── Step 3: 组合 ──
         result = None
@@ -634,16 +578,21 @@ class VerbNounRouter:
                     )
 
         elif verb and not noun:
-            default = VERB_ONLY_DEFAULT.get(verb)
-            if default:
-                domain, intent, tool_cats = default
-                result = VerbNounResult(
-                    domain=domain, intent=intent,
-                    verb=verb, noun="",
-                    confidence=0.70,
-                    source="verb_only",
-                    metadata={"tool_categories": tool_cats},
-                )
+            # ⚠️ verb-only 降级：有明确股票信号时走 finance，否则交给语义路由
+            # 之前：verb alone → 直接 finance/stock_analysis（"天气怎么样" 误判）
+            # 现在：verb alone → 确认股票才走 finance，否则跳到语义路由（Step 5）
+            if _has_stock_context(message):
+                default = VERB_ONLY_DEFAULT.get(verb)
+                if default:
+                    domain, intent, tool_cats = default
+                    result = VerbNounResult(
+                        domain=domain, intent=intent,
+                        verb=verb, noun="",
+                        confidence=0.70,
+                        source="verb_only",
+                        metadata={"tool_categories": tool_cats},
+                    )
+            # 无股票信号 → 不做 verb-only 降级，fall through 到语义路由
 
         elif noun and not verb:
             default = NOUN_ONLY_DEFAULT.get(noun)
@@ -679,34 +628,7 @@ class VerbNounRouter:
             )
             return result
 
-        # ── Step 5: 语义路由兜底 ──
-        if self.semantic_router:
-            semantic_result = self.semantic_router.route(
-                query=message,
-                session_id=session_id,
-                context_domain=context_domain,
-            )
-            if semantic_result.matched:
-                tool_cats = semantic_result.metadata.get("tool_categories", [])
-                result = VerbNounResult(
-                    domain=semantic_result.domain,
-                    intent=semantic_result.intent,
-                    verb="", noun="",
-                    confidence=semantic_result.confidence * 0.9,  # 降级折扣
-                    source="semantic_fallback",
-                    params=_extract_params_from_message(message),
-                    metadata=semantic_result.metadata,
-                    all_scores=semantic_result.all_scores,
-                )
-                result.elapsed_ms = (time.time() - t0) * 1000
-                logger.info(
-                    "[VerbNoun] 语义降级: %s/%s (%.2f) %.0fms | %s",
-                    result.domain, result.intent,
-                    result.confidence, result.elapsed_ms, message[:50],
-                )
-                return result
-
-        # ── 完全未命中 ──
+        # ── 完全未命中（语义路由已在 analyze_intent 先跑，这里直接返回未命中）──
         result = VerbNounResult(
             domain="chat", intent="unmatched",
             confidence=0.0, source="none",

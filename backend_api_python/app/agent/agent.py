@@ -830,40 +830,14 @@ class _AgentExecutor:
                     logger.info("[Prepare] 从消息提取股票代码: %s", _stock_code)
             else:
                 # 2. 中文名查找
-                _name_match = _re_stock.search(r'[\u4e00-\u9fff]{2,6}', message)
-                if _name_match:
-                    _candidate = _name_match.group(0)
-                    _stopwords = {"分析", "查看", "看看", "查询", "怎么样", "什么", "如何",
-                                  "帮我", "一下", "最近", "今天", "昨天", "修改", "修复",
-                                  "创建", "筛选", "回测", "启动", "停止", "显示", "展示",
-                                  "评估", "判断", "研究", "解读", "情况", "状态",
-                                  "买入", "卖出", "持有", "跳过", "短线", "中线", "长线"}
-                    # 先检查完整匹配是否在停用词中
-                    if _candidate in _stopwords:
-                        _candidate = None
-                    # 如果完整匹配含停用词前缀，去掉前缀再试（如 "分析宇通客车" → "宇通客车"）
-                    if _candidate:
-                        for _sw in sorted(_stopwords, key=len, reverse=True):
-                            if _candidate.startswith(_sw) and len(_candidate) > len(_sw):
-                                _candidate = _candidate[len(_sw):]
-                                break
-                    if _candidate and _candidate not in _stopwords and len(_candidate) >= 2:
-                        try:
-                            from app.utils.basicinfo_db import get_stock_basic_db
-                            _matches = get_stock_basic_db().search_stocks(_candidate, limit=1)
-                            if _matches:
-                                context = context or {}
-                                context["stock_code"] = _matches[0].get("symbol", "")
-                                context["stock_name"] = _matches[0].get("name", "")
-                                logger.info("[Prepare] 中文名 '%s' → 代码 %s", _candidate, context["stock_code"])
-                            else:
-                                context = context or {}
-                                context["stock_name"] = _candidate
-                                logger.info("[Prepare] 中文名 '%s' 未匹配代码，作为 stock_name", _candidate)
-                        except Exception as e:
-                            context = context or {}
-                            context["stock_name"] = _candidate
-                            logger.warning("[Prepare] 股票名查询失败: %s", e)
+                from app.agent.text_utils import extract_stock_from_message
+                _code, _name = extract_stock_from_message(message)
+                if _code:
+                    context = context or {}
+                    context["stock_code"] = _code
+                    if _name:
+                        context["stock_name"] = _name
+                    logger.info("[Prepare] 中文名 → 代码 %s", _code)
 
         # ── 提取意图信息，供后置评估使用 ──────────────────────
         _eval_verb = ""
@@ -1175,8 +1149,13 @@ class _AgentExecutor:
         流程：
           1. 查固定链路（verb+noun 精确匹配）
           2. 未匹配 → Planner 规划（LLM 选 Skill）
-          3. 规划失败 → 降级默认链路（必须告知用户）
+          3. 规划失败 → 返回 None（让 agent 直接处理）
         """
+        # ── 前置拦截：无意图信号时直接返回，不浪费 token ──
+        if not verb and not noun:
+            logger.info("[Chain] 无 verb/noun 信号，跳过链路")
+            return None
+
         # ── 提取股票代码（固定链路和规划都需要）──
         stock_code = ""
         stock_name = ""
@@ -1189,38 +1168,13 @@ class _AgentExecutor:
             if match:
                 stock_code = match.group(1)
         if not stock_code:
-            import re
-            name_match = re.search(r'[\u4e00-\u9fff]{2,6}', message)
-            if name_match:
-                candidate = name_match.group(0)
-                _stopwords = {"分析", "查看", "看看", "查询", "怎么样", "什么", "如何",
-                              "帮我", "一下", "最近", "今天", "昨天", "修改", "修复",
-                              "创建", "筛选", "回测", "启动", "停止", "显示", "展示",
-                              "评估", "判断", "研究", "解读", "怎么样", "情况", "状态"}
-                # 先检查完整匹配是否在停用词中
-                if candidate in _stopwords:
-                    candidate = None
-                # 如果完整匹配含停用词前缀，去掉前缀再试
-                if candidate:
-                    for sw in sorted(_stopwords, key=len, reverse=True):
-                        if candidate.startswith(sw) and len(candidate) > len(sw):
-                            candidate = candidate[len(sw):]
-                            break
-                if candidate and candidate not in _stopwords and len(candidate) >= 2:
-                    try:
-                        from app.utils.basicinfo_db import get_stock_basic_db
-                        matches = get_stock_basic_db().search_stocks(candidate, limit=1)
-                        if matches:
-                            stock_code = matches[0].get("symbol", "")
-                            stock_name = matches[0].get("name", "")
-                            logger.info("[Chain] 中文名 '%s' → 代码 %s", candidate, stock_code)
-                        else:
-                            # DB 查不到，至少把中文名传给 Planner，让 LLM 有上下文
-                            stock_name = candidate
-                            logger.info("[Chain] 中文名 '%s' 未匹配到代码，作为 stock_name 传递", candidate)
-                    except Exception as e:
-                        stock_name = candidate
-                        logger.warning("[Chain] 股票名查询失败: %s, 作为 stock_name 传递", e)
+            from app.agent.text_utils import extract_stock_from_message
+            _code, _name = extract_stock_from_message(message)
+            if _code:
+                stock_code = _code
+            if _name:
+                stock_name = _name
+                logger.info("[Chain] 中文名 → 代码 %s", stock_code)
 
         # ── Layer 0: 固定链路匹配 ──
         chain_def = None
@@ -1271,13 +1225,10 @@ class _AgentExecutor:
             except Exception as e:
                 logger.warning("[Planner] 规划异常: %s", e)
 
-        # ── Layer 2: 最终兜底 ──
+        # ── Layer 2: 无匹配 → 返回 None，让 agent 直接处理 ──
         if not chain_def:
-            from app.agent.planner import get_default_fallback_chain
-            chain_def = get_default_fallback_chain()
-            degraded = True
-            degrade_reason = "规划器异常，使用默认链路"
-            logger.warning("[Chain] 最终兜底: %s", chain_def.chain_id)
+            logger.info("[Chain] 无链路匹配 (verb=%s noun=%s)，交给 agent", verb, noun)
+            return None
 
         # 非个股链路不需要股票代码
         if not stock_code:
@@ -1436,8 +1387,8 @@ class _AgentExecutor:
                     "total_steps": chain_result.total_steps,
                     "model": chain_result.model,
                     "session_id": session_id,
-            }
-            return
+                }
+                return
 
         t0 = time.time()
         _stream_tool_calls = []  # 收集流式执行中的工具调用
