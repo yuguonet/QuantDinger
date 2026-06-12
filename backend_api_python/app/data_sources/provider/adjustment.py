@@ -13,6 +13,7 @@
   - unadj_to_hfq(klines, code) — 不复权 → 后复权
 
 因子性质: 只增不改的历史档案 — 已有记录永远不变，只追加新除权日。
+缓存策略: 整体更新间隔为1天，每次更新会重新拉取所有活跃股票的数据。
 """
 
 from __future__ import annotations
@@ -34,6 +35,9 @@ from typing import Dict, List, Optional, Tuple
 
 _CACHE_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "..", "data")
 _CACHE_FILE = os.path.join(_CACHE_DIR, "adjustment_factors.json")
+
+# 全量更新间隔（秒），1天
+_UPDATE_INTERVAL = 86400
 
 # ================================================================
 # HTTP
@@ -88,28 +92,40 @@ def _to_sina_code(code: str) -> Optional[str]:
 #   - 新数据时: 内存 → 文件 (异步全量写入)
 #   - 读取只查内存，不碰磁盘
 #   - 因子只增不改，永不"过期"
+#   - 全量更新通过全局时间戳控制，超过1天重新拉取所有活跃股票
+#
+# 文件结构:
+#   {
+#     "_last_full_update": 1718150000.0,
+#     "sz000001": [[date, factor], ...],
+#     "sh600519": [[date, factor], ...],
+#     ...
+#   }
 
 # 内存缓存: sina_code → [(date, factor), ...]
 _mem: Dict[str, List[Tuple[str, float]]] = {}
 _mem_lock = threading.Lock()
 _write_lock = threading.Lock()
 
+# 全局更新时间戳
+_last_full_update: float = 0.0
+
 
 def _load():
     """启动时从文件全量加载到内存。"""
+    global _last_full_update
     try:
         if not os.path.exists(_CACHE_FILE):
             return
         with open(_CACHE_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
-        n = 0
+        # 读取全局时间戳
+        _last_full_update = float(raw.pop("_last_full_update", 0))
         for code, entry in raw.items():
             if isinstance(entry, dict) and "factors" in entry:
                 _mem[code] = [(d, float(v)) for d, v in entry["factors"]]
-                n += 1
             elif isinstance(entry, list):
                 _mem[code] = [(d, float(v)) for d, v in entry]
-                n += 1
     except Exception:
         pass
 
@@ -121,6 +137,8 @@ def _save():
             snapshot = dict(_mem)
         try:
             os.makedirs(_CACHE_DIR, exist_ok=True)
+            # 把时间戳写入同一个文件
+            snapshot["_last_full_update"] = _last_full_update
             # 先写临时文件再原子替换，避免写入中途崩溃导致文件损坏
             tmp = _CACHE_FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -147,7 +165,7 @@ def _parse_sina_factor(text: str) -> Optional[List[Tuple[str, float]]]:
 
     格式: var sz301128qfq={"total":N,"data":[{"d":"2026-05-19","f":"1.0000000000000000"},...]}
     """
-    m = re.search(r'"total":\s*(\d+),\s*"data":\s*\[(.*?)\]', text)
+    m = re.search(r'"total":\s*(\d+),\s*"data":\s*$$(.*?)$$', text)
     if not m:
         return None
     items = re.findall(r'\{"d":"([\d-]+)",\s*"f":"([\d.]+)"\}', m.group(2))
@@ -192,7 +210,7 @@ def _fetch_remote(sina_code: str) -> Optional[List[Tuple[str, float]]]:
     return _mem.get(sina_code)
 
 
-def fetch_qfq_factors(code: str) -> Optional[List[Tuple[str, float]]]:
+def fetch_qfq_factors(code: str, force_remote: bool = False) -> Optional[List[Tuple[str, float]]]:
     """获取前复权因子。
 
     因子含义:
@@ -200,10 +218,13 @@ def fetch_qfq_factors(code: str) -> Optional[List[Tuple[str, float]]]:
       unadj_price = fwd_price * qfq_factor
       最新除权日 factor=1.0，越早的日期 factor 越大。
 
-    策略: 有缓存直接返回，无缓存同步拉取。
+    策略:
+      - force_remote=False: 有缓存直接返回，无缓存同步拉取。
+      - force_remote=True: 总是从远端拉取并合并，确保数据最新。
 
     Args:
         code: 股票代码 (任意格式)
+        force_remote: 是否强制从远端拉取
 
     Returns:
         [(date_str, factor), ...] 按日期降序，失败返回 None
@@ -211,6 +232,10 @@ def fetch_qfq_factors(code: str) -> Optional[List[Tuple[str, float]]]:
     sina_code = _to_sina_code(code)
     if not sina_code:
         return None
+
+    # 强制从远端拉取
+    if force_remote:
+        return _fetch_remote(sina_code)
 
     with _mem_lock:
         entry = _mem.get(sina_code)
@@ -350,34 +375,41 @@ def unadj_to_hfq(klines: list, code: str) -> list:
 # ================================================================
 
 def update_all_factors(max_workers: int = 16) -> int:
-    """拉取所有活跃股票的因子。已有缓存的跳过，只拉缺失的，16 并发。
+    """拉取所有活跃股票的因子。1天间隔，每次全量刷新，16并发。
 
     Returns:
-        新增缓存的股票数量
+        更新的股票数量
     """
+    global _last_full_update
+
+    now = time.time()
+    if now - _last_full_update < _UPDATE_INTERVAL:
+        print(f"[复权因子] 距上次更新不足1天，跳过 (上次: {datetime.fromtimestamp(_last_full_update):%Y-%m-%d %H:%M:%S})")
+        return 0
+
     from app.utils.basicinfo_db import get_stock_basic_db
 
     codes = get_stock_basic_db().market_all_codes(status="active")
     if not codes:
+        print("[复权因子] 无活跃股票")
         return 0
 
-    # 只收集内存中没有的
     to_fetch = []
     for code in codes:
         sina_code = _to_sina_code(code)
-        if not sina_code:
-            continue
-        with _mem_lock:
-            if sina_code not in _mem:
-                to_fetch.append(code)
+        if sina_code:
+            to_fetch.append(code)
 
     if not to_fetch:
         return 0
 
+    print(f"[复权因子] 开始更新，共 {len(to_fetch)} 只股票")
+
     updated = 0
+    failed = 0
 
     def _fetch_one(code):
-        return fetch_qfq_factors(code) is not None
+        return fetch_qfq_factors(code, force_remote=True) is not None
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(_fetch_one, code): code for code in to_fetch}
@@ -385,7 +417,12 @@ def update_all_factors(max_workers: int = 16) -> int:
             try:
                 if future.result():
                     updated += 1
+                else:
+                    failed += 1
             except Exception:
-                pass
+                failed += 1
 
+    _last_full_update = now
+    _save_async()
+    print(f"[复权因子] 全量更新完成: 成功 {updated}, 失败 {failed}")
     return updated

@@ -1453,59 +1453,7 @@ def start_scheduler():
             logger.info(f"[同步] {task} 启动检查: db最后时间={db_date}, is_update={is_update}, status={last_status}, 正常退出")
             _schedule_next(task, _next_trigger_time(task))
 
-    # 启动前复权因子全量更新（交易日 6:00）
-    threading.Thread(target=_schedule_adj_update, daemon=True, name="adj-factors-scheduler").start()
-
-
-def _schedule_adj_update():
-    """交易日 6:00 全量更新前复权因子（失败不重试）。"""
-    import time as _time
-    import os as _os
-
-    while _running:
-        now = datetime.now(TZ_CN)
-        today_str = now.strftime("%Y-%m-%d")
-
-        if is_trading_day(today_str):
-            target = now.replace(hour=6, minute=0, second=0, microsecond=0)
-            if now < target:
-                wait = (target - now).total_seconds()
-                logger.info(f"[复权因子] 今日交易日，等待 {wait:.0f}s 至 06:00")
-                _time.sleep(wait)
-
-            if not _running:
-                break
-
-            # 检查今天是否已更新过（文件修改时间）
-            try:
-                from app.data_sources.provider.adjustment import _CACHE_FILE
-                if _os.path.exists(_CACHE_FILE):
-                    mtime = datetime.fromtimestamp(_os.path.getmtime(_CACHE_FILE), tz=TZ_CN)
-                    if mtime.strftime("%Y-%m-%d") == today_str:
-                        logger.info(f"[复权因子] 今日已更新，跳过")
-                        next_day = target + timedelta(days=1)
-                        _time.sleep((next_day - datetime.now(TZ_CN)).total_seconds())
-                        continue
-            except Exception:
-                pass
-
-            try:
-                from app.data_sources.provider.adjustment import update_all_factors
-                count = update_all_factors()
-                logger.info(f"[复权因子] 全量更新完成: {count} 只股票")
-            except Exception as e:
-                logger.error(f"[复权因子] 更新失败: {e}")
-
-            # 等到下一天再检查
-            next_day = target + timedelta(days=1)
-            _time.sleep((next_day - datetime.now(TZ_CN)).total_seconds())
-        else:
-            # 非交易日，找下一个交易日 6:00
-            next_td = next_trading_day(today_str)
-            dt_obj = datetime.strptime(next_td, "%Y-%m-%d").replace(hour=6, minute=0, second=0, tzinfo=TZ_CN)
-            wait = (dt_obj - now).total_seconds()
-            logger.info(f"[复权因子] 非交易日，等待至 {next_td} 06:00 ({wait:.0f}s)")
-            _time.sleep(wait)
+    # 前复权因子全量更新由 app.market_cn.scheduler._schedule_adj_update 负责
 
 
 def stop_scheduler():

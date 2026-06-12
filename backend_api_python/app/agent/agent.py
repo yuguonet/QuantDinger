@@ -296,26 +296,37 @@ final_answer({{
 
 {GUIDANCE}
 {tool_catalog}
-{skill_section}{scan_section}{modify_section}{intent_section}{domain_section}{calibration_section}{weight_section}## 规则
+{skill_section}{scan_section}{modify_section}{intent_section}{domain_section}{calibration_section}{weight_section}## 你的角色
 
-0. **⚠️ 必须用 final_answer() 返回结果** — 完成任务后，必须调用 `final_answer(你的回复)` 来结束。
-1. **不需要工具的消息，第一步就 final_answer** — 打招呼、闲聊等直接调用 final_answer。
-2. **必须调用子 agent 获取真实数据** — 你只能调子 agent（如 technical_agent），绝不直接调底层数据工具。
-3. **⚠️ 分析股票必须先调子 agent** — 不要直接调底层工具。先用 `technical_agent(task="分析600519技术面")` 获取标准化报告，再按需调其他子 agent。
-4. **子 agent 返回 JSON** — 所有子 agent 返回 **JSON 字符串**，用 `json.loads()` 解析后访问 `score`/`direction`/`signal`/`confidence` 等字段。不要按文本格式逐行解析。
-5. **深度优先** — 各子 agent 会完成深度分析，你负责综合评估。
-6. **风险优先** — 分析必须包含风险提示。
-7. **工具失败处理** — 子 agent 返回失败时，在结论中说明，继续用已有数据做判断。
-8. **多维验证** — 综合至少 2 个不同维度的子 agent 报告做交叉验证。
-9. **善用编排** — 按需调多个子 agent，收集所有报告后做加权综合。
-10. **⚠️ 绝对禁止重复调用** — 同一只股票的同一个子 agent **绝对只能调一次**。调完直接用结果，不满意也不能重调。technical_agent 已包含趋势/指标/量价/形态/筹码全维度分析，不要拆成"技术指标快照"和"K线形态"两次调用。违反此规则会导致超时。
-11. **⚠️ 标准调用流程** — 个股分析的标准流程：先调 technical_agent，再按需调 1-2 个其他子 agent（如 intelligence_agent），收集完所有报告后立即 final_answer。总共不超过 3 个子 agent 调用。
-12. **诚实透明** — 数据不足时明确告知，不猜测。
-13. **⚠️ 数据完整性** — 如果某个子 agent 返回失败，必须在结论中说明
-    "XX数据缺失，以下结论仅供参考"。绝不用想象填补缺失数据。
-14. **⚠️ 确定性输出** — 你的分析必须基于子 agent 返回的客观数据，不能因为"感觉"
-    或"可能"而改变方向性判断。同样的数据必须得出同样的结论。
-15. **⚠️ 数据获取** — 消息中的"[已获取的实时行情摘要]"仅供参考。如需使用行情数据，必须调用 get_realtime_quote 工具获取完整数据。不要尝试解析消息中的文本为数据对象。
+你是**路由器**。意图分析已经给出了建议（见上方"意图分析"），你的工作是：
+1. 根据建议选择调哪些子 Agent
+2. 调用子 Agent
+3. 把子 Agent 的结果**直接作为最终回复**输出
+
+**你不做分析，不做判断，不做验证。** 子 Agent 的结果就是最终结果。
+
+## ⚠️ 你的可用工具
+
+- **数据层工具**（见"工具分类"中的"数据层"/"显示层"）— 查询数据
+- **search_stock_by_name** — 搜索股票代码
+- **子 agent**（见"可用子 agent"）— 分析任务
+- **final_answer(回复)** — 输出结果
+
+❌ "分析层"/"决策层"工具由子 agent 内部使用，你不能调用。
+
+## 规则
+
+0. **⚠️ 必须用 final_answer() 返回结果**。
+1. **不需要工具的消息，第一步就 final_answer**。
+2. **根据意图分析的建议选择子 Agent** — 见上方"意图分析"中的"工具分类"。
+3. **⚠️ 调完就输出** — 子 Agent 返回结果后，**立即调用 final_answer()**，不要再调任何工具或子 Agent。
+4. **子 Agent 结果 = 最终结果** — 不要修改、不要补充验证、不要重新分析。直接放进 final_answer。
+5. **⚠️ 绝对禁止**：
+   - 收到子 Agent 结果后继续调其他工具或子 Agent
+   - 对子 Agent 数据做二次验证
+   - 同一个子 Agent 调用两次
+6. **子 agent 返回 JSON** — 用 `json.loads()` 解析后直接使用。
+7. **诚实透明** — 子 Agent 返回失败时，**用你手里的数据层工具直接查数据**，能查到多少算多少，在结论中说明"XX子Agent失败，以下为直接查询的数据"。
 {finance_json_section}{lang_section}"""
 
 
@@ -737,10 +748,10 @@ def get_smolagent(
     smol_model = build_model(model=model, provider=provider)
 
     # ── 按领域过滤工具（缓存） ────────────────────────────────
+    from app.agent.tools.registry import registry as tool_registry
     domain_key = domain or "all"
     with _tools_cache_lock:
         if domain_key not in _tools_cache_by_domain:
-            from app.agent.tools.registry import registry as tool_registry
             tool_registry.discover()
             if domain:
                 tools = tool_registry.build({"domain": domain, "deny": list(_EXCLUDED_TOOL_NAMES)})
@@ -762,8 +773,16 @@ def get_smolagent(
     )
 
     # 主 agent 只保留路由层工具
-    _ROUTER_KEEP = {"final_answer", "search_stock_by_name"}
-    router_tools = [t for t in tools if t.name in _ROUTER_KEEP]
+    # 按 layer 自动分流：数据层/显示层 → 主 Agent，分析层/决策层 → 子 Agent
+    _MAIN_AGENT_LAYERS = {"数据层", "显示层"}
+    router_tools = [t for t in tools if t.name == "final_answer"
+                    or (tool_registry.get(t.name) and tool_registry.get(t.name).layer in _MAIN_AGENT_LAYERS)]
+    # search_stock_by_name 无 layer 标签但主 Agent 需要
+    if not any(t.name == "search_stock_by_name" for t in router_tools):
+        for t in tools:
+            if t.name == "search_stock_by_name":
+                router_tools.append(t)
+                break
     # 保底：final_answer 一定有
     if not any(t.name == "final_answer" for t in router_tools):
         from smolagents import FinalAnswerTool
@@ -829,7 +848,7 @@ class AgentResult:
 
 
 def build_agent_executor(
-    skills=None, user_id=1, max_steps=10,
+    skills=None, user_id=1, max_steps=6,
     timeout_seconds=None, model=None, provider=None,
 ):
     return _AgentExecutor(
@@ -959,7 +978,7 @@ class _AgentExecutor:
                         context["stock_name"] = _name
                     logger.info("[Prepare] 中文名 → 代码 %s", _code)
 
-        # ── 提取意图信息，供后置评估使用 ──────────────────────
+        # ── 提取意图信息，供主 Agent 路由决策参考 ─────────────
         _eval_verb = ""
         _eval_noun = ""
         _eval_tool_chain = []
