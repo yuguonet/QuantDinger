@@ -374,6 +374,23 @@ class AgentRunner:
             response = await self._request_model(spec, messages_for_model, hook, context)
             context.response = response
             context.tool_calls = list(response.tool_calls)
+            logger.info("[Runner] LLM 响应: finish_reason=%s, has_tool_calls=%s, should_execute=%s, content_len=%d, tool_calls=%s",
+                        response.finish_reason, response.has_tool_calls,
+                        response.should_execute_tools,
+                        len(response.content or ""),
+                        [tc.name for tc in response.tool_calls])
+            # 打印 content 前500字，检测 LLM 是否把 tool_call 放在了 content 里
+            if response.content:
+                logger.info("[Runner] LLM content 前500字: %s", response.content[:500])
+
+            # ── 回退：从 content 中解析 tool_call（兼容不支持 tool_calls 字段的 LLM）──
+            if not response.has_tool_calls and response.content:
+                parsed_tc = self._parse_tool_call_from_content(response.content)
+                if parsed_tc:
+                    logger.info("[Runner] 从 content 中解析到 tool_call: %s", [tc.name for tc in parsed_tc])
+                    response.tool_calls = parsed_tc
+                    response.finish_reason = "tool_calls"
+                    response.content = ""  # 清掉 content，避免 JSON 文本被当作回复
 
             reasoning_text, cleaned_content = extract_reasoning(
                 response.reasoning_content,
@@ -415,6 +432,9 @@ class AgentRunner:
 
                 await hook.before_execute_tools(context)
 
+                logger.info("[Runner] >>> 执行工具: should_execute_tools=%s, tool_calls=%s",
+                            response.should_execute_tools,
+                            [tc.name for tc in response.tool_calls])
                 results, new_events, fatal_error = await self._execute_tools(
                     spec,
                     response.tool_calls,
@@ -486,9 +506,12 @@ class AgentRunner:
 
             if response.has_tool_calls:
                 logger.warning(
-                    "Ignoring tool calls under finish_reason='{}' for {}",
+                    "[Runner] ⚠️ Ignoring tool calls under finish_reason='{}' for {}. "
+                    "should_execute_tools=%s, tool_names=%s",
                     response.finish_reason,
                     spec.session_key or "default",
+                    response.should_execute_tools,
+                    [tc.name for tc in response.tool_calls],
                 )
 
             clean = hook.finalize_content(context, response.content)
@@ -1055,6 +1078,7 @@ class AgentRunner:
                 if isinstance(prepared, tuple) and len(prepared) == 3:
                     tool, params, prep_error = prepared
         if prep_error:
+            logger.warning("[Runner] prepare_call 错误: tool=%s error=%s", tool_call.name, prep_error)
             event = {
                 "name": tool_call.name,
                 "status": "error",
@@ -1276,6 +1300,64 @@ class AgentRunner:
         callback = spec.checkpoint_callback
         if callback is not None:
             await callback(payload)
+
+    @staticmethod
+    def _parse_tool_call_from_content(content: str) -> list[ToolCallRequest]:
+        """从 LLM content 文本中解析 tool_call JSON（兼容不支持 tool_calls 字段的模型）。
+
+        支持格式：
+        1. ```json\n{"name":"xxx","arguments":{...}}\n```
+        2. {"name":"xxx","arguments":{...}}
+        3. {"function":{"name":"xxx","arguments":{...}}}
+        """
+        import json as _json
+        import re as _re
+
+        if not content:
+            return []
+
+        tool_calls: list[ToolCallRequest] = []
+
+        # 尝试从 markdown code block 中提取
+        patterns = [
+            r'```(?:json)?\s*\n?(\{[^`]*"name"\s*:[^`]*\})\s*\n?```',
+            r'```(?:json)?\s*\n?(\{[^`]*"function"\s*:[^`]*\})\s*\n?```',
+            # 直接匹配裸 JSON（整个 content 就是一个 JSON）
+            r'^\s*(\{[^{}]*"(?:name|function)"\s*:[^{}]*\})\s*$',
+        ]
+
+        for pat in patterns:
+            m = _re.search(pat, content, _re.DOTALL | _re.MULTILINE)
+            if not m:
+                continue
+            try:
+                data = _json.loads(m.group(1).strip())
+            except (_json.JSONDecodeError, TypeError):
+                continue
+
+            if not isinstance(data, dict):
+                continue
+
+            # 格式 1: {"name": "xxx", "arguments": {...}}
+            name = data.get("name", "")
+            args = data.get("arguments", {})
+            # 格式 2: {"function": {"name": "xxx", "arguments": {...}}}
+            if not name and "function" in data:
+                fn = data["function"]
+                if isinstance(fn, dict):
+                    name = fn.get("name", "")
+                    args = fn.get("arguments", {})
+
+            if name and isinstance(args, dict):
+                import uuid
+                tool_calls.append(ToolCallRequest(
+                    id=str(uuid.uuid4())[:8],
+                    name=str(name),
+                    arguments=args,
+                ))
+                break  # 只取第一个
+
+        return tool_calls
 
     @staticmethod
     def _append_final_message(messages: list[dict[str, Any]], content: str | None) -> None:

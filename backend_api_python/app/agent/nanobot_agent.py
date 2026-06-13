@@ -166,6 +166,11 @@ class NanobotAgent:
         self._nanobot = self._run_async(self._init_nanobot())
         self._agent_loop = self._nanobot._loop
 
+        # ── 3.5 包装 LLM provider（兼容 Llama 等不支持 tool_calls 字段的模型）──
+        from app.agent.llm_compat import wrap_provider
+        self._agent_loop.provider = wrap_provider(self._agent_loop.provider)
+        logger.info("[NanobotAgent] LLM provider 已包装 (兼容 content tool_call)")
+
         # ── 4. 注入 QuantDinger 工具 ─────────────────────────
         self._run_async(self._inject_quantdinger_tools())
 
@@ -193,7 +198,7 @@ class NanobotAgent:
     def _run_async(self, coro):
         """在持久事件循环中执行 async 协程，同步等待结果。"""
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future.result(timeout=60)
+        return future.result(timeout=600)  # 10分钟，Llama 本地模型多轮调用需要更长时间
 
     async def _init_nanobot(self):
         """在事件循环中创建 Nanobot 实例。"""

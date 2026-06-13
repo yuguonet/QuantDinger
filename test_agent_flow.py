@@ -354,8 +354,69 @@ def run_mock_flow(message: str):
         print(f"\n[Step 5] 未识别到股票代码，跳过 call_skill")
 
 
+# ═══════════════════════════════════════════════════════════════
+# 5b. Content → tool_call 解析（兼容不支持 tool_calls 字段的 LLM）
+# ═══════════════════════════════════════════════════════════════
+
+def parse_tool_call_from_content(content: str) -> list:
+    """从 LLM content 文本中解析 tool_call JSON。
+
+    返回 OpenAI tool_calls 格式的列表，或空列表。
+    支持: ```json 块、裸 JSON、嵌套 arguments。
+    """
+    import uuid
+
+    if not content or not content.strip():
+        return []
+
+    known_tools = {"call_skill", "final_answer", "search_stock_by_name"}
+    candidates = []
+
+    # 1. ```json ... ``` 代码块
+    for m in re.finditer(r'```(?:json)?\s*\n?(.*?)\n?\s*```', content, re.DOTALL):
+        candidates.append(m.group(1).strip())
+
+    # 2. 裸 JSON — 用括号深度匹配找完整的 {...}
+    for m in re.finditer(r'\{', content):
+        depth = 0
+        start = m.start()
+        for i in range(start, len(content)):
+            if content[i] == '{':
+                depth += 1
+            elif content[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    candidates.append(content[start:i+1])
+                    break
+
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+
+        name = data.get("name", "")
+        args = data.get("arguments", {})
+        if not name and "function" in data:
+            fn = data["function"]
+            if isinstance(fn, dict):
+                name = fn.get("name", "")
+                args = fn.get("arguments", {})
+
+        if name in known_tools and isinstance(args, dict):
+            return [{
+                "id": str(uuid.uuid4())[:8],
+                "type": "function",
+                "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+            }]
+
+    return []
+
+
 def run_llm_flow(message: str):
-    """真实 LLM 测试流程。"""
+    """真实 LLM 测试流程（含完整工具执行循环）。"""
     print(f"\n{'='*60}")
     print(f"📨 用户消息: {message}")
     print(f"{'='*60}")
@@ -375,35 +436,161 @@ def run_llm_flow(message: str):
     for line in enriched.split("\n"):
         print(f"  {line}")
 
-    # Step 4: 调用 LLM
+    # Step 4: 调用 LLM（含工具执行循环）
     print(f"\n[LLM] 调用中...")
     try:
-        response = call_llm(enriched)
-        print(f"\n[LLM 响应]:")
+        # 构建工具定义
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "call_skill",
+                    "description": "调用分析技能，自动执行一整套分析流程",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "skill_name": {"type": "string", "enum": ["technical_agent", "indicator_agent", "intelligence_agent", "market_data_agent"]},
+                            "stock_code": {"type": "string", "description": "6位股票代码"},
+                            "stock_name": {"type": "string", "description": "股票名称"},
+                        },
+                        "required": ["skill_name", "stock_code"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "final_answer",
+                    "description": "输出最终分析结论并结束",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string", "description": "最终分析结论"},
+                        },
+                        "required": ["content"],
+                    },
+                },
+            },
+        ]
 
-        msg = response
-        # 处理 tool_calls
-        if isinstance(msg, dict) and msg.get("tool_calls"):
-            for tc in msg["tool_calls"]:
-                fn = tc["function"]
-                args = json.loads(fn["arguments"])
-                print(f"  🔧 调用工具: {fn['name']}({json.dumps(args, ensure_ascii=False)})")
+        # 读取 agent_preamble 作为系统提示
+        preamble_path = os.path.join(os.path.dirname(__file__), "backend_api_python", "app", "agent", "agent_preamble.md")
+        system_prompt = ""
+        if os.path.exists(preamble_path):
+            system_prompt = open(preamble_path, encoding="utf-8").read()
 
-                # 模拟执行 call_skill
-                if fn["name"] == "call_skill":
-                    skill_name = args.get("skill_name", "")
-                    sc = args.get("stock_code", stock_code)
-                    report = mock_call_skill(skill_name, sc)
-                    print(f"     → 返回: direction={report.get('direction')}, score={report.get('score')}")
+        api_key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY")
+        base_url = os.environ.get("LLM_BASE_URL", "http://localhost:8080/v1")
+        model = os.environ.get("LLM_MODEL", "qwen2.5-coder-14b-instruct")
 
-            print(f"\n  ✅ LLM 正确使用了 call_skill！")
-        elif isinstance(msg, dict) and msg.get("content"):
-            print(f"  {msg['content'][:500]}")
-        else:
-            print(f"  {json.dumps(msg, ensure_ascii=False)[:500]}")
+        import requests
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": enriched},
+        ]
+
+        MAX_TURNS = 10  # 防止无限循环
+        skill_reports = {}  # 收集所有 skill 报告
+
+        for turn in range(MAX_TURNS):
+            print(f"\n  ── LLM 第 {turn+1} 轮 ──")
+
+            resp = requests.post(
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "messages": messages,
+                    "tools": tools,
+                    "tool_choice": "auto",
+                    "temperature": 0.1,
+                    "max_tokens": 2000,
+                },
+                timeout=60,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            msg = data["choices"][0]["message"]
+
+            # ── 从 content 中解析 tool_call（兼容不支持 tool_calls 字段的 LLM）──
+            if not msg.get("tool_calls") and msg.get("content"):
+                parsed = parse_tool_call_from_content(msg["content"])
+                if parsed:
+                    msg["tool_calls"] = parsed
+                    # 保留原始 content（Llama 需要看到 content 才能理解上下文）
+                    # msg["content"] 不清空
+                    print(f"  ℹ️ 从 content 中解析到 tool_call: {[tc['function']['name'] for tc in parsed]}")
+
+            # 有 tool_calls → 执行工具
+            if msg.get("tool_calls"):
+                # 不把 assistant 消息加入对话（Llama 不认 tool_calls 格式）
+
+                for tc in msg["tool_calls"]:
+                    fn = tc["function"]
+                    args = json.loads(fn["arguments"])
+                    tool_name = fn["name"]
+
+                    print(f"  🔧 调用工具: {tool_name}({json.dumps(args, ensure_ascii=False)})")
+
+                    if tool_name == "call_skill":
+                        skill_name = args.get("skill_name", "")
+                        sc = args.get("stock_code", stock_code)
+                        report = mock_call_skill(skill_name, sc)
+                        skill_reports[skill_name] = report
+                        result_text = json.dumps(report, ensure_ascii=False)
+                        print(f"     → direction={report.get('direction')}, score={report.get('score')}")
+
+                    elif tool_name == "final_answer":
+                        final_content = args.get("content", "")
+                        print(f"\n  ✅ LLM 输出最终结论:")
+                        print(f"  {final_content[:1000]}")
+                        if skill_reports:
+                            print(f"\n  📊 收集到的 Skill 报告: {list(skill_reports.keys())}")
+                        return
+
+                    else:
+                        result_text = f"未知工具: {tool_name}"
+
+                    # 把工具结果喂回 LLM（Llama 不认 role:tool，用 user 消息）
+                    messages.append({
+                        "role": "user",
+                        "content": f"[工具 {tool_name} 的返回结果]\n{result_text}\n\n请基于以上工具结果继续分析。如果所有分析都已完成，请直接输出最终结论。",
+                    })
+
+                continue  # 继续下一轮
+
+            # 没有 tool_calls → LLM 直接输出文本（可能是最终回答）
+            content = msg.get("content", "")
+            if content:
+                print(f"\n  ✅ LLM 回复:")
+                print(f"  {content[:1500]}")
+                if skill_reports:
+                    print(f"\n  📊 收集到的 Skill 报告: {list(skill_reports.keys())}")
+                return
+
+            # LLM 返回空内容但已有 skill 报告 → 用报告生成汇总
+            if skill_reports:
+                print(f"\n  ℹ️ LLM 返回空内容，用已有 Skill 报告生成汇总:")
+                avg_score = sum(r.get("score", 0) for r in skill_reports.values()) / len(skill_reports)
+                bullish_count = sum(1 for r in skill_reports.values() if r.get("direction") == "bullish")
+                action = "buy" if avg_score >= 70 and bullish_count >= 2 else "hold" if avg_score >= 50 else "watch"
+                print(f"  综合评分: {avg_score:.0f}/100")
+                print(f"  看多信号: {bullish_count}/{len(skill_reports)}")
+                print(f"  建议操作: {action}")
+                for name, r in skill_reports.items():
+                    print(f"  📊 {name}: score={r.get('score')}, direction={r.get('direction')}")
+                return
+
+            print(f"  ⚠️ LLM 返回空内容")
+            return
+
+        print(f"\n  ⚠️ 达到最大轮次 ({MAX_TURNS})，停止循环")
 
     except Exception as e:
         print(f"\n  ❌ LLM 调用失败: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 def main():

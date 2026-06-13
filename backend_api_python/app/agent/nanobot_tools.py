@@ -353,10 +353,25 @@ class CallSkillToolAdapter(Tool):
     async def execute(self, **kwargs: Any) -> Any:
         """调用 BaseSkill，返回结构化报告。"""
         import asyncio
+        logger.info("[CallSkill] >>> execute() 被调用, kwargs=%s", kwargs)
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None, lambda: self._call_skill_sync(**kwargs)
-        )
+        try:
+            # 在线程池中执行同步代码，带超时保护
+            result = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, lambda: self._call_skill_sync(**kwargs)
+                ),
+                timeout=300,  # 5分钟超时
+            )
+            logger.info("[CallSkill] <<< execute() 返回, 长度=%d, 前100字=%s",
+                        len(str(result)), str(result)[:100])
+            return result
+        except asyncio.TimeoutError:
+            logger.error("[CallSkill] !!! execute() 超时(300s)")
+            return "Error: call_skill 执行超时(300秒)"
+        except Exception as e:
+            logger.error("[CallSkill] !!! execute() 异常: %s", e, exc_info=True)
+            return f"Error: call_skill 执行异常: {e}"
 
     # 工具函数缓存（进程内唯一）
     _tool_fn_cache: Dict[str, Callable] = {}
@@ -374,11 +389,31 @@ class CallSkillToolAdapter(Tool):
         LLM 调用复用 Nanobot 的 provider（缓存，不每次创建）。
         """
         import time as _time
+        import traceback as _tb
+        logger.info("[CallSkill] _call_skill_sync 开始: skill=%s stock=%s", skill_name, stock_code)
+        try:
+            return self._call_skill_sync_inner(skill_name, stock_code, stock_name)
+        except Exception as e:
+            logger.error("[CallSkill] _call_skill_sync 顶层异常: %s\n%s", e, _tb.format_exc())
+            return f"Error: call_skill 内部异常: {e}"
+        except BaseException as e:
+            logger.error("[CallSkill] _call_skill_sync 致命异常: %s\n%s", e, _tb.format_exc())
+            return f"Error: call_skill 致命异常: {type(e).__name__}: {e}"
+
+    def _call_skill_sync_inner(self, skill_name: str, stock_code: str, stock_name: str = None) -> str:
+        """同步调用 BaseSkill（在 executor 线程中运行）。
+
+        不依赖 smolagents：直接从 QuantDinger tool_registry 获取原始函数。
+        LLM 调用复用 Nanobot 的 provider（缓存，不每次创建）。
+        """
+        import time as _time
+        logger.info("[CallSkill] _call_skill_sync 开始: skill=%s stock=%s", skill_name, stock_code)
         from app.agent.skills.registry import skill_registry
         from app.agent.tools.registry import registry as qd_registry
 
         skill_registry.discover()
         qd_registry.discover()
+        logger.info("[CallSkill] registry discover 完成, skills=%s", skill_registry.all_names)
 
         sk = skill_registry.get(skill_name)
         if not sk:
@@ -399,15 +434,21 @@ class CallSkillToolAdapter(Tool):
 
         # 缓存 LLM provider（进程内唯一）
         if CallSkillToolAdapter._cached_provider is None:
+            logger.info("[CallSkill] 首次创建 LLM provider...")
             CallSkillToolAdapter._cached_provider, CallSkillToolAdapter._cached_model = (
                 _create_llm_provider()
             )
+            logger.info("[CallSkill] LLM provider 创建完成: model=%s provider=%s",
+                        CallSkillToolAdapter._cached_model,
+                        type(CallSkillToolAdapter._cached_provider).__name__)
 
         def call_llm(prompt: str) -> str:
             """LLM 调用 — 复用主事件循环，不创建新 loop。"""
             import asyncio
+            logger.info("[CallSkill] call_llm 被调用, prompt长度=%d", len(prompt))
             main_loop = CallSkillToolAdapter._main_loop
             if main_loop and main_loop.is_running():
+                logger.info("[CallSkill] call_llm 使用主事件循环")
                 future = asyncio.run_coroutine_threadsafe(
                     CallSkillToolAdapter._cached_provider.chat_with_retry(
                         messages=[{"role": "user", "content": prompt}],
@@ -417,10 +458,13 @@ class CallSkillToolAdapter(Tool):
                 )
                 try:
                     response = future.result(timeout=120)
+                    logger.info("[CallSkill] call_llm 返回, 长度=%d", len(response.content or ""))
                     return response.content or ""
                 except Exception as e:
+                    logger.error("[CallSkill] call_llm 异常: %s", e, exc_info=True)
                     return f"LLM 调用失败: {e}"
             else:
+                logger.warning("[CallSkill] call_llm 主循环不可用, 创建临时loop")
                 # fallback: 主循环不可用时创建临时 loop
                 loop = asyncio.new_event_loop()
                 try:
@@ -445,6 +489,7 @@ class CallSkillToolAdapter(Tool):
 
         try:
             t0 = _time.time()
+            logger.info("[CallSkill] >>> sk.run() 开始: skill=%s", skill_name)
             report, eval_node = sk.run(
                 stock_code=stock_code,
                 stock_name=stock_name or "",
