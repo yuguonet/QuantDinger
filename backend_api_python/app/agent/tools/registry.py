@@ -20,6 +20,10 @@ Tool Registry — @tool 装饰器自注册 + 自动发现 + smolagents Tool 构�
   ["coding"]   — 仅代码开发
   []           — 通用工具（所有领域可用，优先级较低）
 
+自动分页：
+  列表 > 20 条 → 自动缓存 + 分页（pagination.py）
+  文本 > 2000 字符 → 自动截断
+
 被调用方：
   tool_adapter.py → build_all_tools() → registry.discover() + registry.build()
   agent.py → _generate_tool_catalog() → registry.layered_categories
@@ -91,7 +95,136 @@ def _python_type_to_str(tp) -> str:
     return _TYPE_MAP.get(tp, "string")
 
 
+# ═══════════════════════════════════════════════════════════════
+# Auto-pagination: 工具返回值自动分页拦截
+# ═══════════════════════════════════════════════════════════════
 
+# 分页配置：列表长度超过此值时自动分页
+_PAGE_THRESHOLD = 20
+_PAGE_SIZE = 20
+# 文本截断配置：字符串超过此字符数时截断
+_TEXT_THRESHOLD = 2000
+_TEXT_CHUNK = 4000
+
+
+def _auto_paginate(result: Any, tool_name: str, kwargs: dict) -> Any:
+    """拦截工具返回值，大数据自动缓存+分页。
+
+    流程：工具取数据 → 缓存(自动分页) → agent → 缓存(翻页)
+    工具函数完全无感知。
+
+    处理两种大数据场景：
+    1. 列表 > _PAGE_THRESHOLD 条 → 列表分页
+    2. 字符串 > _TEXT_THRESHOLD 字符 → 文本截断（代码/文件/报告等）
+    """
+    if result is None:
+        return result
+
+    # 错误结果不分页
+    if isinstance(result, dict) and result.get("error"):
+        return result
+
+    # 已分页的结果不重复处理（防套娃）
+    if isinstance(result, dict) and "_pagination" in result:
+        return result
+
+    # ── 场景 1：纯字符串（代码/文件内容）──
+    # 超过阈值时截断，agent 可用 page_tool 翻后续块，或用 grep 精准定位
+    if isinstance(result, str) and len(result) > _TEXT_THRESHOLD:
+        return _truncate_text(result, tool_name, kwargs, data_key="text")
+
+    # ── 场景 2：dict 里可能有列表 + 大字符串 ──
+    if isinstance(result, dict):
+        result = _truncate_dict_strings(result, tool_name, kwargs)
+
+    # 探测要分页的列表
+    items, data_key = _probe_list(result)
+    if not items or len(items) <= _PAGE_THRESHOLD:
+        return result  # 小数据，原样返回
+
+    # 生成缓存键：工具名 + 参数哈希
+    cache_key = _make_cache_key(tool_name, kwargs)
+
+    # 缓存 + 分页
+    from app.agent.tools.pagination import paginate_result
+    return paginate_result(
+        cache_key=cache_key,
+        data=result,
+        page=1,
+        page_size=_PAGE_SIZE,
+        data_key=data_key,
+    )
+
+
+def _make_cache_key(tool_name: str, kwargs: dict) -> str:
+    """根据工具名 + 参数生成缓存键。"""
+    import hashlib, json as _json
+    try:
+        raw = f"{tool_name}:{_json.dumps(kwargs, sort_keys=True, default=str)}"
+    except Exception:
+        raw = f"{tool_name}:{sorted(str(kv) for kv in kwargs.items())}"
+    return f"{tool_name}_{hashlib.md5(raw.encode()).hexdigest()[:12]}"
+
+
+def _truncate_text(text: str, tool_name: str, kwargs: dict, data_key: str = "text") -> Dict[str, Any]:
+    """截断大文本，缓存全文，返回首段 + 分页信息。"""
+    cache_key = _make_cache_key(tool_name, kwargs)
+    from app.agent.tools.pagination import paginate_text
+    return paginate_text(
+        cache_key=cache_key,
+        text=text,
+        chunk_size=_TEXT_CHUNK,
+        data_key=data_key,
+    )
+
+
+def _truncate_dict_strings(data: Dict, tool_name: str, kwargs: dict) -> Dict:
+    """扫描 dict 中的大字符串字段，逐个截断。"""
+    import copy
+    modified = False
+    result = data
+
+    for k, v in data.items():
+        if k.startswith("_"):
+            continue  # 跳过 _pagination, _hint 等
+        if isinstance(v, str) and len(v) > _TEXT_THRESHOLD:
+            # 延迟 copy，只在需要时
+            if not modified:
+                result = copy.copy(data)
+                modified = True
+            cache_key = _make_cache_key(tool_name, {**kwargs, "__field__": k})
+            from app.agent.tools.pagination import paginate_text
+            result[k] = paginate_text(
+                cache_key=cache_key,
+                text=v,
+                chunk_size=_TEXT_CHUNK,
+                data_key=k,
+            )
+
+    return result
+
+
+def _probe_list(data: Any) -> tuple:
+    """从返回值中找到要分页的列表。返回 (items, data_key)。"""
+    if isinstance(data, list):
+        return data, ""
+
+    if not isinstance(data, dict):
+        return [], ""
+
+    # 优先找 "stocks" / "records" / "flows" 等常见命名
+    priority_keys = ["stocks", "records", "flows", "sectors", "concepts", "results", "items"]
+    for k in priority_keys:
+        v = data.get(k)
+        if isinstance(v, list) and len(v) > 0:
+            return v, k
+
+    # fallback: 第一个非空 list
+    for k, v in data.items():
+        if isinstance(v, list) and len(v) > 0:
+            return v, k
+
+    return [], ""
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -137,12 +270,13 @@ class ToolSpec:
 
         param_names = list(sig.parameters.keys())
 
-        def _make_forward(_fn):
+        def _make_forward(_fn, _param_names, _sig, _tool_name):
             def forward(self, **kwargs):
-                return _fn(**kwargs)
+                result = _fn(**kwargs)
+                return _auto_paginate(result, _tool_name, kwargs)
             params = [inspect.Parameter("self", inspect.Parameter.POSITIONAL_OR_KEYWORD)]
-            for pname in param_names:
-                orig = sig.parameters[pname]
+            for pname in _param_names:
+                orig = _sig.parameters[pname]
                 # Preserve original default; use None only if the param is optional or has a default
                 if orig.default is not inspect.Parameter.empty:
                     default = orig.default
@@ -160,7 +294,7 @@ class ToolSpec:
                 "description": self.description,
                 "inputs": inputs,
                 "output_type": self.output_type,
-                "forward": _make_forward(self.fn),
+                "forward": _make_forward(self.fn, param_names, sig, self.name),
             },
         )
         return tool_class()

@@ -213,11 +213,11 @@ def _bar_from_ticker(quote: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     return {
         "time": bar_ts,
-        "open": float(quote.get("open", price)),
-        "high": float(quote.get("high", price)),
-        "low": float(quote.get("low", price)),
+        "open": float(quote.get("open") or price),
+        "high": float(quote.get("high") or price),
+        "low": float(quote.get("low") or price),
         "close": price,
-        "volume": float(quote.get("volume", 0)),
+        "volume": float(quote.get("volume") or 0),
     }
 
 

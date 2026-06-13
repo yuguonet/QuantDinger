@@ -409,7 +409,7 @@ def format_intent_for_agent(intent: IntentResult, original_message: str) -> str:
             desc = step.get('desc', '')
             args = step.get('args', {})
             if tool == 'call_skill' and 'skill_name' in args:
-                parts.append(f"  {i}. call_{args['skill_name']}(task=\"{desc}\") — {desc}")
+                parts.append(f"  {i}. call_skill(skill_name=\"{args['skill_name']}\") — {desc}")
             else:
                 parts.append(f"  {i}. {tool} — {desc}")
         parts.append("  以上为建议顺序，可自行调整。")

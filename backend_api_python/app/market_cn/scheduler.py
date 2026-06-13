@@ -65,10 +65,10 @@ def _refresh_daily():
     from app.market_cn.index import (
         refresh_index_daily_kline, refresh_northbound_holdings,
     )
-    from app.data_providers.sentiment import (
-        refresh_vix, refresh_dollar_index, refresh_yield_curve,
-        refresh_put_call_ratio,
-    )
+#    from app.data_providers.sentiment import (
+#        refresh_vix, refresh_dollar_index, refresh_yield_curve,
+#        refresh_put_call_ratio,
+#    )
     from app.data_providers.commodities import refresh_commodities
     from app.data_providers.forex import refresh_forex_pairs
 
@@ -77,8 +77,8 @@ def _refresh_daily():
         refresh_sector_prediction, refresh_sector_cycle,
         refresh_sector_history,
         refresh_index_daily_kline, refresh_northbound_holdings,
-        refresh_vix, refresh_dollar_index, refresh_yield_curve,
-        refresh_put_call_ratio, refresh_commodities, refresh_forex_pairs,
+#        refresh_vix, refresh_dollar_index, refresh_yield_curve, refresh_put_call_ratio, 
+        refresh_commodities, refresh_forex_pairs,
     ])
 
 
@@ -98,17 +98,17 @@ def _refresh_slow():
     """盘中慢档: 贪恐/情绪/政策/新闻/全球情绪/加密 + 日级"""
     from app.market_cn.china_market import refresh_fear_greed, refresh_policy
     from app.market_cn.emotion import refresh_emotion_cycle
-    from app.market_cn.policy_analysis import refresh_financial_news, refresh_macro_news
-    from app.data_providers.sentiment import refresh_fear_greed_index, refresh_sentiment_data
+#    from app.market_cn.policy_analysis import refresh_financial_news, refresh_macro_news
+#    from app.data_providers.sentiment import refresh_fear_greed_index, refresh_sentiment_data
     from app.data_providers.global_market import refresh_global_sentiment, refresh_global_news
-    from app.data_providers.crypto import refresh_crypto_prices, refresh_crypto_heatmap
+#    from app.data_providers.crypto import refresh_crypto_prices, refresh_crypto_heatmap
 
     _run_all("slow", [
         refresh_fear_greed, refresh_policy, refresh_emotion_cycle,
-        refresh_financial_news, refresh_macro_news,
-        refresh_fear_greed_index, refresh_sentiment_data,
+#        refresh_financial_news, refresh_macro_news,
+#        refresh_fear_greed_index, refresh_sentiment_data,
         refresh_global_sentiment, refresh_global_news,
-        refresh_crypto_prices, refresh_crypto_heatmap,
+#        refresh_crypto_prices, refresh_crypto_heatmap,
     ])
 
     # 日级数据（盘中也能更新）也放到慢档
@@ -235,19 +235,6 @@ def _schedule_adj_update():
             if not _adj_running:
                 break
 
-            # 检查今天是否已更新过（文件修改时间）
-            try:
-                from app.data_sources.provider.adjustment import _CACHE_FILE
-                if _os.path.exists(_CACHE_FILE):
-                    mtime = datetime.fromtimestamp(_os.path.getmtime(_CACHE_FILE), tz=TZ_CN)
-                    if mtime.strftime("%Y-%m-%d") == today_str:
-                        logger.info(f"[复权因子] 今日已更新，跳过")
-                        next_day = target + timedelta(days=1)
-                        _time.sleep((next_day - datetime.now(TZ_CN)).total_seconds())
-                        continue
-            except Exception:
-                pass
-
             try:
                 from app.data_sources.provider.adjustment import update_all_factors
                 count = update_all_factors()
@@ -259,12 +246,12 @@ def _schedule_adj_update():
             next_day = target + timedelta(days=1)
             _time.sleep((next_day - datetime.now(TZ_CN)).total_seconds())
         else:
-            # 非交易日，找下一个交易日 6:00
             next_td = next_trading_day(today_str)
-            dt_obj = datetime.strptime(next_td, "%Y-%m-%d").replace(hour=6, minute=0, second=0, tzinfo=TZ_CN)
+            dt_obj = datetime.strptime(next_td, "%Y-%m-%d").replace(hour=6, minute=0, tzinfo=TZ_CN)
             wait = (dt_obj - now).total_seconds()
             logger.info(f"[复权因子] 非交易日，等待至 {next_td} 06:00 ({wait:.0f}s)")
             _time.sleep(wait)
+
 
 
 # ═══════════════════════════════════════════════════════════

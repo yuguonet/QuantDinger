@@ -678,9 +678,12 @@ class BackfillDB:
             failed = [s for s in symbols if strip_market_prefix(s) not in final_synced]
             return 0, failed, len(final_synced & symbol_set), failed_reasons
 
+        # ── 追踪本次由 _klines_to_records 生成的 symbols（内存级，不受日期漂移影响）──
+        synced_this_run: set[str] = set(r["symbol"] for r in records)
+
         # 写入前只删除有有效记录的 symbols，不删 failed symbols（避免丢失旧数据）
         if not force_refetch:
-            symbols_to_write = list(set(r["symbol"] for r in records))
+            symbols_to_write = list(synced_this_run)
             deleted = self._delete_symbols_bars(bar_time, symbols_to_write, tf="15m")
             if deleted > 0:
                 logger.info(f"[同步] {self.source.name} 15m 已清除 {deleted} 条旧 bar ({len(symbols_to_write)} 只)")
@@ -696,7 +699,8 @@ class BackfillDB:
             return 0, failed, len(final_synced & symbol_set), failed_reasons
 
         # ── 统计 ──
-        final_synced = self._get_synced_symbols(bar_time, tf="15m")
+        # 合并 DB 查询（精确匹配 bar_time）+ 内存追踪（覆盖因日期漂移查不到的 symbol）
+        final_synced = self._get_synced_symbols(bar_time, tf="15m") | synced_this_run
         final_count = len(final_synced & symbol_set)
         failed = [s for s in symbols if strip_market_prefix(s) not in final_synced]
 
@@ -976,7 +980,7 @@ stock_daily_k = BackfillDB(BackfillSource(
 #   - 不用 while-loop + sleep，避免线程卡死无法恢复
 #   - 进程启动后延迟 _INITIAL_DELAY 秒再执行首次（等 DB/依赖就绪）
 #   - 非交易日不执行，跳到下一个交易日
-#   - 未完成的任务（re）每 120s 自动重试，循环<10次
+#   - 未完成的任务（re）每 20s 自动重试，循环<10次
 #
 # 同步协议:
 #   正常退出 = 完成 + 下一次同步任务
@@ -994,13 +998,13 @@ stock_daily_k = BackfillDB(BackfillSource(
 #     读 cn_last_update 最后时间 <= 前一交易日 15:05 / 17:00 且 status=re
 #       → report 修复 → 循环<10次:
 #         全部完成 → status=ok 正常退出
-#         部分完成(本次修复>0) → 修改 report + 等待120s
+#         部分完成(本次修复>0) → 修改 report + 等待20s
 #         未完成(本次修复=0) → 完成度>90% → status=ok 正常退出
 #         否则 → status=error 正常退出
 #
 
 _INITIAL_DELAY = 300          # 进程启动后首次执行延迟（秒）— 等待300s后核心启动
-_RETRY_INTERVAL = 120         # 修复轮次间等待（秒）— 每次修复等待120s
+_RETRY_INTERVAL = 20          # 修复轮次间等待（秒）— 每次修复等待20s
 _MIN_DELAY = 30               # 最小同步延迟（秒），防止 0 延迟
 
 _timers: dict[str, threading.Timer] = {}
@@ -1189,7 +1193,7 @@ def _core_startup(task: str) -> str:
         if not _running:
             return "unknown"
 
-        # 等待 120s
+        # 等待 20s
         _time.sleep(_RETRY_INTERVAL)
         if not _running:
             return "unknown"

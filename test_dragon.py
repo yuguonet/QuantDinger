@@ -1252,7 +1252,7 @@ def main():
     parser.add_argument("--source", choices=["manual", "db"], default="manual",
                         help="数据源: manual=手动指定codes(默认), db=从数据库加载全市场")
     parser.add_argument("--start", type=str, default="2024-01-01", help="DB模式回测开始日期")
-    parser.add_argument("--end", type=str, default="2026-05-22", help="DB模式回测结束日期")
+    parser.add_argument("--end", type=str, default="2026-06-12", help="DB模式回测结束日期")
     parser.add_argument("--all-trades", action="store_true")
     parser.add_argument("--pullback", type=int, default=3, help="龙回头最少回调天数")
     parser.add_argument("--max-pullback", type=int, default=11, help="龙回头最多回调天数")
@@ -1485,7 +1485,7 @@ def main():
 
     # ===== 今日买点统计 =====
     if args.today:
-        today_str = args.today_date if args.today_date else args.end
+        today_str = args.today_date if args.today_date else time.strftime("%Y-%m-%d")
         all_for_today = dc_trades + v1_trades + bb_trades + f4in1_trades
         today_trades = print_today_signals(all_for_today, today_str)
         if today_trades:

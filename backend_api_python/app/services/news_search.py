@@ -1118,7 +1118,6 @@ class SearchService:
                 "央行货币政策 降准 降息 LPR",
                 "财政政策 减税 专项债",
                 "产业政策 新能源 芯片 制造业",
-                "经济数据 社融 M2 进出口",
             ],
             "en": [
                 "China economic policy latest",

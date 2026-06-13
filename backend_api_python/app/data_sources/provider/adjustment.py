@@ -88,11 +88,12 @@ def _to_sina_code(code: str) -> Optional[str]:
 #
 # 设计原则:
 #   - 文件是持久层，内存是快速层
-#   - 启动时: 文件 → 内存 (全量加载)
+#   - 启动时: 文件 → 内存 (全量加载因子数据)
 #   - 新数据时: 内存 → 文件 (异步全量写入)
 #   - 读取只查内存，不碰磁盘
 #   - 因子只增不改，永不"过期"
-#   - 全量更新通过全局时间戳控制，超过1天重新拉取所有活跃股票
+#   - 全量更新通过文件时间戳判断，超过1天重新拉取所有活跃股票
+#   - 时间戳只由 update_all_factors 写入，判断时从文件读取
 #
 # 文件结构:
 #   {
@@ -107,20 +108,32 @@ _mem: Dict[str, List[Tuple[str, float]]] = {}
 _mem_lock = threading.Lock()
 _write_lock = threading.Lock()
 
-# 全局更新时间戳
-_last_full_update: float = 0.0
+# 上次全量更新时间戳（Unix 时间），0 表示从未更新。由 _load() 从文件读取，update_all_factors 成功后更新。
+_last_update_ts: float = 0.0
+
+
+def _read_file_timestamp() -> float:
+    """从缓存文件读取上次全量更新时间。文件不存在或读取失败返回 0。"""
+    try:
+        if os.path.exists(_CACHE_FILE):
+            with open(_CACHE_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            return float(raw.get("_last_full_update", 0))
+    except Exception:
+        pass
+    return 0.0
 
 
 def _load():
-    """启动时从文件全量加载到内存。"""
-    global _last_full_update
+    """启动时从文件全量加载因子数据到内存，同时读取 _last_full_update 时间戳。"""
+    global _last_update_ts
     try:
         if not os.path.exists(_CACHE_FILE):
             return
         with open(_CACHE_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
-        # 读取全局时间戳
-        _last_full_update = float(raw.pop("_last_full_update", 0))
+        _last_update_ts = float(raw.get("_last_full_update", 0))
+        raw.pop("_last_full_update", None)
         for code, entry in raw.items():
             if isinstance(entry, dict) and "factors" in entry:
                 _mem[code] = [(d, float(v)) for d, v in entry["factors"]]
@@ -130,15 +143,14 @@ def _load():
         pass
 
 
-def _save():
+def _save(last_full_update: float):
     """异步全量写入。调用方已在后台线程中。"""
     with _write_lock:
         with _mem_lock:
             snapshot = dict(_mem)
         try:
             os.makedirs(_CACHE_DIR, exist_ok=True)
-            # 把时间戳写入同一个文件
-            snapshot["_last_full_update"] = _last_full_update
+            snapshot["_last_full_update"] = last_full_update
             # 先写临时文件再原子替换，避免写入中途崩溃导致文件损坏
             tmp = _CACHE_FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -148,12 +160,27 @@ def _save():
             pass
 
 
-def _save_async():
+def _save_async(last_full_update: float):
     """触发一次异步写盘。"""
-    threading.Thread(target=_save, daemon=True).start()
+    threading.Thread(target=_save, args=(last_full_update,), daemon=True).start()
+
+
+def _startup_update():
+    """启动时检查：缓存缺失或超过1天 → 后台全量更新。
+
+    延迟 5s 等待 Flask DB 初始化完成，失败静默（scheduler 会兜底重试）。
+    """
+    time.sleep(5)
+    try:
+        update_all_factors()
+    except Exception as e:
+        print(f"[复权因子] 启动更新失败: {e}")
 
 
 _load()
+# 启动时检查：缓存缺失或超过1天 → 后台线程全量更新
+if time.time() - _last_update_ts >= _UPDATE_INTERVAL:
+    threading.Thread(target=_startup_update, daemon=True, name="adj-factor-startup").start()
 
 
 # ================================================================
@@ -165,7 +192,7 @@ def _parse_sina_factor(text: str) -> Optional[List[Tuple[str, float]]]:
 
     格式: var sz301128qfq={"total":N,"data":[{"d":"2026-05-19","f":"1.0000000000000000"},...]}
     """
-    m = re.search(r'"total":\s*(\d+),\s*"data":\s*$$(.*?)$$', text)
+    m = re.search(r'"total":\s*(\d+),\s*"data":\s*\[(.*?)\]', text)
     if not m:
         return None
     items = re.findall(r'\{"d":"([\d-]+)",\s*"f":"([\d.]+)"\}', m.group(2))
@@ -192,7 +219,7 @@ def _merge(existing: List[Tuple[str, float]],
 # ================================================================
 
 def _fetch_remote(sina_code: str) -> Optional[List[Tuple[str, float]]]:
-    """从远端拉取因子，写入内存+触发异步写盘。"""
+    """从远端拉取因子，写入内存缓存。不写文件，文件由 update_all_factors 末尾统一备份。"""
     text = _http_get(f"https://finance.sina.com.cn/realstock/company/{sina_code}/qfq.js")
     if not text:
         return None
@@ -206,7 +233,6 @@ def _fetch_remote(sina_code: str) -> Optional[List[Tuple[str, float]]]:
             _mem[sina_code] = remote
         else:
             _mem[sina_code] = _merge(old, remote)
-    _save_async()
     return _mem.get(sina_code)
 
 
@@ -377,14 +403,19 @@ def unadj_to_hfq(klines: list, code: str) -> list:
 def update_all_factors(max_workers: int = 16) -> int:
     """拉取所有活跃股票的因子。1天间隔，每次全量刷新，16并发。
 
+    时间戳判断以内存 _last_update_ts 为准（由 _load 从文件读取），
+    文件不存在或从未更新则强制拉取。
+    更新完成后将时间戳写入文件并更新内存。
+
     Returns:
         更新的股票数量
     """
-    global _last_full_update
+    global _last_update_ts
 
     now = time.time()
-    if now - _last_full_update < _UPDATE_INTERVAL:
-        print(f"[复权因子] 距上次更新不足1天，跳过 (上次: {datetime.fromtimestamp(_last_full_update):%Y-%m-%d %H:%M:%S})")
+    if now - _last_update_ts < _UPDATE_INTERVAL:
+        print(f"[复权因子] 距上次更新不足1天，跳过 "
+              f"(上次: {datetime.fromtimestamp(_last_update_ts):%Y-%m-%d %H:%M:%S})")
         return 0
 
     from app.utils.basicinfo_db import get_stock_basic_db
@@ -422,7 +453,8 @@ def update_all_factors(max_workers: int = 16) -> int:
             except Exception:
                 failed += 1
 
-    _last_full_update = now
-    _save_async()
+    # 更新完成后将时间戳写入文件并更新内存（唯一写入点）
+    _last_update_ts = now
+    _save_async(now)
     print(f"[复权因子] 全量更新完成: 成功 {updated}, 失败 {failed}")
     return updated

@@ -210,7 +210,7 @@ def main():
         _print_agent_info()
         return
 
-    skills = [s.strip() for s in args.skills.split(",") if s.strip()] if args.skills else None
+    skills = [s.strip() for s in args.skills.split(",")] if args.skills else None
 
     if args.message:
         if args.stream:
