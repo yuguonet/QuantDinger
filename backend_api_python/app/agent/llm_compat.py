@@ -18,7 +18,7 @@ import re
 import uuid
 from typing import Any, Awaitable, Callable
 
-from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from app.nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
 logger = logging.getLogger(__name__)
 

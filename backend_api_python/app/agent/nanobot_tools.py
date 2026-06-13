@@ -20,8 +20,8 @@ import inspect
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
-from nanobot.agent.tools.base import Tool, tool_parameters
-from nanobot.agent.tools.registry import ToolRegistry as NanobotToolRegistry
+from app.nanobot.agent.tools.base import Tool, tool_parameters
+from app.nanobot.agent.tools.registry import ToolRegistry as NanobotToolRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -323,8 +323,8 @@ def _create_llm_provider():
     """创建 Nanobot LLM provider（从 config.json 或环境变量）。"""
     from pathlib import Path
     try:
-        from nanobot.providers.factory import make_provider
-        from nanobot.config.loader import load_config
+        from app.nanobot.providers.factory import make_provider
+        from app.nanobot.config.loader import load_config
 
         config_path = Path.home() / ".nanobot" / "config.json"
         config = load_config(config_path) if config_path.exists() else None
@@ -337,7 +337,7 @@ def _create_llm_provider():
 
     # fallback: 环境变量直接构建
     import os
-    from nanobot.providers.openai_compat_provider import OpenAICompatProvider
+    from app.nanobot.providers.openai_compat_provider import OpenAICompatProvider
     api_key = (
         os.getenv("OPENROUTER_API_KEY")
         or os.getenv("OPENAI_API_KEY")

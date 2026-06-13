@@ -8,6 +8,10 @@ higher throughput — background tasks are idempotent and use DB locks to
 coordinate, so duplicate work is minimal.
 """
 import os
+import sys
+
+# Make app/nanobot/ shadow any pip-installed nanobot-ai package.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "app"))
 
 bind = f"{os.getenv('PYTHON_API_HOST', '0.0.0.0')}:{os.getenv('PYTHON_API_PORT', '5000')}"
 

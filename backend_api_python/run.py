@@ -14,6 +14,10 @@ try:
 except Exception:
     pass
 
+# Make app/nanobot/ shadow any pip-installed nanobot-ai package,
+# so local patches are always used without touching import paths.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "app"))
+
 # Load local .env early so config classes can read from os.environ.
 # This keeps local deployment simple: edit one file and run.
 try:
