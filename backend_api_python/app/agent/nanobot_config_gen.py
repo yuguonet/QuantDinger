@@ -47,9 +47,20 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
             "sessionTtlMinutes": 0,
             "consolidationRatio": 0.5,
             "maxMessages": 30,
-            # 禁用不需要的内置 skill，减少上下文
+            # 禁用不需要的内置 skill，减少上下文（本地模型 prompt 空间宝贵）
             "disabledSkills": [
                 "weather",
+                "tmux",
+                "clawhub",
+                "skill-creator",
+                "github",
+                "cron",
+                "summarize",
+                "image-generation",
+                "long-goal",
+                "update-setup",
+                "my",
+                "memory",
             ],
         }
     },

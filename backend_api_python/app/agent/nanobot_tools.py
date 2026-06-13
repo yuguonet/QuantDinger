@@ -140,6 +140,55 @@ class QuantDingerToolAdapter(Tool):
 # 批量注册
 # ═══════════════════════════════════════════════════════════════
 
+# 主 Agent 不需要看到的工具层级（这些工具由 call_skill 内部调用）
+_HIDDEN_LAYERS = frozenset({"分析层", "执行层"})
+
+
+class DomainFilteredRegistry:
+    """主 Agent 工具注册表代理 — 按 layer 元数据过滤。
+
+    分析层（34个）和执行层（5个）工具由 call_skill 内部调用，
+    不需要出现在主 Agent 的工具列表中。
+    过滤逻辑基于工具注册时的 layer 元数据，无需硬编码工具名。
+    """
+
+    def __init__(self, inner: NanobotToolRegistry):
+        self._inner = inner
+
+    def get_definitions(self) -> list[dict[str, Any]]:
+        from app.agent.tools.registry import registry as qd_registry
+        qd_registry.discover()
+
+        all_defs = self._inner.get_definitions()
+        filtered = []
+        for schema in all_defs:
+            name = self._schema_name(schema)
+            # call_skill 始终保留
+            if name == "call_skill":
+                filtered.append(schema)
+                continue
+            # 通过 QuantDinger ToolSpec 的 layer 元数据过滤
+            spec = qd_registry._tools.get(name)
+            if spec and spec.layer in _HIDDEN_LAYERS:
+                continue  # 跳过分析层/执行层
+            filtered.append(schema)
+        return filtered
+
+    @staticmethod
+    def _schema_name(schema: dict[str, Any]) -> str:
+        fn = schema.get("function")
+        if isinstance(fn, dict):
+            name = fn.get("name")
+            if isinstance(name, str):
+                return name
+        name = schema.get("name")
+        return name if isinstance(name, str) else ""
+
+    # 代理其他方法到原始 registry（prepare_call/execute 不受影响）
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 def register_quantdinger_tools(
     nanobot_registry: NanobotToolRegistry,
     max_result_chars: int = 16000,

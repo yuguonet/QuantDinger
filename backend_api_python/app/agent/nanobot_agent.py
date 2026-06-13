@@ -285,12 +285,16 @@ class NanobotAgent:
         # 设置 contextvar，让工具层能访问 hook
         _current_hook.set(hook)
 
+        # 按领域过滤工具（减少 prompt 中的工具定义 token）
+        filtered_tools = self._filter_tools_by_domain(domain)
+
         # 在持久事件循环中执行
         try:
             result = self._run_async(
                 self._agent_loop.process_direct(
                     enriched,
                     session_key=session_key,
+                    tools=filtered_tools,
                 )
             )
         except Exception as e:
@@ -361,6 +365,9 @@ class NanobotAgent:
         hook.setup_collector(domain=domain, stock_code=stock_code, stock_name=stock_name)
         _current_hook.set(hook)
 
+        # 按领域过滤工具
+        filtered_tools = self._filter_tools_by_domain(domain)
+
         # 流式输出缓冲区
         _stream_buf = []
         _stream_done = threading.Event()
@@ -378,6 +385,7 @@ class NanobotAgent:
                 result = await self._agent_loop.process_direct(
                     enriched,
                     session_key=session_key,
+                    tools=filtered_tools,
                     on_stream=_on_stream,
                     on_stream_end=_on_stream_end,
                 )
@@ -428,6 +436,15 @@ class NanobotAgent:
     # 内部方法
     # ═════════════════════════════════════════════════════════
 
+    def _filter_tools_by_domain(self, domain: str):
+        """返回过滤后的工具注册表 — 只暴露核心决策工具给 LLM。
+
+        50+ 个底层分析工具由 call_skill 内部调用，不需要出现在 LLM 的工具列表中。
+        工具定义从 86 个降到 ~10 个，大幅节省 prompt token。
+        """
+        from app.agent.nanobot_tools import DomainFilteredRegistry
+        return DomainFilteredRegistry(self._agent_loop.tools)
+
     def _enrich_message(self, message: str, context: Optional[Dict[str, Any]],
                          intent_hint: str = "") -> str:
         """拼接上下文信息到消息。"""
@@ -449,8 +466,11 @@ class NanobotAgent:
         # 金融领域：附加分析指令
         if context and context.get("stock_code"):
             code = context.get("stock_code", "")
+            name = context.get("stock_name", "")
             parts.append(
-                f"\n[系统提示] 检测到股票分析请求。请使用 call_skill 执行分析：\n"
+                f"\n[系统提示] 股票代码已确认: {code}（{name}）\n"
+                f"**不要调用 search_stock_by_name**，代码已知。\n"
+                f"直接使用 call_skill 执行分析：\n"
                 f"1. call_skill(skill_name=\"technical_agent\", stock_code=\"{code}\") — 技术面\n"
                 f"2. call_skill(skill_name=\"indicator_agent\", stock_code=\"{code}\") — 指标面\n"
                 f"3. call_skill(skill_name=\"intelligence_agent\", stock_code=\"{code}\") — 情报面\n"
