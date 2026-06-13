@@ -216,11 +216,11 @@ def call_llm(enriched_message: str) -> str:
 
     # 从环境变量读取配置
     api_key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY")
-    base_url = os.environ.get("LLM_BASE_URL", "https://openrouter.ai/api/v1")
-    model = os.environ.get("LLM_MODEL", "deepseek/deepseek-chat")
+    base_url = os.environ.get("LLM_BASE_URL", "http://localhost:8080/v1")
+    model = os.environ.get("LLM_MODEL", "qwen2.5-coder-14b-instruct")
 
-    if not api_key:
-        return "[错误] 未配置 LLM API Key（设置 OPENROUTER_API_KEY 或 DEEPSEEK_API_KEY）"
+#    if not api_key:
+#        return "[错误] 未配置 LLM API Key（设置 OPENROUTER_API_KEY 或 DEEPSEEK_API_KEY）"
 
     # 读取 agent_preamble 作为系统提示
     preamble_path = os.path.join(os.path.dirname(__file__), "backend_api_python", "app", "agent", "agent_preamble.md")
