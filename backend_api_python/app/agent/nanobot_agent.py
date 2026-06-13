@@ -443,7 +443,7 @@ class NanobotAgent:
         工具定义从 86 个降到 ~10 个，大幅节省 prompt token。
         """
         from app.agent.nanobot_tools import DomainFilteredRegistry
-        return DomainFilteredRegistry(self._agent_loop.tools)
+        return DomainFilteredRegistry(self._agent_loop.tools, domain=domain)
 
     def _enrich_message(self, message: str, context: Optional[Dict[str, Any]],
                          intent_hint: str = "") -> str:

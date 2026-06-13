@@ -145,15 +145,27 @@ _HIDDEN_LAYERS = frozenset({"分析层", "执行层"})
 
 
 class DomainFilteredRegistry:
-    """主 Agent 工具注册表代理 — 按 layer 元数据过滤。
+    """主 Agent 工具注册表代理 — 按领域过滤（与 agent-old 逻辑一致）。
 
-    分析层（34个）和执行层（5个）工具由 call_skill 内部调用，
-    不需要出现在主 Agent 的工具列表中。
-    过滤逻辑基于工具注册时的 layer 元数据，无需硬编码工具名。
+    过滤规则：
+    1. call_skill 始终保留
+    2. QuantDinger 工具按 domain 过滤：匹配当前领域或 domain=[]（通用）→ 保留
+    3. 排除特定工具名（_EXCLUDED_TOOL_NAMES）
+    4. nanobot 内置工具全部保留
     """
 
-    def __init__(self, inner: NanobotToolRegistry):
+    # 与 agent-old/agent.py 一致的排除列表
+    _EXCLUDED_TOOL_NAMES = frozenset({
+        "screen_stocks", "smart_screen",
+        "get_stock_fund_flow", "batch_get_stock_fund_flow",
+        "get_dragon_tiger_stocks", "get_dragon_tiger_by_stock",
+        "get_hot_rank_stocks", "get_zt_pool_stocks",
+        "get_limit_down_stocks", "get_broken_board_stocks",
+    })
+
+    def __init__(self, inner: NanobotToolRegistry, domain: str = ""):
         self._inner = inner
+        self._domain = domain
 
     def get_definitions(self) -> list[dict[str, Any]]:
         from app.agent.tools.registry import registry as qd_registry
@@ -167,10 +179,18 @@ class DomainFilteredRegistry:
             if name == "call_skill":
                 filtered.append(schema)
                 continue
-            # 通过 QuantDinger ToolSpec 的 layer 元数据过滤
+            # QuantDinger 工具：按领域 + 排除列表过滤
             spec = qd_registry._tools.get(name)
-            if spec and spec.layer in _HIDDEN_LAYERS:
-                continue  # 跳过分析层/执行层
+            if spec:
+                if name in self._EXCLUDED_TOOL_NAMES:
+                    continue
+                if self._domain:
+                    if spec.domain and self._domain not in spec.domain:
+                        continue  # 工具指定了领域但不匹配 → 排除
+                    # spec.domain 为空（通用）或包含当前领域 → 保留
+                filtered.append(schema)
+                continue
+            # nanobot 内置工具全部保留
             filtered.append(schema)
         return filtered
 
