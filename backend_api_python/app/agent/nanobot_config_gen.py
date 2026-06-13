@@ -104,6 +104,37 @@ def _load_dotenv_values() -> Dict[str, str]:
     ):
         if key not in values and key in os.environ:
             values[key] = os.environ[key]
+
+    # 兼容旧配置格式：LLM_PROVIDER / OPENAI_MODEL / OPENAI_BASE_URL 等
+    # 映射到 AGENT_LLM_* 格式
+    if "AGENT_LLM_PROVIDER" not in values:
+        _legacy_provider = values.get("LLM_PROVIDER", "").strip().lower()
+        if _legacy_provider:
+            values["AGENT_LLM_PROVIDER"] = _legacy_provider
+    if "AGENT_LLM_MODEL" not in values:
+        # 根据 provider 读对应的 MODEL 字段
+        _provider = values.get("AGENT_LLM_PROVIDER", values.get("LLM_PROVIDER", "")).strip().lower()
+        _model_key_map = {
+            "openai": "OPENAI_MODEL",
+            "openrouter": "OPENROUTER_MODEL",
+            "deepseek": "DEEPSEEK_MODEL",
+            "google": "GOOGLE_MODEL",
+            "grok": "GROK_MODEL",
+            "anthropic": "ANTHROPIC_MODEL",
+            "ollama": "OLLAMA_MODEL",
+            "xiaomi_mimo": "XIAOMI_MIMO_MODEL",
+        }
+        _model_key = _model_key_map.get(_provider, "OPENAI_MODEL")
+        _model = values.get(_model_key, "").strip()
+        if _model:
+            values["AGENT_LLM_MODEL"] = _model
+
+    # 兼容 OPENAI_BASE_URL → OPENAI_API_BASE
+    if "OPENAI_API_BASE" not in values:
+        _base = values.get("OPENAI_BASE_URL", "").strip()
+        if _base:
+            values["OPENAI_API_BASE"] = _base
+
     return values
 
 
@@ -160,6 +191,9 @@ def _build_providers(env: Dict[str, str]) -> Dict[str, Any]:
             continue
         cfg: Dict[str, Any] = {"apiKey": api_key}
         base = env.get(f"{prefix}_API_BASE", "").strip()
+        # 兼容 OPENAI_BASE_URL 格式（旧配置常用）
+        if not base and prefix == "OPENAI":
+            base = env.get("OPENAI_BASE_URL", "").strip()
         if base:
             cfg["apiBase"] = base
         elif default_base:

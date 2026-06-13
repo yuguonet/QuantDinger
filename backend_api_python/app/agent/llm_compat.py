@@ -25,11 +25,66 @@ logger = logging.getLogger(__name__)
 # 已知工具名（只解析这些，避免误匹配普通 JSON）
 _KNOWN_TOOLS = frozenset({"call_skill", "final_answer", "search_stock_by_name"})
 
+# 本地模型常见工具名变体（模糊匹配用）
+_KNOWN_TOOL_ALIASES = {
+    "call_skill": "call_skill",
+    "call_skill_tool": "call_skill",
+    "CallSkill": "call_skill",
+    "final_answer": "final_answer",
+    "FinalAnswer": "final_answer",
+    "search_stock_by_name": "search_stock_by_name",
+}
+
+
+def _repair_json(s: str) -> str | None:
+    """尝试修复本地模型常见的 JSON 格式错误。
+
+    修复项:
+    - 尾部逗号: {"a": 1, "b": 2,} → {"a": 1, "b": 2}
+    - 单引号: {'name': 'x'} → {"name": "x"}
+    - 未转义的换行符
+    - 截断的 JSON（补右括号）
+    """
+    s = s.strip()
+    if not s:
+        return None
+
+    # 1. 尾部逗号
+    s = re.sub(r',\s*([}\]])', r'\1', s)
+
+    # 2. 单引号 → 双引号（简单替换，不处理嵌套）
+    if "'" in s and '"' not in s:
+        s = s.replace("'", '"')
+
+    # 3. 未转义的换行符（在字符串值内部）
+    s = s.replace('\n', '\\n').replace('\r', '\\r')
+
+    # 4. 尝试直接解析
+    try:
+        json.loads(s)
+        return s
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # 5. 截断修复：补缺失的右括号
+    open_braces = s.count('{') - s.count('}')
+    open_brackets = s.count('[') - s.count(']')
+    if open_braces > 0 or open_brackets > 0:
+        repaired = s + ']' * open_brackets + '}' * open_braces
+        try:
+            json.loads(repaired)
+            return repaired
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    return None
+
 
 def _parse_tool_calls_from_content(content: str) -> list[ToolCallRequest]:
     """从 content 文本中解析 tool_call JSON。
 
     支持: ```json 块、裸 JSON、任意嵌套的 arguments。
+    增强: 针对本地模型的 JSON 格式容错（尾部逗号、单引号、截断修复）。
     """
     if not content or not content.strip():
         return []
@@ -52,13 +107,28 @@ def _parse_tool_calls_from_content(content: str) -> list[ToolCallRequest]:
                 if depth == 0:
                     candidates.append(content[start:i + 1])
                     break
+        else:
+            # 括号未闭合（JSON 截断），也作为候选（后续 _repair_json 会补全）
+            if depth > 0:
+                candidates.append(content[start:])
 
     logger.debug("[LLMCompat] 找到 %d 个候选 JSON", len(candidates))
 
     for candidate in candidates:
+        # 先直接解析
+        data = None
         try:
             data = json.loads(candidate)
         except (json.JSONDecodeError, TypeError):
+            # 尝试修复后解析
+            repaired = _repair_json(candidate)
+            if repaired:
+                try:
+                    data = json.loads(repaired)
+                    logger.info("[LLMCompat] 🔧 JSON 修复成功: %s...", repaired[:80])
+                except (json.JSONDecodeError, TypeError):
+                    continue
+        if data is None:
             continue
         if not isinstance(data, dict):
             continue
@@ -71,12 +141,16 @@ def _parse_tool_calls_from_content(content: str) -> list[ToolCallRequest]:
                 name = fn.get("name", "")
                 args = fn.get("arguments", {})
 
-        logger.debug("[LLMCompat] 候选: name=%s, args=%s", name, bool(args))
-        if name in _KNOWN_TOOLS and isinstance(args, dict):
-            logger.info("[LLMCompat] ✅ 匹配到已知工具: %s", name)
+        # 模糊匹配工具名（本地模型经常拼错大小写或加后缀）
+        canonical_name = _KNOWN_TOOL_ALIASES.get(name, name)
+
+        logger.debug("[LLMCompat] 候选: name=%s(canonical=%s), args=%s",
+                     name, canonical_name, bool(args))
+        if canonical_name in _KNOWN_TOOLS and isinstance(args, dict):
+            logger.info("[LLMCompat] ✅ 匹配到已知工具: %s (原始: %s)", canonical_name, name)
             return [ToolCallRequest(
                 id=str(uuid.uuid4())[:8],
-                name=str(name),
+                name=str(canonical_name),
                 arguments=args,
             )]
 
@@ -87,8 +161,12 @@ def _patch_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """将 role:tool 消息转为 role:user（Llama 不认 tool 角色）。
 
     同时处理 assistant 消息中的 tool_calls：
-    - 如果 content 只有 tool_call JSON → 跳过整个消息（参考 test_agent_flow.py）
+    - 如果 content 只有 tool_call JSON → 替换为自然语言描述（保留上下文）
     - 如果 content 有 tool_call JSON + 其他文本 → 只保留其他文本
+
+    ⚠️ 关键修复：不再跳过含 tool_call 的 assistant 消息。
+    旧逻辑直接跳过导致 LLM 丢失"我调了什么工具"的上下文，
+    多步 tool_call 链路断裂（如 technical_agent → indicator_agent → intelligence_agent）。
     """
     patched = []
     for msg in messages:
@@ -99,16 +177,34 @@ def _patch_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             name = msg.get("name", "tool")
             patched.append({
                 "role": "user",
-                "content": f"[工具 {name} 的返回结果]\n{content}\n\n请基于以上工具结果继续分析。如果所有分析都已完成，请直接输出最终结论。",
+                "content": (
+                    f"[工具 {name} 的返回结果]\n{content}\n\n"
+                    f"请基于以上工具结果继续分析。\n"
+                    f"- 如果还需要调用其他工具，请输出工具调用 JSON\n"
+                    f"- 如果所有分析已完成，请直接输出包含 stock_code/action/score/direction/confidence/reasons/risks/skill_reports 的 JSON 结论"
+                ),
             })
         elif role == "assistant" and msg.get("tool_calls"):
             content = msg.get("content", "")
+            # 提取 tool_call 信息用于上下文保留
+            tool_call_descriptions = []
+            for tc in msg.get("tool_calls", []):
+                fn = tc.get("function", {})
+                tc_name = fn.get("name", tc.get("name", "unknown"))
+                tc_args = fn.get("arguments", tc.get("arguments", ""))
+                if isinstance(tc_args, dict):
+                    tc_args = json.dumps(tc_args, ensure_ascii=False)[:200]
+                tool_call_descriptions.append(f"调用工具: {tc_name}({tc_args})")
+            tool_summary = "; ".join(tool_call_descriptions)
+
             # 检查 content 是否只有 tool_call JSON（没有其他有用文本）
             non_json = _strip_tool_call_json(content)
             if not non_json or non_json.strip() in ("", "(调用工具中...)"):
-                # content 只有 tool_call JSON，跳过整个消息
-                # （Llama 不需要看到 "调用工具中..." 这种占位符）
-                continue
+                # content 只有 tool_call JSON → 替换为自然语言描述（保留上下文）
+                patched.append({
+                    "role": "assistant",
+                    "content": f"[已执行工具调用] {tool_summary}",
+                })
             else:
                 # content 有 tool_call JSON + 其他文本，只保留其他文本
                 patched.append({
@@ -150,14 +246,46 @@ def _strip_tool_call_json(content: str) -> str:
                         pass
                     break
 
-    return cleaned.strip() or content  # 如果清完了就返回原文
+    # 关键修复：清理完后返回 cleaned（可能为空），不再 fallback 回原文
+    # 空字符串表示"content 只有 tool_call JSON，没有其他文本"
+    return cleaned.strip()
 
 
 def _patch_response(response):
-    """如果响应没有 tool_calls 但 content 中有，解析并修补。"""
+    """统一修补 LLM 响应，处理本地模型的 tool_call 兼容问题。
+
+    两种情况：
+    1. has_tool_calls=False → 从 content 中解析 tool_call JSON（本地模型不支持原生 tool_calls）
+    2. has_tool_calls=True 但 should_execute_tools=False → finish_reason 非标准，
+       修正为 "tool_calls" 使 runner 能正常执行（本地模型常见 "length"/"eos_token" 等）
+    """
+    # ── 情况 2：有 tool_calls 但 finish_reason 不对 → 修正 finish_reason ──
+    if response.has_tool_calls and not response.should_execute_tools:
+        logger.warning(
+            "[LLMCompat] tool_calls 存在但 finish_reason='%s' 不标准，修正为 'tool_calls'",
+            response.finish_reason,
+        )
+        return LLMResponse(
+            content=response.content,
+            tool_calls=response.tool_calls,
+            finish_reason="tool_calls",
+            usage=response.usage,
+            reasoning_content=response.reasoning_content,
+            thinking_blocks=response.thinking_blocks,
+            error_status_code=response.error_status_code,
+            error_kind=response.error_kind,
+            error_type=response.error_type,
+            error_code=response.error_code,
+            error_retry_after_s=response.error_retry_after_s,
+            error_should_retry=response.error_should_retry,
+        )
+
+    # ── 情况 1a：已有标准 tool_calls → 不需要解析 ──
     if response.has_tool_calls:
-        logger.debug("[LLMCompat] 响应已有 tool_calls，跳过解析")
+        logger.debug("[LLMCompat] 响应已有标准 tool_calls，跳过解析")
         return response
+
+    # ── 情况 1b：没有 tool_calls → 尝试从 content 中解析 ──
     if not response.content:
         logger.debug("[LLMCompat] 响应 content 为空，跳过解析")
         return response
@@ -254,3 +382,27 @@ def wrap_provider(provider: LLMProvider) -> LLMProvider:
     if isinstance(provider, CompatProvider):
         return provider
     return CompatProvider(provider)
+
+
+def patch_runner_response(runner) -> None:
+    """Monkey-patch runner._request_model，对每次 LLM 响应应用 _patch_response。
+
+    比 wrap_provider 更可靠：不受 _refresh_provider_snapshot 覆盖影响。
+    直接在 runner 的响应出口处兜底。
+    """
+    import functools
+    from nanobot.providers.base import LLMResponse
+
+    original_request_model = runner._request_model
+
+    @functools.wraps(original_request_model)
+    async def patched_request_model(spec, messages_for_model, hook, context):
+        response = await original_request_model(spec, messages_for_model, hook, context)
+        patched = _patch_response(response)
+        if patched is not response:
+            logger.info("[LLMCompat] ⚡ Runner 响应已修补: has_tool_calls=%s finish_reason=%s tool_calls=%s",
+                        patched.has_tool_calls, patched.finish_reason,
+                        [tc.name for tc in patched.tool_calls])
+        return patched
+
+    runner._request_model = patched_request_model

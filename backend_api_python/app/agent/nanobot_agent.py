@@ -167,9 +167,11 @@ class NanobotAgent:
         self._agent_loop = self._nanobot._loop
 
         # ── 3.5 包装 LLM provider（兼容 Llama 等不支持 tool_calls 字段的模型）──
-        from app.agent.llm_compat import wrap_provider
-        self._agent_loop.provider = wrap_provider(self._agent_loop.provider)
-        logger.info("[NanobotAgent] LLM provider 已包装 (兼容 content tool_call)")
+        # 不用 wrap_provider（会被 _refresh_provider_snapshot 覆盖），
+        # 直接 monkey-patch runner 的 _request_model 方法。
+        from app.agent.llm_compat import patch_runner_response
+        patch_runner_response(self._agent_loop.runner)
+        logger.info("[NanobotAgent] Runner 响应处理已 patch (兼容 content tool_call)")
 
         # ── 4. 注入 QuantDinger 工具 ─────────────────────────
         self._run_async(self._inject_quantdinger_tools())
@@ -474,7 +476,24 @@ class NanobotAgent:
                 f"1. call_skill(skill_name=\"technical_agent\", stock_code=\"{code}\") — 技术面\n"
                 f"2. call_skill(skill_name=\"indicator_agent\", stock_code=\"{code}\") — 指标面\n"
                 f"3. call_skill(skill_name=\"intelligence_agent\", stock_code=\"{code}\") — 情报面\n"
-                f"汇总各 skill 的 SkillReport 后输出结构化分析报告。不要直接调底层工具。"
+                f"汇总各 skill 的 SkillReport 后输出结构化分析报告。不要直接调底层工具。\n"
+                f"\n"
+                f"## 工具调用格式\n"
+                f"你必须通过输出以下 JSON 格式来调用工具（不要用其他格式）：\n"
+                f"\n"
+                f"调用分析技能：\n"
+                f"```json\n"
+                f'{{"name": "call_skill", "arguments": {{"skill_name": "技术名", "stock_code": "代码", "stock_name": "名称"}}}}\n'
+                f"```\n"
+                f"\n"
+                f"重要：\n"
+                f"- 每次只输出一个工具调用 JSON\n"
+                f"- 等待工具返回结果后再调用下一个\n"
+                f"- 完成所有 call_skill 后，直接输出最终分析结论（不用调工具，直接写文字+JSON）\n"
+                f"- 在最终结论中包含以下 JSON 结构：\n"
+                f"```json\n"
+                f'{{"stock_code":"代码","stock_name":"名称","action":"buy/hold/sell/watch","score":0-100,"confidence":"high/medium/low","time_horizon":"short/medium/long","reasons":["理由"],"risks":["风险"],"skill_reports":{{"technical":"摘要","indicator":"摘要","intelligence":"摘要"}}}}\n'
+                f"```"
             )
         parts.append(message)
         return "\n".join(parts)
