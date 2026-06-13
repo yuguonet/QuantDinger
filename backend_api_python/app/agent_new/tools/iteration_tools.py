@@ -1,19 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Iteration Tools — OpenCode-inspired task management, user interaction, and auto-snapshot.
+Iteration Tools — 任务管理与用户交互。
 
 Domain-agnostic tools shared across coding, finance, and trading:
 - todowrite: structured task tracking with states and priorities
 - question: ask user clarifying questions with options
-- auto_snapshot: edit-triggered git snapshots (integrates with edit/patch tools)
 
-Design inspired by OpenCode (https://github.com/anomalyco/opencode).
+状态持久化使用临时目录，不依赖 workspace.py。
 """
 from __future__ import annotations
 
 import json
 import logging
-import os
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -25,17 +24,19 @@ logger = logging.getLogger(__name__)
 
 # ── Todo state persistence ────────────────────────────────────
 
-def _get_todo_path() -> Path:
+_TODO_DIR = Path(tempfile.gettempdir()) / "qd_todos"
+
+
+def _get_todo_path(session_id: str = "default") -> Path:
     """Get the todo state file path for current session."""
-    from app.agent.workspace import get_workspace
-    from app.agent.tool_context import get_session_id
-    ws = get_workspace(get_session_id() or "default")
-    return ws.session_dir / ".todo_state.json"
+    _TODO_DIR.mkdir(parents=True, exist_ok=True)
+    safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in session_id)
+    return _TODO_DIR / f"{safe_id}.json"
 
 
-def _load_todos() -> List[Dict[str, str]]:
+def _load_todos(session_id: str = "default") -> List[Dict[str, str]]:
     """Load persisted todo list."""
-    path = _get_todo_path()
+    path = _get_todo_path(session_id)
     if path.exists():
         try:
             return json.loads(path.read_text(encoding="utf-8"))
@@ -44,9 +45,9 @@ def _load_todos() -> List[Dict[str, str]]:
     return []
 
 
-def _save_todos(todos: List[Dict[str, str]]):
-    """Persist todo list to workspace."""
-    path = _get_todo_path()
+def _save_todos(todos: List[Dict[str, str]], session_id: str = "default"):
+    """Persist todo list to temp directory."""
+    path = _get_todo_path(session_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(todos, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -66,15 +67,12 @@ def _save_todos(todos: List[Dict[str, str]]):
     ),
     category="任务管理",
     layer="支撑层",
-    domain=[],  # 通用，所有域可用
+    domain=[],
 )
 def todowrite(
     todos: List[Dict[str, str]],
 ) -> Dict[str, Any]:
     """Create or update a structured task list.
-
-    Tracks progress across multi-step tasks. The todo list persists across
-    tool calls within a session.
 
     Args:
         todos: List of todo items, each with:
@@ -84,14 +82,7 @@ def todowrite(
 
     Returns:
         {"todos": [...], "summary": str}
-
-    Rules:
-        - Only ONE item should be "in_progress" at a time
-        - Mark "completed" only after the work is actually done (including verification)
-        - Keep items specific and actionable
-        - Update in real time, don't batch completions
     """
-    # Validate
     valid_statuses = {"pending", "in_progress", "completed", "cancelled"}
     valid_priorities = {"high", "medium", "low"}
 
@@ -103,10 +94,8 @@ def todowrite(
         if priority not in valid_priorities:
             item["priority"] = "medium"
 
-    # Check: only one in_progress
     in_progress_count = sum(1 for t in todos if t.get("status") == "in_progress")
     if in_progress_count > 1:
-        # Auto-fix: keep the first in_progress, set rest to pending
         found_first = False
         for t in todos:
             if t.get("status") == "in_progress":
@@ -114,10 +103,8 @@ def todowrite(
                     t["status"] = "pending"
                 found_first = True
 
-    # Persist
     _save_todos(todos)
 
-    # Summary
     total = len(todos)
     completed = sum(1 for t in todos if t.get("status") == "completed")
     in_progress = sum(1 for t in todos if t.get("status") == "in_progress")
@@ -174,7 +161,6 @@ def question(
 
     Returns:
         {"question": str, "options": [...], "status": "awaiting_user_response"}
-        The actual user response will come in the next message.
     """
     if not question_text:
         return {"error": "问题不能为空"}
@@ -182,7 +168,6 @@ def question(
     if not options or len(options) < 2:
         return {"error": "至少需要 2 个选项"}
 
-    # Format for display
     formatted_options = []
     for i, opt in enumerate(options):
         label = opt.get("label", f"选项 {i+1}")
@@ -194,7 +179,6 @@ def question(
             "display": f"{i+1}. {label}" + (f" — {desc}" if desc else ""),
         })
 
-    # Build the display text
     display_lines = []
     if context:
         display_lines.append(f"💡 {context}")
@@ -212,92 +196,3 @@ def question(
         "status": "awaiting_user_response",
         "instruction": "请在下一条消息中回复选项编号或内容",
     }
-
-
-# ═══════════════════════════════════════════════════════════════
-# 3. Auto-snapshot integration helper
-# ═══════════════════════════════════════════════════════════════
-
-# Debounce: skip snapshot if last one was within this many seconds.
-# Prevents rapid-fire edits (e.g. 3 edits in 1s) from creating redundant commits.
-_SNAPSHOT_DEBOUNCE_SECS = 3
-
-# Per-session last snapshot timestamp: {session_id: epoch_seconds}
-_last_snapshot_time: Dict[str, float] = {}
-_last_snapshot_lock = threading.Lock()
-
-
-def auto_snapshot_before_edit(reason: str = "") -> Optional[Dict[str, Any]]:
-    """Auto-snapshot before file edits. Call from edit/patch tools.
-
-    Debounced: skips if last snapshot for this session was < 3s ago.
-    Returns snapshot result or None if skipped/unavailable.
-    """
-    try:
-        from app.agent.workspace import get_workspace
-        from app.agent.tool_context import get_session_id
-        session_id = get_session_id() or "default"
-        ws = get_workspace(session_id)
-
-        # ── Debounce check ───────────────────────────────────
-        now = time.time()
-        with _last_snapshot_lock:
-            last = _last_snapshot_time.get(session_id, 0)
-            if now - last < _SNAPSHOT_DEBOUNCE_SECS:
-                logger.debug(
-                    "[AutoSnapshot] Debounced for session %s (%.1fs ago)",
-                    session_id, now - last,
-                )
-                return None
-
-        git_dir = ws.session_dir / ".git"
-        if not git_dir.exists():
-            # Init git repo
-            import subprocess
-            subprocess.run(["git", "init"], cwd=str(ws.session_dir),
-                         capture_output=True, timeout=5)
-            gitignore = ws.session_dir / ".gitignore"
-            if not gitignore.exists():
-                gitignore.write_text("__pycache__/\n*.pyc\n.env\n", encoding="utf-8")
-
-        # Check for changes
-        import subprocess
-        status = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=str(ws.session_dir), capture_output=True, text=True, timeout=5,
-        )
-        if not status.stdout.strip():
-            return None  # No changes to snapshot
-
-        # Auto-commit
-        msg = reason or f"auto-snapshot before edit ({time.strftime('%H:%M:%S')})"
-        subprocess.run(["git", "add", "-A"], cwd=str(ws.session_dir),
-                      capture_output=True, timeout=5)
-        result = subprocess.run(
-            ["git", "commit", "-m", msg],
-            cwd=str(ws.session_dir), capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0:
-            # Update debounce timestamp
-            with _last_snapshot_lock:
-                _last_snapshot_time[session_id] = time.time()
-            log = subprocess.run(
-                ["git", "log", "--oneline", "-1"],
-                cwd=str(ws.session_dir), capture_output=True, text=True, timeout=5,
-            )
-            return {"snapshot": log.stdout.strip(), "message": msg}
-    except Exception as e:
-        logger.debug("[AutoSnapshot] Failed: %s", e)
-    return None
-
-
-# ═══════════════════════════════════════════════════════════════
-# 4. plan — Planning workflow guidance (prompt-level, not a tool)
-# ═══════════════════════════════════════════════════════════════
-
-# Plan mode is injected via domain instructions, not as a separate tool.
-# The guidance tells the agent:
-#   1. For complex tasks: first analyze (read-only), then plan, then execute
-#   2. Use todowrite to track the plan
-#   3. Use question to clarify ambiguities before starting
-# See domain_registry.py for the actual instructions.

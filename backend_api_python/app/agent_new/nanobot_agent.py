@@ -287,6 +287,16 @@ class NanobotAgent:
         # 设置 contextvar，让工具层能访问 hook
         _current_hook.set(hook)
 
+        # ── 链路优先：有确定性链路时走链路，没有才走 LLM ──
+        chain_result = self._try_chain(
+            message=message, session_id=session_id,
+            context=context, domain=domain,
+            stock_code=stock_code, stock_name=stock_name,
+            hook=hook,
+        )
+        if chain_result is not None:
+            return chain_result
+
         # 按领域过滤工具（减少 prompt 中的工具定义 token）
         filtered_tools = self._filter_tools_by_domain(domain)
 
@@ -367,6 +377,23 @@ class NanobotAgent:
         hook.setup_collector(domain=domain, stock_code=stock_code, stock_name=stock_name)
         _current_hook.set(hook)
 
+        # ── 链路优先：有确定性链路时走链路，没有才走 LLM ──
+        chain_result = self._try_chain(
+            message=message, session_id=session_id,
+            context=context, domain=domain,
+            stock_code=stock_code, stock_name=stock_name,
+            hook=hook,
+        )
+        if chain_result is not None:
+            yield {
+                "type": "done",
+                "success": chain_result.success,
+                "content": chain_result.content,
+                "model": chain_result.model,
+                "session_id": session_id,
+            }
+            return
+
         # 按领域过滤工具
         filtered_tools = self._filter_tools_by_domain(domain)
 
@@ -437,6 +464,154 @@ class NanobotAgent:
     # ═════════════════════════════════════════════════════════
     # 内部方法
     # ═════════════════════════════════════════════════════════
+
+    def _try_chain(
+        self,
+        message: str,
+        session_id: str,
+        context: Optional[Dict[str, Any]],
+        domain: str,
+        stock_code: str,
+        stock_name: str,
+        hook: "TraceCollectorHook",
+    ) -> Optional[NanobotResult]:
+        """尝试确定性链路执行。匹配到链路时执行并返回结果，否则返回 None。
+
+        有确定性链路 → ChainExecutor 按序执行（每个 skill 只调一次）
+        无确定性链路 → 返回 None，让 LLM 自规划
+        """
+        # 无股票代码时跳过链路
+        if not stock_code:
+            return None
+
+        # 查匹配链路
+        from app.agent.chain.chains import get_chain_for_intent
+        from app.agent.intent_analyzer import analyze_intent
+
+        try:
+            intent = analyze_intent(message, session_id=session_id)
+            verb = getattr(intent, 'verb', '') or ''
+            noun = getattr(intent, 'noun', '') or ''
+        except Exception:
+            verb, noun = '', ''
+
+        chain_def = get_chain_for_intent(verb, noun)
+        if not chain_def:
+            logger.info("[Chain] 无匹配链路 (verb=%s noun=%s)，走 LLM 自规划", verb, noun)
+            return None
+
+        logger.info("[Chain] 匹配到链路: %s (%s), 走确定性执行", chain_def.chain_id, chain_def.name)
+
+        # 构建 run_skill_fn（复用 CallSkillToolAdapter 的核心逻辑）
+        run_skill_fn = self._build_run_skill_fn(hook)
+
+        # 在持久事件循环中执行 ChainExecutor
+        from app.agent.chain.executor import ChainExecutor
+        try:
+            executor = ChainExecutor(
+                chain_id=chain_def.chain_id,
+                stock_code=stock_code,
+                stock_name=stock_name,
+            )
+            chain_result = self._run_async(
+                self._loop.run_in_executor(
+                    None,
+                    lambda: executor.execute(
+                        run_skill_fn=run_skill_fn,
+                        context={"user_query": message, **(context or {})},
+                    ),
+                )
+            )
+        except Exception as e:
+            logger.error("[Chain] 链路执行失败: %s, 降级到 LLM 自规划", e, exc_info=True)
+            return None
+
+        content = chain_result.content if chain_result else ""
+
+        # DecisionCard 格式化
+        if content:
+            content = self._maybe_format_decision_card(content, context)
+
+        # 追责：存库
+        if hook.collector and content:
+            try:
+                hook.on_agent_finish(
+                    final_content=content,
+                    total_steps=len(chain_def.steps),
+                    total_tokens=0,
+                    model=self._agent_loop.model,
+                )
+            except Exception as e:
+                logger.warning("[Chain] TraceCollector 存库失败: %s", e)
+
+        return NanobotResult(
+            success=bool(content),
+            content=content,
+            tool_calls_log=hook._tools_used,
+            model=self._agent_loop.model,
+        )
+
+    def _build_run_skill_fn(self, hook: "TraceCollectorHook") -> Callable:
+        """构建 ChainExecutor 所需的 run_skill_fn。
+
+        签名: run_skill_fn(skill_name, stock_code, stock_name, context) -> (SkillReport, EvalNode)
+        直接调用 BaseSkill.run()，不经过 CallSkillToolAdapter 的 dedup 层。
+        """
+        from app.agent.nanobot_tools import _create_llm_provider, CallSkillToolAdapter
+
+        # 确保 LLM provider 已缓存
+        if CallSkillToolAdapter._cached_provider is None:
+            CallSkillToolAdapter._cached_provider, CallSkillToolAdapter._cached_model = (
+                _create_llm_provider()
+            )
+
+        def run_skill_fn(skill_name, stock_code, stock_name, context):
+            from app.agent.skills.registry import skill_registry
+            from app.agent.tools.registry import registry as qd_registry
+
+            skill_registry.discover()
+            qd_registry.discover()
+
+            sk = skill_registry.get(skill_name)
+            if not sk:
+                from app.agent.chain.schema import SkillReport, EvalNode, Status
+                return (
+                    SkillReport(skill_name=skill_name, status="failed", error=f"未知技能: {skill_name}"),
+                    EvalNode(name=skill_name, status=Status.FAILED.value, error=f"未知技能: {skill_name}"),
+                )
+
+            # 构建工具函数映射
+            tool_fn_map = {name: spec.fn for name, spec in qd_registry._tools.items()}
+
+            def call_llm(prompt):
+                import asyncio
+                future = asyncio.run_coroutine_threadsafe(
+                    CallSkillToolAdapter._cached_provider.chat_with_retry(
+                        messages=[{"role": "user", "content": prompt}],
+                        model=CallSkillToolAdapter._cached_model,
+                    ),
+                    self._loop,
+                )
+                response = future.result(timeout=120)
+                return response.content or ""
+
+            def call_tool_fn(tool_name, **kw):
+                fn = tool_fn_map.get(tool_name)
+                if fn is None:
+                    raise ValueError(f"Unknown tool: {tool_name}")
+                return fn(**kw)
+            call_tool_fn._tool_fn_map = tool_fn_map
+
+            report, eval_node = sk.run(
+                stock_code=stock_code,
+                stock_name=stock_name or "",
+                call_llm=call_llm,
+                call_tool_fn=call_tool_fn,
+                context=context,
+            )
+            return report, eval_node
+
+        return run_skill_fn
 
     def _filter_tools_by_domain(self, domain: str):
         """返回过滤后的工具注册表 — 只暴露核心决策工具给 LLM。

@@ -233,10 +233,12 @@ def generate_nanobot_config(
     config["agents"]["defaults"]["model"] = model
     config["agents"]["defaults"]["provider"] = provider
 
-    # max steps
+    # max steps（默认 12，与 agent-old 的 max_steps=10 接近）
     max_steps = env.get("AGENT_MAX_STEPS", "").strip()
     if max_steps and max_steps.isdigit():
         config["agents"]["defaults"]["maxToolIterations"] = int(max_steps)
+    else:
+        config["agents"]["defaults"]["maxToolIterations"] = 12
 
     # providers
     config["providers"] = _build_providers(env)

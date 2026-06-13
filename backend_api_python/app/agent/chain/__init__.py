@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Chain — 追责体系核心（EvalNode 树 + 盘后回溯）。
+Chain — 编排/决策层。
 
 核心模块：
   schema.py    — EvalNode 三层统一数据结构 + SkillReport
-  store.py     — qd_traces 持久化（save_tree / load_tree）
+  store.py     — qd_evaluations 持久化（save_tree / load_tree）
   contract.py  — SkillReport 解析契约（从 LLM 输出提取结构化数据）
-  evaluator.py — 回溯评估引擎（T+N 验证 → 权重迭代）
+  chains.py    — 链路定义
+  executor.py  — 链路执行器（按链路定义调度 Skill，构建决策树）
+  evaluator.py — 回溯评估引擎（T+N 验证 → 因子权重更新）
 """
 from app.agent.chain.schema import (
     EvalNode, SkillReport, FactorItem,

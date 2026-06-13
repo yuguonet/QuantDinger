@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 /api/agent/* — AI Agent 聊天 & 流式接口
-Nanobot 内核 — AgentLoop + ToolRegistry + SkillsLoader
+smolagents 内核 — CodeAgent + Planning + Managed Agents + Hub/MCP Tools
 """
 import os
 import json
@@ -89,39 +89,9 @@ def _extract_stock_code(msg: str, ctx: Optional[Dict], session: Dict) -> Optiona
     import re
     if ctx and ctx.get("stock_code"):
         return ctx["stock_code"]
-    # 1. 直接匹配6位数字代码
-    m = re.search(r'(?<!\d)(\d{6})(?!\d)', msg)
+    m = re.search(r"\b(\d{6})\b", msg)
     if m:
         return m.group(1)
-    # 2. 尝试从消息中提取股票名称，查数据库转代码
-    _EXCLUDE_WORDS = {"分析", "查询", "查看", "显示", "帮助", "你好", "请问", "怎么", "什么", "为什么",
-                      "可以", "能够", "需要", "应该", "已经", "正在", "即将", "可能", "大概", "也许",
-                      "股票", "行情", "走势", "涨跌", "买卖", "交易", "投资", "理财", "基金", "债券",
-                      "期货", "期权", "外汇", "黄金", "白银", "原油", "大盘", "指数", "板块", "行业",
-                      "概念", "题材", "热点", "龙头", "妖股", "黑马", "涨停", "跌停", "涨幅", "跌幅",
-                      "换手", "振幅", "量比", "委比", "内外盘", "怎么样", "能买吗", "值不值得", "好不好"}
-    # 提取连续中文块，去排除词后从长到短匹配数据库
-    chinese_blocks = re.findall(r'[\u4e00-\u9fa5]+', msg)
-    for block in chinese_blocks:
-        # 按排除词切分（长词优先）
-        clean = block
-        for w in sorted(_EXCLUDE_WORDS, key=len, reverse=True):
-            clean = clean.replace(w, "|")
-        for part in clean.split("|"):
-            part = part.strip()
-            if len(part) < 2:
-                continue
-            # 从长到短滑窗匹配
-            for length in range(min(len(part), 6), 1, -1):
-                for i in range(len(part) - length + 1):
-                    candidate = part[i:i+length]
-                    try:
-                        from app.utils.basicinfo_db import get_stock_basic_db
-                        matches = get_stock_basic_db().search_stocks(candidate, limit=1)
-                        if matches and matches[0].get("code"):
-                            return matches[0]["code"]
-                    except Exception:
-                        pass
     return session.get("stock_code")
 
 
@@ -183,6 +153,16 @@ def _build_context(data: Dict, session: Dict, message: str) -> tuple:
                 pass
         _touch_session(session_id, stock_code=stock_code)
     return session_id, context, stock_code
+
+
+def _build_executor(skills, user_id):
+    from app.agent.agent import build_agent_executor
+    return build_agent_executor(
+        skills=skills,
+        user_id=user_id,
+        max_steps=int(os.getenv("AGENT_MAX_STEPS", "10")),
+        timeout_seconds=float(os.getenv("AGENT_TIMEOUT_SECONDS", "180")),
+    )
 
 
 def _parse_request(data: Dict) -> tuple:
@@ -251,10 +231,8 @@ def agent_chat():
             session = _get_session(session_id)
             session_id, context, _ = _build_context(data, session, message)
 
-            # ── Nanobot Agent（替代 smolagents）──
-            from app.agent.nanobot_agent import get_nanobot_agent
-            agent = get_nanobot_agent()
-            result = agent.chat(
+            executor = _build_executor(skills, g.user_id)
+            result = executor.chat(
                 message=message, session_id=session_id,
                 context=context, user_id=g.user_id,
             )
@@ -304,20 +282,38 @@ def agent_chat_stream():
 
             def _run():
                 try:
-                    # ── Nanobot Agent 流式（替代 smolagents）──
-                    from app.agent.nanobot_agent import get_nanobot_agent
-                    agent = get_nanobot_agent()
-                    for ev in agent.chat_stream(
-                        message=message, session_id=session_id,
-                        context=context, user_id=user_id,
-                    ):
-                        event_queue.put(ev)
+                    executor = _build_executor(skills, user_id)
+                    # Store executor for interrupt support
+                    _run._executor = executor
+                    try:
+                        for ev in executor.chat_stream(
+                            message=message, session_id=session_id,
+                            context=context, user_id=user_id,
+                        ):
+                            event_queue.put(ev)
+                    finally:
+                        unregister_interrupt(session_id)
                 except Exception as exc:
                     logger.error("Agent stream error: %s", exc, exc_info=True)
                     event_queue.put({"type": "error", "message": str(exc)})
 
+            _run._executor = None
             t = threading.Thread(target=_run, daemon=True)
             t.start()
+
+            # Wait for agent to be ready, then register interrupt
+            try:
+                # Poll for executor to be set (thread may not have started yet)
+                for _ in range(50):
+                    if _run._executor is not None:
+                        break
+                    time.sleep(0.05)
+                executor_ref = _run._executor
+                if executor_ref and executor_ref._agent_ready_event.wait(timeout=30):
+                    if executor_ref._current_agent:
+                        register_interrupt(session_id, executor_ref._current_agent)
+            except Exception as e:
+                logger.debug("Interrupt registration failed (non-fatal): %s", e)
 
             try:
                 while True:
@@ -327,6 +323,13 @@ def agent_chat_stream():
                         if ev.get("type") in ("done", "error"):
                             break
                     except queue.Empty:
+                        # Timeout — try to interrupt the running agent
+                        try:
+                            executor_ref = _run._executor
+                            if executor_ref and executor_ref._current_agent:
+                                executor_ref._current_agent.interrupt()
+                        except Exception:
+                            pass
                         yield f"data: {json.dumps({'type': 'error', 'message': '分析超时'}, ensure_ascii=False)}\n\n"
                         break
             finally:
@@ -382,7 +385,7 @@ def delete_chat_session(session_id: str):
     store.clear_history(session_id)
     store.clear_tool_results(session_id)
     deleted = store.delete_session(session_id)
-    # 清除意图路由上下文
+    # 清除意图路由上下文（domain 连续性加成）
     try:
         from app.agent.intent_analyzer import _get_context_manager
         ctx_mgr = _get_context_manager()
@@ -393,30 +396,232 @@ def delete_chat_session(session_id: str):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 路由: 工具列表（纯 QuantDinger 工具，无 smolagents 依赖）
+# 路由: Agent 可视化 (visualize)
+# ═══════════════════════════════════════════════════════════════
+
+@agent_bp.route("/visualize", methods=["GET"])
+@login_required
+def visualize_agent():
+    """返回 Agent 结构树（工具列表、managed agents、配置）。
+
+    Query params:
+        skills: comma-separated indicator IDs
+    """
+    try:
+        from flask import g
+        skills_raw = request.args.get("skills", "")
+        skills = [s.strip() for s in skills_raw.split(",") if s.strip()] or None
+
+        from app.agent.agent import get_smolagent
+        agent = get_smolagent(skills=skills, user_id=g.user_id)
+
+        # Collect agent structure
+        tools_info = []
+        for name, tool in agent.tools.items():
+            tools_info.append({
+                "name": name,
+                "description": tool.description[:200],
+                "inputs": tool.inputs,
+                "output_type": tool.output_type,
+            })
+
+        managed_info = []
+        for name, ma in agent.managed_agents.items():
+            managed_info.append({
+                "name": name,
+                "description": ma.description,
+                "tools": list(ma.tools.keys()) if hasattr(ma, "tools") else [],
+            })
+
+        return jsonify({
+            "agent_type": type(agent).__name__,
+            "model": str(getattr(agent.model, "model_id", "")),
+            "max_steps": agent.max_steps,
+            "planning_interval": agent.planning_interval,
+            "tools_count": len(tools_info),
+            "tools": tools_info,
+            "managed_agents": managed_info,
+            "instructions_preview": (agent.instructions or "")[:500],
+        })
+    except Exception as e:
+        logger.error("Visualize failed: %s", e, exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+# ═══════════════════════════════════════════════════════════════
+# 路由: Agent 保存 (save)
+# ═══════════════════════════════════════════════════════════════
+
+@agent_bp.route("/save", methods=["POST"])
+@login_required
+def save_agent():
+    """保存当前 Agent 配置到磁盘（可复现部署）。
+
+    Body:
+        name (str): Agent 保存名称
+        skills (list[str]): 指标 ID 列表
+    """
+    try:
+        from flask import g
+        data = request.get_json() or {}
+        name = data.get("name", f"agent_{uuid.uuid4().hex[:8]}")
+        skills = data.get("skills")
+
+        from app.agent.agent import get_smolagent
+        agent = get_smolagent(skills=skills, user_id=g.user_id)
+
+        save_dir = os.path.join(AGENT_SAVE_DIR, name)
+        os.makedirs(save_dir, exist_ok=True)
+
+        agent.save(save_dir)
+
+        return jsonify({
+            "success": True,
+            "path": save_dir,
+            "files": os.listdir(save_dir),
+        })
+    except Exception as e:
+        logger.error("Save agent failed: %s", e, exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@agent_bp.route("/saved", methods=["GET"])
+@login_required
+def list_saved_agents():
+    """列出已保存的 Agent。"""
+    try:
+        if not os.path.exists(AGENT_SAVE_DIR):
+            return jsonify({"agents": []})
+        agents = []
+        for name in sorted(os.listdir(AGENT_SAVE_DIR)):
+            agent_dir = os.path.join(AGENT_SAVE_DIR, name)
+            if os.path.isdir(agent_dir):
+                meta = {}
+                agent_json = os.path.join(agent_dir, "agent.json")
+                if os.path.exists(agent_json):
+                    with open(agent_json) as f:
+                        meta = json.load(f)
+                agents.append({
+                    "name": name,
+                    "path": agent_dir,
+                    "tools_count": len(meta.get("tools", [])),
+                    "class": meta.get("class", ""),
+                    "model": meta.get("model", {}).get("data", {}).get("model_id", ""),
+                })
+        return jsonify({"agents": agents})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ═══════════════════════════════════════════════════════════════
+# 路由: Agent 回放 (replay)
+# ═══════════════════════════════════════════════════════════════
+
+@agent_bp.route("/replay/<session_id>", methods=["GET"])
+@login_required
+def replay_session(session_id: str):
+    """回放指定会话的 Agent 执行过程。
+
+    Query params:
+        detailed (bool): 是否包含每步的完整内存状态
+    """
+    try:
+        detailed = request.args.get("detailed", "false").lower() == "true"
+        store = get_session_store()
+        session = store.get_session(session_id)
+        if not session:
+            return jsonify({"error": "Session not found"}), 404
+
+        messages = session.get("messages", [])
+
+        replay = []
+        for i, msg in enumerate(messages):
+            entry = {
+                "step": i,
+                "role": msg.get("role"),
+                "content": msg.get("content", "")[:2000] if not detailed else msg.get("content", ""),
+            }
+            if detailed and msg.get("tool_calls"):
+                entry["tool_calls"] = msg["tool_calls"]
+            replay.append(entry)
+
+        return jsonify({
+            "session_id": session_id,
+            "stock_code": session.get("stock_code"),
+            "total_steps": len(replay),
+            "replay": replay,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ═══════════════════════════════════════════════════════════════
+# 路由: Agent 中断 (interrupt)
+# ═══════════════════════════════════════════════════════════════
+
+# Global interrupt registry: session_id → agent instance
+_interrupt_registry: Dict[str, Any] = {}
+_interrupt_lock = threading.Lock()
+
+
+def register_interrupt(session_id: str, agent):
+    with _interrupt_lock:
+        _interrupt_registry[session_id] = agent
+
+
+def unregister_interrupt(session_id: str):
+    with _interrupt_lock:
+        _interrupt_registry.pop(session_id, None)
+
+
+@agent_bp.route("/interrupt/<session_id>", methods=["POST"])
+@login_required
+def interrupt_agent(session_id: str):
+    """中断正在运行的 Agent。"""
+    with _interrupt_lock:
+        agent = _interrupt_registry.get(session_id)
+    if agent:
+        agent.interrupt()
+        return jsonify({"success": True, "message": "Agent interrupt signal sent"})
+    return jsonify({"success": False, "message": "No running agent found for this session"})
+
+
+# ═══════════════════════════════════════════════════════════════
+# 路由: 工具列表 (含 Hub/MCP 来源标记)
 # ═══════════════════════════════════════════════════════════════
 
 @agent_bp.route("/tools", methods=["GET"])
 @login_required
 def list_tools():
-    """列出所有可用工具。"""
+    """列出所有可用工具（含来源分类）。"""
     try:
-        from app.agent.tools.registry import registry as tool_registry
-        tool_registry.discover()
+        from app.agent.tool_adapter import build_all_tools
+        tools = build_all_tools()
 
-        tools_info = []
-        for name, spec in sorted(tool_registry._tools.items()):
-            tools_info.append({
-                "name": name,
-                "description": spec.description[:150],
-                "category": spec.category,
-                "layer": spec.layer,
-                "domain": spec.domain,
-            })
+        qd_tools = []
+        builtin_tools = []
+        hub_tools = []
+        mcp_tools = []
+
+        qd_names = set()
+        from app.agent.tools.registry import registry as tool_registry
+        qd_names.update(tool_registry.all_names)
+
+        for t in tools:
+            info = {"name": t.name, "description": t.description[:150]}
+            if t.name in qd_names:
+                qd_tools.append(info)
+            elif t.name in {"duckduckgo_search", "google_search", "web_search",
+                            "visit_webpage", "wikipedia_search", "user_input"}:
+                builtin_tools.append(info)
+            else:
+                hub_tools.append(info)
 
         return jsonify({
-            "total": len(tools_info),
-            "tools": tools_info,
+            "total": len(tools),
+            "quantdinger": qd_tools,
+            "builtin": builtin_tools,
+            "hub_mcp": hub_tools,
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -429,7 +634,12 @@ def list_tools():
 @agent_bp.route("/chain/evaluate", methods=["POST"])
 @login_required
 def trigger_chain_evaluation():
-    """手动触发 Chain 决策评估闭环。"""
+    """手动触发 Chain 决策评估闭环。
+
+    Body (JSON, all optional):
+        days_old: int = 1       — 只评估至少 N 天前的决策
+        market: str = "CNStock" — 市场类型
+    """
     try:
         data = request.get_json(silent=True) or {}
         days_old = int(data.get("days_old", 1))
@@ -446,7 +656,11 @@ def trigger_chain_evaluation():
 @agent_bp.route("/chain/eval-stats", methods=["GET"])
 @login_required
 def get_chain_eval_status():
-    """查询 Chain 决策评估统计。"""
+    """查询 Chain 决策评估统计。
+
+    Query params:
+        chain_id: str (optional) — 指定链路 ID
+    """
     try:
         chain_id = request.args.get("chain_id")
         from app.agent.chain.store import get_eval_stats
@@ -459,7 +673,17 @@ def get_chain_eval_status():
 @agent_bp.route("/chain/worker-health", methods=["GET"])
 @login_required
 def get_chain_worker_health():
-    """查询 Chain 评估 Worker 健康状态。"""
+    """查询 Chain 评估 Worker 健康状态。
+
+    返回：
+        is_alive: bool — worker 线程是否存活
+        last_run_at: str — 上次运行时间
+        last_success_at: str — 上次成功时间
+        last_error: str — 上次错误信息
+        consecutive_failures: int — 连续失败次数
+        total_runs / total_successes / total_failures — 累计统计
+        current_interval: int — 当前等待间隔（秒）
+    """
     try:
         from app.agent.chain.evaluator import get_worker_health
         return jsonify(get_worker_health())

@@ -380,6 +380,18 @@ class CallSkillToolAdapter(Tool):
     Agent 通过 call_skill(skill_name, stock_code) 调用 BaseSkill。
     """
 
+    # ── 调用去重（同 session 内同一 skill+stock 只执行一次）──
+    _called_skills: set = set()      # {(skill_name, stock_code), ...}
+    _current_session: str = ""       # 当前 session_key
+
+    @classmethod
+    def _reset_dedup(cls, session_key: str = ""):
+        """新 session 时清空调用历史。"""
+        if session_key and session_key != cls._current_session:
+            cls._called_skills.clear()
+            cls._current_session = session_key
+            logger.info("[CallSkill] 去重集合已重置 (新 session: %s)", session_key)
+
     @property
     def name(self) -> str:
         return "call_skill"
@@ -422,6 +434,30 @@ class CallSkillToolAdapter(Tool):
     async def execute(self, **kwargs: Any) -> Any:
         """调用 BaseSkill，返回结构化报告。"""
         import asyncio
+        skill_name = kwargs.get("skill_name", "")
+        stock_code = kwargs.get("stock_code", "")
+
+        # ── 去重检查：同 session 内同一 skill+stock 只执行一次 ──
+        dedup_key = (skill_name, stock_code)
+        # 尝试从 hook 获取 session_key 用于重置检测
+        try:
+            from app.agent.nanobot_agent import _current_hook
+            hook = _current_hook.get()
+            if hook:
+                self._reset_dedup(hook._session_id)
+        except Exception:
+            pass
+
+        if dedup_key in self._called_skills:
+            logger.info("[CallSkill] ⚠️ 跳过重复调用: %s(stock=%s) — 本轮已执行过",
+                        skill_name, stock_code)
+            return (
+                f"## {skill_name}\n"
+                f"⏭️ 已跳过（本轮已对 {stock_code} 执行过 {skill_name}，结果已在上方）\n"
+                f"请直接使用之前的分析结果，不要重复调用。"
+            )
+        self._called_skills.add(dedup_key)
+
         logger.info("[CallSkill] >>> execute() 被调用, kwargs=%s", kwargs)
         loop = asyncio.get_event_loop()
         try:
@@ -555,6 +591,8 @@ class CallSkillToolAdapter(Tool):
             if fn is None:
                 raise ValueError(f"Unknown tool: {tool_name}")
             return fn(**kw)
+        # 暴露工具映射给 _resolve_tool_kwargs 做签名检查
+        call_tool_fn._tool_fn_map = tool_fn_map
 
         try:
             t0 = _time.time()

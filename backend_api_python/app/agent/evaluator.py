@@ -510,11 +510,7 @@ def _writeback_chain(eval_result: EvalResult, verb: str, noun: str):
     - 如果 agent 偏离了 chain 但仍然成功 → 用 agent 实际使用的工具链替换旧 chain
       （说明 agent 找到了更好的路径）
     """
-    try:
-        from app.agent.router.tool_chains import get_tool_chain, save_tool_chain
-    except ImportError:
-        logger.debug("[Learn] router.tool_chains 不可用，跳过链路学习")
-        return
+    from app.agent.router.tool_chains import get_tool_chain, save_tool_chain
 
     if not eval_result.actual_tools:
         return

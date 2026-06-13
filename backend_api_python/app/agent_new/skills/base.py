@@ -99,6 +99,8 @@ class BaseSkill(ABC):
         )
 
         try:
+            logger.info("[Skill:%s] >>> 开始分析 stock=%s %s (工具: %s)",
+                        self.name, stock_code, stock_name, ", ".join(self.tools))
             report = self.analyze(
                 stock_code=stock_code,
                 stock_name=stock_name,
@@ -110,7 +112,7 @@ class BaseSkill(ABC):
                 _missing_data=missing_data,
             )
         except Exception as e:
-            logger.error("[Skill:%s] 执行失败: %s", self.name, e)
+            logger.error("[Skill:%s] <<< 执行失败: %s", self.name, e, exc_info=True)
             report = SkillReport(
                 skill_name=self.name, status="failed", error=str(e),
             )
@@ -133,6 +135,8 @@ class BaseSkill(ABC):
         for tool_node in tool_nodes:
             skill_node.add_child(tool_node)
 
+        logger.info("[Skill:%s] <<< 完成 score=%.1f direction=%s 耗时=%.0fms 状态=%s",
+                    self.name, report.score or 0, report.direction, elapsed, report.status)
         return report, skill_node
 
     def algo_analyze(
@@ -185,9 +189,11 @@ class BaseSkill(ABC):
             )
 
         # Step 1: 调用工具获取数据
+        logger.info("[Skill:%s] Step 1/3: 调用 %d 个工具获取数据", self.name, len(self.tools))
         tool_results = {}
         for tool_name in self.tools:
             try:
+                logger.debug("[Skill:%s]   → 调用工具 %s", self.name, tool_name)
                 result = self.call_tool(
                     tool_name=tool_name,
                     call_tool_fn=call_tool_fn,
@@ -198,8 +204,9 @@ class BaseSkill(ABC):
                 )
                 if result is not None:
                     tool_results[tool_name] = result
+                    logger.debug("[Skill:%s]   ✅ %s OK", self.name, tool_name)
             except Exception as e:
-                logger.warning("[Skill:%s] 工具 %s 调用失败: %s", self.name, tool_name, e)
+                logger.warning("[Skill:%s]   ❌ %s 失败: %s", self.name, tool_name, e)
 
         if not tool_results:
             return SkillReport(
@@ -209,6 +216,8 @@ class BaseSkill(ABC):
             )
 
         # Step 2: 算法引擎（algo 优先，0 token）
+        logger.info("[Skill:%s] Step 2/3: 尝试算法分析 (工具结果: %d个)",
+                    self.name, len(tool_results))
         algo_report = self.algo_analyze(
             stock_code, stock_name, tool_results,
             call_tool_fn=call_tool_fn,
@@ -225,6 +234,7 @@ class BaseSkill(ABC):
             return algo_report
 
         # Step 3: LLM 补位（算法无法处理时）
+        logger.info("[Skill:%s] Step 3/3: 算法未覆盖，调用 LLM 分析", self.name)
         if not call_llm:
             return SkillReport(
                 skill_name=self.name, status="failed",
@@ -279,10 +289,18 @@ class BaseSkill(ABC):
         if "stock_code" not in kwargs:
             return kwargs
 
-        # 获取工具签名
+        # 获取工具签名：优先从 call_tool_fn._tool_fn_map 直接取函数
         param_names = []
-        try:
-            # call_tool_fn 闭包中提取 tool_map
+        tool_fn_map = getattr(call_tool_fn, '_tool_fn_map', None)
+        if tool_fn_map:
+            fn = tool_fn_map.get(tool_name)
+            if fn:
+                import inspect
+                sig = inspect.signature(fn)
+                param_names = list(sig.parameters.keys())
+
+        # fallback: 从闭包中提取（旧逻辑，兼容性保留）
+        if not param_names:
             for cell in getattr(call_tool_fn, '__closure__', None) or []:
                 try:
                     tm = cell.cell_contents
@@ -295,8 +313,6 @@ class BaseSkill(ABC):
                             break
                 except (ValueError, TypeError):
                     continue
-        except Exception:
-            pass
 
         if not param_names:
             return kwargs

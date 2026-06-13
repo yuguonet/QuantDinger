@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Tool Registry — @tool 装饰器自注册 + 自动发现 + smolagents Tool 构建。
+Tool Registry — @tool 装饰器自注册 + 自动发现 + Nanobot Tool 适配。
 
 生命周期：
   1. 各工具模块用 @tool(...) 装饰器注册函数（data_tools.py, analysis_tools.py 等）
   2. registry.discover() 导入 tools/ 包下所有模块，触发注册
-  3. registry.build(config) 过滤 + 转换为 smolagents Tool 列表
+  3. registry.build(config) 过滤 + 转换为 Nanobot Tool 列表
 
 架构分层（layer 参数）：
   显示层 — 图表/可视化输出
@@ -48,7 +48,7 @@ from typing import Any, Callable, Dict, List, Optional, get_type_hints
 
 logger = logging.getLogger(__name__)
 
-# ── Type mapping: Python type → smolagents/OpenAI type string ──
+# ── Type mapping: Python type → OpenAI type string ──
 _TYPE_MAP = {
     str: "string",
     int: "integer",
@@ -78,7 +78,7 @@ def _is_optional(tp) -> bool:
 
 
 def _python_type_to_str(tp) -> str:
-    """Convert a Python type annotation to smolagents type string."""
+    """Convert a Python type annotation to OpenAI type string."""
     if tp is inspect.Parameter.empty:
         return "string"
     # Direct match
@@ -233,99 +233,15 @@ def _probe_list(data: Any) -> tuple:
 
 @dataclass
 class ToolSpec:
-    """Registered tool metadata, convertible to smolagents Tool."""
+    """Registered tool metadata container."""
     fn: Callable
     name: str
     description: str
     category: str = ""
     layer: str = ""          # 架构分层：显示层/数据层/分析层/决策层/执行层/支撑层
-    domain: List[str] = field(default_factory=list)  # 领域标签：["finance"] / ["coding"] / ["finance","coding"] / []=通用
+    domain: List[str] = field(default_factory=list)  # 领域标签：["finance"] / ["coding"] / []=通用
     output_type: str = "string"
     meta: Dict[str, Any] = field(default_factory=dict)
-
-    def to_smolagents_tool(self):
-        """Convert to a smolagents Tool subclass instance."""
-        from smolagents import Tool
-
-        sig = inspect.signature(self.fn)
-        try:
-            hints = get_type_hints(self.fn)
-        except Exception:
-            hints = {}
-
-        # Build smolagents inputs dict from function signature
-        inputs = {}
-        for pname, param in sig.parameters.items():
-            tp = hints.get(pname, param.annotation)
-            type_str = _python_type_to_str(tp)
-            desc = ""
-            # Try to extract from docstring (Google-style)
-            desc = _extract_param_desc(self.fn, pname)
-            inputs[pname] = {"type": type_str, "description": desc}
-            # Mark nullable when the original param has a default or is Optional
-            is_optional = _is_optional(tp)
-            has_default = param.default is not inspect.Parameter.empty
-            if has_default or is_optional:
-                inputs[pname]["nullable"] = True
-
-        param_names = list(sig.parameters.keys())
-
-        def _make_forward(_fn, _param_names, _sig, _tool_name):
-            def forward(self, **kwargs):
-                result = _fn(**kwargs)
-                return _auto_paginate(result, _tool_name, kwargs)
-            params = [inspect.Parameter("self", inspect.Parameter.POSITIONAL_OR_KEYWORD)]
-            for pname in _param_names:
-                orig = _sig.parameters[pname]
-                # Preserve original default; use None only if the param is optional or has a default
-                if orig.default is not inspect.Parameter.empty:
-                    default = orig.default
-                else:
-                    default = inspect.Parameter.empty
-                params.append(inspect.Parameter(pname, inspect.Parameter.KEYWORD_ONLY, default=default))
-            forward.__signature__ = inspect.Signature(params)
-            return forward
-
-        tool_class = type(
-            f"Tool_{self.name}",
-            (Tool,),
-            {
-                "name": self.name,
-                "description": self.description,
-                "inputs": inputs,
-                "output_type": self.output_type,
-                "forward": _make_forward(self.fn, param_names, sig, self.name),
-            },
-        )
-        return tool_class()
-
-
-def _extract_param_desc(fn: Callable, param_name: str) -> str:
-    """Extract parameter description from Google-style docstring.
-
-    Looks for lines like:
-        keyword: 搜索关键词（中文股票名称等）
-    """
-    doc = inspect.getdoc(fn) or ""
-    in_args = False
-    for line in doc.split("\n"):
-        stripped = line.strip()
-        # Section headers: "Args:", "Arguments:", "Parameters:"
-        if stripped.lower().rstrip(":") in ("args", "arguments", "parameters"):
-            in_args = True
-            continue
-        # New section ends args
-        if in_args and stripped and not stripped[0].isspace() and stripped.endswith(":"):
-            break
-        if in_args and ":" in stripped:
-            name_part, _, desc_part = stripped.partition(":")
-            if name_part.strip().split()[0] == param_name:
-                # Handle "name (type): description" format
-                desc = desc_part.strip()
-                if not desc and "(" in name_part:
-                    desc = stripped
-                return desc
-    return ""
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -338,7 +254,7 @@ class ToolRegistry:
     Lifecycle:
         1. Modules define @tool(...) decorated functions
         2. registry.discover() imports all modules in the tools package → triggers registration
-        3. registry.build(config) applies policy filters and returns smolagents Tool list
+        3. registry.build(config) applies policy filters and returns ToolSpec list
     """
 
     def __init__(self):
@@ -374,15 +290,10 @@ class ToolRegistry:
         logger.info("[ToolRegistry] Discovered %d tools from %s", len(self._tools), package)
 
     def build(self, config: Dict = None) -> List:
-        """Build smolagents Tool list with optional policy filtering.
+        """Build tool list with optional policy filtering.
 
-        config keys:
-            allow: list[str] — if set, only these tools are included
-            deny: list[str] — these tools are excluded
-            domain: str — if set, filter by domain:
-                - tools with matching domain tag → included
-                - tools with domain=[] (universal) → included (lower priority)
-                - tools with non-matching domain → excluded
+        Returns ToolSpec list (use nanobot_tools for Nanobot ToolRegistry).
+        Use nanobot_tools.register_quantdinger_tools() for Nanobot ToolRegistry.
         """
         config = config or {}
         allow = set(config.get("allow", []))
@@ -395,20 +306,13 @@ class ToolRegistry:
                 continue
             if allow and spec.name not in allow:
                 continue
-            # Domain filtering
             if domain:
                 if spec.domain and domain not in spec.domain:
-                    continue  # 工具指定了领域但不匹配 → 排除
-                # spec.domain 为空（通用）或包含当前领域 → 保留
-            try:
-                tools.append(spec.to_smolagents_tool())
-            except Exception as e:
-                logger.warning("[ToolRegistry] Failed to build tool '%s': %s", spec.name, e)
+                    continue
+            tools.append(spec)
 
-        # 排序：领域匹配的工具在前，通用工具在后
         if domain:
-            tools.sort(key=lambda t: 0 if self._tools.get(t.name) and domain in self._tools[t.name].domain else 1)
-
+            tools.sort(key=lambda s: 0 if domain in s.domain else 1)
         return tools
 
     @property
