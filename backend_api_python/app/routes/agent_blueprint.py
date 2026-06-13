@@ -89,9 +89,39 @@ def _extract_stock_code(msg: str, ctx: Optional[Dict], session: Dict) -> Optiona
     import re
     if ctx and ctx.get("stock_code"):
         return ctx["stock_code"]
-    m = re.search(r"\b(\d{6})\b", msg)
+    # 1. 直接匹配6位数字代码
+    m = re.search(r'(?<!\d)(\d{6})(?!\d)', msg)
     if m:
         return m.group(1)
+    # 2. 尝试从消息中提取股票名称，查数据库转代码
+    _EXCLUDE_WORDS = {"分析", "查询", "查看", "显示", "帮助", "你好", "请问", "怎么", "什么", "为什么",
+                      "可以", "能够", "需要", "应该", "已经", "正在", "即将", "可能", "大概", "也许",
+                      "股票", "行情", "走势", "涨跌", "买卖", "交易", "投资", "理财", "基金", "债券",
+                      "期货", "期权", "外汇", "黄金", "白银", "原油", "大盘", "指数", "板块", "行业",
+                      "概念", "题材", "热点", "龙头", "妖股", "黑马", "涨停", "跌停", "涨幅", "跌幅",
+                      "换手", "振幅", "量比", "委比", "内外盘", "怎么样", "能买吗", "值不值得", "好不好"}
+    # 提取连续中文块，去排除词后从长到短匹配数据库
+    chinese_blocks = re.findall(r'[\u4e00-\u9fa5]+', msg)
+    for block in chinese_blocks:
+        # 按排除词切分（长词优先）
+        clean = block
+        for w in sorted(_EXCLUDE_WORDS, key=len, reverse=True):
+            clean = clean.replace(w, "|")
+        for part in clean.split("|"):
+            part = part.strip()
+            if len(part) < 2:
+                continue
+            # 从长到短滑窗匹配
+            for length in range(min(len(part), 6), 1, -1):
+                for i in range(len(part) - length + 1):
+                    candidate = part[i:i+length]
+                    try:
+                        from app.utils.basicinfo_db import get_stock_basic_db
+                        matches = get_stock_basic_db().search_stocks(candidate, limit=1)
+                        if matches and matches[0].get("code"):
+                            return matches[0]["code"]
+                    except Exception:
+                        pass
     return session.get("stock_code")
 
 

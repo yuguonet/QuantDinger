@@ -373,6 +373,7 @@ class CallSkillToolAdapter(Tool):
         不依赖 smolagents：直接从 QuantDinger tool_registry 获取原始函数。
         LLM 调用复用 Nanobot 的 provider（缓存，不每次创建）。
         """
+        import time as _time
         from app.agent.skills.registry import skill_registry
         from app.agent.tools.registry import registry as qd_registry
 
@@ -382,7 +383,11 @@ class CallSkillToolAdapter(Tool):
         sk = skill_registry.get(skill_name)
         if not sk:
             available = ", ".join(skill_registry.all_names)
+            logger.error("[CallSkill] 未知技能: %s。可用: %s", skill_name, available)
             return f"未知技能: {skill_name}。可用技能: {available}"
+
+        logger.info("[CallSkill] ═══ 开始 %s(stock=%s %s) ═══",
+                    skill_name, stock_code, stock_name or "")
 
         # 缓存工具函数映射
         if not CallSkillToolAdapter._tool_fn_ready:
@@ -439,13 +444,19 @@ class CallSkillToolAdapter(Tool):
             return fn(**kw)
 
         try:
+            t0 = _time.time()
             report, eval_node = sk.run(
                 stock_code=stock_code,
                 stock_name=stock_name or "",
                 call_llm=call_llm,
                 call_tool_fn=call_tool_fn,
             )
+            elapsed = (_time.time() - t0) * 1000
+            logger.info("[CallSkill] ─── %s 完成 ─── score=%.1f direction=%s signal=%s 耗时=%.0fms 工具=%s",
+                        skill_name, report.score or 0, report.direction, report.signal,
+                        elapsed, report.tools_called or [])
         except Exception as e:
+            logger.error("[CallSkill] ─── %s 失败 ─── %s", skill_name, e, exc_info=True)
             return f"技能 {skill_name} 执行失败: {e}"
 
         # 持久化 EvalNode（保留追责能力）

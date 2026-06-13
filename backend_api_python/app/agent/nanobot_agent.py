@@ -251,8 +251,24 @@ class NanobotAgent:
         # session_id → Nanobot session_key
         session_key = f"qd:{session_id}"
 
+        # 意图分析（异步，不阻塞主流程）
+        intent_hint = ""
+        try:
+            from app.agent.intent_analyzer import analyze_intent, format_intent_for_agent
+            intent_result = analyze_intent(message, session_id=session_id)
+            intent_hint = format_intent_for_agent(intent_result, message)
+            # 用意图分析结果补全 context
+            if intent_result.params.get("stock") and not (context or {}).get("stock_code"):
+                context = context or {}
+                context["stock_code"] = intent_result.params["stock"]
+            if intent_result.params.get("stock_name") and not (context or {}).get("stock_name"):
+                context = context or {}
+                context["stock_name"] = intent_result.params["stock_name"]
+        except Exception as e:
+            logger.debug("[NanobotAgent] 意图分析跳过: %s", e)
+
         # 拼接上下文到消息
-        enriched = self._enrich_message(message, context)
+        enriched = self._enrich_message(message, context, intent_hint=intent_hint)
 
         # 追责 Hook
         hook = TraceCollectorHook(session_id=session_id, user_query=message)
@@ -314,7 +330,23 @@ class NanobotAgent:
         与原 smolagents _AgentExecutor.chat_stream() 接口兼容。
         """
         session_key = f"qd:{session_id}"
-        enriched = self._enrich_message(message, context)
+
+        # 意图分析
+        intent_hint = ""
+        try:
+            from app.agent.intent_analyzer import analyze_intent, format_intent_for_agent
+            intent_result = analyze_intent(message, session_id=session_id)
+            intent_hint = format_intent_for_agent(intent_result, message)
+            if intent_result.params.get("stock") and not (context or {}).get("stock_code"):
+                context = context or {}
+                context["stock_code"] = intent_result.params["stock"]
+            if intent_result.params.get("stock_name") and not (context or {}).get("stock_name"):
+                context = context or {}
+                context["stock_name"] = intent_result.params["stock_name"]
+        except Exception as e:
+            logger.debug("[NanobotAgent] 意图分析跳过: %s", e)
+
+        enriched = self._enrich_message(message, context, intent_hint=intent_hint)
         domain = self._detect_domain(message, context)
 
         # 追责 Hook（流式也需要）
@@ -391,9 +423,13 @@ class NanobotAgent:
     # 内部方法
     # ═════════════════════════════════════════════════════════
 
-    def _enrich_message(self, message: str, context: Optional[Dict[str, Any]]) -> str:
+    def _enrich_message(self, message: str, context: Optional[Dict[str, Any]],
+                         intent_hint: str = "") -> str:
         """拼接上下文信息到消息。"""
         parts = []
+        # 意图分析提示（如果有）
+        if intent_hint:
+            parts.append(intent_hint)
         if context:
             if context.get("stock_code"):
                 parts.append(f"股票代码: {context['stock_code']}")
@@ -402,6 +438,19 @@ class NanobotAgent:
             if context.get("realtime_quote"):
                 import json
                 parts.append(f"[实时行情]\n{json.dumps(context['realtime_quote'], ensure_ascii=False)[:2000]}")
+            if context.get("chip_distribution"):
+                import json
+                parts.append(f"[筹码分布]\n{json.dumps(context['chip_distribution'], ensure_ascii=False)[:1000]}")
+        # 金融领域：附加分析指令
+        if context and context.get("stock_code"):
+            code = context.get("stock_code", "")
+            parts.append(
+                f"\n[系统提示] 检测到股票分析请求。请使用 call_skill 执行分析：\n"
+                f"1. call_skill(skill_name=\"technical_agent\", stock_code=\"{code}\") — 技术面\n"
+                f"2. call_skill(skill_name=\"indicator_agent\", stock_code=\"{code}\") — 指标面\n"
+                f"3. call_skill(skill_name=\"intelligence_agent\", stock_code=\"{code}\") — 情报面\n"
+                f"汇总各 skill 的 SkillReport 后输出结构化分析报告。不要直接调底层工具。"
+            )
         parts.append(message)
         return "\n".join(parts)
 
