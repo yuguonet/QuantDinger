@@ -101,14 +101,12 @@ def _refresh_slow():
 #    from app.market_cn.policy_analysis import refresh_financial_news, refresh_macro_news
 #    from app.data_providers.sentiment import refresh_fear_greed_index, refresh_sentiment_data
     from app.data_providers.global_market import refresh_global_sentiment, refresh_global_news
-#    from app.data_providers.crypto import refresh_crypto_prices, refresh_crypto_heatmap
 
     _run_all("slow", [
         refresh_fear_greed, refresh_policy, refresh_emotion_cycle,
 #        refresh_financial_news, refresh_macro_news,
 #        refresh_fear_greed_index, refresh_sentiment_data,
         refresh_global_sentiment, refresh_global_news,
-#        refresh_crypto_prices, refresh_crypto_heatmap,
     ])
 
     # 日级数据（盘中也能更新）也放到慢档

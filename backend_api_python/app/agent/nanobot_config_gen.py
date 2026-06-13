@@ -46,7 +46,11 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
             "maxToolResultChars": 16000,
             "sessionTtlMinutes": 0,
             "consolidationRatio": 0.5,
-            "maxMessages": 120,
+            "maxMessages": 30,
+            # 禁用不需要的内置 skill，减少上下文
+            "disabledSkills": [
+                "weather",
+            ],
         }
     },
     "providers": {},
@@ -54,6 +58,8 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
         "restrictToWorkspace": False,
         "exec": {"sandbox": False},
         "web": {"enabled": False},
+        "imageGeneration": {"enabled": False},
+        "cliApps": {"enable": False},
     },
     "channels": {},
 }

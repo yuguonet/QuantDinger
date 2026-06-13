@@ -53,6 +53,8 @@ def _parse_tool_calls_from_content(content: str) -> list[ToolCallRequest]:
                     candidates.append(content[start:i + 1])
                     break
 
+    logger.debug("[LLMCompat] 找到 %d 个候选 JSON", len(candidates))
+
     for candidate in candidates:
         try:
             data = json.loads(candidate)
@@ -69,7 +71,9 @@ def _parse_tool_calls_from_content(content: str) -> list[ToolCallRequest]:
                 name = fn.get("name", "")
                 args = fn.get("arguments", {})
 
+        logger.debug("[LLMCompat] 候选: name=%s, args=%s", name, bool(args))
         if name in _KNOWN_TOOLS and isinstance(args, dict):
+            logger.info("[LLMCompat] ✅ 匹配到已知工具: %s", name)
             return [ToolCallRequest(
                 id=str(uuid.uuid4())[:8],
                 name=str(name),
@@ -82,39 +86,90 @@ def _parse_tool_calls_from_content(content: str) -> list[ToolCallRequest]:
 def _patch_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """将 role:tool 消息转为 role:user（Llama 不认 tool 角色）。
 
-    同时移除 assistant 消息中的 tool_calls 字段（Llama 不认）。
+    同时处理 assistant 消息中的 tool_calls：
+    - 如果 content 只有 tool_call JSON → 跳过整个消息（参考 test_agent_flow.py）
+    - 如果 content 有 tool_call JSON + 其他文本 → 只保留其他文本
     """
     patched = []
     for msg in messages:
         role = msg.get("role", "")
         if role == "tool":
-            # tool → user，包装成自然语言
+            # tool → user，包装成自然语言（参考 test_agent_flow.py）
             content = msg.get("content", "")
             name = msg.get("name", "tool")
             patched.append({
                 "role": "user",
-                "content": f"[工具 {name} 的返回结果]\n{content}",
+                "content": f"[工具 {name} 的返回结果]\n{content}\n\n请基于以上工具结果继续分析。如果所有分析都已完成，请直接输出最终结论。",
             })
         elif role == "assistant" and msg.get("tool_calls"):
-            # 移除 tool_calls 字段，只保留 content
-            new_msg = {k: v for k, v in msg.items() if k != "tool_calls"}
-            if not new_msg.get("content"):
-                new_msg["content"] = "(调用工具中...)"
-            patched.append(new_msg)
+            content = msg.get("content", "")
+            # 检查 content 是否只有 tool_call JSON（没有其他有用文本）
+            non_json = _strip_tool_call_json(content)
+            if not non_json or non_json.strip() in ("", "(调用工具中...)"):
+                # content 只有 tool_call JSON，跳过整个消息
+                # （Llama 不需要看到 "调用工具中..." 这种占位符）
+                continue
+            else:
+                # content 有 tool_call JSON + 其他文本，只保留其他文本
+                patched.append({
+                    "role": "assistant",
+                    "content": non_json.strip(),
+                })
         else:
             patched.append(msg)
     return patched
+
+
+def _strip_tool_call_json(content: str) -> str:
+    """从 assistant content 中移除 tool_call JSON，保留非 JSON 文本。"""
+    if not content:
+        return content
+
+    cleaned = content
+
+    # 移除 ```json ... ``` 代码块中的 tool_call
+    for m in re.finditer(r'```(?:json)?\s*\n?\{[^`]*"name"\s*:[^`]*\}\s*\n?```', cleaned, re.DOTALL):
+        cleaned = cleaned.replace(m.group(0), "").strip()
+
+    # 移除裸 JSON tool_call（用括号深度匹配）
+    for m in re.finditer(r'\{', cleaned):
+        depth = 0
+        start = m.start()
+        for i in range(start, len(cleaned)):
+            if cleaned[i] == '{':
+                depth += 1
+            elif cleaned[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    candidate = cleaned[start:i + 1]
+                    try:
+                        data = json.loads(candidate)
+                        if isinstance(data, dict) and data.get("name") in _KNOWN_TOOLS:
+                            cleaned = cleaned.replace(candidate, "").strip()
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                    break
+
+    return cleaned.strip() or content  # 如果清完了就返回原文
+
+
+def _patch_response(response):
     """如果响应没有 tool_calls 但 content 中有，解析并修补。"""
     if response.has_tool_calls:
+        logger.debug("[LLMCompat] 响应已有 tool_calls，跳过解析")
         return response
     if not response.content:
+        logger.debug("[LLMCompat] 响应 content 为空，跳过解析")
         return response
 
+    logger.info("[LLMCompat] 检查 content 中的 tool_call (长度=%d): %s",
+                len(response.content), response.content[:300])
     parsed = _parse_tool_calls_from_content(response.content)
     if not parsed:
+        logger.info("[LLMCompat] content 中未解析到 tool_call")
         return response
 
-    logger.info("[LLMCompat] 从 content 中解析到 tool_call: %s", [tc.name for tc in parsed])
+    logger.info("[LLMCompat] ✅ 从 content 中解析到 tool_call: %s", [tc.name for tc in parsed])
 
     # 清掉 content 中的 JSON，保留非 JSON 部分
     cleaned = response.content
