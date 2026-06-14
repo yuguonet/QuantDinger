@@ -141,6 +141,75 @@ def _load_preamble() -> str:
     return "你是 QuantDinger 量化分析助手。"
 
 
+def _build_router_instructions(
+    language: str = "zh",
+    available_skills: str = "",
+    domain: str = "",
+    domain_instructions: str = "",
+    intent_context: str = "",
+) -> str:
+    """构建极简路由 prompt — 主 Agent 只做分发，不做分析。"""
+    preamble = _load_preamble()
+
+    lang_section = (
+        "\n## 输出语言\n"
+        "- 使用中文回答。\n"
+        "- 所有面向用户的文本值使用中文。\n"
+        "- JSON 中 action/direction/confidence 保持英文枚举值。\n"
+    ) if not str(language or "").lower().startswith("en") else (
+        "\n## Output Language\n- Reply in English.\n- All JSON values in English.\n"
+    )
+
+    domain_section = ""
+    if domain_instructions:
+        domain_section = f"\n## 当前领域: {domain}\n\n{domain_instructions}\n"
+
+    intent_section = ""
+    if intent_context:
+        intent_section = f"\n## 意图分析\n\n{intent_context}\n"
+
+    return f"""{preamble}
+
+## 你的角色
+
+你是**路由器**。你的唯一职责是：
+1. 理解用户意图
+2. 选择正确的工具调用
+3. 把工具返回的结果直接作为最终回复输出
+
+**你不做分析，不做判断，不做验证。** 工具的结果就是最终结果。
+
+## ⚠️ 你的可用工具
+
+- **call_skill(skill_name, stock_code, stock_name)** — 调用单个技能分析
+- **execute_chain(chain_id, stock_code, stock_name)** — 调用多技能链路分析
+- **search_stock_by_name(keyword)** — 搜索股票代码（不确定代码时先搜）
+- **final_answer(回复)** — 输出结果
+
+## 可用技能
+
+{available_skills}
+
+## 可用链路
+
+- **evaluate+stock** — 股票综合评估（游资→解禁→情报→技术→指标→选股→行情→回测→多空辩论）
+- **screen+stock** — 选股筛选（条件选股→技术验证→情报过滤）
+- **scan+market** — 市场全景扫描（大盘指数→板块排名→涨停池→资金流向）
+
+## 规则
+
+0. **⚠️ 必须用 final_answer() 返回结果**。
+1. **不需要工具的消息，第一步就 final_answer**。
+2. **分析股票 → call_skill 或 execute_chain**：
+   - 单维度分析（如"技术面分析600519"）→ call_skill
+   - 全面分析（如"分析贵州茅台"、"帮我看看600519"）→ execute_chain
+3. **⚠️ 工具返回后立即 final_answer** — 不要再调任何工具或做额外分析。
+4. **不确定股票代码时** → 先 search_stock_by_name，再 call_skill/execute_chain。
+5. **工具返回的是完整分析报告，直接原样输出，不要修改、总结或重新格式化。**
+
+{intent_section}{domain_section}{lang_section}"""
+
+
 def _build_instructions(user_message: str = "", skill_instructions: str = "",
                         language: str = "zh", tools=None, managed_agents=None,
                         domain: str = "", domain_instructions: str = "",
@@ -632,138 +701,6 @@ def _step_to_events(step) -> List[Dict[str, Any]]:
 # 5b. Managed Agent Builder
 # ═══════════════════════════════════════════════════════════════
 
-def _build_managed_agents(
-    skill_registry,
-    model,
-    collector=None,
-    user_id: int = 1,
-) -> list:
-    """从 SkillRegistry 构建所有子 agent（smolagents Managed Agent）。
-
-    每个 @skill 注册的 skill 构造一个独立的 CodeAgent：
-      - 只有 1 个 tool: SkillExecutionTool（包装 BaseSkill.run()）
-      - max_steps 从 SkillSpec 读取
-      - 返回结构化报告给主 agent
-
-    另外构造 1 个 Chain 子 Agent：
-      - 只有 1 个 tool: ChainExecutionTool（包装 ChainExecutor）
-      - 用于执行预定义的 Chain 流程（evaluate+stock, screen+stock, scan+market）
-
-    Returns:
-        list[CodeAgent]: 作为 managed_agents 传给主 agent
-    """
-    from smolagents import CodeAgent, LogLevel
-    from app.agent.skills.skill_executor import SkillExecutionTool
-    from app.agent.chain_executor_tool import ChainExecutionTool
-
-    managed_agents = []
-
-    # ── Chain 子 Agent ──
-    chain_tool = ChainExecutionTool(
-        model=model,
-        collector=collector,
-        user_id=user_id,
-    )
-    chain_instructions = (
-        "你是一个专业的量化分析链路执行器。\n\n"
-        "你的任务是执行预定义的分析链路，对指定股票进行全面分析。\n\n"
-        "执行流程（**必须严格按照下面两步，不要多写代码**）：\n"
-        "1. 调用 execute_chain(chain_id=链路ID, stock_code=代码, stock_name=名称)\n"
-        "   — 这步内部会自动调用多个技能进行全面分析\n"
-        "   — 常用链路ID：\n"
-        "     * evaluate+stock：完整股票分析（技术面+资金面+情报面）\n"
-        "     * screen+stock：选股筛选\n"
-        "     * scan+market：大盘扫描\n"
-        "2. 用 final_answer() 原样返回 execute_chain 返回的字符串，不要修改、不要格式化、不要提取字段\n\n"
-        "正确示例（直接照抄这个模式）：\n"
-        "```python\n"
-        "result = execute_chain(chain_id=\"evaluate+stock\", stock_code=\"600519\", stock_name=\"贵州茅台\")\n"
-        "final_answer(result)\n"
-        "```\n\n"
-        "⚠️ 常见错误（禁止）：\n"
-        "- ❌ 不要用 result['score'] / result.get('score') / result.xxx — result 是 JSON 字符串，不是字典\n"
-        "- ❌ 不要用 f-string 重新格式化输出\n"
-        "- ❌ 不要自己调用底层数据工具\n"
-        "- ❌ 不要修改报告内容\n"
-        "- ✅ 直接 final_answer(result)，一步到位\n\n"
-        "⚠️ 语言要求：所有输出必须使用中文，包括思考过程和代码注释。"
-    )
-    chain_agent = CodeAgent(
-        tools=[chain_tool],
-        model=model,
-        max_steps=5,  # Chain 内部已编排，主 Agent 只需调用一次
-        instructions=chain_instructions,
-        name="chain_executor",
-        description="执行预定义的分析链路（evaluate+stock, screen+stock, scan+market），返回结构化决策报告。适用于需要全面分析的场景。",
-        provide_run_summary=False,
-        verbosity_level=LogLevel.INFO,
-        return_full_result=True,
-        additional_authorized_imports=["json"],
-        executor_kwargs={"timeout_seconds": int(os.getenv("SUB_AGENT_EXEC_TIMEOUT", "360"))},
-    )
-    managed_agents.append(chain_agent)
-    logger.debug("[ManagedAgent] 构建 chain_executor")
-
-    # ── Skill 子 Agent ──
-    for spec in skill_registry.all_specs:
-        # 构造子 agent 的唯一工具
-        skill_tool = SkillExecutionTool(
-            skill=skill_registry.get(spec.name),
-            model=model,
-            collector=collector,
-        )
-
-        # 子 agent 指令：调用 execute_skill 后 final_answer
-        sub_instructions = (
-            f"你是一个专业的 {spec.description}。\n\n"
-            f"你的任务是对指定股票进行 {spec.description}。\n\n"
-            "执行流程（**必须严格按照下面两步，不要多写代码**）：\n"
-            "1. 调用 execute_skill(stock_code=代码, stock_name=名称)\n"
-            "   — 这步内部会自动获取数据并进行全面分析\n"
-            "2. 用 final_answer() 原样返回 execute_skill 返回的字符串，不要修改、不要格式化、不要提取字段\n\n"
-            "正确示例（直接照抄这个模式）：\n"
-            "```python\n"
-            "result = execute_skill(stock_code=\"600519\", stock_name=\"贵州茅台\")\n"
-            "final_answer(result)\n"
-            "```\n\n"
-            "⚠️ 常见错误（禁止）：\n"
-            "- ❌ 不要用 result['score'] / result.get('score') / result.xxx — result 是 JSON 字符串，不是字典\n"
-            "- ❌ 不要用 f-string 重新格式化输出\n"
-            "- ❌ 不要自己调用底层数据工具\n"
-            "- ❌ 不要修改报告内容\n"
-            "- ✅ 直接 final_answer(result)，一步到位\n\n"
-            "⚠️ 语言要求：所有输出必须使用中文，包括思考过程和代码注释。"
-        )
-
-        sub_agent = CodeAgent(
-            tools=[skill_tool],
-            model=model,
-            max_steps=spec.max_steps,
-            instructions=sub_instructions,
-            name=spec.name,
-            description=spec.description,
-            provide_run_summary=False,
-            verbosity_level=LogLevel.INFO,
-            return_full_result=True,
-            additional_authorized_imports=[
-                "json", "pandas", "numpy", "math", "statistics",
-                "datetime", "collections", "itertools", "re",
-            ],
-            executor_kwargs={"timeout_seconds": int(os.getenv("SUB_AGENT_EXEC_TIMEOUT", "360"))},
-        )
-
-        managed_agents.append(sub_agent)
-        logger.debug(
-            "[ManagedAgent] 构建 %s: max_steps=%d, run_summary=%s",
-            spec.name, spec.max_steps, spec.run_summary,
-        )
-
-    logger.info(
-        "[ManagedAgent] 共构建 %d 个子 agent: %s",
-        len(managed_agents), [ma.name for ma in managed_agents],
-    )
-    return managed_agents
-
 
 # ═══════════════════════════════════════════════════════════════
 # 6. Agent Builder
@@ -793,67 +730,87 @@ def get_smolagent(
 ) -> "CodeAgent | ToolCallingAgent":
     """Build a fresh agent instance per call.
 
-    Caches only the expensive parts (tools discovery, managed agents).
-    Agent instance is always rebuilt to avoid cross-session state pollution.
+    架构：主 Agent 极简（call_skill / execute_chain / search / final_answer），
+    所有数据工具和分析逻辑封装在 Skill/Chain 内部，不暴露给主 Agent。
     """
-    skill_instructions = get_indicator_skill_instructions(skills, user_id)
     smol_model = build_model(model=model, provider=provider)
 
-    # ── 按领域过滤工具（缓存） ────────────────────────────────
-    from app.agent.tools.registry import registry as tool_registry
-    domain_key = domain or "all"
-    with _tools_cache_lock:
-        if domain_key not in _tools_cache_by_domain:
-            tool_registry.discover()
-            if domain:
-                tools = tool_registry.build({"domain": domain, "deny": list(_EXCLUDED_TOOL_NAMES)})
-            else:
-                tools = tool_registry.build({"deny": list(_EXCLUDED_TOOL_NAMES)})
-
-            _tools_cache_by_domain[domain_key] = tools
-        # 始终拷贝，避免修改缓存原始列表
-        tools = list(_tools_cache_by_domain[domain_key])
-
-    # ── 构建子 agent（Managed Agents）──
+    # ── 发现技能 ──
     from app.agent.skills.registry import skill_registry as _skill_registry
     _skill_registry.discover()
-    managed_agents = _build_managed_agents(
-        skill_registry=_skill_registry,
+
+    # ── 构建主 Agent 工具：极简 4 件套 ──
+    from app.agent.skills.skill_executor import SkillExecutionTool
+    from app.agent.chain_executor_tool import ChainExecutionTool
+    from smolagents import FinalAnswerTool
+
+    # 1) call_skill — 调用单个 Skill（内部 Python 函数调用 + 按需 LLM）
+    call_skill_tool = SkillExecutionTool(
+        skill=None,  # 不绑定单个 skill，由 forward 动态选择
+        model=smol_model,
+        collector=collector,
+    )
+    # 覆盖 inputs 让主 Agent 知道有哪些 skill 可用
+    _available_skills = ", ".join(
+        f"{s.name}({s.description})" for s in _skill_registry.all_specs
+    )
+    call_skill_tool.inputs = {
+        "skill_name": {
+            "type": "string",
+            "description": f"技能名。可选值: {_available_skills}",
+            "nullable": True,
+        },
+        "stock_code": {
+            "type": "string",
+            "description": "股票代码，如 600519、000858",
+            "nullable": True,
+        },
+        "stock_name": {
+            "type": "string",
+            "description": "股票名称（可选），如 贵州茅台",
+            "nullable": True,
+        },
+    }
+
+    # 2) execute_chain — 调用 Chain 编排（内部 Python 函数调用 + 按需 LLM）
+    chain_tool = ChainExecutionTool(
         model=smol_model,
         collector=collector,
         user_id=user_id,
     )
 
-    # 主 agent 只保留路由层工具
-    # 按 layer 自动分流：数据层/显示层 → 主 Agent，分析层/决策层 → 子 Agent
-    _MAIN_AGENT_LAYERS = {"数据层", "显示层"}
-    router_tools = [t for t in tools if t.name == "final_answer"
-                    or (tool_registry.get(t.name) and any(l in _MAIN_AGENT_LAYERS for l in tool_registry.get(t.name).layer))]
-    # search_stock_by_name 无 layer 标签但主 Agent 需要
-    if not any(t.name == "search_stock_by_name" for t in router_tools):
-        for t in tools:
-            if t.name == "search_stock_by_name":
-                router_tools.append(t)
-                break
-    # 保底：final_answer 一定有
-    if not any(t.name == "final_answer" for t in router_tools):
-        from smolagents import FinalAnswerTool
-        router_tools.append(FinalAnswerTool())
+    # 3) search_stock_by_name — 轻量搜索
+    search_tool = None
+    from app.agent.tools.registry import registry as tool_registry
+    tool_registry.discover()
+    all_tools = tool_registry.build({"deny": list(_EXCLUDED_TOOL_NAMES)})
+    for t in all_tools:
+        if t.name == "search_stock_by_name":
+            search_tool = t
+            break
 
-    instructions = _build_instructions(
-        user_message, skill_instructions, language, router_tools, managed_agents=managed_agents,
-        domain=domain, domain_instructions=domain_instructions,
+    # 4) final_answer — 输出
+    final_tool = FinalAnswerTool()
+
+    router_tools = [call_skill_tool, chain_tool, final_tool]
+    if search_tool:
+        router_tools.insert(2, search_tool)
+
+    # ── 极简 prompt：只做路由，不做分析 ──
+    instructions = _build_router_instructions(
+        language=language,
+        available_skills=_available_skills,
+        domain=domain,
+        domain_instructions=domain_instructions,
         intent_context=intent_context,
     )
 
     AgentClass = _get_agent_class()
 
-    # ── Always build fresh agent (avoid cross-session state pollution) ──
     _extra_kwargs = {}
     if AgentClass is CodeAgent:
         _extra_kwargs["additional_authorized_imports"] = [
-            "pandas", "numpy", "json", "math", "statistics",
-            "datetime", "collections", "itertools", "re",
+            "json", "datetime",
         ]
         _extra_kwargs["executor_kwargs"] = {"timeout_seconds": int(os.getenv("AGENT_EXEC_TIMEOUT", "300"))}
 
@@ -870,14 +827,12 @@ def get_smolagent(
         stream_outputs=True,
         planning_interval=None,
         final_answer_checks=checks,
-        managed_agents=managed_agents,
         **_extra_kwargs,
     )
 
     logger.info(
-        "[Agent] Built %s for user=%s domain=%s: %d router tools + %d managed agents, max_steps=%d, collector=%s",
-        AgentClass.__name__, user_id, domain_key, len(router_tools), len(managed_agents), max_steps,
-        "yes" if collector else "no",
+        "[Agent] Built %s for user=%s domain=%s: %d router tools (call_skill/execute_chain/search/final_answer), max_steps=%d",
+        AgentClass.__name__, user_id, domain or "all", len(router_tools), max_steps,
     )
     return agent
 

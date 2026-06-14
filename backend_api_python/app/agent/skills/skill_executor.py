@@ -24,21 +24,29 @@ logger = logging.getLogger(__name__)
 
 
 class SkillExecutionTool(Tool):
-    """子 agent 内部工具：执行指定 skill 的完整分析流程。
+    """统一技能调用工具。
 
-    构造时绑定一个具体的 BaseSkill 实例，forward() 调用 BaseSkill.run()。
+    两种模式：
+      1. 绑定单个 skill（skill=实例）— forward(stock_code, stock_name)
+      2. 动态选择 skill（skill=None）— forward(skill_name, stock_code, stock_name)
     """
 
-    name = "execute_skill"
+    name = "call_skill"
     description = (
-        "执行技能分析，传入股票代码，返回结构化分析报告。"
-        "包含评分、方向、信号、因子明细等字段。"
-        "调用此工具后会获取真实数据并完成分析，不需要再调用其他工具。"
+        "调用分析技能对股票进行专业分析。传入技能名和股票代码，"
+        "返回结构化分析报告（评分/方向/信号/因子明细）。"
+        "适用于需要专业维度分析时，如技术面、动量、情报、政策等。"
     )
     inputs = {
+        "skill_name": {
+            "type": "string",
+            "description": "技能名",
+            "nullable": True,
+        },
         "stock_code": {
             "type": "string",
             "description": "股票代码，如 600519、000858",
+            "nullable": True,
         },
         "stock_name": {
             "type": "string",
@@ -51,7 +59,7 @@ class SkillExecutionTool(Tool):
     def __init__(self, skill, model, collector=None):
         """
         Args:
-            skill: BaseSkill 实例
+            skill: BaseSkill 实例，或 None（动态模式，从 skill_name 参数查找）
             model: smolagents Model 实例（用于 call_llm）
             collector: TraceCollector 实例（可选）
         """
@@ -65,20 +73,28 @@ class SkillExecutionTool(Tool):
     _tool_cache_time = 0
     _TOOL_CACHE_TTL = 300  # 5 分钟刷新一次
 
-    def forward(self, stock_code: str, stock_name: str = None) -> str:
+    def forward(self, skill_name: str = "", stock_code: str = "", stock_name: str = None) -> str:
         """执行 skill 分析，返回格式化报告。"""
         import time as _time
         from app.agent.skills.registry import skill_registry
         from app.agent.tool_adapter import build_all_tools
 
-        # 防御：子 agent 可能传入字符串 "None" 而非 Python None
+        # 防御
         if stock_name in (None, "None", "null", "undefined"):
             stock_name = ""
+        if stock_code in (None, "None", "null", "undefined"):
+            stock_code = ""
 
         skill_registry.discover()
-        sk = skill_registry.get(self._skill.name)
-        if not sk:
-            return f"技能 {self._skill.name} 不可用"
+
+        # 动态模式：从 skill_name 查找；绑定模式：用 self._skill
+        if self._skill is not None:
+            sk = self._skill
+        else:
+            sk = skill_registry.get(skill_name)
+            if not sk:
+                available = ", ".join(skill_registry.all_names)
+                return f"未知技能: {skill_name}。可用技能: {available}"
 
         # 构建工具集（带缓存）
         now = _time.time()
@@ -109,16 +125,16 @@ class SkillExecutionTool(Tool):
                 call_tool_fn=call_tool_fn,
             )
         except Exception as e:
-            logger.error("[SkillExecution] Skill %s 执行异常: %s", self._skill.name, e)
+            logger.error("[SkillExecution] Skill %s 执行异常: %s", sk.name, e)
             return json.dumps({
-                "skill_name": self._skill.name,
+                "skill_name": sk.name,
                 "status": "failed",
                 "error": str(e),
             }, ensure_ascii=False)
 
         # 通知 TraceCollector
         if self._collector:
-            self._collector.on_skill_call(self._skill.name, report, eval_node)
+            self._collector.on_skill_call(sk.name, report, eval_node)
 
         # 持久化 EvalNode（仅非金融领域）
         if not self._collector:
@@ -129,7 +145,7 @@ class SkillExecutionTool(Tool):
 
                 root = EvalNode(
                     layer=Layer.CHAIN.value,
-                    name=f"call_skill+{self._skill.name}",
+                    name=f"call_skill+{sk.name}",
                     exec_date=date.today(),
                     stock_code=stock_code,
                     stock_name=stock_name or "",
@@ -143,7 +159,7 @@ class SkillExecutionTool(Tool):
                 root_id = chain_store.save_tree(root)
                 if root_id:
                     logger.info("[SkillExecution] 写库成功 root_id=%d skill=%s stock=%s",
-                                root_id, self._skill.name, stock_code)
+                                root_id, sk.name, stock_code)
             except Exception as e:
                 logger.warning("[SkillExecution] 写库失败（不影响返回）: %s", e)
 
