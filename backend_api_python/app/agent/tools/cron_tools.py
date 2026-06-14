@@ -112,6 +112,7 @@ def create_cron_job(
     prompt: str = "",
     function_path: str = "",
     description: str = "",
+    one_shot: bool = False,
 ) -> Dict[str, Any]:
     """创建 Agent 定时任务。
 
@@ -122,6 +123,7 @@ def create_cron_job(
         prompt: mode=prompt 时必填，Agent 执行的消息内容
         function_path: mode=function 时必填，Python 函数点分路径（如 "app.agent.chain.evaluator.auto_evaluate"）
         description: 任务描述（可选）
+        one_shot: True=执行一次后自动删除，False=按 cron 循环执行（默认）
 
     Returns:
         创建结果，含 job_id
@@ -160,13 +162,14 @@ def create_cron_job(
         with _get_db() as conn:
             cur = conn.cursor()
             cur.execute("""
-                INSERT INTO qd_cron_jobs (name, cron_expr, mode, prompt, function_path, description)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO qd_cron_jobs (name, cron_expr, mode, prompt, function_path, description, one_shot)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
             """, (name.strip(), cron_expr.strip(), mode,
                   prompt.strip() if prompt else None,
                   function_path.strip() if function_path else None,
-                  description.strip() if description else None))
+                  description.strip() if description else None,
+                  one_shot))
             row = cur.fetchone()
             conn.commit()
             job_id = row["id"]
@@ -186,8 +189,9 @@ def create_cron_job(
             "name": name.strip(),
             "cron_expr": cron_expr.strip(),
             "mode": mode,
+            "one_shot": one_shot,
             "status": "已创建",
-            "提示": "任务已创建，cron_worker 将在下一个匹配时间点自动触发执行",
+            "提示": "任务已创建" + ("，执行一次后自动删除" if one_shot else "，cron_worker 将在下一个匹配时间点自动触发执行"),
         }
     except Exception as e:
         logger.error("[CronTool] 创建定时任务失败: %s", e)

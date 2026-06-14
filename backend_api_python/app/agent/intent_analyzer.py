@@ -102,10 +102,10 @@ _INTENT_PROMPT = """你是意图分类器。分析用户消息，输出 JSON。
 ## 输出格式（只输出 JSON，不要其他内容）
 ```json
 {{
-  "domain": "finance | coding | chat",
-  "intent": "stock_analysis | chart_view | market_scan | screener | backtest | fund_flow | indicator | trading | stock_info | concept_explain | code_modify | code_create | project_scan | general",
-  "verb": "analyze | view | filter | backtest | execute | query | explain | modify | create",
-  "noun": "stock | chart | market | screener | fund_flow | indicator | trading | concept | code | project",
+  "domain": "finance | coding | trading | system | unknown | chat",
+  "intent": "stock_analysis | chart_view | market_scan | screener | backtest | fund_flow | indicator | trading | stock_info | concept_explain | code_modify | code_create | project_scan | reminder | cron_manage | settings | unknown | general",
+  "verb": "analyze | view | filter | backtest | execute | query | explain | modify | create | remind | schedule | configure",
+  "noun": "stock | chart | market | screener | fund_flow | indicator | trading | concept | code | project | reminder | cron | settings",
   "stock_code": "6位代码或空",
   "stock_name": "股票名称或空",
   "confidence": 0.0-1.0,
@@ -114,7 +114,7 @@ _INTENT_PROMPT = """你是意图分类器。分析用户消息，输出 JSON。
 ```
 
 ## 规则
-- domain: finance=金融分析/股票/行情/资金, coding=代码/项目/开发, chat=闲聊/问候
+- domain: finance=金融分析/股票/行情/资金, coding=代码/项目/开发, trading=交易执行/持仓/策略启停, system=定时提醒/任务调度/设置, unknown=无法判断领域, chat=闲聊/问候
 - 有股票名称或代码 → domain=finance, verb=analyze, noun=stock
 - 用户说"怎么样/能买吗/跌了/涨了"等，且提到股票 → finance/stock_analysis
 - 用户问K线/图表 → finance/chart_view
@@ -123,11 +123,16 @@ _INTENT_PROMPT = """你是意图分类器。分析用户消息，输出 JSON。
 - 用户要回测 → finance/backtest
 - 用户问资金流向/主力/北向 → finance/fund_flow
 - 用户问MACD/RSI/指标 → finance/indicator
-- 用户要买入/卖出/持仓 → finance/trading
+- 用户要买入/卖出/持仓/启停策略 → trading/trading
 - 用户问市盈率/市值/基本面 → finance/stock_info
 - 用户问概念/术语 → finance/concept_explain
 - 纯闲聊/问候 → domain=chat
-- confidence: 有明确股票信号=0.9+, 有金融关键词=0.7+, 不确定=0.5-
+- 用户要设置提醒/定时/闹钟/倒计时/几分钟后 → system/reminder
+- 用户要查看/管理/取消定时任务 → system/cron_manage
+- 用户要修改系统设置/配置 → system/settings
+- system 意图不需要调用分析工具，reminder 直接创建定时提醒
+- confidence: 有明确信号=0.9+, 有关键词=0.7+, 不确定=0.5-, 猜测=0.3
+- 意图不明确时（没有匹配到上述任何规则），intent 填 "unknown"，confidence 填 0.3，不要猜测
 - context_summary: 压缩为一句话摘要，供下轮对话使用
 """
 
@@ -143,6 +148,10 @@ _INTENT_TOOL_CATEGORIES = {
     "trading": ["交易", "指标策略"],
     "stock_info": ["名称查询", "行情数据"],
     "concept_explain": [],
+    "reminder": [],
+    "cron_manage": [],
+    "settings": [],
+    "unknown": [],
     "code_modify": ["工作区"],
     "code_create": ["工作区"],
     "project_scan": [],
@@ -223,7 +232,7 @@ def _parse_intent_json(raw: str) -> Dict[str, Any]:
 
 def _validate_intent(data: Dict[str, Any]) -> Dict[str, Any]:
     """校验并修正 LLM 输出的字段。"""
-    valid_domains = {"finance", "coding", "chat"}
+    valid_domains = {"finance", "coding", "trading", "system", "unknown", "chat"}
     if data.get("domain") not in valid_domains:
         data["domain"] = "chat"
 

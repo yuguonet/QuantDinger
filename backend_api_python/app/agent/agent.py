@@ -806,6 +806,19 @@ class _AgentExecutor:
                     skip_agent_reply = _quick_replies.get(intent.intent, "你好！有什么需要帮忙的？")
                     logger.info("[Intent] Quick-reply for %s, skipping agent", intent.intent)
 
+                # ── 未知意图：反问用户，不瞎猜 ──
+                # cron 触发的消息没有用户可问，直接结束不进 agent
+                _is_cron = context and context.get("source") == "cron"
+                if (domain == "unknown" or intent.intent == "unknown") and intent.confidence <= 0.4:
+                    if _is_cron:
+                        skip_agent = True
+                        skip_agent_reply = ""
+                        logger.info("[Intent] Cron unknown intent (conf=%.2f), skipping agent", intent.confidence)
+                    else:
+                        skip_agent = True
+                        skip_agent_reply = "没太明白你的意思，能说得具体一点吗？比如是要分析股票、看行情、设提醒，还是其他什么？"
+                        logger.info("[Intent] Unknown intent (conf=%.2f, domain=%s), asking for clarification", intent.confidence, domain)
+
             except Exception as e:
                 import traceback
                 logger.warning("[Intent] 分析失败，走默认流程: %s\n%s", e, traceback.format_exc())

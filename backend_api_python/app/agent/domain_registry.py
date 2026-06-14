@@ -6,10 +6,12 @@ Domain Registry — 领域注册与管理。
 意图分析器（intent_analyzer）根据识别出的 domain 注入对应的系统提示。
 
 内置领域：
-  finance  — 金融分析（A股中短线特化）
-  trading  — 交易执行（策略启停/持仓管理）
-  coding   — 代码开发（项目扫描/文件操作）
-  chat     — 闲聊/问候（跳过 agent 直接回复）
+  finance   — 金融分析（A股中短线特化）
+  trading   — 交易执行（策略启停/持仓管理）
+  coding    — 代码开发（项目扫描/文件操作）
+  system    — 系统管理（定时提醒/任务调度/设置）
+  unknown   — 无法判断领域（降级或反问）
+  chat      — 闲聊/问候（跳过 agent 直接回复）
 
 被调用方：
   intent_analyzer.py → init_builtin_domains() + get_domain()
@@ -164,6 +166,37 @@ def init_builtin_domains():
             "• 大额操作（仓位>20%）需二次确认"
         ),
         tool_categories=["交易执行"],
+    ))
+
+    # ── 系统管理 ──
+    register_domain(DomainConfig(
+        name="system",
+        description="定时提醒、定时任务管理、系统设置",
+        instructions=(
+            "你是一个系统管理助手，负责处理定时提醒和任务调度。\n"
+            "\n"
+            "## 提醒创建流程\n"
+            "1. 解析用户消息中的时间信息（如'2分钟后'、'明天9点'）\n"
+            "2. 使用 create_cron_job 工具创建定时任务\n"
+            "3. 一次性提醒必须设置 one_shot=True，执行完自动删除\n"
+            "4. 循环任务（如'每天9点'）使用 one_shot=False\n"
+            "5. 任务的 prompt 应包含具体的提醒内容\n"
+            "6. 告知用户提醒已创建\n"
+            "\n"
+            "## 注意\n"
+            "- 时间解析要准确：'2分钟后' = 当前时间+2分钟\n"
+            "- 如果用户没有指定提醒内容，默认提醒'时间到了，请查看结果'\n"
+            "- 创建完成后回复用户确认"
+        ),
+        tool_categories=["定时任务"],
+    ))
+
+    # ── 未知领域 ──
+    register_domain(DomainConfig(
+        name="unknown",
+        description="无法判断领域，需要用户澄清或降级处理",
+        instructions="",
+        tools=[],
     ))
 
     # ── 闲聊 ──

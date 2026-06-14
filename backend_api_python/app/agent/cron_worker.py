@@ -166,13 +166,19 @@ def _execute_prompt_job(job: Dict[str, Any]):
     try:
         from app.agent.agent import build_agent_executor
         from app.agent.skills.registry import skill_registry
+        from app.agent.intent_analyzer import analyze_intent
         skill_registry.discover()
+
+        # 先做意图分析，拿到 domain 以过滤工具
+        intent = analyze_intent(prompt, session_id=f"cron_{job_id}")
+        domain = intent.domain if intent else "unknown"
 
         executor = build_agent_executor(
             skills=skill_registry.all_names,
             user_id="cron",
             max_steps=8,
             timeout_seconds=120,
+            domain=domain,
         )
 
         session_id = f"cron_{job_id}_{int(_time.time())}"
@@ -200,8 +206,11 @@ def _execute_prompt_job(job: Dict[str, Any]):
         _publish(_make_event("job_error", job_id, job_name, mode="prompt", error=str(e)))
         logger.error("[CronWorker] ❌ prompt 任务异常: %s — %s", job_name, e, exc_info=True)
     finally:
-        # 执行完毕 → 调度下一次
-        _reschedule_job(job_id)
+        # 一次性任务：执行完直接删除，不循环
+        if job.get("one_shot"):
+            _delete_one_shot(job_id, job_name)
+        else:
+            _reschedule_job(job_id)
 
 
 def _execute_function_job(job: Dict[str, Any]):
@@ -224,7 +233,10 @@ def _execute_function_job(job: Dict[str, Any]):
         _publish(_make_event("job_error", job_id, job_name, mode="function", error=str(e)))
         logger.error("[CronWorker] ❌ function 任务异常: %s — %s", job_name, e, exc_info=True)
     finally:
-        _reschedule_job(job_id)
+        if job.get("one_shot"):
+            _delete_one_shot(job_id, job_name)
+        else:
+            _reschedule_job(job_id)
 
 
 def _update_job_status(job_id: int, success: bool, error: str = ""):
@@ -292,6 +304,19 @@ def _schedule_job(job_id: int, job: dict, delay_seconds: float):
                      run_at.strftime("%Y-%m-%d %H:%M:%S"))
 
 
+def _delete_one_shot(job_id: int, job_name: str):
+    """一次性任务执行完后删除。"""
+    try:
+        from app.utils.db import get_db_connection
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM qd_cron_jobs WHERE id = %s", (job_id,))
+            conn.commit()
+        logger.info("[CronWorker] 🗑️ 一次性任务 %d (%s) 已删除", job_id, job_name)
+    except Exception as e:
+        logger.error("[CronWorker] 删除一次性任务 %d 失败: %s", job_id, e)
+
+
 def _reschedule_job(job_id: int):
     """从 DB 重新读取任务，计算下次时间，设定 Timer。"""
     try:
@@ -299,7 +324,7 @@ def _reschedule_job(job_id: int):
         with get_db_connection() as conn:
             cur = conn.cursor()
             cur.execute("""
-                SELECT id, name, cron_expr, mode, prompt, function_path, enabled
+                SELECT id, name, cron_expr, mode, prompt, function_path, enabled, one_shot
                 FROM qd_cron_jobs WHERE id = %s
             """, (job_id,))
             row = cur.fetchone()
@@ -347,7 +372,7 @@ def _load_and_schedule_all():
         with get_db_connection() as conn:
             cur = conn.cursor()
             cur.execute("""
-                SELECT id, name, cron_expr, mode, prompt, function_path
+                SELECT id, name, cron_expr, mode, prompt, function_path, one_shot
                 FROM qd_cron_jobs WHERE enabled = TRUE
             """)
             rows = cur.fetchall()

@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS qd_cron_jobs (
     prompt          TEXT,                            -- mode=prompt 时的 Agent 消息
     function_path   VARCHAR(256),                    -- mode=function 时的 Python 函数路径
     description     TEXT,                            -- 任务描述
+    one_shot        BOOLEAN NOT NULL DEFAULT FALSE,  -- TRUE=执行一次后自动删除
     enabled         BOOLEAN NOT NULL DEFAULT TRUE,
     last_run_at     TIMESTAMPTZ,
     last_success_at TIMESTAMPTZ,
@@ -25,3 +26,4 @@ COMMENT ON TABLE qd_cron_jobs IS 'Agent 定时任务';
 COMMENT ON COLUMN qd_cron_jobs.cron_expr IS '5段式: 分 时 日 月 周, 如 0 18 * * 1-5';
 COMMENT ON COLUMN qd_cron_jobs.mode IS 'prompt=调agent.chat, function=直接调Python函数';
 COMMENT ON COLUMN qd_cron_jobs.function_path IS '点分路径: app.agent.chain.evaluator.auto_evaluate';
+COMMENT ON COLUMN qd_cron_jobs.one_shot IS 'TRUE=执行一次后自动删除，FALSE=按cron循环调度';

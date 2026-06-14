@@ -2,24 +2,14 @@
     "analyze+stock": {
         "steps": [
             {
-                "tool": "call_skill",
-                "args": {
-                    "skill_name": "technical_agent"
-                },
-                "desc": "技术面+动量分析专家（先走 Skill 获取标准化报告）"
-            },
-            {
-                "tool": "call_skill",
-                "args": {
-                    "skill_name": "market_data_agent"
-                },
-                "desc": "行情+概念+资金验证（按需）"
+                "tool": "python_interpreter",
+                "desc": ""
             }
         ],
         "stats": {
-            "avg_steps": 3.28,
-            "executions": 7,
-            "success_count": 7,
+            "avg_steps": 3.37,
+            "executions": 8,
+            "success_count": 8,
             "success_rate": 1.0,
             "last_updated": "2026-06-14"
         }
@@ -607,6 +597,31 @@
             "avg_steps": 3.0,
             "executions": 1,
             "success_count": 1,
+            "success_rate": 1.0,
+            "last_updated": "2026-06-14"
+        }
+    },
+    "unknown+unknown": {
+        "steps": [],
+        "stats": {
+            "avg_steps": 3.0,
+            "executions": 2,
+            "success_count": 2,
+            "success_rate": 1.0,
+            "last_updated": "2026-06-14"
+        }
+    },
+    "remind+reminder": {
+        "steps": [
+            {
+                "tool": "python_interpreter",
+                "desc": ""
+            }
+        ],
+        "stats": {
+            "avg_steps": 2.0,
+            "executions": 2,
+            "success_count": 2,
             "success_rate": 1.0,
             "last_updated": "2026-06-14"
         }
