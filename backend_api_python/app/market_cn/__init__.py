@@ -45,7 +45,6 @@ from .hot_sectors import (
 )
 from .sector_history import (
     SectorAnalyzer,
-    SectorHistoryScheduler,
 )
 from .china_market import (
     get_fear_greed,
