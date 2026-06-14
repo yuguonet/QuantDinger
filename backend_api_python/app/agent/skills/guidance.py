@@ -27,23 +27,26 @@ GUIDANCE = """## 核心规则
 **核心原理：价格折扣一切。** 政策、消息、基本面最终都反映在价格上。
 分析必须从客观数据出发，而非从消息/新闻出发。
 
-**分析顺序（强制）：**
+**⚠️ 无链路匹配时，必须先调 call_skill，不要直接调底层工具。**
+call_skill 内部已集成完整的数据优先流程，输出标准化报告并自动写入回溯系统。
 
-**第一步 — 数据基石（必须先做，100%可获取）：**
+**Skill 内部数据优先顺序（供参考，由 Skill 自动执行）：**
+
+**第一步 — 数据基石（Skill 内部自动完成）：**
   1. 行情数据 → get_realtime_quote：实时价格、涨跌幅、量比、换手率
   2. 技术指标 → get_indicator_snapshot：一次获取全部指标（MACD/RSI/KDJ/BOLL/MA/量能）
   3. K线形态 → get_kline：近期走势、支撑阻力、形态识别
 
   → 这三步完成后，你已经有了判断的**客观基础**。
 
-**第二步 — 数据深化（基于第一步结果决定是否需要）：**
+**第二步 — 数据深化（Skill 内部按需执行）：**
   4. 资金流向 → get_stock_fund_flow：主力/北向资金（验证价格趋势的驱动力）
   5. 板块联动 → get_sector_analysis：行业/概念板块（验证是否有板块支撑）
   6. 筹码分布 → get_chip_distribution：持仓成本分布（判断支撑/压力位）
 
   → 这些数据用来**验证和深化**第一步的判断，不是独立判断依据。
 
-**第三步 — 信息补充（可选，仅在数据提示异常时使用）：**
+**第三步 — 信息补充（Skill 内部仅在异常信号时执行）：**
   7. 新闻/舆情 → search_comprehensive_intel：仅当技术面出现异常信号（如突然放量跌停）时，搜索原因
   8. 龙虎榜 → get_dragon_tiger_by_stock：仅当出现涨停/跌停时，查看资金博弈
   9. 解禁/减持 → get_lockup_schedule：仅当中长线分析时，查看供给端风险
@@ -60,15 +63,13 @@ GUIDANCE = """## 核心规则
 
 ### 综合个股分析（标准流程）
 
-按"数据优先"框架执行：
-1. get_realtime_quote → 获取实时行情
-2. get_indicator_snapshot → 获取全部技术指标
-3. 基于数据形成初步判断
-4. 按需调用第二步工具验证
-5. 仅在异常信号时调用第三步工具
-6. 综合判断，用 final_answer 返回
+1. `call_skill(skill_name="technical_agent", stock_code="代码")` — 先走 Skill 获取标准化报告
+2. 基于 Skill 报告的评分/方向/信号形成初步判断
+3. 按需追加其他 Skill 验证（market_data_agent / intelligence_agent 等）
+4. 综合判断，用 final_answer 返回
 
 **禁止行为：**
+- ❌ 跳过 call_skill 直接调 get_realtime_quote / get_indicator_snapshot（Skill 内部已调用）
 - ❌ 先搜新闻再看价格（新闻可能没有，价格永远有）
 - ❌ 用"政策利好"替代技术面分析（政策反映在价格里了）
 - ❌ 因为"消息面好"就忽略技术面的卖出信号

@@ -2,8 +2,18 @@
     "analyze+stock": {
         "steps": [
             {
-                "tool": "python_interpreter",
-                "desc": ""
+                "tool": "call_skill",
+                "args": {
+                    "skill_name": "technical_agent"
+                },
+                "desc": "技术面+动量分析专家（先走 Skill 获取标准化报告）"
+            },
+            {
+                "tool": "call_skill",
+                "args": {
+                    "skill_name": "market_data_agent"
+                },
+                "desc": "行情+概念+资金验证（按需）"
             }
         ],
         "stats": {
@@ -40,8 +50,11 @@
     "analyze+market": {
         "steps": [
             {
-                "tool": "python_interpreter",
-                "desc": ""
+                "tool": "call_skill",
+                "args": {
+                    "skill_name": "market_data_agent"
+                },
+                "desc": "市场数据专家（板块/概念/资金/指数全景）"
             }
         ],
         "stats": {

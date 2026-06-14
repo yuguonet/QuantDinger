@@ -41,6 +41,7 @@ const locale = {
   'menu.dashboard.xuangu': '选股器',
   'menu.dashboard.shichang': '市场看板',
   'menu.dashboard.aiAgent': 'AI智能体',
+  'menu.dashboard.cronJobs': '定时任务',
   // ---- 交易机器人页 ----
   'trading-bot.pageTitle': '交易机器人',
   'trading-bot.pageSubtitle': '创建并管理你的自动交易机器人',

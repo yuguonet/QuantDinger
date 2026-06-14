@@ -41,6 +41,7 @@ const locale = {
   'menu.dashboard.xuangu': 'Stock Screener',
   'menu.dashboard.shichang': 'Market Dashboard',
   'menu.dashboard.aiAgent': 'AI Agent',
+  'menu.dashboard.cronJobs': 'Cron Jobs',
   // ---- Trading Bot Page ----
   'trading-bot.pageTitle': 'Trading Bots',
   'trading-bot.pageSubtitle': 'Create and manage your automated trading bots',
