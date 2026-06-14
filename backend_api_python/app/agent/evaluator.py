@@ -401,25 +401,26 @@ def _evaluate_generic(agent_result, result, tool_chain, verb, noun) -> EvalResul
     else:
         score_chain = -1
 
-    # ── 信号 3: 步骤效率 ─────────────────────────────────────
+    # ── 信号 3: 步骤效率（绝对步数评判）────────────────────
+    # 最佳 2-4 步：Agent 高效完成，chain 建议精准
+    # 1 步：可能跳过了必要的分析维度
+    # 5-6 步：偏多但可接受
+    # 7+ 步：低效，chain 建议不佳或 Agent 迷路
     if result.chain_length > 0:
         result.step_efficiency = result.steps_taken / result.chain_length
     else:
         result.step_efficiency = 0
 
     score_steps = 0
-    if result.chain_length == 0:
-        score_steps = 0
-    elif result.steps_taken <= result.chain_length + 1:
-        score_steps = 2
-    elif result.steps_taken <= result.chain_length * 1.5:
-        score_steps = 1
-    elif result.steps_taken <= result.chain_length * 2:
-        score_steps = 0
-    elif result.steps_taken <= result.chain_length * 3:
-        score_steps = -2
-    else:
-        score_steps = -3
+    if 2 <= result.steps_taken <= 4:
+        score_steps = 2    # 最佳区间
+    elif result.steps_taken == 1:
+        score_steps = 0    # 可能过于简单
+    elif 5 <= result.steps_taken <= 6:
+        score_steps = 0    # 偏多但可接受
+    elif result.steps_taken >= 7:
+        score_steps = -2   # 低效，chain 无价值
+    # steps_taken == 0 通常是 agent 未执行，不加分
 
     # ── 信号 4: final_answer ──────────────────────────────────
     score_answer = 2 if result.has_final_answer else -2
@@ -486,6 +487,7 @@ def learn_from_execution(
 ):
     """根据评估结果执行闭环动作。
 
+    - 每次执行 → 更新统计（avg_steps, executions, success_rate）
     - success → 写回/强化 tool_chains.json
     - failure → 记录到 tool_chain_failures.json
     - grey → 不操作
@@ -494,6 +496,18 @@ def learn_from_execution(
     if not verb or not noun:
         logger.debug("[Learn] verb 或 noun 为空，跳过学习: verb=%s noun=%s", verb, noun)
         return
+
+    # ── 每次都更新统计 ──
+    try:
+        from app.agent.router.tool_chains import update_chain_stats
+        update_chain_stats(
+            verb=verb,
+            noun=noun,
+            steps_taken=eval_result.steps_taken or 0,
+            success=(eval_result.verdict == "success"),
+        )
+    except Exception as e:
+        logger.warning("[Learn] 统计更新失败: %s", e)
 
     if eval_result.verdict == "success":
         _writeback_chain(eval_result, verb, noun)

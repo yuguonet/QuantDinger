@@ -403,6 +403,13 @@ def format_intent_for_agent(intent: IntentResult, original_message: str) -> str:
 
     tool_chain = intent.metadata.get("tool_chain", [])
     if tool_chain:
+        # 获取链路统计
+        try:
+            from app.agent.router.tool_chains import get_chain_stats
+            _stats = get_chain_stats(intent.verb or "", intent.noun or "")
+        except Exception:
+            _stats = {}
+
         parts.append("[工具链] 建议执行步骤（按优先级，遇到失败可自行调整）:")
         for i, step in enumerate(tool_chain, 1):
             tool = step['tool']
@@ -412,6 +419,14 @@ def format_intent_for_agent(intent: IntentResult, original_message: str) -> str:
                 parts.append(f"  {i}. call_skill(skill_name=\"{args['skill_name']}\") — {desc}")
             else:
                 parts.append(f"  {i}. {tool} — {desc}")
+
+        # 注入统计参考
+        if _stats.get("executions", 0) > 0:
+            parts.append(
+                f"  [统计] 历史平均 {_stats['avg_steps']:.1f} 步, "
+                f"成功率 {_stats['success_rate']:.0%}, "
+                f"执行 {_stats['executions']} 次"
+            )
         parts.append("  以上为建议顺序，可自行调整。")
 
     if intent.confidence < 0.6:

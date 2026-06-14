@@ -951,16 +951,6 @@ class _AgentExecutor:
                 model="intent-quick-reply", error=None,
             )
 
-        # ── 链路执行：优先匹配编排链路，不匹配时降级到 agent ──
-        _intent_verb = meta.get("intent_verb", "")
-        _intent_noun = meta.get("intent_noun", "")
-        chain_result = self._try_chain(
-            _intent_verb, _intent_noun, message, session_id, context, user_id,
-        )
-        if chain_result is not None:
-            store.add_message(session_id, "assistant", chain_result.content)
-            return chain_result
-
         # 保存意图信息，供后置评估使用
         _intent_verb = meta.get("intent_verb", "")
         _intent_noun = meta.get("intent_noun", "")
@@ -1356,30 +1346,6 @@ class _AgentExecutor:
                 "error": None,
                 "total_steps": 0,
                 "model": "intent-quick-reply",
-                "session_id": session_id,
-            }
-            return
-
-        # ── 链路执行：优先匹配编排链路，不匹配时降级到 agent ──
-        _intent_verb = meta.get("intent_verb", "")
-        _intent_noun = meta.get("intent_noun", "")
-        chain_result = self._try_chain(
-            _intent_verb, _intent_noun, message, session_id, context, user_id,
-        )
-        if chain_result is not None:
-            store.add_message(session_id, "assistant", chain_result.content)
-            yield {
-                "type": "generating",
-                "step": 0,
-                "message": chain_result.content,
-            }
-            yield {
-                "type": "done",
-                "success": chain_result.success,
-                "content": chain_result.content,
-                "error": chain_result.error,
-                "total_steps": chain_result.total_steps,
-                "model": chain_result.model,
                 "session_id": session_id,
             }
             return
