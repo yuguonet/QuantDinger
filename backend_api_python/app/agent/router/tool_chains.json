@@ -98,8 +98,16 @@
     ],
     "view+market": [
         {
-            "tool": "python_interpreter",
-            "desc": ""
+            "tool": "get_market_indices",
+            "desc": "获取大盘指数"
+        },
+        {
+            "tool": "get_zt_pool",
+            "desc": "获取涨停池"
+        },
+        {
+            "tool": "get_sector_rankings",
+            "desc": "获取板块排名"
         }
     ],
     "view+fund_flow": [

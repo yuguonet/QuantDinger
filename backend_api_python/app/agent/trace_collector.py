@@ -78,13 +78,6 @@ class TraceCollector:
         self.skill_nodes.append(skill_node)
         self.skill_reports.append(report)
 
-    def on_chain_complete(self, root_node: EvalNode):
-        """Chain 执行完成回调。由 ChainExecutionTool 触发。"""
-        # Chain 已经内部处理了 EvalNode 树，这里只记录日志
-        if root_node and root_node.children:
-            logger.info("[TraceCollector] Chain 完成: %d 个 Skill 节点",
-                        len([c for c in root_node.children if c.layer == Layer.SKILL.value]))
-
     def on_agent_finish(self, final_answer: str, total_steps: int,
                         total_tokens: int, model: str) -> EvalNode:
         """Agent 结束，构建完整 EvalNode 树并存库。"""

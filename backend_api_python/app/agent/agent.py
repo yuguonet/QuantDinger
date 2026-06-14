@@ -64,18 +64,6 @@ _EXCLUDED_TOOL_NAMES = {
     "get_limit_down_stocks", "get_broken_board_stocks",
 }
 
-# ── 金融领域主 Agent 可见工具白名单 ──────────────────────────
-# 底层数据/分析工具只在 Skill 内部可用，不暴露给主 Agent。
-# 主 Agent 通过 call_skill 间接调用，Skill 内部通过 build_all_tools() 获取完整工具集。
-_ISOLATED_TOOL_NAMES = {
-    "final_answer",
-    "search_stock_by_name",
-    "execute_chain",
-    "list_project_files",
-    "read_project_file",
-    "grep_project",
-}
-
 
 # ── Per-user agent cache (tools + managed agents only) ────────
 _tools_cache_by_domain: Dict[str, List] = {}       # key: domain → tools list
@@ -296,9 +284,7 @@ final_answer({{
 0. **⚠️ 必须用 final_answer() 返回结果** — 完成任务后，必须调用 `final_answer(你的回复)` 来结束。
 1. **不需要工具的消息，第一步就 final_answer** — 打招呼、闲聊等直接调用 final_answer。
 2. **必须调用工具获取真实数据** — 绝不编造数字。
-3. **⚠️ 分析股票用 call_skill 或 execute_chain** — 你没有底层数据/分析工具。
-   - 单维度分析（如"技术面分析600519"）→ `call_skill`
-   - 全面分析（如"分析贵州茅台"、"帮我看看600519"）→ `execute_chain`
+3. **⚠️ 分析股票必须先调 call_skill** — 不要直接调底层工具（get_realtime_quote、analyze_trend 等），先用 `call_skill(skill_name="technical_agent", stock_code="代码")` 获取标准化报告，再按需调其他 skill。
 3. **深度优先** — 分析深度不够时用 Python 代码做量化分析。
 4. **风险优先** — 分析必须包含风险提示。
 5. **工具失败处理** — 记录失败原因，用已有数据继续，不重复调用。
@@ -665,20 +651,10 @@ def get_smolagent(
         # 始终拷贝，避免修改缓存原始列表
         tools = list(_tools_cache_by_domain[domain_key])
 
-    # ── 金融领域：主 Agent 只暴露隔离工具，底层工具不传入 ────
-    if domain == "finance":
-        tools = [t for t in tools if t.name in _ISOLATED_TOOL_NAMES]
-
     # ── CallSkillTool（替代 managed_agents）──
     from app.agent.skills.call_skill_tool import CallSkillTool
     call_skill = CallSkillTool(model=smol_model, user_id=user_id, collector=collector)
     tools.append(call_skill)
-
-    # ── 金融领域：ChainExecutionTool（多 Skill 编排 + 跨维度综合）──
-    if domain == "finance":
-        from app.agent.chain_executor_tool import ChainExecutionTool
-        chain_exec = ChainExecutionTool(model=smol_model, collector=collector, user_id=user_id)
-        tools.append(chain_exec)
 
     # ── 金融领域：用 TracedTool 包装所有工具 ──────────────────
     if collector:
@@ -975,10 +951,9 @@ class _AgentExecutor:
                 model="intent-quick-reply", error=None,
             )
 
-        # ── 链路执行：检测是否有匹配的编排链路 ───────────────
+        # ── 链路执行：优先匹配编排链路，不匹配时降级到 agent ──
         _intent_verb = meta.get("intent_verb", "")
         _intent_noun = meta.get("intent_noun", "")
-        _eval_domain = meta.get("domain", "")
         chain_result = self._try_chain(
             _intent_verb, _intent_noun, message, session_id, context, user_id,
         )
@@ -1385,30 +1360,29 @@ class _AgentExecutor:
             }
             return
 
-        # ── 链路执行：检测是否有匹配的编排链路 ───────────────
+        # ── 链路执行：优先匹配编排链路，不匹配时降级到 agent ──
         _intent_verb = meta.get("intent_verb", "")
         _intent_noun = meta.get("intent_noun", "")
-        _stream_domain_check = meta.get("domain", "")
         chain_result = self._try_chain(
             _intent_verb, _intent_noun, message, session_id, context, user_id,
         )
         if chain_result is not None:
-                store.add_message(session_id, "assistant", chain_result.content)
-                yield {
-                    "type": "generating",
-                    "step": 0,
-                    "message": chain_result.content,
-                }
-                yield {
-                    "type": "done",
-                    "success": chain_result.success,
-                    "content": chain_result.content,
-                    "error": chain_result.error,
-                    "total_steps": chain_result.total_steps,
-                    "model": chain_result.model,
-                    "session_id": session_id,
-                }
-                return
+            store.add_message(session_id, "assistant", chain_result.content)
+            yield {
+                "type": "generating",
+                "step": 0,
+                "message": chain_result.content,
+            }
+            yield {
+                "type": "done",
+                "success": chain_result.success,
+                "content": chain_result.content,
+                "error": chain_result.error,
+                "total_steps": chain_result.total_steps,
+                "model": chain_result.model,
+                "session_id": session_id,
+            }
+            return
 
         t0 = time.time()
         _stream_tool_calls = []  # 收集流式执行中的工具调用

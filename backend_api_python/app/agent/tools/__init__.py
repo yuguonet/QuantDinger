@@ -13,3 +13,10 @@ Tools — 工具包。
   显示层 — chart_tools
   支撑层 — code_workspace_tools / self_modify_tools / iteration_tools / tool_chain_tools / scan_tools
 """
+# 注册翻页工具
+try:
+    from app.agent.tools.pagination import register_page_tool
+    register_page_tool()
+except Exception as _e:
+    import logging
+    logging.getLogger(__name__).warning("[Tools] 注册翻页工具失败: %s", _e)
