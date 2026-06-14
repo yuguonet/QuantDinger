@@ -88,14 +88,16 @@ def _refresh_daily():
 
 
 def _refresh_post_market():
-    """盘后数据: 龙虎榜/北向日级/情绪历史/资金流日级（非盘中才跑）"""
+    """盘后数据: 龙虎榜/北向日级/情绪历史/资金流日级/板块统计（非盘中才跑）"""
     from app.market_cn.dragon_limit import refresh_dragon_tiger
     from app.market_cn.index import refresh_northbound_daily, refresh_market_fund_flow_daily
     from app.market_cn.emotion import refresh_emotion_cycle
+    from app.market_cn.sector_history import collect_sector_daily
 
     _run_all("post_market", [
         refresh_dragon_tiger, refresh_northbound_daily,
         refresh_market_fund_flow_daily, refresh_emotion_cycle,
+        collect_sector_daily,
     ])
 
 
@@ -130,12 +132,54 @@ def _refresh_fast():
 
 
 # ═══════════════════════════════════════════════════════════
+#  涨跌停池 — 自适应间隔
+#  9:30~10:00  → 60 秒（开盘密集变动期）
+#  其它盘中    → 300 秒
+#  非盘中      → 不执行
+# ═══════════════════════════════════════════════════════════
+
+_DRAGON_FAST_START = 930    # 9:30
+_DRAGON_FAST_END   = 1000   # 10:00
+_DRAGON_FAST_SEC   = 60     # 1 分钟
+_DRAGON_SLOW_SEC   = 300    # 5 分钟
+
+
+def _is_dragon_fast_window():
+    """9:30~10:00 开盘密集变动期"""
+    now = datetime.now()
+    if now.weekday() >= 5:
+        return False
+    t = now.hour * 100 + now.minute
+    return _DRAGON_FAST_START <= t < _DRAGON_FAST_END
+
+
+def _refresh_dragon_pools():
+    """刷新涨跌停三池"""
+    from app.market_cn.dragon_limit import refresh_zt_pool, refresh_dt_pool, refresh_broken_board
+    _run_all("dragon_pools", [refresh_zt_pool, refresh_dt_pool, refresh_broken_board])
+
+
+def _dragon_tick():
+    """涨跌停池自适应调度"""
+    if _is_trading_time():
+        try:
+            _refresh_dragon_pools()
+        except Exception as e:
+            logger.error("[scheduler] dragon_pools 异常: %s", e)
+
+    interval = _DRAGON_FAST_SEC if _is_dragon_fast_window() else _DRAGON_SLOW_SEC
+    _schedule("dragon_pools", _dragon_tick, interval)
+
+
+# ═══════════════════════════════════════════════════════════
 #  调度层 — tick 函数统一控制时段和条件
 # ═══════════════════════════════════════════════════════════
 
 
 def _fast_tick():
+    global _post_market_done_today
     if _is_trading_time():
+        _post_market_done_today = False  # 盘中开始，重置盘后标志
         _refresh_fast()
 
 
@@ -264,11 +308,12 @@ def start():
     logger.info("[scheduler] market_cn 调度器启动")
 
     # 定时器立即注册（不阻塞主线程）
-    _schedule("fast", _fast_tick, 300)
-    _schedule("slow", _slow_tick, 1800)
-    _schedule("post_market", _post_market_tick, 600)
+    _schedule("fast", _fast_tick, 300)        # 5 分钟，非盘中自动跳过
+    _schedule("slow", _slow_tick, 1800)       # 30 分钟，非盘中自动跳过
+    _schedule("dragon_pools", _dragon_tick, 60)  # 自适应间隔，首次 60 秒后启动
+    _schedule("post_market", _post_market_tick, 600)  # 盘后 10 分钟，完成后自动停
 
-    logger.info("[scheduler] 定时刷新已启动: fast=5min, slow=30min, post_market=10min")
+    logger.info("[scheduler] 定时刷新已启动: fast=5min, slow=30min, dragon=adaptive, post_market=10min")
 
     # 冷启动：后台线程拉取，不阻塞主线程
     def _cold_start():
@@ -290,6 +335,10 @@ def start():
                 refresh_hot_sectors, refresh_hot_rank,
             ])
 
+        # ── 冷启动: 涨跌停池（非盘中也加载一次）──
+        def _cold_dragon():
+            _refresh_dragon_pools()
+
         # ── 冷启动专用慢档（不含 _refresh_daily，避免与 daily 组重复）──
         def _cold_slow():
             from app.market_cn.china_market import refresh_fear_greed, refresh_policy
@@ -298,13 +347,14 @@ def start():
                 refresh_fear_greed, refresh_policy, refresh_emotion_cycle,
             ])
 
-        # 4 组并行执行
+        # 5 组并行执行
         _run_all_parallel("cold", [
             _refresh_daily,
             _refresh_post_market,
             _cold_slow,
             _cold_fast,
-        ], max_workers=4)
+            _cold_dragon,
+        ], max_workers=5)
 
         elapsed = _t.time() - t0
         logger.info("[scheduler] 冷启动完成，耗时 %.1fs", elapsed)
@@ -314,12 +364,3 @@ def start():
 
     # 前复权因子全量更新（交易日 6:00）
     threading.Thread(target=_schedule_adj_update, daemon=True, name="adj-factors-scheduler").start()
-
-    # 板块历史采集（每日收盘后 15:30）
-    if _os.getenv("SECTOR_HISTORY_ENABLED", "false").lower() == "true":
-        try:
-            from app.market_cn.sector_history import SectorHistoryScheduler
-            SectorHistoryScheduler().start()
-            logger.info("[scheduler] SectorHistoryScheduler 已启动")
-        except Exception as e:
-            logger.warning("[scheduler] SectorHistoryScheduler 启动失败: %s", e)

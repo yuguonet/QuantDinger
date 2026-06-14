@@ -152,63 +152,18 @@ def get_hot_rank(top_n: int = 30) -> Dict[str, Any]:
     return {"count": len(data[:top_n]), "stocks": data[:top_n]}
 
 @tool(
-    description="获取涨停股票池：代码、名称、涨停价、封板资金、连板天数。可筛选连板股（设 min_continuous_days>=2）。",
+    description="获取涨跌停/炸板股票池。pool_type: zt=涨停池（可筛连板）、dt=跌停池、broken=炸板池（曾封涨停被打开，资金分歧信号）。一次调用可同时获取三类数据。",
     category="行情数据",
     layer="数据层",
     domain=["finance"],
 )
-def get_zt_pool(date: str = "", min_continuous_days: int = 0) -> Dict[str, Any]:
-    """获取涨停股票池。
+def get_limit_pool(date: str = "", pool_type: str = "zt", min_continuous_days: int = 0) -> Dict[str, Any]:
+    """获取涨跌停/炸板股票池。
 
     Args:
         date: 交易日期 YYYY-MM-DD，默认今天
-        min_continuous_days: 最少连板天数，0=全部
-    """
-    try:
-        date = _validate_date(date)
-    except ValueError as e:
-        return {"error": str(e), "retriable": False}
-    if not date:
-        date = _today_str()
-    min_continuous_days = max(0, int(min_continuous_days or 0))
-
-    data = _dl_zt_pool(date)
-    if min_continuous_days > 0:
-        data = [r for r in data if int(r.get("continuous_zt_days", 0) or 0) >= min_continuous_days]
-
-    # ── 文字表格输出 ──
-    lines = [f"涨停池 {date}  共{len(data)}只"]
-    if min_continuous_days > 0:
-        lines[0] += f"  (连板≥{min_continuous_days})"
-    lines.append("")
-    lines.append(f"{'代码':<8} {'名称':<8} {'连板':>4} {'涨停时间':<10} {'封板资金(万)':>12} {'换手率%':>7} {'涨停原因'}")
-    lines.append("-" * 80)
-    for s in data:
-        code = s.get("stock_code", "")
-        name = s.get("stock_name", "")
-        days = s.get("continuous_zt_days", 1) or 1
-        zt_t = s.get("zt_time", "") or ""
-        seal = s.get("seal_amount", 0) or 0
-        seal_wan = f"{seal / 10000:.1f}" if seal else "-"
-        turnover = s.get("turnover_rate", 0) or 0
-        to_str = f"{turnover:.1f}" if turnover else "-"
-        reason = s.get("reason", "") or ""
-        lines.append(f"{code:<8} {name:<8} {days:>4} {zt_t:<10} {seal_wan:>12} {to_str:>7} {reason}")
-    text_table = "\n".join(lines)
-
-    return {"date": date, "min_continuous_days": min_continuous_days, "count": len(data), "stocks": data, "text": text_table}
-
-@tool(
-    description="获取跌停股票池：代码、名称、跌停价、封单量。",
-    category="行情数据",
-    layer="数据层",
-    domain=["finance"],
-)
-def get_limit_down(date: str = "") -> Dict[str, Any]:
-    """获取跌停股票池。
-
-    Args:
-        date: 交易日期 YYYY-MM-DD，默认今天
+        pool_type: zt=涨停池, dt=跌停池, broken=炸板池, all=全部
+        min_continuous_days: 仅 zt 有效，最少连板天数，0=全部
     """
     try:
         date = _validate_date(date)
@@ -217,30 +172,49 @@ def get_limit_down(date: str = "") -> Dict[str, Any]:
     if not date:
         date = _today_str()
 
-    data = _dl_dt_pool(date)
-    return {"date": date, "count": len(data), "stocks": data}
+    pool_type = (pool_type or "zt").strip().lower()
+    valid_types = {"zt", "dt", "broken", "all"}
+    if pool_type not in valid_types:
+        return {"error": f"pool_type 必须是 {'/'.join(valid_types)}，收到: {pool_type}", "retriable": False}
 
-@tool(
-    description="获取炸板(开板)股票池。炸板=曾封涨停但被打开，是资金分歧信号。",
-    category="龙虎榜/热榜",
-    layer="数据层",
-    domain=["finance"],
-)
-def get_broken_board(date: str = "") -> Dict[str, Any]:
-    """获取炸板(开板)股票池。炸板=曾封涨停但被打开，是资金分歧信号。
+    result: Dict[str, Any] = {"date": date}
 
-    Args:
-        date: 交易日期 YYYY-MM-DD，默认今天
-    """
-    try:
-        date = _validate_date(date)
-    except ValueError as e:
-        return {"error": str(e), "retriable": False}
-    if not date:
-        date = _today_str()
+    # 涨停池
+    if pool_type in ("zt", "all"):
+        min_days = max(0, int(min_continuous_days or 0))
+        zt = _dl_zt_pool(date)
+        if min_days > 0:
+            zt = [r for r in zt if int(r.get("continuous_zt_days", 0) or 0) >= min_days]
+        lines = [f"涨停池 {date}  共{len(zt)}只"]
+        if min_days > 0:
+            lines[0] += f"  (连板≥{min_days})"
+        lines.append("")
+        lines.append(f"{'代码':<8} {'名称':<8} {'连板':>4} {'涨停时间':<10} {'封板资金(万)':>12} {'换手率%':>7} {'涨停原因'}")
+        lines.append("-" * 80)
+        for s in zt:
+            code = s.get("stock_code", "")
+            name = s.get("stock_name", "")
+            days = s.get("continuous_zt_days", 1) or 1
+            zt_t = s.get("zt_time", "") or ""
+            seal = s.get("seal_amount", 0) or 0
+            seal_wan = f"{seal / 10000:.1f}" if seal else "-"
+            turnover = s.get("turnover_rate", 0) or 0
+            to_str = f"{turnover:.1f}" if turnover else "-"
+            reason = s.get("reason", "") or ""
+            lines.append(f"{code:<8} {name:<8} {days:>4} {zt_t:<10} {seal_wan:>12} {to_str:>7} {reason}")
+        result["zt"] = {"count": len(zt), "stocks": zt, "text": "\n".join(lines)}
 
-    data = _dl_broken_board(date)
-    return {"date": date, "count": len(data), "stocks": data}
+    # 跌停池
+    if pool_type in ("dt", "all"):
+        dt = _dl_dt_pool(date)
+        result["dt"] = {"count": len(dt), "stocks": dt}
+
+    # 炸板池
+    if pool_type in ("broken", "all"):
+        broken = _dl_broken_board(date)
+        result["broken"] = {"count": len(broken), "stocks": broken}
+
+    return result
 
 @tool(
     description="获取全市场涨跌统计快照：上涨/下跌家数、情绪指标。",
@@ -402,3 +376,75 @@ def get_concept_fund_flow(date: str = "") -> Dict[str, Any]:
     from app.market_cn.index import get_sector_fund_flow as _get_sector_flow
     data = _get_sector_flow("今日")  # 概念板块同源
     return {"date": date, "count": len(data), "concepts": data}
+
+
+# ══════════════════════════════════════════════════════════════
+# 资金流（个股）
+# ══════════════════════════════════════════════════════════════
+
+def _normalize_code(code: str) -> str:
+    code = code.strip().upper()
+    for prefix in ("SH", "SZ", "BJ"):
+        if code.startswith(prefix):
+            code = code[len(prefix):]
+    if "." in code:
+        code = code.split(".")[0]
+    return code
+
+
+@tool(
+    description="[中线] 个股资金流120日日级数据。主力/大单/中单/小单净流入。近20日主力累计净流入=资金在建仓，持续净流出=资金在撤退。配合筹码分析。",
+    category="行情数据",
+    layer="分析层",
+    domain=["finance"],
+)
+def get_fund_flow_120d(stock_code: str) -> Dict[str, Any]:
+    """获取个股资金流120日日级数据。
+
+    Args:
+        stock_code: 股票代码（如 600519）
+    """
+    code = _normalize_code(stock_code)
+    try:
+        from app.market_cn.tape import get_fund_flow_daily
+        result = get_fund_flow_daily(code, 120)
+        if "error" in result:
+            return {"stock_code": code, "error": result["error"]}
+        return {
+            "stock_code": code,
+            "total_days": result.get("total_days", 0),
+            "recent_20d_main_net": result.get("recent_20d_main_net", 0),
+            "data": result.get("data", [])[-30:],
+        }
+    except Exception as e:
+        logger.warning("get_fund_flow_120d(%s) failed: %s", code, e)
+        return {"stock_code": code, "error": str(e)}
+
+
+@tool(
+    description="[短线] 个股资金流分钟级实时数据。当日盘中主力/大单/超大单实时净流入。盘中盯资金用：超大单突然大幅流入=可能有消息或主力进场。",
+    category="行情数据",
+    layer="分析层",
+    domain=["finance"],
+)
+def get_fund_flow_minute(stock_code: str) -> Dict[str, Any]:
+    """获取个股资金流向分钟级。
+
+    Args:
+        stock_code: 股票代码（如 000858）
+    """
+    code = _normalize_code(stock_code)
+    try:
+        from app.market_cn.tape import get_fund_flow_realtime
+        result = get_fund_flow_realtime(code)
+        if "error" in result:
+            return {"stock_code": code, "error": result["error"]}
+        return {
+            "stock_code": code,
+            "points": result.get("points", 0),
+            "total_main_net": result.get("total_main_net", 0),
+            "data": result.get("data", []),
+        }
+    except Exception as e:
+        logger.warning("get_fund_flow_minute(%s) failed: %s", code, e)
+        return {"stock_code": code, "error": str(e)}

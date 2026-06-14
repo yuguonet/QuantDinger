@@ -20,7 +20,7 @@ from app.agent.skills.registry import skill
         "你是A股解禁监控师。解禁是A股特有的供给冲击因素。\n\n"
         "分析框架：\n"
         "1. **解禁日历** — 用 get_lockup_expiry 直接获取解禁数据（历史+未来90天待解禁），\n"
-        "   解禁日期、解禁数量、解禁比例、限售股类型。配合 search_stock_news 搜索解禁相关新闻补充。\n"
+        "   解禁日期、解禁数量、解禁比例、限售股类型。配合 search_comprehensive_intel 搜索解禁相关新闻补充。\n"
         "   - 解禁日期、解禁数量、解禁市值\n"
         "   - 解禁股东类型：IPO 原始股（冲击最大）/ 定增（次之）/ 股权激励（较小）\n"
         "   - 解禁市值占流通市值比例：> 30% = 高风险，> 50% = 极高风险\n"
@@ -39,7 +39,7 @@ from app.agent.skills.registry import skill
         "- 减持动态汇总\n"
         "- 质押风险提示（如有）\n"
         "- 操作建议（回避/轻仓观望/可参与）\n\n"
-        "必须用 search_stock_news 获取真实数据，绝不编造解禁和减持信息。"
+        "必须用 search_comprehensive_intel 获取真实数据，绝不编造解禁和减持信息。"
         "\n\n## 输出格式（必须遵守）\n"
         "你的 final_answer 必须包含以下JSON结构（嵌在正文中即可）：\n"
         "\n"
@@ -64,7 +64,7 @@ from app.agent.skills.registry import skill
         "- factors: 每个分析维度一行。包含你调用工具获取的所有关键数据点。",
     ),
     tools=[
-        "search_stock_news", "search_comprehensive_intel", "get_lockup_expiry",
+        "search_comprehensive_intel", "get_lockup_expiry",
         "get_realtime_quote", "agent_get_kline",
         "search_stock_by_name",
     ],
@@ -144,9 +144,9 @@ class LockupWatcherSkill:
             factors.append(FactorItem(name="解禁", value="数据缺失", score=50, status="missing"))
 
         # ── 新闻搜索（需要 LLM 解读，algo 跳过）──
-        # search_stock_news 和 search_comprehensive_intel 的结果需要 LLM 解读
+        # search_comprehensive_intel 的结果需要 LLM 解读
         # algo_analyze 不处理这部分，交给 LLM 补位
-        news = tool_results.get("search_stock_news", {})
+        news = tool_results.get("search_comprehensive_intel", {})
         if isinstance(news, dict) and "error" not in news:
             news_list = news.get("news", [])
             if news_list:

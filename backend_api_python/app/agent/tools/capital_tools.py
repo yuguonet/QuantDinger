@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-资金筹码工具 — 融资融券、大宗交易、股东户数、分红送转、资金流(日级+分钟级)、财报三表。
+资金筹码工具 — 融资融券、大宗交易、股东户数、分红送转、财报三表。
 
-数据来源：东财 datacenter / market_cn.tape / market_cn.finance / 新浪财报
+数据来源：东财 datacenter / market_cn.finance / 新浪财报
 """
 from __future__ import annotations
 
@@ -205,72 +205,6 @@ def get_dividend_history(stock_code: str) -> Dict[str, Any]:
             "plan": row.get("ASSIGN_PROGRESS", ""),
         })
     return {"stock_code": code, "records": rows}
-
-
-# ══════════════════════════════════════════════════════════════
-# 资金流 120 日
-# ══════════════════════════════════════════════════════════════
-
-@tool(
-    description="[中线] 个股资金流120日（补充 get_fund_flow：本工具走push2his获取最近120个交易日的日级主力/大单净流入）。日级主力/大单/中单/小单净流入。中线趋势判断：近20日主力累计净流入=资金在建仓，持续净流出=资金在撤退。配合筹码分析。",
-    category="行情数据",
-    layer="分析层",
-    domain=["finance"],
-)
-def get_fund_flow_120d(stock_code: str) -> Dict[str, Any]:
-    """获取个股资金流120日日级数据。
-
-    Args:
-        stock_code: 股票代码（如 600519）
-    """
-    code = _stock_code_normalize(stock_code)
-    try:
-        from app.market_cn.tape import get_fund_flow_daily
-        result = get_fund_flow_daily(code, 120)
-        if "error" in result:
-            return {"stock_code": code, "error": result["error"]}
-        return {
-            "stock_code": code,
-            "total_days": result.get("total_days", 0),
-            "recent_20d_main_net": result.get("recent_20d_main_net", 0),
-            "data": result.get("data", [])[-30:],
-        }
-    except Exception as e:
-        logger.warning("get_fund_flow_120d(%s) failed: %s", code, e)
-        return {"stock_code": code, "error": str(e)}
-
-
-# ══════════════════════════════════════════════════════════════
-# 资金流分钟级
-# ══════════════════════════════════════════════════════════════
-
-@tool(
-    description="[短线] 个股资金流分钟级（补充 get_fund_flow：现有工具走东财搜索API，本工具走push2获取当日盘中分钟级实时数据）。当日盘中主力/大单/超大单实时净流入。盘中盯资金用：超大单突然大幅流入=可能有消息或主力进场，配合盘口和成交量综合判断。",
-    category="行情数据",
-    layer="分析层",
-    domain=["finance"],
-)
-def get_fund_flow_minute(stock_code: str) -> Dict[str, Any]:
-    """获取个股资金流向分钟级。
-
-    Args:
-        stock_code: 股票代码（如 000858）
-    """
-    code = _stock_code_normalize(stock_code)
-    try:
-        from app.market_cn.tape import get_fund_flow_realtime
-        result = get_fund_flow_realtime(code)
-        if "error" in result:
-            return {"stock_code": code, "error": result["error"]}
-        return {
-            "stock_code": code,
-            "points": result.get("points", 0),
-            "total_main_net": result.get("total_main_net", 0),
-            "data": result.get("data", []),
-        }
-    except Exception as e:
-        logger.warning("get_fund_flow_minute(%s) failed: %s", code, e)
-        return {"stock_code": code, "error": str(e)}
 
 
 # ══════════════════════════════════════════════════════════════

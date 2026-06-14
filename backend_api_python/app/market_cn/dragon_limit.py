@@ -322,11 +322,13 @@ def get_dragon_tiger(start_date: str = "", end_date: str = "") -> List[Dict[str,
 
 def get_zt_pool(trade_date: str = "") -> List[Dict[str, Any]]:
     """获取涨停池。HTTP 东财搜索优先，AkShare 兜底。"""
+    global _rt_zt_pool
     if _rt_zt_pool is not None:              # ① 内存缓存
         return _rt_zt_pool
     data = _em_search("涨停", 200)          # ② 远端 fallback
     if data:
         logger.info("[HTTP] zt_pool: %d stocks", len(data))
+        _rt_zt_pool = data                   # 回填缓存
         return data
     logger.info("[HTTP] zt_pool 无结果，回退 AkShare")
     return _ak_zt_pool(trade_date)
@@ -334,11 +336,13 @@ def get_zt_pool(trade_date: str = "") -> List[Dict[str, Any]]:
 
 def get_dt_pool(trade_date: str = "") -> List[Dict[str, Any]]:
     """获取跌停池。HTTP 东财搜索优先，AkShare 兜底。"""
+    global _rt_dt_pool
     if _rt_dt_pool is not None:              # ① 内存缓存
         return _rt_dt_pool
     data = _em_search("跌停", 200)          # ② 远端 fallback
     if data:
         logger.info("[HTTP] dt_pool: %d stocks", len(data))
+        _rt_dt_pool = data                   # 回填缓存
         return data
     logger.info("[HTTP] dt_pool 无结果，回退 AkShare")
     return _ak_dt_pool(trade_date)
@@ -346,11 +350,13 @@ def get_dt_pool(trade_date: str = "") -> List[Dict[str, Any]]:
 
 def get_broken_board(trade_date: str = "") -> List[Dict[str, Any]]:
     """获取炸板池。HTTP 东财搜索优先，AkShare 兜底。"""
+    global _rt_broken_board
     if _rt_broken_board is not None:         # ① 内存缓存
         return _rt_broken_board
     data = _em_search("炸板", 200)          # ② 远端 fallback
     if data:
         logger.info("[HTTP] broken_board: %d stocks", len(data))
+        _rt_broken_board = data              # 回填缓存
         return data
     logger.info("[HTTP] broken_board 无结果，回退 AkShare")
     return _ak_broken_board(trade_date)

@@ -24,11 +24,11 @@ from app.agent.skills.registry import skill
         "3. **资金选股** — 跟踪聪明钱：\n"
         "   - 龙虎榜机构席位净买入（get_dragon_tiger / get_dragon_tiger_detail 看机构专用席位）\n"
         "   - 主力资金净流入（get_fund_flow / get_fund_flow_minute 看盘中实时 / get_fund_flow_120d 看中长期趋势）\n"
-        "   - 涨停池（get_zt_pool）看市场最强股\n"
+        "   - 涨停池（get_limit_pool pool_type=zt）看市场最强股\n"
         "4. **条件选股** — 用 search_stocks 按自然语言条件筛选。\n"
         "5. **指标验证** — 用 run_indicator_signal 验证筛选结果的技术信号。\n\n"
-        "用 get_hot_rank 看市场关注度排名，用 get_limit_down / get_broken_board 看情绪面。\n"
-        "   用 get_valuation_metrics 获取PE/PB/市值做估值筛选，用 get_holder_count 看筹码集中度。\n"
+        "用 get_hot_rank 看市场关注度排名，用 get_limit_pool(pool_type=all) 看涨跌停/炸板情绪面。\n"
+        "   用 get_stock_info 获取PE/PB/市值做估值筛选，用 get_holder_count 看筹码集中度。\n"
         "   用 get_stock_sector_info 查个股所属行业/概念，配合热门板块做概念选股。\n\n"
         "必须调用工具获取真实数据，绝不编造。"
         "\n\n## 输出格式（必须遵守）\n"
@@ -56,8 +56,8 @@ from app.agent.skills.registry import skill
     ),
     tools=[
         "search_stocks", "get_screener_presets",
-        "get_zt_pool", "get_dragon_tiger", "get_hot_rank",
-        "get_limit_down", "get_broken_board", "get_market_overview",
+        "get_limit_pool", "get_dragon_tiger", "get_hot_rank",
+        "get_market_overview",
         "list_indicators",
         # run_indicator_signal / review_stocks_with_indicator 需要 indicator_id，
         # 不适合 BaseSkill 默认的 stock_code 调用流程，由 indicator_agent 单独处理

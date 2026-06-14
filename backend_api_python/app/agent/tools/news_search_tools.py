@@ -56,59 +56,20 @@ def _extract_news_items(resp: Dict) -> List[Dict[str, Any]]:
     return items
 
 @tool(
-    description="搜索股票相关新闻、公告、研报。用于获取最新消息面信息。",
+    description="综合情报搜索：个股新闻 + 政策新闻 + 风险排查，多维度获取情报。可选 keyword 聚焦搜索关键词。",
     category="情报搜索",
     layer="分析层",
     domain=["finance"],
 )
-def search_stock_news(stock_code: str, keyword: str = "") -> Dict[str, Any]:
-    """搜索股票相关新闻、公告、研报。"""
-    try:
-        # 直接调用本文件内的转接函数，不再依赖 news_service
-        resp = fetch_financial_news(
-            lang="all",
-            market="CNStock",
-            symbol=stock_code,
-            name=keyword or "",
-        )
-        items = _extract_news_items(resp)
-        search_term = keyword or stock_code
+def search_comprehensive_intel(stock_code: str, keyword: str = "") -> Dict[str, Any]:
+    """综合情报搜索：个股新闻 + 政策新闻。可选 keyword 聚焦关键词。
 
-        if items:
-            return {
-                "stock_code": stock_code,
-                "keyword": search_term,
-                "results": items[:5],
-                "count": len(items),
-            }
-        return {
-            "stock_code": stock_code,
-            "keyword": search_term,
-            "results": [],
-            "count": 0,
-            "message": "未找到相关新闻",
-        }
-    except Exception as e:
-        logger.error("search_stock_news(%s) failed: %s", stock_code, e)
-        return {
-            "stock_code": stock_code,
-            "results": [],
-            "count": 0,
-            "error": f"新闻搜索暂不可用: {e}",
-            "retriable": True,
-        }
-
-@tool(
-    description="综合情报搜索：最新消息 + 风险排查 + 业绩预期，多维度获取情报。",
-    category="情报搜索",
-    layer="分析层",
-    domain=["finance"],
-)
-def search_comprehensive_intel(stock_code: str) -> Dict[str, Any]:
-    """综合情报搜索：最新消息 + 风险排查 + 业绩预期。"""
+    Args:
+        stock_code: 股票代码
+        keyword: 可选，搜索关键词（如 "解禁"、"减持"）
+    """
     try:
-        # 直接调用本文件内的转接函数，不再依赖 news_service
-        stock_resp = fetch_financial_news(lang="all", market="CNStock", symbol=stock_code)
+        stock_resp = fetch_financial_news(lang="all", market="CNStock", symbol=stock_code, name=keyword or "")
         policy_resp = fetch_financial_news(lang="all", market="CNStock", symbol="POLICY")
 
         stock_items = _extract_news_items(stock_resp)
@@ -122,8 +83,10 @@ def search_comprehensive_intel(stock_code: str) -> Dict[str, Any]:
         total = sum(len(v) for v in results.values())
         return {
             "stock_code": stock_code,
+            "keyword": keyword or stock_code,
             "dimensions": {k: len(v) for k, v in results.items()},
             "total_results": total,
+            "results": stock_items[:8],  # 兼容旧接口的扁平列表
             "data": results,
         }
     except Exception as e:

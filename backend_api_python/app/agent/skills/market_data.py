@@ -36,9 +36,9 @@ from app.agent.skills.registry import skill
         "4. **资金流向** — 用 get_fund_flow / get_sector_fund_flow / get_concept_fund_flow。\n"
         "   - 主力净流入方向 = 聪明钱态度\n"
         "   - 板块资金流向 = 轮动方向\n"
-        "5. **涨停池/热榜** — 用 get_zt_pool 看涨停池识别龙头，\n"
+        "5. **涨停池/热榜** — 用 get_limit_pool(pool_type=zt) 看涨停池识别龙头，\n"
         "   用 get_hot_rank 看市场关注度排名，\n"
-        "   用 get_limit_down / get_broken_board 看情绪面。\n"
+        "   用 get_limit_pool(pool_type=all) 看涨跌停/炸板情绪面。\n"
         "   - 最先涨停 = 先手龙\n"
         "   - 连板最多 = 高度龙\n"
         "   - 成交额最大 = 人气龙\n"
@@ -79,7 +79,7 @@ from app.agent.skills.registry import skill
         "get_market_indices", "get_sector_rankings",
         "get_market_overview",
         "get_fund_flow", "get_sector_fund_flow", "get_concept_fund_flow",
-        "get_zt_pool", "get_hot_rank", "get_limit_down", "get_broken_board",
+        "get_limit_pool", "get_hot_rank",
         "get_hot_sectors",
     ],
     priority=10,
@@ -192,10 +192,11 @@ class MarketDataSkill:
             factors.append(FactorItem(name="资金", value="数据缺失", score=50, status="missing"))
 
         # ── 4. 涨停池/情绪面（权重 15%）──
-        zt_pool = tool_results.get("get_zt_pool", {})
+        zt_pool = tool_results.get("get_limit_pool", {})
         emotion_score = 50
         if isinstance(zt_pool, dict) and "error" not in zt_pool:
-            zt_count = zt_pool.get("count", 0) or len(zt_pool.get("stocks", []))
+            zt_data = zt_pool.get("zt", zt_pool)
+            zt_count = zt_data.get("count", 0) or len(zt_data.get("stocks", []))
             if zt_count > 50:
                 emotion_score = 80
                 signals.append(f"涨停{zt_count}家情绪高涨")

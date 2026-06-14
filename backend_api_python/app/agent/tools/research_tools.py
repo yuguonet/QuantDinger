@@ -36,65 +36,6 @@ def _stock_code_normalize(code: str) -> str:
 # 研报评级
 # ══════════════════════════════════════════════════════════════
 
-@tool(
-    description="[中线] 研报评级+EPS预测。机构对个股的评级(买入/增持)和未来三年EPS预测。中线持仓必查：机构覆盖密度高=共识强，评级上调=预期改善。配合一致预期EPS做估值。",
-    category="情报搜索",
-    layer="分析层",
-    domain=["finance"],
-)
-def get_stock_reports(stock_code: str, max_pages: int = 3) -> Dict[str, Any]:
-    """获取个股研报列表（东财 reportapi）。
-
-    Args:
-        stock_code: 股票代码（如 600519）
-        max_pages: 最大页数，默认3
-    """
-    from app.market_cn.eastmoney_search import _em_get
-
-    code = _stock_code_normalize(stock_code)
-    report_api = "https://reportapi.eastmoney.com/report/list"
-    all_records = []
-
-    for page in range(1, max_pages + 1):
-        params = {
-            "industryCode": "*", "pageSize": "100", "industry": "*",
-            "rating": "*", "ratingChange": "*",
-            "beginTime": "2000-01-01", "endTime": "2030-01-01",
-            "pageNo": str(page), "fields": "", "qType": "0",
-            "orgCode": "", "code": code, "rcode": "",
-            "p": str(page), "pageNum": str(page), "pageNumber": str(page),
-        }
-        try:
-            r = _em_get(report_api, params=params,
-                        headers={"Referer": "https://data.eastmoney.com/"}, timeout=30)
-            d = r.json()
-            rows = d.get("data") or []
-            if not rows:
-                break
-            all_records.extend(rows)
-            if page >= (d.get("TotalPage", 1) or 1):
-                break
-        except Exception as e:
-            logger.warning("get_stock_reports(%s) page %d failed: %s", code, page, e)
-            break
-
-    reports = []
-    for row in all_records[:50]:
-        reports.append({
-            "title": row.get("title", ""),
-            "date": (row.get("publishDate") or "")[:10],
-            "org": row.get("orgSName", ""),
-            "rating": row.get("emRatingName", ""),
-            "industry": row.get("indvInduName", ""),
-            "eps_this_year": row.get("predictThisYearEps"),
-            "eps_next_year": row.get("predictNextYearEps"),
-            "eps_next2_year": row.get("predictNextTwoYearEps"),
-            "info_code": row.get("infoCode", ""),
-        })
-
-    return {"stock_code": code, "total": len(all_records), "reports": reports}
-
-
 # ══════════════════════════════════════════════════════════════
 # 一致预期
 # ══════════════════════════════════════════════════════════════
@@ -148,7 +89,7 @@ def get_consensus_eps(stock_code: str) -> Dict[str, Any]:
 # ══════════════════════════════════════════════════════════════
 
 @tool(
-    description="[短线+中线] 个股新闻（补充 search_stock_news：本工具直连东财JSONP，作为 news_search_service 的备用数据源）。东财个股相关新闻流。突发利好/利空消息第一时间获取，配合热点题材判断消息面催化。新闻+概念板块交叉验证。",
+    description="[短线+中线] 个股新闻（补充 search_comprehensive_intel：本工具直连东财JSONP，作为备用数据源）。东财个股相关新闻流。突发利好/利空消息第一时间获取，配合热点题材判断消息面催化。新闻+概念板块交叉验证。",
     category="情报搜索",
     layer="分析层",
     domain=["finance"],
@@ -245,72 +186,4 @@ def get_global_finance_news(page_size: int = 30) -> Dict[str, Any]:
         return {"error": str(e)}
 
 
-# ══════════════════════════════════════════════════════════════
-# 个股公告
-# ══════════════════════════════════════════════════════════════
 
-@tool(
-    description="[短线+中线] 个股公告。巨潮全量公告（沪深北交所）。利好公告（业绩预增/回购/增持）=短线催化，定期报告=中线基本面更新。解禁/减持公告=风险预警。",
-    category="情报搜索",
-    layer="分析层",
-    domain=["finance"],
-)
-def get_stock_filings(stock_code: str, page_size: int = 20) -> Dict[str, Any]:
-    """获取个股公告列表（巨潮 cninfo）。
-
-    Args:
-        stock_code: 股票代码（如 600519）
-        page_size: 返回条数，默认20
-    """
-    code = _stock_code_normalize(stock_code)
-    org_id = _cninfo_orgid(code)
-
-    url = "http://www.cninfo.com.cn/new/hisAnnouncement/query"
-    data = {
-        "stock": f"{code},{org_id}" if org_id else code,
-        "tabName": "fulltext",
-        "pageSize": str(page_size),
-        "pageNum": "1",
-        "column": "sse" if code.startswith("6") else "szse",
-        "category": "", "plate": "", "seDate": "",
-        "searchkey": "", "secid": "",
-        "sortName": "", "sortType": "",
-        "isHLtitle": "true",
-    }
-    headers = {
-        "User-Agent": _UA,
-        "Referer": "http://www.cninfo.com.cn/new/commonUrl?url=disclosure/list/notice",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-    }
-    try:
-        r = requests.post(url, data=data, headers=headers, timeout=15)
-        d = r.json()
-        announcements = d.get("announcements") or []
-        rows = []
-        for ann in announcements:
-            rows.append({
-                "title": ann.get("announcementTitle", ""),
-                "date": ann.get("announcementTime", ""),
-                "type": ann.get("announcementTypeName", ""),
-                "url": f"http://static.cninfo.com.cn/{ann['adjunctUrl']}" if ann.get("adjunctUrl") else "",
-            })
-        return {"stock_code": code, "total": d.get("totalAnnouncement", 0), "filings": rows}
-    except Exception as e:
-        logger.warning("get_stock_filings(%s) failed: %s", code, e)
-        return {"stock_code": code, "error": str(e)}
-
-
-def _cninfo_orgid(code: str) -> str:
-    """动态获取巨潮公告 orgId。"""
-    try:
-        url = "http://www.cninfo.com.cn/new/data/szse_stock.json"
-        r = requests.get(url, headers={"User-Agent": _UA}, timeout=10)
-        data = r.json()
-        for stock in data.get("stockList", []):
-            if stock.get("code") == code:
-                return stock.get("orgId", "")
-    except Exception:
-        pass
-    if code.startswith("6"):
-        return f"gssh0{code}"
-    return f"gssz0{code}"

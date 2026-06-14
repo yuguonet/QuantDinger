@@ -169,8 +169,8 @@ def _build_instructions(user_message: str = "", skill_instructions: str = "",
 ## 自修改能力
 
 允许修改目录: {modify_paths}
-工具: self_modify_list_dirs, self_modify_read, self_modify_write, self_modify_create, self_modify_diff, self_modify_rollback
-安全约束: 每次修改自动备份，只能修改配置目录范围内的文件，先用 self_modify_read 理解代码再做最小改动。
+工具: workspace_read_file, workspace_write_file, workspace_edit_file
+安全约束: 只能修改配置目录范围内的文件，先用 workspace_read_file 理解代码再做最小改动。
 
 """
 

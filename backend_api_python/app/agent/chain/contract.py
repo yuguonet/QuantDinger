@@ -273,7 +273,7 @@ def extract_tools_called(raw: str) -> List[str]:
         r'"tool_name"\s*:\s*"(\w+)"',
         r'agent_get_kline|get_realtime_quote|analyze_trend|calculate_ma|'
         r'get_volume_analysis|analyze_pattern|get_indicator_snapshot|'
-        r'get_chip_distribution|search_stock_news|get_dragon_tiger',
+        r'get_chip_distribution|search_comprehensive_intel|get_dragon_tiger',
     ]
     for pat in patterns:
         for m in re.finditer(pat, raw):

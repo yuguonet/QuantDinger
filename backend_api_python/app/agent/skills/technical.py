@@ -21,7 +21,7 @@ from app.agent.skills.registry import skill
     tools=[
         "analyze_trend", "calculate_ma", "get_volume_analysis",
         "analyze_pattern", "get_chip_distribution",
-        "get_indicator_snapshot", "generate_kline_chart",
+        "get_indicator_snapshot", "render_candlestick",
         "get_realtime_quote", "agent_get_kline",
     ],
     priority=9,

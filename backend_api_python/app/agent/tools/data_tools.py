@@ -122,177 +122,6 @@ def agent_get_kline(stock_code: str, timeframe: str = "1D", days: int = 60, mark
     except Exception as e:
         logger.error("get_kline(%s, %s, %d) failed: %s", stock_code, timeframe, days, e)
         return []
-
-@tool(
-    description="生成K线图（嵌入式交互图表）。当用户要求看K线、显示图表、K线图时，必须先调用 agent_get_kline 获取数据，再调用此工具生成图表。分析类请求不需要此工具。",
-    category="行情数据",
-    layer="数据层",
-    domain=["finance"],
-)
-def generate_kline_chart(
-    stock_code: str,
-    timeframe: str = "1D",
-    days: int = 60,
-    stock_name: str = "",
-    indicators: str = "",
-) -> Dict[str, Any]:
-    """生成K线图（HTML 交互式图表），返回文件路径。
-
-    用 ECharts 渲染专业级蜡烛图 + 成交量柱状图，支持 MA 均线叠加。
-    生成的 HTML 文件用浏览器打开即可交互（缩放、拖动、悬停看详情）。
-
-    Args:
-        stock_code: 股票代码（如 000001、600519）或交易对（如 BTC/USDT）
-        timeframe: K线周期，可选: 1m/5m/15m/30m/1H/4H/1D/1W。默认 1D
-        days: 获取天数，默认 60，最大 250
-        stock_name: 股票名称（可选，显示在标题上）
-        indicators: 叠加指标，逗号分隔。可选: MA5,MA10,MA20,MA60。默认 MA5+MA10+MA20
-    """
-    # 1) 拉取 K 线数据
-    klines = agent_get_kline(stock_code, timeframe, days)
-    if not klines:
-        return {"error": f"无法获取 {stock_code} 的K线数据", "retriable": False}
-
-    # 2) 解析指标参数
-    ma_list = []
-    if indicators:
-        for item in indicators.split(","):
-            item = item.strip().upper()
-            if item.startswith("MA") and item[2:].isdigit():
-                ma_list.append(int(item[2:]))
-    if not ma_list:
-        ma_list = [5, 10, 20]
-
-    # 3) 计算均线数据
-    closes = [k["c"] for k in klines]
-    ma_data = {}
-    for period in ma_list:
-        ma_vals = []
-        for i in range(len(closes)):
-            if i < period - 1:
-                ma_vals.append(None)
-            else:
-                ma_vals.append(round(sum(closes[i - period + 1 : i + 1]) / period, 2))
-        ma_data[f"MA{period}"] = ma_vals
-
-    # 4) 构建 ECharts 数据
-    dates = [k["t"] for k in klines]
-    ohlc = [[k["o"], k["c"], k["l"], k["h"]] for k in klines]
-    volumes = [k["v"] for k in klines]
-    vol_colors = []
-    for k in klines:
-        vol_colors.append("#ef5350" if k["c"] < k["o"] else "#26a69a")
-
-    title = f"{stock_name or stock_code} {timeframe} K线"
-    ma_colors = ["#ff9800", "#2196f3", "#e91e63", "#4caf50", "#9c27b0"]
-
-    # 5) 生成 HTML
-    ma_series_js = ""
-    for idx, (name, vals) in enumerate(ma_data.items()):
-        color = ma_colors[idx % len(ma_colors)]
-        ma_series_js += f""",
-        {{
-            name: '{name}',
-            type: 'line',
-            data: {json.dumps(vals)},
-            smooth: true,
-            lineStyle: {{ width: 1 }},
-            symbol: 'none',
-            itemStyle: {{ color: '{color}' }}
-        }}"""
-
-    chart_html = f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<title>{title}</title>
-<style>
-  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-  body {{ background: #1a1a2e; color: #e0e0e0; font-family: -apple-system, sans-serif; }}
-  #chart {{ width: 100vw; height: 100vh; }}
-</style>
-</head>
-<body>
-<div id="chart"></div>
-<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
-<script>
-var chart = echarts.init(document.getElementById('chart'), 'dark');
-var option = {{
-    backgroundColor: '#1a1a2e',
-    title: {{ text: '{title}', left: 'center', top: 10, textStyle: {{ color: '#eee', fontSize: 16 }} }},
-    tooltip: {{
-        trigger: 'axis',
-        axisPointer: {{ type: 'cross' }},
-        backgroundColor: 'rgba(20,20,40,0.9)',
-        borderColor: '#555',
-        textStyle: {{ color: '#eee' }}
-    }},
-    legend: {{
-        data: ['K线'{', '.join(repr(f"MA{p}") for p in ma_list)}],
-        top: 40, textStyle: {{ color: '#aaa' }}
-    }},
-    grid: [
-        {{ left: '8%', right: '3%', top: 80, height: '55%' }},
-        {{ left: '8%', right: '3%', top: '78%', height: '15%' }}
-    ],
-    xAxis: [
-        {{ type: 'category', data: {json.dumps(dates)}, gridIndex: 0, axisLabel: {{ color: '#888' }}, axisLine: {{ lineStyle: {{ color: '#444' }} }} }},
-        {{ type: 'category', data: {json.dumps(dates)}, gridIndex: 1, axisLabel: {{ show: false }}, axisLine: {{ lineStyle: {{ color: '#444' }} }} }}
-    ],
-    yAxis: [
-        {{ scale: true, gridIndex: 0, splitLine: {{ lineStyle: {{ color: '#333' }} }}, axisLabel: {{ color: '#888' }} }},
-        {{ scale: true, gridIndex: 1, splitLine: {{ show: false }}, axisLabel: {{ show: false }} }}
-    ],
-    dataZoom: [
-        {{ type: 'inside', xAxisIndex: [0, 1], start: 30, end: 100 }},
-        {{ type: 'slider', xAxisIndex: [0, 1], start: 30, end: 100, bottom: 10,
-           borderColor: '#555', textStyle: {{ color: '#aaa' }},
-           fillerColor: 'rgba(60,60,120,0.3)' }}
-    ],
-    series: [
-        {{
-            name: 'K线',
-            type: 'candlestick',
-            data: {json.dumps(ohlc)},
-            xAxisIndex: 0, yAxisIndex: 0,
-            itemStyle: {{
-                color: '#ef5350',
-                color0: '#26a69a',
-                borderColor: '#ef5350',
-                borderColor0: '#26a69a'
-            }}
-        }}{ma_series_js},
-        {{
-            name: '成交量',
-            type: 'bar',
-            data: {json.dumps(volumes)},
-            xAxisIndex: 1, yAxisIndex: 1,
-            itemStyle: {{
-                color: function(p) {{ return {json.dumps(vol_colors)}[p.dataIndex]; }}
-            }}
-        }}
-    ]
-}};
-chart.setOption(option);
-window.addEventListener('resize', function() {{ chart.resize(); }});
-</script>
-</body>
-</html>"""
-
-    # 用 base64 编码 HTML，前端通过 __CHART_B64__ 标记检测并用 iframe 渲染
-    import base64
-    b64 = base64.b64encode(chart_html.encode("utf-8")).decode("ascii")
-    chart_marker = f"__CHART_B64__{b64}__END_CHART__"
-
-    return {
-        "stock_code": stock_code,
-        "stock_name": stock_name,
-        "timeframe": timeframe,
-        "days": days,
-        "kline_count": len(klines),
-        "message": f"K线图已生成，共 {len(klines)} 根K线。\n{chart_marker}",
-    }
-
 @tool(
     description="获取股票基本面信息（行业、概念、市值、PE、PB等）。",
     category="行情数据",
@@ -300,73 +129,114 @@ window.addEventListener('resize', function() {{ chart.resize(); }});
     domain=["finance"],
 )
 def get_stock_info(stock_code: str) -> Dict[str, Any]:
-    """获取股票基本面信息（行业、概念、市值、PE、PB 等）。"""
+    """获取股票基本面信息（行业、概念、市值、PE、PB 等）+ 实时估值补全。"""
     market = _detect_market(stock_code) or "CNStock"
     ds = _get_ds(market)
+    result: Dict[str, Any] = {}
 
     # 1) 尝试数据源原生 get_stock_info
     try:
         if hasattr(ds, "get_stock_info"):
-            result = ds.get_stock_info(stock_code)
-            if isinstance(result, dict) and not result.get("error"):
-                return result
-            if isinstance(result, str):
+            info = ds.get_stock_info(stock_code)
+            if isinstance(info, dict) and not info.get("error"):
+                result = info
+            elif isinstance(info, str):
                 try:
                     import json as _json
-                    parsed = _json.loads(result)
+                    parsed = _json.loads(info)
                     if isinstance(parsed, dict):
-                        return parsed
+                        result = parsed
+                    else:
+                        result = {"stock_code": stock_code, "info_text": info}
                 except (ValueError, TypeError):
-                    pass
-                return {"stock_code": stock_code, "info_text": result}
+                    result = {"stock_code": stock_code, "info_text": info}
     except NotImplementedError:
         pass
     except Exception as e:
         logger.warning("get_stock_info(%s) datasource failed: %s", stock_code, e)
 
     # 2) 兜底：HTTP 实时拉取（双源互补）
-    try:
-        from app.utils.cn_stock_info import get_cn_stock_info
-        info = get_cn_stock_info(stock_code)
-        if info and not info.get("error"):
-            return info
-    except Exception as e:
-        logger.warning("get_stock_info(%s) cn_stock_info failed: %s", stock_code, e)
+    if not result:
+        try:
+            from app.utils.cn_stock_info import get_cn_stock_info
+            info = get_cn_stock_info(stock_code)
+            if info and not info.get("error"):
+                result = info
+        except Exception as e:
+            logger.warning("get_stock_info(%s) cn_stock_info failed: %s", stock_code, e)
 
     # 3) 兜底：本地缓存 basicinfo_db
+    if not result:
+        try:
+            from app.utils.basicinfo_db import get_stock_basic_db
+            from app.data_sources.normalizer import strip_market_prefix
+
+            sym = strip_market_prefix(stock_code)
+            db = get_stock_basic_db()
+            stock = db.get_stock(sym)
+            if stock:
+                result = {"stock_code": sym}
+                if stock.get("name"):
+                    result["name"] = stock["name"]
+                if stock.get("industry"):
+                    result["industry"] = stock["industry"]
+                concepts_str = stock.get("concepts", "")
+                if concepts_str:
+                    result["concepts"] = [c.strip() for c in concepts_str.split(",") if c.strip()]
+                if stock.get("total_shares"):
+                    result["total_shares"] = stock["total_shares"]
+                if stock.get("circ_shares"):
+                    result["circ_shares"] = stock["circ_shares"]
+                if stock.get("pe_ratio"):
+                    result["pe_ratio"] = stock["pe_ratio"]
+                if stock.get("pb_ratio"):
+                    result["pb_ratio"] = stock["pb_ratio"]
+                if stock.get("market_cn"):
+                    result["market_cn"] = stock["market_cn"]
+                if stock.get("list_date"):
+                    result["list_date"] = stock["list_date"]
+                result["source"] = "basicinfo_db"
+        except Exception as e:
+            logger.warning("get_stock_info(%s) basicinfo_db fallback failed: %s", stock_code, e)
+
+    if not result:
+        return {"error": f"无法获取 {stock_code} 的基本面信息", "retriable": False}
+
+    # 4) 腾讯实时估值补全（PE/PB/市值/换手率/量比等）
     try:
-        from app.utils.basicinfo_db import get_stock_basic_db
-        from app.data_sources.normalizer import strip_market_prefix
-
-        sym = strip_market_prefix(stock_code)
-        db = get_stock_basic_db()
-        stock = db.get_stock(sym)
-        if stock:
-            out: Dict[str, Any] = {"stock_code": sym}
-            if stock.get("name"):
-                out["name"] = stock["name"]
-            if stock.get("industry"):
-                out["industry"] = stock["industry"]
-            concepts_str = stock.get("concepts", "")
-            if concepts_str:
-                out["concepts"] = [c.strip() for c in concepts_str.split(",") if c.strip()]
-            if stock.get("total_shares"):
-                out["total_shares"] = stock["total_shares"]
-            if stock.get("circ_shares"):
-                out["circ_shares"] = stock["circ_shares"]
-            if stock.get("pe_ratio"):
-                out["pe_ratio"] = stock["pe_ratio"]
-            if stock.get("pb_ratio"):
-                out["pb_ratio"] = stock["pb_ratio"]
-            if stock.get("market_cn"):
-                out["market_cn"] = stock["market_cn"]
-            if stock.get("list_date"):
-                out["list_date"] = stock["list_date"]
-            out["source"] = "basicinfo_db"
-            return out
+        from app.agent.tools.quote_tools import _tencent_quote_raw, _stock_code_normalize
+        code = _stock_code_normalize(stock_code)
+        tq = _tencent_quote_raw([code])
+        q = tq.get(code)
+        if q:
+            result.setdefault("price", q.get("price"))
+            result.setdefault("change_pct", q.get("change_pct"))
+            # 估值：优先用腾讯的（实时），basicinfo_db 的是静态值
+            if q.get("pe_ttm"):
+                result["pe_ttm"] = q["pe_ttm"]
+            if q.get("pe_static"):
+                result["pe_static"] = q["pe_static"]
+            if q.get("pb"):
+                result["pb"] = q["pb"]
+            if q.get("mcap_yi"):
+                result["mcap_yi"] = q["mcap_yi"]
+            if q.get("float_mcap_yi"):
+                result["float_mcap_yi"] = q["float_mcap_yi"]
+            if q.get("turnover_pct") is not None:
+                result["turnover_pct"] = q["turnover_pct"]
+            if q.get("vol_ratio") is not None:
+                result["vol_ratio"] = q["vol_ratio"]
+            if q.get("amplitude_pct") is not None:
+                result["amplitude_pct"] = q["amplitude_pct"]
+            if q.get("amount_wan"):
+                result["amount_wan"] = q["amount_wan"]
+            if q.get("limit_up"):
+                result["limit_up"] = q["limit_up"]
+            if q.get("limit_down"):
+                result["limit_down"] = q["limit_down"]
     except Exception as e:
-        logger.warning("get_stock_info(%s) basicinfo_db fallback failed: %s", stock_code, e)
+        logger.debug("get_stock_info(%s) 腾讯估值补全跳过: %s", stock_code, e)
 
-    return {"error": f"无法获取 {stock_code} 的基本面信息", "retriable": False}
+    return result
 
 # Legacy list — kept for backward compat during migration; safe to remove later.

@@ -112,9 +112,9 @@ def _evaluate_coding(agent_result, result, tool_chain, verb, noun) -> EvalResult
                     lint_used = True
                 if tool_name in ("lsp_diagnostics",):
                     diagnostics_used = True
-                if tool_name in ("workspace_edit_file", "apply_patch", "workspace_write_file"):
+                if tool_name in ("workspace_edit_file", "workspace_write_file"):
                     edit_count += 1
-                if tool_name in ("workspace_read_file", "read_lines", "grep_code", "glob_files"):
+                if tool_name in ("workspace_read_file", "read_lines"):
                     read_count += 1
 
     result.actual_tools = actual_tools
@@ -245,8 +245,8 @@ def _evaluate_finance(agent_result, result, tool_chain, verb, noun, domain) -> E
     }
     _ANALYSIS_TOOLS = {
         "analyze_trend", "get_indicator_snapshot", "calculate_ma",
-        "get_volume_analysis", "analyze_pattern", "generate_kline_chart",
-        "search_stock_news", "search_comprehensive_intel",
+        "get_volume_analysis", "analyze_pattern", "render_candlestick",
+        "search_comprehensive_intel",
         "get_dragon_tiger_stocks", "get_polymarket_analysis",
     }
     _TRADING_TOOLS = {

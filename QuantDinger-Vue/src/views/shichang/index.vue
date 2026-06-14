@@ -250,7 +250,7 @@ export default {
     this.indexTimer = setInterval(() => {
       this.fetchIndex()
       this.fetchOverview()
-    }, 10000)
+    }, 60000)
   },
 
   activated () {
@@ -262,7 +262,7 @@ export default {
       this.indexTimer = setInterval(() => {
         this.fetchIndex()
         this.fetchOverview()
-      }, 10000)
+      }, 60000)
     }
   },
 

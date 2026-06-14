@@ -249,30 +249,6 @@ def render_candlestick(
         "message": f"蜡烛图已生成，共 {len(klines)} 根K线。\n{chart_marker}",
     }
 
-@tool(
-    description="生成迷你蜡烛图（快速预览版），60天日线+MA5/10/20+成交量。",
-    category="K线图表",
-    layer="显示层",
-    domain=["finance"],
-)
-def render_candlestick_mini(
-    stock_code: str,
-    timeframe: str = "1D",
-    days: int = 60,
-    stock_name: str = "",
-    market: str = "",
-) -> Dict[str, Any]:
-    """生成迷你蜡烛图（快速预览版），60天日线+MA5/10/20+成交量。"""
-    return render_candlestick(
-        stock_code=stock_code,
-        timeframe=timeframe,
-        days=days,
-        stock_name=stock_name,
-        ma_periods="5,10,20",
-        show_volume=True,
-        market=market,
-    )
-
 # ── OpenAI tool declarations ─────────────────────────────────
 
 # Legacy list — kept for backward compat during migration; safe to remove later.

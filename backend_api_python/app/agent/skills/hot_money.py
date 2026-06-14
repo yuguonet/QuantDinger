@@ -24,7 +24,7 @@ from app.agent.skills.registry import skill
         "   - 主力净流入/净流出趋势\n"
         "   - 大单、超大单占比（超大单占比高 = 机构行为）\n"
         "   - 连续多日净流入 = 持续看好\n"
-        "3. **涨停/跌停池** — 用 get_zt_pool / get_limit_down：\n"
+        "3. **涨停/跌停池** — 用 get_limit_pool(pool_type=zt/dt)：\n"
         "   - 涨停家数 > 50 = 市场情绪高涨\n"
         "   - 跌停家数 > 20 = 恐慌情绪\n"
         "   - 连板高度 = 市场投机强度\n"
@@ -60,8 +60,8 @@ from app.agent.skills.registry import skill
     ),
     tools=[
         "get_dragon_tiger", "get_fund_flow", "get_sector_fund_flow",
-        "get_concept_fund_flow", "get_zt_pool", "get_limit_down",
-        "get_hot_rank", "get_broken_board", "get_market_overview",
+        "get_concept_fund_flow", "get_limit_pool",
+        "get_hot_rank", "get_market_overview",
         "get_realtime_quote", "agent_get_kline",
         "search_stock_by_name",
     ],

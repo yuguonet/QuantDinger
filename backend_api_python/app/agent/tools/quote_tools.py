@@ -139,50 +139,6 @@ def get_order_book(stock_code: str) -> Dict[str, Any]:
 
 
 # ══════════════════════════════════════════════════════════════
-# 估值指标
-# ══════════════════════════════════════════════════════════════
-
-@tool(
-    description="[中线核心] 估值指标（优选数据源：走腾讯财经，PE(TTM)/PB/市值/涨跌停价比 get_stock_info 更准更快，不封IP）。PE(TTM)/PE(静)/PB/总市值/流通市值/换手率/涨跌停价/量比。中线选股核心：PE<行业均值=低估，PB<1=破净，量比>2=异动。配合一致预期算前向PE。",
-    category="行情数据",
-    layer="数据层",
-    domain=["finance"],
-)
-def get_valuation_metrics(stock_code: str) -> Dict[str, Any]:
-    """获取估值指标（腾讯财经）。
-
-    Args:
-        stock_code: 股票代码（如 600519）
-    """
-    code = _stock_code_normalize(stock_code)
-    try:
-        data = _tencent_quote_raw([code])
-        q = data.get(code)
-        if not q:
-            return {"stock_code": code, "error": "未获取到数据"}
-        return {
-            "stock_code": code,
-            "name": q["name"],
-            "price": q["price"],
-            "change_pct": q["change_pct"],
-            "pe_ttm": q["pe_ttm"],
-            "pe_static": q["pe_static"],
-            "pb": q["pb"],
-            "mcap_yi": q["mcap_yi"],
-            "float_mcap_yi": q["float_mcap_yi"],
-            "turnover_pct": q["turnover_pct"],
-            "amplitude_pct": q["amplitude_pct"],
-            "limit_up": q["limit_up"],
-            "limit_down": q["limit_down"],
-            "vol_ratio": q["vol_ratio"],
-            "amount_wan": q["amount_wan"],
-        }
-    except Exception as e:
-        logger.warning("get_valuation_metrics(%s) failed: %s", code, e)
-        return {"stock_code": code, "error": str(e)}
-
-
-# ══════════════════════════════════════════════════════════════
 # 指数/ETF行情
 # ══════════════════════════════════════════════════════════════
 

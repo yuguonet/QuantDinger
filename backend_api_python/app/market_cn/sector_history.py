@@ -5,14 +5,14 @@
   - get_sector_history(board_type, days)  → List[Dict]
   - get_sector_trend(board_type)          → Dict
   - SectorAnalyzer.full_analysis()        → Dict
-  - SectorHistoryScheduler                → 每日采集调度器
+  - collect_sector_daily(target_date)     → 采集板块日级统计
 
 数据源: sector_daily_stats 表（由 sector_daily.py 写入）
+触发方式: _post_market_tick 或 scripts/after_1d.py（K线更新后触发，不再独立定时）
 """
 
 import os
 import logging
-import threading
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
 
@@ -20,14 +20,6 @@ import pandas as pd
 import numpy as np
 
 logger = logging.getLogger(__name__)
-
-# ═══════════════════════════════════════════════════
-#  配置
-# ═══════════════════════════════════════════════════
-
-ENABLED = os.getenv("SECTOR_HISTORY_ENABLED", "false").lower() == "true"
-COLLECT_HOUR = int(os.getenv("SECTOR_COLLECT_HOUR", "15"))
-COLLECT_MINUTE = int(os.getenv("SECTOR_COLLECT_MINUTE", "30"))
 
 
 # ═══════════════════════════════════════════════════
@@ -91,74 +83,29 @@ def _has_date_in_db(sector_type: str, date: str) -> bool:
 
 
 # ═══════════════════════════════════════════════════
-#  采集调度器（调用 sector_daily.py）
+#  采集（由 _post_market_tick 或 after_1d.py 触发）
 # ═══════════════════════════════════════════════════
 
-class SectorHistoryScheduler:
-    """每日收盘后采集板块统计数据（写入 sector_daily_stats 表）"""
 
-    def __init__(self):
-        self._timer = None
-        self._running = False
+def collect_sector_daily(target_date: str = None):
+    """采集板块日级统计。由 scheduler 的 post_market 或外部 after_1d.py 调用。"""
+    from .sector_daily import sync_single_date
 
-    def start(self):
-        if not ENABLED:
-            logger.info("[SectorHistory] 未启用 (SECTOR_HISTORY_ENABLED=false)")
-            return
-        debug = os.getenv("PYTHON_API_DEBUG", "false").lower() == "true"
-        if debug and os.environ.get("WERKZEUG_RUN_MAIN") != "true":
-            return
-        self._running = True
-        logger.info("[SectorHistory] 已启动，每日 %02d:%02d 采集", COLLECT_HOUR, COLLECT_MINUTE)
-        self._schedule_next()
+    if target_date is None:
+        target_date = datetime.now().strftime("%Y-%m-%d")
 
-    def stop(self):
-        self._running = False
-        if self._timer:
-            self._timer.cancel()
-            self._timer = None
+    if _has_date_in_db("industry", target_date) and _has_date_in_db("concept", target_date):
+        logger.info("[SectorHistory] %s 已采集，跳过", target_date)
+        return 0
 
-    def _schedule_next(self):
-        if not self._running:
-            return
-        now = datetime.now()
-        target = now.replace(hour=COLLECT_HOUR, minute=COLLECT_MINUTE, second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=1)
-        delay = max(60, (target - now).total_seconds())
-        self._timer = threading.Timer(delay, self._tick)
-        self._timer.daemon = True
-        self._timer.start()
-        logger.debug("[SectorHistory] 下次采集: %s (延迟 %.0fs)", target.strftime("%Y-%m-%d %H:%M"), delay)
-
-    def _tick(self):
-        try:
-            from app.utils.trading_calendar import is_trading_day_today
-            if not is_trading_day_today():
-                logger.debug("[SectorHistory] 非交易日，跳过")
-                return
-            self._collect()
-        except Exception as e:
-            logger.error("[SectorHistory] 采集异常: %s", e, exc_info=True)
-        finally:
-            self._schedule_next()
-
-    def _collect(self):
-        """调用 sector_daily.sync_single_date 采集数据"""
-        from .sector_daily import sync_single_date
-
-        today = datetime.now().strftime("%Y-%m-%d")
-
-        if _has_date_in_db("industry", today) and _has_date_in_db("concept", today):
-            logger.info("[SectorHistory] %s 已采集，跳过", today)
-            return
-
-        logger.info("[SectorHistory] 开始采集 %s 板块数据...", today)
-        try:
-            n = sync_single_date(today)
-            logger.info("[SectorHistory] %s 采集完成，写入 %d 条", today, n)
-        except Exception as e:
-            logger.error("[SectorHistory] 采集失败: %s", e, exc_info=True)
+    logger.info("[SectorHistory] 开始采集 %s 板块数据...", target_date)
+    try:
+        n = sync_single_date(target_date)
+        logger.info("[SectorHistory] %s 采集完成，写入 %d 条", target_date, n)
+        return n
+    except Exception as e:
+        logger.error("[SectorHistory] 采集失败: %s", e, exc_info=True)
+        return 0
 
 
 # ═══════════════════════════════════════════════════

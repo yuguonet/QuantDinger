@@ -12,7 +12,7 @@ Code Workspace — 每会话隔离的持久化文件存储。
 
 被调用方：
   tools/code_workspace_tools.py → 所有文件操作工具
-  tools/self_modify_tools.py → 自修改工具
+  tools/code_workspace_tools.py → 工作区工具
 
 公开接口：
   get_workspace(session_id, domain) → CodeWorkspace

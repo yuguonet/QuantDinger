@@ -28,7 +28,7 @@ from typing import Any, Dict, List
 logger = logging.getLogger(__name__)
 
 def _find_roots() -> tuple:
-    """定位 backend 根目录和项目根目录（与 self_modify_tools 保持一致）。"""
+    """定位 backend 根目录和项目根目录。"""
     backend_root = Path(__file__).resolve().parents[3]  # → backend_api_python/
     cur = backend_root.parent
     for _ in range(5):

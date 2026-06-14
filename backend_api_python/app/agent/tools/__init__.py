@@ -11,7 +11,7 @@ Tools — 工具包。
   决策层 — screening_tools / screener_tools / backtest_tools / capital_tools
   执行层 — trading_tools
   显示层 — chart_tools
-  支撑层 — code_workspace_tools / self_modify_tools / iteration_tools / tool_chain_tools / scan_tools
+  支撑层 — code_workspace_tools / iteration_tools / tool_chain_tools / scan_tools
 """
 # 注册翻页工具
 try:
