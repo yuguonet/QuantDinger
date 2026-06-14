@@ -116,9 +116,11 @@ def _generate_tool_catalog(tools, managed_agents) -> str:
     if uncategorized:
         lines.append(f"**未分层**: {', '.join(sorted(uncategorized))}")
 
-    # 技能调用工具
-    if any(t.name == "call_skill" for t in (tools or [])):
-        lines.append("\n**技能调用**: call_skill — 调用专业分析技能（技术面/动量/情报/政策等）")
+    # 子 agent 列表
+    if managed_agents and managed_agents is not None:
+        lines.append("\n**可用子 agent**")
+        for ma in managed_agents:
+            lines.append(f"  {ma.name} — {ma.description}")
 
     return "\n".join(lines)
 
@@ -139,6 +141,75 @@ def _load_preamble() -> str:
     return "你是 QuantDinger 量化分析助手。"
 
 
+def _build_router_instructions(
+    language: str = "zh",
+    available_skills: str = "",
+    domain: str = "",
+    domain_instructions: str = "",
+    intent_context: str = "",
+) -> str:
+    """构建极简路由 prompt — 主 Agent 只做分发，不做分析。"""
+    preamble = _load_preamble()
+
+    lang_section = (
+        "\n## 输出语言\n"
+        "- 使用中文回答。\n"
+        "- 所有面向用户的文本值使用中文。\n"
+        "- JSON 中 action/direction/confidence 保持英文枚举值。\n"
+    ) if not str(language or "").lower().startswith("en") else (
+        "\n## Output Language\n- Reply in English.\n- All JSON values in English.\n"
+    )
+
+    domain_section = ""
+    if domain_instructions:
+        domain_section = f"\n## 当前领域: {domain}\n\n{domain_instructions}\n"
+
+    intent_section = ""
+    if intent_context:
+        intent_section = f"\n## 意图分析\n\n{intent_context}\n"
+
+    return f"""{preamble}
+
+## 你的角色
+
+你是**路由器**。你的唯一职责是：
+1. 理解用户意图
+2. 选择正确的工具调用
+3. 把工具返回的结果直接作为最终回复输出
+
+**你不做分析，不做判断，不做验证。** 工具的结果就是最终结果。
+
+## ⚠️ 你的可用工具
+
+- **call_skill(skill_name, stock_code, stock_name)** — 调用单个技能分析
+- **execute_chain(chain_id, stock_code, stock_name)** — 调用多技能链路分析
+- **search_stock_by_name(keyword)** — 搜索股票代码（不确定代码时先搜）
+- **final_answer(回复)** — 输出结果
+
+## 可用技能
+
+{available_skills}
+
+## 可用链路
+
+- **evaluate+stock** — 股票综合评估（游资→解禁→情报→技术→指标→选股→行情→回测→多空辩论）
+- **screen+stock** — 选股筛选（条件选股→技术验证→情报过滤）
+- **scan+market** — 市场全景扫描（大盘指数→板块排名→涨停池→资金流向）
+
+## 规则
+
+0. **⚠️ 必须用 final_answer() 返回结果**。
+1. **不需要工具的消息，第一步就 final_answer**。
+2. **分析股票 → call_skill 或 execute_chain**：
+   - 单维度分析（如"技术面分析600519"）→ call_skill
+   - 全面分析（如"分析贵州茅台"、"帮我看看600519"）→ execute_chain
+3. **⚠️ 工具返回后立即 final_answer** — 不要再调任何工具或做额外分析。
+4. **不确定股票代码时** → 先 search_stock_by_name，再 call_skill/execute_chain。
+5. **工具返回的是完整分析报告，直接原样输出，不要修改、总结或重新格式化。**
+
+{intent_section}{domain_section}{lang_section}"""
+
+
 def _build_instructions(user_message: str = "", skill_instructions: str = "",
                         language: str = "zh", tools=None, managed_agents=None,
                         domain: str = "", domain_instructions: str = "",
@@ -146,7 +217,22 @@ def _build_instructions(user_message: str = "", skill_instructions: str = "",
     if str(language or "").lower().startswith("en"):
         lang_section = "\n## Output Language\n- Reply in English.\n- All JSON values in English.\n"
     else:
-        lang_section = "\n## 输出语言\n- 使用中文回答。\n- 所有面向用户的文本值使用中文。\n"
+        lang_section = (
+            "\n## 输出语言\n"
+            "- 使用中文回答。所有输出内容（包括思考过程、代码注释）必须使用中文。\n"
+            "- JSON 中以下字段**必须用英文枚举值**（代码解析需要）：\n"
+            "  action: buy/sell/hold/skip\n"
+            "  direction: bullish/bearish/neutral\n"
+            "  confidence: high/medium/low\n"
+            "  timeframe: T+1/T+3/T+5/1W/1M/3M/1Y\n"
+            "- JSON 中以下字段**必须用中文**（给用户看）：\n"
+            "  signal: 一句话信号摘要，如「多头排列,MACD金叉,放量突破」\n"
+            "  factors[].name: 维度名，如「趋势」「量价」「指标」「形态」「筹码」\n"
+            "  factors[].value: 状态描述，如「主升浪」「缩量回调」「RSI超买」\n"
+            "  analysis: 完整分析文字，全部中文\n"
+            "  timeframe_reason: 为什么选这个时间维度，中文\n"
+            "- 专有名词（MACD/RSI/KDJ/BOLL/MA 等）保持英文即可。\n"
+        )
 
     skill_section = ""
     if skill_instructions:
@@ -271,7 +357,7 @@ final_answer({{
                 weight_lines = ["| 技能 | 权重 |", "|------|------|"]
                 for name, w in sorted(weights.items(), key=lambda x: -x[1]):
                     weight_lines.append(f"| {name} | {w:.2f} |")
-                weight_section = f"\n## 技能权重（历史回溯数据）\n\n{'chr(10)'.join(weight_lines)}\n\n权重越高，该技能的历史预测越准确。\n"
+                weight_section = f"\n## 技能权重（历史回溯数据）\n\n{'\\n'.join(weight_lines)}\n\n权重越高，该技能的历史预测越准确。\n"
         except Exception:
             pass  # 权重注入失败不影响主流程
 
@@ -279,22 +365,37 @@ final_answer({{
 
 {GUIDANCE}
 {tool_catalog}
-{skill_section}{scan_section}{modify_section}{intent_section}{domain_section}{calibration_section}{weight_section}## 规则
+{skill_section}{scan_section}{modify_section}{intent_section}{domain_section}{calibration_section}{weight_section}## 你的角色
 
-0. **⚠️ 必须用 final_answer() 返回结果** — 完成任务后，必须调用 `final_answer(你的回复)` 来结束。
-1. **不需要工具的消息，第一步就 final_answer** — 打招呼、闲聊等直接调用 final_answer。
-2. **必须调用工具获取真实数据** — 绝不编造数字。
-3. **⚠️ 分析股票必须先调 call_skill** — 不要直接调底层工具（get_realtime_quote、analyze_trend 等），先用 `call_skill(skill_name="technical_agent", stock_code="代码")` 获取标准化报告，再按需调其他 skill。
-3. **深度优先** — 分析深度不够时用 Python 代码做量化分析。
-4. **风险优先** — 分析必须包含风险提示。
-5. **工具失败处理** — 记录失败原因，用已有数据继续，不重复调用。
-6. **多维验证** — 技术面结论至少 2 个指标相互验证。
-7. **善用工具** — 可以组合工具做计算、处理数据。
-8. **诚实透明** — 数据不足时明确告知，不猜测。
-9. **⚠️ 数据完整性** — 如果某个工具调用失败（返回 error），必须在结论中说明
-   "XX数据缺失，以下结论仅供参考"。绝不用想象填补缺失数据。
-10. **⚠️ 确定性输出** — 你的分析必须基于工具返回的客观数据，不能因为"感觉"
-    或"可能"而改变方向性判断。同样的数据必须得出同样的结论。
+你是**路由器**。意图分析已经给出了建议（见上方"意图分析"），你的工作是：
+1. 根据建议选择调哪些子 Agent
+2. 调用子 Agent
+3. 把子 Agent 的结果**直接作为最终回复**输出
+
+**你不做分析，不做判断，不做验证。** 子 Agent 的结果就是最终结果。
+
+## ⚠️ 你的可用工具
+
+- **数据层工具**（见"工具分类"中的"数据层"/"显示层"）— 查询数据
+- **search_stock_by_name** — 搜索股票代码
+- **子 agent**（见"可用子 agent"）— 分析任务
+- **final_answer(回复)** — 输出结果
+
+❌ "分析层"/"决策层"工具由子 agent 内部使用，你不能调用。
+
+## 规则
+
+0. **⚠️ 必须用 final_answer() 返回结果**。
+1. **不需要工具的消息，第一步就 final_answer**。
+2. **根据意图分析的建议选择子 Agent** — 见上方"意图分析"中的"工具分类"。
+3. **⚠️ 调完就输出** — 子 Agent 返回结果后，**立即调用 final_answer()**，不要再调任何工具或子 Agent。
+4. **子 Agent 结果 = 最终结果** — 不要修改、不要补充验证、不要重新分析。直接放进 final_answer。
+5. **⚠️ 绝对禁止**：
+   - 收到子 Agent 结果后继续调其他工具或子 Agent
+   - 对子 Agent 数据做二次验证
+   - 同一个子 Agent 调用两次
+6. **子 agent 返回 JSON** — 用 `json.loads()` 解析后直接使用。
+7. **诚实透明** — 子 Agent 返回失败时，**用你手里的数据层工具直接查数据**，能查到多少算多少，在结论中说明"XX子Agent失败，以下为直接查询的数据"。
 {finance_json_section}{lang_section}"""
 
 
@@ -596,10 +697,9 @@ def _step_to_events(step) -> List[Dict[str, Any]]:
     return events
 
 
-# ── Managed Agents 已移除 ────────────────────────────────────
-# 旧机制：每个 Skill → smolagents ManagedAgent（双轨制，BaseSkill 未被调用）
-# 新机制：CallSkillTool 统一调用 BaseSkill.run()（单轨制）
-# 见 agent/skills/call_skill_tool.py
+# ═══════════════════════════════════════════════════════════════
+# 5b. Managed Agent Builder
+# ═══════════════════════════════════════════════════════════════
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -630,58 +730,95 @@ def get_smolagent(
 ) -> "CodeAgent | ToolCallingAgent":
     """Build a fresh agent instance per call.
 
-    Caches only the expensive parts (tools discovery, managed agents).
-    Agent instance is always rebuilt to avoid cross-session state pollution.
+    架构：主 Agent 极简（call_skill / execute_chain / search / final_answer），
+    所有数据工具和分析逻辑封装在 Skill/Chain 内部，不暴露给主 Agent。
     """
-    skill_instructions = get_indicator_skill_instructions(skills, user_id)
     smol_model = build_model(model=model, provider=provider)
 
-    # ── 按领域过滤工具（缓存） ────────────────────────────────
-    domain_key = domain or "all"
-    with _tools_cache_lock:
-        if domain_key not in _tools_cache_by_domain:
-            from app.agent.tools.registry import registry as tool_registry
-            tool_registry.discover()
-            if domain:
-                tools = tool_registry.build({"domain": domain, "deny": list(_EXCLUDED_TOOL_NAMES)})
-            else:
-                tools = tool_registry.build({"deny": list(_EXCLUDED_TOOL_NAMES)})
+    # ── 发现技能 ──
+    from app.agent.skills.registry import skill_registry as _skill_registry
+    _skill_registry.discover()
 
-            _tools_cache_by_domain[domain_key] = tools
-        # 始终拷贝，避免修改缓存原始列表
-        tools = list(_tools_cache_by_domain[domain_key])
+    # ── 构建主 Agent 工具：极简 4 件套 ──
+    from app.agent.skills.skill_executor import SkillExecutionTool
+    from app.agent.chain_executor_tool import ChainExecutionTool
+    from smolagents import FinalAnswerTool
 
-    # ── CallSkillTool（替代 managed_agents）──
-    from app.agent.skills.call_skill_tool import CallSkillTool
-    call_skill = CallSkillTool(model=smol_model, user_id=user_id, collector=collector)
-    tools.append(call_skill)
+    # 1) call_skill — 调用单个 Skill（内部 Python 函数调用 + 按需 LLM）
+    call_skill_tool = SkillExecutionTool(
+        skill=None,  # 不绑定单个 skill，由 forward 动态选择
+        model=smol_model,
+        collector=collector,
+    )
+    # 覆盖 inputs 让主 Agent 知道有哪些 skill 可用
+    _available_skills = ", ".join(
+        f"{s.name}({s.description})" for s in _skill_registry.all_specs
+    )
+    call_skill_tool.inputs = {
+        "skill_name": {
+            "type": "string",
+            "description": f"技能名。可选值: {_available_skills}",
+            "nullable": True,
+        },
+        "stock_code": {
+            "type": "string",
+            "description": "股票代码，如 600519、000858",
+            "nullable": True,
+        },
+        "stock_name": {
+            "type": "string",
+            "description": "股票名称（可选），如 贵州茅台",
+            "nullable": True,
+        },
+    }
 
-    # ── 金融领域：用 TracedTool 包装所有工具 ──────────────────
-    if collector:
-        from app.agent.traced_tool import TracedTool
-        tools = [TracedTool(t, collector) for t in tools]
+    # 2) execute_chain — 调用 Chain 编排（内部 Python 函数调用 + 按需 LLM）
+    chain_tool = ChainExecutionTool(
+        model=smol_model,
+        collector=collector,
+        user_id=user_id,
+    )
 
-    instructions = _build_instructions(
-        user_message, skill_instructions, language, tools, managed_agents=None,
-        domain=domain, domain_instructions=domain_instructions,
+    # 3) search_stock_by_name — 轻量搜索
+    search_tool = None
+    from app.agent.tools.registry import registry as tool_registry
+    tool_registry.discover()
+    all_tools = tool_registry.build({"deny": list(_EXCLUDED_TOOL_NAMES)})
+    for t in all_tools:
+        if t.name == "search_stock_by_name":
+            search_tool = t
+            break
+
+    # 4) final_answer — 输出
+    final_tool = FinalAnswerTool()
+
+    router_tools = [call_skill_tool, chain_tool, final_tool]
+    if search_tool:
+        router_tools.insert(2, search_tool)
+
+    # ── 极简 prompt：只做路由，不做分析 ──
+    instructions = _build_router_instructions(
+        language=language,
+        available_skills=_available_skills,
+        domain=domain,
+        domain_instructions=domain_instructions,
         intent_context=intent_context,
     )
 
     AgentClass = _get_agent_class()
 
-    # ── Always build fresh agent (avoid cross-session state pollution) ──
     _extra_kwargs = {}
     if AgentClass is CodeAgent:
         _extra_kwargs["additional_authorized_imports"] = [
-            "pandas", "numpy", "json", "math", "statistics",
-            "datetime", "collections", "itertools", "re",
+            "json", "datetime",
         ]
+        _extra_kwargs["executor_kwargs"] = {"timeout_seconds": int(os.getenv("AGENT_EXEC_TIMEOUT", "300"))}
 
     # 金融领域用 JSON 校验，其他领域用宽松校验
     checks = [_check_output_json] if domain == "finance" else [_check_dashboard_json]
 
     agent = AgentClass(
-        tools=tools,
+        tools=router_tools,
         model=smol_model,
         max_steps=max_steps,
         instructions=instructions,
@@ -694,9 +831,8 @@ def get_smolagent(
     )
 
     logger.info(
-        "[Agent] Built %s for user=%s domain=%s: %d tools, max_steps=%d, collector=%s",
-        AgentClass.__name__, user_id, domain_key, len(tools), max_steps,
-        "yes" if collector else "no",
+        "[Agent] Built %s for user=%s domain=%s: %d router tools (call_skill/execute_chain/search/final_answer), max_steps=%d",
+        AgentClass.__name__, user_id, domain or "all", len(router_tools), max_steps,
     )
     return agent
 
@@ -719,7 +855,7 @@ class AgentResult:
 
 
 def build_agent_executor(
-    skills=None, user_id=1, max_steps=10,
+    skills=None, user_id=1, max_steps=6,
     timeout_seconds=None, model=None, provider=None,
 ):
     return _AgentExecutor(
@@ -828,6 +964,16 @@ class _AgentExecutor:
                     context = context or {}
                     context["stock_code"] = _stock_code
                     logger.info("[Prepare] 从消息提取股票代码: %s", _stock_code)
+                # 查股票名称（避免 LLM 瞎编）
+                if not (context and context.get("stock_name")):
+                    try:
+                        from app.utils.basicinfo_db import get_stock_basic_db
+                        _matches = get_stock_basic_db().search_stocks(_stock_code, limit=1)
+                        if _matches:
+                            context["stock_name"] = _matches[0].get("name", "")
+                            logger.info("[Prepare] 代码→名称: %s → %s", _stock_code, context["stock_name"])
+                    except Exception:
+                        pass
             else:
                 # 2. 中文名查找
                 from app.agent.text_utils import extract_stock_from_message
@@ -839,7 +985,7 @@ class _AgentExecutor:
                         context["stock_name"] = _name
                     logger.info("[Prepare] 中文名 → 代码 %s", _code)
 
-        # ── 提取意图信息，供后置评估使用 ──────────────────────
+        # ── 提取意图信息，供主 Agent 路由决策参考 ─────────────
         _eval_verb = ""
         _eval_noun = ""
         _eval_tool_chain = []
@@ -877,9 +1023,12 @@ class _AgentExecutor:
             if context.get("stock_name"):
                 ctx_parts.append(f"股票名称: {context['stock_name']}")
             if context.get("realtime_quote"):
-                ctx_parts.append(f"[已获取的实时行情]\n{json.dumps(context['realtime_quote'], ensure_ascii=False)[:2000]}")
+                # 只注入摘要，不注入原始 JSON（避免 LLM 尝试 json.loads()）
+                _q = context["realtime_quote"]
+                _q_summary = f"最新价:{_q.get('price', _q.get('last', '?'))} 涨跌幅:{_q.get('change_pct', _q.get('pct_change', '?'))}%"
+                ctx_parts.append(f"[已获取的实时行情摘要] {_q_summary}（如需完整数据请调用 get_realtime_quote）")
             if context.get("chip_distribution"):
-                ctx_parts.append(f"[已获取的筹码分布]\n{json.dumps(context['chip_distribution'], ensure_ascii=False)[:2000]}")
+                ctx_parts.append(f"[已获取的筹码分布数据]（如需完整数据请调用 get_chip_distribution）")
 
         # 数据完整性预检：标记缺失的数据维度
         _missing_data_hints = []
@@ -951,20 +1100,7 @@ class _AgentExecutor:
                 model="intent-quick-reply", error=None,
             )
 
-        # ── 链路执行：检测是否有匹配的编排链路 ───────────────
-        # 金融领域跳过 _try_chain：agent 自规划 + call_skill 自执行
-        _intent_verb = meta.get("intent_verb", "")
-        _intent_noun = meta.get("intent_noun", "")
-        _eval_domain = meta.get("domain", "")
-        if _eval_domain != "finance":
-            chain_result = self._try_chain(
-                _intent_verb, _intent_noun, message, session_id, context, user_id,
-            )
-            if chain_result is not None:
-                store.add_message(session_id, "assistant", chain_result.content)
-                return chain_result
-
-        # 保存意图信息，供后置评估使用
+        # ── 保存意图信息，供后置评估使用 ───────────────────
         _intent_verb = meta.get("intent_verb", "")
         _intent_noun = meta.get("intent_noun", "")
         _tool_chain = meta.get("tool_chain", [])
@@ -1364,11 +1500,11 @@ class _AgentExecutor:
             return
 
         # ── 链路执行：检测是否有匹配的编排链路 ───────────────
-        # 金融领域跳过 _try_chain：agent 自规划 + call_skill 自执行
+        # 金融领域走 Chain 编排（多 Skill 协作），非金融域 agent 自规划
         _intent_verb = meta.get("intent_verb", "")
         _intent_noun = meta.get("intent_noun", "")
         _stream_domain_check = meta.get("domain", "")
-        if _stream_domain_check != "finance":
+        if _stream_domain_check == "finance":
             chain_result = self._try_chain(
                 _intent_verb, _intent_noun, message, session_id, context, user_id,
             )

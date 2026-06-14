@@ -92,8 +92,6 @@ def _python_type_to_str(tp) -> str:
 
 
 
-
-
 # ═══════════════════════════════════════════════════════════════
 # ToolSpec — lightweight tool metadata container
 # ═══════════════════════════════════════════════════════════════
@@ -105,7 +103,7 @@ class ToolSpec:
     name: str
     description: str
     category: str = ""
-    layer: List[str] = field(default_factory=list)  # 架构分层：可多层，如 ["数据层","分析层"]
+    layer: str = ""          # 架构分层：显示层/数据层/分析层/决策层/执行层/支撑层
     domain: List[str] = field(default_factory=list)  # 领域标签：["finance"] / ["coding"] / ["finance","coding"] / []=通用
     output_type: str = "string"
     meta: Dict[str, Any] = field(default_factory=dict)
@@ -137,12 +135,12 @@ class ToolSpec:
 
         param_names = list(sig.parameters.keys())
 
-        def _make_forward(_fn):
+        def _make_forward(_fn, _param_names, _sig, _tool_name):
             def forward(self, **kwargs):
                 return _fn(**kwargs)
             params = [inspect.Parameter("self", inspect.Parameter.POSITIONAL_OR_KEYWORD)]
-            for pname in param_names:
-                orig = sig.parameters[pname]
+            for pname in _param_names:
+                orig = _sig.parameters[pname]
                 # Preserve original default; use None only if the param is optional or has a default
                 if orig.default is not inspect.Parameter.empty:
                     default = orig.default
@@ -160,7 +158,7 @@ class ToolSpec:
                 "description": self.description,
                 "inputs": inputs,
                 "output_type": self.output_type,
-                "forward": _make_forward(self.fn),
+                "forward": _make_forward(self.fn, param_names, sig, self.name),
             },
         )
         return tool_class()
@@ -212,19 +210,12 @@ class ToolRegistry:
         self._discovered = False
 
     def register(self, fn: Callable, name: str, description: str,
-                 category: str = "", layer: Any = "", domain: List[str] = None,
+                 category: str = "", layer: str = "", domain: List[str] = None,
                  output_type: str = "string", **meta):
         """Register a tool function. Called by the @tool decorator."""
-        # layer 支持: "数据层", "数据层,分析层", ["数据层","分析层"]
-        if isinstance(layer, str):
-            layers = [s.strip() for s in layer.split(",") if s.strip()] if layer else []
-        elif isinstance(layer, (list, tuple)):
-            layers = [s.strip() for s in layer if s.strip()]
-        else:
-            layers = []
         spec = ToolSpec(
             fn=fn, name=name, description=description,
-            category=category, layer=layers, domain=domain or [],
+            category=category, layer=layer, domain=domain or [],
             output_type=output_type, meta=meta,
         )
         self._tools[name] = spec
@@ -295,13 +286,12 @@ class ToolRegistry:
 
     @property
     def layered_categories(self) -> Dict[str, Dict[str, List[str]]]:
-        """Return {layer: {category: [tool_names]}} mapping. A tool can appear in multiple layers."""
+        """Return {layer: {category: [tool_names]}} mapping."""
         layers: Dict[str, Dict[str, List[str]]] = {}
         for spec in self._tools.values():
-            tool_layers = spec.layer if spec.layer else ["未分层"]
+            layer = spec.layer or "未分层"
             cat = spec.category or "其他"
-            for layer in tool_layers:
-                layers.setdefault(layer, {}).setdefault(cat, []).append(spec.name)
+            layers.setdefault(layer, {}).setdefault(cat, []).append(spec.name)
         return layers
 
     @property

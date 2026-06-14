@@ -26,11 +26,42 @@ from __future__ import annotations
 import importlib
 import logging
 import pkgutil
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Type
 
 from app.agent.skills.base import BaseSkill
 
 logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════
+# SkillSpec — Skill 元数据 + 子 agent 配置
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class SkillSpec:
+    """Skill 完整元数据，含子 agent 构造参数。
+
+    Attributes:
+        cls: BaseSkill 子类
+        name: 技能唯一标识
+        description: 技能描述
+        tools: 依赖的工具名列表
+        instructions: 给 LLM 的指令（注入到 prompt 中）
+        priority: 优先级（越高越先执行）
+        default_weight: 出厂权重
+        max_steps: 子 agent 最大步数（默认 2: execute_skill + final_answer）
+        run_summary: 是否返回执行摘要（默认 True）
+    """
+    cls: Type[BaseSkill]
+    name: str
+    description: str
+    tools: List[str]
+    instructions: str
+    priority: int
+    default_weight: float
+    max_steps: int = 2
+    run_summary: bool = True
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -44,6 +75,8 @@ def skill(
     instructions: str = "",
     priority: int = 0,
     default_weight: float = 1.0,
+    max_steps: int = 2,
+    run_summary: bool = True,
 ) -> Callable:
     """装饰器：将普通类转换为 BaseSkill 子类并自动注册。
 
@@ -53,6 +86,7 @@ def skill(
             description="A股技术面+动量分析专家",
             tools=["analyze_trend", "get_indicator_snapshot"],
             priority=9,
+            max_steps=3,
         )
         class TechnicalSkill:
             pass
@@ -61,6 +95,7 @@ def skill(
         - MomentumTrackerSkill 变成 BaseSkill 的子类
         - 自动注册到全局 skill_registry
         - instructions 存储在类属性中，由 BaseSkill.build_prompt() 使用
+        - max_steps / run_summary 存储在 SkillSpec 中，用于子 agent 构造
 
     Args:
         name: 技能唯一标识
@@ -68,6 +103,9 @@ def skill(
         tools: 依赖的工具名列表
         instructions: 给 LLM 的指令（注入到 prompt 中）
         priority: 优先级（越高越先执行）
+        default_weight: 出厂权重
+        max_steps: 子 agent 最大步数（默认 2: execute_skill + final_answer）
+        run_summary: 是否返回执行摘要（默认 True）
 
     Returns:
         装饰器函数
@@ -104,8 +142,19 @@ def skill(
         if custom_algo_analyze is not None:
             skill_cls.algo_analyze = custom_algo_analyze
 
-        # 自动注册到全局 registry
-        skill_registry.register(skill_cls)
+        # 自动注册到全局 registry（传 SkillSpec）
+        spec = SkillSpec(
+            cls=skill_cls,
+            name=name,
+            description=description,
+            tools=list(tools),
+            instructions=instructions,
+            priority=priority,
+            default_weight=default_weight,
+            max_steps=max_steps,
+            run_summary=run_summary,
+        )
+        skill_registry.register(spec)
 
         return skill_cls
 
@@ -125,21 +174,22 @@ class SkillRegistry:
     """
 
     def __init__(self):
-        self._skills: Dict[str, Type[BaseSkill]] = {}
-        self._instances: Dict[str, BaseSkill] = {}
+        self._specs: Dict[str, SkillSpec] = {}      # name → SkillSpec
+        self._instances: Dict[str, BaseSkill] = {}  # name → BaseSkill 实例（懒加载）
         self._discovered = False
 
-    def register(self, cls: Type[BaseSkill]):
-        """注册一个 BaseSkill 子类。"""
-        if not hasattr(cls, "name") or not cls.name:
-            logger.warning("[SkillRegistry] 跳过无 name 的类: %s", cls)
+    def register(self, spec: SkillSpec):
+        """注册一个 Skill 的完整元数据。"""
+        if not spec.name:
+            logger.warning("[SkillRegistry] 跳过无 name 的 spec: %s", spec)
             return
-        if cls.name in self._skills:
-            logger.debug("[SkillRegistry] 覆盖注册: %s", cls.name)
-        self._skills[cls.name] = cls
+        if spec.name in self._specs:
+            logger.debug("[SkillRegistry] 覆盖注册: %s", spec.name)
+        self._specs[spec.name] = spec
         # 清除旧实例缓存（如果覆盖注册）
-        self._instances.pop(cls.name, None)
-        logger.debug("[SkillRegistry] 注册: %s (priority=%s)", cls.name, getattr(cls, "priority", 0))
+        self._instances.pop(spec.name, None)
+        logger.debug("[SkillRegistry] 注册: %s (priority=%s, max_steps=%s)",
+                     spec.name, spec.priority, spec.max_steps)
 
     def discover(self, package: str = "app.agent.skills"):
         """导入包下所有模块，自动发现 BaseSkill 子类并注册。
@@ -166,53 +216,79 @@ class SkillRegistry:
                         and attr is not BaseSkill
                         and hasattr(attr, "name")
                         and attr.name
+                        and attr.name not in self._specs  # @skill 优先
                     ):
-                        self.register(attr)
+                        spec = SkillSpec(
+                            cls=attr,
+                            name=attr.name,
+                            description=getattr(attr, "description", ""),
+                            tools=list(getattr(attr, "tools", [])),
+                            instructions=getattr(attr, "instructions", ""),
+                            priority=getattr(attr, "priority", 0),
+                            default_weight=getattr(attr, "default_weight", 1.0),
+                            max_steps=getattr(attr, "max_steps", 2),
+                            run_summary=getattr(attr, "run_summary", True),
+                        )
+                        self.register(spec)
             except Exception as e:
                 logger.warning("[SkillRegistry] 导入 %s.%s 失败: %s", package, mod_name, e)
 
         self._discovered = True
         logger.info("[SkillRegistry] 发现 %d 个 Skill: %s",
-                    len(self._skills), list(self._skills.keys()))
+                    len(self._specs), list(self._specs.keys()))
 
     def get(self, name: str) -> Optional[BaseSkill]:
         """获取 Skill 实例（懒加载单例）。"""
         if name in self._instances:
             return self._instances[name]
 
-        cls = self._skills.get(name)
-        if cls is None:
+        spec = self._specs.get(name)
+        if spec is None:
             return None
 
-        instance = cls()
+        instance = spec.cls()
         self._instances[name] = instance
         return instance
 
     def get_class(self, name: str) -> Optional[Type[BaseSkill]]:
         """获取 Skill 类（非实例）。"""
-        return self._skills.get(name)
+        spec = self._specs.get(name)
+        return spec.cls if spec else None
+
+    def get_spec(self, name: str) -> Optional[SkillSpec]:
+        """获取 Skill 完整元数据（含子 agent 配置）。"""
+        return self._specs.get(name)
 
     @property
     def all_skills(self) -> List[BaseSkill]:
         """返回所有已注册 Skill 的实例，按 priority 降序排列。"""
         return [
             self.get(name)
-            for name, cls in sorted(
-                self._skills.items(),
-                key=lambda x: getattr(x[1], "priority", 0),
+            for name in sorted(
+                self._specs.keys(),
+                key=lambda n: self._specs[n].priority,
                 reverse=True,
             )
         ]
 
     @property
+    def all_specs(self) -> List[SkillSpec]:
+        """返回所有 SkillSpec，按 priority 降序排列。"""
+        return sorted(
+            self._specs.values(),
+            key=lambda s: s.priority,
+            reverse=True,
+        )
+
+    @property
     def all_names(self) -> List[str]:
-        return list(self._skills.keys())
+        return list(self._specs.keys())
 
     def __len__(self):
-        return len(self._skills)
+        return len(self._specs)
 
     def __contains__(self, name: str):
-        return name in self._skills
+        return name in self._specs
 
 
 # ── 全局单例 ──

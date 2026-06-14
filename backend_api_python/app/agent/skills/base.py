@@ -505,6 +505,10 @@ class BaseSkill(ABC):
             "✅ 允许: score / direction / confidence / signal / factors（数据事实）\n"
             "❌ 禁止: 操作建议（买入/卖出/持有/观望）/ 冗长分析文字 / action 字段\n"
             "signal 和 factors.value 用最简短的词组，不要写句子。\n"
+        )
+
+        # 语言要求
+        parts.append(
             "\n## 语言要求\n"
             "所有输出必须使用中文。\n"
             "- signal: 中文信号摘要，如「多头排列,MACD金叉」\n"

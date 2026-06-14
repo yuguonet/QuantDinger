@@ -19,8 +19,6 @@ import time
 from datetime import date
 from typing import Any, Dict, List, Optional
 
-from app.agent.chain.schema import EvalNode, FactorItem, Layer, SkillReport, Status
-
 from app.agent.chain.schema import (
     EvalNode, FactorItem, Layer, SkillReport, Status,
 )

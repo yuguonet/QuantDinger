@@ -735,7 +735,7 @@ def analyze_pattern(stock_code: str) -> Dict[str, Any]:
 @tool(
     description="分析筹码分布：获利比例、平均成本、集中度、支撑压力位（仅A股支持）。基于120根日K线衰减成本分布模型计算。",
     category="技术分析",
-    layer="分析层",
+    layer="数据层,分析层",
     domain=["finance"],
 )
 def get_chip_distribution(stock_code: str, lookback_days: int = 120) -> Dict[str, Any]:
