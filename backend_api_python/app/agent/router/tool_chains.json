@@ -7,11 +7,11 @@
             }
         ],
         "stats": {
-            "avg_steps": 3.37,
-            "executions": 8,
-            "success_count": 8,
+            "avg_steps": 3.3,
+            "executions": 10,
+            "success_count": 10,
             "success_rate": 1.0,
-            "last_updated": "2026-06-14"
+            "last_updated": "2026-06-15"
         }
     },
     "analyze+chart": {
@@ -619,11 +619,11 @@
             }
         ],
         "stats": {
-            "avg_steps": 2.0,
-            "executions": 2,
-            "success_count": 2,
+            "avg_steps": 2.6,
+            "executions": 5,
+            "success_count": 5,
             "success_rate": 1.0,
-            "last_updated": "2026-06-14"
+            "last_updated": "2026-06-15"
         }
     }
 }

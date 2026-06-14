@@ -721,6 +721,7 @@ class AgentResult:
 def build_agent_executor(
     skills=None, user_id=1, max_steps=10,
     timeout_seconds=None, model=None, provider=None,
+    domain=None,
 ):
     return _AgentExecutor(
         skills=skills, user_id=user_id, max_steps=max_steps,
@@ -879,33 +880,59 @@ class _AgentExecutor:
         ctx_parts = []
 
         # 压缩上下文（上轮分析摘要，领域切换时自动丢弃）
-        context_summary, summary_age = store.get_context_summary(session_id, current_domain=domain, with_age=True)
+        # get_context_summary 返回带轮次分隔符的拼接摘要
+        context_summary, total_rounds = store.get_context_summary(session_id, current_domain=domain, with_age=True)
         if context_summary:
-            age_hint = f" (已存{summary_age}轮)" if summary_age > 0 else ""
-            ctx_parts.append(f"[上轮分析摘要{age_hint}]\n{context_summary}")
+            # context_summary 已含 "━━━ 第N轮 ━━━" 标记，直接注入
+            ctx_parts.append(context_summary)
+            round_num = total_rounds + 1
+        else:
+            round_num = 1
 
-        if context:
-            if context.get("stock_code"):
-                ctx_parts.append(f"股票代码: {context['stock_code']}")
-            if context.get("stock_name"):
-                ctx_parts.append(f"股票名称: {context['stock_name']}")
-            if context.get("realtime_quote"):
-                ctx_parts.append(f"[已获取的实时行情]\n{json.dumps(context['realtime_quote'], ensure_ascii=False)[:2000]}")
-            if context.get("chip_distribution"):
-                ctx_parts.append(f"[已获取的筹码分布]\n{json.dumps(context['chip_distribution'], ensure_ascii=False)[:2000]}")
+        # ── 领域上下文注入规则 ──────────────────────────────────
+        # 每个域定义需要注入的 context 字段和缺失数据提示
+        _DOMAIN_CTX = {
+            "finance": {
+                "fields": {
+                    "stock_code": "股票代码",
+                    "stock_name": "股票名称",
+                },
+                "json_fields": {
+                    "realtime_quote": "实时行情",
+                    "chip_distribution": "筹码分布",
+                },
+                "missing_hints": ["realtime_quote", "chip_distribution"],
+            },
+            "trading": {
+                "fields": {
+                    "stock_code": "股票代码",
+                    "stock_name": "股票名称",
+                },
+                "json_fields": {},
+                "missing_hints": [],
+            },
+        }
+        # coding / system / chat / unknown → 无特殊上下文需求
 
-        # 数据完整性预检：标记缺失的数据维度
-        _missing_data_hints = []
-        if context:
-            if not context.get("realtime_quote"):
-                _missing_data_hints.append("实时行情")
-            if not context.get("chip_distribution"):
-                _missing_data_hints.append("筹码分布")
-        if _missing_data_hints:
-            ctx_parts.append(
-                f"[数据完整性提示] 以下数据在请求时尚未提供，你需要在分析时主动获取: "
-                f"{', '.join(_missing_data_hints)}。如果工具调用失败，必须在结论中说明。"
-            )
+        _domain_cfg = _DOMAIN_CTX.get(domain)
+        _current_round_parts = []
+        if _domain_cfg and context:
+            # 注入简单字段
+            for key, label in _domain_cfg["fields"].items():
+                if context.get(key):
+                    _current_round_parts.append(f"{label}: {context[key]}")
+            # 注入 JSON 字段（截断）
+            for key, label in _domain_cfg["json_fields"].items():
+                if context.get(key):
+                    _current_round_parts.append(f"[{label}]\n{json.dumps(context[key], ensure_ascii=False)[:2000]}")
+            # 缺失数据提示
+            _missing = [label for key, label in _domain_cfg["json_fields"].items()
+                        if key in _domain_cfg["missing_hints"] and not context.get(key)]
+            if _missing:
+                _current_round_parts.append(f"需获取: {', '.join(_missing)}")
+
+        if _current_round_parts:
+            ctx_parts.append(f"--- R{round_num} ---\n" + "\n".join(_current_round_parts))
 
         if ctx_parts:
             enriched = "\n".join(ctx_parts) + "\n\n" + message
