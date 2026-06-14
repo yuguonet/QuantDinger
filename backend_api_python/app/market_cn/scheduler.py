@@ -103,11 +103,11 @@ def _refresh_slow():
     """盘中慢档: 贪恐/情绪/政策/新闻/全球情绪 + 日级"""
     from app.market_cn.china_market import refresh_fear_greed, refresh_policy
     from app.market_cn.emotion import refresh_emotion_cycle
-    from app.data_providers.global_market import refresh_global_sentiment, refresh_global_news
+    from app.data_providers.global_market import refresh_global_sentiment
 
     _run_all("slow", [
         refresh_fear_greed, refresh_policy, refresh_emotion_cycle,
-        refresh_global_sentiment, refresh_global_news,
+        refresh_global_sentiment,
     ])
 
     # 日级数据（盘中也能更新）也放到慢档
@@ -122,13 +122,10 @@ def _refresh_fast():
     )
     from app.market_cn.china_market import refresh_hot_sectors
     from app.market_cn.dragon_limit import refresh_hot_rank
-    from app.data_providers.global_market import refresh_global_indices, refresh_global_heatmap
-
     _run_all("fast", [
         refresh_index_realtime, refresh_northbound_realtime,
         refresh_market_fund_flow_realtime, refresh_sector_fund_flow,
         refresh_hot_sectors, refresh_hot_rank,
-        refresh_global_indices, refresh_global_heatmap,
     ])
 
 
@@ -317,3 +314,12 @@ def start():
 
     # 前复权因子全量更新（交易日 6:00）
     threading.Thread(target=_schedule_adj_update, daemon=True, name="adj-factors-scheduler").start()
+
+    # 板块历史采集（每日收盘后 15:30）
+    if _os.getenv("SECTOR_HISTORY_ENABLED", "false").lower() == "true":
+        try:
+            from app.market_cn.sector_history import SectorHistoryScheduler
+            SectorHistoryScheduler().start()
+            logger.info("[scheduler] SectorHistoryScheduler 已启动")
+        except Exception as e:
+            logger.warning("[scheduler] SectorHistoryScheduler 启动失败: %s", e)

@@ -12,30 +12,17 @@ meta = CardMeta(
 
 
 def fetch():
-    from app.market_cn.china_market import get_fear_greed, get_policy
-    from app.market_cn.sector_history import get_sector_history as _get_sector_history
+    from app.market_cn.china_market import get_fear_greed
 
     fear_greed = {}
-    policy = {}
-    sector_history = {}
 
     try:
         fear_greed = get_fear_greed() or {}
     except Exception:
         pass
-    try:
-        policy = get_policy() or {}
-    except Exception:
-        pass
-    try:
-        sector_history = _get_sector_history(board_type="industry", days=30) or {}
-    except Exception:
-        pass
 
     return {
         "fearGreed": fear_greed,
-        "policy": policy,
-        "sectorHistory": sector_history,
     }
 
 

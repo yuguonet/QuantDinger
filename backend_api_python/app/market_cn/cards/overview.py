@@ -22,8 +22,8 @@ def fetch():
     # 涨停池
     limit_up = streak_height = 0
     try:
-        from app.market_cn.dragon_limit import get_limit_up_pool
-        zt = get_limit_up_pool()
+        from app.market_cn.dragon_limit import get_zt_pool
+        zt = get_zt_pool()
         if zt:
             limit_up = len(zt)
             streak_height = max((safe_int(i.get("continuous_zt_days", 1)) for i in zt), default=0)
@@ -33,13 +33,13 @@ def fetch():
     # 跌停 / 炸板
     limit_down = broken_board = 0
     try:
-        from app.market_cn.dragon_limit import get_limit_down_count
-        limit_down = get_limit_down_count()
+        from app.market_cn.dragon_limit import get_dt_pool
+        limit_down = len(get_dt_pool())
     except Exception:
         pass
     try:
-        from app.market_cn.dragon_limit import get_broken_board_count
-        broken_board = get_broken_board_count()
+        from app.market_cn.dragon_limit import get_broken_board
+        broken_board = len(get_broken_board())
     except Exception:
         pass
 

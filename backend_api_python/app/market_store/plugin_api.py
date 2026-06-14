@@ -121,18 +121,7 @@ def _get_base_url() -> str:
 
 def _fetch_overview_inproc() -> Dict[str, Any]:
     """通过 global_market 获取 overview 数据（自带缓存）。"""
-    from app.data_providers.global_market import get_indices
-
     result = {"indices": [], "forex": [], "crypto": [], "commodities": []}
-
-    try:
-        resp = get_indices()
-        data = resp.get("data", {}) if isinstance(resp, dict) else {}
-        result["indices"] = data.get("indices", []) or []
-        result["forex"] = data.get("forex", []) or []
-        result["crypto"] = data.get("crypto", []) or []
-    except Exception as e:
-        log.error("inproc fetch indices/forex/crypto failed: %s", e)
 
     # commodities 在 get_sentiment() 里
     try:

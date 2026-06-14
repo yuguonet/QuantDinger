@@ -232,9 +232,6 @@ def refresh_data():
 
 from app.data_providers.global_market import (
     get_sentiment,
-    get_indices as _get_indices,
-    get_heatmap as _get_heatmap,
-    get_news as _get_news,
     refresh as refresh_intl,
 )
 
@@ -250,32 +247,7 @@ def market_sentiment():
         return jsonify({"code": 0, "msg": str(e), "data": {}})
 
 
-@global_market_bp.route("/indices", methods=["GET"])
-def market_indices():
-    try:
-        return jsonify(_get_indices())
-    except Exception as e:
-        logger.error("indices 失败: %s", e, exc_info=True)
-        return jsonify({"code": 0, "msg": str(e), "data": {}})
 
-
-@global_market_bp.route("/heatmap", methods=["GET"])
-def market_heatmap():
-    try:
-        return jsonify(_get_heatmap())
-    except Exception as e:
-        logger.error("heatmap 失败: %s", e, exc_info=True)
-        return jsonify({"code": 0, "msg": str(e), "data": {}})
-
-
-@global_market_bp.route("/news", methods=["GET"])
-def market_news():
-    lang = request.args.get("lang", "all")
-    try:
-        return jsonify(_get_news(lang=lang))
-    except Exception as e:
-        logger.error("news 失败: %s", e, exc_info=True)
-        return jsonify({"code": 0, "msg": str(e), "data": {}})
 
 
 @global_market_bp.route("/refresh", methods=["POST"])

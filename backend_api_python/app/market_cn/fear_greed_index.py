@@ -148,11 +148,9 @@ def _limit_ratio():
 
 _CALC = [
     ("股价动量",     _momentum),
-    ("市场宽度",     _breadth),
     ("市场波动率",   _volatility),
     ("成交量变化",   _volume),
     ("北向资金",     _northbound),
-    ("涨跌停比",     _limit_ratio),
 ]
 
 
