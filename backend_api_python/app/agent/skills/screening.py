@@ -28,7 +28,7 @@ from app.agent.skills.registry import skill
         "4. **条件选股** — 用 search_stocks 按自然语言条件筛选。\n"
         "5. **指标验证** — 用 run_indicator_signal 验证筛选结果的技术信号。\n\n"
         "用 get_hot_rank 看市场关注度排名，用 get_limit_pool(pool_type=all) 看涨跌停/炸板情绪面。\n"
-        "   用 get_stock_info 获取PE/PB/市值做估值筛选，用 get_holder_count 看筹码集中度。\n"
+        "   用 get_stock_info 获取PE/PB/市值做估值筛选，用 get_capital_summary 看中长线基本面（筹码集中度、融资融券、大宗交易、分红、财报三表）。\n"
         "   用 get_stock_sector_info 查个股所属行业/概念，配合热门板块做概念选股。\n\n"
         "必须调用工具获取真实数据，绝不编造。"
         "\n\n## 输出格式（必须遵守）\n"

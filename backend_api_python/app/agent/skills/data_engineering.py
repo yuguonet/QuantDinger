@@ -36,31 +36,7 @@ from app.agent.skills.registry import skill
   trading_executor, exchange_execution, ibkr_trading, mt5_trading, live_trading,
   logger, config_loader, agent（避免自引用）
 
-每个用户的代码空间按 user_id + domain 隔离，可安全迭代。
-
-## 输出格式（必须遵守）
-
-你的 final_answer 必须包含以下JSON结构（嵌在正文中即可）：
-
-```json
-{
-  "direction": "bullish/bearish/neutral",
-  "confidence": 0.0-1.0,
-  "score": 0-100,
-  "signal": "一句话信号摘要",
-  "factors": [
-    {"name": "因子名", "value": "值", "score": 0-100, "status": "ok"}
-  ]
-}
-```
-
-规则：
-- score: 0=极度看空, 50=中性, 100=极度看多。基于数据客观打分。
-- confidence: 数据充分程度（0=完全没数据, 1=数据非常充分）。不是方向确定性。
-- direction: 基于score判断。score>=60=bullish, score<=40=bearish, 其余=neutral。
-- status: ok=有数据, missing=数据缺失。缺失的因子必须标missing，不能编造。
-- signal: 一句话总结关键信号。
-- factors: 每个分析维度一行。包含你调用工具获取的所有关键数据点。""",
+每个用户的代码空间按 user_id + domain 隔离，可安全迭代。""",
     tools=[
         "workspace_list",
         # workspace_save_script / workspace_write_file / workspace_edit_file 等

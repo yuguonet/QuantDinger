@@ -582,5 +582,20 @@
             "success_rate": 1.0,
             "last_updated": "2026-06-14"
         }
+    },
+    "query+indicator": {
+        "steps": [
+            {
+                "tool": "python_interpreter",
+                "desc": ""
+            }
+        ],
+        "stats": {
+            "avg_steps": 3.0,
+            "executions": 1,
+            "success_count": 1,
+            "success_rate": 1.0,
+            "last_updated": "2026-06-14"
+        }
     }
 }

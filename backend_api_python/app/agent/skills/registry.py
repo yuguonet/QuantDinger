@@ -20,6 +20,15 @@ Skill Registry — 统一 Skill 注册中心。
   2. skill_registry.discover() 导入 skills/ 包下所有模块
   3. skill_registry.get(name) → BaseSkill 实例
   4. skill_registry.all_skills → 按 priority 排序的 Skill 列表
+
+标准化输出规则：
+  仅 domain=finance 且有 stock_code 且需要买卖信号的 Skill 使用标准化输出。
+  标准化输出 = final_answer 包含 JSON（direction/confidence/score/signal/factors）
+
+  适用：technical_agent / indicator_agent / market_data_agent / lockup_watcher /
+        backtest_agent / trading_agent / screening_agent / bb_screener
+  不适用：bear_researcher / bull_researcher / intelligence_agent /
+          hot_money_tracker / data_agent（无 stock_code，直接返回分析文本）
 """
 from __future__ import annotations
 

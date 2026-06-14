@@ -39,29 +39,7 @@ from app.agent.skills.registry import skill
         "- 并购重组是A股最强催化之一\n"
         "- 行业政策（如新能源补贴）驱动板块行情\n"
         "- 利空出尽是利好（解禁/ST后反弹）\n\n"
-        "数据不足时明确告知，不编造。"
-        "\n\n## 输出格式（必须遵守）\n"
-        "你的 final_answer 必须包含以下JSON结构（嵌在正文中即可）：\n"
-        "\n"
-        "```json\n"
-        "{\n"
-        "  \"direction\": \"bullish/bearish/neutral\",\n"
-        "  \"confidence\": 0.0-1.0,\n"
-        "  \"score\": 0-100,\n"
-        "  \"signal\": \"一句话信号摘要\",\n"
-        "  \"factors\": [\n"
-        "    {\"name\": \"因子名\", \"value\": \"值\", \"score\": 0-100, \"status\": \"ok\"}\n"
-        "  ]\n"
-        "}\n"
-        "```\n"
-        "\n"
-        "规则：\n"
-        "- score: 0=极度看空, 50=中性, 100=极度看多。基于数据客观打分。\n"
-        "- confidence: 数据充分程度（0=完全没数据, 1=数据非常充分）。不是方向确定性。\n"
-        "- direction: 基于score判断。score>=60=bullish, score<=40=bearish, 其余=neutral。\n"
-        "- status: ok=有数据, missing=数据缺失。缺失的因子必须标missing，不能编造。\n"
-        "- signal: 一句话总结关键信号。\n"
-        "- factors: 每个分析维度一行。包含你调用工具获取的所有关键数据点。",
+        "数据不足时明确告知，不编造。",
     ),
     tools=[
         "search_comprehensive_intel",

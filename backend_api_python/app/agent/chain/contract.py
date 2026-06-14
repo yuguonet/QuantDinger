@@ -3,8 +3,19 @@
 Skill Contract — SkillReport 解析契约。
 
 Skill 层输出标准化：
-  每个 Skill 的 final_answer 必须包含 JSON 结构（direction/confidence/score/signal/factors）
-  本模块负责从 LLM 原始输出中解析出 SkillReport。
+  仅 domain=finance 且有 stock_code 且需要买卖信号的 Skill 使用标准化输出。
+  标准化输出 = final_answer 包含 JSON 结构（direction/confidence/score/signal/factors）
+
+标准化输出适用条件（三者同时满足）：
+  ✅ domain = "finance"
+  ✅ 有 stock_code 参数（分析具体个股）
+  ✅ 需要输出买卖信号（direction + score）
+
+不适用的 Skill（无需标准化输出，直接返回分析文本即可）：
+  - bear_researcher / bull_researcher（多空辩论，无 stock_code）
+  - intelligence_agent（情报搜集，无 stock_code）
+  - hot_money_tracker（游资追踪，无 stock_code）
+  - data_agent（数据工程，无 stock_code）
 
 核心规则 — Skill 层职责边界：
   ✅ 允许输出：score / direction / confidence / signal / factors / analysis（事实描述）
@@ -27,6 +38,16 @@ from app.agent.chain.schema import FactorItem, SkillReport
 
 logger = logging.getLogger(__name__)
 
+# ── 无需标准化输出的 Skill（无 stock_code，不产出买卖信号）──
+# 这些 Skill 直接返回分析文本，不强制解析 direction/score/signal/factors
+_NON_SIGNAL_SKILLS = {
+    "bear_researcher",
+    "bull_researcher",
+    "intelligence_agent",
+    "hot_money_tracker",
+    "data_agent",
+}
+
 
 def parse_skill_output(raw_output: str, skill_name: str = "") -> SkillReport:
     """从 LLM 原始输出解析 SkillReport。
@@ -46,6 +67,18 @@ def parse_skill_output(raw_output: str, skill_name: str = "") -> SkillReport:
     """
     if not raw_output:
         return SkillReport(skill_name=skill_name, status="missing", error="无输出")
+
+    # 非信号类 Skill：直接包装为分析文本，不强制解析标准化输出
+    if skill_name in _NON_SIGNAL_SKILLS:
+        return SkillReport(
+            skill_name=skill_name,
+            score=50.0,
+            confidence=0.0,
+            direction="neutral",
+            signal="",
+            analysis=raw_output[:2000],
+            status="ok",
+        )
 
     # 策略 1: JSON 块
     report = _try_parse_json_block(raw_output, skill_name)
