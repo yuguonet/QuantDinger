@@ -392,6 +392,8 @@ SKILL_NAME_CN: Dict[str, str] = {
     "trading_agent": "交易执行",
     "data_agent": "数据工程",
     "analysis_agent": "综合分析",
+    "eod_screener": "尾盘选股",
+    "post_market_screener": "盘后短线选股",
 }
 
 # 否决阈值

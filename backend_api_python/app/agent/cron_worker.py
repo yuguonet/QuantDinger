@@ -169,7 +169,7 @@ def _execute_prompt_job(job: Dict[str, Any]):
         skill_registry.discover()
 
         executor = build_agent_executor(
-            skills=skill_registry.all_classes,
+            skills=skill_registry.all_names,
             user_id="cron",
             max_steps=8,
             timeout_seconds=120,

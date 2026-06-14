@@ -939,6 +939,9 @@ class _AgentExecutor:
 
     def _chat_locked(self, message, session_id, context, progress_callback, user_id) -> AgentResult:
         """Internal chat implementation — assumes session lock is held."""
+        # ── 负面反馈检测：惩罚上一轮 chain ────────────────────
+        self._check_negative_feedback(message, session_id)
+
         store, agent, enriched, meta = self._prepare(message, session_id, context, user_id)
 
         # ── 快速通道：不需要 agent 的简单回复 ────────────────
@@ -1085,7 +1088,7 @@ class _AgentExecutor:
                 success=success, content=content, tool_calls_log=tool_calls_log,
                 total_steps=total_steps, total_tokens=total_tokens,
             )
-            self._post_evaluate(agent_result_for_eval, _tool_chain, _intent_verb, _intent_noun, domain=_eval_domain)
+            self._post_evaluate(agent_result_for_eval, _tool_chain, _intent_verb, _intent_noun, domain=_eval_domain, session_id=session_id)
 
             # 异步压缩上下文（不阻塞返回）
             if success and content:
@@ -1119,8 +1122,17 @@ class _AgentExecutor:
             return AgentResult(success=False, error=str(e))
 
     @staticmethod
-    def _post_evaluate(agent_result, tool_chain, verb, noun, domain=""):
+    def _post_evaluate(agent_result, tool_chain, verb, noun, domain="", session_id=None):
         """后置评估 + 工具链学习闭环（纯规则，不消耗 agent 步数）。"""
+        # 存储本轮 verb/noun 到 session，供下一轮负面反馈检测使用
+        if session_id and (verb or noun):
+            try:
+                from app.agent.session_store import get_session_store
+                get_session_store().update_session(
+                    session_id, last_verb=verb, last_noun=noun,
+                )
+            except Exception:
+                pass
         if not verb and not noun:
             return  # 无意图信息，跳过评估
         try:
@@ -1129,6 +1141,62 @@ class _AgentExecutor:
             learn_from_execution(eval_result, verb, noun)
         except Exception as e:
             logger.warning("[PostEval] 评估异常，不影响返回: %s", e)
+
+    @staticmethod
+    def _check_negative_feedback(message: str, session_id: str) -> None:
+        """检测用户负面反馈，同时惩罚 trace 和 tool_chains。
+
+        每次反馈：
+          - trace: 标 correct=False + calibration 重校准
+          - tool_chains: success_count 扣减（轻度-1，重度-2）
+
+        累计 2-4 次负面反馈后：
+          - trace: 删除整棵 trace 树
+          - tool_chains: success_count <= 0 或 success_rate < 0.2 时删除链路
+        """
+        try:
+            from app.agent.session_store import get_session_store
+            store = get_session_store()
+            from app.agent.router.tool_chains import detect_feedback_severity, penalize_chain
+            from app.agent.chain import store as chain_store
+
+            severity = detect_feedback_severity(message)
+            if not severity:
+                return
+
+            # 从 session 取上一轮的 verb/noun
+            session = store.get_session(session_id)
+            if not session:
+                return
+            last_verb = session.get("last_verb", "")
+            last_noun = session.get("last_noun", "")
+            if not last_verb or not last_noun:
+                return
+
+            # ── trace 层惩罚 ──
+            stock_code = session.get("stock_code", "")
+            if stock_code:
+                trace = chain_store.query_latest_root(stock_code)
+                if trace:
+                    root_id = trace["id"]
+                    penalty_count = chain_store.get_penalty_count(stock_code)
+
+                    if penalty_count >= 3:
+                        # 累计 >=3 次，删除整棵 trace 树
+                        chain_store.delete_tree(root_id)
+                        logger.info("[Feedback] 删除 trace 树 root_id=%d (累计 %d 次)", root_id, penalty_count + 1)
+                    else:
+                        # 标记 wrong + 重校准
+                        chain_store.mark_root_wrong(root_id)
+                        logger.info("[Feedback] 标记 trace root_id=%d correct=False", root_id)
+
+            # ── tool_chains 层惩罚 ──
+            penalize_chain(last_verb, last_noun, severity)
+
+            logger.info("[Feedback] %s 负面反馈: verb=%s noun=%s stock=%s msg=%s",
+                        severity, last_verb, last_noun, stock_code, message[:50])
+        except Exception as e:
+            logger.warning("[Feedback] 负面反馈处理异常: %s", e)
 
     def _try_chain(self, verb, noun, message, session_id, context, user_id):
         """尝试链路执行。匹配到链路时执行并返回 AgentResult，否则返回 None。
@@ -1162,6 +1230,13 @@ class _AgentExecutor:
             if _name:
                 stock_name = _name
                 logger.info("[Chain] 中文名 → 代码 %s", stock_code)
+
+        # 存 stock_code 到 session，供负面反馈检测使用
+        if stock_code and session_id:
+            try:
+                store.update_session(session_id, stock_code=stock_code)
+            except Exception:
+                pass
 
         # ── Layer 0: 固定链路匹配 ──
         chain_def = None
@@ -1328,6 +1403,9 @@ class _AgentExecutor:
 
     def _chat_stream_locked(self, message, session_id, context, progress_callback, user_id):
         """Internal streaming chat — assumes session lock is held."""
+        # ── 负面反馈检测：惩罚上一轮 chain ────────────────────
+        self._check_negative_feedback(message, session_id)
+
         store, agent, enriched, meta = self._prepare(message, session_id, context, user_id)
 
         # ── 快速通道：不需要 agent 的简单回复 ────────────────
@@ -1453,6 +1531,7 @@ class _AgentExecutor:
                         meta.get("intent_verb", ""),
                         meta.get("intent_noun", ""),
                         domain=meta.get("domain", ""),
+                        session_id=session_id,
                     )
 
                     # 压缩上下文

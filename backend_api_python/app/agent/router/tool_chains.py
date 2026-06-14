@@ -162,3 +162,111 @@ def update_chain_stats(
 def list_all_chains() -> Dict[str, Any]:
     """列出所有已配置的工具链。"""
     return _load()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 用户反馈惩罚
+# ═══════════════════════════════════════════════════════════════
+
+# 轻度负面反馈关键词
+_MILD_FEEDBACK_PATTERNS = [
+    "不对", "不正确", "不好", "不行", "不准", "不太对",
+    "有问题", "有误", "错了", "不太行", "不靠谱", "不靠谱",
+]
+
+# 重度负面反馈关键词
+_SEVERE_FEEDBACK_PATTERNS = [
+    "完全不对", "大错特错", "错得离谱", "离谱", "反了",
+    "完全错", "一塌糊涂", "乱七八糟", "瞎扯", "胡说",
+    "垃圾", "废了", "没用", "一点用没有",
+]
+
+
+def detect_feedback_severity(message: str) -> Optional[str]:
+    """检测用户消息中的负面反馈。
+
+    Returns:
+        "severe" — 重度负面（删链路）
+        "mild"   — 轻度负面（降信誉）
+        None     — 无负面反馈
+    """
+    if not message:
+        return None
+    msg = message.strip()
+
+    # 先检测重度（更长的模式优先）
+    for pat in _SEVERE_FEEDBACK_PATTERNS:
+        if pat in msg:
+            return "severe"
+
+    # 再检测轻度
+    for pat in _MILD_FEEDBACK_PATTERNS:
+        if pat in msg:
+            return "mild"
+
+    return None
+
+
+def penalize_chain(verb: str, noun: str, severity: str) -> bool:
+    """对链路施加惩罚，累计 2-4 次后自动删除。
+
+    轻度（不对/不好/不正确）→ success_count -= 1
+    重度（完全不对/大错特错/反了/离谱）→ success_count -= 2
+
+    当 success_count <= 0 或 success_rate < 0.2 时，直接删除链路。
+
+    Args:
+        verb: 动词（如 "analyze"）
+        noun: 名词（如 "stock"）
+        severity: "mild" 或 "severe"
+
+    Returns:
+        是否成功执行惩罚
+    """
+    if not verb or not noun:
+        return False
+
+    key = f"{verb}+{noun}"
+    data = _load()
+
+    if key not in data:
+        logger.warning("[ToolChains] 惩罚目标不存在: %s", key)
+        return False
+
+    entry = _normalize_entry(data[key])
+    stats = entry["stats"]
+
+    # 扣减
+    penalty = 2 if severity == "severe" else 1
+    stats["success_count"] = max(0, stats["success_count"] - penalty)
+
+    # 重算 success_rate
+    if stats["executions"] > 0:
+        stats["success_rate"] = round(
+            stats["success_count"] / stats["executions"], 3
+        )
+    stats["last_updated"] = date.today().isoformat()
+
+    # 判断是否该删除：success_count 归零 或 成功率过低
+    should_delete = (
+        stats["success_count"] <= 0
+        or (stats["executions"] >= 3 and stats["success_rate"] < 0.2)
+    )
+
+    if should_delete:
+        del data[key]
+        _save(data)
+        logger.info(
+            "[ToolChains] 累计惩罚触发删除: %s (penalty=%d, success_count=%d, success_rate=%.3f)",
+            key, penalty, stats["success_count"], stats["success_rate"],
+        )
+        return True
+
+    entry["stats"] = stats
+    data[key] = entry
+    _save(data)
+    logger.info(
+        "[ToolChains] 惩罚: %s -%d → success_count=%d success_rate=%.3f",
+        key, penalty, stats["success_count"], stats["success_rate"],
+    )
+    return True

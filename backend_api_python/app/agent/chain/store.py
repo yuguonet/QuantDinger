@@ -431,6 +431,101 @@ def update_skill_verify(root_id: int, actual_direction: str):
 #   - 增删 Skill 零维护
 # ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# 用户反馈惩罚（trace 层）
+# ═══════════════════════════════════════════════════════════════
+
+def query_latest_root(stock_code: str) -> Optional[Dict[str, Any]]:
+    """查询某股票最近一条根节点 trace。"""
+    from app.utils.db import get_db_connection
+
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT id, exec_date, stock_code, stock_name, name,
+                       score, action, direction, confidence, status
+                FROM qd_traces
+                WHERE parent_id IS NULL AND stock_code = %s
+                ORDER BY created_at DESC LIMIT 1
+            """, (stock_code,))
+
+            row = cur.fetchone()
+            if not row:
+                return None
+            return {
+                "id": row['id'],
+                "exec_date": row['exec_date'].isoformat() if row['exec_date'] else None,
+                "stock_code": row['stock_code'],
+                "stock_name": row['stock_name'],
+                "chain_id": row['name'],
+                "score": row['score'],
+                "action": row['action'],
+                "direction": row['direction'],
+                "confidence": row['confidence'],
+                "status": row['status'],
+            }
+    except Exception as e:
+        logger.error("[Store] 查询最近根节点失败 stock=%s: %s", stock_code, e)
+        return None
+
+
+def mark_root_wrong(root_id: int):
+    """轻度惩罚：标记根节点 correct=False + calibration 重校准。"""
+    from app.utils.db import get_db_connection
+
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE qd_traces SET
+                    correct = FALSE,
+                    calibration = 1.10,
+                    human_reviewed = TRUE,
+                    human_verdict = 'negative_feedback'
+                WHERE id = %s AND parent_id IS NULL
+            """, (root_id,))
+            conn.commit()
+            logger.info("[Store] 标记 trace root_id=%d correct=False", root_id)
+    except Exception as e:
+        logger.error("[Store] 标记 trace 失败 root_id=%d: %s", root_id, e)
+
+
+def delete_tree(root_id: int):
+    """重度惩罚：删除整棵 trace 树。"""
+    from app.utils.db import get_db_connection
+
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM qd_traces WHERE root_id = %s", (root_id,))
+            deleted = cur.rowcount
+            conn.commit()
+            logger.info("[Store] 删除 trace 树 root_id=%d, 共 %d 条", root_id, deleted)
+    except Exception as e:
+        logger.error("[Store] 删除 trace 树失败 root_id=%d: %s", root_id, e)
+
+
+def get_penalty_count(stock_code: str) -> int:
+    """统计某股票最近 trace 的负面反馈次数（human_verdict='negative_feedback'）。"""
+    from app.utils.db import get_db_connection
+
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT COUNT(*) as cnt FROM qd_traces
+                WHERE parent_id IS NULL
+                  AND stock_code = %s
+                  AND human_verdict = 'negative_feedback'
+            """, (stock_code,))
+            row = cur.fetchone()
+            return row['cnt'] if row else 0
+    except Exception as e:
+        logger.warning("[Store] 统计惩罚次数失败: %s", e)
+        return 0
+
+
 def get_skill_weights() -> Dict[str, float]:
     """从 qd_skill_weights 获取 Skill 权重。"""
     from app.utils.db import get_db_connection
@@ -471,6 +566,7 @@ def get_factor_weights(skill_name: str = None) -> Dict[str, float]:
 
 
 def get_eval_stats(chain_id: str = None) -> Dict[str, Any]:
+
     """获取评估统计。"""
     from app.utils.db import get_db_connection
 

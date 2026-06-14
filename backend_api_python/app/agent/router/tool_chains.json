@@ -17,9 +17,9 @@
             }
         ],
         "stats": {
-            "avg_steps": 3.5,
-            "executions": 2,
-            "success_count": 2,
+            "avg_steps": 3.28,
+            "executions": 7,
+            "success_count": 7,
             "success_rate": 1.0,
             "last_updated": "2026-06-14"
         }
@@ -589,9 +589,9 @@
             }
         ],
         "stats": {
-            "avg_steps": 2.0,
-            "executions": 2,
-            "success_count": 2,
+            "avg_steps": 2.67,
+            "executions": 3,
+            "success_count": 3,
             "success_rate": 1.0,
             "last_updated": "2026-06-14"
         }
