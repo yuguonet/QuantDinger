@@ -738,7 +738,7 @@ def analyze_pattern(stock_code: str) -> Dict[str, Any]:
     layer="分析层",
     domain=["finance"],
 )
-def get_chip_distribution(stock_code: str, lookback_days: int = 120) -> Dict[str, Any]:
+def get_chip_distribution(stock_code, lookback_days: int = 120) -> Dict[str, Any]:
     """筹码分布分析（衰减成本分布模型）。
 
     从日K线计算筹码分布，不依赖数据源原生接口。
@@ -746,9 +746,19 @@ def get_chip_distribution(stock_code: str, lookback_days: int = 120) -> Dict[str
     用指数衰减加权（近期筹码权重更高），汇总计算各维度指标。
 
     Args:
-        stock_code: 股票代码
+        stock_code: 股票代码（str 或 search_stock 返回的 dict）
         lookback_days: 回看天数，默认120天
     """
+    # 兼容 search_stock 返回的 dict: {'results': [{'code': '600593', ...}], ...}
+    if isinstance(stock_code, dict):
+        results = stock_code.get("results", [])
+        if results:
+            stock_code = results[0].get("code", "")
+        else:
+            return {"error": "stock_code dict 中无 results", "retriable": False}
+    stock_code = str(stock_code).strip()
+    if not stock_code:
+        return {"error": "stock_code 为空", "retriable": False}
     market = _detect_market(stock_code)
     if market != "CNStock":
         return {"error": f"筹码分布分析仅支持A股，当前市场: {market}", "retriable": False}

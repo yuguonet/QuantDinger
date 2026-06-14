@@ -47,14 +47,6 @@ def _index_df():
         return pd.DataFrame(data)
     return None
 
-def _spot_df():
-    """全A实时行情"""
-    try:
-        import akshare as ak
-        return ak.stock_zh_a_spot_em()
-    except Exception:
-        return None
-
 def _sorted(df):
     """按日期排序"""
     c = _col(df, 'date', 'trade_date', '日期')
@@ -86,14 +78,21 @@ def _momentum():
         return 50, str(e)
 
 def _breadth():
-    """2. 当日上涨占比"""
+    """2. 市场宽度 — 读 scheduler 缓存的行业板块涨跌家数，不发 HTTP"""
     try:
-        df = _spot_df()
-        if df is None:
-            return 50, "行情不可用"
-        chg = _numeric_col(df, '涨跌幅', 'change', 'pct_chg')
-        up = (chg > 0).sum()
-        return (up / len(chg)) * 100, f"上涨{up}/{len(chg)}"
+        from .china_market import _rt_hot_sectors
+        if not _rt_hot_sectors:
+            return 50, "板块数据未加载"
+        industry = (_rt_hot_sectors.get("data") or {}).get("industry", [])
+        if not industry:
+            return 50, "行业板块数据为空"
+        up_total = sum(int(b.get("up_count", 0) or 0) for b in industry)
+        down_total = sum(int(b.get("down_count", 0) or 0) for b in industry)
+        total = up_total + down_total
+        if total == 0:
+            return 50, "涨跌家数为0"
+        ratio = up_total / total
+        return _map(ratio, 0.2, 0.8), f"上涨{up_total}/下跌{down_total}"
     except Exception as e:
         return 50, str(e)
 
@@ -133,43 +132,17 @@ def _northbound():
         return 50, str(e)
 
 def _limit_ratio():
-    """6. 涨停/跌停比"""
+    """6. 涨停/跌停比 — 读 scheduler 缓存，不发 HTTP"""
     try:
-        df = _spot_df()
-        if df is None:
-            return 50, "行情不可用"
-        chg = _numeric_col(df, '涨跌幅', 'change', 'pct_chg')
-        codes = df[_col(df, '代码', 'code', 'ts_code')].astype(str) if _col(df, '代码', 'code', 'ts_code') else None
-
-        if codes is not None:
-            is_20 = codes.str.match(r'^(300|301|688)')
-            is_30 = codes.str.match(r'^(8|4)\d{5}')
-            limit = np.where(is_30, 30.0, np.where(is_20, 20.0, 10.0))
-        else:
-            limit = np.full(len(chg), 10.0)
-
-        arr = chg.values
-        up = int(np.nansum(arr >= limit * 0.98))
-        down = int(np.nansum(arr <= -limit * 0.98))
+        from .dragon_limit import _rt_zt_pool, _rt_dt_pool
+        up = len(_rt_zt_pool) if _rt_zt_pool else 0
+        down = len(_rt_dt_pool) if _rt_dt_pool else 0
+        if up + down == 0:
+            return 50, "涨跌停数据未加载"
         ratio = up / max(down, 1)
         return _map(ratio, 0, 10), f"涨停{up}/跌停{down}"
     except Exception as e:
         return 50, str(e)
-
-def _strength():
-    """7. 60日涨幅为正的个股占比"""
-    try:
-        df = _spot_df()
-        if df is None:
-            return 50, "行情不可用"
-        col = _numeric_col(df, '60日涨跌幅', '60d_pct_chg')
-        if col.empty:
-            return 50, "无60日涨跌幅"
-        pos = (col > 0).sum()
-        return (pos / len(col)) * 100, f"60日上涨{pos}/{len(col)}"
-    except Exception as e:
-        return 50, str(e)
-
 
 # ── 主函数 ────────────────────────────────────────
 
@@ -180,7 +153,6 @@ _CALC = [
     ("成交量变化",   _volume),
     ("北向资金",     _northbound),
     ("涨跌停比",     _limit_ratio),
-    ("股价强度",     _strength),
 ]
 
 

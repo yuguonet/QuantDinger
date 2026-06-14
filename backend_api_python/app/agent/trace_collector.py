@@ -39,8 +39,8 @@ class TraceCollector:
     def __init__(self, session_id: str, user_query: str):
         self.session_id = session_id
         self.user_query = user_query
-        self.stock_code = ""
-        self.stock_name = ""
+        self._stock_code = ""
+        self._stock_name = ""
         self.tool_nodes: List[EvalNode] = []
         self.skill_nodes: List[EvalNode] = []
         self.skill_reports: List[SkillReport] = []
@@ -48,6 +48,35 @@ class TraceCollector:
         self.intent_verb = ""
         self.intent_noun = ""
         self.domain = ""
+
+    # ── stock_code / stock_name 属性，自动规范化 dict → str ──
+    @property
+    def stock_code(self) -> str:
+        return self._stock_code
+
+    @stock_code.setter
+    def stock_code(self, value):
+        if isinstance(value, dict):
+            results = value.get("results", [])
+            self._stock_code = results[0]["code"] if results else ""
+        elif value is not None:
+            self._stock_code = str(value).strip()
+        else:
+            self._stock_code = ""
+
+    @property
+    def stock_name(self) -> str:
+        return self._stock_name
+
+    @stock_name.setter
+    def stock_name(self, value):
+        if isinstance(value, dict):
+            results = value.get("results", [])
+            self._stock_name = results[0]["name"] if results else ""
+        elif value is not None:
+            self._stock_name = str(value).strip()
+        else:
+            self._stock_name = ""
 
     # ── 回调方法 ──────────────────────────────────────────────
 

@@ -968,6 +968,13 @@ class StockBasicDB:
         # 确保 CNStock_db 库 + stock_basic_info 表都存在
         self.ensure_table()
 
+        # ── 每日一次检查：今天已同步过则跳过 ──
+        last_ts = getattr(self, '_last_sync_date', None)
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        if last_ts == today_str:
+            logger.info("[同步] 今日已同步过，跳过")
+            return {"source": "skip", "fetched": 0, "upserted": {}}
+
         # ── 源1: 巨潮 ──
         stocks = self._fetch_cninfo()
         source = "cninfo"
@@ -1010,6 +1017,7 @@ class StockBasicDB:
 
         logger.info(f"[同步] 完成: 源={source} 获取={len(stocks)} "
                     f"写入结果={result} 标记停牌/退市={suspended_count}")
+        self._last_sync_date = today_str
         return result
 
     def _mark_missing_as_suspended(self, fetched_codes: set) -> int:

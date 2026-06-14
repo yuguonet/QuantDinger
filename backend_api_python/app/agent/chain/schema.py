@@ -211,6 +211,19 @@ class EvalNode:
     # 子节点（内存中构建，不直接存储）
     children: List["EvalNode"] = field(default_factory=list)
 
+    def __post_init__(self):
+        """确保 stock_code / stock_name 始终为 str，避免入库时 VARCHAR 溢出。"""
+        if isinstance(self.stock_code, dict):
+            results = self.stock_code.get("results", [])
+            self.stock_code = results[0]["code"] if results else str(self.stock_code)
+        elif self.stock_code is not None:
+            self.stock_code = str(self.stock_code).strip()
+        if isinstance(self.stock_name, dict):
+            results = self.stock_name.get("results", [])
+            self.stock_name = results[0]["name"] if results else str(self.stock_name)
+        elif self.stock_name is not None:
+            self.stock_name = str(self.stock_name).strip()
+
     # ── 便捷属性 ──
 
     @property
@@ -256,8 +269,17 @@ class EvalNode:
         child.parent_id = self.id
         child.root_id = self.root_id or self.id
         child.exec_date = self.exec_date
-        child.stock_code = self.stock_code
-        child.stock_name = self.stock_name
+        # stock_code / stock_name 统一转 str，防止 dict 溢出 VARCHAR(20)
+        sc = self.stock_code
+        if isinstance(sc, dict):
+            results = sc.get("results", [])
+            sc = results[0]["code"] if results else ""
+        child.stock_code = str(sc).strip() if sc else ""
+        sn = self.stock_name
+        if isinstance(sn, dict):
+            results = sn.get("results", [])
+            sn = results[0]["name"] if results else ""
+        child.stock_name = str(sn).strip() if sn else ""
         self.children.append(child)
 
     def to_skill_report(self) -> SkillReport:

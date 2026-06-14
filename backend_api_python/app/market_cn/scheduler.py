@@ -19,6 +19,7 @@ import logging
 import time as _time
 import os as _os
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +56,20 @@ def _run_all(tag, fns):
             logger.warning("[%s] %s 失败: %s", tag, fn.__name__, e)
 
 
+def _run_all_parallel(tag, fns, max_workers=8):
+    """并行执行 refresh 函数，每个独立 try/except 兜底"""
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(fn): fn.__name__ for fn in fns}
+        for f in as_completed(futures):
+            name = futures[f]
+            try:
+                f.result()
+            except Exception as e:
+                logger.warning("[%s] %s 失败: %s", tag, name, e)
+
+
 def _refresh_daily():
-    """日级数据: 宏观/板块趋势/北向持股/国际宏观（盘中也能更新）"""
+    """日级数据: 板块趋势/北向持股（盘中也能更新）"""
     from app.market_cn.china_market import (
         refresh_sector_trend,
         refresh_sector_prediction, refresh_sector_cycle,
@@ -65,20 +78,12 @@ def _refresh_daily():
     from app.market_cn.index import (
         refresh_index_daily_kline, refresh_northbound_holdings,
     )
-#    from app.data_providers.sentiment import (
-#        refresh_vix, refresh_dollar_index, refresh_yield_curve,
-#        refresh_put_call_ratio,
-#    )
-    from app.data_providers.commodities import refresh_commodities
-    from app.data_providers.forex import refresh_forex_pairs
 
     _run_all("daily", [
         refresh_sector_trend,
         refresh_sector_prediction, refresh_sector_cycle,
         refresh_sector_history,
         refresh_index_daily_kline, refresh_northbound_holdings,
-#        refresh_vix, refresh_dollar_index, refresh_yield_curve, refresh_put_call_ratio, 
-        refresh_commodities, refresh_forex_pairs,
     ])
 
 
@@ -95,17 +100,13 @@ def _refresh_post_market():
 
 
 def _refresh_slow():
-    """盘中慢档: 贪恐/情绪/政策/新闻/全球情绪/加密 + 日级"""
+    """盘中慢档: 贪恐/情绪/政策/新闻/全球情绪 + 日级"""
     from app.market_cn.china_market import refresh_fear_greed, refresh_policy
     from app.market_cn.emotion import refresh_emotion_cycle
-#    from app.market_cn.policy_analysis import refresh_financial_news, refresh_macro_news
-#    from app.data_providers.sentiment import refresh_fear_greed_index, refresh_sentiment_data
     from app.data_providers.global_market import refresh_global_sentiment, refresh_global_news
 
     _run_all("slow", [
         refresh_fear_greed, refresh_policy, refresh_emotion_cycle,
-#        refresh_financial_news, refresh_macro_news,
-#        refresh_fear_greed_index, refresh_sentiment_data,
         refresh_global_sentiment, refresh_global_news,
     ])
 
@@ -274,12 +275,42 @@ def start():
 
     # 冷启动：后台线程拉取，不阻塞主线程
     def _cold_start():
-        logger.info("[scheduler] 冷启动: 后台拉取全部数据")
-        _refresh_daily()
-        _refresh_post_market()
-        _refresh_slow()
-        _refresh_fast()
-        logger.info("[scheduler] 冷启动完成，数据已加载到内存")
+        logger.info("[scheduler] 冷启动: 后台并行拉取全部数据")
+        import time as _t
+        t0 = _t.time()
+
+        # ── 冷启动专用快档（不含 global_indices/global_heatmap，避免引入 crypto）──
+        def _cold_fast():
+            from app.market_cn.index import (
+                refresh_index_realtime, refresh_northbound_realtime,
+                refresh_market_fund_flow_realtime, refresh_sector_fund_flow,
+            )
+            from app.market_cn.china_market import refresh_hot_sectors
+            from app.market_cn.dragon_limit import refresh_hot_rank
+            _run_all("cold_fast", [
+                refresh_index_realtime, refresh_northbound_realtime,
+                refresh_market_fund_flow_realtime, refresh_sector_fund_flow,
+                refresh_hot_sectors, refresh_hot_rank,
+            ])
+
+        # ── 冷启动专用慢档（不含 _refresh_daily，避免与 daily 组重复）──
+        def _cold_slow():
+            from app.market_cn.china_market import refresh_fear_greed, refresh_policy
+            from app.market_cn.emotion import refresh_emotion_cycle
+            _run_all("cold_slow", [
+                refresh_fear_greed, refresh_policy, refresh_emotion_cycle,
+            ])
+
+        # 4 组并行执行
+        _run_all_parallel("cold", [
+            _refresh_daily,
+            _refresh_post_market,
+            _cold_slow,
+            _cold_fast,
+        ], max_workers=4)
+
+        elapsed = _t.time() - t0
+        logger.info("[scheduler] 冷启动完成，耗时 %.1fs", elapsed)
 
     t = threading.Thread(target=_cold_start, daemon=True)
     t.start()
