@@ -1,15 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-Semantics Loader — 语义描述统一加载入口。
+Semantics Loader — 语义描述统一加载入口（v4，对齐 Nanobot 两段加载）。
 
-所有描述语义从 YAML 文件加载，代码层只引用不硬编码。
+v4 变更：
+  - 删除 DomainMeta 和 domains.yaml 加载
+  - 删除 PlannerMeta 和 planner.yaml 加载
+  - persona.yaml 扩展，吸收通用行为规范（behaviors）
+  - skills 从单文件 skills.yaml 迁移到 skills/*/SKILL.md（YAML frontmatter + Markdown body）
+  - 领域特定指令移入各 SKILL.md body
+
+职责分离：
+  - strategy = 路由决策（IntentAnalyzer 计算）
+  - tags = 能力标签（@skill/@tool 注册）
+  - semantics = 描述来源（YAML/MD 单一信源）
 
 使用方式：
     from app.agent.semantics import (
-        get_persona, get_domain_meta, get_intent_meta,
+        get_persona, get_intent_meta,
         get_skill_meta, get_all_skill_metas,
         get_tool_meta, get_all_tool_metas,
-        get_route_metas, get_chain_meta, get_planner_meta,
+        get_route_metas, get_chain_meta,
         get_skills_summary_xml, get_tools_summary_xml,
         load_semantics,
     )
@@ -37,15 +47,7 @@ class PersonaMeta:
     role: str = ""
     identity: str = ""
     mission: str = ""
-
-
-@dataclass
-class DomainMeta:
-    name: str = ""
-    description: str = ""
-    instructions: str = ""
-    skills: List[str] = field(default_factory=list)
-    tool_categories: Optional[List[str]] = None
+    behaviors: Dict[str, List[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -60,6 +62,7 @@ class IntentMeta:
 class SkillMeta:
     name: str = ""
     description: str = ""
+    tags: List[str] = field(default_factory=list)
     priority: int = 0
     default_weight: float = 1.0
     tools: List[str] = field(default_factory=list)
@@ -74,7 +77,7 @@ class ToolMeta:
     description: str = ""
     category: str = ""
     layer: str = ""
-    domain: List[str] = field(default_factory=list)
+    tags: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -108,25 +111,16 @@ class ChainMeta:
     steps: List[ChainStepMeta] = field(default_factory=list)
 
 
-@dataclass
-class PlannerMeta:
-    skill_catalog: List[Dict[str, str]] = field(default_factory=list)
-    aliases: Dict[str, str] = field(default_factory=dict)
-    planner_prompt: str = ""
-
-
 # ═══════════════════════════════════════════════════════════════
 # Cache
 # ═══════════════════════════════════════════════════════════════
 
 _persona: Optional[PersonaMeta] = None
-_domains: Dict[str, DomainMeta] = {}
 _intent: Optional[IntentMeta] = None
 _skills: Dict[str, SkillMeta] = {}
 _tools: Dict[str, ToolMeta] = {}
 _routes: List[RouteMeta] = []
 _chains: Dict[str, ChainMeta] = {}
-_planner: Optional[PlannerMeta] = None
 _loaded = False
 
 
@@ -141,53 +135,92 @@ def _load_yaml(relative_path: str) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════
+# SKILL.md parser
+# ═══════════════════════════════════════════════════════════════
+
+def _parse_skill_md(content: str) -> tuple:
+    """解析 SKILL.md，分离 YAML frontmatter 和 Markdown body。
+
+    Returns:
+        (meta_dict, body_str) — meta 为 frontmatter 解析结果，body 为 Markdown 正文
+    """
+    meta = {}
+    body = content
+
+    if content.startswith("---"):
+        parts = content.split("---", 2)
+        if len(parts) >= 3:
+            try:
+                meta = yaml.safe_load(parts[1]) or {}
+            except yaml.YAMLError:
+                meta = {}
+            body = parts[2].strip()
+
+    return meta, body
+
+
+# ═══════════════════════════════════════════════════════════════
 # Loader
 # ═══════════════════════════════════════════════════════════════
 
 def load_semantics():
     """加载所有语义描述文件（幂等，只加载一次）。"""
-    global _loaded, _persona, _intent, _planner
+    global _loaded, _persona, _intent
     if _loaded:
         return
     _loaded = True
 
-    # persona
+    # ── persona（v4: 扩展版，包含 behaviors）──
     p = _load_yaml("persona.yaml")
-    _persona = PersonaMeta(**p)
-
-    # domains
-    for name, cfg in _load_yaml("domains.yaml").get("domains", {}).items():
-        if isinstance(cfg, dict):
-            cfg.setdefault("name", name)
-            _domains[name] = DomainMeta(**cfg)
-
-    # intent
-    i = _load_yaml("intent.yaml")
-    _intent = IntentMeta(
-        classifier_prompt=i.get("classifier_prompt", ""),
-        rules=i.get("rules", []),
-        quick_patterns=i.get("quick_patterns", {}),
-        intent_tool_categories=i.get("intent_tool_categories", {}),
+    _persona = PersonaMeta(
+        role=p.get("role", ""),
+        identity=p.get("identity", ""),
+        mission=p.get("mission", ""),
+        behaviors=p.get("behaviors", {}),
     )
 
-    # skills (单文件 skills.yaml，skills 列表)
-    for s in _load_yaml("skills.yaml").get("skills", []):
-        if isinstance(s, dict) and s.get("name"):
-            _skills[s["name"]] = SkillMeta(**s)
+    # ── skills（从 SKILL.md 加载，YAML frontmatter + Markdown body）──
+    skills_dir = _SEMANTICS_DIR / "skills"
+    if skills_dir.exists():
+        for skill_dir in skills_dir.iterdir():
+            if not skill_dir.is_dir():
+                continue
+            skill_md = skill_dir / "SKILL.md"
+            if not skill_md.exists():
+                continue
+            content = skill_md.read_text(encoding="utf-8")
+            meta, body = _parse_skill_md(content)
+            if meta.get("name"):
+                _skills[meta["name"]] = SkillMeta(
+                    name=meta["name"],
+                    description=meta.get("description", ""),
+                    tags=meta.get("tags", []),
+                    priority=meta.get("priority", 5),
+                    default_weight=meta.get("default_weight", 1.0),
+                    tools=meta.get("tools", []),
+                    instructions=body,
+                    standard_output=meta.get("standard_output", False),
+                )
 
-    # tools (单文件 tools.yaml，按 category 分组)
+    # ── tools（单文件 tools.yaml，按 category 分组）──
     for cat_name, cat_tools in _load_yaml("tools.yaml").get("categories", {}).items():
         if not isinstance(cat_tools, list):
             continue
         for t in cat_tools:
             if isinstance(t, dict) and t.get("name"):
-                _tools[t["name"]] = ToolMeta(**t)
+                _tools[t["name"]] = ToolMeta(
+                    name=t["name"],
+                    description=t.get("description", ""),
+                    category=t.get("category", cat_name),
+                    layer=t.get("layer", ""),
+                    tags=t.get("tags", t.get("domain", [])),
+                )
 
-    # routes
+    # ── routes ──
     for r in _load_yaml("routes.yaml").get("routes", []):
         _routes.append(RouteMeta(**r))
 
-    # chains
+    # ── chains ──
     for name, cfg in _load_yaml("chains.yaml").get("chains", {}).items():
         steps = []
         for s in cfg.get("steps", []):
@@ -200,17 +233,18 @@ def load_semantics():
             steps=steps,
         )
 
-    # planner
-    pl = _load_yaml("planner.yaml")
-    _planner = PlannerMeta(
-        skill_catalog=pl.get("skill_catalog", []),
-        aliases=pl.get("aliases", {}),
-        planner_prompt=pl.get("planner_prompt", ""),
+    # ── intent ──
+    intent_data = _load_yaml("intent.yaml")
+    _intent = IntentMeta(
+        classifier_prompt=intent_data.get("classifier_prompt", ""),
+        rules=intent_data.get("rules", []),
+        quick_patterns=intent_data.get("quick_patterns", {}),
+        intent_tool_categories=intent_data.get("intent_tool_categories", {}),
     )
 
     logger.info(
-        "[Semantics] 加载完成: %d domains, %d skills, %d tools, %d routes, %d chains",
-        len(_domains), len(_skills), len(_tools), len(_routes), len(_chains),
+        "[Semantics] 加载完成: %d skills (SKILL.md), %d tools, %d routes, %d chains",
+        len(_skills), len(_tools), len(_routes), len(_chains),
     )
 
 
@@ -221,16 +255,6 @@ def load_semantics():
 def get_persona() -> PersonaMeta:
     load_semantics()
     return _persona
-
-
-def get_domain_meta(name: str) -> Optional[DomainMeta]:
-    load_semantics()
-    return _domains.get(name)
-
-
-def get_all_domain_metas() -> Dict[str, DomainMeta]:
-    load_semantics()
-    return dict(_domains)
 
 
 def get_intent_meta() -> IntentMeta:
@@ -273,32 +297,34 @@ def get_all_chain_metas() -> Dict[str, ChainMeta]:
     return dict(_chains)
 
 
-def get_planner_meta() -> PlannerMeta:
-    load_semantics()
-    return _planner
-
-
 # ═══════════════════════════════════════════════════════════════
 # Summary generators (for system prompt injection)
 # ═══════════════════════════════════════════════════════════════
 
 def get_skills_summary_xml() -> str:
-    """生成 skills 摘要 XML，用于注入 system prompt（轻量，只有 name+description）。"""
+    """生成 skills 摘要 XML（轻量，只有 name+description+tags）。
+
+    用于第一段加载：system prompt 只放摘要，完整 instructions 按需加载。
+    """
     load_semantics()
     lines = ["<skills>"]
     for name, meta in sorted(_skills.items(), key=lambda x: x[1].priority, reverse=True):
-        lines.append(f'  <skill name="{name}" priority="{meta.priority}">')
+        tags_str = ",".join(meta.tags) if meta.tags else ""
+        lines.append(f'  <skill name="{name}" tags="{tags_str}" priority="{meta.priority}">')
         lines.append(f'    <description>{meta.description}</description>')
         lines.append(f'  </skill>')
     lines.append("</skills>")
     return "\n".join(lines)
 
 
-def get_tools_summary_xml() -> str:
-    """生成 tools 摘要 XML，按 category 分组。"""
+def get_tools_summary_xml(tags_filter: Optional[List[str]] = None) -> str:
+    """生成 tools 摘要 XML，按 category 分组。可选按 tags 过滤。"""
     load_semantics()
     by_cat: Dict[str, List[ToolMeta]] = {}
     for meta in _tools.values():
+        # §15: 用 tags 过滤（tags 优先，降级到无过滤）
+        if tags_filter and meta.tags and not any(t in meta.tags for t in tags_filter):
+            continue
         by_cat.setdefault(meta.category or "其他", []).append(meta)
 
     lines = ["<tools>"]

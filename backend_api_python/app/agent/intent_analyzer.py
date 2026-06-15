@@ -67,14 +67,28 @@ class IntentResult:
 # 快速通道
 # ═══════════════════════════════════════════════════════════════
 
+# ── 快速通道正则（从 intent.yaml 加载，改正则只改 YAML）──
 _PUNCT_TAIL = r'[\s\?\?\.\,\!\~\。\，\！\？\…]*'
-_GREETING_RE = re.compile(r'^(你好|hi|hello|嗨|hey|在吗|哈喽|嘿|yo)' + _PUNCT_TAIL + '$', re.IGNORECASE)
-_FAREWELL_RE = re.compile(r'^(再见|拜拜|bye|88|886|晚安|回见)' + _PUNCT_TAIL + '$', re.IGNORECASE)
-_THANKS_RE  = re.compile(r'^(谢谢|感谢|多谢|thanks|thank\s*you|thx|3q)' + _PUNCT_TAIL + '$', re.IGNORECASE)
+_GREETING_RE = None
+_FAREWELL_RE = None
+_THANKS_RE = None
+
+def _ensure_quick_patterns():
+    """从 intent.yaml 加载快速通道正则。"""
+    global _GREETING_RE, _FAREWELL_RE, _THANKS_RE
+    if _GREETING_RE is not None:
+        return
+    _ensure_intent_loaded()
+    from app.agent.semantics import get_intent_meta
+    patterns = get_intent_meta().quick_patterns
+    _GREETING_RE = re.compile(patterns.get("greeting", r'^NEVER_MATCH$'), re.IGNORECASE)
+    _FAREWELL_RE = re.compile(patterns.get("farewell", r'^NEVER_MATCH$'), re.IGNORECASE)
+    _THANKS_RE = re.compile(patterns.get("thanks", r'^NEVER_MATCH$'), re.IGNORECASE)
 
 
 def _quick_intent_check(message: str) -> Optional[IntentResult]:
     """极低成本的正则快速匹配。"""
+    _ensure_quick_patterns()
     msg = message.strip()
     if not msg:
         return IntentResult(domain="chat", intent="empty", confidence=1.0, source="quick")
@@ -93,71 +107,21 @@ def _quick_intent_check(message: str) -> Optional[IntentResult]:
 # LLM 意图分类 + 上下文压缩
 # ═══════════════════════════════════════════════════════════════
 
-_INTENT_PROMPT = """你是意图分类器。分析用户消息，输出 JSON。
+# ── 从 intent.yaml 加载（单一信源，改规则只改 YAML）──
+def _load_intent_config():
+    """从 semantics/intent.yaml 加载 prompt 和映射。"""
+    from app.agent.semantics import get_intent_meta
+    meta = get_intent_meta()
+    return meta.classifier_prompt, meta.intent_tool_categories
 
-## 用户消息
-{message}
+# 懒加载：首次调用 analyze_intent 时才加载
+_INTENT_PROMPT = ""
+_INTENT_TOOL_CATEGORIES = {}
 
-## 上轮对话摘要（如有）
-{context_summary}
-
-## 输出格式（只输出 JSON，不要其他内容）
-```json
-{{
-  "domain": "finance | coding | trading | system | unknown | chat",
-  "intent": "stock_analysis | chart_view | market_scan | screener | backtest | fund_flow | indicator | trading | stock_info | concept_explain | code_modify | code_create | project_scan | reminder | cron_manage | settings | unknown | general",
-  "verb": "analyze | view | filter | backtest | execute | query | explain | modify | create | remind | schedule | configure",
-  "noun": "stock | chart | market | screener | fund_flow | indicator | trading | concept | code | project | reminder | cron | settings",
-  "stock_code": "6位代码或空",
-  "stock_name": "股票名称或空",
-  "confidence": 0.0-1.0,
-  "context_summary": "本轮对话摘要，30字以内，用于下轮上下文。如果和上轮同话题则延续，否则重写。"
-}}
-```
-
-## 规则
-- domain: finance=金融分析/股票/行情/资金, coding=代码/项目/开发, trading=交易执行/持仓/策略启停, system=定时提醒/任务调度/设置, unknown=无法判断领域, chat=闲聊/问候
-- 有股票名称或代码 → domain=finance, verb=analyze, noun=stock
-- 用户说"怎么样/能买吗/跌了/涨了"等，且提到股票 → finance/stock_analysis
-- 用户问K线/图表 → finance/chart_view
-- 用户问涨停/大盘/板块 → finance/market_scan
-- 用户要选股/推荐 → finance/screener
-- 用户要回测 → finance/backtest
-- 用户问资金流向/主力/北向 → finance/fund_flow
-- 用户问MACD/RSI/指标 → finance/indicator
-- 用户要买入/卖出/持仓/启停策略 → trading/trading
-- 用户问市盈率/市值/基本面 → finance/stock_info
-- 用户问概念/术语 → finance/concept_explain
-- 纯闲聊/问候 → domain=chat
-- 用户要设置提醒/定时/闹钟/倒计时/几分钟后 → system/reminder
-- 用户要查看/管理/取消定时任务 → system/cron_manage
-- 用户要修改系统设置/配置 → system/settings
-- system 意图不需要调用分析工具，reminder 直接创建定时提醒
-- confidence: 有明确信号=0.9+, 有关键词=0.7+, 不确定=0.5-, 猜测=0.3
-- 意图不明确时（没有匹配到上述任何规则），intent 填 "unknown"，confidence 填 0.3，不要猜测
-- context_summary: 压缩为一句话摘要，供下轮对话使用
-"""
-
-# 意图 → tool_categories 映射
-_INTENT_TOOL_CATEGORIES = {
-    "stock_analysis": ["名称查询", "行情数据", "技术分析", "情报搜索"],
-    "chart_view": ["名称查询", "行情数据", "K线图表"],
-    "market_scan": ["行情数据", "龙虎榜/热榜"],
-    "screener": ["名称查询", "选股", "指标策略"],
-    "backtest": ["名称查询", "行情数据", "回测", "指标策略"],
-    "fund_flow": ["名称查询", "行情数据"],
-    "indicator": ["名称查询", "行情数据", "技术分析", "指标策略"],
-    "trading": ["交易", "指标策略"],
-    "stock_info": ["名称查询", "行情数据"],
-    "concept_explain": [],
-    "reminder": [],
-    "cron_manage": [],
-    "settings": [],
-    "unknown": [],
-    "code_modify": ["工作区"],
-    "code_create": ["工作区"],
-    "project_scan": [],
-}
+def _ensure_intent_loaded():
+    global _INTENT_PROMPT, _INTENT_TOOL_CATEGORIES
+    if not _INTENT_PROMPT:
+        _INTENT_PROMPT, _INTENT_TOOL_CATEGORIES = _load_intent_config()
 
 
 def _call_llm_for_intent(
@@ -283,6 +247,7 @@ def analyze_intent(
     """
     from app.agent.domain_registry import init_builtin_domains
     init_builtin_domains()
+    _ensure_intent_loaded()
 
     if not message or not message.strip():
         return IntentResult(domain="chat", intent="empty", confidence=1.0, source="quick")
