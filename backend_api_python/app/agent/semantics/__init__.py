@@ -148,6 +148,8 @@ def _parse_skill_md(content: str) -> tuple:
                 meta = {}
             body = parts[2].strip()
 
+    return meta, body
+
 
 def _parse_behaviors_from_md(body: str) -> Dict[str, List[str]]:
     """从 Markdown body 中解析行为规范。
@@ -296,11 +298,25 @@ def load_semantics():
 
 def get_persona() -> PersonaMeta:
     load_semantics()
+    if _persona is None:
+        return PersonaMeta(role="量化分析助手", identity="", mission="", behaviors={})
     return _persona
 
 
 def get_intent_meta() -> IntentMeta:
     load_semantics()
+    if _intent is None:
+        # load_semantics 失败时返回空默认值，防止调用方 NoneType 崩溃
+        return IntentMeta(
+            classifier_prompt="",
+            rules=[],
+            quick_patterns={
+                "greeting": r'^(你好|hi|hello|嗨|hey|在吗|哈喽|嘿|yo)[\s\?\?\.\,\!\~\。\，\！\？\…]*$',
+                "farewell": r'^(再见|拜拜|bye|88|886|晚安|回见)[\s\?\?\.\,\!\~\。\，\！\？\…]*$',
+                "thanks": r'^(谢谢|感谢|多谢|thanks|thank\s*you|thx|3q)[\s\?\?\.\,\!\~\。\，\！\？\…]*$',
+            },
+            intent_tool_categories={},
+        )
     return _intent
 
 

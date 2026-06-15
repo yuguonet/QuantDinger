@@ -28,27 +28,30 @@ class CallSkillTool(Tool):
 
     name = "call_skill"
     description = (
-        "调用分析技能对股票进行专业分析。传入技能名和股票代码，"
-        "返回结构化分析报告（评分/方向/信号/因子明细）。"
-        "适用于需要专业维度分析时，如技术面、动量、情报、政策等。"
+        "调用专业分析技能的唯一入口。所有技能必须通过此工具调用，"
+        "不能直接把技能名当函数用。传入技能名和股票代码，返回结构化 JSON 报告。"
+        "选股场景不需要具体股票代码时，stock_code 传空字符串即可。"
     )
     inputs = {
         "skill_name": {
             "type": "string",
             "description": (
                 "技能名。可选值: "
-                "technical_agent(技术面+动量), indicator_agent(指标), "
-                "bb_screener(BB超卖全市场扫描+深入分析), "
+                "short_term_screener(短线选股，全市场扫描，不需要stock_code), "
+                "screening_agent(通用选股), "
+                "technical_agent(技术面+动量, 需要stock_code), "
+                "indicator_agent(指标), "
+                "bb_screener(BB超卖扫描), "
                 "intelligence_agent(情报+政策), hot_money_tracker(游资), "
                 "lockup_watcher(解禁), market_data_agent(行情+概念+资金), "
-                "screening_agent(选股), backtest_agent(回测), "
+                "backtest_agent(回测), "
                 "bull_researcher(多头), bear_researcher(空头), "
                 "data_agent(数据工程), trading_agent(交易)"
             ),
         },
         "stock_code": {
             "type": "string",
-            "description": "股票代码，如 600519、000858",
+            "description": "股票代码，如 600519。选股类技能可传空字符串。",
         },
         "stock_name": {
             "type": "string",

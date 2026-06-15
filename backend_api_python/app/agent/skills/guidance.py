@@ -28,7 +28,9 @@ GUIDANCE = """## 核心规则
 **核心原理：价格折扣一切。** 政策、消息、基本面最终都反映在价格上。
 分析必须从客观数据出发，而非从消息/新闻出发。
 
-**⚠️ 无链路匹配时，必须先调 call_skill，不要直接调底层工具。**
+**⚠️ call_skill 是调用所有技能的唯一入口，不能把技能名当函数直接调用。**
+选股用 `call_skill(skill_name="short_term_screener", stock_code="")`，
+个股分析用 `call_skill(skill_name="technical_agent", stock_code="代码")`。
 call_skill 内部已集成完整的数据优先流程，输出标准化报告并自动写入回溯系统。
 
 **Skill 内部数据优先顺序（供参考，由 Skill 自动执行）：**

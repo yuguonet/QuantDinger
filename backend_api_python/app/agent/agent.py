@@ -287,7 +287,7 @@ final_answer({{
 1. **不需要工具的消息，第一步就 final_answer** — 打招呼、闲聊等直接调用 final_answer。
 1b. **⚠️ 任务完成即 final_answer** — 工具调用成功返回结果后（如创建定时任务、查询完成），立即调用 final_answer 返回确认信息。不要等待后续事件（如定时任务触发），那由系统自动处理。
 2. **必须调用工具获取真实数据** — 绝不编造数字。
-3. **⚠️ call_skill 按场景区分** — 推荐/选股用screening_agent，个股分析用 technical_agent，市场/板块用 market_data_agent，游资追踪用 hot_money_tracker。
+3. **⚠️ call_skill 是调用所有技能的唯一入口** — 选股用 `call_skill(skill_name="short_term_screener", stock_code="")`，个股分析用 `call_skill(skill_name="technical_agent", stock_code="代码")`。不能把技能名当 Python 函数直接调用。
 4. **深度优先** — 分析深度不够时用 Python 代码做量化分析。
 5. **风险优先** — 分析必须包含风险提示。
 6. **工具失败处理** — 记录失败原因，用已有数据继续，不重复调用。

@@ -102,7 +102,14 @@ def _ensure_quick_patterns():
         return
     _ensure_intent_loaded()
     from app.agent.semantics import get_intent_meta
-    patterns = get_intent_meta().quick_patterns
+    meta = get_intent_meta()
+    if meta is None:
+        # intent.md 不存在或解析失败，用硬编码兜底
+        _GREETING_RE = re.compile(r'^(你好|hi|hello|嗨|hey|在吗|哈喽|嘿|yo)' + _PUNCT_TAIL + '$', re.IGNORECASE)
+        _FAREWELL_RE = re.compile(r'^(再见|拜拜|bye|88|886|晚安|回见)' + _PUNCT_TAIL + '$', re.IGNORECASE)
+        _THANKS_RE = re.compile(r'^(谢谢|感谢|多谢|thanks|thank\s*you|thx|3q)' + _PUNCT_TAIL + '$', re.IGNORECASE)
+        return
+    patterns = meta.quick_patterns
     _GREETING_RE = re.compile(patterns.get("greeting", r'^NEVER_MATCH$'), re.IGNORECASE)
     _FAREWELL_RE = re.compile(patterns.get("farewell", r'^NEVER_MATCH$'), re.IGNORECASE)
     _THANKS_RE = re.compile(patterns.get("thanks", r'^NEVER_MATCH$'), re.IGNORECASE)
