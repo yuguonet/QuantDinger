@@ -144,7 +144,7 @@ def _load_preamble() -> str:
 def _build_instructions(user_message: str = "", skill_instructions: str = "",
                         language: str = "zh", tools=None, managed_agents=None,
                         domain: str = "", domain_instructions: str = "",
-                        intent_context: str = "") -> str:
+                        intent_context: str = "", stock_code: str = "") -> str:
     if str(language or "").lower().startswith("en"):
         lang_section = "\n## Output Language\n- Reply in English.\n- All JSON values in English.\n"
     else:
@@ -198,8 +198,9 @@ def _build_instructions(user_message: str = "", skill_instructions: str = "",
     # calibration_context 通过外部注入到 user_message 前部
 
     # 金融领域 JSON 标准化输出规范（按 AGENT_TYPE 区分格式）
+    # 仅当有具体个股且需要输出买卖信号时才注入，否则用自然语言回复
     finance_json_section = ""
-    if domain == "finance":
+    if domain == "finance" and stock_code:
         _agent_cls = _get_agent_class()
         _json_fields = (
             '"action": "buy/sell/hold/skip",\n'
@@ -628,6 +629,7 @@ def get_smolagent(
     domain: str = "",
     domain_instructions: str = "",
     intent_context: str = "",
+    stock_code: str = "",
     tool_categories: Optional[List[str]] = None,
     collector=None,  # TraceCollector（金融领域注入）
     strategy: str = "direct",  # §15: 执行策略
@@ -668,7 +670,7 @@ def get_smolagent(
     instructions = _build_instructions(
         user_message, skill_instructions, language, tools, managed_agents=None,
         domain=domain, domain_instructions=domain_instructions,
-        intent_context=intent_context,
+        intent_context=intent_context, stock_code=stock_code,
     )
 
     AgentClass = _get_agent_class()
@@ -942,12 +944,19 @@ class _AgentExecutor:
             if _missing:
                 _current_round_parts.append(f"需获取: {', '.join(_missing)}")
 
-        if _current_round_parts:
+        if context_summary:
+            # 有历史上下文时，始终添加当前轮次分隔符（即便本轮无额外字段）
+            sep = f"--- R{round_num} ---"
+            if _current_round_parts:
+                sep += "\n" + "\n".join(_current_round_parts)
+            ctx_parts.append(sep)
+        elif _current_round_parts:
             ctx_parts.append(f"--- R{round_num} ---\n" + "\n".join(_current_round_parts))
 
         if ctx_parts:
             enriched = "\n".join(ctx_parts) + "\n\n" + message
 
+        stock_code = (context or {}).get("stock_code", "")
         agent = get_smolagent(
             skills=self.skills, user_id=user_id,
             model=self.model, provider=self.provider,
@@ -955,6 +964,7 @@ class _AgentExecutor:
             language=(context or {}).get("report_language", "zh"),
             domain=domain, domain_instructions=domain_instructions,
             intent_context=intent_context,
+            stock_code=stock_code,
             tool_categories=tool_categories,
             collector=collector,
             strategy=strategy,

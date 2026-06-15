@@ -189,7 +189,7 @@ class _InMemoryStore:
     # ── Compressed context (跨轮上下文压缩) ──────────────────
 
     def save_context_summary(self, session_id: str, summary: str, domain: str = "") -> None:
-        """保存压缩上下文摘要。按领域分别存储，追加轮次而非覆盖。空summary清空该领域轮次。"""
+        """保存压缩上下文摘要。按领域分别存储，追加轮次而非覆盖。空summary只确保key存在，不清除已有轮次。"""
         with self._lock:
             if session_id not in self._sessions:
                 self._sessions[session_id] = {}
@@ -208,8 +208,9 @@ class _InMemoryStore:
                         _rounds = _rounds[-5:]
                     s["context_summaries"][domain] = _rounds
                 else:
-                    # 空 summary → 清空该领域轮次
-                    s["context_summaries"][domain] = []
+                    # 空 summary → 确保 key 存在，不清除已有轮次
+                    if domain not in s["context_summaries"]:
+                        s["context_summaries"][domain] = []
                 s["current_domain"] = domain
             elif summary:
                 cur = s.get("current_domain", "")
@@ -470,8 +471,8 @@ class _RedisStore:
                 import json as _json
                 self._r.hset(key, domain, _json.dumps(rounds, ensure_ascii=False))
             else:
-                # 空 summary → 清空该领域轮次
-                self._r.hdel(key, domain)
+                # 空 summary → 不处理（不清除已有轮次）
+                pass
             self._r.expire(key, 3600)
             self._r.set(self._context_domain_key(session_id), domain, ex=3600)
         elif summary:
@@ -758,11 +759,11 @@ class _FileStore:
                         rounds = rounds[-5:]
                     summaries[domain] = rounds
                 else:
-                    # 空 summary → 清空该领域轮次
-                    summaries[domain] = []
+                    # 空 summary → 确保 key 存在，不清除已有轮次
+                    if domain not in summaries:
+                        summaries[domain] = []
                 data["current_domain"] = domain
             elif summary:
-                cur = data.get("current_domain", "")
                 if cur:
                     summaries = data.setdefault("context_summaries", {})
                     rounds = summaries.get(cur)

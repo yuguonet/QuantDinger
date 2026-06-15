@@ -7,11 +7,11 @@
             }
         ],
         "stats": {
-            "avg_steps": 4.1,
-            "executions": 20,
-            "success_count": 18,
-            "success_rate": 0.9,
-            "last_updated": "2026-06-15"
+            "avg_steps": 4.08,
+            "executions": 26,
+            "success_count": 23,
+            "success_rate": 0.885,
+            "last_updated": "2026-06-16"
         }
     },
     "analyze+chart": {
@@ -595,10 +595,10 @@
         ],
         "stats": {
             "avg_steps": 3.0,
-            "executions": 1,
-            "success_count": 1,
+            "executions": 2,
+            "success_count": 2,
             "success_rate": 1.0,
-            "last_updated": "2026-06-14"
+            "last_updated": "2026-06-16"
         }
     },
     "unknown+unknown": {
@@ -631,7 +631,7 @@
             {
                 "tool": "call_skill",
                 "args": {
-                    "skill_name": "short_term_screener"
+                    "skill_name": "screener"
                 },
                 "desc": "短线选股专家（全市场预筛选+深入分析）"
             }
@@ -649,7 +649,7 @@
             {
                 "tool": "call_skill",
                 "args": {
-                    "skill_name": "short_term_screener"
+                    "skill_name": "screener"
                 },
                 "desc": "短线选股专家（全市场预筛选+深入分析）"
             }
@@ -667,7 +667,7 @@
             {
                 "tool": "call_skill",
                 "args": {
-                    "skill_name": "short_term_screener"
+                    "skill_name": "screener"
                 },
                 "desc": "短线选股专家（全市场预筛选+深入分析）"
             }
@@ -685,7 +685,7 @@
             {
                 "tool": "call_skill",
                 "args": {
-                    "skill_name": "short_term_screener"
+                    "skill_name": "screener"
                 },
                 "desc": "短线选股专家（全市场预筛选+深入分析）"
             }
@@ -703,7 +703,7 @@
             {
                 "tool": "call_skill",
                 "args": {
-                    "skill_name": "short_term_screener"
+                    "skill_name": "screener"
                 },
                 "desc": "短线选股专家（全市场预筛选+深入分析）"
             }
