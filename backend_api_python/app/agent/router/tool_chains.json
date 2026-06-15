@@ -625,5 +625,95 @@
             "success_rate": 1.0,
             "last_updated": "2026-06-15"
         }
+    },
+    "recommend+stock": {
+        "steps": [
+            {
+                "tool": "call_skill",
+                "args": {
+                    "skill_name": "short_term_screener"
+                },
+                "desc": "短线选股专家（全市场预筛选+深入分析）"
+            }
+        ],
+        "stats": {
+            "avg_steps": 0.0,
+            "executions": 0,
+            "success_count": 0,
+            "success_rate": 0.0,
+            "last_updated": ""
+        }
+    },
+    "recommend+short_term": {
+        "steps": [
+            {
+                "tool": "call_skill",
+                "args": {
+                    "skill_name": "short_term_screener"
+                },
+                "desc": "短线选股专家（全市场预筛选+深入分析）"
+            }
+        ],
+        "stats": {
+            "avg_steps": 0.0,
+            "executions": 0,
+            "success_count": 0,
+            "success_rate": 0.0,
+            "last_updated": ""
+        }
+    },
+    "screen+stock": {
+        "steps": [
+            {
+                "tool": "call_skill",
+                "args": {
+                    "skill_name": "short_term_screener"
+                },
+                "desc": "短线选股专家（全市场预筛选+深入分析）"
+            }
+        ],
+        "stats": {
+            "avg_steps": 0.0,
+            "executions": 0,
+            "success_count": 0,
+            "success_rate": 0.0,
+            "last_updated": ""
+        }
+    },
+    "select+stock": {
+        "steps": [
+            {
+                "tool": "call_skill",
+                "args": {
+                    "skill_name": "short_term_screener"
+                },
+                "desc": "短线选股专家（全市场预筛选+深入分析）"
+            }
+        ],
+        "stats": {
+            "avg_steps": 0.0,
+            "executions": 0,
+            "success_count": 0,
+            "success_rate": 0.0,
+            "last_updated": ""
+        }
+    },
+    "scan+stock": {
+        "steps": [
+            {
+                "tool": "call_skill",
+                "args": {
+                    "skill_name": "short_term_screener"
+                },
+                "desc": "短线选股专家（全市场预筛选+深入分析）"
+            }
+        ],
+        "stats": {
+            "avg_steps": 0.0,
+            "executions": 0,
+            "success_count": 0,
+            "success_rate": 0.0,
+            "last_updated": ""
+        }
     }
 }

@@ -134,6 +134,9 @@ def _load_intent_config():
     """从 semantics/intent.md 加载 prompt 和映射。"""
     from app.agent.semantics import get_intent_meta
     meta = get_intent_meta()
+    if meta is None:
+        logger.warning("[Intent] get_intent_meta() 返回 None，使用空默认值")
+        return "", {}
     return meta.classifier_prompt, meta.intent_tool_categories
 
 # 懒加载：首次调用 analyze_intent 时才加载
@@ -440,4 +443,14 @@ def format_intent_for_agent(intent: IntentResult, original_message: str) -> str:
 
     if intent.confidence < 0.6:
         parts.append(f"⚠️ 置信度较低({intent.confidence:.2f})，请结合原始消息判断")
+
+    # 选股/推荐类意图：显式提醒正确 skill，防止 agent 乱调 technical_agent
+    _screening_verbs = {"recommend", "screen", "select", "scan", "filter", "pick"}
+    _screening_nouns = {"stock", "short_term", "target", "candidate", "buy"}
+    if (intent.verb in _screening_verbs or intent.noun in _screening_nouns
+            or "选股" in original_message or "买什么" in original_message
+            or "推荐" in original_message):
+        if not intent.params.get("stock"):  # 没给具体股票代码
+            parts.append("⚠️ 用户未指定股票代码，这是选股/推荐场景。你必须使用 short_term_screener（短线选股）或 screening_agent（通用选股），禁止用 technical_agent 分析任意股票。")
+
     return "\n".join(parts)

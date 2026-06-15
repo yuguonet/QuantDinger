@@ -144,26 +144,54 @@ class CallSkillTool(Tool):
         return self._format_report(report)
 
     def _format_report(self, report) -> str:
-        """将 SkillReport 格式化为 Agent 可读的文本。"""
-        lines = [
-            f"## {report.skill_name}",
-            f"评分: {report.score:.0f} | 方向: {report.direction} | 信号: {report.signal}",
-            f"置信: {report.confidence:.2f} | 状态: {report.status}",
-        ]
+        """将 SkillReport 格式化为标准化 JSON，与 agent final_answer 格式对齐。
 
-        if report.factors:
-            lines.append("### 因子明细")
-            for f in report.factors:
-                s = f"{f.score:.0f}" if f.score is not None else "—"
-                lines.append(f"- {f.name}: {f.value} ({s}分)")
+        返回 JSON 字符串，agent 可直接解析字段，无需从纯文本中提取。
+        """
+        # confidence: 0-1 → high/medium/low
+        if report.confidence >= 0.7:
+            conf_label = "high"
+        elif report.confidence >= 0.4:
+            conf_label = "medium"
+        else:
+            conf_label = "low"
 
-        if report.analysis:
-            lines.append(f"\n{report.analysis[:800]}")
+        # factors 标准化
+        factors_out = []
+        for f in (report.factors or []):
+            f_dict = {"name": f.name, "value": f.value}
+            if f.score is not None:
+                f_dict["score"] = round(f.score, 1)
+                f_dict["direction"] = (
+                    "bullish" if f.score >= 60
+                    else ("bearish" if f.score <= 40 else "neutral")
+                )
+            else:
+                f_dict["direction"] = "neutral"
+            factors_out.append(f_dict)
+
+        action = _score_to_action(report.score)
+
+        result = {
+            "skill": report.skill_name,
+            "action": action,
+            "score": round(report.score, 1) if report.score is not None else None,
+            "direction": report.direction,
+            "confidence": conf_label,
+            "signal": report.signal,
+            "factors": factors_out,
+            "analysis": (report.analysis or "")[:800],
+            "status": report.status,
+        }
 
         if report.error:
-            lines.append(f"\n⚠️ 错误: {report.error}")
+            result["error"] = report.error
 
-        return "\n".join(lines)
+        # 数据缺失时标记，agent 应据此如实告知用户
+        if report.status in ("missing", "error") or "无数据" in (report.signal or ""):
+            result["data_missing"] = True
+
+        return json.dumps(result, ensure_ascii=False)
 
 
 def _score_to_action(score: float) -> str:

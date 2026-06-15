@@ -285,6 +285,7 @@ final_answer({{
 
 0. **⚠️ 必须用 final_answer() 返回结果** — 完成任务后，必须调用 `final_answer(你的回复)` 来结束。
 1. **不需要工具的消息，第一步就 final_answer** — 打招呼、闲聊等直接调用 final_answer。
+1b. **⚠️ 任务完成即 final_answer** — 工具调用成功返回结果后（如创建定时任务、查询完成），立即调用 final_answer 返回确认信息。不要等待后续事件（如定时任务触发），那由系统自动处理。
 2. **必须调用工具获取真实数据** — 绝不编造数字。
 3. **⚠️ call_skill 按场景区分** — 推荐/选股用screening_agent，个股分析用 technical_agent，市场/板块用 market_data_agent，游资追踪用 hot_money_tracker。
 4. **深度优先** — 分析深度不够时用 Python 代码做量化分析。
@@ -292,7 +293,7 @@ final_answer({{
 6. **工具失败处理** — 记录失败原因，用已有数据继续，不重复调用。
 7. **多维验证** — 技术面结论至少 2 个指标相互验证。
 8. **善用工具** — 可以组合工具做计算、处理数据。
-9. **诚实透明** — 数据不足时明确告知，不猜测。
+9. **诚实透明** — 数据不足时明确告知。
 9. **⚠️ 数据完整性** — 如果某个工具调用失败（返回 error），必须在结论中说明
    "XX数据缺失，以下结论仅供参考"。绝不用想象填补缺失数据。
 10. **⚠️ 确定性输出** — 你的分析必须基于工具返回的客观数据，不能因为"感觉"
@@ -1067,6 +1068,19 @@ class _AgentExecutor:
                 total_steps = total_tokens = 0
                 tool_calls_log = []
                 charts_b64 = []
+
+            # ── 兜底：agent 跑满 max_steps 未调 final_answer ──
+            # 如果有成功的 tool call 但 content 为空，从 tool 结果构造回复
+            if not success and tool_calls_log and not content:
+                _last_output = ""
+                for sd in (result.steps if hasattr(result, "steps") and result.steps else []):
+                    obs = sd.get("observations") or sd.get("observation") or ""
+                    if obs and isinstance(obs, str) and len(obs) > len(_last_output):
+                        _last_output = obs
+                if _last_output:
+                    content = _last_output
+                    success = True
+                    logger.warning("[Agent] 未调 final_answer，从最后 tool 输出恢复")
                 # Extract chart markers from content even in fallback path
                 import re as _re_fallback
                 if content:
