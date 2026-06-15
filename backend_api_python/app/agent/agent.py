@@ -677,6 +677,9 @@ def get_smolagent(
             "pandas", "numpy", "json", "math", "statistics",
             "datetime", "collections", "itertools", "re",
         ]
+        # 代码执行超时（默认 30s 太短，批量工具调用会超时）
+        _code_exec_timeout = int(os.getenv("CODE_EXECUTION_TIMEOUT", "120"))
+        _extra_kwargs["executor_kwargs"] = {"timeout_seconds": _code_exec_timeout}
 
     # §15: 用 strategy 替代 domain 做 JSON 校验决策
     # traced 策略 → 强制 JSON 校验；其他 → 宽松校验

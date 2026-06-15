@@ -1,8 +1,13 @@
-# 语义描述重构方案（v2 — 对齐 §15 Domain 解耦）
+# 语义描述重构方案（v3 — 三段加载 + SKILL.md 格式）
 
-> 日期: 2026-06-15（v2 重写，对齐 AGENT_ACCOUNTABLE.md §15）
+> 日期: 2026-06-15（v3 重写，对齐 §15 + OpenClaw/Nanobot 三段加载模式）
 > 前置: §15 Domain 解耦重构已实施（domain→纯标签，strategy→路由，tags→多值）
-> 目标: 将散落在 7+ 处的描述语义统一到 `agent/semantics/` 目录，实现「改描述只改一处」。
+> 目标: 将散落在 7+ 处的描述语义统一到 `agent/semantics/` 目录，实现「改描述只改一处」+「按需加载」。
+>
+> 核心参考：OpenClaw / Nanobot 的两阶段加载模式，扩展为三段加载。
+> - 第一段：system prompt 只放能力清单（名字+分类索引）
+> - 第二段：意图分析后注入领域指令+相关描述
+> - 第三段：call_skill 时按需读取 SKILL.md 完整指令
 
 ## 一、现状问题（与 v1 相同，但 §15 已解决路由问题）
 
@@ -19,8 +24,8 @@
 | `agent_preamble.md` | Agent 人设 | 1 | 已是独立文件，还好 |
 | `intent_analyzer.py` `_INTENT_PROMPT` | 意图分类规则（100+ 行） | 1 | 分类规则内嵌在代码里 |
 | `intent_analyzer.py` `_INTENT_TOOL_CATEGORIES` | 意图→工具类别映射 | 1 | 映射关系硬编码 |
-| `planner.py` `SKILL_CATALOG` | Skill 目录（给 LLM 看的精简版） | 1 | **第三份** skill 描述 |
-| `planner.py` `_llm_plan()` prompt | 规划器 prompt | 1 | 规则内嵌在代码中 |
+
+> ⚠️ `planner.py` 已在 AGENT_ACCOUNTABLE.md §11.3 Phase 1 中删除，不再存在。
 
 **§15 已解决的问题**（本方案不再重复）：
 - ✅ domain 从三合一降级为纯标签
@@ -49,9 +54,9 @@
 ### 六条原则
 
 1. **单一信源**：每个描述只在一个地方定义，其他地方引用
-2. **分层加载**：元数据（name+description）始终注入；详细指令按需加载
-3. **声明式优先**：描述用 YAML 声明，代码只负责加载和使用
-4. **渐进式披露**：system prompt 只放轻量摘要
+2. **三段加载**：system prompt 只放能力清单，领域指令按请求注入，Skill 完整指令按需加载
+3. **声明式优先**：描述用 YAML/SKILL.md 声明，代码只负责加载和使用
+4. **token 预算控制**：每段有明确的 token 上限，不允许某段过重
 5. **保留分层**：tags → skill → tool 三级结构不变
 6. **向后兼容**：不改变 @skill/@tool 装饰器的使用方式，只改变描述的来源
 
@@ -75,31 +80,33 @@ backend_api_python/app/agent/
 │   ├── __init__.py               ← 加载器
 │   │
 │   ├── persona.yaml              ← Agent 人设
-│   ├── domains.yaml              ← 领域描述 + instructions（供标签匹配用）
+│   ├── domains.yaml              ← 领域描述 + instructions
 │   ├── intent.yaml               ← 意图分类规则 + 意图→工具映射
 │   ├── routes.yaml               ← 路由 utterances + 元数据
 │   ├── chains.yaml               ← 链路编排 + steps
-│   ├── planner.yaml              ← 规划器 skill 目录 + prompt
 │   │
-│   ├── skills/                   ← 每个 skill 一个 YAML
-│   │   ├── technical.yaml
-│   │   ├── indicator.yaml
-│   │   ├── intelligence.yaml
-│   │   └── ...（15+ 个）
-│   │
-│   └── tools/                    ← 按 category 分组
-│       ├── data.yaml
-│       ├── analysis.yaml
-│       ├── trading.yaml
-│       └── ...
+│   └── skills/                   ← 每个 skill 一个 SKILL.md（Markdown + YAML frontmatter）
+│       ├── technical_agent/
+│       │   └── SKILL.md
+│       ├── indicator_agent/
+│       │   └── SKILL.md
+│       ├── intelligence_agent/
+│       │   └── SKILL.md
+│       └── ...（15 个）
 │
-├── skills/                       ← 代码逻辑（@skill 从 semantics 加载描述）
-├── tools/                        ← 代码逻辑（@tool 从 semantics 加载描述）
+├── skills/                       ← 代码逻辑（@skill 从 SKILL.md 加载描述）
+├── tools/                        ← 代码逻辑（@tool 的 tags 从 semantics 加载，description 保留代码中）
 ├── domain_registry.py            ← 从 domains.yaml 加载
 ├── intent_analyzer.py            ← 从 intent.yaml 加载
-├── planner.py                    ← 从 planner.yaml 加载
-└── agent.py                      ← _build_instructions() 从 semantics 组装
+└── agent.py                      ← 三段加载：_build_instructions() + _prepare() + CallSkillTool
 ```
+
+> ⚠️ `planner.py` 已在 AGENT_ACCOUNTABLE.md §11.3 Phase 1 中删除，不再需要 `planner.yaml`。
+>
+> **文件格式决策**：采用 SKILL.md（Markdown + YAML frontmatter），与 OpenClaw/Nanobot 对齐。
+> - frontmatter 存元数据（name, description, tags, tools, priority, default_weight）
+> - Markdown body 存完整 instructions
+> - 每个 skill 独立目录，便于 git 管理和独立修改
 
 ### 与 §15 tags 的配合
 
@@ -183,61 +190,83 @@ domains:
     tool_categories: []
 ```
 
-### 4.3 skills/*.yaml
+### 4.3 skills/{name}/SKILL.md（Markdown + YAML frontmatter）
 
-```yaml
-# skills/technical.yaml
+> 采用与 OpenClaw/Nanobot 相同的 SKILL.md 格式。
+> frontmatter 存元数据（供第一段/第二段加载），Markdown body 存完整 instructions（供第三段加载）。
+
+```markdown
+---
 name: technical_agent
-tags: [finance, technical]           # §15: 多值标签
-description: "技术面综合分析（趋势/量价/均线/指标/形态/筹码/动量/突破）"
+tags: [finance, technical]
+description: 技术面综合分析（趋势/量价/均线/指标/形态/筹码/动量/突破）
 priority: 9
 default_weight: 1.0
-standard_output: true                # 是否需要 JSON 标准化输出
-
+standard_output: true
 tools:
   - analyze_trend
   - get_indicator_snapshot
   - analyze_volume
   - detect_candlestick_patterns
   - analyze_chip_distribution
+---
 
-triggers:                            # 给 LLM 判断何时调用
-  - "技术分析"
-  - "趋势判断"
-  - "均线/MACD/RSI/KDJ/布林带"
-  - "量价关系"
-  - "K线形态"
+# 技术面综合分析
 
-instructions: |
-  纯算法技术面 + 动量分析。
-  1. 趋势判断：MA排列 + MACD方向
-  2. 量价分析：量比 + 放缩量 + 量价背离
-  3. 指标共振：RSI + KDJ + BOLL
-  4. 形态识别：K线形态 + 突破确认
-  5. 筹码分析：获利比例 + 集中度
-  6. 动量追踪：连续涨跌 + 加速度
+纯算法技术面 + 动量分析。
+
+## 分析流程
+1. **趋势判断** — MA排列 + MACD方向
+2. **量价分析** — 量比 + 放缩量 + 量价背离
+3. **指标共振** — RSI + KDJ + BOLL
+4. **形态识别** — K线形态 + 突破确认
+5. **筹码分析** — 获利比例 + 集中度
+6. **动量追踪** — 连续涨跌 + 加速度
+
+## 输出要求
+- 每个维度独立评分（0-100）
+- 给出综合 direction（bullish/bearish/neutral）
+- 缺失数据标注 missing，不猜测
 ```
 
-### 4.4 tools/*.yaml
+**frontmatter 字段说明**：
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| name | string | ✅ | 技能注册名 |
+| tags | list | ✅ | 多值标签（§15） |
+| description | string | ✅ | 一句话描述（≤100字，用于第二段摘要） |
+| priority | int | ❌ | 优先级（默认 5） |
+| default_weight | float | ❌ | 出厂权重（默认 1.0） |
+| standard_output | bool | ❌ | 是否需要 JSON 标准化输出 |
+| tools | list | ❌ | 依赖的工具名列表 |
+
+**Markdown body**：完整 instructions，只在第三段（call_skill 时）加载。
+
+### 4.4 tools/*.yaml — 只存元数据，description 保留在 @tool 装饰器
+
+> **设计决策**：工具描述不抽到 YAML。原因：
+> 1. 80+ 工具的 description 和代码逻辑紧耦合，拆出去反而双份维护
+> 2. 工具名本身就是最强语义（`get_kline` > "获取K线数据"），description 是辅助
+> 3. `@tool` 装饰器的 description 已经够短（1行），不需要优化
+>
+> YAML 只记录工具的**分类元数据**（tags、category、layer），供过滤和分组用。
 
 ```yaml
-# tools/data.yaml
+# tools/data.yaml — 只存元数据，不存 description
 tools:
   search_stock_by_name:
-    tags: [finance]                  # §15: tags 替代 domain
-    description: "根据中文名称或关键词搜索股票代码"
+    tags: [finance]
     category: "名称查询"
     layer: "数据层"
 
   get_kline:
     tags: [finance]
-    description: "获取K线数据（OHLCV），支持多周期"
     category: "行情数据"
     layer: "数据层"
 
   get_realtime_quote:
     tags: [finance]
-    description: "获取股票实时行情（最新价、涨跌幅、成交量、换手率）"
     category: "行情数据"
     layer: "数据层"
 ```
@@ -314,55 +343,6 @@ intent_tool_categories:
   code_modify: [工作区]
   code_create: [工作区]
   project_scan: []
-```
-
-### 4.6 planner.yaml
-
-```yaml
-skill_catalog:
-  - name: technical_agent
-    summary: "技术面+动量综合。地基，大多数场景必须包含。"
-  - name: indicator_agent
-    summary: "用户自定义指标信号。指标验证。"
-  - name: intelligence_agent
-    summary: "情报+政策分析。信息面分析。"
-  - name: hot_money_tracker
-    summary: "游资/龙虎榜/主力资金。短线资金面。"
-  - name: lockup_watcher
-    summary: "解禁/减持/质押。供给端风险。"
-  - name: market_data_agent
-    summary: "行情+概念+资金。市场概览。"
-  - name: screening_agent
-    summary: "条件选股/指标筛选。"
-  - name: backtest_agent
-    summary: "策略回测。验证历史绩效。"
-  - name: bull_researcher
-    summary: "多头论据构建。"
-  - name: bear_researcher
-    summary: "空头论据构建。"
-  - name: data_agent
-    summary: "数据工程/脚本执行。"
-  - name: trading_agent
-    summary: "交易执行/策略启停。"
-
-aliases:
-  momentum_tracker: technical_agent
-  policy_analyst: intelligence_agent
-  concept_tracker: market_data_agent
-
-planner_prompt: |
-  你是量化分析规划器。根据用户问题，选择需要执行的分析技能。
-
-  ## 用户问题
-  {query}{stock_info}{intent_info}
-
-  ## 可用技能
-  {skill_catalog}
-
-  ## 规则
-  - 从上述技能中选择 1~5 个，按执行顺序排列
-  - 大多数场景必须包含 technical_agent（技术面地基）
-  - 不要选择与问题无关的技能
 ```
 
 ### 4.7 chains.yaml
@@ -506,7 +486,6 @@ _domain_metas: Dict[str, "DomainMeta"] = {}
 _route_metas: List["RouteMeta"] = []
 _chain_metas: Dict[str, "ChainMeta"] = {}
 _intent_meta: Optional["IntentMeta"] = None
-_planner_meta: Optional["PlannerMeta"] = []
 _persona: Optional["PersonaMeta"] = None
 _loaded = False
 
@@ -574,16 +553,10 @@ class IntentMeta:
     quick_patterns: Dict[str, str] = field(default_factory=dict)
     intent_tool_categories: Dict[str, List[str]] = field(default_factory=dict)
 
-@dataclass
-class PlannerMeta:
-    skill_catalog: List[dict] = field(default_factory=list)
-    aliases: Dict[str, str] = field(default_factory=dict)
-    planner_prompt: str = ""
-
 
 def load_semantics():
     """加载所有语义描述文件（幂等，只加载一次）。"""
-    global _loaded, _persona, _intent_meta, _planner_meta
+    global _loaded, _persona, _intent_meta
     if _loaded:
         return
     _loaded = True
@@ -629,14 +602,6 @@ def load_semantics():
         intent_tool_categories=intent_data.get("intent_tool_categories", {}),
     )
 
-    # planner
-    planner_data = _load_yaml("planner.yaml")
-    _planner_meta = PlannerMeta(
-        skill_catalog=planner_data.get("skill_catalog", []),
-        aliases=planner_data.get("aliases", {}),
-        planner_prompt=planner_data.get("planner_prompt", ""),
-    )
-
 
 # ── 公开接口 ──
 
@@ -679,10 +644,6 @@ def get_chain_meta(name: str) -> Optional[ChainMeta]:
 def get_intent_meta() -> IntentMeta:
     load_semantics()
     return _intent_meta
-
-def get_planner_meta() -> PlannerMeta:
-    load_semantics()
-    return _planner_meta
 
 
 def get_skills_summary_xml() -> str:
@@ -756,22 +717,22 @@ class TechnicalSkill:
     pass
 ```
 
-### 6.2 tools/registry.py — @tool 从 semantics 加载
+### 6.2 tools/registry.py — @tool 的 tags 从 semantics 加载，description 保留代码中
 
 ```python
 # 改造前
 @tool(description="获取K线数据...", category="行情数据", tags=["finance"])
 def get_kline(...): ...
 
-# 改造后
+# 改造后 — tags 从 YAML 加载，description 保持在代码中
 from app.agent.semantics import get_tool_meta
 _meta = get_tool_meta("get_kline")
 
 @tool(
-    description=_meta.description,
-    category=_meta.category,
-    layer=_meta.layer,
-    tags=_meta.tags,               # §15: 从 YAML 加载 tags
+    description="获取K线数据（OHLCV），支持多周期",  # 保持在代码中，不从 YAML 读
+    category=_meta.category if _meta else "行情数据",
+    layer=_meta.layer if _meta else "数据层",
+    tags=_meta.tags if _meta else ["finance"],       # §15: 从 YAML 加载 tags
 )
 def get_kline(...): ...
 ```
@@ -795,28 +756,7 @@ _FAREWELL_RE = re.compile(_quick_patterns["farewell"], re.IGNORECASE)
 _THANKS_RE  = re.compile(_quick_patterns["thanks"], re.IGNORECASE)
 ```
 
-### 6.4 planner.py — 从 planner.yaml 加载
-
-```python
-# 改造前：SKILL_CATALOG 硬编码 + prompt 内嵌
-
-# 改造后
-from app.agent.semantics import get_planner_meta
-
-_planner_meta = get_planner_meta()
-
-def _build_skill_catalog() -> str:
-    lines = ["可用技能（从下列中选择 1~5 个）：\n"]
-    for i, s in enumerate(_planner_meta.skill_catalog, 1):
-        lines.append(f"{i}. {s['name']} — {s['summary']}")
-    if _planner_meta.aliases:
-        lines.append(f"\n兼容别名：{', '.join(f'{k}→{v}' for k,v in _planner_meta.aliases.items())}")
-    return "\n".join(lines)
-
-SKILL_CATALOG = _build_skill_catalog()
-```
-
-### 6.5 domain_registry.py — 从 domains.yaml 加载
+### 6.4 domain_registry.py — 从 domains.yaml 加载
 
 ```python
 # 改造前：init_builtin_domains() 里 6 个域的大段硬编码
@@ -840,7 +780,7 @@ def init_builtin_domains():
         ))
 ```
 
-### 6.6 chain/chains.py — 从 chains.yaml 加载
+### 6.5 chain/chains.py — 从 chains.yaml 加载
 
 ```python
 # 改造前：链路定义硬编码在 Python 代码中
@@ -867,7 +807,7 @@ for chain_id in ["evaluate+stock", "screen+stock", "scan+market"]:
         ))
 ```
 
-### 6.7 agent.py — _build_instructions() 简化
+### 6.6 agent.py — _build_instructions() 简化
 
 ```python
 from app.agent.semantics import get_persona, get_skills_summary_xml, get_tools_summary_xml
@@ -902,9 +842,8 @@ def _build_instructions(...):
 | skill instructions（15 个） | ~8000-12000 tokens（全量注入） | ~800-1200 tokens（摘要） | ~85-90% |
 | domain instructions | ~2000 tokens（按域注入） | ~2000 tokens | 0% |
 | tool descriptions | ~3000 tokens（全量注入） | ~1500 tokens（按 category 摘要） | ~50% |
-| planner SKILL_CATALOG | ~500 tokens | 从 YAML 加载 | 100% |
 | intent rules | ~300 tokens | 从 YAML 加载 | 100% |
-| **总计** | ~13800-17800 tokens | ~4300-5500 tokens | **~65-70%** |
+| **总计** | ~13300-17300 tokens | ~4300-5500 tokens | **~65-70%** |
 
 ### 加载时序
 
@@ -933,11 +872,10 @@ Agent 调用 skill
 ### Phase 2：逐模块切换（每步可独立测试）
 1. `domain_registry.py` → 从 domains.yaml 加载
 2. `intent_analyzer.py` → 从 intent.yaml 加载
-3. `planner.py` → 从 planner.yaml 加载
-4. `skills/*.py` → @skill 从 semantics 加载
-5. `tools/*.py` → @tool 从 semantics 加载
-6. `chain/chains.py` → 从 chains.yaml 加载
-7. `agent.py` → _build_instructions() 简化
+3. `skills/*.py` → @skill 从 semantics 加载
+4. `tools/*.py` → @tool 的 tags 从 semantics 加载
+5. `chain/chains.py` → 从 chains.yaml 加载
+6. `agent.py` → _build_instructions() 简化
 
 ### Phase 3：分层加载优化
 1. system prompt 只注入摘要 XML

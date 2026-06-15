@@ -39,34 +39,52 @@ class TracedTool:
         """移除 smolagens 框架附加参数，只保留工具真实参数。"""
         return {k: v for k, v in kwargs.items() if k not in TracedTool._FRAMEWORK_KWARGS}
 
-    def forward(self, **kwargs) -> Any:
+    def forward(self, *args, **kwargs) -> Any:
         t0 = time.time()
         error = None
         result = None
         try:
-            result = self._tool.forward(**self._strip_framework_kwargs(kwargs))
+            if args:
+                # 位置参数调用：将 args 映射到原始工具 forward 的参数名
+                import inspect
+                sig = inspect.signature(self._tool.forward)
+                param_names = [p for p in sig.parameters if p != "self"]
+                merged = dict(zip(param_names, args))
+                merged.update(kwargs)
+                result = self._tool.forward(**self._strip_framework_kwargs(merged))
+            else:
+                result = self._tool.forward(**self._strip_framework_kwargs(kwargs))
         except Exception as e:
             error = str(e)
             raise
         finally:
+            # 构建完整参数记录（合并位置参数和关键字参数）
+            if args:
+                import inspect
+                sig = inspect.signature(self._tool.forward)
+                param_names = [p for p in sig.parameters if p != "self"]
+                full_kwargs = dict(zip(param_names, args))
+                full_kwargs.update(kwargs)
+            else:
+                full_kwargs = kwargs
             elapsed = (time.time() - t0) * 1000
             self._collector.on_tool_call(
                 tool_name=self.name,
-                arguments=kwargs,
+                arguments=full_kwargs,
                 result=result,
                 elapsed_ms=elapsed,
                 error=error,
             )
         return result
 
-    def __call__(self, **kwargs) -> Any:
+    def __call__(self, *args, **kwargs) -> Any:
         """让 TracedTool 可以直接像函数一样调用。
 
-        外部代码（测试/调试/直接调用）可以写：
-            get_realtime_quote(stock_code="600066")
-        而不需要先解包内部工具。
+        支持两种调用方式（CodeAgent 生成的代码可能用任一种）：
+            get_realtime_quote(stock_code="600066")   # 关键字参数
+            get_realtime_quote("600066")               # 位置参数
         """
-        return self.forward(**kwargs)
+        return self.forward(*args, **kwargs)
 
     def to_code_prompt(self) -> str:
         """代理原始工具的 to_code_prompt，smolagents Jinja 模板渲染系统提示词时需要。"""
