@@ -943,7 +943,10 @@ class _AgentExecutor:
                 _current_round_parts.append(f"需获取: {', '.join(_missing)}")
 
         if _current_round_parts:
-            ctx_parts.append(f"--- R{round_num} ---\n" + "\n".join(_current_round_parts))
+            if round_num > 1:
+                ctx_parts.append(f"--- R{round_num} ---\n" + "\n".join(_current_round_parts))
+            else:
+                ctx_parts.append("\n".join(_current_round_parts))
 
         if ctx_parts:
             enriched = "\n".join(ctx_parts) + "\n\n" + message

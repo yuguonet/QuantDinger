@@ -19,7 +19,7 @@ STOPWORDS = {
     # 动作
     "帮我", "分析", "查看", "看看", "查询", "修改", "修复", "创建",
     "筛选", "回测", "启动", "停止", "显示", "展示", "评估", "判断",
-    "研究", "解读", "写", "生成", "选择", "新建",
+    "研究", "解读", "写", "生成", "选择", "新建", "看看",
     # 疑问
     "怎么样", "什么", "如何", "是什么", "什么意思", "怎么理解",
     # 时间
@@ -39,19 +39,28 @@ STOPWORDS = {
 # 股票名提取
 # ═══════════════════════════════════════════════════════════════
 
+# 后缀停用词（股票名后面的修饰词，需要剥离）
+_SUFFIX_STOPWORDS = {
+    "股票", "行情", "走势", "趋势", "怎么样", "什么", "如何",
+    "是什么", "什么意思", "怎么理解", "可以买吗", "能买吗",
+    "可以买入吗", "还能持有吗", "要不要卖", "目标价",
+}
+
+
 def strip_stopwords_prefix(message: str) -> Optional[str]:
-    """从消息中提取候选股票名（去掉停用词前缀）。
+    """从消息中提取候选股票名（去掉停用词前后缀）。
 
     流程：
-      1. 提取第一个连续中文片段（2-6字）
+      1. 提取第一个连续中文片段（2-8字，覆盖4字股票名+后缀）
       2. 如果整个片段是停用词 → 返回 None
-      3. 如果片段以停用词开头，去掉前缀（"分析宇通客车" → "宇通客车"）
-      4. 剩余部分 >= 2 字且不在停用词中 → 返回
+      3. 去掉停用词前缀（"分析宇通客车" → "宇通客车"）
+      4. 去掉停用词后缀（"多氟多股票" → "多氟多"）
+      5. 剩余部分 >= 2 字且不在停用词中 → 返回
 
     Returns:
         候选股票名，或 None
     """
-    match = re.search(r'[\u4e00-\u9fff]{2,6}', message)
+    match = re.search(r'[\u4e00-\u9fff]{2,8}', message)
     if not match:
         return None
 
@@ -65,6 +74,12 @@ def strip_stopwords_prefix(message: str) -> Optional[str]:
     for sw in sorted(STOPWORDS, key=len, reverse=True):
         if candidate.startswith(sw) and len(candidate) > len(sw):
             candidate = candidate[len(sw):]
+            break
+
+    # 去掉停用词后缀（最长匹配优先）
+    for sw in sorted(_SUFFIX_STOPWORDS, key=len, reverse=True):
+        if candidate.endswith(sw) and len(candidate) > len(sw):
+            candidate = candidate[:-len(sw)]
             break
 
     if candidate in STOPWORDS or len(candidate) < 2:
@@ -84,7 +99,7 @@ def extract_stock_from_message(message: str) -> Tuple[Optional[str], Optional[st
 
     优先级：
       1. 6 位数字代码（100% 确定）
-      2. 中文名 → DB 查询验证
+      2. 加载全部股票名 → 内存中按名称长度倒序匹配（最长匹配优先）
 
     Returns:
         (stock_code, stock_name)，未找到返回 (None, None)
@@ -94,16 +109,17 @@ def extract_stock_from_message(message: str) -> Tuple[Optional[str], Optional[st
     if code:
         return code, None
 
-    # 2. 中文名 DB 查询
-    candidate = strip_stopwords_prefix(message)
-    if not candidate:
-        return None, None
-
+    # 2. 加载全部股票名，按长度倒序在消息中匹配
     try:
         from app.utils.basicinfo_db import get_stock_basic_db
-        matches = get_stock_basic_db().search_stocks(candidate, limit=1)
-        if matches:
-            return matches[0].get("symbol", ""), matches[0].get("name", candidate)
+        db = get_stock_basic_db()
+        all_stocks = db.get_all_stocks(status="active")
+        # 按名称长度倒序，保证最长匹配优先（"贵州茅台" 优先于 "茅台"）
+        all_stocks.sort(key=lambda s: len(s.get("name", "")), reverse=True)
+        for s in all_stocks:
+            name = s.get("name", "")
+            if len(name) >= 2 and name in message:
+                return s.get("symbol", ""), name
     except Exception:
         pass
 

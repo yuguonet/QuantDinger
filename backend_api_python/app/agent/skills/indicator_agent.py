@@ -20,6 +20,69 @@ logger = logging.getLogger(__name__)
 class IndicatorAgent:
     """用户自定义指标策略执行 Agent。"""
 
+    def analyze(
+        self,
+        stock_code: str,
+        stock_name: str,
+        context: Dict[str, Any],
+        call_llm=None,
+        call_tool_fn=None,
+        _tool_calls=None,
+        _tool_nodes=None,
+        _missing_data=None,
+        **kwargs,
+    ):
+        """覆盖 base.analyze()：只调 list_indicators，后续由 algo_analyze 处理。
+
+        base.analyze() 会盲目遍历 self.tools 调用所有工具，
+        但 get_indicator_params/run_indicator_signal 需要 indicator_id，
+        不能用 stock_code 直接调用。
+        """
+        from app.agent.chain.schema import EvalNode
+
+        if not call_tool_fn:
+            from app.agent.chain.schema import SkillReport
+            return SkillReport(
+                skill_name=self.name, status="failed",
+                error="call_tool_fn 未提供",
+            )
+
+        # 只调 list_indicators（不需要 indicator_id 的工具）
+        tool_results = {}
+        for tool_name in ["list_indicators"]:
+            try:
+                result = self.call_tool(
+                    tool_name=tool_name,
+                    call_tool_fn=call_tool_fn,
+                    stock_code=stock_code,
+                    _tool_calls=_tool_calls,
+                    _tool_nodes=_tool_nodes,
+                    _missing_data=_missing_data,
+                )
+                if result is not None:
+                    tool_results[tool_name] = result
+            except Exception as e:
+                logger.warning("[Skill:%s] 工具 %s 调用失败: %s", self.name, tool_name, e)
+
+        # algo_analyze 内部会根据 list_indicators 结果
+        # 自行调用 run_indicator_signal（带正确的 indicator_id）
+        algo_report = self.algo_analyze(
+            stock_code, stock_name, tool_results,
+            call_tool_fn=call_tool_fn,
+            _tool_calls=_tool_calls,
+            _tool_nodes=_tool_nodes,
+            _missing_data=_missing_data,
+        )
+        if algo_report is not None:
+            return algo_report
+
+        # 不应走到这里（algo_analyze 总会返回 SkillReport）
+        from app.agent.chain.schema import SkillReport
+        return SkillReport(
+            skill_name=self.name, status="missing",
+            signal="指标分析未产生结果",
+        )
+
     def algo_analyze(
         self,
         stock_code: str,

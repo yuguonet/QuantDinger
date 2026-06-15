@@ -188,6 +188,10 @@ class BaseSkill(ABC):
         # Step 1: 调用工具获取数据
         tool_results = {}
         for tool_name in self.tools:
+            # 安全检查：跳过有必需参数但 kwargs 未提供的工具
+            if not self._tool_can_call_with(tool_name, call_tool_fn, {"stock_code": stock_code}):
+                logger.debug("[Skill:%s] 跳过工具 %s (需要额外必需参数)", self.name, tool_name)
+                continue
             try:
                 result = self.call_tool(
                     tool_name=tool_name,
@@ -267,6 +271,38 @@ class BaseSkill(ABC):
             report.analysis = raw_output[:2000]
 
         return report
+
+    @staticmethod
+    def _tool_can_call_with(tool_name: str, call_tool_fn: Callable, kwargs: dict) -> bool:
+        """检查工具是否能用当前 kwargs 调用（必需参数是否齐全）。
+
+        用于 base.analyze() 循环中跳过需要特殊参数的工具（如 strategy_id、indicator_id），
+        避免无参调用导致 TypeError。
+        """
+        try:
+            for cell in getattr(call_tool_fn, '__closure__', None) or []:
+                try:
+                    tm = cell.cell_contents
+                    if isinstance(tm, dict):
+                        tool_obj = tm.get(tool_name)
+                        if tool_obj and hasattr(tool_obj, "forward"):
+                            import inspect
+                            sig = inspect.signature(tool_obj.forward)
+                            stock_aliases = {"stock_code", "stock", "symbol", "code",
+                                             "stock_codes", "keyword", "query", "search_query"}
+                            for pname, param in sig.parameters.items():
+                                if pname == "self":
+                                    continue
+                                if (param.default is inspect.Parameter.empty
+                                        and pname not in stock_aliases
+                                        and pname not in kwargs):
+                                    return False
+                            return True
+                except (ValueError, TypeError):
+                    continue
+        except Exception:
+            pass
+        return True  # 无法判断时放行
 
     @staticmethod
     def _resolve_tool_kwargs(tool_name: str, call_tool_fn: Callable, kwargs: dict) -> dict:

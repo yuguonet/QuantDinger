@@ -172,7 +172,10 @@ def get_global_finance_news(page_size: int = 30) -> Dict[str, Any]:
     try:
         r = _em_get(url, params=params, headers=headers, timeout=15)
         d = r.json()
-        items = d.get("data", {}).get("listData", []) or d.get("data", []) or []
+        data = d.get("data", {})
+        if isinstance(data, str):
+            data = json.loads(data) if data else {}
+        items = data.get("fastNewsList", []) or data.get("listData", []) or []
         rows = []
         for item in items:
             rows.append({

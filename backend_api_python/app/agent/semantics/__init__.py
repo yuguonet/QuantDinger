@@ -287,7 +287,7 @@ def load_semantics():
         )
 
     logger.info(
-        "[Semantics] 加载完成: %d skills (SKILL.md), %d tools, %d routes, %d chains",
+        "[Semantics] 加载完成: %d skills, %d tools, %d chains",
         len(_skills), len(_tools), len(_chains),
     )
 

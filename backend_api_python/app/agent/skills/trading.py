@@ -44,6 +44,65 @@ logger = logging.getLogger(__name__)
 class TradingSkill:
     """交易执行专家子 Agent。"""
 
+    # get_strategy_detail / start_strategy / stop_strategy / get_strategy_trades
+    # 需要 strategy_id，不能在通用 analyze() 中用 stock_code 单参调用。
+    _TOOLS_NEED_STRATEGY = {
+        "get_strategy_detail", "start_strategy",
+        "stop_strategy", "get_strategy_trades",
+    }
+
+    def analyze(
+        self,
+        stock_code: str,
+        stock_name: str,
+        context: Dict[str, Any],
+        call_llm=None,
+        call_tool_fn=None,
+        _tool_calls=None,
+        _tool_nodes=None,
+        _missing_data=None,
+        **kwargs,
+    ):
+        """覆盖 base.analyze()：跳过需要 strategy_id 的工具。"""
+        if not call_tool_fn:
+            return SkillReport(
+                skill_name=self.name, status="failed",
+                error="call_tool_fn 未提供",
+            )
+
+        tool_results = {}
+        for tool_name in self.tools:
+            if tool_name in self._TOOLS_NEED_STRATEGY:
+                continue
+            try:
+                result = self.call_tool(
+                    tool_name=tool_name,
+                    call_tool_fn=call_tool_fn,
+                    stock_code=stock_code,
+                    _tool_calls=_tool_calls,
+                    _tool_nodes=_tool_nodes,
+                    _missing_data=_missing_data,
+                )
+                if result is not None:
+                    tool_results[tool_name] = result
+            except Exception as e:
+                logger.warning("[Skill:%s] 工具 %s 调用失败: %s", self.name, tool_name, e)
+
+        algo_report = self.algo_analyze(
+            stock_code, stock_name, tool_results,
+            call_tool_fn=call_tool_fn,
+            _tool_calls=_tool_calls,
+            _tool_nodes=_tool_nodes,
+            _missing_data=_missing_data,
+        )
+        if algo_report is not None:
+            return algo_report
+
+        return SkillReport(
+            skill_name=self.name, status="missing",
+            signal="交易分析未产生结果",
+        )
+
     def algo_analyze(
         self,
         stock_code: str,
