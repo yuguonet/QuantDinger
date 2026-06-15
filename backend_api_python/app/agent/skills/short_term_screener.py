@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Short Term Screener Skill — 短线选股专家（A股1-3日交易特化）。
+Short Term Screener Skill — 盘中短线选股专家（A股1-3日交易特化）。
 
 两阶段流程：
   Phase 1: Python 预筛选（0 token）
@@ -768,7 +768,7 @@ def _deep_analyze_one(
 @skill(
     name="short_term_screener",
     description=(
-        "短线选股专家。先用Python全市场预筛选（涨停池连板+热门板块龙头+强势股题材归因），"
+        "盘中短线选股专家。先用Python全市场预筛选（涨停池连板+热门板块龙头+强势股题材归因），"
         "再对候选股逐只做技术面+资金流深入分析。"
         "适用于：今天买什么、短线机会、涨停股里哪些能追、找短线标的。"
     ),
@@ -787,7 +787,7 @@ def _deep_analyze_one(
     priority=9,
     default_weight=1.0,
     instructions=(
-        "你是A股短线选股专家，专注1-3个交易日的机会挖掘。\n\n"
+        "你是A股盘中短线选股专家，专注1-3个交易日的机会挖掘。\n\n"
         "工作流程：\n"
         "1. 先用 algo 逻辑全市场预筛选（涨停池连板+主线题材+龙回头弱转强+强势股交叉）\n"
         "2. 对每只候选股，调用工具做技术面+资金流深入分析\n"
@@ -822,7 +822,7 @@ def _deep_analyze_one(
     ),
 )
 class ShortTermScreenerSkill:
-    """短线选股专家子 Agent。"""
+    """盘中短线选股专家子 Agent。"""
 
     def algo_analyze(
         self,

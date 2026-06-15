@@ -284,7 +284,7 @@ final_answer({{
 0. **⚠️ 必须用 final_answer() 返回结果** — 完成任务后，必须调用 `final_answer(你的回复)` 来结束。
 1. **不需要工具的消息，第一步就 final_answer** — 打招呼、闲聊等直接调用 final_answer。
 2. **必须调用工具获取真实数据** — 绝不编造数字。
-3. **⚠️ 无链路时，分析股票必须先调 call_skill** — 有链路时走链路；无链路时先用 `call_skill(skill_name="technical_agent", stock_code="代码")` 获取标准化报告，再按需调其他 skill。不要直接调底层工具（get_realtime_quote、get_indicator_snapshot 等），Skill 内部已集成完整流程。
+3. **⚠️ call_skill 按场景区分** — 推荐/选股用screening_agent，个股分析用 technical_agent，市场/板块用 market_data_agent，游资追踪用 hot_money_tracker。
 4. **深度优先** — 分析深度不够时用 Python 代码做量化分析。
 5. **风险优先** — 分析必须包含风险提示。
 6. **工具失败处理** — 记录失败原因，用已有数据继续，不重复调用。
@@ -1001,6 +1001,22 @@ class _AgentExecutor:
         _eval_domain = meta.get("domain", "")
         collector = meta.get("collector")
 
+        # ── Chain 优先：verb+noun 匹配链路 → ChainExecutor ──
+        if _intent_verb or _intent_noun:
+            try:
+                chain_result = self._try_chain(
+                    _intent_verb, _intent_noun, message,
+                    session_id, context, user_id,
+                )
+                if chain_result is not None:
+                    store.add_message(session_id, "assistant",
+                                      chain_result.content if isinstance(chain_result.content, str)
+                                      else str(chain_result.content))
+                    logger.info("[Chain] 链路执行完成，跳过 agent")
+                    return chain_result
+            except Exception as e:
+                logger.warning("[Chain] 链路执行异常，降级到 agent: %s", e)
+
         t0 = time.time()
         try:
             result = agent.run(enriched, max_steps=self.max_steps)
@@ -1467,6 +1483,33 @@ class _AgentExecutor:
                 "session_id": session_id,
             }
             return
+
+        # ── Chain 优先：verb+noun 匹配链路 → ChainExecutor ──
+        _intent_verb = meta.get("intent_verb", "")
+        _intent_noun = meta.get("intent_noun", "")
+        if _intent_verb or _intent_noun:
+            try:
+                chain_result = self._try_chain(
+                    _intent_verb, _intent_noun, message,
+                    session_id, context, user_id,
+                )
+                if chain_result is not None:
+                    store.add_message(session_id, "assistant",
+                                      chain_result.content if isinstance(chain_result.content, str)
+                                      else str(chain_result.content))
+                    logger.info("[Chain] 流式链路执行完成，跳过 agent")
+                    yield {
+                        "type": "done",
+                        "success": chain_result.success,
+                        "content": chain_result.content,
+                        "error": chain_result.error,
+                        "total_steps": chain_result.total_steps,
+                        "model": chain_result.model,
+                        "session_id": session_id,
+                    }
+                    return
+            except Exception as e:
+                logger.warning("[Chain] 流式链路执行异常，降级到 agent: %s", e)
 
         t0 = time.time()
         _stream_tool_calls = []  # 收集流式执行中的工具调用
