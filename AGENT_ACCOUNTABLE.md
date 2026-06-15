@@ -1682,3 +1682,144 @@ agent 调一次要烧 token，120 天逐天跑 = 120 倍成本。需要分层设
 1. **第一层先行**：0 token，纯数学，能快速验证权重迭代逻辑
 2. 第二层补充：验证 Skill 层预测能力
 3. 第三层收尾：端到端验证
+
+## 十五、Domain 解耦重构（待实施）
+
+> 日期: 2026-06-15
+> 状态: 设计决议，待实施
+> 背景: domain 同时承担「路由开关」「能力注册」「context 裁剪阀」三重职责，
+>       导致 skill/tool 更纠缠而非更清晰，且 cron 等跨域场景被迫选边。
+
+### 15.1 矛盾分析
+
+domain 设计初衷是按领域特化执行路径，但实际上同时承担了三个职责：
+
+| 职责 | 例子 | 问题 |
+|------|------|------|
+| 路由开关 | domain="finance" → 走 TraceCollector | cron 任务想用 finance agent 得绕 domain 判断 |
+| 能力注册 | @skill(domain="finance") | skill 被标签锁死，跨域复用要改装饰器 |
+| context 裁剪 | domain 过滤 → 只加载该域的工具描述 | 这是唯一合理的用途，但实现方式太粗暴 |
+
+**根源**：domain 既是「这个能力属于哪」（标签），又是「这个任务怎么跑」（策略），
+又是「context 加载什么」（裁剪）。三件事绑一个字段，耦合不可避免。
+
+### 15.2 解耦方案
+
+**核心思路：domain 从「路由+注册+裁剪」三合一 → 降级为纯「标签」。**
+
+#### ① 能力层：skill/tool 只打标签，不绑 domain
+
+```python
+# 改前
+@skill(domain="finance", name="technical_agent")
+class TechnicalAgent(BaseSkill): ...
+
+# 改后
+@skill(tags=["finance", "technical"], name="technical_agent")
+class TechnicalAgent(BaseSkill): ...
+```
+
+- tags 是多值列表，一个 skill 可以属于多个标签组
+- 任何执行路径都能按 tags 组合调用，不被 domain 锁死
+- cron_worker 显式声明 `tags=["finance"]` 即可复用金融 skill
+
+#### ② 策略层：executor 级显式配置，不从 domain 推断
+
+```python
+# 改前（纠缠）
+if domain == "finance":
+    collector = TraceCollector(...)
+    # 走特化路径
+
+# 改后（解耦）
+strategy = context.get("strategy", "traced")  # executor 级配置
+if strategy == "traced":
+    collector = TraceCollector(...)
+elif strategy == "chain":
+    executor = ChainExecutor(...)
+elif strategy == "direct":
+    pass  # 纯 agent 自由推理
+```
+
+- strategy 由调用方显式指定，不从 domain 推断
+- cron_worker 传 strategy="traced"，不依赖 domain 判断
+- 普通金融分析默认 strategy="traced"（配置层面，非代码判断）
+
+#### ③ context 裁剪：分层描述替代 domain 过滤
+
+```
+第一层：Agent 始终可见（~500 token）
+  skill_pool 列表：每个 skill 一行（名称 + 一句话描述 + 权重）
+  tool_hint："有 80+ 工具可用，call_skill 时自动加载相关工具"
+
+第二层：调用时按需注入
+  Agent 调 call_skill("technical_agent")
+    → 注入 technical_agent 完整 instructions
+    → 注入其依赖的工具描述
+    → 返回 SkillReport
+
+第三层：Agent 自主探索
+  Agent 直接调工具 → 工具自带 description
+  Agent 问"有什么工具" → 返回分类索引
+```
+
+效果：context 始终控制在 ~500 token 概览，细节按需加载。
+与 domain 过滤目的完全一致，但不绑死 domain。
+
+#### ④ IntentAnalyzer 降级为 EntityExtractor
+
+```python
+# 改前（200+ 行，承担路由决策）
+class IntentAnalyzer:
+    def analyze(text) -> Intent:  # 含 domain 路由、verb+noun 映射、instructions 注入
+
+# 改后（~30 行，纯工具函数）
+class EntityExtractor:
+    def extract_stock_code(text: str) -> str:   # 正则/NER 提取股票代码
+    def extract_stock_name(text: str) -> str:   # 提取股票名称
+    def extract_timeframe(text: str) -> str:    # 提取时间维度（"明天"→T+1）
+    def extract_entities(text: str) -> dict:    # 一次性提取所有实体
+```
+
+保留：实体提取（stock_code, stock_name, timeframe）
+删除：domain 路由、verb+noun → strategy 映射、instructions 注入逻辑
+
+### 15.3 改动清单
+
+| 改动 | 涉及文件 | 类型 |
+|------|---------|------|
+| domain 降级为 tags | skills/base.py, skills/registry.py, tools/registry.py | 修改 |
+| @skill 装饰器改为 tags 参数 | skills/registry.py | 修改 |
+| strategy 配置化 | agent.py (_AgentExecutor) | 修改 |
+| 分层描述注入 | agent.py (_build_instructions) | 重写 |
+| IntentAnalyzer → EntityExtractor | intent_analyzer.py → entity_extractor.py | 重命名+精简 |
+| 删除 domain 路由逻辑 | agent.py, intent_analyzer.py | 删除 |
+| cron_worker 传 strategy 参数 | agent/cron_worker.py | 修改 |
+| Skill 文件 @skill 装饰器更新 | skills/*.py（15个） | 批量修改 |
+
+### 15.4 与现有设计的关系
+
+| 现有设计 | 影响 |
+|---------|------|
+| AGENT_ACCOUNTABLE §三 TraceCollector | 不变，由 strategy="traced" 触发 |
+| AGENT_ACCOUNTABLE §四 权重迭代 | 不变，按 skill_name 聚合，不依赖 domain |
+| AGENT_ACCOUNTABLE §六 JSON 标准化输出 | 不变 |
+| AGENT_ACCOUNTABLE §七 instructions 注入 | 改为分层描述，不再按 domain 整段注入 |
+| AGENT_ACCOUNTABLE §十一 Domain 隔离方案 | **被本节替代**，装饰器模式保留但标签化 |
+| DESIGN_RESTRUCTURE.md | 彻底废弃（非金融域也不再走 ChainExecutor） |
+
+### 15.5 迁移策略
+
+1. 先把 domain 路由逻辑抽到 strategy 配置（不影响现有功能）
+2. 再把 IntentAnalyzer 瘦身为 EntityExtractor
+3. 最后把 @skill(domain=...) 改为 @skill(tags=...)
+4. 每步独立可回滚
+
+### 15.6 风险
+
+| 风险 | 缓解 |
+|------|------|
+| 分层描述加载时机不明确 | call_skill 已有 _format_report，复用此机制 |
+| Agent 不知道有哪些 skill 可用 | 第一层 skill_pool 列表始终可见 |
+| tags 迁移遗漏 | 批量 sed 替换 + 测试覆盖 |
+| 非金融域完全失去结构化路径 | 统一走 agent 自规划，traced 策略可选 |
