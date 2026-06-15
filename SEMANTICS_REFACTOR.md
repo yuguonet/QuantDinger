@@ -1,13 +1,15 @@
-# 语义描述重构方案（v3 — 三段加载 + SKILL.md 格式）
+# 语义描述重构方案（v4 — 去 domain，两段加载 + SKILL.md 格式）
 
-> 日期: 2026-06-15（v3 重写，对齐 §15 + OpenClaw/Nanobot 三段加载模式）
+> 日期: 2026-06-15（v4 重写，基于 v3 删除 domains.yaml，对齐 Nanobot 两段加载模式）
 > 前置: §15 Domain 解耦重构已实施（domain→纯标签，strategy→路由，tags→多值）
 > 目标: 将散落在 7+ 处的描述语义统一到 `agent/semantics/` 目录，实现「改描述只改一处」+「按需加载」。
 >
-> 核心参考：OpenClaw / Nanobot 的两阶段加载模式，扩展为三段加载。
-> - 第一段：system prompt 只放能力清单（名字+分类索引）
-> - 第二段：意图分析后注入领域指令+相关描述
-> - 第三段：call_skill 时按需读取 SKILL.md 完整指令
+> 核心参考：OpenClaw / Nanobot 的两阶段加载模式。
+> - 第一段：system prompt 只放能力清单（名字+分类索引）+ 通用行为规范
+> - 第二段：call_skill 时按需读取 SKILL.md 完整指令（含领域特定指令）
+>
+> v4 变更：删除 domains.yaml，其内容拆分到 persona.yaml（通用指令）+ SKILL.md body（领域指令）。
+> domain 概念彻底移除，chain 触发靠 verb+noun 匹配，不再依赖 domain 路由。
 
 ## 一、现状问题（与 v1 相同，但 §15 已解决路由问题）
 
@@ -37,6 +39,7 @@
 - ❌ 同一概念 3-5 处重复描述
 - ❌ 描述不一致（SKILL_CATALOG vs chain vs skill 各写一遍）
 - ❌ 改描述要改代码（意图分类规则在 Python 字符串里）
+- ❌ domain 概念残留（domains.yaml），与 §15 解耦目标矛盾
 
 ## 二、设计原则
 
@@ -49,26 +52,28 @@
 §15 前: domain = 路由 + 标签 + 描述注入（三合一）
 §15 后: strategy = 路由, domain = 标签 + 描述注入（二合一）
 本方案: strategy = 路由, tags = 标签, YAML = 描述注入（完全分离）
+         ↑ domain 概念彻底移除
 ```
 
 ### 六条原则
 
 1. **单一信源**：每个描述只在一个地方定义，其他地方引用
-2. **三段加载**：system prompt 只放能力清单，领域指令按请求注入，Skill 完整指令按需加载
+2. **两段加载**：system prompt 只放能力清单+通用规范，Skill 完整指令按需加载
 3. **声明式优先**：描述用 YAML/SKILL.md 声明，代码只负责加载和使用
 4. **token 预算控制**：每段有明确的 token 上限，不允许某段过重
 5. **保留分层**：tags → skill → tool 三级结构不变
 6. **向后兼容**：不改变 @skill/@tool 装饰器的使用方式，只改变描述的来源
 
-### 核心概念映射（§15 后）
+### 核心概念映射（v4）
 
-| 概念 | §15 前 | §15 后 | 本方案 |
-|------|--------|--------|--------|
+| 概念 | §15 前 | §15 后 | 本方案（v4） |
+|------|--------|--------|------------|
 | 路由决策 | domain | strategy | strategy（不变） |
 | 能力标签 | domain | tags | tags（不变） |
-| 指令注入 | domain_instructions | domain_instructions | YAML → 按 tags 组合 |
+| 指令注入 | domain_instructions | domain_instructions | **persona.yaml（通用）+ SKILL.md body（领域）** |
 | 工具过滤 | domain 过滤 | tags 过滤 | tags 过滤（不变） |
 | 描述来源 | Python 硬编码 | Python 硬编码 | **YAML 单一信源** |
+| domain 概念 | 三合一 | 纯标签+指令 | **彻底移除** |
 
 ## 三、目标结构
 
@@ -79,8 +84,7 @@ backend_api_python/app/agent/
 ├── semantics/                    ← 语义描述统一目录（单一信源）
 │   ├── __init__.py               ← 加载器
 │   │
-│   ├── persona.yaml              ← Agent 人设
-│   ├── domains.yaml              ← 领域描述 + instructions
+│   ├── persona.yaml              ← Agent 人设 + 通用行为规范（吸收原 domains.yaml 通用指令）
 │   ├── intent.yaml               ← 意图分类规则 + 意图→工具映射
 │   ├── routes.yaml               ← 路由 utterances + 元数据
 │   ├── chains.yaml               ← 链路编排 + steps
@@ -96,16 +100,16 @@ backend_api_python/app/agent/
 │
 ├── skills/                       ← 代码逻辑（@skill 从 SKILL.md 加载描述）
 ├── tools/                        ← 代码逻辑（@tool 的 tags 从 semantics 加载，description 保留代码中）
-├── domain_registry.py            ← 从 domains.yaml 加载
 ├── intent_analyzer.py            ← 从 intent.yaml 加载
-└── agent.py                      ← 三段加载：_build_instructions() + _prepare() + CallSkillTool
+└── agent.py                      ← 两段加载：_build_instructions() + CallSkillTool
 ```
 
 > ⚠️ `planner.py` 已在 AGENT_ACCOUNTABLE.md §11.3 Phase 1 中删除，不再需要 `planner.yaml`。
+> ⚠️ `domain_registry.py` 已删除，domain 概念移除。
 >
 > **文件格式决策**：采用 SKILL.md（Markdown + YAML frontmatter），与 OpenClaw/Nanobot 对齐。
 > - frontmatter 存元数据（name, description, tags, tools, priority, default_weight）
-> - Markdown body 存完整 instructions
+> - Markdown body 存完整 instructions（含原 domain 的领域特定指令）
 > - 每个 skill 独立目录，便于 git 管理和独立修改
 
 ### 与 §15 tags 的配合
@@ -129,71 +133,37 @@ tools:
 
 ## 四、YAML 文件格式定义
 
-### 4.1 persona.yaml
+### 4.1 persona.yaml（扩展版，吸收原 domains.yaml 通用指令）
 
 ```yaml
+# Agent 人设
 role: "有20年经验的A股分析师和量化程序员"
 identity: "QuantDinger 是你编写的量化分析助手"
 mission: "基于真实数据为用户提供专业、客观、可执行的金融分析/交易建议/代码的迭代维护升级改进"
-```
 
-### 4.2 domains.yaml
-
-```yaml
-domains:
-  finance:
-    name: "金融分析"
-    description: "股票分析、行情查看、选股筛选、策略回测"
-    instructions: |
-      你是一个专业的 A 股量化分析助手。
-      ## 工作流程
-      1. **理解需求** — 明确用户要分析什么
-      2. **规划任务** — 复杂任务用 todowrite 拆解步骤
-      3. **数据收集** — 获取行情、指标、新闻等数据
-      4. **分析执行** — 技术分析、策略回测、选股筛选
-      5. **结果呈现** — 用图表展示，给出明确建议和风险提示
-    tool_categories: [技术分析, 行情数据, 选股筛选, K线图表, 指标策略, 情报搜索, 回测, 龙虎榜/热榜, 板块分析]
-
+# 通用行为规范（原 domains.yaml 中各域共享的指令）
+behaviors:
+  workflow:
+    - "理解需求 — 明确用户要做什么"
+    - "规划任务 — 复杂任务用 todowrite 拆解步骤"
+    - "执行任务 — 调用合适的 skill 和 tool"
+    - "结果呈现 — 用图表展示，给出明确建议"
+  safety:
+    - "任何交易操作前必须确认"
+    - "大额操作需二次确认"
+    - "缺失数据标注 missing，不猜测"
   coding:
-    name: "代码开发"
-    description: "代码编写、调试、重构、项目分析"
-    instructions: |
-      你是一个专业的代码工程师，精通 Python/JavaScript/TypeScript/Vue 等技术栈。
-      ## 工作流程
-      1. **理解阶段** — 用 workspace_read_file 阅读相关代码
-      2. **规划阶段** — 用 todowrite 拆解步骤
-      3. **修改阶段** — 用 workspace_edit_file 精准修改
-      4. **验证阶段** — 用 code_lint 检查风格
-    tool_categories: [工作区]
-
-  trading:
-    name: "交易执行"
-    description: "策略启停、持仓管理、交易记录"
-    instructions: |
-      你是一个量化交易执行助手。
-      ## 安全原则
-      • 任何交易操作前必须确认
-      • 大额操作需二次确认
-    tool_categories: [交易执行]
-
-  system:
-    name: "系统管理"
-    description: "定时提醒、定时任务管理、系统设置"
-    instructions: |
-      你是一个系统管理助手。
-    tool_categories: [定时任务]
-
-  chat:
-    name: "闲聊"
-    description: "通用对话、问候、闲聊"
-    instructions: ""
-    tool_categories: []
+    - "用 workspace_read_file 阅读相关代码"
+    - "用 workspace_edit_file 精准修改"
+    - "用 code_lint 检查风格"
 ```
 
-### 4.3 skills/{name}/SKILL.md（Markdown + YAML frontmatter）
+> **设计决策**：persona.yaml 只放跨领域的通用规范。领域特定指令（如"你是A股量化分析师"、"用专业术语"）放到各 SKILL.md body 中，第二段加载时自然带入。
+
+### 4.2 skills/{name}/SKILL.md（Markdown + YAML frontmatter）
 
 > 采用与 OpenClaw/Nanobot 相同的 SKILL.md 格式。
-> frontmatter 存元数据（供第一段/第二段加载），Markdown body 存完整 instructions（供第三段加载）。
+> frontmatter 存元数据（供第一段加载），Markdown body 存完整 instructions（供第二段加载，含领域特定指令）。
 
 ```markdown
 ---
@@ -213,7 +183,7 @@ tools:
 
 # 技术面综合分析
 
-纯算法技术面 + 动量分析。
+你是一个专业的 A 股量化技术分析师，精通技术面分析方法论。
 
 ## 分析流程
 1. **趋势判断** — MA排列 + MACD方向
@@ -235,15 +205,16 @@ tools:
 |------|------|------|------|
 | name | string | ✅ | 技能注册名 |
 | tags | list | ✅ | 多值标签（§15） |
-| description | string | ✅ | 一句话描述（≤100字，用于第二段摘要） |
+| description | string | ✅ | 一句话描述（≤100字，用于第一段摘要） |
 | priority | int | ❌ | 优先级（默认 5） |
 | default_weight | float | ❌ | 出厂权重（默认 1.0） |
 | standard_output | bool | ❌ | 是否需要 JSON 标准化输出 |
 | tools | list | ❌ | 依赖的工具名列表 |
 
-**Markdown body**：完整 instructions，只在第三段（call_skill 时）加载。
+**Markdown body**：完整 instructions，只在第二段（call_skill 时）加载。
+**body 中包含领域特定指令**（如"你是A股量化分析师"），无需单独的 domains.yaml。
 
-### 4.4 tools/*.yaml — 只存元数据，description 保留在 @tool 装饰器
+### 4.3 tools/*.yaml — 只存元数据，description 保留在 @tool 装饰器
 
 > **设计决策**：工具描述不抽到 YAML。原因：
 > 1. 80+ 工具的 description 和代码逻辑紧耦合，拆出去反而双份维护
@@ -271,7 +242,7 @@ tools:
     layer: "数据层"
 ```
 
-### 4.5 intent.yaml
+### 4.4 intent.yaml
 
 ```yaml
 classifier_prompt: |
@@ -286,7 +257,6 @@ classifier_prompt: |
   ## 输出格式（只输出 JSON，不要其他内容）
   ```json
   {{
-    "domain": "finance | coding | trading | system | unknown | chat",
     "intent": "...",
     "verb": "...",
     "noun": "...",
@@ -299,27 +269,27 @@ classifier_prompt: |
 
 rules:
   - match: "有股票名称或代码"
-    result: { domain: finance, verb: analyze, noun: stock }
+    result: { verb: analyze, noun: stock }
   - match: "怎么样/能买吗/跌了/涨了 + 股票"
-    result: { domain: finance, intent: stock_analysis }
+    result: { intent: stock_analysis }
   - match: "K线/图表"
-    result: { domain: finance, intent: chart_view }
+    result: { intent: chart_view }
   - match: "涨停/大盘/板块"
-    result: { domain: finance, intent: market_scan }
+    result: { intent: market_scan }
   - match: "选股/推荐"
-    result: { domain: finance, intent: screener }
+    result: { intent: screener }
   - match: "回测"
-    result: { domain: finance, intent: backtest }
+    result: { intent: backtest }
   - match: "资金流向/主力/北向"
-    result: { domain: finance, intent: fund_flow }
+    result: { intent: fund_flow }
   - match: "MACD/RSI/指标"
-    result: { domain: finance, intent: indicator }
+    result: { intent: indicator }
   - match: "买入/卖出/持仓/启停策略"
-    result: { domain: trading, intent: trading }
+    result: { intent: trading }
   - match: "设置提醒/定时/闹钟"
-    result: { domain: system, intent: reminder }
+    result: { intent: reminder }
   - match: "闲聊/问候"
-    result: { domain: chat }
+    result: { intent: chat }
 
 quick_patterns:
   greeting: '^(你好|hi|hello|嗨|hey|在吗|哈喽|嘿|yo)[\s\?\?\.\,\!\~\。\，\！\？\…]*$'
@@ -345,7 +315,9 @@ intent_tool_categories:
   project_scan: []
 ```
 
-### 4.7 chains.yaml
+> **v4 变更**：classifier_prompt 中移除了 `domain` 字段。IntentAnalyzer 只输出 verb/noun/intent，不再输出 domain。路由由 strategy 决定，不依赖 domain。
+
+### 4.5 chains.yaml
 
 ```yaml
 chains:
@@ -427,7 +399,7 @@ chains:
         required: false
 ```
 
-### 4.8 routes.yaml
+### 4.6 routes.yaml
 
 ```yaml
 routes:
@@ -463,14 +435,17 @@ routes:
 
 ```python
 """
-Semantics Loader — 语义描述统一加载入口（v2，对齐 §15）。
+Semantics Loader — 语义描述统一加载入口（v4，对齐 Nanobot 两段加载）。
 
-§15 后的职责分离：
+v4 变更：
+  - 删除 DomainMeta 和 domains.yaml 加载
+  - persona.yaml 扩展，吸收通用行为规范
+  - 领域特定指令移入各 SKILL.md body
+
+职责分离：
   - strategy = 路由决策（IntentAnalyzer 计算）
   - tags = 能力标签（@skill/@tool 注册）
   - semantics = 描述来源（YAML 单一信源）
-
-本模块只管「描述从哪来」，不管「路由怎么走」。
 """
 import yaml
 from pathlib import Path
@@ -482,7 +457,6 @@ _SEMANTICS_DIR = Path(__file__).parent
 # ── 缓存 ──
 _skill_metas: Dict[str, "SkillMeta"] = {}
 _tool_metas: Dict[str, "ToolMeta"] = {}
-_domain_metas: Dict[str, "DomainMeta"] = {}
 _route_metas: List["RouteMeta"] = []
 _chain_metas: Dict[str, "ChainMeta"] = {}
 _intent_meta: Optional["IntentMeta"] = None
@@ -503,13 +477,7 @@ class PersonaMeta:
     role: str = ""
     identity: str = ""
     mission: str = ""
-
-@dataclass
-class DomainMeta:
-    name: str = ""
-    description: str = ""
-    instructions: str = ""
-    tool_categories: Optional[List[str]] = None
+    behaviors: dict = field(default_factory=dict)  # v4: 通用行为规范
 
 @dataclass
 class SkillMeta:
@@ -561,21 +529,37 @@ def load_semantics():
         return
     _loaded = True
 
-    # persona
+    # persona（v4: 扩展版，包含 behaviors）
     p = _load_yaml("persona.yaml")
-    _persona = PersonaMeta(**p)
+    _persona = PersonaMeta(
+        role=p.get("role", ""),
+        identity=p.get("identity", ""),
+        mission=p.get("mission", ""),
+        behaviors=p.get("behaviors", {}),
+    )
 
-    # domains
-    for name, cfg in _load_yaml("domains.yaml").get("domains", {}).items():
-        _domain_metas[name] = DomainMeta(name=name, **cfg)
-
-    # skills
+    # skills（从 SKILL.md 加载，YAML frontmatter + Markdown body）
     skills_dir = _SEMANTICS_DIR / "skills"
     if skills_dir.exists():
-        for f in skills_dir.glob("*.yaml"):
-            data = _load_yaml(f"skills/{f.name}")
-            if data.get("name"):
-                _skill_metas[data["name"]] = SkillMeta(**data)
+        for skill_dir in skills_dir.iterdir():
+            if not skill_dir.is_dir():
+                continue
+            skill_md = skill_dir / "SKILL.md"
+            if not skill_md.exists():
+                continue
+            content = skill_md.read_text(encoding="utf-8")
+            meta, body = _parse_skill_md(content)
+            if meta.get("name"):
+                _skill_metas[meta["name"]] = SkillMeta(
+                    name=meta["name"],
+                    description=meta.get("description", ""),
+                    tags=meta.get("tags", []),
+                    priority=meta.get("priority", 5),
+                    default_weight=meta.get("default_weight", 1.0),
+                    tools=meta.get("tools", []),
+                    instructions=body,  # Markdown body 作为 instructions
+                    standard_output=meta.get("standard_output", False),
+                )
 
     # tools
     tools_dir = _SEMANTICS_DIR / "tools"
@@ -603,19 +587,30 @@ def load_semantics():
     )
 
 
+def _parse_skill_md(content: str) -> tuple[dict, str]:
+    """解析 SKILL.md，分离 YAML frontmatter 和 Markdown body。"""
+    meta = {}
+    body = content
+
+    # 检查是否以 --- 开头（YAML frontmatter）
+    if content.startswith("---"):
+        parts = content.split("---", 2)
+        if len(parts) >= 3:
+            # parts[0] = "", parts[1] = YAML, parts[2] = body
+            try:
+                meta = yaml.safe_load(parts[1]) or {}
+            except yaml.YAMLError:
+                meta = {}
+            body = parts[2].strip()
+
+    return meta, body
+
+
 # ── 公开接口 ──
 
 def get_persona() -> PersonaMeta:
     load_semantics()
     return _persona
-
-def get_domain_meta(name: str) -> Optional[DomainMeta]:
-    load_semantics()
-    return _domain_metas.get(name)
-
-def get_all_domain_metas() -> Dict[str, DomainMeta]:
-    load_semantics()
-    return dict(_domain_metas)
 
 def get_skill_meta(name: str) -> Optional[SkillMeta]:
     load_semantics()
@@ -658,13 +653,13 @@ def get_skills_summary_xml() -> str:
     lines.append("</skills>")
     return "\n".join(lines)
 
-def get_tools_summary_xml(domain: str = "") -> str:
-    """生成 tools 摘要 XML，按 category 分组。可选按 domain 过滤。"""
+def get_tools_summary_xml(tags_filter: Optional[List[str]] = None) -> str:
+    """生成 tools 摘要 XML，按 category 分组。可选按 tags 过滤。"""
     load_semantics()
     by_cat: Dict[str, List[ToolMeta]] = {}
     for meta in _tool_metas.values():
         # §15: 用 tags 过滤（tags 优先，降级到无过滤）
-        if domain and meta.tags and domain not in meta.tags:
+        if tags_filter and meta.tags and not any(t in meta.tags for t in tags_filter):
             continue
         by_cat.setdefault(meta.category or "其他", []).append(meta)
 
@@ -756,31 +751,7 @@ _FAREWELL_RE = re.compile(_quick_patterns["farewell"], re.IGNORECASE)
 _THANKS_RE  = re.compile(_quick_patterns["thanks"], re.IGNORECASE)
 ```
 
-### 6.4 domain_registry.py — 从 domains.yaml 加载
-
-```python
-# 改造前：init_builtin_domains() 里 6 个域的大段硬编码
-
-# 改造后
-from app.agent.semantics import load_semantics, get_all_domain_metas
-
-def init_builtin_domains():
-    global _initialized
-    if _initialized:
-        return
-    _initialized = True
-    load_semantics()
-
-    for name, meta in get_all_domain_metas().items():
-        register_domain(DomainConfig(
-            name=meta.name,
-            description=meta.description,
-            instructions=meta.instructions,
-            tool_categories=meta.tool_categories,
-        ))
-```
-
-### 6.5 chain/chains.py — 从 chains.yaml 加载
+### 6.4 chain/chains.py — 从 chains.yaml 加载
 
 ```python
 # 改造前：链路定义硬编码在 Python 代码中
@@ -807,7 +778,7 @@ for chain_id in ["evaluate+stock", "screen+stock", "scan+market"]:
         ))
 ```
 
-### 6.6 agent.py — _build_instructions() 简化
+### 6.5 agent.py — _build_instructions() 简化
 
 ```python
 from app.agent.semantics import get_persona, get_skills_summary_xml, get_tools_summary_xml
@@ -816,15 +787,20 @@ def _build_instructions(...):
     persona = get_persona()
     parts = [f"你是{persona.role}。{persona.identity}"]
 
+    # 通用行为规范（v4: 从 persona.yaml 的 behaviors 加载）
+    if persona.behaviors:
+        parts.append("## 工作流程")
+        for step in persona.behaviors.get("workflow", []):
+            parts.append(f"- {step}")
+        parts.append("\n## 安全原则")
+        for rule in persona.behaviors.get("safety", []):
+            parts.append(f"- {rule}")
+
     # skills 摘要（轻量，~500 token）
     parts.append(get_skills_summary_xml())
 
-    # tools 摘要（按 category 分组，按 domain 过滤）
-    parts.append(get_tools_summary_xml(domain=domain))
-
-    # 领域指令（从 domains.yaml）
-    if domain_instructions:
-        parts.append(f"## 当前领域: {domain}\n\n{domain_instructions}")
+    # tools 摘要（按 tags 过滤）
+    parts.append(get_tools_summary_xml(tags_filter=active_tags))
 
     # §15: strategy 路由的 JSON 格式指令（保持不变）
     if strategy == "traced":
@@ -833,65 +809,413 @@ def _build_instructions(...):
     return "\n\n".join(parts)
 ```
 
-## 七、分层加载策略
+## 七、Chain 执行流程（v4，无 domain）
+
+### 改造后的 chain 流程
+
+```
+用户消息: "分析一下贵州茅台"
+  ↓
+IntentAnalyzer（从 intent.yaml 加载 prompt + 规则）
+  ↓
+输出: { verb: "analyze", noun: "stock", intent: "stock_analysis", ... }
+  ↓
+verb + noun 匹配 chains.yaml
+  ↓
+命中 chain: evaluate+stock (trigger_verbs=[analyze], trigger_nouns=[stock])
+  ↓
+system prompt = persona.yaml（人设 + 通用行为规范）
+  + skills 摘要 XML（第一段）
+  + tools 摘要 XML
+  ↓
+执行 chain steps:
+  step1: hot_money_tracker → 加载 SKILL.md body（含领域指令"你是游资追踪专家..."）
+  step2: lockup_watcher → 加载 SKILL.md body（含领域指令"你是解禁监控专家..."）
+  step3: intelligence_agent → 加载 SKILL.md body（含领域指令"你是情报分析师..."）
+  step4: technical_agent → 加载 SKILL.md body（含领域指令"你是技术分析师..."）
+  ...
+  step10: bear_researcher → 加载 SKILL.md body（含领域指令"你是空头研究员..."）
+```
+
+**关键变化**：
+- ✅ 领域指令从"chain 执行前统一注入"变成"每个 skill 执行时各自带入"
+- ✅ 更精准——每个 skill 只加载自己需要的指令，不加载无关领域的指令
+- ✅ token 更省——不再一次性注入整个 domain 的 instructions
+- ✅ chain 触发完全靠 verb + noun，不依赖 domain
+
+### 与 Nanobot 对齐
+
+Nanobot 的 Skill 加载流程：
+```
+Agent 启动 → 扫描 SKILL.md frontmatter → 生成 XML 摘要注入 system prompt
+  ↓
+用户消息 → Agent 匹配 description → 调用 read_file(SKILL.md) 加载完整指令
+  ↓
+按指令执行
+```
+
+本方案（v4）完全对齐：
+```
+Agent 启动 → 扫描 SKILL.md frontmatter → 生成 XML 摘要注入 system prompt
+  ↓
+用户消息 → IntentAnalyzer 匹配 verb+noun → 命中 chain → 逐个加载 SKILL.md body
+  ↓
+按指令执行
+```
+
+## 八、容错机制（编排层闭环 + 自适应惩罚）
+
+### 设计原则
+
+1. **编排层是主路径**：系统优先走编排层（chain），编排层决定用什么 skill/tool、什么顺序
+2. **执行结果自动反馈**：skill/tool 的成功/失败自动写入编排层，形成闭环
+3. **不预设 fallback**：替代方案由编排层动态决定，失败过的 skill/tool 自动降权
+4. **意图不明就问**：规划层不猜，问用户
+5. **复用现有溯源**：惩罚状态从 TraceCollector + qd_traces 计算，不另建一套
+
+### 溯源能力（已有，直接复用，不改动）
+
+Phase 1 已实现三层溯源（详见 AGENT_ACCOUNTABLE.md），容错机制直接复用，**不改动现有实现**：
+
+| 层级 | 存储 | 容错机制如何用 |
+|------|------|---------------|
+| **Chain** | qd_traces | 评估 chain 整体成功率 |
+| **Skill** | qd_traces + qd_skill_weights | 计算 skill 权重，决定是否降权 |
+| **Tool** | qd_traces | 计算 tool 权重，决定是否降权 |
+
+**不改动的部分**：
+- TraceCollector / TracedTool / CallSkillTool（保持现状）
+- qd_traces 表结构（保持现状）
+- qd_skill_weights / qd_factor_weights（保持现状）
+- update_skill_weights() / update_factor_weights()（保持现状）
+
+**新增的查询接口**（只读，不写入新表）：
+- `get_skill_weight(skill_name)` — 从 qd_traces 聚合计算惩罚权重
+- `get_chain_path_scores(chain_id)` — 从 qd_traces 聚合 chain 各 step 的替代路径评分
+- `get_skill_reliability(skill_name)` — 综合 qd_traces 执行成功率 + qd_skill_weights 交易胜率
+
+**qd_skill_weights 的复用**：
+- 现有的 `update_skill_weights()` 根据历史交易计算 skill 权重
+- 容错机制可以直接用这个权重作为"历史可靠性"指标
+- 权重低的 skill 在规划时自然降优先级
+
+### 闭环架构
+
+```
+                    ┌─────────────────────────────────┐
+                    │         编排层 (Chain)           │
+                    │                                 │
+                    │  chains.yaml + 规划逻辑          │
+                    │  ┌───────────────────────────┐  │
+                    │  │ qd_traces (已有)          │  │
+                    │  │ ├─ chain 执行记录          │  │
+                    │  │ ├─ skill 执行记录 + 权重    │  │
+                    │  │ └─ tool 执行记录           │  │
+                    │  │                           │  │
+                    │  │ qd_skill_weights (已有)    │  │
+                    │  │ └─ skill 交易胜率权重      │  │
+                    │  └───────────────────────────┘  │
+                    └──────────┬──────────▲────────────┘
+                               │          │
+                    规划执行计划 │          │ 自动反馈（TraceCollector）
+                               ▼          │
+                    ┌─────────────────────────────────┐
+                    │         执行层 (Skill/Tool)      │
+                    │                                 │
+                    │  step1 → step2 → step3 → ...    │
+                    │    ✓       ✓       ✗            │
+                    └─────────────────────────────────┘
+```
+
+**闭环流程**：
+1. 用户请求 → 编排层规划执行计划（优先走 chain）
+2. 执行层按计划执行 skill/tool
+3. TraceCollector 自动记录执行结果到 qd_traces
+4. 下次请求 → 编排层从 qd_traces 计算惩罚权重，优先选验证过的路径
+
+### 编排层优先策略
+
+```
+用户消息
+  ↓
+IntentAnalyzer 分析意图
+  ↓
+编排层决策（优先级从高到低）:
+  ├─ 1. 匹配已有 chain → 走 chain（有历史验证的路径）
+  ├─ 2. 无 chain 匹配 → 动态规划（组合 skill/tool）
+  └─ 3. 无 skill 匹配 → 直接用 tool（最简路径）
+```
+
+**编排层的优势**：
+- chain 是经过验证的 skill 组合，成功率有保障
+- chain 有历史执行数据（哪些 step 成功/失败），可以动态调整
+- 动态规划时参考惩罚权重，避开不稳定的 skill/tool
+
+### 自适应惩罚机制
+
+**核心思想**：编排层维护惩罚状态，执行层自动反馈，形成学习闭环。
+
+**惩罚规则**：
+
+| 事件 | 惩罚对象 | 权重变化 | 恢复条件 |
+|------|----------|----------|----------|
+| skill 执行成功 | 该 skill | 权重 ×1.2（上限 1.0） | — |
+| skill 执行失败 | 该 skill | 权重 ×0.5 | 下次成功 ×1.5 |
+| tool 调用成功 | 该 tool | 权重 ×1.2（上限 1.0） | — |
+| tool 调用失败 | 该 tool | 权重 ×0.5 | 下次成功 ×1.5 |
+| skill 连续失败 3 次 | 该 skill | 权重归零（标记不可用） | 手动重置或依赖恢复 |
+| tool 连续失败 3 次 | 该 tool | 权重归零（标记不可用） | 手动重置或依赖恢复 |
+| chain 某 step 替代成功 | 替代路径 | 路径评分 +1 | — |
+| chain 某 step 替代失败 | 替代路径 | 路径评分 -1 | — |
+
+**权重存储**：
+
+> **设计决策**：不新建 penalty_state.json。惩罚状态直接从 qd_traces + qd_skill_weights 计算。
+> 溯源数据已有，直接复用，避免数据重复和不一致。
+
+```python
+# 权重计算：直接查 qd_traces，不需要额外存储
+def get_skill_weight(skill_name):
+    """从 qd_traces 计算 skill 的惩罚权重。"""
+    rows = db.query("""
+        SELECT status, COUNT(*) as cnt
+        FROM qd_traces
+        WHERE skill_name = %s AND trace_type = 'skill'
+        ORDER BY created_at DESC
+        LIMIT 20
+    """, skill_name)
+
+    if not rows:
+        return 1.0  # 无历史，默认权重
+
+    # 连续失败 3 次 → 归零
+    recent = rows[:3]
+    if all(r.status == 'fail' for r in recent):
+        return 0.0
+
+    # 成功率作为权重
+    success = sum(r.cnt for r in rows if r.status == 'success')
+    total = sum(r.cnt for r in rows)
+    return success / total
+
+
+# chain 路径评分：从 qd_traces 按 chain_id + step_order 聚合
+def get_chain_path_scores(chain_id):
+    """从 qd_traces 计算 chain 各 step 的替代路径评分。"""
+    return db.query("""
+        SELECT step_order, skill_name,
+               SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as success,
+               SUM(CASE WHEN status='fail' THEN 1 ELSE 0 END) as fail
+        FROM qd_traces
+        WHERE chain_id = %s AND trace_type = 'skill'
+        GROUP BY step_order, skill_name
+    """, chain_id)
+
+
+# skill 可靠性评分：结合 qd_skill_weights（历史交易胜率）
+def get_skill_reliability(skill_name):
+    """综合 qd_traces 执行成功率 + qd_skill_weights 交易胜率。"""
+    exec_weight = get_skill_weight(skill_name)  # 执行成功率
+    trade_weight = db.query_one("""
+        SELECT weight FROM qd_skill_weights WHERE skill_name = %s
+    """, skill_name)
+
+    if trade_weight:
+        # 执行成功率 × 交易胜率
+        return exec_weight * trade_weight.weight
+    return exec_weight
+```
+
+**编排层如何使用惩罚状态**：
+
+```python
+def plan_with_penalties(intent):
+    """编排层规划时参考惩罚状态，优先选验证过的路径。"""
+    chain = match_chain(intent)
+
+    if chain:
+        # 走 chain，但根据惩罚状态调整 step
+        for step in chain.steps:
+            weight = get_skill_reliability(step.skill)
+
+            if weight < 0.2:
+                # 权重太低，找同 tags 替代
+                alt = find_alternative(step.skill, by_tags=True)
+                if alt and get_skill_reliability(alt) > weight:
+                    step.skill = alt  # 用权重更高的替代
+
+            # 查 chain 路径历史，优先用成功率高的替代
+            path_scores = get_chain_path_scores(chain.id)
+            if path_scores:
+                step_scores = [p for p in path_scores if p.step_order == step.order]
+                if step_scores:
+                    best = max(step_scores, key=lambda x: x.success / (x.success + x.fail))
+                    if best.skill_name != step.skill:
+                        step.skill = best.skill_name
+
+    return chain
+```
+
+### 执行层自动反馈
+
+> **设计决策**：执行层不需要手动调用惩罚接口。TraceCollector 已经自动记录所有执行结果到 qd_traces。
+> 编排层只需要查 qd_traces 计算权重即可。
+
+```python
+def execute_chain(chain, collector: TraceCollector):
+    """执行 chain，TraceCollector 自动记录结果。"""
+    results = []
+
+    for step in chain.steps:
+        try:
+            result = execute_skill(step.skill, context, collector)
+            # TraceCollector.on_skill_call() 自动记录到 qd_traces
+            results.append({"skill": step.skill, "status": "success", "result": result})
+
+        except Exception as e:
+            # TraceCollector.on_skill_call() 自动记录失败到 qd_traces
+            # 回退到编排层重新规划
+            new_chain = plan_with_penalties(chain.intent)
+            return execute_chain(new_chain, collector)  # 递归执行新计划
+
+    return results
+```
+
+**关键点**：
+- TraceCollector 已经在 Phase 1 实现，自动拦截所有 skill/tool 调用
+- 不需要在容错机制中手动调用 `record_success()` / `record_failure()`
+- 编排层直接查 qd_traces 计算权重，数据源是统一的
+
+### 闭环流程示例
+
+```
+第 1 次请求: "分析贵州茅台"
+  │
+  ▼
+编排层: 匹配 evaluate+stock chain
+  ├─ step3: intelligence_agent (weight=1.0, 无历史)
+  └─ 执行计划
+  │
+  ▼
+执行层:
+  ├─ step1-2: ✓
+  ├─ step3: intelligence_agent → ✗ (API 超时)
+  │    │
+  │    ▼ 自动反馈: intelligence_agent weight ×0.5
+  │    ▼ 回退编排层重新规划
+  │    ├─ intelligence_agent (weight=0.5) → 不优先
+  │    ├─ 同 tags: market_data_agent (weight=1.0) → 选它
+  │    └─ 新执行计划
+  │
+  ├─ step3(新): market_data_agent → ✓
+  │    ▼ 自动反馈: market_data_agent weight ×1.2 (保持1.0)
+  │    ▼ 记录路径: evaluate+stock step3 market_data_agent 成功+1
+  │
+  └─ step4-10: ✓
+  └─ 返回结果
+
+第 2 次请求: "分析比亚迪"
+  │
+  ▼
+编排层: 匹配 evaluate+stock chain
+  ├─ step3: 查惩罚状态
+  │    ├─ intelligence_agent (weight=0.5, 1次失败)
+  │    ├─ market_data_agent (weight=1.0, 1次成功)
+  │    └─ 路径历史: market_data_agent 成功率 100%
+  ├─ step3 → 选 market_data_agent（验证过的路径）
+  └─ 执行计划
+  │
+  ▼
+执行层: 全部 ✓（走验证过的路径，成功率更高）
+```
+
+### 错误类型与处理策略
+
+| 错误类型 | 发生阶段 | 处理策略 |
+|----------|----------|----------|
+| 意图不明 | 编排层 | 询问用户，不猜 |
+| skill 不存在 | 编排层校验 | 找同 tags 替代，或告知用户 |
+| tool 不可用 | 编排层校验 | 找同 category 替代，或告知用户 |
+| required step 不可用 | 编排层校验 | 告知用户该 chain 无法完整执行 |
+| skill 执行异常 | 执行层 | 自动反馈 + 回退编排层重新规划 |
+| tool 调用失败 | 执行层 | 自动反馈 + 回退编排层重新规划 |
+| 数据缺失 | 执行层 | skill 内部标注 missing，不猜测 |
+| LLM 输出异常 | 执行层 | 回退编排层重新规划 |
+
+### 与现有 required 字段的关系
+
+| 字段 | v3 含义 | v4 含义（含闭环+惩罚） |
+|------|---------|----------------------|
+| `required: true` | 必须执行，失败则中断 | 必须执行，失败则**自动反馈+回退编排层重新规划**，仍失败则返回部分结果 |
+| `required: false` | 可选，失败跳过 | 可选，失败则**自动反馈+回退编排层找替代**，无替代则跳过 |
+
+> **设计决策**：不预设 fallback 字段。编排层根据 tags 相似度 + 惩罚权重 + 路径历史动态决定替代方案。
+> 这比人工配置 fallback 更智能——编排层会学习哪些路径更可靠。
+
+## 九、分层加载策略
 
 ### token 节省估算
 
 | 部分 | 改造前 | 改造后 | 节省 |
 |------|--------|--------|------|
 | skill instructions（15 个） | ~8000-12000 tokens（全量注入） | ~800-1200 tokens（摘要） | ~85-90% |
-| domain instructions | ~2000 tokens（按域注入） | ~2000 tokens | 0% |
+| domain instructions | ~2000 tokens（按域注入） | **0 tokens**（移入 SKILL.md body，按需加载） | **100%** |
 | tool descriptions | ~3000 tokens（全量注入） | ~1500 tokens（按 category 摘要） | ~50% |
 | intent rules | ~300 tokens | 从 YAML 加载 | 100% |
-| **总计** | ~13300-17300 tokens | ~4300-5500 tokens | **~65-70%** |
+| **总计** | ~13300-17300 tokens | ~2300-2700 tokens | **~80-85%** |
 
 ### 加载时序
 
 ```
 进程启动
-  → load_semantics() 读取所有 YAML（~50ms，一次性）
+  → load_semantics() 读取所有 YAML/SKILL.md（~50ms，一次性）
   → 缓存到内存
 
 每次请求
   → get_skills_summary_xml() 从缓存生成（<1ms）
-  → get_tools_summary_xml(domain) 从缓存生成（<1ms）
-  → 注入 system prompt
+  → get_tools_summary_xml(tags) 从缓存生成（<1ms）
+  → 注入 system prompt（第一段）
 
 Agent 调用 skill
   → get_skill_meta(name).instructions 从缓存读取（<1ms）
-  → 注入 skill prompt
+  → 注入 skill prompt（第二段）
 ```
 
-## 八、迁移步骤
+## 十、迁移步骤
 
 ### Phase 1：建立 semantics 目录（不改现有代码）
 1. 创建 `agent/semantics/` 目录 + `__init__.py` 加载器
-2. 从现有代码提取描述，写入 YAML 文件
-3. 单元测试：验证 YAML 加载正确、覆盖所有 skill/tool/domain
+2. 从现有代码提取描述，写入 YAML 文件和 SKILL.md
+3. 单元测试：验证 YAML 加载正确、覆盖所有 skill/tool
 
 ### Phase 2：逐模块切换（每步可独立测试）
-1. `domain_registry.py` → 从 domains.yaml 加载
-2. `intent_analyzer.py` → 从 intent.yaml 加载
-3. `skills/*.py` → @skill 从 semantics 加载
-4. `tools/*.py` → @tool 的 tags 从 semantics 加载
-5. `chain/chains.py` → 从 chains.yaml 加载
-6. `agent.py` → _build_instructions() 简化
+1. `intent_analyzer.py` → 从 intent.yaml 加载
+2. `skills/*.py` → @skill 从 SKILL.md 加载（frontmatter + body）
+3. `tools/*.py` → @tool 的 tags 从 semantics 加载
+4. `chain/chains.py` → 从 chains.yaml 加载
+5. `agent.py` → _build_instructions() 简化（移除 domain 注入）
 
-### Phase 3：分层加载优化
+### Phase 3：清理
+1. 删除 `domain_registry.py` 和 `domains.yaml`
+2. 删除 Python 代码中的硬编码描述
+3. 从各 SKILL.md body 中补充原 domain 的领域特定指令
+4. 更新文档
+5. 回归测试
+
+### Phase 4：分层加载优化
 1. system prompt 只注入摘要 XML
 2. 详细 instructions 按需加载
 3. 性能测试和 token 对比
 
-### Phase 4：清理
-1. 删除 Python 代码中的硬编码描述
-2. 更新文档
-3. 回归测试
+## 十一、与 §15 的集成检查清单
 
-## 九、与 §15 的集成检查清单
-
-- [ ] YAML 中用 `tags` 替代 `domain`
-- [ ] 加载器将 YAML tags 注入 @skill/@tool
-- [ ] `effective_tags` 逻辑不变（tags 优先，降级到 domain）
-- [ ] strategy 路由逻辑不变（IntentAnalyzer 计算）
-- [ ] domain 仅用于 instructions 注入（从 domains.yaml 加载）
-- [ ] tool 过滤用 tags（build() 中 effective_tags 逻辑不变）
+- [x] YAML 中用 `tags` 替代 `domain`
+- [x] 加载器将 YAML tags 注入 @skill/@tool
+- [x] `effective_tags` 逻辑不变（tags 优先，降级到 domain）
+- [x] strategy 路由逻辑不变（IntentAnalyzer 计算）
+- [x] tool 过滤用 tags（build() 中 effective_tags 逻辑不变）
+- [ ] 删除 domains.yaml 和 domain_registry.py
+- [ ] 通用行为规范迁移到 persona.yaml
+- [ ] 领域特定指令迁移到各 SKILL.md body
+- [ ] IntentAnalyzer 输出移除 domain 字段
+- [ ] chain 触发完全靠 verb + noun，不依赖 domain
