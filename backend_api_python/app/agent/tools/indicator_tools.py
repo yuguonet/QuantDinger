@@ -290,4 +290,3 @@ def run_indicator_signal(
 
 # ── OpenAI tool declarations ─────────────────────────────────
 
-# Legacy list — kept for backward compat during migration; safe to remove later.

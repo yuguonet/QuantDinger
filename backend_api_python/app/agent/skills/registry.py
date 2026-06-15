@@ -2,14 +2,19 @@
 """
 Skill Registry — 统一 Skill 注册中心。
 
-支持两种注册方式（殊途同归，最终都是 BaseSkill 子类）：
+支持三种注册方式（殊途同归，最终都是 BaseSkill 子类）：
 
-  方式 1: @skill 装饰器（推荐，简洁）
+  方式 1: @skill 装饰器（显式参数）
     @skill(name="xxx", description="...", tools=[...], priority=5)
     class MySkill:
         pass
 
-  方式 2: 直接继承 BaseSkill（灵活，可覆盖 build_prompt/analyze）
+  方式 2: @skill 装饰器（auto_load，从 SKILL.md 加载）
+    @skill("technical_agent", auto_load=True)
+    class TechnicalSkill:
+        pass
+
+  方式 3: 直接继承 BaseSkill（灵活，可覆盖 build_prompt/analyze）
     class MySkill(BaseSkill):
         name = "xxx"
         description = "..."
@@ -21,14 +26,11 @@ Skill Registry — 统一 Skill 注册中心。
   3. skill_registry.get(name) → BaseSkill 实例
   4. skill_registry.all_skills → 按 priority 排序的 Skill 列表
 
-标准化输出规则：
-  仅 domain=finance 且有 stock_code 且需要买卖信号的 Skill 使用标准化输出。
-  标准化输出 = final_answer 包含 JSON（direction/confidence/score/signal/factors）
-
-  适用：technical_agent / indicator_agent / market_data_agent / lockup_watcher /
-        backtest_agent / trading_agent / screening_agent / bb_screener
-  不适用：bear_researcher / bull_researcher / intelligence_agent /
-          hot_money_tracker / data_agent（无 stock_code，直接返回分析文本）
+Phase 2 变更（SEMANTICS_REFACTOR）：
+  - auto_load=True 时，从 semantics/skills/{name}/SKILL.md 加载元数据和指令
+  - SKILL.md 的 YAML frontmatter → name/description/tags/tools/priority/default_weight
+  - SKILL.md 的 Markdown body → instructions（领域特定指令）
+  - 单一信源：改描述只改 SKILL.md，不再改 Python 代码
 """
 from __future__ import annotations
 
@@ -54,36 +56,64 @@ def skill(
     priority: int = 0,
     default_weight: float = 1.0,
     tags: List[str] = None,
+    auto_load: bool = False,
 ) -> Callable:
     """装饰器：将普通类转换为 BaseSkill 子类并自动注册。
 
-    使用示例：
+    两种使用模式：
+
+    模式 A — 显式参数（向后兼容）：
         @skill(
             name="technical_agent",
             description="A股技术面+动量分析专家",
             tools=["analyze_trend", "get_indicator_snapshot"],
             tags=["finance", "technical"],
             priority=9,
+            instructions="你是技术分析师...",
         )
         class TechnicalSkill:
             pass
 
-    装饰后：
-        - MomentumTrackerSkill 变成 BaseSkill 的子类
-        - 自动注册到全局 skill_registry
-        - instructions 存储在类属性中，由 BaseSkill.build_prompt() 使用
+    模式 B — 从 SKILL.md 自动加载（Phase 2 新增）：
+        @skill("technical_agent", auto_load=True)
+        class TechnicalSkill:
+            # 可选: 定义 analyze/algo_analyze 方法覆盖默认实现
+            pass
+
+    auto_load=True 时：
+        - 从 semantics/skills/{name}/SKILL.md 加载元数据（frontmatter）
+        - Markdown body 作为 instructions（领域特定指令）
+        - 传入的显式参数会覆盖 SKILL.md 中的值（向后兼容）
 
     Args:
-        name: 技能唯一标识
-        description: 技能描述
-        tools: 依赖的工具名列表
-        instructions: 给 LLM 的指令（注入到 prompt 中）
-        priority: 优先级（越高越先执行）
-        tags: 标签列表（替代 domain，多值，如 ["finance", "technical"]）
+        name: 技能唯一标识（必填）
+        description: 技能描述（auto_load 时从 SKILL.md 加载）
+        tools: 依赖的工具名列表（auto_load 时从 SKILL.md 加载）
+        instructions: 给 LLM 的指令（auto_load 时从 SKILL.md body 加载）
+        priority: 优先级（auto_load 时从 SKILL.md 加载）
+        default_weight: 出厂权重（auto_load 时从 SKILL.md 加载）
+        tags: 标签列表（auto_load 时从 SKILL.md 加载）
+        auto_load: 是否从 SKILL.md 自动加载元数据
 
     Returns:
         装饰器函数
     """
+    # ── auto_load: 从 semantics 加载 SKILL.md ──
+    if auto_load:
+        from app.agent.semantics import get_skill_meta
+        meta = get_skill_meta(name)
+        if meta is None:
+            logger.warning("[Skill] auto_load 找不到 SKILL.md: %s，使用传入参数", name)
+        else:
+            # SKILL.md 元数据作为默认值，显式参数可覆盖
+            description = description or meta.description
+            tools = tools or meta.tools
+            instructions = instructions or meta.instructions
+            priority = priority or meta.priority
+            default_weight = default_weight if default_weight != 1.0 else meta.default_weight
+            tags = tags or meta.tags
+            logger.debug("[Skill] auto_load %s: %d tools, %s", name, len(tools or []), description[:40])
+
     tools = tools or []
     tags = tags or []
 

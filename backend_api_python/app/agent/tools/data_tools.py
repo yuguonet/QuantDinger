@@ -239,4 +239,3 @@ def get_stock_info(stock_code: str) -> Dict[str, Any]:
 
     return result
 
-# Legacy list — kept for backward compat during migration; safe to remove later.

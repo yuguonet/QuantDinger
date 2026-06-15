@@ -471,6 +471,10 @@ def tool(
 ):
     """Decorator to register a function as a QuantDinger tool.
 
+    Phase 2 变更（SEMANTICS_REFACTOR）：
+      tags 和 category 会自动从 semantics/tools.md 补全（如果未显式指定）。
+      改元数据只改 YAML，不再改 Python 代码。
+
     Usage:
         @tool(description="搜索股票", category="名称查询", layer="数据层", tags=["finance"])
         def search_stock_by_name(keyword: str, market: str = "CNStock"):
@@ -498,14 +502,33 @@ def tool(
     """
     def decorator(fn: Callable) -> Callable:
         tool_name = name or fn.__name__
+
+        # ── Phase 2: 从 semantics 补全缺失的 tags/category/layer ──
+        _tags = tags or domain
+        _category = category
+        _layer = layer
+        if not _tags or not _category:
+            try:
+                from app.agent.semantics import get_tool_meta
+                sem_meta = get_tool_meta(tool_name)
+                if sem_meta:
+                    if not _tags:
+                        _tags = sem_meta.tags
+                    if not _category:
+                        _category = sem_meta.category
+                    if not _layer:
+                        _layer = sem_meta.layer
+            except Exception:
+                pass  # semantics 未加载时不影响注册
+
         registry.register(
             fn=fn,
             name=tool_name,
             description=description,
-            category=category,
-            layer=layer,
+            category=_category,
+            layer=_layer,
             domain=domain,
-            tags=tags or domain,  # tags 优先，未指定时降级到 domain
+            tags=_tags,
             output_type=output_type,
             **meta,
         )

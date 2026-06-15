@@ -1,3 +1,4 @@
+---
 categories:
   技术分析:
   - name: analyze_trend
@@ -60,7 +61,8 @@ categories:
     - finance
   工作区:
   - name: shell_exec
-    description: 在工作区目录中执行 shell 命令（支持流式输出）。命令的 cwd 自动设为当前会话的工作区。可用环境变量 WORKSPACE 获取工作区绝对路径。适用场景：pip install、python、文件操作、数据处理、调用外部工具。
+    description: 在工作区目录中执行 shell 命令（支持流式输出）。命令的 cwd 自动设为当前会话的工作区。可用环境变量 WORKSPACE
+      获取工作区绝对路径。适用场景：pip install、python、文件操作、数据处理、调用外部工具。
     category: 工作区
     layer: 支撑层
     domain:
@@ -108,7 +110,8 @@ categories:
     domain:
     - coding
   - name: workspace_exec_script
-    description: 在工作区中执行 Python 脚本，支持数据源注入（get_kline/get_ticker 等自动可用）。可加载已保存脚本（传 name）或直接执行代码（传 code）。支持流式输出和最长 600 秒超时。
+    description: 在工作区中执行 Python 脚本，支持数据源注入（get_kline/get_ticker 等自动可用）。可加载已保存脚本（传
+      name）或直接执行代码（传 code）。支持流式输出和最长 600 秒超时。
     category: 工作区
     layer: 支撑层
     domain:
@@ -282,7 +285,8 @@ categories:
     domain:
     - finance
   - name: get_hot_sectors
-    description: '[短线核心] 实时热门板块（行业+概念）。包含涨停家数、领涨股、成交额、强度标签（强势领涨/稳步上行/弱势调整）、市场情绪判断。比 get_sector_rankings 更详细，短线看板块主线必用。'
+    description: '[短线核心] 实时热门板块（行业+概念）。包含涨停家数、领涨股、成交额、强度标签（强势领涨/稳步上行/弱势调整）、市场情绪判断。比
+      get_sector_rankings 更详细，短线看板块主线必用。'
     category: 行情数据
     layer: 分析层
     domain:
@@ -433,8 +437,8 @@ categories:
     - finance
   选股:
   - name: search_stocks
-    description: 统一选股工具：根据条件从全市场筛选股票。支持自然语言条件（如 'PE<20 半导体'、'净利增长>15%'）和结构化 filters。source='eastmoney' 使用东财智能选股（130+条件），'local_db'
-      查本地数据库，'auto' 自动选择。当用户要求选股、筛选股票时使用此工具。
+    description: 统一选股工具：根据条件从全市场筛选股票。支持自然语言条件（如 'PE<20 半导体'、'净利增长>15%'）和结构化 filters。source='eastmoney'
+      使用东财智能选股（130+条件），'local_db' 查本地数据库，'auto' 自动选择。当用户要求选股、筛选股票时使用此工具。
     category: 选股
     layer: 决策层
     domain:
@@ -482,3 +486,25 @@ categories:
     layer: 执行层
     domain:
     - trading
+---
+
+# 工具元数据
+
+按 category 分组的工具元数据，用于 tags/category/layer 自动补全。
+
+| Category | 工具数 |
+|----------|--------|
+| 技术分析 | 6 |
+| 回测 | 2 |
+| K线图表 | 1 |
+| 工作区 | 14 |
+| 定时任务 | 4 |
+| 名称查询 | 2 |
+| 行情数据 | 30 |
+| 指标策略 | 3 |
+| 任务管理 | 1 |
+| 用户交互 | 1 |
+| 项目扫描 | 3 |
+| 情报搜索 | 4 |
+| 选股 | 3 |
+| 交易 | 5 |

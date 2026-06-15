@@ -1370,4 +1370,3 @@ def _serialize_for_workspace(obj: Any, _depth: int = 0) -> Any:
 
 # ── Tool specs for registry ────────────────────────────────────
 
-# Legacy list — kept for backward compat during migration; safe to remove later.

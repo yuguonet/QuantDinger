@@ -95,4 +95,3 @@ def get_sector_rankings() -> Dict[str, Any]:
         logger.error("get_sector_rankings fallback also failed: %s", e2)
         return {"error": str(e2)}
 
-# Legacy list — kept for backward compat during migration; safe to remove later.

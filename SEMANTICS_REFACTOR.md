@@ -1214,8 +1214,62 @@ Agent 调用 skill
 - [x] `effective_tags` 逻辑不变（tags 优先，降级到 domain）
 - [x] strategy 路由逻辑不变（IntentAnalyzer 计算）
 - [x] tool 过滤用 tags（build() 中 effective_tags 逻辑不变）
-- [ ] 删除 domains.yaml 和 domain_registry.py
-- [ ] 通用行为规范迁移到 persona.yaml
-- [ ] 领域特定指令迁移到各 SKILL.md body
-- [ ] IntentAnalyzer 输出移除 domain 字段
-- [ ] chain 触发完全靠 verb + noun，不依赖 domain
+- [x] 删除 domains.yaml 和 domain_registry.py
+- [x] 通用行为规范迁移到 persona.md
+- [x] 领域特定指令迁移到各 SKILL.md body（Phase 2 auto_load 支持）
+- [x] IntentAnalyzer 的 domain_instructions 改为从 persona.md behaviors 生成
+- [x] chain 触发完全靠 verb + noun，不依赖 domain
+
+### Phase 2 完成记录（2026-06-15）
+- `skills/registry.py`: @skill 新增 `auto_load=True` 模式，从 SKILL.md frontmatter 加载
+- `tools/registry.py`: @tool 的 tags/category/layer 自动从 semantics 补全
+- `chain/chains.py`: 链路定义从 chains.md frontmatter 加载，硬编码降级为 fallback
+- `agent.py`: _load_preamble() 优先从 persona.md 加载 role/identity/mission
+
+### Phase 3 完成记录（2026-06-15）
+- `domain_registry.py` → 删除（domain 概念彻底移除）
+- `domains.yaml` → 删除
+- `intent_analyzer.py`: IntentResult.domain_instructions 改为从 persona.md behaviors 生成
+- `agent.py`: 移除 init_builtin_domains() 调用
+- `run.py`: 领域信息改从 persona.md 读取
+- `semantics/__init__.py`: 删除 RouteMeta、get_route_metas、routes.yaml 加载
+
+### Phase 3.5 统一 Front Matter MD（2026-06-15）
+- 所有语义文件统一为 Front Matter MD 格式
+- `persona.yaml` → `persona.md`（frontmatter: role/identity/mission, body: 行为规范）
+- `intent.yaml` → `intent.md`（frontmatter: rules/patterns/mappings, body: classifier_prompt）
+- `chains.yaml` → `chains.md`（frontmatter: chains 定义, body: 说明文档）
+- `tools.yaml` → `tools.md`（frontmatter: categories 工具元数据, body: 分类说明）
+- 删除废弃文件：domains.yaml.deprecated、skills.yaml、routes.yaml、planner.yaml
+- `semantics/__init__.py`: 新增 `_load_frontmatter()` 统一加载函数
+
+### Phase 3.6 选股技能合并（2026-06-15）
+- `short_term_screener.md` + `eod_screener.md` + `post_market_screener.md` → `screener.md`
+- 用 `names` 列表一个文件注册多个 skill
+- `semantics/__init__.py`: 加载逻辑支持 `names` 列表
+
+### 最终文件结构
+```
+semantics/
+├── __init__.py              # 加载器（_load_frontmatter + names 列表支持）
+├── persona.md               # 人设 + 行为规范（7 个行为域）
+├── intent.md                # 意图分类（15 rules + 3 patterns + prompt body）
+├── chains.md                # 链路编排（3 条链路 16 步）
+├── tools.md                 # 工具元数据（14 categories, 79 tools）
+└── skills/
+    ├── screener.md          # 选股技能（names: 3 个场景）
+    ├── technical_agent.md
+    ├── hot_money_tracker.md
+    └── ...（14 个 .md）
+```
+
+### 代码改动汇总
+| 文件 | 改动 |
+|------|------|
+| `skills/registry.py` | @skill 新增 auto_load，从 SKILL.md 加载 |
+| `tools/registry.py` | @tool tags/category 从 semantics 自动补全 |
+| `chain/chains.py` | 链路从 chains.md frontmatter 加载 |
+| `agent.py` | _load_preamble 从 persona.md 加载 |
+| `intent_analyzer.py` | domain_instructions 从 persona.md behaviors 生成 |
+| `run.py` | 领域信息从 persona.md 读取 |
+| `semantics/__init__.py` | 统一 _load_frontmatter + names 列表支持 |

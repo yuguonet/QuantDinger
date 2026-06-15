@@ -765,62 +765,7 @@ def _deep_analyze_one(
 # Skill 定义
 # ═══════════════════════════════════════════════════════════════
 
-@skill(
-    name="short_term_screener",
-    description=(
-        "盘中短线选股专家。先用Python全市场预筛选（涨停池连板+热门板块龙头+强势股题材归因），"
-        "再对候选股逐只做技术面+资金流深入分析。"
-        "适用于：今天买什么、短线机会、涨停股里哪些能追、找短线标的。"
-    ),
-    tools=[
-        "get_indicator_snapshot",
-        "get_fund_flow_realtime",
-        "get_market_indices",
-        "get_limit_pool",
-        "get_hot_sectors",
-        "get_hot_stocks_with_reason",
-        "agent_technical_analysis",
-        "get_realtime_quote",
-        "agent_get_kline",
-        "search_stock_by_name",
-    ],
-    priority=9,
-    default_weight=1.0,
-    instructions=(
-        "你是A股盘中短线选股专家，专注1-3个交易日的机会挖掘。\n\n"
-        "工作流程：\n"
-        "1. 先用 algo 逻辑全市场预筛选（涨停池连板+主线题材+龙回头弱转强+强势股交叉）\n"
-        "2. 对每只候选股，调用工具做技术面+资金流深入分析\n"
-        "3. 综合评分，输出结构化报告\n\n"
-        "选股逻辑（按优先级）：\n"
-        "- 连板股（≥2板）= 市场选出的龙头，最高优先级\n"
-        "- 龙回头弱转强 = 前期龙头回调后放量站上均线，经典二次启动模式\n"
-        "- 主线题材强势股 = 资金共识方向\n\n"
-        "龙回头弱转强识别要点：\n"
-        "- 前期有连板经历（≥2板）\n"
-        "- 回调8%-35%（缩量回调=卖盘衰竭）\n"
-        "- 今日出现弱转强信号：放量+收阳+站上MA5+RSI低位回升\n"
-        "- 至少2个弱转强信号同时出现才有效\n\n"
-        "技术面验证 = 均线多头+MACD金叉+RSI适中+放量\n"
-        "资金面验证 = 主力净流入\n\n"
-        "短线纪律：\n"
-        "- 不追已涨>7%的票（除非涨停打板策略）\n"
-        "- 炸板率>50%时降低仓位\n"
-        "- RSI>80超买风险\n\n"
-        "## 输出格式（必须遵守）\n"
-        "```json\n"
-        "{\n"
-        '  "direction": "bullish/bearish/neutral",\n'
-        '  "confidence": 0.0-1.0,\n'
-        '  "score": 0-100,\n'
-        '  "signal": "一句话信号摘要",\n'
-        '  "factors": [\n'
-        '    {"name": "因子名", "value": "值", "score": 0-100, "status": "ok"}\n'
-        '  ]\n'
-        "}\n"
-        "```\n"
-    ),
-)
+@skill("short_term_screener", auto_load=True)
 class ShortTermScreenerSkill:
     """盘中短线选股专家子 Agent。"""
 

@@ -49,32 +49,54 @@ class IntentResult:
 
     @property
     def domain_config(self):
-        from app.agent.domain_registry import get_domain
-        return get_domain(self.domain)
+        """Phase 3: domain_registry 已移除，返回 None。用 domain_instructions 替代。"""
+        return None
 
     @property
     def tool_filter(self) -> Optional[List[str]]:
-        dc = self.domain_config
-        return dc.tools if dc else None
+        """Phase 3: 工具过滤改用 tags，不再依赖 domain_config。"""
+        return None
 
     @property
     def domain_instructions(self) -> str:
-        dc = self.domain_config
-        return dc.instructions if dc else ""
+        """Phase 3: 从 persona.md 的 behaviors 生成通用指令（领域特定指令在 SKILL.md body 中）。"""
+        try:
+            from app.agent.semantics import get_persona
+            persona = get_persona()
+            if not persona or not persona.behaviors:
+                return ""
+            parts = []
+            # 按当前 domain 选择相关的行为规范
+            _domain_behaviors = {
+                "finance": ["workflow", "safety", "iteration", "finance"],
+                "trading": ["workflow", "safety", "trading"],
+                "coding": ["workflow", "coding"],
+                "system": ["workflow", "system"],
+            }
+            keys = _domain_behaviors.get(self.domain, ["workflow"])
+            for key in keys:
+                items = persona.behaviors.get(key, [])
+                if items:
+                    parts.append(f"## {key}")
+                    for item in items:
+                        parts.append(f"- {item}")
+            return "\n".join(parts)
+        except Exception:
+            return ""
 
 
 # ═══════════════════════════════════════════════════════════════
 # 快速通道
 # ═══════════════════════════════════════════════════════════════
 
-# ── 快速通道正则（从 intent.yaml 加载，改正则只改 YAML）──
+# ── 快速通道正则（从 intent.md 加载，改正则只改 YAML）──
 _PUNCT_TAIL = r'[\s\?\?\.\,\!\~\。\，\！\？\…]*'
 _GREETING_RE = None
 _FAREWELL_RE = None
 _THANKS_RE = None
 
 def _ensure_quick_patterns():
-    """从 intent.yaml 加载快速通道正则。"""
+    """从 intent.md 加载快速通道正则。"""
     global _GREETING_RE, _FAREWELL_RE, _THANKS_RE
     if _GREETING_RE is not None:
         return
@@ -107,9 +129,9 @@ def _quick_intent_check(message: str) -> Optional[IntentResult]:
 # LLM 意图分类 + 上下文压缩
 # ═══════════════════════════════════════════════════════════════
 
-# ── 从 intent.yaml 加载（单一信源，改规则只改 YAML）──
+# ── 从 intent.md 加载（单一信源，改规则只改 YAML）──
 def _load_intent_config():
-    """从 semantics/intent.yaml 加载 prompt 和映射。"""
+    """从 semantics/intent.md 加载 prompt 和映射。"""
     from app.agent.semantics import get_intent_meta
     meta = get_intent_meta()
     return meta.classifier_prompt, meta.intent_tool_categories
@@ -245,8 +267,6 @@ def analyze_intent(
     Returns:
         IntentResult
     """
-    from app.agent.domain_registry import init_builtin_domains
-    init_builtin_domains()
     _ensure_intent_loaded()
 
     if not message or not message.strip():

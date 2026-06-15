@@ -61,16 +61,20 @@ def _print_agent_info():
     except Exception as e:
         print(f"\n  [!] Session store 失败: {e}")
 
-    # Domains
+    # Domains (Phase 3: 从 persona.md 读取)
     try:
-        from app.agent.domain_registry import get_all_domains, init_builtin_domains
-        init_builtin_domains()
-        domains = get_all_domains()
-        print(f"\n  领域注册: {len(domains)} 个")
-        for name, cfg in domains.items():
-            print(f"    - {name}: {cfg.description[:60]}")
+        from app.agent.semantics import get_persona
+        persona = get_persona()
+        if persona and persona.behaviors:
+            domain_keys = [k for k in persona.behaviors.keys()
+                           if k in ("finance", "trading", "coding", "system")]
+            print(f"\n  领域行为规范: {len(domain_keys)} 个")
+            for key in domain_keys:
+                print(f"    - {key}: {len(persona.behaviors[key])} 条规则")
+        else:
+            print("\n  领域行为规范: 未加载")
     except Exception as e:
-        print(f"\n  [!] 领域注册失败: {e}")
+        print(f"\n  [!] 领域行为规范失败: {e}")
 
     # LLM config
     try:

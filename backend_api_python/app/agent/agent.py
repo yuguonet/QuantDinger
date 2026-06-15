@@ -128,14 +128,16 @@ from app.agent.skills.guidance import GUIDANCE
 
 
 def _load_preamble() -> str:
-    """Load agent preamble from external .md file, with built-in fallback."""
-    import pathlib
-    p = pathlib.Path(__file__).resolve().parent / "agent_preamble.md"
-    if p.is_file():
-        try:
-            return p.read_text(encoding="utf-8").strip()
-        except Exception:
-            pass
+    """从 persona.md 加载 Agent 人设。"""
+    from app.agent.semantics import get_persona
+    persona = get_persona()
+    if persona and persona.role:
+        parts = [f"你是{persona.role}。"]
+        if persona.identity:
+            parts.append(persona.identity)
+        if persona.mission:
+            parts.append(f"使命：{persona.mission}")
+        return "\n".join(parts)
     return "你是 QuantDinger 量化分析助手。"
 
 
@@ -773,8 +775,6 @@ class _AgentExecutor:
         if os.getenv("INTENT_ANALYSIS_ENABLED", "true").lower() == "true":
             try:
                 from app.agent.intent_analyzer import analyze_intent, format_intent_for_agent
-                from app.agent.domain_registry import init_builtin_domains
-                init_builtin_domains()
                 # 取最近 3 轮对话历史，用于指代消解
                 history = store.get_history(session_id)[-6:]
                 intent = analyze_intent(

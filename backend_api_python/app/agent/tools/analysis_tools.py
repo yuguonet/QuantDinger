@@ -829,4 +829,3 @@ def get_indicator_snapshot(stock_code: str) -> Dict[str, Any]:
 
 # ── OpenAI tool declarations ─────────────────────────────────
 
-# Legacy list — kept for backward compat during migration; safe to remove later.

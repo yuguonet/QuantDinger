@@ -706,57 +706,7 @@ def _deep_analyze_post_market(
 # Skill 定义
 # ═══════════════════════════════════════════════════════════════
 
-@skill(
-    name="post_market_screener",
-    description=(
-        "盘后短线选股专家。收盘后用全天K线做技术形态筛选（平台突破/底部放量启动/均线支撑回踩/"
-        "MACD金叉/缩量回调放量突破/突破前高），找次日介入点，计算入场/止损/目标位。"
-        "适用于：收盘后明天买什么、盘后复盘选股、短线技术选股。"
-    ),
-    tools=[
-        "search_stocks",
-        "get_indicator_snapshot",
-        "get_fund_flow_realtime",
-        "agent_technical_analysis",
-        "get_realtime_quote",
-        "agent_get_kline",
-        "search_stock_by_name",
-    ],
-    priority=7,
-    default_weight=1.0,
-    instructions=(
-        "你是A股盘后短线选股专家，专注技术形态筛选和次日介入点计算。\n\n"
-        "工作流程：\n"
-        "1. 获取强势股池 + 条件选股（涨幅1-8%+换手>2%+非ST）\n"
-        "2. 对每只股票做6种形态检测：平台突破/底部放量启动/均线支撑回踩/"
-        "   MACD金叉/缩量回调放量突破/突破前高\n"
-        "3. 综合技术指标（RSI/KDJ/均线排列/量能）评分\n"
-        "4. 对高分候选做深入分析，计算入场价/止损位/目标位\n\n"
-        "选股核心逻辑：\n"
-        "- 平台突破 = 5日振幅<8%后放量突破 → 短期爆发力强\n"
-        "- 底部放量启动 = 缩量后突然放量阳线 → 资金开始介入\n"
-        "- 均线支撑回踩 = 上升趋势回踩MA10不破 → 趋势延续\n"
-        "- MACD金叉 = DIF上穿DEA（水下金叉更佳）→ 动能转多\n"
-        "- 缩量回调放量突破 = 健康回调后突破 → 高胜率形态\n"
-        "- 突破前高 = 放量突破20日高点 → 空间打开\n\n"
-        "风险控制：\n"
-        "- RSI>80不推荐\n"
-        "- 涨停/跌停股不入选\n"
-        "- 每只股必须给出止损位和盈亏比\n\n"
-        "## 输出格式（必须遵守）\n"
-        "```json\n"
-        "{\n"
-        '  "direction": "bullish/bearish/neutral",\n'
-        '  "confidence": 0.0-1.0,\n'
-        '  "score": 0-100,\n'
-        '  "signal": "一句话信号摘要",\n'
-        '  "factors": [\n'
-        '    {"name": "因子名", "value": "值", "score": 0-100, "status": "ok"}\n'
-        '  ]\n'
-        "}\n"
-        "```\n"
-    ),
-)
+@skill("post_market_screener", auto_load=True)
 class PostMarketScreenerSkill:
     """盘后短线选股专家。"""
 

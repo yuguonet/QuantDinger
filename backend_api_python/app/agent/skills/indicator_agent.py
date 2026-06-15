@@ -16,63 +16,7 @@ from app.agent.skills.registry import skill
 logger = logging.getLogger(__name__)
 
 
-@skill(
-    name="indicator_agent",
-    description=(
-        "指标策略执行专家。从指标 IDE 加载用户自定义策略代码，"
-        "对目标股票执行指标计算，提取 buy/sell 交易信号。"
-        "当需要验证用户自定义指标信号、或用户提到某个指标策略时调用。"
-    ),
-    instructions=(
-        "你是指标策略执行专家。你的职责是：\n\n"
-        "## 工作流程\n\n"
-        "1. **加载用户指标** — 调用 `list_indicators` 获取用户的所有指标策略列表。\n"
-        "2. **选择相关指标** — 如果用户指定了指标 ID，直接用；否则从列表中选择最近创建的、"
-        "或与当前分析场景相关的指标（通常 1~3 个就够了，不需要全跑）。\n"
-        "3. **执行指标** — 对目标股票调用 `run_indicator_signal`，传入指标 ID 和股票代码。\n"
-        "4. **汇总信号** — 把每个指标的 buy/sell 信号、当前价格、信号状态整理成简洁报告。\n\n"
-        "## 输出格式\n\n"
-        "对每个执行的指标，报告：\n"
-        "- 指标名称\n"
-        "- 信号状态（买入/卖出/无信号）\n"
-        "- 当前价格 vs 信号价格\n"
-        "- 最近的关键信号点\n\n"
-        "## 注意\n\n"
-        "- 用户通常有 5~10 个指标，不需要全部执行，选择最相关的即可\n"
-        "- 如果某个指标执行失败，跳过它，不要卡住\n"
-        "- 重点关注最近一根 K 线是否有信号（即当前是否触发）\n"
-        "- 你的输出会被后续的选股、回测、辩论步骤参考\n"
-        "\n\n## 输出格式（必须遵守）\n"
-        "你的 final_answer 必须包含以下JSON结构（嵌在正文中即可）：\n"
-        "\n"
-        "```json\n"
-        "{\n"
-        "  \"direction\": \"bullish/bearish/neutral\",\n"
-        "  \"confidence\": 0.0-1.0,\n"
-        "  \"score\": 0-100,\n"
-        "  \"signal\": \"一句话信号摘要\",\n"
-        "  \"factors\": [\n"
-        "    {\"name\": \"因子名\", \"value\": \"值\", \"score\": 0-100, \"status\": \"ok\"}\n"
-        "  ]\n"
-        "}\n"
-        "```\n"
-        "\n"
-        "规则：\n"
-        "- score: 0=极度看空, 50=中性, 100=极度看多。基于数据客观打分。\n"
-        "- confidence: 数据充分程度（0=完全没数据, 1=数据非常充分）。不是方向确定性。\n"
-        "- direction: 基于score判断。score>=60=bullish, score<=40=bearish, 其余=neutral。\n"
-        "- status: ok=有数据, missing=数据缺失。缺失的因子必须标missing，不能编造。\n"
-        "- signal: 一句话总结关键信号。\n"
-        "- factors: 每个分析维度一行。包含你调用工具获取的所有关键数据点。",
-    ),
-    tools=[
-        "list_indicators",
-        # get_indicator_params / run_indicator_signal 由 algo_analyze 自行调用
-        #（需要先 list_indicators 获取 indicator_id）
-    ],
-    priority=7,
-    default_weight=1.1,
-)
+@skill("indicator_agent", auto_load=True)
 class IndicatorAgent:
     """用户自定义指标策略执行 Agent。"""
 

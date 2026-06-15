@@ -40,19 +40,7 @@ from app.agent.skills.registry import skill
 logger = logging.getLogger(__name__)
 
 
-@skill(
-    name="trading_agent",
-    description="交易执行专家。负责策略启动/停止、持仓管理、交易记录查询。当用户要求启动策略、停止策略、查看持仓、执行交易时调用。",
-    instructions="你是交易执行专家。启动策略前必须先确认行情和信号状态。先用 list_strategies 列出可用策略，get_strategy_detail 查看详情，确认后再 start_strategy。停止策略用 stop_strategy。始终优先考虑风险控制。",
-    tools=[
-        "list_strategies",
-        "get_realtime_quote",
-        # get_strategy_detail / start_strategy / stop_strategy / get_strategy_trades
-        # 需要 strategy_id，由 algo_analyze 先 list_strategies 再逐个调用
-    ],
-    priority=5,
-    default_weight=1.0,
-)
+@skill("trading_agent", auto_load=True)
 class TradingSkill:
     """交易执行专家子 Agent。"""
 

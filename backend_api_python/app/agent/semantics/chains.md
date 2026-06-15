@@ -1,16 +1,11 @@
-# 链路定义（从 chain/chains.py 提取）
-# 每条链路由多个步骤组成，每个步骤对应一个 Skill Agent
-# 链路由 intent_analyzer 的 verb+noun 组合触发
-
+---
 chains:
-  # ── 综合评估链（A股中短线特化：环境→技术→验证→辩论收尾）──
   evaluate+stock:
     name: "股票综合评估"
     description: "游资追踪→解禁监控→情报/政策→技术面/动量→指标信号→选股验证→行情/概念/资金→回测→多空辩论"
     trigger_verbs: [analyze, evaluate]
     trigger_nouns: [stock]
     steps:
-      # 第一优先级：环境判断
       - name: hot_money
         agent: hot_money_tracker
         order: 1
@@ -21,7 +16,6 @@ chains:
         order: 2
         description: "解禁监控：限售股解禁、减持预警、质押风险（供给端风险）"
         required: false
-      # 第二优先级：分析验证
       - name: intelligence
         agent: intelligence_agent
         order: 3
@@ -52,7 +46,6 @@ chains:
         order: 8
         description: "策略回测验证：历史绩效、胜率、盈亏比、最大回撤"
         required: false
-      # 第三优先级：多空辩论（决策收尾）
       - name: bull_bear_debate
         agent: bull_researcher
         order: 9
@@ -66,7 +59,6 @@ chains:
         required: false
         extract_fn: extract_bear_args
 
-  # ── 选股筛选链 ──
   screen+stock:
     name: "选股筛选"
     description: "条件选股→技术验证→情报过滤→综合排序"
@@ -89,7 +81,6 @@ chains:
         description: "新闻情报+政策过滤"
         required: false
 
-  # ── 市场扫描链 ──
   scan+market:
     name: "市场全景扫描"
     description: "大盘指数→板块排名→涨停池→龙虎榜→资金流向"
@@ -111,3 +102,17 @@ chains:
         order: 3
         description: "板块和概念资金流向"
         required: false
+---
+
+# 链路定义
+
+每条链路由多个步骤组成，每个步骤对应一个 Skill Agent。
+链路由 intent_analyzer 的 verb+noun 组合触发。
+
+## 链路列表
+
+| 链路 | 触发 | 步骤 | 说明 |
+|------|------|------|------|
+| evaluate+stock | analyze/evaluate + stock | 10 | 股票综合评估 |
+| screen+stock | filter/screen + stock/screener | 3 | 选股筛选 |
+| scan+market | view/analyze/scan + market | 3 | 市场全景扫描 |

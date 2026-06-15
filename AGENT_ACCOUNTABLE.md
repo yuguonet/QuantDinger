@@ -1683,10 +1683,10 @@ agent 调一次要烧 token，120 天逐天跑 = 120 倍成本。需要分层设
 2. 第二层补充：验证 Skill 层预测能力
 3. 第三层收尾：端到端验证
 
-## 十五、Domain 解耦重构（待实施）
+## 十五、Domain 解耦重构（Phase 1-3 已完成）
 
-> 日期: 2026-06-15
-> 状态: 已实施（Phase 1 基础改动完成，分层描述注入待后续迭代）
+> 日期: 2026-06-15（初稿）→ 2026-06-15（Phase 1-3 完成）
+> 状态: **已完成**（Phase 1-3 + 统一 Front Matter MD + 选股技能合并）
 > 背景: domain 同时承担「路由开关」「能力注册」「context 裁剪阀」三重职责，
 >       导致 skill/tool 更纠缠而非更清晰，且 cron 等跨域场景被迫选边。
 
@@ -1703,36 +1703,29 @@ domain 设计初衷是按领域特化执行路径，但实际上同时承担了�
 **根源**：domain 既是「这个能力属于哪」（标签），又是「这个任务怎么跑」（策略），
 又是「context 加载什么」（裁剪）。三件事绑一个字段，耦合不可避免。
 
-### 15.2 解耦方案
+### 15.2 解耦方案（已实施）
 
-**核心思路：domain 从「路由+注册+裁剪」三合一 → 降级为纯「标签」。**
+**核心思路：domain 从「路由+注册+裁剪」三合一 → 降级为纯「标签」→ 彻底移除。**
 
-#### ① 能力层：skill/tool 只打标签，不绑 domain
+#### ① 能力层：skill/tool 只打 tags，domain 概念移除 ✅
 
 ```python
-# 改前
-@skill(domain="finance", name="technical_agent")
+# 已完成
+@skill("technical_agent", auto_load=True)
 class TechnicalAgent(BaseSkill): ...
 
-# 改后
-@skill(tags=["finance", "technical"], name="technical_agent")
-class TechnicalAgent(BaseSkill): ...
+# tags 从 SKILL.md frontmatter 自动加载
+# tools/category 从 semantics 自动补全
 ```
 
 - tags 是多值列表，一个 skill 可以属于多个标签组
 - 任何执行路径都能按 tags 组合调用，不被 domain 锁死
-- cron_worker 显式声明 `tags=["finance"]` 即可复用金融 skill
 
-#### ② 策略层：executor 级显式配置，不从 domain 推断
+#### ② 策略层：executor 级显式配置 ✅
 
 ```python
-# 改前（纠缠）
-if domain == "finance":
-    collector = TraceCollector(...)
-    # 走特化路径
-
-# 改后（解耦）
-strategy = context.get("strategy", "traced")  # executor 级配置
+# 已完成
+strategy = intent.strategy  # "traced" / "chain" / "direct"
 if strategy == "traced":
     collector = TraceCollector(...)
 elif strategy == "chain":
@@ -1741,85 +1734,99 @@ elif strategy == "direct":
     pass  # 纯 agent 自由推理
 ```
 
-- strategy 由调用方显式指定，不从 domain 推断
-- cron_worker 传 strategy="traced"，不依赖 domain 判断
-- 普通金融分析默认 strategy="traced"（配置层面，非代码判断）
+- strategy 由 IntentAnalyzer 计算，不从 domain 推断
+- finance/trading → strategy="traced"
+- 其他 → strategy="direct"
 
-#### ③ context 裁剪：分层描述替代 domain 过滤
+#### ③ context 裁剪：Front Matter MD 两段加载 ✅
 
 ```
-第一层：Agent 始终可见（~500 token）
-  skill_pool 列表：每个 skill 一行（名称 + 一句话描述 + 权重）
-  tool_hint："有 80+ 工具可用，call_skill 时自动加载相关工具"
+第一段：system prompt 注入（~500 token）
+  skills_summary_xml — 每个 skill 一行（名称 + 描述 + tags）
+  tools_summary_xml — 按 category 分组的工具索引
 
-第二层：调用时按需注入
+第二段：call_skill 时按需加载
   Agent 调 call_skill("technical_agent")
-    → 注入 technical_agent 完整 instructions
-    → 注入其依赖的工具描述
+    → 从 SKILL.md body 加载完整 instructions
     → 返回 SkillReport
-
-第三层：Agent 自主探索
-  Agent 直接调工具 → 工具自带 description
-  Agent 问"有什么工具" → 返回分类索引
 ```
 
-效果：context 始终控制在 ~500 token 概览，细节按需加载。
-与 domain 过滤目的完全一致，但不绑死 domain。
+#### ④ domain 概念彻底移除 ✅
 
-#### ④ IntentAnalyzer 降级为 EntityExtractor
+- `domain_registry.py` → 已删除
+- `domains.yaml` → 已删除
+- IntentAnalyzer 的 `domain_instructions` → 从 `persona.md` behaviors 生成
+- Agent 的 `init_builtin_domains()` → 已移除
 
-```python
-# 改前（200+ 行，承担路由决策）
-class IntentAnalyzer:
-    def analyze(text) -> Intent:  # 含 domain 路由、verb+noun 映射、instructions 注入
+### 15.3 改动清单（已实施）
 
-# 改后（~30 行，纯工具函数）
-class EntityExtractor:
-    def extract_stock_code(text: str) -> str:   # 正则/NER 提取股票代码
-    def extract_stock_name(text: str) -> str:   # 提取股票名称
-    def extract_timeframe(text: str) -> str:    # 提取时间维度（"明天"→T+1）
-    def extract_entities(text: str) -> dict:    # 一次性提取所有实体
-```
-
-保留：实体提取（stock_code, stock_name, timeframe）
-删除：domain 路由、verb+noun → strategy 映射、instructions 注入逻辑
-
-### 15.3 改动清单
-
-| 改动 | 涉及文件 | 类型 |
+| 改动 | 涉及文件 | 状态 |
 |------|---------|------|
-| domain 降级为 tags | skills/base.py, skills/registry.py, tools/registry.py | 修改 |
-| @skill 装饰器改为 tags 参数 | skills/registry.py | 修改 |
-| strategy 配置化 | agent.py (_AgentExecutor) | 修改 |
-| 分层描述注入 | agent.py (_build_instructions) | 重写 |
-| IntentAnalyzer → EntityExtractor | intent_analyzer.py → entity_extractor.py | 重命名+精简 |
-| 删除 domain 路由逻辑 | agent.py, intent_analyzer.py | 删除 |
-| cron_worker 传 strategy 参数 | agent/cron_worker.py | 修改 |
-| Skill 文件 @skill 装饰器更新 | skills/*.py（15个） | 批量修改 |
+| domain 降级为 tags | skills/registry.py, tools/registry.py | ✅ 已完成 |
+| @skill 支持 auto_load | skills/registry.py | ✅ 已完成 |
+| @tool tags 从 semantics 补全 | tools/registry.py | ✅ 已完成 |
+| strategy 配置化 | agent.py (_AgentExecutor) | ✅ 已完成 |
+| 分层描述注入 | agent.py (_build_instructions) | ✅ 已完成 |
+| domain_registry 删除 | domain_registry.py | ✅ 已删除 |
+| domains.yaml 删除 | domains.yaml | ✅ 已删除 |
+| persona.md 统一行为规范 | semantics/persona.md | ✅ 已完成 |
+| intent.md 统一意图规则 | semantics/intent.md | ✅ 已完成 |
+| chains.md 统一链路定义 | semantics/chains.md | ✅ 已完成 |
+| tools.md 统一工具元数据 | semantics/tools.md | ✅ 已完成 |
+| SKILL.md 统一为单文件 | semantics/skills/*.md | ✅ 已完成 |
+| 选股技能合并 | semantics/skills/screener.md | ✅ 已完成 |
 
-### 15.4 与现有设计的关系
+### 15.4 语义文件结构（最终）
+
+```
+semantics/
+├── __init__.py              # 加载器（_load_frontmatter + names 列表支持）
+├── persona.md               # 人设 + 行为规范（7 个行为域）
+├── intent.md                # 意图分类（15 rules + 3 patterns + prompt body）
+├── chains.md                # 链路编排（3 条链路 16 步）
+├── tools.md                 # 工具元数据（14 categories, 79 tools）
+└── skills/
+    ├── screener.md          # 选股技能（names: short_term/eod/post_market）
+    ├── technical_agent.md
+    ├── hot_money_tracker.md
+    ├── indicator_agent.md
+    ├── intelligence_agent.md
+    ├── market_data_agent.md
+    ├── backtest_agent.md
+    ├── bull_researcher.md
+    ├── bear_researcher.md
+    ├── screening_agent.md
+    ├── lockup_watcher.md
+    ├── data_agent.md
+    ├── bb_screener.md
+    └── trading_agent.md
+```
+
+**统一格式**：全部 Front Matter MD
+- frontmatter 存结构化元数据（name/names/tags/tools/priority 等）
+- body 存文本内容（instructions/prompt/说明文档）
+- 改描述只改 .md 文件，不改 Python 代码
+
+**names 列表**：一个 .md 文件可注册多个 skill（如 screener.md 注册 3 个）
+
+### 15.5 代码改动汇总
+
+| 文件 | 改动 |
+|------|------|
+| `skills/registry.py` | @skill 新增 auto_load，从 SKILL.md 加载 |
+| `tools/registry.py` | @tool tags/category 从 semantics 自动补全 |
+| `chain/chains.py` | 链路从 chains.md frontmatter 加载 |
+| `agent.py` | _load_preamble 从 persona.md 加载 |
+| `intent_analyzer.py` | domain_instructions 从 persona.md behaviors 生成 |
+| `run.py` | 领域信息从 persona.md 读取 |
+| `semantics/__init__.py` | 统一 _load_frontmatter + names 列表支持 |
+
+### 15.6 与现有设计的关系
 
 | 现有设计 | 影响 |
 |---------|------|
 | AGENT_ACCOUNTABLE §三 TraceCollector | 不变，由 strategy="traced" 触发 |
 | AGENT_ACCOUNTABLE §四 权重迭代 | 不变，按 skill_name 聚合，不依赖 domain |
 | AGENT_ACCOUNTABLE §六 JSON 标准化输出 | 不变 |
-| AGENT_ACCOUNTABLE §七 instructions 注入 | 改为分层描述，不再按 domain 整段注入 |
-| AGENT_ACCOUNTABLE §十一 Domain 隔离方案 | **被本节替代**，装饰器模式保留但标签化 |
-| DESIGN_RESTRUCTURE.md | 彻底废弃（非金融域也不再走 ChainExecutor） |
-
-### 15.5 迁移策略
-
-1. 先把 domain 路由逻辑抽到 strategy 配置（不影响现有功能）
-2. 再把 IntentAnalyzer 瘦身为 EntityExtractor
-3. 最后把 @skill(domain=...) 改为 @skill(tags=...)
-4. 每步独立可回滚
-
-### 15.6 风险
-
-| 风险 | 缓解 |
-|------|------|
-| 分层描述加载时机不明确 | call_skill 已有 _format_report，复用此机制 |
-| Agent 不知道有哪些 skill 可用 | 第一层 skill_pool 列表始终可见 |
-| tags 迁移遗漏 | 批量 sed 替换 + 测试覆盖 |
-| 非金融域完全失去结构化路径 | 统一走 agent 自规划，traced 策略可选 |
+| AGENT_ACCOUNTABLE §七 instructions 注入 | 改为两段加载，不再按 domain 整段注入 |
+| AGENT_ACCOUNTABLE §十一 Domain 隔离方案 | **被本节替代** |

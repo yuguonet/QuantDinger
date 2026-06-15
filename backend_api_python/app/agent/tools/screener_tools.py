@@ -213,4 +213,3 @@ def _search_local_db(keyword: str, market: str = "CNStock", limit: int = 50) -> 
 #  工具声明
 # ══════════════════════════════════════════════════════════════
 
-# Legacy list — kept for backward compat during migration; safe to remove later.

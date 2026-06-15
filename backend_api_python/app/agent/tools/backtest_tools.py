@@ -204,4 +204,3 @@ def get_backtest_history(
         logger.error("get_backtest_history failed: %s", e, exc_info=True)
         return {"runs": [], "count": 0, "error": str(e)}
 
-# Legacy list — kept for backward compat during migration; safe to remove later.

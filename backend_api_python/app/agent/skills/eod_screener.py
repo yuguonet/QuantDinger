@@ -486,59 +486,8 @@ def _deep_analyze_eod(
 # Skill 定义
 # ═══════════════════════════════════════════════════════════════
 
-@skill(
-    name="eod_screener",
-    description=(
-        "尾盘选股专家。用条件选股(search_stocks)做初筛，再用Python验证尾盘特征（收盘接近最高价+放量+主线题材），"
-        "最后对候选股做技术面+资金流深入分析。"
-        "适用于：14:30后尾盘买什么、隔夜持仓标的、次日计划。"
-    ),
-    tools=[
-        "search_stocks",
-        "get_indicator_snapshot",
-        "get_fund_flow_realtime",
-        "get_limit_pool",
-        "get_hot_sectors",
-        "get_hot_stocks_with_reason",
-        "agent_technical_analysis",
-        "get_realtime_quote",
-        "agent_get_kline",
-        "search_stock_by_name",
-    ],
-    priority=8,
-    default_weight=1.0,
-    instructions=(
-        "你是A股尾盘选股专家，专注隔夜持仓标的筛选。\n\n"
-        "工作流程：\n"
-        "1. 用 search_stocks 条件选股（涨幅3%-8% + 换手率>3%）做初筛\n"
-        "2. 用 Python 验证尾盘特征：收盘接近最高价 + 放量 + 主线题材\n"
-        "3. 涨停池识别尾盘封板股（14:30后封板 = 主力尾盘突击）\n"
-        "4. 对候选股调用工具做技术面+资金流深入分析\n\n"
-        "尾盘选股核心逻辑：\n"
-        "- 收盘接近最高价 = 主力尾盘拉升，次日高开概率大\n"
-        "- 放量 = 资金介入真实，非假突破\n"
-        "- 涨幅4-6%最佳（太高追涨风险，太低力度不够）\n"
-        "- 主线题材 = 次日有延续性\n"
-        "- 尾盘封板 = 最强信号\n\n"
-        "隔夜持仓纪律：\n"
-        "- RSI>80超买不隔夜\n"
-        "- 涨幅>7%谨慎隔夜\n"
-        "- 主力净流出不隔夜\n"
-        "- 非主线题材降低仓位\n\n"
-        "## 输出格式（必须遵守）\n"
-        "```json\n"
-        "{\n"
-        '  "direction": "bullish/bearish/neutral",\n'
-        '  "confidence": 0.0-1.0,\n'
-        '  "score": 0-100,\n'
-        '  "signal": "一句话信号摘要",\n'
-        '  "factors": [\n'
-        '    {"name": "因子名", "value": "值", "score": 0-100, "status": "ok"}\n'
-        '  ]\n'
-        "}\n"
-        "```\n"
-    ),
-)
+@skill("eod_screener", auto_load=True)
+
 class EODScreenerSkill:
     """尾盘选股专家子 Agent。"""
 

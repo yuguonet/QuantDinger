@@ -300,4 +300,4 @@ def auto_snapshot_before_edit(reason: str = "") -> Optional[Dict[str, Any]]:
 #   1. For complex tasks: first analyze (read-only), then plan, then execute
 #   2. Use todowrite to track the plan
 #   3. Use question to clarify ambiguities before starting
-# See domain_registry.py for the actual instructions.
+# See persona.md for the actual instructions.

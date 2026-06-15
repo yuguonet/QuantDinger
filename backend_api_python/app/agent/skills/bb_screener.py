@@ -358,50 +358,7 @@ def _deep_analyze_one(code, bb_hit, call_tool_fn, _tool_calls, _tool_nodes, _mis
 # Skill 定义
 # ═══════════════════════════════════════════════════════════════
 
-@skill(
-    name="bb_screener",
-    description=(
-        "BB超卖全市场扫描+深入分析。先用布林带下轨突破策略筛选全市场股票，"
-        "再对候选股票逐只做技术面深入分析，给出综合评分。"
-        "适用于：今日BB超卖信号扫描、BB选股、布林带下轨选股。"
-    ),
-    tools=[
-        "get_indicator_snapshot", "get_chip_distribution",
-        "get_realtime_quote", "agent_get_kline",
-    ],
-    priority=10,
-    default_weight=1.0,
-    instructions=(
-        "你是BB超卖策略选股专家。\n\n"
-        "工作流程：\n"
-        "1. 先用 algo 逻辑全市场扫描今日触发 BB 超卖信号的股票\n"
-        "2. 对每只候选股票，调用工具做深入技术分析\n"
-        "3. 综合评分，输出结构化报告\n\n"
-        "BB超卖入场条件：\n"
-        "- 最低价 < BB(20,3.0) 下轨\n"
-        "- 收盘价 <= BB下轨×1.05\n"
-        "- 振幅 > 8% 且下影线占比 < 30%\n"
-        "- MA60斜率 >= 0%（排除持续下跌）\n\n"
-        "深入分析维度：\n"
-        "- 技术指标交叉验证（MACD/RSI/KDJ/均线）\n"
-        "- 筹码分布（支撑/压力/获利比例）\n"
-        "- 风险评估\n\n"
-        "## 输出格式（必须遵守）\n"
-        "只输出JSON：\n"
-        "```json\n"
-        "{\n"
-        '  "direction": "bullish/bearish/neutral",\n'
-        '  "confidence": 0.0-1.0,\n'
-        '  "score": 0-100,\n'
-        '  "signal": "一句话信号摘要",\n'
-        '  "factors": [\n'
-        '    {"name": "因子名", "value": "值", "score": 0-100}\n'
-        '  ],\n'
-        '  "analysis": "综合分析文字"\n'
-        "}\n"
-        "```\n"
-    ),
-)
+@skill("bb_screener", auto_load=True)
 class BBScreenerSkill:
     """BB超卖全市场扫描 + 深入分析。"""
 

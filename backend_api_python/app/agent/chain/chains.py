@@ -1,15 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-Chain Definitions — 链路定义。
+Chain Definitions — 链路定义（Phase 2: 从 chains.md 加载）。
 
 每条链路由多个步骤组成，每个步骤对应一个 Skill Agent。
 链路由 intent_analyzer 的 verb+noun 组合触发。
+
+Phase 2 变更（SEMANTICS_REFACTOR）：
+  - 链路定义从 chains.md 加载（单一信源）
+  - 改链路只改 YAML，不再改 Python 代码
+  - 保留 register_chain() 接口，支持运行时动态注册
 
 数据结构：
   ChainStep — 链路中的一个步骤（name/agent/order/required）
   ChainDef  — 链路定义（chain_id/name/steps/trigger_verbs/trigger_nouns）
 
-内置链路：
+内置链路（从 chains.md 加载）：
   evaluate+stock  — 股票综合评估（10步：游资→解禁→情报→技术→指标→选股→行情→回测→多空辩论）
   screen+stock    — 选股筛选（3步：条件选股→技术验证→情报过滤）
   scan+market     — 市场全景扫描（3步：大盘指数→涨停池→资金流向）
@@ -22,11 +27,15 @@ Chain Definitions — 链路定义。
   get_chain(chain_id) → Optional[ChainDef]
   get_chain_for_intent(verb, noun) → Optional[ChainDef]
   list_chains() → List[ChainDef]
+  load_chains_from_yaml() → None（从 chains.md 加载，幂等）
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -56,6 +65,7 @@ class ChainDef:
 # ═══════════════════════════════════════════════════════════════
 
 _CHAIN_REGISTRY: Dict[str, ChainDef] = {}
+_yaml_loaded = False
 
 
 def register_chain(chain_def: ChainDef):
@@ -70,6 +80,8 @@ def get_chain(chain_id: str) -> Optional[ChainDef]:
 
 def get_chain_for_intent(verb: str, noun: str) -> Optional[ChainDef]:
     """根据动词+对象查找匹配的链路。"""
+    # 确保 YAML 已加载
+    load_chains_from_yaml()
     # 1. 精确匹配 verb+noun
     if verb and noun:
         for chain in _CHAIN_REGISTRY.values():
@@ -90,159 +102,51 @@ def get_chain_for_intent(verb: str, noun: str) -> Optional[ChainDef]:
 
 def list_chains() -> List[ChainDef]:
     """列出所有已注册链路。"""
+    load_chains_from_yaml()
     return list(_CHAIN_REGISTRY.values())
 
 
 # ═══════════════════════════════════════════════════════════════
-# 内置链路定义
+# 从 chains.md 加载（Phase 2: 单一信源）
 # ═══════════════════════════════════════════════════════════════
 
-# ── 综合评估链（A股中短线特化：环境→技术→验证→辩论收尾）──
-register_chain(ChainDef(
-    chain_id="evaluate+stock",
-    name="股票综合评估",
-    description="游资追踪→解禁监控→情报/政策→技术面/动量→指标信号→选股验证→行情/概念/资金→回测→多空辩论",
-    trigger_verbs=["analyze", "evaluate"],
-    trigger_nouns=["stock"],
-    steps=[
-        # ── 第一优先级：环境判断 ──
-        ChainStep(
-            name="hot_money",
-            agent="hot_money_tracker",
-            order=1,
-            description="游资追踪：龙虎榜、主力资金动态、游资席位动向（短线定价核心）",
-            required=False,
-        ),
-        ChainStep(
-            name="lockup",
-            agent="lockup_watcher",
-            order=2,
-            description="解禁监控：限售股解禁、减持预警、质押风险（供给端风险）",
-            required=False,
-        ),
-        # ── 第二优先级：分析验证 ──
-        ChainStep(
-            name="intelligence",
-            agent="intelligence_agent",
-            order=3,
-            description="情报+政策分析：新闻搜索、事件驱动、概念催化、政策影响",
-            required=False,
-        ),
-        ChainStep(
-            name="technical",
-            agent="technical_agent",
-            order=4,
-            description="技术面+动量综合判断：趋势、量价、指标、形态、筹码、突破、择时",
-            required=True,
-        ),
-        ChainStep(
-            name="indicator",
-            agent="indicator_agent",
-            order=5,
-            description="用户指标信号验证：执行指标 IDE 中的自定义策略，获取 buy/sell 信号",
-            required=False,
-        ),
-        ChainStep(
-            name="screening",
-            agent="screening_agent",
-            order=6,
-            description="选股验证：条件筛选、指标信号验证",
-            required=False,
-        ),
-        ChainStep(
-            name="market_data",
-            agent="market_data_agent",
-            order=7,
-            description="行情+概念+资金流向：大盘、板块轮动、概念热度、主力态度",
-            required=False,
-        ),
-        ChainStep(
-            name="backtest",
-            agent="backtest_agent",
-            order=8,
-            description="策略回测验证：历史绩效、胜率、盈亏比、最大回撤",
-            required=False,
-        ),
-        # ── 第三优先级：多空辩论（决策收尾）──
-        ChainStep(
-            name="bull_bear_debate",
-            agent="bull_researcher",
-            order=9,
-            description="多空辩论：多头研究员基于所有报告构建看涨论据",
-            required=False,
-            extract_fn="extract_bull_args",
-        ),
-        ChainStep(
-            name="bear_rebuttal",
-            agent="bear_researcher",
-            order=10,
-            description="多空辩论：空头研究员反驳多头论据并构建看跌论据",
-            required=False,
-            extract_fn="extract_bear_args",
-        ),
-    ],
-))
+def load_chains_from_yaml():
+    """从 semantics/chains.md 加载链路定义（幂等，只加载一次）。"""
+    global _yaml_loaded
+    if _yaml_loaded:
+        return
+    _yaml_loaded = True
 
-# ── 选股筛选链 ──
-register_chain(ChainDef(
-    chain_id="screen+stock",
-    name="选股筛选",
-    description="条件选股→技术验证→情报过滤→综合排序",
-    trigger_verbs=["filter", "screen"],
-    trigger_nouns=["stock", "screener"],
-    steps=[
-        ChainStep(
-            name="screening",
-            agent="screening_agent",
-            order=1,
-            description="条件选股，获取候选池",
-            required=True,
-        ),
-        ChainStep(
-            name="technical",
-            agent="technical_agent",
-            order=2,
-            description="技术面+动量验证",
-            required=False,
-        ),
-        ChainStep(
-            name="intelligence",
-            agent="intelligence_agent",
-            order=3,
-            description="新闻情报+政策过滤",
-            required=False,
-        ),
-    ],
-))
+    from app.agent.semantics import get_all_chain_metas
+    chain_metas = get_all_chain_metas()
 
-# ── 市场扫描链 ──
-register_chain(ChainDef(
-    chain_id="scan+market",
-    name="市场全景扫描",
-    description="大盘指数→板块排名→涨停池→龙虎榜→资金流向",
-    trigger_verbs=["view", "analyze", "scan"],
-    trigger_nouns=["market"],
-    steps=[
-        ChainStep(
-            name="market_overview",
-            agent="market_data_agent",
-            order=1,
-            description="大盘指数、板块排名、概念热度",
-            required=True,
-        ),
-        ChainStep(
-            name="hotspots",
-            agent="screening_agent",
-            order=2,
-            description="涨停池、龙虎榜、热榜",
-            required=False,
-        ),
-        ChainStep(
-            name="fund_flow",
-            agent="market_data_agent",
-            order=3,
-            description="板块和概念资金流向",
-            required=False,
-        ),
-    ],
-))
+    if not chain_metas:
+        logger.warning("[Chain] chains.md 为空")
+        return
+
+    for chain_id, meta in chain_metas.items():
+        steps = []
+        for s in meta.steps:
+            steps.append(ChainStep(
+                name=s.name,
+                agent=s.agent,
+                order=s.order,
+                description=s.description,
+                required=s.required,
+                extract_fn=s.extract_fn,
+            ))
+        # 按 order 排序
+        steps.sort(key=lambda x: x.order)
+        register_chain(ChainDef(
+            chain_id=chain_id,
+            name=meta.name,
+            description=meta.description,
+            trigger_verbs=meta.trigger_verbs,
+            trigger_nouns=meta.trigger_nouns,
+            steps=steps,
+        ))
+
+    logger.info("[Chain] 从 chains.md 加载 %d 条链路: %s",
+                len(chain_metas), list(chain_metas.keys()))
+
+

@@ -211,4 +211,3 @@ def list_user_selection_strategies(user_id: int = 1) -> Dict[str, Any]:
 
 # ── OpenAI tool declarations ─────────────────────────────────
 
-# Legacy list — kept for backward compat during migration; safe to remove later.
