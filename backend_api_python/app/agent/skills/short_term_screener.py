@@ -2,6 +2,8 @@
 """
 Short Term Screener Skill — 盘中短线选股专家（A股1-3日交易特化）。
 
+⚠️ 时段限制：仅限盘中（9:30-14:30）使用。盘后请用 post_market_screener，尾盘(14:30-15:00)请用 eod_screener。
+
 两阶段流程：
   Phase 1: Python 预筛选（0 token）
     → 涨停池连板股 + 热门板块龙头 + 强势股题材归因 + 资金流交叉验证

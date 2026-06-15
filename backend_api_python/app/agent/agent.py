@@ -943,10 +943,7 @@ class _AgentExecutor:
                 _current_round_parts.append(f"需获取: {', '.join(_missing)}")
 
         if _current_round_parts:
-            if round_num > 1:
-                ctx_parts.append(f"--- R{round_num} ---\n" + "\n".join(_current_round_parts))
-            else:
-                ctx_parts.append("\n".join(_current_round_parts))
+            ctx_parts.append(f"--- R{round_num} ---\n" + "\n".join(_current_round_parts))
 
         if ctx_parts:
             enriched = "\n".join(ctx_parts) + "\n\n" + message
@@ -1019,20 +1016,20 @@ class _AgentExecutor:
         collector = meta.get("collector")
 
         # ── Chain 优先：verb+noun 匹配链路 → ChainExecutor ──
+        # 链路结果作为上下文注入 Agent，Agent 是唯一决策者
+        _chain_context = None
         if _intent_verb or _intent_noun:
             try:
-                chain_result = self._try_chain(
+                _chain_context = self._try_chain(
                     _intent_verb, _intent_noun, message,
                     session_id, context, user_id,
                 )
-                if chain_result is not None:
-                    store.add_message(session_id, "assistant",
-                                      chain_result.content if isinstance(chain_result.content, str)
-                                      else str(chain_result.content))
-                    logger.info("[Chain] 链路执行完成，跳过 agent")
-                    return chain_result
             except Exception as e:
                 logger.warning("[Chain] 链路执行异常，降级到 agent: %s", e)
+
+        # 链路结果注入 Agent prompt
+        if _chain_context:
+            enriched = f"[链路分析结果]\n{_chain_context}\n\n{enriched}"
 
         t0 = time.time()
         try:
@@ -1458,7 +1455,7 @@ class _AgentExecutor:
             content = degrade_msg + "\n\n" + content
             logger.warning("[Chain] 降级告知: %s", degrade_reason)
 
-        # 附加结构化 JSON 供前端解析
+        # 附加结构化 JSON 供 Agent 参考
         import json as _json
         result_dict = chain_result.to_dict()
         if degraded:
@@ -1466,15 +1463,7 @@ class _AgentExecutor:
             result_dict["degrade_reason"] = degrade_reason
         content += "\n\n<!-- decision_result:\n" + _json.dumps(result_dict, ensure_ascii=False, indent=2) + "\n-->"
 
-        return AgentResult(
-            success=chain_result.success,
-            content=content,
-            tool_calls_log=[],
-            total_steps=len(chain_result.root_node.children) if chain_result.root_node else 0,
-            total_tokens=0,
-            model="chain-orchestrator",
-            error=None if chain_result.success else "链路执行失败",
-        )
+        return content
 
     def chat_stream(self, message, session_id, context=None,
                     progress_callback=None, user_id=1):
@@ -1518,29 +1507,19 @@ class _AgentExecutor:
         # ── Chain 优先：verb+noun 匹配链路 → ChainExecutor ──
         _intent_verb = meta.get("intent_verb", "")
         _intent_noun = meta.get("intent_noun", "")
+        _chain_context = None
         if _intent_verb or _intent_noun:
             try:
-                chain_result = self._try_chain(
+                _chain_context = self._try_chain(
                     _intent_verb, _intent_noun, message,
                     session_id, context, user_id,
                 )
-                if chain_result is not None:
-                    store.add_message(session_id, "assistant",
-                                      chain_result.content if isinstance(chain_result.content, str)
-                                      else str(chain_result.content))
-                    logger.info("[Chain] 流式链路执行完成，跳过 agent")
-                    yield {
-                        "type": "done",
-                        "success": chain_result.success,
-                        "content": chain_result.content,
-                        "error": chain_result.error,
-                        "total_steps": chain_result.total_steps,
-                        "model": chain_result.model,
-                        "session_id": session_id,
-                    }
-                    return
             except Exception as e:
                 logger.warning("[Chain] 流式链路执行异常，降级到 agent: %s", e)
+
+        # 链路结果注入 Agent prompt
+        if _chain_context:
+            enriched = f"[链路分析结果]\n{_chain_context}\n\n{enriched}"
 
         t0 = time.time()
         _stream_tool_calls = []  # 收集流式执行中的工具调用
