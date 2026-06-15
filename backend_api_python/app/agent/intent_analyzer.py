@@ -44,6 +44,8 @@ class IntentResult:
     noun: str = ""
     # v4 新增：上下文压缩摘要
     context_summary: str = ""
+    # §15 新增：执行策略（替代 domain 做路由决策）
+    strategy: str = "direct"  # "traced" / "chain" / "direct"
 
     @property
     def domain_config(self):
@@ -370,10 +372,22 @@ def analyze_intent(
         except Exception:
             pass
 
+    # §15 计算执行策略（替代 domain 做路由决策）
+    # traced: 金融领域，走 TraceCollector + EvalNode 树
+    # chain:  有固定链路匹配，走 ChainExecutor
+    # direct: 其他，走 agent 自由推理
+    if domain == "finance":
+        strategy = "traced"
+    elif domain == "trading":
+        strategy = "traced"  # 交易域也走追踪
+    else:
+        strategy = "direct"
+
     logger.info(
-        "[Intent] LLM 分类: %s/%s (%.2f) verb=%s noun=%s stock=%s | %s",
+        "[Intent] LLM 分类: %s/%s (%.2f) verb=%s noun=%s stock=%s strategy=%s | %s",
         domain, intent, confidence, verb, noun,
         stock_code or stock_name or "-",
+        strategy,
         message[:50],
     )
 
@@ -388,6 +402,7 @@ def analyze_intent(
         verb=verb,
         noun=noun,
         context_summary=new_summary,
+        strategy=strategy,
     )
 
 

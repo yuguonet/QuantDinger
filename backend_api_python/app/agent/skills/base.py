@@ -56,6 +56,7 @@ class BaseSkill(ABC):
     instructions: str = ""   # @skill 装饰器注入的 LLM 指令
     priority: int = 0
     default_weight: float = 1.0  # 出厂权重，无历史数据时 fallback
+    tags: List[str] = []     # 标签（替代 domain，多值列表，如 ["finance", "technical"]）
 
     def __init__(self):
         pass  # 无实例状态，run() 使用局部变量

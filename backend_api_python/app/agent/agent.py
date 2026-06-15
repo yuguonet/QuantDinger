@@ -627,6 +627,7 @@ def get_smolagent(
     intent_context: str = "",
     tool_categories: Optional[List[str]] = None,
     collector=None,  # TraceCollector（金融领域注入）
+    strategy: str = "direct",  # §15: 执行策略
 ) -> "CodeAgent | ToolCallingAgent":
     """Build a fresh agent instance per call.
 
@@ -677,8 +678,9 @@ def get_smolagent(
             "datetime", "collections", "itertools", "re",
         ]
 
-    # 金融领域用 JSON 校验，其他领域用宽松校验
-    checks = [_check_output_json] if domain == "finance" else [_check_dashboard_json]
+    # §15: 用 strategy 替代 domain 做 JSON 校验决策
+    # traced 策略 → 强制 JSON 校验；其他 → 宽松校验
+    checks = [_check_output_json] if strategy == "traced" else [_check_dashboard_json]
 
     agent = AgentClass(
         tools=tools,
@@ -759,6 +761,7 @@ class _AgentExecutor:
         domain = ""
         domain_instructions = ""
         tool_categories = None
+        strategy = "direct"  # §15: 执行策略（替代 domain 做路由决策）
         # skip_agent: 意图明确且不需要工具时（如打招呼），直接返回，不进 agent
         skip_agent = False
         skip_agent_reply = ""
@@ -776,18 +779,20 @@ class _AgentExecutor:
                     history=history,
                 )
                 domain = intent.domain
+                strategy = intent.strategy  # §15: 从 intent 获取策略
                 domain_instructions = intent.domain_instructions
                 tool_categories = intent.tool_categories or None
                 intent_context = format_intent_for_agent(intent, message)
                 logger.info(
-                    "[Intent] domain=%s intent=%s confidence=%.2f categories=%s",
-                    intent.domain, intent.intent, intent.confidence,
+                    "[Intent] domain=%s strategy=%s intent=%s confidence=%.2f categories=%s",
+                    domain, strategy, intent.intent, intent.confidence,
                     intent.tool_categories or [],
                 )
                 # Update tool context with domain for per-domain workspace isolation
                 from app.agent.tool_context import get_tool_context
                 _ctx = get_tool_context()
                 _ctx["domain"] = domain
+                _ctx["strategy"] = strategy
                 set_tool_context(_ctx)
 
                 # ── 闲聊/greeting 快速通道：跳过 agent，直接回复 ──
@@ -832,7 +837,8 @@ class _AgentExecutor:
             return store, None, message, {"skip_agent": True, "skip_agent_reply": skip_agent_reply}
 
         # ── 金融域：从消息中提取 stock_code（_try_chain 被跳过，需要在此提取）──
-        if domain == "finance" and not (context and context.get("stock_code")):
+        # §15: 用 strategy="traced" 替代 domain="finance" 做路由判断
+        if strategy == "traced" and not (context and context.get("stock_code")):
             import re as _re_stock
             # 1. 6位数字代码
             _m = _re_stock.search(r'\b(\d{6})\b', message)
@@ -862,9 +868,10 @@ class _AgentExecutor:
             _eval_noun = getattr(intent, 'noun', '') or ""
             _eval_tool_chain = (getattr(intent, 'metadata', None) or {}).get("tool_chain", [])
 
-        # ── 创建 TraceCollector（金融领域注入）─────────────────
+        # ── 创建 TraceCollector（策略触发，非领域绑定）──────────
+        # §15: 用 strategy="traced" 替代 domain="finance"
         collector = None
-        if domain == "finance":
+        if strategy == "traced":
             collector = TraceCollector(session_id=session_id, user_query=message)
             collector.intent_verb = _eval_verb
             collector.intent_noun = _eval_noun
@@ -946,6 +953,7 @@ class _AgentExecutor:
             intent_context=intent_context,
             tool_categories=tool_categories,
             collector=collector,
+            strategy=strategy,
         )
 
         store.add_message(session_id, "user", message)
@@ -962,6 +970,7 @@ class _AgentExecutor:
             "intent_verb": _eval_verb, "intent_noun": _eval_noun,
             "tool_chain": _eval_tool_chain,
             "domain": domain,
+            "strategy": strategy,  # §15
             "collector": collector,
         }
 
@@ -999,6 +1008,7 @@ class _AgentExecutor:
         _intent_noun = meta.get("intent_noun", "")
         _tool_chain = meta.get("tool_chain", [])
         _eval_domain = meta.get("domain", "")
+        _eval_strategy = meta.get("strategy", "direct")  # §15
         collector = meta.get("collector")
 
         # ── Chain 优先：verb+noun 匹配链路 → ChainExecutor ──
@@ -1065,7 +1075,8 @@ class _AgentExecutor:
             store.add_message(session_id, "assistant", content if isinstance(content, str) else str(content))
 
             # ── 金融领域：JSON → TraceCollector 存库 → format_decision_card ──
-            if success and content and collector and _eval_domain == "finance":
+            # ── §15: 用 strategy 替代 domain 做 DecisionCard 路由 ──
+            if success and content and collector and _eval_strategy == "traced":
                 try:
                     import json as _json_card
                     import re as _re_card
@@ -1551,9 +1562,11 @@ class _AgentExecutor:
                     store.add_message(session_id, "assistant", content if isinstance(content, str) else str(content))
 
                     # ── 金融领域：JSON → TraceCollector 存库 → format_decision_card ──
+                    # ── §15: 用 strategy 替代 domain 做 DecisionCard 路由 ──
                     _stream_domain = meta.get("domain", "")
+                    _stream_strategy = meta.get("strategy", "direct")
                     _stream_collector = meta.get("collector")
-                    if content and _stream_collector and _stream_domain == "finance":
+                    if content and _stream_collector and _stream_strategy == "traced":
                         try:
                             import json as _json_sc
                             import re as _re_sc

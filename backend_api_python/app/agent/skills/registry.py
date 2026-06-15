@@ -53,6 +53,7 @@ def skill(
     instructions: str = "",
     priority: int = 0,
     default_weight: float = 1.0,
+    tags: List[str] = None,
 ) -> Callable:
     """装饰器：将普通类转换为 BaseSkill 子类并自动注册。
 
@@ -61,6 +62,7 @@ def skill(
             name="technical_agent",
             description="A股技术面+动量分析专家",
             tools=["analyze_trend", "get_indicator_snapshot"],
+            tags=["finance", "technical"],
             priority=9,
         )
         class TechnicalSkill:
@@ -77,11 +79,13 @@ def skill(
         tools: 依赖的工具名列表
         instructions: 给 LLM 的指令（注入到 prompt 中）
         priority: 优先级（越高越先执行）
+        tags: 标签列表（替代 domain，多值，如 ["finance", "technical"]）
 
     Returns:
         装饰器函数
     """
     tools = tools or []
+    tags = tags or []
 
     # normalize: 如果 instructions 因尾部逗号变成 tuple，还原为 str
     if isinstance(instructions, (list, tuple)):
@@ -100,6 +104,7 @@ def skill(
             "instructions": instructions,
             "priority": priority,
             "default_weight": default_weight,
+            "tags": list(tags),
             # 保留原始类的模块和限定名
             "__module__": cls.__module__,
             "__qualname__": cls.__qualname__,
@@ -216,6 +221,23 @@ class SkillRegistry:
     @property
     def all_names(self) -> List[str]:
         return list(self._skills.keys())
+
+    def get_by_tag(self, tag: str) -> List[BaseSkill]:
+        """按标签过滤 Skill。"""
+        return [
+            self.get(name)
+            for name, cls in self._skills.items()
+            if tag in getattr(cls, "tags", [])
+        ]
+
+    def get_by_tags(self, tags: List[str]) -> List[BaseSkill]:
+        """按多个标签过滤（OR 语义，命中任一标签即返回）。"""
+        tag_set = set(tags)
+        return [
+            self.get(name)
+            for name, cls in self._skills.items()
+            if tag_set & set(getattr(cls, "tags", []))
+        ]
 
     def __len__(self):
         return len(self._skills)

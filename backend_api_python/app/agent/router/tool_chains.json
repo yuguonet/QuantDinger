@@ -7,10 +7,10 @@
             }
         ],
         "stats": {
-            "avg_steps": 3.92,
-            "executions": 13,
+            "avg_steps": 4.43,
+            "executions": 14,
             "success_count": 12,
-            "success_rate": 0.923,
+            "success_rate": 0.857,
             "last_updated": "2026-06-15"
         }
     },
