@@ -18,8 +18,16 @@ import threading
 import time
 import logging
 import atexit
+from collections import OrderedDict
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
+
+# ============================================================
+#  缓存硬上限
+# ============================================================
+_CACHE_STORE_MAX = 200          # _cache_store 最多保留 200 个 endpoint
+_RT_SECTOR_HISTORY_MAX_DAYS = 250   # 板块历史最多 250 天
+_RT_EMOTION_HISTORY_MAX_HOURS = 168  # 情绪历史最多 7 天
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +57,7 @@ _DEFAULT_CFG = {"ttl": 120, "refresh": 90}
 # ============================================================
 
 _CACHE_FILE = None
-_cache_store = {}    # {endpoint: {"data": ..., "ts": float}}
+_cache_store = OrderedDict()  # {endpoint: {"data": ..., "ts": float}} — LRU 顺序
 _cache_lock = threading.Lock()
 _cache_dirty = False  # 延迟写标记，避免每次 put 都 pickle
 
@@ -74,10 +82,16 @@ def _cache_load():
         return
     try:
         with open(path, "rb") as f:
-            _cache_store = pickle.load(f)
+            loaded = pickle.load(f)
+        # 转为 OrderedDict，淘汰超限条目
+        if isinstance(loaded, dict):
+            _cache_store = OrderedDict(loaded)
+            _cache_evict()
+        else:
+            _cache_store = OrderedDict()
     except Exception as e:
         logger.warning("加载缓存文件失败: %s", e)
-        _cache_store = {}
+        _cache_store = OrderedDict()
 
 
 def _cache_save():
@@ -114,12 +128,25 @@ def cache_is_stale(endpoint):
     return (time.time() - entry.get("ts", 0)) >= cfg["refresh"]
 
 
+def _cache_evict():
+    """淘汰超限条目（LRU：淘汰最旧的 20%）。调用方需持有 _cache_lock。"""
+    if len(_cache_store) <= _CACHE_STORE_MAX:
+        return
+    evict_count = max(1, len(_cache_store) // 5)
+    for _ in range(evict_count):
+        _cache_store.popitem(last=False)  # FIFO：淘汰最旧的
+    logger.info("[cache] 淘汰 %d 个旧条目，剩余 %d", evict_count, len(_cache_store))
+
+
 def cache_put(endpoint, data):
     """写缓存: 更新内存 + 标记脏（延迟写盘）。"""
     global _cache_dirty
     ts = time.time()
     with _cache_lock:
+        # 先删后插，保证 LRU 顺序（最新在末尾）
+        _cache_store.pop(endpoint, None)
         _cache_store[endpoint] = {"data": data, "ts": ts}
+        _cache_evict()
         _cache_dirty = True
 
 
@@ -258,7 +285,7 @@ def get_hot_sectors(industry_limit=15, concept_limit=15) -> dict:
 
 def get_sector_trend(board_type="industry") -> dict:
     """板块1个月趋势 + 6个月周期 + 预测"""
-    _rt_max_sector_trend_days[board_type] = max(_rt_max_sector_trend_days.get(board_type, 0), 30)  # ① 峰值
+    _rt_max_sector_trend_days[board_type] = min(max(_rt_max_sector_trend_days.get(board_type, 0), 30), 60)  # ① 峰值（上限 60 天）
     cached = _rt_sector_trend.get(board_type)                          # ② 内存缓存
     if cached:
         return cached
@@ -275,7 +302,7 @@ def get_sector_prediction() -> dict:
 
 def get_sector_cycle(board_type="industry") -> dict:
     """板块6个月周期分析"""
-    _rt_max_sector_cycle_days[board_type] = max(_rt_max_sector_cycle_days.get(board_type, 0), 180)  # ① 峰值
+    _rt_max_sector_cycle_days[board_type] = min(max(_rt_max_sector_cycle_days.get(board_type, 0), 180), 365)  # ① 峰值（上限 365 天）
     cached = _rt_sector_cycle.get(board_type)                          # ② 内存缓存
     if cached:
         return cached
@@ -298,7 +325,7 @@ def get_sector_stocks(board_code: str, limit=15) -> dict:
 def get_sector_history(board_type="industry", days=30) -> dict:
     """板块历史排名数据"""
     global _rt_max_sector_history_days
-    _rt_max_sector_history_days = max(_rt_max_sector_history_days, days)  # ① 峰值
+    _rt_max_sector_history_days = min(max(_rt_max_sector_history_days, days), _RT_SECTOR_HISTORY_MAX_DAYS)  # ① 峰值（有上限）
     cached = _rt_sector_history.get(board_type)                           # ② 内存缓存
     if cached:
         return {"code": 1, "msg": "success", "count": len(cached), "data": cached}
@@ -316,7 +343,7 @@ def get_emotion_history(hours=None, date=None) -> dict:
     """情绪指数历史数据（当天快照）"""
     if hours:
         global _rt_max_emotion_history_hours
-        _rt_max_emotion_history_hours = max(_rt_max_emotion_history_hours, hours)  # ① 峰值
+        _rt_max_emotion_history_hours = min(max(_rt_max_emotion_history_hours, hours), _RT_EMOTION_HISTORY_MAX_HOURS)  # ① 峰值（有上限）
     if _rt_emotion_history is not None:                                           # ② 内存缓存
         return _rt_emotion_history
     from .emotion import get_emotion_history as _get                              # ③ 原有逻辑

@@ -31,7 +31,7 @@ def read_tool_chain(verb: str, noun: str) -> Dict[str, Any]:
         verb: 动作类别（analyze/view/modify/create/filter/backtest/execute/explain/query）
         noun: 对象类别（stock/chart/market/code/project/indicator/strategy/fund_flow/trading/screener/concept）
     """
-    from app.agent.router.tool_chains import get_tool_chain
+    from app.agent.chain.tool_chains import get_tool_chain
     chain = get_tool_chain(verb, noun)
     return {
         "key": f"{verb}+{noun}",
@@ -57,7 +57,7 @@ def write_tool_chain(verb: str, noun: str, chain: List[Dict[str, str]]) -> Dict[
     if not verb or not noun:
         return {"error": "verb 和 noun 不能为空", "saved": False}
 
-    from app.agent.router.tool_chains import save_tool_chain
+    from app.agent.chain.tool_chains import save_tool_chain
     save_tool_chain(verb, noun, chain)
     return {
         "key": f"{verb}+{noun}",
@@ -74,7 +74,7 @@ def write_tool_chain(verb: str, noun: str, chain: List[Dict[str, str]]) -> Dict[
 )
 def list_tool_chains() -> Dict[str, Any]:
     """列出所有已配置的工具链。"""
-    from app.agent.router.tool_chains import list_all_chains
+    from app.agent.chain.tool_chains import list_all_chains
     all_chains = list_all_chains()
     return {
         "total": len(all_chains),

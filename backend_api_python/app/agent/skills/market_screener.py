@@ -624,11 +624,11 @@ def _deep_analyze_intraday(
     """盘中 — 对单只候选股做深入分析。"""
     code = candidate["code"]
     try:
-        fund_flow = call_tool_fn("get_fund_flow_realtime", stock_code=code)
+        fund_flow = call_tool_fn("get_fund_flow", stock_codes=code)
         snapshot = call_tool_fn("get_indicator_snapshot", stock_code=code)
 
         if _tool_calls is not None:
-            for t in ["get_fund_flow_realtime", "get_indicator_snapshot"]:
+            for t in ["get_fund_flow", "get_indicator_snapshot"]:
                 if t not in _tool_calls:
                     _tool_calls.append(t)
 
@@ -915,10 +915,10 @@ def _deep_analyze_eod(
     code = candidate["code"]
     try:
         snapshot = call_tool_fn("get_indicator_snapshot", stock_code=code)
-        fund_flow = call_tool_fn("get_fund_flow_realtime", stock_code=code)
+        fund_flow = call_tool_fn("get_fund_flow", stock_codes=code)
 
         if _tool_calls is not None:
-            for t in ["get_indicator_snapshot", "get_fund_flow_realtime"]:
+            for t in ["get_indicator_snapshot", "get_fund_flow"]:
                 if t not in _tool_calls:
                     _tool_calls.append(t)
 
@@ -1292,10 +1292,10 @@ def _deep_analyze_post_market(
     code = candidate["code"]
     try:
         snapshot = call_tool_fn("get_indicator_snapshot", stock_code=code)
-        fund_flow = call_tool_fn("get_fund_flow_realtime", stock_code=code)
+        fund_flow = call_tool_fn("get_fund_flow", stock_codes=code)
 
         if _tool_calls is not None:
-            for t in ["get_indicator_snapshot", "get_fund_flow_realtime"]:
+            for t in ["get_indicator_snapshot", "get_fund_flow"]:
                 if t not in _tool_calls:
                     _tool_calls.append(t)
 
@@ -1435,21 +1435,22 @@ class MarketScreenerSkill:
         logger.info("[MktScreen] 当前策略: %s", strategy)
 
         if strategy == "intraday":
-            return self._run_intraday(
-                date, call_tool_fn, _tool_calls, _tool_nodes, _missing_data,
+            return _run_intraday(
+                self.name, date, call_tool_fn, _tool_calls, _tool_nodes, _missing_data,
             )
         elif strategy == "eod":
-            return self._run_eod(
-                call_tool_fn, _tool_calls, _tool_nodes, _missing_data,
+            return _run_eod(
+                self.name, call_tool_fn, _tool_calls, _tool_nodes, _missing_data,
             )
         else:
-            return self._run_post_market(
-                date, call_tool_fn, _tool_calls, _tool_nodes, _missing_data,
+            return _run_post_market(
+                self.name, date, call_tool_fn, _tool_calls, _tool_nodes, _missing_data,
             )
 
-    # ── 盘中策略 ──
+# ── 盘中策略 ──
 
-    def _run_intraday(self, date, call_tool_fn, _tool_calls, _tool_nodes, _missing_data):
+
+def _run_intraday(skill_name, date, call_tool_fn, _tool_calls, _tool_nodes, _missing_data):
         try:
             prescreen = _prescreen_intraday(date)
         except Exception as e:
@@ -1467,7 +1468,7 @@ class MarketScreenerSkill:
 
         if market["mood_score"] < 30:
             return SkillReport(
-                skill_name=self.name, score=25.0, direction="bearish",
+                skill_name=skill_name, score=25.0, direction="bearish",
                 confidence=0.7,
                 signal=f"市场冰点（涨停{market['zt_count']}跌停{market['dt_count']}），不宜短线",
                 analysis=(
@@ -1486,7 +1487,7 @@ class MarketScreenerSkill:
 
         if not candidates:
             return SkillReport(
-                skill_name=self.name, score=45.0, direction="neutral",
+                skill_name=skill_name, score=45.0, direction="neutral",
                 confidence=0.5, signal="今日无明确短线标的",
                 analysis=(
                     f"## 盘中短线选股 — 无明确标的\n\n"
@@ -1574,7 +1575,7 @@ class MarketScreenerSkill:
             )
 
         return SkillReport(
-            skill_name=self.name, score=round(avg_score, 1),
+            skill_name=skill_name, score=round(avg_score, 1),
             direction=direction, confidence=confidence,
             signal=f"短线{bullish}只看多候选，主线:{', '.join(t for t, _ in main_themes[:2]) or '无'}",
             factors=factors, analysis="\n".join(lines),
@@ -1589,9 +1590,10 @@ class MarketScreenerSkill:
             status="ok",
         )
 
-    # ── 尾盘策略 ──
+# ── 尾盘策略 ──
 
-    def _run_eod(self, call_tool_fn, _tool_calls, _tool_nodes, _missing_data):
+
+def _run_eod(skill_name, call_tool_fn, _tool_calls, _tool_nodes, _missing_data):
         try:
             prescreen = _prescreen_eod(call_tool_fn)
         except Exception as e:
@@ -1606,7 +1608,7 @@ class MarketScreenerSkill:
 
         if not candidates:
             return SkillReport(
-                skill_name=self.name, score=40.0, direction="neutral",
+                skill_name=skill_name, score=40.0, direction="neutral",
                 confidence=0.5, signal="今日无合适隔夜标的",
                 analysis=(
                     f"## 尾盘选股 — 无合适标的\n\n"
@@ -1678,7 +1680,7 @@ class MarketScreenerSkill:
                 )
 
         return SkillReport(
-            skill_name=self.name, score=round(avg_score, 1),
+            skill_name=skill_name, score=round(avg_score, 1),
             direction=direction, confidence=confidence,
             signal=f"隔夜{bullish}只看多，主线:{', '.join(t for t, _ in main_themes[:2]) or '无'}",
             factors=factors, analysis="\n".join(lines),
@@ -1692,9 +1694,10 @@ class MarketScreenerSkill:
             status="ok",
         )
 
-    # ── 盘后策略 ──
+# ── 盘后策略 ──
 
-    def _run_post_market(self, date, call_tool_fn, _tool_calls, _tool_nodes, _missing_data):
+
+def _run_post_market(skill_name, date, call_tool_fn, _tool_calls, _tool_nodes, _missing_data):
         try:
             prescreen = _prescreen_post_market(date)
         except Exception as e:
@@ -1709,7 +1712,7 @@ class MarketScreenerSkill:
 
         if not candidates:
             return SkillReport(
-                skill_name=self.name, score=40.0, direction="neutral",
+                skill_name=skill_name, score=40.0, direction="neutral",
                 confidence=0.5, signal="今日无符合形态的短线标的",
                 analysis=(
                     f"## 盘后短线选股 — 无合适标的\n\n"
@@ -1785,7 +1788,7 @@ class MarketScreenerSkill:
                 )
 
         return SkillReport(
-            skill_name=self.name, score=round(avg_score, 1),
+            skill_name=skill_name, score=round(avg_score, 1),
             direction=direction, confidence=confidence,
             signal=f"盘后{len(analyzed)}只候选，主线:{', '.join(t for t, _ in main_themes[:2]) or '无'}",
             factors=factors, analysis="\n".join(lines),

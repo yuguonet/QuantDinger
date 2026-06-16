@@ -577,7 +577,7 @@ def get_index_daily_kline(code: str = "000001", days: int = 200) -> List[Dict[st
         >>> get_index_daily_kline("000300", 60)  # 沪深300最近60个交易日
     """
     global _rt_max_idx_daily_days
-    _rt_max_idx_daily_days = max(_rt_max_idx_daily_days, days)       # ① 峰值
+    _rt_max_idx_daily_days = min(max(_rt_max_idx_daily_days, days), _RT_MAX_IDX_DAILY_DAYS)  # ① 峰值（有上限）
     cached = _rt_idx_daily.get(code)                 # ② 内存缓存
     if cached and len(cached) >= days:
         return cached[:days]
@@ -771,7 +771,7 @@ def get_northbound_daily(days: int = 120, force: bool = False) -> List[Dict[str,
         ...     print(f"{d['date']}: 合计 {d['total_yi']:.2f} 亿")
     """
     global _rt_max_nb_daily_days, _rt_nb_daily
-    _rt_max_nb_daily_days = max(_rt_max_nb_daily_days, days)
+    _rt_max_nb_daily_days = min(max(_rt_max_nb_daily_days, days), _RT_MAX_NB_DAILY_DAYS)
 
     # 首次调用时从文件缓存加载
     if _rt_nb_daily is None:
@@ -926,7 +926,7 @@ def get_northbound_holdings(top: int = 50) -> List[Dict[str, Any]]:
         ...     print(f"{h['name']}: {h['hold_market']/1e8:.0f}亿 占比{h['hold_ratio']}%")
     """
     global _rt_max_nb_holdings_top
-    _rt_max_nb_holdings_top = max(_rt_max_nb_holdings_top, top)
+    _rt_max_nb_holdings_top = min(max(_rt_max_nb_holdings_top, top), _RT_MAX_NB_HOLDINGS_TOP)
     if _rt_nb_holdings and len(_rt_nb_holdings) >= top:
         return _rt_nb_holdings[:top]
 
@@ -1450,7 +1450,7 @@ def get_market_fund_flow_daily(days: int = 120) -> List[Dict[str, Any]]:
         ...     print(f"{d['date']}: 主力 {d['main_net']/1e8:.2f} 亿")
     """
     global _rt_max_mf_daily_days
-    _rt_max_mf_daily_days = max(_rt_max_mf_daily_days, days)  # ① 峰值
+    _rt_max_mf_daily_days = min(max(_rt_max_mf_daily_days, days), _RT_MAX_MF_DAILY_DAYS)  # ① 峰值（有上限）
     if _rt_mf_daily and len(_rt_mf_daily) >= days:            # ② 内存缓存
         return _rt_mf_daily[:days]
     data = _mkt_flow_daily_eastmoney(days)                    # ③ 远端 fallback
@@ -1706,6 +1706,12 @@ _rt_nb_holdings = None
 _rt_mf_realtime = None
 _rt_mf_daily = None
 _rt_sector_flow = None
+
+# 峰值硬上限（防止刷新时无限增长）
+_RT_MAX_IDX_DAILY_DAYS = 750       # 指数日K最多 3 年
+_RT_MAX_NB_DAILY_DAYS = 250        # 北向日K最多 1 年
+_RT_MAX_NB_HOLDINGS_TOP = 200      # 北向持仓最多 Top 200
+_RT_MAX_MF_DAILY_DAYS = 750        # 主力资金日K最多 3 年
 
 _rt_max_idx_daily_days = 0
 _rt_max_nb_daily_days = 0

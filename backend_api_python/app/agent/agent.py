@@ -123,12 +123,16 @@ def _generate_tool_catalog(tools, managed_agents) -> str:
     return "\n".join(lines)
 
 
-# ── GUIDANCE loaded from skills.guidance ──
-from app.agent.skills.guidance import GUIDANCE
+
 
 
 def _load_preamble() -> str:
-    """从 persona.md 加载 Agent 人设。"""
+    """从 persona.md 加载前导词（人设 + 行为规范）。"""
+    from app.agent.semantics import get_persona_body
+    body = get_persona_body()
+    if body:
+        return body
+    # fallback
     from app.agent.semantics import get_persona
     persona = get_persona()
     if persona and persona.role:
@@ -278,28 +282,29 @@ final_answer({{
         except Exception:
             pass  # 权重注入失败不影响主流程
 
+    # 从 semantics 加载 guidance 和 rules
+    guidance_text = ""
+    try:
+        from app.agent.semantics import get_guidance_text
+        _g = get_guidance_text()
+        if _g:
+            guidance_text = f"\n{_g}\n"
+    except Exception:
+        pass
+
+    rules_text = ""
+    try:
+        from app.agent.semantics import get_rules_text
+        _r = get_rules_text()
+        if _r:
+            rules_text = f"\n{_r}\n"
+    except Exception:
+        pass
+
     return f"""{preamble}
-
-{GUIDANCE}
+{guidance_text}
 {tool_catalog}
-{skill_section}{scan_section}{modify_section}{intent_section}{domain_section}{calibration_section}{weight_section}## 规则
-
-0. **⚠️ 必须用 final_answer() 返回结果** — 完成任务后，必须调用 `final_answer(你的回复)` 来结束。
-1. **不需要工具的消息，第一步就 final_answer** — 打招呼、闲聊等直接调用 final_answer。
-1b. **⚠️ 任务完成即 final_answer** — 工具调用成功返回结果后（如创建定时任务、查询完成），立即调用 final_answer 返回确认信息。不要等待后续事件（如定时任务触发），那由系统自动处理。
-2. **必须调用工具获取真实数据** — 绝不编造数字。
-3. **⚠️ call_skill 是调用所有技能的唯一入口** — 选股用 `call_skill(skill_name="short_term_screener", stock_code="")`，个股分析用 `call_skill(skill_name="technical_agent", stock_code="代码")`。不能把技能名当 Python 函数直接调用。
-4. **深度优先** — 分析深度不够时用 Python 代码做量化分析。
-5. **风险优先** — 分析必须包含风险提示。
-6. **工具失败处理** — 记录失败原因，用已有数据继续，不重复调用。
-7. **多维验证** — 技术面结论至少 2 个指标相互验证。
-8. **善用工具** — 可以组合工具做计算、处理数据。
-9. **诚实透明** — 数据不足时明确告知。
-9. **⚠️ 数据完整性** — 如果某个工具调用失败（返回 error），必须在结论中说明
-   "XX数据缺失，以下结论仅供参考"。绝不用想象填补缺失数据。
-10. **⚠️ 确定性输出** — 你的分析必须基于工具返回的客观数据，不能因为"感觉"
-    或"可能"而改变方向性判断。同样的数据必须得出同样的结论。
-{finance_json_section}{lang_section}"""
+{skill_section}{scan_section}{modify_section}{intent_section}{domain_section}{calibration_section}{weight_section}{rules_text}{finance_json_section}{lang_section}"""
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1251,7 +1256,7 @@ class _AgentExecutor:
         try:
             from app.agent.session_store import get_session_store
             store = get_session_store()
-            from app.agent.router.tool_chains import detect_feedback_severity, penalize_chain
+            from app.agent.chain.tool_chains import detect_feedback_severity, penalize_chain
             from app.agent.chain import store as chain_store
 
             severity = detect_feedback_severity(message)

@@ -100,6 +100,16 @@ def get_chain_for_intent(verb: str, noun: str) -> Optional[ChainDef]:
     return None
 
 
+def get_all_chains_for_noun(noun: str) -> List[ChainDef]:
+    """按 noun 查找所有匹配的链路（用于降级匹配）。"""
+    load_chains_from_yaml()
+    matches = []
+    for chain in _CHAIN_REGISTRY.values():
+        if noun in chain.trigger_nouns:
+            matches.append(chain)
+    return matches
+
+
 def list_chains() -> List[ChainDef]:
     """列出所有已注册链路。"""
     load_chains_from_yaml()

@@ -37,9 +37,7 @@ class CallSkillTool(Tool):
             "type": "string",
             "description": (
                 "技能名。可选值: "
-                "short_term_screener(盘中短线选股，仅限9:30-14:30使用，全市场扫描，不需要stock_code), "
-                "post_market_screener(盘后短线选股，15:00后使用，找次日介入点，不需要stock_code), "
-                "eod_screener(尾盘选股，14:30-15:00使用，隔夜持仓，不需要stock_code), "
+                "market_screener(短线选股首选,全市场扫描，不需要stock_code), "
                 "screening_agent(通用选股), "
                 "technical_agent(技术面+动量, 需要stock_code), "
                 "indicator_agent(指标), "

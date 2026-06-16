@@ -2,7 +2,7 @@
 name: screening_agent
 tags: [finance, screening]
 description: 选股专家。负责条件选股、动量筛选、概念选股、龙虎榜、涨停池、热榜、指标验证。
-priority: 8
+priority: 5
 default_weight: 1.0
 standard_output: true
 tools:

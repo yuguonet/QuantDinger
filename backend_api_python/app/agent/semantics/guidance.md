@@ -1,12 +1,4 @@
-# -*- coding: utf-8 -*-
-"""
-Guidance — 全局行为规则（粗粒化版本）。
-
-每个 Skill 的具体工作流程定义在 semantics/skills/*.md 中。
-此处仅保留跨所有 Skill 的全局原则。
-"""
-
-GUIDANCE = """## 核心哲学：价格折扣一切
+## 核心哲学：价格折扣一切
 
 价格数据是所有信息的"共识结果"——政策、消息、基本面、资金最终都反映在价格和成交量上。
 分析必须**从客观数据出发**，而非从消息/新闻出发。
@@ -38,4 +30,3 @@ GUIDANCE = """## 核心哲学：价格折扣一切
 - 选股 → `call_skill(skill_name="screener", stock_code="")`
 - 不能把技能名当函数直接调用
 - 每个 Skill 的详细说明见其对应的 semantics/skills/*.md
-"""

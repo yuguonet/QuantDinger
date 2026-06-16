@@ -350,6 +350,37 @@ def get_all_chain_metas() -> Dict[str, ChainMeta]:
     return dict(_chains)
 
 
+def get_persona_body() -> str:
+    """返回 persona.md 的 Markdown body（不含 frontmatter）。"""
+    load_semantics()
+    persona_path = _SEMANTICS_DIR / "persona.md"
+    if not persona_path.exists():
+        return ""
+    content = persona_path.read_text(encoding="utf-8")
+    _, body = _parse_skill_md(content)
+    return body
+
+
+def get_guidance_text() -> str:
+    """返回 guidance.md 的 Markdown body。"""
+    guidance_path = _SEMANTICS_DIR / "guidance.md"
+    if not guidance_path.exists():
+        return ""
+    content = guidance_path.read_text(encoding="utf-8")
+    _, body = _parse_skill_md(content)
+    return body
+
+
+def get_rules_text() -> str:
+    """返回 rules.md 的 Markdown body。"""
+    rules_path = _SEMANTICS_DIR / "rules.md"
+    if not rules_path.exists():
+        return ""
+    content = rules_path.read_text(encoding="utf-8")
+    _, body = _parse_skill_md(content)
+    return body
+
+
 # ═══════════════════════════════════════════════════════════════
 # Summary generators (for system prompt injection)
 # ═══════════════════════════════════════════════════════════════

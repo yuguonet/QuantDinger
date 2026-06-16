@@ -345,7 +345,7 @@ def analyze_intent(
     tool_chain = []
     if verb and noun:
         try:
-            from app.agent.router.tool_chains import get_tool_chain
+            from app.agent.chain.tool_chains import get_tool_chain
             tool_chain = get_tool_chain(verb, noun)
         except Exception:
             pass
@@ -424,7 +424,7 @@ def format_intent_for_agent(intent: IntentResult, original_message: str) -> str:
     if tool_chain:
         # 获取链路统计
         try:
-            from app.agent.router.tool_chains import get_chain_stats
+            from app.agent.chain.tool_chains import get_chain_stats
             _stats = get_chain_stats(intent.verb or "", intent.noun or "")
         except Exception:
             _stats = {}
@@ -458,6 +458,6 @@ def format_intent_for_agent(intent: IntentResult, original_message: str) -> str:
             or "选股" in original_message or "买什么" in original_message
             or "推荐" in original_message):
         if not intent.params.get("stock"):  # 没给具体股票代码
-            parts.append("⚠️ 用户未指定股票代码，这是选股/推荐场景。你必须使用 short_term_screener（短线选股）或 screening_agent（通用选股），禁止用 technical_agent 分析任意股票。")
+            parts.append("⚠️ 用户未指定股票代码，这是选股/推荐场景。你必须使用 market_screener（短线选股）或 screening_agent（通用选股），禁止用 technical_agent 分析任意股票。")
 
     return "\n".join(parts)

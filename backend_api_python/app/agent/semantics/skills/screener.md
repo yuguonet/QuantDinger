@@ -3,19 +3,18 @@
 names:
   - market_screener
 tags: [finance, screener]
-priority: 8
+priority: 9
 default_weight: 1.0
 standard_output: true
 tools:
   - search_stocks
   - get_indicator_snapshot
-  - get_fund_flow_realtime
+  - get_fund_flow
   - get_fund_flow_minute
   - get_market_indices
   - get_limit_pool
   - get_hot_sectors
   - get_hot_stocks_with_reason
-  - agent_technical_analysis
   - get_realtime_quote
   - agent_get_kline
   - search_stock_by_name
@@ -24,18 +23,11 @@ tools:
 
 # 选股技能
 
-统一的 A 股选股技能，根据当前交易时间段自动切换策略（盘中短线/尾盘隔夜/盘后复盘），无需用户指定时段。
+统一的 A 股选股技能，根据当前交易时间段自动切换策略（盘中短线/尾盘隔夜/盘后复盘）。
 
 ## 自动策略调度
 
-系统按当前时间自动选择策略，LLM 不需要手动匹配时段：
-
-| 策略 | 时间 | 核心方法 |
-|------|------|---------|
-| 盘中短线 | 9:30-14:29 | 涨停池连板 + 热门板块龙头 + 龙回头弱转强 + 题材归因 |
-| 尾盘隔夜 | 14:30-15:00 | 条件初筛 + 收盘位置验证 + 尾盘封板抢筹 |
-| 盘后复盘 | 15:00+ / 非交易日 | 技术形态筛选（平台突破/底部放量/均线回踩/MACD金叉等）+ 介入点计算 |
-
+系统按当前时间自动选择策略
 ## 各策略说明
 
 ### 盘中短线（intraday）

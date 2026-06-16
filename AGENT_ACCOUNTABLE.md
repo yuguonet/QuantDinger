@@ -1830,3 +1830,186 @@ semantics/
 | AGENT_ACCOUNTABLE §六 JSON 标准化输出 | 不变 |
 | AGENT_ACCOUNTABLE §七 instructions 注入 | 改为两段加载，不再按 domain 整段注入 |
 | AGENT_ACCOUNTABLE §十一 Domain 隔离方案 | **被本节替代** |
+
+## 十六、四个闭环
+
+> 日期: 2026-06-16
+> 状态: 已验证，代码已实现
+
+### 总览
+
+```
+用户消息 ──→ Agent 处理 ──→ 返回用户
+                │
+                ├──→ 在线评估 ──→ 学习闭环（写 tool_chains）
+                │
+                ├──→ 写入 DB（EvalNode 树）
+                │         │
+                │         └──→ 异步回测闭环（T+N 验证 → 权重迭代）
+                │
+                └──→ 用户反馈 ──→ 惩罚闭环（负面 → 扣减/删除链路）
+
+意图分析 ──→ 编排闭环（读 tool_chains → 编排执行）
+```
+
+### 16.1 学习闭环
+
+**流程**: Agent 自由发挥 → 在线评估 → 写入 tool_chains.json
+
+**触发**: 每次 `agent.run()` 结束后自动调用（`_post_evaluate()`）
+
+**实现**:
+- `evaluator.py:evaluate()` — 纯规则评估（<1ms，0 token）
+  - 工具调用成功率
+  - 工具链遵循度（实际调用 vs 预期 chain 匹配度）
+  - 步骤效率（实际步数 vs chain 长度）
+  - final_answer 是否生成
+  - 响应是否包含实际数据
+- `evaluator.py:learn_from_execution()` — 闭环动作
+  - success + agent 遵循 chain → `update_chain_stats()` 强化统计
+  - success + agent 偏离 chain → 质量门检查 → 通过后才 `save_tool_chain()`
+  - failure → `_record_failure()` 写入 tool_chain_failures.json
+- `evaluator.py:_writeback_chain()` — 质量门（5 项拦截，全部放行才写入）
+  1. 步数 > 5 → 拦截（太低效）
+  2. 新链长度 > 5 个工具 → 拦截（太臃肿）
+  3. 评分 < 60 → 拦截（质量不足）
+  4. 工具成功率 < 50% → 拦截（工具不可靠）
+  5. 旧链执行 ≥ 10 次且成功率 ≥ 80% → 拦截（旧链已验证，不轻易替换）
+- `router/tool_chains.py:update_chain_stats()` — 增量均值算法更新 avg_steps / executions / success_rate
+
+**数据流**:
+```
+agent.run() 完成
+  → evaluate(result, chain, verb, noun) → EvalResult(verdict/score)
+  → learn_from_execution(eval_result, verb, noun)
+      ├─ success + 偏离 → save_tool_chain(verb, noun, actual_tools)
+      ├─ success + 遵循 → update_chain_stats(verb, noun, steps, True)
+      └─ failure → update_chain_stats(verb, noun, steps, False) + _record_failure()
+```
+
+**文件**: `evaluator.py` L491-580, `router/tool_chains.py`
+
+### 16.2 编排闭环
+
+**流程**: 读取 tool_chains.json → 编排执行 → 结果交给 Agent
+
+**触发**: 每次用户消息进入 `_try_chain()`
+
+**实现**:
+- `intent_analyzer.py` — 意图分析时读取 chain stats
+  - `get_tool_chain(verb, noun)` — 获取预配置的工具链步骤
+  - `get_chain_stats(verb, noun)` — 获取链路统计（成功率、平均步数）
+- `agent.py._try_chain()` — 链路执行
+  - 匹配 verb+noun → 按 tool_chains.json 的 steps 顺序执行
+  - 未匹配 → `planner.py` LLM 规划 → 存入 tool_chains.json
+  - 规划失败 → 返回 None（让 agent 自由处理）
+- `router/tool_chains.py:get_tool_chain()` — 读取链路配置
+
+**数据流**:
+```
+用户消息
+  → intent_analyzer → verb + noun
+  → _try_chain(verb, noun)
+      ├─ tool_chains.json 有链路 → 按 steps 执行 → 返回 AgentResult
+      ├─ 无链路 → planner LLM 规划 → save_tool_chain() → 执行
+      └─ 规划失败 → 返回 None → agent 自由处理
+```
+
+**文件**: `agent.py:_try_chain()`, `intent_analyzer.py`, `planner.py`, `router/tool_chains.py`
+
+### 16.3 惩罚闭环
+
+**流程**: 用户负面反馈 → 惩罚 tool_chains → 低质量链路被清除
+
+**触发**: 每次用户消息自动检测（`_check_negative_feedback()`）
+
+**实现**:
+- `router/tool_chains.py:detect_feedback_severity()` — 关键词检测
+  - 轻度: "不对"、"不好"、"不准"、"有问题" → success_count - 1
+  - 重度: "完全不对"、"大错特错"、"离谱"、"垃圾" → success_count - 2
+- `router/tool_chains.py:penalize_chain()` — 执行惩罚
+  - success_count <= 0 或 success_rate < 0.2 → 删除链路
+- `agent.py._check_negative_feedback()` — 双层惩罚
+  - tool_chains 层: penalize_chain() 扣减/删除
+  - trace 层: mark_root_wrong() 标记错误，累计 3 次删除整棵 trace 树
+
+**数据流**:
+```
+用户消息（含负面关键词）
+  → detect_feedback_severity(message) → "mild" / "severe" / None
+  → _check_negative_feedback(message, session_id)
+      ├─ trace 层: mark_root_wrong(root_id) / delete_tree(root_id)
+      └─ tool_chains 层: penalize_chain(verb, noun, severity)
+            ├─ 轻度 → success_count -= 1
+            ├─ 重度 → success_count -= 2
+            └─ 累计触发 → 删除链路
+```
+
+**文件**: `agent.py:_check_negative_feedback()` L1193-1260, `router/tool_chains.py:penalize_chain()`
+
+### 16.4 异步回测闭环
+
+**流程**: 用户消息 → Agent 处理 → 写入 DB → (T+N 天) → 获取实际行情 → 验证结果 → 修改权重
+
+**触发**: 后台 Worker 每 4 小时自动运行（`start_eval_worker()`），或 API 手动触发
+
+**实现**:
+- `chain/store.py:save_tree()` — Agent 执行时 EvalNode 树存库（含 action / score / direction / timeframe）
+- `chain/evaluator.py:evaluate_pending()` — 查找 exit_date IS NULL 的记录
+  - 按 timeframe 映射持有天数: T+1=1, T+3=3, T+5=5, 1W=5, 1M=22
+  - `_get_actual_return()` — 从数据源获取实际涨跌
+  - `is_direction_correct()` — 预测方向 vs 实际方向对比
+  - `update_verify_results()` — 写回 exit_date / pnl_pct / hold_days / correct
+- `chain/evaluator.py:update_skill_weights()` — 按单位时间收益率更新 Skill 权重
+  - 核心指标: `return_per_day = (win_rate × avg_win - loss_rate × avg_loss) / avg_hold_days`
+  - 映射到权重: `weight = clamp(1.0 + return_per_day × 20, 0.5, 2.0)`
+  - 自动同步 registry: 新 Skill → INSERT 工厂默认值
+- `chain/evaluator.py:update_factor_weights()` — 按因子维度聚合权重（带时间衰减）
+  - 半衰期: 政策/消息=7天, 游资/资金=14天, 概念/板块=21天, 技术指标=30天, 量价=60天
+  - 自动清理过期因子（近 N 天内未出现的 → DELETE）
+- 权重注入: `_build_instructions()` → `get_skill_weights()` → 注入 agent instructions
+
+**数据流**:
+```
+T日: 用户问 "600519 能不能买"
+  → Agent 执行 → EvalNode 树存库
+      root: chain, action=buy, score=72, direction=bullish, timeframe=T+3
+        ├─ skill: technical_agent, score=75, direction=bullish
+        │   ├─ tool: agent_get_kline
+        │   └─ tool: analyze_trend
+        └─ skill: momentum_tracker, score=80, direction=bullish
+
+T+3: 后台 Worker 自动运行（每 4 小时）
+  → evaluate_pending()
+      → _get_actual_return("600519", T日, 3) → pnl_pct=+5.2%
+      → is_direction_correct("bullish", "bullish") → correct=True
+      → update_verify_results(root_id, exit_date, pnl_pct, correct)
+  → update_skill_weights()
+      → technical_agent: 100笔, 胜率65%, 单位时间收益率+0.48%/天 → weight=1.96
+      → momentum_tracker: 80笔, 胜率45%, 单位时间收益率+1.25%/天 → weight=2.0
+  → update_factor_weights()
+      → 趋势因子: 0.48%/天 → weight=1.96
+      → 量价因子: 0.35%/天 → weight=1.70
+
+下次执行: 权重自动注入 agent instructions
+  → "technical_agent | 权重 1.96 | +0.48%/天 | 120 笔"
+```
+
+**文件**: `chain/evaluator.py`, `chain/store.py`, `app/__init__.py` (启动 worker), `routes/agent_blueprint.py` (API 触发)
+
+### 16.5 闭环间的关系
+
+| 闭环 | 时间尺度 | token 消耗 | 数据载体 |
+|------|---------|-----------|---------|
+| 学习闭环 | 实时（每次执行后） | 0（纯规则） | tool_chains.json |
+| 编排闭环 | 实时（每次用户消息） | 0（读 JSON） | tool_chains.json |
+| 惩罚闭环 | 实时（每次用户消息） | 0（关键词匹配） | tool_chains.json + qd_traces |
+| 异步回测闭环 | T+N 天（每 4 小时检查） | 0（纯 SQL + 数学） | qd_traces + qd_skill_weights + qd_factor_weights |
+
+**学习闭环** 和 **惩罚闭环** 共同维护 tool_chains.json 的质量：
+- 学习 → 成功路径写入/强化
+- 惩罚 → 失败路径扣减/清除
+
+**异步回测闭环** 独立于前三者，维护权重表：
+- tool_chains.json 管"怎么走"（路径选择）
+- qd_skill_weights / qd_factor_weights 管"信多少"（权重校准）

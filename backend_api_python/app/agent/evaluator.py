@@ -499,7 +499,7 @@ def learn_from_execution(
 
     # ── 每次都更新统计 ──
     try:
-        from app.agent.router.tool_chains import update_chain_stats
+        from app.agent.chain.tool_chains import update_chain_stats
         update_chain_stats(
             verb=verb,
             noun=noun,
@@ -524,7 +524,7 @@ def _writeback_chain(eval_result: EvalResult, verb: str, noun: str):
     - 如果 agent 偏离了 chain 但仍然成功 → 用 agent 实际使用的工具链替换旧 chain
       （说明 agent 找到了更好的路径）
     """
-    from app.agent.router.tool_chains import get_tool_chain, save_tool_chain
+    from app.agent.chain.tool_chains import get_tool_chain, save_tool_chain
 
     if not eval_result.actual_tools:
         return

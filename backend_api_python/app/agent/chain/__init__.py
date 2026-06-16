@@ -22,6 +22,12 @@ from app.agent.chain.store import (
     get_skill_weights, get_factor_weights, get_eval_stats,
 )
 from app.agent.chain.contract import parse_skill_output, extract_tools_called
+from app.agent.chain.tool_chains import (
+    get_tool_chain, save_tool_chain,
+    get_chain_stats, update_chain_stats,
+    list_all_chains,
+    detect_feedback_severity, penalize_chain,
+)
 
 __all__ = [
     "EvalNode", "SkillReport", "FactorItem",
@@ -33,4 +39,8 @@ __all__ = [
     "get_skill_weights", "get_factor_weights",
     "get_eval_stats",
     "parse_skill_output", "extract_tools_called",
+    "get_tool_chain", "save_tool_chain",
+    "get_chain_stats", "update_chain_stats",
+    "list_all_chains",
+    "detect_feedback_severity", "penalize_chain",
 ]
