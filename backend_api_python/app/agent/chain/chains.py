@@ -15,7 +15,7 @@ Phase 2 变更（SEMANTICS_REFACTOR）：
   ChainDef  — 链路定义（chain_id/name/steps/trigger_verbs/trigger_nouns）
 
 内置链路（从 chains.md 加载）：
-  evaluate+stock  — 股票综合评估（10步：游资→解禁→情报→技术→指标→选股→行情→回测→多空辩论）
+  evaluate+stock  — 股票深度综合评估（10步：游资→解禁→情报→技术→指标→选股→行情→回测→多空辩论）
   screen+stock    — 选股筛选（3步：条件选股→技术验证→情报过滤）
   scan+market     — 市场全景扫描（3步：大盘指数→涨停池→资金流向）
 
@@ -58,6 +58,7 @@ class ChainDef:
     steps: List[ChainStep]      # 步骤列表
     trigger_verbs: List[str] = field(default_factory=list)   # 触发动词
     trigger_nouns: List[str] = field(default_factory=list)   # 触发对象
+    context: Dict[str, Any] = field(default_factory=dict)    # Planner 传入的额外上下文（tips/focus/data_criticality 等）
 
 
 # ═══════════════════════════════════════════════════════════════

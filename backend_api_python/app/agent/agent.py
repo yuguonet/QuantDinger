@@ -38,6 +38,8 @@ import os
 import time
 from typing import Any, Callable, Dict, List, Optional
 
+from dataclasses import dataclass, field
+
 from smolagents import (
     CodeAgent,
     ToolCallingAgent,
@@ -207,8 +209,8 @@ def _build_instructions(user_message: str = "", skill_instructions: str = "",
     if domain == "finance" and stock_code:
         _agent_cls = _get_agent_class()
         try:
-            from app.agent.semantics import get_output_format_text
-            _of_text = get_output_format_text()
+            from app.agent.semantics import get_agent_rules_text
+            _of_text = get_agent_rules_text()
             if _of_text:
                 # 根据 agent 类型选择对应段落
                 if _agent_cls is ToolCallingAgent:
@@ -238,29 +240,20 @@ def _build_instructions(user_message: str = "", skill_instructions: str = "",
         except Exception:
             pass  # 权重注入失败不影响主流程
 
-    # 从 semantics 加载 guidance 和 rules
-    guidance_text = ""
+    # 从 semantics 加载统一 agent 规则
+    agent_rules_text = ""
     try:
-        from app.agent.semantics import get_guidance_text
-        _g = get_guidance_text()
-        if _g:
-            guidance_text = f"\n{_g}\n"
-    except Exception:
-        pass
-
-    rules_text = ""
-    try:
-        from app.agent.semantics import get_rules_text
-        _r = get_rules_text()
+        from app.agent.semantics import get_agent_rules_text
+        _r = get_agent_rules_text()
         if _r:
-            rules_text = f"\n{_r}\n"
+            agent_rules_text = f"\n{_r}\n"
     except Exception:
         pass
 
     return f"""{preamble}
-{guidance_text}
+{agent_rules_text}
 {tool_catalog}
-{skill_section}{scan_section}{modify_section}{intent_section}{domain_section}{calibration_section}{weight_section}{rules_text}{finance_json_section}{lang_section}"""
+{skill_section}{scan_section}{modify_section}{intent_section}{domain_section}{calibration_section}{weight_section}{finance_json_section}{lang_section}"""
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -359,6 +352,28 @@ def _check_output_json(answer, memory, agent) -> bool:
     except Exception:
         # 任何校验异常 → 视为校验不通过
         return False
+
+
+def _make_retry_once_checker():
+    """包裹 _check_output_json，最多容忍一次重试。
+
+    第一次校验失败 → 返回 False，smolagents 触发 agent 重试。
+    第二次（重试后）→ 无论是否通过都放行，避免无限重试循环。
+    """
+    _has_retried = False
+
+    def _checker(answer, memory, agent) -> bool:
+        nonlocal _has_retried
+        if _has_retried:
+            # 已重试过一次，直接放行
+            agent._json_output_fallback = True
+            return True
+        if not _check_output_json(answer, memory, agent):
+            _has_retried = True
+            return False  # 触发 smolagents 重试
+        return True
+
+    return _checker
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -648,8 +663,10 @@ def get_smolagent(
         _extra_kwargs["executor_kwargs"] = {"timeout_seconds": _code_exec_timeout}
 
     # §15: 用 strategy 替代 domain 做 JSON 校验决策
-    # traced 策略 → 强制 JSON 校验；其他 → 宽松校验
-    checks = [_check_output_json] if strategy == "traced" else [_check_dashboard_json]
+    # traced 策略 + 有 stock_code → 强制 JSON 校验；其他 → 宽松校验
+    # 无 stock_code 时 system prompt 不会注入 JSON 格式指令（见 _build_instructions），
+    # LLM 输出自然语言会被 _check_output_json 拒绝，导致重试循环。
+    checks = [_make_retry_once_checker()] if (strategy == "traced" and stock_code) else [_check_dashboard_json]
 
     agent = AgentClass(
         tools=tools,
@@ -700,6 +717,27 @@ def build_agent_executor(
     )
 
 
+# ═══════════════════════════════════════════════════════════════
+# _prepare_intent 返回结构
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class _IntentPrepResult:
+    """_prepare_intent() 的结构化返回结果。"""
+    skip_agent: bool = False
+    skip_agent_reply: str = ""
+    intent_context: str = ""
+    domain: str = ""
+    intent: Optional[Any] = None  # IntentResult
+    strategy: str = "direct"
+    domain_instructions: str = ""
+    tool_categories: Optional[List[str]] = None
+    verb: str = ""
+    noun: str = ""
+    tool_chain: List[str] = field(default_factory=list)
+    intent_meta: Dict[str, Any] = field(default_factory=dict)  # 额外元数据
+
+
 class _AgentExecutor:
     """Wraps smolagents CodeAgent with session management."""
 
@@ -716,6 +754,122 @@ class _AgentExecutor:
         import threading as _threading
         self._agent_ready_event = _threading.Event()
 
+    def _prepare_intent(self, message, session_id, context):
+        """快速通道 → 意图分析(LLM) → 提取 stock_code，返回结构化结果。
+
+        流程：
+        1. 快速通道 — 正则匹配闲聊（0 LLM 调用）
+        2. 意图分析 — LLM #1（仅非闲聊时）
+        3. 提取 stock_code — 从消息解析个股代码
+        """
+        from app.agent.intent_analyzer import _quick_intent_check, analyze_intent, format_intent_for_agent
+        from app.agent.session_store import get_session_store
+        store = get_session_store()
+
+        result = _IntentPrepResult()
+
+        # ── 1. 快速通道（极低成本正则，零 LLM 调用）───────────
+        quick = _quick_intent_check(message)
+        if quick:
+            _quick_replies = {
+                "greeting": "你好！我是 QuantDinger 量化分析助手，可以帮你做股票分析、选股筛选、策略回测等。有什么需要帮忙的？",
+                "farewell": "再见！有问题随时找我。",
+                "thanks": "不客气！有需要随时找我。",
+                "empty": "请告诉我你需要什么帮助。",
+            }
+            result.skip_agent = True
+            result.skip_agent_reply = _quick_replies.get(quick.intent, "你好！有什么需要帮忙的？")
+            result.intent = quick
+            logger.info("[Intent] Pre-LLM quick path: %s", quick.intent)
+            return result
+
+        # ── 2. 意图分析（LLM #1）──────────────────────────────
+        if os.getenv("INTENT_ANALYSIS_ENABLED", "true").lower() == "true":
+            try:
+                history = store.get_history(session_id)[-6:]
+                intent = analyze_intent(
+                    message, model=self.model, provider=self.provider,
+                    history=history,
+                )
+                domain = intent.domain
+                result.intent = intent
+                result.domain = domain
+                result.strategy = intent.strategy
+                result.domain_instructions = intent.domain_instructions
+                result.tool_categories = intent.tool_categories or None
+                result.intent_context = format_intent_for_agent(intent, message)
+                result.verb = getattr(intent, 'verb', '') or ""
+                result.noun = getattr(intent, 'noun', '') or ""
+                result.tool_chain = (getattr(intent, 'metadata', None) or {}).get("tool_chain", [])
+                result.intent_meta = {
+                    "intent": intent.intent,
+                    "confidence": intent.confidence,
+                    "source": intent.source,
+                }
+
+                logger.info(
+                    "[Intent] domain=%s strategy=%s intent=%s confidence=%.2f",
+                    domain, result.strategy, intent.intent, intent.confidence,
+                )
+
+                # Update tool context with domain
+                from app.agent.tool_context import get_tool_context
+                _ctx = get_tool_context()
+                _ctx["domain"] = domain
+                _ctx["strategy"] = result.strategy
+                set_tool_context(_ctx)
+
+                # ── Post-LLM 闲聊快速通道（LLM 也识别为 chat 时）──
+                if (domain == "chat"
+                        and intent.confidence >= 0.6
+                        and intent.intent in ("greeting", "farewell", "thanks", "empty")):
+                    _quick_replies = {
+                        "greeting": "你好！我是 QuantDinger 量化分析助手，可以帮你做股票分析、选股筛选、策略回测等。有什么需要帮忙的？",
+                        "farewell": "再见！有问题随时找我。",
+                        "thanks": "不客气！有需要随时找我。",
+                        "empty": "请告诉我你需要什么帮助。",
+                    }
+                    result.skip_agent = True
+                    result.skip_agent_reply = _quick_replies.get(intent.intent, "你好！有什么需要帮忙的？")
+                    logger.info("[Intent] Post-LLM quick-reply for %s, skipping agent", intent.intent)
+                    return result
+
+                # ── 未知意图：反问用户，不瞎猜 ──
+                _is_cron = context and context.get("source") == "cron"
+                if (domain == "unknown" or intent.intent == "unknown") and intent.confidence <= 0.4:
+                    if _is_cron:
+                        result.skip_agent = True
+                        result.skip_agent_reply = ""
+                        logger.info("[Intent] Cron unknown intent (conf=%.2f), skipping agent", intent.confidence)
+                    else:
+                        result.skip_agent = True
+                        result.skip_agent_reply = "没太明白你的意思，能说得具体一点吗？比如是要分析股票、看行情、设提醒，还是其他什么？"
+                        logger.info("[Intent] Unknown intent (conf=%.2f, domain=%s), asking for clarification", intent.confidence, domain)
+                    return result
+
+            except Exception as e:
+                import traceback
+                logger.warning("[Intent] 分析失败，走默认流程: %s\n%s", e, traceback.format_exc())
+                return result
+
+        # ── 3. 提取 stock_code（仅 traced 策略、消息中未带时）───
+        if result.strategy == "traced" and not (context and context.get("stock_code")):
+            import re as _re_stock
+            _m = _re_stock.search(r'\b(\d{6})\b', message)
+            if _m:
+                logger.info("[Prepare] 从消息提取股票代码: %s", _m.group(1))
+                result.intent_meta["stock_code"] = _m.group(1)
+            else:
+                from app.agent.text_utils import extract_stock_from_message
+                _code, _name = extract_stock_from_message(message)
+                if _code:
+                    result.intent_meta["stock_code"] = _code
+                    if _name:
+                        result.intent_meta["stock_name"] = _name
+                    logger.info("[Prepare] 中文名 → 代码 %s", _code)
+
+        return result
+
     def _prepare(self, message, session_id, context, user_id):
         from app.agent.session_store import get_session_store
         store = get_session_store()
@@ -725,115 +879,34 @@ class _AgentExecutor:
             "progress_callback": None,
         })
 
-        # ── 前置意图分析 ──────────────────────────────────────
-        intent_context = ""
-        domain = ""
-        domain_instructions = ""
-        tool_categories = None
-        strategy = "direct"  # §15: 执行策略（替代 domain 做路由决策）
-        # skip_agent: 意图明确且不需要工具时（如打招呼），直接返回，不进 agent
-        skip_agent = False
-        skip_agent_reply = ""
-        intent = None  # 供后置评估提取 verb/noun
-
-        if os.getenv("INTENT_ANALYSIS_ENABLED", "true").lower() == "true":
-            try:
-                from app.agent.intent_analyzer import analyze_intent, format_intent_for_agent
-                # 取最近 3 轮对话历史，用于指代消解
-                history = store.get_history(session_id)[-6:]
-                intent = analyze_intent(
-                    message, model=self.model, provider=self.provider,
-                    history=history,
-                )
-                domain = intent.domain
-                strategy = intent.strategy  # §15: 从 intent 获取策略
-                domain_instructions = intent.domain_instructions
-                tool_categories = intent.tool_categories or None
-                intent_context = format_intent_for_agent(intent, message)
-                logger.info(
-                    "[Intent] domain=%s strategy=%s intent=%s confidence=%.2f categories=%s",
-                    domain, strategy, intent.intent, intent.confidence,
-                    intent.tool_categories or [],
-                )
-                # Update tool context with domain for per-domain workspace isolation
-                from app.agent.tool_context import get_tool_context
-                _ctx = get_tool_context()
-                _ctx["domain"] = domain
-                _ctx["strategy"] = strategy
-                set_tool_context(_ctx)
-
-                # ── 闲聊/greeting 快速通道：跳过 agent，直接回复 ──
-                # 本地模型（如 gemma4）经常忽略 final_answer 指令，
-                # 把问候语包在 <code> 块里导致解析失败。
-                # 对于置信度 >= 0.6 的 chat 意图，直接构造回复，不走 agent。
-                if (domain == "chat"
-                        and intent.confidence >= 0.6
-                        and intent.intent in ("greeting", "farewell", "thanks", "empty")):
-                    skip_agent = True
-                    _quick_replies = {
-                        "greeting": "你好！我是 QuantDinger 量化分析助手，可以帮你做股票分析、选股筛选、策略回测等。有什么需要帮忙的？",
-                        "farewell": "再见！有问题随时找我。",
-                        "thanks": "不客气！有需要随时找我。",
-                        "empty": "请告诉我你需要什么帮助。",
-                    }
-                    skip_agent_reply = _quick_replies.get(intent.intent, "你好！有什么需要帮忙的？")
-                    logger.info("[Intent] Quick-reply for %s, skipping agent", intent.intent)
-
-                # ── 未知意图：反问用户，不瞎猜 ──
-                # cron 触发的消息没有用户可问，直接结束不进 agent
-                _is_cron = context and context.get("source") == "cron"
-                if (domain == "unknown" or intent.intent == "unknown") and intent.confidence <= 0.4:
-                    if _is_cron:
-                        skip_agent = True
-                        skip_agent_reply = ""
-                        logger.info("[Intent] Cron unknown intent (conf=%.2f), skipping agent", intent.confidence)
-                    else:
-                        skip_agent = True
-                        skip_agent_reply = "没太明白你的意思，能说得具体一点吗？比如是要分析股票、看行情、设提醒，还是其他什么？"
-                        logger.info("[Intent] Unknown intent (conf=%.2f, domain=%s), asking for clarification", intent.confidence, domain)
-
-            except Exception as e:
-                import traceback
-                logger.warning("[Intent] 分析失败，走默认流程: %s\n%s", e, traceback.format_exc())
+        # ── 意图分析（快速通道 → LLM → 提取 stock_code）──────
+        _ipr = self._prepare_intent(message, session_id, context)
+        skip_agent = _ipr.skip_agent
+        skip_agent_reply = _ipr.skip_agent_reply
+        intent = _ipr.intent
+        domain = _ipr.domain
+        strategy = _ipr.strategy
+        domain_instructions = _ipr.domain_instructions
+        tool_categories = _ipr.tool_categories
+        intent_context = _ipr.intent_context
 
         # ── 快速通道：不需要 agent 时直接返回 ────────────────
         if skip_agent:
             store.add_message(session_id, "user", message)
-            # Signal "ready" with no agent (skip path)
             self._agent_ready_event.set()
             return store, None, message, {"skip_agent": True, "skip_agent_reply": skip_agent_reply}
 
-        # ── 金融域：从消息中提取 stock_code（_try_chain 被跳过，需要在此提取）──
-        # §15: 用 strategy="traced" 替代 domain="finance" 做路由判断
-        if strategy == "traced" and not (context and context.get("stock_code")):
-            import re as _re_stock
-            # 1. 6位数字代码
-            _m = _re_stock.search(r'\b(\d{6})\b', message)
-            if _m:
-                _stock_code = _m.group(1)
-                if not (context and context.get("stock_code")):
-                    context = context or {}
-                    context["stock_code"] = _stock_code
-                    logger.info("[Prepare] 从消息提取股票代码: %s", _stock_code)
-            else:
-                # 2. 中文名查找
-                from app.agent.text_utils import extract_stock_from_message
-                _code, _name = extract_stock_from_message(message)
-                if _code:
-                    context = context or {}
-                    context["stock_code"] = _code
-                    if _name:
-                        context["stock_name"] = _name
-                    logger.info("[Prepare] 中文名 → 代码 %s", _code)
+        # ── 合并 intent 提取的股票代码到 context ──────────────
+        if _ipr.intent_meta.get("stock_code") and not (context and context.get("stock_code")):
+            context = context or {}
+            context["stock_code"] = _ipr.intent_meta["stock_code"]
+            if _ipr.intent_meta.get("stock_name"):
+                context["stock_name"] = _ipr.intent_meta["stock_name"]
 
         # ── 提取意图信息，供后置评估使用 ──────────────────────
-        _eval_verb = ""
-        _eval_noun = ""
-        _eval_tool_chain = []
-        if intent is not None:
-            _eval_verb = getattr(intent, 'verb', '') or ""
-            _eval_noun = getattr(intent, 'noun', '') or ""
-            _eval_tool_chain = (getattr(intent, 'metadata', None) or {}).get("tool_chain", [])
+        _eval_verb = _ipr.verb
+        _eval_noun = _ipr.noun
+        _eval_tool_chain = _ipr.tool_chain
 
         # ── 创建 TraceCollector（策略触发，非领域绑定）──────────
         # §15: 用 strategy="traced" 替代 domain="finance"
@@ -1164,6 +1237,13 @@ class _AgentExecutor:
                 except Exception:
                     pass
 
+            # ── JSON 校验重试失败后标记输出 ──
+            if getattr(agent, '_json_output_fallback', False):
+                if isinstance(content, str):
+                    content += "\n\n> 输出内容未做标准化处理"
+                elif isinstance(content, dict):
+                    content["_warning"] = "输出内容未做标准化处理"
+
             return AgentResult(
                 success=success, content=content, tool_calls_log=tool_calls_log,
                 total_steps=total_steps, total_tokens=total_tokens,
@@ -1409,9 +1489,13 @@ class _AgentExecutor:
             stock_name=stock_name,
             user_id=user_id,
         )
+        # 合并链路的 context（Planner 传入的 tips/focus/data_criticality 等）
+        exec_context = {"user_query": message}
+        if chain_def.context:
+            exec_context.update(chain_def.context)
         chain_result = executor.execute(
             run_skill_fn=run_skill_fn,
-            context={"user_query": message},
+            context=exec_context,
             call_llm=call_llm,
         )
 
@@ -1584,6 +1668,13 @@ class _AgentExecutor:
                                             _sc_data.get("action", ""))
                         except Exception as e:
                             logger.warning("[Agent] 流式DecisionCard/存库失败，保留原始输出: %s", e)
+
+                    # ── JSON 校验重试失败后标记输出 ──
+                    if getattr(agent, '_json_output_fallback', False):
+                        if isinstance(content, str):
+                            content += "\n\n> 输出内容未做标准化处理"
+                        elif isinstance(content, dict):
+                            content["_warning"] = "输出内容未做标准化处理"
 
                     # ── 后置评估 + 工具链学习闭环 ─────────────
                     _eval_result = AgentResult(

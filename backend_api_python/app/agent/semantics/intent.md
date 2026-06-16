@@ -104,3 +104,4 @@ intent_tool_categories:
 - confidence: 有明确信号=0.9+, 有关键词=0.7+, 不确定=0.5-, 猜测=0.3
 - 意图不明确时（没有匹配到上述任何规则），intent 填 "unknown"，confidence 填 0.3，不要猜测
 - context_summary: 压缩为一句话摘要，供下轮对话使用
+- domain = chat，直接返回答案 — 打招呼、闲聊等直接给出结果并返回。

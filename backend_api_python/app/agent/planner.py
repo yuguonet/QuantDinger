@@ -345,6 +345,12 @@ class Planner:
                 required=(i == 1),  # 第一步必须成功
             ))
 
+        # 收集 Planner 上下文（关键信息传递给各 Skill Agent）
+        planner_context = plan_data.get("context", {})
+        # 兼容旧链路 "规则" 字段
+        if "规则" in plan_data and "rules" not in planner_context:
+            planner_context["rules"] = plan_data["规则"]
+
         chain_id = f"planned+{hashlib.md5(json.dumps(plan_data, sort_keys=True).encode()).hexdigest()[:8]}"
 
         chain_def = ChainDef(
@@ -354,6 +360,7 @@ class Planner:
             steps=steps,
             trigger_verbs=[],
             trigger_nouns=[],
+            context=planner_context,
         )
         register_chain(chain_def)  # 动态链路必须注册才能被 ChainExecutor 找到
         return chain_def

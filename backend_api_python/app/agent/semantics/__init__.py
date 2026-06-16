@@ -15,12 +15,13 @@ v4 变更：
   - semantics = 描述来源（YAML/MD 单一信源）
 
 使用方式：
-    from app.agent.semantics import (
+     from app.agent.semantics import (
         get_persona, get_intent_meta,
         get_skill_meta, get_all_skill_metas,
         get_tool_meta, get_all_tool_metas,
         get_chain_meta,
         get_skills_summary_xml, get_tools_summary_xml,
+        get_agent_rules_text,
         load_semantics,
     )
 """
@@ -274,8 +275,6 @@ def load_semantics():
 
     # ── intent（intent.md frontmatter + body 作为 classifier_prompt）──
     intent_md = _SEMANTICS_DIR / "intent.md"
-    # ── intent（intent.md frontmatter + body）──
-    intent_md = _SEMANTICS_DIR / "intent.md"
     if intent_md.exists():
         content = intent_md.read_text(encoding="utf-8")
         meta, body = _parse_skill_md(content)
@@ -361,32 +360,13 @@ def get_persona_body() -> str:
     return body
 
 
-def get_guidance_text() -> str:
-    """返回 guidance.md 的 Markdown body。"""
-    guidance_path = _SEMANTICS_DIR / "guidance.md"
-    if not guidance_path.exists():
-        return ""
-    content = guidance_path.read_text(encoding="utf-8")
-    _, body = _parse_skill_md(content)
-    return body
-
-
-def get_rules_text() -> str:
-    """返回 rules.md 的 Markdown body。"""
-    rules_path = _SEMANTICS_DIR / "rules.md"
-    if not rules_path.exists():
-        return ""
-    content = rules_path.read_text(encoding="utf-8")
-    _, body = _parse_skill_md(content)
-    return body
-
-
-def get_output_format_text() -> str:
-    """返回 output_format.md 的 Markdown body。"""
-    path = _SEMANTICS_DIR / "output_format.md"
+def get_agent_rules_text() -> str:
+    """返回 agent_rules.md 的完整 Markdown body（核心规则 + 执行流程）。"""
+    path = _SEMANTICS_DIR / "agent_rules.md"
     if not path.exists():
         return ""
     content = path.read_text(encoding="utf-8")
+    # 用 frontmatter 后的 body
     _, body = _parse_skill_md(content)
     return body
 

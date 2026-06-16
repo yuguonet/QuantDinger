@@ -1,7 +1,7 @@
 ---
 chains:
   evaluate+stock:
-    name: "股票综合评估"
+    name: "股票深度综合评估"
     description: "游资追踪→解禁监控→情报/政策→技术面/动量→指标信号→选股验证→行情/概念/资金→回测→多空辩论"
     trigger_verbs: [analyze, evaluate]
     trigger_nouns: [stock]
@@ -113,6 +113,6 @@ chains:
 
 | 链路 | 触发 | 步骤 | 说明 |
 |------|------|------|------|
-| evaluate+stock | analyze/evaluate + stock | 10 | 股票综合评估 |
+| evaluate+stock | analyze/evaluate + stock | 10 | 股票深度综合评估 |
 | screen+stock | filter/screen + stock/screener | 3 | 选股筛选 |
 | scan+market | view/analyze/scan + market | 3 | 市场全景扫描 |
