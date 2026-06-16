@@ -17,6 +17,7 @@ import os as _os
 import threading
 import time
 import logging
+import atexit
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 
@@ -50,6 +51,11 @@ _DEFAULT_CFG = {"ttl": 120, "refresh": 90}
 _CACHE_FILE = None
 _cache_store = {}    # {endpoint: {"data": ..., "ts": float}}
 _cache_lock = threading.Lock()
+_cache_dirty = False  # 延迟写标记，避免每次 put 都 pickle
+
+# 有界线程池：后台异步刷新最多 2 个并发，用完回收
+_refresh_async_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="market_cn_refr")
+atexit.register(lambda: _refresh_async_pool.shutdown(wait=False))
 
 
 def _cache_path():
@@ -109,11 +115,24 @@ def cache_is_stale(endpoint):
 
 
 def cache_put(endpoint, data):
-    """写缓存: 更新内存 + 触发文件保存。"""
+    """写缓存: 更新内存 + 标记脏（延迟写盘）。"""
+    global _cache_dirty
     ts = time.time()
     with _cache_lock:
         _cache_store[endpoint] = {"data": data, "ts": ts}
-        _cache_save()
+        _cache_dirty = True
+
+
+def cache_flush():
+    """将脏缓存写盘（批量化，避免多次全量 pickle）。"""
+    global _cache_dirty
+    if not _cache_dirty:
+        return
+    with _cache_lock:
+        try:
+            _cache_save()
+        finally:
+            _cache_dirty = False
 
 
 # ============================================================
@@ -174,7 +193,7 @@ def _refresh(endpoint, force=False):
 
 
 def _refresh_async(endpoint, force=False):
-    threading.Thread(target=_refresh, args=(endpoint, force), daemon=True).start()
+    _refresh_async_pool.submit(_refresh, endpoint, force)
 
 
 # ============================================================
@@ -205,6 +224,7 @@ def _warmup():
     for endpoint in _CACHE_CONFIG:
         if cache_is_stale(endpoint):
             _refresh_async(endpoint, force=True)
+    cache_flush()
     logger.info("[warmup] 后台刷新已启动")
 
 
@@ -334,6 +354,7 @@ def refresh(target="all") -> dict:
             except Exception as e:
                 results[key] = f"error: {e}"
 
+    cache_flush()
     return results
 
 
