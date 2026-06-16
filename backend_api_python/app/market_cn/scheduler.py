@@ -102,13 +102,13 @@ def _refresh_post_market():
 
 
 def _refresh_slow():
-    """盘中慢档: 贪恐/情绪/政策/新闻/全球情绪 + 日级"""
-    from app.market_cn.china_market import refresh_fear_greed, refresh_policy
+    """盘中慢档: 贪恐/情绪/全球情绪 + 日级"""
+    from app.market_cn.china_market import refresh_fear_greed
     from app.market_cn.emotion import refresh_emotion_cycle
     from app.data_providers.global_market import refresh_global_sentiment
 
     _run_all("slow", [
-        refresh_fear_greed, refresh_policy, refresh_emotion_cycle,
+        refresh_fear_greed, refresh_emotion_cycle,
         refresh_global_sentiment,
     ])
 
@@ -186,6 +186,27 @@ def _fast_tick():
 def _slow_tick():
     if _is_trading_time():
         _refresh_slow()
+
+
+_policy_last_date = ""
+
+
+def _policy_daily_tick():
+    """政策新闻: 交易日 9:00 后跑一次"""
+    global _policy_last_date
+    now = datetime.now()
+    if now.weekday() >= 5:
+        return
+    today = now.strftime("%Y-%m-%d")
+    if now.hour < 9 or _policy_last_date == today:
+        return
+    try:
+        from app.market_cn.china_market import refresh_policy
+        refresh_policy()
+        _policy_last_date = today
+        logger.info("[scheduler] 政策新闻每日刷新完成")
+    except Exception as e:
+        logger.warning("[scheduler] 政策新闻刷新失败: %s", e)
 
 
 _post_market_done_today = False
@@ -312,8 +333,9 @@ def start():
     _schedule("slow", _slow_tick, 1800)       # 30 分钟，非盘中自动跳过
     _schedule("dragon_pools", _dragon_tick, 60)  # 自适应间隔，首次 60 秒后启动
     _schedule("post_market", _post_market_tick, 600)  # 盘后 10 分钟，完成后自动停
+    _schedule("policy_daily", _policy_daily_tick, 300)  # 政策新闻: 5 分钟轮询，9:00 后触发一次
 
-    logger.info("[scheduler] 定时刷新已启动: fast=5min, slow=30min, dragon=adaptive, post_market=10min")
+    logger.info("[scheduler] 定时刷新已启动: fast=5min, slow=30min, dragon=adaptive, post_market=10min, policy=9:00")
 
     # 冷启动：后台线程拉取，不阻塞主线程
     def _cold_start():
@@ -341,10 +363,10 @@ def start():
 
         # ── 冷启动专用慢档（不含 _refresh_daily，避免与 daily 组重复）──
         def _cold_slow():
-            from app.market_cn.china_market import refresh_fear_greed, refresh_policy
+            from app.market_cn.china_market import refresh_fear_greed
             from app.market_cn.emotion import refresh_emotion_cycle
             _run_all("cold_slow", [
-                refresh_fear_greed, refresh_policy, refresh_emotion_cycle,
+                refresh_fear_greed, refresh_emotion_cycle,
             ])
 
         # 5 组并行执行

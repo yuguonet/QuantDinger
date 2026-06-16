@@ -1537,21 +1537,6 @@ class NewsCacheManager:
     def __init__(self):
         pass
 
-    def _purge_expired(self, conn) -> int:
-        """清除超过 NEWS_CACHE_EXPIRY_DAYS 天的过期记录"""
-        try:
-            cursor = conn.cursor()
-            cursor.execute(
-                f"DELETE FROM qd_news_cache_items WHERE created_at < NOW() - INTERVAL '{NEWS_CACHE_EXPIRY_DAYS} days'"
-            )
-            deleted = cursor.rowcount
-            if deleted > 0:
-                logger.info(f"[过期清理] 已清除 {deleted} 条超过 {NEWS_CACHE_EXPIRY_DAYS} 天的新闻缓存")
-            return deleted
-        except Exception as e:
-            logger.warning(f"过期清理异常(非致命): {e}")
-            return 0
-
     def _get_last_search_time(self, symbol: str, market: str) -> Optional[datetime]:
         """从 DB 查询该 symbol 最后一条缓存的入库时间"""
         try:
@@ -1569,20 +1554,20 @@ class NewsCacheManager:
             logger.warning(f"查询最后搜索时间异常: {e}")
             return None
 
-    def get_items(self, symbol: str, market: str = "CNStock") -> List[Dict[str, Any]]:
-        """从 DB 查询缓存新闻, 同时清理过期记录"""
+    def get_items(self, symbol: str, market: str = "CNStock", limit: int = 50) -> List[Dict[str, Any]]:
+        """从 DB 查询缓存新闻, 过期数据直接跳过"""
         try:
             with get_db_connection() as conn:
-                self._purge_expired(conn)
-                conn.commit()
                 cursor = conn.cursor()
                 cursor.execute(
                     """SELECT title, snippet, url, source, published_date, sentiment, sentiment_score
                        FROM qd_news_cache_items
                        WHERE symbol = %s AND market = %s
                          AND title NOT LIKE '__empty_%%__'
-                       ORDER BY published_date DESC""",
-                    (symbol, market)
+                         AND created_at >= NOW() - INTERVAL '%s days'
+                       ORDER BY published_date DESC
+                       LIMIT %s""",
+                    (symbol, market, NEWS_CACHE_EXPIRY_DAYS, limit)
                 )
                 return [dict(r) for r in cursor.fetchall()] or []
         except Exception as e:
@@ -1641,7 +1626,6 @@ class NewsCacheManager:
             return False
         try:
             with get_db_connection() as conn:
-                self._purge_expired(conn)
                 cursor = conn.cursor()
 
                 news_type = get_news_type(symbol, market)
@@ -1667,15 +1651,27 @@ class NewsCacheManager:
                     logger.info(f"[去重] {symbol}({market}) 全部重复, 跳过写入")
                     return True
 
-                # ── 相关性过滤 (仅个股) ──
+                # ── 相关性过滤 (仅个股, 模糊匹配) ──
                 if news_type == "stock" and symbol:
                     before_relv = len(results)
-                    patterns = [re.escape(symbol)]
+                    # 构建匹配词列表: 代码 + 名称 + 名称各字
+                    match_terms = [symbol.lower()]
                     if name:
-                        patterns.append(re.escape(name))
-                    relv_re = re.compile("|".join(patterns), re.IGNORECASE)
+                        match_terms.append(name.lower())
+                        # 名称拆词: 如 "贵州茅台" → ["贵州", "茅台", "贵", "州", "茅", "台"]
+                        if len(name) >= 2:
+                            for i in range(len(name) - 1):
+                                match_terms.append(name[i:i+2].lower())
+                    def _is_relevant(text: str) -> bool:
+                        if not text:
+                            return False
+                        low = text.lower()
+                        for term in match_terms:
+                            if term in low:
+                                return True
+                        return False
                     results = [r for r in results
-                               if relv_re.search(r.title or "") or relv_re.search(r.snippet or "")]
+                               if _is_relevant(r.title) or _is_relevant(r.snippet)]
                     relv_filtered = before_relv - len(results)
                     if relv_filtered > 0:
                         logger.info(f"[相关性] {symbol}({market}) 过滤 {relv_filtered} 条不相关文章")

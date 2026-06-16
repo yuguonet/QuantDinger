@@ -65,18 +65,57 @@ def get_macro_news():
         return None
 
 
+def _fuzzy_match(keyword: str, text: str, threshold: float = 0.6) -> bool:
+    """模糊匹配: 精确包含 + 首字母缩写 + 子串 + 编辑距离"""
+    if not keyword or not text:
+        return False
+    # 1. 精确包含
+    if keyword in text:
+        return True
+    # 2. 短关键词只做包含匹配
+    if len(keyword) <= 2:
+        return False
+    # 3. 首字母缩写 (如 "AI" 匹配 "人工智能")
+    if len(keyword) <= 4 and keyword.isascii():
+        # 提取中文首字
+        cn_chars = re.findall(r'[一-鿿]', text)
+        if cn_chars and keyword.lower() in ''.join(c[0] for c in cn_chars).lower():
+            return True
+    # 4. 子串模糊: 关键词的连续子串出现在文本中
+    for i in range(len(keyword) - 1):
+        sub = keyword[i:i+2]
+        if sub in text:
+            # 找到公共子串后, 检查剩余部分是否也有命中
+            remaining = keyword[:i] + keyword[i+2:]
+            if any(c in text for c in remaining):
+                return True
+    # 5. 编辑距离 (仅较长关键词)
+    if len(keyword) >= 4:
+        from difflib import SequenceMatcher
+        # 滑动窗口匹配
+        klen = len(keyword)
+        for i in range(len(text) - klen + 2):
+            window = text[max(0, i):i + klen + 1]
+            ratio = SequenceMatcher(None, keyword, window).ratio()
+            if ratio >= threshold:
+                return True
+    return False
+
+
 def get_policy_keywords():
     """政策关键词扫描 — 从新闻标题中筛出政策相关"""
     print("\n🔍 政策关键词扫描")
     print("=" * 60)
 
+    # 关键词 + 同义词/近义词组
     policy_words = [
-        '央行', '降准', '降息', 'LPR', 'MLF', '逆回购',
-        '国务院', '国常会', '发改委', '财政部', '证监会',
-        '政策', '监管', '改革', '调控', '扶持', '补贴',
-        '产业政策', '财政', '货币', '金融', '房地产',
-        '新基建', '新能源', '芯片', 'AI', '人工智能',
-        '碳中和', '共同富裕', '一带一路', 'RCEP',
+        '央行', '降准', '降息', 'LPR', 'MLF', '逆回购', '量化宽松',
+        '国务院', '国常会', '发改委', '财政部', '证监会', '银保监',
+        '政策', '监管', '改革', '调控', '扶持', '补贴', '减税',
+        '产业政策', '财政', '货币', '金融', '房地产', '楼市',
+        '新基建', '新能源', '芯片', '半导体', 'AI', '人工智能', '大模型',
+        '碳中和', '碳达峰', '共同富裕', '一带一路', 'RCEP',
+        '存款准备金', '公开市场', '国债', '专项债',
     ]
 
     ak = _get_akshare()
@@ -116,11 +155,11 @@ def get_policy_keywords():
             logger.warning(f"[政策关键词] {source_name} 异常: {e}")
             continue
 
-    # 关键词匹配
+    # 模糊关键词匹配
     policy_related = []
     for item in all_titles:
         for kw in policy_words:
-            if kw in item['title']:
+            if _fuzzy_match(kw, item['title']):
                 item['matched_keywords'].append(kw)
         if item['matched_keywords']:
             policy_related.append(item)
@@ -166,10 +205,10 @@ def analyze_policy_impact(titles):
     impacts = []
     for item in titles:
         for kw, impact in bullish_kw.items():
-            if kw in item['title']:
+            if _fuzzy_match(kw, item['title']):
                 impacts.append({'title': item['title'], 'keyword': kw, 'impact': impact, 'direction': '📈 利好'})
         for kw, impact in bearish_kw.items():
-            if kw in item['title']:
+            if _fuzzy_match(kw, item['title']):
                 impacts.append({'title': item['title'], 'keyword': kw, 'impact': impact, 'direction': '📉 利空'})
 
     if impacts:

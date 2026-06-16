@@ -125,6 +125,7 @@ class Planner:
         verb: str = "",
         noun: str = "",
         context: Dict[str, Any] = None,
+        context_summary: str = "",
     ) -> PlanResult:
         """为用户 query 生成执行规划。
 
@@ -135,6 +136,7 @@ class Planner:
             verb: 意图动词（可选）
             noun: 意图对象（可选）
             context: 额外上下文
+            context_summary: 对话历史摘要（可选）
 
         Returns:
             PlanResult
@@ -154,7 +156,7 @@ class Planner:
             return self._degrade("LLM 不可用", t0)
 
         try:
-            plan_data = self._llm_plan(query, stock_code, stock_name, verb, noun)
+            plan_data = self._llm_plan(query, stock_code, stock_name, verb, noun, context_summary)
         except Exception as e:
             logger.warning("[Planner] LLM 规划失败: %s", e)
             return self._degrade(f"LLM 规划异常: {e}", t0)
@@ -188,36 +190,75 @@ class Planner:
         stock_name: str,
         verb: str,
         noun: str,
+        context_summary: str = "",
     ) -> Dict[str, Any]:
-        """调用 LLM 生成规划。返回原始 JSON dict。"""
+        """调用 LLM 生成规划。返回原始 JSON dict。
+
+        注入完整上下文：人设 + 对话历史 + 规则 + 全量 skill + 全量 tool
+        """
+        # 1. 人设
+        persona_section = ""
+        try:
+            from app.agent.semantics import get_persona
+            p = get_persona()
+            if p:
+                persona_section = f"你是{p.role}。{p.identity}"
+        except Exception:
+            pass
+
+        # 2. 股票 + 意图
         stock_info = ""
         if stock_code:
             stock_info = f"\n股票: {stock_name or '未知'}（{stock_code}）"
-
         intent_info = ""
         if verb or noun:
             intent_info = f"\n意图: verb={verb or '-'}, noun={noun or '-'}"
 
+        # 3. 全量 skill 摘要
+        skills_section = ""
+        try:
+            from app.agent.semantics import get_skills_summary_xml
+            skills_section = get_skills_summary_xml()
+        except Exception:
+            skills_section = SKILL_CATALOG  # fallback
+
+        # 4. 全量 tool 摘要
+        tools_section = ""
+        try:
+            from app.agent.semantics import get_tools_summary_xml
+            tools_section = get_tools_summary_xml()
+        except Exception:
+            pass
+
+        # 5. 规则 + 输出格式
+        planner_section = ""
+        try:
+            from app.agent.semantics import get_planner_text
+            planner_section = get_planner_text()
+        except Exception:
+            pass
+        if not planner_section:
+            planner_section = (
+                "## 规则\n"
+                "- 从上述技能中选择 1~5 个，按执行顺序排列\n"
+                "- 大多数场景必须包含 technical_agent（技术面地基）\n"
+                "- 不要选择与问题无关的技能\n"
+                "- 如果涉及股票但未提供代码，在 stocks 中列出需要的代码\n"
+            )
+
+        # 6. 对话上下文
+        context_section = ""
+        if context_summary:
+            context_section = f"\n## 对话历史\n{context_summary}\n"
+
         prompt = (
-            "你是量化分析规划器。根据用户问题，选择需要执行的分析技能。\n\n"
+            f"{persona_section}\n\n"
+            "你是量化分析规划器。根据用户问题，制定执行计划。\n\n"
             f"## 用户问题\n{query}{stock_info}{intent_info}\n\n"
-            f"## 可用技能\n{SKILL_CATALOG}\n\n"
-            "## 规则\n"
-            "- 从上述技能中选择 1~5 个，按执行顺序排列\n"
-            "- 大多数场景必须包含 technical_agent（技术面地基）\n"
-            "- 不要选择与问题无关的技能\n"
-            "- 如果涉及股票但未提供代码，在 stocks 中列出需要的代码\n\n"
-            "## 输出格式（只输出 JSON，不要其他文字）\n"
-            "```json\n"
-            "{\n"
-            '  "steps": [\n'
-            '    {"agent": "technical_agent"},\n'
-            '    {"agent": "intelligence_agent"}\n'
-            "  ],\n"
-            '  "stocks": ["600519"],\n'
-            '  "reasoning": "选择理由（50字以内）"\n'
-            "}\n"
-            "```\n"
+            f"{context_section}\n"
+            f"## 可用技能\n{skills_section}\n\n"
+            f"## 可用工具\n{tools_section}\n\n"
+            f"{planner_section}\n"
         )
 
         raw = self._call_llm(prompt)

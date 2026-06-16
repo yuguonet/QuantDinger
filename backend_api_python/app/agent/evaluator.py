@@ -245,7 +245,7 @@ def _evaluate_finance(agent_result, result, tool_chain, verb, noun, domain) -> E
     }
     _ANALYSIS_TOOLS = {
         "analyze_trend", "get_indicator_snapshot", "calculate_ma",
-        "get_volume_analysis", "analyze_pattern", "render_candlestick",
+        "get_volume_analysis", "analyze_pattern",
         "search_comprehensive_intel",
         "get_dragon_tiger_stocks", "get_polymarket_analysis",
     }
@@ -517,14 +517,13 @@ def learn_from_execution(
 
 
 def _writeback_chain(eval_result: EvalResult, verb: str, noun: str):
-    """成功 → 写回工具链。
+    """成功 → 写回工具链（带 5 道质量门）。
 
     策略：
     - 如果 agent 完全遵循了 chain → 不需要更新（chain 已验证有效）
-    - 如果 agent 偏离了 chain 但仍然成功 → 用 agent 实际使用的工具链替换旧 chain
-      （说明 agent 找到了更好的路径）
+    - 如果 agent 偏离了 chain 但仍然成功 → 质量门检查 → 通过后才写入
     """
-    from app.agent.chain.tool_chains import get_tool_chain, save_tool_chain
+    from app.agent.chain.tool_chains import get_tool_chain, save_tool_chain, get_chain_stats
 
     if not eval_result.actual_tools:
         return
@@ -539,8 +538,41 @@ def _writeback_chain(eval_result: EvalResult, verb: str, noun: str):
         )
         return
 
-    # agent 偏离了 chain 但成功了 → 用实际路径替换
-    # 去重保序
+    # ── 质量门（5 道拦截） ──
+    # 1. 步数 > 5 → 拦截（太低效）
+    if eval_result.steps_taken > 5:
+        logger.info("[Learn] %s+%s: 拦截 — 步数 %d > 5", verb, noun, eval_result.steps_taken)
+        return
+
+    # 2. 新链长度 > 5 → 拦截（太臃肿）
+    new_chain_len = len(dict.fromkeys(eval_result.actual_tools))  # 去重后长度
+    if new_chain_len > 5:
+        logger.info("[Learn] %s+%s: 拦截 — 新链长度 %d > 5", verb, noun, new_chain_len)
+        return
+
+    # 3. 评分 < 60 → 拦截（质量不足）
+    if eval_result.score < 60:
+        logger.info("[Learn] %s+%s: 拦截 — 评分 %d < 60", verb, noun, eval_result.score)
+        return
+
+    # 4. 工具成功率 < 50% → 拦截（工具不可靠）
+    if eval_result.tool_success_rate < 0.5:
+        logger.info("[Learn] %s+%s: 拦截 — 工具成功率 %.1f%% < 50%%", verb, noun, eval_result.tool_success_rate * 100)
+        return
+
+    # 5. 旧链执行 ≥ 10 次且成功率 ≥ 80% → 拦截（旧链已验证，不轻易替换）
+    if chain_set:
+        stats = get_chain_stats(verb, noun)
+        executions = stats.get("executions", 0)
+        success_rate = stats.get("success_rate", 0.0)
+        if executions >= 10 and success_rate >= 0.8:
+            logger.info(
+                "[Learn] %s+%s: 拦截 — 旧链已验证（%d次, 成功率%.1f%%）",
+                verb, noun, executions, success_rate * 100,
+            )
+            return
+
+    # ── 质量门全部通过，写入新链 ──
     seen = set()
     new_chain = []
     for t in eval_result.actual_tools:

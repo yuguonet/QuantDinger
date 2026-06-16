@@ -1,6 +1,6 @@
 # Agent + 可追责 架构设计
 
-> 日期: 2026-06-09（初版）→ 2026-06-10（补充关键设计细节 + Skill 自注册 + 因子清理）
+> 日期: 2026-06-09（初版）→ 2026-06-10（补充关键设计细节 + Skill 自注册 + 因子清理）→ 2026-06-16（§17 Planner 前置重构）
 > 适用范围: 仅 domain="finance" 金融领域，其他领域保持 DESIGN_RESTRUCTURE.md 架构
 > 替代: DESIGN_RESTRUCTURE.md（算法化路线，已废弃，保留只读参考）
 > 继承: AGENT_REDESIGN.md（三层追责体系）+ 现有 agent.py（smolagents）
@@ -2013,3 +2013,171 @@ T+3: 后台 Worker 自动运行（每 4 小时）
 **异步回测闭环** 独立于前三者，维护权重表：
 - tool_chains.json 管"怎么走"（路径选择）
 - qd_skill_weights / qd_factor_weights 管"信多少"（权重校准）
+
+## 十七、Phase 1 流程重构（Planner 前置）
+
+> 日期: 2026-06-16
+> 状态: 已实施
+> 目标: Planner 成为唯一编排器，Agent 变为纯执行器
+
+### 17.1 设计原则
+
+**第一阶段只有一个语义注入点：Planner。**
+
+```
+_prepare_intent() ─────────────────────────────────────
+│  1. 意图分析      ← 纯分类器，无语义（只有 intent.md 的规则）
+│  2. 快速通道判断   ← 正则，无语义
+│  3. 提取 stock_code ← 正则，无语义
+│  4. 创建 TraceCollector ← 数据结构，无语义
+│  5. 上下文拼接     ← 纯数据拼接，无语义
+│  6. Planner        ← 唯一语义注入点
+│     ├─ persona（人设）
+│     ├─ context（对话历史）
+│     ├─ skills（全量 skill 摘要）
+│     ├─ tools（全量 tool 摘要）
+│     └─ rules（planner.md 规则）
+│     → 输出: 执行计划
+└──────────────────────────────────────────────────────
+```
+
+其余步骤都是纯数据/正则操作，不涉及任何语义描述。
+
+### 17.2 流程对比
+
+**改造前**：
+```
+用户消息
+    │
+    ▼
+_prepare() ─────────────────────────────────────────
+│  1. 意图分析 (analyze_intent) ← LLM #1
+│  2. 快速通道判断
+│  3. 提取 stock_code
+│  4. 创建 TraceCollector
+│  5. 上下文拼接
+│  6. 构建 Agent (get_smolagent) ← 全量 skill/tool
+└──────────────────────────────────────────────────────
+    │
+    ▼
+_chat_locked() ─────────────────────────────────────
+│  7. 负面反馈检测
+│  8. _try_chain() ← LLM #2 (Planner，无固定链路时)
+│  9. 链路结果注入 enriched
+│ 10. agent.run() ← LLM #3
+│ 11. 结果处理 + DecisionCard
+│ 12. 后置评估 + 学习闭环
+└──────────────────────────────────────────────────────
+```
+
+**问题**：
+- 步骤6在步骤8之前，Agent 全量构建后才知道需要什么
+- Planner 只拿到 SKILL_CATALOG（硬编码12个skill名），没有人设、工具、上下文
+
+**改造后**：
+```
+用户消息
+    │
+    ▼
+_prepare_intent() ─────────────────────────────────
+│  1. 意图分析 ← LLM #1
+│  2. 快速通道判断
+│  3. 提取 stock_code
+│  4. 创建 TraceCollector
+│  5. 上下文拼接
+│  6. Planner ← LLM #2
+│     注入: 人设+上下文+全量skill+全量tool+规则
+│     输出: [{skill, tools}, ...] 执行计划
+└──────────────────────────────────────────────────────
+    │
+    ▼
+_chat_locked() ─────────────────────────────────────
+│  7. 负面反馈检测
+│  8. 构建精简Agent (只加载计划中的 skill/tool)
+│  9. agent.run() ← LLM #3 (纯执行，不编排)
+│ 10. 结果处理 + DecisionCard
+│ 11. 后置评估 + 学习闭环
+└──────────────────────────────────────────────────────
+```
+
+**改进**：
+- Planner 是唯一的编排决策者，拿到完整上下文
+- Agent 只加载需要的 skill/tool，不再全量
+- Agent 变为纯执行器，不需要思考"为什么选这个 Skill"
+
+### 17.3 Planner 注入内容
+
+Planner 的 prompt 包含：
+
+| 内容 | 来源 | 用途 |
+|------|------|------|
+| persona | `semantics/persona.md` | 告诉 Planner 它是谁 |
+| context | `store.get_context_summary()` | 对话历史摘要 |
+| skills | `get_skills_summary_xml()` | 全量 skill 列表+描述 |
+| tools | `get_tools_summary_xml()` | 全量 tool 列表+描述 |
+| rules | `semantics/planner.md` | 核心哲学+数据陷阱+技能优先级+输出格式 |
+
+### 17.4 语义文件职责分离
+
+| 文件 | 注入到 | 职责 |
+|------|--------|------|
+| `planner.md` | Planner LLM | 选什么 Skill、为什么选、用什么工具 |
+| `guidance.md` | Agent instructions | 按顺序执行、怎么调 call_skill |
+| `persona.md` | Planner + Agent | 人设 |
+| `intent.md` | IntentAnalyzer | 意图分类规则 |
+
+**planner.md 内容**：
+- 核心哲学：价格折扣一切
+- 数据陷阱警告（影响 Skill 权重选择）
+- 技能优先级表（从高到低）
+- 场景 → 技能组合示例
+- 输出格式（JSON，包含 skill + tools）
+
+**guidance.md 内容**：
+- 执行规则（按计划顺序执行）
+- call_skill 用法
+
+### 17.5 Planner 输出格式
+
+Planner 输出执行计划，包含每个步骤的 skill 和 tools：
+
+```json
+{
+  "steps": [
+    {
+      "skill": "technical_agent",
+      "tools": ["analyze_trend", "get_indicator_snapshot", "agent_get_kline"]
+    },
+    {
+      "skill": "intelligence_agent",
+      "tools": ["search_stock_news", "get_market_sentiment"]
+    }
+  ],
+  "stocks": ["600519"],
+  "reasoning": "选择理由（50字以内）"
+}
+```
+
+### 17.6 学习闭环质量门
+
+`_writeback_chain()` 新增 5 道质量门，防止脏数据写入 tool_chains.json：
+
+| 门 | 条件 | 拦截原因 |
+|---|------|----------|
+| 1 | 步数 > 5 | 太低效 |
+| 2 | 新链长度 > 5 | 太臃肿 |
+| 3 | 评分 < 60 | 质量不足 |
+| 4 | 工具成功率 < 50% | 工具不可靠 |
+| 5 | 旧链 ≥10次 且 成功率 ≥80% | 旧链已验证，不轻易替换 |
+
+全部通过才写入 `tool_chains.json`，每道门都有日志记录拦截原因。
+
+### 17.7 涉及文件
+
+| 文件 | 改动 |
+|------|------|
+| `agent.py` | `_prepare()` → `_prepare_intent()`，Planner 前置，Agent 构建后移 |
+| `planner.py` | 注入 persona + context + 全量 skills + 全量 tools |
+| `evaluator.py` | `_writeback_chain()` 新增 5 道质量门 |
+| `semantics/planner.md` | 新增核心哲学、数据陷阱、技能优先级 |
+| `semantics/guidance.md` | 精简为纯执行规则 |

@@ -52,13 +52,6 @@ categories:
     domain:
     - finance
     - trading
-  K线图表:
-  - name: render_candlestick
-    description: ''
-    category: K线图表
-    layer: 显示层
-    domain:
-    - finance
   工作区:
   - name: shell_exec
     description: 在工作区目录中执行 shell 命令（支持流式输出）。命令的 cwd 自动设为当前会话的工作区。可用环境变量 WORKSPACE

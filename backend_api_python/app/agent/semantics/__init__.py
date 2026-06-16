@@ -381,6 +381,36 @@ def get_rules_text() -> str:
     return body
 
 
+def get_output_format_text() -> str:
+    """返回 output_format.md 的 Markdown body。"""
+    path = _SEMANTICS_DIR / "output_format.md"
+    if not path.exists():
+        return ""
+    content = path.read_text(encoding="utf-8")
+    _, body = _parse_skill_md(content)
+    return body
+
+
+def get_planner_text() -> str:
+    """返回 planner.md 的 Markdown body。"""
+    path = _SEMANTICS_DIR / "planner.md"
+    if not path.exists():
+        return ""
+    content = path.read_text(encoding="utf-8")
+    _, body = _parse_skill_md(content)
+    return body
+
+
+def get_judgment_text() -> str:
+    """返回 judgment.md 的 Markdown body。"""
+    path = _SEMANTICS_DIR / "judgment.md"
+    if not path.exists():
+        return ""
+    content = path.read_text(encoding="utf-8")
+    _, body = _parse_skill_md(content)
+    return body
+
+
 # ═══════════════════════════════════════════════════════════════
 # Summary generators (for system prompt injection)
 # ═══════════════════════════════════════════════════════════════

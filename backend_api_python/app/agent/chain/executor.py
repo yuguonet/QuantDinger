@@ -454,35 +454,28 @@ class ChainExecutor:
                 "如果修正，必须在 reasoning 中解释为什么基线不够准确。\n"
             )
 
+        # 从 semantics/judgment.md 加载核心原则和输出格式
+        judgment_section = ""
+        try:
+            from app.agent.semantics import get_judgment_text
+            judgment_section = get_judgment_text()
+        except Exception:
+            pass
+        if not judgment_section:
+            judgment_section = (
+                "## 核心原则\n"
+                "- 价格折扣一切：技术面是地基，其他维度用来验证和解释\n"
+                "- 数据陷阱：龙虎榜(盘后+游资一日游)、资金流向(滞后)、新闻(你看到时市场已反应)\n"
+                "- 多维度矛盾时，优先相信量价关系\n"
+                "- A股只能做多，空头信号意味着回避而非做空\n"
+            )
+
         prompt = (
             "你是 A 股量化决策分析师。基于以下各维度分析报告，做跨维度综合研判。\n\n"
-            "## 核心原则\n"
-            "- 价格折扣一切：技术面是地基，其他维度用来验证和解释\n"
-            "- 数据陷阱：龙虎榜(盘后+游资一日游)、资金流向(滞后)、新闻(你看到时市场已反应)\n"
-            "- 多维度矛盾时，优先相信量价关系\n"
-            "- A股只能做多，空头信号意味着回避而非做空\n\n"
+            f"{judgment_section}\n\n"
             f"## 分析目标\n股票: {self.stock_name or self.stock_code}（{self.stock_code}）\n\n"
             f"## 各维度分析报告\n{reports_text}\n"
             f"{baseline_section}\n"
-            "## 输出格式（只输出 JSON，不要其他文字）\n"
-            "```json\n"
-            "{\n"
-            '  "action": "buy/sell/hold/skip",\n'
-            '  "score": 0-100,\n'
-            '  "direction": "bullish/bearish/neutral",\n'
-            '  "confidence": 0.0-1.0,\n'
-            '  "reasoning": "你的跨维度推理过程（50-200字）",\n'
-            '  "key_factors": ["最关键的1-3个因素"],\n'
-            '  "baseline_override": false\n'
-            "}\n"
-            "```\n\n"
-            "规则：\n"
-            "- action: buy=建议买入, sell=建议卖出, hold=建议观望, skip=建议跳过\n"
-            "- score: 0=极度看空, 50=中性, 100=极度看多\n"
-            "- direction: score>=60=bullish, score<=40=bearish, 其余=neutral\n"
-            "- confidence: 你对这个判断的确信程度（0-1），不是数据充分度\n"
-            "- reasoning: 必须解释为什么各维度综合后得出这个结论\n"
-            "- baseline_override: 是否修正了基线判断（true=修正，false=同意基线）\n"
         )
 
         raw = call_llm(prompt)

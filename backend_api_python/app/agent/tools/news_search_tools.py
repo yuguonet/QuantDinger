@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-news Search tools — news search, comprehensive intelligence.
+news_search_tools — Agent 新闻情报工具 (薄壳)
 
-数据源统一走 app.services.news_search.fetch_financial_news()（带 DB 缓存）
+实际逻辑在 services/news_search.py + news_analysis.py
+返回: 总分 + 方向 + 摘要(一票否决置顶, 合计≤20条)
 """
 from __future__ import annotations
 
@@ -13,82 +14,145 @@ from app.agent.tools.registry import tool
 
 logger = logging.getLogger(__name__)
 
-# ═══════════════════════════════════════════════════════════════
-# 转接适配层 — 对齐原 fetch_financial_news() 接口
-# ═══════════════════════════════════════════════════════════════
+# 工具层短时缓存: 同一 symbol 60s 内直接返回
+_search_cache: Dict[str, tuple] = {}  # key → (timestamp, result)
+_CACHE_TTL = 60
 
-def fetch_financial_news(
-    lang: str = "all",
-    market: str = "all",
-    symbol: str = "",
-    name: str = "",
-    keywords: str = "",
-) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    转接适配函数 — 调用 news_search.fetch_financial_news()（带缓存）
 
-    内部流程:
-      1. 先查 DB 缓存 (24h 内命中直接返回, 零网络请求)
-      2. 缓存未命中 → search_news_dispatch() → 评分 → 写 DB
-      3. 格式化返回
-    """
-    from app.services.news_search import fetch_financial_news as _fetch
-    return _fetch(lang=lang, market=market, symbol=symbol, name=name, keywords=keywords)
+def _get_policy_from_cache() -> List[Dict[str, Any]]:
+    """政策新闻: 只读 DB 缓存 (scheduler 每日写入)"""
+    try:
+        from app.services.news_search import get_news_cache_manager
+        cached = get_news_cache_manager().get_items("POLICY", "CNStock")
+        if not cached:
+            return []
+        return [
+            {"title": r["title"], "link": r.get("url", ""),
+             "snippet": r.get("snippet", ""), "source": r.get("source", ""),
+             "published": r.get("published_date", ""),
+             "sentiment": r.get("sentiment", "neutral"),
+             "sentiment_score": r.get("sentiment_score")}
+            for r in cached
+        ]
+    except Exception as e:
+        logger.warning("读取 POLICY 缓存失败: %s", e)
+        return []
 
-# ═══════════════════════════════════════════════════════════════
-# 工具函数 — 无需改动
-# ═══════════════════════════════════════════════════════════════
 
-def _extract_news_items(resp: Dict) -> List[Dict[str, Any]]:
-    """从 fetch_financial_news 返回的 {"cn":[...], "en":[...]} 中提取扁平列表。"""
-    items: List[Dict[str, Any]] = []
-    for lang_key in ("cn", "en"):
-        for item in resp.get(lang_key) or []:
-            items.append({
-                "title": item.get("title", ""),
-                "link": item.get("link", ""),
-                "snippet": item.get("snippet", ""),
-                "source": item.get("source", ""),
-                "published": item.get("published", ""),
-                "sentiment": item.get("sentiment", "neutral"),
-                "sentiment_score": item.get("sentiment_score", 0),
-            })
-    return items
+def _get_news(symbol: str, market: str = "CNStock", name: str = "") -> List[Dict[str, Any]]:
+    """个股/板块新闻: 走 fetch_financial_news (缓存→搜索→写入)"""
+    try:
+        from app.services.news_search import fetch_financial_news
+        resp = fetch_financial_news(lang="all", market=market, symbol=symbol, name=name)
+        items = []
+        for lang_key in ("cn", "en"):
+            for it in resp.get(lang_key) or []:
+                items.append({
+                    "title": it.get("title", ""),
+                    "link": it.get("link", ""),
+                    "snippet": it.get("snippet", ""),
+                    "source": it.get("source", ""),
+                    "published": it.get("published", ""),
+                    "sentiment": it.get("sentiment", "neutral"),
+                    "sentiment_score": it.get("sentiment_score"),
+                })
+        return items
+    except Exception as e:
+        logger.warning("获取新闻失败 %s(%s): %s", symbol, market, e)
+        return []
+
+
+def _build_result(items: List[Dict[str, Any]], label: str) -> Dict[str, Any]:
+    """评分 + 排序: 一票否决置顶, 合计≤20条"""
+    from app.services.news_analysis import composite_score
+
+    articles = [
+        {"score": it.get("sentiment_score") or 0.0,
+         "published_date": it.get("published", "")}
+        for it in items
+    ]
+    score_info = composite_score(articles) if articles else {}
+
+    veto = score_info.get("veto", False)
+    veto_article = score_info.get("veto_article")
+
+    # 分离一票否决 vs 正常
+    veto_items, normal_items = [], []
+    for it in items:
+        sc = it.get("sentiment_score")
+        if sc == -999:
+            veto_items.append({**it, "_veto": True})
+        else:
+            normal_items.append(it)
+
+    # 正常按时间倒序
+    normal_items.sort(key=lambda x: x.get("published", ""), reverse=True)
+
+    # 合并: 一票否决置顶, 合计≤20
+    merged = veto_items + normal_items
+    merged = merged[:20]
+
+    return {
+        "label": label,
+        "composite_score": score_info.get("composite_score", 0),
+        "direction": score_info.get("direction", "中性"),
+        "veto": veto,
+        "veto_article": veto_article,
+        "count": len(merged),
+        "news": merged,
+    }
+
 
 @tool(
-    description="综合情报搜索：个股新闻 + 政策新闻 + 风险排查，多维度获取情报。可选 keyword 聚焦搜索关键词。",
+    description="个股情报: 返回综合评分+摘要。一票否决置顶强调, 最新≤20条。",
     category="情报搜索",
     layer="分析层",
     domain=["finance"],
 )
-def search_comprehensive_intel(stock_code: str, keyword: str = "") -> Dict[str, Any]:
-    """综合情报搜索：个股新闻 + 政策新闻。可选 keyword 聚焦关键词。
+def search_stock_intel(stock_code: str, name: str = "") -> Dict[str, Any]:
+    items = _get_news(stock_code, "CNStock", name)
+    return _build_result(items, f"个股:{stock_code}")
 
-    Args:
-        stock_code: 股票代码
-        keyword: 可选，搜索关键词（如 "解禁"、"减持"）
-    """
-    try:
-        stock_resp = fetch_financial_news(lang="all", market="CNStock", symbol=stock_code, name=keyword or "")
-        policy_resp = fetch_financial_news(lang="all", market="CNStock", symbol="POLICY")
 
-        stock_items = _extract_news_items(stock_resp)
-        policy_items = _extract_news_items(policy_resp)
+@tool(
+    description="板块/市场情报: 返回综合评分+摘要。一票否决置顶强调, 最新≤20条。",
+    category="情报搜索",
+    layer="分析层",
+    domain=["finance"],
+)
+def search_sector_intel(market: str = "CNStock") -> Dict[str, Any]:
+    items = _get_news(market, market)
+    return _build_result(items, f"板块:{market}")
 
-        results = {
-            "latest_news": stock_items[:8],
-            "policy_news": policy_items[:5],
-        }
 
-        total = sum(len(v) for v in results.values())
-        return {
-            "stock_code": stock_code,
-            "keyword": keyword or stock_code,
-            "dimensions": {k: len(v) for k, v in results.items()},
-            "total_results": total,
-            "results": stock_items[:8],  # 兼容旧接口的扁平列表
-            "data": results,
-        }
-    except Exception as e:
-        logger.error("search_comprehensive_intel(%s) failed: %s", stock_code, e)
-        return {"stock_code": stock_code, "error": str(e), "retriable": True}
+@tool(
+    description="政策/宏观情报: 返回综合评分+摘要。一票否决置顶强调, 最新≤20条。只读缓存,不触发搜索。",
+    category="情报搜索",
+    layer="分析层",
+    domain=["finance"],
+)
+def search_policy_intel(market: str = "CNStock") -> Dict[str, Any]:
+    items = _get_policy_from_cache()
+    return _build_result(items, f"政策:{market}")
+
+
+@tool(
+    description="综合情报: 个股+政策, 返回总分+摘要。一票否决置顶, 合计≤20条。",
+    category="情报搜索",
+    layer="分析层",
+    domain=["finance"],
+)
+def search_comprehensive_intel(stock_code: str, name: str = "") -> Dict[str, Any]:
+    stock_items = _get_news(stock_code, "CNStock", name)
+    policy_items = _get_policy_from_cache()
+
+    # 合并去重(按title)
+    seen = set()
+    merged = []
+    for it in stock_items + policy_items:
+        t = it.get("title", "")
+        if t and t not in seen:
+            seen.add(t)
+            merged.append(it)
+
+    return _build_result(merged, f"综合:{stock_code}")

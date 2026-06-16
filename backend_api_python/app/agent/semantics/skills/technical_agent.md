@@ -12,7 +12,6 @@ tools:
   - analyze_pattern
   - get_chip_distribution
   - get_indicator_snapshot
-  - render_candlestick
   - get_realtime_quote
   - agent_get_kline
 ---

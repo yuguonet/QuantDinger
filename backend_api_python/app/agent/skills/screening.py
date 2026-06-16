@@ -88,7 +88,12 @@ class ScreeningSkill:
 
         try:
             llm_text = call_llm(prompt)
-            return self.parse_output(stock_code, stock_name, llm_text, tool_results)
+            from app.agent.chain.contract import parse_skill_output
+            report = parse_skill_output(llm_text, skill_name=self.name)
+            report.tools_called = list(tool_results.keys())
+            if not report.analysis:
+                report.analysis = llm_text[:2000]
+            return report
         except Exception as e:
             logger.warning("[Skill:%s] LLM 调用失败: %s", self.name, e)
             return SkillReport(

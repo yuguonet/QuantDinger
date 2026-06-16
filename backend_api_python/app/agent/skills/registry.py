@@ -140,6 +140,11 @@ def skill(
             "__qualname__": cls.__qualname__,
         })
 
+        # 继承原始类的自定义类属性 (如 _TOOLS_NEED_STRATEGY)
+        for k, v in cls.__dict__.items():
+            if k.startswith("_") and not k.startswith("__") and k not in skill_cls.__dict__:
+                setattr(skill_cls, k, v)
+
         # 如果原始类定义了 analyze 方法，覆盖默认实现
         if custom_analyze is not None:
             skill_cls.analyze = custom_analyze

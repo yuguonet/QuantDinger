@@ -351,10 +351,52 @@ def get_emotion_history(hours=None, date=None) -> dict:
 
 
 def get_policy() -> dict:
-    """AI政策解读 — 直接调用，由 news.py PostgreSQL 缓存管理"""
-    if _rt_policy is not None:               # ① 内存缓存
+    """AI政策解读 — 只读内存缓存，不主动触发搜索（由 scheduler 每日写入）"""
+    if _rt_policy is not None:
         return _rt_policy
-    return _fetch_policy()                   # ② 原有逻辑
+    # 内存没有时从 DB 读一次，仍不触发网络请求
+    try:
+        from app.services.news_search import get_news_cache_manager
+        cache_mgr = get_news_cache_manager()
+        cached_items = cache_mgr.get_items("POLICY", "CNStock")
+        if cached_items:
+            news_list = [
+                {
+                    "title": r.get("title", ""),
+                    "link": r.get("url", ""),
+                    "snippet": r.get("snippet", ""),
+                    "source": r.get("source", ""),
+                    "published": r.get("published_date", ""),
+                    "sentiment": r.get("sentiment", "neutral"),
+                    "sentiment_score": r.get("sentiment_score"),
+                    "category": "政策/宏观:CNStock", "lang": "cn",
+                }
+                for r in cached_items
+            ]
+            from app.services.news_analysis import composite_score
+            score_articles = [
+                {"score": item.get("sentiment_score", 0.0) or 0.0,
+                 "published_date": item.get("published", "")}
+                for item in news_list
+            ]
+            try:
+                score_info = composite_score(score_articles)
+            except Exception:
+                score_info = {}
+            result = {
+                "code": 1, "msg": "success",
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "data": {
+                    "news": news_list,
+                    "score": score_info.get("composite_score", 0),
+                    "direction": score_info.get("direction", "中性"),
+                    "count": len(news_list),
+                },
+            }
+            return result
+    except Exception as e:
+        logger.warning("DB 缓存读取 POLICY 失败: %s", e)
+    return {"code": 0, "msg": "暂无政策数据（等待 scheduler 每日刷新）", "data": {}}
 
 
 # ============================================================

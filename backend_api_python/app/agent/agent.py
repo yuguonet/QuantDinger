@@ -206,67 +206,23 @@ def _build_instructions(user_message: str = "", skill_instructions: str = "",
     finance_json_section = ""
     if domain == "finance" and stock_code:
         _agent_cls = _get_agent_class()
-        _json_fields = (
-            '"action": "buy/sell/hold/skip",\n'
-            '    "score": 0-100,\n'
-            '    "direction": "bullish/bearish/neutral",\n'
-            '    "confidence": "high/medium/low",\n'
-            '    "timeframe": "T+1/T+3/T+5/1W/1M/3M/1Y",\n'
-            '    "timeframe_reason": "为什么选这个时间维度",\n'
-            '    "stock_code": "6位代码",\n'
-            '    "stock_name": "股票名称",\n'
-            '    "signal": "一句话信号摘要",\n'
-            '    "factors": [\n'
-            '        {"name": "维度名", "score": 0-100, "direction": "bullish/bearish/neutral"}\n'
-            '    ],\n'
-            '    "analysis": "你的完整分析文字"'
-        )
-        _timeframe_rules = """**timeframe 规则**：
-- 用户给了时间（"明天"/"这周"）→ 按用户的来
-- 用户没给时间 → **默认 T+3**（3个交易日短线），除非用户明确问中长期
-- 禁止使用 1Y/1Y+ 等超长周期作为默认值，那等于没分析
-- direction 和 score 只在你声明的时间维度内有效
-- 不同时间维度方向可能相反，必须明确"""
-
-        if _agent_cls is ToolCallingAgent:
-            finance_json_section = f"""
-## ⚠️ 输出格式（必须遵守）
-
-你必须调用 final_answer 工具来返回结果。工具调用的 JSON 格式如下：
-
-```json
-{{
-    "name": "final_answer",
-    "arguments": {{
-{_json_fields}
-    }}
-}}
-```
-
-{_timeframe_rules}
-
-不要输出任何其他文字，只输出上述 JSON 工具调用。格式不对会被系统拒绝并要求重写。
-
-"""
-        else:
-            finance_json_section = f"""
-## ⚠️ 输出格式（必须遵守）
-
-你的最终答案必须通过 Python 代码调用 `final_answer()` 函数来返回一个包含以下字段的字典。
-
-在代码块的最后一行加上：
-
-```py
-final_answer({{
-{_json_fields}
-}})
-```
-
-{_timeframe_rules}
-
-不要输出任何 ````json` 代码块。必须用 Python 的 `final_answer()` 返回。格式不对会被系统拒绝并要求重写。
-
-"""
+        try:
+            from app.agent.semantics import get_output_format_text
+            _of_text = get_output_format_text()
+            if _of_text:
+                # 根据 agent 类型选择对应段落
+                if _agent_cls is ToolCallingAgent:
+                    # 提取 ToolCallingAgent 段落
+                    import re as _of_re
+                    _m = _of_re.search(r'## ToolCallingAgent 输出格式\n(.*?)(?=## CodeAgent|$)', _of_text, _of_re.DOTALL)
+                    finance_json_section = f"\n## ⚠️ 输出格式（必须遵守）\n\n{_m.group(1).strip()}\n\n" if _m else ""
+                else:
+                    # 提取 CodeAgent 段落
+                    import re as _of_re
+                    _m = _of_re.search(r'## CodeAgent 输出格式\n(.*?)$', _of_text, _of_re.DOTALL)
+                    finance_json_section = f"\n## ⚠️ 输出格式（必须遵守）\n\n{_m.group(1).strip()}\n\n" if _m else ""
+        except Exception:
+            pass  # 加载失败不影响主流程
 
     # 金融领域权重注入
     weight_section = ""

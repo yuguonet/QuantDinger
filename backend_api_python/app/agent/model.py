@@ -18,10 +18,43 @@ import os
 from typing import Any, Optional
 
 from smolagents import OpenAIModel
+import re as _re
+import json as _json
 
 from app.services.llm import LLMService, LLMProvider, PROVIDER_CONFIGS
 
 logger = logging.getLogger(__name__)
+
+
+def _fix_llm_output(text: str) -> str:
+    """修复本地模型不遵循 final_answer() 格式的问题。
+    如果 LLM 输出了裸 JSON (```json 块)，自动包装成 final_answer() 调用。"""
+    if not text or "final_answer" in text:
+        return text
+    # 匹配 ```json ... ``` 块
+    m = _re.search(r'```json\s*\n?(.*?)\n?\s*```', text, _re.DOTALL)
+    if m:
+        json_str = m.group(1).strip()
+        try:
+            _json.loads(json_str)  # 验证是合法 JSON
+            # 替换为 final_answer() 调用
+            prefix = text[:m.start()].rstrip()
+            if prefix:
+                prefix += "\n"
+            return f'{prefix}<code>\nfinal_answer({json_str})\n</code>'
+        except _json.JSONDecodeError:
+            pass
+    return text
+
+
+class _WrappedOpenAIModel(OpenAIModel):
+    """包装 OpenAIModel，在 generate 后自动修复输出格式。"""
+
+    def generate(self, *args, **kwargs):
+        result = super().generate(*args, **kwargs)
+        if hasattr(result, 'content') and isinstance(result.content, str):
+            result.content = _fix_llm_output(result.content)
+        return result
 
 
 def build_model(
@@ -75,7 +108,7 @@ def build_model(
         active_provider.value, model_id, base_url,
     )
 
-    return OpenAIModel(
+    return _WrappedOpenAIModel(
         model_id=model_id,
         api_base=base_url,
         api_key=api_key,
