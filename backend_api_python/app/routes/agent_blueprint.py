@@ -229,12 +229,22 @@ def agent_chat_stream():
                 while True:
                     try:
                         ev = event_queue.get(timeout=300)
-                        yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                        try:
+                            yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            # 客户端已断开，停止推送
+                            logger.info("[SSE] Client disconnected, stopping stream")
+                            break
                         if ev.get("type") in ("done", "error"):
                             break
                     except queue.Empty:
-                        yield f"data: {json.dumps({'type': 'error', 'message': '超时'}, ensure_ascii=False)}\n\n"
+                        try:
+                            yield f"data: {json.dumps({'type': 'error', 'message': '超时'}, ensure_ascii=False)}\n\n"
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            pass
                         break
+            except GeneratorExit:
+                logger.info("[SSE] Client disconnected (GeneratorExit)")
             finally:
                 _release_user_lock(uid)
 

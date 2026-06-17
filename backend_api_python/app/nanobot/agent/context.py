@@ -62,6 +62,7 @@ class ContextBuilder:
         self.timezone = timezone
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace, disabled_skills=set(disabled_skills) if disabled_skills else None)
+        self.system_prompt_extra: str = ""
 
     def build_system_prompt(
         self,
@@ -113,6 +114,9 @@ class ContextBuilder:
 
         if session_summary:
             parts.append(f"[Archived Context Summary]\n\n{session_summary}")
+
+        if self.system_prompt_extra:
+            parts.append(self.system_prompt_extra)
 
         return "\n\n---\n\n".join(parts)
 

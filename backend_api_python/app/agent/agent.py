@@ -29,11 +29,24 @@ class _AgentExecutor:
     """委托给 nanobot_bridge.NanobotExecutor。"""
 
     def __init__(self, skills=None, user_id=1, max_steps=10,
-                 timeout_seconds=None, model=None, provider=None):
+                 timeout_seconds=None, model=None, provider=None,
+                 temperature=None, max_tokens=None,
+                 context_window_tokens=None, context_block_limit=None,
+                 reasoning_effort=None, model_preset=None,
+                 max_concurrent_subagents=None,
+                 dream_enabled=None, dream_interval_h=None,
+                 timezone=None):
         from app.agent.nanobot_bridge import NanobotExecutor
         self._impl = NanobotExecutor(
             skills=skills, user_id=user_id, max_steps=max_steps,
             timeout_seconds=timeout_seconds, model=model, provider=provider,
+            temperature=temperature, max_tokens=max_tokens,
+            context_window_tokens=context_window_tokens,
+            context_block_limit=context_block_limit,
+            reasoning_effort=reasoning_effort, model_preset=model_preset,
+            max_concurrent_subagents=max_concurrent_subagents,
+            dream_enabled=dream_enabled, dream_interval_h=dream_interval_h,
+            timezone=timezone,
         )
         self._current_agent = None
         self._agent_ready_event = self._impl._agent_ready_event
@@ -49,8 +62,21 @@ class _AgentExecutor:
 
 def build_agent_executor(skills=None, user_id=1, max_steps=10,
                          timeout_seconds=None, model=None, provider=None,
+                         temperature=None, max_tokens=None,
+                         context_window_tokens=None, context_block_limit=None,
+                         reasoning_effort=None, model_preset=None,
+                         max_concurrent_subagents=None,
+                         dream_enabled=None, dream_interval_h=None,
+                         timezone=None,
                          domain=None) -> _AgentExecutor:
     return _AgentExecutor(
         skills=skills, user_id=user_id, max_steps=max_steps,
         timeout_seconds=timeout_seconds, model=model, provider=provider,
+        temperature=temperature, max_tokens=max_tokens,
+        context_window_tokens=context_window_tokens,
+        context_block_limit=context_block_limit,
+        reasoning_effort=reasoning_effort, model_preset=model_preset,
+        max_concurrent_subagents=max_concurrent_subagents,
+        dream_enabled=dream_enabled, dream_interval_h=dream_interval_h,
+        timezone=timezone,
     )

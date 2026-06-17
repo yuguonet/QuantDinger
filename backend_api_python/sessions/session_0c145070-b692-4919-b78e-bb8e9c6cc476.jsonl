@@ -1,0 +1,8 @@
+{"_type": "metadata", "key": "session_0c145070-b692-4919-b78e-bb8e9c6cc476", "created_at": "2026-06-17T20:30:10.201210", "updated_at": "2026-06-17T23:39:36.959939", "metadata": {"_last_summary": {"text": "```plaintext\n[2026-06-17] USER: 你好\n[2026-06-17] ASSISTANT: 你好！有什么我可以帮忙的吗？\n```", "last_active": "2026-06-17T23:21:08.352801"}, "pending_user_turn": true}, "last_consolidated": 4}
+{"role": "user", "content": "你好", "timestamp": "2026-06-17T22:46:21.754126"}
+{"role": "assistant", "content": "你好！有什么我可以帮忙的吗？", "timestamp": "2026-06-17T22:47:37.291395", "latency_ms": 75699}
+{"role": "user", "content": "你好", "timestamp": "2026-06-17T23:07:22.289316"}
+{"role": "assistant", "content": "你好！有什么我可以帮忙的吗？", "timestamp": "2026-06-17T23:09:14.986642", "latency_ms": 115721}
+{"role": "user", "content": "你好", "timestamp": "2026-06-17T23:19:30.785187"}
+{"role": "assistant", "content": "你好！有什么我可以帮忙的吗？", "timestamp": "2026-06-17T23:21:08.352801", "latency_ms": 114389}
+{"role": "user", "content": "你好", "timestamp": "2026-06-17T23:39:36.959939"}

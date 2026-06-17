@@ -273,7 +273,7 @@ def _insert_node(cur, node: EvalNode, parent_id: Optional[int],
         node.status, node.error or None, node.elapsed_ms, node.data_source or None,
         session_id or None, user_query or None, model or None,
     ))
-    node_id = cur.fetchone()[0]
+    node_id = cur.fetchone()['id']
 
     # 更新 root_id
     if parent_id is None:
