@@ -2,12 +2,10 @@
 """
 Cron Jobs API — 定时任务 REST 接口。
 
-供前端管理定时任务（CRUD + 手动触发）。
-Agent 工具通过 cron_tools.py 直接操作数据库，不经过此路由。
+委托给 nanobot cron service，数据库仅做持久化。
 """
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -16,8 +14,6 @@ from flask import Blueprint, jsonify, request
 logger = logging.getLogger(__name__)
 
 cron_bp = Blueprint('cron', __name__, url_prefix='/api/agent/cron')
-
-TZ_CN = timezone(timedelta(hours=8))
 
 
 def _get_db():
@@ -34,11 +30,21 @@ def _row_to_dict(row) -> dict:
     return d
 
 
+def _get_cron_service():
+    """获取 nanobot cron service。"""
+    try:
+        from app.agent.nanobot_bridge import get_nanobot_loop
+        loop = get_nanobot_loop()
+        return loop.cron_service
+    except Exception as e:
+        logger.warning("[CronAPI] nanobot cron service 不可用: %s", e)
+        return None
+
+
 # ── 列表 ──────────────────────────────────────────────────
 
 @cron_bp.route('/jobs', methods=['GET'])
 def list_jobs():
-    """获取所有定时任务。"""
     try:
         with _get_db() as conn:
             cur = conn.cursor()
@@ -59,7 +65,6 @@ def list_jobs():
 
 @cron_bp.route('/jobs', methods=['POST'])
 def create_job():
-    """创建定时任务。"""
     data = request.get_json() or {}
     name = (data.get("name") or "").strip()
     cron_expr = (data.get("cron_expr") or "").strip()
@@ -79,7 +84,6 @@ def create_job():
     if mode == "function" and not function_path:
         return jsonify({"error": "function 模式需要提供 function_path"}), 400
 
-    # 校验函数路径
     if mode == "function" and function_path:
         try:
             module_path, _, func_name = function_path.rpartition(".")
@@ -96,18 +100,13 @@ def create_job():
             cur = conn.cursor()
             cur.execute("""
                 INSERT INTO qd_cron_jobs (name, cron_expr, mode, prompt, function_path, description)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                RETURNING id
+                VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
             """, (name, cron_expr, mode, prompt, function_path, description))
             row = cur.fetchone()
             conn.commit()
 
-        # 自调度：立即注册 Timer
-        try:
-            from app.agent.cron_worker import schedule_job_from_db
-            schedule_job_from_db(row["id"])
-        except Exception as e:
-            logger.warning("[CronAPI] 调度注册失败: %s", e)
+        # 注册到 nanobot cron service
+        _sync_job_to_nanobot(row["id"])
 
         return jsonify({"id": row["id"], "status": "created"}), 201
     except Exception as e:
@@ -119,23 +118,17 @@ def create_job():
 
 @cron_bp.route('/jobs/<int:job_id>', methods=['PUT'])
 def update_job(job_id):
-    """更新定时任务。"""
     data = request.get_json() or {}
-    updates = []
-    params = []
-
+    updates, params = [], []
     for field in ("name", "cron_expr", "mode", "prompt", "function_path", "description"):
         if field in data:
             updates.append(f"{field} = %s")
             params.append(data[field] if data[field] else None)
-
     if "enabled" in data:
         updates.append("enabled = %s")
         params.append(bool(data["enabled"]))
-
     if not updates:
         return jsonify({"error": "没有要更新的字段"}), 400
-
     updates.append("updated_at = NOW()")
     params.append(job_id)
 
@@ -145,20 +138,10 @@ def update_job(job_id):
             cur.execute(f"UPDATE qd_cron_jobs SET {', '.join(updates)} WHERE id = %s RETURNING id, enabled", params)
             row = cur.fetchone()
             conn.commit()
-
         if not row:
             return jsonify({"error": "任务不存在"}), 404
 
-        # 自调度：重算 Timer
-        try:
-            from app.agent.cron_worker import schedule_job_from_db, unschedule_job
-            if row["enabled"]:
-                schedule_job_from_db(row["id"])
-            else:
-                unschedule_job(row["id"])
-        except Exception as e:
-            logger.warning("[CronAPI] 调度更新失败: %s", e)
-
+        _sync_job_to_nanobot(job_id)
         return jsonify({"status": "updated"})
     except Exception as e:
         logger.error("[CronAPI] 更新失败: %s", e)
@@ -169,23 +152,25 @@ def update_job(job_id):
 
 @cron_bp.route('/jobs/<int:job_id>', methods=['DELETE'])
 def delete_job(job_id):
-    """删除定时任务。"""
     try:
         with _get_db() as conn:
             cur = conn.cursor()
             cur.execute("DELETE FROM qd_cron_jobs WHERE id = %s RETURNING id", (job_id,))
             row = cur.fetchone()
             conn.commit()
-
         if not row:
             return jsonify({"error": "任务不存在"}), 404
 
-        # 自调度：取消 Timer
-        try:
-            from app.agent.cron_worker import unschedule_job
-            unschedule_job(job_id)
-        except Exception as e:
-            logger.warning("[CronAPI] 取消调度失败: %s", e)
+        # 从 nanobot cron 移除
+        cs = _get_cron_service()
+        if cs:
+            try:
+                import asyncio
+                loop = asyncio.new_event_loop()
+                loop.run_until_complete(cs.remove_job(f"qd_{job_id}"))
+                loop.close()
+            except Exception:
+                pass
 
         return jsonify({"status": "deleted"})
     except Exception as e:
@@ -197,28 +182,78 @@ def delete_job(job_id):
 
 @cron_bp.route('/jobs/<int:job_id>/trigger', methods=['POST'])
 def trigger_job(job_id):
-    """手动触发任务。"""
     try:
         with _get_db() as conn:
             cur = conn.cursor()
             cur.execute("SELECT id, name, cron_expr, mode, prompt, function_path FROM qd_cron_jobs WHERE id = %s", (job_id,))
             row = cur.fetchone()
-
         if not row:
             return jsonify({"error": "任务不存在"}), 404
 
         job = dict(row)
-        mode = job.get("mode", "prompt")
-
-        import threading
-        from app.agent.cron_worker import _execute_prompt_job, _execute_function_job
-
-        target = _execute_function_job if mode == "function" else _execute_prompt_job
-        t = threading.Thread(target=target, args=(job,), daemon=True,
-                             name=f"cron-manual-{job_id}")
-        t.start()
-
+        _execute_job(job)
         return jsonify({"status": "triggered", "job_id": job_id, "name": job["name"]})
     except Exception as e:
         logger.error("[CronAPI] 触发失败: %s", e)
         return jsonify({"error": str(e)}), 500
+
+
+# ── 内部：同步 DB job → nanobot cron ─────────────────────
+
+def _sync_job_to_nanobot(job_id: int):
+    """从 DB 读取 job，注册到 nanobot cron service。"""
+    cs = _get_cron_service()
+    if not cs:
+        return
+    try:
+        with _get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM qd_cron_jobs WHERE id = %s", (job_id,))
+            row = cur.fetchone()
+        if not row or not row.get("enabled"):
+            return
+
+        job = dict(row)
+        import asyncio
+        from nanobot.cron.types import CronJob, CronSchedule, CronJobState
+
+        cron_job = CronJob(
+            id=f"qd_{job_id}",
+            name=job.get("name", f"Job#{job_id}"),
+            schedule=CronSchedule(kind="cron", expr=job["cron_expr"], tz="Asia/Shanghai"),
+            message=f"执行定时任务: {job.get('prompt') or job.get('function_path') or job['name']}",
+            state=CronJobState.ENABLED,
+        )
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(cs.add_job(cron_job))
+        loop.close()
+        logger.info("[CronAPI] 已注册 nanobot cron: qd_%d", job_id)
+    except Exception as e:
+        logger.warning("[CronAPI] 注册失败: %s", e)
+
+
+def _execute_job(job: dict):
+    """执行一个 cron job（prompt 模式用 agent，function 模式直接调用）。"""
+    import threading
+    mode = job.get("mode", "prompt")
+
+    if mode == "function":
+        fn_path = job.get("function_path")
+        if fn_path:
+            module_path, _, func_name = fn_path.rpartition(".")
+            import importlib
+            mod = importlib.import_module(module_path)
+            fn = getattr(mod, func_name)
+            threading.Thread(target=fn, daemon=True).start()
+    else:
+        # prompt 模式：用 agent 执行
+        prompt = job.get("prompt", "")
+        if prompt:
+            def _run():
+                try:
+                    from app.agent.agent import build_agent_executor
+                    executor = build_agent_executor(skills=[], user_id="cron", max_steps=8, timeout_seconds=120)
+                    executor.chat(message=prompt, session_id=f"cron_{job['id']}")
+                except Exception as e:
+                    logger.error("[CronAPI] prompt 执行失败: %s", e)
+            threading.Thread(target=_run, daemon=True).start()
