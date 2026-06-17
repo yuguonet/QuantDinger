@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any, Dict, List, Optional
-from app.agent.tools.registry import tool
 
 logger = logging.getLogger(__name__)
 
@@ -26,12 +25,6 @@ except ImportError as _e:
 
 # ── Tool functions ────────────────────────────────────────────
 
-@tool(
-    description="列出用户的所有交易策略（含运行状态）。返回策略 ID、名称、类型、状态、交易对、时间框架。用于发现可用策略。",
-    category="交易",
-    layer="执行层",
-    domain=["trading"],
-)
 def list_strategies(user_id: int = 1) -> Dict[str, Any]:
     """列出用户的所有交易策略（含运行状态）。
 
@@ -65,12 +58,6 @@ def list_strategies(user_id: int = 1) -> Dict[str, Any]:
         logger.error("list_strategies failed: %s", e, exc_info=True)
         return {"strategies": [], "count": 0, "error": str(e)}
 
-@tool(
-    description="获取策略的详细配置信息（类型、交易对、指标、参数、状态等）。",
-    category="交易",
-    layer="执行层",
-    domain=["trading"],
-)
 def get_strategy_detail(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
     """获取策略的详细配置信息。
 
@@ -100,12 +87,6 @@ def get_strategy_detail(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
         logger.error("get_strategy_detail failed: %s", e, exc_info=True)
         return {"success": False, "error": str(e)}
 
-@tool(
-    description="启动一个交易策略，开始按指标信号自动执行买卖操作。",
-    category="交易",
-    layer="执行层",
-    domain=["trading"],
-)
 def start_strategy(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
     """启动一个交易策略（开始实盘运行）。
 
@@ -155,12 +136,6 @@ def start_strategy(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
         logger.error("start_strategy failed: %s", e, exc_info=True)
         return {"success": False, "error": f"启动失败: {e}"}
 
-@tool(
-    description="停止一个正在运行的交易策略。",
-    category="交易",
-    layer="执行层",
-    domain=["trading"],
-)
 def stop_strategy(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
     """停止一个正在运行的交易策略。
 
@@ -202,12 +177,6 @@ def stop_strategy(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
         logger.error("stop_strategy failed: %s", e, exc_info=True)
         return {"success": False, "error": f"停止失败: {e}"}
 
-@tool(
-    description="获取策略的最近交易记录，包含买卖价格、数量、盈亏等。",
-    category="交易",
-    layer="执行层",
-    domain=["trading"],
-)
 def get_strategy_trades(
     strategy_id: int,
     user_id: int = 1,

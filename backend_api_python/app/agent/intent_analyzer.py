@@ -434,8 +434,9 @@ def format_intent_for_agent(intent: IntentResult, original_message: str) -> str:
             tool = step['tool']
             desc = step.get('desc', '')
             args = step.get('args', {})
-            if tool == 'call_skill' and 'skill_name' in args:
-                parts.append(f"  {i}. call_skill(skill_name=\"{args['skill_name']}\") — {desc}")
+            # call_skill 已移除：新架构走 exec python run.py
+            if False:
+                pass
             else:
                 parts.append(f"  {i}. {tool} — {desc}")
 

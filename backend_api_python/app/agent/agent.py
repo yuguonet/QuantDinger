@@ -6,7 +6,7 @@ Agent — smolagents Agent for QuantDinger.
 
 架构：
   smolagents CodeAgent（默认）或 ToolCallingAgent（AGENT_TYPE=tool）
-  + 15 个 Managed Agents（skills/ 目录，@skill 装饰器自动发现）
+  + 8 个 Skills（skills/ 目录，SKILL.md + run.py）
   + 40+ 工具（tools/ 目录，@tool 装饰器自动发现）
   + Chain 链路编排（chain/ 目录，verb+noun 触发）
 
@@ -51,7 +51,7 @@ from smolagents import (
 from smolagents.memory import ToolCall
 
 from app.agent.model import build_model
-from app.agent.tool_adapter import build_all_tools, load_tools_from_module
+from app.agent.tools.nanobot_registry import build_smolagent_tools, registry as nanobot_registry
 from app.agent.tool_context import set_tool_context
 from app.agent.trace_collector import TraceCollector
 
@@ -92,10 +92,14 @@ def _get_agent_class():
 
 def _generate_tool_catalog(tools, managed_agents) -> str:
     """从工具对象自动生成分类目录。按 layer → category 二级分组。"""
-    from app.agent.tools.registry import registry as tool_registry
-
-    tool_names = {t.name for t in tools}
-    layered = tool_registry.layered_categories  # {layer: {category: [tool_names]}}
+    # 旧 registry 保留用于目录生成（有 category/layer 元数据）
+    try:
+        from app.agent.tools.nanobot_registry import registry as tool_registry
+        tool_registry.discover()
+        tool_names = {t.name for t in tools}
+        layered = tool_registry.layered_categories
+    except Exception:
+        return ""
 
     lines = []
     categorized = set()
@@ -119,8 +123,7 @@ def _generate_tool_catalog(tools, managed_agents) -> str:
         lines.append(f"**未分层**: {', '.join(sorted(uncategorized))}")
 
     # 技能调用工具
-    if any(t.name == "call_skill" for t in (tools or [])):
-        lines.append("\n**技能调用**: call_skill — 调用专业分析技能（技术面/动量/情报/政策等）")
+    # call_skill 已移除：新架构走 exec python run.py
 
     return "\n".join(lines)
 
@@ -578,8 +581,8 @@ def _step_to_events(step) -> List[Dict[str, Any]]:
 
 # ── Managed Agents 已移除 ────────────────────────────────────
 # 旧机制：每个 Skill → smolagents ManagedAgent（双轨制，BaseSkill 未被调用）
-# 新机制：CallSkillTool 统一调用 BaseSkill.run()（单轨制）
-# 见 agent/skills/call_skill_tool.py
+# 旧机制已移除：CallSkillTool / BaseSkill / skill_registry
+# 新机制：Skill 通过 exec python run.py 调用，Tool 通过 ToolRegistry.execute() 调用
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -622,21 +625,16 @@ def get_smolagent(
     domain_key = domain or "all"
     with _tools_cache_lock:
         if domain_key not in _tools_cache_by_domain:
-            from app.agent.tools.registry import registry as tool_registry
-            tool_registry.discover()
-            if domain:
-                tools = tool_registry.build({"domain": domain, "deny": list(_EXCLUDED_TOOL_NAMES)})
-            else:
-                tools = tool_registry.build({"deny": list(_EXCLUDED_TOOL_NAMES)})
-
+            # 新架构：nanobot_registry 自动发现 + smolagents 桥接
+            tools = build_smolagent_tools({
+                "deny": list(_EXCLUDED_TOOL_NAMES),
+                "domain": domain,
+            })
             _tools_cache_by_domain[domain_key] = tools
         # 始终拷贝，避免修改缓存原始列表
         tools = list(_tools_cache_by_domain[domain_key])
 
-    # ── CallSkillTool（替代 managed_agents）──
-    from app.agent.skills.call_skill_tool import CallSkillTool
-    call_skill = CallSkillTool(model=smol_model, user_id=user_id, collector=collector)
-    tools.append(call_skill)
+    # ── call_skill 已移除：新架构走 exec python run.py ──
 
     # ── 金融领域：用 TracedTool 包装所有工具 ──────────────────
     if collector:
@@ -1442,44 +1440,11 @@ class _AgentExecutor:
         from app.agent.session_store import get_session_store
         store = get_session_store()
 
-        try:
-            from app.agent.skills.registry import skill_registry
-            skill_registry.discover()
-            smol_model = build_model(self.model, self.provider)
-        except Exception as e:
-            logger.warning("[Chain] 初始化失败: %s", e)
-            return None
-
-        # 工具只构建一次，所有 skill 共享
-        from app.agent.tool_adapter import build_all_tools
-        _all_tools = build_all_tools()
-        _tool_map = {t.name: t for t in _all_tools}
-
-        # call_llm：Skill 层和 Chain 层共用的 LLM 调用函数
-        def call_llm(prompt: str) -> str:
-            messages = [{"role": "user", "content": prompt}]
-            response = smol_model(messages)
-            return response.content if hasattr(response, "content") else str(response)
-
-        # run_skill_fn：调用指定的 BaseSkill
-        def run_skill_fn(skill_name: str, scode: str, sname: str, ctx: dict) -> tuple:
-            sk = skill_registry.get(skill_name)
-            if not sk:
-                raise ValueError(f"Unknown skill: {skill_name}")
-
-            def call_tool_fn(tool_name: str, **kwargs):
-                t = _tool_map.get(tool_name)
-                if not t:
-                    raise ValueError(f"Unknown tool: {tool_name}")
-                return t(**kwargs)
-
-            return sk.run(
-                stock_code=scode,
-                stock_name=sname,
-                context=ctx,
-                call_llm=call_llm,
-                call_tool_fn=call_tool_fn,
-            )
+        # ── 旧架构已移除：skill_registry / BaseSkill / call_skill_tool ──
+        # 新架构：skill 通过 exec python run.py 调用，tool 通过 ToolRegistry.execute() 调用
+        # _try_chain 暂时禁用，等待新架构集成
+        logger.info("[Chain] _try_chain 暂时禁用（旧架构已移除，新架构待集成）")
+        return None
 
         # 执行链路
         from app.agent.chain.executor import ChainExecutor

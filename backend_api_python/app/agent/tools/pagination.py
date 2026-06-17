@@ -431,10 +431,6 @@ def paginated(
 # 4. Agent 翻页工具（注册到 tools/registry）
 # ═══════════════════════════════════════════════════════════════
 
-def register_page_tool():
-    """注册翻页工具到全局 registry。"""
-    from app.agent.tools.registry import tool as reg_tool
-
     @reg_tool(
         description=(
             "翻页查看上一次查询的缓存数据。当工具返回了 _pagination 字段时，"

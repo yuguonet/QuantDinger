@@ -271,8 +271,9 @@ def update_skill_weights(days: int = 90) -> Dict[str, Any]:
       4. registry 删除的 Skill → 保留（不删，避免丢失历史）
     """
     from app.utils.db import get_db_connection
-    from app.agent.skills.registry import skill_registry
-    skill_registry.discover()
+    # skill_registry 已移除：新架构 skill 通过 SKILL.md 管理
+    # 权重同步暂时跳过 registry 发现，只更新已有记录
+    skill_registry = None
 
     stats = {"synced": 0, "updated": 0}
     since = date.today() - timedelta(days=days)
@@ -285,17 +286,20 @@ def update_skill_weights(days: int = 90) -> Dict[str, Any]:
             cur.execute("SELECT skill_name FROM qd_skill_weights")
             existing = {row['skill_name'] for row in cur.fetchall()}
 
-            for name in skill_registry.all_names:
-                if name not in existing:
-                    cls = skill_registry.get_class(name)
-                    default_w = getattr(cls, "default_weight", 1.0) if cls else 1.0
-                    cur.execute("""
-                        INSERT INTO qd_skill_weights (skill_name, weight, sample_count)
-                        VALUES (%s, %s, 0)
-                        ON CONFLICT (skill_name) DO NOTHING
-                    """, (name, default_w))
-                    stats["synced"] += 1
-                    logger.info("[Evaluator] 新 Skill 注册: %s (weight=%.2f)", name, default_w)
+            # skill_registry 已移除，跳过自动同步
+            # 新架构下 skill 权重通过 SKILL.md metadata 或手动 INSERT
+            if skill_registry is not None:
+                for name in skill_registry.all_names:
+                    if name not in existing:
+                        cls = skill_registry.get_class(name)
+                        default_w = getattr(cls, "default_weight", 1.0) if cls else 1.0
+                        cur.execute("""
+                            INSERT INTO qd_skill_weights (skill_name, weight, sample_count)
+                            VALUES (%s, %s, 0)
+                            ON CONFLICT (skill_name) DO NOTHING
+                        """, (name, default_w))
+                        stats["synced"] += 1
+                        logger.info("[Evaluator] 新 Skill 注册: %s (weight=%.2f)", name, default_w)
 
             # ② 从 qd_traces 读已验证的 skill 节点
             cur.execute("""

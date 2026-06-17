@@ -31,7 +31,7 @@ class TraceCollector:
 
     职责：
     1. 拦截 tool_call，自动创建 Tool 层 EvalNode
-    2. 拦截 call_skill，自动创建 Skill 层 EvalNode + SkillReport
+    2. 拦截 skill 调用，自动创建 Skill 层 EvalNode + SkillReport
     3. Agent 结束时，创建 Chain 层根节点，组装完整 EvalNode 树
     4. 存库
     """
@@ -80,15 +80,32 @@ class TraceCollector:
 
     # ── 回调方法 ──────────────────────────────────────────────
 
+    @staticmethod
+    def _summarize_for_storage(data: Any, max_items: int = 10) -> dict:
+        """将工具返回数据压缩为摘要（原 BaseSkill._summarize_for_storage）。"""
+        if data is None:
+            return {}
+        if isinstance(data, dict):
+            summary = {}
+            for k, v in data.items():
+                if isinstance(v, list) and len(v) > max_items:
+                    summary[k] = v[:max_items]
+                    summary[f"{k}_total"] = len(v)
+                else:
+                    summary[k] = v
+            return summary
+        if isinstance(data, list):
+            return {"items": data[:max_items], "total": len(data)}
+        return {"raw": str(data)[:1000]}
+
     def on_tool_call(self, tool_name: str, arguments: dict, result: Any,
                      elapsed_ms: float, error: str = None):
         """普通工具调用回调。由 TracedTool 自动触发。"""
-        from app.agent.skills.base import BaseSkill
         node = EvalNode(
             layer=Layer.TOOL.value,
             name=tool_name,
             input_params=arguments,
-            output_data=BaseSkill._summarize_for_storage(result),
+            output_data=self._summarize_for_storage(result),
             elapsed_ms=elapsed_ms,
             status=Status.FAILED.value if error else Status.OK.value,
             error=error or "",
@@ -103,7 +120,7 @@ class TraceCollector:
 
     def on_skill_call(self, skill_name: str, report: SkillReport,
                       skill_node: EvalNode):
-        """Skill 调用回调。由 CallSkillTool 触发。"""
+        """Skill 调用回调。"""
         self.skill_nodes.append(skill_node)
         self.skill_reports.append(report)
 
@@ -259,7 +276,4 @@ class TraceCollector:
         return 0.5
 
 
-# 避免循环导入，延迟引用 BaseSkill
-def _lazy_base_skill():
-    from app.agent.skills.base import BaseSkill
-    return BaseSkill
+# BaseSkill 已移除，_lazy_base_skill 不再需要

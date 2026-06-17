@@ -37,7 +37,7 @@ def _print_agent_info():
 
     # Tools
     try:
-        from app.agent.tools.registry import registry as tool_registry
+        from app.agent.tools.nanobot_registry import registry as tool_registry
         tool_registry.discover()
         categories = tool_registry.categories
         total = len(tool_registry)

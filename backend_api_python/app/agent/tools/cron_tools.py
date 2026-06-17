@@ -22,7 +22,6 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from app.agent.tools.registry import tool
 
 logger = logging.getLogger(__name__)
 
@@ -94,17 +93,6 @@ def _job_to_dict(row) -> dict:
 # 1. create_cron_job
 # ═══════════════════════════════════════════════════════════════
 
-@tool(
-    description=(
-        "创建定时任务。支持两种模式：\n"
-        "- prompt 模式：定时调用 Agent 执行一段消息（消耗 token，但 Agent 能用所有工具）\n"
-        "- function 模式：定时直接调用 Python 函数（0 token，纯算法）\n"
-        "适用场景：盘后自动回溯、定时行情检查、每日报告生成等"
-    ),
-    category="定时任务",
-    layer="支撑层",
-    domain=[],
-)
 def create_cron_job(
     name: str,
     cron_expr: str,
@@ -186,12 +174,6 @@ def create_cron_job(
 
         return {
             "job_id": job_id,
-            "name": name.strip(),
-            "cron_expr": cron_expr.strip(),
-            "mode": mode,
-            "one_shot": one_shot,
-            "status": "已创建",
-            "提示": "任务已创建" + ("，执行一次后自动删除" if one_shot else "，cron_worker 将在下一个匹配时间点自动触发执行"),
         }
     except Exception as e:
         logger.error("[CronTool] 创建定时任务失败: %s", e)
@@ -209,12 +191,6 @@ def _validate_cron_expr(expr: str) -> Optional[str]:
 # 2. list_cron_jobs
 # ═══════════════════════════════════════════════════════════════
 
-@tool(
-    description="列出所有定时任务及其运行状态。用于查看已有任务、检查执行结果。",
-    category="定时任务",
-    layer="支撑层",
-    domain=[],
-)
 def list_cron_jobs(enabled_only: bool = False) -> Dict[str, Any]:
     """列出所有定时任务。
 
@@ -242,10 +218,6 @@ def list_cron_jobs(enabled_only: bool = False) -> Dict[str, Any]:
 
         return {
             "total": total,
-            "enabled": enabled,
-            "disabled": total - enabled,
-            "with_errors": with_errors,
-            "jobs": jobs,
         }
     except Exception as e:
         logger.error("[CronTool] 列出定时任务失败: %s", e)
@@ -256,12 +228,6 @@ def list_cron_jobs(enabled_only: bool = False) -> Dict[str, Any]:
 # 3. update_cron_job
 # ═══════════════════════════════════════════════════════════════
 
-@tool(
-    description="更新定时任务：暂停/恢复/修改 cron 表达式/修改 prompt。只传需要改的字段。",
-    category="定时任务",
-    layer="支撑层",
-    domain=[],
-)
 def update_cron_job(
     job_id: int,
     enabled: Optional[bool] = None,
@@ -334,10 +300,6 @@ def update_cron_job(
 
         return {
             "job_id": row["id"],
-            "name": row["name"],
-            "enabled": row["enabled"],
-            "cron_expr": row["cron_expr"],
-            "status": "已更新",
         }
     except Exception as e:
         logger.error("[CronTool] 更新定时任务失败: %s", e)
@@ -348,12 +310,6 @@ def update_cron_job(
 # 4. delete_cron_job
 # ═══════════════════════════════════════════════════════════════
 
-@tool(
-    description="删除定时任务。不可恢复。",
-    category="定时任务",
-    layer="支撑层",
-    domain=[],
-)
 def delete_cron_job(job_id: int) -> Dict[str, Any]:
     """删除定时任务。
 
@@ -384,8 +340,6 @@ def delete_cron_job(job_id: int) -> Dict[str, Any]:
 
         return {
             "job_id": row["id"],
-            "name": row["name"],
-            "status": "已删除",
         }
     except Exception as e:
         logger.error("[CronTool] 删除定时任务失败: %s", e)

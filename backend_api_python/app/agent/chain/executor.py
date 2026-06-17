@@ -187,16 +187,10 @@ class ChainExecutor:
 
         # 无历史数据，从 skill 的出厂权重构建
         try:
-            from app.agent.skills.registry import skill_registry
-            skill_registry.discover()
-            defaults = {}
-            for step in self.chain_def.steps:
-                sk = skill_registry.get(step.agent)
-                if sk and hasattr(sk, "default_weight"):
-                    defaults[step.agent] = sk.default_weight
-            if defaults:
-                logger.info("[ChainExecutor] 使用出厂权重 %s: %s", self.chain_id, defaults)
-            return defaults
+            # skill_registry 已移除：新架构 skill 通过 SKILL.md 管理
+            # 出厂权重从 qd_skill_weights 表读取，不从代码获取
+            logger.info("[ChainExecutor] skill_registry 已移除，跳过出厂权重获取")
+            return {}
         except Exception:
             return {}
 

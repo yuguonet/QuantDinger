@@ -19,7 +19,6 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from app.agent.tools.registry import tool
 
 logger = logging.getLogger(__name__)
 
@@ -55,19 +54,6 @@ def _save_todos(todos: List[Dict[str, str]]):
 # 1. todowrite — Structured task tracking
 # ═══════════════════════════════════════════════════════════════
 
-@tool(
-    description=(
-        "创建和更新结构化任务列表。用于追踪多步骤任务的进度。\n"
-        "适用场景：\n"
-        "- 任务需要 3 步以上才能完成\n"
-        "- 用户一次给了多个任务\n"
-        "- 复杂分析或修改需要分步执行\n"
-        "状态：pending（未开始）、in_progress（进行中，同时只能一个）、completed（完成）、cancelled（取消）"
-    ),
-    category="任务管理",
-    layer="支撑层",
-    domain=[],  # 通用，所有域可用
-)
 def todowrite(
     todos: List[Dict[str, str]],
 ) -> Dict[str, Any]:
@@ -136,7 +122,6 @@ def todowrite(
 
     return {
         "todos": todos,
-        "summary": f"任务进度: {completed}/{total} | {' | '.join(summary_parts)}",
     }
 
 
@@ -144,20 +129,6 @@ def todowrite(
 # 2. question — Ask user with structured options
 # ═══════════════════════════════════════════════════════════════
 
-@tool(
-    description=(
-        "向用户提问并提供选项。当你不确定用户意图、需要确认操作、或有多种方案时使用。\n"
-        "适用场景：\n"
-        "- 选股条件不明确时（市值？板块？涨停类型？）\n"
-        "- 策略参数有多种选择时\n"
-        "- 风险偏好不确定时\n"
-        "- 要执行有风险的操作前确认\n"
-        "不要用于：简单的信息查询、闲聊、已有明确答案的问题"
-    ),
-    category="用户交互",
-    layer="支撑层",
-    domain=[],
-)
 def question(
     question_text: str,
     options: List[Dict[str, str]],
@@ -189,9 +160,6 @@ def question(
         desc = opt.get("description", "")
         formatted_options.append({
             "index": i + 1,
-            "label": label,
-            "description": desc,
-            "display": f"{i+1}. {label}" + (f" — {desc}" if desc else ""),
         })
 
     # Build the display text
@@ -206,11 +174,6 @@ def question(
 
     return {
         "question": question_text,
-        "options": formatted_options,
-        "context": context,
-        "display_text": "\n".join(display_lines),
-        "status": "awaiting_user_response",
-        "instruction": "请在下一条消息中回复选项编号或内容",
     }
 
 

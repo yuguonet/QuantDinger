@@ -13,17 +13,10 @@ import json
 import logging
 from typing import Any, Dict, List
 
-from app.agent.tools.registry import tool
 
 logger = logging.getLogger(__name__)
 
 
-@tool(
-    description="读取指定场景的工具链配置。用于查看当前场景建议使用哪些工具及顺序。",
-    category="工作区",
-    layer="支撑层",
-    domain=[],
-)
 def read_tool_chain(verb: str, noun: str) -> Dict[str, Any]:
     """读取指定场景的工具链。
 
@@ -40,12 +33,6 @@ def read_tool_chain(verb: str, noun: str) -> Dict[str, Any]:
     }
 
 
-@tool(
-    description="保存工具链配置。执行任务成功后，将验证过的工具调用顺序写回配置，供下次使用。",
-    category="工作区",
-    layer="支撑层",
-    domain=[],
-)
 def write_tool_chain(verb: str, noun: str, chain: List[Dict[str, str]]) -> Dict[str, Any]:
     """保存工具链（执行验证后写回）。
 
@@ -66,12 +53,6 @@ def write_tool_chain(verb: str, noun: str, chain: List[Dict[str, str]]) -> Dict[
     }
 
 
-@tool(
-    description="列出所有已配置的工具链。用于查看系统支持哪些场景。",
-    category="工作区",
-    layer="支撑层",
-    domain=[],
-)
 def list_tool_chains() -> Dict[str, Any]:
     """列出所有已配置的工具链。"""
     from app.agent.chain.tool_chains import list_all_chains

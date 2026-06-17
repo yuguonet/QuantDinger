@@ -246,20 +246,6 @@ def load_semantics():
                     standard_output=meta.get("standard_output", False),
                 )
 
-    # ── tools（tools.md frontmatter）──
-    for cat_name, cat_tools in _load_frontmatter("tools.md").get("categories", {}).items():
-        if not isinstance(cat_tools, list):
-            continue
-        for t in cat_tools:
-            if isinstance(t, dict) and t.get("name"):
-                _tools[t["name"]] = ToolMeta(
-                    name=t["name"],
-                    description=t.get("description", ""),
-                    category=t.get("category", cat_name),
-                    layer=t.get("layer", ""),
-                    tags=t.get("tags", t.get("domain", [])),
-                )
-
     # ── chains（chains.md frontmatter）──
     for name, cfg in _load_frontmatter("chains.md").get("chains", {}).items():
         steps = []
