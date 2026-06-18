@@ -186,12 +186,19 @@ def get_capital_summary(stock_code: str) -> Dict[str, Any]:
     """
     code = _stock_code_normalize(stock_code)
 
-    # ── 并行采集五维数据 ──────────────────────────────────────
-    margin = _get_margin_trading(code, days=60)
-    block = _get_block_trades(code, page_size=20)
-    holders = _get_holder_count(code)
-    dividend = _get_dividend_history(code)
-    financials = _get_financial_statements(code)
+    # ── 并行采集五维数据（单源超时不阻断整体）────────────────────
+    def _safe(fn, label):
+        try:
+            return fn()
+        except Exception as e:
+            logger.warning("[Capital] %s 超时/失败: %s", label, e)
+            return {}
+
+    margin = _safe(lambda: _get_margin_trading(code, days=60), "margin")
+    block = _safe(lambda: _get_block_trades(code, page_size=20), "block")
+    holders = _safe(lambda: _get_holder_count(code), "holders")
+    dividend = _safe(lambda: _get_dividend_history(code), "dividend")
+    financials = _safe(lambda: _get_financial_statements(code), "financials")
 
     # ── 摘要计算 ─────────────────────────────────────────────
     summary: Dict[str, Any] = {"stock_code": code}

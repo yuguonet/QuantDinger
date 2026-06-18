@@ -12,7 +12,7 @@ Skill 层输出标准化：
   ✅ 需要输出买卖信号（direction + score）
 
 不适用的 Skill（无需标准化输出，直接返回分析文本即可）：
-  - bear_researcher / bull_researcher（多空辩论，无 stock_code）
+  - researcher（多空辩论，无 stock_code）
   - intelligence_agent（情报搜集，无 stock_code）
   - hot_money_tracker（游资追踪，无 stock_code）
   - data_agent（数据工程，无 stock_code）
@@ -41,8 +41,7 @@ logger = logging.getLogger(__name__)
 # ── 无需标准化输出的 Skill（无 stock_code，不产出买卖信号）──
 # 这些 Skill 直接返回分析文本，不强制解析 direction/score/signal/factors
 _NON_SIGNAL_SKILLS = {
-    "bear_researcher",
-    "bull_researcher",
+    "researcher",
     "intelligence_agent",
     "hot_money_tracker",
     "data_agent",

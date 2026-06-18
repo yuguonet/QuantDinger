@@ -338,99 +338,28 @@ class TracedTool:
         return result
 ```
 
-### 3.3 call_skill 工具 — Skill 调用入口
+### 3.3 Skill 执行入口 — skill_runner.py
 
-Agent 通过 `call_skill` 工具调用专业分析 Skill。Skill 内部的工具调用也会被 TraceCollector 拦截。
+> ⚠️ 旧的 `CallSkillTool` + `skill_registry` + `BaseSkill` 架构已移除。
+> 新架构通过 `skill_runner.py` 直接调用 `tools/` 中的工具函数。
 
 ```python
-class CallSkillTool(Tool):
-    """Agent 调用 Skill 的统一入口。
-    
-    Agent 自主决定何时调用、调用哪个 Skill。
-    调用后返回标准化 SkillReport，agent 可以基于报告继续推理。
-    """
-    name = "call_skill"
-    description = "调用专业分析技能。返回标准化分析报告（评分/方向/信号/因子明细）。"
-    inputs = {
-        "skill_name": {"type": "string", "description": "技能名称"},
-        "stock_code": {"type": "string", "description": "股票代码"},
-        "stock_name": {"type": "string", "description": "股票名称（可选）"},
-    }
-    output_type = "text"
-    
-    def __init__(self, model, user_id, collector: TraceCollector):
-        super().__init__()
-        self._model = model
-        self._user_id = user_id
-        self._collector = collector
-    
-    def forward(self, skill_name: str, stock_code: str, 
-                stock_name: str = "") -> str:
-        from app.agent.skills.registry import skill_registry
-        skill_registry.discover()
-        
-        skill = skill_registry.get(skill_name)
-        if not skill:
-            return f"未知技能: {skill_name}"
-        
-        # 构建 call_llm 和 call_tool_fn
-        def call_llm(prompt):
-            response = self._model([{"role": "user", "content": prompt}])
-            return response.content if hasattr(response, "content") else str(response)
-        
-        all_tools = build_all_tools()
-        tool_map = {t.name: t for t in all_tools}
-        
-        def call_tool_fn(tool_name, **kwargs):
-            t = tool_map.get(tool_name)
-            if not t:
-                raise ValueError(f"Unknown tool: {tool_name}")
-            return t(**kwargs)
-        
-        # 执行 Skill
-        report, skill_node = skill.run(
-            stock_code=stock_code,
-            stock_name=stock_name,
-            context={},
-            call_llm=call_llm,
-            call_tool_fn=call_tool_fn,
-        )
-        
-        # 通知 TraceCollector
-        self._collector.on_skill_call(skill_name, report, skill_node)
-        
-        # 返回标准化文本给 agent
-        return self._format_report(report)
-    
-    def _format_report(self, report: SkillReport) -> str:
-        """将 SkillReport 格式化为 agent 可读的文本。"""
-        direction_cn = {
-            "bullish": "看多", "bearish": "看空", "neutral": "中性"
-        }.get(report.direction, "中性")
-        
-        lines = [
-            f"## {report.skill_name} 分析报告",
-            f"- 评分: {report.score:.0f}/100",
-            f"- 方向: {direction_cn}",
-            f"- 置信度: {report.confidence:.2f}",
-        ]
-        if report.signal:
-            lines.append(f"- 信号: {report.signal}")
-        
-        if report.factors:
-            lines.append("- 因子明细:")
-            for f in report.factors:
-                s = f"{f.score:.0f}" if f.score is not None else "—"
-                lines.append(f"  - {f.name}: {f.value} ({s}分)")
-        
-        if report.missing_data:
-            lines.append(f"- ⚠️ 缺失数据: {', '.join(report.missing_data)}")
-        
-        if report.analysis:
-            lines.append(f"\n### 详细分析\n{report.analysis[:1500]}")
-        
-        return "\n".join(lines)
+# skill_runner.py 核心接口
+
+def run_skill(skill_name, stock_code, stock_name, context) -> (SkillReport, EvalNode):
+    """执行单个 Skill，返回标准化报告。"""
+    runner = _SKILL_RUNNERS[skill_name]  # 14 个 Skill 的 runner 函数
+    data = runner(stock_code, stock_name)  # 直接调用 tools/ 工具函数
+    return _to_skill_report(data), _to_eval_node(data)
+
+# 每个 runner 从 run.py 核心逻辑提取，直接 import tools/ 函数
+def _run_technical(stock_code, stock_name):
+    from app.agent.tools.analysis_tools import analyze_trend, get_indicator_snapshot, ...
+    results = {name: fn(stock_code) for name, fn in [...]}
+    return algo_analyze(results)  # 返回标准化 dict
 ```
+
+**优势**：无 subprocess 开销，无 skill_registry 依赖，直接 import 即用。
 
 ### 3.4 Agent Builder — 组装
 
@@ -1891,31 +1820,40 @@ agent.run() 完成
 
 ### 16.2 编排闭环
 
-**流程**: 读取 tool_chains.json → 编排执行 → 结果交给 Agent
+**流程**: tool_chains.json 路由 → 链路执行 → 结果注入 Agent
 
 **触发**: 每次用户消息进入 `_try_chain()`
 
 **实现**:
-- `intent_analyzer.py` — 意图分析时读取 chain stats
-  - `get_tool_chain(verb, noun)` — 获取预配置的工具链步骤
+- `chain/tool_chains.py` — 链路配置读写
+  - `get_tool_chain(verb, noun)` — 获取已学习的工具链步骤
   - `get_chain_stats(verb, noun)` — 获取链路统计（成功率、平均步数）
-- `agent.py._try_chain()` — 链路执行
-  - 匹配 verb+noun → 按 tool_chains.json 的 steps 顺序执行
-  - 未匹配 → `planner.py` LLM 规划 → 存入 tool_chains.json
-  - 规划失败 → 返回 None（让 agent 自由处理）
-- `router/tool_chains.py:get_tool_chain()` — 读取链路配置
+  - `save_tool_chain(verb, noun, steps)` — 学习闭环写入
+  - `penalize_chain(verb, noun, severity)` — 惩罚闭环扣减/删除
+- `agent.py._try_chain()` — 链路路由 + 执行
+  - Layer 0: `get_tool_chain(verb, noun)` → 命中 → 转 ChainDef → `ChainExecutor.execute()` → 注入 agent
+  - Layer 1: 未命中 → `Planner.plan()` LLM #2 规划 → `ChainExecutor.execute()` → 注入 agent
+  - 兜底: 降级/失败/无匹配 → 返回 None → agent 自由处理
+- `skill_runner.py` — Skill 执行
+  - `run_skill(skill_name, stock_code, stock_name, context)` → (SkillReport, EvalNode)
+  - 直接调用 `tools/` 中的工具函数，无 subprocess
+- `chain/executor.py` — 链路决策执行器
+  - 依次调度 Skill → 构建 EvalNode 树 → LLM 跨维度研判 → DecisionResult
 
 **数据流**:
 ```
-用户消息
-  → intent_analyzer → verb + noun
+用户消息 → intent_analyzer → verb + noun
   → _try_chain(verb, noun)
-      ├─ tool_chains.json 有链路 → 按 steps 执行 → 返回 AgentResult
-      ├─ 无链路 → planner LLM 规划 → save_tool_chain() → 执行
-      └─ 规划失败 → 返回 None → agent 自由处理
+      ├─ tool_chains.json 命中 → ChainDef → ChainExecutor 执行（0 token）
+      ├─ 未命中 → Planner LLM #2 规划 → ChainExecutor 执行
+      │   规划结果存入 tool_chains.json（下次命中走 Layer 0）
+      ├─ 执行失败 → return None → agent 自由处理
+      └─ 降级 → return None → agent 自由处理
 ```
 
-**文件**: `agent.py:_try_chain()`, `intent_analyzer.py`, `planner.py`, `router/tool_chains.py`
+**关键设计**：tool_chains.json 是主路由器（学习闭环积累），Planner 是首次规划器。成功路径写入 tool_chains.json，失败路径被惩罚闭环清除。
+
+**文件**: `agent.py:_try_chain()`, `skill_runner.py`, `chain/executor.py`, `planner.py`, `chain/tool_chains.py`
 
 ### 16.3 惩罚闭环
 
@@ -2080,8 +2018,8 @@ _chat_locked() ─────────────────────�
     │
     ▼
 _prepare_intent() ─────────────────────────────────
-│  1. 快速通道判断
-│  2. 意图分析 ← LLM #1
+│  1. 意图分析 ← LLM #1
+│  2. 快速通道判断
 │  3. 提取 stock_code
 │  4. 创建 TraceCollector
 │  5. 上下文拼接
@@ -2181,3 +2119,114 @@ Planner 输出执行计划，包含每个步骤的 skill 和 tools：
 | `evaluator.py` | `_writeback_chain()` 新增 5 道质量门 |
 | `semantics/planner.md` | 新增核心哲学、数据陷阱、技能优先级 |
 | `semantics/guidance.md` | 精简为纯执行规则 |
+
+## 十八、链路系统重构（2026-06-18）
+
+> 日期: 2026-06-18
+> 状态: 已实施并验证
+> 目标: 去除静态链路定义，tool_chains.json 成为主路由器
+
+### 18.1 核心变更
+
+| 变更 | 原方案 | 新方案 |
+|------|--------|--------|
+| 链路定义 | `semantics/chains.md`（3 条固定链路） | `tool_chains.json`（动态学习积累） |
+| Skill 执行 | `CallSkillTool` + `skill_registry` + `BaseSkill` | `skill_runner.py` 直接调用 `tools/` |
+| JSON 提取 | agent.py / trace_collector.py 各自实现 | `json_extractor.py` 统一模块 |
+| Planner 校验 | `skill_registry.get_class()` | `get_all_skill_metas()` 从 semantics 读取 |
+| Skill Catalog | 硬编码 12 个 skill 名 | `_get_skill_catalog()` 从 `semantics/skills/*.md` 动态生成 |
+| Planner JSON 解析 | 仅支持 ```json``` 和纯 JSON | 支持 `final_answer()` / `<code>` / 纯 JSON / markdown |
+| 降级链路 | 执行并存库 | 直接返回 None，交给 agent 自由处理 |
+| 链路执行失败 | 注入 agent（可能引发循环重试） | 返回 None，agent 自由处理 |
+
+### 18.2 链路路由流程
+
+```
+用户消息 → LLM#1 意图分析 → verb/noun
+  │
+  ▼ _try_chain(verb, noun)
+  │
+  ├─ Layer 0: get_tool_chain(verb, noun) → tool_chains.json
+  │   ├─ 命中 → 转 ChainDef → ChainExecutor 执行（0 token）
+  │   └─ 未命中 ↓
+  │
+  ├─ Layer 1: Planner LLM #2
+  │   ├─ 注入: persona + skills + tools + rules
+  │   ├─ 输出: 执行计划 → ChainDef → ChainExecutor 执行
+  │   └─ 计划存入 tool_chains.json（通过学习闭环）
+  │
+  └─ 兜底: return None → agent 自由处理
+      （降级/失败/无匹配/无 stock_code）
+```
+
+**关键**：tool_chains.json 是主路由器。同一 verb+noun 首次走 Planner（LLM #2），后续直接命中 tool_chains.json（0 token）。失败路径被惩罚闭环清除后，下次重新走 Planner。
+
+### 18.3 新增文件
+
+| 文件 | 职责 |
+|------|------|
+| `agent/skill_runner.py` | 14 个 Skill 的 runner 函数，直接调用 `tools/` 工具函数，返回 `(SkillReport, EvalNode)` |
+| `agent/json_extractor.py` | 统一 JSON 提取：`extract_decision()` / `extract_json()` / `extract_field()` |
+
+### 18.4 修改文件
+
+| 文件 | 改动 |
+|------|------|
+| `agent.py` | `_try_chain` 接入 skill_runner；degrade/fail 返回 None；3 处 JSON 提取改用 json_extractor |
+| `planner.py` | `_validate` 用 `get_all_skill_metas()` 校验；`_get_skill_catalog` 动态生成；`_parse_plan_json` 支持 `final_answer()` 格式 |
+| `trace_collector.py` | `_extract_from_json` → `json_extractor.extract_decision` |
+| `chain/chains.py` | 移除 `load_chains_from_yaml()`，纯动态注册表 |
+| `chain/executor.py` | `_load_skill_weights` 从 `get_all_skill_metas()` 读出厂权重 |
+| `chain/evaluator.py` | `update_skill_weights` 用 `get_all_skill_metas()` 同步新 Skill |
+| `semantics/__init__.py` | 移除 `ChainMeta` / `ChainStepMeta` / chains.md 加载 |
+| `tools/analysis_tools.py` | 修复 4 处 docstring 缩进 + `get_chip_distribution` 缺类型注解 |
+
+### 18.5 删除文件
+
+| 文件 | 原因 |
+|------|------|
+| `semantics/chains.md` | 3 条固定链路锁死 Planner 选择，由 tool_chains.json 动态学习替代 |
+
+### 18.6 编排闭环数据流（更新后）
+
+```
+首次执行（tool_chains.json 无缓存）:
+  LLM#1 → verb=analyze, noun=stock
+  → tool_chains.json 未命中
+  → Planner LLM#2 选 Skill（technical_agent + intelligence_agent）
+  → ChainExecutor 执行
+  → agent.run() + DecisionCard
+  → _post_evaluate() → learn_from_execution()
+  → 质量门通过 → save_tool_chain("analyze", "stock", steps) → 写入 tool_chains.json
+
+后续执行（tool_chains.json 有缓存）:
+  LLM#1 → verb=analyze, noun=stock
+  → tool_chains.json 命中（0 token）
+  → ChainExecutor 直接执行
+  → agent.run() + DecisionCard
+  → _post_evaluate() → update_chain_stats()（强化统计）
+
+失败后:
+  执行失败 → _post_evaluate() 评分低 → 不写入 tool_chains.json
+  用户负面反馈 → penalize_chain() → 扣减/删除 → 下次重新走 Planner
+```
+
+### 18.7 四个闭环状态
+
+| 闭环 | 状态 | 数据载体 | 关键路径 |
+|------|------|---------|----------|
+| 学习闭环 | ✅ | tool_chains.json | `_post_evaluate` → `learn_from_execution` → `save_tool_chain` |
+| 编排闭环 | ✅ | tool_chains.json | `_try_chain` → `get_tool_chain` / `Planner` → `ChainExecutor` |
+| 惩罚闭环 | ✅ | tool_chains.json + qd_traces | `_check_negative_feedback` → `penalize_chain` + `mark_root_wrong` |
+| 异步回测闭环 | ✅ | qd_traces + qd_skill_weights | `evaluate_pending` → `update_skill_weights` |
+
+### 18.8 Planner 输出解析容错
+
+`_parse_plan_json()` 支持 4 种 LLM 输出格式：
+
+| 格式 | 示例 | 处理 |
+|------|------|------|
+| `<code>final_answer({...})</code>` | qwen-coder 实际输出 | 去 `<code>` 标签 → 提取 `final_answer()` 内容 |
+| `final_answer({...})` | 无标签版本 | 正则提取 `final_answer()` 内容 |
+| `` ```json{...}``` `` | markdown 代码块 | 去代码块标记 |
+| `{...}` 纯 JSON | 标准格式 | 直接解析 |

@@ -28,7 +28,7 @@ description: 规划器 prompt — 人设、核心哲学、技能选择规则、�
 | 资金流向 | 判断洗盘或拉伸上有一定参考价值 | 滞后指标，主力可对倒 | market_data_agent 资金部分仅作验证 |
 | 新闻/舆情 | 与行情共振 | 你看到时市场已反应 | intelligence_agent 仅作解释，不预测 |
 | 北向资金 | 与大盘或行业共振 | 有时滞，外资也会割肉 | 仅连续大幅流入/流出才值得关注 |
-| 解禁/减持 | 与K线共振 | 提前公布，市场可能已消化 | lockup_watcher 仅中长线风险 |
+| 解禁/减持 | 与K线共振 | 提前公布，市场可能已消化 | intelligence_agent 已合并 |
 
 **核心原则：你不是第一个看到这些信息的人。** 当你看到龙虎榜、新闻、资金流向时，比你快的人早就行动了。价格数据是唯一的"实时共识"。
 
@@ -55,8 +55,8 @@ description: 规划器 prompt — 人设、核心哲学、技能选择规则、�
 | 中 | screening_agent | 选股场景 |
 | 中 | backtest_agent | 验证策略 |
 | 低 | hot_money_tracker | 仅作风险警示 |
-| 低 | lockup_watcher | 仅中长线风险 |
-| 低 | bull/bear_researcher | 多空辩论场景 |
+| 低 | intelligence_agent | 情报+解禁合并 |
+| 低 | researcher | 多空辩论场景 |
 
 ### 场景 → 技能组合示例
 

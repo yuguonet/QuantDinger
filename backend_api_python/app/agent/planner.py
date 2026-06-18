@@ -96,7 +96,7 @@ def _get_skill_catalog() -> str:
         return (
             "可用技能：technical_agent(技术面), intelligence_agent(情报), "
             "market_data_agent(行情), screening_agent(选股), backtest_agent(回测), "
-            "bull_researcher(多头), bear_researcher(空头), trading_agent(交易)"
+            "researcher(多空), trading_agent(交易)"
         )
     lines = ["可用技能（从下列中选择 1~5 个，按执行顺序排列）：", ""]
     # 按 priority 降序排列
