@@ -17,9 +17,10 @@ v4 变更：
 使用方式：
      from app.agent.semantics import (
         get_persona, get_intent_meta,
+        get_skill_meta, get_all_skill_metas,
         get_tool_meta, get_all_tool_metas,
         get_chain_meta,
-        get_tools_summary_xml,
+        get_skills_summary_xml, get_tools_summary_xml,
         get_agent_rules_text,
         load_semantics,
     )
@@ -59,6 +60,19 @@ class IntentMeta:
 
 
 @dataclass
+class SkillMeta:
+    name: str = ""
+    description: str = ""
+    tags: List[str] = field(default_factory=list)
+    priority: int = 0
+    default_weight: float = 1.0
+    tools: List[str] = field(default_factory=list)
+    instructions: str = ""
+    triggers: List[str] = field(default_factory=list)
+    standard_output: bool = False
+
+
+@dataclass
 class ToolMeta:
     name: str = ""
     description: str = ""
@@ -92,6 +106,7 @@ class ChainMeta:
 
 _persona: Optional[PersonaMeta] = None
 _intent: Optional[IntentMeta] = None
+_skills: Dict[str, SkillMeta] = {}
 _tools: Dict[str, ToolMeta] = {}
 _chains: Dict[str, ChainMeta] = {}
 _loaded = False
@@ -171,6 +186,8 @@ def _parse_behaviors_from_md(body: str) -> Dict[str, List[str]]:
             behaviors[current_key].append(stripped[2:].strip())
     return behaviors
 
+    return meta, body
+
 
 # ═══════════════════════════════════════════════════════════════
 # Loader
@@ -194,6 +211,54 @@ def load_semantics():
             mission=meta.get("mission", ""),
             behaviors=_parse_behaviors_from_md(body),
         )
+
+    # ── skills（从 skills/*.md 加载，支持 names 列表）──
+    skills_dir = _SEMANTICS_DIR / "skills"
+    if skills_dir.exists():
+        for md_file in skills_dir.glob("*.md"):
+            content = md_file.read_text(encoding="utf-8")
+            meta, body = _parse_skill_md(content)
+            if not meta:
+                continue
+            # 支持 names 列表（一个文件定义多个 skill）
+            names = meta.get("names", [])
+            if names:
+                for skill_name in names:
+                    _skills[skill_name] = SkillMeta(
+                        name=skill_name,
+                        description=meta.get("description", ""),
+                        tags=meta.get("tags", []),
+                        priority=meta.get("priority", 5),
+                        default_weight=meta.get("default_weight", 1.0),
+                        tools=meta.get("tools", []),
+                        instructions=body,
+                        standard_output=meta.get("standard_output", False),
+                    )
+            elif meta.get("name"):
+                _skills[meta["name"]] = SkillMeta(
+                    name=meta["name"],
+                    description=meta.get("description", ""),
+                    tags=meta.get("tags", []),
+                    priority=meta.get("priority", 5),
+                    default_weight=meta.get("default_weight", 1.0),
+                    tools=meta.get("tools", []),
+                    instructions=body,
+                    standard_output=meta.get("standard_output", False),
+                )
+
+    # ── tools（tools.md frontmatter）──
+    for cat_name, cat_tools in _load_frontmatter("tools.md").get("categories", {}).items():
+        if not isinstance(cat_tools, list):
+            continue
+        for t in cat_tools:
+            if isinstance(t, dict) and t.get("name"):
+                _tools[t["name"]] = ToolMeta(
+                    name=t["name"],
+                    description=t.get("description", ""),
+                    category=t.get("category", cat_name),
+                    layer=t.get("layer", ""),
+                    tags=t.get("tags", t.get("domain", [])),
+                )
 
     # ── chains（chains.md frontmatter）──
     for name, cfg in _load_frontmatter("chains.md").get("chains", {}).items():
@@ -221,8 +286,8 @@ def load_semantics():
         )
 
     logger.info(
-        "[Semantics] 加载完成: %d tools, %d chains",
-        len(_tools), len(_chains),
+        "[Semantics] 加载完成: %d skills, %d tools, %d chains",
+        len(_skills), len(_tools), len(_chains),
     )
 
 
@@ -252,6 +317,16 @@ def get_intent_meta() -> IntentMeta:
             intent_tool_categories={},
         )
     return _intent
+
+
+def get_skill_meta(name: str) -> Optional[SkillMeta]:
+    load_semantics()
+    return _skills.get(name)
+
+
+def get_all_skill_metas() -> Dict[str, SkillMeta]:
+    load_semantics()
+    return dict(_skills)
 
 
 def get_tool_meta(name: str) -> Optional[ToolMeta]:
@@ -319,6 +394,22 @@ def get_judgment_text() -> str:
 # ═══════════════════════════════════════════════════════════════
 # Summary generators (for system prompt injection)
 # ═══════════════════════════════════════════════════════════════
+
+def get_skills_summary_xml() -> str:
+    """生成 skills 摘要 XML（轻量，只有 name+description+tags）。
+
+    用于第一段加载：system prompt 只放摘要，完整 instructions 按需加载。
+    """
+    load_semantics()
+    lines = ["<skills>"]
+    for name, meta in sorted(_skills.items(), key=lambda x: x[1].priority, reverse=True):
+        tags_str = ",".join(meta.tags) if meta.tags else ""
+        lines.append(f'  <skill name="{name}" tags="{tags_str}" priority="{meta.priority}">')
+        lines.append(f'    <description>{meta.description}</description>')
+        lines.append(f'  </skill>')
+    lines.append("</skills>")
+    return "\n".join(lines)
+
 
 def get_tools_summary_xml(tags_filter: Optional[List[str]] = None) -> str:
     """生成 tools 摘要 XML，按 category 分组。可选按 tags 过滤。"""

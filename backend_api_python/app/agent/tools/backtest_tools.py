@@ -12,6 +12,7 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from app.agent.tools.registry import tool
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,15 @@ except ImportError as _e:
 
 # ── Tool functions ────────────────────────────────────────────
 
+@tool(
+    description=(
+        "对指定策略在指定股票上跑历史回测。执行策略代码模拟交易，返回收益率、"
+        "胜率、最大回撤、夏普比率等绩效指标和最近交易明细。"
+    ),
+    category="回测",
+    layer="决策层",
+    domain=["finance","trading"],
+)
 def run_backtest(
     strategy_id: int,
     stock_code: str,
@@ -94,6 +104,16 @@ def run_backtest(
         # 提取关键绩效指标
         summary = {
             "total_return_pct": result.get("total_return_pct", 0),
+            "win_rate": result.get("win_rate", 0),
+            "total_trades": result.get("total_trades", 0),
+            "max_drawdown_pct": result.get("max_drawdown_pct", 0),
+            "sharpe_ratio": result.get("sharpe_ratio", 0),
+            "profit_factor": result.get("profit_factor", 0),
+            "initial_capital": result.get("initial_capital", 0),
+            "final_equity": result.get("final_equity", 0),
+            "best_trade_pct": result.get("best_trade_pct", 0),
+            "worst_trade_pct": result.get("worst_trade_pct", 0),
+            "avg_trade_pct": result.get("avg_trade_pct", 0),
         }
 
         # 交易明细摘要（最近 10 笔）
@@ -102,15 +122,34 @@ def run_backtest(
         for t in trades[-10:]:
             recent_trades.append({
                 "type": t.get("type", ""),
+                "price": t.get("price", 0),
+                "amount": t.get("amount", 0),
+                "profit": t.get("profit", 0),
+                "profit_pct": t.get("profit_pct", 0),
+                "time": str(t.get("time", "")),
             })
 
         return {
             "success": True,
+            "strategy_id": strategy_id,
+            "strategy_name": strategy.get("name", ""),
+            "stock_code": stock_code,
+            "timeframe": timeframe,
+            "period": f"{start_date} ~ {end_date}",
+            "days": days_diff,
+            "summary": summary,
+            "recent_trades": recent_trades,
         }
     except Exception as e:
         logger.error("run_backtest failed: %s", e, exc_info=True)
         return {"success": False, "error": f"回测执行失败: {e}"}
 
+@tool(
+    description="查询策略的历史回测记录列表（即过去跑过的回测任务结果）。注意：这不是获取K线数据的工具，获取K线请用 agent_get_kline。",
+    category="回测",
+    layer="决策层",
+    domain=["finance","trading"],
+)
 def get_backtest_history(
     strategy_id: int,
     user_id: int = 1,
@@ -153,6 +192,9 @@ def get_backtest_history(
             if isinstance(result_data, dict):
                 d["summary"] = {
                     "total_return_pct": result_data.get("total_return_pct", 0),
+                    "win_rate": result_data.get("win_rate", 0),
+                    "total_trades": result_data.get("total_trades", 0),
+                    "max_drawdown_pct": result_data.get("max_drawdown_pct", 0),
                 }
             d.pop("result", None)  # 不返回完整结果，太大
             runs.append(d)

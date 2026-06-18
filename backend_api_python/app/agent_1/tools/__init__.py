@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-agent_1 tools — discovered automatically by local ToolRegistry.
+agent tools — discovered automatically by local ToolRegistry.
 """
-from app.agent_1.tools.registry import ToolRegistry, build_smolagent_tools
+from app.agent.tools.registry import ToolRegistry, build_smolagent_tools
 
 registry = ToolRegistry()
 

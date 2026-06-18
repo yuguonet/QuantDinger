@@ -15,6 +15,7 @@ from typing import Any, Dict, List
 
 import requests
 
+from app.agent.tools.registry import tool
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,12 @@ def _stock_code_normalize(code: str) -> str:
 # 一致预期
 # ══════════════════════════════════════════════════════════════
 
+@tool(
+    description="[中线] 机构一致预期EPS。预测机构数、均值、最大最小值。算前向PE/PEG的核心输入：当前价÷一致预期EPS=前向PE。机构数<3的要谨慎。",
+    category="情报搜索",
+    layer="分析层",
+    domain=["finance"],
+)
 def get_consensus_eps(stock_code: str) -> Dict[str, Any]:
     """获取同花顺机构一致预期EPS。
 
@@ -81,6 +88,12 @@ def get_consensus_eps(stock_code: str) -> Dict[str, Any]:
 # 个股新闻
 # ══════════════════════════════════════════════════════════════
 
+@tool(
+    description="[短线+中线] 个股新闻（补充 search_comprehensive_intel：本工具直连东财JSONP，作为备用数据源）。东财个股相关新闻流。突发利好/利空消息第一时间获取，配合热点题材判断消息面催化。新闻+概念板块交叉验证。",
+    category="情报搜索",
+    layer="分析层",
+    domain=["finance"],
+)
 def get_eastmoney_stock_news(stock_code: str, page_size: int = 20) -> Dict[str, Any]:
     """获取东财个股新闻。
 
@@ -134,6 +147,12 @@ def get_eastmoney_stock_news(stock_code: str, page_size: int = 20) -> Dict[str, 
 # 全球财经资讯
 # ══════════════════════════════════════════════════════════════
 
+@tool(
+    description="[短线] 全球财经资讯。东财7×24滚动快讯。盘中突发事件监控：政策利好、外围异动、行业突发新闻。短线事件驱动策略必看。",
+    category="情报搜索",
+    layer="分析层",
+    domain=["finance"],
+)
 def get_global_finance_news(page_size: int = 30) -> Dict[str, Any]:
     """获取东财全球财经资讯。
 

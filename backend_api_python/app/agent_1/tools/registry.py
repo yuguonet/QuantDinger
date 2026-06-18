@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Local ToolRegistry for agent_1.
+Local ToolRegistry for agent.
 
-Auto-discovers tool functions from agent_1/tools/ and wraps them as
+Auto-discovers tool functions from agent/tools/ and wraps them as
 smolagents Tool objects via the smolagents `tool` decorator.
 
 Usage:
-    from app.agent_1.tools import registry
+    from app.agent.tools import registry
     registry.discover()
     tools = build_smolagent_tools({"deny": [...], "domain": ...})
     spec = registry.get("search_stock_by_name")
@@ -126,7 +126,7 @@ class _ToolSpec:
 
 
 class ToolRegistry:
-    """本地工具注册表 — 扫描 agent_1/tools/ 并包装为 smolagents Tool 对象。"""
+    """本地工具注册表 — 扫描 agent/tools/ 并包装为 smolagents Tool 对象。"""
 
     def __init__(self):
         self._tools: Dict[str, _ToolSpec] = {}
@@ -146,7 +146,7 @@ class ToolRegistry:
                 continue
 
             try:
-                mod = importlib.import_module(f"app.agent_1.tools.{module_name}")
+                mod = importlib.import_module(f"app.agent.tools.{module_name}")
             except Exception:
                 logger.debug("[ToolRegistry] 跳过模块 %s: %s", module_name, exc_info=True)
                 continue

@@ -13,6 +13,7 @@ from typing import Any, Dict, List
 import requests
 
 from app.data_sources.normalizer import safe_float as _safe_float
+from app.agent.tools.registry import tool
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,12 @@ def _em_datacenter(report_name: str, columns: str = "ALL",
 # 热点题材归因
 # ══════════════════════════════════════════════════════════════
 
+@tool(
+    description="[短线核心] 当日强势股+题材归因。同花顺编辑部人工标注的reason tags（如「算力租赁+Token工厂」）。短线打板/跟题材必用：先看哪些题材在发酵，再找龙头。含涨幅、换手、大单净量。",
+    category="行情数据",
+    layer="分析层",
+    domain=["finance"],
+)
 def get_hot_stocks_with_reason(date: str = "") -> Dict[str, Any]:
     """获取同花顺当日强势股+题材归因。
 
@@ -112,6 +119,12 @@ def get_hot_stocks_with_reason(date: str = "") -> Dict[str, Any]:
 # 北向资金
 # ══════════════════════════════════════════════════════════════
 
+@tool(
+    description="[短线+中线] 北向资金实时流向。沪股通/深股通分钟级净买入（262个时间点）。外资是A股边际定价力量：北向大幅流入=市场偏强，持续流出=谨慎。盘中看实时，收盘看累计。",
+    category="行情数据",
+    layer="分析层",
+    domain=["finance"],
+)
 def get_northbound_flow() -> Dict[str, Any]:
     """获取北向资金实时分钟流向（同花顺 hsgtApi）。"""
     try:
@@ -126,6 +139,12 @@ def get_northbound_flow() -> Dict[str, Any]:
 # 概念板块归属
 # ══════════════════════════════════════════════════════════════
 
+@tool(
+    description="[短线+中线] 个股概念板块归属。一次拿全所属板块（行业/概念/地域）+板块涨跌幅+龙头股。短线看题材联动（板块涨=个股跟涨概率大），中线看行业赛道。",
+    category="行情数据",
+    layer="分析层",
+    domain=["finance"],
+)
 def get_stock_concept_blocks(stock_code: str) -> Dict[str, Any]:
     """获取个股所属板块/概念归属（东财 slist）。
 
@@ -172,6 +191,12 @@ def get_stock_concept_blocks(stock_code: str) -> Dict[str, Any]:
 # 限售解禁
 # ══════════════════════════════════════════════════════════════
 
+@tool(
+    description="[中线] 限售解禁日历。历史解禁+未来90天待解禁。中线持仓必查风险项：大比例解禁前1-2周通常有抛压，首发原股东解禁尤其注意。解禁比例>5%需警惕。",
+    category="行情数据",
+    layer="分析层",
+    domain=["finance"],
+)
 def get_lockup_expiry(stock_code: str, forward_days: int = 90) -> Dict[str, Any]:
     """获取限售解禁日历。
 
@@ -225,6 +250,12 @@ def get_lockup_expiry(stock_code: str, forward_days: int = 90) -> Dict[str, Any]
 # 行业排名
 # ══════════════════════════════════════════════════════════════
 
+@tool(
+    description="[短线+中线] 行业板块涨跌排名（补充 get_sector_rankings：本工具直连东财push2，返回约100个行业的涨跌幅+上涨下跌家数+领涨股，数据更全）。约100个行业的涨跌幅+上涨下跌家数+领涨股。短线看当日资金主线（哪个行业在涨），中线看行业轮动趋势（连续走强的行业）。",
+    category="行情数据",
+    layer="分析层",
+    domain=["finance"],
+)
 def get_industry_ranking(top_n: int = 20) -> Dict[str, Any]:
     """获取行业板块涨跌幅排名（东财行业板块）。
 
@@ -272,6 +303,12 @@ def get_industry_ranking(top_n: int = 20) -> Dict[str, Any]:
 # 龙虎榜详情
 # ══════════════════════════════════════════════════════════════
 
+@tool(
+    description="[短线核心] 龙虎榜席位详情（补充 get_dragon_tiger：现有工具返回基础数据，本工具返回买卖席位TOP5+机构专用席位动向）。上榜记录+买卖席位TOP5营业部+机构专用席位动向。短线追踪游资必用：知名游资席位买入=短期有溢价预期，机构专用净买入=中线信号。",
+    category="行情数据",
+    layer="分析层",
+    domain=["finance"],
+)
 def get_dragon_tiger_detail(stock_code: str, look_back_days: int = 30) -> Dict[str, Any]:
     """获取个股龙虎榜详情（席位+机构）。
 

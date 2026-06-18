@@ -51,8 +51,8 @@ from smolagents import (
 from smolagents.memory import ToolCall
 
 from app.agent.model import build_model
-from app.agent_1.tools.registry import build_smolagent_tools
-from app.agent_1.tools import registry as local_registry
+from app.agent.tools.registry import build_smolagent_tools
+from app.agent.tools import registry as local_registry
 from app.agent.tool_context import set_tool_context
 from app.agent.trace_collector import TraceCollector
 

@@ -19,6 +19,7 @@ def _get_ds(market: str = "CNStock"):
 
 # ── Re-exported from shared utils (kept for backward compat) ──
 from app.agent.utils import detect_market as _detect_market
+from app.agent.tools.registry import tool
 
 # ═══════════════════════════════════════════════════════════════
 # 数据获取辅助
@@ -297,6 +298,12 @@ def _calc_kdj(highs: List[float], lows: List[float], closes: List[float],
 # Tool 函数（注册给 Agent 调用）
 # ═══════════════════════════════════════════════════════════════
 
+@tool(
+    description="综合技术趋势分析（MA + MACD + RSI + BOLL + KDJ 五维共振），返回均线排列、趋势评分、买卖信号和所有子指标详情。这是最核心的分析工具，一次调用获取全部技术面数据。",
+    category="技术分析",
+    layer="分析层",
+    domain=["finance"],
+)
 def analyze_trend(stock_code: str) -> Dict[str, Any]:
     """综合技术趋势分析：均线排列 + MACD + RSI + BOLL + KDJ，给出多维度趋势评分和买卖信号。"""
     try:
@@ -468,6 +475,12 @@ def analyze_trend(stock_code: str) -> Dict[str, Any]:
         logger.error("analyze_trend(%s) failed: %s", stock_code, e)
         return {"error": str(e)}
 
+@tool(
+    description="计算指定周期的移动平均线数值及斜率（趋势方向）。",
+    category="技术分析",
+    layer="分析层",
+    domain=["finance"],
+)
 def calculate_ma(stock_code: str, periods: str = "5,10,20,60,120") -> Dict[str, Any]:
     """计算指定周期的均线数值，同时返回均线斜率（趋势方向）。"""
     try:
@@ -497,6 +510,12 @@ def calculate_ma(stock_code: str, periods: str = "5,10,20,60,120") -> Dict[str, 
         logger.error("calculate_ma(%s) failed: %s", stock_code, e)
         return {"error": str(e)}
 
+@tool(
+    description="分析量能变化：量比、成交量趋势、放量/缩量判断、量价关系（量价齐升/缩量上涨/放量下跌等）。",
+    category="技术分析",
+    layer="分析层",
+    domain=["finance"],
+)
 def get_volume_analysis(stock_code: str) -> Dict[str, Any]:
     """分析量能变化：量比、成交量趋势、放量/缩量判断、量价关系。"""
     try:
@@ -565,6 +584,12 @@ def get_volume_analysis(stock_code: str) -> Dict[str, Any]:
         logger.error("get_volume_analysis(%s) failed: %s", stock_code, e)
         return {"error": str(e)}
 
+@tool(
+    description="识别K线形态（增强版）：锤子线、十字星、吞没、早晨/黄昏之星、三连阳/阴、红三兵/黑三鸦、长上下影线、缺口等 15+ 种形态。",
+    category="技术分析",
+    layer="分析层",
+    domain=["finance"],
+)
 def analyze_pattern(stock_code: str) -> Dict[str, Any]:
     """识别K线形态（增强版）：锤子线、十字星、吞没、早晨/晚星、三连阳/阴、长上影/下影、缺口等。"""
     try:
@@ -707,6 +732,12 @@ def analyze_pattern(stock_code: str) -> Dict[str, Any]:
         logger.error("analyze_pattern(%s) failed: %s", stock_code, e)
         return {"error": str(e)}
 
+@tool(
+    description="分析筹码分布：获利比例、平均成本、集中度、支撑压力位（仅A股支持）。基于120根日K线衰减成本分布模型计算。",
+    category="技术分析",
+    layer="分析层",
+    domain=["finance"],
+)
 def get_chip_distribution(stock_code, lookback_days: int = 120) -> Dict[str, Any]:
     """筹码分布分析（衰减成本分布模型）。
 
@@ -740,6 +771,12 @@ def get_chip_distribution(stock_code, lookback_days: int = 120) -> Dict[str, Any
         logger.error("get_chip_distribution(%s) failed: %s", stock_code, e, exc_info=True)
         return {"error": str(e)}
 
+@tool(
+    description="一次性获取所有主要技术指标快照（MA/MACD/RSI/BOLL/KDJ/量比），减少多轮工具调用。适合需要快速全面了解技术面的场景。",
+    category="技术分析",
+    layer="分析层",
+    domain=["finance"],
+)
 def get_indicator_snapshot(stock_code: str) -> Dict[str, Any]:
     """一次性返回所有主要技术指标的最新值，供 Agent 全局研判。
 

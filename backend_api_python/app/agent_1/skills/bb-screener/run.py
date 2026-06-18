@@ -13,7 +13,7 @@ def main():
     from app.agent.skills.bb_screener import (
         _get_all_codes, _get_name_map, _fetch_kline, _check_bb_entry, _deep_analyze_one
     )
-    from app.agent_1.tools import registry as tool_registry
+    from app.agent.tools import registry as tool_registry
     tool_registry.discover()
 
     def call_tool_fn(tool_name, **kwargs):

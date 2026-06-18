@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List
 
+from app.agent.tools.registry import tool
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,12 @@ def _tencent_quote_raw(codes: list) -> dict:
 # 五档盘口
 # ══════════════════════════════════════════════════════════════
 
+@tool(
+    description="[短线] 五档盘口。买一~买五/卖一~卖五价格+挂单量+实时行情。短线盘口语言：买盘挂单大=支撑强，卖盘挂单大=压力大。大单托底可能是诱多，大单压顶可能是洗盘。",
+    category="行情数据",
+    layer="数据层",
+    domain=["finance"],
+)
 def get_order_book(stock_code: str) -> Dict[str, Any]:
     """获取五档盘口+实时行情。
 
@@ -135,6 +142,12 @@ def get_order_book(stock_code: str) -> Dict[str, Any]:
 # 指数/ETF行情
 # ══════════════════════════════════════════════════════════════
 
+@tool(
+    description="[短线+中线] 指数/ETF行情（扩展 get_market_indices：现有工具仅覆盖3大指数，本工具支持任意指数+ETF代码，如510050/510300/159919等）。上证/深证/沪深300/创业板指+主流ETF实时行情。看大盘方向用：指数涨跌判断市场情绪，ETF跟踪行业/宽基趋势。短线看情绪，中线看趋势。",
+    category="行情数据",
+    layer="数据层",
+    domain=["finance"],
+)
 def get_index_etf_quote(codes: str) -> Dict[str, Any]:
     """获取指数/ETF实时行情（腾讯财经）。
 
@@ -177,6 +190,12 @@ def get_index_etf_quote(codes: str) -> Dict[str, Any]:
 # 批量估值对比
 # ══════════════════════════════════════════════════════════════
 
+@tool(
+    description="[中线] 批量估值对比。多只股票PE/PB/市值/涨跌幅横向排列。同行业选股用：PE最低+PB最低=潜在低估标的。最多20只同时对比。",
+    category="行情数据",
+    layer="数据层",
+    domain=["finance"],
+)
 def batch_valuation_compare(stock_codes: str) -> Dict[str, Any]:
     """批量估值对比（腾讯财经）。
 
