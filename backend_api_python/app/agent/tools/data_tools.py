@@ -9,7 +9,6 @@ import json
 import logging
 from typing import Any, Dict, List, Optional
 
-from app.agent.tools.registry import tool
 
 logger = logging.getLogger(__name__)
 
@@ -22,12 +21,6 @@ from app.data_sources.market_detector import detect_market as _detect_market
 
 # ── Tool functions ────────────────────────────────────────────
 
-@tool(
-    description="根据中文名称或关键词搜索股票代码。支持模糊匹配，如输入茅台可找到贵州茅台(600519)。当用户提供中文股票名称但没有代码时，必须先用此工具查到代码再进行后续分析。",
-    category="名称查询",
-    layer="数据层",
-    domain=[],
-)
 def search_stock_by_name(keyword: str, market: str = "CNStock", limit: int = 10) -> Dict[str, Any]:
     """根据中文名称或关键词搜索股票代码,支持模糊搜索。
 
@@ -57,14 +50,12 @@ def search_stock_by_name(keyword: str, market: str = "CNStock", limit: int = 10)
         logger.error("search_stock_by_name(%s) failed: %s", keyword, e)
         return {"keyword": keyword, "results": [], "count": 0, "error": str(e)}
 
-@tool(
-    description="获取股票或交易对的实时行情（最新价、涨跌幅、成交量、换手率、量比、PE/PB等）。",
-    category="行情数据",
-    layer="数据层",
-    domain=["finance"],
-)
 def get_realtime_quote(stock_code: str) -> Dict[str, Any]:
-    """获取股票/交易对的实时行情数据，包括最新价、涨跌幅、成交量、换手率等。"""
+        """获取股票实时行情数据。
+
+    Args:
+        stock_code: 股票代码，如 "600519"
+    """
     market = _detect_market(stock_code) or "CNStock"
     ds = _get_ds(market)
     try:
@@ -78,12 +69,6 @@ def get_realtime_quote(stock_code: str) -> Dict[str, Any]:
         logger.error("get_realtime_quote(%s) failed: %s", stock_code, e)
         return {"error": str(e)}
 
-@tool(
-    description="获取股票/交易对的K线数据（OHLCV：开盘价/最高价/最低价/收盘价/成交量）。支持多周期：1m/5m/15m/30m/1H/4H/1D/1W。这是获取原始K线数据的核心工具，用于趋势分析和技术指标计算。当用户要求查看K线、行情数据、历史价格时必须使用此工具。",
-    category="行情数据",
-    layer="数据层",
-    domain=["finance"],
-)
 def agent_get_kline(stock_code: str, timeframe: str = "1D", days: int = 60, market: str = "") -> List[Dict[str, Any]]:
     """获取股票/交易对的K线数据（OHLCV）。
 
@@ -122,14 +107,12 @@ def agent_get_kline(stock_code: str, timeframe: str = "1D", days: int = 60, mark
     except Exception as e:
         logger.error("get_kline(%s, %s, %d) failed: %s", stock_code, timeframe, days, e)
         return []
-@tool(
-    description="获取股票基本面信息（行业、概念、市值、PE、PB等）。",
-    category="行情数据",
-    layer="数据层",
-    domain=["finance"],
-)
 def get_stock_info(stock_code: str) -> Dict[str, Any]:
-    """获取股票基本面信息（行业、概念、市值、PE、PB 等）+ 实时估值补全。"""
+        """获取股票基本信息（名称、行业、市值等）。
+
+    Args:
+        stock_code: 股票代码，如 "600519"
+    """
     market = _detect_market(stock_code) or "CNStock"
     ds = _get_ds(market)
     result: Dict[str, Any] = {}

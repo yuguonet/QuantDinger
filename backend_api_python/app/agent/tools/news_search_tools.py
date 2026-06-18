@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List
 
-from app.agent.tools.registry import tool
 
 logger = logging.getLogger(__name__)
 
@@ -103,46 +102,44 @@ def _build_result(items: List[Dict[str, Any]], label: str) -> Dict[str, Any]:
     }
 
 
-@tool(
-    description="个股情报: 返回综合评分+摘要。一票否决置顶强调, 最新≤20条。",
-    category="情报搜索",
-    layer="分析层",
-    domain=["finance"],
-)
 def search_stock_intel(stock_code: str, name: str = "") -> Dict[str, Any]:
+    """搜索个股情报（新闻、公告、研报）。
+
+    Args:
+        stock_code: 股票代码，如 "600519"
+        name: 股票名称，如 "贵州茅台"
+    """
     items = _get_news(stock_code, "CNStock", name)
     return _build_result(items, f"个股:{stock_code}")
 
 
-@tool(
-    description="板块/市场情报: 返回综合评分+摘要。一票否决置顶强调, 最新≤20条。",
-    category="情报搜索",
-    layer="分析层",
-    domain=["finance"],
-)
 def search_sector_intel(market: str = "CNStock") -> Dict[str, Any]:
+    """搜索板块情报。
+
+    Args:
+        market: 板块名称或关键词
+    """
     items = _get_news(market, market)
     return _build_result(items, f"板块:{market}")
 
 
-@tool(
-    description="政策/宏观情报: 返回综合评分+摘要。一票否决置顶强调, 最新≤20条。只读缓存,不触发搜索。",
-    category="情报搜索",
-    layer="分析层",
-    domain=["finance"],
-)
 def search_policy_intel(market: str = "CNStock") -> Dict[str, Any]:
+    """搜索政策情报。
+
+    Args:
+        market: 市场或政策关键词
+    """
     items = _get_policy_from_cache()
     return _build_result(items, f"政策:{market}")
 
 
-@tool(
-    description="综合情报: 个股+政策, 返回总分+摘要。一票否决置顶, 合计≤20条。",
-    category="情报搜索",
-    layer="分析层",
-    domain=["finance"],
-)
 def search_comprehensive_intel(stock_code: str, name: str = "") -> Dict[str, Any]:
+    """综合情报搜索（个股+板块+政策）。
+
+    Args:
+        stock_code: 股票代码，如 "600519"
+        name: 股票名称，如 "贵州茅台"
+    """
     stock_items = _get_news(stock_code, "CNStock", name)
     policy_items = _get_policy_from_cache()
 

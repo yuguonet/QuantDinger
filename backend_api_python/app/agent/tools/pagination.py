@@ -216,7 +216,11 @@ def get_page(cache_key: str, page: int, page_size: int = 0) -> Dict[str, Any]:
 
 
 def get_cache_summary(cache_key: str) -> Optional[Dict[str, Any]]:
-    """查看缓存摘要（不返回数据，只返回元信息）。"""
+        """获取缓存摘要信息。
+
+    Args:
+        cache_key: 缓存键名
+    """
     cached = _cache.get(cache_key)
     if not cached:
         return None
@@ -282,7 +286,13 @@ def paginate_text(
 
 
 def get_text_page(cache_key: str, page: int, chunk_size: int = 0) -> Dict[str, Any]:
-    """从缓存中取文本的指定块。供 page_tool 调用。"""
+        """获取文本分页内容。
+
+    Args:
+        cache_key: 缓存键名
+        page: 页码
+        chunk_size: 每页字符数
+    """
     cached = _cache.get(cache_key)
     if not cached:
         return {"error": f"缓存已过期或不存在: {cache_key}", "retriable": False}
@@ -431,10 +441,6 @@ def paginated(
 # 4. Agent 翻页工具（注册到 tools/registry）
 # ═══════════════════════════════════════════════════════════════
 
-def register_page_tool():
-    """注册翻页工具到全局 registry。"""
-    from app.agent.tools.registry import tool as reg_tool
-
     @reg_tool(
         description=(
             "翻页查看上一次查询的缓存数据。当工具返回了 _pagination 字段时，"
@@ -459,4 +465,18 @@ def register_page_tool():
             return {"error": "cache_key 不能为空", "retriable": False}
         page = max(1, int(page))
         page_size = max(1, min(int(page_size), 100))
-        return get_page(cache_key, page, page_size)
+        return get_page(cache_key, page, page_size)    """存入缓存数据。
+
+    Args:
+        key: 缓存键名
+        data: 要缓存的数据
+        data_key: 数据子键
+    """    """删除缓存条目。
+
+    Args:
+        key: 缓存键名
+    """    """分页装饰器。
+
+    Args:
+        fn: 被装饰的函数
+    """

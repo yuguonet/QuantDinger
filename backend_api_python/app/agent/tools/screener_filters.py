@@ -23,7 +23,11 @@ from app.agent.tools.screener_config import (
 # ══════════════════════════════════════════════════════════════
 
 def build_keyword_from_filters(filters: Dict[str, Any]) -> str:
-    """将结构化筛选条件转换为自然语言关键词字符串。"""
+    """将结构化筛选条件转换为自然语言关键词字符串。
+
+    Args:
+        filters: 筛选条件字典，如 {"market": "主板", "pe_range": [0, 30]}
+    """
     parts: List[str] = []
 
     # ── 基本面：估值 ──
@@ -348,15 +352,8 @@ def build_keyword_from_filters(filters: Dict[str, Any]) -> str:
 #  筛选条件分类说明（给 Agent 看的文档）
 # ══════════════════════════════════════════════════════════════
 
-from app.agent.tools.registry import tool
 
 
-@tool(
-    description="获取选股器支持的所有筛选条件分类和示例。",
-    category="选股",
-    layer="决策层",
-    domain=["finance"],
-)
 def get_screener_presets() -> Dict[str, Any]:
     """获取选股器支持的所有筛选条件分类和示例。"""
     return {

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Semantics Loader — 语义描述统一加载入口（v4，对齐 Nanobot 两段加载）。
+Semantics Loader — 语义描述统一加载入口（v4）。
 
 v4 变更：
   - 删除 DomainMeta 和 domains.md 加载
@@ -244,20 +244,6 @@ def load_semantics():
                     tools=meta.get("tools", []),
                     instructions=body,
                     standard_output=meta.get("standard_output", False),
-                )
-
-    # ── tools（tools.md frontmatter）──
-    for cat_name, cat_tools in _load_frontmatter("tools.md").get("categories", {}).items():
-        if not isinstance(cat_tools, list):
-            continue
-        for t in cat_tools:
-            if isinstance(t, dict) and t.get("name"):
-                _tools[t["name"]] = ToolMeta(
-                    name=t["name"],
-                    description=t.get("description", ""),
-                    category=t.get("category", cat_name),
-                    layer=t.get("layer", ""),
-                    tags=t.get("tags", t.get("domain", [])),
                 )
 
     # ── chains（chains.md frontmatter）──

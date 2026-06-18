@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
-from app.agent.tools.registry import tool
 
 logger = logging.getLogger(__name__)
 
@@ -87,12 +86,6 @@ def _dl_hot_rank() -> List[Dict[str, Any]]:
 #  工具函数
 # ══════════════════════════════════════════════════════════════
 
-@tool(
-    description="获取龙虎榜数据。stock_code为空返回全市场龙虎榜，非空返回该股票的历史龙虎榜。包含上榜股票代码、名称、买卖金额、净买入额、涨跌幅、上榜原因。",
-    category="行情数据",
-    layer="数据层",
-    domain=["finance"],
-)
 def get_dragon_tiger(stock_code: str = "", date: str = "", days: int = 30) -> Dict[str, Any]:
     """获取龙虎榜数据。
 
@@ -135,12 +128,6 @@ def get_dragon_tiger(stock_code: str = "", date: str = "", days: int = 30) -> Di
         data = _dl_dragon_tiger(start_date, date)
         return {"date": date, "days": days, "count": len(data), "stocks": data}
 
-@tool(
-    description="获取实时股票热榜/人气榜：排名、代码、名称、人气分数、价格、涨跌幅。反映市场关注度最高的个股。",
-    category="行情数据",
-    layer="数据层",
-    domain=["finance"],
-)
 def get_hot_rank(top_n: int = 30) -> Dict[str, Any]:
     """获取实时股票热榜/人气榜。
 
@@ -151,12 +138,6 @@ def get_hot_rank(top_n: int = 30) -> Dict[str, Any]:
     data = _dl_hot_rank()
     return {"count": len(data[:top_n]), "stocks": data[:top_n]}
 
-@tool(
-    description="获取涨跌停/炸板股票池。pool_type: zt=涨停池（可筛连板）、dt=跌停池、broken=炸板池（曾封涨停被打开，资金分歧信号）。一次调用可同时获取三类数据。",
-    category="行情数据",
-    layer="数据层",
-    domain=["finance"],
-)
 def get_limit_pool(date: str = "", pool_type: str = "zt", min_continuous_days: int = 0) -> Dict[str, Any]:
     """获取涨跌停/炸板股票池。
 
@@ -216,12 +197,6 @@ def get_limit_pool(date: str = "", pool_type: str = "zt", min_continuous_days: i
 
     return result
 
-@tool(
-    description="获取全市场涨跌统计快照：上涨/下跌家数、情绪指标。",
-    category="行情数据",
-    layer="数据层",
-    domain=["finance"],
-)
 def get_market_overview() -> Dict[str, Any]:
     """获取全市场涨跌统计快照：上涨/下跌家数、资金流向、情绪指标。"""
     up = down = 0
@@ -273,12 +248,6 @@ def get_market_overview() -> Dict[str, Any]:
         "main_net_yi": main_net_yi, "main_pct": main_pct,
     }
 
-@tool(
-    description="获取个股资金流向：主力/大单/中单/小单的净流入额。支持单只（传一个代码）或批量（逗号分隔，最多20只）。",
-    category="行情数据",
-    layer="数据层",
-    domain=["finance"],
-)
 def get_fund_flow(stock_codes: str = "") -> Dict[str, Any]:
     """获取个股资金流向。支持单只或批量（逗号分隔），单次最多20只。
 
@@ -331,12 +300,6 @@ def get_fund_flow(stock_codes: str = "") -> Dict[str, Any]:
                 result[code] = {"code": code, "name": "", "net_flow": 0, "main_flow": 0, "retail_flow": 0}
         return {"count": len(result), "flows": result, "failed": []}
 
-@tool(
-    description="获取行业板块资金流向排名。",
-    category="行情数据",
-    layer="数据层",
-    domain=["finance"],
-)
 def get_sector_fund_flow(date: str = "") -> Dict[str, Any]:
     """获取行业板块资金流向排名。
 
@@ -354,12 +317,6 @@ def get_sector_fund_flow(date: str = "") -> Dict[str, Any]:
     data = _get_sector_flow("今日")
     return {"date": date, "count": len(data), "sectors": data}
 
-@tool(
-    description="获取概念板块资金流向排名。",
-    category="行情数据",
-    layer="数据层",
-    domain=["finance"],
-)
 def get_concept_fund_flow(date: str = "") -> Dict[str, Any]:
     """获取概念板块资金流向排名。
 
@@ -392,12 +349,6 @@ def _normalize_code(code: str) -> str:
     return code
 
 
-@tool(
-    description="[中线] 个股资金流120日日级数据。主力/大单/中单/小单净流入。近20日主力累计净流入=资金在建仓，持续净流出=资金在撤退。配合筹码分析。",
-    category="行情数据",
-    layer="分析层",
-    domain=["finance"],
-)
 def get_fund_flow_120d(stock_code: str) -> Dict[str, Any]:
     """获取个股资金流120日日级数据。
 
@@ -421,12 +372,6 @@ def get_fund_flow_120d(stock_code: str) -> Dict[str, Any]:
         return {"stock_code": code, "error": str(e)}
 
 
-@tool(
-    description="[短线] 个股资金流分钟级实时数据。当日盘中主力/大单/超大单实时净流入。盘中盯资金用：超大单突然大幅流入=可能有消息或主力进场。",
-    category="行情数据",
-    layer="分析层",
-    domain=["finance"],
-)
 def get_fund_flow_minute(stock_code: str) -> Dict[str, Any]:
     """获取个股资金流向分钟级。
 

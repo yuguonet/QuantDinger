@@ -324,14 +324,8 @@ class Planner:
                 plan_data["steps"].insert(0, {"agent": skill})
                 logger.info("[Planner] 自动补充必选 Skill: %s", skill)
 
-        # 校验 Skill 名是否合法
-        from app.agent.skills.registry import skill_registry
-        skill_registry.discover()
-        valid_names = set(skill_registry.all_names)
-        for step in plan_data["steps"]:
-            if step.get("agent", "") not in valid_names:
-                return f"未知技能: {step.get('agent', '')}"
-
+        # skill_registry 已移除：新架构 skill 通过 SKILL.md 管理
+        # 校验暂时跳过，让 agent 自行处理未知技能
         return None  # 通过
 
     def _build_chain_def(self, plan_data: Dict[str, Any], stock_code: str) -> ChainDef:

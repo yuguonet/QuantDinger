@@ -165,16 +165,15 @@ def _execute_prompt_job(job: Dict[str, Any]):
 
     try:
         from app.agent.agent import build_agent_executor
-        from app.agent.skills.registry import skill_registry
         from app.agent.intent_analyzer import analyze_intent
-        skill_registry.discover()
 
+        # skill_registry 已移除：新架构 skill 通过 SKILL.md 管理
         # 先做意图分析，拿到 domain 以过滤工具
         intent = analyze_intent(prompt, session_id=f"cron_{job_id}")
         domain = intent.domain if intent else "unknown"
 
         executor = build_agent_executor(
-            skills=skill_registry.all_names,
+            skills=[],
             user_id="cron",
             max_steps=8,
             timeout_seconds=120,
