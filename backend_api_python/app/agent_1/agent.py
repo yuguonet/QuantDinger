@@ -51,7 +51,8 @@ from smolagents import (
 from smolagents.memory import ToolCall
 
 from app.agent.model import build_model
-from app.agent.tools.nanobot_registry import build_smolagent_tools, registry as nanobot_registry
+from app.agent_1.tools.registry import build_smolagent_tools
+from app.agent_1.tools import registry as local_registry
 from app.agent.tool_context import set_tool_context
 from app.agent.trace_collector import TraceCollector
 
@@ -92,12 +93,11 @@ def _get_agent_class():
 
 def _generate_tool_catalog(tools, managed_agents) -> str:
     """从工具对象自动生成分类目录。按 layer → category 二级分组。"""
-    # 旧 registry 保留用于目录生成（有 category/layer 元数据）
+    # 用本地 registry 生成目录（有 category/layer 元数据）
     try:
-        from app.agent.tools.nanobot_registry import registry as tool_registry
-        tool_registry.discover()
+        local_registry.discover()
         tool_names = {t.name for t in tools}
-        layered = tool_registry.layered_categories
+        layered = local_registry.layered_categories
     except Exception:
         return ""
 
@@ -625,7 +625,7 @@ def get_smolagent(
     domain_key = domain or "all"
     with _tools_cache_lock:
         if domain_key not in _tools_cache_by_domain:
-            # 新架构：nanobot_registry 自动发现 + smolagents 桥接
+            # 本地 registry 自动发现 + smolagents 桥接
             tools = build_smolagent_tools({
                 "deny": list(_EXCLUDED_TOOL_NAMES),
                 "domain": domain,

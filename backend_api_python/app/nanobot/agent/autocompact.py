@@ -73,7 +73,7 @@ class AutoCompact:
                         datetime.fromisoformat(meta["last_active"]),
                     )
         except Exception:
-            logger.exception("Auto-compact: failed for {}", key)
+            logger.exception("Auto-compact: failed for %s", key)
         finally:
             self._archiving.discard(key)
 
@@ -83,7 +83,7 @@ class AutoCompact:
             self._summaries.pop(key, None)
             return session, None
         if key in self._archiving or self._is_expired(session.updated_at):
-            logger.info("Auto-compact: reloading session {} (archiving={})", key, key in self._archiving)
+            logger.info("Auto-compact: reloading session %s (archiving=%s)", key, key in self._archiving)
             session = self.sessions.get_or_create(key)
         # Hot path: summary from in-memory dict (process hasn't restarted).
         entry = self._summaries.pop(key, None)

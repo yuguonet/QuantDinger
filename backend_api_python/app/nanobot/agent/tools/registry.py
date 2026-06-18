@@ -1,6 +1,7 @@
 """Tool registry for dynamic tool management."""
 
 import json
+from loguru import logger
 from typing import Any
 
 from nanobot.agent.tools.base import Tool
@@ -87,6 +88,11 @@ class ToolRegistry:
         builtins.sort(key=self._schema_name)
         mcp_tools.sort(key=self._schema_name)
         self._cached_definitions = builtins + mcp_tools
+        # Debug: log tool schema sizes
+        import json as _json
+        total_chars = sum(len(_json.dumps(s, ensure_ascii=False)) for s in self._cached_definitions)
+        logger.info("[ToolRegistry] {} tools, schema total: {} chars (~{} tokens)",
+                    len(self._cached_definitions), total_chars, total_chars // 4)
         return self._cached_definitions
 
     def prepare_call(

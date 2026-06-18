@@ -11,7 +11,7 @@ def main():
 
     # 复用原 market_screener.py 的核心函数
     from app.agent.skills.market_screener import _select_strategy, _run_intraday, _run_eod, _run_post_market
-    from app.agent.tools.nanobot_registry import registry as tool_registry
+    from app.agent_1.tools import registry as tool_registry
     tool_registry.discover()
 
     def call_tool_fn(tool_name, **kwargs):

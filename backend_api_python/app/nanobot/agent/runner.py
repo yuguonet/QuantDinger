@@ -224,7 +224,7 @@ class AgentRunner:
                 len(injections), phase, injection_cycles, _MAX_INJECTION_CYCLES,
             )
         else:
-            logger.info("Injected sustained-goal continuation {}", phase)
+            logger.info("Injected sustained-goal continuation %s", phase)
         return True, injection_cycles
 
     async def _drain_injections(self, spec: AgentRunSpec) -> list[dict[str, Any]]:
@@ -714,6 +714,12 @@ class AgentRunner:
             messages,
             tools=spec.tools.get_definitions(),
         )
+        # Debug: log message sizes
+        import json as _json
+        msg_chars = sum(len(_json.dumps(m, ensure_ascii=False)) for m in messages)
+        tool_chars = sum(len(_json.dumps(t, ensure_ascii=False)) for t in (spec.tools.get_definitions() or []))
+        logger.info("[Runner] LLM call: msgs=%s, msg_chars=%s, tool_chars=%s, total_chars=%s",
+                    len(messages), msg_chars, tool_chars, msg_chars + tool_chars)
         wants_streaming = hook.wants_streaming()
         wants_progress_streaming = (
             not wants_streaming

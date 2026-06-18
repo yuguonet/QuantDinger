@@ -1,6 +1,7 @@
 """Context builder for assembling agent prompts."""
 
 import base64
+from loguru import logger
 import mimetypes
 import platform
 from pathlib import Path
@@ -53,8 +54,8 @@ class ContextBuilder:
 
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
-    _MAX_RECENT_HISTORY = 50
-    _MAX_HISTORY_CHARS = 32_000  # hard cap on recent history section size
+    _MAX_RECENT_HISTORY = 10  # 减少：50→10，避免系统提示词过长
+    _MAX_HISTORY_CHARS = 4_000  # 减少：32000→4000，历史工具结果不应全量注入
     _RUNTIME_CONTEXT_END = "[/Runtime Context]"
 
     def __init__(self, workspace: Path, timezone: str | None = None, disabled_skills: list[str] | None = None):
@@ -118,7 +119,12 @@ class ContextBuilder:
         if self.system_prompt_extra:
             parts.append(self.system_prompt_extra)
 
-        return "\n\n---\n\n".join(parts)
+        result = "\n\n---\n\n".join(parts)
+        logger.info("[Context] system_prompt parts={}, total_chars={}",
+                    len(parts), len(result))
+        for i, p in enumerate(parts):
+            logger.debug("[Context] part[{}]: {} chars", i, len(p))
+        return result
 
     def _get_identity(self, channel: str | None = None, workspace: Path | None = None) -> str:
         """Get the core identity section."""

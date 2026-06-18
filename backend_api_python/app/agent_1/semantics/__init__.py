@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Semantics Loader — 语义描述统一加载入口（v4，对齐 Nanobot 两段加载）。
+Semantics Loader — 语义描述统一加载入口（v4）。
 
 v4 变更：
   - 删除 DomainMeta 和 domains.md 加载

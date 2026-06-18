@@ -429,7 +429,7 @@ class AgentLoop:
                 self.model,
                 model_preset if model_preset is not None else self.model_preset,
             )
-        logger.info("Runtime model switched for next turn: {} -> {}", old_model, model)
+        logger.info("Runtime model switched for next turn: %s -> %s", old_model, model)
 
     def _refresh_provider_snapshot(self) -> None:
         if self._provider_snapshot_loader is None:
@@ -506,7 +506,7 @@ class AgentLoop:
             )
             registered.append("my")
 
-        logger.info("Registered {} tools: {}", len(registered), registered)
+        logger.info("Registered %s tools: %s", len(registered), registered)
 
     async def _connect_mcp(self) -> None:
         """Connect configured MCP servers."""
@@ -645,7 +645,7 @@ class AgentLoop:
         if result:
             await self.bus.publish_outbound(result)
         else:
-            logger.warning("Command '{}' matched but dispatch returned None", raw)
+            logger.warning("Command '%s' matched but dispatch returned None", raw)
 
     async def _cancel_active_tasks(self, key: str) -> int:
         """Cancel and await all active tasks and subagents for *key*.
@@ -848,7 +848,7 @@ class AgentLoop:
             reset_file_states(file_state_token)
         self._last_usage = result.usage
         if result.stop_reason == "max_iterations":
-            logger.warning("Max iterations ({}) reached", self.max_iterations)
+            logger.warning("Max iterations (%s) reached", self.max_iterations)
             should_stream = turn_continuation.should_stream_budget_response(
                 stop_reason=result.stop_reason,
                 pending_queue_available=pending_queue is not None and session is not None,
@@ -861,7 +861,7 @@ class AgentLoop:
                 await on_stream(result.final_content or "")
                 await on_stream_end(resuming=False)
         elif result.stop_reason == "error":
-            logger.error("LLM returned error: {}", (result.final_content or "")[:200])
+            logger.error("LLM returned error: %s", (result.final_content or "")[:200])
         return result.final_content, result.tools_used, result.messages, result.stop_reason, result.had_injections
 
     async def run(self) -> None:
@@ -886,7 +886,7 @@ class AgentLoop:
                     raise
                 continue
             except Exception as e:
-                logger.warning("Error consuming inbound message: {}, continuing...", e)
+                logger.warning("Error consuming inbound message: %s, continuing...", e)
                 continue
 
             raw = msg.content.strip()
@@ -1028,7 +1028,7 @@ class AgentLoop:
                         msg,
                         error=asyncio.CancelledError(),
                     )
-                    logger.info("Task cancelled for session {}", session_key)
+                    logger.info("Task cancelled for session %s", session_key)
                     # Preserve partial context from the interrupted turn so
                     # the user does not lose tool results and assistant
                     # messages accumulated before /stop.  The checkpoint was
@@ -1054,7 +1054,7 @@ class AgentLoop:
                         )
                     raise
                 except Exception as exc:
-                    logger.exception("Error processing message for session {}", session_key)
+                    logger.exception("Error processing message for session %s", session_key)
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel, chat_id=msg.chat_id,
                         content="Sorry, I encountered an error.",
@@ -1115,7 +1115,7 @@ class AgentLoop:
             try:
                 await stack.aclose()
             except (RuntimeError, BaseExceptionGroup):
-                logger.debug("MCP server '{}' cleanup error (can be ignored)", name)
+                logger.debug("MCP server '%s' cleanup error (can be ignored)", name)
         self._mcp_stacks.clear()
 
     def _schedule_background(self, coro) -> None:
@@ -1142,7 +1142,7 @@ class AgentLoop:
         channel, chat_id = (
             msg.chat_id.split(":", 1) if ":" in msg.chat_id else ("cli", msg.chat_id)
         )
-        logger.info("Processing system message from {}", msg.sender_id)
+        logger.info("Processing system message from %s", msg.sender_id)
         key = msg.session_key_override or f"{channel}:{chat_id}"
         session = self.sessions.get_or_create(key)
         if self._restore_runtime_checkpoint(session):
@@ -1152,7 +1152,7 @@ class AgentLoop:
 
         session, pending = self.auto_compact.prepare_session(session, key)
         if pending:
-            logger.info("Memory compact triggered for session {}", key)
+            logger.info("Memory compact triggered for session %s", key)
 
         await self.consolidator.maybe_consolidate_by_tokens(
             session,
@@ -1160,7 +1160,7 @@ class AgentLoop:
         )
         is_subagent = msg.sender_id == "subagent"
         if is_subagent and self._persist_subagent_followup(session, msg):
-            logger.debug("Subagent result persisted for session {}", key)
+            logger.debug("Subagent result persisted for session %s", key)
             self.sessions.save(session)
         self._set_tool_context(
             channel, chat_id, msg.metadata.get("message_id"),
@@ -1343,7 +1343,7 @@ class AgentLoop:
                 return None
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
-        logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
+        logger.info("Response to %s:%s: %s", msg.channel, msg.sender_id, preview)
 
         meta = dict(msg.metadata or {})
         if on_stream is not None and stop_reason not in {"error", "tool_error"}:
@@ -1368,7 +1368,7 @@ class AgentLoop:
             msg = ctx.msg
 
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
-        logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
+        logger.info("Processing message from %s:%s: %s", msg.channel, msg.sender_id, preview)
 
         # Session is already fetched by the caller (_process_message) but
         # ensure it exists in case this handler is invoked independently.
