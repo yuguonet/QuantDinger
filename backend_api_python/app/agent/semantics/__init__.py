@@ -19,7 +19,7 @@ v4 变更：
         get_persona, get_intent_meta,
         get_skill_meta, get_all_skill_metas,
         get_tool_meta, get_all_tool_metas,
-        get_chain_meta,
+    
         get_skills_summary_xml, get_tools_summary_xml,
         get_agent_rules_text,
         load_semantics,
@@ -81,25 +81,6 @@ class ToolMeta:
     tags: List[str] = field(default_factory=list)
 
 
-@dataclass
-class ChainStepMeta:
-    name: str = ""
-    agent: str = ""
-    order: int = 0
-    description: str = ""
-    required: bool = True
-    extract_fn: str = ""
-
-
-@dataclass
-class ChainMeta:
-    name: str = ""
-    description: str = ""
-    trigger_verbs: List[str] = field(default_factory=list)
-    trigger_nouns: List[str] = field(default_factory=list)
-    steps: List[ChainStepMeta] = field(default_factory=list)
-
-
 # ═══════════════════════════════════════════════════════════════
 # Cache
 # ═══════════════════════════════════════════════════════════════
@@ -108,7 +89,7 @@ _persona: Optional[PersonaMeta] = None
 _intent: Optional[IntentMeta] = None
 _skills: Dict[str, SkillMeta] = {}
 _tools: Dict[str, ToolMeta] = {}
-_chains: Dict[str, ChainMeta] = {}
+
 _loaded = False
 
 
@@ -246,19 +227,6 @@ def load_semantics():
                     standard_output=meta.get("standard_output", False),
                 )
 
-    # ── chains（chains.md frontmatter）──
-    for name, cfg in _load_frontmatter("chains.md").get("chains", {}).items():
-        steps = []
-        for s in cfg.get("steps", []):
-            steps.append(ChainStepMeta(**s))
-        _chains[name] = ChainMeta(
-            name=cfg.get("name", name),
-            description=cfg.get("description", ""),
-            trigger_verbs=cfg.get("trigger_verbs", []),
-            trigger_nouns=cfg.get("trigger_nouns", []),
-            steps=steps,
-        )
-
     # ── intent（intent.md frontmatter + body 作为 classifier_prompt）──
     intent_md = _SEMANTICS_DIR / "intent.md"
     if intent_md.exists():
@@ -272,8 +240,8 @@ def load_semantics():
         )
 
     logger.info(
-        "[Semantics] 加载完成: %d skills, %d tools, %d chains",
-        len(_skills), len(_tools), len(_chains),
+        "[Semantics] 加载完成: %d skills, %d tools",
+        len(_skills), len(_tools),
     )
 
 
@@ -323,16 +291,6 @@ def get_tool_meta(name: str) -> Optional[ToolMeta]:
 def get_all_tool_metas() -> Dict[str, ToolMeta]:
     load_semantics()
     return dict(_tools)
-
-
-def get_chain_meta(name: str) -> Optional[ChainMeta]:
-    load_semantics()
-    return _chains.get(name)
-
-
-def get_all_chain_metas() -> Dict[str, ChainMeta]:
-    load_semantics()
-    return dict(_chains)
 
 
 def get_persona_body() -> str:

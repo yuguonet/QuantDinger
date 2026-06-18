@@ -185,12 +185,17 @@ class ChainExecutor:
         except Exception:
             pass
 
-        # 无历史数据，从 skill 的出厂权重构建
+        # 无历史数据，从 semantics/skills/*.md 的 default_weight 构建
         try:
-            # skill_registry 已移除：新架构 skill 通过 SKILL.md 管理
-            # 出厂权重从 qd_skill_weights 表读取，不从代码获取
-            logger.info("[ChainExecutor] skill_registry 已移除，跳过出厂权重获取")
-            return {}
+            from app.agent.semantics import get_all_skill_metas
+            metas = get_all_skill_metas()
+            factory_weights = {}
+            for name, meta in metas.items():
+                if meta.default_weight and meta.default_weight != 1.0:
+                    factory_weights[name] = meta.default_weight
+            if factory_weights:
+                logger.info("[ChainExecutor] 使用出厂权重: %s", factory_weights)
+            return factory_weights
         except Exception:
             return {}
 

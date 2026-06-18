@@ -298,7 +298,7 @@ def _calc_kdj(highs: List[float], lows: List[float], closes: List[float],
 # ═══════════════════════════════════════════════════════════════
 
 def analyze_trend(stock_code: str) -> Dict[str, Any]:
-        """获取股票的综合技术趋势分析，包括均线排列、MACD、RSI、BOLL和KDJ等指标。
+    """获取股票的综合技术趋势分析，包括均线排列、MACD、RSI、BOLL和KDJ等指标。
 
     Args:
         stock_code: 股票代码，如 "600519"
@@ -473,7 +473,7 @@ def analyze_trend(stock_code: str) -> Dict[str, Any]:
         return {"error": str(e)}
 
 def calculate_ma(stock_code: str, periods: str = "5,10,20,60,120") -> Dict[str, Any]:
-        """计算均线指标。
+    """计算均线指标。
 
     Args:
         stock_code: 股票代码，如 "600519"
@@ -507,7 +507,7 @@ def calculate_ma(stock_code: str, periods: str = "5,10,20,60,120") -> Dict[str, 
         return {"error": str(e)}
 
 def get_volume_analysis(stock_code: str) -> Dict[str, Any]:
-        """量能分析：量比、换手率、成交量趋势。
+    """量能分析：量比、换手率、成交量趋势。
 
     Args:
         stock_code: 股票代码，如 "600519"
@@ -724,7 +724,7 @@ def analyze_pattern(stock_code: str) -> Dict[str, Any]:
         logger.error("analyze_pattern(%s) failed: %s", stock_code, e)
         return {"error": str(e)}
 
-def get_chip_distribution(stock_code, lookback_days: int = 120) -> Dict[str, Any]:
+def get_chip_distribution(stock_code: str, lookback_days: int = 120) -> Dict[str, Any]:
     """筹码分布分析（衰减成本分布模型）。
 
     从日K线计算筹码分布，不依赖数据源原生接口。
@@ -758,7 +758,7 @@ def get_chip_distribution(stock_code, lookback_days: int = 120) -> Dict[str, Any
         return {"error": str(e)}
 
 def get_indicator_snapshot(stock_code: str) -> Dict[str, Any]:
-        """单次获取多个技术指标快照（MACD、RSI、BOLL、KDJ等）。
+    """单次获取多个技术指标快照（MACD、RSI、BOLL、KDJ等）。
 
     Args:
         stock_code: 股票代码，如 "600519"

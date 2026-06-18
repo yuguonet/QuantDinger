@@ -122,8 +122,7 @@ def _generate_tool_catalog(tools, managed_agents) -> str:
     if uncategorized:
         lines.append(f"**未分层**: {', '.join(sorted(uncategorized))}")
 
-    # 技能调用工具
-    # call_skill 已移除：新架构走 exec python run.py
+    # 技能调用工具（通过 skill_runner.run_skill()）
 
     return "\n".join(lines)
 
@@ -295,35 +294,12 @@ def _check_output_json(answer, memory, agent) -> bool:
 
     仅 domain=finance 时使用。不通过时 agent 会收到错误提示并重写 final_answer。
     """
-    import json as _json
-    import re as _re
-
     if not answer:
         return False
 
-    data = None
-
-    # 情况 1：answer 已经是 dict（ToolCallingAgent 的 final_answer 工具调用）
-    if isinstance(answer, dict):
-        data = answer
-
-    # 情况 2：answer 是字符串，尝试从中提取 JSON 块
-    elif isinstance(answer, str):
-        patterns = [
-            r'```json\s*\n?(.*?)\n?\s*```',
-            r'(\{[^{}]*"action"[^{}]*"score"[^{}]*\})',
-        ]
-        for pat in patterns:
-            m = _re.search(pat, answer, _re.DOTALL)
-            if m:
-                try:
-                    data = _json.loads(m.group(1).strip())
-                except (_json.JSONDecodeError, TypeError):
-                    continue
-                if isinstance(data, dict):
-                    break
-
-    if not isinstance(data, dict):
+    from app.agent.json_extractor import extract_decision
+    data = extract_decision(answer)
+    if not data:
         return False
 
     # 校验必填字段
@@ -579,10 +555,9 @@ def _step_to_events(step) -> List[Dict[str, Any]]:
     return events
 
 
-# ── Managed Agents 已移除 ────────────────────────────────────
-# 旧机制：每个 Skill → smolagents ManagedAgent（双轨制，BaseSkill 未被调用）
-# 旧机制已移除：CallSkillTool / BaseSkill / skill_registry
-# 新机制：Skill 通过 exec python run.py 调用，Tool 通过 ToolRegistry.execute() 调用
+# ── Skill 执行 ───────────────────────────────────────────────
+# 新架构：Skill → skill_runner.run_skill() → 直接调用 tools/ 中的工具函数
+# _try_chain 通过 skill_runner + ChainExecutor 执行链路
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -634,7 +609,7 @@ def get_smolagent(
         # 始终拷贝，避免修改缓存原始列表
         tools = list(_tools_cache_by_domain[domain_key])
 
-    # ── call_skill 已移除：新架构走 exec python run.py ──
+    # ── Skill 通过 skill_runner.run_skill() 执行 ──
 
     # ── 金融领域：用 TracedTool 包装所有工具 ──────────────────
     if collector:
@@ -1137,23 +1112,8 @@ class _AgentExecutor:
             # ── §15: 用 strategy 替代 domain 做 DecisionCard 路由 ──
             if success and content and collector and _eval_strategy == "traced":
                 try:
-                    import json as _json_card
-                    import re as _re_card
-                    # 提取 JSON 块：content 可能已是 dict（ToolCallingAgent）或 str（CodeAgent）
-                    _card_data = None
-                    if isinstance(content, dict) and "action" in content:
-                        _card_data = content
-                    elif isinstance(content, str):
-                        for _pat in [r'```json\s*\n?(.*?)\n?\s*```',
-                                     r'(\{[^{}]*"action"[^{}]*"score"[^{}]*\})']:
-                            _m = _re_card.search(_pat, content, _re_card.DOTALL)
-                            if _m:
-                                try:
-                                    _card_data = _json_card.loads(_m.group(1).strip())
-                                    if isinstance(_card_data, dict) and "action" in _card_data:
-                                        break
-                                except (_json_card.JSONDecodeError, TypeError):
-                                    _card_data = None
+                    from app.agent.json_extractor import extract_decision as _extract_dec
+                    _card_data = _extract_dec(content)
 
                     # ── fallback：自由文本 → skip JSON ──
                     # agent 输出了非 JSON 内容，构造兜底结构化响应
@@ -1186,7 +1146,7 @@ class _AgentExecutor:
 
                     # 先用原始 JSON 内容调用 on_agent_finish（提取字段 + 存库）
                     # TraceCollector 需要字符串输入，dict 转 JSON 字符串
-                    _tc_answer = _json_card.dumps(content, ensure_ascii=False) if isinstance(content, dict) else content
+                    _tc_answer = json.dumps(content, ensure_ascii=False) if isinstance(content, dict) else content
                     tu = result.token_usage if hasattr(result, 'token_usage') else None
                     total_tok = (tu.input_tokens + tu.output_tokens) if tu else 0
                     root = collector.on_agent_finish(
@@ -1332,11 +1292,11 @@ class _AgentExecutor:
             logger.warning("[Feedback] 负面反馈处理异常: %s", e)
 
     def _try_chain(self, verb, noun, message, session_id, context, user_id):
-        """尝试链路执行。匹配到链路时执行并返回 AgentResult，否则返回 None。
+        """尝试链路执行。匹配到链路时执行并返回结果，否则返回 None。
 
         流程：
-          1. 查固定链路（verb+noun 精确匹配）
-          2. 未匹配 → Planner 规划（LLM 选 Skill）
+          1. tool_chains.json 匹配（学习闭环积累的已知链路）→ 直接执行
+          2. 未匹配 → Planner LLM #2 规划 → 存入 tool_chains.json → 执行
           3. 规划失败 → 返回 None（让 agent 直接处理）
         """
         # ── 前置拦截：无意图信号时直接返回，不浪费 token ──
@@ -1371,20 +1331,34 @@ class _AgentExecutor:
             except Exception:
                 pass
 
-        # ── Layer 0: 固定链路匹配 ──
+        # ── 查链路 ──
         chain_def = None
         degraded = False
         degrade_reason = ""
 
+        # Layer 0: tool_chains.json 匹配（学习闭环积累的已知链路）
         try:
-            from app.agent.chain.chains import get_chain_for_intent
-            chain_def = get_chain_for_intent(verb, noun)
+            from app.agent.chain.tool_chains import get_tool_chain
+            from app.agent.chain.chains import ChainDef, ChainStep, register_chain
+            steps_data = get_tool_chain(verb, noun)
+            if steps_data:
+                steps = [ChainStep(name=s["tool"], agent=s["tool"], order=i+1,
+                                   description=s.get("desc", ""), required=(i == 0))
+                         for i, s in enumerate(steps_data)]
+                chain_id = f"learned+{verb}+{noun}"
+                chain_def = ChainDef(
+                    chain_id=chain_id, name=f"学习链路: {verb}+{noun}",
+                    description=f"从 tool_chains.json 加载（{len(steps)} 步）",
+                    steps=steps, trigger_verbs=[verb], trigger_nouns=[noun],
+                )
+                register_chain(chain_def)
+                logger.info("[Chain] tool_chains.json 命中: %s → %d 步", chain_id, len(steps))
         except Exception as e:
-            logger.warning("[Chain] 查找链路异常: %s", e)
+            logger.warning("[Chain] tool_chains.json 查询异常: %s", e)
 
-        # ── Layer 1: Planner 规划（无固定链路时）──
+        # Layer 1: Planner 规划（tool_chains.json 未命中）
         if not chain_def:
-            logger.info("[Chain] 无固定链路匹配 (verb=%s noun=%s)，尝试 Planner", verb, noun)
+            logger.info("[Chain] tool_chains.json 未命中 (verb=%s noun=%s)，Planner 规划中...", verb, noun)
             try:
                 from app.agent.planner import Planner
                 smol_model = build_model(self.model, self.provider)
@@ -1420,33 +1394,39 @@ class _AgentExecutor:
             except Exception as e:
                 logger.warning("[Planner] 规划异常: %s", e)
 
-        # ── Layer 2: 无匹配 → 返回 None，让 agent 直接处理 ──
+        # ── 无匹配或降级 → 返回 None，让 agent 直接处理 ──
         if not chain_def:
             logger.info("[Chain] 无链路匹配 (verb=%s noun=%s)，交给 agent", verb, noun)
+            return None
+
+        if degraded:
+            logger.warning("[Chain] 降级链路 %s，跳过执行，交给 agent 自由处理", chain_def.chain_id)
             return None
 
         # 非个股链路不需要股票代码
         if not stock_code:
             if chain_def.chain_id == "scan+market":
                 stock_code = ""
-            elif not degraded:
+            else:
                 logger.info("[Chain] 链路 %s 匹配但未找到股票代码，跳过", chain_def.chain_id)
                 return None
 
         logger.info("[Chain] 执行链路 %s | 股票=%s | degraded=%s",
                      chain_def.chain_id, stock_code, degraded)
 
-        # ── 构建 Skill 实例并执行 ──
+        # ── 构建 run_skill_fn 并执行链路 ──
         from app.agent.session_store import get_session_store
-        store = get_session_store()
+        from app.agent.skill_runner import run_skill as _run_skill
 
-        # ── 旧架构已移除：skill_registry / BaseSkill / call_skill_tool ──
-        # 新架构：skill 通过 exec python run.py 调用，tool 通过 ToolRegistry.execute() 调用
-        # _try_chain 暂时禁用，等待新架构集成
-        logger.info("[Chain] _try_chain 暂时禁用（旧架构已移除，新架构待集成）")
-        return None
+        def run_skill_fn(skill_name, sc, sn, ctx):
+            return _run_skill(skill_name, sc, sn, ctx)
 
-        # 执行链路
+        def call_llm(prompt: str) -> str:
+            smol_model = build_model(self.model, self.provider)
+            messages = [{"role": "user", "content": prompt}]
+            response = smol_model(messages)
+            return response.content if hasattr(response, "content") else str(response)
+
         from app.agent.chain.executor import ChainExecutor
         executor = ChainExecutor(
             chain_id=chain_def.chain_id,
@@ -1454,7 +1434,6 @@ class _AgentExecutor:
             stock_name=stock_name,
             user_id=user_id,
         )
-        # 合并链路的 context（Planner 传入的 tips/focus/data_criticality 等）
         exec_context = {"user_query": message}
         if chain_def.context:
             exec_context.update(chain_def.context)
@@ -1464,23 +1443,17 @@ class _AgentExecutor:
             call_llm=call_llm,
         )
 
-        # 转换为 AgentResult — 用 DecisionResult 的 content 属性
+        # 链路执行失败 → 不注入 agent，返回 None
+        if not chain_result.success:
+            logger.warning("[Chain] 链路 %s 执行失败，交给 agent 自由处理", chain_def.chain_id)
+            return None
+
         content = chain_result.content
         if not content:
-            content = "链路执行未产生决策。"
+            return None
 
-        # 降级告知用户（必须告知）
-        if degraded:
-            degrade_msg = f"⚠️ 当前为降级模式（{degrade_reason}），仅执行基础分析，结果可能不完整。"
-            content = degrade_msg + "\n\n" + content
-            logger.warning("[Chain] 降级告知: %s", degrade_reason)
-
-        # 附加结构化 JSON 供 Agent 参考
         import json as _json
         result_dict = chain_result.to_dict()
-        if degraded:
-            result_dict["degraded"] = True
-            result_dict["degrade_reason"] = degrade_reason
         content += "\n\n<!-- decision_result:\n" + _json.dumps(result_dict, ensure_ascii=False, indent=2) + "\n-->"
 
         return content
@@ -1587,27 +1560,12 @@ class _AgentExecutor:
                     _stream_collector = meta.get("collector")
                     if content and _stream_collector and _stream_strategy == "traced":
                         try:
-                            import json as _json_sc
-                            import re as _re_sc
-                            # 提取 JSON 块：content 可能已是 dict（ToolCallingAgent）或 str（CodeAgent）
-                            _sc_data = None
-                            if isinstance(content, dict) and "action" in content:
-                                _sc_data = content
-                            elif isinstance(content, str):
-                                for _pat in [r'```json\s*\n?(.*?)\n?\s*```',
-                                             r'(\{[^{}]*"action"[^{}]*"score"[^{}]*\})']:
-                                    _m = _re_sc.search(_pat, content, _re_sc.DOTALL)
-                                    if _m:
-                                        try:
-                                            _sc_data = _json_sc.loads(_m.group(1).strip())
-                                            if isinstance(_sc_data, dict) and "action" in _sc_data:
-                                                break
-                                        except (_json_sc.JSONDecodeError, TypeError):
-                                            _sc_data = None
+                            from app.agent.json_extractor import extract_decision as _extract_dec2
+                            _sc_data = _extract_dec2(content)
 
                             # 先用原始 JSON 内容调用 on_agent_finish（提取字段 + 存库）
                             # TraceCollector 需要字符串输入，dict 转 JSON 字符串
-                            _tc_stream_answer = _json_sc.dumps(content, ensure_ascii=False) if isinstance(content, dict) else content
+                            _tc_stream_answer = json.dumps(content, ensure_ascii=False) if isinstance(content, dict) else content
                             _tu = None
                             try:
                                 _tu = agent.token_usage

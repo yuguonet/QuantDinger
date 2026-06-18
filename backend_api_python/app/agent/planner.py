@@ -87,24 +87,36 @@ class PlanResult:
 # Skill 描述（给 LLM 看的，精简版）
 # ═══════════════════════════════════════════════════════════════
 
-SKILL_CATALOG = """
-可用技能（从下列中选择 1~5 个，按执行顺序排列）：
+def _get_skill_catalog() -> str:
+    """从 semantics/skills/*.md 动态生成技能目录（单一信源）。"""
+    from app.agent.semantics import get_all_skill_metas
+    metas = get_all_skill_metas()
+    if not metas:
+        # fallback: 硬编码兜底（semantics 加载失败时）
+        return (
+            "可用技能：technical_agent(技术面), intelligence_agent(情报), "
+            "market_data_agent(行情), screening_agent(选股), backtest_agent(回测), "
+            "bull_researcher(多头), bear_researcher(空头), trading_agent(交易)"
+        )
+    lines = ["可用技能（从下列中选择 1~5 个，按执行顺序排列）：", ""]
+    # 按 priority 降序排列
+    sorted_skills = sorted(metas.items(), key=lambda x: x[1].priority, reverse=True)
+    for i, (name, meta) in enumerate(sorted_skills, 1):
+        desc = meta.description or meta.name
+        tags_str = f" [{','.join(meta.tags)}]" if meta.tags else ""
+        lines.append(f"{i}. {name} — {desc}{tags_str}")
+    lines.append("")
+    lines.append("大多数场景必须包含 technical_agent（技术面地基）。")
+    return "\n".join(lines)
 
-1. technical_agent — 技术面+动量综合（趋势/均线/量价/形态/筹码/突破/择时）。地基，大多数场景必须包含。
-2. indicator_agent — 用户自定义指标信号（指标IDE策略执行）。指标验证。
-3. intelligence_agent — 情报+政策分析（新闻/事件/舆情/公告/政策面）。信息面分析。
-4. hot_money_tracker — 游资/龙虎榜/主力资金。短线资金面。
-5. lockup_watcher — 解禁/减持/质押。供给端风险。
-6. market_data_agent — 行情+概念+资金（指数/板块/概念热度/涨停池/资金流向）。市场概览。
-7. screening_agent — 条件选股/指标筛选。选股场景。
-8. backtest_agent — 策略回测。验证历史绩效。
-9. bull_researcher — 多头论据构建。多空辩论看涨方。
-10. bear_researcher — 空头论据构建。多空辩论看跌方。
-11. data_agent — 数据工程/脚本执行。数据处理。
-12. trading_agent — 交易执行/策略启停。交易场景。
+# 懒加载缓存
+_SKILL_CATALOG_CACHE: str = ""
 
-兼容别名（旧名仍可调用）：momentum_tracker→technical_agent, policy_analyst→intelligence_agent, concept_tracker→market_data_agent
-""".strip()
+def _ensure_skill_catalog() -> str:
+    global _SKILL_CATALOG_CACHE
+    if not _SKILL_CATALOG_CACHE:
+        _SKILL_CATALOG_CACHE = _get_skill_catalog()
+    return _SKILL_CATALOG_CACHE
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -220,7 +232,7 @@ class Planner:
             from app.agent.semantics import get_skills_summary_xml
             skills_section = get_skills_summary_xml()
         except Exception:
-            skills_section = SKILL_CATALOG  # fallback
+            skills_section = _ensure_skill_catalog()  # fallback
 
         # 4. 全量 tool 摘要
         tools_section = ""
@@ -265,15 +277,25 @@ class Planner:
         return self._parse_plan_json(raw)
 
     def _parse_plan_json(self, raw: str) -> Dict[str, Any]:
-        """解析 LLM 输出的规划 JSON。"""
+        """解析 LLM 输出的规划 JSON。容错处理各种 LLM 输出格式。"""
         import re
 
-        # 清理
+        # 1. 清理 think 标签
         cleaned = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
+
+        # 2. 去掉 <code>...</code> 包装（必须在 final_answer 之前）
+        cleaned = re.sub(r'</?code>', '', cleaned).strip()
+
+        # 3. 去掉 final_answer() 包装（qwen-coder 常见格式）
+        m = re.search(r'final_answer\s*\(\s*(.+)\s*\)', cleaned, re.DOTALL)
+        if m:
+            cleaned = m.group(1).strip()
+
+        # 3. 去掉 markdown 代码块
         cleaned = re.sub(r'```json\s*', '', cleaned).strip()
         cleaned = re.sub(r'```\s*$', '', cleaned).strip()
 
-        # 尝试直接解析
+        # 4. 尝试直接解析
         try:
             data = json.loads(cleaned)
             if isinstance(data, dict) and "steps" in data:
@@ -281,7 +303,7 @@ class Planner:
         except json.JSONDecodeError:
             pass
 
-        # 提取 JSON 块
+        # 5. 提取最外层 JSON 对象（含 steps）
         match = re.search(r'\{[^{}]*"steps"\s*:\s*\[.*?\][^{}]*\}', cleaned, re.DOTALL)
         if match:
             try:
@@ -289,7 +311,17 @@ class Planner:
             except json.JSONDecodeError:
                 pass
 
-        raise ValueError(f"无法解析规划 JSON: {raw[:200]}")
+        # 6. 提取任意最外层 {...}
+        brace_match = re.search(r'\{.*\}', cleaned, re.DOTALL)
+        if brace_match:
+            try:
+                data = json.loads(brace_match.group())
+                if isinstance(data, dict) and "steps" in data:
+                    return data
+            except json.JSONDecodeError:
+                pass
+
+        raise ValueError(f"无法解析规划 JSON: {raw[:300]}")
 
     def _validate(self, plan_data: Dict[str, Any]) -> Optional[str]:
         """校验规划。返回 None 表示通过，返回字符串表示失败原因。"""
@@ -324,8 +356,21 @@ class Planner:
                 plan_data["steps"].insert(0, {"agent": skill})
                 logger.info("[Planner] 自动补充必选 Skill: %s", skill)
 
-        # skill_registry 已移除：新架构 skill 通过 SKILL.md 管理
-        # 校验暂时跳过，让 agent 自行处理未知技能
+        # 新架构：从 semantics/skills/*.md 校验 Skill 是否存在
+        from app.agent.semantics import get_all_skill_metas
+        known_skills = set(get_all_skill_metas().keys())
+        if known_skills:
+            selected = {s.get("agent", "") for s in plan_data.get("steps", [])}
+            unknown = selected - known_skills - {""}
+            if unknown:
+                # 移除未知 Skill（LLM 可能幻觉出不存在的 Skill）
+                plan_data["steps"] = [
+                    s for s in plan_data["steps"]
+                    if s.get("agent", "") in known_skills or s.get("agent", "") == ""
+                ]
+                logger.warning("[Planner] 移除未知 Skill: %s (已知: %s)", unknown, known_skills)
+                if not plan_data["steps"]:
+                    return "所有 Skill 均未知，无法规划"
         return None  # 通过
 
     def _build_chain_def(self, plan_data: Dict[str, Any], stock_code: str) -> ChainDef:

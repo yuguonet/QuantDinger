@@ -196,20 +196,9 @@ class TraceCollector:
 
         返回 dict，字段缺失时返回空 dict（触发 fallback）。
         """
-        patterns = [
-            r'```json\s*\n?(.*?)\n?\s*```',
-            r'(\{[^{}]*"action"[^{}]*"score"[^{}]*\})',
-        ]
-        for pat in patterns:
-            m = re.search(pat, answer, re.DOTALL)
-            if m:
-                try:
-                    data = json.loads(m.group(1).strip())
-                    if isinstance(data, dict) and "action" in data:
-                        return data
-                except (json.JSONDecodeError, TypeError):
-                    continue
-        return {}
+        from app.agent.json_extractor import extract_decision
+        result = extract_decision(answer)
+        return result if result else {}
 
     # ── 正则 fallback（降级路径）───────────────────────────────
 
