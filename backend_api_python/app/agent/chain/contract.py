@@ -14,7 +14,6 @@ Skill 层输出标准化：
 不适用的 Skill（无需标准化输出，直接返回分析文本即可）：
   - researcher（多空辩论，无 stock_code）
   - intelligence_agent（情报搜集，无 stock_code）
-  - data_agent（数据工程，无 stock_code）
 
 核心规则 — Skill 层职责边界：
   ✅ 允许输出：score / direction / confidence / signal / factors / analysis（事实描述）
@@ -42,7 +41,6 @@ logger = logging.getLogger(__name__)
 _NON_SIGNAL_SKILLS = {
     "researcher",
     "intelligence_agent",
-    "data_agent",
 }
 
 

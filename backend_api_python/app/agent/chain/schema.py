@@ -383,11 +383,8 @@ SKILL_NAME_CN: Dict[str, str] = {
     "indicator_agent": "指标信号",
     "intelligence_agent": "个股情报/政策",
     "researcher": "多空研究",
-    "market_data_agent": "行情/概念/资金",
 
     "backtest_agent": "策略回测",
-    "trading_agent": "交易执行",
-    "data_agent": "数据工程",
     "market_screener": "全市场选股",
     "bb_screener": "BB超卖扫描",
 
@@ -445,12 +442,9 @@ SKILL_MODULES: Dict[str, str] = {
     "technical_agent": "app.agent.skills.technical_agent.run",
     "intelligence_agent": "app.agent.skills.intelligence_agent.run",
     "researcher": "app.agent.skills.researcher.run",
-    "market_data_agent": "app.agent.skills.market_data_agent.run",
 
     "backtest_agent": "app.agent.skills.backtest_agent.run",
-    "trading_agent": "app.agent.skills.trading_agent.run",
     "indicator_agent": "app.agent.skills.indicator_agent.run",
-    "data_agent": "app.agent.skills.data_agent.run",
     "market_screener": "app.agent.skills.market_screener.run",
     "bb_screener": "app.agent.skills.bb_screener.run",
 }

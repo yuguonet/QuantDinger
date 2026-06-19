@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 def run(stock_code: str = "", stock_name: str = "", context: dict = None) -> dict:
     """薄壳入口，调用 BBScreenerSkill 执行全市场扫描。"""
-    from app.agent.skills.bb_screener import BBScreenerSkill
+    from app.agent.skills.bb_screener.bb_screener import BBScreenerSkill
     from app.agent.tools import registry as tool_registry
     tool_registry.discover()
 
@@ -31,7 +31,7 @@ def main():
     args = parser.parse_args()
 
     # 复用原 bb_screener.py 的辅助函数
-    from app.agent.skills.bb_screener import (
+    from app.agent.skills.bb_screener.bb_screener import (
         _get_all_codes, _get_name_map, _fetch_kline, _check_bb_entry, _deep_analyze_one
     )
     from app.agent.tools import registry as tool_registry

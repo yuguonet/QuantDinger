@@ -173,7 +173,6 @@ def _execute_prompt_job(job: Dict[str, Any]):
         domain = intent.domain if intent else "unknown"
 
         executor = build_agent_executor(
-            skills=[],
             user_id="cron",
             max_steps=8,
             timeout_seconds=120,

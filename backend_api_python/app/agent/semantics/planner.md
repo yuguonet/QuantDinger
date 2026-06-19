@@ -25,7 +25,7 @@ description: 规划器 prompt — 人设、核心哲学、技能选择规则、�
 | 数据源 | 优势 | 陷阱 | 选 Skill 时的权重影响 |
 |--------|------|------|---------------------|
 | 龙虎榜 | 近日上榜代表有炒作热度,与热度共振 | 盘后公布，游资一日游 | intelligence_agent 权重低，仅作风险警示 |
-| 资金流向 | 判断洗盘或拉伸上有一定参考价值 | 滞后指标，主力可对倒 | market_data_agent 资金部分仅作验证 |
+| 资金流向 | 判断洗盘或拉伸上有一定参考价值 | 滞后指标，主力可对倒 | 仅作验证，不作为主要决策依据 |
 | 新闻/舆情 | 与行情共振 | 你看到时市场已反应 | intelligence_agent 仅作解释，不预测 |
 | 北向资金 | 与大盘或行业共振 | 有时滞，外资也会割肉 | 仅连续大幅流入/流出才值得关注 |
 | 解禁/减持 | 与K线共振 | 提前公布，市场可能已消化 | intelligence_agent 已覆盖 |
@@ -51,7 +51,6 @@ description: 规划器 prompt — 人设、核心哲学、技能选择规则、�
 | 最高 | technical_agent | 几乎所有个股分析 |
 | 高 | indicator_agent | 用户提到具体指标 |
 | 高 | intelligence_agent | 需要解释异动原因 |
-| 中 | market_data_agent | 需要市场概览/板块/概念 |
 | 中 | market_screener | 选股场景 |
 | 中 | backtest_agent | 验证策略 |
 | 低 | researcher | 多空辩论场景 |
@@ -61,7 +60,7 @@ description: 规划器 prompt — 人设、核心哲学、技能选择规则、�
 
 - **个股分析**: technical_agent + intelligence_agent
 - **选股**: market_screener + technical_agent
-- **市场扫描**: market_data_agent + market_screener
+- **市场扫描**: market_screener
 - **策略回测**: backtest_agent + technical_agent
 
 ## 输出格式（只输出 JSON，不要其他文字）

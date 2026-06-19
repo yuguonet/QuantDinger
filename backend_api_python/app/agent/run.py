@@ -28,6 +28,13 @@ _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+# 加载 .env
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(_project_root, ".env"), override=False)
+except ImportError:
+    pass
+
 
 def _print_agent_info():
     """打印 agent 结构信息（不依赖 smolagents）"""
@@ -109,7 +116,6 @@ def _run_single(message: str, session_id: str = None, skills: list = None):
         session = store.create_session(session_id, {})
 
     executor = build_agent_executor(
-        skills=skills,
         user_id=1,
         max_steps=int(os.getenv("AGENT_MAX_STEPS", "10")),
         timeout_seconds=float(os.getenv("AGENT_TIMEOUT_SECONDS", "180")),
@@ -155,7 +161,6 @@ def _run_interactive(session_id: str = None):
         session = store.create_session(session_id, {})
 
     executor = build_agent_executor(
-        skills=None,
         user_id=1,
         max_steps=int(os.getenv("AGENT_MAX_STEPS", "10")),
         timeout_seconds=float(os.getenv("AGENT_TIMEOUT_SECONDS", "180")),
@@ -239,7 +244,6 @@ def _run_single_stream(message: str, session_id: str = None, skills: list = None
         session = store.create_session(session_id, {})
 
     executor = build_agent_executor(
-        skills=skills,
         user_id=1,
         max_steps=int(os.getenv("AGENT_MAX_STEPS", "10")),
         timeout_seconds=float(os.getenv("AGENT_TIMEOUT_SECONDS", "180")),

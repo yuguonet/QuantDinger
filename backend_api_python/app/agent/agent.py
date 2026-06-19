@@ -6,7 +6,7 @@ Agent — smolagents Agent for QuantDinger.
 
 架构：
   smolagents CodeAgent（默认）或 ToolCallingAgent（AGENT_TYPE=tool）
-  + 8 个 Skills（skills/ 目录，SKILL.md + run.py）
+  + 7 个 Skills（skills/ 目录，SKILL.md + run.py）
   + 40+ 工具（tools/ 目录，@tool 装饰器自动发现）
   + Chain 链路编排（chain/ 目录，verb+noun 触发）
 
@@ -25,7 +25,7 @@ Agent — smolagents Agent for QuantDinger.
   INTENT_ANALYSIS_ENABLED=true — 意图分析开关
 
 公开接口：
-  build_agent_executor(skills, user_id, max_steps, timeout_seconds, model, provider) → _AgentExecutor
+  build_agent_executor(user_id, max_steps, timeout_seconds, model, provider) → _AgentExecutor
   _AgentExecutor.chat(message, session_id, context, progress_callback, user_id) → AgentResult
   _AgentExecutor.chat_stream(...) → Generator[dict]
   AgentResult(success, content, tool_calls_log, total_steps, total_tokens, model, error, charts)
@@ -36,7 +36,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from dataclasses import dataclass, field
 
@@ -149,7 +149,7 @@ def _load_preamble() -> str:
     return "你是 QuantDinger 量化分析助手。"
 
 
-def _build_instructions(user_message: str = "", skill_instructions: str = "",
+def _build_instructions(user_message: str = "",
                         language: str = "zh", tools=None, managed_agents=None,
                         domain: str = "", domain_instructions: str = "",
                         intent_context: str = "", stock_code: str = "") -> str:
@@ -157,10 +157,6 @@ def _build_instructions(user_message: str = "", skill_instructions: str = "",
         lang_section = "\n## Output Language\n- Reply in English.\n- All JSON values in English.\n"
     else:
         lang_section = "\n## 输出语言\n- 使用中文回答。\n- 所有面向用户的文本值使用中文。\n"
-
-    skill_section = ""
-    if skill_instructions:
-        skill_section = f"\n## 激活的交易技能\n\n{skill_instructions}\n"
 
     scan_section = ""
     if os.getenv("AGENT_SCAN_PROJECT_READONLY", "true").lower() == "true":
@@ -255,15 +251,13 @@ def _build_instructions(user_message: str = "", skill_instructions: str = "",
     return f"""{preamble}
 {agent_rules_text}
 {tool_catalog}
-{skill_section}{scan_section}{modify_section}{intent_section}{domain_section}{calibration_section}{weight_section}{finance_json_section}{lang_section}"""
+{scan_section}{modify_section}{intent_section}{domain_section}{calibration_section}{weight_section}{finance_json_section}{lang_section}"""
 
 
 # ═══════════════════════════════════════════════════════════════
 # 2. Skill Instructions (from indicator IDE)
 # ═══════════════════════════════════════════════════════════════
 
-# ── Indicator skills loaded from skills.indicator_skills ──
-from app.agent.skills.indicator_skills import get_indicator_skill_instructions
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -573,7 +567,6 @@ def _filter_tools_by_categories(all_tools: List, categories: List[str]) -> List:
 
 
 def get_smolagent(
-    skills: Optional[List[str]] = None,
     user_id: int = 1,
     model: str = None,
     provider: str = None,
@@ -593,7 +586,6 @@ def get_smolagent(
     Caches only the expensive parts (tools discovery, managed agents).
     Agent instance is always rebuilt to avoid cross-session state pollution.
     """
-    skill_instructions = get_indicator_skill_instructions(skills, user_id)
     smol_model = build_model(model=model, provider=provider)
 
     # ── 按领域过滤工具（缓存） ────────────────────────────────
@@ -609,7 +601,13 @@ def get_smolagent(
         # 始终拷贝，避免修改缓存原始列表
         tools = list(_tools_cache_by_domain[domain_key])
 
-    # ── Skill 通过 skills/<name>/run.py 执行 ──
+    # ── 注册 call_skill 工具（Anthropic Agent Skills 兼容层）──
+    try:
+        from app.agent.skills.call_skill_tool import get_call_skill_tool
+        call_skill = get_call_skill_tool()
+        tools.append(call_skill)
+    except Exception as e:
+        logger.warning("[Agent] call_skill 工具加载失败: %s", e)
 
     # ── 金融领域：用 TracedTool 包装所有工具 ──────────────────
     if collector:
@@ -617,7 +615,7 @@ def get_smolagent(
         tools = [TracedTool(t, collector) for t in tools]
 
     instructions = _build_instructions(
-        user_message, skill_instructions, language, tools, managed_agents=None,
+        user_message, language, tools, managed_agents=None,
         domain=domain, domain_instructions=domain_instructions,
         intent_context=intent_context, stock_code=stock_code,
     )
@@ -680,12 +678,12 @@ class AgentResult:
 
 
 def build_agent_executor(
-    skills=None, user_id=1, max_steps=10,
+    user_id=1, max_steps=10,
     timeout_seconds=None, model=None, provider=None,
     domain=None,
 ):
     return _AgentExecutor(
-        skills=skills, user_id=user_id, max_steps=max_steps,
+        user_id=user_id, max_steps=max_steps,
         timeout_seconds=timeout_seconds, model=model, provider=provider,
     )
 
@@ -714,9 +712,8 @@ class _IntentPrepResult:
 class _AgentExecutor:
     """Wraps smolagents CodeAgent with session management."""
 
-    def __init__(self, skills=None, user_id=1, max_steps=10,
+    def __init__(self, user_id=1, max_steps=10,
                  timeout_seconds=None, model=None, provider=None):
-        self.skills = skills
         self.user_id = user_id
         self.max_steps = max_steps
         self.timeout_seconds = timeout_seconds
@@ -965,7 +962,7 @@ class _AgentExecutor:
 
         stock_code = (context or {}).get("stock_code", "")
         agent = get_smolagent(
-            skills=self.skills, user_id=user_id,
+            user_id=user_id,
             model=self.model, provider=self.provider,
             max_steps=self.max_steps, user_message=message,
             language=(context or {}).get("report_language", "zh"),

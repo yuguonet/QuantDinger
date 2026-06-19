@@ -14,7 +14,7 @@ def run(stock_code: str = "", stock_name: str = "", context: dict = None) -> dic
         return spec.fn(**kwargs)
 
     from datetime import date
-    from app.agent.skills.market_screener import _select_strategy, _run_intraday, _run_eod, _run_post_market
+    from app.agent.skills.market_screener.market_screener import _select_strategy, _run_intraday, _run_eod, _run_post_market
 
     strategy = _select_strategy()
     today = date.today().isoformat()
@@ -49,7 +49,7 @@ def main():
     args = parser.parse_args()
 
     # 复用原 market_screener.py 的核心函数
-    from app.agent.skills.market_screener import _select_strategy, _run_intraday, _run_eod, _run_post_market
+    from app.agent.skills.market_screener.market_screener import _select_strategy, _run_intraday, _run_eod, _run_post_market
     from app.agent.tools import registry as tool_registry
     tool_registry.discover()
 
