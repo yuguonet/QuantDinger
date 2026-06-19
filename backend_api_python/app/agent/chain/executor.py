@@ -32,7 +32,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from app.agent.chain.schema import (
     Action, Direction, EvalNode, Layer, SkillReport, Status,
-    VETO_SCORE, COVERAGE_THRESHOLD, get_skill_cn_name,
+    VETO_SCORE, COVERAGE_THRESHOLD, get_skill_cn_name, run_skill,
 )
 from app.agent.chain import store
 from app.agent.chain.contract import parse_skill_output
@@ -201,15 +201,12 @@ class ChainExecutor:
 
     def execute(
         self,
-        run_skill_fn: Callable[[str, str, str, dict], tuple],
         context: Dict[str, Any] = None,
         call_llm: Callable[[str], str] = None,
     ) -> DecisionResult:
         """执行链路。
 
         Args:
-            run_skill_fn: 调用 Skill 的函数。
-                签名: run_skill_fn(skill_name, stock_code, stock_name, context) -> (SkillReport, EvalNode)
             context: 传递给每个 skill 的上下文。
             call_llm: LLM 调用函数，Chain 层跨维度推理用。
                 签名: call_llm(prompt: str) -> str
@@ -239,7 +236,7 @@ class ChainExecutor:
 
         for step in sorted(self.chain_def.steps, key=lambda s: s.order):
             report, skill_node = self._execute_skill(
-                step, previous_outputs, context, run_skill_fn,
+                step, previous_outputs, context,
             )
             root.add_child(skill_node)
             skill_reports.append(report)
@@ -270,7 +267,6 @@ class ChainExecutor:
         step: ChainStep,
         previous_outputs: List[SkillReport],
         context: Dict[str, Any],
-        run_skill_fn: Callable,
     ) -> tuple:
         """执行单个 Skill。"""
         try:
@@ -282,7 +278,7 @@ class ChainExecutor:
                     for r in previous_outputs if r.status == "ok"
                 ]
 
-            report, skill_node = run_skill_fn(
+            report, skill_node = run_skill(
                 step.agent, self.stock_code, self.stock_name, step_context,
             )
             return report, skill_node

@@ -216,7 +216,7 @@ def get_page(cache_key: str, page: int, page_size: int = 0) -> Dict[str, Any]:
 
 
 def get_cache_summary(cache_key: str) -> Optional[Dict[str, Any]]:
-        """获取缓存摘要信息。
+    """获取缓存摘要信息。
 
     Args:
         cache_key: 缓存键名
@@ -286,7 +286,7 @@ def paginate_text(
 
 
 def get_text_page(cache_key: str, page: int, chunk_size: int = 0) -> Dict[str, Any]:
-        """获取文本分页内容。
+    """获取文本分页内容。
 
     Args:
         cache_key: 缓存键名
@@ -465,18 +465,4 @@ def paginated(
             return {"error": "cache_key 不能为空", "retriable": False}
         page = max(1, int(page))
         page_size = max(1, min(int(page_size), 100))
-        return get_page(cache_key, page, page_size)    """存入缓存数据。
-
-    Args:
-        key: 缓存键名
-        data: 要缓存的数据
-        data_key: 数据子键
-    """    """删除缓存条目。
-
-    Args:
-        key: 缓存键名
-    """    """分页装饰器。
-
-    Args:
-        fn: 被装饰的函数
-    """
+        return get_page(cache_key, page, page_size)

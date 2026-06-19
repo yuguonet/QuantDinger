@@ -39,13 +39,28 @@ def algo_analyze(stock_code, stock_name, tool_results, call_tool_fn=None):
         "factors": factors, "analysis": f"{running_count}/{total_count} 策略运行中", "status": "ok",
     }
 
+def run(stock_code: str, stock_name: str = "", context: dict = None) -> dict:
+    """薄壳入口：调用工具 + 算法分析，返回 dict。"""
+    from app.agent.tools.trading_tools import list_strategies, get_strategy_trades
+
+    results = {}
+    try: results["list_strategies"] = list_strategies()
+    except Exception as e: results["list_strategies"] = {"error": str(e)}
+
+    def call_tool_fn(name, **kwargs):
+        if name == "get_strategy_trades": return get_strategy_trades(**kwargs)
+        raise ValueError(f"Unknown tool: {name}")
+
+    return algo_analyze(stock_code, stock_name, results, call_tool_fn=call_tool_fn)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("stock_code")
     parser.add_argument("--name", default="")
     args = parser.parse_args()
 
-    from app.agent.tools.strategy_tools import list_strategies, get_strategy_trades
+    from app.agent.tools.trading_tools import list_strategies, get_strategy_trades
 
     results = {}
     try: results["list_strategies"] = list_strategies()

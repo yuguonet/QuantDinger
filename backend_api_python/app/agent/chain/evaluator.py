@@ -615,20 +615,32 @@ _worker_health = {
     "total_runs": 0, "total_successes": 0, "total_failures": 0,
 }
 
-_BASE_INTERVAL = 4 * 3600
-_MAX_INTERVAL = 24 * 3600
-
-
 def get_worker_health() -> Dict[str, Any]:
     h = dict(_worker_health)
     h["is_alive"] = _eval_thread is not None and _eval_thread.is_alive()
-    failures = h["consecutive_failures"]
-    h["current_interval"] = min(_BASE_INTERVAL * (2 ** min(failures, 3)), _MAX_INTERVAL)
+    h["next_run_in_seconds"] = _seconds_until_post_market() if h["is_alive"] else None
+    h["schedule"] = "每天 15:30（盘后）"
     return h
 
 
+def _seconds_until_post_market() -> float:
+    """计算距离下一个盘后 15:30 的秒数。"""
+    from datetime import datetime
+    now = datetime.now()
+    target = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    if now >= target:
+        # 已过今天 15:30，算明天
+        from datetime import timedelta
+        target += timedelta(days=1)
+    # 跳过周末
+    while target.weekday() >= 5:
+        from datetime import timedelta
+        target += timedelta(days=1)
+    return max(0, (target - now).total_seconds())
+
+
 def start_eval_worker():
-    """启动后台评估 worker（每4小时运行，指数退避）。"""
+    """启动后台评估 worker（盘后 15:30 每天运行一次，T+N 验证）。"""
     global _eval_thread, _eval_stop
 
     import threading
@@ -640,28 +652,34 @@ def start_eval_worker():
     _eval_stop = threading.Event()
 
     def _worker():
-        _time.sleep(60)
         while not _eval_stop.is_set():
+            # 计算距离下一个盘后 15:30 的等待时间
+            wait_secs = _seconds_until_post_market()
+            logger.info("[EvalWorker] 下次盘后验证: %.0f 秒后 (%.1f 小时)",
+                        wait_secs, wait_secs / 3600)
+            if _eval_stop.wait(timeout=wait_secs):
+                break  # 收到停止信号
+
+            # 盘后执行 T+N 验证
             _worker_health["total_runs"] += 1
             _worker_health["last_run_at"] = _time.strftime("%Y-%m-%d %H:%M:%S")
             try:
                 result = auto_evaluate(days_old=1)
+                evaluated = result.get("evaluation", {}).get("evaluated", 0)
                 _worker_health["consecutive_failures"] = 0
                 _worker_health["total_successes"] += 1
                 _worker_health["last_success_at"] = _worker_health["last_run_at"]
                 _worker_health["last_error"] = None
+                logger.info("[EvalWorker] 盘后验证完成: %d 条已评估", evaluated)
             except Exception as e:
                 _worker_health["consecutive_failures"] += 1
                 _worker_health["total_failures"] += 1
                 _worker_health["last_error"] = str(e)
-
-            failures = _worker_health["consecutive_failures"]
-            interval = min(_BASE_INTERVAL * (2 ** min(failures, 3)), _MAX_INTERVAL)
-            _eval_stop.wait(timeout=interval)
+                logger.warning("[EvalWorker] 盘后验证失败: %s", e)
 
     _eval_thread = threading.Thread(target=_worker, daemon=True, name="eval-worker")
     _eval_thread.start()
-    logger.info("[EvalWorker] 后台评估 worker 已启动")
+    logger.info("[EvalWorker] 盘后回溯评估 worker 已启动")
 
 
 def stop_eval_worker():

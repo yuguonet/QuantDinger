@@ -12,31 +12,7 @@ import math
 import logging
 import traceback
 
-from flask import Flask
-from flask.json.provider import DefaultJSONProvider
-from flask_cors import CORS
-
 from app.utils.logger import setup_logger, get_logger
-
-
-class SafeJSONProvider(DefaultJSONProvider):
-    """JSON provider that converts NaN / Infinity to null.
-
-    Python's ``json.dumps`` with ``allow_nan=True`` (the default) emits
-    literal ``NaN`` / ``Infinity`` tokens which are **not** valid JSON per
-    RFC 8259.  JavaScript's ``JSON.parse()`` will throw on them, breaking
-    every frontend consumer.  This provider silently replaces those values
-    with ``None`` (→ ``null``) so the output is always spec-compliant.
-    """
-
-    @staticmethod
-    def default(o):
-        """Handle non-serializable objects (same as super)."""
-        return DefaultJSONProvider.default(o)
-
-    def dumps(self, obj, **kwargs):
-        kwargs.setdefault("default", self.default)
-        return _safe_json_dumps(obj, **kwargs)
 
 
 def _safe_json_dumps(obj, **kwargs):
@@ -253,6 +229,19 @@ def create_app(config_name='default'):
     Returns:
         Flask app
     """
+    from flask import Flask
+    from flask.json.provider import DefaultJSONProvider
+    from flask_cors import CORS
+
+    class SafeJSONProvider(DefaultJSONProvider):
+        """JSON provider that converts NaN / Infinity to null."""
+        @staticmethod
+        def default(o):
+            return DefaultJSONProvider.default(o)
+        def dumps(self, obj, **kwargs):
+            kwargs.setdefault("default", self.default)
+            return _safe_json_dumps(obj, **kwargs)
+
     app = Flask(__name__)
     app.json_provider_class = SafeJSONProvider
     app.json = SafeJSONProvider(app)
@@ -421,6 +410,15 @@ def create_app(config_name='default'):
             start_market_cn_scheduler()
         except Exception as e:
             logger.warning(f"market_cn scheduler not started: {e}")
+
+        # ── Agent 盘后回溯评估 worker（T+N 验证 → 权重迭代）──
+        # 盘后自动运行，按 timeframe 取实际行情验证决策准确性
+        try:
+            from app.agent.chain.evaluator import start_eval_worker
+            start_eval_worker()
+            logger.info("[EvalWorker] 盘后回溯评估 worker 已启动")
+        except Exception as e:
+            logger.warning(f"EvalWorker not started: {e}")
 
     return app
 

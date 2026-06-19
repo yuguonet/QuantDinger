@@ -201,6 +201,12 @@ def run_indicator_signal(
     buy_price = None
     sell_price = None
     current_price = float(executed_df["close"].iloc[-1]) if len(executed_df) > 0 else None
+    total_bars = len(executed_df)
+
+    # 最近5根K线的逐根信号（用于衰减判断）
+    last5_buy = [False] * 5   # [今天, 昨天, 前天, 大前天, 5天前]
+    last5_sell = [False] * 5
+    last5_close = []           # 对应收盘价
 
     if "buy" in executed_df.columns:
         buy_series = executed_df["buy"].astype(bool)
@@ -211,6 +217,11 @@ def run_indicator_signal(
                 buy_price = float(executed_df.loc[last_buy_idx, "close"])
             except Exception:
                 pass
+        # 最近5根K线的 buy 信号
+        for i in range(min(5, total_bars)):
+            bar_idx = total_bars - 1 - i
+            if bar_idx >= 0:
+                last5_buy[i] = bool(buy_series.iloc[bar_idx])
 
     if "sell" in executed_df.columns:
         sell_series = executed_df["sell"].astype(bool)
@@ -221,6 +232,17 @@ def run_indicator_signal(
                 sell_price = float(executed_df.loc[last_sell_idx, "close"])
             except Exception:
                 pass
+        # 最近5根K线的 sell 信号
+        for i in range(min(5, total_bars)):
+            bar_idx = total_bars - 1 - i
+            if bar_idx >= 0:
+                last5_sell[i] = bool(sell_series.iloc[bar_idx])
+
+    # 最近5根K线的收盘价
+    for i in range(min(5, total_bars)):
+        bar_idx = total_bars - 1 - i
+        if bar_idx >= 0:
+            last5_close.append(float(executed_df["close"].iloc[bar_idx]))
 
     # 提取 output 中的图表数据（只取最后 10 个点，避免 token 爆炸）
     plots_summary = []
@@ -267,6 +289,9 @@ def run_indicator_signal(
         "plots": plots_summary,
         "signals": signals_summary,
         "data_points": len(executed_df),
+        "last5_buy": last5_buy,     # [今天, 昨天, 前天, 大前天, 5天前]
+        "last5_sell": last5_sell,
+        "last5_close": last5_close,  # 对应收盘价
     }
 
 # ── OpenAI tool declarations ─────────────────────────────────

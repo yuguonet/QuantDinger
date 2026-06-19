@@ -122,7 +122,7 @@ def _generate_tool_catalog(tools, managed_agents) -> str:
     if uncategorized:
         lines.append(f"**未分层**: {', '.join(sorted(uncategorized))}")
 
-    # 技能调用工具（通过 skill_runner.run_skill()）
+    # 技能调用工具（通过 skills/<name>/run.py）
 
     return "\n".join(lines)
 
@@ -556,8 +556,8 @@ def _step_to_events(step) -> List[Dict[str, Any]]:
 
 
 # ── Skill 执行 ───────────────────────────────────────────────
-# 新架构：Skill → skill_runner.run_skill() → 直接调用 tools/ 中的工具函数
-# _try_chain 通过 skill_runner + ChainExecutor 执行链路
+# 新架构：Skill → skills/<name>/run.py → 直接调用 tools/ 中的工具函数
+# _try_chain 通过 ChainExecutor 执行链路
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -609,7 +609,7 @@ def get_smolagent(
         # 始终拷贝，避免修改缓存原始列表
         tools = list(_tools_cache_by_domain[domain_key])
 
-    # ── Skill 通过 skill_runner.run_skill() 执行 ──
+    # ── Skill 通过 skills/<name>/run.py 执行 ──
 
     # ── 金融领域：用 TracedTool 包装所有工具 ──────────────────
     if collector:
@@ -1414,13 +1414,7 @@ class _AgentExecutor:
         logger.info("[Chain] 执行链路 %s | 股票=%s | degraded=%s",
                      chain_def.chain_id, stock_code, degraded)
 
-        # ── 构建 run_skill_fn 并执行链路 ──
-        from app.agent.session_store import get_session_store
-        from app.agent.skill_runner import run_skill as _run_skill
-
-        def run_skill_fn(skill_name, sc, sn, ctx):
-            return _run_skill(skill_name, sc, sn, ctx)
-
+        # ── 执行链路 ──
         def call_llm(prompt: str) -> str:
             smol_model = build_model(self.model, self.provider)
             messages = [{"role": "user", "content": prompt}]
@@ -1438,7 +1432,6 @@ class _AgentExecutor:
         if chain_def.context:
             exec_context.update(chain_def.context)
         chain_result = executor.execute(
-            run_skill_fn=run_skill_fn,
             context=exec_context,
             call_llm=call_llm,
         )

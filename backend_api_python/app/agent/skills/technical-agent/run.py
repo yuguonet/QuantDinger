@@ -20,7 +20,7 @@ from typing import Any, Dict, List
 
 
 def call_tools(stock_code: str) -> Dict[str, Any]:
-    """调用 5 个技术分析工具，返回结果字典。"""
+    """调用 6 个技术分析工具 + basicinfo，返回结果字典。"""
     from app.agent.tools.analysis_tools import (
         analyze_trend,
         get_indicator_snapshot,
@@ -28,6 +28,8 @@ def call_tools(stock_code: str) -> Dict[str, Any]:
         analyze_pattern,
         get_chip_distribution,
     )
+    from app.agent.tools.data_tools import get_realtime_quote
+    from app.utils.basicinfo_db import get_stock_basic_db
 
     results = {}
     for name, fn in [
@@ -36,11 +38,22 @@ def call_tools(stock_code: str) -> Dict[str, Any]:
         ("get_volume_analysis", get_volume_analysis),
         ("analyze_pattern", analyze_pattern),
         ("get_chip_distribution", get_chip_distribution),
+        ("realtime_quote", lambda: get_realtime_quote(stock_code)),
     ]:
         try:
-            results[name] = fn(stock_code)
+            results[name] = fn()
         except Exception as e:
             results[name] = {"error": str(e)}
+
+    # basicinfo_db 拉流通股本（比 realtime_quote 更靠谱）
+    try:
+        stock_db = get_stock_basic_db()
+        info = stock_db.get_stock(stock_code)
+        if info:
+            results["basicinfo"] = info
+    except Exception as e:
+        results["basicinfo"] = {"error": str(e)}
+
     return results
 
 
@@ -183,6 +196,93 @@ def algo_analyze(
     else:
         data_missing = True
 
+    # ── 6. 流通盘分析（评分修正核心）──
+    # 优先从 basicinfo_db 拿流通股本（靠谱），乘以当前价算流通市值
+    float_mcap = 0.0  # 流通市值（亿元）
+    float_size_label = ""
+    float_size_tier = ""  # "micro"/"small"/"mid"/"large"/"mega"
+
+    basicinfo = tool_results.get("basicinfo", {})
+    quote = tool_results.get("realtime_quote", {})
+
+    circ_shares = 0.0
+    if isinstance(basicinfo, dict) and "error" not in basicinfo:
+        circ_shares = float(basicinfo.get("circ_shares", 0) or 0)
+
+    current_price = 0.0
+    if isinstance(quote, dict) and "error" not in quote:
+        current_price = float(quote.get("price", 0) or 0)
+
+    if circ_shares > 0 and current_price > 0:
+        # circ_shares 是股数，current_price 是元 → 亿元
+        float_mcap = circ_shares * current_price / 1e8
+    elif isinstance(quote, dict) and "error" not in quote:
+        # fallback: realtime_quote 的 float_mcap_yi
+        float_mcap = float(quote.get("float_mcap_yi", 0) or 0)
+
+    if float_mcap > 0:
+        if float_mcap < 30:
+            float_size_tier = "micro"
+            float_size_label = f"超小盘{float_mcap:.0f}亿"
+        elif float_mcap < 100:
+            float_size_tier = "small"
+            float_size_label = f"小盘{float_mcap:.0f}亿"
+        elif float_mcap < 500:
+            float_size_tier = "mid"
+            float_size_label = f"中盘{float_mcap:.0f}亿"
+        elif float_mcap < 2000:
+            float_size_tier = "large"
+            float_size_label = f"大盘{float_mcap:.0f}亿"
+        else:
+            float_size_tier = "mega"
+            float_size_label = f"超大盘{float_mcap:.0f}亿"
+        signals.append(float_size_label)
+    else:
+        float_size_tier = "mid"  # 默认中盘
+
+    # ── 流通盘对量价信号的修正 ──
+    # 小盘股：量价信号可靠性低（易操纵），分数向50收缩
+    # 大盘股：量价信号可靠性高（真实资金），分数保持
+    _FLOAT_VOL_RELIABILITY = {
+        "micro": 0.5,   # 超小盘：量价信号半信半疑
+        "small": 0.7,   # 小盘：打七折
+        "mid": 1.0,     # 中盘：正常
+        "large": 1.1,   # 大盘：量价信号更可靠
+        "mega": 1.2,    # 超大盘：机构行为，信号最可靠
+    }
+    vol_reliability = _FLOAT_VOL_RELIABILITY.get(float_size_tier, 1.0)
+    # 量价分数向50收缩（小盘股信号不可靠时拉回中性）
+    vol_score = int(50 + (vol_score - 50) * vol_reliability)
+    vol_score = max(0, min(100, vol_score))
+
+    # ── 流通盘对形态信号的修正 ──
+    # 小盘股形态不可靠（主力画线），大盘股形态更真实
+    _FLOAT_PAT_RELIABILITY = {
+        "micro": 0.4,
+        "small": 0.6,
+        "mid": 1.0,
+        "large": 1.1,
+        "mega": 1.15,
+    }
+    pat_reliability = _FLOAT_PAT_RELIABILITY.get(float_size_tier, 1.0)
+    pat_score = int(50 + (pat_score - 50) * pat_reliability)
+    pat_score = max(0, min(100, pat_score))
+
+    # ── 流通盘对趋势信号的修正 ──
+    # 大盘股趋势更稳定，小盘股趋势更容易反转
+    _FLOAT_TREND_RELIABILITY = {
+        "micro": 0.6,
+        "small": 0.8,
+        "mid": 1.0,
+        "large": 1.05,
+        "mega": 1.1,
+    }
+    trend_reliability = _FLOAT_TREND_RELIABILITY.get(float_size_tier, 1.0)
+    trend_score = int(50 + (trend_score - 50) * trend_reliability)
+    trend_score = max(0, min(100, trend_score))
+
+    factors.append({"name": "流通盘", "value": float_size_label or "未知", "score": 50})
+
     # ── 综合评分 ──
     final_score = int(
         trend_score * 0.40 +
@@ -208,7 +308,7 @@ def algo_analyze(
         direction = "neutral"
 
     valid_count = sum(1 for f in factors if "缺失" not in str(f.get("value", "")))
-    confidence_val = round(min(valid_count / 4, 1.0), 2)
+    confidence_val = round(min(valid_count / 5, 1.0), 2)
     confidence = "high" if confidence_val >= 0.7 else ("medium" if confidence_val >= 0.4 else "low")
 
     if final_score >= 80:
@@ -233,10 +333,19 @@ def algo_analyze(
         "signal": signal_text,
         "factors": factors,
         "analysis": f"动量评级:{momentum_rating} 综合评分:{final_score}/100。"
-                    f"趋势:{trend_score} 动量:{ind_score} 量价:{vol_score} 形态:{pat_score}",
+                    f"趋势:{trend_score} 动量:{ind_score} 量价:{vol_score} 形态:{pat_score}"
+                    f" 流通盘:{float_size_label or '未知'}",
         "status": "ok",
         "data_missing": data_missing,
+        "float_mcap_yi": float_mcap,
+        "float_size_tier": float_size_tier,
     }
+
+
+def run(stock_code: str, stock_name: str = "", context: dict = None) -> dict:
+    """薄壳入口：调用工具 + 算法分析，返回 dict。"""
+    tool_results = call_tools(stock_code)
+    return algo_analyze(stock_code, stock_name, tool_results)
 
 
 def main():

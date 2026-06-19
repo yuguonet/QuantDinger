@@ -14,7 +14,6 @@ Skill 层输出标准化：
 不适用的 Skill（无需标准化输出，直接返回分析文本即可）：
   - researcher（多空辩论，无 stock_code）
   - intelligence_agent（情报搜集，无 stock_code）
-  - hot_money_tracker（游资追踪，无 stock_code）
   - data_agent（数据工程，无 stock_code）
 
 核心规则 — Skill 层职责边界：
@@ -43,7 +42,6 @@ logger = logging.getLogger(__name__)
 _NON_SIGNAL_SKILLS = {
     "researcher",
     "intelligence_agent",
-    "hot_money_tracker",
     "data_agent",
 }
 

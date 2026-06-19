@@ -381,18 +381,16 @@ class EvalNode:
 SKILL_NAME_CN: Dict[str, str] = {
     "technical_agent": "技术面/动量",
     "indicator_agent": "指标信号",
-    "intelligence_agent": "情报/政策",
-    "hot_money_tracker": "游资追踪",
-
+    "intelligence_agent": "个股情报/政策",
+    "researcher": "多空研究",
     "market_data_agent": "行情/概念/资金",
-    "screening_agent": "选股验证",
+
     "backtest_agent": "策略回测",
-    "researcher": "多空论证",
     "trading_agent": "交易执行",
     "data_agent": "数据工程",
-    "analysis_agent": "综合分析",
-    "eod_screener": "尾盘选股",
-    "post_market_screener": "盘后短线选股",
+    "market_screener": "全市场选股",
+    "bb_screener": "BB超卖扫描",
+
 }
 
 # 否决阈值
@@ -436,3 +434,151 @@ def is_direction_correct(predicted: str, actual: str) -> Optional[str]:
     if predicted == actual:
         return "correct"
     return "wrong"
+
+
+# ═══════════════════════════════════════════════════════════════
+# Skill 执行 + 转换
+# ═══════════════════════════════════════════════════════════════
+
+# Skill 模块注册表
+SKILL_MODULES: Dict[str, str] = {
+    "technical_agent": "app.agent.skills.technical_agent.run",
+    "intelligence_agent": "app.agent.skills.intelligence_agent.run",
+    "researcher": "app.agent.skills.researcher.run",
+    "market_data_agent": "app.agent.skills.market_data_agent.run",
+
+    "backtest_agent": "app.agent.skills.backtest_agent.run",
+    "trading_agent": "app.agent.skills.trading_agent.run",
+    "indicator_agent": "app.agent.skills.indicator_agent.run",
+    "data_agent": "app.agent.skills.data_agent.run",
+    "market_screener": "app.agent.skills.market_screener.run",
+    "bb_screener": "app.agent.skills.bb_screener.run",
+}
+
+
+def run_skill(skill_name: str, stock_code: str, stock_name: str = "",
+              context: Dict[str, Any] = None) -> Tuple["SkillReport", "EvalNode"]:
+    """执行单个 Skill，返回 (SkillReport, EvalNode)。"""
+    import time as _time
+    import importlib
+    import logging
+    logger = logging.getLogger(__name__)
+
+    if skill_name not in SKILL_MODULES:
+        logger.warning("[Skill] 未知: %s", skill_name)
+        return _make_error(skill_name, stock_code, stock_name, f"未知 Skill: {skill_name}")
+
+    t0 = _time.time()
+    try:
+        mod = importlib.import_module(SKILL_MODULES[skill_name])
+        data = mod.run(stock_code, stock_name or "")
+    except Exception as e:
+        elapsed = (_time.time() - t0) * 1000
+        logger.warning("[Skill] %s 异常: %s (%.0fms)", skill_name, e, elapsed)
+        return _make_error(skill_name, stock_code, stock_name, str(e), elapsed)
+
+    elapsed = (_time.time() - t0) * 1000
+    if not isinstance(data, dict):
+        return _make_error(skill_name, stock_code, stock_name, f"输出格式错误: {type(data)}", elapsed)
+
+    data.setdefault("skill", skill_name)
+    report = skill_report_from_dict(data, skill_name)
+    node = eval_node_from_dict(data, skill_name, stock_code, stock_name, elapsed)
+
+    logger.info("[Skill] %s | score=%s dir=%s status=%s | %.0fms",
+                skill_name, report.score, report.direction, report.status, elapsed)
+    return report, node
+
+
+def skill_report_from_dict(data: dict, skill_name: str = "") -> "SkillReport":
+    """dict → SkillReport。"""
+    factors = []
+    for f in data.get("factors", []):
+        if isinstance(f, dict):
+            factors.append(FactorItem(
+                name=f.get("name", ""), value=str(f.get("value", "")),
+                score=f.get("score"), weight=f.get("weight", 1.0),
+                status=f.get("status", "ok"),
+            ))
+
+    conf = data.get("confidence", 0.5)
+    if isinstance(conf, str):
+        conf = {"high": 0.8, "medium": 0.5, "low": 0.3}.get(conf, 0.5)
+    conf = max(0.0, min(1.0, float(conf)))
+
+    raw_status = data.get("status", "ok")
+    status = "failed" if raw_status in ("failed", "error") else ("missing" if raw_status == "missing" else "ok")
+
+    return SkillReport(
+        skill_name=data.get("skill", skill_name),
+        score=float(data.get("score", 50)),
+        confidence=conf,
+        direction=data.get("direction", "neutral"),
+        signal=data.get("signal", ""),
+        factors=factors,
+        analysis=data.get("analysis", ""),
+        output_data=data.get("output_data", data),
+        tools_called=[],
+        missing_data=[],
+        status=status,
+        error=data.get("error", ""),
+    )
+
+
+def eval_node_from_dict(data: dict, skill_name: str = "", stock_code: str = "",
+                        stock_name: str = "", elapsed_ms: float = 0.0) -> "EvalNode":
+    """dict → EvalNode。"""
+    factors = []
+    for f in data.get("factors", []):
+        if isinstance(f, dict):
+            factors.append(FactorItem(
+                name=f.get("name", ""), value=str(f.get("value", "")),
+                score=f.get("score"), weight=f.get("weight", 1.0),
+                status=f.get("status", "ok"),
+            ))
+
+    conf = data.get("confidence", 0.5)
+    if isinstance(conf, str):
+        conf = {"high": 0.8, "medium": 0.5, "low": 0.3}.get(conf, 0.5)
+    conf = max(0.0, min(1.0, float(conf)))
+
+    raw_status = data.get("status", "ok")
+    if raw_status in ("failed", "error"):
+        node_status = Status.FAILED.value
+    elif raw_status == "missing":
+        node_status = Status.MISSING.value
+    else:
+        node_status = Status.OK.value
+
+    return EvalNode(
+        layer=Layer.SKILL.value,
+        name=data.get("skill", skill_name),
+        exec_date=date.today(),
+        stock_code=stock_code,
+        stock_name=stock_name,
+        score=float(data.get("score", 50)),
+        direction=data.get("direction", "neutral"),
+        action=data.get("action", ""),
+        signal=data.get("signal", ""),
+        confidence=conf,
+        factors=factors,
+        output_data=data.get("output_data", data),
+        analysis=data.get("analysis", ""),
+        tools_called=[],
+        missing_data=[],
+        status=node_status,
+        error=data.get("error", ""),
+        elapsed_ms=elapsed_ms,
+    )
+
+
+def _make_error(skill_name: str, stock_code: str, stock_name: str,
+                error: str, elapsed_ms: float = 0):
+    """构建错误态结果。"""
+    report = SkillReport(skill_name=skill_name, score=0, confidence=0,
+                         direction="neutral", status="failed", error=error)
+    node = EvalNode(layer=Layer.SKILL.value, name=skill_name,
+                    exec_date=date.today(), stock_code=stock_code,
+                    stock_name=stock_name, score=0, direction="neutral",
+                    status=Status.FAILED.value, error=error, elapsed_ms=elapsed_ms)
+    return report, node

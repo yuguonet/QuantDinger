@@ -165,7 +165,7 @@ class BaseDataSource(ABC):
     
     # ── A-Share 数据已迁移至独立模块 ──
     # 龙虎榜/涨跌停池/热榜 → app.market_cn.dragon_limit
-    # 资金流向/市场数据     → app.agent.tools.market_data_tools
+    # 资金流向/市场数据     → app.agent.tools.fund_flow_tools / index_tools
 
     def log_result(
         self,

@@ -14,6 +14,9 @@
 """
 from __future__ import annotations
 
+from app.agent.tools.em_utils import em_datacenter
+from app.data_sources.normalizer import strip_market_prefix as _strip_prefix
+
 import logging
 from typing import Any, Dict, List
 
@@ -24,17 +27,8 @@ from app.data_sources.normalizer import safe_float as _safe_float
 logger = logging.getLogger(__name__)
 
 _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-_DATACENTER_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 
 
-def _stock_code_normalize(code: str) -> str:
-    code = code.strip().upper()
-    for prefix in ("SH", "SZ", "BJ"):
-        if code.startswith(prefix):
-            code = code[len(prefix):]
-    if "." in code:
-        code = code.split(".")[0]
-    return code
 
 
 def _market_prefix(code: str) -> str:
@@ -45,28 +39,10 @@ def _market_prefix(code: str) -> str:
     return "sz"
 
 
-def _em_datacenter(report_name: str, columns: str = "ALL",
-                   filter_str: str = "", page_size: int = 50,
-                   sort_columns: str = "", sort_types: str = "-1") -> list:
-    """东财数据中心统一查询。"""
-    params = {
-        "reportName": report_name, "columns": columns,
-    }
-    r = requests.get(_DATACENTER_URL, params=params,
-                     headers={"User-Agent": _UA}, timeout=15)
-    d = r.json()
-    if d.get("result") and d["result"].get("data"):
-        return d["result"]["data"]
-    return []
-
-
-# ══════════════════════════════════════════════════════════════
-# 内部函数（_前缀，不暴露为独立工具）
-# ══════════════════════════════════════════════════════════════
 
 def _get_margin_trading(code: str, days: int = 60) -> Dict[str, Any]:
     """融资融券明细。日级融资余额/买入/偿还+融券余额。"""
-    data = _em_datacenter(
+    data = em_datacenter(
         "RPTA_WEB_RZRQ_GGMX",
         filter_str=f'(SCODE="{code}")',
         page_size=days,
@@ -82,7 +58,7 @@ def _get_margin_trading(code: str, days: int = 60) -> Dict[str, Any]:
 
 def _get_block_trades(code: str, page_size: int = 20) -> Dict[str, Any]:
     """大宗交易记录。成交价/量+买卖方营业部+溢价率。"""
-    data = _em_datacenter(
+    data = em_datacenter(
         "RPT_DATA_BLOCKTRADE",
         filter_str=f'(SECURITY_CODE="{code}")',
         page_size=page_size,
@@ -101,7 +77,7 @@ def _get_block_trades(code: str, page_size: int = 20) -> Dict[str, Any]:
 
 def _get_holder_count(code: str) -> Dict[str, Any]:
     """股东户数变化。季度股东数+环比变化+户均持股。"""
-    data = _em_datacenter(
+    data = em_datacenter(
         "RPT_HOLDERNUMLATEST",
         filter_str=f'(SECURITY_CODE="{code}")',
         page_size=10,
@@ -117,7 +93,7 @@ def _get_holder_count(code: str) -> Dict[str, Any]:
 
 def _get_dividend_history(code: str) -> Dict[str, Any]:
     """分红送转历史。每股派息/送股/转增+进度状态。"""
-    data = _em_datacenter(
+    data = em_datacenter(
         "RPT_SHAREBONUS_DET",
         filter_str=f'(SECURITY_CODE="{code}")',
         page_size=20,
@@ -184,7 +160,7 @@ def get_capital_summary(stock_code: str) -> Dict[str, Any]:
     Args:
         stock_code: 股票代码（如 600519）
     """
-    code = _stock_code_normalize(stock_code)
+    code = _strip_prefix(stock_code)
 
     # ── 并行采集五维数据（单源超时不阻断整体）────────────────────
     def _safe(fn, label):

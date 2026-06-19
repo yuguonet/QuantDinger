@@ -5,6 +5,7 @@
 数据来源：market_cn.tape（五档盘口）/ 腾讯财经 HTTP API（估值/指数/批量）
 """
 from __future__ import annotations
+from app.data_sources.normalizer import strip_market_prefix as _strip_prefix
 
 import logging
 from typing import Any, Dict, List
@@ -14,15 +15,6 @@ logger = logging.getLogger(__name__)
 
 _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 
-
-def _stock_code_normalize(code: str) -> str:
-    code = code.strip().upper()
-    for prefix in ("SH", "SZ", "BJ"):
-        if code.startswith(prefix):
-            code = code[len(prefix):]
-    if "." in code:
-        code = code.split(".")[0]
-    return code
 
 
 # ══════════════════════════════════════════════════════════════
@@ -35,7 +27,7 @@ def _tencent_quote_raw(codes: list) -> dict:
 
     prefixed = []
     for c in codes:
-        c = _stock_code_normalize(c)
+        c = _strip_prefix(c)
         if c.startswith(("6", "9", "5", "000")):
             if c.startswith("000") and not c.startswith(("002", "003")):
                 prefixed.append(f"sh{c}")
@@ -119,7 +111,7 @@ def get_order_book(stock_code: str) -> Dict[str, Any]:
     Args:
         stock_code: 股票代码（如 600519）
     """
-    code = _stock_code_normalize(stock_code)
+    code = _strip_prefix(stock_code)
     try:
         from app.market_cn.tape import get_order_book as _get_order_book
         result = _get_order_book(code)
@@ -143,7 +135,7 @@ def get_index_etf_quote(codes: str) -> Dict[str, Any]:
                指数：000001(上证) 399001(深证) 000300(沪深300) 399006(创业板)
                ETF：510050(上证50) 510300(沪深300) 159919(沪深300) 512880(证券)
     """
-    code_list = [_stock_code_normalize(c.strip()) for c in codes.split(",") if c.strip()]
+    code_list = [_strip_prefix(c.strip()) for c in codes.split(",") if c.strip()]
     if not code_list:
         return {"error": "请提供至少一个代码"}
 
@@ -183,7 +175,7 @@ def batch_valuation_compare(stock_codes: str) -> Dict[str, Any]:
     Args:
         stock_codes: 逗号分隔的股票代码，如 "600519,000858,688017"
     """
-    code_list = [_stock_code_normalize(c.strip()) for c in stock_codes.split(",") if c.strip()]
+    code_list = [_strip_prefix(c.strip()) for c in stock_codes.split(",") if c.strip()]
     if not code_list:
         return {"error": "请提供至少一个股票代码"}
     if len(code_list) > 20:

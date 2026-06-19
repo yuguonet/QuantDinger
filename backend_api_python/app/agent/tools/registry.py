@@ -93,10 +93,7 @@ _TOOL_META: Dict[str, tuple[str, str]] = {
     "get_sector_cycle": ("分析层", "板块周期"),
     "get_stock_sector_info": ("分析层", "个股板块"),
     "get_sector_stocks": ("分析层", "板块成分股"),
-    # Tool chain tools
-    "read_tool_chain": ("系统层", "链路管理"),
-    "write_tool_chain": ("系统层", "链路管理"),
-    "list_tool_chains": ("系统层", "链路管理"),
+
     # Trading tools
     "list_strategies": ("交易层", "策略管理"),
     "get_strategy_detail": ("交易层", "策略管理"),
@@ -110,7 +107,6 @@ _TOOL_META: Dict[str, tuple[str, str]] = {
 
 _SKIP_MODULES: Set[str] = {
     "__init__", "__pycache__", "pagination", "screener_config",
-    "screener_filters",
 }
 
 

@@ -3,6 +3,27 @@
 import argparse, json, sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
+def run(stock_code: str = "", stock_name: str = "", context: dict = None) -> dict:
+    """薄壳入口，调用 BBScreenerSkill 执行全市场扫描。"""
+    from app.agent.skills.bb_screener import BBScreenerSkill
+    from app.agent.tools import registry as tool_registry
+    tool_registry.discover()
+
+    def call_tool_fn(tool_name, **kwargs):
+        spec = tool_registry.get(tool_name)
+        if not spec: raise ValueError(f"Unknown tool: {tool_name}")
+        return spec.fn(**kwargs)
+
+    skill = BBScreenerSkill()
+    result = skill.run(call_tool_fn=call_tool_fn)
+    if isinstance(result, dict):
+        result.setdefault("skill", "bb_screener")
+        return result
+    return {"skill": "bb_screener", "score": 50, "direction": "neutral",
+            "confidence": 0.4, "signal": "BB扫描完成", "factors": [],
+            "analysis": str(result)[:500], "status": "ok"}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("stock_code", nargs="?", default="")

@@ -6,6 +6,9 @@
 """
 from __future__ import annotations
 
+from app.agent.tools.em_utils import em_datacenter
+from app.data_sources.normalizer import strip_market_prefix as _strip_prefix
+
 import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, List
@@ -17,44 +20,10 @@ from app.data_sources.normalizer import safe_float as _safe_float
 logger = logging.getLogger(__name__)
 
 _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-_DATACENTER_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 
 
-def _stock_code_normalize(code: str) -> str:
-    code = code.strip().upper()
-    for prefix in ("SH", "SZ", "BJ"):
-        if code.startswith(prefix):
-            code = code[len(prefix):]
-    if "." in code:
-        code = code.split(".")[0]
-    return code
 
 
-def _em_datacenter(report_name: str, columns: str = "ALL",
-                   filter_str: str = "", page_size: int = 50,
-                   sort_columns: str = "", sort_types: str = "-1") -> list:
-    """东财数据中心统一查询。"""
-    import os, time
-    import requests as _req
-
-    _EM_MIN_INTERVAL = float(os.getenv("EM_MIN_INTERVAL", "1.0"))
-    params = {
-        "reportName": report_name, "columns": columns,
-        "filter": filter_str, "pageNumber": "1", "pageSize": str(page_size),
-        "sortColumns": sort_columns, "sortTypes": sort_types,
-        "source": "WEB", "client": "WEB",
-    }
-    r = _req.get(_DATACENTER_URL, params=params,
-                 headers={"User-Agent": _UA}, timeout=15)
-    d = r.json()
-    if d.get("result") and d["result"].get("data"):
-        return d["result"]["data"]
-    return []
-
-
-# ══════════════════════════════════════════════════════════════
-# 热点题材归因
-# ══════════════════════════════════════════════════════════════
 
 def get_hot_stocks_with_reason(date: str = "") -> Dict[str, Any]:
     """获取同花顺当日强势股+题材归因。
@@ -109,20 +78,6 @@ def get_hot_stocks_with_reason(date: str = "") -> Dict[str, Any]:
 
 
 # ══════════════════════════════════════════════════════════════
-# 北向资金
-# ══════════════════════════════════════════════════════════════
-
-def get_northbound_flow() -> Dict[str, Any]:
-    """获取北向资金实时分钟流向（同花顺 hsgtApi）。"""
-    try:
-        from app.market_cn.index import get_northbound_realtime
-        return get_northbound_realtime()
-    except Exception as e:
-        logger.warning("get_northbound_flow failed: %s", e)
-        return {"error": str(e)}
-
-
-# ══════════════════════════════════════════════════════════════
 # 概念板块归属
 # ══════════════════════════════════════════════════════════════
 
@@ -134,7 +89,7 @@ def get_stock_concept_blocks(stock_code: str) -> Dict[str, Any]:
     """
     from app.market_cn.eastmoney_search import _em_get
 
-    code = _stock_code_normalize(stock_code)
+    code = _strip_prefix(stock_code)
     market_code = 1 if code.startswith("6") else 0
     params = {
         "fltt": "2", "invt": "2",
@@ -179,11 +134,11 @@ def get_lockup_expiry(stock_code: str, forward_days: int = 90) -> Dict[str, Any]
         stock_code: 股票代码（如 002475）
         forward_days: 向前看的天数，默认90天
     """
-    code = _stock_code_normalize(stock_code)
+    code = _strip_prefix(stock_code)
     today = datetime.now().strftime("%Y-%m-%d")
     end_date = (datetime.now() + timedelta(days=forward_days)).strftime("%Y-%m-%d")
 
-    history_data = _em_datacenter(
+    history_data = em_datacenter(
         "RPT_LIFT_STAGE",
         filter_str=f'(SECURITY_CODE="{code}")',
         page_size=15,
@@ -198,7 +153,7 @@ def get_lockup_expiry(stock_code: str, forward_days: int = 90) -> Dict[str, Any]
             "ratio": _safe_float(row.get("FREE_RATIO")),
         })
 
-    upcoming_data = _em_datacenter(
+    upcoming_data = em_datacenter(
         "RPT_LIFT_STAGE",
         filter_str=f'(SECURITY_CODE="{code}")(FREE_DATE>=\'{today}\')(FREE_DATE<=\'{end_date}\')',
         page_size=20,
@@ -226,43 +181,17 @@ def get_lockup_expiry(stock_code: str, forward_days: int = 90) -> Dict[str, Any]
 # ══════════════════════════════════════════════════════════════
 
 def get_industry_ranking(top_n: int = 20) -> Dict[str, Any]:
-    """获取行业板块涨跌幅排名（东财行业板块）。
+    """获取行业板块涨跌幅排名。
+
+    数据源：market_cn.hot_sectors（东财 + 新浪双源）
 
     Args:
         top_n: 返回前N个行业，默认20
     """
-    from app.market_cn.eastmoney_search import _em_get
-
-    url = "https://push2.eastmoney.com/api/qt/clist/get"
-    params = {
-        "pn": "1", "pz": "100", "po": "1", "np": "1",
-        "fltt": "2", "invt": "2",
-        "fs": "m:90+t:2",
-        "fields": "f2,f3,f4,f12,f13,f14,f104,f105,f128,f136,f140,f141,f207",
-    }
-    headers = {"User-Agent": _UA}
+    from app.market_cn.hot_sectors import get_hot_industry_boards as _get
     try:
-        r = _em_get(url, params=params, headers=headers, timeout=15)
-        d = r.json()
-        items = d.get("data", {}).get("diff", [])
-        if not items:
-            return {"top": [], "bottom": [], "total": 0}
-
-        rows = []
-        for i, item in enumerate(items):
-            rows.append({
-                "rank": i + 1,
-                "name": item.get("f14", ""),
-                "change_pct": _safe_float(item.get("f3")),
-                "code": item.get("f12", ""),
-                "up_count": item.get("f104", 0),
-                "down_count": item.get("f105", 0),
-                "leader": item.get("f140", ""),
-                "leader_change": _safe_float(item.get("f136")),
-            })
-
-        n = min(top_n, len(rows))
-        return {"top": rows[:n], "bottom": rows[-n:], "total": len(rows)}
+        data = _get(limit=top_n)
+        return {"top": data[:top_n], "total": len(data)}
     except Exception as e:
         logger.warning("get_industry_ranking failed: %s", e)
         return {"error": str(e)}
@@ -279,11 +208,11 @@ def get_dragon_tiger_detail(stock_code: str, look_back_days: int = 30) -> Dict[s
         stock_code: 股票代码（如 002475）
         look_back_days: 回看天数，默认30
     """
-    code = _stock_code_normalize(stock_code)
+    code = _strip_prefix(stock_code)
     today = datetime.now().strftime("%Y-%m-%d")
     start = (datetime.now() - timedelta(days=look_back_days)).strftime("%Y-%m-%d")
 
-    data = _em_datacenter(
+    data = em_datacenter(
         "RPT_DAILYBILLBOARD_DETAILSNEW",
         filter_str=f"(TRADE_DATE>='{start}')(TRADE_DATE<='{today}')(SECURITY_CODE=\"{code}\")",
         page_size=50,
@@ -303,7 +232,7 @@ def get_dragon_tiger_detail(stock_code: str, look_back_days: int = 30) -> Dict[s
     sell_data = []
     if records:
         latest_date = records[0]["date"]
-        buy_data = _em_datacenter(
+        buy_data = em_datacenter(
             "RPT_BILLBOARD_DAILYDETAILSBUY",
             filter_str=f"(TRADE_DATE='{latest_date}')(SECURITY_CODE=\"{code}\")",
             page_size=10, sort_columns="BUY", sort_types="-1",
@@ -316,7 +245,7 @@ def get_dragon_tiger_detail(stock_code: str, look_back_days: int = 30) -> Dict[s
                 "net_wan": round(_safe_float(row.get("NET")) / 10000, 1),
             })
 
-        sell_data = _em_datacenter(
+        sell_data = em_datacenter(
             "RPT_BILLBOARD_DAILYDETAILSSELL",
             filter_str=f"(TRADE_DATE='{latest_date}')(SECURITY_CODE=\"{code}\")",
             page_size=10, sort_columns="SELL", sort_types="-1",

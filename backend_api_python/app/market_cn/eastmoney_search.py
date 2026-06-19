@@ -5,7 +5,7 @@
 被以下模块引用:
   - app.market_cn.dragon_limit (龙虎榜/涨跌停池)
   - app.market_cn.cards.* (前端卡片)
-  - app.agent.tools.market_data_tools (Agent 工具)
+  - app.agent.tools.dragon_tools (Agent 工具)
   - app.agent.tools.screener_tools (选股工具)
 
 前端调用: GET /api/shichang/search?keyword=xxx&page_size=200

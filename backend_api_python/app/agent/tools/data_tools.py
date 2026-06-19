@@ -51,7 +51,7 @@ def search_stock_by_name(keyword: str, market: str = "CNStock", limit: int = 10)
         return {"keyword": keyword, "results": [], "count": 0, "error": str(e)}
 
 def get_realtime_quote(stock_code: str) -> Dict[str, Any]:
-        """获取股票实时行情数据。
+    """获取股票实时行情数据。
 
     Args:
         stock_code: 股票代码，如 "600519"
@@ -108,7 +108,7 @@ def agent_get_kline(stock_code: str, timeframe: str = "1D", days: int = 60, mark
         logger.error("get_kline(%s, %s, %d) failed: %s", stock_code, timeframe, days, e)
         return []
 def get_stock_info(stock_code: str) -> Dict[str, Any]:
-        """获取股票基本信息（名称、行业、市值等）。
+    """获取股票基本信息（名称、行业、市值等）。
 
     Args:
         stock_code: 股票代码，如 "600519"
@@ -187,8 +187,9 @@ def get_stock_info(stock_code: str) -> Dict[str, Any]:
 
     # 4) 腾讯实时估值补全（PE/PB/市值/换手率/量比等）
     try:
-        from app.agent.tools.quote_tools import _tencent_quote_raw, _stock_code_normalize
-        code = _stock_code_normalize(stock_code)
+        from app.agent.tools.quote_tools import _tencent_quote_raw
+        from app.data_sources.normalizer import strip_market_prefix as _strip_prefix
+        code = _strip_prefix(stock_code)
         tq = _tencent_quote_raw([code])
         q = tq.get(code)
         if q:

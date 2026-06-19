@@ -95,7 +95,7 @@ def _get_skill_catalog() -> str:
         # fallback: 硬编码兜底（semantics 加载失败时）
         return (
             "可用技能：technical_agent(技术面), intelligence_agent(情报), "
-            "market_data_agent(行情), screening_agent(选股), backtest_agent(回测), "
+            "market_data_agent(行情), market_screener(选股), backtest_agent(回测), "
             "researcher(多空), trading_agent(交易)"
         )
     lines = ["可用技能（从下列中选择 1~5 个，按执行顺序排列）：", ""]

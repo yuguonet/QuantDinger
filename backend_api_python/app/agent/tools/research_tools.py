@@ -5,6 +5,7 @@
 数据来源：东财 reportapi / 同花顺 / 东财搜索API / 巨潮 cninfo
 """
 from __future__ import annotations
+from app.data_sources.normalizer import strip_market_prefix as _strip_prefix
 
 import json
 import logging
@@ -21,15 +22,6 @@ logger = logging.getLogger(__name__)
 _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 
 
-def _stock_code_normalize(code: str) -> str:
-    code = code.strip().upper()
-    for prefix in ("SH", "SZ", "BJ"):
-        if code.startswith(prefix):
-            code = code[len(prefix):]
-    if "." in code:
-        code = code.split(".")[0]
-    return code
-
 
 # ══════════════════════════════════════════════════════════════
 # 研报评级
@@ -45,7 +37,7 @@ def get_consensus_eps(stock_code: str) -> Dict[str, Any]:
     Args:
         stock_code: 股票代码（如 688017）
     """
-    code = _stock_code_normalize(stock_code)
+    code = _strip_prefix(stock_code)
     try:
         import pandas as pd
         from io import StringIO
@@ -90,7 +82,7 @@ def get_eastmoney_stock_news(stock_code: str, page_size: int = 20) -> Dict[str, 
     """
     from app.market_cn.eastmoney_search import _em_get
 
-    code = _stock_code_normalize(stock_code)
+    code = _strip_prefix(stock_code)
     cb = "jQuery_news"
     url = "https://search-api-web.eastmoney.com/search/jsonp"
     inner_params = json.dumps({
