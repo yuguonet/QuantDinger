@@ -1,4 +1,15 @@
-# 全市场短线选股 (market_screener)
+---
+name: market-screener
+version: 2.0.0
+description: 根据当前时间自动切换策略，从A股全市场筛选短线标的,短线选股。
+tags: [market, screener, short_term, a_share]
+tools:
+  - get_fund_flow_realtime
+  - get_indicator_snapshot
+  - search_stocks
+---
+
+# 全市场短线选股 (market-screener)
 
 ## 描述
 
@@ -49,7 +60,7 @@
 ## 输出结构
 '''json
   {
-  "skill": "market_screener",
+  "skill": "market-screener",
   "strategy_used": "intraday | eod | post_market",
   "score": 0-100, // 综合评分
   "direction": "bullish | neutral | bearish",
