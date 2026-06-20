@@ -1,45 +1,128 @@
 # -*- coding: utf-8 -*-
-"""全市场短线选股 — 自动选择盘中/盘后/收盘策略进行市场筛选。"""
+"""
+market_screener/run.py
+
+A股全市场短线选股 — Anthropic Agent Skills 执行入口。
+
+框架调用方式：
+    from market_screener.run import run
+    result = run(call_tool_fn=my_call_tool_fn)
+"""
+
 from __future__ import annotations
 
 import logging
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Any, Callable, Dict, List, Optional
+
 from app.agent.tools.screener_tools import search_stocks
-
-# -*- coding: utf-8 -*-
-"""
-Market Screener Skill — A股选股（盘中/尾盘/盘后统一入口，按时间自动切换策略）。
-
-时间自动调度：
-  09:30-14:29 → 盘中短线（涨停池连板 + 热门板块龙头 + 题材归因）
-  14:30-15:00 → 尾盘隔夜（条件初筛 + 尾盘特征验证 + 收盘抢筹）
-  15:00+      → 盘后复盘（技术形态筛选 + 介入点计算 + 次日计划）
-
-两阶段流程（各策略共享）：
-  Phase 1: Python 预筛选（0 token，调底层数据源）
-  Phase 2: 对候选股逐只调工具做深入分析
-
-与 screening_agent 的区别：screening_agent 是通用条件选股（search_stocks），
-本 Skill 是针对 A 股时间场景特化的三合一自动策略。
-"""
-from __future__ import annotations
-
-import logging
-import os
-import sys
-from collections import Counter
-from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, List, Optional
-
 from app.agent.chain.schema import FactorItem, SkillReport
 
 logger = logging.getLogger(__name__)
 
+
 # ═══════════════════════════════════════════════════════════════
-# 通用数据加载
+#  框架标准入口
 # ═══════════════════════════════════════════════════════════════
+
+def run(
+    call_tool_fn: Callable,
+    stock_code: str = "",
+    stock_name: str = "",
+    **kwargs,
+) -> Dict[str, Any]:
+    """Agent 框架调用的标准入口。
+
+    两阶段流程：
+      Phase 1 — Python 预筛选（0 token）：从涨停池、强势股、热门板块等
+                数据源获取原始数据，按策略规则筛选候选标的。
+      Phase 2 — 对候选股逐只调用工具做深入分析（资金流向、技术指标快照等），
+                计算综合评分并生成操作建议。
+
+    Args:
+        call_tool_fn: Agent 框架注入的工具调用函数
+        stock_code: 留空即可，本技能为全市场扫描
+        stock_name: 留空即可，本技能为全市场扫描
+
+    Returns:
+        dict: 符合 skill.md 输出结构的结果字典
+    """
+    strategy = _select_strategy()
+    today = date.today().isoformat()
+    _tool_calls: List[str] = []
+    _tool_nodes: List = []
+    _missing_data: List = []
+
+    logger.info("[market_screener] 执行策略: %s", strategy)
+
+    runners = {
+        "intraday":    lambda: _run_intraday(today, call_tool_fn, _tool_calls, _tool_nodes, _missing_data),
+        "eod":         lambda: _run_eod(call_tool_fn, _tool_calls, _tool_nodes, _missing_data),
+        "post_market": lambda: _run_post_market(today, call_tool_fn, _tool_calls, _tool_nodes, _missing_data),
+    }
+
+    report = runners[strategy]()
+
+    if report is None:
+        return {
+            "skill": "market_screener",
+            "status": "failed",
+            "error": f"策略 {strategy} 执行失败",
+            "score": 0,
+            "direction": "neutral",
+            "confidence": 0,
+            "signal": "",
+            "analysis": "",
+            "factors": [],
+            "strategy_used": strategy,
+            "tools_called": _tool_calls,
+        }
+
+    # 统一转 dict
+    if hasattr(report, "to_dict"):
+        d = report.to_dict()
+    elif isinstance(report, dict):
+        d = report
+    else:
+        d = {
+            "score": getattr(report, "score", 50),
+            "direction": getattr(report, "direction", "neutral"),
+            "signal": getattr(report, "signal", ""),
+            "analysis": str(getattr(report, "analysis", ""))[:2000],
+            "status": getattr(report, "status", "ok"),
+            "confidence": 0.5,
+            "factors": [],
+        }
+
+    d.setdefault("skill", "market_screener")
+    d["strategy_used"] = strategy
+    d["tools_called"] = _tool_calls
+    return d
+
+# ═══════════════════════════════════════════════════════════════
+#  策略调度
+# ═══════════════════════════════════════════════════════════════
+
+def _select_strategy() -> str:
+    """根据当前时间返回策略名称: intraday / eod / post_market。"""
+    now = datetime.now()
+    h, m = now.hour, now.minute
+    if now.weekday() >= 5:
+        return "post_market"
+    if h < 9 or (h == 9 and m < 30) or h >= 15:
+        return "post_market"
+    if h >= 14 and m >= 30:
+        return "eod"
+    return "intraday"
+
+
+# ═══════════════════════════════════════════════════════════════
+#  通用数据加载
+# ═══════════════════════════════════════════════════════════════
+
+import os
+import sys
 
 _backend_root = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..")
@@ -90,11 +173,10 @@ def _today_str() -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 通用数据采集
+#  通用数据采集
 # ═══════════════════════════════════════════════════════════════
 
 def _fetch_kline(code: str, days: int = 60) -> List[Dict]:
-    """从 db_market 获取日K线（前复权）。"""
     from app.data_sources.provider.adjustment import unadj_to_qfq
     end = datetime.now().strftime("%Y-%m-%d")
     start = (datetime.now() - timedelta(days=int(days * 1.5))).strftime("%Y-%m-%d")
@@ -103,23 +185,17 @@ def _fetch_kline(code: str, days: int = 60) -> List[Dict]:
         data = writer.query("CNStock", code, "1D", start_time=start, end_time=end, limit=0)
         if not data:
             return []
-        bars = []
-        for r in data:
-            bars.append({
-                "time": str(r["time"])[:10],
-                "open": float(r["open"]),
-                "high": float(r["high"]),
-                "low": float(r["low"]),
-                "close": float(r["close"]),
-                "volume": float(r["volume"]),
-            })
+        bars = [{
+            "time": str(r["time"])[:10], "open": float(r["open"]),
+            "high": float(r["high"]), "low": float(r["low"]),
+            "close": float(r["close"]), "volume": float(r["volume"]),
+        } for r in data]
         return unadj_to_qfq(bars, code)
     except Exception:
         return []
 
 
 def _fetch_zt_pool(date: str) -> List[Dict]:
-    """涨停池。"""
     try:
         from app.market_cn.dragon_limit import get_zt_pool
         return get_zt_pool(date)
@@ -129,7 +205,6 @@ def _fetch_zt_pool(date: str) -> List[Dict]:
 
 
 def _fetch_dt_pool(date: str) -> List[Dict]:
-    """跌停池。"""
     try:
         from app.market_cn.dragon_limit import get_dt_pool
         return get_dt_pool(date)
@@ -139,7 +214,6 @@ def _fetch_dt_pool(date: str) -> List[Dict]:
 
 
 def _fetch_broken_board(date: str) -> List[Dict]:
-    """炸板池。"""
     try:
         from app.market_cn.dragon_limit import get_broken_board
         return get_broken_board(date)
@@ -149,7 +223,6 @@ def _fetch_broken_board(date: str) -> List[Dict]:
 
 
 def _fetch_hot_stocks_with_reason(date: str) -> Dict:
-    """同花顺强势股+题材归因。"""
     import requests as _req
     url = (
         f"http://zx.10jqka.com.cn/event/api/getharden/"
@@ -162,16 +235,13 @@ def _fetch_hot_stocks_with_reason(date: str) -> Dict:
         if data.get("errocode", 0) != 0:
             return {"error": f"同花顺错误: {data.get('errormsg', '')}"}
         rows = data.get("data") or []
-        stocks = []
-        for row in rows:
-            stocks.append({
-                "code": row.get("code", ""),
-                "name": row.get("name", ""),
-                "reason": row.get("reason", ""),
-                "change_pct": float(row.get("zhangfu", 0) or 0),
-                "turnover_pct": float(row.get("huanshou", 0) or 0),
-                "amount": float(row.get("chengjiaoe", 0) or 0),
-            })
+        stocks = [{
+            "code": row.get("code", ""), "name": row.get("name", ""),
+            "reason": row.get("reason", ""),
+            "change_pct": float(row.get("zhangfu", 0) or 0),
+            "turnover_pct": float(row.get("huanshou", 0) or 0),
+            "amount": float(row.get("chengjiaoe", 0) or 0),
+        } for row in rows]
         tag_counter: Counter = Counter()
         for s in stocks:
             if s["reason"]:
@@ -184,7 +254,6 @@ def _fetch_hot_stocks_with_reason(date: str) -> Dict:
 
 
 def _fetch_hot_sectors() -> Dict:
-    """热门板块。"""
     try:
         from app.market_cn.china_market import get_hot_sectors
         return get_hot_sectors(industry_limit=15, concept_limit=15)
@@ -194,7 +263,7 @@ def _fetch_hot_sectors() -> Dict:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 通用技术指标计算
+#  通用技术指标计算
 # ═══════════════════════════════════════════════════════════════
 
 def _compute_ma(closes: List[float], period: int) -> List[Optional[float]]:
@@ -292,7 +361,7 @@ def _compute_atr(bars: List[Dict], period: int = 14) -> List[float]:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 策略通用 — 龙回头弱转强检测（盘中+盘后共享）
+#  龙回头弱转强检测（盘中 + 盘后共享）
 # ═══════════════════════════════════════════════════════════════
 
 def _fetch_recent_zt_pools(days: int = 8) -> Dict[str, List[Dict]]:
@@ -307,7 +376,6 @@ def _fetch_recent_zt_pools(days: int = 8) -> Dict[str, List[Dict]]:
 
 
 def _scan_dragon_pullback(date: str) -> List[Dict]:
-    """扫描龙回头弱转强模式。"""
     recent_pools = _fetch_recent_zt_pools(8)
     code_history: Dict[str, List[Dict]] = {}
 
@@ -423,20 +491,16 @@ def _scan_dragon_pullback(date: str) -> List[Dict]:
             continue
 
         candidates.append({
-            "code": code,
-            "name": info["name"],
-            "source": "龙回头",
+            "code": code, "name": info["name"], "source": "龙回头",
             "max_continuous_days": info["max_continuous_days"],
-            "zt_dates": info["zt_dates"],
-            "reason": info["reason"],
+            "zt_dates": info["zt_dates"], "reason": info["reason"],
             "pullback_pct": round(pullback_pct, 1),
             "peak_price": round(peak_price, 3),
             "trough_price": round(trough_price, 3),
             "close": round(closes[i], 3),
             "vol_ratio_today": round(vol_ratio_today, 2),
             "rsi": round(rsi[i], 2),
-            "signals": signals,
-            "strength_score": strength_score,
+            "signals": signals, "strength_score": strength_score,
         })
 
     candidates.sort(key=lambda x: -x["strength_score"])
@@ -444,11 +508,10 @@ def _scan_dragon_pullback(date: str) -> List[Dict]:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 策略 1 — 盘中短线（9:30-14:29）
+#  策略 1 — 盘中短线 (09:30-14:29)
 # ═══════════════════════════════════════════════════════════════
 
 def _tech_check(code: str) -> Optional[Dict]:
-    """对单只候选股做快速技术面检查（纯 Python）。"""
     bars = _fetch_kline(code, days=60)
     if len(bars) < 20:
         return None
@@ -477,7 +540,6 @@ def _tech_check(code: str) -> Optional[Dict]:
 
 
 def _prescreen_intraday(date: str) -> Dict[str, Any]:
-    """盘中预筛选：涨停池 + 强势股题材 + 龙回头。"""
     zt_pool = _fetch_zt_pool(date)
     dt_pool = _fetch_dt_pool(date)
     broken_pool = _fetch_broken_board(date)
@@ -508,12 +570,10 @@ def _prescreen_intraday(date: str) -> Dict[str, Any]:
         mood_score = 50
 
     market_summary = {
-        "zt_count": zt_count,
-        "dt_count": dt_count,
+        "zt_count": zt_count, "dt_count": dt_count,
         "broken_count": broken_count,
         "broken_rate": round(broken_rate * 100, 1),
-        "mood": mood,
-        "mood_score": mood_score,
+        "mood": mood, "mood_score": mood_score,
     }
 
     zt_reason_counter: Counter = Counter()
@@ -548,26 +608,19 @@ def _prescreen_intraday(date: str) -> Dict[str, Any]:
             })
     continuous_board.sort(key=lambda x: (-x["continuous_days"], x["zt_time"] or "99:99"))
 
-    main_theme_keywords = set()
-    for tag, _ in main_themes[:5]:
-        main_theme_keywords.add(tag)
+    main_theme_keywords = {tag for tag, _ in main_themes[:5]}
 
     theme_stocks = []
     for s in hot_stocks:
         reason = s.get("reason", "") or ""
         if not reason:
             continue
-        matched_tags = []
-        for tag in reason.replace("，", "+").replace(",", "+").split("+"):
-            tag = tag.strip()
-            if tag in main_theme_keywords:
-                matched_tags.append(tag)
+        matched_tags = [tag for tag in reason.replace("，", "+").replace(",", "+").split("+")
+                        if tag.strip() in main_theme_keywords]
         if matched_tags:
             theme_stocks.append({
-                "code": s.get("code", ""),
-                "name": s.get("name", ""),
-                "reason": reason,
-                "matched_tags": matched_tags,
+                "code": s.get("code", ""), "name": s.get("name", ""),
+                "reason": reason, "matched_tags": matched_tags,
                 "change_pct": s.get("change_pct", 0),
                 "turnover_pct": s.get("turnover_pct", 0),
                 "amount": s.get("amount", 0),
@@ -582,7 +635,8 @@ def _prescreen_intraday(date: str) -> Dict[str, Any]:
         candidates[code] = {
             "code": code, "name": s["name"], "source": "连板",
             "continuous_days": s["continuous_days"], "zt_time": s["zt_time"],
-            "reason": s["reason"], "change_pct": 0, "tags": [], "pullback_signals": [],
+            "reason": s["reason"], "change_pct": 0, "tags": [],
+            "pullback_signals": [],
         }
     for s in theme_stocks[:20]:
         code = s["code"]
@@ -593,7 +647,8 @@ def _prescreen_intraday(date: str) -> Dict[str, Any]:
             candidates[code] = {
                 "code": code, "name": s["name"], "source": "主线题材",
                 "continuous_days": 0, "zt_time": "", "reason": s["reason"],
-                "change_pct": s["change_pct"], "tags": s["matched_tags"], "pullback_signals": [],
+                "change_pct": s["change_pct"], "tags": s["matched_tags"],
+                "pullback_signals": [],
             }
     for s in dragon_pullback[:10]:
         code = s["code"]
@@ -603,10 +658,11 @@ def _prescreen_intraday(date: str) -> Dict[str, Any]:
         else:
             candidates[code] = {
                 "code": code, "name": s["name"], "source": "龙回头",
-                "continuous_days": s.get("max_continuous_days", 0), "zt_time": "",
-                "reason": s["reason"], "change_pct": 0, "tags": [],
-                "pullback_signals": s["signals"],
-                "pullback_pct": s["pullback_pct"], "strength_score": s["strength_score"],
+                "continuous_days": s.get("max_continuous_days", 0),
+                "zt_time": "", "reason": s["reason"], "change_pct": 0,
+                "tags": [], "pullback_signals": s["signals"],
+                "pullback_pct": s["pullback_pct"],
+                "strength_score": s["strength_score"],
             }
 
     candidate_list = list(candidates.values())
@@ -630,7 +686,6 @@ def _deep_analyze_intraday(
     candidate: Dict, tech: Optional[Dict],
     call_tool_fn, _tool_calls, _tool_nodes, _missing_data,
 ) -> Optional[Dict]:
-    """盘中 — 对单只候选股做深入分析。"""
     code = candidate["code"]
     try:
         fund_flow = call_tool_fn("get_fund_flow_realtime", stock_code=code)
@@ -703,13 +758,13 @@ def _deep_analyze_intraday(
             main_net = fund_flow.get("main_net_inflow", 0) or 0
             if main_net > 0:
                 score += 5
-                signals.append(f"主力净流入{main_net/10000:.0f}万")
+                signals.append(f"主力净流入{main_net / 10000:.0f}万")
             elif main_net < -5000000:
                 score -= 3
-                signals.append(f"主力净流出{abs(main_net)/10000:.0f}万")
+                signals.append(f"主力净流出{abs(main_net) / 10000:.0f}万")
             factors.append(FactorItem(
                 name="资金流",
-                value=f"主力净流入={main_net/10000:.0f}万",
+                value=f"主力净流入={main_net / 10000:.0f}万",
                 score=65 if main_net > 0 else (35 if main_net < -5000000 else 50),
             ))
 
@@ -734,12 +789,140 @@ def _deep_analyze_intraday(
         return None
 
 
+def _run_intraday(date, call_tool_fn, _tool_calls, _tool_nodes, _missing_data):
+    try:
+        prescreen = _prescreen_intraday(date)
+    except Exception as e:
+        logger.warning("[MktScreen] 盘中预筛选失败: %s", e)
+        return None
+
+    market = prescreen["market"]
+    main_themes = prescreen["main_themes"]
+    candidates = prescreen["candidates"]
+
+    logger.info("[MktScreen] 盘中预筛选: 涨停%d 跌停%d 候选%d只",
+                market["zt_count"], market["dt_count"], len(candidates))
+
+    if market["mood_score"] < 30:
+        return SkillReport(
+            skill_name="market_screener", score=25.0, direction="bearish",
+            confidence=0.7,
+            signal=f"市场冰点（涨停{market['zt_count']}跌停{market['dt_count']}），不宜短线",
+            analysis=(
+                f"## 盘中短线选股 — 市场冰点\n\n"
+                f"涨停 {market['zt_count']} 只，跌停 {market['dt_count']} 只，"
+                f"炸板率 {market['broken_rate']}%。\n\n"
+                f"**建议：空仓观望，等待情绪回暖。**"
+            ),
+            factors=[
+                FactorItem(name="涨停数", value=str(market["zt_count"]), score=market["mood_score"]),
+                FactorItem(name="跌停数", value=str(market["dt_count"]), score=max(0, 100 - market["dt_count"] * 3)),
+                FactorItem(name="炸板率", value=f"{market['broken_rate']}%", score=max(0, 100 - int(market["broken_rate"]))),
+            ],
+            status="ok",
+        )
+
+    if not candidates:
+        return SkillReport(
+            skill_name="market_screener", score=45.0, direction="neutral",
+            confidence=0.5, signal="今日无明确短线标的",
+            analysis=(
+                f"## 盘中短线选股 — 无明确标的\n\n"
+                f"市场情绪：{market['mood']}（涨停{market['zt_count']}跌停{market['dt_count']}）\n"
+                f"今日无连板股或主线题材强势股进入候选池。"
+            ),
+            factors=[FactorItem(name="市场情绪", value=market["mood"], score=market["mood_score"])],
+            status="ok",
+        )
+
+    tech_results = {}
+    for c in candidates[:15]:
+        tech = _tech_check(c["code"])
+        if tech:
+            tech_results[c["code"]] = tech
+
+    analyzed = []
+    for c in candidates[:8]:
+        tech = tech_results.get(c["code"])
+        result = _deep_analyze_intraday(c, tech, call_tool_fn, _tool_calls, _tool_nodes, _missing_data)
+        if result:
+            analyzed.append(result)
+
+    if analyzed:
+        avg_score = sum(a["score"] for a in analyzed) / len(analyzed)
+        bullish = sum(1 for a in analyzed if a["direction"] == "bullish")
+    else:
+        avg_score = 50.0
+        bullish = 0
+
+    direction = "bullish" if avg_score >= 55 else ("bearish" if avg_score < 45 else "neutral")
+    confidence = min(0.9, 0.4 + len(analyzed) * 0.06)
+
+    factors = [
+        FactorItem(name="市场情绪", value=market["mood"], score=market["mood_score"]),
+        FactorItem(name="涨停/跌停", value=f"{market['zt_count']}/{market['dt_count']}", score=market["mood_score"]),
+        FactorItem(name="候选股数", value=str(len(candidates)), score=min(100, len(candidates) * 8 + 30)),
+        FactorItem(name="主线题材", value=", ".join(t for t, _ in main_themes[:3]) or "无", score=70 if main_themes else 40),
+        FactorItem(name="深入分析数", value=str(len(analyzed)), score=min(100, len(analyzed) * 12 + 20)),
+        FactorItem(name="看多比例", value=f"{bullish}/{len(analyzed) or len(candidates)}", score=int(avg_score)),
+    ]
+
+    lines = [
+        "## 盘中短线选股结果",
+        f"市场情绪: {market['mood']} | 涨停{market['zt_count']} 跌停{market['dt_count']} 炸板率{market['broken_rate']}%",
+        f"主线题材: {', '.join(t for t, _ in main_themes[:5]) or '无明确主线'}",
+        f"候选: {len(candidates)}只 | 深入分析: {len(analyzed)}只 | 综合评分: {avg_score:.0f}",
+        "",
+    ]
+
+    cb = prescreen.get("continuous_board", [])
+    if cb:
+        lines.append("### 连板龙头")
+        for s in cb[:5]:
+            lines.append(f"- **{s['code']}** {s['name']} | {s['continuous_days']}连板 | 涨停时间{s['zt_time']} | {s['reason']}")
+        lines.append("")
+
+    dp = prescreen.get("dragon_pullback", [])
+    if dp:
+        lines.append("### 龙回头弱转强")
+        for s in dp[:5]:
+            sig_str = ", ".join(s["signals"][:4])
+            lines.append(
+                f"- **{s['code']}** {s['name']} | 前期{s['max_continuous_days']}连板 | "
+                f"回调{s['pullback_pct']}% | 弱转强信号: {sig_str}"
+            )
+        lines.append("")
+
+    lines.append("### 候选标的")
+    for a in analyzed:
+        src = a.get("source", "")
+        lines.append(
+            f"- **{a['code']}** {a.get('name', '')} | 评分{a['score']:.0f} | "
+            f"{a['direction']} | 来源:{src} | {a['signal']}"
+        )
+
+    return SkillReport(
+        skill_name="market_screener", score=round(avg_score, 1),
+        direction=direction, confidence=confidence,
+        signal=f"短线{bullish}只看多候选，主线:{', '.join(t for t, _ in main_themes[:2]) or '无'}",
+        factors=factors, analysis="\n".join(lines),
+        output_data={
+            "market": market, "main_themes": main_themes,
+            "dragon_pullback": dp,
+            "candidates": [c for c in candidates[:15]],
+            "analyzed": analyzed,
+        },
+        tools_called=_tool_calls or [],
+        missing_data=_missing_data or [],
+        status="ok",
+    )
+
+
 # ═══════════════════════════════════════════════════════════════
-# 策略 2 — 尾盘隔夜（14:30-15:00）
+#  策略 2 — 尾盘隔夜 (14:30-15:00)
 # ═══════════════════════════════════════════════════════════════
 
 def _prescreen_eod(call_tool_fn) -> Dict[str, Any]:
-    """尾盘预筛选：条件选股 + Python 尾盘特征验证。"""
     screener_result = call_tool_fn(
         "search_stocks",
         query="涨幅3%到8% 换手率大于3% 非ST",
@@ -776,9 +959,7 @@ def _prescreen_eod(call_tool_fn) -> Dict[str, Any]:
     for s in hot_data.get("stocks", []):
         reason_map[s.get("code", "")] = s.get("reason", "")
 
-    main_tags = set()
-    for tag, _ in hot_tags[:5]:
-        main_tags.add(tag)
+    main_tags = {tag for tag, _ in hot_tags[:5]}
 
     candidates = []
     for s in raw_stocks:
@@ -917,10 +1098,7 @@ def _prescreen_eod(call_tool_fn) -> Dict[str, Any]:
     }
 
 
-def _deep_analyze_eod(
-    candidate: Dict, call_tool_fn, _tool_calls, _tool_nodes, _missing_data,
-) -> Optional[Dict]:
-    """尾盘 — 深入分析单只候选股，评估隔夜持仓价值。"""
+def _deep_analyze_eod(candidate, call_tool_fn, _tool_calls, _tool_nodes, _missing_data) -> Optional[Dict]:
     code = candidate["code"]
     try:
         snapshot = call_tool_fn("get_indicator_snapshot", stock_code=code)
@@ -949,7 +1127,6 @@ def _deep_analyze_eod(
                 value=f"DIF={macd.get('dif', '?')} DEA={macd.get('dea', '?')}",
                 score=65 if "金叉" in macd_sig else (35 if "死叉" in macd_sig else 50),
             ))
-
             kdj = snapshot.get("kdj", {})
             kdj_sigs = kdj.get("signals") or []
             if any("金叉" in s for s in kdj_sigs):
@@ -965,13 +1142,13 @@ def _deep_analyze_eod(
             main_net = fund_flow.get("main_net_inflow", 0) or 0
             if main_net > 0:
                 score += 6
-                signals.append(f"主力净流入{main_net/10000:.0f}万")
+                signals.append(f"主力净流入{main_net / 10000:.0f}万")
             elif main_net < -5000000:
                 score -= 4
-                signals.append(f"主力净流出{abs(main_net)/10000:.0f}万")
+                signals.append(f"主力净流出{abs(main_net) / 10000:.0f}万")
             factors.append(FactorItem(
                 name="资金流",
-                value=f"主力净流入={main_net/10000:.0f}万",
+                value=f"主力净流入={main_net / 10000:.0f}万",
                 score=65 if main_net > 0 else (35 if main_net < -5000000 else 50),
             ))
 
@@ -1007,12 +1184,109 @@ def _deep_analyze_eod(
         return None
 
 
+def _run_eod(call_tool_fn, _tool_calls, _tool_nodes, _missing_data):
+    try:
+        prescreen = _prescreen_eod(call_tool_fn)
+    except Exception as e:
+        logger.warning("[MktScreen] 尾盘预筛选失败: %s", e)
+        return None
+
+    candidates = prescreen["candidates"]
+    main_themes = prescreen["main_themes"]
+
+    logger.info("[MktScreen] 尾盘预筛选: 条件选股%d只, 尾盘封板%d只, 候选%d只",
+                prescreen["screener_count"], prescreen["zt_eod_count"], len(candidates))
+
+    if not candidates:
+        return SkillReport(
+            skill_name="market_screener", score=40.0, direction="neutral",
+            confidence=0.5, signal="今日无合适隔夜标的",
+            analysis=(
+                f"## 尾盘选股 — 无合适标的\n\n"
+                f"条件选股扫描 {prescreen['screener_count']} 只，"
+                f"尾盘封板 {prescreen['zt_eod_count']} 只，"
+                f"经尾盘特征验证后无合格标的。\n\n"
+                f"**建议：空仓过夜，等待明日机会。**"
+            ),
+            factors=[
+                FactorItem(name="条件选股", value=str(prescreen["screener_count"]), score=40),
+                FactorItem(name="尾盘封板", value=str(prescreen["zt_eod_count"]), score=50),
+            ],
+            status="ok",
+        )
+
+    analyzed = []
+    for c in candidates[:6]:
+        result = _deep_analyze_eod(c, call_tool_fn, _tool_calls, _tool_nodes, _missing_data)
+        if result:
+            analyzed.append(result)
+
+    if analyzed:
+        avg_score = sum(a["score"] for a in analyzed) / len(analyzed)
+        bullish = sum(1 for a in analyzed if a["direction"] == "bullish")
+    else:
+        avg_score = 50.0
+        bullish = 0
+
+    direction = "bullish" if avg_score >= 55 else ("bearish" if avg_score < 45 else "neutral")
+    confidence = min(0.85, 0.4 + len(analyzed) * 0.07)
+
+    factors = [
+        FactorItem(name="条件选股数", value=str(prescreen["screener_count"]), score=50),
+        FactorItem(name="尾盘封板", value=str(prescreen["zt_eod_count"]),
+                   score=min(100, prescreen["zt_eod_count"] * 25 + 30)),
+        FactorItem(name="主线题材", value=", ".join(t for t, _ in main_themes[:3]) or "无",
+                   score=70 if main_themes else 40),
+        FactorItem(name="候选标的", value=str(len(analyzed)), score=min(100, len(analyzed) * 15 + 20)),
+        FactorItem(name="看多比例", value=f"{bullish}/{len(analyzed)}", score=int(avg_score)),
+    ]
+
+    lines = [
+        "## 尾盘选股结果（隔夜持仓）",
+        f"条件选股: {prescreen['screener_count']}只 | 尾盘封板: {prescreen['zt_eod_count']}只 | 深入分析: {len(analyzed)}只",
+        f"主线题材: {', '.join(t for t, _ in main_themes[:5]) or '无明确主线'}",
+        "",
+    ]
+
+    eod_zt = [c for c in candidates if c.get("source") == "尾盘封板"]
+    if eod_zt:
+        lines.append("### 尾盘封板（最强信号）")
+        for s in eod_zt[:3]:
+            lines.append(f"- **{s['code']}** {s['name']} | 封板时间{s.get('zt_time', '')} | {s.get('reason', '')}")
+        lines.append("")
+
+    if analyzed:
+        lines.append("### 隔夜候选标的")
+        for a in analyzed:
+            risk = " ⚠️" + "、".join(a.get("risk_notes", [])) if a.get("risk_notes") else ""
+            lines.append(
+                f"- **{a['code']}** {a.get('name', '')} | 评分{a['score']:.0f} | {a['direction']} | "
+                f"涨幅{a.get('eod_data', {}).get('change_pct', 0):.1f}% | "
+                f"收盘距高{a.get('eod_data', {}).get('close_to_high', 0):.1f}% | "
+                f"{a['signal']}{risk}"
+            )
+
+    return SkillReport(
+        skill_name="market_screener", score=round(avg_score, 1),
+        direction=direction, confidence=confidence,
+        signal=f"隔夜{bullish}只看多，主线:{', '.join(t for t, _ in main_themes[:2]) or '无'}",
+        factors=factors, analysis="\n".join(lines),
+        output_data={
+            "main_themes": main_themes,
+            "candidates": [c for c in candidates[:15]],
+            "analyzed": analyzed,
+        },
+        tools_called=_tool_calls or [],
+        missing_data=_missing_data or [],
+        status="ok",
+    )
+
+
 # ═══════════════════════════════════════════════════════════════
-# 策略 3 — 盘后复盘（15:00+）
+#  策略 3 — 盘后复盘 (15:00+)
 # ═══════════════════════════════════════════════════════════════
 
 def _detect_platform_breakout(bars: List[Dict]) -> Optional[Dict]:
-    """平台突破：近5日振幅<8%，今日放量突破平台高点。"""
     if len(bars) < 10:
         return None
     recent = bars[-6:-1]
@@ -1030,17 +1304,14 @@ def _detect_platform_breakout(bars: List[Dict]) -> Optional[Dict]:
         vol_ratio = today["volume"] / (sum(b["volume"] for b in recent) / len(recent)) if sum(b["volume"] for b in recent) > 0 else 1
         if vol_ratio > 1.3:
             return {
-                "pattern": "平台突破",
-                "platform_high": round(platform_high, 2),
-                "range_pct": round(range_pct, 1),
-                "vol_ratio": round(vol_ratio, 2),
+                "pattern": "平台突破", "platform_high": round(platform_high, 2),
+                "range_pct": round(range_pct, 1), "vol_ratio": round(vol_ratio, 2),
                 "score": 75 if vol_ratio > 2 else 65,
             }
     return None
 
 
 def _detect_volume_reversal(bars: List[Dict]) -> Optional[Dict]:
-    """底部放量启动：连续缩量后今日放量阳线。"""
     if len(bars) < 10:
         return None
     recent = bars[-6:-1]
@@ -1057,8 +1328,7 @@ def _detect_volume_reversal(bars: List[Dict]) -> Optional[Dict]:
     if is_shrinking and is_surge and abs(period_change) < 5:
         vol_ratio = today["volume"] / avg_vol if avg_vol > 0 else 1
         return {
-            "pattern": "底部放量启动",
-            "vol_ratio": round(vol_ratio, 2),
+            "pattern": "底部放量启动", "vol_ratio": round(vol_ratio, 2),
             "period_change": round(period_change, 1),
             "score": 70 if vol_ratio > 2.5 else 60,
         }
@@ -1066,7 +1336,6 @@ def _detect_volume_reversal(bars: List[Dict]) -> Optional[Dict]:
 
 
 def _detect_ma_support_pullback(bars: List[Dict]) -> Optional[Dict]:
-    """均线支撑回踩：上升趋势中回踩MA10不破。"""
     if len(bars) < 20:
         return None
     closes = [b["close"] for b in bars]
@@ -1081,17 +1350,14 @@ def _detect_ma_support_pullback(bars: List[Dict]) -> Optional[Dict]:
     ma10_dist = abs(today["low"] - ma10[-1]) / ma10[-1] * 100
     if ma10_dist < 1.5 and today["close"] > ma10[-1]:
         return {
-            "pattern": "均线支撑回踩",
-            "ma10": round(ma10[-1], 2),
-            "low": round(today["low"], 2),
-            "distance_pct": round(ma10_dist, 2),
+            "pattern": "均线支撑回踩", "ma10": round(ma10[-1], 2),
+            "low": round(today["low"], 2), "distance_pct": round(ma10_dist, 2),
             "score": 68 if today["close"] > today["open"] else 58,
         }
     return None
 
 
 def _detect_macd_golden_cross(bars: List[Dict]) -> Optional[Dict]:
-    """MACD金叉：DIF上穿DEA。"""
     if len(bars) < 30:
         return None
     closes = [b["close"] for b in bars]
@@ -1102,17 +1368,13 @@ def _detect_macd_golden_cross(bars: List[Dict]) -> Optional[Dict]:
         is_underwater = dif[-1] < 0
         score = 72 if is_underwater else 62
         return {
-            "pattern": "MACD金叉",
-            "dif": round(dif[-1], 3),
-            "dea": round(dea[-1], 3),
-            "underwater": is_underwater,
-            "score": score,
+            "pattern": "MACD金叉", "dif": round(dif[-1], 3),
+            "dea": round(dea[-1], 3), "underwater": is_underwater, "score": score,
         }
     return None
 
 
 def _detect_shrink_pullback_breakout(bars: List[Dict]) -> Optional[Dict]:
-    """缩量回调后放量突破。"""
     if len(bars) < 15:
         return None
     recent_10 = bars[-11:-1]
@@ -1137,8 +1399,7 @@ def _detect_shrink_pullback_breakout(bars: List[Dict]) -> Optional[Dict]:
     is_volume_up = today["volume"] > avg_pullback_vol * 1.5
     if is_shrink and is_breakout and is_volume_up:
         return {
-            "pattern": "缩量回调放量突破",
-            "peak": round(peak_price, 2),
+            "pattern": "缩量回调放量突破", "peak": round(peak_price, 2),
             "pullback_pct": round(pullback_pct, 1),
             "vol_ratio": round(today["volume"] / avg_pullback_vol, 2) if avg_pullback_vol > 0 else 0,
             "score": 73,
@@ -1147,7 +1408,6 @@ def _detect_shrink_pullback_breakout(bars: List[Dict]) -> Optional[Dict]:
 
 
 def _detect_prev_high_breakout(bars: List[Dict]) -> Optional[Dict]:
-    """突破前高：收盘突破近20日最高价。"""
     if len(bars) < 20:
         return None
     today = bars[-1]
@@ -1158,17 +1418,14 @@ def _detect_prev_high_breakout(bars: List[Dict]) -> Optional[Dict]:
         vol_ratio = today["volume"] / vol_5 if vol_5 > 0 else 1
         if vol_ratio > 1.2:
             return {
-                "pattern": "突破前高",
-                "prev_high": round(prev_high, 2),
-                "close": round(today["close"], 2),
-                "vol_ratio": round(vol_ratio, 2),
+                "pattern": "突破前高", "prev_high": round(prev_high, 2),
+                "close": round(today["close"], 2), "vol_ratio": round(vol_ratio, 2),
                 "score": 70 if vol_ratio > 2 else 60,
             }
     return None
 
 
 def _prescreen_post_market(date: str) -> Dict[str, Any]:
-    """盘后全市场形态扫描。"""
     hot_data = _fetch_hot_stocks_with_reason(date)
     hot_stocks = hot_data.get("stocks", [])
     hot_tags = hot_data.get("hot_tags", [])
@@ -1194,8 +1451,7 @@ def _prescreen_post_market(date: str) -> Dict[str, Any]:
         code = str(s.get("code", "") or s.get("symbol", ""))
         if code and len(code) == 6 and code not in scan_pool:
             scan_pool[code] = {
-                "code": code,
-                "name": s.get("name", ""),
+                "code": code, "name": s.get("name", ""),
                 "change_pct": float(s.get("change_pct", 0) or s.get("pct_change", 0) or 0),
                 "turnover_pct": float(s.get("turnover_rate", 0) or 0),
                 "reason": "",
@@ -1285,18 +1541,12 @@ def _prescreen_post_market(date: str) -> Dict[str, Any]:
     candidates.sort(key=lambda x: -x["score"])
 
     return {
-        "date": date,
-        "scanned": scanned,
-        "pool_size": len(scan_pool),
-        "main_themes": main_themes,
-        "candidates": candidates[:20],
+        "date": date, "scanned": scanned, "pool_size": len(scan_pool),
+        "main_themes": main_themes, "candidates": candidates[:20],
     }
 
 
-def _deep_analyze_post_market(
-    candidate: Dict, call_tool_fn, _tool_calls, _tool_nodes, _missing_data,
-) -> Optional[Dict]:
-    """盘后 — 深入分析，评估次日介入价值。"""
+def _deep_analyze_post_market(candidate, call_tool_fn, _tool_calls, _tool_nodes, _missing_data) -> Optional[Dict]:
     code = candidate["code"]
     try:
         snapshot = call_tool_fn("get_indicator_snapshot", stock_code=code)
@@ -1325,7 +1575,6 @@ def _deep_analyze_post_market(
                 value=f"DIF={macd_data.get('dif', '?')} DEA={macd_data.get('dea', '?')}",
                 score=65 if "金叉" in macd_sig else (35 if "死叉" in macd_sig else 50),
             ))
-
             boll = snapshot.get("boll", {})
             if boll:
                 factors.append(FactorItem(
@@ -1395,488 +1644,106 @@ def _deep_analyze_post_market(
         return None
 
 
-# ═══════════════════════════════════════════════════════════════
-# 策略选择 — 按时间自动调度
-# ═══════════════════════════════════════════════════════════════
+def _run_post_market(date, call_tool_fn, _tool_calls, _tool_nodes, _missing_data):
+    try:
+        prescreen = _prescreen_post_market(date)
+    except Exception as e:
+        logger.warning("[MktScreen] 盘后形态扫描失败: %s", e)
+        return None
 
-def _select_strategy() -> str:
-    """根据当前时间返回策略名称: intraday / eod / post_market。"""
-    now = datetime.now()
-    h, m = now.hour, now.minute
-    # 非交易时间(周末/节假日) → 盘后
-    if now.weekday() >= 5:
-        return "post_market"
-    # 盘前 / 盘后 → 盘后
-    if h < 9 or (h == 9 and m < 30) or h >= 15:
-        return "post_market"
-    # 尾盘
-    if h >= 14 and m >= 30:
-        return "eod"
-    # 盘中
-    return "intraday"
+    candidates = prescreen["candidates"]
+    main_themes = prescreen["main_themes"]
 
+    logger.info("[MktScreen] 盘后扫描: 池%d只, 扫描%d只, 候选%d只",
+                prescreen["pool_size"], prescreen["scanned"], len(candidates))
 
-# ═══════════════════════════════════════════════════════════════
-# Skill 定义
-# ═══════════════════════════════════════════════════════════════
-
-class MarketScreenerSkill:
-    """A股选股（盘中/尾盘/盘后三合一，按时间自动切换）。"""
-
-    def algo_analyze(
-        self,
-        stock_code: str,
-        stock_name: str,
-        tool_results: Dict[str, Any],
-        **kwargs,
-    ) -> Optional[SkillReport]:
-        """Phase 1: Python 预筛选（0 token）+ Phase 2: 候选股深入分析。"""
-        call_tool_fn = kwargs.get("call_tool_fn")
-        _tool_calls = kwargs.get("_tool_calls", [])
-        _tool_nodes = kwargs.get("_tool_nodes", [])
-        _missing_data = kwargs.get("_missing_data", [])
-
-        strategy = _select_strategy()
-        date = _today_str()
-
-        logger.info("[MktScreen] 当前策略: %s", strategy)
-
-        if strategy == "intraday":
-            return self._run_intraday(
-                date, call_tool_fn, _tool_calls, _tool_nodes, _missing_data,
-            )
-        elif strategy == "eod":
-            return self._run_eod(
-                call_tool_fn, _tool_calls, _tool_nodes, _missing_data,
-            )
-        else:
-            return self._run_post_market(
-                date, call_tool_fn, _tool_calls, _tool_nodes, _missing_data,
-            )
-
-    # ── 盘中策略 ──
-
-    def _run_intraday(self, date, call_tool_fn, _tool_calls, _tool_nodes, _missing_data):
-        try:
-            prescreen = _prescreen_intraday(date)
-        except Exception as e:
-            logger.warning("[MktScreen] 盘中预筛选失败: %s", e)
-            return None
-
-        market = prescreen["market"]
-        main_themes = prescreen["main_themes"]
-        candidates = prescreen["candidates"]
-
-        logger.info(
-            "[MktScreen] 盘中预筛选: 涨停%d 跌停%d 候选%d只",
-            market["zt_count"], market["dt_count"], len(candidates),
-        )
-
-        if market["mood_score"] < 30:
-            return SkillReport(
-                skill_name=self.name, score=25.0, direction="bearish",
-                confidence=0.7,
-                signal=f"市场冰点（涨停{market['zt_count']}跌停{market['dt_count']}），不宜短线",
-                analysis=(
-                    f"## 盘中短线选股 — 市场冰点\n\n"
-                    f"涨停 {market['zt_count']} 只，跌停 {market['dt_count']} 只，"
-                    f"炸板率 {market['broken_rate']}%。\n\n"
-                    f"**建议：空仓观望，等待情绪回暖。**"
-                ),
-                factors=[
-                    FactorItem(name="涨停数", value=str(market["zt_count"]), score=market["mood_score"]),
-                    FactorItem(name="跌停数", value=str(market["dt_count"]), score=max(0, 100 - market["dt_count"] * 3)),
-                    FactorItem(name="炸板率", value=f"{market['broken_rate']}%", score=max(0, 100 - int(market["broken_rate"]))),
-                ],
-                status="ok",
-            )
-
-        if not candidates:
-            return SkillReport(
-                skill_name=self.name, score=45.0, direction="neutral",
-                confidence=0.5, signal="今日无明确短线标的",
-                analysis=(
-                    f"## 盘中短线选股 — 无明确标的\n\n"
-                    f"市场情绪：{market['mood']}（涨停{market['zt_count']}跌停{market['dt_count']}）\n"
-                    f"今日无连板股或主线题材强势股进入候选池。"
-                ),
-                factors=[
-                    FactorItem(name="市场情绪", value=market["mood"], score=market["mood_score"]),
-                ],
-                status="ok",
-            )
-
-        tech_results = {}
-        for c in candidates[:15]:
-            tech = _tech_check(c["code"])
-            if tech:
-                tech_results[c["code"]] = tech
-
-        analyzed = []
-        for c in candidates[:8]:
-            tech = tech_results.get(c["code"])
-            result = _deep_analyze_intraday(
-                c, tech, call_tool_fn, _tool_calls, _tool_nodes, _missing_data,
-            )
-            if result:
-                analyzed.append(result)
-
-        if analyzed:
-            avg_score = sum(a["score"] for a in analyzed) / len(analyzed)
-            bullish = sum(1 for a in analyzed if a["direction"] == "bullish")
-        else:
-            avg_score = 50.0
-            bullish = 0
-
-        direction = "bullish" if avg_score >= 55 else ("bearish" if avg_score < 45 else "neutral")
-        confidence = min(0.9, 0.4 + len(analyzed) * 0.06)
-
-        factors = [
-            FactorItem(name="市场情绪", value=market["mood"], score=market["mood_score"]),
-            FactorItem(name="涨停/跌停", value=f"{market['zt_count']}/{market['dt_count']}", score=market["mood_score"]),
-            FactorItem(name="候选股数", value=str(len(candidates)), score=min(100, len(candidates) * 8 + 30)),
-            FactorItem(name="主线题材", value=", ".join(t for t, _ in main_themes[:3]) or "无", score=70 if main_themes else 40),
-            FactorItem(name="深入分析数", value=str(len(analyzed)), score=min(100, len(analyzed) * 12 + 20)),
-            FactorItem(name="看多比例", value=f"{bullish}/{len(analyzed) or len(candidates)}", score=int(avg_score)),
-        ]
-
-        lines = [
-            f"## 盘中短线选股结果",
-            f"市场情绪: {market['mood']} | 涨停{market['zt_count']} 跌停{market['dt_count']} 炸板率{market['broken_rate']}%",
-            f"主线题材: {', '.join(t for t, _ in main_themes[:5]) or '无明确主线'}",
-            f"候选: {len(candidates)}只 | 深入分析: {len(analyzed)}只 | 综合评分: {avg_score:.0f}",
-            "",
-        ]
-
-        cb = prescreen.get("continuous_board", [])
-        if cb:
-            lines.append("### 连板龙头")
-            for s in cb[:5]:
-                lines.append(
-                    f"- **{s['code']}** {s['name']} | "
-                    f"{s['continuous_days']}连板 | 涨停时间{s['zt_time']} | {s['reason']}"
-                )
-            lines.append("")
-
-        dp = prescreen.get("dragon_pullback", [])
-        if dp:
-            lines.append("### 龙回头弱转强")
-            for s in dp[:5]:
-                sig_str = ", ".join(s["signals"][:4])
-                lines.append(
-                    f"- **{s['code']}** {s['name']} | "
-                    f"前期{s['max_continuous_days']}连板 | "
-                    f"回调{s['pullback_pct']}% | "
-                    f"弱转强信号: {sig_str}"
-                )
-            lines.append("")
-
-        lines.append("### 候选标的")
-        for a in analyzed:
-            src = a.get("source", "")
-            lines.append(
-                f"- **{a['code']}** {a.get('name', '')} | "
-                f"评分{a['score']:.0f} | {a['direction']} | "
-                f"来源:{src} | {a['signal']}"
-            )
-
+    if not candidates:
         return SkillReport(
-            skill_name=self.name, score=round(avg_score, 1),
-            direction=direction, confidence=confidence,
-            signal=f"短线{bullish}只看多候选，主线:{', '.join(t for t, _ in main_themes[:2]) or '无'}",
-            factors=factors, analysis="\n".join(lines),
-            output_data={
-                "market": market, "main_themes": main_themes,
-                "dragon_pullback": dp,
-                "candidates": [c for c in candidates[:15]],
-                "analyzed": analyzed,
-            },
-            tools_called=_tool_calls or [],
-            missing_data=_missing_data or [],
+            skill_name="market_screener", score=40.0, direction="neutral",
+            confidence=0.5, signal="今日无符合形态的短线标的",
+            analysis=(
+                "## 盘后短线选股 — 无合适标的\n\n"
+                f"扫描 {prescreen['scanned']} 只股票，"
+                f"未发现符合技术形态条件的标的。\n\n"
+                "**建议：观望等待更好的形态出现。**"
+            ),
+            factors=[
+                FactorItem(name="扫描数", value=str(prescreen["scanned"]), score=50),
+                FactorItem(name="主线题材", value=", ".join(t for t, _ in main_themes[:3]) or "无", score=50),
+            ],
             status="ok",
         )
 
-    # ── 尾盘策略 ──
+    analyzed = []
+    for c in candidates[:6]:
+        result = _deep_analyze_post_market(c, call_tool_fn, _tool_calls, _tool_nodes, _missing_data)
+        if result:
+            analyzed.append(result)
 
-    def _run_eod(self, call_tool_fn, _tool_calls, _tool_nodes, _missing_data):
-        try:
-            prescreen = _prescreen_eod(call_tool_fn)
-        except Exception as e:
-            logger.warning("[MktScreen] 尾盘预筛选失败: %s", e)
-            return None
-
-        candidates = prescreen["candidates"]
-        main_themes = prescreen["main_themes"]
-
-        logger.info("[MktScreen] 尾盘预筛选: 条件选股%d只, 尾盘封板%d只, 候选%d只",
-                     prescreen["screener_count"], prescreen["zt_eod_count"], len(candidates))
-
-        if not candidates:
-            return SkillReport(
-                skill_name=self.name, score=40.0, direction="neutral",
-                confidence=0.5, signal="今日无合适隔夜标的",
-                analysis=(
-                    f"## 尾盘选股 — 无合适标的\n\n"
-                    f"条件选股扫描 {prescreen['screener_count']} 只，"
-                    f"尾盘封板 {prescreen['zt_eod_count']} 只，"
-                    f"经尾盘特征验证后无合格标的。\n\n"
-                    f"**建议：空仓过夜，等待明日机会。**"
-                ),
-                factors=[
-                    FactorItem(name="条件选股", value=str(prescreen["screener_count"]), score=40),
-                    FactorItem(name="尾盘封板", value=str(prescreen["zt_eod_count"]), score=50),
-                ],
-                status="ok",
-            )
-
-        analyzed = []
-        for c in candidates[:6]:
-            result = _deep_analyze_eod(c, call_tool_fn, _tool_calls, _tool_nodes, _missing_data)
-            if result:
-                analyzed.append(result)
-
-        if analyzed:
-            avg_score = sum(a["score"] for a in analyzed) / len(analyzed)
-            bullish = sum(1 for a in analyzed if a["direction"] == "bullish")
-        else:
-            avg_score = 50.0
-            bullish = 0
-
-        direction = "bullish" if avg_score >= 55 else ("bearish" if avg_score < 45 else "neutral")
-        confidence = min(0.85, 0.4 + len(analyzed) * 0.07)
-
-        factors = [
-            FactorItem(name="条件选股数", value=str(prescreen["screener_count"]), score=50),
-            FactorItem(name="尾盘封板", value=str(prescreen["zt_eod_count"]),
-                       score=min(100, prescreen["zt_eod_count"] * 25 + 30)),
-            FactorItem(name="主线题材", value=", ".join(t for t, _ in main_themes[:3]) or "无",
-                       score=70 if main_themes else 40),
-            FactorItem(name="候选标的", value=str(len(analyzed)), score=min(100, len(analyzed) * 15 + 20)),
-            FactorItem(name="看多比例", value=f"{bullish}/{len(analyzed)}", score=int(avg_score)),
-        ]
-
-        lines = [
-            f"## 尾盘选股结果（隔夜持仓）",
-            f"条件选股: {prescreen['screener_count']}只 | 尾盘封板: {prescreen['zt_eod_count']}只 | 深入分析: {len(analyzed)}只",
-            f"主线题材: {', '.join(t for t, _ in main_themes[:5]) or '无明确主线'}",
-            "",
-        ]
-
-        eod_zt = [c for c in candidates if c.get("source") == "尾盘封板"]
-        if eod_zt:
-            lines.append("### 尾盘封板（最强信号）")
-            for s in eod_zt[:3]:
-                lines.append(
-                    f"- **{s['code']}** {s['name']} | "
-                    f"封板时间{s.get('zt_time', '')} | {s.get('reason', '')}"
-                )
-            lines.append("")
-
-        if analyzed:
-            lines.append("### 隔夜候选标的")
-            for a in analyzed:
-                risk = " ⚠️" + "、".join(a.get("risk_notes", [])) if a.get("risk_notes") else ""
-                lines.append(
-                    f"- **{a['code']}** {a.get('name', '')} | "
-                    f"评分{a['score']:.0f} | {a['direction']} | "
-                    f"涨幅{a.get('eod_data', {}).get('change_pct', 0):.1f}% | "
-                    f"收盘距高{a.get('eod_data', {}).get('close_to_high', 0):.1f}% | "
-                    f"{a['signal']}{risk}"
-                )
-
-        return SkillReport(
-            skill_name=self.name, score=round(avg_score, 1),
-            direction=direction, confidence=confidence,
-            signal=f"隔夜{bullish}只看多，主线:{', '.join(t for t, _ in main_themes[:2]) or '无'}",
-            factors=factors, analysis="\n".join(lines),
-            output_data={
-                "main_themes": main_themes,
-                "candidates": [c for c in candidates[:15]],
-                "analyzed": analyzed,
-            },
-            tools_called=_tool_calls or [],
-            missing_data=_missing_data or [],
-            status="ok",
-        )
-
-    # ── 盘后策略 ──
-
-    def _run_post_market(self, date, call_tool_fn, _tool_calls, _tool_nodes, _missing_data):
-        try:
-            prescreen = _prescreen_post_market(date)
-        except Exception as e:
-            logger.warning("[MktScreen] 盘后形态扫描失败: %s", e)
-            return None
-
-        candidates = prescreen["candidates"]
-        main_themes = prescreen["main_themes"]
-
-        logger.info("[MktScreen] 盘后扫描: 池%d只, 扫描%d只, 候选%d只",
-                     prescreen["pool_size"], prescreen["scanned"], len(candidates))
-
-        if not candidates:
-            return SkillReport(
-                skill_name=self.name, score=40.0, direction="neutral",
-                confidence=0.5, signal="今日无符合形态的短线标的",
-                analysis=(
-                    f"## 盘后短线选股 — 无合适标的\n\n"
-                    f"扫描 {prescreen['scanned']} 只股票，"
-                    f"未发现符合技术形态条件的标的。\n\n"
-                    f"**建议：观望等待更好的形态出现。**"
-                ),
-                factors=[
-                    FactorItem(name="扫描数", value=str(prescreen["scanned"]), score=50),
-                    FactorItem(name="主线题材", value=", ".join(t for t, _ in main_themes[:3]) or "无", score=50),
-                ],
-                status="ok",
-            )
-
-        analyzed = []
-        for c in candidates[:6]:
-            result = _deep_analyze_post_market(c, call_tool_fn, _tool_calls, _tool_nodes, _missing_data)
-            if result:
-                analyzed.append(result)
-
-        if analyzed:
-            avg_score = sum(a["score"] for a in analyzed) / len(analyzed)
-            bullish = sum(1 for a in analyzed if a["direction"] == "bullish")
-        else:
-            avg_score = 50.0
-            bullish = 0
-
-        direction = "bullish" if avg_score >= 55 else ("bearish" if avg_score < 45 else "neutral")
-        confidence = min(0.85, 0.4 + len(analyzed) * 0.07)
-
-        factors = [
-            FactorItem(name="扫描池", value=str(prescreen["pool_size"]), score=50),
-            FactorItem(name="形态命中", value=str(len(candidates)), score=min(100, len(candidates) * 12 + 20)),
-            FactorItem(name="主线题材", value=", ".join(t for t, _ in main_themes[:3]) or "无",
-                       score=70 if main_themes else 40),
-            FactorItem(name="深入分析", value=str(len(analyzed)), score=min(100, len(analyzed) * 15 + 20)),
-            FactorItem(name="看多比例", value=f"{bullish}/{len(analyzed)}", score=int(avg_score)),
-        ]
-
-        lines = [
-            f"## 盘后短线选股结果",
-            f"扫描池: {prescreen['pool_size']}只 | 形态命中: {len(candidates)}只 | 深入分析: {len(analyzed)}只",
-            f"主线题材: {', '.join(t for t, _ in main_themes[:5]) or '无明确主线'}",
-            "",
-        ]
-
-        pattern_counter: Counter = Counter()
-        for c in candidates:
-            for p in c.get("pattern_names", []):
-                pattern_counter[p] += 1
-        if pattern_counter:
-            lines.append("### 形态分布")
-            for p, cnt in pattern_counter.most_common(6):
-                lines.append(f"- {p}: {cnt}只")
-            lines.append("")
-
-        if analyzed:
-            lines.append("### 次日候选标的")
-            for a in analyzed:
-                risk = " ⚠️" + "、".join(a.get("risk_notes", [])) if a.get("risk_notes") else ""
-                entry = a.get("entry", {})
-                lines.append(
-                    f"- **{a['code']}** {a.get('name', '')} | "
-                    f"评分{a['score']:.0f} | {a['direction']} | "
-                    f"形态:{','.join(a.get('patterns', []))} | "
-                    f"{a['signal']}{risk}"
-                )
-                lines.append(
-                    f"  入场:{entry.get('price_low', '?')}-{entry.get('price_high', '?')} | "
-                    f"止损:{entry.get('stop_loss', '?')} | "
-                    f"目标:{entry.get('target_1', '?')}/{entry.get('target_2', '?')} | "
-                    f"盈亏比:{entry.get('risk_reward', '?')}"
-                )
-
-        return SkillReport(
-            skill_name=self.name, score=round(avg_score, 1),
-            direction=direction, confidence=confidence,
-            signal=f"盘后{len(analyzed)}只候选，主线:{', '.join(t for t, _ in main_themes[:2]) or '无'}",
-            factors=factors, analysis="\n".join(lines),
-            output_data={
-                "main_themes": main_themes,
-                "pattern_distribution": dict(pattern_counter),
-                "candidates": [c for c in candidates[:15]],
-                "analyzed": analyzed,
-            },
-            tools_called=_tool_calls or [],
-            missing_data=_missing_data or [],
-            status="ok",
-        )
-
-
-# -*- coding: utf-8 -*-
-"""全市场短线选股 — 自动选择盘中/盘后/收盘策略进行市场筛选。"""
-
-def market_screen(stock_code: str = "", stock_name: str = "") -> dict:
-    """全市场短线选股，根据当前时间自动切换策略并返回筛选结果。
-
-    策略自动调度规则：
-      - 盘中 (09:30-14:29): 涨停池连板 + 热门板块龙头 + 题材归因 + 龙回头弱转强
-      - 尾盘 (14:30-15:00): 条件初筛 + 尾盘特征验证 + 尾盘封板 + 隔夜持仓评估
-      - 盘后 (15:00+/非交易日): 全市场技术形态扫描 + 介入点计算 + 次日计划
-
-    执行流程（两阶段）：
-      Phase 1 — Python 预筛选（0 token，不消耗模型调用）：从涨停池、强势股、热门板块等
-                数据源获取原始数据，按策略规则筛选候选标的。
-      Phase 2 — 对候选股逐只调用工具做深入分析（资金流向、技术指标快照等），
-                计算综合评分并生成操作建议。
-
-    Args:
-        stock_code: 股票代码（本技能为全市场扫描，此参数通常留空）
-        stock_name: 股票名称（本技能为全市场扫描，此参数通常留空）
-
-    Returns:
-        dict: 包含以下字段的结果字典 —
-            - skill (str): 技能名称 "market_screener"
-            - score (float): 综合评分 0-100
-            - direction (str): 方向判断 "bullish" / "neutral" / "bearish"
-            - signal (str): 核心信号摘要
-            - analysis (str): 完整分析报告（Markdown 格式）
-            - confidence (float): 置信度 0-1
-            - factors (list): 评分因子列表
-            - status (str): 执行状态 "ok" / "failed"
-            - output_data (dict): 结构化输出（市场概况、主线题材、候选标的等）
-
-    使用场景：
-        当用户询问"今天买什么"、"盘后复盘选股"、"尾盘隔夜选什么"等
-        全市场短线选股相关问题时调用此工具。无需传入具体股票代码。
-    """
-    from app.agent.tools import registry as tool_registry
-    tool_registry.discover()
-
-    def call_tool_fn(tool_name, **kwargs):
-        spec = tool_registry.get(tool_name)
-        if not spec: raise ValueError(f"Unknown tool: {tool_name}")
-        return spec.fn(**kwargs)
-
-    from datetime import date
-
-    strategy = _select_strategy()
-    today = date.today().isoformat()
-
-    if strategy == "intraday":
-        report = _run_intraday("market_screener", today, call_tool_fn, [], [], [])
-    elif strategy == "eod":
-        report = _run_eod("market_screener", call_tool_fn, [], [], [])
+    if analyzed:
+        avg_score = sum(a["score"] for a in analyzed) / len(analyzed)
+        bullish = sum(1 for a in analyzed if a["direction"] == "bullish")
     else:
-        report = _run_post_market("market_screener", today, call_tool_fn, [], [], [])
+        avg_score = 50.0
+        bullish = 0
 
-    if report is None:
-        return {"skill": "market_screener", "status": "failed", "error": "策略执行失败", "score": 0, "direction": "neutral", "confidence": 0, "factors": []}
-    if hasattr(report, "to_dict"):
-        d = report.to_dict()
-        d.setdefault("skill", "market_screener")
-        return d
-    if isinstance(report, dict):
-        report.setdefault("skill", "market_screener")
-        return report
-    return {"skill": "market_screener", "score": getattr(report, "score", 50),
-            "direction": getattr(report, "direction", "neutral"),
-            "signal": getattr(report, "signal", ""),
-            "analysis": str(getattr(report, "analysis", ""))[:2000],
-            "status": getattr(report, "status", "ok"), "confidence": 0.5, "factors": []}
+    direction = "bullish" if avg_score >= 55 else ("bearish" if avg_score < 45 else "neutral")
+    confidence = min(0.85, 0.4 + len(analyzed) * 0.07)
 
+    factors = [
+        FactorItem(name="扫描池", value=str(prescreen["pool_size"]), score=50),
+        FactorItem(name="形态命中", value=str(len(candidates)), score=min(100, len(candidates) * 12 + 20)),
+        FactorItem(name="主线题材", value=", ".join(t for t, _ in main_themes[:3]) or "无",
+                   score=70 if main_themes else 40),
+        FactorItem(name="深入分析", value=str(len(analyzed)), score=min(100, len(analyzed) * 15 + 20)),
+        FactorItem(name="看多比例", value=f"{bullish}/{len(analyzed)}", score=int(avg_score)),
+    ]
+
+    lines = [
+        "## 盘后短线选股结果",
+        f"扫描池: {prescreen['pool_size']}只 | 形态命中: {len(candidates)}只 | 深入分析: {len(analyzed)}只",
+        f"主线题材: {', '.join(t for t, _ in main_themes[:5]) or '无明确主线'}",
+        "",
+    ]
+
+    pattern_counter: Counter = Counter()
+    for c in candidates:
+        for p in c.get("pattern_names", []):
+            pattern_counter[p] += 1
+    if pattern_counter:
+        lines.append("### 形态分布")
+        for p, cnt in pattern_counter.most_common(6):
+            lines.append(f"- {p}: {cnt}只")
+        lines.append("")
+
+    if analyzed:
+        lines.append("### 次日候选标的")
+        for a in analyzed:
+            risk = " ⚠️" + "、".join(a.get("risk_notes", [])) if a.get("risk_notes") else ""
+            entry = a.get("entry", {})
+            lines.append(
+                f"- **{a['code']}** {a.get('name', '')} | 评分{a['score']:.0f} | {a['direction']} | "
+                f"形态:{','.join(a.get('patterns', []))} | {a['signal']}{risk}"
+            )
+            lines.append(
+                f"  入场:{entry.get('price_low', '?')}-{entry.get('price_high', '?')} | "
+                f"止损:{entry.get('stop_loss', '?')} | "
+                f"目标:{entry.get('target_1', '?')}/{entry.get('target_2', '?')} | "
+                f"盈亏比:{entry.get('risk_reward', '?')}"
+            )
+
+    return SkillReport(
+        skill_name="market_screener", score=round(avg_score, 1),
+        direction=direction, confidence=confidence,
+        signal=f"盘后{len(analyzed)}只候选，主线:{', '.join(t for t, _ in main_themes[:2]) or '无'}",
+        factors=factors, analysis="\n".join(lines),
+        output_data={
+            "main_themes": main_themes,
+            "pattern_distribution": dict(pattern_counter),
+            "candidates": [c for c in candidates[:15]],
+            "analyzed": analyzed,
+        },
+        tools_called=_tool_calls or [],
+        missing_data=_missing_data or [],
+        status="ok",
+    )

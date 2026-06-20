@@ -46,12 +46,11 @@ def _print_agent_info():
     try:
         from app.agent.tools import registry as tool_registry
         tool_registry.discover()
-        categories = tool_registry.categories
         total = len(tool_registry)
-        for cat, names in categories.items():
-            print(f"\n  [{cat}] ({len(names)} tools)")
-            for name in names:
-                print(f"    - {name}")
+        for name in sorted(tool_registry._tools.keys()):
+            spec = tool_registry.get(name)
+            desc = spec.description[:60] if spec else ""
+            print(f"    - {name}: {desc}")
         print(f"\n  总计: {total} 个工具")
     except Exception as e:
         print(f"\n  [!] 工具加载失败: {e}")

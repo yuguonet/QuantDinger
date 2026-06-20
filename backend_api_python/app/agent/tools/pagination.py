@@ -357,7 +357,7 @@ def paginated(
     page_size: int = 20,
     data_key: str = "",
     auto_key: bool = True,
-):
+) -> Callable:
     """装饰器：自动为工具函数添加分页支持。
 
     被装饰的函数照常返回完整数据，装饰器自动：

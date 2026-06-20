@@ -346,7 +346,7 @@ class Planner:
                 seen.add(agent)
                 deduped.append(step)
         plan_data["steps"] = deduped
-
+''''
         # 必选 Skill 检查
         selected = {s.get("agent", "") for s in plan_data["steps"]}
         missing_required = REQUIRED_SKILLS - selected
@@ -355,7 +355,7 @@ class Planner:
             for skill in reversed(sorted(missing_required)):
                 plan_data["steps"].insert(0, {"agent": skill})
                 logger.info("[Planner] 自动补充必选 Skill: %s", skill)
-
+'''
         # 新架构：从 agent/skills/*/SKILL.md 校验 Skill 是否存在
         from app.agent.semantics import get_all_skill_metas
         known_skills = set(get_all_skill_metas().keys())

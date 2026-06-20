@@ -1,14 +1,4 @@
 # -*- coding: utf-8 -*-
-"""全市场短线选股 — 自动选择盘中/盘后/收盘策略进行市场筛选。"""
-from __future__ import annotations
-
-import logging
-from collections import Counter
-from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, List, Optional
-from app.agent.tools.screener_tools import search_stocks
-
-# -*- coding: utf-8 -*-
 """
 Market Screener Skill — A股选股（盘中/尾盘/盘后统一入口，按时间自动切换策略）。
 
@@ -34,6 +24,7 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
 from app.agent.chain.schema import FactorItem, SkillReport
+from app.agent.skills.registry import skill
 
 logger = logging.getLogger(__name__)
 
@@ -1176,6 +1167,7 @@ def _prescreen_post_market(date: str) -> Dict[str, Any]:
     main_themes = [(tag, cnt) for tag, cnt in hot_tags[:5]]
 
     try:
+        from app.agent.tools.screening_tools import search_stocks
         screener_result = search_stocks(
             query="涨幅1%到8% 换手率大于2% 非ST",
             source="eastmoney",
@@ -1420,6 +1412,7 @@ def _select_strategy() -> str:
 # Skill 定义
 # ═══════════════════════════════════════════════════════════════
 
+@skill("market_screener", auto_load=True)
 class MarketScreenerSkill:
     """A股选股（盘中/尾盘/盘后三合一，按时间自动切换）。"""
 
@@ -1806,77 +1799,3 @@ class MarketScreenerSkill:
             missing_data=_missing_data or [],
             status="ok",
         )
-
-
-# -*- coding: utf-8 -*-
-"""全市场短线选股 — 自动选择盘中/盘后/收盘策略进行市场筛选。"""
-
-def market_screen(stock_code: str = "", stock_name: str = "") -> dict:
-    """全市场短线选股，根据当前时间自动切换策略并返回筛选结果。
-
-    策略自动调度规则：
-      - 盘中 (09:30-14:29): 涨停池连板 + 热门板块龙头 + 题材归因 + 龙回头弱转强
-      - 尾盘 (14:30-15:00): 条件初筛 + 尾盘特征验证 + 尾盘封板 + 隔夜持仓评估
-      - 盘后 (15:00+/非交易日): 全市场技术形态扫描 + 介入点计算 + 次日计划
-
-    执行流程（两阶段）：
-      Phase 1 — Python 预筛选（0 token，不消耗模型调用）：从涨停池、强势股、热门板块等
-                数据源获取原始数据，按策略规则筛选候选标的。
-      Phase 2 — 对候选股逐只调用工具做深入分析（资金流向、技术指标快照等），
-                计算综合评分并生成操作建议。
-
-    Args:
-        stock_code: 股票代码（本技能为全市场扫描，此参数通常留空）
-        stock_name: 股票名称（本技能为全市场扫描，此参数通常留空）
-
-    Returns:
-        dict: 包含以下字段的结果字典 —
-            - skill (str): 技能名称 "market_screener"
-            - score (float): 综合评分 0-100
-            - direction (str): 方向判断 "bullish" / "neutral" / "bearish"
-            - signal (str): 核心信号摘要
-            - analysis (str): 完整分析报告（Markdown 格式）
-            - confidence (float): 置信度 0-1
-            - factors (list): 评分因子列表
-            - status (str): 执行状态 "ok" / "failed"
-            - output_data (dict): 结构化输出（市场概况、主线题材、候选标的等）
-
-    使用场景：
-        当用户询问"今天买什么"、"盘后复盘选股"、"尾盘隔夜选什么"等
-        全市场短线选股相关问题时调用此工具。无需传入具体股票代码。
-    """
-    from app.agent.tools import registry as tool_registry
-    tool_registry.discover()
-
-    def call_tool_fn(tool_name, **kwargs):
-        spec = tool_registry.get(tool_name)
-        if not spec: raise ValueError(f"Unknown tool: {tool_name}")
-        return spec.fn(**kwargs)
-
-    from datetime import date
-
-    strategy = _select_strategy()
-    today = date.today().isoformat()
-
-    if strategy == "intraday":
-        report = _run_intraday("market_screener", today, call_tool_fn, [], [], [])
-    elif strategy == "eod":
-        report = _run_eod("market_screener", call_tool_fn, [], [], [])
-    else:
-        report = _run_post_market("market_screener", today, call_tool_fn, [], [], [])
-
-    if report is None:
-        return {"skill": "market_screener", "status": "failed", "error": "策略执行失败", "score": 0, "direction": "neutral", "confidence": 0, "factors": []}
-    if hasattr(report, "to_dict"):
-        d = report.to_dict()
-        d.setdefault("skill", "market_screener")
-        return d
-    if isinstance(report, dict):
-        report.setdefault("skill", "market_screener")
-        return report
-    return {"skill": "market_screener", "score": getattr(report, "score", 50),
-            "direction": getattr(report, "direction", "neutral"),
-            "signal": getattr(report, "signal", ""),
-            "analysis": str(getattr(report, "analysis", ""))[:2000],
-            "status": getattr(report, "status", "ok"), "confidence": 0.5, "factors": []}
-
