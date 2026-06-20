@@ -102,15 +102,31 @@ def _build_result(items: List[Dict[str, Any]], label: str) -> Dict[str, Any]:
     }
 
 
-def search_stock_intel(stock_code: str, name: str = "") -> Dict[str, Any]:
-    """搜索个股情报（新闻、公告、研报）。
+def search_stock_intel(codes: str, name: str = "") -> Dict[str, Any]:
+    """搜索个股情报（新闻、公告、研报），支持多股批量获取。
 
     Args:
-        stock_code: 股票代码，如 "600519"
+        codes: 逗号分隔的股票代码，如 "600519" 或 "600519,000001"
         name: 股票名称，如 "贵州茅台"
     """
-    items = _get_news(stock_code, "CNStock", name)
-    return _build_result(items, f"个股:{stock_code}")
+    code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
+    if not code_list:
+        return {"error": "codes 不能为空", "retriable": False}
+
+    def _one(stock_code: str) -> Dict[str, Any]:
+        items = _get_news(stock_code, "CNStock", name)
+        return _build_result(items, f"个股:{stock_code}")
+
+    if len(code_list) == 1:
+        return _one(code_list[0])
+
+    results = {}
+    for code in code_list:
+        try:
+            results[code] = _one(code)
+        except Exception as e:
+            results[code] = {"error": str(e)}
+    return {"count": len(results), "data": results}
 
 
 def search_sector_intel(market: str = "CNStock") -> Dict[str, Any]:
@@ -133,23 +149,38 @@ def search_policy_intel(market: str = "CNStock") -> Dict[str, Any]:
     return _build_result(items, f"政策:{market}")
 
 
-def search_comprehensive_intel(stock_code: str, name: str = "") -> Dict[str, Any]:
-    """综合情报搜索（个股+板块+政策）。
+def search_comprehensive_intel(codes: str, name: str = "") -> Dict[str, Any]:
+    """综合情报搜索（个股+板块+政策），支持多股批量获取。
 
     Args:
-        stock_code: 股票代码，如 "600519"
+        codes: 逗号分隔的股票代码，如 "600519" 或 "600519,000001"
         name: 股票名称，如 "贵州茅台"
     """
-    stock_items = _get_news(stock_code, "CNStock", name)
-    policy_items = _get_policy_from_cache()
+    code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
+    if not code_list:
+        return {"error": "codes 不能为空", "retriable": False}
 
-    # 合并去重(按title)
-    seen = set()
-    merged = []
-    for it in stock_items + policy_items:
-        t = it.get("title", "")
-        if t and t not in seen:
-            seen.add(t)
-            merged.append(it)
+    def _one(stock_code: str) -> Dict[str, Any]:
+        stock_items = _get_news(stock_code, "CNStock", name)
+        policy_items = _get_policy_from_cache()
 
-    return _build_result(merged, f"综合:{stock_code}")
+        seen = set()
+        merged = []
+        for it in stock_items + policy_items:
+            t = it.get("title", "")
+            if t and t not in seen:
+                seen.add(t)
+                merged.append(it)
+
+        return _build_result(merged, f"综合:{stock_code}")
+
+    if len(code_list) == 1:
+        return _one(code_list[0])
+
+    results = {}
+    for code in code_list:
+        try:
+            results[code] = _one(code)
+        except Exception as e:
+            results[code] = {"error": str(e)}
+    return {"count": len(results), "data": results}

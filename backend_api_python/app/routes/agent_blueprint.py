@@ -155,10 +155,9 @@ def _build_context(data: Dict, session: Dict, message: str) -> tuple:
     return session_id, context, stock_code
 
 
-def _build_executor(skills, user_id):
+def _build_executor(user_id):
     from app.agent.agent import build_agent_executor
     return build_agent_executor(
-        skills=skills,
         user_id=user_id,
         max_steps=int(os.getenv("AGENT_MAX_STEPS", "10")),
         timeout_seconds=float(os.getenv("AGENT_TIMEOUT_SECONDS", "180")),
@@ -168,16 +167,11 @@ def _build_executor(skills, user_id):
 def _parse_request(data: Dict) -> tuple:
     message = data.get("message")
     if not message or not isinstance(message, str):
-        return None, None, None, "Message is required and must be a string"
+        return None, None, "Message is required and must be a string"
     if len(message) > MAX_MESSAGE_LENGTH:
-        return None, None, None, f"Message too long (max {MAX_MESSAGE_LENGTH})"
+        return None, None, f"Message too long (max {MAX_MESSAGE_LENGTH})"
     session_id = data.get("session_id") or str(uuid.uuid4())
-    skills = data.get("skills")
-    if not skills:
-        strategy_id = data.get("strategy_id")
-        if strategy_id is not None:
-            skills = [str(strategy_id)]
-    return message, skills, session_id, None
+    return message, session_id, None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -219,7 +213,7 @@ def agent_chat():
         if not data:
             return jsonify({"error": "Request body must be JSON"}), 400
 
-        message, skills, session_id, err = _parse_request(data)
+        message, session_id, err = _parse_request(data)
         if err:
             return jsonify({"error": err}), 400
 
@@ -231,7 +225,7 @@ def agent_chat():
             session = _get_session(session_id)
             session_id, context, _ = _build_context(data, session, message)
 
-            executor = _build_executor(skills, g.user_id)
+            executor = _build_executor(g.user_id)
             result = executor.chat(
                 message=message, session_id=session_id,
                 context=context, user_id=g.user_id,
@@ -265,7 +259,7 @@ def agent_chat_stream():
         if not data:
             return jsonify({"error": "Request body must be JSON"}), 400
 
-        message, skills, session_id, err = _parse_request(data)
+        message, session_id, err = _parse_request(data)
         if err:
             return jsonify({"error": err}), 400
 
@@ -282,7 +276,7 @@ def agent_chat_stream():
 
             def _run():
                 try:
-                    executor = _build_executor(skills, user_id)
+                    executor = _build_executor(user_id)
                     # Store executor for interrupt support
                     _run._executor = executor
                     try:
@@ -402,18 +396,12 @@ def delete_chat_session(session_id: str):
 @agent_bp.route("/visualize", methods=["GET"])
 @login_required
 def visualize_agent():
-    """返回 Agent 结构树（工具列表、managed agents、配置）。
-
-    Query params:
-        skills: comma-separated indicator IDs
-    """
+    """返回 Agent 结构树（工具列表、managed agents、配置）。"""
     try:
         from flask import g
-        skills_raw = request.args.get("skills", "")
-        skills = [s.strip() for s in skills_raw.split(",") if s.strip()] or None
 
         from app.agent.agent import get_smolagent
-        agent = get_smolagent(skills=skills, user_id=g.user_id)
+        agent = get_smolagent(user_id=g.user_id)
 
         # Collect agent structure
         tools_info = []
@@ -459,16 +447,13 @@ def save_agent():
 
     Body:
         name (str): Agent 保存名称
-        skills (list[str]): 指标 ID 列表
     """
     try:
         from flask import g
         data = request.get_json() or {}
         name = data.get("name", f"agent_{uuid.uuid4().hex[:8]}")
-        skills = data.get("skills")
-
         from app.agent.agent import get_smolagent
-        agent = get_smolagent(skills=skills, user_id=g.user_id)
+        agent = get_smolagent(user_id=g.user_id)
 
         save_dir = os.path.join(AGENT_SAVE_DIR, name)
         os.makedirs(save_dir, exist_ok=True)

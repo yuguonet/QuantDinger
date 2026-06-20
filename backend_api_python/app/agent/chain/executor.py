@@ -185,7 +185,7 @@ class ChainExecutor:
         except Exception:
             pass
 
-        # 无历史数据，从 semantics/skills/*.md 的 default_weight 构建
+        # 无历史数据，从 agent/skills/*/SKILL.md 的 default_weight 构建
         try:
             from app.agent.semantics import get_all_skill_metas
             metas = get_all_skill_metas()

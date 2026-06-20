@@ -65,19 +65,35 @@ def get_concept_fund_flow(indicator: str = "今日") -> Dict[str, Any]:
         return {"error": str(e)}
 
 
-def get_fund_flow_daily(stock_code: str, days: int = 120) -> Dict[str, Any]:
-    """获取个股历史资金流向（日线级别）。
+def get_fund_flow_daily(codes: str, days: int = 120) -> Dict[str, Any]:
+    """获取个股历史资金流向（日线级别），支持多股批量获取。
 
     Args:
-        stock_code: 股票代码
+        codes: 逗号分隔的股票代码，如 "600519" 或 "600519,000001"
         days: 回溯天数，默认120
     """
-    from app.market_cn.tape import get_fund_flow_daily as _get
-    try:
-        return _get(stock_code, days=days)
-    except Exception as e:
-        logger.warning("get_fund_flow_daily(%s) failed: %s", stock_code, e)
-        return {"error": str(e)}
+    code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
+    if not code_list:
+        return {"error": "codes 不能为空", "retriable": False}
+
+    def _one(stock_code: str) -> Dict[str, Any]:
+        from app.market_cn.tape import get_fund_flow_daily as _get
+        try:
+            return _get(stock_code, days=days)
+        except Exception as e:
+            logger.warning("get_fund_flow_daily(%s) failed: %s", stock_code, e)
+            return {"error": str(e)}
+
+    if len(code_list) == 1:
+        return _one(code_list[0])
+
+    results = {}
+    for code in code_list:
+        try:
+            results[code] = _one(code)
+        except Exception as e:
+            results[code] = {"error": str(e)}
+    return {"count": len(results), "data": results}
 
 
 def get_market_fund_flow() -> Dict[str, Any]:

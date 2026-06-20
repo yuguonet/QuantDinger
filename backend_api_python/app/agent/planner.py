@@ -88,7 +88,7 @@ class PlanResult:
 # ═══════════════════════════════════════════════════════════════
 
 def _get_skill_catalog() -> str:
-    """从 semantics/skills/*.md 动态生成技能目录（单一信源）。"""
+    """从 agent/skills/*/SKILL.md 动态生成技能目录（单一信源）。"""
     from app.agent.semantics import get_all_skill_metas
     metas = get_all_skill_metas()
     if not metas:
@@ -356,7 +356,7 @@ class Planner:
                 plan_data["steps"].insert(0, {"agent": skill})
                 logger.info("[Planner] 自动补充必选 Skill: %s", skill)
 
-        # 新架构：从 semantics/skills/*.md 校验 Skill 是否存在
+        # 新架构：从 agent/skills/*/SKILL.md 校验 Skill 是否存在
         from app.agent.semantics import get_all_skill_metas
         known_skills = set(get_all_skill_metas().keys())
         if known_skills:

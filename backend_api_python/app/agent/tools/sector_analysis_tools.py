@@ -83,39 +83,55 @@ def get_sector_cycle(board_type: str = "industry") -> Dict[str, Any]:
         return {"error": str(e)}
 
 
-def get_stock_sector_info(stock_code: str) -> Dict[str, Any]:
-    """从本地数据库查询股票所属行业和概念。
+def get_stock_sector_info(codes: str) -> Dict[str, Any]:
+    """从本地数据库查询股票所属行业和概念，支持多股批量获取。
 
     Args:
-        stock_code: 股票代码（如 600519）
+        codes: 逗号分隔的股票代码，如 "600519" 或 "600519,000001"
     """
-    try:
-        from app.utils.basicinfo_db import get_stock_basic_db
-        from app.data_sources.normalizer import strip_market_prefix
+    code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
+    if not code_list:
+        return {"error": "codes 不能为空", "retriable": False}
 
-        db = get_stock_basic_db()
-        sym = strip_market_prefix(stock_code)
-        stock = db.get_stock(sym)
+    def _one(stock_code: str) -> Dict[str, Any]:
+        try:
+            from app.utils.basicinfo_db import get_stock_basic_db
+            from app.data_sources.normalizer import strip_market_prefix
 
-        if not stock:
-            return {"stock_code": stock_code, "error": "未找到该股票信息"}
+            db = get_stock_basic_db()
+            sym = strip_market_prefix(stock_code)
+            stock = db.get_stock(sym)
 
-        result = {"stock_code": sym}
-        if stock.get("name"):
-            result["name"] = stock["name"]
-        if stock.get("industry"):
-            result["industry"] = stock["industry"]
-        concepts_str = stock.get("concepts", "")
-        if concepts_str:
-            result["concepts"] = [c.strip() for c in concepts_str.split(",") if c.strip()]
-        if stock.get("market_cn"):
-            result["market_cn"] = stock["market_cn"]
-        if stock.get("list_date"):
-            result["list_date"] = stock["list_date"]
-        return result
-    except Exception as e:
-        logger.warning("get_stock_sector_info(%s) failed: %s", stock_code, e)
-        return {"stock_code": stock_code, "error": str(e)}
+            if not stock:
+                return {"stock_code": stock_code, "error": "未找到该股票信息"}
+
+            result = {"stock_code": sym}
+            if stock.get("name"):
+                result["name"] = stock["name"]
+            if stock.get("industry"):
+                result["industry"] = stock["industry"]
+            concepts_str = stock.get("concepts", "")
+            if concepts_str:
+                result["concepts"] = [c.strip() for c in concepts_str.split(",") if c.strip()]
+            if stock.get("market_cn"):
+                result["market_cn"] = stock["market_cn"]
+            if stock.get("list_date"):
+                result["list_date"] = stock["list_date"]
+            return result
+        except Exception as e:
+            logger.warning("get_stock_sector_info(%s) failed: %s", stock_code, e)
+            return {"stock_code": stock_code, "error": str(e)}
+
+    if len(code_list) == 1:
+        return _one(code_list[0])
+
+    results = {}
+    for code in code_list:
+        try:
+            results[code] = _one(code)
+        except Exception as e:
+            results[code] = {"error": str(e)}
+    return {"count": len(results), "data": results}
 
 
 def get_sector_stocks(board_code: str, limit: int = 10) -> Dict[str, Any]:

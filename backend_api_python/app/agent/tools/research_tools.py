@@ -31,95 +31,127 @@ _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 # 一致预期
 # ══════════════════════════════════════════════════════════════
 
-def get_consensus_eps(stock_code: str) -> Dict[str, Any]:
-    """获取同花顺机构一致预期EPS。
+def get_consensus_eps(codes: str) -> Dict[str, Any]:
+    """获取同花顺机构一致预期EPS，支持多股批量获取。
 
     Args:
-        stock_code: 股票代码（如 688017）
+        codes: 逗号分隔的股票代码，如 "688017" 或 "688017,600519"
     """
-    code = _strip_prefix(stock_code)
-    try:
-        import pandas as pd
-        from io import StringIO
+    code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
+    if not code_list:
+        return {"error": "codes 不能为空", "retriable": False}
 
-        url = f"https://basic.10jqka.com.cn/new/{code}/worth.html"
-        headers = {
-            "User-Agent": _UA,
-            "Referer": "https://basic.10jqka.com.cn/",
-        }
-        r = requests.get(url, headers=headers, timeout=15)
-        r.encoding = "gbk"
-        dfs = pd.read_html(StringIO(r.text))
+    def _one(stock_code: str) -> Dict[str, Any]:
+        code = _strip_prefix(stock_code)
+        try:
+            import pandas as pd
+            from io import StringIO
 
-        target_df = None
-        for df in dfs:
-            cols = [str(c) for c in df.columns]
-            if any("每股收益" in c or "均值" in c for c in cols):
-                target_df = df
-                break
-        if target_df is None and dfs:
-            target_df = dfs[0]
+            url = f"https://basic.10jqka.com.cn/new/{code}/worth.html"
+            headers = {
+                "User-Agent": _UA,
+                "Referer": "https://basic.10jqka.com.cn/",
+            }
+            r = requests.get(url, headers=headers, timeout=15)
+            r.encoding = "gbk"
+            dfs = pd.read_html(StringIO(r.text))
 
-        if target_df is not None:
-            records = target_df.to_dict(orient="records")
-            return {"stock_code": code, "consensus": records, "source": "同花顺"}
-        return {"stock_code": code, "consensus": [], "message": "未找到一致预期数据"}
-    except Exception as e:
-        logger.warning("get_consensus_eps(%s) failed: %s", code, e)
-        return {"stock_code": code, "error": str(e)}
+            target_df = None
+            for df in dfs:
+                cols = [str(c) for c in df.columns]
+                if any("每股收益" in c or "均值" in c for c in cols):
+                    target_df = df
+                    break
+            if target_df is None and dfs:
+                target_df = dfs[0]
+
+            if target_df is not None:
+                records = target_df.to_dict(orient="records")
+                return {"stock_code": code, "consensus": records, "source": "同花顺"}
+            return {"stock_code": code, "consensus": [], "message": "未找到一致预期数据"}
+        except Exception as e:
+            logger.warning("get_consensus_eps(%s) failed: %s", code, e)
+            return {"stock_code": code, "error": str(e)}
+
+    if len(code_list) == 1:
+        return _one(code_list[0])
+
+    results = {}
+    for code in code_list:
+        try:
+            results[code] = _one(code)
+        except Exception as e:
+            results[code] = {"error": str(e)}
+    return {"count": len(results), "data": results}
 
 
 # ══════════════════════════════════════════════════════════════
 # 个股新闻
 # ══════════════════════════════════════════════════════════════
 
-def get_eastmoney_stock_news(stock_code: str, page_size: int = 20) -> Dict[str, Any]:
-    """获取东财个股新闻。
+def get_eastmoney_stock_news(codes: str, page_size: int = 20) -> Dict[str, Any]:
+    """获取东财个股新闻，支持多股批量获取。
 
     Args:
-        stock_code: 股票代码（如 688017）
+        codes: 逗号分隔的股票代码，如 "688017" 或 "688017,600519"
         page_size: 返回条数，默认20
     """
-    from app.market_cn.eastmoney_search import _em_get
+    code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
+    if not code_list:
+        return {"error": "codes 不能为空", "retriable": False}
 
-    code = _strip_prefix(stock_code)
-    cb = "jQuery_news"
-    url = "https://search-api-web.eastmoney.com/search/jsonp"
-    inner_params = json.dumps({
-        "uid": "",
-        "keyword": code,
-        "type": ["cmsArticleWebOld"],
-        "client": "web",
-        "clientType": "web",
-        "clientVersion": "curr",
-        "param": {"cmsArticleWebOld": {
-            "searchScope": "default", "sort": "default",
-            "pageIndex": 1, "pageSize": page_size,
-            "preTag": "", "postTag": "",
-        }},
-    }, separators=(',', ':'))
-    params = {"cb": cb, "param": inner_params}
-    headers = {"User-Agent": _UA, "Referer": "https://so.eastmoney.com/"}
-    try:
-        r = _em_get(url, params=params, headers=headers, timeout=15)
-        text = r.text
-        json_str = text[text.index("(") + 1: text.rindex(")")]
-        d = json.loads(json_str)
+    def _one(stock_code: str) -> Dict[str, Any]:
+        from app.market_cn.eastmoney_search import _em_get
 
-        articles = d.get("result", {}).get("cmsArticleWebOld", []) or []
-        rows = []
-        for a in articles:
-            rows.append({
-                "title": re.sub(r'<[^>]+>', '', a.get("title", "")),
-                "content": re.sub(r'<[^>]+>', '', a.get("content", ""))[:200],
-                "time": a.get("date", ""),
-                "source": a.get("mediaName", ""),
-                "url": a.get("url", ""),
-            })
-        return {"stock_code": code, "total": len(rows), "news": rows}
-    except Exception as e:
-        logger.warning("get_eastmoney_stock_news(%s) failed: %s", code, e)
-        return {"stock_code": code, "error": str(e)}
+        code = _strip_prefix(stock_code)
+        cb = "jQuery_news"
+        url = "https://search-api-web.eastmoney.com/search/jsonp"
+        inner_params = json.dumps({
+            "uid": "",
+            "keyword": code,
+            "type": ["cmsArticleWebOld"],
+            "client": "web",
+            "clientType": "web",
+            "clientVersion": "curr",
+            "param": {"cmsArticleWebOld": {
+                "searchScope": "default", "sort": "default",
+                "pageIndex": 1, "pageSize": page_size,
+                "preTag": "", "postTag": "",
+            }},
+        }, separators=(',', ':'))
+        params = {"cb": cb, "param": inner_params}
+        headers = {"User-Agent": _UA, "Referer": "https://so.eastmoney.com/"}
+        try:
+            r = _em_get(url, params=params, headers=headers, timeout=15)
+            text = r.text
+            json_str = text[text.index("(") + 1: text.rindex(")")]
+            d = json.loads(json_str)
+
+            articles = d.get("result", {}).get("cmsArticleWebOld", []) or []
+            rows = []
+            for a in articles:
+                rows.append({
+                    "title": re.sub(r'<[^>]+>', '', a.get("title", "")),
+                    "content": re.sub(r'<[^>]+>', '', a.get("content", ""))[:200],
+                    "time": a.get("date", ""),
+                    "source": a.get("mediaName", ""),
+                    "url": a.get("url", ""),
+                })
+            return {"stock_code": code, "total": len(rows), "news": rows}
+        except Exception as e:
+            logger.warning("get_eastmoney_stock_news(%s) failed: %s", code, e)
+            return {"stock_code": code, "error": str(e)}
+
+    if len(code_list) == 1:
+        return _one(code_list[0])
+
+    results = {}
+    for code in code_list:
+        try:
+            results[code] = _one(code)
+        except Exception as e:
+            results[code] = {"error": str(e)}
+    return {"count": len(results), "data": results}
 
 
 # ══════════════════════════════════════════════════════════════

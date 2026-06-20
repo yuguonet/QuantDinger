@@ -283,7 +283,7 @@ def update_skill_weights(days: int = 90) -> Dict[str, Any]:
             cur.execute("SELECT skill_name FROM qd_skill_weights")
             existing = {row['skill_name'] for row in cur.fetchall()}
 
-            # 新架构：从 semantics/skills/*.md 获取 Skill 列表和出厂权重
+            # 新架构：从 agent/skills/*/SKILL.md 获取 Skill 列表和出厂权重
             from app.agent.semantics import get_all_skill_metas
             metas = get_all_skill_metas()
             for name, meta in metas.items():

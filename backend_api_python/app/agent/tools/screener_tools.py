@@ -118,6 +118,10 @@ def search_stocks(
         filters: 结构化筛选条件字典（可选，与 query 互补）
         market: 市场筛选（全部/A股/科创板/创业板/港股/美股/ETF基金）
         top_n: 返回数量上限，默认50，最大200
+
+    Returns:
+        dict: {"stocks": [{"code": "600519", "name": "贵州茅台", "industry": "白酒", ...}, ...], "count": N}
+        取第一个结果: result["stocks"][0]["code"]
     """
     top_n = min(max(top_n, 1), 200)
 

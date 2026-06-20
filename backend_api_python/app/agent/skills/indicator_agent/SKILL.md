@@ -1,6 +1,10 @@
 ---
-name: indicator-agent
+name: indicator_agent
 description: "指标策略执行。最近5天有买卖点评分，历史胜率加权，延迟信号衰减。"
+tags: [indicator, finance]
+priority: 6
+default_weight: 0.8
+tools: [run_indicator_signal, list_indicators, get_indicator_params]
 metadata: {"openclaw": {"requires": {"bins": ["python3"]}, "emoji": "📈"}}
 ---
 

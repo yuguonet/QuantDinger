@@ -12,35 +12,57 @@ from typing import Any, Dict, List
 logger = logging.getLogger(__name__)
 
 
-def get_dragon_tiger(stock_code: str = "", date: str = "", days: int = 30) -> Dict[str, Any]:
-    """获取龙虎榜数据。
+def get_dragon_tiger(codes: str = "", date: str = "", days: int = 30) -> Dict[str, Any]:
+    """获取龙虎榜数据，支持多股批量获取。
 
-    stock_code 为空时返回全市场龙虎榜；非空时返回该股票的历史龙虎榜记录。
+    codes 为空时返回全市场龙虎榜；非空时返回该股票的历史龙虎榜记录。
 
     Args:
-        stock_code: 股票代码（可选，空=全市场）
+        codes: 逗号分隔的股票代码（可选，空=全市场），如 "600519" 或 "600519,000001"
         date: 查询日期 YYYY-MM-DD，默认最近交易日
         days: 回溯天数，默认30
     """
-    from datetime import datetime, timedelta
-    from app.market_cn.dragon_limit import get_dragon_tiger as _get
+    def _one(stock_code: str) -> Dict[str, Any]:
+        from datetime import datetime, timedelta
+        from app.market_cn.dragon_limit import get_dragon_tiger as _get
 
-    if stock_code and stock_code.strip():
-        # 个股历史
-        if not date:
-            date = datetime.now().strftime("%Y-%m-%d")
-        start_date = (datetime.now() - timedelta(days=max(1, min(days, 365)))).strftime("%Y-%m-%d")
-        all_data = _get(start_date, date)
-        code = stock_code.strip().replace(".", "").upper()
-        data = [r for r in all_data if str(r.get("stock_code", "")).replace(".", "").upper() == code
-                or stock_code.strip() in str(r.get("code", ""))]
-        return {"stock_code": stock_code, "days": days, "count": len(data), "records": data}
-    else:
-        # 全市场
-        if not date:
-            date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-        data = _get(date, date)
-        return {"date": date, "days": 1, "count": len(data), "stocks": data}
+        if stock_code and stock_code.strip():
+            if not date:
+                _date = datetime.now().strftime("%Y-%m-%d")
+            else:
+                _date = date
+            start_date = (datetime.now() - timedelta(days=max(1, min(days, 365)))).strftime("%Y-%m-%d")
+            all_data = _get(start_date, _date)
+            code = stock_code.strip().replace(".", "").upper()
+            data = [r for r in all_data if str(r.get("stock_code", "")).replace(".", "").upper() == code
+                    or stock_code.strip() in str(r.get("code", ""))]
+            return {"stock_code": stock_code, "days": days, "count": len(data), "records": data}
+        else:
+            if not date:
+                _date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            else:
+                _date = date
+            data = _get(_date, _date)
+            return {"date": _date, "days": 1, "count": len(data), "stocks": data}
+
+    # codes 为空时走全市场逻辑（不经过批量）
+    if not codes or not codes.strip():
+        return _one("")
+
+    code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
+    if not code_list:
+        return {"error": "codes 不能为空", "retriable": False}
+
+    if len(code_list) == 1:
+        return _one(code_list[0])
+
+    results = {}
+    for code in code_list:
+        try:
+            results[code] = _one(code)
+        except Exception as e:
+            results[code] = {"error": str(e)}
+    return {"count": len(results), "data": results}
 
 
 def get_hot_rank(top_n: int = 30) -> Dict[str, Any]:

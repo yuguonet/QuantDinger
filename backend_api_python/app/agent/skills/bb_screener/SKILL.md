@@ -1,6 +1,10 @@
 ---
-name: bb-screener
+name: bb_screener
 description: "BB超卖全市场扫描。布林带下轨突破策略筛选全市场，再对候选股做技术面深入分析。"
+tags: [screener, finance]
+priority: 3
+default_weight: 0.8
+tools: [search_stocks, analyze_trend, get_indicator_snapshot]
 metadata: {"openclaw": {"requires": {"bins": ["python3"]}, "emoji": "📉"}}
 ---
 
@@ -13,23 +17,3 @@ metadata: {"openclaw": {"requires": {"bins": ["python3"]}, "emoji": "📉"}}
 ```bash
 python {baseDir}/run.py <stock_code> [--name <stock_name>]
 ```
-
-> stock_code 在此技能中仅用于日志标识，实际扫描全市场。
-
-## 输出
-
-JSON 格式，包含全市场 BB 超卖命中股票列表及深入分析结果。
-
-## 策略逻辑
-
-1. 全市场股票逐一计算布林带（20 日，3 倍标准差）
-2. 收盘价跌破下轨 → 命中
-3. 按振幅降序排列
-4. 对前 10 只做深入技术面分析（趋势/量价/指标/形态）
-5. 综合评分
-
-## 注意
-
-- 全市场扫描耗时较长（~5000 只股票）
-- 需要数据库连接获取股票列表
-- BB 超卖 ≠ 一定买入，需结合其他维度判断

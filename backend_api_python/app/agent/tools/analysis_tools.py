@@ -297,515 +297,580 @@ def _calc_kdj(highs: List[float], lows: List[float], closes: List[float],
 # Tool 函数（注册给 Agent 调用）
 # ═══════════════════════════════════════════════════════════════
 
-def analyze_trend(stock_code: str) -> Dict[str, Any]:
-    """获取股票的综合技术趋势分析，包括均线排列、MACD、RSI、BOLL和KDJ等指标。
+def analyze_trend(codes: str) -> Dict[str, Any]:
+    """获取股票的综合技术趋势分析，包括均线排列、MACD、RSI、BOLL和KDJ等指标，支持多股批量获取。
 
     Args:
-        stock_code: 股票代码，如 "600519"
+        codes: 逗号分隔的股票代码，如 "600519" 或 "600519,000001"
     """
-    try:
-        data = _fetch_ohlcv(stock_code, 120)
-        closes = data["close"]
-        if len(closes) < 5:
-            return {"error": "K线数据不足（至少需要5根）", "retriable": True}
+    code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
+    if not code_list:
+        return {"error": "codes 不能为空", "retriable": False}
 
-        latest = closes[-1]
-        prev = closes[-2] if len(closes) >= 2 else latest
+    def _one(stock_code: str) -> Dict[str, Any]:
+        try:
+            data = _fetch_ohlcv(stock_code, 120)
+            closes = data["close"]
+            if len(closes) < 5:
+                return {"error": "K线数据不足（至少需要5根）", "retriable": True}
 
-        # ── 均线 ──
-        ma5 = _safe_round(sum(closes[-5:]) / 5)
-        ma10 = _safe_round(sum(closes[-10:]) / 10) if len(closes) >= 10 else ma5
-        ma20 = _safe_round(sum(closes[-20:]) / 20) if len(closes) >= 20 else ma10
-        ma60 = _safe_round(sum(closes[-60:]) / 60) if len(closes) >= 60 else _safe_round(sum(closes) / len(closes))
-        ma120 = _safe_round(sum(closes[-120:]) / 120) if len(closes) >= 120 else ma60
+            latest = closes[-1]
+            prev = closes[-2] if len(closes) >= 2 else latest
 
-        # 均线排列评分（0-100）
-        ma_score = 50
-        if ma5 > ma10 > ma20 > ma60:
-            ma_desc = "强多头排列"
-            ma_score = 90
-        elif ma5 > ma10 > ma20:
-            ma_desc = "多头排列"
-            ma_score = 75
-        elif ma5 > ma20:
-            ma_desc = "弱势多头"
-            ma_score = 60
-        elif ma5 < ma10 < ma20 < ma60:
-            ma_desc = "强空头排列"
-            ma_score = 10
-        elif ma5 < ma10 < ma20:
-            ma_desc = "空头排列"
-            ma_score = 25
-        elif ma5 < ma20:
-            ma_desc = "弱势空头"
-            ma_score = 40
-        else:
-            ma_desc = "均线缠绕/震荡"
+            # ── 均线 ──
+            ma5 = _safe_round(sum(closes[-5:]) / 5)
+            ma10 = _safe_round(sum(closes[-10:]) / 10) if len(closes) >= 10 else ma5
+            ma20 = _safe_round(sum(closes[-20:]) / 20) if len(closes) >= 20 else ma10
+            ma60 = _safe_round(sum(closes[-60:]) / 60) if len(closes) >= 60 else _safe_round(sum(closes) / len(closes))
+            ma120 = _safe_round(sum(closes[-120:]) / 120) if len(closes) >= 120 else ma60
+
+            # 均线排列评分（0-100）
             ma_score = 50
-
-        # 乖离率
-        bias_ma5 = _safe_round((latest - ma5) / ma5 * 100, 2) if ma5 else 0
-        bias_ma20 = _safe_round((latest - ma20) / ma20 * 100, 2) if ma20 else 0
-
-        # ── MACD ──
-        macd_result = _calc_macd(closes)
-        macd_score = 50
-        if isinstance(macd_result, dict) and "error" not in macd_result:
-            if macd_result.get("dif", 0) > macd_result.get("dea", 0):
-                macd_score = 70 if macd_result.get("macd", 0) > 0 else 60
+            if ma5 > ma10 > ma20 > ma60:
+                ma_desc = "强多头排列"
+                ma_score = 90
+            elif ma5 > ma10 > ma20:
+                ma_desc = "多头排列"
+                ma_score = 75
+            elif ma5 > ma20:
+                ma_desc = "弱势多头"
+                ma_score = 60
+            elif ma5 < ma10 < ma20 < ma60:
+                ma_desc = "强空头排列"
+                ma_score = 10
+            elif ma5 < ma10 < ma20:
+                ma_desc = "空头排列"
+                ma_score = 25
+            elif ma5 < ma20:
+                ma_desc = "弱势空头"
+                ma_score = 40
             else:
-                macd_score = 30 if macd_result.get("macd", 0) < 0 else 40
-            if "金叉" in str(macd_result.get("signals", [])):
-                macd_score += 15
-            elif "死叉" in str(macd_result.get("signals", [])):
-                macd_score -= 15
+                ma_desc = "均线缠绕/震荡"
+                ma_score = 50
 
-        # ── RSI ──
-        rsi_result = _calc_rsi(closes, [6, 12, 24])
-        rsi_score = 50
-        if isinstance(rsi_result, dict) and "error" not in rsi_result:
-            rsi6 = rsi_result.get("rsi6", 50)
-            if rsi6 >= 70:
-                rsi_score = 25  # 超买 = 看空
-            elif rsi6 <= 30:
-                rsi_score = 75  # 超卖 = 看多
+            # 乖离率
+            bias_ma5 = _safe_round((latest - ma5) / ma5 * 100, 2) if ma5 else 0
+            bias_ma20 = _safe_round((latest - ma20) / ma20 * 100, 2) if ma20 else 0
+
+            # ── MACD ──
+            macd_result = _calc_macd(closes)
+            macd_score = 50
+            if isinstance(macd_result, dict) and "error" not in macd_result:
+                if macd_result.get("dif", 0) > macd_result.get("dea", 0):
+                    macd_score = 70 if macd_result.get("macd", 0) > 0 else 60
+                else:
+                    macd_score = 30 if macd_result.get("macd", 0) < 0 else 40
+                if "金叉" in str(macd_result.get("signals", [])):
+                    macd_score += 15
+                elif "死叉" in str(macd_result.get("signals", [])):
+                    macd_score -= 15
+
+            # ── RSI ──
+            rsi_result = _calc_rsi(closes, [6, 12, 24])
+            rsi_score = 50
+            if isinstance(rsi_result, dict) and "error" not in rsi_result:
+                rsi6 = rsi_result.get("rsi6", 50)
+                if rsi6 >= 70:
+                    rsi_score = 25
+                elif rsi6 <= 30:
+                    rsi_score = 75
+                else:
+                    rsi_score = int(rsi6)
+
+            # ── 布林带 ──
+            boll_result = _calc_boll(closes)
+            boll_score = 50
+            if isinstance(boll_result, dict) and "error" not in boll_result:
+                pos = boll_result.get("position_pct", 50)
+                if pos >= 80:
+                    boll_score = 30
+                elif pos <= 20:
+                    boll_score = 70
+                else:
+                    boll_score = int(50 + (50 - pos) * 0.4)
+
+            # ── KDJ ──
+            kdj_result = _calc_kdj(data["high"], data["low"], closes)
+            kdj_score = 50
+            if isinstance(kdj_result, dict) and "error" not in kdj_result:
+                j = kdj_result.get("j", 50)
+                if j >= 100:
+                    kdj_score = 25
+                elif j <= 0:
+                    kdj_score = 75
+                elif "金叉" in str(kdj_result.get("signals", [])):
+                    kdj_score = 70
+                elif "死叉" in str(kdj_result.get("signals", [])):
+                    kdj_score = 30
+
+            # ── 综合评分 ──
+            total_score = int(
+                ma_score * 0.30 +
+                macd_score * 0.25 +
+                rsi_score * 0.20 +
+                boll_score * 0.15 +
+                kdj_score * 0.10
+            )
+            total_score = max(0, min(100, total_score))
+
+            if total_score >= 75:
+                overall = "看多"
+                buy_signal = "多指标共振看多"
+                signal_score = total_score
+            elif total_score >= 60:
+                overall = "偏多"
+                buy_signal = "偏多但需确认"
+                signal_score = total_score
+            elif total_score <= 25:
+                overall = "看空"
+                buy_signal = "多指标共振看空，建议回避"
+                signal_score = total_score
+            elif total_score <= 40:
+                overall = "偏空"
+                buy_signal = "偏空，观望为主"
+                signal_score = total_score
             else:
-                rsi_score = int(rsi6)
+                overall = "震荡"
+                buy_signal = "多空分歧，观望"
+                signal_score = total_score
 
-        # ── 布林带 ──
-        boll_result = _calc_boll(closes)
-        boll_score = 50
-        if isinstance(boll_result, dict) and "error" not in boll_result:
-            pos = boll_result.get("position_pct", 50)
-            if pos >= 80:
-                boll_score = 30  # 接近上轨 = 风险
-            elif pos <= 20:
-                boll_score = 70  # 接近下轨 = 机会
-            else:
-                boll_score = int(50 + (50 - pos) * 0.4)
+            all_signals = []
+            if isinstance(macd_result, dict):
+                all_signals.extend(macd_result.get("signals", []))
+            if isinstance(rsi_result, dict):
+                all_signals.extend(rsi_result.get("signals", []))
+            if isinstance(boll_result, dict):
+                all_signals.extend(boll_result.get("signals", []))
+            if isinstance(kdj_result, dict):
+                all_signals.extend(kdj_result.get("signals", []))
 
-        # ── KDJ ──
-        kdj_result = _calc_kdj(data["high"], data["low"], closes)
-        kdj_score = 50
-        if isinstance(kdj_result, dict) and "error" not in kdj_result:
-            j = kdj_result.get("j", 50)
-            if j >= 100:
-                kdj_score = 25
-            elif j <= 0:
-                kdj_score = 75
-            elif "金叉" in str(kdj_result.get("signals", [])):
-                kdj_score = 70
-            elif "死叉" in str(kdj_result.get("signals", [])):
-                kdj_score = 30
+            change_pct = _safe_round((latest - prev) / prev * 100, 2) if prev else 0
 
-        # ── 综合评分 ──
-        # 权重：均线30% + MACD25% + RSI20% + BOLL15% + KDJ10%
-        total_score = int(
-            ma_score * 0.30 +
-            macd_score * 0.25 +
-            rsi_score * 0.20 +
-            boll_score * 0.15 +
-            kdj_score * 0.10
-        )
-        total_score = max(0, min(100, total_score))
+            return {
+                "stock_code": stock_code,
+                "latest_close": _safe_round(latest),
+                "change_pct": change_pct,
+                "ma5": ma5, "ma10": ma10, "ma20": ma20, "ma60": ma60, "ma120": ma120,
+                "ma_alignment": ma_desc,
+                "bias_ma5": bias_ma5, "bias_ma20": bias_ma20,
+                "macd": macd_result,
+                "rsi": rsi_result,
+                "boll": boll_result,
+                "kdj": kdj_result,
+                "trend_score": total_score,
+                "trend": overall,
+                "buy_signal": buy_signal,
+                "signal_score": signal_score,
+                "all_signals": all_signals,
+                "data_points": len(closes),
+            }
+        except Exception as e:
+            logger.error("analyze_trend(%s) failed: %s", stock_code, e)
+            return {"error": str(e)}
 
-        # 综合信号
-        if total_score >= 75:
-            overall = "看多"
-            buy_signal = "多指标共振看多"
-            signal_score = total_score
-        elif total_score >= 60:
-            overall = "偏多"
-            buy_signal = "偏多但需确认"
-            signal_score = total_score
-        elif total_score <= 25:
-            overall = "看空"
-            buy_signal = "多指标共振看空，建议回避"
-            signal_score = total_score
-        elif total_score <= 40:
-            overall = "偏空"
-            buy_signal = "偏空，观望为主"
-            signal_score = total_score
-        else:
-            overall = "震荡"
-            buy_signal = "多空分歧，观望"
-            signal_score = total_score
+    if len(code_list) == 1:
+        return _one(code_list[0])
 
-        # 汇总所有子信号
-        all_signals = []
-        if isinstance(macd_result, dict):
-            all_signals.extend(macd_result.get("signals", []))
-        if isinstance(rsi_result, dict):
-            all_signals.extend(rsi_result.get("signals", []))
-        if isinstance(boll_result, dict):
-            all_signals.extend(boll_result.get("signals", []))
-        if isinstance(kdj_result, dict):
-            all_signals.extend(kdj_result.get("signals", []))
+    results = {}
+    for code in code_list:
+        try:
+            results[code] = _one(code)
+        except Exception as e:
+            results[code] = {"error": str(e)}
+    return {"count": len(results), "data": results}
 
-        change_pct = _safe_round((latest - prev) / prev * 100, 2) if prev else 0
 
-        return {
-            "stock_code": stock_code,
-            "latest_close": _safe_round(latest),
-            "change_pct": change_pct,
-            # 均线
-            "ma5": ma5, "ma10": ma10, "ma20": ma20, "ma60": ma60, "ma120": ma120,
-            "ma_alignment": ma_desc,
-            "bias_ma5": bias_ma5, "bias_ma20": bias_ma20,
-            # MACD
-            "macd": macd_result,
-            # RSI
-            "rsi": rsi_result,
-            # 布林带
-            "boll": boll_result,
-            # KDJ
-            "kdj": kdj_result,
-            # 综合
-            "trend_score": total_score,
-            "trend": overall,
-            "buy_signal": buy_signal,
-            "signal_score": signal_score,
-            "all_signals": all_signals,
-            "data_points": len(closes),
-        }
-    except Exception as e:
-        logger.error("analyze_trend(%s) failed: %s", stock_code, e)
-        return {"error": str(e)}
-
-def calculate_ma(stock_code: str, periods: str = "5,10,20,60,120") -> Dict[str, Any]:
-    """计算均线指标。
+def calculate_ma(codes: str, periods: str = "5,10,20,60,120") -> Dict[str, Any]:
+    """计算均线指标，支持多股批量获取。
 
     Args:
-        stock_code: 股票代码，如 "600519"
+        codes: 逗号分隔的股票代码，如 "600519" 或 "600519,000001"
         periods: 均线周期列表，默认 [5,10,20,60,120,250]
     """
-    try:
-        period_list = sorted(set(int(p.strip()) for p in periods.split(",") if p.strip().isdigit()))
-        if not period_list:
-            return {"error": "无效的周期参数"}
+    code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
+    if not code_list:
+        return {"error": "codes 不能为空", "retriable": False}
 
-        max_period = max(period_list)
-        closes = _fetch_closes(stock_code, max_period + 10)
-        if len(closes) < max_period:
-            return {"error": f"数据不足，需要至少{max_period}根K线"}
+    def _one(stock_code: str) -> Dict[str, Any]:
+        try:
+            period_list = sorted(set(int(p.strip()) for p in periods.split(",") if p.strip().isdigit()))
+            if not period_list:
+                return {"error": "无效的周期参数"}
 
-        result = {"stock_code": stock_code, "latest_close": _safe_round(closes[-1])}
-        for p in period_list:
-            if len(closes) < p:
-                continue
-            avg = _safe_round(sum(closes[-p:]) / p)
-            result[f"ma{p}"] = avg
-            # 斜率：与前一天对比
-            if len(closes) >= p + 1:
-                prev_avg = _safe_round(sum(closes[-p - 1:-1]) / p)
-                slope_pct = _safe_round((avg - prev_avg) / prev_avg * 100, 2) if prev_avg else 0
-                result[f"ma{p}_slope"] = slope_pct
-                result[f"ma{p}_trend"] = "上行" if slope_pct > 0.05 else ("下行" if slope_pct < -0.05 else "走平")
-        return result
-    except Exception as e:
-        logger.error("calculate_ma(%s) failed: %s", stock_code, e)
-        return {"error": str(e)}
+            max_period = max(period_list)
+            closes = _fetch_closes(stock_code, max_period + 10)
+            if len(closes) < max_period:
+                return {"error": f"数据不足，需要至少{max_period}根K线"}
 
-def get_volume_analysis(stock_code: str) -> Dict[str, Any]:
-    """量能分析：量比、换手率、成交量趋势。
+            result = {"stock_code": stock_code, "latest_close": _safe_round(closes[-1])}
+            for p in period_list:
+                if len(closes) < p:
+                    continue
+                avg = _safe_round(sum(closes[-p:]) / p)
+                result[f"ma{p}"] = avg
+                if len(closes) >= p + 1:
+                    prev_avg = _safe_round(sum(closes[-p - 1:-1]) / p)
+                    slope_pct = _safe_round((avg - prev_avg) / prev_avg * 100, 2) if prev_avg else 0
+                    result[f"ma{p}_slope"] = slope_pct
+                    result[f"ma{p}_trend"] = "上行" if slope_pct > 0.05 else ("下行" if slope_pct < -0.05 else "走平")
+            return result
+        except Exception as e:
+            logger.error("calculate_ma(%s) failed: %s", stock_code, e)
+            return {"error": str(e)}
 
-    Args:
-        stock_code: 股票代码，如 "600519"
-    """
-    try:
-        data = _fetch_ohlcv(stock_code, 30)
-        volumes = data["volume"]
-        closes = data["close"]
-        if len(volumes) < 5:
-            return {"error": "K线数据不足"}
+    if len(code_list) == 1:
+        return _one(code_list[0])
 
-        latest_vol = volumes[-1]
-        avg_vol_5 = sum(volumes[-5:]) / 5
-        avg_vol_20 = sum(volumes) / len(volumes)
+    results = {}
+    for code in code_list:
+        try:
+            results[code] = _one(code)
+        except Exception as e:
+            results[code] = {"error": str(e)}
+    return {"count": len(results), "data": results}
 
-        volume_ratio = _safe_round(latest_vol / avg_vol_5, 2) if avg_vol_5 else 0
 
-        if volume_ratio > 2.0:
-            status = "显著放量"
-            meaning = "放量，需结合价格方向判断"
-        elif volume_ratio > 1.5:
-            status = "温和放量"
-            meaning = "成交活跃度提升"
-        elif volume_ratio < 0.5:
-            status = "明显缩量"
-            meaning = "缩量，抛压减轻或交投清淡"
-        elif volume_ratio < 0.8:
-            status = "温和缩量"
-            meaning = "成交活跃度下降"
-        else:
-            status = "平量"
-            meaning = "成交量维持常态"
-
-        # 成交量趋势
-        vol_trend = "数据不足"
-        if len(volumes) >= 6:
-            recent_avg = sum(volumes[-3:]) / 3
-            earlier_avg = sum(volumes[-6:-3]) / 3
-            vol_trend = "上升" if recent_avg > earlier_avg * 1.1 else ("下降" if recent_avg < earlier_avg * 0.9 else "平稳")
-
-        # 量价关系
-        vol_price_relation = "数据不足"
-        if len(closes) >= 2 and latest_vol > 0:
-            price_change = closes[-1] - closes[-2]
-            if price_change > 0 and volume_ratio > 1.3:
-                vol_price_relation = "量价齐升（健康上涨）"
-            elif price_change > 0 and volume_ratio < 0.7:
-                vol_price_relation = "缩量上涨（上涨乏力，需警惕）"
-            elif price_change < 0 and volume_ratio > 1.3:
-                vol_price_relation = "放量下跌（恐慌抛售）"
-            elif price_change < 0 and volume_ratio < 0.7:
-                vol_price_relation = "缩量下跌（下跌动能减弱）"
-            else:
-                vol_price_relation = "量价配合一般"
-
-        return {
-            "stock_code": stock_code,
-            "latest_volume": _safe_round(latest_vol, 0),
-            "avg_volume_5d": _safe_round(avg_vol_5, 0),
-            "avg_volume_20d": _safe_round(avg_vol_20, 0),
-            "volume_ratio": volume_ratio,
-            "volume_status": status,
-            "volume_meaning": meaning,
-            "volume_trend": vol_trend,
-            "vol_price_relation": vol_price_relation,
-        }
-    except Exception as e:
-        logger.error("get_volume_analysis(%s) failed: %s", stock_code, e)
-        return {"error": str(e)}
-
-def analyze_pattern(stock_code: str) -> Dict[str, Any]:
-    """识别K线形态（增强版）：锤子线、十字星、吞没、早晨/晚星、三连阳/阴、长上影/下影、缺口等。
+def get_volume_analysis(codes: str) -> Dict[str, Any]:
+    """量能分析：量比、换手率、成交量趋势，支持多股批量获取。
 
     Args:
-        stock_code: 股票代码，如 "600519"
+        codes: 逗号分隔的股票代码，如 "600519" 或 "600519,000001"
     """
-    try:
-        data = _fetch_ohlcv(stock_code, 10)
-        if len(data["close"]) < 3:
-            return {"error": "K线数据不足"}
+    code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
+    if not code_list:
+        return {"error": "codes 不能为空", "retriable": False}
 
-        patterns = []
-        o, h, l, c = data["open"], data["high"], data["low"], data["close"]
-        n = len(c)
+    def _one(stock_code: str) -> Dict[str, Any]:
+        try:
+            data = _fetch_ohlcv(stock_code, 30)
+            volumes = data["volume"]
+            closes = data["close"]
+            if len(volumes) < 5:
+                return {"error": "K线数据不足"}
 
-        # 最近一根
-        lo, lh, ll, lc = o[-1], h[-1], l[-1], c[-1]
-        body = abs(lc - lo)
-        candle_range = lh - ll if lh > ll else 0.001
-        upper_shadow = lh - max(lo, lc)
-        lower_shadow = min(lo, lc) - ll
+            latest_vol = volumes[-1]
+            avg_vol_5 = sum(volumes[-5:]) / 5
+            avg_vol_20 = sum(volumes) / len(volumes)
 
-        # ── 单根形态 ──
+            volume_ratio = _safe_round(latest_vol / avg_vol_5, 2) if avg_vol_5 else 0
 
-        # 锤子线 / 倒锤子
-        if body > 0 and candle_range > 0:
-            if lower_shadow >= 2 * body and upper_shadow <= body * 0.3:
-                patterns.append("锤子线（底部反转信号）")
-            elif upper_shadow >= 2 * body and lower_shadow <= body * 0.3:
-                patterns.append("倒锤子线（顶部反转信号）")
-
-        # 十字星
-        if body <= candle_range * 0.1:
-            if upper_shadow > candle_range * 0.3 and lower_shadow > candle_range * 0.3:
-                patterns.append("长腿十字星（强烈犹豫信号）")
-            elif upper_shadow > candle_range * 0.4 and lower_shadow < candle_range * 0.1:
-                patterns.append("墓碑线（顶部反转）")
-            elif lower_shadow > candle_range * 0.4 and upper_shadow < candle_range * 0.1:
-                patterns.append("蜻蜓线（底部反转）")
+            if volume_ratio > 2.0:
+                status = "显著放量"
+                meaning = "放量，需结合价格方向判断"
+            elif volume_ratio > 1.5:
+                status = "温和放量"
+                meaning = "成交活跃度提升"
+            elif volume_ratio < 0.5:
+                status = "明显缩量"
+                meaning = "缩量，抛压减轻或交投清淡"
+            elif volume_ratio < 0.8:
+                status = "温和缩量"
+                meaning = "成交活跃度下降"
             else:
-                patterns.append("十字星（犹豫信号）")
+                status = "平量"
+                meaning = "成交量维持常态"
 
-        # 长上影线
-        if upper_shadow > body * 2 and upper_shadow > lower_shadow * 2:
-            patterns.append("长上影线（上方压力大）")
+            vol_trend = "数据不足"
+            if len(volumes) >= 6:
+                recent_avg = sum(volumes[-3:]) / 3
+                earlier_avg = sum(volumes[-6:-3]) / 3
+                vol_trend = "上升" if recent_avg > earlier_avg * 1.1 else ("下降" if recent_avg < earlier_avg * 0.9 else "平稳")
 
-        # 长下影线
-        if lower_shadow > body * 2 and lower_shadow > upper_shadow * 2:
-            patterns.append("长下影线（下方支撑强）")
-
-        # 光头光脚大阳线/大阴线
-        if body > candle_range * 0.85:
-            if lc > lo:
-                patterns.append("光头光脚大阳线（强势）")
-            else:
-                patterns.append("光头光脚大阴线（弱势）")
-
-        # ── 两根形态 ──
-        if n >= 2:
-            po, pc = o[-2], c[-2]
-            prev_body = abs(pc - po)
-
-            # 吞没形态
-            if prev_body > 0 and body > prev_body:
-                if pc < po and lc > lo and lo <= pc and lc >= po:
-                    patterns.append("看涨吞没（底部反转）")
-                elif pc > po and lc < lo and lo >= pc and lc <= po:
-                    patterns.append("看跌吞没（顶部反转）")
-
-        # ── 三根形态 ──
-        if n >= 3:
-            o1, c1 = o[-3], c[-3]
-            o2, c2 = o[-2], c[-2]
-            o3, c3 = o[-1], c[-1]
-            body1 = abs(c1 - o1)
-            body2 = abs(c2 - o2)
-            body3 = abs(c3 - o3)
-
-            # 早晨之星
-            if (c1 < o1 and body1 > 0 and
-                    body2 < body1 * 0.3 and
-                    c3 > o3 and body3 > 0 and
-                    c3 > (o1 + c1) / 2):
-                patterns.append("早晨之星（底部反转，看多）")
-
-            # 黄昏之星
-            if (c1 > o1 and body1 > 0 and
-                    body2 < body1 * 0.3 and
-                    c3 < o3 and body3 > 0 and
-                    c3 < (o1 + c1) / 2):
-                patterns.append("黄昏之星（顶部反转，看空）")
-
-            # 三连阳
-            if c1 > o1 and c2 > o2 and c3 > o3:
-                if body3 > body2 > body1:
-                    patterns.append("三连阳递增（强势看多）")
+            vol_price_relation = "数据不足"
+            if len(closes) >= 2 and latest_vol > 0:
+                price_change = closes[-1] - closes[-2]
+                if price_change > 0 and volume_ratio > 1.3:
+                    vol_price_relation = "量价齐升（健康上涨）"
+                elif price_change > 0 and volume_ratio < 0.7:
+                    vol_price_relation = "缩量上涨（上涨乏力，需警惕）"
+                elif price_change < 0 and volume_ratio > 1.3:
+                    vol_price_relation = "放量下跌（恐慌抛售）"
+                elif price_change < 0 and volume_ratio < 0.7:
+                    vol_price_relation = "缩量下跌（下跌动能减弱）"
                 else:
-                    patterns.append("三连阳（多头排列）")
+                    vol_price_relation = "量价配合一般"
 
-            # 三连阴
-            if c1 < o1 and c2 < o2 and c3 < o3:
-                if body3 > body2 > body1:
-                    patterns.append("三连阴递增（强势看空）")
+            return {
+                "stock_code": stock_code,
+                "latest_volume": _safe_round(latest_vol, 0),
+                "avg_volume_5d": _safe_round(avg_vol_5, 0),
+                "avg_volume_20d": _safe_round(avg_vol_20, 0),
+                "volume_ratio": volume_ratio,
+                "volume_status": status,
+                "volume_meaning": meaning,
+                "volume_trend": vol_trend,
+                "vol_price_relation": vol_price_relation,
+            }
+        except Exception as e:
+            logger.error("get_volume_analysis(%s) failed: %s", stock_code, e)
+            return {"error": str(e)}
+
+    if len(code_list) == 1:
+        return _one(code_list[0])
+
+    results = {}
+    for code in code_list:
+        try:
+            results[code] = _one(code)
+        except Exception as e:
+            results[code] = {"error": str(e)}
+    return {"count": len(results), "data": results}
+
+
+def analyze_pattern(codes: str) -> Dict[str, Any]:
+    """识别K线形态（增强版），支持多股批量获取：锤子线、十字星、吞没、早晨/晚星、三连阳/阴、长上影/下影、缺口等。
+
+    Args:
+        codes: 逗号分隔的股票代码，如 "600519" 或 "600519,000001"
+    """
+    code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
+    if not code_list:
+        return {"error": "codes 不能为空", "retriable": False}
+
+    def _one(stock_code: str) -> Dict[str, Any]:
+        try:
+            data = _fetch_ohlcv(stock_code, 10)
+            if len(data["close"]) < 3:
+                return {"error": "K线数据不足"}
+
+            patterns = []
+            o, h, l, c = data["open"], data["high"], data["low"], data["close"]
+            n = len(c)
+
+            lo, lh, ll, lc = o[-1], h[-1], l[-1], c[-1]
+            body = abs(lc - lo)
+            candle_range = lh - ll if lh > ll else 0.001
+            upper_shadow = lh - max(lo, lc)
+            lower_shadow = min(lo, lc) - ll
+
+            if body > 0 and candle_range > 0:
+                if lower_shadow >= 2 * body and upper_shadow <= body * 0.3:
+                    patterns.append("锤子线（底部反转信号）")
+                elif upper_shadow >= 2 * body and lower_shadow <= body * 0.3:
+                    patterns.append("倒锤子线（顶部反转信号）")
+
+            if body <= candle_range * 0.1:
+                if upper_shadow > candle_range * 0.3 and lower_shadow > candle_range * 0.3:
+                    patterns.append("长腿十字星（强烈犹豫信号）")
+                elif upper_shadow > candle_range * 0.4 and lower_shadow < candle_range * 0.1:
+                    patterns.append("墓碑线（顶部反转）")
+                elif lower_shadow > candle_range * 0.4 and upper_shadow < candle_range * 0.1:
+                    patterns.append("蜻蜓线（底部反转）")
                 else:
-                    patterns.append("三连阴（空头排列）")
+                    patterns.append("十字星（犹豫信号）")
 
-            # 红三兵
-            if (c1 > o1 and c2 > o2 and c3 > o3 and
-                    c2 > c1 and c3 > c2 and
-                    o2 > o1 and o3 > o2):
-                patterns.append("红三兵（强烈看多）")
+            if upper_shadow > body * 2 and upper_shadow > lower_shadow * 2:
+                patterns.append("长上影线（上方压力大）")
 
-            # 黑三鸦
-            if (c1 < o1 and c2 < o2 and c3 < o3 and
-                    c2 < c1 and c3 < c2 and
-                    o2 < o1 and o3 < o2):
-                patterns.append("黑三鸦（强烈看空）")
+            if lower_shadow > body * 2 and lower_shadow > upper_shadow * 2:
+                patterns.append("长下影线（下方支撑强）")
 
-        # ── 缺口检测 ──
-        if n >= 2:
-            prev_high = h[-2]
-            prev_low = l[-2]
-            if l[-1] > prev_high:
-                gap_size = _safe_round((l[-1] - prev_high) / prev_high * 100, 2)
-                patterns.append(f"向上跳空缺口（幅度{gap_size}%）")
-            elif h[-1] < prev_low:
-                gap_size = _safe_round((prev_low - h[-1]) / prev_low * 100, 2)
-                patterns.append(f"向下跳空缺口（幅度{gap_size}%）")
+            if body > candle_range * 0.85:
+                if lc > lo:
+                    patterns.append("光头光脚大阳线（强势）")
+                else:
+                    patterns.append("光头光脚大阴线（弱势）")
 
-        if not patterns:
-            patterns.append("无明显特殊形态")
+            if n >= 2:
+                po, pc = o[-2], c[-2]
+                prev_body = abs(pc - po)
+                if prev_body > 0 and body > prev_body:
+                    if pc < po and lc > lo and lo <= pc and lc >= po:
+                        patterns.append("看涨吞没（底部反转）")
+                    elif pc > po and lc < lo and lo >= pc and lc <= po:
+                        patterns.append("看跌吞没（顶部反转）")
 
-        return {
-            "stock_code": stock_code,
-            "latest_candle": {"open": _safe_round(lo), "high": _safe_round(lh),
-                              "low": _safe_round(ll), "close": _safe_round(lc)},
-            "body_size": _safe_round(body),
-            "upper_shadow": _safe_round(upper_shadow),
-            "lower_shadow": _safe_round(lower_shadow),
-            "patterns": patterns,
-            "pattern_count": len([p for p in patterns if "无明显" not in p]),
-        }
-    except Exception as e:
-        logger.error("analyze_pattern(%s) failed: %s", stock_code, e)
-        return {"error": str(e)}
+            if n >= 3:
+                o1, c1 = o[-3], c[-3]
+                o2, c2 = o[-2], c[-2]
+                o3, c3 = o[-1], c[-1]
+                body1 = abs(c1 - o1)
+                body2 = abs(c2 - o2)
+                body3 = abs(c3 - o3)
 
-def get_chip_distribution(stock_code: str, lookback_days: int = 120) -> Dict[str, Any]:
-    """筹码分布分析（衰减成本分布模型）。
+                if (c1 < o1 and body1 > 0 and
+                        body2 < body1 * 0.3 and
+                        c3 > o3 and body3 > 0 and
+                        c3 > (o1 + c1) / 2):
+                    patterns.append("早晨之星（底部反转，看多）")
+
+                if (c1 > o1 and body1 > 0 and
+                        body2 < body1 * 0.3 and
+                        c3 < o3 and body3 > 0 and
+                        c3 < (o1 + c1) / 2):
+                    patterns.append("黄昏之星（顶部反转，看空）")
+
+                if c1 > o1 and c2 > o2 and c3 > o3:
+                    if body3 > body2 > body1:
+                        patterns.append("三连阳递增（强势看多）")
+                    else:
+                        patterns.append("三连阳（多头排列）")
+
+                if c1 < o1 and c2 < o2 and c3 < o3:
+                    if body3 > body2 > body1:
+                        patterns.append("三连阴递增（强势看空）")
+                    else:
+                        patterns.append("三连阴（空头排列）")
+
+                if (c1 > o1 and c2 > o2 and c3 > o3 and
+                        c2 > c1 and c3 > c2 and
+                        o2 > o1 and o3 > o2):
+                    patterns.append("红三兵（强烈看多）")
+
+                if (c1 < o1 and c2 < o2 and c3 < o3 and
+                        c2 < c1 and c3 < c2 and
+                        o2 < o1 and o3 < o2):
+                    patterns.append("黑三鸦（强烈看空）")
+
+            if n >= 2:
+                prev_high = h[-2]
+                prev_low = l[-2]
+                if l[-1] > prev_high:
+                    gap_size = _safe_round((l[-1] - prev_high) / prev_high * 100, 2)
+                    patterns.append(f"向上跳空缺口（幅度{gap_size}%）")
+                elif h[-1] < prev_low:
+                    gap_size = _safe_round((prev_low - h[-1]) / prev_low * 100, 2)
+                    patterns.append(f"向下跳空缺口（幅度{gap_size}%）")
+
+            if not patterns:
+                patterns.append("无明显特殊形态")
+
+            return {
+                "stock_code": stock_code,
+                "latest_candle": {"open": _safe_round(lo), "high": _safe_round(lh),
+                                  "low": _safe_round(ll), "close": _safe_round(lc)},
+                "body_size": _safe_round(body),
+                "upper_shadow": _safe_round(upper_shadow),
+                "lower_shadow": _safe_round(lower_shadow),
+                "patterns": patterns,
+                "pattern_count": len([p for p in patterns if "无明显" not in p]),
+            }
+        except Exception as e:
+            logger.error("analyze_pattern(%s) failed: %s", stock_code, e)
+            return {"error": str(e)}
+
+    if len(code_list) == 1:
+        return _one(code_list[0])
+
+    results = {}
+    for code in code_list:
+        try:
+            results[code] = _one(code)
+        except Exception as e:
+            results[code] = {"error": str(e)}
+    return {"count": len(results), "data": results}
+
+
+def get_chip_distribution(codes: str, lookback_days: int = 120) -> Dict[str, Any]:
+    """筹码分布分析（衰减成本分布模型），支持多股批量获取。
 
     从日K线计算筹码分布，不依赖数据源原生接口。
     算法：按日K线的 high/low 区间分配成交量到价格档位，
     用指数衰减加权（近期筹码权重更高），汇总计算各维度指标。
 
     Args:
-        stock_code: 股票代码（str 或 search_stock 返回的 dict）
+        codes: 逗号分隔的股票代码，如 "600519" 或 "600519,000001"（也兼容 search_stock 返回的 dict）
         lookback_days: 回看天数，默认120天
     """
     # 兼容 search_stock 返回的 dict: {'results': [{'code': '600593', ...}], ...}
-    if isinstance(stock_code, dict):
-        results = stock_code.get("results", [])
+    if isinstance(codes, dict):
+        results = codes.get("results", [])
         if results:
-            stock_code = results[0].get("code", "")
+            codes = results[0].get("code", "")
         else:
-            return {"error": "stock_code dict 中无 results", "retriable": False}
-    stock_code = str(stock_code).strip()
-    if not stock_code:
-        return {"error": "stock_code 为空", "retriable": False}
-    market = _detect_market(stock_code)
-    if market != "CNStock":
-        return {"error": f"筹码分布分析仅支持A股，当前市场: {market}", "retriable": False}
+            return {"error": "codes dict 中无 results", "retriable": False}
 
-    try:
-        klines = _fetch_klines(stock_code, lookback_days)
-        from app.agent.tools.chip_distribution import calc_chip_distribution
-        return calc_chip_distribution(klines, stock_code=stock_code, lookback_days=lookback_days)
-    except Exception as e:
-        logger.error("get_chip_distribution(%s) failed: %s", stock_code, e, exc_info=True)
-        return {"error": str(e)}
+    code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
+    if not code_list:
+        return {"error": "codes 不能为空", "retriable": False}
 
-def get_indicator_snapshot(stock_code: str) -> Dict[str, Any]:
-    """单次获取多个技术指标快照（MACD、RSI、BOLL、KDJ等）。
+    def _one(stock_code: str) -> Dict[str, Any]:
+        stock_code = str(stock_code).strip()
+        if not stock_code:
+            return {"error": "stock_code 为空", "retriable": False}
+        market = _detect_market(stock_code)
+        if market != "CNStock":
+            return {"error": f"筹码分布分析仅支持A股，当前市场: {market}", "retriable": False}
+
+        try:
+            klines = _fetch_klines(stock_code, lookback_days)
+            from app.agent.tools.chip_distribution import calc_chip_distribution
+            return calc_chip_distribution(klines, stock_code=stock_code, lookback_days=lookback_days)
+        except Exception as e:
+            logger.error("get_chip_distribution(%s) failed: %s", stock_code, e, exc_info=True)
+            return {"error": str(e)}
+
+    if len(code_list) == 1:
+        return _one(code_list[0])
+
+    results = {}
+    for code in code_list:
+        try:
+            results[code] = _one(code)
+        except Exception as e:
+            results[code] = {"error": str(e)}
+    return {"count": len(results), "data": results}
+
+
+def get_indicator_snapshot(codes: str) -> Dict[str, Any]:
+    """单次获取多个技术指标快照（MACD、RSI、BOLL、KDJ等），支持多股批量获取。
 
     Args:
-        stock_code: 股票代码，如 "600519"
+        codes: 逗号分隔的股票代码，如 "600519" 或 "600519,000001"
     """
-    try:
-        data = _fetch_ohlcv(stock_code, 120)
-        closes = data["close"]
-        if len(closes) < 10:
-            return {"error": "K线数据不足（至少需要10根）", "retriable": True}
+    code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
+    if not code_list:
+        return {"error": "codes 不能为空", "retriable": False}
 
-        result = {"stock_code": stock_code, "latest_close": _safe_round(closes[-1])}
+    def _one(stock_code: str) -> Dict[str, Any]:
+        try:
+            data = _fetch_ohlcv(stock_code, 120)
+            closes = data["close"]
+            if len(closes) < 10:
+                return {"error": "K线数据不足（至少需要10根）", "retriable": True}
 
-        # 均线
-        for p in [5, 10, 20, 60, 120]:
-            if len(closes) >= p:
-                result[f"ma{p}"] = _safe_round(sum(closes[-p:]) / p)
+            result = {"stock_code": stock_code, "latest_close": _safe_round(closes[-1])}
 
-        # MACD
-        macd = _calc_macd(closes)
-        if "error" not in macd:
-            result["macd"] = macd
+            for p in [5, 10, 20, 60, 120]:
+                if len(closes) >= p:
+                    result[f"ma{p}"] = _safe_round(sum(closes[-p:]) / p)
 
-        # RSI
-        rsi = _calc_rsi(closes, [6, 12, 24])
-        if "error" not in rsi:
-            result["rsi"] = rsi
+            macd = _calc_macd(closes)
+            if "error" not in macd:
+                result["macd"] = macd
 
-        # BOLL
-        boll = _calc_boll(closes)
-        if "error" not in boll:
-            result["boll"] = boll
+            rsi = _calc_rsi(closes, [6, 12, 24])
+            if "error" not in rsi:
+                result["rsi"] = rsi
 
-        # KDJ
-        kdj = _calc_kdj(data["high"], data["low"], closes)
-        if "error" not in kdj:
-            result["kdj"] = kdj
+            boll = _calc_boll(closes)
+            if "error" not in boll:
+                result["boll"] = boll
 
-        # 量能
-        if len(data["volume"]) >= 5:
-            vol = data["volume"][-1]
-            avg5 = sum(data["volume"][-5:]) / 5
-            result["volume_ratio"] = _safe_round(vol / avg5, 2) if avg5 else 0
+            kdj = _calc_kdj(data["high"], data["low"], closes)
+            if "error" not in kdj:
+                result["kdj"] = kdj
 
-        return result
-    except Exception as e:
-        logger.error("get_indicator_snapshot(%s) failed: %s", stock_code, e)
-        return {"error": str(e)}
+            if len(data["volume"]) >= 5:
+                vol = data["volume"][-1]
+                avg5 = sum(data["volume"][-5:]) / 5
+                result["volume_ratio"] = _safe_round(vol / avg5, 2) if avg5 else 0
+
+            return result
+        except Exception as e:
+            logger.error("get_indicator_snapshot(%s) failed: %s", stock_code, e)
+            return {"error": str(e)}
+
+    if len(code_list) == 1:
+        return _one(code_list[0])
+
+    results = {}
+    for code in code_list:
+        try:
+            results[code] = _one(code)
+        except Exception as e:
+            results[code] = {"error": str(e)}
+    return {"count": len(results), "data": results}
 
 # ── OpenAI tool declarations ─────────────────────────────────
 

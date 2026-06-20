@@ -193,39 +193,29 @@ def load_semantics():
             behaviors=_parse_behaviors_from_md(body),
         )
 
-    # ── skills（从 skills/*.md 加载，支持 names 列表）──
-    skills_dir = _SEMANTICS_DIR / "skills"
+    # ── skills（从 agent/skills/*/SKILL.md 加载）──
+    skills_dir = _SEMANTICS_DIR.parent / "skills"
     if skills_dir.exists():
-        for md_file in skills_dir.glob("*.md"):
+        for skill_dir in skills_dir.iterdir():
+            if not skill_dir.is_dir():
+                continue
+            md_file = skill_dir / "SKILL.md"
+            if not md_file.exists():
+                continue
             content = md_file.read_text(encoding="utf-8")
             meta, body = _parse_skill_md(content)
-            if not meta:
+            if not meta or not meta.get("name"):
                 continue
-            # 支持 names 列表（一个文件定义多个 skill）
-            names = meta.get("names", [])
-            if names:
-                for skill_name in names:
-                    _skills[skill_name] = SkillMeta(
-                        name=skill_name,
-                        description=meta.get("description", ""),
-                        tags=meta.get("tags", []),
-                        priority=meta.get("priority", 5),
-                        default_weight=meta.get("default_weight", 1.0),
-                        tools=meta.get("tools", []),
-                        instructions=body,
-                        standard_output=meta.get("standard_output", False),
-                    )
-            elif meta.get("name"):
-                _skills[meta["name"]] = SkillMeta(
-                    name=meta["name"],
-                    description=meta.get("description", ""),
-                    tags=meta.get("tags", []),
-                    priority=meta.get("priority", 5),
-                    default_weight=meta.get("default_weight", 1.0),
-                    tools=meta.get("tools", []),
-                    instructions=body,
-                    standard_output=meta.get("standard_output", False),
-                )
+            _skills[meta["name"]] = SkillMeta(
+                name=meta["name"],
+                description=meta.get("description", ""),
+                tags=meta.get("tags", []),
+                priority=meta.get("priority", 5),
+                default_weight=meta.get("default_weight", 1.0),
+                tools=meta.get("tools", []),
+                instructions=body,
+                standard_output=meta.get("standard_output", False),
+            )
 
     # ── intent（intent.md frontmatter + body 作为 classifier_prompt）──
     intent_md = _SEMANTICS_DIR / "intent.md"

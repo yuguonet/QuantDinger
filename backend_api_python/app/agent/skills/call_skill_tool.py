@@ -1,45 +1,48 @@
 # -*- coding: utf-8 -*-
 """
-call_skill — Agent 调用 Skill 的统一入口（smolagents Tool）。
+call_skill — Agent 调用 Skill 的统一入口（smolagents Tool 子类）。
 
-注册为 smolagents Tool 后，Agent 可以通过 tool_calls 协议调用任意 Skill。
-符合 OpenAI Function Calling 标准（JSON Schema 声明）。
+继承 smolagents.Tool，description/inputs 作为类属性，不受 docstring 解析限制。
 """
 from __future__ import annotations
 
-from app.agent.skills.registry import all_skills, run_skill
+from smolagents import Tool
+
+from app.agent.skills.registry import run_skill
+
+
+class CallSkillTool(Tool):
+    """调用指定的分析技能（Skill），返回标准化分析报告。"""
+
+    name = "call_skill"
+    description = (
+        "调用指定的分析技能（Skill），返回标准化分析报告。"
+        "可用技能: technical_agent(技术面), indicator_agent(指标), "
+        "intelligence_agent(情报面), market_screener(市场筛选), "
+        "bb_screener(布林带), researcher(深度研究), backtest_agent(回测)"
+    )
+    inputs = {
+        "skill_name": {
+            "type": "string",
+            "description": "技能名称，可选值: technical_agent, indicator_agent, intelligence_agent, market_screener, bb_screener, researcher, backtest_agent",
+        },
+        "stock_code": {
+            "type": "string",
+            "description": "股票代码（6位数字），部分技能可为空",
+            "nullable": True,
+        },
+        "stock_name": {
+            "type": "string",
+            "description": "股票名称（可选）",
+            "nullable": True,
+        },
+    }
+    output_type = "object"
+
+    def forward(self, skill_name: str, stock_code: str = "", stock_name: str = "") -> dict:
+        return run_skill(skill_name, stock_code, stock_name)
 
 
 def get_call_skill_tool():
-    """获取 call_skill 工具实例（供 agent.py 使用）。
-
-    延迟导入 smolagents，避免模块加载时就要求安装。
-    """
-    from smolagents import tool as smolagents_tool
-
-    # 动态生成 description，包含可用 Skill 列表
-    skills = all_skills()
-    skill_lines = []
-    for name, info in sorted(skills.items()):
-        skill_lines.append(f"- {name}: {info.description}")
-    skills_catalog = "\n".join(skill_lines) if skill_lines else "(无可用 Skill)"
-
-    @smolagents_tool
-    def call_skill(skill_name: str, stock_code: str = "", stock_name: str = "") -> dict:
-        """调用指定的分析技能（Skill），返回标准化分析报告。
-
-        可用技能：
-        {catalog}
-
-        Args:
-            skill_name: 技能名称，必须是上述列表中的一个
-            stock_code: 股票代码（6位数字），部分技能可为空
-            stock_name: 股票名称（可选）
-
-        Returns:
-            标准化分析报告 dict，包含 skill/score/direction/confidence/factors/analysis 等字段
-        """.format(catalog=skills_catalog)
-
-        return run_skill(skill_name, stock_code, stock_name)
-
-    return call_skill
+    """获取 call_skill 工具实例（供 agent.py 使用）。"""
+    return CallSkillTool()

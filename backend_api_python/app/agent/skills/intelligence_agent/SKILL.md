@@ -1,6 +1,10 @@
 ---
-name: intelligence-agent
+name: intelligence_agent
 description: "个股情报+政策面。新闻/事件/舆情/解禁/减持/质押，RMS评分+一票否决。"
+tags: [news, finance]
+priority: 7
+default_weight: 0.8
+tools: [search_stock_intel, search_policy_intel]
 metadata: {"openclaw": {"requires": {"bins": ["python3"]}, "emoji": "🕵️"}}
 ---
 

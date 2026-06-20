@@ -1,6 +1,10 @@
 ---
 name: researcher
 description: "多空研究员。基于数据同时构建看涨/看跌论据，帮用户全面评估。A股散户天然偏多，空头视角尤其重要。"
+tags: [analysis, finance]
+priority: 5
+default_weight: 1.0
+tools: [get_realtime_quote, analyze_trend, get_volume_analysis, get_indicator_snapshot, search_stock_intel]
 metadata: {"openclaw": {"requires": {"bins": ["python3"]}, "emoji": "🔬"}}
 ---
 
@@ -20,6 +24,13 @@ JSON 格式，包含：
 - bull_case: 多头论据（score, factors, argument）
 - bear_case: 空头论据（score, factors, argument）
 - verdict: 综合判断（多头/空头/中性）
+
+## 评分规则
+
+同时构建多头和空头论据：
+- 多头得分 = 趋势分 + 利好因子数 × 5
+- 空头得分 = (100 - 趋势分) + 利空因子数 × 5
+- verdict = 得分高的一方（差距 < 10 则中性）
 
 ## 你的职责
 

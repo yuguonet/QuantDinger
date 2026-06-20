@@ -151,108 +151,124 @@ def _get_financial_statements(code: str) -> Dict[str, Any]:
 # 对外工具 — 中长线基本面综合摘要
 # ══════════════════════════════════════════════════════════════
 
-def get_capital_summary(stock_code: str) -> Dict[str, Any]:
-    """中长线基本面综合摘要分析。
+def get_capital_summary(codes: str) -> Dict[str, Any]:
+    """中长线基本面综合摘要分析，支持多股批量获取。
 
     一次调用聚合融资融券、大宗交易、股东户数、分红送转、财报三表五大维度数据，
     并生成结构化摘要供中长线持仓决策参考。
 
     Args:
-        stock_code: 股票代码（如 600519）
+        codes: 逗号分隔的股票代码，如 "600519" 或 "600519,000001"
     """
-    code = _strip_prefix(stock_code)
+    code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
+    if not code_list:
+        return {"error": "codes 不能为空", "retriable": False}
 
-    # ── 并行采集五维数据（单源超时不阻断整体）────────────────────
-    def _safe(fn, label):
+    def _one(stock_code: str) -> Dict[str, Any]:
+        code = _strip_prefix(stock_code)
+
+        # ── 并行采集五维数据（单源超时不阻断整体）────────────────────
+        def _safe(fn, label):
+            try:
+                return fn()
+            except Exception as e:
+                logger.warning("[Capital] %s 超时/失败: %s", label, e)
+                return {}
+
+        margin = _safe(lambda: _get_margin_trading(code, days=60), "margin")
+        block = _safe(lambda: _get_block_trades(code, page_size=20), "block")
+        holders = _safe(lambda: _get_holder_count(code), "holders")
+        dividend = _safe(lambda: _get_dividend_history(code), "dividend")
+        financials = _safe(lambda: _get_financial_statements(code), "financials")
+
+        # ── 摘要计算 ─────────────────────────────────────────────
+        summary: Dict[str, Any] = {"stock_code": code}
+
+        # 1) 融资融券摘要
+        margin_records = margin.get("records", [])
+        if margin_records:
+            latest = margin_records[0]
+            rz_trend = [r.get("rzye", 0) for r in margin_records[:10]]
+            rz_direction = "上升" if len(rz_trend) >= 2 and rz_trend[0] > rz_trend[-1] else "下降" if len(rz_trend) >= 2 else "持平"
+            summary["margin"] = {
+                "latest_date": latest.get("date"),
+            }
+        else:
+            summary["margin"] = {"signal": "无数据"}
+
+        # 2) 大宗交易摘要
+        block_records = block.get("records", [])
+        if block_records:
+            premium_avg = sum(r.get("premium_pct", 0) for r in block_records) / len(block_records)
+            inst_buy = sum(1 for r in block_records if "机构" in str(r.get("buyer", "")))
+            signal = "溢价成交（正面）" if premium_avg > 5 else "折价成交（负面）" if premium_avg < -5 else "中性"
+            summary["block_trade"] = {
+                "recent_count": len(block_records),
+                "signal": signal,
+            }
+        else:
+            summary["block_trade"] = {"signal": "无大宗交易记录"}
+
+        # 3) 股东户数摘要
+        holder_records = holders.get("records", [])
+        if holder_records:
+            latest_h = holder_records[0]
+            prev_h = holder_records[1] if len(holder_records) > 1 else None
+            trend = "减少" if prev_h and latest_h.get("holder_num", 0) < prev_h.get("holder_num", 0) \
+                    else "增加" if prev_h and latest_h.get("holder_num", 0) > prev_h.get("holder_num", 0) \
+                    else "未知"
+            summary["holders"] = {
+                "latest_date": latest_h.get("date"),
+            }
+        else:
+            summary["holders"] = {"signal": "无数据"}
+
+        # 4) 分红送转摘要
+        div_records = dividend.get("records", [])
+        if div_records:
+            total_bonus = sum(r.get("bonus_rmb", 0) or 0 for r in div_records if r.get("bonus_rmb"))
+            continuous_years = len(set(str(r.get("date", ""))[:4] for r in div_records if r.get("bonus_rmb", 0) and r.get("bonus_rmb", 0) > 0))
+            summary["dividend"] = {
+                "record_count": len(div_records),
+            }
+        else:
+            summary["dividend"] = {"signal": "无分红记录"}
+
+        # 5) 财报三表摘要
+        balance = financials.get("balance_sheet", [])
+        income = financials.get("income_statement", [])
+        cash = financials.get("cash_flow", [])
+        summary["financials"] = {
+            "balance_sheet_items": len(balance),
+        }
+
+        # ── 综合信号 ─────────────────────────────────────────────
+        signals = [
+            summary.get("margin", {}).get("signal", ""),
+            summary.get("block_trade", {}).get("signal", ""),
+            summary.get("holders", {}).get("signal", ""),
+            summary.get("dividend", {}).get("signal", ""),
+        ]
+        positive = sum(1 for s in signals if "正面" in s or "看多" in s or "吸筹" in s or "友好" in s)
+        negative = sum(1 for s in signals if "负面" in s or "撤退" in s or "接盘" in s)
+
+        if positive > negative:
+            summary["overall_signal"] = "中长线偏多"
+        elif negative > positive:
+            summary["overall_signal"] = "中长线偏空"
+        else:
+            summary["overall_signal"] = "中性"
+
+        # ── 返回（含原始数据供深度分析）─────────────────────────
+        return {"summary": summary}
+
+    if len(code_list) == 1:
+        return _one(code_list[0])
+
+    results = {}
+    for code in code_list:
         try:
-            return fn()
+            results[code] = _one(code)
         except Exception as e:
-            logger.warning("[Capital] %s 超时/失败: %s", label, e)
-            return {}
-
-    margin = _safe(lambda: _get_margin_trading(code, days=60), "margin")
-    block = _safe(lambda: _get_block_trades(code, page_size=20), "block")
-    holders = _safe(lambda: _get_holder_count(code), "holders")
-    dividend = _safe(lambda: _get_dividend_history(code), "dividend")
-    financials = _safe(lambda: _get_financial_statements(code), "financials")
-
-    # ── 摘要计算 ─────────────────────────────────────────────
-    summary: Dict[str, Any] = {"stock_code": code}
-
-    # 1) 融资融券摘要
-    margin_records = margin.get("records", [])
-    if margin_records:
-        latest = margin_records[0]
-        rz_trend = [r.get("rzye", 0) for r in margin_records[:10]]
-        rz_direction = "上升" if len(rz_trend) >= 2 and rz_trend[0] > rz_trend[-1] else "下降" if len(rz_trend) >= 2 else "持平"
-        summary["margin"] = {
-            "latest_date": latest.get("date"),
-        }
-    else:
-        summary["margin"] = {"signal": "无数据"}
-
-    # 2) 大宗交易摘要
-    block_records = block.get("records", [])
-    if block_records:
-        premium_avg = sum(r.get("premium_pct", 0) for r in block_records) / len(block_records)
-        inst_buy = sum(1 for r in block_records if "机构" in str(r.get("buyer", "")))
-        signal = "溢价成交（正面）" if premium_avg > 5 else "折价成交（负面）" if premium_avg < -5 else "中性"
-        summary["block_trade"] = {
-            "recent_count": len(block_records),
-            "signal": signal,
-        }
-    else:
-        summary["block_trade"] = {"signal": "无大宗交易记录"}
-
-    # 3) 股东户数摘要
-    holder_records = holders.get("records", [])
-    if holder_records:
-        latest_h = holder_records[0]
-        prev_h = holder_records[1] if len(holder_records) > 1 else None
-        trend = "减少" if prev_h and latest_h.get("holder_num", 0) < prev_h.get("holder_num", 0) \
-                else "增加" if prev_h and latest_h.get("holder_num", 0) > prev_h.get("holder_num", 0) \
-                else "未知"
-        summary["holders"] = {
-            "latest_date": latest_h.get("date"),
-        }
-    else:
-        summary["holders"] = {"signal": "无数据"}
-
-    # 4) 分红送转摘要
-    div_records = dividend.get("records", [])
-    if div_records:
-        total_bonus = sum(r.get("bonus_rmb", 0) or 0 for r in div_records if r.get("bonus_rmb"))
-        continuous_years = len(set(str(r.get("date", ""))[:4] for r in div_records if r.get("bonus_rmb", 0) and r.get("bonus_rmb", 0) > 0))
-        summary["dividend"] = {
-            "record_count": len(div_records),
-        }
-    else:
-        summary["dividend"] = {"signal": "无分红记录"}
-
-    # 5) 财报三表摘要
-    balance = financials.get("balance_sheet", [])
-    income = financials.get("income_statement", [])
-    cash = financials.get("cash_flow", [])
-    summary["financials"] = {
-        "balance_sheet_items": len(balance),
-    }
-
-    # ── 综合信号 ─────────────────────────────────────────────
-    signals = [
-        summary.get("margin", {}).get("signal", ""),
-        summary.get("block_trade", {}).get("signal", ""),
-        summary.get("holders", {}).get("signal", ""),
-        summary.get("dividend", {}).get("signal", ""),
-    ]
-    positive = sum(1 for s in signals if "正面" in s or "看多" in s or "吸筹" in s or "友好" in s)
-    negative = sum(1 for s in signals if "负面" in s or "撤退" in s or "接盘" in s)
-
-    if positive > negative:
-        summary["overall_signal"] = "中长线偏多"
-    elif negative > positive:
-        summary["overall_signal"] = "中长线偏空"
-    else:
-        summary["overall_signal"] = "中性"
-
-    # ── 返回（含原始数据供深度分析）─────────────────────────
-    return {"summary": summary}
+            results[code] = {"error": str(e)}
+    return {"count": len(results), "data": results}

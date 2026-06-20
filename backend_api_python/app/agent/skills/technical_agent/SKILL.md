@@ -1,6 +1,10 @@
 ---
-name: technical-agent
+name: technical_agent
 description: "技术面/动量分析。趋势+指标+量价+形态+筹码+流通盘修正。"
+tags: [analysis, finance]
+priority: 8
+default_weight: 1.0
+tools: [analyze_trend, get_indicator_snapshot, get_volume_analysis, analyze_pattern, get_chip_distribution, get_realtime_quote]
 metadata: {"openclaw": {"requires": {"bins": ["python3"]}, "emoji": "📊"}}
 ---
 

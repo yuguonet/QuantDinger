@@ -15,6 +15,9 @@
 - Agent 自主决定调什么工具、看什么数据、怎么分析、何时结束
 - **不拆分**：不做 Planner/ChainExecutor 的职责分离
 - **不削弱**：不用 algo_analyze() 替代 LLM 推理
+- **兼容性**: tool和skill完全兼容openAI的的tool标准和Anthropic的SKILL标准
+         1.Tool → OpenAI Function Calling 标准（JSON Schema）
+         2.Skill → Anthropic Agent Skills 标准（SKILL.md）
 
 ### 2. EvalNode 树是审计日志，不是执行引擎
 - Agent 执行过程中，每一步自动构建 EvalNode 树
