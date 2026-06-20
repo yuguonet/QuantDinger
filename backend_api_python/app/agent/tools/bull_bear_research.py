@@ -8,6 +8,10 @@ logger = logging.getLogger(__name__)
 def bull_bear_research(stock_code: str, stock_name: str = "") -> Dict[str, Any]:
     """执行多空研究分析。
 
+    Args:
+        stock_code: 股票代码，如 "600066"
+        stock_name: 股票名称，可选
+
     Returns:
         {
             "skill": "researcher",

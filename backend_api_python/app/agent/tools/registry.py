@@ -170,17 +170,24 @@ class ToolRegistry:
                 )
                 self._tools[attr_name] = spec
 
-    def _wrap_as_smolagent(self, name: str) -> Any:
-        """将指定工具包装为 smolagents Tool（惰性）。"""
+    def _wrap_as_smolagent(self, name: str) -> Optional[Any]:
+        """将指定工具包装为 smolagents Tool（惰性）。
+
+        包装失败时返回 None 并记录警告，不抛异常。
+        """
         if name in self._smolagent_tools:
             return self._smolagent_tools[name]
         spec = self._tools.get(name)
         if spec is None:
-            raise KeyError(f"工具 '{name}' 未注册")
-        # smolagents.tool() 要求函数有完整 type hints
-        tool_obj = smolagents_tool(spec.fn)
-        self._smolagent_tools[name] = tool_obj
-        return tool_obj
+            logger.warning("[ToolRegistry] 工具 '%s' 未注册，跳过", name)
+            return None
+        try:
+            tool_obj = smolagents_tool(spec.fn)
+            self._smolagent_tools[name] = tool_obj
+            return tool_obj
+        except Exception as e:
+            logger.warning("[ToolRegistry] 工具 '%s' 包装失败，跳过: %s", name, e)
+            return None
 
     def get(self, name: str) -> Optional[_ToolSpec]:
         """获取已注册的工具规格。
@@ -239,11 +246,18 @@ def build_smolagent_tools(config: Optional[Dict[str, Any]] = None) -> List[Any]:
     domain = config.get("domain", "")
 
     tools = []
+    skipped = []
     for name in sorted(registry._tools.keys()):
         if name in deny or name == "final_answer":
             continue
         tool_obj = registry._wrap_as_smolagent(name)
-        tools.append(tool_obj)
+        if tool_obj is not None:
+            tools.append(tool_obj)
+        else:
+            skipped.append(name)
+    if skipped:
+        logger.warning("[ToolRegistry] %d 个工具加载失败已跳过: %s", len(skipped), ", ".join(skipped))
+    logger.info("[ToolRegistry] 成功加载 %d/%d 个工具", len(tools), len(tools) + len(skipped))
     return tools
 
 

@@ -53,7 +53,12 @@ def algo_analyze(stock_code, stock_name, tool_results, call_tool_fn=None):
     }
 
 def backtest_analysis(stock_code: str, stock_name: str = "") -> dict:
-    """薄壳入口：调用工具 + 算法分析，返回 dict。"""
+    """薄壳入口：调用工具 + 算法分析，返回 dict。
+
+    Args:
+        stock_code: 股票代码，如 "600066"
+        stock_name: 股票名称，可选
+    """
         
     results = {}
     try: results["list_strategies"] = list_strategies()

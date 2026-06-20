@@ -10,6 +10,11 @@ logger = logging.getLogger(__name__)
 def indicator_analysis(stock_code: str, stock_name: str = "", user_id: int = 1) -> Dict[str, Any]:
     """执行用户指标策略分析。
 
+    Args:
+        stock_code: 股票代码，如 "600066"
+        stock_name: 股票名称，可选
+        user_id: 用户 ID，默认 1
+
     流程：
       1. 加载用户指标列表
       2. 对每个指标：沙箱执行 + 信号统计 + 轻量回测

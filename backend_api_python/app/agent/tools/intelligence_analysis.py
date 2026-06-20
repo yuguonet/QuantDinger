@@ -11,6 +11,10 @@ logger = logging.getLogger(__name__)
 def intelligence_analysis(stock_code: str, stock_name: str = "") -> Dict[str, Any]:
     """执行个股情报+政策面分析。
 
+    Args:
+        stock_code: 股票代码，如 "600066"
+        stock_name: 股票名称，可选
+
     Returns:
         {
             "skill": "intelligence_agent",

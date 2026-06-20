@@ -505,7 +505,12 @@ class BBScreenerSkill:
 """BB超卖全市场扫描 — 布林带下轨突破策略筛选全市场，再对候选股做技术面深入分析。"""
 
 def bb_screener_scan(stock_code: str = "", stock_name: str = "") -> dict:
-    """薄壳入口，调用 BBScreenerSkill 执行全市场扫描。"""
+    """薄壳入口，调用 BBScreenerSkill 执行全市场扫描。
+
+    Args:
+        stock_code: 股票代码，可选，为空则全市场扫描
+        stock_name: 股票名称，可选
+    """
     from app.agent.tools import registry as tool_registry
     tool_registry.discover()
 
