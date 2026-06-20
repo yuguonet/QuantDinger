@@ -61,16 +61,6 @@
   EvalNode 树 → 存库 → 盘后回溯 → 权重迭代
 ```
 
-### 与 DESIGN_RESTRUCTURE 的关键区别
-
-| 维度 | DESIGN_RESTRUCTURE（废弃） | 本设计 |
-|------|--------------------------|--------|
-| 决策者 | Planner(LLM) + ChainExecutor(算法) | Agent(LLM，完整推理循环) |
-| Skill 间通信 | 无，线性盲执行 | Agent 看到前序结果后自主决定下一步 |
-| LLM 调用次数 | Planner 1次 + 每个 Skill 可能 1次 | Agent 内部按需调用（和现在一样） |
-| 自适应能力 | 无 | 有（agent 可根据中间结果调整策略） |
-| 可追责性 | 有（EvalNode 树） | 有（同样的 EvalNode 树） |
-
 ## 三、核心组件
 
 ### 3.1 TraceCollector — 执行追踪器
@@ -2021,8 +2011,8 @@ _chat_locked() ─────────────────────�
     │
     ▼
 _prepare_intent() ─────────────────────────────────
-│  1. 意图分析 ← LLM #1
-│  2. 快速通道判断
+│  1. 快速通道判断
+│  2. 意图分析 ← LLM #1
 │  3. 提取 stock_code
 │  4. 创建 TraceCollector
 │  5. 上下文拼接
