@@ -1,4 +1,13 @@
 # -*- coding: utf-8 -*-
+"""全市场短线选股 — 自动选择盘中/盘后/收盘策略进行市场筛选。"""
+from __future__ import annotations
+
+import logging
+from collections import Counter
+from datetime import datetime, timedelta
+from typing import Any, Callable, Dict, List, Optional
+
+# -*- coding: utf-8 -*-
 """
 Market Screener Skill — A股选股（盘中/尾盘/盘后统一入口，按时间自动切换策略）。
 
@@ -24,7 +33,6 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
 from app.agent.chain.schema import FactorItem, SkillReport
-from app.agent.skills.registry import skill
 
 logger = logging.getLogger(__name__)
 
@@ -1167,8 +1175,7 @@ def _prescreen_post_market(date: str) -> Dict[str, Any]:
     main_themes = [(tag, cnt) for tag, cnt in hot_tags[:5]]
 
     try:
-        from app.agent.tools.screening_tools import search_stocks
-        screener_result = search_stocks(
+                screener_result = search_stocks(
             query="涨幅1%到8% 换手率大于2% 非ST",
             source="eastmoney",
             top_n=100,
@@ -1412,7 +1419,6 @@ def _select_strategy() -> str:
 # Skill 定义
 # ═══════════════════════════════════════════════════════════════
 
-@skill("market_screener", auto_load=True)
 class MarketScreenerSkill:
     """A股选股（盘中/尾盘/盘后三合一，按时间自动切换）。"""
 
@@ -1799,3 +1805,112 @@ class MarketScreenerSkill:
             missing_data=_missing_data or [],
             status="ok",
         )
+
+
+# -*- coding: utf-8 -*-
+"""全市场短线选股 — 自动选择盘中/盘后/收盘策略进行市场筛选。"""
+
+def market_screen(stock_code: str = "", stock_name: str = "") -> dict:
+    """薄壳入口，返回 dict。"""
+    from app.agent.tools import registry as tool_registry
+    tool_registry.discover()
+
+    def call_tool_fn(tool_name, **kwargs):
+        spec = tool_registry.get(tool_name)
+        if not spec: raise ValueError(f"Unknown tool: {tool_name}")
+        return spec.fn(**kwargs)
+
+    from datetime import date
+
+    strategy = _select_strategy()
+    today = date.today().isoformat()
+
+    if strategy == "intraday":
+        report = _run_intraday("market_screener", today, call_tool_fn, [], [], [])
+    elif strategy == "eod":
+        report = _run_eod("market_screener", call_tool_fn, [], [], [])
+    else:
+        report = _run_post_market("market_screener", today, call_tool_fn, [], [], [])
+
+    if report is None:
+        return {"skill": "market_screener", "status": "failed", "error": "策略执行失败", "score": 0, "direction": "neutral", "confidence": 0, "factors": []}
+    if hasattr(report, "to_dict"):
+        d = report.to_dict()
+        d.setdefault("skill", "market_screener")
+        return d
+    if isinstance(report, dict):
+        report.setdefault("skill", "market_screener")
+        return report
+    return {"skill": "market_screener", "score": getattr(report, "score", 50),
+            "direction": getattr(report, "direction", "neutral"),
+            "signal": getattr(report, "signal", ""),
+            "analysis": str(getattr(report, "analysis", ""))[:2000],
+            "status": getattr(report, "status", "ok"), "confidence": 0.5, "factors": []}
+
+
+# ── 内联自 screener_tools.py ──
+
+def search_stocks(
+    query: str = "",
+    source: str = "auto",
+    filters: Optional[Dict[str, Any]] = None,
+    market: str = "全部",
+    top_n: int = 50,
+) -> Dict[str, Any]:
+    """统一选股工具：根据条件从全市场筛选股票。
+
+    支持自然语言条件（如 "PE<20 半导体"）和结构化 filters 字典。
+    source 参数控制数据源：auto(东财优先,本地DB兜底) / eastmoney / local_db。
+
+    Args:
+        query: 自然语言选股条件（如 "半导体 净利增长>15%"、"PE在5到20之间"）
+        source: 数据源 — auto(自动选择) / eastmoney(东财智能选股) / local_db(本地数据库)
+        filters: 结构化筛选条件字典（可选，与 query 互补）
+        market: 市场筛选（全部/A股/科创板/创业板/港股/美股/ETF基金）
+        top_n: 返回数量上限，默认50，最大200
+
+    Returns:
+        dict: {"stocks": [{"code": "600519", "name": "贵州茅台", "industry": "白酒", ...}, ...], "count": N}
+        取第一个结果: result["stocks"][0]["code"]
+    """
+    top_n = min(max(top_n, 1), 200)
+
+    # 如果有 filters 但没 query，从 filters 生成 keyword
+    if filters and not query:
+        query = build_keyword_from_filters(filters)
+        if market == "全部" and filters.get("_market"):
+            market = filters["_market"]
+
+    if not query or not query.strip():
+        return {"error": "选股条件不能为空（传入 query 或 filters）", "retriable": False}
+
+    search_keyword = query.strip()
+    if market and market != "全部" and market in MARKET_FILTER_MAP:
+        search_keyword = f"{market} {search_keyword}"
+
+    # ── eastmoney / auto 模式 ──
+    if source in ("eastmoney", "auto"):
+        raw = _call_eastmoney_api(search_keyword, page_size=top_n)
+        if str(raw.get("code")) == "100":
+            data = raw.get("data", {})
+            result = data.get("result", {})
+            stocks_raw = result.get("dataList", [])
+            total = result.get("total", len(stocks_raw))
+            stocks = [_parse_stock_item(s) for s in stocks_raw]
+            return {
+                "source": "eastmoney",
+                "keyword": query,
+                "market": market,
+                "total": total,
+                "count": len(stocks),
+                "stocks": stocks,
+            }
+        elif source == "eastmoney":
+            return {"error": raw.get("msg", "东财选股搜索失败"), "retriable": True}
+        # auto 模式下东财失败，继续 fallback
+
+    # ── local_db 模式 / auto fallback ──
+    if source in ("local_db", "auto"):
+        return _search_local_db(query, market, top_n)
+
+    return {"error": f"未知数据源: {source}", "retriable": False}

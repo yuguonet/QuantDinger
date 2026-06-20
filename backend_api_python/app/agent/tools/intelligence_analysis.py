@@ -1,17 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-intelligence_agent — 个股情报 + 政策面分析。
-
-评分规则定义在 SKILL.md，本文件是实现。
-输出: dict（标准化格式）
-
-核心逻辑:
-  - 个股情报: search_stock_intel() → composite_score() (RMS + 时间衰减 + 一票否决)
-  - 政策面: search_policy_intel() → composite_score()
-  - 只输出有实质影响的内容（|score| > 3），中性不显示
-  - 一票否决: composite_score() 检测 score=-999 → veto=True, stock_score=-5.0
-"""
-from __future__ import annotations
+"""个股情报+政策面分析 — 新闻/事件/舆情/解禁/减持/质押，RMS评分+一票否决。"""
 
 import logging
 from datetime import datetime
@@ -20,7 +8,7 @@ from typing import Any, Dict, List
 logger = logging.getLogger(__name__)
 
 
-def run(stock_code: str, stock_name: str = "", context: dict = None) -> Dict[str, Any]:
+def intelligence_analysis(stock_code: str, stock_name: str = "") -> Dict[str, Any]:
     """执行个股情报+政策面分析。
 
     Returns:
@@ -40,8 +28,7 @@ def run(stock_code: str, stock_name: str = "", context: dict = None) -> Dict[str
             "status": "ok",
         }
     """
-    from app.agent.tools.news_search_tools import search_stock_intel, search_policy_intel
-
+    
     # ── 个股情报 ──
     stock_result, stock_score, stock_veto, stock_signals = _analyze_stock(stock_code, stock_name)
 
@@ -135,8 +122,7 @@ def _analyze_stock(stock_code: str, stock_name: str):
     使用 search_stock_intel() → composite_score() (RMS + 时间衰减 + 一票否决)
     只输出有实质影响的内容（|score| > 3），中性不显示。
     """
-    from app.agent.tools.news_search_tools import search_stock_intel
-
+    
     result = {}
     score = 0.0
     veto = False
@@ -180,8 +166,7 @@ def _analyze_policy():
     输出格式和个股情报统一：总分 + 一票否决 + 1-20字说明(带日期)
     政策利好/利空哪个行业，1-20字说明。
     """
-    from app.agent.tools.news_search_tools import search_policy_intel
-
+    
     result = {}
     score = 0.0
     veto = False
@@ -260,3 +245,122 @@ def _extract_date(pub: str) -> str:
         return pub[:10]
     except Exception:
         return ""
+
+
+# ── 内联自 news_search_tools.py ──
+
+def _get_policy_from_cache() -> List[Dict[str, Any]]:
+    """政策新闻: 只读 DB 缓存 (scheduler 每日写入)"""
+    try:
+        from app.services.news_search import get_news_cache_manager
+        cached = get_news_cache_manager().get_items("POLICY", "CNStock")
+        if not cached:
+            return []
+        return [
+            {"title": r["title"], "link": r.get("url", ""),
+             "snippet": r.get("snippet", ""), "source": r.get("source", ""),
+             "published": r.get("published_date", ""),
+             "sentiment": r.get("sentiment", "neutral"),
+             "sentiment_score": r.get("sentiment_score")}
+            for r in cached
+        ]
+    except Exception as e:
+        logger.warning("读取 POLICY 缓存失败: %s", e)
+        return []
+
+def _get_news(symbol: str, market: str = "CNStock", name: str = "") -> List[Dict[str, Any]]:
+    """个股/板块新闻: 走 fetch_financial_news (缓存→搜索→写入)"""
+    try:
+        from app.services.news_search import fetch_financial_news
+        resp = fetch_financial_news(lang="all", market=market, symbol=symbol, name=name)
+        items = []
+        for lang_key in ("cn", "en"):
+            for it in resp.get(lang_key) or []:
+                items.append({
+                    "title": it.get("title", ""),
+                    "link": it.get("link", ""),
+                    "snippet": it.get("snippet", ""),
+                    "source": it.get("source", ""),
+                    "published": it.get("published", ""),
+                    "sentiment": it.get("sentiment", "neutral"),
+                    "sentiment_score": it.get("sentiment_score"),
+                })
+        return items
+    except Exception as e:
+        logger.warning("获取新闻失败 %s(%s): %s", symbol, market, e)
+        return []
+
+def _build_result(items: List[Dict[str, Any]], label: str) -> Dict[str, Any]:
+    """评分 + 排序: 一票否决置顶, 合计≤20条"""
+    from app.services.news_analysis import composite_score
+
+    articles = [
+        {"score": it.get("sentiment_score") or 0.0,
+         "published_date": it.get("published", "")}
+        for it in items
+    ]
+    score_info = composite_score(articles) if articles else {}
+
+    veto = score_info.get("veto", False)
+    veto_article = score_info.get("veto_article")
+
+    # 分离一票否决 vs 正常
+    veto_items, normal_items = [], []
+    for it in items:
+        sc = it.get("sentiment_score")
+        if sc == -999:
+            veto_items.append({**it, "_veto": True})
+        else:
+            normal_items.append(it)
+
+    # 正常按时间倒序
+    normal_items.sort(key=lambda x: x.get("published", ""), reverse=True)
+
+    # 合并: 一票否决置顶, 合计≤20
+    merged = veto_items + normal_items
+    merged = merged[:20]
+
+    return {
+        "label": label,
+        "composite_score": score_info.get("composite_score", 0),
+        "direction": score_info.get("direction", "中性"),
+        "veto": veto,
+        "veto_article": veto_article,
+        "count": len(merged),
+        "news": merged,
+    }
+
+def search_stock_intel(codes: str, name: str = "") -> Dict[str, Any]:
+    """搜索个股情报（新闻、公告、研报），支持多股批量获取。
+
+    Args:
+        codes: 逗号分隔的股票代码，如 "600519" 或 "600519,000001"
+        name: 股票名称，如 "贵州茅台"
+    """
+    code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
+    if not code_list:
+        return {"error": "codes 不能为空", "retriable": False}
+
+    def _one(stock_code: str) -> Dict[str, Any]:
+        items = _get_news(stock_code, "CNStock", name)
+        return _build_result(items, f"个股:{stock_code}")
+
+    if len(code_list) == 1:
+        return _one(code_list[0])
+
+    results = {}
+    for code in code_list:
+        try:
+            results[code] = _one(code)
+        except Exception as e:
+            results[code] = {"error": str(e)}
+    return {"count": len(results), "data": results}
+
+def search_policy_intel(market: str = "CNStock") -> Dict[str, Any]:
+    """搜索政策情报。
+
+    Args:
+        market: 市场或政策关键词
+    """
+    items = _get_policy_from_cache()
+    return _build_result(items, f"政策:{market}")

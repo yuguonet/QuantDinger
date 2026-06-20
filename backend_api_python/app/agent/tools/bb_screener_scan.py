@@ -1,4 +1,13 @@
 # -*- coding: utf-8 -*-
+"""BB超卖全市场扫描 — 布林带下轨突破策略筛选全市场，再对候选股做技术面深入分析。"""
+from __future__ import annotations
+
+import logging
+import math
+from datetime import datetime, timedelta
+from typing import Any, Callable, Dict, List, Optional
+
+# -*- coding: utf-8 -*-
 """
 BB Screener Skill — BB超卖全市场扫描 + 逐只深入分析。
 
@@ -20,7 +29,6 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
 from app.agent.chain.schema import FactorItem, SkillReport
-from app.agent.skills.registry import skill
 
 logger = logging.getLogger(__name__)
 
@@ -358,7 +366,6 @@ def _deep_analyze_one(code, bb_hit, call_tool_fn, _tool_calls, _tool_nodes, _mis
 # Skill 定义
 # ═══════════════════════════════════════════════════════════════
 
-@skill("bb_screener", auto_load=True)
 class BBScreenerSkill:
     """BB超卖全市场扫描 + 深入分析。"""
 
@@ -492,3 +499,28 @@ class BBScreenerSkill:
             },
             status="ok",
         )
+
+
+# -*- coding: utf-8 -*-
+"""BB超卖全市场扫描 — 布林带下轨突破策略筛选全市场，再对候选股做技术面深入分析。"""
+
+def bb_screener_scan(stock_code: str = "", stock_name: str = "") -> dict:
+    """薄壳入口，调用 BBScreenerSkill 执行全市场扫描。"""
+    from app.agent.tools import registry as tool_registry
+    tool_registry.discover()
+
+    def call_tool_fn(tool_name, **kwargs):
+        spec = tool_registry.get(tool_name)
+        if not spec: raise ValueError(f"Unknown tool: {tool_name}")
+        return spec.fn(**kwargs)
+
+    skill = BBScreenerSkill()
+    result = skill.run(call_tool_fn=call_tool_fn)
+    if isinstance(result, dict):
+        result.setdefault("skill", "bb_screener")
+        return result
+    return {"skill": "bb_screener", "score": 50, "direction": "neutral",
+            "confidence": 0.4, "signal": "BB扫描完成", "factors": [],
+            "analysis": str(result)[:500], "status": "ok"}
+
+
