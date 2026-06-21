@@ -20,7 +20,7 @@ Agent — smolagents Agent for QuantDinger.
 
 配置：
   AGENT_TYPE=code|tool     — Agent 类型（默认 code）
-  AGENT_MAX_STEPS=10       — 最大步数
+  AGENT_MAX_STEPS=6       — 最大步数
   AGENT_TIMEOUT_SECONDS=180 — 超时
   INTENT_ANALYSIS_ENABLED=true — 意图分析开关
 

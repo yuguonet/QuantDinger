@@ -116,7 +116,7 @@ def _run_single(message: str, session_id: str = None, skills: list = None):
 
     executor = build_agent_executor(
         user_id=1,
-        max_steps=int(os.getenv("AGENT_MAX_STEPS", "10")),
+        max_steps=int(os.getenv("AGENT_MAX_STEPS", "6")),
         timeout_seconds=float(os.getenv("AGENT_TIMEOUT_SECONDS", "180")),
     )
 
@@ -161,7 +161,7 @@ def _run_interactive(session_id: str = None):
 
     executor = build_agent_executor(
         user_id=1,
-        max_steps=int(os.getenv("AGENT_MAX_STEPS", "10")),
+        max_steps=int(os.getenv("AGENT_MAX_STEPS", "6")),
         timeout_seconds=float(os.getenv("AGENT_TIMEOUT_SECONDS", "180")),
     )
 
@@ -244,7 +244,7 @@ def _run_single_stream(message: str, session_id: str = None, skills: list = None
 
     executor = build_agent_executor(
         user_id=1,
-        max_steps=int(os.getenv("AGENT_MAX_STEPS", "10")),
+        max_steps=int(os.getenv("AGENT_MAX_STEPS", "6")),
         timeout_seconds=float(os.getenv("AGENT_TIMEOUT_SECONDS", "180")),
     )
 
