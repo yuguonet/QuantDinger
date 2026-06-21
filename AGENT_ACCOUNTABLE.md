@@ -1,6 +1,6 @@
 # Agent 可追责架构设计
 
-> 最后更新: 2026-06-20
+> 最后更新: 2026-06-21
 > 状态: 实施中
 > 仓库: https://github.com/yuguonet/QuantDinger
 
@@ -9,11 +9,16 @@
 ### 1. Agent 是唯一的决策者
 - smolagents CodeAgent 保持完整推理-行动-观察循环
 - Agent 自主决定调什么工具、看什么数据、怎么分析、何时结束
-- **不拆分**：不做 Planner/ChainExecutor 的职责分离
+- **Planner 只规划，不执行**：Planner 产出执行计划，注入 Agent 上下文，由 Agent 自己用 read_skill + 工具执行
 - **不削弱**：不用 algo_analyze() 替代 LLM 推理
 - **兼容性**: tool 和 skill 完全兼容 OpenAI 的 tool 标准和 Anthropic 的 SKILL 标准
   - Tool → OpenAI Function Calling 标准（JSON Schema）
   - Skill → Anthropic Agent Skills 标准（SKILL.md）
+
+### 1.1 设计终极目标
+- **最大实现可复测**：同样的输入条件能重放 → 才能验证决策对不对 → 才能迭代权重
+- **最终目的**：减小系统 bug 或规则不完善带来的亏钱
+- 四个闭环各自堵一个漏洞，复杂但必要
 
 ### 2. EvalNode 树是审计日志，不是执行引擎
 - Agent 执行过程中，每一步自动构建 EvalNode 树
@@ -37,19 +42,27 @@
     │
     ▼
 ┌──────────────────────────────────────────────────────────┐
-│  smolagents CodeAgent                                     │
-│  ┌────────────────────────────────────────────────────┐   │
-│  │  推理循环: Observe → Think → Act → Observe → ...   │   │
-│  └────────────────────────────────────────────────────┘   │
-│                                                           │
+│  Intent Analyzer (LLM #1)                                │
+│    → domain / verb / noun / strategy / stock_code        │
+│                                                          │
+│  _try_chain()                                            │
+│    → tool_chains.json 匹配 或 Planner (LLM #2) 规划     │
+│    → 返回执行计划文本（不执行）                            │
+│    → 注入 Agent 上下文                                    │
+│                                                          │
+│  smolagents CodeAgent                                    │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │  推理循环: Observe → Think → Act → Observe → ...   │  │
+│  │  Agent 用 read_skill + 工具 自主执行计划            │  │
+│  └────────────────────────────────────────────────────┘  │
+│                                                          │
 │  工具集:                                                  │
 │    ① 80+ 普通工具 (get_kline, analyze_trend, ...)        │
-│    ② call_skill 工具 (调用 Skill，返回标准化 SkillReport)  │
+│    ② read_skill 工具 (加载 SKILL.md 指令)                │
 │    ③ final_answer 工具 (结束并输出最终结论)                │
-│                                                           │
+│                                                          │
 │  自动记录层 (TraceCollector):                              │
 │    每次 tool_call → EvalNode 子树                         │
-│    每次 call_skill → SkillReport + EvalNode               │
 │    最终 answer → Chain 根节点                             │
 └──────────────────────────────────────────────────────────┘
     │
@@ -72,23 +85,29 @@
 │  3. 提取 stock_code
 │  4. 创建 TraceCollector
 │  5. 上下文拼接（历史摘要 + 领域上下文）
-│  6. Planner ← LLM #2
-│     注入: 人设 + 上下文 + 全量 skill + 全量 tool + 规则
-│     输出: [{phase, skill, tools}, ...] 全部阶段一次性规划
+│  6. _try_chain() 获取执行计划                              │
+│     ├─ tool_chains.json 匹配 → 直接返回计划               │
+│     ├─ 未匹配 → Planner (LLM #2) 规划 → 返回计划         │
+│     └─ 无 verb/noun 或规划失败 → 返回 None               │
+│     计划格式：每个 phase 独立自包含                         │
+│     （任务 + 技能 + 工具 + 说明 + 规则）                    │
+│     注入 Agent 上下文（enriched）                           │
 └──────────────────────────────────────────────────────
     │
     ▼
 阶段 2: _execute_plan() ──── 按 phase 顺序循环 ────
 │  for phase in plan.phases:
 │  ┌────────────────────────────────────────────────┐
-│  │  7. 构建精简 Agent                             │
-│  │     只加载当前 phase 的 rules/skill/tools      │
-│  │  8. agent.run() ← LLM #3 (单 phase 执行)      │
+│  │  7. 构建 Agent（只加载当前 phase 的内容）       │
+│  │     - 当前 phase 的任务描述                     │
+│  │     - 当前 phase 的 skill 指令                  │
+│  │     - 当前 phase 的工具子集                     │
+│  │     - 当前 phase 的规则                         │
+│  │  8. agent.run() ← LLM #3（单 phase 执行）      │
+│  │     Agent 只看到这 1 步，专注完成               │
 │  │  9. 错误检测:                                  │
-│  │     ├─ 成功 → 继续下一个 phase                 │
-│  │     └─ 工具失效 + steps ≤ PLAN_PHASE_FAST_EXIT │
-│  │        → 快速退出，返回 LLM #2 决策            │
-│  │        → LLM #2: 返回结果 / 提问 / 另选路径    │
+│  │     ├─ 成功 → 保存结果，进入下一个 phase        │
+│  │     └─ 工具失效 → 快速退出，LLM #2 决策        │
 │  └────────────────────────────────────────────────┘
 │  全部 phase 完成 → 进入阶段 3
 └──────────────────────────────────────────────────────
@@ -110,11 +129,11 @@
 
 | 设计点 | 说明 |
 |--------|------|
-| Planner 前置 | LLM #2 在阶段 1 完成全部规划，拿到完整上下文 |
-| 一次规划多阶段 | LLM #2 一次输出全部 phase，无错直接循环 |
-| 错误快速退出 | 工具失效时不跑满 max_steps，快速返回 LLM #2 决策 |
-| 精简 Agent | 每个 phase 只加载当前需要的 rules/skill/tools |
+| Planner 只规划不执行 | LLM #2 产出计划文本，注入 Agent 上下文，Agent 自己执行 |
+| 计划注入而非调度 | 不经过 ChainExecutor 逐个调 Skill，Agent 用 read_skill + 工具自行执行 |
+| 错误快速退出 | 工具连续失败 ≥ 阈值时不跑满 max_steps，快速退出重试 |
 | 负面反馈前置 | 在 Planner 之前生效，影响规划决策 |
+| 根节点兜底写入 | 非 traced 策略在阶段 3 后写根节点到 qd_traces，保证回溯验证有数据 |
 
 ### 3.3 配置项
 
@@ -159,7 +178,9 @@ PLAN_PHASE_FAST_EXIT_STEPS=3   # 工具失效快速退出步数阈值
 
 ### 4.3 Planner — 规划器
 
-**职责**: 当无固定链路匹配时，用 LLM 规划 Skill 执行方案。
+**职责**: 当无固定链路匹配时，用 LLM 规划 Skill 执行方案。规划结果注入 Agent 上下文，由 Agent 自己执行。
+
+**设计本质**: Chain 编排层是从用户消息到执行入口的便捷路线，缓存好的思维捷径，省去 LLM #2 的重复思考。不是逐个调度 Skill 的执行器。
 
 **注入内容**:
 | 内容 | 来源 | 用途 |
@@ -203,13 +224,20 @@ PLAN_PHASE_FAST_EXIT_STEPS=3   # 工具失效快速退出步数阈值
 
 ### 4.5 Evaluator — 评估器
 
-**职责**: 盘后回溯验证，更新权重。
+**职责**: 盘后回溯验证，统一驱动权重更新和链路学习。
 
 **数据来源**: `qd_traces` 表 + `qd_skill_weights` + `qd_factor_weights`
 
 **更新逻辑**:
-- Skill 权重: 按单位时间收益率聚合
-- 因子权重: 按单位时间收益率聚合（带时间衰减）
+- Skill 权重: 按单位时间收益率聚合（多次 T+N 验证渐进调权）
+- 因子权重: 按单位时间收益率聚合（带时间衰减，不同因子半衰期不同）
+- 链路学习: 验证正确的链路才写入 tool_chains.json（5 道质量门）
+
+**追踪能力**:
+- Skill 维度: `qd_skill_weights.return_per_day` 下降 → 该 Skill 在退化
+- 因子维度: `qd_factor_weights.win_rate` 下降 → 该因子在失效
+- 链路维度: `tool_chains.json.stats.success_rate` 下降 → 该工具组合在失效
+- 工具维度: `qd_traces` 中 tool 层节点的 correct 统计 → 哪个工具在出错
 
 ## 五、语义文件结构
 
@@ -227,7 +255,7 @@ semantics/
 **职责分离**:
 | 文件 | 注入到 | 职责 |
 |------|--------|------|
-| `planner.md` | Planner LLM | 选什么 Skill、为什么选、用什么工具 |
+| `planner.md` | Planner LLM | 选什么 Skill、为什么选、输出执行计划 |
 | `guidance.md` | Agent instructions | 按顺序执行、怎么调 call_skill |
 | `persona.md` | Planner + Agent | 人设 |
 | `intent.md` | IntentAnalyzer | 意图分类规则 |
@@ -291,25 +319,45 @@ CREATE TABLE qd_skill_weights (
 
 ## 七、四个闭环
 
-### 7.1 学习闭环
-```
-agent.run() → TraceCollector 存库 → 盘后回测 → 权重更新
-```
+四个闭环各自堵一个漏洞，不能去掉任何一个。终极目标：减小系统 bug 或规则不完善带来的亏钱。
 
-### 7.2 编排闭环
+### 7.1 记录闭环（数据源）
 ```
-Planner 规划 → ChainExecutor 执行 → 结果注入 Agent → 决策输出
+agent.run() → TraceCollector → EvalNode 树存库 → qd_traces
 ```
+**作用**：记录每一步执行过程，是其他三个闭环的数据源。
+**去掉后果**：没有数据，回测和溯源都废了。
 
-### 7.3 惩罚闭环
+### 7.2 T+N 回测闭环（概率验证 + 渐进调权）
 ```
-用户负面反馈 → 惩罚 trace → 惩罚 tool_chains → 删除低质量链路
+每天盘后 15:30 → evaluate_pending() → 取实际行情 → 写回 correct/pnl_pct
+  → update_skill_weights()      # 哪个 Skill 权重在下降
+  → update_factor_weights()     # 哪个因子权重在下降
 ```
+**作用**：用实际行情客观验证预测方向，多次验证渐进调权（单次对错无意义，看统计）。
+**核心指标**：单位时间收益率（不是胜率）。
+**追踪能力**：权重下降 → 识别哪个 Skill/因子在退化。
+**去掉后果**：无法区分预测对不对，权重失去客观依据。
 
-### 7.4 异步回测闭环
+### 7.3 用户反馈闭环（加速检测 tool 故障）
 ```
-T+N 天后 → 自动回测 → 评估决策正确性 → 更新权重
+用户说"不对/垃圾/反了" → detect_feedback_severity()
+  → trace 层: mark_root_wrong() / delete_tree()
+  → chain 层: penalize_chain() → success_count 扣减 → 累计后删除
 ```
+**作用**：检测执行层故障（tool 更新、数据源挂了、API 变了）。T+N 回测也能通过统计发现，但需要 N 轮，期间持续亏钱。用户反馈是加速器。
+**和 T+N 的关系**：不在同一层——用户反馈检测**执行层**（工具坏了），T+N 检测**预测层**（方向对不对）。
+**去掉后果**：tool 坏了要等 N 轮 T+N 才能淘汰，期间持续亏钱。
+
+### 7.4 编排路径学习闭环（省去 LLM #2 重复工作量）
+```
+首次执行成功 → _writeback_chain() → 存入 tool_chains.json
+  → 第二次执行 → _try_chain() 匹配 → 直接返回计划 → 注入 Agent 上下文
+```
+**作用**：首次走一遍后，后续直接使用编排路径，省去 LLM #2（Planner 大脑）的重复思考。
+**本质**：Chain 编排层是从用户消息到执行入口的便捷路线，是缓存好的思维捷径。
+**质量门**：5 道拦截（步数>5、链长>5、评分<60、工具成功率<50%、旧链已验证），防止学习低质量链路。
+**去掉后果**：每次都从零规划，重复消耗 LLM #2 token。
 
 ## 八、工具分类
 
@@ -384,12 +432,13 @@ backend_api_python/app/agent/
 ├── text_utils.py         # 文本工具
 ├── run.py                # CLI 入口
 ├── chain/                # 链路系统
-│   ├── chains.py         # 链路定义
-│   ├── executor.py       # 链路执行器
-│   ├── evaluator.py      # 链路评估器
-│   ├── schema.py         # 数据结构
-│   ├── store.py          # 链路存储
-│   └── tool_chains.json  # 学习积累的链路
+│   ├── chains.py         # 链路定义 (ChainDef/ChainStep)
+│   ├── executor.py       # 链路执行器（死代码，已不被调用）
+│   ├── evaluator.py      # 回溯评估引擎（T+N 验证 + 权重更新）
+│   ├── schema.py         # 数据结构 (EvalNode/SkillReport/FactorItem)
+│   ├── store.py          # qd_traces 持久化
+│   ├── contract.py       # Skill 输出解析契约
+│   └── tool_chains.json  # 学习积累的编排路径
 ├── semantics/            # 语义文件
 │   ├── __init__.py       # 语义加载器
 │   ├── persona.md        # 人设
