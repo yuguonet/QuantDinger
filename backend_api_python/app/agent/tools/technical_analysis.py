@@ -7,7 +7,7 @@ from typing import Any, Dict, List
 
 def call_tools(stock_code: str) -> Dict[str, Any]:
     """调用 6 个技术分析工具 + basicinfo，返回结果字典。"""
-            from app.utils.basicinfo_db import get_stock_basic_db
+    from app.utils.basicinfo_db import get_stock_basic_db
 
     results = {}
     for name, fn in [
@@ -341,7 +341,7 @@ def analyze_trend(codes: str) -> Dict[str, Any]:
     """获取股票的综合技术趋势分析，包括均线排列、MACD、RSI、BOLL和KDJ等指标，支持多股批量获取。
 
     Args:
-        codes: 逗号分隔的股票代码，如 "600519" 或 "600519,000001"
+        codes: 多股用逗号分隔"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
@@ -523,7 +523,7 @@ def get_volume_analysis(codes: str) -> Dict[str, Any]:
     """量能分析：量比、换手率、成交量趋势，支持多股批量获取。
 
     Args:
-        codes: 逗号分隔的股票代码，如 "600519" 或 "600519,000001"
+        codes: 多股用逗号分隔"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
@@ -609,7 +609,7 @@ def analyze_pattern(codes: str) -> Dict[str, Any]:
     """识别K线形态（增强版），支持多股批量获取：锤子线、十字星、吞没、早晨/晚星、三连阳/阴、长上影/下影、缺口等。
 
     Args:
-        codes: 逗号分隔的股票代码，如 "600519" 或 "600519,000001"
+        codes: 多股用逗号分隔"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
@@ -756,7 +756,7 @@ def get_chip_distribution(codes: str, lookback_days: int = 120) -> Dict[str, Any
     用指数衰减加权（近期筹码权重更高），汇总计算各维度指标。
 
     Args:
-        codes: 逗号分隔的股票代码，如 "600519" 或 "600519,000001"（也兼容 search_stock 返回的 dict）
+        codes: 多股用逗号分隔"（也兼容 search_stock 返回的 dict）
         lookback_days: 回看天数，默认120天
     """
     # 兼容 search_stock 返回的 dict: {'results': [{'code': '600593', ...}], ...}
@@ -801,7 +801,7 @@ def get_indicator_snapshot(codes: str) -> Dict[str, Any]:
     """单次获取多个技术指标快照（MACD、RSI、BOLL、KDJ等），支持多股批量获取。
 
     Args:
-        codes: 逗号分隔的股票代码，如 "600519" 或 "600519,000001"
+        codes: 多股用逗号分隔"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
@@ -864,7 +864,7 @@ def get_realtime_quote(codes: str) -> Dict[str, Any]:
     """获取股票实时行情数据，支持多股批量获取。
 
     Args:
-        codes: 逗号分隔的股票代码，如 "600519" 或 "600519,000001"
+        codes: 多股用逗号分隔"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:

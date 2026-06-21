@@ -95,10 +95,13 @@ class ToolRegistry:
         spec = self._tools.get(name)
         if spec is None:
             raise KeyError(f"工具 '{name}' 未注册")
-        # smolagents.tool() 要求函数有完整 type hints
-        tool_obj = smolagents_tool(spec.fn)
-        self._smolagent_tools[name] = tool_obj
-        return tool_obj
+        try:
+            tool_obj = smolagents_tool(spec.fn)
+            self._smolagent_tools[name] = tool_obj
+            return tool_obj
+        except Exception as e:
+            logger.warning("[ToolRegistry] 工具 %s 包装失败，跳过: %s", name, e)
+            return None
 
     def get(self, name: str) -> Optional[_ToolSpec]:
         """获取工具 spec（含 .fn 属性）。"""
@@ -133,7 +136,8 @@ def build_smolagent_tools(config: Optional[Dict[str, Any]] = None) -> List[Any]:
         if name in deny or name == "final_answer":
             continue
         tool_obj = registry._wrap_as_smolagent(name)
-        tools.append(tool_obj)
+        if tool_obj is not None:
+            tools.append(tool_obj)
     return tools
 
 

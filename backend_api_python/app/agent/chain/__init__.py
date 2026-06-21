@@ -14,7 +14,7 @@ from app.agent.chain.schema import (
     EvalNode, SkillReport, FactorItem,
     Layer, Status, Action, Direction,
     VETO_SCORE, COVERAGE_THRESHOLD, DIRECTION_THRESHOLD,
-    get_skill_cn_name, classify_return, is_direction_correct,
+    classify_return, is_direction_correct,
 )
 from app.agent.chain.store import (
     save_tree, load_tree, query_roots, query_pending_verify,
@@ -33,7 +33,7 @@ __all__ = [
     "EvalNode", "SkillReport", "FactorItem",
     "Layer", "Status", "Action", "Direction",
     "VETO_SCORE", "COVERAGE_THRESHOLD", "DIRECTION_THRESHOLD",
-    "get_skill_cn_name", "classify_return", "is_direction_correct",
+    "classify_return", "is_direction_correct",
     "save_tree", "load_tree", "query_roots", "query_pending_verify",
     "update_verify_results", "update_skill_verify",
     "get_skill_weights", "get_factor_weights",

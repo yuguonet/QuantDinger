@@ -69,7 +69,7 @@ def get_fund_flow_daily(codes: str, days: int = 120) -> Dict[str, Any]:
     """获取个股历史资金流向（日线级别），支持多股批量获取。
 
     Args:
-        codes: 逗号分隔的股票代码，如 "600519" 或 "600519,000001"
+        codes: 多股用逗号分隔"
         days: 回溯天数，默认120
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]

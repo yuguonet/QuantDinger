@@ -6,6 +6,14 @@ from typing import Any, Dict
 
 
 def algo_analyze(stock_code, stock_name, tool_results, call_tool_fn=None):
+    """策略回测分析 — 评估用户策略的历史表现。
+
+    Args:
+        stock_code: 股票代码
+        stock_name: 股票名称
+        tool_results: 工具调用结果字典
+        call_tool_fn: 工具调用函数（可选）
+    """
     factors = []
     best_score = 50.0
     best_strategy = None

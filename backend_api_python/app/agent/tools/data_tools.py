@@ -22,16 +22,17 @@ from app.data_sources.market_detector import detect_market as _detect_market
 # ── Tool functions ────────────────────────────────────────────
 
 def search_stock_by_name(keyword: str, market: str = "CNStock", limit: int = 10) -> Dict[str, Any]:
-    """根据中文名称或关键词搜索股票代码,支持模糊搜索。
+    """根据中文名称或代码或关键词搜索股票代码,股票名称,支持模糊搜索,简拼,混合搜索。
 
     Args:
         keyword: 搜索关键词（中文股票名称、代码片段等）
-        market: 市场，默认 CNStock（可选：CNStock、HKStock、Crypto、USStock）
+        market: 市场，默认 CNStock
         limit: 返回数量上限，默认10
 
     Returns:
         dict: {"results": [{"code": "600519", "name": "贵州茅台", "market": "SH"}, ...], "count": N}
-        取第一个结果: result["results"][0]["code"]
+        取第一个结果代码: result["results"][0]["code"]
+        取第一个结果名称: result["results"][0]["name"]        
     """
     keyword = (keyword or "").strip()
     if not keyword:
@@ -58,7 +59,7 @@ def get_realtime_quote(codes: str) -> Dict[str, Any]:
     """获取股票实时行情数据，支持多股批量获取。
 
     Args:
-        codes: 逗号分隔的股票代码，如 "600519" 或 "600519,000001"
+        codes: 多股用逗号分隔"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
@@ -93,7 +94,7 @@ def agent_get_kline(codes: str, timeframe: str = "1D", days: int = 60, market: s
     """获取股票/交易对的K线数据（OHLCV），支持多股批量获取。
 
     Args:
-        codes: 逗号分隔的股票代码，如 "000001" 或 "000001,600519"（也支持交易对如 BTC/USDT）
+        codes: 多股用逗号分隔
         timeframe: K线周期，可选值: 1m, 5m, 15m, 30m, 1H, 4H, 1D, 1W。默认 1D（日线）
         days: 获取天数，默认60天，最大250天（仅对日线及以上周期有意义）
         market: 市场类型，可选值: CNStock, HKStock, Crypto, Forex, USStock, Futures, MOEX。
@@ -146,7 +147,7 @@ def get_stock_info(codes: str) -> Dict[str, Any]:
     """获取股票基本信息（名称、行业、市值等），支持多股批量获取。
 
     Args:
-        codes: 逗号分隔的股票代码，如 "600519" 或 "600519,000001"
+        codes: 多股用逗号分隔"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:

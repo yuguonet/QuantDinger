@@ -368,11 +368,15 @@ class Planner:
         """从规划数据构建 ChainDef。"""
         steps = []
         for i, step_data in enumerate(plan_data.get("steps", []), 1):
+            # 兼容 "skill" 和 "agent" 两个字段名
+            agent = step_data.get("skill", "") or step_data.get("agent", "")
             steps.append(ChainStep(
-                name=step_data.get("agent", ""),
-                agent=step_data.get("agent", ""),
+                name=agent,
+                agent=agent,
                 order=i,
-                required=(i == 1),  # 第一步必须成功
+                description=step_data.get("description", ""),
+                required=(i == 1),
+                rules=step_data.get("rules", ""),
             ))
 
         # 收集 Planner 上下文（关键信息传递给各 Skill Agent）

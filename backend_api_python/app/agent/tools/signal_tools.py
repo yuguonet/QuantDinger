@@ -85,7 +85,7 @@ def get_stock_concept_blocks(codes: str) -> Dict[str, Any]:
     """获取个股所属板块/概念归属（东财 slist），支持多股批量获取。
 
     Args:
-        codes: 逗号分隔的股票代码，如 "600519" 或 "600519,000001"
+        codes: 多股用逗号分隔"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:

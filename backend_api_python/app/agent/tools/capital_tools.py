@@ -158,7 +158,7 @@ def get_capital_summary(codes: str) -> Dict[str, Any]:
     并生成结构化摘要供中长线持仓决策参考。
 
     Args:
-        codes: 逗号分隔的股票代码，如 "600519" 或 "600519,000001"
+        codes: 多股用逗号分隔"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:

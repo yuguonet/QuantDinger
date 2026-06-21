@@ -106,7 +106,7 @@ def search_stock_intel(codes: str, name: str = "") -> Dict[str, Any]:
     """搜索个股情报（新闻、公告、研报），支持多股批量获取。
 
     Args:
-        codes: 逗号分隔的股票代码，如 "600519" 或 "600519,000001"
+        codes: 多股用逗号分隔"
         name: 股票名称，如 "贵州茅台"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
@@ -153,7 +153,7 @@ def search_comprehensive_intel(codes: str, name: str = "") -> Dict[str, Any]:
     """综合情报搜索（个股+板块+政策），支持多股批量获取。
 
     Args:
-        codes: 逗号分隔的股票代码，如 "600519" 或 "600519,000001"
+        codes: 多股用逗号分隔"
         name: 股票名称，如 "贵州茅台"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]

@@ -32,7 +32,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from app.agent.chain.schema import (
     Action, Direction, EvalNode, Layer, SkillReport, Status,
-    VETO_SCORE, COVERAGE_THRESHOLD, get_skill_cn_name, run_skill,
+    VETO_SCORE, COVERAGE_THRESHOLD,
 )
 from app.agent.chain import store
 from app.agent.chain.contract import parse_skill_output
@@ -100,7 +100,7 @@ class DecisionResult:
             parts = []
             for child in self.root_node.children:
                 if child.layer == Layer.SKILL.value:
-                    cn = get_skill_cn_name(child.name)
+                    cn = child.name
                     s = f"{child.score:.0f}" if child.score is not None else "—"
                     parts.append(f"{cn}:{s}/{child.direction}")
             if parts:
@@ -129,7 +129,7 @@ class DecisionResult:
         if self.root_node and self.root_node.children:
             d["breakdown"] = [
                 {
-                    "skill": get_skill_cn_name(c.name),
+                    "skill": c.name,
                     "score": c.score,
                     "direction": c.direction,
                     "signal": c.signal,
@@ -153,7 +153,7 @@ class ChainExecutor:
 
     Usage:
         executor = ChainExecutor(chain_id="evaluate+stock", stock_code="600519")
-        result = executor.execute(run_skill_fn=my_run_skill, call_llm=my_llm)
+        result = executor.execute(call_llm=my_llm)
     """
 
     def __init__(
@@ -216,6 +216,7 @@ class ChainExecutor:
         """
         t0 = time.time()
         context = context or {}
+        self._call_llm = call_llm
 
         # 创建根节点（chain 层）
         root = EvalNode(
@@ -268,31 +269,81 @@ class ChainExecutor:
         previous_outputs: List[SkillReport],
         context: Dict[str, Any],
     ) -> tuple:
-        """执行单个 Skill。"""
-        try:
-            # 构造上下文（包含前序 skill 结果）
-            step_context = dict(context)
-            if previous_outputs:
-                step_context["previous_results"] = [
-                    {"skill": r.skill_name, "signal": r.signal, "direction": r.direction}
-                    for r in previous_outputs if r.status == "ok"
-                ]
+        """执行单个 Skill（新架构：SKILL.md + LLM 执行）。"""
+        t0 = time.time()
+        skill_name = step.agent
 
-            report, skill_node = run_skill(
-                step.agent, self.stock_code, self.stock_name, step_context,
+        try:
+            # 1. 从 registry 获取 SKILL.md body
+            from app.agent.skills.registry import get_skill_body
+            skill_body = get_skill_body(skill_name)
+            if not skill_body:
+                raise ValueError(f"Skill '{skill_name}' 的 SKILL.md 未找到或为空")
+
+            # 2. 构造 prompt
+            parts = [
+                f"你是量化分析 Skill '{skill_name}' 的执行器。",
+                f"\n## 任务指令\n{skill_body}",
+                f"\n## 标的\n股票: {self.stock_name or '未知'}（{self.stock_code}）",
+            ]
+            if previous_outputs:
+                prev_summary = []
+                for r in previous_outputs:
+                    if r.status == "ok":
+                        prev_summary.append(f"- {r.skill_name}: {r.direction} / {r.score:.0f}分 / {r.signal}")
+                if prev_summary:
+                    parts.append(f"\n## 前序分析结果\n" + "\n".join(prev_summary))
+            user_query = context.get("user_query", "")
+            if user_query:
+                parts.append(f"\n## 用户原始问题\n{user_query}")
+
+            prompt = "\n".join(parts)
+
+            # 3. 调用 LLM
+            call_llm = getattr(self, "_call_llm", None)
+            if not call_llm:
+                raise ValueError("call_llm 未设置，无法执行 Skill")
+            raw_output = call_llm(prompt)
+
+            # 4. 解析输出 → SkillReport
+            report = parse_skill_output(raw_output, skill_name)
+
+            # 5. 构建 EvalNode
+            elapsed_ms = (time.time() - t0) * 1000
+            skill_node = EvalNode(
+                layer=Layer.SKILL.value,
+                name=skill_name,
+                exec_date=date.today(),
+                stock_code=self.stock_code,
+                stock_name=self.stock_name,
+                score=report.score,
+                direction=report.direction,
+                signal=report.signal,
+                confidence=report.confidence,
+                factors=list(report.factors),
+                analysis=report.analysis,
+                output_data=report.output_data,
+                status=Status.OK.value if report.status == "ok" else Status.FAILED.value,
+                error=report.error,
+                elapsed_ms=elapsed_ms,
             )
+
+            logger.info("[ChainExecutor] Skill %s | score=%.0f dir=%s status=%s | %.0fms",
+                        skill_name, report.score, report.direction, report.status, elapsed_ms)
             return report, skill_node
 
         except Exception as e:
-            logger.warning("[ChainExecutor] Skill %s 失败: %s", step.name, e)
+            elapsed_ms = (time.time() - t0) * 1000
+            logger.warning("[ChainExecutor] Skill %s 失败: %s (%.0fms)", skill_name, e, elapsed_ms)
             report = SkillReport(
-                skill_name=step.agent, status="failed", error=str(e),
+                skill_name=skill_name, status="failed", error=str(e),
             )
             skill_node = EvalNode(
                 layer=Layer.SKILL.value,
-                name=step.agent,
+                name=skill_name,
                 status=Status.FAILED.value,
                 error=str(e),
+                elapsed_ms=elapsed_ms,
             )
             return report, skill_node
 
@@ -329,9 +380,9 @@ class ChainExecutor:
         gaps = []
         for r in skill_reports:
             if r.status == "missing":
-                gaps.append(f"{get_skill_cn_name(r.skill_name)}: 数据缺失")
+                gaps.append(f"{r.skill_name}: 数据缺失")
             elif r.status == "failed":
-                gaps.append(f"{get_skill_cn_name(r.skill_name)}: {r.error}")
+                gaps.append(f"{r.skill_name}: {r.error}")
 
         # 否决 → 直接 skip
         if has_veto:
@@ -480,7 +531,7 @@ class ChainExecutor:
         """将各 Skill 报告格式化为 LLM 可读的文本。"""
         parts = []
         for r in skill_reports:
-            cn_name = get_skill_cn_name(r.skill_name)
+            cn_name = r.skill_name
             direction_cn = {"bullish": "看多", "bearish": "看空", "neutral": "中性"}.get(r.direction, "中性")
 
             part = f"### {cn_name}（{r.skill_name}）\n"
@@ -617,7 +668,7 @@ class ChainExecutor:
         # 构造推理摘要
         parts = []
         for r in skill_reports:
-            cn = get_skill_cn_name(r.skill_name)
+            cn = r.skill_name
             parts.append(f"{cn}:{r.direction}/{r.score:.0f}")
         reasoning = f"加权评分 {score:.1f}。各维度: {', '.join(parts)}"
 

@@ -70,11 +70,15 @@ description: 规划器 prompt — 人设、核心哲学、技能选择规则、�
   "steps": [
     {
       "skill": "technical_agent",
-      "tools": ["analyze_trend", "get_indicator_snapshot", "agent_get_kline"]
+      "description": "技术面趋势分析，五维加权评分",
+      "tools": ["analyze_trend", "get_indicator_snapshot", "agent_get_kline"],
+      "rules": "先取K线再算指标，关注MACD金叉"
     },
     {
       "skill": "intelligence_agent",
-      "tools": ["search_stock_news", "get_market_sentiment"]
+      "description": "个股情报搜索，解释异动原因",
+      "tools": ["search_stock_news", "get_market_sentiment"],
+      "rules": "只做解释不做预测，龙虎榜数据盘后才有"
     }
   ],
   "stocks": ["600519"],
@@ -86,6 +90,12 @@ description: 规划器 prompt — 人设、核心哲学、技能选择规则、�
   }
 }
 ```
+
+每个 step 的字段说明：
+- `skill`: 技能名（必填）
+- `description`: 这一步要做什么（必填，10字以内）
+- `tools`: 需要的工具列表（必填，从可用工具中选）
+- `rules`: 这一步的执行规则（选填，简短具体）
 
 ### context 字段说明
 
