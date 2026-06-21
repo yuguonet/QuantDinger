@@ -110,11 +110,11 @@ def search_stocks(
     """统一选股工具：根据条件从全市场筛选股票。
 
     支持自然语言条件（如 "PE<20 半导体"）和结构化 filters 字典。
-    source 参数控制数据源：auto(东财优先,本地DB兜底) / eastmoney / local_db。
+    source 参数控制数据源：auto(东财优先) / eastmoney。
 
     Args:
         query: 自然语言选股条件（如 "半导体 净利增长>15%"、"PE在5到20之间"）
-        source: 数据源 — auto(自动选择) / eastmoney(东财智能选股) / local_db(本地数据库)
+        source: 数据源 — auto(自动选择) / eastmoney(东财智能选股)
         filters: 结构化筛选条件字典（可选，与 query 互补）
         market: 市场筛选（全部/A股/科创板/创业板/港股/美股/ETF基金）
         top_n: 返回数量上限，默认50，最大200
@@ -159,52 +159,7 @@ def search_stocks(
             return {"error": raw.get("msg", "东财选股搜索失败"), "retriable": True}
         # auto 模式下东财失败，继续 fallback
 
-    # ── local_db 模式 / auto fallback ──
-    if source in ("local_db", "auto"):
-        return _search_local_db(query, market, top_n)
-
     return {"error": f"未知数据源: {source}", "retriable": False}
-
-def _search_local_db(keyword: str, market: str = "CNStock", limit: int = 50) -> Dict[str, Any]:
-    """本地 DB 选股（cnstock_selection 表）。"""
-    from app.utils.db import get_db_connection
-
-    try:
-        with get_db_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT MAX(date) AS d FROM cnstock_selection")
-            row = cur.fetchone() or {}
-            target_date = str(row.get("d") or "")
-            if not target_date:
-                return {"source": "local_db", "stocks": [], "count": 0, "message": "选股数据为空"}
-
-            cur.execute(
-                "SELECT * FROM cnstock_selection WHERE date = %s ORDER BY id DESC LIMIT %s",
-                (target_date, limit),
-            )
-            rows = cur.fetchall() or []
-            cur.close()
-
-        stocks = []
-        for r in rows:
-            d = dict(r)
-            for k in ("change_rate", "turnover_rate", "volume_ratio", "new_price"):
-                if d.get(k) is not None:
-                    try:
-                        d[k] = float(d[k])
-                    except (ValueError, TypeError):
-                        pass
-            stock = {}
-            for k in ("code", "name", "industry", "concept", "change_rate",
-                       "turnover_rate", "volume_ratio", "new_price", "market"):
-                if k in d:
-                    stock[k] = d[k]
-            stocks.append(stock)
-
-        return {"source": "local_db", "date": target_date, "count": len(stocks), "stocks": stocks}
-    except Exception as e:
-        logger.error("_search_local_db failed: %s", e, exc_info=True)
-        return {"source": "local_db", "stocks": [], "count": 0, "error": str(e)}
 
 # ══════════════════════════════════════════════════════════════
 #  筛选条件转换（原 screener_filters.py）

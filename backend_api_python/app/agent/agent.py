@@ -179,6 +179,21 @@ def _build_instructions(user_message: str = "",
     if tools is not None:
         tool_catalog = f"\n## 工具分类\n\n{_generate_tool_catalog(tools, managed_agents)}\n"
 
+    # Anthropic Agent Skills catalog
+    skill_catalog = ""
+    try:
+        from app.agent.skills.registry import get_skill_catalog_text
+        _catalog = get_skill_catalog_text()
+        if _catalog:
+            skill_catalog = (
+                "\n## 可用技能 (Agent Skills)\n\n"
+                "以下技能提供特定任务的专业指令。"
+                "当任务匹配技能描述时，用 read_skill 工具加载完整指令，然后按指令执行。\n\n"
+                f"{_catalog}\n"
+            )
+    except Exception:
+        pass
+
     # 意图分析上下文（前置分析器的输出）
     intent_section = ""
     if intent_context:
@@ -242,6 +257,7 @@ def _build_instructions(user_message: str = "",
 
     return f"""{preamble}
 {agent_rules_text}
+{skill_catalog}
 {tool_catalog}
 {scan_section}{modify_section}{intent_section}{domain_section}{calibration_section}{weight_section}{finance_json_section}{lang_section}"""
 
@@ -585,13 +601,13 @@ def get_smolagent(
         # 始终拷贝，避免修改缓存原始列表
         tools = list(_tools_cache_by_domain[domain_key])
 
-    # ── 注册 call_skill 工具（Anthropic Agent Skills 兼容层）──
+    # ── 注册 read_skill 工具（Anthropic Agent Skills 标准）──
     try:
-        from app.agent.skills.call_skill_tool import get_call_skill_tool
-        call_skill = get_call_skill_tool()
-        tools.append(call_skill)
+        from app.agent.skills.call_skill_tool import get_read_skill_tool
+        read_skill = get_read_skill_tool()
+        tools.append(read_skill)
     except Exception as e:
-        logger.warning("[Agent] call_skill 工具加载失败: %s", e)
+        logger.warning("[Agent] read_skill 工具加载失败: %s", e)
 
     # ── 金融领域：用 TracedTool 包装所有工具 ──────────────────
     if collector:
@@ -606,12 +622,20 @@ def get_smolagent(
 
     AgentClass = _get_agent_class()
 
+    # ── 确保项目根目录在 sys.path（沙箱 import 需要）──
+    import sys as _sys
+    _backend_root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+    if _backend_root not in _sys.path:
+        _sys.path.insert(0, _backend_root)
+
     # ── Always build fresh agent (avoid cross-session state pollution) ──
     _extra_kwargs = {}
     if AgentClass is CodeAgent:
         _extra_kwargs["additional_authorized_imports"] = [
             "pandas", "numpy", "json", "math", "statistics",
             "datetime", "collections", "itertools", "re",
+            # 项目模块（app.* 通配符放行所有子模块）
+            "app.*",
         ]
         # 代码执行超时（默认 30s 太短，批量工具调用会超时）
         _code_exec_timeout = int(os.getenv("CODE_EXECUTION_TIMEOUT", "120"))
@@ -978,12 +1002,50 @@ class _AgentExecutor:
     def _execute_phase(self, agent, enriched, max_steps, context, meta, store, session_id):
         """执行单个阶段，返回 (success, content, tool_calls_log, total_steps, total_tokens, charts_b64, result_obj)。
 
-        工具失效时快速退出（不跑满 max_steps），返回错误信息供 LLM #2 决策。
+        §3.1 步骤 9 错误检测：
+          - 成功 → 返回 success
+          - 工具失效 + steps ≤ PLAN_PHASE_FAST_EXIT → 快速退出，返回错误供 LLM #2 决策
         """
         fast_exit_steps = int(os.getenv("PLAN_PHASE_FAST_EXIT_STEPS", "3"))
 
         t0 = time.time()
         result = agent.run(enriched, max_steps=max_steps)
+
+        # ── §3.1 步骤 9: 错误检测 + 快速退出 ──────────────────
+        total_steps = len(result.steps) if hasattr(result, 'steps') and result.steps else 0
+        if hasattr(result, 'steps') and result.steps:
+            tool_failures = 0
+            for step in result.steps:
+                if step.get('type') == 'action' and step.get('error'):
+                    tool_failures += 1
+                elif step.get('type') == 'action':
+                    for tc in step.get('tool_calls', []):
+                        pass  # tool_calls 本身不报错，看 step.error
+
+            # 连续工具失败达到阈值 → 快速退出
+            consecutive_failures = 0
+            max_consecutive = 0
+            for step in result.steps:
+                if step.get('type') == 'action':
+                    if step.get('error'):
+                        consecutive_failures += 1
+                        max_consecutive = max(max_consecutive, consecutive_failures)
+                    else:
+                        consecutive_failures = 0
+
+            if max_consecutive >= fast_exit_steps and total_steps <= max_steps:
+                logger.warning(
+                    "[Phase] 工具连续失败 %d 步（阈值 %d），快速退出",
+                    max_consecutive, fast_exit_steps
+                )
+                # 返回失败，供 _chat_locked 决定是否重试或返回 LLM #2
+                elapsed = time.time() - t0
+                error_content = f"工具连续失败 {max_consecutive} 步，快速退出。最后错误: "
+                for step in reversed(result.steps):
+                    if step.get('type') == 'action' and step.get('error'):
+                        error_content += str(step['error'])[:200]
+                        break
+                return False, error_content, [], total_steps, 0, [], result
 
         # ── 解析 agent 输出 ──
         if hasattr(result, "output"):
@@ -1175,7 +1237,7 @@ class _AgentExecutor:
                 model="intent-quick-reply", error=None,
             )
 
-        # ── 阶段 2: 执行阶段（可多轮） ────────────────────────
+        # ── 阶段 2: 执行阶段（可多轮，§3.1 错误检测 + LLM #2 决策）──
         max_retries = int(os.getenv("PLAN_PHASE_MAX_RETRIES", "1"))
         last_error = ""
 
@@ -1186,12 +1248,19 @@ class _AgentExecutor:
             if success:
                 break  # 成功，进入阶段 3
 
-            # 工具失效 → 快速退出，记录错误
+            # §3.1 步骤 9: 工具失效 → 快速退出，记录错误
             last_error = content  # content 此时是错误信息
             logger.warning("[Phase] 阶段执行失败 (attempt=%d/%d): %s", attempt + 1, max_retries + 1, last_error)
 
-            # TODO: 返回 LLM #2 决策（返回/提问/另选路径）
-            # 当前实现：重试 max_retries 次后继续
+            # §3.1: 返回 LLM #2 决策（返回结果 / 提问 / 另选路径）
+            # 不再盲目重试，将错误信息注入上下文让 Planner 决策
+            if attempt < max_retries:
+                enriched = (
+                    f"[上一阶段执行失败]\n"
+                    f"错误: {last_error[:500]}\n\n"
+                    f"请根据错误决定: 返回已有结果 / 向用户提问 / 换一种分析方式\n\n"
+                    f"{enriched}"
+                )
 
         # ── 阶段 3: 结果处理 ──────────────────────────────────
         return self._post_process(

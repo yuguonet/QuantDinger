@@ -54,20 +54,32 @@ _BUILTINS_WHITELIST: Set[str] = {
 }
 
 # Modules allowed in user code via `import xxx`
+# 危险模块黑名单（禁止导入）
+BLOCKED_IMPORT_MODULES: Set[str] = {
+    'builtins', 'io', 'multiprocessing', 'os', 'pathlib',
+    'pty', 'shutil', 'socket', 'subprocess', 'sys',
+    'ctypes', 'signal', 'threading', '_thread',
+}
+
+# 安全模块白名单（兼容旧接口）
 SAFE_IMPORT_MODULES: Set[str] = {
     'numpy', 'pandas', 'math', 'json', 'datetime', 'time',
     'collections', 'functools', 'itertools', 'statistics',
     'decimal', 'fractions', 'operator', 'copy',
+    'app', 're', 'random', 'queue', 'stat', 'unicodedata',
 }
 
 
 def _make_safe_import():
-    """Create a restricted __import__ that only allows whitelisted modules."""
+    """Create a restricted __import__ that blocks dangerous modules.
+
+n    黑名单模式：放行所有模块，只拦截黑名单中的危险模块。
+    """
     def safe_import(name, *args, **kwargs):
         root = name.split('.')[0]
-        if root in SAFE_IMPORT_MODULES:
-            return _builtins_mod.__import__(name, *args, **kwargs)
-        raise ImportError(f"Import not allowed: {name}")
+        if root in BLOCKED_IMPORT_MODULES:
+            raise ImportError(f"Import blocked (dangerous module): {name}")
+        return _builtins_mod.__import__(name, *args, **kwargs)
     return safe_import
 
 

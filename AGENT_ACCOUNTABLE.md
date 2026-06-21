@@ -126,8 +126,11 @@ PLAN_PHASE_FAST_EXIT_STEPS=3   # 工具失效快速退出步数阈值
 ```
 
 ## 四、核心组件
+### 4.1a Skill Registry — 技能注册表
 
-### 4.1 Tool Registry — 工具注册表
+**职责**: 扫描 `agent/skills/` 目录，自动发现并注册技能。
+**插件化**: 新增技能只需往 `skills/` 目录扔文件夹和skill.md文件，零配置。
+### 4.1b Tool Registry — 工具注册表
 
 **职责**: 扫描 `agent/tools/` 目录，自动发现并注册工具。
 
@@ -136,7 +139,7 @@ PLAN_PHASE_FAST_EXIT_STEPS=3   # 工具失效快速退出步数阈值
 - 跳过 `_` 开头的文件
 - 有 docstring 的公开函数 → 自动注册
 
-**工具定义**: 纯 OpenAI Function Calling 标准
+**工具定义**: 纯 OpenAI Function Calling 或 Tool Calling 标准
 - `name`: 函数名
 - `description`: docstring 第一行
 - `parameters`: type hints 自动生成

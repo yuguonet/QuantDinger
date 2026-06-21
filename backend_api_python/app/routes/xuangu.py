@@ -64,26 +64,8 @@ def _cleanup_cancel_event(user_id: int):
 # ================================================================
 @xuangu_bp.route("/")
 def index():
-    """选股器概览：最新数据日期和记录数"""
-    try:
-        with get_db_connection() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT MAX(date) AS latest_date, COUNT(*) AS total "
-                "FROM cnstock_selection"
-            )
-            row = cur.fetchone() or {}
-            cur.close()
-        return jsonify({
-            "code": 0,
-            "data": {
-                "latest_date": str(row.get("latest_date") or ""),
-                "total_records": int(row.get("total") or 0),
-            },
-        })
-    except Exception as e:
-        logger.error(f"xuangu index failed: {e}", exc_info=True)
-        return jsonify({"code": 1, "msg": str(e), "data": {}}), 500
+    """选股器概览"""
+    return jsonify({"code": 0, "data": {"message": "选股功能暂未配置数据源"}})
 
 
 # ================================================================
@@ -92,29 +74,8 @@ def index():
 # ================================================================
 @xuangu_bp.route("/stats")
 def table_stats():
-    """返回 cnstock_selection 表的统计信息"""
-    try:
-        with get_db_connection() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT date, COUNT(*) AS cnt "
-                "FROM cnstock_selection "
-                "GROUP BY date ORDER BY date DESC LIMIT 10"
-            )
-            date_counts = [dict(r) for r in (cur.fetchall() or [])]
-
-            cur.execute(
-                "SELECT COUNT(DISTINCT code) AS stock_count, "
-                "MAX(date) AS latest_date, MIN(date) AS earliest_date "
-                "FROM cnstock_selection"
-            )
-            summary = dict(cur.fetchone() or {})
-            cur.close()
-
-        return jsonify({"code": 0, "data": {"summary": summary, "by_date": date_counts}})
-    except Exception as e:
-        logger.error(f"table_stats failed: {e}", exc_info=True)
-        return jsonify({"code": 1, "msg": str(e)}), 500
+    """选股数据统计（暂未配置）"""
+    return jsonify({"code": 0, "data": {"summary": {}, "by_date": [], "message": "暂未配置数据源"}})
 
 
 # ================================================================

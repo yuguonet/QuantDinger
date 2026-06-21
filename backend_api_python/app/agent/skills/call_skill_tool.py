@@ -1,59 +1,64 @@
 # -*- coding: utf-8 -*-
 """
-call_skill — Agent 调用 Skill 的统一入口（smolagents Tool 子类）。
+read_skill — Agent 读取 Skill 的 SKILL.md body（smolagents Tool 子类）。
 
-继承 smolagents.Tool，description/inputs 作为类属性，不受 docstring 解析限制。
-description 和 skill_name 可选值从 registry 动态生成，新增 skill 无需改此文件。
+遵循 Anthropic Agent Skills 标准：
+  - Agent 看到 catalog（system prompt 中）后，按需调用此工具加载完整 SKILL.md body
+  - 此工具只返回 body 内容，不执行代码
+  - Agent 读取 body 后，用自身工具（code-run、bash 等）执行
+
+与旧版 call_skill_tool 的区别：
+  - 旧版：CallSkillTool.forward() → importlib → mod.run() → 直接执行 Python 代码
+  - 新版：ReadSkillTool.forward() → 返回 SKILL.md body → Agent 自行执行
 """
 from __future__ import annotations
 
 from smolagents import Tool
 
-from app.agent.skills.registry import run_skill, all_skills
+from app.agent.skills.registry import all_skills, get_skill_body, get_skill_dir
 
 
 def _build_description() -> str:
     """从 registry 动态生成工具描述。"""
     skills = all_skills()
     if not skills:
-        return "调用指定的分析技能（Skill），返回标准化分析报告。当前无可用技能。"
-    parts = [f"{name}({info.description[:20]})" for name, info in skills.items()]
-    return "调用指定的分析技能（Skill），返回标准化分析报告。可用技能: " + ", ".join(parts)
+        return "读取指定 Skill 的 SKILL.md 完整指令。当前无可用技能。"
+    parts = [f"{info.display_name}" for info in skills.values()]
+    return (
+        "读取指定 Skill 的 SKILL.md 完整指令（含执行方式）。"
+        "加载后按 body 中的指令执行。可用技能: " + ", ".join(parts)
+    )
 
 
 def _build_skill_name_enum() -> str:
     """从 registry 动态生成 skill_name 可选值。"""
     skills = all_skills()
-    return ", ".join(skills.keys()) if skills else "(无可用技能)"
+    return ", ".join(info.display_name for info in skills.values()) if skills else "(无可用技能)"
 
 
-class CallSkillTool(Tool):
-    """调用指定的分析技能（Skill），返回标准化分析报告。"""
+class ReadSkillTool(Tool):
+    """读取指定 Skill 的 SKILL.md 完整指令，Agent 按指令自行执行。"""
 
-    name = "call_skill"
+    name = "read_skill"
     description = _build_description()
     inputs = {
         "skill_name": {
             "type": "string",
             "description": f"技能名称，可选值: {_build_skill_name_enum()}",
         },
-        "stock_code": {
-            "type": "string",
-            "description": "股票代码（6位数字），部分技能可为空",
-            "nullable": True,
-        },
-        "stock_name": {
-            "type": "string",
-            "description": "股票名称（可选）",
-            "nullable": True,
-        },
     }
-    output_type = "object"
+    output_type = "string"
 
-    def forward(self, skill_name: str, stock_code: str = "", stock_name: str = "") -> dict:
-        return run_skill(skill_name, stock_code, stock_name)
+    def forward(self, skill_name: str) -> str:
+        body = get_skill_body(skill_name)
+        if body is None:
+            return f"错误: 未找到技能 '{skill_name}'。可用技能: {', '.join(info.display_name for info in all_skills().values())}"
+
+        dir_path = get_skill_dir(skill_name)
+        header = f"<!-- Skill: {skill_name} | Dir: {dir_path} -->\n\n"
+        return header + body
 
 
-def get_call_skill_tool():
-    """获取 call_skill 工具实例（供 agent.py 使用）。"""
-    return CallSkillTool()
+def get_read_skill_tool():
+    """获取 read_skill 工具实例（供 agent.py 使用）。"""
+    return ReadSkillTool()

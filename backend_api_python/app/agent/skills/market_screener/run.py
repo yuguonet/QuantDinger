@@ -6,7 +6,7 @@ A股全市场短线选股 — Anthropic Agent Skills 执行入口。
 
 框架调用方式：
     from market_screener.run import run
-    result = run(call_tool_fn=my_call_tool_fn)
+    result = run(stock_code="", stock_name="", context=None)
 """
 
 from __future__ import annotations
@@ -14,40 +14,45 @@ from __future__ import annotations
 import logging
 from collections import Counter
 from datetime import datetime, timedelta, date
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from app.agent.tools.screener_tools import search_stocks
+from app.agent.tools.analysis_tools import get_indicator_snapshot
+from app.market_cn.tape import get_fund_flow_realtime
 from app.agent.chain.schema import FactorItem, SkillReport
 
 logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════
+#  工具分发（替代框架注入的 call_tool_fn）
+# ═══════════════════════════════════════════════════════════════
+
+_TOOL_REGISTRY = {
+    "get_fund_flow_realtime": get_fund_flow_realtime,
+    "get_indicator_snapshot": get_indicator_snapshot,
+    "search_stocks": search_stocks,
+}
+
+
+def _call_tool(name: str, **kwargs) -> Any:
+    """按名称分发工具调用。"""
+    fn = _TOOL_REGISTRY.get(name)
+    if fn is None:
+        return {"error": f"未知工具: {name}"}
+    try:
+        return fn(**kwargs)
+    except Exception as e:
+        logger.warning("[market_screener] 工具 %s 调用失败: %s", name, e)
+        return {"error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════
 #  框架标准入口
 # ═══════════════════════════════════════════════════════════════
 
-def run(
-    call_tool_fn: Callable,
-    stock_code: str = "",
-    stock_name: str = "",
-    **kwargs,
-) -> Dict[str, Any]:
-    """Agent 框架调用的标准入口。
-
-    两阶段流程：
-      Phase 1 — Python 预筛选（0 token）：从涨停池、强势股、热门板块等
-                数据源获取原始数据，按策略规则筛选候选标的。
-      Phase 2 — 对候选股逐只调用工具做深入分析（资金流向、技术指标快照等），
-                计算综合评分并生成操作建议。
-
-    Args:
-        call_tool_fn: Agent 框架注入的工具调用函数
-        stock_code: 留空即可，本技能为全市场扫描
-        stock_name: 留空即可，本技能为全市场扫描
-
-    Returns:
-        dict: 符合 skill.md 输出结构的结果字典
-    """
+def run() -> Dict[str, Any]:
+    """一步完成 Phase 1 + Phase 2。"""
     strategy = _select_strategy()
     today = date.today().isoformat()
     _tool_calls: List[str] = []
@@ -57,9 +62,9 @@ def run(
     logger.info("[market_screener] 执行策略: %s", strategy)
 
     runners = {
-        "intraday":    lambda: _run_intraday(today, call_tool_fn, _tool_calls, _tool_nodes, _missing_data),
-        "eod":         lambda: _run_eod(call_tool_fn, _tool_calls, _tool_nodes, _missing_data),
-        "post_market": lambda: _run_post_market(today, call_tool_fn, _tool_calls, _tool_nodes, _missing_data),
+        "intraday":    lambda: _run_intraday(today, _call_tool, _tool_calls, _tool_nodes, _missing_data),
+        "eod":         lambda: _run_eod(_call_tool, _tool_calls, _tool_nodes, _missing_data),
+        "post_market": lambda: _run_post_market(today, _call_tool, _tool_calls, _tool_nodes, _missing_data),
     }
 
     report = runners[strategy]()
@@ -98,6 +103,281 @@ def run(
     d.setdefault("skill", "market_screener")
     d["strategy_used"] = strategy
     d["tools_called"] = _tool_calls
+    return d
+
+
+def _deep_from_prescreen_intraday(prescreen, call_tool_fn, _tool_calls, _tool_nodes, _missing_data):
+    """Phase 2 包装：从 prescreen 结果做深入分析（盘中）。"""
+    market = prescreen["market"]
+    main_themes = prescreen["main_themes"]
+    candidates = prescreen["candidates"]
+
+    if market["mood_score"] < 30:
+        return SkillReport(
+            skill_name="market_screener", score=25.0, direction="bearish",
+            confidence=0.7,
+            signal=f"市场冰点（涨停{market['zt_count']}跌停{market['dt_count']}），不宜短线",
+            analysis=f"## 盘中短线选股 — 市场冰点\n\n涨停 {market['zt_count']} 只，跌停 {market['dt_count']} 只，炸板率 {market['broken_rate']}%。\n\n**建议：空仓观望，等待情绪回暖。**",
+            factors=[
+                FactorItem(name="涨停数", value=str(market["zt_count"]), score=market["mood_score"]),
+                FactorItem(name="跌停数", value=str(market["dt_count"]), score=max(0, 100 - market["dt_count"] * 3)),
+            ],
+            status="ok",
+        )
+
+    if not candidates:
+        return SkillReport(
+            skill_name="market_screener", score=45.0, direction="neutral",
+            confidence=0.5, signal="今日无明确短线标的",
+            analysis=f"## 盘中短线选股 — 无明确标的\n\n市场情绪：{market['mood']}（涨停{market['zt_count']}跌停{market['dt_count']}）",
+            factors=[FactorItem(name="市场情绪", value=market["mood"], score=market["mood_score"])],
+            status="ok",
+        )
+
+    tech_results = {}
+    for c in candidates[:15]:
+        tech = _tech_check(c["code"])
+        if tech:
+            tech_results[c["code"]] = tech
+
+    analyzed = []
+    for c in candidates[:8]:
+        tech = tech_results.get(c["code"])
+        result = _deep_analyze_intraday(c, tech, call_tool_fn, _tool_calls, _tool_nodes, _missing_data)
+        if result:
+            analyzed.append(result)
+
+    # Phase 2: 过滤低分（观望/卖出），只保留高分候选
+    analyzed = [a for a in analyzed if a.get("score", 0) >= 60 and a.get("direction") == "bullish"]
+    analyzed.sort(key=lambda x: -x.get("score", 0))
+
+    return _build_report_intraday(prescreen, analyzed, main_themes, market, candidates)
+
+
+def _build_report_intraday(prescreen, analyzed, main_themes, market, candidates):
+    """构建盘中短线 SkillReport。"""
+    if analyzed:
+        avg_score = sum(a["score"] for a in analyzed) / len(analyzed)
+        bullish = sum(1 for a in analyzed if a["direction"] == "bullish")
+    else:
+        avg_score = 50.0
+        bullish = 0
+
+    direction = "bullish" if avg_score >= 55 else ("bearish" if avg_score < 45 else "neutral")
+    confidence = min(0.9, 0.4 + len(analyzed) * 0.06)
+
+    factors = [
+        FactorItem(name="市场情绪", value=market["mood"], score=market["mood_score"]),
+        FactorItem(name="候选股数", value=str(len(candidates)), score=min(100, len(candidates) * 8 + 30)),
+        FactorItem(name="深入分析数", value=str(len(analyzed)), score=min(100, len(analyzed) * 12 + 20)),
+        FactorItem(name="看多比例", value=f"{bullish}/{len(analyzed) or len(candidates)}", score=int(avg_score)),
+    ]
+
+    lines = [
+        "## 盘中短线选股结果",
+        f"市场情绪: {market['mood']} | 涨停{market['zt_count']} 跌停{market['dt_count']} 炸板率{market['broken_rate']}%",
+        f"主线题材: {', '.join(t for t, _ in main_themes[:5]) or '无明确主线'}",
+        f"候选: {len(candidates)}只 | 深入分析: {len(analyzed)}只 | 综合评分: {avg_score:.0f}",
+        "",
+    ]
+    for a in analyzed:
+        src = a.get("source", "")
+        lines.append(f"- **{a['code']}** {a.get('name', '')} | 评分{a['score']:.0f} | {a['direction']} | {src} | {a['signal']}")
+
+    return SkillReport(
+        skill_name="market_screener", score=round(avg_score, 1),
+        direction=direction, confidence=confidence,
+        signal=f"短线{bullish}只看多候选，主线:{', '.join(t for t, _ in main_themes[:2]) or '无'}",
+        factors=factors, analysis="\n".join(lines),
+        output_data={"market": market, "main_themes": main_themes, "candidates": candidates[:15], "analyzed": analyzed},
+        status="ok",
+    )
+
+
+def _deep_from_prescreen_eod(prescreen, call_tool_fn, _tool_calls, _tool_nodes, _missing_data):
+    """Phase 2 包装：从 prescreen 结果做深入分析（尾盘）。"""
+    candidates = prescreen["candidates"]
+    main_themes = prescreen["main_themes"]
+
+    if not candidates:
+        return SkillReport(
+            skill_name="market_screener", score=40.0, direction="neutral",
+            confidence=0.5, signal="今日无合适隔夜标的",
+            analysis=f"## 尾盘选股 — 无合适标的\n\n条件选股扫描 {prescreen['screener_count']} 只，尾盘封板 {prescreen['zt_eod_count']} 只。",
+            factors=[FactorItem(name="条件选股", value=str(prescreen["screener_count"]), score=40)],
+            status="ok",
+        )
+
+    analyzed = []
+    for c in candidates[:6]:
+        result = _deep_analyze_eod(c, call_tool_fn, _tool_calls, _tool_nodes, _missing_data)
+        if result:
+            analyzed.append(result)
+
+    # Phase 2: 过滤低分（观望/卖出），只保留高分候选，按分数排序
+    analyzed = [a for a in analyzed if a.get("score", 0) >= 60 and a.get("direction") == "bullish"]
+    analyzed.sort(key=lambda x: -x.get("score", 0))
+
+    if analyzed:
+        avg_score = sum(a["score"] for a in analyzed) / len(analyzed)
+        bullish = len(analyzed)
+    else:
+        avg_score = 50.0
+        bullish = 0
+
+    direction = "bullish" if avg_score >= 55 else ("bearish" if avg_score < 45 else "neutral")
+    confidence = min(0.85, 0.4 + len(analyzed) * 0.07)
+    lines = ["## 尾盘选股结果", f"候选: {len(candidates)}只 | 高分通过: {len(analyzed)}只"]
+    for a in analyzed:
+        lines.append(f"- **{a['code']}** {a.get('name', '')} | 评分{a['score']:.0f} | {a['direction']} | {a['signal']}")
+
+    return SkillReport(
+        skill_name="market_screener", score=round(avg_score, 1),
+        direction=direction, confidence=confidence,
+        signal=f"隔夜{bullish}只高分候选，主线:{', '.join(t for t, _ in main_themes[:2]) or '无'}",
+        factors=[], analysis="\n".join(lines),
+        output_data={"main_themes": main_themes, "candidates": candidates[:15], "analyzed": analyzed},
+        status="ok",
+    )
+
+
+def _deep_from_prescreen_post_market(prescreen, call_tool_fn, _tool_calls, _tool_nodes, _missing_data):
+    """Phase 2 包装：从 prescreen 结果做深入分析（盘后）。"""
+    candidates = prescreen["candidates"]
+    main_themes = prescreen["main_themes"]
+
+    if not candidates:
+        return SkillReport(
+            skill_name="market_screener", score=40.0, direction="neutral",
+            confidence=0.5, signal="今日无符合形态的短线标的",
+            analysis=f"## 盘后短线选股 — 无合适标的\n\n扫描 {prescreen['scanned']} 只股票，未发现符合技术形态条件的标的。",
+            factors=[FactorItem(name="扫描数", value=str(prescreen["scanned"]), score=50)],
+            status="ok",
+        )
+
+    analyzed = []
+    for c in candidates[:6]:
+        result = _deep_analyze_post_market(c, call_tool_fn, _tool_calls, _tool_nodes, _missing_data)
+        if result:
+            analyzed.append(result)
+
+    # Phase 2: 过滤低分（观望/卖出），只保留高分候选，按分数排序
+    analyzed = [a for a in analyzed if a.get("score", 0) >= 60 and a.get("direction") == "bullish"]
+    analyzed.sort(key=lambda x: -x.get("score", 0))
+
+    if analyzed:
+        avg_score = sum(a["score"] for a in analyzed) / len(analyzed)
+        bullish = len(analyzed)
+    else:
+        avg_score = 50.0
+        bullish = 0
+
+    direction = "bullish" if avg_score >= 55 else ("bearish" if avg_score < 45 else "neutral")
+    confidence = min(0.85, 0.4 + len(analyzed) * 0.07)
+    lines = ["## 盘后短线选股结果", f"扫描池: {prescreen['pool_size']}只 | 形态命中: {len(candidates)}只 | 高分通过: {len(analyzed)}只"]
+    for a in analyzed:
+        risk = " ⚠️" + "、".join(a.get("risk_notes", [])) if a.get("risk_notes") else ""
+        entry = a.get("entry", {})
+        lines.append(f"- **{a['code']}** {a.get('name', '')} | 评分{a['score']:.0f} | {a['direction']} | {','.join(a.get('patterns', []))} | {a['signal']}{risk}")
+        lines.append(f"  入场:{entry.get('price_low', '?')}-{entry.get('price_high', '?')} | 止损:{entry.get('stop_loss', '?')} | 目标:{entry.get('target_1', '?')}/{entry.get('target_2', '?')}")
+
+    return SkillReport(
+        skill_name="market_screener", score=round(avg_score, 1),
+        direction=direction, confidence=confidence,
+        signal=f"盘后{len(analyzed)}只高分候选，主线:{', '.join(t for t, _ in main_themes[:2]) or '无'}",
+        factors=[], analysis="\n".join(lines),
+        output_data={"main_themes": main_themes, "candidates": candidates[:15], "analyzed": analyzed},
+        status="ok",
+    )
+
+
+def pre_screen() -> Dict[str, Any]:
+    """Phase 1: Python 预筛选（0 token，不消耗模型调用）。
+
+    Returns:
+        dict: {
+            "strategy": "intraday | eod | post_market",
+            "market": {...},       # 市场情绪
+            "main_themes": [...],  # 主线题材
+            "candidates": [...],   # 候选股列表
+        }
+    """
+    strategy = _select_strategy()
+    today = date.today().isoformat()
+    logger.info("[market_screener] Phase 1 预筛选，策略: %s", strategy)
+
+    try:
+        if strategy == "intraday":
+            result = _prescreen_intraday(today)
+        elif strategy == "eod":
+            result = _prescreen_eod(_call_tool)
+        else:
+            result = _prescreen_post_market(today)
+    except Exception as e:
+        logger.warning("[market_screener] Phase 1 预筛选失败: %s", e)
+        return {"strategy": strategy, "error": str(e), "candidates": [], "market": {}, "main_themes": []}
+
+    result["strategy"] = strategy
+    logger.info("[market_screener] Phase 1 完成，候选 %d 只", len(result.get("candidates", [])))
+    return result
+
+
+def deep_analyze(
+    prescreen_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Phase 2: 逐只深入分析（消耗 token，调用工具）。
+
+    对 Phase 1 的候选股逐只调用工具获取实时数据，计算综合评分并生成操作建议。
+
+    Args:
+        prescreen_result: pre_screen() 的返回值
+
+    Returns:
+        dict: 符合 SKILL.md 输出结构的完整结果，含 analyzed 列表
+    """
+    strategy = prescreen_result.get("strategy", _select_strategy())
+    _tool_calls: List[str] = []
+    _tool_nodes: List = []
+    _missing_data: List = []
+
+    logger.info("[market_screener] Phase 2 深入分析，策略: %s", strategy)
+
+    # 构造 _run_* 所需的 prescreen 格式
+    if strategy == "intraday":
+        report = _deep_from_prescreen_intraday(prescreen_result, _call_tool, _tool_calls, _tool_nodes, _missing_data)
+    elif strategy == "eod":
+        report = _deep_from_prescreen_eod(prescreen_result, _call_tool, _tool_calls, _tool_nodes, _missing_data)
+    else:
+        report = _deep_from_prescreen_post_market(prescreen_result, _call_tool, _tool_calls, _tool_nodes, _missing_data)
+
+    if report is None:
+        return {
+            "skill": "market_screener", "status": "failed",
+            "error": f"Phase 2 分析失败 (策略: {strategy})",
+            "score": 0, "direction": "neutral", "confidence": 0,
+            "signal": "", "analysis": "", "factors": [],
+            "strategy_used": strategy, "tools_called": _tool_calls,
+        }
+
+    # 统一转 dict
+    if hasattr(report, "to_dict"):
+        d = report.to_dict()
+    elif isinstance(report, dict):
+        d = report
+    else:
+        d = {
+            "score": getattr(report, "score", 50),
+            "direction": getattr(report, "direction", "neutral"),
+            "signal": getattr(report, "signal", ""),
+            "analysis": str(getattr(report, "analysis", ""))[:2000],
+            "status": getattr(report, "status", "ok"),
+            "confidence": 0.5, "factors": [],
+        }
+
+    d.setdefault("skill", "market_screener")
+    d["strategy_used"] = strategy
+    d["tools_called"] = _tool_calls
+    logger.info("[market_screener] Phase 2 完成，评分 %s", d.get("score"))
     return d
 
 # ═══════════════════════════════════════════════════════════════
@@ -193,6 +473,28 @@ def _fetch_kline(code: str, days: int = 60) -> List[Dict]:
         return unadj_to_qfq(bars, code)
     except Exception:
         return []
+
+
+def _get_limit_pct(code: str, name: str = "") -> float:
+    """根据股票代码和名称返回涨跌停幅度。"""
+    if "ST" in name.upper():
+        return 5.0
+    if code.startswith(("300", "301")):  # 创业板
+        return 20.0
+    if code.startswith("688"):  # 科创板
+        return 20.0
+    if code.startswith(("8", "4")):  # 北交所
+        return 30.0
+    return 10.0  # 主板/中小板
+
+
+def _is_limit_locked(code: str, name: str, close: float, prev_close: float) -> bool:
+    """判断是否涨停封板（买不进去）。"""
+    if prev_close <= 0 or close <= 0:
+        return False
+    limit_pct = _get_limit_pct(code, name)
+    change_pct = (close - prev_close) / prev_close * 100
+    return change_pct >= limit_pct - 0.5  # 接近涨停也算（封板可能有小误差）
 
 
 def _fetch_zt_pool(date: str) -> List[Dict]:
@@ -401,7 +703,7 @@ def _scan_dragon_pullback(date: str) -> List[Dict]:
                 "name": records[0]["name"],
                 "max_continuous_days": max_days,
                 "zt_dates": [r["date"] for r in records],
-                "last_zt_date": min(records[0]["date"], date),
+                "last_zt_date": max(records[0]["date"], date),
                 "reason": records[0]["reason"],
             }
 
@@ -666,8 +968,27 @@ def _prescreen_intraday(date: str) -> Dict[str, Any]:
             }
 
     candidate_list = list(candidates.values())
+
+    # 过滤涨停封板股（买不进去）和涨跌停幅度不符的
+    filtered = []
+    for c in candidate_list:
+        code = c.get("code", "")
+        name = c.get("name", "")
+        change_pct = c.get("change_pct", 0)
+        limit_pct = _get_limit_pct(code, name)
+
+        # 连板股全部在涨停状态，买不进去
+        if "连板" in c.get("source", "") and "龙回头" not in c.get("source", ""):
+            continue
+
+        # 涨幅接近涨停的也买不进去
+        if change_pct >= limit_pct - 0.5:
+            continue
+
+        filtered.append(c)
+
     source_priority = {"连板": 0, "龙回头": 1, "主线题材": 2}
-    candidate_list.sort(key=lambda x: (
+    filtered.sort(key=lambda x: (
         min(source_priority.get(s, 9) for s in x.get("source", "").split("+")),
         -(x.get("continuous_days", 0)),
         -x.get("strength_score", 0),
@@ -678,7 +999,7 @@ def _prescreen_intraday(date: str) -> Dict[str, Any]:
         "main_themes": main_themes[:10],
         "continuous_board": continuous_board[:10],
         "dragon_pullback": dragon_pullback[:10],
-        "candidates": candidate_list[:20],
+        "candidates": filtered[:20],
     }
 
 
@@ -1089,12 +1410,22 @@ def _prescreen_eod(call_tool_fn) -> Dict[str, Any]:
 
     themes = [(tag, cnt) for tag, cnt in hot_tags[:5]]
 
+    # 过滤涨停封板股（买不进去）
+    filtered = []
+    for c in unique:
+        code = c.get("code", "")
+        name = c.get("name", "")
+        limit_pct = _get_limit_pct(code, name)
+        if c.get("change_pct", 0) >= limit_pct - 0.5:
+            continue
+        filtered.append(c)
+
     return {
         "date": date,
         "screener_count": len(raw_stocks),
         "zt_eod_count": len(eod_zt),
         "main_themes": themes,
-        "candidates": unique[:15],
+        "candidates": filtered[:15],
     }
 
 
