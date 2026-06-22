@@ -538,17 +538,15 @@ def _writeback_chain(eval_result: EvalResult, verb: str, noun: str, chain_def=No
         )
         return
 
-    # ── 质量门（5 道拦截） ──
-    # 1. 步数 > 5 → 拦截（太低效）
-    if eval_result.steps_taken > 5:
-        logger.info("[Learn] %s+%s: 拦截 — 步数 %d > 5", verb, noun, eval_result.steps_taken)
-        return
+    # ── 质量门（拦截低质量链路） ──
+    MAX_STEPS_PER_PHASE = 5 # 每个 phase 最多 5 步
 
-    # 2. 新链长度 > 5 → 拦截（太臃肿）
-    new_chain_len = len(dict.fromkeys(eval_result.actual_tools))  # 去重后长度
-    if new_chain_len > 5:
-        logger.info("[Learn] %s+%s: 拦截 — 新链长度 %d > 5", verb, noun, new_chain_len)
-        return
+    # 任意阶段 phase 步数 > 5 → 拦截
+    if chain_def and chain_def.steps:
+        for step in chain_def.steps:
+            if hasattr(step, 'steps_taken') and step.steps_taken and step.steps_taken > MAX_STEPS_PER_PHASE:
+                logger.info("[Learn] %s+%s: 拦截 — phase %d 步数 %d > %d", verb, noun, step.order, step.steps_taken, MAX_STEPS_PER_PHASE)
+                return
 
     # 3. 评分 < 60 → 拦截（质量不足）
     if eval_result.score < 60:

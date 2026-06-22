@@ -28,34 +28,16 @@ description: 规划器 prompt — 人设、核心哲学、技能选择规则、�
 
 ## 技能或工具选择规则
 
-- 从可用技能中选择 1~5 个，按执行顺序排列
-- **技术分析是地基**
-- **善用工具** — 可以组合工具做计算、处理数据。
-- 不要选择与问题无关的技能
+- **自由选择**：所有 skill 和 tool 都由 Planner 的 LLM 自由选择，没有必选项
+- 从可用技能/工具中选择 1~5 个，按执行顺序排列
+- **善用工具** — 可以组合工具做计算、处理数据
+- 不要选择与问题无关的技能/工具
 - 如果涉及股票但未提供代码，在 stocks 中列出需要的代码
-- 为每个选中的技能列出需要的工具（从可用工具中选择）
+- 为每个选中的技能/工具列出需要的工具（从可用工具中选择）
 - 优先选择技能,技能不能完全覆盖则使用工具作为补充
-- 每个 tool 的详细说明在文件 @tool 装饰符中。
+- 每个 tool 的详细说明在文件 @tool 装饰符中
 - 深度思考,找出最优选择
-
-### 技能优先级（从高到低）
-
-| 优先级 | 技能 | 何时必选 |
-|--------|------|---------|
-| 最高 | technical_agent | 几乎所有个股分析 |
-| 高 | indicator_agent | 用户提到具体指标 |
-| 高 | intelligence_agent | 需要解释异动原因 |
-| 中 | market-screener | 选股场景 |
-| 中 | backtest_agent | 验证策略 |
-| 低 | researcher | 多空辩论场景 |
-| 低 | researcher | 多空辩论场景 |
-
-### 场景 → 技能组合示例
-
-- **个股分析**: technical_agent + intelligence_agent
-- **选股**: market-screener + technical_agent
-- **市场扫描**: market-screener
-- **策略回测**: backtest_agent + technical_agent
+- ⚠️ **多步骤处理**：如果用户明确指定了步骤（如"第一步"、"第二步"、"首先"、"然后"），必须严格按用户指定的步骤拆分为多个 phase，每个 phase 对应用户指定的一个步骤
 
 ## 输出格式（只输出 JSON，不要其他文字）
 
@@ -63,34 +45,26 @@ description: 规划器 prompt — 人设、核心哲学、技能选择规则、�
 {
   "phases": [
     {
-      "skill": "technical_agent",
-      "description": "技术面趋势分析，五维加权评分",
-      "tools": ["analyze_trend", "get_indicator_snapshot", "agent_get_kline"],
-      "rules": "先取K线再算指标，关注MACD金叉"
-    },
-    {
-      "skill": "intelligence_agent",
-      "description": "个股情报搜索，解释异动原因",
-      "tools": ["search_stock_news", "get_market_sentiment"],
-      "rules": "只做解释不做预测，龙虎榜数据盘后才有"
+      "skill": "工具名或技能名",
+      "description": "这一步做什么（10字以内）",
+      "tools": ["工具1", "工具2"],
+      "rules": "具体执行规则（必填）"
     }
   ],
   "progressive": true,
-  "stocks": ["600519"],
+  "stocks": [],
   "reasoning": "选择理由（50字以内）",
-  "context": {
-    "tips": "执行的技巧或注意事项",
-    "focus": "本次分析的侧重点",
-    "data_criticality": "哪些数据必须成功获取（失败则终止），哪些数据失败问题不大可以跳过"
-  }
+  "context": {}
 }
 ```
 
 每个 phase 的字段说明：
-- `skill`: 技能名（必填）
+- `skill`: 技能名或工具名（必填）
+  - **skill 模式**：指定 skill 名，Agent 会读取 SKILL.md 执行
+  - **tool 模式**：指定 tool 名，Agent 直接调用工具
 - `description`: 这一步要做什么（必填，10字以内）
 - `tools`: 需要的工具列表（必填，从可用工具中选）
-- `rules`: 这一步的执行规则（选填，简短具体）
+- `rules`: 这一步的执行规则（必填，简短具体，告诉 agent 具体做什么）
 
 ### progressive 字段说明
 
@@ -102,8 +76,8 @@ description: 规划器 prompt — 人设、核心哲学、技能选择规则、�
 | `false` | 独立关系，各 phase 互不依赖 | 不注入，每个 phase 独立执行 |
 
 **典型场景**：
-- `technical_agent` → `intelligence_agent`（递进）：技术面先出结论，情报面解释原因 → `progressive: true`
-- `technical_agent` + `market-screener`（独立）：各做各的，最后汇总 → `progressive: false`
+- 分析板块资金流入 → 筛选龙头股（递进）：先看资金流向，再找龙头 → `progressive: true`
+- 获取行情 + 获取新闻（独立）：各做各的，最后汇总 → `progressive: false`
 
 ### context 字段说明
 

@@ -120,6 +120,7 @@ def build_smolagent_tools(config: Optional[Dict[str, Any]] = None) -> List[Any]:
     Args:
         config: 可选配置字典，支持:
             - deny: List[str] — 排除的工具名列表
+            - allow: List[str] — 只加载指定的工具名列表（用于 per-phase 工具过滤）
             - domain: str — 领域过滤（当前未实现全部过滤）
 
     Returns:
@@ -129,10 +130,14 @@ def build_smolagent_tools(config: Optional[Dict[str, Any]] = None) -> List[Any]:
     registry.discover()
     config = config or {}
     deny = set(config.get("deny", []) or [])
+    allow = set(config.get("allow", []) or [])
     domain = config.get("domain", "")
 
     tools = []
     for name in sorted(registry._tools.keys()):
+        # 如果指定了 allow 列表，只加载 allow 中的工具
+        if allow and name not in allow:
+            continue
         if name in deny or name == "final_answer":
             continue
         tool_obj = registry._wrap_as_smolagent(name)

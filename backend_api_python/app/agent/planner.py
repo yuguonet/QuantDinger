@@ -14,7 +14,7 @@ Planner — LLM 规划器。
 设计原则：
   - LLM 只做选择题（从 15 个 Skill 中选 1~5 个），不做开放题
   - 规划必须可回测（存 query + 选择 + reasoning）
-  - 失败降级到默认链路，必须告知用户
+  - 失败必须告知用户
 """
 from __future__ import annotations
 
@@ -40,12 +40,6 @@ logger = logging.getLogger(__name__)
 # 规划步数限制
 MIN_STEPS = 1
 MAX_STEPS = 5
-
-# 必选 Skill（技术面是地基）
-REQUIRED_SKILLS = {"technical_agent"}
-
-# 默认降级链路
-DEFAULT_FALLBACK_SKILLS = ["technical_agent"]
 
 # 缓存相似度阈值（query hash 前缀匹配位数）
 CACHE_HASH_PREFIX_LEN = 8
@@ -156,12 +150,15 @@ class Planner:
         t0 = time.time()
 
         # 1. 查询缓存
+        print(f"[DEBUG] Planner 开始规划 | query={query[:50]}")
         cached = self._lookup_cache(query, stock_code=stock_code, verb=verb, noun=noun)
         if cached:
+            print(f"[DEBUG] Planner 缓存命中，跳过 LLM")
             logger.info("[Planner] 缓存命中: query=%s", query[:30])
             cached.from_cache = True
             cached.elapsed_ms = (time.time() - t0) * 1000
             return cached
+        print(f"[DEBUG] Planner 缓存未命中，调用 LLM")
 
         # 2. LLM 规划
         if not self._call_llm:
@@ -170,6 +167,8 @@ class Planner:
 
         try:
             plan_data = self._llm_plan(query, stock_code, stock_name, verb, noun, context_summary)
+            # ── 调试日志：Planner 输出 JSON ──
+            print(f"[DEBUG] Planner 输出 JSON: {json.dumps(plan_data, ensure_ascii=False, indent=2)}")
         except Exception as e:
             logger.warning("[Planner] LLM 规划失败: %s", e)
             return PlanResult(success=False, reasoning=f"LLM 规划异常: {e}", elapsed_ms=(time.time() - t0) * 1000)
@@ -258,6 +257,7 @@ class Planner:
                 "- 大多数场景必须包含 technical_agent（技术面地基）\n"
                 "- 不要选择与问题无关的技能\n"
                 "- 如果涉及股票但未提供代码，在 stocks 中列出需要的代码\n"
+                "- ⚠️ 如果用户明确指定了步骤（如'第一步'、'第二步'、'首先'、'然后'），必须严格按用户指定的步骤拆分为多个 phase\n"
             )
 
         # 6. 对话上下文
@@ -276,7 +276,10 @@ class Planner:
         )
 
         raw = self._call_llm(prompt)
-        return self._parse_plan_json(raw)
+        result = self._parse_plan_json(raw)
+        # ── 调试日志：Planner 输出 JSON ──
+        print(f"[DEBUG] Planner 输出 JSON: {json.dumps(result, ensure_ascii=False, indent=2)}")
+        return result
 
     def _parse_plan_json(self, raw: str) -> Dict[str, Any]:
         """解析 LLM 输出的规划 JSON。容错处理各种 LLM 输出格式。"""
@@ -340,13 +343,16 @@ class Planner:
             phases = phases[:MAX_STEPS]
             logger.info("[Planner] 步数超限，截断到 %d 步", MAX_STEPS)
 
-        # 去重
+        # 去重（保留描述不同的步骤，即使 skill 相同）
         seen = set()
         deduped = []
         for step in phases:
             agent = step.get("agent", step.get("skill", ""))
-            if agent and agent not in seen:
-                seen.add(agent)
+            desc = step.get("description", "")
+            # 用 skill+description 作为去重 key，描述不同的步骤保留
+            dedup_key = f"{agent}:{desc}" if desc else agent
+            if agent and dedup_key not in seen:
+                seen.add(dedup_key)
                 deduped.append(step)
         phases = deduped
 
@@ -355,20 +361,15 @@ class Planner:
         plan_data.pop("steps", None)
 
         # 新架构：从 agent/skills/*/SKILL.md 校验 Skill 是否存在
+        # 注：未知的 skill 不再移除，因为可能是 tool 而不是 skill
         from app.agent.semantics import get_all_skill_metas
         known_skills = set(get_all_skill_metas().keys())
         if known_skills:
             selected = {s.get("agent", s.get("skill", "")) for s in phases}
             unknown = selected - known_skills - {""}
             if unknown:
-                # 移除未知 Skill（LLM 可能幻觉出不存在的 Skill）
-                plan_data["phases"] = [
-                    s for s in phases
-                    if s.get("agent", s.get("skill", "")) in known_skills or s.get("agent", s.get("skill", "")) == ""
-                ]
-                logger.warning("[Planner] 移除未知 Skill: %s (已知: %s)", unknown, known_skills)
-                if not plan_data["phases"]:
-                    return "所有 Skill 均未知，无法规划"
+                logger.info("[Planner] 发现未知 Skill（可能是 tool）: %s (已知 Skill: %s)", unknown, known_skills)
+                # 不再移除未知 skill，让 agent.py 处理（作为 tool 直接调用）
         return None  # 通过
 
     def _build_chain_def(self, plan_data: Dict[str, Any], stock_code: str) -> ChainDef:
@@ -708,67 +709,3 @@ class Planner:
         except Exception:
             return {"total": 0, "error": True}
 
-    # ── 降级 ──
-
-    def _degrade(self, reason: str, t0: float) -> PlanResult:
-        """降级到默认链路。"""
-        logger.warning("[Planner] 降级: %s", reason)
-
-        # 写降级日志（结构化，便于后续分析）
-        try:
-            log_path = _get_tool_chains_path().parent / "planner_degrade.log"
-            log_entry = {
-                "timestamp": datetime.now().isoformat(),
-                "reason": reason,
-                "fallback_skills": DEFAULT_FALLBACK_SKILLS,
-            }
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
-        except Exception:
-            pass  # 日志写入失败不影响主流程
-
-        steps = [
-            ChainStep(name=skill, agent=skill, order=i + 1, required=(i == 0))
-            for i, skill in enumerate(DEFAULT_FALLBACK_SKILLS)
-        ]
-
-        chain_def = ChainDef(
-            chain_id="degrade+default",
-            name="降级默认链路",
-            description=f"规划失败降级: {reason}",
-            steps=steps,
-            trigger_verbs=[],
-            trigger_nouns=[],
-        )
-        register_chain(chain_def)  # 动态链路注册到全局表
-
-        return PlanResult(
-            success=True,  # 降级也算成功（有链路可执行）
-            chain_def=chain_def,
-            reasoning=f"降级: {reason}",
-            degraded=True,
-            degrade_reason=reason,
-            elapsed_ms=(time.time() - t0) * 1000,
-        )
-
-
-# ═══════════════════════════════════════════════════════════════
-# 默认降级链路（不需要 Planner 实例也能用）
-# ═══════════════════════════════════════════════════════════════
-
-def get_default_fallback_chain() -> ChainDef:
-    """获取默认降级链路。"""
-    steps = [
-        ChainStep(name=skill, agent=skill, order=i + 1, required=(i == 0))
-        for i, skill in enumerate(DEFAULT_FALLBACK_SKILLS)
-    ]
-    chain_def = ChainDef(
-        chain_id="degrade+default",
-        name="降级默认链路",
-        description="规划失败时的保底链路",
-        steps=steps,
-        trigger_verbs=[],
-        trigger_nouns=[],
-    )
-    register_chain(chain_def)  # 动态链路注册到全局表
-    return chain_def

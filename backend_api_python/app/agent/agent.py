@@ -6,12 +6,12 @@ Agent — smolagents Agent for QuantDinger.
 
 架构：
   smolagents CodeAgent（默认）或 ToolCallingAgent（AGENT_TYPE=tool）
-  + 7 个 Skills（skills/ 目录，SKILL.md + run.py）
+  + Skills（skills/ 目录，SKILL.md + run.py）
   + 40+ 工具（tools/ 目录，@tool 装饰器自动发现）
   + Chain 链路编排（chain/ 目录，verb+noun 触发）
 
 执行流程：
-  1. _prepare() — 意图分析 → 领域路由 → 工具过滤 → 上下文拼接
+  1. _prepare() — 意图分析 → 领域路由→ 上下文拼接
   2. 快速通道 — 闲聊/greeting 直接回复，不走 agent
   3. 链路触发 — _try_chain() 匹配 verb+noun → 注入执行计划到 Agent 上下文
   4. Agent 执行 — smolagents CodeAgent.run()（流式/阻塞）
@@ -144,7 +144,8 @@ def _load_preamble() -> str:
 def _build_instructions(user_message: str = "",
                         language: str = "zh", tools=None, managed_agents=None,
                         domain: str = "", domain_instructions: str = "",
-                        intent_context: str = "", stock_code: str = "") -> str:
+                        intent_context: str = "", stock_code: str = "",
+                        is_tool_mode: bool = False) -> str:
     if str(language or "").lower().startswith("en"):
         lang_section = "\n## Output Language\n- Reply in English.\n- All JSON values in English.\n"
     else:
@@ -179,20 +180,8 @@ def _build_instructions(user_message: str = "",
     if tools is not None:
         tool_catalog = f"\n## 工具分类\n\n{_generate_tool_catalog(tools, managed_agents)}\n"
 
-    # Anthropic Agent Skills catalog
-    skill_catalog = ""
-    try:
-        from app.agent.skills.registry import get_skill_catalog_text
-        _catalog = get_skill_catalog_text()
-        if _catalog:
-            skill_catalog = (
-                "\n## 可用技能 (Agent Skills)\n\n"
-                "以下技能提供特定任务的专业指令。"
-                "当任务匹配技能描述时，用 read_skill 工具加载完整指令，然后按指令执行。\n\n"
-                f"{_catalog}\n"
-            )
-    except Exception:
-        pass
+    # Anthropic Agent Skills catalog - 已改为工具，不再注入 instructions
+    # agent 需要时会调用 get_skill_catalog 工具获取 skill 列表
 
     # 意图分析上下文（前置分析器的输出）
     intent_section = ""
@@ -257,7 +246,15 @@ def _build_instructions(user_message: str = "",
 
     return f"""{preamble}
 {agent_rules_text}
-{skill_catalog}
+
+## 技能使用说明
+
+如果需要使用 skill，请按以下步骤：
+1. 调用 get_skill_catalog 工具获取可用技能列表
+2. 选择合适的技能
+3. 调用 read_skill 工具加载具体指令
+4. 按指令执行
+
 {tool_catalog}
 {scan_section}{modify_section}{intent_section}{domain_section}{calibration_section}{weight_section}{finance_json_section}{lang_section}"""
 
@@ -580,6 +577,7 @@ def get_smolagent(
     tool_categories: Optional[List[str]] = None,
     collector=None,  # TraceCollector（金融领域注入）
     strategy: str = "direct",  # §15: 执行策略
+    is_tool_mode: bool = False,  # 是否是 tool 模式
 ) -> "CodeAgent | ToolCallingAgent":
     """Build a fresh agent instance per call.
 
@@ -601,13 +599,23 @@ def get_smolagent(
         # 始终拷贝，避免修改缓存原始列表
         tools = list(_tools_cache_by_domain[domain_key])
 
-    # ── 注册 read_skill 工具（Anthropic Agent Skills 标准）──
+    # ── per-phase 工具过滤（用于 per-phase agent 重建）──
+    if tool_categories:
+        # 只保留 tool_categories 中指定的工具
+        _allow_set = set(tool_categories)
+        tools = [t for t in tools if t.name in _allow_set]
+        logger.info("[Agent] per-phase 工具过滤，保留 %d 个工具: %s", len(tools), tool_categories)
+
+    # ── 注册 read_skill 和 get_skill_catalog 工具（Anthropic Agent Skills 标准）──
     try:
         from app.agent.skills.call_skill_tool import get_read_skill_tool
+        from app.agent.tools.skill_catalog_tool import get_skill_catalog_tool
         read_skill = get_read_skill_tool()
+        skill_catalog = get_skill_catalog_tool()
         tools.append(read_skill)
+        tools.append(skill_catalog)
     except Exception as e:
-        logger.warning("[Agent] read_skill 工具加载失败: %s", e)
+        logger.warning("[Agent] read_skill/skill_catalog 工具加载失败: %s", e)
 
     # ── 金融领域：用 TracedTool 包装所有工具 ──────────────────
     if collector:
@@ -618,6 +626,7 @@ def get_smolagent(
         user_message, language, tools, managed_agents=None,
         domain=domain, domain_instructions=domain_instructions,
         intent_context=intent_context, stock_code=stock_code,
+        is_tool_mode=is_tool_mode,
     )
 
     AgentClass = _get_agent_class()
@@ -1043,13 +1052,27 @@ class _AgentExecutor:
             # 连续工具失败达到阈值 → 快速退出
             consecutive_failures = 0
             max_consecutive = 0
+            _not_found_tool = False
             for step in result.steps:
                 if isinstance(step, ActionStep):
                     if step.error:
                         consecutive_failures += 1
                         max_consecutive = max(max_consecutive, consecutive_failures)
+                        # 检测工具不存在的情况
+                        if "not among the explicitly allowed tools" in str(step.error) or "Forbidden function" in str(step.error):
+                            _not_found_tool = True
                     else:
                         consecutive_failures = 0
+
+            # 工具不存在 → 立即退出
+            if _not_found_tool:
+                logger.warning("[Phase] 检测到调用不存在的工具，立即退出")
+                error_content = "调用不存在的工具，立即退出。最后错误: "
+                for step in reversed(result.steps):
+                    if isinstance(step, ActionStep) and step.error:
+                        error_content += str(step.error)[:200]
+                        break
+                return False, error_content, [], total_steps, 0, [], result
 
             if max_consecutive >= fast_exit_steps and total_steps <= max_steps:
                 logger.warning(
@@ -1186,7 +1209,7 @@ class _AgentExecutor:
         return success, content, tool_calls_log, total_steps, total_tokens, charts_b64, result
 
     def _execute_plan(self, agent, chain_def, message, context, meta, store, session_id):
-        """per-phase 执行：逐 phase 调用 agent.run()。"""
+        """per-phase 执行：逐 phase 调用 agent.run()。每个 phase 重建 agent，只加载当前 phase 需要的工具。"""
         # ── 调试日志：plan 入口 ───────────────────────────────
         print(
             f"[DEBUG] _execute_plan() 入口 | phases={len(chain_def.steps)} "
@@ -1219,6 +1242,22 @@ class _AgentExecutor:
         sorted_steps = sorted(chain_def.steps, key=lambda s: s.order)
         is_last = lambda s: s.order == sorted_steps[-1].order
 
+        # 保存原始 agent 的配置，用于重建
+        _orig_agent = agent
+        _agent_config = {
+            "user_id": meta.get("user_id", 1),
+            "model": meta.get("model"),
+            "provider": meta.get("provider"),
+            "max_steps": self.max_steps,
+            "language": (context or {}).get("report_language", "zh"),
+            "domain": meta.get("domain", ""),
+            "domain_instructions": meta.get("domain_instructions", ""),
+            "intent_context": meta.get("intent_context", ""),
+            "stock_code": stock_code,
+            "collector": meta.get("collector"),
+            "strategy": meta.get("strategy", "direct"),
+        }
+
         for step in sorted_steps:
             # 构建当前 phase 的独立上下文
             parts = [
@@ -1241,10 +1280,16 @@ class _AgentExecutor:
                         parts.append(f"  第{i}步: {prev[:300]}")
 
             # 当前 phase 的指令（精简，skill 全貌由 read_skill 加载）
-            parts.append(f"\n请用 read_skill 加载 {step.agent} 的指令并执行。")
             meta_skill = skill_metas.get(step.agent)
-            if meta_skill and meta_skill.tools:
-                parts.append(f"可用工具: {', '.join(meta_skill.tools)}")
+            if meta_skill:
+                # 是 skill → 读取 SKILL.md
+                parts.append(f"\n请用 read_skill 加载 {step.agent} 的指令并执行。")
+                if meta_skill.tools:
+                    parts.append(f"可用工具: {', '.join(meta_skill.tools)}")
+            else:
+                # 是 tool → 直接调用
+                parts.append(f"\n直接调用工具: {step.agent}")
+                parts.append("请直接使用上述工具完成任务，无需读取 SKILL.md。")
             step_rules = step.rules or tips
             if step_rules:
                 parts.append(f"规则: {step_rules}")
@@ -1258,9 +1303,41 @@ class _AgentExecutor:
             )
             print(f"[DEBUG] Plan phase {step.order} step_context 前300字: {(step_context or '')[:300]}")
 
+            # 为当前 phase 重建 agent（只加载当前 phase 需要的工具）
+            phase_tools = []
+            meta_skill = skill_metas.get(step.agent)
+            if meta_skill and meta_skill.tools:
+                # 是 skill → 加载 skill 指定的工具 + get_skill_catalog 和 read_skill
+                phase_tools = meta_skill.tools + ["get_skill_catalog", "read_skill"]
+                is_tool_mode = False
+            else:
+                # 是 tool → 只加载这一个工具
+                phase_tools = [step.agent]
+                is_tool_mode = True
+
+            # 重建 agent（per-phase 工具过滤）
+            phase_agent = get_smolagent(
+                user_id=_agent_config["user_id"],
+                model=_agent_config["model"],
+                provider=_agent_config["provider"],
+                max_steps=_agent_config["max_steps"],
+                user_message=message,
+                language=_agent_config["language"],
+                domain=_agent_config["domain"],
+                domain_instructions=_agent_config["domain_instructions"],
+                intent_context=_agent_config["intent_context"],
+                stock_code=_agent_config["stock_code"],
+                tool_categories=phase_tools,  # 当前 phase 的工具列表
+                collector=_agent_config["collector"],
+                strategy=_agent_config["strategy"],
+                is_tool_mode=is_tool_mode,  # 是否是 tool 模式
+            )
+            logger.info("[Plan] Phase %d 重建 agent，加载 %d 个工具: %s", step.order, len(phase_tools), phase_tools)
+            print(f"[DEBUG] Plan phase {step.order} 重建 agent，工具: {phase_tools}")
+
             # 执行当前 phase
             step_success, step_content, step_tool_calls, step_steps, step_tokens, step_charts, step_result = \
-                self._execute_phase(agent, step_context, self.max_steps, context, meta, store, session_id)
+                self._execute_phase(phase_agent, step_context, self.max_steps, context, meta, store, session_id)
 
             # 收集结果
             all_content.append(step_content or "")
@@ -1282,7 +1359,7 @@ class _AgentExecutor:
 
     def _execute_plan_stream(self, agent, chain_def, message, context, meta, store, session_id,
                              _stream_tool_calls, _stream_tool_call_counter, _pending_tool_ids):
-        """per-phase 流式执行：逐 phase 调用 agent.run(stream=True)，每步只看到 1 步内容。"""
+        """per-phase 流式执行：逐 phase 调用 agent.run(stream=True)，每步只看到 1 步内容。每个 phase 重建 agent。"""
         # ── 调试日志：plan_stream 入口 ───────────────────────
         print(
             f"[DEBUG] _execute_plan_stream() 入口 | phases={len(chain_def.steps)} "
@@ -1309,6 +1386,22 @@ class _AgentExecutor:
         sorted_steps = sorted(chain_def.steps, key=lambda s: s.order)
         is_last = lambda s: s.order == sorted_steps[-1].order
 
+        # 保存原始 agent 的配置，用于重建
+        _orig_agent = agent
+        _agent_config = {
+            "user_id": meta.get("user_id", 1),
+            "model": meta.get("model"),
+            "provider": meta.get("provider"),
+            "max_steps": self.max_steps,
+            "language": (context or {}).get("report_language", "zh"),
+            "domain": meta.get("domain", ""),
+            "domain_instructions": meta.get("domain_instructions", ""),
+            "intent_context": meta.get("intent_context", ""),
+            "stock_code": stock_code,
+            "collector": meta.get("collector"),
+            "strategy": meta.get("strategy", "direct"),
+        }
+
         from smolagents import FinalAnswerStep
 
         for step in sorted_steps:
@@ -1328,10 +1421,16 @@ class _AgentExecutor:
                     parts.append("前序分析结论:")
                     for i, prev in enumerate(all_content, 1):
                         parts.append(f"  第{i}步: {prev[:300]}")
-            parts.append(f"\n请用 read_skill 加载 {step.agent} 的指令并执行。")
             meta_skill = skill_metas.get(step.agent)
-            if meta_skill and meta_skill.tools:
-                parts.append(f"可用工具: {', '.join(meta_skill.tools)}")
+            if meta_skill:
+                # 是 skill → 读取 SKILL.md
+                parts.append(f"\n请用 read_skill 加载 {step.agent} 的指令并执行。")
+                if meta_skill.tools:
+                    parts.append(f"可用工具: {', '.join(meta_skill.tools)}")
+            else:
+                # 是 tool → 直接调用
+                parts.append(f"\n直接调用工具: {step.agent}")
+                parts.append("请直接使用上述工具完成任务，无需读取 SKILL.md。")
             step_rules = step.rules or tips
             if step_rules:
                 parts.append(f"规则: {step_rules}")
@@ -1346,12 +1445,44 @@ class _AgentExecutor:
             )
             print(f"[DEBUG] Plan-Stream step_context 前300字: {(step_context or '')[:300]}")
 
+            # 为当前 phase 重建 agent（只加载当前 phase 需要的工具）
+            phase_tools = []
+            meta_skill = skill_metas.get(step.agent)
+            if meta_skill and meta_skill.tools:
+                # 是 skill → 加载 skill 指定的工具 + get_skill_catalog 和 read_skill
+                phase_tools = meta_skill.tools + ["get_skill_catalog", "read_skill"]
+                is_tool_mode = False
+            else:
+                # 是 tool → 只加载这一个工具
+                phase_tools = [step.agent]
+                is_tool_mode = True
+
+            # 重建 agent（per-phase 工具过滤）
+            phase_agent = get_smolagent(
+                user_id=_agent_config["user_id"],
+                model=_agent_config["model"],
+                provider=_agent_config["provider"],
+                max_steps=_agent_config["max_steps"],
+                user_message=message,
+                language=_agent_config["language"],
+                domain=_agent_config["domain"],
+                domain_instructions=_agent_config["domain_instructions"],
+                intent_context=_agent_config["intent_context"],
+                stock_code=_agent_config["stock_code"],
+                tool_categories=phase_tools,  # 当前 phase 的工具列表
+                collector=_agent_config["collector"],
+                strategy=_agent_config["strategy"],
+                is_tool_mode=is_tool_mode,  # 是否是 tool 模式
+            )
+            logger.info("[Plan-Stream] Phase %d 重建 agent，加载 %d 个工具: %s", step.order, len(phase_tools), phase_tools)
+            print(f"[DEBUG] Plan-Stream phase {step.order} 重建 agent，工具: {phase_tools}")
+
             # 通知前端当前 phase
             yield {"type": "tool_info", "tool": "", "message": f"── 第 {step.order} 步: {step.description or step.agent} ──"}
 
             # 流式执行当前 phase
             content = ""
-            for s in agent.run(step_context, max_steps=self.max_steps, stream=True):
+            for s in phase_agent.run(step_context, max_steps=self.max_steps, stream=True):
                 events = _step_to_events(s)
                 for ev in events:
                     yield ev

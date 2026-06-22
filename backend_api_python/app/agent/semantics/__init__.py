@@ -229,6 +229,20 @@ def load_semantics():
             intent_tool_categories=meta.get("intent_tool_categories", {}),
         )
 
+    # ── tools（从 agent/tools/ 目录扫描工具函数）──
+    tools_dir = _SEMANTICS_DIR.parent / "tools"
+    if tools_dir.exists():
+        from app.agent.tools.registry import ToolRegistry
+        registry = ToolRegistry()
+        registry.discover()
+        for name, spec in registry._tools.items():
+            _tools[name] = ToolMeta(
+                name=name,
+                description=spec.description or "",
+                category="工具",
+                layer="tool",
+            )
+
     logger.info(
         "[Semantics] 加载完成: %d skills, %d tools",
         len(_skills), len(_tools),

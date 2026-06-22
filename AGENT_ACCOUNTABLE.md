@@ -1,14 +1,13 @@
 # Agent 可追责架构设计
 
-> 最后更新: 2026-06-21
+> 最后更新: 2026-06-22
 > 状态: 实施中
 > 仓库: https://github.com/yuguonet/QuantDinger
 
 ## 一、设计原则
 
-### 1. Agent 是唯一的决策者
+### 1. Agent 是执行者, Planner是规划师,是大脑
 - smolagents CodeAgent 保持完整推理-行动-观察循环
-- Agent 自主决定调什么工具、看什么数据、怎么分析、何时结束
 - **Planner 只规划，不执行**：Planner 产出执行计划，注入 Agent 上下文，由 Agent 自己用 read_skill + 工具执行
 - **不削弱**：不用 algo_analyze() 替代 LLM 推理
 - **兼容性**: tool 和 skill 完全兼容 OpenAI 的 tool 标准和 Anthropic 的 SKILL 标准
@@ -88,7 +87,7 @@
 │  4. 创建 TraceCollector
 │  5. 上下文拼接（历史摘要 + 领域上下文）
 │  6. _try_chain() 获取执行计划                              │
-│     ├─ tool_chains.json 匹配 → 返回 ChainDef              │
+│     ├─ 有 domain/verb/noun → tool_chains.json 匹配 → 返回 ChainDef              │
 │     ├─ 未命中 → Planner (LLM #2) 必须跑一遍              │
 │     │   ├─ 成功 → 返回 ChainDef                           │
 │     │   └─ 失败 → 返回 None + 日志警告                    │
@@ -99,21 +98,24 @@
     │
     ▼
 阶段 2: _execute_plan() ──── 按 phase 顺序循环 ────
-│  Agent 构建一次，所有 phase 共用同一实例                     │
 │  for phase in plan.phases:
 │  ┌────────────────────────────────────────────────┐
-│  │  7. 构建当前 phase 的上下文（step_context）     │
+│  │  7. 为当前 phase 重建 agent（上下文最小化）     │
+│  │     - 只加载当前 phase 需要的工具               │
+│  │     - skill → 加载 skill 指定的工具             │
+│  │     - tool → 只加载这一个工具                   │
+│  │  8. 构建当前 phase 的上下文（step_context）     │
 │  │     - 当前 phase 的任务描述                     │
-│  │     - 当前 phase 的 skill 指令                  │
+│  │     - skill 指令 或 tool 直接调用指令           │
 │  │     - progressive=true 时注入前序结论           │
 │  │     - 当前 phase 的规则                         │
-│  │  8. agent.run(step_context) ← LLM #3           │
+│  │  9. phase_agent.run(step_context) ← LLM #3     │
 │  │     smolagents 每次 run() 独立 memory           │
-│  │  9. 错误检测:                                  │
-│  │     ├─ 成功 → 保存结果，进入下一个 phase        │
-│  │     ├─ 连续工具失败 ≥ 阈值 → 快速退出          │
-│  │     ├─ 重复工具调用 ≥ 3 次 → 快速退出          │
-│  │     └─ 连续空结果 ≥ 3 次 → 快速退出            │
+│  │  10. 错误检测:                                 │
+│  │      ├─ 成功 → 保存结果，进入下一个 phase       │
+│  │      ├─ 连续工具失败 ≥ 阈值 → 快速退出         │
+│  │      ├─ 重复工具调用 ≥ 3 次 → 快速退出         │
+│  │      └─ 连续空结果 ≥ 3 次 → 快速退出           │
 │  └────────────────────────────────────────────────┘
 │  全部 phase 完成 → 进入阶段 3
 │  无 chain_def 时走 agent 自由执行 + 重试                  │
@@ -138,6 +140,9 @@
 |--------|------|
 | Planner 只规划不执行 | LLM #2 产出计划文本，注入 Agent 上下文，Agent 自己执行 |
 | 计划注入而非调度 | Agent 用 read_skill + 工具自行执行，不逐个调度 Skill |
+| per-phase agent 重建 | 每个 phase 重建 agent，只加载当前 phase 需要的工具，上下文最小化 |
+| 支持 skill 和 tool 两种模式 | skill → 读取 SKILL.md 执行；tool → 直接调用工具 |
+| 多步骤处理 | 用户明确指定步骤（如"第一步"、"第二步"）时，严格按用户指定的步骤拆分 |
 | 错误快速退出 | 连续工具失败 / 重复工具调用 / 连续空结果 ≥ 阈值时快速退出 |
 | progressive 控制 | phase 间递进关系时注入前序结论，独立关系时不注入 |
 | 负面反馈前置 | 在 Planner 之前生效，影响规划决策 |
@@ -148,7 +153,7 @@
 
 ```bash
 # .env 配置
-PLAN_MAX_PHASES=3              # 单次规划最大阶段数
+PLAN_MAX_PHASES=5              # 单次规划最大阶段数
 PLAN_PHASE_MAX_RETRIES=1       # 单阶段最大重试次数
 PLAN_PHASE_FAST_EXIT_STEPS=3   # 工具失效快速退出步数阈值
 ```
@@ -158,7 +163,7 @@ PLAN_PHASE_FAST_EXIT_STEPS=3   # 工具失效快速退出步数阈值
 
 **职责**: 扫描 `agent/skills/` 目录，自动发现并注册技能。
 **插件化**: 新增技能只需往 `skills/` 目录扔文件夹和 SKILL.md 文件，零配置。
-**命名规范**: SKILL.md 的 `name` 字段使用 PascalCase（如 `MarketScreener`），目录名使用下划线（如 `market_screener`）。
+**命名规范**: SKILL.md 的 `name` 字段使用 PascalCase（如 `market-screener`），目录名使用下划线（如 `market_screener`）。
 ### 4.1b Tool Registry — 工具注册表
 
 **职责**: 扫描 `agent/tools/` 目录，自动发现并注册工具。
@@ -232,6 +237,12 @@ PLAN_PHASE_FAST_EXIT_STEPS=3   # 工具失效快速退出步数阈值
   }
 }
 ```
+
+**skill 字段说明**:
+- `skill` 字段支持两种模式：
+  - **skill 模式**：指定 skill 名（如 `technical_agent`），Agent 会读取 SKILL.md 执行
+  - **tool 模式**：指定 tool 名（如 `get_fund_flow_realtime`），Agent 直接调用工具
+- per-phase agent 重建：每个 phase 会创建新的 agent 实例，只加载当前 phase 需要的工具
 
 `progressive` 字段控制执行阶段是否注入前序结论：
 - `true`（默认）：递进关系，后续 phase 注入前序结论
@@ -329,7 +340,7 @@ CREATE TABLE qd_traces (
     correct BOOLEAN,
     calibration FLOAT DEFAULT 1.0,
     -- 人工介入
-n    human_reviewed BOOLEAN DEFAULT FALSE,
+    human_reviewed BOOLEAN DEFAULT FALSE,
     human_verdict VARCHAR(64),
     created_at TIMESTAMP DEFAULT NOW()
 );
@@ -470,7 +481,7 @@ CODE_EXECUTION_TIMEOUT=120       # 代码执行超时（秒）
 - `semantics/intent.md` — 意图分类规则
 - `semantics/planner.md` — Planner 规则
 - `semantics/guidance.md` — Agent 执行规则
-- `semantics/skills/*/SKILL.md` — Skill 定义
+- `skills/*/SKILL.md` — Skill 定义
 
 ## 十、文件结构
 
@@ -503,7 +514,6 @@ backend_api_python/app/agent/
 │   ├── intent.md         # 意图规则
 │   ├── planner.md        # Planner 规则
 │   ├── guidance.md       # Agent 规则
-│   └── skills/           # Skill 定义
 ├── skills/               # Skill 执行
 │   ├── call_skill_tool.py
 │   └── registry.py
@@ -529,6 +539,8 @@ backend_api_python/app/agent/
 2. **工具失效检测**: 基于 steps 数量和工具调用成功率，可能误判
 3. **多阶段循环**: 当前实现为顺序循环，不支持并行执行
 4. **LLM #2 决策**: 工具失效时的 LLM #2 决策逻辑尚未完全实现（TODO）
+5. **per-phase agent 重建**: 每个 phase 重建 agent 会有一定的性能开销，但能保证上下文最小化
+6. **多步骤处理**: 依赖 LLM 正确解析用户的多步骤指示，有容错处理但不保证 100% 成功
 
 ## 十二、后续迭代
 
