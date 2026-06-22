@@ -46,9 +46,11 @@
 │    → domain / verb / noun / strategy / stock_code        │
 │                                                          │
 │  _try_chain()                                            │
-│    → tool_chains.json 匹配 或 Planner (LLM #2) 规划     │
-│    → 返回执行计划文本（不执行）                            │
-│    → 注入 Agent 上下文                                    │
+│    → tool_chains.json 匹配 → 返回 ChainDef              │
+│    → 未命中 → Planner (LLM #2) 必须跑一遍              │
+│       ├─ 成功 → 返回 ChainDef                           │
+│       └─ 失败 → 返回 None                               │
+│    → 注入 Agent 上下文（enriched）                       │
 │                                                          │
 │  smolagents CodeAgent                                    │
 │  ┌────────────────────────────────────────────────────┐  │
@@ -57,12 +59,12 @@
 │  └────────────────────────────────────────────────────┘  │
 │                                                          │
 │  工具集:                                                  │
-│    ① 80+ 普通工具 (get_kline, analyze_trend, ...)        │
+│    ① 55+ 普通工具 (get_kline, analyze_trend, ...)        │
 │    ② read_skill 工具 (加载 SKILL.md 指令)                │
 │    ③ final_answer 工具 (结束并输出最终结论)                │
 │                                                          │
 │  自动记录层 (TraceCollector):                              │
-│    每次 tool_call → EvalNode 子树                         │
+│    每次 tool_call → EvalNode 子树（TracedTool 包装）      │
 │    最终 answer → Chain 根节点                             │
 └──────────────────────────────────────────────────────────┘
     │
@@ -86,30 +88,35 @@
 │  4. 创建 TraceCollector
 │  5. 上下文拼接（历史摘要 + 领域上下文）
 │  6. _try_chain() 获取执行计划                              │
-│     ├─ tool_chains.json 匹配 → 直接返回计划               │
-│     ├─ 未匹配 → Planner (LLM #2) 规划 → 返回计划         │
-│     └─ 无 verb/noun 或规划失败 → 返回 None               │
-│     计划格式：每个 phase 独立自包含                         │
-│     （任务 + 技能 + 工具 + 说明 + 规则）                    │
+│     ├─ tool_chains.json 匹配 → 返回 ChainDef              │
+│     ├─ 未命中 → Planner (LLM #2) 必须跑一遍              │
+│     │   ├─ 成功 → 返回 ChainDef                           │
+│     │   └─ 失败 → 返回 None + 日志警告                    │
+│     └─ 无 verb/noun 不再跳过，Planner 始终执行             │
+│     计划格式：phases 数组，progressive 标记递进关系         │
 │     注入 Agent 上下文（enriched）                           │
 └──────────────────────────────────────────────────────
     │
     ▼
 阶段 2: _execute_plan() ──── 按 phase 顺序循环 ────
+│  Agent 构建一次，所有 phase 共用同一实例                     │
 │  for phase in plan.phases:
 │  ┌────────────────────────────────────────────────┐
-│  │  7. 构建 Agent（只加载当前 phase 的内容）       │
+│  │  7. 构建当前 phase 的上下文（step_context）     │
 │  │     - 当前 phase 的任务描述                     │
 │  │     - 当前 phase 的 skill 指令                  │
-│  │     - 当前 phase 的工具子集                     │
+│  │     - progressive=true 时注入前序结论           │
 │  │     - 当前 phase 的规则                         │
-│  │  8. agent.run() ← LLM #3（单 phase 执行）      │
-│  │     Agent 只看到这 1 步，专注完成               │
+│  │  8. agent.run(step_context) ← LLM #3           │
+│  │     smolagents 每次 run() 独立 memory           │
 │  │  9. 错误检测:                                  │
 │  │     ├─ 成功 → 保存结果，进入下一个 phase        │
-│  │     └─ 工具失效 → 快速退出，LLM #2 决策        │
+│  │     ├─ 连续工具失败 ≥ 阈值 → 快速退出          │
+│  │     ├─ 重复工具调用 ≥ 3 次 → 快速退出          │
+│  │     └─ 连续空结果 ≥ 3 次 → 快速退出            │
 │  └────────────────────────────────────────────────┘
 │  全部 phase 完成 → 进入阶段 3
+│  无 chain_def 时走 agent 自由执行 + 重试                  │
 └──────────────────────────────────────────────────────
     │
     ▼
@@ -130,10 +137,12 @@
 | 设计点 | 说明 |
 |--------|------|
 | Planner 只规划不执行 | LLM #2 产出计划文本，注入 Agent 上下文，Agent 自己执行 |
-| 计划注入而非调度 | 不经过 ChainExecutor 逐个调 Skill，Agent 用 read_skill + 工具自行执行 |
-| 错误快速退出 | 工具连续失败 ≥ 阈值时不跑满 max_steps，快速退出重试 |
+| 计划注入而非调度 | Agent 用 read_skill + 工具自行执行，不逐个调度 Skill |
+| 错误快速退出 | 连续工具失败 / 重复工具调用 / 连续空结果 ≥ 阈值时快速退出 |
+| progressive 控制 | phase 间递进关系时注入前序结论，独立关系时不注入 |
 | 负面反馈前置 | 在 Planner 之前生效，影响规划决策 |
 | 根节点兜底写入 | 非 traced 策略在阶段 3 后写根节点到 qd_traces，保证回溯验证有数据 |
+| 规划失败降级 | Planner 失败返回 None，agent 走自由执行 + 重试 |
 
 ### 3.3 配置项
 
@@ -148,7 +157,8 @@ PLAN_PHASE_FAST_EXIT_STEPS=3   # 工具失效快速退出步数阈值
 ### 4.1a Skill Registry — 技能注册表
 
 **职责**: 扫描 `agent/skills/` 目录，自动发现并注册技能。
-**插件化**: 新增技能只需往 `skills/` 目录扔文件夹和skill.md文件，零配置。
+**插件化**: 新增技能只需往 `skills/` 目录扔文件夹和 SKILL.md 文件，零配置。
+**命名规范**: SKILL.md 的 `name` 字段使用 PascalCase（如 `MarketScreener`），目录名使用下划线（如 `market_screener`）。
 ### 4.1b Tool Registry — 工具注册表
 
 **职责**: 扫描 `agent/tools/` 目录，自动发现并注册工具。
@@ -165,6 +175,8 @@ PLAN_PHASE_FAST_EXIT_STEPS=3   # 工具失效快速退出步数阈值
 
 **插件化**: 新增工具只需往 `tools/` 目录扔 `.py` 文件，零配置。
 
+**sandbox 兼容**: 模块级 `from app.data_sources.*` 导入改为函数内延迟导入，避免 agent sandbox 执行时 `NameError`。
+
 ### 4.2 TraceCollector — 执行追踪器
 
 **职责**: Agent 执行过程中自动收集信息，构建 EvalNode 树。
@@ -172,8 +184,8 @@ PLAN_PHASE_FAST_EXIT_STEPS=3   # 工具失效快速退出步数阈值
 **提取策略**: JSON 优先，正则降级。
 
 **层级**:
-- Tool 层: 每次 tool_call → EvalNode 子树
-- Skill 层: 每次 call_skill → SkillReport + EvalNode
+- Tool 层: 每次 tool_call → EvalNode 子树（由 TracedTool 自动触发 `on_tool_call()`）
+- Skill 层: `on_skill_call()` 方法已定义但当前未接入，skill 层数据由 `_post_process` 兜底写入
 - Chain 层: 最终 answer → 根节点
 
 ### 4.3 Planner — 规划器
@@ -181,6 +193,8 @@ PLAN_PHASE_FAST_EXIT_STEPS=3   # 工具失效快速退出步数阈值
 **职责**: 当无固定链路匹配时，用 LLM 规划 Skill 执行方案。规划结果注入 Agent 上下文，由 Agent 自己执行。
 
 **设计本质**: Chain 编排层是从用户消息到执行入口的便捷路线，缓存好的思维捷径，省去 LLM #2 的重复思考。不是逐个调度 Skill 的执行器。
+
+**失败行为**: 规划失败时返回 `PlanResult(success=False)`，不降级兜底。`_try_chain()` 收到后返回 None，agent 走自由执行。
 
 **注入内容**:
 | 内容 | 来源 | 用途 |
@@ -196,20 +210,32 @@ PLAN_PHASE_FAST_EXIT_STEPS=3   # 工具失效快速退出步数阈值
 {
   "phases": [
     {
-      "phase": 1,
       "skill": "technical_agent",
-      "tools": ["analyze_trend", "get_indicator_snapshot", "agent_get_kline"]
+      "description": "技术面趋势分析",
+      "tools": ["analyze_trend", "get_indicator_snapshot", "agent_get_kline"],
+      "rules": "先取K线再算指标"
     },
     {
-      "phase": 2,
       "skill": "intelligence_agent",
-      "tools": ["search_stock_news", "get_market_sentiment"]
+      "description": "个股情报搜索",
+      "tools": ["search_stock_news", "get_market_sentiment"],
+      "rules": "只做解释不做预测"
     }
   ],
+  "progressive": true,
   "stocks": ["600519"],
-  "reasoning": "选择理由（50字以内）"
+  "reasoning": "选择理由（50字以内）",
+  "context": {
+    "tips": "执行技巧",
+    "focus": "分析侧重",
+    "data_criticality": "数据重要性"
+  }
 }
 ```
+
+`progressive` 字段控制执行阶段是否注入前序结论：
+- `true`（默认）：递进关系，后续 phase 注入前序结论
+- `false`：独立关系，每个 phase 独立执行
 
 ### 4.4 Intent Analyzer — 意图分析器
 
@@ -225,6 +251,10 @@ PLAN_PHASE_FAST_EXIT_STEPS=3   # 工具失效快速退出步数阈值
 ### 4.5 Evaluator — 评估器
 
 **职责**: 盘后回溯验证，统一驱动权重更新和链路学习。
+
+**两个组件**:
+- `evaluator.py`（agent 根目录）：在线评估，每次 `agent.run()` 后立即执行，纯规则 <1ms
+- `chain/evaluator.py`：离线评估，T+N 验证，盘后定时运行
 
 **数据来源**: `qd_traces` 表 + `qd_skill_weights` + `qd_factor_weights`
 
@@ -267,26 +297,41 @@ semantics/
 ```sql
 CREATE TABLE qd_traces (
     id SERIAL PRIMARY KEY,
-    session_id VARCHAR(64),
     root_id INTEGER REFERENCES qd_traces(id),
     parent_id INTEGER REFERENCES qd_traces(id),
     layer VARCHAR(16),          -- 'chain' / 'skill' / 'tool'
     name VARCHAR(128),
     step_order INTEGER,
+    exec_date DATE,
     stock_code VARCHAR(16),
     stock_name VARCHAR(32),
-    domain VARCHAR(32),
-    input_json JSONB,
-    output_json JSONB,
     score FLOAT,
     direction VARCHAR(16),
-    confidence VARCHAR(16),
     action VARCHAR(16),
+    signal TEXT,
+    confidence FLOAT,
     timeframe VARCHAR(8),
-    correct BOOLEAN,
+    factors JSONB,              -- [{name, value, score, weight, status}]
+    output_summary JSONB,
+    analysis TEXT,
+    input_params JSONB,
+    tools_called TEXT[],        -- PostgreSQL 数组
+    missing_data TEXT[],
+    data_source VARCHAR(64),
+    status VARCHAR(16),         -- 'ok' / 'missing' / 'failed' / 'skipped' / 'veto'
+    error TEXT,
+    elapsed_ms FLOAT,
+    -- 回溯验证（盘后写入）
+    exit_date DATE,
+    exit_reason VARCHAR(32),    -- 'take_profit' / 'stop_loss' / 'max_hold' / 'signal_change'
     pnl_pct FLOAT,
-    created_at TIMESTAMP DEFAULT NOW(),
-    evaluated_at TIMESTAMP
+    hold_days INTEGER,
+    correct BOOLEAN,
+    calibration FLOAT DEFAULT 1.0,
+    -- 人工介入
+n    human_reviewed BOOLEAN DEFAULT FALSE,
+    human_verdict VARCHAR(64),
+    created_at TIMESTAMP DEFAULT NOW()
 );
 ```
 
@@ -295,11 +340,14 @@ CREATE TABLE qd_traces (
 ```sql
 CREATE TABLE qd_factor_weights (
     id SERIAL PRIMARY KEY,
-    factor_name VARCHAR(128) UNIQUE,
+    skill_name VARCHAR(128),
+    factor_name VARCHAR(128),
     weight FLOAT DEFAULT 1.0,
+    win_rate FLOAT DEFAULT 0,
     sample_count INTEGER DEFAULT 0,
-    avg_pnl_pct FLOAT DEFAULT 0,
-    updated_at TIMESTAMP DEFAULT NOW()
+    decay_half_life INTEGER DEFAULT 30,
+    last_updated TIMESTAMP DEFAULT NOW(),
+    UNIQUE(skill_name, factor_name)
 );
 ```
 
@@ -312,8 +360,10 @@ CREATE TABLE qd_skill_weights (
     weight FLOAT DEFAULT 1.0,
     win_rate FLOAT DEFAULT 0,
     avg_pnl_pct FLOAT DEFAULT 0,
+    avg_hold_days FLOAT DEFAULT 1,
+    return_per_day FLOAT DEFAULT 0,
     sample_count INTEGER DEFAULT 0,
-    updated_at TIMESTAMP DEFAULT NOW()
+    last_updated TIMESTAMP DEFAULT NOW()
 );
 ```
 
@@ -323,40 +373,48 @@ CREATE TABLE qd_skill_weights (
 
 ### 7.1 记录闭环（数据源）
 ```
-agent.run() → TraceCollector → EvalNode 树存库 → qd_traces
+agent.run() → TracedTool.forward() → collector.on_tool_call() → tool 节点
+  → agent 结束 → _post_process() → collector.on_agent_finish() → store.save_tree(root) → qd_traces
 ```
 **作用**：记录每一步执行过程，是其他三个闭环的数据源。
+**实现**：TracedTool 包装所有工具（`if collector: tools = [TracedTool(t, collector)]`），对 agent 透明。非 traced 策略有兜底写入（`if not meta.get("collector")`）。
 **去掉后果**：没有数据，回测和溯源都废了。
 
 ### 7.2 T+N 回测闭环（概率验证 + 渐进调权）
 ```
-每天盘后 15:30 → evaluate_pending() → 取实际行情 → 写回 correct/pnl_pct
-  → update_skill_weights()      # 哪个 Skill 权重在下降
-  → update_factor_weights()     # 哪个因子权重在下降
+app 启动 → start_eval_worker() → 等到盘后 15:30
+  → auto_evaluate()
+    → evaluate_pending() → 取实际行情 → 写回 correct/pnl_pct
+    → update_skill_weights()      # 哪个 Skill 权重在下降
+    → update_factor_weights()     # 哪个因子权重在下降
 ```
 **作用**：用实际行情客观验证预测方向，多次验证渐进调权（单次对错无意义，看统计）。
-**核心指标**：单位时间收益率（不是胜率）。
+**核心指标**：单位时间收益率 = (win_rate × avg_win - loss_rate × avg_loss) / avg_hold_days
 **追踪能力**：权重下降 → 识别哪个 Skill/因子在退化。
 **去掉后果**：无法区分预测对不对，权重失去客观依据。
 
 ### 7.3 用户反馈闭环（加速检测 tool 故障）
 ```
-用户说"不对/垃圾/反了" → detect_feedback_severity()
+用户说"不对/垃圾/反了" → _check_negative_feedback()
+  → detect_feedback_severity()
   → trace 层: mark_root_wrong() / delete_tree()
   → chain 层: penalize_chain() → success_count 扣减 → 累计后删除
 ```
 **作用**：检测执行层故障（tool 更新、数据源挂了、API 变了）。T+N 回测也能通过统计发现，但需要 N 轮，期间持续亏钱。用户反馈是加速器。
 **和 T+N 的关系**：不在同一层——用户反馈检测**执行层**（工具坏了），T+N 检测**预测层**（方向对不对）。
+**前提条件**：`_post_evaluate()` 在每轮结束时存 `last_verb`/`last_noun` 到 session，下一轮 `_check_negative_feedback()` 读取。verb/noun 为空时闭环断裂（金融分析场景少见）。
 **去掉后果**：tool 坏了要等 N 轮 T+N 才能淘汰，期间持续亏钱。
 
 ### 7.4 编排路径学习闭环（省去 LLM #2 重复工作量）
 ```
-首次执行成功 → _writeback_chain() → 存入 tool_chains.json
-  → 第二次执行 → _try_chain() 匹配 → 直接返回计划 → 注入 Agent 上下文
+agent 结束 → _post_evaluate() → learn_from_execution()
+  → verdict=="success" → _writeback_chain() → 5 道质量门 → save_tool_chain()
+  → 下次 _try_chain() → get_tool_chain() 命中 → 直接返回 ChainDef
 ```
 **作用**：首次走一遍后，后续直接使用编排路径，省去 LLM #2（Planner 大脑）的重复思考。
 **本质**：Chain 编排层是从用户消息到执行入口的便捷路线，是缓存好的思维捷径。
 **质量门**：5 道拦截（步数>5、链长>5、评分<60、工具成功率<50%、旧链已验证），防止学习低质量链路。
+**前提条件**：verb/noun 非空（`learn_from_execution` 在 verb/noun 为空时跳过）。
 **去掉后果**：每次都从零规划，重复消耗 LLM #2 token。
 
 ## 八、工具分类

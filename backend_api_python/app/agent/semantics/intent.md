@@ -84,6 +84,9 @@ intent_tool_categories:
 ```
 
 ## 规则
+- ⚠️ 话题切换：用户消息的意图优先级最高。上轮对话摘要仅供参考，不覆盖当前消息的明确意图。
+- 当前消息明确说“大盘/板块/市场” → noun=market，不要携带上轮的 stock_code。
+- 当前消息没有提到任何股票 → 不要从上轮摘要继承 stock_code。
 - domain: finance=金融分析/股票/行情/资金, coding=代码/项目/开发, trading=交易执行/持仓/策略启停, system=定时提醒/任务调度/设置, unknown=无法判断领域, chat=闲聊/问候
 - 有股票名称或代码 → domain=finance, verb=analyze, noun=stock
 - 用户说"怎么样/能买吗/跌了/涨了"等，且提到股票 → finance/stock_analysis

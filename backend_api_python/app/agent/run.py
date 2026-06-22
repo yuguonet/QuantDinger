@@ -13,7 +13,7 @@ Agent 独立调试入口。
 环境变量：
   LLM_PROVIDER / LLM_BASE_URL / LLM_MODEL — LLM 配置
   AGENT_TYPE=code|tool                     — Agent 类型
-  AGENT_MAX_STEPS=10                       — 最大步数
+  AGENT_MAX_STEPS=6                       — 最大步数
 """
 from __future__ import annotations
 

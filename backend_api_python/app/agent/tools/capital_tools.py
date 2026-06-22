@@ -15,14 +15,18 @@
 from __future__ import annotations
 
 from app.agent.tools.em_utils import em_datacenter
-from app.data_sources.normalizer import strip_market_prefix as _strip_prefix
+def _strip_prefix(s):
+    from app.data_sources.normalizer import strip_market_prefix
+    return strip_market_prefix(s)
 
 import logging
 from typing import Any, Dict, List
 
 import requests
 
-from app.data_sources.normalizer import safe_float as _safe_float
+def _safe_float(v, default=0.0):
+    from app.data_sources.normalizer import safe_float
+    return safe_float(v, default)
 
 logger = logging.getLogger(__name__)
 

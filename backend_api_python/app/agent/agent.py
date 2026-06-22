@@ -854,6 +854,14 @@ class _AgentExecutor:
                         result.intent_meta["stock_name"] = _name
                     logger.info("[Prepare] 中文名 → 代码 %s", _code)
 
+        # ── 话题切换：非个股意图时清除遗留 stock_code ────────
+        _is_stock_intent = result.noun in ("stock", "chart") or result.intent in (
+            "stock_analysis", "chart_view", "backtest", "indicator", "fund_flow")
+        if not _is_stock_intent and context and context.get("stock_code"):
+            logger.info("[Prepare] 意图=%s 非个股，清除遗留 stock_code=%s", result.intent, context.get("stock_code"))
+            context.pop("stock_code", None)
+            context.pop("stock_name", None)
+
         # ── 合并 intent 提取的股票代码到 context ──────────────
         if result.intent_meta.get("stock_code") and not (context and context.get("stock_code")):
             context = context or {}
@@ -1010,22 +1018,16 @@ class _AgentExecutor:
         result = agent.run(enriched, max_steps=max_steps)
 
         # ── §3.1 步骤 9: 错误检测 + 快速退出 ──────────────────
+        # 注意：result.steps 是 ActionStep 对象列表，不是 dict！
+        # 必须用 step.error / step.tool_calls 等属性访问，不能用 step.get()
         total_steps = len(result.steps) if hasattr(result, 'steps') and result.steps else 0
         if hasattr(result, 'steps') and result.steps:
-            tool_failures = 0
-            for step in result.steps:
-                if step.get('type') == 'action' and step.get('error'):
-                    tool_failures += 1
-                elif step.get('type') == 'action':
-                    for tc in step.get('tool_calls', []):
-                        pass  # tool_calls 本身不报错，看 step.error
-
             # 连续工具失败达到阈值 → 快速退出
             consecutive_failures = 0
             max_consecutive = 0
             for step in result.steps:
-                if step.get('type') == 'action':
-                    if step.get('error'):
+                if isinstance(step, ActionStep):
+                    if step.error:
                         consecutive_failures += 1
                         max_consecutive = max(max_consecutive, consecutive_failures)
                     else:
@@ -1036,14 +1038,77 @@ class _AgentExecutor:
                     "[Phase] 工具连续失败 %d 步（阈值 %d），快速退出",
                     max_consecutive, fast_exit_steps
                 )
-                # 返回失败，供 _chat_locked 决定是否重试或返回 LLM #2
-                elapsed = time.time() - t0
                 error_content = f"工具连续失败 {max_consecutive} 步，快速退出。最后错误: "
                 for step in reversed(result.steps):
-                    if step.get('type') == 'action' and step.get('error'):
-                        error_content += str(step['error'])[:200]
+                    if isinstance(step, ActionStep) and step.error:
+                        error_content += str(step.error)[:200]
                         break
                 return False, error_content, [], total_steps, 0, [], result
+
+            # ── 重复工具调用检测（同一工具+同一参数调用 ≥ 3 次 → 快速退出）──
+            _tool_call_counter: Dict[str, int] = {}
+            _REPEAT_THRESHOLD = 3
+            for step in result.steps:
+                if isinstance(step, ActionStep) and step.tool_calls:
+                    for tc in step.tool_calls:
+                        _tc_name = getattr(tc, 'name', '') or ''
+                        if not _tc_name or _tc_name == 'final_answer':
+                            continue
+                        _tc_args = getattr(tc, 'arguments', {}) or {}
+                        _args_key = str(sorted(_tc_args.items())) if isinstance(_tc_args, dict) else str(_tc_args)
+                        _tc_key = f"{_tc_name}:{_args_key[:80]}"
+                        _tool_call_counter[_tc_key] = _tool_call_counter.get(_tc_key, 0) + 1
+
+            _repeated_tools = {k: v for k, v in _tool_call_counter.items() if v >= _REPEAT_THRESHOLD}
+            if _repeated_tools:
+                _rep_desc = "; ".join(f"{k} ×{v}" for k, v in _repeated_tools.items())
+                logger.warning(
+                    "[Phase] 检测到重复工具调用（阈值 %d），快速退出: %s",
+                    _REPEAT_THRESHOLD, _rep_desc
+                )
+                return False, f"工具重复调用 {_REPEAT_THRESHOLD}+ 次，快速退出。重复工具: {_rep_desc}", \
+                    tool_calls_log, total_steps, total_tokens, charts_b64, result
+
+            # ── 连续空结果检测（工具成功但无数据，LLM 换关键词重试场景）──
+            _EMPTY_RESULT_THRESHOLD = 3
+            _consecutive_empty = 0
+            for step in result.steps:
+                if not isinstance(step, ActionStep) or step.error:
+                    _consecutive_empty = 0
+                    continue
+                obs = getattr(step, 'observations', None) or getattr(step, 'observation', None) or ""
+                if not isinstance(obs, str):
+                    obs = str(obs) if obs else ""
+                if not obs:
+                    continue
+                # 检测空结果模式：count=0 / news=[] / results=[] / 无数据
+                _is_empty = False
+                try:
+                    import json as _json_check
+                    _json_match = _json_check.loads(obs) if obs.strip().startswith('{') else None
+                    if isinstance(_json_match, dict):
+                        if _json_match.get('count', -1) == 0:
+                            _is_empty = True
+                        for _key in ('results', 'news', 'data', 'items', 'stocks'):
+                            _val = _json_match.get(_key)
+                            if isinstance(_val, list) and len(_val) == 0:
+                                _is_empty = True
+                except (ValueError, TypeError):
+                    pass
+                if not _is_empty and ('无数据' in obs or '未找到' in obs or '无结果' in obs or 'not found' in obs.lower()):
+                    _is_empty = True
+                if _is_empty:
+                    _consecutive_empty += 1
+                else:
+                    _consecutive_empty = 0
+            if _consecutive_empty >= _EMPTY_RESULT_THRESHOLD:
+                logger.warning(
+                    "[Phase] 连续 %d 次空结果，快速退出",
+                    _consecutive_empty
+                )
+                return False, \
+                    f"工具连续返回空数据 {_consecutive_empty} 次，该股票可能无此数据源。请基于已有数据给出分析，注明数据缺失。", \
+                    tool_calls_log, total_steps, total_tokens, charts_b64, result
 
         # ── 解析 agent 输出 ──
         if hasattr(result, "output"):
@@ -1057,15 +1122,15 @@ class _AgentExecutor:
             charts_b64 = []
             import re as _re_chat
             for sd in result.steps:
-                if sd.get("type") == "action":
-                    for tc in sd.get("tool_calls", []):
+                if isinstance(sd, ActionStep) and sd.tool_calls:
+                    for tc in sd.tool_calls:
                         tool_calls_log.append({
-                            "tool": tc.get("name", ""),
-                            "arguments": tc.get("arguments", {}),
-                            "success": sd.get("error") is None,
-                            "duration": sd.get("timing", {}).get("duration", 0),
+                            "tool": getattr(tc, 'name', ''),
+                            "arguments": getattr(tc, 'arguments', {}) or {},
+                            "success": sd.error is None,
+                            "duration": sd.timing.duration if hasattr(sd, 'timing') and sd.timing else 0,
                         })
-                obs = sd.get("observations") or sd.get("observation") or ""
+                obs = getattr(sd, 'observations', None) or getattr(sd, 'observation', None) or ""
                 if obs and isinstance(obs, str):
                     for _cm in _re_chat.finditer(r'__CHART_B64__([A-Za-z0-9+/=]+)__END_CHART__', obs):
                         charts_b64.append(_cm.group(1))
@@ -1086,7 +1151,7 @@ class _AgentExecutor:
         if not success and tool_calls_log and not content:
             _last_output = ""
             for sd in (result.steps if hasattr(result, "steps") and result.steps else []):
-                obs = sd.get("observations") or sd.get("observation") or ""
+                obs = getattr(sd, 'observations', None) or getattr(sd, 'observation', None) or ""
                 if obs and isinstance(obs, str) and len(obs) > len(_last_output):
                     _last_output = obs
             if _last_output:
@@ -1103,7 +1168,7 @@ class _AgentExecutor:
         return success, content, tool_calls_log, total_steps, total_tokens, charts_b64, result
 
     def _execute_plan(self, agent, chain_def, message, context, meta, store, session_id):
-        """per-phase 执行：逐 phase 调用 agent.run()，每步只看到 1 步内容。"""
+        """per-phase 执行：逐 phase 调用 agent.run()。"""
         # 获取 skill 元数据（工具列表、描述等）
         skill_metas = {}
         try:
@@ -1117,6 +1182,9 @@ class _AgentExecutor:
         tips = ""
         if chain_def.context:
             tips = chain_def.context.get("tips", chain_def.context.get("rules", ""))
+
+        # progressive: phase 间是否递进关系
+        progressive = getattr(chain_def, 'progressive', True)
 
         all_content = []
         all_tool_calls = []
@@ -1134,8 +1202,8 @@ class _AgentExecutor:
                 f"标的: {stock_name or '未知'}（{stock_code}）" if stock_code else "",
             ]
 
-            # 加入前序结论
-            if all_content:
+            # 按 progressive 决定是否注入前序结论
+            if progressive and all_content:
                 if is_last(step):
                     # 最后一步：完整前序结论 + 总结指令
                     parts.append("以下是前面所有步骤的完整分析结论，请综合后给出最终总结：")
@@ -1198,6 +1266,9 @@ class _AgentExecutor:
         if chain_def.context:
             tips = chain_def.context.get("tips", chain_def.context.get("rules", ""))
 
+        # progressive: phase 间是否递进关系
+        progressive = getattr(chain_def, 'progressive', True)
+
         all_content = []
         sorted_steps = sorted(chain_def.steps, key=lambda s: s.order)
         is_last = lambda s: s.order == sorted_steps[-1].order
@@ -1210,7 +1281,8 @@ class _AgentExecutor:
                 f"[第 {step.order} 步] {step.description or step.agent}",
                 f"标的: {stock_name or '未知'}（{stock_code}）" if stock_code else "",
             ]
-            if all_content:
+            # 按 progressive 决定是否注入前序结论
+            if progressive and all_content:
                 if is_last(step):
                     parts.append("以下是前面所有步骤的完整分析结论，请综合后给出最终总结：")
                     for i, prev in enumerate(all_content, 1):
@@ -1598,18 +1670,14 @@ class _AgentExecutor:
             logger.warning("[Feedback] 负面反馈处理异常: %s", e)
 
     def _try_chain(self, verb, noun, message, session_id, context, user_id):
-        """获取执行计划，注入 Agent 上下文。无匹配时返回 None。
+        """获取执行计划。无匹配时返回 None，让 agent 自由执行。
 
         流程：
-          1. tool_chains.json 匹配（学习闭环积累的已知链路）→ 返回计划
-          2. 未匹配 → Planner LLM #2 规划 → 存入 tool_chains.json → 返回计划
-          3. 规划失败 → 返回 None（让 agent 直接处理）
+          1. tool_chains.json 匹配（学习闭环积累的已知链路）→ 返回 ChainDef
+          2. 未命中 → Planner LLM 必须跑一遍 →
+             ├─ 成功 → 返回 ChainDef
+             └─ 失败 → 返回 None + 日志警告
         """
-        # ── 前置拦截：无意图信号时直接返回，不浪费 token ──
-        if not verb and not noun:
-            logger.info("[Chain] 无 verb/noun 信号，跳过链路")
-            return None
-
         # ── 提取股票代码（固定链路和规划都需要）──
         stock_code = ""
         stock_name = ""
@@ -1639,8 +1707,6 @@ class _AgentExecutor:
 
         # ── 查链路 ──
         chain_def = None
-        degraded = False
-        degrade_reason = ""
 
         # Layer 0: tool_chains.json 匹配（学习闭环积累的已知链路）
         try:
@@ -1686,13 +1752,9 @@ class _AgentExecutor:
 
                 if plan_result.success and plan_result.chain_def:
                     chain_def = plan_result.chain_def
-                    degraded = plan_result.degraded
-                    degrade_reason = plan_result.degrade_reason
 
                     if plan_result.from_cache:
                         logger.info("[Planner] 缓存命中: %s", chain_def.chain_id)
-                    elif degraded:
-                        logger.warning("[Planner] 降级: %s", degrade_reason)
                     else:
                         logger.info("[Planner] 规划成功: %d 步, reasoning=%s",
                                     len(chain_def.steps), plan_result.reasoning[:80])
@@ -1701,13 +1763,9 @@ class _AgentExecutor:
             except Exception as e:
                 logger.warning("[Planner] 规划异常: %s", e)
 
-        # ── 无匹配或降级 → 返回 None，让 agent 直接处理 ──
+        # ── 无匹配 → 返回 None，让 agent 直接处理 ──
         if not chain_def:
             logger.info("[Chain] 无链路匹配 (verb=%s noun=%s)，交给 agent", verb, noun)
-            return None
-
-        if degraded:
-            logger.warning("[Chain] 降级链路 %s，跳过执行，交给 agent 自由处理", chain_def.chain_id)
             return None
 
         # 非个股链路不需要股票代码

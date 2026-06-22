@@ -7,7 +7,7 @@ Chain — 编排/决策层。
   store.py     — qd_evaluations 持久化（save_tree / load_tree）
   contract.py  — SkillReport 解析契约（从 LLM 输出提取结构化数据）
   chains.py    — 链路定义
-  executor.py  — 链路执行器（按链路定义调度 Skill，构建决策树）
+  executor.py  — [已删除] 链路执行器（旧架构，已被 agent.run() 替代）
   evaluator.py — 回溯评估引擎（T+N 验证 → 因子权重更新）
 """
 from app.agent.chain.schema import (

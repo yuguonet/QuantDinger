@@ -17,7 +17,7 @@ tools:
 
 ## 使用场景
 
-- 用户询问"今天买什么""有什么好股票""短线选什么"等全市场选股问题
+- 用户询问"今天买什么股""有什么好股票""短线选什么"等全市场选股问题
 - 用户要求盘后复盘、尾盘隔夜选股、盘中热点追踪选股
 - 需要对全市场做系统性筛选,而非分析单只股票
 
@@ -35,7 +35,7 @@ tools:
 
 ## 执行流程
 
-### Phase 1 - Python 预筛选(0 token,不消耗模型调用)
+### Phase 1 - Python 预筛选
 
 从涨停池、跌停池、炸板池、强势股题材归因、热门板块等数据源获取原始数据,按策略规则筛选候选标的。
 
@@ -64,14 +64,6 @@ final = deep_analyze(result)
 - `get_indicator_snapshot` - 技术指标快照(MACD/KDJ/BOLL等)
 - `search_stocks` - 条件选股(尾盘/盘后策略使用)
 
-### 一步调用(可选)
-
-如果不需要分步控制,可直接调用 `run()` 一步完成 Phase 1 + Phase 2:
-
-```python
-from app.agent.skills.market_screener.run import run
-result = run()
-```
 
 ### 失败处理
 
@@ -81,7 +73,7 @@ result = run()
 
 ## 输入参数
 
-无参数。全市场扫描,无需传入股票代码。
+无参数。
 
 ## 输出结构
 

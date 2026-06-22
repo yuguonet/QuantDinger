@@ -51,7 +51,7 @@ description: 规划器 prompt — 人设、核心哲学、技能选择规则、�
 | 最高 | technical_agent | 几乎所有个股分析 |
 | 高 | indicator_agent | 用户提到具体指标 |
 | 高 | intelligence_agent | 需要解释异动原因 |
-| 中 | market_screener | 选股场景 |
+| 中 | market-screener | 选股场景 |
 | 中 | backtest_agent | 验证策略 |
 | 低 | researcher | 多空辩论场景 |
 | 低 | researcher | 多空辩论场景 |
@@ -59,15 +59,15 @@ description: 规划器 prompt — 人设、核心哲学、技能选择规则、�
 ### 场景 → 技能组合示例
 
 - **个股分析**: technical_agent + intelligence_agent
-- **选股**: market_screener + technical_agent
-- **市场扫描**: market_screener
+- **选股**: market-screener + technical_agent
+- **市场扫描**: market-screener
 - **策略回测**: backtest_agent + technical_agent
 
 ## 输出格式（只输出 JSON，不要其他文字）
 
 ```json
 {
-  "steps": [
+  "phases": [
     {
       "skill": "technical_agent",
       "description": "技术面趋势分析，五维加权评分",
@@ -81,6 +81,7 @@ description: 规划器 prompt — 人设、核心哲学、技能选择规则、�
       "rules": "只做解释不做预测，龙虎榜数据盘后才有"
     }
   ],
+  "progressive": true,
   "stocks": ["600519"],
   "reasoning": "选择理由（50字以内）",
   "context": {
@@ -91,11 +92,24 @@ description: 规划器 prompt — 人设、核心哲学、技能选择规则、�
 }
 ```
 
-每个 step 的字段说明：
+每个 phase 的字段说明：
 - `skill`: 技能名（必填）
 - `description`: 这一步要做什么（必填，10字以内）
 - `tools`: 需要的工具列表（必填，从可用工具中选）
 - `rules`: 这一步的执行规则（选填，简短具体）
+
+### progressive 字段说明
+
+`progressive` 决定执行阶段是否注入前序结论：
+
+| 值 | 含义 | 前序结论注入 |
+|------|------|------|
+| `true` | 递进关系，后一步依赖前一步的结论 | 注入前序结论到后续 phase 的上下文 |
+| `false` | 独立关系，各 phase 互不依赖 | 不注入，每个 phase 独立执行 |
+
+**典型场景**：
+- `technical_agent` → `intelligence_agent`（递进）：技术面先出结论，情报面解释原因 → `progressive: true`
+- `technical_agent` + `market-screener`（独立）：各做各的，最后汇总 → `progressive: false`
 
 ### context 字段说明
 

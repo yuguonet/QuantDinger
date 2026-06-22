@@ -16,13 +16,20 @@ def _get_ds(market: str = "CNStock"):
     from app.data_sources.factory import DataSourceFactory
     return DataSourceFactory.get_source(market)
 
-# ── Re-exported from shared utils (kept for backward compat) ──
-from app.data_sources.market_detector import detect_market as _detect_market
+# ── detect_market: 延迟导入，避免 agent sandbox 执行时模块级 import 失败 ──
+def _detect_market(code: str) -> str:
+    from app.data_sources.market_detector import detect_market
+    return detect_market(code)
 
 # ── Tool functions ────────────────────────────────────────────
 
 def search_stock_by_name(keyword: str, market: str = "CNStock", limit: int = 10) -> Dict[str, Any]:
     """根据中文名称或代码或关键词搜索股票代码,股票名称,支持模糊搜索,简拼,混合搜索。
+
+    ⚠️ 返回值是 dict，不是 list！用法：
+        result = search_stock_by_name("茅台")
+        stock_code = result["results"][0]["code"]   # ✅
+        # ❌ result[0]["code"] 会报 KeyError
 
     Args:
         keyword: 搜索关键词（中文股票名称、代码片段等）
@@ -31,8 +38,6 @@ def search_stock_by_name(keyword: str, market: str = "CNStock", limit: int = 10)
 
     Returns:
         dict: {"results": [{"code": "600519", "name": "贵州茅台", "market": "SH"}, ...], "count": N}
-        取第一个结果代码: result["results"][0]["code"]
-        取第一个结果名称: result["results"][0]["name"]        
     """
     keyword = (keyword or "").strip()
     if not keyword:

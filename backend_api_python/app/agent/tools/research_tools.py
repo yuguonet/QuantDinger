@@ -5,7 +5,9 @@
 数据来源：东财 reportapi / 同花顺 / 东财搜索API / 巨潮 cninfo
 """
 from __future__ import annotations
-from app.data_sources.normalizer import strip_market_prefix as _strip_prefix
+def _strip_prefix(s):
+    from app.data_sources.normalizer import strip_market_prefix
+    return strip_market_prefix(s)
 
 import json
 import logging

@@ -9,7 +9,7 @@ Planner — LLM 规划器。
   2. 缓存未命中 → LLM 规划（只选 Skill，不执行）
   3. 校验规划（步数、必选 Skill、去重）
   4. 存入 tool_chains.json
-  5. 返回 ChainDef 供 ChainExecutor 执行
+  5. 返回 ChainDef 供 _execute_plan() 执行
 
 设计原则：
   - LLM 只做选择题（从 15 个 Skill 中选 1~5 个），不做开放题
@@ -95,7 +95,7 @@ def _get_skill_catalog() -> str:
         # fallback: 硬编码兜底（semantics 加载失败时）
         return (
             "可用技能：technical_agent(技术面), intelligence_agent(情报), "
-            "market_screener(选股), backtest_agent(回测), "
+            "market-screener(选股), backtest_agent(回测), "
             "researcher(多空)"
         )
     lines = ["可用技能（从下列中选择 1~5 个，按执行顺序排列）：", ""]
@@ -165,18 +165,20 @@ class Planner:
 
         # 2. LLM 规划
         if not self._call_llm:
-            return self._degrade("LLM 不可用", t0)
+            logger.warning("[Planner] LLM 不可用，返回失败")
+            return PlanResult(success=False, reasoning="LLM 不可用", elapsed_ms=(time.time() - t0) * 1000)
 
         try:
             plan_data = self._llm_plan(query, stock_code, stock_name, verb, noun, context_summary)
         except Exception as e:
             logger.warning("[Planner] LLM 规划失败: %s", e)
-            return self._degrade(f"LLM 规划异常: {e}", t0)
+            return PlanResult(success=False, reasoning=f"LLM 规划异常: {e}", elapsed_ms=(time.time() - t0) * 1000)
 
         # 3. 校验
         validated = self._validate(plan_data)
         if validated is not None:
-            return self._degrade(f"规划校验失败: {validated}", t0)
+            logger.warning("[Planner] 规划校验失败: %s", validated)
+            return PlanResult(success=False, reasoning=f"规划校验失败: {validated}", elapsed_ms=(time.time() - t0) * 1000)
 
         # 4. 构建 ChainDef
         chain_def = self._build_chain_def(plan_data, stock_code)
@@ -185,7 +187,7 @@ class Planner:
         self._save_plan(query, plan_data, stock_code)
 
         elapsed = (time.time() - t0) * 1000
-        logger.info("[Planner] 规划完成: %d 步, %.0fms", len(plan_data.get("steps", [])), elapsed)
+        logger.info("[Planner] 规划完成: %d 步, %.0fms", len(plan_data.get("phases", plan_data.get("steps", []))), elapsed)
 
         return PlanResult(
             success=True,
@@ -298,13 +300,13 @@ class Planner:
         # 4. 尝试直接解析
         try:
             data = json.loads(cleaned)
-            if isinstance(data, dict) and "steps" in data:
+            if isinstance(data, dict) and ("phases" in data or "steps" in data):
                 return data
         except json.JSONDecodeError:
             pass
 
-        # 5. 提取最外层 JSON 对象（含 steps）
-        match = re.search(r'\{[^{}]*"steps"\s*:\s*\[.*?\][^{}]*\}', cleaned, re.DOTALL)
+        # 5. 提取最外层 JSON 对象（含 phases 或 steps）
+        match = re.search(r'\{[^{}]*"(?:phases|steps)"\s*:\s*\[.*?\][^{}]*\}', cleaned, re.DOTALL)
         if match:
             try:
                 return json.loads(match.group())
@@ -316,7 +318,7 @@ class Planner:
         if brace_match:
             try:
                 data = json.loads(brace_match.group())
-                if isinstance(data, dict) and "steps" in data:
+                if isinstance(data, dict) and ("phases" in data or "steps" in data):
                     return data
             except json.JSONDecodeError:
                 pass
@@ -325,49 +327,55 @@ class Planner:
 
     def _validate(self, plan_data: Dict[str, Any]) -> Optional[str]:
         """校验规划。返回 None 表示通过，返回字符串表示失败原因。"""
-        steps = plan_data.get("steps", [])
-        if not steps:
-            return "steps 为空"
+        # 兼容 phases 和 steps 两个字段名
+        phases = plan_data.get("phases", plan_data.get("steps", []))
+        if not phases:
+            return "phases 为空"
 
-        if len(steps) < MIN_STEPS:
-            return f"步数不足（{len(steps)} < {MIN_STEPS}）"
+        if len(phases) < MIN_STEPS:
+            return f"步数不足（{len(phases)} < {MIN_STEPS}）"
 
-        if len(steps) > MAX_STEPS:
+        if len(phases) > MAX_STEPS:
             # 截断而非失败
-            plan_data["steps"] = steps[:MAX_STEPS]
+            phases = phases[:MAX_STEPS]
             logger.info("[Planner] 步数超限，截断到 %d 步", MAX_STEPS)
 
         # 去重
         seen = set()
         deduped = []
-        for step in steps:
-            agent = step.get("agent", "")
+        for step in phases:
+            agent = step.get("agent", step.get("skill", ""))
             if agent and agent not in seen:
                 seen.add(agent)
                 deduped.append(step)
-        plan_data["steps"] = deduped
+        phases = deduped
+
+        # 统一存为 phases
+        plan_data["phases"] = phases
+        plan_data.pop("steps", None)
 
         # 新架构：从 agent/skills/*/SKILL.md 校验 Skill 是否存在
         from app.agent.semantics import get_all_skill_metas
         known_skills = set(get_all_skill_metas().keys())
         if known_skills:
-            selected = {s.get("agent", "") for s in plan_data.get("steps", [])}
+            selected = {s.get("agent", s.get("skill", "")) for s in phases}
             unknown = selected - known_skills - {""}
             if unknown:
                 # 移除未知 Skill（LLM 可能幻觉出不存在的 Skill）
-                plan_data["steps"] = [
-                    s for s in plan_data["steps"]
-                    if s.get("agent", "") in known_skills or s.get("agent", "") == ""
+                plan_data["phases"] = [
+                    s for s in phases
+                    if s.get("agent", s.get("skill", "")) in known_skills or s.get("agent", s.get("skill", "")) == ""
                 ]
                 logger.warning("[Planner] 移除未知 Skill: %s (已知: %s)", unknown, known_skills)
-                if not plan_data["steps"]:
+                if not plan_data["phases"]:
                     return "所有 Skill 均未知，无法规划"
         return None  # 通过
 
     def _build_chain_def(self, plan_data: Dict[str, Any], stock_code: str) -> ChainDef:
         """从规划数据构建 ChainDef。"""
+        phases = plan_data.get("phases", plan_data.get("steps", []))
         steps = []
-        for i, step_data in enumerate(plan_data.get("steps", []), 1):
+        for i, step_data in enumerate(phases, 1):
             # 兼容 "skill" 和 "agent" 两个字段名
             agent = step_data.get("skill", "") or step_data.get("agent", "")
             steps.append(ChainStep(
@@ -387,6 +395,9 @@ class Planner:
 
         chain_id = f"planned+{hashlib.md5(json.dumps(plan_data, sort_keys=True).encode()).hexdigest()[:8]}"
 
+        # progressive: phase 间是否递进关系（后一步依赖前一步结论）
+        progressive = plan_data.get("progressive", True)
+
         chain_def = ChainDef(
             chain_id=chain_id,
             name="LLM 规划链路",
@@ -395,8 +406,9 @@ class Planner:
             trigger_verbs=[],
             trigger_nouns=[],
             context=planner_context,
+            progressive=progressive,
         )
-        register_chain(chain_def)  # 动态链路必须注册才能被 ChainExecutor 找到
+        register_chain(chain_def)  # 动态链路注册到全局表
         return chain_def
 
     # ── 缓存 ──
@@ -566,7 +578,8 @@ class Planner:
                 "query_hash": qh,
                 "query": query[:200],
                 "created_at": datetime.now().isoformat(),
-                "steps": plan_data.get("steps", []),
+                "phases": plan_data.get("phases", plan_data.get("steps", [])),
+                "progressive": plan_data.get("progressive", True),
                 "stocks": plan_data.get("stocks", []) or ([stock_code] if stock_code else []),
                 "reasoning": plan_data.get("reasoning", ""),
                 "hit_count": 1,
@@ -602,9 +615,10 @@ class Planner:
 
     def _chain_from_dict(self, data: Dict) -> Optional[ChainDef]:
         """从缓存条目构建 ChainDef。"""
+        phases = data.get("phases", data.get("steps", []))
         steps = []
-        for i, s in enumerate(data.get("steps", []), 1):
-            agent = s.get("agent", "")
+        for i, s in enumerate(phases, 1):
+            agent = s.get("agent", s.get("skill", ""))
             if agent:
                 steps.append(ChainStep(
                     name=agent, agent=agent, order=i,
@@ -614,6 +628,7 @@ class Planner:
             return None
 
         chain_id = f"cached+{data.get('query_hash', '')[:8]}"
+        progressive = data.get("progressive", True)
         chain_def = ChainDef(
             chain_id=chain_id,
             name="缓存规划链路",
@@ -621,8 +636,9 @@ class Planner:
             steps=steps,
             trigger_verbs=[],
             trigger_nouns=[],
+            progressive=progressive,
         )
-        register_chain(chain_def)  # 动态链路必须注册才能被 ChainExecutor 找到
+        register_chain(chain_def)  # 动态链路注册到全局表
         return chain_def
 
     # ── 文件 IO ──
@@ -724,7 +740,7 @@ class Planner:
             trigger_verbs=[],
             trigger_nouns=[],
         )
-        register_chain(chain_def)  # 动态链路必须注册才能被 ChainExecutor 找到
+        register_chain(chain_def)  # 动态链路注册到全局表
 
         return PlanResult(
             success=True,  # 降级也算成功（有链路可执行）
@@ -754,5 +770,5 @@ def get_default_fallback_chain() -> ChainDef:
         trigger_verbs=[],
         trigger_nouns=[],
     )
-    register_chain(chain_def)  # 动态链路必须注册才能被 ChainExecutor 找到
+    register_chain(chain_def)  # 动态链路注册到全局表
     return chain_def

@@ -5,7 +5,9 @@
 数据来源：market_cn.tape（五档盘口）/ 腾讯财经 HTTP API（估值/指数/批量）
 """
 from __future__ import annotations
-from app.data_sources.normalizer import strip_market_prefix as _strip_prefix
+def _strip_prefix(s):
+    from app.data_sources.normalizer import strip_market_prefix
+    return strip_market_prefix(s)
 
 import logging
 from typing import Any, Dict, List

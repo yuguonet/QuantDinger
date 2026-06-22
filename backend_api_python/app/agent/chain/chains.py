@@ -10,7 +10,7 @@ Chain Definitions — 链路定义（动态注册）。
   ChainDef  — 链路定义（chain_id/name/steps/trigger_verbs/trigger_nouns）
 
 触发方式：
-  agent._try_chain(verb, noun) → get_chain_for_intent() / Planner.plan() → ChainExecutor.execute()
+  agent._try_chain(verb, noun) → get_chain_for_intent() / Planner.plan() → _execute_plan()
 
 公开接口：
   register_chain(chain_def) → None
@@ -49,6 +49,7 @@ class ChainDef:
     trigger_verbs: List[str] = field(default_factory=list)   # 触发动词
     trigger_nouns: List[str] = field(default_factory=list)   # 触发对象
     context: Dict[str, Any] = field(default_factory=dict)    # Planner 传入的额外上下文（tips/focus/data_criticality 等）
+    progressive: bool = True    # phase 间是否递进关系（后一步依赖前一步结论）
 
 
 # ═══════════════════════════════════════════════════════════════
