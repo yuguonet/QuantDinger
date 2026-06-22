@@ -27,6 +27,30 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# ── 响应体大小限制 ──
+_MAX_RESPONSE_BYTES = 5 * 1024 * 1024  # 5MB, 超过则截断
+
+
+def _safe_get(url: str, **kwargs) -> requests.Response:
+    """requests.get 带响应体大小限制，防止异常大响应吃光内存"""
+    kwargs.setdefault('timeout', 10)
+    resp = requests.get(url, **kwargs)
+    # 检查 Content-Length
+    cl = resp.headers.get('Content-Length')
+    if cl and int(cl) > _MAX_RESPONSE_BYTES:
+        raise ValueError(f"响应体过大: {int(cl)/1024/1024:.1f}MB > {_MAX_RESPONSE_BYTES/1024/1024:.0f}MB")
+    return resp
+
+
+def _safe_post(url: str, **kwargs) -> requests.Response:
+    """requests.post 带响应体大小限制"""
+    kwargs.setdefault('timeout', 10)
+    resp = requests.post(url, **kwargs)
+    cl = resp.headers.get('Content-Length')
+    if cl and int(cl) > _MAX_RESPONSE_BYTES:
+        raise ValueError(f"响应体过大: {int(cl)/1024/1024:.1f}MB > {_MAX_RESPONSE_BYTES/1024/1024:.0f}MB")
+    return resp
+
 
 def fetch_eastmoney_news(category="财经", max_items=20):
     """
@@ -47,7 +71,7 @@ def fetch_eastmoney_news(category="财经", max_items=20):
         "req_trace": str(uuid.uuid4()),
     }
     try:
-        resp = requests.get(url, params=params, headers=HEADERS, timeout=10)
+        resp = _safe_get(url, params=params, headers=HEADERS, timeout=10)
         data = resp.json()
         items = data.get("data", {}).get("list", [])
         if items:
@@ -68,7 +92,7 @@ def fetch_eastmoney_news(category="财经", max_items=20):
     # ── 备用: newsapi JSONP ──
     url2 = "https://newsapi.eastmoney.com/kuaixun/v1/getlist_102_ajaxResult_50_1_.html"
     try:
-        resp = requests.get(url2, headers=HEADERS, timeout=10)
+        resp = _safe_get(url2, headers=HEADERS, timeout=10)
         text = resp.text
         # var ajaxResult={...}
         match = re.search(r'var\s+\w+=\s*(\{.*\})', text, re.DOTALL)
@@ -169,7 +193,7 @@ def fetch_cls_news(max_items=20):
     url = "https://www.cls.cn/nodeapi/updateTelegraphList"
     params = {"app": "CailianpressWeb", "os": "web", "sv": "7.7.5", "rn": str(max_items)}
     try:
-        resp = requests.get(url, params=params, headers=HEADERS, timeout=10)
+        resp = _safe_get(url, params=params, headers=HEADERS, timeout=10)
         data = resp.json()
         items = data.get("data", {}).get("roll_data", [])
         news = []
@@ -211,7 +235,7 @@ def fetch_wallstreetcn_news(max_items=20):
     url = "https://api-one-wscn.awtmt.com/apiv1/content/lives"
     params = {"channel": "global-channel", "limit": max_items}
     try:
-        resp = requests.get(url, params=params, headers=HEADERS, timeout=10)
+        resp = _safe_get(url, params=params, headers=HEADERS, timeout=10)
         data = resp.json()
         items = data.get("data", {}).get("items", [])
         results = []
@@ -239,14 +263,16 @@ def fetch_akshare_news(max_items=20):
     try:
         import akshare as ak
         df = ak.stock_news_em(symbol="财经")
+        # 只取前 max_items 行，避免加载整个 DataFrame 到内存
+        df = df.head(max_items)
         news = []
-        for _, row in df.head(max_items).iterrows():
-            # 新版列: 0=关键词, 1=新闻标题, 2=新闻内容, 3=发布时间, 4=文章来源, 5=新闻链接
+        for _, row in df.iterrows():
             title = str(row.get('新闻标题', row.iloc[1] if len(row) > 1 else ''))
             time_str = str(row.get('发布时间', row.iloc[3] if len(row) > 3 else ''))
             url = str(row.get('新闻链接', row.iloc[5] if len(row) > 5 else ''))
             if title and title not in ('财经', 'None', ''):
                 news.append({"title": title, "time": time_str, "url": url, "source": "AKShare-东方财富"})
+        del df
         return news
     except Exception as e:
         return [{"error": f"akshare: {e}"}]
@@ -272,7 +298,7 @@ def fetch_all_news(max_per_source=10):
 
     t0 = time.time()
     all_news = []
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {executor.submit(fn): name for name, fn in sources}
         for future in as_completed(futures):
             name = futures[future]
@@ -710,7 +736,7 @@ def fetch_all_market_news(max_per_source: int = 10, days: int = 1) -> List[Dict[
     ]
 
     all_news = []
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {executor.submit(fn): name for name, fn in sources}
         for future in as_completed(futures):
             name = futures[future]
@@ -747,7 +773,7 @@ def fetch_all_stock_news(
     ]
 
     all_news = []
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {executor.submit(fn): name for name, fn in sources}
         for future in as_completed(futures):
             src_name = futures[future]
@@ -794,7 +820,7 @@ if __name__ == "__main__":
 
     t0 = time.perf_counter()
     all_news = []
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {executor.submit(_fetch, n, f): n for n, f in sources}
         for future in as_completed(futures):
             name, items = future.result()

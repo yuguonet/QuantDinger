@@ -71,9 +71,9 @@ def _clean_old():
 #  对外接口
 # ══════════════════════════════════════════════════════════════
 
-def fetch_emotion_cycle() -> Dict[str, Any]:
+def fetch_emotion_cycle(force: bool = False) -> Dict[str, Any]:
     """拉取最新情绪数据 + 追加快照到当天缓存。"""
-    if _rt_emotion_cycle is not None:        # ① 内存缓存
+    if not force and _rt_emotion_cycle is not None:  # 内存缓存
         return _rt_emotion_cycle
     try:                                      # ② 远端 fallback
         r = requests.get(_SOURCE_URL, headers={"User-Agent": _UA}, timeout=10)
@@ -165,7 +165,7 @@ _rt_emotion_cycle = None
 def refresh_emotion_cycle():
     global _rt_emotion_cycle
     try:
-        _rt_emotion_cycle = fetch_emotion_cycle()
+        _rt_emotion_cycle = fetch_emotion_cycle(force=True)
     except Exception as e:
         logger.warning("[refresh] refresh_emotion_cycle 失败: %s", e)
 

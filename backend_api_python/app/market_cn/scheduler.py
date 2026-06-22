@@ -6,10 +6,11 @@ market_cn 数据刷新调度器
   - _xxx_tick()     — 本文件，调度层，控制时段和条件
   - _schedule()     — Timer 自调度，只管间隔
 
-三档刷新:
-  - 快档: 盘中 5 分钟
-  - 慢档: 盘中 30 分钟（含日级宏观/板块/国际）
-  - 盘后: 非盘中 10 分钟（对比 last_finish_trading_day，到了就停）
+四档刷新:
+  - 快档: 盘中 5 分钟（实时行情）
+  - 慢档: 盘中 30 分钟（贪恐/情绪/全球）
+  - 日档: 交易日 9:00 后跑一次（板块/北向持股/指数日线）
+  - 盘后: 非盘中 10 分钟（龙虎榜/北向日级/资金流日级/板块统计）
 
 盘中时段: 9:00~11:31, 13:00~15:01
 """
@@ -25,6 +26,12 @@ logger = logging.getLogger(__name__)
 
 TZ_CN = timezone(timedelta(hours=8))
 _adj_running = True
+
+# ── 防重复/防堆叠 状态 ──
+_daily_last_date = ""        # 日档: 记录已刷新的日期，一天只跑一次
+_emotion_last_ts = 0.0        # 情绪: 最近一次刷新时间戳，防30分钟内重复
+_EMOTION_MIN_INTERVAL = 1800  # 情绪数据最小刷新间隔(秒)
+_cold_start_done = threading.Event()  # 冷启动完成信号，防止定时器提前触发
 
 
 # ═══════════════════════════════════════════════════════════
@@ -69,51 +76,57 @@ def _run_all_parallel(tag, fns, max_workers=8):
 
 
 def _refresh_daily():
-    """日级数据: 板块趋势/北向持股（盘中也能更新）"""
-    from app.market_cn.china_market import (
-        refresh_sector_trend,
-        refresh_sector_prediction, refresh_sector_cycle,
-        refresh_sector_history,
-    )
+    """日级数据: 指数日线/北向持股（板块数据由 post_market → collect_sector_daily 写 DB）"""
     from app.market_cn.index import (
         refresh_index_daily_kline, refresh_northbound_holdings,
     )
 
     _run_all("daily", [
-        refresh_sector_trend,
-        refresh_sector_prediction, refresh_sector_cycle,
-        refresh_sector_history,
         refresh_index_daily_kline, refresh_northbound_holdings,
     ])
 
 
+def _refresh_emotion_safe():
+    """带去重的情绪数据刷新（防止多处重复调用 refresh_emotion_cycle）"""
+    global _emotion_last_ts
+    import time
+    now = time.time()
+    if now - _emotion_last_ts < _EMOTION_MIN_INTERVAL:
+        return
+    try:
+        from app.market_cn.emotion import refresh_emotion_cycle
+        refresh_emotion_cycle()
+        _emotion_last_ts = now
+    except Exception as e:
+        logger.warning("[scheduler] refresh_emotion_cycle 失败: %s", e)
+
+
 def _refresh_post_market():
-    """盘后数据: 龙虎榜/北向日级/情绪历史/资金流日级/板块统计（非盘中才跑）"""
+    """盘后数据: 龙虎榜/北向日级/资金流日级/板块统计（非盘中才跑）"""
     from app.market_cn.dragon_limit import refresh_dragon_tiger
     from app.market_cn.index import refresh_northbound_daily, refresh_market_fund_flow_daily
-    from app.market_cn.emotion import refresh_emotion_cycle
     from app.market_cn.sector_history import collect_sector_daily
 
     _run_all("post_market", [
         refresh_dragon_tiger, refresh_northbound_daily,
-        refresh_market_fund_flow_daily, refresh_emotion_cycle,
+        refresh_market_fund_flow_daily,
         collect_sector_daily,
     ])
+    # 情绪数据独立去重，避免与 slow 重复
+    _refresh_emotion_safe()
 
 
 def _refresh_slow():
-    """盘中慢档: 贪恐/情绪/全球情绪 + 日级"""
+    """盘中慢档: 贪恐/情绪/全球（不含日级，日级由 _daily_tick 独立管理）"""
     from app.market_cn.china_market import refresh_fear_greed
-    from app.market_cn.emotion import refresh_emotion_cycle
     from app.data_providers.global_market import refresh_global_sentiment
 
     _run_all("slow", [
-        refresh_fear_greed, refresh_emotion_cycle,
+        refresh_fear_greed,
         refresh_global_sentiment,
     ])
-
-    # 日级数据（盘中也能更新）也放到慢档
-    _refresh_daily()
+    # 情绪数据独立去重
+    _refresh_emotion_safe()
 
 
 def _refresh_fast():
@@ -161,6 +174,7 @@ def _refresh_dragon_pools():
 
 def _dragon_tick():
     """涨跌停池自适应调度"""
+    _cold_start_done.wait()  # 冷启动完成前不执行
     if _is_trading_time():
         try:
             _refresh_dragon_pools()
@@ -177,13 +191,17 @@ def _dragon_tick():
 
 
 def _fast_tick():
-    global _post_market_done_today
+    global _post_market_done_today, _daily_last_date
+    _cold_start_done.wait()  # 冷启动完成前不执行
     if _is_trading_time():
         _post_market_done_today = False  # 盘中开始，重置盘后标志
         _refresh_fast()
+    # 日档: 交易日 9:00 后只跑一次
+    _daily_tick()
 
 
 def _slow_tick():
+    _cold_start_done.wait()  # 冷启动完成前不执行
     if _is_trading_time():
         _refresh_slow()
 
@@ -209,11 +227,26 @@ def _policy_daily_tick():
         logger.warning("[scheduler] 政策新闻刷新失败: %s", e)
 
 
+def _daily_tick():
+    """日档数据: 交易日 9:00 后只跑一次（板块/北向持股/指数日线）"""
+    global _daily_last_date
+    now = datetime.now()
+    if now.weekday() >= 5:
+        return
+    today = now.strftime("%Y-%m-%d")
+    if now.hour < 9 or _daily_last_date == today:
+        return
+    _refresh_daily()
+    _daily_last_date = today
+    logger.info("[scheduler] 日档数据刷新完成")
+
+
 _post_market_done_today = False
 
 
 def _post_market_tick():
     global _post_market_done_today
+    _cold_start_done.wait()  # 冷启动完成前不执行
     if _post_market_done_today or _is_trading_time():
         return
 
@@ -222,22 +255,25 @@ def _post_market_tick():
 
     _refresh_post_market()
 
-    # 用关键数据源的日期判断是否已更新到目标日
-    from app.market_cn.dragon_limit import _rt_dragon_tiger
-    from app.market_cn.index import _rt_nb_daily
-
-    # _rt_dragon_tiger 是 list[dict]，取第一条的 date
+    # 通过公开 API 获取数据日期，不直接读模块内部 _rt_* 变量
     dt_date = ""
-    if _rt_dragon_tiger and isinstance(_rt_dragon_tiger, list) and len(_rt_dragon_tiger) > 0:
-        dt_date = _rt_dragon_tiger[0].get("date", "") if isinstance(_rt_dragon_tiger[0], dict) else ""
-    elif isinstance(_rt_dragon_tiger, dict):
-        dt_date = _rt_dragon_tiger.get("date", "")
-
-    # _rt_nb_daily 是 list[dict]，取最后一条的 date（最新日期）
     nb_date = ""
-    if _rt_nb_daily and isinstance(_rt_nb_daily, list) and len(_rt_nb_daily) > 0:
-        last = _rt_nb_daily[-1]
-        nb_date = last.get("date", "") if isinstance(last, dict) else ""
+    try:
+        from app.market_cn.dragon_limit import get_dragon_tiger
+        dt = get_dragon_tiger()
+        if dt and isinstance(dt, list) and len(dt) > 0:
+            dt_date = dt[0].get("date", "") if isinstance(dt[0], dict) else ""
+        elif isinstance(dt, dict):
+            dt_date = dt.get("date", "")
+    except Exception:
+        pass
+    try:
+        from app.market_cn.index import get_northbound_daily
+        nb = get_northbound_daily(10)
+        if nb and isinstance(nb, list) and len(nb) > 0:
+            nb_date = nb[-1].get("date", "") if isinstance(nb[-1], dict) else ""
+    except Exception:
+        pass
 
     if dt_date >= target and nb_date >= target:
         _post_market_done_today = True
@@ -324,11 +360,11 @@ def start():
     """应用启动时调用（在 Flask app.run 之前或 after_fork）
 
     冷启动：后台线程拉取，不阻塞主线程。
-    定时器立即启动，按各自间隔逐步填充数据。
+    定时器立即启动，但需等待冷启动完成才执行（防止重复拉取）。
     """
     logger.info("[scheduler] market_cn 调度器启动")
 
-    # 定时器立即注册（不阻塞主线程）
+    # 定时器立即注册（不阻塞主线程），但 tick 内部会 wait 冷启动完成
     _schedule("fast", _fast_tick, 300)        # 5 分钟，非盘中自动跳过
     _schedule("slow", _slow_tick, 1800)       # 30 分钟，非盘中自动跳过
     _schedule("dragon_pools", _dragon_tick, 60)  # 自适应间隔，首次 60 秒后启动
@@ -364,22 +400,33 @@ def start():
         # ── 冷启动专用慢档（不含 _refresh_daily，避免与 daily 组重复）──
         def _cold_slow():
             from app.market_cn.china_market import refresh_fear_greed
-            from app.market_cn.emotion import refresh_emotion_cycle
-            _run_all("cold_slow", [
-                refresh_fear_greed, refresh_emotion_cycle,
-            ])
+            _run_all("cold_slow", [refresh_fear_greed])
+            # 情绪数据走统一去重入口
+            _refresh_emotion_safe()
+
+        # 日档数据（冷启动时标记为已刷新，防止定时器重复拉取）
+        def _cold_daily():
+            global _daily_last_date
+            _refresh_daily()
+            _daily_last_date = datetime.now().strftime("%Y-%m-%d")
 
         # 5 组并行执行
         _run_all_parallel("cold", [
-            _refresh_daily,
+            _cold_daily,
             _refresh_post_market,
             _cold_slow,
             _cold_fast,
             _cold_dragon,
         ], max_workers=5)
 
+        # 冷启动期间的情绪刷新时间戳标记（防止定时器立即重跑）
+        global _emotion_last_ts
+        import time
+        _emotion_last_ts = time.time()
+
         elapsed = _t.time() - t0
         logger.info("[scheduler] 冷启动完成，耗时 %.1fs", elapsed)
+        _cold_start_done.set()  # 通知所有定时器: 冷启动已完成
 
     t = threading.Thread(target=_cold_start, daemon=True)
     t.start()

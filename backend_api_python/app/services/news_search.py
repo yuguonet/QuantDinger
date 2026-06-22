@@ -28,6 +28,29 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from typing import List, Dict, Any, Optional
+
+# ── HTTP 响应体大小限制 ──
+_MAX_RESPONSE_BYTES = 5 * 1024 * 1024  # 5MB
+
+
+def _safe_get(url: str, **kwargs) -> requests.Response:
+    """requests.get 带响应体大小限制"""
+    kwargs.setdefault('timeout', 10)
+    resp = _safe_get(url, **kwargs)
+    cl = resp.headers.get('Content-Length')
+    if cl and int(cl) > _MAX_RESPONSE_BYTES:
+        raise ValueError(f"响应体过大: {int(cl)/1024/1024:.1f}MB")
+    return resp
+
+
+def _safe_post(url: str, **kwargs) -> requests.Response:
+    """requests.post 带响应体大小限制"""
+    kwargs.setdefault('timeout', 10)
+    resp = _safe_post(url, **kwargs)
+    cl = resp.headers.get('Content-Length')
+    if cl and int(cl) > _MAX_RESPONSE_BYTES:
+        raise ValueError(f"响应体过大: {int(cl)/1024/1024:.1f}MB")
+    return resp
 from itertools import cycle
 from urllib.parse import urlparse
 
@@ -276,7 +299,7 @@ class TavilySearchProvider(BaseSearchProvider):
                 'api_key': api_key, 'query': query, 'search_depth': 'advanced',
                 'max_results': max_results, 'include_answer': False, 'include_raw_content': False,
             }
-            response = requests.post(url, headers=headers, json=payload, timeout=15)
+            response = _safe_post(url, headers=headers, json=payload, timeout=15)
             if response.status_code != 200:
                 return SearchResponse(query=query, results=[], provider=self.name, success=False,
                                       error_message=f"HTTP {response.status_code}: {response.text}")
@@ -356,7 +379,7 @@ class SerpAPISearchProvider(BaseSearchProvider):
                 "engine": "google", "q": query, "api_key": api_key,
                 "hl": "zh-cn", "gl": "cn", "tbs": tbs, "num": max_results
             }
-            response = requests.get(url, params=params, timeout=15)
+            response = _safe_get(url, params=params, timeout=15)
             if response.status_code != 200:
                 return SearchResponse(query=query, results=[], provider=self.name, success=False,
                                       error_message=f"HTTP {response.status_code}")
@@ -397,7 +420,7 @@ class GoogleSearchProvider(BaseSearchProvider):
                 params['dateRestrict'] = 'w1'
             elif days <= 30:
                 params['dateRestrict'] = 'm1'
-            response = requests.get(url, params=params, timeout=10)
+            response = _safe_get(url, params=params, timeout=10)
             if response.status_code == 429:
                 _google_quota_exhausted = True
                 tomorrow = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
@@ -435,7 +458,7 @@ class BingSearchProvider(BaseSearchProvider):
             url = "https://api.bing.microsoft.com/v7.0/search"
             headers = {"Ocp-Apim-Subscription-Key": api_key}
             params = {"q": query, "count": max_results, "textDecorations": True, "textFormat": "HTML"}
-            response = requests.get(url, headers=headers, params=params, timeout=10)
+            response = _safe_get(url, headers=headers, params=params, timeout=10)
             response.raise_for_status()
             data = response.json()
             from app.services.news_compressor import compress_news
@@ -474,7 +497,7 @@ class BaiduSearchProvider(BaseSearchProvider):
                 "search_recency_filter": self._days_to_recency(days),
                 "result_num": min(max_results, 10),
             }
-            resp = requests.post(url, headers=headers, json=payload, timeout=15)
+            resp = _safe_post(url, headers=headers, json=payload, timeout=15)
             resp.raise_for_status()
             data = resp.json()
             from app.services.news_compressor import compress_news
@@ -524,7 +547,7 @@ class BochaAISearchProvider(BaseSearchProvider):
                 "query": query, "count": min(max_results, 10),
                 "search_lang": "zh", "freshness": self._days_to_freshness(days),
             }
-            resp = requests.post(url, headers=headers, json=payload, timeout=15)
+            resp = _safe_post(url, headers=headers, json=payload, timeout=15)
             resp.raise_for_status()
             data = resp.json()
             results = []
@@ -568,7 +591,7 @@ class DuckDuckGoSearchProvider(BaseSearchProvider):
         try:
             url = "https://api.duckduckgo.com/"
             params = {'q': query, 'format': 'json', 'no_html': 1, 'skip_disambig': 1}
-            response = requests.get(url, params=params, timeout=10)
+            response = _safe_get(url, params=params, timeout=10)
             response.raise_for_status()
             data = response.json()
             results = []
@@ -613,7 +636,7 @@ class DuckDuckGoSearchProvider(BaseSearchProvider):
             url = "https://lite.duckduckgo.com/lite/"
             headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
             data = {'q': query}
-            response = requests.post(url, headers=headers, data=data, timeout=10)
+            response = _safe_post(url, headers=headers, data=data, timeout=10)
             response.raise_for_status()
             results = []
             html = response.text
@@ -647,7 +670,7 @@ class _BaseNewsProvider(BaseSearchProvider):
         super().__init__(['free'], name)
 
     def _news_to_results(self, items: List[Dict]) -> List[SearchResult]:
-        """将新闻 dict 列表转为 SearchResult 列表 (snippet 压缩)"""
+        """将新闻 dict 列表转为 SearchResult 列表 (只保留摘要)"""
         from app.services.news_compressor import compress_news
         if not items:
             return []
@@ -658,10 +681,12 @@ class _BaseNewsProvider(BaseSearchProvider):
             title = _safe_encode(item.get("title", ""))
             if not title:
                 continue
-            # 新闻源优先用 content/description，压缩到 300 字
+            # snippet: 先截断到 500 字再压缩到 200 字
             raw_snippet = item.get("content") or item.get("description") or item.get("title") or ""
+            if len(raw_snippet) > 500:
+                raw_snippet = raw_snippet[:500]
             snippet = _safe_encode(raw_snippet)
-            snippet = compress_news(snippet, max_len=300, title=title)
+            snippet = compress_news(snippet, max_len=200, title=title)
             results.append(SearchResult(
                 title=title,
                 snippet=snippet,
@@ -986,17 +1011,19 @@ class SearchService:
         return True
 
     def _dicts_to_results(self, items: List[Dict[str, Any]]) -> List[SearchResult]:
-        """将 news_provider 返回的 dict 列表转为 SearchResult 列表 (snippet 入口压缩)"""
+        """将 news_provider 返回的 dict 列表转为 SearchResult 列表 (只保留摘要)"""
         from app.services.news_compressor import compress_news
         results = []
         for item in items:
             if not isinstance(item, dict) or not item.get("title"):
                 continue
             title = _safe_encode(item.get("title", ""))
-            # 优先用 content/description 作为 snippet，压缩到 300 字以内
+            # snippet: 先截断到 500 字再压缩到 200 字，避免加载长文本
             raw_snippet = item.get("content") or item.get("description") or item.get("title") or ""
+            if len(raw_snippet) > 500:
+                raw_snippet = raw_snippet[:500]
             snippet = _safe_encode(raw_snippet)
-            snippet = compress_news(snippet, max_len=300, title=title)
+            snippet = compress_news(snippet, max_len=200, title=title)
             results.append(SearchResult(
                 title=title,
                 snippet=snippet,
@@ -1113,58 +1140,33 @@ class SearchService:
     _POLICY_QUERIES: Dict[str, Dict[str, List[str]]] = {
         "CNStock": {
             "cn": [
-                "国务院政策 最新",
-                "宏观经济分析 GDP CPI PPI",
-                "央行货币政策 降准 降息 LPR",
-                "财政政策 减税 专项债",
-                "产业政策 新能源 芯片 制造业",
+                "国务院 央行 发改委 财政部 最新政策",
+                "GDP CPI PPI 货币政策 降准 降息 专项债",
+                "产业政策 新能源 芯片 半导体 AI 制造业",
             ],
             "en": [
-                "China economic policy latest",
-                "China central bank monetary policy",
-                "China fiscal policy stimulus GDP",
-                "China industry policy manufacturing",
+                "China economic policy central bank fiscal stimulus",
+                "China GDP CPI PPI monetary policy interest rate",
+                "China industry policy manufacturing technology",
             ],
         },
         "USStock": {
             "cn": [
-                "美联储货币政策 利率决议",
-                "美国经济数据 非农 CPI GDP",
-                "美国财政政策 减税 刺激计划",
-                "美国贸易政策 关税 制裁",
-                "美国产业政策 芯片法案 科技监管",
+                "美联储 利率决议 非农 CPI 财政政策",
+                "美国贸易政策 关税 制裁 芯片法案",
             ],
             "en": [
-                "Federal Reserve interest rate decision",
-                "US economic data nonfarm CPI GDP",
-                "US fiscal policy tax cut stimulus",
-                "US trade policy tariff sanctions",
-                "US industrial policy CHIPS act regulation",
+                "Federal Reserve interest rate US economic data CPI",
+                "US trade policy tariff sanctions CHIPS act",
             ],
         },
         "Crypto": {
-            "cn": [
-                "加密货币监管政策 各国",
-                "数字货币政策 央行数字货币",
-                "区块链监管 Web3 政策",
-            ],
-            "en": [
-                "cryptocurrency regulation policy",
-                "digital currency CBDC policy",
-                "crypto regulation Web3 government",
-            ],
+            "cn": ["加密货币监管 央行数字货币 区块链政策"],
+            "en": ["cryptocurrency regulation CBDC policy"],
         },
         "Forex": {
-            "cn": [
-                "外汇政策 央行干预 汇率",
-                "货币政策 利率决议 各国央行",
-                "国际贸易收支 外汇储备",
-            ],
-            "en": [
-                "forex policy central bank intervention",
-                "monetary policy interest rate decision",
-                "trade balance foreign exchange reserves",
-            ],
+            "cn": ["外汇政策 央行干预 汇率 利率决议"],
+            "en": ["forex policy central bank intervention exchange rate"],
         },
     }
 
@@ -1230,35 +1232,57 @@ class SearchService:
 
         # ═══════════════════════════════════════════════
         # 路由 0: 政策/宏观新闻 (symbol == POLICY)
+        #   - 3 线程并发（市场源1 + 中文查询1 + 英文查询1）
+        #   - DB 增量: 只搜索比缓存更新的新闻
         # ═══════════════════════════════════════════════
         if news_type == "policy":
-            logger.info(f"[调度] POLICY({market}): Web 政策关键词 + 市场源并行, days={days}")
             market_queries = self._POLICY_QUERIES.get(market, self._POLICY_QUERIES["CNStock"])
-            all_queries = []
-            for lk in ("cn", "en"):
-                for q in market_queries.get(lk, []):
-                    all_queries.append(q)
+            cn_queries = market_queries.get("cn", [])
+            en_queries = market_queries.get("en", [])
+            # 合并为单个查询字符串（用空格连接，搜索引擎会分词处理）
+            cn_query = " ".join(cn_queries) if cn_queries else ""
+            en_query = " ".join(en_queries) if en_queries else ""
 
-            with ThreadPoolExecutor(max_workers=8) as pool:
+            logger.info(f"[调度] POLICY({market}): 市场源 + CN + EN, 3线程, days={days}")
+
+            # DB 增量: 取最新一条的 published_date，搜索比它更新的
+            latest_cached_date = ""
+            try:
+                cache_mgr = get_news_cache_manager()
+                cached_items = cache_mgr.get_items("POLICY", market if market != "all" else "CNStock", limit=1)
+                if cached_items:
+                    latest_cached_date = cached_items[0].get("published_date", "") or ""
+            except Exception:
+                pass
+
+            with ThreadPoolExecutor(max_workers=3) as pool:
                 f_market = pool.submit(fetch_all_market_news, 10, days)
-                web_futures = {
-                    pool.submit(self.search_with_fallback, q, max_web_results, days): q
-                    for q in all_queries
-                }
-                # 收集市场源
+                f_cn = pool.submit(self.search_with_fallback, cn_query, max_web_results, days) if cn_query else None
+                f_en = pool.submit(self.search_with_fallback, en_query, max_web_results, days) if en_query else None
+
                 try:
                     market_dicts = f_market.result(timeout=20)
                     source_results = self._dicts_to_results(market_dicts)
                 except Exception as e:
                     logger.warning(f"[调度] POLICY 市场源异常: {e}")
-                # 收集 Web 政策搜索
-                for future in as_completed(web_futures):
+                for f in (f_cn, f_en):
+                    if f is None:
+                        continue
                     try:
-                        resp = future.result()
+                        resp = f.result(timeout=30)
                         if resp and resp.success:
                             web_results.extend(resp.results)
                     except Exception as e:
                         logger.warning(f"[调度] POLICY Web异常: {e}")
+
+            # 增量过滤: 丢弃比 DB 缓存更旧的结果
+            if latest_cached_date and web_results:
+                before = len(web_results)
+                web_results = [r for r in web_results
+                               if not r.published_date or r.published_date >= latest_cached_date]
+                dropped = before - len(web_results)
+                if dropped:
+                    logger.info(f"[调度] POLICY 增量过滤: 丢弃 {dropped} 条旧新闻 (< {latest_cached_date})")
 
         # ═══════════════════════════════════════════════
         # 路由 1: 纯关键词搜索 (symbol 空 + market 空 + keywords 非空)
@@ -1283,7 +1307,7 @@ class SearchService:
             if lang in ("all", "en"):
                 queries.extend(self._GENERAL_QUERIES["en"])
 
-            with ThreadPoolExecutor(max_workers=8) as pool:
+            with ThreadPoolExecutor(max_workers=3) as pool:
                 futures = {
                     pool.submit(self.search_with_fallback, q, max_web_results, 1): q
                     for q in queries
@@ -1371,6 +1395,9 @@ class SearchService:
             f"[调度] {news_type}({symbol or market}): "
             f"源={len(source_results)}, Web+{web_added}, 合并={len(merged)}, 耗时={elapsed}s"
         )
+
+        # POLICY 路由完成后主动 GC，释放并发搜索的临时对象
+        import gc; gc.collect()
 
         return SearchResponse(
             query=f"{symbol} {name}".strip() if name else (symbol or f"通用财经({market})"),

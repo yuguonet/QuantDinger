@@ -543,9 +543,9 @@ def _kline_baostock(code: str, days: int) -> Optional[pd.DataFrame]:
 #  对外接口（Public API）
 # ══════════════════════════════════════════════════════════════
 
-def get_index_realtime(codes: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+def get_index_realtime(codes: Optional[List[str]] = None, force: bool = False) -> List[Dict[str, Any]]:
     """获取指数实时行情（自动降级）"""
-    if _rt_idx_realtime is not None:         # ① 内存缓存
+    if not force and _rt_idx_realtime is not None:  # 内存缓存
         return _rt_idx_realtime
     if codes is None:                        # ② 原有逻辑
         codes = list(INDEX_CODES.keys())
@@ -559,7 +559,7 @@ def get_index_realtime(codes: Optional[List[str]] = None) -> List[Dict[str, Any]
     return []
 
 
-def get_index_daily_kline(code: str = "000001", days: int = 200) -> List[Dict[str, Any]]:
+def get_index_daily_kline(code: str = "000001", days: int = 200, force: bool = False) -> List[Dict[str, Any]]:
     """获取指数日K线（自动降级）
 
     依次尝试 mootdx → AKShare → BaoStock。
@@ -567,6 +567,7 @@ def get_index_daily_kline(code: str = "000001", days: int = 200) -> List[Dict[st
     Args:
         code: 指数代码，默认 "000001"（上证指数）
         days: 数据条数，默认 200（约一个交易年的日线数）
+        force: 强制从数据源拉取，跳过缓存
 
     Returns:
         成功: [{date, open, high, low, close, volume, amount}, ...]
@@ -579,7 +580,7 @@ def get_index_daily_kline(code: str = "000001", days: int = 200) -> List[Dict[st
     global _rt_max_idx_daily_days
     _rt_max_idx_daily_days = min(max(_rt_max_idx_daily_days, days), _RT_MAX_IDX_DAILY_DAYS)  # ① 峰值（有上限）
     cached = _rt_idx_daily.get(code)                 # ② 内存缓存
-    if cached and len(cached) >= days:
+    if not force and cached and len(cached) >= days:
         return cached[:days]
     for fetcher in (_kline_mootdx, _kline_tencent, _kline_sina, _kline_baostock):  # ③ 远端 fallback
         df = fetcher(code, days)
@@ -661,7 +662,7 @@ def get_index_kline(code: str = "000001", frequency: str = "1D", days: int = 200
 # 北向合计 = 沪股通净买入 + 深股通净买入（单位: 亿元）
 
 
-def get_northbound_realtime() -> Dict[str, Any]:
+def get_northbound_realtime(force: bool = False) -> Dict[str, Any]:
     """获取当日北向资金实时分钟级流向（同花顺 hexin API）。
 
     数据来源: 同花顺 data.hexin.cn
@@ -690,7 +691,7 @@ def get_northbound_realtime() -> Dict[str, Any]:
         >>> nb = get_northbound_realtime()
         >>> print(f"北向合计: {nb['total_latest_yi']:.2f} 亿")
     """
-    if _rt_nb_realtime is not None:          # ① 内存缓存
+    if not force and _rt_nb_realtime is not None:  # 内存缓存
         return _rt_nb_realtime
     import urllib.request
 
@@ -899,7 +900,7 @@ def get_northbound_daily(days: int = 120, force: bool = False) -> List[Dict[str,
     return []
 
 
-def get_northbound_holdings(top: int = 50) -> List[Dict[str, Any]]:
+def get_northbound_holdings(top: int = 50, force: bool = False) -> List[Dict[str, Any]]:
     """获取北向持股明细（同花顺 hexin API）。
 
     返回当前北向资金（沪股通+深股通）持有的 A 股个股明细，
@@ -927,7 +928,7 @@ def get_northbound_holdings(top: int = 50) -> List[Dict[str, Any]]:
     """
     global _rt_max_nb_holdings_top
     _rt_max_nb_holdings_top = min(max(_rt_max_nb_holdings_top, top), _RT_MAX_NB_HOLDINGS_TOP)
-    if _rt_nb_holdings and len(_rt_nb_holdings) >= top:
+    if not force and _rt_nb_holdings and len(_rt_nb_holdings) >= top:
         return _rt_nb_holdings[:top]
 
     import urllib.request
@@ -1307,55 +1308,22 @@ def _mkt_flow_eastmoney_realtime() -> Optional[Dict[str, Any]]:
         return None
 
 
-_fund_flow_cache: Dict[str, Any] = {}
-_fund_flow_cache_ts: float = 0
-_FUND_FLOW_TTL: int = 120  # 秒
 
 
-def get_market_fund_flow_realtime() -> Dict[str, Any]:
+def get_market_fund_flow_realtime(force: bool = False) -> Dict[str, Any]:
     """获取实时大盘资金流向（沪深两市主力资金净流入/流出）。
 
     多源降级: 新浪(行业汇总) → 东财 push2(兜底)
-    接口级缓存: 30秒 TTL，所有调用方共享。
-
-    数据含义:
-      - main_net = 主力净流入（新浪: 行业板块净额汇总; 东财: 超大单+大单）
-      - main_pct = 主力净占比(%)
-      - in_net / out_net = 总流入 / 总流出（仅新浪源有）
-      - sectors_count = 行业板块数（仅新浪源有）
-
-    Returns:
-        成功: {
-            source: "sina",
-            timestamp: "2025-01-15 14:30:00",
-            main_net: 21835000000.0,    # 主力净流入(元)
-            main_pct: 1.34,             # 主力净占比(%)
-            in_net: 825332000000.0,     # 总流入(元)
-            out_net: 803496000000.0,    # 总流出(元)
-            sectors_count: 48,          # 行业板块数
-            data: [{name, code, change_pct, main_net, main_pct, ...}],
-        }
-        失败: {source: "none", error: "..."}
-
-    Example:
-        >>> flow = get_market_fund_flow_realtime()
-        >>> if flow.get("main_net", 0) > 0:
-        ...     print(f"主力净流入 {flow['main_net']/1e8:.2f} 亿")
+    内存缓存: _rt_mf_realtime，由 scheduler 定期刷新。
     """
-    if _rt_mf_realtime is not None:          # ① 内存缓存
+    if not force and _rt_mf_realtime is not None:  # 内存缓存（由 refresh 写入）
         return _rt_mf_realtime
-    global _fund_flow_cache, _fund_flow_cache_ts
-    import time
-    now = time.time()
-    if _fund_flow_cache and (now - _fund_flow_cache_ts) < _FUND_FLOW_TTL:
-        return _fund_flow_cache
 
+    # 缓存 miss: 直接拉取（冷启动或 refresh 未跑时的兜底）
     for fetcher in (_mkt_flow_sina_realtime, _mkt_flow_tencent_realtime,
                     _mkt_flow_ths_realtime, _mkt_flow_eastmoney_realtime):
         data = fetcher()
         if data:
-            _fund_flow_cache = data
-            _fund_flow_cache_ts = now
             return data
 
     logger.error("所有数据源获取大盘实时资金流均失败")
@@ -1421,7 +1389,7 @@ def _mkt_flow_daily_eastmoney(days: int = 120) -> Optional[List[Dict[str, Any]]]
         return None
 
 
-def get_market_fund_flow_daily(days: int = 120) -> List[Dict[str, Any]]:
+def get_market_fund_flow_daily(days: int = 120, force: bool = False) -> List[Dict[str, Any]]:
     """获取大盘资金流向日线数据（沪深两市每日主力资金净流入/流出）。
 
     多源降级: 东财 push2his(兜底)
@@ -1451,7 +1419,7 @@ def get_market_fund_flow_daily(days: int = 120) -> List[Dict[str, Any]]:
     """
     global _rt_max_mf_daily_days
     _rt_max_mf_daily_days = min(max(_rt_max_mf_daily_days, days), _RT_MAX_MF_DAILY_DAYS)  # ① 峰值（有上限）
-    if _rt_mf_daily and len(_rt_mf_daily) >= days:            # ② 内存缓存
+    if not force and _rt_mf_daily and len(_rt_mf_daily) >= days:  # 内存缓存
         return _rt_mf_daily[:days]
     data = _mkt_flow_daily_eastmoney(days)                    # ③ 远端 fallback
     if data:
@@ -1644,7 +1612,7 @@ def _sector_flow_eastmoney(indicator: str = "今日") -> Optional[List[Dict[str,
         return None
 
 
-def get_sector_fund_flow(indicator: str = "今日") -> List[Dict[str, Any]]:
+def get_sector_fund_flow(indicator: str = "今日", force: bool = False) -> List[Dict[str, Any]]:
     """获取行业板块资金流向排名。
 
     多源降级: 新浪 → 东财(兜底)
@@ -1674,7 +1642,7 @@ def get_sector_fund_flow(indicator: str = "今日") -> List[Dict[str, Any]]:
         >>> for s in sectors[:5]:
         ...     print(f"{s['name']}: 主力 {s['main_net']/1e8:.2f} 亿")
     """
-    if _rt_sector_flow is not None:          # ① 内存缓存
+    if not force and _rt_sector_flow is not None:  # 内存缓存
         return _rt_sector_flow
     if indicator not in ("今日", "3日", "5日", "10日"):
         logger.warning("不支持的统计周期: %s，使用'今日'", indicator)
@@ -1773,7 +1741,7 @@ def _merge_and_cache_nb_daily(new_data: List[Dict[str, Any]], days: int) -> List
 def refresh_index_realtime():
     global _rt_idx_realtime
     try:
-        _rt_idx_realtime = get_index_realtime()
+        _rt_idx_realtime = get_index_realtime(force=True)
     except Exception as e:
         logger.warning("[refresh] refresh_index_realtime 失败: %s", e)
 
@@ -1782,7 +1750,7 @@ def refresh_index_daily_kline():
     try:
         fetch_days = max(500, _rt_max_idx_daily_days)
         for code in INDEX_CODES:
-            data = get_index_daily_kline(code, fetch_days)
+            data = get_index_daily_kline(code, fetch_days, force=True)
             if data:
                 _rt_idx_daily[code] = data
     except Exception as e:
@@ -1791,7 +1759,7 @@ def refresh_index_daily_kline():
 def refresh_northbound_realtime():
     global _rt_nb_realtime
     try:
-        _rt_nb_realtime = get_northbound_realtime()
+        _rt_nb_realtime = get_northbound_realtime(force=True)
     except Exception as e:
         logger.warning("[refresh] refresh_northbound_realtime 失败: %s", e)
 
@@ -1807,14 +1775,14 @@ def refresh_northbound_holdings():
     global _rt_nb_holdings, _rt_max_nb_holdings_top
     try:
         fetch_top = max(100, _rt_max_nb_holdings_top)
-        _rt_nb_holdings = get_northbound_holdings(fetch_top)
+        _rt_nb_holdings = get_northbound_holdings(fetch_top, force=True)
     except Exception as e:
         logger.warning("[refresh] northbound_holdings 失败: %s", e)
 
 def refresh_market_fund_flow_realtime():
     global _rt_mf_realtime
     try:
-        _rt_mf_realtime = get_market_fund_flow_realtime()
+        _rt_mf_realtime = get_market_fund_flow_realtime(force=True)
     except Exception as e:
         logger.warning("[refresh] refresh_market_fund_flow_realtime 失败: %s", e)
 
@@ -1822,14 +1790,14 @@ def refresh_market_fund_flow_daily():
     global _rt_mf_daily, _rt_max_mf_daily_days
     try:
         fetch_days = max(500, _rt_max_mf_daily_days)
-        _rt_mf_daily = get_market_fund_flow_daily(fetch_days)
+        _rt_mf_daily = get_market_fund_flow_daily(fetch_days, force=True)
     except Exception as e:
         logger.warning("[refresh] market_fund_flow_daily 失败: %s", e)
 
 def refresh_sector_fund_flow():
     global _rt_sector_flow
     try:
-        _rt_sector_flow = get_sector_fund_flow()
+        _rt_sector_flow = get_sector_fund_flow(force=True)
     except Exception as e:
         logger.warning("[refresh] refresh_sector_fund_flow 失败: %s", e)
 

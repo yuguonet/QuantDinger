@@ -26,8 +26,6 @@ from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 #  缓存硬上限
 # ============================================================
 _CACHE_STORE_MAX = 200          # _cache_store 最多保留 200 个 endpoint
-_RT_SECTOR_HISTORY_MAX_DAYS = 250   # 板块历史最多 250 天
-_RT_EMOTION_HISTORY_MAX_HOURS = 168  # 情绪历史最多 7 天
 
 logger = logging.getLogger(__name__)
 
@@ -284,29 +282,19 @@ def get_hot_sectors(industry_limit=15, concept_limit=15) -> dict:
 
 
 def get_sector_trend(board_type="industry") -> dict:
-    """板块1个月趋势 + 6个月周期 + 预测"""
-    _rt_max_sector_trend_days[board_type] = min(max(_rt_max_sector_trend_days.get(board_type, 0), 30), 60)  # ① 峰值（上限 60 天）
-    cached = _rt_sector_trend.get(board_type)                          # ② 内存缓存
-    if cached:
-        return cached
-    data = _fetch_sector_trend(board_type)                             # ③ 远端 fallback
+    """板块1个月趋势 + 6个月周期 + 预测 — 直接从 DB 计算，无缓存"""
+    data = _fetch_sector_trend(board_type)
     return {"code": 1, "msg": "success", "data": data or {}}
 
 
 def get_sector_prediction() -> dict:
-    """今日热门板块预测"""
-    if _rt_sector_prediction is not None:    # ① 内存缓存
-        return _rt_sector_prediction
-    return _fetch_sector_prediction()        # ② 远端 fallback（已包装）
+    """今日热门板块预测 — 直接从 DB 计算，无缓存"""
+    return _fetch_sector_prediction()
 
 
 def get_sector_cycle(board_type="industry") -> dict:
-    """板块6个月周期分析"""
-    _rt_max_sector_cycle_days[board_type] = min(max(_rt_max_sector_cycle_days.get(board_type, 0), 180), 365)  # ① 峰值（上限 365 天）
-    cached = _rt_sector_cycle.get(board_type)                          # ② 内存缓存
-    if cached:
-        return cached
-    return _fetch_sector_cycle(board_type)                             # ③ 远端 fallback（已包装）
+    """板块6个月周期分析 — 直接从 DB 计算，无缓存"""
+    return _fetch_sector_cycle(board_type)
 
 
 def get_sector_stocks(board_code: str, limit=15) -> dict:
@@ -323,13 +311,8 @@ def get_sector_stocks(board_code: str, limit=15) -> dict:
 
 
 def get_sector_history(board_type="industry", days=30) -> dict:
-    """板块历史排名数据"""
-    global _rt_max_sector_history_days
-    _rt_max_sector_history_days = min(max(_rt_max_sector_history_days, days), _RT_SECTOR_HISTORY_MAX_DAYS)  # ① 峰值（有上限）
-    cached = _rt_sector_history.get(board_type)                           # ② 内存缓存
-    if cached:
-        return {"code": 1, "msg": "success", "count": len(cached), "data": cached}
-    days = min(max(days, 1), 200)                                         # ③ 原有逻辑
+    """板块历史排名数据 — 直接从 DB 读取，无缓存"""
+    days = min(max(days, 1), 250)
     try:
         from .sector_history import get_sector_history as _get_history
         rows = _get_history(board_type=board_type, days=days)
@@ -340,63 +323,58 @@ def get_sector_history(board_type="industry", days=30) -> dict:
 
 
 def get_emotion_history(hours=None, date=None) -> dict:
-    """情绪指数历史数据（当天快照）"""
-    if hours:
-        global _rt_max_emotion_history_hours
-        _rt_max_emotion_history_hours = min(max(_rt_max_emotion_history_hours, hours), _RT_EMOTION_HISTORY_MAX_HOURS)  # ① 峰值（有上限）
-    if _rt_emotion_history is not None:                                           # ② 内存缓存
-        return _rt_emotion_history
-    from .emotion import get_emotion_history as _get                              # ③ 原有逻辑
+    """情绪指数历史数据 — 直接从文件读取，无缓存"""
+    from .emotion import get_emotion_history as _get
     return _get(hours=hours)
 
 
 def get_policy() -> dict:
-    """AI政策解读 — 只读内存缓存，不主动触发搜索（由 scheduler 每日写入）"""
-    if _rt_policy is not None:
-        return _rt_policy
-    # 内存没有时从 DB 读一次，仍不触发网络请求
+    """政策新闻 — 纯读: 直接从 DB 加载，无内存缓存"""
     try:
         from app.services.news_search import get_news_cache_manager
+        from app.services.news_analysis import composite_score
+
         cache_mgr = get_news_cache_manager()
         cached_items = cache_mgr.get_items("POLICY", "CNStock")
-        if cached_items:
-            news_list = [
-                {
-                    "title": r.get("title", ""),
-                    "link": r.get("url", ""),
-                    "snippet": r.get("snippet", ""),
-                    "source": r.get("source", ""),
-                    "published": r.get("published_date", ""),
-                    "sentiment": r.get("sentiment", "neutral"),
-                    "sentiment_score": r.get("sentiment_score"),
-                    "category": "政策/宏观:CNStock", "lang": "cn",
-                }
-                for r in cached_items
-            ]
-            from app.services.news_analysis import composite_score
-            score_articles = [
-                {"score": item.get("sentiment_score", 0.0) or 0.0,
-                 "published_date": item.get("published", "")}
-                for item in news_list
-            ]
-            try:
-                score_info = composite_score(score_articles)
-            except Exception:
-                score_info = {}
-            result = {
-                "code": 1, "msg": "success",
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "data": {
-                    "news": news_list,
-                    "score": score_info.get("composite_score", 0),
-                    "direction": score_info.get("direction", "中性"),
-                    "count": len(news_list),
-                },
+        if not cached_items:
+            return {"code": 0, "msg": "暂无政策数据（等待 scheduler 每日刷新）", "data": {}}
+
+        news_list = [
+            {
+                "title": r.get("title", ""),
+                "link": r.get("url", ""),
+                "snippet": (r.get("snippet", "") or "")[:200],
+                "source": r.get("source", ""),
+                "published": r.get("published_date", ""),
+                "sentiment": r.get("sentiment", "neutral"),
+                "sentiment_score": r.get("sentiment_score"),
             }
-            return result
+            for r in cached_items
+        ]
+
+        score_articles = [
+            {"score": item.get("sentiment_score", 0.0) or 0.0,
+             "published_date": item.get("published", "")}
+            for item in news_list
+        ]
+        try:
+            score_info = composite_score(score_articles)
+        except Exception:
+            score_info = {}
+
+        return {
+            "code": 1, "msg": "success",
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "data": {
+                "news": news_list,
+                "score": score_info.get("composite_score", 0),
+                "direction": score_info.get("direction", "中性"),
+                "count": len(news_list),
+            },
+        }
     except Exception as e:
-        logger.warning("DB 缓存读取 POLICY 失败: %s", e)
-    return {"code": 0, "msg": "暂无政策数据（等待 scheduler 每日刷新）", "data": {}}
+        logger.warning("DB 读取 POLICY 失败: %s", e)
+        return {"code": 0, "msg": f"读取失败: {e}", "data": {}}
 
 
 # ============================================================
@@ -475,68 +453,16 @@ def _fetch_sector_cycle(board_type="industry"):
     }
 
 
-def _fetch_policy() -> dict:
-    from app.services.news_search import fetch_financial_news, get_news_cache_manager
-    from app.services.news_analysis import composite_score
-
-    news_list = []
+def _fetch_policy() -> None:
+    """政策新闻 — 写入: 触发搜索，数据自动写入 DB (qd_news_cache_items)"""
+    from app.services.news_search import fetch_financial_news
     try:
         resp = fetch_financial_news(lang="all", market="CNStock", symbol="POLICY")
-        news_list = resp.get("cn", []) + resp.get("en", [])
+        cn_count = len(resp.get("cn", []))
+        en_count = len(resp.get("en", []))
+        logger.info("[POLICY] 搜索完成: cn=%d, en=%d (已写入DB)", cn_count, en_count)
     except Exception as e:
         logger.error("fetch_financial_news(POLICY) 异常: %s", e)
-
-    if not news_list:
-        try:
-            cache_mgr = get_news_cache_manager()
-            cached_items = cache_mgr.get_items("POLICY", "CNStock")
-            if cached_items:
-                news_list = [
-                    {
-                        "title": r.get("title", ""),
-                        "link": r.get("url", ""),
-                        "snippet": r.get("snippet", ""),
-                        "source": r.get("source", ""),
-                        "published": r.get("published_date", ""),
-                        "sentiment": r.get("sentiment", "neutral"),
-                        "sentiment_score": r.get("sentiment_score"),
-                        "category": "政策/宏观:CNStock", "lang": "cn",
-                    }
-                    for r in cached_items
-                ]
-        except Exception as e:
-            logger.error("DB 缓存降级失败: %s", e)
-
-    if not news_list:
-        return {"code": 0, "msg": "暂无政策数据", "data": {}}
-
-    score_articles = [
-        {"score": item.get("sentiment_score", 0.0) or 0.0,
-         "published_date": item.get("published", "")}
-        for item in news_list
-    ]
-    try:
-        score_info = composite_score(score_articles)
-    except Exception:
-        score_info = {}
-
-    return {
-        "code": 1, "msg": "success",
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "data": {
-            "news": news_list,
-            "items": news_list,
-            "score": {
-                "composite_score": score_info.get("composite_score", 0.0),
-                "direction": score_info.get("direction", "中性"),
-                "positive": score_info.get("positive_count", 0),
-                "negative": score_info.get("negative_count", 0),
-                "neutral": score_info.get("neutral_count", 0),
-                "veto": score_info.get("veto", False),
-                "veto_count": 1 if score_info.get("veto") else 0,
-            },
-        },
-    }
 
 
 # ============================================================
@@ -551,17 +477,7 @@ def _fetch_policy() -> dict:
 
 _rt_fear_greed = None
 _rt_hot_sectors = None
-_rt_sector_trend = {}       # {board_type: data}
-_rt_sector_prediction = None
-_rt_sector_cycle = {}       # {board_type: data}
-_rt_sector_history = {}     # {board_type: data}
-_rt_emotion_history = None
-_rt_policy = None
 
-_rt_max_sector_trend_days = {}    # {board_type: days}
-_rt_max_sector_cycle_days = {}    # {board_type: days}
-_rt_max_sector_history_days = 0   # 峰值记录
-_rt_max_emotion_history_hours = 0 # 峰值记录
 
 def refresh_fear_greed():
     global _rt_fear_greed
@@ -579,48 +495,10 @@ def refresh_hot_sectors():
     except Exception as e:
         logger.warning("[refresh] refresh_hot_sectors 失败: %s", e)
 
-def refresh_sector_trend(board_type="industry"):
-    global _rt_sector_trend
-    try:
-        data = _fetch_sector_trend(board_type)
-        _rt_sector_trend[board_type] = {"code": 1, "msg": "success", "data": data or {}}
-    except Exception as e:
-        logger.warning("[refresh] refresh_sector_trend(%s) 失败: %s", board_type, e)
-
-def refresh_sector_prediction():
-    global _rt_sector_prediction
-    try:
-        _rt_sector_prediction = _fetch_sector_prediction()
-    except Exception as e:
-        logger.warning("[refresh] refresh_sector_prediction 失败: %s", e)
-
-def refresh_sector_cycle(board_type="industry"):
-    global _rt_sector_cycle
-    try:
-        _rt_sector_cycle[board_type] = _fetch_sector_cycle(board_type)
-    except Exception as e:
-        logger.warning("[refresh] refresh_sector_cycle(%s) 失败: %s", board_type, e)
-
-def refresh_sector_history(board_type="industry"):
-    global _rt_sector_history, _rt_max_sector_history_days
-    try:
-        fetch_days = max(250, int(_rt_max_sector_history_days * 1.5))
-        _rt_sector_history[board_type] = get_sector_history(board_type, fetch_days)
-    except Exception as e:
-        logger.warning("[refresh] sector_history(%s) 失败: %s", board_type, e)
-
-def refresh_emotion_history():
-    global _rt_emotion_history, _rt_max_emotion_history_hours
-    try:
-        fetch_hours = max(48, int(_rt_max_emotion_history_hours * 1.5)) if _rt_max_emotion_history_hours > 0 else 48
-        _rt_emotion_history = get_emotion_history(hours=fetch_hours)
-    except Exception as e:
-        logger.warning("[refresh] emotion_history 失败: %s", e)
-
 def refresh_policy():
-    global _rt_policy
+    """写入: 触发搜索，结果自动入库 DB"""
     try:
-        _rt_policy = _fetch_policy()
+        _fetch_policy()
     except Exception as e:
         logger.warning("[refresh] refresh_policy 失败: %s", e)
 

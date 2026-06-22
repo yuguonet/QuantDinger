@@ -80,10 +80,10 @@ def _momentum():
 def _breadth():
     """2. 市场宽度 — 读 scheduler 缓存的行业板块涨跌家数，不发 HTTP"""
     try:
-        from .china_market import _rt_hot_sectors
-        if not _rt_hot_sectors:
-            return 50, "板块数据未加载"
-        industry = (_rt_hot_sectors.get("data") or {}).get("industry", [])
+        from .china_market import get_hot_sectors
+        resp = get_hot_sectors()
+        data = resp.get("data") or {} if isinstance(resp, dict) else {}
+        industry = data.get("industry", [])
         if not industry:
             return 50, "行业板块数据为空"
         up_total = sum(int(b.get("up_count", 0) or 0) for b in industry)
@@ -134,9 +134,9 @@ def _northbound():
 def _limit_ratio():
     """6. 涨停/跌停比 — 读 scheduler 缓存，不发 HTTP"""
     try:
-        from .dragon_limit import _rt_zt_pool, _rt_dt_pool
-        up = len(_rt_zt_pool) if _rt_zt_pool else 0
-        down = len(_rt_dt_pool) if _rt_dt_pool else 0
+        from .dragon_limit import get_zt_pool, get_dt_pool
+        up = len(get_zt_pool())
+        down = len(get_dt_pool())
         if up + down == 0:
             return 50, "涨跌停数据未加载"
         ratio = up / max(down, 1)
