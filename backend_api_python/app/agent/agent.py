@@ -797,6 +797,11 @@ class _AgentExecutor:
                     "[Intent] domain=%s strategy=%s intent=%s confidence=%.2f",
                     domain, result.strategy, intent.intent, intent.confidence,
                 )
+                print(
+                    f"[DEBUG] 意图分析结果 | domain={domain} strategy={result.strategy} "
+                    f"intent={intent.intent} confidence={intent.confidence:.2f} "
+                    f"verb={result.verb} noun={result.noun}"
+                )
 
                 # Update tool context with domain
                 from app.agent.tool_context import get_tool_context
@@ -835,6 +840,7 @@ class _AgentExecutor:
 
             except Exception as e:
                 import traceback
+                print(f"[DEBUG] 意图分析异常: {e}")
                 logger.warning("[Intent] 分析失败，走默认流程: %s\n%s", e, traceback.format_exc())
                 return result
 
@@ -931,16 +937,15 @@ class _AgentExecutor:
             enriched = "\n".join(ctx_parts) + "\n\n" + message
         result.enriched = enriched
 
-        # ── 6. 获取执行计划（仅 traced 策略且有 verb/noun 时）──
+        # ── 6. 获取执行计划（始终调用，verb/noun 为空时由 Planner 从消息解析）──
         chain_def = None
-        if result.verb or result.noun:
-            try:
-                chain_def = self._try_chain(
-                    result.verb, result.noun, message,
-                    session_id, context, user_id,
-                )
-            except Exception as e:
-                logger.warning("[Planner] 链路获取异常，降级到 agent: %s", e)
+        try:
+            chain_def = self._try_chain(
+                result.verb, result.noun, message,
+                session_id, context, user_id,
+            )
+        except Exception as e:
+            logger.warning("[Planner] 链路获取异常，降级到 agent: %s", e)
         result.chain_def = chain_def
 
         return result
@@ -1015,6 +1020,19 @@ class _AgentExecutor:
         fast_exit_steps = int(os.getenv("PLAN_PHASE_FAST_EXIT_STEPS", "3"))
 
         t0 = time.time()
+        # ── 调试日志：agent.run() 前 ──────────────────────────
+        print(
+            f"[DEBUG] agent.run() 即将执行 | enriched_len={len(enriched) if enriched else 0} "
+            f"max_steps={max_steps} agent_type={type(agent).__name__} "
+            f"domain={(context or {}).get('domain', '')} "
+            f"strategy={(meta or {}).get('strategy', '')} "
+            f"session_id={(context or {}).get('session_id', '')}"
+        )
+        print(f"[DEBUG] enriched 前500字: {(enriched or '')[:500]}")
+        print(
+            f"[DEBUG] context={json.dumps({k: str(v)[:100] for k, v in (context or {}).items()}, ensure_ascii=False)} "
+            f"meta_keys={list((meta or {}).keys())}"
+        )
         result = agent.run(enriched, max_steps=max_steps)
 
         # ── §3.1 步骤 9: 错误检测 + 快速退出 ──────────────────
@@ -1169,6 +1187,12 @@ class _AgentExecutor:
 
     def _execute_plan(self, agent, chain_def, message, context, meta, store, session_id):
         """per-phase 执行：逐 phase 调用 agent.run()。"""
+        # ── 调试日志：plan 入口 ───────────────────────────────
+        print(
+            f"[DEBUG] _execute_plan() 入口 | phases={len(chain_def.steps)} "
+            f"progressive={getattr(chain_def, 'progressive', True)} "
+            f"agent_type={type(agent).__name__}"
+        )
         # 获取 skill 元数据（工具列表、描述等）
         skill_metas = {}
         try:
@@ -1227,6 +1251,12 @@ class _AgentExecutor:
 
             step_context = "\n".join(p for p in parts if p)
             logger.info("[Plan] 执行 phase %d/%d: %s", step.order, len(chain_def.steps), step.agent)
+            # ── 调试日志：per-phase 详情 ──────────────────────
+            print(
+                f"[DEBUG] Plan phase {step.order}/{len(chain_def.steps)} | "
+                f"agent={step.agent} step_context_len={len(step_context) if step_context else 0}"
+            )
+            print(f"[DEBUG] Plan phase {step.order} step_context 前300字: {(step_context or '')[:300]}")
 
             # 执行当前 phase
             step_success, step_content, step_tool_calls, step_steps, step_tokens, step_charts, step_result = \
@@ -1253,6 +1283,12 @@ class _AgentExecutor:
     def _execute_plan_stream(self, agent, chain_def, message, context, meta, store, session_id,
                              _stream_tool_calls, _stream_tool_call_counter, _pending_tool_ids):
         """per-phase 流式执行：逐 phase 调用 agent.run(stream=True)，每步只看到 1 步内容。"""
+        # ── 调试日志：plan_stream 入口 ───────────────────────
+        print(
+            f"[DEBUG] _execute_plan_stream() 入口 | phases={len(chain_def.steps)} "
+            f"progressive={getattr(chain_def, 'progressive', True)} "
+            f"agent_type={type(agent).__name__}"
+        )
         skill_metas = {}
         try:
             from app.agent.semantics import get_all_skill_metas
@@ -1302,6 +1338,13 @@ class _AgentExecutor:
 
             step_context = "\n".join(p for p in parts if p)
             logger.info("[Plan-Stream] 执行 phase %d/%d: %s", step.order, len(sorted_steps), step.agent)
+            # ── 调试日志：agent.run() 前（Plan-Stream）──────────
+            print(
+                f"[DEBUG] Plan-Stream agent.run() 即将执行 | phase={step.order}/{len(sorted_steps)} "
+                f"agent={step.agent} max_steps={self.max_steps} "
+                f"step_context_len={len(step_context) if step_context else 0}"
+            )
+            print(f"[DEBUG] Plan-Stream step_context 前300字: {(step_context or '')[:300]}")
 
             # 通知前端当前 phase
             yield {"type": "tool_info", "tool": "", "message": f"── 第 {step.order} 步: {step.description or step.agent} ──"}
@@ -1346,6 +1389,7 @@ class _AgentExecutor:
             _eval_result, meta.get("tool_chain", []),
             meta.get("intent_verb", ""), meta.get("intent_noun", ""),
             domain=meta.get("domain", ""), session_id=session_id,
+            chain_def=meta.get("chain_def"),
         )
 
         # ── 保存根节点 ──
@@ -1448,7 +1492,7 @@ class _AgentExecutor:
             success=success, content=content, tool_calls_log=tool_calls_log,
             total_steps=total_steps, total_tokens=total_tokens,
         )
-        self._post_evaluate(agent_result_for_eval, _tool_chain, _intent_verb, _intent_noun, domain=_eval_domain, session_id=session_id)
+        self._post_evaluate(agent_result_for_eval, _tool_chain, _intent_verb, _intent_noun, domain=_eval_domain, session_id=session_id, chain_def=meta.get("chain_def"))
 
         # ── 异步压缩上下文 ──
         if success and content:
@@ -1522,32 +1566,20 @@ class _AgentExecutor:
         # ── 阶段 2: 执行阶段 ──
         chain_def = meta.get("chain_def")
 
+        print(
+            f"[DEBUG] 阶段2 | chain_def={'有' if chain_def else 'None'} "
+            f"verb={meta.get('intent_verb', '')} noun={meta.get('intent_noun', '')} "
+            f"domain={meta.get('domain', '')} strategy={meta.get('strategy', '')}"
+        )
+
         if chain_def:
             # per-phase 执行：每个 phase 单独一次 agent.run()，只看到这 1 步
             success, content, tool_calls_log, total_steps, total_tokens, charts_b64, result = \
                 self._execute_plan(agent, chain_def, message, context, meta, store, session_id)
         else:
-            # 无链路：Agent 自由执行
-            max_retries = int(os.getenv("PLAN_PHASE_MAX_RETRIES", "1"))
-            last_error = ""
-
-            for attempt in range(max_retries + 1):
-                success, content, tool_calls_log, total_steps, total_tokens, charts_b64, result = \
-                    self._execute_phase(agent, enriched, self.max_steps, context, meta, store, session_id)
-
-                if success:
-                    break
-
-                last_error = content
-                logger.warning("[Phase] 阶段执行失败 (attempt=%d/%d): %s", attempt + 1, max_retries + 1, last_error)
-
-                if attempt < max_retries:
-                    enriched = (
-                        f"[上一阶段执行失败]\n"
-                        f"错误: {last_error[:500]}\n\n"
-                        f"请根据错误决定: 返回已有结果 / 向用户提问 / 换一种分析方式\n\n"
-                        f"{enriched}"
-                    )
+            # 无链路：Agent 自由执行（一次调用，内部自循环）
+            success, content, tool_calls_log, total_steps, total_tokens, charts_b64, result = \
+                self._execute_phase(agent, enriched, self.max_steps, context, meta, store, session_id)
 
         # ── 阶段 3: 结果处理 ──────────────────────────────────
         agent_result = self._post_process(
@@ -1593,7 +1625,7 @@ class _AgentExecutor:
         return agent_result
 
     @staticmethod
-    def _post_evaluate(agent_result, tool_chain, verb, noun, domain="", session_id=None):
+    def _post_evaluate(agent_result, tool_chain, verb, noun, domain="", session_id=None, chain_def=None):
         """后置评估 + 工具链学习闭环（纯规则，不消耗 agent 步数）。"""
         # 存储本轮 verb/noun 到 session，供下一轮负面反馈检测使用
         if session_id and (verb or noun):
@@ -1609,7 +1641,7 @@ class _AgentExecutor:
         try:
             from app.agent.evaluator import evaluate, learn_from_execution
             eval_result = evaluate(agent_result, tool_chain, verb, noun, domain=domain)
-            learn_from_execution(eval_result, verb, noun)
+            learn_from_execution(eval_result, verb, noun, chain_def=chain_def)
         except Exception as e:
             logger.warning("[PostEval] 评估异常，不影响返回: %s", e)
 
@@ -1710,22 +1742,49 @@ class _AgentExecutor:
 
         # Layer 0: tool_chains.json 匹配（学习闭环积累的已知链路）
         try:
-            from app.agent.chain.tool_chains import get_tool_chain
             from app.agent.chain.chains import ChainDef, ChainStep, register_chain
-            steps_data = get_tool_chain(verb, noun)
-            if steps_data:
-                steps = [ChainStep(name=s["tool"], agent=s["tool"], order=i+1,
-                                   description=s.get("desc", ""), required=(i == 0),
-                                   rules=s.get("rules", ""))
-                         for i, s in enumerate(steps_data)]
+
+            # 优先读完整 plan（新格式）
+            from app.agent.chain.tool_chains import get_chain_plan
+            cached_plan = get_chain_plan(verb, noun)
+            if cached_plan and cached_plan.get("phases"):
+                phases = cached_plan["phases"]
+                steps = []
+                for i, p in enumerate(phases, 1):
+                    agent = p.get("skill", "") or p.get("agent", "")
+                    steps.append(ChainStep(
+                        name=agent, agent=agent, order=i,
+                        description=p.get("description", ""),
+                        required=(i == 1),
+                        rules=p.get("rules", ""),
+                    ))
                 chain_id = f"learned+{verb}+{noun}"
                 chain_def = ChainDef(
                     chain_id=chain_id, name=f"学习链路: {verb}+{noun}",
-                    description=f"从 tool_chains.json 加载（{len(steps)} 步）",
+                    description=cached_plan.get("reasoning", ""),
                     steps=steps, trigger_verbs=[verb], trigger_nouns=[noun],
+                    context=cached_plan.get("context", {}),
+                    progressive=cached_plan.get("progressive", True),
                 )
                 register_chain(chain_def)
-                logger.info("[Chain] tool_chains.json 命中: %s → %d 步", chain_id, len(steps))
+                logger.info("[Chain] tool_chains.json plan 命中: %s → %d phases", chain_id, len(steps))
+            else:
+                # 降级：旧格式 steps（工具列表）
+                from app.agent.chain.tool_chains import get_tool_chain
+                steps_data = get_tool_chain(verb, noun)
+                if steps_data:
+                    steps = [ChainStep(name=s["tool"], agent=s["tool"], order=i+1,
+                                       description=s.get("desc", ""), required=(i == 0),
+                                       rules=s.get("rules", ""))
+                             for i, s in enumerate(steps_data)]
+                    chain_id = f"learned+{verb}+{noun}"
+                    chain_def = ChainDef(
+                        chain_id=chain_id, name=f"学习链路: {verb}+{noun}",
+                        description=f"从 tool_chains.json 加载（{len(steps)} 步）",
+                        steps=steps, trigger_verbs=[verb], trigger_nouns=[noun],
+                    )
+                    register_chain(chain_def)
+                    logger.info("[Chain] tool_chains.json 旧格式命中: %s → %d 步", chain_id, len(steps))
         except Exception as e:
             logger.warning("[Chain] tool_chains.json 查询异常: %s", e)
 
@@ -1769,12 +1828,14 @@ class _AgentExecutor:
             return None
 
         # 非个股链路不需要股票代码
+        # Planner 生成的链路信任 Planner 判断（Planner 输出含 stocks 字段）
         if not stock_code:
-            if chain_def.chain_id == "scan+market":
-                stock_code = ""
-            else:
-                logger.info("[Chain] 链路 %s 匹配但未找到股票代码，跳过", chain_def.chain_id)
+            # tool_chains.json 学习的链路：仅 scan+market 允许无股票代码
+            # Planner 生成的链路：信任 Planner 的 stocks 字段
+            if chain_def.chain_id.startswith("learned+") and chain_def.chain_id != "learned+scan+market":
+                logger.info("[Chain] 学习链路 %s 需要股票代码但未找到，跳过", chain_def.chain_id)
                 return None
+            # Planner 生成的链路或 scan+market → 继续执行
 
         logger.info("[Chain] 链路 %s 匹配（%d 步）", chain_def.chain_id, len(chain_def.steps))
         return chain_def
@@ -1834,6 +1895,14 @@ class _AgentExecutor:
 
         # ── 无链路：自由执行 ──
         t0 = time.time()
+        # ── 调试日志：agent.run() 前（Stream 自由执行）───────
+        print(
+            f"[DEBUG] Stream agent.run() 即将执行 | "
+            f"enriched_len={len(enriched) if enriched else 0} "
+            f"max_steps={self.max_steps} agent_type={type(agent).__name__} "
+            f"domain={meta.get('domain', '')} strategy={meta.get('strategy', '')}"
+        )
+        print(f"[DEBUG] Stream enriched 前500字: {(enriched or '')[:500]}")
         try:
             for step in agent.run(enriched, max_steps=self.max_steps, stream=True):
                 events = _step_to_events(step)
@@ -1928,6 +1997,7 @@ class _AgentExecutor:
                         meta.get("intent_noun", ""),
                         domain=meta.get("domain", ""),
                         session_id=session_id,
+                        chain_def=meta.get("chain_def"),
                     )
 
                     # ── 保存根节点到 qd_traces（非 traced 策略的兜底写入）──

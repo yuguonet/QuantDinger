@@ -79,17 +79,23 @@ def _empty_stats() -> Dict[str, Any]:
 
 
 def get_tool_chain(verb: str, noun: str) -> List[Dict[str, str]]:
-    """获取指定动作+对象的工具链步骤列表。
-
-    Returns:
-        [{"tool": "tool_name", "desc": "描述", "args": {...}}, ...]
-        未配置时返回空列表。
-    """
+    """获取指定动作+对象的工具链步骤列表（旧格式兼容）。"""
     data = _load()
     entry = data.get(f"{verb}+{noun}")
     if not entry:
         return []
     return _normalize_entry(entry).get("steps", [])
+
+
+def get_chain_plan(verb: str, noun: str) -> Optional[Dict[str, Any]]:
+    """获取完整 plan 结构（新格式）。返回 None 表示无缓存。"""
+    data = _load()
+    entry = data.get(f"{verb}+{noun}")
+    if not entry:
+        return None
+    if isinstance(entry, dict) and "plan" in entry:
+        return entry["plan"]
+    return None  # 旧格式，无 plan
 
 
 def get_chain_stats(verb: str, noun: str) -> Dict[str, Any]:
@@ -102,7 +108,7 @@ def get_chain_stats(verb: str, noun: str) -> Dict[str, Any]:
 
 
 def save_tool_chain(verb: str, noun: str, chain: List[Dict[str, str]]):
-    """保存工具链（agent 自主学习后调用）。"""
+    """保存工具链（旧格式兼容）。"""
     if not verb or not noun:
         logger.warning("[ToolChains] 拒绝保存残缺键: verb=%s noun=%s", verb, noun)
         return
@@ -113,6 +119,25 @@ def save_tool_chain(verb: str, noun: str, chain: List[Dict[str, str]]):
     data[key] = existing
     _save(data)
     logger.info("[ToolChains] 保存工具链: %s → %s", key, [s["tool"] for s in chain])
+
+
+def save_chain_plan(verb: str, noun: str, plan: Dict[str, Any]):
+    """保存完整 plan 结构（新格式）。"""
+    if not verb or not noun:
+        logger.warning("[ToolChains] 拒绝保存残缺键: verb=%s noun=%s", verb, noun)
+        return
+    data = _load()
+    key = f"{verb}+{noun}"
+    existing = data.get(key, {})
+    if not isinstance(existing, dict):
+        existing = {}
+    if "stats" not in existing:
+        existing["stats"] = _empty_stats()
+    existing["plan"] = plan
+    data[key] = existing
+    _save(data)
+    phases = plan.get("phases", [])
+    logger.info("[ToolChains] 保存 plan: %s → %d phases", key, len(phases))
 
 
 def update_chain_stats(

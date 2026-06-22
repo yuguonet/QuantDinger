@@ -484,6 +484,7 @@ def learn_from_execution(
     eval_result: EvalResult,
     verb: str,
     noun: str,
+    chain_def=None,
 ):
     """根据评估结果执行闭环动作。
 
@@ -510,20 +511,19 @@ def learn_from_execution(
         logger.warning("[Learn] 统计更新失败: %s", e)
 
     if eval_result.verdict == "success":
-        _writeback_chain(eval_result, verb, noun)
+        _writeback_chain(eval_result, verb, noun, chain_def=chain_def)
     elif eval_result.verdict == "failure":
         _record_failure(eval_result, verb, noun)
     # grey → 不操作
 
 
-def _writeback_chain(eval_result: EvalResult, verb: str, noun: str):
-    """成功 → 写回工具链（带 5 道质量门）。
+def _writeback_chain(eval_result: EvalResult, verb: str, noun: str, chain_def=None):
+    """成功 → 写回 tool_chains.json（带 5 道质量门）。
 
-    策略：
-    - 如果 agent 完全遵循了 chain → 不需要更新（chain 已验证有效）
-    - 如果 agent 偏离了 chain 但仍然成功 → 质量门检查 → 通过后才写入
+    新格式：存储完整 plan 结构（phases + progressive + context），
+    下次 _try_chain 直接命中，跳过 Planner LLM #2。
     """
-    from app.agent.chain.tool_chains import get_tool_chain, save_tool_chain, get_chain_stats
+    from app.agent.chain.tool_chains import get_tool_chain, save_tool_chain, save_chain_plan, get_chain_stats
 
     if not eval_result.actual_tools:
         return
@@ -572,20 +572,43 @@ def _writeback_chain(eval_result: EvalResult, verb: str, noun: str):
             )
             return
 
-    # ── 质量门全部通过，写入新链 ──
-    seen = set()
-    new_chain = []
-    for t in eval_result.actual_tools:
-        if t not in seen:
-            seen.add(t)
-            new_chain.append({"tool": t, "desc": ""})
+    # ── 质量门全部通过，写入 ──
 
-    if new_chain:
-        save_tool_chain(verb, noun, new_chain)
+    # 优先存储完整 plan（从 chain_def 重建）
+    if chain_def and chain_def.steps:
+        plan = {
+            "phases": [
+                {
+                    "skill": step.agent,
+                    "description": step.description or "",
+                    "tools": [],
+                    "rules": step.rules or "",
+                }
+                for step in sorted(chain_def.steps, key=lambda s: s.order)
+            ],
+            "progressive": getattr(chain_def, "progressive", True),
+            "context": getattr(chain_def, "context", {}) or {},
+            "reasoning": chain_def.description or "",
+        }
+        save_chain_plan(verb, noun, plan)
         logger.info(
-            "[Learn] %s+%s: 学习新链 → %s",
-            verb, noun, [s["tool"] for s in new_chain],
+            "[Learn] %s+%s: 保存完整 plan → %d phases",
+            verb, noun, len(plan["phases"]),
         )
+    else:
+        # 降级：无 chain_def 时存旧格式工具列表
+        seen = set()
+        new_chain = []
+        for t in eval_result.actual_tools:
+            if t not in seen:
+                seen.add(t)
+                new_chain.append({"tool": t, "desc": ""})
+        if new_chain:
+            save_tool_chain(verb, noun, new_chain)
+            logger.info(
+                "[Learn] %s+%s: 学习新链（旧格式） → %s",
+                verb, noun, [s["tool"] for s in new_chain],
+            )
 
 
 def _record_failure(eval_result: EvalResult, verb: str, noun: str):

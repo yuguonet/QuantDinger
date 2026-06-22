@@ -124,12 +124,16 @@ def _run_single(message: str, session_id: str = None, skills: list = None):
     print(f"💬 Message: {message}")
     print("-" * 50)
 
-    result = executor.chat(
-        message=message,
-        session_id=session_id,
-        context={},
-        user_id=1,
-    )
+    try:
+        result = executor.chat(
+            message=message,
+            session_id=session_id,
+            context={},
+            user_id=1,
+        )
+    except KeyboardInterrupt:
+        print("\n⏹ 已中断")
+        return None
 
     print(f"\n{'✅ 成功' if result.success else '❌ 失败'}")
     if result.content:
@@ -189,12 +193,19 @@ def _run_interactive(session_id: str = None):
             _print_agent_info()
             continue
 
-        result = executor.chat(
-            message=message,
-            session_id=session_id,
-            context={},
-            user_id=1,
-        )
+        try:
+            result = executor.chat(
+                message=message,
+                session_id=session_id,
+                context={},
+                user_id=1,
+            )
+        except KeyboardInterrupt:
+            print("\n⏹ 已中断，等待下一条消息...\n")
+            continue
+        except Exception as e:
+            print(f"\n❌ 执行出错: {e}\n")
+            continue
 
         if result.content:
             print(f"\nAgent> {result.content}\n")
@@ -252,24 +263,27 @@ def _run_single_stream(message: str, session_id: str = None, skills: list = None
     print(f"💬 Message: {message}")
     print("-" * 50)
 
-    for ev in executor.chat_stream(
-        message=message,
-        session_id=session_id,
-        context={},
-        user_id=1,
-    ):
-        etype = ev.get("type", "")
-        if etype == "token":
-            print(ev.get("content", ""), end="", flush=True)
-        elif etype == "step":
-            step = ev.get("step", {})
-            print(f"\n  [Step {step.get('step_number', '?')}] {step.get('tool_calls', [{}])[0].get('tool_name', '') if step.get('tool_calls') else 'thinking'}")
-        elif etype == "tool_call":
-            print(f"\n  🔧 {ev.get('tool_name', '?')}({ev.get('arguments', '')})")
-        elif etype == "done":
-            print(f"\n\n✅ 完成 | steps={ev.get('total_steps', 0)} tokens={ev.get('total_tokens', 0)}")
-        elif etype == "error":
-            print(f"\n\n❌ 错误: {ev.get('message', '')}")
+    try:
+        for ev in executor.chat_stream(
+            message=message,
+            session_id=session_id,
+            context={},
+            user_id=1,
+        ):
+            etype = ev.get("type", "")
+            if etype == "token":
+                print(ev.get("content", ""), end="", flush=True)
+            elif etype == "step":
+                step = ev.get("step", {})
+                print(f"\n  [Step {step.get('step_number', '?')}] {step.get('tool_calls', [{}])[0].get('tool_name', '') if step.get('tool_calls') else 'thinking'}")
+            elif etype == "tool_call":
+                print(f"\n  🔧 {ev.get('tool_name', '?')}({ev.get('arguments', '')})")
+            elif etype == "done":
+                print(f"\n\n✅ 完成 | steps={ev.get('total_steps', 0)} tokens={ev.get('total_tokens', 0)}")
+            elif etype == "error":
+                print(f"\n\n❌ 错误: {ev.get('message', '')}")
+    except KeyboardInterrupt:
+        print("\n⏹ 已中断")
 
     print()
 
