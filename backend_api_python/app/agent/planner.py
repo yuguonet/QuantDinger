@@ -254,10 +254,10 @@ class Planner:
             planner_section = (
                 "## 规则\n"
                 "- 从上述技能中选择 1~5 个，按执行顺序排列\n"
-                "- 大多数场景必须包含 technical_agent（技术面地基）\n"
                 "- 不要选择与问题无关的技能\n"
                 "- 如果涉及股票但未提供代码，在 stocks 中列出需要的代码\n"
                 "- ⚠️ 如果用户明确指定了步骤（如'第一步'、'第二步'、'首先'、'然后'），必须严格按用户指定的步骤拆分为多个 phase\n"
+                "- 不要过度拆分：相关操作（如多个数据获取、多个指标计算）合并到一个 phase，简单股票分析通常 2~3 个 phase 足够\n"
             )
 
         # 6. 对话上下文
@@ -615,7 +615,11 @@ class Planner:
             return False
 
     def _chain_from_dict(self, data: Dict) -> Optional[ChainDef]:
-        """从缓存条目构建 ChainDef。"""
+        """从缓存条目构建 ChainDef。
+
+        保留缓存中的 rules、description、context，确保快速通道执行时
+        agent 上下文完整（规则文本而非工具名）。
+        """
         phases = data.get("phases", data.get("steps", []))
         steps = []
         for i, s in enumerate(phases, 1):
@@ -623,13 +627,16 @@ class Planner:
             if agent:
                 steps.append(ChainStep(
                     name=agent, agent=agent, order=i,
+                    description=s.get("description", ""),
                     required=(i == 1),
+                    rules=s.get("rules", ""),
                 ))
         if not steps:
             return None
 
         chain_id = f"cached+{data.get('query_hash', '')[:8]}"
         progressive = data.get("progressive", True)
+        planner_context = data.get("context", {})
         chain_def = ChainDef(
             chain_id=chain_id,
             name="缓存规划链路",
@@ -637,6 +644,7 @@ class Planner:
             steps=steps,
             trigger_verbs=[],
             trigger_nouns=[],
+            context=planner_context,
             progressive=progressive,
         )
         register_chain(chain_def)  # 动态链路注册到全局表

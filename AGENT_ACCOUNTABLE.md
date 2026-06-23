@@ -113,11 +113,14 @@
 │  │     smolagents 每次 run() 独立 memory           │
 │  │  10. 错误检测:                                 │
 │  │      ├─ 成功 → 保存结果，进入下一个 phase       │
-│  │      ├─ 连续工具失败 ≥ 阈值 → 快速退出         │
-│  │      ├─ 重复工具调用 ≥ 3 次 → 快速退出         │
-│  │      └─ 连续空结果 ≥ 3 次 → 快速退出           │
+│  │      ├─ 工具错误 → 退回 LLM #2 重规划          │
+│  │      │   ├─ 连续工具失败 ≥ 阈值                │
+│  │      │   ├─ 重复工具调用 ≥ 3 次                │
+│  │      │   └─ 连续空结果 ≥ 3 次                  │
+│  │      └─ 代码错误 → 直接退出，打印日志           │
 │  └────────────────────────────────────────────────┘
 │  全部 phase 完成 → 进入阶段 3
+│  未完成全部 phase → 拦截 chain 写入
 │  无 chain_def 时走 agent 自由执行 + 重试                  │
 └──────────────────────────────────────────────────────
     │
@@ -143,7 +146,7 @@
 | per-phase agent 重建 | 每个 phase 重建 agent，只加载当前 phase 需要的工具，上下文最小化 |
 | 支持 skill 和 tool 两种模式 | skill → 读取 SKILL.md 执行；tool → 直接调用工具 |
 | 多步骤处理 | 用户明确指定步骤（如"第一步"、"第二步"）时，严格按用户指定的步骤拆分 |
-| 错误快速退出 | 连续工具失败 / 重复工具调用 / 连续空结果 ≥ 阈值时快速退出 |
+| 错误快速退出 | 工具错误（连续工具失败 / 重复工具调用 / 连续空结果 ≥ 阈值）→ 退回 LLM #2 重规划；代码错误 → 直接退出并打印日志 |
 | progressive 控制 | phase 间递进关系时注入前序结论，独立关系时不注入 |
 | 负面反馈前置 | 在 Planner 之前生效，影响规划决策 |
 | 根节点兜底写入 | 非 traced 策略在阶段 3 后写根节点到 qd_traces，保证回溯验证有数据 |
@@ -153,8 +156,7 @@
 
 ```bash
 # .env 配置
-PLAN_MAX_PHASES=5              # 单次规划最大阶段数
-PLAN_PHASE_MAX_RETRIES=1       # 单阶段最大重试次数
+PLAN_MAX_PHASES=5              # 单次规划最大阶段数（对应 planner.py MAX_STEPS）
 PLAN_PHASE_FAST_EXIT_STEPS=3   # 工具失效快速退出步数阈值
 ```
 
@@ -272,7 +274,7 @@ PLAN_PHASE_FAST_EXIT_STEPS=3   # 工具失效快速退出步数阈值
 **更新逻辑**:
 - Skill 权重: 按单位时间收益率聚合（多次 T+N 验证渐进调权）
 - 因子权重: 按单位时间收益率聚合（带时间衰减，不同因子半衰期不同）
-- 链路学习: 验证正确的链路才写入 tool_chains.json（5 道质量门）
+- 链路学习: 验证正确的链路才写入 tool_chains.json（4 道质量门 + phase 完整性守卫）
 
 **追踪能力**:
 - Skill 维度: `qd_skill_weights.return_per_day` 下降 → 该 Skill 在退化
@@ -419,12 +421,12 @@ app 启动 → start_eval_worker() → 等到盘后 15:30
 ### 7.4 编排路径学习闭环（省去 LLM #2 重复工作量）
 ```
 agent 结束 → _post_evaluate() → learn_from_execution()
-  → verdict=="success" → _writeback_chain() → 5 道质量门 → save_tool_chain()
+  → verdict=="success" + all_phases_completed → _writeback_chain() → 4 道质量门 → save_tool_chain()
   → 下次 _try_chain() → get_tool_chain() 命中 → 直接返回 ChainDef
 ```
 **作用**：首次走一遍后，后续直接使用编排路径，省去 LLM #2（Planner 大脑）的重复思考。
 **本质**：Chain 编排层是从用户消息到执行入口的便捷路线，是缓存好的思维捷径。
-**质量门**：5 道拦截（步数>5、链长>5、评分<60、工具成功率<50%、旧链已验证），防止学习低质量链路。
+**质量门**：4 道拦截（phase步数>5、评分<60、工具成功率<50%、旧链已验证），防止学习低质量链路。
 **前提条件**：verb/noun 非空（`learn_from_execution` 在 verb/noun 为空时跳过）。
 **去掉后果**：每次都从零规划，重复消耗 LLM #2 token。
 
@@ -464,8 +466,7 @@ AGENT_COMPRESS_MODEL=            # 上下文压缩模型
 AGENT_EMBED_MODEL=               # Embedding 模型
 
 # §17.2 Planner 多阶段执行配置
-PLAN_MAX_PHASES=3                # 单次规划最大阶段数
-PLAN_PHASE_MAX_RETRIES=1         # 单阶段最大重试次数
+PLAN_MAX_PHASES=5                # 单次规划最大阶段数
 PLAN_PHASE_FAST_EXIT_STEPS=3     # 工具失效快速退出步数阈值
 
 # 意图分析

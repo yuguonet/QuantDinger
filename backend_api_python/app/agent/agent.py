@@ -58,16 +58,6 @@ from app.agent.trace_collector import TraceCollector
 
 logger = logging.getLogger(__name__)
 
-# ── Legacy excluded tool names ────────────────────────────────
-_EXCLUDED_TOOL_NAMES = {
-    "screen_stocks", "smart_screen",
-    "get_stock_fund_flow", "batch_get_stock_fund_flow",
-    "get_dragon_tiger_stocks", "get_dragon_tiger_by_stock",
-    "get_hot_rank_stocks", "get_zt_pool_stocks",
-    "get_limit_down_stocks", "get_broken_board_stocks",
-}
-
-
 # ── Per-user agent cache (tools + managed agents only) ────────
 _tools_cache_by_domain: Dict[str, List] = {}       # key: domain → tools list
 _tools_cache_lock = __import__("threading").Lock()
@@ -592,7 +582,6 @@ def get_smolagent(
         if domain_key not in _tools_cache_by_domain:
             # 本地 registry 自动发现 + smolagents 桥接
             tools = build_smolagent_tools({
-                "deny": list(_EXCLUDED_TOOL_NAMES),
                 "domain": domain,
             })
             _tools_cache_by_domain[domain_key] = tools
@@ -1154,7 +1143,11 @@ class _AgentExecutor:
         # ── 解析 agent 输出 ──
         if hasattr(result, "output"):
             _raw_output = result.output
-            content = _raw_output if isinstance(_raw_output, dict) else (str(_raw_output) if _raw_output else "")
+            # 统一转为字符串，避免 dict 内容在后续 [:300] 切片时崩溃
+            if isinstance(_raw_output, dict):
+                content = json.dumps(_raw_output, ensure_ascii=False)
+            else:
+                content = str(_raw_output) if _raw_output else ""
             total_steps = len(result.steps) if result.steps else 0
             tu = result.token_usage
             total_tokens = (tu.input_tokens + tu.output_tokens) if tu else 0
@@ -1239,6 +1232,7 @@ class _AgentExecutor:
         total_steps = 0
         total_tokens = 0
         last_result = None
+        all_phases_completed = False  # 跟踪是否全部 phase 正常完成
         sorted_steps = sorted(chain_def.steps, key=lambda s: s.order)
         is_last = lambda s: s.order == sorted_steps[-1].order
 
@@ -1348,14 +1342,38 @@ class _AgentExecutor:
             last_result = step_result
 
             if not step_success:
-                logger.warning("[Plan] Phase %d 失败，提前终止", step.order)
-                break
+                # 工具错误 → 退回 LLM #2 重规划
+                logger.warning("[Plan] Phase %d 工具失败 → 尝试 LLM #2 重规划", step.order)
+                replan = self._replan_on_tool_error(
+                    message, stock_code, stock_name, verb, noun,
+                    all_content, step.order, step_content, context, meta,
+                )
+                if replan and replan.get("phases"):
+                    # 用新 plan 替换剩余 phase
+                    new_steps = []
+                    for j, rp in enumerate(replan["phases"]):
+                        _agent = rp.get("skill", "") or rp.get("agent", "")
+                        new_steps.append(ChainStep(
+                            name=_agent, agent=_agent, order=step.order + j + 1,
+                            description=rp.get("description", ""),
+                            rules=rp.get("rules", ""),
+                        ))
+                    idx = sorted_steps.index(step)
+                    sorted_steps = sorted_steps[:idx + 1] + new_steps
+                    is_last = lambda s: s.order == sorted_steps[-1].order
+                    logger.info("[Plan] 重规划成功，替换剩余 %d 个 phase", len(new_steps))
+                else:
+                    logger.warning("[Plan] 重规划失败，终止执行")
+                    break
+        else:
+            # for 循环正常结束（没有 break）→ 全部 phase 完成
+            all_phases_completed = True
 
         # 合并结果
         content = "\n\n".join(c for c in all_content if c)
         success = bool(content)
 
-        return success, content, all_tool_calls, total_steps, total_tokens, all_charts, last_result
+        return success, content, all_tool_calls, total_steps, total_tokens, all_charts, last_result, all_phases_completed
 
     def _execute_plan_stream(self, agent, chain_def, message, context, meta, store, session_id,
                              _stream_tool_calls, _stream_tool_call_counter, _pending_tool_ids):
@@ -1383,6 +1401,7 @@ class _AgentExecutor:
         progressive = getattr(chain_def, 'progressive', True)
 
         all_content = []
+        all_phases_completed = False  # 跟踪是否全部 phase 正常完成
         sorted_steps = sorted(chain_def.steps, key=lambda s: s.order)
         is_last = lambda s: s.order == sorted_steps[-1].order
 
@@ -1500,12 +1519,42 @@ class _AgentExecutor:
                                     break
                 if isinstance(s, FinalAnswerStep):
                     raw = s.output
-                    content = str(raw) if not isinstance(raw, dict) else (raw.get("content", "") or str(raw))
+                    # 统一转为字符串，避免 dict 内容在后续切片时崩溃
+                    if isinstance(raw, dict):
+                        content = json.dumps(raw, ensure_ascii=False)
+                    else:
+                        content = str(raw) if raw else ""
 
             all_content.append(content or "")
             if not content:
-                logger.warning("[Plan-Stream] Phase %d 无输出，提前终止", step.order)
-                break
+                # 工具错误 → 退回 LLM #2 重规划
+                logger.warning("[Plan-Stream] Phase %d 无输出 → 尝试 LLM #2 重规划", step.order)
+                yield {"type": "tool_info", "tool": "", "message": f"⚠️ 第 {step.order} 步失败，尝试重新规划..."}
+                replan = self._replan_on_tool_error(
+                    message, stock_code, stock_name, verb, noun,
+                    all_content, step.order, content or "", context, meta,
+                )
+                if replan and replan.get("phases"):
+                    new_steps = []
+                    for j, rp in enumerate(replan["phases"]):
+                        _agent = rp.get("skill", "") or rp.get("agent", "")
+                        new_steps.append(ChainStep(
+                            name=_agent, agent=_agent, order=step.order + j + 1,
+                            description=rp.get("description", ""),
+                            rules=rp.get("rules", ""),
+                        ))
+                    idx = sorted_steps.index(step)
+                    sorted_steps = sorted_steps[:idx + 1] + new_steps
+                    is_last = lambda s: s.order == sorted_steps[-1].order
+                    logger.info("[Plan-Stream] 重规划成功，替换剩余 %d 个 phase", len(new_steps))
+                    yield {"type": "tool_info", "tool": "", "message": f"✅ 重规划成功，新增 {len(new_steps)} 个步骤"}
+                else:
+                    logger.warning("[Plan-Stream] 重规划失败，终止执行")
+                    yield {"type": "tool_info", "tool": "", "message": f"❌ 重规划失败，终止执行"}
+                    break
+        else:
+            # for 循环正常结束（没有 break）→ 全部 phase 完成
+            all_phases_completed = True
 
         # 合并结果
         content = "\n\n".join(c for c in all_content if c)
@@ -1521,6 +1570,7 @@ class _AgentExecutor:
             meta.get("intent_verb", ""), meta.get("intent_noun", ""),
             domain=meta.get("domain", ""), session_id=session_id,
             chain_def=meta.get("chain_def"),
+            all_phases_completed=all_phases_completed,
         )
 
         # ── 保存根节点 ──
@@ -1561,8 +1611,12 @@ class _AgentExecutor:
 
     def _post_process(self, store, session_id, content, success, tool_calls_log,
                       total_steps, total_tokens, charts_b64, result, agent,
-                      context, meta, message):
-        """§17.2 阶段 3: 结果处理 + DecisionCard + 后置评估 + 学习闭环。"""
+                      context, meta, message, all_phases_completed=None):
+        """§17.2 阶段 3: 结果处理 + DecisionCard + 后置评估 + 学习闭环。
+
+        Args:
+            all_phases_completed: None=不适用（自由执行），True=全部phase完成，False=phase被中断
+        """
         _eval_domain = meta.get("domain", "")
         _eval_strategy = meta.get("strategy", "direct")
         _tool_chain = meta.get("tool_chain", [])
@@ -1623,7 +1677,7 @@ class _AgentExecutor:
             success=success, content=content, tool_calls_log=tool_calls_log,
             total_steps=total_steps, total_tokens=total_tokens,
         )
-        self._post_evaluate(agent_result_for_eval, _tool_chain, _intent_verb, _intent_noun, domain=_eval_domain, session_id=session_id, chain_def=meta.get("chain_def"))
+        self._post_evaluate(agent_result_for_eval, _tool_chain, _intent_verb, _intent_noun, domain=_eval_domain, session_id=session_id, chain_def=meta.get("chain_def"), all_phases_completed=all_phases_completed)
 
         # ── 异步压缩上下文 ──
         if success and content:
@@ -1705,7 +1759,7 @@ class _AgentExecutor:
 
         if chain_def:
             # per-phase 执行：每个 phase 单独一次 agent.run()，只看到这 1 步
-            success, content, tool_calls_log, total_steps, total_tokens, charts_b64, result = \
+            success, content, tool_calls_log, total_steps, total_tokens, charts_b64, result, all_phases_completed = \
                 self._execute_plan(agent, chain_def, message, context, meta, store, session_id)
         else:
             # 无链路：Agent 自由执行（一次调用，内部自循环）
@@ -1713,10 +1767,12 @@ class _AgentExecutor:
                 self._execute_phase(agent, enriched, self.max_steps, context, meta, store, session_id)
 
         # ── 阶段 3: 结果处理 ──────────────────────────────────
+        # 无链路时 all_phases_completed 不适用（自由执行，无 phase 概念）
+        _all_phases_completed = all_phases_completed if chain_def else None
         agent_result = self._post_process(
             store, session_id, content, success, tool_calls_log,
             total_steps, total_tokens, charts_b64, result, agent,
-            context, meta, message,
+            context, meta, message, all_phases_completed=_all_phases_completed,
         )
 
         # ── 保存根节点到 qd_traces（非 traced 策略的兜底写入）──
@@ -1756,8 +1812,12 @@ class _AgentExecutor:
         return agent_result
 
     @staticmethod
-    def _post_evaluate(agent_result, tool_chain, verb, noun, domain="", session_id=None, chain_def=None):
-        """后置评估 + 工具链学习闭环（纯规则，不消耗 agent 步数）。"""
+    def _post_evaluate(agent_result, tool_chain, verb, noun, domain="", session_id=None, chain_def=None, all_phases_completed=None):
+        """后置评估 + 工具链学习闭环（纯规则，不消耗 agent 步数）。
+
+        Args:
+            all_phases_completed: None=不适用，True=全部phase完成，False=phase被中断
+        """
         # 存储本轮 verb/noun 到 session，供下一轮负面反馈检测使用
         if session_id and (verb or noun):
             try:
@@ -1772,7 +1832,7 @@ class _AgentExecutor:
         try:
             from app.agent.evaluator import evaluate, learn_from_execution
             eval_result = evaluate(agent_result, tool_chain, verb, noun, domain=domain)
-            learn_from_execution(eval_result, verb, noun, chain_def=chain_def)
+            learn_from_execution(eval_result, verb, noun, chain_def=chain_def, all_phases_completed=all_phases_completed)
         except Exception as e:
             logger.warning("[PostEval] 评估异常，不影响返回: %s", e)
 
@@ -1831,6 +1891,88 @@ class _AgentExecutor:
                         severity, last_verb, last_noun, stock_code, message[:50])
         except Exception as e:
             logger.warning("[Feedback] 负面反馈处理异常: %s", e)
+
+    def _replan_on_tool_error(
+        self,
+        message: str,
+        stock_code: str,
+        stock_name: str,
+        verb: str,
+        noun: str,
+        completed_content: list,
+        failed_phase: int,
+        error_info: str,
+        context: dict,
+        meta: dict,
+    ) -> Optional[dict]:
+        """工具错误时退回 LLM #2 重新规划。
+
+        将已完成的结论和失败信息注入 Planner 上下文，让 LLM #2 重新规划剩余步骤。
+
+        Args:
+            message: 用户原始消息
+            stock_code: 股票代码
+            stock_name: 股票名称
+            verb: 意图动词
+            noun: 意图对象
+            completed_content: 已完成的 phase 结论列表
+            failed_phase: 失败的 phase 编号
+            error_info: 错误信息
+            context: 上下文
+            meta: 元数据
+
+        Returns:
+            新的 plan dict（含 phases），或 None 表示重规划失败
+        """
+        try:
+            from app.agent.planner import Planner
+            smol_model = build_model(self.model, self.provider)
+
+            def planner_llm(prompt: str) -> str:
+                messages = [{"role": "user", "content": prompt}]
+                response = smol_model(messages)
+                return response.content if hasattr(response, "content") else str(response)
+
+            planner = Planner(call_llm=planner_llm)
+
+            # 构建带失败上下文的 query
+            context_parts = [message]
+            if completed_content:
+                context_parts.append("\n## 已完成的分析结论")
+                for i, c in enumerate(completed_content, 1):
+                    if c:
+                        context_parts.append(f"第{i}步结论: {c[:500]}")
+            context_parts.append(f"\n## 第{failed_phase}步执行失败")
+            context_parts.append(f"错误信息: {error_info[:300]}")
+            context_parts.append("\n请基于已有结论重新规划剩余步骤，跳过已失败的工具/技能，选择替代方案。")
+
+            enriched_query = "\n".join(context_parts)
+
+            plan_result = planner.plan(
+                query=enriched_query,
+                stock_code=stock_code,
+                stock_name=stock_name,
+                verb=verb,
+                noun=noun,
+            )
+
+            if plan_result.success and plan_result.chain_def:
+                # 转为 dict 格式供调用方使用
+                return {
+                    "phases": [
+                        {
+                            "skill": step.agent,
+                            "description": step.description or "",
+                            "rules": step.rules or "",
+                        }
+                        for step in sorted(plan_result.chain_def.steps, key=lambda s: s.order)
+                    ],
+                    "progressive": getattr(plan_result.chain_def, "progressive", True),
+                }
+            return None
+        except Exception as e:
+            logger.warning("[Replan] 重规划异常: %s", e)
+            return None
 
     def _try_chain(self, verb, noun, message, session_id, context, user_id):
         """获取执行计划。无匹配时返回 None，让 agent 自由执行。
