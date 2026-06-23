@@ -8,7 +8,7 @@
   - collect_sector_daily(target_date)     → 采集板块日级统计
 
 数据源: sector_daily_stats 表（由 sector_daily.py 写入）
-触发方式: _post_market_tick 或 scripts/after_1d.py（K线更新后触发，不再独立定时）
+触发方式: scheduler._post_market_batch 中调用
 """
 
 import os
@@ -83,12 +83,12 @@ def _has_date_in_db(sector_type: str, date: str) -> bool:
 
 
 # ═══════════════════════════════════════════════════
-#  采集（由 _post_market_tick 或 after_1d.py 触发）
+#  采集（由 scheduler._post_market_batch 触发）
 # ═══════════════════════════════════════════════════
 
 
 def collect_sector_daily(target_date: str = None):
-    """采集板块日级统计。由 scheduler 的 post_market 或外部 after_1d.py 调用。"""
+    """采集板块日级统计。由 scheduler._post_market_batch 调用。"""
     from .sector_daily import sync_single_date
 
     if target_date is None:

@@ -44,7 +44,6 @@ cn_last_update 表结构:
 
 import os as _os
 import re as _re
-import subprocess
 import threading
 import time as _time
 from datetime import datetime, timedelta, timezone, time as dt_time
@@ -1073,30 +1072,6 @@ def _compute_is_update(task: str, last_bar_time: datetime) -> bool:
                else last_bar_time.strftime("%Y-%m-%d"))
     return db_date < target_td
 
-def _run_post_script(task: str):
-    import sys as _sys
-
-    script_dir = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))), "scripts")
-    script_map = {"15m": "after_15m.py", "1D": "after_1d.py"}
-    script_name = script_map.get(task)
-    if not script_name:
-        return
-    script_path = _os.path.join(script_dir, script_name)
-    if not _os.path.isfile(script_path):
-        logger.warning(f"[同步] {task} 批处理脚本不存在: {script_path}")
-        return
-    try:
-        subprocess.Popen(
-            [_sys.executable, script_path],
-            cwd=script_dir,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        logger.info(f"[同步] {task} 已启动批处理脚本: {script_path}")
-    except Exception as e:
-        logger.error(f"[同步] {task} 批处理脚本执行失败: {e}")
-
 
 def _prepare_datasources():
     """初始化远程数据源连接（核心启动时调用一次）。"""
@@ -1155,9 +1130,7 @@ def _run_task(task: str):
                 _schedule_next(task, _next_trigger_time(task))
                 final_status = None
 
-        # status=ok 时触发批处理脚本
-        if final_status == "ok":
-            _run_post_script(task)
+
 
     except Exception as e:
         logger.error(f"[同步] {task} 异常: {e}", exc_info=True)
@@ -1468,3 +1441,19 @@ def stop_scheduler():
         timer.cancel()
     _timers.clear()
     logger.info("[同步] 同步器已停止")
+
+
+# ═══════════════════════════════════════════════════════════
+#  对外接口 — 供 scheduler.py 调用
+# ═══════════════════════════════════════════════════════════
+
+def run_15m() -> str:
+    """执行 15m 回填，返回 "ok" / "error"。"""
+    _prepare_datasources()
+    return _core_startup("15m")
+
+
+def run_1d() -> str:
+    """执行 1D 回填，返回 "ok" / "error"。"""
+    _prepare_datasources()
+    return _core_startup("1D")

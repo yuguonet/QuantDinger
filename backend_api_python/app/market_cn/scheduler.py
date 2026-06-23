@@ -103,24 +103,41 @@ def _refresh_slow():
 def _refresh_post_market():
     from app.market_cn.dragon_limit import refresh_dragon_tiger
     from app.market_cn.index import refresh_northbound_daily, refresh_market_fund_flow_daily
-    from app.market_cn.sector_history import collect_sector_daily
     _run_all("post_market", [
         refresh_dragon_tiger, refresh_northbound_daily,
-        refresh_market_fund_flow_daily, collect_sector_daily,
+        refresh_market_fund_flow_daily,
     ])
     _refresh_emotion_safe()
 
 
+def _refresh_sector_daily():
+    """板块日级统计，依赖 1D 日线数据，必须在 backfill 1D 之后调用。"""
+    from app.market_cn.sector_history import collect_sector_daily
+    try:
+        collect_sector_daily()
+    except Exception as e:
+        logger.warning("[sector_daily] collect_sector_daily 失败: %s", e)
+
+
 def _refresh_daily():
-    from app.market_cn.index import (
-        refresh_index_daily_kline, refresh_northbound_holdings,
-    )
-    _run_all("daily", [refresh_index_daily_kline, refresh_northbound_holdings])
+    from app.market_cn.index_daily import sync_index_daily
+    from app.market_cn.index import refresh_northbound_holdings
+    _run_all("daily", [sync_index_daily, refresh_northbound_holdings])
 
 
 def _refresh_policy():
     from app.market_cn.china_market import refresh_policy
     refresh_policy()
+
+
+def _refresh_backfill_15m():
+    from app.data_sources.backfill_db import run_15m
+    run_15m()
+
+
+def _refresh_backfill_1d():
+    from app.data_sources.backfill_db import run_1d
+    run_1d()
 
 
 def _refresh_adj_factors():
@@ -136,12 +153,19 @@ def _morning_batch():
 
 
 def _post_market_batch():
-    """盘后日级串行: 日档数据 → 龙虎榜/北向日级/资金流/板块，重试至数据到位后退出。"""
+    """盘后日级串行: 15m → 日档 → 龙虎榜/北向/资金流 → 1D → 板块统计，重试至数据到位后退出。"""
     from app.utils.trading_calendar import last_finish_trading_day
     target = last_finish_trading_day()
 
+    # 15m 最先跑
+    _refresh_backfill_15m()
+
     _refresh_daily()
     _refresh_post_market()
+
+    # 1D 最后跑，完成后触发板块统计
+    _refresh_backfill_1d()
+    _refresh_sector_daily()
 
     # 检测数据是否到位
     dt_date = nb_date = ""
@@ -173,35 +197,7 @@ def _post_market_batch():
 # ═══════════════════════════════════════════════════════════
 
 
-def _post_market_once():
-    """盘后刷新单次，返回 True=数据到位可结束，False=还需重试。"""
-    _refresh_post_market()
 
-    from app.utils.trading_calendar import last_finish_trading_day
-    target = last_finish_trading_day()
-
-    dt_date = nb_date = ""
-    try:
-        from app.market_cn.dragon_limit import get_dragon_tiger
-        dt = get_dragon_tiger()
-        if dt and isinstance(dt, list) and len(dt) > 0:
-            dt_date = dt[0].get("date", "") if isinstance(dt[0], dict) else ""
-    except Exception:
-        pass
-    try:
-        from app.market_cn.index import get_northbound_daily
-        nb = get_northbound_daily(10)
-        if nb and isinstance(nb, list) and len(nb) > 0:
-            nb_date = nb[-1].get("date", "") if isinstance(nb[-1], dict) else ""
-    except Exception:
-        pass
-
-    if dt_date >= target and nb_date >= target:
-        logger.info("[post_market] 数据到位 (dt=%s, nb=%s, 目标=%s)", dt_date, nb_date, target)
-        return True
-
-    logger.info("[post_market] 数据未到 (dt=%s, nb=%s, 目标≥%s)，下次重试", dt_date, nb_date, target)
-    return False
 
 
 # ═══════════════════════════════════════════════════════════

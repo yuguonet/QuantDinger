@@ -380,14 +380,7 @@ def create_app(config_name='default'):
         except Exception as e:
             logger.warning(f"[StockBasic] 初始化跳过: {e}")
         
-        # ── A股K线增量同步调度 ──────────────────────────────────
-        try:
-            from app.data_sources.backfill_db import start_scheduler
-            start_scheduler()  # ← 启动统一调度器（15m + 1D）
-        except ImportError:
-            pass
-        except Exception as e:
-            logger.debug(f"[Backfill] A股K线增量调度器未启动: {e}")
+        # ── A股K线增量同步调度 ── 已迁移至 market_cn.scheduler._post_market_batch ──
 
         # ── AI 反思 & 校准 worker（必须在 stock_basic_db + backfill 之后）──
         # 这两个 worker 会从 qd_analysis_memory 捞历史记录，通过 Coordinator 拉行情验证。
