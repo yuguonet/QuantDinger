@@ -56,7 +56,6 @@ class IntentMeta:
     classifier_prompt: str = ""
     rules: List[Dict[str, Any]] = field(default_factory=list)
     quick_patterns: Dict[str, str] = field(default_factory=dict)
-    intent_tool_categories: Dict[str, List[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -226,7 +225,6 @@ def load_semantics():
             classifier_prompt=body or meta.get("classifier_prompt", ""),
             rules=meta.get("rules", []),
             quick_patterns=meta.get("quick_patterns", {}),
-            intent_tool_categories=meta.get("intent_tool_categories", {}),
         )
 
     # ── tools（从 agent/tools/ 目录扫描工具函数）──
@@ -243,8 +241,13 @@ def load_semantics():
                 layer="tool",
             )
 
+    # ── 全量缓存 XML 摘要 ──
+    global _skills_summary_xml_cache, _tools_summary_xml_cache
+    _skills_summary_xml_cache = _build_skills_summary_xml()
+    _tools_summary_xml_cache = _build_tools_summary_xml()
+
     logger.info(
-        "[Semantics] 加载完成: %d skills, %d tools",
+        "[Semantics] 加载完成: %d skills, %d tools, XML 缓存已生成",
         len(_skills), len(_tools),
     )
 
@@ -272,7 +275,6 @@ def get_intent_meta() -> IntentMeta:
                 "farewell": r'^(再见|拜拜|bye|88|886|晚安|回见)[\s\?\?\.\,\!\~\。\，\！\？\…]*$',
                 "thanks": r'^(谢谢|感谢|多谢|thanks|thank\s*you|thx|3q)[\s\?\?\.\,\!\~\。\，\！\？\…]*$',
             },
-            intent_tool_categories={},
         )
     return _intent
 
@@ -336,12 +338,13 @@ def get_planner_text() -> str:
 # Summary generators (for system prompt injection)
 # ═══════════════════════════════════════════════════════════════
 
-def get_skills_summary_xml() -> str:
-    """生成 skills 摘要 XML（轻量，只有 name+description+tags）。
+# ── 全量缓存（启动时生成，后续直接读取）──
+_skills_summary_xml_cache: str = ""
+_tools_summary_xml_cache: str = ""
 
-    用于第一段加载：system prompt 只放摘要，完整 instructions 按需加载。
-    """
-    load_semantics()
+
+def _build_skills_summary_xml() -> str:
+    """生成 skills 摘要 XML（内部，启动时调用一次）。"""
     lines = ["<skills>"]
     for name, meta in sorted(_skills.items(), key=lambda x: x[1].priority, reverse=True):
         tags_str = ",".join(meta.tags) if meta.tags else ""
@@ -352,14 +355,10 @@ def get_skills_summary_xml() -> str:
     return "\n".join(lines)
 
 
-def get_tools_summary_xml(tags_filter: Optional[List[str]] = None) -> str:
-    """生成 tools 摘要 XML，按 category 分组。可选按 tags 过滤。"""
-    load_semantics()
+def _build_tools_summary_xml() -> str:
+    """生成 tools 摘要 XML（内部，启动时调用一次）。"""
     by_cat: Dict[str, List[ToolMeta]] = {}
     for meta in _tools.values():
-        # §15: 用 tags 过滤（tags 优先，降级到无过滤）
-        if tags_filter and meta.tags and not any(t in meta.tags for t in tags_filter):
-            continue
         by_cat.setdefault(meta.category or "其他", []).append(meta)
 
     lines = ["<tools>"]
@@ -371,3 +370,15 @@ def get_tools_summary_xml(tags_filter: Optional[List[str]] = None) -> str:
         lines.append(f'  </category>')
     lines.append("</tools>")
     return "\n".join(lines)
+
+
+def get_skills_summary_xml() -> str:
+    """返回 skills 摘要 XML（全量缓存）。"""
+    load_semantics()
+    return _skills_summary_xml_cache
+
+
+def get_tools_summary_xml(tags_filter: Optional[List[str]] = None) -> str:
+    """返回 tools 摘要 XML（全量缓存，tags_filter 参数保留兼容但不再支持过滤）。"""
+    load_semantics()
+    return _tools_summary_xml_cache

@@ -39,7 +39,6 @@ class IntentResult:
     raw_response: str = ""
     source: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
-    tool_categories: List[str] = field(default_factory=list)
     verb: str = ""
     noun: str = ""
     # v4 新增：上下文压缩摘要
@@ -143,17 +142,16 @@ def _load_intent_config():
     meta = get_intent_meta()
     if meta is None:
         logger.warning("[Intent] get_intent_meta() 返回 None，使用空默认值")
-        return "", {}
-    return meta.classifier_prompt, meta.intent_tool_categories
+        return ""
+    return meta.classifier_prompt
 
 # 懒加载：首次调用 analyze_intent 时才加载
 _INTENT_PROMPT = ""
-_INTENT_TOOL_CATEGORIES = {}
 
 def _ensure_intent_loaded():
-    global _INTENT_PROMPT, _INTENT_TOOL_CATEGORIES
+    global _INTENT_PROMPT
     if not _INTENT_PROMPT:
-        _INTENT_PROMPT, _INTENT_TOOL_CATEGORIES = _load_intent_config()
+        _INTENT_PROMPT = _load_intent_config()
 
 
 def _call_llm_for_intent(
@@ -338,9 +336,6 @@ def analyze_intent(
             params["stock_name"] = name
             stock_name = name
 
-    # tool_categories
-    tool_cats = _INTENT_TOOL_CATEGORIES.get(intent, [])
-
     # tool_chain
     tool_chain = []
     if verb and noun:
@@ -354,7 +349,6 @@ def analyze_intent(
     metadata = {
         "domain": domain, "intent": intent,
         "verb": verb, "noun": noun,
-        "tool_categories": tool_cats,
         "tool_chain": tool_chain,
     }
 
@@ -393,7 +387,6 @@ def analyze_intent(
         confidence=confidence,
         source="llm",
         metadata=metadata,
-        tool_categories=tool_cats,
         verb=verb,
         noun=noun,
         context_summary=new_summary,
@@ -417,8 +410,6 @@ def format_intent_for_agent(intent: IntentResult, original_message: str) -> str:
         parts.append(f"[动作-对象] verb={intent.verb or '-'}, noun={intent.noun or '-'}")
     if intent.params:
         parts.append(f"[参数] {json.dumps(intent.params, ensure_ascii=False)}")
-    if intent.tool_categories:
-        parts.append(f"[工具分类] {', '.join(intent.tool_categories)}")
 
     tool_chain = intent.metadata.get("tool_chain", [])
     if tool_chain:

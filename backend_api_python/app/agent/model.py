@@ -6,7 +6,7 @@ Model Adapter — 桥接 QuantDinger LLM 配置到 smolagents OpenAIModel。
 
 被调用方：
   agent.py → build_model() → get_smolagent() 构建 Agent 实例
-  agent.py → _build_managed_agents() → 构建子 Agent 实例
+  planner.py → build_model() → Planner LLM 推理
 
 公开接口：
   build_model(model, provider, temperature, **kwargs) → OpenAIModel

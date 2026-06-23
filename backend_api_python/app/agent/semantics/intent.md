@@ -38,25 +38,6 @@ rules:
   - match: "闲聊/问候"
     result: { domain: chat }
 
-# 意图 → 工具类别映射
-intent_tool_categories:
-  stock_analysis: [名称查询, 行情数据, 技术分析, 情报搜索]
-  chart_view: [名称查询, 行情数据, K线图表]
-  market_scan: [行情数据, 龙虎榜/热榜]
-  screener: [名称查询, 选股, 指标策略]
-  backtest: [名称查询, 行情数据, 回测, 指标策略]
-  fund_flow: [名称查询, 行情数据]
-  indicator: [名称查询, 行情数据, 技术分析, 指标策略]
-  trading: [交易, 指标策略]
-  stock_info: [名称查询, 行情数据]
-  concept_explain: []
-  reminder: []
-  cron_manage: []
-  settings: []
-  unknown: []
-  code_modify: [工作区]
-  code_create: [工作区]
-  project_scan: []
 ---
 
 # 意图分类 Prompt

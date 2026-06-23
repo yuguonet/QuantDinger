@@ -4,7 +4,7 @@ version: 2.0.0
 description: 自包含选股技能,从A股全市场筛选短线标的。用户问"今天买什么股""有什么好股票""短线选什么"时使用。
 tags: [market, screener, short_term, a_share]
 tools:
-  - get_fund_flow_realtime
+  - get_fund_flow
   - get_indicator_snapshot
   - search_stocks
 ---
@@ -60,7 +60,7 @@ final = deep_analyze(result)
 ```
 
 调用的工具(Phase 2 内部自动调用,无需手动):
-- `get_fund_flow_realtime` - 实时资金流向
+- `get_fund_flow` - 实时资金流向
 - `get_indicator_snapshot` - 技术指标快照(MACD/KDJ/BOLL等)
 - `search_stocks` - 条件选股(尾盘/盘后策略使用)
 

@@ -15,7 +15,7 @@ Agent — smolagents Agent for QuantDinger.
   2. 快速通道 — 闲聊/greeting 直接回复，不走 agent
   3. 链路触发 — _try_chain() 匹配 verb+noun → 注入执行计划到 Agent 上下文
   4. Agent 执行 — smolagents CodeAgent.run()（流式/阻塞）
-  5. 后置评估 — _post_evaluate() → evaluator.learn_from_execution()
+  5. 后置学习 — _post_evaluate() → evaluator.learn_from_execution()
   6. 上下文压缩 — compress_context() 异步线程
 
 配置：
@@ -81,7 +81,7 @@ def _get_agent_class():
 # 1. Tool Catalog & Agent Instructions
 # ═══════════════════════════════════════════════════════════════
 
-def _generate_tool_catalog(tools, managed_agents) -> str:
+def _generate_tool_catalog(tools) -> str:
     """从工具对象自动生成目录，按模块分组。"""
     try:
         local_registry.discover()
@@ -132,7 +132,7 @@ def _load_preamble() -> str:
 
 
 def _build_instructions(user_message: str = "",
-                        language: str = "zh", tools=None, managed_agents=None,
+                        language: str = "zh", tools=None,
                         domain: str = "", domain_instructions: str = "",
                         intent_context: str = "", stock_code: str = "",
                         is_tool_mode: bool = False) -> str:
@@ -168,7 +168,7 @@ def _build_instructions(user_message: str = "",
     # 动态生成工具分类目录
     tool_catalog = ""
     if tools is not None:
-        tool_catalog = f"\n## 工具分类\n\n{_generate_tool_catalog(tools, managed_agents)}\n"
+        tool_catalog = f"\n## 工具分类\n\n{_generate_tool_catalog(tools)}\n"
 
     # Anthropic Agent Skills catalog - 已改为工具，不再注入 instructions
     # agent 需要时会调用 get_skill_catalog 工具获取 skill 列表
@@ -612,7 +612,7 @@ def get_smolagent(
         tools = [TracedTool(t, collector) for t in tools]
 
     instructions = _build_instructions(
-        user_message, language, tools, managed_agents=None,
+        user_message, language, tools,
         domain=domain, domain_instructions=domain_instructions,
         intent_context=intent_context, stock_code=stock_code,
         is_tool_mode=is_tool_mode,
@@ -780,7 +780,7 @@ class _AgentExecutor:
                 result.domain = domain
                 result.strategy = intent.strategy
                 result.domain_instructions = intent.domain_instructions
-                result.tool_categories = intent.tool_categories or None
+
                 result.intent_context = format_intent_for_agent(intent, message)
                 result.verb = getattr(intent, 'verb', '') or ""
                 result.noun = getattr(intent, 'noun', '') or ""
@@ -978,7 +978,7 @@ class _AgentExecutor:
             domain=_ipr.domain, domain_instructions=_ipr.domain_instructions,
             intent_context=_ipr.intent_context,
             stock_code=stock_code,
-            tool_categories=_ipr.tool_categories,
+            tool_categories=None,
             collector=_ipr.collector,
             strategy=_ipr.strategy,
         )
@@ -1560,7 +1560,7 @@ class _AgentExecutor:
         content = "\n\n".join(c for c in all_content if c)
         store.add_message(session_id, "assistant", content if isinstance(content, str) else str(content))
 
-        # ── 后置评估 + 学习闭环 ──
+        # ── 后置学习闭环 ──
         _eval_result = AgentResult(
             success=bool(content), content=content,
             tool_calls_log=_stream_tool_calls, total_steps=agent.step_number,
@@ -1612,7 +1612,7 @@ class _AgentExecutor:
     def _post_process(self, store, session_id, content, success, tool_calls_log,
                       total_steps, total_tokens, charts_b64, result, agent,
                       context, meta, message, all_phases_completed=None):
-        """§17.2 阶段 3: 结果处理 + DecisionCard + 后置评估 + 学习闭环。
+        """§17.2 阶段 3: 结果处理 + DecisionCard + 后置学习闭环。
 
         Args:
             all_phases_completed: None=不适用（自由执行），True=全部phase完成，False=phase被中断
@@ -1672,7 +1672,7 @@ class _AgentExecutor:
             except Exception as e:
                 logger.warning("[Agent] DecisionCard/存库失败，保留原始输出: %s", e)
 
-        # ── 后置评估 + 工具链学习闭环 ──
+        # ── 后置学习闭环 ──
         agent_result_for_eval = AgentResult(
             success=success, content=content, tool_calls_log=tool_calls_log,
             total_steps=total_steps, total_tokens=total_tokens,
@@ -1733,7 +1733,7 @@ class _AgentExecutor:
           阶段 2: _execute_plan() 或 _execute_phase()
                  — 有链路 → per-phase 循环，每步 agent.run() 只有 1 步内容
                  — 无链路 → agent 自由执行
-          阶段 3: _post_process() — 结果处理 + DecisionCard + 后置评估 + 学习闭环
+          阶段 3: _post_process() — 结果处理 + DecisionCard + 后置学习闭环
         """
         # ── 阶段 1: 准备意图 ──────────────────────────────────
         store, agent, enriched, meta = self._prepare(message, session_id, context, user_id)
@@ -1813,7 +1813,7 @@ class _AgentExecutor:
 
     @staticmethod
     def _post_evaluate(agent_result, tool_chain, verb, noun, domain="", session_id=None, chain_def=None, all_phases_completed=None):
-        """后置评估 + 工具链学习闭环（纯规则，不消耗 agent 步数）。
+        """后置学习闭环（纯规则，不消耗 agent 步数）。
 
         Args:
             all_phases_completed: None=不适用，True=全部phase完成，False=phase被中断
@@ -1828,13 +1828,12 @@ class _AgentExecutor:
             except Exception:
                 pass
         if not verb and not noun:
-            return  # 无意图信息，跳过评估
+            return
         try:
-            from app.agent.evaluator import evaluate, learn_from_execution
-            eval_result = evaluate(agent_result, tool_chain, verb, noun, domain=domain)
-            learn_from_execution(eval_result, verb, noun, chain_def=chain_def, all_phases_completed=all_phases_completed)
+            from app.agent.evaluator import learn_from_execution
+            learn_from_execution(agent_result, verb, noun, chain_def=chain_def, all_phases_completed=all_phases_completed)
         except Exception as e:
-            logger.warning("[PostEval] 评估异常，不影响返回: %s", e)
+            logger.warning("[PostEval] 学习闭环异常，不影响返回: %s", e)
 
     @staticmethod
     def _check_negative_feedback(message: str, session_id: str) -> None:
@@ -2257,7 +2256,7 @@ class _AgentExecutor:
                         elif isinstance(content, dict):
                             content["_warning"] = "输出内容未做标准化处理"
 
-                    # ── 后置评估 + 工具链学习闭环 ─────────────
+                    # ── 后置学习闭环 ─────────────
                     _eval_result = AgentResult(
                         success=bool(content), content=content,
                         tool_calls_log=_stream_tool_calls,
