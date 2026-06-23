@@ -5,11 +5,11 @@ Planner — LLM 规划器。
 职责：当无固定链路匹配时，用轻量 LLM 调用规划 Skill 执行方案。
 
 流程：
-  1. 用户 query → 查询缓存（相似 query 复用旧规划）
+  1. 缓存查询已移至 _try_chain() Layer 0（tool_chains.py get_chain_plan）
   2. 缓存未命中 → LLM 规划（只选 Skill，不执行）
   3. 校验规划（步数、必选 Skill、去重）
-  4. 存入 tool_chains.json
-  5. 返回 ChainDef 供 _execute_plan() 执行
+  4. 返回 ChainDef 供 _execute_plan() 执行
+  5. 执行成功 + 质量门通过后，由 evaluator._writeback_chain() 写入 tool_chains.json
 
 设计原则：
   - LLM 只做选择题（从 15 个 Skill 中选 1~5 个），不做开放题
@@ -21,11 +21,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from app.agent.chain.chains import ChainDef, ChainStep, register_chain
@@ -41,23 +38,7 @@ logger = logging.getLogger(__name__)
 MIN_STEPS = 1
 MAX_STEPS = 5
 
-# 缓存相似度阈值（query hash 前缀匹配位数）
-CACHE_HASH_PREFIX_LEN = 8
 
-# 规划 TTL（秒）
-PLAN_TTL = int(os.getenv("PLAN_TTL", "86400"))  # 24h
-
-# tool_chains.json 路径
-_TOOL_CHAINS_PATH = None
-
-
-def _get_tool_chains_path() -> Path:
-    global _TOOL_CHAINS_PATH
-    if _TOOL_CHAINS_PATH is None:
-        base = Path(__file__).resolve().parent.parent
-        _TOOL_CHAINS_PATH = base / "data" / "tool_chains.json"
-        _TOOL_CHAINS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    return _TOOL_CHAINS_PATH
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -149,16 +130,7 @@ class Planner:
         """
         t0 = time.time()
 
-        # 1. 查询缓存
-        print(f"[DEBUG] Planner 开始规划 | query={query[:50]}")
-        cached = self._lookup_cache(query, stock_code=stock_code, verb=verb, noun=noun)
-        if cached:
-            print(f"[DEBUG] Planner 缓存命中，跳过 LLM")
-            logger.info("[Planner] 缓存命中: query=%s", query[:30])
-            cached.from_cache = True
-            cached.elapsed_ms = (time.time() - t0) * 1000
-            return cached
-        print(f"[DEBUG] Planner 缓存未命中，调用 LLM")
+        # 1. 缓存查询已移至 _try_chain() Layer 0（tool_chains.py）
 
         # 2. LLM 规划
         if not self._call_llm:
@@ -182,8 +154,8 @@ class Planner:
         # 4. 构建 ChainDef
         chain_def = self._build_chain_def(plan_data, stock_code)
 
-        # 5. 存储
-        self._save_plan(query, plan_data, stock_code)
+        # 5. 不在此处存储 — plan 须经 agent 执行 + 质量门验证后
+        #    由 evaluator._writeback_chain() 统一写入 tool_chains.json
 
         elapsed = (time.time() - t0) * 1000
         logger.info("[Planner] 规划完成: %d 步, %.0fms", len(plan_data.get("phases", plan_data.get("steps", []))), elapsed)
@@ -412,308 +384,5 @@ class Planner:
         register_chain(chain_def)  # 动态链路注册到全局表
         return chain_def
 
-    # ── 缓存 ──
 
-    def _query_hash(self, query: str) -> str:
-        """生成 query hash。"""
-        normalized = query.strip().lower()
-        return hashlib.md5(normalized.encode()).hexdigest()
-
-    def _extract_keywords(self, query: str) -> set:
-        """从 query 中提取关键词（中文分词 + 英文单词）。"""
-        import re
-        # 英文单词
-        en_words = set(re.findall(r'[a-zA-Z_]+', query.lower()))
-        # 中文 2~4 字词组（简单滑窗）
-        cn_chars = re.findall(r'[\u4e00-\u9fff]+', query)
-        cn_words = set()
-        for seg in cn_chars:
-            for n in (2, 3, 4):
-                for i in range(len(seg) - n + 1):
-                    cn_words.add(seg[i:i+n])
-        # 去停用词
-        stopwords = {"的", "了", "吗", "吧", "呢", "啊", "是", "在", "有", "和",
-                     "帮我", "一下", "看看", "怎么", "什么", "如何", "请", "想", "要"}
-        return (en_words | cn_words) - stopwords
-
-    def _similarity(self, query1: str, query2: str, stock1: str = "", stock2: str = "",
-                    verb1: str = "", noun1: str = "", verb2: str = "", noun2: str = "") -> float:
-        """计算两个 query 的相似度（0~1）。
-
-        多维度加权：
-          - 关键词 Jaccard 相似度（0.4 权重）
-          - 股票代码匹配（0.3 权重）
-          - verb+noun 匹配（0.3 权重）
-        """
-        score = 0.0
-
-        # 1. 关键词相似度（Jaccard）
-        kw1 = self._extract_keywords(query1)
-        kw2 = self._extract_keywords(query2)
-        if kw1 and kw2:
-            intersection = kw1 & kw2
-            union = kw1 | kw2
-            kw_sim = len(intersection) / len(union) if union else 0
-            score += kw_sim * 0.4
-
-        # 2. 股票代码匹配
-        if stock1 and stock2:
-            if stock1 == stock2:
-                score += 0.3
-            # 同板块前缀匹配（如 600xxx）
-            elif stock1[:3] == stock2[:3]:
-                score += 0.1
-        elif not stock1 and not stock2:
-            score += 0.15  # 都没股票代码，部分加分
-
-        # 3. verb+noun 匹配
-        if verb1 and verb2:
-            if verb1 == verb2:
-                score += 0.15
-        if noun1 and noun2:
-            if noun1 == noun2:
-                score += 0.15
-
-        return round(score, 3)
-
-    def _lookup_cache(self, query: str, stock_code: str = "",
-                      verb: str = "", noun: str = "") -> Optional[PlanResult]:
-        """查询缓存（多维度相似度匹配）。
-
-        匹配策略（按优先级）：
-          1. hash 精确匹配（100% 相同 query）
-          2. 相似度 ≥ 0.7 + 同股票代码 → 复用
-          3. 相似度 ≥ 0.6 + 同 verb+noun → 复用
-        """
-        try:
-            data = self._load_chains()
-            qh = self._query_hash(query)
-
-            best_match = None
-            best_score = 0.0
-
-            for chain_data in data.get("chains", []):
-                cached_hash = chain_data.get("query_hash", "")
-
-                # 策略 1: 精确 hash 匹配
-                if cached_hash == qh:
-                    best_match = chain_data
-                    best_score = 1.0
-                    break
-
-                # 策略 2: 前缀匹配（短 query 可能碰撞）
-                if cached_hash[:CACHE_HASH_PREFIX_LEN] == qh[:CACHE_HASH_PREFIX_LEN]:
-                    best_match = chain_data
-                    best_score = 0.9
-                    break
-
-                # 策略 3: 多维度相似度
-                cached_query = chain_data.get("query", "")
-                cached_stocks = chain_data.get("stocks", [])
-                cached_stock = cached_stocks[0] if cached_stocks else ""
-
-                sim = self._similarity(
-                    query, cached_query,
-                    stock1=stock_code, stock2=cached_stock,
-                    verb1=verb, noun1=noun,
-                    verb2="", noun2="",
-                )
-
-                if sim > best_score:
-                    best_score = sim
-                    best_match = chain_data
-
-            # 判断是否命中
-            hit = False
-            if best_match and best_score >= 0.7:
-                hit = True
-            elif best_match and best_score >= 0.6:
-                # 需要 verb+noun 匹配加持
-                cached_verbs = best_match.get("trigger_verbs", [])
-                cached_nouns = best_match.get("trigger_nouns", [])
-                if (verb and verb in cached_verbs) or (noun and noun in cached_nouns):
-                    hit = True
-
-            if hit and best_match:
-                # 检查 TTL
-                created = best_match.get("created_at", "")
-                if created:
-                    try:
-                        created_dt = datetime.fromisoformat(created)
-                        age = (datetime.now() - created_dt).total_seconds()
-                        if age > PLAN_TTL:
-                            logger.info("[Planner] 缓存过期 (age=%.0fs)", age)
-                            return None
-                    except ValueError:
-                        return None
-
-                chain_def = self._chain_from_dict(best_match)
-                if chain_def:
-                    best_match["hit_count"] = best_match.get("hit_count", 0) + 1
-                    best_match["last_used"] = datetime.now().isoformat()
-                    self._save_chains(data)
-
-                    logger.info("[Planner] 缓存命中 (score=%.2f): %s → %s",
-                                best_score, query[:30], chain_def.chain_id)
-
-                    return PlanResult(
-                        success=True,
-                        chain_def=chain_def,
-                        reasoning=best_match.get("reasoning", ""),
-                        from_cache=True,
-                        stocks=best_match.get("stocks", []),
-                    )
-        except Exception as e:
-            logger.warning("[Planner] 缓存查询失败: %s", e)
-
-        return None
-
-    def _save_plan(self, query: str, plan_data: Dict[str, Any], stock_code: str):
-        """保存规划到 tool_chains.json。"""
-        try:
-            data = self._load_chains()
-            qh = self._query_hash(query)
-
-            entry = {
-                "id": f"plan_{int(time.time())}_{qh[:8]}",
-                "query_hash": qh,
-                "query": query[:200],
-                "created_at": datetime.now().isoformat(),
-                "phases": plan_data.get("phases", plan_data.get("steps", [])),
-                "progressive": plan_data.get("progressive", True),
-                "stocks": plan_data.get("stocks", []) or ([stock_code] if stock_code else []),
-                "reasoning": plan_data.get("reasoning", ""),
-                "hit_count": 1,
-                "last_used": datetime.now().isoformat(),
-                "backtest_results": {},  # 回测结果（后续填充）
-            }
-
-            data.setdefault("chains", []).append(entry)
-
-            # 清理过期条目
-            now = datetime.now()
-            before_count = len(data["chains"])
-            data["chains"] = [
-                c for c in data["chains"]
-                if self._is_not_expired(c, now)
-            ]
-            after_count = len(data["chains"])
-            if before_count != after_count:
-                logger.info("[Planner] 清理过期规划: %d → %d", before_count, after_count)
-
-            self._save_chains(data)
-        except Exception as e:
-            logger.warning("[Planner] 保存规划失败: %s", e)
-
-    def _is_not_expired(self, chain_data: Dict, now: datetime) -> bool:
-        created = chain_data.get("created_at", "")
-        if not created:
-            return False
-        try:
-            return (now - datetime.fromisoformat(created)).total_seconds() <= PLAN_TTL
-        except ValueError:
-            return False
-
-    def _chain_from_dict(self, data: Dict) -> Optional[ChainDef]:
-        """从缓存条目构建 ChainDef。
-
-        保留缓存中的 rules、description、context，确保快速通道执行时
-        agent 上下文完整（规则文本而非工具名）。
-        """
-        phases = data.get("phases", data.get("steps", []))
-        steps = []
-        for i, s in enumerate(phases, 1):
-            agent = s.get("agent", s.get("skill", ""))
-            if agent:
-                steps.append(ChainStep(
-                    name=agent, agent=agent, order=i,
-                    description=s.get("description", ""),
-                    required=(i == 1),
-                    rules=s.get("rules", ""),
-                ))
-        if not steps:
-            return None
-
-        chain_id = f"cached+{data.get('query_hash', '')[:8]}"
-        progressive = data.get("progressive", True)
-        planner_context = data.get("context", {})
-        chain_def = ChainDef(
-            chain_id=chain_id,
-            name="缓存规划链路",
-            description=data.get("reasoning", ""),
-            steps=steps,
-            trigger_verbs=[],
-            trigger_nouns=[],
-            context=planner_context,
-            progressive=progressive,
-        )
-        register_chain(chain_def)  # 动态链路注册到全局表
-        return chain_def
-
-    # ── 文件 IO ──
-
-    def _load_chains(self) -> Dict[str, Any]:
-        path = _get_tool_chains_path()
-        if path.exists():
-            try:
-                return json.loads(path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                pass
-        return {"version": 1, "chains": []}
-
-    def _save_chains(self, data: Dict[str, Any]):
-        path = _get_tool_chains_path()
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    def update_backtest_result(self, plan_id: str, win_rate: float, avg_pnl: float, sample_count: int):
-        """更新规划的回测结果（由回溯评估引擎调用）。
-
-        Args:
-            plan_id: 规划 ID（如 "plan_1717900000_a1b2c3d4"）
-            win_rate: 胜率
-            avg_pnl: 平均盈亏率（%）
-            sample_count: 样本数
-        """
-        try:
-            data = self._load_chains()
-            for chain in data.get("chains", []):
-                if chain.get("id") == plan_id:
-                    chain["backtest_results"] = {
-                        "win_rate": round(win_rate, 3),
-                        "avg_pnl": round(avg_pnl, 2),
-                        "sample_count": sample_count,
-                        "updated_at": datetime.now().isoformat(),
-                    }
-                    self._save_chains(data)
-                    logger.info("[Planner] 回测结果更新: plan=%s win_rate=%.1f%% avg_pnl=%.2f%%",
-                                plan_id, win_rate * 100, avg_pnl)
-                    return
-            logger.warning("[Planner] 未找到规划: %s", plan_id)
-        except Exception as e:
-            logger.warning("[Planner] 回测结果更新失败: %s", e)
-
-    def get_plan_stats(self) -> Dict[str, Any]:
-        """获取规划统计信息（调试用）。"""
-        try:
-            data = self._load_chains()
-            chains = data.get("chains", [])
-            if not chains:
-                return {"total": 0, "active": 0, "expired": 0}
-
-            now = datetime.now()
-            active = [c for c in chains if self._is_not_expired(c, now)]
-            expired = len(chains) - len(active)
-
-            total_hits = sum(c.get("hit_count", 0) for c in chains)
-            avg_hits = total_hits / len(chains) if chains else 0
-
-            return {
-                "total": len(chains),
-                "active": len(active),
-                "expired": expired,
-                "total_hits": total_hits,
-                "avg_hits": round(avg_hits, 1),
-            }
-        except Exception:
-            return {"total": 0, "error": True}
 

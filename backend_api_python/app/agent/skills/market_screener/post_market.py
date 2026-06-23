@@ -185,14 +185,24 @@ def prescreen(date: str) -> Dict[str, Any]:
 
     try:
         from app.agent.tools.screener_tools import search_stocks
+        # 常规盘后选股
         screener_result = search_stocks(
             query="涨幅1%到8% 换手率大于2% 非ST",
             source="eastmoney",
             top_n=100,
         )
         raw_stocks = screener_result.get("stocks", []) if isinstance(screener_result, dict) else []
+
+        # 4IN1 候选：搜索近期涨停过的股票（连板/首板回调）
+        dragon_result = search_stocks(
+            query="近10日涨停 换手率大于2% 非ST",
+            source="eastmoney",
+            top_n=50,
+        )
+        dragon_stocks = dragon_result.get("stocks", []) if isinstance(dragon_result, dict) else []
     except Exception:
         raw_stocks = []
+        dragon_stocks = []
 
     scan_pool = {}
     for s in hot_stocks:
@@ -207,6 +217,18 @@ def prescreen(date: str) -> Dict[str, Any]:
                 "change_pct": float(s.get("change_pct", 0) or s.get("pct_change", 0) or 0),
                 "turnover_pct": float(s.get("turnover_rate", 0) or 0),
                 "reason": "",
+                "source": "盘后筛选",
+            }
+    # 4IN1 候选：近期涨停过的股票
+    for s in dragon_stocks:
+        code = str(s.get("code", "") or s.get("symbol", ""))
+        if code and len(code) == 6 and code not in scan_pool:
+            scan_pool[code] = {
+                "code": code, "name": s.get("name", ""),
+                "change_pct": float(s.get("change_pct", 0) or s.get("pct_change", 0) or 0),
+                "turnover_pct": float(s.get("turnover_rate", 0) or 0),
+                "reason": "",
+                "source": "4IN1(近期涨停)",
             }
 
     candidates = []
@@ -273,6 +295,11 @@ def prescreen(date: str) -> Dict[str, Any]:
         if vol_ratio > 1.5:
             signals.append(f"放量{vol_ratio:.1f}倍")
 
+        # 换手率 < 2% 排除（活跃度不够）
+        turnover_pct = info.get("turnover_pct", 0)
+        if turnover_pct > 0 and turnover_pct < 2.0:
+            continue
+
         candidates.append({
             "code": code, "name": info.get("name", ""),
             "change_pct": info.get("change_pct", 0),
@@ -284,6 +311,7 @@ def prescreen(date: str) -> Dict[str, Any]:
             "ma5": round(ma5[-1], 2) if ma5[-1] else None,
             "ma10": round(ma10[-1], 2) if ma10[-1] else None,
             "reason": info.get("reason", ""), "signals": signals,
+            "source": info.get("source", "盘后筛选"),
         })
 
     candidates.sort(key=lambda x: -x["score"])

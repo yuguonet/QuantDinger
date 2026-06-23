@@ -1201,6 +1201,68 @@ class _AgentExecutor:
 
         return success, content, tool_calls_log, total_steps, total_tokens, charts_b64, result
 
+    def _build_phase_context_and_agent(self, step, all_content, progressive, is_last,
+                                        stock_code, stock_name, skill_metas, tips,
+                                        _agent_config, message, chain_def):
+        """构建当前 phase 的上下文和重建 agent。供 _execute_plan / _execute_plan_stream 复用。"""
+        parts = [
+            f"[第 {step.order} 步] {step.description or step.agent}",
+            f"标的: {stock_name or '未知'}（{stock_code}）" if stock_code else "",
+        ]
+        if progressive and all_content:
+            if is_last(step):
+                parts.append("以下是前面所有步骤的完整分析结论，请综合后给出最终总结：")
+                for i, prev in enumerate(all_content, 1):
+                    parts.append(f"\n--- 第{i}步结论 ---\n{prev}")
+                parts.append("\n请综合以上所有步骤的结论，给出最终分析总结。")
+            else:
+                parts.append("前序分析结论:")
+                for i, prev in enumerate(all_content, 1):
+                    parts.append(f"  第{i}步: {prev[:300]}")
+
+        meta_skill = skill_metas.get(step.agent)
+        if meta_skill:
+            parts.append(f"\n请用 read_skill 加载 {step.agent} 的指令并执行。")
+            if meta_skill.tools:
+                parts.append(f"可用工具: {', '.join(meta_skill.tools)}")
+        else:
+            parts.append(f"\n直接调用工具: {step.agent}")
+            parts.append("请直接使用上述工具完成任务，无需读取 SKILL.md。")
+        step_rules = step.rules or tips
+        if step_rules:
+            parts.append(f"规则: {step_rules}")
+
+        step_context = "\n".join(p for p in parts if p)
+
+        # 重建 agent（per-phase 工具过滤）
+        phase_tools = []
+        if meta_skill and meta_skill.tools:
+            phase_tools = meta_skill.tools + ["get_skill_catalog", "read_skill"]
+            is_tool_mode = False
+        else:
+            phase_tools = [step.agent]
+            is_tool_mode = True
+
+        phase_agent = get_smolagent(
+            user_id=_agent_config["user_id"],
+            model=_agent_config["model"],
+            provider=_agent_config["provider"],
+            max_steps=_agent_config["max_steps"],
+            user_message=message,
+            language=_agent_config["language"],
+            domain=_agent_config["domain"],
+            domain_instructions=_agent_config["domain_instructions"],
+            intent_context=_agent_config["intent_context"],
+            stock_code=_agent_config["stock_code"],
+            tool_categories=phase_tools,
+            collector=_agent_config["collector"],
+            strategy=_agent_config["strategy"],
+            is_tool_mode=is_tool_mode,
+        )
+        logger.info("[Plan] Phase %d 重建 agent，加载 %d 个工具: %s", step.order, len(phase_tools), phase_tools)
+
+        return step_context, phase_agent
+
     def _execute_plan(self, agent, chain_def, message, context, meta, store, session_id):
         """per-phase 执行：逐 phase 调用 agent.run()。每个 phase 重建 agent，只加载当前 phase 需要的工具。"""
         # ── 调试日志：plan 入口 ───────────────────────────────
@@ -1253,81 +1315,13 @@ class _AgentExecutor:
         }
 
         for step in sorted_steps:
-            # 构建当前 phase 的独立上下文
-            parts = [
-                f"[第 {step.order} 步] {step.description or step.agent}",
-                f"标的: {stock_name or '未知'}（{stock_code}）" if stock_code else "",
-            ]
-
-            # 按 progressive 决定是否注入前序结论
-            if progressive and all_content:
-                if is_last(step):
-                    # 最后一步：完整前序结论 + 总结指令
-                    parts.append("以下是前面所有步骤的完整分析结论，请综合后给出最终总结：")
-                    for i, prev in enumerate(all_content, 1):
-                        parts.append(f"\n--- 第{i}步结论 ---\n{prev}")
-                    parts.append("\n请综合以上所有步骤的结论，给出最终分析总结。")
-                else:
-                    # 中间步骤：截断的前序结论（节省 token）
-                    parts.append("前序分析结论:")
-                    for i, prev in enumerate(all_content, 1):
-                        parts.append(f"  第{i}步: {prev[:300]}")
-
-            # 当前 phase 的指令（精简，skill 全貌由 read_skill 加载）
-            meta_skill = skill_metas.get(step.agent)
-            if meta_skill:
-                # 是 skill → 读取 SKILL.md
-                parts.append(f"\n请用 read_skill 加载 {step.agent} 的指令并执行。")
-                if meta_skill.tools:
-                    parts.append(f"可用工具: {', '.join(meta_skill.tools)}")
-            else:
-                # 是 tool → 直接调用
-                parts.append(f"\n直接调用工具: {step.agent}")
-                parts.append("请直接使用上述工具完成任务，无需读取 SKILL.md。")
-            step_rules = step.rules or tips
-            if step_rules:
-                parts.append(f"规则: {step_rules}")
-
-            step_context = "\n".join(p for p in parts if p)
+            # 构建当前 phase 的上下文 + 重建 agent
+            step_context, phase_agent = self._build_phase_context_and_agent(
+                step, all_content, progressive, is_last,
+                stock_code, stock_name, skill_metas, tips,
+                _agent_config, message, chain_def,
+            )
             logger.info("[Plan] 执行 phase %d/%d: %s", step.order, len(chain_def.steps), step.agent)
-            # ── 调试日志：per-phase 详情 ──────────────────────
-            print(
-                f"[DEBUG] Plan phase {step.order}/{len(chain_def.steps)} | "
-                f"agent={step.agent} step_context_len={len(step_context) if step_context else 0}"
-            )
-            print(f"[DEBUG] Plan phase {step.order} step_context 前300字: {(step_context or '')[:300]}")
-
-            # 为当前 phase 重建 agent（只加载当前 phase 需要的工具）
-            phase_tools = []
-            meta_skill = skill_metas.get(step.agent)
-            if meta_skill and meta_skill.tools:
-                # 是 skill → 加载 skill 指定的工具 + get_skill_catalog 和 read_skill
-                phase_tools = meta_skill.tools + ["get_skill_catalog", "read_skill"]
-                is_tool_mode = False
-            else:
-                # 是 tool → 只加载这一个工具
-                phase_tools = [step.agent]
-                is_tool_mode = True
-
-            # 重建 agent（per-phase 工具过滤）
-            phase_agent = get_smolagent(
-                user_id=_agent_config["user_id"],
-                model=_agent_config["model"],
-                provider=_agent_config["provider"],
-                max_steps=_agent_config["max_steps"],
-                user_message=message,
-                language=_agent_config["language"],
-                domain=_agent_config["domain"],
-                domain_instructions=_agent_config["domain_instructions"],
-                intent_context=_agent_config["intent_context"],
-                stock_code=_agent_config["stock_code"],
-                tool_categories=phase_tools,  # 当前 phase 的工具列表
-                collector=_agent_config["collector"],
-                strategy=_agent_config["strategy"],
-                is_tool_mode=is_tool_mode,  # 是否是 tool 模式
-            )
-            logger.info("[Plan] Phase %d 重建 agent，加载 %d 个工具: %s", step.order, len(phase_tools), phase_tools)
-            print(f"[DEBUG] Plan phase {step.order} 重建 agent，工具: {phase_tools}")
 
             # 执行当前 phase
             step_success, step_content, step_tool_calls, step_steps, step_tokens, step_charts, step_result = \
@@ -1424,77 +1418,13 @@ class _AgentExecutor:
         from smolagents import FinalAnswerStep
 
         for step in sorted_steps:
-            # 构建当前 phase 的独立上下文
-            parts = [
-                f"[第 {step.order} 步] {step.description or step.agent}",
-                f"标的: {stock_name or '未知'}（{stock_code}）" if stock_code else "",
-            ]
-            # 按 progressive 决定是否注入前序结论
-            if progressive and all_content:
-                if is_last(step):
-                    parts.append("以下是前面所有步骤的完整分析结论，请综合后给出最终总结：")
-                    for i, prev in enumerate(all_content, 1):
-                        parts.append(f"\n--- 第{i}步结论 ---\n{prev}")
-                    parts.append("\n请综合以上所有步骤的结论，给出最终分析总结。")
-                else:
-                    parts.append("前序分析结论:")
-                    for i, prev in enumerate(all_content, 1):
-                        parts.append(f"  第{i}步: {prev[:300]}")
-            meta_skill = skill_metas.get(step.agent)
-            if meta_skill:
-                # 是 skill → 读取 SKILL.md
-                parts.append(f"\n请用 read_skill 加载 {step.agent} 的指令并执行。")
-                if meta_skill.tools:
-                    parts.append(f"可用工具: {', '.join(meta_skill.tools)}")
-            else:
-                # 是 tool → 直接调用
-                parts.append(f"\n直接调用工具: {step.agent}")
-                parts.append("请直接使用上述工具完成任务，无需读取 SKILL.md。")
-            step_rules = step.rules or tips
-            if step_rules:
-                parts.append(f"规则: {step_rules}")
-
-            step_context = "\n".join(p for p in parts if p)
+            # 构建当前 phase 的上下文 + 重建 agent
+            step_context, phase_agent = self._build_phase_context_and_agent(
+                step, all_content, progressive, is_last,
+                stock_code, stock_name, skill_metas, tips,
+                _agent_config, message, chain_def,
+            )
             logger.info("[Plan-Stream] 执行 phase %d/%d: %s", step.order, len(sorted_steps), step.agent)
-            # ── 调试日志：agent.run() 前（Plan-Stream）──────────
-            print(
-                f"[DEBUG] Plan-Stream agent.run() 即将执行 | phase={step.order}/{len(sorted_steps)} "
-                f"agent={step.agent} max_steps={self.max_steps} "
-                f"step_context_len={len(step_context) if step_context else 0}"
-            )
-            print(f"[DEBUG] Plan-Stream step_context 前300字: {(step_context or '')[:300]}")
-
-            # 为当前 phase 重建 agent（只加载当前 phase 需要的工具）
-            phase_tools = []
-            meta_skill = skill_metas.get(step.agent)
-            if meta_skill and meta_skill.tools:
-                # 是 skill → 加载 skill 指定的工具 + get_skill_catalog 和 read_skill
-                phase_tools = meta_skill.tools + ["get_skill_catalog", "read_skill"]
-                is_tool_mode = False
-            else:
-                # 是 tool → 只加载这一个工具
-                phase_tools = [step.agent]
-                is_tool_mode = True
-
-            # 重建 agent（per-phase 工具过滤）
-            phase_agent = get_smolagent(
-                user_id=_agent_config["user_id"],
-                model=_agent_config["model"],
-                provider=_agent_config["provider"],
-                max_steps=_agent_config["max_steps"],
-                user_message=message,
-                language=_agent_config["language"],
-                domain=_agent_config["domain"],
-                domain_instructions=_agent_config["domain_instructions"],
-                intent_context=_agent_config["intent_context"],
-                stock_code=_agent_config["stock_code"],
-                tool_categories=phase_tools,  # 当前 phase 的工具列表
-                collector=_agent_config["collector"],
-                strategy=_agent_config["strategy"],
-                is_tool_mode=is_tool_mode,  # 是否是 tool 模式
-            )
-            logger.info("[Plan-Stream] Phase %d 重建 agent，加载 %d 个工具: %s", step.order, len(phase_tools), phase_tools)
-            print(f"[DEBUG] Plan-Stream phase {step.order} 重建 agent，工具: {phase_tools}")
 
             # 通知前端当前 phase
             yield {"type": "tool_info", "tool": "", "message": f"── 第 {step.order} 步: {step.description or step.agent} ──"}
@@ -1560,45 +1490,15 @@ class _AgentExecutor:
         content = "\n\n".join(c for c in all_content if c)
         store.add_message(session_id, "assistant", content if isinstance(content, str) else str(content))
 
-        # ── 后置学习闭环 ──
-        _eval_result = AgentResult(
-            success=bool(content), content=content,
-            tool_calls_log=_stream_tool_calls, total_steps=agent.step_number,
-        )
-        self._post_evaluate(
-            _eval_result, meta.get("tool_chain", []),
-            meta.get("intent_verb", ""), meta.get("intent_noun", ""),
-            domain=meta.get("domain", ""), session_id=session_id,
-            chain_def=meta.get("chain_def"),
-            all_phases_completed=all_phases_completed,
+        # 后置学习闭环 + 异步压缩上下文
+        self._post_learn_and_compress(
+            content, bool(content), _stream_tool_calls,
+            agent.step_number, 0, meta, session_id, store, agent, agent,
+            chain_def=meta.get("chain_def"), all_phases_completed=all_phases_completed,
         )
 
-        # ── 保存根节点 ──
-        if not meta.get("collector"):
-            try:
-                from app.agent.chain.schema import EvalNode, Layer, Status
-                from app.agent.json_extractor import extract_decision
-                from datetime import date as _date
-                _sc = stock_code
-                _sn = stock_name
-                _dec = extract_decision(content) if content else None
-                root = EvalNode(
-                    layer=Layer.CHAIN.value,
-                    name=f"{meta.get('intent_verb', '')}+{meta.get('intent_noun', '')}" or "agent",
-                    exec_date=_date.today(), stock_code=_sc, stock_name=_sn,
-                    score=_dec.get("score") if _dec else None,
-                    direction=_dec.get("direction", "") if _dec else "",
-                    action=_dec.get("action", "") if _dec else "",
-                    signal=_dec.get("signal", "") if _dec else "",
-                    confidence=_dec.get("confidence") if _dec else None,
-                    timeframe=_dec.get("timeframe", "") if _dec else "",
-                    analysis=str(content)[:2000] if content else "",
-                    input_params={"user_query": message},
-                    status=Status.OK.value if content else Status.FAILED.value,
-                )
-                store.save_tree(root)
-            except Exception as _e:
-                logger.warning("[Plan-Stream] 根节点存库失败: %s", _e)
+        # 非 traced 策略兜底根节点写入
+        self._save_root_to_traces(content, bool(content), context, meta, message, store)
 
         yield {
             "type": "done",
@@ -1608,110 +1508,6 @@ class _AgentExecutor:
             "model": str(getattr(agent.model, "model_id", "")),
             "session_id": session_id,
         }
-
-    def _post_process(self, store, session_id, content, success, tool_calls_log,
-                      total_steps, total_tokens, charts_b64, result, agent,
-                      context, meta, message, all_phases_completed=None):
-        """§17.2 阶段 3: 结果处理 + DecisionCard + 后置学习闭环。
-
-        Args:
-            all_phases_completed: None=不适用（自由执行），True=全部phase完成，False=phase被中断
-        """
-        _eval_domain = meta.get("domain", "")
-        _eval_strategy = meta.get("strategy", "direct")
-        _tool_chain = meta.get("tool_chain", [])
-        _intent_verb = meta.get("intent_verb", "")
-        _intent_noun = meta.get("intent_noun", "")
-        collector = meta.get("collector")
-
-        store.add_message(session_id, "assistant", content if isinstance(content, str) else str(content))
-
-        # ── 金融领域：JSON → TraceCollector 存库 → format_decision_card ──
-        if success and content and collector and _eval_strategy == "traced":
-            try:
-                from app.agent.json_extractor import extract_decision as _extract_dec
-                _card_data = _extract_dec(content)
-
-                if _card_data is None and isinstance(content, str) and content.strip():
-                    _stock_code = ""
-                    _stock_name = ""
-                    if context:
-                        _stock_code = context.get("stock_code", "")
-                        _stock_name = context.get("stock_name", "")
-                    if not _stock_code:
-                        for _k in ("stock_code", "stock", "symbol", "code"):
-                            if _k in (meta or {}) and meta[_k]:
-                                _stock_code = str(meta[_k])
-                                break
-                    _card_data = {
-                        "action": "skip", "score": 0, "direction": "neutral",
-                        "confidence": "low", "timeframe": "T+3",
-                        "timeframe_reason": "agent未输出结构化JSON",
-                        "stock_code": _stock_code or (collector.stock_code if collector else ""),
-                        "stock_name": _stock_name or (collector.stock_name if collector else ""),
-                        "signal": "分析未完成，输出格式异常",
-                        "factors": [], "analysis": content[:2000],
-                    }
-                    logger.warning("[Agent] JSON提取失败，fallback → skip。原始内容前200字: %s", content[:200])
-
-                _tc_answer = json.dumps(content, ensure_ascii=False) if isinstance(content, dict) else content
-                tu = result.token_usage if hasattr(result, 'token_usage') else None
-                total_tok = (tu.input_tokens + tu.output_tokens) if tu else 0
-                root = collector.on_agent_finish(
-                    final_answer=_tc_answer, total_steps=total_steps,
-                    total_tokens=total_tok,
-                    model=str(getattr(agent.model, "model_id", "")),
-                )
-                logger.info("[Agent] TraceCollector 存库 root_id=%s stock=%s", root.id, root.stock_code)
-
-                if _card_data:
-                    content = format_decision_card(_card_data)
-                    store.add_message(session_id, "assistant", content)
-                    logger.info("[Agent] DecisionCard: %s score=%s action=%s",
-                                _card_data.get("stock_code", ""), _card_data.get("score", ""), _card_data.get("action", ""))
-            except Exception as e:
-                logger.warning("[Agent] DecisionCard/存库失败，保留原始输出: %s", e)
-
-        # ── 后置学习闭环 ──
-        agent_result_for_eval = AgentResult(
-            success=success, content=content, tool_calls_log=tool_calls_log,
-            total_steps=total_steps, total_tokens=total_tokens,
-        )
-        self._post_evaluate(agent_result_for_eval, _tool_chain, _intent_verb, _intent_noun, domain=_eval_domain, session_id=session_id, chain_def=meta.get("chain_def"), all_phases_completed=all_phases_completed)
-
-        # ── 异步压缩上下文 ──
-        if success and content:
-            try:
-                from app.agent.context_compressor import compress_context
-                import threading
-                _compress_domain = _eval_domain
-                def _compress(c=content, tc=tool_calls_log, sid=session_id, m=self.model, d=_compress_domain):
-                    try:
-                        _, age = store.get_context_summary(sid, current_domain=d, with_age=True)
-                        summary = compress_context(c, tc, model=m, domain=d, age_turns=age)
-                    except Exception as e:
-                        logger.warning("[Compress] 压缩异常，降级截断: %s", e)
-                        summary = c[:500]
-                    if summary:
-                        store.save_context_summary(sid, summary, domain=d)
-                threading.Thread(target=_compress, daemon=True).start()
-            except Exception:
-                pass
-
-        # ── JSON 校验重试失败后标记输出 ──
-        if getattr(agent, '_json_output_fallback', False):
-            if isinstance(content, str):
-                content += "\n\n> 输出内容未做标准化处理"
-            elif isinstance(content, dict):
-                content["_warning"] = "输出内容未做标准化处理"
-
-        return AgentResult(
-            success=success, content=content, tool_calls_log=tool_calls_log,
-            total_steps=total_steps, total_tokens=total_tokens,
-            model=str(getattr(agent.model, "model_id", "")),
-            error=None if success else "Agent did not produce a final answer",
-            charts=charts_b64,
-        )
 
     def chat(self, message, session_id, context=None,
              progress_callback=None, user_id=1) -> AgentResult:
@@ -1733,7 +1529,7 @@ class _AgentExecutor:
           阶段 2: _execute_plan() 或 _execute_phase()
                  — 有链路 → per-phase 循环，每步 agent.run() 只有 1 步内容
                  — 无链路 → agent 自由执行
-          阶段 3: _post_process() — 结果处理 + DecisionCard + 后置学习闭环
+          阶段 3: _handle_decision_card + _post_learn_and_compress + _save_root_to_traces
         """
         # ── 阶段 1: 准备意图 ──────────────────────────────────
         store, agent, enriched, meta = self._prepare(message, session_id, context, user_id)
@@ -1765,51 +1561,166 @@ class _AgentExecutor:
             # 无链路：Agent 自由执行（一次调用，内部自循环）
             success, content, tool_calls_log, total_steps, total_tokens, charts_b64, result = \
                 self._execute_phase(agent, enriched, self.max_steps, context, meta, store, session_id)
+            all_phases_completed = None
 
         # ── 阶段 3: 结果处理 ──────────────────────────────────
-        # 无链路时 all_phases_completed 不适用（自由执行，无 phase 概念）
-        _all_phases_completed = all_phases_completed if chain_def else None
-        agent_result = self._post_process(
-            store, session_id, content, success, tool_calls_log,
-            total_steps, total_tokens, charts_b64, result, agent,
-            context, meta, message, all_phases_completed=_all_phases_completed,
+        store.add_message(session_id, "assistant", content if isinstance(content, str) else str(content))
+
+        # DecisionCard + TraceCollector 存库（traced 策略）
+        content = self._handle_decision_card(
+            content, success, agent, result,
+            meta.get("collector"), meta.get("strategy", "direct"),
+            store, session_id, context, meta, total_steps, tool_calls_log,
         )
 
-        # ── 保存根节点到 qd_traces（非 traced 策略的兜底写入）──
-        # traced 策略已由 TraceCollector.on_agent_finish() 写入完整树，此处跳过
-        if not meta.get("collector"):
+        # 后置学习闭环 + 异步压缩上下文
+        _all_phases_completed = all_phases_completed if chain_def else None
+        self._post_learn_and_compress(
+            content, success, tool_calls_log, total_steps, total_tokens,
+            meta, session_id, store, agent, result,
+            chain_def=meta.get("chain_def"), all_phases_completed=_all_phases_completed,
+        )
+
+        # 非 traced 策略兜底根节点写入
+        self._save_root_to_traces(content, success, context, meta, message, store)
+
+        # JSON 校验重试失败后标记
+        if getattr(agent, '_json_output_fallback', False):
+            if isinstance(content, str):
+                content += "\n\n> 输出内容未做标准化处理"
+            elif isinstance(content, dict):
+                content["_warning"] = "输出内容未做标准化处理"
+
+        return AgentResult(
+            success=success, content=content, tool_calls_log=tool_calls_log,
+            total_steps=total_steps, total_tokens=total_tokens,
+            model=str(getattr(agent.model, "model_id", "")),
+            error=None if success else "Agent did not produce a final answer",
+            charts=charts_b64,
+        )
+
+    # ═══════════════════════════════════════════════════════════════
+    # 公共后处理函数（chat / chat_stream 复用）
+    # ═══════════════════════════════════════════════════════════════
+
+    def _save_root_to_traces(self, content, success, context, meta, message, store):
+        """非 traced 策略的兜底根节点写入 qd_traces。"""
+        if meta.get("collector"):
+            return
+        try:
+            from app.agent.chain.schema import EvalNode, Layer, Status
+            from app.agent.json_extractor import extract_decision
+            from datetime import date as _date
+
+            _sc = (context or {}).get("stock_code", "")
+            _sn = (context or {}).get("stock_name", "")
+            _dec = extract_decision(content) if content else None
+
+            root = EvalNode(
+                layer=Layer.CHAIN.value,
+                name=f"{meta.get('intent_verb', '')}+{meta.get('intent_noun', '')}" or "agent",
+                exec_date=_date.today(),
+                stock_code=_sc, stock_name=_sn,
+                score=_dec.get("score") if _dec else None,
+                direction=_dec.get("direction", "") if _dec else "",
+                action=_dec.get("action", "") if _dec else "",
+                signal=_dec.get("signal", "") if _dec else "",
+                confidence=_dec.get("confidence") if _dec else None,
+                timeframe=_dec.get("timeframe", "") if _dec else "",
+                analysis=str(content)[:2000] if content else "",
+                input_params={"user_query": message},
+                status=Status.OK.value if success else Status.FAILED.value,
+                elapsed_ms=0,
+            )
+            store.save_tree(root)
+            logger.info("[Agent] 根节点存库 stock=%s action=%s", _sc, root.action)
+        except Exception as _e:
+            logger.warning("[Agent] 根节点存库失败（不影响返回）: %s", _e)
+
+    def _handle_decision_card(self, content, success, agent, result,
+                              collector, strategy, store, session_id,
+                              context, meta, total_steps, tool_calls_log):
+        """traced 策略: JSON → TraceCollector 存库 → DecisionCard 格式化。"""
+        if not (success and content and collector and strategy == "traced"):
+            return content
+        try:
+            from app.agent.json_extractor import extract_decision as _extract_dec
+            _card_data = _extract_dec(content)
+
+            if _card_data is None and isinstance(content, str) and content.strip():
+                _stock_code = (context or {}).get("stock_code", "")
+                _stock_name = (context or {}).get("stock_name", "")
+                if not _stock_code:
+                    for _k in ("stock_code", "stock", "symbol", "code"):
+                        if _k in (meta or {}) and meta[_k]:
+                            _stock_code = str(meta[_k])
+                            break
+                _card_data = {
+                    "action": "skip", "score": 0, "direction": "neutral",
+                    "confidence": "low", "timeframe": "T+3",
+                    "timeframe_reason": "agent未输出结构化JSON",
+                    "stock_code": _stock_code or (collector.stock_code if collector else ""),
+                    "stock_name": _stock_name or (collector.stock_name if collector else ""),
+                    "signal": "分析未完成，输出格式异常",
+                    "factors": [], "analysis": content[:2000],
+                }
+                logger.warning("[Agent] JSON提取失败，fallback → skip。原始内容前200字: %s", content[:200])
+
+            _tc_answer = json.dumps(content, ensure_ascii=False) if isinstance(content, dict) else content
+            tu = result.token_usage if hasattr(result, 'token_usage') else None
+            total_tok = (tu.input_tokens + tu.output_tokens) if tu else 0
+            root = collector.on_agent_finish(
+                final_answer=_tc_answer, total_steps=total_steps,
+                total_tokens=total_tok,
+                model=str(getattr(agent.model, "model_id", "")),
+            )
+            logger.info("[Agent] TraceCollector 存库 root_id=%s stock=%s", root.id, root.stock_code)
+
+            if _card_data:
+                content = format_decision_card(_card_data)
+                store.add_message(session_id, "assistant", content)
+                logger.info("[Agent] DecisionCard: %s score=%s action=%s",
+                            _card_data.get("stock_code", ""), _card_data.get("score", ""), _card_data.get("action", ""))
+        except Exception as e:
+            logger.warning("[Agent] DecisionCard/存库失败，保留原始输出: %s", e)
+        return content
+
+    def _post_learn_and_compress(self, content, success, tool_calls_log,
+                                 total_steps, total_tokens, meta, session_id,
+                                 store, agent, result, chain_def=None,
+                                 all_phases_completed=None):
+        """后置学习闭环 + 异步压缩上下文。"""
+        agent_result_for_eval = AgentResult(
+            success=success, content=content, tool_calls_log=tool_calls_log,
+            total_steps=total_steps, total_tokens=total_tokens,
+        )
+        self._post_evaluate(
+            agent_result_for_eval,
+            meta.get("tool_chain", []),
+            meta.get("intent_verb", ""), meta.get("intent_noun", ""),
+            domain=meta.get("domain", ""),
+            session_id=session_id,
+            chain_def=chain_def,
+            all_phases_completed=all_phases_completed,
+        )
+
+        if success and content:
             try:
-                from app.agent.chain.schema import EvalNode, Layer, Status
-                from app.agent.json_extractor import extract_decision
-                from datetime import date as _date
-
-                _sc = (context or {}).get("stock_code", "")
-                _sn = (context or {}).get("stock_name", "")
-                _dec = extract_decision(content) if content else None
-
-                root = EvalNode(
-                    layer=Layer.CHAIN.value,
-                    name=f"{meta.get('intent_verb', '')}+{meta.get('intent_noun', '')}" or "agent",
-                    exec_date=_date.today(),
-                    stock_code=_sc,
-                    stock_name=_sn,
-                    score=_dec.get("score") if _dec else None,
-                    direction=_dec.get("direction", "") if _dec else "",
-                    action=_dec.get("action", "") if _dec else "",
-                    signal=_dec.get("signal", "") if _dec else "",
-                    confidence=_dec.get("confidence") if _dec else None,
-                    timeframe=_dec.get("timeframe", "") if _dec else "",
-                    analysis=str(content)[:2000] if content else "",
-                    input_params={"user_query": message},
-                    status=Status.OK.value if success else Status.FAILED.value,
-                    elapsed_ms=0,
-                )
-                store.save_tree(root)
-                logger.info("[Agent] 根节点存库 stock=%s action=%s", _sc, root.action)
-            except Exception as _e:
-                logger.warning("[Agent] 根节点存库失败（不影响返回）: %s", _e)
-
-        return agent_result
+                from app.agent.context_compressor import compress_context
+                import threading
+                _d = meta.get("domain", "")
+                def _compress(c=content, tc=tool_calls_log, sid=session_id, m=self.model, d=_d):
+                    try:
+                        _, age = store.get_context_summary(sid, current_domain=d, with_age=True)
+                        summary = compress_context(c, tc, model=m, domain=d, age_turns=age)
+                    except Exception as e:
+                        logger.warning("[Compress] 压缩异常，降级截断: %s", e)
+                        summary = c[:500]
+                    if summary:
+                        store.save_context_summary(sid, summary, domain=d)
+                threading.Thread(target=_compress, daemon=True).start()
+            except Exception:
+                pass
 
     @staticmethod
     def _post_evaluate(agent_result, tool_chain, verb, noun, domain="", session_id=None, chain_def=None, all_phases_completed=None):
@@ -2210,118 +2121,30 @@ class _AgentExecutor:
                         content = str(_raw_stream_output) if _raw_stream_output else ""
                     store.add_message(session_id, "assistant", content if isinstance(content, str) else str(content))
 
-                    # ── 金融领域：JSON → TraceCollector 存库 → format_decision_card ──
-                    # ── §15: 用 strategy 替代 domain 做 DecisionCard 路由 ──
-                    _stream_domain = meta.get("domain", "")
-                    _stream_strategy = meta.get("strategy", "direct")
-                    _stream_collector = meta.get("collector")
-                    if content and _stream_collector and _stream_strategy == "traced":
-                        try:
-                            from app.agent.json_extractor import extract_decision as _extract_dec2
-                            _sc_data = _extract_dec2(content)
+                    # DecisionCard + TraceCollector 存库（traced 策略）
+                    content = self._handle_decision_card(
+                        content, bool(content), agent, agent,
+                        meta.get("collector"), meta.get("strategy", "direct"),
+                        store, session_id, context, meta,
+                        agent.step_number, _stream_tool_calls,
+                    )
 
-                            # 先用原始 JSON 内容调用 on_agent_finish（提取字段 + 存库）
-                            # TraceCollector 需要字符串输入，dict 转 JSON 字符串
-                            _tc_stream_answer = json.dumps(content, ensure_ascii=False) if isinstance(content, dict) else content
-                            _tu = None
-                            try:
-                                _tu = agent.token_usage
-                            except Exception:
-                                pass
-                            _total_tok = (_tu.input_tokens + _tu.output_tokens) if _tu else 0
-                            _root = _stream_collector.on_agent_finish(
-                                final_answer=_tc_stream_answer,
-                                total_steps=agent.step_number,
-                                total_tokens=_total_tok,
-                                model=str(getattr(agent.model, "model_id", "")),
-                            )
-                            logger.info("[Agent] 流式TraceCollector 存库 root_id=%s stock=%s",
-                                        _root.id, _root.stock_code)
-
-                            # 再用 JSON 格式化为 DecisionCard 给用户
-                            if _sc_data:
-                                content = format_decision_card(_sc_data)
-                                store.add_message(session_id, "assistant", content)
-                                logger.info("[Agent] 流式DecisionCard: %s score=%s action=%s",
-                                            _sc_data.get("stock_code", ""),
-                                            _sc_data.get("score", ""),
-                                            _sc_data.get("action", ""))
-                        except Exception as e:
-                            logger.warning("[Agent] 流式DecisionCard/存库失败，保留原始输出: %s", e)
-
-                    # ── JSON 校验重试失败后标记输出 ──
+                    # JSON 校验重试失败后标记
                     if getattr(agent, '_json_output_fallback', False):
                         if isinstance(content, str):
                             content += "\n\n> 输出内容未做标准化处理"
                         elif isinstance(content, dict):
                             content["_warning"] = "输出内容未做标准化处理"
 
-                    # ── 后置学习闭环 ─────────────
-                    _eval_result = AgentResult(
-                        success=bool(content), content=content,
-                        tool_calls_log=_stream_tool_calls,
-                        total_steps=agent.step_number,
-                    )
-                    self._post_evaluate(
-                        _eval_result,
-                        meta.get("tool_chain", []),
-                        meta.get("intent_verb", ""),
-                        meta.get("intent_noun", ""),
-                        domain=meta.get("domain", ""),
-                        session_id=session_id,
+                    # 后置学习闭环 + 异步压缩上下文
+                    self._post_learn_and_compress(
+                        content, bool(content), _stream_tool_calls,
+                        agent.step_number, 0, meta, session_id, store, agent, agent,
                         chain_def=meta.get("chain_def"),
                     )
 
-                    # ── 保存根节点到 qd_traces（非 traced 策略的兜底写入）──
-                    if not meta.get("collector"):
-                        try:
-                            from app.agent.chain.schema import EvalNode, Layer, Status
-                            from app.agent.json_extractor import extract_decision
-                            from datetime import date as _date
-
-                            _sc = (context or {}).get("stock_code", "")
-                            _sn = (context or {}).get("stock_name", "")
-                            _dec = extract_decision(content) if content else None
-
-                            root = EvalNode(
-                                layer=Layer.CHAIN.value,
-                                name=f"{meta.get('intent_verb', '')}+{meta.get('intent_noun', '')}" or "agent",
-                                exec_date=_date.today(),
-                                stock_code=_sc,
-                                stock_name=_sn,
-                                score=_dec.get("score") if _dec else None,
-                                direction=_dec.get("direction", "") if _dec else "",
-                                action=_dec.get("action", "") if _dec else "",
-                                signal=_dec.get("signal", "") if _dec else "",
-                                confidence=_dec.get("confidence") if _dec else None,
-                                timeframe=_dec.get("timeframe", "") if _dec else "",
-                                analysis=str(content)[:2000] if content else "",
-                                input_params={"user_query": message},
-                                status=Status.OK.value if content else Status.FAILED.value,
-                            )
-                            store.save_tree(root)
-                            logger.info("[Agent] 流式根节点存库 stock=%s action=%s", _sc, root.action)
-                        except Exception as _e:
-                            logger.warning("[Agent] 流式根节点存库失败（不影响返回）: %s", _e)
-
-                    # 压缩上下文
-                    if content:
-                        try:
-                            from app.agent.context_compressor import compress_context
-                            import threading
-                            _stream_domain = meta.get("domain", "")
-                            def _compress(c=content, tc=_stream_tool_calls, sid=session_id, m=self.model, d=_stream_domain):
-                                try:
-                                    _, age = store.get_context_summary(sid, current_domain=d, with_age=True)
-                                    summary = compress_context(c, tc, model=m, domain=d, age_turns=age)
-                                except Exception as e:
-                                    logger.warning("[Compress] 压缩异常，降级截断: %s", e)
-                                    summary = c[:500]
-                                if summary:
-                                    store.save_context_summary(sid, summary, domain=d)
-                            threading.Thread(target=_compress, daemon=True).start()
-                        except Exception:
-                            pass
+                    # 非 traced 策略兜底根节点写入
+                    self._save_root_to_traces(content, bool(content), context, meta, message, store)
 
                     yield {
                         "type": "done",

@@ -197,6 +197,9 @@ def prescreen() -> Dict[str, Any]:
         limit_pct = get_limit_pct(code, name)
         if c.get("change_pct", 0) >= limit_pct - 0.5:
             continue
+        # 换手率 < 2% 排除（活跃度不够）
+        if c.get("turnover", 0) > 0 and c["turnover"] < 2.0:
+            continue
         filtered.append(c)
 
     return {
