@@ -1,20 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-Planner — LLM 规划器。
+Planner — LLM 单步决策器。
 
-职责：当无固定链路匹配时，用轻量 LLM 调用规划 Skill 执行方案。
+职责：每次只输出一步执行指令，执行完后根据结果决定下一步。
 
 流程：
-  1. 缓存查询已移至 _try_chain() Layer 0（tool_chains.py get_chain_plan）
-  2. 缓存未命中 → LLM 规划（只选 Skill，不执行）
-  3. 校验规划（步数、必选 Skill、去重）
-  4. 返回 ChainDef 供 _execute_plan() 执行
-  5. 执行成功 + 质量门通过后，由 evaluator._writeback_chain() 写入 tool_chains.json
+  1. 接收：用户消息 + 已执行步骤的结果
+  2. 判断：任务是否完成？
+  3. 如果未完成：输出下一步指令
+  4. 如果已完成：输出完成总结
 
 设计原则：
-  - LLM 只做选择题（从 15 个 Skill 中选 1~5 个），不做开放题
-  - 规划必须可回测（存 query + 选择 + reasoning）
-  - 失败必须告知用户
+  - 每次只输出一步，不规划多步
+  - 根据执行结果决定下一步
+  - 任务完成时输出 done=true
 """
 from __future__ import annotations
 
@@ -25,8 +24,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
-from app.agent.chain.chains import ChainDef, ChainStep, register_chain
-
 logger = logging.getLogger(__name__)
 
 
@@ -34,9 +31,8 @@ logger = logging.getLogger(__name__)
 # 配置
 # ═══════════════════════════════════════════════════════════════
 
-# 规划步数限制
-MIN_STEPS = 1
-MAX_STEPS = 5
+# 工具数量限制
+MAX_TOOLS_PER_STEP = 5
 
 
 
@@ -46,14 +42,17 @@ MAX_STEPS = 5
 # ═══════════════════════════════════════════════════════════════
 
 @dataclass
-class PlanResult:
-    """规划结果。"""
+class StepResult:
+    """单步执行结果。"""
     success: bool = False
-    chain_def: Optional[ChainDef] = None
-    reasoning: str = ""
-    degraded: bool = False          # 是否降级
-    degrade_reason: str = ""        # 降级原因
+    skill: Optional[str] = None
+    description: str = ""
+    tools: List[str] = field(default_factory=list)
+    rules: str = ""
+    done: bool = False
+    summary: str = ""
     stocks: List[str] = field(default_factory=list)
+    reasoning: str = ""
     elapsed_ms: float = 0.0
 
 
@@ -68,7 +67,7 @@ def _get_skill_catalog() -> str:
     if not metas:
         # fallback: 硬编码兜底（semantics 加载失败时）
         return "可用技能：market-screener(短线选股)"
-    lines = ["可用技能（从下列中选择 1~5 个，按执行顺序排列）：", ""]
+    lines = ["可用技能（每次选择 1 个最合适的）：", ""]
     # 按 priority 降序排列
     sorted_skills = sorted(metas.items(), key=lambda x: x[1].priority, reverse=True)
     for i, (name, meta) in enumerate(sorted_skills, 1):
@@ -92,24 +91,26 @@ def _ensure_skill_catalog() -> str:
 # ═══════════════════════════════════════════════════════════════
 
 class Planner:
-    """LLM 规划器。"""
+    """LLM 单步决策器。"""
 
     def __init__(self, call_llm: Callable[[str], str] = None):
         self._call_llm = call_llm
 
-    def plan(
+    def plan_next_step(
         self,
         query: str,
+        previous_results: List[Dict[str, Any]] = None,
         intent=None,
         stock_code: str = "",
         stock_name: str = "",
         context: Dict[str, Any] = None,
         context_summary: str = "",
-    ) -> PlanResult:
-        """为用户 query 生成执行规划。
+    ) -> StepResult:
+        """根据用户消息和已执行结果，决定下一步。
 
         Args:
             query: 用户原始消息
+            previous_results: 已执行步骤的结果列表
             intent: IntentResult 对象（含 domain/verb/noun/confidence）
             stock_code: 股票代码（可选）
             stock_name: 股票名称（可选）
@@ -117,76 +118,57 @@ class Planner:
             context_summary: 对话历史摘要（可选）
 
         Returns:
-            PlanResult
+            StepResult
         """
         t0 = time.time()
 
-        # 1. 缓存查询已移至 _try_chain() Layer 0（tool_chains.py）
-
-        # 2. LLM 规划
+        # LLM 决策
         if not self._call_llm:
             logger.warning("[Planner] LLM 不可用，返回失败")
-            return PlanResult(success=False, reasoning="LLM 不可用", elapsed_ms=(time.time() - t0) * 1000)
+            return StepResult(success=False, reasoning="LLM 不可用", elapsed_ms=(time.time() - t0) * 1000)
 
         try:
-            plan_data = self._llm_plan(query, intent, stock_code, stock_name, context_summary)
+            step_data = self._llm_decide_next_step(query, previous_results, intent, stock_code, stock_name, context_summary)
             # ── 调试日志：Planner 输出 JSON ──
-            print(f"[DEBUG] Planner 输出 JSON: {json.dumps(plan_data, ensure_ascii=False, indent=2)}")
+            print(f"[DEBUG] Planner 输出 JSON: {json.dumps(step_data, ensure_ascii=False, indent=2)}")
         except Exception as e:
-            logger.warning("[Planner] LLM 规划失败: %s", e)
-            return PlanResult(success=False, reasoning=f"LLM 规划异常: {e}", elapsed_ms=(time.time() - t0) * 1000)
+            logger.warning("[Planner] LLM 决策失败: %s", e)
+            return StepResult(success=False, reasoning=f"LLM 决策异常: {e}", elapsed_ms=(time.time() - t0) * 1000)
 
-        # 2.5 phase 合并：用户未指定步骤时强制合并为 1 个 phase
-        import re as _re_merge
-        _step_indicators = _re_merge.findall(r'第[一二三四五六七八九十\d]+步|先.{1,10}再|首先.{1,10}然后|步骤[\d一二三]', query)
-        if not _step_indicators and "phases" in plan_data and len(plan_data["phases"]) > 1:
-            all_tools = []
-            all_rules = []
-            for p in plan_data["phases"]:
-                all_tools.extend(p.get("tools", []))
-                if p.get("rules"):
-                    all_rules.append(p["rules"])
-            plan_data["phases"] = [{
-                "description": plan_data["phases"][0].get("description", "分析"),
-                "tools": list(dict.fromkeys(all_tools)),  # 去重保序
-                "rules": "; ".join(all_rules),
-            }]
-            print("[Planner] ⚠️ 用户未指定步骤，已将 %d 个 phase 合并为 1 个" % (len(all_tools)))
-
-        # 3. 校验
-        validated = self._validate(plan_data)
+        # 校验
+        validated = self._validate_step(step_data)
         if validated is not None:
-            logger.warning("[Planner] 规划校验失败: %s", validated)
-            return PlanResult(success=False, reasoning=f"规划校验失败: {validated}", elapsed_ms=(time.time() - t0) * 1000)
-
-        # 4. 构建 ChainDef
-        chain_def = self._build_chain_def(plan_data, stock_code)
-
-        # 5. 不在此处存储 — plan 须经 agent 执行 + 质量门验证后
-        #    由 evaluator._writeback_chain() 统一写入 tool_chains.json
+            logger.warning("[Planner] 步骤校验失败: %s", validated)
+            return StepResult(success=False, reasoning=f"步骤校验失败: {validated}", elapsed_ms=(time.time() - t0) * 1000)
 
         elapsed = (time.time() - t0) * 1000
-        logger.info("[Planner] 规划完成: %d 步, %.0fms", len(plan_data.get("phases", plan_data.get("steps", []))), elapsed)
+        logger.info("[Planner] 决策完成: done=%s, %.0fms", step_data.get("done", False), elapsed)
 
-        return PlanResult(
+        return StepResult(
             success=True,
-            chain_def=chain_def,
-            reasoning=plan_data.get("reasoning", ""),
-            stocks=plan_data.get("stocks", []),
+            skill=step_data.get("skill"),
+            description=step_data.get("description", ""),
+            tools=step_data.get("tools", []),
+            rules=step_data.get("rules", ""),
+            done=step_data.get("done", False),
+            summary=step_data.get("summary", ""),
+            stocks=step_data.get("stocks", []),
+            reasoning=step_data.get("reasoning", ""),
             elapsed_ms=elapsed,
         )
 
-    def _llm_plan(
+    def _llm_decide_next_step(
         self,
         query: str,
-        intent,
-        stock_code: str,
-        stock_name: str,
+        previous_results: List[Dict[str, Any]] = None,
+        intent=None,
+        stock_code: str = "",
+        stock_name: str = "",
         context_summary: str = "",
     ) -> Dict[str, Any]:
-        """调用 LLM 生成规划。返回原始 JSON dict。
+        """调用 LLM 决策下一步。返回原始 JSON dict。
 
-        注入完整上下文：人设 + 对话历史 + 规则 + 全量 skill + 全量 tool
+        注入完整上下文：人设 + 已执行结果 + 规则 + 全量 skill + 全量 tool
         """
         # 1. 人设
         persona_section = ""
@@ -206,7 +188,19 @@ class Planner:
         if intent and (intent.verb or intent.noun or intent.domain):
             intent_info = f"\n意图: verb={intent.verb or '-'}, noun={intent.noun or '-'}, domain={intent.domain or '-'}"
 
-        # 3. 全量 skill 摘要
+        # 3. 已执行结果
+        previous_results_section = ""
+        if previous_results:
+            previous_results_section = "\n## 已执行步骤结果\n"
+            for i, result in enumerate(previous_results, 1):
+                previous_results_section += f"\n### 步骤 {i}\n"
+                previous_results_section += f"- 技能: {result.get('skill', '无')}\n"
+                previous_results_section += f"- 描述: {result.get('description', '无')}\n"
+                previous_results_section += f"- 工具: {', '.join(result.get('tools', []))}\n"
+                previous_results_section += f"- 结果: {result.get('content', '无')[:500]}\n"
+
+
+        # 4. 全量 skill 摘要
         skills_section = ""
         try:
             from app.agent.semantics import get_skills_summary_xml
@@ -214,7 +208,7 @@ class Planner:
         except Exception:
             skills_section = _ensure_skill_catalog()  # fallback
 
-        # 4. 全量 tool 摘要
+        # 5. 全量 tool 摘要
         tools_section = ""
         try:
             from app.agent.semantics import get_tools_summary_xml
@@ -222,7 +216,7 @@ class Planner:
         except Exception:
             pass
 
-        # 5. 规则 + 输出格式
+        # 6. 规则 + 输出格式
         planner_section = ""
         try:
             from app.agent.semantics import get_planner_text
@@ -230,24 +224,18 @@ class Planner:
         except Exception:
             pass
         if not planner_section:
-            planner_section = (
-                "## 规则\n"
-                "- 从上述技能中选择 1~5 个，按执行顺序排列\n"
-                "- 不要选择与问题无关的技能\n"
-                "- 如果涉及股票但未提供代码，在 stocks 中列出需要的代码\n"
-                "- ⚠️ 如果用户明确指定了步骤（如'第一步'、'第二步'、'首先'、'然后'），必须严格按用户指定的步骤拆分为多个 phase\n"
-                "- 不要过度拆分：相关操作（如多个数据获取、多个指标计算）合并到一个 phase，简单股票分析通常 2~3 个 phase 足够\n"
-            )
+            planner_section = ""
 
-        # 6. 对话上下文
+        # 7. 对话上下文
         context_section = ""
         if context_summary:
             context_section = f"\n## 对话历史\n{context_summary}\n"
 
         prompt = (
             f"{persona_section}\n\n"
-            "你是量化分析规划器。根据用户问题，制定执行计划。\n\n"
+            "你是量化分析单步决策器。根据用户问题和已执行结果，决定下一步。\n\n"
             f"## 用户问题\n{query}{stock_info}{intent_info}\n\n"
+            f"{previous_results_section}\n"
             f"{context_section}\n"
             f"## 可用技能\n{skills_section}\n\n"
             f"## 可用工具\n{tools_section}\n\n"
@@ -259,6 +247,7 @@ class Planner:
         print(f"[Planner] 人设: {persona_section[:200]}")
         print(f"[Planner] 股票: {stock_info}")
         print(f"[Planner] 意图: {intent_info.strip()}")
+        print(f"[Planner] 已执行结果: {previous_results_section[:500]}")
         print(f"[Planner] 对话历史: {context_section[:500]}")
         print(f"[Planner] 可用技能:\n{skills_section[:2000]}")
         print(f"[Planner] 可用工具:\n{tools_section[:2000]}")
@@ -267,145 +256,82 @@ class Planner:
         print("[Planner] ═══════════════════")
 
         raw = self._call_llm(prompt)
-        result = self._parse_plan_json(raw)
+        result = self._parse_step_json(raw)
         return result
 
-    def _parse_plan_json(self, raw: str) -> Dict[str, Any]:
-        """解析 LLM 输出的规划 JSON。容错处理各种 LLM 输出格式。"""
+    def _parse_step_json(self, raw: str) -> Dict[str, Any]:
+        """解析 LLM 输出的步骤 JSON。容错处理各种 LLM 输出格式。"""
         import re
 
         # 1. 清理 think 标签
         cleaned = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
 
-        # 2. 去掉 <code>...</code> 包装（必须在 final_answer 之前）
+        # 2. 去掉 <code>...</code> 包装
         cleaned = re.sub(r'</?code>', '', cleaned).strip()
 
-        # 3. 去掉 final_answer() 包装（qwen-coder 常见格式）
+        # 3. 去掉 final_answer() 包装
         m = re.search(r'final_answer\s*\(\s*(.+)\s*\)', cleaned, re.DOTALL)
         if m:
             cleaned = m.group(1).strip()
 
-        # 3. 去掉 markdown 代码块
+        # 4. 去掉 markdown 代码块
         cleaned = re.sub(r'```json\s*', '', cleaned).strip()
         cleaned = re.sub(r'```\s*$', '', cleaned).strip()
 
-        # 4. 尝试直接解析
+        # 5. 尝试直接解析
         try:
             data = json.loads(cleaned)
-            if isinstance(data, dict) and ("phases" in data or "steps" in data):
+            if isinstance(data, dict) and "done" in data:
                 return data
         except json.JSONDecodeError:
             pass
 
-        # 5. 提取最外层 JSON 对象（含 phases 或 steps）
-        match = re.search(r'\{[^{}]*"(?:phases|steps)"\s*:\s*\[.*?\][^{}]*\}', cleaned, re.DOTALL)
+        # 6. 提取最外层 JSON 对象（含 done）
+        match = re.search(r'\{[^{}]*"done"\s*:\s*(?:true|false)[^{}]*\}', cleaned, re.DOTALL)
         if match:
             try:
                 return json.loads(match.group())
             except json.JSONDecodeError:
                 pass
 
-        # 6. 提取任意最外层 {...}
+        # 7. 提取任意最外层 {...}
         brace_match = re.search(r'\{.*\}', cleaned, re.DOTALL)
         if brace_match:
             try:
                 data = json.loads(brace_match.group())
-                if isinstance(data, dict) and ("phases" in data or "steps" in data):
+                if isinstance(data, dict) and "done" in data:
                     return data
             except json.JSONDecodeError:
                 pass
 
-        raise ValueError(f"无法解析规划 JSON: {raw[:300]}")
+        raise ValueError(f"无法解析步骤 JSON: {raw[:300]}")
 
-    def _validate(self, plan_data: Dict[str, Any]) -> Optional[str]:
-        """校验规划。返回 None 表示通过，返回字符串表示失败原因。"""
-        # 兼容 phases 和 steps 两个字段名
-        phases = plan_data.get("phases", plan_data.get("steps", []))
-        if not phases:
-            return "phases 为空"
+    def _validate_step(self, step_data: Dict[str, Any]) -> Optional[str]:
+        """校验步骤。返回 None 表示通过，返回字符串表示失败原因。"""
+        # 检查必要字段
+        if "done" not in step_data:
+            return "缺少 done 字段"
 
-        if len(phases) < MIN_STEPS:
-            return f"步数不足（{len(phases)} < {MIN_STEPS}）"
+        # 如果任务未完成，检查必要字段
+        if not step_data.get("done"):
+            if not step_data.get("skill") and not step_data.get("tools"):
+                return "任务未完成时必须提供 skill 或 tools"
+            if not step_data.get("rules"):
+                return "任务未完成时必须提供 rules"
 
-        if len(phases) > MAX_STEPS:
+        # 如果任务完成，检查必要字段
+        if step_data.get("done"):
+            if not step_data.get("summary"):
+                return "任务完成时必须提供 summary"
+
+        # 工具数量限制
+        tools = step_data.get("tools", [])
+        if len(tools) > MAX_TOOLS_PER_STEP:
             # 截断而非失败
-            phases = phases[:MAX_STEPS]
-            logger.info("[Planner] 步数超限，截断到 %d 步", MAX_STEPS)
+            step_data["tools"] = tools[:MAX_TOOLS_PER_STEP]
+            logger.info("[Planner] 工具数量超限，截断到 %d 个", MAX_TOOLS_PER_STEP)
 
-        # 去重（保留描述不同的步骤，即使 skill 相同）
-        seen = set()
-        deduped = []
-        for step in phases:
-            agent = step.get("agent", step.get("skill", ""))
-            tools = step.get("tools", [])
-            desc = step.get("description", "")
-            # 用 skill+description 作为去重 key，纯工具 phase 用 tools[0]+description
-            dedup_key_agent = agent if agent else (tools[0] if tools else "")
-            dedup_key = f"{dedup_key_agent}:{desc}" if desc else dedup_key_agent
-            if (agent or tools) and dedup_key not in seen:
-                seen.add(dedup_key)
-                deduped.append(step)
-        phases = deduped
-
-        # 统一存为 phases
-        plan_data["phases"] = phases
-        plan_data.pop("steps", None)
-
-        # 新架构：从 agent/skills/*/SKILL.md 校验 Skill 是否存在
-        # 注：未知的 skill 不再移除，因为可能是 tool 而不是 skill
-        from app.agent.semantics import get_all_skill_metas
-        known_skills = set(get_all_skill_metas().keys())
-        if known_skills:
-            selected = {s.get("agent", s.get("skill", "")) for s in phases}
-            unknown = selected - known_skills - {""}
-            if unknown:
-                logger.info("[Planner] 发现未知 Skill（可能是 tool）: %s (已知 Skill: %s)", unknown, known_skills)
-                # 不再移除未知 skill，让 agent.py 处理（作为 tool 直接调用）
         return None  # 通过
-
-    def _build_chain_def(self, plan_data: Dict[str, Any], stock_code: str) -> ChainDef:
-        """从规划数据构建 ChainDef。"""
-        phases = plan_data.get("phases", plan_data.get("steps", []))
-        steps = []
-        for i, step_data in enumerate(phases, 1):
-            # 兼容 "skill" 和 "agent" 两个字段名
-            agent = step_data.get("skill", "") or step_data.get("agent", "")
-            tools = step_data.get("tools", [])
-            # 纯工具 phase: agent 为空时用 tools[0] 作为 name
-            step_name = agent or (tools[0] if tools else f"phase_{i}")
-            steps.append(ChainStep(
-                name=step_name,
-                agent=agent,
-                order=i,
-                description=step_data.get("description", ""),
-                required=(i == 1),
-                rules=step_data.get("rules", ""),
-                tools=step_data.get("tools", []),
-            ))
-
-        # 收集 Planner 上下文（关键信息传递给各 Skill Agent）
-        planner_context = plan_data.get("context", {})
-        # 兼容旧链路 "规则" 字段
-        if "规则" in plan_data and "rules" not in planner_context:
-            planner_context["rules"] = plan_data["规则"]
-
-        chain_id = f"planned+{hashlib.md5(json.dumps(plan_data, sort_keys=True).encode()).hexdigest()[:8]}"
-
-        # progressive: phase 间是否递进关系（后一步依赖前一步结论）
-        progressive = plan_data.get("progressive", True)
-
-        chain_def = ChainDef(
-            chain_id=chain_id,
-            name="LLM 规划链路",
-            description=plan_data.get("reasoning", ""),
-            steps=steps,
-            trigger_verbs=[],
-            trigger_nouns=[],
-            context=planner_context,
-            progressive=progressive,
-        )
-        register_chain(chain_def)  # 动态链路注册到全局表
-        return chain_def
 
 
 

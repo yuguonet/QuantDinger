@@ -1288,14 +1288,290 @@ class _AgentExecutor:
 
         return step_context, phase_agent
 
+    def _execute_step_loop(self, agent, message, context, meta, store, session_id, planner, intent, stock_code, stock_name):
+        """单步执行+主LLM决策循环。
+
+        断点机制：
+          1. 成功：记录断点 → agent执行 → LLM确认 → 记录新断点
+          2. 失败：记录断点 → agent执行失败 → 回退重试
+          3. 重试失败：代码告诉LLM已失败多次 → LLM决定跳过或退出
+          4. LLM不决定：代码强行退出
+        """
+        # ── 调试日志：step_loop 入口 ───────────────────────────
+        print(
+            f"[DEBUG] _execute_step_loop() 入口 | "
+            f"agent_type={type(agent).__name__} "
+            f"stock_code={stock_code} stock_name={stock_name}"
+        )
+
+        # 获取 skill 元数据（工具列表、描述等）
+        skill_metas = {}
+        try:
+            from app.agent.semantics import get_all_skill_metas
+            skill_metas = get_all_skill_metas()
+        except Exception:
+            pass
+
+        # 保存原始 agent 的配置，用于重建
+        _agent_config = {
+            "user_id": meta.get("user_id", 1),
+            "model": meta.get("model"),
+            "provider": meta.get("provider"),
+            "max_steps": self.max_steps,
+            "language": (context or {}).get("report_language", "zh"),
+            "domain": meta.get("domain", ""),
+            "domain_instructions": meta.get("domain_instructions", ""),
+            "intent_context": meta.get("intent_context", ""),
+            "stock_code": stock_code,
+            "collector": meta.get("collector"),
+            "strategy": meta.get("strategy", "direct"),
+        }
+
+        all_content = []
+        all_tool_calls = []
+        all_charts = []
+        total_steps = 0
+        total_tokens = 0
+        last_result = None
+        previous_results = []
+        max_loop_steps = 10  # 防止无限循环
+        max_retry_per_step = 1  # 每步最大重试次数（允许失败1次）
+        current_fail_count = 0  # 当前步骤失败次数
+
+        for loop_step in range(max_loop_steps):
+            # 1. 调用 Planner 决策下一步
+            logger.info("[StepLoop] 决策下一步 (loop_step=%d, fail_count=%d)", loop_step, current_fail_count)
+            step_result = planner.plan_next_step(
+                query=message,
+                previous_results=previous_results,
+                intent=intent,
+                stock_code=stock_code,
+                stock_name=stock_name,
+                context_summary="",
+            )
+
+            if not step_result.success:
+                logger.warning("[StepLoop] Planner 决策失败: %s", step_result.reasoning)
+                break
+
+            # 2. 如果任务完成，返回结果
+            if step_result.done:
+                logger.info("[StepLoop] 任务完成: %s", step_result.summary[:100])
+                all_content.append(step_result.summary)
+                break
+
+            # 2.5 安全机制：根据上一步的执行状态决定是否强制结束
+            if previous_results and loop_step > 0:
+                last_result = previous_results[-1]
+                last_success = last_result.get("success")
+                last_exceeded = last_result.get("max_steps_exceeded", False)
+                last_steps_used = last_result.get("steps_used", 0)
+
+                # 情况1：agent 正常完成（调用了final_answer），但Planner仍然输出done=false
+                # 这说明Planner可能没有正确识别任务完成，强制结束
+                if last_success and not last_exceeded:
+                    logger.info("[StepLoop] 上一步执行成功（agent已调用final_answer），但Planner未结束，强制结束")
+                    all_content.append(last_result.get("content", ""))
+                    break
+
+                # 情况2：agent 超出 max_steps，未完成任务
+                if last_exceeded:
+                    current_fail_count += 1
+                    logger.warning("[StepLoop] agent 超出 max_steps (%d/%d)，失败次数: %d/%d",
+                                   last_steps_used, self.max_steps, current_fail_count, max_retry_per_step + 1)
+
+                    # 检查是否超过最大失败次数（允许失败1次，所以最大失败次数是2）
+                    if current_fail_count > max_retry_per_step:
+                        # 超过最大失败次数，关键数据丢失，强行退出
+                        logger.warning("[StepLoop] 已失败 %d 次，关键数据丢失，强行退出", current_fail_count)
+                        break
+                    else:
+                        # 还可以重试，继续循环
+                        logger.info("[StepLoop] 重试当前步骤 (%d/%d)", current_fail_count, max_retry_per_step + 1)
+                        continue
+
+            # 3. 如果任务未完成，执行这一步
+            logger.info("[StepLoop] 执行步骤: skill=%s, tools=%s", step_result.skill, step_result.tools)
+
+            # 构建步骤上下文
+            step_context = self._build_step_context(
+                step_result=step_result,
+                stock_code=stock_code,
+                stock_name=stock_name,
+                previous_results=previous_results,
+                message=message,
+            )
+
+            # 重建 agent（只加载当前步骤需要的工具）
+            step_agent = self._build_step_agent(
+                step_result=step_result,
+                _agent_config=_agent_config,
+                message=message,
+            )
+
+            # 执行当前步骤
+            step_success, step_content, step_tool_calls, step_steps, step_tokens, step_charts, step_result_obj = \
+                self._execute_phase(step_agent, step_context, self.max_steps, context, meta, store, session_id)
+
+            # 4. 收集执行结果
+            all_content.append(step_content or "")
+            all_tool_calls.extend(step_tool_calls or [])
+            all_charts.extend(step_charts or [])
+            total_steps += step_steps
+            total_tokens += step_tokens
+            last_result = step_result_obj
+
+            # 判断 agent 结束原因
+            agent_completed_normally = step_success  # agent 调用了 final_answer
+            agent_exceeded_max_steps = False
+            if step_result_obj and hasattr(step_result_obj, 'state'):
+                agent_exceeded_max_steps = (step_result_obj.state != "success" and step_steps >= self.max_steps)
+
+            # 添加到 previous_results，供下一步决策使用
+            previous_results.append({
+                "skill": step_result.skill,
+                "description": step_result.description,
+                "tools": step_result.tools,
+                "rules": step_result.rules,
+                "content": step_content or "",
+                "success": step_success,
+                "max_steps_exceeded": agent_exceeded_max_steps,
+                "steps_used": step_steps,
+                "fail_count": current_fail_count,
+            })
+
+            # 5. 处理执行结果
+            if step_success:
+                # 成功：进度+1，清空错误计数器
+                current_fail_count = 0
+                logger.info("[StepLoop] 步骤执行成功，进度+1，清空错误计数器")
+            elif agent_exceeded_max_steps:
+                # 失败：超出 max_steps，已在上面处理
+                pass
+            else:
+                # 失败：其他原因
+                current_fail_count += 1
+                logger.warning("[StepLoop] 步骤执行失败，失败次数: %d/%d", current_fail_count, max_retry_per_step + 1)
+
+        # 合并结果
+        content = "\n\n".join(c for c in all_content if c)
+        success = bool(content)
+
+        # 后置学习闭环 + 异步压缩上下文
+        self._post_learn_and_compress(
+            content, success, all_tool_calls,
+            total_steps, total_tokens, meta, session_id, store, agent, last_result,
+            chain_def=meta.get("chain_def"), all_phases_completed=True,
+        )
+
+        # 非 traced 策略兜底根节点写入
+        self._save_root_to_traces(content, success, context, meta, message, store)
+
+        return success, content, all_tool_calls, total_steps, total_tokens, all_charts, last_result, True
+
+    def _build_step_context(self, step_result, stock_code, stock_name, previous_results, message):
+        """构建当前步骤的上下文。"""
+        parts = [
+            f"[步骤] {step_result.description}",
+            f"标的: {stock_name or '未知'}（{stock_code}）" if stock_code else "",
+        ]
+
+        # 注入前序结果
+        if previous_results:
+            parts.append("\n前序步骤结果:")
+            for i, prev in enumerate(previous_results, 1):
+                parts.append(f"  步骤{i}: {prev.get('description', '无')} - {prev.get('content', '无')[:200]}")
+
+        # 注入规则
+        if step_result.rules:
+            parts.append(f"\n规则: {step_result.rules}")
+
+        # 注入 skill 指令
+        if step_result.skill:
+            parts.append(f"\n请用 read_skill 加载 {step_result.skill} 的指令并执行。")
+
+        return "\n".join(p for p in parts if p)
+
+    def _build_step_agent(self, step_result, _agent_config, message):
+        """构建当前步骤的 agent。"""
+        # 确定工具列表
+        phase_tools = []
+        is_tool_mode = True
+
+        if step_result.skill:
+            # skill 模式
+            try:
+                from app.agent.semantics import get_all_skill_metas
+                skill_metas = get_all_skill_metas()
+                meta_skill = skill_metas.get(step_result.skill)
+                if meta_skill and meta_skill.tools:
+                    phase_tools = meta_skill.tools + ["get_skill_catalog", "read_skill"]
+                    is_tool_mode = False
+            except Exception:
+                pass
+        elif step_result.tools:
+            # 工具模式
+            phase_tools = step_result.tools
+
+        # 重建 agent
+        step_agent = get_smolagent(
+            user_id=_agent_config["user_id"],
+            model=_agent_config["model"],
+            provider=_agent_config["provider"],
+            max_steps=_agent_config["max_steps"],
+            user_message=message,
+            language=_agent_config["language"],
+            domain=_agent_config["domain"],
+            domain_instructions=_agent_config["domain_instructions"],
+            intent_context=_agent_config["intent_context"],
+            stock_code=_agent_config["stock_code"],
+            tool_categories=phase_tools,
+            collector=_agent_config["collector"],
+            strategy=_agent_config["strategy"],
+            is_tool_mode=is_tool_mode,
+        )
+        logger.info("[StepLoop] 重建 agent，加载 %d 个工具: %s", len(phase_tools), phase_tools)
+
+        return step_agent
+
     def _execute_plan(self, agent, chain_def, message, context, meta, store, session_id):
-        """per-phase 执行：逐 phase 调用 agent.run()。每个 phase 重建 agent，只加载当前 phase 需要的工具。"""
+        """执行计划。支持两种模式：
+          1. 传统模式：逐 phase 执行（旧架构）
+          2. 单步决策模式：Planner 每次只决定一步，执行后根据结果决定下一步（新架构）
+        """
         # ── 调试日志：plan 入口 ───────────────────────────────
         print(
-            f"[DEBUG] _execute_plan() 入口 | phases={len(chain_def.steps)} "
+            f"[DEBUG] _execute_plan() 入口 | chain_id={chain_def.chain_id} "
+            f"phases={len(chain_def.steps)} "
             f"progressive={getattr(chain_def, 'progressive', True)} "
             f"agent_type={type(agent).__name__}"
         )
+
+        # 新架构：单步决策模式
+        if chain_def.chain_id == "step_loop_mode":
+            logger.info("[Plan] 使用单步决策模式")
+            stock_code = (context or {}).get("stock_code", "")
+            stock_name = (context or {}).get("stock_name", "")
+            intent = meta.get("intent")
+
+            # 创建 Planner
+            from app.agent.planner import Planner
+            smol_model = build_model(self.model, self.provider)
+
+            def planner_llm(prompt: str) -> str:
+                messages = [{"role": "user", "content": prompt}]
+                response = smol_model(messages)
+                return response.content if hasattr(response, "content") else str(response)
+
+            planner = Planner(call_llm=planner_llm)
+
+            # 调用单步决策循环
+            return self._execute_step_loop(
+                agent, message, context, meta, store, session_id,
+                planner, intent, stock_code, stock_name,
+            )
+
+        # 传统模式：逐 phase 执行
         # 获取 skill 元数据（工具列表、描述等）
         skill_metas = {}
         try:
@@ -1402,10 +1678,39 @@ class _AgentExecutor:
         """per-phase 流式执行：逐 phase 调用 agent.run(stream=True)，每步只看到 1 步内容。每个 phase 重建 agent。"""
         # ── 调试日志：plan_stream 入口 ───────────────────────
         print(
-            f"[DEBUG] _execute_plan_stream() 入口 | phases={len(chain_def.steps)} "
+            f"[DEBUG] _execute_plan_stream() 入口 | chain_id={chain_def.chain_id} "
+            f"phases={len(chain_def.steps)} "
             f"progressive={getattr(chain_def, 'progressive', True)} "
             f"agent_type={type(agent).__name__}"
         )
+
+        # 新架构：单步决策模式
+        if chain_def.chain_id == "step_loop_mode":
+            logger.info("[Plan-Stream] 使用单步决策模式")
+            stock_code = (context or {}).get("stock_code", "")
+            stock_name = (context or {}).get("stock_name", "")
+            intent = meta.get("intent")
+
+            # 创建 Planner
+            from app.agent.planner import Planner
+            smol_model = build_model(self.model, self.provider)
+
+            def planner_llm(prompt: str) -> str:
+                messages = [{"role": "user", "content": prompt}]
+                response = smol_model(messages)
+                return response.content if hasattr(response, "content") else str(response)
+
+            planner = Planner(call_llm=planner_llm)
+
+            # 调用单步决策循环（流式版本）
+            yield from self._execute_step_loop_stream(
+                agent, message, context, meta, store, session_id,
+                planner, intent, stock_code, stock_name,
+                _stream_tool_calls, _stream_tool_call_counter, _pending_tool_ids,
+            )
+            return
+
+        # 传统模式：逐 phase 执行
         skill_metas = {}
         try:
             from app.agent.semantics import get_all_skill_metas
@@ -1526,6 +1831,220 @@ class _AgentExecutor:
             content, bool(content), _stream_tool_calls,
             agent.step_number, 0, meta, session_id, store, agent, agent,
             chain_def=meta.get("chain_def"), all_phases_completed=all_phases_completed,
+        )
+
+        # 非 traced 策略兜底根节点写入
+        self._save_root_to_traces(content, bool(content), context, meta, message, store)
+
+        yield {
+            "type": "done",
+            "success": bool(content), "content": content,
+            "error": None if content else "No final answer",
+            "total_steps": agent.step_number,
+            "model": str(getattr(agent.model, "model_id", "")),
+            "session_id": session_id,
+        }
+
+    def _execute_step_loop_stream(self, agent, message, context, meta, store, session_id,
+                                  planner, intent, stock_code, stock_name,
+                                  _stream_tool_calls, _stream_tool_call_counter, _pending_tool_ids):
+        """单步决策循环（流式版本）。
+
+        流程：
+          1. 调用 Planner 决策下一步
+          2. 如果任务完成（done=true），返回结果
+          3. 如果任务未完成（done=false），执行这一步
+          4. 收集执行结果，添加到 previous_results
+          5. 循环，直到任务完成或达到最大步数
+        """
+        # ── 调试日志：step_loop_stream 入口 ───────────────────
+        print(
+            f"[DEBUG] _execute_step_loop_stream() 入口 | "
+            f"agent_type={type(agent).__name__} "
+            f"stock_code={stock_code} stock_name={stock_name}"
+        )
+
+        # 获取 skill 元数据（工具列表、描述等）
+        skill_metas = {}
+        try:
+            from app.agent.semantics import get_all_skill_metas
+            skill_metas = get_all_skill_metas()
+        except Exception:
+            pass
+
+        # 保存原始 agent 的配置，用于重建
+        _agent_config = {
+            "user_id": meta.get("user_id", 1),
+            "model": meta.get("model"),
+            "provider": meta.get("provider"),
+            "max_steps": self.max_steps,
+            "language": (context or {}).get("report_language", "zh"),
+            "domain": meta.get("domain", ""),
+            "domain_instructions": meta.get("domain_instructions", ""),
+            "intent_context": meta.get("intent_context", ""),
+            "stock_code": stock_code,
+            "collector": meta.get("collector"),
+            "strategy": meta.get("strategy", "direct"),
+        }
+
+        all_content = []
+        previous_results = []
+        max_loop_steps = 10  # 防止无限循环
+        max_retry_per_step = 1  # 每步最大重试次数（允许失败1次）
+        current_fail_count = 0  # 当前步骤失败次数
+        from smolagents import FinalAnswerStep
+
+        for loop_step in range(max_loop_steps):
+            # 1. 调用 Planner 决策下一步
+            logger.info("[StepLoop-Stream] 决策下一步 (loop_step=%d, fail_count=%d)", loop_step, current_fail_count)
+            yield {"type": "tool_info", "tool": "", "message": f"── 决策第 {loop_step + 1} 步 ──"}
+
+            step_result = planner.plan_next_step(
+                query=message,
+                previous_results=previous_results,
+                intent=intent,
+                stock_code=stock_code,
+                stock_name=stock_name,
+                context_summary="",
+            )
+
+            if not step_result.success:
+                logger.warning("[StepLoop-Stream] Planner 决策失败: %s", step_result.reasoning)
+                yield {"type": "tool_info", "tool": "", "message": f"❌ 决策失败: {step_result.reasoning}"}
+                break
+
+            # 2. 如果任务完成，返回结果
+            if step_result.done:
+                logger.info("[StepLoop-Stream] 任务完成: %s", step_result.summary[:100])
+                all_content.append(step_result.summary)
+                yield {"type": "tool_info", "tool": "", "message": f"✅ 任务完成"}
+                break
+
+            # 2.5 安全机制：根据上一步的执行状态决定是否强制结束
+            if previous_results and loop_step > 0:
+                last_result = previous_results[-1]
+                last_success = last_result.get("success")
+                last_exceeded = last_result.get("max_steps_exceeded", False)
+                last_steps_used = last_result.get("steps_used", 0)
+
+                # 情况1：agent 正常完成（调用了final_answer），但Planner仍然输出done=false
+                # 这说明Planner可能没有正确识别任务完成，强制结束
+                if last_success and not last_exceeded:
+                    logger.info("[StepLoop-Stream] 上一步执行成功（agent已调用final_answer），但Planner未结束，强制结束")
+                    all_content.append(last_result.get("content", ""))
+                    yield {"type": "tool_info", "tool": "", "message": f"✅ 任务完成（agent已返回结果）"}
+                    break
+
+                # 情况2：agent 超出 max_steps，未完成任务
+                if last_exceeded:
+                    current_fail_count += 1
+                    logger.warning("[StepLoop-Stream] agent 超出 max_steps (%d/%d)，失败次数: %d/%d",
+                                   last_steps_used, self.max_steps, current_fail_count, max_retry_per_step + 1)
+                    yield {"type": "tool_info", "tool": "", "message": f"⚠️ agent 超出 max_steps ({last_steps_used}/{self.max_steps})，失败次数: {current_fail_count}/{max_retry_per_step + 1}"}
+
+                    # 检查是否超过最大失败次数（允许失败1次，所以最大失败次数是2）
+                    if current_fail_count > max_retry_per_step:
+                        # 超过最大失败次数，关键数据丢失，强行退出
+                        logger.warning("[StepLoop-Stream] 已失败 %d 次，关键数据丢失，强行退出", current_fail_count)
+                        yield {"type": "tool_info", "tool": "", "message": f"❌ 已失败 {current_fail_count} 次，关键数据丢失，强行退出"}
+                        break
+                    else:
+                        # 还可以重试，继续循环
+                        logger.info("[StepLoop-Stream] 重试当前步骤 (%d/%d)", current_fail_count, max_retry_per_step + 1)
+                        continue
+
+            # 3. 如果任务未完成，执行这一步
+            logger.info("[StepLoop-Stream] 执行步骤: skill=%s, tools=%s", step_result.skill, step_result.tools)
+            yield {"type": "tool_info", "tool": "", "message": f"── 执行: {step_result.description} ──"}
+
+            # 构建步骤上下文
+            step_context = self._build_step_context(
+                step_result=step_result,
+                stock_code=stock_code,
+                stock_name=stock_name,
+                previous_results=previous_results,
+                message=message,
+            )
+
+            # 重建 agent（只加载当前步骤需要的工具）
+            step_agent = self._build_step_agent(
+                step_result=step_result,
+                _agent_config=_agent_config,
+                message=message,
+            )
+
+            # 流式执行当前步骤
+            content = ""
+            for s in step_agent.run(step_context, max_steps=self.max_steps, stream=True):
+                events = _step_to_events(s)
+                for ev in events:
+                    yield ev
+                    if ev.get("type") == "tool_start":
+                        _stream_tool_calls.append({"tool": ev.get("tool", ""), "success": True, "_id": _stream_tool_call_counter})
+                        _pending_tool_ids[ev.get("tool", "")] = _stream_tool_call_counter
+                        _stream_tool_call_counter += 1
+                    elif ev.get("type") == "tool_done":
+                        tool_name = ev.get("tool", "")
+                        pending_id = _pending_tool_ids.pop(tool_name, None)
+                        if pending_id is not None:
+                            for tc in _stream_tool_calls:
+                                if tc.get("_id") == pending_id:
+                                    tc["success"] = ev.get("success", True)
+                                    break
+                if isinstance(s, FinalAnswerStep):
+                    raw = s.output
+                    if isinstance(raw, dict):
+                        content = json.dumps(raw, ensure_ascii=False)
+                    else:
+                        content = str(raw) if raw else ""
+
+            # 4. 收集执行结果
+            # 判断 agent 结束原因
+            agent_completed_normally = bool(content)  # agent 调用了 final_answer
+            agent_exceeded_max_steps = False
+            steps_used = step_agent.step_number if hasattr(step_agent, 'step_number') else 0
+            # 检查是否超出 max_steps
+            if not content and steps_used >= self.max_steps:
+                agent_exceeded_max_steps = True
+
+            all_content.append(content or "")
+            # 返回结构：success + max_steps_exceeded
+            previous_results.append({
+                "skill": step_result.skill,
+                "description": step_result.description,
+                "tools": step_result.tools,
+                "rules": step_result.rules,
+                "content": content or "",
+                "success": bool(content),
+                "max_steps_exceeded": agent_exceeded_max_steps,
+                "steps_used": steps_used,
+                "fail_count": current_fail_count,
+            })
+
+            # 5. 处理执行结果
+            if bool(content):
+                # 成功：进度+1，清空错误计数器
+                current_fail_count = 0
+                logger.info("[StepLoop-Stream] 步骤执行成功，进度+1，清空错误计数器")
+                yield {"type": "tool_info", "tool": "", "message": f"✅ 步骤执行成功，进度+1"}
+            elif agent_exceeded_max_steps:
+                # 失败：超出 max_steps，已在上面处理
+                pass
+            else:
+                # 失败：其他原因
+                current_fail_count += 1
+                logger.warning("[StepLoop-Stream] 步骤执行失败，失败次数: %d/%d", current_fail_count, max_retry_per_step + 1)
+                yield {"type": "tool_info", "tool": "", "message": f"⚠️ 步骤执行失败，失败次数: {current_fail_count}/{max_retry_per_step + 1}"}
+
+        # 合并结果
+        content = "\n\n".join(c for c in all_content if c)
+        store.add_message(session_id, "assistant", content if isinstance(content, str) else str(content))
+
+        # 后置学习闭环 + 异步压缩上下文
+        self._post_learn_and_compress(
+            content, bool(content), _stream_tool_calls,
+            agent.step_number, 0, meta, session_id, store, agent, agent,
+            chain_def=meta.get("chain_def"), all_phases_completed=True,
         )
 
         # 非 traced 策略兜底根节点写入
@@ -1918,11 +2437,7 @@ class _AgentExecutor:
     def _try_chain(self, intent, message, session_id, context, user_id):
         """获取执行计划。无匹配时返回 None，让 agent 自由执行。
 
-        流程：
-          1. tool_chains.json 匹配（学习闭环积累的已知链路，仅新格式 plan）→ 返回 ChainDef
-          2. 未命中 → Planner LLM 必须跑一遍 →
-             ├─ 成功 → 返回 ChainDef
-             └─ 失败 → 返回 None + 日志警告
+        新架构：不再一次性规划所有步骤，而是返回一个标记，让执行层调用 _execute_step_loop()。
         """
         # ── stock_code 已由 _prepare_intent() 步骤3 提取到 context ──
         stock_code = (context or {}).get("stock_code", "")
@@ -1965,50 +2480,24 @@ class _AgentExecutor:
         except Exception as e:
             logger.warning("[Chain] tool_chains.json 查询异常: %s", e)
 
-        # Layer 1: Planner 规划（tool_chains.json 未命中）
+        # Layer 1: 新架构 - 返回一个标记，让执行层调用 _execute_step_loop()
         if not chain_def:
-            logger.info("[Chain] tool_chains.json 未命中 (verb=%s noun=%s)，Planner 规划中...", intent.verb, intent.noun)
-            try:
-                from app.agent.planner import Planner
-                smol_model = build_model(self.model, self.provider)
+            logger.info("[Chain] tool_chains.json 未命中 (verb=%s noun=%s)，使用单步决策模式", intent.verb, intent.noun)
+            # 返回一个特殊的 chain_def，标记使用单步决策模式
+            from app.agent.chain.chains import ChainDef, ChainStep, register_chain
+            chain_def = ChainDef(
+                chain_id="step_loop_mode",
+                name="单步决策模式",
+                description="使用 Planner 单步决策，逐步执行",
+                steps=[],  # 空步骤，由 _execute_step_loop() 动态生成
+                trigger_verbs=[],
+                trigger_nouns=[],
+                context={},
+                progressive=True,
+            )
+            register_chain(chain_def)
 
-                # ── LLM #2 入口日志 ──
-                print("[Planner] ═══ _try_chain → Planner 入口 ═══")
-                print(f"[Planner] message: {message[:500]}")
-                print(f"[Planner] stock_code={stock_code} stock_name={stock_name}")
-                print(f"[Planner] verb={intent.verb} noun={intent.noun} domain={intent.domain}")
-                print(f"[Planner] context keys: {list((context or {}).keys())}")
-                print(f"[Planner] model={self.model} provider={self.provider}")
-                print("[Planner] ══════════════════════════════")
-
-                def planner_llm(prompt: str) -> str:
-                    messages = [{"role": "user", "content": prompt}]
-                    response = smol_model(messages)
-                    return response.content if hasattr(response, "content") else str(response)
-
-                planner = Planner(call_llm=planner_llm)
-                plan_result = planner.plan(
-                    query=message,
-                    intent=intent,
-                    stock_code=stock_code,
-                    stock_name=stock_name,
-                )
-
-                if plan_result.success and plan_result.chain_def:
-                    chain_def = plan_result.chain_def
-                    logger.info("[Planner] 规划成功: %d 步, reasoning=%s",
-                                len(chain_def.steps), plan_result.reasoning[:80])
-                else:
-                    logger.warning("[Planner] 规划失败")
-            except Exception as e:
-                logger.warning("[Planner] 规划异常: %s", e)
-
-        # ── 无匹配 → 返回 None，让 agent 直接处理 ──
-        if not chain_def:
-            logger.info("[Chain] 无链路匹配 (verb=%s noun=%s)，交给 agent", intent.verb, intent.noun)
-            return None
-
-        logger.info("[Chain] 链路 %s 匹配（%d 步）", chain_def.chain_id, len(chain_def.steps))
+        logger.info("[Chain] 链路 %s 匹配", chain_def.chain_id)
         return chain_def
 
     def chat_stream(self, message, session_id, context=None,
