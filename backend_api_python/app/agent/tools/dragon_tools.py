@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 def get_dragon_tiger(codes: str = "", date: str = "", days: int = 30) -> Dict[str, Any]:
-    """获取龙虎榜数据，支持多股批量获取。
+    """龙虎榜：返回上榜股票的买卖金额、上榜原因（涨幅/跌幅/换手异常等）、日期。
 
     codes 为空时返回全市场龙虎榜；非空时返回该股票的历史龙虎榜记录。
 
@@ -66,7 +66,7 @@ def get_dragon_tiger(codes: str = "", date: str = "", days: int = 30) -> Dict[st
 
 
 def get_hot_rank(top_n: int = 30) -> Dict[str, Any]:
-    """获取实时股票热榜/人气榜。
+    """人气榜：返回当日市场关注度最高的股票排名及热度分数。
 
     Args:
         top_n: 返回前N名，默认30，最大100
@@ -78,7 +78,7 @@ def get_hot_rank(top_n: int = 30) -> Dict[str, Any]:
 
 
 def get_limit_pool(date: str = "", pool_type: str = "zt", min_continuous_days: int = 0) -> Dict[str, Any]:
-    """获取涨跌停/炸板股票池。
+    """涨跌停池：返回当日涨停/跌停/炸板股票列表，含封板时间、连板天数。
 
     Args:
         date: 交易日期 YYYY-MM-DD，默认今天

@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 def get_market_indices() -> Dict[str, Any]:
-    """获取主要指数实时行情（上证/深证/创业板/科创/北证）。"""
+    """指数行情：返回上证/深证/创业板/科创/北证五大指数的价格、涨跌幅、成交量。"""
     from app.market_cn.index import get_index_realtime as _get
     try:
         data = _get()
@@ -25,7 +25,7 @@ def get_market_indices() -> Dict[str, Any]:
 
 
 def get_market_overview() -> Dict[str, Any]:
-    """获取全市场涨跌统计快照：涨跌家数、北向资金、情绪指数、主力资金流。"""
+    """市场概览：返回全市场涨跌家数、涨停跌停数、北向资金净买入、市场情绪指数、主力资金流向。"""
     result = {}
 
     # 指数行情 → 涨跌家数

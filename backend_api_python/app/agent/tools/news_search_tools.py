@@ -103,7 +103,7 @@ def _build_result(items: List[Dict[str, Any]], label: str) -> Dict[str, Any]:
 
 
 def search_stock_intel(codes: str, name: str = "") -> Dict[str, Any]:
-    """搜索个股情报（新闻、公告、研报），支持多股批量获取。
+    """个股情报搜索：返回指定股票的新闻、公告、研报列表及摘要。
 
     Args:
         codes: 多股用逗号分隔"
@@ -130,7 +130,7 @@ def search_stock_intel(codes: str, name: str = "") -> Dict[str, Any]:
 
 
 def search_sector_intel(market: str = "CNStock") -> Dict[str, Any]:
-    """搜索板块情报。
+    """板块情报搜索：返回指定板块的相关新闻和政策动态。
 
     Args:
         market: 板块名称或关键词
@@ -140,7 +140,7 @@ def search_sector_intel(market: str = "CNStock") -> Dict[str, Any]:
 
 
 def search_policy_intel(market: str = "CNStock") -> Dict[str, Any]:
-    """搜索政策情报。
+    """政策情报搜索：返回最新财经政策、监管动态。
 
     Args:
         market: 市场或政策关键词
@@ -150,7 +150,7 @@ def search_policy_intel(market: str = "CNStock") -> Dict[str, Any]:
 
 
 def search_comprehensive_intel(codes: str, name: str = "") -> Dict[str, Any]:
-    """综合情报搜索（个股+板块+政策），支持多股批量获取。
+    """综合情报：同时搜索个股新闻+板块动态+政策面，返回合并结果。
 
     Args:
         codes: 多股用逗号分隔"

@@ -259,7 +259,7 @@ def _algo_analyze(
 
 
 def technical_analysis(stock_code: str, stock_name: str = "") -> dict:
-    """技术面综合分析。五维加权评分（趋势40%+动量25%+量价20%+形态10%+筹码5%），含流通盘修正。
+    """技术面综合评分：内部调用 analyze_trend+get_indicator_snapshot+get_volume_analysis+analyze_pattern+get_chip_distribution，加权输出 0-100 分。需要单股深度分析时用此工具，不要同时调 analyze_trend。
 
     Args:
         stock_code: 股票代码（6位数字），如 "600519"

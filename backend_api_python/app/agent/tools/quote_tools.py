@@ -108,7 +108,7 @@ def _tencent_quote_raw(codes: list) -> dict:
 # ══════════════════════════════════════════════════════════════
 
 def get_order_book(codes: str) -> Dict[str, Any]:
-    """获取五档盘口+实时行情，支持多股批量获取。
+    """五档盘口：返回买卖各5档价格和挂单量、涨跌幅、换手率、PE、市值等。
 
     Args:
         codes: 多股用逗号分隔"
@@ -146,7 +146,7 @@ def get_order_book(codes: str) -> Dict[str, Any]:
 # ══════════════════════════════════════════════════════════════
 
 def get_index_etf_quote(codes: str) -> Dict[str, Any]:
-    """获取指数/ETF实时行情（腾讯财经）。
+    """指数/ETF行情：返回价格、涨跌幅、成交量，支持上证/深证/创业板/沪深300及对应ETF。
 
     Args:
         codes: 逗号分隔的代码，如 "000001,000300,399006,510050"
@@ -188,7 +188,7 @@ def get_index_etf_quote(codes: str) -> Dict[str, Any]:
 # ══════════════════════════════════════════════════════════════
 
 def batch_valuation_compare(stock_codes: str) -> Dict[str, Any]:
-    """批量估值对比（腾讯财经）。
+    """估值对比：返回多只股票的PE/PB/市值/营收并排对比表。
 
     Args:
         stock_codes: 逗号分隔的股票代码，如 "600519,000858,688017"

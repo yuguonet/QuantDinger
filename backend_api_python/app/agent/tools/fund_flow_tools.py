@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 def get_fund_flow(stock_codes: str = "") -> Dict[str, Any]:
-    """获取个股资金流向。支持单只或批量（逗号分隔），单次最多20只。
+    """个股资金流向：返回主力/散户/净流入金额、资金流向趋势。
 
     Args:
         stock_codes: 股票代码，如 "000001" 或 "000001,600519"
@@ -36,7 +36,7 @@ def get_fund_flow(stock_codes: str = "") -> Dict[str, Any]:
 
 
 def get_sector_fund_flow(indicator: str = "今日") -> Dict[str, Any]:
-    """获取行业板块资金流向。
+    """行业资金流向：返回各行业板块主力资金净流入排名。
 
     Args:
         indicator: 时间维度，可选 "今日" "5日" "10日"
@@ -51,7 +51,7 @@ def get_sector_fund_flow(indicator: str = "今日") -> Dict[str, Any]:
 
 
 def get_concept_fund_flow(indicator: str = "今日") -> Dict[str, Any]:
-    """获取概念板块资金流向。
+    """概念资金流向：返回各概念板块主力资金净流入排名。
 
     Args:
         indicator: 时间维度，可选 "今日" "5日" "10日"
@@ -66,7 +66,7 @@ def get_concept_fund_flow(indicator: str = "今日") -> Dict[str, Any]:
 
 
 def get_fund_flow_daily(codes: str, days: int = 120) -> Dict[str, Any]:
-    """获取个股历史资金流向（日线级别），支持多股批量获取。
+    """个股历史资金流向：返回近N天每日主力/散户净流入金额。
 
     Args:
         codes: 多股用逗号分隔"
@@ -97,7 +97,7 @@ def get_fund_flow_daily(codes: str, days: int = 120) -> Dict[str, Any]:
 
 
 def get_market_fund_flow() -> Dict[str, Any]:
-    """获取大盘实时资金流向（主力/散户）。"""
+    """大盘资金流向：返回全市场主力/散户实时净流入金额。"""
     from app.market_cn.index import get_market_fund_flow_realtime as _get
     try:
         return _get()
@@ -107,7 +107,7 @@ def get_market_fund_flow() -> Dict[str, Any]:
 
 
 def get_northbound_flow() -> Dict[str, Any]:
-    """获取北向资金实时流向。"""
+    """北向资金：返回沪股通/深股通当日实时净买入金额。"""
     from app.market_cn.index import get_northbound_realtime as _get
     try:
         return _get()

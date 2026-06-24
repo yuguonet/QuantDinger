@@ -5,13 +5,13 @@ from __future__ import annotations
 from typing import Any, Dict
 
 
-def algo_analyze(stock_code, stock_name, tool_results, call_tool_fn=None):
-    """策略回测分析 — 评估用户策略的历史表现。
+def _algo_analyze(stock_code: str, stock_name: str, tool_results: dict, call_tool_fn=None):
+    """对用户策略跑历史回测，返回评分(0-100)、方向、胜率、盈亏比、最大回撤。无策略时返回 hold/50。
 
     Args:
         stock_code: 股票代码
         stock_name: 股票名称
-        tool_results: 工具调用结果字典
+        tool_results: 工具调用结果字典（需含 list_strategies）
         call_tool_fn: 工具调用函数（可选）
     """
     factors = []
@@ -61,7 +61,7 @@ def algo_analyze(stock_code, stock_name, tool_results, call_tool_fn=None):
     }
 
 def backtest_analysis(stock_code: str, stock_name: str = "") -> dict:
-    """薄壳入口：调用工具 + 算法分析，返回 dict。
+    """一站式回测：自动列出用户策略 → 逐个跑回测 → 返回最佳策略评分。等价于 list_strategies + run_backtest。
 
     Args:
         stock_code: 股票代码，如 "600066"
@@ -76,7 +76,7 @@ def backtest_analysis(stock_code: str, stock_name: str = "") -> dict:
         if name == "run_backtest": return run_backtest(**kwargs)
         raise ValueError(f"Unknown tool: {name}")
 
-    return algo_analyze(stock_code, stock_name, results, call_tool_fn=call_tool_fn)
+    return _algo_analyze(stock_code, stock_name, results, call_tool_fn=call_tool_fn)
 
 
     main()

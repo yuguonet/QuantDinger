@@ -6,7 +6,7 @@ logger = logging.getLogger(__name__)
 
 
 def bull_bear_research(stock_code: str, stock_name: str = "") -> Dict[str, Any]:
-    """执行多空研究分析。
+    """多空研究：对单只股票做技术面+筹码+情报综合分析，返回多空评分和方向判断。
 
     Args:
         stock_code: 股票代码，如 "600066"
@@ -178,7 +178,7 @@ def bull_bear_research(stock_code: str, stock_name: str = "") -> Dict[str, Any]:
 # ── 内联自 analysis_tools.py ──
 
 def analyze_trend(codes: str) -> Dict[str, Any]:
-    """获取股票的综合技术趋势分析，包括均线排列、MACD、RSI、BOLL和KDJ等指标，支持多股批量获取。
+    """技术趋势（内部复用）：同 analysis_tools.analyze_trend，仅供 bull_bear_research 内部调用，外部请用 analyze_trend。
 
     Args:
         codes: 多股用逗号分隔"
@@ -360,7 +360,7 @@ def analyze_trend(codes: str) -> Dict[str, Any]:
     return {"count": len(results), "data": results}
 
 def get_volume_analysis(codes: str) -> Dict[str, Any]:
-    """量能分析：量比、换手率、成交量趋势，支持多股批量获取。
+    """量能分析：量比、换手率、成交量趋势。
 
     Args:
         codes: 多股用逗号分隔"
@@ -446,7 +446,7 @@ def get_volume_analysis(codes: str) -> Dict[str, Any]:
     return {"count": len(results), "data": results}
 
 def analyze_pattern(codes: str) -> Dict[str, Any]:
-    """识别K线形态（增强版），支持多股批量获取：锤子线、十字星、吞没、早晨/晚星、三连阳/阴、长上影/下影、缺口等。
+    """识别K线形态（增强版）：锤子线、十字星、吞没、早晨/晚星、三连阳/阴、长上影/下影、缺口等。
 
     Args:
         codes: 多股用逗号分隔"
@@ -589,7 +589,7 @@ def analyze_pattern(codes: str) -> Dict[str, Any]:
     return {"count": len(results), "data": results}
 
 def get_chip_distribution(codes: str, lookback_days: int = 120) -> Dict[str, Any]:
-    """筹码分布分析（衰减成本分布模型），支持多股批量获取。
+    """筹码分布分析（衰减成本分布模型）。
 
     从日K线计算筹码分布，不依赖数据源原生接口。
     算法：按日K线的 high/low 区间分配成交量到价格档位，
@@ -638,7 +638,7 @@ def get_chip_distribution(codes: str, lookback_days: int = 120) -> Dict[str, Any
     return {"count": len(results), "data": results}
 
 def get_indicator_snapshot(codes: str) -> Dict[str, Any]:
-    """单次获取多个技术指标快照（MACD、RSI、BOLL、KDJ等），支持多股批量获取。
+    """单次获取多个技术指标快照（MACD、RSI、BOLL、KDJ等）。
 
     Args:
         codes: 多股用逗号分隔"
@@ -782,7 +782,7 @@ def _build_result(items: List[Dict[str, Any]], label: str) -> Dict[str, Any]:
     }
 
 def search_stock_intel(codes: str, name: str = "") -> Dict[str, Any]:
-    """搜索个股情报（新闻、公告、研报），支持多股批量获取。
+    """个股情报搜索：返回指定股票的新闻、公告、研报列表及摘要。
 
     Args:
         codes: 多股用逗号分隔"
@@ -808,7 +808,7 @@ def search_stock_intel(codes: str, name: str = "") -> Dict[str, Any]:
     return {"count": len(results), "data": results}
 
 def search_policy_intel(market: str = "CNStock") -> Dict[str, Any]:
-    """搜索政策情报。
+    """政策情报搜索：返回最新财经政策、监管动态。
 
     Args:
         market: 市场或政策关键词

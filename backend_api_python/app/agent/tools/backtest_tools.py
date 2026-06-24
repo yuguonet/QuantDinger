@@ -37,7 +37,7 @@ def run_backtest(
     timeframe: str = "1D",
     user_id: int = 1,
 ) -> Dict[str, Any]:
-    """对指定策略在指定股票上跑历史回测，返回绩效指标。
+    """策略回测：返回指定策略在指定股票上的胜率、盈亏比、最大回撤、交易次数等绩效指标。
 
     Args:
         strategy_id: 策略 ID
@@ -116,7 +116,7 @@ def get_backtest_history(
     user_id: int = 1,
     limit: int = 10,
 ) -> Dict[str, Any]:
-    """查询策略的历史回测记录。
+    """回测历史：返回指定策略过往回测的时间、股票、绩效指标记录。
 
     Args:
         strategy_id: 策略 ID

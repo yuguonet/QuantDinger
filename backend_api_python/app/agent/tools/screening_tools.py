@@ -21,7 +21,7 @@ def review_stocks_with_indicator(
     user_id: int = 1,
     params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """用指标策略批量审核股票，检查是否出现买入信号。
+    """批量审核：对多只股票运行同一指标策略，返回出现买入信号的股票列表。
 
     对每只股票拉取 K 线数据，沙箱执行指标代码，提取 buy/sell 信号。
 
@@ -162,7 +162,7 @@ def review_stocks_with_indicator(
     }
 
 def list_user_selection_strategies(user_id: int = 1) -> Dict[str, Any]:
-    """列出用户收藏的选股策略。
+    """收藏策略：返回用户收藏的选股策略列表及筛选条件。
 
     Args:
         user_id: 用户 ID

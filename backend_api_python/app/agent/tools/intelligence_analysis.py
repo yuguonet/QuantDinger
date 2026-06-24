@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 
 def intelligence_analysis(stock_code: str, stock_name: str = "") -> Dict[str, Any]:
-    """执行个股情报+政策面分析。
+    """个股情报+政策面综合分析：搜索新闻公告研报 + 政策动态，返回情报评分和利空/利多信号。
 
     Args:
         stock_code: 股票代码，如 "600066"
@@ -335,7 +335,7 @@ def _build_result(items: List[Dict[str, Any]], label: str) -> Dict[str, Any]:
     }
 
 def search_stock_intel(codes: str, name: str = "") -> Dict[str, Any]:
-    """搜索个股情报（新闻、公告、研报），支持多股批量获取。
+    """个股情报搜索：返回指定股票的新闻、公告、研报列表及摘要。
 
     Args:
         codes: 多股用逗号分隔"
@@ -361,7 +361,7 @@ def search_stock_intel(codes: str, name: str = "") -> Dict[str, Any]:
     return {"count": len(results), "data": results}
 
 def search_policy_intel(market: str = "CNStock") -> Dict[str, Any]:
-    """搜索政策情报。
+    """政策情报搜索：返回最新财经政策、监管动态。
 
     Args:
         market: 市场或政策关键词

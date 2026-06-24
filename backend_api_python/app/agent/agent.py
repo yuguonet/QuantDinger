@@ -842,21 +842,40 @@ class _AgentExecutor:
                 logger.warning("[Intent] 分析失败，走默认流程: %s\n%s", e, traceback.format_exc())
                 return result
 
-        # ── 3. 提取 stock_code（仅 traced 策略、消息中未带时）───
-        if result.strategy == "traced" and not (context and context.get("stock_code")):
-            import re as _re_stock
-            _m = _re_stock.search(r'\b(\d{6})\b', message)
-            if _m:
-                logger.info("[Prepare] 从消息提取股票代码: %s", _m.group(1))
-                result.intent_meta["stock_code"] = _m.group(1)
-            else:
+        # ── 3. 提取 stock_code（金融领域才提取，否则跳过）───
+        if result.domain in ("finance", "trading"):
+            stock_code = (context or {}).get("stock_code", "")
+            stock_name = (context or {}).get("stock_name", "")
+            if not stock_code:
+                import re as _re_stock
+                _m = _re_stock.search(r'(?<!\d)(\d{6})(?!\d)', message)
+                if _m:
+                    stock_code = _m.group(1)
+                    # 从 DB 取股票名称
+                    try:
+                        from app.utils.basicinfo_db import get_stock_basic_db
+                        _stock = get_stock_basic_db().get_stock(stock_code)
+                        if _stock:
+                            stock_name = _stock.get("name", "")
+                    except Exception:
+                        pass
+            if not stock_code:
                 from app.agent.text_utils import extract_stock_from_message
                 _code, _name = extract_stock_from_message(message)
                 if _code:
-                    result.intent_meta["stock_code"] = _code
+                    stock_code = _code
                     if _name:
-                        result.intent_meta["stock_name"] = _name
-                    logger.info("[Prepare] 中文名 → 代码 %s", _code)
+                        stock_name = _name
+                        logger.info("[Prepare] 中文名 → 代码 %s", stock_code)
+            if stock_code:
+                result.intent_meta["stock_code"] = stock_code
+                if stock_name:
+                    result.intent_meta["stock_name"] = stock_name
+                if session_id:
+                    try:
+                        store.update_session(session_id, stock_code=stock_code)
+                    except Exception:
+                        pass
 
         # ── 话题切换：非个股意图时清除遗留 stock_code ────────
         _is_stock_intent = result.noun in ("stock", "chart") or result.intent in (
@@ -939,7 +958,7 @@ class _AgentExecutor:
         chain_def = None
         try:
             chain_def = self._try_chain(
-                result.verb, result.noun, message,
+                result, message,
                 session_id, context, user_id,
             )
         except Exception as e:
@@ -1896,41 +1915,18 @@ class _AgentExecutor:
             logger.warning("[Replan] 重规划异常: %s", e)
             return None
 
-    def _try_chain(self, verb, noun, message, session_id, context, user_id):
+    def _try_chain(self, intent, message, session_id, context, user_id):
         """获取执行计划。无匹配时返回 None，让 agent 自由执行。
 
         流程：
-          1. tool_chains.json 匹配（学习闭环积累的已知链路）→ 返回 ChainDef
+          1. tool_chains.json 匹配（学习闭环积累的已知链路，仅新格式 plan）→ 返回 ChainDef
           2. 未命中 → Planner LLM 必须跑一遍 →
              ├─ 成功 → 返回 ChainDef
              └─ 失败 → 返回 None + 日志警告
         """
-        # ── 提取股票代码（固定链路和规划都需要）──
-        stock_code = ""
-        stock_name = ""
-        if context:
-            stock_code = context.get("stock_code", "")
-            stock_name = context.get("stock_name", "")
-        if not stock_code:
-            import re
-            match = re.search(r'\b(\d{6})\b', message)
-            if match:
-                stock_code = match.group(1)
-        if not stock_code:
-            from app.agent.text_utils import extract_stock_from_message
-            _code, _name = extract_stock_from_message(message)
-            if _code:
-                stock_code = _code
-            if _name:
-                stock_name = _name
-                logger.info("[Chain] 中文名 → 代码 %s", stock_code)
-
-        # 存 stock_code 到 session，供负面反馈检测使用
-        if stock_code and session_id:
-            try:
-                store.update_session(session_id, stock_code=stock_code)
-            except Exception:
-                pass
+        # ── stock_code 已由 _prepare_intent() 步骤3 提取到 context ──
+        stock_code = (context or {}).get("stock_code", "")
+        stock_name = (context or {}).get("stock_name", "")
 
         # ── 查链路 ──
         chain_def = None
@@ -1941,7 +1937,7 @@ class _AgentExecutor:
 
             # 优先读完整 plan（新格式）
             from app.agent.chain.tool_chains import get_chain_plan
-            cached_plan = get_chain_plan(verb, noun)
+            cached_plan = get_chain_plan(intent.verb, intent.noun)
             if cached_plan and cached_plan.get("phases"):
                 phases = cached_plan["phases"]
                 steps = []
@@ -1956,42 +1952,34 @@ class _AgentExecutor:
                         rules=p.get("rules", ""),
                         tools=p.get("tools", []),
                     ))
-                chain_id = f"learned+{verb}+{noun}"
+                chain_id = f"learned+{intent.verb}+{intent.noun}"
                 chain_def = ChainDef(
-                    chain_id=chain_id, name=f"学习链路: {verb}+{noun}",
+                    chain_id=chain_id, name=f"学习链路: {intent.verb}+{intent.noun}",
                     description=cached_plan.get("reasoning", ""),
-                    steps=steps, trigger_verbs=[verb], trigger_nouns=[noun],
+                    steps=steps, trigger_verbs=[intent.verb], trigger_nouns=[intent.noun],
                     context=cached_plan.get("context", {}),
                     progressive=cached_plan.get("progressive", True),
                 )
                 register_chain(chain_def)
                 logger.info("[Chain] tool_chains.json plan 命中: %s → %d phases", chain_id, len(steps))
-            else:
-                # 降级：旧格式 steps（工具列表）
-                from app.agent.chain.tool_chains import get_tool_chain
-                steps_data = get_tool_chain(verb, noun)
-                if steps_data:
-                    steps = [ChainStep(name=s["tool"], agent=s["tool"], order=i+1,
-                                       description=s.get("desc", ""), required=(i == 0),
-                                       rules=s.get("rules", ""))
-                             for i, s in enumerate(steps_data)]
-                    chain_id = f"learned+{verb}+{noun}"
-                    chain_def = ChainDef(
-                        chain_id=chain_id, name=f"学习链路: {verb}+{noun}",
-                        description=f"从 tool_chains.json 加载（{len(steps)} 步）",
-                        steps=steps, trigger_verbs=[verb], trigger_nouns=[noun],
-                    )
-                    register_chain(chain_def)
-                    logger.info("[Chain] tool_chains.json 旧格式命中: %s → %d 步", chain_id, len(steps))
         except Exception as e:
             logger.warning("[Chain] tool_chains.json 查询异常: %s", e)
 
         # Layer 1: Planner 规划（tool_chains.json 未命中）
         if not chain_def:
-            logger.info("[Chain] tool_chains.json 未命中 (verb=%s noun=%s)，Planner 规划中...", verb, noun)
+            logger.info("[Chain] tool_chains.json 未命中 (verb=%s noun=%s)，Planner 规划中...", intent.verb, intent.noun)
             try:
                 from app.agent.planner import Planner
                 smol_model = build_model(self.model, self.provider)
+
+                # ── LLM #2 入口日志 ──
+                print("[Planner] ═══ _try_chain → Planner 入口 ═══")
+                print(f"[Planner] message: {message[:500]}")
+                print(f"[Planner] stock_code={stock_code} stock_name={stock_name}")
+                print(f"[Planner] verb={intent.verb} noun={intent.noun} domain={intent.domain}")
+                print(f"[Planner] context keys: {list((context or {}).keys())}")
+                print(f"[Planner] model={self.model} provider={self.provider}")
+                print("[Planner] ══════════════════════════════")
 
                 def planner_llm(prompt: str) -> str:
                     messages = [{"role": "user", "content": prompt}]
@@ -2001,20 +1989,15 @@ class _AgentExecutor:
                 planner = Planner(call_llm=planner_llm)
                 plan_result = planner.plan(
                     query=message,
+                    intent=intent,
                     stock_code=stock_code,
                     stock_name=stock_name,
-                    verb=verb,
-                    noun=noun,
                 )
 
                 if plan_result.success and plan_result.chain_def:
                     chain_def = plan_result.chain_def
-
-                    if plan_result.from_cache:
-                        logger.info("[Planner] 缓存命中: %s", chain_def.chain_id)
-                    else:
-                        logger.info("[Planner] 规划成功: %d 步, reasoning=%s",
-                                    len(chain_def.steps), plan_result.reasoning[:80])
+                    logger.info("[Planner] 规划成功: %d 步, reasoning=%s",
+                                len(chain_def.steps), plan_result.reasoning[:80])
                 else:
                     logger.warning("[Planner] 规划失败")
             except Exception as e:
@@ -2022,18 +2005,8 @@ class _AgentExecutor:
 
         # ── 无匹配 → 返回 None，让 agent 直接处理 ──
         if not chain_def:
-            logger.info("[Chain] 无链路匹配 (verb=%s noun=%s)，交给 agent", verb, noun)
+            logger.info("[Chain] 无链路匹配 (verb=%s noun=%s)，交给 agent", intent.verb, intent.noun)
             return None
-
-        # 非个股链路不需要股票代码
-        # Planner 生成的链路信任 Planner 判断（Planner 输出含 stocks 字段）
-        if not stock_code:
-            # tool_chains.json 学习的链路：仅 scan+market 允许无股票代码
-            # Planner 生成的链路：信任 Planner 的 stocks 字段
-            if chain_def.chain_id.startswith("learned+") and chain_def.chain_id != "learned+scan+market":
-                logger.info("[Chain] 学习链路 %s 需要股票代码但未找到，跳过", chain_def.chain_id)
-                return None
-            # Planner 生成的链路或 scan+market → 继续执行
 
         logger.info("[Chain] 链路 %s 匹配（%d 步）", chain_def.chain_id, len(chain_def.steps))
         return chain_def

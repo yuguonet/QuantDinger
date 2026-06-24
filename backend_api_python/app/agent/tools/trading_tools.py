@@ -26,7 +26,7 @@ except ImportError as _e:
 # ── Tool functions ────────────────────────────────────────────
 
 def list_strategies(user_id: int = 1) -> Dict[str, Any]:
-    """列出用户的所有交易策略（含运行状态）。
+    """策略列表：返回用户所有策略的ID、名称、类型、运行状态、市场。
 
     返回策略 ID、名称、类型、状态、交易对、时间框架等信息。
 
@@ -59,7 +59,7 @@ def list_strategies(user_id: int = 1) -> Dict[str, Any]:
         return {"strategies": [], "count": 0, "error": str(e)}
 
 def get_strategy_detail(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
-    """获取策略的详细配置信息。
+    """策略详情：返回指定策略的参数配置、持仓、触发条件。
 
     包含策略类型、交易配置、指标配置、运行状态等。
 
@@ -88,7 +88,7 @@ def get_strategy_detail(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
         return {"success": False, "error": str(e)}
 
 def start_strategy(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
-    """启动一个交易策略（开始实盘运行）。
+    """启动策略：将指定策略从停止状态切换为运行状态。
 
     策略将按照配置的指标信号自动执行买卖操作。
 
@@ -137,7 +137,7 @@ def start_strategy(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
         return {"success": False, "error": f"启动失败: {e}"}
 
 def stop_strategy(strategy_id: int, user_id: int = 1) -> Dict[str, Any]:
-    """停止一个正在运行的交易策略。
+    """停止策略：将指定策略从运行状态切换为停止状态。
 
     Args:
         strategy_id: 策略 ID
@@ -182,7 +182,7 @@ def get_strategy_trades(
     user_id: int = 1,
     limit: int = 20,
 ) -> Dict[str, Any]:
-    """获取策略的最近交易记录。
+    """策略交易记录：返回指定策略最近的买入/卖出记录。
 
     Args:
         strategy_id: 策略 ID

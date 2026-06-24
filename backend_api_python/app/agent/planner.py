@@ -51,7 +51,6 @@ class PlanResult:
     success: bool = False
     chain_def: Optional[ChainDef] = None
     reasoning: str = ""
-    from_cache: bool = False
     degraded: bool = False          # 是否降级
     degrade_reason: str = ""        # 降级原因
     stocks: List[str] = field(default_factory=list)
@@ -101,10 +100,9 @@ class Planner:
     def plan(
         self,
         query: str,
+        intent=None,
         stock_code: str = "",
         stock_name: str = "",
-        verb: str = "",
-        noun: str = "",
         context: Dict[str, Any] = None,
         context_summary: str = "",
     ) -> PlanResult:
@@ -112,10 +110,9 @@ class Planner:
 
         Args:
             query: 用户原始消息
+            intent: IntentResult 对象（含 domain/verb/noun/confidence）
             stock_code: 股票代码（可选）
             stock_name: 股票名称（可选）
-            verb: 意图动词（可选）
-            noun: 意图对象（可选）
             context: 额外上下文
             context_summary: 对话历史摘要（可选）
 
@@ -132,12 +129,29 @@ class Planner:
             return PlanResult(success=False, reasoning="LLM 不可用", elapsed_ms=(time.time() - t0) * 1000)
 
         try:
-            plan_data = self._llm_plan(query, stock_code, stock_name, verb, noun, context_summary)
+            plan_data = self._llm_plan(query, intent, stock_code, stock_name, context_summary)
             # ── 调试日志：Planner 输出 JSON ──
             print(f"[DEBUG] Planner 输出 JSON: {json.dumps(plan_data, ensure_ascii=False, indent=2)}")
         except Exception as e:
             logger.warning("[Planner] LLM 规划失败: %s", e)
             return PlanResult(success=False, reasoning=f"LLM 规划异常: {e}", elapsed_ms=(time.time() - t0) * 1000)
+
+        # 2.5 phase 合并：用户未指定步骤时强制合并为 1 个 phase
+        import re as _re_merge
+        _step_indicators = _re_merge.findall(r'第[一二三四五六七八九十\d]+步|先.{1,10}再|首先.{1,10}然后|步骤[\d一二三]', query)
+        if not _step_indicators and "phases" in plan_data and len(plan_data["phases"]) > 1:
+            all_tools = []
+            all_rules = []
+            for p in plan_data["phases"]:
+                all_tools.extend(p.get("tools", []))
+                if p.get("rules"):
+                    all_rules.append(p["rules"])
+            plan_data["phases"] = [{
+                "description": plan_data["phases"][0].get("description", "分析"),
+                "tools": list(dict.fromkeys(all_tools)),  # 去重保序
+                "rules": "; ".join(all_rules),
+            }]
+            print("[Planner] ⚠️ 用户未指定步骤，已将 %d 个 phase 合并为 1 个" % (len(all_tools)))
 
         # 3. 校验
         validated = self._validate(plan_data)
@@ -165,10 +179,9 @@ class Planner:
     def _llm_plan(
         self,
         query: str,
+        intent,
         stock_code: str,
         stock_name: str,
-        verb: str,
-        noun: str,
         context_summary: str = "",
     ) -> Dict[str, Any]:
         """调用 LLM 生成规划。返回原始 JSON dict。
@@ -190,8 +203,8 @@ class Planner:
         if stock_code:
             stock_info = f"\n股票: {stock_name or '未知'}（{stock_code}）"
         intent_info = ""
-        if verb or noun:
-            intent_info = f"\n意图: verb={verb or '-'}, noun={noun or '-'}"
+        if intent and (intent.verb or intent.noun or intent.domain):
+            intent_info = f"\n意图: verb={intent.verb or '-'}, noun={intent.noun or '-'}, domain={intent.domain or '-'}"
 
         # 3. 全量 skill 摘要
         skills_section = ""
@@ -240,6 +253,18 @@ class Planner:
             f"## 可用工具\n{tools_section}\n\n"
             f"{planner_section}\n"
         )
+
+        # ── LLM #2 输入日志 ──
+        print("[Planner] ═══ LLM #2 输入 ═══")
+        print(f"[Planner] 人设: {persona_section[:200]}")
+        print(f"[Planner] 股票: {stock_info}")
+        print(f"[Planner] 意图: {intent_info.strip()}")
+        print(f"[Planner] 对话历史: {context_section[:500]}")
+        print(f"[Planner] 可用技能:\n{skills_section[:2000]}")
+        print(f"[Planner] 可用工具:\n{tools_section[:2000]}")
+        print(f"[Planner] 规则:\n{planner_section[:1000]}")
+        print(f"[Planner] prompt 总长度: {len(prompt)} 字符")
+        print("[Planner] ═══════════════════")
 
         raw = self._call_llm(prompt)
         result = self._parse_plan_json(raw)

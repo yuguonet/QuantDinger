@@ -24,10 +24,10 @@ _last_call: float = 0.0
 def em_datacenter(report_name: str, columns: str = "ALL",
                   filter_str: str = "", page_size: int = 50,
                   sort_columns: str = "", sort_types: str = "-1") -> list:
-    """东财数据中心统一查询（带限流）。
+    """东财数据中心 API 封装，按 report_name 查询结构化报表（如限售解禁、高管增减持、龙虎榜明细等）。内部限流 1s/次。
 
     Args:
-        report_name: 报表名，如 RPT_LIFT_STAGE
+        report_name: 报表名（RPT_LIFT_STAGE=解禁, RPT_EXECUTIVE_HOLDCHANGE=高管增减持 等）
         columns: 列名，ALL 或逗号分隔
         filter_str: 过滤条件
         page_size: 每页条数

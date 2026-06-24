@@ -1,6 +1,6 @@
 # Agent 可追责架构设计
 
-> 最后更新: 2026-06-22
+> 最后更新: 2026-06-24
 > 状态: 实施中
 > 仓库: https://github.com/yuguonet/QuantDinger
 
@@ -44,12 +44,12 @@
 │  Intent Analyzer (LLM #1)                                │
 │    → domain / verb / noun / strategy / stock_code        │
 │                                                          │
-│  _try_chain()                                            │
-│    → tool_chains.json 匹配 → 返回 ChainDef              │
+│  _try_chain(verb, noun, message, session_id, context, user_id)
+│    → tool_chains.json 匹配（仅新格式 plan）→ ChainDef   │
 │    → 未命中 → Planner (LLM #2) 必须跑一遍              │
 │       ├─ 成功 → 返回 ChainDef                           │
 │       └─ 失败 → 返回 None                               │
-│    → 注入 Agent 上下文（enriched）                       │
+│    → chain_def 通过 meta 传递给 _execute_plan()         │
 │                                                          │
 │  smolagents CodeAgent                                    │
 │  ┌────────────────────────────────────────────────────┐  │
@@ -86,14 +86,15 @@
 │  3. 提取 stock_code
 │  4. 创建 TraceCollector
 │  5. 上下文拼接（历史摘要 + 领域上下文）
-│  6. _try_chain() 获取执行计划                              │
-│     ├─ 有 domain/verb/noun → tool_chains.json 匹配 → 返回 ChainDef              │
-│     ├─ 未命中 → Planner (LLM #2) 必须跑一遍              │
-│     │   ├─ 成功 → 返回 ChainDef                           │
-│     │   └─ 失败 → 返回 None + 日志警告                    │
-│     └─ 无 verb/noun 不再跳过，Planner 始终执行             │
+│  6. _try_chain(verb, noun) 获取执行计划                     │
+│     ├─ 有 verb/noun → tool_chains.json 匹配（仅新格式 plan）│
+│     │   ├─ 命中 → 返回 ChainDef                           │
+│     │   └─ 未命中 → Planner (LLM #2) 必须跑一遍          │
+│     │       ├─ 成功 → 返回 ChainDef                       │
+│     │       └─ 失败 → 返回 None + 日志警告                │
+│     └─ 无 verb/noun → Planner 始终执行                    │
 │     计划格式：phases 数组，progressive 标记递进关系         │
-│     注入 Agent 上下文（enriched）                           │
+│     chain_def 通过 meta 传递给 _execute_plan()             │
 └──────────────────────────────────────────────────────
     │
     ▼
@@ -257,9 +258,11 @@ PLAN_PHASE_FAST_EXIT_STEPS=3   # 工具失效快速退出步数阈值
 **流程**:
 1. 快速通道: 正则匹配闲聊（0 LLM 调用）
 2. LLM 分析: 仅非闲聊时调用
-3. 提取 stock_code: 从消息解析个股代码
+3. 提取 stock_code: **仅金融领域**（`domain in ("finance", "trading")`）执行 3 级提取（context → 正则 → 中文名解析），写入 session。非金融领域跳过。
 
 **输出**: `IntentResult` 结构体，包含 intent/domain/verb/noun/strategy/confidence。
+
+**注意**: stock_code 提取在 `_prepare_intent()` 步骤3 完成，`_try_chain()` 不再提取，直接从 context 读取。
 
 ### 4.5 Evaluator — 评估器
 
@@ -282,26 +285,32 @@ PLAN_PHASE_FAST_EXIT_STEPS=3   # 工具失效快速退出步数阈值
 - 链路维度: `tool_chains.json.stats.success_rate` 下降 → 该工具组合在失效
 - 工具维度: `qd_traces` 中 tool 层节点的 correct 统计 → 哪个工具在出错
 
-## 五、语义文件结构
+> **注意**: 代码中引用 `tool_chains.json` 路径名，实际文件为 `chain/tool_chains.py`（Python 封装模块，内部读写 JSON 数据），两者是封装关系而非简单替换。
+
+## 五、语义文件与 Skill 结构
 
 ```
-semantics/
+semantics/                      # 语义文件
 ├── persona.md          # 人设 → Planner + Agent
 ├── intent.md           # 意图分类规则 → IntentAnalyzer
 ├── planner.md          # 规划规则 → Planner LLM
-├── guidance.md         # 执行规则 → Agent instructions
-└── skills/
-    └── <name>/
-        └── SKILL.md    # Skill 定义 → call_skill
+└── agent_rules.md      # 执行规则 → Agent instructions（原 guidance.md）
+
+skills/                         # Skill 目录（与 semantics 平级）
+└── <name>/
+    ├── SKILL.md        # Skill 定义 → call_skill
+    └── *.py            # Skill 实现
 ```
 
 **职责分离**:
 | 文件 | 注入到 | 职责 |
 |------|--------|------|
 | `planner.md` | Planner LLM | 选什么 Skill、为什么选、输出执行计划 |
-| `guidance.md` | Agent instructions | 按顺序执行、怎么调 call_skill |
+| `agent_rules.md` | Agent instructions | 按顺序执行、怎么调 call_skill（原 `guidance.md`，已重命名） |
 | `persona.md` | Planner + Agent | 人设 |
 | `intent.md` | IntentAnalyzer | 意图分类规则 |
+
+**Skill 目录**：`agent/skills/<name>/SKILL.md`，不在 `semantics/` 下。
 
 ## 六、数据库设计
 
@@ -421,12 +430,14 @@ app 启动 → start_eval_worker() → 等到盘后 15:30
 ### 7.4 编排路径学习闭环（省去 LLM #2 重复工作量）
 ```
 agent 结束 → _post_evaluate() → learn_from_execution()
-  → verdict=="success" + all_phases_completed → _writeback_chain() → 4 道质量门 → save_tool_chain()
-  → 下次 _try_chain() → get_tool_chain() 命中 → 直接返回 ChainDef
+  → verdict=="success" + all_phases_completed → _writeback_chain()
+    → 有 chain_def → 3 道质量门 → save_chain_plan()（新格式 plan）
+    → 无 chain_def → save_tool_chain()（旧格式 steps）
+  → 下次 _try_chain() → get_chain_plan() 命中 → 直接返回 ChainDef
 ```
 **作用**：首次走一遍后，后续直接使用编排路径，省去 LLM #2（Planner 大脑）的重复思考。
 **本质**：Chain 编排层是从用户消息到执行入口的便捷路线，是缓存好的思维捷径。
-**质量门**：4 道拦截（phase步数>5、评分<60、工具成功率<50%、旧链已验证），防止学习低质量链路。
+**质量门**：3 道拦截（phase步数>5、工具成功率<50%、旧链已验证），防止学习低质量链路。
 **前提条件**：verb/noun 非空（`learn_from_execution` 在 verb/noun 为空时跳过）。
 **去掉后果**：每次都从零规划，重复消耗 LLM #2 token。
 
@@ -481,60 +492,10 @@ CODE_EXECUTION_TIMEOUT=120       # 代码执行超时（秒）
 - `semantics/persona.md` — 人设定义
 - `semantics/intent.md` — 意图分类规则
 - `semantics/planner.md` — Planner 规则
-- `semantics/guidance.md` — Agent 执行规则
+- `semantics/agent_rules.md` — Agent 执行规则（原 `guidance.md`）
 - `skills/*/SKILL.md` — Skill 定义
 
-## 十、文件结构
-
-```
-backend_api_python/app/agent/
-├── agent.py              # 核心 Agent 执行器
-├── planner.py            # Planner 规划器
-├── intent_analyzer.py    # 意图分析器
-├── evaluator.py          # 评估器
-├── trace_collector.py    # 执行追踪器
-├── traced_tool.py        # 工具追踪包装
-├── context_compressor.py # 上下文压缩
-├── json_extractor.py     # JSON 提取
-├── session_store.py      # Session 存储
-├── model.py              # 模型构建
-├── tool_context.py       # 工具上下文
-├── text_utils.py         # 文本工具
-├── run.py                # CLI 入口
-├── chain/                # 链路系统
-│   ├── chains.py         # 链路定义 (ChainDef/ChainStep)
-│   ├── executor.py       # 链路执行器（死代码，已不被调用）
-│   ├── evaluator.py      # 回溯评估引擎（T+N 验证 + 权重更新）
-│   ├── schema.py         # 数据结构 (EvalNode/SkillReport/FactorItem)
-│   ├── store.py          # qd_traces 持久化
-│   ├── contract.py       # Skill 输出解析契约
-│   └── tool_chains.json  # 学习积累的编排路径
-├── semantics/            # 语义文件
-│   ├── __init__.py       # 语义加载器
-│   ├── persona.md        # 人设
-│   ├── intent.md         # 意图规则
-│   ├── planner.md        # Planner 规则
-│   ├── guidance.md       # Agent 规则
-├── skills/               # Skill 执行
-│   ├── call_skill_tool.py
-│   └── registry.py
-└── tools/                # 工具插件
-    ├── registry.py       # 工具注册表
-    ├── data_tools.py     # 行情数据
-    ├── analysis_tools.py # 分析工具
-    ├── indicator_tools.py # 指标工具
-    ├── capital_tools.py  # 资本面
-    ├── quote_tools.py    # 盘口数据
-    ├── market_screen.py  # 市场筛选
-    ├── screener_tools.py # 选股筛选
-    ├── signal_tools.py   # 信号捕捉
-    ├── research_tools.py # 研究分析
-    ├── sector_analysis_tools.py # 板块分析
-    ├── trading_tools.py  # 交易管理
-    └── ...               # 更多工具插件
-```
-
-## 十一、已知限制
+## 十、已知限制
 
 1. **Planner 输出解析**: 依赖 LLM 输出 JSON 格式，有容错处理但不保证 100% 成功
 2. **工具失效检测**: 基于 steps 数量和工具调用成功率，可能误判
@@ -543,7 +504,7 @@ backend_api_python/app/agent/
 5. **per-phase agent 重建**: 每个 phase 重建 agent 会有一定的性能开销，但能保证上下文最小化
 6. **多步骤处理**: 依赖 LLM 正确解析用户的多步骤指示，有容错处理但不保证 100% 成功
 
-## 十二、后续迭代
+## 十一、后续迭代
 
 1. **LLM #2 决策完善**: 工具失效时返回 LLM #2 决策（返回/提问/另选路径）
 2. **并行阶段执行**: 支持无依赖关系的 phase 并行执行

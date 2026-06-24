@@ -88,10 +88,23 @@ def strip_stopwords_prefix(message: str) -> Optional[str]:
     return candidate
 
 
-def extract_stock_code(message: str) -> Optional[str]:
-    """从消息中提取 6 位股票代码。"""
-    match = re.search(r'\b(\d{6})\b', message)
-    return match.group(1) if match else None
+def extract_stock_code(message: str) -> Tuple[Optional[str], Optional[str]]:
+    """从消息中提取 6 位股票代码和名称。
+
+    Returns:
+        (stock_code, stock_name)，未找到返回 (None, None)
+    """
+    match = re.search(r'(?<!\d)(\d{6})(?!\d)', message)
+    if match:
+        code = match.group(1)
+        try:
+            from app.utils.basicinfo_db import get_stock_basic_db
+            stock = get_stock_basic_db().get_stock(code)
+            if stock:
+                return code, stock.get("name", "")
+        except Exception:
+            pass
+    return None, None
 
 
 def extract_stock_from_message(message: str) -> Tuple[Optional[str], Optional[str]]:
@@ -105,9 +118,9 @@ def extract_stock_from_message(message: str) -> Tuple[Optional[str], Optional[st
         (stock_code, stock_name)，未找到返回 (None, None)
     """
     # 1. 数字代码
-    code = extract_stock_code(message)
+    code, name = extract_stock_code(message)
     if code:
-        return code, None
+        return code, name
 
     # 2. 加载全部股票名，按长度倒序在消息中匹配
     try:
@@ -120,6 +133,24 @@ def extract_stock_from_message(message: str) -> Tuple[Optional[str], Optional[st
             name = s.get("name", "")
             if len(name) >= 2 and name in message:
                 return s.get("symbol", ""), name
+    except Exception:
+        pass
+
+    # 3. DB 模糊查找（提取关键词逐个搜索）
+    try:
+        from app.utils.basicinfo_db import get_stock_basic_db
+        db = get_stock_basic_db()
+        import re as _re
+        # 中文词 2-8 字 + 英文词 2+ 字
+        candidates = _re.findall(r'[\u4e00-\u9fff]{2,8}', message)
+        candidates += _re.findall(r'[a-zA-Z]{2,}', message)
+        # 也尝试直接搜数字（可能有非标准格式代码）
+        digit_m = _re.findall(r'\d{4,8}', message)
+        candidates += digit_m
+        for kw in candidates:
+            results = db.search_stocks(kw, limit=1)
+            if results:
+                return results[0].get("symbol", ""), results[0].get("name", "")
     except Exception:
         pass
 

@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 
 def indicator_analysis(stock_code: str, stock_name: str = "", user_id: int = 1) -> Dict[str, Any]:
-    """执行用户指标策略分析。
+    """指标策略批量分析：对多只股票执行用户自定义指标策略，返回每只股票的最新信号(buy/sell)和评分。
 
     Args:
         stock_code: 股票代码，如 "600066"

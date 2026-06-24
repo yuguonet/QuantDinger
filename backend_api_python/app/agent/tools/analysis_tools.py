@@ -298,7 +298,7 @@ def _calc_kdj(highs: List[float], lows: List[float], closes: List[float],
 # ═══════════════════════════════════════════════════════════════
 
 def analyze_trend(codes: str) -> Dict[str, Any]:
-    """获取股票的综合技术趋势分析，包括均线排列、MACD、RSI、BOLL和KDJ等指标，支持多股批量获取。
+    """技术趋势（单一工具）：返回均线排列、MACD金死叉、RSI超买超卖、BOLL位置、KDJ状态及综合评分。仅做趋势判断，不做综合评分；需要综合评分用 technical_analysis。
 
     Args:
         codes: 多股用逗号分隔"
@@ -481,7 +481,7 @@ def analyze_trend(codes: str) -> Dict[str, Any]:
 
 
 def calculate_ma(codes: str, periods: str = "5,10,20,60,120") -> Dict[str, Any]:
-    """计算均线指标，支持多股批量获取。
+    """均线指标：返回指定周期(5/10/20/60/120/250)的MA值、斜率和趋势方向。
 
     Args:
         codes: 多股用逗号分隔"
@@ -531,7 +531,7 @@ def calculate_ma(codes: str, periods: str = "5,10,20,60,120") -> Dict[str, Any]:
 
 
 def get_volume_analysis(codes: str) -> Dict[str, Any]:
-    """量能分析：量比、换手率、成交量趋势，支持多股批量获取。
+    """量能分析：返回量比、换手率、近5日成交量趋势（放量/缩量/平量）。
 
     Args:
         codes: 多股用逗号分隔"
@@ -618,7 +618,7 @@ def get_volume_analysis(codes: str) -> Dict[str, Any]:
 
 
 def analyze_pattern(codes: str) -> Dict[str, Any]:
-    """识别K线形态（增强版），支持多股批量获取：锤子线、十字星、吞没、早晨/晚星、三连阳/阴、长上影/下影、缺口等。
+    """K线形态识别：返回当日出现的形态信号（锤子线/十字星/吞没/三连阳等）及含义。
 
     Args:
         codes: 多股用逗号分隔"
@@ -762,7 +762,7 @@ def analyze_pattern(codes: str) -> Dict[str, Any]:
 
 
 def get_chip_distribution(codes: str, lookback_days: int = 120) -> Dict[str, Any]:
-    """筹码分布分析（衰减成本分布模型），支持多股批量获取。
+    """筹码分布：返回获利比例、平均成本、90%筹码集中度、套牢/获利盘比例。
 
     从日K线计算筹码分布，不依赖数据源原生接口。
     算法：按日K线的 high/low 区间分配成交量到价格档位，
@@ -813,7 +813,7 @@ def get_chip_distribution(codes: str, lookback_days: int = 120) -> Dict[str, Any
 
 
 def get_indicator_snapshot(codes: str) -> Dict[str, Any]:
-    """单次获取多个技术指标快照（MACD、RSI、BOLL、KDJ等），支持多股批量获取。
+    """指标快照：一次返回MACD/RSI/BOLL/KDJ/KD的最新数值和金叉/死叉/超买超卖状态。
 
     Args:
         codes: 多股用逗号分隔"

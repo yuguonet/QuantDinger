@@ -16,9 +16,7 @@ logger = logging.getLogger(__name__)
 # ── Tool functions ────────────────────────────────────────────
 
 def list_indicators(user_id: int = 1) -> Dict[str, Any]:
-    """列出用户的所有指标策略（自建 + 购买的）。
-
-    返回指标 ID、名称、描述、是否已购买等信息。
+    """指标策略列表：返回用户所有指标策略的ID、名称、描述、是否已购买。
 
     Args:
         user_id: 用户 ID，默认 1
@@ -55,7 +53,7 @@ def list_indicators(user_id: int = 1) -> Dict[str, Any]:
         return {"indicators": [], "count": 0, "error": str(e)}
 
 def get_indicator_params(indicator_id: int, user_id: int = 1) -> Dict[str, Any]:
-    """获取指标策略声明的可配置参数。
+    """指标参数：返回指定指标策略的可配置参数列表及默认值。
 
     解析指标代码中的 # @param 注释，返回参数名称、类型、默认值。
 
@@ -102,9 +100,7 @@ def run_indicator_signal(
     user_id: int = 1,
     params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """对单只股票执行指标策略，返回最新的 buy/sell 信号和指标数据。
-
-    拉取 K 线 → 沙箱执行指标代码 → 提取 output 中的信号和图表数据。
+    """执行指标策略：对单只股票运行指定指标，返回最新信号(buy/sell)、评分、指标数值。
 
     Args:
         indicator_id: 指标策略 ID

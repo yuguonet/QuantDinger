@@ -61,7 +61,7 @@ def search_stock_by_name(keyword: str, market: str = "CNStock", limit: int = 10)
         return {"keyword": keyword, "results": [], "count": 0, "error": str(e)}
 
 def get_realtime_quote(codes: str) -> Dict[str, Any]:
-    """获取股票实时行情数据，支持多股批量获取。
+    """实时行情：价格、涨跌幅、成交量、换手率、量比、PE、PB、总市值等。
 
     Args:
         codes: 多股用逗号分隔"
@@ -96,7 +96,7 @@ def get_realtime_quote(codes: str) -> Dict[str, Any]:
     return {"count": len(results), "data": results}
 
 def agent_get_kline(codes: str, timeframe: str = "1D", days: int = 60, market: str = "") -> Dict[str, Any]:
-    """获取股票/交易对的K线数据（OHLCV），支持多股批量获取。
+    """K线数据：返回 date/open/high/low/close/volume 数组，支持 A股/港股/美股/加密货币。
 
     Args:
         codes: 多股用逗号分隔
@@ -149,7 +149,7 @@ def agent_get_kline(codes: str, timeframe: str = "1D", days: int = 60, market: s
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
 def get_stock_info(codes: str) -> Dict[str, Any]:
-    """获取股票基本信息（名称、行业、市值等），支持多股批量获取。
+    """股票基本信息：名称、代码、行业、上市日期、总股本、流通股本等。
 
     Args:
         codes: 多股用逗号分隔"

@@ -34,7 +34,7 @@ _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 # ══════════════════════════════════════════════════════════════
 
 def get_consensus_eps(codes: str) -> Dict[str, Any]:
-    """获取同花顺机构一致预期EPS，支持多股批量获取。
+    """机构一致预期EPS：返回同花顺数据源的机构预测每股收益均值。
 
     Args:
         codes: 逗号分隔的股票代码，如 "688017" 或 "688017,600519"
@@ -92,7 +92,7 @@ def get_consensus_eps(codes: str) -> Dict[str, Any]:
 # ══════════════════════════════════════════════════════════════
 
 def get_eastmoney_stock_news(codes: str, page_size: int = 20) -> Dict[str, Any]:
-    """获取东财个股新闻，支持多股批量获取。
+    """个股新闻：返回东财数据源的个股相关新闻标题和摘要。
 
     Args:
         codes: 逗号分隔的股票代码，如 "688017" 或 "688017,600519"
@@ -161,7 +161,7 @@ def get_eastmoney_stock_news(codes: str, page_size: int = 20) -> Dict[str, Any]:
 # ══════════════════════════════════════════════════════════════
 
 def get_global_finance_news(page_size: int = 30) -> Dict[str, Any]:
-    """获取东财全球财经资讯。
+    """全球资讯：返回东财数据源的全球财经快讯标题和摘要。
 
     Args:
         page_size: 返回条数，默认30

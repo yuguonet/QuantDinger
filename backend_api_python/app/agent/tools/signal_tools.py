@@ -30,7 +30,7 @@ _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 
 
 def get_hot_stocks_with_reason(date: str = "") -> Dict[str, Any]:
-    """获取同花顺当日强势股+题材归因。
+    """当日强势股：同花顺数据源，返回涨幅居前个股及其涨停/强势的题材归因。
 
     Args:
         date: 日期 YYYY-MM-DD，默认今天
@@ -86,7 +86,7 @@ def get_hot_stocks_with_reason(date: str = "") -> Dict[str, Any]:
 # ══════════════════════════════════════════════════════════════
 
 def get_stock_concept_blocks(codes: str) -> Dict[str, Any]:
-    """获取个股所属板块/概念归属（东财 slist），支持多股批量获取。
+    """个股概念归属：返回股票所属的行业板块和概念板块列表。
 
     Args:
         codes: 多股用逗号分隔"
@@ -148,7 +148,7 @@ def get_stock_concept_blocks(codes: str) -> Dict[str, Any]:
 # ══════════════════════════════════════════════════════════════
 
 def get_lockup_expiry(codes: str, forward_days: int = 90) -> Dict[str, Any]:
-    """获取限售解禁日历，支持多股批量获取。
+    """限售解禁日历：返回指定股票未来解禁日期、解禁数量、占总股本比例。
 
     Args:
         codes: 逗号分隔的股票代码，如 "002475" 或 "002475,600519"
@@ -217,7 +217,7 @@ def get_lockup_expiry(codes: str, forward_days: int = 90) -> Dict[str, Any]:
 # ══════════════════════════════════════════════════════════════
 
 def get_industry_ranking(top_n: int = 20) -> Dict[str, Any]:
-    """获取行业板块涨跌幅排名。
+    """行业涨跌幅排名：返回当日各行业板块涨跌幅、领涨股、成交额排名。
 
     数据源：market_cn.hot_sectors（东财 + 新浪双源）
 
@@ -238,7 +238,7 @@ def get_industry_ranking(top_n: int = 20) -> Dict[str, Any]:
 # ══════════════════════════════════════════════════════════════
 
 def get_dragon_tiger_detail(codes: str, look_back_days: int = 30) -> Dict[str, Any]:
-    """获取个股龙虎榜详情（席位+机构），支持多股批量获取。
+    """龙虎榜详情：返回个股上榜日期、买卖席位明细、机构/游资动向。
 
     Args:
         codes: 逗号分隔的股票代码，如 "002475" 或 "002475,600519"

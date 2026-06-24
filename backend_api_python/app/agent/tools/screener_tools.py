@@ -107,10 +107,7 @@ def search_stocks(
     market: str = "全部",
     top_n: int = 50,
 ) -> Dict[str, Any]:
-    """统一选股工具：根据条件从全市场筛选股票。
-
-    支持自然语言条件（如 "PE<20 半导体"）和结构化 filters 字典。
-    source 参数控制数据源：auto(东财优先) / eastmoney。
+    """选股：根据自然语言条件（如"PE<20 半导体"）或结构化 filters 从全市场筛选股票，返回代码/名称/行业/价格/PE/PB等。
 
     Args:
         query: 自然语言选股条件（如 "半导体 净利增长>15%"、"PE在5到20之间"）
@@ -166,7 +163,7 @@ def search_stocks(
 # ══════════════════════════════════════════════════════════════
 
 def build_keyword_from_filters(filters: Dict[str, Any]) -> str:
-    """将结构化筛选条件转换为自然语言关键词字符串。
+    """条件转关键词：将 filters 字典转为自然语言查询字符串，供 search_stocks 使用。
 
     Args:
         filters: 筛选条件字典，如 {"market": "主板", "pe_range": [0, 30]}
@@ -477,7 +474,7 @@ def build_keyword_from_filters(filters: Dict[str, Any]) -> str:
 
 
 def get_screener_presets() -> Dict[str, Any]:
-    """获取选股器支持的所有筛选条件分类和示例。"""
+    """选股条件列表：返回所有可用筛选条件的分类、字段名、示例值。"""
     return {
         "categories": {
             "基本面": {

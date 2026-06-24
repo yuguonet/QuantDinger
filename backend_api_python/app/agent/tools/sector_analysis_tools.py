@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 def get_hot_sectors(industry_limit: int = 15, concept_limit: int = 15) -> Dict[str, Any]:
-    """获取实时热门板块（行业+概念），含涨停数/领涨股/强度标签/情绪判断。
+    """实时热门板块：返回行业+概念板块的涨跌幅排名、涨停家数、领涨股、板块强度标签、市场情绪指标。
 
     Args:
         industry_limit: 行业板块数量，默认15
@@ -31,7 +31,7 @@ def get_hot_sectors(industry_limit: int = 15, concept_limit: int = 15) -> Dict[s
 
 
 def get_sector_trend_analysis(board_type: str = "industry") -> Dict[str, Any]:
-    """获取板块趋势分析（1月趋势+6月周期+今日预测）。
+    """板块趋势：返回近1月涨跌趋势、6个月周期位置、今日预测信号。
 
     Args:
         board_type: 板块类型，"industry"(行业) 或 "concept"(概念)
@@ -45,7 +45,7 @@ def get_sector_trend_analysis(board_type: str = "industry") -> Dict[str, Any]:
 
 
 def get_sector_history_data(board_type: str = "industry", days: int = 30) -> Dict[str, Any]:
-    """获取板块历史排名数据。
+    """板块历史排名：返回板块近N天的每日涨跌幅排名变化。
 
     Args:
         board_type: 板块类型，"industry"(行业) 或 "concept"(概念)
@@ -60,7 +60,7 @@ def get_sector_history_data(board_type: str = "industry", days: int = 30) -> Dic
 
 
 def get_sector_prediction() -> Dict[str, Any]:
-    """获取今日热门板块预测。"""
+    """板块预测：基于资金流+情绪+技术面，预测今日可能走强的板块。"""
     try:
         from app.market_cn.china_market import get_sector_prediction as _get
         return _get()
@@ -70,7 +70,7 @@ def get_sector_prediction() -> Dict[str, Any]:
 
 
 def get_sector_cycle(board_type: str = "industry") -> Dict[str, Any]:
-    """获取板块6个月周期分析。
+    """板块周期：返回板块6个月内的周期位置（高位/低位/上升/下降）。
 
     Args:
         board_type: 板块类型，"industry"(行业) 或 "concept"(概念)
@@ -84,7 +84,7 @@ def get_sector_cycle(board_type: str = "industry") -> Dict[str, Any]:
 
 
 def get_stock_sector_info(codes: str) -> Dict[str, Any]:
-    """从本地数据库查询股票所属行业和概念，支持多股批量获取。
+    """从本地数据库查询股票所属行业和概念。
 
     Args:
         codes: 多股用逗号分隔"
