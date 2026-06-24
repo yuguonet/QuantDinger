@@ -17,7 +17,7 @@ def intelligence_analysis(stock_code: str, stock_name: str = "") -> Dict[str, An
 
     Returns:
         {
-            "skill": "intelligence_agent",
+            
             "score": float,          # 综合评分 (0-100)
             "direction": str,        # bullish / bearish / neutral
             "confidence": float,     # 0.0-1.0
@@ -92,7 +92,7 @@ def intelligence_analysis(stock_code: str, stock_name: str = "") -> Dict[str, An
     )
 
     return {
-        "skill": "intelligence_agent",
+        
         "score": final_score,
         "direction": direction,
         "confidence": 0.5,

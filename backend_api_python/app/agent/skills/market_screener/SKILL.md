@@ -1,7 +1,7 @@
 ---
 name: market-screener
 version: 3.0.0
-description: 自包含选股技能,从A股全市场筛选短线标的。用户问"今天买什么股""有什么好股票""短线选什么"时使用。
+description: 从A股全市场筛选短线标的,自包含选股技能。用户问"今天买什么股""有什么好股票""短线选什么"时使用,不含个股分析。
 tags: [market, screener, short_term, a_share]
 tools:
   - get_fund_flow

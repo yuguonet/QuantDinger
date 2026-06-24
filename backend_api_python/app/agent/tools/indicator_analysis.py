@@ -58,7 +58,7 @@ def indicator_analysis(stock_code: str, stock_name: str = "", user_id: int = 1) 
     # ── 4. 无近期信号 → 50分观望 ──
     if not active_buy and not active_sell:
         return {
-            "skill": "indicator_agent", "score": 50, "direction": "neutral",
+            "score": 50, "direction": "neutral",
             "confidence": 0.3,
             "signal": "无近期信号",
             "factors": _build_no_signal_factors(evaluated),
@@ -155,7 +155,7 @@ def indicator_analysis(stock_code: str, stock_name: str = "", user_id: int = 1) 
     )
 
     return {
-        "skill": "indicator_agent",
+        
         "score": round(final_score),
         "direction": direction,
         "confidence": round(confidence, 2),
@@ -395,7 +395,7 @@ def _avg_win_rate(evaluated: List[Dict]) -> float:
 def _neutral(signal: str, analysis: str) -> Dict[str, Any]:
     """返回中性结果。"""
     return {
-        "skill": "indicator_agent", "score": 50, "direction": "neutral",
+        "score": 50, "direction": "neutral",
         "confidence": 0.3, "signal": signal, "factors": [],
         "analysis": analysis, "status": "ok",
     }

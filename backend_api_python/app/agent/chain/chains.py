@@ -37,6 +37,7 @@ class ChainStep:
     required: bool = True       # 是否必须成功（False 则失败可跳过）
     extract_fn: str = ""        # 结果提取函数名（从 agent 输出中提取关键结论）
     rules: str = ""             # 这一步的执行规则
+    tools: List[str] = field(default_factory=list)  # 当前 phase 需要加载的工具列表
 
 
 @dataclass

@@ -450,6 +450,6 @@ def format_intent_for_agent(intent: IntentResult, original_message: str) -> str:
             or "选股" in original_message or "买什么" in original_message
             or "推荐" in original_message):
         if not intent.params.get("stock"):  # 没给具体股票代码
-            parts.append("⚠️ 用户未指定股票代码，这是选股/推荐场景。你必须使用 market-screener（短线选股）或 bb_screener（BB超卖扫描），禁止用 technical_agent 分析任意股票。")
+            parts.append("⚠️ 用户未指定股票代码，这是选股/推荐场景。使用 market-screener 或选股工具，不要用分析工具处理未指定的股票。")
 
     return "\n".join(parts)

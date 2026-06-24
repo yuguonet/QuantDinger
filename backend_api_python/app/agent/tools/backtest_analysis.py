@@ -22,7 +22,7 @@ def algo_analyze(stock_code, stock_name, tool_results, call_tool_fn=None):
     strat_list = strategies.get("strategies", []) if isinstance(strategies, dict) else strategies
 
     if not strat_list:
-        return {"skill": "backtest_agent", "action": "hold", "score": 50, "direction": "neutral",
+        return {"action": "hold", "score": 50, "direction": "neutral",
                 "signal": "无用户策略", "confidence": "low", "factors": [], "analysis": "无策略可回测", "status": "ok"}
 
     for strat in strat_list[:3]:
@@ -49,12 +49,12 @@ def algo_analyze(stock_code, stock_name, tool_results, call_tool_fn=None):
             factors.append({"name": f"回测:{strat_name}", "value": f"胜率{win_rate:.0%} 盈亏比{profit_loss_ratio:.1f} 回撤{max_drawdown:.0%}", "score": score})
 
     if not factors:
-        return {"skill": "backtest_agent", "action": "hold", "score": 50, "direction": "neutral",
+        return {"action": "hold", "score": 50, "direction": "neutral",
                 "signal": "回测未产生结果", "confidence": "low", "factors": [], "analysis": "无数据", "status": "ok"}
 
     direction = "bullish" if best_score >= 60 else ("bearish" if best_score <= 40 else "neutral")
     return {
-        "skill": "backtest_agent", "action": "hold", "score": best_score,
+        "action": "hold", "score": best_score,
         "direction": direction, "confidence": "medium",
         "signal": f"最佳策略:{best_strategy}" if best_strategy else "回测完成",
         "factors": factors, "analysis": f"回测{len(factors)}个策略，最佳:{best_strategy}", "status": "ok",

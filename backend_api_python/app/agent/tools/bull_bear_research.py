@@ -14,7 +14,7 @@ def bull_bear_research(stock_code: str, stock_name: str = "") -> Dict[str, Any]:
 
     Returns:
         {
-            "skill": "researcher",
+            
             "score": float,          # 0-100 综合评分
             "direction": str,        # bullish / bearish / neutral
             "confidence": float,     # 0.0-1.0
@@ -150,7 +150,7 @@ def bull_bear_research(stock_code: str, stock_name: str = "") -> Dict[str, Any]:
     )
 
     return {
-        "skill": "researcher",
+        
         "score": final_score,
         "direction": direction,
         "confidence": confidence,

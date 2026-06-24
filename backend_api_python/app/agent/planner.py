@@ -68,11 +68,7 @@ def _get_skill_catalog() -> str:
     metas = get_all_skill_metas()
     if not metas:
         # fallback: 硬编码兜底（semantics 加载失败时）
-        return (
-            "可用技能：technical_agent(技术面), intelligence_agent(情报), "
-            "market-screener(选股), backtest_agent(回测), "
-            "researcher(多空)"
-        )
+        return "可用技能：market-screener(短线选股)"
     lines = ["可用技能（从下列中选择 1~5 个，按执行顺序排列）：", ""]
     # 按 priority 降序排列
     sorted_skills = sorted(metas.items(), key=lambda x: x[1].priority, reverse=True)
@@ -80,8 +76,6 @@ def _get_skill_catalog() -> str:
         desc = meta.description or meta.name
         tags_str = f" [{','.join(meta.tags)}]" if meta.tags else ""
         lines.append(f"{i}. {name} — {desc}{tags_str}")
-    lines.append("")
-    lines.append("大多数场景必须包含 technical_agent（技术面地基）。")
     return "\n".join(lines)
 
 # 懒加载缓存
@@ -249,8 +243,6 @@ class Planner:
 
         raw = self._call_llm(prompt)
         result = self._parse_plan_json(raw)
-        # ── 调试日志：Planner 输出 JSON ──
-        print(f"[DEBUG] Planner 输出 JSON: {json.dumps(result, ensure_ascii=False, indent=2)}")
         return result
 
     def _parse_plan_json(self, raw: str) -> Dict[str, Any]:
@@ -320,10 +312,12 @@ class Planner:
         deduped = []
         for step in phases:
             agent = step.get("agent", step.get("skill", ""))
+            tools = step.get("tools", [])
             desc = step.get("description", "")
-            # 用 skill+description 作为去重 key，描述不同的步骤保留
-            dedup_key = f"{agent}:{desc}" if desc else agent
-            if agent and dedup_key not in seen:
+            # 用 skill+description 作为去重 key，纯工具 phase 用 tools[0]+description
+            dedup_key_agent = agent if agent else (tools[0] if tools else "")
+            dedup_key = f"{dedup_key_agent}:{desc}" if desc else dedup_key_agent
+            if (agent or tools) and dedup_key not in seen:
                 seen.add(dedup_key)
                 deduped.append(step)
         phases = deduped
@@ -351,13 +345,17 @@ class Planner:
         for i, step_data in enumerate(phases, 1):
             # 兼容 "skill" 和 "agent" 两个字段名
             agent = step_data.get("skill", "") or step_data.get("agent", "")
+            tools = step_data.get("tools", [])
+            # 纯工具 phase: agent 为空时用 tools[0] 作为 name
+            step_name = agent or (tools[0] if tools else f"phase_{i}")
             steps.append(ChainStep(
-                name=agent,
+                name=step_name,
                 agent=agent,
                 order=i,
                 description=step_data.get("description", ""),
                 required=(i == 1),
                 rules=step_data.get("rules", ""),
+                tools=step_data.get("tools", []),
             ))
 
         # 收集 Planner 上下文（关键信息传递给各 Skill Agent）

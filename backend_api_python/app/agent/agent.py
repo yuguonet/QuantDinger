@@ -1225,9 +1225,12 @@ class _AgentExecutor:
             parts.append(f"\n请用 read_skill 加载 {step.agent} 的指令并执行。")
             if meta_skill.tools:
                 parts.append(f"可用工具: {', '.join(meta_skill.tools)}")
-        else:
-            parts.append(f"\n直接调用工具: {step.agent}")
-            parts.append("请直接使用上述工具完成任务，无需读取 SKILL.md。")
+#        elif step.agent:
+#            parts.append(f"\n直接调用工具: {step.agent}")
+#            parts.append("请直接使用上述工具完成任务，无需读取 SKILL.md。")
+#        elif step.tools:
+#            parts.append(f"\n直接调用工具: {', '.join(step.tools)}")
+#            parts.append("请直接使用上述工具完成任务，无需读取 SKILL.md。")
         step_rules = step.rules or tips
         if step_rules:
             parts.append(f"规则: {step_rules}")
@@ -1239,8 +1242,11 @@ class _AgentExecutor:
         if meta_skill and meta_skill.tools:
             phase_tools = meta_skill.tools + ["get_skill_catalog", "read_skill"]
             is_tool_mode = False
-        else:
+        elif step.agent:
             phase_tools = [step.agent]
+            is_tool_mode = True
+        elif step.tools:
+            phase_tools = step.tools
             is_tool_mode = True
 
         phase_agent = get_smolagent(
@@ -1347,10 +1353,13 @@ class _AgentExecutor:
                     new_steps = []
                     for j, rp in enumerate(replan["phases"]):
                         _agent = rp.get("skill", "") or rp.get("agent", "")
+                        _tools = rp.get("tools", [])
+                        _name = _agent or (_tools[0] if _tools else f"phase_{step.order + j + 1}")
                         new_steps.append(ChainStep(
-                            name=_agent, agent=_agent, order=step.order + j + 1,
+                            name=_name, agent=_agent, order=step.order + j + 1,
                             description=rp.get("description", ""),
                             rules=rp.get("rules", ""),
+                            tools=_tools,
                         ))
                     idx = sorted_steps.index(step)
                     sorted_steps = sorted_steps[:idx + 1] + new_steps
@@ -1468,10 +1477,13 @@ class _AgentExecutor:
                     new_steps = []
                     for j, rp in enumerate(replan["phases"]):
                         _agent = rp.get("skill", "") or rp.get("agent", "")
+                        _tools = rp.get("tools", [])
+                        _name = _agent or (_tools[0] if _tools else f"phase_{step.order + j + 1}")
                         new_steps.append(ChainStep(
-                            name=_agent, agent=_agent, order=step.order + j + 1,
+                            name=_name, agent=_agent, order=step.order + j + 1,
                             description=rp.get("description", ""),
                             rules=rp.get("rules", ""),
+                            tools=_tools,
                         ))
                     idx = sorted_steps.index(step)
                     sorted_steps = sorted_steps[:idx + 1] + new_steps
@@ -1935,11 +1947,14 @@ class _AgentExecutor:
                 steps = []
                 for i, p in enumerate(phases, 1):
                     agent = p.get("skill", "") or p.get("agent", "")
+                    tools = p.get("tools", [])
+                    step_name = agent or (tools[0] if tools else f"phase_{i}")
                     steps.append(ChainStep(
-                        name=agent, agent=agent, order=i,
+                        name=step_name, agent=agent, order=i,
                         description=p.get("description", ""),
                         required=(i == 1),
                         rules=p.get("rules", ""),
+                        tools=p.get("tools", []),
                     ))
                 chain_id = f"learned+{verb}+{noun}"
                 chain_def = ChainDef(

@@ -522,9 +522,8 @@ def bb_screener_scan(stock_code: str = "", stock_name: str = "") -> dict:
     skill = BBScreenerSkill()
     result = skill.run(call_tool_fn=call_tool_fn)
     if isinstance(result, dict):
-        result.setdefault("skill", "bb_screener")
         return result
-    return {"skill": "bb_screener", "score": 50, "direction": "neutral",
+    return {"score": 50, "direction": "neutral",
             "confidence": 0.4, "signal": "BB扫描完成", "factors": [],
             "analysis": str(result)[:500], "status": "ok"}
 
