@@ -868,6 +868,18 @@ class _AgentExecutor:
                         stock_name = _name
                         logger.info("[Prepare] 中文名 → 代码 %s", stock_code)
             if stock_code:
+                # 用 DB 权威名称覆盖 LLM 猜测的名称
+                try:
+                    from app.utils.basicinfo_db import get_stock_basic_db
+                    _db_stock = get_stock_basic_db().get_stock(stock_code)
+                    if _db_stock:
+                        _db_name = _db_stock.get("name", "")
+                        if _db_name:
+                            if stock_name and stock_name != _db_name:
+                                logger.info("[Prepare] stock_name 校正: LLM='%s' → DB='%s' (code=%s)", stock_name, _db_name, stock_code)
+                            stock_name = _db_name
+                except Exception:
+                    pass
                 result.intent_meta["stock_code"] = stock_code
                 if stock_name:
                     result.intent_meta["stock_name"] = stock_name
@@ -987,6 +999,17 @@ class _AgentExecutor:
             self._agent_ready_event.set()
             return store, None, message, {"skip_agent": True, "skip_agent_reply": _ipr.skip_agent_reply}
 
+        # ── §17.2 步骤 7.5: 同步 stock_code/stock_name 到 context ──
+        _ipr_stock_code = (_ipr.intent_meta or {}).get("stock_code", "")
+        _ipr_stock_name = (_ipr.intent_meta or {}).get("stock_name", "")
+        if _ipr_stock_code:
+            if context is None:
+                context = {}
+            if not context.get("stock_code"):
+                context["stock_code"] = _ipr_stock_code
+            if _ipr_stock_name and not context.get("stock_name"):
+                context["stock_name"] = _ipr_stock_name
+
         # ── §17.2 步骤 8: 构建精简 Agent ──────────────────────
         stock_code = (context or {}).get("stock_code", "")
         agent = get_smolagent(
@@ -1021,6 +1044,8 @@ class _AgentExecutor:
             "collector": _ipr.collector,
             "enriched": enriched,
             "chain_def": _ipr.chain_def,
+            "stock_code": (context or {}).get("stock_code", ""),
+            "stock_name": (context or {}).get("stock_name", ""),
         }
 
     # ═══════════════════════════════════════════════════════════════
@@ -1550,8 +1575,8 @@ class _AgentExecutor:
         # 新架构：单步决策模式
         if chain_def.chain_id == "step_loop_mode":
             logger.info("[Plan] 使用单步决策模式")
-            stock_code = (context or {}).get("stock_code", "")
-            stock_name = (context or {}).get("stock_name", "")
+            stock_code = (context or {}).get("stock_code", "") or meta.get("stock_code", "")
+            stock_name = (context or {}).get("stock_name", "") or meta.get("stock_name", "")
             intent = meta.get("intent")
 
             # 创建 Planner
@@ -1687,8 +1712,8 @@ class _AgentExecutor:
         # 新架构：单步决策模式
         if chain_def.chain_id == "step_loop_mode":
             logger.info("[Plan-Stream] 使用单步决策模式")
-            stock_code = (context or {}).get("stock_code", "")
-            stock_name = (context or {}).get("stock_name", "")
+            stock_code = (context or {}).get("stock_code", "") or meta.get("stock_code", "")
+            stock_name = (context or {}).get("stock_name", "") or meta.get("stock_name", "")
             intent = meta.get("intent")
 
             # 创建 Planner

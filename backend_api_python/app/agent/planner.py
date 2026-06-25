@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
@@ -53,6 +54,7 @@ class StepResult:
     summary: str = ""
     stocks: List[str] = field(default_factory=list)
     reasoning: str = ""
+    confidence: float = 0.0
     elapsed_ms: float = 0.0
 
 
@@ -144,16 +146,29 @@ class Planner:
         elapsed = (time.time() - t0) * 1000
         logger.info("[Planner] 决策完成: done=%s, %.0fms", step_data.get("done", False), elapsed)
 
+        confidence = step_data.get("confidence", 0.5)
+        if not isinstance(confidence, (int, float)):
+            try:
+                confidence = float(confidence)
+            except (TypeError, ValueError):
+                confidence = 0.5
+        confidence = max(0.0, min(1.0, confidence))
+
+        # confidence 低于阈值时视为任务完成
+        CONFIDENCE_THRESHOLD = float(os.getenv("PLANNER_CONFIDENCE_THRESHOLD", "0.4"))
+        done = confidence < CONFIDENCE_THRESHOLD or len(step_data.get("tools", [])) == 0
+
         return StepResult(
             success=True,
             skill=step_data.get("skill"),
             description=step_data.get("description", ""),
             tools=step_data.get("tools", []),
             rules=step_data.get("rules", ""),
-            done=step_data.get("done", False),
+            done=done,
             summary=step_data.get("summary", ""),
             stocks=step_data.get("stocks", []),
             reasoning=step_data.get("reasoning", ""),
+            confidence=confidence,
             elapsed_ms=elapsed,
         )
 
@@ -281,25 +296,17 @@ class Planner:
         # 5. 尝试直接解析
         try:
             data = json.loads(cleaned)
-            if isinstance(data, dict) and "done" in data:
+            if isinstance(data, dict):
                 return data
         except json.JSONDecodeError:
             pass
 
-        # 6. 提取最外层 JSON 对象（含 done）
-        match = re.search(r'\{[^{}]*"done"\s*:\s*(?:true|false)[^{}]*\}', cleaned, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group())
-            except json.JSONDecodeError:
-                pass
-
-        # 7. 提取任意最外层 {...}
+        # 6. 提取最外层 JSON 对象
         brace_match = re.search(r'\{.*\}', cleaned, re.DOTALL)
         if brace_match:
             try:
                 data = json.loads(brace_match.group())
-                if isinstance(data, dict) and "done" in data:
+                if isinstance(data, dict):
                     return data
             except json.JSONDecodeError:
                 pass
@@ -308,26 +315,9 @@ class Planner:
 
     def _validate_step(self, step_data: Dict[str, Any]) -> Optional[str]:
         """校验步骤。返回 None 表示通过，返回字符串表示失败原因。"""
-        # 检查必要字段
-        if "done" not in step_data:
-            return "缺少 done 字段"
-
-        # 如果任务未完成，检查必要字段
-        if not step_data.get("done"):
-            if not step_data.get("skill") and not step_data.get("tools"):
-                return "任务未完成时必须提供 skill 或 tools"
-            if not step_data.get("rules"):
-                return "任务未完成时必须提供 rules"
-
-        # 如果任务完成，检查必要字段
-        if step_data.get("done"):
-            if not step_data.get("summary"):
-                return "任务完成时必须提供 summary"
-
         # 工具数量限制
         tools = step_data.get("tools", [])
         if len(tools) > MAX_TOOLS_PER_STEP:
-            # 截断而非失败
             step_data["tools"] = tools[:MAX_TOOLS_PER_STEP]
             logger.info("[Planner] 工具数量超限，截断到 %d 个", MAX_TOOLS_PER_STEP)
 
