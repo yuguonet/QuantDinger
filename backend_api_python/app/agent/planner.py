@@ -259,14 +259,13 @@ class Planner:
 
         # ── LLM #2 输入日志 ──
         print("[Planner] ═══ LLM #2 输入 ═══")
-        print(f"[Planner] 人设: {persona_section[:200]}")
         print(f"[Planner] 股票: {stock_info}")
         print(f"[Planner] 意图: {intent_info.strip()}")
-        print(f"[Planner] 已执行结果: {previous_results_section[:500]}")
-        print(f"[Planner] 对话历史: {context_section[:500]}")
-        print(f"[Planner] 可用技能:\n{skills_section[:2000]}")
-        print(f"[Planner] 可用工具:\n{tools_section[:2000]}")
-        print(f"[Planner] 规则:\n{planner_section[:1000]}")
+        print(f"[Planner] 已执行结果: {previous_results_section[:100]}")
+        print(f"[Planner] 对话历史: {context_section[:100]}")
+        print(f"[Planner] 可用技能:\n{skills_section[:50]}")
+        print(f"[Planner] 可用工具:\n{tools_section[:50]}")
+        print(f"[Planner] 规则:\n{planner_section[:100]}")
         print(f"[Planner] prompt 总长度: {len(prompt)} 字符")
         print("[Planner] ═══════════════════")
 
