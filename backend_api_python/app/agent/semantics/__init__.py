@@ -166,8 +166,6 @@ def _parse_behaviors_from_md(body: str) -> Dict[str, List[str]]:
             behaviors[current_key].append(stripped[2:].strip())
     return behaviors
 
-    return meta, body
-
 
 # ═══════════════════════════════════════════════════════════════
 # Loader
@@ -299,6 +297,75 @@ def get_all_tool_metas() -> Dict[str, ToolMeta]:
     return dict(_tools)
 
 
+def get_skill_body(name: str) -> Optional[str]:
+    """返回指定 skill 的 SKILL.md body（执行指令）。兼容 skills/registry.py 接口。"""
+    load_semantics()
+    # 尝试原始名（下划线）
+    meta = _skills.get(name)
+    if not meta:
+        # 尝试连字符名
+        for m in _skills.values():
+            if m.name == name:
+                meta = m
+                break
+    return meta.instructions if meta else None
+
+
+def get_skill_dir(name: str) -> Optional[str]:
+    """返回指定 skill 的目录路径。兼容 skills/registry.py 接口。"""
+    load_semantics()
+    skills_dir = _SEMANTICS_DIR.parent / "skills"
+    # 尝试原始名（下划线）
+    candidate = skills_dir / name
+    if candidate.is_dir() and (candidate / "SKILL.md").exists():
+        return str(candidate)
+    # 尝试连字符名 → 下划线目录
+    for d in skills_dir.iterdir():
+        if d.is_dir() and (d / "SKILL.md").exists():
+            content = (d / "SKILL.md").read_text(encoding="utf-8")
+            meta_part, _ = _parse_skill_md(content)
+            if meta_part.get("name") == name:
+                return str(d)
+    return None
+
+
+def get_skill_catalog_text() -> str:
+    """生成 skill catalog XML。兼容 skills/registry.py 接口。"""
+    load_semantics()
+    if not _skills:
+        return ""
+    lines = ["<available_skills>"]
+    for name, meta in sorted(_skills.items(), key=lambda x: x[1].priority, reverse=True):
+        dir_path = get_skill_dir(name) or ""
+        lines.append(f'  <skill name="{meta.name}">')
+        lines.append(f'    <description>{meta.description}</description>')
+        lines.append(f'    <location>{dir_path}/SKILL.md</location>')
+        lines.append(f'  </skill>')
+    lines.append("</available_skills>")
+    return "\n".join(lines)
+
+
+def all_skills_compat() -> Dict[str, Any]:
+    """返回兼容 skills/registry.SkillInfo 接口的字典。"""
+    load_semantics()
+    # 动态创建兼容对象
+    class _CompatSkill:
+        def __init__(self, meta: SkillMeta, dir_path: str = ""):
+            self.name = meta.name
+            self.display_name = meta.name
+            self.description = meta.description
+            self.tags = meta.tags
+            self.priority = meta.priority
+            self.tools = meta.tools
+            self.body = meta.instructions
+            self.dir_path = dir_path
+    result = {}
+    for name, meta in _skills.items():
+        dir_path = get_skill_dir(name) or ""
+        result[name] = _CompatSkill(meta, dir_path)
+    return result
+
+
 def get_persona_body() -> str:
     """返回 persona.md 的 Markdown body（不含 frontmatter）。"""
     load_semantics()
@@ -324,6 +391,16 @@ def get_agent_rules_text() -> str:
 def get_planner_text() -> str:
     """返回 planner.md 的 Markdown body。"""
     path = _SEMANTICS_DIR / "planner.md"
+    if not path.exists():
+        return ""
+    content = path.read_text(encoding="utf-8")
+    _, body = _parse_skill_md(content)
+    return body
+
+
+def get_judge_text() -> str:
+    """返回 judge.md 的 Markdown body。"""
+    path = _SEMANTICS_DIR / "judge.md"
     if not path.exists():
         return ""
     content = path.read_text(encoding="utf-8")

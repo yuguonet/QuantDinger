@@ -11,28 +11,10 @@ description: Agent 执行规范 — 工具调用、错误处理、输出格式
 5. **确定性输出** — 同样数据必须得出同样结论，不因"感觉"改变判断。
 6. **中文回答**。
 
-## 输出格式（金融分析）
+## 输出要求
 
-```json
-{
-    "action": "buy/sell/hold/skip",
-    "score": 0-100,
-    "direction": "bullish/bearish/neutral",
-    "confidence": "high/medium/low",
-    "timeframe": "T+3",
-    "timeframe_reason": "为什么选这个时间维度",
-    "stock_code": "6位代码",
-    "stock_name": "股票名称",
-    "signal": "一句话信号摘要",
-    "factors": [
-        {"name": "维度名", "score": 0-100, "direction": "bullish/bearish/neutral"}
-    ],
-    "analysis": "完整分析文字"
-}
-```
-
-- ToolCallingAgent: 用 `final_answer` 工具调用返回上述 JSON
-- CodeAgent: 用 `final_answer({...})` 返回上述字典
+- 用 `final_answer()` 返回结果，内容为**原始数据 + 一句话关键结论**
+- 不需要结构化 JSON，最终输出由 Judge 统一处理
 - 打招呼、闲聊直接回答，不走分析流程
 
 ## 运行上下文
