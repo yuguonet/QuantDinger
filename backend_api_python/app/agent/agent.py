@@ -1272,9 +1272,19 @@ class _AgentExecutor:
         for loop_step in range(max_loop_steps):
             logger.info("[StepLoop] 决策下一步 (loop_step=%d)", loop_step)
 
+            # 提取已用工具列表（去重，保序）
+            _used_tool_names = [tc.get("tool", "") for tc in all_tool_calls if tc.get("tool")]
+            # 构建已获取数据摘要（取最近 N 条内容的前 200 字）
+            _fetched_preview = ""
+            if all_content:
+                _recent = all_content[-3:]  # 最近 3 步
+                _fetched_preview = "\n".join(f"- 步骤{i+len(all_content)-len(_recent)+1}: {c[:200]}" for i, c in enumerate(_recent) if c)
+
             step_result = planner.plan_next_step(
                 query=message, judge_context=judge_context, intent=intent,
                 stock_code=stock_code, stock_name=stock_name, context_summary="",
+                already_used_tools=_used_tool_names,
+                already_fetched_data=_fetched_preview,
             )
             if not step_result.success:
                 logger.warning("[StepLoop] Planner 决策失败: %s", step_result.reasoning)
@@ -1327,6 +1337,10 @@ class _AgentExecutor:
             judge_summaries.append(judge_result.summary)
             judge_context = judge_result.next_context
             logger.info("[Judge] step=%d continue=%s summary=%s", loop_step + 1, judge_result.continue_loop, judge_result.summary[:50])
+
+            # 第2轮起，用 Judge 摘要替换用户消息（推理驱动）
+            if judge_result.next_context:
+                message = judge_result.next_context
 
             if not judge_result.continue_loop:
                 logger.info("[Judge] 决定停止: %s", judge_result.reasoning)
@@ -1405,9 +1419,19 @@ class _AgentExecutor:
                 yield {"type": "tool_info", "tool": "", "message": f"── 决策第 {loop_step + 1} 步 ──"}
 
             # ── LLM#2 Planner：选工具（只看 Judge 摘要，不看原始数据）──
+            # 提取已用工具列表（去重，保序）
+            _used_tool_names = [tc.get("tool", "") for tc in _stream_tool_calls if tc.get("tool")]
+            # 构建已获取数据摘要（取最近 N 条内容的前 200 字）
+            _fetched_preview = ""
+            if all_content:
+                _recent = all_content[-3:]
+                _fetched_preview = "\n".join(f"- 步骤{i+len(all_content)-len(_recent)+1}: {c[:200]}" for i, c in enumerate(_recent) if c)
+
             step_result = planner.plan_next_step(
                 query=message, judge_context=judge_context, intent=intent,
                 stock_code=stock_code, stock_name=stock_name, context_summary="",
+                already_used_tools=_used_tool_names,
+                already_fetched_data=_fetched_preview,
             )
 
             if not step_result.success:
@@ -1515,6 +1539,10 @@ class _AgentExecutor:
             )
             judge_summaries.append(judge_result.summary)
             judge_context = judge_result.next_context
+
+            # 第2轮起，用 Judge 摘要替换用户消息（推理驱动）
+            if judge_result.next_context:
+                message = judge_result.next_context
 
             logger.info("[Judge] step=%d continue=%s summary=%s", loop_step + 1, judge_result.continue_loop, judge_result.summary[:50])
             if stream:

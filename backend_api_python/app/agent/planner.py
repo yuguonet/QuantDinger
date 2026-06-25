@@ -102,6 +102,8 @@ class Planner:
         stock_code: str = "",
         stock_name: str = "",
         context_summary: str = "",
+        already_used_tools: List[str] = None,
+        already_fetched_data: str = "",
     ) -> StepResult:
         """根据用户消息和 Judge 上下文摘要，决定下一步。
 
@@ -112,6 +114,8 @@ class Planner:
             stock_code: 股票代码（可选）
             stock_name: 股票名称（可选）
             context_summary: 对话历史摘要（可选）
+            already_used_tools: 前序步骤已调用的工具列表（去重）
+            already_fetched_data: 前序步骤已获取的数据摘要
 
         Returns:
             StepResult
@@ -124,7 +128,11 @@ class Planner:
             return StepResult(success=False, reasoning="LLM 不可用", elapsed_ms=(time.time() - t0) * 1000)
 
         try:
-            step_data = self._llm_decide_next_step(query, judge_context, intent, stock_code, stock_name, context_summary)
+            step_data = self._llm_decide_next_step(
+                query, judge_context, intent, stock_code, stock_name, context_summary,
+                already_used_tools=already_used_tools,
+                already_fetched_data=already_fetched_data,
+            )
             # ── 调试日志：Planner 输出 JSON ──
             print(f"[DEBUG] Planner 输出 JSON: {json.dumps(step_data, ensure_ascii=False, indent=2)}")
         except Exception as e:
@@ -169,10 +177,12 @@ class Planner:
         stock_code: str = "",
         stock_name: str = "",
         context_summary: str = "",
+        already_used_tools: List[str] = None,
+        already_fetched_data: str = "",
     ) -> Dict[str, Any]:
         """调用 LLM 决策下一步。返回原始 JSON dict。
 
-        注入上下文：人设 + Judge 摘要 + 规则 + 全量 skill + 全量 tool
+        注入上下文：人设 + Judge 摘要 + 规则 + 全量 skill + 全量 tool + 已用工具
         """
         # 1. 人设
         persona_section = ""
@@ -227,11 +237,24 @@ class Planner:
         if context_summary:
             context_section = f"\n## 对话历史\n{context_summary}\n"
 
+        # 8. 已用工具（避免重复调用）
+        used_tools_section = ""
+        if already_used_tools:
+            unique_tools = list(dict.fromkeys(already_used_tools))  # 保序去重
+            used_tools_section = f"\n## 前序步骤已调用的工具\n{', '.join(unique_tools)}\n\n⚠️ 不要重复调用上述工具，除非需要用不同参数获取不同数据。\n"
+
+        # 9. 已获取数据摘要
+        fetched_data_section = ""
+        if already_fetched_data:
+            fetched_data_section = f"\n## 前序步骤已获取的数据\n{already_fetched_data}\n\n请基于已有数据决定下一步，不要重复获取相同数据。\n"
+
         prompt = (
             f"{persona_section}\n\n"
             "你是量化分析单步决策器。根据用户问题和上一步结论，选出最相关的工具。\n\n"
             f"## 用户问题\n{query}{stock_info}{intent_info}\n\n"
             f"{judge_section}"
+            f"{used_tools_section}"
+            f"{fetched_data_section}"
             f"{context_section}\n"
             f"## 可用技能\n{skills_section}\n\n"
             f"## 可用工具\n{tools_section}\n\n"

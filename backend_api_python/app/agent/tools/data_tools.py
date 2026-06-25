@@ -96,15 +96,14 @@ def get_realtime_quote(codes: str) -> Dict[str, Any]:
     return {"count": len(results), "data": results}
 
 def agent_get_kline(codes: str, timeframe: str = "1D", days: int = 60, market: str = "") -> Dict[str, Any]:
-    """K线数据：返回 date/open/high/low/close/volume 数组，支持 A股/港股/美股/加密货币。
+    """K线数据：返回 date/open/high/low/close/volume 数组，支持 A股/港股, 数据量大,适合单独分析。
 
     Args:
         codes: 多股用逗号分隔
         timeframe: K线周期，可选值: 1m, 5m, 15m, 30m, 1H, 4H, 1D, 1W。默认 1D（日线）
         days: 获取天数，默认60天，最大250天（仅对日线及以上周期有意义）
-        market: 市场类型，可选值: CNStock, HKStock, Crypto, Forex, USStock, Futures, MOEX。
+        market: 市场类型，可选值: CNStock, HKStock。
                 留空则自动推断（A股6位数字→CNStock, HK前缀→HKStock, USDT结尾→Crypto 等）。
-                当自动推断不准时（如美股代码、期货合约）需手动指定。
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
