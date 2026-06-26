@@ -1,0 +1,14 @@
+{
+    "analyze+stock": {
+        "chain": [],
+        "fail_count": 4,
+        "failed_tools": [],
+        "last_fail_time": "2026-06-27 00:36:37"
+    },
+    "unknown+unknown": {
+        "chain": [],
+        "fail_count": 1,
+        "failed_tools": [],
+        "last_fail_time": "2026-06-26 23:54:53"
+    }
+}

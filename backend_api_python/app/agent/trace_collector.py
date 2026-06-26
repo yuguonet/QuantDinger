@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 from app.agent.chain.schema import (
     EvalNode, FactorItem, Layer, SkillReport, Status,
 )
+from app.agent.json_extractor import extract_decision
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,7 @@ class TraceCollector:
     def stock_code(self, value):
         if isinstance(value, dict):
             results = value.get("results", [])
-            self._stock_code = results[0]["code"] if results else ""
+            self._stock_code = results[0].get("code", "") if results else ""
         elif value is not None:
             self._stock_code = str(value).strip()
         else:
@@ -72,7 +73,7 @@ class TraceCollector:
     def stock_name(self, value):
         if isinstance(value, dict):
             results = value.get("results", [])
-            self._stock_name = results[0]["name"] if results else ""
+            self._stock_name = results[0].get("name", "") if results else ""
         elif value is not None:
             self._stock_name = str(value).strip()
         else:
@@ -196,7 +197,6 @@ class TraceCollector:
 
         返回 dict，字段缺失时返回空 dict（触发 fallback）。
         """
-        from app.agent.json_extractor import extract_decision
         result = extract_decision(answer)
         return result if result else {}
 

@@ -62,14 +62,12 @@ def _publish(event: dict):
         try:
             q.put_nowait(event)
         except queue.Full:
-            dead.append(q)
-    if dead:
-        with _subscribers_lock:
-            for q in dead:
-                try:
-                    _subscribers.remove(q)
-                except ValueError:
-                    pass
+            # 慢速 subscriber：丢弃最旧事件而不是断连，保持实时性
+            try:
+                q.get_nowait()
+                q.put_nowait(event)
+            except queue.Empty:
+                pass
 
 
 def _make_event(event_type: str, job_id: int, job_name: str, **extra) -> dict:
@@ -157,30 +155,17 @@ def _import_function(path: str) -> Callable:
 
 
 def _execute_prompt_job(job: Dict[str, Any]):
-    prompt = job["prompt"]
-    job_name = job["name"]
-    job_id = job["id"]
+    prompt = job.get("prompt", "")
+    job_name = job.get("name", "unknown")
+    job_id = job.get("id", 0)
 
     _publish(_make_event("job_start", job_id, job_name, mode="prompt"))
 
     try:
-        from app.agent.agent import build_agent_executor
-        from app.agent.intent_analyzer import analyze_intent
-
-        # skill_registry 已移除：新架构 skill 通过 SKILL.md 管理
-        # 先做意图分析，拿到 domain 以过滤工具
-        intent = analyze_intent(prompt, session_id=f"cron_{job_id}")
-        domain = intent.domain if intent else "unknown"
-
-        executor = build_agent_executor(
-            user_id="cron",
-            max_steps=8,
-            timeout_seconds=120,
-            domain=domain,
-        )
+        from app.agent.graph import chat
 
         session_id = f"cron_{job_id}_{int(_time.time())}"
-        result = executor.chat(
+        result = chat(
             message=prompt,
             session_id=session_id,
             context={"source": "cron", "job_name": job_name},
@@ -212,9 +197,9 @@ def _execute_prompt_job(job: Dict[str, Any]):
 
 
 def _execute_function_job(job: Dict[str, Any]):
-    func_path = job["function_path"]
-    job_name = job["name"]
-    job_id = job["id"]
+    func_path = job.get("function_path", "")
+    job_name = job.get("name", "unknown")
+    job_id = job.get("id", 0)
 
     _publish(_make_event("job_start", job_id, job_name, mode="function", function_path=func_path))
 

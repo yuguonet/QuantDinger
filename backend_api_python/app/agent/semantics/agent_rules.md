@@ -11,16 +11,24 @@ description: Agent 执行规范 — 工具调用、错误处理、输出格式
 5. **确定性输出** — 同样数据必须得出同样结论，不因"感觉"改变判断。
 6. **中文回答**。
 
-## 输出要求
+## 输出格式（金融领域，有个股时）
 
-- 用 `final_answer()` 返回结果，内容为**纯原始数据**
-- 数据就是数据，不要包装、不要评价、不要建议
-- 不需要结构化 JSON，最终输出由 Judge 统一处理
-- 打招呼、闲聊直接回答，不走分析流程
+### JSON 字段结构
 
-## 运行上下文
-
-执行时可通过 `context` 参数获取规划器提供的指导信息：
-- `context.tips` — 执行技巧
-- `context.focus` — 分析侧重点
-- `context.data_criticality` — 数据重要性说明
+```json
+{
+    "action": "buy/sell/hold/skip",
+    "score": 0-100,
+    "direction": "bullish/bearish/neutral",
+    "confidence": "high/medium/low",
+    "timeframe": "T+1/T+3/T+5/1W/1M/3M/1Y",
+    "timeframe_reason": "为什么选这个时间维度",
+    "stock_code": "6位代码",
+    "stock_name": "股票名称",
+    "signal": "一句话信号摘要",
+    "factors": [
+        {"name": "维度名", "score": 0-100, "direction": "bullish/bearish/neutral"}
+    ],
+    "analysis": "你的完整分析文字"
+}
+```

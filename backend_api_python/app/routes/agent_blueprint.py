@@ -156,12 +156,26 @@ def _build_context(data: Dict, session: Dict, message: str) -> tuple:
 
 
 def _build_executor(user_id):
-    from app.agent.agent import build_agent_executor
-    return build_agent_executor(
-        user_id=user_id,
-        max_steps=int(os.getenv("AGENT_MAX_STEPS", "10")),
-        timeout_seconds=float(os.getenv("AGENT_TIMEOUT_SECONDS", "180")),
-    )
+    from app.agent import graph as _graph
+    max_steps = int(os.getenv("AGENT_MAX_STEPS", "10"))
+    timeout_seconds = float(os.getenv("AGENT_TIMEOUT_SECONDS", "180"))
+
+    class _GraphExecutor:
+        def chat(self, message, session_id, context, user_id):
+            return _graph.chat(
+                message=message, session_id=session_id,
+                context=context, user_id=user_id,
+                max_loop_steps=max_steps,
+            )
+
+        def chat_stream(self, message, session_id, context, user_id):
+            return _graph.chat_stream(
+                message=message, session_id=session_id,
+                context=context, user_id=user_id,
+                max_loop_steps=max_steps,
+            )
+
+    return _GraphExecutor()
 
 
 def _parse_request(data: Dict) -> tuple:

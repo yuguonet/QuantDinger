@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import threading
 import time
@@ -739,14 +740,12 @@ def stop_cleanup_scheduler():
 
 def _safe_session_id(session_id: str) -> str:
     """Sanitize session ID for use as directory name."""
-    import re
     safe = re.sub(r"[^a-zA-Z0-9_\-.]", "_", session_id)
     return safe[:64] or "default"
 
 
 def _sanitize_filename(name: str) -> str:
     """Sanitize filename to prevent path traversal."""
-    import re
     name = os.path.basename(name)
     name = re.sub(r"[^a-zA-Z0-9_\-.]", "_", name)
     return name[:128] or "unnamed"
@@ -759,7 +758,6 @@ def _versioned_filename(name: str, version: int) -> str:
 
 def _base_name(versioned: str) -> str:
     """Extract base name from a versioned filename."""
-    import re
     m = re.match(r"^(.+?)\.v\d+$", versioned)
     return m.group(1) if m else versioned
 

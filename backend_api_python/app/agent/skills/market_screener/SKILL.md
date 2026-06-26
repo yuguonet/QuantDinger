@@ -93,10 +93,10 @@ Phase 1 的核心是先判断市场状态,再根据状态调整选股策略:
 
 ```python
 from app.agent.skills.market_screener.run import pre_screen
-result = pre_screen()  # 无参数,自动根据当前时间选择策略
-# result["market"] → 市场状态(资金流向、板块强弱)
-# result["main_themes"] → 主线题材
-# result["candidates"] → 候选股列表
+phase1 = pre_screen()  # 无参数,自动根据当前时间选择策略
+# phase1["market"] → 市场状态(资金流向、板块强弱)
+# phase1["main_themes"] → 主线题材
+# phase1["candidates"] → 候选股列表
 ```
 
 > ⚠️ `pre_screen()` 不接受任何参数。不要传入 filters、kwargs 或其他参数。
@@ -107,10 +107,11 @@ result = pre_screen()  # 无参数,自动根据当前时间选择策略
 
 ```python
 from app.agent.skills.market_screener.run import deep_analyze
-final = deep_analyze(result)
-# final["output_data"]["analyzed"] → 深入分析结果
-# final["score"] → 综合评分
-# final["analysis"] → Markdown 报告
+phase2 = deep_analyze(phase1)
+# phase2["output_data"]["analyzed"] → 深入分析结果
+# phase2["score"] → 综合评分
+# phase2["analysis"] → Markdown 报告
+# 没有 generate_final_report 函数，deep_analyze 就是最后一步
 ```
 
 调用的工具(Phase 2 内部自动调用,无需手动):

@@ -17,12 +17,15 @@ Tool Context — 运行时上下文注入。
 from __future__ import annotations
 
 import contextvars
+import logging
 from typing import Any, Callable, Dict, Optional
 
 # Context variable for current tool call context
 _tool_context: contextvars.ContextVar[Dict[str, Any]] = contextvars.ContextVar(
     "tool_context", default={}
 )
+
+logger = logging.getLogger(__name__)
 
 
 def set_tool_context(ctx: Dict[str, Any]):
@@ -37,29 +40,29 @@ def get_tool_context() -> Dict[str, Any]:
 
 def get_session_id() -> str:
     """Get current session_id from context."""
-    return _tool_context.get({}).get("session_id", "")
+    return get_tool_context().get("session_id", "")
 
 
 def get_user_id() -> int:
     """Get current user_id from context."""
-    return _tool_context.get({}).get("user_id", 1)
+    return get_tool_context().get("user_id", 1)
 
 
 def get_domain() -> str:
     """Get current domain from context."""
-    return _tool_context.get({}).get("domain", "default")
+    return get_tool_context().get("domain", "default")
 
 
 def get_progress_callback() -> Optional[Callable]:
     """Get current progress_callback from context (for real-time streaming)."""
-    return _tool_context.get({}).get("progress_callback")
+    return get_tool_context().get("progress_callback")
 
 
 def emit_progress(event: Dict[str, Any]):
     """Emit a progress event via the current callback (if any)."""
-    cb = _tool_context.get({}).get("progress_callback")
+    cb = get_tool_context().get("progress_callback")
     if cb:
         try:
             cb(event)
         except Exception:
-            pass
+            logger.warning("progress_callback 抛异常", exc_info=True)

@@ -1137,7 +1137,7 @@ def _run_task(task: str):
         _schedule_next(task, delay_seconds=_RETRY_INTERVAL)
 
 
-def _core_startup(task: str) -> str:
+def _core_startup(task: str, check_running: bool = True) -> str:
     """核心启动: 全新拉取 → 修复循环(≤10次) → 终态(ok/error)。
 
     流程:
@@ -1150,6 +1150,13 @@ def _core_startup(task: str) -> str:
          b. 部分完成(本轮修复>0) → continue 下一轮
          c. 未完成(本轮修复=0) → 完成度>90% → ok; 否则 → error
       3. 循环用尽 → 完成度>90% → ok; 否则 → error
+
+    Args:
+        task: "15m" / "1D"
+        check_running: 是否检查 _running 全局标志。
+                       定时器回调 (schedule 模式) 为 True，
+                       直接 API 调用 (run_1d / run_15m) 为 False，
+                       因为 _running 默认 False (start_scheduler 未调用)。
     """
     _prepare_datasources()
 
@@ -1163,12 +1170,12 @@ def _core_startup(task: str) -> str:
     logger.info(f"[同步] {task} 全新拉取未全部完成 (status={status}), 进入修复循环 (max {_MAX_REPAIR_ATTEMPTS} 轮)")
 
     for attempt in range(1, _MAX_REPAIR_ATTEMPTS + 1):
-        if not _running:
+        if check_running and not _running:
             return "unknown"
 
         # 等待 20s
         _time.sleep(_RETRY_INTERVAL)
-        if not _running:
+        if check_running and not _running:
             return "unknown"
 
         # 读取当前状态
@@ -1452,10 +1459,10 @@ def stop_scheduler():
 def run_15m() -> str:
     """执行 15m 回填，返回 "ok" / "error"。"""
     _prepare_datasources()
-    return _core_startup("15m")
+    return _core_startup("15m", check_running=False)
 
 
 def run_1d() -> str:
     """执行 1D 回填，返回 "ok" / "error"。"""
     _prepare_datasources()
-    return _core_startup("1D")
+    return _core_startup("1D", check_running=False)

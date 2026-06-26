@@ -203,9 +203,14 @@ def _call_llm_for_intent(
 
 def _parse_intent_json(raw: str) -> Dict[str, Any]:
     """从 LLM 输出中提取 JSON。容错处理。"""
-    # 提取 JSON 块
+    # 先用共享的 extract_json 尝试
+    from app.agent.json_extractor import extract_json
+    data = extract_json(raw)
+    if data and "domain" in data:
+        return _validate_intent(data)
+
+    # 后备：intent 专属的宽松模式（无 json 标记的块、行内 domain 匹配）
     patterns = [
-        r'```json\s*\n?(.*?)\n?\s*```',
         r'```\s*\n?(.*?)\n?\s*```',
         r'(\{[^{}]*"domain"[^{}]*\})',
     ]
@@ -258,6 +263,7 @@ def analyze_intent(
     provider: str = None,
     history: List[Dict[str, str]] = None,
     session_id: str = None,
+    context_summary: str = "",
 ) -> IntentResult:
     """分析用户消息的意图。
 
@@ -287,15 +293,9 @@ def analyze_intent(
         return quick
 
     # ── Level 2: LLM 意图分类 + 上下文压缩 ────────────────────
-    # 获取上轮摘要
-    context_summary = ""
-    if session_id:
-        try:
-            from app.agent.session_store import get_session_store
-            store = get_session_store()
-            context_summary, _ = store.get_context_summary(session_id)
-        except Exception:
-            pass
+    # 获取上轮摘要（由调用方传入，不再从 session_store 读）
+    if not context_summary and session_id:
+        context_summary = ""
 
     # 单次 LLM 调用
     try:
@@ -352,14 +352,9 @@ def analyze_intent(
         "tool_chain": tool_chain,
     }
 
-    # 保存摘要到 session store
+    # 摘要由调用方（LangGraph checkpointer）管理，不再存 session_store
     if session_id and new_summary:
-        try:
-            from app.agent.session_store import get_session_store
-            store = get_session_store()
-            store.save_context_summary(session_id, new_summary, domain=domain)
-        except Exception:
-            pass
+        pass  # checkpointer 自动持久化
 
     # §15 计算执行策略（替代 domain 做路由决策）
     # traced: 金融领域，走 TraceCollector + EvalNode 树

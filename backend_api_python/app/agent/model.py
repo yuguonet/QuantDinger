@@ -41,7 +41,7 @@ def _fix_llm_output(text: str) -> str:
             prefix = text[:m.start()].rstrip()
             if prefix:
                 prefix += "\n"
-            return f'{prefix}<code>\nfinal_answer({json_str})\n</code>'
+            return f'{prefix}<code>\nfinal_answer({json_str.replace("</code>", "<\\/code>")})\n</code>'
         except _json.JSONDecodeError:
             pass
     return text

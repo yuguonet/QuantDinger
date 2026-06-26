@@ -398,15 +398,6 @@ def get_planner_text() -> str:
     return body
 
 
-def get_judge_text() -> str:
-    """返回 judge.md 的 Markdown body。"""
-    path = _SEMANTICS_DIR / "judge.md"
-    if not path.exists():
-        return ""
-    content = path.read_text(encoding="utf-8")
-    _, body = _parse_skill_md(content)
-    return body
-
 
 
 

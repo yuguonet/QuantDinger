@@ -5,17 +5,15 @@ Planner — LLM 单步决策器。
 职责：每次只输出一步执行指令，执行完后根据结果决定下一步。
 
 流程：
-  1. 接收：用户消息 + Judge 上下文摘要
+  1. 接收：用户消息 + 上下文摘要
   2. 输出：下一步执行指令（工具选择）
 
 设计原则：
   - 每次只输出一步，不规划多步
-  - 根据 Judge 摘要决定下一步工具
-  - 不判断任务是否完成（由 Judge 负责）
+  - 根据上下文和已获取数据决定下一步工具
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import time
@@ -94,9 +92,10 @@ class Planner:
         stock_code: str = "",
         stock_name: str = "",
         context_summary: str = "",
-        loop_state=None,
+        step_records: list = None,
+        **kwargs,
     ) -> StepResult:
-        """根据用户消息和 LoopState，决定下一步。
+        """根据用户消息和已有步骤记录，决定下一步工具。
 
         Args:
             query: 用户原始消息
@@ -104,7 +103,7 @@ class Planner:
             stock_code: 股票代码
             stock_name: 股票名称
             context_summary: 对话历史摘要
-            loop_state: LoopState 对象（包含全部进度信息）
+            step_records: list of dict（来自 State.step_records）
 
         Returns:
             StepResult
@@ -115,53 +114,39 @@ class Planner:
             logger.warning("[Planner] LLM 不可用，返回失败")
             return StepResult(success=False, reasoning="LLM 不可用", elapsed_ms=(time.time() - t0) * 1000)
 
-        # 从 LoopState 提取进度信息
+        step_records = step_records or []
+
+        # 从 step_records 提取进度信息
         already_used_tools = []
         already_fetched_data = ""
-        judge_feedback = ""
-        redo_hint = ""
-        if loop_state:
-            for rec in loop_state.step_records:
-                for tc in rec.tool_calls:
-                    name = tc.get("tool", "")
-                    if name and name not in already_used_tools:
-                        already_used_tools.append(name)
-            if loop_state.step_records:
-                recent = loop_state.step_records[-3:]
-                parts = []
-                for r in recent:
-                    parts.append(f"- 步骤{r.step}({r.description}): {r.step_content[:200]}" if r.step_content else f"- 步骤{r.step}: 无数据")
-                already_fetched_data = "\n".join(parts)
-            # Judge 否决/重做反馈
-            if loop_state.judge_veto and loop_state.redo_from >= 0:
-                redo_hint = f"\n⚠️ Judge 否决了步骤{loop_state.redo_from}，需要从该步重新规划。原因: {loop_state.step_records[loop_state.redo_from - 1].judge_corrections if loop_state.redo_from <= len(loop_state.step_records) else '未知'}"
-            elif loop_state.step_records:
-                last = loop_state.step_records[-1]
-                if last.judge_corrections:
-                    judge_feedback = f"\nJudge 纠错: {last.judge_corrections}"
+        for rec in step_records:
+            for tc in rec.get("tool_calls", []):
+                name = tc.get("tool", "")
+                if name and name not in already_used_tools:
+                    already_used_tools.append(name)
+            if not rec.get("tool_calls"):
+                for t in rec.get("tools", []):
+                    if t and t not in already_used_tools:
+                        already_used_tools.append(t)
+        if step_records:
+            recent = step_records[-3:]
+            parts = []
+            for r in recent:
+                step = r.get("step", "?")
+                desc = r.get("description", "")
+                content = r.get("step_content", "")
+                parts.append(f"- 步骤{step}({desc}): {content[:200]}" if content else f"- 步骤{step}: 无数据")
+            already_fetched_data = "\n".join(parts)
 
-            # 打印进度
-            done_steps = len(loop_state.step_records)
+            done_steps = len(step_records)
             done_tools = len(already_used_tools)
             print(f"[Planner] 进度: 已完成{done_steps}步, 已用{done_tools}个工具: {already_used_tools}")
-            # 打印规划进度
-            if loop_state.planned_steps:
-                print(f"[Planner] 规划 ({len(loop_state.planned_steps)}步):")
-                for ps in loop_state.planned_steps:
-                    status = ps.get("status", "pending")
-                    marker = "✅" if status == "done" else "🔄" if status == "doing" else "⬜"
-                    print(f"  {marker} 步骤{ps.get('step','?')}: {ps.get('description','')} | 工具: {ps.get('tools',[])}")
-            if judge_feedback:
-                print(f"[Planner] Judge反馈: {judge_feedback.strip()}")
-            if redo_hint:
-                print(f"[Planner] 重做: {redo_hint.strip()}")
 
         try:
             step_data = self._llm_decide_next_step(
                 query, intent, stock_code, stock_name, context_summary,
                 already_used_tools=already_used_tools,
                 already_fetched_data=already_fetched_data,
-                judge_feedback=judge_feedback + redo_hint,
             )
             print(f"[DEBUG] Planner 输出 JSON: {json.dumps(step_data, ensure_ascii=False, indent=2)}")
         except Exception as e:
@@ -212,11 +197,10 @@ class Planner:
         context_summary: str = "",
         already_used_tools: List[str] = None,
         already_fetched_data: str = "",
-        judge_feedback: str = "",
     ) -> Dict[str, Any]:
         """调用 LLM 决策下一步。返回原始 JSON dict。
 
-        注入上下文：人设 + Judge 摘要 + 规则 + 全量 skill + 全量 tool + 已用工具
+        注入上下文：人设 + 规则 + 全量 skill + 全量 tool + 已用工具 + 已获取数据
         """
         # 1. 人设
         persona_section = ""
@@ -236,12 +220,10 @@ class Planner:
         if intent and (intent.verb or intent.noun or intent.domain):
             intent_info = f"\n意图: verb={intent.verb or '-'}, noun={intent.noun or '-'}, domain={intent.domain or '-'}"
 
-        # 3. 已获取数据 + Judge 反馈
+        # 3. 已获取数据
         data_section = ""
         if already_fetched_data:
             data_section = f"\n## 已获取的数据\n{already_fetched_data}\n"
-        if judge_feedback:
-            data_section += f"\n{judge_feedback}\n"
 
         # 4. 全量 skill 摘要
         skills_section = ""
@@ -295,7 +277,6 @@ class Planner:
             f"## 可用工具\n{tools_section}\n\n"
             f"{planner_section}\n\n"
             "## 输出格式（只输出 JSON）\n"
-            "```json\n"
             "```json\n"
             "{\n"
             '  "skill": null,\n'

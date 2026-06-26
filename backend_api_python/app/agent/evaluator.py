@@ -231,4 +231,5 @@ def _load_failures() -> Dict:
 
 
 def _save_failures(data: Dict):
+    _FAILURES_PATH.parent.mkdir(parents=True, exist_ok=True)
     _FAILURES_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=4), encoding="utf-8")

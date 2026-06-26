@@ -40,6 +40,49 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+
+# ── Shared context summary helpers ─────────────────────────────
+
+def _append_summary_round(summaries, key, summary, max_rounds=5):
+    """Append a summary round to the given key in a context_summaries dict."""
+    rounds = summaries.get(key)
+    if not isinstance(rounds, list):
+        rounds = []
+    _next = (rounds[-1]["round"] + 1) if rounds else 1
+    rounds.append({"round": _next, "summary": summary})
+    if len(rounds) > max_rounds:
+        rounds = rounds[-max_rounds:]
+    summaries[key] = rounds
+
+
+def _format_context_rounds(rounds, with_age=False):
+    """Format a rounds value (list of dict or legacy str) to output format.
+
+    Returns (str, int) if with_age else str.
+    """
+    if isinstance(rounds, str) and rounds:
+        return (rounds, 0) if with_age else rounds
+    if not isinstance(rounds, list) or not rounds:
+        return ("", 0) if with_age else ""
+    parts = [f"--- R{r['round']} ---\n{r['summary']}" for r in rounds]
+    joined = "\n".join(parts)
+    return (joined, len(rounds)) if with_age else joined
+
+
+def _redis_parse_rounds(raw):
+    """Parse a raw Redis hash value into a rounds list."""
+    if raw is None:
+        return []
+    raw = raw.decode() if isinstance(raw, bytes) else raw
+    if not raw:
+        return []
+    try:
+        rounds = json.loads(raw)
+        return rounds if isinstance(rounds, list) else []
+    except (ValueError, TypeError):
+        return []
+
+
 # Redis keys
 _SESSION_PREFIX = "agent:session:"
 _CONVERSATION_PREFIX = "agent:conv:"
@@ -191,40 +234,18 @@ class _InMemoryStore:
     def save_context_summary(self, session_id: str, summary: str, domain: str = "") -> None:
         """保存压缩上下文摘要。按领域分别存储，追加轮次而非覆盖。空summary只确保key存在，不清除已有轮次。"""
         with self._lock:
-            if session_id not in self._sessions:
-                self._sessions[session_id] = {}
-            s = self._sessions[session_id]
+            s = self._sessions.setdefault(session_id, {})
             if domain:
-                if "context_summaries" not in s:
-                    s["context_summaries"] = {}
+                summaries = s.setdefault("context_summaries", {})
                 if summary:
-                    _rounds = s["context_summaries"].get(domain)
-                    if not isinstance(_rounds, list):
-                        _rounds = []
-                    _next_round = (_rounds[-1]["round"] + 1) if _rounds else 1
-                    _rounds.append({"round": _next_round, "summary": summary})
-                    # 最多保留最近 5 轮
-                    if len(_rounds) > 5:
-                        _rounds = _rounds[-5:]
-                    s["context_summaries"][domain] = _rounds
-                else:
-                    # 空 summary → 确保 key 存在，不清除已有轮次
-                    if domain not in s["context_summaries"]:
-                        s["context_summaries"][domain] = []
+                    _append_summary_round(summaries, domain, summary)
+                elif domain not in summaries:
+                    summaries[domain] = []
                 s["current_domain"] = domain
             elif summary:
                 cur = s.get("current_domain", "")
                 if cur:
-                    if "context_summaries" not in s:
-                        s["context_summaries"] = {}
-                    _rounds = s["context_summaries"].get(cur)
-                    if not isinstance(_rounds, list):
-                        _rounds = []
-                    _next_round = (_rounds[-1]["round"] + 1) if _rounds else 1
-                    _rounds.append({"round": _next_round, "summary": summary})
-                    if len(_rounds) > 5:
-                        _rounds = _rounds[-5:]
-                    s["context_summaries"][cur] = _rounds
+                    _append_summary_round(s.setdefault("context_summaries", {}), cur, summary)
             s["updated_at"] = time.time()
 
     def get_context_summary(self, session_id: str, current_domain: str = "", with_age: bool = False):
@@ -235,29 +256,11 @@ class _InMemoryStore:
             with_age=True: (拼接摘要, 总轮次数) 元组
         """
         with self._lock:
+            if not current_domain:
+                return ("", 0) if with_age else ""
             s = self._sessions.get(session_id, {})
-            if current_domain:
-                rounds = s.get("context_summaries", {}).get(current_domain, "")
-                # 兼容旧格式（纯字符串）
-                if isinstance(rounds, str) and rounds:
-                    if with_age:
-                        return rounds, 0
-                    return rounds
-                if not isinstance(rounds, list) or not rounds:
-                    if with_age:
-                        return "", 0
-                    return ""
-                # 拼接轮次，带分隔符
-                parts = []
-                for r in rounds:
-                    parts.append(f"--- R{r['round']} ---\n{r['summary']}")
-                joined = "\n".join(parts)
-                if with_age:
-                    return joined, len(rounds)
-                return joined
-            if with_age:
-                return "", 0
-            return ""
+            rounds = s.get("context_summaries", {}).get(current_domain, "")
+            return _format_context_rounds(rounds, with_age)
 
     # ── Maintenance ──────────────────────────────────────────
 
@@ -450,53 +453,28 @@ class _RedisStore:
         return f"quantdinger:ctx_domain:{session_id}"
 
     def save_context_summary(self, session_id: str, summary: str, domain: str = "") -> None:
+        key = self._context_summaries_key(session_id)
         if domain:
-            key = self._context_summaries_key(session_id)
             if summary:
-                raw = self._r.hget(key, domain)
-                existing = raw.decode() if isinstance(raw, bytes) else (raw or "")
-                rounds = []
-                if existing:
-                    try:
-                        import json as _json
-                        rounds = _json.loads(existing)
-                        if not isinstance(rounds, list):
-                            rounds = []
-                    except (ValueError, TypeError):
-                        rounds = []
-                _next_round = (rounds[-1]["round"] + 1) if rounds else 1
-                rounds.append({"round": _next_round, "summary": summary})
+                rounds = _redis_parse_rounds(self._r.hget(key, domain))
+                _next = (rounds[-1]["round"] + 1) if rounds else 1
+                rounds.append({"round": _next, "summary": summary})
                 if len(rounds) > 5:
                     rounds = rounds[-5:]
-                import json as _json
-                self._r.hset(key, domain, _json.dumps(rounds, ensure_ascii=False))
-            else:
-                # 空 summary → 不处理（不清除已有轮次）
-                pass
+                self._r.hset(key, domain, json.dumps(rounds, ensure_ascii=False))
+            # 空 summary → 不处理（不清除已有轮次）
             self._r.expire(key, 3600)
             self._r.set(self._context_domain_key(session_id), domain, ex=3600)
         elif summary:
             cur = self._r.get(self._context_domain_key(session_id))
             cur = cur.decode() if isinstance(cur, bytes) else (cur or "")
             if cur:
-                key = self._context_summaries_key(session_id)
-                raw = self._r.hget(key, cur)
-                existing = raw.decode() if isinstance(raw, bytes) else (raw or "")
-                rounds = []
-                if existing:
-                    try:
-                        import json as _json
-                        rounds = _json.loads(existing)
-                        if not isinstance(rounds, list):
-                            rounds = []
-                    except (ValueError, TypeError):
-                        rounds = []
-                _next_round = (rounds[-1]["round"] + 1) if rounds else 1
-                rounds.append({"round": _next_round, "summary": summary})
+                rounds = _redis_parse_rounds(self._r.hget(key, cur))
+                _next = (rounds[-1]["round"] + 1) if rounds else 1
+                rounds.append({"round": _next, "summary": summary})
                 if len(rounds) > 5:
                     rounds = rounds[-5:]
-                import json as _json
-                self._r.hset(key, cur, _json.dumps(rounds, ensure_ascii=False))
+                self._r.hset(key, cur, json.dumps(rounds, ensure_ascii=False))
                 self._r.expire(key, 3600)
 
     def _context_ages_key(self, session_id: str) -> str:
@@ -509,14 +487,10 @@ class _RedisStore:
         data = raw.decode() if isinstance(raw, bytes) else (raw or "")
         if not data:
             return ("", 0) if with_age else ""
-        # 尝试解析 JSON 轮次列表
         try:
-            import json as _json
-            rounds = _json.loads(data)
-            if isinstance(rounds, list) and rounds:
-                parts = [f"--- R{r['round']} ---\n{r['summary']}" for r in rounds]
-                joined = "\n".join(parts)
-                return (joined, len(rounds)) if with_age else joined
+            rounds = json.loads(data)
+            if isinstance(rounds, list):
+                return _format_context_rounds(rounds, with_age)
         except (ValueError, TypeError):
             pass
         # 兼容旧格式（纯字符串）
@@ -739,7 +713,6 @@ class _FileStore:
         with self._lock:
             data = self._read(session_id)
             if not data:
-                # 自动创建最小 session 结构
                 data = {
                     "session": {"updated_at": time.time()},
                     "history": [],
@@ -750,30 +723,14 @@ class _FileStore:
             if domain:
                 summaries = data.setdefault("context_summaries", {})
                 if summary:
-                    rounds = summaries.get(domain)
-                    if not isinstance(rounds, list):
-                        rounds = []
-                    _next_round = (rounds[-1]["round"] + 1) if rounds else 1
-                    rounds.append({"round": _next_round, "summary": summary})
-                    if len(rounds) > 5:
-                        rounds = rounds[-5:]
-                    summaries[domain] = rounds
-                else:
-                    # 空 summary → 确保 key 存在，不清除已有轮次
-                    if domain not in summaries:
-                        summaries[domain] = []
+                    _append_summary_round(summaries, domain, summary)
+                elif domain not in summaries:
+                    summaries[domain] = []
                 data["current_domain"] = domain
             elif summary:
+                cur = data.get("current_domain", "")
                 if cur:
-                    summaries = data.setdefault("context_summaries", {})
-                    rounds = summaries.get(cur)
-                    if not isinstance(rounds, list):
-                        rounds = []
-                    _next_round = (rounds[-1]["round"] + 1) if rounds else 1
-                    rounds.append({"round": _next_round, "summary": summary})
-                    if len(rounds) > 5:
-                        rounds = rounds[-5:]
-                    summaries[cur] = rounds
+                    _append_summary_round(data.setdefault("context_summaries", {}), cur, summary)
             data.setdefault("session", {})["updated_at"] = time.time()
             self._write(session_id, data)
 
@@ -785,14 +742,7 @@ class _FileStore:
             if not data:
                 return ("", 0) if with_age else ""
             rounds = data.get("context_summaries", {}).get(current_domain, "")
-            # 兼容旧格式（纯字符串）
-            if isinstance(rounds, str) and rounds:
-                return (rounds, 0) if with_age else rounds
-            if not isinstance(rounds, list) or not rounds:
-                return ("", 0) if with_age else ""
-            parts = [f"--- R{r['round']} ---\n{r['summary']}" for r in rounds]
-            joined = "\n".join(parts)
-            return (joined, len(rounds)) if with_age else joined
+            return _format_context_rounds(rounds, with_age)
 
     # ── Maintenance ──────────────────────────────────────────
 
