@@ -9,7 +9,7 @@ Judge — LLM #4 循环控制器。
   4. 最终输出 — 所有步骤结束后，读取 checkpoint 全量数据，输出结构化结果
 
 设计原则：
-  - 每步结束后调用 judge_step() → 产出摘要 + 继续/停止决策
+  - 每步结束后调用 review_step() → 产出摘要 + 继续/停止决策
   - 循环结束后调用 judge_final() → 产出最终金融分析 JSON
   - 不执行工具，只做判断和总结
 """
@@ -25,16 +25,6 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class StepJudgeResult:
-    """单步判断结果。"""
-    continue_loop: bool = True
-    summary: str = ""               # 一句话关键结论
-    corrections: Optional[str] = None  # 纠错建议（None=无问题）
-    next_context: str = ""          # 传给下一轮 Planner 的上下文摘要
-    reasoning: str = ""             # 判断理由
-    elapsed_ms: float = 0.0
-
-
 @dataclass
 class FinalJudgeResult:
     """最终输出结果。"""
@@ -63,159 +53,116 @@ class Judge:
                 logger.debug("[Judge] judge.md 加载失败: %s", e)
         return self._judge_rules
 
-    # ── 单步判断 ──────────────────────────────────────────────
-
-    def judge_step(
+    def review_step(
         self,
         query: str,
-        step_number: int,
-        step_description: str,
-        step_content: str,
-        step_success: bool,
-        previous_summaries: List[str],
-        step_queue_remaining: int,
+        step_record,
+        all_records: list,
         intent=None,
         stock_code: str = "",
         stock_name: str = "",
-    ) -> StepJudgeResult:
-        """每步结束后调用，判断下一步行为。
+    ):
+        """审查单步结果，写入 StepRecord 的 judge 字段。
 
-        Args:
-            query: 用户原始消息
-            step_number: 当前步骤编号
-            step_description: 当前步骤描述（Planner 给的）
-            step_content: Agent 返回的原始数据
-            step_success: 步骤是否执行成功
-            previous_summaries: 之前步骤的摘要列表（Judge 产出的）
-            step_queue_remaining: 剩余步骤数
-            intent: IntentResult 对象
-            stock_code: 股票代码
-            stock_name: 股票名称
-
-        Returns:
-            StepJudgeResult
+        同时返回 (continue_loop, veto, redo_from) 供循环控制。
         """
         t0 = time.time()
 
         if not self._call_llm:
-            # LLM 不可用，用简单逻辑兜底
-            return StepJudgeResult(
-                continue_loop=step_success and step_queue_remaining > 0,
-                summary=step_content[:100] if step_content else "执行完成",
-                next_context=step_content[:200] if step_content else "",
-                reasoning="LLM 不可用，使用简单逻辑",
-                elapsed_ms=(time.time() - t0) * 1000,
-            )
+            return True, False, -1
 
         try:
-            raw = self._llm_judge_step(
-                query, step_number, step_description, step_content,
-                step_success, previous_summaries, step_queue_remaining,
-                intent, stock_code, stock_name,
+            raw = self._llm_review_step(
+                query, step_record, all_records, intent, stock_code, stock_name,
             )
-            result = self._parse_step_judge(raw, step_success, step_queue_remaining)
-            result.elapsed_ms = (time.time() - t0) * 1000
-            return result
+            result = self._parse_review(raw)
+            # 写入 StepRecord
+            step_record.judge_summary = result.get("summary", "")
+            step_record.judge_corrections = result.get("corrections")
+            step_record.judge_continue = result.get("continue", True)
+            step_record.judge_reasoning = result.get("reasoning", "")
+            elapsed = (time.time() - t0) * 1000
+            logger.info("[Judge] 审查 step=%d continue=%s veto=%s %.0fms",
+                        step_record.step, result.get("continue"), result.get("veto"), elapsed)
+            return (
+                result.get("continue", True),
+                result.get("veto", False),
+                result.get("redo_from", -1),
+            )
         except Exception as e:
-            logger.warning("[Judge] 步骤判断失败: %s", e)
-            return StepJudgeResult(
-                continue_loop=step_success and step_queue_remaining > 0,
-                summary=step_content[:100] if step_content else "执行完成",
-                reasoning=f"Judge 异常: {e}",
-                elapsed_ms=(time.time() - t0) * 1000,
-            )
+            logger.warning("[Judge] 审查失败: %s", e)
+            return True, False, -1
 
-    def _llm_judge_step(
+    def _llm_review_step(
         self,
         query: str,
-        step_number: int,
-        step_description: str,
-        step_content: str,
-        step_success: bool,
-        previous_summaries: List[str],
-        step_queue_remaining: int,
+        step_record,
+        all_records: list,
         intent=None,
         stock_code: str = "",
         stock_name: str = "",
     ) -> str:
-        """构建 prompt 并调用 LLM。"""
-        # 意图信息
+        """构建审查 prompt。"""
         intent_info = ""
         if intent and (intent.verb or intent.noun or intent.domain):
             intent_info = f"\n意图: verb={intent.verb or '-'}, noun={intent.noun or '-'}, domain={intent.domain or '-'}"
-
-        # 股票信息
         stock_info = ""
         if stock_code:
             stock_info = f"\n标的: {stock_name or '未知'}（{stock_code}）"
 
-        # 前序摘要
-        summaries_section = ""
-        if previous_summaries:
-            summaries_section = "\n## 前序步骤结论\n"
-            for i, s in enumerate(previous_summaries, 1):
-                summaries_section += f"- 步骤{i}: {s}\n"
+        # 前序步骤摘要
+        history = ""
+        if len(all_records) > 1:
+            history = "\n## 前序步骤\n"
+            for r in all_records[:-1]:
+                history += f"- 步骤{r.step}: {r.description} → {r.judge_summary or '未审查'}\n"
 
-        # 当前步骤结果
-        content_preview = step_content[:1500] if step_content else "无数据"
+        content_preview = step_record.step_content[:1500] if step_record.step_content else "无数据"
+        tools_info = f"\n工具: {', '.join(step_record.tools)}" if step_record.tools else ""
+        if step_record.planner_reasoning:
+            tools_info += f"\nPlanner推理: {step_record.planner_reasoning}"
 
-        # 从 judge.md 加载规则
         judge_rules = self._get_judge_rules()
 
         prompt = (
-            f"你是量化分析循环控制器。\n\n"
+            f"你是量化分析质量审查员。\n\n"
             f"## 用户问题\n{query}{stock_info}{intent_info}\n\n"
-            f"{summaries_section}\n"
-            f"## 当前步骤（第{step_number}步）\n"
-            f"- 描述: {step_description}\n"
-            f"- 成功: {step_success}\n"
-            f"- 原始数据:\n{content_preview}\n\n"
+            f"{history}\n"
+            f"## 当前步骤（第{step_record.step}步）\n"
+            f"- 描述: {step_record.description}\n"
+            f"- 成功: {step_record.step_success}\n"
+            f"- 原始数据:\n{content_preview}\n"
+            f"{tools_info}\n\n"
             f"## 输出格式（只输出 JSON）\n"
             f"```json\n"
             f'{{\n'
             f'  "continue": true/false,\n'
-            f'  "summary": "一句话关键结论，30字以内",\n'
+            f'  "veto": false,\n'
+            f'  "redo_from": -1,\n'
+            f'  "summary": "一句话结论，30字以内",\n'
             f'  "corrections": null 或 "纠错建议",\n'
-            f'  "next_context": "传给下一步的上下文，50字以内",\n'
             f'  "reasoning": "判断理由，20字以内"\n'
             f'}}\n'
             f"```\n\n"
             f"{judge_rules}\n"
         )
-
         return self._call_llm(prompt)
 
-    def _parse_step_judge(self, raw: str, step_success: bool, step_queue_remaining: int) -> StepJudgeResult:
-        """解析 LLM 输出。"""
+    def _parse_review(self, raw: str) -> Dict[str, Any]:
+        """解析审查结果。"""
         import re
-
         cleaned = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
         cleaned = re.sub(r'```json\s*', '', cleaned).strip()
         cleaned = re.sub(r'```\s*$', '', cleaned).strip()
-
-        # 提取 JSON
         brace_match = re.search(r'\{.*\}', cleaned, re.DOTALL)
         if brace_match:
             try:
-                data = json.loads(brace_match.group())
-                return StepJudgeResult(
-                    continue_loop=bool(data.get("continue", True)),
-                    summary=str(data.get("summary", ""))[:100],
-                    corrections=data.get("corrections"),
-                    next_context=str(data.get("next_context", ""))[:200],
-                    reasoning=str(data.get("reasoning", "")),
-                )
+                return json.loads(brace_match.group())
             except json.JSONDecodeError:
                 pass
+        return {"continue": True, "veto": False, "redo_from": -1, "summary": "审查解析失败"}
 
-        # 解析失败，用默认逻辑
-        return StepJudgeResult(
-            continue_loop=step_success and step_queue_remaining > 0,
-            summary="步骤完成（Judge 解析失败）",
-            reasoning="JSON 解析失败，使用默认逻辑",
-        )
-
-    # ── 最终输出 ──────────────────────────────────────────────
+    # ── 单步判断 ──────────────────────────────────────────────
 
     def judge_final(
         self,

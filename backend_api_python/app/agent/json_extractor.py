@@ -19,8 +19,9 @@ from typing import Any, Dict, Optional
 # 统一的 JSON 块匹配模式（按优先级排序）
 _JSON_PATTERNS = [
     r'```json\s*\n?(.*?)\n?\s*```',                    # markdown JSON 块
-    r'(\{[^{}]*"action"[^{}]*"score"[^{}]*\})',        # 行内 action+score
-    r'(\{[^{}]*"score"[^{}]*"action"[^{}]*\})',        # 行内 score+action
+    r'(\{[^{}]*"action"[^{}]*"score"[^{}]*\})',        # 行内 action+score（无嵌套）
+    r'(\{[^{}]*"score"[^{}]*"action"[^{}]*\})',        # 行内 score+action（无嵌套）
+    r'(\{\s*"action"\s*:\s*"[^"]+".*?"score"\s*:\s*\d+.*?\})',  # 嵌套 JSON（含数组/对象）
 ]
 
 

@@ -13,6 +13,7 @@
 - Agent 自主推理（smolagents CodeAgent），TraceCollector 自动追踪
 - EvalNode 树存库 → 盘后回溯验证 → 权重自动迭代
 - 核心指标：单位时间收益率（不是胜率）
+- 架构通用性,不局限在金融领域,所有领域保持通用性
 
 ## 关键设计文档
 - AGENT_ACCOUNTABLE.md — 可追责架构（2026-06-20 重写，基于当前代码状态）

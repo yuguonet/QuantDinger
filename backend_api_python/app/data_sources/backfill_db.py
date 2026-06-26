@@ -1008,7 +1008,7 @@ _MIN_DELAY = 30               # 最小同步延迟（秒），防止 0 延迟
 
 _timers: dict[str, threading.Timer] = {}
 _running = False
-_MAX_REPAIR_ATTEMPTS = 9                 # 循环<10次修复（初始1次 + 最多9次重试），超过标记 error 退出
+_MAX_REPAIR_ATTEMPTS = 30                # 循环 30 次修复（30×20s = 10 分钟），超过后安排短期重试
 
 
 def _next_trigger_time(task: str) -> datetime:
@@ -1213,12 +1213,11 @@ def _core_startup(task: str) -> str:
             _schedule_next(task, _next_trigger_time(task))
             return "ok"
         else:
-            logger.info(f"[同步] {task} 修复第 {attempt} 轮无进展, 完成度 {sync_rate:.0%} <= 90%, status=error")
+            logger.info(f"[同步] {task} 修复第 {attempt} 轮无进展, 完成度 {sync_rate:.0%} <= 90%, 继续重试")
             if lbt:
-                _update_record(task, lbt, status="error",
+                _update_record(task, lbt, status="re",
                                report=f"修复无进展: 完成度 {sync_rate:.0%}", pool_name="CNStock")
-            _schedule_next(task, _next_trigger_time(task))
-            return "error"
+            continue  # 不退出，继续下一轮修复
 
     # ── 3. 循环用尽 ──
     doc_final = _get_last_update(task, pool_name="CNStock")
@@ -1239,6 +1238,8 @@ def _core_startup(task: str) -> str:
             _update_record(task, lbt, status="ok",
                            report=f"循环 {_MAX_REPAIR_ATTEMPTS} 次修复后完成度 {sync_rate:.0%} > 90%",
                            pool_name="CNStock")
+        _schedule_next(task, _next_trigger_time(task))
+        return "ok"
     else:
         logger.info(f"[同步] {task} 循环 {_MAX_REPAIR_ATTEMPTS} 次修复后完成度 {sync_rate:.0%} <= 90%, status=error")
         if lbt:
@@ -1246,8 +1247,9 @@ def _core_startup(task: str) -> str:
                            report=f"循环 {_MAX_REPAIR_ATTEMPTS} 次修复未完成: 写入{written}/同步{synced}, 失败 {failed}",
                            synced_count=synced, failed_count=failed,
                            written_count=written, pool_name="CNStock")
-    _schedule_next(task, _next_trigger_time(task))
-    return "ok" if sync_rate > 0.9 else "error"
+        # error 状态：安排短期重试（120s 后），而不是等到明天
+        _schedule_next(task, delay_seconds=120)
+        return "error"
 
 
 def _run_fresh_pull(task: str) -> str:

@@ -635,11 +635,6 @@ def get_smolagent(
         _extra_kwargs["executor_kwargs"] = {"timeout_seconds": _code_exec_timeout}
 
     # §15: 用 strategy 替代 domain 做 JSON 校验决策
-    # traced 策略 + 有 stock_code → 强制 JSON 校验；其他 → 宽松校验
-    # 无 stock_code 时 system prompt 不会注入 JSON 格式指令（见 _build_instructions），
-    # Agent 不再输出结构化 JSON，只需非空检查
-    checks = [_check_dashboard_json]
-
     agent = AgentClass(
         tools=tools,
         model=smol_model,
@@ -649,7 +644,6 @@ def get_smolagent(
         return_full_result=True,
         stream_outputs=True,
         planning_interval=None,
-        final_answer_checks=checks,
         **_extra_kwargs,
     )
 
@@ -790,6 +784,7 @@ class _AgentExecutor:
                     "[Intent] domain=%s strategy=%s intent=%s confidence=%.2f",
                     domain, result.strategy, intent.intent, intent.confidence,
                 )
+                print(f"[Intent] domain={domain} verb={result.verb} noun={result.noun} conf={intent.confidence:.2f}")
                 logger.debug(
                     "[Intent] domain=%s strategy=%s intent=%s confidence=%.2f verb=%s noun=%s",
                     domain, result.strategy, intent.intent, intent.confidence,
@@ -862,6 +857,7 @@ class _AgentExecutor:
                     if _name:
                         stock_name = _name
                         logger.info("[Prepare] 中文名 → 代码 %s", stock_code)
+                        print(f"[Prepare] 中文名解析: {stock_code}")
             if stock_code:
                 # 用 DB 权威名称覆盖 LLM 猜测的名称
                 try:
@@ -876,6 +872,7 @@ class _AgentExecutor:
                 except Exception as e:
                     logger.debug("[Prepare] stock_name 校正失败: %s", e)
                 result.intent_meta["stock_code"] = stock_code
+                print(f"[Prepare] stock_code={stock_code} name={stock_name}")
                 if stock_name:
                     result.intent_meta["stock_name"] = stock_name
                 if session_id:
@@ -1237,6 +1234,7 @@ class _AgentExecutor:
                                      planner, intent, stock_code, stock_name):
         """单步决策循环（阻塞版，返回元组）。"""
         logger.info("[StepLoop] 入口（阻塞）| stock=%s %s", stock_code, stock_name)
+        print(f"[StepLoop] ═══ 开始 ═══ stock={stock_name}({stock_code})")
 
         _agent_config = {
             "user_id": meta.get("user_id", 1),
@@ -1252,118 +1250,121 @@ class _AgentExecutor:
             "strategy": meta.get("strategy", "direct"),
         }
 
-        all_content = []
-        all_tool_calls = []
-        all_charts = []
-        total_steps = 0
-        total_tokens = 0
-        last_result = None
         max_loop_steps = 10
 
-        from app.agent.checkpoint import get_checkpoint_manager
+        from app.agent.checkpoint import get_checkpoint_manager, LoopStateStore, StepRecord
         ckpt_mgr = get_checkpoint_manager(session_id)
+        state_store = LoopStateStore(ckpt_mgr)
+        state = state_store.state
+        state.query = message
+        state.stock_code = stock_code
+        state.stock_name = stock_name
 
         from app.agent.judge import Judge
         judge = Judge(call_llm=planner._call_llm)
-        judge_context = ""
-        judge_summaries = []
 
         all_phases_completed = False
         for loop_step in range(max_loop_steps):
-            logger.info("[StepLoop] 决策下一步 (loop_step=%d)", loop_step)
+            state.current_step = loop_step
+            logger.info("[StepLoop] 第 %d 步", loop_step)
 
-            # 提取已用工具列表（去重，保序）
-            _used_tool_names = [tc.get("tool", "") for tc in all_tool_calls if tc.get("tool")]
-            # 构建已获取数据摘要（取最近 N 条内容的前 200 字）
-            _fetched_preview = ""
-            if all_content:
-                _recent = all_content[-3:]  # 最近 3 步
-                _fetched_preview = "\n".join(f"- 步骤{i+len(all_content)-len(_recent)+1}: {c[:200]}" for i, c in enumerate(_recent) if c)
-
+            # ── Planner：读 LoopState，选工具 ──
             step_result = planner.plan_next_step(
-                query=message, judge_context=judge_context, intent=intent,
-                stock_code=stock_code, stock_name=stock_name, context_summary="",
-                already_used_tools=_used_tool_names,
-                already_fetched_data=_fetched_preview,
+                query=message, intent=intent,
+                stock_code=stock_code, stock_name=stock_name,
+                loop_state=state,
             )
             if not step_result.success:
                 logger.warning("[StepLoop] Planner 决策失败: %s", step_result.reasoning)
                 break
 
-            logger.info("[StepLoop] 执行步骤: skill=%s, tools=%s", step_result.skill, step_result.tools)
-
-            ckpt_mgr.save(
-                step=loop_step + 1, skill=step_result.skill, description=step_result.description,
-                tools=step_result.tools, rules=step_result.rules,
-                step_content="", step_success=False, steps_used=0,
-                all_content=list(all_content), previous_results=[],
-                total_steps=total_steps, total_tokens=total_tokens,
-                stock_code=stock_code, stock_name=stock_name,
-                intent_data={"verb": getattr(intent, 'verb', ''), "noun": getattr(intent, 'noun', ''),
-                             "domain": getattr(intent, 'domain', '')},
-            )
-
-            step_context = self._build_step_context(step_result, stock_code, stock_name, judge_context, message)
-            step_agent = self._build_step_agent(step_result, _agent_config, message)
-
-            step_success, step_content, step_tool_calls, step_steps, step_tokens, step_charts, step_result_obj = \
-                self._execute_phase(step_agent, step_context, self.max_steps, context, meta, store, session_id)
-
-            all_content.append(step_content or "")
-            all_tool_calls.extend(step_tool_calls or [])
-            all_charts.extend(step_charts or [])
-            total_steps += step_steps
-            total_tokens += step_tokens
-            last_result = step_result_obj
-
-            _cp = ckpt_mgr.load(loop_step + 1)
-            if _cp:
-                _cp.step_content = step_content or ""
-                _cp.step_success = step_success
-                _cp.steps_used = step_steps
-
-            if not step_result.tools and step_success:
-                logger.info("[StepLoop] Planner 无工具可选且上一步成功，任务完成")
+            # 空工具 → Planner 认为完成
+            if not step_result.tools and not step_result.skill:
+                logger.info("[StepLoop] Planner 无工具可选，规划完成")
+                all_phases_completed = True
                 break
 
-            remaining = max_loop_steps - loop_step - 1
-            judge_result = judge.judge_step(
-                query=message, step_number=loop_step + 1,
-                step_description=step_result.description, step_content=step_content or "",
-                step_success=step_success, previous_summaries=judge_summaries,
-                step_queue_remaining=remaining, intent=intent,
+            logger.info("[StepLoop] 执行: skill=%s tools=%s", step_result.skill, step_result.tools)
+            print(f"[StepLoop] 第{loop_step+1}步: {step_result.description} | 工具: {step_result.tools}")
+
+            # 创建 StepRecord
+            record = StepRecord(
+                step=loop_step,
+                skill=step_result.skill,
+                description=step_result.description,
+                tools=step_result.tools,
+                rules=step_result.rules,
+                planner_reasoning=step_result.reasoning,
+            )
+
+            # ── Agent 执行 ──
+            step_context = self._build_step_context(step_result, stock_code, stock_name, state)
+            step_agent = self._build_step_agent(step_result, _agent_config, message)
+            step_success, step_content, step_tool_calls, step_steps, step_tokens, step_charts, _ = \
+                self._execute_phase(step_agent, step_context, self.max_steps, context, meta, store, session_id)
+
+            record.step_content = step_content or ""
+            record.step_success = step_success
+            record.steps_used = step_steps
+            record.step_tokens = step_tokens
+            record.tool_calls = step_tool_calls or []
+            record.charts = step_charts or []
+            state.step_records.append(record)
+            state.total_steps += step_steps
+            state.total_tokens += step_tokens
+            state.planned_steps.append({
+                "step": loop_step, "skill": step_result.skill,
+                "description": step_result.description, "tools": step_result.tools,
+            })
+            state_store.save()
+
+            # ── Judge 审查 ──
+            continue_loop, veto, redo_from = judge.review_step(
+                query=message, step_record=record,
+                all_records=state.step_records, intent=intent,
                 stock_code=stock_code, stock_name=stock_name,
             )
-            judge_summaries.append(judge_result.summary)
-            judge_context = judge_result.next_context
-            logger.info("[Judge] step=%d continue=%s summary=%s", loop_step + 1, judge_result.continue_loop, judge_result.summary[:50])
+            state.judge_veto = veto
+            state.redo_from = redo_from
+            state.judge_stop = not continue_loop
+            state_store.save()
 
-            # 第2轮起，用 Judge 摘要替换用户消息（推理驱动）
-            if judge_result.next_context:
-                message = judge_result.next_context
+            logger.info("[Judge] step=%d continue=%s veto=%s redo=%s summary=%s",
+                        loop_step, continue_loop, veto, redo_from, record.judge_summary[:50])
 
-            if not judge_result.continue_loop:
-                logger.info("[Judge] 决定停止: %s", judge_result.reasoning)
+            # Judge 否决 → 截断，下轮 Planner 重新规划
+            if veto and redo_from >= 0:
+                logger.info("[Judge] 否决步骤%d，从步骤%d重做", loop_step, redo_from)
+                state.step_records = state.step_records[:redo_from]
+                state.judge_veto = False
+                state.redo_from = -1
+                state_store.save()
+                continue
+
+            # Judge 提前叫停（数据已足够）
+            if not continue_loop:
+                logger.info("[Judge] 提前叫停: %s", record.judge_reasoning)
+                all_phases_completed = True
                 break
         else:
             all_phases_completed = True
 
+        # ── 最终输出 ──
         final_result = judge.judge_final(
-            query=message, all_summaries=judge_summaries, all_contents=all_content,
+            query=message,
+            all_summaries=[r.judge_summary for r in state.step_records],
+            all_contents=[r.step_content for r in state.step_records],
             intent=intent, stock_code=stock_code, stock_name=stock_name,
         )
-        final_output = final_result.output
-        content = json.dumps(final_output, ensure_ascii=False) if final_output else "\n\n".join(c for c in all_content if c)
+        state.final_output = final_result.output
+        content = json.dumps(final_result.output, ensure_ascii=False) if final_result.output else ""
         success = bool(content)
 
-        if final_result.need_rerun:
-            logger.info("[Judge] 需要补跑: %s", final_result.rerun_hint)
-
-        ckpt_mgr.clear()
+        state_store.clear()
 
         self._post_learn_and_compress(
-            content, success, all_tool_calls,
-            total_steps, total_tokens, meta, session_id, store, agent, last_result,
+            content, success, self._collect_tool_calls(state),
+            state.total_steps, state.total_tokens, meta, session_id, store, agent, last_result,
             chain_def=meta.get("chain_def"), all_phases_completed=all_phases_completed,
         )
         self._save_root_to_traces(content, success, context, meta, message, store)
@@ -1394,44 +1395,27 @@ class _AgentExecutor:
             "strategy": meta.get("strategy", "direct"),
         }
 
-        all_content = []
-        all_tool_calls = []
-        all_charts = []
-        total_steps = 0
-        total_tokens = 0
-        last_result = None
         max_loop_steps = 10
 
-        # ── 断点管理器 ────────────────────────────────────────
-        from app.agent.checkpoint import get_checkpoint_manager
+        from app.agent.checkpoint import get_checkpoint_manager, LoopStateStore
         ckpt_mgr = get_checkpoint_manager(session_id)
+        state_store = LoopStateStore(ckpt_mgr)
+        state = state_store.state
 
-        # ── LLM#4 Judge ───────────────────────────────────────
         from app.agent.judge import Judge
-        judge = Judge(call_llm=planner._call_llm)  # 复用同一个 LLM
-        judge_context = ""        # Judge 产出的上下文摘要，传给 Planner
-        judge_summaries = []       # 所有步骤的摘要
+        judge = Judge(call_llm=planner._call_llm)
 
         all_phases_completed = False
         for loop_step in range(max_loop_steps):
+            state.loop_step = loop_step
             logger.info("[StepLoop] 决策下一步 (loop_step=%d)", loop_step)
             if stream:
                 yield {"type": "tool_info", "tool": "", "message": f"── 决策第 {loop_step + 1} 步 ──"}
 
-            # ── LLM#2 Planner：选工具（只看 Judge 摘要，不看原始数据）──
-            # 提取已用工具列表（去重，保序）
-            _used_tool_names = [tc.get("tool", "") for tc in _stream_tool_calls if tc.get("tool")]
-            # 构建已获取数据摘要（取最近 N 条内容的前 200 字）
-            _fetched_preview = ""
-            if all_content:
-                _recent = all_content[-3:]
-                _fetched_preview = "\n".join(f"- 步骤{i+len(all_content)-len(_recent)+1}: {c[:200]}" for i, c in enumerate(_recent) if c)
-
             step_result = planner.plan_next_step(
-                query=message, judge_context=judge_context, intent=intent,
-                stock_code=stock_code, stock_name=stock_name, context_summary="",
-                already_used_tools=_used_tool_names,
-                already_fetched_data=_fetched_preview,
+                query=message, intent=intent,
+                stock_code=stock_code, stock_name=stock_name,
+                loop_state=state,
             )
 
             if not step_result.success:
@@ -1440,145 +1424,109 @@ class _AgentExecutor:
                     yield {"type": "tool_info", "tool": "", "message": f"❌ 决策失败: {step_result.reasoning}"}
                 break
 
-            # ── 执行当前步骤 ──
             logger.info("[StepLoop] 执行步骤: skill=%s, tools=%s", step_result.skill, step_result.tools)
             if stream:
                 yield {"type": "tool_info", "tool": "", "message": f"── 执行: {step_result.description} ──"}
 
-            # 保存 checkpoint（执行前状态）
+            state_store.save()
             ckpt_mgr.save(
                 step=loop_step + 1,
-                skill=step_result.skill,
-                description=step_result.description,
-                tools=step_result.tools,
-                rules=step_result.rules,
-                step_content="",
-                step_success=False,
-                steps_used=0,
-                all_content=list(all_content),
-                previous_results=[],
-                total_steps=total_steps,
-                total_tokens=total_tokens,
-                stock_code=stock_code,
-                stock_name=stock_name,
+                skill=step_result.skill, description=step_result.description,
+                tools=step_result.tools, rules=step_result.rules,
+                step_content="", step_success=False, steps_used=0,
+                all_content=list([r.step_content for r in state.step_records]), previous_results=[],
+                total_steps=state.total_steps, total_tokens=state.total_tokens,
+                stock_code=stock_code, stock_name=stock_name,
                 intent_data={"verb": getattr(intent, 'verb', ''), "noun": getattr(intent, 'noun', ''),
                              "domain": getattr(intent, 'domain', '')},
             )
 
-            step_context = self._build_step_context(step_result, stock_code, stock_name, judge_context, message)
+            step_context = self._build_step_context(step_result, stock_code, stock_name, state)
             step_agent = self._build_step_agent(step_result, _agent_config, message)
 
-            if stream:
-                content = ""
-                for s in step_agent.run(step_context, max_steps=self.max_steps, stream=True):
-                    events = _step_to_events(s)
-                    for ev in events:
-                        yield ev
-                        if ev.get("type") == "tool_start":
-                            _stream_tool_calls.append({"tool": ev.get("tool", ""), "success": True, "_id": _stream_tool_call_counter})
-                            _pending_tool_ids[ev.get("tool", "")] = _stream_tool_call_counter
-                            _stream_tool_call_counter += 1
-                        elif ev.get("type") == "tool_done":
-                            tool_name = ev.get("tool", "")
-                            pending_id = _pending_tool_ids.pop(tool_name, None)
-                            if pending_id is not None:
-                                for tc in _stream_tool_calls:
-                                    if tc.get("_id") == pending_id:
-                                        tc["success"] = ev.get("success", True)
-                                        break
-                    if isinstance(s, _FAS):
-                        raw = s.output
-                        content = json.dumps(raw, ensure_ascii=False) if isinstance(raw, dict) else (str(raw) if raw else "")
-                step_success = bool(content)
-                step_content = content
-                steps_used = step_agent.step_number if hasattr(step_agent, 'step_number') else 0
-                step_tool_calls = []
-                step_tokens = 0
-                step_charts = []
-                step_result_obj = step_agent
-            else:
-                step_success, step_content, step_tool_calls, step_steps, step_tokens, step_charts, step_result_obj = \
-                    self._execute_phase(step_agent, step_context, self.max_steps, context, meta, store, session_id)
+            content = ""
+            for s in step_agent.run(step_context, max_steps=self.max_steps, stream=True):
+                events = _step_to_events(s)
+                for ev in events:
+                    yield ev
+                    if ev.get("type") == "tool_start":
+                        _stream_tool_calls.append({"tool": ev.get("tool", ""), "success": True, "_id": _stream_tool_call_counter})
+                        _pending_tool_ids[ev.get("tool", "")] = _stream_tool_call_counter
+                        _stream_tool_call_counter += 1
+                    elif ev.get("type") == "tool_done":
+                        tool_name = ev.get("tool", "")
+                        pending_id = _pending_tool_ids.pop(tool_name, None)
+                        if pending_id is not None:
+                            for tc in _stream_tool_calls:
+                                if tc.get("_id") == pending_id:
+                                    tc["success"] = ev.get("success", True)
+                                    break
+                if isinstance(s, _FAS):
+                    raw = s.output
+                    content = json.dumps(raw, ensure_ascii=False) if isinstance(raw, dict) else (str(raw) if raw else "")
+            step_success = bool(content)
+            step_content = content
 
-            all_content.append(step_content or "")
-            if not stream:
-                all_tool_calls.extend(step_tool_calls or [])
-                all_charts.extend(step_charts or [])
-                total_steps += step_steps
-                total_tokens += step_tokens
-            last_result = step_result_obj
+            [r.step_content for r in state.step_records].append(step_content or "")
 
-            # 更新 checkpoint 的执行结果
             _cp = ckpt_mgr.load(loop_step + 1)
             if _cp:
                 _cp.step_content = step_content or ""
-                _cp.step_success = step_success if not stream else bool(step_content)
-                _cp.steps_used = steps_used if stream else step_steps
+                _cp.step_success = step_success
 
-            # ── Planner 无工具可选 → 任务完成 ──
-            step_success_actual = step_success if not stream else bool(step_content)
-            if not step_result.tools and step_success_actual:
+            if not step_result.tools and step_success:
                 logger.info("[StepLoop] Planner 无工具可选且上一步成功，任务完成")
                 if stream:
                     yield {"type": "tool_info", "tool": "", "message": "✅ 任务完成"}
                 break
 
-            # ── LLM#4 Judge：总结 + 纠错 + 控循环 ──
-            remaining = max_loop_steps - loop_step - 1
-            judge_result = judge.judge_step(
-                query=message,
-                step_number=loop_step + 1,
-                step_description=step_result.description,
-                step_content=step_content or "",
-                step_success=step_success_actual,
-                previous_summaries=judge_summaries,
-                step_queue_remaining=remaining,
-                intent=intent,
-                stock_code=stock_code,
-                stock_name=stock_name,
+            # 创建 StepRecord 用于 Judge 审查
+            from app.agent.checkpoint import StepRecord as _SR
+            _rec = _SR(
+                step=loop_step, skill=step_result.skill, description=step_result.description,
+                tools=step_result.tools, rules=step_result.rules,
+                planner_reasoning=step_result.reasoning,
+                step_content=step_content or "", step_success=step_success,
+                tool_calls=[{"tool": tc.get("tool", ""), "success": tc.get("success", True)} for tc in _stream_tool_calls if tc.get("tool")],
             )
-            judge_summaries.append(judge_result.summary)
-            judge_context = judge_result.next_context
+            state.step_records.append(_rec)
 
-            # 第2轮起，用 Judge 摘要替换用户消息（推理驱动）
-            if judge_result.next_context:
-                message = judge_result.next_context
+            continue_loop, veto, redo_from = judge.review_step(
+                query=message, step_record=_rec,
+                all_records=state.step_records, intent=intent,
+                stock_code=stock_code, stock_name=stock_name,
+            )
+            state.judge_veto = veto
+            state.redo_from = redo_from
+            state.judge_stop = not continue_loop
+            state_store.save()
 
-            logger.info("[Judge] step=%d continue=%s summary=%s", loop_step + 1, judge_result.continue_loop, judge_result.summary[:50])
+            logger.info("[Judge] step=%d continue=%s summary=%s", loop_step + 1, continue_loop, _rec.judge_summary[:50])
             if stream:
-                yield {"type": "tool_info", "tool": "", "message": f"📊 {judge_result.summary}"}
-                if judge_result.corrections:
-                    yield {"type": "tool_info", "tool": "", "message": f"⚠️ 纠错: {judge_result.corrections}"}
+                yield {"type": "tool_info", "tool": "", "message": f"📊 {_rec.judge_summary}"}
+                if _rec.judge_corrections:
+                    yield {"type": "tool_info", "tool": "", "message": f"⚠️ 纠错: {_rec.judge_corrections}"}
 
-            # Judge 决定是否继续
-            if not judge_result.continue_loop:
-                logger.info("[Judge] 决定停止: %s", judge_result.reasoning)
+            if not continue_loop:
+                logger.info("[Judge] 决定停止: %s", _rec.judge_reasoning)
                 if stream:
-                    yield {"type": "tool_info", "tool": "", "message": f"✅ {judge_result.reasoning}"}
+                    yield {"type": "tool_info", "tool": "", "message": f"✅ {_rec.judge_reasoning}"}
                 break
         else:
             all_phases_completed = True
 
-        # ── 最终输出：LLM#4 Judge 读取全量数据，输出结构化结果 ──
-        # 保持 summaries 和 contents 一一对应（不过滤空值）
         final_result = judge.judge_final(
-            query=message,
-            all_summaries=judge_summaries,
-            all_contents=all_content,
-            intent=intent,
-            stock_code=stock_code,
-            stock_name=stock_name,
+            query=message, all_summaries=[r.judge_summary for r in state.step_records], all_contents=[r.step_content for r in state.step_records],
+            intent=intent, stock_code=stock_code, stock_name=stock_name,
         )
         final_output = final_result.output
-        content = json.dumps(final_output, ensure_ascii=False) if final_output else "\n\n".join(c for c in all_content if c)
+        content = json.dumps(final_output, ensure_ascii=False) if final_output else "\n\n".join(c for c in [r.step_content for r in state.step_records] if c)
         success = bool(content)
 
-        # 如需补跑（Judge 发现数据缺失）
         if final_result.need_rerun:
             logger.info("[Judge] 需要补跑: %s", final_result.rerun_hint)
 
-        # 清理 checkpoint
-        ckpt_mgr.clear()
+        state_store.clear()
 
         if stream:
             store.add_message(session_id, "assistant", content if isinstance(content, str) else str(content))
@@ -1597,23 +1545,41 @@ class _AgentExecutor:
             }
         else:
             self._post_learn_and_compress(
-                content, success, all_tool_calls,
-                total_steps, total_tokens, meta, session_id, store, agent, last_result,
+                content, success, self._collect_tool_calls(state),
+                state.total_steps, state.total_tokens, meta, session_id, store, agent, None,
                 chain_def=meta.get("chain_def"), all_phases_completed=all_phases_completed,
             )
             self._save_root_to_traces(content, success, context, meta, message, store)
-            return success, content, all_tool_calls, total_steps, total_tokens, all_charts, last_result, all_phases_completed
+            return success, content, self._collect_tool_calls(state), state.total_steps, state.total_tokens, self._collect_charts(state), None, all_phases_completed
 
-    def _build_step_context(self, step_result, stock_code, stock_name, judge_context, message):
+    @staticmethod
+    def _collect_tool_calls(state) -> list:
+        """从 LoopState 收集所有 tool_calls。"""
+        result = []
+        for rec in state.step_records:
+            result.extend(rec.tool_calls)
+        return result
+
+    @staticmethod
+    def _collect_charts(state) -> list:
+        """从 LoopState 收集所有 charts。"""
+        result = []
+        for rec in state.step_records:
+            result.extend(rec.charts)
+        return result
+
+    def _build_step_context(self, step_result, stock_code, stock_name, loop_state):
         """构建当前步骤的上下文。"""
         parts = [
             f"[步骤] {step_result.description}",
             f"标的: {stock_name or '未知'}（{stock_code}）" if stock_code else "",
         ]
 
-        # 注入 Judge 上下文摘要（替代前序结果）
-        if judge_context:
-            parts.append(f"\n上一步结论: {judge_context}")
+        # 注入前序步骤摘要（从 LoopState 读取）
+        if loop_state and loop_state.step_records:
+            parts.append("\n前序步骤结论:")
+            for r in loop_state.step_records:
+                parts.append(f"  步骤{r.step}: {r.description} → {r.judge_summary or r.step_content[:100]}")
 
         # 注入规则
         if step_result.rules:
@@ -1682,7 +1648,6 @@ class _AgentExecutor:
             _stream_tool_calls=_stream_tool_calls,
             _stream_tool_call_counter=_stream_tool_call_counter,
             _pending_tool_ids=_pending_tool_ids,
-            resume_from=resume_from,
         )
 
     def _execute_plan_core(self, agent, chain_def, message, context, meta, store, session_id,
