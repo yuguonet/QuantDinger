@@ -280,10 +280,15 @@ def _get_news(symbol: str, market: str = "CNStock", name: str = "") -> List[Dict
         items = []
         for lang_key in ("cn", "en"):
             for it in resp.get(lang_key) or []:
+                title = it.get("title", "")
+                snippet = it.get("snippet", "")
+                # 去重: snippet 和 title 一样或 snippet 是 title 的子串 → 只留 title
+                if snippet and snippet != title and snippet not in title:
+                    # snippet 有额外信息 → 拼到 title 末尾（截断）
+                    keep = snippet[:80] if len(snippet) > 80 else snippet
+                    title = f"{title} | {keep}" if title else keep
                 items.append({
-                    "title": it.get("title", ""),
-                    "link": it.get("link", ""),
-                    "snippet": it.get("snippet", ""),
+                    "title": title[:120] if title else "",
                     "source": it.get("source", ""),
                     "published": it.get("published", ""),
                     "sentiment": it.get("sentiment", "neutral"),
@@ -320,9 +325,33 @@ def _build_result(items: List[Dict[str, Any]], label: str) -> Dict[str, Any]:
     # 正常按时间倒序
     normal_items.sort(key=lambda x: x.get("published", ""), reverse=True)
 
-    # 合并: 一票否决置顶, 合计≤20
-    merged = veto_items + normal_items
-    merged = merged[:20]
+    # 过滤: 只保留有明确情感倾向的新闻，去掉中性
+    filtered = []
+    for it in veto_items + normal_items:
+        sc = it.get("sentiment_score")
+        sentiment = it.get("sentiment", "neutral")
+        # 一票否决始终保留
+        if it.get("_veto"):
+            filtered.append(it)
+            continue
+        # 有明确分数且非中性 → 保留
+        if sc is not None and sc != 0 and sentiment != "neutral":
+            filtered.append(it)
+            continue
+        # 有分数但中性 → 跳过
+    merged = filtered[:20]
+
+    # 精简: 只保留 title + sentiment + score + source
+    slim = []
+    for it in merged:
+        slim.append({
+            "title": it.get("title", ""),
+            "sentiment": it.get("sentiment", ""),
+            "sentiment_score": it.get("sentiment_score"),
+            "source": it.get("source", ""),
+            "published": it.get("published", ""),
+            **({"_veto": True} if it.get("_veto") else {}),
+        })
 
     return {
         "label": label,
@@ -330,8 +359,8 @@ def _build_result(items: List[Dict[str, Any]], label: str) -> Dict[str, Any]:
         "direction": score_info.get("direction", "中性"),
         "veto": veto,
         "veto_article": veto_article,
-        "count": len(merged),
-        "news": merged,
+        "count": len(slim),
+        "news": slim,
     }
 
 def search_stock_intel(codes: str, name: str = "") -> Dict[str, Any]:
@@ -346,8 +375,11 @@ def search_stock_intel(codes: str, name: str = "") -> Dict[str, Any]:
         return {"error": "codes 不能为空", "retriable": False}
 
     def _one(stock_code: str) -> Dict[str, Any]:
-        items = _get_news(stock_code, "CNStock", name)
-        return _build_result(items, f"个股:{stock_code}")
+        try:
+            items = _get_news(stock_code, "CNStock", name)
+            return _build_result(items, f"个股:{stock_code}")
+        except Exception as e:
+            return {"error": str(e)}
 
     if len(code_list) == 1:
         return _one(code_list[0])

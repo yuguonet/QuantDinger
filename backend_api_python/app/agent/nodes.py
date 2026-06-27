@@ -15,10 +15,11 @@ from app.agent.state import AgentState, AgentResult, StepRecord
 
 logger = logging.getLogger(__name__)
 
-# ── TraceCollector 外部存储 ────────────────────────────────────
-# TraceCollector 实例不可被 msgpack 序列化，不能放入 graph state。
-# 通过 session_id 在模块级 dict 中存取，避免 checkpointer 报错。
+# ── 外部存储（不可序列化对象）────────────────────────────────
+# TraceCollector / smolagents Agent 实例不可被 msgpack 序列化，
+# 不能放入 LangGraph state。通过 session_id 在模块级 dict 中存取。
 _collectors: Dict[str, Any] = {}
+_agents: Dict[str, Any] = {}      # session_id → smolagents CodeAgent（中断用）
 
 def _store_collector(session_id: str, collector: Any) -> None:
     if session_id:
@@ -29,6 +30,19 @@ def _get_collector(session_id: str) -> Optional[Any]:
 
 def _pop_collector(session_id: str) -> Optional[Any]:
     return _collectors.pop(session_id, None)
+
+def _store_agent(session_id: str, agent: Any) -> None:
+    """存储 agent 引用，供中断端点使用。"""
+    if session_id:
+        _agents[session_id] = agent
+
+def _clear_agent(session_id: str) -> None:
+    """agent 执行完毕后清理引用。"""
+    _agents.pop(session_id, None)
+
+def get_active_agent(session_id: str) -> Optional[Any]:
+    """公开接口：获取当前活跃的 agent 实例（供中断使用）。"""
+    return _agents.get(session_id)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -257,6 +271,10 @@ def agent_node(state: AgentState) -> Dict[str, Any]:
         strategy=state.get("strategy", "direct"),
     )
 
+    # 持久化 agent 引用，供 /interrupt 端点使用
+    _session_id = state.get("session_id", "")
+    _store_agent(_session_id, agent)
+
     tool_calls_log = []
     charts = []
     try:
@@ -290,6 +308,9 @@ def agent_node(state: AgentState) -> Dict[str, Any]:
     except Exception as e:
         logger.error("[Agent] 执行失败: %s", e)
         content, success, total_steps, total_tokens = f"执行失败: {e}", False, 0, 0
+    finally:
+        # 执行完毕（成功或失败），清理 agent 引用
+        _clear_agent(_session_id)
 
     record: StepRecord = {
         "step": state.get("loop_step", 0),
@@ -428,9 +449,11 @@ def _save_traces(state: AgentState, content: str) -> None:
 
             sc = state.get("stock_code", "")
             dec = extract_decision(content) if content else None
+            _verb = state.get('intent_verb', '')
+            _noun = state.get('intent_noun', '')
             root = EvalNode(
                 layer=Layer.CHAIN.value,
-                name=f"{state.get('intent_verb', '')}+{state.get('intent_noun', '')}" or "agent",
+                name=f"{_verb}+{_noun}" if _verb or _noun else "agent",
                 exec_date=date.today(), stock_code=sc, stock_name=state.get("stock_name", ""),
                 score=dec.get("score") if dec else None,
                 direction=dec.get("direction", "") if dec else "",

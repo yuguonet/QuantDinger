@@ -155,27 +155,17 @@ def _build_context(data: Dict, session: Dict, message: str) -> tuple:
     return session_id, context, stock_code
 
 
-def _build_executor(user_id):
-    from app.agent import graph as _graph
+def _build_chat_hybrid():
+    from app.agent.graph import chat_hybrid
     max_steps = int(os.getenv("AGENT_MAX_STEPS", "10"))
-    timeout_seconds = float(os.getenv("AGENT_TIMEOUT_SECONDS", "180"))
 
-    class _GraphExecutor:
-        def chat(self, message, session_id, context, user_id):
-            return _graph.chat(
-                message=message, session_id=session_id,
-                context=context, user_id=user_id,
-                max_loop_steps=max_steps,
-            )
-
-        def chat_stream(self, message, session_id, context, user_id):
-            return _graph.chat_stream(
-                message=message, session_id=session_id,
-                context=context, user_id=user_id,
-                max_loop_steps=max_steps,
-            )
-
-    return _GraphExecutor()
+    def _chat(message, session_id, context, user_id):
+        return chat_hybrid(
+            message=message, session_id=session_id,
+            context=context, user_id=user_id,
+            max_loop_steps=max_steps,
+        )
+    return _chat
 
 
 def _parse_request(data: Dict) -> tuple:
@@ -214,58 +204,13 @@ def get_strategies():
 
 
 # ═══════════════════════════════════════════════════════════════
-# 路由: 同步聊天
+# 路由: 聊天（统一混合模式 — 内部 stream，SSE 输出）
 # ═══════════════════════════════════════════════════════════════
 
 @agent_bp.route("/chat", methods=["POST"])
 @login_required
 def agent_chat():
-    try:
-        if os.getenv("AGENT_MODE", "true").lower() != "true":
-            return jsonify({"error": "Agent mode is not enabled"}), 400
-        data = request.get_json()
-        if not data:
-            return jsonify({"error": "Request body must be JSON"}), 400
-
-        message, session_id, err = _parse_request(data)
-        if err:
-            return jsonify({"error": err}), 400
-
-        from flask import g
-        if not _acquire_user_lock(g.user_id):
-            return jsonify({"error": "当前有分析任务运行中，请等待完成后再试", "code": "BUSY"}), 429
-
-        try:
-            session = _get_session(session_id)
-            session_id, context, _ = _build_context(data, session, message)
-
-            executor = _build_executor(g.user_id)
-            result = executor.chat(
-                message=message, session_id=session_id,
-                context=context, user_id=g.user_id,
-            )
-
-            return jsonify({
-                "success": result.success, "content": result.content,
-                "session_id": session_id, "error": result.error,
-                "total_steps": result.total_steps, "total_tokens": result.total_tokens,
-                "model": result.model, "tool_calls_log": result.tool_calls_log,
-                "charts": result.charts,
-            })
-        finally:
-            _release_user_lock(g.user_id)
-    except Exception as e:
-        logger.error("Agent chat failed: %s", e, exc_info=True)
-        return jsonify({"error": str(e)}), 500
-
-
-# ═══════════════════════════════════════════════════════════════
-# 路由: 流式聊天 (SSE)
-# ═══════════════════════════════════════════════════════════════
-
-@agent_bp.route("/chat/stream", methods=["POST"])
-@login_required
-def agent_chat_stream():
+    """统一聊天端点：内部 stream 执行，SSE 推送进度 + 最终结果。"""
     try:
         if os.getenv("AGENT_MODE", "true").lower() != "true":
             return jsonify({"error": "Agent mode is not enabled"}), 400
@@ -285,43 +230,24 @@ def agent_chat_stream():
         session = _get_session(session_id)
         session_id, context, _ = _build_context(data, session, message)
 
+        chat_fn = _build_chat_hybrid()
+
         def _sse():
             event_queue: queue.Queue = queue.Queue()
 
             def _run():
                 try:
-                    executor = _build_executor(user_id)
-                    # Store executor for interrupt support
-                    _run._executor = executor
-                    try:
-                        for ev in executor.chat_stream(
-                            message=message, session_id=session_id,
-                            context=context, user_id=user_id,
-                        ):
-                            event_queue.put(ev)
-                    finally:
-                        unregister_interrupt(session_id)
+                    for ev in chat_fn(
+                        message=message, session_id=session_id,
+                        context=context, user_id=user_id,
+                    ):
+                        event_queue.put(ev)
                 except Exception as exc:
-                    logger.error("Agent stream error: %s", exc, exc_info=True)
+                    logger.error("Agent 执行异常: %s", exc, exc_info=True)
                     event_queue.put({"type": "error", "message": str(exc)})
 
-            _run._executor = None
             t = threading.Thread(target=_run, daemon=True)
             t.start()
-
-            # Wait for agent to be ready, then register interrupt
-            try:
-                # Poll for executor to be set (thread may not have started yet)
-                for _ in range(50):
-                    if _run._executor is not None:
-                        break
-                    time.sleep(0.05)
-                executor_ref = _run._executor
-                if executor_ref and executor_ref._agent_ready_event.wait(timeout=30):
-                    if executor_ref._current_agent:
-                        register_interrupt(session_id, executor_ref._current_agent)
-            except Exception as e:
-                logger.debug("Interrupt registration failed (non-fatal): %s", e)
 
             try:
                 while True:
@@ -331,13 +257,6 @@ def agent_chat_stream():
                         if ev.get("type") in ("done", "error"):
                             break
                     except queue.Empty:
-                        # Timeout — try to interrupt the running agent
-                        try:
-                            executor_ref = _run._executor
-                            if executor_ref and executor_ref._current_agent:
-                                executor_ref._current_agent.interrupt()
-                        except Exception:
-                            pass
                         yield f"data: {json.dumps({'type': 'error', 'message': '分析超时'}, ensure_ascii=False)}\n\n"
                         break
             finally:
@@ -349,7 +268,7 @@ def agent_chat_stream():
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
         )
     except Exception as e:
-        logger.error("Agent stream failed: %s", e, exc_info=True)
+        logger.error("Agent chat failed: %s", e, exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 
@@ -558,27 +477,12 @@ def replay_session(session_id: str):
 # 路由: Agent 中断 (interrupt)
 # ═══════════════════════════════════════════════════════════════
 
-# Global interrupt registry: session_id → agent instance
-_interrupt_registry: Dict[str, Any] = {}
-_interrupt_lock = threading.Lock()
-
-
-def register_interrupt(session_id: str, agent):
-    with _interrupt_lock:
-        _interrupt_registry[session_id] = agent
-
-
-def unregister_interrupt(session_id: str):
-    with _interrupt_lock:
-        _interrupt_registry.pop(session_id, None)
-
-
 @agent_bp.route("/interrupt/<session_id>", methods=["POST"])
 @login_required
 def interrupt_agent(session_id: str):
     """中断正在运行的 Agent。"""
-    with _interrupt_lock:
-        agent = _interrupt_registry.get(session_id)
+    from app.agent.nodes import get_active_agent
+    agent = get_active_agent(session_id)
     if agent:
         agent.interrupt()
         return jsonify({"success": True, "message": "Agent interrupt signal sent"})

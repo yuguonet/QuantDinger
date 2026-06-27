@@ -148,29 +148,6 @@ def _build_instructions(user_message: str = "",
     calibration_section = ""
     # calibration_context 通过外部注入到 user_message 前部
 
-    # 金融领域 JSON 标准化输出规范（按 AGENT_TYPE 区分格式）
-    # 仅当有具体个股且需要输出买卖信号时才注入，否则用自然语言回复
-    finance_json_section = ""
-    if domain == "finance" and stock_code:
-        _agent_cls = _get_agent_class()
-        try:
-            from app.agent.semantics import get_agent_rules_text
-            _of_text = get_agent_rules_text()
-            if _of_text:
-                # 根据 agent 类型选择对应段落
-                if _agent_cls is ToolCallingAgent:
-                    # 提取 ToolCallingAgent 段落
-                    import re as _of_re
-                    _m = _of_re.search(r'## ToolCallingAgent 输出格式\n(.*?)(?=## CodeAgent|$)', _of_text, _of_re.DOTALL)
-                    finance_json_section = f"\n## ⚠️ 输出格式（必须遵守）\n\n{_m.group(1).strip()}\n\n" if _m else ""
-                else:
-                    # 提取 CodeAgent 段落
-                    import re as _of_re
-                    _m = _of_re.search(r'## CodeAgent 输出格式\n(.*?)$', _of_text, _of_re.DOTALL)
-                    finance_json_section = f"\n## ⚠️ 输出格式（必须遵守）\n\n{_m.group(1).strip()}\n\n" if _m else ""
-        except Exception as e:
-            logger.debug("[Instructions] 输出格式加载失败: %s", e)
-
     # 金融领域权重注入
     weight_section = ""
     if domain == "finance":
@@ -207,7 +184,7 @@ def _build_instructions(user_message: str = "",
 4. 按指令执行
 
 {tool_catalog}
-{scan_section}{modify_section}{intent_section}{domain_section}{calibration_section}{weight_section}{finance_json_section}{lang_section}"""
+{scan_section}{modify_section}{intent_section}{domain_section}{calibration_section}{weight_section}{lang_section}"""
 
 
 def get_smolagent(

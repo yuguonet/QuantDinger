@@ -17,36 +17,16 @@ export function getStrategies () {
 
 // ── 聊天 ──────────────────────────────────────────────────
 
-/**
- * 普通聊天
- * POST /api/agent/chat
- */
-export function agentChat (data) {
-  return request({ url: '/api/agent/chat', method: 'post', data })
-}
-
-/**
- * 流式聊天（SSE）
- * POST /api/agent/chat/stream
- */
-export function agentChatStream (data) {
-  return request({
-    url: '/api/agent/chat/stream',
-    method: 'post',
-    data,
-    responseType: 'stream'
-  })
-}
-
 // ── SSE 工具函数 ──────────────────────────────────────────
 
 /**
- * 创建 Agent 流式连接（SSE）
+ * 创建 Agent 流式连接（SSE，统一混合模式）
  * @param {Object} params - { message, session_id, strategy_id?, context? }
  * @param {Object} callbacks - {
- *   onThinking, onToolStart, onToolDone, onGenerating,
- *   onToolStream, onToolInfo,   // 新增：流式输出 + 工具信息
- *   onDone, onError
+ *   onNodeStart, onNodeDone,     // 节点生命周期
+ *   onProgress, onStepContent,   // 进度 + 步骤内容
+ *   onToolStart, onToolDone,     // 工具调用
+ *   onDone, onError              // 最终结果
  * }
  * @returns {{ close: Function }}
  */
@@ -59,7 +39,7 @@ export function createAgentStream (params, callbacks) {
   }
   const lang = storage.get('lang') || 'en-US'
 
-  fetch('/api/agent/chat/stream', {
+  fetch('/api/agent/chat', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -102,13 +82,12 @@ export function createAgentStream (params, callbacks) {
         try {
           const event = JSON.parse(dataStr)
           switch (event.type) {
-            case 'thinking': callbacks.onThinking?.(event); break
+            case 'node_start': callbacks.onNodeStart?.(event); break
+            case 'node_done': callbacks.onNodeDone?.(event); break
+            case 'progress': callbacks.onProgress?.(event); break
+            case 'step_content': callbacks.onStepContent?.(event); break
             case 'tool_start': callbacks.onToolStart?.(event); break
             case 'tool_done': callbacks.onToolDone?.(event); break
-            case 'tool_stream': callbacks.onToolStream?.(event); break
-            case 'tool_info': callbacks.onToolInfo?.(event); break
-            case 'chart': callbacks.onChart?.(event); break
-            case 'generating': callbacks.onGenerating?.(event); break
             case 'done': callbacks.onDone?.(event); break
             case 'error': callbacks.onError?.(event); break
           }

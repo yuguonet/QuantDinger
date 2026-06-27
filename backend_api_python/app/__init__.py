@@ -395,7 +395,13 @@ def create_app(config_name='default'):
             start_reflection_worker()
         except Exception as e:
             logger.warning(f"Reflection worker not started: {e}")
-        # ── Cron: nanobot 内置 cron service 随 AgentLoop 自动启动 ──
+        # ── Cron Worker（定时任务调度）──
+        try:
+            from app.agent.cron_worker import start_cron_worker
+            start_cron_worker()
+            logger.info("[CronWorker] 定时任务调度器已启动")
+        except Exception as e:
+            logger.warning(f"CronWorker not started: {e}")
 
         # ── market_cn 数据刷新调度器 ─────────────────────────
         try:

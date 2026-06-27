@@ -147,11 +147,7 @@
           <template #icon><a-icon type="stop" /></template>
         </a-button>
       </div>
-      <div class="input-hint">
-        <span>流式模式</span>
-        <!-- eslint-disable-next-line vue/no-v-model-argument -->
-        <a-switch v-model:checked="useStream" size="small" />
-      </div>
+
     </div>
 
     <!-- 任务状态抽屉 -->
@@ -199,7 +195,6 @@ import { message } from 'ant-design-vue'
 
 import ChatBubble from './components/ChatBubble.vue'
 import {
-  agentChat,
   triggerAnalysis,
   getAnalysisTasks,
   createAgentStream,
@@ -236,7 +231,6 @@ export default {
     const messages = ref([])
     const inputText = ref('')
     const streaming = ref(false)
-    const useStream = ref(true)
     const connected = ref(false)
     const sessionId = ref(null)
 
@@ -338,47 +332,12 @@ export default {
 
       inputText.value = ''
       pushMessage('user', text)
-
-      if (useStream.value) {
-        await sendStream(text)
-      } else {
-        await sendNormal(text)
-      }
+      await sendStream(text)
     }
 
     function quickAsk (text) {
       inputText.value = text
       sendMessage()
-    }
-
-    async function sendNormal (text) {
-      streaming.value = true
-      pushMessage('assistant', '', { streaming: true })
-
-      try {
-        const { data } = await agentChat({
-          message: text,
-          session_id: sessionId.value,
-          strategy_id: selectedStrategy.value || undefined,
-          context: stockCode.value ? { stock_code: stockCode.value } : undefined
-        })
-        // 处理后端返回的图表数据（非流式模式）
-        if (data.charts && data.charts.length > 0) {
-          const last = messages.value[messages.value.length - 1]
-          if (last) {
-            if (!last.charts) last.charts = []
-            data.charts.forEach(b64 => {
-              try { last.charts.push(atob(b64)) } catch (e) { /* ignore */ }
-            })
-          }
-        }
-        updateLastMessage(data.content || '无响应')
-        connected.value = true
-      } catch (e) {
-        updateLastMessage('请求失败: ' + (e.message || '未知错误'), true)
-      } finally {
-        streaming.value = false
-      }
     }
 
     async function sendStream (text) {
@@ -399,13 +358,12 @@ export default {
           context: stockCode.value ? { stock_code: stockCode.value } : undefined
         },
         {
-          onThinking: makeCb('onThinking'),
+          onNodeStart: makeCb('onNodeStart'),
+          onNodeDone: makeCb('onNodeDone'),
+          onProgress: makeCb('onProgress'),
+          onStepContent: makeCb('onStepContent'),
           onToolStart: makeCb('onToolStart'),
           onToolDone: makeCb('onToolDone'),
-          onToolStream: makeCb('onToolStream'),
-          onToolInfo: makeCb('onToolInfo'),
-          onChart: makeCb('onChart'),
-          onGenerating: makeCb('onGenerating'),
           onDone: makeCb('onDone'),
           onError: makeCb('onError')
         }
@@ -413,8 +371,30 @@ export default {
 
       // 绑定实际回调
       _currentCallbacks = {
-        onThinking: () => {
-          updateLastMessage('🤔 思考中...')
+        onNodeStart: (ev) => {
+          // planner 节点开始时显示思考状态
+          if (ev.node === 'planner') {
+            updateLastMessage('🤔 分析中...')
+          }
+        },
+        onNodeDone: () => {},
+        onProgress: (ev) => {
+          // 工具规划进度
+          const last = messages.value[messages.value.length - 1]
+          if (last && ev.message) {
+            if (!last.progressSteps) last.progressSteps = []
+            last.progressSteps.push(ev.message)
+          }
+          nextTick(() => scrollToBottom())
+        },
+        onStepContent: (ev) => {
+          // 步骤输出内容
+          const last = messages.value[messages.value.length - 1]
+          if (last && ev.content) {
+            if (!last.stepContents) last.stepContents = []
+            last.stepContents.push(ev.content)
+            updateLastMessage(last.stepContents.join('\n\n'))
+          }
         },
         onToolStart: (ev) => {
           toolEvents.push({ ...ev, status: 'loading', streamOutput: '' })
@@ -424,31 +404,19 @@ export default {
           const item = toolEvents.find((t) => t.tool === ev.tool && t.status === 'loading')
           if (item) {
             item.status = ev.success === false ? 'error' : 'done'
-            if (ev.recovery) item.recovery = ev.recovery
           }
-        },
-        onToolStream: (ev) => {
-          const item = toolEvents.find((t) => t.tool === ev.tool && t.status === 'loading')
-          if (item) {
-            item.streamOutput = (item.streamOutput || '') + (ev.output || '')
-            nextTick(() => scrollToBottom())
-          }
-        },
-        onToolInfo: (ev) => {
-          const item = toolEvents.find((t) => t.tool === ev.tool)
-          if (item) item.info = ev.message
-        },
-        onChart: (ev) => {
-          const last = messages.value[messages.value.length - 1]
-          if (last) {
-            if (!last.charts) last.charts = []
-            try { last.charts.push(atob(ev.b64)) } catch (e) { /* ignore */ }
-          }
-        },
-        onGenerating: () => {
-          updateLastMessage('')
         },
         onDone: (ev) => {
+          // 处理图表数据
+          if (ev.charts && ev.charts.length > 0) {
+            const last = messages.value[messages.value.length - 1]
+            if (last) {
+              if (!last.charts) last.charts = []
+              ev.charts.forEach(b64 => {
+                try { last.charts.push(atob(b64)) } catch (e) { /* ignore */ }
+              })
+            }
+          }
           updateLastMessage(ev.content || '完成')
           streaming.value = false
           _streamActive = false
@@ -457,7 +425,7 @@ export default {
           saveMessages()
         },
         onError: (ev) => {
-          updateLastMessage('❌ ' + (ev.message || '流式连接错误'), true)
+          updateLastMessage('❌ ' + (ev.message || '连接错误'), true)
           streaming.value = false
           _streamActive = false
           _activeStream = null
@@ -695,7 +663,6 @@ export default {
       messages,
       inputText,
       streaming,
-      useStream,
       connected,
       stockCode,
       analyzing,
