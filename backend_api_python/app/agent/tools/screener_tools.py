@@ -73,27 +73,18 @@ def _call_eastmoney_api(keyword: str, page_size: int = 200, page_no: int = 1) ->
     return {"code": "0", "msg": result.get("msg", "搜索失败")}
 
 def _parse_stock_item(item: Dict[str, Any]) -> Dict[str, Any]:
-    """将东方财富返回的单只股票解析为标准格式。"""
+    """将东方财富返回的单只股票解析为精简格式。"""
     from app.data_sources.normalizer import safe_float as _sf
     return {
         "code": item.get("SECURITY_CODE", ""),
         "name": item.get("SECURITY_SHORT_NAME", ""),
         "industry": item.get("INDUSTRY", ""),
-        "concept": item.get("CONCEPT", ""),
-        "new_price": _sf(item.get("NEWEST_PRICE")),
         "change_rate": _sf(item.get("CHG")),
-        "high_price": _sf(item.get("HIGH_PRICE")),
-        "low_price": _sf(item.get("LOW_PRICE")),
-        "pre_close_price": _sf(item.get("PRE_CLOSE_PRICE")),
-        "volume": _sf(item.get("TRADE_VOLUME")),
-        "deal_amount": item.get("TRADING_VOLUMES") or item.get("TRADE_AMOUNT"),
-        "volume_ratio": item.get("QRR"),
+        "new_price": _sf(item.get("NEWEST_PRICE")),
         "turnover_rate": _sf(item.get("TURNOVER_RATE")),
-        "amplitude": _sf(item.get("AMPLITUDE")),
         "pe_dynamic": item.get("PE_DYNAMIC") or item.get("PE9"),
         "pb_mrq": item.get("PB_NEW_MRQ"),
         "total_market_cap": item.get("TOEAL_MARKET_VALUE") or item.get("TOTAL_MARKET_CAP"),
-        "free_cap": item.get("FREE_CAP"),
     }
 
 # ══════════════════════════════════════════════════════════════

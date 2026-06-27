@@ -507,8 +507,8 @@ def list_tools():
         mcp_tools = []
 
         qd_names = set()
-        from app.agent.tools.registry import registry as tool_registry
-        qd_names.update(tool_registry.all_names)
+        from app.agent.tools.registry import get_local_registry as _get_registry
+        qd_names.update(_get_registry().all_names)
 
         for t in tools:
             info = {"name": t.name, "description": t.description[:150]}

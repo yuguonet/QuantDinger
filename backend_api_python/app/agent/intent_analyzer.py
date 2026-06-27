@@ -85,53 +85,6 @@ class IntentResult:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 快速通道
-# ═══════════════════════════════════════════════════════════════
-
-# ── 快速通道正则（从 intent.md 加载，改正则只改 YAML）──
-_PUNCT_TAIL = r'[\s\?\?\.\,\!\~\。\，\！\？\…]*'
-_GREETING_RE = None
-_FAREWELL_RE = None
-_THANKS_RE = None
-
-def _ensure_quick_patterns():
-    """从 intent.md 加载快速通道正则。"""
-    global _GREETING_RE, _FAREWELL_RE, _THANKS_RE
-    if _GREETING_RE is not None:
-        return
-    _ensure_intent_loaded()
-    from app.agent.semantics import get_intent_meta
-    meta = get_intent_meta()
-    if meta is None:
-        # intent.md 不存在或解析失败，用硬编码兜底
-        _GREETING_RE = re.compile(r'^(你好|hi|hello|嗨|hey|在吗|哈喽|嘿|yo)' + _PUNCT_TAIL + '$', re.IGNORECASE)
-        _FAREWELL_RE = re.compile(r'^(再见|拜拜|bye|88|886|晚安|回见)' + _PUNCT_TAIL + '$', re.IGNORECASE)
-        _THANKS_RE = re.compile(r'^(谢谢|感谢|多谢|thanks|thank\s*you|thx|3q)' + _PUNCT_TAIL + '$', re.IGNORECASE)
-        return
-    patterns = meta.quick_patterns
-    _GREETING_RE = re.compile(patterns.get("greeting", r'^NEVER_MATCH$'), re.IGNORECASE)
-    _FAREWELL_RE = re.compile(patterns.get("farewell", r'^NEVER_MATCH$'), re.IGNORECASE)
-    _THANKS_RE = re.compile(patterns.get("thanks", r'^NEVER_MATCH$'), re.IGNORECASE)
-
-
-def _quick_intent_check(message: str) -> Optional[IntentResult]:
-    """极低成本的正则快速匹配。"""
-    _ensure_quick_patterns()
-    msg = message.strip()
-    if not msg:
-        return IntentResult(domain="chat", intent="empty", confidence=1.0, source="quick")
-    if re.match(r'^[\s\.\,\!\?\~\。\，\！\？\…]+$', msg):
-        return IntentResult(domain="chat", intent="empty", confidence=1.0, source="quick")
-    if len(msg) <= 10 and _GREETING_RE.match(msg):
-        return IntentResult(domain="chat", intent="greeting", confidence=1.0, source="quick")
-    if len(msg) <= 10 and _FAREWELL_RE.match(msg):
-        return IntentResult(domain="chat", intent="farewell", confidence=1.0, source="quick")
-    if len(msg) <= 15 and _THANKS_RE.match(msg):
-        return IntentResult(domain="chat", intent="thanks", confidence=1.0, source="quick")
-    return None
-
-
-# ═══════════════════════════════════════════════════════════════
 # LLM 意图分类 + 上下文压缩
 # ═══════════════════════════════════════════════════════════════
 
@@ -268,8 +221,7 @@ def analyze_intent(
     """分析用户消息的意图。
 
     流程（v4）：
-    1. 快速通道 — 闲聊正则（<1ms）
-    2. LLM 分类 — 单次调用，意图 + 上下文压缩
+    1. LLM 分类 — 单次调用，意图 + 上下文压缩
 
     Args:
         message: 用户消息
@@ -284,15 +236,9 @@ def analyze_intent(
     _ensure_intent_loaded()
 
     if not message or not message.strip():
-        return IntentResult(domain="chat", intent="empty", confidence=1.0, source="quick")
+        return IntentResult(domain="chat", intent="empty", confidence=1.0, source="empty")
 
-    # ── Level 1: 快速通道 ──────────────────────────────────────
-    quick = _quick_intent_check(message)
-    if quick:
-        logger.info("[Intent] 快速通道: %s/%s", quick.domain, quick.intent)
-        return quick
-
-    # ── Level 2: LLM 意图分类 + 上下文压缩 ────────────────────
+    # ── LLM 意图分类 + 上下文压缩 ────────────────────────────
     # 获取上轮摘要（由调用方传入，不再从 session_store 读）
     if not context_summary and session_id:
         context_summary = ""
@@ -403,8 +349,6 @@ def format_intent_for_agent(intent: IntentResult, original_message: str) -> str:
     parts = [f"[意图] domain={intent.domain}, intent={intent.intent}"]
     if intent.verb or intent.noun:
         parts.append(f"[动作-对象] verb={intent.verb or '-'}, noun={intent.noun or '-'}")
-    if intent.params:
-        parts.append(f"[参数] {json.dumps(intent.params, ensure_ascii=False)}")
 
     tool_chain = intent.metadata.get("tool_chain", [])
     if tool_chain:

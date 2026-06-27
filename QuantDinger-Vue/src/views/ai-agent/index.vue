@@ -417,7 +417,12 @@ export default {
               })
             }
           }
-          updateLastMessage(ev.content || '完成')
+          // 不覆盖中间步骤，最终结果写入 finalContent
+          const last = messages.value[messages.value.length - 1]
+          if (last && last.role === 'assistant') {
+            last.finalContent = ev.content || ''
+            last.streaming = false
+          }
           streaming.value = false
           _streamActive = false
           _activeStream = null

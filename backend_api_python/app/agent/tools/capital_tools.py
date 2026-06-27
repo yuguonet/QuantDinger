@@ -45,110 +45,186 @@ def _market_prefix(code: str) -> str:
 
 
 def _get_margin_trading(code: str, days: int = 60) -> Dict[str, Any]:
-    """融资融券明细。日级融资余额/买入/偿还+融券余额。"""
+    """融资融券摘要。提取融资余额趋势+近期变化幅度。"""
     data = em_datacenter(
         "RPTA_WEB_RZRQ_GGMX",
         filter_str=f'(SCODE="{code}")',
         page_size=days,
         sort_columns="DATE", sort_types="-1",
     )
-    rows = []
-    for row in data:
-        rows.append({
-            "date": str(row.get("DATE", ""))[:10],
-        })
-    return {"records": rows}
+    if not data:
+        return {"signal": "无数据"}
+
+    latest = data[0]
+    rz_latest = _safe_float(latest.get("RZYE"))  # 融资余额
+    rz_5d_ago = _safe_float(data[4].get("RZYE")) if len(data) > 5 else rz_latest
+    rz_change_pct = ((rz_latest / rz_5d_ago - 1) * 100) if rz_5d_ago else 0
+
+    rq_latest = _safe_float(latest.get("RQYE"))  # 融券余额
+
+    signal = "融资净流入" if rz_change_pct > 2 else "融资净流出" if rz_change_pct < -2 else "持平"
+    return {
+        "rz_balance": round(rz_latest / 1e4, 1),  # 万元
+        "rz_5d_change_pct": round(rz_change_pct, 1),
+        "rq_balance": round(rq_latest / 1e4, 1),
+        "signal": signal,
+    }
 
 
 def _get_block_trades(code: str, page_size: int = 20) -> Dict[str, Any]:
-    """大宗交易记录。成交价/量+买卖方营业部+溢价率。"""
+    """大宗交易摘要。提取近期成交笔数、平均溢价率、机构买卖方向。"""
     data = em_datacenter(
         "RPT_DATA_BLOCKTRADE",
         filter_str=f'(SECURITY_CODE="{code}")',
         page_size=page_size,
         sort_columns="TRADE_DATE", sort_types="-1",
     )
-    rows = []
+    if not data:
+        return {"signal": "无大宗交易记录"}
+
+    premiums = []
+    inst_buy = 0
+    inst_sell = 0
     for row in data:
         close = _safe_float(row.get("CLOSE_PRICE"))
         deal_price = _safe_float(row.get("DEAL_PRICE"))
-        premium = ((deal_price / close - 1) * 100) if close else 0
-        rows.append({
-            "date": str(row.get("TRADE_DATE", ""))[:10],
-        })
-    return {"records": rows}
+        if close:
+            premiums.append((deal_price / close - 1) * 100)
+        buyer = str(row.get("BUYER", ""))
+        seller = str(row.get("SELLER", ""))
+        if "机构" in buyer:
+            inst_buy += 1
+        if "机构" in seller:
+            inst_sell += 1
+
+    avg_premium = sum(premiums) / len(premiums) if premiums else 0
+    signal = "溢价成交（正面）" if avg_premium > 5 else "折价成交（负面）" if avg_premium < -5 else "中性"
+    return {
+        "recent_count": len(data),
+        "avg_premium_pct": round(avg_premium, 1),
+        "inst_buy": inst_buy,
+        "inst_sell": inst_sell,
+        "signal": signal,
+    }
 
 
 def _get_holder_count(code: str) -> Dict[str, Any]:
-    """股东户数变化。季度股东数+环比变化+户均持股。"""
+    """股东户数摘要。提取最新户数、环比变化趋势。"""
     data = em_datacenter(
         "RPT_HOLDERNUMLATEST",
         filter_str=f'(SECURITY_CODE="{code}")',
         page_size=10,
         sort_columns="END_DATE", sort_types="-1",
     )
-    rows = []
-    for row in data:
-        rows.append({
-            "date": str(row.get("END_DATE", ""))[:10],
-        })
-    return {"records": rows}
+    if not data:
+        return {"signal": "无数据"}
+
+    latest = data[0]
+    latest_count = _safe_float(latest.get("HOLDER_NUM"))
+    prev_count = _safe_float(data[1].get("HOLDER_NUM")) if len(data) > 1 else latest_count
+    change_pct = ((latest_count / prev_count - 1) * 100) if prev_count else 0
+    avg_amount = _safe_float(latest.get("AVG_AMOUNT"))  # 户均持股
+
+    signal = "筹码集中" if change_pct < -5 else "筹码分散" if change_pct > 5 else "持平"
+    return {
+        "latest_date": str(latest.get("END_DATE", ""))[:10],
+        "holder_count": int(latest_count),
+        "change_pct": round(change_pct, 1),
+        "avg_amount": round(avg_amount, 0),
+        "signal": signal,
+    }
 
 
 def _get_dividend_history(code: str) -> Dict[str, Any]:
-    """分红送转历史。每股派息/送股/转增+进度状态。"""
+    """分红送转摘要。提取累计分红次数、连续分红年数、近期派息水平。"""
     data = em_datacenter(
         "RPT_SHAREBONUS_DET",
         filter_str=f'(SECURITY_CODE="{code}")',
         page_size=20,
         sort_columns="EX_DIVIDEND_DATE", sort_types="-1",
     )
-    rows = []
+    if not data:
+        return {"signal": "无分红记录"}
+
+    years = set()
+    total_bonus = 0.0
     for row in data:
-        rows.append({
-            "date": str(row.get("EX_DIVIDEND_DATE", ""))[:10],
-        })
-    return {"records": rows}
+        date_str = str(row.get("EX_DIVIDEND_DATE", ""))[:4]
+        if date_str:
+            years.add(date_str)
+        total_bonus += _safe_float(row.get("PRETAX_BONUS_RMB"))
+
+    return {
+        "record_count": len(data),
+        "dividend_years": len(years),
+        "total_bonus_rmb": round(total_bonus, 3),
+        "signal": "持续分红" if len(years) >= 3 else "偶有分红" if years else "无分红",
+    }
 
 
 def _get_financial_statements(code: str) -> Dict[str, Any]:
-    """财报三表（资产负债表/利润表/现金流量表，最近4个报告期）。"""
+    """财报关键指标摘要。只提取 Agent 关心的几个数，不返回原始表格。"""
     prefix = _market_prefix(code)
     symbol = f"{prefix}{code}"
 
-    result = {"balance_sheet": [], "income_statement": [], "cash_flow": []}
-    table_map = {
-        "balance_sheet": ("zcfzb", "资产负债表"),
-    }
+    summary: Dict[str, Any] = {}
 
-    for key, (table_id, table_name) in table_map.items():
-        try:
-            url = f"https://quotes.sina.cn/cn/go.php/vFD_FinancialGuideLine/stockid/{symbol}/ctrl/{table_id}/displaytype/4.phtml"
-            headers = {"User-Agent": _UA, "Referer": "https://finance.sina.com.cn/"}
-            r = requests.get(url, headers=headers, timeout=15)
-            r.encoding = "gbk"
+    try:
+        url = f"https://quotes.sina.cn/cn/go.php/vFD_FinancialGuideLine/stockid/{symbol}/ctrl/zcfzb/displaytype/4.phtml"
+        headers = {"User-Agent": _UA, "Referer": "https://finance.sina.com.cn/"}
+        r = requests.get(url, headers=headers, timeout=15)
+        r.encoding = "gbk"
 
-            import pandas as pd
-            from io import StringIO
-            dfs = pd.read_html(StringIO(r.text))
-            if not dfs:
-                continue
-
+        import pandas as pd
+        from io import StringIO
+        dfs = pd.read_html(StringIO(r.text))
+        if dfs:
             df = dfs[0]
-            records = []
             cols = df.columns.tolist()
-            for _, row in df.iterrows():
-                item = {"item": str(row.iloc[0]) if len(row) > 0 else ""}
-                for col in cols[1:5]:
-                    item[str(col)] = row[col] if pd.notna(row[col]) else None
-                records.append(item)
+            latest_col = cols[1] if len(cols) > 1 else None
+            if latest_col:
+                for _, row in df.iterrows():
+                    item_name = str(row.iloc[0]) if len(row) > 0 else ""
+                    val = row[latest_col] if pd.notna(row[latest_col]) else None
+                    if val is None:
+                        continue
+                    # 只保留关键指标
+                    if "总资产" in item_name and "负债" not in item_name:
+                        summary["total_assets"] = val
+                    elif "总负债" in item_name:
+                        summary["total_liabilities"] = val
+                    elif "股东权益合计" in item_name or "归属.*股东.*权益" in item_name:
+                        summary["equity"] = val
+                    elif "货币资金" in item_name:
+                        summary["cash"] = val
+    except Exception as e:
+        logger.warning("_get_financial_statements(%s) 资产负债表失败: %s", code, e)
 
-            result[key] = records[:30]
-        except Exception as e:
-            logger.warning("_get_financial_statements(%s) %s failed: %s", code, table_name, e)
-            result[key] = []
+    # 利润表：从财务指标接口取关键增速
+    try:
+        url2 = f"https://quotes.sina.cn/cn/go.php/vFD_FinancialGuideLine/stockid/{symbol}/ctrl/lrb/displaytype/4.phtml"
+        headers = {"User-Agent": _UA, "Referer": "https://finance.sina.com.cn/"}
+        r2 = requests.get(url2, headers=headers, timeout=15)
+        r2.encoding = "gbk"
+        dfs2 = pd.read_html(StringIO(r2.text))
+        if dfs2:
+            df2 = dfs2[0]
+            cols2 = df2.columns.tolist()
+            latest_col2 = cols2[1] if len(cols2) > 1 else None
+            if latest_col2:
+                for _, row in df2.iterrows():
+                    item_name = str(row.iloc[0]) if len(row) > 0 else ""
+                    val = row[latest_col2] if pd.notna(row[latest_col2]) else None
+                    if val is None:
+                        continue
+                    if "营业总收入" in item_name or "营业收入" in item_name:
+                        summary["revenue"] = val
+                    elif "净利润" in item_name and "扣非" not in item_name:
+                        summary["net_profit"] = val
+    except Exception as e:
+        logger.warning("_get_financial_statements(%s) 利润表失败: %s", code, e)
 
-    return result
+    return summary
 
 
 # ══════════════════════════════════════════════════════════════
@@ -185,76 +261,24 @@ def get_capital_summary(codes: str) -> Dict[str, Any]:
         dividend = _safe(lambda: _get_dividend_history(code), "dividend")
         financials = _safe(lambda: _get_financial_statements(code), "financials")
 
-        # ── 摘要计算 ─────────────────────────────────────────────
+        # ── 直接组装摘要（子函数已返回浓缩指标，无需二次计算）──
         summary: Dict[str, Any] = {"stock_code": code}
 
-        # 1) 融资融券摘要
-        margin_records = margin.get("records", [])
-        if margin_records:
-            latest = margin_records[0]
-            rz_trend = [r.get("rzye", 0) for r in margin_records[:10]]
-            rz_direction = "上升" if len(rz_trend) >= 2 and rz_trend[0] > rz_trend[-1] else "下降" if len(rz_trend) >= 2 else "持平"
-            summary["margin"] = {
-                "latest_date": latest.get("date"),
-            }
-        else:
-            summary["margin"] = {"signal": "无数据"}
-
-        # 2) 大宗交易摘要
-        block_records = block.get("records", [])
-        if block_records:
-            premium_avg = sum(r.get("premium_pct", 0) for r in block_records) / len(block_records)
-            inst_buy = sum(1 for r in block_records if "机构" in str(r.get("buyer", "")))
-            signal = "溢价成交（正面）" if premium_avg > 5 else "折价成交（负面）" if premium_avg < -5 else "中性"
-            summary["block_trade"] = {
-                "recent_count": len(block_records),
-                "signal": signal,
-            }
-        else:
-            summary["block_trade"] = {"signal": "无大宗交易记录"}
-
-        # 3) 股东户数摘要
-        holder_records = holders.get("records", [])
-        if holder_records:
-            latest_h = holder_records[0]
-            prev_h = holder_records[1] if len(holder_records) > 1 else None
-            trend = "减少" if prev_h and latest_h.get("holder_num", 0) < prev_h.get("holder_num", 0) \
-                    else "增加" if prev_h and latest_h.get("holder_num", 0) > prev_h.get("holder_num", 0) \
-                    else "未知"
-            summary["holders"] = {
-                "latest_date": latest_h.get("date"),
-            }
-        else:
-            summary["holders"] = {"signal": "无数据"}
-
-        # 4) 分红送转摘要
-        div_records = dividend.get("records", [])
-        if div_records:
-            total_bonus = sum(r.get("bonus_rmb", 0) or 0 for r in div_records if r.get("bonus_rmb"))
-            continuous_years = len(set(str(r.get("date", ""))[:4] for r in div_records if r.get("bonus_rmb", 0) and r.get("bonus_rmb", 0) > 0))
-            summary["dividend"] = {
-                "record_count": len(div_records),
-            }
-        else:
-            summary["dividend"] = {"signal": "无分红记录"}
-
-        # 5) 财报三表摘要
-        balance = financials.get("balance_sheet", [])
-        income = financials.get("income_statement", [])
-        cash = financials.get("cash_flow", [])
-        summary["financials"] = {
-            "balance_sheet_items": len(balance),
-        }
+        summary["margin"] = margin
+        summary["block_trade"] = block
+        summary["holders"] = holders
+        summary["dividend"] = dividend
+        summary["financials"] = financials
 
         # ── 综合信号 ─────────────────────────────────────────────
         signals = [
-            summary.get("margin", {}).get("signal", ""),
-            summary.get("block_trade", {}).get("signal", ""),
-            summary.get("holders", {}).get("signal", ""),
-            summary.get("dividend", {}).get("signal", ""),
+            margin.get("signal", ""),
+            block.get("signal", ""),
+            holders.get("signal", ""),
+            dividend.get("signal", ""),
         ]
-        positive = sum(1 for s in signals if "正面" in s or "看多" in s or "吸筹" in s or "友好" in s)
-        negative = sum(1 for s in signals if "负面" in s or "撤退" in s or "接盘" in s)
+        positive = sum(1 for s in signals if "正面" in s or "看多" in s or "集中" in s or "持续" in s or "流入" in s)
+        negative = sum(1 for s in signals if "负面" in s or "撤退" in s or "分散" in s or "流出" in s)
 
         if positive > negative:
             summary["overall_signal"] = "中长线偏多"
@@ -263,7 +287,6 @@ def get_capital_summary(codes: str) -> Dict[str, Any]:
         else:
             summary["overall_signal"] = "中性"
 
-        # ── 返回（含原始数据供深度分析）─────────────────────────
         return {"summary": summary}
 
     if len(code_list) == 1:

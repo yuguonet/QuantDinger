@@ -38,8 +38,8 @@ _MULTI_PUNCT = re.compile(r'[，。、；：！？,;:!?]{2,}')
 
 def compress_news(
     text: str,
-    min_len: int = 50,
-    max_len: int = 300,
+    min_len: int = 30,
+    max_len: int = 100,
     title: str = "",
 ) -> str:
     """
@@ -125,7 +125,7 @@ def compress_news_batch(
     items: list,
     snippet_key: str = "snippet",
     title_key: str = "title",
-    max_len: int = 300,
+    max_len: int = 100,
 ) -> list:
     """批量压缩新闻列表 (原地修改 snippet 字段)"""
     for item in items:
@@ -213,6 +213,6 @@ def _smart_truncate(text: str, max_len: int) -> str:
     return cut_text.rstrip() + "…"
 
 
-def extract_key_sentences(text: str, max_chars: int = 300) -> str:
+def extract_key_sentences(text: str, max_chars: int = 100) -> str:
     """兼容 news_analysis._extract_key_sentences() 的接口"""
-    return compress_news(text, min_len=50, max_len=max_chars)
+    return compress_news(text, min_len=30, max_len=max_chars)

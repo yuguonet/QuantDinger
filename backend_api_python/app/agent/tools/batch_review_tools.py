@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Screening tools — stock screening (选股) and indicator-based review.
+Batch review tools — stock indicator review and user strategy management.
 
 Wraps xuangu.py selection logic and indicator_review.py validation
 into Agent-callable tools.
@@ -195,6 +195,3 @@ def list_user_selection_strategies(user_id: int = 1) -> Dict[str, Any]:
     except Exception as e:
         logger.error("list_user_selection_strategies failed: %s", e)
         return {"strategies": [], "count": 0, "error": str(e)}
-
-# ── OpenAI tool declarations ─────────────────────────────────
-

@@ -27,7 +27,8 @@ def _get_policy_from_cache() -> List[Dict[str, Any]]:
             return []
         return [
             {"title": r["title"], "link": r.get("url", ""),
-             "snippet": r.get("snippet", ""), "source": r.get("source", ""),
+             "snippet": r.get("snippet", "") if (r.get("sentiment_score") or 0) == -999 or abs(r.get("sentiment_score") or 0) >= 3 else "",
+             "source": r.get("source", ""),
              "published": r.get("published_date", ""),
              "sentiment": r.get("sentiment", "neutral"),
              "sentiment_score": r.get("sentiment_score")}
@@ -46,14 +47,21 @@ def _get_news(symbol: str, market: str = "CNStock", name: str = "") -> List[Dict
         items = []
         for lang_key in ("cn", "en"):
             for it in resp.get(lang_key) or []:
+                sentiment = it.get("sentiment", "neutral")
+                score = it.get("sentiment_score") or 0
+                snippet = it.get("snippet", "")
+                # 一票否决/强信号(|score|>=3)保留 snippet，Agent 需验证
+                # 中性/弱信号靠评分就够了
+                if score != -999 and abs(score) < 3:
+                    snippet = ""
                 items.append({
                     "title": it.get("title", ""),
                     "link": it.get("link", ""),
-                    "snippet": it.get("snippet", ""),
+                    "snippet": snippet,
                     "source": it.get("source", ""),
                     "published": it.get("published", ""),
-                    "sentiment": it.get("sentiment", "neutral"),
-                    "sentiment_score": it.get("sentiment_score"),
+                    "sentiment": sentiment,
+                    "sentiment_score": score,
                 })
         return items
     except Exception as e:

@@ -108,10 +108,15 @@ def build_model(
         active_provider.value, model_id, base_url,
     )
 
+    # 抑制本地模型重复生成（qwen 等）
+    extra_body = kwargs.pop("extra_body", {})
+    extra_body.setdefault("repetition_penalty", 1.10)
+
     return _WrappedOpenAIModel(
         model_id=model_id,
         api_base=base_url,
         api_key=api_key,
         temperature=temperature,
+        extra_body=extra_body,
         **kwargs,
     )

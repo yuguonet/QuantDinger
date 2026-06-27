@@ -30,8 +30,35 @@
         </div>
       </div>
 
-      <!-- 消息内容（支持简单 markdown） -->
-      <div class="bubble-content" v-html="renderedContent"></div>
+      <!-- 消息内容：JSON 分析结果渲染为卡片，否则 markdown -->
+      <div v-if="analysisResult" class="analysis-card">
+        <div class="card-header">
+          <span class="card-title">{{ analysisResult.stock_name || analysisResult.stock_code || '分析结果' }}</span>
+          <span v-if="analysisResult.stock_code" class="card-code">{{ analysisResult.stock_code }}</span>
+          <a-tag :color="actionColor(analysisResult.action)" class="card-action">{{ actionLabel(analysisResult.action) }}</a-tag>
+        </div>
+        <div class="card-score-row">
+          <div class="score-circle" :class="scoreClass(analysisResult.score)">
+            <span class="score-num">{{ analysisResult.score }}</span>
+            <span class="score-label">评分</span>
+          </div>
+          <div class="score-meta">
+            <div v-if="analysisResult.direction"><span class="meta-label">方向</span> <a-tag :color="dirColor(analysisResult.direction)">{{ analysisResult.direction }}</a-tag></div>
+            <div v-if="analysisResult.confidence"><span class="meta-label">置信度</span> {{ analysisResult.confidence }}</div>
+            <div v-if="analysisResult.timeframe"><span class="meta-label">周期</span> {{ analysisResult.timeframe }}</div>
+          </div>
+        </div>
+        <div v-if="analysisResult.signal" class="card-signal">{{ analysisResult.signal }}</div>
+        <div v-if="analysisResult.factors && analysisResult.factors.length" class="card-factors">
+          <div v-for="f in analysisResult.factors" :key="f.name" class="factor-item">
+            <span class="factor-name">{{ f.name }}</span>
+            <a-progress :percent="f.score" :show-info="false" :stroke-color="factorColor(f.score)" size="small" />
+            <span class="factor-score">{{ f.score }}</span>
+          </div>
+        </div>
+        <div v-if="analysisResult.analysis" class="card-analysis">{{ analysisResult.analysis }}</div>
+      </div>
+      <div v-else class="bubble-content" v-html="renderedContent"></div>
 
       <!-- 图表渲染（来自 SSE chart 事件） -->
       <div v-for="(chartHtml, ci) in (message.charts || [])" :key="'c'+ci" class="chart-container">
@@ -58,6 +85,48 @@ export default defineComponent({
     }
   },
   setup (props) {
+    // 通用 JSON 分析结果检测：任何含 score 字段的 JSON 对象
+    // 优先从 finalContent 取（混合模式），否则从 content 取
+    const analysisResult = computed(() => {
+      const raw = props.message.finalContent || props.message.content || ''
+      if (!raw || raw.length > 50000) return null
+      try {
+        let text = raw
+        // 处理双重转义
+        if (typeof text === 'string' && text.includes('\\"')) {
+          text = text.replace(/\\"/g, '"')
+        }
+        const obj = typeof text === 'string' ? JSON.parse(text) : text
+        if (obj && typeof obj === 'object' && !Array.isArray(obj) && 'score' in obj) {
+          return obj
+        }
+      } catch (_) {}
+      return null
+    })
+
+    function actionColor (action) {
+      const map = { buy: 'green', sell: 'red', hold: 'blue', skip: 'default' }
+      return map[action] || 'default'
+    }
+    function actionLabel (action) {
+      const map = { buy: '买入', sell: '卖出', hold: '持有', skip: '回避' }
+      return map[action] || action || '-'
+    }
+    function scoreClass (score) {
+      if (score >= 70) return 'score-high'
+      if (score <= 30) return 'score-low'
+      return 'score-mid'
+    }
+    function dirColor (d) {
+      const map = { bullish: 'green', bearish: 'red', neutral: 'blue' }
+      return map[d] || 'default'
+    }
+    function factorColor (score) {
+      if (score >= 70) return '#52c41a'
+      if (score <= 30) return '#ff4d4f'
+      return '#1890ff'
+    }
+
     const renderedContent = computed(() => {
       const raw = props.message.content || ''
 
@@ -152,7 +221,7 @@ export default defineComponent({
       return safe
     })
 
-    return { renderedContent }
+    return { renderedContent, analysisResult, actionColor, actionLabel, scoreClass, dirColor, factorColor }
   }
 })
 </script>
@@ -445,4 +514,138 @@ export default defineComponent({
   0%, 100% { opacity: 1; }
   50% { opacity: 0; }
 }
+/* ── 分析结果卡片（通用：任何含 score 的 JSON） ─── */
+
+.analysis-card {
+  background: #fff;
+  border: 1px solid #e8e8e8;
+  border-radius: 12px;
+  padding: 16px;
+  max-width: 100%;
+
+  .card-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 12px;
+
+    .card-title {
+      font-size: 16px;
+      font-weight: 600;
+      color: #333;
+    }
+    .card-code {
+      font-size: 13px;
+      color: #888;
+    }
+    .card-action {
+      margin-left: auto;
+    }
+  }
+
+  .card-score-row {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin-bottom: 12px;
+
+    .score-circle {
+      width: 64px;
+      height: 64px;
+      border-radius: 50%;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+
+      .score-num {
+        font-size: 22px;
+        font-weight: 700;
+        line-height: 1;
+      }
+      .score-label {
+        font-size: 10px;
+        opacity: 0.7;
+      }
+
+      &.score-high {
+        background: #f6ffed;
+        border: 2px solid #52c41a;
+        color: #52c41a;
+      }
+      &.score-mid {
+        background: #e6f7ff;
+        border: 2px solid #1890ff;
+        color: #1890ff;
+      }
+      &.score-low {
+        background: #fff2f0;
+        border: 2px solid #ff4d4f;
+        color: #ff4d4f;
+      }
+    }
+
+    .score-meta {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 13px;
+
+      .meta-label {
+        color: #999;
+        margin-right: 4px;
+      }
+    }
+  }
+
+  .card-signal {
+    padding: 8px 12px;
+    background: #fafafa;
+    border-radius: 8px;
+    font-size: 14px;
+    color: #333;
+    margin-bottom: 12px;
+    line-height: 1.5;
+  }
+
+  .card-factors {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 12px;
+
+    .factor-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+
+      .factor-name {
+        width: 80px;
+        font-size: 13px;
+        color: #555;
+        flex-shrink: 0;
+      }
+      .factor-score {
+        width: 32px;
+        text-align: right;
+        font-size: 13px;
+        font-weight: 500;
+        flex-shrink: 0;
+      }
+      :deep(.ant-progress) {
+        flex: 1;
+      }
+    }
+  }
+
+  .card-analysis {
+    font-size: 13px;
+    color: #666;
+    line-height: 1.6;
+    border-top: 1px solid #f0f0f0;
+    padding-top: 10px;
+  }
+}
+
 </style>

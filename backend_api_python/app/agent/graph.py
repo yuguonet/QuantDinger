@@ -159,7 +159,12 @@ def chat_hybrid(
                     if not output.get("should_continue", True):
                         # 快速通道（闲聊等），直接出结果
                         final_output = output.get("final_output", {})
-                        content = json.dumps(final_output, ensure_ascii=False) if final_output else ""
+                        if isinstance(final_output, str):
+                            content = final_output
+                        elif isinstance(final_output, dict):
+                            content = json.dumps(final_output, ensure_ascii=False)
+                        else:
+                            content = str(final_output) if final_output else ""
                         yield {"type": "node_done", "node": node_name}
                         yield {"type": "done", "success": True, "content": content}
                         return
@@ -200,7 +205,13 @@ def chat_hybrid(
         return
 
     final_output = final_state.get("final_output", {})
-    content = json.dumps(final_output, ensure_ascii=False) if final_output else ""
+    # 避免双重 JSON 序列化：如果 final_output 已经是 str 直接用，否则 json.dumps
+    if isinstance(final_output, str):
+        content = final_output
+    elif isinstance(final_output, dict):
+        content = json.dumps(final_output, ensure_ascii=False)
+    else:
+        content = str(final_output) if final_output else ""
     if not content:
         contents = [
             r.get("step_content", "")

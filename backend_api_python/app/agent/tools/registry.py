@@ -107,6 +107,11 @@ class ToolRegistry:
         """获取工具 spec（含 .fn 属性）。"""
         return self._tools.get(name)
 
+    @property
+    def all_names(self) -> List[str]:
+        """返回所有已注册的工具名列表。"""
+        return list(self._tools.keys())
+
     def __len__(self) -> int:
         return len(self._tools)
 
@@ -156,3 +161,7 @@ def get_local_registry() -> ToolRegistry:
     if _registry is None:
         _registry = ToolRegistry()
     return _registry
+
+
+# 模块级便捷引用 — 供 from app.agent.tools.registry import registry 使用
+registry: ToolRegistry = get_local_registry()

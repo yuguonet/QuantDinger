@@ -85,30 +85,13 @@ def _get_history_from_state(state: AgentState) -> list:
 
 def prepare_node(state: AgentState) -> Dict[str, Any]:
     from app.agent.intent_analyzer import (
-        _quick_intent_check, analyze_intent, format_intent_for_agent,
+        analyze_intent, format_intent_for_agent,
     )
     from app.agent.tool_context import set_tool_context
 
     query = state["query"]
 
     _check_negative_feedback(state)
-
-    # 快速通道
-    quick = _quick_intent_check(query)
-    if quick:
-        _quick_replies = {
-            "greeting": "你好！我是 QuantDinger 量化分析助手，有什么需要帮忙的？",
-            "farewell": "再见！有问题随时找我。",
-            "thanks": "不客气！有需要随时找我。",
-            "empty": "请告诉我你需要什么帮助。",
-        }
-        reply = _quick_replies.get(quick.intent, "你好！有什么需要帮忙的？")
-        return {
-            "messages": [{"role": "user", "content": query}, {"role": "assistant", "content": reply}],
-            "final_output": {"analysis": reply, "signal": "quick_reply"},
-            "should_continue": False,
-            "all_phases_completed": True,
-        }
 
     # 意图分析
     domain = ""
@@ -219,7 +202,7 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
     return {
         "current_tools": step_result.tools,
         "current_skill": step_result.skill,
-        "current_rules": step_result.rules,
+        "current_tool_strategy": step_result.tool_strategy,
         "loop_step": state.get("loop_step", 0) + 1,
     }
 
@@ -243,10 +226,8 @@ def agent_node(state: AgentState) -> Dict[str, Any]:
         parts.append("前序步骤结论:")
         for r in state["step_records"][-3:]:
             parts.append(f"  步骤{r['step']}: {r.get('description', '')} → {r.get('step_content', '')[:100]}")
-    if stock_code:
-        parts.append(f"标的: {stock_name or '未知'}（{stock_code}）")
-    if state.get("current_rules"):
-        parts.append(f"规则: {state['current_rules']}")
+    if state.get("current_tool_strategy"):
+        parts.append(f"工具策略: {state['current_tool_strategy']}")
     if skill:
         parts.append(f"请用 read_skill 加载 {skill} 的指令并执行。")
     step_context = "\n".join(parts) if parts else state["query"]
@@ -265,7 +246,6 @@ def agent_node(state: AgentState) -> Dict[str, Any]:
         user_id=state.get("user_id", "1"), max_steps=10,
         user_message=state["query"], domain=state.get("domain", ""),
         domain_instructions=state.get("domain_instructions", ""),
-        intent_context=state.get("intent_context", ""),
         stock_code=stock_code, tool_categories=phase_tools or None,
         collector=_get_collector(state.get("session_id", "")),
         strategy=state.get("strategy", "direct"),
@@ -315,7 +295,7 @@ def agent_node(state: AgentState) -> Dict[str, Any]:
     record: StepRecord = {
         "step": state.get("loop_step", 0),
         "description": f"工具: {', '.join(tools)}" if tools else f"Skill: {skill}",
-        "tools": tools, "skill": skill, "rules": state.get("current_rules", ""),
+        "tools": tools, "skill": skill, "tool_strategy": state.get("current_tool_strategy", ""),
         "planner_reasoning": "", "step_content": content or "", "step_success": success,
         "steps_used": total_steps, "step_tokens": total_tokens,
         "tool_calls": tool_calls_log, "charts": charts,

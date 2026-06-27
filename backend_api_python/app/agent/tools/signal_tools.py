@@ -70,11 +70,23 @@ def get_hot_stocks_with_reason(date: str = "") -> Dict[str, Any]:
                 tags = [t.strip() for t in s["reason"].split("+") if t.strip()]
                 tag_counter.update(tags)
 
+        # ── 精简字段：去掉 close/turnover/amount/dde，保留 code/name/change_pct/reason ──
+        hot_tags = tag_counter.most_common(15)
+
+        compact_stocks = []
+        for s in stocks[:50]:
+            compact_stocks.append({
+                "code": s["code"],
+                "name": s["name"],
+                "change_pct": s["change_pct"],
+                "reason": s["reason"],
+            })
+
         return {
             "date": date,
             "total": len(stocks),
-            "stocks": stocks[:50],
-            "hot_tags": tag_counter.most_common(15),
+            "stocks": compact_stocks,
+            "hot_tags": hot_tags,
         }
     except Exception as e:
         logger.warning("get_hot_stocks_with_reason(%s) failed: %s", date, e)

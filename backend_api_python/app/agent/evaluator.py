@@ -10,26 +10,18 @@ Agent Evaluator — 工具链学习闭环。
   agent.py → _post_evaluate() → learn_from_execution()
 
 闭环动作：
-  agent_result.success + all_phases_completed → _writeback_chain() → tool_chains.json
-  !agent_result.success → _record_failure() → tool_chain_failures.json
+  success + all_phases_completed → _writeback_chain() → tool_chains.json
+  !success → 丢弃（不记录）
 
 公开接口：
   learn_from_execution(agent_result, verb, noun, chain_def, all_phases_completed) → None
-  get_failure_record(verb, noun) → Optional[Dict]
 """
 from __future__ import annotations
 
-import json
 import logging
-import pathlib
-import time
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
-
-# ── 存储路径 ─────────────────────────────────────────────────
-_ROUTER_DIR = pathlib.Path(__file__).resolve().parent / "router"
-_FAILURES_PATH = _ROUTER_DIR / "tool_chain_failures.json"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -47,7 +39,7 @@ def learn_from_execution(
 
     - 每次执行 → 更新统计（avg_steps, executions, success_rate）
     - success + all_phases_completed → 写回 tool_chains.json
-    - failure → 记录到 tool_chain_failures.json
+    - failure → 丢弃
 
     Args:
         agent_result: AgentResult 实例（success, content, tool_calls_log, total_steps）
@@ -107,7 +99,7 @@ def learn_from_execution(
             return
         _writeback_chain(actual_tools, tool_success_rate, verb, noun, chain_def=chain_def)
     else:
-        _record_failure(actual_tools, tool_calls_log, verb, noun)
+        logger.info("[Learn] %s+%s: 失败，丢弃不记录", verb, noun)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -194,42 +186,4 @@ def _writeback_chain(
             logger.info("[Learn] %s+%s: 学习新链（旧格式） → %s", verb, noun, [s["tool"] for s in new_chain])
 
 
-def _record_failure(actual_tools: List[str], tool_calls_log: List[Dict], verb: str, noun: str):
-    """失败 → 记录到 failures.json。"""
-    data = _load_failures()
-    key = f"{verb}+{noun}"
 
-    failed_tools = []
-    for tc in tool_calls_log:
-        if not tc.get("success", True):
-            failed_tools.append(tc.get("tool", ""))
-
-    entry = data.get(key, {"chain": actual_tools, "fail_count": 0, "failed_tools": []})
-    entry["fail_count"] = entry.get("fail_count", 0) + 1
-    entry["last_fail_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    entry["chain"] = actual_tools
-    entry["failed_tools"] = failed_tools or entry.get("failed_tools", [])
-    data[key] = entry
-
-    _save_failures(data)
-    logger.info("[Learn] %s+%s: 记录失败 (count=%d, failed=%s)", verb, noun, entry["fail_count"], failed_tools or "unknown")
-
-
-def get_failure_record(verb: str, noun: str) -> Optional[Dict]:
-    """查询某场景的失败记录（供路由决策参考）。"""
-    data = _load_failures()
-    return data.get(f"{verb}+{noun}")
-
-
-def _load_failures() -> Dict:
-    if not _FAILURES_PATH.exists():
-        return {}
-    try:
-        return json.loads(_FAILURES_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def _save_failures(data: Dict):
-    _FAILURES_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _FAILURES_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=4), encoding="utf-8")

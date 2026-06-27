@@ -41,7 +41,7 @@ class StepResult:
     skill: Optional[str] = None
     description: str = ""
     tools: List[str] = field(default_factory=list)
-    rules: str = ""
+    tool_strategy: str = ""
     summary: str = ""
     stocks: List[str] = field(default_factory=list)
     reasoning: str = ""
@@ -180,7 +180,7 @@ class Planner:
             skill=step_data.get("skill"),
             description=step_data.get("description", ""),
             tools=step_data.get("tools", []),
-            rules=step_data.get("rules", ""),
+            tool_strategy=step_data.get("tool_strategy", step_data.get("hint", step_data.get("rules", ""))),
             summary=step_data.get("summary", ""),
             stocks=step_data.get("stocks", []),
             reasoning=step_data.get("reasoning", ""),
@@ -212,15 +212,7 @@ class Planner:
         except Exception as e:
             logger.debug("[Planner] persona 加载失败: %s", e)
 
-        # 2. 股票 + 意图
-        stock_info = ""
-        if stock_code:
-            stock_info = f"\n股票: {stock_name or '未知'}（{stock_code}）"
-        intent_info = ""
-        if intent and (intent.verb or intent.noun or intent.domain):
-            intent_info = f"\n意图: verb={intent.verb or '-'}, noun={intent.noun or '-'}, domain={intent.domain or '-'}"
-
-        # 3. 已获取数据
+        # 2. 已获取数据
         data_section = ""
         if already_fetched_data:
             data_section = f"\n## 已获取的数据\n{already_fetched_data}\n"
@@ -269,7 +261,7 @@ class Planner:
         prompt = (
             f"{persona_section}\n\n"
             "你是量化分析规划器。根据用户问题，规划分析步骤并选出本步工具。\n\n"
-            f"## 用户问题\n{query}{stock_info}{intent_info}\n\n"
+            f"## 用户问题\n{query}\n\n"
             f"{data_section}"
             f"{used_tools_section}"
             f"{fetched_data_section}"
@@ -282,12 +274,11 @@ class Planner:
             '  "skill": null,\n'
             '  "tools": ["工具1", "工具2"],\n'
             '  "description": "步骤描述",\n'
-            '  "rules": "执行规则",\n'
-            '  "reasoning": "理由"\n'
+            '  "tool_strategy": "为什么选这些工具"\n'
             "}\n"
             "```\n\n"
             "## 规则\n"
-            "- 简单任务一把工具全选，不要拆步\n"
+            "- 根据用户需求选择相关工具\n"
             "- 不要重复已调用的工具\n"
         )
 

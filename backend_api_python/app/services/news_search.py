@@ -275,7 +275,7 @@ class TavilySearchProvider(BaseSearchProvider):
             results = []
             for item in response.get('results', []):
                 title = _safe_encode(item.get('title', ''))
-                snippet = compress_news(_safe_encode(item.get('content', '')), max_len=300, title=title)
+                snippet = compress_news(_safe_encode(item.get('content', '')), max_len=100, title=title)
                 results.append(SearchResult(
                     title=title,
                     snippet=snippet,
@@ -307,7 +307,7 @@ class TavilySearchProvider(BaseSearchProvider):
             results = []
             for item in data.get('results', []):
                 title = _safe_encode(item.get('title', ''))
-                snippet = compress_news(_safe_encode(item.get('content', '')), max_len=300, title=title)
+                snippet = compress_news(_safe_encode(item.get('content', '')), max_len=100, title=title)
                 results.append(SearchResult(
                     title=title,
                     snippet=snippet,
@@ -352,7 +352,7 @@ class SerpAPISearchProvider(BaseSearchProvider):
             results = []
             for item in response.get('organic_results', [])[:max_results]:
                 title = _safe_encode(item.get('title', ''))
-                snippet = compress_news(_safe_encode(item.get('snippet', '')), max_len=300, title=title)
+                snippet = compress_news(_safe_encode(item.get('snippet', '')), max_len=100, title=title)
                 results.append(SearchResult(
                     title=title,
                     snippet=snippet,
@@ -387,7 +387,7 @@ class SerpAPISearchProvider(BaseSearchProvider):
             results = []
             for item in data.get('organic_results', [])[:max_results]:
                 title = _safe_encode(item.get('title', ''))
-                snippet = compress_news(_safe_encode(item.get('snippet', '')), max_len=300, title=title)
+                snippet = compress_news(_safe_encode(item.get('snippet', '')), max_len=100, title=title)
                 results.append(SearchResult(
                     title=title,
                     snippet=snippet,
@@ -434,7 +434,7 @@ class GoogleSearchProvider(BaseSearchProvider):
             if 'items' in data:
                 for item in data['items']:
                     title = _safe_encode(item.get('title', ''))
-                    snippet = compress_news(_safe_encode(item.get('snippet', '')), max_len=300, title=title)
+                    snippet = compress_news(_safe_encode(item.get('snippet', '')), max_len=100, title=title)
                     results.append(SearchResult(
                         title=title,
                         snippet=snippet,
@@ -466,7 +466,7 @@ class BingSearchProvider(BaseSearchProvider):
             if 'webPages' in data and 'value' in data['webPages']:
                 for item in data['webPages']['value']:
                     title = _safe_encode(item.get('name', ''))
-                    snippet = compress_news(_safe_encode(item.get('snippet', '')), max_len=300, title=title)
+                    snippet = compress_news(_safe_encode(item.get('snippet', '')), max_len=100, title=title)
                     results.append(SearchResult(
                         title=title,
                         snippet=snippet,
@@ -504,7 +504,7 @@ class BaiduSearchProvider(BaseSearchProvider):
             results = []
             for item in (data.get("result") or {}).get("results", [])[:max_results]:
                 title = _safe_encode(item.get("title", ""))
-                snippet = compress_news(_safe_encode(item.get("content", "")), max_len=300, title=title)
+                snippet = compress_news(_safe_encode(item.get("content", "")), max_len=100, title=title)
                 results.append(SearchResult(
                     title=title,
                     snippet=snippet,
@@ -555,7 +555,7 @@ class BochaAISearchProvider(BaseSearchProvider):
             webpages = (data.get("data") or {}).get("webPages", {}).get("value", [])
             for item in webpages[:max_results]:
                 title = _safe_encode(item.get("name", ""))
-                snippet = compress_news(_safe_encode(item.get("snippet", "")), max_len=300, title=title)
+                snippet = compress_news(_safe_encode(item.get("snippet", "")), max_len=100, title=title)
                 results.append(SearchResult(
                     title=title,
                     snippet=snippet,
@@ -1712,8 +1712,8 @@ class NewsCacheManager:
                 for r in results:
                     title = _safe_encode(r.title, 500)
                     snippet = _safe_encode(r.snippet, 2000)
-                    # 入库前兜底压缩：确保 snippet 不超过 300 字
-                    snippet = compress_news(snippet, max_len=300, title=title)
+                    # 入库前兜底压缩：确保 snippet 不超过 100 字
+                    snippet = compress_news(snippet, max_len=100, title=title)
                     url = _safe_encode(r.url, 1000)
                     source = _safe_encode(r.source, 100)
                     pub_date = _safe_encode(r.published_date or '', 40)
@@ -1728,7 +1728,9 @@ class NewsCacheManager:
                         score = kw_result["score"]
                         sentiment = kw_result["sentiment"]
 
-                    # 中性评分(score=0)也入库，不跳过
+                    # 入库保留压缩后 snippet (存档用，不发给 Agent)
+                    # 仅一票否决保留原文长度，其余压缩到 100 字
+
                     rows.append((symbol, market, title, snippet, url, source,
                                  pub_date, sentiment, score))
 

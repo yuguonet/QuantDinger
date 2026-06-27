@@ -18,8 +18,8 @@ from smolagents import (
 )
 
 from app.agent.model import build_model
-from app.agent.tools.registry import build_smolagent_tools
-from app.agent.tools import registry as local_registry
+from app.agent.tools.registry import build_smolagent_tools, get_local_registry as _get_local_registry
+local_registry = _get_local_registry()
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +95,7 @@ def _load_preamble() -> str:
 def _build_instructions(user_message: str = "",
                         language: str = "zh", tools=None,
                         domain: str = "", domain_instructions: str = "",
-                        intent_context: str = "", stock_code: str = "",
+                        stock_code: str = "",
                         is_tool_mode: bool = False) -> str:
     if str(language or "").lower().startswith("en"):
         lang_section = "\n## Output Language\n- Reply in English.\n- All JSON values in English.\n"
@@ -133,11 +133,6 @@ def _build_instructions(user_message: str = "",
 
     # Anthropic Agent Skills catalog - 已改为工具，不再注入 instructions
     # agent 需要时会调用 get_skill_catalog 工具获取 skill 列表
-
-    # 意图分析上下文（前置分析器的输出）
-    intent_section = ""
-    if intent_context:
-        intent_section = f"\n## 意图分析\n\n{intent_context}\n"
 
     # 领域专属指令
     domain_section = ""
@@ -184,7 +179,7 @@ def _build_instructions(user_message: str = "",
 4. 按指令执行
 
 {tool_catalog}
-{scan_section}{modify_section}{intent_section}{domain_section}{calibration_section}{weight_section}{lang_section}"""
+{scan_section}{modify_section}{domain_section}{calibration_section}{weight_section}{lang_section}"""
 
 
 def get_smolagent(
@@ -196,7 +191,6 @@ def get_smolagent(
     language: str = "zh",
     domain: str = "",
     domain_instructions: str = "",
-    intent_context: str = "",
     stock_code: str = "",
     tool_categories: Optional[List[str]] = None,
     collector=None,  # TraceCollector（金融领域注入）
@@ -248,7 +242,7 @@ def get_smolagent(
     instructions = _build_instructions(
         user_message, language, tools,
         domain=domain, domain_instructions=domain_instructions,
-        intent_context=intent_context, stock_code=stock_code,
+        stock_code=stock_code,
         is_tool_mode=is_tool_mode,
     )
 
