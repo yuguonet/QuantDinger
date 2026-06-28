@@ -1,6 +1,6 @@
 # Agent 可追责架构设计
 
-> 最后更新: 2026-06-28（v3 — 循环回边 + TTL + evaluation + 状态精简）
+> 最后更新: 2026-06-28（v4 — qd_traces 缓存 + 工具权重 + 删除 tool_chains）
 > 状态: 实施中（LangGraph 版本）
 > 仓库: https://github.com/yuguonet/QuantDinger
 
@@ -16,7 +16,7 @@
 ### 1.1 设计终极目标
 - **最大实现可复测**：同样的输入条件能重放 → 才能验证决策对不对 → 才能迭代权重
 - **最终目的**：减小系统 bug 或规则不完善带来的亏钱
-- 四个闭环各自堵一个漏洞，复杂但必要
+- 三个闭环 + qd_traces 缓存各自堵一个漏洞，复杂但必要
 
 ### 2. EvalNode 树是审计日志，不是执行引擎
 - Agent 执行过程中，每一步自动构建 EvalNode 树
@@ -115,22 +115,28 @@ graph.add_edge("finalize", END)
 │  2. 意图分析 ← LLM #1
 │     → domain / verb / noun / strategy / confidence
 │  3. stock_code 提取（仅金融领域，3 级：context → 正则 → 中文名解析）
-│  4. TraceCollector 创建（仅 traced 策略）
+│  4. qd_traces 缓存查询（五层质量门，见 §7.4）
+│     → 命中: cached_tools 存入 state
+│     → 未命中: cached_tools = None
+│  5. TraceCollector 创建（仅 traced 策略，即使缓存命中也创建）
 │     → 存入模块级 _collectors dict（不可 msgpack 序列化）
-│  5. 输出 state 更新 → 固定边到 planner
+│  6. 输出 state 更新 → 固定边到 planner
 └──────────────────────────────────────────────────────
     │
     ▼
 阶段 2: planner_node ──────────────────────────────────
-│  1. Planner (LLM #2) 选工具
+│  1. 检查 state.cached_tools（prepare_node 已查询）
+│     - 有缓存 + 无 step_records → 跳过 LLM#2，直接返回 current_tools
+│     - cached_tools 置 None（用完即清，防止循环误读）
+│  2. 缓存未命中 → Planner (LLM #2) 选工具
 │     输入: 用户消息 + step_records（前序步骤结论）
 │     输出: StepResult (tools/skill/tool_strategy/reasoning)
-│  2. 空工具检查:
+│  3. 空工具检查:
 │     - 无工具 + 无 skill → LLM 直接回复 → should_continue=False → skip → finalize
-│  3. 有工具:
+│  4. 有工具:
 │     - should_continue=True（标记需要继续，finalize 判断循环）
 │     - loop_step += 1
-│  4. route_after_planner 决定去向（skip / run）
+│  5. route_after_planner 决定去向（skip / run）
 └──────────────────────────────────────────────────────
     │ run
     ▼
@@ -157,7 +163,7 @@ graph.add_edge("finalize", END)
 │  1. 从 step_records 拼接内容
 │  2. JSON 提取 → 结构化 final_output
 │  3. 学习闭环:
-│     - _learn_from_execution() → 成功时写回 tool_chains.json
+│     - _learn_from_execution() → 记录日志（tool_chains 写入已移除）
 │     - _save_traces() → TraceCollector 存库 或 兜底写入 EvalNode
 │  4. 更新 last_verb / last_noun（供下轮负面反馈检测）
 │  5. TTL 清理过期 TraceCollector
@@ -186,6 +192,7 @@ class AgentState(TypedDict, total=False):
     step_records: Annotated[List[StepRecord], add]  # 自动追加合并
     current_tools: List[str]
     current_skill: Optional[str]
+    cached_tools: Optional[List[str]]   # qd_traces 缓存命中时注入，跳过 LLM#2
 
     # ── 控制流 ────────────────────────────────────
     loop_step: int
@@ -273,11 +280,8 @@ def _build_checkpointer():
 {
   "tools": ["tool_name_1", "tool_name_2"],
   "skill": "skill_name 或 null",
-  "rules": "执行指令和顺序",
-  "confidence": 0.0-1.0,
   "description": "步骤描述",
-  "stocks": ["股票代码或null"],
-  "reasoning": "选择理由，30字以内"
+  "tool_strategy": "为什么选这些工具、执行顺序"
 }
 ```
 
@@ -332,10 +336,10 @@ def _build_checkpointer():
 
 ### 4.7 Evaluator — 评估器
 
-**职责**: 盘后回溯验证，统一驱动权重更新和链路学习。
+**职责**: 盘后回溯验证，驱动权重更新。
 
 **两个组件**:
-- `evaluator.py`（agent 根目录）: 在线学习，每次 agent 执行后立即执行，纯规则 <1ms
+- `evaluator.py`（agent 根目录）: 精简版，仅记录日志（原 tool_chains 写入已移除）
 - `chain/evaluator.py`: 离线评估，T+N 验证，盘后定时运行
 
 **数据来源**: `qd_traces` 表 + `qd_skill_weights` + `qd_factor_weights`
@@ -439,9 +443,9 @@ CREATE TABLE qd_skill_weights (
 );
 ```
 
-## 七、四个闭环
+## 七、三个闭环 + qd_traces 缓存
 
-四个闭环各自堵一个漏洞，不能去掉任何一个。终极目标：减小系统 bug 或规则不完善带来的亏钱。
+三个闭环 + 缓存各自堵一个漏洞。终极目标：减小系统 bug 或规则不完善带来的亏钱。
 
 ### 7.1 记录闭环（数据源）
 ```
@@ -470,24 +474,53 @@ app 启动 → start_eval_worker() → 等到盘后 15:30
 用户说"不对/垃圾/反了" → prepare_node._check_negative_feedback()
   → detect_feedback_severity()
   → trace 层: mark_root_wrong() / delete_tree()
-  → chain 层: penalize_chain() → success_count 扣减 → 累计后删除
 ```
 **作用**: 检测执行层故障（tool 更新、数据源挂了、API 变了）。T+N 回测也能通过统计发现，但需要 N 轮，期间持续亏钱。用户反馈是加速器。
 **和 T+N 的关系**: 不在同一层——用户反馈检测**执行层**（工具坏了），T+N 检测**预测层**（方向对不对）。
+**惩罚方式**: `mark_root_wrong()` 设置 `correct=false`，T+N 聚合时自动排除，缓存查询自然过滤。
 **前提条件**: `finalize_node` 在每轮结束时写 `last_verb`/`last_noun` 到 state（Checkpointer 自动持久化），下一轮 `prepare_node` 读取。
 **去掉后果**: tool 坏了要等 N 轮 T+N 才能淘汰，期间持续亏钱。
 
-### 7.4 编排路径学习闭环（省去 LLM #2 重复工作量）
+### 7.4 qd_traces 编排缓存（省去 LLM #2 重复工作量）
+
+~~原"编排路径学习闭环"已删除。tool_chains.json 读写链路断裂（Planner 从来不读），改用 qd_traces 聚合。~~
+
 ```
-finalize_node → _learn_from_execution()
-  → verdict=="success" + all_phases_completed → _writeback_chain()
-    → save_chain_plan()（新格式 plan）
-  → 下次 _try_chain() → get_chain_plan() 命中 → 直接返回 ChainDef
+prepare_node
+  → query_cached_tools(domain, verb, noun, stock_code)
+    → GROUP BY tools_called
+    → 质量门五层过滤（见下）
+    → 命中: cached_tools 存入 state
+  → planner_node
+    → cached_tools 非空 → 跳过 LLM#2，直接注入 current_tools
+    → agent_node 执行
+    → 第2轮 agent→planner → cached_tools 已清 → 正常走 LLM#2
 ```
+
 **作用**: 首次走一遍后，后续直接使用编排路径，省去 LLM #2（Planner）的重复思考。
-**本质**: Chain 编排层是从用户消息到执行入口的便捷路线，是缓存好的思维捷径。
-**质量门**: 3 道拦截（phase 步数>5、工具成功率<50%、旧链已验证），防止学习低质量链路。
-**前提条件**: verb/noun 非空（`learn_from_execution` 在 verb/noun 为空时跳过）。
+
+**五层质量门**（全部通过才返回缓存）：
+
+| 层级 | 条件 | 作用 |
+|------|------|------|
+| 1. 意图置信度 | confidence >= 0.7 | 意图识别不确定时不走缓存 |
+| 2. 聚合胜率 | win_rate >= 0.7, sample_count >= 3 | 工具序列整体表现好 |
+| 3. 步数限制 | tools_called 长度 <= 6 | 链路不能太长（低效） |
+| 4. 子节点无失败 | NOT EXISTS child.status='failed' | 工具执行无错误 |
+| 5. 工具权重 | 无低权重工具（win_rate < 0.4） | 工具历史上表现差的不进缓存 |
+
+**工具级权重过滤**（独立于缓存，作用于 LLM#2 候选集）：
+
+```
+agent.py → get_smolagent()
+  → query_low_weight_tools()  ← 聚合 qd_traces child+root
+  → 移除低权重工具 → LLM#2 看不到它们
+```
+
+**数据来源**: 纯聚合 qd_traces，不加新表，不加字段。1 万条数据 GROUP BY 无压力，数据有过期清理。
+
+**前提条件**: domain + verb + noun 非空，意图置信度 >= 0.7。
+
 **去掉后果**: 每次都从零规划，重复消耗 LLM #2 token。
 
 ## 八、工具分类

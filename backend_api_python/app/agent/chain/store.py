@@ -565,6 +565,124 @@ def get_factor_weights(skill_name: str = None) -> Dict[str, float]:
     return weights
 
 
+def query_cached_tools(domain: str, verb: str, noun: str, stock_code: str = None) -> Optional[List[str]]:
+    """查询 qd_traces 中已验证的工具序列（编排路径缓存）。
+
+    chain_name 格式: domain+verb+noun（如 finance+analyze+stock）。
+    聚合同一工具序列的多条执行记录，取 win_rate 最高且 return_per_day 最优的。
+
+    质量门：
+      1. 样本数 >= MIN_SAMPLES
+      2. win_rate >= MIN_WIN_RATE
+      3. 工具步数 <= MAX_STEPS
+      4. 无子节点 failed
+    """
+    from app.utils.db import get_db_connection
+
+    if not verb or not noun:
+        return None
+
+    MIN_SAMPLES = 3       # 最少执行次数
+    MIN_WIN_RATE = 0.7    # 最低胜率
+    MAX_STEPS = 6         # 单轮最大步数
+
+    chain_name = f"{domain}+{verb}+{noun}" if domain else f"{verb}+{noun}"
+
+    def _query(cur, extra_where: str, params: tuple) -> Optional[list]:
+        """聚合查询：按 tools_called 分组，取最优链路。"""
+        cur.execute(f"""
+            SELECT
+                t.tools_called,
+                COUNT(*) as executions,
+                AVG(CASE WHEN t.correct THEN 1.0 ELSE 0.0 END) as win_rate,
+                AVG(t.pnl_pct) as avg_pnl,
+                AVG(NULLIF(t.hold_days, 0)) as avg_hold_days
+            FROM qd_traces t
+            WHERE t.layer = 'chain'
+              AND t.name = %s
+              AND t.status = 'ok'
+              AND t.correct IS NOT NULL
+              AND t.tools_called IS NOT NULL
+              AND array_length(t.tools_called, 1) BETWEEN 1 AND %s
+              {extra_where}
+              AND NOT EXISTS (
+                  SELECT 1 FROM qd_traces child
+                  WHERE child.root_id = t.id
+                    AND child.status = 'failed'
+              )
+            GROUP BY t.tools_called
+            HAVING COUNT(*) >= %s
+               AND AVG(CASE WHEN t.correct THEN 1.0 ELSE 0.0 END) >= %s
+            ORDER BY COALESCE(AVG(t.pnl_pct), 0) / COALESCE(NULLIF(AVG(NULLIF(t.hold_days, 0)), 0), 1) DESC
+            LIMIT 1
+        """, (chain_name, MAX_STEPS) + params + (MIN_SAMPLES, MIN_WIN_RATE))
+        row = cur.fetchone()
+        if row:
+            tools = row['tools_called']
+            logger.info("[Store] 缓存命中: %s tools=%s win_rate=%.2f pnl=%.2f",
+                        chain_name, tools, row['win_rate'], row['avg_pnl'] or 0)
+            return tools if isinstance(tools, list) else list(tools)
+        return None
+
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+
+            # 优先：精确匹配 stock_code
+            if stock_code:
+                result = _query(cur, "AND t.stock_code = %s", (stock_code,))
+                if result:
+                    return result
+
+            # 降级：忽略 stock_code，取全局最优
+            return _query(cur, "", ())
+
+    except Exception as e:
+        logger.warning("[Store] 查询缓存工具链失败 %s: %s", chain_name, e)
+        return None
+
+
+def query_low_weight_tools(min_appearances: int = 5, max_win_rate: float = 0.4) -> set:
+    """聚合 qd_traces，返回低权重工具集合。
+
+    工具出现次数 >= min_appearances 且所在链路 win_rate < max_win_rate → 低权重。
+    结果缓存 10 分钟，避免每次调用都聚合。
+    """
+    from app.utils.db import get_db_connection
+    import time
+
+    # 简单内存缓存
+    cache_key = f"{min_appearances}_{max_win_rate}"
+    if not hasattr(query_low_weight_tools, '_cache'):
+        query_low_weight_tools._cache = {}
+    cached = query_low_weight_tools._cache.get(cache_key)
+    if cached and time.time() - cached[1] < 600:
+        return cached[0]
+
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT child.name
+                FROM qd_traces child
+                JOIN qd_traces root ON child.root_id = root.id
+                WHERE child.layer = 'tool'
+                  AND root.layer = 'chain'
+                  AND root.correct IS NOT NULL
+                GROUP BY child.name
+                HAVING COUNT(*) >= %s
+                   AND AVG(CASE WHEN root.correct THEN 1.0 ELSE 0.0 END) < %s
+            """, (min_appearances, max_win_rate))
+            result = {row['name'] for row in cur.fetchall()}
+            query_low_weight_tools._cache[cache_key] = (result, time.time())
+            if result:
+                logger.info("[Store] 低权重工具 (%d): %s", len(result), result)
+            return result
+    except Exception as e:
+        logger.warning("[Store] 查询工具权重失败: %s", e)
+        return set()
+
+
 def get_eval_stats(chain_id: str = None) -> Dict[str, Any]:
 
     """获取评估统计。"""

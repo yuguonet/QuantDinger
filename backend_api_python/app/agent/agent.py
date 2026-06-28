@@ -223,6 +223,19 @@ def get_smolagent(
         tools = [t for t in tools if t.name in _allow_set]
         logger.info("[Agent] per-phase 工具过滤，保留 %d 个工具: %s", len(tools), tool_categories)
 
+    # ── 工具级权重过滤：移除低权重工具 ────────────────────────
+    try:
+        from app.agent.chain.store import query_low_weight_tools
+        low_weight = query_low_weight_tools()
+        if low_weight:
+            before = len(tools)
+            removed_names = {t.name for t in tools} & low_weight
+            tools = [t for t in tools if t.name not in low_weight]
+            if removed_names:
+                logger.info("[Agent] 低权重工具过滤: 移除 %d 个 %s", len(removed_names), removed_names)
+    except Exception as e:
+        logger.debug("[Agent] 工具权重查询跳过: %s", e)
+
     # ── 注册 read_skill 和 get_skill_catalog 工具（Anthropic Agent Skills 标准）──
     try:
         from app.agent.skills.call_skill_tool import get_read_skill_tool

@@ -134,7 +134,7 @@ class TraceCollector:
         # 构建根节点
         root = EvalNode(
             layer=Layer.CHAIN.value,
-            name=f"{self.intent_verb}+{self.intent_noun}" if self.intent_verb else "agent",
+            name=f"{self.domain}+{self.intent_verb}+{self.intent_noun}" if self.intent_verb else "agent",
             exec_date=date.today(),
             stock_code=self.stock_code or extracted.get("stock_code", ""),
             stock_name=self.stock_name or extracted.get("stock_name", ""),

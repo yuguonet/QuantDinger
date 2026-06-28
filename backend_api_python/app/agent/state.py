@@ -44,6 +44,7 @@ class AgentState(TypedDict, total=False):
     step_records: Annotated[List[StepRecord], add]  # 自动追加合并
     current_tools: List[str]            # Planner 当轮选的工具
     current_skill: Optional[str]        # Planner 当轮选的 skill
+    cached_tools: Optional[List[str]]   # qd_traces 命中的缓存工具链（跳过 LLM#2）
 
     # ── 控制流 ────────────────────────────────────────────────
     loop_step: int                      # 当前循环步数
@@ -106,6 +107,7 @@ def create_initial_state(
         step_records=[],
         current_tools=[],
         current_skill=None,
+        cached_tools=None,
 
         loop_step=0,
         max_loop_steps=max_loop_steps,

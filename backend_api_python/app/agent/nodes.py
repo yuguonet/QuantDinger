@@ -65,12 +65,28 @@ def get_active_agent(session_id: str) -> Optional[Any]:
 # ═══════════════════════════════════════════════════════════════
 
 def _build_llm_call():
-    from app.agent.model import build_model
-    smol_model = build_model()
-    def llm_call(prompt: str) -> str:
-        from smolagents import ChatMessage
-        response = smol_model([ChatMessage(role="user", content=prompt)])
-        return response.content if hasattr(response, "content") else str(response)
+    """构建 LLM 调用函数（直连 OpenAI API，不走 smolagents）。"""
+    from app.services.llm import LLMService
+    import requests as _requests
+
+    svc = LLMService()
+    api_key = svc.get_api_key()
+    base_url = svc.get_base_url()
+    import os
+    model_id = os.getenv("AGENT_LLM_MODEL", "").strip() or svc.get_default_model()
+
+    def llm_call(messages) -> str:
+        """支持 str 或 list[dict] 两种入参。"""
+        if isinstance(messages, str):
+            messages = [{"role": "user", "content": messages}]
+        resp = _requests.post(
+            f"{base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": model_id, "messages": messages, "temperature": 0.3, "max_tokens": 1024},
+            timeout=60.0,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
     return llm_call
 
 
@@ -149,7 +165,32 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
             if _code:
                 stock_code, stock_name = _code, _name or stock_name
 
-    # TraceCollector
+    # ── 编排路径缓存：qd_traces 命中 → 跳过 LLM#2 ──
+    # 质量门：意图置信度 → 聚合 win_rate → 步数 → 子节点 → 工具权重
+    intent_confidence = intent_data.get("confidence", 0) if intent_data else 0
+    cached_tools = None
+    if intent_verb and intent_noun:
+        if intent_confidence < 0.7:
+            logger.info("[Prepare] 意图置信度 %.2f < 0.7，跳过缓存", intent_confidence)
+        else:
+            from app.agent.chain.store import query_cached_tools
+            cached_tools = query_cached_tools(domain, intent_verb, intent_noun, stock_code)
+            if cached_tools:
+                # 校验：缓存工具里不能有低权重工具
+                try:
+                    from app.agent.chain.store import query_low_weight_tools
+                    low_weight = query_low_weight_tools()
+                    if low_weight and set(cached_tools) & low_weight:
+                        blocked = set(cached_tools) & low_weight
+                        logger.info("[Prepare] 缓存拒绝: 含低权重工具 %s", blocked)
+                        cached_tools = None
+                except Exception:
+                    pass
+            if cached_tools:
+                logger.info("[Prepare] 缓存命中: %s+%s+%s → %s", domain, intent_verb, intent_noun, cached_tools)
+    # 未命中时显式置 None，防止 checkpointer 残留上轮旧值
+
+    # TraceCollector（即使缓存命中也要创建，agent 仍需执行工具并追踪）
     collector = None
     if strategy == "traced":
         from app.agent.trace_collector import TraceCollector
@@ -172,6 +213,7 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
         "domain_instructions": domain_instructions,
         "strategy": strategy, "stock_code": stock_code, "stock_name": stock_name,
         "should_continue": True,
+        "cached_tools": cached_tools,
     }
 
 
@@ -182,12 +224,38 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
 def planner_node(state: AgentState) -> Dict[str, Any]:
     from app.agent.planner import Planner
 
+    step_records = state.get("step_records", [])
+
+    # ── 编排路径缓存：prepare_node 已查 qd_traces，命中则跳过 LLM#2 ──
+    cached_tools = state.get("cached_tools")
+    if cached_tools and not step_records:
+        logger.info("[Planner] 缓存命中，跳过 LLM#2: %s", cached_tools)
+        return {
+            "current_tools": cached_tools,
+            "current_skill": None,
+            "current_tool_strategy": "",
+            "loop_step": state.get("loop_step", 0) + 1,
+            "should_continue": True,
+            "cached_tools": None,  # 用完即清
+        }
+
+    # ── 已有结论 → 直接结束，不再调 LLM#2 ──
+    if step_records:
+        last_content = step_records[-1].get("step_content", "")
+        if _has_conclusion(last_content):
+            logger.info("[Planner] 已有结论，结束规划")
+            return {
+                "should_continue": False,
+                "all_phases_completed": True,
+            }
+
+    # ── 缓存未命中，走 LLM#2 规划 ──
     planner = Planner(call_llm=_build_llm_call())
 
     step_result = planner.plan_next_step(
         query=state["query"], intent=_build_intent_obj(state),
         stock_code=state.get("stock_code", ""), stock_name=state.get("stock_name", ""),
-        step_records=state.get("step_records", []),
+        step_records=step_records,
     )
 
     if not step_result.success or (not step_result.tools and not step_result.skill):
@@ -326,12 +394,35 @@ def agent_node(state: AgentState) -> Dict[str, Any]:
 
 
 def route_after_agent(state: AgentState) -> str:
-    """agent 执行完毕后，回到 planner 让它决定是否还有更多工具。"""
+    """agent 执行完毕后，决定继续还是结束。"""
     loop_step = state.get("loop_step", 0)
     max_loop = state.get("max_loop_steps", 10)
-    if loop_step < max_loop:
-        return "continue"  # 回 planner，它看 step_records 后决定 run/skip
-    return "finish"
+
+    if loop_step >= max_loop:
+        return "finish"
+
+    # ── 已有结论检测：agent 输出了 action → 不再循环 ──
+    step_records = state.get("step_records", [])
+    if step_records:
+        last_content = step_records[-1].get("step_content", "")
+        if _has_conclusion(last_content):
+            logger.info("[Route] 已有结论，结束循环 (step %d)", loop_step)
+            return "finish"
+
+    return "continue"
+
+
+def _has_conclusion(content: str) -> bool:
+    """检测 agent 输出是否已包含结构化结论。"""
+    if not content:
+        return False
+    # JSON 里有 action 字段
+    if '"action"' in content and '"score"' in content:
+        return True
+    # 关键结论词
+    _keywords = ['建议买入', '建议卖出', '建议持有', '建议观望', '建议回避',
+                 '维持持有', '维持买入', '维持卖出']
+    return any(kw in content for kw in _keywords)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -384,32 +475,50 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
 # ═══════════════════════════════════════════════════════════════
 
 def _check_negative_feedback(state: AgentState) -> None:
-    try:
-        from app.agent.chain.tool_chains import detect_feedback_severity, penalize_chain
-        from app.agent.chain import store as chain_store
+    """用户负面反馈 → 惩罚 qd_traces（correct=false）。
 
-        severity = detect_feedback_severity(state.get("query", ""))
-        if not severity:
-            return
-        last_verb = state.get("last_verb", "")
-        last_noun = state.get("last_noun", "")
-        if not last_verb or not last_noun:
-            return
+    工具链惩罚（tool_chains.json）已移除，T+N 回测的 correct 字段
+    天然过滤掉被标记的链路。
+    """
+    from app.agent.chain import store as chain_store
 
-        stock_code = state.get("stock_code", "")
-        if stock_code:
-            trace = chain_store.query_latest_root(stock_code)
-            if trace:
-                root_id = trace["id"]
-                if chain_store.get_penalty_count(stock_code) >= 3:
-                    chain_store.delete_tree(root_id)
-                else:
-                    chain_store.mark_root_wrong(root_id)
+    severity = _detect_feedback_severity(state.get("query", ""))
+    if not severity:
+        return
+    last_verb = state.get("last_verb", "")
+    last_noun = state.get("last_noun", "")
+    if not last_verb or not last_noun:
+        return
 
-        penalize_chain(last_verb, last_noun, severity)
-        logger.info("[Feedback] %s: verb=%s noun=%s", severity, last_verb, last_noun)
-    except Exception as e:
-        logger.warning("[Feedback] 异常: %s", e)
+    stock_code = state.get("stock_code", "")
+    if stock_code:
+        trace = chain_store.query_latest_root(stock_code)
+        if trace:
+            root_id = trace["id"]
+            if chain_store.get_penalty_count(stock_code) >= 3:
+                chain_store.delete_tree(root_id)
+            else:
+                chain_store.mark_root_wrong(root_id)
+
+    logger.info("[Feedback] %s: verb=%s noun=%s", severity, last_verb, last_noun)
+
+
+def _detect_feedback_severity(message: str) -> Optional[str]:
+    """内置负面反馈检测（替代 tool_chains.detect_feedback_severity）。"""
+    if not message:
+        return None
+    msg = message.strip()
+    _SEVERE = ["完全不对", "大错特错", "错得离谱", "离谱", "反了", "完全错",
+               "一塌糊涂", "乱七八糟", "瞎扯", "胡说", "垃圾", "废了", "没用", "一点用没有"]
+    _MILD = ["不对", "不正确", "不好", "不行", "不准", "不太对",
+             "有问题", "有误", "错了", "不太行", "不靠谱"]
+    for pat in _SEVERE:
+        if pat in msg:
+            return "severe"
+    for pat in _MILD:
+        if pat in msg:
+            return "mild"
+    return None
 
 
 def _learn_from_execution(state: AgentState) -> None:
@@ -451,6 +560,11 @@ def _save_traces(state: AgentState, content: str) -> None:
         except Exception as e:
             logger.warning("[Trace] 存库失败: %s", e)
     else:
+        # 兜底写入（仅金融/交易域，且有 verb+noun）
+        _verb = state.get('intent_verb', '')
+        _noun = state.get('intent_noun', '')
+        if not _verb and not _noun:
+            return  # 闲聊等无意图场景，不写 qd_traces
         try:
             from app.agent.chain.schema import EvalNode, Layer, Status
             from app.agent.json_extractor import extract_decision
@@ -458,11 +572,10 @@ def _save_traces(state: AgentState, content: str) -> None:
 
             sc = state.get("stock_code", "")
             dec = extract_decision(content) if content else None
-            _verb = state.get('intent_verb', '')
-            _noun = state.get('intent_noun', '')
+            _domain = state.get('domain', '')
             root = EvalNode(
                 layer=Layer.CHAIN.value,
-                name=f"{_verb}+{_noun}" if _verb or _noun else "agent",
+                name=f"{_domain}+{_verb}+{_noun}",
                 exec_date=date.today(), stock_code=sc, stock_name=state.get("stock_name", ""),
                 score=dec.get("score") if dec else None,
                 direction=dec.get("direction", "") if dec else "",

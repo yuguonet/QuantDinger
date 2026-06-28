@@ -282,20 +282,10 @@ def analyze_intent(
             params["stock_name"] = name
             stock_name = name
 
-    # tool_chain
-    tool_chain = []
-    if verb and noun:
-        try:
-            from app.agent.chain.tool_chains import get_tool_chain
-            tool_chain = get_tool_chain(verb, noun)
-        except Exception:
-            pass
-
     # 合并 metadata
     metadata = {
         "domain": domain, "intent": intent,
         "verb": verb, "noun": noun,
-        "tool_chain": tool_chain,
     }
 
     # 摘要由调用方（LangGraph checkpointer）管理，不再存 session_store
