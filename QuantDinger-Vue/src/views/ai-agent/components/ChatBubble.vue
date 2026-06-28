@@ -30,8 +30,41 @@
         </div>
       </div>
 
-      <!-- 消息内容：JSON 分析结果渲染为卡片，否则 markdown -->
-      <div v-if="analysisResult" class="analysis-card">
+      <!-- 工具规划进度 -->
+      <div v-if="message.progressSteps && message.progressSteps.length" class="progress-steps">
+        <div v-for="(step, si) in message.progressSteps" :key="si" class="progress-step">
+          <a-icon type="right" class="step-icon" /> {{ step }}
+        </div>
+      </div>
+
+      <!-- 步骤输出内容（中间过程） -->
+      <div v-if="message.stepContents && message.stepContents.length && !analysisResult" class="step-contents">
+        <div v-for="(sc, si) in message.stepContents" :key="si" class="step-content-block" v-html="renderMarkdown(sc)"></div>
+      </div>
+
+      <!-- 多股票分析结果 -->
+      <div v-if="analysisResult && isMultiStock" class="multi-stock-card">
+        <div v-if="analysisResult.summary" class="multi-summary">{{ analysisResult.summary }}</div>
+        <div class="stock-list">
+          <div v-for="(s, si) in analysisResult.stocks" :key="si" class="stock-item" :class="'action-' + (s.action || 'hold')">
+            <div class="stock-header">
+              <span class="stock-name">{{ s.stock_name || s.stock_code }}</span>
+              <span class="stock-code">{{ s.stock_code }}</span>
+              <a-tag :color="actionColor(s.action)" size="small">{{ actionLabel(s.action) }}</a-tag>
+              <span class="stock-score" :class="scoreClass(s.score)">{{ s.score }}</span>
+            </div>
+            <div class="stock-signal" v-if="s.signal">{{ s.signal }}</div>
+            <div class="stock-meta">
+              <span v-if="s.direction"><a-tag :color="dirColor(s.direction)" size="small">{{ s.direction }}</a-tag></span>
+              <span v-if="s.confidence" class="meta-item">置信度: {{ s.confidence }}</span>
+              <span v-if="s.timeframe" class="meta-item">周期: {{ s.timeframe }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 单股票分析结果 -->
+      <div v-else-if="analysisResult" class="analysis-card">
         <div class="card-header">
           <span class="card-title">{{ analysisResult.stock_name || analysisResult.stock_code || '分析结果' }}</span>
           <span v-if="analysisResult.stock_code" class="card-code">{{ analysisResult.stock_code }}</span>
@@ -85,7 +118,7 @@ export default defineComponent({
     }
   },
   setup (props) {
-    // 通用 JSON 分析结果检测：任何含 score 字段的 JSON 对象
+    // 通用 JSON 分析结果检测：单股票（含 score）或多股票（含 stocks 数组）
     // 优先从 finalContent 取（混合模式），否则从 content 取
     const analysisResult = computed(() => {
       const raw = props.message.finalContent || props.message.content || ''
@@ -97,11 +130,19 @@ export default defineComponent({
           text = text.replace(/\\"/g, '"')
         }
         const obj = typeof text === 'string' ? JSON.parse(text) : text
-        if (obj && typeof obj === 'object' && !Array.isArray(obj) && 'score' in obj) {
-          return obj
+        if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+          // 单股票：顶层有 score
+          if ('score' in obj) return obj
+          // 多股票：有 stocks 数组
+          if (Array.isArray(obj.stocks) && obj.stocks.length > 0) return obj
         }
       } catch (_) {}
       return null
+    })
+
+    // 判断是否为多股票分析结果
+    const isMultiStock = computed(() => {
+      return analysisResult.value && Array.isArray(analysisResult.value.stocks)
     })
 
     function actionColor (action) {
@@ -221,7 +262,23 @@ export default defineComponent({
       return safe
     })
 
-    return { renderedContent, analysisResult, actionColor, actionLabel, scoreClass, dirColor, factorColor }
+    // 简化版 markdown 渲染（用于步骤内容）
+    function renderMarkdown (text) {
+      if (!text) return ''
+      const safe = text
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
+          return `<div class="code-block-wrapper"><pre class="code-block"><code>${code}</code></pre></div>`
+        })
+        .replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>')
+        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        .replace(/^- (.+)$/gm, '<li>$1</li>')
+        .replace(/(<li>.*<\/li>)/gs, '<ul>$1</ul>')
+        .replace(/\n/g, '<br>')
+      return safe
+    }
+
+    return { renderedContent, renderMarkdown, analysisResult, isMultiStock, actionColor, actionLabel, scoreClass, dirColor, factorColor }
   }
 })
 </script>
@@ -385,6 +442,51 @@ export default defineComponent({
     tr:last-child td {
       border-bottom: none;
     }
+  }
+}
+
+/* ── 工具规划进度 ─────────────────────────── */
+
+.progress-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+  padding: 8px 12px;
+  background: #f6f8fa;
+  border-radius: 8px;
+  border: 1px solid #e8e8e8;
+
+  .progress-step {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: #555;
+
+    .step-icon {
+      color: #1890ff;
+      font-size: 10px;
+    }
+  }
+}
+
+/* ── 步骤输出内容 ─────────────────────────── */
+
+.step-contents {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 8px;
+
+  .step-content-block {
+    padding: 10px 14px;
+    background: #f0f2f5;
+    border-radius: 12px;
+    font-size: 13px;
+    line-height: 1.7;
+    color: #333;
+    word-break: break-word;
   }
 }
 
@@ -645,6 +747,97 @@ export default defineComponent({
     line-height: 1.6;
     border-top: 1px solid #f0f0f0;
     padding-top: 10px;
+  }
+}
+
+/* ── 多股票分析卡片 ─────────────────────────── */
+
+.multi-stock-card {
+  background: #fff;
+  border: 1px solid #e8e8e8;
+  border-radius: 12px;
+  padding: 16px;
+  max-width: 100%;
+
+  .multi-summary {
+    font-size: 14px;
+    color: #333;
+    line-height: 1.6;
+    margin-bottom: 12px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid #f0f0f0;
+  }
+
+  .stock-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .stock-item {
+    padding: 10px 12px;
+    border-radius: 8px;
+    border: 1px solid #f0f0f0;
+    background: #fafafa;
+    transition: all 0.2s;
+
+    &:hover {
+      border-color: #d9d9d9;
+    }
+
+    &.action-buy {
+      border-left: 3px solid #52c41a;
+    }
+    &.action-sell {
+      border-left: 3px solid #ff4d4f;
+    }
+    &.action-hold {
+      border-left: 3px solid #1890ff;
+    }
+
+    .stock-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 4px;
+
+      .stock-name {
+        font-size: 14px;
+        font-weight: 600;
+        color: #333;
+      }
+      .stock-code {
+        font-size: 12px;
+        color: #888;
+      }
+      .stock-score {
+        margin-left: auto;
+        font-size: 16px;
+        font-weight: 700;
+        &.score-high { color: #52c41a; }
+        &.score-mid { color: #1890ff; }
+        &.score-low { color: #ff4d4f; }
+      }
+    }
+
+    .stock-signal {
+      font-size: 13px;
+      color: #555;
+      line-height: 1.5;
+      margin-bottom: 4px;
+    }
+
+    .stock-meta {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      color: #888;
+
+      .meta-item {
+        color: #999;
+      }
+    }
   }
 }
 

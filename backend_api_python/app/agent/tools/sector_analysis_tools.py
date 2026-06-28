@@ -94,26 +94,22 @@ def get_hot_sectors(industry_limit: int = 15, concept_limit: int = 15) -> Dict[s
         analysis = (result.get("data") or {}).get("analysis") if isinstance(result, dict) else None
 
         return {
-            "code": 1,
-            "msg": "success",
-            "data": {
-                "timestamp": result.get("data", {}).get("timestamp", ""),
-                "industry": [{
-                    "code": s.get("code", ""),
-                    "name": s.get("name", ""),
-                    "change_pct": s.get("change_pct", 0),
-                    "limit_up_count": s.get("limit_up_count", 0),
-                    "leading_stock": s.get("leading_stock", ""),
-                } for s in industry],
-                "concept": [{
-                    "code": s.get("code", ""),
-                    "name": s.get("name", ""),
-                    "change_pct": s.get("change_pct", 0),
-                    "limit_up_count": s.get("limit_up_count", 0),
-                    "leading_stock": s.get("leading_stock", ""),
-                } for s in concept],
-                "analysis": analysis or {},
-            },
+            "timestamp": result.get("data", {}).get("timestamp", ""),
+            "industry": [{
+                "code": s.get("code", ""),
+                "name": s.get("name", ""),
+                "change_pct": s.get("change_pct", 0),
+                "limit_up_count": s.get("limit_up_count", 0),
+                "leading_stock": s.get("leading_stock", ""),
+            } for s in industry],
+            "concept": [{
+                "code": s.get("code", ""),
+                "name": s.get("name", ""),
+                "change_pct": s.get("change_pct", 0),
+                "limit_up_count": s.get("limit_up_count", 0),
+                "leading_stock": s.get("leading_stock", ""),
+            } for s in concept],
+            "analysis": analysis or {},
         }
     except Exception as e:
         logger.warning("get_hot_sectors failed: %s", e)

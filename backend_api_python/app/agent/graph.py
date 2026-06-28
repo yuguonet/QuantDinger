@@ -46,7 +46,10 @@ def _build_checkpointer():
         return MemorySaver()
 
     try:
-        saver = PostgresSaver.from_conn_string(database_url)
+        # v3.x: 用 ConnectionPool 直接构造，连接池自动管理连接生命周期
+        from psycopg_pool import ConnectionPool
+        pool = ConnectionPool(conninfo=database_url, min_size=2, max_size=10)
+        saver = PostgresSaver(pool)
         saver.setup()  # 自动建表
         logger.info("[Graph] PostgreSQL checkpointer 就绪")
         return saver

@@ -151,11 +151,12 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
         import re
         m = re.search(r'(?<!\d)(\d{6})(?!\d)', query)
         if m:
-            stock_code = m.group(1)
+            _candidate_code = m.group(1)
             try:
                 from app.utils.basicinfo_db import get_stock_basic_db
-                _stock = get_stock_basic_db().get_stock(stock_code)
+                _stock = get_stock_basic_db().get_stock(_candidate_code)
                 if _stock:
+                    stock_code = _candidate_code
                     stock_name = _stock.get("name", "")
             except Exception:
                 pass
@@ -164,6 +165,10 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
             _code, _name = extract_stock_from_message(query)
             if _code:
                 stock_code, stock_name = _code, _name or stock_name
+        # 校验：stock_name 必须出现在用户消息中，防止 LLM 误匹配
+        if stock_code and stock_name and stock_name not in query:
+            logger.warning("[Prepare] stock_name '%s' 不在消息中，丢弃 LLM 匹配", stock_name)
+            stock_code, stock_name = "", ""
 
     # ── 编排路径缓存：qd_traces 命中 → 跳过 LLM#2 ──
     # 质量门：意图置信度 → 聚合 win_rate → 步数 → 子节点 → 工具权重
@@ -385,9 +390,14 @@ def agent_node(state: AgentState) -> Dict[str, Any]:
         "tool_calls": tool_calls_log, "charts": charts,
     }
 
+    # 累积已有记录（普通 List reducer，返回值会覆盖而非追加）
+    prev_records = state.get("step_records", [])
+    all_tool_calls = list(state.get("tool_calls_log", [])) + tool_calls_log
+    all_charts = list(state.get("charts", [])) + charts
+
     return {
-        "step_records": [record],
-        "tool_calls_log": tool_calls_log, "charts": charts,
+        "step_records": prev_records + [record],
+        "tool_calls_log": all_tool_calls, "charts": all_charts,
         "total_steps": state.get("total_steps", 0) + total_steps,
         "total_tokens": state.get("total_tokens", 0) + total_tokens,
     }

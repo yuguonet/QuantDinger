@@ -41,7 +41,7 @@ class AgentState(TypedDict, total=False):
     intent: Dict[str, Any]              # IntentResult 序列化
 
     # ── 执行状态 ──────────────────────────────────────────────
-    step_records: Annotated[List[StepRecord], add]  # 自动追加合并
+    step_records: List[StepRecord]  # 每轮覆盖（非追加），避免跨轮污染
     current_tools: List[str]            # Planner 当轮选的工具
     current_skill: Optional[str]        # Planner 当轮选的 skill
     cached_tools: Optional[List[str]]   # qd_traces 命中的缓存工具链（跳过 LLM#2）
@@ -56,8 +56,8 @@ class AgentState(TypedDict, total=False):
     final_output: Dict[str, Any]        # 最终结构化金融 JSON
     total_steps: int
     total_tokens: int
-    tool_calls_log: Annotated[List[Dict[str, Any]], add]  # 自动追加
-    charts: Annotated[List[str], add]   # 自动追加
+    tool_calls_log: List[Dict[str, Any]]  # 每轮覆盖
+    charts: List[str]  # 每轮覆盖
 
     # ── 元数据 ────────────────────────────────────────────────
     session_id: str

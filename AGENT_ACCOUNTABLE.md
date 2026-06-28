@@ -1,6 +1,6 @@
 # Agent 可追责架构设计
 
-> 最后更新: 2026-06-28（v4 — qd_traces 缓存 + 工具权重 + 删除 tool_chains）
+> 最后更新: 2026-06-28（v4.3 — 跨轮状态隔离 + checkpointer v3.x 适配 + 结束判断逻辑校正 + LLM#1 职责收窄）
 > 状态: 实施中（LangGraph 版本）
 > 仓库: https://github.com/yuguonet/QuantDinger
 
@@ -9,8 +9,9 @@
 ### 1. LangGraph 是编排层，Agent 是执行者
 - **LangGraph StateGraph** 负责节点编排、状态管理、持久化
 - **smolagents CodeAgent** 保持完整推理-行动-观察循环（ReAct）
-- **Planner 只选工具，不判断完成**：每步只决定用什么工具
+- **Planner 主要选工具，兼做结论检测**：正常情况只选工具；当 Agent 上一步已输出结论（`_has_conclusion()`）时，Planner 直接结束，不再调 LLM#2
 - **Agent 只执行，返回原始数据**：`final_answer()` 就是最终输出，不做二次汇总
+- **路由做兜底判断**：`route_after_agent` 在步数超限或 Agent 输出含结论时强制结束
 - **兼容性**：Tool 完全兼容 OpenAI Function Calling 标准（JSON Schema）；Skill 兼容 Anthropic SKILL 标准
 
 ### 1.1 设计终极目标
@@ -131,12 +132,14 @@ graph.add_edge("finalize", END)
 │  2. 缓存未命中 → Planner (LLM #2) 选工具
 │     输入: 用户消息 + step_records（前序步骤结论）
 │     输出: StepResult (tools/skill/tool_strategy/reasoning)
-│  3. 空工具检查:
+│  3. 结论检测（在调 LLM#2 之前）:
+│     - step_records 非空 且 _has_conclusion(last_content) → should_continue=False → skip → finalize
+│  4. 空工具检查:
 │     - 无工具 + 无 skill → LLM 直接回复 → should_continue=False → skip → finalize
-│  4. 有工具:
-│     - should_continue=True（标记需要继续，finalize 判断循环）
+│  5. 有工具:
+│     - should_continue=True（标记需要继续）
 │     - loop_step += 1
-│  5. route_after_planner 决定去向（skip / run）
+│  6. route_after_planner 决定去向（skip / run）
 └──────────────────────────────────────────────────────
     │ run
     ▼
@@ -154,8 +157,10 @@ graph.add_edge("finalize", END)
 │     - final_answer() → 原始数据 + 一句话结论
 │  5. 提取 tool_calls_log 和 charts
 │  6. 构建 StepRecord → 追加到 state.step_records
-│  7. route_after_agent: 有工具且成功 → continue → 回 planner
-│                        否则 → finish → finalize
+│  7. route_after_agent 结束判断（兜底）:
+│     - loop_step >= max_loop → finish（步数硬限制）
+│     - _has_conclusion(last_content) → finish（Agent 输出含结论）
+│     - 否则 → continue → 回 planner 继续选工具
 └──────────────────────────────────────────────────────
     │ finish
     ▼
@@ -189,7 +194,7 @@ class AgentState(TypedDict, total=False):
     intent: Dict[str, Any]
 
     # ── 执行状态 ──────────────────────────────────
-    step_records: Annotated[List[StepRecord], add]  # 自动追加合并
+    step_records: List[StepRecord]  # 每轮覆盖（非追加），避免跨轮执行状态污染
     current_tools: List[str]
     current_skill: Optional[str]
     cached_tools: Optional[List[str]]   # qd_traces 缓存命中时注入，跳过 LLM#2
@@ -204,8 +209,8 @@ class AgentState(TypedDict, total=False):
     final_output: Dict[str, Any]
     total_steps: int
     total_tokens: int
-    tool_calls_log: Annotated[List[Dict[str, Any]], add]
-    charts: Annotated[List[str], add]
+    tool_calls_log: List[Dict[str, Any]]  # 每轮覆盖，agent_node 内部手动累积
+    charts: List[str]  # 每轮覆盖
 
     # ── 元数据 ────────────────────────────────────
     session_id: str
@@ -222,7 +227,8 @@ class AgentState(TypedDict, total=False):
 ```
 
 **关键设计点**：
-- `messages` 和 `step_records` 使用 `Annotated[List, add]` reducer，LangGraph 自动追加合并
+- `messages` 使用 `Annotated[List, add]` reducer，对话历史自动追加
+- `step_records` / `tool_calls_log` / `charts` 使用普通 List，每轮由 `create_initial_state()` 初始化为空，覆盖 checkpointer 旧值，避免跨轮执行状态污染。同轮内 agent→planner 多步循环由 agent_node 手动累积（`prev_records + [record]`）
 - `TraceCollector` 不能放入 state（不可 msgpack 序列化），通过 `_collectors` 模块级 dict 存取
 - `last_verb` / `last_noun` 跨轮持久化，供负面反馈检测使用
 - 已删除: `enriched`（LangGraph messages 替代）、`intent_context`（死代码）、`current_rules`（tool_strategy 替代）、`step_content`/`step_success`（step_records 替代）
@@ -232,14 +238,17 @@ class AgentState(TypedDict, total=False):
 ```python
 def _build_checkpointer():
     database_url = os.getenv("DATABASE_URL")
-    saver = PostgresSaver.from_conn_string(database_url)
+    from psycopg_pool import ConnectionPool
+    pool = ConnectionPool(conninfo=database_url, min_size=2, max_size=10)
+    saver = PostgresSaver(pool)
     saver.setup()  # 自动建表
     return saver
 ```
 
-- 优先使用 `langgraph-checkpoint-postgres`（官方包）
+- 优先使用 `langgraph-checkpoint-postgres`（官方包，v3.x）
+- v3.x 的 `from_conn_string()` 是 `@contextmanager`，不直接返回实例；改用 `ConnectionPool` 直接构造，连接池自动管理连接生命周期
 - 降级到 `MemorySaver`（跨重启不持久化）并输出警告日志
-- 复用项目已有的 PostgreSQL（`DATABASE_URL`），不引入额外数据库
+- 使用独立的 `psycopg_pool.ConnectionPool`（psycopg v3），与业务层的 `psycopg2.ThreadedConnectionPool`（psycopg2 v2）互不影响
 - `thread_id = session_id`，每个会话独立
 - `get_previous_state(session_id)` 可读取上一轮 state
 - `get_session_messages(session_id)` 读取消息历史
@@ -252,18 +261,28 @@ def _build_checkpointer():
 
 ### 4.1 Intent Analyzer（LLM #1）
 
-**职责**: 分析用户意图，提取 domain/verb/noun/strategy。
+**职责**: 分析用户意图，提取 domain/verb/noun/strategy/context_summary。
 
 **流程**:
-1. 快速通道: 正则匹配闲聊（0 LLM 调用）
-2. LLM 分析: 仅非闲聊时调用
-3. stock_code 提取: **仅金融领域**执行 3 级提取
+1. 空消息快速返回（0 LLM 调用）
+2. LLM 分析: 单次调用同时完成意图分类 + 上下文压缩
+   - 输入: 用户消息 + context_summary（上轮摘要）
+   - 输出: domain / verb / noun / confidence / context_summary
+   - **不提取 stock_code**（由 prepare_node 第 3 步处理）
+3. strategy 计算: finance/trading → `traced`，其他 → `direct`
+
+**注意**: stock_code 提取由 prepare_node 第 3 步负责（正则 + text_utils），不在意图分析阶段处理，避免 LLM 误匹配。
 
 **输出**: `IntentResult` 结构体 → 序列化到 `state.intent`
 
 ### 4.2 Planner（LLM #2）
 
-**职责**: 每步只选工具，不判断任务是否完成。
+**职责**: 选工具为主，兼做结论检测。正常情况只选工具；当 Agent 上一步已输出结论时，跳过 LLM#2 直接结束。
+
+**结束判断逻辑**（优先级从高到低）:
+1. `_has_conclusion(step_records[-1])` → 跳过 LLM#2，直接结束（避免重复调用）
+2. LLM#2 返回无工具无 skill → 闲聊快速通道，LLM 直接回复
+3. 有工具 → 标记 `should_continue=True`，交给 agent 执行
 
 **注入内容**:
 

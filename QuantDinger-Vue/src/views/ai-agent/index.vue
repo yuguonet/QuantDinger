@@ -417,11 +417,15 @@ export default {
               })
             }
           }
-          // 不覆盖中间步骤，最终结果写入 finalContent
+          // 最终结果写入 finalContent，并更新显示
           const last = messages.value[messages.value.length - 1]
           if (last && last.role === 'assistant') {
             last.finalContent = ev.content || ''
             last.streaming = false
+            // 如果没有 step_content 事件（如闲聊快速通道），用 finalContent 填充 content
+            if (!last.content && ev.content) {
+              last.content = ev.content
+            }
           }
           streaming.value = false
           _streamActive = false

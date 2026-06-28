@@ -158,14 +158,3 @@ def extract_stock_from_message(message: str) -> Tuple[Optional[str], Optional[st
 
 
 
-# ═══════════════════════════════════════════════════════════════
-# Ollama URL 检测
-# ═══════════════════════════════════════════════════════════════
-
-_OLLAMA_MARKERS = ("localhost:11434", "127.0.0.1:11434", "ollama")
-
-
-def is_ollama_url(url: str) -> bool:
-    """判断 URL 是否指向 Ollama 服务。"""
-    url_lower = url.lower()
-    return any(k in url_lower for k in _OLLAMA_MARKERS)
