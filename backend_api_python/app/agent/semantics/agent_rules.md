@@ -10,17 +10,21 @@ description: Agent 执行规范
 4. **数据缺失** — 结论中注明"XX数据缺失"，不用想象填补。
 5. **中文回答**。
 
+## 评分引用规则
+
+工具返回的 evaluation/评分是算法预评，可直接引用。highlights/warnings 提示异常时需关注。
+
 ## 输出格式(金融领域,有个股时)
 
 ```json
 {
-  "stock_code": "从工具返回值中获取的真实代码",
-  "stock_name": "从工具返回值中获取的真实名称",
+  "stock_code": "股票代码",
+  "stock_name": "股票名称",
   "action": "根据分析结果选择: buy/sell/hold/skip",
-  "score": "根据多维度分析计算的真实评分(0-100)",
+  "score": "综合评分(0-100)，基于工具评分整合，必要时结合文字信息修正",
   "direction": "根据评分判断: bullish/bearish/neutral",
   "confidence": "根据数据完整度判断: high/medium/low",
-  "timeframe": "根据分析周期判断: T+1/T+3/T+5/1W/1M",
+  "timeframe": "分析周期: T+1/T+3/T+5/1W/1M",
   "signal": "根据真实数据总结的核心逻辑",
   "analysis": "基于真实数据的完整分析过程"
 }

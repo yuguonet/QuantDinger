@@ -435,6 +435,9 @@ def analyze_trend(codes: str) -> Dict[str, Any]:
                 signal_score = total_score
 
             all_signals = []
+            highlights = []
+            warnings = []
+
             if isinstance(macd_result, dict):
                 all_signals.extend(macd_result.get("signals", []))
             if isinstance(rsi_result, dict):
@@ -443,6 +446,41 @@ def analyze_trend(codes: str) -> Dict[str, Any]:
                 all_signals.extend(boll_result.get("signals", []))
             if isinstance(kdj_result, dict):
                 all_signals.extend(kdj_result.get("signals", []))
+
+            # ── highlights / warnings ──
+            if ma_score >= 75:
+                highlights.append(f"均线{ma_desc}")
+            elif ma_score <= 25:
+                warnings.append(f"均线{ma_desc}")
+            if macd_score >= 65:
+                highlights.append("MACD 偏多")
+            elif macd_score <= 35:
+                warnings.append("MACD 偏空")
+            if isinstance(rsi_result, dict) and "error" not in rsi_result:
+                rsi6 = rsi_result.get("rsi6", 50)
+                if rsi6 >= 70:
+                    warnings.append(f"RSI {rsi6:.0f} 超买")
+                elif rsi6 <= 30:
+                    highlights.append(f"RSI {rsi6:.0f} 超卖")
+            if isinstance(boll_result, dict) and "error" not in boll_result:
+                pos = boll_result.get("position_pct", 50)
+                if pos >= 80:
+                    warnings.append(f"BOLL 上轨附近")
+                elif pos <= 20:
+                    highlights.append(f"BOLL 下轨附近")
+            if isinstance(kdj_result, dict) and "error" not in kdj_result:
+                j = kdj_result.get("j", 50)
+                if j >= 100:
+                    warnings.append(f"KDJ J值{j:.0f} 超买")
+                elif j <= 0:
+                    highlights.append(f"KDJ J值{j:.0f} 超卖")
+
+            evaluation = {
+                "score": total_score,
+                "scores": {"ma": ma_score, "macd": macd_score, "rsi": rsi_score, "boll": boll_score, "kdj": kdj_score},
+                "highlights": highlights,
+                "warnings": warnings,
+            }
 
             change_pct = _safe_round((latest - prev) / prev * 100, 2) if prev else 0
 
@@ -462,6 +500,7 @@ def analyze_trend(codes: str) -> Dict[str, Any]:
                 "buy_signal": buy_signal,
                 "signal_score": signal_score,
                 "all_signals": all_signals,
+                "evaluation": evaluation,
                 "data_points": len(closes),
             }
         except Exception as e:

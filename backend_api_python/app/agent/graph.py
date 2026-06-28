@@ -16,9 +16,9 @@ from langgraph.graph import StateGraph, END
 
 from app.agent.state import AgentState, AgentResult, create_initial_state
 from app.agent.nodes import (
-    prepare_node, route_after_prepare,
-    planner_node,
-    agent_node,
+    prepare_node,
+    planner_node, route_after_planner,
+    agent_node, route_after_agent,
     finalize_node,
 )
 
@@ -65,12 +65,15 @@ def build_graph() -> StateGraph:
     graph.add_node("finalize", finalize_node)
 
     graph.set_entry_point("prepare")
-    graph.add_conditional_edges("prepare", route_after_prepare, {
+    graph.add_edge("prepare", "planner")
+    graph.add_conditional_edges("planner", route_after_planner, {
         "skip": "finalize",
-        "plan": "planner",
+        "run": "agent",
     })
-    graph.add_edge("planner", "agent")
-    graph.add_edge("agent", "finalize")
+    graph.add_conditional_edges("agent", route_after_agent, {
+        "continue": "planner",
+        "finish": "finalize",
+    })
     graph.add_edge("finalize", END)
 
     return graph
@@ -85,11 +88,48 @@ def get_graph_app():
     global _app
     if _app is None:
         _app = build_graph().compile(checkpointer=_checkpointer)
+        # 启动时清理 7 天前的 checkpointer 数据
+        cleanup_old_checkpoints(days=7)
     return _app
 
 
 def get_checkpointer():
     return _checkpointer
+
+def cleanup_old_checkpoints(days: int = 7) -> int:
+    """清理超过 N 天的 checkpointer session state。返回清理条数。"""
+    try:
+        import psycopg2
+        database_url = os.getenv("DATABASE_URL", "")
+        if not database_url:
+            return 0
+        conn = psycopg2.connect(database_url)
+        try:
+            with conn.cursor() as cur:
+                # langgraph-checkpoint-postgres 的表结构
+                cur.execute("""
+                    DELETE FROM checkpoint_writes
+                    WHERE thread_id IN (
+                        SELECT DISTINCT thread_id FROM checkpoints
+                        WHERE checkpoint_ts < NOW() - INTERVAL '%s days'
+                    )
+                """, (days,))
+                deleted_writes = cur.rowcount
+                cur.execute("""
+                    DELETE FROM checkpoints
+                    WHERE checkpoint_ts < NOW() - INTERVAL '%s days'
+                """, (days,))
+                deleted_checkpoints = cur.rowcount
+                conn.commit()
+                total = deleted_writes + deleted_checkpoints
+                if total > 0:
+                    logger.info("[Checkpointer] 清理 %d 天前数据: %d 条", days, total)
+                return total
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.debug("[Checkpointer] 清理跳过: %s", e)
+        return 0
 
 
 def get_previous_state(session_id: str):
@@ -102,6 +142,61 @@ def get_previous_state(session_id: str):
     except Exception as e:
         logger.debug("[Graph] 读取历史 state 失败: %s", e)
     return None
+
+
+def get_session_messages(session_id: str) -> list:
+    """从 checkpointer 读取会话的完整消息历史。"""
+    state = get_previous_state(session_id)
+    if state:
+        return state.get("messages", [])
+    return []
+
+
+def list_checkpointer_sessions(limit: int = 50) -> list:
+    """从 PostgreSQL checkpointer 列出所有会话（按最近更新排序）。"""
+    try:
+        import psycopg2
+        database_url = os.getenv("DATABASE_URL", "")
+        if not database_url:
+            return []
+        conn = psycopg2.connect(database_url)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT thread_id, MAX(checkpoint_ts) AS latest
+                    FROM checkpoints
+                    GROUP BY thread_id
+                    ORDER BY latest DESC
+                    LIMIT %s
+                """, (limit,))
+                return [{"session_id": row[0], "updated_at": row[1].isoformat() if row[1] else None}
+                        for row in cur.fetchall()]
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.debug("[Checkpointer] 列出会话失败: %s", e)
+        return []
+
+
+def delete_checkpointer_session(session_id: str) -> bool:
+    """从 PostgreSQL checkpointer 删除指定会话。"""
+    try:
+        import psycopg2
+        database_url = os.getenv("DATABASE_URL", "")
+        if not database_url:
+            return False
+        conn = psycopg2.connect(database_url)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM checkpoint_writes WHERE thread_id = %s", (session_id,))
+                cur.execute("DELETE FROM checkpoints WHERE thread_id = %s", (session_id,))
+                conn.commit()
+                return cur.rowcount > 0
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.debug("[Checkpointer] 删除会话失败: %s", e)
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -155,21 +250,7 @@ def chat_hybrid(
                 # ── 节点开始 ──
                 yield {"type": "node_start", "node": node_name}
 
-                if node_name == "prepare":
-                    if not output.get("should_continue", True):
-                        # 快速通道（闲聊等），直接出结果
-                        final_output = output.get("final_output", {})
-                        if isinstance(final_output, str):
-                            content = final_output
-                        elif isinstance(final_output, dict):
-                            content = json.dumps(final_output, ensure_ascii=False)
-                        else:
-                            content = str(final_output) if final_output else ""
-                        yield {"type": "node_done", "node": node_name}
-                        yield {"type": "done", "success": True, "content": content}
-                        return
-
-                elif node_name == "planner":
+                if node_name == "planner":
                     tools = output.get("current_tools", [])
                     skill = output.get("current_skill")
                     parts = []
@@ -184,9 +265,12 @@ def chat_hybrid(
                     for tc in output.get("tool_calls_log", []):
                         yield {"type": "tool_start", "tool": tc.get("tool", "")}
                         yield {"type": "tool_done", "tool": tc.get("tool", ""), "success": tc.get("success", True)}
-                    step_content = output.get("step_content", "")
-                    if step_content:
-                        yield {"type": "step_content", "content": step_content[:2000]}
+                    # 从 step_records 读取，不依赖顶层 step_content
+                    _records = output.get("step_records", [])
+                    if _records:
+                        _sc = _records[-1].get("step_content", "")
+                        if _sc:
+                            yield {"type": "step_content", "content": _sc[:2000]}
 
                 elif node_name == "finalize":
                     final_state = output

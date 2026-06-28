@@ -19,17 +19,32 @@ logger = logging.getLogger(__name__)
 # TraceCollector / smolagents Agent 实例不可被 msgpack 序列化，
 # 不能放入 LangGraph state。通过 session_id 在模块级 dict 中存取。
 _collectors: Dict[str, Any] = {}
+_collectors_ts: Dict[str, float] = {}   # session_id → 创建时间戳（TTL 用）
 _agents: Dict[str, Any] = {}      # session_id → smolagents CodeAgent（中断用）
+_COLLECTOR_TTL = 3600  # 1 小时
 
 def _store_collector(session_id: str, collector: Any) -> None:
     if session_id:
+        import time
         _collectors[session_id] = collector
+        _collectors_ts[session_id] = time.time()
 
 def _get_collector(session_id: str) -> Optional[Any]:
     return _collectors.get(session_id)
 
 def _pop_collector(session_id: str) -> Optional[Any]:
+    _collectors_ts.pop(session_id, None)
     return _collectors.pop(session_id, None)
+
+def _cleanup_stale_collectors() -> None:
+    """清理超时未消费的 TraceCollector，防止内存泄漏。"""
+    import time
+    now = time.time()
+    stale = [sid for sid, ts in _collectors_ts.items() if now - ts > _COLLECTOR_TTL]
+    for sid in stale:
+        _collectors.pop(sid, None)
+        _collectors_ts.pop(sid, None)
+        logger.debug("[Trace] 清理过期 collector: %s", sid)
 
 def _store_agent(session_id: str, agent: Any) -> None:
     """存储 agent 引用，供中断端点使用。"""
@@ -84,9 +99,7 @@ def _get_history_from_state(state: AgentState) -> list:
 # ═══════════════════════════════════════════════════════════════
 
 def prepare_node(state: AgentState) -> Dict[str, Any]:
-    from app.agent.intent_analyzer import (
-        analyze_intent, format_intent_for_agent,
-    )
+    from app.agent.intent_analyzer import analyze_intent
     from app.agent.tool_context import set_tool_context
 
     query = state["query"]
@@ -99,7 +112,6 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
     intent_verb = ""
     intent_noun = ""
     domain_instructions = ""
-    intent_context = ""
     strategy = "direct"
 
     history = _get_history_from_state(state)
@@ -110,7 +122,6 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
         domain_instructions = intent.domain_instructions
         intent_verb = getattr(intent, "verb", "") or ""
         intent_noun = getattr(intent, "noun", "") or ""
-        intent_context = format_intent_for_agent(intent, query)
         intent_data = {
             "intent": intent.intent, "confidence": intent.confidence,
             "source": intent.source, "verb": intent_verb, "noun": intent_noun,
@@ -138,17 +149,6 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
             if _code:
                 stock_code, stock_name = _code, _name or stock_name
 
-    # 上下文拼接
-    enriched = query
-    messages = state.get("messages", [])
-    if messages:
-        parts = [f"[历史] 最近 {len(messages)} 条消息"]
-        if stock_code:
-            parts.append(f"股票代码: {stock_code}")
-        if stock_name:
-            parts.append(f"股票名称: {stock_name}")
-        enriched = "\n".join(parts) + f"\n\n{query}"
-
     # TraceCollector
     collector = None
     if strategy == "traced":
@@ -169,16 +169,10 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
         "messages": [{"role": "user", "content": query}],
         "domain": domain, "intent": intent_data,
         "intent_verb": intent_verb, "intent_noun": intent_noun,
-        "domain_instructions": domain_instructions, "intent_context": intent_context,
+        "domain_instructions": domain_instructions,
         "strategy": strategy, "stock_code": stock_code, "stock_name": stock_name,
-        "enriched": enriched, "should_continue": True,
+        "should_continue": True,
     }
-
-
-def route_after_prepare(state: AgentState) -> str:
-    if not state.get("should_continue", True):
-        return "skip"
-    return "plan"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -197,14 +191,36 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
     )
 
     if not step_result.success or (not step_result.tools and not step_result.skill):
-        return {"should_continue": False, "all_phases_completed": True}
+        # 无工具无 skill（闲聊等）→ LLM 直接回复，跳过 agent
+        try:
+            llm_call = _build_llm_call()
+            reply = llm_call([
+                {"role": "system", "content": "你是 QuantDinger 量化分析助手。简洁友好地回复用户。"},
+                {"role": "user", "content": state["query"]},
+            ])
+            content = reply if isinstance(reply, str) else str(reply)
+        except Exception as e:
+            logger.warning("planner 闲聊 LLM 调用失败: %s", e)
+            content = ""
+        return {
+            "should_continue": False,
+            "all_phases_completed": True,
+            "step_records": [{"step": 0, "step_content": content, "step_success": True}],
+        }
 
     return {
         "current_tools": step_result.tools,
         "current_skill": step_result.skill,
         "current_tool_strategy": step_result.tool_strategy,
         "loop_step": state.get("loop_step", 0) + 1,
+        "should_continue": True,  # 有工具，标记需要继续（finalize 判断是否循环）
     }
+
+
+def route_after_planner(state: AgentState) -> str:
+    if not state.get("should_continue", True):
+        return "skip"
+    return "run"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -302,11 +318,20 @@ def agent_node(state: AgentState) -> Dict[str, Any]:
     }
 
     return {
-        "step_records": [record], "step_content": content or "", "step_success": success,
+        "step_records": [record],
         "tool_calls_log": tool_calls_log, "charts": charts,
         "total_steps": state.get("total_steps", 0) + total_steps,
         "total_tokens": state.get("total_tokens", 0) + total_tokens,
     }
+
+
+def route_after_agent(state: AgentState) -> str:
+    """agent 执行完毕后，回到 planner 让它决定是否还有更多工具。"""
+    loop_step = state.get("loop_step", 0)
+    max_loop = state.get("max_loop_steps", 10)
+    if loop_step < max_loop:
+        return "continue"  # 回 planner，它看 step_records 后决定 run/skip
+    return "finish"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -343,9 +368,13 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
     _learn_from_execution(state)
     _save_traces(state, content)
 
+    # TTL 清理过期 collector
+    _cleanup_stale_collectors()
+
     return {
         "messages": [{"role": "assistant", "content": content}] if content else [],
         "final_output": final_output, "all_phases_completed": True,
+        # 不设 should_continue — finalize 不参与循环决策
         "last_verb": state.get("intent_verb", ""), "last_noun": state.get("intent_noun", ""),
     }
 

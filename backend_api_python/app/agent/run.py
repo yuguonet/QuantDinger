@@ -105,8 +105,9 @@ def _print_info():
     graph = build_graph()
     print(f"\n  节点: {list(graph.nodes.keys()) if hasattr(graph, 'nodes') else 'N/A'}")
     print(f"\n  图结构:")
-    print(f"    prepare → (skip: finalize | plan: planner)")
-    print(f"    planner → agent → finalize")
+    print(f"    prepare → planner")
+    print(f"    planner → (skip: finalize | run: agent)")
+    print(f"    agent → finalize")
     print(f"    finalize → (loop: prepare | end: END)")
 
     # Tools

@@ -44,9 +44,6 @@ class AgentState(TypedDict, total=False):
     step_records: Annotated[List[StepRecord], add]  # 自动追加合并
     current_tools: List[str]            # Planner 当轮选的工具
     current_skill: Optional[str]        # Planner 当轮选的 skill
-    current_rules: str                  # Planner 当轮的执行规则
-    step_content: str                   # 当前步骤产出
-    step_success: bool
 
     # ── 控制流 ────────────────────────────────────────────────
     loop_step: int                      # 当前循环步数
@@ -66,11 +63,9 @@ class AgentState(TypedDict, total=False):
     user_id: str
     strategy: str                       # direct / traced
     collector: Any                      # TraceCollector（运行时对象，不序列化）
-    enriched: str                       # 上下文拼接后的用户消息
     intent_verb: str
     intent_noun: str
     domain_instructions: str
-    intent_context: str
     # ── 跨轮元数据（checkpointer 自动持久化）─────────────
     last_verb: str                      # 上一轮 verb（反馈闭环用）
     last_noun: str                      # 上一轮 noun（反馈闭环用）
@@ -111,9 +106,7 @@ def create_initial_state(
         step_records=[],
         current_tools=[],
         current_skill=None,
-        current_rules="",
-        step_content="",
-        step_success=False,
+
         loop_step=0,
         max_loop_steps=max_loop_steps,
         should_continue=True,
@@ -127,11 +120,9 @@ def create_initial_state(
         user_id=user_id,
         strategy=strategy,
         collector=None,
-        enriched="",
         intent_verb="",
         intent_noun="",
         domain_instructions="",
-        intent_context="",
         messages=[],
         last_verb="",
         last_noun="",

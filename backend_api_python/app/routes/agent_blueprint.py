@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 /api/agent/* — AI Agent 聊天 & 流式接口
-smolagents 内核 — CodeAgent + Planning + Managed Agents + Hub/MCP Tools
+LangGraph 内核 — StateGraph + smolagents CodeAgent + PostgreSQL Checkpointer
 """
 import os
 import json
@@ -83,6 +83,10 @@ def _release_user_lock(user_id: int):
 # ── 共享工具 ─────────────────────────────────────────────────
 from app.agent.utils import detect_market as _detect_market
 from app.agent.session_store import get_session_store
+from app.agent.graph import (
+    get_session_messages, list_checkpointer_sessions, delete_checkpointer_session,
+    get_previous_state,
+)
 
 
 def _extract_stock_code(msg: str, ctx: Optional[Dict], session: Dict) -> Optional[str]:
@@ -280,46 +284,52 @@ def agent_chat():
 @login_required
 def list_chat_sessions():
     limit = int(request.args.get("limit", 50))
-    raw = get_session_store().list_sessions(limit)
-    return jsonify({
-        "sessions": [
-            {"session_id": s["session_id"], "created_at": s.get("created_at"),
-             "updated_at": s.get("updated_at"),
-             "message_count": len(s.get("messages", [])),
-             "stock_code": s.get("stock_code")}
-            for s in raw
-        ]
-    })
+    sessions = list_checkpointer_sessions(limit)
+    # 补充 session_store 里的元数据（stock_code 等）
+    store = get_session_store()
+    for s in sessions:
+        meta = store.get_session(s["session_id"]) or {}
+        s["stock_code"] = meta.get("stock_code", "")
+        s["created_at"] = meta.get("created_at")
+        # 从 checkpointer 读消息数
+        state = get_previous_state(s["session_id"])
+        s["message_count"] = len(state.get("messages", [])) if state else 0
+    return jsonify({"sessions": sessions})
 
 
 @agent_bp.route("/chat/sessions/<session_id>", methods=["GET"])
 @login_required
 def get_chat_session_messages(session_id: str):
-    session = get_session_store().get_session(session_id)
-    if not session:
-        return jsonify({"error": "Session not found"}), 404
+    messages = get_session_messages(session_id)
+    if not messages:
+        # 可能是空会话或不存在
+        state = get_previous_state(session_id)
+        if not state:
+            return jsonify({"error": "Session not found"}), 404
+    meta = get_session_store().get_session(session_id) or {}
     return jsonify({
         "session_id": session_id,
-        "messages": session.get("messages", []),
-        "stock_code": session.get("stock_code"),
+        "messages": messages,
+        "stock_code": meta.get("stock_code", ""),
     })
 
 
 @agent_bp.route("/chat/sessions/<session_id>", methods=["DELETE"])
 @login_required
 def delete_chat_session(session_id: str):
+    # 清 checkpointer（消息+state）
+    deleted_cp = delete_checkpointer_session(session_id)
+    # 清 session_store（元数据）
     store = get_session_store()
-    store.clear_history(session_id)
-    store.clear_tool_results(session_id)
-    deleted = store.delete_session(session_id)
-    # 清除意图路由上下文（domain 连续性加成）
+    store.delete_session(session_id)
+    # 清意图路由上下文
     try:
         from app.agent.intent_analyzer import _get_context_manager
         ctx_mgr = _get_context_manager()
         ctx_mgr.clear_session(session_id)
     except Exception:
         pass
-    return jsonify({"deleted": 1 if deleted else 0})
+    return jsonify({"deleted": 1 if deleted_cp else 0})
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -438,19 +448,20 @@ def list_saved_agents():
 @agent_bp.route("/replay/<session_id>", methods=["GET"])
 @login_required
 def replay_session(session_id: str):
-    """回放指定会话的 Agent 执行过程。
+    """回放指定会话的 Agent 执行过程（从 LangGraph checkpointer 读取）。
 
     Query params:
         detailed (bool): 是否包含每步的完整内存状态
     """
     try:
         detailed = request.args.get("detailed", "false").lower() == "true"
-        store = get_session_store()
-        session = store.get_session(session_id)
-        if not session:
+
+        state = get_previous_state(session_id)
+        if not state:
             return jsonify({"error": "Session not found"}), 404
 
-        messages = session.get("messages", [])
+        messages = state.get("messages", [])
+        step_records = state.get("step_records", [])
 
         replay = []
         for i, msg in enumerate(messages):
@@ -459,14 +470,25 @@ def replay_session(session_id: str):
                 "role": msg.get("role"),
                 "content": msg.get("content", "")[:2000] if not detailed else msg.get("content", ""),
             }
-            if detailed and msg.get("tool_calls"):
-                entry["tool_calls"] = msg["tool_calls"]
             replay.append(entry)
 
+        # 附加 step_records（工具调用详情）
+        if detailed and step_records:
+            for sr in step_records:
+                replay.append({
+                    "step": sr.get("step", "?"),
+                    "role": "tool_calls",
+                    "description": sr.get("description", ""),
+                    "tools": sr.get("tools", []),
+                    "tool_calls": sr.get("tool_calls", []),
+                })
+
+        meta = get_session_store().get_session(session_id) or {}
         return jsonify({
             "session_id": session_id,
-            "stock_code": session.get("stock_code"),
-            "total_steps": len(replay),
+            "stock_code": meta.get("stock_code", ""),
+            "loop_step": state.get("loop_step", 0),
+            "total_steps": state.get("total_steps", 0),
             "replay": replay,
         })
     except Exception as e:

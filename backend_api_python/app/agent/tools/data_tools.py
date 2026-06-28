@@ -147,11 +147,41 @@ def agent_get_kline(codes: str, timeframe: str = "1D", days: int = 60, market: s
         except Exception as e:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
-def get_stock_info(codes: str) -> Dict[str, Any]:
-    """股票基本信息：名称、代码、行业、上市日期、总股本、流通股本等。
+# ── 核心字段集（Agent 日常分析最常用的 ~15 个字段） ──────────────────────
+_STOCK_INFO_CORE_FIELDS = {
+    "stock_code", "name", "industry", "concepts",
+    "price", "change_pct",
+    "pe_ratio", "pe_ttm", "pe_static", "pb_ratio",
+    "market_cap", "mcap_yi", "float_market_cap", "float_mcap_yi",
+    "roe", "eps", "bvps",
+    "total_shares", "circ_shares",
+    "turnover_pct", "vol_ratio",
+    "list_date", "main_business",
+}
+
+
+def _filter_stock_info(info: Dict[str, Any], detail: bool = False) -> Dict[str, Any]:
+    """过滤股票信息，去除 None 值；非 detail 模式只保留核心字段。"""
+    if not isinstance(info, dict):
+        return info
+    if detail:
+        return {k: v for k, v in info.items() if v is not None}
+    return {k: v for k, v in info.items() if v is not None and k in _STOCK_INFO_CORE_FIELDS}
+
+
+
+
+
+def get_stock_info(codes: str, detail: bool = False) -> Dict[str, Any]:
+    """股票基本信息（精简模式，节省 token）。
+
+    默认返回核心字段：名称、行业、价格、PE/PB、市值、ROE、EPS、股本等。
+    数据量小，Agent 直接评估更靠谱，不出评分。
+    如需完整财务数据（利润表/资产负债表/现金流/股东/杜邦），设置 detail=true。
 
     Args:
-        codes: 多股用逗号分隔"
+        codes: 多股用逗号分隔
+        detail: false=精简（默认），true=完整（50+字段）
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
@@ -268,12 +298,12 @@ def get_stock_info(codes: str) -> Dict[str, Any]:
         return result
 
     if len(code_list) == 1:
-        return _one(code_list[0])
+        return _filter_stock_info(_one(code_list[0]), detail)
 
     results = {}
     for code in code_list:
         try:
-            results[code] = _one(code)
+            results[code] = _filter_stock_info(_one(code), detail)
         except Exception as e:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}

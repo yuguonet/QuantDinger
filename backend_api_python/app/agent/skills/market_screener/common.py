@@ -449,6 +449,11 @@ def scan_dragon_pullback(date: str) -> List[Dict]:
             "vol_ratio_today": round(vol_ratio_today, 2),
             "rsi": round(rsi[i], 2),
             "signals": signals, "strength_score": strength_score,
+            "evaluation": {
+                "score": strength_score,
+                "highlights": signals,
+                "warnings": [] if strength_score >= 40 else ["强度偏低，谨慎"],
+            },
         })
 
     candidates.sort(key=lambda x: -x["strength_score"])

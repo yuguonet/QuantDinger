@@ -1,6 +1,6 @@
 # Agent 可追责架构设计
 
-> 最后更新: 2026-06-27（v2 — PostgreSQL checkpointer + 混合输出 + Cron 修复）
+> 最后更新: 2026-06-28（v3 — 循环回边 + TTL + evaluation + 状态精简）
 > 状态: 实施中（LangGraph 版本）
 > 仓库: https://github.com/yuguonet/QuantDinger
 
@@ -42,23 +42,23 @@
 ┌──────────────────────────────────────────────────────────────┐
 │  LangGraph StateGraph（graph.py）                            │
 │                                                              │
-│  ┌─────────┐   skip    ┌──────────┐                         │
-│  │ prepare │ ─────────→│ finalize │                         │
-│  │ (LLM#1) │           └──────────┘                         │
-│  └────┬────┘                                                 │
-│       │ plan                                                 │
-│       ▼                                                      │
-│  ┌──────────┐        ┌──────────┐        ┌──────────┐       │
-│  │ planner  │ ──────→│  agent   │ ──────→│ finalize │       │
-│  │ (LLM#2) │        │ (LLM#3)  │        │          │       │
-│  └──────────┘        └──────────┘        └────┬─────┘       │
-│                                               │              │
-│                                          ┌────▼─────┐       │
-│                                          │   END    │       │
-│                                          └──────────┘       │
+│  ┌──────────┐        ┌──────────┐                            │
+│  │ prepare  │───────→│ planner  │──skip──→ finalize → END    │
+│  │ (LLM#1)  │        │ (LLM#2)  │                            │
+│  └──────────┘        └────┬─────┘                            │
+│                           │ run                               │
+│                           ▼                                   │
+│                     ┌──────────┐                              │
+│                     │  agent   │──continue──→ (back to planner)│
+│                     │ (LLM#3)  │                              │
+│                     └────┬─────┘                              │
+│                          │ finish                             │
+│                          ▼                                    │
+│                       finalize → END                          │
 │                                                              │
-│  状态管理: LangGraph Checkpointer (SQLite)                   │
+│  状态管理: LangGraph Checkpointer (PostgreSQL)               │
 │  追踪: TraceCollector（模块级 dict 存储，不进 state）        │
+│  TTL: TraceCollector 1h / Checkpointer 7d                    │
 └──────────────────────────────────────────────────────────────┘
     │
     ▼
@@ -72,10 +72,11 @@
 | 编排方式 | 手动 for-loop + `_execute_plan()` | `StateGraph` 节点图 |
 | LLM 数量 | 4 个（Intent/Planner/Agent/Judge） | 3 个（Intent/Planner/Agent） |
 | Judge (LLM#4) | 每步总结+纠错+控循环 | **已移除**，Agent 的 final_answer 即最终输出 |
-| 状态管理 | 手动 checkpoint.py（dict 传递） | LangGraph Checkpointer（SQLite 自动持久化） |
+| 状态管理 | 手动 checkpoint.py（dict 传递） | LangGraph Checkpointer（PostgreSQL 自动持久化） |
 | 对话历史 | 手动拼接 | `messages: Annotated[List, add]` 自动追加 |
-| 循环控制 | Judge 的 `continue_loop` | 当前为线性流，暂无循环回边 |
+| 循环控制 | Judge 的 `continue_loop` | agent → planner 循环（should_continue + loop_step） |
 | 流式输出 | 自行实现 | `app.stream()` 原生支持 |
+| 闲聊快速通道 | 无 | planner 无工具时 LLM 直接回复 → skip → finalize |
 
 ## 三、LangGraph 图结构
 
@@ -91,12 +92,15 @@ graph.add_node("agent", agent_node)         # ReAct 执行
 graph.add_node("finalize", finalize_node)   # 后处理
 
 graph.set_entry_point("prepare")
-graph.add_conditional_edges("prepare", route_after_prepare, {
-    "skip": "finalize",    # 快速通道（闲聊等）
-    "plan": "planner",     # 正常流程
+graph.add_edge("prepare", "planner")         # 固定边
+graph.add_conditional_edges("planner", route_after_planner, {
+    "skip": "finalize",    # 无工具（闲聊等）→ LLM 直接回复
+    "run": "agent",        # 有工具 → ReAct 执行
 })
-graph.add_edge("planner", "agent")
-graph.add_edge("agent", "finalize")
+graph.add_conditional_edges("agent", route_after_agent, {
+    "continue": "planner",  # 还需要更多工具 → 回到 planner
+    "finish": "finalize",  # 执行完毕 → finalize → END
+})
 graph.add_edge("finalize", END)
 ```
 
@@ -108,35 +112,32 @@ graph.add_edge("finalize", END)
     ▼
 阶段 1: prepare_node ──────────────────────────────────
 │  1. 负面反馈检测 — 惩罚上一轮 chain（checkpointer 读 last_verb/noun）
-│  2. 快速通道判断 — 正则匹配闲聊（0 LLM 调用）
-│     └─ 命中 → should_continue=False → 直接跳 finalize
-│  3. 意图分析 ← LLM #1（仅非闲聊时）
+│  2. 意图分析 ← LLM #1
 │     → domain / verb / noun / strategy / confidence
-│  4. stock_code 提取（仅金融领域，3 级：context → 正则 → 中文名解析）
-│  5. TraceCollector 创建（仅 traced 策略）
+│  3. stock_code 提取（仅金融领域，3 级：context → 正则 → 中文名解析）
+│  4. TraceCollector 创建（仅 traced 策略）
 │     → 存入模块级 _collectors dict（不可 msgpack 序列化）
-│  6. 上下文拼接 → enriched 字段
-│  7. 输出 state 更新 → route_after_prepare 决定去向
+│  5. 输出 state 更新 → 固定边到 planner
 └──────────────────────────────────────────────────────
-    │ plan
+    │
     ▼
 阶段 2: planner_node ──────────────────────────────────
 │  1. Planner (LLM #2) 选工具
 │     输入: 用户消息 + step_records（前序步骤结论）
-│     输出: StepResult (tools/skill/rules/reasoning)
+│     输出: StepResult (tools/skill/tool_strategy/reasoning)
 │  2. 空工具检查:
-│     - 无工具 + 无 skill → should_continue=False → 循环结束
-│  3. 输出 state 更新:
-│     - current_tools / current_skill / current_rules
+│     - 无工具 + 无 skill → LLM 直接回复 → should_continue=False → skip → finalize
+│  3. 有工具:
+│     - should_continue=True（标记需要继续，finalize 判断循环）
 │     - loop_step += 1
+│  4. route_after_planner 决定去向（skip / run）
 └──────────────────────────────────────────────────────
-    │
+    │ run
     ▼
 阶段 3: agent_node ────────────────────────────────────
 │  1. 构建步骤上下文（step_context）
 │     - 前序步骤结论（最近 3 步）
 │     - 标的信息（stock_code / stock_name）
-│     - Planner 的 rules
 │     - Skill 指令（如有）
 │  2. 工具过滤（如有 skill，加载 skill 的 tools 列表）
 │  3. 构建 smolagents CodeAgent（LLM #3）
@@ -147,17 +148,19 @@ graph.add_edge("finalize", END)
 │     - final_answer() → 原始数据 + 一句话结论
 │  5. 提取 tool_calls_log 和 charts
 │  6. 构建 StepRecord → 追加到 state.step_records
+│  7. route_after_agent: 有工具且成功 → continue → 回 planner
+│                        否则 → finish → finalize
 └──────────────────────────────────────────────────────
-    │
+    │ finish
     ▼
-阶段 4: finalize_node ─────────────────────────────────
-│  1. 快速通道处理（prepare_node 已设 final_output → 直接返回）
-│  2. 从 step_records 拼接内容
-│  3. JSON 提取 → 结构化 final_output
-│  4. 学习闭环:
+阶段 4: finalize_node（只在最后执行一次）────────────────
+│  1. 从 step_records 拼接内容
+│  2. JSON 提取 → 结构化 final_output
+│  3. 学习闭环:
 │     - _learn_from_execution() → 成功时写回 tool_chains.json
 │     - _save_traces() → TraceCollector 存库 或 兜底写入 EvalNode
-│  5. 更新 last_verb / last_noun（供下轮负面反馈检测）
+│  4. 更新 last_verb / last_noun（供下轮负面反馈检测）
+│  5. TTL 清理过期 TraceCollector
 │  6. 写入 messages（对话历史自动持久化）
 └──────────────────────────────────────────────────────
     │
@@ -183,9 +186,6 @@ class AgentState(TypedDict, total=False):
     step_records: Annotated[List[StepRecord], add]  # 自动追加合并
     current_tools: List[str]
     current_skill: Optional[str]
-    current_rules: str
-    step_content: str
-    step_success: bool
 
     # ── 控制流 ────────────────────────────────────
     loop_step: int
@@ -205,11 +205,9 @@ class AgentState(TypedDict, total=False):
     user_id: str
     strategy: str                   # direct / traced
     collector: Any                  # TraceCollector（运行时，不序列化）
-    enriched: str
     intent_verb: str
     intent_noun: str
     domain_instructions: str
-    intent_context: str
 
     # ── 跨轮元数据（Checkpointer 自动持久化）─────
     last_verb: str
@@ -220,6 +218,7 @@ class AgentState(TypedDict, total=False):
 - `messages` 和 `step_records` 使用 `Annotated[List, add]` reducer，LangGraph 自动追加合并
 - `TraceCollector` 不能放入 state（不可 msgpack 序列化），通过 `_collectors` 模块级 dict 存取
 - `last_verb` / `last_noun` 跨轮持久化，供负面反馈检测使用
+- 已删除: `enriched`（LangGraph messages 替代）、`intent_context`（死代码）、`current_rules`（tool_strategy 替代）、`step_content`/`step_success`（step_records 替代）
 
 ### 3.4 Checkpointer（PostgreSQL 持久化）
 
@@ -236,6 +235,11 @@ def _build_checkpointer():
 - 复用项目已有的 PostgreSQL（`DATABASE_URL`），不引入额外数据库
 - `thread_id = session_id`，每个会话独立
 - `get_previous_state(session_id)` 可读取上一轮 state
+- `get_session_messages(session_id)` 读取消息历史
+- `list_checkpointer_sessions(limit)` 列出所有会话
+- `delete_checkpointer_session(session_id)` 删除会话
+- TTL: `cleanup_old_checkpoints(days=7)` 启动时清理 7 天前数据
+- 消息历史统一: 所有消息读写走 Checkpointer，session_store 仅保留元数据（stock_code 等）
 
 ## 四、核心组件
 
@@ -314,9 +318,10 @@ def _build_checkpointer():
 
 **职责**: Agent 执行过程中自动收集信息，构建 EvalNode 树。
 
-**存储方式**: 模块级 `_collectors` dict，key 为 `session_id`。
+**存储方式**: 模块级 `_collectors` dict + `_collectors_ts` 时间戳 dict，key 为 `session_id`。
 - `TraceCollector` 实例不可被 msgpack 序列化，不能放入 LangGraph state
 - `prepare_node` 创建并存入 → `agent_node` 读取 → `finalize_node` 弹出并存库
+- TTL: `_cleanup_stale_collectors()` 在 finalize_node 末尾调用，清理超过 1 小时未消费的 collector
 
 **提取策略**: JSON 优先，正则降级。
 
@@ -510,6 +515,33 @@ Skill 从 `agent/skills/*/SKILL.md` 动态加载，包含：
 - 工具列表
 - 执行指令（SKILL.md body）
 
+### 8.3 工具评分（evaluation）
+
+**原则**: token 优化在工具层完成，不在 Agent 层。
+
+**判断标准**: 数据量大（多指标、多行）→ 用评分压缩；数据量小（单个数字）→ 直接返回原始数据，不出评分。
+
+**统一结构**:
+```json
+{
+  "evaluation": {
+    "score": 72,
+    "scores": {"dim1": 80, "dim2": 65},
+    "highlights": ["RSI 28 超卖"],
+    "warnings": ["MACD 死叉"]
+  }
+}
+```
+
+**出评分的工具**（数据量大、多指标综合）：
+- `analysis_tools.py` analyze_trend — MA/MACD/RSI/BOLL/KDJ 多维度加权
+- `intelligence_analysis.py` — 新闻/政策文字量大，评分压缩有效
+- `market_screener` — 候选池数据量大
+
+**不出评分的工具**（数据量小、Agent 直接看更靠谱）：
+- `data_tools.py` get_stock_info — PE/PB/ROE 就几个数字
+- `news_search_tools.py` — 文字性内容，Agent 自行分析
+
 ## 九、配置项
 
 ### 9.1 环境变量
@@ -540,12 +572,12 @@ CODE_EXECUTION_TIMEOUT=120       # 代码执行超时（秒）
 
 ## 十、已知限制
 
-1. **无循环回边**: 当前图是线性流（prepare → planner → agent → finalize → END），finalize 不回 prepare。多步依赖靠 Planner 在单次调用中处理。
+1. ~~**无循环回边**~~: ✅ 已实现（agent → planner 条件循环）。
 2. **Planner 输出解析**: 依赖 LLM 输出 JSON 格式，有容错处理但不保证 100% 成功。
 3. **单步执行**: 当前实现为顺序执行，不支持并行步骤。
 4. **per-step agent 重建**: 每步重建 agent 有性能开销，但保证上下文最小化。
-5. **TraceCollector 内存泄漏风险**: 模块级 `_collectors` dict，如果 finalize_node 未正常执行（异常中断），collector 不会被清理。需要定期清理过期 session。
-6. **Checkpointer 无 TTL**: PostgreSQL checkpointer 持久化所有 session state，无自动过期机制，长期运行需手动清理。
+5. **TraceCollector 内存泄漏风险**: 模块级 `_collectors` dict，如果 finalize_node 未正常执行（异常中断），collector 不会被清理。已加 TTL（1小时）缓解。
+6. **Checkpointer TTL**: 启动时清理 7 天前数据，无实时清理。
 
 ## 十一、混合输出模式
 
@@ -592,8 +624,8 @@ CODE_EXECUTION_TIMEOUT=120       # 代码执行超时（秒）
 
 ## 十三、后续迭代
 
-1. **循环回边**: finalize → prepare 条件循环，支持多轮 Planner → Agent 递进执行。
+1. ~~**循环回边**~~: ✅ 已实现（agent → planner 条件循环，should_continue + loop_step）
 2. **并行步骤执行**: 支持无依赖关系的步骤并行执行。
 3. **动态 skill 加载**: 根据步骤需要动态加载/卸载 skill。
-4. **Checkpointer TTL**: 自动清理过期 session state。
+4. ~~**Checkpointer TTL**~~: ✅ 已实现（启动时清理 7 天前数据）
 5. **回测引擎**: 完整的回测系统设计。

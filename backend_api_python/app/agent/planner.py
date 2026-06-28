@@ -154,7 +154,7 @@ class Planner:
             return StepResult(success=False, reasoning=f"LLM 决策异常: {e}", elapsed_ms=(time.time() - t0) * 1000)
 
         # 校验
-        validated = self._validate_step(step_data)
+        validated = self._validate_step(step_data, already_used_tools)
         if validated is not None:
             logger.warning("[Planner] 步骤校验失败: %s", validated)
             return StepResult(success=False, reasoning=f"步骤校验失败: {validated}", elapsed_ms=(time.time() - t0) * 1000)
@@ -280,6 +280,7 @@ class Planner:
             "## 规则\n"
             "- 根据用户需求选择相关工具\n"
             "- 不要重复已调用的工具\n"
+            "- 如果前序步骤已获取足够数据完成分析，返回空工具: \"tools\": []\n"
         )
 
         print(f"[Planner] prompt 长度: {len(prompt)} 字符")
@@ -326,8 +327,13 @@ class Planner:
 
         raise ValueError(f"无法解析步骤 JSON: {raw[:300]}")
 
-    def _validate_step(self, step_data: Dict[str, Any]) -> Optional[str]:
+    def _validate_step(self, step_data: Dict[str, Any], already_used: List[str] = None) -> Optional[str]:
         """校验步骤。返回 None 表示通过。"""
+        tools = step_data.get("tools", [])
+        if already_used and tools:
+            overlap = [t for t in tools if t in already_used]
+            if overlap:
+                return f"重复工具: {overlap}，已在前序步骤使用"
         return None
 
 

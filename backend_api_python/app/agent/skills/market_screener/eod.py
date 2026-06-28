@@ -164,20 +164,27 @@ def prescreen() -> Dict[str, Any]:
             "vol_ratio": round(vol_ratio, 2), "rsi": round(rsi[-1], 2),
             "reason": reason, "eod_score": eod_score,
             "signals": signals, "source": "尾盘强势",
+            "evaluation": {
+                "score": eod_score,
+                "highlights": signals,
+                "warnings": ["RSI超买"] if eod_score > 0 and any("超买" in s for s in signals) else [],
+            },
         })
 
     for s in eod_zt:
         code = s["code"]
         bars = fetch_kline(code, days=5)
         close = bars[-1]["close"] if bars else 0
+        _zt_signals = [f"尾盘封板{s['zt_time']}", f"{s['continuous_days']}连板"]
         candidates.append({
             "code": code, "name": s["name"],
             "change_pct": 9.9, "turnover": 0,
             "close": round(close, 3), "high": round(close, 3),
             "close_to_high": 0, "vol_ratio": 0, "rsi": 0,
             "reason": s.get("reason", ""), "eod_score": 90,
-            "signals": [f"尾盘封板{s['zt_time']}", f"{s['continuous_days']}连板"],
+            "signals": _zt_signals,
             "source": "尾盘封板",
+            "evaluation": {"score": 90, "highlights": _zt_signals, "warnings": []},
         })
 
     seen = set()

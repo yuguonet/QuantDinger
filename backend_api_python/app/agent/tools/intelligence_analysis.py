@@ -96,6 +96,42 @@ def intelligence_analysis(stock_code: str, stock_name: str = "") -> Dict[str, An
         f"{'一票否决' if veto else ''}"
     )
 
+    # ── highlights / warnings ──
+    highlights = []
+    warnings = []
+
+    # 一票否决是最高级别警告
+    if stock_veto:
+        veto_src = _find_veto_source(stock_result)
+        warnings.append(f"个股否决: {veto_src}" if veto_src else "个股一票否决")
+    if policy_veto:
+        veto_src = _find_veto_source(policy_result)
+        warnings.append(f"政策否决: {veto_src}" if veto_src else "政策一票否决")
+
+    # 有实质影响的信号 → highlights
+    for s in stock_signals[:3]:
+        if not s.startswith("⚠"):
+            highlights.append(s)
+    for s in policy_signals[:2]:
+        if not s.startswith("⚠"):
+            highlights.append(s)
+
+    if stock_score >= 3:
+        highlights.append(f"个股情报正面({stock_score}/5)")
+    elif stock_score <= -3:
+        warnings.append(f"个股情报负面({stock_score}/5)")
+    if policy_score >= 3:
+        highlights.append(f"政策面利好({policy_score}/5)")
+    elif policy_score <= -3:
+        warnings.append(f"政策面利空({policy_score}/5)")
+
+    evaluation = {
+        "score": final_score,
+        "scores": {"stock": _5_to_100(stock_score), "policy": _5_to_100(policy_score)},
+        "highlights": highlights,
+        "warnings": warnings,
+    }
+
     return {
         
         "score": final_score,
@@ -118,6 +154,7 @@ def intelligence_analysis(stock_code: str, stock_name: str = "") -> Dict[str, An
         "policy_score": policy_score,
         "stock_signals": stock_signals,
         "policy_signals": policy_signals,
+        "evaluation": evaluation,
     }
 
 

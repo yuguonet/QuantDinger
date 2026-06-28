@@ -131,6 +131,22 @@ def assess_market_state() -> Dict[str, Any]:
     else:
         mood = "弱势"
 
+    # ── highlights / warnings ──
+    highlights = []
+    warnings = []
+    if mood_score >= 70:
+        highlights.append(f"情绪偏强({mood_score})")
+    elif mood_score <= 30:
+        warnings.append(f"情绪偏弱({mood_score})")
+    if zt_count > 80:
+        highlights.append(f"涨停{zt_count}家，赚钱效应好")
+    elif dt_count > 30:
+        warnings.append(f"跌停{dt_count}家，亏钱效应")
+    if net_inflow > 50000000:
+        highlights.append(f"主力净流入{net_inflow/10000:.0f}万")
+    elif net_inflow < -50000000:
+        warnings.append(f"主力净流出{abs(net_inflow)/10000:.0f}万")
+
     return {
         "fund_flow": net_inflow,
         "mood": mood,
@@ -141,6 +157,12 @@ def assess_market_state() -> Dict[str, Any]:
         "dt_count": dt_count,
         "broken_count": broken_count,
         "broken_rate": broken_rate,
+        "evaluation": {
+            "score": mood_score,
+            "scores": {"mood": mood_score},
+            "highlights": highlights,
+            "warnings": warnings,
+        },
     }
 
 
