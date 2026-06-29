@@ -199,11 +199,11 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
             from app.agent.text_utils import extract_stock_from_message
             _code, _name = extract_stock_from_message(query)
             if _code and _name:
-                stock_code, stock_name = _code, _name
-        # ── 校验：stock_name 必须出现在用户消息中 ────────────────
-        if stock_code and stock_name and stock_name not in query:
-            logger.warning("[Prepare] stock_name '%s' 不在消息中，丢弃匹配", stock_name)
-            stock_code, stock_name = "", ""
+                # 中文名解析才校验名称是否在消息中
+                if _name in query:
+                    stock_code, stock_name = _code, _name
+                else:
+                    logger.warning("[Prepare] 中文名 '%s' 不在消息中，丢弃匹配", _name)
         # ── 校验：必须同时有 code 和 name ─────────────────────
         if bool(stock_code) != bool(stock_name):
             logger.warning("[Prepare] code/name 不完整 (code=%s, name=%s)，清空", stock_code, stock_name)
@@ -304,8 +304,7 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
 
     # ── 已有结论 → 直接结束，不再调 LLM#2 ──
     if step_records:
-        last_content = step_records[-1].get("step_content", "")
-        if _has_conclusion(last_content):
+        if _has_conclusion(step_records):
             logger.info("[Planner] 已有结论，结束规划")
             return {
                 "should_continue": False,
@@ -462,14 +461,18 @@ def agent_node(state: AgentState) -> Dict[str, Any]:
         # 执行完毕（成功或失败），清理 agent 引用
         _clear_agent(_session_id)
 
-    # ── 统一解壳：壳只在 agent 内部用，step_records 存干净数据 ──
+    # ── 统一解壳：壳只在 agent_node 解析，其他地方通过 state 接口读取 ──
     _shell_valid = False
     _shell_data = None
+    _shell_errors = []
+    _shell_conclusion = True   # 缺省结束
     if content:
         from app.agent.json_extractor import extract_json
         _parsed = extract_json(content)
         if _parsed and _parsed.get("reply"):
             _shell_data = _parsed.get("data", {}) or {}
+            _shell_errors = _parsed.get("errors", []) or []
+            _shell_conclusion = _parsed.get("conclusion", True)
             content = _parsed["reply"]
             _shell_valid = True
 
@@ -480,7 +483,8 @@ def agent_node(state: AgentState) -> Dict[str, Any]:
         "planner_reasoning": "", "step_content": content or "", "step_success": success,
         "steps_used": total_steps, "step_tokens": total_tokens,
         "tool_calls": tool_calls_log, "charts": charts,
-        "shell_data": _shell_data,
+        "shell_data": _shell_data, "shell_errors": _shell_errors,
+        "shell_conclusion": _shell_conclusion,
     }
 
     # 累积已有记录（普通 List reducer，返回值会覆盖而非追加）
@@ -498,7 +502,10 @@ def agent_node(state: AgentState) -> Dict[str, Any]:
 
 
 def route_after_agent(state: AgentState) -> str:
-    """agent 执行完毕后，决定继续还是结束。"""
+    """agent 执行完毕后，决定继续还是结束。
+
+    只看壳层字段，不碰 data 内容。壳层通用，不针对任何领域。
+    """
     loop_step = state.get("loop_step", 0)
     max_loop = state.get("max_loop_steps", 10)
 
@@ -509,56 +516,32 @@ def route_after_agent(state: AgentState) -> str:
     if not step_records:
         return "finish"
 
-    last_content = step_records[-1].get("step_content", "")
-
-    # ── 壳检测 + 结论检测 ──
+    # ── 壳层判断：从 step_records 读取，不直接读壳 ──
     _shell_valid = state.get("_shell_valid", False)
-    domain = state.get("domain", "")
-
     if not _shell_valid:
-        _last = step_records[-1] if step_records else {}
-        logger.warning("[Route] agent 未输出有效壳，结束循环 (step %d): %s", loop_step, _last.get("step_content", "")[:200])
-        return "finish"
-
-    # 金融/交易域：从 shell_data 检测结论（action+score）
-    if domain in ("finance", "trading"):
-        _last_record = step_records[-1]
-        _sd = _last_record.get("shell_data") or {}
-        if _sd.get("action") and _sd.get("score") is not None:
-            logger.info("[Route] 已有结论(action=%s, score=%s)，结束循环 (step %d)",
-                        _sd["action"], _sd["score"], loop_step)
-            return "finish"
-        # 有壳但无结论 → 继续（planner 补充数据）
+        # 中间步骤无壳，继续循环
+        logger.info("[Route] 无壳（中间步骤），继续循环 (step %d)", loop_step)
         return "continue"
 
-    # 非金融域：有壳就是完成
-    return "finish"
+    # conclusion 缺省为 true（结束），只有显式 false 才继续
+    _conclusion = step_records[-1].get("shell_conclusion", True)
+    if _conclusion:
+        logger.info("[Route] 壳层 conclusion=true，结束循环 (step %d)", loop_step)
+        return "finish"
+
+    logger.info("[Route] 壳层 conclusion=false，继续循环 (step %d)", loop_step)
+    return "continue"
 
 
-def _has_conclusion(content: str) -> bool:
-    """检测 agent 输出是否包含可交付的结论。
+def _has_conclusion(step_records: list) -> bool:
+    """检测上一步是否已有结论。
 
-    优先从通用壳的 data 字段检测 action+score，
-    fallback 到关键词匹配。
+    从 step_records 读取壳层解出的 shell_conclusion，不直接读壳。
+    conclusion=true 或缺省 → 有结论；conclusion=false → 还需要继续。
     """
-    if not content:
+    if not step_records:
         return False
-
-    # 从壳的 data 里检测
-    from app.agent.json_extractor import extract_json
-    parsed = extract_json(content)
-    if parsed:
-        data = parsed.get("data", {})
-        if isinstance(data, dict) and data.get("action") and data.get("score") is not None:
-            return True
-        # 壳顶层有 action+score（兼容旧格式）
-        if parsed.get("action") and parsed.get("score") is not None:
-            return True
-
-    # fallback：关键词匹配
-    _keywords = ['建议买入', '建议卖出', '建议持有', '建议观望', '建议回避',
-                 '维持持有', '维持买入', '维持卖出']
-    return any(kw in content for kw in _keywords)
+    return step_records[-1].get("shell_conclusion", True)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -581,24 +564,18 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
     contents = [r.get("step_content", "") for r in step_records if r.get("step_content")]
     content = "\n\n".join(contents) if contents else ""
 
-    # 提取最终输出（从 shell_data 取，不从 step_content 解析）
+    # 提取最终输出（从 shell_data 取）
     final_output = {}
     display_content = content
     if step_records:
         _last_record = step_records[-1]
         _sd = _last_record.get("shell_data")
         if _sd:
-            # 有壳数据 → 直接用
             final_output = _sd
             display_content = _last_record.get("step_content", content)
-        elif content:
-            # 无壳数据 → fallback 到 extract_decision
-            from app.agent.json_extractor import extract_decision
-            dec = extract_decision(content)
-            if dec:
-                final_output = dec
-            else:
-                final_output = {"analysis": content}
+        else:
+            # 壳无效：reply 直接作为分析文本
+            final_output = {"analysis": content}
 
     # 闭环
     _learn_from_execution(state)
@@ -618,11 +595,21 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
 #  辅助函数
 # ═══════════════════════════════════════════════════════════════
 
+def _aggregate_tools_called(state: AgentState) -> list:
+    """从 step_records 聚合所有工具名（去重保序）。"""
+    tools = []
+    for r in state.get("step_records", []):
+        for tc in r.get("tool_calls", []):
+            name = tc.get("tool", "")
+            if name and name not in tools:
+                tools.append(name)
+    return tools
+
+
 def _check_negative_feedback(state: AgentState) -> None:
     """用户负面反馈 → 惩罚 qd_traces（correct=false）。
 
-    工具链惩罚（tool_chains.json）已移除，T+N 回测的 correct 字段
-    天然过滤掉被标记的链路。
+    T+N 回测的 correct 字段天然过滤掉被标记的链路。
     """
     from app.agent.chain import store as chain_store
 
@@ -648,7 +635,7 @@ def _check_negative_feedback(state: AgentState) -> None:
 
 
 def _detect_feedback_severity(message: str) -> Optional[str]:
-    """内置负面反馈检测（替代 tool_chains.detect_feedback_severity）。"""
+    """内置负面反馈检测。"""
     if not message:
         return None
     msg = message.strip()
@@ -711,23 +698,26 @@ def _save_traces(state: AgentState, content: str) -> None:
             return  # 闲聊等无意图场景，不写 qd_traces
         try:
             from app.agent.chain.schema import EvalNode, Layer, Status
-            from app.agent.json_extractor import extract_decision
             from datetime import date
 
             sc = state.get("stock_code", "")
-            dec = extract_decision(content) if content else None
+            # 从 step_records 取 shell_data，不再从 content 解析
+            _sd = {}
+            if state.get("step_records"):
+                _sd = state["step_records"][-1].get("shell_data") or {}
             _domain = state.get('domain', '')
             root = EvalNode(
                 layer=Layer.CHAIN.value,
                 name=f"{_domain}+{_verb}+{_noun}",
                 exec_date=date.today(), stock_code=sc, stock_name=state.get("stock_name", ""),
-                score=dec.get("score") if dec else None,
-                direction=dec.get("direction", "") if dec else "",
-                action=dec.get("action", "") if dec else "",
-                signal=dec.get("signal", "") if dec else "",
+                score=_sd.get("score") if _sd else None,
+                direction=_sd.get("direction", "") if _sd else "",
+                action=_sd.get("action", "") if _sd else "",
+                signal=_sd.get("signal", "") if _sd else "",
                 analysis=content[:2000] if content else "",
                 input_params={"user_query": state.get("query", "")},
                 status=Status.OK.value if content else Status.FAILED.value,
+                tools_called=_aggregate_tools_called(state),
             )
             from app.agent.chain.store import save_tree
             save_tree(root)

@@ -2,20 +2,14 @@
 """
 Agent Evaluator — 执行记录（精简版）。
 
-原"编排路径学习闭环"已移除：
-  tool_chains.json 的读写链路断了（Planner 从来不读），
-  改用 qd_traces 的 correct 字段天然过滤。
-
 当前职责：
   - 记录日志（verb+noun+success+tools）
-  - TraceCollector 的 qd_traces 写入不受影响（闭环#1）
 
 闭环#2（T+N 回测）在 chain/evaluator.py，独立运行。
 """
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -28,9 +22,6 @@ def learn_from_execution(
     all_phases_completed=None,
 ):
     """记录执行结果日志。
-
-    tool_chains.json 写入已移除。链路缓存改用 qd_traces（store.query_cached_tools），
-    质量由 T+N 回测的 correct 字段保证。
 
     Args:
         agent_result: AgentResult 实例

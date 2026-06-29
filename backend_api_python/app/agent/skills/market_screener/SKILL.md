@@ -16,6 +16,17 @@ tools:
 
 根据当前交易时间自动切换策略,从A股全市场筛选短线标的。
 
+## 调用方式
+
+`read_skill("market-screener")` 返回本文件的文本内容（不是可执行函数）。阅读后按下方“执行流程”调用对应 Python 函数：
+
+```python
+from app.agent.skills.market_screener.run import pre_screen, deep_analyze
+
+phase1 = pre_screen()       # Phase 1: 市场状态 + 候选池
+result = deep_analyze(phase1)  # Phase 2: 逐只深入分析
+```
+
 ## 使用场景
 
 - 用户询问"今天买什么股""有什么好股票""短线选什么"等全市场选股问题
@@ -132,41 +143,26 @@ phase2 = deep_analyze(phase1)
 
 ## 输出结构
 
+以下是 skill 返回的内部数据结构，供 agent 继续分析使用：
+
 ```json
-  {
+{
   "skill": "market-screener",
   "strategy_used": "intraday | eod | post_market",
-  "score": 0-100, // 综合评分
+  "score": 0-100,
   "direction": "bullish | neutral | bearish",
-  "confidence": 0-1, // 置信度
-  "signal": "...", // 核心信号摘要(一句话)
-  "analysis": "...", // Markdown 格式完整报告
-  "factors": [...], // 评分因子列表
-  "status": "ok | failed",
+  "confidence": 0-1,
+  "signal": "核心信号摘要（一句话）",
+  "analysis": "完整报告",
+  "factors": [],
   "output_data": {
-    "market": {...}, // 市场情绪(涨停/跌停/炸板率)
-    "main_themes": [...], // 主线题材
-    "candidates": [...], // 候选股列表
-    "analyzed": [ // 深入分析结果(盘后策略)
-      {
-        "code": "002816",
-        "name": "xxx",
-        "score": 100,
-        "direction": "bullish",
-        "signal": "...",
-        "patterns": ["MACD金叉", "突破前高"],
-        "entry": {"price_low": 6.23, "stop_loss": 5.92, "target_1": 6.77}
-      }
-    ],
-    "pattern_distribution": {...} // 形态分布统计
-  }
-  "tools_called": [...] // 实际调用的工具列表
-  }
-```
-
-**注意**:深入分析结果在 `output_data.analyzed`,不在顶层。访问方式:
-```python
-best = max(result['output_data']['analyzed'], key=lambda x: x['score'])
+    "market": {},
+    "main_themes": [],
+    "candidates": [],
+    "analyzed": []
+  },
+  "tools_called": []
+}
 ```
 
 ### 输出示例(盘后复盘)

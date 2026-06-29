@@ -17,10 +17,10 @@ import logging
 import re
 import time
 from datetime import date
-from typing import Any, Dict, List, Optional
+from typing import Any, List
 
 from app.agent.chain.schema import (
-    EvalNode, FactorItem, Layer, SkillReport, Status,
+    EvalNode, Layer, SkillReport, Status,
 )
 from app.agent.json_extractor import extract_decision
 
@@ -168,6 +168,17 @@ class TraceCollector:
         ]
         for tool_node in orphan_tools:
             root.add_child(tool_node)
+
+        # 聚合 tools_called 到根节点（缓存查询依赖此字段）
+        _all_tools = []
+        for sn in self.skill_nodes:
+            for t in sn.tools_called:
+                if t not in _all_tools:
+                    _all_tools.append(t)
+        for tn in orphan_tools:
+            if tn.name not in _all_tools:
+                _all_tools.append(tn.name)
+        root.tools_called = _all_tools
 
         # JSON 提取失败时，降级到正则提取（fallback）
         if root.score is None:

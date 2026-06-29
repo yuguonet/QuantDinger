@@ -63,7 +63,7 @@ def _run_single(message: str, session_id: str = None):
 
 def _run_stream(message: str, session_id: str = None):
     """流式调用。"""
-    from app.agent.graph import chat_stream
+    from app.agent.graph import chat_hybrid
 
     if not session_id:
         session_id = f"cli-{int(time.time())}"
@@ -72,7 +72,7 @@ def _run_stream(message: str, session_id: str = None):
     print(f"💬 Message: {message}")
     print("-" * 50)
 
-    for ev in chat_stream(message=message, session_id=session_id):
+    for ev in chat_hybrid(message=message, session_id=session_id):
         etype = ev.get("type", "")
         if etype == "tool_info":
             print(f"\n  {ev.get('message', '')}")

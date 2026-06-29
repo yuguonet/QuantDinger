@@ -127,5 +127,6 @@ def create_initial_state(
         domain_instructions="",
         messages=[],
         last_verb="",
+        last_noun="",
         **kwargs,
     )

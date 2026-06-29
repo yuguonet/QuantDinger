@@ -12,18 +12,20 @@ description: Agent 执行规范
 
 ## 通用输出格式（所有域必须遵守）
 
-**final_answer 必须输出以下 JSON 结构，不允许输出纯文本。**
+**最终输出时**，`final_answer` 必须套以下 JSON 壳。内部循环中间步骤不套壳。
 
 ```json
 {
-  "status": "ok 或 error",
   "reply": "用户看到的回复（自然语言）",
+  "conclusion": true,
+  "errors": [],
   "data": {}
 }
 ```
 
-- `status`: ok=正常完成, error=执行出错
 - `reply`: 面向用户的中文回复，必须是非空字符串
+- `conclusion`: true=分析完成可以结束, false=还需要更多数据继续执行。缺省为 true（结束）
+- `errors`: 执行过程中 tool/skill 发生的错误列表，无错误时为空数组 `[]`
 - `data`: 域特定的结构化数据，可以为空对象 `{}`
 
 ### 金融域 data 字段
@@ -43,20 +45,6 @@ description: Agent 执行规范
   }
 }
 ```
-
-| 字段 | 必填 | 说明 |
-|------|------|------|
-| action | ✅ | buy=建议买入, sell=建议卖出, hold=持有观望, skip=回避 |
-| score | ✅ | 综合评分 0-100，>70 偏多，<30 偏空 |
-| direction | ✅ | 与 score 一致 |
-| confidence | ✅ | high=多维共振, medium=部分数据, low=数据缺失或矛盾 |
-| timeframe | ✅ | 建议持仓周期 |
-| signal | ✅ | 一句话总结核心逻辑 |
-| analysis |  | 完整分析过程，必须是可读的自然语言文本 |
-
-### 其他域
-
-data 字段可以为空对象 `{}`，也可以放域特定数据。reply 必须有内容。
 
 ## 评分引用规则
 
