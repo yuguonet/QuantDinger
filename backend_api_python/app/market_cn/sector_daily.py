@@ -26,7 +26,7 @@ from typing import Dict, List, Tuple
 # ============================================================
 # 路径 & 环境
 # ============================================================
-_root = Path(__file__).resolve().parent.parent  # scripts/ → QuantDinger/
+_root = Path(__file__).resolve().parent.parent.parent  # app/market_cn/ → backend_api_python/
 sys.path.insert(0, str(_root / "backend_api_python"))
 
 try:
