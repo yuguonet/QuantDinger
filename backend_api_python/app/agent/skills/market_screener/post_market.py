@@ -200,7 +200,8 @@ def prescreen(date: str) -> Dict[str, Any]:
             top_n=50,
         )
         dragon_stocks = dragon_result.get("stocks", []) if isinstance(dragon_result, dict) else []
-    except Exception:
+    except Exception as e:
+        logger.warning("[MktScreen] search_stocks 调用失败: %s", e)
         raw_stocks = []
         dragon_stocks = []
 
@@ -230,6 +231,25 @@ def prescreen(date: str) -> Dict[str, Any]:
                 "reason": "",
                 "source": "4IN1(近期涨停)",
             }
+
+    # 龙回头扫描（当 search_stocks 结果不足时补充）
+    if len(scan_pool) < 10:
+        try:
+            from .common import scan_dragon_pullback
+            dragon_pullback = scan_dragon_pullback(date)
+            for s in dragon_pullback[:15]:
+                code = s.get("code", "")
+                if code and len(code) == 6 and code not in scan_pool:
+                    scan_pool[code] = {
+                        "code": code, "name": s.get("name", ""),
+                        "change_pct": 0,
+                        "turnover_pct": 0,
+                        "reason": s.get("reason", ""),
+                        "source": "龙回头",
+                    }
+            logger.info("[MktScreen] 龙回头补充: %d只", min(len(dragon_pullback), 15))
+        except Exception as e:
+            logger.warning("[MktScreen] 龙回头扫描失败: %s", e)
 
     candidates = []
     scanned = 0

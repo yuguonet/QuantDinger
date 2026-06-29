@@ -56,16 +56,27 @@ def extract_json(content: Any) -> Optional[Dict[str, Any]]:
 def extract_decision(content: Any) -> Optional[Dict[str, Any]]:
     """提取含 "action" 字段的决策 JSON。
 
-    与 extract_json 相同，但额外校验 "action" 键存在。
+    兼容两种格式：
+      1. 旧格式：action/score 在顶层
+      2. 通用壳：action/score 在 data 字段内
     """
     data = extract_json(content)
-    if data and "action" in data:
+    if not data:
+        return None
+    # 顶层有 action（旧格式）
+    if "action" in data:
         return data
+    # 壳格式：action 在 data 里
+    inner = data.get("data", {})
+    if isinstance(inner, dict) and "action" in inner:
+        return inner
     return None
 
 
 def extract_field(content: Any, field: str) -> Optional[Any]:
     """从 JSON 中提取单个字段。
+
+    兼容壳格式：先查顶层，再查 data 字段。
 
     Args:
         content: str 或 dict
@@ -75,8 +86,13 @@ def extract_field(content: Any, field: str) -> Optional[Any]:
         字段值，或 None。
     """
     data = extract_json(content)
-    if data and field in data:
+    if not data:
+        return None
+    if field in data:
         return data[field]
+    inner = data.get("data", {})
+    if isinstance(inner, dict) and field in inner:
+        return inner[field]
     return None
 
 

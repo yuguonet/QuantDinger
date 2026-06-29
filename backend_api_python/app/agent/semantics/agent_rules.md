@@ -10,27 +10,39 @@ description: Agent 执行规范
 4. **数据缺失** — 结论中注明"XX数据缺失"，不用想象填补。
 5. **中文回答**。
 
-## 评分引用规则
+## 通用输出格式（所有域必须遵守）
 
-工具返回的 evaluation/评分是算法预评，可直接引用。highlights/warnings 提示异常时需关注。
-
-## 输出格式(金融领域,有个股时)
+**final_answer 必须输出以下 JSON 结构，不允许输出纯文本。**
 
 ```json
 {
-  "stock_code": "股票代码",
-  "stock_name": "股票名称",
-  "action": "根据分析结果选择: buy/sell/hold/skip",
-  "score": "综合评分(0-100)，基于工具评分整合，必要时结合文字信息修正",
-  "direction": "根据评分判断: bullish/bearish/neutral",
-  "confidence": "根据数据完整度判断: high/medium/low",
-  "timeframe": "分析周期: T+1/T+3/T+5/1W/1M",
-  "signal": "根据真实数据总结的核心逻辑",
-  "analysis": "基于真实数据的完整分析过程"
+  "status": "ok 或 error",
+  "reply": "用户看到的回复（自然语言）",
+  "data": {}
 }
 ```
 
-### 字段说明
+- `status`: ok=正常完成, error=执行出错
+- `reply`: 面向用户的中文回复，必须是非空字符串
+- `data`: 域特定的结构化数据，可以为空对象 `{}`
+
+### 金融域 data 字段
+
+```json
+{
+  "data": {
+    "stock_code": "股票代码",
+    "stock_name": "股票名称",
+    "action": "buy/sell/hold/skip",
+    "score": 0-100,
+    "direction": "bullish/bearish/neutral",
+    "confidence": "high/medium/low",
+    "timeframe": "T+1/T+3/T+5/1W/1M",
+    "signal": "核心逻辑",
+    "analysis": "完整分析过程"
+  }
+}
+```
 
 | 字段 | 必填 | 说明 |
 |------|------|------|
@@ -40,4 +52,12 @@ description: Agent 执行规范
 | confidence | ✅ | high=多维共振, medium=部分数据, low=数据缺失或矛盾 |
 | timeframe | ✅ | 建议持仓周期 |
 | signal | ✅ | 一句话总结核心逻辑 |
-| analysis |  | 完整分析过程 |
+| analysis |  | 完整分析过程，必须是可读的自然语言文本 |
+
+### 其他域
+
+data 字段可以为空对象 `{}`，也可以放域特定数据。reply 必须有内容。
+
+## 评分引用规则
+
+工具返回的 evaluation/评分是算法预评，可直接引用。highlights/warnings 提示异常时需关注。

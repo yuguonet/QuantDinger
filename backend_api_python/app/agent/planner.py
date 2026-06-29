@@ -258,10 +258,18 @@ class Planner:
         if already_fetched_data:
             fetched_data_section = f"\n## 前序步骤已获取的数据\n{already_fetched_data}\n\n请基于已有数据决定下一步，不要重复获取相同数据。\n"
 
+        # 标的状态（告知 Planner 是否已识别到股票）
+        stock_status = ""
+        if stock_code:
+            stock_status = f"\n## 当前标的\n已识别: {stock_name}({stock_code})\n\n"
+        else:
+            stock_status = "\n## 当前标的\n未识别到股票代码或名称。如果用户问题涉及个股，必须先用 search_stock_by_name 搜索，不要直接调用需要 stock_code 的工具。\n\n"
+
         prompt = (
             f"{persona_section}\n\n"
             "你是量化分析规划器。根据用户问题，规划分析步骤并选出本步工具。\n\n"
             f"## 用户问题\n{query}\n\n"
+            f"{stock_status}"
             f"{data_section}"
             f"{used_tools_section}"
             f"{fetched_data_section}"

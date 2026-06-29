@@ -115,6 +115,7 @@ def deep_analyze(prescreen_result: Dict[str, Any]) -> Dict[str, Any]:
                 skill_name="market_screener", score=45.0, direction="neutral",
                 confidence=0.5, signal="今日无明确短线标的",
                 analysis="", factors=[], status="ok",
+                output_data={"analyzed": [], "market": market},
             )
         else:
             analyzed = []
@@ -196,8 +197,12 @@ def deep_analyze(prescreen_result: Dict[str, Any]) -> Dict[str, Any]:
     output["strategy_used"] = strategy
     output["tools_called"] = _tool_calls
     output["missing_data"] = _missing_data
-    if hasattr(report, "output_data") and report.output_data:
-        output["output_data"] = report.output_data
+    # 确保 output_data 始终在输出中（to_dict() 可能不含此字段）
+    _od = getattr(report, "output_data", None)
+    if _od:
+        output["output_data"] = _od
+    elif "output_data" not in output:
+        output["output_data"] = {}
 
     return output
 

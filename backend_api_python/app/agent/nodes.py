@@ -144,6 +144,32 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
         }
         set_tool_context({"domain": domain, "strategy": strategy})
 
+    # ── chat / unknown 域：旁路 LLM 直接回复，不进 planner ──
+    if domain in ("chat", "unknown"):
+        try:
+            llm_call = _build_llm_call()
+            _history = _get_history_from_state(state)
+            _msgs = [
+                {"role": "system", "content": "你是 QuantDinger 量化分析助手。简洁友好地回复用户。"},
+                *_history[-6:],
+                {"role": "user", "content": query},
+            ]
+            content = llm_call(_msgs)
+        except Exception as e:
+            logger.warning("[Prepare] 旁路 LLM 调用失败: %s", e)
+            content = ""
+        return {
+            "messages": [{"role": "user", "content": query}],
+            "domain": domain, "intent": intent_data,
+            "intent_verb": intent_verb, "intent_noun": intent_noun,
+            "domain_instructions": domain_instructions,
+            "strategy": strategy,
+            "final_output": {"reply": content},
+            "should_continue": False,
+            "all_phases_completed": True,
+            # 不设 step_records，让 finalize 走快速通道，保留 reply 字段
+        }
+
     # stock_code — 始终走 3 级提取（context → 正则 → 中文名解析）
     # 金融领域必须同时拿到 code + name，任一缺失则两者皆空
     stock_code = ""
@@ -182,6 +208,25 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
         if bool(stock_code) != bool(stock_name):
             logger.warning("[Prepare] code/name 不完整 (code=%s, name=%s)，清空", stock_code, stock_name)
             stock_code, stock_name = "", ""
+        # ── 级别 4: 用 search_stock_by_name 工具搜索 ──────────
+        if not stock_code and intent_verb in ("analyze", "query"):
+            import re as _re
+            _candidates = _re.findall(r'[\u4e00-\u9fff]{2,8}', query)
+            for _kw in _candidates:
+                try:
+                    from app.agent.tools.data_tools import search_stock_by_name
+                    _res = search_stock_by_name(_kw, limit=1)
+                    _items = _res.get("results", []) if isinstance(_res, dict) else []
+                    if _items:
+                        _r = _items[0]
+                        _r_code = _r.get("code", "")
+                        _r_name = _r.get("name", "")
+                        if _r_code and _r_name:
+                            stock_code, stock_name = _r_code, _r_name
+                            logger.info("[Prepare] 工具搜索命中: %s → %s(%s)", _kw, _r_name, _r_code)
+                            break
+                except Exception:
+                    pass
 
     # ── 编排路径缓存：qd_traces 命中 → 跳过 LLM#2 ──
     # 质量门：意图置信度 → 聚合 win_rate → 步数 → 子节点 → 工具权重
@@ -277,7 +322,7 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
     )
 
     if not step_result.success or (not step_result.tools and not step_result.skill):
-        # 无工具无 skill（闲聊等）→ LLM 直接回复，跳过 agent
+        # 金融域但 planner 找不到工具 → 兜底 LLM 直接回复
         try:
             llm_call = _build_llm_call()
             reply = llm_call([
@@ -286,7 +331,7 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
             ])
             content = reply if isinstance(reply, str) else str(reply)
         except Exception as e:
-            logger.warning("planner 闲聊 LLM 调用失败: %s", e)
+            logger.warning("[Planner] 兜底 LLM 调用失败: %s", e)
             content = ""
         return {
             "should_continue": False,
@@ -417,6 +462,17 @@ def agent_node(state: AgentState) -> Dict[str, Any]:
         # 执行完毕（成功或失败），清理 agent 引用
         _clear_agent(_session_id)
 
+    # ── 统一解壳：壳只在 agent 内部用，step_records 存干净数据 ──
+    _shell_valid = False
+    _shell_data = None
+    if content:
+        from app.agent.json_extractor import extract_json
+        _parsed = extract_json(content)
+        if _parsed and _parsed.get("reply"):
+            _shell_data = _parsed.get("data", {}) or {}
+            content = _parsed["reply"]
+            _shell_valid = True
+
     record: StepRecord = {
         "step": state.get("loop_step", 0),
         "description": f"工具: {', '.join(tools)}" if tools else f"Skill: {skill}",
@@ -424,6 +480,7 @@ def agent_node(state: AgentState) -> Dict[str, Any]:
         "planner_reasoning": "", "step_content": content or "", "step_success": success,
         "steps_used": total_steps, "step_tokens": total_tokens,
         "tool_calls": tool_calls_log, "charts": charts,
+        "shell_data": _shell_data,
     }
 
     # 累积已有记录（普通 List reducer，返回值会覆盖而非追加）
@@ -436,6 +493,7 @@ def agent_node(state: AgentState) -> Dict[str, Any]:
         "tool_calls_log": all_tool_calls, "charts": all_charts,
         "total_steps": state.get("total_steps", 0) + total_steps,
         "total_tokens": state.get("total_tokens", 0) + total_tokens,
+        "_shell_valid": _shell_valid,
     }
 
 
@@ -447,25 +505,57 @@ def route_after_agent(state: AgentState) -> str:
     if loop_step >= max_loop:
         return "finish"
 
-    # ── 已有结论检测：agent 输出了 action → 不再循环 ──
     step_records = state.get("step_records", [])
-    if step_records:
-        last_content = step_records[-1].get("step_content", "")
-        if _has_conclusion(last_content):
-            logger.info("[Route] 已有结论，结束循环 (step %d)", loop_step)
-            return "finish"
+    if not step_records:
+        return "finish"
 
-    return "continue"
+    last_content = step_records[-1].get("step_content", "")
+
+    # ── 壳检测 + 结论检测 ──
+    _shell_valid = state.get("_shell_valid", False)
+    domain = state.get("domain", "")
+
+    if not _shell_valid:
+        _last = step_records[-1] if step_records else {}
+        logger.warning("[Route] agent 未输出有效壳，结束循环 (step %d): %s", loop_step, _last.get("step_content", "")[:200])
+        return "finish"
+
+    # 金融/交易域：从 shell_data 检测结论（action+score）
+    if domain in ("finance", "trading"):
+        _last_record = step_records[-1]
+        _sd = _last_record.get("shell_data") or {}
+        if _sd.get("action") and _sd.get("score") is not None:
+            logger.info("[Route] 已有结论(action=%s, score=%s)，结束循环 (step %d)",
+                        _sd["action"], _sd["score"], loop_step)
+            return "finish"
+        # 有壳但无结论 → 继续（planner 补充数据）
+        return "continue"
+
+    # 非金融域：有壳就是完成
+    return "finish"
 
 
 def _has_conclusion(content: str) -> bool:
-    """检测 agent 输出是否已包含结构化结论。"""
+    """检测 agent 输出是否包含可交付的结论。
+
+    优先从通用壳的 data 字段检测 action+score，
+    fallback 到关键词匹配。
+    """
     if not content:
         return False
-    # JSON 里有 action 字段
-    if '"action"' in content and '"score"' in content:
-        return True
-    # 关键结论词
+
+    # 从壳的 data 里检测
+    from app.agent.json_extractor import extract_json
+    parsed = extract_json(content)
+    if parsed:
+        data = parsed.get("data", {})
+        if isinstance(data, dict) and data.get("action") and data.get("score") is not None:
+            return True
+        # 壳顶层有 action+score（兼容旧格式）
+        if parsed.get("action") and parsed.get("score") is not None:
+            return True
+
+    # fallback：关键词匹配
     _keywords = ['建议买入', '建议卖出', '建议持有', '建议观望', '建议回避',
                  '维持持有', '维持买入', '维持卖出']
     return any(kw in content for kw in _keywords)
@@ -491,15 +581,24 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
     contents = [r.get("step_content", "") for r in step_records if r.get("step_content")]
     content = "\n\n".join(contents) if contents else ""
 
-    # 尝试从最后一步提取结构化 JSON
+    # 提取最终输出（从 shell_data 取，不从 step_content 解析）
     final_output = {}
-    if contents:
-        from app.agent.json_extractor import extract_decision
-        dec = extract_decision(contents[-1])
-        if dec:
-            final_output = dec
-        else:
-            final_output = {"analysis": content}
+    display_content = content
+    if step_records:
+        _last_record = step_records[-1]
+        _sd = _last_record.get("shell_data")
+        if _sd:
+            # 有壳数据 → 直接用
+            final_output = _sd
+            display_content = _last_record.get("step_content", content)
+        elif content:
+            # 无壳数据 → fallback 到 extract_decision
+            from app.agent.json_extractor import extract_decision
+            dec = extract_decision(content)
+            if dec:
+                final_output = dec
+            else:
+                final_output = {"analysis": content}
 
     # 闭环
     _learn_from_execution(state)
@@ -509,9 +608,8 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
     _cleanup_stale_collectors()
 
     return {
-        "messages": [{"role": "assistant", "content": content}] if content else [],
+        "messages": [{"role": "assistant", "content": display_content}] if display_content else [],
         "final_output": final_output, "all_phases_completed": True,
-        # 不设 should_continue — finalize 不参与循环决策
         "last_verb": state.get("intent_verb", ""), "last_noun": state.get("intent_noun", ""),
     }
 
