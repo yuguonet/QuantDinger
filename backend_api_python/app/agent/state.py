@@ -67,9 +67,11 @@ class AgentState(TypedDict, total=False):
     intent_verb: str
     intent_noun: str
     domain_instructions: str
+
     # ── 跨轮元数据（checkpointer 自动持久化）─────────────
     last_verb: str                      # 上一轮 verb（反馈闭环用）
     last_noun: str                      # 上一轮 noun（反馈闭环用）
+    context_summary: str                # 上轮意图分析摘要（跨轮上下文）
 
 
 class AgentResult:
@@ -128,5 +130,6 @@ def create_initial_state(
         messages=[],
         last_verb="",
         last_noun="",
+        context_summary="",
         **kwargs,
     )

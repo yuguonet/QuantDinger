@@ -131,7 +131,8 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
     strategy = "direct"
 
     history = _get_history_from_state(state)
-    intent = analyze_intent(query, history=history)
+    prev_context_summary = state.get("context_summary", "")
+    intent = analyze_intent(query, history=history, context_summary=prev_context_summary)
     if intent:
         domain = intent.domain
         strategy = intent.strategy
@@ -176,24 +177,18 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
     stock_name = ""
     if domain in ("finance", "trading"):
         import re
-        # ── 级别 1: context（上轮 state 残留）────────────────────
-        _ctx_code = state.get("stock_code", "")
-        _ctx_name = state.get("stock_name", "")
-        if _ctx_code and _ctx_name and _ctx_name in query:
-            stock_code, stock_name = _ctx_code, _ctx_name
         # ── 级别 2: 正则提取 6 位数字代码 ─────────────────────
-        if not stock_code:
-            m = re.search(r'(?<!\d)(\d{6})(?!\d)', query)
-            if m:
-                _candidate_code = m.group(1)
-                try:
-                    from app.utils.basicinfo_db import get_stock_basic_db
-                    _stock = get_stock_basic_db().get_stock(_candidate_code)
-                    if _stock:
-                        stock_code = _candidate_code
-                        stock_name = _stock.get("name", "")
-                except Exception:
-                    pass
+        m = re.search(r'(?<!\d)(\d{6})(?!\d)', query)
+        if m:
+            _candidate_code = m.group(1)
+            try:
+                from app.utils.basicinfo_db import get_stock_basic_db
+                _stock = get_stock_basic_db().get_stock(_candidate_code)
+                if _stock:
+                    stock_code = _candidate_code
+                    stock_name = _stock.get("name", "")
+            except Exception:
+                pass
         # ── 级别 3: 中文名解析（正则未命中时）──────────────────
         if not stock_code:
             from app.agent.text_utils import extract_stock_from_message
@@ -204,6 +199,12 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
                     stock_code, stock_name = _code, _name
                 else:
                     logger.warning("[Prepare] 中文名 '%s' 不在消息中，丢弃匹配", _name)
+        # ── 级别 1: context（上轮残留，仅当前轮未识别到新代码时继承）──
+        if not stock_code:
+            _ctx_code = state.get("stock_code", "")
+            _ctx_name = state.get("stock_name", "")
+            if _ctx_code and _ctx_name:
+                stock_code, stock_name = _ctx_code, _ctx_name
         # ── 校验：必须同时有 code 和 name ─────────────────────
         if bool(stock_code) != bool(stock_name):
             logger.warning("[Prepare] code/name 不完整 (code=%s, name=%s)，清空", stock_code, stock_name)
@@ -227,6 +228,10 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
                             break
                 except Exception:
                     pass
+
+    # ── 注入股票名称到查询（让下游看到完整信息）─────
+    if stock_code and stock_name and stock_name not in query:
+        query = query.replace(stock_code, f"{stock_code}({stock_name})", 1)
 
     # ── 编排路径缓存：qd_traces 命中 → 跳过 LLM#2 ──
     # 质量门：意图置信度 → 聚合 win_rate → 步数 → 子节点 → 工具权重
@@ -277,6 +282,7 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
         "strategy": strategy, "stock_code": stock_code, "stock_name": stock_name,
         "should_continue": True,
         "cached_tools": cached_tools,
+        "context_summary": intent.context_summary if intent else "",
     }
 
 
@@ -557,6 +563,7 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
         return {
             "messages": [{"role": "assistant", "content": json.dumps(state["final_output"], ensure_ascii=False)}],
             "last_verb": state.get("intent_verb", ""), "last_noun": state.get("intent_noun", ""),
+            "context_summary": state.get("context_summary", ""),
         }
 
     # Agent 的 final_answer 就是最终输出，不需要 Judge 汇总
@@ -588,6 +595,7 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
         "messages": [{"role": "assistant", "content": display_content}] if display_content else [],
         "final_output": final_output, "all_phases_completed": True,
         "last_verb": state.get("intent_verb", ""), "last_noun": state.get("intent_noun", ""),
+        "context_summary": state.get("context_summary", ""),
     }
 
 
