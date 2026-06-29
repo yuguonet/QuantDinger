@@ -1,9 +1,4 @@
 ---
-quick_patterns:
-  greeting: '^(你好|hi|hello|嗨|hey|在吗|哈喽|嘿|yo)[\s\?\?\.\,\!\~\。\，\！\？\…]*$'
-  farewell: '^(再见|拜拜|bye|88|886|晚安|回见)[\s\?\?\.\,\!\~\。\，\！\？\…]*$'
-  thanks: '^(谢谢|感谢|多谢|thanks|thank\s*you|thx|3q)[\s\?\?\.\,\!\~\。\，\！\？\…]*$'
-
 rules:
   - match: "有股票名称或代码"
     result: { verb: analyze, noun: stock }

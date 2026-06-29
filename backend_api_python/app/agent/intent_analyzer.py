@@ -259,28 +259,15 @@ def analyze_intent(
     intent = result.get("intent", "general")
     verb = result.get("verb", "")
     noun = result.get("noun", "")
-    stock_code = result.get("stock_code", "")
-    stock_name = result.get("stock_name", "")
     confidence = result.get("confidence", 0.5)
     new_summary = result.get("context_summary", "")
 
+    # stock_code 不在此处提取，由 prepare_node 走 3 级提取（context → 正则 → 中文名解析）
+    stock_code = ""
+    stock_name = ""
+
     # 构造 params
     params = {}
-    if stock_code:
-        params["stock"] = stock_code
-    if stock_name:
-        params["stock_name"] = stock_name
-
-    # 如果 LLM 没提取到股票代码，尝试 text_utils 兜底
-    if domain == "finance" and not stock_code:
-        from app.agent.text_utils import extract_stock_from_message
-        code, name = extract_stock_from_message(message)
-        if code:
-            params["stock"] = code
-            stock_code = code
-        if name:
-            params["stock_name"] = name
-            stock_name = name
 
     # 合并 metadata
     metadata = {
@@ -304,9 +291,8 @@ def analyze_intent(
         strategy = "direct"
 
     logger.info(
-        "[Intent] LLM 分类: %s/%s (%.2f) verb=%s noun=%s stock=%s strategy=%s | %s",
+        "[Intent] LLM 分类: %s/%s (%.2f) verb=%s noun=%s strategy=%s | %s",
         domain, intent, confidence, verb, noun,
-        stock_code or stock_name or "-",
         strategy,
         message[:50],
     )

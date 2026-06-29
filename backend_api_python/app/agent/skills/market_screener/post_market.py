@@ -325,8 +325,8 @@ def prescreen(date: str) -> Dict[str, Any]:
 def deep_analyze(candidate, _tool_calls, _tool_nodes, _missing_data) -> Optional[Dict]:
     code = candidate["code"]
     try:
-        snapshot = call_tool("get_indicator_snapshot", stock_code=code)
-        fund_flow = call_tool("get_fund_flow_realtime", stock_code=code)
+        snapshot = call_tool("get_indicator_snapshot", codes=code)
+        fund_flow = call_tool("get_fund_flow_realtime", code=code)
 
         if _tool_calls is not None:
             for t in ["get_indicator_snapshot", "get_fund_flow_realtime"]:

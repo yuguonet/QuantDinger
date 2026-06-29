@@ -582,8 +582,6 @@ def query_cached_tools(domain: str, verb: str, noun: str, stock_code: str = None
     if not verb or not noun:
         return None
 
-    MIN_SAMPLES = 3       # 最少执行次数
-    MIN_WIN_RATE = 0.7    # 最低胜率
     MAX_STEPS = 6         # 单轮最大步数
 
     chain_name = f"{domain}+{verb}+{noun}" if domain else f"{verb}+{noun}"
@@ -601,7 +599,6 @@ def query_cached_tools(domain: str, verb: str, noun: str, stock_code: str = None
             WHERE t.layer = 'chain'
               AND t.name = %s
               AND t.status = 'ok'
-              AND t.correct IS NOT NULL
               AND t.tools_called IS NOT NULL
               AND array_length(t.tools_called, 1) BETWEEN 1 AND %s
               {extra_where}
@@ -611,11 +608,9 @@ def query_cached_tools(domain: str, verb: str, noun: str, stock_code: str = None
                     AND child.status = 'failed'
               )
             GROUP BY t.tools_called
-            HAVING COUNT(*) >= %s
-               AND AVG(CASE WHEN t.correct THEN 1.0 ELSE 0.0 END) >= %s
             ORDER BY COALESCE(AVG(t.pnl_pct), 0) / COALESCE(NULLIF(AVG(NULLIF(t.hold_days, 0)), 0), 1) DESC
             LIMIT 1
-        """, (chain_name, MAX_STEPS) + params + (MIN_SAMPLES, MIN_WIN_RATE))
+        """, (chain_name, MAX_STEPS) + params)
         row = cur.fetchone()
         if row:
             tools = row['tools_called']

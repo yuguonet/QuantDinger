@@ -79,7 +79,7 @@ def assess_market_state() -> Dict[str, Any]:
     today = datetime.now().strftime("%Y-%m-%d")
 
     # 1. 大盘资金流向
-    fund_flow_result = call_tool("get_fund_flow_realtime", stock_code="000001")  # 上证指数
+    fund_flow_result = call_tool("get_fund_flow_realtime", code="000001")  # 上证指数
     net_inflow = 0
     if isinstance(fund_flow_result, dict) and not fund_flow_result.get("error"):
         net_inflow = fund_flow_result.get("net_inflow", 0) or 0
@@ -570,7 +570,7 @@ def deep_analyze(
     code = candidate.get("code", "")
     try:
         # ── 工具调用 ──
-        fund_flow = call_tool("get_fund_flow_realtime", stock_code=code)
+        fund_flow = call_tool("get_fund_flow_realtime", code=code)
         mtf = analyze_multitimeframe(code)
 
         if _tool_calls is not None:

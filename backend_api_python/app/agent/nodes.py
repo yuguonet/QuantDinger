@@ -82,7 +82,7 @@ def _build_llm_call():
         resp = _requests.post(
             f"{base_url}/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": model_id, "messages": messages, "temperature": 0.3, "max_tokens": 1024},
+            json={"model": model_id, "messages": messages, "temperature": 0.05, "max_tokens": 1024},
             timeout=60.0,
         )
         resp.raise_for_status()
@@ -144,30 +144,43 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
         }
         set_tool_context({"domain": domain, "strategy": strategy})
 
-    # stock_code
-    stock_code = state.get("stock_code", "")
-    stock_name = state.get("stock_name", "")
-    if domain in ("finance", "trading") and not stock_code:
+    # stock_code — 始终走 3 级提取（context → 正则 → 中文名解析）
+    # 金融领域必须同时拿到 code + name，任一缺失则两者皆空
+    stock_code = ""
+    stock_name = ""
+    if domain in ("finance", "trading"):
         import re
-        m = re.search(r'(?<!\d)(\d{6})(?!\d)', query)
-        if m:
-            _candidate_code = m.group(1)
-            try:
-                from app.utils.basicinfo_db import get_stock_basic_db
-                _stock = get_stock_basic_db().get_stock(_candidate_code)
-                if _stock:
-                    stock_code = _candidate_code
-                    stock_name = _stock.get("name", "")
-            except Exception:
-                pass
+        # ── 级别 1: context（上轮 state 残留）────────────────────
+        _ctx_code = state.get("stock_code", "")
+        _ctx_name = state.get("stock_name", "")
+        if _ctx_code and _ctx_name and _ctx_name in query:
+            stock_code, stock_name = _ctx_code, _ctx_name
+        # ── 级别 2: 正则提取 6 位数字代码 ─────────────────────
+        if not stock_code:
+            m = re.search(r'(?<!\d)(\d{6})(?!\d)', query)
+            if m:
+                _candidate_code = m.group(1)
+                try:
+                    from app.utils.basicinfo_db import get_stock_basic_db
+                    _stock = get_stock_basic_db().get_stock(_candidate_code)
+                    if _stock:
+                        stock_code = _candidate_code
+                        stock_name = _stock.get("name", "")
+                except Exception:
+                    pass
+        # ── 级别 3: 中文名解析（正则未命中时）──────────────────
         if not stock_code:
             from app.agent.text_utils import extract_stock_from_message
             _code, _name = extract_stock_from_message(query)
-            if _code:
-                stock_code, stock_name = _code, _name or stock_name
-        # 校验：stock_name 必须出现在用户消息中，防止 LLM 误匹配
+            if _code and _name:
+                stock_code, stock_name = _code, _name
+        # ── 校验：stock_name 必须出现在用户消息中 ────────────────
         if stock_code and stock_name and stock_name not in query:
-            logger.warning("[Prepare] stock_name '%s' 不在消息中，丢弃 LLM 匹配", stock_name)
+            logger.warning("[Prepare] stock_name '%s' 不在消息中，丢弃匹配", stock_name)
+            stock_code, stock_name = "", ""
+        # ── 校验：必须同时有 code 和 name ─────────────────────
+        if bool(stock_code) != bool(stock_name):
+            logger.warning("[Prepare] code/name 不完整 (code=%s, name=%s)，清空", stock_code, stock_name)
             stock_code, stock_name = "", ""
 
     # ── 编排路径缓存：qd_traces 命中 → 跳过 LLM#2 ──
@@ -309,6 +322,12 @@ def agent_node(state: AgentState) -> Dict[str, Any]:
     stock_code = state.get("stock_code", "")
     stock_name = state.get("stock_name", "")
 
+    # 用户消息中注入股票代码（"分析宇通客车" → "分析宇通客车(600066)"）
+    query = state["query"]
+    _query = query
+    if stock_code and stock_name and stock_name in query:
+        _query = query.replace(stock_name, f"{stock_name}({stock_code})", 1)
+
     # 步骤上下文
     parts = []
     if state.get("step_records"):
@@ -319,7 +338,7 @@ def agent_node(state: AgentState) -> Dict[str, Any]:
         parts.append(f"工具策略: {state['current_tool_strategy']}")
     if skill:
         parts.append(f"请用 read_skill 加载 {skill} 的指令并执行。")
-    step_context = "\n".join(parts) if parts else state["query"]
+    step_context = "\n".join(parts) if parts else _query
 
     phase_tools = tools
     if skill:
@@ -333,9 +352,10 @@ def agent_node(state: AgentState) -> Dict[str, Any]:
 
     agent = get_smolagent(
         user_id=state.get("user_id", "1"), max_steps=10,
-        user_message=state["query"], domain=state.get("domain", ""),
+        user_message=_query, domain=state.get("domain", ""),
         domain_instructions=state.get("domain_instructions", ""),
-        stock_code=stock_code, tool_categories=phase_tools or None,
+        stock_code=stock_code, stock_name=stock_name,
+        tool_categories=phase_tools or None,
         collector=_get_collector(state.get("session_id", "")),
         strategy=state.get("strategy", "direct"),
     )
@@ -356,14 +376,30 @@ def agent_node(state: AgentState) -> Dict[str, Any]:
 
         if hasattr(result, "steps") and result.steps:
             for sd in result.steps:
-                if isinstance(sd, ActionStep) and sd.tool_calls:
-                    for tc in sd.tool_calls:
-                        tool_calls_log.append({
-                            "tool": getattr(tc, "name", ""),
-                            "arguments": getattr(tc, "arguments", {}) or {},
-                            "success": sd.error is None,
-                            "duration": sd.timing.duration if hasattr(sd, "timing") and sd.timing else 0,
-                        })
+                if isinstance(sd, ActionStep):
+                    if sd.tool_calls:
+                        for tc in sd.tool_calls:
+                            tool_calls_log.append({
+                                "tool": getattr(tc, "name", ""),
+                                "arguments": getattr(tc, "arguments", {}) or {},
+                                "success": sd.error is None,
+                                "duration": sd.timing.duration if hasattr(sd, "timing") and sd.timing else 0,
+                            })
+                    elif sd.code_action:
+                        # CodeAgent: 从生成的 Python 代码中提取工具名
+                        import re as _re
+                        _tool_names = set()
+                        for _t in tools:
+                            _tname = getattr(_t, 'name', '')
+                            if _tname and _tname in sd.code_action:
+                                _tool_names.add(_tname)
+                        for _tname in sorted(_tool_names):
+                            tool_calls_log.append({
+                                "tool": _tname,
+                                "arguments": {},
+                                "success": sd.error is None,
+                                "duration": sd.timing.duration if hasattr(sd, "timing") and sd.timing else 0,
+                            })
                 obs = getattr(sd, "observations", None) or ""
                 if obs and isinstance(obs, str):
                     import re

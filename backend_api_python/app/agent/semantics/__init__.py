@@ -55,7 +55,6 @@ class PersonaMeta:
 class IntentMeta:
     classifier_prompt: str = ""
     rules: List[Dict[str, Any]] = field(default_factory=list)
-    quick_patterns: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -222,7 +221,6 @@ def load_semantics():
         _intent = IntentMeta(
             classifier_prompt=body or meta.get("classifier_prompt", ""),
             rules=meta.get("rules", []),
-            quick_patterns=meta.get("quick_patterns", {}),
         )
 
     # ── tools（从 agent/tools/ 目录扫描工具函数）──
@@ -268,11 +266,6 @@ def get_intent_meta() -> IntentMeta:
         return IntentMeta(
             classifier_prompt="",
             rules=[],
-            quick_patterns={
-                "greeting": r'^(你好|hi|hello|嗨|hey|在吗|哈喽|嘿|yo)[\s\?\?\.\,\!\~\。\，\！\？\…]*$',
-                "farewell": r'^(再见|拜拜|bye|88|886|晚安|回见)[\s\?\?\.\,\!\~\。\，\！\？\…]*$',
-                "thanks": r'^(谢谢|感谢|多谢|thanks|thank\s*you|thx|3q)[\s\?\?\.\,\!\~\。\，\！\？\…]*$',
-            },
         )
     return _intent
 

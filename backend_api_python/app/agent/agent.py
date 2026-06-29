@@ -192,6 +192,7 @@ def get_smolagent(
     domain: str = "",
     domain_instructions: str = "",
     stock_code: str = "",
+    stock_name: str = "",
     tool_categories: Optional[List[str]] = None,
     collector=None,  # TraceCollector（金融领域注入）
     strategy: str = "direct",  # §15: 执行策略
