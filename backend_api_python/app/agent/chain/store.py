@@ -623,13 +623,15 @@ def query_cached_tools(domain: str, verb: str, noun: str, stock_code: str = None
         with get_db_connection() as conn:
             cur = conn.cursor()
 
-            # 优先：精确匹配 stock_code
+            # 精确匹配 stock_code
             if stock_code:
                 result = _query(cur, "AND t.stock_code = %s", (stock_code,))
                 if result:
                     return result
+                # 有具体股票但无缓存 → 不降级到全局（语义不同）
+                return None
 
-            # 降级：忽略 stock_code，取全局最优
+            # 无 stock_code → 取全局最优
             return _query(cur, "", ())
 
     except Exception as e:

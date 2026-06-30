@@ -1,15 +1,15 @@
 ---
 rules:
-  - match: "有股票名称或代码"
-    result: { verb: analyze, noun: stock }
-  - match: "怎么样/能买吗/跌了/涨了 + 股票"
-    result: { intent: stock_analysis }
+  - match: "有具体股票名称或代码（如露笑科技、002617）"
+    result: { intent: stock_analysis, verb: analyze, noun: stock }
+  - match: "怎么样/能买吗/跌了/涨了 + 具体股票"
+    result: { intent: stock_analysis, verb: analyze, noun: stock }
+  - match: "选股/推荐/买什么股/什么股好/可以买哪些"
+    result: { intent: screener, verb: filter, noun: screener }
   - match: "K线/图表"
     result: { intent: chart_view, verb: view, noun: chart }
   - match: "涨停/大盘/板块"
     result: { intent: market_scan, verb: scan, noun: market }
-  - match: "选股/推荐"
-    result: { intent: screener, verb: filter, noun: stock }
   - match: "回测"
     result: { intent: backtest, verb: backtest, noun: stock }
   - match: "资金流向/主力/北向"
@@ -46,7 +46,7 @@ rules:
   "domain": "finance | trading | system | chat | unknown",
   "intent": "stock_analysis | chart_view | market_scan | screener | backtest | fund_flow | indicator | trading | stock_info | concept_explain | reminder | cron_manage | settings | chat | unknown",
   "verb": "analyze | view | filter | backtest | execute | query | explain | remind | configure",
-  "noun": "stock | chart | market | screener | fund_flow | indicator | trading | concept | reminder | cron | settings",
+  "noun": "stock | screener | chart | market | fund_flow | indicator | trading | concept | reminder | cron | settings",
   "stock_code": "6位代码或空",
   "stock_name": "股票名称或空",
   "confidence": 0.0-1.0,
@@ -60,3 +60,4 @@ rules:
 - confidence: 有明确信号=0.9+, 有关键词=0.7+, 不确定=0.5-, 猜测=0.3
 - 意图不明确时 intent 填 "unknown", confidence 填 0.3，不要猜测
 - context_summary: 压缩为一句话，供下轮对话使用
+- **重要**：有具体股票名/代码 → verb=analyze, noun=stock；泛问买什么/推荐 → verb=filter, noun=screener。两者不能混淆。

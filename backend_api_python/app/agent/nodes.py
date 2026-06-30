@@ -229,9 +229,31 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
                 except Exception:
                     pass
 
-    # ── 注入股票名称到查询（让下游看到完整信息）─────
-    if stock_code and stock_name and stock_name not in query:
-        query = query.replace(stock_code, f"{stock_code}({stock_name})", 1)
+    # ── 金融域但未识别到股票 → 走旁路 LLM 快速通道，不过 planner ──
+    if domain in ("finance", "trading") and not stock_code:
+        logger.info("[Prepare] 金融域但未识别股票代码，走旁路 LLM")
+        try:
+            llm_call = _build_llm_call()
+            _history = _get_history_from_state(state)
+            _msgs = [
+                {"role": "system", "content": "你是 QuantDinger 量化分析助手。简洁友好地回复用户。"},
+                *_history[-6:],
+                {"role": "user", "content": query},
+            ]
+            content = llm_call(_msgs)
+        except Exception as e:
+            logger.warning("[Prepare] 旁路 LLM 调用失败: %s", e)
+            content = ""
+        return {
+            "messages": [{"role": "user", "content": query}],
+            "domain": domain, "intent": intent_data,
+            "intent_verb": intent_verb, "intent_noun": intent_noun,
+            "domain_instructions": domain_instructions,
+            "strategy": strategy,
+            "final_output": {"reply": content},
+            "should_continue": False,
+            "all_phases_completed": True,
+        }
 
     # ── 编排路径缓存：qd_traces 命中 → 跳过 LLM#2 ──
     # 质量门：意图置信度 → 聚合 win_rate → 步数 → 子节点 → 工具权重
@@ -372,11 +394,15 @@ def agent_node(state: AgentState) -> Dict[str, Any]:
     stock_code = state.get("stock_code", "")
     stock_name = state.get("stock_name", "")
 
-    # 用户消息中注入股票代码（"分析宇通客车" → "分析宇通客车(600066)"）
+    # 用户消息中注入完整股票信息（仅用于 agent 上下文，不改原始消息）
+    # "分析002617" → "分析002617(露笑科技)"；"分析露笑科技" → "分析露笑科技(002617)"
     query = state["query"]
     _query = query
-    if stock_code and stock_name and stock_name in query:
-        _query = query.replace(stock_name, f"{stock_name}({stock_code})", 1)
+    if stock_code and stock_name:
+        if stock_name not in _query and stock_code in _query:
+            _query = _query.replace(stock_code, f"{stock_code}({stock_name})", 1)
+        elif stock_code not in _query and stock_name in _query:
+            _query = _query.replace(stock_name, f"{stock_name}({stock_code})", 1)
 
     # 步骤上下文
     parts = []
