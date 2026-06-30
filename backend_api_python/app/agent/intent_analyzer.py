@@ -45,6 +45,9 @@ class IntentResult:
     context_summary: str = ""
     # §15 新增：执行策略（替代 domain 做路由决策）
     strategy: str = "direct"  # "traced" / "chain" / "direct"
+    # v4.5 新增：分析维度和深度
+    dimension: str = ""  # technical / fundamental / capital / chip / news / sector / all
+    depth: str = "normal"  # brief / normal / deep
 
     @property
     def domain_config(self):
@@ -199,6 +202,16 @@ def _validate_intent(data: Dict[str, Any]) -> Dict[str, Any]:
             conf = 0.5
     data["confidence"] = max(0.0, min(1.0, conf))
 
+    # 校验 dimension
+    valid_dimensions = {"technical", "fundamental", "capital", "chip", "news", "sector", "all", ""}
+    if data.get("dimension") not in valid_dimensions:
+        data["dimension"] = ""
+
+    # 校验 depth
+    valid_depths = {"brief", "normal", "deep"}
+    if data.get("depth") not in valid_depths:
+        data["depth"] = "normal"
+
     # 确保字符串字段
     for key in ("intent", "verb", "noun", "stock_code", "stock_name", "context_summary"):
         data[key] = str(data.get(key, "") or "")
@@ -259,6 +272,8 @@ def analyze_intent(
     intent = result.get("intent", "general")
     verb = result.get("verb", "")
     noun = result.get("noun", "")
+    dimension = result.get("dimension", "")
+    depth = result.get("depth", "normal")
     confidence = result.get("confidence", 0.5)
     new_summary = result.get("context_summary", "")
 
@@ -291,9 +306,9 @@ def analyze_intent(
         strategy = "direct"
 
     logger.info(
-        "[Intent] LLM 分类: %s/%s (%.2f) verb=%s noun=%s strategy=%s | %s",
+        "[Intent] LLM 分类: %s/%s (%.2f) verb=%s noun=%s dim=%s depth=%s strategy=%s | %s",
         domain, intent, confidence, verb, noun,
-        strategy,
+        dimension, depth, strategy,
         message[:50],
     )
 
@@ -306,6 +321,8 @@ def analyze_intent(
         metadata=metadata,
         verb=verb,
         noun=noun,
+        dimension=dimension,
+        depth=depth,
         context_summary=new_summary,
         strategy=strategy,
     )

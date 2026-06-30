@@ -69,11 +69,11 @@ def backtest_analysis(stock_code: str, stock_name: str = "") -> dict:
     """
         
     results = {}
-    try: results["list_strategies"] = list_strategies()
+    try: results["list_strategies"] = _list_strategies()
     except Exception as e: results["list_strategies"] = {"error": str(e)}
 
     def call_tool_fn(name, **kwargs):
-        if name == "run_backtest": return run_backtest(**kwargs)
+        if name == "run_backtest": return _run_backtest(**kwargs)
         raise ValueError(f"Unknown tool: {name}")
 
     return _algo_analyze(stock_code, stock_name, results, call_tool_fn=call_tool_fn)
@@ -84,7 +84,7 @@ def backtest_analysis(stock_code: str, stock_name: str = "") -> dict:
 
 # ── 内联自 trading_tools.py + backtest_tools.py ──
 
-def list_strategies(user_id: int = 1) -> Dict[str, Any]:
+def _list_strategies(user_id: int = 1) -> Dict[str, Any]:
     """列出用户的所有交易策略（含运行状态）。
 
     返回策略 ID、名称、类型、状态、交易对、时间框架等信息。
@@ -114,10 +114,10 @@ def list_strategies(user_id: int = 1) -> Dict[str, Any]:
 
         return {"strategies": strategies, "count": len(strategies)}
     except Exception as e:
-        logger.error("list_strategies failed: %s", e, exc_info=True)
+        logger.error("_list_strategies failed: %s", e, exc_info=True)
         return {"strategies": [], "count": 0, "error": str(e)}
 
-def run_backtest(
+def _run_backtest(
     strategy_id: int,
     stock_code: str,
     start_date: str,
@@ -196,5 +196,5 @@ def run_backtest(
             "success": True,
         }
     except Exception as e:
-        logger.error("run_backtest failed: %s", e, exc_info=True)
+        logger.error("_run_backtest failed: %s", e, exc_info=True)
         return {"success": False, "error": f"回测执行失败: {e}"}

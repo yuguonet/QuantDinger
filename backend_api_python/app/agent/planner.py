@@ -142,11 +142,20 @@ class Planner:
             done_tools = len(already_used_tools)
             print(f"[Planner] 进度: 已完成{done_steps}步, 已用{done_tools}个工具: {already_used_tools}")
 
+        # 从 intent 提取 dimension 和 depth
+        dimension = ""
+        depth = "normal"
+        if intent:
+            dimension = getattr(intent, "dimension", "") or ""
+            depth = getattr(intent, "depth", "normal") or "normal"
+
         try:
             step_data = self._llm_decide_next_step(
                 query, intent, stock_code, stock_name, context_summary,
                 already_used_tools=already_used_tools,
                 already_fetched_data=already_fetched_data,
+                dimension=dimension,
+                depth=depth,
             )
             print(f"[DEBUG] Planner 输出 JSON: {json.dumps(step_data, ensure_ascii=False, indent=2)}")
         except Exception as e:
@@ -197,6 +206,8 @@ class Planner:
         context_summary: str = "",
         already_used_tools: List[str] = None,
         already_fetched_data: str = "",
+        dimension: str = "",
+        depth: str = "normal",
     ) -> Dict[str, Any]:
         """调用 LLM 决策下一步。返回原始 JSON dict。
 
@@ -265,11 +276,37 @@ class Planner:
         else:
             stock_status = "\n## 当前标的\n未识别到股票代码或名称。如果用户问题涉及个股，必须先用 search_stock_by_name 搜索，不要直接调用需要 stock_code 的工具。\n\n"
 
+        # dimension 和 depth 指导
+        dimension_section = ""
+        if dimension:
+            _dim_map = {
+                "technical": "技术面（analyze_trend, get_indicator_snapshot, calculate_ma, analyze_pattern, get_volume_analysis）",
+                "fundamental": "基本面（get_stock_info, get_consensus_eps, batch_valuation_compare, get_capital_summary）",
+                "capital": "资金面（get_fund_flow, get_fund_flow_daily, get_concept_fund_flow, get_northbound_flow）",
+                "chip": "筹码（get_chip_distribution）",
+                "news": "情报（search_stock_intel, search_comprehensive_intel, get_eastmoney_stock_news, get_global_finance_news）",
+                "sector": "板块（get_hot_sectors, get_sector_trend_analysis, get_sector_history_data, get_sector_prediction）",
+                "all": "全面分析（综合选择上述各类工具）",
+            }
+            dim_desc = _dim_map.get(dimension, dimension)
+            dimension_section = f"\n## 分析方向（dimension）\n用户期望: {dim_desc}\n请优先选择该方向的工具。\n\n"
+
+        depth_section = ""
+        if depth and depth != "normal":
+            _depth_map = {
+                "brief": "快速查看 — 只选 1 个最相关的工具",
+                "deep": "深度分析 — 选 4-6 个工具覆盖全部维度，可分步执行",
+            }
+            depth_desc = _depth_map.get(depth, depth)
+            depth_section = f"\n## 分析深度（depth）\n{depth_desc}\n\n"
+
         prompt = (
             f"{persona_section}\n\n"
             "你是量化分析规划器。根据用户问题，规划分析步骤并选出本步工具。\n\n"
             f"## 用户问题\n{query}\n\n"
             f"{stock_status}"
+            f"{dimension_section}"
+            f"{depth_section}"
             f"{data_section}"
             f"{used_tools_section}"
             f"{fetched_data_section}"

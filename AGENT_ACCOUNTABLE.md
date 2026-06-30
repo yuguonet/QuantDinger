@@ -1,6 +1,6 @@
 # Agent 可追责架构设计
 
-> 最后更新: 2026-06-28（v4.3 — 跨轮状态隔离 + checkpointer v3.x 适配 + 结束判断逻辑校正 + LLM#1 职责收窄）
+> 最后更新: 2026-06-30（v4.5 — 意图识别细化 + Tool/Skill 回测引擎 + 高胜率股票记录）
 > 状态: 实施中（LangGraph 版本）
 > 仓库: https://github.com/yuguonet/QuantDinger
 
@@ -168,7 +168,6 @@ graph.add_edge("finalize", END)
 │  1. 从 step_records 拼接内容
 │  2. JSON 提取 → 结构化 final_output
 │  3. 学习闭环:
-│     - _learn_from_execution() → 记录日志（tool_chains 写入已移除）
 │     - _save_traces() → TraceCollector 存库 或 兜底写入 EvalNode
 │  4. 更新 last_verb / last_noun（供下轮负面反馈检测）
 │  5. TTL 清理过期 TraceCollector
@@ -219,6 +218,8 @@ class AgentState(TypedDict, total=False):
     collector: Any                  # TraceCollector（运行时，不序列化）
     intent_verb: str
     intent_noun: str
+    intent_dimension: str           # technical / fundamental / capital / chip / news / sector / all
+    intent_depth: str               # brief / normal / deep
     domain_instructions: str
 
     # ── 跨轮元数据（Checkpointer 自动持久化）─────
@@ -293,6 +294,8 @@ def _build_checkpointer():
 | skills | `get_skills_summary_xml()` | 全量 skill 列表+描述 |
 | tools | `get_tools_summary_xml()` | 全量 tool 列表+描述 |
 | rules | `semantics/planner.md` | 输出格式和选工具规则 |
+| dimension | `state.intent_dimension` | 分析方向，指导工具类型选择 |
+| depth | `state.intent_depth` | 分析深度，指导工具数量选择 |
 
 **输出格式**:
 ```json
@@ -302,6 +305,39 @@ def _build_checkpointer():
   "description": "步骤描述",
   "tool_strategy": "为什么选这些工具、执行顺序"
 }
+```
+
+### 4.2.1 意图识别细化（v4.5 新增）
+
+在 verb/noun 基础上，新增两个独立维度指导 Planner 选工具：
+
+**dimension — 分析方向**（仅 finance/trading 域有效）
+
+| dimension | 含义 | 典型关键词 | 对应工具类型 |
+|-----------|------|-----------|-------------|
+| technical | 技术面分析 | K线、均线、MACD、RSI、趋势、形态 | analyze_trend, get_indicator_snapshot, analyze_pattern |
+| fundamental | 基本面分析 | 市盈率、PE、PB、ROE、业绩、估值 | get_stock_info, get_consensus_eps, batch_valuation_compare |
+| capital | 资金面分析 | 资金流向、主力、北向、融资、大单 | get_fund_flow, get_northbound_flow, get_concept_fund_flow |
+| chip | 筹码分析 | 筹码、持仓、成本、套牢、获利盘 | get_chip_distribution |
+| news | 情报分析 | 新闻、公告、研报、舆情、政策 | search_stock_intel, search_comprehensive_intel |
+| sector | 板块分析 | 板块、行业、概念、热点、轮动 | get_hot_sectors, get_sector_trend_analysis |
+| all | 全面分析 | 全面分析、综合分析 | 多维度工具组合 |
+
+**depth — 分析深度**
+
+| depth | 含义 | 典型表述 | 工具数量 |
+|-------|------|---------|----------|
+| brief | 快速查看 | “看一眼/快速查/简单看” | 1 个 |
+| normal | 常规分析 | “分析/看看/怎么样”（默认） | 2-3 个 |
+| deep | 深度分析 | “深度分析/详细分析/全面分析” | 4-6 个，可分步 |
+
+**实现流程**:
+```
+用户: “茅台深度分析技术面”
+  → intent: analyze+stock, dimension=technical, depth=deep
+  → Planner 收到 dimension + depth 指导
+  → 第一步: 选 analyze_trend + get_indicator_snapshot + get_volume_analysis
+  → 第二步: 根据结果选 analyze_pattern + get_chip_distribution
 ```
 
 ### 4.3 Agent（LLM #3，smolagents CodeAgent）
@@ -357,9 +393,7 @@ def _build_checkpointer():
 
 **职责**: 盘后回溯验证，驱动权重更新。
 
-**两个组件**:
-- `evaluator.py`（agent 根目录）: 精简版，仅记录日志（原 tool_chains 写入已移除）
-- `chain/evaluator.py`: 离线评估，T+N 验证，盘后定时运行
+**组件**: `chain/evaluator.py` — 离线评估，T+N 验证，盘后定时运行
 
 **数据来源**: `qd_traces` 表 + `qd_skill_weights` + `qd_factor_weights`
 
@@ -491,14 +525,22 @@ app 启动 → start_eval_worker() → 等到盘后 15:30
 ### 7.3 用户反馈闭环（加速检测 tool 故障）
 ```
 用户说"不对/垃圾/反了" → prepare_node._check_negative_feedback()
-  → detect_feedback_severity()
-  → trace 层: mark_root_wrong() / delete_tree()
+  → detect_feedback_severity(severe/mild)
+  → 有 stock_code: query_latest_root(stock_code) → mark_root_wrong() / delete_tree()
+  → 无 stock_code: query_latest_root_by_chain(chain_name) → mark_root_wrong() / delete_tree()
 ```
 **作用**: 检测执行层故障（tool 更新、数据源挂了、API 变了）。T+N 回测也能通过统计发现，但需要 N 轮，期间持续亏钱。用户反馈是加速器。
 **和 T+N 的关系**: 不在同一层——用户反馈检测**执行层**（工具坏了），T+N 检测**预测层**（方向对不对）。
-**惩罚方式**: `mark_root_wrong()` 设置 `correct=false`，T+N 聚合时自动排除，缓存查询自然过滤。
+**惩罚方式**:
+- 轻度（mild）: `mark_root_wrong()` 设置 `correct=false` + `calibration=1.10`
+- 重度（severe）: 惩罚次数 >= 3 时 `delete_tree()` 删除整棵 trace 树
+**两种匹配模式**:
+- 有 stock_code → 按股票代码匹配最近一条 trace
+- 无 stock_code → 按 `domain+verb+noun` chain_name 匹配（如用户说"分析大盘"后反馈"不对"）
 **前提条件**: `finalize_node` 在每轮结束时写 `last_verb`/`last_noun` 到 state（Checkpointer 自动持久化），下一轮 `prepare_node` 读取。
 **去掉后果**: tool 坏了要等 N 轮 T+N 才能淘汰，期间持续亏钱。
+
+**v4.4 修复**: 原实现中无 stock_code 时不会执行惩罚操作。新增 `query_latest_root_by_chain()` 和 `get_penalty_count_by_chain()` 函数，支持通过 chain_name 匹配。
 
 ### 7.4 qd_traces 编排缓存（省去 LLM #2 重复工作量）
 
@@ -520,13 +562,15 @@ prepare_node
 
 **五层质量门**（全部通过才返回缓存）：
 
-| 层级 | 条件 | 作用 |
-|------|------|------|
-| 1. 意图置信度 | confidence >= 0.7 | 意图识别不确定时不走缓存 |
-| 2. 聚合胜率 | win_rate >= 0.7, sample_count >= 3 | 工具序列整体表现好 |
-| 3. 步数限制 | tools_called 长度 <= 6 | 链路不能太长（低效） |
-| 4. 子节点无失败 | NOT EXISTS child.status='failed' | 工具执行无错误 |
-| 5. 工具权重 | 无低权重工具（win_rate < 0.4） | 工具历史上表现差的不进缓存 |
+| 层级 | 条件 | 实现位置 | 作用 |
+|------|------|----------|------|
+| 1. 意图置信度 | confidence >= 0.7 | nodes.py prepare_node | 意图识别不确定时不走缓存 |
+| 2. 聚合胜率 | win_rate >= 0.7, sample_count >= 3 | store.py SQL HAVING | 工具序列整体表现好 |
+| 3. 步数限制 | tools_called 长度 <= 6 | store.py SQL WHERE | 链路不能太长（低效） |
+| 4. 子节点无失败 | NOT EXISTS child.status='failed' | store.py SQL NOT EXISTS | 工具执行无错误 |
+| 5. 工具权重 | 无低权重工具（win_rate < 0.4） | nodes.py prepare_node | 工具历史上表现差的不进缓存 |
+
+**v4.4 修复**: 质量门第2层原仅在文档中描述，SQL 未实现。已添加 `HAVING COUNT(*) >= 3 AND AVG(CASE WHEN t.correct THEN 1.0 ELSE 0.0 END) >= 0.7`。
 
 **工具级权重过滤**（独立于缓存，作用于 LLM#2 候选集）：
 
@@ -544,7 +588,22 @@ agent.py → get_smolagent()
 
 ## 八、工具分类
 
-### 8.1 工具层（80+ 工具，按职责分组）
+### 8.0 工具注册规则
+
+ToolRegistry 自动扫描 `agent/tools/*.py`，注册所有公开函数（不以 `_` 开头）。
+
+**命名规范**:
+- 公开工具：`def tool_name(...)` — 会被注册，Planner 可见
+- 内部函数：`def _helper(...)` — 不注册，仅供模块内部调用
+
+**重复问题预防**:
+- 如果函数仅供内部调用（如 `bull_bear_research.py` 中的分析函数），必须加 `_` 前缀
+- 如果多个文件需要复用同一函数，从源文件 import，不要重新定义
+- ToolRegistry 按文件名字母序扫描，同名函数后加载的覆盖先加载的
+
+**v4.4 修复**: `bull_bear_research.py` 中 5 个内部函数 + `backtest_analysis.py` 中 2 个内部函数 + 2 个 intel 函数已改为 `_` 前缀，公开工具从 87 个降至 78 个。
+
+### 8.1 工具层（78 工具，按职责分组）
 
 | 分组 | Tools | 职责 |
 |------|-------|------|
@@ -630,6 +689,7 @@ CODE_EXECUTION_TIMEOUT=120       # 代码执行超时（秒）
 4. **per-step agent 重建**: 每步重建 agent 有性能开销，但保证上下文最小化。
 5. **TraceCollector 内存泄漏风险**: 模块级 `_collectors` dict，如果 finalize_node 未正常执行（异常中断），collector 不会被清理。已加 TTL（1小时）缓解。
 6. **Checkpointer TTL**: 启动时清理 7 天前数据，无实时清理。
+7. ~~**工具重复注册**~~: ✅ 已修复（v4.4）。`bull_bear_research.py` 和 `backtest_analysis.py` 中的内部函数与 `analysis_tools.py`/`news_search_tools.py`/`trading_tools.py`/`backtest_tools.py` 同名，导致 ToolRegistry 后加载的覆盖前加载的，Planner 看到错误描述。已将内部函数改为 `_` 前缀。
 
 ## 十一、混合输出模式
 

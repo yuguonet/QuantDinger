@@ -66,13 +66,13 @@ class AgentState(TypedDict, total=False):
     collector: Any                      # TraceCollector（运行时对象，不序列化）
     intent_verb: str
     intent_noun: str
+    intent_dimension: str               # technical / fundamental / capital / chip / news / sector / all
+    intent_depth: str                   # brief / normal / deep
     domain_instructions: str
 
     # ── 跨轮元数据（checkpointer 自动持久化）─────────────
     last_verb: str                      # 上一轮 verb（反馈闭环用）
     last_noun: str                      # 上一轮 noun（反馈闭环用）
-    last_used_cache: bool               # 上一轮是否走了编排路径缓存
-    last_cached_tools: Optional[List[str]]  # 上一轮的缓存工具链（惩罚用）
     context_summary: str                # 上轮意图分析摘要（跨轮上下文）
 
 
@@ -128,12 +128,12 @@ def create_initial_state(
         collector=None,
         intent_verb="",
         intent_noun="",
+        intent_dimension="",
+        intent_depth="normal",
         domain_instructions="",
         messages=[],
         last_verb="",
         last_noun="",
-        last_used_cache=False,
-        last_cached_tools=None,
         context_summary="",
         **kwargs,
     )

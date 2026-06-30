@@ -32,10 +32,10 @@ def bull_bear_research(stock_code: str, stock_name: str = "") -> Dict[str, Any]:
     data = {}
     for name, fn in [
         ("realtime_quote", lambda: get_realtime_quote(stock_code)),
-        ("trend", lambda: analyze_trend(stock_code)),
-        ("volume", lambda: get_volume_analysis(stock_code)),
-        ("indicator", lambda: get_indicator_snapshot(stock_code)),
-        ("intel", lambda: search_stock_intel(stock_code, stock_name or "")),
+        ("trend", lambda: _analyze_trend(stock_code)),
+        ("volume", lambda: _get_volume_analysis(stock_code)),
+        ("indicator", lambda: _get_indicator_snapshot(stock_code)),
+        ("intel", lambda: _search_stock_intel(stock_code, stock_name or "")),
     ]:
         try:
             data[name] = fn()
@@ -177,7 +177,7 @@ def bull_bear_research(stock_code: str, stock_name: str = "") -> Dict[str, Any]:
 
 # ── 内联自 analysis_tools.py ──
 
-def analyze_trend(codes: str) -> Dict[str, Any]:
+def _analyze_trend(codes: str) -> Dict[str, Any]:
     """技术趋势（内部复用）：同 analysis_tools.analyze_trend，仅供 bull_bear_research 内部调用，外部请用 analyze_trend。
 
     Args:
@@ -345,7 +345,7 @@ def analyze_trend(codes: str) -> Dict[str, Any]:
                 "data_points": len(closes),
             }
         except Exception as e:
-            logger.error("analyze_trend(%s) failed: %s", stock_code, e)
+            logger.error("_analyze_trend(%s) failed: %s", stock_code, e)
             return {"error": str(e)}
 
     if len(code_list) == 1:
@@ -359,7 +359,7 @@ def analyze_trend(codes: str) -> Dict[str, Any]:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
 
-def get_volume_analysis(codes: str) -> Dict[str, Any]:
+def _get_volume_analysis(codes: str) -> Dict[str, Any]:
     """量能分析：量比、换手率、成交量趋势。
 
     Args:
@@ -431,7 +431,7 @@ def get_volume_analysis(codes: str) -> Dict[str, Any]:
                 "vol_price_relation": vol_price_relation,
             }
         except Exception as e:
-            logger.error("get_volume_analysis(%s) failed: %s", stock_code, e)
+            logger.error("_get_volume_analysis(%s) failed: %s", stock_code, e)
             return {"error": str(e)}
 
     if len(code_list) == 1:
@@ -445,7 +445,7 @@ def get_volume_analysis(codes: str) -> Dict[str, Any]:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
 
-def analyze_pattern(codes: str) -> Dict[str, Any]:
+def _analyze_pattern(codes: str) -> Dict[str, Any]:
     """识别K线形态（增强版）：锤子线、十字星、吞没、早晨/晚星、三连阳/阴、长上影/下影、缺口等。
 
     Args:
@@ -574,7 +574,7 @@ def analyze_pattern(codes: str) -> Dict[str, Any]:
                 "pattern_count": len([p for p in patterns if "无明显" not in p]),
             }
         except Exception as e:
-            logger.error("analyze_pattern(%s) failed: %s", stock_code, e)
+            logger.error("_analyze_pattern(%s) failed: %s", stock_code, e)
             return {"error": str(e)}
 
     if len(code_list) == 1:
@@ -588,7 +588,7 @@ def analyze_pattern(codes: str) -> Dict[str, Any]:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
 
-def get_chip_distribution(codes: str, lookback_days: int = 120) -> Dict[str, Any]:
+def _get_chip_distribution(codes: str, lookback_days: int = 120) -> Dict[str, Any]:
     """筹码分布分析（衰减成本分布模型）。
 
     从日K线计算筹码分布，不依赖数据源原生接口。
@@ -623,7 +623,7 @@ def get_chip_distribution(codes: str, lookback_days: int = 120) -> Dict[str, Any
             klines = _fetch_klines(stock_code, lookback_days)
             return calc_chip_distribution(klines, stock_code=stock_code, lookback_days=lookback_days)
         except Exception as e:
-            logger.error("get_chip_distribution(%s) failed: %s", stock_code, e, exc_info=True)
+            logger.error("_get_chip_distribution(%s) failed: %s", stock_code, e, exc_info=True)
             return {"error": str(e)}
 
     if len(code_list) == 1:
@@ -637,7 +637,7 @@ def get_chip_distribution(codes: str, lookback_days: int = 120) -> Dict[str, Any
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
 
-def get_indicator_snapshot(codes: str) -> Dict[str, Any]:
+def _get_indicator_snapshot(codes: str) -> Dict[str, Any]:
     """单次获取多个技术指标快照（MACD、RSI、BOLL、KDJ等）。
 
     Args:
@@ -683,7 +683,7 @@ def get_indicator_snapshot(codes: str) -> Dict[str, Any]:
 
             return result
         except Exception as e:
-            logger.error("get_indicator_snapshot(%s) failed: %s", stock_code, e)
+            logger.error("_get_indicator_snapshot(%s) failed: %s", stock_code, e)
             return {"error": str(e)}
 
     if len(code_list) == 1:
@@ -785,7 +785,7 @@ def _build_result(items: List[Dict[str, Any]], label: str) -> Dict[str, Any]:
         "news": merged,
     }
 
-def search_stock_intel(codes: str, name: str = "") -> Dict[str, Any]:
+def _search_stock_intel(codes: str, name: str = "") -> Dict[str, Any]:
     """个股情报搜索：返回指定股票的新闻、公告、研报列表及摘要。
 
     Args:
@@ -811,7 +811,7 @@ def search_stock_intel(codes: str, name: str = "") -> Dict[str, Any]:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
 
-def search_policy_intel(market: str = "CNStock") -> Dict[str, Any]:
+def _search_policy_intel(market: str = "CNStock") -> Dict[str, Any]:
     """政策情报搜索：返回最新财经政策、监管动态。
 
     Args:

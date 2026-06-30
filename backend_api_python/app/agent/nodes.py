@@ -100,6 +100,8 @@ def _build_intent_obj(state: AgentState):
         domain=state.get("domain", ""),
         verb=intent_data.get("verb", ""),
         noun=intent_data.get("noun", ""),
+        dimension=intent_data.get("dimension", ""),
+        depth=intent_data.get("depth", "normal"),
         confidence=intent_data.get("confidence", 0.5),
         source=intent_data.get("source", ""),
     )
@@ -127,6 +129,8 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
     intent_data = {}
     intent_verb = ""
     intent_noun = ""
+    intent_dimension = ""
+    intent_depth = "normal"
     domain_instructions = ""
     strategy = "direct"
 
@@ -139,9 +143,12 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
         domain_instructions = intent.domain_instructions
         intent_verb = getattr(intent, "verb", "") or ""
         intent_noun = getattr(intent, "noun", "") or ""
+        intent_dimension = getattr(intent, "dimension", "") or ""
+        intent_depth = getattr(intent, "depth", "normal") or "normal"
         intent_data = {
             "intent": intent.intent, "confidence": intent.confidence,
             "source": intent.source, "verb": intent_verb, "noun": intent_noun,
+            "dimension": intent_dimension, "depth": intent_depth,
         }
         set_tool_context({"domain": domain, "strategy": strategy})
 
@@ -300,6 +307,7 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
         "messages": [{"role": "user", "content": query}],
         "domain": domain, "intent": intent_data,
         "intent_verb": intent_verb, "intent_noun": intent_noun,
+        "intent_dimension": intent_dimension, "intent_depth": intent_depth,
         "domain_instructions": domain_instructions,
         "strategy": strategy, "stock_code": stock_code, "stock_name": stock_name,
         "should_continue": True,
@@ -327,6 +335,7 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
             "current_tool_strategy": "",
             "loop_step": state.get("loop_step", 0) + 1,
             "should_continue": True,
+            "cached_tools": None,  # 用完即清
         }
 
     # ── 已有结论 → 直接结束，不再调 LLM#2 ──
@@ -425,18 +434,13 @@ def agent_node(state: AgentState) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # 通知 collector 本轮 skill 边界（planner 已决策）
-    collector = _get_collector(state.get("session_id", ""))
-    if collector and skill:
-        collector.begin_skill(skill, tools=phase_tools)
-
     agent = get_smolagent(
         user_id=state.get("user_id", "1"), max_steps=10,
         user_message=_query, domain=state.get("domain", ""),
         domain_instructions=state.get("domain_instructions", ""),
         stock_code=stock_code, stock_name=stock_name,
         tool_categories=phase_tools or None,
-        collector=collector,
+        collector=_get_collector(state.get("session_id", "")),
         strategy=state.get("strategy", "direct"),
     )
 
@@ -593,8 +597,6 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
         return {
             "messages": [{"role": "assistant", "content": json.dumps(state["final_output"], ensure_ascii=False)}],
             "last_verb": state.get("intent_verb", ""), "last_noun": state.get("intent_noun", ""),
-            "last_used_cache": bool(state.get("cached_tools")),
-            "last_cached_tools": state.get("cached_tools"),
             "context_summary": state.get("context_summary", ""),
         }
 
@@ -617,7 +619,6 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
             final_output = {"analysis": content}
 
     # 闭环
-    _learn_from_execution(state)
     _save_traces(state, content)
 
     # TTL 清理过期 collector
@@ -627,8 +628,6 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
         "messages": [{"role": "assistant", "content": display_content}] if display_content else [],
         "final_output": final_output, "all_phases_completed": True,
         "last_verb": state.get("intent_verb", ""), "last_noun": state.get("intent_noun", ""),
-        "last_used_cache": bool(state.get("cached_tools")),
-        "last_cached_tools": state.get("cached_tools"),
         "context_summary": state.get("context_summary", ""),
     }
 
@@ -649,10 +648,9 @@ def _aggregate_tools_called(state: AgentState) -> list:
 
 
 def _check_negative_feedback(state: AgentState) -> None:
-    """用户负面反馈 → 惩罚。
+    """用户负面反馈 → 惩罚 qd_traces（correct=false）。
 
-    自由建树：只惩罚根节点（还没 T+N 验证过）。
-    编排路径：惩罚根节点 + 路径缓存 + skill 权重（已经验证过还出错）。
+    T+N 回测的 correct 字段天然过滤掉被标记的链路。
     """
     from app.agent.chain import store as chain_store
 
@@ -664,9 +662,10 @@ def _check_negative_feedback(state: AgentState) -> None:
     if not last_verb or not last_noun:
         return
 
-    used_cache = state.get("last_used_cache", False)
     stock_code = state.get("stock_code", "")
-
+    
+    # 如果有 stock_code，惩罚该股票的最近一条 trace
+    # 如果没有 stock_code，惩罚上一轮的 chain（通过 last_verb + last_noun 匹配）
     if stock_code:
         trace = chain_store.query_latest_root(stock_code)
         if trace:
@@ -675,17 +674,18 @@ def _check_negative_feedback(state: AgentState) -> None:
                 chain_store.delete_tree(root_id)
             else:
                 chain_store.mark_root_wrong(root_id)
+    else:
+        # 无 stock_code 时，通过 last_verb + last_noun 匹配上一轮的 chain
+        chain_name = f"{state.get('domain', '')}+{last_verb}+{last_noun}"
+        trace = chain_store.query_latest_root_by_chain(chain_name)
+        if trace:
+            root_id = trace["id"]
+            if chain_store.get_penalty_count_by_chain(chain_name) >= 3:
+                chain_store.delete_tree(root_id)
+            else:
+                chain_store.mark_root_wrong(root_id)
 
-            # 编排路径：额外惩罚路径缓存 + 工具
-            if used_cache:
-                last_tools = state.get("last_cached_tools")
-                if last_tools:
-                    chain_store.punish_path(
-                        state.get("domain", ""), last_verb, last_noun, last_tools)
-                    chain_store.punish_tools(root_id, last_tools)
-
-    logger.info("[Feedback] %s: verb=%s noun=%s used_cache=%s",
-                severity, last_verb, last_noun, used_cache)
+    logger.info("[Feedback] %s: verb=%s noun=%s", severity, last_verb, last_noun)
 
 
 def _detect_feedback_severity(message: str) -> Optional[str]:
@@ -706,44 +706,16 @@ def _detect_feedback_severity(message: str) -> Optional[str]:
     return None
 
 
-def _learn_from_execution(state: AgentState) -> None:
-    try:
-        verb = state.get("intent_verb", "")
-        noun = state.get("intent_noun", "")
-        if not verb and not noun:
-            return
-
-        from app.agent.evaluator import learn_from_execution
-
-        all_tool_calls = []
-        for r in state.get("step_records", []):
-            all_tool_calls.extend(r.get("tool_calls", []))
-
-        agent_result = AgentResult(
-            success=state.get("all_phases_completed", False),
-            content=json.dumps(state.get("final_output", {}), ensure_ascii=False),
-            tool_calls_log=all_tool_calls,
-            total_steps=state.get("total_steps", 0),
-            total_tokens=state.get("total_tokens", 0),
-        )
-        learn_from_execution(agent_result, verb, noun,
-                             all_phases_completed=state.get("all_phases_completed", False))
-    except Exception as e:
-        logger.warning("[Learn] 异常: %s", e)
-
-
 def _save_traces(state: AgentState, content: str) -> None:
     collector = _pop_collector(state.get("session_id", ""))
     if collector:
         try:
-            root = collector.on_agent_finish(
+            collector.on_agent_finish(
                 final_answer=content,
                 total_steps=state.get("total_steps", 0),
                 total_tokens=state.get("total_tokens", 0),
                 model="langgraph",
             )
-            if root:
-                collector.flush()
         except Exception as e:
             logger.warning("[Trace] 存库失败: %s", e)
     else:
