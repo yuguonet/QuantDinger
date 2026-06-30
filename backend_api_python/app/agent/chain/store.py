@@ -419,13 +419,80 @@ def update_skill_verify(root_id: int, actual_direction: str):
         logger.error("[Store] 更新 skill 验证失败 root_id=%d: %s", root_id, e)
 
 
+def update_path_cache(root_id: int):
+    """验证完成后，增量更新 qd_agent_path_cache。
+
+    累加器字段 +1，派生值查询时实时计算。
+    """
+    import hashlib
+    from app.utils.db import get_db_connection
+
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+
+            # 读根节点信息
+            cur.execute("""
+                SELECT name, tools_called, correct, pnl_pct, hold_days
+                FROM qd_traces WHERE id = %s AND layer = 'chain'
+            """, (root_id,))
+            root = cur.fetchone()
+            if not root or not root['tools_called']:
+                return
+
+            tools = root['tools_called']
+            if not isinstance(tools, list):
+                tools = list(tools)
+            if not tools:
+                return
+
+            parts = root['name'].split('+')
+            domain = parts[0] if len(parts) >= 3 else ''
+            verb = parts[-2] if len(parts) >= 2 else parts[0]
+            noun = parts[-1] if len(parts) >= 2 else ''
+
+            sig = hashlib.md5(','.join(tools).encode()).hexdigest()
+
+            # 累加字段
+            correct_val = 1 if root['correct'] else 0
+            pnl_val = root['pnl_pct'] or 0
+            hold_val = root['hold_days'] or 3
+
+            cur.execute("""
+                INSERT INTO qd_agent_path_cache
+                    (domain, verb, noun, tool_signature, tools,
+                     total_runs, verified_runs, total_verified_correct,
+                     total_verified_pnl, total_hold_days,
+                     last_root_id, updated_at)
+                VALUES (%s, %s, %s, %s, %s, 1, 1, %s, %s, %s, %s, NOW())
+                ON CONFLICT (domain, verb, noun, tool_signature)
+                DO UPDATE SET
+                    total_runs = qd_agent_path_cache.total_runs + 1,
+                    verified_runs = qd_agent_path_cache.verified_runs + 1,
+                    total_verified_correct = qd_agent_path_cache.total_verified_correct + %s,
+                    total_verified_pnl = qd_agent_path_cache.total_verified_pnl + %s,
+                    total_hold_days = qd_agent_path_cache.total_hold_days + %s,
+                    last_root_id = EXCLUDED.last_root_id,
+                    last_success_at = CASE WHEN %s THEN NOW()
+                        ELSE qd_agent_path_cache.last_success_at END,
+                    updated_at = NOW()
+            """, (
+                domain, verb, noun, sig, tools,
+                correct_val, pnl_val, hold_val, root_id,
+                correct_val, pnl_val, hold_val, bool(root['correct']),
+            ))
+
+            conn.commit()
+    except Exception as e:
+        logger.error("[Store] 更新路径缓存失败 root_id=%d: %s", root_id, e)
+
+
 # ═══════════════════════════════════════════════════════════════
 # 权重查询
 #
-# Skill 权重：qd_skill_weights 表
-# 因子权重：qd_factor_weights 表
+# 统一权重表：qd_agent_weights（layer 区分 skill / factor）
 #
-# evaluator.update_skill_weights() 自动同步 registry：
+# evaluator.update_weights() 自动同步 registry：
 #   - 新 Skill 自动 INSERT 工厂默认值
 #   - registry 删除的 Skill 保留但标记
 #   - 增删 Skill 零维护
@@ -526,116 +593,163 @@ def get_penalty_count(stock_code: str) -> int:
         return 0
 
 
-def get_skill_weights() -> Dict[str, float]:
-    """从 qd_skill_weights 获取 Skill 权重。"""
+def punish_tools(root_id: int, tool_names: list):
+    """负面反馈 → 标记工具节点为 failed。
+
+    被标记的工具在 query_low_weight_tools 中直接计入失败，无需等阈值。
+    """
+    from app.utils.db import get_db_connection
+
+    if not tool_names:
+        return
+
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            for name in tool_names:
+                cur.execute("""
+                    UPDATE qd_traces SET status = 'failed'
+                    WHERE root_id = %s AND layer = 'tool' AND name = %s
+                """, (root_id, name))
+            conn.commit()
+            logger.info("[Store] 惩罚工具 root_id=%d: %s", root_id, tool_names)
+    except Exception as e:
+        logger.error("[Store] 惩罚工具失败: %s", e)
+
+
+def punish_path(domain: str, verb: str, noun: str, tools: list):
+    """负面反馈 → 惩罚编排路径缓存（工具级）。
+
+    惩罚方式：累加一次"错误执行"（verified_runs+1, correct不加）。
+    1. 惩罚当前路径（精确匹配）
+    2. 惩罚所有包含这些工具的路径（工具级扩散）
+    """
+    import hashlib
+    from app.utils.db import get_db_connection
+
+    if not tools:
+        return
+    sig = hashlib.md5(','.join(tools).encode()).hexdigest()
+
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+
+            # 1. 精确惩罚当前路径：+1 次错误
+            cur.execute("""
+                UPDATE qd_agent_path_cache SET
+                    verified_runs = verified_runs + 1,
+                    updated_at = NOW()
+                WHERE domain = %s AND verb = %s AND noun = %s AND tool_signature = %s
+            """, (domain, verb, noun, sig))
+
+            # 2. 扩散：所有含这些工具的路径也 +1 次错误
+            for tool in tools:
+                cur.execute("""
+                    UPDATE qd_agent_path_cache SET
+                        verified_runs = verified_runs + 1,
+                        updated_at = NOW()
+                    WHERE domain = %s AND verb = %s AND noun = %s
+                      AND %s = ANY(tools)
+                      AND tool_signature != %s
+                """, (domain, verb, noun, tool, sig))
+
+            conn.commit()
+            logger.info("[Store] 惩罚路径: %s+%s+%s tools=%s", domain, verb, noun, tools)
+    except Exception as e:
+        logger.error("[Store] 惩罚路径失败: %s", e)
+
+
+def get_weights(layer: str, skill_name: str = None) -> Dict[str, float]:
+    """从 qd_agent_weights 获取权重。
+
+    Args:
+        layer: 'skill' 或 'factor'
+        skill_name: factor 层可选按 skill 过滤
+    """
     from app.utils.db import get_db_connection
     weights = {}
     try:
         with get_db_connection() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT skill_name, weight FROM qd_skill_weights")
+            if layer == "factor" and skill_name:
+                cur.execute("""
+                    SELECT name, weight FROM qd_agent_weights
+                    WHERE layer = %s AND skill_name = %s AND sample_count >= 5
+                """, (layer, skill_name))
+            elif layer == "factor":
+                cur.execute("""
+                    SELECT name, weight FROM qd_agent_weights
+                    WHERE layer = %s AND sample_count >= 5
+                """, (layer,))
+            else:
+                cur.execute(
+                    "SELECT name, weight FROM qd_agent_weights WHERE layer = %s",
+                    (layer,))
             for name, weight in cur.fetchall():
                 weights[name] = weight
     except Exception as e:
-        logger.warning("[Store] 获取 Skill 权重失败: %s", e)
+        logger.warning("[Store] 获取 %s 权重失败: %s", layer, e)
     return weights
+
+
+def get_skill_weights() -> Dict[str, float]:
+    """便捷包装：获取 Skill 权重。"""
+    return get_weights("skill")
 
 
 def get_factor_weights(skill_name: str = None) -> Dict[str, float]:
-    """从 qd_factor_weights 获取因子权重。"""
-    from app.utils.db import get_db_connection
-    weights = {}
-    try:
-        with get_db_connection() as conn:
-            cur = conn.cursor()
-            if skill_name:
-                cur.execute("""
-                    SELECT factor_name, weight FROM qd_factor_weights
-                    WHERE skill_name = %s AND sample_count >= 5
-                """, (skill_name,))
-            else:
-                cur.execute("""
-                    SELECT factor_name, weight FROM qd_factor_weights
-                    WHERE sample_count >= 5
-                """)
-            for fname, weight in cur.fetchall():
-                weights[fname] = weight
-    except Exception as e:
-        logger.warning("[Store] 获取因子权重失败: %s", e)
-    return weights
+    """便捷包装：获取因子权重。"""
+    return get_weights("factor", skill_name=skill_name)
 
 
 def query_cached_tools(domain: str, verb: str, noun: str, stock_code: str = None) -> Optional[List[str]]:
-    """查询 qd_traces 中已验证的工具序列（编排路径缓存）。
-
-    chain_name 格式: domain+verb+noun（如 finance+analyze+stock）。
-    聚合同一工具序列的多条执行记录，取 win_rate 最高且 return_per_day 最优的。
+    """从 qd_agent_path_cache 查询最优编排路径。
 
     质量门：
-      1. 样本数 >= MIN_SAMPLES
-      2. win_rate >= MIN_WIN_RATE
+      1. verified_runs >= MIN_SAMPLES
+      2. win_rate >= MIN_WIN_RATE（从累加字段实时算）
       3. 工具步数 <= MAX_STEPS
-      4. 无子节点 failed
     """
     from app.utils.db import get_db_connection
 
     if not verb or not noun:
         return None
 
-    MAX_STEPS = 6         # 单轮最大步数
-
-    chain_name = f"{domain}+{verb}+{noun}" if domain else f"{verb}+{noun}"
-
-    def _query(cur, extra_where: str, params: tuple) -> Optional[list]:
-        """聚合查询：按 tools_called 分组，取最优链路。"""
-        cur.execute(f"""
-            SELECT
-                t.tools_called,
-                COUNT(*) as executions,
-                AVG(CASE WHEN t.correct THEN 1.0 ELSE 0.0 END) as win_rate,
-                AVG(t.pnl_pct) as avg_pnl,
-                AVG(NULLIF(t.hold_days, 0)) as avg_hold_days
-            FROM qd_traces t
-            WHERE t.layer = 'chain'
-              AND t.name = %s
-              AND t.status = 'ok'
-              AND t.tools_called IS NOT NULL
-              AND array_length(t.tools_called, 1) BETWEEN 1 AND %s
-              {extra_where}
-              AND NOT EXISTS (
-                  SELECT 1 FROM qd_traces child
-                  WHERE child.root_id = t.id
-                    AND child.status = 'failed'
-              )
-            GROUP BY t.tools_called
-            ORDER BY COALESCE(AVG(t.pnl_pct), 0) / COALESCE(NULLIF(AVG(NULLIF(t.hold_days, 0)), 0), 1) DESC
-            LIMIT 1
-        """, (chain_name, MAX_STEPS) + params)
-        row = cur.fetchone()
-        if row:
-            tools = row['tools_called']
-            logger.info("[Store] 缓存命中: %s tools=%s win_rate=%.2f pnl=%.2f",
-                        chain_name, tools, row['win_rate'], row['avg_pnl'] or 0)
-            return tools if isinstance(tools, list) else list(tools)
-        return None
+    MIN_SAMPLES = 3
+    MIN_WIN_RATE = 0.55
+    MAX_STEPS = 6
 
     try:
         with get_db_connection() as conn:
             cur = conn.cursor()
+            cur.execute("""
+                SELECT * FROM (
+                    SELECT tools, verified_runs,
+                        total_verified_correct::float / verified_runs as win_rate,
+                        CASE WHEN total_hold_days > 0
+                            THEN total_verified_pnl / total_hold_days
+                            ELSE 0 END as return_per_day
+                    FROM qd_agent_path_cache
+                    WHERE domain = %s AND verb = %s AND noun = %s
+                      AND verified_runs >= %s
+                      AND array_length(tools, 1) BETWEEN 1 AND %s
+                ) sub
+                WHERE win_rate >= %s
+                ORDER BY return_per_day DESC
+                LIMIT 1
+            """, (domain, verb, noun, MIN_SAMPLES, MAX_STEPS, MIN_WIN_RATE))
 
-            # 精确匹配 stock_code
-            if stock_code:
-                result = _query(cur, "AND t.stock_code = %s", (stock_code,))
-                if result:
-                    return result
-                # 有具体股票但无缓存 → 不降级到全局（语义不同）
-                return None
-
-            # 无 stock_code → 取全局最优
-            return _query(cur, "", ())
+            row = cur.fetchone()
+            if row:
+                tools = row['tools']
+                logger.info("[Store] 路径缓存命中: %s+%s+%s tools=%s win_rate=%.2f",
+                            domain, verb, noun, tools, row['win_rate'] or 0)
+                return tools if isinstance(tools, list) else list(tools)
+            return None
 
     except Exception as e:
-        logger.warning("[Store] 查询缓存工具链失败 %s: %s", chain_name, e)
+        logger.warning("[Store] 查询路径缓存失败 %s+%s+%s: %s", domain, verb, noun, e)
         return None
 
 
@@ -643,22 +757,21 @@ def query_low_weight_tools(min_appearances: int = 5, max_win_rate: float = 0.4) 
     """聚合 qd_traces，返回低权重工具集合。
 
     工具出现次数 >= min_appearances 且所在链路 win_rate < max_win_rate → 低权重。
-    结果缓存 10 分钟，避免每次调用都聚合。
+    或：工具被 punish_tools 标记为 status='failed' → 直接计入。
     """
     from app.utils.db import get_db_connection
-    import time
-
-    # 简单内存缓存
-    cache_key = f"{min_appearances}_{max_win_rate}"
-    if not hasattr(query_low_weight_tools, '_cache'):
-        query_low_weight_tools._cache = {}
-    cached = query_low_weight_tools._cache.get(cache_key)
-    if cached and time.time() - cached[1] < 600:
-        return cached[0]
 
     try:
         with get_db_connection() as conn:
             cur = conn.cursor()
+            # 1. 被用户反馈直接标记为 failed 的工具
+            cur.execute("""
+                SELECT DISTINCT name FROM qd_traces
+                WHERE layer = 'tool' AND status = 'failed'
+            """)
+            result = {row['name'] for row in cur.fetchall()}
+
+            # 2. 聚合胜率低的工具
             cur.execute("""
                 SELECT child.name
                 FROM qd_traces child
@@ -670,8 +783,9 @@ def query_low_weight_tools(min_appearances: int = 5, max_win_rate: float = 0.4) 
                 HAVING COUNT(*) >= %s
                    AND AVG(CASE WHEN root.correct THEN 1.0 ELSE 0.0 END) < %s
             """, (min_appearances, max_win_rate))
-            result = {row['name'] for row in cur.fetchall()}
-            query_low_weight_tools._cache[cache_key] = (result, time.time())
+            for row in cur.fetchall():
+                result.add(row['name'])
+
             if result:
                 logger.info("[Store] 低权重工具 (%d): %s", len(result), result)
             return result

@@ -71,6 +71,8 @@ class AgentState(TypedDict, total=False):
     # ── 跨轮元数据（checkpointer 自动持久化）─────────────
     last_verb: str                      # 上一轮 verb（反馈闭环用）
     last_noun: str                      # 上一轮 noun（反馈闭环用）
+    last_used_cache: bool               # 上一轮是否走了编排路径缓存
+    last_cached_tools: Optional[List[str]]  # 上一轮的缓存工具链（惩罚用）
     context_summary: str                # 上轮意图分析摘要（跨轮上下文）
 
 
@@ -130,6 +132,8 @@ def create_initial_state(
         messages=[],
         last_verb="",
         last_noun="",
+        last_used_cache=False,
+        last_cached_tools=None,
         context_summary="",
         **kwargs,
     )

@@ -327,7 +327,6 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
             "current_tool_strategy": "",
             "loop_step": state.get("loop_step", 0) + 1,
             "should_continue": True,
-            "cached_tools": None,  # 用完即清
         }
 
     # ── 已有结论 → 直接结束，不再调 LLM#2 ──
@@ -426,13 +425,18 @@ def agent_node(state: AgentState) -> Dict[str, Any]:
         except Exception:
             pass
 
+    # 通知 collector 本轮 skill 边界（planner 已决策）
+    collector = _get_collector(state.get("session_id", ""))
+    if collector and skill:
+        collector.begin_skill(skill, tools=phase_tools)
+
     agent = get_smolagent(
         user_id=state.get("user_id", "1"), max_steps=10,
         user_message=_query, domain=state.get("domain", ""),
         domain_instructions=state.get("domain_instructions", ""),
         stock_code=stock_code, stock_name=stock_name,
         tool_categories=phase_tools or None,
-        collector=_get_collector(state.get("session_id", "")),
+        collector=collector,
         strategy=state.get("strategy", "direct"),
     )
 
@@ -589,6 +593,8 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
         return {
             "messages": [{"role": "assistant", "content": json.dumps(state["final_output"], ensure_ascii=False)}],
             "last_verb": state.get("intent_verb", ""), "last_noun": state.get("intent_noun", ""),
+            "last_used_cache": bool(state.get("cached_tools")),
+            "last_cached_tools": state.get("cached_tools"),
             "context_summary": state.get("context_summary", ""),
         }
 
@@ -621,6 +627,8 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
         "messages": [{"role": "assistant", "content": display_content}] if display_content else [],
         "final_output": final_output, "all_phases_completed": True,
         "last_verb": state.get("intent_verb", ""), "last_noun": state.get("intent_noun", ""),
+        "last_used_cache": bool(state.get("cached_tools")),
+        "last_cached_tools": state.get("cached_tools"),
         "context_summary": state.get("context_summary", ""),
     }
 
@@ -641,9 +649,10 @@ def _aggregate_tools_called(state: AgentState) -> list:
 
 
 def _check_negative_feedback(state: AgentState) -> None:
-    """用户负面反馈 → 惩罚 qd_traces（correct=false）。
+    """用户负面反馈 → 惩罚。
 
-    T+N 回测的 correct 字段天然过滤掉被标记的链路。
+    自由建树：只惩罚根节点（还没 T+N 验证过）。
+    编排路径：惩罚根节点 + 路径缓存 + skill 权重（已经验证过还出错）。
     """
     from app.agent.chain import store as chain_store
 
@@ -655,7 +664,9 @@ def _check_negative_feedback(state: AgentState) -> None:
     if not last_verb or not last_noun:
         return
 
+    used_cache = state.get("last_used_cache", False)
     stock_code = state.get("stock_code", "")
+
     if stock_code:
         trace = chain_store.query_latest_root(stock_code)
         if trace:
@@ -665,7 +676,16 @@ def _check_negative_feedback(state: AgentState) -> None:
             else:
                 chain_store.mark_root_wrong(root_id)
 
-    logger.info("[Feedback] %s: verb=%s noun=%s", severity, last_verb, last_noun)
+            # 编排路径：额外惩罚路径缓存 + 工具
+            if used_cache:
+                last_tools = state.get("last_cached_tools")
+                if last_tools:
+                    chain_store.punish_path(
+                        state.get("domain", ""), last_verb, last_noun, last_tools)
+                    chain_store.punish_tools(root_id, last_tools)
+
+    logger.info("[Feedback] %s: verb=%s noun=%s used_cache=%s",
+                severity, last_verb, last_noun, used_cache)
 
 
 def _detect_feedback_severity(message: str) -> Optional[str]:
@@ -716,12 +736,14 @@ def _save_traces(state: AgentState, content: str) -> None:
     collector = _pop_collector(state.get("session_id", ""))
     if collector:
         try:
-            collector.on_agent_finish(
+            root = collector.on_agent_finish(
                 final_answer=content,
                 total_steps=state.get("total_steps", 0),
                 total_tokens=state.get("total_tokens", 0),
                 model="langgraph",
             )
+            if root:
+                collector.flush()
         except Exception as e:
             logger.warning("[Trace] 存库失败: %s", e)
     else:

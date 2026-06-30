@@ -2,7 +2,7 @@
 """
 Evaluator — 回溯评估引擎（重写版）。
 
-基于 qd_traces 表 + qd_skill_weights + qd_factor_weights。
+基于 qd_traces 表 + qd_agent_weights。
 
 核心流程（每日盘后自动运行）：
   evaluate_pending()      → 按 timeframe 取实际行情，写回 qd_traces
@@ -184,6 +184,9 @@ def evaluate_pending(days_old: int = 1, market: str = "CNStock") -> Dict[str, An
             # 写入 skill 子节点验证结果
             store.update_skill_verify(root_id, actual_dir)
 
+            # 更新编排路径缓存
+            store.update_path_cache(root_id)
+
             stats["evaluated"] += 1
             stats["details"].append({
                 "root_id": root_id, "stock": stock_code,
@@ -205,8 +208,7 @@ def evaluate_pending(days_old: int = 1, market: str = "CNStock") -> Dict[str, An
     # 评估后自动更新权重
     if stats["evaluated"] > 0:
         try:
-            update_skill_weights()
-            update_factor_weights()
+            update_weights()
         except Exception as e:
             logger.warning("[Evaluator] 自动更新权重失败: %s", e)
 
@@ -261,46 +263,46 @@ def _calc_skill_weight_from_trades(trades: List[Dict]) -> Dict[str, float]:
     }
 
 
-def update_skill_weights(days: int = 90) -> Dict[str, Any]:
-    """更新 qd_skill_weights 表。
+def update_weights(days: int = 90) -> Dict[str, Any]:
+    """更新 qd_agent_weights 表（统一 skill + factor）。
 
-    自动同步 registry：
-      1. 从 registry 读当前所有 Skill
-      2. 新 Skill → INSERT 工厂默认值
-      3. 已有 Skill + 有回测数据 → 更新权重
-      4. registry 删除的 Skill → 保留（不删，避免丢失历史）
+    一次扫描 qd_traces WHERE layer='skill'，同时产出：
+      1. skill 层权重（按单位时间收益率）
+      2. factor 层权重（带时间衰减的准确率）
+
+    自动同步 registry：新 Skill → INSERT 工厂默认值。
     """
     from app.utils.db import get_db_connection
 
-    stats = {"synced": 0, "updated": 0}
+    stats = {"synced": 0, "skill_updated": 0, "factor_updated": 0, "factor_cleaned": 0}
     since = date.today() - timedelta(days=days)
+    today = date.today()
 
     try:
         with get_db_connection() as conn:
             cur = conn.cursor()
 
             # ① 同步 semantics：新 Skill 自动 INSERT 工厂默认值
-            cur.execute("SELECT skill_name FROM qd_skill_weights")
-            existing = {row['skill_name'] for row in cur.fetchall()}
+            cur.execute("SELECT name FROM qd_agent_weights WHERE layer = 'skill'")
+            existing_skills = {row['name'] for row in cur.fetchall()}
 
-            # 新架构：从 agent/skills/*/SKILL.md 获取 Skill 列表和出厂权重
             from app.agent.semantics import get_all_skill_metas
             metas = get_all_skill_metas()
             for name, meta in metas.items():
-                if name not in existing:
+                if name not in existing_skills:
                     default_w = meta.default_weight if meta.default_weight else 1.0
                     cur.execute("""
-                        INSERT INTO qd_skill_weights (skill_name, weight, sample_count)
-                        VALUES (%s, %s, 0)
-                        ON CONFLICT (skill_name) DO NOTHING
+                        INSERT INTO qd_agent_weights (layer, name, skill_name, weight, sample_count)
+                        VALUES ('skill', %s, NULL, %s, 0)
+                        ON CONFLICT (layer, name, skill_name) DO NOTHING
                     """, (name, default_w))
                     stats["synced"] += 1
                     logger.info("[Evaluator] 新 Skill 注册: %s (weight=%.2f)", name, default_w)
 
-            # ② 从 qd_traces 读已验证的 skill 节点
+            # ② 一次扫描 qd_traces，同时聚合 skill 和 factor 数据
             cur.execute("""
-                SELECT t.name as skill_name, t.pnl_pct, t.hold_days, t.correct,
-                       r.exec_date
+                SELECT t.name as skill_name, t.factors, t.pnl_pct,
+                       t.hold_days, t.correct, r.exec_date
                 FROM qd_traces t
                 JOIN qd_traces r ON r.id = t.root_id
                 WHERE t.layer = 'skill'
@@ -310,128 +312,31 @@ def update_skill_weights(days: int = 90) -> Dict[str, Any]:
             """, (since,))
 
             skill_trades: Dict[str, List[Dict]] = {}
+            factor_stats: Dict[tuple, Dict[str, float]] = {}
+
             for row in cur.fetchall():
                 skill_name = row['skill_name']
+                correct = row['correct']
+                exec_date = row['exec_date']
+
+                # 聚合 skill 交易数据
                 if skill_name not in skill_trades:
                     skill_trades[skill_name] = []
                 skill_trades[skill_name].append({
                     "pnl_pct": row['pnl_pct'],
                     "hold_days": row['hold_days'] or 3,
-                    "correct": row['correct'],
-                    "exec_date": row['exec_date'],
+                    "correct": correct,
+                    "exec_date": exec_date,
                 })
 
-            # ③ 计算权重并 UPSERT
-            for skill_name, trades in skill_trades.items():
-                result = _calc_skill_weight_from_trades(trades)
-
-                cur.execute("""
-                    INSERT INTO qd_skill_weights
-                        (skill_name, weight, win_rate, avg_pnl_pct, avg_hold_days,
-                         return_per_day, sample_count, last_updated)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
-                    ON CONFLICT (skill_name)
-                    DO UPDATE SET
-                        weight = EXCLUDED.weight,
-                        win_rate = EXCLUDED.win_rate,
-                        avg_pnl_pct = EXCLUDED.avg_pnl_pct,
-                        avg_hold_days = EXCLUDED.avg_hold_days,
-                        return_per_day = EXCLUDED.return_per_day,
-                        sample_count = EXCLUDED.sample_count,
-                        last_updated = NOW()
-                """, (
-                    skill_name, result["weight"], result["win_rate"],
-                    result["avg_pnl_pct"], result["avg_hold_days"],
-                    result["return_per_day"], result["sample_count"],
-                ))
-                stats["updated"] += 1
-
-            conn.commit()
-
-    except Exception as e:
-        logger.error("[Evaluator] 更新 Skill 权重失败: %s", e)
-
-    logger.info("[Evaluator] Skill 权重: 同步 %d 个新 Skill, 更新 %d 个", stats["synced"], stats["updated"])
-    return stats
-
-
-# ═══════════════════════════════════════════════════════════════
-# 因子权重更新（带时间衰减）
-# ═══════════════════════════════════════════════════════════════
-
-_FACTOR_HALF_LIFE_RULES = [
-    (["政策", "policy", "监管", "新规"], 7),
-    (["新闻", "news", "公告", "消息", "舆情"], 7),
-    (["解禁", "lockup", "减持", "增持"], 7),
-    (["游资", "hot_money", "龙虎榜", "主力"], 14),
-    (["资金", "fund_flow", "北向", "融资"], 14),
-    (["概念", "concept", "题材", "板块", "sector"], 21),
-    (["MACD", "macd", "DIF", "DEA", "金叉", "死叉"], 30),
-    (["RSI", "rsi", "超买", "超卖"], 30),
-    (["KDJ", "kdj", "J值"], 30),
-    (["BOLL", "boll", "布林"], 30),
-    (["均线", "MA", "ma", "多头排列", "空头排列"], 30),
-    (["形态", "pattern", "突破", "反转", "K线"], 30),
-    (["动量", "momentum", "趋势", "trend"], 30),
-    (["量", "volume", "量比", "换手", "放量", "缩量"], 60),
-    (["筹码", "chip", "持仓", "成本"], 45),
-]
-
-_DEFAULT_HALF_LIFE = 30
-
-
-def _get_factor_half_life(factor_name: str) -> int:
-    name_lower = factor_name.lower()
-    for keywords, hl in _FACTOR_HALF_LIFE_RULES:
-        for kw in keywords:
-            if kw.lower() in name_lower:
-                return hl
-    return _DEFAULT_HALF_LIFE
-
-
-def update_factor_weights(days: int = 90) -> Dict[str, Any]:
-    """更新 qd_factor_weights 表。
-
-    从 qd_traces 中读取已验证的 skill 节点及其 factors，
-    按 (skill_name, factor_name) 聚合带时间衰减的准确率，UPSERT 到表。
-    同时清理近 days 天内未出现的过期因子。
-    """
-    from app.utils.db import get_db_connection
-
-    stats = {"updated": 0, "cleaned": 0}
-    since = date.today() - timedelta(days=days)
-    today = date.today()
-
-    try:
-        with get_db_connection() as conn:
-            cur = conn.cursor()
-
-            cur.execute("""
-                SELECT t.name as skill_name, t.factors, t.correct,
-                       r.exec_date
-                FROM qd_traces t
-                JOIN qd_traces r ON r.id = t.root_id
-                WHERE t.layer = 'skill'
-                  AND t.status = 'ok'
-                  AND t.correct IS NOT NULL
-                  AND r.exec_date >= %s
-            """, (since,))
-
-            factor_stats: Dict[tuple, Dict[str, float]] = {}
-
-            for row in cur.fetchall():
-                skill_name = row['skill_name']
+                # 聚合 factor 数据（带时间衰减）
                 factors_json = row['factors']
-                correct = row['correct']
-                exec_date = row['exec_date']
-
                 try:
                     factors_raw = json.loads(factors_json) if isinstance(factors_json, str) else (factors_json or [])
                 except (json.JSONDecodeError, TypeError):
                     factors_raw = []
 
                 days_ago = (today - exec_date).days
-
                 for factor in factors_raw:
                     if not isinstance(factor, dict):
                         continue
@@ -448,61 +353,96 @@ def update_factor_weights(days: int = 90) -> Dict[str, Any]:
                             "weighted_correct": 0.0, "weighted_total": 0.0,
                             "raw_total": 0, "half_life": hl,
                         }
-
                     factor_stats[key]["weighted_total"] += decay_weight
                     factor_stats[key]["raw_total"] += 1
                     if correct:
                         factor_stats[key]["weighted_correct"] += decay_weight
 
-            # UPSERT 有效因子
-            active_keys = set()
+            # ③ UPSERT skill 权重
+            for skill_name, trades in skill_trades.items():
+                result = _calc_skill_weight_from_trades(trades)
+                cur.execute("""
+                    INSERT INTO qd_agent_weights
+                        (layer, name, skill_name, weight, win_rate,
+                         avg_pnl_pct, avg_hold_days, return_per_day,
+                         sample_count, last_updated)
+                    VALUES ('skill', %s, NULL, %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (layer, name, skill_name)
+                    DO UPDATE SET
+                        weight = EXCLUDED.weight,
+                        win_rate = EXCLUDED.win_rate,
+                        avg_pnl_pct = EXCLUDED.avg_pnl_pct,
+                        avg_hold_days = EXCLUDED.avg_hold_days,
+                        return_per_day = EXCLUDED.return_per_day,
+                        sample_count = EXCLUDED.sample_count,
+                        last_updated = NOW()
+                """, (
+                    skill_name, result["weight"], result["win_rate"],
+                    result["avg_pnl_pct"], result["avg_hold_days"],
+                    result["return_per_day"], result["sample_count"],
+                ))
+                stats["skill_updated"] += 1
+
+            # ④ UPSERT factor 权重
+            active_factor_keys = set()
             for (skill_name, fname), s in factor_stats.items():
                 total = s["weighted_total"]
                 if total < 0.5:
                     continue
 
-                active_keys.add((skill_name, fname))
+                active_factor_keys.add((skill_name, fname))
                 accuracy = round(s["weighted_correct"] / total, 4)
                 weight = max(0.5, min(2.0, accuracy * 2))
 
                 cur.execute("""
-                    INSERT INTO qd_factor_weights
-                        (skill_name, factor_name, weight, win_rate, sample_count,
-                         decay_half_life, last_updated)
-                    VALUES (%s, %s, %s, %s, %s, %s, NOW())
-                    ON CONFLICT (skill_name, factor_name)
+                    INSERT INTO qd_agent_weights
+                        (layer, name, skill_name, weight, win_rate,
+                         sample_count, decay_half_life, last_updated)
+                    VALUES ('factor', %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (layer, name, skill_name)
                     DO UPDATE SET
                         weight = EXCLUDED.weight,
                         win_rate = EXCLUDED.win_rate,
                         sample_count = EXCLUDED.sample_count,
                         decay_half_life = EXCLUDED.decay_half_life,
                         last_updated = NOW()
-                """, (skill_name, fname, weight, accuracy,
+                """, (fname, skill_name, weight, accuracy,
                       int(s["raw_total"]), s["half_life"]))
-                stats["updated"] += 1
+                stats["factor_updated"] += 1
 
-            # 清理过期因子：近 days 天内未出现的
-            if active_keys:
+            # ⑤ 清理过期因子
+            if active_factor_keys:
                 placeholders = []
                 params = []
-                for sname, fname in active_keys:
-                    placeholders.append(f"NOT (skill_name = %s AND factor_name = %s)")
+                for sname, fname in active_factor_keys:
+                    placeholders.append("NOT (skill_name = %s AND name = %s)")
                     params.extend([sname, fname])
-                if placeholders:
-                    cur.execute(f"""
-                        DELETE FROM qd_factor_weights
-                        WHERE sample_count > 0
-                          AND ({' AND '.join(placeholders)})
-                    """, params)
-                    stats["cleaned"] = cur.rowcount
+                cur.execute(f"""
+                    DELETE FROM qd_agent_weights
+                    WHERE layer = 'factor'
+                      AND sample_count > 0
+                      AND ({' AND '.join(placeholders)})
+                """, params)
+                stats["factor_cleaned"] = cur.rowcount
 
             conn.commit()
 
     except Exception as e:
-        logger.error("[Evaluator] 更新因子权重失败: %s", e)
+        logger.error("[Evaluator] 更新权重失败: %s", e)
 
-    logger.info("[Evaluator] 因子权重: 更新 %d 个, 清理 %d 个过期", stats["updated"], stats["cleaned"])
+    logger.info("[Evaluator] 权重更新: 同步 %d, skill %d, factor %d, 清理 %d",
+                stats["synced"], stats["skill_updated"], stats["factor_updated"], stats["factor_cleaned"])
     return stats
+
+
+def update_skill_weights(days: int = 90) -> Dict[str, Any]:
+    """兼容旧接口。"""
+    return update_weights(days)
+
+
+def update_factor_weights(days: int = 90) -> Dict[str, Any]:
+    """兼容旧接口。"""
+    return update_weights(days)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -557,9 +497,9 @@ def get_eval_report(days: int = 30) -> Dict[str, Any]:
 
             # 因子准确率
             cur.execute("""
-                SELECT skill_name, factor_name, win_rate, weight, sample_count
-                FROM qd_factor_weights
-                WHERE sample_count >= 3
+                SELECT skill_name, name as factor_name, win_rate, weight, sample_count
+                FROM qd_agent_weights
+                WHERE layer = 'factor' AND sample_count >= 3
                 ORDER BY win_rate DESC
                 LIMIT 30
             """)

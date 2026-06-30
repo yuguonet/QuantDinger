@@ -17,7 +17,7 @@ description: Agent 执行规范
 ```json
 {
   "reply": "用户看到的回复（自然语言）",
-  "conclusion": true,
+  "conclusion": True,
   "errors": [],
   "data": {}
 }

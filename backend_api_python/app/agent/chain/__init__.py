@@ -4,9 +4,9 @@ Chain — 编排/决策层。
 
 核心模块：
   schema.py    — EvalNode 三层统一数据结构 + SkillReport
-  store.py     — qd_traces 持久化（save_tree / load_tree / query_cached_tools）
+  store.py     — qd_traces 持久化 + qd_agent_path_cache + qd_agent_weights
   chains.py    — 链路定义
-  evaluator.py — 回溯评估引擎（T+N 验证 → 因子权重更新）
+  evaluator.py — 回溯评估引擎（T+N 验证 → 权重更新）
 
 已删除：
   tool_chains.py — 编排路径缓存（读写链路断裂，改用 qd_traces）
