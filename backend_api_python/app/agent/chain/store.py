@@ -422,8 +422,7 @@ def update_skill_verify(root_id: int, actual_direction: str):
 # ═══════════════════════════════════════════════════════════════
 # 权重查询
 #
-# Skill 权重：qd_skill_weights 表
-# 因子权重：qd_factor_weights 表
+# 统一权重表：qd_agent_weights（layer='skill' / layer='factor'）
 #
 # evaluator.update_skill_weights() 自动同步 registry：
 #   - 新 Skill 自动 INSERT 工厂默认值
@@ -582,13 +581,13 @@ def get_penalty_count_by_chain(chain_name: str) -> int:
 
 
 def get_skill_weights() -> Dict[str, float]:
-    """从 qd_skill_weights 获取 Skill 权重。"""
+    """从 qd_agent_weights 获取 Skill 权重。"""
     from app.utils.db import get_db_connection
     weights = {}
     try:
         with get_db_connection() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT skill_name, weight FROM qd_skill_weights")
+            cur.execute("SELECT name, weight FROM qd_agent_weights WHERE layer = 'skill'")
             for name, weight in cur.fetchall():
                 weights[name] = weight
     except Exception as e:
@@ -597,7 +596,7 @@ def get_skill_weights() -> Dict[str, float]:
 
 
 def get_factor_weights(skill_name: str = None) -> Dict[str, float]:
-    """从 qd_factor_weights 获取因子权重。"""
+    """从 qd_agent_weights 获取因子权重。"""
     from app.utils.db import get_db_connection
     weights = {}
     try:
@@ -605,13 +604,13 @@ def get_factor_weights(skill_name: str = None) -> Dict[str, float]:
             cur = conn.cursor()
             if skill_name:
                 cur.execute("""
-                    SELECT factor_name, weight FROM qd_factor_weights
-                    WHERE skill_name = %s AND sample_count >= 5
+                    SELECT name, weight FROM qd_agent_weights
+                    WHERE layer = 'factor' AND skill_name = %s AND sample_count >= 5
                 """, (skill_name,))
             else:
                 cur.execute("""
-                    SELECT factor_name, weight FROM qd_factor_weights
-                    WHERE sample_count >= 5
+                    SELECT name, weight FROM qd_agent_weights
+                    WHERE layer = 'factor' AND sample_count >= 5
                 """)
             for fname, weight in cur.fetchall():
                 weights[fname] = weight

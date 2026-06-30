@@ -30,6 +30,11 @@ Tool/Skill 历史回测引擎
   # 指定输出目录
   python -m app.agent.tools.backtest_tool_skill --tool analyze_trend --stock-pool all --days 90 --output-dir ./my_results
 
+  # 快速测试（随机抽样）
+  python -m app.agent.tools.backtest_tool_skill --tool get_indicator_snapshot --sample 100 --days 30
+
+  # 中断: Ctrl+C 可随时安全退出
+
 输出文件说明：
   - 汇总文件 (--output): 包含所有 tool/skill 的统计摘要
   - 高胜率股票文件 (--output-dir): 每个 tool/skill × 周期独立文件
@@ -67,6 +72,9 @@ logger = get_logger(__name__)
 # K 线内存缓存 key=(stock_code, timeframe) → 前复权后的完整 K 线列表
 # 跨 backtest_single 调用复用，大幅减少 DB 查询
 _kline_cache: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+
+# 批量预加载的 K 线数据 key=(stock_code) → {"1D": [...], "15m": [...]}
+_bulk_kline_cache: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
 
 # ═══════════════════════════════════════════════════════════════
 #  数据结构
@@ -311,6 +319,175 @@ def _get_kline_cached(
     return klines
 
 
+def preload_bulk_klines(
+    stock_codes: List[str],
+    timeframe: str = "1D",
+    start_date: str = "",
+    end_date: str = "",
+    batch_size: int = 50,
+) -> int:
+    """批量预加载 K 线数据到缓存。
+
+    优化策略：
+    1. 直接 SQL 批量查询，避免逐只股票调用 API
+    2. 复用 DB 连接，减少连接开销
+    3. 前复权处理在内存中完成
+
+    Args:
+        stock_codes: 股票代码列表
+        timeframe: K 线周期
+        start_date: 开始日期
+        end_date: 结束日期
+        batch_size: 批量查询大小（未使用，保留兼容）
+
+    Returns:
+        成功加载的股票数量
+    """
+    global _kline_cache
+    loaded = 0
+    total = len(stock_codes)
+
+    # 预加载复权因子缓存（避免回测时触发网络请求）
+    print("  预加载复权因子缓存...")
+    try:
+        from app.data_sources.provider.adjustment import _load as load_factors
+        load_factors()
+        print("    复权因子缓存已加载")
+    except Exception as e:
+        logger.warning("加载复权因子缓存失败: %s", e)
+
+    print(f"  预加载 K 线数据: {total} 只股票, 周期={timeframe}")
+
+    # 直接 SQL 批量查询
+    from datetime import datetime
+    from app.utils.db_market import get_market_db_manager
+
+    mgr = get_market_db_manager()
+    pool = mgr._get_pool("CNStock")
+
+    # 解析日期
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d") if start_date else None
+
+    # 确定要查询的年份（加载最近3年，确保有足够历史数据）
+    years = set()
+    current_year = datetime.now().year
+    if start_dt:
+        for y in range(start_dt.year, current_year + 1):
+            years.add(y)
+    else:
+        # 默认加载最近3年，确保指标计算有足够的历史数据
+        for y in range(current_year - 2, current_year + 1):
+            years.add(y)
+
+    with pool.connection() as conn:
+        cur = conn.cursor()
+
+        # 检查表是否存在（缓存结果）
+        tables_exist = set()
+        for year in years:
+            table = f"kline_{timeframe}_{year}"
+            if table in tables_exist:
+                continue
+            cur.execute("""
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = %s
+            """, (table,))
+            if cur.fetchone():
+                tables_exist.add(table)
+
+        print(f"    可用表: {tables_exist}")
+
+        # 批量查询每张表
+        for table in sorted(tables_exist):
+            # 构建 IN 条件
+            placeholders = ", ".join(["%s"] * len(stock_codes))
+            conditions = [f"symbol IN ({placeholders})"]
+            params = list(stock_codes)
+
+            if start_dt:
+                conditions.append("time >= %s")
+                params.append(start_dt)
+
+            query = f"""
+                SELECT symbol, time, open, high, low, close, volume
+                FROM "{table}"
+                WHERE {' AND '.join(conditions)}
+                ORDER BY symbol, time ASC
+            """
+
+            cur.execute(query, params)
+            rows = cur.fetchall()
+
+            # 按股票分组
+            stock_data = {}
+            for row in rows:
+                code = row[0]
+                if code not in stock_data:
+                    stock_data[code] = []
+                stock_data[code].append({
+                    "time": row[1],
+                    "open": float(row[2]),
+                    "high": float(row[3]),
+                    "low": float(row[4]),
+                    "close": float(row[5]),
+                    "volume": float(row[6]),
+                })
+
+            # 前复权处理并存入缓存
+            from app.data_sources.provider.adjustment import unadj_to_qfq
+            for code, klines in stock_data.items():
+                if not klines:
+                    continue
+
+                # 转换日期格式
+                formatted = []
+                for k in klines:
+                    t = k["time"]
+                    if isinstance(t, datetime):
+                        date_str = t.strftime("%Y-%m-%d")
+                    else:
+                        date_str = str(t)[:10]
+                    formatted.append({
+                        "time": date_str,
+                        "open": k["open"],
+                        "high": k["high"],
+                        "low": k["low"],
+                        "close": k["close"],
+                        "volume": k["volume"],
+                    })
+
+                # 前复权
+                adjusted = unadj_to_qfq(formatted, code)
+
+                # 转换为标准格式
+                result = [{
+                    "date": k["time"],
+                    "open": k["open"],
+                    "high": k["high"],
+                    "low": k["low"],
+                    "close": k["close"],
+                    "volume": k["volume"],
+                } for k in adjusted]
+
+                # 存入缓存（合并多张表的数据）
+                cache_key = (code, timeframe)
+                if cache_key in _kline_cache:
+                    existing = _kline_cache[cache_key]
+                    # 合并并去重
+                    merged = {k["date"]: k for k in existing}
+                    for k in result:
+                        merged[k["date"]] = k
+                    _kline_cache[cache_key] = sorted(merged.values(), key=lambda x: x["date"])
+                else:
+                    _kline_cache[cache_key] = result
+                    loaded += 1
+
+            print(f"    表 {table}: 查询 {len(rows)} 行, 覆盖 {len(stock_data)} 只股票")
+
+    print(f"  预加载完成: {loaded}/{total} 只股票")
+    return loaded
+
+
 def get_future_return(
     stock_code: str,
     from_date: str,
@@ -447,13 +624,14 @@ def _get_tool_fn(tool_name: str) -> Optional[Callable]:
     return spec.fn if spec else None
 
 
-def call_tool(tool_name: str, stock_code: str, stock_name: str = "") -> PredictionResult:
+def call_tool(tool_name: str, stock_code: str, stock_name: str = "", decision_date: str = "") -> PredictionResult:
     """调用 tool 并提取预测结果。
 
     Args:
         tool_name: tool 名称
         stock_code: 股票代码
         stock_name: 股票名称
+        decision_date: 决策日期（用于从缓存获取历史K线）
 
     Returns:
         PredictionResult
@@ -462,7 +640,7 @@ def call_tool(tool_name: str, stock_code: str, stock_name: str = "") -> Predicti
     result = PredictionResult(
         stock_code=stock_code,
         stock_name=stock_name,
-        decision_date=today,
+        decision_date=decision_date or today,
         tool_name=tool_name,
     )
 
@@ -472,9 +650,63 @@ def call_tool(tool_name: str, stock_code: str, stock_name: str = "") -> Predicti
         return result
 
     try:
-        # 调用 tool
-        raw = fn(stock_code)
-        result.raw_output = raw
+        # 注入缓存数据源到 DataSourceFactory
+        from app.data_sources.factory import DataSourceFactory
+        original_source = DataSourceFactory._sources.get("CNStock")
+
+        # 创建缓存数据源
+        class CachedDataSource:
+            def __init__(self, cache, target_date):
+                self._cache = cache
+                self._target_date = target_date
+
+            def get_kline(self, symbol, timeframe, limit, **kwargs):
+                cache_key = (symbol, timeframe)
+                if cache_key not in self._cache:
+                    return []
+                klines = self._cache[cache_key]
+                if not klines:
+                    return []
+                # 截取到决策日期
+                if self._target_date:
+                    klines = [k for k in klines if k["date"] <= self._target_date]
+                # 转换为数据源格式
+                result = []
+                for k in klines:
+                    result.append({
+                        "time": k["date"],
+                        "open": k["open"],
+                        "high": k["high"],
+                        "low": k["low"],
+                        "close": k["close"],
+                        "volume": k["volume"],
+                    })
+                # 返回最后 limit 根
+                if len(result) > limit:
+                    result = result[-limit:]
+                return result
+
+            # 添加其他可能需要的方法
+            def __getattr__(self, name):
+                # 委托给原始数据源
+                if original_source:
+                    return getattr(original_source, name)
+                raise AttributeError(f"CachedDataSource 没有属性 {name}")
+
+        # 注入缓存数据源
+        cached_source = CachedDataSource(_kline_cache, decision_date)
+        DataSourceFactory._sources["CNStock"] = cached_source
+
+        try:
+            # 调用 tool
+            raw = fn(stock_code)
+            result.raw_output = raw
+        finally:
+            # 恢复原始数据源
+            if original_source:
+                DataSourceFactory._sources["CNStock"] = original_source
+            else:
+                DataSourceFactory._sources.pop("CNStock", None)
 
         # 提取预测结果
         if isinstance(raw, dict):
@@ -492,6 +724,24 @@ def call_tool(tool_name: str, stock_code: str, stock_name: str = "") -> Predicti
                 result.score = raw.get("score")
                 result.direction = raw.get("direction", "")
                 result.confidence = raw.get("confidence", 0.5)
+
+            # 如果没有 direction，根据 score 推断
+            if not result.direction and result.score is not None:
+                if result.score >= 65:
+                    result.direction = "bullish"
+                elif result.score <= 35:
+                    result.direction = "bearish"
+                else:
+                    result.direction = "neutral"
+
+            # 如果没有 action，根据 direction 推断
+            if not result.action:
+                if result.direction == "bullish":
+                    result.action = "buy"
+                elif result.direction == "bearish":
+                    result.action = "sell"
+                else:
+                    result.action = "hold"
 
             # 提取 action
             if "action" in raw:
@@ -631,9 +881,7 @@ def backtest_single(
     if is_skill:
         pred = call_skill(tool_name, stock_code, stock_name)
     else:
-        pred = call_tool(tool_name, stock_code, stock_name)
-
-    pred.decision_date = decision_date
+        pred = call_tool(tool_name, stock_code, stock_name, decision_date)
 
     # 如果有错误，返回带错误的结果
     if pred.error:
@@ -757,8 +1005,14 @@ def backtest_batch(
     is_skill: bool = False,
     max_workers: int = 16,
     verbose: bool = False,
+    timeframe: str = "1D",
 ) -> List[VerifyResult]:
-    """批量回测（两阶段：先预测后验证，预测只执行一次/股）。
+    """批量回测（两阶段：预加载K线 → 预测+验证）。
+
+    设计说明：
+    - 每个 (股票, 日期) 组合需要独立预测，因为 Tool 可能依赖历史数据
+    - 不同决策日期的历史K线不同，预测结果也不同
+    - 预加载K线数据避免重复DB查询
 
     Args:
         stocks: [{"code": "600519", "name": "贵州茅台"}, ...]
@@ -768,6 +1022,7 @@ def backtest_batch(
         is_skill: 是否为 skill
         max_workers: 并发数
         verbose: 是否输出详细信息
+        timeframe: K 线周期
 
     Returns:
         [VerifyResult, ...]
@@ -776,66 +1031,74 @@ def backtest_batch(
     n_stocks = len(stocks)
     n_dates = len(decision_dates)
     total_tasks = n_stocks * n_dates
+    max_hold = max(int(p.replace("T+", "").replace("T-", "")) for p in periods)
+
+    # ═══════════════════════════════════════════════
+    # 阶段 0: 预加载 K 线数据（一次性批量加载）
+    # ═══════════════════════════════════════════════
+    print(f"  阶段0/2: 预加载 K 线数据...")
+    earliest_date = decision_dates[0] if decision_dates else ""
+    if earliest_date:
+        from datetime import datetime, timedelta
+        # 指标计算需要120天历史 + 持有天数 + 缓冲
+        dt = datetime.strptime(earliest_date, "%Y-%m-%d") - timedelta(days=120 + max_hold + 30)
+        earliest_date = dt.strftime("%Y-%m-%d")
+        print(f"    最早决策日: {decision_dates[0]}, 预加载起点: {earliest_date}")
+
+    stock_codes = [s["code"] for s in stocks]
+    try:
+        preload_bulk_klines(stock_codes, timeframe, earliest_date, "", batch_size=100)
+    except KeyboardInterrupt:
+        print("\n⚠️  用户中断，停止预加载")
+        return all_results
+
+    # ═══════════════════════════════════════════════
+    # 阶段 1: 预测 + 验证（每个样本独立）
+    # ═══════════════════════════════════════════════
+    print(f"  阶段1/1: 预测 + 验证（{total_tasks} 个样本）...")
     completed = 0
+    start_time = time.time()
 
-    # ═══════════════════════════════════════════════
-    # 阶段 1: 每只股票只跑一次预测（结果跨日期复用）
-    # ═══════════════════════════════════════════════
-    print(f"  阶段1/2: 执行预测（{n_stocks} 只股票）...")
-    stock_preds: Dict[str, Dict[str, Any]] = {}
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            fut_map = {}
+            for s in stocks:
+                for dt in decision_dates:
+                    fut = executor.submit(
+                        backtest_single, s["code"], s["name"], dt, tool_name, periods, is_skill
+                    )
+                    fut_map[fut] = (s, dt)
 
-    with ThreadPoolExecutor(max_workers=min(max_workers, n_stocks)) as executor:
-        fut_map = {}
-        for s in stocks:
-            fut = executor.submit(_call_tool_once, s["code"], s["name"], tool_name, is_skill)
-            fut_map[fut] = s["code"]
+            for fut in as_completed(fut_map):
+                s, dt = fut_map[fut]
+                completed += 1
 
-        for fut in as_completed(fut_map):
-            code = fut_map[fut]
-            try:
-                stock_preds[code] = fut.result()
-            except Exception as e:
-                logger.error("预测失败 %s: %s", code, e)
-                stock_preds[code] = {
-                    "score": None, "direction": "", "action": "",
-                    "confidence": 0.0, "raw_output": {}, "error": str(e),
-                }
+                try:
+                    results = fut.result()
+                    all_results.extend(results)
 
-    # ═══════════════════════════════════════════════
-    # 阶段 2: 逐日期验证（只剩 K 线查询，纯 I/O）
-    # ═══════════════════════════════════════════════
-    print(f"  阶段2/2: 验证结果（{total_tasks} 个样本）...")
-    completed = 0
+                    if verbose:
+                        for r in results:
+                            status = "✓" if r.correct else ("✗" if r.correct is False else "·")
+                            print(f"  {status} {r.prediction.stock_code} {r.prediction.decision_date} "
+                                  f"{r.period}: pred={r.prediction.direction} actual={r.actual_direction} "
+                                  f"pnl={r.pnl_pct:+.2f}%")
+                except Exception as e:
+                    logger.error("回测失败 %s %s: %s", s["code"], dt, e)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        fut_map = {}
-        for s in stocks:
-            pd = stock_preds.get(s["code"])
-            if pd is None:
-                continue
-            for dt in decision_dates:
-                fut = executor.submit(_verify_one, s["code"], s["name"], dt, tool_name, pd, periods)
-                fut_map[fut] = (s, dt)
+                # 进度显示（每 200 个样本）
+                if completed % 200 == 0:
+                    elapsed = time.time() - start_time
+                    speed = completed / elapsed if elapsed > 0 else 0
+                    eta = (total_tasks - completed) / speed if speed > 0 else 0
+                    print(f"    进度: {completed}/{total_tasks} ({completed/total_tasks*100:.1f}%) "
+                          f"速度: {speed:.0f} 样本/秒, ETA: {eta:.0f}秒")
+    except KeyboardInterrupt:
+        print(f"\n⚠️  用户中断，已完成 {completed}/{total_tasks} 个样本")
 
-        for fut in as_completed(fut_map):
-            s, dt = fut_map[fut]
-            completed += 1
-
-            try:
-                results = fut.result()
-                all_results.extend(results)
-
-                if verbose:
-                    for r in results:
-                        status = "✓" if r.correct else ("✗" if r.correct is False else "·")
-                        print(f"  {status} {r.prediction.stock_code} {r.prediction.decision_date} "
-                              f"{r.period}: pred={r.prediction.direction} actual={r.actual_direction} "
-                              f"pnl={r.pnl_pct:+.2f}%")
-            except Exception as e:
-                logger.error("回测失败 %s %s: %s", stock["code"], date, e)
-
-            if completed % 100 == 0:
-                print(f"  进度: {completed}/{total_tasks} ({completed/total_tasks*100:.1f}%)")
+    elapsed_total = time.time() - start_time
+    speed = len(all_results) / elapsed_total if elapsed_total > 0 else 0
+    print(f"  完成: {len(all_results)} 条结果, 耗时 {elapsed_total:.1f}s ({speed:.0f} 样本/秒)")
 
     return all_results
 
@@ -995,6 +1258,8 @@ def print_summary(all_stats: List[ToolSkillStats]):
 # ═══════════════════════════════════════════════════════════════
 
 def main():
+    total_start = time.time()
+
     parser = argparse.ArgumentParser(
         description="Tool/Skill 历史回测引擎",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1011,6 +1276,8 @@ def main():
     parser.add_argument("--timeframe", type=str, default="1D",
                         help="K线周期: 1D/15m（默认1D）")
     parser.add_argument("--workers", type=int, default=16, help="并发数（默认16）")
+    parser.add_argument("--sample", type=int, default=0,
+                        help="随机抽样数量（0=全量，>0 时从股票池随机抽取 N 只）")
     parser.add_argument("--verbose", action="store_true", help="输出详细结果")
     parser.add_argument("--output", type=str, help="汇总结果 JSON 文件路径")
     parser.add_argument("--output-dir", type=str, default="backtest_results",
@@ -1033,6 +1300,14 @@ def main():
         stocks = get_random_stocks(count)
     else:
         stocks = get_stock_pool(args.stock_pool)
+
+    # 随机抽样
+    if args.sample > 0 and args.sample < len(stocks):
+        import random
+        random.seed(42)
+        stocks = random.sample(stocks, args.sample)
+        print(f"随机抽样: {args.sample} 只")
+
     print(f"股票数量: {len(stocks)}")
 
     # 生成决策日期
@@ -1060,6 +1335,7 @@ def main():
         results = backtest_batch(
             stocks, decision_dates, tool_name, periods,
             is_skill=False, max_workers=args.workers, verbose=args.verbose,
+            timeframe=args.timeframe,
         )
         elapsed = time.time() - t0
 
@@ -1080,6 +1356,7 @@ def main():
         results = backtest_batch(
             stocks, decision_dates, skill_name, periods,
             is_skill=True, max_workers=args.workers, verbose=args.verbose,
+            timeframe=args.timeframe,
         )
         elapsed = time.time() - t0
 
@@ -1126,6 +1403,7 @@ def main():
                 "tools": tools,
                 "skills": skills,
                 "stock_pool": args.stock_pool,
+                "sample": args.sample,
                 "days": args.days,
                 "periods": periods,
                 "timeframe": args.timeframe,
@@ -1154,6 +1432,40 @@ def main():
         with open(args.output, "w", encoding="utf-8") as f:
             json.dump(output_data, f, ensure_ascii=False, indent=2)
         print(f"\n汇总结果已保存到: {args.output}")
+
+    # 总耗时统计
+    total_elapsed = time.time() - total_start
+    print(f"\n{'='*80}")
+    print(f"回测完成！总耗时: {total_elapsed:.1f}s ({total_elapsed/60:.1f} 分钟)")
+    print(f"{'='*80}")
+
+
+# 捕获 Ctrl+C，确保 ThreadPoolExecutor 能被正确清理
+_original_main = main
+
+def _main_with_signal():
+    """包装 main，支持键盘中断。"""
+    import signal
+
+    def _sigint_handler(signum, frame):
+        print("\n\n⚠️  收到中断信号，正在退出...")
+        # 直接抛出 KeyboardInterrupt，让 ThreadPoolExecutor 清理
+        raise KeyboardInterrupt
+
+    # 注册信号处理器
+    old_handler = signal.signal(signal.SIGINT, _sigint_handler)
+
+    try:
+        _original_main()
+    except KeyboardInterrupt:
+        print("\n回测已中断。")
+    finally:
+        # 恢复原始信号处理器
+        signal.signal(signal.SIGINT, old_handler)
+
+
+if __name__ == "__main__":
+    _main_with_signal()
 
 
 if __name__ == "__main__":
