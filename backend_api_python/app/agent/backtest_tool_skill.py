@@ -50,7 +50,7 @@ import json
 import os
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -72,6 +72,10 @@ logger = get_logger(__name__)
 # K 线内存缓存 key=(stock_code, timeframe) → 前复权后的完整 K 线列表
 # 跨 backtest_single 调用复用，大幅减少 DB 查询
 _kline_cache: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+
+# 日期索引 key=(stock_code, timeframe) → {date_str: index_in_kline_list}
+# 用于 O(1) 查找决策日在 K 线列表中的位置
+_kline_date_index: Dict[Tuple[str, str], Dict[str, int]] = {}
 
 # 批量预加载的 K 线数据 key=(stock_code) → {"1D": [...], "15m": [...]}
 _bulk_kline_cache: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
@@ -118,6 +122,7 @@ class ToolSkillStats:
     wrong_count: int = 0
     neutral_count: int = 0
     win_rate: float = 0.0
+    weighted_accuracy: float = 0.0  # 置信度加权准确率（score越极端权重越高）
     avg_pnl_pct: float = 0.0
     avg_hold_days: float = 0.0
     return_per_day: float = 0.0
@@ -289,9 +294,10 @@ def _get_kline_cached(
     """带进程级缓存的 K 线查询，避免同一股票跨决策日重复查 DB。
 
     缓存策略: key=(stock_code, timeframe)，保留最早起始日期的数据。
-    当请求的 start_date 落在缓存范围内时，直接从内存过滤返回。
+    当请求的 start_date 落在缓存范围内时，直接从内存二分查找返回。
+    同时构建日期索引用于 O(1) 查找。
     """
-    global _kline_cache
+    global _kline_cache, _kline_date_index
     cache_key = (stock_code, timeframe)
 
     if cache_key in _kline_cache:
@@ -299,10 +305,29 @@ def _get_kline_cached(
         if cached and (not start_date or cached[0]["date"][:10] <= start_date[:10]):
             result = cached
             if start_date:
-                result = [k for k in cached if k["date"][:10] >= start_date[:10]]
+                # 二分查找第一个 >= start_date 的位置
+                lo, hi = 0, len(cached)
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    if cached[mid]["date"][:10] < start_date[:10]:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                result = cached[lo:]
             if end_date and result:
-                result = [k for k in result if k["date"][:10] <= end_date[:10]]
+                # 二分查找第一个 > end_date 的位置
+                lo, hi = 0, len(result)
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    if result[mid]["date"][:10] <= end_date[:10]:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                result = result[:lo]
             if result:
+                # 确保日期索引已构建
+                if cache_key not in _kline_date_index:
+                    _build_date_index(cache_key, cached)
                 return result
 
     # 缓存未命中 → 查 DB
@@ -313,10 +338,23 @@ def _get_kline_cached(
     # 保留范围更广的数据（起始日期更早）进缓存
     if cache_key not in _kline_cache:
         _kline_cache[cache_key] = klines
+        _build_date_index(cache_key, klines)
     elif klines and klines[0]["date"] < _kline_cache[cache_key][0]["date"]:
         _kline_cache[cache_key] = klines
+        _build_date_index(cache_key, klines)
 
     return klines
+
+
+def _build_date_index(cache_key: Tuple[str, str], klines: List[Dict[str, Any]]):
+    """为 K 线列表构建日期索引 {date_str: index}，用于 O(1) 查找。"""
+    global _kline_date_index
+    index = {}
+    for i, k in enumerate(klines):
+        d = k["date"][:10]
+        if d not in index:
+            index[d] = i
+    _kline_date_index[cache_key] = index
 
 
 def preload_bulk_klines(
@@ -482,6 +520,9 @@ def preload_bulk_klines(
                     _kline_cache[cache_key] = result
                     loaded += 1
 
+                # 构建日期索引
+                _build_date_index(cache_key, _kline_cache[cache_key])
+
             print(f"    表 {table}: 查询 {len(rows)} 行, 覆盖 {len(stock_data)} 只股票")
 
     print(f"  预加载完成: {loaded}/{total} 只股票")
@@ -554,27 +595,37 @@ def _compute_return_from_klines(
     klines: List[Dict[str, Any]],
     from_date: str,
     hold_days: int,
+    stock_code: str = "",
+    timeframe: str = "1D",
 ) -> Optional[Dict[str, Any]]:
     """从已获取的 K 线数据计算未来 N 天涨跌（避免重复查询 DB）。
 
-    Args:
-        klines: get_kline_from_db 返回的 K 线列表
-        from_date: 决策日 YYYY-MM-DD
-        hold_days: 持有天数
-
-    Returns:
-        {"pnl_pct": 2.5, "hold_days": 3, "direction": "bullish", "exit_date": "2025-01-04"}
+    使用日期索引 O(1) 查找 base_idx，避免线性扫描。
     """
     if not klines or len(klines) < 2:
         return None
 
     base_idx = None
-    for i, k in enumerate(klines):
-        if k["date"][:10] >= from_date:
-            base_idx = i
-            break
 
+    # 优先使用日期索引 O(1)
+    if stock_code:
+        cache_key = (stock_code, timeframe)
+        idx_map = _kline_date_index.get(cache_key)
+        if idx_map:
+            base_idx = idx_map.get(from_date)
+
+    # 回退到二分查找 O(log n)
     if base_idx is None:
+        lo, hi = 0, len(klines)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if klines[mid]["date"][:10] < from_date:
+                lo = mid + 1
+            else:
+                hi = mid
+        base_idx = lo
+
+    if base_idx is None or base_idx >= len(klines):
         return None
 
     exit_idx = min(base_idx + hold_days, len(klines) - 1)
@@ -896,7 +947,7 @@ def backtest_single(
     # 验证每个周期
     for period in periods:
         hold_days = int(period.replace("T+", "").replace("T-", ""))
-        future = _compute_return_from_klines(klines, decision_date, hold_days)
+        future = _compute_return_from_klines(klines, decision_date, hold_days, stock_code, "1D")
 
         vr = VerifyResult(prediction=pred, period=period)
 
@@ -970,7 +1021,7 @@ def _verify_one(
 
     for period in periods:
         hold_days = int(period.replace("T+", "").replace("T-", ""))
-        future = _compute_return_from_klines(klines, date, hold_days)
+        future = _compute_return_from_klines(klines, date, hold_days, code, "1D")
         vr = VerifyResult(prediction=pred, period=period)
 
         if future:
@@ -997,6 +1048,176 @@ def _verify_one(
     return results
 
 
+def _backtest_batch_worker(args: Tuple) -> List[Dict[str, Any]]:
+    """进程池 worker：处理一只股票在所有决策日期的回测。
+
+    每个 worker 进程有独立的内存空间，不存在 GIL 竞争，
+    也不存在 DataSourceFactory 线程安全问题。
+    """
+    import sys as _sys
+    # 确保子进程 stdout/stderr 使用 UTF-8（Windows 默认可能是 GBK）
+    if hasattr(_sys.stdout, 'reconfigure'):
+        try:
+            _sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
+    if hasattr(_sys.stderr, 'reconfigure'):
+        try:
+            _sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
+
+    stock_code, stock_name, decision_dates, tool_name, periods, is_skill, klines_raw = args
+
+    # 重建进程内的 K 线缓存和日期索引
+    global _kline_cache, _kline_date_index
+    _kline_cache = {}
+    _kline_date_index = {}
+    for key_str, klines in klines_raw.items():
+        parts = key_str.split("|", 1)
+        if len(parts) == 2:
+            cache_key = (parts[0], parts[1])
+            _kline_cache[cache_key] = klines
+            # 构建日期索引
+            idx = {}
+            for i, k in enumerate(klines):
+                d = k["date"][:10]
+                if d not in idx:
+                    idx[d] = i
+            _kline_date_index[cache_key] = idx
+
+    results = []
+
+    for date in decision_dates:
+        try:
+            if is_skill:
+                pred = call_skill(tool_name, stock_code, stock_name)
+            else:
+                pred = call_tool(tool_name, stock_code, stock_name, date)
+
+            # 安全序列化 raw_output（移除不可 pickle 的对象）
+            raw = pred.raw_output
+            safe_raw = _sanitize_for_pickle(raw)
+
+            pred_dict = {
+                "score": pred.score,
+                "direction": pred.direction,
+                "action": pred.action,
+                "confidence": pred.confidence,
+                "raw_output": safe_raw,
+                "error": pred.error,
+            }
+
+            if pred.error:
+                for period in periods:
+                    results.append({
+                        "code": stock_code, "name": stock_name, "date": date,
+                        "period": period, "prediction": pred_dict, "verify": None,
+                    })
+                continue
+
+            klines = _get_kline_cached(stock_code, "1D", date)
+
+            for period in periods:
+                hold_days = int(period.replace("T+", "").replace("T-", ""))
+                future = _compute_return_from_klines(klines, date, hold_days, stock_code, "1D")
+
+                verify = None
+                if future:
+                    correct = None
+                    if pred.direction and pred.direction != "neutral":
+                        correct = pred.direction == future["direction"]
+
+                    pnl_pct = 0.0
+                    if pred.action == "buy":
+                        pnl_pct = future["pnl_pct"]
+                    elif pred.action == "sell":
+                        pnl_pct = -future["pnl_pct"]
+
+                    verify = {
+                        "actual_return_pct": future["pnl_pct"],
+                        "actual_direction": future["direction"],
+                        "correct": correct,
+                        "pnl_pct": pnl_pct,
+                    }
+
+                results.append({
+                    "code": stock_code, "name": stock_name, "date": date,
+                    "period": period, "prediction": pred_dict, "verify": verify,
+                })
+        except Exception as e:
+            # 单个日期失败不影响其他日期
+            pred_dict = {
+                "score": None, "direction": "", "action": "",
+                "confidence": 0.0, "raw_output": {}, "error": str(e),
+            }
+            for period in periods:
+                results.append({
+                    "code": stock_code, "name": stock_name, "date": date,
+                    "period": period, "prediction": pred_dict, "verify": None,
+                })
+
+    return results
+
+
+def _sanitize_for_pickle(obj: Any, _depth: int = 0) -> Any:
+    """将对象转换为可 pickle / JSON 安全的格式。
+
+    处理：
+    - datetime → ISO 字符串
+    - bytes → UTF-8 字符串（errors=replace）
+    - Decimal → float
+    - 集合 → list
+    - 嵌套 dict/list 递归处理
+    - 其他不可处理的对象 → str(obj)
+    """
+    if _depth > 10:
+        return str(obj)
+
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+
+    if isinstance(obj, bytes):
+        return obj.decode('utf-8', errors='replace')
+
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+
+    try:
+        from decimal import Decimal
+        if isinstance(obj, Decimal):
+            return float(obj)
+    except ImportError:
+        pass
+
+    if isinstance(obj, dict):
+        return {
+            _sanitize_for_pickle(k, _depth + 1): _sanitize_for_pickle(v, _depth + 1)
+            for k, v in obj.items()
+        }
+
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_pickle(item, _depth + 1) for item in obj]
+
+    if isinstance(obj, set):
+        return [_sanitize_for_pickle(item, _depth + 1) for item in obj]
+
+    # numpy 等特殊对象
+    try:
+        if hasattr(obj, 'tolist'):
+            return obj.tolist()
+        if hasattr(obj, 'item'):
+            return obj.item()
+    except Exception:
+        pass
+
+    # 兜底：转字符串
+    try:
+        return str(obj)
+    except Exception:
+        return "<unserializable>"
+
+
 def backtest_batch(
     stocks: List[Dict[str, str]],
     decision_dates: List[str],
@@ -1007,25 +1228,14 @@ def backtest_batch(
     verbose: bool = False,
     timeframe: str = "1D",
 ) -> List[VerifyResult]:
-    """批量回测（两阶段：预加载K线 → 预测+验证）。
+    """批量回测（多进程版，绕过 GIL）。
 
-    设计说明：
-    - 每个 (股票, 日期) 组合需要独立预测，因为 Tool 可能依赖历史数据
-    - 不同决策日期的历史K线不同，预测结果也不同
-    - 预加载K线数据避免重复DB查询
-
-    Args:
-        stocks: [{"code": "600519", "name": "贵州茅台"}, ...]
-        decision_dates: ["2025-01-01", "2025-01-02", ...]
-        tool_name: tool/skill 名称
-        periods: ["T+1", "T+3", "T+5"]
-        is_skill: 是否为 skill
-        max_workers: 并发数
-        verbose: 是否输出详细信息
-        timeframe: K 线周期
-
-    Returns:
-        [VerifyResult, ...]
+    优化设计：
+    1. ProcessPoolExecutor 绕过 GIL，真正利用多核 CPU
+    2. 每只股票一个任务（而非每个 (stock,date) 一个），减少 IPC 开销
+    3. K 线数据序列化传入子进程，子进程内重建缓存
+    4. 子进程内 DataSourceFactory 独立，无线程安全问题
+    5. 失败时自动回退到串行执行
     """
     all_results = []
     n_stocks = len(stocks)
@@ -1033,14 +1243,10 @@ def backtest_batch(
     total_tasks = n_stocks * n_dates
     max_hold = max(int(p.replace("T+", "").replace("T-", "")) for p in periods)
 
-    # ═══════════════════════════════════════════════
-    # 阶段 0: 预加载 K 线数据（一次性批量加载）
-    # ═══════════════════════════════════════════════
+    # ── 阶段 0: 预加载 K 线数据 ──
     print(f"  阶段0/2: 预加载 K 线数据...")
     earliest_date = decision_dates[0] if decision_dates else ""
     if earliest_date:
-        from datetime import datetime, timedelta
-        # 指标计算需要120天历史 + 持有天数 + 缓冲
         dt = datetime.strptime(earliest_date, "%Y-%m-%d") - timedelta(days=120 + max_hold + 30)
         earliest_date = dt.strftime("%Y-%m-%d")
         print(f"    最早决策日: {decision_dates[0]}, 预加载起点: {earliest_date}")
@@ -1052,49 +1258,93 @@ def backtest_batch(
         print("\n⚠️  用户中断，停止预加载")
         return all_results
 
-    # ═══════════════════════════════════════════════
-    # 阶段 1: 预测 + 验证（每个样本独立）
-    # ═══════════════════════════════════════════════
-    print(f"  阶段1/1: 预测 + 验证（{total_tasks} 个样本）...")
-    completed = 0
+    # ── 阶段 1: 序列化 K 线缓存（主进程 → 子进程）──
+    klines_by_stock = {}
+    for s in stocks:
+        code = s["code"]
+        stock_klines = {}
+        for tf in [timeframe]:
+            key = (code, tf)
+            if key in _kline_cache:
+                stock_klines[f"{code}|{tf}"] = _kline_cache[key]
+        klines_by_stock[code] = stock_klines
+
+    # ── 阶段 2: 多进程预测 + 验证 ──
+    print(f"  阶段1/1: 多进程预测 + 验证（{n_stocks} 只股票 × {n_dates} 天 = {total_tasks} 样本, {max_workers} 进程）...")
+    completed_tasks = 0
+    completed_stocks = 0
     start_time = time.time()
 
+    worker_args = []
+    for s in stocks:
+        code = s["code"]
+        worker_args.append((
+            code, s["name"], decision_dates, tool_name, periods, is_skill,
+            klines_by_stock.get(code, {}),
+        ))
+
+    def _collect_worker_results(worker_results):
+        """将 worker 返回的 dict 列表转为 VerifyResult。"""
+        for wr in worker_results:
+            pred = PredictionResult(
+                stock_code=wr["code"], stock_name=wr["name"],
+                decision_date=wr["date"], tool_name=tool_name,
+                score=wr["prediction"]["score"], direction=wr["prediction"]["direction"],
+                action=wr["prediction"]["action"], confidence=wr["prediction"]["confidence"],
+                raw_output=wr["prediction"]["raw_output"], error=wr["prediction"]["error"],
+            )
+            vr = VerifyResult(prediction=pred, period=wr["period"])
+            v = wr.get("verify")
+            if v:
+                vr.actual_return_pct = v["actual_return_pct"]
+                vr.actual_direction = v["actual_direction"]
+                vr.correct = v["correct"]
+                vr.pnl_pct = v["pnl_pct"]
+            all_results.append(vr)
+
+            if verbose:
+                status = "✓" if vr.correct else ("✗" if vr.correct is False else "·")
+                print(f"  {status} {vr.prediction.stock_code} {vr.prediction.decision_date} "
+                      f"{vr.period}: pred={vr.prediction.direction} actual={vr.actual_direction} "
+                      f"pnl={vr.pnl_pct:+.2f}%")
+
     try:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        actual_workers = min(max_workers, n_stocks)
+        with ProcessPoolExecutor(max_workers=actual_workers) as executor:
             fut_map = {}
-            for s in stocks:
-                for dt in decision_dates:
-                    fut = executor.submit(
-                        backtest_single, s["code"], s["name"], dt, tool_name, periods, is_skill
-                    )
-                    fut_map[fut] = (s, dt)
+            for args in worker_args:
+                fut = executor.submit(_backtest_batch_worker, args)
+                fut_map[fut] = args[0]  # stock_code
 
             for fut in as_completed(fut_map):
-                s, dt = fut_map[fut]
-                completed += 1
+                stock_code = fut_map[fut]
+                completed_stocks += 1
 
                 try:
-                    results = fut.result()
-                    all_results.extend(results)
-
-                    if verbose:
-                        for r in results:
-                            status = "✓" if r.correct else ("✗" if r.correct is False else "·")
-                            print(f"  {status} {r.prediction.stock_code} {r.prediction.decision_date} "
-                                  f"{r.period}: pred={r.prediction.direction} actual={r.actual_direction} "
-                                  f"pnl={r.pnl_pct:+.2f}%")
+                    _collect_worker_results(fut.result())
+                    completed_tasks += n_dates
                 except Exception as e:
-                    logger.error("回测失败 %s %s: %s", s["code"], dt, e)
+                    logger.error("回测失败 %s: %s", stock_code, e)
+                    completed_tasks += n_dates
 
-                # 进度显示（每 200 个样本）
-                if completed % 200 == 0:
+                if completed_stocks % 10 == 0 or completed_stocks == n_stocks:
                     elapsed = time.time() - start_time
-                    speed = completed / elapsed if elapsed > 0 else 0
-                    eta = (total_tasks - completed) / speed if speed > 0 else 0
-                    print(f"    进度: {completed}/{total_tasks} ({completed/total_tasks*100:.1f}%) "
+                    speed = completed_tasks / elapsed if elapsed > 0 else 0
+                    eta = (total_tasks - completed_tasks) / speed if speed > 0 else 0
+                    print(f"    进度: {completed_stocks}/{n_stocks} 只股票 "
+                          f"({completed_tasks}/{total_tasks} 样本, {completed_tasks/total_tasks*100:.1f}%) "
                           f"速度: {speed:.0f} 样本/秒, ETA: {eta:.0f}秒")
     except KeyboardInterrupt:
-        print(f"\n⚠️  用户中断，已完成 {completed}/{total_tasks} 个样本")
+        print(f"\n⚠️  用户中断，已完成 {completed_stocks}/{n_stocks} 只股票")
+    except Exception as e:
+        # ProcessPoolExecutor 可能因 pickle 失败等回退到串行
+        logger.warning("多进程回测失败，回退到串行执行: %s", e)
+        print(f"  ⚠️  多进程失败 ({e})，回退到串行执行...")
+        for args in worker_args:
+            try:
+                _collect_worker_results(_backtest_batch_worker(args))
+            except Exception as e2:
+                logger.error("串行回测失败 %s: %s", args[0], e2)
 
     elapsed_total = time.time() - start_time
     speed = len(all_results) / elapsed_total if elapsed_total > 0 else 0
@@ -1161,6 +1411,26 @@ def calculate_stats(results: List[VerifyResult], tool_name: str, period: str) ->
     if directional > 0:
         stats.win_rate = stats.correct_count / directional
 
+    # 置信度加权准确率
+    # 权重 = |score - 50| / 50，score 越极端权重越高
+    # score=100 或 0 → 权重 1.0；score=50 → 权重 0.0
+    weighted_correct = 0.0
+    weighted_total = 0.0
+    for r in valid_results:
+        if r.correct is None:
+            continue
+        score = r.prediction.score
+        if score is None:
+            continue
+        w = abs(score - 50) / 50.0
+        if w < 0.01:
+            continue  # score≈50 的预测不参与（无方向性）
+        weighted_total += w
+        if r.correct:
+            weighted_correct += w
+    if weighted_total > 0:
+        stats.weighted_accuracy = weighted_correct / weighted_total
+
     # 盈亏统计
     pnl_list = [r.pnl_pct for r in valid_results if r.pnl_pct != 0]
     if pnl_list:
@@ -1221,6 +1491,7 @@ def print_stats(stats: ToolSkillStats):
     print(f"方向错误:     {stats.wrong_count}")
     print(f"方向中性:     {stats.neutral_count}")
     print(f"胜率:         {stats.win_rate:.2%}")
+    print(f"加权准确率:   {stats.weighted_accuracy:.2%}")
     print(f"平均盈亏:     {stats.avg_pnl_pct:+.2f}%")
     print(f"平均持有天数: {stats.avg_hold_days:.1f}")
     print(f"时间收益率:   {stats.return_per_day:+.4f}%/天")
@@ -1240,17 +1511,17 @@ def print_stats(stats: ToolSkillStats):
 
 def print_summary(all_stats: List[ToolSkillStats]):
     """打印汇总表格。"""
-    print(f"\n{'='*80}")
+    print(f"\n{'='*90}")
     print("回测汇总")
-    print(f"{'='*80}")
-    print(f"{'Tool/Skill':<25} {'周期':<8} {'样本':<8} {'胜率':<10} {'平均盈亏':<12} {'时间收益率':<12}")
-    print("-" * 80)
+    print(f"{'='*90}")
+    print(f"{'Tool/Skill':<25} {'周期':<8} {'样本':<8} {'胜率':<10} {'加权准确率':<12} {'平均盈亏':<12} {'时间收益率':<12}")
+    print("-" * 90)
 
     for stats in all_stats:
         high_wr = get_high_win_rate_stocks(stats)
         high_wr_mark = f" [高胜率:{len(high_wr)}只]" if high_wr else ""
         print(f"{stats.name:<25} {stats.period:<8} {stats.valid_samples:<8} "
-              f"{stats.win_rate:<10.2%} {stats.avg_pnl_pct:<+12.2f} {stats.return_per_day:<+12.4f}{high_wr_mark}")
+              f"{stats.win_rate:<10.2%} {stats.weighted_accuracy:<12.2%} {stats.avg_pnl_pct:<+12.2f} {stats.return_per_day:<+12.4f}{high_wr_mark}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1275,7 +1546,7 @@ def main():
                         help="验证周期（默认 T+1,T+3,T+5）")
     parser.add_argument("--timeframe", type=str, default="1D",
                         help="K线周期: 1D/15m（默认1D）")
-    parser.add_argument("--workers", type=int, default=16, help="并发数（默认16）")
+    parser.add_argument("--workers", type=int, default=0, help="并发进程数（默认=CPU核心数）")
     parser.add_argument("--sample", type=int, default=0,
                         help="随机抽样数量（0=全量，>0 时从股票池随机抽取 N 只）")
     parser.add_argument("--verbose", action="store_true", help="输出详细结果")
@@ -1292,6 +1563,11 @@ def main():
     periods = [p.strip() for p in args.periods.split(",") if p.strip()]
     tools = [t.strip() for t in args.tool.split(",")] if args.tool else []
     skills = [s.strip() for s in args.skill.split(",")] if args.skill else []
+
+    # 默认进程数 = CPU 核心数
+    if args.workers <= 0:
+        args.workers = os.cpu_count() or 4
+        print(f"并发进程数: {args.workers}（自动检测 CPU 核心数）")
 
     # 获取股票池
     print(f"获取股票池: {args.stock_pool}")
@@ -1388,6 +1664,7 @@ def main():
                 "total_samples": stats.total_samples,
                 "valid_samples": stats.valid_samples,
                 "win_rate": round(stats.win_rate, 4),
+                "weighted_accuracy": round(stats.weighted_accuracy, 4),
                 "avg_pnl_pct": round(stats.avg_pnl_pct, 4),
                 "return_per_day": round(stats.return_per_day, 6),
                 "high_win_rate_stocks": high_wr,
@@ -1419,6 +1696,7 @@ def main():
                     "wrong_count": s.wrong_count,
                     "neutral_count": s.neutral_count,
                     "win_rate": round(s.win_rate, 4),
+                    "weighted_accuracy": round(s.weighted_accuracy, 4),
                     "avg_pnl_pct": round(s.avg_pnl_pct, 4),
                     "avg_hold_days": round(s.avg_hold_days, 1),
                     "return_per_day": round(s.return_per_day, 6),
@@ -1466,7 +1744,3 @@ def _main_with_signal():
 
 if __name__ == "__main__":
     _main_with_signal()
-
-
-if __name__ == "__main__":
-    main()

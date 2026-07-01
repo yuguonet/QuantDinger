@@ -626,21 +626,24 @@ def _detect_resonance(
     macd_div: str,
     rsi_div: str,
 ) -> Dict[str, Any]:
-    """多指标共振检测。
+    """多重共振检测。
 
-    共振 = 多个不同类别的指标同时指向同一方向，信号可靠度远高于单个指标。
+    共振 = 多个不同类别的指标同时指向同一方向。
+    双重共振 +50% 加成，三重及以上 +100% 加成。
+    共振越多，分数越极端（区分度越高）。
 
-    检测维度：
-    - 趋势+动量共振（MACD+KDJ 同时金叉/死叉）
-    - 趋势+量价共振（MACD方向 + OBV方向一致）
-    - 超买超卖共振（RSI+KDJ+MFI 同时超买/超卖）
-    - 背离共振（MACD+RSI 同时背离）
-    - 均线粘合+动量共振
+    检测维度（6 类）：
+    1. 趋势共振：MACD 金叉/死叉
+    2. 动量共振：KDJ 金叉/死叉
+    3. 超买超卖共振：RSI + KDJ + BOLL
+    4. 背离共振：MACD + RSI 背离
+    5. 均线粘合共振：MA 收敛 + 动量方向
+    6. 乖离率极值共振
     """
+    # 每个维度独立计分（不分正负，最后统一方向）
+    bullish_scores = []  # [(维度名, 基础分)]
+    bearish_scores = []
     signals = []
-    score_adj = 0
-    resonance_type = "无"
-    resonance_detail = ""
 
     # 提取各指标状态
     macd_signals = macd_result.get("signals", []) if isinstance(macd_result, dict) else []
@@ -655,19 +658,23 @@ def _detect_resonance(
     kdj_golden = any("金叉" in s for s in kdj_signals)
     kdj_death = any("死叉" in s for s in kdj_signals)
 
-    # ── 1. MACD + KDJ 同时金叉/死叉（最强共振）──
-    if macd_golden and kdj_golden:
-        signals.append("🔥 MACD+KDJ 同时金叉（强烈看多共振）")
-        score_adj += 15
-        resonance_type = "强多头共振"
-        resonance_detail = "MACD+KDJ双金叉"
-    elif macd_death and kdj_death:
-        signals.append("⚠️ MACD+KDJ 同时死叉（强烈看空共振）")
-        score_adj -= 15
-        resonance_type = "强空头共振"
-        resonance_detail = "MACD+KDJ双死叉"
+    # ── 维度 1: 趋势共振（MACD）──
+    if macd_golden:
+        bullish_scores.append(("趋势", 8))
+        signals.append("MACD金叉（趋势看多）")
+    elif macd_death:
+        bearish_scores.append(("趋势", 8))
+        signals.append("MACD死叉（趋势看空）")
 
-    # ── 2. 超买超卖共振 ──
+    # ── 维度 2: 动量共振（KDJ）──
+    if kdj_golden:
+        bullish_scores.append(("动量", 8))
+        signals.append("KDJ金叉（动量看多）")
+    elif kdj_death:
+        bearish_scores.append(("动量", 8))
+        signals.append("KDJ死叉（动量看空）")
+
+    # ── 维度 3: 超买超卖共振（RSI + KDJ + BOLL）──
     oversold_count = 0
     overbought_count = 0
     if rsi6 <= 30:
@@ -684,76 +691,110 @@ def _detect_resonance(
         overbought_count += 1
 
     if oversold_count >= 3:
-        signals.append("🔥 RSI+KDJ+BOLL 三重超卖共振（强烈看多）")
-        score_adj += 12
-        if resonance_type == "无":
-            resonance_type = "超卖共振"
-            resonance_detail = "RSI+KDJ+BOLL三重超卖"
-    elif overbought_count >= 3:
-        signals.append("⚠️ RSI+KDJ+BOLL 三重超买共振（强烈看空）")
-        score_adj -= 12
-        if resonance_type == "无":
-            resonance_type = "超买共振"
-            resonance_detail = "RSI+KDJ+BOLL三重超买"
+        bullish_scores.append(("超卖", 12))
+        signals.append("🔥 RSI+KDJ+BOLL 三重超卖共振")
     elif oversold_count >= 2:
-        signals.append("RSI+KDJ 双重超卖（看多）")
-        score_adj += 6
+        bullish_scores.append(("超卖", 6))
+        signals.append("RSI+KDJ 双重超卖")
+    elif overbought_count >= 3:
+        bearish_scores.append(("超买", 12))
+        signals.append("⚠️ RSI+KDJ+BOLL 三重超买共振")
     elif overbought_count >= 2:
-        signals.append("RSI+KDJ 双重超买（看空）")
-        score_adj -= 6
+        bearish_scores.append(("超买", 6))
+        signals.append("RSI+KDJ 双重超买")
 
-    # ── 3. 背离共振 ──
+    # ── 维度 4: 背离共振（MACD + RSI）──
     if macd_div == "bullish_div" and rsi_div == "bullish_div":
-        signals.append("🔥 MACD+RSI 双底背离共振（强烈看多）")
-        score_adj += 10
-        if resonance_type == "无":
-            resonance_type = "双底背离共振"
+        bullish_scores.append(("背离", 10))
+        signals.append("🔥 MACD+RSI 双底背离共振")
     elif macd_div == "bearish_div" and rsi_div == "bearish_div":
-        signals.append("⚠️ MACD+RSI 双顶背离共振（强烈看空）")
-        score_adj -= 10
-        if resonance_type == "无":
-            resonance_type = "双顶背离共振"
-    elif macd_div == "bullish_div" or rsi_div == "bullish_div":
-        signals.append("单指标底背离（偏多）")
-        score_adj += 4
-    elif macd_div == "bearish_div" or rsi_div == "bearish_div":
-        signals.append("单指标顶背离（偏空）")
-        score_adj -= 4
+        bearish_scores.append(("背离", 10))
+        signals.append("⚠️ MACD+RSI 双顶背离共振")
+    elif macd_div == "bullish_div":
+        bullish_scores.append(("背离", 4))
+        signals.append("MACD底背离")
+    elif macd_div == "bearish_div":
+        bearish_scores.append(("背离", 4))
+        signals.append("MACD顶背离")
+    elif rsi_div == "bullish_div":
+        bullish_scores.append(("背离", 4))
+        signals.append("RSI底背离")
+    elif rsi_div == "bearish_div":
+        bearish_scores.append(("背离", 4))
+        signals.append("RSI顶背离")
 
-    # ── 4. 均线粘合 + 动量共振 ──
+    # ── 维度 5: 均线粘合共振 ──
     if ma_convergence.get("converged"):
         if kdj_golden or rsi6 < 40:
+            bullish_scores.append(("粘合", 8))
             signals.append("均线粘合+动量偏多，向上变盘概率大")
-            score_adj += 8
         elif kdj_death or rsi6 > 60:
+            bearish_scores.append(("粘合", 8))
             signals.append("均线粘合+动量偏空，向下变盘概率大")
-            score_adj -= 8
         else:
             signals.append("均线粘合，方向待定")
 
-    # ── 5. 趋势+动量背离（趋势强但动量衰减）──
-    if ma_score >= 75 and (kdj_j >= 100 or rsi6 >= 75):
-        signals.append("趋势偏多但动量超买，短期回调风险")
-        score_adj -= 5
-    elif ma_score <= 25 and (kdj_j <= 0 or rsi6 <= 25):
-        signals.append("趋势偏空但动量超卖，短期反弹可能")
-        score_adj += 5
-
-    # ── 6. 乖离率极值 ──
+    # ── 维度 6: 乖离率极值 ──
     if bias_ma20 > 10:
-        signals.append(f"乖离率MA20={bias_ma20}%，严重超涨，回调压力大")
-        score_adj -= 8
+        bearish_scores.append(("乖离", 8))
+        signals.append(f"乖离率MA20={bias_ma20}%，严重超涨")
     elif bias_ma20 > 8:
+        bearish_scores.append(("乖离", 4))
         signals.append(f"乖离率MA20={bias_ma20}%，超涨")
-        score_adj -= 4
     elif bias_ma20 < -10:
-        signals.append(f"乖离率MA20={bias_ma20}%，严重超跌，反弹压力大")
-        score_adj += 8
+        bullish_scores.append(("乖离", 8))
+        signals.append(f"乖离率MA20={bias_ma20}%，严重超跌")
     elif bias_ma20 < -8:
+        bullish_scores.append(("乖离", 4))
         signals.append(f"乖离率MA20={bias_ma20}%，超跌")
-        score_adj += 4
 
-    score_adj = max(-20, min(20, score_adj))  # 限制修正幅度
+    # ── 多重共振加成计算 ──
+    # 统计看多/看空各有多少个维度共振
+    bull_dims = len(bullish_scores)
+    bear_dims = len(bearish_scores)
+
+    # 加成系数：维度越多加成越大
+    if bull_dims >= 4:
+        bull_multiplier = 3.0
+    elif bull_dims >= 3:
+        bull_multiplier = 2.5
+    elif bull_dims >= 2:
+        bull_multiplier = 2.0
+    else:
+        bull_multiplier = 1.0
+
+    if bear_dims >= 4:
+        bear_multiplier = 3.0
+    elif bear_dims >= 3:
+        bear_multiplier = 2.5
+    elif bear_dims >= 2:
+        bear_multiplier = 2.0
+    else:
+        bear_multiplier = 1.0
+
+    bull_total = int(sum(s for _, s in bullish_scores) * bull_multiplier)
+    bear_total = int(sum(s for _, s in bearish_scores) * bear_multiplier)
+
+    score_adj = bull_total - bear_total
+
+    # 确定共振类型
+    resonance_type = "无"
+    resonance_detail = ""
+    if bull_dims >= 3:
+        resonance_type = f"🔥 {bull_dims}重看多共振"
+        resonance_detail = "+".join(n for n, _ in bullish_scores)
+    elif bear_dims >= 3:
+        resonance_type = f"⚠️ {bear_dims}重看空共振"
+        resonance_detail = "+".join(n for n, _ in bearish_scores)
+    elif bull_dims >= 2:
+        resonance_type = "双重看多共振"
+        resonance_detail = "+".join(n for n, _ in bullish_scores)
+    elif bear_dims >= 2:
+        resonance_type = "双重看空共振"
+        resonance_detail = "+".join(n for n, _ in bearish_scores)
+
+    # 最终修正幅度限制
+    score_adj = max(-50, min(50, score_adj))
 
     return {
         "type": resonance_type,
@@ -762,6 +803,8 @@ def _detect_resonance(
         "score_adjustment": score_adj,
         "oversold_count": oversold_count,
         "overbought_count": overbought_count,
+        "bull_dims": bull_dims,
+        "bear_dims": bear_dims,
     }
 
 
@@ -973,7 +1016,6 @@ def analyze_trend(codes: str) -> Dict[str, Any]:
             # ─────────────────────────────────────────────
             # 8. 综合评分（加权 + 共振修正）
             # ─────────────────────────────────────────────
-            # 权重分配：趋势30% + 动量25% + 量能20% + 波动率10% + 均线15%
             base_score = int(
                 ma_score * 0.15 +
                 macd_score * 0.15 +
@@ -1017,17 +1059,27 @@ def analyze_trend(codes: str) -> Dict[str, Any]:
 
             total_score = max(0, min(100, total_score))
 
+            # ── 多重共振过滤：无共振时强制中性 ──
+            # 只有 2 重+共振才给出明确方向，否则判为震荡
+            bull_dims = resonance.get("bull_dims", 0)
+            bear_dims = resonance.get("bear_dims", 0)
+            has_resonance = bull_dims >= 2 or bear_dims >= 2
+
             # ─────────────────────────────────────────────
             # 9. 趋势判定
             # ─────────────────────────────────────────────
-            if total_score >= 80:
+            if not has_resonance:
+                # 无多重共振 → 强制震荡，不给方向
+                overall, strength = "震荡（无共振）", "弱"
+                total_score = 50  # 归中，回测端判为 neutral
+            elif total_score >= 80:
                 overall, strength = "强烈看多", "强"
             elif total_score >= 65:
                 overall, strength = "看多", "中强"
             elif total_score >= 55:
                 overall, strength = "偏多", "中"
             elif total_score >= 45:
-                overall, strength = "震荡", "弱"
+                overall, strength = "偏多", "中"
             elif total_score >= 35:
                 overall, strength = "偏空", "中"
             elif total_score >= 20:
