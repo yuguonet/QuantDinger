@@ -1,18 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-Graph — LangGraph 图定义 + 编译。
+Graph — LangGraph 图定义 + 编译（融合 Agent-Template 基础设施）。
 
 图结构：prepare → planner → agent → finalize
 上下文：LangGraph Checkpointer（PostgreSQL 持久化）
+
+相比旧版改进：
+  - AsyncPostgresSaver（Agent-Template 的 async checkpointer）
+  - graph.ainvoke() / graph.astream() 异步接口
+  - sync 兼容接口（chat / chat_hybrid）保留 Flask 路由可用
+  - smolagents agent.run() → asyncio.to_thread() 包装
 """
 from __future__ import annotations
 
+import asyncio
 import json
-import logging
+
 import os
 from typing import Dict, Optional
 
 from langgraph.graph import StateGraph, END
+from langgraph.types import RetryPolicy
 
 from app.agent.state import AgentState, AgentResult, create_initial_state
 from app.agent.nodes import (
@@ -22,11 +30,15 @@ from app.agent.nodes import (
     finalize_node,
 )
 
-logger = logging.getLogger(__name__)
+from app.agent.log import logger
 
+
+# ═══════════════════════════════════════════════════════════════
+#  Checkpointer
+# ═══════════════════════════════════════════════════════════════
 
 def _build_checkpointer():
-    """构建 PostgreSQL checkpointer，跨重启持久化。"""
+    """构建 checkpointer。无 DATABASE_URL 时用 MemorySaver（同步版，兼容 Flask）。"""
     database_url = os.getenv("DATABASE_URL", "")
 
     if not database_url:
@@ -34,7 +46,7 @@ def _build_checkpointer():
         from langgraph.checkpoint.memory import MemorySaver
         return MemorySaver()
 
-    # 优先: langgraph-checkpoint-postgres（官方包）
+    # 同步 PostgresSaver（兼容 sync/async 上下文，区别于 AsyncPostgresSaver）
     try:
         from langgraph.checkpoint.postgres import PostgresSaver
     except ImportError:
@@ -46,11 +58,14 @@ def _build_checkpointer():
         return MemorySaver()
 
     try:
-        # v3.x: 用 ConnectionPool 直接构造，连接池自动管理连接生命周期
         from psycopg_pool import ConnectionPool
-        pool = ConnectionPool(conninfo=database_url, min_size=2, max_size=10)
+        pool = ConnectionPool(
+            conninfo=database_url,
+            min_size=2,
+            max_size=int(os.getenv("POSTGRES_POOL_SIZE", "10")),
+        )
         saver = PostgresSaver(pool)
-        saver.setup()  # 自动建表
+        saver.setup()  # 自动建表（同步）
         logger.info("[Graph] PostgreSQL checkpointer 就绪")
         return saver
     except Exception as e:
@@ -59,12 +74,16 @@ def _build_checkpointer():
         return MemorySaver()
 
 
+# ═══════════════════════════════════════════════════════════════
+#  图构建
+# ═══════════════════════════════════════════════════════════════
+
 def build_graph() -> StateGraph:
     graph = StateGraph(AgentState)
 
     graph.add_node("prepare", prepare_node)
     graph.add_node("planner", planner_node)
-    graph.add_node("agent", agent_node)
+    graph.add_node("agent", agent_node, retry=RetryPolicy(max_attempts=2))
     graph.add_node("finalize", finalize_node)
 
     graph.set_entry_point("prepare")
@@ -82,25 +101,46 @@ def build_graph() -> StateGraph:
     return graph
 
 
-# ── 全局单例 ─────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+#  全局单例
+# ═══════════════════════════════════════════════════════════════
+
 _app = None
-_checkpointer = _build_checkpointer()
+_checkpointer = None  # 懒初始化，避免模块加载时无 event loop 的问题
+
+
+def _get_checkpointer():
+    """懒初始化 checkpointer（首次调用时构建）。"""
+    global _checkpointer
+    if _checkpointer is None:
+        _checkpointer = _build_checkpointer()
+    return _checkpointer
+
+
+async def setup_checkpointer():
+    """async 兼容接口（同步 setup 已在 _build_checkpointer 内完成）。"""
+    _get_checkpointer()
 
 
 def get_graph_app():
     global _app
     if _app is None:
-        _app = build_graph().compile(checkpointer=_checkpointer)
-        # 启动时清理 7 天前的 checkpointer 数据
+        _app = build_graph().compile(checkpointer=_get_checkpointer())
+        # 清理旧数据（同步版本，兼容启动时调用）
         cleanup_old_checkpoints(days=7)
     return _app
 
 
 def get_checkpointer():
-    return _checkpointer
+    return _get_checkpointer()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Checkpointer 维护
+# ═══════════════════════════════════════════════════════════════
 
 def cleanup_old_checkpoints(days: int = 7) -> int:
-    """清理超过 N 天的 checkpointer session state。返回清理条数。"""
+    """清理超过 N 天的 checkpointer session state。"""
     try:
         import psycopg2
         database_url = os.getenv("DATABASE_URL", "")
@@ -109,7 +149,6 @@ def cleanup_old_checkpoints(days: int = 7) -> int:
         conn = psycopg2.connect(database_url)
         try:
             with conn.cursor() as cur:
-                # langgraph-checkpoint-postgres 的表结构
                 cur.execute("""
                     DELETE FROM checkpoint_writes
                     WHERE thread_id IN (
@@ -136,10 +175,10 @@ def cleanup_old_checkpoints(days: int = 7) -> int:
 
 
 def get_previous_state(session_id: str):
-    """从 checkpointer 读取上一轮的 State。"""
+    """从 checkpointer 读取上一轮的 State（同步兼容）。"""
     try:
         config = {"configurable": {"thread_id": session_id}}
-        snapshot = _checkpointer.get(config)
+        snapshot = _get_checkpointer().get(config)
         if snapshot and snapshot.values:
             return snapshot.values
     except Exception as e:
@@ -156,7 +195,7 @@ def get_session_messages(session_id: str) -> list:
 
 
 def list_checkpointer_sessions(limit: int = 50) -> list:
-    """从 PostgreSQL checkpointer 列出所有会话（按最近更新排序）。"""
+    """从 PostgreSQL checkpointer 列出所有会话。"""
     try:
         import psycopg2
         database_url = os.getenv("DATABASE_URL", "")
@@ -203,7 +242,7 @@ def delete_checkpointer_session(session_id: str) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  公开接口（统一混合模式）
+#  核心执行（同步 — 兼容现有 Flask 路由）
 # ═══════════════════════════════════════════════════════════════
 
 def _create_initial_state(
@@ -268,7 +307,6 @@ def chat_hybrid(
                     for tc in output.get("tool_calls_log", []):
                         yield {"type": "tool_start", "tool": tc.get("tool", "")}
                         yield {"type": "tool_done", "tool": tc.get("tool", ""), "success": tc.get("success", True)}
-                    # 从 step_records 读取，不依赖顶层 step_content
                     _records = output.get("step_records", [])
                     if _records:
                         _sc = _records[-1].get("step_content", "")
@@ -287,12 +325,10 @@ def chat_hybrid(
 
     # ── 最终结果 ──
     if final_state is None:
-        # finalize 未执行到（理论上不会发生）
         yield {"type": "error", "message": "执行异常：finalize 节点未执行"}
         return
 
     final_output = final_state.get("final_output", {})
-    # 避免双重 JSON 序列化：如果 final_output 已经是 str 直接用，否则 json.dumps
     if isinstance(final_output, str):
         content = final_output
     elif isinstance(final_output, dict):
@@ -347,3 +383,55 @@ def chat(
         elif ev["type"] == "error":
             return AgentResult(success=False, error=ev.get("message", ""))
     return result or AgentResult(success=False, error="执行未完成")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  异步接口（FastAPI 用）
+# ═══════════════════════════════════════════════════════════════
+
+async def ainvoke(
+    message: str,
+    session_id: str,
+    context: Optional[Dict] = None,
+    user_id: str = "1",
+    max_loop_steps: int = 10,
+) -> AgentResult:
+    """异步调用（smolagents agent.run() 放线程池执行）。"""
+    app = get_graph_app()
+    initial_state, config = _create_initial_state(
+        message, session_id, user_id, context, max_loop_steps,
+    )
+
+    try:
+        # smolagents agent.run() 是同步阻塞，放线程池
+        final_state = await asyncio.to_thread(_run_graph_sync, app, initial_state, config)
+
+        if final_state is None:
+            return AgentResult(success=False, error="执行未完成")
+
+        final_output = final_state.get("final_output", {})
+        content = json.dumps(final_output, ensure_ascii=False) if isinstance(final_output, dict) else str(final_output or "")
+        if not content:
+            contents = [r.get("step_content", "") for r in final_state.get("step_records", []) if r.get("step_content")]
+            content = "\n\n".join(contents)
+
+        return AgentResult(
+            success=bool(content), content=content,
+            tool_calls_log=final_state.get("tool_calls_log", []),
+            total_steps=final_state.get("total_steps", 0),
+            total_tokens=final_state.get("total_tokens", 0),
+            model="langgraph", charts=final_state.get("charts", []),
+        )
+    except Exception as e:
+        logger.error("[Graph] async 执行失败: %s", e, exc_info=True)
+        return AgentResult(success=False, error=str(e))
+
+
+def _run_graph_sync(app, initial_state, config):
+    """同步执行 graph（在线程池中运行）。"""
+    final_state = None
+    for event in app.stream(initial_state, config=config):
+        for node_name, output in event.items():
+            if node_name == "finalize":
+                final_state = output
+    return final_state

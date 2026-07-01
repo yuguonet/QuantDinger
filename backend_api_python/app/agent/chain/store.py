@@ -16,15 +16,11 @@ root_id 字段冗余存储根节点 id，方便快速查整棵树。
 from __future__ import annotations
 
 import json
-import logging
+from app.agent.log import logger
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
 from app.agent.chain.schema import EvalNode, FactorItem, Layer, Status
-
-logger = logging.getLogger(__name__)
-
-
 def _list_to_pg_array(items: list) -> str:
     """将 Python list 转为 PostgreSQL TEXT[] 格式。
 
@@ -36,8 +32,6 @@ def _list_to_pg_array(items: list) -> str:
         s = str(item).replace("\\", "\\\\").replace('"', '\\"')
         escaped.append(f'"{s}"')
     return "{" + ",".join(escaped) + "}"
-
-
 # ═══════════════════════════════════════════════════════════════
 # 写入
 # ═══════════════════════════════════════════════════════════════
@@ -65,8 +59,6 @@ def save_tree(root: EvalNode) -> Optional[int]:
     except Exception as e:
         logger.error("[Store] 保存决策树失败: %s", e, exc_info=True)
         return None
-
-
 def _save_node(cur, node: EvalNode, parent_id: Optional[int], root_id: Optional[int],
                root_exec_date: Optional[date] = None) -> int:
     """递归保存单个节点及其子节点。"""
@@ -152,8 +144,6 @@ def _save_node(cur, node: EvalNode, parent_id: Optional[int], root_id: Optional[
                    root_exec_date=node.exec_date)
 
     return node_id
-
-
 # ═══════════════════════════════════════════════════════════════
 # 读取
 # ═══════════════════════════════════════════════════════════════
@@ -201,8 +191,6 @@ def load_tree(root_id: int) -> Optional[EvalNode]:
     except Exception as e:
         logger.error("[Store] 读取决策树 root_id=%d 失败: %s", root_id, e)
         return None
-
-
 def _row_to_node(row) -> EvalNode:
     """将数据库行转为 EvalNode。"""
     (id_, parent_id, root_id, layer, name, step_order,
@@ -247,8 +235,6 @@ def _row_to_node(row) -> EvalNode:
         pnl_pct=pnl_pct, hold_days=hold_days,
         correct=correct, calibration=calibration or 1.0,
     )
-
-
 # ═══════════════════════════════════════════════════════════════
 # 查询
 # ═══════════════════════════════════════════════════════════════
@@ -306,8 +292,6 @@ def query_roots(
     except Exception as e:
         logger.error("[Store] 查询根节点失败: %s", e)
         return []
-
-
 def query_pending_verify(days_old: int = 1, limit: int = 100) -> List[Dict[str, Any]]:
     """查询待验证的根节点（exit_date IS NULL 且足够老）。"""
     from app.utils.db import get_db_connection
@@ -339,8 +323,6 @@ def query_pending_verify(days_old: int = 1, limit: int = 100) -> List[Dict[str, 
     except Exception as e:
         logger.error("[Store] 查询待验证节点失败: %s", e)
         return []
-
-
 # ═══════════════════════════════════════════════════════════════
 # 回溯验证写入
 # ═══════════════════════════════════════════════════════════════
@@ -368,8 +350,6 @@ def update_verify_results(
             conn.commit()
     except Exception as e:
         logger.error("[Store] 写入验证结果失败 root_id=%d: %s", root_id, e)
-
-
 def update_skill_verify(root_id: int, actual_direction: str):
     """回溯时逐层验证：更新每个 skill 子节点的 correct。
 
@@ -417,8 +397,6 @@ def update_skill_verify(root_id: int, actual_direction: str):
             conn.commit()
     except Exception as e:
         logger.error("[Store] 更新 skill 验证失败 root_id=%d: %s", root_id, e)
-
-
 # ═══════════════════════════════════════════════════════════════
 # 权重查询
 #
@@ -467,8 +445,6 @@ def query_latest_root(stock_code: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.error("[Store] 查询最近根节点失败 stock=%s: %s", stock_code, e)
         return None
-
-
 def query_latest_root_by_chain(chain_name: str) -> Optional[Dict[str, Any]]:
     """查询某 chain 最近一条根节点 trace（无 stock_code 时使用）。"""
     from app.utils.db import get_db_connection
@@ -502,8 +478,6 @@ def query_latest_root_by_chain(chain_name: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.error("[Store] 查询最近根节点失败 chain=%s: %s", chain_name, e)
         return None
-
-
 def mark_root_wrong(root_id: int):
     """轻度惩罚：标记根节点 correct=False + calibration 重校准。"""
     from app.utils.db import get_db_connection
@@ -523,8 +497,6 @@ def mark_root_wrong(root_id: int):
             logger.info("[Store] 标记 trace root_id=%d correct=False", root_id)
     except Exception as e:
         logger.error("[Store] 标记 trace 失败 root_id=%d: %s", root_id, e)
-
-
 def delete_tree(root_id: int):
     """重度惩罚：删除整棵 trace 树。"""
     from app.utils.db import get_db_connection
@@ -538,8 +510,6 @@ def delete_tree(root_id: int):
             logger.info("[Store] 删除 trace 树 root_id=%d, 共 %d 条", root_id, deleted)
     except Exception as e:
         logger.error("[Store] 删除 trace 树失败 root_id=%d: %s", root_id, e)
-
-
 def get_penalty_count(stock_code: str) -> int:
     """统计某股票最近 trace 的负面反馈次数（human_verdict='negative_feedback'）。"""
     from app.utils.db import get_db_connection
@@ -558,8 +528,6 @@ def get_penalty_count(stock_code: str) -> int:
     except Exception as e:
         logger.warning("[Store] 统计惩罚次数失败: %s", e)
         return 0
-
-
 def get_penalty_count_by_chain(chain_name: str) -> int:
     """统计某 chain 最近 trace 的负面反馈次数（human_verdict='negative_feedback'）。"""
     from app.utils.db import get_db_connection
@@ -578,8 +546,6 @@ def get_penalty_count_by_chain(chain_name: str) -> int:
     except Exception as e:
         logger.warning("[Store] 统计惩罚次数失败 chain=%s: %s", chain_name, e)
         return 0
-
-
 def get_skill_weights() -> Dict[str, float]:
     """从 qd_agent_weights 获取 Skill 权重。"""
     from app.utils.db import get_db_connection
@@ -593,8 +559,6 @@ def get_skill_weights() -> Dict[str, float]:
     except Exception as e:
         logger.warning("[Store] 获取 Skill 权重失败: %s", e)
     return weights
-
-
 def get_factor_weights(skill_name: str = None) -> Dict[str, float]:
     """从 qd_agent_weights 获取因子权重。"""
     from app.utils.db import get_db_connection
@@ -617,8 +581,6 @@ def get_factor_weights(skill_name: str = None) -> Dict[str, float]:
     except Exception as e:
         logger.warning("[Store] 获取因子权重失败: %s", e)
     return weights
-
-
 def query_cached_tools(domain: str, verb: str, noun: str, stock_code: str = None) -> Optional[List[str]]:
     """查询 qd_traces 中已验证的工具序列（编排路径缓存）。
 
@@ -696,8 +658,6 @@ def query_cached_tools(domain: str, verb: str, noun: str, stock_code: str = None
     except Exception as e:
         logger.warning("[Store] 查询缓存工具链失败 %s: %s", chain_name, e)
         return None
-
-
 def query_low_weight_tools(min_appearances: int = 5, max_win_rate: float = 0.4) -> set:
     """聚合 qd_traces，返回低权重工具集合。
 
@@ -737,8 +697,6 @@ def query_low_weight_tools(min_appearances: int = 5, max_win_rate: float = 0.4) 
     except Exception as e:
         logger.warning("[Store] 查询工具权重失败: %s", e)
         return set()
-
-
 def get_eval_stats(chain_id: str = None) -> Dict[str, Any]:
 
     """获取评估统计。"""

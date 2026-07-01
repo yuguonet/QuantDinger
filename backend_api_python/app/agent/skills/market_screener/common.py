@@ -8,16 +8,12 @@ market_screener/common.py
 
 from __future__ import annotations
 
-import logging
+from app.agent.log import logger
 import os
 import sys
 from collections import Counter
 from datetime import datetime, timedelta, date
 from typing import Any, Dict, List, Optional
-
-logger = logging.getLogger(__name__)
-
-
 # ═══════════════════════════════════════════════════════════════
 #  路径与环境
 # ═══════════════════════════════════════════════════════════════
@@ -27,8 +23,6 @@ _backend_root = os.path.normpath(
 )
 if _backend_root not in sys.path:
     sys.path.insert(0, _backend_root)
-
-
 def _load_env():
     try:
         from dotenv import load_dotenv
@@ -41,12 +35,8 @@ def _load_env():
                 break
     except Exception:
         pass
-
-
 _writer_cache = None
 _basic_db_cache = None
-
-
 def _get_writer():
     global _writer_cache
     if _writer_cache is not None:
@@ -55,8 +45,6 @@ def _get_writer():
     from app.utils.db_market import get_market_kline_writer
     _writer_cache = get_market_kline_writer()
     return _writer_cache
-
-
 def _get_basic_db():
     global _basic_db_cache
     if _basic_db_cache is not None:
@@ -65,12 +53,8 @@ def _get_basic_db():
     from app.utils.basicinfo_db import get_stock_basic_db
     _basic_db_cache = get_stock_basic_db()
     return _basic_db_cache
-
-
 def _today_str() -> str:
     return datetime.now().strftime("%Y-%m-%d")
-
-
 # ═══════════════════════════════════════════════════════════════
 #  工具分发
 # ═══════════════════════════════════════════════════════════════
@@ -84,8 +68,6 @@ _TOOL_REGISTRY = {
     "get_indicator_snapshot": get_indicator_snapshot,
     "search_stocks": search_stocks,
 }
-
-
 def call_tool(name: str, **kwargs) -> Any:
     """按名称分发工具调用。"""
     fn = _TOOL_REGISTRY.get(name)
@@ -96,8 +78,6 @@ def call_tool(name: str, **kwargs) -> Any:
     except Exception as e:
         logger.warning("[market_screener] 工具 %s 调用失败: %s", name, e)
         return {"error": str(e)}
-
-
 # ═══════════════════════════════════════════════════════════════
 #  通用数据采集
 # ═══════════════════════════════════════════════════════════════
@@ -119,8 +99,6 @@ def fetch_kline(code: str, days: int = 60) -> List[Dict]:
         return unadj_to_qfq(bars, code)
     except Exception:
         return []
-
-
 def get_limit_pct(code: str, name: str = "") -> float:
     """根据股票代码和名称返回涨跌停幅度。"""
     if "ST" in name.upper():
@@ -132,8 +110,6 @@ def get_limit_pct(code: str, name: str = "") -> float:
     if code.startswith(("8", "4")):
         return 30.0
     return 10.0
-
-
 def is_limit_locked(code: str, name: str, close: float, prev_close: float) -> bool:
     """判断是否涨停封板（买不进去）。"""
     if prev_close <= 0 or close <= 0:
@@ -141,8 +117,6 @@ def is_limit_locked(code: str, name: str, close: float, prev_close: float) -> bo
     limit_pct = get_limit_pct(code, name)
     change_pct = (close - prev_close) / prev_close * 100
     return change_pct >= limit_pct - 0.5
-
-
 def fetch_zt_pool(date: str) -> List[Dict]:
     try:
         from app.market_cn.dragon_limit import get_zt_pool
@@ -150,8 +124,6 @@ def fetch_zt_pool(date: str) -> List[Dict]:
     except Exception as e:
         logger.warning("[MktScreen] 涨停池获取失败: %s", e)
         return []
-
-
 def fetch_dt_pool(date: str) -> List[Dict]:
     try:
         from app.market_cn.dragon_limit import get_dt_pool
@@ -159,8 +131,6 @@ def fetch_dt_pool(date: str) -> List[Dict]:
     except Exception as e:
         logger.warning("[MktScreen] 跌停池获取失败: %s", e)
         return []
-
-
 def fetch_broken_board(date: str) -> List[Dict]:
     try:
         from app.market_cn.dragon_limit import get_broken_board
@@ -168,8 +138,6 @@ def fetch_broken_board(date: str) -> List[Dict]:
     except Exception as e:
         logger.warning("[MktScreen] 炸板池获取失败: %s", e)
         return []
-
-
 def fetch_hot_stocks_with_reason(date: str) -> Dict:
     import requests as _req
     url = (
@@ -199,8 +167,6 @@ def fetch_hot_stocks_with_reason(date: str) -> Dict:
     except Exception as e:
         logger.warning("[MktScreen] 强势股获取失败: %s", e)
         return {"error": str(e)}
-
-
 def fetch_hot_sectors() -> Dict:
     try:
         from app.market_cn.china_market import get_hot_sectors
@@ -208,8 +174,6 @@ def fetch_hot_sectors() -> Dict:
     except Exception as e:
         logger.warning("[MktScreen] 热门板块获取失败: %s", e)
         return {"error": str(e)}
-
-
 # ═══════════════════════════════════════════════════════════════
 #  技术指标计算
 # ═══════════════════════════════════════════════════════════════
@@ -220,8 +184,6 @@ def compute_ma(closes: List[float], period: int) -> List[Optional[float]]:
     for i in range(period - 1, n):
         ma[i] = sum(closes[i - period + 1:i + 1]) / period
     return ma
-
-
 def compute_ema(values: List[float], period: int) -> List[float]:
     n = len(values)
     if n == 0:
@@ -231,8 +193,6 @@ def compute_ema(values: List[float], period: int) -> List[float]:
     for i in range(1, n):
         ema.append(values[i] * k + ema[-1] * (1 - k))
     return ema
-
-
 def compute_macd(closes: List[float]) -> Dict[str, List[float]]:
     ema12 = compute_ema(closes, 12)
     ema26 = compute_ema(closes, 26)
@@ -240,8 +200,6 @@ def compute_macd(closes: List[float]) -> Dict[str, List[float]]:
     dea = compute_ema(dif, 9)
     macd_bar = [2 * (d - e) for d, e in zip(dif, dea)]
     return {"dif": dif, "dea": dea, "macd": macd_bar}
-
-
 def compute_rsi(closes: List[float], period: int = 14) -> List[float]:
     n = len(closes)
     if n < period + 1:
@@ -262,8 +220,6 @@ def compute_rsi(closes: List[float], period: int = 14) -> List[float]:
         al = alpha * max(-d, 0.0) + (1 - alpha) * al
         rsi.append(100.0 if al == 0 else 100.0 - 100.0 / (1.0 + ag / al))
     return rsi
-
-
 def compute_volume_ratio(volumes: List[float], window: int = 5) -> List[float]:
     n = len(volumes)
     vr = [0.0] * n
@@ -272,8 +228,6 @@ def compute_volume_ratio(volumes: List[float], window: int = 5) -> List[float]:
         if avg > 0:
             vr[i] = volumes[i] / avg
     return vr
-
-
 def compute_kdj(bars: List[Dict], period: int = 9) -> Dict[str, List[float]]:
     n = len(bars)
     k_vals = [50.0] * n
@@ -290,8 +244,6 @@ def compute_kdj(bars: List[Dict], period: int = 9) -> Dict[str, List[float]]:
         d_vals[i] = 2 / 3 * d_vals[i - 1] + 1 / 3 * k_vals[i]
         j_vals[i] = 3 * k_vals[i] - 2 * d_vals[i]
     return {"k": k_vals, "d": d_vals, "j": j_vals}
-
-
 def compute_atr(bars: List[Dict], period: int = 14) -> List[float]:
     n = len(bars)
     trs = [0.0] * n
@@ -306,8 +258,6 @@ def compute_atr(bars: List[Dict], period: int = 14) -> List[float]:
         for i in range(period + 1, n):
             atrs[i] = (atrs[i - 1] * (period - 1) + trs[i]) / period
     return atrs
-
-
 # ═══════════════════════════════════════════════════════════════
 #  龙回头弱转强检测（盘中 + 盘后共享）
 # ═══════════════════════════════════════════════════════════════
@@ -321,8 +271,6 @@ def fetch_recent_zt_pools(days: int = 8) -> Dict[str, List[Dict]]:
         if pool:
             pools[d] = pool
     return pools
-
-
 def scan_dragon_pullback(date: str) -> List[Dict]:
     recent_pools = fetch_recent_zt_pools(8)
     code_history: Dict[str, List[Dict]] = {}

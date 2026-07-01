@@ -15,21 +15,13 @@ Planner — LLM 单步决策器。
 from __future__ import annotations
 
 import json
-import logging
+from app.agent.log import logger
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
-
-logger = logging.getLogger(__name__)
-
-
 # ═══════════════════════════════════════════════════════════════
 # 配置
 # ═══════════════════════════════════════════════════════════════
-
-
-
-
 # ═══════════════════════════════════════════════════════════════
 # 数据结构
 # ═══════════════════════════════════════════════════════════════
@@ -47,8 +39,6 @@ class StepResult:
     reasoning: str = ""
     confidence: float = 0.0
     elapsed_ms: float = 0.0
-
-
 def _get_skill_catalog() -> str:
     """从 agent/skills/*/SKILL.md 动态生成技能目录（单一信源）。"""
     from app.agent.semantics import get_all_skill_metas
@@ -73,8 +63,6 @@ def _ensure_skill_catalog() -> str:
     if not _SKILL_CATALOG_CACHE:
         _SKILL_CATALOG_CACHE = _get_skill_catalog()
     return _SKILL_CATALOG_CACHE
-
-
 # ═══════════════════════════════════════════════════════════════
 # Planner
 # ═══════════════════════════════════════════════════════════════
@@ -380,6 +368,4 @@ class Planner:
             if overlap:
                 return f"重复工具: {overlap}，已在前序步骤使用"
         return None
-
-
 

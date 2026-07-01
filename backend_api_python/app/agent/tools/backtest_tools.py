@@ -8,13 +8,9 @@ Wraps BacktestService into Agent-callable tools.
 from __future__ import annotations
 
 import json
-import logging
+from app.agent.log import logger
 from datetime import datetime
 from typing import Any, Dict, List, Optional
-
-
-logger = logging.getLogger(__name__)
-
 # ── 显式依赖检查 ──────────────────────────────────────────────
 try:
     from app.services.strategy import StrategyService

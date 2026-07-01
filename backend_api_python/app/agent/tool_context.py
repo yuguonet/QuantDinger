@@ -17,47 +17,31 @@ Tool Context — 运行时上下文注入。
 from __future__ import annotations
 
 import contextvars
-import logging
+from app.agent.log import logger
 from typing import Any, Callable, Dict, Optional
 
 # Context variable for current tool call context
 _tool_context: contextvars.ContextVar[Dict[str, Any]] = contextvars.ContextVar(
     "tool_context", default={}
 )
-
-logger = logging.getLogger(__name__)
-
-
 def set_tool_context(ctx: Dict[str, Any]):
     """Set the current tool context (called before agent loop)."""
     _tool_context.set(ctx)
-
-
 def get_tool_context() -> Dict[str, Any]:
     """Get the current tool context."""
     return _tool_context.get({})
-
-
 def get_session_id() -> str:
     """Get current session_id from context."""
     return get_tool_context().get("session_id", "")
-
-
 def get_user_id() -> int:
     """Get current user_id from context."""
     return get_tool_context().get("user_id", 1)
-
-
 def get_domain() -> str:
     """Get current domain from context."""
     return get_tool_context().get("domain", "default")
-
-
 def get_progress_callback() -> Optional[Callable]:
     """Get current progress_callback from context (for real-time streaming)."""
     return get_tool_context().get("progress_callback")
-
-
 def emit_progress(event: Dict[str, Any]):
     """Emit a progress event via the current callback (if any)."""
     cb = get_tool_context().get("progress_callback")

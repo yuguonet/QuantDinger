@@ -7,13 +7,9 @@ Sector Analysis Tools — 桥接 market_cn.china_market 到 agent 工具系统�
 """
 from __future__ import annotations
 
-import logging
+from app.agent.log import logger
 import re
 from typing import Any, Dict, List
-
-
-logger = logging.getLogger(__name__)
-
 
 def _to_float(val, default=0.0) -> float:
     """安全转 float，处理 '-' 等异常值。"""
@@ -23,8 +19,6 @@ def _to_float(val, default=0.0) -> float:
         return float(val)
     except (ValueError, TypeError):
         return default
-
-
 def _to_int(val, default=0) -> int:
     """安全转 int，处理 '-' 等异常值。"""
     if val is None:
@@ -33,8 +27,6 @@ def _to_int(val, default=0) -> int:
         return int(float(val))
     except (ValueError, TypeError):
         return default
-
-
 def _fetch_em_hot_sectors(board_type: str, limit: int = 15) -> List[Dict[str, Any]]:
     """从东方财富直接获取热门板块排名（带 BK 代码）。"""
     fs_filter = _BOARD_TYPE_MAP.get(board_type)
@@ -74,8 +66,6 @@ def _fetch_em_hot_sectors(board_type: str, limit: int = 15) -> List[Dict[str, An
     except Exception as e:
         logger.warning("_fetch_em_hot_sectors(%s) 失败: %s", board_type, e)
         return []
-
-
 def get_hot_sectors(industry_limit: int = 15, concept_limit: int = 15) -> Dict[str, Any]:
     """实时热门板块：返回行业+概念板块的涨跌幅排名、涨停家数、领涨股。
 
@@ -114,8 +104,6 @@ def get_hot_sectors(industry_limit: int = 15, concept_limit: int = 15) -> Dict[s
     except Exception as e:
         logger.warning("get_hot_sectors failed: %s", e)
         return {"error": str(e)}
-
-
 def get_sector_trend_analysis(board_type: str = "industry") -> Dict[str, Any]:
     """板块趋势：返回近1月涨跌趋势、6个月周期位置、今日预测信号。
 
@@ -128,8 +116,6 @@ def get_sector_trend_analysis(board_type: str = "industry") -> Dict[str, Any]:
     except Exception as e:
         logger.warning("get_sector_trend_analysis failed: %s", e)
         return {"error": str(e)}
-
-
 def get_sector_history_data(board_type: str = "industry", days: int = 30) -> Dict[str, Any]:
     """板块历史排名：返回板块近N天的每日涨跌幅排名变化。
 
@@ -143,8 +129,6 @@ def get_sector_history_data(board_type: str = "industry", days: int = 30) -> Dic
     except Exception as e:
         logger.warning("get_sector_history_data failed: %s", e)
         return {"error": str(e)}
-
-
 def get_sector_prediction() -> Dict[str, Any]:
     """板块预测：基于资金流+情绪+技术面，预测今日可能走强的板块。"""
     try:
@@ -153,8 +137,6 @@ def get_sector_prediction() -> Dict[str, Any]:
     except Exception as e:
         logger.warning("get_sector_prediction failed: %s", e)
         return {"error": str(e)}
-
-
 def get_sector_cycle(board_type: str = "industry") -> Dict[str, Any]:
     """板块周期：返回板块6个月内的周期位置（高位/低位/上升/下降）。
 
@@ -167,8 +149,6 @@ def get_sector_cycle(board_type: str = "industry") -> Dict[str, Any]:
     except Exception as e:
         logger.warning("get_sector_cycle failed: %s", e)
         return {"error": str(e)}
-
-
 def get_stock_sector_info(codes: str) -> Dict[str, Any]:
     """从本地数据库查询股票所属行业和概念。
 
@@ -218,8 +198,6 @@ def get_stock_sector_info(codes: str) -> Dict[str, Any]:
         except Exception as e:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
-
-
 # 东方财富板块类型与 filter 映射
 _BOARD_TYPE_MAP = {
     "industry": "m:90+t:2",
@@ -228,8 +206,6 @@ _BOARD_TYPE_MAP = {
 
 # 板块名称 → 代码缓存的线程安全存储
 _board_name_cache: Dict[str, Dict[str, str]] = {}
-
-
 def _build_board_name_cache() -> Dict[str, Dict[str, str]]:
     """构建{板块类型: {板块名称: BK代码}}映射缓存。"""
     if _board_name_cache:
@@ -268,8 +244,6 @@ def _build_board_name_cache() -> Dict[str, Dict[str, str]]:
         logger.warning("_build_board_name_cache 初始化失败: %s", e)
 
     return _board_name_cache
-
-
 def _resolve_board_code(name_or_code: str) -> str:
     """将板块名称（如 '玻璃行业'）解析为东方财富板块代码（如 'BK0546'）。"""
     if not name_or_code:
@@ -284,8 +258,6 @@ def _resolve_board_code(name_or_code: str) -> str:
             return mapping[name_or_code]
     logger.warning("_resolve_board_code: 未找到 '%s' 对应 BK 代码", name_or_code)
     return name_or_code
-
-
 def get_sector_stocks(board_code: str = "", board_name: str = "", limit: int = 10) -> List[Dict[str, Any]]:
     """获取板块内强势个股列表。
 

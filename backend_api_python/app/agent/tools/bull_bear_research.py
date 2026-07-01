@@ -1,10 +1,6 @@
 # -*- coding: utf-8 -*-
 """多空研究员 — 同时构建多头和空头论据，综合判断方向。"""
 from typing import Any, Dict, List
-
-logger = logging.getLogger(__name__)
-
-
 def bull_bear_research(stock_code: str, stock_name: str = "") -> Dict[str, Any]:
     """多空研究：对单只股票做技术面+筹码+情报综合分析，返回多空评分和方向判断。
 
@@ -173,8 +169,6 @@ def bull_bear_research(stock_code: str, stock_name: str = "") -> Dict[str, Any]:
             "data": data,
         },
     }
-
-
 # ── 内联自 analysis_tools.py ──
 
 def _analyze_trend(codes: str) -> Dict[str, Any]:
@@ -696,8 +690,6 @@ def _get_indicator_snapshot(codes: str) -> Dict[str, Any]:
         except Exception as e:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
-
-
 # ── 内联自 news_search_tools.py ──
 
 def _get_policy_from_cache() -> List[Dict[str, Any]]:

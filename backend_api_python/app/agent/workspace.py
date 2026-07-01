@@ -25,7 +25,7 @@ Code Workspace — 每会话隔离的持久化文件存储。
 from __future__ import annotations
 
 import json
-import logging
+from app.agent.log import logger
 import os
 import re
 import shutil
@@ -33,8 +33,6 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
-logger = logging.getLogger(__name__)
 
 # ── Configuration ──────────────────────────────────────────────
 WORKSPACE_ROOT = os.getenv(
@@ -45,8 +43,6 @@ MAX_FILE_SIZE = int(os.getenv("AGENT_WORKSPACE_MAX_FILE_SIZE", str(5 * 1024 * 10
 MAX_FILES_PER_SESSION = int(os.getenv("AGENT_WORKSPACE_MAX_FILES", "100"))
 MAX_WORKSPACE_AGE_HOURS = int(os.getenv("AGENT_WORKSPACE_MAX_AGE_HOURS", "72"))
 CLEANUP_INTERVAL = int(os.getenv("AGENT_WORKSPACE_CLEANUP_INTERVAL", "3600"))
-
-
 class CodeWorkspace:
     """Manages a single session's code workspace."""
 
@@ -398,8 +394,6 @@ class CodeWorkspace:
                 parts.append(f"  - {o['name']} ({o['size']}B)")
 
         return "\n".join(parts) if parts else "工作区为空"
-
-
 # ── Project Templates ──────────────────────────────────────────
 
 TEMPLATES: Dict[str, Dict[str, str]] = {
@@ -628,8 +622,6 @@ if not df.empty:
         },
     },
 }
-
-
 def apply_template(session_id: str, template_name: str) -> Dict[str, Any]:
     """Apply a project template to a workspace.
 
@@ -661,8 +653,6 @@ def apply_template(session_id: str, template_name: str) -> Dict[str, Any]:
         "created_scripts": created,
         "workspace": str(ws.session_dir),
     }
-
-
 def list_templates() -> List[Dict[str, str]]:
     """List available project templates."""
     return [
@@ -670,14 +660,10 @@ def list_templates() -> List[Dict[str, str]]:
          "scripts": list(v.get("scripts", {}).keys())}
         for k, v in TEMPLATES.items()
     ]
-
-
 # ── Cleanup ────────────────────────────────────────────────────
 
 _cleanup_timer: Optional[threading.Timer] = None
 _cleanup_lock = threading.Lock()
-
-
 def cleanup_expired_workspaces(root: str = None, max_age_hours: int = None):
     """Remove workspaces older than max_age_hours."""
     root = Path(root or WORKSPACE_ROOT).resolve()
@@ -698,8 +684,6 @@ def cleanup_expired_workspaces(root: str = None, max_age_hours: int = None):
     if cleaned:
         logger.info("Cleaned up %d expired workspaces", cleaned)
     return cleaned
-
-
 def start_cleanup_scheduler():
     """Start periodic cleanup of expired workspaces."""
     global _cleanup_timer
@@ -725,8 +709,6 @@ def start_cleanup_scheduler():
         _schedule_next()
         logger.info("Workspace cleanup scheduler started (interval=%ds, max_age=%dh)",
                      CLEANUP_INTERVAL, MAX_WORKSPACE_AGE_HOURS)
-
-
 def stop_cleanup_scheduler():
     """Stop the cleanup scheduler."""
     global _cleanup_timer
@@ -734,48 +716,34 @@ def stop_cleanup_scheduler():
         if _cleanup_timer is not None:
             _cleanup_timer.cancel()
             _cleanup_timer = None
-
-
 # ── Helpers ────────────────────────────────────────────────────
 
 def _safe_session_id(session_id: str) -> str:
     """Sanitize session ID for use as directory name."""
     safe = re.sub(r"[^a-zA-Z0-9_\-.]", "_", session_id)
     return safe[:64] or "default"
-
-
 def _sanitize_filename(name: str) -> str:
     """Sanitize filename to prevent path traversal."""
     name = os.path.basename(name)
     name = re.sub(r"[^a-zA-Z0-9_\-.]", "_", name)
     return name[:128] or "unnamed"
-
-
 def _versioned_filename(name: str, version: int) -> str:
     """Generate a versioned filename."""
     return f"{name}.v{version}"
-
-
 def _base_name(versioned: str) -> str:
     """Extract base name from a versioned filename."""
     m = re.match(r"^(.+?)\.v\d+$", versioned)
     return m.group(1) if m else versioned
-
-
 def _count_lines(path: Path) -> int:
     """Count lines in a file."""
     try:
         return len(path.read_text(encoding="utf-8").split("\n"))
     except Exception:
         return 0
-
-
 # ── Singleton access ───────────────────────────────────────────
 
 _workspaces: Dict[str, CodeWorkspace] = {}
 _lock = threading.Lock()
-
-
 def get_workspace(session_id: str = "", user_id: int = 0, domain: str = "") -> CodeWorkspace:
     """Get or create a workspace with per-user, per-domain isolation.
 

@@ -6,12 +6,8 @@ Dragon Tools — 龙虎榜/涨跌停/热榜。
 """
 from __future__ import annotations
 
-import logging
+from app.agent.log import logger
 from typing import Any, Dict, List
-
-logger = logging.getLogger(__name__)
-
-
 def get_dragon_tiger(codes: str = "", date: str = "", days: int = 30) -> Dict[str, Any]:
     """龙虎榜：返回上榜股票的买卖金额、上榜原因（涨幅/跌幅/换手异常等）、日期。
 
@@ -63,8 +59,6 @@ def get_dragon_tiger(codes: str = "", date: str = "", days: int = 30) -> Dict[st
         except Exception as e:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
-
-
 def get_hot_rank(top_n: int = 30) -> Dict[str, Any]:
     """人气榜：返回当日市场关注度最高的股票排名及热度分数。
 
@@ -75,8 +69,6 @@ def get_hot_rank(top_n: int = 30) -> Dict[str, Any]:
     top_n = min(max(int(top_n or 30), 1), 100)
     data = _get()
     return {"count": len(data[:top_n]), "stocks": data[:top_n]}
-
-
 def get_limit_pool(date: str = "", pool_type: str = "zt", min_continuous_days: int = 0) -> Dict[str, Any]:
     """涨跌停池：返回当日涨停/跌停/炸板股票列表，含封板时间、连板天数。
 

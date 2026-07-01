@@ -7,7 +7,7 @@ Screener Tools — Agent 选股工具。
 """
 from __future__ import annotations
 
-import logging
+from app.agent.log import logger
 from typing import Any, Dict, List, Optional
 
 from app.agent.tools.screener_config import (
@@ -15,8 +15,6 @@ from app.agent.tools.screener_config import (
     CONCEPT_OPTIONS,
     MARKET_FILTER_MAP,
 )
-
-logger = logging.getLogger(__name__)
 
 # ══════════════════════════════════════════════════════════════
 #  东方财富 API 调用 (正本: eastmoney_search.py)
@@ -462,8 +460,6 @@ def build_keyword_from_filters(filters: Dict[str, Any]) -> str:
             parts.append(pledge_map[k])
 
     return "; ".join(parts)
-
-
 def get_screener_presets() -> Dict[str, Any]:
     """选股条件列表：返回所有可用筛选条件的分类、字段名、示例值。"""
     return {
@@ -502,8 +498,6 @@ def get_screener_presets() -> Dict[str, Any]:
             "也可直接用自然语言描述",
         ],
     }
-
-
 # ══════════════════════════════════════════════════════════════
 #  工具声明
 # ══════════════════════════════════════════════════════════════

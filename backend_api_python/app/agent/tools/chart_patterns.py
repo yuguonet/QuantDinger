@@ -7,7 +7,7 @@ Chart pattern recognition — 经典图表形态 + 缠论 + OBV 量价分析。
 """
 from __future__ import annotations
 
-import logging
+from app.agent.log import logger
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.agent.tools.analysis_tools import (
@@ -16,8 +16,6 @@ from app.agent.tools.analysis_tools import (
     _safe_round,
     _calc_obv,
 )
-
-logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════════
 # 枢轴点与线性拟合
@@ -55,8 +53,6 @@ def _find_pivots(highs: List[float], lows: List[float],
             troughs.append((i, lows[i]))
 
     return peaks, troughs
-
-
 def _fit_line(points: List[Tuple[int, float]]) -> Tuple[float, float]:
     """对一组 (index, price) 做最小二乘线性拟合，返回 (slope, intercept)。"""
     if len(points) < 2:
@@ -72,19 +68,13 @@ def _fit_line(points: List[Tuple[int, float]]) -> Tuple[float, float]:
     slope = (n * sxy - sx * sy) / denom
     intercept = (sy - slope * sx) / n
     return slope, intercept
-
-
 def _line_value(slope: float, intercept: float, x: int) -> float:
     return slope * x + intercept
-
-
 def _price_near(price: float, target: float, tolerance_pct: float = 3.0) -> bool:
     """判断 price 是否在 target 的 tolerance_pct% 范围内。"""
     if target == 0:
         return False
     return abs(price - target) / abs(target) * 100 <= tolerance_pct
-
-
 # ═══════════════════════════════════════════════════════════════
 # 缠论基础：顶底分型 + 笔
 # ═══════════════════════════════════════════════════════════════
@@ -188,8 +178,6 @@ def _detect_chan_fractals(highs: List[float], lows: List[float],
         "stroke_count": len(strokes),
         "recent_strokes": strokes[-3:] if len(strokes) >= 3 else strokes,
     }
-
-
 # ═══════════════════════════════════════════════════════════════
 # Tool 函数
 # ═══════════════════════════════════════════════════════════════
@@ -435,8 +423,6 @@ def analyze_chart_patterns(codes: str) -> Dict[str, Any]:
         except Exception as e:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
-
-
 def get_obv_analysis(codes: str) -> Dict[str, Any]:
     """OBV（能量潮）量价分析：返回 OBV 值、趋势、与价格的背离检测。
 

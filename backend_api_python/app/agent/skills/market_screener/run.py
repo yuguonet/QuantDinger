@@ -17,13 +17,9 @@ A股全市场短线选股 — 入口 + 策略调度。
 
 from __future__ import annotations
 
-import logging
+from app.agent.log import logger
 from datetime import datetime, date
 from typing import Any, Dict
-
-logger = logging.getLogger(__name__)
-
-
 # ═══════════════════════════════════════════════════════════════
 #  策略调度
 # ═══════════════════════════════════════════════════════════════
@@ -43,8 +39,6 @@ def _select_strategy() -> str:
     if h == 14 and m >= 30:
         return "eod"
     return "post_market"
-
-
 # ═══════════════════════════════════════════════════════════════
 #  Phase 1 — 预筛选
 # ═══════════════════════════════════════════════════════════════
@@ -81,8 +75,6 @@ def pre_screen() -> Dict[str, Any]:
 
     result["strategy"] = strategy
     return result
-
-
 # ═══════════════════════════════════════════════════════════════
 #  Phase 2 — 深入分析
 # ═══════════════════════════════════════════════════════════════
@@ -205,8 +197,6 @@ def deep_analyze(prescreen_result: Dict[str, Any]) -> Dict[str, Any]:
         output["output_data"] = {}
 
     return output
-
-
 # ═══════════════════════════════════════════════════════════════
 #  主入口
 # ═══════════════════════════════════════════════════════════════

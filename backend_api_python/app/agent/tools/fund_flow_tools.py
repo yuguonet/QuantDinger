@@ -7,12 +7,8 @@ Fund Flow Tools — 资金流向（个股/板块/大盘）。
 """
 from __future__ import annotations
 
-import logging
+from app.agent.log import logger
 from typing import Any, Dict, List
-
-logger = logging.getLogger(__name__)
-
-
 def get_fund_flow(stock_codes: str = "") -> Dict[str, Any]:
     """个股资金流向：返回主力/散户/净流入金额、资金流向趋势。
 
@@ -33,8 +29,6 @@ def get_fund_flow(stock_codes: str = "") -> Dict[str, Any]:
             results[code] = {"error": str(e)}
 
     return {"count": len(results), "data": results}
-
-
 def get_sector_fund_flow(indicator: str = "今日") -> Dict[str, Any]:
     """行业资金流向：返回各行业板块主力资金净流入排名。
 
@@ -48,8 +42,6 @@ def get_sector_fund_flow(indicator: str = "今日") -> Dict[str, Any]:
     except Exception as e:
         logger.warning("get_sector_fund_flow failed: %s", e)
         return {"error": str(e)}
-
-
 def get_concept_fund_flow(indicator: str = "今日") -> Dict[str, Any]:
     """概念资金流向：返回各概念板块主力资金净流入排名。
 
@@ -63,8 +55,6 @@ def get_concept_fund_flow(indicator: str = "今日") -> Dict[str, Any]:
     except Exception as e:
         logger.warning("get_concept_fund_flow failed: %s", e)
         return {"error": str(e)}
-
-
 def get_fund_flow_daily(codes: str, days: int = 120) -> Dict[str, Any]:
     """个股历史资金流向：返回近N天每日主力/散户净流入金额。
 
@@ -94,8 +84,6 @@ def get_fund_flow_daily(codes: str, days: int = 120) -> Dict[str, Any]:
         except Exception as e:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
-
-
 def get_market_fund_flow() -> Dict[str, Any]:
     """大盘资金流向：返回全市场主力/散户实时净流入金额。"""
     from app.market_cn.index import get_market_fund_flow_realtime as _get
@@ -104,8 +92,6 @@ def get_market_fund_flow() -> Dict[str, Any]:
     except Exception as e:
         logger.warning("get_market_fund_flow failed: %s", e)
         return {"error": str(e)}
-
-
 def get_northbound_flow() -> Dict[str, Any]:
     """北向资金：返回沪股通/深股通当日实时净买入金额。"""
     from app.market_cn.index import get_northbound_realtime as _get

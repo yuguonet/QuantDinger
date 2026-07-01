@@ -10,20 +10,14 @@ def _strip_prefix(s):
     return strip_market_prefix(s)
 
 import json
-import logging
+from app.agent.log import logger
 import re
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List
 
 import requests
-
-
-logger = logging.getLogger(__name__)
-
 _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-
-
 
 # ══════════════════════════════════════════════════════════════
 # 研报评级
@@ -85,8 +79,6 @@ def get_consensus_eps(codes: str) -> Dict[str, Any]:
         except Exception as e:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
-
-
 # ══════════════════════════════════════════════════════════════
 # 个股新闻
 # ══════════════════════════════════════════════════════════════
@@ -154,8 +146,6 @@ def get_eastmoney_stock_news(codes: str, page_size: int = 20) -> Dict[str, Any]:
         except Exception as e:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
-
-
 # ══════════════════════════════════════════════════════════════
 # 全球财经资讯
 # ══════════════════════════════════════════════════════════════
@@ -194,6 +184,4 @@ def get_global_finance_news(page_size: int = 30) -> Dict[str, Any]:
     except Exception as e:
         logger.warning("get_global_finance_news failed: %s", e)
         return {"error": str(e)}
-
-
 

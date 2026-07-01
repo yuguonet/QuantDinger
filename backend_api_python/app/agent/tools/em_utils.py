@@ -6,21 +6,17 @@
 """
 from __future__ import annotations
 
-import logging
+from app.agent.log import logger
 import os
 import time
 from typing import Any, Dict, List
 
 import requests
 
-logger = logging.getLogger(__name__)
-
 _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 _DATACENTER_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 _EM_MIN_INTERVAL = float(os.getenv("EM_MIN_INTERVAL", "1.0"))
 _last_call: float = 0.0
-
-
 def em_datacenter(report_name: str, columns: str = "ALL",
                   filter_str: str = "", page_size: int = 50,
                   sort_columns: str = "", sort_types: str = "-1") -> list:

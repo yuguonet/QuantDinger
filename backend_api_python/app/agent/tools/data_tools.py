@@ -6,12 +6,10 @@ Wraps DataSourceFactory into OpenAI-function-callable tools.
 from __future__ import annotations
 
 import json
-import logging
+from app.agent.log import logger
 from typing import Any, Dict, List, Optional
 
-
-logger = logging.getLogger(__name__)
-
+from app.agent.cache import cache
 def _get_ds(market: str = "CNStock"):
     from app.data_sources.factory import DataSourceFactory
     return DataSourceFactory.get_source(market)
@@ -158,8 +156,6 @@ _STOCK_INFO_CORE_FIELDS = {
     "turnover_pct", "vol_ratio",
     "list_date", "main_business",
 }
-
-
 def _filter_stock_info(info: Dict[str, Any], detail: bool = False) -> Dict[str, Any]:
     """过滤股票信息，去除 None 值；非 detail 模式只保留核心字段。"""
     if not isinstance(info, dict):
@@ -167,10 +163,6 @@ def _filter_stock_info(info: Dict[str, Any], detail: bool = False) -> Dict[str, 
     if detail:
         return {k: v for k, v in info.items() if v is not None}
     return {k: v for k, v in info.items() if v is not None and k in _STOCK_INFO_CORE_FIELDS}
-
-
-
-
 
 def get_stock_info(codes: str, detail: bool = False) -> Dict[str, Any]:
     """股票基本信息（精简模式，节省 token）。
@@ -186,6 +178,13 @@ def get_stock_info(codes: str, detail: bool = False) -> Dict[str, Any]:
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
+
+    # 缓存检查（精简模式缓存 60s，detail 不缓存）
+    _ck = f"stock_info:{','.join(sorted(code_list))}:{detail}"
+    if not detail:
+        _hit = cache.get(_ck)
+        if _hit is not None:
+            return _hit
 
     def _one(stock_code: str) -> Dict[str, Any]:
         market = _detect_market(stock_code) or "CNStock"
@@ -298,7 +297,10 @@ def get_stock_info(codes: str, detail: bool = False) -> Dict[str, Any]:
         return result
 
     if len(code_list) == 1:
-        return _filter_stock_info(_one(code_list[0]), detail)
+        result = _filter_stock_info(_one(code_list[0]), detail)
+        if not detail and not result.get("error"):
+            cache.set(_ck, result, ttl=60)
+        return result
 
     results = {}
     for code in code_list:
@@ -306,5 +308,8 @@ def get_stock_info(codes: str, detail: bool = False) -> Dict[str, Any]:
             results[code] = _filter_stock_info(_one(code), detail)
         except Exception as e:
             results[code] = {"error": str(e)}
-    return {"count": len(results), "data": results}
+    final = {"count": len(results), "data": results}
+    if not detail:
+        cache.set(_ck, final, ttl=60)
+    return final
 

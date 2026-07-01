@@ -20,15 +20,11 @@ Intent Analyzer — LLM 意图分类 + 上下文压缩（v4，精简版）。
 from __future__ import annotations
 
 import json
-import logging
+from app.agent.log import logger
 import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
-
-logger = logging.getLogger(__name__)
-
-
 @dataclass
 class IntentResult:
     """意图分析结果。"""
@@ -85,8 +81,6 @@ class IntentResult:
             return "\n".join(parts)
         except Exception:
             return ""
-
-
 # ═══════════════════════════════════════════════════════════════
 # LLM 意图分类 + 上下文压缩
 # ═══════════════════════════════════════════════════════════════
@@ -108,8 +102,6 @@ def _ensure_intent_loaded():
     global _INTENT_PROMPT
     if not _INTENT_PROMPT:
         _INTENT_PROMPT = _load_intent_config()
-
-
 def _call_llm_for_intent(
     message: str,
     context_summary: str = "",
@@ -154,9 +146,8 @@ def _call_llm_for_intent(
 
     # 清理输出
     raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
+    logger.info("[Intent] 清理后 LLM 输出: %s", raw[:300])
     return _parse_intent_json(raw)
-
-
 def _parse_intent_json(raw: str) -> Dict[str, Any]:
     """从 LLM 输出中提取 JSON。容错处理。"""
     # 先用共享的 extract_json 尝试
@@ -180,13 +171,35 @@ def _parse_intent_json(raw: str) -> Dict[str, Any]:
             except (json.JSONDecodeError, TypeError):
                 continue
 
-    # 完全解析失败 → 默认 chat
+    # 完全解析失败 → 关键词降级（不走 chat，避免丢失分析意图）
     logger.warning("[Intent] LLM 输出解析失败: %s", raw[:200])
-    return {"domain": "chat", "intent": "general", "verb": "", "noun": "",
-            "stock_code": "", "stock_name": "", "confidence": 0.3,
-            "context_summary": ""}
+    return _keyword_fallback(message)
 
 
+def _keyword_fallback(message: str) -> Dict[str, Any]:
+    """JSON 解析失败时，用关键词推断意图。"""
+    import re
+    msg = message.strip()
+
+    # 股票相关关键词 → finance
+    _finance_kw = ["分析", "走势", "行情", "涨", "跌", "技术面", "基本面",
+                   "K线", "均线", "MACD", "RSI", "PE", "PB", "估值",
+                   "板块", "概念", "资金流", "北向", "龙虎榜", "筹码"]
+    _trade_kw = ["买入", "卖出", "建仓", "清仓", "止损", "止盈", "仓位"]
+    _query_kw = ["查", "看", "多少", "价格", "代码"]
+
+    if any(kw in msg for kw in _trade_kw):
+        return {"domain": "trading", "intent": msg[:50], "verb": "trade", "noun": "",
+                "stock_code": "", "stock_name": "", "confidence": 0.5, "context_summary": ""}
+    if any(kw in msg for kw in _finance_kw):
+        return {"domain": "finance", "intent": msg[:50], "verb": "analyze", "noun": "",
+                "stock_code": "", "stock_name": "", "confidence": 0.5, "context_summary": ""}
+    if any(kw in msg for kw in _query_kw):
+        return {"domain": "finance", "intent": msg[:50], "verb": "query", "noun": "",
+                "stock_code": "", "stock_name": "", "confidence": 0.4, "context_summary": ""}
+
+    return {"domain": "chat", "intent": "general", "verb": "chat", "noun": "",
+            "stock_code": "", "stock_name": "", "confidence": 0.3, "context_summary": ""}
 def _validate_intent(data: Dict[str, Any]) -> Dict[str, Any]:
     """校验并修正 LLM 输出的字段。"""
     valid_domains = {"finance", "coding", "trading", "system", "unknown", "chat"}
@@ -217,8 +230,6 @@ def _validate_intent(data: Dict[str, Any]) -> Dict[str, Any]:
         data[key] = str(data.get(key, "") or "")
 
     return data
-
-
 # ═══════════════════════════════════════════════════════════════
 # 主入口
 # ═══════════════════════════════════════════════════════════════
@@ -326,5 +337,3 @@ def analyze_intent(
         context_summary=new_summary,
         strategy=strategy,
     )
-
-

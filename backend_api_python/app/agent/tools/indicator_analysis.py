@@ -1,14 +1,10 @@
 # -*- coding: utf-8 -*-
 """用户指标策略分析 — 沙箱执行+信号衰减+冲突检测+历史胜率加权。"""
 
-import logging
+from app.agent.log import logger
 from typing import Any, Dict, List, Optional
 
 from app.agent.tools.indicator_tools import run_indicator_signal
-
-logger = logging.getLogger(__name__)
-
-
 def indicator_analysis(stock_code: str, stock_name: str = "", user_id: int = 1) -> Dict[str, Any]:
     """指标策略批量分析：对多只股票执行用户自定义指标策略，返回每只股票的最新信号(buy/sell)和评分。
 
@@ -173,8 +169,6 @@ def indicator_analysis(stock_code: str, stock_name: str = "", user_id: int = 1) 
             "no_signal": [e["name"] for e in no_signal],
         },
     }
-
-
 # ═══════════════════════════════════════════════════════════════
 # 单指标评估
 # ═══════════════════════════════════════════════════════════════
@@ -302,16 +296,12 @@ def _evaluate_indicator(indicator_id: int, stock_code: str, user_id: int) -> Opt
         "sell_count": signal_stats.get("sell_count", 0),
         "avg_hold_bars": signal_stats.get("avg_hold_bars", 0),
     }
-
-
 def _bar_decay(days_ago: int) -> float:
     """按信号出现的天数返回衰减系数。
 
     今天(0)=1.0, 昨天(1)=0.95, 前天(2)=0.90, 3天前=0.85, 4天前=0.80
     """
     return max(0.70, 1.0 - days_ago * 0.05)
-
-
 # ═══════════════════════════════════════════════════════════════
 # 评分计算
 # ═══════════════════════════════════════════════════════════════
@@ -382,14 +372,10 @@ def _calc_signal_score(ev: Dict[str, Any], signal_type: str) -> tuple:
     label = f"胜率{win_rate:.0%} 收益{total_return:+.1f}% {trades}笔 {price_str}"
 
     return base_score, confidence, label
-
-
 def _avg_win_rate(evaluated: List[Dict]) -> float:
     """计算所有指标的平均胜率（有回测数据的）。"""
     rates = [e["win_rate"] for e in evaluated if e.get("trades", 0) >= 2]
     return sum(rates) / len(rates) if rates else 0.0
-
-
 # ═══════════════════════════════════════════════════════════════
 # 辅助函数
 # ═══════════════════════════════════════════════════════════════
@@ -401,8 +387,6 @@ def _neutral(signal: str, analysis: str) -> Dict[str, Any]:
         "confidence": 0.3, "signal": signal, "factors": [],
         "analysis": analysis, "status": "ok",
     }
-
-
 def _build_no_signal_factors(evaluated: List[Dict]) -> List[Dict]:
     """构建无信号时的 factors。"""
     factors = []
@@ -419,8 +403,6 @@ def _build_no_signal_factors(evaluated: List[Dict]) -> List[Dict]:
             "score": 50, "direction": "neutral",
         })
     return factors
-
-
 def _build_signal_summary(active_buy: List[Dict], active_sell: List[Dict]) -> str:
     """构建信号摘要。"""
     parts = []
@@ -431,8 +413,6 @@ def _build_signal_summary(active_buy: List[Dict], active_sell: List[Dict]) -> st
         names = [e["name"] for e in active_sell[:3]]
         parts.append(f"卖出:{','.join(names)}")
     return " | ".join(parts) if parts else "无信号"
-
-
 def _list_user_indicators(user_id: int = 1) -> List[Dict[str, Any]]:
     """从 qd_indicator_codes 加载用户的指标列表。"""
     from app.utils.db import get_db_connection

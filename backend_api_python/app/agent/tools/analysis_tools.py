@@ -7,11 +7,9 @@ Pure-Python calculations on K-line data, no external API calls.
 """
 from __future__ import annotations
 
-import logging
+from app.agent.log import logger
 import math
 from typing import Any, Dict, List, Optional, Tuple
-
-logger = logging.getLogger(__name__)
 
 def _get_ds(market: str = "CNStock"):
     from app.data_sources.factory import DataSourceFactory
@@ -293,8 +291,6 @@ def _calc_obv(closes: List[float], volumes: List[float]) -> Dict[str, Any]:
         "obv_vs_ma": obv_vs_ma,
         "signals": signals,
     }
-
-
 def _calc_kdj(highs: List[float], lows: List[float], closes: List[float],
               n: int = 9, m1: int = 3, m2: int = 3) -> Dict[str, Any]:
     """KDJ 随机指标计算。"""
@@ -350,8 +346,6 @@ def _calc_kdj(highs: List[float], lows: List[float], closes: List[float],
         "j": latest_j,
         "signals": signals,
     }
-
-
 def _calc_atr(highs: List[float], lows: List[float], closes: List[float],
               period: int = 14) -> Dict[str, Any]:
     """ATR（真实波幅均值）— 波动率指标。"""
@@ -407,8 +401,6 @@ def _calc_atr(highs: List[float], lows: List[float], closes: List[float],
         "atr_trend": atr_trend,
         "volatility_level": vol_level,
     }
-
-
 def _calc_mfi(highs: List[float], lows: List[float], closes: List[float],
               volumes: List[float], period: int = 14) -> Dict[str, Any]:
     """MFI（资金流量指标）— 量价结合的 RSI。"""
@@ -457,8 +449,6 @@ def _calc_mfi(highs: List[float], lows: List[float], closes: List[float],
         "mfi": mfi_val,
         "signals": signals,
     }
-
-
 def _calc_cmf(highs: List[float], lows: List[float], closes: List[float],
               volumes: List[float], period: int = 20) -> Dict[str, Any]:
     """CMF（蔡金资金流量）— 衡量一段时间内资金流入/流出强度。"""
@@ -503,8 +493,6 @@ def _calc_cmf(highs: List[float], lows: List[float], closes: List[float],
         "cmf": cmf_val,
         "signals": signals,
     }
-
-
 def _calc_hist_volatility(closes: List[float], period: int = 20) -> Dict[str, Any]:
     """历史波动率（基于对数收益率标准差，年化）。"""
     n = len(closes)
@@ -549,8 +537,6 @@ def _calc_hist_volatility(closes: List[float], period: int = 20) -> Dict[str, An
         "short_term_volatility": _safe_round(short_vol * 100, 2),
         "vol_trend": vol_trend,
     }
-
-
 def _detect_divergence(closes: List[float], indicator: List[float],
                        lookback: int = 20) -> str:
     """检测价格与指标的背离。
@@ -582,8 +568,6 @@ def _detect_divergence(closes: List[float], indicator: List[float],
             return "bearish_div"
 
     return "none"
-
-
 def _calc_ma_convergence(closes: List[float]) -> Dict[str, Any]:
     """均线收敛度检测 — 多条均线粘合程度。"""
     if len(closes) < 60:
@@ -613,8 +597,6 @@ def _calc_ma_convergence(closes: List[float]) -> Dict[str, Any]:
         "max_deviation_pct": _safe_round(max_dev, 2),
         "description": "均线高度粘合，即将变盘" if converged else "均线发散中",
     }
-
-
 def _detect_resonance(
     macd_result: Dict[str, Any],
     kdj_result: Dict[str, Any],
@@ -806,8 +788,6 @@ def _detect_resonance(
         "bull_dims": bull_dims,
         "bear_dims": bear_dims,
     }
-
-
 # ═══════════════════════════════════════════════════════════════
 # Tool 函数（注册给 Agent 调用）
 # ═══════════════════════════════════════════════════════════════
@@ -1228,8 +1208,6 @@ def analyze_trend(codes: str) -> Dict[str, Any]:
         except Exception as e:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
-
-
 def calculate_ma(codes: str, periods: str = "5,10,20,60,120") -> Dict[str, Any]:
     """均线指标：返回指定周期(5/10/20/60/120/250)的MA值、斜率和趋势方向。
 
@@ -1278,8 +1256,6 @@ def calculate_ma(codes: str, periods: str = "5,10,20,60,120") -> Dict[str, Any]:
         except Exception as e:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
-
-
 def get_volume_analysis(codes: str) -> Dict[str, Any]:
     """量能分析：返回量比、换手率、近5日成交量趋势（放量/缩量/平量）。
 
@@ -1365,8 +1341,6 @@ def get_volume_analysis(codes: str) -> Dict[str, Any]:
         except Exception as e:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
-
-
 def analyze_pattern(codes: str) -> Dict[str, Any]:
     """K线形态识别：返回当日出现的形态信号（锤子线/十字星/吞没/三连阳等）及含义。
 
@@ -1577,8 +1551,6 @@ def analyze_pattern(codes: str) -> Dict[str, Any]:
         except Exception as e:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
-
-
 def get_chip_distribution(codes: str, lookback_days: int = 120) -> Dict[str, Any]:
     """筹码分布：返回获利比例、平均成本、90%筹码集中度、套牢/获利盘比例。
 
@@ -1628,8 +1600,6 @@ def get_chip_distribution(codes: str, lookback_days: int = 120) -> Dict[str, Any
         except Exception as e:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
-
-
 def get_indicator_snapshot(codes: str) -> Dict[str, Any]:
     """指标快照：一次返回MACD/RSI/BOLL/KDJ/KD的最新数值和金叉/死叉/超买超卖状态。
 
@@ -1689,7 +1659,5 @@ def get_indicator_snapshot(codes: str) -> Dict[str, Any]:
         except Exception as e:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
-
-
 # ── OpenAI tool declarations ─────────────────────────────────
 

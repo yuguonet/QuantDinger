@@ -16,34 +16,26 @@ from __future__ import annotations
 
 import importlib
 import json
-import logging
+from app.agent.log import logger
 import queue
 import threading
 import time as _time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
-
 TZ_CN = timezone(timedelta(hours=8))
-
-
 # ═══════════════════════════════════════════════════════════════
 #  SSE 事件总线（发布/订阅）
 # ═══════════════════════════════════════════════════════════════
 
 _subscribers: List[queue.Queue] = []
 _subscribers_lock = threading.Lock()
-
-
 def subscribe() -> queue.Queue:
     """前端连接时调用，返回一个事件队列。"""
     q = queue.Queue(maxsize=256)
     with _subscribers_lock:
         _subscribers.append(q)
     return q
-
-
 def unsubscribe(q: queue.Queue):
     """前端断开时调用。"""
     with _subscribers_lock:
@@ -51,8 +43,6 @@ def unsubscribe(q: queue.Queue):
             _subscribers.remove(q)
         except ValueError:
             pass
-
-
 def _publish(event: dict):
     """向所有订阅者推送事件。"""
     dead = []
@@ -68,8 +58,6 @@ def _publish(event: dict):
                 q.put_nowait(event)
             except queue.Empty:
                 pass
-
-
 def _make_event(event_type: str, job_id: int, job_name: str, **extra) -> dict:
     ev = {
         "type": event_type,
@@ -79,13 +67,9 @@ def _make_event(event_type: str, job_id: int, job_name: str, **extra) -> dict:
     }
     ev.update(extra)
     return ev
-
-
 # ═══════════════════════════════════════════════════════════════
 #  Cron 表达式解析（5 段式）
 # ═══════════════════════════════════════════════════════════════
-
-
 def _parse_cron_field(field_str: str, min_val: int, max_val: int) -> set:
     values = set()
     for part in field_str.split(","):
@@ -106,8 +90,6 @@ def _parse_cron_field(field_str: str, min_val: int, max_val: int) -> set:
         else:
             values.add(int(part))
     return {v for v in values if min_val <= v <= max_val}
-
-
 def cron_matches(cron_expr: str, dt: datetime) -> bool:
     parts = cron_expr.strip().split()
     if len(parts) != 5:
@@ -125,8 +107,6 @@ def cron_matches(cron_expr: str, dt: datetime) -> bool:
         and dt.month in months
         and py_wday in weekdays
     )
-
-
 def next_cron_time(cron_expr: str, after: datetime, max_search_minutes: int = 1440 * 2) -> datetime:
     """计算下一个匹配时间。最多搜索 2 天。"""
     dt = after.replace(second=0, microsecond=0) + timedelta(minutes=1)
@@ -136,13 +116,9 @@ def next_cron_time(cron_expr: str, after: datetime, max_search_minutes: int = 14
         dt += timedelta(minutes=1)
     # 兜底：1 分钟后
     return after + timedelta(minutes=1)
-
-
 # ═══════════════════════════════════════════════════════════════
 #  任务执行
 # ═══════════════════════════════════════════════════════════════
-
-
 def _import_function(path: str) -> Callable:
     module_path, _, func_name = path.rpartition(".")
     if not module_path:
@@ -152,8 +128,6 @@ def _import_function(path: str) -> Callable:
     if not callable(fn):
         raise TypeError(f"{path} is not callable")
     return fn
-
-
 def _execute_prompt_job(job: Dict[str, Any]):
     prompt = job.get("prompt", "")
     job_name = job.get("name", "unknown")
@@ -194,8 +168,6 @@ def _execute_prompt_job(job: Dict[str, Any]):
             _delete_one_shot(job_id, job_name)
         else:
             _reschedule_job(job_id)
-
-
 def _execute_function_job(job: Dict[str, Any]):
     func_path = job.get("function_path", "")
     job_name = job.get("name", "unknown")
@@ -220,8 +192,6 @@ def _execute_function_job(job: Dict[str, Any]):
             _delete_one_shot(job_id, job_name)
         else:
             _reschedule_job(job_id)
-
-
 def _update_job_status(job_id: int, success: bool, error: str = ""):
     try:
         from app.utils.db import get_db_connection
@@ -245,8 +215,6 @@ def _update_job_status(job_id: int, success: bool, error: str = ""):
             conn.commit()
     except Exception as e:
         logger.error("[CronWorker] 更新任务状态失败 id=%d: %s", job_id, e)
-
-
 # ═══════════════════════════════════════════════════════════════
 #  自调度核心：Timer 管理
 # ═══════════════════════════════════════════════════════════════
@@ -254,8 +222,6 @@ def _update_job_status(job_id: int, success: bool, error: str = ""):
 # job_id → threading.Timer
 _timers: Dict[int, threading.Timer] = {}
 _timers_lock = threading.Lock()
-
-
 def _schedule_job(job_id: int, job: dict, delay_seconds: float):
     """为单个任务设定 Timer。"""
     with _timers_lock:
@@ -285,8 +251,6 @@ def _schedule_job(job_id: int, job: dict, delay_seconds: float):
         logger.info("[CronWorker] 调度任务 %d (%s): %.0f 秒后执行 → %s",
                      job_id, job.get("name", "?"), delay_seconds,
                      run_at.strftime("%Y-%m-%d %H:%M:%S"))
-
-
 def _delete_one_shot(job_id: int, job_name: str):
     """一次性任务执行完后删除。"""
     try:
@@ -298,8 +262,6 @@ def _delete_one_shot(job_id: int, job_name: str):
         logger.info("[CronWorker] 🗑️ 一次性任务 %d (%s) 已删除", job_id, job_name)
     except Exception as e:
         logger.error("[CronWorker] 删除一次性任务 %d 失败: %s", job_id, e)
-
-
 def _reschedule_job(job_id: int):
     """从 DB 重新读取任务，计算下次时间，设定 Timer。"""
     try:
@@ -325,13 +287,9 @@ def _reschedule_job(job_id: int):
 
     except Exception as e:
         logger.error("[CronWorker] reschedule 任务 %d 失败: %s", job_id, e)
-
-
 def schedule_job_from_db(job_id: int):
     """外部调用：任务创建/更新后，重新调度。"""
     _reschedule_job(job_id)
-
-
 def unschedule_job(job_id: int):
     """外部调用：任务删除/禁用后，取消 Timer。"""
     with _timers_lock:
@@ -339,15 +297,11 @@ def unschedule_job(job_id: int):
         if old:
             old.cancel()
             logger.info("[CronWorker] 取消任务 %d 的 Timer", job_id)
-
-
 # ═══════════════════════════════════════════════════════════════
 #  启动：加载所有任务
 # ═══════════════════════════════════════════════════════════════
 
 _worker_started = False
-
-
 def _load_and_schedule_all():
     """从 DB 加载所有 enabled 任务，计算下次时间，设 Timer。"""
     try:
@@ -374,8 +328,6 @@ def _load_and_schedule_all():
 
     except Exception as e:
         logger.error("[CronWorker] 加载任务失败: %s", e, exc_info=True)
-
-
 def start_cron_worker():
     """启动 Cron Worker（在 app/__init__.py 中调用）。"""
     global _worker_started
@@ -391,8 +343,6 @@ def start_cron_worker():
     t = threading.Thread(target=_delayed_start, daemon=True, name="cron-worker-init")
     t.start()
     logger.info("[CronWorker] 自调度模式已启动（延迟 10 秒加载任务）")
-
-
 def stop_cron_worker():
     """停止所有 Timer。"""
     with _timers_lock:
@@ -400,8 +350,6 @@ def stop_cron_worker():
             timer.cancel()
         _timers.clear()
     logger.info("[CronWorker] 已停止所有定时任务")
-
-
 def get_scheduled_jobs() -> List[dict]:
     """获取当前已调度的任务信息（供状态查询）。"""
     with _timers_lock:

@@ -7,17 +7,11 @@ news_search_tools — Agent 新闻情报工具 (薄壳)
 """
 from __future__ import annotations
 
-import logging
+from app.agent.log import logger
 from typing import Any, Dict, List
-
-
-logger = logging.getLogger(__name__)
-
 # 工具层短时缓存: 同一 symbol 60s 内直接返回
 _search_cache: Dict[str, tuple] = {}  # key → (timestamp, result)
 _CACHE_TTL = 60
-
-
 def _get_policy_from_cache() -> List[Dict[str, Any]]:
     """政策新闻: 只读 DB 缓存 (scheduler 每日写入)"""
     try:
@@ -37,8 +31,6 @@ def _get_policy_from_cache() -> List[Dict[str, Any]]:
     except Exception as e:
         logger.warning("读取 POLICY 缓存失败: %s", e)
         return []
-
-
 def _get_news(symbol: str, market: str = "CNStock", name: str = "") -> List[Dict[str, Any]]:
     """个股/板块新闻: 走 fetch_financial_news (缓存→搜索→写入)"""
     try:
@@ -67,8 +59,6 @@ def _get_news(symbol: str, market: str = "CNStock", name: str = "") -> List[Dict
     except Exception as e:
         logger.warning("获取新闻失败 %s(%s): %s", symbol, market, e)
         return []
-
-
 def _build_result(items: List[Dict[str, Any]], label: str) -> Dict[str, Any]:
     """评分 + 排序: 一票否决置顶, 合计≤20条"""
     from app.services.news_analysis import composite_score
@@ -108,8 +98,6 @@ def _build_result(items: List[Dict[str, Any]], label: str) -> Dict[str, Any]:
         "count": len(merged),
         "news": merged,
     }
-
-
 def search_stock_intel(codes: str, name: str = "") -> Dict[str, Any]:
     """个股情报搜索：返回指定股票的新闻、公告、研报列表及摘要。
 
@@ -135,8 +123,6 @@ def search_stock_intel(codes: str, name: str = "") -> Dict[str, Any]:
         except Exception as e:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
-
-
 def search_sector_intel(market: str = "CNStock") -> Dict[str, Any]:
     """板块情报搜索：返回指定板块的相关新闻和政策动态。
 
@@ -145,8 +131,6 @@ def search_sector_intel(market: str = "CNStock") -> Dict[str, Any]:
     """
     items = _get_news(market, market)
     return _build_result(items, f"板块:{market}")
-
-
 def search_policy_intel(market: str = "CNStock") -> Dict[str, Any]:
     """政策情报搜索：返回最新财经政策、监管动态。
 
@@ -155,8 +139,6 @@ def search_policy_intel(market: str = "CNStock") -> Dict[str, Any]:
     """
     items = _get_policy_from_cache()
     return _build_result(items, f"政策:{market}")
-
-
 def search_comprehensive_intel(codes: str, name: str = "") -> Dict[str, Any]:
     """综合情报：同时搜索个股新闻+板块动态+政策面，返回合并结果。
 

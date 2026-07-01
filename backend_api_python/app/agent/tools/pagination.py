@@ -25,13 +25,11 @@ Pagination & Cache — 对大数据量工具返回值做分页处理。
 from __future__ import annotations
 
 import hashlib
-import logging
+from app.agent.log import logger
 import threading
 import time
 from functools import wraps
 from typing import Any, Callable, Dict, List, Optional, Tuple
-
-logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════════
 # 1. 内存缓存
@@ -85,12 +83,8 @@ class _PageCache:
         to_remove = max(1, len(sorted_keys) // 5)
         for k in sorted_keys[:to_remove]:
             self._store.pop(k, None)
-
-
 # 全局单例
 _cache = _PageCache()
-
-
 # ═══════════════════════════════════════════════════════════════
 # 2. 分页逻辑
 # ═══════════════════════════════════════════════════════════════
@@ -109,8 +103,6 @@ def _extract_list(data: Any, data_key: str) -> List:
         if len(list_fields) == 1:
             return list_fields[0]
     return []
-
-
 def paginate_result(
     cache_key: str,
     data: Any,
@@ -133,8 +125,6 @@ def paginate_result(
     _cache.put(cache_key, data, data_key)
 
     return _format_page(cache_key, data, page, page_size, data_key)
-
-
 def _format_page(
     cache_key: str,
     data: Any,
@@ -186,8 +176,6 @@ def _format_page(
     result["_hint"] = " | ".join(hint_parts)
 
     return result
-
-
 def get_page(cache_key: str, page: int, page_size: int = 0) -> Dict[str, Any]:
     """从缓存中取指定页。自动识别列表模式/文本模式。
 
@@ -213,8 +201,6 @@ def get_page(cache_key: str, page: int, page_size: int = 0) -> Dict[str, Any]:
         page_size = 20
 
     return _format_page(cache_key, data, page, page_size, data_key)
-
-
 def get_cache_summary(cache_key: str) -> Optional[Dict[str, Any]]:
     """获取缓存摘要信息。
 
@@ -231,8 +217,6 @@ def get_cache_summary(cache_key: str) -> Optional[Dict[str, Any]]:
         "total_items": len(items),
         "data_key": data_key,
     }
-
-
 # ═══════════════════════════════════════════════════════════════
 # 2b. 文本截断（大字符串/代码/文件内容）
 # ═══════════════════════════════════════════════════════════════
@@ -283,8 +267,6 @@ def paginate_text(
         },
         "_hint": f"文本已截断: 显示前{len(first_chunk)}/{total_len}字符 | 用 page_tool 翻页查看后续内容",
     }
-
-
 def get_text_page(cache_key: str, page: int, chunk_size: int = 0) -> Dict[str, Any]:
     """获取文本分页内容。
 
@@ -338,8 +320,6 @@ def get_text_page(cache_key: str, page: int, chunk_size: int = 0) -> Dict[str, A
 
     # 列表模式（fallback 到 get_page）
     return get_page(cache_key, page, chunk_size or 20)
-
-
 # ═══════════════════════════════════════════════════════════════
 # 3. 装饰器：@paginated
 # ═══════════════════════════════════════════════════════════════
@@ -351,8 +331,6 @@ def _make_cache_key(fn_name: str, args_dict: Dict) -> str:
     raw = f"{fn_name}:{sorted_args}"
     short_hash = hashlib.md5(raw.encode()).hexdigest()[:12]
     return f"{fn_name}_{short_hash}"
-
-
 def paginated(
     page_size: int = 20,
     data_key: str = "",
@@ -435,8 +413,6 @@ def paginated(
 
         return wrapper
     return decorator
-
-
 # ═══════════════════════════════════════════════════════════════
 # 4. Agent 翻页工具（注册到 tools/registry）
 # ═══════════════════════════════════════════════════════════════

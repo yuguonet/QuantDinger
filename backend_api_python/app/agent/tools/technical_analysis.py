@@ -7,12 +7,8 @@
 """
 from __future__ import annotations
 
-import logging
+from app.agent.log import logger
 from typing import Any, Dict, List
-
-logger = logging.getLogger(__name__)
-
-
 def _call_tools(stock_code: str) -> Dict[str, Any]:
     """调用 analysis_tools.py 中的分析工具 + basicinfo，返回结果字典。"""
     from app.utils.basicinfo_db import get_stock_basic_db
@@ -45,8 +41,6 @@ def _call_tools(stock_code: str) -> Dict[str, Any]:
         results["basicinfo"] = {"error": str(e)}
 
     return results
-
-
 def _algo_analyze(
     stock_code: str,
     stock_name: str,
@@ -256,8 +250,6 @@ def _algo_analyze(
         "stock_code": stock_code,
         "stock_name": stock_name,
     }
-
-
 def technical_analysis(stock_code: str, stock_name: str = "") -> dict:
     """技术面综合评分：内部调用 analyze_trend+get_indicator_snapshot+get_volume_analysis+analyze_pattern+get_chip_distribution，加权输出 0-100 分。需要单股深度分析时用此工具，不要同时调 analyze_trend。
 

@@ -16,15 +16,11 @@ from __future__ import annotations
 
 import importlib
 import inspect
-import logging
+from app.agent.log import logger
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from smolagents import tool as smolagents_tool
-
-logger = logging.getLogger(__name__)
-
-
 class _ToolSpec:
     """薄的 spec 包装，提供 .fn 属性供 skill 脚本调用。"""
 
@@ -32,8 +28,6 @@ class _ToolSpec:
         self.fn = fn
         self.name = name
         self.description = description
-
-
 class ToolRegistry:
     """本地工具注册表 — 扫描 agent/tools/ 并包装为 smolagents Tool 对象。"""
 
@@ -117,8 +111,6 @@ class ToolRegistry:
 
     def __contains__(self, name: str) -> bool:
         return name in self._tools
-
-
 def build_smolagent_tools(config: Optional[Dict[str, Any]] = None) -> List[Any]:
     """构建 smolagent 兼容工具列表。
 
@@ -149,19 +141,13 @@ def build_smolagent_tools(config: Optional[Dict[str, Any]] = None) -> List[Any]:
         if tool_obj is not None:
             tools.append(tool_obj)
     return tools
-
-
 # ── 模块级单例 ──────────────────────────────────────────────────
 _registry: Optional[ToolRegistry] = None
-
-
 def get_local_registry() -> ToolRegistry:
     """获取（或创建）全局 ToolRegistry 单例。"""
     global _registry
     if _registry is None:
         _registry = ToolRegistry()
     return _registry
-
-
 # 模块级便捷引用 — 供 from app.agent.tools.registry import registry 使用
 registry: ToolRegistry = get_local_registry()

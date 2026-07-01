@@ -18,7 +18,7 @@ TraceCollector — Agent 执行追踪器。
 """
 from __future__ import annotations
 
-import logging
+from app.agent.log import logger
 import re
 import time
 from datetime import date
@@ -28,10 +28,6 @@ from app.agent.chain.schema import (
     EvalNode, Layer, Status,
 )
 from app.agent.json_extractor import extract_decision
-
-logger = logging.getLogger(__name__)
-
-
 class TraceCollector:
     """Agent 执行过程中的自动追踪器。
 

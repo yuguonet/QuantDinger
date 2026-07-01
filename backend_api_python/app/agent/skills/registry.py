@@ -15,7 +15,7 @@ Skill Registry — 发现和管理 skills/*/SKILL.md。
 """
 from __future__ import annotations
 
-import logging
+from app.agent.log import logger
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,11 +23,7 @@ from typing import Dict, List, Optional
 
 import yaml
 
-logger = logging.getLogger(__name__)
-
 _SKILLS_DIR = Path(__file__).parent
-
-
 @dataclass
 class SkillInfo:
     """Skill 元数据（从 SKILL.md frontmatter 解析）。"""
@@ -39,13 +35,9 @@ class SkillInfo:
     tools: List[str] = field(default_factory=list)
     body: str = ""               # SKILL.md 的 Markdown body（执行指令）
     dir_path: str = ""           # 目录绝对路径
-
-
 # 缓存：name（下划线）→ SkillInfo
 _skills: Dict[str, SkillInfo] = {}
 _loaded = False
-
-
 def _parse_skill_md(content: str) -> tuple:
     """解析 SKILL.md，分离 YAML frontmatter 和 Markdown body。"""
     meta = {}
@@ -59,8 +51,6 @@ def _parse_skill_md(content: str) -> tuple:
                 meta = {}
             body = parts[2].strip()
     return meta, body
-
-
 def _validate_skill(skill_dir: Path, meta: dict) -> Optional[str]:
     """校验 skill 是否合规。返回 None 表示通过，否则返回拒绝原因。"""
     name = meta.get("name", "")
@@ -79,8 +69,6 @@ def _validate_skill(skill_dir: Path, meta: dict) -> Optional[str]:
         return f"description 超过1024字符: {len(desc)}"
 
     return None
-
-
 def discover():
     """扫描 skills/*/SKILL.md，加载元数据。幂等，只加载一次。
 
@@ -130,8 +118,6 @@ def discover():
         logger.debug("[SkillRegistry] 发现: %s (%s)", info.name, info.display_name)
 
     logger.info("[SkillRegistry] 已发现 %d 个 Skill", len(_skills))
-
-
 # ═══════════════════════════════════════════════════════════════
 #  公开接口
 # ═══════════════════════════════════════════════════════════════
@@ -140,20 +126,14 @@ def get(name: str) -> Optional[SkillInfo]:
     """按名称查找 Skill。"""
     discover()
     return _skills.get(name)
-
-
 def all_skills() -> Dict[str, SkillInfo]:
     """返回全部已发现的 Skill。"""
     discover()
     return dict(_skills)
-
-
 def all_names() -> List[str]:
     """返回全部 Skill 名称列表。"""
     discover()
     return list(_skills.keys())
-
-
 def get_skill_catalog_text() -> str:
     """生成 skill catalog XML，供注入 agent system prompt。
 
@@ -172,8 +152,6 @@ def get_skill_catalog_text() -> str:
         lines.append(f'  </skill>')
     lines.append("</available_skills>")
     return "\n".join(lines)
-
-
 def get_skill_body(name: str) -> Optional[str]:
     """返回指定 skill 的 SKILL.md body（执行指令）。
 
@@ -188,8 +166,6 @@ def get_skill_body(name: str) -> Optional[str]:
                 return skill_info.body
         return None
     return info.body
-
-
 def get_skill_dir(name: str) -> Optional[str]:
     """返回指定 skill 的目录路径。"""
     discover()

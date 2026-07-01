@@ -27,18 +27,14 @@ v4 变更：
 """
 from __future__ import annotations
 
-import logging
+from app.agent.log import logger
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
 
-logger = logging.getLogger(__name__)
-
 _SEMANTICS_DIR = Path(__file__).parent
-
-
 # ═══════════════════════════════════════════════════════════════
 # Data classes
 # ═══════════════════════════════════════════════════════════════
@@ -49,14 +45,10 @@ class PersonaMeta:
     identity: str = ""
     mission: str = ""
     behaviors: Dict[str, List[str]] = field(default_factory=dict)
-
-
 @dataclass
 class IntentMeta:
     classifier_prompt: str = ""
     rules: List[Dict[str, Any]] = field(default_factory=list)
-
-
 @dataclass
 class SkillMeta:
     name: str = ""
@@ -68,8 +60,6 @@ class SkillMeta:
     instructions: str = ""
     triggers: List[str] = field(default_factory=list)
     standard_output: bool = False
-
-
 @dataclass
 class ToolMeta:
     name: str = ""
@@ -77,8 +67,6 @@ class ToolMeta:
     category: str = ""
     layer: str = ""
     tags: List[str] = field(default_factory=list)
-
-
 # ═══════════════════════════════════════════════════════════════
 # Cache
 # ═══════════════════════════════════════════════════════════════
@@ -89,8 +77,6 @@ _skills: Dict[str, SkillMeta] = {}
 _tools: Dict[str, ToolMeta] = {}
 
 _loaded = False
-
-
 def _load_frontmatter(relative_path: str) -> dict:
     """从 .md 文件的 YAML frontmatter 加载元数据。"""
     md_path = _SEMANTICS_DIR / relative_path.replace(".yaml", ".md")
@@ -104,8 +90,6 @@ def _load_frontmatter(relative_path: str) -> dict:
                 except yaml.YAMLError:
                     pass
     return {}
-
-
 # ═══════════════════════════════════════════════════════════════
 # SKILL.md parser
 # ═══════════════════════════════════════════════════════════════
@@ -129,8 +113,6 @@ def _parse_skill_md(content: str) -> tuple:
             body = parts[2].strip()
 
     return meta, body
-
-
 def _parse_behaviors_from_md(body: str) -> Dict[str, List[str]]:
     """从 Markdown body 中解析行为规范。
 
@@ -164,8 +146,6 @@ def _parse_behaviors_from_md(body: str) -> Dict[str, List[str]]:
         elif stripped.startswith("- ") and current_key:
             behaviors[current_key].append(stripped[2:].strip())
     return behaviors
-
-
 # ═══════════════════════════════════════════════════════════════
 # Loader
 # ═══════════════════════════════════════════════════════════════
@@ -246,8 +226,6 @@ def load_semantics():
         "[Semantics] 加载完成: %d skills, %d tools, XML 缓存已生成",
         len(_skills), len(_tools),
     )
-
-
 # ═══════════════════════════════════════════════════════════════
 # Public API
 # ═══════════════════════════════════════════════════════════════
@@ -257,8 +235,6 @@ def get_persona() -> PersonaMeta:
     if _persona is None:
         return PersonaMeta(role="量化分析助手", identity="", mission="", behaviors={})
     return _persona
-
-
 def get_intent_meta() -> IntentMeta:
     load_semantics()
     if _intent is None:
@@ -268,28 +244,18 @@ def get_intent_meta() -> IntentMeta:
             rules=[],
         )
     return _intent
-
-
 def get_skill_meta(name: str) -> Optional[SkillMeta]:
     load_semantics()
     return _skills.get(name)
-
-
 def get_all_skill_metas() -> Dict[str, SkillMeta]:
     load_semantics()
     return dict(_skills)
-
-
 def get_tool_meta(name: str) -> Optional[ToolMeta]:
     load_semantics()
     return _tools.get(name)
-
-
 def get_all_tool_metas() -> Dict[str, ToolMeta]:
     load_semantics()
     return dict(_tools)
-
-
 def get_skill_body(name: str) -> Optional[str]:
     """返回指定 skill 的 SKILL.md body（执行指令）。兼容 skills/registry.py 接口。"""
     load_semantics()
@@ -302,8 +268,6 @@ def get_skill_body(name: str) -> Optional[str]:
                 meta = m
                 break
     return meta.instructions if meta else None
-
-
 def get_skill_dir(name: str) -> Optional[str]:
     """返回指定 skill 的目录路径。兼容 skills/registry.py 接口。"""
     load_semantics()
@@ -320,8 +284,6 @@ def get_skill_dir(name: str) -> Optional[str]:
             if meta_part.get("name") == name:
                 return str(d)
     return None
-
-
 def get_skill_catalog_text() -> str:
     """生成 skill catalog XML。兼容 skills/registry.py 接口。"""
     load_semantics()
@@ -336,8 +298,6 @@ def get_skill_catalog_text() -> str:
         lines.append(f'  </skill>')
     lines.append("</available_skills>")
     return "\n".join(lines)
-
-
 def all_skills_compat() -> Dict[str, Any]:
     """返回兼容 skills/registry.SkillInfo 接口的字典。"""
     load_semantics()
@@ -357,8 +317,6 @@ def all_skills_compat() -> Dict[str, Any]:
         dir_path = get_skill_dir(name) or ""
         result[name] = _CompatSkill(meta, dir_path)
     return result
-
-
 def get_persona_body() -> str:
     """返回 persona.md 的 Markdown body（不含 frontmatter）。"""
     load_semantics()
@@ -368,8 +326,6 @@ def get_persona_body() -> str:
     content = persona_path.read_text(encoding="utf-8")
     _, body = _parse_skill_md(content)
     return body
-
-
 def get_agent_rules_text() -> str:
     """返回 agent_rules.md 的完整 Markdown body（核心规则 + 执行流程）。"""
     path = _SEMANTICS_DIR / "agent_rules.md"
@@ -379,8 +335,6 @@ def get_agent_rules_text() -> str:
     # 用 frontmatter 后的 body
     _, body = _parse_skill_md(content)
     return body
-
-
 def get_planner_text() -> str:
     """返回 planner.md 的 Markdown body。"""
     path = _SEMANTICS_DIR / "planner.md"
@@ -389,12 +343,6 @@ def get_planner_text() -> str:
     content = path.read_text(encoding="utf-8")
     _, body = _parse_skill_md(content)
     return body
-
-
-
-
-
-
 # ═══════════════════════════════════════════════════════════════
 # Summary generators (for system prompt injection)
 # ═══════════════════════════════════════════════════════════════
@@ -402,8 +350,6 @@ def get_planner_text() -> str:
 # ── 全量缓存（启动时生成，后续直接读取）──
 _skills_summary_xml_cache: str = ""
 _tools_summary_xml_cache: str = ""
-
-
 def _build_skills_summary_xml() -> str:
     """生成 skills 摘要 XML（内部，启动时调用一次）。"""
     lines = ["<skills>"]
@@ -414,8 +360,6 @@ def _build_skills_summary_xml() -> str:
         lines.append(f'  </skill>')
     lines.append("</skills>")
     return "\n".join(lines)
-
-
 def _build_tools_summary_xml() -> str:
     """生成 tools 摘要 XML（内部，启动时调用一次）。"""
     by_cat: Dict[str, List[ToolMeta]] = {}
@@ -431,14 +375,10 @@ def _build_tools_summary_xml() -> str:
         lines.append(f'  </category>')
     lines.append("</tools>")
     return "\n".join(lines)
-
-
 def get_skills_summary_xml() -> str:
     """返回 skills 摘要 XML（全量缓存）。"""
     load_semantics()
     return _skills_summary_xml_cache
-
-
 def get_tools_summary_xml(tags_filter: Optional[List[str]] = None) -> str:
     """返回 tools 摘要 XML（全量缓存，tags_filter 参数保留兼容但不再支持过滤）。"""
     load_semantics()

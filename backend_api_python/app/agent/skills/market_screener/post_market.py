@@ -8,7 +8,7 @@ market_screener/post_market.py
 
 from __future__ import annotations
 
-import logging
+from app.agent.log import logger
 from collections import Counter
 from typing import Any, Dict, List, Optional
 
@@ -18,10 +18,6 @@ from .common import (
     fetch_hot_stocks_with_reason,
     compute_ma, compute_macd, compute_rsi, compute_kdj,
 )
-
-logger = logging.getLogger(__name__)
-
-
 # ═══════════════════════════════════════════════════════════════
 #  形态检测器
 # ═══════════════════════════════════════════════════════════════
@@ -49,8 +45,6 @@ def _detect_platform_breakout(bars: List[Dict]) -> Optional[Dict]:
                 "score": 75 if vol_ratio > 2 else 65,
             }
     return None
-
-
 def _detect_volume_reversal(bars: List[Dict]) -> Optional[Dict]:
     if len(bars) < 10:
         return None
@@ -73,8 +67,6 @@ def _detect_volume_reversal(bars: List[Dict]) -> Optional[Dict]:
             "score": 70 if vol_ratio > 2.5 else 60,
         }
     return None
-
-
 def _detect_ma_support_pullback(bars: List[Dict]) -> Optional[Dict]:
     if len(bars) < 20:
         return None
@@ -95,8 +87,6 @@ def _detect_ma_support_pullback(bars: List[Dict]) -> Optional[Dict]:
             "score": 68 if today["close"] > today["open"] else 58,
         }
     return None
-
-
 def _detect_macd_golden_cross(bars: List[Dict]) -> Optional[Dict]:
     if len(bars) < 30:
         return None
@@ -112,8 +102,6 @@ def _detect_macd_golden_cross(bars: List[Dict]) -> Optional[Dict]:
             "dea": round(dea[-1], 3), "underwater": is_underwater, "score": score,
         }
     return None
-
-
 def _detect_shrink_pullback_breakout(bars: List[Dict]) -> Optional[Dict]:
     if len(bars) < 15:
         return None
@@ -145,8 +133,6 @@ def _detect_shrink_pullback_breakout(bars: List[Dict]) -> Optional[Dict]:
             "score": 73,
         }
     return None
-
-
 def _detect_prev_high_breakout(bars: List[Dict]) -> Optional[Dict]:
     if len(bars) < 20:
         return None
@@ -163,15 +149,11 @@ def _detect_prev_high_breakout(bars: List[Dict]) -> Optional[Dict]:
                 "score": 70 if vol_ratio > 2 else 60,
             }
     return None
-
-
 _DETECTORS = [
     _detect_platform_breakout, _detect_volume_reversal,
     _detect_ma_support_pullback, _detect_macd_golden_cross,
     _detect_shrink_pullback_breakout, _detect_prev_high_breakout,
 ]
-
-
 # ═══════════════════════════════════════════════════════════════
 #  Phase 1 + Phase 2
 # ═══════════════════════════════════════════════════════════════
@@ -340,8 +322,6 @@ def prescreen(date: str) -> Dict[str, Any]:
         "date": date, "scanned": scanned, "pool_size": len(scan_pool),
         "main_themes": main_themes, "candidates": candidates[:20],
     }
-
-
 def deep_analyze(candidate, _tool_calls, _tool_nodes, _missing_data) -> Optional[Dict]:
     code = candidate["code"]
     try:
@@ -438,8 +418,6 @@ def deep_analyze(candidate, _tool_calls, _tool_nodes, _missing_data) -> Optional
     except Exception as e:
         logger.warning("[MktScreen] 盘后深入分析 %s 失败: %s", code, e)
         return None
-
-
 def run_strategy(date: str, _tool_calls, _tool_nodes, _missing_data) -> Optional[SkillReport]:
     try:
         prescreen_result = prescreen(date)

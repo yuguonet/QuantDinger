@@ -11,7 +11,7 @@ def _strip_prefix(s):
     from app.data_sources.normalizer import strip_market_prefix
     return strip_market_prefix(s)
 
-import logging
+from app.agent.log import logger
 from datetime import datetime, timedelta
 from typing import Any, Dict, List
 
@@ -21,13 +21,7 @@ def _safe_float(v, default=0.0):
     from app.data_sources.normalizer import safe_float
     return safe_float(v, default)
 
-logger = logging.getLogger(__name__)
-
 _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-
-
-
-
 
 def get_hot_stocks_with_reason(date: str = "") -> Dict[str, Any]:
     """当日强势股：同花顺数据源，返回涨幅居前个股及其涨停/强势的题材归因。
@@ -91,8 +85,6 @@ def get_hot_stocks_with_reason(date: str = "") -> Dict[str, Any]:
     except Exception as e:
         logger.warning("get_hot_stocks_with_reason(%s) failed: %s", date, e)
         return {"error": str(e)}
-
-
 # ══════════════════════════════════════════════════════════════
 # 概念板块归属
 # ══════════════════════════════════════════════════════════════
@@ -153,8 +145,6 @@ def get_stock_concept_blocks(codes: str) -> Dict[str, Any]:
         except Exception as e:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
-
-
 # ══════════════════════════════════════════════════════════════
 # 限售解禁
 # ══════════════════════════════════════════════════════════════
@@ -222,8 +212,6 @@ def get_lockup_expiry(codes: str, forward_days: int = 90) -> Dict[str, Any]:
         except Exception as e:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
-
-
 # ══════════════════════════════════════════════════════════════
 # 行业排名
 # ══════════════════════════════════════════════════════════════
@@ -243,8 +231,6 @@ def get_industry_ranking(top_n: int = 20) -> Dict[str, Any]:
     except Exception as e:
         logger.warning("get_industry_ranking failed: %s", e)
         return {"error": str(e)}
-
-
 # ══════════════════════════════════════════════════════════════
 # 龙虎榜详情
 # ══════════════════════════════════════════════════════════════

@@ -2,7 +2,7 @@
 """BB超卖全市场扫描 — 布林带下轨突破策略筛选全市场，再对候选股做技术面深入分析。"""
 from __future__ import annotations
 
-import logging
+from app.agent.log import logger
 import math
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
@@ -21,7 +21,7 @@ BB Screener Skill — BB超卖全市场扫描 + 逐只深入分析。
 """
 from __future__ import annotations
 
-import logging
+from app.agent.log import logger
 import math
 import os
 import sys
@@ -29,10 +29,6 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
 from app.agent.chain.schema import FactorItem, SkillReport
-
-logger = logging.getLogger(__name__)
-
-
 # ═══════════════════════════════════════════════════════════════
 # 数据加载（复用 test_bb_indicator.py 的数据源）
 # ═══════════════════════════════════════════════════════════════
@@ -45,8 +41,6 @@ if _backend_root not in sys.path:
 
 _writer_cache = None
 _basic_db_cache = None
-
-
 def _load_env():
     try:
         from dotenv import load_dotenv
@@ -59,8 +53,6 @@ def _load_env():
                 break
     except Exception:
         pass
-
-
 def _get_writer():
     global _writer_cache
     if _writer_cache is not None:
@@ -69,8 +61,6 @@ def _get_writer():
     from app.utils.db_market import get_market_kline_writer
     _writer_cache = get_market_kline_writer()
     return _writer_cache
-
-
 def _get_basic_db():
     global _basic_db_cache
     if _basic_db_cache is not None:
@@ -79,22 +69,16 @@ def _get_basic_db():
     from app.utils.basicinfo_db import get_stock_basic_db
     _basic_db_cache = get_stock_basic_db()
     return _basic_db_cache
-
-
 def _get_all_codes(filter_st=True):
     db = _get_basic_db()
     stocks = db.get_all_stocks(status="active")
     if filter_st:
         stocks = [s for s in stocks if "ST" not in s.get("name", "").upper()]
     return [s["symbol"] for s in stocks]
-
-
 def _get_name_map():
     db = _get_basic_db()
     stocks = db.get_all_stocks(status="active")
     return {s["symbol"]: s["name"] for s in stocks}
-
-
 def _get_board_name(code):
     c = str(code)[:3]
     if c.startswith("68"):
@@ -106,8 +90,6 @@ def _get_board_name(code):
     elif c.startswith(("0", "2")):
         return "深主板"
     return "未知"
-
-
 def _fetch_kline(code, days=300):
     """从 db_market 获取日 K 线（前复权）。"""
     from app.data_sources.provider.adjustment import unadj_to_qfq
@@ -132,8 +114,6 @@ def _fetch_kline(code, days=300):
         return unadj_to_qfq(bars, code)
     except Exception:
         return []
-
-
 # ═══════════════════════════════════════════════════════════════
 # 指标计算（从 test_bb_indicator.py 提取，纯 Python）
 # ═══════════════════════════════════════════════════════════════
@@ -158,8 +138,6 @@ def _compute_rsi(closes, period=14):
         al = alpha * max(-d, 0.0) + (1 - alpha) * al
         rsi.append(100.0 if al == 0 else 100.0 - 100.0 / (1.0 + ag / al))
     return rsi
-
-
 def _compute_volume_ratio(volumes, window=5):
     n = len(volumes)
     vr = [0.0] * n
@@ -168,8 +146,6 @@ def _compute_volume_ratio(volumes, window=5):
         if avg > 0:
             vr[i] = volumes[i] / avg
     return vr
-
-
 def _compute_ma_slope(closes, ma_len=60):
     n = len(closes)
     slope = [-999.0] * n
@@ -182,8 +158,6 @@ def _compute_ma_slope(closes, ma_len=60):
         if ma[i - 1] > 0:
             slope[i] = (ma[i] - ma[i - 1]) / ma[i - 1] * 100
     return slope
-
-
 def _compute_bb(closes, period=20, num_std=3.0):
     n = len(closes)
     mid, up, lo = [None] * n, [None] * n, [None] * n
@@ -193,8 +167,6 @@ def _compute_bb(closes, period=20, num_std=3.0):
         std = math.sqrt(sum((x - sma) ** 2 for x in w) / period)
         mid[i], up[i], lo[i] = sma, sma + num_std * std, sma - num_std * std
     return mid, up, lo
-
-
 # ═══════════════════════════════════════════════════════════════
 # BB 超卖入场检查（今日信号，跳过 D+1 规则）
 # ═══════════════════════════════════════════════════════════════
@@ -252,8 +224,6 @@ def _check_bb_entry(bars, code, bb_period=20, bb_std=3.0, ma_slope_threshold=0.0
         "vol_ratio": round(vol_ratio[i], 3),
         "ma60_slope": round(ma60_slopes[i], 4),
     }
-
-
 # ═══════════════════════════════════════════════════════════════
 # 深入分析（Phase 2）
 # ═══════════════════════════════════════════════════════════════
@@ -360,8 +330,6 @@ def _deep_analyze_one(code, bb_hit, call_tool_fn, _tool_calls, _tool_nodes, _mis
     except Exception as e:
         logger.warning("[BBScreener] 深入分析 %s 失败: %s", code, e)
         return None
-
-
 # ═══════════════════════════════════════════════════════════════
 # Skill 定义
 # ═══════════════════════════════════════════════════════════════
@@ -499,8 +467,6 @@ class BBScreenerSkill:
             },
             status="ok",
         )
-
-
 # -*- coding: utf-8 -*-
 """BB超卖全市场扫描 — 布林带下轨突破策略筛选全市场，再对候选股做技术面深入分析。"""
 
@@ -526,5 +492,3 @@ def bb_screener_scan(stock_code: str = "", stock_name: str = "") -> dict:
     return {"score": 50, "direction": "neutral",
             "confidence": 0.4, "signal": "BB扫描完成", "factors": [],
             "analysis": str(result)[:500], "status": "ok"}
-
-

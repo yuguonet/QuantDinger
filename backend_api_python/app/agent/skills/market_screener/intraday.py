@@ -18,7 +18,7 @@ market_screener/intraday.py
 
 from __future__ import annotations
 
-import logging
+from app.agent.log import logger
 from collections import Counter
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -32,10 +32,6 @@ from .common import (
     compute_volume_ratio, compute_kdj, compute_atr,
     scan_dragon_pullback, _get_writer,
 )
-
-logger = logging.getLogger(__name__)
-
-
 # ═══════════════════════════════════════════════════════════════
 #  多周期数据
 # ═══════════════════════════════════════════════════════════════
@@ -59,8 +55,6 @@ def fetch_intraday_kline(code: str, timeframe: str = "15m", days: int = 10) -> L
     except Exception as e:
         logger.debug("[MktScreen] %s %s K线获取失败: %s", code, timeframe, e)
         return []
-
-
 # ═══════════════════════════════════════════════════════════════
 #  市场状态评估
 # ═══════════════════════════════════════════════════════════════
@@ -164,8 +158,6 @@ def assess_market_state() -> Dict[str, Any]:
             "warnings": warnings,
         },
     }
-
-
 # ═══════════════════════════════════════════════════════════════
 #  条件选股 — 根据市场状态生成搜索条件
 # ═══════════════════════════════════════════════════════════════
@@ -176,8 +168,6 @@ def _search_by_condition(query: str, top_n: int = 20) -> List[Dict]:
     if isinstance(result, dict) and result.get("stocks"):
         return result["stocks"]
     return []
-
-
 def search_candidates_by_market(market: Dict) -> List[Dict]:
     """根据市场状态生成选股条件，用 search_stocks 搜索。
 
@@ -224,8 +214,6 @@ def search_candidates_by_market(market: Dict) -> List[Dict]:
                 candidates.append(r)
 
     return candidates
-
-
 # ═══════════════════════════════════════════════════════════════
 #  多周期分析
 # ═══════════════════════════════════════════════════════════════
@@ -392,8 +380,6 @@ def analyze_multitimeframe(code: str) -> Dict[str, Any]:
         }
 
     return result
-
-
 # ═══════════════════════════════════════════════════════════════
 #  技术快检（保留原有，用于 Phase 1 快速筛选）
 # ═══════════════════════════════════════════════════════════════
@@ -423,8 +409,6 @@ def tech_check(code: str) -> Optional[Dict]:
         "above_ma5": closes[i] > (ma5[i] or 0),
         "above_ma20": closes[i] > (ma20[i] or 0),
     }
-
-
 # ═══════════════════════════════════════════════════════════════
 #  Phase 1 — 预筛选
 # ═══════════════════════════════════════════════════════════════
@@ -547,8 +531,6 @@ def prescreen(date: str) -> Dict[str, Any]:
         "dragon_pullback": dragon_pullback[:10],
         "candidates": filtered[:20],
     }
-
-
 # ═══════════════════════════════════════════════════════════════
 #  Phase 2 — 多周期深入分析
 # ═══════════════════════════════════════════════════════════════

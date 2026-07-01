@@ -7,7 +7,7 @@ Agent — smolagents CodeAgent/ToolCallingAgent 构建器。
 """
 from __future__ import annotations
 
-import logging
+from app.agent.log import logger
 import os
 from typing import Dict, List, Optional
 
@@ -20,8 +20,6 @@ from smolagents import (
 from app.agent.model import build_model
 from app.agent.tools.registry import build_smolagent_tools, get_local_registry as _get_local_registry
 local_registry = _get_local_registry()
-
-logger = logging.getLogger(__name__)
 
 # ── Per-user agent cache (tools + managed agents only) ────────
 _tools_cache_by_domain: Dict[str, List] = {}
@@ -39,8 +37,6 @@ def _get_agent_class():
         return ToolCallingAgent
     # 默认 CodeAgent，不再自动检测 Ollama
     return CodeAgent
-
-
 def _generate_tool_catalog(tools) -> str:
     """从工具对象自动生成目录，按模块分组。"""
     try:
@@ -69,10 +65,6 @@ def _generate_tool_catalog(tools) -> str:
 
     return "\n".join(lines)
 
-
-
-
-
 def _load_preamble() -> str:
     """从 persona.md 加载前导词（人设 + 行为规范）。"""
     from app.agent.semantics import get_persona_body
@@ -90,8 +82,6 @@ def _load_preamble() -> str:
             parts.append(f"使命：{persona.mission}")
         return "\n".join(parts)
     return "你是 QuantDinger 量化分析助手。"
-
-
 def _build_instructions(user_message: str = "",
                         language: str = "zh", tools=None,
                         domain: str = "", domain_instructions: str = "",
@@ -180,8 +170,6 @@ def _build_instructions(user_message: str = "",
 
 {tool_catalog}
 {scan_section}{modify_section}{domain_section}{calibration_section}{weight_section}{lang_section}"""
-
-
 def get_smolagent(
     user_id: int = 1,
     model: str = None,
@@ -300,5 +288,3 @@ def get_smolagent(
         "yes" if collector else "no",
     )
     return agent
-
-

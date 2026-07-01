@@ -19,7 +19,7 @@ def _strip_prefix(s):
     from app.data_sources.normalizer import strip_market_prefix
     return strip_market_prefix(s)
 
-import logging
+from app.agent.log import logger
 from typing import Any, Dict, List
 
 import requests
@@ -28,21 +28,13 @@ def _safe_float(v, default=0.0):
     from app.data_sources.normalizer import safe_float
     return safe_float(v, default)
 
-logger = logging.getLogger(__name__)
-
 _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-
-
-
-
 def _market_prefix(code: str) -> str:
     if code.startswith(("6", "9")):
         return "sh"
     elif code.startswith("8"):
         return "bj"
     return "sz"
-
-
 
 def _get_margin_trading(code: str, days: int = 60) -> Dict[str, Any]:
     """融资融券摘要。提取融资余额趋势+近期变化幅度。"""
@@ -69,8 +61,6 @@ def _get_margin_trading(code: str, days: int = 60) -> Dict[str, Any]:
         "rq_balance": round(rq_latest / 1e4, 1),
         "signal": signal,
     }
-
-
 def _get_block_trades(code: str, page_size: int = 20) -> Dict[str, Any]:
     """大宗交易摘要。提取近期成交笔数、平均溢价率、机构买卖方向。"""
     data = em_datacenter(
@@ -106,8 +96,6 @@ def _get_block_trades(code: str, page_size: int = 20) -> Dict[str, Any]:
         "inst_sell": inst_sell,
         "signal": signal,
     }
-
-
 def _get_holder_count(code: str) -> Dict[str, Any]:
     """股东户数摘要。提取最新户数、环比变化趋势。"""
     data = em_datacenter(
@@ -133,8 +121,6 @@ def _get_holder_count(code: str) -> Dict[str, Any]:
         "avg_amount": round(avg_amount, 0),
         "signal": signal,
     }
-
-
 def _get_dividend_history(code: str) -> Dict[str, Any]:
     """分红送转摘要。提取累计分红次数、连续分红年数、近期派息水平。"""
     data = em_datacenter(
@@ -160,8 +146,6 @@ def _get_dividend_history(code: str) -> Dict[str, Any]:
         "total_bonus_rmb": round(total_bonus, 3),
         "signal": "持续分红" if len(years) >= 3 else "偶有分红" if years else "无分红",
     }
-
-
 def _get_financial_statements(code: str) -> Dict[str, Any]:
     """财报关键指标摘要。只提取 Agent 关心的几个数，不返回原始表格。"""
     prefix = _market_prefix(code)
@@ -225,8 +209,6 @@ def _get_financial_statements(code: str) -> Dict[str, Any]:
         logger.warning("_get_financial_statements(%s) 利润表失败: %s", code, e)
 
     return summary
-
-
 # ══════════════════════════════════════════════════════════════
 # 对外工具 — 中长线基本面综合摘要
 # ══════════════════════════════════════════════════════════════

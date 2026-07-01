@@ -9,15 +9,9 @@ def _strip_prefix(s):
     from app.data_sources.normalizer import strip_market_prefix
     return strip_market_prefix(s)
 
-import logging
+from app.agent.log import logger
 from typing import Any, Dict, List
-
-
-logger = logging.getLogger(__name__)
-
 _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-
-
 
 # ══════════════════════════════════════════════════════════════
 # 腾讯财经批量行情（内部共用）
@@ -101,8 +95,6 @@ def _tencent_quote_raw(codes: list) -> dict:
             "pe_static":      float(vals[52]) if vals[52] else 0,
         }
     return result
-
-
 # ══════════════════════════════════════════════════════════════
 # 五档盘口
 # ══════════════════════════════════════════════════════════════
@@ -139,8 +131,6 @@ def get_order_book(codes: str) -> Dict[str, Any]:
         except Exception as e:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
-
-
 # ══════════════════════════════════════════════════════════════
 # 指数/ETF行情
 # ══════════════════════════════════════════════════════════════
@@ -181,8 +171,6 @@ def get_index_etf_quote(codes: str) -> Dict[str, Any]:
     except Exception as e:
         logger.warning("get_index_etf_quote(%s) failed: %s", codes, e)
         return {"error": str(e)}
-
-
 # ══════════════════════════════════════════════════════════════
 # 批量估值对比
 # ══════════════════════════════════════════════════════════════

@@ -8,10 +8,8 @@ Wraps TradingExecutor and StrategyService into Agent-callable tools.
 from __future__ import annotations
 
 import json
-import logging
+from app.agent.log import logger
 from typing import Any, Dict, List, Optional
-
-logger = logging.getLogger(__name__)
 
 # ── 显式依赖检查 ──────────────────────────────────────────────
 try:

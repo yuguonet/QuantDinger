@@ -8,7 +8,7 @@ market_screener/eod.py
 
 from __future__ import annotations
 
-import logging
+from app.agent.log import logger
 from typing import Any, Dict, List, Optional
 
 from app.agent.chain.schema import FactorItem, SkillReport
@@ -17,10 +17,6 @@ from .common import (
     fetch_zt_pool, fetch_hot_stocks_with_reason,
     compute_ma, compute_rsi,
 )
-
-logger = logging.getLogger(__name__)
-
-
 def prescreen() -> Dict[str, Any]:
     screener_result = call_tool(
         "search_stocks",
@@ -216,8 +212,6 @@ def prescreen() -> Dict[str, Any]:
         "main_themes": themes,
         "candidates": filtered[:15],
     }
-
-
 def deep_analyze(candidate, _tool_calls, _tool_nodes, _missing_data) -> Optional[Dict]:
     code = candidate["code"]
     try:
@@ -302,8 +296,6 @@ def deep_analyze(candidate, _tool_calls, _tool_nodes, _missing_data) -> Optional
     except Exception as e:
         logger.warning("[MktScreen] 尾盘深入分析 %s 失败: %s", code, e)
         return None
-
-
 def run_strategy(_tool_calls, _tool_nodes, _missing_data) -> Optional[SkillReport]:
     try:
         prescreen_result = prescreen()

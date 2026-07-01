@@ -1,50 +1,35 @@
 # -*- coding: utf-8 -*-
 """
-Session Store — 会话持久化存储。
+Session Store — 会话元数据 + 跨轮上下文存储。
 
-存储方式：Redis 优先 + 内存降级
-  - Redis：进程重启不丢失，支持多 worker
-  - 内存：单 worker / 无 Redis 环境自动降级
+存储方式：Redis 优先 → File → 内存降级
 
-功能：
-  - 会话 CRUD（create/get/clear/list）
-  - 对话历史管理（add_message/get_history）
-  - 上下文摘要（save_context_summary/get_context_summary）
-  - 领域隔离（domain 切换时自动丢弃旧领域上下文）
+职责（仅元数据和跨轮上下文）：
+  - 会话 CRUD（create/get/clear/list）→ session metadata（stock_code 等）
+  - 工具结果缓存（save_tool_results/get_tool_results）→ 跨轮复用
+  - 上下文摘要（save_context_summary/get_context_summary）→ 跨轮压缩
   - TTL 自动清理
   - 线程安全（per-session lock）
 
-被调用方：
-  agent.py → get_session_store() → 所有会话操作
-  agent.py → store.session_lock(session_id) → 防止并发交错
-
-公开接口：
-  get_session_store() → SessionStore（单例）
-  SessionStore.create_session(session_id, metadata) → dict
-  SessionStore.get_session(session_id) → Optional[dict]
-  SessionStore.add_message(session_id, role, content) → None
-  SessionStore.get_history(session_id, limit) → List[dict]
-  SessionStore.save_context_summary(session_id, summary, domain) → None
-  SessionStore.get_context_summary(session_id, current_domain, with_age) → str | tuple
-  SessionStore.session_lock(session_id) → context manager
+⚠️ 消息历史由 LangGraph Checkpointer 统一管理，本模块不处理消息。
 """
 from __future__ import annotations
 
 import json
-import logging
+
 import os
 import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
+from app.agent.log import logger
 
 
-# ── Shared context summary helpers ─────────────────────────────
+# ── Context summary helpers ──────────────────────────────────
 
-def _append_summary_round(summaries, key, summary, max_rounds=5):
-    """Append a summary round to the given key in a context_summaries dict."""
+def _append_summary_round(summaries: dict, key: str, summary: str, max_rounds: int = 5):
+    """Append a summary round (dict mutation)."""
     rounds = summaries.get(key)
     if not isinstance(rounds, list):
         rounds = []
@@ -55,11 +40,8 @@ def _append_summary_round(summaries, key, summary, max_rounds=5):
     summaries[key] = rounds
 
 
-def _format_context_rounds(rounds, with_age=False):
-    """Format a rounds value (list of dict or legacy str) to output format.
-
-    Returns (str, int) if with_age else str.
-    """
+def _format_context_rounds(rounds, with_age: bool = False):
+    """Format rounds list → str, or (str, round_count) when with_age=True."""
     if isinstance(rounds, str) and rounds:
         return (rounds, 0) if with_age else rounds
     if not isinstance(rounds, list) or not rounds:
@@ -69,7 +51,7 @@ def _format_context_rounds(rounds, with_age=False):
     return (joined, len(rounds)) if with_age else joined
 
 
-def _redis_parse_rounds(raw):
+def _redis_parse_rounds(raw) -> list:
     """Parse a raw Redis hash value into a rounds list."""
     if raw is None:
         return []
@@ -85,7 +67,6 @@ def _redis_parse_rounds(raw):
 
 # Redis keys
 _SESSION_PREFIX = "agent:session:"
-_CONVERSATION_PREFIX = "agent:conv:"
 _TOOL_RESULTS_PREFIX = "agent:tool_results:"
 
 
@@ -110,14 +91,15 @@ def _get_redis():
         return None
 
 
-# ── In-memory fallback ───────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+#  In-memory fallback
+# ═══════════════════════════════════════════════════════════════
 
 class _InMemoryStore:
-    """Thread-safe in-memory session store."""
+    """Thread-safe in-memory session store (metadata + tool results + context)."""
 
     def __init__(self, max_sessions: int = 200, session_ttl: int = 7200):
         self._sessions: Dict[str, Dict] = {}
-        self._conversations: Dict[str, List[Dict]] = {}
         self._tool_results: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
         self._session_locks: Dict[str, threading.Lock] = {}
@@ -126,21 +108,12 @@ class _InMemoryStore:
         self._session_ttl = session_ttl
 
     def _get_session_lock(self, session_id: str) -> threading.Lock:
-        """Get or create a per-session lock."""
         with self._session_locks_master:
             if session_id not in self._session_locks:
                 self._session_locks[session_id] = threading.Lock()
             return self._session_locks[session_id]
 
     def session_lock(self, session_id: str):
-        """Return a context manager that locks a specific session.
-
-        Usage:
-            with store.session_lock(sid):
-                history = store.get_history(sid)
-                # ... process ...
-                store.add_message(sid, "assistant", reply)
-        """
         return self._get_session_lock(session_id)
 
     # ── Session CRUD ─────────────────────────────────────────
@@ -150,7 +123,7 @@ class _InMemoryStore:
             s = self._sessions.get(session_id)
             if s and time.time() - s.get("updated_at", 0) > self._session_ttl:
                 self._sessions.pop(session_id, None)
-                self._conversations.pop(session_id, None)
+                self._tool_results.pop(session_id, None)
                 return None
             return s
 
@@ -158,7 +131,6 @@ class _InMemoryStore:
         with self._lock:
             self._maybe_cleanup()
             session = {
-                "messages": data.get("messages", []),
                 "created_at": data.get("created_at", time.time()),
                 "updated_at": time.time(),
                 "stock_code": data.get("stock_code"),
@@ -174,7 +146,6 @@ class _InMemoryStore:
 
     def delete_session(self, session_id: str) -> bool:
         with self._lock:
-            self._conversations.pop(session_id, None)
             self._tool_results.pop(session_id, None)
             return self._sessions.pop(session_id, None) is not None
 
@@ -184,34 +155,9 @@ class _InMemoryStore:
                            key=lambda x: x[1].get("updated_at", 0), reverse=True)[:limit]
             return [{"session_id": sid, **s} for sid, s in items]
 
-    # ── Conversation history ─────────────────────────────────
-
-    def get_history(self, session_id: str) -> List[Dict]:
-        with self._lock:
-            return list(self._conversations.get(session_id, []))
-
-    def add_message(self, session_id: str, role: str, content: str, max_turns: int = 20):
-        with self._lock:
-            if session_id not in self._conversations:
-                self._conversations[session_id] = []
-            self._conversations[session_id].append({"role": role, "content": content})
-            max_msgs = max_turns * 2
-            if len(self._conversations[session_id]) > max_msgs:
-                self._conversations[session_id] = self._conversations[session_id][-max_msgs:]
-
-    def clear_history(self, session_id: str):
-        with self._lock:
-            self._conversations.pop(session_id, None)
-
     # ── Tool results (cross-turn context) ─────────────────────
 
     def save_tool_results(self, session_id: str, results: Dict[str, Any]) -> None:
-        """Persist tool call results for reuse in subsequent turns.
-
-        Args:
-            session_id: Session identifier.
-            results: Dict mapping stock_code → {quote, trend, news, ...}.
-        """
         with self._lock:
             existing = self._tool_results.get(session_id, {})
             for stock_code, data in results.items():
@@ -232,7 +178,6 @@ class _InMemoryStore:
     # ── Compressed context (跨轮上下文压缩) ──────────────────
 
     def save_context_summary(self, session_id: str, summary: str, domain: str = "") -> None:
-        """保存压缩上下文摘要。按领域分别存储，追加轮次而非覆盖。空summary只确保key存在，不清除已有轮次。"""
         with self._lock:
             s = self._sessions.setdefault(session_id, {})
             if domain:
@@ -249,12 +194,6 @@ class _InMemoryStore:
             s["updated_at"] = time.time()
 
     def get_context_summary(self, session_id: str, current_domain: str = "", with_age: bool = False):
-        """获取指定领域的压缩上下文摘要。
-
-        Returns:
-            with_age=False: 拼接后的摘要字符串（带轮次分隔符）
-            with_age=True: (拼接摘要, 总轮次数) 元组
-        """
         with self._lock:
             if not current_domain:
                 return ("", 0) if with_age else ""
@@ -268,7 +207,6 @@ class _InMemoryStore:
         if len(self._sessions) >= self._max_sessions:
             oldest = min(self._sessions, key=lambda s: self._sessions[s].get("updated_at", 0))
             self._sessions.pop(oldest, None)
-            self._conversations.pop(oldest, None)
             self._tool_results.pop(oldest, None)
 
     def cleanup_expired(self):
@@ -278,85 +216,53 @@ class _InMemoryStore:
                        if now - s.get("updated_at", 0) > self._session_ttl]
             for sid in expired:
                 self._sessions.pop(sid, None)
-                self._conversations.pop(sid, None)
                 self._tool_results.pop(sid, None)
             if expired:
                 logger.info("Cleaned up %d expired sessions (memory)", len(expired))
 
 
-# ── Redis store ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+#  Redis store
+# ═══════════════════════════════════════════════════════════════
 
 class _RedisStore:
-    """Redis-backed session store."""
-
-    # Lua script: atomic read-append-trim for conversation history.
-    # KEYS[1] = conversation key
-    # ARGV[1] = message JSON (role+content)
-    # ARGV[2] = max messages to keep
-    # ARGV[3] = TTL seconds
-    _LUA_ADD_MESSAGE = """
-    local key = KEYS[1]
-    local msg = ARGV[1]
-    local max_msgs = tonumber(ARGV[2])
-    local ttl = tonumber(ARGV[3])
-    local raw = redis.call('GET', key)
-    local history = {}
-    if raw then
-        history = cjson.decode(raw)
-    end
-    table.insert(history, cjson.decode(msg))
-    if #history > max_msgs then
-        local trimmed = {}
-        for i = #history - max_msgs + 1, #history do
-            trimmed[#trimmed + 1] = history[i]
-        end
-        history = trimmed
-    end
-    local out = cjson.encode(history)
-    redis.call('SETEX', key, ttl, out)
-    return out
-    """
+    """Redis-backed session store (metadata + tool results + context)."""
 
     def __init__(self, redis_client, session_ttl: int = 7200):
         self._r = redis_client
         self._ttl = session_ttl
         self._session_locks: Dict[str, threading.Lock] = {}
         self._session_locks_master = threading.Lock()
-        # Register Lua script
-        self._lua_add = self._r.register_script(self._LUA_ADD_MESSAGE)
 
     def _get_session_lock(self, session_id: str) -> threading.Lock:
-        """Get or create a per-session lock for this worker process."""
         with self._session_locks_master:
             if session_id not in self._session_locks:
                 self._session_locks[session_id] = threading.Lock()
             return self._session_locks[session_id]
 
     def session_lock(self, session_id: str):
-        """Return a context manager that locks a specific session.
-
-        Note: This is per-process locking. For multi-worker deployments,
-        Redis Lua scripts provide atomicity for add_message().
-        """
         return self._get_session_lock(session_id)
 
     def _session_key(self, session_id: str) -> str:
         return f"{_SESSION_PREFIX}{session_id}"
 
-    def _conv_key(self, session_id: str) -> str:
-        return f"{_CONVERSATION_PREFIX}{session_id}"
+    def _tool_results_key(self, session_id: str) -> str:
+        return f"{_TOOL_RESULTS_PREFIX}{session_id}"
+
+    def _context_summaries_key(self, session_id: str) -> str:
+        return f"quantdinger:ctx_summaries:{session_id}"
+
+    def _context_domain_key(self, session_id: str) -> str:
+        return f"quantdinger:ctx_domain:{session_id}"
 
     # ── Session CRUD ─────────────────────────────────────────
 
     def get_session(self, session_id: str) -> Optional[Dict]:
         raw = self._r.get(self._session_key(session_id))
-        if raw:
-            return json.loads(raw)
-        return None
+        return json.loads(raw) if raw else None
 
     def create_session(self, session_id: str, data: Dict) -> Dict:
         session = {
-            "messages": data.get("messages", []),
             "created_at": data.get("created_at", time.time()),
             "updated_at": time.time(),
             "stock_code": data.get("stock_code"),
@@ -375,7 +281,6 @@ class _RedisStore:
     def delete_session(self, session_id: str) -> bool:
         pipe = self._r.pipeline()
         pipe.delete(self._session_key(session_id))
-        pipe.delete(self._conv_key(session_id))
         pipe.delete(self._tool_results_key(session_id))
         pipe.delete(self._context_summaries_key(session_id))
         pipe.delete(self._context_domain_key(session_id))
@@ -394,37 +299,7 @@ class _RedisStore:
         sessions.sort(key=lambda x: x.get("updated_at", 0), reverse=True)
         return sessions[:limit]
 
-    # ── Conversation history ─────────────────────────────────
-
-    def get_history(self, session_id: str) -> List[Dict]:
-        raw = self._r.get(self._conv_key(session_id))
-        if raw:
-            return json.loads(raw)
-        return []
-
-    def add_message(self, session_id: str, role: str, content: str, max_turns: int = 20):
-        """Atomically append a message using Lua script (no TOCTOU race)."""
-        key = self._conv_key(session_id)
-        msg = json.dumps({"role": role, "content": content}, ensure_ascii=False)
-        max_msgs = max_turns * 2
-        try:
-            self._lua_add(keys=[key], args=[msg, max_msgs, self._ttl])
-        except Exception:
-            # Fallback: non-atomic (Lua script failure, e.g. Redis < 2.6)
-            raw = self._r.get(key)
-            history = json.loads(raw) if raw else []
-            history.append({"role": role, "content": content})
-            if len(history) > max_msgs:
-                history = history[-max_msgs:]
-            self._r.setex(key, self._ttl, json.dumps(history, ensure_ascii=False))
-
-    def clear_history(self, session_id: str):
-        self._r.delete(self._conv_key(session_id))
-
     # ── Tool results (cross-turn context) ─────────────────────
-
-    def _tool_results_key(self, session_id: str) -> str:
-        return f"{_TOOL_RESULTS_PREFIX}{session_id}"
 
     def save_tool_results(self, session_id: str, results: Dict[str, Any]) -> None:
         key = self._tool_results_key(session_id)
@@ -446,12 +321,6 @@ class _RedisStore:
 
     # ── Compressed context ───────────────────────────────────
 
-    def _context_summaries_key(self, session_id: str) -> str:
-        return f"quantdinger:ctx_summaries:{session_id}"
-
-    def _context_domain_key(self, session_id: str) -> str:
-        return f"quantdinger:ctx_domain:{session_id}"
-
     def save_context_summary(self, session_id: str, summary: str, domain: str = "") -> None:
         key = self._context_summaries_key(session_id)
         if domain:
@@ -462,7 +331,6 @@ class _RedisStore:
                 if len(rounds) > 5:
                     rounds = rounds[-5:]
                 self._r.hset(key, domain, json.dumps(rounds, ensure_ascii=False))
-            # 空 summary → 不处理（不清除已有轮次）
             self._r.expire(key, 3600)
             self._r.set(self._context_domain_key(session_id), domain, ex=3600)
         elif summary:
@@ -477,9 +345,6 @@ class _RedisStore:
                 self._r.hset(key, cur, json.dumps(rounds, ensure_ascii=False))
                 self._r.expire(key, 3600)
 
-    def _context_ages_key(self, session_id: str) -> str:
-        return f"quantdinger:ctx_ages:{session_id}"
-
     def get_context_summary(self, session_id: str, current_domain: str = "", with_age: bool = False):
         if not current_domain:
             return ("", 0) if with_age else ""
@@ -493,38 +358,31 @@ class _RedisStore:
                 return _format_context_rounds(rounds, with_age)
         except (ValueError, TypeError):
             pass
-        # 兼容旧格式（纯字符串）
         return (data, 0) if with_age else data
-
-    # ── Maintenance (Redis handles TTL natively) ─────────────
 
     def cleanup_expired(self):
         pass  # Redis EXPIRE handles this automatically
 
 
-# ── File store ───────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+#  File store
+# ═══════════════════════════════════════════════════════════════
 
 class _FileStore:
-    """File-backed session store.
+    """File-backed session store (metadata + tool results + context).
 
-    Each session is persisted as a JSON file under SESSION_DIR:
-        {SESSION_DIR}/{session_id}.json
-
+    Each session → {SESSION_DIR}/{session_id}.json
     File structure:
         {
-            "session": { ... session metadata ... },
-            "history": [ {role, content}, ... ],
+            "session": { ... metadata (stock_code, created_at, ...) ... },
             "tool_results": { stock_code: { ... } },
-            "context_summaries": { domain: summary },
+            "context_summaries": { domain: [{round, summary}, ...] },
             "current_domain": "..."
         }
-
-    Survives process restarts. No external dependencies.
     """
 
     def __init__(self, session_dir: str, session_ttl: int = 7200, max_sessions: int = 200):
-        import pathlib
-        self._dir = pathlib.Path(session_dir)
+        self._dir = Path(session_dir)
         self._dir.mkdir(parents=True, exist_ok=True)
         self._ttl = session_ttl
         self._max = max_sessions
@@ -533,14 +391,12 @@ class _FileStore:
         self._session_locks_master = threading.Lock()
 
     def _get_session_lock(self, session_id: str) -> threading.Lock:
-        """Get or create a per-session lock."""
         with self._session_locks_master:
             if session_id not in self._session_locks:
                 self._session_locks[session_id] = threading.Lock()
             return self._session_locks[session_id]
 
     def session_lock(self, session_id: str):
-        """Return a context manager that locks a specific session."""
         return self._get_session_lock(session_id)
 
     def _path(self, session_id: str) -> Path:
@@ -568,7 +424,6 @@ class _FileStore:
             os.replace(tmp, p)
         except OSError as e:
             logger.error("[FileStore] Failed to write session %s: %s", session_id, e)
-            # Clean up temp file on failure
             if tmp is not None:
                 try:
                     os.unlink(tmp)
@@ -595,14 +450,12 @@ class _FileStore:
         with self._lock:
             self._maybe_cleanup()
             session = {
-                "messages": data.get("messages", []),
                 "created_at": data.get("created_at", time.time()),
                 "updated_at": time.time(),
                 "stock_code": data.get("stock_code"),
             }
             full = {
                 "session": session,
-                "history": [],
                 "tool_results": {},
                 "context_summaries": {},
                 "current_domain": "",
@@ -644,42 +497,6 @@ class _FileStore:
                 sessions.append({"session_id": sid, **s})
             return sessions
 
-    # ── Conversation history ─────────────────────────────────
-
-    def get_history(self, session_id: str) -> List[Dict]:
-        with self._lock:
-            data = self._read(session_id)
-            return list(data.get("history", [])) if data else []
-
-    def add_message(self, session_id: str, role: str, content: str, max_turns: int = 20):
-        with self._lock:
-            data = self._read(session_id)
-            if not data:
-                data = {
-                    "session": {"messages": [], "created_at": time.time(), "updated_at": time.time()},
-                    "history": [],
-                    "tool_results": {},
-                    "context_summaries": {},
-                    "current_domain": "",
-                }
-            history = data.setdefault("history", [])
-            history.append({"role": role, "content": content})
-            max_msgs = max_turns * 2
-            if len(history) > max_msgs:
-                data["history"] = history[-max_msgs:]
-            # Also update session.messages for compatibility
-            data["session"]["messages"] = data["history"]
-            data["session"]["updated_at"] = time.time()
-            self._write(session_id, data)
-
-    def clear_history(self, session_id: str):
-        with self._lock:
-            data = self._read(session_id)
-            if data:
-                data["history"] = []
-                data["session"]["messages"] = []
-                self._write(session_id, data)
-
     # ── Tool results (cross-turn context) ─────────────────────
 
     def save_tool_results(self, session_id: str, results: Dict[str, Any]) -> None:
@@ -715,7 +532,6 @@ class _FileStore:
             if not data:
                 data = {
                     "session": {"updated_at": time.time()},
-                    "history": [],
                     "tool_results": {},
                     "context_summaries": {},
                     "current_domain": "",
@@ -744,12 +560,9 @@ class _FileStore:
             rounds = data.get("context_summaries", {}).get(current_domain, "")
             return _format_context_rounds(rounds, with_age)
 
-    # ── Maintenance ──────────────────────────────────────────
-
     def _maybe_cleanup(self):
         files = sorted(self._dir.glob("*.json"), key=lambda x: x.stat().st_mtime)
         if len(files) >= self._max:
-            # Remove oldest files
             for f in files[: len(files) - self._max + 1]:
                 f.unlink(missing_ok=True)
 
@@ -768,7 +581,9 @@ class _FileStore:
             logger.info("[FileStore] Cleaned up %d expired sessions", removed)
 
 
-# ── Public API ───────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+#  Public API
+# ═══════════════════════════════════════════════════════════════
 
 _store = None
 _store_lock = threading.Lock()
@@ -791,12 +606,11 @@ def get_session_store():
     with _store_lock:
         if _store is not None:
             return _store
-        import os
+
         session_ttl = int(os.getenv("AGENT_SESSION_TTL", "7200"))
         max_sessions = int(os.getenv("AGENT_MAX_SESSIONS", "200"))
         backend = os.getenv("SESSION_BACKEND", "").strip().lower()
 
-        # Explicit backend selection
         if backend == "redis":
             redis_client = _get_redis()
             if redis_client:

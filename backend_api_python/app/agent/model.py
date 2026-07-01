@@ -13,7 +13,7 @@ Model Adapter — 桥接 QuantDinger LLM 配置到 smolagents OpenAIModel。
 """
 from __future__ import annotations
 
-import logging
+from app.agent.log import logger
 import os
 from typing import Any, Optional
 
@@ -22,10 +22,6 @@ import re as _re
 import json as _json
 
 from app.services.llm import LLMService, LLMProvider, PROVIDER_CONFIGS
-
-logger = logging.getLogger(__name__)
-
-
 def _fix_llm_output(text: str) -> str:
     """修复本地模型不遵循 final_answer() 格式的问题。
     如果 LLM 输出了裸 JSON (```json 块)，自动包装成 final_answer() 调用。"""
@@ -45,8 +41,6 @@ def _fix_llm_output(text: str) -> str:
         except _json.JSONDecodeError:
             pass
     return text
-
-
 class _WrappedOpenAIModel(OpenAIModel):
     """包装 OpenAIModel，在 generate 后自动修复输出格式。"""
 
@@ -55,8 +49,6 @@ class _WrappedOpenAIModel(OpenAIModel):
         if hasattr(result, 'content') and isinstance(result.content, str):
             result.content = _fix_llm_output(result.content)
         return result
-
-
 def build_model(
     model: str = None,
     provider: str = None,

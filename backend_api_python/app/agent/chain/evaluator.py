@@ -18,7 +18,7 @@ Evaluator — 回溯评估引擎（重写版）。
 from __future__ import annotations
 
 import json
-import logging
+from app.agent.log import logger
 import math
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
@@ -27,10 +27,6 @@ from app.agent.chain.schema import (
     DIRECTION_THRESHOLD, Direction, classify_return, is_direction_correct,
 )
 from app.agent.chain import store
-
-logger = logging.getLogger(__name__)
-
-
 # ═══════════════════════════════════════════════════════════════
 # timeframe → 验证窗口映射
 # ═══════════════════════════════════════════════════════════════
@@ -46,13 +42,9 @@ _TIMEFRAME_DAYS = {
 }
 
 _DEFAULT_HOLD_DAYS = 3  # timeframe 缺失时的默认值
-
-
 def _get_hold_days(timeframe: str) -> int:
     """timeframe → 验证用持有天数。"""
     return _TIMEFRAME_DAYS.get(timeframe, _DEFAULT_HOLD_DAYS)
-
-
 # ═══════════════════════════════════════════════════════════════
 # 实际行情获取
 # ═══════════════════════════════════════════════════════════════
@@ -112,8 +104,6 @@ def _get_actual_return(
     except Exception as e:
         logger.warning("[Evaluator] 获取实际涨跌失败 %s: %s", stock_code, e)
         return None
-
-
 # ═══════════════════════════════════════════════════════════════
 # 评估执行
 # ═══════════════════════════════════════════════════════════════
@@ -213,8 +203,6 @@ def evaluate_pending(days_old: int = 1, market: str = "CNStock") -> Dict[str, An
             logger.warning("[Evaluator] 自动更新权重失败: %s", e)
 
     return stats
-
-
 # ═══════════════════════════════════════════════════════════════
 # Skill 权重更新（按单位时间收益率）
 # ═══════════════════════════════════════════════════════════════
@@ -261,8 +249,6 @@ def _calc_skill_weight_from_trades(trades: List[Dict]) -> Dict[str, float]:
         "return_per_day": round(return_per_day, 4),
         "sample_count": total,
     }
-
-
 def update_weights(days: int = 90) -> Dict[str, Any]:
     """更新 qd_agent_weights 表（统一 skill + factor）。
 
@@ -433,18 +419,12 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
     logger.info("[Evaluator] 权重更新: 同步 %d, skill %d, factor %d, 清理 %d",
                 stats["synced"], stats["skill_updated"], stats["factor_updated"], stats["factor_cleaned"])
     return stats
-
-
 def update_skill_weights(days: int = 90) -> Dict[str, Any]:
     """兼容旧接口。"""
     return update_weights(days)
-
-
 def update_factor_weights(days: int = 90) -> Dict[str, Any]:
     """兼容旧接口。"""
     return update_weights(days)
-
-
 # ═══════════════════════════════════════════════════════════════
 # 评估报告
 # ═══════════════════════════════════════════════════════════════
@@ -515,8 +495,6 @@ def get_eval_report(days: int = 30) -> Dict[str, Any]:
         logger.error("[Evaluator] 获取评估报告失败: %s", e)
 
     return result
-
-
 # ═══════════════════════════════════════════════════════════════
 # 自动评估入口
 # ═══════════════════════════════════════════════════════════════
@@ -540,8 +518,6 @@ def auto_evaluate(days_old: int = 1, market: str = "CNStock") -> Dict[str, Any]:
         result["report"] = {"error": str(e)}
 
     return result
-
-
 # ═══════════════════════════════════════════════════════════════
 # 后台 Worker
 # ═══════════════════════════════════════════════════════════════
@@ -561,8 +537,6 @@ def get_worker_health() -> Dict[str, Any]:
     h["next_run_in_seconds"] = _seconds_until_post_market() if h["is_alive"] else None
     h["schedule"] = "每天 15:30（盘后）"
     return h
-
-
 def _seconds_until_post_market() -> float:
     """计算距离下一个盘后 15:30 的秒数。"""
     from datetime import datetime
@@ -577,8 +551,6 @@ def _seconds_until_post_market() -> float:
         from datetime import timedelta
         target += timedelta(days=1)
     return max(0, (target - now).total_seconds())
-
-
 def start_eval_worker():
     """启动后台评估 worker（盘后 15:30 每天运行一次，T+N 验证）。"""
     global _eval_thread, _eval_stop
@@ -620,8 +592,6 @@ def start_eval_worker():
     _eval_thread = threading.Thread(target=_worker, daemon=True, name="eval-worker")
     _eval_thread.start()
     logger.info("[EvalWorker] 盘后回溯评估 worker 已启动")
-
-
 def stop_eval_worker():
     global _eval_stop
     if _eval_stop:

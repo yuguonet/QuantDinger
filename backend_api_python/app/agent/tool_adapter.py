@@ -7,12 +7,8 @@ Combines local registry tools + smolagents Hub tools + MCP tools.
 """
 from __future__ import annotations
 
-import logging
+from app.agent.log import logger
 from typing import Any, List
-
-logger = logging.getLogger(__name__)
-
-
 def build_all_tools() -> List[Any]:
     """汇总所有可用工具（本地 + builtin + hub/MCP），返回 smolagents Tool 对象列表。
 
@@ -37,8 +33,6 @@ def build_all_tools() -> List[Any]:
     tools.extend(hub_tools)
 
     return tools
-
-
 def _load_builtin_tools() -> List[Any]:
     """加载 smolagents 内置工具（如 web_search, visit_webpage 等）。"""
     builtin_ids = [
@@ -57,8 +51,6 @@ def _load_builtin_tools() -> List[Any]:
         except Exception:
             pass
     return result
-
-
 def _load_hub_tools() -> List[Any]:
     """加载 smolagents Hub 上托管的工具（最佳努力，忽略失败）。"""
     tools = []

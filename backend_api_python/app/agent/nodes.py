@@ -4,16 +4,28 @@ Nodes — LangGraph 节点函数。
 
 图：prepare → planner → agent → finalize
 上下文通过 LangGraph Checkpointer 自动持久化。
+
+P1: trim_messages 替代硬编码 messages[-12:]
+P2: finalize_node 自动压缩旧消息 → context_summary
+    prepare_node 注入 context_summary 到旁路 LLM 调用
 """
 from __future__ import annotations
 
 import json
-import logging
+
 from typing import Any, Dict, Optional
 
 from app.agent.state import AgentState, AgentResult, StepRecord
+from app.agent.utils import trim_messages, estimate_tokens
 
-logger = logging.getLogger(__name__)
+from app.agent.log import logger
+from app.agent.cache import cache
+
+# ── 上下文裁剪常量 ──────────────────────────────────────────
+MAX_CONTEXT_TOKENS = 8000      # LLM 调用时的消息 token 预算
+KEEP_RECENT_MESSAGES = 6       # 裁剪时至少保留的最近消息数
+SUMMARIZE_THRESHOLD = 16       # 消息超过此条数时触发自动摘要
+
 
 # ── 外部存储（不可序列化对象）────────────────────────────────
 # TraceCollector / smolagents Agent 实例不可被 msgpack 序列化，
@@ -64,8 +76,15 @@ def get_active_agent(session_id: str) -> Optional[Any]:
 #  公共工具
 # ═══════════════════════════════════════════════════════════════
 
+_llm_call_fn = None  # 缓存 LLM 调用函数，避免每次重建
+
+
 def _build_llm_call():
-    """构建 LLM 调用函数（直连 OpenAI API，不走 smolagents）。"""
+    """构建 LLM 调用函数（直连 OpenAI API，不走 smolagents）。模块级缓存，只构建一次。"""
+    global _llm_call_fn
+    if _llm_call_fn is not None:
+        return _llm_call_fn
+
     from app.services.llm import LLMService
     import requests as _requests
 
@@ -79,14 +98,30 @@ def _build_llm_call():
         """支持 str 或 list[dict] 两种入参。"""
         if isinstance(messages, str):
             messages = [{"role": "user", "content": messages}]
-        resp = _requests.post(
-            f"{base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": model_id, "messages": messages, "temperature": 0.05, "max_tokens": 1024},
-            timeout=60.0,
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        payload = {
+            "model": model_id,
+            "messages": messages,
+            "temperature": 0.05,
+            "max_tokens": 1024,
+        }
+        logger.debug("[LLM] 请求: %s %s, model=%s, msgs=%d",
+                     f"{base_url}/chat/completions", "POST", model_id, len(messages))
+        try:
+            resp = _requests.post(
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=60.0,
+            )
+            if resp.status_code != 200:
+                logger.warning("[LLM] 服务返回 %d: %s", resp.status_code, resp.text[:300])
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            logger.error("[LLM] 调用失败: %s", e)
+            raise
+
+    _llm_call_fn = llm_call
     return llm_call
 
 
@@ -107,9 +142,70 @@ def _build_intent_obj(state: AgentState):
     )
 
 
-def _get_history_from_state(state: AgentState) -> list:
+def _get_history_from_state(state: AgentState, max_tokens: int = MAX_CONTEXT_TOKENS) -> list:
+    """从 state 获取裁剪后的消息历史（token 级裁剪，非硬编码条数）。
+
+    P1: 用 trim_messages 替代 messages[-12:]
+    """
     messages = state.get("messages", [])
-    return [{"role": m.get("role", "user"), "content": m.get("content", "")} for m in messages[-12:]]
+    if not messages:
+        return []
+    # 统一转为 OpenAI API 格式: {"role":..., "content":...}
+    _type_to_role = {"human": "user", "ai": "assistant", "system": "system", "tool": "tool"}
+    dicts = []
+    for m in messages:
+        if isinstance(m, dict):
+            role = m.get("role") or _type_to_role.get(m.get("type", "")) or "user"
+            content = m.get("content", "")
+            dicts.append({"role": role, "content": content if content else ""})
+        elif hasattr(m, "model_dump"):
+            d = m.model_dump()
+            role = d.get("role") or _type_to_role.get(d.get("type", "")) or "user"
+            content = d.get("content", "")
+            dicts.append({"role": role, "content": content if content else ""})
+        elif hasattr(m, "role") and hasattr(m, "content"):
+            dicts.append({"role": m.role, "content": m.content})
+        else:
+            dicts.append({"role": "user", "content": str(m)})
+    return trim_messages(dicts, max_tokens=max_tokens, keep_recent=KEEP_RECENT_MESSAGES)
+
+
+def _summarize_messages(messages: list, query: str, domain: str) -> str:
+    """用 LLM 压缩旧消息为摘要（P2: 上下文压缩）。
+
+    只摘要 user/assistant 消息，跳过 system/tool 消息。
+    """
+    # 提取纯文本对话
+    parts = []
+    for m in messages:
+        role = m.get("role", "")
+        if role in ("user", "assistant"):
+            content = m.get("content", "")
+            if isinstance(content, str) and content:
+                parts.append(f"{role}: {content[:200]}")
+    if not parts:
+        return ""
+    dialogue = "\n".join(parts[-20:])  # 最多取最近 20 条
+
+    prompt = f"""请将以下对话历史压缩为一段简洁的上下文摘要（100字以内）。
+保留关键信息：用户关注的股票、分析结论、重要数据点。
+丢弃：寒暄、重复、工具调用细节。
+
+领域: {domain}
+当前问题: {query}
+
+对话历史:
+{dialogue}
+
+要求：直接输出摘要，不要解释。"""
+
+    try:
+        llm_call = _build_llm_call()
+        summary = llm_call([{"role": "user", "content": prompt}])
+        return summary.strip()[:500]  # 限制长度
+    except Exception as e:
+        logger.warning("[Summarize] 摘要生成失败: %s", e)
+        return ""
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -124,7 +220,7 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
 
     _check_negative_feedback(state)
 
-    # 意图分析
+    # 意图分析（P2: 传入 context_summary 用于跨轮理解）
     domain = ""
     intent_data = {}
     intent_verb = ""
@@ -156,12 +252,12 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
     if domain in ("chat", "unknown"):
         try:
             llm_call = _build_llm_call()
-            _history = _get_history_from_state(state)
-            _msgs = [
-                {"role": "system", "content": "你是 QuantDinger 量化分析助手。简洁友好地回复用户。"},
-                *_history[-6:],
-                {"role": "user", "content": query},
-            ]
+            _history = _get_history_from_state(state, max_tokens=4000)
+            # P2: 注入 context_summary 到 system prompt
+            _system = "你是 QuantDinger 量化分析助手。简洁友好地回复用户。"
+            if prev_context_summary:
+                _system += f"\n\n[上文摘要] {prev_context_summary}"
+            _msgs = [{"role": "system", "content": _system}, *_history[-6:], {"role": "user", "content": query}]
             content = llm_call(_msgs)
         except Exception as e:
             logger.warning("[Prepare] 旁路 LLM 调用失败: %s", e)
@@ -175,16 +271,13 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
             "final_output": {"reply": content},
             "should_continue": False,
             "all_phases_completed": True,
-            # 不设 step_records，让 finalize 走快速通道，保留 reply 字段
         }
 
     # stock_code — 始终走 3 级提取（context → 正则 → 中文名解析）
-    # 金融领域必须同时拿到 code + name，任一缺失则两者皆空
     stock_code = ""
     stock_name = ""
     if domain in ("finance", "trading"):
         import re
-        # ── 级别 2: 正则提取 6 位数字代码 ─────────────────────
         m = re.search(r'(?<!\d)(\d{6})(?!\d)', query)
         if m:
             _candidate_code = m.group(1)
@@ -196,27 +289,22 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
                     stock_name = _stock.get("name", "")
             except Exception:
                 pass
-        # ── 级别 3: 中文名解析（正则未命中时）──────────────────
         if not stock_code:
             from app.agent.text_utils import extract_stock_from_message
             _code, _name = extract_stock_from_message(query)
             if _code and _name:
-                # 中文名解析才校验名称是否在消息中
                 if _name in query:
                     stock_code, stock_name = _code, _name
                 else:
                     logger.warning("[Prepare] 中文名 '%s' 不在消息中，丢弃匹配", _name)
-        # ── 级别 1: context（上轮残留，仅当前轮未识别到新代码时继承）──
         if not stock_code:
             _ctx_code = state.get("stock_code", "")
             _ctx_name = state.get("stock_name", "")
             if _ctx_code and _ctx_name:
                 stock_code, stock_name = _ctx_code, _ctx_name
-        # ── 校验：必须同时有 code 和 name ─────────────────────
         if bool(stock_code) != bool(stock_name):
             logger.warning("[Prepare] code/name 不完整 (code=%s, name=%s)，清空", stock_code, stock_name)
             stock_code, stock_name = "", ""
-        # ── 级别 4: 用 search_stock_by_name 工具搜索 ──────────
         if not stock_code and intent_verb in ("analyze", "query"):
             import re as _re
             _candidates = _re.findall(r'[\u4e00-\u9fff]{2,8}', query)
@@ -236,17 +324,16 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
                 except Exception:
                     pass
 
-    # ── 金融域但未识别到股票 → 走旁路 LLM 快速通道，不过 planner ──
+    # ── 金融域但未识别到股票 → 走旁路 LLM 快速通道 ──
     if domain in ("finance", "trading") and not stock_code:
         logger.info("[Prepare] 金融域但未识别股票代码，走旁路 LLM")
         try:
             llm_call = _build_llm_call()
-            _history = _get_history_from_state(state)
-            _msgs = [
-                {"role": "system", "content": "你是 QuantDinger 量化分析助手。简洁友好地回复用户。"},
-                *_history[-6:],
-                {"role": "user", "content": query},
-            ]
+            _history = _get_history_from_state(state, max_tokens=4000)
+            _system = "你是 QuantDinger 量化分析助手。简洁友好地回复用户。"
+            if prev_context_summary:
+                _system += f"\n\n[上文摘要] {prev_context_summary}"
+            _msgs = [{"role": "system", "content": _system}, *_history[-6:], {"role": "user", "content": query}]
             content = llm_call(_msgs)
         except Exception as e:
             logger.warning("[Prepare] 旁路 LLM 调用失败: %s", e)
@@ -263,7 +350,6 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
         }
 
     # ── 编排路径缓存：qd_traces 命中 → 跳过 LLM#2 ──
-    # 质量门：意图置信度 → 聚合 win_rate → 步数 → 子节点 → 工具权重
     intent_confidence = intent_data.get("confidence", 0) if intent_data else 0
     cached_tools = None
     if intent_verb and intent_noun:
@@ -273,7 +359,6 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
             from app.agent.chain.store import query_cached_tools
             cached_tools = query_cached_tools(domain, intent_verb, intent_noun, stock_code)
             if cached_tools:
-                # 校验：缓存工具里不能有低权重工具
                 try:
                     from app.agent.chain.store import query_low_weight_tools
                     low_weight = query_low_weight_tools()
@@ -285,9 +370,8 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
                     pass
             if cached_tools:
                 logger.info("[Prepare] 缓存命中: %s+%s+%s → %s", domain, intent_verb, intent_noun, cached_tools)
-    # 未命中时显式置 None，防止 checkpointer 残留上轮旧值
 
-    # TraceCollector（即使缓存命中也要创建，agent 仍需执行工具并追踪）
+    # TraceCollector
     collector = None
     if strategy == "traced":
         from app.agent.trace_collector import TraceCollector
@@ -299,8 +383,6 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
             collector.stock_code = stock_code
         if stock_name:
             collector.stock_name = stock_name
-
-    # collector 存入外部存储（不可 msgpack 序列化，不能进 graph state）
     _store_collector(state.get("session_id", ""), collector)
 
     return {
@@ -325,7 +407,6 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
 
     step_records = state.get("step_records", [])
 
-    # ── 编排路径缓存：prepare_node 已查 qd_traces，命中则跳过 LLM#2 ──
     cached_tools = state.get("cached_tools")
     if cached_tools and not step_records:
         logger.info("[Planner] 缓存命中，跳过 LLM#2: %s", cached_tools)
@@ -335,21 +416,15 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
             "current_tool_strategy": "",
             "loop_step": state.get("loop_step", 0) + 1,
             "should_continue": True,
-            "cached_tools": None,  # 用完即清
+            "cached_tools": None,
         }
 
-    # ── 已有结论 → 直接结束，不再调 LLM#2 ──
     if step_records:
         if _has_conclusion(step_records):
             logger.info("[Planner] 已有结论，结束规划")
-            return {
-                "should_continue": False,
-                "all_phases_completed": True,
-            }
+            return {"should_continue": False, "all_phases_completed": True}
 
-    # ── 缓存未命中，走 LLM#2 规划 ──
     planner = Planner(call_llm=_build_llm_call())
-
     step_result = planner.plan_next_step(
         query=state["query"], intent=_build_intent_obj(state),
         stock_code=state.get("stock_code", ""), stock_name=state.get("stock_name", ""),
@@ -357,7 +432,6 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
     )
 
     if not step_result.success or (not step_result.tools and not step_result.skill):
-        # 金融域但 planner 找不到工具 → 兜底 LLM 直接回复
         try:
             llm_call = _build_llm_call()
             reply = llm_call([
@@ -379,7 +453,7 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
         "current_skill": step_result.skill,
         "current_tool_strategy": step_result.tool_strategy,
         "loop_step": state.get("loop_step", 0) + 1,
-        "should_continue": True,  # 有工具，标记需要继续（finalize 判断是否循环）
+        "should_continue": True,
     }
 
 
@@ -402,8 +476,6 @@ def agent_node(state: AgentState) -> Dict[str, Any]:
     stock_code = state.get("stock_code", "")
     stock_name = state.get("stock_name", "")
 
-    # 用户消息中注入完整股票信息（仅用于 agent 上下文，不改原始消息）
-    # "分析002617" → "分析002617(露笑科技)"；"分析露笑科技" → "分析露笑科技(002617)"
     query = state["query"]
     _query = query
     if stock_code and stock_name:
@@ -444,7 +516,6 @@ def agent_node(state: AgentState) -> Dict[str, Any]:
         strategy=state.get("strategy", "direct"),
     )
 
-    # 持久化 agent 引用，供 /interrupt 端点使用
     _session_id = state.get("session_id", "")
     _store_agent(_session_id, agent)
 
@@ -470,7 +541,6 @@ def agent_node(state: AgentState) -> Dict[str, Any]:
                                 "duration": sd.timing.duration if hasattr(sd, "timing") and sd.timing else 0,
                             })
                     elif sd.code_action:
-                        # CodeAgent: 从生成的 Python 代码中提取工具名
                         import re as _re
                         _tool_names = set()
                         for _t in tools:
@@ -498,14 +568,13 @@ def agent_node(state: AgentState) -> Dict[str, Any]:
         logger.error("[Agent] 执行失败: %s", e)
         content, success, total_steps, total_tokens = f"执行失败: {e}", False, 0, 0
     finally:
-        # 执行完毕（成功或失败），清理 agent 引用
         _clear_agent(_session_id)
 
-    # ── 统一解壳：壳只在 agent_node 解析，其他地方通过 state 接口读取 ──
+    # ── 统一解壳 ──
     _shell_valid = False
     _shell_data = None
     _shell_errors = []
-    _shell_conclusion = True   # 缺省结束
+    _shell_conclusion = True
     if content:
         from app.agent.json_extractor import extract_json
         _parsed = extract_json(content)
@@ -527,7 +596,6 @@ def agent_node(state: AgentState) -> Dict[str, Any]:
         "shell_conclusion": _shell_conclusion,
     }
 
-    # 累积已有记录（普通 List reducer，返回值会覆盖而非追加）
     prev_records = state.get("step_records", [])
     all_tool_calls = list(state.get("tool_calls_log", [])) + tool_calls_log
     all_charts = list(state.get("charts", [])) + charts
@@ -542,10 +610,6 @@ def agent_node(state: AgentState) -> Dict[str, Any]:
 
 
 def route_after_agent(state: AgentState) -> str:
-    """agent 执行完毕后，决定继续还是结束。
-
-    只看壳层字段，不碰 data 内容。壳层通用，不针对任何领域。
-    """
     loop_step = state.get("loop_step", 0)
     max_loop = state.get("max_loop_steps", 10)
 
@@ -556,14 +620,11 @@ def route_after_agent(state: AgentState) -> str:
     if not step_records:
         return "finish"
 
-    # ── 壳层判断：从 step_records 读取，不直接读壳 ──
     _shell_valid = state.get("_shell_valid", False)
     if not _shell_valid:
-        # 中间步骤无壳，继续循环
         logger.info("[Route] 无壳（中间步骤），继续循环 (step %d)", loop_step)
         return "continue"
 
-    # conclusion 缺省为 true（结束），只有显式 false 才继续
     _conclusion = step_records[-1].get("shell_conclusion", True)
     if _conclusion:
         logger.info("[Route] 壳层 conclusion=true，结束循环 (step %d)", loop_step)
@@ -574,38 +635,30 @@ def route_after_agent(state: AgentState) -> str:
 
 
 def _has_conclusion(step_records: list) -> bool:
-    """检测上一步是否已有结论。
-
-    从 step_records 读取壳层解出的 shell_conclusion，不直接读壳。
-    conclusion=true 或缺省 → 有结论；conclusion=false → 还需要继续。
-    """
     if not step_records:
         return False
     return step_records[-1].get("shell_conclusion", True)
 
 
 # ═══════════════════════════════════════════════════════════════
-#  finalize_node — 后处理（无 Judge）
+#  finalize_node — 后处理 + 自动上下文压缩（P2）
 # ═══════════════════════════════════════════════════════════════
 
 def finalize_node(state: AgentState) -> Dict[str, Any]:
     step_records = state.get("step_records", [])
 
-    # 快速通道（prepare_node 已设置 final_output）
+    # 快速通道
     if state.get("final_output") and not step_records:
-        _pop_collector(state.get("session_id", ""))  # 清理未使用的 collector
+        _pop_collector(state.get("session_id", ""))
         return {
             "messages": [{"role": "assistant", "content": json.dumps(state["final_output"], ensure_ascii=False)}],
             "last_verb": state.get("intent_verb", ""), "last_noun": state.get("intent_noun", ""),
             "context_summary": state.get("context_summary", ""),
         }
 
-    # Agent 的 final_answer 就是最终输出，不需要 Judge 汇总
-    # 从 step_records 拼接内容
     contents = [r.get("step_content", "") for r in step_records if r.get("step_content")]
     content = "\n\n".join(contents) if contents else ""
 
-    # 提取最终输出（从 shell_data 取）
     final_output = {}
     display_content = content
     if step_records:
@@ -615,20 +668,38 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
             final_output = _sd
             display_content = _last_record.get("step_content", content)
         else:
-            # 壳无效：reply 直接作为分析文本
             final_output = {"analysis": content}
 
     # 闭环
     _save_traces(state, content)
-
-    # TTL 清理过期 collector
     _cleanup_stale_collectors()
+
+    # ── P2: 自动上下文压缩 ──────────────────────────────────
+    # 当消息历史过长时，用 LLM 摘要旧消息，存入 context_summary
+    # 下一轮 prepare_node 会读取 context_summary 注入 system prompt
+    messages = state.get("messages", [])
+    new_context_summary = state.get("context_summary", "")
+
+    if len(messages) > SUMMARIZE_THRESHOLD:
+        # 取旧消息（排除最近 4 条）做摘要
+        old_messages = [
+            {"role": m.get("role", "user") if isinstance(m, dict) else getattr(m, "role", "user"),
+             "content": m.get("content", "") if isinstance(m, dict) else getattr(m, "content", "")}
+            for m in messages[:-4]
+        ]
+        if old_messages:
+            domain = state.get("domain", "")
+            query = state.get("query", "")
+            summary = _summarize_messages(old_messages, query, domain)
+            if summary:
+                new_context_summary = summary
+                logger.info("[Finalize] 上下文压缩: %d 条消息 → 摘要 (%d 字)", len(old_messages), len(summary))
 
     return {
         "messages": [{"role": "assistant", "content": display_content}] if display_content else [],
         "final_output": final_output, "all_phases_completed": True,
         "last_verb": state.get("intent_verb", ""), "last_noun": state.get("intent_noun", ""),
-        "context_summary": state.get("context_summary", ""),
+        "context_summary": new_context_summary,
     }
 
 
@@ -637,7 +708,6 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
 # ═══════════════════════════════════════════════════════════════
 
 def _aggregate_tools_called(state: AgentState) -> list:
-    """从 step_records 聚合所有工具名（去重保序）。"""
     tools = []
     for r in state.get("step_records", []):
         for tc in r.get("tool_calls", []):
@@ -648,10 +718,6 @@ def _aggregate_tools_called(state: AgentState) -> list:
 
 
 def _check_negative_feedback(state: AgentState) -> None:
-    """用户负面反馈 → 惩罚 qd_traces（correct=false）。
-
-    T+N 回测的 correct 字段天然过滤掉被标记的链路。
-    """
     from app.agent.chain import store as chain_store
 
     severity = _detect_feedback_severity(state.get("query", ""))
@@ -663,9 +729,6 @@ def _check_negative_feedback(state: AgentState) -> None:
         return
 
     stock_code = state.get("stock_code", "")
-    
-    # 如果有 stock_code，惩罚该股票的最近一条 trace
-    # 如果没有 stock_code，惩罚上一轮的 chain（通过 last_verb + last_noun 匹配）
     if stock_code:
         trace = chain_store.query_latest_root(stock_code)
         if trace:
@@ -675,7 +738,6 @@ def _check_negative_feedback(state: AgentState) -> None:
             else:
                 chain_store.mark_root_wrong(root_id)
     else:
-        # 无 stock_code 时，通过 last_verb + last_noun 匹配上一轮的 chain
         chain_name = f"{state.get('domain', '')}+{last_verb}+{last_noun}"
         trace = chain_store.query_latest_root_by_chain(chain_name)
         if trace:
@@ -689,7 +751,6 @@ def _check_negative_feedback(state: AgentState) -> None:
 
 
 def _detect_feedback_severity(message: str) -> Optional[str]:
-    """内置负面反馈检测。"""
     if not message:
         return None
     msg = message.strip()
@@ -719,17 +780,15 @@ def _save_traces(state: AgentState, content: str) -> None:
         except Exception as e:
             logger.warning("[Trace] 存库失败: %s", e)
     else:
-        # 兜底写入（仅金融/交易域，且有 verb+noun）
         _verb = state.get('intent_verb', '')
         _noun = state.get('intent_noun', '')
         if not _verb and not _noun:
-            return  # 闲聊等无意图场景，不写 qd_traces
+            return
         try:
             from app.agent.chain.schema import EvalNode, Layer, Status
             from datetime import date
 
             sc = state.get("stock_code", "")
-            # 从 step_records 取 shell_data，不再从 content 解析
             _sd = {}
             if state.get("step_records"):
                 _sd = state["step_records"][-1].get("shell_data") or {}

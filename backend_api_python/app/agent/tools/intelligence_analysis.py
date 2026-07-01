@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """个股情报+政策面分析 — 新闻/事件/舆情/解禁/减持/质押，RMS评分+一票否决。"""
 
-import logging
+from app.agent.log import logger
 from datetime import datetime
 from typing import Any, Dict, List
 
@@ -9,10 +9,6 @@ from app.agent.tools.news_search_tools import (
     search_stock_intel,
     search_policy_intel,
 )
-
-logger = logging.getLogger(__name__)
-
-
 def intelligence_analysis(stock_code: str, stock_name: str = "") -> Dict[str, Any]:
     """个股情报+政策面综合分析：搜索新闻公告研报 + 政策动态，返回情报评分和利空/利多信号。
 
@@ -156,8 +152,6 @@ def intelligence_analysis(stock_code: str, stock_name: str = "") -> Dict[str, An
         "policy_signals": policy_signals,
         "evaluation": evaluation,
     }
-
-
 # ═══════════════════════════════════════════════════════════════
 # 个股情报分析
 # ═══════════════════════════════════════════════════════════════
@@ -200,8 +194,6 @@ def _analyze_stock(stock_code: str, stock_name: str):
         logger.warning("[Intelligence] 个股情报失败: %s", e)
 
     return result, score, veto, signals
-
-
 # ═══════════════════════════════════════════════════════════════
 # 政策面分析
 # ═══════════════════════════════════════════════════════════════
@@ -243,8 +235,6 @@ def _analyze_policy():
         logger.warning("[Intelligence] 政策面失败: %s", e)
 
     return result, score, veto, signals
-
-
 # ═══════════════════════════════════════════════════════════════
 # 工具函数
 # ═══════════════════════════════════════════════════════════════
@@ -265,18 +255,12 @@ def _find_veto_source(result: dict) -> str:
             return f"{title}({date})" if date else title
 
     return ""
-
-
 def _composite_to_5(composite: float) -> float:
     """composite_score (-5~+5) → 5 分制。"""
     return round(max(-5.0, min(5.0, composite)), 1)
-
-
 def _5_to_100(score_5: float) -> int:
     """5分制 (-5~+5) → 0-100 分制。"""
     return max(0, min(100, int(50 + score_5 * 10)))
-
-
 def _extract_date(pub: str) -> str:
     """从发布时间提取 \"M月D日\" 格式。"""
     if not pub:
@@ -291,6 +275,4 @@ def _extract_date(pub: str) -> str:
         return pub[:10]
     except Exception:
         return ""
-
-
 

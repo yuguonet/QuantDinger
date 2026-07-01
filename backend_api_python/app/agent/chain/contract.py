@@ -27,15 +27,11 @@ Skill 层输出标准化：
 from __future__ import annotations
 
 import json
-import logging
+from app.agent.log import logger
 import re
 from typing import Any, Dict, List, Optional
 
 from app.agent.chain.schema import FactorItem, SkillReport
-
-logger = logging.getLogger(__name__)
-
-
 def parse_skill_output(raw_output: str, skill_name: str = "") -> SkillReport:
     """从 LLM 原始输出解析 SkillReport。
 
@@ -76,8 +72,6 @@ def parse_skill_output(raw_output: str, skill_name: str = "") -> SkillReport:
         analysis=raw_output[:2000],
         status="ok",
     ))
-
-
 def _sanitize_report(report: SkillReport) -> SkillReport:
     """清理 SkillReport，确保 Skill 层不越权。
 
@@ -93,8 +87,6 @@ def _sanitize_report(report: SkillReport) -> SkillReport:
         report.analysis = _strip_action_advice(report.analysis)
 
     return report
-
-
 # 操作建议关键词 → 替换为事实描述
 _ACTION_PATTERNS = [
     # 中文操作建议
@@ -108,16 +100,12 @@ _ACTION_PATTERNS = [
     (r'[Ss]uggest\w*\s+(buy|sell|hold)', r'technical signal: \1'),
     (r'[Rr]ecommend\w*\s+(buy|sell|hold)', r'technical signal: \1'),
 ]
-
-
 def _strip_action_advice(text: str) -> str:
     """从分析文本中移除操作建议语句，保留事实描述。"""
     import re
     for pattern, replacement in _ACTION_PATTERNS:
         text = re.sub(pattern, replacement, text)
     return text
-
-
 def _try_parse_json_block(raw: str, skill_name: str) -> Optional[SkillReport]:
     """尝试从 JSON 块中解析。"""
     # 匹配 ```json ... ``` 或 ``` ... ```
@@ -139,8 +127,6 @@ def _try_parse_json_block(raw: str, skill_name: str) -> Optional[SkillReport]:
                 continue
 
     return None
-
-
 def _try_parse_keywords(raw: str, skill_name: str) -> Optional[SkillReport]:
     """从关键词中提取方向和分数。"""
     raw_lower = raw.lower()
@@ -221,8 +207,6 @@ def _try_parse_keywords(raw: str, skill_name: str) -> Optional[SkillReport]:
         analysis=raw[:2000],
         status="ok",
     )
-
-
 def _dict_to_report(data: Dict[str, Any], skill_name: str, raw: str) -> SkillReport:
     """将解析出的 dict 转为 SkillReport。"""
     direction = data.get("direction", "neutral")
@@ -270,8 +254,6 @@ def _dict_to_report(data: Dict[str, Any], skill_name: str, raw: str) -> SkillRep
         output_data=data,
         status="ok",
     )
-
-
 def extract_tools_called(raw: str) -> List[str]:
     """从 LLM 输出中提取工具调用列表。"""
     tools = []

@@ -11,12 +11,8 @@
 """
 from __future__ import annotations
 
-import logging
+from app.agent.log import logger
 from typing import Any, Dict, List
-
-logger = logging.getLogger(__name__)
-
-
 def calc_chip_distribution(
     klines: List[Dict[str, Any]],
     stock_code: str = "",

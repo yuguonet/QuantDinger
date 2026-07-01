@@ -7,12 +7,8 @@ Index Tools — 指数行情/市场概览/情绪。
 """
 from __future__ import annotations
 
-import logging
+from app.agent.log import logger
 from typing import Any, Dict, List
-
-logger = logging.getLogger(__name__)
-
-
 def get_market_indices() -> Dict[str, Any]:
     """指数行情：返回上证/深证/创业板/科创/北证五大指数的价格、涨跌幅、成交量。"""
     from app.market_cn.index import get_index_realtime as _get
@@ -22,8 +18,6 @@ def get_market_indices() -> Dict[str, Any]:
     except Exception as e:
         logger.warning("get_market_indices failed: %s", e)
         return {"error": str(e)}
-
-
 def get_market_overview() -> Dict[str, Any]:
     """市场概览：返回全市场涨跌家数、涨停跌停数、北向资金净买入、市场情绪指数、主力资金流向。"""
     result = {}
