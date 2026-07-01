@@ -1277,7 +1277,8 @@ def main():
     parser.add_argument("--today", action="store_true", help="仅统计今日出现买点的股票")
     parser.add_argument("--today-date", type=str, default="", help="指定日期(YYYY-MM-DD), 默认为 --end 日期")
     args = parser.parse_args()
-
+    if not args.end:
+        args.end = time.strftime("%Y-%m-%d")
     codes = [c.strip() for c in args.codes.split(",") if c.strip()] if args.codes else TEST_CODES
 
     # DB模式: 从数据库加载全市场代码

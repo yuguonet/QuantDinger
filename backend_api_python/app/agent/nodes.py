@@ -227,6 +227,7 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
     intent_noun = ""
     intent_dimension = ""
     intent_depth = "normal"
+    intent_stock_required = False
     domain_instructions = ""
     strategy = "direct"
 
@@ -241,15 +242,32 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
         intent_noun = getattr(intent, "noun", "") or ""
         intent_dimension = getattr(intent, "dimension", "") or ""
         intent_depth = getattr(intent, "depth", "normal") or "normal"
+        intent_stock_required = getattr(intent, "stock_required", False)
         intent_data = {
             "intent": intent.intent, "confidence": intent.confidence,
             "source": intent.source, "verb": intent_verb, "noun": intent_noun,
             "dimension": intent_dimension, "depth": intent_depth,
+            "stock_required": intent_stock_required,
         }
         set_tool_context({"domain": domain, "strategy": strategy})
 
     # ── chat / unknown 域：旁路 LLM 直接回复，不进 planner ──
     if domain in ("chat", "unknown"):
+        # 历史查询：LLM 分类为 history 时从 Checkpointer 读取
+        if intent_noun == "history":
+            _history_answer = _try_answer_from_history(state)
+            if _history_answer:
+                return {
+                    "messages": [{"role": "user", "content": query}],
+                    "domain": domain, "intent": intent_data,
+                    "intent_verb": intent_verb, "intent_noun": intent_noun,
+                    "domain_instructions": domain_instructions,
+                    "strategy": strategy,
+                    "final_output": {"reply": _history_answer},
+                    "should_continue": False,
+                    "all_phases_completed": True,
+                }
+
         try:
             llm_call = _build_llm_call()
             _history = _get_history_from_state(state, max_tokens=4000)
@@ -273,78 +291,52 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
             "all_phases_completed": True,
         }
 
-    # stock_code — 始终走 3 级提取（context → 正则 → 中文名解析）
+    # stock_code — 用 _resolve_stock 作为唯一来源
     stock_code = ""
     stock_name = ""
     if domain in ("finance", "trading"):
         import re
+        # 从消息中提取关键词：6位代码 或 中文名
+        _keyword = ""
         m = re.search(r'(?<!\d)(\d{6})(?!\d)', query)
         if m:
-            _candidate_code = m.group(1)
+            _keyword = m.group(1)
+        else:
+            # 去掉常见动词前缀再提取中文名
+            _cleaned = re.sub(r'^(分析|查看|看看|查查|帮我看看|帮我查|帮我分析)', '', query)
+            _candidates = re.findall(r'[\u4e00-\u9fff]{2,8}', _cleaned)
+            if _candidates:
+                _keyword = _candidates[0]
+
+        if _keyword:
             try:
-                from app.utils.basicinfo_db import get_stock_basic_db
-                _stock = get_stock_basic_db().get_stock(_candidate_code)
-                if _stock:
-                    stock_code = _candidate_code
-                    stock_name = _stock.get("name", "")
-            except Exception:
-                pass
-        if not stock_code:
-            from app.agent.text_utils import extract_stock_from_message
-            _code, _name = extract_stock_from_message(query)
-            if _code and _name:
-                if _name in query:
-                    stock_code, stock_name = _code, _name
-                else:
-                    logger.warning("[Prepare] 中文名 '%s' 不在消息中，丢弃匹配", _name)
+                from app.agent.tools.data_tools import _resolve_stock
+                _res = _resolve_stock(_keyword, limit=1)
+                _items = _res.get("results", []) if isinstance(_res, dict) else []
+                if _items:
+                    stock_code = _items[0].get("code", "")
+                    stock_name = _items[0].get("name", "")
+                    logger.info("[Prepare] _resolve_stock('%s') → %s(%s)", _keyword, stock_name, stock_code)
+            except Exception as e:
+                logger.warning("[Prepare] _resolve_stock 失败: %s", e)
+
+        # 未识别到股票 → 从上一轮继承
         if not stock_code:
             _ctx_code = state.get("stock_code", "")
             _ctx_name = state.get("stock_name", "")
             if _ctx_code and _ctx_name:
                 stock_code, stock_name = _ctx_code, _ctx_name
-        if bool(stock_code) != bool(stock_name):
-            logger.warning("[Prepare] code/name 不完整 (code=%s, name=%s)，清空", stock_code, stock_name)
-            stock_code, stock_name = "", ""
-        if not stock_code and intent_verb in ("analyze", "query"):
-            import re as _re
-            _candidates = _re.findall(r'[\u4e00-\u9fff]{2,8}', query)
-            for _kw in _candidates:
-                try:
-                    from app.agent.tools.data_tools import search_stock_by_name
-                    _res = search_stock_by_name(_kw, limit=1)
-                    _items = _res.get("results", []) if isinstance(_res, dict) else []
-                    if _items:
-                        _r = _items[0]
-                        _r_code = _r.get("code", "")
-                        _r_name = _r.get("name", "")
-                        if _r_code and _r_name:
-                            stock_code, stock_name = _r_code, _r_name
-                            logger.info("[Prepare] 工具搜索命中: %s → %s(%s)", _kw, _r_name, _r_code)
-                            break
-                except Exception:
-                    pass
+                logger.info("[Prepare] 继承上轮股票: %s(%s)", stock_name, stock_code)
 
-    # ── 金融域但未识别到股票 → 走旁路 LLM 快速通道 ──
-    if domain in ("finance", "trading") and not stock_code:
-        logger.info("[Prepare] 金融域但未识别股票代码，走旁路 LLM")
-        try:
-            llm_call = _build_llm_call()
-            _history = _get_history_from_state(state, max_tokens=4000)
-            _system = "你是 QuantDinger 量化分析助手。简洁友好地回复用户。"
-            if prev_context_summary:
-                _system += f"\n\n[上文摘要] {prev_context_summary}"
-            _msgs = [{"role": "system", "content": _system}, *_history[-6:], {"role": "user", "content": query}]
-            content = llm_call(_msgs)
-        except Exception as e:
-            logger.warning("[Prepare] 旁路 LLM 调用失败: %s", e)
-            content = ""
+    # ── 金融域需要股票但未识别 → 询问用户 ──
+    if domain in ("finance", "trading") and not stock_code and intent_stock_required:
         return {
             "messages": [{"role": "user", "content": query}],
             "domain": domain, "intent": intent_data,
             "intent_verb": intent_verb, "intent_noun": intent_noun,
             "domain_instructions": domain_instructions,
             "strategy": strategy,
-            "final_output": {"reply": content},
+            "final_output": {"reply": "请提供股票名称或代码，例如：分析贵州茅台 或 查看600519"},
             "should_continue": False,
             "all_phases_completed": True,
         }
@@ -396,6 +388,17 @@ def prepare_node(state: AgentState) -> Dict[str, Any]:
         "cached_tools": cached_tools,
         "context_summary": intent.context_summary if intent else "",
     }
+
+
+# ═══════════════════════════════════════════════════════════════
+#  route_after_prepare — prepare 后路由
+# ═══════════════════════════════════════════════════════════════
+
+def route_after_prepare(state: AgentState) -> str:
+    """prepare 已完成的场景（chat/unknown/未识别股票）→ 直接到 finalize。"""
+    if not state.get("should_continue", True):
+        return "direct"
+    return "plan"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -652,6 +655,7 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
         _pop_collector(state.get("session_id", ""))
         return {
             "messages": [{"role": "assistant", "content": json.dumps(state["final_output"], ensure_ascii=False)}],
+            "final_output": state["final_output"],
             "last_verb": state.get("intent_verb", ""), "last_noun": state.get("intent_noun", ""),
             "context_summary": state.get("context_summary", ""),
         }
@@ -810,3 +814,44 @@ def _save_traces(state: AgentState, content: str) -> None:
             save_tree(root)
         except Exception as e:
             logger.warning("[Trace] 兜底失败: %s", e)
+
+
+def _try_answer_from_history(state: AgentState) -> str:
+    """从 Checkpointer 读取上轮 state 并格式化。"""
+    session_id = state.get("session_id", "")
+    if not session_id:
+        return "暂无历史记录。"
+
+    try:
+        from app.agent.graph import get_previous_state
+        prev_state = get_previous_state(session_id)
+        if not prev_state or not isinstance(prev_state, dict):
+            return "暂无历史记录。"
+
+        prev_output = prev_state.get("final_output", {})
+        prev_records = prev_state.get("step_records", [])
+        prev_verb = prev_state.get("intent_verb", "")
+        prev_noun = prev_state.get("intent_noun", "")
+        prev_stock = prev_state.get("stock_name", "")
+
+        parts = ["上次执行的操作："]
+        if prev_verb or prev_noun:
+            parts.append(f"- 意图：{prev_verb} {prev_noun}")
+        if prev_stock:
+            parts.append(f"- 标的：{prev_stock}")
+        if prev_records:
+            for r in prev_records:
+                desc = r.get("description", "")
+                content = r.get("step_content", "")[:200]
+                if desc or content:
+                    parts.append(f"- {desc}: {content}")
+        if prev_output:
+            reply = prev_output.get("reply", "") or prev_output.get("analysis", "")
+            if reply:
+                parts.append(f"- 结论：{reply[:200]}")
+
+        return "\n".join(parts) if len(parts) > 1 else "暂无历史记录。"
+
+    except Exception as e:
+        logger.warning("[History] 查询历史失败: %s", e)
+        return "暂无历史记录。"

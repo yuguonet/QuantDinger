@@ -24,7 +24,7 @@ from langgraph.types import RetryPolicy
 
 from app.agent.state import AgentState, AgentResult, create_initial_state
 from app.agent.nodes import (
-    prepare_node,
+    prepare_node, route_after_prepare,
     planner_node, route_after_planner,
     agent_node, route_after_agent,
     finalize_node,
@@ -87,7 +87,10 @@ def build_graph() -> StateGraph:
     graph.add_node("finalize", finalize_node)
 
     graph.set_entry_point("prepare")
-    graph.add_edge("prepare", "planner")
+    graph.add_conditional_edges("prepare", route_after_prepare, {
+        "plan": "planner",
+        "direct": "finalize",
+    })
     graph.add_conditional_edges("planner", route_after_planner, {
         "skip": "finalize",
         "run": "agent",

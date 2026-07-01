@@ -44,6 +44,7 @@ class IntentResult:
     # v4.5 新增：分析维度和深度
     dimension: str = ""  # technical / fundamental / capital / chip / news / sector / all
     depth: str = "normal"  # brief / normal / deep
+    stock_required: bool = False  # 是否需要股票代码
 
     @property
     def domain_config(self):
@@ -171,35 +172,11 @@ def _parse_intent_json(raw: str) -> Dict[str, Any]:
             except (json.JSONDecodeError, TypeError):
                 continue
 
-    # 完全解析失败 → 关键词降级（不走 chat，避免丢失分析意图）
+    # 完全解析失败 → 默认 chat
     logger.warning("[Intent] LLM 输出解析失败: %s", raw[:200])
-    return _keyword_fallback(message)
-
-
-def _keyword_fallback(message: str) -> Dict[str, Any]:
-    """JSON 解析失败时，用关键词推断意图。"""
-    import re
-    msg = message.strip()
-
-    # 股票相关关键词 → finance
-    _finance_kw = ["分析", "走势", "行情", "涨", "跌", "技术面", "基本面",
-                   "K线", "均线", "MACD", "RSI", "PE", "PB", "估值",
-                   "板块", "概念", "资金流", "北向", "龙虎榜", "筹码"]
-    _trade_kw = ["买入", "卖出", "建仓", "清仓", "止损", "止盈", "仓位"]
-    _query_kw = ["查", "看", "多少", "价格", "代码"]
-
-    if any(kw in msg for kw in _trade_kw):
-        return {"domain": "trading", "intent": msg[:50], "verb": "trade", "noun": "",
-                "stock_code": "", "stock_name": "", "confidence": 0.5, "context_summary": ""}
-    if any(kw in msg for kw in _finance_kw):
-        return {"domain": "finance", "intent": msg[:50], "verb": "analyze", "noun": "",
-                "stock_code": "", "stock_name": "", "confidence": 0.5, "context_summary": ""}
-    if any(kw in msg for kw in _query_kw):
-        return {"domain": "finance", "intent": msg[:50], "verb": "query", "noun": "",
-                "stock_code": "", "stock_name": "", "confidence": 0.4, "context_summary": ""}
-
-    return {"domain": "chat", "intent": "general", "verb": "chat", "noun": "",
-            "stock_code": "", "stock_name": "", "confidence": 0.3, "context_summary": ""}
+    return {"domain": "chat", "intent": "general", "verb": "", "noun": "",
+            "stock_code": "", "stock_name": "", "confidence": 0.3,
+            "context_summary": ""}
 def _validate_intent(data: Dict[str, Any]) -> Dict[str, Any]:
     """校验并修正 LLM 输出的字段。"""
     valid_domains = {"finance", "coding", "trading", "system", "unknown", "chat"}
@@ -215,10 +192,9 @@ def _validate_intent(data: Dict[str, Any]) -> Dict[str, Any]:
             conf = 0.5
     data["confidence"] = max(0.0, min(1.0, conf))
 
-    # 校验 dimension
-    valid_dimensions = {"technical", "fundamental", "capital", "chip", "news", "sector", "all", ""}
-    if data.get("dimension") not in valid_dimensions:
-        data["dimension"] = ""
+    # 校验 dimension（允许 LLM 自由输出，只确保非空时为小写字符串）
+    dim = data.get("dimension", "")
+    data["dimension"] = str(dim).strip().lower() if dim else ""
 
     # 校验 depth
     valid_depths = {"brief", "normal", "deep"}
@@ -285,6 +261,7 @@ def analyze_intent(
     noun = result.get("noun", "")
     dimension = result.get("dimension", "")
     depth = result.get("depth", "normal")
+    stock_required = result.get("stock_required", False)
     confidence = result.get("confidence", 0.5)
     new_summary = result.get("context_summary", "")
 
@@ -334,6 +311,7 @@ def analyze_intent(
         noun=noun,
         dimension=dimension,
         depth=depth,
+        stock_required=bool(stock_required),
         context_summary=new_summary,
         strategy=strategy,
     )

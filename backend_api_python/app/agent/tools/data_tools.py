@@ -21,16 +21,16 @@ def _detect_market(code: str) -> str:
 
 # ── Tool functions ────────────────────────────────────────────
 
-def search_stock_by_name(keyword: str, market: str = "CNStock", limit: int = 10) -> Dict[str, Any]:
-    """根据中文名称或代码或关键词搜索股票代码,股票名称,支持模糊搜索,简拼,混合搜索。
+def _resolve_stock(keyword: str, market: str = "CNStock", limit: int = 10) -> Dict[str, Any]:
+    """股票名称/代码双向解析。输入名称返回代码，输入代码返回名称，支持模糊搜索。
 
     ⚠️ 返回值是 dict，不是 list！用法：
-        result = search_stock_by_name("茅台")
+        result = resolve_stock("茅台")
         stock_code = result["results"][0]["code"]   # ✅
         # ❌ result[0]["code"] 会报 KeyError
 
     Args:
-        keyword: 搜索关键词（中文股票名称、代码片段等）
+        keyword: 搜索关键词（中文名称、代码、简拼等）
         market: 市场，默认 CNStock
         limit: 返回数量上限，默认10
 
@@ -55,8 +55,11 @@ def search_stock_by_name(keyword: str, market: str = "CNStock", limit: int = 10)
             "count": len(matches),
         }
     except Exception as e:
-        logger.error("search_stock_by_name(%s) failed: %s", keyword, e)
+        logger.error("_resolve_stock(%s) failed: %s", keyword, e)
         return {"keyword": keyword, "results": [], "count": 0, "error": str(e)}
+
+# 向后兼容别名
+search_stock_by_name = _resolve_stock
 
 def get_realtime_quote(codes: str) -> Dict[str, Any]:
     """实时行情：价格、涨跌幅、成交量、换手率、量比、PE、PB、总市值等。

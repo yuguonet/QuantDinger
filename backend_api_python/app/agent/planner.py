@@ -262,31 +262,17 @@ class Planner:
         if stock_code:
             stock_status = f"\n## 当前标的\n已识别: {stock_name}({stock_code})\n\n"
         else:
-            stock_status = "\n## 当前标的\n未识别到股票代码或名称。如果用户问题涉及个股，必须先用 search_stock_by_name 搜索，不要直接调用需要 stock_code 的工具。\n\n"
+            stock_status = "\n## 当前标的\n未识别到股票代码或名称。如果用户问题涉及个股，系统已自动解析；如果涉及选股，请使用选股相关技能。\n\n"
 
-        # dimension 和 depth 指导
+        # dimension 和 depth 指导（直接传值，LLM 根据 tools XML 自主选工具）
         dimension_section = ""
         if dimension:
-            _dim_map = {
-                "technical": "技术面（analyze_trend, get_indicator_snapshot, calculate_ma, analyze_pattern, get_volume_analysis）",
-                "fundamental": "基本面（get_stock_info, get_consensus_eps, batch_valuation_compare, get_capital_summary）",
-                "capital": "资金面（get_fund_flow, get_fund_flow_daily, get_concept_fund_flow, get_northbound_flow）",
-                "chip": "筹码（get_chip_distribution）",
-                "news": "情报（search_stock_intel, search_comprehensive_intel, get_eastmoney_stock_news, get_global_finance_news）",
-                "sector": "板块（get_hot_sectors, get_sector_trend_analysis, get_sector_history_data, get_sector_prediction）",
-                "all": "全面分析（综合选择上述各类工具）",
-            }
-            dim_desc = _dim_map.get(dimension, dimension)
-            dimension_section = f"\n## 分析方向（dimension）\n用户期望: {dim_desc}\n请优先选择该方向的工具。\n\n"
+            dimension_section = f"\n## 分析方向（dimension）\n{dimension}\n根据 tools XML 中的工具描述，选择与该方向相关的工具。\n\n"
 
         depth_section = ""
         if depth and depth != "normal":
-            _depth_map = {
-                "brief": "快速查看 — 只选 1 个最相关的工具",
-                "deep": "深度分析 — 选 4-6 个工具覆盖全部维度，可分步执行",
-            }
-            depth_desc = _depth_map.get(depth, depth)
-            depth_section = f"\n## 分析深度（depth）\n{depth_desc}\n\n"
+            _depth_desc = {"brief": "1个", "deep": "4-6个，可分步"}.get(depth, "")
+            depth_section = f"\n## 分析深度（depth）\n{depth}（{_depth_desc}）\n\n" if _depth_desc else f"\n## 分析深度（depth）\n{depth}\n\n"
 
         prompt = (
             f"{persona_section}\n\n"

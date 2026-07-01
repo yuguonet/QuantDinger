@@ -9,8 +9,8 @@ Usage:
     from app.agent.tools import registry
     registry.discover()
     tools = build_smolagent_tools({"deny": [...], "domain": ...})
-    spec = registry.get("search_stock_by_name")
-    spec.fn(stock_code="600066")
+    spec = registry.get("resolve_stock")
+    spec.fn(keyword="茅台")
 """
 from __future__ import annotations
 
