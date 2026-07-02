@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Flask 集成壳 — 将 agent 模板接入 QuantDinger Flask 应用。
+Flask 壳 — 共用 CLI 链路（QDAgent）。
 
-路由（与 agent_blueprint.py 并存，不冲突）：
+路由：
   POST /api/agent-v2/chat          — 普通对话（SSE 流式）
   POST /api/agent-v2/task          — 带工具调用的 ReAct 任务
   GET  /api/agent-v2/tools         — 列出可用工具
@@ -24,7 +24,6 @@ import queue
 import sys
 import threading
 import uuid
-from typing import Dict, Optional
 
 from flask import Blueprint, Response, jsonify, request
 
@@ -40,7 +39,6 @@ if _agent_dir not in sys.path:
 
 
 def _ensure_agent_path():
-    """确保 app/agent/ 在 sys.path 头部。"""
     if sys.path[0] != _agent_dir:
         try:
             sys.path.remove(_agent_dir)
@@ -49,36 +47,63 @@ def _ensure_agent_path():
         sys.path.insert(0, _agent_dir)
 
 
-# ── 懒加载组件 ────────────────────────────────────────────────
-_cache: Dict[str, object] = {}
-
-
-def _get_llm():
-    if "llm" not in _cache:
-        _ensure_agent_path()
-        from llm import create_llm
-        _cache["llm"] = create_llm()
-    return _cache["llm"]
-
-
+# ── 工具/技能适配器（仅用于信息展示）──
 def _get_tool_adapter():
-    if "tools" not in _cache:
-        _ensure_agent_path()
-        from llm import QDToolAdapter
-        _cache["tools"] = QDToolAdapter()
-    return _cache["tools"]
+    _ensure_agent_path()
+    from llm import QDToolAdapter
+    return QDToolAdapter()
 
 
 def _get_skill_adapter():
-    if "skills" not in _cache:
-        _ensure_agent_path()
-        from llm import QDSkillAdapter
-        _cache["skills"] = QDSkillAdapter()
-    return _cache["skills"]
+    _ensure_agent_path()
+    from llm import QDSkillAdapter
+    return QDSkillAdapter()
 
 
 # ── Blueprint ─────────────────────────────────────────────────
 agent_v2_bp = Blueprint("agent_v2", __name__, url_prefix="/api/agent-v2")
+
+
+def _run_agent(message: str, session_id: str) -> str:
+    """同步执行 QDAgent.chat()（在后台线程中调用）。"""
+    _ensure_agent_path()
+    from agent import QDAgent
+
+    agent = QDAgent()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        response = loop.run_until_complete(agent.chat(message, session_id=session_id))
+        return response.content
+    finally:
+        loop.close()
+
+
+def _sse_stream(message: str, session_id: str, timeout: int = 300):
+    """SSE 生成器：在线程中运行 agent，通过队列推送结果。"""
+    q: queue.Queue = queue.Queue()
+
+    def _run():
+        try:
+            result = _run_agent(message, session_id)
+            q.put({"type": "done", "content": result, "session_id": session_id})
+        except Exception as exc:
+            logger.error("Agent 异常: %s", exc, exc_info=True)
+            q.put({"type": "error", "message": str(exc)})
+
+    threading.Thread(target=_run, daemon=True).start()
+    while True:
+        try:
+            ev = q.get(timeout=timeout)
+            yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+            if ev.get("type") in ("done", "error"):
+                break
+        except queue.Empty:
+            yield f'data: {json.dumps({"type": "error", "message": "超时"}, ensure_ascii=False)}\n\n'
+            break
+
+
+# ── 路由 ──────────────────────────────────────────────────────
 
 
 @agent_v2_bp.route("/health", methods=["GET"])
@@ -113,7 +138,6 @@ def info():
 
 @agent_v2_bp.route("/tools", methods=["GET"])
 def list_tools():
-    """列出所有可用工具。"""
     try:
         tools = _get_tool_adapter()
         result = []
@@ -128,7 +152,6 @@ def list_tools():
 
 @agent_v2_bp.route("/skills", methods=["GET"])
 def list_skills():
-    """列出所有可用技能。"""
     try:
         skills = _get_skill_adapter()
         return jsonify({"total": len(skills), "skills": skills.list_skills()})
@@ -138,7 +161,7 @@ def list_skills():
 
 @agent_v2_bp.route("/chat", methods=["POST"])
 def chat():
-    """普通对话（无工具，SSE）。"""
+    """普通对话（SSE）。共用 CLI 链路，QDAgent 内部决定是否调用工具。"""
     try:
         data = request.get_json() or {}
         message = data.get("message", "").strip()
@@ -146,48 +169,18 @@ def chat():
         if not message:
             return jsonify({"error": "message 不能为空"}), 400
 
-        llm = _get_llm()
-
-        def _sse():
-            q: queue.Queue = queue.Queue()
-
-            def _run():
-                try:
-                    from llm import run_with_tools
-                    from utils.prompt_loader import load_prompt
-
-                    system_prompt = load_prompt("chat_system.txt")
-                    messages = [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": message},
-                    ]
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    answer = loop.run_until_complete(run_with_tools(llm, messages, adapter=None))
-                    q.put({"type": "done", "content": answer, "session_id": session_id})
-                except Exception as exc:
-                    q.put({"type": "error", "message": str(exc)})
-
-            threading.Thread(target=_run, daemon=True).start()
-            while True:
-                try:
-                    ev = q.get(timeout=120)
-                    yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
-                    if ev.get("type") in ("done", "error"):
-                        break
-                except queue.Empty:
-                    yield f'data: {json.dumps({"type": "error", "message": "超时"}, ensure_ascii=False)}\n\n'
-                    break
-
-        return Response(_sse(), mimetype="text/event-stream",
-                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+        return Response(
+            _sse_stream(message, session_id, timeout=120),
+            mimetype="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @agent_v2_bp.route("/task", methods=["POST"])
 def task():
-    """带工具调用的 ReAct 任务（SSE）。"""
+    """带工具调用的 ReAct 任务（SSE）。共用 CLI 链路。"""
     try:
         data = request.get_json() or {}
         message = data.get("message", "").strip()
@@ -195,64 +188,16 @@ def task():
         if not message:
             return jsonify({"error": "message 不能为空"}), 400
 
-        llm = _get_llm()
-        tools = _get_tool_adapter()
-        skills = _get_skill_adapter()
-
-        def _sse():
-            q: queue.Queue = queue.Queue()
-
-            def _run():
-                try:
-                    from llm import run_with_tools
-                    from utils.prompt_loader import load_prompt
-
-                    tool_names = tools.list_tools()
-                    tool_catalog = ", ".join(tool_names[:30])
-                    if len(tool_names) > 30:
-                        tool_catalog += f" ... 共 {len(tool_names)} 个"
-
-                    system_prompt = load_prompt(
-                        "tool_system.txt",
-                        tool_count=len(tools),
-                        tool_catalog=tool_catalog,
-                        skill_catalog=skills.get_catalog_text(),
-                    )
-
-                    messages = [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": message},
-                    ]
-
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    answer = loop.run_until_complete(
-                        run_with_tools(llm, messages, tools)
-                    )
-                    q.put({"type": "done", "content": answer, "session_id": session_id})
-                except Exception as exc:
-                    logger.error("Task 异常: %s", exc, exc_info=True)
-                    q.put({"type": "error", "message": str(exc)})
-
-            threading.Thread(target=_run, daemon=True).start()
-            while True:
-                try:
-                    ev = q.get(timeout=300)
-                    yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
-                    if ev.get("type") in ("done", "error"):
-                        break
-                except queue.Empty:
-                    yield f'data: {json.dumps({"type": "error", "message": "超时"}, ensure_ascii=False)}\n\n'
-                    break
-
-        return Response(_sse(), mimetype="text/event-stream",
-                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+        return Response(
+            _sse_stream(message, session_id, timeout=300),
+            mimetype="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 def register_agent_routes(app):
-    """注册 agent_v2 路由到 Flask app。"""
     app.register_blueprint(agent_v2_bp)
     logger.info("[AgentV2] 路由已注册: /api/agent-v2/*")
 

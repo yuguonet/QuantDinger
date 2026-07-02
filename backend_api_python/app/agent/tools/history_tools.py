@@ -46,16 +46,16 @@ def search_history(query: str, limit: int = 5) -> Dict[str, Any]:
                 # 从 checkpointer 的 checkpoints 表搜索
                 # checkpoint_blobs 存了 state 数据
                 cur.execute("""
-                    SELECT thread_id, checkpoint_ts,
+                    SELECT thread_id, checkpoint_id,
                            checkpoint::text
                     FROM checkpoints
-                    ORDER BY checkpoint_ts DESC
+                    ORDER BY checkpoint_id DESC
                     LIMIT 200
                 """)
                 rows = cur.fetchall()
 
                 query_lower = query.strip().lower()
-                for thread_id, ts, checkpoint_text in rows:
+                for thread_id, cid, checkpoint_text in rows:
                     if len(results) >= limit:
                         break
                     try:
@@ -72,7 +72,7 @@ def search_history(query: str, limit: int = 5) -> Dict[str, Any]:
                             if q and query_lower in q.lower():
                                 results.append({
                                     "session_id": thread_id,
-                                    "time": ts.isoformat() if ts else "",
+                                    "time": cid or "",
                                     "query": q[:200],
                                     "domain": domain,
                                     "stock": stock,
@@ -132,56 +132,75 @@ def get_previous_analysis(stock_code: str = "") -> Dict[str, Any]:
         上轮分析的结论、工具调用记录等
     """
     try:
-        from app.agent.graph import get_previous_state, list_checkpointer_sessions
+        database_url = os.getenv("DATABASE_URL", "")
+        if not database_url:
+            return {"error": "数据库未配置", "result": None}
 
-        # 获取最近的会话
-        sessions = list_checkpointer_sessions(limit=10)
-        if not sessions:
-            return {"error": "没有历史会话", "result": None}
+        import psycopg2
+        conn = psycopg2.connect(database_url)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT thread_id, checkpoint_id, checkpoint::text
+                    FROM checkpoints
+                    ORDER BY checkpoint_id DESC
+                    LIMIT 20
+                """)
+                rows = cur.fetchall()
 
-        for sess in sessions:
-            sid = sess.get("session_id", "")
-            if not sid:
-                continue
-            state = get_previous_state(sid)
-            if not state or not isinstance(state, dict):
-                continue
+            for thread_id, cid, checkpoint_text in rows:
+                if not checkpoint_text:
+                    continue
+                try:
+                    state = json.loads(checkpoint_text)
+                except (json.JSONDecodeError, TypeError):
+                    continue
 
-            prev_stock = state.get("stock_name", "")
-            prev_code = state.get("stock_code", "")
-            prev_output = state.get("final_output", {})
-            prev_records = state.get("step_records", [])
-            prev_verb = state.get("intent_verb", "")
-            prev_noun = state.get("intent_noun", "")
+                channel_values = state.get("channel_values", {})
+                if not isinstance(channel_values, dict):
+                    continue
 
-            # 如果指定了 stock_code，过滤匹配的
-            if stock_code and stock_code not in (prev_code, ""):
-                continue
+                prev_stock = channel_values.get("stock_name", "") or ""
+                prev_code = channel_values.get("stock_code", "") or ""
+                prev_output = channel_values.get("final_output", {}) or {}
+                prev_records = channel_values.get("step_records", []) or []
+                prev_verb = channel_values.get("intent_verb", "") or ""
+                prev_noun = channel_values.get("intent_noun", "") or ""
 
-            parts = []
-            if prev_verb or prev_noun:
-                parts.append(f"意图: {prev_verb} {prev_noun}")
-            if prev_stock:
-                parts.append(f"标的: {prev_stock}({prev_code})")
-            if prev_records:
-                for r in prev_records:
-                    desc = r.get("description", "")
-                    content = r.get("step_content", "")[:300]
-                    if desc or content:
-                        parts.append(f"{desc}: {content}")
-            if prev_output:
-                reply = prev_output.get("reply", "") or prev_output.get("analysis", "")
-                if reply:
-                    parts.append(f"结论: {reply[:300]}")
+                if not (prev_stock or prev_code or prev_verb):
+                    # 没有分析痕迹，跳过
+                    continue
 
-            if parts:
-                return {
-                    "stock_code": prev_code or stock_code,
-                    "stock_name": prev_stock,
-                    "session_id": sid,
-                    "time": sess.get("updated_at", ""),
-                    "analysis": "\n".join(parts),
-                }
+                # 如果指定了 stock_code，过滤匹配的
+                if stock_code and stock_code not in (prev_code, ""):
+                    continue
+
+                parts = []
+                if prev_verb or prev_noun:
+                    parts.append(f"意图: {prev_verb} {prev_noun}")
+                if prev_stock:
+                    parts.append(f"标的: {prev_stock}({prev_code})")
+                if prev_records:
+                    for r in prev_records:
+                        desc = r.get("description", "") or ""
+                        content = r.get("step_content", "") or ""
+                        if desc or content:
+                            parts.append(f"{desc}: {content[:300]}")
+                if prev_output:
+                    reply = prev_output.get("reply", "") or prev_output.get("analysis", "") or ""
+                    if reply:
+                        parts.append(f"结论: {reply[:300]}")
+
+                if parts:
+                    return {
+                        "stock_code": prev_code or stock_code,
+                        "stock_name": prev_stock,
+                        "session_id": thread_id,
+                        "time": cid or "",
+                        "analysis": "\n".join(parts),
+                    }
+        finally:
+            conn.close()
 
         return {"error": f"未找到 {'股票 ' + stock_code if stock_code else ''}的历史分析", "result": None}
 
