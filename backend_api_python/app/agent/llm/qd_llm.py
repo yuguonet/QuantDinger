@@ -132,7 +132,19 @@ class QDLLM(LLMBase):
                     svc.call_with_tools, msg_dicts, tools,
                     temperature=temp, model=model,
                 )
-                tc = result.get("tool_calls", [])
+                raw_tc = result.get("tool_calls", [])
+                # 转换为 OpenAI 嵌套格式：{id, type, function: {name, arguments}}
+                tc = []
+                for item in raw_tc:
+                    args = item.get("arguments", {})
+                    tc.append({
+                        "id": item.get("id", ""),
+                        "type": "function",
+                        "function": {
+                            "name": item.get("name", ""),
+                            "arguments": json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args),
+                        },
+                    })
                 logger.info("[QDLLM] call_with_tools 返回: content=%s, tool_calls=%d",
                            (result.get("content") or "")[:80], len(tc))
                 return LLMResponse(

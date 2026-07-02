@@ -1,65 +1,133 @@
+# -*- coding: utf-8 -*-
 """
-任务型 Agent
+任务型 Agent — 基于 smolagents 的 ReAct 实现。
 
-支持 Function Calling 的 Agent，实现 ReAct 循环：
-1. 用户输入 -> LLM 思考
-2. LLM 决定调用工具 -> 执行工具 -> 将结果返回给 LLM
-3. 重复步骤 2 直到 LLM 给出最终回答
+使用 smolagents CodeAgent 处理工具调用循环，
+不依赖模型的 function calling 能力。
 """
-import time
+from __future__ import annotations
+
+import asyncio
 import logging
-from typing import Optional
+import time
+from typing import List, Optional
 
-from llm.base import LLMBase, ChatMessage
-from memory.base import MemoryBase
-from rag.retriever import Retriever
-from tools.registry import ToolRegistry
 from agents.base import AgentBase, AgentResponse
-from utils.tracing import AgentTraceRecorder, llm_response_to_dict, messages_to_dict
+from llm.base import ChatMessage, LLMBase
+from tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
 
+def _build_smolagent_tools(tool_registry: ToolRegistry, skill_adapter=None) -> List:
+    """将 ToolRegistry 工具 + Skill 转换为 smolagents Tool 对象。"""
+    from smolagents import tool as smolagents_tool
+
+    tools = []
+
+    # 注册普通工具
+    for name in tool_registry.list_tools():
+        tool_obj = tool_registry.get(name)
+        if not tool_obj:
+            continue
+        fn = getattr(tool_obj, "_original_func", None)
+        if fn is None:
+            continue
+        try:
+            tools.append(smolagents_tool(fn))
+        except Exception as e:
+            logger.debug("[TaskAgent] 包装 %s 失败: %s", name, e)
+
+    # 注册 Skill 工具
+    if skill_adapter:
+        _adapter = skill_adapter
+
+        @smolagents_tool
+        def get_skill_catalog() -> str:
+            """获取可用技能列表。用户提到选股、筛选等需求时先调用此工具。"""
+            catalog = _adapter.get_catalog_text()
+            return catalog if catalog else "当前无可用技能。"
+
+        @smolagents_tool
+        def read_skill(skill_name: str) -> str:
+            """加载指定技能的详细执行指令。
+
+            Args:
+                skill_name: 技能名称，如 market-screener
+            """
+            body = _adapter.get_body(skill_name)
+            if body:
+                return body
+            available = ", ".join(s.name for s in _adapter.list_skills())
+            return f"技能 '{skill_name}' 不存在。可用技能: {available}"
+
+        tools.extend([get_skill_catalog, read_skill])
+
+    return tools
+
+
+class _SmolagentsLLMWrapper:
+    """把 Agent Template 的 LLMBase 包装为 smolagents Model 接口。"""
+
+    def __init__(self, llm: LLMBase):
+        self._llm = llm
+
+    def _call_llm(self, messages, **kwargs):
+        """统一调用逻辑，返回带 token_usage 的响应。"""
+        chat_messages = []
+        for m in messages:
+            if isinstance(m, dict):
+                role, content = m.get("role", "user"), m.get("content", "")
+            else:
+                role, content = getattr(m, "role", "user"), getattr(m, "content", "")
+            chat_messages.append(ChatMessage(role=role, content=content))
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    resp = pool.submit(asyncio.run, self._llm.generate(chat_messages)).result()
+            else:
+                resp = asyncio.run(self._llm.generate(chat_messages))
+        except Exception as e:
+            logger.error("[TaskAgent] LLM 调用失败: %s", e)
+            raise
+
+        # 包装为 smolagents 期望的格式（token_usage 必须是对象属性，不能是 dict）
+        class _TokenUsage:
+            def __init__(self, r):
+                self.input_tokens = r.prompt_tokens if r is not None else 0
+                self.output_tokens = r.completion_tokens if r is not None else 0
+                self.total_tokens = r.tokens_used if r is not None else 0
+
+        class _Result:
+            def __init__(self, r):
+                self.content = r.content if r is not None else ""
+                self.token_usage = _TokenUsage(r)
+
+        return _Result(resp)
+
+    def generate(self, messages, **kwargs):
+        """smolagents 调用入口。"""
+        return self._call_llm(messages, **kwargs)
+
+    def __call__(self, messages, **kwargs):
+        return self._call_llm(messages, **kwargs)
+
+
 class TaskAgent(AgentBase):
-    """
-    任务型 Agent（支持 Tool Calling）
-
-    实现 ReAct 循环：思考 -> 调用工具 -> 观察 -> 再思考 -> 最终回答
-
-    使用示例：
-        registry = ToolRegistry()
-        registry.add(WebSearchTool())
-        registry.add(CodeExecutorTool())
-
-        agent = TaskAgent(
-            llm=llm,
-            memory=LocalMemory(),
-            tool_registry=registry,
-            system_prompt="你是一个能使用工具的智能助手。",
-            max_tool_rounds=5,
-        )
-        response = await agent.chat("帮我搜索今天的新闻")
-    """
+    """任务型 Agent — smolagents ReAct 引擎。"""
 
     def __init__(
         self,
-        llm: LLMBase,
-        memory: Optional[MemoryBase] = None,
-        retriever: Optional[Retriever] = None,
-        tool_registry: Optional[ToolRegistry] = None,
-        system_prompt: str = "你是一个智能助手，可以使用工具来完成任务。",
-        memory_window_size: int = 10,
-        max_tool_rounds: int = 5,
+        max_tool_rounds: int = 10,
+        skill_adapter=None,
+        **kwargs,
     ):
-        super().__init__(
-            llm=llm,
-            memory=memory,
-            retriever=retriever,
-            tool_registry=tool_registry,
-            system_prompt=system_prompt,
-            memory_window_size=memory_window_size,
-        )
+        super().__init__(**kwargs)
         self.max_tool_rounds = max_tool_rounds
+        self.skill_adapter = skill_adapter
 
     async def chat(
         self,
@@ -67,185 +135,32 @@ class TaskAgent(AgentBase):
         session_id: str = "default",
         use_rag: bool = True,
     ) -> AgentResponse:
-        """
-        带工具调用的对话入口
+        from smolagents import CodeAgent as SmolCodeAgent
 
-        实现 ReAct 循环：
-        LLM 回复 -> 检查是否有 tool_calls -> 执行工具 -> 将结果传回 LLM -> 循环
-        """
         start_time = time.time()
-        trace = AgentTraceRecorder(
-            agent_type=type(self).__name__,
-            session_id=session_id,
-            user_input=user_input,
-            metadata={"use_rag": use_rag, "max_tool_rounds": self.max_tool_rounds},
+
+        smol_tools = _build_smolagent_tools(self.tool_registry, self.skill_adapter) if self.tool_registry else []
+        model = _SmolagentsLLMWrapper(self.llm)
+
+        agent = SmolCodeAgent(
+            tools=smol_tools,
+            model=model,
+            max_steps=self.max_tool_rounds,
         )
 
+        logger.info("[TaskAgent] 执行: %s (工具: %d)", user_input[:60], len(smol_tools))
         try:
-            # 1. 构建消息列表
-            messages = [ChatMessage(role="system", content=self.system_prompt)]
-
-            # 2. RAG 检索
-            sources = []
-            if use_rag and self.retriever:
-                rag_start = time.time()
-                docs = await self.retriever.retrieve(user_input)
-                trace.record(
-                    "rag_retrieve",
-                    {
-                        "elapsed_seconds": round(time.time() - rag_start, 3),
-                        "doc_count": len(docs),
-                        "docs": docs,
-                    },
-                )
-                if docs:
-                    context = Retriever.format_context(docs)
-                    messages.append(ChatMessage(
-                        role="system",
-                        content=f"【参考资料】\n{context}\n\n请结合参考资料回答。",
-                    ))
-                    sources = [
-                        {
-                            "content": d["content"][:200],
-                            "score": d.get("score", 0),
-                            "metadata": d.get("metadata", {}),
-                        }
-                        for d in docs
-                    ]
-
-            # 3. 加载对话历史
-            if self.memory:
-                history = await self.memory.get_history(session_id, limit=self.memory_window_size)
-                trace.record(
-                    "memory_load",
-                    {
-                        "history_count": len(history),
-                        "limit": self.memory_window_size,
-                        "messages": [
-                            {"role": msg.role, "content": msg.content}
-                            for msg in history
-                        ],
-                    },
-                )
-                for msg in history:
-                    messages.append(ChatMessage(role=msg.role, content=msg.content))
-
-            # 4. 添加用户输入
-            messages.append(ChatMessage(role="user", content=user_input))
-
-            # 5. 获取工具 Schema
-            tools = self.tool_registry.get_function_schemas() if self.tool_registry else None
-            trace.record("tools_available", {"tools": tools or []})
-
-            # 6. ReAct 循环
-            all_tool_calls = []
-            llm_response = None
-            for round_idx in range(self.max_tool_rounds):
-                trace.record(
-                    "llm_request",
-                    {
-                        "round": round_idx + 1,
-                        "model": getattr(self.llm, "model", ""),
-                        "message_count": len(messages),
-                        "messages": messages_to_dict(messages),
-                        "tools": tools or [],
-                    },
-                )
-                llm_start = time.time()
-                llm_response = await self.llm.generate(messages=messages, tools=tools)
-                trace.record(
-                    "llm_response",
-                    {
-                        "round": round_idx + 1,
-                        "elapsed_seconds": round(time.time() - llm_start, 3),
-                        **llm_response_to_dict(llm_response),
-                    },
-                )
-
-                if not llm_response.is_tool_call:
-                    # LLM 给出了最终回答
-                    break
-
-                # 处理工具调用
-                logger.info(f"[ReAct 第{round_idx + 1}轮] 工具调用: {len(llm_response.tool_calls)} 个")
-
-                # 将 assistant 的 tool_calls 消息加入历史
-                messages.append(ChatMessage(
-                    role="assistant",
-                    content=llm_response.content or "",
-                    tool_calls=llm_response.tool_calls,
-                ))
-
-                # 逐个执行工具
-                for tc in llm_response.tool_calls:
-                    func_name = tc.get("function", {}).get("name", "")
-                    func_args = tc.get("function", {}).get("arguments", "{}")
-                    logger.info(f"  执行工具: {func_name}")
-                    trace.record(
-                        "tool_request",
-                        {
-                            "round": round_idx + 1,
-                            "tool_call_id": tc.get("id", ""),
-                            "tool": func_name,
-                            "arguments": func_args,
-                        },
-                    )
-
-                    tool_start = time.time()
-                    result = await self.tool_registry.call_from_llm_response(tc)
-                    trace.record(
-                        "tool_response",
-                        {
-                            "round": round_idx + 1,
-                            "tool_call_id": tc.get("id", ""),
-                            "tool": func_name,
-                            "elapsed_seconds": round(time.time() - tool_start, 3),
-                            "success": result.success,
-                            "output": result.output,
-                            "error": result.error,
-                        },
-                    )
-                    all_tool_calls.append({
-                        "tool": func_name,
-                        "result": result.to_str()[:500],
-                        "success": result.success,
-                    })
-
-                    # 将工具结果传回 LLM
-                    messages.append(ChatMessage(
-                        role="tool",
-                        content=result.to_str(),
-                        tool_call_id=tc.get("id", ""),
-                        name=func_name,
-                    ))
-            else:
-                # 达到最大轮次仍未结束
-                logger.warning(f"达到最大工具调用轮次 ({self.max_tool_rounds})")
-                trace.record("tool_round_limit_reached", {"max_tool_rounds": self.max_tool_rounds})
-
-            if llm_response is None:
-                raise RuntimeError("LLM 未返回响应")
-
-            # 7. 保存对话历史
-            if self.memory:
-                await self.memory.add(session_id, "user", user_input)
-                await self.memory.add(session_id, "assistant", llm_response.content)
-                trace.record("memory_save", {"messages_saved": 2})
-
-            elapsed = time.time() - start_time
-
-            response = AgentResponse(
-                content=llm_response.content,
-                tool_calls=all_tool_calls,
-                sources=sources,
-                tokens_used=llm_response.tokens_used,
-                model=llm_response.model,
-                session_id=session_id,
-                elapsed_seconds=round(elapsed, 2),
-                metadata={"trace_id": trace.trace_id},
-            )
-            trace.finish(response=response.to_dict())
-            return response
+            result = agent.run(user_input)
         except Exception as e:
-            trace.fail(e)
-            raise
+            logger.error("[TaskAgent] 执行失败: %s", e)
+            return AgentResponse(
+                content=f"执行异常: {e}",
+                session_id=session_id,
+                elapsed_seconds=round(time.time() - start_time, 2),
+            )
+
+        return AgentResponse(
+            content=str(result),
+            session_id=session_id,
+            elapsed_seconds=round(time.time() - start_time, 2),
+        )
