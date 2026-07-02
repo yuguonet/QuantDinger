@@ -1,153 +1,139 @@
-# -*- coding: utf-8 -*-
 """
-Local ToolRegistry for agent.
+工具注册中心
 
-Auto-discovers tool functions from agent/tools/ and wraps them as
-smolagents Tool objects via the smolagents `tool` decorator.
+管理所有可用工具的注册、查找和执行。
+支持装饰器注册和手动注册两种方式。
 
-Usage:
-    from app.agent.tools import registry
-    registry.discover()
-    tools = build_smolagent_tools({"deny": [...], "domain": ...})
-    spec = registry.get("resolve_stock")
-    spec.fn(keyword="茅台")
+使用方式：
+    registry = ToolRegistry()
+
+    # 方式1: 装饰器注册
+    @registry.register
+    class MyTool(Tool): ...
+
+    # 方式2: 手动注册
+    registry.add(MyTool())
+
+    # 获取所有工具的 Function Schema（传给 LLM）
+    schemas = registry.get_function_schemas()
+
+    # 执行工具
+    result = await registry.call("my_tool", city="北京")
 """
-from __future__ import annotations
+import json
+import logging
+from typing import Optional
 
-import importlib
-import inspect
-from app.agent.log import logger
-from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from tools.base import Tool, ToolResult
 
-from smolagents import tool as smolagents_tool
-class _ToolSpec:
-    """薄的 spec 包装，提供 .fn 属性供 skill 脚本调用。"""
+logger = logging.getLogger(__name__)
 
-    def __init__(self, fn: Callable, name: str, description: str):
-        self.fn = fn
-        self.name = name
-        self.description = description
+
 class ToolRegistry:
-    """本地工具注册表 — 扫描 agent/tools/ 并包装为 smolagents Tool 对象。"""
+    """
+    工具注册中心
+
+    管理所有工具的生命周期，提供：
+    - 工具注册（装饰器/手动）
+    - 工具查找
+    - 工具 Schema 生成（OpenAI Function Calling 格式）
+    - 工具执行（按名调用）
+    """
 
     def __init__(self):
-        self._tools: Dict[str, _ToolSpec] = {}
-        self._smolagent_tools: Dict[str, Any] = {}  # name → smolagents Tool instance
-        self._discovered = False
-        self._tools_dir = Path(__file__).parent.resolve()
+        self._tools: dict[str, Tool] = {}
 
-    def discover(self):
-        """扫描 tools 目录，发现所有公开函数并注册。"""
-        if self._discovered:
-            return
-        self._discovered = True
+    def register(self, tool_cls_or_instance):
+        """
+        注册工具（支持类或实例）
 
-        for py_file in sorted(self._tools_dir.glob("*.py")):
-            module_name = py_file.stem
-            if module_name.startswith("_"):
-                continue
+        可作为装饰器使用：
+            @registry.register
+            class MyTool(Tool): ...
 
-            try:
-                mod = importlib.import_module(f"app.agent.tools.{module_name}")
-            except Exception:
-                logger.debug("[ToolRegistry] 跳过模块 %s: %s", module_name, exc_info=True)
-                continue
+        也可直接传入实例：
+            registry.register(MyTool())
+        """
+        if isinstance(tool_cls_or_instance, type):
+            # 传入的是类，实例化后注册
+            instance = tool_cls_or_instance()
+        else:
+            instance = tool_cls_or_instance
 
-            for attr_name in dir(mod):
-                if attr_name.startswith("_"):
-                    continue
-                obj = getattr(mod, attr_name)
-                if not callable(obj):
-                    continue
-                # 必须是普通函数（非 class）
-                if not inspect.isfunction(obj):
-                    continue
-                # 必须定义在当前模块（不是导入的）
-                if getattr(obj, '__module__', '') != mod.__name__:
-                    continue
-                doc = inspect.getdoc(obj)
-                if not doc:
-                    continue
-                # 跳过返回 Callable 的装饰器函数（smolagents 不支持）
-                hints = inspect.get_annotations(obj, eval_str=False)
-                ret = hints.get('return', '')
-                if 'Callable' in str(ret):
-                    continue
+        if not instance.name:
+            raise ValueError(f"工具必须定义 name 属性: {type(instance).__name__}")
 
-                spec = _ToolSpec(
-                    fn=obj,
-                    name=attr_name,
-                    description=doc.split("\n")[0][:500],
-                )
-                self._tools[attr_name] = spec
+        self._tools[instance.name] = instance
+        logger.debug(f"注册工具: {instance.name} - {instance.description}")
+        return tool_cls_or_instance  # 返回原始类（支持装饰器用法）
 
-    def _wrap_as_smolagent(self, name: str) -> Any:
-        """将指定工具包装为 smolagents Tool（惰性）。"""
-        if name in self._smolagent_tools:
-            return self._smolagent_tools[name]
-        spec = self._tools.get(name)
-        if spec is None:
-            raise KeyError(f"工具 '{name}' 未注册")
-        try:
-            tool_obj = smolagents_tool(spec.fn)
-            self._smolagent_tools[name] = tool_obj
-            return tool_obj
-        except Exception as e:
-            logger.warning("[ToolRegistry] 工具 %s 包装失败，跳过: %s", name, e)
-            return None
+    def add(self, tool: Tool):
+        """手动注册工具实例"""
+        self.register(tool)
 
-    def get(self, name: str) -> Optional[_ToolSpec]:
-        """获取工具 spec（含 .fn 属性）。"""
+    def get(self, name: str) -> Optional[Tool]:
+        """按名获取工具"""
         return self._tools.get(name)
 
-    @property
-    def all_names(self) -> List[str]:
-        """返回所有已注册的工具名列表。"""
+    def list_tools(self) -> list[str]:
+        """列出所有已注册的工具名"""
         return list(self._tools.keys())
 
-    def __len__(self) -> int:
+    def get_function_schemas(self) -> list[dict]:
+        """
+        获取所有工具的 Function Calling Schema
+
+        返回格式兼容 OpenAI / DashScope Function Calling API。
+
+        :return: Schema 列表
+        """
+        return [tool.get_function_schema() for tool in self._tools.values()]
+
+    async def call(self, name: str, **kwargs) -> ToolResult:
+        """
+        按名执行工具
+
+        :param name: 工具名称
+        :param kwargs: 工具参数
+        :return: ToolResult
+        """
+        tool = self._tools.get(name)
+        if not tool:
+            available = ", ".join(self._tools.keys())
+            return ToolResult(
+                success=False,
+                error=f"工具不存在: '{name}', 可用工具: [{available}]",
+            )
+
+        logger.info(f"执行工具: {name}, 参数: {kwargs}")
+        result = await tool.safe_execute(**kwargs)
+        logger.info(f"工具执行完成: {name}, 成功: {result.success}")
+        return result
+
+    async def call_from_llm_response(self, tool_call: dict) -> ToolResult:
+        """
+        从 LLM 的 tool_call 响应中执行工具
+
+        :param tool_call: LLM 返回的 tool_call 字典
+            {
+                "id": "call_xxx",
+                "function": {"name": "get_weather", "arguments": '{"city": "北京"}'}
+            }
+        :return: ToolResult
+        """
+        func_info = tool_call.get("function", {})
+        name = func_info.get("name", "")
+        arguments_str = func_info.get("arguments", "{}")
+
+        try:
+            kwargs = json.loads(arguments_str)
+        except json.JSONDecodeError:
+            return ToolResult(success=False, error=f"工具参数解析失败: {arguments_str}")
+
+        return await self.call(name, **kwargs)
+
+    def __len__(self):
         return len(self._tools)
 
-    def __contains__(self, name: str) -> bool:
+    def __contains__(self, name: str):
         return name in self._tools
-def build_smolagent_tools(config: Optional[Dict[str, Any]] = None) -> List[Any]:
-    """构建 smolagent 兼容工具列表。
-
-    Args:
-        config: 可选配置字典，支持:
-            - deny: List[str] — 排除的工具名列表
-            - allow: List[str] — 只加载指定的工具名列表（用于 per-phase 工具过滤）
-            - domain: str — 领域过滤（当前未实现全部过滤）
-
-    Returns:
-        可用于 smolagents CodeAgent/ToolCallingAgent 的工具列表
-    """
-    registry = ToolRegistry()
-    registry.discover()
-    config = config or {}
-    deny = set(config.get("deny", []) or [])
-    allow = set(config.get("allow", []) or [])
-    domain = config.get("domain", "")
-
-    tools = []
-    for name in sorted(registry._tools.keys()):
-        # 如果指定了 allow 列表，只加载 allow 中的工具
-        if allow and name not in allow:
-            continue
-        if name in deny or name == "final_answer":
-            continue
-        tool_obj = registry._wrap_as_smolagent(name)
-        if tool_obj is not None:
-            tools.append(tool_obj)
-    return tools
-# ── 模块级单例 ──────────────────────────────────────────────────
-_registry: Optional[ToolRegistry] = None
-def get_local_registry() -> ToolRegistry:
-    """获取（或创建）全局 ToolRegistry 单例。"""
-    global _registry
-    if _registry is None:
-        _registry = ToolRegistry()
-    return _registry
-# 模块级便捷引用 — 供 from app.agent.tools.registry import registry 使用
-registry: ToolRegistry = get_local_registry()
