@@ -1,11 +1,13 @@
+# -*- coding: utf-8 -*-
 """
-配置加载器 - 支持 YAML 文件 + 环境变量覆盖
+配置加载器 — 支持 YAML 文件 + .env 环境变量 + AGENT_ 前缀覆盖
 
 加载优先级（从低到高）：
   1. dataclass 默认值
-  2. settings.yaml
-  3. settings.{env}.yaml
-  4. 环境变量（AGENT_ 前缀）
+  2. backend_api_python/.env（通过 python-dotenv 加载到 os.environ）
+  3. settings.yaml
+  4. settings.{env}.yaml
+  5. AGENT_ 前缀环境变量（最高优先级）
 """
 
 import os
@@ -17,11 +19,34 @@ from typing import Optional, get_args, get_origin
 from .settings import Settings, LLMConfig, RAGConfig, MemoryConfig, ServerConfig
 
 
+def _load_dotenv():
+    """加载 backend_api_python/.env 到 os.environ（幂等，不覆盖已有变量）。"""
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+
+    # 从当前文件向上查找 backend_api_python/.env
+    # config/loader.py → config/ → agent/ → app/ → backend_api_python/
+    candidates = [
+        Path(__file__).resolve().parents[3] / ".env",  # backend_api_python/.env
+        Path(__file__).resolve().parents[2] / ".env",  # app/.env（备用）
+    ]
+    for env_path in candidates:
+        if env_path.exists():
+            load_dotenv(env_path, override=False)
+            return
+
+
+# 模块加载时自动读取 .env（幂等）
+_load_dotenv()
+
+
 class ConfigLoader:
     """配置加载器"""
 
     def __init__(self, config_dir: Optional[str] = None):
-        self.config_dir = Path(config_dir) if config_dir else Path("config")
+        self.config_dir = Path(config_dir) if config_dir else Path(__file__).parent
 
     def load(self, env: Optional[str] = None) -> Settings:
         """
@@ -38,7 +63,7 @@ class ConfigLoader:
         env_data = self._load_yaml(f"settings.{env}.yaml")
         # 3. 合并
         merged = self._deep_merge(base_data, env_data)
-        # 4. 环境变量覆盖
+        # 4. .env + AGENT_ 前缀环境变量覆盖
         merged = self._apply_env_overrides(merged)
 
         # 5. 构造 Settings 对象
@@ -65,10 +90,46 @@ class ConfigLoader:
     @staticmethod
     def _apply_env_overrides(data: dict) -> dict:
         """
-        环境变量覆盖规则：
-          AGENT_LLM_API_KEY  ->  data["llm"]["api_key"]
-          AGENT_RAG_QDRANT_HOST  ->  data["rag"]["qdrant_host"]
+        环境变量覆盖规则（两级映射）：
+
+        QuantDinger 标准变量 → LLM 配置：
+          LLM_PROVIDER     → data["llm"]["qd_provider"]
+          OPENROUTER_API_KEY → data["llm"]["api_key"]（按 provider 选取）
+          OPENROUTER_MODEL  → data["llm"]["model"]
+          AGENT_LLM_MODEL   → data["llm"]["model"]（更高优先级）
+
+        AGENT_ 前缀变量 → 任意配置段：
+          AGENT_LLM_API_KEY  → data["llm"]["api_key"]
+          AGENT_RAG_QDRANT_HOST → data["rag"]["qdrant_host"]
         """
+        # ── QuantDinger 标准变量映射 ──────────────────────
+        qd_provider = os.getenv("LLM_PROVIDER", "").strip().lower()
+        if qd_provider:
+            data.setdefault("llm", {})["qd_provider"] = qd_provider
+
+            # 按 provider 选取 API key 和 model
+            key_env = f"{qd_provider.upper()}_API_KEY"
+            model_env = f"{qd_provider.upper()}_MODEL"
+            base_url_env = f"{qd_provider.upper()}_BASE_URL"
+
+            api_key = os.getenv(key_env, "").strip()
+            model = os.getenv(model_env, "").strip()
+            base_url = os.getenv(base_url_env, "").strip()
+
+            llm = data.setdefault("llm", {})
+            if api_key:
+                llm.setdefault("api_key", api_key)
+            if model:
+                llm.setdefault("model", model)
+            if base_url:
+                llm.setdefault("base_url", base_url)
+
+        # AGENT_LLM_MODEL 覆盖（优先级高于 provider 默认模型）
+        agent_model = os.getenv("AGENT_LLM_MODEL", "").strip()
+        if agent_model:
+            data.setdefault("llm", {})["model"] = agent_model
+
+        # ── AGENT_ 前缀变量覆盖 ──────────────────────────
         prefix = "AGENT_"
         for key, value in os.environ.items():
             if not key.startswith(prefix):
@@ -81,6 +142,7 @@ class ConfigLoader:
                 data[section][field] = value
             elif len(parts) == 1:
                 data[parts[0]] = value
+
         return data
 
     @staticmethod

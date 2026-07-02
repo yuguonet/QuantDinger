@@ -9,7 +9,8 @@ from typing import Optional, List
 @dataclass
 class LLMConfig:
     """LLM 模型配置"""
-    provider: str = "dashscope"           # dashscope / openai
+    provider: str = "dashscope"           # dashscope / openai（原始 provider）
+    qd_provider: str = ""                  # QuantDinger LLMService provider（openrouter/openai/google/deepseek/grok）
     model: str = "qwen-plus"
     api_key: str = ""
     base_url: Optional[str] = None        # OpenAI 兼容接口地址
