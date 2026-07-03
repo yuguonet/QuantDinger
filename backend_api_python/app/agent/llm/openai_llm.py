@@ -56,9 +56,13 @@ class OpenAILLM(LLMBase):
     def __init__(self, model: str, api_key: str, **kwargs):
         super().__init__(model, api_key, **kwargs)
         self.base_url = kwargs.get("base_url")
+        self._client = None
 
     def _get_client(self):
-        """获取 OpenAI 异步客户端"""
+        """获取（缓存的）OpenAI 异步客户端"""
+        if self._client is not None:
+            return self._client
+
         try:
             from openai import AsyncOpenAI
         except ImportError:
@@ -68,7 +72,8 @@ class OpenAILLM(LLMBase):
         if self.base_url:
             client_kwargs["base_url"] = self.base_url
 
-        return AsyncOpenAI(**client_kwargs)
+        self._client = AsyncOpenAI(**client_kwargs)
+        return self._client
 
     async def generate(
         self,

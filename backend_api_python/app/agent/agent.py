@@ -6,10 +6,11 @@
 """
 from __future__ import annotations
 
+import os
 import logging
+from types import SimpleNamespace
 from typing import Optional
 
-from config.loader import get_settings
 from llm import create_llm, QDSkillAdapter
 from memory import LocalMemory
 from tools.registry import ToolRegistry
@@ -17,26 +18,53 @@ from agents import TaskAgent
 
 logger = logging.getLogger(__name__)
 
-# ---------- FastAPI （可选）----------
+# ---------- FastAPI（可选）----------
 try:
     from fastapi import FastAPI, HTTPException
 except ImportError:
     FastAPI = None
     HTTPException = None
 
-# ---------- 初始化 ----------
-settings = get_settings(config_dir="config")
+# ---------- 配置（来自 backend_api_python/.env）----------
+VERSION = "1.0.0"
+AGENT_ENV = os.getenv("AGENT_ENV", "development")
 
+LLM_PROVIDER     = os.getenv("LLM_PROVIDER", "")
+LLM_MODEL        = os.getenv("OPENAI_MODEL", "qwen-plus")
+LLM_API_KEY      = os.getenv("OPENAI_API_KEY", "")
+LLM_BASE_URL     = os.getenv("OPENAI_BASE_URL")
+LLM_TEMPERATURE  = float(os.getenv("AGENT_LLM_TEMPERATURE", "0.1"))
+LLM_MAX_TOKENS   = int(os.getenv("OPENAI_MAX_TOKENS", "2048"))
+MEMORY_MAX_HISTORY = int(os.getenv("AGENT_MEMORY_MAX_HISTORY", "20"))
+MAX_TOOL_ROUNDS  = int(os.getenv("AGENT_MAX_STEPS", "6"))
+
+# ---------- settings 兼容对象（cli.py / flask_app.py 使用）----------
+settings = SimpleNamespace(
+    version=VERSION,
+    env=AGENT_ENV,
+    llm=SimpleNamespace(
+        provider=LLM_PROVIDER,
+        qd_provider=LLM_PROVIDER,
+        model=LLM_MODEL,
+        api_key=LLM_API_KEY,
+        base_url=LLM_BASE_URL,
+        temperature=LLM_TEMPERATURE,
+        max_tokens=LLM_MAX_TOKENS,
+    ),
+    memory=SimpleNamespace(max_history=MEMORY_MAX_HISTORY),
+)
+
+# ---------- 初始化 ----------
 llm = create_llm({
-    "provider": settings.llm.provider,
-    "model": settings.llm.model,
-    "api_key": settings.llm.api_key,
-    "base_url": settings.llm.base_url,
-    "temperature": settings.llm.temperature,
-    "max_tokens": settings.llm.max_tokens,
+    "provider": LLM_PROVIDER,
+    "model": LLM_MODEL,
+    "api_key": LLM_API_KEY,
+    "base_url": LLM_BASE_URL,
+    "temperature": LLM_TEMPERATURE,
+    "max_tokens": LLM_MAX_TOKENS,
 })
 
-memory = LocalMemory(max_messages=settings.memory.max_history)
+memory = LocalMemory(max_messages=MEMORY_MAX_HISTORY)
 
 # 工具注册
 registry = ToolRegistry()
@@ -49,7 +77,7 @@ skills = QDSkillAdapter()
 _mode = "task" if len(registry) > 0 else "chat"
 logger.info(
     "QuantDinger Agent 启动: %s 模式 | %d 工具 | %d 技能 | provider=%s model=%s",
-    _mode, len(registry), len(skills), settings.llm.provider, settings.llm.model,
+    _mode, len(registry), len(skills), LLM_PROVIDER, LLM_MODEL,
 )
 
 # ---------- Agent 实例 ----------
@@ -58,7 +86,7 @@ agent = TaskAgent(
     memory=memory,
     tool_registry=registry,
     system_prompt="你是 QuantDinger 量化分析 AI 助手。用中文回答。",
-    max_tool_rounds=10,
+    max_tool_rounds=MAX_TOOL_ROUNDS,
     skill_adapter=skills,
 )
 
