@@ -152,7 +152,9 @@ def main():
         _list_skills()
         return
 
-    session_id = args.session or f"cli-{int(time.time())}"
+    _ensure_agent_path()
+    from agent import DEFAULT_SESSION_ID
+    session_id = args.session or DEFAULT_SESSION_ID
 
     if args.message:
         _ensure_agent_path()

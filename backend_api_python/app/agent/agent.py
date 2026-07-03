@@ -42,6 +42,7 @@ MEMORY_MAX_HISTORY = int(os.getenv("AGENT_MEMORY_MAX_HISTORY", "20"))
 MEMORY_BACKEND    = os.getenv("MEMORY_BACKEND", "local").lower()
 DATABASE_URL      = os.getenv("DATABASE_URL", "")
 MAX_TOOL_ROUNDS   = int(os.getenv("AGENT_MAX_STEPS", "6"))
+DEFAULT_SESSION_ID = "default"
 
 # ---------- settings 兼容对象（cli.py / flask_app.py 使用）----------
 settings = SimpleNamespace(
