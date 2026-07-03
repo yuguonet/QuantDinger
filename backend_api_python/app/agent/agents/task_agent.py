@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import logging
 import os
 import re
@@ -142,44 +143,6 @@ def _build_smol_tools(tool_registry: ToolRegistry, selected_names: List[str]) ->
             except Exception as e:
                 logger.warning("[TaskAgent] 包装 %s 失败: %s", name, e, exc_info=True)
     return tools
-
-
-def _build_skill_tools(skill_adapter) -> list:
-    """将 SkillAdapter 转换为 smolagents Tool 列表。"""
-    if not skill_adapter:
-        return []
-
-    from smolagents import Tool as SmolToolBase
-
-    _adapter = skill_adapter
-
-    class GetSkillCatalog(SmolToolBase):
-        name = "get_skill_catalog"
-        description = "获取可用技能列表。用户提到选股、筛选等需求时先调用此工具。"
-        inputs = {}
-        output_type = "string"
-
-        def forward(self) -> str:
-            catalog = _adapter.get_catalog_text()
-            return catalog if catalog else "当前无可用技能。"
-
-    class ReadSkill(SmolToolBase):
-        name = "read_skill"
-        description = "加载指定技能的详细执行指令。"
-        inputs = {
-            "skill_name": {"type": "string", "description": "技能名称，如 market-screener"},
-        }
-        output_type = "string"
-
-        def forward(self, skill_name: str) -> str:
-            body = _adapter.get_body(skill_name)
-            if body:
-                return body
-            available = ", ".join(s["name"] for s in _adapter.list_skills())
-            return f"技能 '{skill_name}' 不存在。可用技能: {available}"
-
-    return [GetSkillCatalog(), ReadSkill()]
-
 
 # ═══════════════════════════════════════════════════════════════
 #  TaskAgent
@@ -361,14 +324,35 @@ class TaskAgent(AgentBase):
             if history_text:
                 task_parts.append(f"【对话历史】\n{history_text}")
 
-            # 加载计划选中的技能内容
+            # 加载计划选中的技能：先执行 skill，结果 + SKILL.md 一起注入
             skill_names = [t[6:] for t in selected_tools if t.startswith("skill:")]
             if skill_names and self.skill_adapter:
                 for sname in skill_names:
-                    body = self.skill_adapter.get_body(sname)
-                    if body:
-                        task_parts.append(f"【技能: {sname}】\n{body}")
-                        logger.info("[TaskAgent] 加载技能: %s", sname)
+                    # ① 执行 skill，获取结构化结果
+                    skill_result_text = ""
+                    try:
+                        skill_info = self.skill_adapter.get(sname)
+                        if skill_info:
+                            # 优先尝试执行 run.py（无论 skill_type）
+                            # skill 名可能带连字符（market-screener），模块名用下划线
+                            module_name = sname.replace("-", "_")
+                            mod = importlib.import_module(f"skills.{module_name}.run")
+                            if hasattr(mod, "run"):
+                                raw = mod.run()
+                                if isinstance(raw, dict):
+                                    skill_result_text = _format_skill_result(raw)
+                                else:
+                                    skill_result_text = str(raw)
+                                logger.info("[TaskAgent] skill %s 执行成功，结果 %d 字符", sname, len(skill_result_text))
+                                trace.record("skill_executed", {"skill": sname, "result_len": len(skill_result_text)})
+                    except Exception as e:
+                        logger.warning("[TaskAgent] skill %s 执行失败: %s", sname, e)
+                        skill_result_text = f"(skill 执行失败: {e})"
+
+                    # ② 注入执行结果（SKILL.md 执行指令不再注入，已外部执行）
+                    if skill_result_text:
+                        task_parts.append(f"【技能执行结果: {sname}】\n{skill_result_text}")
+                        logger.info("[TaskAgent] 注入 skill 结果: %s", sname)
 
             task_parts.append(f"【任务】\n{user_input}")
             task = "\n\n".join(task_parts)
