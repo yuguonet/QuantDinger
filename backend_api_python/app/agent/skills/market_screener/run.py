@@ -71,9 +71,11 @@ def pre_screen() -> Dict[str, Any]:
             result = prescreen(today)
     except Exception as e:
         logger.warning("[market_screener] Phase 1 预筛选失败: %s", e)
-        return {"strategy": strategy, "error": str(e), "candidates": [], "market": {}, "main_themes": []}
+        return {"strategy": strategy, "error": str(e), "candidates": [], "main_themes": []}
 
     result["strategy"] = strategy
+    result.setdefault("main_themes", [])
+    result.setdefault("candidates", [])
     return result
 # ═══════════════════════════════════════════════════════════════
 #  Phase 2 — 深入分析
@@ -98,7 +100,7 @@ def deep_analyze(prescreen_result: Dict[str, Any]) -> Dict[str, Any]:
     if strategy == "intraday":
         from .intraday import deep_analyze as _deep, tech_check
         candidates = prescreen_result.get("candidates", [])
-        market = prescreen_result.get("market", {})
+        # 默认 CNStock，不需要 market 字段
         main_themes = prescreen_result.get("main_themes", [])
 
         if not candidates:
@@ -107,7 +109,7 @@ def deep_analyze(prescreen_result: Dict[str, Any]) -> Dict[str, Any]:
                 skill_name="market_screener", score=45.0, direction="neutral",
                 confidence=0.5, signal="今日无明确短线标的",
                 analysis="", factors=[], status="ok",
-                output_data={"analyzed": [], "market": market},
+                output_data={"analyzed": []},
             )
         else:
             analyzed = []
@@ -128,7 +130,7 @@ def deep_analyze(prescreen_result: Dict[str, Any]) -> Dict[str, Any]:
                 direction="bullish" if avg_score >= 55 else ("bearish" if avg_score < 45 else "neutral"),
                 confidence=min(0.9, 0.4 + len(analyzed) * 0.06),
                 signal="", analysis="", factors=[], status="ok",
-                output_data={"analyzed": analyzed, "market": market},
+                output_data={"analyzed": analyzed},
             )
     elif strategy == "eod":
         from .eod import deep_analyze as _deep
@@ -186,6 +188,7 @@ def deep_analyze(prescreen_result: Dict[str, Any]) -> Dict[str, Any]:
         "factors": [{"name": f.name, "value": f.value, "score": f.score} for f in (report.factors or [])],
         "status": report.status,
     }
+    output["strategy"] = strategy
     output["strategy_used"] = strategy
     output["tools_called"] = _tool_calls
     output["missing_data"] = _missing_data
