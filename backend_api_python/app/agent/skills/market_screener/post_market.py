@@ -9,12 +9,11 @@ market_screener/post_market.py
 from __future__ import annotations
 
 from app.agent.log import logger
-from collections import Counter
 from typing import Any, Dict, List, Optional
 
 
 from .common import (
-    FactorItem, SkillReport,
+    FactorItem,
     call_tool, fetch_kline, get_limit_pct,
     fetch_hot_stocks_with_reason,
     compute_ma, compute_macd, compute_rsi, compute_kdj,
@@ -250,7 +249,8 @@ def prescreen(date: str) -> Dict[str, Any]:
             prev_close = bars[-2]["close"]
             if prev_close > 0:
                 change = (today["close"] - prev_close) / prev_close * 100
-                if change > 9.8 or change < -9.8:
+                limit_pct = get_limit_pct(code, info.get("name", ""))
+                if change >= limit_pct - 0.5 or change <= -(limit_pct - 0.5):
                     continue
 
         patterns = []
@@ -274,7 +274,7 @@ def prescreen(date: str) -> Dict[str, Any]:
             total_score -= 10
         elif rsi_val > 70:
             total_score -= 3
-        elif 40 < rsi_val < 60:
+        elif 40 <= rsi_val <= 60:
             total_score += 3
 
         if kdj["k"][-1] > kdj["d"][-1] and kdj["k"][-2] <= kdj["d"][-2]:
@@ -378,7 +378,7 @@ def deep_analyze(candidate, _tool_calls, _tool_nodes, _missing_data) -> Optional
         ma10 = candidate.get("ma10")
         entry_low = round(close * 0.995, 2)
         entry_high = round(close * 1.005, 2)
-        stop_loss = round(min(ma10 or close * 0.97, close * 0.97), 2)
+        stop_loss = round(ma10 or close * 0.97, 2)
         risk = close - stop_loss
         if risk <= 0:
             risk = close * 0.03
@@ -419,110 +419,4 @@ def deep_analyze(candidate, _tool_calls, _tool_nodes, _missing_data) -> Optional
     except Exception as e:
         logger.warning("[MktScreen] 盘后深入分析 %s 失败: %s", code, e)
         return None
-def run_strategy(date: str, _tool_calls, _tool_nodes, _missing_data) -> Optional[SkillReport]:
-    try:
-        prescreen_result = prescreen(date)
-    except Exception as e:
-        logger.warning("[MktScreen] 盘后形态扫描失败: %s", e)
-        return None
 
-    candidates = prescreen_result["candidates"]
-    main_themes = prescreen_result["main_themes"]
-
-    logger.info("[MktScreen] 盘后扫描: 池%d只, 扫描%d只, 候选%d只",
-                prescreen_result["pool_size"], prescreen_result["scanned"], len(candidates))
-
-    if not candidates:
-        return SkillReport(
-            skill_name="market_screener", score=40.0, direction="neutral",
-            confidence=0.5, signal="今日无符合形态的短线标的",
-            analysis=(
-                "## 盘后短线选股 — 无合适标的\n\n"
-                f"扫描 {prescreen_result['scanned']} 只股票，"
-                f"未发现符合技术形态条件的标的。\n\n"
-                "**建议：观望等待更好的形态出现。**"
-            ),
-            factors=[
-                FactorItem(name="扫描数", value=str(prescreen_result["scanned"]), score=50),
-                FactorItem(name="主线题材", value=", ".join(t for t, _ in main_themes[:3]) or "无", score=50),
-            ],
-            status="ok",
-        )
-
-    analyzed = []
-    for c in candidates[:6]:
-        result = deep_analyze(c, _tool_calls, _tool_nodes, _missing_data)
-        if result:
-            analyzed.append(result)
-
-    # Phase 2: 过滤低分
-    analyzed = [a for a in analyzed if a.get("score", 0) >= 60 and a.get("direction") == "bullish"]
-    analyzed.sort(key=lambda x: -x.get("score", 0))
-
-    if analyzed:
-        avg_score = sum(a["score"] for a in analyzed) / len(analyzed)
-        bullish = sum(1 for a in analyzed if a["direction"] == "bullish")
-    else:
-        avg_score = 50.0
-        bullish = 0
-
-    direction = "bullish" if avg_score >= 55 else ("bearish" if avg_score < 45 else "neutral")
-    confidence = min(0.85, 0.4 + len(analyzed) * 0.07)
-
-    factors = [
-        FactorItem(name="扫描池", value=str(prescreen_result["pool_size"]), score=50),
-        FactorItem(name="形态命中", value=str(len(candidates)), score=min(100, len(candidates) * 12 + 20)),
-        FactorItem(name="主线题材", value=", ".join(t for t, _ in main_themes[:3]) or "无",
-                   score=70 if main_themes else 40),
-        FactorItem(name="深入分析", value=str(len(analyzed)), score=min(100, len(analyzed) * 15 + 20)),
-        FactorItem(name="看多比例", value=f"{bullish}/{len(analyzed)}", score=int(avg_score)),
-    ]
-
-    lines = [
-        "## 盘后短线选股结果",
-        f"扫描池: {prescreen_result['pool_size']}只 | 形态命中: {len(candidates)}只 | 深入分析: {len(analyzed)}只",
-        f"主线题材: {', '.join(t for t, _ in main_themes[:5]) or '无明确主线'}",
-        "",
-    ]
-
-    pattern_counter: Counter = Counter()
-    for c in candidates:
-        for p in c.get("pattern_names", []):
-            pattern_counter[p] += 1
-    if pattern_counter:
-        lines.append("### 形态分布")
-        for p, cnt in pattern_counter.most_common(6):
-            lines.append(f"- {p}: {cnt}只")
-        lines.append("")
-
-    if analyzed:
-        lines.append("### 次日候选标的")
-        for a in analyzed:
-            risk = " ⚠️" + "、".join(a.get("risk_notes", [])) if a.get("risk_notes") else ""
-            entry = a.get("entry", {})
-            lines.append(
-                f"- **{a['code']}** {a.get('name', '')} | 评分{a['score']:.0f} | {a['direction']} | "
-                f"形态:{','.join(a.get('patterns', []))} | {a['signal']}{risk}"
-            )
-            lines.append(
-                f"  入场:{entry.get('price_low', '?')}-{entry.get('price_high', '?')} | "
-                f"止损:{entry.get('stop_loss', '?')} | "
-                f"目标:{entry.get('target_1', '?')}/{entry.get('target_2', '?')} | "
-                f"盈亏比:{entry.get('risk_reward', '?')}"
-            )
-
-    return SkillReport(
-        skill_name="market_screener", score=round(avg_score, 1),
-        direction=direction, confidence=confidence,
-        signal=f"盘后{len(analyzed)}只候选，主线:{', '.join(t for t, _ in main_themes[:2]) or '无'}",
-        factors=factors, analysis="\n".join(lines),
-        output_data={
-            "main_themes": main_themes,
-            "pattern_distribution": dict(pattern_counter),
-            "candidates": [c for c in candidates[:15]],
-            "analyzed": analyzed,
-        },
-        tools_called=_tool_calls or [],
-        missing_data=_missing_data or [],
-        status="ok",
-    )

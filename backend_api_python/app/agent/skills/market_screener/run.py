@@ -19,7 +19,8 @@ from __future__ import annotations
 
 from app.agent.log import logger
 from datetime import datetime, date
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
+from skills.market_screener.common import SkillReport
 # ═══════════════════════════════════════════════════════════════
 #  策略调度
 # ═══════════════════════════════════════════════════════════════
@@ -81,6 +82,32 @@ def pre_screen() -> Dict[str, Any]:
 #  Phase 2 — 深入分析
 # ═══════════════════════════════════════════════════════════════
 
+def _analyze_batch(
+    candidates: List[Dict],
+    analyze_fn,
+    max_candidates: int = 6,
+) -> List[Dict]:
+    """Loop over candidates, collect non-None results from analyze_fn."""
+    results = []
+    for c in candidates[:max_candidates]:
+        result = analyze_fn(c)
+        if result:
+            results.append(result)
+    return results
+
+def _build_report(analyzed: List[Dict]) -> SkillReport:
+    """Filter low scores, sort, compute aggregate, build SkillReport."""
+    analyzed = [a for a in analyzed if a.get("score", 0) >= 60 and a.get("direction") == "bullish"]
+    analyzed.sort(key=lambda x: -x.get("score", 0))
+    avg_score = sum(a["score"] for a in analyzed) / len(analyzed) if analyzed else 50.0
+    return SkillReport(
+        skill_name="market_screener", score=round(avg_score, 1),
+        direction="bullish" if avg_score >= 55 else ("bearish" if avg_score < 45 else "neutral"),
+        confidence=min(0.9, 0.4 + len(analyzed) * 0.06),
+        signal="", analysis="", factors=[], status="ok",
+        output_data={"analyzed": analyzed},
+    )
+
 def deep_analyze(prescreen_result: Dict[str, Any]) -> Dict[str, Any]:
     """Phase 2: 对 Phase 1 候选股做深入分析。
 
@@ -100,11 +127,9 @@ def deep_analyze(prescreen_result: Dict[str, Any]) -> Dict[str, Any]:
     if strategy == "intraday":
         from .intraday import deep_analyze as _deep, tech_check
         candidates = prescreen_result.get("candidates", [])
-        # 默认 CNStock，不需要 market 字段
         main_themes = prescreen_result.get("main_themes", [])
 
         if not candidates:
-            from skills.market_screener.common import SkillReport
             report = SkillReport(
                 skill_name="market_screener", score=45.0, direction="neutral",
                 confidence=0.5, signal="今日无明确短线标的",
@@ -112,70 +137,28 @@ def deep_analyze(prescreen_result: Dict[str, Any]) -> Dict[str, Any]:
                 output_data={"analyzed": []},
             )
         else:
-            analyzed = []
-            for c in candidates[:8]:
-                tech = tech_check(c["code"])
-                result = _deep(c, tech, _tool_calls, _tool_nodes, _missing_data)
-                if result:
-                    analyzed.append(result)
-            analyzed = [a for a in analyzed if a.get("score", 0) >= 60 and a.get("direction") == "bullish"]
-            analyzed.sort(key=lambda x: -x.get("score", 0))
-            if analyzed:
-                avg_score = sum(a["score"] for a in analyzed) / len(analyzed)
-            else:
-                avg_score = 50.0
-            from skills.market_screener.common import SkillReport
-            report = SkillReport(
-                skill_name="market_screener", score=round(avg_score, 1),
-                direction="bullish" if avg_score >= 55 else ("bearish" if avg_score < 45 else "neutral"),
-                confidence=min(0.9, 0.4 + len(analyzed) * 0.06),
-                signal="", analysis="", factors=[], status="ok",
-                output_data={"analyzed": analyzed},
+            raw = _analyze_batch(
+                candidates,
+                lambda c: _deep(c, tech_check(c["code"]), _tool_calls, _tool_nodes, _missing_data),
+                max_candidates=8,
             )
+            report = _build_report(raw)
     elif strategy == "eod":
         from .eod import deep_analyze as _deep
         candidates = prescreen_result.get("candidates", [])
-        analyzed = []
-        for c in candidates[:6]:
-            result = _deep(c, _tool_calls, _tool_nodes, _missing_data)
-            if result:
-                analyzed.append(result)
-        analyzed = [a for a in analyzed if a.get("score", 0) >= 60 and a.get("direction") == "bullish"]
-        analyzed.sort(key=lambda x: -x.get("score", 0))
-        if analyzed:
-            avg_score = sum(a["score"] for a in analyzed) / len(analyzed)
-        else:
-            avg_score = 50.0
-        from skills.market_screener.common import SkillReport
-        report = SkillReport(
-            skill_name="market_screener", score=round(avg_score, 1),
-            direction="bullish" if avg_score >= 55 else ("bearish" if avg_score < 45 else "neutral"),
-            confidence=min(0.9, 0.4 + len(analyzed) * 0.06),
-            signal="", analysis="", factors=[], status="ok",
-            output_data={"analyzed": analyzed},
+        raw = _analyze_batch(
+            candidates,
+            lambda c: _deep(c, _tool_calls, _tool_nodes, _missing_data),
         )
+        report = _build_report(raw)
     else:
         from .post_market import deep_analyze as _deep
         candidates = prescreen_result.get("candidates", [])
-        analyzed = []
-        for c in candidates[:6]:
-            result = _deep(c, _tool_calls, _tool_nodes, _missing_data)
-            if result:
-                analyzed.append(result)
-        analyzed = [a for a in analyzed if a.get("score", 0) >= 60 and a.get("direction") == "bullish"]
-        analyzed.sort(key=lambda x: -x.get("score", 0))
-        if analyzed:
-            avg_score = sum(a["score"] for a in analyzed) / len(analyzed)
-        else:
-            avg_score = 50.0
-        from skills.market_screener.common import SkillReport
-        report = SkillReport(
-            skill_name="market_screener", score=round(avg_score, 1),
-            direction="bullish" if avg_score >= 55 else ("bearish" if avg_score < 45 else "neutral"),
-            confidence=min(0.9, 0.4 + len(analyzed) * 0.06),
-            signal="", analysis="", factors=[], status="ok",
-            output_data={"analyzed": analyzed},
+        raw = _analyze_batch(
+            candidates,
+            lambda c: _deep(c, _tool_calls, _tool_nodes, _missing_data),
         )
+        report = _build_report(raw)
 
     # 构建最终输出
     output = report.to_dict() if hasattr(report, "to_dict") else {

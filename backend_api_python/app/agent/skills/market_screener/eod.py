@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 
 
 from .common import (
-    FactorItem, SkillReport,
+    FactorItem,
     call_tool, fetch_kline, get_limit_pct, _today_str,
     fetch_zt_pool, fetch_hot_stocks_with_reason,
     compute_ma, compute_rsi,
@@ -297,65 +297,4 @@ def deep_analyze(candidate, _tool_calls, _tool_nodes, _missing_data) -> Optional
     except Exception as e:
         logger.warning("[MktScreen] 尾盘深入分析 %s 失败: %s", code, e)
         return None
-def run_strategy(_tool_calls, _tool_nodes, _missing_data) -> Optional[SkillReport]:
-    try:
-        prescreen_result = prescreen()
-    except Exception as e:
-        logger.warning("[MktScreen] 尾盘预筛选失败: %s", e)
-        return None
 
-    candidates = prescreen_result["candidates"]
-    main_themes = prescreen_result["main_themes"]
-
-    logger.info("[MktScreen] 尾盘预筛选: 条件选股%d只, 尾盘封板%d只, 候选%d只",
-                prescreen_result["screener_count"], prescreen_result["zt_eod_count"], len(candidates))
-
-    if not candidates:
-        return SkillReport(
-            skill_name="market_screener", score=40.0, direction="neutral",
-            confidence=0.5, signal="今日无合适隔夜标的",
-            analysis=(
-                f"## 尾盘选股 — 无合适标的\n\n"
-                f"条件选股扫描 {prescreen_result['screener_count']} 只，"
-                f"尾盘封板 {prescreen_result['zt_eod_count']} 只，"
-                f"经尾盘特征验证后无合格标的。\n\n"
-                f"**建议：空仓过夜，等待明日机会。**"
-            ),
-            factors=[
-                FactorItem(name="条件选股", value=str(prescreen_result["screener_count"]), score=40),
-                FactorItem(name="尾盘封板", value=str(prescreen_result["zt_eod_count"]), score=50),
-            ],
-            status="ok",
-        )
-
-    analyzed = []
-    for c in candidates[:6]:
-        result = deep_analyze(c, _tool_calls, _tool_nodes, _missing_data)
-        if result:
-            analyzed.append(result)
-
-    # Phase 2: 过滤低分
-    analyzed = [a for a in analyzed if a.get("score", 0) >= 60 and a.get("direction") == "bullish"]
-    analyzed.sort(key=lambda x: -x.get("score", 0))
-
-    if analyzed:
-        avg_score = sum(a["score"] for a in analyzed) / len(analyzed)
-        bullish = len(analyzed)
-    else:
-        avg_score = 50.0
-        bullish = 0
-
-    direction = "bullish" if avg_score >= 55 else ("bearish" if avg_score < 45 else "neutral")
-    confidence = min(0.85, 0.4 + len(analyzed) * 0.07)
-    lines = ["## 尾盘选股结果", f"候选: {len(candidates)}只 | 高分通过: {len(analyzed)}只"]
-    for a in analyzed:
-        lines.append(f"- **{a['code']}** {a.get('name', '')} | 评分{a['score']:.0f} | {a['direction']} | {a['signal']}")
-
-    return SkillReport(
-        skill_name="market_screener", score=round(avg_score, 1),
-        direction=direction, confidence=confidence,
-        signal=f"隔夜{bullish}只高分候选，主线:{', '.join(t for t, _ in main_themes[:2]) or '无'}",
-        factors=[], analysis="\n".join(lines),
-        output_data={"main_themes": main_themes, "candidates": candidates[:15], "analyzed": analyzed},
-        status="ok",
-    )

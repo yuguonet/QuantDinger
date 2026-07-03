@@ -455,9 +455,13 @@ def prescreen(date: str) -> Dict[str, Any]:
     dragon_pullback = scan_dragon_pullback(date)
     logger.info("[MktScreen] 连板: %d只, 龙回头: %d只", len(continuous_board), len(dragon_pullback))
 
+    # ── 题材热点 ──
+    hot_data = fetch_hot_stocks_with_reason(date)
+    hot_tags = hot_data.get("hot_tags", [])
+    main_themes = [(tag, cnt) for tag, cnt in hot_tags[:5]]
+
     # ── 4. 合并候选池 ──
     candidates = {}
-    main_themes = []
 
     # 连板
     for s in continuous_board:
