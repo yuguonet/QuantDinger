@@ -102,7 +102,7 @@ def deep_analyze(prescreen_result: Dict[str, Any]) -> Dict[str, Any]:
         main_themes = prescreen_result.get("main_themes", [])
 
         if not candidates:
-            from app.agent.chain.schema import SkillReport
+            from skills.market_screener.common import SkillReport
             report = SkillReport(
                 skill_name="market_screener", score=45.0, direction="neutral",
                 confidence=0.5, signal="今日无明确短线标的",
@@ -122,7 +122,7 @@ def deep_analyze(prescreen_result: Dict[str, Any]) -> Dict[str, Any]:
                 avg_score = sum(a["score"] for a in analyzed) / len(analyzed)
             else:
                 avg_score = 50.0
-            from app.agent.chain.schema import SkillReport
+            from skills.market_screener.common import SkillReport
             report = SkillReport(
                 skill_name="market_screener", score=round(avg_score, 1),
                 direction="bullish" if avg_score >= 55 else ("bearish" if avg_score < 45 else "neutral"),
@@ -144,7 +144,7 @@ def deep_analyze(prescreen_result: Dict[str, Any]) -> Dict[str, Any]:
             avg_score = sum(a["score"] for a in analyzed) / len(analyzed)
         else:
             avg_score = 50.0
-        from app.agent.chain.schema import SkillReport
+        from skills.market_screener.common import SkillReport
         report = SkillReport(
             skill_name="market_screener", score=round(avg_score, 1),
             direction="bullish" if avg_score >= 55 else ("bearish" if avg_score < 45 else "neutral"),
@@ -166,7 +166,7 @@ def deep_analyze(prescreen_result: Dict[str, Any]) -> Dict[str, Any]:
             avg_score = sum(a["score"] for a in analyzed) / len(analyzed)
         else:
             avg_score = 50.0
-        from app.agent.chain.schema import SkillReport
+        from skills.market_screener.common import SkillReport
         report = SkillReport(
             skill_name="market_screener", score=round(avg_score, 1),
             direction="bullish" if avg_score >= 55 else ("bearish" if avg_score < 45 else "neutral"),

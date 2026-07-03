@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import time
 from typing import Dict, List, Optional
@@ -31,6 +32,20 @@ from utils.json_parser import safe_parse_json
 from utils.tracing import AgentTraceRecorder, llm_response_to_dict
 
 logger = logging.getLogger(__name__)
+
+# Plan 提示词模板
+_PLAN_TEMPLATE: str | None = None
+_PLAN_TEMPLATE_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "prompts", "plan_system.txt"
+)
+
+
+def _load_plan_template() -> str:
+    global _PLAN_TEMPLATE
+    if _PLAN_TEMPLATE is None:
+        with open(_PLAN_TEMPLATE_PATH, encoding="utf-8") as f:
+            _PLAN_TEMPLATE = f.read()
+    return _PLAN_TEMPLATE
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -226,15 +241,8 @@ class TaskAgent(AgentBase):
 
         tools_text = "\n".join(tools_desc)
 
-        prompt = (
-            f"你是任务规划器。根据用户消息，判断需要调用哪些工具。\n\n"
-            f"可用工具:\n{tools_text}\n\n"
-            f"用户消息: {user_input}\n\n"
-            f"注意：对话历史会自动包含在上下文中，无需调用工具查询历史。\n"
-            f"只输出 JSON，不要其他内容:\n"
-            f'{{"tools": ["工具名1", "技能名"], "reason": "简短原因"}}\n'
-            f"如果不需要工具，tools 为空数组。最多选 5 个。技能请用 skill:前缀。"
-        )
+        template = _load_plan_template()
+        prompt = template.format(tools_text=tools_text, user_input=user_input)
 
         messages = [
             ChatMessage(role="system", content="你是任务规划器。只输出 JSON。"),

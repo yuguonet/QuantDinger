@@ -11,8 +11,9 @@ from __future__ import annotations
 from app.agent.log import logger
 from typing import Any, Dict, List, Optional
 
-from app.agent.chain.schema import FactorItem, SkillReport
+
 from .common import (
+    FactorItem, SkillReport,
     call_tool, fetch_kline, get_limit_pct, _today_str,
     fetch_zt_pool, fetch_hot_stocks_with_reason,
     compute_ma, compute_rsi,

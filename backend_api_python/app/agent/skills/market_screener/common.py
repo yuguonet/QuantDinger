@@ -14,6 +14,82 @@ import sys
 from collections import Counter
 from datetime import datetime, timedelta, date
 from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
+
+# ═══════════════════════════════════════════════════════════════
+#  Skill 自包含数据结构
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class FactorItem:
+    """单个因子的评分结果。"""
+    name: str
+    value: str = ""
+    score: Optional[float] = None
+    weight: float = 1.0
+    status: str = "ok"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name, "value": self.value,
+            "score": self.score, "weight": self.weight, "status": self.status,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "FactorItem":
+        return cls(
+            name=d.get("name", ""),
+            value=str(d.get("value", "")),
+            score=d.get("score"),
+            weight=d.get("weight", 1.0),
+            status=d.get("status", "ok"),
+        )
+
+
+@dataclass
+class SkillReport:
+    """Skill 标准化输出。"""
+    skill_name: str
+    score: float = 50.0
+    confidence: float = 0.0
+    direction: str = "neutral"
+    signal: str = ""
+    factors: List[FactorItem] = field(default_factory=list)
+    analysis: str = ""
+    output_data: Dict[str, Any] = field(default_factory=dict)
+    tools_called: List[str] = field(default_factory=list)
+    missing_data: List[str] = field(default_factory=list)
+    status: str = "ok"
+    error: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "skill_name": self.skill_name,
+            "score": self.score, "confidence": self.confidence,
+            "direction": self.direction, "signal": self.signal,
+            "factors": [f.to_dict() for f in self.factors],
+            "analysis": self.analysis, "output_data": self.output_data,
+            "tools_called": self.tools_called, "missing_data": self.missing_data,
+            "status": self.status, "error": self.error,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "SkillReport":
+        return cls(
+            skill_name=d.get("skill_name", ""),
+            score=d.get("score", 50.0),
+            confidence=d.get("confidence", 0.0),
+            direction=d.get("direction", "neutral"),
+            signal=d.get("signal", ""),
+            factors=[FactorItem.from_dict(f) for f in d.get("factors", [])],
+            analysis=d.get("analysis", ""),
+            output_data=d.get("output_data", {}),
+            tools_called=d.get("tools_called", []),
+            missing_data=d.get("missing_data", []),
+            status=d.get("status", "ok"),
+            error=d.get("error", ""),
+        )
+
 # ═══════════════════════════════════════════════════════════════
 #  路径与环境
 # ═══════════════════════════════════════════════════════════════

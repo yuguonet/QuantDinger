@@ -12,8 +12,9 @@ from app.agent.log import logger
 from collections import Counter
 from typing import Any, Dict, List, Optional
 
-from app.agent.chain.schema import FactorItem, SkillReport
+
 from .common import (
+    FactorItem, SkillReport,
     call_tool, fetch_kline, get_limit_pct,
     fetch_hot_stocks_with_reason,
     compute_ma, compute_macd, compute_rsi, compute_kdj,

@@ -23,8 +23,9 @@ from collections import Counter
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-from app.agent.chain.schema import FactorItem, SkillReport
+
 from .common import (
+    FactorItem, SkillReport,
     call_tool, fetch_kline, get_limit_pct,
     fetch_zt_pool, fetch_dt_pool, fetch_broken_board,
     fetch_hot_stocks_with_reason, fetch_hot_sectors,
