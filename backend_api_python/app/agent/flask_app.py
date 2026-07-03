@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Flask 壳 — 共用 CLI 链路（QDAgent）。
+Flask 壳 — 共用 agent.py 全局组件。
 
 路由：
   POST /api/agent-v2/chat          — 普通对话（SSE 流式）
-  POST /api/agent-v2/task          — 带工具调用的 ReAct 任务
+  POST /api/agent-v2/task          — 带工具调用的任务
   GET  /api/agent-v2/tools         — 列出可用工具
   GET  /api/agent-v2/skills        — 列出可用技能
   GET  /api/agent-v2/health        — 健康检查
@@ -47,29 +47,15 @@ def _ensure_agent_path():
         sys.path.insert(0, _agent_dir)
 
 
-# ── 工具/技能适配器（仅用于信息展示）──
-def _get_tool_adapter():
-    _ensure_agent_path()
-    from llm import QDToolAdapter
-    return QDToolAdapter()
-
-
-def _get_skill_adapter():
-    _ensure_agent_path()
-    from llm import QDSkillAdapter
-    return QDSkillAdapter()
-
-
 # ── Blueprint ─────────────────────────────────────────────────
 agent_v2_bp = Blueprint("agent_v2", __name__, url_prefix="/api/agent-v2")
 
 
 def _run_agent(message: str, session_id: str) -> str:
-    """同步执行 QDAgent.chat()（在后台线程中调用）。"""
+    """同步执行 TaskAgent.chat()（在后台线程中调用）。"""
     _ensure_agent_path()
-    from agent import QDAgent
+    from agent import agent
 
-    agent = QDAgent()
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -110,9 +96,14 @@ def _sse_stream(message: str, session_id: str, timeout: int = 300):
 def health():
     try:
         _ensure_agent_path()
-        from app.agent.config.loader import get_settings
-        s = get_settings()
-        return jsonify({"status": "ok", "version": s.version, "env": s.env})
+        from agent import settings, registry, skills
+        return jsonify({
+            "status": "ok",
+            "version": settings.version,
+            "env": settings.env,
+            "tools": len(registry),
+            "skills": len(skills),
+        })
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 
@@ -121,15 +112,12 @@ def health():
 def info():
     try:
         _ensure_agent_path()
-        from app.agent.config.loader import get_settings
-        s = get_settings()
-        tools = _get_tool_adapter()
-        skills = _get_skill_adapter()
+        from agent import settings, registry, skills
         return jsonify({
-            "version": s.version,
-            "env": s.env,
-            "llm": {"provider": s.llm.provider, "qd_provider": s.llm.qd_provider, "model": s.llm.model},
-            "tools_count": len(tools),
+            "version": settings.version,
+            "env": settings.env,
+            "llm": {"provider": settings.llm.provider, "qd_provider": settings.llm.qd_provider, "model": settings.llm.model},
+            "tools_count": len(registry),
             "skills_count": len(skills),
         })
     except Exception as e:
@@ -139,11 +127,12 @@ def info():
 @agent_v2_bp.route("/tools", methods=["GET"])
 def list_tools():
     try:
-        tools = _get_tool_adapter()
+        _ensure_agent_path()
+        from agent import registry
         result = []
-        for name in tools.list_tools():
-            schema = tools.get_schema(name)
-            desc = schema.get("function", {}).get("description", "")[:200] if schema else ""
+        for name in registry.list_tools():
+            tool = registry.get(name)
+            desc = tool.description[:200] if tool else ""
             result.append({"name": name, "description": desc})
         return jsonify({"total": len(result), "tools": result})
     except Exception as e:
@@ -153,7 +142,8 @@ def list_tools():
 @agent_v2_bp.route("/skills", methods=["GET"])
 def list_skills():
     try:
-        skills = _get_skill_adapter()
+        _ensure_agent_path()
+        from agent import skills
         return jsonify({"total": len(skills), "skills": skills.list_skills()})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -161,7 +151,7 @@ def list_skills():
 
 @agent_v2_bp.route("/chat", methods=["POST"])
 def chat():
-    """普通对话（SSE）。共用 CLI 链路，QDAgent 内部决定是否调用工具。"""
+    """普通对话（SSE）。TaskAgent 内部决定是否调用工具。"""
     try:
         data = request.get_json() or {}
         message = data.get("message", "").strip()
@@ -180,7 +170,7 @@ def chat():
 
 @agent_v2_bp.route("/task", methods=["POST"])
 def task():
-    """带工具调用的 ReAct 任务（SSE）。共用 CLI 链路。"""
+    """带工具调用的任务（SSE）。"""
     try:
         data = request.get_json() or {}
         message = data.get("message", "").strip()

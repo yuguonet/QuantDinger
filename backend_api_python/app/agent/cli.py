@@ -53,19 +53,18 @@ def _ensure_agent_path():
 
 
 # ═══════════════════════════════════════════════════════════════
-#  核心：统一 Agent 对话
+#  核心：统一 Agent 对话（组件从 agent.py 导入）
 # ═══════════════════════════════════════════════════════════════
 
 async def _run_chat(message: str, session_id: str = "cli"):
     """统一对话入口。"""
     _ensure_agent_path()
-    from agent import QDAgent
+    from agent import agent, registry, skills
 
-    agent = QDAgent()
-
+    mode = "task" if len(registry) > 0 else "chat"
     print(f"\n📎 Session: {session_id}")
     print(f"💬 Message: {message}")
-    print(f"🔧 模式: {agent.mode} | 工具: {agent.tool_count} 个 | 技能: {agent.skill_count} 个")
+    print(f"🔧 模式: {mode} | 工具: {len(registry)} 个 | 技能: {len(skills)} 个")
     print("-" * 50)
 
     response = await agent.chat(message, session_id=session_id)
@@ -83,14 +82,15 @@ async def _run_chat(message: str, session_id: str = "cli"):
 def _print_info():
     """显示配置信息。"""
     _ensure_agent_path()
-    from app.agent.config.loader import get_settings
-    settings = get_settings()
+    from agent import settings, registry, skills
 
     print("=" * 60)
     print("QuantDinger Agent — CLI")
     print("=" * 60)
     print(f"\n  环境: {settings.env}")
     print(f"  版本: {settings.version}")
+    print(f"  工具: {len(registry)} 个")
+    print(f"  技能: {len(skills)} 个")
 
     try:
         from app.agent.llm.qd_llm import _load_llm_service
@@ -109,10 +109,8 @@ def _print_info():
 def _list_tools():
     """列出所有工具。"""
     _ensure_agent_path()
-    from tools.registry import ToolRegistry
+    from agent import registry
 
-    registry = ToolRegistry()
-    registry.discover()
     print(f"\n🔧 可用工具 ({len(registry)} 个):\n")
     for name in registry.list_tools():
         tool = registry.get(name)
@@ -123,11 +121,10 @@ def _list_tools():
 def _list_skills():
     """列出所有技能。"""
     _ensure_agent_path()
-    from llm import QDSkillAdapter
+    from agent import skills
 
-    adapter = QDSkillAdapter()
-    print(f"\n🎯 可用技能 ({len(adapter)} 个):\n")
-    for info in adapter.list_skills():
+    print(f"\n🎯 可用技能 ({len(skills)} 个):\n")
+    for info in skills.list_skills():
         print(f"  {info['name']:30s} {info['description'][:60]}")
 
 

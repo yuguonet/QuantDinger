@@ -1,133 +1,293 @@
 # -*- coding: utf-8 -*-
 """
-任务型 Agent — 基于 smolagents 的 ReAct 实现。
+任务型 Agent
 
-使用 smolagents CodeAgent 处理工具调用循环，
-不依赖模型的 function calling 能力。
+流程（对应 README 图）：
+  user input
+    -> plan: LLM 判断需要哪些工具
+    -> 无工具 → AgentBase.chat()（RAG + Memory + LLM）
+    -> 有工具 → RAG + Memory + smolagents CodeAgent（筛选后的工具）
+    -> response
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
-from typing import List, Optional
+from typing import Dict, List, Optional
+
+import nest_asyncio
+nest_asyncio.apply()
 
 from agents.base import AgentBase, AgentResponse
 from llm.base import ChatMessage, LLMBase
+from memory.base import MemoryBase
+from rag.retriever import Retriever
+from smolagents import Tool as SmolToolBase
 from tools.registry import ToolRegistry
+from tools.base import Tool
+from utils.json_parser import safe_parse_json
+from utils.tracing import AgentTraceRecorder, llm_response_to_dict
 
 logger = logging.getLogger(__name__)
 
 
-def _build_smolagent_tools(tool_registry: ToolRegistry, skill_adapter=None) -> List:
-    """将 ToolRegistry 工具 + Skill 转换为 smolagents Tool 对象。"""
-    from smolagents import tool as smolagents_tool
+# ═══════════════════════════════════════════════════════════════
+#  smolagents 适配层
+# ═══════════════════════════════════════════════════════════════
 
-    tools = []
-
-    # 注册普通工具
-    for name in tool_registry.list_tools():
-        tool_obj = tool_registry.get(name)
-        if not tool_obj:
-            continue
-        fn = getattr(tool_obj, "_original_func", None)
-        if fn is None:
-            continue
-        try:
-            tools.append(smolagents_tool(fn))
-        except Exception as e:
-            logger.debug("[TaskAgent] 包装 %s 失败: %s", name, e)
-
-    # 注册 Skill 工具
-    if skill_adapter:
-        _adapter = skill_adapter
-
-        @smolagents_tool
-        def get_skill_catalog() -> str:
-            """获取可用技能列表。用户提到选股、筛选等需求时先调用此工具。"""
-            catalog = _adapter.get_catalog_text()
-            return catalog if catalog else "当前无可用技能。"
-
-        @smolagents_tool
-        def read_skill(skill_name: str) -> str:
-            """加载指定技能的详细执行指令。
-
-            Args:
-                skill_name: 技能名称，如 market-screener
-            """
-            body = _adapter.get_body(skill_name)
-            if body:
-                return body
-            available = ", ".join(s.name for s in _adapter.list_skills())
-            return f"技能 '{skill_name}' 不存在。可用技能: {available}"
-
-        tools.extend([get_skill_catalog, read_skill])
-
-    return tools
-
-
-class _SmolagentsLLMWrapper:
+class _LLMAdapter:
     """把 Agent Template 的 LLMBase 包装为 smolagents Model 接口。"""
 
     def __init__(self, llm: LLMBase):
         self._llm = llm
+        self.model_id = getattr(llm, "model", "unknown")
 
-    def _call_llm(self, messages, **kwargs):
-        """统一调用逻辑，返回带 token_usage 的响应。"""
+    def generate(
+        self,
+        messages: list,
+        stop_sequences: list | None = None,
+        response_format: dict | None = None,
+        tools_to_call_from: list | None = None,
+        **kwargs,
+    ):
+        """smolagents 调用入口 → 转发到 LLMBase.generate()。"""
+        from smolagents.models import ChatMessage as SmolChatMessage
+
         chat_messages = []
         for m in messages:
             if isinstance(m, dict):
                 role, content = m.get("role", "user"), m.get("content", "")
             else:
-                role, content = getattr(m, "role", "user"), getattr(m, "content", "")
+                role = getattr(m, "role", "user")
+                content = getattr(m, "content", "")
             chat_messages.append(ChatMessage(role=role, content=content))
 
+        # smolagents 通过 prompt 传递工具描述，不走 function calling
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    resp = pool.submit(asyncio.run, self._llm.generate(chat_messages)).result()
-            else:
-                resp = asyncio.run(self._llm.generate(chat_messages))
+            resp = asyncio.run(self._llm.generate(chat_messages))
         except Exception as e:
             logger.error("[TaskAgent] LLM 调用失败: %s", e)
             raise
 
-        # 包装为 smolagents 期望的格式（token_usage 必须是对象属性，不能是 dict）
+        smol_msg = SmolChatMessage(role="assistant", content=resp.content or "")
+
         class _TokenUsage:
             def __init__(self, r):
-                self.input_tokens = r.prompt_tokens if r is not None else 0
-                self.output_tokens = r.completion_tokens if r is not None else 0
-                self.total_tokens = r.tokens_used if r is not None else 0
+                self.input_tokens = r.prompt_tokens if r else 0
+                self.output_tokens = r.completion_tokens if r else 0
+                self.total_tokens = r.tokens_used if r else 0
 
-        class _Result:
-            def __init__(self, r):
-                self.content = r.content if r is not None else ""
-                self.token_usage = _TokenUsage(r)
+        smol_msg.token_usage = _TokenUsage(resp)
+        return smol_msg
 
-        return _Result(resp)
 
-    def generate(self, messages, **kwargs):
-        """smolagents 调用入口。"""
-        return self._call_llm(messages, **kwargs)
+class _SmolTool(SmolToolBase):
+    """把 Agent Template 的 Tool 包装为 smolagents Tool 子类。"""
+    skip_forward_signature_validation = True
 
-    def __call__(self, messages, **kwargs):
-        return self._call_llm(messages, **kwargs)
+    def __init__(self, wrapped: Tool):
+        self._wrapped = wrapped
+        self.name = wrapped.name
+        self.description = wrapped.description
+        self.output_type = "string"
 
+        props = wrapped.parameters.get("properties", {})
+        required = wrapped.parameters.get("required", [])
+        self.inputs = {}
+        for pname, pdef in props.items():
+            entry = {
+                "type": pdef.get("type", "string"),
+                "description": pdef.get("description", ""),
+            }
+            if pname not in required:
+                entry["nullable"] = True
+            self.inputs[pname] = entry
+
+    def forward(self, **kwargs) -> str:
+        try:
+            result = asyncio.run(self._wrapped.safe_execute(**kwargs))
+        except Exception as e:
+            return f"[工具执行失败] {self.name}: {e}"
+        return result.to_str()
+
+    def __call__(self, *args, **kwargs):
+        return self.forward(**kwargs)
+
+
+def _build_smol_tools(tool_registry: ToolRegistry, selected_names: List[str]) -> list:
+    """将选中的 Tool 实例转换为 smolagents 兼容工具列表。"""
+    tools = []
+    for name in selected_names:
+        tool = tool_registry.get(name)
+        if tool:
+            try:
+                tools.append(_SmolTool(tool))
+            except Exception as e:
+                logger.warning("[TaskAgent] 包装 %s 失败: %s", name, e, exc_info=True)
+    return tools
+
+
+def _build_skill_tools(skill_adapter) -> list:
+    """将 SkillAdapter 转换为 smolagents Tool 列表。"""
+    if not skill_adapter:
+        return []
+
+    from smolagents import Tool as SmolToolBase
+
+    _adapter = skill_adapter
+
+    class GetSkillCatalog(SmolToolBase):
+        name = "get_skill_catalog"
+        description = "获取可用技能列表。用户提到选股、筛选等需求时先调用此工具。"
+        inputs = {}
+        output_type = "string"
+
+        def forward(self) -> str:
+            catalog = _adapter.get_catalog_text()
+            return catalog if catalog else "当前无可用技能。"
+
+    class ReadSkill(SmolToolBase):
+        name = "read_skill"
+        description = "加载指定技能的详细执行指令。"
+        inputs = {
+            "skill_name": {"type": "string", "description": "技能名称，如 market-screener"},
+        }
+        output_type = "string"
+
+        def forward(self, skill_name: str) -> str:
+            body = _adapter.get_body(skill_name)
+            if body:
+                return body
+            available = ", ".join(s["name"] for s in _adapter.list_skills())
+            return f"技能 '{skill_name}' 不存在。可用技能: {available}"
+
+    return [GetSkillCatalog(), ReadSkill()]
+
+
+# ═══════════════════════════════════════════════════════════════
+#  TaskAgent
+# ═══════════════════════════════════════════════════════════════
 
 class TaskAgent(AgentBase):
-    """任务型 Agent — smolagents ReAct 引擎。"""
+    """
+    任务型 Agent — plan + smolagents CodeAgent
+
+    1. plan 阶段：LLM 根据用户意图筛选需要的工具
+    2. 无工具 → 委托 AgentBase.chat()（完整 RAG + Memory 链路）
+    3. 有工具 → RAG + Memory + smolagents CodeAgent 执行
+    """
 
     def __init__(
         self,
+        llm: LLMBase,
+        memory: Optional[MemoryBase] = None,
+        retriever: Optional[Retriever] = None,
+        tool_registry: Optional[ToolRegistry] = None,
+        system_prompt: str = "你是一个智能助手，可以使用工具来完成任务。",
+        memory_window_size: int = 10,
         max_tool_rounds: int = 10,
         skill_adapter=None,
-        **kwargs,
     ):
-        super().__init__(**kwargs)
+        super().__init__(
+            llm=llm,
+            memory=memory,
+            retriever=retriever,
+            tool_registry=tool_registry,
+            system_prompt=system_prompt,
+            memory_window_size=memory_window_size,
+        )
         self.max_tool_rounds = max_tool_rounds
         self.skill_adapter = skill_adapter
+
+    # ── plan: 工具筛选 ────────────────────────────────────────
+
+    async def _plan(
+        self,
+        user_input: str,
+        llm: LLMBase,
+        trace: AgentTraceRecorder,
+    ) -> List[str]:
+        """Plan 节点：让 LLM 根据用户意图选择需要的工具。"""
+        if not self.tool_registry or len(self.tool_registry) == 0:
+            return []
+
+        all_names = self.tool_registry.list_tools()
+        tools_desc = []
+        for name in all_names:
+            tool = self.tool_registry.get(name)
+            if tool:
+                tools_desc.append(f"- {name}: {tool.description[:100]}")
+
+        if self.skill_adapter:
+            for s in self.skill_adapter.list_skills():
+                tools_desc.append(f"- skill:{s['name']}: {s.get('description', '')[:100]}")
+
+        tools_text = "\n".join(tools_desc)
+
+        prompt = (
+            f"你是任务规划器。根据用户消息，判断需要调用哪些工具。\n\n"
+            f"可用工具:\n{tools_text}\n\n"
+            f"用户消息: {user_input}\n\n"
+            f"注意：对话历史会自动包含在上下文中，无需调用工具查询历史。\n"
+            f"只输出 JSON，不要其他内容:\n"
+            f'{{"tools": ["工具名1", "技能名"], "reason": "简短原因"}}\n'
+            f"如果不需要工具，tools 为空数组。最多选 5 个。技能请用 skill:前缀。"
+        )
+
+        messages = [
+            ChatMessage(role="system", content="你是任务规划器。只输出 JSON。"),
+            ChatMessage(role="user", content=prompt),
+        ]
+
+        trace.record(
+            "plan_request",
+            {"model": getattr(llm, "model", ""), "tools_available": all_names},
+        )
+
+        plan_start = time.time()
+        response = await llm.generate(messages=messages)
+        trace.record(
+            "plan_response",
+            {
+                "elapsed_seconds": round(time.time() - plan_start, 3),
+                **llm_response_to_dict(response),
+            },
+        )
+
+        text = response.content.strip()
+        if "```" in text:
+            m = re.search(r"```(?:json)?\s*\n(.*?)```", text, re.DOTALL)
+            if m:
+                text = m.group(1).strip()
+
+        plan = safe_parse_json(text, default={"tools": []})
+        selected = plan.get("tools", [])
+
+        all_tool_names = set(self.tool_registry.list_tools()) if self.tool_registry else set()
+        all_skill_names = {s["name"] for s in self.skill_adapter.list_skills()} if self.skill_adapter else set()
+
+        valid = []
+        for t in selected:
+            if t in all_tool_names:
+                valid.append(t)
+            elif t.startswith("skill:") and t[6:] in all_skill_names:
+                valid.append(t)
+            elif t in all_skill_names:
+                valid.append(f"skill:{t}")
+
+        if len(valid) != len(selected):
+            unknown = set(selected) - set(valid)
+            logger.warning("[TaskAgent] plan 选了不存在的工具/技能: %s", unknown)
+
+        logger.info("[TaskAgent] plan: 选了 %d 项 %s, 原因: %s",
+                     len(valid), valid, plan.get("reason", ""))
+        trace.record("plan_result", {"selected_tools": valid, "reason": plan.get("reason", "")})
+
+        return valid
+
+    # ── 主对话入口 ────────────────────────────────────────────
 
     async def chat(
         self,
@@ -135,32 +295,139 @@ class TaskAgent(AgentBase):
         session_id: str = "default",
         use_rag: bool = True,
     ) -> AgentResponse:
-        from smolagents import CodeAgent as SmolCodeAgent
-
         start_time = time.time()
-
-        smol_tools = _build_smolagent_tools(self.tool_registry, self.skill_adapter) if self.tool_registry else []
-        model = _SmolagentsLLMWrapper(self.llm)
-
-        agent = SmolCodeAgent(
-            tools=smol_tools,
-            model=model,
-            max_steps=self.max_tool_rounds,
+        trace = AgentTraceRecorder(
+            agent_type=type(self).__name__,
+            session_id=session_id,
+            user_input=user_input,
+            metadata={"use_rag": use_rag, "max_tool_rounds": self.max_tool_rounds},
         )
 
-        logger.info("[TaskAgent] 执行: %s (工具: %d)", user_input[:60], len(smol_tools))
         try:
-            result = agent.run(user_input)
-        except Exception as e:
-            logger.error("[TaskAgent] 执行失败: %s", e)
-            return AgentResponse(
-                content=f"执行异常: {e}",
-                session_id=session_id,
-                elapsed_seconds=round(time.time() - start_time, 2),
+            selected_tools = await self._plan(user_input, self.llm, trace)
+
+            if not selected_tools:
+                trace.record("delegate_chat", {"reason": "plan: 无需工具"})
+                trace.finish(response={"delegated_to": "AgentBase.chat"})
+                return await super().chat(user_input, session_id=session_id, use_rag=use_rag)
+
+            # RAG 检索
+            sources = []
+            context = ""
+            if use_rag and self.retriever:
+                rag_start = time.time()
+                docs = await self.retriever.retrieve(user_input)
+                trace.record(
+                    "rag_retrieve",
+                    {
+                        "elapsed_seconds": round(time.time() - rag_start, 3),
+                        "doc_count": len(docs),
+                        "docs": docs,
+                    },
+                )
+                if docs:
+                    context = Retriever.format_context(docs)
+                    sources = [
+                        {"content": d["content"][:200], "score": d.get("score", 0)}
+                        for d in docs
+                    ]
+
+            # 加载对话历史（截断长消息，避免 prompt 过长）
+            history_text = ""
+            if self.memory:
+                history = await self.memory.get_history(session_id, limit=self.memory_window_size)
+                trace.record(
+                    "memory_load",
+                    {"history_count": len(history), "limit": self.memory_window_size},
+                )
+                if history:
+                    lines = []
+                    for msg in history:
+                        lines.append(f"{msg.role}: {msg.content}")
+                    history_text = "\n".join(lines)
+
+            # 构建 task prompt
+            task_parts = []
+            if context:
+                task_parts.append(f"【参考资料】\n{context}")
+            if history_text:
+                task_parts.append(f"【对话历史】\n{history_text}")
+
+            # 加载计划选中的技能内容
+            skill_names = [t[6:] for t in selected_tools if t.startswith("skill:")]
+            if skill_names and self.skill_adapter:
+                for sname in skill_names:
+                    body = self.skill_adapter.get_body(sname)
+                    if body:
+                        task_parts.append(f"【技能: {sname}】\n{body}")
+                        logger.info("[TaskAgent] 加载技能: %s", sname)
+
+            task_parts.append(f"【任务】\n{user_input}")
+            task = "\n\n".join(task_parts)
+
+            # 构建工具（只用 plan 筛选的工具，技能不注入 CodeAgent）
+            tool_names = [t for t in selected_tools if not t.startswith("skill:")]
+            smol_tools = _build_smol_tools(self.tool_registry, tool_names)
+            logger.info("[TaskAgent] 工具: %s", [t.name for t in smol_tools])
+
+            trace.record("smolagents_setup", {"tools": [t.name for t in smol_tools]})
+
+            # CodeAgent 执行
+            model = _LLMAdapter(self.llm)
+            from smolagents import CodeAgent as SmolCodeAgent
+
+            agent = SmolCodeAgent(
+                tools=smol_tools,
+                model=model,
+                max_steps=self.max_tool_rounds,
             )
 
-        return AgentResponse(
-            content=str(result),
-            session_id=session_id,
-            elapsed_seconds=round(time.time() - start_time, 2),
-        )
+            logger.info("[TaskAgent] CodeAgent 执行: %s (工具: %s)",
+                        user_input[:60], [t.name for t in smol_tools])
+
+            react_start = time.time()
+            result = agent.run(task)
+            react_elapsed = round(time.time() - react_start, 2)
+
+            trace.record(
+                "smolagents_done",
+                {"elapsed_seconds": react_elapsed, "result_preview": str(result)[:200]},
+            )
+
+            # 保存对话历史（含 CodeAgent 中间步骤）
+            if self.memory:
+                await self.memory.add(session_id, "user", user_input)
+
+                # 从 CodeAgent memory 提取完整步骤
+                try:
+                    full_messages = agent.write_memory_to_messages(summary_mode=True)
+                    steps_text = []
+                    for msg in full_messages:
+                        role = getattr(msg, "role", "")
+                        content = getattr(msg, "content", "")
+                        if role == "assistant" and content:
+                            steps_text.append(content)
+                    if steps_text:
+                        await self.memory.add(session_id, "assistant", "\n".join(steps_text))
+                    else:
+                        await self.memory.add(session_id, "assistant", str(result))
+                except Exception:
+                    await self.memory.add(session_id, "assistant", str(result))
+
+                trace.record("memory_save", {"messages_saved": 2})
+
+            elapsed = round(time.time() - start_time, 2)
+
+            response = AgentResponse(
+                content=str(result),
+                sources=sources,
+                session_id=session_id,
+                elapsed_seconds=elapsed,
+                metadata={"trace_id": trace.trace_id},
+            )
+            trace.finish(response=response.to_dict())
+            return response
+
+        except Exception as e:
+            trace.fail(e)
+            raise

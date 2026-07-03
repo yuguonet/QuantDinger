@@ -2,128 +2,106 @@
 """
 统一 Agent 入口
 
-1. Planner: LLM 根据用户消息选择需要的工具
-2. Executor: 只把选中的工具传给 TaskAgent (smolagents)
-
-smolagents 是执行子模块，不负责工具选择。
+提供 FastAPI 服务端点，也可作为 CLI 入口。
 """
 from __future__ import annotations
 
-import json
 import logging
-from typing import List, Optional
+from typing import Optional
 
+from config.loader import get_settings
 from llm import create_llm, QDSkillAdapter
-from llm.base import ChatMessage
+from memory import LocalMemory
 from tools.registry import ToolRegistry
-from agents.chat_agent import ChatAgent
-from agents.task_agent import TaskAgent
-from agents.base import AgentResponse
+from agents import TaskAgent
 
 logger = logging.getLogger(__name__)
 
+# ---------- FastAPI （可选）----------
+try:
+    from fastapi import FastAPI, HTTPException
+except ImportError:
+    FastAPI = None
+    HTTPException = None
 
-async def _select_tools(llm, message: str, tool_names: List[str], skill_names: List[str]) -> dict:
-    """Planner: 让 LLM 选择需要的工具和技能。"""
-    names_str = ", ".join(tool_names)
-    skills_str = ", ".join(skill_names) if skill_names else "无"
+# ---------- 初始化 ----------
+settings = get_settings(config_dir="config")
 
-    prompt = (
-        f"你是工具选择器。根据用户消息，选择需要的工具和技能。\n\n"
-        f"可用工具: {names_str}\n"
-        f"可用技能: {skills_str}\n\n"
-        f"用户消息: {message}\n\n"
-        f"只输出 JSON，不要其他内容:\n"
-        f'{{"tools": ["工具名1", "工具名2"], "skills": ["技能名"]}}\n'
-        f"如果不需要工具，tools 为空数组。最多选 5 个工具。"
+llm = create_llm({
+    "provider": settings.llm.provider,
+    "model": settings.llm.model,
+    "api_key": settings.llm.api_key,
+    "base_url": settings.llm.base_url,
+    "temperature": settings.llm.temperature,
+    "max_tokens": settings.llm.max_tokens,
+})
+
+memory = LocalMemory(max_messages=settings.memory.max_history)
+
+# 工具注册
+registry = ToolRegistry()
+registry.discover()
+
+# 技能适配器
+skills = QDSkillAdapter()
+
+# 模式
+_mode = "task" if len(registry) > 0 else "chat"
+logger.info(
+    "QuantDinger Agent 启动: %s 模式 | %d 工具 | %d 技能 | provider=%s model=%s",
+    _mode, len(registry), len(skills), settings.llm.provider, settings.llm.model,
+)
+
+# ---------- Agent 实例 ----------
+agent = TaskAgent(
+    llm=llm,
+    memory=memory,
+    tool_registry=registry,
+    system_prompt="你是 QuantDinger 量化分析 AI 助手。用中文回答。",
+    max_tool_rounds=10,
+    skill_adapter=skills,
+)
+
+
+# ---------- FastAPI 路由（可选）----------
+if FastAPI is not None:
+
+    app = FastAPI(
+        title="QuantDinger Agent",
+        version=settings.version,
+        description="QuantDinger 量化分析 AI 助手",
     )
 
-    resp = await llm.generate([ChatMessage(role="user", content=prompt)])
+    @app.get("/health")
+    async def health():
+        return {
+            "status": "ok",
+            "version": settings.version,
+            "mode": _mode,
+            "tools": len(registry),
+            "skills": len(skills),
+        }
 
-    try:
-        # 从响应中提取 JSON
-        text = resp.content.strip()
-        if "```" in text:
-            import re
-            m = re.search(r'```(?:json)?\s*\n(.*?)```', text, re.DOTALL)
-            if m:
-                text = m.group(1).strip()
-        result = json.loads(text)
-    except (json.JSONDecodeError, AttributeError):
-        result = {"tools": [], "skills": []}
+    @app.post("/chat")
+    async def chat_route(message: str, session_id: Optional[str] = "default"):
+        try:
+            session_id = session_id or "default"
+            response = await agent.chat(message, session_id=session_id)
+            return {
+                "reply": response.content,
+                "session_id": session_id,
+                "mode": _mode,
+                "elapsed_seconds": response.elapsed_seconds,
+                "trace_id": response.metadata.get("trace_id"),
+            }
+        except Exception as e:
+            logger.error("对话异常: %s", e, exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
 
-    return result
+    @app.get("/tools")
+    async def list_tools():
+        return {"total": len(registry), "tools": registry.list_tools()}
 
-
-class QDAgent:
-    """统一 Agent — Planner 选工具 → TaskAgent 执行。"""
-
-    def __init__(
-        self,
-        system_prompt: str = "你是 QuantDinger 量化分析 AI 助手。用中文回答。",
-        max_tool_rounds: int = 10,
-    ):
-        self._llm = create_llm()
-        self._skills = QDSkillAdapter()
-        self._system_prompt = system_prompt
-        self._max_tool_rounds = max_tool_rounds
-
-        # 全量注册
-        self._registry = ToolRegistry()
-        self._registry.discover()
-
-        self._tool_count = len(self._registry)
-        self._skill_count = len(self._skills)
-
-        self._mode = "task" if self._tool_count > 0 else "chat"
-        logger.info("[QDAgent] %s 模式: %d 工具, %d 技能", self._mode, self._tool_count, self._skill_count)
-
-    @property
-    def mode(self) -> str:
-        return self._mode
-
-    @property
-    def tool_count(self) -> int:
-        return self._tool_count
-
-    @property
-    def skill_count(self) -> int:
-        return self._skill_count
-
-    async def chat(self, message: str, session_id: str = "default") -> AgentResponse:
-        if self._mode == "chat":
-            agent = ChatAgent(llm=self._llm, system_prompt=self._system_prompt)
-            return await agent.chat(user_input=message, session_id=session_id, use_rag=False)
-
-        # ── Step 1: Planner 选工具 ──
-        all_tool_names = self._registry.list_tools()
-        all_skill_names = [s["name"] for s in self._skills.list_skills()]
-
-        selection = await _select_tools(self._llm, message, all_tool_names, all_skill_names)
-        selected_tools = selection.get("tools", [])
-        selected_skills = selection.get("skills", [])
-
-        logger.info("[QDAgent] Planner 选了 %d 工具: %s, %d 技能: %s",
-                     len(selected_tools), selected_tools, len(selected_skills), selected_skills)
-
-        # ── Step 2: 构建过滤后的 ToolRegistry ──
-        filtered = ToolRegistry()
-        for name in selected_tools:
-            tool = self._registry.get(name)
-            if tool:
-                filtered.add(tool)
-
-        # ── Step 3: TaskAgent 执行（只看到选中的工具）──
-        agent = TaskAgent(
-            llm=self._llm,
-            tool_registry=filtered,
-            system_prompt=self._system_prompt,
-            max_tool_rounds=self._max_tool_rounds,
-            skill_adapter=self._skills if selected_skills else None,
-        )
-
-        return await agent.chat(
-            user_input=message,
-            session_id=session_id,
-            use_rag=False,
-        )
+    @app.get("/skills")
+    async def list_skills():
+        return {"total": len(skills), "skills": skills.list_skills()}
