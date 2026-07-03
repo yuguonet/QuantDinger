@@ -6,5 +6,6 @@ Memory 记忆系统
 from memory.base import MemoryBase, MemoryMessage
 from memory.local_memory import LocalMemory
 from memory.redis_memory import RedisMemory
+from memory.postgres_memory import PostgresMemory
 
-__all__ = ["MemoryBase", "MemoryMessage", "LocalMemory", "RedisMemory"]
+__all__ = ["MemoryBase", "MemoryMessage", "LocalMemory", "RedisMemory", "PostgresMemory"]

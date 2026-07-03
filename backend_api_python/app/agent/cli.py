@@ -167,30 +167,33 @@ def main():
 
         asyncio.run(_run_chat(args.message, session_id))
     else:
-        # 交互模式
+        # 交互模式（单个事件循环，避免 PostgresMemory 连接池随循环销毁重建）
         print(f"\n🤖 QuantDinger Agent CLI")
         print(f"📎 Session: {session_id}")
         print(f"💡 /quit 退出\n")
 
-        while True:
-            try:
-                message = input("You> ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print("\n👋 再见!")
-                break
+        async def _interactive_loop():
+            while True:
+                try:
+                    message = input("You> ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print("\n👋 再见!")
+                    break
 
-            if not message:
-                continue
-            if message == "/quit":
-                print("👋 再见!")
-                break
+                if not message:
+                    continue
+                if message == "/quit":
+                    print("👋 再见!")
+                    break
 
-            try:
-                asyncio.run(_run_chat(message, session_id))
-            except Exception as e:
-                print(f"\n❌ 异常: {e}")
-                import traceback
-                traceback.print_exc()
+                try:
+                    await _run_chat(message, session_id)
+                except Exception as e:
+                    print(f"\n❌ 异常: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+        asyncio.run(_interactive_loop())
 
 
 if __name__ == "__main__":

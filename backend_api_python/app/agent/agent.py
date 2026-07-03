@@ -12,7 +12,10 @@ from types import SimpleNamespace
 from typing import Optional
 
 from llm import create_llm, QDSkillAdapter
-from memory import LocalMemory
+from memory import (
+    LocalMemory,
+    PostgresMemory,
+)
 from tools.registry import ToolRegistry
 from agents import TaskAgent
 
@@ -34,9 +37,11 @@ LLM_MODEL        = os.getenv("OPENAI_MODEL", "qwen-plus")
 LLM_API_KEY      = os.getenv("OPENAI_API_KEY", "")
 LLM_BASE_URL     = os.getenv("OPENAI_BASE_URL")
 LLM_TEMPERATURE  = float(os.getenv("AGENT_LLM_TEMPERATURE", "0.1"))
-LLM_MAX_TOKENS   = int(os.getenv("OPENAI_MAX_TOKENS", "2048"))
+LLM_MAX_TOKENS   = int(os.getenv("OPENAI_MAX_TOKENS", "16384"))
 MEMORY_MAX_HISTORY = int(os.getenv("AGENT_MEMORY_MAX_HISTORY", "20"))
-MAX_TOOL_ROUNDS  = int(os.getenv("AGENT_MAX_STEPS", "6"))
+MEMORY_BACKEND    = os.getenv("MEMORY_BACKEND", "local").lower()
+DATABASE_URL      = os.getenv("DATABASE_URL", "")
+MAX_TOOL_ROUNDS   = int(os.getenv("AGENT_MAX_STEPS", "6"))
 
 # ---------- settings 兼容对象（cli.py / flask_app.py 使用）----------
 settings = SimpleNamespace(
@@ -64,7 +69,17 @@ llm = create_llm({
     "max_tokens": LLM_MAX_TOKENS,
 })
 
-memory = LocalMemory(max_messages=MEMORY_MAX_HISTORY)
+if MEMORY_BACKEND == "postgres" and DATABASE_URL:
+    memory = PostgresMemory(
+        dsn=DATABASE_URL,
+        max_messages=MEMORY_MAX_HISTORY,
+    )
+    logger.info("使用 PostgresMemory: %s", DATABASE_URL.replace("://", "://***@"))
+elif MEMORY_BACKEND == "postgres" and not DATABASE_URL:
+    logger.warning("MEMORY_BACKEND=postgres 但 DATABASE_URL 未设置，回退 LocalMemory")
+    memory = LocalMemory(max_messages=MEMORY_MAX_HISTORY)
+else:
+    memory = LocalMemory(max_messages=MEMORY_MAX_HISTORY)
 
 # 工具注册
 registry = ToolRegistry()
