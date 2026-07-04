@@ -6,11 +6,11 @@ Wraps xuangu.py selection logic and indicator_review.py validation
 into Agent-callable tools.
 """
 from __future__ import annotations
-from app.agent.utils.md_format import _to_md
 
 import json
 from app.agent.log import logger
 from typing import Any, Dict, List, Optional
+from app.agent.utils.md_format import _format_output, _to_md
 
 # ── Tool functions ────────────────────────────────────────────
 
@@ -19,7 +19,7 @@ def review_stocks_with_indicator(
     indicator_id: int,
     user_id: int = 1,
     params: Optional[Dict[str, Any]] = None,
-    output: str = "markdown",
+    _output: str = "markdown",
 ) -> str:
     """批量审核：对多只股票运行同一指标策略，返回出现买入信号的股票列表。
 
@@ -39,8 +39,7 @@ def review_stocks_with_indicator(
 
     if not stock_codes:
         _r = {"results": [], "count": 0, "message": "未提供股票代码"}
-        from app.agent.utils.md_format import _to_md
-        return json.dumps(_r, ensure_ascii=False) if output == "json" else _to_md(_r)
+        return _format_output(_r, _output)
     stock_codes = [str(c).strip() for c in stock_codes if c]
     if not stock_codes:
         return {"results": [], "count": 0, "message": "未提供股票代码"}
@@ -163,12 +162,12 @@ def review_stocks_with_indicator(
         "buy_count": buy_count,
     }
 
-def list_user_selection_strategies(user_id: int = 1, output: str = "markdown") -> str:
+def list_user_selection_strategies(user_id: int = 1, _output: str = "markdown") -> str:
     """收藏策略：返回用户收藏的选股策略列表及筛选条件。
 
     Args:
         user_id: 用户 ID
-        output: "markdown"(默认) | "json"
+        _output: "markdown"(默认) | "json"
     """
     from app.utils.db import get_db_connection
 
@@ -195,8 +194,7 @@ def list_user_selection_strategies(user_id: int = 1, output: str = "markdown") -
             strategies.append(d)
 
         _r = {"strategies": strategies, "count": len(strategies)}
-        from app.agent.utils.md_format import _to_md
-        return json.dumps(_r, ensure_ascii=False) if output == "json" else _to_md(_r)
+        return _format_output(_r, _output)
     except Exception as e:
         logger.error("list_user_selection_strategies failed: %s", e)
         return {"strategies": [], "count": 0, "error": str(e)}

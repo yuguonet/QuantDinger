@@ -10,6 +10,7 @@ from app.agent.log import logger
 from typing import Any, Dict, List, Optional
 
 from app.agent.cache import cache
+from app.agent.utils.md_format import _to_tsv
 def _get_ds(market: str = "CNStock"):
     from app.data_sources.factory import DataSourceFactory
     return DataSourceFactory.get_source(market)
@@ -61,11 +62,12 @@ def _resolve_stock(keyword: str, market: str = "CNStock", limit: int = 10) -> Di
 # 向后兼容别名
 search_stock_by_name = _resolve_stock
 
-def get_realtime_quote(codes: str) -> Dict[str, Any]:
+def get_realtime_quote(codes: str, _output: str = "tsv") -> Any:
     """实时行情：价格、涨跌幅、成交量、换手率、量比、PE、PB、总市值等。
 
     Args:
-        codes: 多股用逗号分隔"
+        codes: 多股用逗号分隔
+        _output: "tsv"(默认,tab分隔文本) | "json"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
@@ -86,7 +88,10 @@ def get_realtime_quote(codes: str) -> Dict[str, Any]:
             return {"error": str(e)}
 
     if len(code_list) == 1:
-        return _one(code_list[0])
+        r = _one(code_list[0])
+        if _output == "tsv":
+            return _to_tsv([r]) if not r.get("error") else json.dumps(r, ensure_ascii=False)
+        return r
 
     # ── 按市场分组，每组一次批量拉取 ──
     from collections import defaultdict
@@ -120,9 +125,12 @@ def get_realtime_quote(codes: str) -> Dict[str, Any]:
                     results[code] = _one(code)
                 except Exception as e2:
                     results[code] = {"error": str(e2)}
+    if _output == "tsv":
+        rows = [v for v in results.values() if not v.get("error")]
+        return _to_tsv(rows)
     return {"count": len(results), "data": results}
 
-def agent_get_kline(codes: str, timeframe: str = "1D", days: int = 60, market: str = "") -> Dict[str, Any]:
+def agent_get_kline(codes: str, timeframe: str = "1D", days: int = 60, market: str = "", _output: str = "tsv") -> Any:
     """K线数据：返回 date/open/high/low/close/volume 数组，支持 A股/港股, 数据量大,适合单独分析。
 
     Args:
@@ -131,6 +139,7 @@ def agent_get_kline(codes: str, timeframe: str = "1D", days: int = 60, market: s
         days: 获取天数，默认60天，最大250天（仅对日线及以上周期有意义）
         market: 市场类型，可选值: CNStock, HKStock。
                 留空则自动推断（A股6位数字→CNStock, HK前缀→HKStock, USDT结尾→Crypto 等）。
+        _output: "tsv"(默认,tab分隔文本) | "json"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
@@ -165,7 +174,12 @@ def agent_get_kline(codes: str, timeframe: str = "1D", days: int = 60, market: s
             return []
 
     if len(code_list) == 1:
-        return _one(code_list[0])
+        klines = _one(code_list[0])
+        if _output == "tsv":
+            if isinstance(klines, list) and klines:
+                return _to_tsv(klines)
+            return json.dumps(klines, ensure_ascii=False)
+        return klines
 
     results = {}
     for code in code_list:
@@ -173,6 +187,16 @@ def agent_get_kline(codes: str, timeframe: str = "1D", days: int = 60, market: s
             results[code] = _one(code)
         except Exception as e:
             results[code] = {"error": str(e)}
+    if _output == "tsv":
+        parts = []
+        for code, klines in results.items():
+            if isinstance(klines, list) and klines:
+                parts.append(f"# === {code} ===")
+                parts.append(_to_tsv(klines))
+            else:
+                parts.append(f"# === {code} ===")
+                parts.append(json.dumps(klines, ensure_ascii=False))
+        return "\n".join(parts)
     return {"count": len(results), "data": results}
 # ── 核心字段集（Agent 日常分析最常用的 ~15 个字段） ──────────────────────
 _STOCK_INFO_CORE_FIELDS = {
@@ -193,7 +217,7 @@ def _filter_stock_info(info: Dict[str, Any], detail: bool = False) -> Dict[str, 
         return {k: v for k, v in info.items() if v is not None}
     return {k: v for k, v in info.items() if v is not None and k in _STOCK_INFO_CORE_FIELDS}
 
-def get_stock_info(codes: str, detail: bool = False) -> Dict[str, Any]:
+def get_stock_info(codes: str, detail: bool = False, _output: str = "tsv") -> Any:
     """股票基本信息（精简模式，节省 token）。
 
     默认返回核心字段：名称、行业、价格、PE/PB、市值、ROE、EPS、股本等。
@@ -203,6 +227,7 @@ def get_stock_info(codes: str, detail: bool = False) -> Dict[str, Any]:
     Args:
         codes: 多股用逗号分隔
         detail: false=精简（默认），true=完整（50+字段）
+        _output: "tsv"(默认,tab分隔文本) | "json"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
@@ -228,8 +253,7 @@ def get_stock_info(codes: str, detail: bool = False) -> Dict[str, Any]:
                     result = info
                 elif isinstance(info, str):
                     try:
-                        import json as _json
-                        parsed = _json.loads(info)
+                        parsed = json.loads(info)
                         if isinstance(parsed, dict):
                             result = parsed
                         else:
@@ -329,6 +353,8 @@ def get_stock_info(codes: str, detail: bool = False) -> Dict[str, Any]:
         result = _filter_stock_info(_one(code_list[0]), detail)
         if not detail and not result.get("error"):
             cache.set(_ck, result, ttl=60)
+        if _output == "tsv":
+            return _to_tsv([result]) if not result.get("error") else json.dumps(result, ensure_ascii=False)
         return result
 
     results = {}
@@ -337,8 +363,11 @@ def get_stock_info(codes: str, detail: bool = False) -> Dict[str, Any]:
             results[code] = _filter_stock_info(_one(code), detail)
         except Exception as e:
             results[code] = {"error": str(e)}
-    final = {"count": len(results), "data": results}
     if not detail:
+        final = {"count": len(results), "data": results}
         cache.set(_ck, final, ttl=60)
-    return final
+    if _output == "tsv":
+        rows = [v for v in results.values() if not v.get("error")]
+        return _to_tsv(rows)
+    return {"count": len(results), "data": results}
 

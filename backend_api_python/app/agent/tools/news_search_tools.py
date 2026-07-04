@@ -11,6 +11,7 @@ import json
 
 from app.agent.log import logger
 from typing import Any, Dict, List
+from app.agent.utils.md_format import _batch_execute, _format_output, _to_md
 # 工具层短时缓存: 同一 symbol 60s 内直接返回
 _search_cache: Dict[str, tuple] = {}  # key → (timestamp, result)
 _CACHE_TTL = 60
@@ -100,13 +101,13 @@ def _build_result(items: List[Dict[str, Any]], label: str) -> Dict[str, Any]:
         "count": len(merged),
         "news": merged,
     }
-def search_stock_intel(codes: str, name: str = "", output: str = "markdown") -> Dict[str, Any]:
+def search_stock_intel(codes: str, name: str = "", _output: str = "markdown") -> Dict[str, Any]:
     """个股情报搜索：返回指定股票的新闻、公告、研报列表及摘要。
 
     Args:
         codes: 多股用逗号分隔"
         name: 股票名称，如 "贵州茅台"
-        output: "markdown"(默认) | "json"
+        _output: "markdown"(默认) | "json"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
@@ -117,10 +118,8 @@ def search_stock_intel(codes: str, name: str = "", output: str = "markdown") -> 
         return _build_result(items, f"个股:{stock_code}")
 
     if len(code_list) == 1:
-        import json
-        from app.agent.utils.md_format import _to_md
         _r = _one(code_list[0])
-        return json.dumps(_r, ensure_ascii=False) if output == "json" else _to_md(_r)
+        return _format_output(_r, _output)
 
     results = {}
     for code in code_list:
@@ -129,37 +128,37 @@ def search_stock_intel(codes: str, name: str = "", output: str = "markdown") -> 
         except Exception as e:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
-def search_sector_intel(market: str = "CNStock", output: str = "markdown") -> str:
+def search_sector_intel(market: str = "CNStock", _output: str = "markdown") -> str:
     """板块情报搜索：返回指定板块的相关新闻和政策动态。
 
     Args:
         market: 板块名称或关键词
-        output: "markdown"(默认) | "json"
+        _output: "markdown"(默认) | "json"
     """
     items = _get_news(market, market)
     return _build_result(items, f"板块:{market}")
-def search_policy_intel(market: str = "CNStock", output: str = "markdown") -> Dict[str, Any]:
+def search_policy_intel(market: str = "CNStock", _output: str = "markdown") -> Dict[str, Any]:
     """政策情报搜索：返回最新财经政策、监管动态。
 
     Args:
         market: 市场或政策关键词
-        output: "markdown"(默认) | "json"
+        _output: "markdown"(默认) | "json"
     """
     items = _get_policy_from_cache()
     return _build_result(items, f"政策:{market}")
-def search_comprehensive_intel(codes: str, name: str = "", output: str = "markdown") -> str:
+def search_comprehensive_intel(codes: str, name: str = "", _output: str = "markdown") -> str:
     """综合情报：同时搜索个股新闻+板块动态+政策面，返回合并结果。
 
     Args:
         codes: 多股用逗号分隔"
         name: 股票名称，如 "贵州茅台"
-        output: "markdown"(默认) | "json"
+        _output: "markdown"(默认) | "json"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
 
-    def _one(stock_code: str, output: str = "markdown") -> str:
+    def _one(stock_code: str, _output: str = "markdown") -> str:
         stock_items = _get_news(stock_code, "CNStock", name)
         policy_items = _get_policy_from_cache()
 
@@ -173,13 +172,4 @@ def search_comprehensive_intel(codes: str, name: str = "", output: str = "markdo
 
         return _build_result(merged, f"综合:{stock_code}")
 
-    if len(code_list) == 1:
-        return _one(code_list[0])
-
-    results = {}
-    for code in code_list:
-        try:
-            results[code] = _one(code)
-        except Exception as e:
-            results[code] = {"error": str(e)}
-    return {"count": len(results), "data": results}
+    return _batch_execute(_one, code_list)

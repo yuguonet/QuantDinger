@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """策略回测分析 — 评估用户策略的历史胜率、盈亏比、最大回撤。"""
 from __future__ import annotations
+import json
 
 from typing import Any, Dict
+from app.agent.utils.md_format import _lookup_stock_name, _format_output
 
 
 def _algo_analyze(stock_code: str, stock_name: str, tool_results: dict, call_tool_fn=None):
@@ -67,15 +69,14 @@ def _algo_analyze(stock_code: str, stock_name: str, tool_results: dict, call_too
         "factors": factors, "analysis": analysis, "status": "ok",
     }
 
-def backtest_analysis(stock_code: str, stock_name: str = "", output: str = "markdown") -> str:
+def backtest_analysis(stock_code: str, _output: str = "markdown") -> str:
     """一站式回测：自动列出用户策略 → 逐个跑回测 → 返回最佳策略评分。等价于 list_strategies + run_backtest。
 
     Args:
         stock_code: 股票代码，如 "600066"
-        stock_name: 股票名称，可选
-        output: "markdown"(默认) | "json"
+        _output: "markdown"(默认) | "json"
     """
-        
+    stock_name = _lookup_stock_name(stock_code)
     results = {}
     try: results["list_strategies"] = _list_strategies()
     except Exception as e: results["list_strategies"] = {"error": str(e)}
@@ -85,8 +86,7 @@ def backtest_analysis(stock_code: str, stock_name: str = "", output: str = "mark
         raise ValueError(f"Unknown tool: {name}")
 
     _r = _algo_analyze(stock_code, stock_name, results, call_tool_fn=call_tool_fn)
-    import json
-    return _r.get("analysis", str(_r)) if output == "markdown" else json.dumps(_r, ensure_ascii=False)
+    return _r.get("analysis", str(_r)) if _output == "markdown" else json.dumps(_r, ensure_ascii=False)
 
 
     main()

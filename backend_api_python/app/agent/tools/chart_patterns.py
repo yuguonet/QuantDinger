@@ -6,7 +6,7 @@ Chart pattern recognition — 经典图表形态 + 缠论 + OBV 量价分析。
 纯 Python 计算，无外部依赖。
 """
 from __future__ import annotations
-from app.agent.utils.md_format import _to_md
+from app.agent.utils.md_format import _to_md, _batch_execute
 
 from app.agent.log import logger
 from typing import Any, Dict, List, Optional, Tuple
@@ -183,20 +183,20 @@ def _detect_chan_fractals(highs: List[float], lows: List[float],
 # Tool 函数
 # ═══════════════════════════════════════════════════════════════
 
-def analyze_chart_patterns(codes: str, output: str = "markdown") -> str:
+def analyze_chart_patterns(codes: str, _output: str = "markdown") -> str:
     """图表形态识别：头肩顶/底、双顶/双底、三角形、旗形、楔形、矩形、杯柄等经典形态。
 
     基于枢轴点（局部极值）检测，分析多K线构成的结构性形态。
 
     Args:
         codes: 多股用逗号分隔
-        output: "markdown"(默认) | "json"
+        _output: "markdown"(默认) | "json"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
 
-    def _one(stock_code: str, output: str = "markdown") -> str:
+    def _one(stock_code: str, _output: str = "markdown") -> str:
         try:
             data = _fetch_ohlcv(stock_code, 120)
             closes, highs, lows = data["close"], data["high"], data["low"]
@@ -415,17 +415,8 @@ def analyze_chart_patterns(codes: str, output: str = "markdown") -> str:
             logger.error("analyze_chart_patterns(%s) failed: %s", stock_code, e)
             return {"error": str(e)}
 
-    if len(code_list) == 1:
-        return _one(code_list[0])
-
-    results = {}
-    for code in code_list:
-        try:
-            results[code] = _one(code)
-        except Exception as e:
-            results[code] = {"error": str(e)}
-    return {"count": len(results), "data": results}
-def get_obv_analysis(codes: str, output: str = "markdown") -> str:
+    return _batch_execute(_one, code_list)
+def get_obv_analysis(codes: str, _output: str = "markdown") -> str:
     """OBV（能量潮）量价分析：返回 OBV 值、趋势、与价格的背离检测。
 
     OBV 是累计成交量指标，价格上涨日加上成交量，价格下跌日减去成交量。
@@ -433,13 +424,13 @@ def get_obv_analysis(codes: str, output: str = "markdown") -> str:
 
     Args:
         codes: 多股用逗号分隔
-        output: "markdown"(默认) | "json"
+        _output: "markdown"(默认) | "json"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
 
-    def _one(stock_code: str, output: str = "markdown") -> str:
+    def _one(stock_code: str, _output: str = "markdown") -> str:
         try:
             data = _fetch_ohlcv(stock_code, 120)
             closes = data["close"]
@@ -479,13 +470,4 @@ def get_obv_analysis(codes: str, output: str = "markdown") -> str:
             logger.error("get_obv_analysis(%s) failed: %s", stock_code, e)
             return {"error": str(e)}
 
-    if len(code_list) == 1:
-        return _one(code_list[0])
-
-    results = {}
-    for code in code_list:
-        try:
-            results[code] = _one(code)
-        except Exception as e:
-            results[code] = {"error": str(e)}
-    return {"count": len(results), "data": results}
+    return _batch_execute(_one, code_list)

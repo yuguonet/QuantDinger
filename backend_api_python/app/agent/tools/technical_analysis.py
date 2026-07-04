@@ -6,9 +6,13 @@
 具体的分析工具（analyze_trend 等）在 analysis_tools.py 中定义。
 """
 from __future__ import annotations
+import json
 
 from app.agent.log import logger
 from typing import Any, Dict, List
+from app.agent.utils.md_format import _format_final_md, _format_output
+
+
 def _call_tools(stock_code: str) -> Dict[str, Any]:
     """调用 analysis_tools.py 中的分析工具 + basicinfo，返回结果字典。"""
     from app.utils.basicinfo_db import get_stock_basic_db
@@ -17,18 +21,26 @@ def _call_tools(stock_code: str) -> Dict[str, Any]:
         analyze_pattern, get_chip_distribution,
     )
     from app.agent.tools.data_tools import get_realtime_quote
+    import json as _json
 
     results = {}
     for name, fn in [
-        ("analyze_trend", lambda: analyze_trend(stock_code)),
-        ("get_indicator_snapshot", lambda: get_indicator_snapshot(stock_code)),
-        ("get_volume_analysis", lambda: get_volume_analysis(stock_code)),
-        ("analyze_pattern", lambda: analyze_pattern(stock_code)),
-        ("get_chip_distribution", lambda: get_chip_distribution(stock_code)),
-        ("realtime_quote", lambda: get_realtime_quote(stock_code)),
+        ("analyze_trend", lambda: analyze_trend(stock_code, _output="json")),
+        ("get_indicator_snapshot", lambda: get_indicator_snapshot(stock_code, _output="json")),
+        ("get_volume_analysis", lambda: get_volume_analysis(stock_code, _output="json")),
+        ("analyze_pattern", lambda: analyze_pattern(stock_code, _output="json")),
+        ("get_chip_distribution", lambda: get_chip_distribution(stock_code, _output="json")),
+        ("realtime_quote", lambda: get_realtime_quote(stock_code, _output="json")),
     ]:
         try:
-            results[name] = fn()
+            raw = fn()
+            if isinstance(raw, str):
+                parsed = _json.loads(raw)
+            elif isinstance(raw, dict):
+                parsed = raw
+            else:
+                parsed = {"error": f"unexpected type: {type(raw).__name__}"}
+            results[name] = parsed
         except Exception as e:
             results[name] = {"error": str(e)}
 
@@ -41,6 +53,8 @@ def _call_tools(stock_code: str) -> Dict[str, Any]:
         results["basicinfo"] = {"error": str(e)}
 
     return results
+
+
 def _algo_analyze(
     stock_code: str,
     stock_name: str,
@@ -49,6 +63,11 @@ def _algo_analyze(
     """纯算法技术面 + 动量分析。"""
     factors: List[dict] = []
     signals: List[str] = []
+
+    # 防御: 确保所有 tool_result 是 dict
+    for k in list(tool_results.keys()):
+        if not isinstance(tool_results[k], dict):
+            tool_results[k] = {"error": f"unexpected type: {type(tool_results[k]).__name__}"}
 
     # ── 1. 趋势评分（主权重 40%）──
     trend = tool_results.get("analyze_trend", {})
@@ -81,10 +100,10 @@ def _algo_analyze(
         kdj = indicator.get("kdj", {})
         boll = indicator.get("boll", {})
 
-        macd_signal = macd.get("signal", "")
-        rsi_value = rsi.get("value", 50)
-        kdj_j = kdj.get("j_value", 50)
-        boll_pos = boll.get("position", "")
+        macd_signal = macd.get("signal", "") if isinstance(macd, dict) else ""
+        rsi_value = rsi.get("value", rsi.get("rsi6", 50)) if isinstance(rsi, dict) else 50
+        kdj_j = kdj.get("j_value", kdj.get("j", 50)) if isinstance(kdj, dict) else 50
+        boll_pos = boll.get("position", "") if isinstance(boll, dict) else ""
 
         if macd_signal == "金叉":
             indicator_score += 15
@@ -229,13 +248,10 @@ def _algo_analyze(
     signal = " | ".join(signals[:5]) if signals else "无明显信号"
 
     # ── markdown 分析 ──
-    dir_map = {"bullish": "看多", "bearish": "看空", "neutral": "中性"}
-    md = f"{stock_name or stock_code}({stock_code}) {final_score:.0f}分 {dir_map.get(direction, direction)}"
-    if factors:
-        md += "\n" + " ".join(f"{f['name']}:{f['score']}" for f in factors[:4])
-    if signals:
-        md += "\n" + " ".join(signals[:3])
-    analysis = md
+    analysis = _format_final_md(
+        title=f"{stock_name or stock_code}({stock_code})", score=final_score, direction=direction,
+        factors=factors, signals=signals,
+    )
 
     _r = {
         "score": final_score,
@@ -245,21 +261,29 @@ def _algo_analyze(
         "factors": factors,
         "analysis": analysis,
         "stock_code": stock_code,
-        "stock_name": stock_name,
     }
-    import json
-    return analysis if output == "markdown" else json.dumps(_r, ensure_ascii=False)
-def technical_analysis(stock_code: str, stock_name: str = "", output: str = "markdown") -> str:
+    return _r
+
+
+def technical_analysis(stock_code: str, _output: str = "markdown") -> str:
     """技术面综合评分：内部调用 analyze_trend+get_indicator_snapshot+get_volume_analysis+analyze_pattern+get_chip_distribution，加权输出 0-100 分。需要单股深度分析时用此工具，不要同时调 analyze_trend。
 
     Args:
         stock_code: 股票代码（6位数字），如 "600519"
-        stock_name: 股票名称（可选），如 "贵州茅台"
 
     Returns:
         dict: 标准化分析报告，包含 score(0-100)、direction(bullish/bearish/neutral)、
               confidence(high/medium/low)、signal(信号摘要)、factors(因子明细)、analysis(分析文字)
-        output: "markdown"(默认) | "json"
+        _output: "markdown"(默认) | "json"
     """
     tool_results = _call_tools(stock_code)
-    return _algo_analyze(stock_code, stock_name, tool_results)
+
+    # 从工具结果中提取股票名称（不额外查询）
+    stock_name = ""
+    for key in ("realtime_quote", "basicinfo"):
+        r = tool_results.get(key, {})
+        if isinstance(r, dict) and r.get("name"):
+            stock_name = r["name"]
+            break
+    _r = _algo_analyze(stock_code, stock_name, tool_results)
+    return _format_output(_r, _output)

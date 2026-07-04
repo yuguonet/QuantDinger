@@ -11,6 +11,7 @@ BB Screener Skill — BB超卖全市场扫描 + 逐只深入分析。
 触发方式：用户说"今天有没有BB超卖的股票"、"扫描BB信号"、"BB选股"等。
 """
 from __future__ import annotations
+import json
 
 from app.agent.log import logger
 import math
@@ -18,6 +19,7 @@ import os
 import sys
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
+from app.agent.utils.md_format import _format_final_md
 
 from dataclasses import dataclass, field
 
@@ -519,13 +521,12 @@ class BBScreenerSkill:
                     f"评分{a['score']:.0f} | {a['direction']} | {a['signal']}"
                 )
 
-        dir_map = {"bullish": "看多", "bearish": "看空", "neutral": "中性"}
-        md = f"BB超卖 {avg_score:.0f}分 {dir_map.get(direction, direction)} 命中{len(hits)}只"
-        if factors:
-            md += "\n" + " ".join(f"{f.name}:{f.score}" for f in factors[:3])
-        if lines:
-            md += "\n" + " ".join(l.replace("- **", "").replace("**", "") for l in lines[:5])
-        analysis = md
+        _factors = [{"name": f.name, "score": f.score} for f in factors[:3]] if factors else []
+        _extra = [l.replace("- **", "").replace("**", "") for l in lines[:5]] if lines else []
+        analysis = _format_final_md(
+            title=f"BB超卖 命中{len(hits)}只", score=avg_score, direction=direction,
+            factors=_factors, extra=_extra,
+        )
         return SkillReport(
             skill_name=self.name,
             score=round(avg_score, 1),
@@ -543,13 +544,12 @@ class BBScreenerSkill:
 # -*- coding: utf-8 -*-
 """BB超卖全市场扫描 — 布林带下轨突破策略筛选全市场，再对候选股做技术面深入分析。"""
 
-def bb_screener_scan(stock_code: str = "", stock_name: str = "", output: str = "markdown") -> str:
+def bb_screener_scan(stock_code: str = "", _output: str = "markdown") -> str:
     """布林带超卖全市场扫描：先筛选触及下轨的候选股，再对候选股做技术面深入分析返回推荐列表。
 
     Args:
         stock_code: 股票代码，可选，为空则全市场扫描
-        stock_name: 股票名称，可选
-        output: "markdown"(默认) | "json"
+        _output: "markdown"(默认) | "json"
     """
     from app.agent.tools import registry as tool_registry
     tool_registry.discover()
@@ -565,5 +565,4 @@ def bb_screener_scan(stock_code: str = "", stock_name: str = "", output: str = "
         _r = result
     else:
         _r = {"score": 50, "direction": "neutral", "confidence": 0.4, "signal": "BB扫描完成", "factors": [], "analysis": str(result)[:500], "status": "ok"}
-    import json
-    return _r.get("analysis", str(_r)) if output == "markdown" else json.dumps(_r, ensure_ascii=False)
+    return _r.get("analysis", str(_r)) if _output == "markdown" else json.dumps(_r, ensure_ascii=False)

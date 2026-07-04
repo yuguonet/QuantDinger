@@ -5,7 +5,6 @@
 数据来源：同花顺 / 东财 push2 / 东财 datacenter / market_cn.index / market_cn.dragon_limit
 """
 from __future__ import annotations
-from app.agent.utils.md_format import _to_md
 
 from app.agent.tools.em_utils import em_datacenter
 def _strip_prefix(s):
@@ -17,6 +16,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List
 
 import requests
+from app.agent.utils.md_format import _batch_execute, _format_output, _to_md
 
 def _safe_float(v, default=0.0):
     from app.data_sources.normalizer import safe_float
@@ -24,12 +24,12 @@ def _safe_float(v, default=0.0):
 
 _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 
-def get_hot_stocks_with_reason(date: str = "", output: str = "markdown") -> str:
+def get_hot_stocks_with_reason(date: str = "", _output: str = "markdown") -> str:
     """当日强势股：同花顺数据源，返回涨幅居前个股及其涨停/强势的题材归因。
 
     Args:
         date: 日期 YYYY-MM-DD，默认今天
-        output: "markdown"(默认) | "json"
+        _output: "markdown"(默认) | "json"
     """
     if not date:
         date = datetime.now().strftime("%Y-%m-%d")
@@ -88,8 +88,7 @@ def get_hot_stocks_with_reason(date: str = "", output: str = "markdown") -> str:
             "hot_tags": hot_tags,
             "hot_tags": hot_tags,
         }
-        from app.agent.utils.md_format import _to_md
-        return json.dumps(_r, ensure_ascii=False) if output == "json" else _to_md(_r)
+        return _format_output(_r, _output)
     except Exception as e:
         logger.warning("get_hot_stocks_with_reason(%s) failed: %s", date, e)
         return {"error": str(e)}
@@ -97,18 +96,18 @@ def get_hot_stocks_with_reason(date: str = "", output: str = "markdown") -> str:
 # 概念板块归属
 # ══════════════════════════════════════════════════════════════
 
-def get_stock_concept_blocks(codes: str, output: str = "markdown") -> str:
+def get_stock_concept_blocks(codes: str, _output: str = "markdown") -> str:
     """个股概念归属：返回股票所属的行业板块和概念板块列表。
 
     Args:
         codes: 多股用逗号分隔"
-        output: "markdown"(默认) | "json"
+        _output: "markdown"(默认) | "json"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
 
-    def _one(stock_code: str, output: str = "markdown") -> str:
+    def _one(stock_code: str, _output: str = "markdown") -> str:
         from app.market_cn.eastmoney_search import _em_get
 
         code = _strip_prefix(stock_code)
@@ -144,33 +143,24 @@ def get_stock_concept_blocks(codes: str, output: str = "markdown") -> str:
             logger.warning("get_stock_concept_blocks(%s) failed: %s", code, e)
             return {"stock_code": code, "error": str(e)}
 
-    if len(code_list) == 1:
-        return _one(code_list[0])
-
-    results = {}
-    for code in code_list:
-        try:
-            results[code] = _one(code)
-        except Exception as e:
-            results[code] = {"error": str(e)}
-    return {"count": len(results), "data": results}
+    return _batch_execute(_one, code_list)
 # ══════════════════════════════════════════════════════════════
 # 限售解禁
 # ══════════════════════════════════════════════════════════════
 
-def get_lockup_expiry(codes: str, forward_days: int = 90, output: str = "markdown") -> str:
+def get_lockup_expiry(codes: str, forward_days: int = 90, _output: str = "markdown") -> str:
     """限售解禁日历：返回指定股票未来解禁日期、解禁数量、占总股本比例。
 
     Args:
         codes: 逗号分隔的股票代码，如 "002475" 或 "002475,600519"
         forward_days: 向前看的天数，默认90天
-        output: "markdown"(默认) | "json"
+        _output: "markdown"(默认) | "json"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
 
-    def _one(stock_code: str, output: str = "markdown") -> str:
+    def _one(stock_code: str, _output: str = "markdown") -> str:
         code = _strip_prefix(stock_code)
         today = datetime.now().strftime("%Y-%m-%d")
         end_date = (datetime.now() + timedelta(days=forward_days)).strftime("%Y-%m-%d")
@@ -215,38 +205,27 @@ def get_lockup_expiry(codes: str, forward_days: int = 90, output: str = "markdow
             "upcoming_count": len(upcoming),
             "upcoming_count": len(upcoming),
         }
-        from app.agent.utils.md_format import _to_md
-        return json.dumps(_r, ensure_ascii=False) if output == "json" else _to_md(_r)
+        return _format_output(_r, _output)
 
-    if len(code_list) == 1:
-        return _one(code_list[0])
-
-    results = {}
-    for code in code_list:
-        try:
-            results[code] = _one(code)
-        except Exception as e:
-            results[code] = {"error": str(e)}
-    return {"count": len(results), "data": results}
+    return _batch_execute(_one, code_list)
 # ══════════════════════════════════════════════════════════════
 # 行业排名
 # ══════════════════════════════════════════════════════════════
 
-def get_industry_ranking(top_n: int = 20, output: str = "markdown") -> str:
+def get_industry_ranking(top_n: int = 20, _output: str = "markdown") -> str:
     """行业涨跌幅排名：返回当日各行业板块涨跌幅、领涨股、成交额排名。
 
     数据源：market_cn.hot_sectors（东财 + 新浪双源）
 
     Args:
         top_n: 返回前N个行业，默认20
-        output: "markdown"(默认) | "json"
+        _output: "markdown"(默认) | "json"
     """
     from app.market_cn.hot_sectors import get_hot_industry_boards as _get
     try:
         data = _get(limit=top_n)
         _r = {"top": data[:top_n], "total": len(data)}
-        from app.agent.utils.md_format import _to_md
-        return json.dumps(_r, ensure_ascii=False) if output == "json" else _to_md(_r)
+        return _format_output(_r, _output)
     except Exception as e:
         logger.warning("get_industry_ranking failed: %s", e)
         return {"error": str(e)}
@@ -254,19 +233,19 @@ def get_industry_ranking(top_n: int = 20, output: str = "markdown") -> str:
 # 龙虎榜详情
 # ══════════════════════════════════════════════════════════════
 
-def get_dragon_tiger_detail(codes: str, look_back_days: int = 30, output: str = "markdown") -> str:
+def get_dragon_tiger_detail(codes: str, look_back_days: int = 30, _output: str = "markdown") -> str:
     """龙虎榜详情：返回个股上榜日期、买卖席位明细、机构/游资动向。
 
     Args:
         codes: 逗号分隔的股票代码，如 "002475" 或 "002475,600519"
         look_back_days: 回看天数，默认30
-        output: "markdown"(默认) | "json"
+        _output: "markdown"(默认) | "json"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
 
-    def _one(stock_code: str, output: str = "markdown") -> str:
+    def _one(stock_code: str, _output: str = "markdown") -> str:
         code = _strip_prefix(stock_code)
         today = datetime.now().strftime("%Y-%m-%d")
         start = (datetime.now() - timedelta(days=look_back_days)).strftime("%Y-%m-%d")
@@ -340,16 +319,6 @@ def get_dragon_tiger_detail(codes: str, look_back_days: int = 30, output: str = 
             "institution": institution,
             "institution": institution,
         }
-        from app.agent.utils.md_format import _to_md
-        return json.dumps(_r, ensure_ascii=False) if output == "json" else _to_md(_r)
+        return _format_output(_r, _output)
 
-    if len(code_list) == 1:
-        return _one(code_list[0])
-
-    results = {}
-    for code in code_list:
-        try:
-            results[code] = _one(code)
-        except Exception as e:
-            results[code] = {"error": str(e)}
-    return {"count": len(results), "data": results}
+    return _batch_execute(_one, code_list)

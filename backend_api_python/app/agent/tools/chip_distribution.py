@@ -13,12 +13,13 @@ from __future__ import annotations
 
 from app.agent.log import logger
 from typing import Any, Dict, List
+from app.agent.utils.md_format import _format_output, _to_md
 def calc_chip_distribution(
     klines: List[Dict[str, Any]],
     stock_code: str = "",
     lookback_days: int = 120,
     num_buckets: int = 80,
-    output: str = "markdown",
+    _output: str = "markdown",
 ) -> str:
     """计算筹码分布。
 
@@ -204,6 +205,4 @@ def calc_chip_distribution(
         "total_volume_analyzed": round(total_chips, 0),
         "analyzed_days": n,
     }
-    import json
-    from app.agent.utils.md_format import _to_md
-    return json.dumps(_r, ensure_ascii=False) if output == "json" else _to_md(_r)
+    return _format_output(_r, _output)

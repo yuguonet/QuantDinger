@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """多空研究员 — 同时构建多头和空头论据，综合判断方向。"""
 from typing import Any, Dict, List
-def bull_bear_research(stock_code: str, stock_name: str = "", output: str = "markdown") -> str:
+import json
+from app.agent.utils.md_format import _format_final_md, _batch_execute
+def bull_bear_research(stock_code: str, _output: str = "markdown") -> str:
     """多空研究：对单只股票做技术面+筹码+情报综合分析，返回多空评分和方向判断。
 
     Args:
         stock_code: 股票代码，如 "600066"
-        stock_name: 股票名称，可选
 
     Returns:
         {
@@ -22,10 +23,11 @@ def bull_bear_research(stock_code: str, stock_name: str = "", output: str = "mar
             "verdict": str,          # 综合判断
             "status": "ok",
         }
-        output: "markdown"(默认) | "json"
+        _output: "markdown"(默认) | "json"
     """
         
     # ── 获取数据 ──
+    stock_name = ""
     data = {}
     for name, fn in [
         ("realtime_quote", lambda: get_realtime_quote(stock_code)),
@@ -38,6 +40,11 @@ def bull_bear_research(stock_code: str, stock_name: str = "", output: str = "mar
             data[name] = fn()
         except Exception as e:
             data[name] = {"error": str(e)}
+
+    # 从工具结果中提取股票名称
+    _q = data.get("realtime_quote", {})
+    if isinstance(_q, dict) and _q.get("name"):
+        stock_name = _q["name"]
 
     # ── 构建多头论据 ──
     bull_factors = []
@@ -140,15 +147,11 @@ def bull_bear_research(stock_code: str, stock_name: str = "", output: str = "mar
     for f in bear_factors[:3]:
         factors.append({"name": f"空头:{f}", "score": bear_score, "direction": "bearish"})
 
-    dir_map = {"bullish": "看多", "bearish": "看空", "neutral": "中性"}
     all_signals = (bull_signals or []) + (bear_signals or [])
-    md = f"多空分析 {final_score:.0f}分 {dir_map.get(direction, direction)}"
-    if factors:
-        md += "\n" + " ".join(f"{f['name']}:{f['score']}" for f in factors[:4])
-    if all_signals:
-        md += "\n" + " ".join(all_signals[:3])
-    md += f"\n{verdict}"
-    analysis = md
+    analysis = _format_final_md(
+        title="多空分析", score=final_score, direction=direction,
+        factors=factors, signals=all_signals, extra=[verdict],
+    )
 
     _r = {
         "score": final_score,
@@ -173,8 +176,7 @@ def bull_bear_research(stock_code: str, stock_name: str = "", output: str = "mar
             "data": data,
         },
     }
-    import json
-    return analysis if output == "markdown" else json.dumps(_r, ensure_ascii=False)
+    return analysis if _output == "markdown" else json.dumps(_r, ensure_ascii=False)
 # ── 内联自 analysis_tools.py ──
 
 def _analyze_trend(codes: str) -> Dict[str, Any]:
@@ -348,16 +350,7 @@ def _analyze_trend(codes: str) -> Dict[str, Any]:
             logger.error("_analyze_trend(%s) failed: %s", stock_code, e)
             return {"error": str(e)}
 
-    if len(code_list) == 1:
-        return _one(code_list[0])
-
-    results = {}
-    for code in code_list:
-        try:
-            results[code] = _one(code)
-        except Exception as e:
-            results[code] = {"error": str(e)}
-    return {"count": len(results), "data": results}
+    return _batch_execute(_one, code_list)
 
 def _get_volume_analysis(codes: str) -> Dict[str, Any]:
     """量能分析：量比、换手率、成交量趋势。
@@ -434,16 +427,7 @@ def _get_volume_analysis(codes: str) -> Dict[str, Any]:
             logger.error("_get_volume_analysis(%s) failed: %s", stock_code, e)
             return {"error": str(e)}
 
-    if len(code_list) == 1:
-        return _one(code_list[0])
-
-    results = {}
-    for code in code_list:
-        try:
-            results[code] = _one(code)
-        except Exception as e:
-            results[code] = {"error": str(e)}
-    return {"count": len(results), "data": results}
+    return _batch_execute(_one, code_list)
 
 def _analyze_pattern(codes: str) -> Dict[str, Any]:
     """识别K线形态（增强版）：锤子线、十字星、吞没、早晨/晚星、三连阳/阴、长上影/下影、缺口等。
@@ -577,16 +561,7 @@ def _analyze_pattern(codes: str) -> Dict[str, Any]:
             logger.error("_analyze_pattern(%s) failed: %s", stock_code, e)
             return {"error": str(e)}
 
-    if len(code_list) == 1:
-        return _one(code_list[0])
-
-    results = {}
-    for code in code_list:
-        try:
-            results[code] = _one(code)
-        except Exception as e:
-            results[code] = {"error": str(e)}
-    return {"count": len(results), "data": results}
+    return _batch_execute(_one, code_list)
 
 def _get_chip_distribution(codes: str, lookback_days: int = 120) -> Dict[str, Any]:
     """筹码分布分析（衰减成本分布模型）。
@@ -626,16 +601,7 @@ def _get_chip_distribution(codes: str, lookback_days: int = 120) -> Dict[str, An
             logger.error("_get_chip_distribution(%s) failed: %s", stock_code, e, exc_info=True)
             return {"error": str(e)}
 
-    if len(code_list) == 1:
-        return _one(code_list[0])
-
-    results = {}
-    for code in code_list:
-        try:
-            results[code] = _one(code)
-        except Exception as e:
-            results[code] = {"error": str(e)}
-    return {"count": len(results), "data": results}
+    return _batch_execute(_one, code_list)
 
 def _get_indicator_snapshot(codes: str) -> Dict[str, Any]:
     """单次获取多个技术指标快照（MACD、RSI、BOLL、KDJ等）。
@@ -686,16 +652,7 @@ def _get_indicator_snapshot(codes: str) -> Dict[str, Any]:
             logger.error("_get_indicator_snapshot(%s) failed: %s", stock_code, e)
             return {"error": str(e)}
 
-    if len(code_list) == 1:
-        return _one(code_list[0])
-
-    results = {}
-    for code in code_list:
-        try:
-            results[code] = _one(code)
-        except Exception as e:
-            results[code] = {"error": str(e)}
-    return {"count": len(results), "data": results}
+    return _batch_execute(_one, code_list)
 # ── 内联自 news_search_tools.py ──
 
 def _get_policy_from_cache() -> List[Dict[str, Any]]:
@@ -798,16 +755,7 @@ def _search_stock_intel(codes: str, name: str = "") -> Dict[str, Any]:
         items = _get_news(stock_code, "CNStock", name)
         return _build_result(items, f"个股:{stock_code}")
 
-    if len(code_list) == 1:
-        return _one(code_list[0])
-
-    results = {}
-    for code in code_list:
-        try:
-            results[code] = _one(code)
-        except Exception as e:
-            results[code] = {"error": str(e)}
-    return {"count": len(results), "data": results}
+    return _batch_execute(_one, code_list)
 
 def _search_policy_intel(market: str = "CNStock") -> Dict[str, Any]:
     """政策情报搜索：返回最新财经政策、监管动态。

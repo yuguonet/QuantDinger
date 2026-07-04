@@ -10,15 +10,16 @@ from __future__ import annotations
 import json
 from app.agent.log import logger
 from typing import Any, Dict, List, Optional
+from app.agent.utils.md_format import _format_output, _to_md
 
 # ── Tool functions ────────────────────────────────────────────
 
-def list_indicators(user_id: int = 1, output: str = "markdown") -> str:
+def list_indicators(user_id: int = 1, _output: str = "markdown") -> str:
     """指标策略列表：返回用户所有指标策略的ID、名称、描述、是否已购买。
 
     Args:
         user_id: 用户 ID，默认 1
-        output: "markdown"(默认) | "json"
+        _output: "markdown"(默认) | "json"
     """
     from app.utils.db import get_db_connection
 
@@ -51,7 +52,7 @@ def list_indicators(user_id: int = 1, output: str = "markdown") -> str:
         logger.error("list_indicators failed: %s", e, exc_info=True)
         return {"indicators": [], "count": 0, "error": str(e)}
 
-def get_indicator_params(indicator_id: int, user_id: int = 1, output: str = "markdown") -> str:
+def get_indicator_params(indicator_id: int, user_id: int = 1, _output: str = "markdown") -> str:
     """指标参数：返回指定指标策略的可配置参数列表及默认值。
 
     解析指标代码中的 # @param 注释，返回参数名称、类型、默认值。
@@ -59,7 +60,7 @@ def get_indicator_params(indicator_id: int, user_id: int = 1, output: str = "mar
     Args:
         indicator_id: 指标 ID
         user_id: 用户 ID，默认 1
-        output: "markdown"(默认) | "json"
+        _output: "markdown"(默认) | "json"
     """
     from app.utils.db import get_db_connection
     from app.services.indicator_params import IndicatorParamsParser
@@ -99,7 +100,7 @@ def run_indicator_signal(
     days: int = 60,
     user_id: int = 1,
     params: Optional[Dict[str, Any]] = None,
-    output: str = "markdown",
+    _output: str = "markdown",
 ) -> str:
     """执行指标策略：对单只股票运行指定指标，返回最新信号(buy/sell)、评分、指标数值。
 
@@ -290,9 +291,7 @@ def run_indicator_signal(
         "last5_sell": last5_sell,
         "last5_close": last5_close,
     }
-    import json
-    from app.agent.utils.md_format import _to_md
-    return json.dumps(_r, ensure_ascii=False) if output == "json" else _to_md(_r)
+    return _format_output(_r, _output)
 
 # ── OpenAI tool declarations ─────────────────────────────────
 

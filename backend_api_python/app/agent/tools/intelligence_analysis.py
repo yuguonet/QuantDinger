@@ -2,19 +2,20 @@
 """个股情报+政策面分析 — 新闻/事件/舆情/解禁/减持/质押，RMS评分+一票否决。"""
 
 from app.agent.log import logger
+import json
 from datetime import datetime
 from typing import Any, Dict, List
+from app.agent.utils.md_format import _format_final_md, _lookup_stock_name
 
 from app.agent.tools.news_search_tools import (
     search_stock_intel,
     search_policy_intel,
 )
-def intelligence_analysis(stock_code: str, stock_name: str = "", output: str = "markdown") -> str:
+def intelligence_analysis(stock_code: str, _output: str = "markdown") -> str:
     """个股情报+政策面综合分析：搜索新闻公告研报 + 政策动态，返回情报评分和利空/利多信号。
 
     Args:
         stock_code: 股票代码，如 "600066"
-        stock_name: 股票名称，可选
 
     Returns:
         {
@@ -32,9 +33,11 @@ def intelligence_analysis(stock_code: str, stock_name: str = "", output: str = "
             "policy_signals": list,  # 政策信号列表
             "status": "ok",
         }
-        output: "markdown"(默认) | "json"
+        _output: "markdown"(默认) | "json"
     """
     
+    stock_name = _lookup_stock_name(stock_code)
+
     # ── 个股情报 ──
     stock_result, stock_score, stock_veto, stock_signals = _analyze_stock(stock_code, stock_name)
 
@@ -87,16 +90,12 @@ def intelligence_analysis(stock_code: str, stock_name: str = "", output: str = "
     if policy_signals:
         factors.append({"name": "政策面", "value": f"{len(policy_signals)}条", "score": _5_to_100(policy_score)})
 
-    dir_map = {"bullish": "看多", "bearish": "看空", "neutral": "中性"}
     all_signals = (stock_signals or []) + (policy_signals or [])
-    md = f"{stock_code or '综合'}情报 {final_score:.0f}分 {dir_map.get(direction, direction)}"
-    if factors:
-        md += "\n" + " ".join(f"{f['name']}:{f['score']}" for f in factors[:3])
-    if all_signals:
-        md += "\n" + " ".join(all_signals[:3])
-    if veto:
-        md += "\n一票否决"
-    analysis = md
+    extra = ["一票否决"] if veto else []
+    analysis = _format_final_md(
+        title=f"{stock_code or '综合'}情报", score=final_score, direction=direction,
+        factors=factors, signals=all_signals, extra=extra,
+    )
 
     # ── highlights / warnings ──
     highlights = []
@@ -157,8 +156,7 @@ def intelligence_analysis(stock_code: str, stock_name: str = "", output: str = "
         "policy_signals": policy_signals,
         "evaluation": evaluation,
     }
-    import json
-    return analysis if output == "markdown" else json.dumps(_r, ensure_ascii=False)
+    return analysis if _output == "markdown" else json.dumps(_r, ensure_ascii=False)
 # ═══════════════════════════════════════════════════════════════
 # 个股情报分析
 # ═══════════════════════════════════════════════════════════════

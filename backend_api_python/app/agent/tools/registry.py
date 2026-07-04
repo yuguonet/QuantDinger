@@ -96,6 +96,8 @@ def _func_to_tool(func: Callable) -> Tool:
     for pname, param in sig.parameters.items():
         if pname in ("self", "cls"):
             continue
+        if pname.startswith("_"):
+            continue  # 跳过内部参数（如 _output），不暴露给 Agent
         if param.kind == inspect.Parameter.VAR_KEYWORD:
             continue
         ptype = hints.get(pname, str)
