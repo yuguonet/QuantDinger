@@ -519,6 +519,13 @@ class BBScreenerSkill:
                     f"评分{a['score']:.0f} | {a['direction']} | {a['signal']}"
                 )
 
+        dir_map = {"bullish": "看多", "bearish": "看空", "neutral": "中性"}
+        md = f"BB超卖 {avg_score:.0f}分 {dir_map.get(direction, direction)} 命中{len(hits)}只"
+        if factors:
+            md += "\n" + " ".join(f"{f.name}:{f.score}" for f in factors[:3])
+        if lines:
+            md += "\n" + " ".join(l.replace("- **", "").replace("**", "") for l in lines[:5])
+        analysis = md
         return SkillReport(
             skill_name=self.name,
             score=round(avg_score, 1),
@@ -526,7 +533,7 @@ class BBScreenerSkill:
             confidence=confidence,
             signal=f"BB超卖命中{len(hits)}只，{bullish}只看多",
             factors=factors,
-            analysis="\n".join(lines),
+            analysis=analysis,
             output_data={
                 "candidates": hits[:20],
                 "analyzed": analyzed,
@@ -536,12 +543,13 @@ class BBScreenerSkill:
 # -*- coding: utf-8 -*-
 """BB超卖全市场扫描 — 布林带下轨突破策略筛选全市场，再对候选股做技术面深入分析。"""
 
-def bb_screener_scan(stock_code: str = "", stock_name: str = "") -> dict:
+def bb_screener_scan(stock_code: str = "", stock_name: str = "", output: str = "markdown") -> str:
     """布林带超卖全市场扫描：先筛选触及下轨的候选股，再对候选股做技术面深入分析返回推荐列表。
 
     Args:
         stock_code: 股票代码，可选，为空则全市场扫描
         stock_name: 股票名称，可选
+        output: "markdown"(默认) | "json"
     """
     from app.agent.tools import registry as tool_registry
     tool_registry.discover()
@@ -554,7 +562,8 @@ def bb_screener_scan(stock_code: str = "", stock_name: str = "") -> dict:
     skill = BBScreenerSkill()
     result = skill.run(call_tool_fn=call_tool_fn)
     if isinstance(result, dict):
-        return result
-    return {"score": 50, "direction": "neutral",
-            "confidence": 0.4, "signal": "BB扫描完成", "factors": [],
-            "analysis": str(result)[:500], "status": "ok"}
+        _r = result
+    else:
+        _r = {"score": 50, "direction": "neutral", "confidence": 0.4, "signal": "BB扫描完成", "factors": [], "analysis": str(result)[:500], "status": "ok"}
+    import json
+    return _r.get("analysis", str(_r)) if output == "markdown" else json.dumps(_r, ensure_ascii=False)

@@ -228,29 +228,28 @@ def _algo_analyze(
     # ── 信号摘要 ──
     signal = " | ".join(signals[:5]) if signals else "无明显信号"
 
-    # ── 分析文字 ──
-    analysis_parts = [
-        f"标的: {stock_name or stock_code}",
-        f"综合评分: {final_score}/100",
-        f"方向: {direction}",
-        f"置信度: {confidence}",
-    ]
-    for f in factors:
-        analysis_parts.append(f"{f['name']}: {f['value']} ({f['score']})")
+    # ── markdown 分析 ──
+    dir_map = {"bullish": "看多", "bearish": "看空", "neutral": "中性"}
+    md = f"{stock_name or stock_code}({stock_code}) {final_score:.0f}分 {dir_map.get(direction, direction)}"
+    if factors:
+        md += "\n" + " ".join(f"{f['name']}:{f['score']}" for f in factors[:4])
     if signals:
-        analysis_parts.append(f"信号: {signal}")
+        md += "\n" + " ".join(signals[:3])
+    analysis = md
 
-    return {
+    _r = {
         "score": final_score,
         "direction": direction,
         "confidence": confidence,
         "signal": signal,
         "factors": factors,
-        "analysis": "\n".join(analysis_parts),
+        "analysis": analysis,
         "stock_code": stock_code,
         "stock_name": stock_name,
     }
-def technical_analysis(stock_code: str, stock_name: str = "") -> dict:
+    import json
+    return analysis if output == "markdown" else json.dumps(_r, ensure_ascii=False)
+def technical_analysis(stock_code: str, stock_name: str = "", output: str = "markdown") -> str:
     """技术面综合评分：内部调用 analyze_trend+get_indicator_snapshot+get_volume_analysis+analyze_pattern+get_chip_distribution，加权输出 0-100 分。需要单股深度分析时用此工具，不要同时调 analyze_trend。
 
     Args:
@@ -260,6 +259,7 @@ def technical_analysis(stock_code: str, stock_name: str = "") -> dict:
     Returns:
         dict: 标准化分析报告，包含 score(0-100)、direction(bullish/bearish/neutral)、
               confidence(high/medium/low)、signal(信号摘要)、factors(因子明细)、analysis(分析文字)
+        output: "markdown"(默认) | "json"
     """
     tool_results = _call_tools(stock_code)
     return _algo_analyze(stock_code, stock_name, tool_results)

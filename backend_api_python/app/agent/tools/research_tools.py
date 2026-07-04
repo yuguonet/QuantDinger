@@ -5,6 +5,7 @@
 数据来源：东财 reportapi / 同花顺 / 东财搜索API / 巨潮 cninfo
 """
 from __future__ import annotations
+from app.agent.utils.md_format import _to_md
 def _strip_prefix(s):
     from app.data_sources.normalizer import strip_market_prefix
     return strip_market_prefix(s)
@@ -27,17 +28,18 @@ _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 # 一致预期
 # ══════════════════════════════════════════════════════════════
 
-def get_consensus_eps(codes: str) -> Dict[str, Any]:
+def get_consensus_eps(codes: str, output: str = "markdown") -> str:
     """机构一致预期EPS：返回同花顺数据源的机构预测每股收益均值。
 
     Args:
         codes: 逗号分隔的股票代码，如 "688017" 或 "688017,600519"
+        output: "markdown"(默认) | "json"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
 
-    def _one(stock_code: str) -> Dict[str, Any]:
+    def _one(stock_code: str, output: str = "markdown") -> str:
         code = _strip_prefix(stock_code)
         try:
             import pandas as pd
@@ -63,7 +65,9 @@ def get_consensus_eps(codes: str) -> Dict[str, Any]:
 
             if target_df is not None:
                 records = target_df.to_dict(orient="records")
-                return {"stock_code": code, "consensus": records, "source": "同花顺"}
+                _r = {"stock_code": code, "consensus": records, "source": "同花顺"}
+                from app.agent.utils.md_format import _to_md
+                return json.dumps(_r, ensure_ascii=False) if output == "json" else _to_md(_r)
             return {"stock_code": code, "consensus": [], "message": "未找到一致预期数据"}
         except Exception as e:
             logger.warning("get_consensus_eps(%s) failed: %s", code, e)
@@ -83,18 +87,19 @@ def get_consensus_eps(codes: str) -> Dict[str, Any]:
 # 个股新闻
 # ══════════════════════════════════════════════════════════════
 
-def get_eastmoney_stock_news(codes: str, page_size: int = 20) -> Dict[str, Any]:
+def get_eastmoney_stock_news(codes: str, page_size: int = 20, output: str = "markdown") -> str:
     """个股新闻：返回东财数据源的个股相关新闻标题和摘要。
 
     Args:
         codes: 逗号分隔的股票代码，如 "688017" 或 "688017,600519"
         page_size: 返回条数，默认20
+        output: "markdown"(默认) | "json"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
 
-    def _one(stock_code: str) -> Dict[str, Any]:
+    def _one(stock_code: str, output: str = "markdown") -> str:
         from app.market_cn.eastmoney_search import _em_get
 
         code = _strip_prefix(stock_code)
@@ -131,7 +136,9 @@ def get_eastmoney_stock_news(codes: str, page_size: int = 20) -> Dict[str, Any]:
                     "source": a.get("mediaName", ""),
                     "url": a.get("url", ""),
                 })
-            return {"stock_code": code, "total": len(rows), "news": rows}
+            _r = {"stock_code": code, "total": len(rows), "news": rows}
+            from app.agent.utils.md_format import _to_md
+            return json.dumps(_r, ensure_ascii=False) if output == "json" else _to_md(_r)
         except Exception as e:
             logger.warning("get_eastmoney_stock_news(%s) failed: %s", code, e)
             return {"stock_code": code, "error": str(e)}
@@ -150,11 +157,12 @@ def get_eastmoney_stock_news(codes: str, page_size: int = 20) -> Dict[str, Any]:
 # 全球财经资讯
 # ══════════════════════════════════════════════════════════════
 
-def get_global_finance_news(page_size: int = 30) -> Dict[str, Any]:
+def get_global_finance_news(page_size: int = 30, output: str = "markdown") -> str:
     """全球资讯：返回东财数据源的全球财经快讯标题和摘要。
 
     Args:
         page_size: 返回条数，默认30
+        output: "markdown"(默认) | "json"
     """
     from app.market_cn.eastmoney_search import _em_get
 
@@ -180,7 +188,9 @@ def get_global_finance_news(page_size: int = 30) -> Dict[str, Any]:
                 "summary": item.get("digest", "") or item.get("content", "")[:200],
                 "time": item.get("showTime", "") or item.get("date", ""),
             })
-        return {"total": len(rows), "news": rows}
+        _r = {"total": len(rows), "news": rows}
+        from app.agent.utils.md_format import _to_md
+        return json.dumps(_r, ensure_ascii=False) if output == "json" else _to_md(_r)
     except Exception as e:
         logger.warning("get_global_finance_news failed: %s", e)
         return {"error": str(e)}

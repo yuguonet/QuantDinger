@@ -95,7 +95,8 @@ def search_stocks(
     filters: Optional[Dict[str, Any]] = None,
     market: str = "全部",
     top_n: int = 50,
-) -> Dict[str, Any]:
+    output: str = "markdown",
+) -> str:
     """选股：根据自然语言条件（如"PE<20 半导体"）或结构化 filters 从全市场筛选股票，返回代码/名称/行业/价格/PE/PB等。
 
     Args:
@@ -133,14 +134,10 @@ def search_stocks(
             stocks_raw = result.get("dataList", [])
             total = result.get("total", len(stocks_raw))
             stocks = [_parse_stock_item(s) for s in stocks_raw]
-            return {
-                "source": "eastmoney",
-                "keyword": query,
-                "market": market,
-                "total": total,
-                "count": len(stocks),
-                "stocks": stocks,
-            }
+            _r = {"source": "eastmoney", "keyword": query, "market": market, "total": total, "count": len(stocks), "stocks": stocks}
+            import json
+            from app.agent.utils.md_format import _to_md
+            return json.dumps(_r, ensure_ascii=False) if output == "json" else _to_md(_r)
         elif source == "eastmoney":
             return {"error": raw.get("msg", "东财选股搜索失败"), "retriable": True}
         # auto 模式下东财失败，继续 fallback
@@ -460,7 +457,7 @@ def build_keyword_from_filters(filters: Dict[str, Any]) -> str:
             parts.append(pledge_map[k])
 
     return "; ".join(parts)
-def get_screener_presets() -> Dict[str, Any]:
+def get_screener_presets( output: str = "markdown") -> str:
     """选股条件列表：返回所有可用筛选条件的分类、字段名、示例值。"""
     return {
         "categories": {

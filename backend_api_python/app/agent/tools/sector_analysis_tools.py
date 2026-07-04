@@ -6,6 +6,7 @@ Sector Analysis Tools — 桥接 market_cn.china_market 到 agent 工具系统�
 不直接 import hot_sectors/sector_history 底层模块。
 """
 from __future__ import annotations
+from app.agent.utils.md_format import _to_md
 
 from app.agent.log import logger
 import re
@@ -66,7 +67,7 @@ def _fetch_em_hot_sectors(board_type: str, limit: int = 15) -> List[Dict[str, An
     except Exception as e:
         logger.warning("_fetch_em_hot_sectors(%s) 失败: %s", board_type, e)
         return []
-def get_hot_sectors(industry_limit: int = 15, concept_limit: int = 15) -> Dict[str, Any]:
+def get_hot_sectors(industry_limit: int = 15, concept_limit: int = 15, output: str = "markdown") -> str:
     """实时热门板块：返回行业+概念板块的涨跌幅排名、涨停家数、领涨股。
 
     数据源为东方财富，返回的 code 字段为可直接使用的 BK 板块代码。
@@ -74,6 +75,7 @@ def get_hot_sectors(industry_limit: int = 15, concept_limit: int = 15) -> Dict[s
     Args:
         industry_limit: 行业板块数量，默认15
         concept_limit: 概念板块数量，默认15
+        output: "markdown"(默认) | "json"
     """
     try:
         industry = _fetch_em_hot_sectors("industry", industry_limit)
@@ -83,32 +85,51 @@ def get_hot_sectors(industry_limit: int = 15, concept_limit: int = 15) -> Dict[s
         result = _get(industry_limit=industry_limit, concept_limit=concept_limit)
         analysis = (result.get("data") or {}).get("analysis") if isinstance(result, dict) else None
 
-        return {
+        _r = {
+            "timestamp": result.get("data", {}).get("timestamp", ""),
             "timestamp": result.get("data", {}).get("timestamp", ""),
             "industry": [{
+            "industry": [{
+                "code": s.get("code", ""),
                 "code": s.get("code", ""),
                 "name": s.get("name", ""),
+                "name": s.get("name", ""),
+                "change_pct": s.get("change_pct", 0),
                 "change_pct": s.get("change_pct", 0),
                 "limit_up_count": s.get("limit_up_count", 0),
+                "limit_up_count": s.get("limit_up_count", 0),
+                "leading_stock": s.get("leading_stock", ""),
                 "leading_stock": s.get("leading_stock", ""),
             } for s in industry],
+            } for s in industry],
+            "concept": [{
             "concept": [{
                 "code": s.get("code", ""),
+                "code": s.get("code", ""),
+                "name": s.get("name", ""),
                 "name": s.get("name", ""),
                 "change_pct": s.get("change_pct", 0),
+                "change_pct": s.get("change_pct", 0),
+                "limit_up_count": s.get("limit_up_count", 0),
                 "limit_up_count": s.get("limit_up_count", 0),
                 "leading_stock": s.get("leading_stock", ""),
+                "leading_stock": s.get("leading_stock", ""),
+            } for s in concept],
             } for s in concept],
             "analysis": analysis or {},
+            "analysis": analysis or {},
         }
+        from app.agent.utils.md_format import _to_md
+        return json.dumps(_r, ensure_ascii=False) if output == "json" else _to_md(_r)
     except Exception as e:
         logger.warning("get_hot_sectors failed: %s", e)
         return {"error": str(e)}
-def get_sector_trend_analysis(board_type: str = "industry") -> Dict[str, Any]:
+def get_sector_trend_analysis(board_type: str = "industry", output: str = "markdown") -> str:
     """板块趋势：返回近1月涨跌趋势、6个月周期位置、今日预测信号。
 
     Args:
         board_type: 板块类型，"industry"(行业) 或 "concept"(概念)
+        output: "markdown"(默认) | "json"
     """
     try:
         from app.market_cn.china_market import get_sector_trend as _get
@@ -116,12 +137,13 @@ def get_sector_trend_analysis(board_type: str = "industry") -> Dict[str, Any]:
     except Exception as e:
         logger.warning("get_sector_trend_analysis failed: %s", e)
         return {"error": str(e)}
-def get_sector_history_data(board_type: str = "industry", days: int = 30) -> Dict[str, Any]:
+def get_sector_history_data(board_type: str = "industry", days: int = 30, output: str = "markdown") -> str:
     """板块历史排名：返回板块近N天的每日涨跌幅排名变化。
 
     Args:
         board_type: 板块类型，"industry"(行业) 或 "concept"(概念)
         days: 获取天数，默认30
+        output: "markdown"(默认) | "json"
     """
     try:
         from app.market_cn.china_market import get_sector_history as _get
@@ -129,7 +151,7 @@ def get_sector_history_data(board_type: str = "industry", days: int = 30) -> Dic
     except Exception as e:
         logger.warning("get_sector_history_data failed: %s", e)
         return {"error": str(e)}
-def get_sector_prediction() -> Dict[str, Any]:
+def get_sector_prediction( output: str = "markdown") -> str:
     """板块预测：基于资金流+情绪+技术面，预测今日可能走强的板块。"""
     try:
         from app.market_cn.china_market import get_sector_prediction as _get
@@ -137,11 +159,12 @@ def get_sector_prediction() -> Dict[str, Any]:
     except Exception as e:
         logger.warning("get_sector_prediction failed: %s", e)
         return {"error": str(e)}
-def get_sector_cycle(board_type: str = "industry") -> Dict[str, Any]:
+def get_sector_cycle(board_type: str = "industry", output: str = "markdown") -> str:
     """板块周期：返回板块6个月内的周期位置（高位/低位/上升/下降）。
 
     Args:
         board_type: 板块类型，"industry"(行业) 或 "concept"(概念)
+        output: "markdown"(默认) | "json"
     """
     try:
         from app.market_cn.china_market import get_sector_cycle as _get
@@ -149,17 +172,18 @@ def get_sector_cycle(board_type: str = "industry") -> Dict[str, Any]:
     except Exception as e:
         logger.warning("get_sector_cycle failed: %s", e)
         return {"error": str(e)}
-def get_stock_sector_info(codes: str) -> Dict[str, Any]:
+def get_stock_sector_info(codes: str, output: str = "markdown") -> str:
     """从本地数据库查询股票所属行业和概念。
 
     Args:
         codes: 多股用逗号分隔"
+        output: "markdown"(默认) | "json"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
 
-    def _one(stock_code: str) -> Dict[str, Any]:
+    def _one(stock_code: str, output: str = "markdown") -> str:
         try:
             from app.utils.basicinfo_db import get_stock_basic_db
             from app.data_sources.normalizer import strip_market_prefix
@@ -258,13 +282,14 @@ def _resolve_board_code(name_or_code: str) -> str:
             return mapping[name_or_code]
     logger.warning("_resolve_board_code: 未找到 '%s' 对应 BK 代码", name_or_code)
     return name_or_code
-def get_sector_stocks(board_code: str = "", board_name: str = "", limit: int = 10) -> List[Dict[str, Any]]:
+def get_sector_stocks(board_code: str = "", board_name: str = "", limit: int = 10, output: str = "markdown") -> str:
     """获取板块内强势个股列表。
 
     Args:
         board_code: 板块代码（如 BK0475），与 board_name 二选一
         board_name: 板块名称（如 '玻璃行业'），与 board_code 二选一
         limit: 返回数量，默认10
+        output: "markdown"(默认) | "json"
     """
     try:
         resolved = board_code or _resolve_board_code(board_name)

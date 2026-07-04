@@ -18,7 +18,8 @@ def calc_chip_distribution(
     stock_code: str = "",
     lookback_days: int = 120,
     num_buckets: int = 80,
-) -> Dict[str, Any]:
+    output: str = "markdown",
+) -> str:
     """计算筹码分布。
 
     Args:
@@ -185,7 +186,7 @@ def calc_chip_distribution(
     support_prices = sorted(support_prices, reverse=True)[:3]
     resistance_prices = sorted(resistance_prices)[:3]
 
-    return {
+    _r = {
         "stock_code": stock_code,
         "avg_cost": round(avg_cost, 2),
         "current_price": round(current_price, 2),
@@ -199,7 +200,10 @@ def calc_chip_distribution(
         "concentration_90_width_pct": f"{round(c90_width * 100, 1)}%",
         "support_prices": support_prices,
         "resistance_prices": resistance_prices,
-        "chip_peaks": peaks[:5],  # 最多 5 个峰
+        "chip_peaks": peaks[:5],
         "total_volume_analyzed": round(total_chips, 0),
         "analyzed_days": n,
     }
+    import json
+    from app.agent.utils.md_format import _to_md
+    return json.dumps(_r, ensure_ascii=False) if output == "json" else _to_md(_r)

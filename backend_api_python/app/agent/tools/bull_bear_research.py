@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """多空研究员 — 同时构建多头和空头论据，综合判断方向。"""
 from typing import Any, Dict, List
-def bull_bear_research(stock_code: str, stock_name: str = "") -> Dict[str, Any]:
+def bull_bear_research(stock_code: str, stock_name: str = "", output: str = "markdown") -> str:
     """多空研究：对单只股票做技术面+筹码+情报综合分析，返回多空评分和方向判断。
 
     Args:
@@ -22,6 +22,7 @@ def bull_bear_research(stock_code: str, stock_name: str = "") -> Dict[str, Any]:
             "verdict": str,          # 综合判断
             "status": "ok",
         }
+        output: "markdown"(默认) | "json"
     """
         
     # ── 获取数据 ──
@@ -139,14 +140,17 @@ def bull_bear_research(stock_code: str, stock_name: str = "") -> Dict[str, Any]:
     for f in bear_factors[:3]:
         factors.append({"name": f"空头:{f}", "score": bear_score, "direction": "bearish"})
 
-    analysis = (
-        f"多头论据({len(bull_factors)}项): {', '.join(bull_factors[:3]) or '无'}。"
-        f"空头论据({len(bear_factors)}项): {', '.join(bear_factors[:3]) or '无'}。"
-        f"综合判断: {verdict}"
-    )
+    dir_map = {"bullish": "看多", "bearish": "看空", "neutral": "中性"}
+    all_signals = (bull_signals or []) + (bear_signals or [])
+    md = f"多空分析 {final_score:.0f}分 {dir_map.get(direction, direction)}"
+    if factors:
+        md += "\n" + " ".join(f"{f['name']}:{f['score']}" for f in factors[:4])
+    if all_signals:
+        md += "\n" + " ".join(all_signals[:3])
+    md += f"\n{verdict}"
+    analysis = md
 
-    return {
-        
+    _r = {
         "score": final_score,
         "direction": direction,
         "confidence": confidence,
@@ -169,6 +173,8 @@ def bull_bear_research(stock_code: str, stock_name: str = "") -> Dict[str, Any]:
             "data": data,
         },
     }
+    import json
+    return analysis if output == "markdown" else json.dumps(_r, ensure_ascii=False)
 # ── 内联自 analysis_tools.py ──
 
 def _analyze_trend(codes: str) -> Dict[str, Any]:

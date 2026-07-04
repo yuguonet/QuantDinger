@@ -53,19 +53,27 @@ def _algo_analyze(stock_code: str, stock_name: str, tool_results: dict, call_too
                 "signal": "回测未产生结果", "confidence": "low", "factors": [], "analysis": "无数据", "status": "ok"}
 
     direction = "bullish" if best_score >= 60 else ("bearish" if best_score <= 40 else "neutral")
+    dir_map = {"bullish": "看多", "bearish": "看空", "neutral": "中性"}
+    md = f"回测 {best_score:.0f}分 {dir_map.get(direction, direction)}"
+    if factors:
+        md += "\n" + " ".join(f"{f['name']}:{f['score']}" for f in factors[:3])
+    if best_strategy:
+        md += f"\n最佳: {best_strategy}"
+    analysis = md
     return {
         "action": "hold", "score": best_score,
         "direction": direction, "confidence": "medium",
-        "signal": f"最佳策略:{best_strategy}" if best_strategy else "回测完成",
-        "factors": factors, "analysis": f"回测{len(factors)}个策略，最佳:{best_strategy}", "status": "ok",
+        "signal": signals[0],
+        "factors": factors, "analysis": analysis, "status": "ok",
     }
 
-def backtest_analysis(stock_code: str, stock_name: str = "") -> dict:
+def backtest_analysis(stock_code: str, stock_name: str = "", output: str = "markdown") -> str:
     """一站式回测：自动列出用户策略 → 逐个跑回测 → 返回最佳策略评分。等价于 list_strategies + run_backtest。
 
     Args:
         stock_code: 股票代码，如 "600066"
         stock_name: 股票名称，可选
+        output: "markdown"(默认) | "json"
     """
         
     results = {}
@@ -76,7 +84,9 @@ def backtest_analysis(stock_code: str, stock_name: str = "") -> dict:
         if name == "run_backtest": return _run_backtest(**kwargs)
         raise ValueError(f"Unknown tool: {name}")
 
-    return _algo_analyze(stock_code, stock_name, results, call_tool_fn=call_tool_fn)
+    _r = _algo_analyze(stock_code, stock_name, results, call_tool_fn=call_tool_fn)
+    import json
+    return _r.get("analysis", str(_r)) if output == "markdown" else json.dumps(_r, ensure_ascii=False)
 
 
     main()

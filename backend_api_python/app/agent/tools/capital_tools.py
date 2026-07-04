@@ -13,6 +13,8 @@
   get_capital_summary  — 中长线基本面综合摘要（一次调用聚合全部数据）
 """
 from __future__ import annotations
+from app.agent.utils.md_format import _to_md
+import json
 
 from app.agent.tools.em_utils import em_datacenter
 def _strip_prefix(s):
@@ -213,7 +215,7 @@ def _get_financial_statements(code: str) -> Dict[str, Any]:
 # 对外工具 — 中长线基本面综合摘要
 # ══════════════════════════════════════════════════════════════
 
-def get_capital_summary(codes: str) -> Dict[str, Any]:
+def get_capital_summary(codes: str, output: str = "markdown") -> str:
     """基本面摘要：返回营收/利润增速、ROE、PE/PB估值、机构持仓变化等中长线指标。
 
     一次调用聚合融资融券、大宗交易、股东户数、分红送转、财报三表五大维度数据，
@@ -221,12 +223,13 @@ def get_capital_summary(codes: str) -> Dict[str, Any]:
 
     Args:
         codes: 多股用逗号分隔"
+        output: "markdown"(默认) | "json"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
 
-    def _one(stock_code: str) -> Dict[str, Any]:
+    def _one(stock_code: str, output: str = "markdown") -> str:
         code = _strip_prefix(stock_code)
 
         # ── 并行采集五维数据（单源超时不阻断整体）────────────────────
@@ -235,7 +238,9 @@ def get_capital_summary(codes: str) -> Dict[str, Any]:
                 return fn()
             except Exception as e:
                 logger.warning("[Capital] %s 超时/失败: %s", label, e)
-                return {}
+                _r = {}
+                from app.agent.utils.md_format import _to_md
+                return json.dumps(_r, ensure_ascii=False) if output == "json" else _to_md(_r)
 
         margin = _safe(lambda: _get_margin_trading(code, days=60), "margin")
         block = _safe(lambda: _get_block_trades(code, page_size=20), "block")

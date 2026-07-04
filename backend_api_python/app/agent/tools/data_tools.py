@@ -88,12 +88,38 @@ def get_realtime_quote(codes: str) -> Dict[str, Any]:
     if len(code_list) == 1:
         return _one(code_list[0])
 
-    results = {}
+    # ── 按市场分组，每组一次批量拉取 ──
+    from collections import defaultdict
+    by_market: Dict[str, List[str]] = defaultdict(list)
     for code in code_list:
+        by_market[_detect_market(code) or "CNStock"].append(code)
+
+    results: Dict[str, Dict[str, Any]] = {}
+    for market, group in by_market.items():
         try:
-            results[code] = _one(code)
+            ds = _get_ds(market)
+            batch_fn = getattr(ds, "get_tickers", None)
+            if batch_fn is not None:
+                quotes = batch_fn(group)
+                req = set(group)
+                for q in quotes if isinstance(quotes, list) else []:
+                    sym = q.get("symbol", "")
+                    if sym and sym in req:
+                        results[sym] = {"stock_code": sym, "market": market, **q}
+                        req.discard(sym)
+                # 批量未覆盖的 → 逐只补查
+                for code in req:
+                    results[code] = _one(code)
+            else:
+                for code in group:
+                    results[code] = _one(code)
         except Exception as e:
-            results[code] = {"error": str(e)}
+            logger.warning("get_realtime_quote 批量(%s)失败: %s, 逐只回退", market, e)
+            for code in group:
+                try:
+                    results[code] = _one(code)
+                except Exception as e2:
+                    results[code] = {"error": str(e2)}
     return {"count": len(results), "data": results}
 
 def agent_get_kline(codes: str, timeframe: str = "1D", days: int = 60, market: str = "") -> Dict[str, Any]:

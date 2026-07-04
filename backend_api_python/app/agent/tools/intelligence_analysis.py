@@ -9,7 +9,7 @@ from app.agent.tools.news_search_tools import (
     search_stock_intel,
     search_policy_intel,
 )
-def intelligence_analysis(stock_code: str, stock_name: str = "") -> Dict[str, Any]:
+def intelligence_analysis(stock_code: str, stock_name: str = "", output: str = "markdown") -> str:
     """个股情报+政策面综合分析：搜索新闻公告研报 + 政策动态，返回情报评分和利空/利多信号。
 
     Args:
@@ -32,6 +32,7 @@ def intelligence_analysis(stock_code: str, stock_name: str = "") -> Dict[str, An
             "policy_signals": list,  # 政策信号列表
             "status": "ok",
         }
+        output: "markdown"(默认) | "json"
     """
     
     # ── 个股情报 ──
@@ -86,11 +87,16 @@ def intelligence_analysis(stock_code: str, stock_name: str = "") -> Dict[str, An
     if policy_signals:
         factors.append({"name": "政策面", "value": f"{len(policy_signals)}条", "score": _5_to_100(policy_score)})
 
-    analysis = (
-        f"个股情报:{stock_score}/5({len(stock_signals)}条信号) "
-        f"政策面:{policy_score}/5({len(policy_signals)}条信号) "
-        f"{'一票否决' if veto else ''}"
-    )
+    dir_map = {"bullish": "看多", "bearish": "看空", "neutral": "中性"}
+    all_signals = (stock_signals or []) + (policy_signals or [])
+    md = f"{stock_code or '综合'}情报 {final_score:.0f}分 {dir_map.get(direction, direction)}"
+    if factors:
+        md += "\n" + " ".join(f"{f['name']}:{f['score']}" for f in factors[:3])
+    if all_signals:
+        md += "\n" + " ".join(all_signals[:3])
+    if veto:
+        md += "\n一票否决"
+    analysis = md
 
     # ── highlights / warnings ──
     highlights = []
@@ -128,8 +134,7 @@ def intelligence_analysis(stock_code: str, stock_name: str = "") -> Dict[str, An
         "warnings": warnings,
     }
 
-    return {
-        
+    _r = {
         "score": final_score,
         "direction": direction,
         "confidence": 0.5,
@@ -152,6 +157,8 @@ def intelligence_analysis(stock_code: str, stock_name: str = "") -> Dict[str, An
         "policy_signals": policy_signals,
         "evaluation": evaluation,
     }
+    import json
+    return analysis if output == "markdown" else json.dumps(_r, ensure_ascii=False)
 # ═══════════════════════════════════════════════════════════════
 # 个股情报分析
 # ═══════════════════════════════════════════════════════════════

@@ -32,7 +32,8 @@ def run_backtest(
     end_date: str,
     timeframe: str = "1D",
     user_id: int = 1,
-) -> Dict[str, Any]:
+    output: str = "markdown",
+) -> str:
     """策略回测：返回指定策略在指定股票上的胜率、盈亏比、最大回撤、交易次数等绩效指标。
 
     Args:
@@ -100,9 +101,10 @@ def run_backtest(
                 "type": t.get("type", ""),
             })
 
-        return {
-            "success": True,
-        }
+        _r = {"success": True}
+        import json
+        from app.agent.utils.md_format import _to_md
+        return json.dumps(_r, ensure_ascii=False) if output == "json" else _to_md(_r)
     except Exception as e:
         logger.error("run_backtest failed: %s", e, exc_info=True)
         return {"success": False, "error": f"回测执行失败: {e}"}
@@ -111,7 +113,8 @@ def get_backtest_history(
     strategy_id: int,
     user_id: int = 1,
     limit: int = 10,
-) -> Dict[str, Any]:
+    output: str = "markdown",
+) -> str:
     """回测历史：返回指定策略过往回测的时间、股票、绩效指标记录。
 
     Args:
@@ -153,7 +156,10 @@ def get_backtest_history(
             d.pop("result", None)  # 不返回完整结果，太大
             runs.append(d)
 
-        return {"runs": runs, "count": len(runs)}
+        _r = {"runs": runs, "count": len(runs)}
+        import json
+        from app.agent.utils.md_format import _to_md
+        return json.dumps(_r, ensure_ascii=False) if output == "json" else _to_md(_r)
     except Exception as e:
         logger.error("get_backtest_history failed: %s", e, exc_info=True)
         return {"runs": [], "count": 0, "error": str(e)}

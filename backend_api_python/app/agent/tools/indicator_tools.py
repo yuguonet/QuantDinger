@@ -13,11 +13,12 @@ from typing import Any, Dict, List, Optional
 
 # ── Tool functions ────────────────────────────────────────────
 
-def list_indicators(user_id: int = 1) -> Dict[str, Any]:
+def list_indicators(user_id: int = 1, output: str = "markdown") -> str:
     """指标策略列表：返回用户所有指标策略的ID、名称、描述、是否已购买。
 
     Args:
         user_id: 用户 ID，默认 1
+        output: "markdown"(默认) | "json"
     """
     from app.utils.db import get_db_connection
 
@@ -50,7 +51,7 @@ def list_indicators(user_id: int = 1) -> Dict[str, Any]:
         logger.error("list_indicators failed: %s", e, exc_info=True)
         return {"indicators": [], "count": 0, "error": str(e)}
 
-def get_indicator_params(indicator_id: int, user_id: int = 1) -> Dict[str, Any]:
+def get_indicator_params(indicator_id: int, user_id: int = 1, output: str = "markdown") -> str:
     """指标参数：返回指定指标策略的可配置参数列表及默认值。
 
     解析指标代码中的 # @param 注释，返回参数名称、类型、默认值。
@@ -58,6 +59,7 @@ def get_indicator_params(indicator_id: int, user_id: int = 1) -> Dict[str, Any]:
     Args:
         indicator_id: 指标 ID
         user_id: 用户 ID，默认 1
+        output: "markdown"(默认) | "json"
     """
     from app.utils.db import get_db_connection
     from app.services.indicator_params import IndicatorParamsParser
@@ -97,7 +99,8 @@ def run_indicator_signal(
     days: int = 60,
     user_id: int = 1,
     params: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    output: str = "markdown",
+) -> str:
     """执行指标策略：对单只股票运行指定指标，返回最新信号(buy/sell)、评分、指标数值。
 
     Args:
@@ -269,7 +272,7 @@ def run_indicator_signal(
     else:
         signal_status = "无信号"
 
-    return {
+    _r = {
         "success": True,
         "stock_code": stock_code,
         "indicator_id": indicator_id,
@@ -283,10 +286,13 @@ def run_indicator_signal(
         "plots": plots_summary,
         "signals": signals_summary,
         "data_points": len(executed_df),
-        "last5_buy": last5_buy,     # [今天, 昨天, 前天, 大前天, 5天前]
+        "last5_buy": last5_buy,
         "last5_sell": last5_sell,
-        "last5_close": last5_close,  # 对应收盘价
+        "last5_close": last5_close,
     }
+    import json
+    from app.agent.utils.md_format import _to_md
+    return json.dumps(_r, ensure_ascii=False) if output == "json" else _to_md(_r)
 
 # ── OpenAI tool declarations ─────────────────────────────────
 
