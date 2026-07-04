@@ -19,6 +19,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -46,6 +47,39 @@ class SkillInfo:
     skill_cls: Any = None        # Python 技能的类引用
 
 
+@dataclass
+class SkillSection:
+    """SKILL.md 中的一个段落（按 ## 标题切分）。"""
+    heading: str           # 段落标题（不含 ##）
+    level: int             # markdown 标题层级 (2=##, 3=###)
+    content: str           # 段落内容（含标题行）
+    char_offset: int       # 在原始 body 中的字符偏移
+
+
+@dataclass
+class SkillDocument:
+    """完整 skill 文档（缓存加载结果）。"""
+    name: str
+    body: str                              # SKILL.md 完整正文
+    base_path: Path                        # skill 目录路径
+    sections: List[SkillSection] = field(default_factory=list)
+    _resource_cache: Dict[str, str] = field(default_factory=dict)
+
+    def get_section(self, heading_keyword: str) -> Optional[SkillSection]:
+        """按标题关键词模糊匹配段落。"""
+        kw = heading_keyword.lower()
+        for sec in self.sections:
+            if kw in sec.heading.lower():
+                return sec
+        return None
+
+    def get_section_by_index(self, index: int) -> Optional[SkillSection]:
+        """按索引获取段落。"""
+        if 0 <= index < len(self.sections):
+            return self.sections[index]
+        return None
+
+
 def _parse_skill_md(content: str) -> tuple:
     """解析 SKILL.md → (metadata_dict, body_str)。"""
     meta = {}
@@ -67,12 +101,46 @@ def _parse_skill_md(content: str) -> tuple:
     return meta, body
 
 
+def _split_sections(body: str) -> List[SkillSection]:
+    """按 ## 标题切分 SKILL.md body 为多个段落。"""
+    sections: List[SkillSection] = []
+    pattern = re.compile(r"^(#{1,4})\s+(.+)$", re.MULTILINE)
+    matches = list(pattern.finditer(body))
+    if not matches:
+        sections.append(SkillSection(
+            heading="(全文)", level=1, content=body, char_offset=0,
+        ))
+        return sections
+    h2_matches = [m for m in matches if len(m.group(1)) == 2]
+    if not h2_matches:
+        h2_matches = matches
+    for i, match in enumerate(h2_matches):
+        heading = match.group(2).strip()
+        start = match.start()
+        end = h2_matches[i + 1].start() if i + 1 < len(h2_matches) else len(body)
+        sections.append(SkillSection(
+            heading=heading,
+            level=len(match.group(1)),
+            content=body[start:end].strip(),
+            char_offset=start,
+        ))
+    first_heading_start = h2_matches[0].start()
+    if first_heading_start > 0:
+        preamble = body[:first_heading_start].strip()
+        if preamble:
+            sections.insert(0, SkillSection(
+                heading="(前言)", level=0, content=preamble, char_offset=0,
+            ))
+    return sections
+
+
 class QDSkillAdapter:
     """QuantDinger 技能适配器 — 发现和管理技能。"""
 
     def __init__(self, skills_dirs: List[str] = None):
         self._skills: Dict[str, SkillInfo] = {}
         self._display_to_name: Dict[str, str] = {}
+        self._docs: Dict[str, SkillDocument] = {}  # SkillDocument 缓存
         dirs = skills_dirs or self._default_dirs()
         for d in dirs:
             self._scan_python(d)
@@ -263,3 +331,111 @@ class QDSkillAdapter:
 
     def __len__(self):
         return len(self._skills)
+
+    # ── Level 2: SKILL.md body（按需加载）─────────────────────────
+
+    def load_body(self, skill_name: str) -> Optional[str]:
+        """加载 SKILL.md 完整正文（缓存）。"""
+        doc = self._load_doc(skill_name)
+        return doc.body if doc else None
+
+    def load_sections(self, skill_name: str) -> List[SkillSection]:
+        """返回 SKILL.md 按 ## 标题切分的所有段落。"""
+        doc = self._load_doc(skill_name)
+        return doc.sections if doc else []
+
+    def load_section(self, skill_name: str, heading_keyword: str) -> Optional[str]:
+        """按标题关键词加载单个段落。"""
+        doc = self._load_doc(skill_name)
+        if not doc:
+            return None
+        section = doc.get_section(heading_keyword)
+        return section.content if section else None
+
+    def load_section_by_index(self, skill_name: str, index: int) -> Optional[str]:
+        """按索引加载段落。"""
+        doc = self._load_doc(skill_name)
+        if not doc:
+            return None
+        section = doc.get_section_by_index(index)
+        return section.content if section else None
+
+    def get_section_headings(self, skill_name: str) -> List[str]:
+        """返回 skill 的所有段落标题。"""
+        doc = self._load_doc(skill_name)
+        if not doc:
+            return []
+        return [s.heading for s in doc.sections]
+
+    # ── Level 3: 引用文件（按需加载）────────────────────────────
+
+    def load_resource(self, skill_name: str, resource_path: str) -> Optional[str]:
+        """按需加载 skill 目录下的引用文件。"""
+        doc = self._load_doc(skill_name)
+        if not doc:
+            return None
+        cache_key = f"{skill_name}:{resource_path}"
+        if cache_key in doc._resource_cache:
+            return doc._resource_cache[cache_key]
+        full_path = doc.base_path / resource_path
+        if not full_path.exists():
+            logger.warning("[QDSkills] Level 3 资源不存在: %s", full_path)
+            return None
+        try:
+            content = full_path.read_text(encoding="utf-8")
+            doc._resource_cache[cache_key] = content
+            return content
+        except Exception as e:
+            logger.warning("[QDSkills] Level 3 读取失败: %s, error=%s", full_path, e)
+            return None
+
+    def list_resources(self, skill_name: str) -> List[str]:
+        """列出 skill 目录下的资源文件。"""
+        doc = self._load_doc(skill_name)
+        if not doc:
+            return []
+        resource_dirs = {"references", "scripts", "assets"}
+        skip_ext = {".pyc", ".pyo", ".pyd"}
+        resources = []
+        for d in resource_dirs:
+            dir_path = doc.base_path / d
+            if not dir_path.exists():
+                continue
+            for p in sorted(dir_path.rglob("*")):
+                if p.is_file() and p.suffix not in skip_ext:
+                    resources.append(str(p.relative_to(doc.base_path)))
+        return resources
+
+    # ── 内部实现 ────────────────────────────────────────────────
+
+    def _load_doc(self, skill_name: str) -> Optional[SkillDocument]:
+        """加载并缓存 SkillDocument。"""
+        if skill_name in self._docs:
+            return self._docs[skill_name]
+        info = self._skills.get(skill_name) or self._skills.get(self._display_to_name.get(skill_name))
+        if not info:
+            logger.warning("[QDSkills] skill 不存在: %s", skill_name)
+            return None
+        # Python 类型 skill 尝试找同目录下的 SKILL.md
+        if info.skill_type == "python" and not info.body:
+            skill_dir = Path(info.dir_path) if info.dir_path else None
+            if skill_dir:
+                skill_md = skill_dir / "SKILL.md"
+                if skill_md.exists():
+                    try:
+                        content = skill_md.read_text(encoding="utf-8")
+                        _, body = _parse_skill_md(content)
+                        info.body = body
+                    except Exception:
+                        pass
+        if not info.body:
+            logger.warning("[QDSkills] skill %s 无 body 内容", skill_name)
+            return None
+        base_path = Path(info.dir_path) if info.dir_path else Path(".")
+        sections = _split_sections(info.body)
+        doc = SkillDocument(
+            name=skill_name, body=info.body,
+            base_path=base_path, sections=sections,
+        )
+        self._docs[skill_name] = doc
+        return doc

@@ -365,14 +365,10 @@ class TaskAgent(AgentBase):
         )
         self.max_tool_rounds = max_tool_rounds
         self.skill_adapter = skill_adapter
-        self._skill_loader = None  # 延迟初始化
 
     def _get_skill_loader(self):
-        """延迟初始化 SkillLoader（复用 skill_adapter）。"""
-        if self._skill_loader is None:
-            from app.agent.skills.skill_loader import SkillLoader
-            self._skill_loader = SkillLoader(self.skill_adapter)
-        return self._skill_loader
+        """返回 skill_adapter（原 SkillLoader 功能已合入 QDSkillAdapter）。"""
+        return self.skill_adapter
 
     # ── plan: 工具筛选 ────────────────────────────────────────
 
