@@ -6,7 +6,5 @@ Skills 技能系统
 
 from skills.base import Skill
 from skills.json_extractor import JsonExtractorSkill
-from skills.document_parser import DocumentParserSkill
-from skills.report_generator import ReportGeneratorSkill
 
-__all__ = ["Skill", "JsonExtractorSkill", "DocumentParserSkill", "ReportGeneratorSkill"]
+__all__ = ["Skill", "JsonExtractorSkill"]
