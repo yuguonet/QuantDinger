@@ -49,6 +49,21 @@ def _load_plan_template() -> str:
     return _PLAN_TEMPLATE
 
 
+# 结果总结提示词（从 prompts/summarize_system.txt 加载）
+_SUMMARIZE_PROMPT: str | None = None
+_SUMMARIZE_PROMPT_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "prompts", "summarize_system.txt"
+)
+
+
+def _load_summarize_prompt() -> str:
+    global _SUMMARIZE_PROMPT
+    if _SUMMARIZE_PROMPT is None:
+        with open(_SUMMARIZE_PROMPT_PATH, encoding="utf-8") as f:
+            _SUMMARIZE_PROMPT = f.read()
+    return _SUMMARIZE_PROMPT
+
+
 # ═══════════════════════════════════════════════════════════════
 #  smolagents 适配层
 # ═══════════════════════════════════════════════════════════════
@@ -357,6 +372,38 @@ class TaskAgent(AgentBase):
             self._skill_loader = SkillLoader(self.skill_adapter)
         return self._skill_loader
 
+    # ── 结果后处理总结 ────────────────────────────────────────
+
+    async def _summarize_result(
+        self,
+        raw_result: str,
+        task_description: str,
+        tool_names: list,
+    ) -> str:
+        """在 CodeAgent 返回后对原始输出做 LLM 后处理总结。
+
+        将工具返回的 JSON / 结构化数据整理为自然语言可读报告。
+        如果结果已简短可读或无意义，跳过总结以免浪费 token。
+        """
+        if len(raw_result) < 100 or raw_result.startswith(("[")):
+            return raw_result
+
+        messages = [
+            ChatMessage(role="user", content=_load_summarize_prompt().format(
+                task=task_description[:600],
+                tools=", ".join(tool_names) if tool_names else "—",
+                raw_result=raw_result[:5000],
+            )),
+        ]
+        try:
+            response = await self.llm.generate(messages)
+            if response and response.content:
+                return response.content
+        except Exception as e:
+            logger.warning("[TaskAgent] 结果总结失败，使用原始输出: %s", e)
+
+        return raw_result
+
     # ── plan: 工具筛选 ────────────────────────────────────────
 
     async def _plan(
@@ -568,6 +615,17 @@ class TaskAgent(AgentBase):
                 {"elapsed_seconds": react_elapsed, "result_preview": str(result)[:200]},
             )
 
+            # ── 结果后处理：LLM 总结原始输出 ──
+            result_raw = str(result)
+            summarized = await self._summarize_result(
+                result_raw, expanded_query, tool_names,
+            )
+            trace.record("summarization", {
+                "raw_length": len(result_raw),
+                "summarized_length": len(summarized),
+                "is_summarized": summarized != result_raw,
+            })
+
             # 保存对话历史（含 CodeAgent 中间步骤）
             if self.memory:
                 await self.memory.add(session_id, "user", user_input)
@@ -593,7 +651,7 @@ class TaskAgent(AgentBase):
             elapsed = round(time.time() - start_time, 2)
 
             response = AgentResponse(
-                content=str(result),
+                content=summarized,
                 sources=sources,
                 session_id=session_id,
                 elapsed_seconds=elapsed,
