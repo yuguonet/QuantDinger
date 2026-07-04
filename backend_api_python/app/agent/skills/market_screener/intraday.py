@@ -19,6 +19,7 @@ market_screener/intraday.py
 from __future__ import annotations
 
 from app.agent.log import logger
+from app.agent.tools.data_tools import get_realtime_quote
 from collections import Counter
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -26,7 +27,7 @@ from typing import Any, Dict, List, Optional
 
 from .common import (
     FactorItem, SkillReport,
-    call_tool, fetch_kline, get_limit_pct,
+    call_tool, fetch_kline,
     fetch_zt_pool, fetch_dt_pool, fetch_broken_board,
     fetch_hot_stocks_with_reason, fetch_hot_sectors,
     compute_ma, compute_ema, compute_macd, compute_rsi,
@@ -421,8 +422,9 @@ def prescreen(date: str) -> Dict[str, Any]:
     1. 评估市场状态（资金流向、涨跌停、板块强弱）
     2. 根据市场状态用 search_stocks 搜索候选
     3. 补充连板 + 龙回头
-    4. 过滤（换手率>=2%、非涨停封板）
-    5. 返回候选池
+    4. 合并候选池，批量回填实时行情（价格、涨幅、换手率、量比等）
+    5. 换手率>=2% 过滤
+    6. 按来源+强度排序，返回前 20 只（不含涨停封板排除，由 agent 按 SKILL.md 规则处理）
     """
     # ── 1. 市场状态评估 ──
     market = assess_market_state()
@@ -502,23 +504,36 @@ def prescreen(date: str) -> Dict[str, Any]:
                 "turnover_pct": s.get("turnover_pct", 0),
             }
 
-    # ── 5. 过滤 ──
+    # ── 5. 批量回填实时行情 ──
+    all_codes = [c["code"] for c in candidates.values() if c.get("code")]
+    if all_codes:
+        try:
+            quote_raw = get_realtime_quote(",".join(all_codes))
+            quotes = {}
+            if isinstance(quote_raw, dict):
+                if "data" in quote_raw:
+                    quotes = quote_raw["data"]
+                elif quote_raw.get("stock_code"):
+                    quotes = {quote_raw["stock_code"]: quote_raw}
+            for code_str, q in quotes.items():
+                code = q.get("stock_code", code_str)
+                if code in candidates:
+                    candidates[code]["change_pct"] = q.get("change_pct", candidates[code].get("change_pct", 0))
+                    candidates[code]["turnover_pct"] = q.get("turnover_pct", candidates[code].get("turnover_pct", 0))
+                    candidates[code]["price"] = q.get("price", 0)
+                    candidates[code]["vol_ratio"] = q.get("vol_ratio", 0)
+                    candidates[code]["high"] = q.get("high", 0)
+                    candidates[code]["low"] = q.get("low", 0)
+        except Exception as e:
+            logger.warning("[MktScreen] 批量回填行情失败: %s", e)
+
+    # ── 6. 过滤 ──
     candidate_list = list(candidates.values())
     filtered = []
     for c in candidate_list:
-        code = c.get("code", "")
-        name = c.get("name", "")
-        change_pct = c.get("change_pct", 0)
-        limit_pct = get_limit_pct(code, name)
-
-        # 涨停封板排除（买不进去）
-        if change_pct >= limit_pct - 0.5:
-            continue
-
-        # 换手率 < 2% 排除（活跃度不够）
+        # 换手率 < 2% 排除（活跃度不够，turnover_pct=0 时不过滤避免误杀）
         if c.get("turnover_pct", 0) > 0 and c["turnover_pct"] < 2.0:
             continue
-
         filtered.append(c)
 
     # 排序：连板 > 龙回头 > 条件搜索，同类型按连续天数/强度排序
@@ -540,23 +555,23 @@ def prescreen(date: str) -> Dict[str, Any]:
 #  Phase 2 — 多周期深入分析
 # ═══════════════════════════════════════════════════════════════
 
-def deep_analyze(
-    candidate: Dict, tech: Optional[Dict],
+def analyze_code(
+    code: str, name: str,
     _tool_calls, _tool_nodes, _missing_data,
 ) -> Optional[Dict]:
-    """Phase 2 深入分析：多周期 + 量价 + 弱转强判断。
+    """单个股票深入分析：多周期 + 量价 + 弱转强判断。
 
-    评分逻辑：
+    Args:
+        code: 股票代码（如 "000001"）
+        name: 股票名称
+
+    评分逻辑（纯技术面）：
     - 基础分 55
     - 弱转强 +15, 强转弱 -15
     - 量价配合 +10~+15
-    - 连板/龙回头 +8~+12
     - 多周期共振 +10
-    - 换手率活跃 +5
     """
-    code = candidate.get("code", "")
     try:
-        # ── 工具调用 ──
         fund_flow = call_tool("get_fund_flow_realtime", code=code)
         mtf = analyze_multitimeframe(code)
 
@@ -602,17 +617,6 @@ def deep_analyze(
         else:
             factors.append(FactorItem(name="量价", value=vol_pattern, score=50))
 
-        # ── 来源加分 ──
-        source = candidate.get("source", "")
-        if "连板" in source:
-            score += 12
-            signals.append(f"{candidate.get('continuous_days', 1)}连板")
-        if "龙回头" in source:
-            score += 10
-            signals.append(f"龙回头(回调{candidate.get('pullback_pct', 0)}%)")
-        if "条件搜索" in source:
-            score += 3
-
         # ── 均线位置 ──
         if daily.get("above_ma5"):
             score += 5
@@ -640,7 +644,6 @@ def deep_analyze(
             score += 3
             signals.append("MACD红柱")
         elif macd_bar < 0 and daily.get("above_ma5"):
-            # MACD 绿柱但价格在 MA5 上方 = 弱转强信号
             score += 5
             signals.append("MACD绿柱+价格稳在MA5上方")
         factors.append(FactorItem(
@@ -666,7 +669,6 @@ def deep_analyze(
         if mtf.get("intraday_5m", {}).get("above_ma5") and mtf.get("intraday_15m", {}).get("above_ma5"):
             mtf_score += 5
 
-        # 5m MACD 红绿柱 vs 价格波动 — 承压/拉升强度
         macd_5m_strength = mtf.get("intraday_5m", {}).get("macd_strength", "neutral")
         if macd_5m_strength == "strong":
             mtf_score += 8
@@ -696,14 +698,13 @@ def deep_analyze(
 
         return {
             "code": code,
-            "name": candidate.get("name", ""),
+            "name": name,
             "score": round(score, 1),
             "direction": direction,
             "confidence": round(confidence, 2),
             "signal": " | ".join(signals[:5]),
             "signals": signals,
             "factors": factors,
-            "source": source,
             "daily": daily,
             "intraday_15m": mtf.get("intraday_15m", {}),
             "intraday_5m": mtf.get("intraday_5m", {}),

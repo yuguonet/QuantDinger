@@ -14,10 +14,11 @@ from typing import Any, Dict, List, Optional
 
 from .common import (
     FactorItem,
-    call_tool, fetch_kline, get_limit_pct, _today_str,
+    call_tool, fetch_kline, _today_str,
     fetch_zt_pool, fetch_hot_stocks_with_reason,
     compute_ma, compute_rsi,
 )
+from .intraday import assess_market_state
 def prescreen() -> Dict[str, Any]:
     screener_result = call_tool(
         "search_stocks",
@@ -155,7 +156,7 @@ def prescreen() -> Dict[str, Any]:
 
         candidates.append({
             "code": code, "name": name,
-            "change_pct": change_pct, "turnover": turnover,
+            "change_pct": change_pct, "turnover_pct": turnover,
             "close": round(close, 3), "high": round(high, 3),
             "close_to_high": round(close_to_high, 2),
             "vol_ratio": round(vol_ratio, 2), "rsi": round(rsi[-1], 2),
@@ -175,7 +176,7 @@ def prescreen() -> Dict[str, Any]:
         _zt_signals = [f"尾盘封板{s['zt_time']}", f"{s['continuous_days']}连板"]
         candidates.append({
             "code": code, "name": s["name"],
-            "change_pct": 9.9, "turnover": 0,
+            "change_pct": 9.9, "turnover_pct": 0,
             "close": round(close, 3), "high": round(close, 3),
             "close_to_high": 0, "vol_ratio": 0, "rsi": 0,
             "reason": s.get("reason", ""), "eod_score": 90,
@@ -193,40 +194,94 @@ def prescreen() -> Dict[str, Any]:
 
     themes = [(tag, cnt) for tag, cnt in hot_tags[:5]]
 
-    # 过滤涨停封板股（买不进去）
+    # 换手率 < 2% 排除（活跃度不够，turnover_pct=0 时不过滤避免误杀）
     filtered = []
     for c in unique:
-        code = c.get("code", "")
-        name = c.get("name", "")
-        limit_pct = get_limit_pct(code, name)
-        if c.get("change_pct", 0) >= limit_pct - 0.5:
-            continue
-        # 换手率 < 2% 排除（活跃度不够）
-        if c.get("turnover", 0) > 0 and c["turnover"] < 2.0:
+        if c.get("turnover_pct", 0) > 0 and c["turnover_pct"] < 2.0:
             continue
         filtered.append(c)
 
     return {
         "date": date,
+        "market": assess_market_state(),
         "screener_count": len(raw_stocks),
         "zt_eod_count": len(eod_zt),
         "main_themes": themes,
         "candidates": filtered[:15],
     }
-def deep_analyze(candidate, _tool_calls, _tool_nodes, _missing_data) -> Optional[Dict]:
-    code = candidate["code"]
+def analyze_code(
+    code: str, name: str,
+    _tool_calls, _tool_nodes, _missing_data,
+) -> Optional[Dict]:
+    """尾盘个股深入分析：指标快照 + 资金流向 + 收盘形态。
+
+    Args:
+        code: 股票代码
+        name: 股票名称
+    """
     try:
-        snapshot = call_tool("get_indicator_snapshot", codes=code)
-        fund_flow = call_tool("get_fund_flow_realtime", code=code)
+        # 自取日线数据，不依赖 prescreen
+        bars = fetch_kline(code, days=10)
+        if len(bars) < 3:
+            return None
+        today = bars[-1]
+        close = today["close"]
+        high = today["high"]
+        low = today["low"]
+        volume = today["volume"]
 
-        if _tool_calls is not None:
-            for t in ["get_indicator_snapshot", "get_fund_flow_realtime"]:
-                if t not in _tool_calls:
-                    _tool_calls.append(t)
+        # 计算收盘形态指标
+        close_to_high = (high - close) / high * 100 if high > 0 else 0
+        day_range = high - low
+        close_position = (close - low) / day_range if day_range > 0 else 0
 
-        score = candidate.get("eod_score", 60)
-        signals = list(candidate.get("signals", []))
+        prev_volumes = [bars[j]["volume"] for j in range(max(0, len(bars) - 5), len(bars) - 1)]
+        avg_vol = sum(prev_volumes) / len(prev_volumes) if prev_volumes else 1
+        vol_ratio = volume / avg_vol if avg_vol > 0 else 1
+
+        # 计算 RSI
+        closes = [b["close"] for b in bars]
+        rsi_val = compute_rsi(closes)[-1]
+
+        change_pct = (close - bars[-2]["close"]) / bars[-2]["close"] * 100 if len(bars) >= 2 else 0
+
+        score = 55.0
+        signals = []
         factors = []
+
+        # ── 收盘位置 ──
+        if close_to_high < 0.3:
+            score += 10
+            signals.append("收盘=最高价")
+        elif close_to_high < 0.8:
+            score += 7
+            signals.append("收盘接近最高价")
+        elif close_to_high < 1.5:
+            score += 3
+            signals.append("收盘偏高位")
+
+        # ── 量能 ──
+        if vol_ratio > 2.5:
+            score += 8
+            signals.append(f"大幅放量{vol_ratio:.1f}倍")
+        elif vol_ratio > 1.5:
+            score += 5
+            signals.append(f"放量{vol_ratio:.1f}倍")
+        elif vol_ratio > 1.2:
+            score += 2
+            signals.append(f"温和放量{vol_ratio:.1f}倍")
+
+        # ── 涨幅位置 ──
+        if close_position > 0.85:
+            score += 5
+            signals.append("收盘在日内高位")
+        elif close_position > 0.7:
+            score += 2
+
+        # ── 指标快照 ──
+        snapshot = call_tool("get_indicator_snapshot", codes=code)
+        if _tool_calls is not None and "get_indicator_snapshot" not in _tool_calls:
+            _tool_calls.append("get_indicator_snapshot")
 
         if isinstance(snapshot, dict) and "error" not in snapshot:
             macd = snapshot.get("macd", {})
@@ -253,6 +308,11 @@ def deep_analyze(candidate, _tool_calls, _tool_nodes, _missing_data) -> Optional
                 score=60 if any("金叉" in s for s in kdj_sigs) else 50,
             ))
 
+        # ── 资金流向 ──
+        fund_flow = call_tool("get_fund_flow_realtime", code=code)
+        if _tool_calls is not None and "get_fund_flow_realtime" not in _tool_calls:
+            _tool_calls.append("get_fund_flow_realtime")
+
         if isinstance(fund_flow, dict) and "error" not in fund_flow:
             main_net = fund_flow.get("main_net_inflow", 0) or 0
             if main_net > 0:
@@ -267,12 +327,12 @@ def deep_analyze(candidate, _tool_calls, _tool_nodes, _missing_data) -> Optional
                 score=65 if main_net > 0 else (35 if main_net < -5000000 else 50),
             ))
 
+        # ── 风险提示 ──
         risk_notes = []
-        rsi = candidate.get("rsi", 50)
-        if rsi > 75:
-            risk_notes.append(f"RSI{rsi:.0f}偏高，次日回调风险")
+        if rsi_val > 75:
+            risk_notes.append(f"RSI{rsi_val:.0f}偏高，次日回调风险")
             score -= 5
-        if candidate.get("change_pct", 0) > 7:
+        if change_pct > 7:
             risk_notes.append("涨幅>7%，追涨风险高")
             score -= 5
 
@@ -280,18 +340,17 @@ def deep_analyze(candidate, _tool_calls, _tool_nodes, _missing_data) -> Optional
         direction = "bullish" if score >= 60 else ("bearish" if score <= 40 else "neutral")
 
         return {
-            "code": code, "name": candidate.get("name", ""),
-            "source": candidate.get("source", ""), "reason": candidate.get("reason", ""),
+            "code": code, "name": name,
             "score": round(score, 1), "direction": direction,
             "signal": ", ".join(signals[:5]),
             "factors": [f.to_dict() for f in factors],
             "risk_notes": risk_notes,
             "eod_data": {
-                "close": candidate.get("close"),
-                "close_to_high": candidate.get("close_to_high"),
-                "vol_ratio": candidate.get("vol_ratio"),
-                "change_pct": candidate.get("change_pct"),
-                "rsi": rsi,
+                "close": round(close, 3),
+                "close_to_high": round(close_to_high, 2),
+                "vol_ratio": round(vol_ratio, 2),
+                "change_pct": round(change_pct, 1),
+                "rsi": round(rsi_val, 1),
             },
         }
     except Exception as e:

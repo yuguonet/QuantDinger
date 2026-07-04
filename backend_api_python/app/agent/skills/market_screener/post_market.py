@@ -14,10 +14,11 @@ from typing import Any, Dict, List, Optional
 
 from .common import (
     FactorItem,
-    call_tool, fetch_kline, get_limit_pct,
+    call_tool, fetch_kline,
     fetch_hot_stocks_with_reason,
     compute_ma, compute_macd, compute_rsi, compute_kdj,
 )
+from .intraday import assess_market_state
 # ═══════════════════════════════════════════════════════════════
 #  形态检测器
 # ═══════════════════════════════════════════════════════════════
@@ -191,17 +192,24 @@ def prescreen(date: str) -> Dict[str, Any]:
     for s in hot_stocks:
         code = s.get("code", "")
         if code and len(code) == 6:
-            scan_pool[code] = s
+            scan_pool[code] = {**s, "source": "热点题材"}
     for s in raw_stocks:
         code = str(s.get("code", "") or s.get("symbol", ""))
-        if code and len(code) == 6 and code not in scan_pool:
-            scan_pool[code] = {
-                "code": code, "name": s.get("name", ""),
-                "change_pct": float(s.get("change_pct", 0) or s.get("pct_change", 0) or 0),
-                "turnover_pct": float(s.get("turnover_rate", 0) or 0),
-                "reason": "",
-                "source": "盘后筛选",
-            }
+        if code and len(code) == 6:
+            change_pct = float(s.get("change_pct", 0) or s.get("pct_change", 0) or 0)
+            turnover_pct = float(s.get("turnover_rate", 0) or 0)
+            if code in scan_pool:
+                # hot_stocks 已有 → 回填 change_pct/turnover_pct
+                scan_pool[code].setdefault("change_pct", change_pct)
+                scan_pool[code].setdefault("turnover_pct", turnover_pct)
+            else:
+                scan_pool[code] = {
+                    "code": code, "name": s.get("name", ""),
+                    "change_pct": change_pct,
+                    "turnover_pct": turnover_pct,
+                    "reason": "",
+                    "source": "盘后筛选",
+                }
     # 4IN1 候选：近期涨停过的股票
     for s in dragon_stocks:
         code = str(s.get("code", "") or s.get("symbol", ""))
@@ -234,109 +242,98 @@ def prescreen(date: str) -> Dict[str, Any]:
             logger.warning("[MktScreen] 龙回头扫描失败: %s", e)
 
     candidates = []
-    scanned = 0
 
     for code, info in scan_pool.items():
+        turnover_pct = info.get("turnover_pct", 0)
+        if turnover_pct > 0 and turnover_pct < 2.0:
+            continue
+        candidates.append({
+            "code": code, "name": info.get("name", ""),
+            "change_pct": info.get("change_pct", 0),
+            "turnover_pct": turnover_pct,
+            "reason": info.get("reason", ""),
+            "source": info.get("source", "盘后筛选"),
+        })
+
+    candidates.sort(key=lambda x: -abs(x["change_pct"]))
+
+    return {
+        "date": date, "market": assess_market_state(),
+        "scanned": len(scan_pool), "pool_size": len(scan_pool),
+        "main_themes": main_themes, "candidates": candidates[:40],
+    }
+def analyze_code(
+    code: str, name: str,
+    _tool_calls, _tool_nodes, _missing_data,
+) -> Optional[Dict]:
+    """盘后个股深入分析：形态检测 + 指标快照 + 资金流向 + 介入点。
+
+    Args:
+        code: 股票代码
+        name: 股票名称
+    """
+    try:
         bars = fetch_kline(code, days=40)
         if len(bars) < 15:
-            continue
-
-        scanned += 1
+            return None
         today = bars[-1]
+        close = today["close"]
         closes = [b["close"] for b in bars]
 
-        if len(bars) >= 2:
-            prev_close = bars[-2]["close"]
-            if prev_close > 0:
-                change = (today["close"] - prev_close) / prev_close * 100
-                limit_pct = get_limit_pct(code, info.get("name", ""))
-                if change >= limit_pct - 0.5 or change <= -(limit_pct - 0.5):
-                    continue
-
+        # ── 形态检测 ──
         patterns = []
-        total_score = 0
-
+        pattern_score = 0
         for detector in _DETECTORS:
             result = detector(bars)
             if result:
                 patterns.append(result)
-                total_score += result["score"]
-
+                pattern_score += result["score"]
         if not patterns:
-            continue
+            return None
 
+        # ── 技术指标 ──
         rsi = compute_rsi(closes)
         macd = compute_macd(closes)
         kdj = compute_kdj(bars)
-
-        rsi_val = rsi[-1]
-        if rsi_val > 80:
-            total_score -= 10
-        elif rsi_val > 70:
-            total_score -= 3
-        elif 40 <= rsi_val <= 60:
-            total_score += 3
-
-        if kdj["k"][-1] > kdj["d"][-1] and kdj["k"][-2] <= kdj["d"][-2]:
-            total_score += 5
-
         ma5 = compute_ma(closes, 5)
         ma10 = compute_ma(closes, 10)
         ma20 = compute_ma(closes, 20)
+        rsi_val = rsi[-1]
+
+        score = float(pattern_score)
+        signals = [p["pattern"] for p in patterns]
+        factors = []
+
+        if rsi_val > 80:
+            score -= 10
+        elif rsi_val > 70:
+            score -= 3
+        elif 40 <= rsi_val <= 60:
+            score += 3
+
+        if kdj["k"][-1] > kdj["d"][-1] and kdj["k"][-2] <= kdj["d"][-2]:
+            score += 5
+            signals.append("KDJ金叉")
+
         if ma5[-1] and ma10[-1] and ma20[-1]:
             if ma5[-1] > ma10[-1] > ma20[-1]:
-                total_score += 5
+                score += 5
+                signals.append("MA多头排列")
+            factors.append(FactorItem(
+                name="均线",
+                value=f"MA5={ma5[-1]:.2f} MA10={ma10[-1]:.2f} MA20={ma20[-1]:.2f}",
+                score=65 if (ma5[-1] or 0) > (ma20[-1] or 0) else 45,
+            ))
 
         vol_5 = sum(b["volume"] for b in bars[-6:-1]) / 5 if len(bars) > 5 else 1
         vol_ratio = today["volume"] / vol_5 if vol_5 > 0 else 1
-
-        total_score = max(0, min(100, total_score))
-
-        signals = [p["pattern"] for p in patterns]
-        if rsi_val > 70:
-            signals.append(f"RSI{rsi_val:.0f}偏高")
         if vol_ratio > 1.5:
             signals.append(f"放量{vol_ratio:.1f}倍")
 
-        # 换手率 < 2% 排除（活跃度不够）
-        turnover_pct = info.get("turnover_pct", 0)
-        if turnover_pct > 0 and turnover_pct < 2.0:
-            continue
-
-        candidates.append({
-            "code": code, "name": info.get("name", ""),
-            "change_pct": info.get("change_pct", 0),
-            "close": round(today["close"], 2),
-            "patterns": patterns, "pattern_names": [p["pattern"] for p in patterns],
-            "score": total_score, "rsi": round(rsi_val, 1),
-            "macd_dif": round(macd["dif"][-1], 3),
-            "kdj_k": round(kdj["k"][-1], 1), "vol_ratio": round(vol_ratio, 2),
-            "ma5": round(ma5[-1], 2) if ma5[-1] else None,
-            "ma10": round(ma10[-1], 2) if ma10[-1] else None,
-            "reason": info.get("reason", ""), "signals": signals,
-            "source": info.get("source", "盘后筛选"),
-        })
-
-    candidates.sort(key=lambda x: -x["score"])
-
-    return {
-        "date": date, "scanned": scanned, "pool_size": len(scan_pool),
-        "main_themes": main_themes, "candidates": candidates[:20],
-    }
-def deep_analyze(candidate, _tool_calls, _tool_nodes, _missing_data) -> Optional[Dict]:
-    code = candidate["code"]
-    try:
+        # ── 指标快照 ──
         snapshot = call_tool("get_indicator_snapshot", codes=code)
-        fund_flow = call_tool("get_fund_flow_realtime", code=code)
-
-        if _tool_calls is not None:
-            for t in ["get_indicator_snapshot", "get_fund_flow_realtime"]:
-                if t not in _tool_calls:
-                    _tool_calls.append(t)
-
-        score = candidate.get("score", 60)
-        signals = list(candidate.get("signals", []))
-        factors = []
+        if _tool_calls is not None and "get_indicator_snapshot" not in _tool_calls:
+            _tool_calls.append("get_indicator_snapshot")
 
         if isinstance(snapshot, dict) and "error" not in snapshot:
             macd_data = snapshot.get("macd", {})
@@ -360,6 +357,11 @@ def deep_analyze(candidate, _tool_calls, _tool_nodes, _missing_data) -> Optional
                     score=55,
                 ))
 
+        # ── 资金流向 ──
+        fund_flow = call_tool("get_fund_flow_realtime", code=code)
+        if _tool_calls is not None and "get_fund_flow_realtime" not in _tool_calls:
+            _tool_calls.append("get_fund_flow_realtime")
+
         if isinstance(fund_flow, dict) and "error" not in fund_flow:
             main_net = fund_flow.get("main_net_inflow", 0) or 0
             if main_net > 0:
@@ -374,33 +376,33 @@ def deep_analyze(candidate, _tool_calls, _tool_nodes, _missing_data) -> Optional
                 score=65 if main_net > 0 else (35 if main_net < -5000000 else 50),
             ))
 
-        close = candidate.get("close", 0)
-        ma10 = candidate.get("ma10")
+        # ── 介入点计算 ──
         entry_low = round(close * 0.995, 2)
         entry_high = round(close * 1.005, 2)
-        stop_loss = round(ma10 or close * 0.97, 2)
+        stop_loss = round((ma10[-1] or close * 0.97) if ma10[-1] else close * 0.97, 2)
         risk = close - stop_loss
         if risk <= 0:
             risk = close * 0.03
         target_1 = round(close + risk * 1.5, 2)
         target_2 = round(close + risk * 2.5, 2)
 
+        # ── 风险提示 ──
         risk_notes = []
-        rsi = candidate.get("rsi", 50)
-        if rsi > 75:
-            risk_notes.append(f"RSI{rsi:.0f}偏高，短线回调风险")
+        change_pct = (close - bars[-2]["close"]) / bars[-2]["close"] * 100 if len(bars) >= 2 else 0
+        if rsi_val > 75:
+            risk_notes.append(f"RSI{rsi_val:.0f}偏高，短线回调风险")
             score -= 3
-        if candidate.get("change_pct", 0) > 6:
+        if change_pct > 6:
             risk_notes.append("涨幅偏大，追涨需谨慎")
-        if candidate.get("vol_ratio", 1) > 4:
+        if vol_ratio > 4:
             risk_notes.append("量能异常放大，注意出货嫌疑")
 
         score = max(0, min(100, score))
         direction = "bullish" if score >= 60 else ("bearish" if score <= 40 else "neutral")
 
         return {
-            "code": code, "name": candidate.get("name", ""),
-            "patterns": candidate.get("pattern_names", []),
+            "code": code, "name": name,
+            "patterns": [p["pattern"] for p in patterns],
             "score": round(score, 1), "direction": direction,
             "signal": ", ".join(signals[:5]),
             "factors": [f.to_dict() for f in factors],
@@ -411,9 +413,10 @@ def deep_analyze(candidate, _tool_calls, _tool_nodes, _missing_data) -> Optional
                 "risk_reward": "1:1.5 / 1:2.5",
             },
             "tech": {
-                "close": close, "rsi": candidate.get("rsi"),
-                "vol_ratio": candidate.get("vol_ratio"),
-                "ma5": candidate.get("ma5"), "ma10": candidate.get("ma10"),
+                "close": round(close, 2), "rsi": round(rsi_val, 1),
+                "vol_ratio": round(vol_ratio, 2),
+                "ma5": round(ma5[-1], 2) if ma5[-1] else None,
+                "ma10": round(ma10[-1], 2) if ma10[-1] else None,
             },
         }
     except Exception as e:

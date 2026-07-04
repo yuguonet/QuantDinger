@@ -129,6 +129,10 @@ class _SmolTool(SmolToolBase):
         return result.to_str()
 
     def __call__(self, *args, **kwargs):
+        pnames = list(self.inputs.keys())
+        for i, arg in enumerate(args):
+            if i < len(pnames):
+                kwargs[pnames[i]] = arg
         return self.forward(**kwargs)
 
 
@@ -167,6 +171,10 @@ class _SkillSectionTool(SmolToolBase):
         return content
 
     def __call__(self, *args, **kwargs):
+        pnames = list(self.inputs.keys())
+        for i, arg in enumerate(args):
+            if i < len(pnames):
+                kwargs[pnames[i]] = arg
         return self.forward(**kwargs)
 
 
@@ -208,6 +216,10 @@ class _SkillResourceTool(SmolToolBase):
         return content
 
     def __call__(self, *args, **kwargs):
+        pnames = list(self.inputs.keys())
+        for i, arg in enumerate(args):
+            if i < len(pnames):
+                kwargs[pnames[i]] = arg
         return self.forward(**kwargs)
 
 
@@ -274,6 +286,10 @@ class _SkillFuncTool(SmolToolBase):
             return {"error": f"{self.name} 执行失败: {e}"}
 
     def __call__(self, *args, **kwargs):
+        pnames = list(self.inputs.keys())
+        for i, arg in enumerate(args):
+            if i < len(pnames):
+                kwargs[pnames[i]] = arg
         return self.forward(**kwargs)
 
 

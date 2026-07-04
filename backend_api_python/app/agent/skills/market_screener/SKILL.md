@@ -1,6 +1,6 @@
 ---
 name: market-screener
-version: 4.0.0
+version: 5.0.0
 description: 从A股全市场筛选短线标的。用户问"今天买什么股""有什么好股票""短线选什么"时使用。不含个股分析。
 tags: [market, screener, short_term, a_share]
 tools:
@@ -12,144 +12,125 @@ tools:
 
 # 全市场短线选股 (market-screener)
 
-根据当前交易时间自动切换策略，从A股全市场筛选短线标的。
-
 ## 使用场景
 
-- 用户询问"今天买什么股""有什么好股票""短线选什么"
-- 盘后复盘、尾盘隔夜选股、盘中热点追踪
-- 全市场系统性筛选，非单只股票分析
+用户询问"今天买什么股""有什么好股票""短线选什么"时使用。不含个股分析。
 
-如果用户指定了具体股票代码，不要调用本技能，使用其他个股分析技能。
+如果用户指定了具体股票代码，不要调用本技能。
 
-## 执行流程
+## 执行流程（严格按此顺序，不可跳过）
 
-### Phase 1: 市场状态评估 + 候选池构建
-
-调用 `pre_screen()` 获取市场状态和候选股：
+使用 `filter_candidates()` 和 `generate_report_markdown()` 两个注册好的辅助工具，**不要自己写筛选代码**。
 
 ```python
-from app.agent.skills.market_screener.run import pre_screen
-phase1 = pre_screen()
+# step1: 获取候选
+result = pre_screen()
+
+# step2: filter_candidates() → 自动按 strategy 筛选 → 返回 codes 字符串
+codes = filter_candidates(result)
+
+# step3: deep_analyze(codes=codes) — codes 是逗号分隔的字符串
+if codes:
+    deep_result = deep_analyze(codes=codes)
+    result_md = generate_report_markdown(deep_result)
+else:
+    result_md = "当前无符合条件的股票"
+
+# step4: final_answer 的 key 固定为 "markdown"
+final_answer({"markdown": result_md})
 ```
 
-`pre_screen()` 不接受任何参数。返回:
-- `phase1["main_themes"]` — 主线题材
-- `phase1["candidates"]` — 候选股列表，每个候选股结构:
-  - `code` — 股票代码（如 "002168"）
-  - `name` — 股票名称
-  - `score` — 评分（0-100）
-  - `reason` — 入选原因
-  - `signals` — 信号列表
-  - `source` — 来源
-- `phase1["strategy"]` — 当前策略（intraday/eod/post_market）
+## Phase 1: 获取候选
 
-如果 `phase1["error"]` 存在，Phase 1 失败，直接告知用户，不重试。
-
-### Phase 2: 逐只深入分析
-
-调用 `deep_analyze(prescreen_result=phase1)` 对候选股逐只分析：
-
-参数:
-- `prescreen_result`: Phase 1 的返回值（必须传入）
+```python
+result = pre_screen()
+```
 
 返回:
-- `result["output_data"]["analyzed"]` — 深入分析结果，每个元素结构:
-  - `code` — 股票代码
-  - `name` — 股票名称
-  - `score` — 综合评分（0-100）
-  - `direction` — 方向（bullish/neutral/bearish）
-  - `confidence` — 置信度（0-1）
-  - `signals` — 信号列表
-  - `reason` — 入选原因
-- `result["score"]` — 综合评分（0-100）
-- `result["direction"]` — 方向（bullish/neutral/bearish）
-- `result["confidence"]` — 置信度（0-1）
-- `result["strategy"]` — 当前策略（intraday/eod/post_market）
-- `result["analysis"]` — 完整报告
+- `result["strategy"]` — 当前策略 (intraday/eod/post_market)
+- `result["market"]` — 市场状态 (mood, fund_flow, zt_count, dt_count, broken_rate)
+- `result["candidates"]` — 候选股列表
+- `result["main_themes"]` — 主线题材
 
-Phase 2 内部自动调用工具（`get_fund_flow`、`get_indicator_snapshot`、`search_stocks`），无需手动调用。
+候选股结构: `{code, name, source, continuous_days, change_pct, turnover_pct, reason, ...}`
 
-### 结果汇报
+## Phase 2: 筛选 + 分析
 
-直接用 Phase 2 的 result 汇报，不要手动拼接 Phase 1 数据。向用户展示:
-1. 策略和综合评分
-2. analyzed 列表中的标的（code、name、score、direction、signals）
-3. 操作建议
+调用 `filter_candidates(result)` 自动按策略筛选，返回 codes。
 
-## 评分权重参考
+然后 `deep_analyze(codes=codes)` 做深入分析，返回 `{score, direction, confidence, signal, analyzed, strategy}`。
 
-### 盘中策略（intraday）评分细则
+`analyzed` 每项含 `{code, name, score, direction, signal, signals, factors}`
 
-| 因子 | 分值 | 说明 |
-|------|------|------|
-| 基础分 | 55 | 每只候选股起始分 |
-| 弱转强 | +15 | 价格站稳MA5上方，之前均线附近震荡 |
-| 强转弱 | -15 | 价格跌破MA5无法收复 |
-| 放量上涨 | +12 | 量比>1.5且收盘上涨 |
-| 缩量拉升 | +10 | 量比<0.7且收盘上涨（主力控盘） |
-| 放量下跌 | -10 | 量比>1.5且收盘下跌（真实抛压） |
-| 连板 | +12 | 连续涨停天数加分 |
-| 龙回头 | +10 | 涨停回调后弱转强 |
-| 站上MA5 | +5 | 收盘价在MA5上方 |
-| 站上MA20 | +5 | 收盘价在MA20上方 |
-| MA5上升 | +5 | MA5斜率>0.5% |
-| MACD红柱 | +3 | 日线MACD为红柱 |
-| MACD绿柱+MA5上方 | +5 | MACD绿柱但价格稳在MA5上方（弱转强信号） |
-| RSI中性 | +3 | RSI在40-60区间 |
-| RSI偏高 | -5 | RSI>75 |
-| 多周期共振 | +5~+18 | 日线+15m+5m多周期一致 |
-| 资金净流入 | +5 | 主力资金净流入 |
+## 筛选规则（agent 执行）
 
-### 尾盘策略（eod）评分细则
+**你必须根据 result["strategy"] 和 result["market"] 执行不同的筛选逻辑。**
 
-| 因子 | 分值 | 说明 |
-|------|------|------|
-| 基础分 | 50 | 起始分，基于尾盘特征验证 |
-| 收盘=最高价 | +18 | 收盘价与最高价差<0.3% |
-| 收盘接近最高价 | +12 | 价差<0.8% |
-| 大幅放量 | +12 | 量比>2.5 |
-| 放量 | +8 | 量比>1.5 |
-| 收盘在日内高位 | +10 | 收盘位置在日内高85%分位以上 |
-| 涨幅适中 | +8 | 涨幅4-6% |
-| 主线题材 | +10 | 踩中当日主线热点 |
-| RSI超买 | -10 | RSI>80 |
-| MACD金叉 | +8 | 日线MACD金叉 |
-| MACD死叉 | -5 | 日线MACD死叉 |
-| 主力净流入 | +6 | 主力资金净流入为正 |
-| 主力净流出 | -4 | 主力净流出>500万 |
+### 通用排除规则
 
-### 盘后策略（post_market）评分细则
+- ST 股排除（所有策略）
+- 换手率 < 2% 排除（所有策略，活跃度不够）
 
-| 因子 | 分值 | 说明 |
-|------|------|------|
-| 基础分 | 形态检测得分 | 6种技术形态检测的累计分 |
-| RSI>80 | -10 | 超买风险 |
-| RSI>70 | -3 | 偏高预警 |
-| RSI 40-60 | +3 | 中性区间加分 |
-| KDJ金叉 | +5 | 日线KDJ金叉 |
-| 多头排列 | +5 | MA5>MA10>MA20 |
-| 形态确认后MACD金叉 | +5 | 快照确认金叉 |
-| 形态确认后MACD死叉 | -5 | 快照确认死叉 |
-| 主力净流入 | +5 | 确认日主力资金净流入 |
-| 主力净流出>500万 | -3 | 资金流出预警 |
+### 涨停封板处理（策略相关）
 
-各策略最终评分统一按以下标准映射方向：
-- **score ≥ 55**: bullish（看多）
-- **45 ≤ score < 55**: neutral（中性）
-- **score < 45**: bearish（看空）
+- **盘中/尾盘（intraday/eod）**: 涨停封板股排除（change_pct 接近涨停幅度，买不进去）
+- **盘后（post_market）**: 不排除涨停股（盘后复盘关注已涨停/大涨股，评估次日机会）
 
-Phase 2 最终结果中，评分 < 60 或方向不为 bullish 的标的自动淘汰。
+### 盘中策略 (intraday) 筛选规则
 
-## 失败处理
+盘中关注主线题材 + 弱转强信号：
 
-- Phase 1 失败 → 不重试，告知用户"选股执行失败"
-- Phase 2 单只分析失败 → 跳过该股，继续下一只
+1. **主线题材优先**: main_themes 中的题材对应的候选股优先保留
+2. **连板股保留**: source="连板" 的候选股保留（连续涨停，市场关注度高）
+3. **龙回头保留**: source="龙回头" 且有弱转强信号的保留
+4. **条件搜索结果**: 根据 market.mood_score 或 market.mood 取舍
+   - mood="偏强" 或 mood_score >= 70 → 保留全部
+   - mood="中性" 或 mood_score >= 50 → 保留有 reason 或 tags 的
+   - mood="偏弱" 或 mood="弱势" → 只保留 source="连板" 或 "龙回头"
+5. **最终数量**: 控制在 5-8 只，太多会分散分析资源
+
+### 尾盘策略 (eod) 筛选规则
+
+尾盘关注收盘形态 + 放量：
+
+1. **收盘=最高价**: 优先保留（收盘价与最高价差 < 0.3%）
+2. **大幅放量**: 量比 > 2.5 的优先
+3. **涨幅适中**: 涨幅 4-6% 的优先
+4. **最终数量**: 控制在 3-5 只
+
+### 盘后策略 (post_market) 筛选规则
+
+盘后复盘已收盘，关注次日机会。source 可能值: "热点题材" / "盘后筛选" / "4IN1(近期涨停)" / "龙回头"
+
+1. **热点题材优先**: source="热点题材" 的候选股(有题材 reason)优先保留
+2. **近期涨停活跃股补充**: source="4IN1(近期涨停)" 或 "龙回头" 的优先保留
+3. **主线题材匹配**: reason 涉及 main_themes 中题材的优先
+4. **换手率适中**: 5-15% 优先（换手率过低可能缩量，过高可能出货）
+5. **涨幅参考**: 大涨股(>=9%)需有题材支撑；涨幅 < 5% 且调整充分的保留
+6. **最终数量**: 控制在 5-10 只
+
+### 市场状态判断
+
+从 result["market"] 读取:
+- `mood`: "偏强" / "中性" / "偏弱" / "弱势"
+- `mood_score`: 情绪评分 0-100（>=70 偏强，>=50 中性，>=30 偏弱，<30 弱势）
+- `fund_flow`: 资金流向（正=净流入，负=净流出）
+- `zt_count` / `dt_count`: 涨停/跌停家数
+- `broken_rate`: 炸板率
+
+市场弱势（mood="偏弱" 或 "弱势"）：
+- 减少候选数量（3-5只）
+- **盘中（intraday）** 只保留确定性高的（连板、龙回头）；盘后（post_market）和尾盘（eod）按各自规则执行，不受此限制
+- 降低评分预期
+
+## Phase 3: 输出结果
+
+直接调用 `generate_report_markdown(deep_result)`，返回 markdown 文本。用 `final_answer({"markdown": ...})` 输出。不要自己写 markdown 生成代码。
 
 ## 参考资料
 
 按需查阅:
-- `references/trading-logic.md` — 核心交易逻辑（弱转强、放量、MACD 等）
+- `references/trading-logic.md` — 核心交易逻辑
 - `references/market-sentiment.md` — 市场情绪判断标准
-- `references/limit-rules.md` — 涨跌停规则和过滤规则
-- `references/strategy-notes.md` — 已验证策略参考（BB 超卖、龙回头等）
+- `references/limit-rules.md` — 涨跌停规则
+- `references/strategy-notes.md` — 已验证策略参考

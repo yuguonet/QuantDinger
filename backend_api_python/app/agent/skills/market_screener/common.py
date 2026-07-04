@@ -91,6 +91,138 @@ class SkillReport:
         )
 
 # ═══════════════════════════════════════════════════════════════
+#  Markdown 渲染
+# ═══════════════════════════════════════════════════════════════
+
+_SRC_SHORT = {
+    "连板": "连板", "龙回头": "龙头", "尾盘封板": "封板", "尾盘强势": "尾强",
+    "盘后筛选": "筛选", "条件搜索": "搜索", "4IN1(近期涨停)": "4IN1",
+}
+
+
+def _fmt(v, dec=2):
+    if v is None:
+        return ""
+    if isinstance(v, float):
+        return f"{v:.{dec}f}"
+    return str(v)
+
+
+def _fmt_pct(v):
+    if v is None or v == 0:
+        return "-"
+    return f"{v:+.1f}"
+
+
+class SkillResult(dict):
+    """dict 子类，代码按 dict 用，转 str 出 markdown 给 LLM。"""
+
+    def __str__(self):
+        # 错误
+        if self.get("error"):
+            return f"ERR: {self['error']}"
+
+        # pre_screen() 格式
+        if "candidates" in self or "market" in self:
+            return self._prescreen_md()
+
+        # deep_analyze() 格式
+        if "analyzed" in self:
+            return self._deep_analyze_md()
+
+        # raw dict fallback
+        return _compact_json(self)
+
+    def __repr__(self):
+        return self.__str__()
+
+    def _prescreen_md(self):
+        parts = []
+
+        # 策略 + market 一行
+        strategy = self.get("strategy", "")
+        market = self.get("market", {})
+        if market:
+            mood = market.get("mood", "")
+            ms = market.get("mood_score", 0)
+            zt = market.get("zt_count", 0)
+            dt = market.get("dt_count", 0)
+            fund = market.get("fund_flow", 0)
+            brk = market.get("broken_rate", 0)
+            m_line = f"{strategy} M:{mood}({ms}) ZT:{zt} DT:{dt}"
+            if fund:
+                m_line += f" F{fund/1e8:.1f}e"
+            if brk:
+                m_line += f" 炸{brk}%"
+            parts.append(m_line)
+
+        # main_themes
+        themes = self.get("main_themes", [])
+        if themes:
+            parts.append("题材:" + ",".join(f"{t}({c})" for t, c in themes[:5]))
+
+        # candidates
+        candidates = self.get("candidates", [])
+        if candidates:
+            parts.append(f"候选{len(candidates)}只:")
+            rows = ["C#   Name    Src  Chg%   Trn%   Price  Vol"]
+            rows.append("---- ------ ---- ----- ------ ----- ---")
+            for c in candidates:
+                src = _SRC_SHORT.get(c.get("source", ""), c.get("source", "")[:3])
+                price = c.get("price") or c.get("close") or ""
+                price_s = f"{price:.2f}" if isinstance(price, (int, float)) else str(price)
+                rows.append(
+                    f"{c.get('code',''):6} {c.get('name',''):6} {src:4} "
+                    f"{_fmt_pct(c.get('change_pct')):5} "
+                    f"{_fmt_pct(c.get('turnover_pct')):4} "
+                    f"{price_s:6} {_fmt(c.get('vol_ratio'),1):3}"
+                )
+            parts.append("\n".join(rows))
+
+        return "\n".join(parts)
+
+    def _deep_analyze_md(self):
+        parts = []
+        s = self.get("score", 0)
+        d = self.get("direction", "")
+        cnf = self.get("confidence", 0)
+        sig = self.get("signal", "")
+        strategy = self.get("strategy", "")
+        parts.append(
+            f"{strategy} {d} score:{s:.1f} conf:{cnf:.2f}"
+            + (f" sig:{sig}" if sig else "")
+        )
+
+        analyzed = self.get("analyzed", [])
+        if analyzed:
+            parts.append(f"分析{len(analyzed)}只:")
+            rows = ["C#   Name    Score Dir     Signal"]
+            rows.append("---- ------ ----- ------- -------")
+            for a in analyzed:
+                sig_short = (a.get("signal", "") or "")[:20]
+                rows.append(
+                    f"{a.get('code',''):6} {a.get('name',''):6} "
+                    f"{a.get('score',0):5.1f} {a.get('direction',''):7} "
+                    f"{sig_short}"
+                )
+            parts.append("\n".join(rows))
+
+        return "\n".join(parts)
+
+
+def _compact_json(d, max_depth=2, _depth=0):
+    if _depth >= max_depth or not isinstance(d, dict):
+        return str(d)
+    items = []
+    for k, v in d.items():
+        if isinstance(v, (list, dict)) and len(str(v)) > 80 and _depth > 0:
+            items.append(f"{k}: [{type(v).__name__}({len(v)})]")
+        else:
+            items.append(f"{k}: {_compact_json(v, max_depth, _depth+1)}")
+    return "{" + ", ".join(items) + "}"
+
+
+# ═══════════════════════════════════════════════════════════════
 #  路径与环境
 # ═══════════════════════════════════════════════════════════════
 
