@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-market_screener/run.py
-
-A股全市场短线选股 — 入口 + 策略调度。
+market_screener/run.py — 工具函数入口
 
 根据交易时间自动选择策略:
   - 09:25-10:00 → 关键窗口（集合竞价+开盘定基调）
@@ -10,39 +8,16 @@ A股全市场短线选股 — 入口 + 策略调度。
   - 14:30-15:00 → eod (尾盘隔夜)
   - 15:00+ / 非交易日 → post_market (盘后复盘)
 
-框架调用方式:
-    from market_screener.run import run
-    result = run()
+仅包含对 LLM 暴露的工具函数，内部实现在 _helpers.py 及各策略模块中。
 """
 
-from __future__ import annotations
+from datetime import date
+from typing import Any, Dict
 
 from app.agent.log import logger
-from datetime import datetime, date
-from typing import Any, Dict, List, Optional
+from skills.market_screener._helpers import select_strategy, analyze_batch, build_report
 from skills.market_screener.common import SkillReport
-# ═══════════════════════════════════════════════════════════════
-#  策略调度
-# ═══════════════════════════════════════════════════════════════
 
-def _select_strategy() -> str:
-    """根据当前时间返回策略名称: intraday / eod / post_market。"""
-    now = datetime.now()
-    h, m = now.hour, now.minute
-    if now.weekday() >= 5:
-        return "post_market"
-    if h < 9 or (h == 9 and m < 30):
-        return "post_market"
-    if h == 9 and m >= 30:
-        return "intraday"
-    if h < 14 or (h == 14 and m < 30):
-        return "intraday"
-    if h == 14 and m >= 30:
-        return "eod"
-    return "post_market"
-# ═══════════════════════════════════════════════════════════════
-#  Phase 1 — 预筛选
-# ═══════════════════════════════════════════════════════════════
 
 def pre_screen() -> Dict[str, Any]:
     """Phase 1: Python 预筛选（0 token，不消耗模型调用）。
@@ -56,7 +31,7 @@ def pre_screen() -> Dict[str, Any]:
     3. 补充连板 + 龙回头
     4. 过滤（换手率>=2%、非涨停封板）
     """
-    strategy = _select_strategy()
+    strategy = select_strategy()
     today = date.today().isoformat()
     logger.info("[market_screener] Phase 1 预筛选，策略: %s", strategy)
 
@@ -78,35 +53,7 @@ def pre_screen() -> Dict[str, Any]:
     result.setdefault("main_themes", [])
     result.setdefault("candidates", [])
     return result
-# ═══════════════════════════════════════════════════════════════
-#  Phase 2 — 深入分析
-# ═══════════════════════════════════════════════════════════════
 
-def _analyze_batch(
-    candidates: List[Dict],
-    analyze_fn,
-    max_candidates: int = 6,
-) -> List[Dict]:
-    """Loop over candidates, collect non-None results from analyze_fn."""
-    results = []
-    for c in candidates[:max_candidates]:
-        result = analyze_fn(c)
-        if result:
-            results.append(result)
-    return results
-
-def _build_report(analyzed: List[Dict]) -> SkillReport:
-    """Filter low scores, sort, compute aggregate, build SkillReport."""
-    analyzed = [a for a in analyzed if a.get("score", 0) >= 60 and a.get("direction") == "bullish"]
-    analyzed.sort(key=lambda x: -x.get("score", 0))
-    avg_score = sum(a["score"] for a in analyzed) / len(analyzed) if analyzed else 50.0
-    return SkillReport(
-        skill_name="market_screener", score=round(avg_score, 1),
-        direction="bullish" if avg_score >= 55 else ("bearish" if avg_score < 45 else "neutral"),
-        confidence=min(0.9, 0.4 + len(analyzed) * 0.06),
-        signal="", analysis="", factors=[], status="ok",
-        output_data={"analyzed": analyzed},
-    )
 
 def deep_analyze(prescreen_result: Dict[str, Any]) -> Dict[str, Any]:
     """Phase 2: 对 Phase 1 候选股做深入分析。
@@ -119,7 +66,7 @@ def deep_analyze(prescreen_result: Dict[str, Any]) -> Dict[str, Any]:
     - 尾盘策略：条件搜索+尾盘特征验证
     - 盘后策略：全市场技术形态扫描+介入点计算
     """
-    strategy = prescreen_result.get("strategy", _select_strategy())
+    strategy = prescreen_result.get("strategy", select_strategy())
     _tool_calls = []
     _tool_nodes = []
     _missing_data = []
@@ -137,28 +84,28 @@ def deep_analyze(prescreen_result: Dict[str, Any]) -> Dict[str, Any]:
                 output_data={"analyzed": []},
             )
         else:
-            raw = _analyze_batch(
+            raw = analyze_batch(
                 candidates,
                 lambda c: _deep(c, tech_check(c["code"]), _tool_calls, _tool_nodes, _missing_data),
                 max_candidates=8,
             )
-            report = _build_report(raw)
+            report = build_report(raw)
     elif strategy == "eod":
         from .eod import deep_analyze as _deep
         candidates = prescreen_result.get("candidates", [])
-        raw = _analyze_batch(
+        raw = analyze_batch(
             candidates,
             lambda c: _deep(c, _tool_calls, _tool_nodes, _missing_data),
         )
-        report = _build_report(raw)
+        report = build_report(raw)
     else:
         from .post_market import deep_analyze as _deep
         candidates = prescreen_result.get("candidates", [])
-        raw = _analyze_batch(
+        raw = analyze_batch(
             candidates,
             lambda c: _deep(c, _tool_calls, _tool_nodes, _missing_data),
         )
-        report = _build_report(raw)
+        report = build_report(raw)
 
     # 构建最终输出
     output = report.to_dict() if hasattr(report, "to_dict") else {
@@ -183,9 +130,7 @@ def deep_analyze(prescreen_result: Dict[str, Any]) -> Dict[str, Any]:
         output["output_data"] = {}
 
     return output
-# ═══════════════════════════════════════════════════════════════
-#  主入口
-# ═══════════════════════════════════════════════════════════════
+
 
 def run() -> Dict[str, Any]:
     """完整选股流程：Phase 1 + Phase 2。"""
