@@ -701,14 +701,14 @@ def _detect_resonance(
 # Tool 函数（注册给 Agent 调用）
 # ═══════════════════════════════════════════════════════════════
 
-def analyze_trend(codes: str, _output: str = "json") -> Dict[str, Any]:
+def analyze_trend(codes: str, _output: str = "markdown") -> Dict[str, Any]:
     """技术趋势综合分析：趋势类(MA/MACD/BOLL) + 动量类(RSI/KDJ) + 量能类(OBV/MFI/CMF) + 波动率(ATR/HV)。
 
     包含多指标共振检测、背离检测、均线收敛度、乖离率极值等高级信号。
 
     Args:
         codes: 多股用逗号分隔
-        _output: "json" (默认) | "markdown"
+        _output: "markdown" (默认) | "json"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
