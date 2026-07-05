@@ -338,10 +338,11 @@ def analyze_code(
 
         score = max(0, min(100, score))
         direction = "bullish" if score >= 60 else ("bearish" if score <= 40 else "neutral")
+        confidence = round(min(0.85, max(0.1, score / 100 * 0.7 + 0.15)), 2)
 
         return {
             "code": code, "name": name,
-            "score": round(score, 1), "direction": direction,
+            "score": round(score, 1), "direction": direction, "confidence": confidence,
             "signal": ", ".join(signals[:5]),
             "factors": [f.to_dict() for f in factors],
             "risk_notes": risk_notes,

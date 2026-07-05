@@ -18,78 +18,6 @@ import json
 from dataclasses import dataclass, field
 from enum import IntEnum
 
-# from rich import box removed
-
-# --- Inline stubs for removed rich dependencies ---
-class _Text(str):
-    def __new__(cls, *args, **kwargs):
-        return str.__new__(cls, args[0] if args else "")
-    def __init__(self, *args, **kwargs):
-        pass
-
-class _Console:
-    def __init__(self, *a, **kw): pass
-    def print(self, *a, **kw):
-        import logging
-        for arg in a:
-            if isinstance(arg, str):
-                logging.getLogger("smolagents").info(arg)
-    def __getattr__(self, name):
-        return lambda *a, **kw: None
-
-class _Panel:
-    def __init__(self, *a, **kw): pass
-    def __bool__(self): return False
-
-class _Rule:
-    def __init__(self, *a, **kw): pass
-    def __bool__(self): return False
-
-class _Syntax:
-    def __init__(self, *a, **kw): pass
-    def __bool__(self): return False
-
-class _Table:
-    def __init__(self, *a, **kw): pass
-    def __getattr__(self, name):
-        return lambda *a, **kw: None
-    def __bool__(self): return False
-
-class _Group:
-    def __init__(self, *a, **kw): pass
-    def __bool__(self): return False
-
-class _Tree:
-    def __init__(self, *a, **kw): pass
-    def __bool__(self): return False
-
-class _box:
-    ROUNDED = None
-    HEAVY = None
-    HORIZONTALS = None
-    SIMPLE = None
-    SQUARE = None
-
-Text = _Text
-Console = _Console
-Panel = _Panel
-Rule = _Rule
-Syntax = _Syntax
-Table = _Table
-Group = _Group
-Tree = _Tree
-box = _box()
-
-# from rich.console import Console, Group removed
-# from rich.panel import Panel removed
-# from rich.rule import Rule removed
-# from rich.syntax import Syntax removed
-# from rich.table import Table removed
-# from rich.text import Text removed
-# from rich.tree import Tree removed
-
-from .utils import sanitize_for_rich
-
 
 __all__ = ["AgentLogger", "LogLevel", "Monitor", "TokenUsage", "Timing"]
 
@@ -175,7 +103,7 @@ class Monitor:
                 f"| Input tokens: {self.total_input_token_count:,} | Output tokens: {self.total_output_token_count:,}"
             )
         console_outputs += "]"
-        self.logger.log(Text(console_outputs, style="dim"), level=1)
+        self.logger.log(console_outputs, level=LogLevel.INFO)
 
 
 class LogLevel(IntEnum):
@@ -188,13 +116,21 @@ class LogLevel(IntEnum):
 YELLOW_HEX = "#d4b702"
 
 
+class Console:
+    """Simple console wrapper using print() — replaces rich Console."""
+
+    def __init__(self, highlight: bool = False):
+        self.highlight = highlight
+
+    def print(self, *args, **kwargs):
+        for arg in args:
+            print(str(arg))
+
+
 class AgentLogger:
     def __init__(self, level: LogLevel = LogLevel.INFO, console: Console | None = None):
         self.level = level
-        if console is None:
-            self.console = Console(highlight=False)
-        else:
-            self.console = console
+        self.console = console if console is not None else Console(highlight=False)
 
     def log(self, *args, level: int | str | LogLevel = LogLevel.INFO, **kwargs) -> None:
         """Logs a message to the console.
@@ -208,127 +144,55 @@ class AgentLogger:
             self.console.print(*args, **kwargs)
 
     def log_error(self, error_message: str) -> None:
-        self.log(Text(sanitize_for_rich(error_message), style="bold red"), level=LogLevel.ERROR)
+        self.log(f"[ERROR] {error_message}", level=LogLevel.ERROR)
 
-    def log_markdown(self, content: str, title: str | None = None, level=LogLevel.INFO, style=YELLOW_HEX) -> None:
-        markdown_content = Syntax(
-            content,
-            lexer="markdown",
-            theme="github-dark",
-            word_wrap=True,
-        )
+    def log_markdown(self, content: str, title: str | None = None, level=LogLevel.INFO) -> None:
+        if level > self.level:
+            return
         if title:
-            self.log(
-                Group(
-                    Rule(
-                        "[bold italic]" + title,
-                        align="left",
-                        style=style,
-                    ),
-                    markdown_content,
-                ),
-                level=level,
-            )
-        else:
-            self.log(markdown_content, level=level)
+            self.log(f"\n{'-' * 40}\n  {title}\n{'-' * 40}", level=level)
+        self.log(content, level=level)
 
     def log_code(self, title: str, content: str, level: int = LogLevel.INFO) -> None:
-        self.log(
-            Panel(
-                Syntax(
-                    content,
-                    lexer="python",
-                    theme="monokai",
-                    word_wrap=True,
-                ),
-                title="[bold]" + title,
-                title_align="left",
-                box=box.HORIZONTALS,
-            ),
-            level=level,
-        )
+        if level > self.level:
+            return
+        self.log(f"\n{'-' * 40}\n  {title}\n{'-' * 40}\n{content}", level=level)
 
     def log_rule(self, title: str, level: int = LogLevel.INFO) -> None:
-        self.log(
-            Rule(
-                "[bold white]" + title,
-                characters="━",
-                style=YELLOW_HEX,
-            ),
-            level=LogLevel.INFO,
-        )
+        self.log(f"\n{'=' * 40} {title} {'=' * 40}", level=LogLevel.INFO)
 
     def log_task(self, content: str, subtitle: str, title: str | None = None, level: LogLevel = LogLevel.INFO) -> None:
-        # Important: `content` can contain arbitrary tool logs / payloads. If we embed it
-        # inside Rich markup (e.g. f"[bold]{content}"), any stray "[/...]" sequences or
-        # binary-ish characters can crash Rich's markup parser. Render the content as
-        # `Text` instead, and apply styling via Text/style, not markup.
-        safe_content = sanitize_for_rich(content)
-        safe_subtitle = sanitize_for_rich(subtitle)
-        content_text = Text("\n") + Text(safe_content, style="bold") + Text("\n")
-        subtitle_text = Text(safe_subtitle)
-        self.log(
-            Panel(
-                content_text,
-                title="[bold]New run" + (f" - {title}" if title else ""),
-                subtitle=subtitle_text,
-                border_style=YELLOW_HEX,
-                subtitle_align="left",
-            ),
-            level=level,
-        )
+        if level > self.level:
+            return
+        header = f"\n{'=' * 60}"
+        header += f"\n  New run{' - ' + title if title else ''}"
+        header += f"\n  {subtitle}"
+        header += f"\n{'=' * 60}"
+        self.log(header, level=level)
+        self.log(content, level=level)
 
-    def log_messages(self, messages: list[dict], level: LogLevel = LogLevel.DEBUG) -> None:
-        messages_as_string = "\n".join([json.dumps(message.dict(), indent=4) for message in messages])
-        self.log(
-            Syntax(
-                messages_as_string,
-                lexer="markdown",
-                theme="github-dark",
-                word_wrap=True,
-            ),
-            level=level,
-        )
+    def log_messages(self, messages: list, level: LogLevel = LogLevel.DEBUG) -> None:
+        if level > self.level:
+            return
+        messages_as_string = "\n".join([json.dumps(msg.dict(), indent=4) for msg in messages])
+        self.log(messages_as_string, level=level)
 
     def visualize_agent_tree(self, agent):
-        def create_tools_section(tools_dict):
-            table = Table(show_header=True, header_style="bold")
-            table.add_column("Name", style="#1E90FF")
-            table.add_column("Description")
-            table.add_column("Arguments")
-
-            for name, tool in tools_dict.items():
-                args = [
-                    f"{arg_name} (`{info.get('type', 'Any')}`{', optional' if info.get('optional') else ''}): {info.get('description', '')}"
-                    for arg_name, info in getattr(tool, "inputs", {}).items()
-                ]
-                table.add_row(name, getattr(tool, "description", str(tool)), "\n".join(args))
-
-            return Group("🛠️ [italic #1E90FF]Tools:[/italic #1E90FF]", table)
-
-        def get_agent_headline(agent, name: str | None = None):
-            name_headline = f"{name} | " if name else ""
-            return f"[bold {YELLOW_HEX}]{name_headline}{agent.__class__.__name__} | {agent.model.model_id}"
-
-        def build_agent_tree(parent_tree, agent_obj):
-            """Recursively builds the agent tree."""
-            parent_tree.add(create_tools_section(agent_obj.tools))
-
-            if agent_obj.managed_agents:
-                agents_branch = parent_tree.add("🤖 [italic #1E90FF]Managed agents:")
-                for name, managed_agent in agent_obj.managed_agents.items():
-                    agent_tree = agents_branch.add(get_agent_headline(managed_agent, name))
-                    if managed_agent.__class__.__name__ == "CodeAgent":
-                        agent_tree.add(
-                            f"✅ [italic #1E90FF]Authorized imports:[/italic #1E90FF] {managed_agent.additional_authorized_imports}"
-                        )
-                    agent_tree.add(f"📝 [italic #1E90FF]Description:[/italic #1E90FF] {managed_agent.description}")
-                    build_agent_tree(agent_tree, managed_agent)
-
-        main_tree = Tree(get_agent_headline(agent))
-        if agent.__class__.__name__ == "CodeAgent":
-            main_tree.add(
-                f"✅ [italic #1E90FF]Authorized imports:[/italic #1E90FF] {agent.additional_authorized_imports}"
-            )
-        build_agent_tree(main_tree, agent)
-        self.console.print(main_tree)
+        """Prints a simple text tree visualization of the agent's structure."""
+        name = agent.__class__.__name__
+        model_id = agent.model.model_id if hasattr(agent.model, 'model_id') else 'N/A'
+        print(f"\n{'=' * 48}")
+        print(f"  Agent: {name}")
+        print(f"  Model: {model_id}")
+        print(f"{'-' * 48}")
+        print(f"  Tools:")
+        for t_name, t_obj in agent.tools.items():
+            desc = getattr(t_obj, 'description', str(t_obj))
+            if len(desc) > 80:
+                desc = desc[:80] + '...'
+            print(f"    - {t_name}: {desc}")
+        if agent.managed_agents:
+            print(f"  Managed agents:")
+            for ma_name in agent.managed_agents:
+                print(f"    - {ma_name}")
+        print(f"{'=' * 48}")
