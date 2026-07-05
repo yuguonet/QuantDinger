@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from app.agent.log import logger
 from typing import Any, Dict, List, Optional
-from app.agent.utils.md_format import _format_output, _to_md
+from app.agent.utils.md_format import _to_md
 
 # ── 显式依赖检查 ──────────────────────────────────────────────
 try:
@@ -24,14 +24,13 @@ except ImportError as _e:
 
 # ── Tool functions ────────────────────────────────────────────
 
-def list_strategies(user_id: int = 1, _output: str = "markdown") -> str:
+def list_strategies(user_id: int = 1) -> dict:
     """策略列表：返回用户所有策略的ID、名称、类型、运行状态、市场。
 
     返回策略 ID、名称、类型、状态、交易对、时间框架等信息。
 
     Args:
         user_id: 用户 ID，默认 1
-        _output: "markdown"(默认) | "json"
     """
     if not _TRADING_DEPS_OK:
         return {"strategies": [], "count": 0, "error": f"交易依赖缺失: {_TRADING_DEPS_ERROR}"}
@@ -53,13 +52,12 @@ def list_strategies(user_id: int = 1, _output: str = "markdown") -> str:
                 "created_at": str(s.get("created_at", "")),
             })
 
-        _r = {"strategies": strategies, "count": len(strategies)}
-        return _format_output(_r, _output)
+        return {"strategies": strategies, "count": len(strategies)}
     except Exception as e:
         logger.error("list_strategies failed: %s", e, exc_info=True)
         return {"strategies": [], "count": 0, "error": str(e)}
 
-def get_strategy_detail(strategy_id: int, user_id: int = 1, _output: str = "markdown") -> str:
+def get_strategy_detail(strategy_id: int, user_id: int = 1) -> dict:
     """策略详情：返回指定策略的参数配置、持仓、触发条件。
 
     包含策略类型、交易配置、指标配置、运行状态等。
@@ -67,7 +65,6 @@ def get_strategy_detail(strategy_id: int, user_id: int = 1, _output: str = "mark
     Args:
         strategy_id: 策略 ID
         user_id: 用户 ID，默认 1
-        _output: "markdown"(默认) | "json"
     """
     if not _TRADING_DEPS_OK:
         return {"success": False, "error": f"交易依赖缺失: {_TRADING_DEPS_ERROR}"}
@@ -84,13 +81,12 @@ def get_strategy_detail(strategy_id: int, user_id: int = 1, _output: str = "mark
         safe.pop("secret_key", None)
         safe.pop("passphrase", None)
 
-        _r = {"success": True, "strategy": safe}
-        return _format_output(_r, _output)
+        return {"success": True, "strategy": safe}
     except Exception as e:
         logger.error("get_strategy_detail failed: %s", e, exc_info=True)
         return {"success": False, "error": str(e)}
 
-def start_strategy(strategy_id: int, user_id: int = 1, _output: str = "markdown") -> str:
+def start_strategy(strategy_id: int, user_id: int = 1) -> dict:
     """启动策略：将指定策略从停止状态切换为运行状态。
 
     策略将按照配置的指标信号自动执行买卖操作。
@@ -98,7 +94,6 @@ def start_strategy(strategy_id: int, user_id: int = 1, _output: str = "markdown"
     Args:
         strategy_id: 策略 ID
         user_id: 用户 ID，默认 1
-        _output: "markdown"(默认) | "json"
     """
     if not _TRADING_DEPS_OK:
         return {"success": False, "error": f"交易依赖缺失: {_TRADING_DEPS_ERROR}"}
@@ -130,19 +125,17 @@ def start_strategy(strategy_id: int, user_id: int = 1, _output: str = "markdown"
             svc.update_strategy_status(strategy_id, "stopped", user_id=user_id)
             return {"success": False, "error": "策略执行器启动失败"}
 
-        _r = {"success": True, "strategy_id": strategy_id, "strategy_name": st.get("name", ""), "message": "策略已启动"}
-        return _format_output(_r, _output)
+        return {"success": True, "strategy_id": strategy_id, "strategy_name": st.get("name", ""), "message": "策略已启动"}
     except Exception as e:
         logger.error("start_strategy failed: %s", e, exc_info=True)
         return {"success": False, "error": f"启动失败: {e}"}
 
-def stop_strategy(strategy_id: int, user_id: int = 1, _output: str = "markdown") -> str:
+def stop_strategy(strategy_id: int, user_id: int = 1) -> dict:
     """停止策略：将指定策略从运行状态切换为停止状态。
 
     Args:
         strategy_id: 策略 ID
         user_id: 用户 ID，默认 1
-        _output: "markdown"(默认) | "json"
     """
     if not _TRADING_DEPS_OK:
         return {"success": False, "error": f"交易依赖缺失: {_TRADING_DEPS_ERROR}"}
@@ -168,8 +161,7 @@ def stop_strategy(strategy_id: int, user_id: int = 1, _output: str = "markdown")
         # 更新状态
         svc.update_strategy_status(strategy_id, "stopped", user_id=user_id)
 
-        _r = {"success": True, "strategy_id": strategy_id, "strategy_name": st.get("name", ""), "message": "策略已停止"}
-        return _format_output(_r, _output)
+        return {"success": True, "strategy_id": strategy_id, "strategy_name": st.get("name", ""), "message": "策略已停止"}
     except Exception as e:
         logger.error("stop_strategy failed: %s", e, exc_info=True)
         return {"success": False, "error": f"停止失败: {e}"}
@@ -178,8 +170,7 @@ def get_strategy_trades(
     strategy_id: int,
     user_id: int = 1,
     limit: int = 20,
-    _output: str = "markdown",
-) -> str:
+) -> dict:
     """策略交易记录：返回指定策略最近的买入/卖出记录。
 
     Args:
@@ -213,8 +204,7 @@ def get_strategy_trades(
                     d[k] = float(d[k])
             trades.append(d)
 
-        _r = {"trades": trades, "count": len(trades)}
-        return _format_output(_r, _output)
+        return {"trades": trades, "count": len(trades)}
     except Exception as e:
         logger.error("get_strategy_trades failed: %s", e, exc_info=True)
         return {"trades": [], "count": 0, "error": str(e)}

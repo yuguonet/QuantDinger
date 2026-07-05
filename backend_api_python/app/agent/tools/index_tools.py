@@ -10,18 +10,17 @@ import json
 
 from app.agent.log import logger
 from typing import Any, Dict, List
-from app.agent.utils.md_format import _format_output, _to_md
-def get_market_indices( _output: str = "markdown") -> str:
+from app.agent.utils.md_format import _to_md
+def get_market_indices() -> dict:
     """指数行情：返回上证/深证/创业板/科创/北证五大指数的价格、涨跌幅、成交量。"""
     from app.market_cn.index import get_index_realtime as _get
     try:
         data = _get()
-        _r = {"count": len(data), "indices": data}
-        return _format_output(_r, _output)
+        return {"count": len(data), "indices": data}
     except Exception as e:
         logger.warning("get_market_indices failed: %s", e)
         return {"error": str(e)}
-def get_market_overview(_output: str = "markdown") -> str:
+def get_market_overview() -> dict:
     """市场概览：返回全市场涨跌家数、涨停跌停数、北向资金净买入、市场情绪指数、主力资金流向。"""
     result = {}
 
@@ -61,4 +60,4 @@ def get_market_overview(_output: str = "markdown") -> str:
     except Exception:
         pass
 
-    return _format_output(result, _output)
+    return result

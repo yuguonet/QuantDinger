@@ -15,7 +15,7 @@ from app.agent.tools.screener_config import (
     CONCEPT_OPTIONS,
     MARKET_FILTER_MAP,
 )
-from app.agent.utils.md_format import _format_output, _to_md
+from app.agent.utils.md_format import _to_md
 
 # ══════════════════════════════════════════════════════════════
 #  东方财富 API 调用 (正本: eastmoney_search.py)
@@ -96,8 +96,7 @@ def search_stocks(
     filters: Optional[Dict[str, Any]] = None,
     market: str = "全部",
     top_n: int = 50,
-    _output: str = "markdown",
-) -> str:
+) -> dict:
     """选股：根据自然语言条件（如"PE<20 半导体"）或结构化 filters 从全市场筛选股票，返回代码/名称/行业/价格/PE/PB等。
 
     Args:
@@ -137,7 +136,7 @@ def search_stocks(
             stocks = [_parse_stock_item(s) for s in stocks_raw]
             _r = {"source": "eastmoney", "keyword": query, "market": market, "total": total, "count": len(stocks), "stocks": stocks}
             import json
-            return _format_output(_r, _output)
+            return _r
         elif source == "eastmoney":
             return {"error": raw.get("msg", "东财选股搜索失败"), "retriable": True}
         # auto 模式下东财失败，继续 fallback
@@ -457,7 +456,7 @@ def build_keyword_from_filters(filters: Dict[str, Any]) -> str:
             parts.append(pledge_map[k])
 
     return "; ".join(parts)
-def get_screener_presets( _output: str = "markdown") -> str:
+def get_screener_presets() -> dict:
     """选股条件列表：返回所有可用筛选条件的分类、字段名、示例值。"""
     return {
         "categories": {

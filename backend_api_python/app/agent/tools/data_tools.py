@@ -54,12 +54,11 @@ def _resolve_stock(keyword: str, market: str = "CNStock", limit: int = 10) -> Di
 # 向后兼容别名
 search_stock_by_name = _resolve_stock
 
-def get_realtime_quote(codes: str, _output: str = "markdown") -> Dict[str, Any]:
+def get_realtime_quote(codes: str) -> Dict[str, Any]:
     """实时行情：价格、涨跌幅、成交量、换手率、量比、PE、PB、总市值等。
 
     Args:
-        codes: 多股用逗号分隔"
-        _output: "markdown" (默认) | "json"
+        codes: 多股用逗号分隔
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
@@ -89,42 +88,11 @@ def get_realtime_quote(codes: str, _output: str = "markdown") -> Dict[str, Any]:
         else:
             results[code] = {"error": "未获取到行情", "stock_code": code}
 
-    if _output == "json":
-        if len(code_list) == 1:
-            return results[code_list[0]]
-        return {"count": len(results), "data": results}
-
-    def _fmt(t: Dict) -> str:
-        price = t.get("last") or t.get("close") or t.get("price") or 0
-        chg = t.get("change_pct", 0)
-        vol = t.get("volume", 0)
-        name = t.get("name", "")
-        code = t.get("stock_code", t.get("symbol", ""))
-        vol_str = f"{vol/10000:.0f}万" if vol and vol > 10000 else (str(int(vol)) if vol else "-")
-        chg_str = f"{chg:+.2f}%" if isinstance(chg, (int, float)) else str(chg)
-        return f"{code} {name} {price} {chg_str} 量:{vol_str}"
-
     if len(code_list) == 1:
-        r = results[code_list[0]]
-        if "error" in r:
-            return f"行情获取失败: {r['error']}"
-        return _fmt(r)
+        return results[code_list[0]]
+    return {"count": len(results), "data": results}
 
-    # 多股 TSV
-    rows = ["代码\t名称\t现价\t涨跌\t成交量"]
-    for code, r in results.items():
-        if "error" in r:
-            rows.append(f"{code}\t获取失败")
-        else:
-            price = r.get("last") or r.get("close") or r.get("price") or 0
-            chg = r.get("change_pct", 0)
-            vol = r.get("volume", 0)
-            vol_str = f"{vol/10000:.0f}万" if vol and vol > 10000 else (str(int(vol)) if vol else "-")
-            chg_str = f"{chg:+.2f}%" if isinstance(chg, (int, float)) else str(chg)
-            rows.append(f"{code}\t{r.get('name','')}\t{price}\t{chg_str}\t{vol_str}")
-    return '\n'.join(rows)
-
-def agent_get_kline(codes: str, timeframe: str = "1D", days: int = 30, _output: str = "markdown") -> Dict[str, Any]:
+def agent_get_kline(codes: str, timeframe: str = "1D", days: int = 30) -> Dict[str, Any]:
     """K线数据：返回OHLCV，支持 A 股。
 
     ⚠️ 仅在需要原始数据或自定义计算时调用。趋势/指标/形态/量价/筹码分析已内置K线获取，不要重复调用。
@@ -133,7 +101,6 @@ def agent_get_kline(codes: str, timeframe: str = "1D", days: int = 30, _output: 
         codes: 多股用逗号分隔
         timeframe: 1m/5m/15m/30m/1H/4H/1D/1W，默认1D
         days: 天数，默认30，最大250
-        _output: "markdown" (默认) | "json"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
@@ -160,68 +127,22 @@ def agent_get_kline(codes: str, timeframe: str = "1D", days: int = 30, _output: 
         except Exception:
             return str(ts)
 
-    # ── json 模式：完整 OHLCV ──
-    if _output == "json":
-        results: Dict[str, Any] = {}
-        for code in code_list:
-            klines = _fetch(code)
-            results[code] = [{
-                "t": k.get("date") or _ts_to_date(k.get("time", 0)),
-                "o": round(k.get("open", 0), 2),
-                "h": round(k.get("high", 0), 2),
-                "l": round(k.get("low", 0), 2),
-                "c": round(k.get("close", 0), 2),
-                "v": k.get("volume", 0),
-            } for k in klines]
-        if len(code_list) == 1:
-            return results[code_list[0]]
-        return {"count": len(results), "data": results}
-
-    # ── markdown 模式：紧凑，只取最近 N 根 ──
-    MAX_SHOW = 10  # markdown 最多显示根数
-
-    def _fmt_one(code: str) -> str:
-        klines = _fetch(code)
-        if not klines:
-            return f"{code} 无数据"
-        tail = klines[-MAX_SHOW:]
-        rows = ["日期\t开\t高\t低\t收\t量"]
-        for k in tail:
-            vol = k.get("volume", 0)
-            vol_str = f"{vol/10000:.0f}万" if vol > 10000 else str(int(vol))
-            dt = k.get("date") or _ts_to_date(k.get("time", 0))
-            rows.append(
-                f"{dt}"
-                f"\t{round(k.get('open',0),2)}"
-                f"\t{round(k.get('high',0),2)}"
-                f"\t{round(k.get('low',0),2)}"
-                f"\t{round(k.get('close',0),2)}"
-                f"\t{vol_str}"
-            )
-        return '\n'.join(rows)
-
-    if len(code_list) == 1:
-        return _fmt_one(code_list[0])
-
-    # 多股：每只一行摘要
-    rows = ["代码\t最新收盘\t近5日涨跌\t成交量"]
+    # ── 完整 OHLCV ──
+    results: Dict[str, Any] = {}
     for code in code_list:
         klines = _fetch(code)
-        if not klines:
-            rows.append(f"{code}\t无数据")
-            continue
-        last = klines[-1]
-        close = round(last.get("close", 0), 2)
-        vol = last.get("volume", 0)
-        vol_str = f"{vol/10000:.0f}万" if vol > 10000 else str(int(vol))
-        # 近5日涨跌
-        if len(klines) >= 6:
-            chg5 = (close - round(klines[-6].get("close", close), 2)) / round(klines[-6].get("close", close), 2) * 100
-            chg_str = f"{chg5:+.2f}%"
-        else:
-            chg_str = "-"
-        rows.append(f"{code}\t{close}\t{chg_str}\t{vol_str}")
-    return '\n'.join(rows)
+        results[code] = [{
+            "t": k.get("date") or _ts_to_date(k.get("time", 0)),
+            "o": round(k.get("open", 0), 2),
+            "h": round(k.get("high", 0), 2),
+            "l": round(k.get("low", 0), 2),
+            "c": round(k.get("close", 0), 2),
+            "v": k.get("volume", 0),
+        } for k in klines]
+    if len(code_list) == 1:
+        return results[code_list[0]]
+    return {"count": len(results), "data": results}
+
 # ── 核心字段集（Agent 日常分析最常用的 ~15 个字段） ──────────────────────
 _STOCK_INFO_CORE_FIELDS = {
     "stock_code", "name", "industry", "concepts",

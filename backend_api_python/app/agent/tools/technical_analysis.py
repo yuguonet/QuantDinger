@@ -247,8 +247,8 @@ def _algo_analyze(
         "stock_code": stock_code,
         "stock_name": stock_name,
     }
-    return analysis if _output == "markdown" else _r
-def technical_analysis(stock_code: str, stock_name: str = "", _output: str = "markdown") -> str:
+    return _r
+def technical_analysis(stock_code: str, stock_name: str = "") -> dict:
     """技术面综合评分：内部调用 analyze_trend+get_indicator_snapshot+get_volume_analysis+analyze_pattern+get_chip_distribution，加权输出 0-100 分。需要单股深度分析时用此工具，不要同时调 analyze_trend。
 
     Args:
@@ -258,7 +258,6 @@ def technical_analysis(stock_code: str, stock_name: str = "", _output: str = "ma
     Returns:
         dict: 标准化分析报告，包含 score(0-100)、direction(bullish/bearish/neutral)、
               confidence(high/medium/low)、signal(信号摘要)、factors(因子明细)、analysis(分析文字)
-        _output: "markdown" (默认) | "json"
     """
     tool_results = _call_tools(stock_code)
     return _algo_analyze(stock_code, stock_name, tool_results)

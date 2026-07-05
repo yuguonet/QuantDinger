@@ -19,12 +19,40 @@ class ToolResult:
     error: Optional[str] = None
 
     def to_str(self) -> str:
-        """转为字符串（用于传回 LLM）"""
-        if self.success:
-            if isinstance(self.output, (dict, list)):
-                return json.dumps(self.output, ensure_ascii=False, indent=2)
-            return str(self.output)
-        return f"[工具执行失败] {self.error}"
+        """转为字符串（用于传回 LLM），按数据形态选择最省 token 的格式"""
+        if not self.success:
+            return f"[工具执行失败] {self.error}"
+
+        data = self.output
+
+        # 标量直接转
+        if not isinstance(data, (dict, list)):
+            return str(data)
+
+        # 扁平 dict → "key: value" 每行一条（无引号无括号）
+        if isinstance(data, dict) and not _is_nested(data):
+            return "\n".join(f"- {k}: {v}" for k, v in data.items())
+
+        # list[dict]（表形数据）→ TSV（最省 token 的表格表示）
+        if isinstance(data, list) and data and all(isinstance(item, dict) for item in data):
+            return _to_tsv(data)
+
+        # 嵌套结构 → 紧凑 JSON（无缩进空格）
+        return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+
+def _is_nested(d: dict) -> bool:
+    """值中是否包含嵌套的 dict 或 list"""
+    return any(isinstance(v, (dict, list)) for v in d.values())
+
+
+def _to_tsv(items: list) -> str:
+    """list[dict] → TSV（无冗余字符，最省 token）"""
+    headers = list(dict.fromkeys(k for d in items for k in d))
+    lines = ["\t".join(headers)]
+    for item in items:
+        lines.append("\t".join(str(item.get(h, "")) for h in headers))
+    return "\n".join(lines)
 
 
 class Tool(ABC):

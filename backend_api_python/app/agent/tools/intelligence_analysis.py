@@ -11,7 +11,7 @@ from app.agent.tools.news_search_tools import (
     search_stock_intel,
     search_policy_intel,
 )
-def intelligence_analysis(stock_code: str, _output: str = "markdown") -> str:
+def intelligence_analysis(stock_code: str) -> dict:
     """个股情报+政策面综合分析：搜索新闻公告研报 + 政策动态，返回情报评分和利空/利多信号。
 
     Args:
@@ -19,7 +19,6 @@ def intelligence_analysis(stock_code: str, _output: str = "markdown") -> str:
 
     Returns:
         {
-            
             "score": float,          # 综合评分 (0-100)
             "direction": str,        # bullish / bearish / neutral
             "confidence": float,     # 0.0-1.0
@@ -33,7 +32,6 @@ def intelligence_analysis(stock_code: str, _output: str = "markdown") -> str:
             "policy_signals": list,  # 政策信号列表
             "status": "ok",
         }
-        _output: "markdown"(默认) | "json"
     """
     
     stock_name = _lookup_stock_name(stock_code)
@@ -156,7 +154,7 @@ def intelligence_analysis(stock_code: str, _output: str = "markdown") -> str:
         "policy_signals": policy_signals,
         "evaluation": evaluation,
     }
-    return analysis if _output == "markdown" else json.dumps(_r, ensure_ascii=False)
+    return _r
 # ═══════════════════════════════════════════════════════════════
 # 个股情报分析
 # ═══════════════════════════════════════════════════════════════

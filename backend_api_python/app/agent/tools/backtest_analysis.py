@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 
 from typing import Any, Dict
-from app.agent.utils.md_format import _lookup_stock_name, _format_output
+from app.agent.utils.md_format import _lookup_stock_name
 
 
 def _algo_analyze(stock_code: str, stock_name: str, tool_results: dict, call_tool_fn=None):
@@ -69,12 +69,11 @@ def _algo_analyze(stock_code: str, stock_name: str, tool_results: dict, call_too
         "factors": factors, "analysis": analysis, "status": "ok",
     }
 
-def backtest_analysis(stock_code: str, _output: str = "markdown") -> str:
+def backtest_analysis(stock_code: str) -> Dict[str, Any]:
     """一站式回测：自动列出用户策略 → 逐个跑回测 → 返回最佳策略评分。等价于 list_strategies + run_backtest。
 
     Args:
         stock_code: 股票代码，如 "600066"
-        _output: "markdown"(默认) | "json"
     """
     stock_name = _lookup_stock_name(stock_code)
     results = {}
@@ -85,8 +84,7 @@ def backtest_analysis(stock_code: str, _output: str = "markdown") -> str:
         if name == "run_backtest": return _run_backtest(**kwargs)
         raise ValueError(f"Unknown tool: {name}")
 
-    _r = _algo_analyze(stock_code, stock_name, results, call_tool_fn=call_tool_fn)
-    return _r.get("analysis", str(_r)) if _output == "markdown" else json.dumps(_r, ensure_ascii=False)
+    return _algo_analyze(stock_code, stock_name, results, call_tool_fn=call_tool_fn)
 
 
     main()

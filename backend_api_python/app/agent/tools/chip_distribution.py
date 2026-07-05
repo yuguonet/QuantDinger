@@ -292,7 +292,7 @@ def _format_chip_markdown(r: Dict[str, Any]) -> str:
     return '\n'.join(lines)
 
 
-def get_chip_distribution(codes: str, lookback_days: int = 120, _output: str = "markdown") -> Dict[str, Any]:
+def get_chip_distribution(codes: str, lookback_days: int = 120) -> Dict[str, Any]:
     """筹码分布：返回获利比例、平均成本、90%筹码集中度、套牢/获利盘比例。
 
     从日K线计算筹码分布，不依赖数据源原生接口。
@@ -300,9 +300,8 @@ def get_chip_distribution(codes: str, lookback_days: int = 120, _output: str = "
     用指数衰减加权（近期筹码权重更高），汇总计算各维度指标。
 
     Args:
-        codes: 多股用逗号分隔"（也兼容 search_stock 返回的 dict）
+        codes: 多股用逗号分隔（也兼容 search_stock 返回的 dict）
         lookback_days: 回看天数，默认120天
-        _output: "markdown" (默认) | "json"
     """
     # 兼容 search_stock 返回的 dict: {'results': [{'code': '600593', ...}], ...}
     if isinstance(codes, dict):
@@ -329,10 +328,7 @@ def get_chip_distribution(codes: str, lookback_days: int = 120, _output: str = "
             return {"error": str(e)}
 
     if len(code_list) == 1:
-        r = _one(code_list[0])
-        if "error" in r:
-            return f"筹码分析失败: {r['error']}" if _output == "markdown" else r
-        return _format_chip_markdown(r) if _output == "markdown" else r
+        return _one(code_list[0])
 
     results = {}
     for code in code_list:
@@ -340,25 +336,4 @@ def get_chip_distribution(codes: str, lookback_days: int = 120, _output: str = "
             results[code] = _one(code)
         except Exception as e:
             results[code] = {"error": str(e)}
-
-    if _output == "markdown":
-        rows = ["代码\t现价\t平均成本\t获利盘\t70%集中度\t70%区间\t90%集中度\t90区间\t支撑\t压力"]
-        for code, r in results.items():
-            if "error" in r:
-                rows.append(f"{code}\t分析失败: {r['error']}")
-            else:
-                rows.append(
-                    f"{r.get('stock_code','')}"
-                    f"\t{r.get('current_price',0)}"
-                    f"\t{r.get('avg_cost',0)}"
-                    f"\t{r.get('profit_ratio_pct','')}"
-                    f"\t{r.get('concentration_70','')}({r.get('concentration_70_width_pct','')})"
-                    f"\t{r.get('concentration_70_lower',0)}~{r.get('concentration_70_upper',0)}"
-                    f"\t{r.get('concentration_90','')}({r.get('concentration_90_width_pct','')})"
-                    f"\t{r.get('concentration_90_lower',0)}~{r.get('concentration_90_upper',0)}"
-                    f"\t{','.join(str(s) for s in r.get('support_prices',[]))}"
-                    f"\t{','.join(str(s) for s in r.get('resistance_prices',[]))}"
-                )
-        return '\n'.join(rows)
-
     return {"count": len(results), "data": results}

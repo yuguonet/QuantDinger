@@ -181,14 +181,13 @@ def _detect_chan_fractals(highs: List[float], lows: List[float],
 # Tool 函数
 # ═══════════════════════════════════════════════════════════════
 
-def analyze_chart_patterns(codes: str, _output: str = "markdown") -> Dict[str, Any]:
+def analyze_chart_patterns(codes: str) -> Dict[str, Any]:
     """图表形态识别：头肩顶/底、双顶/双底、三角形、旗形、楔形、矩形、杯柄等经典形态。
 
     基于枢轴点（局部极值）检测，分析多K线构成的结构性形态。
 
     Args:
         codes: 多股用逗号分隔
-        _output: "markdown" (默认) | "json"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
@@ -414,23 +413,7 @@ def analyze_chart_patterns(codes: str, _output: str = "markdown") -> Dict[str, A
             return {"error": str(e)}
 
     if len(code_list) == 1:
-        _r = _one(code_list[0])
-        if _output == "json":
-            return _r
-        if "error" in _r:
-            return f"形态分析失败: {_r['error']}"
-        code = _r.get("stock_code", "")
-        patterns = _r.get("patterns", [])
-        direction = _r.get("direction", "")
-        score = _r.get("pattern_score", 0)
-        signals = _r.get("signals", [])
-        if not patterns:
-            return f"{code} 无明显形态"
-        md = f"{code} {score}分 {direction}"
-        md += f"\n{' '.join(patterns[:5])}"
-        if signals:
-            md += f"\n{' '.join(signals[:3])}"
-        return md
+        return _one(code_list[0])
 
     results = {}
     for code in code_list:
@@ -438,24 +421,8 @@ def analyze_chart_patterns(codes: str, _output: str = "markdown") -> Dict[str, A
             results[code] = _one(code)
         except Exception as e:
             results[code] = {"error": str(e)}
-
-    if _output == "markdown":
-        rows = ["代码\t评分\t方向\t形态"]
-        for code, r in results.items():
-            if "error" in r:
-                rows.append(f"{code}\t分析失败: {r['error']}")
-            else:
-                patterns = r.get("patterns", [])
-                rows.append(
-                    f"{r.get('stock_code','')}"
-                    f"\t{r.get('pattern_score',0)}"
-                    f"\t{r.get('direction','')}"
-                    f"\t{' '.join(patterns[:3])}"
-                )
-        return '\n'.join(rows)
-
     return {"count": len(results), "data": results}
-def get_obv_analysis(codes: str, _output: str = "markdown") -> Dict[str, Any]:
+def get_obv_analysis(codes: str) -> Dict[str, Any]:
     """OBV（能量潮）量价分析：返回 OBV 值、趋势、与价格的背离检测。
 
     OBV 是累计成交量指标，价格上涨日加上成交量，价格下跌日减去成交量。
@@ -463,7 +430,6 @@ def get_obv_analysis(codes: str, _output: str = "markdown") -> Dict[str, Any]:
 
     Args:
         codes: 多股用逗号分隔
-        _output: "markdown" (默认) | "json"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
@@ -510,21 +476,7 @@ def get_obv_analysis(codes: str, _output: str = "markdown") -> Dict[str, Any]:
             return {"error": str(e)}
 
     if len(code_list) == 1:
-        _r = _one(code_list[0])
-        if _output == "json":
-            return _r
-        if "error" in _r:
-            return f"OBV分析失败: {_r['error']}"
-        code = _r.get("stock_code", "")
-        obv_trend = _r.get("obv_trend", "")
-        obv_vs = _r.get("obv_vs_ma", "")
-        div = _r.get("divergence", "无")
-        assessment = _r.get("vol_price_assessment", "")
-        md = f"{code} OBV趋势:{obv_trend} {obv_vs}"
-        if div != "无":
-            md += f"\n{div}"
-        md += f"\n{assessment}"
-        return md
+        return _one(code_list[0])
 
     results = {}
     for code in code_list:
@@ -532,18 +484,4 @@ def get_obv_analysis(codes: str, _output: str = "markdown") -> Dict[str, Any]:
             results[code] = _one(code)
         except Exception as e:
             results[code] = {"error": str(e)}
-
-    if _output == "markdown":
-        rows = ["代码\tOBV趋势\t量价评估"]
-        for code, r in results.items():
-            if "error" in r:
-                rows.append(f"{code}\t分析失败: {r['error']}")
-            else:
-                rows.append(
-                    f"{r.get('stock_code','')}"
-                    f"\t{r.get('obv_trend','')}"
-                    f"\t{r.get('vol_price_assessment','')}"
-                )
-        return '\n'.join(rows)
-
     return {"count": len(results), "data": results}

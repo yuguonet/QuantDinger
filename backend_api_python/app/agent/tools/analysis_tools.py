@@ -701,14 +701,13 @@ def _detect_resonance(
 # Tool 函数（注册给 Agent 调用）
 # ═══════════════════════════════════════════════════════════════
 
-def analyze_trend(codes: str, _output: str = "markdown") -> Dict[str, Any]:
+def analyze_trend(codes: str) -> Dict[str, Any]:
     """技术趋势综合分析：趋势类(MA/MACD/BOLL) + 动量类(RSI/KDJ) + 量能类(OBV/MFI/CMF) + 波动率(ATR/HV)。
 
     包含多指标共振检测、背离检测、均线收敛度、乖离率极值等高级信号。
 
     Args:
         codes: 多股用逗号分隔
-        _output: "markdown" (默认) | "json"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
@@ -1109,25 +1108,7 @@ def analyze_trend(codes: str, _output: str = "markdown") -> Dict[str, Any]:
             return {"error": str(e)}
 
     if len(code_list) == 1:
-        _r = _one(code_list[0])
-        if _output == "json":
-            return _r
-        if "error" in _r:
-            return f"趋势分析失败: {_r['error']}"
-        macd = _r.get("macd", {})
-        rsi = _r.get("rsi", {})
-        kdj = _r.get("kdj", {})
-        boll = _r.get("boll", {})
-        obv = _r.get("obv", {})
-        resonance = _r.get("resonance", {})
-        signals = _r.get("all_signals", [])[:3]
-        md = f"{_r.get('stock_code','')} {_r.get('latest_close',0)} {_r.get('change_pct',0):+.2f}% {_r.get('trend','')} {_r.get('trend_score',0)}分 {_r.get('strength','')} {_r.get('ma_alignment','')}"
-        md += f"\nMACD柱:{macd.get('bar_trend','')} RSI(6):{rsi.get('rsi6',0):.0f} KDJ-K:{kdj.get('k',0):.0f} 布林位:{boll.get('position_pct',0):.0f}% OBV:{obv.get('obv_trend','')}"
-        if resonance.get("type"):
-            md += f" 共振:{resonance['type']}"
-        if signals:
-            md += f"\n{' '.join(signals)}"
-        return md
+        return _one(code_list[0])
 
     results = {}
     for code in code_list:
@@ -1135,41 +1116,13 @@ def analyze_trend(codes: str, _output: str = "markdown") -> Dict[str, Any]:
             results[code] = _one(code)
         except Exception as e:
             results[code] = {"error": str(e)}
-
-    if _output == "markdown":
-        rows = ["代码\t现价\t涨跌\t趋势\t评分\t均线\tMACD柱\tRSI(6)\tKDJ-K\t布林位\tOBV"]
-        for code, r in results.items():
-            if "error" in r:
-                rows.append(f"{code}\t分析失败: {r['error']}")
-            else:
-                macd = r.get("macd", {})
-                rsi = r.get("rsi", {})
-                kdj = r.get("kdj", {})
-                boll = r.get("boll", {})
-                obv = r.get("obv", {})
-                rows.append(
-                    f"{r.get('stock_code','')}"
-                    f"\t{r.get('latest_close',0)}"
-                    f"\t{r.get('change_pct',0):+.2f}%"
-                    f"\t{r.get('trend','')}"
-                    f"\t{r.get('trend_score',0)}"
-                    f"\t{r.get('ma_alignment','')}"
-                    f"\t{macd.get('bar_trend','')}"
-                    f"\t{rsi.get('rsi6',0):.0f}"
-                    f"\t{kdj.get('k',0):.0f}"
-                    f"\t{boll.get('position_pct',0):.0f}%"
-                    f"\t{obv.get('obv_trend','')}"
-                )
-        return '\n'.join(rows)
-
     return {"count": len(results), "data": results}
-def calculate_ma(codes: str, periods: str = "5,10,20,60,120", _output: str = "markdown") -> str:
+def calculate_ma(codes: str, periods: str = "5,10,20,60,120") -> Dict[str, Any]:
     """均线指标：返回指定周期(5/10/20/60/120/250)的MA值、斜率和趋势方向。
 
     Args:
-        codes: 多股用逗号分隔"
+        codes: 多股用逗号分隔
         periods: 均线周期列表，默认 [5,10,20,60,120,250]
-        _output: "markdown" (默认) | "json"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
@@ -1203,14 +1156,7 @@ def calculate_ma(codes: str, periods: str = "5,10,20,60,120", _output: str = "ma
             return {"error": str(e)}
 
     if len(code_list) == 1:
-        _r = _one(code_list[0])
-        if _output == "json":
-            return _json.dumps(_r, ensure_ascii=False)
-        if "error" in _r:
-            return f"均线获取失败: {_r['error']}"
-        code = _r.get("stock_code", "")
-        parts = [f"均线{k[2:]}:{v:.2f}" for k, v in _r.items() if k.startswith("ma") and not k.endswith("_slope") and not k.endswith("_trend")]
-        return f"{code} {' '.join(parts)}"
+        return _one(code_list[0])
 
     results = {}
     for code in code_list:
@@ -1218,26 +1164,12 @@ def calculate_ma(codes: str, periods: str = "5,10,20,60,120", _output: str = "ma
             results[code] = _one(code)
         except Exception as e:
             results[code] = {"error": str(e)}
-
-    if _output == "markdown":
-        period_list = [int(p) for p in periods.split(",") if p.strip().isdigit()]
-        header = "代码" + "\t".join(f"\t均线{p}" for p in period_list)
-        rows = [header]
-        for code, r in results.items():
-            if "error" in r:
-                rows.append(f"{code}\t获取失败: {r['error']}")
-            else:
-                vals = "\t".join(str(r.get(f"ma{p}", "-")) for p in period_list)
-                rows.append(f"{r.get('stock_code','')}\t{vals}")
-        return '\n'.join(rows)
-
     return {"count": len(results), "data": results}
-def get_volume_analysis(codes: str, _output: str = "markdown") -> Dict[str, Any]:
+def get_volume_analysis(codes: str) -> Dict[str, Any]:
     """量能分析：返回量比、换手率、近5日成交量趋势（放量/缩量/平量）。
 
     Args:
-        codes: 多股用逗号分隔"
-        _output: "markdown" (默认) | "json"
+        codes: 多股用逗号分隔
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
@@ -1338,21 +1270,7 @@ def get_volume_analysis(codes: str, _output: str = "markdown") -> Dict[str, Any]
             return {"error": str(e)}
 
     if len(code_list) == 1:
-        _r = _one(code_list[0])
-        if _output == "json":
-            return _r
-        if "error" in _r:
-            return f"量能分析失败: {_r['error']}"
-        code = _r.get("stock_code", "")
-        vol = _r.get("latest_volume", 0)
-        ratio = _r.get("volume_ratio", 0)
-        status = _r.get("volume_status", "")
-        trend = _r.get("volume_trend", "")
-        vp = _r.get("vol_price_relation", "")
-        vol_str = f"{vol/10000:.0f}万" if vol > 10000 else str(int(vol))
-        if _r.get("is_intraday"):
-            return f"{code} 盘中量:{vol_str} 量比:{ratio} {status} {trend}\n{vp}"
-        return f"{code} 量:{vol_str} 量比:{ratio} {status} {trend}\n{vp}"
+        return _one(code_list[0])
 
     # 批量预取盘中量比（一次 HTTP）
     from datetime import datetime as _dt
@@ -1400,31 +1318,12 @@ def get_volume_analysis(codes: str, _output: str = "markdown") -> Dict[str, Any]
     for code in code_list:
         results[code] = _one_with_vr(code)
 
-    if _output == "markdown":
-        rows = ["代码\t成交量\t量比\t状态\t趋势\t量价关系"]
-        for code, r in results.items():
-            if "error" in r:
-                rows.append(f"{code}\t分析失败: {r['error']}")
-            else:
-                vol = r.get('latest_volume', 0)
-                vol_str = f"{vol/10000:.0f}万" if vol > 10000 else str(int(vol))
-                rows.append(
-                    f"{r.get('stock_code','')}"
-                    f"\t{vol_str}"
-                    f"\t{r.get('volume_ratio',0)}"
-                    f"\t{r.get('volume_status','')}"
-                    f"\t{r.get('volume_trend','')}"
-                    f"\t{r.get('vol_price_relation','')}"
-                )
-        return '\n'.join(rows)
-
     return {"count": len(results), "data": results}
-def analyze_pattern(codes: str, _output: str = "markdown") -> Dict[str, Any]:
+def analyze_pattern(codes: str) -> Dict[str, Any]:
     """K线形态识别：返回当日出现的形态信号（锤子线/十字星/吞没/三连阳等）及含义。
 
     Args:
-        codes: 多股用逗号分隔"
-        _output: "markdown" (默认) | "json"
+        codes: 多股用逗号分隔
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
@@ -1621,17 +1520,7 @@ def analyze_pattern(codes: str, _output: str = "markdown") -> Dict[str, Any]:
             return {"error": str(e)}
 
     if len(code_list) == 1:
-        _r = _one(code_list[0])
-        if _output == "json":
-            return _r
-        if "error" in _r:
-            return f"形态分析失败: {_r['error']}"
-        code = _r.get("stock_code", "")
-        patterns = _r.get("patterns", [])
-        if not patterns:
-            return f"{code} 无明显形态"
-        # patterns 是字符串列表，如 ["锤子线（底部反转信号）", "十字星（犹豫信号）"]
-        return f"{code} {' '.join(patterns[:5])}"
+        return _one(code_list[0])
 
     results = {}
     for code in code_list:
@@ -1639,26 +1528,14 @@ def analyze_pattern(codes: str, _output: str = "markdown") -> Dict[str, Any]:
             results[code] = _one(code)
         except Exception as e:
             results[code] = {"error": str(e)}
-
-    if _output == "markdown":
-        rows = ["代码\t形态"]
-        for code, r in results.items():
-            if "error" in r:
-                rows.append(f"{code}\t分析失败: {r['error']}")
-            else:
-                patterns = r.get("patterns", [])
-                rows.append(f"{r.get('stock_code','')}\t{' '.join(patterns[:5])}")
-        return '\n'.join(rows)
-
     return {"count": len(results), "data": results}
 # get_chip_distribution 已迁移至 chip_distribution.py
 from app.agent.tools.chip_distribution import get_chip_distribution  # noqa: F401
-def get_indicator_snapshot(codes: str, _output: str = "markdown") -> Dict[str, Any]:
+def get_indicator_snapshot(codes: str) -> Dict[str, Any]:
     """指标快照：一次返回MACD/RSI/BOLL/KDJ/KD的最新数值和金叉/死叉/超买超卖状态。
 
     Args:
-        codes: 多股用逗号分隔"
-        _output: "markdown" (默认) | "json"
+        codes: 多股用逗号分隔
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
@@ -1711,22 +1588,7 @@ def get_indicator_snapshot(codes: str, _output: str = "markdown") -> Dict[str, A
             return {"error": str(e)}
 
     if len(code_list) == 1:
-        _r = _one(code_list[0])
-        if _output == "json":
-            return _r
-        if "error" in _r:
-            return f"指标获取失败: {_r['error']}"
-        code = _r.get("stock_code", "")
-        close = _r.get("latest_close", 0)
-        ma5 = _r.get("ma5", 0)
-        ma10 = _r.get("ma10", 0)
-        ma20 = _r.get("ma20", 0)
-        vol_ratio = _r.get("volume_ratio", 0)
-        macd = _r.get("macd", {})
-        rsi = _r.get("rsi", {})
-        kdj = _r.get("kdj", {})
-        boll = _r.get("boll", {})
-        return f"{code} {close} 均线:{ma5:.2f}/{ma10:.2f}/{ma20:.2f} 量比:{vol_ratio}\nMACD柱:{macd.get('bar_trend','')} RSI(6):{rsi.get('rsi6',0):.0f} KDJ-K:{kdj.get('k',0):.0f} 布林位:{boll.get('position_pct',0):.0f}%"
+        return _one(code_list[0])
 
     # 批量预取盘中量比（一次 HTTP）
     from datetime import datetime as _dt2
@@ -1745,28 +1607,6 @@ def get_indicator_snapshot(codes: str, _output: str = "markdown") -> Dict[str, A
             results[code] = r
         except Exception as e:
             results[code] = {"error": str(e)}
-
-    if _output == "markdown":
-        rows = ["代码\t现价\t均线5\t均线10\t均线20\t量比\tMACD柱\tRSI(6)\tKDJ-K"]
-        for code, r in results.items():
-            if "error" in r:
-                rows.append(f"{code}\t获取失败: {r['error']}")
-            else:
-                macd = r.get("macd", {})
-                rsi = r.get("rsi", {})
-                kdj = r.get("kdj", {})
-                rows.append(
-                    f"{r.get('stock_code','')}"
-                    f"\t{r.get('latest_close',0)}"
-                    f"\t{r.get('ma5',0):.2f}"
-                    f"\t{r.get('ma10',0):.2f}"
-                    f"\t{r.get('ma20',0):.2f}"
-                    f"\t{r.get('volume_ratio',0)}"
-                    f"\t{macd.get('bar_trend','')}"
-                    f"\t{rsi.get('rsi6',0):.0f}"
-                    f"\t{kdj.get('k',0):.0f}"
-                )
-        return '\n'.join(rows)
 
     return {"count": len(results), "data": results}
 # ── OpenAI tool declarations ─────────────────────────────────

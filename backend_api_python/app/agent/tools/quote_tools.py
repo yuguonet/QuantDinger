@@ -11,7 +11,7 @@ def _strip_prefix(s):
 
 from app.agent.log import logger
 from typing import Any, Dict, List
-from app.agent.utils.md_format import _batch_execute, _format_output, _to_md
+from app.agent.utils.md_format import _batch_execute, _to_md
 _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 
 # ══════════════════════════════════════════════════════════════
@@ -100,18 +100,17 @@ def _tencent_quote_raw(codes: list) -> dict:
 # 五档盘口
 # ══════════════════════════════════════════════════════════════
 
-def get_order_book(codes: str, _output: str = "markdown") -> str:
+def get_order_book(codes: str) -> dict:
     """五档盘口：返回买卖各5档价格和挂单量、涨跌幅、换手率、PE、市值等。
 
     Args:
-        codes: 多股用逗号分隔"
-        _output: "markdown"(默认) | "json"
+        codes: 多股用逗号分隔
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
 
-    def _one(stock_code: str, _output: str = "markdown") -> str:
+    def _one(stock_code: str) -> dict:
         code = _strip_prefix(stock_code)
         try:
             from app.market_cn.tape import get_order_book as _get_order_book
@@ -128,14 +127,13 @@ def get_order_book(codes: str, _output: str = "markdown") -> str:
 # 指数/ETF行情
 # ══════════════════════════════════════════════════════════════
 
-def get_index_etf_quote(codes: str, _output: str = "markdown") -> str:
+def get_index_etf_quote(codes: str) -> dict:
     """指数/ETF行情：返回价格、涨跌幅、成交量，支持上证/深证/创业板/沪深300及对应ETF。
 
     Args:
         codes: 逗号分隔的代码，如 "000001,000300,399006,510050"
                指数：000001(上证) 399001(深证) 000300(沪深300) 399006(创业板)
                ETF：510050(上证50) 510300(沪深300) 159919(沪深300) 512880(证券)
-        _output: "markdown"(默认) | "json"
     """
     code_list = [_strip_prefix(c.strip()) for c in codes.split(",") if c.strip()]
     if not code_list:
@@ -162,7 +160,7 @@ def get_index_etf_quote(codes: str, _output: str = "markdown") -> str:
             else:
                 results.append({"code": code, "error": "未获取到数据"})
         _r = {"total": len(results), "quotes": results}
-        return _format_output(_r, _output)
+        return _r
     except Exception as e:
         logger.warning("get_index_etf_quote(%s) failed: %s", codes, e)
         return {"error": str(e)}
@@ -170,12 +168,11 @@ def get_index_etf_quote(codes: str, _output: str = "markdown") -> str:
 # 批量估值对比
 # ══════════════════════════════════════════════════════════════
 
-def batch_valuation_compare(stock_codes: str, _output: str = "markdown") -> str:
+def batch_valuation_compare(stock_codes: str) -> dict:
     """估值对比：返回多只股票的PE/PB/市值/营收并排对比表。
 
     Args:
         stock_codes: 逗号分隔的股票代码，如 "600519,000858,688017"
-        _output: "markdown"(默认) | "json"
     """
     code_list = [_strip_prefix(c.strip()) for c in stock_codes.split(",") if c.strip()]
     if not code_list:
@@ -208,13 +205,10 @@ def batch_valuation_compare(stock_codes: str, _output: str = "markdown") -> str:
 
         _r = {
             "total": len(results),
-            "total": len(results),
             "stocks": results,
-            "stocks": results,
-            "pe_sorted": [r["code"] for r in valid],
             "pe_sorted": [r["code"] for r in valid],
         }
-        return _format_output(_r, _output)
+        return _r
     except Exception as e:
         logger.warning("batch_valuation_compare(%s) failed: %s", stock_codes, e)
         return {"error": str(e)}

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """多空研究员 — 同时构建多头和空头论据，综合判断方向。"""
 from typing import Any, Dict, List
-def bull_bear_research(stock_code: str, stock_name: str = "", _output: str = "markdown") -> str:
+def bull_bear_research(stock_code: str, stock_name: str = "") -> dict:
     """多空研究：对单只股票做技术面+筹码+情报综合分析，返回多空评分和方向判断。
 
     Args:
@@ -10,7 +10,6 @@ def bull_bear_research(stock_code: str, stock_name: str = "", _output: str = "ma
 
     Returns:
         {
-            
             "score": float,          # 0-100 综合评分
             "direction": str,        # bullish / bearish / neutral
             "confidence": float,     # 0.0-1.0
@@ -22,7 +21,6 @@ def bull_bear_research(stock_code: str, stock_name: str = "", _output: str = "ma
             "verdict": str,          # 综合判断
             "status": "ok",
         }
-        _output: "markdown" (默认) | "json"
     """
         
     # ── 获取数据 ──
@@ -173,7 +171,7 @@ def bull_bear_research(stock_code: str, stock_name: str = "", _output: str = "ma
             "data": data,
         },
     }
-    return analysis if _output == "markdown" else _r
+    return _r
 # ── 内联自 analysis_tools.py ──
 
 def _analyze_trend(codes: str) -> Dict[str, Any]:
@@ -590,7 +588,7 @@ def _analyze_pattern(codes: str) -> Dict[str, Any]:
 def _get_chip_distribution(codes: str, lookback_days: int = 120) -> Dict[str, Any]:
     """筹码分布分析 — 委托给 chip_distribution.get_chip_distribution。"""
     from app.agent.tools.chip_distribution import get_chip_distribution
-    return get_chip_distribution(codes, lookback_days=lookback_days, _output="json")
+    return get_chip_distribution(codes, lookback_days=lookback_days)
 
 def _get_indicator_snapshot(codes: str) -> Dict[str, Any]:
     """单次获取多个技术指标快照（MACD、RSI、BOLL、KDJ等）。

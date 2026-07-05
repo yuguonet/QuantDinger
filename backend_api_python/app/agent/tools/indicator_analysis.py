@@ -5,7 +5,7 @@ from app.agent.log import logger
 from typing import Any, Dict, List, Optional
 
 from app.agent.tools.indicator_tools import run_indicator_signal
-def indicator_analysis(stock_code: str, stock_name: str = "", user_id: int = 1, _output: str = "markdown") -> str:
+def indicator_analysis(stock_code: str, stock_name: str = "", user_id: int = 1) -> dict:
     """指标策略批量分析：对多只股票执行用户自定义指标策略，返回每只股票的最新信号(buy/sell)和评分。
 
     Args:
@@ -22,7 +22,6 @@ def indicator_analysis(stock_code: str, stock_name: str = "", user_id: int = 1, 
 
     Returns:
         标准化 SkillReport dict
-        _output: "markdown" (默认) | "json"
     """
     user_id = (context or {}).get("user_id", 1)
 
@@ -172,7 +171,7 @@ def indicator_analysis(stock_code: str, stock_name: str = "", user_id: int = 1, 
             "no_signal": [e["name"] for e in no_signal],
         },
     }
-    return analysis if _output == "markdown" else _r
+    return _r
 # ═══════════════════════════════════════════════════════════════
 # 单指标评估
 # ═══════════════════════════════════════════════════════════════
