@@ -6,13 +6,11 @@ Chart pattern recognition — 经典图表形态 + 缠论 + OBV 量价分析。
 纯 Python 计算，无外部依赖。
 """
 from __future__ import annotations
-from app.agent.utils.md_format import _to_md, _batch_execute
 
 from app.agent.log import logger
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.agent.tools.analysis_tools import (
-    _detect_market,
+from app.agent.tools._analysis_utils import (
     _fetch_ohlcv,
     _safe_round,
     _calc_obv,
@@ -183,20 +181,20 @@ def _detect_chan_fractals(highs: List[float], lows: List[float],
 # Tool 函数
 # ═══════════════════════════════════════════════════════════════
 
-def analyze_chart_patterns(codes: str, _output: str = "markdown") -> str:
+def analyze_chart_patterns(codes: str, _output: str = "markdown") -> Dict[str, Any]:
     """图表形态识别：头肩顶/底、双顶/双底、三角形、旗形、楔形、矩形、杯柄等经典形态。
 
     基于枢轴点（局部极值）检测，分析多K线构成的结构性形态。
 
     Args:
         codes: 多股用逗号分隔
-        _output: "markdown"(默认) | "json"
+        _output: "markdown" (默认) | "json"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
 
-    def _one(stock_code: str, _output: str = "markdown") -> str:
+    def _one(stock_code: str) -> Dict[str, Any]:
         try:
             data = _fetch_ohlcv(stock_code, 120)
             closes, highs, lows = data["close"], data["high"], data["low"]
@@ -415,8 +413,49 @@ def analyze_chart_patterns(codes: str, _output: str = "markdown") -> str:
             logger.error("analyze_chart_patterns(%s) failed: %s", stock_code, e)
             return {"error": str(e)}
 
-    return _batch_execute(_one, code_list)
-def get_obv_analysis(codes: str, _output: str = "markdown") -> str:
+    if len(code_list) == 1:
+        _r = _one(code_list[0])
+        if _output == "json":
+            return _r
+        if "error" in _r:
+            return f"形态分析失败: {_r['error']}"
+        code = _r.get("stock_code", "")
+        patterns = _r.get("patterns", [])
+        direction = _r.get("direction", "")
+        score = _r.get("pattern_score", 0)
+        signals = _r.get("signals", [])
+        if not patterns:
+            return f"{code} 无明显形态"
+        md = f"{code} {score}分 {direction}"
+        md += f"\n{' '.join(patterns[:5])}"
+        if signals:
+            md += f"\n{' '.join(signals[:3])}"
+        return md
+
+    results = {}
+    for code in code_list:
+        try:
+            results[code] = _one(code)
+        except Exception as e:
+            results[code] = {"error": str(e)}
+
+    if _output == "markdown":
+        rows = ["代码\t评分\t方向\t形态"]
+        for code, r in results.items():
+            if "error" in r:
+                rows.append(f"{code}\t分析失败: {r['error']}")
+            else:
+                patterns = r.get("patterns", [])
+                rows.append(
+                    f"{r.get('stock_code','')}"
+                    f"\t{r.get('pattern_score',0)}"
+                    f"\t{r.get('direction','')}"
+                    f"\t{' '.join(patterns[:3])}"
+                )
+        return '\n'.join(rows)
+
+    return {"count": len(results), "data": results}
+def get_obv_analysis(codes: str, _output: str = "markdown") -> Dict[str, Any]:
     """OBV（能量潮）量价分析：返回 OBV 值、趋势、与价格的背离检测。
 
     OBV 是累计成交量指标，价格上涨日加上成交量，价格下跌日减去成交量。
@@ -424,13 +463,13 @@ def get_obv_analysis(codes: str, _output: str = "markdown") -> str:
 
     Args:
         codes: 多股用逗号分隔
-        _output: "markdown"(默认) | "json"
+        _output: "markdown" (默认) | "json"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
 
-    def _one(stock_code: str, _output: str = "markdown") -> str:
+    def _one(stock_code: str) -> Dict[str, Any]:
         try:
             data = _fetch_ohlcv(stock_code, 120)
             closes = data["close"]
@@ -470,4 +509,41 @@ def get_obv_analysis(codes: str, _output: str = "markdown") -> str:
             logger.error("get_obv_analysis(%s) failed: %s", stock_code, e)
             return {"error": str(e)}
 
-    return _batch_execute(_one, code_list)
+    if len(code_list) == 1:
+        _r = _one(code_list[0])
+        if _output == "json":
+            return _r
+        if "error" in _r:
+            return f"OBV分析失败: {_r['error']}"
+        code = _r.get("stock_code", "")
+        obv_trend = _r.get("obv_trend", "")
+        obv_vs = _r.get("obv_vs_ma", "")
+        div = _r.get("divergence", "无")
+        assessment = _r.get("vol_price_assessment", "")
+        md = f"{code} OBV趋势:{obv_trend} {obv_vs}"
+        if div != "无":
+            md += f"\n{div}"
+        md += f"\n{assessment}"
+        return md
+
+    results = {}
+    for code in code_list:
+        try:
+            results[code] = _one(code)
+        except Exception as e:
+            results[code] = {"error": str(e)}
+
+    if _output == "markdown":
+        rows = ["代码\tOBV趋势\t量价评估"]
+        for code, r in results.items():
+            if "error" in r:
+                rows.append(f"{code}\t分析失败: {r['error']}")
+            else:
+                rows.append(
+                    f"{r.get('stock_code','')}"
+                    f"\t{r.get('obv_trend','')}"
+                    f"\t{r.get('vol_price_assessment','')}"
+                )
+        return '\n'.join(rows)
+
+    return {"count": len(results), "data": results}

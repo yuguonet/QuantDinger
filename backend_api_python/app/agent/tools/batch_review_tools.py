@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 from app.agent.log import logger
 from typing import Any, Dict, List, Optional
-from app.agent.utils.md_format import _format_output, _to_md
 
 # ── Tool functions ────────────────────────────────────────────
 
@@ -19,8 +18,7 @@ def review_stocks_with_indicator(
     indicator_id: int,
     user_id: int = 1,
     params: Optional[Dict[str, Any]] = None,
-    _output: str = "markdown",
-) -> str:
+) -> Dict[str, Any]:
     """批量审核：对多只股票运行同一指标策略，返回出现买入信号的股票列表。
 
     对每只股票拉取 K 线数据，沙箱执行指标代码，提取 buy/sell 信号。
@@ -35,11 +33,9 @@ def review_stocks_with_indicator(
     from app.services.indicator_params import IndicatorParamsParser
     from app.utils.safe_exec import build_safe_builtins, safe_exec_with_validation
     from app.services.kline import KlineService
-    from app.agent.utils import detect_market
 
     if not stock_codes:
-        _r = {"results": [], "count": 0, "message": "未提供股票代码"}
-        return _format_output(_r, _output)
+        return {"results": [], "count": 0, "message": "未提供股票代码"}
     stock_codes = [str(c).strip() for c in stock_codes if c]
     if not stock_codes:
         return {"results": [], "count": 0, "message": "未提供股票代码"}
@@ -78,9 +74,8 @@ def review_stocks_with_indicator(
     results = []
 
     for code in stock_codes:
-        market = detect_market(code)
         try:
-            klines = kline_svc.get_kline(market=market, symbol=code, timeframe="1D", limit=200)
+            klines = kline_svc.get_kline(market="CNStock", symbol=code, timeframe="1D", limit=200)
             if not klines or len(klines) < 10:
                 results.append({"code": code, "has_buy": False, "error": "K线数据不足"})
                 continue
@@ -162,12 +157,11 @@ def review_stocks_with_indicator(
         "buy_count": buy_count,
     }
 
-def list_user_selection_strategies(user_id: int = 1, _output: str = "markdown") -> str:
+def list_user_selection_strategies(user_id: int = 1) -> Dict[str, Any]:
     """收藏策略：返回用户收藏的选股策略列表及筛选条件。
 
     Args:
         user_id: 用户 ID
-        _output: "markdown"(默认) | "json"
     """
     from app.utils.db import get_db_connection
 
@@ -193,8 +187,7 @@ def list_user_selection_strategies(user_id: int = 1, _output: str = "markdown") 
                 pass
             strategies.append(d)
 
-        _r = {"strategies": strategies, "count": len(strategies)}
-        return _format_output(_r, _output)
+        return {"strategies": strategies, "count": len(strategies)}
     except Exception as e:
         logger.error("list_user_selection_strategies failed: %s", e)
         return {"strategies": [], "count": 0, "error": str(e)}

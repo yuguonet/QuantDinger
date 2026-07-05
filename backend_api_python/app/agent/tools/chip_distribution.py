@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-芯片分布（筹码分布）计算模块。
+筹码分布模块。
 
-用 K 线数据模拟筹码分布，不依赖外部 API。
+计算 + tool 包装自包含，不依赖 analysis_tools。
 算法：
   1. 每条 K 线的成交量按三角分布（峰值在 close）分配至 low~high 区间
   2. 时间指数衰减加权（近期权重更高）
@@ -11,22 +11,28 @@
 """
 from __future__ import annotations
 
-from app.agent.log import logger
 from typing import Any, Dict, List
-from app.agent.utils.md_format import _format_output, _to_md
-def calc_chip_distribution(
+
+from app.agent.log import logger
+from app.agent.tools._analysis_utils import _fetch_klines
+
+
+# ═══════════════════════════════════════════════════════════════
+# 筹码计算（纯函数，只做数学）
+# ═══════════════════════════════════════════════════════════════
+
+def _calc_chip_distribution(
     klines: List[Dict[str, Any]],
     stock_code: str = "",
     lookback_days: int = 120,
     num_buckets: int = 80,
-    _output: str = "markdown",
-) -> str:
+) -> Dict[str, Any]:
     """计算筹码分布。
 
     Args:
         klines: K 线列表，每项含 time/open/high/low/close/volume
         stock_code: 股票代码
-        lookback_days: 回看天数
+        lookback_days: 回看天数，截取最近 N 条 K 线
         num_buckets: 价格桶数量
 
     Returns:
@@ -42,12 +48,16 @@ def calc_chip_distribution(
             "concentration_90_width": 区间宽度百分比,
             "support_prices": [支撑位列表],
             "resistance_prices": [阻力位列表],
-            "chip_peaks": [筹码峰(price, ratio)],
+            "chip_peaks": [筹码峰(price, strength)],
             "total_volume_analyzed": 分析总成交量,
         }
     """
     if not klines:
         return {"error": "K线数据为空"}
+
+    # lookback_days 生效：截取最近 N 条
+    if lookback_days > 0 and len(klines) > lookback_days:
+        klines = klines[-lookback_days:]
 
     # 提取 OHLCV
     closes = [float(k.get("close", 0)) for k in klines]
@@ -84,15 +94,23 @@ def calc_chip_distribution(
         decay = 0.98 ** age
 
         # 三角分布：峰值在 close，两端在 low/high
-        # 计算每个离散价格步长的权重，然后分配到桶
+        # 左右半宽分别计算，避免 close 偏向一侧时权重失真
+        left_half = cl - lo
+        right_half = hi - cl
+        if left_half < 0.001:
+            left_half = 0.001
+        if right_half < 0.001:
+            right_half = 0.001
+
         steps = max(int((hi - lo) / bucket_width) + 1, 10)
         total_weight = 0.0
         weights = []
         for j in range(steps + 1):
             p = lo + (hi - lo) * j / steps
-            # 三角分布：到 close 越近权重越高
-            half_range = max(hi - cl, cl - lo, 0.001)
-            dist = abs(p - cl) / half_range
+            if p <= cl:
+                dist = (cl - p) / left_half
+            else:
+                dist = (p - cl) / right_half
             w = max(1.0 - dist, 0.0)
             weights.append((p, w))
             total_weight += w
@@ -100,11 +118,11 @@ def calc_chip_distribution(
         if total_weight <= 0:
             continue
 
-        # 按桶累积
+        # 按桶累积（clamp 索引防越界）
         for p, w in weights:
             idx = int((p - price_min) / bucket_width)
-            if 0 <= idx < buckets:
-                chip_density[idx] += (vol * decay * w / total_weight)
+            idx = max(0, min(idx, buckets - 1))
+            chip_density[idx] += (vol * decay * w / total_weight)
 
     if max(chip_density) <= 0:
         return {"error": "筹码计算无有效数据"}
@@ -112,7 +130,6 @@ def calc_chip_distribution(
     # ── 计算总量和累积比例 ──
     total_chips = sum(chip_density)
 
-    # 累积比例
     cum_ratio = []
     acc = 0.0
     for d in chip_density:
@@ -142,11 +159,34 @@ def calc_chip_distribution(
     c90_width = (c90_upper - c90_lower) / avg_cost if avg_cost > 0 else 0
 
     if c90_width < 0.15:
-        concentration = "高"
+        concentration_90 = "高"
     elif c90_width < 0.35:
-        concentration = "中"
+        concentration_90 = "中"
     else:
-        concentration = "低"
+        concentration_90 = "低"
+
+    # ── 70% 集中区间（剔除两端各 15%） ──
+    c70_lower_idx = 0
+    c70_upper_idx = buckets - 1
+    for i in range(buckets):
+        if cum_ratio[i] >= 0.15:
+            c70_lower_idx = i
+            break
+    for i in range(buckets - 1, -1, -1):
+        if cum_ratio[i] <= 0.85:
+            c70_upper_idx = i
+            break
+
+    c70_lower = prices[c70_lower_idx]
+    c70_upper = prices[c70_upper_idx]
+    c70_width = (c70_upper - c70_lower) / avg_cost if avg_cost > 0 else 0
+
+    if c70_width < 0.08:
+        concentration_70 = "高"
+    elif c70_width < 0.20:
+        concentration_70 = "中"
+    else:
+        concentration_70 = "低"
 
     # ── 获利/亏损比例 ──
     profit_ratio = 0.0
@@ -159,7 +199,7 @@ def calc_chip_distribution(
     # ── 筹码峰检测（局部最大值） ──
     peaks = []
     density_sum = sum(chip_density)
-    peak_threshold = max(chip_density) * 0.4  # 至少主峰 40%
+    peak_threshold = max(chip_density) * 0.15  # 降至 15%，捕获次级峰
 
     for i in range(1, buckets - 1):
         if (chip_density[i] > chip_density[i - 1] and
@@ -173,7 +213,7 @@ def calc_chip_distribution(
 
     peaks.sort(key=lambda x: x["strength"], reverse=True)
 
-    # ── 支撑/阻力位：筹码峰最密集的价格区间 ──
+    # ── 支撑/阻力位 ──
     sorted_peaks = sorted(peaks, key=lambda x: x["strength"], reverse=True)
     support_prices = []
     resistance_prices = []
@@ -183,11 +223,10 @@ def calc_chip_distribution(
         elif p["price"] > current_price:
             resistance_prices.append(p["price"])
 
-    # 只保留前 3
     support_prices = sorted(support_prices, reverse=True)[:3]
     resistance_prices = sorted(resistance_prices)[:3]
 
-    _r = {
+    return {
         "stock_code": stock_code,
         "avg_cost": round(avg_cost, 2),
         "current_price": round(current_price, 2),
@@ -195,14 +234,131 @@ def calc_chip_distribution(
         "loss_ratio": round(loss_ratio, 4),
         "profit_ratio_pct": f"{round(profit_ratio * 100, 1)}%",
         "loss_ratio_pct": f"{round(loss_ratio * 100, 1)}%",
-        "concentration_90": concentration,
+        "concentration_90": concentration_90,
         "concentration_90_lower": round(c90_lower, 2),
         "concentration_90_upper": round(c90_upper, 2),
         "concentration_90_width_pct": f"{round(c90_width * 100, 1)}%",
+        "concentration_70": concentration_70,
+        "concentration_70_lower": round(c70_lower, 2),
+        "concentration_70_upper": round(c70_upper, 2),
+        "concentration_70_width_pct": f"{round(c70_width * 100, 1)}%",
         "support_prices": support_prices,
         "resistance_prices": resistance_prices,
         "chip_peaks": peaks[:5],
         "total_volume_analyzed": round(total_chips, 0),
         "analyzed_days": n,
     }
-    return _format_output(_r, _output)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Tool 包装（Agent 调用入口）
+# ═══════════════════════════════════════════════════════════════
+
+def _format_chip_markdown(r: Dict[str, Any]) -> str:
+    """将筹码分布结果格式化为中文 markdown。"""
+    code = r.get("stock_code", "")
+    avg_cost = r.get("avg_cost", 0)
+    price = r.get("current_price", 0)
+    profit_pct = r.get("profit_ratio_pct", "")
+    loss_pct = r.get("loss_ratio_pct", "")
+    conc90 = r.get("concentration_90", "")
+    conc90_width = r.get("concentration_90_width_pct", "")
+    conc90_lower = r.get("concentration_90_lower", 0)
+    conc90_upper = r.get("concentration_90_upper", 0)
+    conc70 = r.get("concentration_70", "")
+    conc70_width = r.get("concentration_70_width_pct", "")
+    conc70_lower = r.get("concentration_70_lower", 0)
+    conc70_upper = r.get("concentration_70_upper", 0)
+    supports = r.get("support_prices", [])
+    resistances = r.get("resistance_prices", [])
+    peaks = r.get("chip_peaks", [])
+    days = r.get("analyzed_days", 0)
+
+    lines = [f"### {code} 筹码分布"]
+    lines.append(f"- **平均成本**: {avg_cost}  **现价**: {price}")
+    lines.append(f"- **获利盘**: {profit_pct}  **套牢盘**: {loss_pct}")
+    lines.append(f"- **70%筹码集中度**: {conc70}（{conc70_width}，区间 {conc70_lower}~{conc70_upper}）")
+    lines.append(f"- **90%筹码集中度**: {conc90}（{conc90_width}，区间 {conc90_lower}~{conc90_upper}）")
+
+    if supports:
+        lines.append(f"- **支撑位**: {', '.join(str(s) for s in supports)}")
+    if resistances:
+        lines.append(f"- **压力位**: {', '.join(str(s) for s in resistances)}")
+    if peaks:
+        peak_str = ', '.join(f"{p['price']}({p['strength']:.1%})" for p in peaks)
+        lines.append(f"- **筹码峰**: {peak_str}")
+
+    lines.append(f"\n> 分析 {days} 根K线")
+    return '\n'.join(lines)
+
+
+def get_chip_distribution(codes: str, lookback_days: int = 120, _output: str = "markdown") -> Dict[str, Any]:
+    """筹码分布：返回获利比例、平均成本、90%筹码集中度、套牢/获利盘比例。
+
+    从日K线计算筹码分布，不依赖数据源原生接口。
+    算法：按日K线的 high/low 区间分配成交量到价格档位，
+    用指数衰减加权（近期筹码权重更高），汇总计算各维度指标。
+
+    Args:
+        codes: 多股用逗号分隔"（也兼容 search_stock 返回的 dict）
+        lookback_days: 回看天数，默认120天
+        _output: "markdown" (默认) | "json"
+    """
+    # 兼容 search_stock 返回的 dict: {'results': [{'code': '600593', ...}], ...}
+    if isinstance(codes, dict):
+        results = codes.get("results", [])
+        if results:
+            codes = results[0].get("code", "")
+        else:
+            return {"error": "codes dict 中无 results", "retriable": False}
+
+    code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
+    if not code_list:
+        return {"error": "codes 不能为空", "retriable": False}
+
+    def _one(stock_code: str) -> Dict[str, Any]:
+        stock_code = str(stock_code).strip()
+        if not stock_code:
+            return {"error": "stock_code 为空", "retriable": False}
+
+        try:
+            klines = _fetch_klines(stock_code, lookback_days)
+            return _calc_chip_distribution(klines, stock_code=stock_code, lookback_days=lookback_days)
+        except Exception as e:
+            logger.error("get_chip_distribution(%s) failed: %s", stock_code, e, exc_info=True)
+            return {"error": str(e)}
+
+    if len(code_list) == 1:
+        r = _one(code_list[0])
+        if "error" in r:
+            return f"筹码分析失败: {r['error']}" if _output == "markdown" else r
+        return _format_chip_markdown(r) if _output == "markdown" else r
+
+    results = {}
+    for code in code_list:
+        try:
+            results[code] = _one(code)
+        except Exception as e:
+            results[code] = {"error": str(e)}
+
+    if _output == "markdown":
+        rows = ["代码\t现价\t平均成本\t获利盘\t70%集中度\t70%区间\t90%集中度\t90区间\t支撑\t压力"]
+        for code, r in results.items():
+            if "error" in r:
+                rows.append(f"{code}\t分析失败: {r['error']}")
+            else:
+                rows.append(
+                    f"{r.get('stock_code','')}"
+                    f"\t{r.get('current_price',0)}"
+                    f"\t{r.get('avg_cost',0)}"
+                    f"\t{r.get('profit_ratio_pct','')}"
+                    f"\t{r.get('concentration_70','')}({r.get('concentration_70_width_pct','')})"
+                    f"\t{r.get('concentration_70_lower',0)}~{r.get('concentration_70_upper',0)}"
+                    f"\t{r.get('concentration_90','')}({r.get('concentration_90_width_pct','')})"
+                    f"\t{r.get('concentration_90_lower',0)}~{r.get('concentration_90_upper',0)}"
+                    f"\t{','.join(str(s) for s in r.get('support_prices',[]))}"
+                    f"\t{','.join(str(s) for s in r.get('resistance_prices',[]))}"
+                )
+        return '\n'.join(rows)
+
+    return {"count": len(results), "data": results}

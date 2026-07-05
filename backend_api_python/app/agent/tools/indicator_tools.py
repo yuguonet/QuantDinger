@@ -10,16 +10,14 @@ from __future__ import annotations
 import json
 from app.agent.log import logger
 from typing import Any, Dict, List, Optional
-from app.agent.utils.md_format import _format_output, _to_md
 
 # ── Tool functions ────────────────────────────────────────────
 
-def list_indicators(user_id: int = 1, _output: str = "markdown") -> str:
+def list_indicators(user_id: int = 1) -> Dict[str, Any]:
     """指标策略列表：返回用户所有指标策略的ID、名称、描述、是否已购买。
 
     Args:
         user_id: 用户 ID，默认 1
-        _output: "markdown"(默认) | "json"
     """
     from app.utils.db import get_db_connection
 
@@ -52,7 +50,7 @@ def list_indicators(user_id: int = 1, _output: str = "markdown") -> str:
         logger.error("list_indicators failed: %s", e, exc_info=True)
         return {"indicators": [], "count": 0, "error": str(e)}
 
-def get_indicator_params(indicator_id: int, user_id: int = 1, _output: str = "markdown") -> str:
+def get_indicator_params(indicator_id: int, user_id: int = 1) -> Dict[str, Any]:
     """指标参数：返回指定指标策略的可配置参数列表及默认值。
 
     解析指标代码中的 # @param 注释，返回参数名称、类型、默认值。
@@ -60,7 +58,6 @@ def get_indicator_params(indicator_id: int, user_id: int = 1, _output: str = "ma
     Args:
         indicator_id: 指标 ID
         user_id: 用户 ID，默认 1
-        _output: "markdown"(默认) | "json"
     """
     from app.utils.db import get_db_connection
     from app.services.indicator_params import IndicatorParamsParser
@@ -100,8 +97,7 @@ def run_indicator_signal(
     days: int = 60,
     user_id: int = 1,
     params: Optional[Dict[str, Any]] = None,
-    _output: str = "markdown",
-) -> str:
+) -> Dict[str, Any]:
     """执行指标策略：对单只股票运行指定指标，返回最新信号(buy/sell)、评分、指标数值。
 
     Args:
@@ -118,7 +114,6 @@ def run_indicator_signal(
     from app.services.indicator_params import IndicatorParamsParser
     from app.utils.safe_exec import build_safe_builtins, safe_exec_with_validation
     from app.services.kline import KlineService
-    from app.agent.utils import detect_market
 
     days = min(max(days, 10), 500)
 
@@ -144,10 +139,9 @@ def run_indicator_signal(
         return {"success": False, "error": "指标代码为空"}
 
     # 2. 获取 K 线
-    market = detect_market(stock_code)
     try:
         kline_svc = KlineService()
-        klines = kline_svc.get_kline(market=market, symbol=stock_code, timeframe=timeframe, limit=days)
+        klines = kline_svc.get_kline(market="CNStock", symbol=stock_code, timeframe=timeframe, limit=days)
         if not klines or len(klines) < 10:
             return {"success": False, "error": f"{stock_code} K线数据不足（{len(klines) if klines else 0}条）"}
     except Exception as e:
@@ -273,7 +267,7 @@ def run_indicator_signal(
     else:
         signal_status = "无信号"
 
-    _r = {
+    return {
         "success": True,
         "stock_code": stock_code,
         "indicator_id": indicator_id,
@@ -287,11 +281,10 @@ def run_indicator_signal(
         "plots": plots_summary,
         "signals": signals_summary,
         "data_points": len(executed_df),
-        "last5_buy": last5_buy,
+        "last5_buy": last5_buy,     # [今天, 昨天, 前天, 大前天, 5天前]
         "last5_sell": last5_sell,
-        "last5_close": last5_close,
+        "last5_close": last5_close,  # 对应收盘价
     }
-    return _format_output(_r, _output)
 
 # ── OpenAI tool declarations ─────────────────────────────────
 

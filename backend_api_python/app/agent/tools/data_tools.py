@@ -10,15 +10,7 @@ from app.agent.log import logger
 from typing import Any, Dict, List, Optional
 
 from app.agent.cache import cache
-from app.agent.utils.md_format import _to_tsv
-def _get_ds(market: str = "CNStock"):
-    from app.data_sources.factory import DataSourceFactory
-    return DataSourceFactory.get_source(market)
-
-# ── detect_market: 延迟导入，避免 agent sandbox 执行时模块级 import 失败 ──
-def _detect_market(code: str) -> str:
-    from app.data_sources.market_detector import detect_market
-    return detect_market(code)
+from app.agent.tools._analysis_utils import _get_ds
 
 # ── Tool functions ────────────────────────────────────────────
 
@@ -62,142 +54,174 @@ def _resolve_stock(keyword: str, market: str = "CNStock", limit: int = 10) -> Di
 # 向后兼容别名
 search_stock_by_name = _resolve_stock
 
-def get_realtime_quote(codes: str, _output: str = "tsv") -> Any:
+def get_realtime_quote(codes: str, _output: str = "markdown") -> Dict[str, Any]:
     """实时行情：价格、涨跌幅、成交量、换手率、量比、PE、PB、总市值等。
 
     Args:
-        codes: 多股用逗号分隔
-        _output: "tsv"(默认,tab分隔文本) | "json"
+        codes: 多股用逗号分隔"
+        _output: "markdown" (默认) | "json"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
 
-    def _one(stock_code: str) -> Dict[str, Any]:
-        market = _detect_market(stock_code) or "CNStock"
-        ds = _get_ds(market)
-        try:
-            result = ds.get_ticker(stock_code)
-            if isinstance(result, dict) and "error" not in result:
-                return {"stock_code": stock_code, "market": market, **result}
-            return result if isinstance(result, dict) else {"error": "Unexpected result type"}
-        except NotImplementedError:
-            return {"error": f"数据源 {market} 不支持 get_ticker", "retriable": False}
-        except Exception as e:
-            logger.error("get_realtime_quote(%s) failed: %s", stock_code, e)
-            return {"error": str(e)}
+    ds = _get_ds("CNStock")
+
+    # 批量接口：一次 coordinate_tickers 拉全部
+    try:
+        tickers = ds.get_tickers(code_list)
+    except Exception as e:
+        logger.error("get_realtime_quote batch failed: %s", e)
+        tickers = []
+
+    # 按 symbol 索引
+    ticker_map: Dict[str, Dict] = {}
+    for t in tickers:
+        sym = t.get("symbol", "")
+        if sym:
+            ticker_map[sym] = t
+
+    results: Dict[str, Any] = {}
+    for code in code_list:
+        t = ticker_map.get(code)
+        if t:
+            results[code] = {"stock_code": code, "market": "CNStock", **t}
+        else:
+            results[code] = {"error": "未获取到行情", "stock_code": code}
+
+    if _output == "json":
+        if len(code_list) == 1:
+            return results[code_list[0]]
+        return {"count": len(results), "data": results}
+
+    def _fmt(t: Dict) -> str:
+        price = t.get("last") or t.get("close") or t.get("price") or 0
+        chg = t.get("change_pct", 0)
+        vol = t.get("volume", 0)
+        name = t.get("name", "")
+        code = t.get("stock_code", t.get("symbol", ""))
+        vol_str = f"{vol/10000:.0f}万" if vol and vol > 10000 else (str(int(vol)) if vol else "-")
+        chg_str = f"{chg:+.2f}%" if isinstance(chg, (int, float)) else str(chg)
+        return f"{code} {name} {price} {chg_str} 量:{vol_str}"
 
     if len(code_list) == 1:
-        r = _one(code_list[0])
-        if _output == "tsv":
-            return _to_tsv([r]) if not r.get("error") else json.dumps(r, ensure_ascii=False)
-        return r
+        r = results[code_list[0]]
+        if "error" in r:
+            return f"行情获取失败: {r['error']}"
+        return _fmt(r)
 
-    # ── 按市场分组，每组一次批量拉取 ──
-    from collections import defaultdict
-    by_market: Dict[str, List[str]] = defaultdict(list)
-    for code in code_list:
-        by_market[_detect_market(code) or "CNStock"].append(code)
+    # 多股 TSV
+    rows = ["代码\t名称\t现价\t涨跌\t成交量"]
+    for code, r in results.items():
+        if "error" in r:
+            rows.append(f"{code}\t获取失败")
+        else:
+            price = r.get("last") or r.get("close") or r.get("price") or 0
+            chg = r.get("change_pct", 0)
+            vol = r.get("volume", 0)
+            vol_str = f"{vol/10000:.0f}万" if vol and vol > 10000 else (str(int(vol)) if vol else "-")
+            chg_str = f"{chg:+.2f}%" if isinstance(chg, (int, float)) else str(chg)
+            rows.append(f"{code}\t{r.get('name','')}\t{price}\t{chg_str}\t{vol_str}")
+    return '\n'.join(rows)
 
-    results: Dict[str, Dict[str, Any]] = {}
-    for market, group in by_market.items():
-        try:
-            ds = _get_ds(market)
-            batch_fn = getattr(ds, "get_tickers", None)
-            if batch_fn is not None:
-                quotes = batch_fn(group)
-                req = set(group)
-                for q in quotes if isinstance(quotes, list) else []:
-                    sym = q.get("symbol", "")
-                    if sym and sym in req:
-                        results[sym] = {"stock_code": sym, "market": market, **q}
-                        req.discard(sym)
-                # 批量未覆盖的 → 逐只补查
-                for code in req:
-                    results[code] = _one(code)
-            else:
-                for code in group:
-                    results[code] = _one(code)
-        except Exception as e:
-            logger.warning("get_realtime_quote 批量(%s)失败: %s, 逐只回退", market, e)
-            for code in group:
-                try:
-                    results[code] = _one(code)
-                except Exception as e2:
-                    results[code] = {"error": str(e2)}
-    if _output == "tsv":
-        rows = [v for v in results.values() if not v.get("error")]
-        return _to_tsv(rows)
-    return {"count": len(results), "data": results}
+def agent_get_kline(codes: str, timeframe: str = "1D", days: int = 30, _output: str = "markdown") -> Dict[str, Any]:
+    """K线数据：返回OHLCV，支持 A 股。
 
-def agent_get_kline(codes: str, timeframe: str = "1D", days: int = 60, market: str = "", _output: str = "tsv") -> Any:
-    """K线数据：返回 date/open/high/low/close/volume 数组，支持 A股/港股, 数据量大,适合单独分析。
+    ⚠️ 仅在需要原始数据或自定义计算时调用。趋势/指标/形态/量价/筹码分析已内置K线获取，不要重复调用。
 
     Args:
         codes: 多股用逗号分隔
-        timeframe: K线周期，可选值: 1m, 5m, 15m, 30m, 1H, 4H, 1D, 1W。默认 1D（日线）
-        days: 获取天数，默认60天，最大250天（仅对日线及以上周期有意义）
-        market: 市场类型，可选值: CNStock, HKStock。
-                留空则自动推断（A股6位数字→CNStock, HK前缀→HKStock, USDT结尾→Crypto 等）。
-        _output: "tsv"(默认,tab分隔文本) | "json"
+        timeframe: 1m/5m/15m/30m/1H/4H/1D/1W，默认1D
+        days: 天数，默认30，最大250
+        _output: "markdown" (默认) | "json"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
 
-    def _one(stock_code: str) -> Any:
-        valid_timeframes = {"1m", "5m", "15m", "30m", "1H", "4H", "1D", "1W"}
-        if timeframe not in valid_timeframes:
-            return []
-        _days = min(max(days, 1), 250)
-        if market:
-            from app.data_sources.factory import DataSourceFactory
-            _market = DataSourceFactory.normalize_market(market)
-        else:
-            _market = _detect_market(stock_code) or "CNStock"
-        ds = _get_ds(_market)
+    valid_timeframes = {"1m", "5m", "15m", "30m", "1H", "4H", "1D", "1W"}
+    if timeframe not in valid_timeframes:
+        return {"error": f"无效周期: {timeframe}，可选: {','.join(sorted(valid_timeframes))}"}
+    _days = min(max(days, 1), 250)
+
+    ds = _get_ds("CNStock")
+
+    def _fetch(stock_code: str) -> list:
         try:
-            klines = ds.get_kline(stock_code, timeframe, _days) or []
-            compact = []
-            for k in klines:
-                compact.append({
-                    "t": k.get("date", k.get("timestamp", "")),
-                    "o": round(k.get("open", 0), 2),
-                    "h": round(k.get("high", 0), 2),
-                    "l": round(k.get("low", 0), 2),
-                    "c": round(k.get("close", 0), 2),
-                    "v": k.get("volume", 0),
-                })
-            return compact
+            return ds.get_kline(stock_code, timeframe, _days) or []
         except Exception as e:
             logger.error("get_kline(%s, %s, %d) failed: %s", stock_code, timeframe, _days, e)
             return []
 
-    if len(code_list) == 1:
-        klines = _one(code_list[0])
-        if _output == "tsv":
-            if isinstance(klines, list) and klines:
-                return _to_tsv(klines)
-            return json.dumps(klines, ensure_ascii=False)
-        return klines
-
-    results = {}
-    for code in code_list:
+    def _ts_to_date(ts) -> str:
         try:
-            results[code] = _one(code)
-        except Exception as e:
-            results[code] = {"error": str(e)}
-    if _output == "tsv":
-        parts = []
-        for code, klines in results.items():
-            if isinstance(klines, list) and klines:
-                parts.append(f"# === {code} ===")
-                parts.append(_to_tsv(klines))
-            else:
-                parts.append(f"# === {code} ===")
-                parts.append(json.dumps(klines, ensure_ascii=False))
-        return "\n".join(parts)
-    return {"count": len(results), "data": results}
+            from datetime import datetime
+            return datetime.fromtimestamp(int(ts)).strftime("%m-%d")
+        except Exception:
+            return str(ts)
+
+    # ── json 模式：完整 OHLCV ──
+    if _output == "json":
+        results: Dict[str, Any] = {}
+        for code in code_list:
+            klines = _fetch(code)
+            results[code] = [{
+                "t": k.get("date") or _ts_to_date(k.get("time", 0)),
+                "o": round(k.get("open", 0), 2),
+                "h": round(k.get("high", 0), 2),
+                "l": round(k.get("low", 0), 2),
+                "c": round(k.get("close", 0), 2),
+                "v": k.get("volume", 0),
+            } for k in klines]
+        if len(code_list) == 1:
+            return results[code_list[0]]
+        return {"count": len(results), "data": results}
+
+    # ── markdown 模式：紧凑，只取最近 N 根 ──
+    MAX_SHOW = 10  # markdown 最多显示根数
+
+    def _fmt_one(code: str) -> str:
+        klines = _fetch(code)
+        if not klines:
+            return f"{code} 无数据"
+        tail = klines[-MAX_SHOW:]
+        rows = ["日期\t开\t高\t低\t收\t量"]
+        for k in tail:
+            vol = k.get("volume", 0)
+            vol_str = f"{vol/10000:.0f}万" if vol > 10000 else str(int(vol))
+            dt = k.get("date") or _ts_to_date(k.get("time", 0))
+            rows.append(
+                f"{dt}"
+                f"\t{round(k.get('open',0),2)}"
+                f"\t{round(k.get('high',0),2)}"
+                f"\t{round(k.get('low',0),2)}"
+                f"\t{round(k.get('close',0),2)}"
+                f"\t{vol_str}"
+            )
+        return '\n'.join(rows)
+
+    if len(code_list) == 1:
+        return _fmt_one(code_list[0])
+
+    # 多股：每只一行摘要
+    rows = ["代码\t最新收盘\t近5日涨跌\t成交量"]
+    for code in code_list:
+        klines = _fetch(code)
+        if not klines:
+            rows.append(f"{code}\t无数据")
+            continue
+        last = klines[-1]
+        close = round(last.get("close", 0), 2)
+        vol = last.get("volume", 0)
+        vol_str = f"{vol/10000:.0f}万" if vol > 10000 else str(int(vol))
+        # 近5日涨跌
+        if len(klines) >= 6:
+            chg5 = (close - round(klines[-6].get("close", close), 2)) / round(klines[-6].get("close", close), 2) * 100
+            chg_str = f"{chg5:+.2f}%"
+        else:
+            chg_str = "-"
+        rows.append(f"{code}\t{close}\t{chg_str}\t{vol_str}")
+    return '\n'.join(rows)
 # ── 核心字段集（Agent 日常分析最常用的 ~15 个字段） ──────────────────────
 _STOCK_INFO_CORE_FIELDS = {
     "stock_code", "name", "industry", "concepts",
@@ -217,7 +241,7 @@ def _filter_stock_info(info: Dict[str, Any], detail: bool = False) -> Dict[str, 
         return {k: v for k, v in info.items() if v is not None}
     return {k: v for k, v in info.items() if v is not None and k in _STOCK_INFO_CORE_FIELDS}
 
-def get_stock_info(codes: str, detail: bool = False, _output: str = "tsv") -> Any:
+def get_stock_info(codes: str, detail: bool = False) -> Dict[str, Any]:
     """股票基本信息（精简模式，节省 token）。
 
     默认返回核心字段：名称、行业、价格、PE/PB、市值、ROE、EPS、股本等。
@@ -227,7 +251,6 @@ def get_stock_info(codes: str, detail: bool = False, _output: str = "tsv") -> An
     Args:
         codes: 多股用逗号分隔
         detail: false=精简（默认），true=完整（50+字段）
-        _output: "tsv"(默认,tab分隔文本) | "json"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
@@ -241,8 +264,7 @@ def get_stock_info(codes: str, detail: bool = False, _output: str = "tsv") -> An
             return _hit
 
     def _one(stock_code: str) -> Dict[str, Any]:
-        market = _detect_market(stock_code) or "CNStock"
-        ds = _get_ds(market)
+        ds = _get_ds("CNStock")
         result: Dict[str, Any] = {}
 
         # 1) 尝试数据源原生 get_stock_info
@@ -253,7 +275,8 @@ def get_stock_info(codes: str, detail: bool = False, _output: str = "tsv") -> An
                     result = info
                 elif isinstance(info, str):
                     try:
-                        parsed = json.loads(info)
+                        import json as _json
+                        parsed = _json.loads(info)
                         if isinstance(parsed, dict):
                             result = parsed
                         else:
@@ -353,8 +376,6 @@ def get_stock_info(codes: str, detail: bool = False, _output: str = "tsv") -> An
         result = _filter_stock_info(_one(code_list[0]), detail)
         if not detail and not result.get("error"):
             cache.set(_ck, result, ttl=60)
-        if _output == "tsv":
-            return _to_tsv([result]) if not result.get("error") else json.dumps(result, ensure_ascii=False)
         return result
 
     results = {}
@@ -363,11 +384,8 @@ def get_stock_info(codes: str, detail: bool = False, _output: str = "tsv") -> An
             results[code] = _filter_stock_info(_one(code), detail)
         except Exception as e:
             results[code] = {"error": str(e)}
+    final = {"count": len(results), "data": results}
     if not detail:
-        final = {"count": len(results), "data": results}
         cache.set(_ck, final, ttl=60)
-    if _output == "tsv":
-        rows = [v for v in results.values() if not v.get("error")]
-        return _to_tsv(rows)
-    return {"count": len(results), "data": results}
+    return final
 

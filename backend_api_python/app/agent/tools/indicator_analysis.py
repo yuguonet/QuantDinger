@@ -2,16 +2,15 @@
 """用户指标策略分析 — 沙箱执行+信号衰减+冲突检测+历史胜率加权。"""
 
 from app.agent.log import logger
-import json
 from typing import Any, Dict, List, Optional
-from app.agent.utils.md_format import _format_final_md
 
 from app.agent.tools.indicator_tools import run_indicator_signal
-def indicator_analysis(stock_code: str, user_id: int = 1, _output: str = "markdown") -> str:
+def indicator_analysis(stock_code: str, stock_name: str = "", user_id: int = 1, _output: str = "markdown") -> str:
     """指标策略批量分析：对多只股票执行用户自定义指标策略，返回每只股票的最新信号(buy/sell)和评分。
 
     Args:
         stock_code: 股票代码，如 "600066"
+        stock_name: 股票名称，可选
         user_id: 用户 ID，默认 1
 
     流程：
@@ -23,7 +22,7 @@ def indicator_analysis(stock_code: str, user_id: int = 1, _output: str = "markdo
 
     Returns:
         标准化 SkillReport dict
-        _output: "markdown"(默认) | "json"
+        _output: "markdown" (默认) | "json"
     """
     user_id = (context or {}).get("user_id", 1)
 
@@ -147,14 +146,15 @@ def indicator_analysis(stock_code: str, user_id: int = 1, _output: str = "markdo
     decayed = [e for e in active_buy + active_sell if e.get("decay", 1.0) < 1.0]
     decay_info = f"，{len(decayed)}个信号有衰减" if decayed else ""
 
+    dir_map = {"bullish": "看多", "bearish": "看空", "neutral": "中性"}
+    md = f"指标分析 {final_score:.0f}分 {dir_map.get(direction, direction)}"
+    if factors:
+        md += "\n" + " ".join(f"{f['name']}:{f['score']}" for f in factors[:4])
     signals = signal.split(" | ") if signal and signal != "无近期信号" else []
-    extra = [f"买{len(active_buy)} 卖{len(active_sell)} 胜率{avg_win_rate:.0%}"]
-    if decayed:
-        extra.append(f"{len(decayed)}个信号有衰减")
-    analysis = _format_final_md(
-        title="指标分析", score=final_score, direction=direction,
-        factors=factors, signals=signals, extra=extra,
-    )
+    if signals:
+        md += "\n" + " ".join(signals[:3])
+    md += f"\n买{len(active_buy)} 卖{len(active_sell)} 胜率{avg_win_rate:.0%}"
+    analysis = md
 
     _r = {
         "score": round(final_score),
@@ -172,7 +172,7 @@ def indicator_analysis(stock_code: str, user_id: int = 1, _output: str = "markdo
             "no_signal": [e["name"] for e in no_signal],
         },
     }
-    return analysis if _output == "markdown" else json.dumps(_r, ensure_ascii=False)
+    return analysis if _output == "markdown" else _r
 # ═══════════════════════════════════════════════════════════════
 # 单指标评估
 # ═══════════════════════════════════════════════════════════════
@@ -180,9 +180,7 @@ def indicator_analysis(stock_code: str, user_id: int = 1, _output: str = "markdo
 def _evaluate_indicator(indicator_id: int, stock_code: str, user_id: int) -> Optional[Dict[str, Any]]:
     """对单个指标执行沙箱分析 + 回测，返回评估结果。"""
     from app.services.indicator_analyzer import analyze_indicator
-    from app.agent.utils import detect_market
-    
-    market = detect_market(stock_code)
+    market = "CNStock"
 
     # analyze_indicator：沙箱执行 + 信号统计 + 轻量回测
     result = analyze_indicator(
