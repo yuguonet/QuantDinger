@@ -6,7 +6,7 @@
   user input
     -> plan: LLM 判断需要哪些工具
     -> 无工具 → AgentBase.chat()（RAG + Memory + LLM）
-    -> 有工具 → RAG + Memory + smolagents CodeAgent（筛选后的工具）
+    -> 有工具 → RAG + Memory + react_engine CodeAgent（筛选后的工具）
     -> response
 """
 from __future__ import annotations
@@ -26,7 +26,7 @@ from agents.base import AgentBase, AgentResponse
 from llm.base import ChatMessage, LLMBase
 from memory.base import MemoryBase
 from rag.retriever import Retriever
-from smolagents import Tool as SmolToolBase
+from react_engine import Tool as SmolToolBase
 from tools.registry import ToolRegistry
 from tools.base import Tool
 from utils.json_parser import safe_parse_json
@@ -50,11 +50,11 @@ def _load_plan_template() -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  smolagents 适配层
+#  react_engine 适配层
 # ═══════════════════════════════════════════════════════════════
 
 class _LLMAdapter:
-    """把 Agent Template 的 LLMBase 包装为 smolagents Model 接口。"""
+    """把 Agent Template 的 LLMBase 包装为 react_engine Model 接口。"""
 
     def __init__(self, llm: LLMBase):
         self._llm = llm
@@ -68,8 +68,8 @@ class _LLMAdapter:
         tools_to_call_from: list | None = None,
         **kwargs,
     ):
-        """smolagents 调用入口 → 转发到 LLMBase.generate()。"""
-        from smolagents.models import ChatMessage as SmolChatMessage
+        """react_engine 调用入口 → 转发到 LLMBase.generate()。"""
+        from react_engine import ChatMessage as SmolChatMessage
 
         chat_messages = []
         for m in messages:
@@ -80,7 +80,7 @@ class _LLMAdapter:
                 content = getattr(m, "content", "")
             chat_messages.append(ChatMessage(role=role, content=content))
 
-        # smolagents 通过 prompt 传递工具描述，不走 function calling
+        # react_engine 通过 prompt 传递工具描述，不走 function calling
         try:
             resp = asyncio.run(self._llm.generate(chat_messages))
         except Exception as e:
@@ -104,6 +104,7 @@ class _SmolTool(SmolToolBase):
     skip_forward_signature_validation = True
 
     def __init__(self, wrapped: Tool):
+        super().__init__()
         self._wrapped = wrapped
         self.name = wrapped.name
         self.description = wrapped.description
@@ -116,9 +117,8 @@ class _SmolTool(SmolToolBase):
             entry = {
                 "type": pdef.get("type", "string"),
                 "description": pdef.get("description", ""),
+                "nullable": pname not in required,
             }
-            if pname not in required:
-                entry["nullable"] = True
             self.inputs[pname] = entry
 
     def forward(self, **kwargs) -> str:
@@ -141,6 +141,7 @@ class _SkillSectionTool(SmolToolBase):
     skip_forward_signature_validation = True
 
     def __init__(self, loader, skill_name: str):
+        super().__init__()
         self._loader = loader
         self._skill_name = skill_name
         self.name = f"read_skill_section"
@@ -183,6 +184,7 @@ class _SkillResourceTool(SmolToolBase):
     skip_forward_signature_validation = True
 
     def __init__(self, loader, skill_name: str):
+        super().__init__()
         self._loader = loader
         self._skill_name = skill_name
         self.name = f"read_skill_resource"
@@ -228,6 +230,7 @@ class _SkillFuncTool(SmolToolBase):
     skip_forward_signature_validation = True
 
     def __init__(self, func, module_path: str):
+        super().__init__()
         self._func = func
         self._module_path = module_path
         self.name = func.__name__
@@ -263,10 +266,10 @@ class _SkillFuncTool(SmolToolBase):
                     ptype = type_map.get(param.annotation, "string")
 
                 desc = param_docs.get(pname, "")
-                entry = {"type": ptype, "description": desc}
+                has_default = param.default != inspect.Parameter.empty
+                entry = {"type": ptype, "description": desc, "nullable": has_default}
 
-                if param.default != inspect.Parameter.empty:
-                    entry["nullable"] = True
+                if has_default:
                     param_parts.append(f"{pname}={param.default}")
                 else:
                     param_parts.append(pname)
@@ -320,7 +323,7 @@ def _load_skill_functions(skill_name: str) -> list:
 
 
 def _build_smol_tools(tool_registry: ToolRegistry, selected_names: List[str]) -> list:
-    """将选中的 Tool 实例转换为 smolagents 兼容工具列表。"""
+    """将选中的 Tool 实例转换为 react_engine 兼容工具列表。"""
     tools = []
     for name in selected_names:
         tool = tool_registry.get(name)
@@ -337,11 +340,11 @@ def _build_smol_tools(tool_registry: ToolRegistry, selected_names: List[str]) ->
 
 class TaskAgent(AgentBase):
     """
-    任务型 Agent — plan + smolagents CodeAgent
+    任务型 Agent — plan + react_engine CodeAgent
 
     1. plan 阶段：LLM 根据用户意图筛选需要的工具
     2. 无工具 → 委托 AgentBase.chat()（完整 RAG + Memory 链路）
-    3. 有工具 → RAG + Memory + smolagents CodeAgent 执行
+    3. 有工具 → RAG + Memory + react_engine CodeAgent 执行
     """
 
     def __init__(
@@ -557,11 +560,11 @@ class TaskAgent(AgentBase):
                     smol_tools.append(_SkillResourceTool(loader, sname))
             logger.info("[TaskAgent] 工具: %s", [t.name for t in smol_tools])
 
-            trace.record("smolagents_setup", {"tools": [t.name for t in smol_tools]})
+            trace.record("react_engine_setup", {"tools": [t.name for t in smol_tools]})
 
             # CodeAgent 执行
             model = _LLMAdapter(self.llm)
-            from smolagents import CodeAgent as SmolCodeAgent
+            from react_engine import CodeAgent as SmolCodeAgent
 
             agent = SmolCodeAgent(
                 tools=smol_tools,
@@ -577,7 +580,7 @@ class TaskAgent(AgentBase):
             react_elapsed = round(time.time() - react_start, 2)
 
             trace.record(
-                "smolagents_done",
+                "react_engine_done",
                 {"elapsed_seconds": react_elapsed, "result_preview": str(result)[:200]},
             )
 
