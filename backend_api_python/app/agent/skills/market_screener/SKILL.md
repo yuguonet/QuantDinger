@@ -20,7 +20,7 @@ tools:
 
 ## 执行流程（严格按此顺序，不可跳过）
 
-使用 `filter_candidates()` 和 `generate_report_markdown()` 两个注册好的辅助工具，**不要自己写筛选代码**。
+使用 `filter_candidates()` 辅助工具筛选，**不要自己写筛选代码**。输出结果由你自己生成，按 Phase 3 格式规则。
 
 ```python
 # step1: 获取候选
@@ -32,12 +32,11 @@ codes = filter_candidates(result)
 # step3: deep_analyze(codes=codes) — codes 是逗号分隔的字符串
 if codes:
     deep_result = deep_analyze(codes=codes)
-    result_md = generate_report_markdown(deep_result)
 else:
-    result_md = "当前无符合条件的股票"
+    deep_result = {"analyzed": [], "strategy": result.get("strategy", ""), "score": 0, "direction": "neutral"}
 
-# step4: final_answer 的 key 固定为 "markdown"
-final_answer({"markdown": result_md})
+# step4: 按 Phase 3 格式规则生成输出，用 final_answer 输出
+final_answer(你生成的markdown文本)
 ```
 
 ## Phase 1: 获取候选
@@ -125,7 +124,33 @@ result = pre_screen()
 
 ## Phase 3: 输出结果
 
-直接调用 `generate_report_markdown(deep_result)`，返回 markdown 文本。用 `final_answer({"markdown": ...})` 输出。不要自己写 markdown 生成代码。
+根据 `deep_result` 自己生成 markdown 输出，用 `final_answer(...)` 输出。
+
+### 格式规则
+
+1. **标题行**: `**{strategy}**`（策略名，如 post_market / intraday / eod）
+2. **评分行**: ` 综合评分: {score}/100`
+3. **方向行**: ` 方    向: {看多/看空/中性}`
+4. **空行**
+5. **表头**: `股票代码 股票名称 评分 方向 置信度 信号`
+6. **数据行**: 每只股票一行，空格分隔
+7. **置信度**: 0-1.0数值越高, 代表分析结果越可靠
+
+### 示例
+
+```
+**post_market**
+ 综合评分: 68.8/100
+ 方    向: 看多
+ 置 信 度: 0.85
+
+股票代码	股票名称	评分	方向	置信度	信号
+301199	迈赫股份	70.0	看多	0.85	突破前高, 放量5.2倍
+301379	天山电子	65.0	看多	0.85	突破前高, MA多头排列, 放量1.8倍
+300129	泰胜风能	70.0	看多	0.85	突破前高, 放量3.3倍
+```
+
+如果无符合条件的股票，输出: `当前无符合条件的股票`
 
 ## 参考资料
 

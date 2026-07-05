@@ -188,24 +188,22 @@ class SkillResult(dict):
         cnf = self.get("confidence", 0)
         sig = self.get("signal", "")
         strategy = self.get("strategy", "")
-        parts.append(
-            f"{strategy} {d} score:{s:.1f} conf:{cnf:.2f}"
-            + (f" sig:{sig}" if sig else "")
-        )
+        parts.append(f"**{strategy}**")
+        parts.append(f"  综合评分: {s:.1f}/100")
+        parts.append(f"  方向: {d}")
+        parts.append("")
 
         analyzed = self.get("analyzed", [])
         if analyzed:
-            parts.append(f"分析{len(analyzed)}只:")
-            rows = ["C#   Name    Score Dir     Signal"]
-            rows.append("---- ------ ----- ------- -------")
+            parts.append("股票代码\t股票名称\t评分\t方向\t置信度\t信号")
             for a in analyzed:
-                sig_short = (a.get("signal", "") or "")[:20]
-                rows.append(
-                    f"{a.get('code',''):6} {a.get('name',''):6} "
-                    f"{a.get('score',0):5.1f} {a.get('direction',''):7} "
-                    f"{sig_short}"
-                )
-            parts.append("\n".join(rows))
+                code = a.get("code", "")
+                name = a.get("name", "")
+                score = a.get("score", 0)
+                direction = a.get("direction", "")
+                confidence = a.get("confidence", "")
+                signal = (a.get("signal", "") or "")
+                parts.append(f"{code}\t{name}\t{score}\t{direction}\t{confidence}\t{signal}")
 
         return "\n".join(parts)
 

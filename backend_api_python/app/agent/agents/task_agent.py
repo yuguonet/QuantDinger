@@ -565,11 +565,21 @@ class TaskAgent(AgentBase):
             # CodeAgent 执行
             model = _LLMAdapter(self.llm)
             from react_engine import CodeAgent as SmolCodeAgent
+            from pathlib import Path
+            import yaml
+
+            # 加载 base YAML（英文原始模板）+ 合并自定义格式规则
+            _base_path = Path(__file__).resolve().parent.parent / "react_engine" / "prompts" / "code_agent.yaml"
+            _rule_path = Path(__file__).resolve().parent.parent / "prompts" / "format_rules.yaml"
+            prompt_templates = yaml.safe_load(_base_path.read_text(encoding="utf-8"))
+            format_rules = yaml.safe_load(_rule_path.read_text(encoding="utf-8"))
+            prompt_templates["system_prompt"] += "\n" + format_rules["system_prompt_suffix"]
 
             agent = SmolCodeAgent(
                 tools=smol_tools,
                 model=model,
                 max_steps=self.max_tool_rounds,
+                prompt_templates=prompt_templates,
             )
 
             logger.info("[TaskAgent] CodeAgent 执行: %s (工具: %s)",

@@ -18,7 +18,6 @@ from app.agent.log import logger
 from skills.market_screener._helpers import (
     select_strategy, analyze_batch, build_report, resolve_names,
     filter_candidates as _filter_candidates,
-    generate_report_markdown as _generate_report_markdown,
 )
 from skills.market_screener.common import SkillReport, SkillResult
 
@@ -137,16 +136,7 @@ def filter_candidates(prescreen_result: Dict) -> str:
     return _filter_candidates(prescreen_result)
 
 
-def generate_report_markdown(deep_result: Dict) -> str:
-    """从 deep_analyze 结果生成 markdown 报告字符串。
 
-    Args:
-        deep_result: deep_analyze() 的返回值
-
-    Returns:
-        markdown 格式的报告文本
-    """
-    return _generate_report_markdown(deep_result)
 
 
 def run() -> Dict[str, Any]:

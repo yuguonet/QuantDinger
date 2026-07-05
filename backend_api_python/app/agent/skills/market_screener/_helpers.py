@@ -179,29 +179,4 @@ def filter_candidates(prescreen_result: Dict) -> str:
     return codes
 
 
-def generate_report_markdown(deep_result: Dict) -> str:
-    """从 deep_analyze 结果生成 markdown 报告字符串。
 
-    Args:
-        deep_result: deep_analyze() 的返回值
-
-    Returns:
-        markdown 格式的报告文本
-    """
-    analyzed = deep_result.get("analyzed", []) if isinstance(deep_result, dict) else []
-    if not analyzed:
-        return "当前无符合条件的股票"
-
-    lines = [
-        f"**{deep_result.get('strategy', 'unknown')}** "
-        f"| 综合评分: {deep_result.get('score', 0)}/100 "
-        f"| 方向: {deep_result.get('direction', 'neutral')}"
-    ]
-    lines.append("")
-    for a in analyzed:
-        lines.append(
-            f"- `{a.get('code', '')} {a.get('name', '')}` "
-            f"评分{a.get('score', 0)} {a.get('direction', 'neutral')} "
-            f"— {a.get('signal', '')}"
-        )
-    return "\n".join(lines)
