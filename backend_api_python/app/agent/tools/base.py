@@ -37,8 +37,8 @@ class ToolResult:
         if isinstance(data, list) and data and all(isinstance(item, dict) for item in data):
             return _to_tsv(data)
 
-        # 嵌套结构 → 紧凑 JSON（无缩进空格）
-        return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+        # 嵌套结构 → 带缩进的 JSON（LLM 更容易阅读，避免 compact JSON 解析门槛）
+        return json.dumps(data, ensure_ascii=False, indent=2, default=str)
 
 
 def _is_nested(d: dict) -> bool:

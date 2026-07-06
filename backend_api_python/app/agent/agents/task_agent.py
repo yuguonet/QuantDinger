@@ -8,6 +8,13 @@
     -> 无工具 → AgentBase.chat()（RAG + Memory + LLM）
     -> 有工具 → RAG + Memory + smolagents CodeAgent（筛选后的工具）
     -> response
+
+MCP 模式（工具数量多时推荐）：
+  user input
+    -> MCP 连接 → 自动发现所有工具
+    -> RAG + Memory + smolagents CodeAgent（全部 MCP 工具）
+    -> response
+    工具 schema 不占上下文，500+ 工具无压力
 """
 from __future__ import annotations
 
@@ -33,6 +40,11 @@ from utils.json_parser import safe_parse_json
 from utils.tracing import AgentTraceRecorder, llm_response_to_dict
 
 logger = logging.getLogger(__name__)
+
+# ── MCP 配置 ──────────────────────────────────────────────────
+_MCP_ENABLED = os.getenv("AGENT_MCP_ENABLED", "false").lower() in ("1", "true", "yes")
+_MCP_SERVER_CMD = os.getenv("AGENT_MCP_SERVER_CMD", "python")
+_MCP_SERVER_ARGS = os.getenv("AGENT_MCP_SERVER_ARGS", "tools/mcp_bridge.py").split()
 
 # Plan 提示词模板
 _PLAN_TEMPLATE: str | None = None
@@ -334,6 +346,35 @@ def _build_smol_tools(tool_registry: ToolRegistry, selected_names: List[str]) ->
                 logger.warning("[TaskAgent] 包装 %s 失败: %s", name, e, exc_info=True)
     return tools
 
+
+# ═══════════════════════════════════════════════════════════════
+#  MCP 工具加载
+# ═══════════════════════════════════════════════════════════════
+
+def _load_mcp_tools() -> list:
+    """
+    连接 MCP 服务器，加载全部工具。
+    工具 schema 由 MCP server 在执行环境解析，不占 Agent 上下文。
+    """
+    try:
+        from smolagents import ToolCollection
+        from mcp import StdioServerParameters
+
+        server = StdioServerParameters(
+            command=_MCP_SERVER_CMD,
+            args=_MCP_SERVER_ARGS,
+        )
+
+        # ToolCollection.from_mcp 返回上下文管理器
+        # 这里需要持久连接，所以在 chat() 中用 with 管理
+        return server
+    except ImportError:
+        logger.warning("[TaskAgent] MCP 依赖未安装 (pip install mcp)")
+        return None
+    except Exception as e:
+        logger.warning("[TaskAgent] MCP 初始化失败: %s", e)
+        return None
+
 # ═══════════════════════════════════════════════════════════════
 #  TaskAgent
 # ═══════════════════════════════════════════════════════════════
@@ -469,12 +510,122 @@ class TaskAgent(AgentBase):
         session_id: str = "default",
         use_rag: bool = True,
     ) -> AgentResponse:
+        # MCP 模式：跳过 plan，直接用 MCP 工具
+        if _MCP_ENABLED:
+            return await self._chat_mcp(user_input, session_id, use_rag)
+        # 传统模式：plan + ToolRegistry
+        return await self._chat_plan(user_input, session_id, use_rag)
+
+    # ── MCP 模式 ────────────────────────────────────────────────
+
+    async def _chat_mcp(
+        self,
+        user_input: str,
+        session_id: str,
+        use_rag: bool,
+    ) -> AgentResponse:
+        """
+        MCP 模式：跳过 plan，MCP server 自动暴露工具。
+        工具 schema 在执行环境解析，不占 Agent 上下文。
+        适合工具数量多（50+）的场景。
+        """
+        start_time = time.time()
+        trace = AgentTraceRecorder(
+            agent_type=f"{type(self).__name__}(MCP)",
+            session_id=session_id,
+            user_input=user_input,
+            metadata={"mode": "mcp", "use_rag": use_rag},
+        )
+
+        try:
+            # RAG 检索
+            sources = []
+            context = ""
+            if use_rag and self.retriever:
+                docs = await self.retriever.retrieve(user_input)
+                if docs:
+                    context = Retriever.format_context(docs)
+                    sources = [{"content": d["content"][:200], "score": d.get("score", 0)} for d in docs]
+
+            task_parts = []
+            if context:
+                task_parts.append(f"【参考资料】\n{context}")
+            task_parts.append(f"【任务】\n{user_input}")
+            task = "\n\n".join(task_parts)
+
+            # 连接 MCP 服务器
+            from smolagents import ToolCollection, CodeAgent as SmolCodeAgent
+            from pathlib import Path
+            import yaml
+
+            mcp_server = _load_mcp_tools()
+            if not mcp_server:
+                logger.info("[TaskAgent] MCP 不可用，降级到传统模式")
+                return await self._chat_plan(user_input, session_id, use_rag)
+
+            model = _LLMAdapter(self.llm)
+
+            with ToolCollection.from_mcp(mcp_server) as mcp_tools:
+                tool_list = list(mcp_tools)
+                logger.info("[TaskAgent] MCP 加载 %d 个工具", len(tool_list))
+                trace.record("mcp_tools_loaded", {"count": len(tool_list)})
+
+                agent = SmolCodeAgent(
+                    tools=tool_list,
+                    model=model,
+                    max_steps=self.max_tool_rounds,
+                )
+
+                # 追加格式规则
+                _rule_path = Path(__file__).resolve().parent.parent / "prompts" / "format_rules.yaml"
+                format_rules = yaml.safe_load(_rule_path.read_text(encoding="utf-8"))
+                agent.prompt_templates["system_prompt"] += "\n" + format_rules["system_prompt_suffix"]
+
+                react_start = time.time()
+                result = agent.run(task)
+                react_elapsed = round(time.time() - react_start, 2)
+
+                trace.record("mcp_agent_done", {"elapsed_seconds": react_elapsed, "result_preview": str(result)[:200]})
+
+            result_raw = str(result)
+
+            # 保存对话历史
+            if self.memory:
+                await self.memory.add(session_id, "user", user_input)
+                try:
+                    full_messages = agent.write_memory_to_messages(summary_mode=True)
+                    steps_text = [m.content for m in full_messages if getattr(m, "role", "") == "assistant" and m.content]
+                    await self.memory.add(session_id, "assistant", "\n".join(steps_text) if steps_text else result_raw)
+                except Exception:
+                    await self.memory.add(session_id, "assistant", result_raw)
+
+            elapsed = round(time.time() - start_time, 2)
+            response = AgentResponse(
+                content=result_raw, sources=sources, session_id=session_id,
+                elapsed_seconds=elapsed, metadata={"trace_id": trace.trace_id, "mode": "mcp"},
+            )
+            trace.finish(response=response.to_dict())
+            return response
+
+        except Exception as e:
+            trace.fail(e)
+            raise
+
+    # ── 传统模式（plan + ToolRegistry）─────────────────────────
+
+    async def _chat_plan(
+        self,
+        user_input: str,
+        session_id: str,
+        use_rag: bool,
+    ) -> AgentResponse:
+        """传统模式：plan + ToolRegistry，适合工具数量少（<50）的场景。"""
         start_time = time.time()
         trace = AgentTraceRecorder(
             agent_type=type(self).__name__,
             session_id=session_id,
             user_input=user_input,
-            metadata={"use_rag": use_rag, "max_tool_rounds": self.max_tool_rounds},
+            metadata={"mode": "plan", "use_rag": use_rag, "max_tool_rounds": self.max_tool_rounds},
         )
 
         try:

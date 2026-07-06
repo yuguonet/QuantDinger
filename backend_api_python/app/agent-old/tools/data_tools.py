@@ -10,11 +10,18 @@ from app.agent.log import logger
 from typing import Any, Dict, List, Optional
 
 from app.agent.cache import cache
-from app.agent.tools._analysis_utils import _get_ds
+def _get_ds(market: str = "CNStock"):
+    from app.data_sources.factory import DataSourceFactory
+    return DataSourceFactory.get_source(market)
+
+# ── detect_market: 延迟导入，避免 agent sandbox 执行时模块级 import 失败 ──
+def _detect_market(code: str) -> str:
+    from app.data_sources.market_detector import detect_market
+    return detect_market(code)
 
 # ── Tool functions ────────────────────────────────────────────
 
-def resolve_stock(keyword: str, market: str = "CNStock", limit: int = 10) -> Dict[str, Any]:
+def _resolve_stock(keyword: str, market: str = "CNStock", limit: int = 10) -> Dict[str, Any]:
     """股票名称/代码双向解析。输入名称返回代码，输入代码返回名称，支持模糊搜索。
 
     ⚠️ 返回值是 dict，不是 list！用法：
@@ -51,96 +58,96 @@ def resolve_stock(keyword: str, market: str = "CNStock", limit: int = 10) -> Dic
         logger.error("_resolve_stock(%s) failed: %s", keyword, e)
         return {"keyword": keyword, "results": [], "count": 0, "error": str(e)}
 
+# 向后兼容别名
+search_stock_by_name = _resolve_stock
 
 def get_realtime_quote(codes: str) -> Dict[str, Any]:
     """实时行情：价格、涨跌幅、成交量、换手率、量比、PE、PB、总市值等。
 
     Args:
-        codes: 多股用逗号分隔
+        codes: 多股用逗号分隔"
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
 
-    ds = _get_ds("CNStock")
-
-    # 批量接口：一次 coordinate_tickers 拉全部
-    try:
-        tickers = ds.get_tickers(code_list)
-    except Exception as e:
-        logger.error("get_realtime_quote batch failed: %s", e)
-        tickers = []
-
-    # 按 symbol 索引
-    ticker_map: Dict[str, Dict] = {}
-    for t in tickers:
-        sym = t.get("symbol", "")
-        if sym:
-            ticker_map[sym] = t
-
-    results: Dict[str, Any] = {}
-    for code in code_list:
-        t = ticker_map.get(code)
-        if t:
-            results[code] = {"stock_code": code, "market": "CNStock", **t}
-        else:
-            results[code] = {"error": "未获取到行情", "stock_code": code}
+    def _one(stock_code: str) -> Dict[str, Any]:
+        market = _detect_market(stock_code) or "CNStock"
+        ds = _get_ds(market)
+        try:
+            result = ds.get_ticker(stock_code)
+            if isinstance(result, dict) and "error" not in result:
+                return {"stock_code": stock_code, "market": market, **result}
+            return result if isinstance(result, dict) else {"error": "Unexpected result type"}
+        except NotImplementedError:
+            return {"error": f"数据源 {market} 不支持 get_ticker", "retriable": False}
+        except Exception as e:
+            logger.error("get_realtime_quote(%s) failed: %s", stock_code, e)
+            return {"error": str(e)}
 
     if len(code_list) == 1:
-        return results[code_list[0]]
+        return _one(code_list[0])
+
+    results = {}
+    for code in code_list:
+        try:
+            results[code] = _one(code)
+        except Exception as e:
+            results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
 
-def agent_get_kline(codes: str, timeframe: str = "1D", days: int = 30) -> Dict[str, Any]:
-    """K线数据：返回OHLCV，支持 A 股。
-
-    ⚠️ 仅在需要原始数据或自定义计算时调用。趋势/指标/形态/量价/筹码分析已内置K线获取，不要重复调用。
+def agent_get_kline(codes: str, timeframe: str = "1D", days: int = 60, market: str = "") -> Dict[str, Any]:
+    """K线数据：返回 date/open/high/low/close/volume 数组，支持 A股/港股, 数据量大,适合单独分析。
 
     Args:
         codes: 多股用逗号分隔
-        timeframe: 1m/5m/15m/30m/1H/4H/1D/1W，默认1D
-        days: 天数，默认30，最大250
+        timeframe: K线周期，可选值: 1m, 5m, 15m, 30m, 1H, 4H, 1D, 1W。默认 1D（日线）
+        days: 获取天数，默认60天，最大250天（仅对日线及以上周期有意义）
+        market: 市场类型，可选值: CNStock, HKStock。
+                留空则自动推断（A股6位数字→CNStock, HK前缀→HKStock, USDT结尾→Crypto 等）。
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
 
-    valid_timeframes = {"1m", "5m", "15m", "30m", "1H", "4H", "1D", "1W"}
-    if timeframe not in valid_timeframes:
-        return {"error": f"无效周期: {timeframe}，可选: {','.join(sorted(valid_timeframes))}"}
-    _days = min(max(days, 1), 250)
-
-    ds = _get_ds("CNStock")
-
-    def _fetch(stock_code: str) -> list:
+    def _one(stock_code: str) -> Any:
+        valid_timeframes = {"1m", "5m", "15m", "30m", "1H", "4H", "1D", "1W"}
+        if timeframe not in valid_timeframes:
+            return []
+        _days = min(max(days, 1), 250)
+        if market:
+            from app.data_sources.factory import DataSourceFactory
+            _market = DataSourceFactory.normalize_market(market)
+        else:
+            _market = _detect_market(stock_code) or "CNStock"
+        ds = _get_ds(_market)
         try:
-            return ds.get_kline(stock_code, timeframe, _days) or []
+            klines = ds.get_kline(stock_code, timeframe, _days) or []
+            compact = []
+            for k in klines:
+                compact.append({
+                    "t": k.get("date", k.get("timestamp", "")),
+                    "o": round(k.get("open", 0), 2),
+                    "h": round(k.get("high", 0), 2),
+                    "l": round(k.get("low", 0), 2),
+                    "c": round(k.get("close", 0), 2),
+                    "v": k.get("volume", 0),
+                })
+            return compact
         except Exception as e:
             logger.error("get_kline(%s, %s, %d) failed: %s", stock_code, timeframe, _days, e)
             return []
 
-    def _ts_to_date(ts) -> str:
-        try:
-            from datetime import datetime
-            return datetime.fromtimestamp(int(ts)).strftime("%m-%d")
-        except Exception:
-            return str(ts)
-
-    # ── 完整 OHLCV ──
-    results: Dict[str, Any] = {}
-    for code in code_list:
-        klines = _fetch(code)
-        results[code] = [{
-            "t": k.get("date") or _ts_to_date(k.get("time", 0)),
-            "o": round(k.get("open", 0), 2),
-            "h": round(k.get("high", 0), 2),
-            "l": round(k.get("low", 0), 2),
-            "c": round(k.get("close", 0), 2),
-            "v": k.get("volume", 0),
-        } for k in klines]
     if len(code_list) == 1:
-        return results[code_list[0]]
-    return {"count": len(results), "data": results}
+        return _one(code_list[0])
 
+    results = {}
+    for code in code_list:
+        try:
+            results[code] = _one(code)
+        except Exception as e:
+            results[code] = {"error": str(e)}
+    return {"count": len(results), "data": results}
 # ── 核心字段集（Agent 日常分析最常用的 ~15 个字段） ──────────────────────
 _STOCK_INFO_CORE_FIELDS = {
     "stock_code", "name", "industry", "concepts",
@@ -183,7 +190,8 @@ def get_stock_info(codes: str, detail: bool = False) -> Dict[str, Any]:
             return _hit
 
     def _one(stock_code: str) -> Dict[str, Any]:
-        ds = _get_ds("CNStock")
+        market = _detect_market(stock_code) or "CNStock"
+        ds = _get_ds(market)
         result: Dict[str, Any] = {}
 
         # 1) 尝试数据源原生 get_stock_info

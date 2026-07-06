@@ -81,17 +81,15 @@ def _algo_analyze(
         kdj = indicator.get("kdj", {})
         boll = indicator.get("boll", {})
 
-        macd_signals = macd.get("signals", []) if isinstance(macd.get("signals"), list) else []
-        rsi_value = rsi.get("rsi6", 50)
-        kdj_j = kdj.get("j", 50)
-        boll_pos = boll.get("position_pct", 50)
+        macd_signal = macd.get("signal", "")
+        rsi_value = rsi.get("value", 50)
+        kdj_j = kdj.get("j_value", 50)
+        boll_pos = boll.get("position", "")
 
-        macd_has_golden = any("金叉" in s for s in macd_signals)
-        macd_has_death = any("死叉" in s for s in macd_signals)
-        if macd_has_golden:
+        if macd_signal == "金叉":
             indicator_score += 15
             signals.append("MACD金叉")
-        elif macd_has_death:
+        elif macd_signal == "死叉":
             indicator_score -= 15
             signals.append("MACD死叉")
 
@@ -107,15 +105,13 @@ def _algo_analyze(
         elif kdj_j > 80:
             indicator_score -= 5
 
-        if isinstance(boll_pos, (int, float)):
-            if boll_pos >= 80:
-                indicator_score -= 5
-            elif boll_pos <= 20:
-                indicator_score += 5
+        if boll_pos == "上轨附近":
+            indicator_score -= 5
+        elif boll_pos == "下轨附近":
+            indicator_score += 5
 
         indicator_score = max(0, min(100, indicator_score))
-        macd_label = "金叉" if macd_has_golden else ("死叉" if macd_has_death else "中性")
-        factors.append({"name": "指标", "value": f"MACD:{macd_label} RSI:{rsi_value:.0f}", "score": indicator_score})
+        factors.append({"name": "指标", "value": f"MACD:{macd_signal} RSI:{rsi_value:.0f}", "score": indicator_score})
     else:
         factors.append({"name": "指标", "value": "数据缺失", "score": 50})
 
@@ -152,19 +148,17 @@ def _algo_analyze(
     pattern = tool_results.get("analyze_pattern", {})
     pattern_score = 50
     if isinstance(pattern, dict) and "error" not in pattern:
-        raw_patterns = pattern.get("patterns", [])
-        if not isinstance(raw_patterns, list):
-            raw_patterns = []
-        # analyze_pattern 返回字符串列表，按关键词分看多/看空
-        bullish_kw = ["底部反转", "看涨", "早晨之星", "三连阳", "红三兵", "蜻蜓线", "刺透", "上升三法"]
-        bearish_kw = ["顶部反转", "看跌", "黄昏之星", "三连阴", "黑三鸦", "墓碑线", "乌云盖顶", "下降三法"]
-        bullish_count = sum(1 for p in raw_patterns if any(k in p for k in bullish_kw))
-        bearish_count = sum(1 for p in raw_patterns if any(k in p for k in bearish_kw))
-        pattern_score = 50 + bullish_count * 10 - bearish_count * 10
-        for p in raw_patterns[:3]:
-            signals.append(f"形态:{p}")
+        patterns = pattern.get("patterns", [])
+        if patterns:
+            bullish_patterns = [p for p in patterns if p.get("type") == "bullish"]
+            bearish_patterns = [p for p in patterns if p.get("type") == "bearish"]
+            pattern_score = 50 + len(bullish_patterns) * 10 - len(bearish_patterns) * 10
+            for p in bullish_patterns[:2]:
+                signals.append(f"形态:{p.get('name', '')}")
+            for p in bearish_patterns[:2]:
+                signals.append(f"形态:{p.get('name', '')}")
         pattern_score = max(0, min(100, pattern_score))
-        factors.append({"name": "形态", "value": f"{len(raw_patterns)}个形态", "score": pattern_score})
+        factors.append({"name": "形态", "value": f"{len(patterns)}个形态", "score": pattern_score})
     else:
         factors.append({"name": "形态", "value": "数据缺失", "score": 50})
 
@@ -234,26 +228,28 @@ def _algo_analyze(
     # ── 信号摘要 ──
     signal = " | ".join(signals[:5]) if signals else "无明显信号"
 
-    # ── markdown 分析 ──
-    dir_map = {"bullish": "看多", "bearish": "看空", "neutral": "中性"}
-    md = f"{stock_name or stock_code}({stock_code}) {final_score:.0f}分 {dir_map.get(direction, direction)}"
-    if factors:
-        md += "\n" + " ".join(f"{f['name']}:{f['score']}" for f in factors[:4])
+    # ── 分析文字 ──
+    analysis_parts = [
+        f"标的: {stock_name or stock_code}",
+        f"综合评分: {final_score}/100",
+        f"方向: {direction}",
+        f"置信度: {confidence}",
+    ]
+    for f in factors:
+        analysis_parts.append(f"{f['name']}: {f['value']} ({f['score']})")
     if signals:
-        md += "\n" + " ".join(signals[:3])
-    analysis = md
+        analysis_parts.append(f"信号: {signal}")
 
-    _r = {
+    return {
         "score": final_score,
         "direction": direction,
         "confidence": confidence,
         "signal": signal,
         "factors": factors,
-        "analysis": analysis,
+        "analysis": "\n".join(analysis_parts),
         "stock_code": stock_code,
         "stock_name": stock_name,
     }
-    return _r
 def technical_analysis(stock_code: str, stock_name: str = "") -> dict:
     """技术面综合评分：内部调用 analyze_trend+get_indicator_snapshot+get_volume_analysis+analyze_pattern+get_chip_distribution，加权输出 0-100 分。需要单股深度分析时用此工具，不要同时调 analyze_trend。
 
