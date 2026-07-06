@@ -28,6 +28,14 @@ except ImportError:
     FastAPI = None
     HTTPException = None
 
+# ---------- 加载 .env（FastAPI/uvicorn 入口需要显式加载）----------
+try:
+    from dotenv import load_dotenv
+    _dotenv_path = os.path.join(os.path.dirname(__file__), "..", "..", ".env")
+    load_dotenv(_dotenv_path, override=False)
+except ImportError:
+    pass
+
 # ---------- 配置（来自 backend_api_python/.env）----------
 VERSION = "1.0.0"
 AGENT_ENV = os.getenv("AGENT_ENV", "development")
