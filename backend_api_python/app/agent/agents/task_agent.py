@@ -6,7 +6,7 @@
   user input
     -> plan: LLM 判断需要哪些工具
     -> 无工具 → AgentBase.chat()（RAG + Memory + LLM）
-    -> 有工具 → RAG + Memory + react_engine CodeAgent（筛选后的工具）
+    -> 有工具 → RAG + Memory + smolagents CodeAgent（筛选后的工具）
     -> response
 """
 from __future__ import annotations
@@ -26,7 +26,7 @@ from agents.base import AgentBase, AgentResponse
 from llm.base import ChatMessage, LLMBase
 from memory.base import MemoryBase
 from rag.retriever import Retriever
-from react_engine import Tool as SmolToolBase
+from smolagents import Tool as SmolToolBase
 from tools.registry import ToolRegistry
 from tools.base import Tool
 from utils.json_parser import safe_parse_json
@@ -50,11 +50,11 @@ def _load_plan_template() -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  react_engine 适配层
+#  smolagents 适配层
 # ═══════════════════════════════════════════════════════════════
 
 class _LLMAdapter:
-    """把 Agent Template 的 LLMBase 包装为 react_engine Model 接口。"""
+    """把 Agent Template 的 LLMBase 包装为 smolagents Model 接口。"""
 
     def __init__(self, llm: LLMBase):
         self._llm = llm
@@ -68,8 +68,8 @@ class _LLMAdapter:
         tools_to_call_from: list | None = None,
         **kwargs,
     ):
-        """react_engine 调用入口 → 转发到 LLMBase.generate()。"""
-        from react_engine import ChatMessage as SmolChatMessage
+        """smolagents 调用入口 → 转发到 LLMBase.generate()。"""
+        from smolagents import ChatMessage as SmolChatMessage
 
         chat_messages = []
         for m in messages:
@@ -80,7 +80,7 @@ class _LLMAdapter:
                 content = getattr(m, "content", "")
             chat_messages.append(ChatMessage(role=role, content=content))
 
-        # react_engine 通过 prompt 传递工具描述，不走 function calling
+        # smolagents 通过 prompt 传递工具描述，不走 function calling
         try:
             resp = asyncio.run(self._llm.generate(chat_messages))
         except Exception as e:
@@ -323,7 +323,7 @@ def _load_skill_functions(skill_name: str) -> list:
 
 
 def _build_smol_tools(tool_registry: ToolRegistry, selected_names: List[str]) -> list:
-    """将选中的 Tool 实例转换为 react_engine 兼容工具列表。"""
+    """将选中的 Tool 实例转换为 smolagents 兼容工具列表。"""
     tools = []
     for name in selected_names:
         tool = tool_registry.get(name)
@@ -340,11 +340,11 @@ def _build_smol_tools(tool_registry: ToolRegistry, selected_names: List[str]) ->
 
 class TaskAgent(AgentBase):
     """
-    任务型 Agent — plan + react_engine CodeAgent
+    任务型 Agent — plan + smolagents CodeAgent
 
     1. plan 阶段：LLM 根据用户意图筛选需要的工具
     2. 无工具 → 委托 AgentBase.chat()（完整 RAG + Memory 链路）
-    3. 有工具 → RAG + Memory + react_engine CodeAgent 执行
+    3. 有工具 → RAG + Memory + smolagents CodeAgent 执行
     """
 
     def __init__(
@@ -560,27 +560,24 @@ class TaskAgent(AgentBase):
                     smol_tools.append(_SkillResourceTool(loader, sname))
             logger.info("[TaskAgent] 工具: %s", [t.name for t in smol_tools])
 
-            trace.record("react_engine_setup", {"tools": [t.name for t in smol_tools]})
+            trace.record("code_agent_setup", {"tools": [t.name for t in smol_tools]})
 
             # CodeAgent 执行
             model = _LLMAdapter(self.llm)
-            from react_engine import CodeAgent as SmolCodeAgent
+            from smolagents import CodeAgent as SmolCodeAgent
             from pathlib import Path
             import yaml
-
-            # 加载 base YAML（英文原始模板）+ 合并自定义格式规则
-            _base_path = Path(__file__).resolve().parent.parent / "react_engine" / "prompts" / "code_agent.yaml"
-            _rule_path = Path(__file__).resolve().parent.parent / "prompts" / "format_rules.yaml"
-            prompt_templates = yaml.safe_load(_base_path.read_text(encoding="utf-8"))
-            format_rules = yaml.safe_load(_rule_path.read_text(encoding="utf-8"))
-            prompt_templates["system_prompt"] += "\n" + format_rules["system_prompt_suffix"]
 
             agent = SmolCodeAgent(
                 tools=smol_tools,
                 model=model,
                 max_steps=self.max_tool_rounds,
-                prompt_templates=prompt_templates,
             )
+
+            # 追加自定义格式规则
+            _rule_path = Path(__file__).resolve().parent.parent / "prompts" / "format_rules.yaml"
+            format_rules = yaml.safe_load(_rule_path.read_text(encoding="utf-8"))
+            agent.prompt_templates["system_prompt"] += "\n" + format_rules["system_prompt_suffix"]
 
             logger.info("[TaskAgent] CodeAgent 执行: %s (工具: %s)",
                         user_input[:60], [t.name for t in smol_tools])
@@ -590,7 +587,7 @@ class TaskAgent(AgentBase):
             react_elapsed = round(time.time() - react_start, 2)
 
             trace.record(
-                "react_engine_done",
+                "code_agent_done",
                 {"elapsed_seconds": react_elapsed, "result_preview": str(result)[:200]},
             )
 
