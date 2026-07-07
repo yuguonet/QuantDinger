@@ -92,7 +92,11 @@ else:
 # 技能适配器
 skills = QDSkillAdapter()
 
-# 模式（MCP 启动后自动发现工具，这里只看技能）
+# 模式：固定 task（工具由 MCP 动态发现，不再需要 ToolRegistry 预扫描）
+# ToolRegistry 已移除：
+#   - MCP bridge 扫描同一套 tools/*.py，工具集完全对齐，无需重复扫描
+#   - Plan 和 CodeAgent 都通过 MCP 获取工具，省掉 ToolRegistry 的维护成本
+#   - 独立脚本（如 bb_screener_scan.py）仍可自行 import ToolRegistry
 _mode = "task"
 logger.info(
     "QuantDinger Agent 启动: %s 模式 | %d 技能 | provider=%s model=%s",

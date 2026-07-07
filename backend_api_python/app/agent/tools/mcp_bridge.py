@@ -65,12 +65,13 @@ def _discover_and_register() -> int:
     global _tool_catalog
     count = 0
 
-    # 确保 app/agent/ 目录在 import 路径中（与 Flask 启动时一致）
-    # 这样 tools.xxx、llm.xxx、memory.xxx 等绝对导入都能工作
+    # MCP bridge 作为子进程启动时，sys.path 与 Flask 不同。
+    # Flask 启动时 run.py 和 app/__init__.py 会把 app/ 加入 sys.path，
+    # 所以 tools.xxx、llm.xxx、memory.xxx 等绝对导入能工作。
+    # MCP 子进程需要手动设置相同的路径，否则所有工具模块导入失败（只注册 3 个发现工具）。
     agent_dir = str(_TOOLS_DIR.parent)  # app/agent/
     if agent_dir not in sys.path:
         sys.path.insert(0, agent_dir)
-    # 同时确保 backend_api_python/ 也在路径中（for app.agent.xxx 导入）
     backend_dir = str(_TOOLS_DIR.parent.parent.parent)  # backend_api_python/
     if backend_dir not in sys.path:
         sys.path.insert(0, backend_dir)

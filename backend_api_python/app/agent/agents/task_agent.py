@@ -5,10 +5,17 @@
 流程：
   user input
     -> 负面反馈检测
-    -> plan: LLM 决定用哪些技能
-    -> MCP 加载全部工具 + 技能加载
-    -> CodeAgent 执行
+    -> plan: LLM 决定用哪些技能/工具
+    -> 有技能 → 已有技能渐进式加载
+    -> 无技能 → 自动生成临时 SKILL.md
+    -> MCP 全量工具 + 技能工具 → CodeAgent 执行
     -> response
+
+设计要点：
+  - MCP 常驻连接，首次启动后复用，避免每次请求 2-3s 启动开销
+  - _plan() 同时选技能和工具：有技能走技能，没技能走工具+自动生成SKILL.md
+  - CodeAgent 拿全量 MCP 工具 + 技能工具，smolagents 原生支持 MCP 不占 token
+  - 临时 SKILL.md 存内存，后续可持久化为编排路径，重复任务直接加载跳过 plan
 """
 from __future__ import annotations
 
@@ -31,14 +38,24 @@ from smolagents import Tool as SmolToolBase
 from utils.json_parser import safe_parse_json
 from utils.tracing import AgentTraceRecorder, llm_response_to_dict
 
-logger = logging.getLogger(__name__)
+# 使用 app.agent logger（与 log.py 配置一致，确保日志写入文件）
+try:
+    from log import logger
+except ImportError:
+    logger = logging.getLogger(__name__)
 
 # ── 模块级 TraceCollector 存储 ──
 _collectors: Dict[str, "TraceCollector"] = {}
 
 # ── MCP 配置 ──────────────────────────────────────────────────
 _MCP_SERVER_CMD = os.getenv("AGENT_MCP_SERVER_CMD", "python")
-_MCP_SERVER_ARGS = os.getenv("AGENT_MCP_SERVER_ARGS", "tools/mcp_bridge.py").split()
+# 默认路径：相对于本文件(app/agent/)定位 mcp_bridge.py
+# 从 backend_api_python/ 运行时，子进程 cwd 是 backend_api_python/
+# 所以需要用 app/agent/tools/mcp_bridge.py 而非 tools/mcp_bridge.py
+_MCP_SERVER_ARGS = os.getenv(
+    "AGENT_MCP_SERVER_ARGS",
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tools", "mcp_bridge.py")),
+).split()
 
 # Plan 提示词模板
 _PLAN_TEMPLATE: str | None = None
@@ -192,6 +209,84 @@ class _SkillResourceTool(SmolToolBase):
         return self.forward(**kwargs)
 
 
+class _TempSkillSectionTool(SmolToolBase):
+    """从内存 SKILL.md body 按需加载段落（临时技能用）。
+
+    与 _SkillSectionTool 的区别：
+      - _SkillSectionTool：从 QDSkillAdapter 加载（文件系统）
+      - _TempSkillSectionTool：从内存字符串加载（临时生成）
+    接口一致，CodeAgent 无感知，统一用 read_skill_section 调用。
+
+    兼容性：
+      - 段落切分逻辑与 QDSkillAdapter._split_sections 一致（按 ## 标题）
+      - 支持 # ~ #### 四级标题
+      - Anthropic SKILL.md 标准兼容
+
+    扩展点：
+      - 持久化时，body 直接写入 skills/auto_xxx/SKILL.md
+      - 持久化后可改用 _SkillSectionTool 加载（从文件系统）
+    """
+    skip_forward_signature_validation = True
+
+    def __init__(self, body: str, skill_name: str):
+        super().__init__()
+        self._body = body
+        self._skill_name = skill_name
+        self.name = "read_skill_section"
+
+        # 按 ## 标题切分段落（re.finditer 方式，避免 split 的分组问题）
+        self._sections = {}
+        heading_pattern = re.compile(r"^(#{1,4})\s+(.+)$", re.MULTILINE)
+        matches = list(heading_pattern.finditer(body))
+        if matches:
+            # 前言（第一个标题之前的内容）
+            preamble = body[:matches[0].start()].strip()
+            if preamble:
+                self._sections["(前言)"] = preamble
+            # 各段落
+            for i, m in enumerate(matches):
+                heading = m.group(2).strip()
+                start = m.end()
+                end = matches[i + 1].start() if i + 1 < len(matches) else len(body)
+                content = body[start:end].strip()
+                if content:
+                    self._sections[heading] = content
+        else:
+            self._sections["(全文)"] = body
+
+        headings = list(self._sections.keys())
+        headings_text = ", ".join(headings) if headings else "(无段落)"
+        self.description = (
+            f"读取技能 '{skill_name}' 的指令段落。"
+            f"可用段落: {headings_text}\n"
+            f"参数: heading（段落标题关键词）"
+        )
+        self.output_type = "string"
+        self.inputs = {
+            "heading": {
+                "type": "string",
+                "description": f"段落标题关键词，可用: {headings_text}",
+            }
+        }
+
+    def forward(self, heading: str = "", **kwargs) -> str:
+        kw = heading or kwargs.get("section", "")
+        if not kw:
+            return f"[错误] 未指定段落。可用段落: {list(self._sections.keys())}"
+        kw_lower = kw.lower()
+        for h, content in self._sections.items():
+            if kw_lower in h.lower():
+                return content
+        return f"[错误] 未找到段落 '{kw}'。可用段落: {list(self._sections.keys())}"
+
+    def __call__(self, *args, **kwargs):
+        pnames = list(self.inputs.keys())
+        for i, arg in enumerate(args):
+            if i < len(pnames):
+                kwargs[pnames[i]] = arg
+        return self.forward(**kwargs)
+
+
 class _SkillFuncTool(SmolToolBase):
     """把 skill 的 Python 函数暴露为 CodeAgent 工具。"""
     skip_forward_signature_validation = True
@@ -288,7 +383,23 @@ def _load_skill_functions(skill_name: str) -> list:
 # ═══════════════════════════════════════════════════════════════
 
 class _MCPSingleton:
-    """MCP 连接单例 — 常驻子进程，避免每次请求重复启动。"""
+    """MCP 连接单例 — 常驻子进程，避免每次请求重复启动。
+
+    设计原因：
+      - MCP 子进程启动 + 工具注册需要 2-3s，每条消息都启动一次浪费严重
+      - 常驻连接后，首次 2-3s，后续 0 开销
+      - smolagents ToolCollection 上下文管理器保持连接存活
+
+    生命周期：
+      - 进程启动 → _mcp = _MCPSingleton()（不启动子进程）
+      - 首次 _mcp.tools / _mcp.available → 触发 _ensure() → 启动子进程
+      - 进程退出 → 自动回收（daemon 线程）
+      - 需要手动关闭时 → _mcp.close()
+
+    扩展点：
+      - 未来可加健康检查、自动重连、工具热更新
+      - 未来可改为 SSE 模式连接远程 MCP server
+    """
 
     def __init__(self):
         self._tools: list | None = None
@@ -346,6 +457,49 @@ _mcp = _MCPSingleton()
 #  TaskAgent
 # ═══════════════════════════════════════════════════════════════
 
+
+def _generate_temp_skill(steps: list, task_hint: str = "") -> dict | None:
+    """从选定的执行步骤生成临时 SKILL.md（内存）。返回 {name, body, tools} 或 None。"""
+    if not steps:
+        return None
+
+    all_tool_names = []
+    for step in steps:
+        for t in step["tools"]:
+            if t.name not in all_tool_names:
+                all_tool_names.append(t.name)
+
+    skill_name = "auto_skill"
+
+    steps_lines = []
+    for i, step in enumerate(steps, 1):
+        names = [t.name for t in step["tools"]]
+        if step["parallel"]:
+            steps_lines.append(f"步骤{i}（并行）: {', '.join(names)} — 同一步代码中同时调用")
+        else:
+            steps_lines.append(f"步骤{i}（串行）: {', '.join(names)} — 等待上一步结果后再调用")
+    steps_md = "\n".join(steps_lines)
+
+    body = f"""---
+name: {skill_name}
+description: auto skill
+---
+
+# {skill_name}
+
+## 执行步骤
+{steps_md}
+
+## 执行规则
+1. 汇总所有工具的输出，给出最终分析
+"""
+
+    return {"name": skill_name, "body": body, "tools": all_tool_names}
+
+
+    # ── 主对话入口 ────────────────────────────────────────────
+
+
 class TaskAgent(AgentBase):
     """
     任务型 Agent — MCP + Plan
@@ -387,18 +541,28 @@ class TaskAgent(AgentBase):
         trace: AgentTraceRecorder,
         mcp_tools: list | None = None,
     ) -> tuple:
-        """Plan 节点：判断是否需要工具，选择需要的技能。
+        """Plan 节点：判断是否需要工具，选择技能或工具。
 
-        Args:
-            mcp_tools: MCP 工具列表
+        设计决策：
+          - _plan() 同时看到 MCP 工具列表和已有技能列表
+          - 有匹配技能 → selected_skills，走已有技能渐进式加载
+          - 无匹配技能 → selected_tools，下游自动生成临时 SKILL.md
+          - skills 和 tools 互斥：有技能走技能，没技能走工具
+
+        为什么传 mcp_tools：
+          - Plan LLM 需要看到完整工具描述才能精确选择
+          - 选定的工具名映射回 MCP 工具对象，确保名称精确
+
+        扩展点：
+          - 未来可缓存编排路径：相同任务直接加载 SKILL.md，跳过 plan
+          - 未来可加 skill 权重：plan 参考历史收益率选择技能
 
         Returns:
-            (selected_skills, expanded_query, need_tools) 三元组。
-            need_tools=false → 纯对话
-            need_tools=true, skills=[] → 走 MCP，CodeAgent 自选工具
-            need_tools=true, skills=[...] → 走 MCP + 技能
+            (selected_skills, selected_tools, expanded_query, need_tools) 四元组。
+            selected_skills: 已有技能名列表
+            selected_tools: MCP 工具对象列表（仅无匹配技能时有值）
         """
-        # 构建工具描述（供 LLM 判断是否需要工具能力）
+        # 构建工具描述（供 LLM 在无技能时选择具体工具）
         tools_desc = []
         if mcp_tools:
             for tool in mcp_tools:
@@ -440,36 +604,53 @@ class TaskAgent(AgentBase):
             if m:
                 text = m.group(1).strip()
 
-        plan = safe_parse_json(text, default={"skills": []})
+        plan = safe_parse_json(text, default={"skills": [], "steps": []})
 
         # 路由判断：need_tools=false → 纯对话
         need_tools = plan.get("need_tools", True)
         if not need_tools:
             logger.info("[TaskAgent] plan: 不需要工具，纯对话")
             trace.record("plan_result", {"need_tools": False, "route": "chat"})
-            return [], user_input, False
+            return [], [], user_input, False
 
-        selected = plan.get("skills", plan.get("tools", []))  # 兼容旧格式
+        # 解析选定的技能
+        selected_skill_names = plan.get("skills", [])
         all_skill_names = {s["name"] for s in self.skill_adapter.list_skills()} if self.skill_adapter else set()
         selected_skills = []
-        for name in selected:
+        for name in selected_skill_names:
             if name.startswith("skill:"):
                 name = name[6:]
             if name in all_skill_names:
                 selected_skills.append(name)
 
+        # 解析执行步骤（无匹配技能时，从 MCP 中选择工具 + 并行/串行分组）
+        mcp_tool_map = {t.name: t for t in mcp_tools} if mcp_tools else {}
+        steps = []
+        for step in plan.get("steps", []):
+            step_tools = []
+            for name in step.get("tools", []):
+                tool = mcp_tool_map.get(name)
+                if tool:
+                    step_tools.append(tool)
+                else:
+                    logger.warning("[TaskAgent] plan 选了未知工具: %s", name)
+            if step_tools:
+                steps.append({"tools": step_tools, "parallel": step.get("parallel", False)})
+
         expanded_query = plan.get("expanded_query", user_input) or user_input
-        logger.info("[TaskAgent] plan: need_tools=%s, 选了 %d 个技能 %s",
-                     need_tools, len(selected_skills), selected_skills)
+        logger.info("[TaskAgent] plan: need_tools=%s, %d 技能 %s, %d 步骤 %s",
+                     need_tools,
+                     len(selected_skills), selected_skills,
+                     len(steps), [f"{'∥' if s['parallel'] else '→'}{[t.name for t in s['tools']]}" for s in steps])
         trace.record("plan_result", {
             "need_tools": True,
             "route": "mcp+plan",
             "selected_skills": selected_skills,
+            "steps": [{"tools": [t.name for t in s["tools"]], "parallel": s["parallel"]} for s in steps],
         })
 
-        return selected_skills, expanded_query, True
+        return selected_skills, steps, expanded_query, True
 
-    # ── 主对话入口 ────────────────────────────────────────────
 
     async def chat(
         self,
@@ -486,6 +667,21 @@ class TaskAgent(AgentBase):
         return await self._chat_plan(user_input, session_id, use_rag)
 
     # ── MCP + Plan 执行 ──────────────────────────────────────
+    #
+    # 三条路径：
+    #   A. need_tools=false → 纯对话，不调工具
+    #   B. selected_skills 有值 → 已有技能渐进式加载
+    #   C. selected_tools 有值 → 自动生成临时 SKILL.md → 统一走技能流程
+    #
+    # CodeAgent 始终拿全量 MCP + 技能工具：
+    #   - MCP 工具：smolagents 原生支持，不占 token
+    #   - 技能工具：渐进式加载（段落按需读取 + 函数直接注入）
+    #   - 未来：smolagents 规则声明优先使用技能工具
+    #
+    # 扩展点：
+    #   - TraceCollector 存库后，盘后 Evaluator 自动回溯验证
+    #   - 验证结果更新 Skill/Factor 权重，反馈到下次 plan
+    #   - 编排路径缓存：重复任务跳过 plan，直接加载 SKILL.md
 
     async def _chat_plan(
         self,
@@ -493,6 +689,7 @@ class TaskAgent(AgentBase):
         session_id: str,
         use_rag: bool,
     ) -> AgentResponse:
+        print(f"[DEBUG] _chat_plan called: {user_input[:50]}", flush=True)
         start_time = time.time()
         trace = AgentTraceRecorder(
             agent_type=type(self).__name__,
@@ -507,20 +704,23 @@ class TaskAgent(AgentBase):
             from pathlib import Path
             import yaml
 
-            if not _mcp.available:
+            mcp_ok = _mcp.available
+            print(f"[DEBUG] MCP available: {mcp_ok}, tools: {len(_mcp.tools)}", flush=True)
+            if not mcp_ok:
                 logger.error("[TaskAgent] MCP 不可用")
                 return await super().chat(user_input, session_id=session_id, use_rag=use_rag)
 
             mcp_tool_list = _mcp.tools
             model = _LLMAdapter(self.llm)
 
-            # 2. Plan 选技能（MCP 工具列表传入，LLM 看到完整工具集）
-            selected_skills, expanded_query, need_tools = await self._plan(
+            # 2. Plan 选技能 + 选工具
+            selected_skills, steps, expanded_query, need_tools = await self._plan(
                 user_input, self.llm, trace, mcp_tools=mcp_tool_list,
             )
+            print(f"[DEBUG] plan: need_tools={need_tools}, skills={selected_skills}, steps={len(steps)}", flush=True)
 
-            # need_tools=false 且无技能 → 纯对话
-            if not need_tools and not selected_skills:
+            # need_tools=false → 纯对话
+            if not need_tools:
                 trace.record("delegate_chat", {"reason": "plan: 不需要工具"})
                 trace.finish(response={"delegated_to": "AgentBase.chat"})
                 return await super().chat(user_input, session_id=session_id, use_rag=use_rag)
@@ -563,12 +763,33 @@ class TaskAgent(AgentBase):
                 except Exception as e:
                     logger.warning("[TaskAgent] skill %s 加载失败: %s", sname, e)
 
+            # 无匹配技能时，从选定步骤生成临时 SKILL.md
+            temp_skill = None
+            if not selected_skills and steps:
+                temp_skill = _generate_temp_skill(steps, task_hint=user_input)
+                if temp_skill:
+                    selected_skills = [temp_skill["name"]]
+                    # 临时技能 body 注入 task prompt
+                    task_parts.append(f"【技能指令: {temp_skill['name']}】\n{temp_skill['body']}")
+                    logger.info("[TaskAgent] 自动生成技能: %s (%d 工具)",
+                                temp_skill["name"], len(temp_skill["tools"]))
+                    trace.record("temp_skill_generated", {
+                        "name": temp_skill["name"],
+                        "tools": temp_skill["tools"],
+                    })
+
             task_parts.append(f"【任务】\n{expanded_query}")
             task = "\n\n".join(task_parts)
 
             # 5. 加载技能工具（函数 + 渐进式加载）
             skill_tools = []
             for sname in selected_skills:
+                # 临时技能：注入段落工具（body 已在步骤 4 注入 task prompt）
+                if temp_skill and sname == temp_skill["name"]:
+                    skill_tools.append(_TempSkillSectionTool(temp_skill["body"], sname))
+                    logger.info("[TaskAgent] 临时技能 %s 注入段落工具", sname)
+                    continue
+                # 已有技能：函数 + 段落 + 资源
                 func_tools = _load_skill_functions(sname)
                 skill_tools.extend(func_tools)
                 skill_tools.append(_SkillSectionTool(loader, sname))
@@ -587,12 +808,14 @@ class TaskAgent(AgentBase):
                 logger.debug("[Trace] TraceCollector 创建失败: %s", e)
 
             # 7. CodeAgent 执行
+            #    - mcp_tool_list: 全量 MCP 工具（smolagents 原生支持，不占 token）
+            #    - skill_tools: 技能工具（渐进式加载，按需注入）
+            #    - CodeAgent 自主推理，按需从 MCP 或技能工具中选择调用
             all_tools = mcp_tool_list + skill_tools
             logger.info("[TaskAgent] MCP %d 工具 + %d 技能工具", len(mcp_tool_list), len(skill_tools))
             trace.record("code_agent_setup", {
                 "mcp_tools": len(mcp_tool_list),
                 "skill_tools": len(skill_tools),
-                "tools": [t.name for t in skill_tools],
             })
 
             agent = SmolCodeAgent(
