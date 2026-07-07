@@ -17,18 +17,15 @@ from app.agent.tools._analysis_utils import _get_ds
 def resolve_stock(keyword: str, market: str = "CNStock", limit: int = 10) -> Dict[str, Any]:
     """股票名称/代码双向解析。输入名称返回代码，输入代码返回名称，支持模糊搜索。
 
-    ⚠️ 返回值是 dict，不是 list！用法：
-        result = resolve_stock("茅台")
-        stock_code = result["results"][0]["code"]   # ✅
-        # ❌ result[0]["code"] 会报 KeyError
-
     Args:
         keyword: 搜索关键词（中文名称、代码、简拼等）
         market: 市场，默认 CNStock
         limit: 返回数量上限，默认10
 
     Returns:
-        dict: {"results": [{"code": "600519", "name": "贵州茅台", "market": "SH"}, ...], "count": N}
+        单只 → {"code": "...", "name": "...", "market": "..."}
+        多只 → {"count": N, "data": [{"code": "...", ...}, ...]}
+        失败 → {"error": "...", "retriable": false}
     """
     keyword = (keyword or "").strip()
     if not keyword:
@@ -38,18 +35,16 @@ def resolve_stock(keyword: str, market: str = "CNStock", limit: int = 10) -> Dic
     try:
         from app.utils.basicinfo_db import get_stock_basic_db
         matches = get_stock_basic_db().search_stocks(keyword, limit=limit)
-        return {
-            "keyword": keyword,
-            "market": market,
-            "results": [
-                {"code": m["symbol"], "name": m.get("name", ""), "market": m.get("market_cn", market)}
-                for m in matches
-            ],
-            "count": len(matches),
-        }
+        items = [
+            {"code": m["symbol"], "name": m.get("name", ""), "market": m.get("market_cn", market)}
+            for m in matches
+        ]
+        if len(items) == 1:
+            return items[0]
+        return {"count": len(items), "data": items}
     except Exception as e:
-        logger.error("_resolve_stock(%s) failed: %s", keyword, e)
-        return {"keyword": keyword, "results": [], "count": 0, "error": str(e)}
+        logger.error("resolve_stock(%s) failed: %s", keyword, e)
+        return {"error": str(e), "retriable": False}
 
 
 def get_realtime_quote(codes: str) -> Dict[str, Any]:
