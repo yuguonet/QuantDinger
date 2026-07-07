@@ -157,3 +157,11 @@ if FastAPI is not None:
     @app.get("/skills")
     async def list_skills():
         return {"total": len(skills), "skills": skills.list_skills()}
+
+# ---------- 盘后回溯评估 Worker ----------
+try:
+    from chain.evaluator import start_eval_worker
+    start_eval_worker()
+    logger.info("盘后回溯评估 worker 已启动")
+except Exception as e:
+    logger.warning("eval worker 启动失败: %s", e)
