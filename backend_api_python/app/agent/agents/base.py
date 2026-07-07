@@ -11,7 +11,6 @@ from typing import Optional
 from llm.base import LLMBase, ChatMessage, LLMResponse
 from memory.base import MemoryBase
 from rag.retriever import Retriever
-from tools.registry import ToolRegistry
 from utils.tracing import AgentTraceRecorder, llm_response_to_dict, messages_to_dict
 
 logger = logging.getLogger(__name__)
@@ -67,14 +66,12 @@ class AgentBase:
         llm: LLMBase,
         memory: Optional[MemoryBase] = None,
         retriever: Optional[Retriever] = None,
-        tool_registry: Optional[ToolRegistry] = None,
         system_prompt: str = "你是一个智能助手。",
         memory_window_size: int = 10,
     ):
         self.llm = llm
         self.memory = memory
         self.retriever = retriever
-        self.tool_registry = tool_registry
         self.system_prompt = system_prompt
         self.memory_window_size = memory_window_size
 

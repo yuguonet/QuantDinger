@@ -16,7 +16,6 @@ from memory import (
     LocalMemory,
     PostgresMemory,
 )
-from tools.registry import ToolRegistry
 from agents import TaskAgent
 
 logger = logging.getLogger(__name__)
@@ -90,25 +89,20 @@ elif MEMORY_BACKEND == "postgres" and not DATABASE_URL:
 else:
     memory = LocalMemory(max_messages=MEMORY_MAX_HISTORY)
 
-# 工具注册
-registry = ToolRegistry()
-registry.discover()
-
 # 技能适配器
 skills = QDSkillAdapter()
 
-# 模式
-_mode = "task" if len(registry) > 0 else "chat"
+# 模式（MCP 启动后自动发现工具，这里只看技能）
+_mode = "task"
 logger.info(
-    "QuantDinger Agent 启动: %s 模式 | %d 工具 | %d 技能 | provider=%s model=%s",
-    _mode, len(registry), len(skills), LLM_PROVIDER, LLM_MODEL,
+    "QuantDinger Agent 启动: %s 模式 | %d 技能 | provider=%s model=%s",
+    _mode, len(skills), LLM_PROVIDER, LLM_MODEL,
 )
 
 # ---------- Agent 实例 ----------
 agent = TaskAgent(
     llm=llm,
     memory=memory,
-    tool_registry=registry,
     system_prompt="你是 QuantDinger 量化分析 AI 助手。用中文回答。",
     max_tool_rounds=MAX_TOOL_ROUNDS,
     skill_adapter=skills,
@@ -130,7 +124,6 @@ if FastAPI is not None:
             "status": "ok",
             "version": settings.version,
             "mode": _mode,
-            "tools": len(registry),
             "skills": len(skills),
         }
 
@@ -152,7 +145,7 @@ if FastAPI is not None:
 
     @app.get("/tools")
     async def list_tools():
-        return {"total": len(registry), "tools": registry.list_tools()}
+        return {"total": 0, "tools": [], "note": "工具由 MCP 动态发现，详见 /health"}
 
     @app.get("/skills")
     async def list_skills():

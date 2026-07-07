@@ -59,12 +59,11 @@ def _ensure_agent_path():
 async def _run_chat(message: str, session_id: str = "cli"):
     """统一对话入口。"""
     _ensure_agent_path()
-    from agent import agent, registry, skills
+    from agent import agent, skills
 
-    mode = "task" if len(registry) > 0 else "chat"
     print(f"\n📎 Session: {session_id}")
     print(f"💬 Message: {message}")
-    print(f"🔧 模式: {mode} | 工具: {len(registry)} 个 | 技能: {len(skills)} 个")
+    print(f"🔧 模式: task | 技能: {len(skills)} 个")
     print("-" * 50)
 
     response = await agent.chat(message, session_id=session_id)
@@ -82,14 +81,13 @@ async def _run_chat(message: str, session_id: str = "cli"):
 def _print_info():
     """显示配置信息。"""
     _ensure_agent_path()
-    from agent import settings, registry, skills
+    from agent import settings, skills
 
     print("=" * 60)
     print("QuantDinger Agent — CLI")
     print("=" * 60)
     print(f"\n  环境: {settings.env}")
     print(f"  版本: {settings.version}")
-    print(f"  工具: {len(registry)} 个")
     print(f"  技能: {len(skills)} 个")
 
     try:
@@ -108,14 +106,7 @@ def _print_info():
 
 def _list_tools():
     """列出所有工具。"""
-    _ensure_agent_path()
-    from agent import registry
-
-    print(f"\n🔧 可用工具 ({len(registry)} 个):\n")
-    for name in registry.list_tools():
-        tool = registry.get(name)
-        desc = tool.description[:80] if tool else ""
-        print(f"  {name:40s} {desc}")
+    print("\n🔧 工具由 MCP 动态发现，启动时自动加载。")
 
 
 def _list_skills():

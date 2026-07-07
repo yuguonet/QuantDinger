@@ -96,12 +96,11 @@ def _sse_stream(message: str, session_id: str, timeout: int = 300):
 def health():
     try:
         _ensure_agent_path()
-        from agent import settings, registry, skills
+        from agent import settings, skills
         return jsonify({
             "status": "ok",
             "version": settings.version,
             "env": settings.env,
-            "tools": len(registry),
             "skills": len(skills),
         })
     except Exception as e:
@@ -112,12 +111,11 @@ def health():
 def info():
     try:
         _ensure_agent_path()
-        from agent import settings, registry, skills
+        from agent import settings, skills
         return jsonify({
             "version": settings.version,
             "env": settings.env,
             "llm": {"provider": settings.llm.provider, "qd_provider": settings.llm.qd_provider, "model": settings.llm.model},
-            "tools_count": len(registry),
             "skills_count": len(skills),
         })
     except Exception as e:
@@ -126,17 +124,7 @@ def info():
 
 @agent_v2_bp.route("/tools", methods=["GET"])
 def list_tools():
-    try:
-        _ensure_agent_path()
-        from agent import registry
-        result = []
-        for name in registry.list_tools():
-            tool = registry.get(name)
-            desc = tool.description[:200] if tool else ""
-            result.append({"name": name, "description": desc})
-        return jsonify({"total": len(result), "tools": result})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    return jsonify({"total": 0, "tools": [], "note": "工具由 MCP 动态发现"})
 
 
 @agent_v2_bp.route("/skills", methods=["GET"])

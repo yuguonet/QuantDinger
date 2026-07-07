@@ -18,7 +18,7 @@ import logging
 import os
 import re
 import time
-from typing import Dict, List, Optional, TYPE_CHECKING
+from typing import Dict, List, Optional
 
 import nest_asyncio
 nest_asyncio.apply()
@@ -30,9 +30,6 @@ from rag.retriever import Retriever
 from smolagents import Tool as SmolToolBase
 from utils.json_parser import safe_parse_json
 from utils.tracing import AgentTraceRecorder, llm_response_to_dict
-
-if TYPE_CHECKING:
-    from tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -287,24 +284,62 @@ def _load_skill_functions(skill_name: str) -> list:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  MCP 工具加载
+#  MCP 常驻连接（单例，首次调用启动，之后复用）
 # ═══════════════════════════════════════════════════════════════
 
-def _load_mcp_tools() -> list:
-    try:
-        from mcp import StdioServerParameters
+class _MCPSingleton:
+    """MCP 连接单例 — 常驻子进程，避免每次请求重复启动。"""
 
-        server = StdioServerParameters(
-            command=_MCP_SERVER_CMD,
-            args=_MCP_SERVER_ARGS,
-        )
-        return server
-    except ImportError:
-        logger.warning("[TaskAgent] MCP 依赖未安装 (pip install mcp)")
-        return None
-    except Exception as e:
-        logger.warning("[TaskAgent] MCP 初始化失败: %s", e)
-        return None
+    def __init__(self):
+        self._tools: list | None = None
+        self._ctx = None  # ToolCollection 上下文管理器
+        self._collection = None
+
+    def _ensure(self) -> bool:
+        if self._tools is not None:
+            return True
+        try:
+            from mcp import StdioServerParameters
+            from smolagents import ToolCollection
+
+            server = StdioServerParameters(
+                command=_MCP_SERVER_CMD,
+                args=_MCP_SERVER_ARGS,
+            )
+            self._ctx = ToolCollection.from_mcp(server, trust_remote_code=True)
+            self._collection = self._ctx.__enter__()
+            self._tools = list(self._collection.tools) if hasattr(self._collection, 'tools') else list(self._collection)
+            logger.info("[MCP] 常驻连接已建立，%d 个工具", len(self._tools))
+            return True
+        except ImportError:
+            logger.warning("[TaskAgent] MCP 依赖未安装 (pip install mcp)")
+            return False
+        except Exception as e:
+            logger.warning("[TaskAgent] MCP 初始化失败: %s", e)
+            return False
+
+    @property
+    def tools(self) -> list:
+        self._ensure()
+        return self._tools or []
+
+    @property
+    def available(self) -> bool:
+        return self._ensure()
+
+    def close(self):
+        if self._ctx:
+            try:
+                self._ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+            self._ctx = None
+            self._collection = None
+            self._tools = None
+            logger.info("[MCP] 连接已关闭")
+
+
+_mcp = _MCPSingleton()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -325,7 +360,6 @@ class TaskAgent(AgentBase):
         llm: LLMBase,
         memory: Optional[MemoryBase] = None,
         retriever: Optional[Retriever] = None,
-        tool_registry: Optional[ToolRegistry] = None,
         system_prompt: str = "你是一个智能助手，可以使用工具来完成任务。",
         memory_window_size: int = 10,
         max_tool_rounds: int = 10,
@@ -335,7 +369,6 @@ class TaskAgent(AgentBase):
             llm=llm,
             memory=memory,
             retriever=retriever,
-            tool_registry=tool_registry,
             system_prompt=system_prompt,
             memory_window_size=memory_window_size,
         )
@@ -352,8 +385,12 @@ class TaskAgent(AgentBase):
         user_input: str,
         llm: LLMBase,
         trace: AgentTraceRecorder,
+        mcp_tools: list | None = None,
     ) -> tuple:
         """Plan 节点：判断是否需要工具，选择需要的技能。
+
+        Args:
+            mcp_tools: MCP 工具列表
 
         Returns:
             (selected_skills, expanded_query, need_tools) 三元组。
@@ -363,11 +400,10 @@ class TaskAgent(AgentBase):
         """
         # 构建工具描述（供 LLM 判断是否需要工具能力）
         tools_desc = []
-        if self.tool_registry:
-            for name in self.tool_registry.list_tools():
-                tool = self.tool_registry.get(name)
-                if tool:
-                    tools_desc.append(f"- {name}: {tool.description[:80]}")
+        if mcp_tools:
+            for tool in mcp_tools:
+                desc = getattr(tool, 'description', '') or ''
+                tools_desc.append(f"- {tool.name}: {desc[:80]}")
         tools_text = "\n".join(tools_desc) if tools_desc else "(无可用工具)"
 
         # 构建技能描述
@@ -387,7 +423,7 @@ class TaskAgent(AgentBase):
 
         trace.record("plan_request", {
             "model": getattr(llm, "model", ""),
-            "tools_available": self.tool_registry.list_tools() if self.tool_registry else [],
+            "tools_available": [t.name for t in mcp_tools] if mcp_tools else [],
             "skills_available": [s["name"] for s in self.skill_adapter.list_skills()] if self.skill_adapter else [],
         })
 
@@ -466,8 +502,22 @@ class TaskAgent(AgentBase):
         )
 
         try:
-            # 1. Plan 选技能
-            selected_skills, expanded_query, need_tools = await self._plan(user_input, self.llm, trace)
+            # 1. MCP 常驻连接（首次启动，之后复用）
+            from smolagents import CodeAgent as SmolCodeAgent
+            from pathlib import Path
+            import yaml
+
+            if not _mcp.available:
+                logger.error("[TaskAgent] MCP 不可用")
+                return await super().chat(user_input, session_id=session_id, use_rag=use_rag)
+
+            mcp_tool_list = _mcp.tools
+            model = _LLMAdapter(self.llm)
+
+            # 2. Plan 选技能（MCP 工具列表传入，LLM 看到完整工具集）
+            selected_skills, expanded_query, need_tools = await self._plan(
+                user_input, self.llm, trace, mcp_tools=mcp_tool_list,
+            )
 
             # need_tools=false 且无技能 → 纯对话
             if not need_tools and not selected_skills:
@@ -475,7 +525,7 @@ class TaskAgent(AgentBase):
                 trace.finish(response={"delegated_to": "AgentBase.chat"})
                 return await super().chat(user_input, session_id=session_id, use_rag=use_rag)
 
-            # 2. RAG 检索
+            # 3. RAG 检索
             sources = []
             context = ""
             if use_rag and self.retriever:
@@ -489,7 +539,7 @@ class TaskAgent(AgentBase):
                     context = Retriever.format_context(docs)
                     sources = [{"content": d["content"][:200], "score": d.get("score", 0)} for d in docs]
 
-            # 3. 构建 task prompt（技能指令）
+            # 4. 构建 task prompt（技能指令）
             task_parts = []
             if context:
                 task_parts.append(f"【参考资料】\n{context}")
@@ -516,7 +566,7 @@ class TaskAgent(AgentBase):
             task_parts.append(f"【任务】\n{expanded_query}")
             task = "\n\n".join(task_parts)
 
-            # 4. 加载技能工具（函数 + 渐进式加载）
+            # 5. 加载技能工具（函数 + 渐进式加载）
             skill_tools = []
             for sname in selected_skills:
                 func_tools = _load_skill_functions(sname)
@@ -524,18 +574,6 @@ class TaskAgent(AgentBase):
                 skill_tools.append(_SkillSectionTool(loader, sname))
                 skill_tools.append(_SkillResourceTool(loader, sname))
                 logger.info("[TaskAgent] skill %s 注入函数工具: %s", sname, [t.name for t in func_tools])
-
-            # 5. 连接 MCP 加载全部工具
-            from smolagents import ToolCollection, CodeAgent as SmolCodeAgent
-            from pathlib import Path
-            import yaml
-
-            mcp_server = _load_mcp_tools()
-            if not mcp_server:
-                logger.error("[TaskAgent] MCP 不可用")
-                return await super().chat(user_input, session_id=session_id, use_rag=use_rag)
-
-            model = _LLMAdapter(self.llm)
 
             # 6. 创建 TraceCollector
             collector = None
@@ -548,35 +586,33 @@ class TaskAgent(AgentBase):
             except Exception as e:
                 logger.debug("[Trace] TraceCollector 创建失败: %s", e)
 
-            # 7. CodeAgent 执行（MCP 工具 + 技能工具）
-            with ToolCollection.from_mcp(mcp_server, trust_remote_code=True) as mcp_tools:
-                mcp_tool_list = list(mcp_tools.tools) if hasattr(mcp_tools, 'tools') else list(mcp_tools)
-                all_tools = mcp_tool_list + skill_tools
-                logger.info("[TaskAgent] MCP %d 工具 + %d 技能工具", len(mcp_tool_list), len(skill_tools))
-                trace.record("code_agent_setup", {
-                    "mcp_tools": len(mcp_tool_list),
-                    "skill_tools": len(skill_tools),
-                    "tools": [t.name for t in skill_tools],
-                })
+            # 7. CodeAgent 执行
+            all_tools = mcp_tool_list + skill_tools
+            logger.info("[TaskAgent] MCP %d 工具 + %d 技能工具", len(mcp_tool_list), len(skill_tools))
+            trace.record("code_agent_setup", {
+                "mcp_tools": len(mcp_tool_list),
+                "skill_tools": len(skill_tools),
+                "tools": [t.name for t in skill_tools],
+            })
 
-                agent = SmolCodeAgent(
-                    tools=all_tools,
-                    model=model,
-                    max_steps=self.max_tool_rounds,
-                )
+            agent = SmolCodeAgent(
+                tools=all_tools,
+                model=model,
+                max_steps=self.max_tool_rounds,
+            )
 
-                # 追加格式规则
-                _rule_path = Path(__file__).resolve().parent.parent / "prompts" / "format_rules.yaml"
-                try:
-                    format_rules = yaml.safe_load(_rule_path.read_text(encoding="utf-8"))
-                    agent.prompt_templates["system_prompt"] += "\n" + format_rules["system_prompt_suffix"]
-                except Exception:
-                    pass
+            # 追加格式规则
+            _rule_path = Path(__file__).resolve().parent.parent / "prompts" / "format_rules.yaml"
+            try:
+                format_rules = yaml.safe_load(_rule_path.read_text(encoding="utf-8"))
+                agent.prompt_templates["system_prompt"] += "\n" + format_rules["system_prompt_suffix"]
+            except Exception:
+                pass
 
-                react_start = time.time()
-                result = agent.run(task)
-                react_elapsed = round(time.time() - react_start, 2)
-                trace.record("code_agent_done", {"elapsed_seconds": react_elapsed, "result_preview": str(result)[:200]})
+            react_start = time.time()
+            result = agent.run(task)
+            react_elapsed = round(time.time() - react_start, 2)
+            trace.record("code_agent_done", {"elapsed_seconds": react_elapsed, "result_preview": str(result)[:200]})
 
             # 8. TraceCollector 存库
             if collector:
