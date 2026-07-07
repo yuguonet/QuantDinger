@@ -65,10 +65,15 @@ def _discover_and_register() -> int:
     global _tool_catalog
     count = 0
 
-    # 确保 tools 目录在 import 路径中
-    tools_parent = str(_TOOLS_DIR.parent)
-    if tools_parent not in sys.path:
-        sys.path.insert(0, tools_parent)
+    # 确保 app/agent/ 目录在 import 路径中（与 Flask 启动时一致）
+    # 这样 tools.xxx、llm.xxx、memory.xxx 等绝对导入都能工作
+    agent_dir = str(_TOOLS_DIR.parent)  # app/agent/
+    if agent_dir not in sys.path:
+        sys.path.insert(0, agent_dir)
+    # 同时确保 backend_api_python/ 也在路径中（for app.agent.xxx 导入）
+    backend_dir = str(_TOOLS_DIR.parent.parent.parent)  # backend_api_python/
+    if backend_dir not in sys.path:
+        sys.path.insert(0, backend_dir)
 
     for py_file in sorted(_TOOLS_DIR.glob("*.py")):
         module_name = py_file.stem
@@ -76,8 +81,8 @@ def _discover_and_register() -> int:
             continue
 
         try:
-            # 用完整包路径导入（与 QDToolAdapter 一致）
-            mod = importlib.import_module(f"app.agent.tools.{module_name}")
+            # 用 tools.xxx 导入（与 Flask 启动时 sys.path 一致）
+            mod = importlib.import_module(f"tools.{module_name}")
         except Exception as e:
             logger.debug("[MCP Bridge] 跳过模块 %s: %s", module_name, e)
             continue
