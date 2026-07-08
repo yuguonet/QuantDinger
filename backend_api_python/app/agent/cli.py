@@ -166,25 +166,33 @@ def main():
         print(f"💡 /quit 退出\n")
 
         async def _interactive_loop():
-            while True:
-                try:
-                    message = input("You> ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    print("\n👋 再见!")
-                    break
+            try:
+                while True:
+                    try:
+                        message = input("You> ").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        print("\n👋 再见!")
+                        break
 
-                if not message:
-                    continue
-                if message == "/quit":
-                    print("👋 再见!")
-                    break
+                    if not message:
+                        continue
+                    if message == "/quit":
+                        print("👋 再见!")
+                        break
 
+                    try:
+                        await _run_chat(message, session_id)
+                    except Exception as e:
+                        print(f"\n❌ 异常: {e}")
+                        import traceback
+                        traceback.print_exc()
+            finally:
+                # 退出时关闭 MCP 连接，避免 "Cannot close a running event loop" 警告
                 try:
-                    await _run_chat(message, session_id)
-                except Exception as e:
-                    print(f"\n❌ 异常: {e}")
-                    import traceback
-                    traceback.print_exc()
+                    from agents.task_agent import _mcp
+                    _mcp.close()
+                except Exception:
+                    pass
 
         asyncio.run(_interactive_loop())
 

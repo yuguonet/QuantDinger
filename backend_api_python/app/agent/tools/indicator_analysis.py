@@ -5,11 +5,11 @@ from app.agent.log import logger
 from typing import Any, Dict, List, Optional
 
 from app.agent.tools.indicator_tools import run_indicator_signal
-def indicator_analysis(stock_code: str, stock_name: str = "", user_id: int = 1) -> dict:
+def indicator_analysis(codes: str, stock_name: str = "", user_id: int = 1) -> dict:
     """指标策略批量分析：对多只股票执行用户自定义指标策略，返回每只股票的最新信号(buy/sell)和评分。
 
     Args:
-        stock_code: 股票代码，如 "600066"
+        codes: 股票代码，如 "600066"
         stock_name: 股票名称，可选
         user_id: 用户 ID，默认 1
 
@@ -33,7 +33,7 @@ def indicator_analysis(stock_code: str, stock_name: str = "", user_id: int = 1) 
     # ── 2. 逐个执行指标 + 回测 ──
     evaluated = []
     for ind in indicators[:5]:
-        result = _evaluate_indicator(ind["id"], stock_code, user_id)
+        result = _evaluate_indicator(ind["id"], codes, user_id)
         if result:
             evaluated.append(result)
 
@@ -176,7 +176,7 @@ def indicator_analysis(stock_code: str, stock_name: str = "", user_id: int = 1) 
 # 单指标评估
 # ═══════════════════════════════════════════════════════════════
 
-def _evaluate_indicator(indicator_id: int, stock_code: str, user_id: int) -> Optional[Dict[str, Any]]:
+def _evaluate_indicator(indicator_id: int, codes: str, user_id: int) -> Optional[Dict[str, Any]]:
     """对单个指标执行沙箱分析 + 回测，返回评估结果。"""
     from app.services.indicator_analyzer import analyze_indicator
     market = "CNStock"
@@ -185,7 +185,7 @@ def _evaluate_indicator(indicator_id: int, stock_code: str, user_id: int) -> Opt
     result = analyze_indicator(
         indicator_id=indicator_id,
         user_id=user_id,
-        symbol=stock_code,
+        symbol=codes,
         market=market,
         timeframe="1D",
         bars=300,
@@ -201,7 +201,7 @@ def _evaluate_indicator(indicator_id: int, stock_code: str, user_id: int) -> Opt
     # run_indicator_signal：最近5根K线的逐根信号
     sig = run_indicator_signal(
         indicator_id=indicator_id,
-        stock_code=stock_code,
+        codes=codes,
         timeframe="1D",
         days=10,
         user_id=user_id,

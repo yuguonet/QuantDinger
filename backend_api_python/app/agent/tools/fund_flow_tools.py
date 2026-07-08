@@ -11,16 +11,16 @@ import json
 from app.agent.log import logger
 from typing import Any, Dict, List
 from app.agent.utils.md_format import _batch_execute, _to_md
-def get_fund_flow(stock_codes: str = "") -> dict:
+def get_fund_flow(codes: str = "") -> dict:
     """个股资金流向：返回主力/散户/净流入金额、资金流向趋势。
 
     Args:
-        stock_codes: 股票代码，如 "000001" 或 "000001,600519"
+        codes: 股票代码，如 "000001" 或 "000001,600519"
     """
-    if not stock_codes or not stock_codes.strip():
-        return {"error": "stock_codes 不能为空", "retriable": False}
+    if not codes or not codes.strip():
+        return {"error": "codes 不能为空", "retriable": False}
 
-    codes = [c.strip() for c in stock_codes.split(",") if c.strip()][:20]
+    codes = [c.strip() for c in codes.split(",") if c.strip()][:20]
     from app.market_cn.tape import get_fund_flow_realtime
 
     results = {}

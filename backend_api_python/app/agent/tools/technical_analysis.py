@@ -254,16 +254,16 @@ def _algo_analyze(
         "stock_name": stock_name,
     }
     return _r
-def technical_analysis(stock_code: str, stock_name: str = "") -> dict:
+def technical_analysis(codes: str, stock_name: str = "") -> dict:
     """技术面综合评分：内部调用 analyze_trend+get_indicator_snapshot+get_volume_analysis+analyze_pattern+get_chip_distribution，加权输出 0-100 分。需要单股深度分析时用此工具，不要同时调 analyze_trend。
 
     Args:
-        stock_code: 股票代码（6位数字），如 "600519"
+        codes: 股票代码（6位数字），如 "600519"
         stock_name: 股票名称（可选），如 "贵州茅台"
 
     Returns:
         dict: 标准化分析报告，包含 score(0-100)、direction(bullish/bearish/neutral)、
               confidence(high/medium/low)、signal(信号摘要)、factors(因子明细)、analysis(分析文字)
     """
-    tool_results = _call_tools(stock_code)
-    return _algo_analyze(stock_code, stock_name, tool_results)
+    tool_results = _call_tools(codes)
+    return _algo_analyze(codes, stock_name, tool_results)

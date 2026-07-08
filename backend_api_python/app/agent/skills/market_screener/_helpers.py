@@ -135,7 +135,11 @@ def filter_candidates(prescreen_result: Dict) -> str:
         trn = c.get("turnover_pct", 0) or 0
         reason = c.get("reason", "") or ""
 
-        if src in ("ST股",) or trn < 2:
+        # ST股排除
+        if src in ("ST股",):
+            continue
+        # 换手率 < 2% 排除，但热点题材股数据缺失(=0)时不排除
+        if trn < 2 and not (src == "热点题材" and trn == 0):
             continue
 
         if strategy == "post_market":

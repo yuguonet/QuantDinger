@@ -22,16 +22,18 @@ tools:
 
 使用 `filter_candidates()` 辅助工具筛选，**不要自己写筛选代码**。输出结果由你自己生成，按 Phase 3 格式规则。
 
+工具通过 `mcp(action='call', tool_name='工具名', args={...})` 调用。
+
 ```python
 # step1: 获取候选
-result = pre_screen()
+result = mcp(action='call', tool_name='pre_screen')
 
 # step2: filter_candidates() → 自动按 strategy 筛选 → 返回 codes 字符串
-codes = filter_candidates(result)
+codes = mcp(action='call', tool_name='filter_candidates', args={'prescreen_result': result})
 
 # step3: deep_analyze(codes=codes) — codes 是逗号分隔的字符串
 if codes:
-    deep_result = deep_analyze(codes=codes)
+    deep_result = mcp(action='call', tool_name='deep_analyze', args={'codes': codes})
 else:
     deep_result = {"analyzed": [], "strategy": result.get("strategy", ""), "score": 0, "direction": "neutral"}
 
@@ -42,7 +44,7 @@ final_answer(你生成的markdown文本)
 ## Phase 1: 获取候选
 
 ```python
-result = pre_screen()
+result = mcp(action='call', tool_name='pre_screen')
 ```
 
 返回:

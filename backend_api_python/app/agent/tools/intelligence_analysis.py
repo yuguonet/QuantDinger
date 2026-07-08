@@ -11,11 +11,11 @@ from app.agent.tools.news_search_tools import (
     search_stock_intel,
     search_policy_intel,
 )
-def intelligence_analysis(stock_code: str) -> dict:
+def intelligence_analysis(codes: str) -> dict:
     """个股情报+政策面综合分析：搜索新闻公告研报 + 政策动态，返回情报评分和利空/利多信号。
 
     Args:
-        stock_code: 股票代码，如 "600066"
+        codes: 股票代码，如 "600066"
 
     Returns:
         {
@@ -34,10 +34,10 @@ def intelligence_analysis(stock_code: str) -> dict:
         }
     """
     
-    stock_name = _lookup_stock_name(stock_code)
+    stock_name = _lookup_stock_name(codes)
 
     # ── 个股情报 ──
-    stock_result, stock_score, stock_veto, stock_signals = _analyze_stock(stock_code, stock_name)
+    stock_result, stock_score, stock_veto, stock_signals = _analyze_stock(codes, stock_name)
 
     # ── 政策面 ──
     policy_result, policy_score, policy_veto, policy_signals = _analyze_policy()
@@ -91,7 +91,7 @@ def intelligence_analysis(stock_code: str) -> dict:
     all_signals = (stock_signals or []) + (policy_signals or [])
     extra = ["一票否决"] if veto else []
     analysis = _format_final_md(
-        title=f"{stock_code or '综合'}情报", score=final_score, direction=direction,
+        title=f"{codes or '综合'}情报", score=final_score, direction=direction,
         factors=factors, signals=all_signals, extra=extra,
     )
 
@@ -159,7 +159,7 @@ def intelligence_analysis(stock_code: str) -> dict:
 # 个股情报分析
 # ═══════════════════════════════════════════════════════════════
 
-def _analyze_stock(stock_code: str, stock_name: str):
+def _analyze_stock(codes: str, stock_name: str):
     """个股情报分析。返回 (result, score, veto, signals)。
 
     使用 search_stock_intel() → composite_score() (RMS + 时间衰减 + 一票否决)
@@ -172,7 +172,7 @@ def _analyze_stock(stock_code: str, stock_name: str):
     signals = []
 
     try:
-        result = search_stock_intel(stock_code, stock_name or "")
+        result = search_stock_intel(codes, stock_name or "")
         score = _composite_to_5(result.get("composite_score", 0))
         veto = result.get("veto", False)
 

@@ -168,13 +168,13 @@ def get_index_etf_quote(codes: str) -> dict:
 # 批量估值对比
 # ══════════════════════════════════════════════════════════════
 
-def batch_valuation_compare(stock_codes: str) -> dict:
+def batch_valuation_compare(codes: str) -> dict:
     """估值对比：返回多只股票的PE/PB/市值/营收并排对比表。
 
     Args:
-        stock_codes: 逗号分隔的股票代码，如 "600519,000858,688017"
+        codes: 逗号分隔的股票代码，如 "600519,000858,688017"
     """
-    code_list = [_strip_prefix(c.strip()) for c in stock_codes.split(",") if c.strip()]
+    code_list = [_strip_prefix(c.strip()) for c in codes.split(",") if c.strip()]
     if not code_list:
         return {"error": "请提供至少一个股票代码"}
     if len(code_list) > 20:
@@ -210,5 +210,5 @@ def batch_valuation_compare(stock_codes: str) -> dict:
         }
         return _r
     except Exception as e:
-        logger.warning("batch_valuation_compare(%s) failed: %s", stock_codes, e)
+        logger.warning("batch_valuation_compare(%s) failed: %s", codes, e)
         return {"error": str(e)}

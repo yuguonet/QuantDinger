@@ -48,4 +48,4 @@ final_answer(f"Stock info: {info}\nQuote: {quote}")
 
 If a tool fails, read the error message for the correct parameter name:
 - Most tools: args={'codes': '300599'}
-- Some tools: args={'stock_code': '300599'}
+

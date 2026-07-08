@@ -544,11 +544,11 @@ class BBScreenerSkill:
 # -*- coding: utf-8 -*-
 """BB超卖全市场扫描 — 布林带下轨突破策略筛选全市场，再对候选股做技术面深入分析。"""
 
-def bb_screener_scan(stock_code: str = "") -> dict:
+def bb_screener_scan(codes: str = "") -> dict:
     """布林带超卖全市场扫描：先筛选触及下轨的候选股，再对候选股做技术面深入分析返回推荐列表。
 
     Args:
-        stock_code: 股票代码，可选，为空则全市场扫描
+        codes: 股票代码，可选，为空则全市场扫描
     """
     from app.agent.tools import registry as tool_registry
     tool_registry.discover()

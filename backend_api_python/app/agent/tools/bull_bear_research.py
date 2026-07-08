@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """多空研究员 — 同时构建多头和空头论据，综合判断方向。"""
 from typing import Any, Dict, List
-def bull_bear_research(stock_code: str, stock_name: str = "") -> dict:
+def bull_bear_research(codes: str, stock_name: str = "") -> dict:
     """多空研究：对单只股票做技术面+筹码+情报综合分析，返回多空评分和方向判断。
 
     Args:
-        stock_code: 股票代码，如 "600066"
+        codes: 股票代码，如 "600066"
         stock_name: 股票名称，可选
 
     Returns:
@@ -26,11 +26,11 @@ def bull_bear_research(stock_code: str, stock_name: str = "") -> dict:
     # ── 获取数据 ──
     data = {}
     for name, fn in [
-        ("realtime_quote", lambda: get_realtime_quote(stock_code)),
-        ("trend", lambda: _analyze_trend(stock_code)),
-        ("volume", lambda: _get_volume_analysis(stock_code)),
-        ("indicator", lambda: _get_indicator_snapshot(stock_code)),
-        ("intel", lambda: _search_stock_intel(stock_code, stock_name or "")),
+        ("realtime_quote", lambda: get_realtime_quote(codes)),
+        ("trend", lambda: _analyze_trend(codes)),
+        ("volume", lambda: _get_volume_analysis(codes)),
+        ("indicator", lambda: _get_indicator_snapshot(codes)),
+        ("intel", lambda: _search_stock_intel(codes, stock_name or "")),
     ]:
         try:
             data[name] = fn()
@@ -184,9 +184,9 @@ def _analyze_trend(codes: str) -> Dict[str, Any]:
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
 
-    def _one(stock_code: str) -> Dict[str, Any]:
+    def _one(codes: str) -> Dict[str, Any]:
         try:
-            data = _fetch_ohlcv(stock_code, 120)
+            data = _fetch_ohlcv(codes, 120)
             closes = data["close"]
             if len(closes) < 5:
                 return {"error": "K线数据不足（至少需要5根）", "retriable": True}
@@ -324,7 +324,7 @@ def _analyze_trend(codes: str) -> Dict[str, Any]:
             change_pct = _safe_round((latest - prev) / prev * 100, 2) if prev else 0
 
             return {
-                "stock_code": stock_code,
+                "codes": codes,
                 "latest_close": _safe_round(latest),
                 "change_pct": change_pct,
                 "ma5": ma5, "ma10": ma10, "ma20": ma20, "ma60": ma60, "ma120": ma120,
@@ -342,7 +342,7 @@ def _analyze_trend(codes: str) -> Dict[str, Any]:
                 "data_points": len(closes),
             }
         except Exception as e:
-            logger.error("_analyze_trend(%s) failed: %s", stock_code, e)
+            logger.error("_analyze_trend(%s) failed: %s", codes, e)
             return {"error": str(e)}
 
     if len(code_list) == 1:
@@ -366,9 +366,9 @@ def _get_volume_analysis(codes: str) -> Dict[str, Any]:
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
 
-    def _one(stock_code: str) -> Dict[str, Any]:
+    def _one(codes: str) -> Dict[str, Any]:
         try:
-            data = _fetch_ohlcv(stock_code, 30)
+            data = _fetch_ohlcv(codes, 30)
             volumes = data["volume"]
             closes = data["close"]
             if len(volumes) < 5:
@@ -417,7 +417,7 @@ def _get_volume_analysis(codes: str) -> Dict[str, Any]:
                     vol_price_relation = "量价配合一般"
 
             return {
-                "stock_code": stock_code,
+                "codes": codes,
                 "latest_volume": _safe_round(latest_vol, 0),
                 "avg_volume_5d": _safe_round(avg_vol_5, 0),
                 "avg_volume_20d": _safe_round(avg_vol_20, 0),
@@ -428,7 +428,7 @@ def _get_volume_analysis(codes: str) -> Dict[str, Any]:
                 "vol_price_relation": vol_price_relation,
             }
         except Exception as e:
-            logger.error("_get_volume_analysis(%s) failed: %s", stock_code, e)
+            logger.error("_get_volume_analysis(%s) failed: %s", codes, e)
             return {"error": str(e)}
 
     if len(code_list) == 1:
@@ -452,9 +452,9 @@ def _analyze_pattern(codes: str) -> Dict[str, Any]:
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
 
-    def _one(stock_code: str) -> Dict[str, Any]:
+    def _one(codes: str) -> Dict[str, Any]:
         try:
-            data = _fetch_ohlcv(stock_code, 10)
+            data = _fetch_ohlcv(codes, 10)
             if len(data["close"]) < 3:
                 return {"error": "K线数据不足"}
 
@@ -561,7 +561,7 @@ def _analyze_pattern(codes: str) -> Dict[str, Any]:
                 patterns.append("无明显特殊形态")
 
             return {
-                "stock_code": stock_code,
+                "codes": codes,
                 "latest_candle": {"open": _safe_round(lo), "high": _safe_round(lh),
                                   "low": _safe_round(ll), "close": _safe_round(lc)},
                 "body_size": _safe_round(body),
@@ -571,7 +571,7 @@ def _analyze_pattern(codes: str) -> Dict[str, Any]:
                 "pattern_count": len([p for p in patterns if "无明显" not in p]),
             }
         except Exception as e:
-            logger.error("_analyze_pattern(%s) failed: %s", stock_code, e)
+            logger.error("_analyze_pattern(%s) failed: %s", codes, e)
             return {"error": str(e)}
 
     if len(code_list) == 1:
@@ -600,14 +600,14 @@ def _get_indicator_snapshot(codes: str) -> Dict[str, Any]:
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
 
-    def _one(stock_code: str) -> Dict[str, Any]:
+    def _one(codes: str) -> Dict[str, Any]:
         try:
-            data = _fetch_ohlcv(stock_code, 120)
+            data = _fetch_ohlcv(codes, 120)
             closes = data["close"]
             if len(closes) < 10:
                 return {"error": "K线数据不足（至少需要10根）", "retriable": True}
 
-            result = {"stock_code": stock_code, "latest_close": _safe_round(closes[-1])}
+            result = {"codes": codes, "latest_close": _safe_round(closes[-1])}
 
             for p in [5, 10, 20, 60, 120]:
                 if len(closes) >= p:
@@ -636,7 +636,7 @@ def _get_indicator_snapshot(codes: str) -> Dict[str, Any]:
 
             return result
         except Exception as e:
-            logger.error("_get_indicator_snapshot(%s) failed: %s", stock_code, e)
+            logger.error("_get_indicator_snapshot(%s) failed: %s", codes, e)
             return {"error": str(e)}
 
     if len(code_list) == 1:
@@ -747,9 +747,9 @@ def _search_stock_intel(codes: str, name: str = "") -> Dict[str, Any]:
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
 
-    def _one(stock_code: str) -> Dict[str, Any]:
-        items = _get_news(stock_code, "CNStock", name)
-        return _build_result(items, f"个股:{stock_code}")
+    def _one(codes: str) -> Dict[str, Any]:
+        items = _get_news(codes, "CNStock", name)
+        return _build_result(items, f"个股:{codes}")
 
     if len(code_list) == 1:
         return _one(code_list[0])

@@ -693,7 +693,6 @@ class TaskAgent(AgentBase):
         """
         from smolagents import CodeAgent as SmolCodeAgent
         from pathlib import Path
-        import yaml
 
         catalog = build_tool_catalog(mcp_tool_list)
 
@@ -721,21 +720,15 @@ class TaskAgent(AgentBase):
             planning_interval=planning_interval,
         )
 
-        # 注入工具使用说明（从文件加载）
-        _tool_usage_path = Path(__file__).resolve().parent.parent / "prompts" / "tool_usage.txt"
+        # 覆盖 smolagents 默认 system_prompt，使用自定义模板
+        # 保留 {{tools}} 和 {{managed_agents}} 占位符，smolagents 运行时会渲染
+        _system_prompt_path = Path(__file__).resolve().parent.parent / "prompts" / "code_agent_system.txt"
         try:
-            router_usage = "\n\n" + _tool_usage_path.read_text(encoding="utf-8")
-            agent.prompt_templates["system_prompt"] += router_usage
-        except Exception:
-            pass
-
-        # 注入格式规则
-        _rule_path = Path(__file__).resolve().parent.parent / "prompts" / "format_rules.yaml"
-        try:
-            format_rules = yaml.safe_load(_rule_path.read_text(encoding="utf-8"))
-            agent.prompt_templates["system_prompt"] += "\n" + format_rules["system_prompt_suffix"]
-        except Exception:
-            pass
+            custom_prompt = _system_prompt_path.read_text(encoding="utf-8")
+            agent.prompt_templates["system_prompt"] = custom_prompt
+            logger.info("[TaskAgent] 已加载自定义 system_prompt")
+        except Exception as e:
+            logger.warning("[TaskAgent] 自定义 system_prompt 加载失败: %s，使用默认", e)
 
         # 注入自定义 planning prompt（如果有 replan 间隔）
         if planning_interval:
@@ -768,7 +761,11 @@ class TaskAgent(AgentBase):
         logger.info("[TaskAgent] 执行阶段 %d: %s — %s", phase_id, phase_name, phase_goal)
 
         react_start = time.time()
+
+        # 包装 agent.run()，通过 max_steps 硬限制防止无限循环
+        # smolagents 的 max_steps 已经限制了总步数，这里不需要额外逻辑
         result = agent.run(task)
+
         react_elapsed = round(time.time() - react_start, 2)
 
         trace.record("phase_done", {
@@ -864,6 +861,37 @@ class TaskAgent(AgentBase):
             print(f"[DEBUG] plan: skills={selected_skills}, "
                   f"phases={[(p['name'], p['type']) for p in phases]}, pi={planning_interval}", flush=True)
 
+            # ── 1.5 股票解析（用户输入含股票关键词时，解析出标准 code+name）──
+            stock_code = ""
+            stock_name = ""
+            try:
+                from tools.data_tools import resolve_stock
+                # 从 expanded_query 或 user_input 中提取可能的股票关键词
+                import re as _re
+                # 匹配6位数字代码
+                code_match = _re.search(r'\b(\d{6})\b', user_input)
+                if code_match:
+                    stock_code = code_match.group(1)
+                else:
+                    # 尝试用中文名解析
+                    # 去掉常见动词前缀，保留股票名
+                    clean_input = _re.sub(r'分析|看看|查一下|怎么样|什么股|股票|推荐|选|买|卖', '', user_input).strip()
+                    if clean_input and len(clean_input) >= 2:
+                        result = resolve_stock(clean_input, limit=1)
+                        if isinstance(result, dict) and not result.get('error'):
+                            if result.get('code'):
+                                stock_code = result['code']
+                                stock_name = result.get('name', '')
+                            elif result.get('data'):
+                                first = result['data'][0]
+                                stock_code = first.get('code', '')
+                                stock_name = first.get('name', '')
+                if stock_code:
+                    logger.info("[TaskAgent] 股票解析: %s → %s %s", user_input, stock_code, stock_name)
+                    trace.record("stock_resolved", {"code": stock_code, "name": stock_name})
+            except Exception as e:
+                logger.debug("[TaskAgent] 股票解析跳过: %s", e)
+
             # ── 2. RAG 检索（所有阶段共享）──
             sources = []
             context = ""
@@ -880,6 +908,10 @@ class TaskAgent(AgentBase):
 
             # ── 3. 构建技能指令 ──
             task_parts = []
+            # 注入股票信息（如果有）
+            if stock_code:
+                stock_info = f"【股票】{stock_name}({stock_code})" if stock_name else f"【股票】{stock_code}"
+                task_parts.append(stock_info)
             if context:
                 task_parts.append(f"【参考资料】\n{context}")
 

@@ -69,13 +69,13 @@ def _algo_analyze(stock_code: str, stock_name: str, tool_results: dict, call_too
         "factors": factors, "analysis": analysis, "status": "ok",
     }
 
-def backtest_analysis(stock_code: str) -> Dict[str, Any]:
+def backtest_analysis(codes: str) -> Dict[str, Any]:
     """一站式回测：自动列出用户策略 → 逐个跑回测 → 返回最佳策略评分。等价于 list_strategies + run_backtest。
 
     Args:
-        stock_code: 股票代码，如 "600066"
+        codes: 股票代码，如 "600066"
     """
-    stock_name = _lookup_stock_name(stock_code)
+    stock_name = _lookup_stock_name(codes)
     results = {}
     try: results["list_strategies"] = _list_strategies()
     except Exception as e: results["list_strategies"] = {"error": str(e)}
@@ -84,7 +84,7 @@ def backtest_analysis(stock_code: str) -> Dict[str, Any]:
         if name == "run_backtest": return _run_backtest(**kwargs)
         raise ValueError(f"Unknown tool: {name}")
 
-    return _algo_analyze(stock_code, stock_name, results, call_tool_fn=call_tool_fn)
+    return _algo_analyze(codes, stock_name, results, call_tool_fn=call_tool_fn)
 
 
     main()
@@ -137,7 +137,7 @@ def _run_backtest(
 
     Args:
         strategy_id: 策略 ID
-        stock_code: 股票代码（如 600519）或交易对（如 BTC/USDT）
+        codes: 股票代码（如 600519）或交易对（如 BTC/USDT）
         start_date: 回测开始日期 YYYY-MM-DD
         end_date: 回测结束日期 YYYY-MM-DD
         timeframe: K 线周期，默认 1D（可选 1H, 4H, 1W）
