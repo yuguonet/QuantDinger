@@ -548,29 +548,27 @@ class TaskAgent(AgentBase):
         llm: LLMBase,
         trace: AgentTraceRecorder,
         mcp_tools: list | None = None,
-    ) -> tuple:
-        """Plan 节点：判断是否需要工具，选择技能或工具。
+    ) -> dict:
+        """Plan 节点：选择技能、划分执行阶段。
 
         设计决策：
           - _plan() 同时看到 MCP 工具列表和已有技能列表
-          - 有匹配技能 → selected_skills，走已有技能渐进式加载
-          - 无匹配技能 → selected_tools，下游自动生成临时 SKILL.md
+          - 输出统一格式：skills + phases + planning_interval
+          - phase.type=direct → LLM 直接回答（RAG + 知识）
+          - phase.type=execute → CodeAgent + 工具执行
+          - 单阶段 → planning_interval=None，跳过 eval
+          - 多阶段 → planning_interval=动态值，eval + 重试
           - skills 和 tools 互斥：有技能走技能，没技能走工具
 
-        为什么传 mcp_tools：
-          - Plan LLM 需要看到完整工具描述才能精确选择
-          - 选定的工具名映射回 MCP 工具对象，确保名称精确
-
-        扩展点：
-          - 未来可缓存编排路径：相同任务直接加载 SKILL.md，跳过 plan
-          - 未来可加 skill 权重：plan 参考历史收益率选择技能
-
         Returns:
-            (selected_skills, selected_tools, expanded_query, need_tools) 四元组。
-            selected_skills: 已有技能名列表
-            selected_tools: MCP 工具对象列表（仅无匹配技能时有值）
+            {
+              "skills": list[str],     # 已有技能名列表
+              "phases": list[dict],    # 阶段列表 [{id, name, type, goal, tools}]
+              "planning_interval": int | None,
+              "expanded_query": str,
+            }
         """
-        # 构建工具描述（供 LLM 在无技能时选择具体工具）
+        # 构建工具描述
         tools_desc = []
         if mcp_tools:
             for tool in mcp_tools:
@@ -612,14 +610,7 @@ class TaskAgent(AgentBase):
             if m:
                 text = m.group(1).strip()
 
-        plan = safe_parse_json(text, default={"skills": [], "steps": []})
-
-        # 路由判断：need_tools=false → 纯对话
-        need_tools = plan.get("need_tools", True)
-        if not need_tools:
-            logger.info("[TaskAgent] plan: 不需要工具，纯对话")
-            trace.record("plan_result", {"need_tools": False, "route": "chat"})
-            return [], [], user_input, False
+        plan = safe_parse_json(text, default={"skills": [], "phases": []})
 
         # 解析选定的技能
         selected_skill_names = plan.get("skills", [])
@@ -631,33 +622,45 @@ class TaskAgent(AgentBase):
             if name in all_skill_names:
                 selected_skills.append(name)
 
-        # 解析执行步骤（无匹配技能时，从 MCP 中选择工具 + 并行/串行分组）
-        mcp_tool_map = {t.name: t for t in mcp_tools} if mcp_tools else {}
-        steps = []
-        for step in plan.get("steps", []):
-            step_tools = []
-            for name in step.get("tools", []):
-                tool = mcp_tool_map.get(name)
-                if tool:
-                    step_tools.append(tool)
-                else:
-                    logger.warning("[TaskAgent] plan 选了未知工具: %s", name)
-            if step_tools:
-                steps.append({"tools": step_tools})
+        # 解析阶段
+        phases = plan.get("phases", [])
+        if not phases:
+            # 兜底：至少一个 direct 阶段
+            phases = [{"id": 0, "name": "回答", "type": "direct", "goal": plan.get("expanded_query", user_input), "tools": []}]
+
+        # 补全阶段字段
+        for i, phase in enumerate(phases):
+            phase.setdefault("id", i)
+            phase.setdefault("name", "执行")
+            phase.setdefault("type", "execute")
+            phase.setdefault("goal", "")
+            phase.setdefault("tools", [])
+
+        # 解析 planning_interval
+        planning_interval = plan.get("planning_interval", None)
+
+        # 单阶段不需要 planning_interval
+        if len(phases) <= 1:
+            planning_interval = None
 
         expanded_query = plan.get("expanded_query", user_input) or user_input
-        logger.info("[TaskAgent] plan: need_tools=%s, %d 技能 %s, %d 步骤 %s",
-                     need_tools,
+        logger.info("[TaskAgent] plan: %d 技能 %s, %d 阶段 %s, planning_interval=%s",
                      len(selected_skills), selected_skills,
-                     len(steps), [[t.name for t in s['tools']] for s in steps])
+                     len(phases), [(p["name"], p["type"]) for p in phases],
+                     planning_interval)
         trace.record("plan_result", {
-            "need_tools": True,
             "route": "mcp+plan",
             "selected_skills": selected_skills,
-            "steps": [{"tools": [t.name for t in s["tools"]]} for s in steps],
+            "phases": phases,
+            "planning_interval": planning_interval,
         })
 
-        return selected_skills, steps, expanded_query, True
+        return {
+            "skills": selected_skills,
+            "phases": phases,
+            "planning_interval": planning_interval,
+            "expanded_query": expanded_query,
+        }
 
 
     async def chat(
@@ -674,22 +677,152 @@ class TaskAgent(AgentBase):
             pass
         return await self._chat_plan(user_input, session_id, use_rag)
 
-    # ── MCP + Plan 执行 ──────────────────────────────────────
-    #
-    # 三条路径：
-    #   A. need_tools=false → 纯对话，不调工具
-    #   B. selected_skills 有值 → 已有技能渐进式加载
-    #   C. selected_tools 有值 → 自动生成临时 SKILL.md → 统一走技能流程
-    #
-    # CodeAgent 传 tools=[]，工具描述 0 token：
-    #   - MCP 工具通过 MCPExecutor 注入 static_tools（代码执行命名空间）
-    #   - 技能工具（SmolToolBase 子类）通过 tools=[] 留空，由 MCPExecutor 统一注入
-    #   - LLM 代码直接调用工具名，MCPExecutor 路由到 MCP bridge
-    #
-    # 扩展点：
-    #   - TraceCollector 存库后，盘后 Evaluator 自动回溯验证
-    #   - 验证结果更新 Skill/Factor 权重，反馈到下次 plan
-    #   - 编排路径缓存：重复任务跳过 plan，直接加载 SKILL.md
+    # ── 阶段执行与评估 ──────────────────────────────────────
+
+    def _build_code_agent(
+        self,
+        model,
+        mcp_tool_list: list,
+        skill_tools: list,
+        planning_interval: int | None = None,
+    ):
+        """构建 smolagents CodeAgent 实例。
+
+        每个阶段独立构建，避免状态污染。
+        planning_interval: None=不 replan，3~5=每 N 步 replan。
+        """
+        from smolagents import CodeAgent as SmolCodeAgent
+        from pathlib import Path
+        import yaml
+
+        catalog = build_tool_catalog(mcp_tool_list)
+
+        router_tool = MCPRouterTool(
+            tool_map={},
+            tool_catalog=catalog,
+        )
+
+        full_tool_map = {t.name: t for t in mcp_tool_list}
+        for st in skill_tools:
+            sname = getattr(st, "name", "unknown")
+            full_tool_map[sname] = st
+
+        mcp_executor = MCPExecutor(
+            router_tool=router_tool,
+            full_tool_map=full_tool_map,
+            additional_authorized_imports=["json", "datetime", "math", "re", "collections", "itertools"],
+        )
+
+        agent = SmolCodeAgent(
+            tools=[],
+            model=model,
+            max_steps=self.max_tool_rounds,
+            executor=mcp_executor,
+            planning_interval=planning_interval,
+        )
+
+        # 注入工具使用说明（从文件加载）
+        _tool_usage_path = Path(__file__).resolve().parent.parent / "prompts" / "tool_usage.txt"
+        try:
+            router_usage = "\n\n" + _tool_usage_path.read_text(encoding="utf-8")
+            agent.prompt_templates["system_prompt"] += router_usage
+        except Exception:
+            pass
+
+        # 注入格式规则
+        _rule_path = Path(__file__).resolve().parent.parent / "prompts" / "format_rules.yaml"
+        try:
+            format_rules = yaml.safe_load(_rule_path.read_text(encoding="utf-8"))
+            agent.prompt_templates["system_prompt"] += "\n" + format_rules["system_prompt_suffix"]
+        except Exception:
+            pass
+
+        # 注入自定义 planning prompt（如果有 replan 间隔）
+        if planning_interval:
+            _replan_path = Path(__file__).resolve().parent.parent / "prompts" / "replan_system.txt"
+            try:
+                replan_prompt = _replan_path.read_text(encoding="utf-8")
+                agent.prompt_templates["planning"]["initial_plan"] = replan_prompt
+                agent.prompt_templates["planning"]["update_plan_pre_messages"] = replan_prompt
+            except Exception:
+                pass
+
+        return agent
+
+    async def _execute_phase(
+        self,
+        task: str,
+        agent,
+        phase: dict,
+        trace: AgentTraceRecorder,
+    ) -> str:
+        """执行单个阶段。
+
+        phase 格式: {id, name, goal, tools}
+        返回: 阶段执行结果字符串
+        """
+        phase_id = phase.get("id", 0)
+        phase_name = phase.get("name", "执行")
+        phase_goal = phase.get("goal", "")
+
+        logger.info("[TaskAgent] 执行阶段 %d: %s — %s", phase_id, phase_name, phase_goal)
+
+        react_start = time.time()
+        result = agent.run(task)
+        react_elapsed = round(time.time() - react_start, 2)
+
+        trace.record("phase_done", {
+            "phase_id": phase_id,
+            "elapsed_seconds": react_elapsed,
+            "result_preview": str(result)[:200],
+        })
+
+        return str(result)
+
+    async def _eval_phase(
+        self,
+        phase: dict,
+        phase_result: str,
+        llm: LLMBase,
+    ) -> dict:
+        """评估阶段是否通过。
+
+        返回: {passed: bool, reason: str, suggestion: str}
+        """
+        from pathlib import Path
+
+        _eval_path = Path(__file__).resolve().parent.parent / "prompts" / "phase_eval.txt"
+        try:
+            eval_template = _eval_path.read_text(encoding="utf-8")
+        except Exception:
+            # 兜底：无评估模板则默认通过
+            return {"passed": True, "reason": "无评估模板，默认通过", "suggestion": ""}
+
+        prompt = eval_template.format(
+            phase_name=phase.get("name", ""),
+            phase_goal=phase.get("goal", ""),
+            phase_result=phase_result[:2000],  # 截断避免 token 爆炸
+        )
+
+        messages = [
+            ChatMessage(role="system", content="你是评估器。只输出 JSON。"),
+            ChatMessage(role="user", content=prompt),
+        ]
+
+        try:
+            response = await llm.generate(messages=messages)
+            text = response.content.strip()
+            if "```" in text:
+                m = re.search(r"```(?:json)?\s*\n(.*?)```", text, re.DOTALL)
+                if m:
+                    text = m.group(1).strip()
+            result = safe_parse_json(text, default={"passed": True, "reason": "解析失败，默认通过", "suggestion": ""})
+            return result
+        except Exception as e:
+            logger.warning("[TaskAgent] 阶段评估异常: %s，默认通过", e)
+            return {"passed": True, "reason": f"评估异常: {e}", "suggestion": ""}
+
+    # ── 主对话入口（多阶段循环）──────────────────────────────
 
     async def _chat_plan(
         self,
@@ -697,6 +830,11 @@ class TaskAgent(AgentBase):
         session_id: str,
         use_rag: bool,
     ) -> AgentResponse:
+        """主对话流程：Plan → 多阶段执行 → 评估。
+
+        量化任务: 1 个阶段，planning_interval=None
+        编程任务: 多个阶段，planning_interval=动态值
+        """
         print(f"[DEBUG] _chat_plan called: {user_input[:50]}", flush=True)
         start_time = time.time()
         trace = AgentTraceRecorder(
@@ -707,11 +845,6 @@ class TaskAgent(AgentBase):
         )
 
         try:
-            # 1. MCP 常驻连接（首次启动，之后复用）
-            from smolagents import CodeAgent as SmolCodeAgent
-            from pathlib import Path
-            import yaml
-
             mcp_ok = _mcp.available
             print(f"[DEBUG] MCP available: {mcp_ok}, tools: {len(_mcp.tools)}", flush=True)
             if not mcp_ok:
@@ -721,26 +854,17 @@ class TaskAgent(AgentBase):
             mcp_tool_list = _mcp.tools
             model = _LLMAdapter(self.llm)
 
-            # 2. Plan 选技能 + 选工具
-            selected_skills, steps, expanded_query, need_tools = await self._plan(
-                user_input, self.llm, trace, mcp_tools=mcp_tool_list,
-            )
-            print(f"[DEBUG] plan: need_tools={need_tools}, skills={selected_skills}, steps={len(steps)}", flush=True)
+            # ── 1. Plan ──
+            plan = await self._plan(user_input, self.llm, trace, mcp_tools=mcp_tool_list)
+            selected_skills = plan["skills"]
+            phases = plan["phases"]
+            planning_interval = plan["planning_interval"]
+            expanded_query = plan["expanded_query"]
 
-            # need_tools=false → 纯对话
-            if not need_tools:
-                trace.record("delegate_chat", {"reason": "plan: 不需要工具"})
-                trace.finish(response={"delegated_to": "AgentBase.chat"})
-                return await super().chat(user_input, session_id=session_id, use_rag=use_rag)
+            print(f"[DEBUG] plan: skills={selected_skills}, "
+                  f"phases={[(p['name'], p['type']) for p in phases]}, pi={planning_interval}", flush=True)
 
-            # 兜底：plan 说要工具但既没选技能也没选工具 → 降级纯对话
-            if not selected_skills and not steps:
-                logger.warning("[TaskAgent] plan: need_tools=true 但 skills 和 steps 均为空，降级纯对话")
-                trace.record("delegate_chat", {"reason": "plan: need_tools=true 但无工具"})
-                trace.finish(response={"delegated_to": "AgentBase.chat"})
-                return await super().chat(user_input, session_id=session_id, use_rag=use_rag)
-
-            # 3. RAG 检索
+            # ── 2. RAG 检索（所有阶段共享）──
             sources = []
             context = ""
             if use_rag and self.retriever:
@@ -754,12 +878,14 @@ class TaskAgent(AgentBase):
                     context = Retriever.format_context(docs)
                     sources = [{"content": d["content"][:200], "score": d.get("score", 0)} for d in docs]
 
-            # 4. 构建 task prompt（技能指令）
+            # ── 3. 构建技能指令 ──
             task_parts = []
             if context:
                 task_parts.append(f"【参考资料】\n{context}")
 
             loader = self._get_skill_loader()
+            temp_skill = None
+
             for sname in selected_skills:
                 try:
                     body = loader.load_body(sname)
@@ -778,36 +904,35 @@ class TaskAgent(AgentBase):
                 except Exception as e:
                     logger.warning("[TaskAgent] skill %s 加载失败: %s", sname, e)
 
-            # 无匹配技能时，从选定步骤生成临时 SKILL.md
-            temp_skill = None
-            if not selected_skills and steps:
-                temp_skill = _generate_temp_skill(steps, task_hint=user_input)
-                if temp_skill:
-                    selected_skills = [temp_skill["name"]]
-                    # 临时技能 body 注入 task prompt
-                    task_parts.append(f"【技能指令: {temp_skill['name']}】\n{temp_skill['body']}")
-                    logger.info("[TaskAgent] 自动生成技能: %s", temp_skill["name"])
-                    trace.record("temp_skill_generated", {"name": temp_skill["name"]})
+            # 无匹配技能时，从阶段工具生成临时 SKILL.md
+            if not selected_skills:
+                all_tools = []
+                for phase in phases:
+                    all_tools.extend(phase.get("tools", []))
+                if all_tools:
+                    # _generate_temp_skill 期望 tools 是带 .name 属性的对象
+                    _ToolStub = type("_ToolStub", (), {"__init__": lambda self, n: setattr(self, "name", n) or setattr(self, "inputs", {})})
+                    temp_steps = [{"tools": [_ToolStub(t) for t in all_tools]}]
+                    temp_skill = _generate_temp_skill(temp_steps, task_hint=user_input)
+                    if temp_skill:
+                        selected_skills = [temp_skill["name"]]
+                        task_parts.append(f"【技能指令: {temp_skill['name']}】\n{temp_skill['body']}")
+                        logger.info("[TaskAgent] 自动生成技能: %s", temp_skill["name"])
+                        trace.record("temp_skill_generated", {"name": temp_skill["name"]})
 
-            task_parts.append(f"【任务】\n{expanded_query}")
-            task = "\n\n".join(task_parts)
-
-            # 5. 加载技能工具（函数 + 渐进式加载）
+            # ── 4. 加载技能工具 ──
             skill_tools = []
             for sname in selected_skills:
-                # 临时技能：注入段落工具（body 已在步骤 4 注入 task prompt）
                 if temp_skill and sname == temp_skill["name"]:
                     skill_tools.append(_TempSkillSectionTool(temp_skill["body"], sname))
-                    logger.info("[TaskAgent] 临时技能 %s 注入段落工具", sname)
                     continue
-                # 已有技能：函数 + 段落 + 资源
                 func_tools = _load_skill_functions(sname)
                 skill_tools.extend(func_tools)
                 skill_tools.append(_SkillSectionTool(loader, sname))
                 skill_tools.append(_SkillResourceTool(loader, sname))
                 logger.info("[TaskAgent] skill %s 注入函数工具: %s", sname, [t.name for t in func_tools])
 
-            # 6. 创建 TraceCollector
+            # ── 5. 创建 TraceCollector ──
             collector = None
             try:
                 from trace_collector import TraceCollector
@@ -818,86 +943,119 @@ class TaskAgent(AgentBase):
             except Exception as e:
                 logger.debug("[Trace] TraceCollector 创建失败: %s", e)
 
-            # 7. CodeAgent 执行（Router 模式）
-            #
-            # 核心：1 个 router 工具 → 路由到所有 MCP 工具
-            #
-            #   tools=[mcp_router]     ← 只传 1 个工具，~100 tokens
-            #   5000 MCP tools vs 50:  prompt token 完全一样
-            #
-            # LLM 生成的代码：
-            #   tools = mcp(action="list", category="stock_data")  # 发现
-            #   result = mcp(action="call", tool_name="get_kline", args={...})  # 调用
-            #
-            # 技能工具也通过 router 注入：
-            #   skill_tools 的 forward() 包装为 MCP 可调用，router 统一管理
-            # catalog: 全量 MCP 工具（mcp(action='list') 可返回所有工具）
-            catalog = build_tool_catalog(mcp_tool_list)
-            logger.info("[TaskAgent] Router 模式: %d MCP 工具 + %d 技能工具",
-                        len(catalog), len(skill_tools))
-            trace.record("code_agent_setup", {
-                "mcp_tools": len(mcp_tool_list),
-                "skill_tools": len(skill_tools),
-                "executor": "MCPExecutor",
-                "mode": "router",
-            })
+            # ── 6. 阶段执行循环 ──
+            phase_results = []
+            max_retries = 1
+            is_single_phase = len(phases) == 1
 
-            # ── 构建工具体系 ──
-            # tools=[]: 不传工具给 smolagents，统一走 router
-            # executor: router 接全量 MCP 工具（运行时可调任何工具）
-            # plan 选中的工具通过 SKILL.md 注入签名，LLM 用 mcp(action='call') 统一调用
+            for phase in phases:
+                phase_id = phase.get("id", 0)
+                phase_name = phase.get("name", "执行")
+                phase_type = phase.get("type", "execute")
+                phase_goal = phase.get("goal", "")
 
-            router_tool = MCPRouterTool(
-                tool_map={},
-                tool_catalog=catalog,
-            )
+                trace.record("phase_start", {"phase_id": phase_id, "phase_name": phase_name, "phase_type": phase_type, "phase_goal": phase_goal})
 
-            full_tool_map = {t.name: t for t in mcp_tool_list}
-            for st in skill_tools:
-                sname = getattr(st, "name", "unknown")
-                full_tool_map[sname] = st
+                # ── direct 类型：RAG + Memory + LLM 直接回答 ──
+                if phase_type == "direct":
+                    logger.info("[TaskAgent] 阶段 %d: direct — %s", phase_id, phase_name)
+                    messages = [ChatMessage(role="system", content=self.system_prompt)]
+                    if context:
+                        messages.append(ChatMessage(role="system", content=f"【参考资料】\n{context}"))
+                    if self.memory:
+                        history = await self.memory.get_history(session_id, limit=self.memory_window_size)
+                        for msg in history:
+                            messages.append(ChatMessage(role=msg.role, content=msg.content))
+                    messages.append(ChatMessage(role="user", content=user_input))
+                    llm_response = await self.llm.generate(messages=messages)
+                    phase_result = llm_response.content
+                    phase_results.append({
+                        "phase": phase,
+                        "result": phase_result,
+                        "passed": True,
+                        "retries": 0,
+                    })
+                    continue
 
-            mcp_executor = MCPExecutor(
-                router_tool=router_tool,
-                full_tool_map=full_tool_map,
-                additional_authorized_imports=["json", "datetime", "math", "re", "collections", "itertools"],
-            )
+                # ── execute 类型：CodeAgent + 工具 ──
+                logger.info("[TaskAgent] 阶段 %d: execute — %s", phase_id, phase_name)
 
-            agent = SmolCodeAgent(
-                tools=[],              # ← 全走 router
-                model=model,
-                max_steps=self.max_tool_rounds,
-                executor=mcp_executor,
-            )
+                # 构建阶段任务
+                phase_roadmap = self._build_phase_roadmap(phases, phase_id)
+                phase_task_parts = list(task_parts)
+                phase_task_parts.append(phase_roadmap)
+                phase_task_parts.append(f"【当前阶段】{phase_name} — {phase_goal}")
+                phase_task_parts.append(f"【任务】\n{expanded_query}")
+                phase_task = "\n\n".join(phase_task_parts)
 
-            # 注入工具使用说明到 system prompt
-            router_usage = (
-                "\n\n## Tool Usage\n"
-                "All tools are called via mcp router:\n"
-                "  result = mcp(action='call', tool_name='get_realtime_quote', args={'codes': '300599'})\n"
-                "If parameter error, the error response will include correct params. Retry with correct params.\n"
-            )
-            agent.prompt_templates["system_prompt"] += router_usage
+                # 构建 CodeAgent（每阶段独立）
+                agent = self._build_code_agent(
+                    model=model,
+                    mcp_tool_list=mcp_tool_list,
+                    skill_tools=skill_tools,
+                    planning_interval=planning_interval,
+                )
 
-            _rule_path = Path(__file__).resolve().parent.parent / "prompts" / "format_rules.yaml"
-            try:
-                format_rules = yaml.safe_load(_rule_path.read_text(encoding="utf-8"))
-                agent.prompt_templates["system_prompt"] += "\n" + format_rules["system_prompt_suffix"]
-            except Exception:
-                pass
+                # 单阶段：直接执行，跳过 eval
+                if is_single_phase:
+                    phase_result = await self._execute_phase(phase_task, agent, phase, trace)
+                    phase_results.append({
+                        "phase": phase,
+                        "result": phase_result,
+                        "passed": True,
+                        "retries": 0,
+                    })
+                    continue
 
-            react_start = time.time()
-            result = agent.run(task)
-            react_elapsed = round(time.time() - react_start, 2)
-            trace.record("code_agent_done", {"elapsed_seconds": react_elapsed, "result_preview": str(result)[:200]})
+                # 多阶段：执行 + eval + 重试
+                retry_count = 0
+                phase_passed = False
+                phase_result = ""
 
-            # 8. TraceCollector 存库
+                while retry_count <= max_retries:
+                    phase_result = await self._execute_phase(phase_task, agent, phase, trace)
+
+                    # 评估阶段
+                    eval_result = await self._eval_phase(phase, phase_result, self.llm)
+                    phase_passed = eval_result.get("passed", True)
+
+                    if phase_passed:
+                        logger.info("[TaskAgent] 阶段 %d 通过: %s", phase_id, phase_name)
+                        break
+
+                    retry_count += 1
+                    if retry_count <= max_retries:
+                        logger.info("[TaskAgent] 阶段 %d 未通过，重试 %d/%d: %s",
+                                    phase_id, retry_count, max_retries, eval_result.get("reason", ""))
+                        trace.record("phase_retry", {
+                            "phase_id": phase_id,
+                            "retry": retry_count,
+                            "reason": eval_result.get("reason", ""),
+                        })
+                        # 重试时注入失败原因
+                        phase_task += f"\n\n【上次执行问题】{eval_result.get('reason', '')}\n{eval_result.get('suggestion', '')}"
+                    else:
+                        logger.warning("[TaskAgent] 阶段 %d 重试耗尽，继续下一阶段", phase_id)
+                        trace.record("phase_failed", {
+                            "phase_id": phase_id,
+                            "reason": eval_result.get("reason", ""),
+                        })
+
+                phase_results.append({
+                    "phase": phase,
+                    "result": phase_result,
+                    "passed": phase_passed,
+                    "retries": retry_count,
+                })
+
+            # ── 7. TraceCollector 存库 ──
             if collector:
                 try:
                     collector.end_skill()
+                    final_answer = "\n\n".join(r["result"] for r in phase_results)
                     collector.on_agent_finish(
-                        final_answer=str(result),
-                        total_steps=1,
+                        final_answer=final_answer,
+                        total_steps=len(phase_results),
                         total_tokens=0,
                         model=getattr(self.llm, "model", "unknown"),
                     )
@@ -907,17 +1065,20 @@ class TaskAgent(AgentBase):
                 finally:
                     _collectors.pop(session_id, None)
 
-            result_raw = str(result)
+            # ── 8. 汇总结果 ──
+            if len(phase_results) == 1:
+                result_raw = phase_results[0]["result"]
+            else:
+                result_parts = []
+                for pr in phase_results:
+                    status = "✅" if pr["passed"] else "❌"
+                    result_parts.append(f"{status} 阶段: {pr['phase'].get('name', '')}\n{pr['result']}")
+                result_raw = "\n\n".join(result_parts)
 
-            # 9. 保存对话历史
+            # ── 9. 保存对话历史 ──
             if self.memory:
                 await self.memory.add(session_id, "user", user_input)
-                try:
-                    full_messages = agent.write_memory_to_messages(summary_mode=True)
-                    steps_text = [m.content for m in full_messages if getattr(m, "role", "") == "assistant" and m.content]
-                    await self.memory.add(session_id, "assistant", "\n".join(steps_text) if steps_text else result_raw)
-                except Exception:
-                    await self.memory.add(session_id, "assistant", result_raw)
+                await self.memory.add(session_id, "assistant", result_raw)
 
             elapsed = round(time.time() - start_time, 2)
             response = AgentResponse(
@@ -925,7 +1086,7 @@ class TaskAgent(AgentBase):
                 sources=sources,
                 session_id=session_id,
                 elapsed_seconds=elapsed,
-                metadata={"trace_id": trace.trace_id},
+                metadata={"trace_id": trace.trace_id, "phase_count": len(phases), "phase_types": [p.get("type") for p in phases]},
             )
             trace.finish(response=response.to_dict())
             return response
@@ -934,3 +1095,19 @@ class TaskAgent(AgentBase):
             trace.fail(e)
             _collectors.pop(session_id, None)
             raise
+
+    def _build_phase_roadmap(self, phases: list, current_phase_id: int) -> str:
+        """构建阶段路线图提示（全量可见，标记当前阶段）。"""
+        lines = ["【执行路线图】（仅作参考，不要跳过当前阶段）"]
+        for phase in phases:
+            pid = phase.get("id", 0)
+            name = phase.get("name", "")
+            goal = phase.get("goal", "")
+            if pid == current_phase_id:
+                lines.append(f"  → 阶段{pid}: {name} — {goal} ← 你在这里")
+            elif pid < current_phase_id:
+                lines.append(f"  ✓ 阶段{pid}: {name}")
+            else:
+                lines.append(f"  ○ 阶段{pid}: {name} — {goal}")
+        lines.append("\n【约束】完成当前阶段后输出结果，不要自行进入下一阶段。")
+        return "\n".join(lines)

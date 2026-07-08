@@ -127,6 +127,9 @@ class MCPRouterTool(SmolToolBase):
                     return json.loads(result)
                 except (json.JSONDecodeError, TypeError):
                     return result
+            # 成功时附加提示，引导 LLM 调用 final_answer
+            if isinstance(result, dict):
+                result["_hint"] = "调用成功。如果已获取足够数据，请调用 final_answer() 返回结果。不要重复调用同一工具。"
             return result
         except Exception as e:
             # pydantic 验证错误 → 返回正确参数名，让 LLM 纠正
@@ -136,11 +139,12 @@ class MCPRouterTool(SmolToolBase):
                 if tool:
                     inputs = getattr(tool, "inputs", {}) or {}
                     correct_params = list(inputs.keys())
+                    # 构建示例 args（用 '300599' 作为示例值）
+                    example_args = ", ".join(f"'{k}': '300599'" for k in correct_params)
                     return {
-                        "error": f"参数错误: {err_msg}",
-                        "correct_usage": f"mcp(action='call', tool_name='{tool_name}', args={{正确的参数}})",
-                        "required_params": inputs,
-                        "hint": f"请使用正确的参数名: {correct_params}, 然后重试",
+                        "error": f"参数名错误。你用了 {list(args.keys())}，但 {tool_name} 需要 {correct_params}",
+                        "correct_code": f"mcp(action='call', tool_name='{tool_name}', args={{{example_args}}})",
+                        "hint": f"复制上面的 correct_code 重试，注意参数名是 {correct_params} 不是 {list(args.keys())}",
                     }
             return {"error": f"Tool '{tool_name}' failed: {e}"}
 
