@@ -478,16 +478,28 @@ def _generate_temp_skill(steps: list, task_hint: str = "") -> dict | None:
         steps_lines.append(f"调用: {', '.join(names)}\n")
     steps_md = "\n".join(steps_lines)
 
-    body = f"""
+    # 从 steps 中收集工具签名（去重）
+    seen = set()
+    tool_sigs = []
+    for step in steps:
+        for t in step["tools"]:
+            tname = getattr(t, "name", "unknown")
+            if tname in seen:
+                continue
+            seen.add(tname)
+            tinputs = getattr(t, "inputs", {}) or {}
+            params = ", ".join(f"{p}: {i.get('type', 'string')}" for p, i in tinputs.items())
+            tool_sigs.append(f"  {tname}({params})")
 
-# {skill_name}
+    body = f"""# {skill_name}
 
 {steps_md}
+## 工具签名
 
-## 执行规则
+"""
+    body += "\n".join(tool_sigs)
+    body += """
 
-1. 按步骤顺序执行，根据数据依赖自行决定代码块结构
-2. 汇总所有工具输出，给出最终分析
 """
 
     return {"name": skill_name, "body": body}
@@ -819,14 +831,9 @@ class TaskAgent(AgentBase):
             #
             # 技能工具也通过 router 注入：
             #   skill_tools 的 forward() 包装为 MCP 可调用，router 统一管理
-            # catalog 只含 plan 选中的工具（不构建全量）
-            selected_tool_names = set()
-            if steps:
-                for step in steps:
-                    for tool in step["tools"]:
-                        selected_tool_names.add(getattr(tool, "name", ""))
-            catalog = [t for t in build_tool_catalog(mcp_tool_list) if t["name"] in selected_tool_names]
-            logger.info("[TaskAgent] Router 模式: 选中 %d MCP 工具 + %d 技能工具",
+            # catalog: 全量 MCP 工具（mcp(action='list') 可返回所有工具）
+            catalog = build_tool_catalog(mcp_tool_list)
+            logger.info("[TaskAgent] Router 模式: %d MCP 工具 + %d 技能工具",
                         len(catalog), len(skill_tools))
             trace.record("code_agent_setup", {
                 "mcp_tools": len(mcp_tool_list),
@@ -835,45 +842,39 @@ class TaskAgent(AgentBase):
                 "mode": "router",
             })
 
-            # 构建 tool_map: 只注入 plan 选中的工具（不注入全量 MCP）
-            tool_map = {}
-            if steps:
-                mcp_map = {t.name: t for t in mcp_tool_list}
-                for step in steps:
-                    for tool in step["tools"]:
-                        tname = getattr(tool, "name", "unknown")
-                        if tname not in tool_map:
-                            tool_map[tname] = mcp_map.get(tname, tool)
-            # 技能工具也注册
-            for st in skill_tools:
-                sname = getattr(st, "name", "unknown")
-                tool_map[sname] = st
+            # ── 构建工具体系 ──
+            # tools=[]: 不传工具给 smolagents，统一走 router
+            # executor: router 接全量 MCP 工具（运行时可调任何工具）
+            # plan 选中的工具通过 SKILL.md 注入签名，LLM 用 mcp(action='call') 统一调用
 
             router_tool = MCPRouterTool(
-                tool_map=tool_map,
+                tool_map={},
                 tool_catalog=catalog,
             )
 
+            full_tool_map = {t.name: t for t in mcp_tool_list}
+            for st in skill_tools:
+                sname = getattr(st, "name", "unknown")
+                full_tool_map[sname] = st
+
             mcp_executor = MCPExecutor(
                 router_tool=router_tool,
+                full_tool_map=full_tool_map,
                 additional_authorized_imports=["json", "datetime", "math", "re", "collections", "itertools"],
             )
 
             agent = SmolCodeAgent(
-                tools=[router_tool],   # ← 1 个工具，~100 tokens
+                tools=[],              # ← 全走 router
                 model=model,
                 max_steps=self.max_tool_rounds,
                 executor=mcp_executor,
             )
 
-            # 注入 router 使用说明到 system prompt
+            # 注入工具使用说明到 system prompt
             router_usage = (
-                "\n\n## Tool Usage (MANDATORY)\n"
-                "You have ONE tool: **mcp** — a router to backend tools.\n"
-                "\n"
-                "Call tools directly:\n"
+                "\n\n## Tool Usage\n"
+                "All tools are called via mcp router:\n"
                 "  result = mcp(action='call', tool_name='get_realtime_quote', args={'codes': '300599'})\n"
-                "\n"
                 "If parameter error, the error response will include correct params. Retry with correct params.\n"
             )
             agent.prompt_templates["system_prompt"] += router_usage

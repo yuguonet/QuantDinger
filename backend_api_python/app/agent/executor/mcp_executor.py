@@ -154,17 +154,22 @@ class MCPExecutor(LocalPythonExecutor):
 
     继承 LocalPythonExecutor，override send_tools()：
       static_tools = {**BASE_PYTHON_TOOLS, "mcp": router_tool, ...}
+
+    full_tool_map 在 send_tools 时注入 router，使 router 可路由到全量 MCP 工具。
     """
 
-    def __init__(self, router_tool: MCPRouterTool, **kwargs):
+    def __init__(self, router_tool: MCPRouterTool, full_tool_map: dict | None = None, **kwargs):
         super().__init__(**kwargs)
         self._router = router_tool
+        self._full_tool_map = full_tool_map or {}
 
     def send_tools(self, tools: dict):
-        """Override: 注入 mcp router 到 static_tools。"""
+        """Override: 注入全量工具到 router，再注入 router 到 static_tools。"""
+        # 先把全量工具注入 router 的 tool_map（运行时可调任何工具）
+        self._router._tool_map.update(self._full_tool_map)
         super().send_tools(tools)
         self.static_tools["mcp"] = self._router.forward
-        logger.debug("[MCPExecutor] mcp router 已注入 static_tools")
+        logger.debug("[MCPExecutor] mcp router 已注入 static_tools，可调用 %d 个工具", len(self._router._tool_map))
 
 
 # ═══════════════════════════════════════════════════════════════
