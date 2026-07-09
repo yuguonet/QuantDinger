@@ -162,6 +162,21 @@ class MCPExecutor(LocalPythonExecutor):
       static_tools = {**BASE_PYTHON_TOOLS, "mcp": router_tool, ...}
 
     full_tool_map 在 send_tools 时注入 router，使 router 可路由到全量 MCP 工具。
+
+    ══ 为什么用 router 模式，不把 MCP 工具注册为 smolagents Tool？ ══
+
+    smolagents 的 tools=[Tool1, Tool2, ...] 会把所有工具描述写入 system prompt。
+    70+ 个 MCP 工具 × ~100 token/工具 ≈ 7000 token，对小模型是沉重负担。
+
+    router 模式只注册 mcp 一个工具（~100 token），LLM 通过：
+      mcp(action="list")                    → 动态发现所有工具
+      mcp(action="call", tool_name="...", args={...})  → 调用
+    token 成本从 7000 降到 100，且工具数量增长不影响 prompt 长度。
+
+    所以：
+    - SmolCodeAgent(tools=[], ...) 是故意的，不要往里塞 MCP 工具
+    - MCP 工具全部走 mcp router，不走 smolagents 原生 Tool
+    - system prompt 里教 LLM 用 mcp(action="list/call") 即可
     """
 
     def __init__(self, router_tool: MCPRouterTool, full_tool_map: dict | None = None, **kwargs):

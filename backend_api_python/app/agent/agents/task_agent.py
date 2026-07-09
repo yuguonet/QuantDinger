@@ -1,22 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-任务型 Agent — MCP + Plan
+任务型 Agent — 统一多阶段
 
 流程：
   user input
     -> 负面反馈检测
-    -> plan: LLM 决定用哪些技能/工具
-    -> 有技能 → 已有技能渐进式加载
-    -> 无技能 → 自动生成临时 SKILL.md
-    -> MCPExecutor 注入 MCP 工具到代码执行命名空间 → CodeAgent(tools=[]) 执行
+    -> plan: LLM 选择技能、划分阶段（不选具体工具）
+    -> 统一多阶段循环：
+       - skill 阶段：加载技能指令 + 工具 → CodeAgent 执行
+       - execute 阶段：MCP 通用工具 → CodeAgent 执行
+       - direct 阶段：LLM 直接回答
+    -> 规则 eval（结果非空 → passed）
     -> response
 
 设计要点：
   - MCP 常驻连接，首次启动后复用，避免每次请求 2-3s 启动开销
-  - _plan() 同时选技能和工具：有技能走技能，没技能走工具+自动生成SKILL.md
-  - CodeAgent 传 tools=[]，工具描述 0 token；MCP 工具通过 MCPExecutor 注入 static_tools
-  - LLM 生成的 Python 代码直接调用 MCP 工具名，由 MCPExecutor 路由到 MCP bridge
-  - 临时 SKILL.md 存内存，后续可持久化为编排路径，重复任务直接加载跳过 plan
+  - _plan() 只看技能列表，不看 MCP 全量工具（工具在执行阶段自动注入）
+  - 统一多阶段：所有任务走同一套循环，无单阶段/多阶段分支
+  - eval 用规则判断，不调 LLM，省 token
 """
 from __future__ import annotations
 
@@ -27,6 +28,8 @@ import os
 import re
 import time
 from typing import Dict, List, Optional
+
+import yaml
 
 import nest_asyncio
 nest_asyncio.apply()
@@ -65,6 +68,12 @@ _PLAN_TEMPLATE_PATH = os.path.join(
     os.path.dirname(__file__), "..", "prompts", "plan_system.txt"
 )
 
+# CodeAgent YAML 提示词模板（缓存）
+_CODE_AGENT_YAML: dict | None = None
+_CODE_AGENT_YAML_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "prompts", "code_agent.yaml"
+)
+
 
 def _load_plan_template() -> str:
     global _PLAN_TEMPLATE
@@ -72,6 +81,14 @@ def _load_plan_template() -> str:
         with open(_PLAN_TEMPLATE_PATH, encoding="utf-8") as f:
             _PLAN_TEMPLATE = f.read()
     return _PLAN_TEMPLATE
+
+
+def _load_code_agent_yaml() -> dict:
+    global _CODE_AGENT_YAML
+    if _CODE_AGENT_YAML is None:
+        with open(_CODE_AGENT_YAML_PATH, encoding="utf-8") as f:
+            _CODE_AGENT_YAML = yaml.safe_load(f)
+    return _CODE_AGENT_YAML
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -460,61 +477,15 @@ _mcp = _MCPSingleton()
 # ═══════════════════════════════════════════════════════════════
 
 
-def _generate_temp_skill(steps: list, task_hint: str = "") -> dict | None:
-    """从选定的执行步骤生成临时 SKILL.md（Anthropic 标准格式）。
-
-    返回 {name, body}。body 符合 SKILL.md 规范：YAML frontmatter + markdown 标题结构。
-    """
-    if not steps:
-        return None
-
-    skill_name = "auto_skill"
-
-    # 构建执行步骤 markdown（不标注串行/并行，LLM 自行决定代码块结构）
-    steps_lines = []
-    for i, step in enumerate(steps, 1):
-        names = [t.name for t in step["tools"]]
-        steps_lines.append(f"## 步骤 {i}\n")
-        steps_lines.append(f"调用: {', '.join(names)}\n")
-    steps_md = "\n".join(steps_lines)
-
-    # 从 steps 中收集工具签名（去重）
-    seen = set()
-    tool_sigs = []
-    for step in steps:
-        for t in step["tools"]:
-            tname = getattr(t, "name", "unknown")
-            if tname in seen:
-                continue
-            seen.add(tname)
-            tinputs = getattr(t, "inputs", {}) or {}
-            params = ", ".join(f"{p}: {i.get('type', 'string')}" for p, i in tinputs.items())
-            tool_sigs.append(f"  {tname}({params})")
-
-    body = f"""# {skill_name}
-
-{steps_md}
-## 工具签名
-
-"""
-    body += "\n".join(tool_sigs)
-    body += """
-
-"""
-
-    return {"name": skill_name, "body": body}
-
-
-    # ── 主对话入口 ────────────────────────────────────────────
 
 
 class TaskAgent(AgentBase):
     """
-    任务型 Agent — MCP + Plan
+    任务型 Agent — 统一多阶段
 
-    1. plan: LLM 决定用哪些技能
-    2. MCP 加载全部工具，技能按需加载
-    3. CodeAgent 执行
+    1. plan: LLM 选择技能、划分阶段
+    2. 统一多阶段循环：skill/execute/direct
+    3. 规则 eval
     """
 
     def __init__(
@@ -547,35 +518,23 @@ class TaskAgent(AgentBase):
         user_input: str,
         llm: LLMBase,
         trace: AgentTraceRecorder,
-        mcp_tools: list | None = None,
     ) -> dict:
         """Plan 节点：选择技能、划分执行阶段。
 
         设计决策：
-          - _plan() 同时看到 MCP 工具列表和已有技能列表
-          - 输出统一格式：skills + phases + planning_interval
-          - phase.type=direct → LLM 直接回答（RAG + 知识）
-          - phase.type=execute → CodeAgent + 工具执行
-          - 单阶段 → planning_interval=None，跳过 eval
-          - 多阶段 → planning_interval=动态值，eval + 重试
-          - skills 和 tools 互斥：有技能走技能，没技能走工具
+          - _plan() 只看技能列表，不看 MCP 全量工具（工具在执行阶段自动注入）
+          - 输出统一格式：phases + planning_interval
+          - phase.type=skill → 加载该技能的 SKILL.md + 工具
+          - phase.type=execute → CodeAgent + MCP 通用工具
+          - phase.type=direct → LLM 直接回答（不调工具）
 
         Returns:
             {
-              "skills": list[str],     # 已有技能名列表
-              "phases": list[dict],    # 阶段列表 [{id, name, type, goal, tools}]
-              "planning_interval": int | None,
+              "phases": list[dict],    # [{id, name, type, skill?, goal}]
+              "planning_interval": int,
               "expanded_query": str,
             }
         """
-        # 构建工具描述
-        tools_desc = []
-        if mcp_tools:
-            for tool in mcp_tools:
-                desc = getattr(tool, 'description', '') or ''
-                tools_desc.append(f"- {tool.name}: {desc[:80]}")
-        tools_text = "\n".join(tools_desc) if tools_desc else "(无可用工具)"
-
         # 构建技能描述
         skills_desc = []
         if self.skill_adapter:
@@ -584,7 +543,7 @@ class TaskAgent(AgentBase):
         skills_text = "\n".join(skills_desc) if skills_desc else "(无可用技能)"
 
         template = _load_plan_template()
-        prompt = template.format(tools_text=tools_text, skills_text=skills_text, user_input=user_input)
+        prompt = template.format(skills_text=skills_text, user_input=user_input)
 
         messages = [
             ChatMessage(role="system", content="你是任务规划器。只输出 JSON。"),
@@ -593,7 +552,6 @@ class TaskAgent(AgentBase):
 
         trace.record("plan_request", {
             "model": getattr(llm, "model", ""),
-            "tools_available": [t.name for t in mcp_tools] if mcp_tools else [],
             "skills_available": [s["name"] for s in self.skill_adapter.list_skills()] if self.skill_adapter else [],
         })
 
@@ -604,59 +562,57 @@ class TaskAgent(AgentBase):
             **llm_response_to_dict(response),
         })
 
-        text = response.content.strip()
+        text = (response.content or "").strip()
         if "```" in text:
             m = re.search(r"```(?:json)?\s*\n(.*?)```", text, re.DOTALL)
             if m:
                 text = m.group(1).strip()
 
-        plan = safe_parse_json(text, default={"skills": [], "phases": []})
-
-        # 解析选定的技能
-        selected_skill_names = plan.get("skills", [])
-        all_skill_names = {s["name"] for s in self.skill_adapter.list_skills()} if self.skill_adapter else set()
-        selected_skills = []
-        for name in selected_skill_names:
-            if name.startswith("skill:"):
-                name = name[6:]
-            if name in all_skill_names:
-                selected_skills.append(name)
+        plan = safe_parse_json(text, default={"phases": []})
 
         # 解析阶段
         phases = plan.get("phases", [])
         if not phases:
             # 兜底：至少一个 direct 阶段
-            phases = [{"id": 0, "name": "回答", "type": "direct", "goal": plan.get("expanded_query", user_input), "tools": []}]
+            phases = [{"id": 0, "name": "回答", "type": "direct", "skill": None, "goal": plan.get("expanded_query", user_input)}]
 
         # 补全阶段字段
+        all_skill_names = {s["name"] for s in self.skill_adapter.list_skills()} if self.skill_adapter else set()
         for i, phase in enumerate(phases):
             phase.setdefault("id", i)
             phase.setdefault("name", "执行")
             phase.setdefault("type", "execute")
             phase.setdefault("goal", "")
-            phase.setdefault("tools", [])
+            phase.setdefault("skill", None)
+            # 校验技能名
+            if phase["type"] == "skill" and phase["skill"]:
+                sname = phase["skill"]
+                if sname.startswith("skill:"):
+                    sname = sname[6:]
+                    phase["skill"] = sname
+                if sname not in all_skill_names:
+                    logger.warning("[TaskAgent] plan 引用了未知技能 '%s'，降级为 execute", sname)
+                    phase["type"] = "execute"
+                    phase["skill"] = None
+            elif phase["type"] == "skill" and not phase["skill"]:
+                logger.warning("[TaskAgent] phase.type=skill 但未指定 skill，降级为 execute")
+                phase["type"] = "execute"
 
         # 解析 planning_interval
-        planning_interval = plan.get("planning_interval", None)
-
-        # 单阶段不需要 planning_interval
-        if len(phases) <= 1:
-            planning_interval = None
+        # 默认 3：initial_plan 已有全量工具，直接出具体计划，不需要早期 replan
+        planning_interval = plan.get("planning_interval", 3) or 3
 
         expanded_query = plan.get("expanded_query", user_input) or user_input
-        logger.info("[TaskAgent] plan: %d 技能 %s, %d 阶段 %s, planning_interval=%s",
-                     len(selected_skills), selected_skills,
-                     len(phases), [(p["name"], p["type"]) for p in phases],
+        logger.info("[TaskAgent] plan: %d 阶段 %s, planning_interval=%s",
+                     len(phases), [(p["name"], p["type"], p.get("skill")) for p in phases],
                      planning_interval)
         trace.record("plan_result", {
-            "route": "mcp+plan",
-            "selected_skills": selected_skills,
+            "route": "plan",
             "phases": phases,
             "planning_interval": planning_interval,
         })
 
         return {
-            "skills": selected_skills,
             "phases": phases,
             "planning_interval": planning_interval,
             "expanded_query": expanded_query,
@@ -712,35 +668,70 @@ class TaskAgent(AgentBase):
             additional_authorized_imports=["json", "datetime", "math", "re", "collections", "itertools"],
         )
 
+        # tools=[] 是故意的：MCP 工具通过 MCPExecutor router 模式注入，不走 smolagents 原生 Tool。
+        # 原因：MCP 工具数量大（70+），注册为 smolagents Tool 会全量写入 system prompt，token 爆炸。
+        # router 模式只注册 mcp 一个工具，LLM 通过 mcp(action="list") 动态发现，mcp(action="call") 调用。
+        # 不要把 MCP 工具往 tools=[] 里塞，那是打补丁，不是正路。详见 mcp_executor.py 注释。
         agent = SmolCodeAgent(
             tools=[],
             model=model,
             max_steps=self.max_tool_rounds,
             executor=mcp_executor,
             planning_interval=planning_interval,
+            code_block_tags="markdown",
+            instructions=(
+                "个股分析输出格式：\n"
+                "调用工具获取数据后，综合评估并填写以下格式，用 final_answer() 输出：\n\n"
+                "\"\"\"\n"
+                "**股票名称**: 股票名称 (股票代码)\n"
+                "**操作建议**: 买入/卖出/持有/跳过（综合判断现在的操作，A股只能做多）\n"
+                "**评    分**: 0-100（总体评分）\n"
+                "**方    向**: 看涨/看跌/中性（未来时间窗口内的方向）\n"
+                "**置 信 度**: 高/中/低（多方结果是否一致或矛盾）\n"
+                "**时间窗口**: T+1/T+3/T+5\n"
+                "**信    号**: 核心逻辑一句话\n"
+                "**分    析**: 怎么分析的数据(100字内)\n"
+                "\"\"\""
+            ),
         )
 
-        # 覆盖 smolagents 默认 system_prompt，使用自定义模板
-        # 保留 {{tools}} 和 {{managed_agents}} 占位符，smolagents 运行时会渲染
-        _system_prompt_path = Path(__file__).resolve().parent.parent / "prompts" / "code_agent_system.txt"
+        # 覆盖 smolagents 默认 prompt_templates，使用自定义 YAML 模板
         try:
-            custom_prompt = _system_prompt_path.read_text(encoding="utf-8")
-            agent.prompt_templates["system_prompt"] = custom_prompt
-            logger.info("[TaskAgent] 已加载自定义 system_prompt")
-        except Exception as e:
-            logger.warning("[TaskAgent] 自定义 system_prompt 加载失败: %s，使用默认", e)
+            custom_templates = _load_code_agent_yaml()
 
-        # 注入自定义 planning prompt（如果有 replan 间隔）
-        if planning_interval:
-            _replan_path = Path(__file__).resolve().parent.parent / "prompts" / "replan_system.txt"
-            try:
-                replan_prompt = _replan_path.read_text(encoding="utf-8")
-                agent.prompt_templates["planning"]["initial_plan"] = replan_prompt
-                agent.prompt_templates["planning"]["update_plan_pre_messages"] = replan_prompt
-            except Exception:
-                pass
+            agent.prompt_templates.update(custom_templates)
+            logger.info("[TaskAgent] 已加载自定义 prompt_templates (YAML)")
+        except Exception as e:
+            logger.warning("[TaskAgent] 自定义 prompt_templates 加载失败: %s，使用默认", e)
 
         return agent
+
+    def _inject_tools_to_planning(self, agent, mcp_tool_list: list):
+        """注入工具列表到 smolagents 的 planning prompts。
+
+        只改 planning prompt，不改 task → planning 看到全量工具，execution 看不到。
+        在 agent 创建后、agent.run() 前调用。
+
+        注入格式：工具名 + 参数名（不含描述，控制 token）
+        LLM 需要至少知道参数名才能正确调用，否则会编造参数。
+        """
+        # 构建工具描述：tool_name(param: type) — 简短描述
+        # LLM 需要参数类型才能写出正确的 args，否则会传错参数
+        tool_lines = []
+        for t in mcp_tool_list:
+            inputs = getattr(t, 'inputs', {}) or {}
+            params = ', '.join(f"{p}: {i.get('type', 'string')}" for p, i in inputs.items()) if inputs else ''
+            desc = (getattr(t, 'description', '') or '')[:80]
+            tool_lines.append(f"  {t.name}({params}) — {desc}")
+        tools_text = '\n'.join(tool_lines)
+
+        placeholder = "可用工具见系统提示中的「可用工具」部分。"
+        tool_block = f"可用工具（通过 mcp(action='call', tool_name='...', args={{...}}) 调用）：\n{tools_text}"
+        for key in ("initial_plan", "update_plan_post_messages"):
+            planning = agent.prompt_templates.get("planning", {})
+            if key in planning and placeholder in planning[key]:
+                planning[key] = planning[key].replace(placeholder, tool_block)
+                logger.info("[TaskAgent] planning[%s] 已注入 %d 个工具", key, len(mcp_tool_list))
 
     async def _execute_phase(
         self,
@@ -762,9 +753,12 @@ class TaskAgent(AgentBase):
 
         react_start = time.time()
 
-        # 包装 agent.run()，通过 max_steps 硬限制防止无限循环
-        # smolagents 的 max_steps 已经限制了总步数，这里不需要额外逻辑
-        result = agent.run(task)
+        try:
+            result = agent.run(task)
+        except Exception as e:
+            logger.error("[TaskAgent] 阶段 %d 执行异常: %s", phase_id, e)
+            trace.record("phase_error", {"phase_id": phase_id, "error": str(e)})
+            return ""
 
         react_elapsed = round(time.time() - react_start, 2)
 
@@ -774,52 +768,9 @@ class TaskAgent(AgentBase):
             "result_preview": str(result)[:200],
         })
 
-        return str(result)
+        return str(result) if result else ""
 
-    async def _eval_phase(
-        self,
-        phase: dict,
-        phase_result: str,
-        llm: LLMBase,
-    ) -> dict:
-        """评估阶段是否通过。
-
-        返回: {passed: bool, reason: str, suggestion: str}
-        """
-        from pathlib import Path
-
-        _eval_path = Path(__file__).resolve().parent.parent / "prompts" / "phase_eval.txt"
-        try:
-            eval_template = _eval_path.read_text(encoding="utf-8")
-        except Exception:
-            # 兜底：无评估模板则默认通过
-            return {"passed": True, "reason": "无评估模板，默认通过", "suggestion": ""}
-
-        prompt = eval_template.format(
-            phase_name=phase.get("name", ""),
-            phase_goal=phase.get("goal", ""),
-            phase_result=phase_result[:2000],  # 截断避免 token 爆炸
-        )
-
-        messages = [
-            ChatMessage(role="system", content="你是评估器。只输出 JSON。"),
-            ChatMessage(role="user", content=prompt),
-        ]
-
-        try:
-            response = await llm.generate(messages=messages)
-            text = response.content.strip()
-            if "```" in text:
-                m = re.search(r"```(?:json)?\s*\n(.*?)```", text, re.DOTALL)
-                if m:
-                    text = m.group(1).strip()
-            result = safe_parse_json(text, default={"passed": True, "reason": "解析失败，默认通过", "suggestion": ""})
-            return result
-        except Exception as e:
-            logger.warning("[TaskAgent] 阶段评估异常: %s，默认通过", e)
-            return {"passed": True, "reason": f"评估异常: {e}", "suggestion": ""}
-
-    # ── 主对话入口（多阶段循环）──────────────────────────────
+    # ── 主对话入口（统一多阶段）──────────────────────────────
 
     async def _chat_plan(
         self,
@@ -827,10 +778,13 @@ class TaskAgent(AgentBase):
         session_id: str,
         use_rag: bool,
     ) -> AgentResponse:
-        """主对话流程：Plan → 多阶段执行 → 评估。
+        """主对话流程：Plan → 统一多阶段执行 → 规则 eval。
 
-        量化任务: 1 个阶段，planning_interval=None
-        编程任务: 多个阶段，planning_interval=动态值
+        所有任务统一走多阶段：
+          - skill 阶段：加载技能指令 + 工具，CodeAgent 执行
+          - execute 阶段：MCP 通用工具，CodeAgent 执行
+          - direct 阶段：LLM 直接回答
+        eval 用规则判断（结果非空 → passed），不调 LLM。
         """
         print(f"[DEBUG] _chat_plan called: {user_input[:50]}", flush=True)
         start_time = time.time()
@@ -852,14 +806,12 @@ class TaskAgent(AgentBase):
             model = _LLMAdapter(self.llm)
 
             # ── 1. Plan ──
-            plan = await self._plan(user_input, self.llm, trace, mcp_tools=mcp_tool_list)
-            selected_skills = plan["skills"]
+            plan = await self._plan(user_input, self.llm, trace)
             phases = plan["phases"]
             planning_interval = plan["planning_interval"]
             expanded_query = plan["expanded_query"]
 
-            print(f"[DEBUG] plan: skills={selected_skills}, "
-                  f"phases={[(p['name'], p['type']) for p in phases]}, pi={planning_interval}", flush=True)
+            print(f"[DEBUG] plan: phases={[(p['name'], p['type'], p.get('skill')) for p in phases]}, pi={planning_interval}", flush=True)
 
             # ── 1.5 股票解析（用户输入含股票关键词时，解析出标准 code+name）──
             stock_code = ""
@@ -867,15 +819,14 @@ class TaskAgent(AgentBase):
             try:
                 from tools.data_tools import resolve_stock
                 # 从 expanded_query 或 user_input 中提取可能的股票关键词
-                import re as _re
                 # 匹配6位数字代码
-                code_match = _re.search(r'\b(\d{6})\b', user_input)
+                code_match = re.search(r'\b(\d{6})\b', user_input)
                 if code_match:
                     stock_code = code_match.group(1)
                 else:
                     # 尝试用中文名解析
                     # 去掉常见动词前缀，保留股票名
-                    clean_input = _re.sub(r'分析|看看|查一下|怎么样|什么股|股票|推荐|选|买|卖', '', user_input).strip()
+                    clean_input = re.sub(r'分析|看看|查一下|怎么样|什么股|股票|推荐|选|买|卖', '', user_input).strip()
                     if clean_input and len(clean_input) >= 2:
                         result = resolve_stock(clean_input, limit=1)
                         if isinstance(result, dict) and not result.get('error'):
@@ -906,89 +857,38 @@ class TaskAgent(AgentBase):
                     context = Retriever.format_context(docs)
                     sources = [{"content": d["content"][:200], "score": d.get("score", 0)} for d in docs]
 
-            # ── 3. 构建技能指令 ──
-            task_parts = []
-            # 注入股票信息（如果有）
+            # 构建共享上下文（股票信息 + RAG，不含工具列表）
+            # 工具列表在 phase 循环内通过 MCPExecutor 的 router 发现，注入 planning prompt
+            shared_parts = []
             if stock_code:
                 stock_info = f"【股票】{stock_name}({stock_code})" if stock_name else f"【股票】{stock_code}"
-                task_parts.append(stock_info)
+                shared_parts.append(stock_info)
             if context:
-                task_parts.append(f"【参考资料】\n{context}")
-
-            loader = self._get_skill_loader()
-            temp_skill = None
-
-            for sname in selected_skills:
-                try:
-                    body = loader.load_body(sname)
-                    if body:
-                        if len(body.split()) > 500:
-                            headings = loader.get_section_headings(sname)
-                            catalog = "\n".join(f"  - {h}" for h in headings)
-                            task_parts.append(
-                                f"【技能: {sname}】\n"
-                                f"使用 read_skill_section 工具按需加载指令段落。\n"
-                                f"可用段落:\n{catalog}"
-                            )
-                        else:
-                            task_parts.append(f"【技能指令: {sname}】\n{body}")
-                        trace.record("skill_loaded", {"skill": sname, "body_len": len(body)})
-                except Exception as e:
-                    logger.warning("[TaskAgent] skill %s 加载失败: %s", sname, e)
-
-            # 无匹配技能时，从阶段工具生成临时 SKILL.md
-            if not selected_skills:
-                all_tools = []
-                for phase in phases:
-                    all_tools.extend(phase.get("tools", []))
-                if all_tools:
-                    # _generate_temp_skill 期望 tools 是带 .name 属性的对象
-                    _ToolStub = type("_ToolStub", (), {"__init__": lambda self, n: setattr(self, "name", n) or setattr(self, "inputs", {})})
-                    temp_steps = [{"tools": [_ToolStub(t) for t in all_tools]}]
-                    temp_skill = _generate_temp_skill(temp_steps, task_hint=user_input)
-                    if temp_skill:
-                        selected_skills = [temp_skill["name"]]
-                        task_parts.append(f"【技能指令: {temp_skill['name']}】\n{temp_skill['body']}")
-                        logger.info("[TaskAgent] 自动生成技能: %s", temp_skill["name"])
-                        trace.record("temp_skill_generated", {"name": temp_skill["name"]})
-
-            # ── 4. 加载技能工具 ──
-            skill_tools = []
-            for sname in selected_skills:
-                if temp_skill and sname == temp_skill["name"]:
-                    skill_tools.append(_TempSkillSectionTool(temp_skill["body"], sname))
-                    continue
-                func_tools = _load_skill_functions(sname)
-                skill_tools.extend(func_tools)
-                skill_tools.append(_SkillSectionTool(loader, sname))
-                skill_tools.append(_SkillResourceTool(loader, sname))
-                logger.info("[TaskAgent] skill %s 注入函数工具: %s", sname, [t.name for t in func_tools])
+                shared_parts.append(f"【参考资料】\n{context}")
 
             # ── 5. 创建 TraceCollector ──
             collector = None
             try:
                 from trace_collector import TraceCollector
                 collector = TraceCollector(session_id=session_id, user_query=user_input)
-                for sname in selected_skills:
-                    collector.begin_skill(sname)
                 _collectors[session_id] = collector
             except Exception as e:
                 logger.debug("[Trace] TraceCollector 创建失败: %s", e)
 
-            # ── 6. 阶段执行循环 ──
+            # ── 6. 阶段执行循环（统一多阶段）──
+            loader = self._get_skill_loader()  # 可能为 None
             phase_results = []
-            max_retries = 1
-            is_single_phase = len(phases) == 1
 
             for phase in phases:
                 phase_id = phase.get("id", 0)
                 phase_name = phase.get("name", "执行")
                 phase_type = phase.get("type", "execute")
                 phase_goal = phase.get("goal", "")
+                phase_skill = phase.get("skill")
 
-                trace.record("phase_start", {"phase_id": phase_id, "phase_name": phase_name, "phase_type": phase_type, "phase_goal": phase_goal})
+                trace.record("phase_start", {"phase_id": phase_id, "phase_name": phase_name, "phase_type": phase_type, "phase_goal": phase_goal, "skill": phase_skill})
 
-                # ── direct 类型：RAG + Memory + LLM 直接回答 ──
+                # ── direct 类型：LLM 直接回答 ──
                 if phase_type == "direct":
                     logger.info("[TaskAgent] 阶段 %d: direct — %s", phase_id, phase_name)
                     messages = [ChatMessage(role="system", content=self.system_prompt)]
@@ -1001,20 +901,47 @@ class TaskAgent(AgentBase):
                     messages.append(ChatMessage(role="user", content=user_input))
                     llm_response = await self.llm.generate(messages=messages)
                     phase_result = llm_response.content
-                    phase_results.append({
-                        "phase": phase,
-                        "result": phase_result,
-                        "passed": True,
-                        "retries": 0,
-                    })
+                    phase_results.append({"phase": phase, "result": phase_result, "passed": bool(phase_result and phase_result.strip())})
                     continue
 
-                # ── execute 类型：CodeAgent + 工具 ──
-                logger.info("[TaskAgent] 阶段 %d: execute — %s", phase_id, phase_name)
+                # ── skill / execute 类型：CodeAgent + 工具 ──
+                logger.info("[TaskAgent] 阶段 %d: %s — %s (skill=%s)", phase_id, phase_type, phase_name, phase_skill)
+
+                # 构建阶段任务上下文
+                phase_task_parts = list(shared_parts)
+
+                # skill 类型：加载该技能的指令和工具
+                skill_tools = []
+                if phase_type == "skill" and phase_skill and loader:
+                    try:
+                        body = loader.load_body(phase_skill)
+                        if body:
+                            if len(body.split()) > 500:
+                                headings = loader.get_section_headings(phase_skill)
+                                catalog = "\n".join(f"  - {h}" for h in headings)
+                                phase_task_parts.append(
+                                    f"【技能: {phase_skill}】\n"
+                                    f"使用 read_skill_section 工具按需加载指令段落。\n"
+                                    f"可用段落:\n{catalog}"
+                                )
+                            else:
+                                phase_task_parts.append(f"【技能指令: {phase_skill}】\n{body}")
+                            trace.record("skill_loaded", {"skill": phase_skill, "body_len": len(body)})
+                    except Exception as e:
+                        logger.warning("[TaskAgent] skill %s 加载失败: %s", phase_skill, e)
+
+                    # 加载技能工具
+                    func_tools = _load_skill_functions(phase_skill)
+                    skill_tools.extend(func_tools)
+                    if loader:
+                        skill_tools.append(_SkillSectionTool(loader, phase_skill))
+                        skill_tools.append(_SkillResourceTool(loader, phase_skill))
+                    logger.info("[TaskAgent] skill %s 注入函数工具: %s", phase_skill, [t.name for t in func_tools])
+                    if collector:
+                        collector.begin_skill(phase_skill)
 
                 # 构建阶段任务
                 phase_roadmap = self._build_phase_roadmap(phases, phase_id)
-                phase_task_parts = list(task_parts)
                 phase_task_parts.append(phase_roadmap)
                 phase_task_parts.append(f"【当前阶段】{phase_name} — {phase_goal}")
                 phase_task_parts.append(f"【任务】\n{expanded_query}")
@@ -1028,62 +955,31 @@ class TaskAgent(AgentBase):
                     planning_interval=planning_interval,
                 )
 
-                # 单阶段：直接执行，跳过 eval
-                if is_single_phase:
-                    phase_result = await self._execute_phase(phase_task, agent, phase, trace)
-                    phase_results.append({
-                        "phase": phase,
-                        "result": phase_result,
-                        "passed": True,
-                        "retries": 0,
-                    })
-                    continue
+                # MCP 工具列表 → 注入 planning prompt（_mcp.tools 已在启动时加载）
+                if mcp_tool_list:
+                    self._inject_tools_to_planning(agent, mcp_tool_list)
 
-                # 多阶段：执行 + eval + 重试
-                retry_count = 0
-                phase_passed = False
-                phase_result = ""
+                # 执行
+                phase_result = await self._execute_phase(phase_task, agent, phase, trace)
 
-                while retry_count <= max_retries:
-                    phase_result = await self._execute_phase(phase_task, agent, phase, trace)
+                # 规则 eval
+                passed = bool(phase_result and phase_result.strip())
+                if not passed:
+                    logger.warning("[TaskAgent] 阶段 %d eval 未通过: 结果为空", phase_id)
+                    trace.record("phase_failed", {"phase_id": phase_id, "reason": "empty result"})
 
-                    # 评估阶段
-                    eval_result = await self._eval_phase(phase, phase_result, self.llm)
-                    phase_passed = eval_result.get("passed", True)
+                phase_results.append({"phase": phase, "result": phase_result, "passed": passed})
 
-                    if phase_passed:
-                        logger.info("[TaskAgent] 阶段 %d 通过: %s", phase_id, phase_name)
-                        break
-
-                    retry_count += 1
-                    if retry_count <= max_retries:
-                        logger.info("[TaskAgent] 阶段 %d 未通过，重试 %d/%d: %s",
-                                    phase_id, retry_count, max_retries, eval_result.get("reason", ""))
-                        trace.record("phase_retry", {
-                            "phase_id": phase_id,
-                            "retry": retry_count,
-                            "reason": eval_result.get("reason", ""),
-                        })
-                        # 重试时注入失败原因
-                        phase_task += f"\n\n【上次执行问题】{eval_result.get('reason', '')}\n{eval_result.get('suggestion', '')}"
-                    else:
-                        logger.warning("[TaskAgent] 阶段 %d 重试耗尽，继续下一阶段", phase_id)
-                        trace.record("phase_failed", {
-                            "phase_id": phase_id,
-                            "reason": eval_result.get("reason", ""),
-                        })
-
-                phase_results.append({
-                    "phase": phase,
-                    "result": phase_result,
-                    "passed": phase_passed,
-                    "retries": retry_count,
-                })
+                # TraceCollector: 结束当前技能
+                if phase_type == "skill" and collector:
+                    try:
+                        collector.end_skill()
+                    except Exception:
+                        pass
 
             # ── 7. TraceCollector 存库 ──
             if collector:
                 try:
-                    collector.end_skill()
                     final_answer = "\n\n".join(r["result"] for r in phase_results)
                     collector.on_agent_finish(
                         final_answer=final_answer,
