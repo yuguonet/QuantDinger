@@ -727,7 +727,7 @@ class TaskAgent(AgentBase):
 
         placeholder = "可用工具见系统提示中的「可用工具」部分。"
         tool_block = f"可用工具（通过 mcp(action='call', tool_name='...', args={{...}}) 调用）：\n{tools_text}"
-        for key in ("initial_plan", "update_plan_post_messages"):
+        for key in ("initial_plan", "update_plan_pre_messages", "update_plan_post_messages"):
             planning = agent.prompt_templates.get("planning", {})
             if key in planning and placeholder in planning[key]:
                 planning[key] = planning[key].replace(placeholder, tool_block)
