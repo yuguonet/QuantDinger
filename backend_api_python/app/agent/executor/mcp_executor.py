@@ -124,12 +124,14 @@ class MCPRouterTool(SmolToolBase):
             result = tool.forward(**args)
             if isinstance(result, str):
                 try:
-                    return json.loads(result)
+                    result = json.loads(result)
                 except (json.JSONDecodeError, TypeError):
                     return result
-            # 成功时附加提示，引导 LLM 调用 final_answer
+            # 成功时附加可用字段列表，帮助 LLM 正确访问数据
             if isinstance(result, dict):
-                result["_hint"] = "调用成功。如果已获取足够数据，请调用 final_answer() 返回结果。不要重复调用同一工具。"
+                public_fields = [k for k in result.keys() if not k.startswith('_')]
+                if public_fields:
+                    result["_fields"] = public_fields
             return result
         except Exception as e:
             # pydantic 验证错误 → 返回正确参数名，让 LLM 纠正
