@@ -641,13 +641,16 @@ class TaskAgent(AgentBase):
         mcp_tool_list: list,
         skill_tools: list,
         planning_interval: int | None = None,
+        phase_id: int = 0,
     ):
         """构建 smolagents CodeAgent 实例。
 
         每个阶段独立构建，避免状态污染。
         planning_interval: None=不 replan，3~5=每 N 步 replan。
+        phase_id: 阶段ID，用于缓存key前缀。
         """
         from smolagents import CodeAgent as SmolCodeAgent
+        from smolagents.memory import ActionStep
         from pathlib import Path
 
         catalog = build_tool_catalog(mcp_tool_list)
@@ -672,6 +675,31 @@ class TaskAgent(AgentBase):
         # 原因：MCP 工具数量大（70+），注册为 smolagents Tool 会全量写入 system prompt，token 爆炸。
         # router 模式只注册 mcp 一个工具，LLM 通过 mcp(action="list") 动态发现，mcp(action="call") 调用。
         # 不要把 MCP 工具往 tools=[] 里塞，那是打补丁，不是正路。详见 mcp_executor.py 注释。
+
+        # 阶段内缓存 + 截断：
+        # 1. 每步执行后把 observations 存入 RoundCache
+        # 2. 截断旧步骤的 observations（保留最近 2 步完整）
+        from agents.round_cache import get_current_cache
+
+        keep_recent = 2
+
+        def _cache_and_truncate(memory_step: ActionStep, agent: SmolCodeAgent) -> None:
+            cache = get_current_cache()
+
+            # 缓存当前步（带阶段id前缀，避免跨阶段冲突）
+            if cache and memory_step.observations:
+                cache_key = f"phase{phase_id}_step{memory_step.step_number}"
+                cache.put(cache_key, memory_step.observations)
+
+            # 截断旧步骤
+            for step in agent.memory.steps:
+                if isinstance(step, ActionStep) and step.step_number is not None:
+                    if step.step_number <= memory_step.step_number - keep_recent:
+                        if step.observations and len(str(step.observations)) > 200:
+                            step.observations = str(step.observations)[:200] + "...(truncated)"
+                        if hasattr(step, 'observations_images') and step.observations_images:
+                            step.observations_images = None
+
         agent = SmolCodeAgent(
             tools=[],
             model=model,
@@ -679,6 +707,7 @@ class TaskAgent(AgentBase):
             executor=mcp_executor,
             planning_interval=planning_interval,
             code_block_tags="markdown",
+            step_callbacks=[_cache_and_truncate],
             instructions=(
                 "个股分析输出格式：\n"
                 "调用工具获取数据后，综合评估并填写以下格式，用 final_answer() 输出：\n\n"
@@ -879,6 +908,10 @@ class TaskAgent(AgentBase):
             loader = self._get_skill_loader()  # 可能为 None
             phase_results = []
 
+            # 请求级缓存初始化（阶段间共享）
+            from agents.round_cache import reset_current_cache
+            cache = reset_current_cache()
+
             for phase in phases:
                 phase_id = phase.get("id", 0)
                 phase_name = phase.get("name", "执行")
@@ -945,6 +978,18 @@ class TaskAgent(AgentBase):
                 phase_task_parts.append(phase_roadmap)
                 phase_task_parts.append(f"【当前阶段】{phase_name} — {phase_goal}")
                 phase_task_parts.append(f"【任务】\n{expanded_query}")
+
+                # 注入缓存索引（如果有）
+                cache_index = cache.index()
+                if cache_index:
+                    cache_hint = "【缓存中的已有数据】\n"
+                    for k, v in cache_index.items():
+                        cache_hint += f"- {k}: {v}\n"
+                    cache_hint += """\n使用 read_cache(key) 读取上述数据，无需重复调用工具。
+用法：result = read_cache("phase0_step1")
+"""
+                    phase_task_parts.append(cache_hint)
+
                 phase_task = "\n\n".join(phase_task_parts)
 
                 # 构建 CodeAgent（每阶段独立）
@@ -953,6 +998,7 @@ class TaskAgent(AgentBase):
                     mcp_tool_list=mcp_tool_list,
                     skill_tools=skill_tools,
                     planning_interval=planning_interval,
+                    phase_id=phase_id,
                 )
 
                 # MCP 工具列表 → 注入 planning prompt（_mcp.tools 已在启动时加载）
