@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 # ── 配置 ──────────────────────────────────────────────────────
 # 跳过的文件（框架文件，非工具）
 _SKIP_FILES = {"__init__", "base", "registry", "em_utils", "pagination",
-               "screener_config", "mcp_bridge"}
+               "screener_config", "mcp_bridge", "cache_tools"}
 
 # tools 目录路径
 _TOOLS_DIR = Path(__file__).resolve().parent

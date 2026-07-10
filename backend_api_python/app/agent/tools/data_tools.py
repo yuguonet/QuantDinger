@@ -9,7 +9,6 @@ import json
 from app.agent.log import logger
 from typing import Any, Dict, List, Optional
 
-from app.agent.cache import cache
 from app.agent.tools._analysis_utils import _get_ds
 
 # ── Tool functions ────────────────────────────────────────────
@@ -146,6 +145,7 @@ _STOCK_INFO_CORE_FIELDS = {
     "total_shares", "circ_shares",
     "turnover_pct", "vol_ratio",
     "list_date", "main_business",
+    "source", "market_cn",
 }
 def _filter_stock_info(info: Dict[str, Any], detail: bool = False) -> Dict[str, Any]:
     """过滤股票信息，去除 None 值；非 detail 模式只保留核心字段。"""
@@ -170,92 +170,96 @@ def get_stock_info(codes: str, detail: bool = False) -> Dict[str, Any]:
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
 
-    # 缓存检查（精简模式缓存 60s，detail 不缓存）
-    _ck = f"stock_info:{','.join(sorted(code_list))}:{detail}"
-    if not detail:
-        _hit = cache.get(_ck)
-        if _hit is not None:
-            return _hit
+    # 缓存检查已移除：basicinfo_db 本地快读 + HTTP 5s 竞赛替代
 
     def _one(stock_code: str) -> Dict[str, Any]:
-        ds = _get_ds("CNStock")
-        result: Dict[str, Any] = {}
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+        from app.data_sources.normalizer import strip_market_prefix
 
-        # 1) 尝试数据源原生 get_stock_info
+        sym = strip_market_prefix(stock_code)
+
+        # ── 1) basicinfo_db 本地快读（毫秒级）──
+        db_result: Dict[str, Any] = {}
         try:
-            if hasattr(ds, "get_stock_info"):
-                info = ds.get_stock_info(stock_code)
-                if isinstance(info, dict) and not info.get("error"):
-                    result = info
-                elif isinstance(info, str):
-                    try:
-                        import json as _json
-                        parsed = _json.loads(info)
-                        if isinstance(parsed, dict):
-                            result = parsed
-                        else:
-                            result = {"stock_code": stock_code, "info_text": info}
-                    except (ValueError, TypeError):
-                        result = {"stock_code": stock_code, "info_text": info}
-        except NotImplementedError:
-            pass
+            from app.utils.basicinfo_db import get_stock_basic_db
+            db = get_stock_basic_db()
+            stock = db.get_stock(sym)
+            if stock:
+                db_result = {"stock_code": sym}
+                for fld in ("name", "industry", "total_shares", "circ_shares",
+                            "pe_ratio", "pb_ratio", "market_cn", "list_date"):
+                    val = stock.get(fld)
+                    if val is not None and val != "":
+                        db_result[fld] = val
+                concepts_str = stock.get("concepts", "")
+                if concepts_str:
+                    db_result["concepts"] = [c.strip() for c in concepts_str.split(",") if c.strip()]
+                db_result["source"] = "basicinfo_db"
         except Exception as e:
-            logger.warning("get_stock_info(%s) datasource failed: %s", stock_code, e)
+            logger.warning("get_stock_info(%s) basicinfo_db failed: %s", stock_code, e)
 
-        # 2) 兜底：HTTP 实时拉取（双源互补）
-        if not result:
+        # ── 2) HTTP 实时拉取（5s 超时竞赛）──
+        def _http_fetch() -> Dict[str, Any]:
+            # 数据源原生
+            try:
+                ds = _get_ds("CNStock")
+                if hasattr(ds, "get_stock_info"):
+                    info = ds.get_stock_info(stock_code)
+                    if isinstance(info, dict) and not info.get("error"):
+                        return info
+                    elif isinstance(info, str):
+                        try:
+                            parsed = json.loads(info)
+                            if isinstance(parsed, dict):
+                                return parsed
+                        except (ValueError, TypeError):
+                            pass
+            except (NotImplementedError, Exception) as e:
+                logger.debug("get_stock_info(%s) datasource failed: %s", stock_code, e)
+
+            # cn_stock_info 兜底
             try:
                 from app.utils.cn_stock_info import get_cn_stock_info
                 info = get_cn_stock_info(stock_code)
                 if info and not info.get("error"):
-                    result = info
+                    return info
             except Exception as e:
-                logger.warning("get_stock_info(%s) cn_stock_info failed: %s", stock_code, e)
+                logger.debug("get_stock_info(%s) cn_stock_info failed: %s", stock_code, e)
+            return {}
 
-        # 3) 兜底：本地缓存 basicinfo_db
-        if not result:
-            try:
-                from app.utils.basicinfo_db import get_stock_basic_db
-                from app.data_sources.normalizer import strip_market_prefix
+        http_result: Dict[str, Any] = {}
+        _pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            future = _pool.submit(_http_fetch)
+            http_result = future.result(timeout=5)
+        except FuturesTimeout:
+            logger.info("get_stock_info(%s) HTTP 5s 超时，使用 basicinfo_db", stock_code)
+        except Exception as e:
+            logger.debug("get_stock_info(%s) HTTP fetch error: %s", stock_code, e)
+        finally:
+            _pool.shutdown(wait=False)
 
-                sym = strip_market_prefix(stock_code)
-                db = get_stock_basic_db()
-                stock = db.get_stock(sym)
-                if stock:
-                    result = {"stock_code": sym}
-                    if stock.get("name"):
-                        result["name"] = stock["name"]
-                    if stock.get("industry"):
-                        result["industry"] = stock["industry"]
-                    concepts_str = stock.get("concepts", "")
-                    if concepts_str:
-                        result["concepts"] = [c.strip() for c in concepts_str.split(",") if c.strip()]
-                    if stock.get("total_shares"):
-                        result["total_shares"] = stock["total_shares"]
-                    if stock.get("circ_shares"):
-                        result["circ_shares"] = stock["circ_shares"]
-                    if stock.get("pe_ratio"):
-                        result["pe_ratio"] = stock["pe_ratio"]
-                    if stock.get("pb_ratio"):
-                        result["pb_ratio"] = stock["pb_ratio"]
-                    if stock.get("market_cn"):
-                        result["market_cn"] = stock["market_cn"]
-                    if stock.get("list_date"):
-                        result["list_date"] = stock["list_date"]
-                    result["source"] = "basicinfo_db"
-            except Exception as e:
-                logger.warning("get_stock_info(%s) basicinfo_db fallback failed: %s", stock_code, e)
+        # ── 3) 合并：basicinfo_db 为底，HTTP 补充新字段 ──
+        result = {**db_result, **{k: v for k, v in http_result.items() if v is not None}}
 
         if not result:
             return {"error": f"无法获取 {stock_code} 的基本面信息", "retriable": False}
 
-        # 4) 腾讯实时估值补全（PE/PB/市值/换手率/量比等）
+        if http_result:
+            result["source"] = "http"
+        # else: 保持 basicinfo_db source
+
+        # ── 4) 腾讯实时估值补全（3s 超时保护）──
         try:
             from app.agent.tools.quote_tools import _tencent_quote_raw
-            from app.data_sources.normalizer import strip_market_prefix as _strip_prefix
-            code = _strip_prefix(stock_code)
-            tq = _tencent_quote_raw([code])
-            q = tq.get(code)
+            def _tencent_fetch():
+                return _tencent_quote_raw([sym])
+            _tpool = ThreadPoolExecutor(max_workers=1)
+            try:
+                tq = _tpool.submit(_tencent_fetch).result(timeout=3)
+            finally:
+                _tpool.shutdown(wait=False)
+            q = tq.get(sym)
             if q:
                 result.setdefault("price", q.get("price"))
                 result.setdefault("change_pct", q.get("change_pct"))
@@ -281,16 +285,15 @@ def get_stock_info(codes: str, detail: bool = False) -> Dict[str, Any]:
                     result["limit_up"] = q["limit_up"]
                 if q.get("limit_down"):
                     result["limit_down"] = q["limit_down"]
+        except FuturesTimeout:
+            logger.info("get_stock_info(%s) 腾讯估值 3s 超时，跳过补全", stock_code)
         except Exception as e:
             logger.debug("get_stock_info(%s) 腾讯估值补全跳过: %s", stock_code, e)
 
         return result
 
     if len(code_list) == 1:
-        result = _filter_stock_info(_one(code_list[0]), detail)
-        if not detail and not result.get("error"):
-            cache.set(_ck, result, ttl=60)
-        return result
+        return _filter_stock_info(_one(code_list[0]), detail)
 
     results = {}
     for code in code_list:
@@ -298,8 +301,5 @@ def get_stock_info(codes: str, detail: bool = False) -> Dict[str, Any]:
             results[code] = _filter_stock_info(_one(code), detail)
         except Exception as e:
             results[code] = {"error": str(e)}
-    final = {"count": len(results), "data": results}
-    if not detail:
-        cache.set(_ck, final, ttl=60)
-    return final
+    return {"count": len(results), "data": results}
 
