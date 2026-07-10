@@ -23,8 +23,12 @@ from typing import Any
 
 from smolagents import Tool as SmolToolBase
 from smolagents.local_python_executor import LocalPythonExecutor
+import smolagents.local_python_executor as _lpe
 
 logger = logging.getLogger(__name__)
+
+# smolagents 默认30s，5个重型工具串行易超时，改为60s
+_lpe.MAX_EXECUTION_TIME_SECONDS = 60
 
 
 # ═══════════════════════════════════════════════════════════════

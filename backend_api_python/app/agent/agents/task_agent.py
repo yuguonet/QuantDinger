@@ -127,6 +127,9 @@ class _LLMAdapter:
             logger.error("[TaskAgent] LLM 调用失败: %s", e)
             raise
 
+        if resp.finish_reason == "error":
+            raise RuntimeError(f"LLM 调用失败: {resp.content}")
+
         smol_msg = SmolChatMessage(role="assistant", content=resp.content or "")
 
         class _TokenUsage:

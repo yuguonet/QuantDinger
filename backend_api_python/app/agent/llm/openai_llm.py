@@ -68,7 +68,7 @@ class OpenAILLM(LLMBase):
         except ImportError:
             raise ImportError("openai 未安装，请运行: pip install openai")
 
-        client_kwargs = {"api_key": self.api_key, "timeout": self.timeout}
+        client_kwargs = {"api_key": self.api_key, "timeout": self.timeout, "max_retries": self.max_retries}
         if self.base_url:
             client_kwargs["base_url"] = self.base_url
 

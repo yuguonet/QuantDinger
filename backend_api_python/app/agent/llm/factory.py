@@ -108,7 +108,7 @@ def create_llm(config: Union[dict, object, None] = None) -> LLMBase:
         model = getattr(config, "model", "")
         api_key = getattr(config, "api_key", "")
         extra_kwargs = {}
-        for attr in ("base_url", "temperature", "max_tokens", "top_p", "timeout"):
+        for attr in ("base_url", "temperature", "max_tokens", "top_p", "timeout", "max_retries"):
             val = getattr(config, attr, None)
             if val is not None:
                 extra_kwargs[attr] = val
