@@ -516,37 +516,121 @@ class TaskAgent(AgentBase):
 
     # ── plan: 决定用哪些技能 ──────────────────────────────────
 
+    def _extract_skill_steps(self, skill_name: str) -> list[dict]:
+        """从技能 SKILL.md 的执行流程中提取编号步骤。
+
+        查找 "# stepN: 名称" 格式的注释，返回 [{step_num, name, tool_name}]。
+        用于自动拆分：LLM 未拆分时，根据技能内部步骤强制拆分为多个 phase。
+        """
+        if not self.skill_adapter:
+            return []
+        try:
+            body = self.skill_adapter.load_body(skill_name)
+            if not body:
+                return []
+        except Exception:
+            return []
+
+        lines = body.split('\n')
+        in_flow = False
+        flow_lines = []
+        for line in lines:
+            if '执行流程' in line or '执行步骤' in line:
+                in_flow = True
+            elif in_flow and line.startswith('#') and '执行' not in line:
+                break
+            if in_flow:
+                flow_lines.append(line)
+
+        if not flow_lines:
+            return []
+
+        steps = []
+        for i, line in enumerate(flow_lines):
+            m = re.search(r'#\s*step\s*(\d+)\s*[:：]\s*(.+)', line, re.IGNORECASE)
+            if m:
+                step_num = int(m.group(1))
+                raw_name = m.group(2).strip()
+                # 清理名称：去掉括号内的参数，如 "filter_candidates()" → "filter_candidates"
+                clean_name = re.sub(r'\(.*?\)', '', raw_name).strip()
+                # 从后续行提取 tool_name
+                tool_name = ""
+                if i + 1 < len(flow_lines):
+                    tm = re.search(r"tool_name=['\"](\w+)['\"]", flow_lines[i + 1])
+                    if tm:
+                        tool_name = tm.group(1)
+                steps.append({"step_num": step_num, "name": clean_name, "tool_name": tool_name})
+        return steps
+
     async def _plan(
         self,
         user_input: str,
         llm: LLMBase,
         trace: AgentTraceRecorder,
+        completed_phases: list | None = None,
     ) -> dict:
-        """Plan 节点：选择技能、划分执行阶段。
+        """Plan 节点：根据已完成阶段，决定下一步执行什么。
 
         设计决策：
-          - _plan() 只看技能列表，不看 MCP 全量工具（工具在执行阶段自动注入）
-          - 输出统一格式：phases + planning_interval
-          - phase.type=skill → 加载该技能的 SKILL.md + 工具
-          - phase.type=execute → CodeAgent + MCP 通用工具
-          - phase.type=direct → LLM 直接回答（不调工具）
+          - 每次调用只输出1个阶段（或空列表表示完成）
+          - _plan() 始终掌控全局，根据中间结果调整后续计划
+          - 每次调用后 CodeAgent 复位（step从0开始）
 
         Returns:
             {
-              "phases": list[dict],    # [{id, name, type, skill?, goal}]
+              "phases": list[dict],    # [{id, name, type, skill?, goal}] 或 [] 表示完成
               "planning_interval": int,
               "expanded_query": str,
             }
         """
-        # 构建技能描述
+        # 构建技能描述（含 SKILL.md 执行流程，让 LLM 知道有几步）
         skills_desc = []
         if self.skill_adapter:
             for s in self.skill_adapter.list_skills():
-                skills_desc.append(f"- {s['name']}: {s.get('description', '')[:150]}")
+                name = s['name']
+                desc = s.get('description', '')[:150]
+                # 加载 SKILL.md 的执行流程段落
+                flow = ""
+                try:
+                    body = self.skill_adapter.load_body(name)
+                    if body:
+                        # 提取"执行流程"相关段落
+                        lines = body.split('\n')
+                        in_flow = False
+                        flow_lines = []
+                        for line in lines:
+                            if '执行流程' in line or '执行步骤' in line:
+                                in_flow = True
+                            elif in_flow and line.startswith('#') and '执行' not in line:
+                                break
+                            if in_flow:
+                                flow_lines.append(line)
+                        if flow_lines:
+                            flow = '\n'.join(flow_lines[:30])  # 最多30行
+                except Exception:
+                    pass
+                if flow:
+                    skills_desc.append(f"- {name}: {desc}\n{flow}")
+                else:
+                    skills_desc.append(f"- {name}: {desc}")
         skills_text = "\n".join(skills_desc) if skills_desc else "(无可用技能)"
 
+        # 构建已完成阶段文本
+        completed_phases_text = ""
+        if completed_phases:
+            lines = ["已完成的阶段:"]
+            for cp in completed_phases:
+                p = cp.get("phase", {})
+                result_preview = str(cp.get("result", ""))[:200]
+                status = "✓" if cp.get("passed") else "✗"
+                lines.append(f"  {status} 阶段{p.get('id', '?')}: {p.get('name', '')} — {p.get('goal', '')}")
+                if result_preview:
+                    lines.append(f"    结果: {result_preview}")
+            lines.append("\n根据已完成的阶段，决定下一步。如果所有阶段都已完成，输出空 phases 列表。")
+            completed_phases_text = "\n".join(lines)
+
         template = _load_plan_template()
-        prompt = template.format(skills_text=skills_text, user_input=user_input)
+        prompt = template.format(skills_text=skills_text, user_input=user_input, completed_phases_text=completed_phases_text)
 
         messages = [
             ChatMessage(role="system", content="你是任务规划器。只输出 JSON。"),
@@ -575,9 +659,7 @@ class TaskAgent(AgentBase):
 
         # 解析阶段
         phases = plan.get("phases", [])
-        if not phases:
-            # 兜底：至少一个 direct 阶段
-            phases = [{"id": 0, "name": "回答", "type": "direct", "skill": None, "goal": plan.get("expanded_query", user_input)}]
+        # 注意：空 phases = 所有阶段已完成，不兜底
 
         # 补全阶段字段
         all_skill_names = {s["name"] for s in self.skill_adapter.list_skills()} if self.skill_adapter else set()
@@ -600,6 +682,28 @@ class TaskAgent(AgentBase):
             elif phase["type"] == "skill" and not phase["skill"]:
                 logger.warning("[TaskAgent] phase.type=skill 但未指定 skill，降级为 execute")
                 phase["type"] = "execute"
+
+        # ── 自动拆分：LLM 未拆分时，根据技能内部步骤强制拆分 ──
+        if len(phases) == 1 and phases[0].get("type") == "skill" and phases[0].get("skill"):
+            skill_name = phases[0]["skill"]
+            skill_steps = self._extract_skill_steps(skill_name)
+            if len(skill_steps) > 1:
+                orig = phases[0]
+                phases = []
+                for step in skill_steps:
+                    goal = step["name"]
+                    if step["tool_name"]:
+                        goal = f"{step['name']}（{step['tool_name']}）"
+                    phases.append({
+                        "id": len(phases),
+                        "name": f"{orig['name']} - {step['name']}",
+                        "type": "skill",
+                        "skill": skill_name,
+                        "goal": goal,
+                    })
+                plan["phases"] = phases
+                logger.info("[TaskAgent] 技能 %s 自动拆分为 %d 阶段: %s",
+                            skill_name, len(phases), [p["goal"] for p in phases])
 
         # 解析 planning_interval
         # 默认 3：initial_plan 已有全量工具，直接出具体计划，不需要早期 replan
@@ -671,7 +775,7 @@ class TaskAgent(AgentBase):
         mcp_executor = MCPExecutor(
             router_tool=router_tool,
             full_tool_map=full_tool_map,
-            additional_authorized_imports=["json", "datetime", "math", "re", "collections", "itertools"],
+            additional_authorized_imports=["json", "datetime", "math", "re", "collections", "itertools", "concurrent.futures"],
         )
 
         # tools=[] 是故意的：MCP 工具通过 MCPExecutor router 模式注入，不走 smolagents 原生 Tool。
@@ -839,11 +943,9 @@ class TaskAgent(AgentBase):
 
             # ── 1. Plan ──
             plan = await self._plan(user_input, self.llm, trace)
-            phases = plan["phases"]
-            planning_interval = plan["planning_interval"]
             expanded_query = plan["expanded_query"]
 
-            print(f"[DEBUG] plan: phases={[(p['name'], p['type'], p.get('skill')) for p in phases]}, pi={planning_interval}", flush=True)
+            print(f"[DEBUG] plan: phases={[(p['name'], p['type'], p.get('skill')) for p in plan.get('phases', [])]}", flush=True)
 
             # ── 1.5 股票解析（用户输入含股票关键词时，解析出标准 code+name）──
             stock_code = ""
@@ -907,15 +1009,26 @@ class TaskAgent(AgentBase):
             except Exception as e:
                 logger.debug("[Trace] TraceCollector 创建失败: %s", e)
 
-            # ── 6. 阶段执行循环（统一多阶段）──
+            # ── 6. 阶段执行循环（每阶段执行后重新规划）──
             loader = self._get_skill_loader()  # 可能为 None
             phase_results = []
+            completed_phases = []
 
             # 请求级缓存初始化（阶段间共享）
             from agents.round_cache import reset_current_cache
             cache = reset_current_cache()
 
-            for phase in phases:
+            while True:
+                phases = plan.get("phases", [])
+                if not phases:
+                    logger.info("[TaskAgent] 所有阶段已完成")
+                    break
+
+                phase = phases[0]  # 每次只执行1个阶段
+                planning_interval = plan.get("planning_interval", 3)
+                # skill/execute 阶段：禁用 smolagents 内部 replan，由 TaskAgent._plan() 统一管理
+                if phase.get("type") in ("skill", "execute"):
+                    planning_interval = 999
                 phase_id = phase.get("id", 0)
                 phase_name = phase.get("name", "执行")
                 phase_type = phase.get("type", "execute")
@@ -937,7 +1050,11 @@ class TaskAgent(AgentBase):
                     messages.append(ChatMessage(role="user", content=user_input))
                     llm_response = await self.llm.generate(messages=messages)
                     phase_result = llm_response.content
-                    phase_results.append({"phase": phase, "result": phase_result, "passed": bool(phase_result and phase_result.strip())})
+                    passed = bool(phase_result and phase_result.strip())
+                    phase_results.append({"phase": phase, "result": phase_result, "passed": passed})
+                    completed_phases.append({"phase": phase, "result": phase_result, "passed": passed})
+                    # 重新规划
+                    plan = await self._plan(user_input, self.llm, trace, completed_phases)
                     continue
 
                 # ── skill / execute 类型：CodeAgent + 工具 ──
@@ -977,7 +1094,7 @@ class TaskAgent(AgentBase):
                         collector.begin_skill(phase_skill)
 
                 # 构建阶段任务
-                phase_roadmap = self._build_phase_roadmap(phases, phase_id)
+                phase_roadmap = self._build_phase_roadmap(phase, completed_phases)
                 phase_task_parts.append(phase_roadmap)
                 phase_task_parts.append(f"【当前阶段】{phase_name} — {phase_goal}")
                 phase_task_parts.append(f"【任务】\n{expanded_query}")
@@ -1004,9 +1121,10 @@ class TaskAgent(AgentBase):
                     phase_id=phase_id,
                 )
 
-                # MCP 工具列表 → 注入 planning prompt（_mcp.tools 已在启动时加载）
-                if mcp_tool_list:
-                    self._inject_tools_to_planning(agent, mcp_tool_list)
+                # MCP 工具 + skill 工具 → 注入 planning prompt
+                all_tools = list(mcp_tool_list) + skill_tools
+                if all_tools:
+                    self._inject_tools_to_planning(agent, all_tools)
 
                 # 执行
                 phase_result = await self._execute_phase(phase_task, agent, phase, trace)
@@ -1018,6 +1136,7 @@ class TaskAgent(AgentBase):
                     trace.record("phase_failed", {"phase_id": phase_id, "reason": "empty result"})
 
                 phase_results.append({"phase": phase, "result": phase_result, "passed": passed})
+                completed_phases.append({"phase": phase, "result": phase_result, "passed": passed})
 
                 # TraceCollector: 结束当前技能
                 if phase_type == "skill" and collector:
@@ -1025,6 +1144,14 @@ class TaskAgent(AgentBase):
                         collector.end_skill()
                     except Exception:
                         pass
+
+                # ── 重新规划：如果有剩余阶段则直接执行，否则调 _plan() ──
+                remaining_phases = phases[1:]  # phases[0] 已执行
+                if remaining_phases:
+                    plan["phases"] = remaining_phases
+                else:
+                    plan = await self._plan(user_input, self.llm, trace, completed_phases)
+                print(f"[DEBUG] replan: phases={[(p['name'], p['type'], p.get('skill')) for p in plan.get('phases', [])]}", flush=True)
 
             # ── 7. TraceCollector 存库 ──
             if collector:
@@ -1063,7 +1190,7 @@ class TaskAgent(AgentBase):
                 sources=sources,
                 session_id=session_id,
                 elapsed_seconds=elapsed,
-                metadata={"trace_id": trace.trace_id, "phase_count": len(phases), "phase_types": [p.get("type") for p in phases]},
+                metadata={"trace_id": trace.trace_id, "phase_count": len(phase_results), "phase_types": [p["phase"].get("type") for p in phase_results]},
             )
             trace.finish(response=response.to_dict())
             return response
@@ -1073,18 +1200,18 @@ class TaskAgent(AgentBase):
             _collectors.pop(session_id, None)
             raise
 
-    def _build_phase_roadmap(self, phases: list, current_phase_id: int) -> str:
-        """构建阶段路线图提示（全量可见，标记当前阶段）。"""
-        lines = ["【执行路线图】（仅作参考，不要跳过当前阶段）"]
-        for phase in phases:
-            pid = phase.get("id", 0)
-            name = phase.get("name", "")
-            goal = phase.get("goal", "")
-            if pid == current_phase_id:
-                lines.append(f"  → 阶段{pid}: {name} — {goal} ← 你在这里")
-            elif pid < current_phase_id:
-                lines.append(f"  ✓ 阶段{pid}: {name}")
-            else:
-                lines.append(f"  ○ 阶段{pid}: {name} — {goal}")
+    def _build_phase_roadmap(self, current_phase: dict, completed_phases: list | None = None) -> str:
+        """构建阶段路线图提示。"""
+        lines = ["【执行路线图】"]
+        # 已完成阶段
+        if completed_phases:
+            for cp in completed_phases:
+                p = cp.get("phase", {})
+                lines.append(f"  ✓ 阶段{p.get('id', '?')}: {p.get('name', '')}")
+        # 当前阶段
+        pid = current_phase.get("id", 0)
+        name = current_phase.get("name", "")
+        goal = current_phase.get("goal", "")
+        lines.append(f"  → 阶段{pid}: {name} — {goal} ← 你在这里")
         lines.append("\n【约束】完成当前阶段后输出结果，不要自行进入下一阶段。")
         return "\n".join(lines)
