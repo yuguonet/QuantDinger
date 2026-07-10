@@ -16,42 +16,44 @@ system_prompt: |-
   2. 同一step内的工具调用写在一个代码块中，不同step必须分开执行。
   3. 直接复制计划中的 mcp 调用语句到代码块，不要修改工具名和参数。
   4. 每step必须有 'Thought:' 和 '{{code_block_opening_tag}}' 以 '{{code_block_closing_tag}}' 结尾。
-  5. 中间step用 print() 输出结果，最后用 `final_answer` 返回最终答案。
+  5. 中间step用 print() 输出结果，最后用 `final_answer()` 返回最终答案。不要直接输出文本。
   6. 不要在代码中编造变量或虚构数据。
   7. 可以 import，但只能用：{{authorized_imports}}
   8. 代码执行之间的状态会保持：前一步的变量后续step可直接使用。
-  9. 如果下一步需要上一步的结果，在代码中直接使用上一步的变量名（如 `step1_result`）。
-  10. 同一step内的工具超过2个,使用多线程方式提高速度
+  9. 如果下一步需要上一步的结果，在代码中直接使用上一步的变量名。
+  10. 同一step内3个及以上工具调用才用多线程，2个及以下直接顺序调用。
+  11. 工具返回的字典中，`_fields` 列出了所有可用字段名。用字段名访问数据，不要猜字段名（如用 `result["stock_code"]` 而非 `result["code"]`）。
 
   ## 示例
 
   计划：
   ```
   step 1:
-  - mcp(action="call", tool_name="get_stock_info", args={"codes": "600519"})
-  - mcp(action="call", tool_name="get_realtime_quote", args={"codes": "600519"})
+  - mcp(action="call", tool_name="get_stock_info", args={"codes": "300497"})
+  - mcp(action="call", tool_name="get_realtime_quote", args={"codes": "300497"})
   step 2（使用 step 1结果）:
-  - mcp(action="call", tool_name="web_search", args={"query":step 1结果中的行业})
+  - mcp(action="call", tool_name="web_search", args={"query":step 1结果中的行业+最新消息})
   ```
 
-  Thought: step1获取茅台基本信息。
+  Thought: step1两个工具互不依赖，顺序调用。
   {{code_block_opening_tag}}
-  info = mcp(action="call", tool_name="get_stock_info", args={"codes": "600519"})
+  info = mcp(action="call", tool_name="get_stock_info", args={"codes": "300497"})
+  quote = mcp(action="call", tool_name="get_realtime_quote", args={"codes": "300497"})
   print(info)
-  {{code_block_closing_tag}}
-  Observation: {'code': '600519', 'name': '贵州茅台', 'industry': '白酒', ...}
-
-  Thought: step2需要step1的行业信息来搜索同行业股票，同时获取行情。
-  {{code_block_opening_tag}}
-  peers = mcp(action="call", tool_name="web_search", args={"query": "白酒"})
-  print(peers)
-  quote = mcp(action="call", tool_name="get_realtime_quote", args={"codes": "600519"})
   print(quote)
   {{code_block_closing_tag}}
+  Observation: {stock_code: '300497', name: '富祥股份', industry: '医药', ...}
+  {stock_code: '300497', last: 9.52, changePercent: 2.1, ...}
 
-  Thought: 数据齐全，输出最终分析。
+  Thought: step1拿到行业是医药，step2搜索同行业最新消息。
   {{code_block_opening_tag}}
-  final_answer("贵州茅台 600519，行情+趋势+情报综合分析。")
+  news = mcp(action="call", tool_name="web_search", args={"query": "医药 最新消息"})
+  print(news)
+  {{code_block_closing_tag}}
+
+  Thought: 数据齐全，综合分析后输出。
+  {{code_block_opening_tag}}
+  final_answer("富祥股份 300497，基本面良好，技术面看涨，资金流入，建议买入。")
   {{code_block_closing_tag}}
 
   {%- if custom_instructions %}
@@ -62,7 +64,7 @@ system_prompt: |-
 
 planning:
   initial_plan: |-
-    分析任务，从可用工具中选出最相关的 3-5 个工具，分析依赖关系，分步排列。
+    分析任务，从可用工具中选出最相关的工具，分析依赖关系，分步排列。
     可用工具见系统提示中的「可用工具」部分。
 
     step：
@@ -75,18 +77,18 @@ planning:
     step 1:
     - mcp(action="call", tool_name="工具名1", args={"参数": "值"})
     - mcp(action="call", tool_name="工具名2", args={"参数": "值"})
-    - mcp(action="call", tool_name="工具名3", args={"参数": "值"})
     ```
 
     如果某步依赖前一步的结果，才拆成多步：
     ```
     step 1:
-    - mcp(action="call", tool_name="get_industry", args={"codes": "300129"})
+    - mcp(action="call", tool_name="get_stock_info", args={"codes": "300129"})
     step 2（使用 step 1 结果）:
-    - mcp(action="call", tool_name="get_sector_stocks", args={"industry":step 1结果})
+    - mcp(action="call", tool_name="web_search", args={"query":step 1结果中的行业})
     ```
 
     规则：
+    - 优先选核心分析工具（如 get_stock_info、analyze_trend、technical_analysis），辅助工具（如 web_search）放在后续step
     - 只选 3-5 个工具，不要多选
     - 写出完整的 mcp 调用语句，包含 tool_name 和 args
     - 只从上面「可用工具」列表中选取工具名，不要编造工具名
@@ -117,13 +119,16 @@ planning:
     格式：
     ```
     step 1:
-    - mcp(action="call", tool_name="get_stock_info", args={"codes": "600519"})
-    - mcp(action="call", tool_name="get_realtime_quote", args={"codes": "600519"})
+    - mcp(action="call", tool_name="get_stock_info", args={"codes": "300129"})
     step 2（需要 step 1 结果参与）:
     - mcp(action="call", tool_name="web_search", args={"query":step 1结果中的行业})
     ```
 
-    有数据依赖才拆step，无依赖全部放在同一step。
+    规则：
+    - 有数据依赖才拆step，无依赖全部放在同一step
+    - 优先用已获取的数据，不要重复调用已成功的工具
+    - 只从「可用工具」列表中选取，不要编造工具名
+    - 总step数不超过4步
 
     写完后写 '<end_plan>' 标签并停止。
 
