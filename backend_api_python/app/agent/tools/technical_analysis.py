@@ -43,7 +43,6 @@ def _call_tools(stock_code: str) -> Dict[str, Any]:
     return results
 def _algo_analyze(
     stock_code: str,
-    stock_name: str,
     tool_results: Dict[str, Any],
 ) -> dict:
     """纯算法技术面 + 动量分析。"""
@@ -236,7 +235,7 @@ def _algo_analyze(
 
     # ── markdown 分析 ──
     dir_map = {"bullish": "看多", "bearish": "看空", "neutral": "中性"}
-    md = f"{stock_name or stock_code}({stock_code}) {final_score:.0f}分 {dir_map.get(direction, direction)}"
+    md = f"{stock_code}({stock_code}) {final_score:.0f}分 {dir_map.get(direction, direction)}"
     if factors:
         md += "\n" + " ".join(f"{f['name']}:{f['score']}" for f in factors[:4])
     if signals:
@@ -251,19 +250,17 @@ def _algo_analyze(
         "factors": factors,
         "analysis": analysis,
         "stock_code": stock_code,
-        "stock_name": stock_name,
     }
     return _r
-def technical_analysis(codes: str, stock_name: str = "") -> dict:
+def technical_analysis(codes: str) -> dict:
     """技术面综合评分：内部调用 analyze_trend+get_indicator_snapshot+get_volume_analysis+analyze_pattern+get_chip_distribution，加权输出 0-100 分。需要单股深度分析时用此工具，不要同时调 analyze_trend。
 
     Args:
         codes: 股票代码（6位数字），如 "600519"
-        stock_name: 股票名称（可选），如 "贵州茅台"
 
     Returns:
         dict: 标准化分析报告，包含 score(0-100)、direction(bullish/bearish/neutral)、
               confidence(high/medium/low)、signal(信号摘要)、factors(因子明细)、analysis(分析文字)
     """
     tool_results = _call_tools(codes)
-    return _algo_analyze(codes, stock_name, tool_results)
+    return _algo_analyze(codes, tool_results)
