@@ -31,6 +31,15 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
+# MCP 子进程需要加载 .env，否则拿不到数据库密码等配置
+# mcp_bridge.py 位于 app/agent/tools/，.env 位于 backend_api_python/
+try:
+    from dotenv import load_dotenv
+    _env_path = Path(__file__).resolve().parent.parent.parent.parent / ".env"  # backend_api_python/.env
+    load_dotenv(_env_path, override=False)
+except ImportError:
+    pass
+
 logger = logging.getLogger(__name__)
 
 # ── 配置 ──────────────────────────────────────────────────────

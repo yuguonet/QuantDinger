@@ -151,6 +151,9 @@ def _filter_stock_info(info: Dict[str, Any], detail: bool = False) -> Dict[str, 
     """过滤股票信息，去除 None 值；非 detail 模式只保留核心字段。"""
     if not isinstance(info, dict):
         return info
+    # error 直接透传，不过滤
+    if "error" in info:
+        return info
     if detail:
         return {k: v for k, v in info.items() if v is not None}
     return {k: v for k, v in info.items() if v is not None and k in _STOCK_INFO_CORE_FIELDS}
