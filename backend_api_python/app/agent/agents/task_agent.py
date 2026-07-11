@@ -479,7 +479,31 @@ _mcp = _MCPSingleton()
 #  TaskAgent
 # ═══════════════════════════════════════════════════════════════
 
+class _CacheReadTool(SmolToolBase):
+    """让 CodeAgent 读取跨阶段缓存数据（内部工具，不通过 MCP 暴露）。"""
+    skip_forward_signature_validation = True
 
+    def __init__(self):
+        super().__init__()
+        self.name = "read_cache"
+        self.description = "读取之前步骤的缓存数据。参数: key（缓存键名，如 phase0_step1）"
+        self.output_type = "string"
+        self.inputs = {"key": {"type": "string", "description": "缓存键名"}}
+
+    def forward(self, key: str = "", **kwargs) -> str:
+        from tools.cache_tools import read_cache
+        result = read_cache(key)
+        if isinstance(result, dict):
+            import json
+            return json.dumps(result, ensure_ascii=False, default=str)
+        return str(result) if result is not None else ""
+
+    def __call__(self, *args, **kwargs):
+        pnames = list(self.inputs.keys())
+        for i, arg in enumerate(args):
+            if i < len(pnames):
+                kwargs[pnames[i]] = arg
+        return self.forward(**kwargs)
 
 
 class TaskAgent(AgentBase):
@@ -733,11 +757,11 @@ class TaskAgent(AgentBase):
                             step.observations_images = None
 
         agent = SmolCodeAgent(
-            tools=[],
+            tools=[_CacheReadTool()],
             model=model,
             max_steps=self.max_tool_rounds,
             executor=mcp_executor,
-            planning_interval=planning_interval,
+            planning_interval=None if skill_tools else planning_interval,
             code_block_tags="markdown",
             step_callbacks=[_cache_and_truncate],
             instructions=(
@@ -995,17 +1019,21 @@ class TaskAgent(AgentBase):
                         try:
                             body = loader.load_body(phase_skill)
                             if body:
-                                if len(body.split()) > 500:
-                                    headings = loader.get_section_headings(phase_skill)
-                                    catalog = "\n".join(f"  - {h}" for h in headings)
-                                    phase_task_parts.append(
-                                        f"【技能: {phase_skill}】\n"
-                                        f"使用 read_skill_section 工具按需加载指令段落。\n"
-                                        f"可用段落:\n{catalog}"
-                                    )
+                                # 只注入当前阶段对应的段落，不注入完整 SKILL.md
+                                # 按 "Phase N" 关键词匹配段落标题
+                                phase_sections = [h for h in loader.get_section_headings(phase_skill) if "phase" in h.lower()]
+                                if phase_id < len(phase_sections):
+                                    section = loader.load_section(phase_skill, phase_sections[phase_id])
+                                    if section:
+                                        phase_task_parts.append(f"【技能指令: {phase_skill} — {phase_sections[phase_id]}】\n{section}")
+                                        trace.record("skill_loaded", {"skill": phase_skill, "body_len": len(section), "mode": "phase_section"})
+                                    else:
+                                        phase_task_parts.append(f"【技能指令: {phase_skill}】\n{body}")
+                                        trace.record("skill_loaded", {"skill": phase_skill, "body_len": len(body), "mode": "full"})
                                 else:
+                                    # phase_id 超出段落数，注入完整 body
                                     phase_task_parts.append(f"【技能指令: {phase_skill}】\n{body}")
-                                trace.record("skill_loaded", {"skill": phase_skill, "body_len": len(body)})
+                                    trace.record("skill_loaded", {"skill": phase_skill, "body_len": len(body), "mode": "full"})
                         except Exception as e:
                             logger.warning("[TaskAgent] skill %s 加载失败: %s", phase_skill, e)
 
@@ -1025,17 +1053,17 @@ class TaskAgent(AgentBase):
                     phase_task_parts.append(f"【当前阶段】{phase_name} — {phase_goal}")
                     phase_task_parts.append(f"【任务】\n{expanded_query}")
 
-                    # 注入缓存索引（如果有）
+
+
+
+                    # 注入缓存索引（让 CodeAgent 知道有哪些数据可用）
                     cache_index = cache.index()
                     if cache_index:
-                        cache_hint = "【缓存中的已有数据】\n"
+                        cache_hint = "【可用缓存数据】\n"
                         for k, v in cache_index.items():
-                            cache_hint += f"- {k}: {v}\n"
-                        cache_hint += """\n使用 read_cache(key) 读取上述数据，无需重复调用工具。
-用法：result = read_cache("phase0_step1")
-"""
+                            cache_hint += f"  - {k}: {v}\n"
+                        cache_hint += "\n用 read_cache(key) 按需读取，不要重复调用工具。\n"
                         phase_task_parts.append(cache_hint)
-
                     phase_task = "\n\n".join(phase_task_parts)
 
                     # 构建 CodeAgent（每阶段独立）
