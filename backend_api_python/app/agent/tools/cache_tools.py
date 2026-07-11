@@ -30,6 +30,13 @@ def read_cache(key: str) -> Any:
             "error": f"缓存中不存在 key '{key}'",
             "available_keys": available[:20],
         }
+    # 如果是 JSON 字符串，自动解析为 dict/list
+    if isinstance(result, str):
+        import json
+        try:
+            return json.loads(result)
+        except (json.JSONDecodeError, TypeError):
+            pass
     return result
 
 

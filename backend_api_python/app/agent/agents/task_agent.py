@@ -521,6 +521,8 @@ class TaskAgent(AgentBase):
         user_input: str,
         llm: LLMBase,
         trace: AgentTraceRecorder,
+        completed_phases: list | None = None,
+        selected_skill: str | None = None,
     ) -> dict:
         """Plan 节点：选择技能、划分执行阶段。
 
@@ -545,8 +547,32 @@ class TaskAgent(AgentBase):
                 skills_desc.append(f"- {s['name']}: {s.get('description', '')[:150]}")
         skills_text = "\n".join(skills_desc) if skills_desc else "(无可用技能)"
 
+        # 如果有选定技能，追加执行流程，让 LLM 看到步骤以拆分阶段
+        if selected_skill and self.skill_adapter:
+            skill_body = self.skill_adapter.load_body(selected_skill)
+            if skill_body:
+                skills_text += f"\n\n技能 [{selected_skill}] 的执行流程（请按此拆分阶段）:\n{skill_body}"
+
         template = _load_plan_template()
-        prompt = template.format(skills_text=skills_text, user_input=user_input)
+        # 构建已完成阶段文本
+        if completed_phases:
+            completed_lines = []
+            for cp in completed_phases:
+                status = "✅" if cp.get("passed") else "❌"
+                result_preview = str(cp.get("result", ""))[:300]
+                completed_lines.append(
+                    f"  {status} 阶段{cp.get('id', '?')}: {cp.get('name', '')} — {cp.get('goal', '')}\n"
+                    f"     结果: {result_preview}"
+                )
+            completed_phases_text = "\n已完成阶段:\n" + "\n".join(completed_lines)
+        else:
+            completed_phases_text = ""
+
+        prompt = template.format(
+            skills_text=skills_text,
+            user_input=user_input,
+            completed_phases_text=completed_phases_text,
+        )
 
         messages = [
             ChatMessage(role="system", content="你是任务规划器。只输出 JSON。"),
@@ -576,7 +602,10 @@ class TaskAgent(AgentBase):
         # 解析阶段
         phases = plan.get("phases", [])
         if not phases:
-            # 兜底：至少一个 direct 阶段
+            if completed_phases:
+                # re-plan 返回空列表 → 任务完成，不兜底
+                return {"phases": [], "planning_interval": 3, "expanded_query": user_input}
+            # 首次 plan 无阶段 → 兜底一个 direct
             phases = [{"id": 0, "name": "回答", "type": "direct", "skill": None, "goal": plan.get("expanded_query", user_input)}]
 
         # 补全阶段字段
@@ -907,22 +936,37 @@ class TaskAgent(AgentBase):
             except Exception as e:
                 logger.debug("[Trace] TraceCollector 创建失败: %s", e)
 
-            # ── 6. 阶段执行循环（统一多阶段）──
+            # ── 6. 阶段执行循环（re-planning 模式）──
+            # _plan() 首次返回所有阶段，执行一个后重新调 _plan()，
+            # LLM 根据已完成结果决定剩余阶段，[] 表示结束。
             loader = self._get_skill_loader()  # 可能为 None
             phase_results = []
+            selected_skill = None  # 跨 re-plan 保持首次选定的技能
 
             # 请求级缓存初始化（阶段间共享）
             from agents.round_cache import reset_current_cache
             cache = reset_current_cache()
 
-            for phase in phases:
+            max_replan_rounds = 10  # 防止无限循环
+            replan_round = 0
+            completed_count = 0  # 已完成阶段计数（跨 re-plan）
+
+            while phases and replan_round < max_replan_rounds:
+                replan_round += 1
+                phase = phases[0]  # 每次只执行第一个待执行阶段
                 phase_id = phase.get("id", 0)
                 phase_name = phase.get("name", "执行")
                 phase_type = phase.get("type", "execute")
                 phase_goal = phase.get("goal", "")
                 phase_skill = phase.get("skill")
 
+                # 记录首次选定的技能（跨 re-plan 保持）
+                if phase_skill and not selected_skill:
+                    selected_skill = phase_skill
+
                 trace.record("phase_start", {"phase_id": phase_id, "phase_name": phase_name, "phase_type": phase_type, "phase_goal": phase_goal, "skill": phase_skill})
+
+                phase_result = ""
 
                 # ── direct 类型：LLM 直接回答 ──
                 if phase_type == "direct":
@@ -937,79 +981,85 @@ class TaskAgent(AgentBase):
                     messages.append(ChatMessage(role="user", content=user_input))
                     llm_response = await self.llm.generate(messages=messages)
                     phase_result = llm_response.content
-                    phase_results.append({"phase": phase, "result": phase_result, "passed": bool(phase_result and phase_result.strip())})
-                    continue
 
-                # ── skill / execute 类型：CodeAgent + 工具 ──
-                logger.info("[TaskAgent] 阶段 %d: %s — %s (skill=%s)", phase_id, phase_type, phase_name, phase_skill)
+                else:
+                    # ── skill / execute 类型：CodeAgent + 工具 ──
+                    logger.info("[TaskAgent] 阶段 %d: %s — %s (skill=%s)", phase_id, phase_type, phase_name, phase_skill)
 
-                # 构建阶段任务上下文
-                phase_task_parts = list(shared_parts)
+                    # 构建阶段任务上下文
+                    phase_task_parts = list(shared_parts)
 
-                # skill 类型：加载该技能的指令和工具
-                skill_tools = []
-                if phase_type == "skill" and phase_skill and loader:
-                    try:
-                        body = loader.load_body(phase_skill)
-                        if body:
-                            if len(body.split()) > 500:
-                                headings = loader.get_section_headings(phase_skill)
-                                catalog = "\n".join(f"  - {h}" for h in headings)
-                                phase_task_parts.append(
-                                    f"【技能: {phase_skill}】\n"
-                                    f"使用 read_skill_section 工具按需加载指令段落。\n"
-                                    f"可用段落:\n{catalog}"
-                                )
-                            else:
-                                phase_task_parts.append(f"【技能指令: {phase_skill}】\n{body}")
-                            trace.record("skill_loaded", {"skill": phase_skill, "body_len": len(body)})
-                    except Exception as e:
-                        logger.warning("[TaskAgent] skill %s 加载失败: %s", phase_skill, e)
+                    # skill 类型：加载该技能的指令和工具
+                    skill_tools = []
+                    if phase_type == "skill" and phase_skill and loader:
+                        try:
+                            body = loader.load_body(phase_skill)
+                            if body:
+                                if len(body.split()) > 500:
+                                    headings = loader.get_section_headings(phase_skill)
+                                    catalog = "\n".join(f"  - {h}" for h in headings)
+                                    phase_task_parts.append(
+                                        f"【技能: {phase_skill}】\n"
+                                        f"使用 read_skill_section 工具按需加载指令段落。\n"
+                                        f"可用段落:\n{catalog}"
+                                    )
+                                else:
+                                    phase_task_parts.append(f"【技能指令: {phase_skill}】\n{body}")
+                                trace.record("skill_loaded", {"skill": phase_skill, "body_len": len(body)})
+                        except Exception as e:
+                            logger.warning("[TaskAgent] skill %s 加载失败: %s", phase_skill, e)
 
-                    # 加载技能工具
-                    func_tools = _load_skill_functions(phase_skill)
-                    skill_tools.extend(func_tools)
-                    if loader:
-                        skill_tools.append(_SkillSectionTool(loader, phase_skill))
-                        skill_tools.append(_SkillResourceTool(loader, phase_skill))
-                    logger.info("[TaskAgent] skill %s 注入函数工具: %s", phase_skill, [t.name for t in func_tools])
-                    if collector:
-                        collector.begin_skill(phase_skill)
+                        # 加载技能工具
+                        func_tools = _load_skill_functions(phase_skill)
+                        skill_tools.extend(func_tools)
+                        if loader:
+                            skill_tools.append(_SkillSectionTool(loader, phase_skill))
+                            skill_tools.append(_SkillResourceTool(loader, phase_skill))
+                        logger.info("[TaskAgent] skill %s 注入函数工具: %s", phase_skill, [t.name for t in func_tools])
+                        if collector:
+                            collector.begin_skill(phase_skill)
 
-                # 构建阶段任务
-                phase_roadmap = self._build_phase_roadmap(phases, phase_id)
-                phase_task_parts.append(phase_roadmap)
-                phase_task_parts.append(f"【当前阶段】{phase_name} — {phase_goal}")
-                phase_task_parts.append(f"【任务】\n{expanded_query}")
+                    # 构建阶段任务
+                    phase_roadmap = self._build_phase_roadmap(phases, completed_count=completed_count)
+                    phase_task_parts.append(phase_roadmap)
+                    phase_task_parts.append(f"【当前阶段】{phase_name} — {phase_goal}")
+                    phase_task_parts.append(f"【任务】\n{expanded_query}")
 
-                # 注入缓存索引（如果有）
-                cache_index = cache.index()
-                if cache_index:
-                    cache_hint = "【缓存中的已有数据】\n"
-                    for k, v in cache_index.items():
-                        cache_hint += f"- {k}: {v}\n"
-                    cache_hint += """\n使用 read_cache(key) 读取上述数据，无需重复调用工具。
+                    # 注入缓存索引（如果有）
+                    cache_index = cache.index()
+                    if cache_index:
+                        cache_hint = "【缓存中的已有数据】\n"
+                        for k, v in cache_index.items():
+                            cache_hint += f"- {k}: {v}\n"
+                        cache_hint += """\n使用 read_cache(key) 读取上述数据，无需重复调用工具。
 用法：result = read_cache("phase0_step1")
 """
-                    phase_task_parts.append(cache_hint)
+                        phase_task_parts.append(cache_hint)
 
-                phase_task = "\n\n".join(phase_task_parts)
+                    phase_task = "\n\n".join(phase_task_parts)
 
-                # 构建 CodeAgent（每阶段独立）
-                agent = self._build_code_agent(
-                    model=model,
-                    mcp_tool_list=mcp_tool_list,
-                    skill_tools=skill_tools,
-                    planning_interval=planning_interval,
-                    phase_id=phase_id,
-                )
+                    # 构建 CodeAgent（每阶段独立）
+                    agent = self._build_code_agent(
+                        model=model,
+                        mcp_tool_list=mcp_tool_list,
+                        skill_tools=skill_tools,
+                        planning_interval=planning_interval,
+                        phase_id=phase_id,
+                    )
 
-                # MCP 工具列表 → 注入 planning prompt（_mcp.tools 已在启动时加载）
-                if mcp_tool_list:
-                    self._inject_tools_to_planning(agent, mcp_tool_list)
+                    # MCP 工具列表 → 注入 planning prompt（_mcp.tools 已在启动时加载）
+                    if mcp_tool_list:
+                        self._inject_tools_to_planning(agent, mcp_tool_list)
 
-                # 执行
-                phase_result = await self._execute_phase(phase_task, agent, phase, trace)
+                    # 执行
+                    phase_result = await self._execute_phase(phase_task, agent, phase, trace)
+
+                    # TraceCollector: 结束当前技能
+                    if phase_type == "skill" and collector:
+                        try:
+                            collector.end_skill()
+                        except Exception:
+                            pass
 
                 # 规则 eval
                 passed = bool(phase_result and phase_result.strip())
@@ -1017,14 +1067,36 @@ class TaskAgent(AgentBase):
                     logger.warning("[TaskAgent] 阶段 %d eval 未通过: 结果为空", phase_id)
                     trace.record("phase_failed", {"phase_id": phase_id, "reason": "empty result"})
 
-                phase_results.append({"phase": phase, "result": phase_result, "passed": passed})
+                phase_results.append({
+                    "id": phase_id,
+                    "name": phase_name,
+                    "goal": phase_goal,
+                    "result": phase_result,
+                    "passed": passed,
+                })
+                completed_count += 1
 
-                # TraceCollector: 结束当前技能
-                if phase_type == "skill" and collector:
-                    try:
-                        collector.end_skill()
-                    except Exception:
-                        pass
+                # ── re-plan: 阶段完成后重新规划 ──
+                logger.info("[TaskAgent] 阶段 %d 完成，重新规划...", phase_id)
+                trace.record("replan_request", {"completed_count": len(phase_results)})
+
+                plan = await self._plan(
+                    user_input,
+                    self.llm,
+                    trace,
+                    completed_phases=phase_results,
+                    selected_skill=selected_skill,
+                )
+                phases = plan["phases"]
+                planning_interval = plan["planning_interval"]
+                expanded_query = plan["expanded_query"]
+
+                logger.info("[TaskAgent] re-plan: %d 剩余阶段 %s",
+                             len(phases), [(p["name"], p["type"]) for p in phases])
+                trace.record("replan_result", {
+                    "remaining_phases": len(phases),
+                    "phases": [(p["name"], p["type"]) for p in phases],
+                })
 
             # ── 7. TraceCollector 存库 ──
             if collector:
@@ -1049,7 +1121,7 @@ class TaskAgent(AgentBase):
                 result_parts = []
                 for pr in phase_results:
                     status = "✅" if pr["passed"] else "❌"
-                    result_parts.append(f"{status} 阶段: {pr['phase'].get('name', '')}\n{pr['result']}")
+                    result_parts.append(f"{status} 阶段: {pr.get('name', '')}\n{pr['result']}")
                 result_raw = "\n\n".join(result_parts)
 
             # ── 9. 保存对话历史 ──
@@ -1063,7 +1135,7 @@ class TaskAgent(AgentBase):
                 sources=sources,
                 session_id=session_id,
                 elapsed_seconds=elapsed,
-                metadata={"trace_id": trace.trace_id, "phase_count": len(phases), "phase_types": [p.get("type") for p in phases]},
+                metadata={"trace_id": trace.trace_id, "phase_count": len(phase_results), "replan_rounds": replan_round},
             )
             trace.finish(response=response.to_dict())
             return response
@@ -1073,18 +1145,30 @@ class TaskAgent(AgentBase):
             _collectors.pop(session_id, None)
             raise
 
-    def _build_phase_roadmap(self, phases: list, current_phase_id: int) -> str:
-        """构建阶段路线图提示（全量可见，标记当前阶段）。"""
-        lines = ["【执行路线图】（仅作参考，不要跳过当前阶段）"]
-        for phase in phases:
+    def _build_phase_roadmap(self, phases: list, completed_count: int = 0) -> str:
+        """构建阶段路线图提示（全量可见，标记当前阶段）。
+
+        关键约束：CodeAgent 必须在当前阶段完成后立即调用 final_answer() 输出结果，
+        然后停止。不允许自行进入后续阶段。后续阶段由外层循环调度。
+
+        completed_count: 已完成的阶段数（跨 re-plan 累计）。
+        phases[0] 始终是当前阶段（与 while 循环的 phase = phases[0] 对齐）。
+        """
+        lines = ["【执行路线图】（多阶段任务，你只负责当前阶段）"]
+        if completed_count > 0:
+            lines.append(f"  （已完成 {completed_count} 个阶段）")
+        for i, phase in enumerate(phases):
             pid = phase.get("id", 0)
             name = phase.get("name", "")
             goal = phase.get("goal", "")
-            if pid == current_phase_id:
-                lines.append(f"  → 阶段{pid}: {name} — {goal} ← 你在这里")
-            elif pid < current_phase_id:
-                lines.append(f"  ✓ 阶段{pid}: {name}")
+            # 每次循环只执行 phases[0]，所以 i==0 就是当前阶段
+            if i == 0:
+                lines.append(f"  → 阶段{pid}: {name} — {goal} ← 【当前】你只做这个")
             else:
                 lines.append(f"  ○ 阶段{pid}: {name} — {goal}")
-        lines.append("\n【约束】完成当前阶段后输出结果，不要自行进入下一阶段。")
+        lines.append("")
+        lines.append("【严格约束】")
+        lines.append("1. 只执行当前阶段的任务，不要做后续阶段的事情")
+        lines.append("2. 当前阶段完成后，立即调用 final_answer() 输出结果")
+        lines.append("3. 不要自行进入下一阶段，后续阶段由系统自动调度")
         return "\n".join(lines)
