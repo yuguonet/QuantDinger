@@ -316,7 +316,7 @@ def make_chat_node(ctx: NodeContext):
 
     职责：
       1. RAG 检索（只做一次，结果贯穿后续链路）
-      2. 实体解析（股票代码等）
+      2. 实体解析（代码/名称/标识）
       3. 消息标准化（短指令 → 完整分析指令）
       4. 意图分类：简单问题直接回答，需要工具进 plan
     """
@@ -366,7 +366,7 @@ def make_chat_node(ctx: NodeContext):
         needs_task = True
         direct_answer = ""
 
-        # 有实体（股票代码等）→ 必须走任务流程
+        # 有实体 → 必须走任务流程
         if entity_code:
             needs_task = True
         else:

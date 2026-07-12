@@ -21,5 +21,6 @@
 - 如果需要使用技能，在 task 中说明
 
 示例：
-"分析300129" → {{"task": "分析300129股票的技术面、基本面和资金流向，给出标准评估结果", "step_budget": 10, "planning_interval": 3}}
-"今天选什么股" → {{"task": "使用 market-screener 技能筛选今日值得关注的股票", "step_budget": 8, "planning_interval": 3}}
+"分析300129" → {{"task": "分析300129的多维度数据，给出标准评估结果", "step_budget": 10, "planning_interval": 3}}
+"今天选什么股" → {{"task": "使用 market-screener 技能筛选今日值得关注的标的", "step_budget": 8, "planning_interval": 3}}
+"写一个交易接口" → {{"task": "设计并实现交易接口", "step_budget": 10, "planning_interval": 3}}
