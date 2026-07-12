@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """多空研究员 — 同时构建多头和空头论据，综合判断方向。"""
 from typing import Any, Dict, List
+from app.agent.tools.news_search_tools import search_stock_intel, search_policy_intel
 def bull_bear_research(codes: str, stock_name: str = "") -> dict:
     """多空研究：对单只股票做技术面+筹码+情报综合分析，返回多空评分和方向判断。
 
@@ -30,7 +31,7 @@ def bull_bear_research(codes: str, stock_name: str = "") -> dict:
         ("trend", lambda: _analyze_trend(codes)),
         ("volume", lambda: _get_volume_analysis(codes)),
         ("indicator", lambda: _get_indicator_snapshot(codes)),
-        ("intel", lambda: _search_stock_intel(codes, stock_name or "")),
+        ("intel", lambda: search_stock_intel(codes, stock_name or "")),
     ]:
         try:
             data[name] = fn()
@@ -649,124 +650,3 @@ def _get_indicator_snapshot(codes: str) -> Dict[str, Any]:
         except Exception as e:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
-# ── 内联自 news_search_tools.py ──
-
-def _get_policy_from_cache() -> List[Dict[str, Any]]:
-    """政策新闻: 只读 DB 缓存 (scheduler 每日写入)"""
-    try:
-        from app.services.news_search import get_news_cache_manager
-        cached = get_news_cache_manager().get_items("POLICY", "CNStock")
-        if not cached:
-            return []
-        return [
-            {"title": r["title"], "link": r.get("url", ""),
-             "snippet": r.get("snippet", "") if (r.get("sentiment_score") or 0) == -999 or abs(r.get("sentiment_score") or 0) >= 3 else "",
-             "source": r.get("source", ""),
-             "published": r.get("published_date", ""),
-             "sentiment": r.get("sentiment", "neutral"),
-             "sentiment_score": r.get("sentiment_score")}
-            for r in cached
-        ]
-    except Exception as e:
-        logger.warning("读取 POLICY 缓存失败: %s", e)
-        return []
-
-def _get_news(symbol: str, market: str = "CNStock", name: str = "") -> List[Dict[str, Any]]:
-    """个股/板块新闻: 走 fetch_financial_news (缓存→搜索→写入)"""
-    try:
-        from app.services.news_search import fetch_financial_news
-        resp = fetch_financial_news(lang="all", market=market, symbol=symbol, name=name)
-        items = []
-        for lang_key in ("cn", "en"):
-            for it in resp.get(lang_key) or []:
-                score = it.get("sentiment_score") or 0
-                # 一票否决/强信号(|score|>=3)保留 snippet，中性/弱信号丢弃
-                snippet = it.get("snippet", "") if score == -999 or abs(score) >= 3 else ""
-                items.append({
-                    "title": it.get("title", ""),
-                    "link": it.get("link", ""),
-                    "snippet": snippet,
-                    "source": it.get("source", ""),
-                    "published": it.get("published", ""),
-                    "sentiment": it.get("sentiment", "neutral"),
-                    "sentiment_score": score,
-                })
-        return items
-    except Exception as e:
-        logger.warning("获取新闻失败 %s(%s): %s", symbol, market, e)
-        return []
-
-def _build_result(items: List[Dict[str, Any]], label: str) -> Dict[str, Any]:
-    """评分 + 排序: 一票否决置顶, 合计≤20条"""
-    from app.services.news_analysis import composite_score
-
-    articles = [
-        {"score": it.get("sentiment_score") or 0.0,
-         "published_date": it.get("published", "")}
-        for it in items
-    ]
-    score_info = composite_score(articles) if articles else {}
-
-    veto = score_info.get("veto", False)
-    veto_article = score_info.get("veto_article")
-
-    # 分离一票否决 vs 正常
-    veto_items, normal_items = [], []
-    for it in items:
-        sc = it.get("sentiment_score")
-        if sc == -999:
-            veto_items.append({**it, "_veto": True})
-        else:
-            normal_items.append(it)
-
-    # 正常按时间倒序
-    normal_items.sort(key=lambda x: x.get("published", ""), reverse=True)
-
-    # 合并: 一票否决置顶, 合计≤20
-    merged = veto_items + normal_items
-    merged = merged[:20]
-
-    return {
-        "label": label,
-        "composite_score": score_info.get("composite_score", 0),
-        "direction": score_info.get("direction", "中性"),
-        "veto": veto,
-        "veto_article": veto_article,
-        "count": len(merged),
-        "news": merged,
-    }
-
-def _search_stock_intel(codes: str, name: str = "") -> Dict[str, Any]:
-    """个股情报搜索：返回指定股票的新闻、公告、研报列表及摘要。
-
-    Args:
-        codes: 多股用逗号分隔"
-        name: 股票名称，如 "贵州茅台"
-    """
-    code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
-    if not code_list:
-        return {"error": "codes 不能为空", "retriable": False}
-
-    def _one(codes: str) -> Dict[str, Any]:
-        items = _get_news(codes, "CNStock", name)
-        return _build_result(items, f"个股:{codes}")
-
-    if len(code_list) == 1:
-        return _one(code_list[0])
-
-    results = {}
-    for code in code_list:
-        try:
-            results[code] = _one(code)
-        except Exception as e:
-            results[code] = {"error": str(e)}
-    return {"count": len(results), "data": results}
-
-def _search_policy_intel(market: str = "CNStock") -> Dict[str, Any]:
-    """政策情报搜索：返回最新财经政策、监管动态。
-
-    Args:
-        market: 市场或政策关键词
-    """
-    items = _get_policy_from_cache()
-    return _build_result(items, f"政策:{market}")
