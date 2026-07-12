@@ -11,12 +11,12 @@ graph.py — 轻量状态机（移植 LangGraph 核心设计模式）
     from graph import StateGraph, END
 
     graph = StateGraph(AgentState)
-    graph.add_node("prepare", prepare_node)
+    graph.add_node("chat", chat_node)
     graph.add_node("plan", plan_node)
-    graph.add_edge("prepare", "plan")
-    graph.add_conditional_edges("plan", route_after_plan, {"direct": "finalize", "execute": "execute"})
+    graph.add_conditional_edges("chat", route_after_chat, {"plan": "plan", "finalize": "finalize"})
+    graph.add_conditional_edges("plan", route_after_plan, {"execute": "execute", "finalize": "finalize"})
     graph.add_edge("finalize", END)
-    graph.set_entry_point("prepare")
+    graph.set_entry_point("chat")
 
     compiled = graph.compile(checkpointer=my_checkpointer)
     result = await compiled.ainvoke({"user_input": "分析300129"})

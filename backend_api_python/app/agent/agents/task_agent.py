@@ -647,54 +647,25 @@ class TaskAgent(AgentBase):
             if m:
                 text = m.group(1).strip()
 
-        plan = safe_parse_json(text, default={"phases": []})
+        plan = safe_parse_json(text, default={})
 
-        # 解析阶段
-        phases = plan.get("phases", [])
-        if not phases:
-            # 兜底：至少一个 direct 阶段
-            phases = [{"id": 0, "name": "回答", "type": "direct", "skill": None, "goal": plan.get("expanded_query", user_input)}]
-
-        # 补全阶段字段
-        all_skill_names = {s["name"] for s in self.skill_adapter.list_skills()} if self.skill_adapter else set()
-        for i, phase in enumerate(phases):
-            phase.setdefault("id", i)
-            phase.setdefault("name", "执行")
-            phase.setdefault("type", "execute")
-            phase.setdefault("goal", "")
-            phase.setdefault("skill", None)
-            # 校验技能名
-            if phase["type"] == "skill" and phase["skill"]:
-                sname = phase["skill"]
-                if sname.startswith("skill:"):
-                    sname = sname[6:]
-                    phase["skill"] = sname
-                if sname not in all_skill_names:
-                    logger.warning("[TaskAgent] plan 引用了未知技能 '%s'，降级为 execute", sname)
-                    phase["type"] = "execute"
-                    phase["skill"] = None
-            elif phase["type"] == "skill" and not phase["skill"]:
-                logger.warning("[TaskAgent] phase.type=skill 但未指定 skill，降级为 execute")
-                phase["type"] = "execute"
-
-        # 解析 planning_interval
-        # 默认 5：减少 replan 频率，避免正常工作被频繁打断
+        task = plan.get("task", "") or plan.get("expanded_query", "") or user_input
+        step_budget = plan.get("step_budget", 10) or 10
         planning_interval = plan.get("planning_interval", 3) or 3
 
-        expanded_query = plan.get("expanded_query", user_input) or user_input
-        logger.info("[TaskAgent] plan: %d 阶段 %s, planning_interval=%s",
-                     len(phases), [(p["name"], p["type"], p.get("skill")) for p in phases],
-                     planning_interval)
+        logger.info("[TaskAgent] plan: task=%s..., step_budget=%d, planning_interval=%d",
+                     task[:80], step_budget, planning_interval)
         trace.record("plan_result", {
             "route": "plan",
-            "phases": phases,
+            "task": task,
+            "step_budget": step_budget,
             "planning_interval": planning_interval,
         })
 
         return {
-            "phases": phases,
+            "task": task,
+            "step_budget": step_budget,
             "planning_interval": planning_interval,
-            "expanded_query": expanded_query,
         }
 
 
@@ -898,9 +869,9 @@ class TaskAgent(AgentBase):
         from graph import StateGraph, END
         from nodes import (
             AgentState, NodeContext,
-            make_prepare_node, make_plan_node,
+            make_chat_node, make_plan_node,
             make_execute_node, make_finalize_node,
-            route_after_plan, route_after_execute,
+            route_after_chat, route_after_plan, route_after_execute,
         )
 
         start_time = time.time()
@@ -923,27 +894,26 @@ class TaskAgent(AgentBase):
                 max_tool_rounds=self.max_tool_rounds,
             )
             ctx.agent = self  # 传递 TaskAgent 实例，供节点调用 _build_code_agent 等方法
-            ctx.init_mcp()
-
-            if not ctx.mcp_tool_list:
-                logger.error("[Graph] MCP 不可用")
-                return await super().chat(user_input, session_id=session_id, use_rag=use_rag)
+            # MCP 延迟初始化：chat_node 不需要 MCP，只在 plan/execute 路径才初始化
 
             # 构建图
             graph = StateGraph(AgentState)
-            graph.add_node("prepare", make_prepare_node(ctx))
+            graph.add_node("chat", make_chat_node(ctx))
             graph.add_node("plan", make_plan_node(ctx))
             graph.add_node("execute", make_execute_node(ctx))
             graph.add_node("finalize", make_finalize_node(ctx))
 
-            graph.set_entry_point("prepare")
-            graph.add_edge("prepare", "plan")
+            graph.set_entry_point("chat")
+            graph.add_conditional_edges("chat", route_after_chat, {
+                "plan": "plan",
+                "finalize": "finalize",
+            })
             graph.add_conditional_edges("plan", route_after_plan, {
                 "execute": "execute",
                 "finalize": "finalize",
             })
             graph.add_conditional_edges("execute", route_after_execute, {
-                "execute": "execute",
+                "plan": "plan",
                 "finalize": "finalize",
             })
             graph.add_edge("finalize", END)

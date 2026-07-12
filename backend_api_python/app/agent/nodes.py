@@ -2,12 +2,11 @@
 """
 nodes.py — Graph 节点定义
 
-将 _chat_plan() 拆分为 5 个独立节点：
-  - prepare_node：股票解析 + RAG + TraceCollector
-  - plan_node：_plan() 调用
-  - execute_node：执行单个阶段（direct/skill/execute）
-  - eval_node：评估阶段结果 + 重试
-  - finalize_node：汇总 + memory + TraceCollector 存库
+4 个节点 + plan 复盘循环：
+  - chat_node：RAG + 实体解析 + 意图分类 + 简单问题直接回答
+  - plan_node：生成任务描述 + step_budget（复盘时带前轮结果）
+  - execute_node：单 CodeAgent 执行，跨轮复用实例
+  - finalize_node：保存 memory + TraceCollector 存库
 
 每个节点签名为 async def node(state: dict) -> dict | None：
   - 输入：完整状态
@@ -169,26 +168,30 @@ class AgentState(TypedDict, total=False):
     session_id: str
     use_rag: bool
 
-    # ── prepare_node 输出（通用实体字段）──
+    # ── chat_node 输出（通用实体字段）──
     entity_code: str      # 实体代码（股票代码/商品代码/...）
     entity_name: str      # 实体名称
     entity_type: str      # 实体类型（stock/commodity/crypto/...）
-    context: str          # RAG 上下文
+    context: str          # RAG 上下文（仅 chat_node 检索一次）
     sources: list         # RAG 来源
     effective_input: str  # 扩写后的完整指令
 
-    # ── plan_node 输出 ──
-    phases: list          # [{id, name, type, skill?, goal}]
-    planning_interval: int
-    expanded_query: str
+    # ── chat_node 路由 ──
+    needs_task: bool      # True=进 plan→execute 任务流程, False=直接回答
+    direct_answer: str    # 直接回答内容（needs_task=False 时有值）
 
-    # ── execute_node 状态 ──
-    current_phase_index: int
-    phase_results: list   # [{phase, result, passed}]
-    shared_state: dict    # 跨阶段变量（executor state 注入）
+    # ── plan_node 输出 ──
+    task: str             # 完整任务描述
+    step_budget: int      # CodeAgent 本轮步数预算
+    planning_interval: int
+
+    # ── execute_node 输出 ──
+    result_raw: str       # CodeAgent 执行结果
+    hit_max_steps: bool   # True=max_steps 耗尽，需复盘
+    replan_count: int     # 已复盘次数
+    _code_agent: Any      # CodeAgent 实例（跨轮复用，不序列化）
 
     # ── finalize_node 输出 ──
-    result_raw: str
     elapsed: float
 
     # ── 错误处理 ──
@@ -252,50 +255,94 @@ class NodeContext:
 #  节点函数
 # ═══════════════════════════════════════════════════════════════
 
-def _expand_stock_query(user_input: str, stock_name: str, stock_code: str) -> str:
-    """将简短的股票分析指令扩写为完整的分析指令。"""
-    import re as _re
-
-    msg = user_input.strip()
-
-    # ── 检测分析深度 ──
-    is_deep = any(kw in msg for kw in ("深度", "详细", "全面", "中线", "中长线", "综合"))
-
-    # ── 检测时间周期 ──
-    if any(kw in msg for kw in ("短线", "日内", "超短")):
-        period = "T+1"
-    elif any(kw in msg for kw in ("中线", "中长线", "月线", "深度")):
-        period = "1M"
-    elif any(kw in msg for kw in ("长线", "半年", "年线")):
-        period = "1M"
-    else:
-        period = "T+3"
-
-    # ── 检测用户指定的周期覆盖 ──
-    period_match = _re.search(r'[Tt]\+\d+', msg)
-    if period_match:
-        period = period_match.group().upper()
-
-    # ── 构建分析维度 ──
-    if is_deep:
-        dimensions = "技术指标,基本面,新闻,资金流向,政策,公司财务"
-    else:
-        dimensions = "技术指标,基本面,资金流向"
-
-    return f"用户需要从{dimensions}等方面分析{stock_name} ({stock_code}) 股票,周期:{period},给出标准评估结果"
+def _expand_entity_query(user_input: str, entity_name: str, entity_code: str, entity_type: str) -> str:
+    """将简短的实体分析指令扩写为完整的分析指令。"""
+    return f"分析{entity_name}({entity_code}): {user_input}"
 
 
-def make_prepare_node(ctx: NodeContext):
-    """创建 prepare_node（闭包捕获 ctx）。"""
+def _set_llm_timeout(agent, timeout_seconds: int):
+    """设置 LLM 超时（直接改底层 OpenAI 客户端，而非 model 属性）。"""
+    try:
+        # smolagents _LLMAdapter → 内部 _llm (OpenAILLM) → _client (AsyncOpenAI)
+        llm_adapter = getattr(agent, 'model', None)
+        if llm_adapter and hasattr(llm_adapter, '_llm'):
+            inner_llm = llm_adapter._llm
+            client = getattr(inner_llm, '_client', None)
+            if client:
+                client.timeout = timeout_seconds
+                logger.debug("[Execute] 已设置 OpenAI 客户端 timeout=%ds", timeout_seconds)
+                return
+        # 兜底：改 model 属性
+        if llm_adapter and hasattr(llm_adapter, 'timeout'):
+            llm_adapter.timeout = timeout_seconds
+    except Exception as e:
+        logger.debug("[Execute] 设置超时失败: %s", e)
 
-    async def prepare_node(state: dict) -> dict:
-        """准备阶段：实体解析 + RAG + TraceCollector。"""
+
+def _extract_failed_tools(agent, mcp_tool_list: list = None) -> list:
+    """从 CodeAgent memory 提取失败的工具调用，返回 [(name, description), ...]。"""
+    # 工具描述映射
+    tool_desc = {}
+    if mcp_tool_list:
+        for t in mcp_tool_list:
+            tool_desc[t.name] = getattr(t, 'description', '') or ''
+
+    failed = []  # [(name, desc)]
+    seen = set()
+    try:
+        from smolagents.memory import ActionStep
+        for step in getattr(agent.memory, 'steps', []):
+            if not isinstance(step, ActionStep):
+                continue
+            obs = str(getattr(step, 'observations', '') or '')
+            if 'error' not in obs.lower():
+                continue
+            for tc in getattr(step, 'tool_calls', []) or []:
+                name = getattr(tc, 'name', '') or ''
+                if not name or name in seen:
+                    continue
+                # 检查这个工具的输出是否真的有 error
+                if name in obs or 'error' in obs:
+                    seen.add(name)
+                    desc = tool_desc.get(name, '')
+                    failed.append((name, desc))
+    except Exception:
+        pass
+    return failed
+
+
+def make_chat_node(ctx: NodeContext):
+    """创建 chat_node（闭包捕获 ctx）。
+
+    职责：
+      1. RAG 检索（只做一次，结果贯穿后续链路）
+      2. 实体解析（股票代码等）
+      3. 消息标准化（短指令 → 完整分析指令）
+      4. 意图分类：简单问题直接回答，需要工具进 plan
+    """
+
+    async def chat_node(state: dict) -> dict:
+        """对话层：RAG + 实体解析 + 意图判断 + 简单问题直接回答。"""
         user_input = state["user_input"]
         session_id = state.get("session_id", "default")
         use_rag = state.get("use_rag", True)
         trace = state.get("_trace")
 
-        # 实体解析（通用接口，由 ctx.entity_resolver 决定领域）
+        # ── 1. RAG 检索（仅此处执行一次）──
+        sources = []
+        context = ""
+        if use_rag and ctx.retriever:
+            try:
+                docs = await ctx.retriever.retrieve(user_input)
+                if docs:
+                    from rag.retriever import Retriever
+                    context = Retriever.format_context(docs)
+                    sources = [{"content": d["content"][:200], "score": d.get("score", 0)} for d in docs]
+                    logger.info("[Chat] RAG 检索到 %d 条文档, %d 字符", len(docs), len(context))
+            except Exception as e:
+                logger.warning("[Chat] RAG 检索失败: %s", e)
+
+        # ── 2. 实体解析 ──
         entity_code = ""
         entity_name = ""
         entity_type = ""
@@ -306,39 +353,67 @@ def make_prepare_node(ctx: NodeContext):
                     entity_code = entity.get("code", "")
                     entity_name = entity.get("name", "")
                     entity_type = entity.get("type", "")
-                    logger.info("[Prepare] 实体解析: %s → %s %s (%s)", user_input, entity_code, entity_name, entity_type)
+                    logger.info("[Chat] 实体解析: %s → %s %s (%s)", user_input, entity_code, entity_name, entity_type)
             except Exception as e:
-                logger.debug("[Prepare] 实体解析跳过: %s", e)
+                logger.debug("[Chat] 实体解析跳过: %s", e)
 
-        # ── 消息扩写：将简短指令扩写为完整分析指令 ──
+        # ── 3. 消息标准化 ──
         effective_input = user_input
-        if entity_code and entity_type == "stock" and entity_name:
-            effective_input = _expand_stock_query(user_input, entity_name, entity_code)
+        if entity_code and entity_name:
+            effective_input = _expand_entity_query(user_input, entity_name, entity_code, entity_type)
 
-        # RAG 检索
-        sources = []
-        context = ""
-        if use_rag and ctx.retriever:
+        # ── 4. 意图分类：是否需要任务流程 ──
+        needs_task = True
+        direct_answer = ""
+
+        # 有实体（股票代码等）→ 必须走任务流程
+        if entity_code:
+            needs_task = True
+        else:
+            # 无实体，用 LLM 快速判断意图
             try:
-                docs = await ctx.retriever.retrieve(user_input)
-                if docs:
-                    from rag.retriever import Retriever
-                    context = Retriever.format_context(docs)
-                    sources = [{"content": d["content"][:200], "score": d.get("score", 0)} for d in docs]
-                    logger.info("[Prepare] RAG 检索到 %d 条文档, %d 字符", len(docs), len(context))
-                    for i, d in enumerate(docs[:3]):
-                        logger.info("[Prepare] RAG[%d] score=%.2f content=%s", i, d.get("score", 0), d["content"][:100])
+                intent_messages = [
+                    ChatMessage(role="system", content=(
+                        "你是意图分类器。判断用户消息是否需要调用工具完成任务。\n"
+                        "需要工具（分析、查询、搜索、计算、对比等）回复: task\n"
+                        "不需要工具（闲聊、问候、简单知识问答、感谢等）回复: chat\n"
+                        "只回复一个词: task 或 chat"
+                    )),
+                    ChatMessage(role="user", content=user_input),
+                ]
+                intent_resp = await ctx.llm.generate(messages=intent_messages)
+                intent = (intent_resp.content or "").strip().lower()
+                if "chat" in intent and "task" not in intent:
+                    needs_task = False
+                    logger.info("[Chat] 意图分类: chat（直接回答）")
+                else:
+                    logger.info("[Chat] 意图分类: task（进入任务流程）")
             except Exception as e:
-                logger.warning("[Prepare] RAG 检索失败: %s", e)
+                logger.warning("[Chat] 意图分类失败，默认走任务流程: %s", e)
+                needs_task = True
 
-        # TraceCollector
+        # ── 5. 直接回答（不需要工具）──
+        if not needs_task:
+            messages = [ChatMessage(role="system", content=ctx.system_prompt)]
+            if context:
+                messages.append(ChatMessage(role="system", content=f"【参考资料】\n{context}"))
+            if ctx.memory:
+                history = await ctx.memory.get_history(session_id, limit=ctx.memory_window_size)
+                for msg in history:
+                    messages.append(ChatMessage(role=msg.role, content=msg.content))
+            messages.append(ChatMessage(role="user", content=user_input))
+            llm_response = await ctx.llm.generate(messages=messages)
+            direct_answer = llm_response.content or ""
+            logger.info("[Chat] 直接回答: %s 字符", len(direct_answer))
+
+        # ── 6. TraceCollector ──
         try:
             from trace_collector import TraceCollector
             from agents.task_agent import _collectors
             collector = TraceCollector(session_id=session_id, user_query=user_input)
             _collectors[session_id] = collector
         except Exception as e:
-            logger.debug("[Prepare] TraceCollector 创建失败: %s", e)
+            logger.debug("[Chat] TraceCollector 创建失败: %s", e)
 
         return {
             "entity_code": entity_code,
@@ -347,33 +422,57 @@ def make_prepare_node(ctx: NodeContext):
             "context": context,
             "sources": sources,
             "effective_input": effective_input,
+            "needs_task": needs_task,
+            "direct_answer": direct_answer,
         }
 
-    return prepare_node
+    return chat_node
 
 
 def make_plan_node(ctx: NodeContext):
     """创建 plan_node（闭包捕获 ctx）。"""
 
     async def plan_node(state: dict) -> dict:
-        """规划阶段：RAG 检索 + 选择技能 + 划分阶段。"""
+        """规划：初始化 MCP + 生成任务描述。复盘时带前轮结果。"""
         trace = state.get("_trace")
         effective_input = state.get("effective_input", state["user_input"])
 
-        # RAG 检索结果注入到规划输入
-        rag_context = state.get("context", "")
-        if rag_context:
-            logger.info("[Plan] RAG 检索到 %d 字符上下文", len(rag_context))
-            effective_input = f"{effective_input}\n\n【参考资料】\n{rag_context}"
+        # MCP 延迟初始化（首次进入任务流程时才启动，直接回答路径跳过）
+        if not ctx.mcp_tool_list:
+            ctx.init_mcp()
+        if not ctx.mcp_tool_list:
+            logger.error("[Plan] MCP 不可用，无法执行任务流程")
+            return {"task": "", "step_budget": 0, "planning_interval": 3}
 
-        plan = await ctx.agent._plan(effective_input, ctx.llm, trace)
+        # 复盘时注入前轮结果
+        prev_result = state.get("result_raw", "")
+        prev_hit = state.get("hit_max_steps", False)
+        replan_count = state.get("replan_count", 0)
+
+        replan_context = ""
+        if prev_hit and prev_result:
+            replan_context = f"\n\n【前轮执行结果（步数耗尽）】\n{prev_result[:2000]}\n请基于上述进度继续完成任务。"
+            logger.info("[Plan] 复盘第 %d 轮，前轮结果 %d 字符", replan_count, len(prev_result))
+
+        plan_input = effective_input + replan_context
+
+        # 第一层：只注入 name + description（简历），不注入 SKILL.md body
+        if ctx.skill_adapter:
+            for s in ctx.skill_adapter.list_skills():
+                name = s['name']
+                if name in plan_input or name.replace('-', ' ') in plan_input:
+                    desc = s.get('description', '')[:200]
+                    plan_input += f"\n\n【可用技能】{name}: {desc}"
+                    logger.info("[Plan] 第一层：技能 '%s' 简历已注入", name)
+                    break
+
+        plan = await ctx.agent._plan(plan_input, ctx.llm, trace)
 
         return {
-            "phases": plan["phases"],
+            "task": plan["task"],
+            "step_budget": plan["step_budget"],
             "planning_interval": plan["planning_interval"],
-            "expanded_query": plan["expanded_query"],
-            "current_phase_index": 0,
-            "phase_results": [],
+            "replan_count": replan_count + (1 if prev_hit else 0),
         }
 
     return plan_node
@@ -383,215 +482,163 @@ def make_execute_node(ctx: NodeContext):
     """创建 execute_node（闭包捕获 ctx）。"""
 
     async def execute_node(state: dict) -> dict:
-        """执行阶段：执行 phases[current_phase_index]。"""
-        # 通过 ctx.agent 调用 TaskAgent 的方法
+        """执行：单次 CodeAgent 跑完任务，planning_interval 内部进度检查。"""
         agent_instance = ctx.agent
         if not agent_instance:
             logger.error("[Execute] ctx.agent 未设置")
-            return {"error": "agent 未初始化", "current_phase_index": state.get("current_phase_index", 0) + 1}
+            return {"result_raw": "[错误] agent 未初始化", "hit_max_steps": True}
 
-        from agents.task_agent import _load_skill_functions, _SkillSectionTool, _SkillResourceTool
+        task = state.get("task", "")
+        if not task:
+            return {"result_raw": "[错误] 无任务描述", "hit_max_steps": False}
 
-        phases = state["phases"]
-        idx = state.get("current_phase_index", 0)
-        phase = phases[idx]
-        phase_id = phase.get("id", idx)
-        phase_type = phase.get("type", "execute")
-        phase_skill = phase.get("skill")
-        expanded_query = state.get("expanded_query", state["user_input"])
-        planning_interval = state.get("planning_interval", 5)
-
+        step_budget = state.get("step_budget", 10)
+        planning_interval = state.get("planning_interval", 3)
         trace = state.get("_trace")
 
-        # 构建共享上下文（通用：只注入实体信息，不做领域判断）
-        shared_parts = []
+        # 构建上下文
+        task_parts = []
         if state.get("entity_code"):
             entity_label = state.get("entity_type", "实体")
             entity_info = f"【{entity_label}】{state.get('entity_name', '')}({state['entity_code']})" if state.get('entity_name') else f"【{entity_label}】{state['entity_code']}"
-            shared_parts.append(entity_info)
+            task_parts.append(entity_info)
         if state.get("context"):
-            shared_parts.append(f"【参考资料】\n{state['context']}")
+            task_parts.append(f"【参考资料】\n{state['context']}")
 
-        # direct 类型：LLM 直接回答
-        if phase_type == "direct":
-            logger.info("[Execute] 阶段 %d: direct — %s", phase_id, phase.get("name"))
-            messages = [ChatMessage(role="system", content=ctx.system_prompt)]
-            if state.get("context"):
-                messages.append(ChatMessage(role="system", content=f"【参考资料】\n{state['context']}"))
-            if ctx.memory:
-                history = await ctx.memory.get_history(state.get("session_id", "default"), limit=ctx.memory_window_size)
-                for msg in history:
-                    messages.append(ChatMessage(role=msg.role, content=msg.content))
-            messages.append(ChatMessage(role="user", content=state["user_input"]))
-            llm_response = await ctx.llm.generate(messages=messages)
-            result = llm_response.content or ""
-            phase_results = state.get("phase_results", [])
-            phase_results.append({"phase": phase, "result": result, "passed": bool(result.strip())})
-            return {
-                "phase_results": phase_results,
-                "current_phase_index": idx + 1,
-            }
-
-        # skill / execute 类型
-        logger.info("[Execute] 阶段 %d: %s — %s (skill=%s)", phase_id, phase_type, phase.get("name"), phase_skill)
-
-        phase_task_parts = list(shared_parts)
-
-        # skill 类型：加载技能指令和工具
+        # 第二层：SKILL.md body → 注入 task context
+        # 第三层：_SkillResourceTool → CodeAgent 按需读取资源
         skill_tools = []
-        if phase_type == "skill" and phase_skill and ctx.skill_adapter:
-            loader = ctx.skill_adapter
-            try:
-                body = loader.load_body(phase_skill)
-                if body:
-                    if len(body.split()) > 500:
-                        headings = loader.get_section_headings(phase_skill)
-                        catalog = "\n".join(f"  - {h}" for h in headings)
-                        phase_task_parts.append(
-                            f"【技能: {phase_skill}】\n"
-                            f"使用 read_skill_section 工具按需加载指令段落。\n"
-                            f"可用段落:\n{catalog}"
-                        )
-                    else:
-                        phase_task_parts.append(f"【技能指令: {phase_skill}】\n{body}")
-            except Exception as e:
-                logger.warning("[Execute] skill %s 加载失败: %s", phase_skill, e)
+        if ctx.skill_adapter:
+            from agents.task_agent import _load_skill_functions, _SkillResourceTool
+            for s in ctx.skill_adapter.list_skills():
+                name = s['name']
+                if name in task or name.replace('-', ' ') in task:
+                    body = ctx.skill_adapter.load_body(name)
+                    if body:
+                        task_parts.append(f"【技能指令: {name}】\n{body}")
+                        logger.info("[Execute] 第二层：SKILL.md '%s'，%d 字符", name, len(body))
+                    skill_tools.append(_SkillResourceTool(ctx.skill_adapter, name))
+                    skill_tools.extend(_load_skill_functions(name))
+                    break
 
-            func_tools = _load_skill_functions(phase_skill)
-            skill_tools.extend(func_tools)
-            skill_tools.append(_SkillSectionTool(loader, phase_skill))
-            skill_tools.append(_SkillResourceTool(loader, phase_skill))
+        task_parts.append(f"【任务】\n{task}")
+        full_task = "\n\n".join(task_parts)
 
-        # 构建阶段任务
-        # 阶段路线图（旧版 _build_phase_roadmap 的逻辑）
-        phases = state.get("phases", [])
-        roadmap_lines = ["【执行路线图】（仅作参考，不要跳过当前阶段）"]
-        for p in phases:
-            pid = p.get("id", 0)
-            name = p.get("name", "")
-            goal = p.get("goal", "")
-            if pid == phase_id:
-                roadmap_lines.append(f"  → 阶段{pid}: {name} — {goal} ← 你在这里")
-            elif pid < phase_id:
-                roadmap_lines.append(f"  ✓ 阶段{pid}: {name}")
-            else:
-                roadmap_lines.append(f"  ○ 阶段{pid}: {name} — {goal}")
-        roadmap_lines.append("\n【约束】完成当前阶段后输出结果，不要自行进入下一阶段。")
-        phase_task_parts.append("\n".join(roadmap_lines))
+        # 复用已有 CodeAgent 实例（跨轮 memory 自然衔接）
+        agent = state.get("_code_agent")
+        if agent is None:
 
-        phase_task_parts.append(f"【当前阶段】{phase.get('name', '执行')} — {phase.get('goal', '')}")
-        phase_task_parts.append(f"【任务】\n{expanded_query}")
+            agent = agent_instance._build_code_agent(
+                model=ctx.model,
+                mcp_tool_list=ctx.mcp_tool_list,
+                skill_tools=skill_tools,
+                planning_interval=planning_interval,
+                phase_id=0,
+            )
+            # 注入工具列表到 planning prompt
+            all_tools = list(ctx.mcp_tool_list) + skill_tools
+            if all_tools:
+                agent_instance._inject_tools_to_planning(agent, all_tools)
+            logger.info("[Execute] 新建 CodeAgent 实例")
+        else:
+            logger.info("[Execute] 复用 CodeAgent 实例，memory 自然衔接")
 
-        # 注入前序阶段变量摘要
-        shared_state = state.get("shared_state", {})
-        if shared_state:
-            var_summary = "【前序阶段变量】\n"
-            for k, v in shared_state.items():
-                var_summary += f"- {k}: {agent_instance._infer_var_type(v)}\n"
-            var_summary += "这些变量可直接使用，无需重新获取。\n"
-            phase_task_parts.append(var_summary)
+        # 用 plan 的 step_budget 覆盖默认 max_steps
+        agent.max_steps = step_budget
 
-        phase_task = "\n\n".join(phase_task_parts)
-
-        # 构建 CodeAgent
-        agent = agent_instance._build_code_agent(
-            model=ctx.model,
-            mcp_tool_list=ctx.mcp_tool_list,
-            skill_tools=skill_tools,
-            planning_interval=planning_interval,
-            phase_id=phase_id,
-        )
-
-        # 注入工具列表到 planning prompt（作用域仅 planning，执行层看不见）
-        all_tools = list(ctx.mcp_tool_list) + skill_tools
-        if all_tools:
-            agent_instance._inject_tools_to_planning(agent, all_tools)
-
-        # 注入前序阶段变量到 executor state
-        if shared_state:
-            try:
-                executor = getattr(agent, 'python_executor', None)
-                if executor and hasattr(executor, 'state'):
-                    executor.state.update(shared_state)
-            except Exception as e:
-                logger.debug("[Execute] executor state 注入跳过: %s", e)
+        # LLM 超时设 180s（上限，不是等待时间）
+        _set_llm_timeout(agent, 180)
 
         # 执行
-        result = await agent_instance._execute_phase(phase_task, agent, phase, trace)
+        logger.info("[Execute] 开始执行，step_budget=%d, planning_interval=%d, timeout=180s", step_budget, planning_interval)
+        react_start = time.time()
 
-        # ── 提取结构化数据 ──
-        stock_data = extract_stock_data(result) if result else None
-        if stock_data:
-            logger.info("[Execute] 提取到结构化数据: %s", list(stock_data.keys()))
-
-        # 捕获 executor state（阶段变量）→ 传给下一阶段
-        new_shared_state = dict(shared_state)
+        hit_max_steps = False
         try:
-            executor = getattr(agent, 'python_executor', None)
-            if executor and hasattr(executor, 'state'):
-                for k, v in executor.state.items():
-                    if not k.startswith('_') and agent_instance._is_serializable(v):
-                        new_shared_state[k] = v
+            result = agent.run(full_task)
+            result = str(result) if result else ""
+        except KeyboardInterrupt:
+            logger.warning("[Execute] 被用户中断")
+            result = "[中断] 用户中断"
         except Exception as e:
-            logger.debug("[Execute] executor state 捕获跳过: %s", e)
+            error_str = str(e).lower()
+            if "max_steps" in error_str or "maximum" in error_str:
+                logger.info("[Execute] max_steps 耗尽，需复盘")
+                hit_max_steps = True
+                result = f"[max_steps 耗尽] {e}"
+            else:
+                logger.error("[Execute] 执行异常: %s", e)
+                result = f"[错误] {e}"
 
-        # 规则 eval
-        passed = bool(result and result.strip())
-        phase_results = state.get("phase_results", [])
-        phase_results.append({
-            "phase": phase,
-            "result": result,
-            "passed": passed,
-            "stock_data": stock_data,
-        })
+        react_elapsed = round(time.time() - react_start, 2)
+        logger.info("[Execute] 完成，耗时 %.1fs，hit_max_steps=%s", react_elapsed, hit_max_steps)
+
+        # 从 agent memory 提取失败的工具调用，自动补充到结果
+        failed_tools = _extract_failed_tools(agent, ctx.mcp_tool_list)
+        if failed_tools:
+            lines = [f"{name} -- {desc[:40]}" if desc else name for name, desc in failed_tools]
+            missing = "\n".join(lines)
+            result = f"{result}\n\n【错误】以下工具未获取到数据:\n{missing}"
+            logger.info("[Execute] 补充数据完整性提示: %s", missing)
+
+        if trace:
+            trace.record("execute_done", {
+                "elapsed_seconds": react_elapsed,
+                "hit_max_steps": hit_max_steps,
+                "result_preview": result[:200],
+            })
 
         return {
-            "phase_results": phase_results,
-            "current_phase_index": idx + 1,
-            "shared_state": new_shared_state,
+            "result_raw": result,
+            "hit_max_steps": hit_max_steps,
+            "replan_count": state.get("replan_count", 0),
+            "_code_agent": agent,  # 保留实例，下轮复用
         }
 
     return execute_node
+
+
+def _finalize_domain(ctx: NodeContext, state: dict, result_raw: str):
+    """领域特化后处理（可扩展）。"""
+    entity_type = state.get("entity_type", "")
+
+    if entity_type == "stock":
+        stock_data = extract_stock_data(result_raw)
+        if stock_data:
+            from chain.schema import EvalNode, Layer, Status
+            from chain.store import save_tree
+            from datetime import date
+
+            root = EvalNode(
+                layer=Layer.CHAIN.value,
+                name=f"stock+analyze+{state.get('entity_code', '')}",
+                exec_date=date.today(),
+                stock_code=state.get("entity_code", ""),
+                stock_name=state.get("entity_name", ""),
+                score=stock_data.get("score"),
+                direction=stock_data.get("direction", ""),
+                action=stock_data.get("action", ""),
+                signal=stock_data.get("signal", ""),
+                analysis=result_raw[:2000],
+                input_params={"user_query": state.get("user_input", "")},
+                status=Status.OK.value,
+            )
+            save_tree(root)
+            logger.info("[Finalize:stock] EvalNode 已存储: score=%s action=%s", stock_data.get("score"), stock_data.get("action"))
+
+    # 扩展点：elif entity_type == "crypto": ...
 
 
 def make_finalize_node(ctx: NodeContext):
     """创建 finalize_node（闭包捕获 ctx）。"""
 
     async def finalize_node(state: dict) -> dict:
-        """最终阶段：汇总结果 + 提取结构化数据 + 保存 memory + TraceCollector 存库。"""
+        """最终阶段：保存 memory + TraceCollector 存库。"""
         from agents.task_agent import _collectors
 
         session_id = state.get("session_id", "default")
-        phase_results = state.get("phase_results", [])
-
-        # ── 提取结构化数据（最后一个有效阶段）──
-        stock_data = {}
-        for pr in reversed(phase_results):
-            if pr.get("stock_data"):
-                stock_data = pr["stock_data"]
-                break
-
-        # ── 生成显示文本 ──
-        if stock_data:
-            result_raw = format_stock_report(stock_data)
-        elif not phase_results:
-            result_raw = "[错误] 没有执行任何阶段"
-        elif len(phase_results) == 1:
-            result_raw = phase_results[0]["result"]
-        else:
-            result_parts = []
-            for pr in phase_results:
-                status = "✅" if pr["passed"] else "❌"
-                result_parts.append(f"{status} 阶段: {pr['phase'].get('name', '')}\n{pr['result']}")
-            result_raw = "\n\n".join(result_parts)
-
-        # 全部失败时提示
-        all_failed = all(not pr.get("passed") for pr in phase_results)
-        if all_failed and phase_results:
-            result_raw = "所有阶段执行失败，请检查网络连接或稍后重试。\n\n" + result_raw
-
-        # ── 构建 final_output ──
-        final_output = {"data": stock_data} if stock_data else {}
+        direct_answer = state.get("direct_answer", "")
+        result_raw = state.get("result_raw", "") or direct_answer or "[错误] 无执行结果"
 
         # 保存 memory
         if ctx.memory:
@@ -601,40 +648,12 @@ def make_finalize_node(ctx: NodeContext):
             except Exception as e:
                 logger.warning("[Finalize] memory 保存失败: %s", e)
 
-        # ── EvalNode 存库（结构化追踪） ──
-        if stock_data:
-            try:
-                from chain.schema import EvalNode, Layer, Status
-                from chain.store import save_tree
-                from datetime import date
-
-                entity_code = state.get("entity_code", "")
-                entity_name = state.get("entity_name", "")
-                tools_called = []
-                for pr in phase_results:
-                    phase = pr.get("phase", {})
-                    if phase.get("skill"):
-                        tools_called.append(f"skill:{phase['skill']}")
-
-                root = EvalNode(
-                    layer=Layer.CHAIN.value,
-                    name=f"{state.get('entity_type', 'stock')}+analyze+{entity_code}",
-                    exec_date=date.today(),
-                    stock_code=entity_code,
-                    stock_name=entity_name,
-                    score=stock_data.get("score"),
-                    direction=stock_data.get("direction", ""),
-                    action=stock_data.get("action", ""),
-                    signal=stock_data.get("signal", ""),
-                    analysis=result_raw[:2000],
-                    input_params={"user_query": state.get("user_input", "")},
-                    status=Status.OK.value,
-                    tools_called=tools_called,
-                )
-                save_tree(root)
-                logger.info("[Finalize] EvalNode 已存储: score=%s action=%s", stock_data.get("score"), stock_data.get("action"))
-            except Exception as e:
-                logger.warning("[Finalize] EvalNode 存库失败: %s", e)
+        # 领域特化钩子：提取结构化数据 + EvalNode 存库
+        # 可通过 ctx.entity_type 扩展不同领域的后处理
+        try:
+            _finalize_domain(ctx, state, result_raw)
+        except Exception as e:
+            logger.debug("[Finalize] 领域后处理跳过: %s", e)
 
         # TraceCollector 存库
         collector = _collectors.get(session_id)
@@ -642,7 +661,7 @@ def make_finalize_node(ctx: NodeContext):
             try:
                 collector.on_agent_finish(
                     final_answer=result_raw,
-                    total_steps=len(phase_results),
+                    total_steps=1,
                     total_tokens=0,
                     model=getattr(ctx.llm, "model", "unknown"),
                 )
@@ -659,7 +678,7 @@ def make_finalize_node(ctx: NodeContext):
         return {
             "result_raw": result_raw,
             "elapsed": elapsed,
-            "final_output": final_output,
+            "final_output": {},
         }
 
     return finalize_node
@@ -669,25 +688,26 @@ def make_finalize_node(ctx: NodeContext):
 #  路由函数
 # ═══════════════════════════════════════════════════════════════
 
+def route_after_chat(state: dict) -> str:
+    """chat_node 之后的路由。"""
+    if state.get("needs_task", True):
+        return "plan"
+    return "finalize"
+
+
 def route_after_plan(state: dict) -> str:
     """plan_node 之后的路由。"""
-    phases = state.get("phases", [])
-    if not phases:
-        return "finalize"
-    # 如果只有一个 direct 阶段，直接 finalize
-    if len(phases) == 1 and phases[0].get("type") == "direct":
-        return "execute"  # direct 也在 execute_node 处理
-    return "execute"
+    if state.get("task") and state.get("step_budget", 0) > 0:
+        return "execute"
+    return "finalize"
 
 
 def route_after_execute(state: dict) -> str:
     """execute_node 之后的路由。"""
-    phases = state.get("phases", [])
-    idx = state.get("current_phase_index", 0)
+    MAX_REPLAN = 2
 
-    # 还有更多阶段
-    if idx < len(phases):
-        return "execute"
-
-    # 所有阶段完成
-    return "finalize"
+    if not state.get("hit_max_steps", False):
+        return "finalize"        # CodeAgent 完成或正常结束
+    if state.get("replan_count", 0) >= MAX_REPLAN:
+        return "finalize"        # 复盘次数用完
+    return "plan"                 # max_steps 耗尽，回 plan 复盘
