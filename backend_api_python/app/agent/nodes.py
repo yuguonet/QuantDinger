@@ -442,7 +442,7 @@ def make_plan_node(ctx: NodeContext):
             ctx.init_mcp()
         if not ctx.mcp_tool_list:
             logger.error("[Plan] MCP 不可用，无法执行任务流程")
-            return {"task": "", "step_budget": 0, "planning_interval": 3}
+            return {"task": "", "step_budget": 0, "planning_interval": 6}
 
         # 复盘时注入前轮结果
         prev_result = state.get("result_raw", "")
@@ -493,7 +493,7 @@ def make_execute_node(ctx: NodeContext):
             return {"result_raw": "[错误] 无任务描述", "hit_max_steps": False}
 
         step_budget = state.get("step_budget", 10)
-        planning_interval = state.get("planning_interval", 3)
+        planning_interval = state.get("planning_interval", 6)
         trace = state.get("_trace")
 
         # 构建上下文
