@@ -85,6 +85,11 @@ class MCPRouterTool(SmolToolBase):
         super().__init__()
         self._tool_map = tool_map
         self._catalog = tool_catalog or []
+        self._failed_calls: list[tuple[str, str]] = []  # [(tool_name, description)]
+
+    def get_failed_calls(self) -> list[tuple[str, str]]:
+        """返回本次执行中失败的工具调用列表。"""
+        return list(self._failed_calls)
 
     def forward(
         self,
@@ -119,11 +124,28 @@ class MCPRouterTool(SmolToolBase):
             })
         return result
 
+    def _has_error(self, obj, depth: int = 3) -> bool:
+        """递归检查 dict/list 中是否包含 error 字段（避免深层遍历过深）。"""
+        if depth <= 0:
+            return False
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k.lower() == 'error':
+                    return True
+                if self._has_error(v, depth - 1):
+                    return True
+        elif isinstance(obj, (list, tuple)):
+            for item in obj:
+                if self._has_error(item, depth - 1):
+                    return True
+        return False
+
     def _call_tool(self, tool_name: str, args: dict) -> Any:
         """路由到 tool_map 中的 Tool.forward()。失败时返回正确参数名，让 LLM 自我纠正。"""
         try:
             tool = self._tool_map.get(tool_name)
             if tool is None:
+                self._record_failure(tool_name, "")
                 return {"error": f"Unknown tool: {tool_name}"}
             result = tool.forward(**args)
             if isinstance(result, str):
@@ -133,19 +155,26 @@ class MCPRouterTool(SmolToolBase):
                     return result
             # 成功时附加可用字段列表，帮助 LLM 正确访问数据
             if isinstance(result, dict):
+                # 递归检查是否包含 error
+                if self._has_error(result):
+                    desc = getattr(tool, 'description', '') or ''
+                    self._record_failure(tool_name, desc)
+                    result['_failed_tool'] = tool_name  # 标记失败工具名
                 public_fields = [k for k in result.keys() if not k.startswith('_')]
                 if public_fields:
                     result["_fields"] = public_fields
             return result
         except Exception as e:
+            # 记录失败
+            tool = self._tool_map.get(tool_name)
+            desc = getattr(tool, 'description', '') or '' if tool else ''
+            self._record_failure(tool_name, desc)
             # pydantic 验证错误 → 返回正确参数名，让 LLM 纠正
             err_msg = str(e)
             if "validation error" in err_msg.lower() or "Field required" in err_msg:
-                tool = self._tool_map.get(tool_name)
                 if tool:
                     inputs = getattr(tool, "inputs", {}) or {}
                     correct_params = list(inputs.keys())
-                    # 构建示例 args（用 '300599' 作为示例值）
                     example_args = ", ".join(f"'{k}': '300599'" for k in correct_params)
                     return {
                         "error": f"参数名错误。你用了 {list(args.keys())}，但 {tool_name} 需要 {correct_params}",
@@ -153,6 +182,13 @@ class MCPRouterTool(SmolToolBase):
                         "hint": f"复制上面的 correct_code 重试，注意参数名是 {correct_params} 不是 {list(args.keys())}",
                     }
             return {"error": f"Tool '{tool_name}' failed: {e}"}
+
+    def _record_failure(self, tool_name: str, description: str):
+        """记录失败的工具调用（去重）。"""
+        for name, _ in self._failed_calls:
+            if name == tool_name:
+                return
+        self._failed_calls.append((tool_name, description))
 
 
 # ═══════════════════════════════════════════════════════════════

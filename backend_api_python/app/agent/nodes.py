@@ -280,27 +280,17 @@ def _set_llm_timeout(agent, timeout_seconds: int):
 
 
 def _extract_failed_tools(agent, mcp_tool_list: list = None) -> list:
-    """从 CodeAgent memory 提取失败的工具调用，返回 [(name, description), ...]。
+    """从 agent memory 中提取失败工具。
 
-    smolagents CodeAgent 用 python_interpreter 作为外层 executor，
-    内部的 mcp(action='call', tool_name='xxx') 调用失败时，
-    tool_calls 只记录 python_interpreter，实际失败工具名在 observations 里。
-
-    两种提取方式：
-    1. observations 中出现 tool_name='xxx' ... error 格式
-    2. observations 中打印的字典包含 'error' 字段，从代码中按顺序匹配工具名
+    MCPExecutor._call_tool() 在工具返回含 error 的 dict 时，
+    会添加 '_failed_tool' 字段标记工具名。这里从 observations 中提取。
     """
     tool_desc = {}
-    tool_names = set()
     if mcp_tool_list:
         for t in mcp_tool_list:
             tool_desc[t.name] = getattr(t, 'description', '') or ''
-            tool_names.add(t.name)
 
-    # 从代码块中提取 mcp 调用的工具名（按顺序）
-    _MCP_CALL_RE = re.compile(r"mcp\s*\(.*?tool_name\s*=\s*['\"]?(\w+)['\"]?", re.IGNORECASE)
-
-    failed = []  # [(name, desc)]
+    failed = []
     seen = set()
     try:
         from smolagents.memory import ActionStep
@@ -308,62 +298,12 @@ def _extract_failed_tools(agent, mcp_tool_list: list = None) -> list:
             if not isinstance(step, ActionStep):
                 continue
             obs = str(getattr(step, 'observations', '') or '')
-            if not obs.strip():
-                continue
-
-            # ── 方式 1: 直接匹配 tool_name='xxx' ... error ──
-            if 'error' in obs.lower() or '失败' in obs or '超时' in obs:
-                for m in re.finditer(
-                    r"tool_name\s*[=:]\s*['\"]?(\w+)['\"]?\b.*?(?:error|失败)",
-                    obs, re.IGNORECASE | re.DOTALL
-                ):
-                    name = m.group(1)
-                    if name and name in tool_names and name not in seen:
-                        seen.add(name)
-                        failed.append((name, tool_desc.get(name, '')))
-
-            # ── 方式 2: 从代码中提取工具调用顺序，匹配含 error 的返回值 ──
-            # 代码中 mcp 调用的顺序 = print 输出的顺序
-            code = str(getattr(step, 'code', '') or '')
-            tool_calls_in_code = _MCP_CALL_RE.findall(code)
-
-            # 将 observation 按 Python dict 边界拆分
-            # 每个 dict 以 '{' 开头，对应一个 print() 输出
-            obs_dicts = []
-            depth = 0
-            start = -1
-            for i, c in enumerate(obs):
-                if c == '{':
-                    if depth == 0:
-                        start = i
-                    depth += 1
-                elif c == '}':
-                    depth -= 1
-                    if depth == 0 and start >= 0:
-                        obs_dicts.append(obs[start:i+1])
-                        start = -1
-
-            # 按顺序匹配：第 i 个 dict 对应第 i 个 mcp 调用
-            for i, dict_str in enumerate(obs_dicts):
-                if i >= len(tool_calls_in_code):
-                    break
-                tname = tool_calls_in_code[i]
-                if tname in seen or tname not in tool_names:
-                    continue
-                # 检查这个 dict 是否包含 error
-                if "'error'" in dict_str or '"error"' in dict_str:
-                    seen.add(tname)
-                    failed.append((tname, tool_desc.get(tname, '')))
-
-            # ── 方式 3: 兜底，已知工具名直接出现在 observation 附近有 error ──
-            if not seen:
-                for tname in tool_names:
-                    if tname in obs and tname not in seen and tname not in {'python_interpreter', 'final_answer', 'mcp'}:
-                        idx = obs.find(tname)
-                        nearby = obs[max(0, idx-20):idx+len(tname)+200].lower()
-                        if 'error' in nearby or '失败' in nearby or '超时' in nearby:
-                            seen.add(tname)
-                            failed.append((tname, tool_desc.get(tname, '')))
+            # 从 observation 中提取 _failed_tool 字段值
+            for m in re.finditer(r"'_failed_tool'\s*:\s*'(\w+)'", obs):
+                name = m.group(1)
+                if name and name not in seen:
+                    seen.add(name)
+                    failed.append((name, tool_desc.get(name, '')))
     except Exception:
         pass
     return failed
