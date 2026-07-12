@@ -17,6 +17,14 @@ _MILD = [
     "有问题", "有误", "错了", "不太行", "不靠谱",
 ]
 
+# session_id → 最近一次 flush 的 root_id（由 finalize_node 写入）
+_session_last_root: dict[str, int] = {}
+
+
+def record_session_root(session_id: str, root_id: int) -> None:
+    """finalize_node flush 后调用，记录 session → root_id 映射。"""
+    _session_last_root[session_id] = root_id
+
 
 def detect_feedback_severity(message: str) -> str | None:
     """检测消息中的负面反馈严重程度。
@@ -36,7 +44,7 @@ def detect_feedback_severity(message: str) -> str | None:
     return None
 
 
-def check_negative_feedback(user_input: str) -> None:
+def check_negative_feedback(user_input: str, session_id: str = "default") -> None:
     """检测负面反馈并惩罚上一轮分析。
 
     在 TaskAgent.chat() 入口调用。检测到负面反馈时：
@@ -47,22 +55,27 @@ def check_negative_feedback(user_input: str) -> None:
     if not severity:
         return
 
+    # 通过 session_id 找到上一轮的 root_id
+    root_id = _session_last_root.get(session_id)
+    if not root_id:
+        logger.debug("[Feedback] session=%s 无历史 trace，跳过", session_id)
+        return
+
     try:
-        from app.utils.db import get_db_connection
         from chain import store as chain_store
 
+        # 获取 trace 信息
+        from app.utils.db import get_db_connection
         with get_db_connection() as conn:
             cur = conn.cursor()
-            cur.execute("""
-                SELECT id, stock_code, name FROM qd_traces
-                WHERE parent_id IS NULL
-                ORDER BY created_at DESC LIMIT 1
-            """)
+            cur.execute(
+                "SELECT id, stock_code, name FROM qd_traces WHERE id = %s",
+                (root_id,),
+            )
             row = cur.fetchone()
             if not row:
                 return
 
-            root_id = row["id"]
             stock_code = row["stock_code"]
             chain_name = row["name"]
 

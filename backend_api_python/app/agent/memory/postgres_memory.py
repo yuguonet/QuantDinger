@@ -27,6 +27,19 @@ DEFAULT_TABLE = "agent_messages"
 DEFAULT_TTL_SECONDS = 7 * 24 * 3600
 
 
+def _raw_cursor(conn):
+    """获取底层 psycopg2 cursor，绕过 PostgresCursor 包装器。
+
+    PostgresCursor.execute() 会做字符串预处理（_rewrite_insert_or_ignore），
+    不接受 psycopg2.sql.Composed 对象。需要直接用底层 cursor。
+
+    返回的 cursor 必须在用完后 close()，否则连接归还池时 cursor 泄漏。
+    """
+    pg_conn = conn._conn  # PostgresConnection._conn 是原始 psycopg2 connection
+    from psycopg2.extras import RealDictCursor
+    return pg_conn.cursor(cursor_factory=RealDictCursor)
+
+
 class PostgresMemory(MemoryBase):
     """
     PostgreSQL 持久化记忆（基于 app.utils.db 同步连接池）
@@ -45,16 +58,11 @@ class PostgresMemory(MemoryBase):
         table_name: str = DEFAULT_TABLE,
         ttl_seconds: int = DEFAULT_TTL_SECONDS,
     ):
-        """
-        :param dsn: 兼容参数（无实际作用，app.utils.db 从 DATABASE_URL 读取）
-        :param max_messages: 每个会话最大消息数（超出后裁剪旧消息）
-        :param table_name: 数据库表名
-        :param ttl_seconds: 会话自动过期时间（秒）
-        """
         self._max_messages = max_messages
         self._table_name = table_name
         self._ttl_seconds = ttl_seconds
         self._initialized = False
+        self._init_lock = asyncio.Lock()
 
     # ── 同步 DB 辅助 ────────────────────────────────────────────
 
@@ -75,35 +83,43 @@ class PostgresMemory(MemoryBase):
         """惰性初始化：建表 + 旧数据清理"""
         if self._initialized:
             return
+        async with self._init_lock:
+            if self._initialized:
+                return
 
-        def _init():
-            with self._get_connection() as conn:
-                c = conn.cursor()
-                c.execute(f"""
-                    CREATE TABLE IF NOT EXISTS {self._table_name} (
-                        id          BIGSERIAL PRIMARY KEY,
-                        session_id  TEXT NOT NULL,
-                        role        TEXT NOT NULL,
-                        content     TEXT NOT NULL,
-                        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    )
-                """)
-                c.execute(f"""
-                    CREATE INDEX IF NOT EXISTS idx_{self._table_name}_lookup
-                    ON {self._table_name}(session_id, id DESC)
-                """)
-                c.execute(f"""
-                    DELETE FROM {self._table_name}
-                    WHERE created_at < NOW() - make_interval(secs => %s)
-                """, (self._ttl_seconds,))
-                conn.commit()
+            from psycopg2 import sql
+            tbl = sql.Identifier(self._table_name)
+            idx = sql.Identifier(f"idx_{self._table_name}_lookup")
 
-        await self._run_sync(_init)
-        self._initialized = True
-        logger.info(
-            "PostgresMemory 就绪: table=%s max_messages=%d ttl=%ds",
-            self._table_name, self._max_messages, self._ttl_seconds,
-        )
+            def _init():
+                with self._get_connection() as conn:
+                    c = _raw_cursor(conn)
+                    try:
+                        c.execute(sql.SQL("""
+                            CREATE TABLE IF NOT EXISTS {} (
+                                id          BIGSERIAL PRIMARY KEY,
+                                session_id  TEXT NOT NULL,
+                                role        TEXT NOT NULL,
+                                content     TEXT NOT NULL,
+                                created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                            )
+                        """).format(tbl))
+                        c.execute(sql.SQL("""
+                            CREATE INDEX IF NOT EXISTS {} ON {}(session_id, id DESC)
+                        """).format(idx, tbl))
+                        c.execute(sql.SQL("""
+                            DELETE FROM {} WHERE created_at < NOW() - make_interval(secs => %s)
+                        """).format(tbl), (self._ttl_seconds,))
+                        conn.commit()
+                    finally:
+                        c.close()
+
+            await self._run_sync(_init)
+            self._initialized = True
+            logger.info(
+                "PostgresMemory 就绪: table=%s max_messages=%d ttl=%ds",
+                self._table_name, self._max_messages, self._ttl_seconds,
+            )
 
     # ── MemoryBase 接口 ─────────────────────────────────────────
 
@@ -115,26 +131,30 @@ class PostgresMemory(MemoryBase):
             logger.error("PostgresMemory 初始化失败: %s", e, exc_info=True)
             return False
 
+        from psycopg2 import sql
+        tbl = sql.Identifier(self._table_name)
+
         def _add():
             with self._get_connection() as conn:
-                c = conn.cursor()
-                c.execute(
-                    f"INSERT INTO {self._table_name} (session_id, role, content) VALUES (%s, %s, %s)",
-                    (session_id, role, content),
-                )
-                # 裁剪超出窗口的旧消息
-                c.execute(f"""
-                    DELETE FROM {self._table_name}
-                    WHERE session_id = %s
-                      AND id <= (
-                          SELECT id FROM {self._table_name}
-                          WHERE session_id = %s
-                          ORDER BY id DESC
-                          OFFSET %s
-                          LIMIT 1
-                      )
-                """, (session_id, session_id, self._max_messages))
-                conn.commit()
+                c = _raw_cursor(conn)
+                try:
+                    c.execute(sql.SQL(
+                        "INSERT INTO {} (session_id, role, content) VALUES (%s, %s, %s)"
+                    ).format(tbl), (session_id, role, content))
+                    c.execute(sql.SQL("""
+                        DELETE FROM {}
+                        WHERE session_id = %s
+                          AND id <= (
+                              SELECT id FROM {}
+                              WHERE session_id = %s
+                              ORDER BY id DESC
+                              OFFSET %s
+                              LIMIT 1
+                          )
+                    """).format(tbl, tbl), (session_id, session_id, self._max_messages))
+                    conn.commit()
+                finally:
+                    c.close()
             return True
 
         try:
@@ -156,16 +176,23 @@ class PostgresMemory(MemoryBase):
             logger.error("PostgresMemory 初始化失败: %s", e, exc_info=True)
             return []
 
+        from psycopg2 import sql
+        tbl = sql.Identifier(self._table_name)
+
         def _get():
             with self._get_connection() as conn:
-                c = conn.cursor()
-                c.execute(
-                    f"SELECT role, content FROM {self._table_name}"
-                    f" WHERE session_id = %s ORDER BY id ASC LIMIT %s",
-                    (session_id, limit),
-                )
-                rows = c.fetchall()
-                return [MemoryMessage(role=r["role"], content=r["content"]) for r in rows]
+                c = _raw_cursor(conn)
+                try:
+                    c.execute(sql.SQL("""
+                        SELECT role, content FROM (
+                            SELECT role, content, id FROM {}
+                            WHERE session_id = %s ORDER BY id DESC LIMIT %s
+                        ) sub ORDER BY id ASC
+                    """).format(tbl), (session_id, limit))
+                    rows = c.fetchall()
+                    return [MemoryMessage(role=r["role"], content=r["content"]) for r in rows]
+                finally:
+                    c.close()
 
         try:
             return await self._run_sync(_get)
@@ -184,14 +211,18 @@ class PostgresMemory(MemoryBase):
             logger.error("PostgresMemory 初始化失败: %s", e, exc_info=True)
             return False
 
+        from psycopg2 import sql
+        tbl = sql.Identifier(self._table_name)
+
         def _clear():
             with self._get_connection() as conn:
-                c = conn.cursor()
-                c.execute(
-                    f"DELETE FROM {self._table_name} WHERE session_id = %s",
-                    (session_id,),
-                )
-                conn.commit()
+                c = _raw_cursor(conn)
+                try:
+                    c.execute(sql.SQL("DELETE FROM {} WHERE session_id = %s").format(tbl),
+                              (session_id,))
+                    conn.commit()
+                finally:
+                    c.close()
             return True
 
         try:
@@ -208,55 +239,68 @@ class PostgresMemory(MemoryBase):
     async def count_messages(self, session_id: str) -> int:
         """获取会话的消息数量"""
         await self._ensure_init()
+        from psycopg2 import sql
+        tbl = sql.Identifier(self._table_name)
 
         def _count():
             with self._get_connection() as conn:
-                c = conn.cursor()
-                c.execute(
-                    f"SELECT COUNT(*) FROM {self._table_name} WHERE session_id = %s",
-                    (session_id,),
-                )
-                row = c.fetchone()
-                return row["count"] if row else 0
+                c = _raw_cursor(conn)
+                try:
+                    c.execute(sql.SQL("SELECT COUNT(*) FROM {} WHERE session_id = %s").format(tbl),
+                              (session_id,))
+                    row = c.fetchone()
+                    return row["count"] if row else 0
+                finally:
+                    c.close()
 
         return await self._run_sync(_count)
 
     async def list_sessions(self) -> list[str]:
         """列出所有有消息的 session_id（按最后活动时间降序）"""
         await self._ensure_init()
+        from psycopg2 import sql
+        tbl = sql.Identifier(self._table_name)
 
         def _list():
             with self._get_connection() as conn:
-                c = conn.cursor()
-                c.execute(f"""
-                    SELECT session_id FROM {self._table_name}
-                    GROUP BY session_id
-                    ORDER BY MAX(created_at) DESC
-                """)
-                return [r["session_id"] for r in c.fetchall()]
+                c = _raw_cursor(conn)
+                try:
+                    c.execute(sql.SQL("""
+                        SELECT session_id FROM {}
+                        GROUP BY session_id
+                        ORDER BY MAX(created_at) DESC
+                    """).format(tbl))
+                    return [r["session_id"] for r in c.fetchall()]
+                finally:
+                    c.close()
 
         return await self._run_sync(_list)
 
     async def get_stats(self) -> dict:
         """获取存储统计"""
         await self._ensure_init()
+        from psycopg2 import sql
+        tbl = sql.Identifier(self._table_name)
 
         def _stats():
             with self._get_connection() as conn:
-                c = conn.cursor()
-                c.execute(f"SELECT COUNT(*) AS count FROM {self._table_name}")
-                total = c.fetchone()["count"] or 0
-                c.execute(f"SELECT COUNT(DISTINCT session_id) AS count FROM {self._table_name}")
-                sessions = c.fetchone()["count"] or 0
-                c.execute(f"SELECT MIN(created_at) AS oldest FROM {self._table_name}")
-                oldest = c.fetchone()["oldest"]
-                c.execute(f"SELECT MAX(created_at) AS newest FROM {self._table_name}")
-                newest = c.fetchone()["newest"]
-                return {
-                    "total_messages": total,
-                    "total_sessions": sessions,
-                    "oldest_message": str(oldest) if oldest else None,
-                    "newest_message": str(newest) if newest else None,
-                }
+                c = _raw_cursor(conn)
+                try:
+                    c.execute(sql.SQL("SELECT COUNT(*) AS count FROM {}").format(tbl))
+                    total = c.fetchone()["count"] or 0
+                    c.execute(sql.SQL("SELECT COUNT(DISTINCT session_id) AS count FROM {}").format(tbl))
+                    sessions = c.fetchone()["count"] or 0
+                    c.execute(sql.SQL("SELECT MIN(created_at) AS oldest FROM {}").format(tbl))
+                    oldest = c.fetchone()["oldest"]
+                    c.execute(sql.SQL("SELECT MAX(created_at) AS newest FROM {}").format(tbl))
+                    newest = c.fetchone()["newest"]
+                    return {
+                        "total_messages": total,
+                        "total_sessions": sessions,
+                        "oldest_message": str(oldest) if oldest else None,
+                        "newest_message": str(newest) if newest else None,
+                    }
+                finally:
+                    c.close()
 
         return await self._run_sync(_stats)

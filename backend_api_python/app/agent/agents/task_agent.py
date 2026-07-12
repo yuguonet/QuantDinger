@@ -26,6 +26,7 @@ import inspect
 import logging
 import os
 import re
+import threading
 import time
 from typing import Dict, List, Optional
 
@@ -449,29 +450,33 @@ class _MCPSingleton:
         self._tools: list | None = None
         self._ctx = None  # ToolCollection 上下文管理器
         self._collection = None
+        self._lock = threading.Lock()
 
     def _ensure(self) -> bool:
         if self._tools is not None:
             return True
-        try:
-            from mcp import StdioServerParameters
-            from smolagents import ToolCollection
+        with self._lock:
+            if self._tools is not None:
+                return True
+            try:
+                from mcp import StdioServerParameters
+                from smolagents import ToolCollection
 
-            server = StdioServerParameters(
-                command=_MCP_SERVER_CMD,
-                args=_MCP_SERVER_ARGS,
-            )
-            self._ctx = ToolCollection.from_mcp(server, trust_remote_code=True)
-            self._collection = self._ctx.__enter__()
-            self._tools = list(self._collection.tools) if hasattr(self._collection, 'tools') else list(self._collection)
-            logger.info("[MCP] 常驻连接已建立，%d 个工具", len(self._tools))
-            return True
-        except ImportError:
-            logger.warning("[TaskAgent] MCP 依赖未安装 (pip install mcp)")
-            return False
-        except Exception as e:
-            logger.warning("[TaskAgent] MCP 初始化失败: %s", e)
-            return False
+                server = StdioServerParameters(
+                    command=_MCP_SERVER_CMD,
+                    args=_MCP_SERVER_ARGS,
+                )
+                self._ctx = ToolCollection.from_mcp(server, trust_remote_code=True)
+                self._collection = self._ctx.__enter__()
+                self._tools = list(self._collection.tools) if hasattr(self._collection, 'tools') else list(self._collection)
+                logger.info("[MCP] 常驻连接已建立，%d 个工具", len(self._tools))
+                return True
+            except ImportError:
+                logger.warning("[TaskAgent] MCP 依赖未安装 (pip install mcp)")
+                return False
+            except Exception as e:
+                logger.warning("[TaskAgent] MCP 初始化失败: %s", e)
+                return False
 
     @property
     def tools(self) -> list:
@@ -485,7 +490,18 @@ class _MCPSingleton:
     def close(self):
         if self._ctx:
             try:
-                self._ctx.__exit__(None, None, None)
+                import threading
+                # Windows ProactorEventLoop 下 __exit__ 可能挂住，加超时保护
+                done = threading.Event()
+                def _do_close():
+                    try:
+                        self._ctx.__exit__(None, None, None)
+                    except Exception:
+                        pass
+                    done.set()
+                t = threading.Thread(target=_do_close, daemon=True)
+                t.start()
+                done.wait(timeout=3)
             except Exception:
                 pass
             self._ctx = None
@@ -679,7 +695,7 @@ class TaskAgent(AgentBase):
         # 负面反馈检测
         try:
             from feedback import check_negative_feedback
-            check_negative_feedback(user_input)
+            check_negative_feedback(user_input, session_id=session_id)
         except Exception:
             pass
         return await self._chat_plan_graph(user_input, session_id, use_rag)

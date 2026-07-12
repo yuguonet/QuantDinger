@@ -76,14 +76,30 @@ class PostgresCheckpointer:
         self._table = table_name
         self._table_ready = False
 
+    def _sql_table(self):
+        """安全的表名标识符"""
+        from psycopg2 import sql
+        return sql.Identifier(self._table)
+
     def _ensure_table(self):
         """确保表存在（幂等）。"""
         if self._table_ready:
             return
         try:
+            from psycopg2 import sql
             with self._pool.cursor() as cur:
-                cur.execute(_CREATE_TABLE_SQL)
-                cur.execute(_CREATE_INDEX_SQL)
+                cur.execute(sql.SQL(
+                    "CREATE TABLE IF NOT EXISTS {} ("
+                    "id SERIAL PRIMARY KEY, thread_id VARCHAR(64) NOT NULL, "
+                    "node VARCHAR(64) NOT NULL, state JSONB NOT NULL, "
+                    "created_at TIMESTAMP DEFAULT NOW())"
+                ).format(self._sql_table()))
+                cur.execute(sql.SQL(
+                    "CREATE INDEX IF NOT EXISTS {} ON {} (thread_id, created_at DESC)"
+                ).format(
+                    sql.Identifier(f"idx_{self._table}_thread"), self._sql_table(),
+                ))
+            # MarketPool.cursor() 上下文管理器已自动 commit
             self._table_ready = True
             logger.info("[Checkpointer] %s 表就绪", self._table)
         except Exception as e:
@@ -107,12 +123,13 @@ class PostgresCheckpointer:
             state_json = json.dumps({"error": f"序列化失败: {e}"}, ensure_ascii=False)
 
         try:
+            from psycopg2 import sql
             with self._pool.cursor() as cur:
-                cur.execute(
-                    f"INSERT INTO {self._table} (thread_id, node, state, created_at) "
-                    f"VALUES (%s, %s, %s::jsonb, %s)",
-                    (thread_id, node, state_json, datetime.now()),
-                )
+                cur.execute(sql.SQL(
+                    "INSERT INTO {} (thread_id, node, state, created_at) VALUES (%s, %s, %s::jsonb, %s)"
+                ).format(self._sql_table()),
+                    (thread_id, node, state_json, datetime.now()))
+            # MarketPool.cursor() 上下文管理器已自动 commit
             logger.debug("[Checkpointer] 保存: thread=%s node=%s", thread_id, node)
         except Exception as e:
             logger.warning("[Checkpointer] 保存失败: %s", e)
@@ -128,12 +145,12 @@ class PostgresCheckpointer:
         """
         self._ensure_table()
         try:
+            from psycopg2 import sql
             with self._pool.cursor() as cur:
-                cur.execute(
-                    f"SELECT state FROM {self._table} "
-                    f"WHERE thread_id = %s ORDER BY created_at DESC LIMIT 1",
-                    (thread_id,),
-                )
+                cur.execute(sql.SQL(
+                    "SELECT state FROM {} WHERE thread_id = %s ORDER BY created_at DESC LIMIT 1"
+                ).format(self._sql_table()),
+                    (thread_id,))
                 row = cur.fetchone()
                 if row:
                     state = row[0]
@@ -154,12 +171,14 @@ class PostgresCheckpointer:
         self._ensure_table()
         cutoff = datetime.now() - timedelta(days=days)
         try:
+            from psycopg2 import sql
             with self._pool.cursor() as cur:
-                cur.execute(
-                    f"DELETE FROM {self._table} WHERE created_at < %s",
-                    (cutoff,),
-                )
+                cur.execute(sql.SQL(
+                    "DELETE FROM {} WHERE created_at < %s"
+                ).format(self._sql_table()),
+                    (cutoff,))
                 deleted = cur.rowcount
+            # MarketPool.cursor() 上下文管理器已自动 commit
             if deleted > 0:
                 logger.info("[Checkpointer] 清理 %d 条过期记录", deleted)
         except Exception as e:

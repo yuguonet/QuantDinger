@@ -280,12 +280,25 @@ def _set_llm_timeout(agent, timeout_seconds: int):
 
 
 def _extract_failed_tools(agent, mcp_tool_list: list = None) -> list:
-    """从 CodeAgent memory 提取失败的工具调用，返回 [(name, description), ...]。"""
-    # 工具描述映射
+    """从 CodeAgent memory 提取失败的工具调用，返回 [(name, description), ...]。
+
+    smolagents CodeAgent 用 python_interpreter 作为外层 executor，
+    内部的 mcp(action='call', tool_name='xxx') 调用失败时，
+    tool_calls 只记录 python_interpreter，实际失败工具名在 observations 里。
+
+    两种提取方式：
+    1. observations 中出现 tool_name='xxx' ... error 格式
+    2. observations 中打印的字典包含 'error' 字段，从代码中按顺序匹配工具名
+    """
     tool_desc = {}
+    tool_names = set()
     if mcp_tool_list:
         for t in mcp_tool_list:
             tool_desc[t.name] = getattr(t, 'description', '') or ''
+            tool_names.add(t.name)
+
+    # 从代码块中提取 mcp 调用的工具名（按顺序）
+    _MCP_CALL_RE = re.compile(r"mcp\s*\(.*?tool_name\s*=\s*['\"]?(\w+)['\"]?", re.IGNORECASE)
 
     failed = []  # [(name, desc)]
     seen = set()
@@ -295,17 +308,62 @@ def _extract_failed_tools(agent, mcp_tool_list: list = None) -> list:
             if not isinstance(step, ActionStep):
                 continue
             obs = str(getattr(step, 'observations', '') or '')
-            if 'error' not in obs.lower():
+            if not obs.strip():
                 continue
-            for tc in getattr(step, 'tool_calls', []) or []:
-                name = getattr(tc, 'name', '') or ''
-                if not name or name in seen:
+
+            # ── 方式 1: 直接匹配 tool_name='xxx' ... error ──
+            if 'error' in obs.lower() or '失败' in obs or '超时' in obs:
+                for m in re.finditer(
+                    r"tool_name\s*[=:]\s*['\"]?(\w+)['\"]?\b.*?(?:error|失败)",
+                    obs, re.IGNORECASE | re.DOTALL
+                ):
+                    name = m.group(1)
+                    if name and name in tool_names and name not in seen:
+                        seen.add(name)
+                        failed.append((name, tool_desc.get(name, '')))
+
+            # ── 方式 2: 从代码中提取工具调用顺序，匹配含 error 的返回值 ──
+            # 代码中 mcp 调用的顺序 = print 输出的顺序
+            code = str(getattr(step, 'code', '') or '')
+            tool_calls_in_code = _MCP_CALL_RE.findall(code)
+
+            # 将 observation 按 Python dict 边界拆分
+            # 每个 dict 以 '{' 开头，对应一个 print() 输出
+            obs_dicts = []
+            depth = 0
+            start = -1
+            for i, c in enumerate(obs):
+                if c == '{':
+                    if depth == 0:
+                        start = i
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 0 and start >= 0:
+                        obs_dicts.append(obs[start:i+1])
+                        start = -1
+
+            # 按顺序匹配：第 i 个 dict 对应第 i 个 mcp 调用
+            for i, dict_str in enumerate(obs_dicts):
+                if i >= len(tool_calls_in_code):
+                    break
+                tname = tool_calls_in_code[i]
+                if tname in seen or tname not in tool_names:
                     continue
-                # 检查这个工具的输出是否真的有 error
-                if name in obs or 'error' in obs:
-                    seen.add(name)
-                    desc = tool_desc.get(name, '')
-                    failed.append((name, desc))
+                # 检查这个 dict 是否包含 error
+                if "'error'" in dict_str or '"error"' in dict_str:
+                    seen.add(tname)
+                    failed.append((tname, tool_desc.get(tname, '')))
+
+            # ── 方式 3: 兜底，已知工具名直接出现在 observation 附近有 error ──
+            if not seen:
+                for tname in tool_names:
+                    if tname in obs and tname not in seen and tname not in {'python_interpreter', 'final_answer', 'mcp'}:
+                        idx = obs.find(tname)
+                        nearby = obs[max(0, idx-20):idx+len(tname)+200].lower()
+                        if 'error' in nearby or '失败' in nearby or '超时' in nearby:
+                            seen.add(tname)
+                            failed.append((tname, tool_desc.get(tname, '')))
     except Exception:
         pass
     return failed
@@ -573,13 +631,10 @@ def make_execute_node(ctx: NodeContext):
         react_elapsed = round(time.time() - react_start, 2)
         logger.info("[Execute] 完成，耗时 %.1fs，hit_max_steps=%s", react_elapsed, hit_max_steps)
 
-        # 从 agent memory 提取失败的工具调用，自动补充到结果
+        # 从 agent memory 提取失败的工具调用（不追加到 result，由 finalize_node 处理）
         failed_tools = _extract_failed_tools(agent, ctx.mcp_tool_list)
         if failed_tools:
-            lines = [f"{name} -- {desc[:40]}" if desc else name for name, desc in failed_tools]
-            missing = "\n".join(lines)
-            result = f"{result}\n\n【错误】以下工具未获取到数据:\n{missing}"
-            logger.info("[Execute] 补充数据完整性提示: %s", missing)
+            logger.info("[Execute] 失败工具: %s", [n for n, _ in failed_tools])
 
         if trace:
             trace.record("execute_done", {
@@ -593,13 +648,18 @@ def make_execute_node(ctx: NodeContext):
             "hit_max_steps": hit_max_steps,
             "replan_count": state.get("replan_count", 0),
             "_code_agent": agent,  # 保留实例，下轮复用
+            "_failed_tools": failed_tools,  # 失败工具列表，由 finalize_node 追加到输出
         }
 
     return execute_node
 
 
-def _finalize_domain(ctx: NodeContext, state: dict, result_raw: str):
-    """领域特化后处理（可扩展）。"""
+def _finalize_domain(ctx: NodeContext, state: dict, result_raw: str) -> int | None:
+    """领域特化后处理（可扩展）。
+
+    Returns:
+        root_id 如果存库成功，否则 None
+    """
     entity_type = state.get("entity_type", "")
 
     if entity_type == "stock":
@@ -623,39 +683,36 @@ def _finalize_domain(ctx: NodeContext, state: dict, result_raw: str):
                 input_params={"user_query": state.get("user_input", "")},
                 status=Status.OK.value,
             )
-            save_tree(root)
-            logger.info("[Finalize:stock] EvalNode 已存储: score=%s action=%s", stock_data.get("score"), stock_data.get("action"))
+            root_id = save_tree(root)
+            logger.info("[Finalize:stock] EvalNode 已存储: root_id=%s score=%s action=%s",
+                        root_id, stock_data.get("score"), stock_data.get("action"))
+            return root_id
 
     # 扩展点：elif entity_type == "crypto": ...
+    return None
 
 
 def make_finalize_node(ctx: NodeContext):
     """创建 finalize_node（闭包捕获 ctx）。"""
 
     async def finalize_node(state: dict) -> dict:
-        """最终阶段：保存 memory + TraceCollector 存库。"""
+        """最终阶段：领域提取 → 存库 → 追加错误信息 → 保存 memory。"""
         from agents.task_agent import _collectors
 
         session_id = state.get("session_id", "default")
         direct_answer = state.get("direct_answer", "")
         result_raw = state.get("result_raw", "") or direct_answer or "[错误] 无执行结果"
+        failed_tools = state.get("_failed_tools", [])
 
-        # 保存 memory
-        if ctx.memory:
-            try:
-                await ctx.memory.add(session_id, "user", state["user_input"])
-                await ctx.memory.add(session_id, "assistant", result_raw)
-            except Exception as e:
-                logger.warning("[Finalize] memory 保存失败: %s", e)
-
-        # 领域特化钩子：提取结构化数据 + EvalNode 存库
-        # 可通过 ctx.entity_type 扩展不同领域的后处理
+        # ── 1. 领域特化：从干净的 result_raw 提取数据 + 存库 ──
+        domain_root_id = None
         try:
-            _finalize_domain(ctx, state, result_raw)
+            domain_root_id = _finalize_domain(ctx, state, result_raw)
         except Exception as e:
             logger.debug("[Finalize] 领域后处理跳过: %s", e)
 
-        # TraceCollector 存库
+        # ── 2. TraceCollector 存库（仅当领域后处理未存时） ──
+        collector_root_id = None
         collector = _collectors.get(session_id)
         if collector:
             try:
@@ -665,11 +722,41 @@ def make_finalize_node(ctx: NodeContext):
                     total_tokens=0,
                     model=getattr(ctx.llm, "model", "unknown"),
                 )
-                collector.flush()
+                if not domain_root_id:
+                    # 领域后处理未存，由 collector 存
+                    collector_root_id = collector.flush()
             except Exception as e:
                 logger.warning("[Finalize] TraceCollector 存库失败: %s", e)
             finally:
                 _collectors.pop(session_id, None)
+
+        # ── 3. 记录 root_id 供反馈闭环使用 ──
+        root_id = domain_root_id or collector_root_id
+        if root_id:
+            from feedback import record_session_root
+            record_session_root(session_id, root_id)
+
+        # ── 4. 追加失败工具信息（在领域提取之后，不污染提取） ──
+        if failed_tools:
+            tool_desc_map = {}
+            if ctx.mcp_tool_list:
+                for t in ctx.mcp_tool_list:
+                    tool_desc_map[t.name] = getattr(t, 'description', '') or ''
+
+            lines = []
+            for name, desc in failed_tools:
+                desc = desc or tool_desc_map.get(name, '')
+                lines.append(f"{name} -- {desc[:60]}" if desc else name)
+            missing = "\n".join(lines)
+            result_raw = f"{result_raw}\n\n【数据完整性】以下工具未获取到数据:\n{missing}"
+
+        # ── 5. 保存 memory ──
+        if ctx.memory:
+            try:
+                await ctx.memory.add(session_id, "user", state["user_input"])
+                await ctx.memory.add(session_id, "assistant", result_raw)
+            except Exception as e:
+                logger.warning("[Finalize] memory 保存失败: %s", e)
 
         # 计算耗时
         start_time = state.get("_start_time", 0)
