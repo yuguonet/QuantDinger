@@ -92,6 +92,26 @@ else:
 # 技能适配器
 skills = QDSkillAdapter()
 
+# RAG 检索器（关键词召回，无需外部服务）
+retriever = None
+try:
+    from rag import KeywordRetriever
+    # 基础知识库：A股分析常用知识
+    _knowledge_base = [
+        "A股交易规则：T+1交易制度，涨跌幅限制主板10%、创业板/科创板20%，集合竞价9:15-9:25",
+        "技术分析常用指标：MACD（趋势）、RSI（超买超卖）、KDJ（随机指标）、BOLL（布林带）、均线系统（MA5/10/20/60）",
+        "基本面分析关键指标：PE（市盈率）、PB（市净率）、ROE（净资产收益率）、EPS（每股收益）、营收增长率、净利润增长率",
+        "资金流向分析：主力资金净流入/流出、北向资金、融资融券余额变化、大宗交易",
+        "选股策略：价值投资（低PE低PB）、成长投资（高增长）、趋势跟踪（均线突破）、动量策略（强势股）",
+        "风险管理：止损线设置、仓位管理、分散投资、最大回撤控制",
+        "A股市场结构：主板（600/601/603/605）、中小板（002）、创业板（300）、科创板（688）、北交所（8/4）",
+        "行业分类：申万一级行业31个，包括银行、非银金融、食品饮料、医药生物、电子、计算机等",
+    ]
+    retriever = KeywordRetriever(_knowledge_base, top_k=3)
+    logger.info("RAG 检索器已初始化（关键词模式，%d 条知识）", len(_knowledge_base))
+except Exception as e:
+    logger.warning("RAG 检索器初始化失败: %s", e)
+
 # 模式：固定 task（工具由 MCP 动态发现，不再需要 ToolRegistry 预扫描）
 # ToolRegistry 已移除：
 #   - MCP bridge 扫描同一套 tools/*.py，工具集完全对齐，无需重复扫描
@@ -107,6 +127,7 @@ logger.info(
 agent = TaskAgent(
     llm=llm,
     memory=memory,
+    retriever=retriever,
     system_prompt="你是 QuantDinger 量化分析 AI 助手。用中文回答。",
     max_tool_rounds=MAX_TOOL_ROUNDS,
     skill_adapter=skills,

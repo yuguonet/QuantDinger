@@ -144,6 +144,9 @@ class CompiledGraph:
                 partial = await node_func(state)
                 if partial and isinstance(partial, dict):
                     state.update(partial)
+            except KeyboardInterrupt:
+                logger.warning("[Graph] 节点 '%s' 被用户中断", current)
+                raise
             except Exception as e:
                 logger.error("[Graph] 节点 '%s' 异常: %s", current, e)
                 state["error"] = str(e)

@@ -136,6 +136,9 @@ class _LLMAdapter:
 
         try:
             resp = asyncio.run(self._llm.generate(chat_messages))
+        except KeyboardInterrupt:
+            logger.warning("[LLMAdapter] LLM 调用被中断")
+            raise
         except Exception as e:
             logger.error("[TaskAgent] LLM 调用失败: %s", e)
             raise
@@ -603,13 +606,23 @@ class TaskAgent(AgentBase):
                     skills_desc.append(f"- {name}{weight_tag}: {desc}")
         skills_text = "\n".join(skills_desc) if skills_desc else "(无可用技能)"
 
+        # 注入 MCP 工具名列表，让规划器知道 CodeAgent 能调什么
+        tool_names = []
+        try:
+            from agents.task_agent import _mcp
+            if _mcp.available:
+                tool_names = [t.name for t in _mcp.tools]
+        except Exception:
+            pass
+        tools_hint = f"\n\n可用工具（CodeAgent 可直接调用，无需拆分阶段）：{', '.join(tool_names[:30])}..." if tool_names else ""
+
         template = _load_plan_template()
         # completed_phases_text: 已完成阶段的摘要（用于多轮规划），首次调用为空
         prompt = template.format(
             skills_text=skills_text,
             user_input=user_input,
             completed_phases_text=getattr(self, '_completed_phases_text', '') or '',
-        )
+        ) + tools_hint
 
         messages = [
             ChatMessage(role="system", content="你是任务规划器。只输出 JSON。"),
@@ -666,7 +679,7 @@ class TaskAgent(AgentBase):
 
         # 解析 planning_interval
         # 默认 5：减少 replan 频率，避免正常工作被频繁打断
-        planning_interval = plan.get("planning_interval", 5) or 5
+        planning_interval = plan.get("planning_interval", 3) or 3
 
         expanded_query = plan.get("expanded_query", user_input) or user_input
         logger.info("[TaskAgent] plan: %d 阶段 %s, planning_interval=%s",
@@ -849,10 +862,13 @@ class TaskAgent(AgentBase):
 
         try:
             result = agent.run(task)
+        except KeyboardInterrupt:
+            logger.warning("[TaskAgent] 阶段 %d 被用户中断", phase_id)
+            return f"[中断] 阶段 {phase_name} 被用户中断", {}
         except Exception as e:
             logger.error("[TaskAgent] 阶段 %d 执行异常: %s", phase_id, e)
             trace.record("phase_error", {"phase_id": phase_id, "error": str(e)})
-            return f"[错误] 阶段 {phase_name} 执行失败: {e}"
+            return f"[错误] 阶段 {phase_name} 执行失败: {e}", {}
 
         react_elapsed = round(time.time() - react_start, 2)
 

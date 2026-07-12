@@ -182,6 +182,8 @@ def main():
 
                     try:
                         await _run_chat(message, session_id)
+                    except KeyboardInterrupt:
+                        print("\n⚠️ 已中断")
                     except Exception as e:
                         print(f"\n❌ 异常: {e}")
                         import traceback

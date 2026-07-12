@@ -325,6 +325,9 @@ def make_prepare_node(ctx: NodeContext):
                     from rag.retriever import Retriever
                     context = Retriever.format_context(docs)
                     sources = [{"content": d["content"][:200], "score": d.get("score", 0)} for d in docs]
+                    logger.info("[Prepare] RAG 检索到 %d 条文档, %d 字符", len(docs), len(context))
+                    for i, d in enumerate(docs[:3]):
+                        logger.info("[Prepare] RAG[%d] score=%.2f content=%s", i, d.get("score", 0), d["content"][:100])
             except Exception as e:
                 logger.warning("[Prepare] RAG 检索失败: %s", e)
 
@@ -353,10 +356,16 @@ def make_plan_node(ctx: NodeContext):
     """创建 plan_node（闭包捕获 ctx）。"""
 
     async def plan_node(state: dict) -> dict:
-        """规划阶段：选择技能、划分阶段。"""
+        """规划阶段：RAG 检索 + 选择技能 + 划分阶段。"""
         trace = state.get("_trace")
-        # 使用扩写后的消息
         effective_input = state.get("effective_input", state["user_input"])
+
+        # RAG 检索结果注入到规划输入
+        rag_context = state.get("context", "")
+        if rag_context:
+            logger.info("[Plan] RAG 检索到 %d 字符上下文", len(rag_context))
+            effective_input = f"{effective_input}\n\n【参考资料】\n{rag_context}"
+
         plan = await ctx.agent._plan(effective_input, ctx.llm, trace)
 
         return {
