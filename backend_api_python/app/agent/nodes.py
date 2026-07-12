@@ -27,6 +27,94 @@ logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════
+#  格式化函数
+# ═══════════════════════════════════════════════════════════════
+
+def format_stock_report(data: dict) -> str:
+    """将结构化股票分析数据格式化为人类可读文本。"""
+    if not data:
+        return ""
+    parts = []
+    name = data.get("stock_name", "")
+    code = data.get("stock_code", "")
+    if name or code:
+        parts.append(f"**股票名称**: {name} ({code})" if name and code else f"**股票名称**: {name or code}")
+    field_map = [
+        ("action", "操作建议"),
+        ("score", "评    分"),
+        ("direction", "方    向"),
+        ("confidence", "置 信 度"),
+        ("time_window", "时间窗口"),
+        ("signal", "信    号"),
+        ("analysis", "分    析"),
+    ]
+    for key, label in field_map:
+        val = data.get(key)
+        if val is not None and val != "":
+            parts.append(f"**{label}**: {val}")
+    return "\n".join(parts)
+
+
+# markdown 字段标签 → 结构化 key
+_FIELD_MAP = {
+    "股票名称": "stock_name", "股票代码": "stock_code",
+    "操作建议": "action",
+    "评分": "score", "评    分": "score",
+    "方向": "direction", "方    向": "direction",
+    "置信度": "confidence", "置 信 度": "confidence",
+    "时间窗口": "time_window",
+    "信号": "signal", "信    号": "signal",
+    "分析": "analysis", "分    析": "analysis",
+}
+
+
+def extract_stock_data(content: str) -> dict | None:
+    """从 LLM 输出中提取结构化股票分析数据。支持 markdown 和 JSON。"""
+    if not content:
+        return None
+
+    # 方式1: 尝试 JSON 解析
+    from json_extractor import extract_json
+    parsed = extract_json(content)
+    if parsed and isinstance(parsed, dict):
+        # 壳格式：data 字段里有结构化数据
+        inner = parsed.get("data")
+        if isinstance(inner, dict) and any(inner.get(k) for k in ("action", "score", "direction", "signal")):
+            return inner
+        # 直接格式：顶层有结构化数据
+        if any(parsed.get(k) for k in ("action", "score", "direction", "signal")):
+            return parsed
+
+    # 方式2: 从 markdown 格式提取
+    data = {}
+    for m in re.finditer(r"\*\*(.+?)\*\*\s*[:：]\s*(.+)", content):
+        label = m.group(1).strip()
+        value = m.group(2).strip()
+        key = _FIELD_MAP.get(label)
+        if key:
+            data[key] = value
+
+    if not any(data.get(k) for k in ("action", "score", "direction", "signal")):
+        return None
+
+    # 从 stock_name 中拆出 code
+    if "stock_name" in data and not data.get("stock_code"):
+        code_match = re.search(r"(\d{6})", data["stock_name"])
+        if code_match:
+            data["stock_code"] = code_match.group(1)
+            data["stock_name"] = data["stock_name"].replace(code_match.group(0), "").strip(" ()")
+
+    # score 转 int
+    if "score" in data:
+        try:
+            data["score"] = int(re.search(r"\d+", str(data["score"])).group())
+        except (ValueError, AttributeError):
+            pass
+
+    return data
+
+
+# ═══════════════════════════════════════════════════════════════
 #  AgentState — 状态类型定义
 # ═══════════════════════════════════════════════════════════════
 
@@ -87,6 +175,7 @@ class AgentState(TypedDict, total=False):
     entity_type: str      # 实体类型（stock/commodity/crypto/...）
     context: str          # RAG 上下文
     sources: list         # RAG 来源
+    effective_input: str  # 扩写后的完整指令
 
     # ── plan_node 输出 ──
     phases: list          # [{id, name, type, skill?, goal}]
@@ -163,6 +252,39 @@ class NodeContext:
 #  节点函数
 # ═══════════════════════════════════════════════════════════════
 
+def _expand_stock_query(user_input: str, stock_name: str, stock_code: str) -> str:
+    """将简短的股票分析指令扩写为完整的分析指令。"""
+    import re as _re
+
+    msg = user_input.strip()
+
+    # ── 检测分析深度 ──
+    is_deep = any(kw in msg for kw in ("深度", "详细", "全面", "中线", "中长线", "综合"))
+
+    # ── 检测时间周期 ──
+    if any(kw in msg for kw in ("短线", "日内", "超短")):
+        period = "T+1"
+    elif any(kw in msg for kw in ("中线", "中长线", "月线", "深度")):
+        period = "1M"
+    elif any(kw in msg for kw in ("长线", "半年", "年线")):
+        period = "1M"
+    else:
+        period = "T+3"
+
+    # ── 检测用户指定的周期覆盖 ──
+    period_match = _re.search(r'[Tt]\+\d+', msg)
+    if period_match:
+        period = period_match.group().upper()
+
+    # ── 构建分析维度 ──
+    if is_deep:
+        dimensions = "技术指标,基本面,新闻,资金流向,政策,公司财务"
+    else:
+        dimensions = "技术指标,基本面,资金流向"
+
+    return f"用户需要从{dimensions}等方面分析{stock_name} ({stock_code}) 股票,周期:{period},给出标准评估结果"
+
+
 def make_prepare_node(ctx: NodeContext):
     """创建 prepare_node（闭包捕获 ctx）。"""
 
@@ -187,6 +309,11 @@ def make_prepare_node(ctx: NodeContext):
                     logger.info("[Prepare] 实体解析: %s → %s %s (%s)", user_input, entity_code, entity_name, entity_type)
             except Exception as e:
                 logger.debug("[Prepare] 实体解析跳过: %s", e)
+
+        # ── 消息扩写：将简短指令扩写为完整分析指令 ──
+        effective_input = user_input
+        if entity_code and entity_type == "stock" and entity_name:
+            effective_input = _expand_stock_query(user_input, entity_name, entity_code)
 
         # RAG 检索
         sources = []
@@ -216,6 +343,7 @@ def make_prepare_node(ctx: NodeContext):
             "entity_type": entity_type,
             "context": context,
             "sources": sources,
+            "effective_input": effective_input,
         }
 
     return prepare_node
@@ -226,9 +354,10 @@ def make_plan_node(ctx: NodeContext):
 
     async def plan_node(state: dict) -> dict:
         """规划阶段：选择技能、划分阶段。"""
-        # 直接使用 ctx.agent（TaskAgent 实例）调用 _plan()
         trace = state.get("_trace")
-        plan = await ctx.agent._plan(state["user_input"], ctx.llm, trace)
+        # 使用扩写后的消息
+        effective_input = state.get("effective_input", state["user_input"])
+        plan = await ctx.agent._plan(effective_input, ctx.llm, trace)
 
         return {
             "phases": plan["phases"],
@@ -261,7 +390,7 @@ def make_execute_node(ctx: NodeContext):
         phase_type = phase.get("type", "execute")
         phase_skill = phase.get("skill")
         expanded_query = state.get("expanded_query", state["user_input"])
-        planning_interval = state.get("planning_interval", 3)
+        planning_interval = state.get("planning_interval", 5)
 
         trace = state.get("_trace")
 
@@ -381,6 +510,11 @@ def make_execute_node(ctx: NodeContext):
         # 执行
         result = await agent_instance._execute_phase(phase_task, agent, phase, trace)
 
+        # ── 提取结构化数据 ──
+        stock_data = extract_stock_data(result) if result else None
+        if stock_data:
+            logger.info("[Execute] 提取到结构化数据: %s", list(stock_data.keys()))
+
         # 捕获 executor state（阶段变量）→ 传给下一阶段
         new_shared_state = dict(shared_state)
         try:
@@ -395,7 +529,12 @@ def make_execute_node(ctx: NodeContext):
         # 规则 eval
         passed = bool(result and result.strip())
         phase_results = state.get("phase_results", [])
-        phase_results.append({"phase": phase, "result": result, "passed": passed})
+        phase_results.append({
+            "phase": phase,
+            "result": result,
+            "passed": passed,
+            "stock_data": stock_data,
+        })
 
         return {
             "phase_results": phase_results,
@@ -410,14 +549,23 @@ def make_finalize_node(ctx: NodeContext):
     """创建 finalize_node（闭包捕获 ctx）。"""
 
     async def finalize_node(state: dict) -> dict:
-        """最终阶段：汇总结果 + 保存 memory + TraceCollector 存库。"""
+        """最终阶段：汇总结果 + 提取结构化数据 + 保存 memory + TraceCollector 存库。"""
         from agents.task_agent import _collectors
 
         session_id = state.get("session_id", "default")
         phase_results = state.get("phase_results", [])
 
-        # 汇总结果
-        if not phase_results:
+        # ── 提取结构化数据（最后一个有效阶段）──
+        stock_data = {}
+        for pr in reversed(phase_results):
+            if pr.get("stock_data"):
+                stock_data = pr["stock_data"]
+                break
+
+        # ── 生成显示文本 ──
+        if stock_data:
+            result_raw = format_stock_report(stock_data)
+        elif not phase_results:
             result_raw = "[错误] 没有执行任何阶段"
         elif len(phase_results) == 1:
             result_raw = phase_results[0]["result"]
@@ -433,6 +581,9 @@ def make_finalize_node(ctx: NodeContext):
         if all_failed and phase_results:
             result_raw = "所有阶段执行失败，请检查网络连接或稍后重试。\n\n" + result_raw
 
+        # ── 构建 final_output ──
+        final_output = {"data": stock_data} if stock_data else {}
+
         # 保存 memory
         if ctx.memory:
             try:
@@ -440,6 +591,41 @@ def make_finalize_node(ctx: NodeContext):
                 await ctx.memory.add(session_id, "assistant", result_raw)
             except Exception as e:
                 logger.warning("[Finalize] memory 保存失败: %s", e)
+
+        # ── EvalNode 存库（结构化追踪） ──
+        if stock_data:
+            try:
+                from chain.schema import EvalNode, Layer, Status
+                from chain.store import save_tree
+                from datetime import date
+
+                entity_code = state.get("entity_code", "")
+                entity_name = state.get("entity_name", "")
+                tools_called = []
+                for pr in phase_results:
+                    phase = pr.get("phase", {})
+                    if phase.get("skill"):
+                        tools_called.append(f"skill:{phase['skill']}")
+
+                root = EvalNode(
+                    layer=Layer.CHAIN.value,
+                    name=f"{state.get('entity_type', 'stock')}+analyze+{entity_code}",
+                    exec_date=date.today(),
+                    stock_code=entity_code,
+                    stock_name=entity_name,
+                    score=stock_data.get("score"),
+                    direction=stock_data.get("direction", ""),
+                    action=stock_data.get("action", ""),
+                    signal=stock_data.get("signal", ""),
+                    analysis=result_raw[:2000],
+                    input_params={"user_query": state.get("user_input", "")},
+                    status=Status.OK.value,
+                    tools_called=tools_called,
+                )
+                save_tree(root)
+                logger.info("[Finalize] EvalNode 已存储: score=%s action=%s", stock_data.get("score"), stock_data.get("action"))
+            except Exception as e:
+                logger.warning("[Finalize] EvalNode 存库失败: %s", e)
 
         # TraceCollector 存库
         collector = _collectors.get(session_id)
@@ -464,6 +650,7 @@ def make_finalize_node(ctx: NodeContext):
         return {
             "result_raw": result_raw,
             "elapsed": elapsed,
+            "final_output": final_output,
         }
 
     return finalize_node

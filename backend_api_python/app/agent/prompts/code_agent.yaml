@@ -17,6 +17,13 @@ system_prompt: |-
   3. 直接复制计划中的 mcp 调用语句到代码块，不要修改工具名和参数。
   4. 每step必须有 'Thought:' 和 '{{code_block_opening_tag}}' 以 '{{code_block_closing_tag}}' 结尾。
   5. 中间step用 print() 输出结果，最后用 `final_answer()` 返回最终答案。不要直接输出文本。
+  5.1 【数据驱动 - 最高优先级】final_answer 中的每个数字、每个判断必须来自 print 输出的实际数据，严禁编造。具体规则：
+  - score 必须等于 technical_analysis 返回的 score（原样引用，不要修改）
+  - direction 必须等于 technical_analysis 返回的 direction
+  - signal 必须引用 technical_analysis.signal 的原文
+  - PE 为负 = 亏损，不能写'估值合理'
+  - 工具返回 error = 数据缺失，不能编造替代数据
+  - 违反以上任何一条 = 分析无效
   6. 不要在代码中编造变量或虚构数据。
   7. 可以 import，但只能用：{{authorized_imports}}
   8. 代码执行之间的状态会保持：前一步的变量后续step可直接使用。
@@ -51,9 +58,9 @@ system_prompt: |-
   print(news)
   {{code_block_closing_tag}}
 
-  Thought: 数据齐全，综合分析后输出。
+  Thought: technical_analysis 返回 score=52/direction=neutral/signal=强空头排列，info 显示 PE=-9.99 亏损，overall_signal=中长线偏空。综合评估。
   {{code_block_opening_tag}}
-  final_answer("富祥股份 300497，基本面良好，技术面看涨，资金流入，建议买入。")
+  final_answer("**股票名称**: 南威软件 (603636)\n**操作建议**: 跳过\n**评    分**: 42\n**方    向**: 中性\n**置 信 度**: 低\n**时间窗口**: T+3\n**信    号**: 技术面中性(52分强空头排列)+基本面亏损(PE-9.99)+资金融资净流出\n**分    析**: technical_analysis评分52中性强空头排列，PE为负表示亏损，融资净流出，不建议买入")
   {{code_block_closing_tag}}
 
   {%- if custom_instructions %}
@@ -102,33 +109,25 @@ planning:
     {{task}}
     ```
   update_plan_pre_messages: |-
-    下面是之前尝试的记录。请根据进展更新计划。
+    下面是你已经完成的工作进度。请检查当前进展，只规划尚未完成的步骤。
+    【重要】已经成功的步骤绝对不要重复，不要重新规划已完成的工作。
 
     任务：
     ```
     {{task}}
     ```
 
-    历史记录：
+    已完成的步骤和结果：
 
   update_plan_post_messages: |-
-    根据以上记录，更新剩余需要执行的step。
-    注意你还剩 {{remaining_steps}} 步。
-    可用工具见系统提示中的「可用工具」部分。
-
-    格式：
-    ```
-    step 1:
-    - mcp(action="call", tool_name="get_stock_info", args={"codes": "300129"})
-    step 2（需要 step 1 结果参与）:
-    - mcp(action="call", tool_name="web_search", args={"query":step 1结果中的行业})
-    ```
+    请根据以上进度，只列出尚未完成的步骤。
 
     规则：
-    - 有数据依赖才拆step，无依赖全部放在同一step
-    - 优先用已获取的数据，不要重复调用已成功的工具
+    - 已成功的步骤不要重复规划，不要重新调用已成功的工具
+    - 如果已有足够数据完成最终分析，直接用 final_answer() 输出结果
+    - 注意你还剩 {{remaining_steps}} 步
     - 只从「可用工具」列表中选取，不要编造工具名
-    - 总step数不超过4步
+    - 输出格式：只写剩余的 step，例如 "step 3: ..."，不要重写整个计划
 
     写完后写 '<end_plan>' 标签并停止。
 

@@ -102,6 +102,19 @@ class _LLMAdapter:
         self._llm = llm
         self.model_id = getattr(llm, "model", "unknown")
 
+    @staticmethod
+    def _normalize_code_blocks(content: str) -> str:
+        """将 markdown 代码块转为 smolagents <code>...</code> 格式。"""
+        import re
+        # ```python ... ``` → <code>...</code>
+        content = re.sub(r'```python\s*\n(.*?)```', r'<code>\n\1</code>', content, flags=re.DOTALL)
+        # ``` ... ``` → <code>...</code>（排除已处理的）
+        content = re.sub(r'```\s*\n(.*?)```', r'<code>\n\1</code>', content, flags=re.DOTALL)
+        # 裸 final_answer() 没有 <code> 包裹 → 包裹它
+        if 'final_answer(' in content and '<code>' not in content:
+            content = f'<code>\n{content}\n</code>'
+        return content
+
     def generate(
         self,
         messages: list,
@@ -130,7 +143,13 @@ class _LLMAdapter:
         if resp.finish_reason == "error":
             raise RuntimeError(f"LLM 调用失败: {resp.content}")
 
-        smol_msg = SmolChatMessage(role="assistant", content=resp.content or "")
+        # 规范化：markdown 代码块 → <code>...</code>
+        raw_content = resp.content or ""
+        normalized = self._normalize_code_blocks(raw_content)
+        if normalized != raw_content:
+            logger.debug("[LLMAdapter] 代码块格式已规范化")
+
+        smol_msg = SmolChatMessage(role="assistant", content=normalized)
 
         class _TokenUsage:
             def __init__(self, r):
@@ -538,18 +557,32 @@ class TaskAgent(AgentBase):
               "expanded_query": str,
             }
         """
-        # 构建技能描述（含 SKILL.md 执行流程，让 LLM 知道有几步）
+        # 构建技能描述（含权重 + SKILL.md 执行流程）
         skills_desc = []
         if self.skill_adapter:
-            for s in self.skill_adapter.list_skills():
+            # 从数据库读取技能历史权重
+            skill_weights = {}
+            try:
+                from chain.store import get_skill_weights
+                skill_weights = get_skill_weights()
+            except Exception as e:
+                logger.debug("[Plan] 获取技能权重失败: %s", e)
+
+            skills = self.skill_adapter.list_skills()
+            # 按权重降序排列（无权重默认 0.5，排在已验证技能之后）
+            skills.sort(key=lambda s: skill_weights.get(s['name'], 0.5), reverse=True)
+
+            for s in skills:
                 name = s['name']
                 desc = s.get('description', '')[:150]
+                weight = skill_weights.get(name)
+                weight_tag = f" [权重:{weight:.2f}]" if weight is not None else ""
+
                 # 加载 SKILL.md 的执行流程段落
                 flow = ""
                 try:
                     body = self.skill_adapter.load_body(name)
                     if body:
-                        # 提取"执行流程"相关段落
                         lines = body.split('\n')
                         in_flow = False
                         flow_lines = []
@@ -561,13 +594,13 @@ class TaskAgent(AgentBase):
                             if in_flow:
                                 flow_lines.append(line)
                         if flow_lines:
-                            flow = '\n'.join(flow_lines[:30])  # 最多30行
+                            flow = '\n'.join(flow_lines[:30])
                 except Exception:
                     pass
                 if flow:
-                    skills_desc.append(f"- {name}: {desc}\n{flow}")
+                    skills_desc.append(f"- {name}{weight_tag}: {desc}\n{flow}")
                 else:
-                    skills_desc.append(f"- {name}: {desc}")
+                    skills_desc.append(f"- {name}{weight_tag}: {desc}")
         skills_text = "\n".join(skills_desc) if skills_desc else "(无可用技能)"
 
         template = _load_plan_template()
@@ -632,8 +665,8 @@ class TaskAgent(AgentBase):
                 phase["type"] = "execute"
 
         # 解析 planning_interval
-        # 默认 3：initial_plan 已有全量工具，直接出具体计划，不需要早期 replan
-        planning_interval = plan.get("planning_interval", 3) or 3
+        # 默认 5：减少 replan 频率，避免正常工作被频繁打断
+        planning_interval = plan.get("planning_interval", 5) or 5
 
         expanded_query = plan.get("expanded_query", user_input) or user_input
         logger.info("[TaskAgent] plan: %d 阶段 %s, planning_interval=%s",
@@ -729,18 +762,26 @@ class TaskAgent(AgentBase):
             planning_interval=planning_interval,
             step_callbacks=[_truncate_observations],
             instructions=(
-                "个股分析输出格式：\n"
-                "调用工具获取数据后，综合评估并填写以下格式，用 final_answer() 输出：\n\n"
-                "\"\"\"\n"
+                "调用工具获取数据后，必须基于实际返回的数据评估，用 final_answer() 输出以下格式：\n\n"
                 "**股票名称**: 股票名称 (股票代码)\n"
-                "**操作建议**: 买入/卖出/持有/跳过（综合判断现在的操作，A股只能做多）\n"
-                "**评    分**: 0-100（总体评分）\n"
-                "**方    向**: 看涨/看跌/中性（未来时间窗口内的方向）\n"
-                "**置 信 度**: 高/中/低（多方结果是否一致或矛盾）\n"
+                "**操作建议**: 买入/卖出/持有/跳过\n"
+                "**评    分**: 0-100\n"
+                "**方    向**: 看涨/看跌/中性\n"
+                "**置 信 度**: 高/中/低\n"
                 "**时间窗口**: T+1/T+3/T+5\n"
                 "**信    号**: 核心逻辑一句话\n"
-                "**分    析**: 怎么分析的数据(100字内)\n"
-                "\"\"\""
+                "**分    析**: 怎么分析的数据(100字内)\n\n"
+                "【硬规则 - 违反即错误】\n"
+                "- final_answer 中的所有数据必须来自 print 输出的实际结果，禁止编造任何数字\n"
+                "- score 直接使用 technical_analysis 返回的 score 值（如返回52就写52）\n"
+                "- direction 直接使用 technical_analysis 返回的 direction（如返回neutral就写中性）\n"
+                "- signal 必须引用 technical_analysis.signal 的原文（如'强空头排列'）\n"
+                "- 如果 technical_analysis.score < 55，action 不能是买入，应该持有或跳过\n"
+                "- 如果 technical_analysis.direction 是 neutral，不要写看涨，应该写中性\n"
+                "- 如果 technical_analysis.direction 是 bearish，不要写看涨或中性，应该写看跌\n"
+                "- PE 为负数表示亏损，不要写'估值合理'\n"
+                "- 工具返回 error 时，不要编造数据，该维度写'数据获取失败'\n"
+                "- 用 final_answer() 输出，不要直接 print"
             ),
         )
 
@@ -756,26 +797,30 @@ class TaskAgent(AgentBase):
         return agent
 
     def _inject_tools_to_planning(self, agent, mcp_tool_list: list):
-        """注入工具列表到 smolagents 的 planning prompts。
+        """注入工具列表（含权重）到 smolagents 的 planning prompts。"""
+        # 获取低权重工具集合
+        low_weight_tools = set()
+        try:
+            from chain.store import query_low_weight_tools
+            low_weight_tools = query_low_weight_tools()
+        except Exception as e:
+            logger.debug("[Inject] 获取工具权重失败: %s", e)
 
-        只改 planning prompt，不改 task → planning 看到全量工具，execution 看不到。
-        在 agent 创建后、agent.run() 前调用。
-
-        注入格式：工具名 + 参数名（不含描述，控制 token）
-        LLM 需要至少知道参数名才能正确调用，否则会编造参数。
-        """
-        # 构建工具描述：tool_name(param: type) — 简短描述
-        # LLM 需要参数类型才能写出正确的 args，否则会传错参数
         tool_lines = []
         for t in mcp_tool_list:
             inputs = getattr(t, 'inputs', {}) or {}
             params = ', '.join(f"{p}: {i.get('type', 'string')}" for p, i in inputs.items()) if inputs else ''
             desc = (getattr(t, 'description', '') or '')[:80]
-            tool_lines.append(f"  {t.name}({params}) — {desc}")
+            tag = " ⚠️低权重" if t.name in low_weight_tools else ""
+            tool_lines.append(f"  {t.name}({params}) — {desc}{tag}")
         tools_text = '\n'.join(tool_lines)
 
+        low_weight_note = ""
+        if low_weight_tools:
+            low_weight_note = f"\n\n⚠️ 标记「低权重」的工具历史胜率低，优先用未标记的工具。"
+
         placeholder = "可用工具见系统提示中的「可用工具」部分。"
-        tool_block = f"可用工具（通过 mcp(action='call', tool_name='...', args={{...}}) 调用）：\n{tools_text}"
+        tool_block = f"可用工具（通过 mcp(action='call', tool_name='...', args={{...}}) 调用）：\n{tools_text}{low_weight_note}"
         for key in ("initial_plan", "update_plan_pre_messages", "update_plan_post_messages"):
             planning = agent.prompt_templates.get("planning", {})
             if key in planning and placeholder in planning[key]:
@@ -901,6 +946,7 @@ class TaskAgent(AgentBase):
 
             result = await compiled.ainvoke(initial_state)
 
+            final_output = result.get("final_output", {})
             response = AgentResponse(
                 content=result.get("result_raw", ""),
                 sources=result.get("sources", []),
@@ -910,6 +956,7 @@ class TaskAgent(AgentBase):
                     "trace_id": trace.trace_id,
                     "phase_count": len(result.get("phases", [])),
                     "phase_types": [p.get("type") for p in result.get("phases", [])],
+                    "final_output": final_output,
                 },
             )
             trace.finish(response=response.to_dict())

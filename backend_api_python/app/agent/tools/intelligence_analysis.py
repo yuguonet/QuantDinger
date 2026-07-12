@@ -11,7 +11,7 @@ from app.agent.tools.news_search_tools import (
     search_stock_intel,
     search_policy_intel,
 )
-def intelligence_analysis(codes: str) -> dict:
+def _intelligence_analysis(codes: str) -> dict:
     """个股情报+政策面综合分析：搜索新闻公告研报 + 政策动态，返回情报评分和利空/利多信号。
 
     Args:
@@ -139,19 +139,11 @@ def intelligence_analysis(codes: str) -> dict:
         "factors": factors,
         "analysis": analysis,
         "status": "ok",
-        "output_data": {
-            "stock": stock_result,
-            "policy": policy_result,
-            "stock_signals": stock_signals,
-            "policy_signals": policy_signals,
-        },
         "veto": veto,
-        "stock_veto": stock_veto,
-        "policy_veto": policy_veto,
         "stock_score": stock_score,
         "policy_score": policy_score,
-        "stock_signals": stock_signals,
-        "policy_signals": policy_signals,
+        "stock_signals": stock_signals[:3],
+        "policy_signals": policy_signals[:2],
         "evaluation": evaluation,
     }
     return _r
@@ -183,15 +175,20 @@ def _analyze_stock(codes: str, stock_name: str):
             if veto_src:
                 signals.append(f"⚠否决:{veto_src}")
 
-        # 只保留有实质影响的（|score| > 3 或一票否决）
+        # 只保留有实质影响且与目标股票相关的（|score| > 3 或一票否决）
+        _relevance = set(filter(None, [codes, stock_name]))
         for it in result.get("news", []):
             sc = it.get("sentiment_score", 0) or 0
             if sc == -999:
                 continue  # 已在否决项处理
             if abs(sc) > 3:
-                title = it.get("title", "")[:20]
+                title = it.get("title", "")
+                # 过滤：标题必须提及目标股票（名称或代码）
+                if _relevance and not any(kw in title for kw in _relevance):
+                    continue
+                short = title[:20]
                 date = _extract_date(it.get("published", ""))
-                signals.append(f"{title}({date})" if date else title)
+                signals.append(f"{short}({date})" if date else short)
 
     except Exception as e:
         logger.warning("[Intelligence] 个股情报失败: %s", e)
