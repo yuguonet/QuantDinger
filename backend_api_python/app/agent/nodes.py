@@ -333,6 +333,7 @@ def make_chat_node(ctx: NodeContext):
         # ── 1. RAG 检索（仅此处执行一次）──
         sources = []
         context = ""
+        docs = []
         if use_rag and ctx.retriever:
             try:
                 docs = await ctx.retriever.retrieve(user_input)
@@ -343,6 +344,37 @@ def make_chat_node(ctx: NodeContext):
                     logger.info("[Chat] RAG 检索到 %d 条文档, %d 字符", len(docs), len(context))
             except Exception as e:
                 logger.warning("[Chat] RAG 检索失败: %s", e)
+
+        # ── 1.1 RAG 结果不足时，用 web_search 补充实时信息 ──
+        if len(docs) < 3:
+            try:
+                from tools.web_search_tools import web_search
+                # 构建搜索关键词（优先用实体名+股票代码）
+                search_query = user_input
+                if entity_name and entity_code:
+                    search_query = f"{entity_name} {entity_code} 最新消息 分析"
+                elif entity_code:
+                    search_query = f"{entity_code} 股票 最新分析"
+
+                web_result = web_search(search_query, count=5, freshness="pw")
+                if web_result.get("success") and web_result.get("results"):
+                    web_docs = []
+                    for r in web_result["results"]:
+                        web_docs.append({
+                            "content": f"{r['title']}: {r['snippet']}",
+                            "metadata": {"source": "web_search", "url": r.get("url", "")},
+                            "score": 0.5,
+                        })
+                    # 合并到 docs 和 context
+                    docs.extend(web_docs)
+                    web_context = "\n".join([f"[实时{i+1}] {r['title']}: {r['snippet'][:200]}" for i, r in enumerate(web_result["results"])])
+                    context = (context + "\n\n【实时信息补充】\n" + web_context).strip() if context else web_context
+                    sources.extend([{"content": d["content"][:200], "score": 0.5} for d in web_docs])
+                    logger.info("[Chat] web_search 补充 %d 条实时信息", len(web_docs))
+                    if web_result.get("summary"):
+                        context += f"\n\n【AI摘要】{web_result['summary'][:500]}"
+            except Exception as e:
+                logger.warning("[Chat] web_search 补充失败: %s", e)
 
         # ── 2. 实体解析（RAG 上下文辅助）──
         entity_code = ""

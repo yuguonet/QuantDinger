@@ -781,7 +781,12 @@ class TaskAgent(AgentBase):
                 "- 如果 technical_analysis.direction 是 bearish，不要写看涨或中性，应该写看跌\n"
                 "- PE 为负数表示亏损，不要写'估值合理'\n"
                 "- 工具返回 error 时，不要编造数据，该维度写'数据获取失败'\n"
-                "- 用 final_answer() 输出，不要直接 print"
+                "- 用 final_answer() 输出，不要直接 print\n\n"
+                "【数据补充策略】\n"
+                "- 当关键工具返回 error 或数据为空时，使用 web_search 搜索最新信息补充\n"
+                "- web_search 搜索关键词示例：'{股票名称} {股票代码} 最新消息 分析'\n"
+                "- 将 web_search 结果作为参考信息，结合已有数据分析\n"
+                "- web_search 结果用于补充新闻面、政策面、市场情绪等实时信息"
             ),
         )
 
@@ -789,8 +794,22 @@ class TaskAgent(AgentBase):
         try:
             custom_templates = _load_code_agent_yaml()
 
+            # 调试：检查 YAML 加载的 planning 内容
+            yaml_planning = custom_templates.get("planning", {})
+            logger.info("[TaskAgent] YAML planning 类型: %s, keys: %s", type(yaml_planning), list(yaml_planning.keys()) if isinstance(yaml_planning, dict) else "非字典")
+            if isinstance(yaml_planning, dict):
+                for k, v in yaml_planning.items():
+                    logger.info("[TaskAgent] YAML planning['%s'] 前100字符: %s", k, repr(str(v)[:100]))
+
             agent.prompt_templates.update(custom_templates)
             logger.info("[TaskAgent] 已加载自定义 prompt_templates (YAML)")
+
+            # 调试：检查 update 后的 planning 内容
+            after_planning = agent.prompt_templates.get("planning", {})
+            logger.info("[TaskAgent] update 后 planning 类型: %s", type(after_planning))
+            if isinstance(after_planning, dict):
+                for k, v in after_planning.items():
+                    logger.info("[TaskAgent] update 后 planning['%s'] 前100字符: %s", k, repr(str(v)[:100]))
         except Exception as e:
             logger.warning("[TaskAgent] 自定义 prompt_templates 加载失败: %s，使用默认", e)
 
@@ -821,22 +840,44 @@ class TaskAgent(AgentBase):
 
         placeholder = "可用工具见系统提示中的「可用工具」部分。"
         tool_block = f"可用工具（通过 mcp(action='call', tool_name='...', args={{...}}) 调用）：\n{tools_text}{low_weight_note}"
+
+        # 检查 prompt_templates 结构
+        logger.info("[Inject] prompt_templates 类型: %s", type(agent.prompt_templates))
+        logger.info("[Inject] prompt_templates 顶层 keys: %s", list(agent.prompt_templates.keys()) if isinstance(agent.prompt_templates, dict) else "非字典")
+
         planning = agent.prompt_templates.get("planning", {})
-        logger.info("[Inject] planning keys: %s, 共 %d 个 key", list(planning.keys()), len(planning))
+        logger.info("[Inject] planning 类型: %s, keys: %s", type(planning), list(planning.keys()) if isinstance(planning, dict) else "非字典")
+
+        if not isinstance(planning, dict):
+            logger.error("[Inject] planning 不是字典，无法注入工具！实际类型: %s", type(planning))
+            # 尝试直接修改字符串模板
+            if isinstance(agent.prompt_templates, dict) and isinstance(agent.prompt_templates.get("planning"), str):
+                logger.info("[Inject] planning 是字符串，尝试直接替换...")
+                planning_str = agent.prompt_templates["planning"]
+                if placeholder in planning_str:
+                    agent.prompt_templates["planning"] = planning_str.replace(placeholder, tool_block)
+                    logger.info("[Inject] 字符串 planning 已注入 %d 个工具", len(mcp_tool_list))
+                    return True
+            return False
+
         injected = False
         for key in ("initial_plan", "update_plan_pre_messages", "update_plan_post_messages"):
             if key not in planning:
                 logger.warning("[Inject] planning 中无 key '%s'，跳过", key)
                 continue
             val = planning[key]
+            logger.info("[Inject] planning['%s'] 类型: %s, 前80字符: %s", key, type(val), repr(str(val)[:80]))
+            if not isinstance(val, str):
+                logger.warning("[Inject] planning['%s'] 不是字符串，跳过", key)
+                continue
             if placeholder not in val:
-                logger.warning("[Inject] planning['%s'] 中未找到 placeholder，内容前80字符: %s", key, repr(val[:80]))
+                logger.warning("[Inject] planning['%s'] 中未找到 placeholder", key)
                 continue
             planning[key] = val.replace(placeholder, tool_block)
             injected = True
             logger.info("[TaskAgent] planning[%s] 已注入 %d 个工具", key, len(mcp_tool_list))
         if not injected:
-            logger.error("[Inject] 工具注入失败！planning 完整内容: %s", {k: v[:100] for k, v in planning.items()})
+            logger.error("[Inject] 工具注入失败！")
         return injected
 
     async def _execute_phase(
