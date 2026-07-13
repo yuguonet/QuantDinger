@@ -821,11 +821,23 @@ class TaskAgent(AgentBase):
 
         placeholder = "可用工具见系统提示中的「可用工具」部分。"
         tool_block = f"可用工具（通过 mcp(action='call', tool_name='...', args={{...}}) 调用）：\n{tools_text}{low_weight_note}"
+        planning = agent.prompt_templates.get("planning", {})
+        logger.info("[Inject] planning keys: %s, 共 %d 个 key", list(planning.keys()), len(planning))
+        injected = False
         for key in ("initial_plan", "update_plan_pre_messages", "update_plan_post_messages"):
-            planning = agent.prompt_templates.get("planning", {})
-            if key in planning and placeholder in planning[key]:
-                planning[key] = planning[key].replace(placeholder, tool_block)
-                logger.info("[TaskAgent] planning[%s] 已注入 %d 个工具", key, len(mcp_tool_list))
+            if key not in planning:
+                logger.warning("[Inject] planning 中无 key '%s'，跳过", key)
+                continue
+            val = planning[key]
+            if placeholder not in val:
+                logger.warning("[Inject] planning['%s'] 中未找到 placeholder，内容前80字符: %s", key, repr(val[:80]))
+                continue
+            planning[key] = val.replace(placeholder, tool_block)
+            injected = True
+            logger.info("[TaskAgent] planning[%s] 已注入 %d 个工具", key, len(mcp_tool_list))
+        if not injected:
+            logger.error("[Inject] 工具注入失败！planning 完整内容: %s", {k: v[:100] for k, v in planning.items()})
+        return injected
 
     async def _execute_phase(
         self,

@@ -92,8 +92,116 @@ else:
 # 技能适配器
 skills = QDSkillAdapter()
 
-# RAG 检索器（禁用硬编码知识库，RAG 由外部数据源驱动）
-retriever = None
+# RAG 检索器
+# 优先用 Qdrant（需 QDRANT_HOST），降级到关键词召回（无需外部服务）
+QDRANT_HOST = os.getenv("QDRANT_HOST", "")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
+QDRANT_GRPC_PORT = int(os.getenv("QDRANT_GRPC_PORT", "6334"))
+RAG_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
+RAG_SCORE_THRESHOLD = float(os.getenv("RAG_SCORE_THRESHOLD", "0.3"))
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "dashscope")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-v2")
+EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", LLM_API_KEY)
+EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "1536"))
+
+def _build_retriever():
+    """构建 RAG 检索器。"""
+    try:
+        from rag import (
+            EmbeddingModel, QdrantVectorStore, Retriever,
+            KeywordRetriever, MultiRouteRetriever, RetrieverRoute,
+        )
+
+        routes = []
+
+        # 路线 1: 向量检索（需 Qdrant）
+        if QDRANT_HOST:
+            try:
+                embedding = EmbeddingModel(
+                    provider=EMBEDDING_PROVIDER,
+                    model=EMBEDDING_MODEL,
+                    api_key=EMBEDDING_API_KEY,
+                )
+                vector_store = QdrantVectorStore(
+                    collection_name="quantdinger",
+                    embedding=embedding,
+                    host=QDRANT_HOST,
+                    port=QDRANT_PORT,
+                    grpc_port=QDRANT_GRPC_PORT,
+                    dimension=EMBEDDING_DIMENSION,
+                    score_threshold=RAG_SCORE_THRESHOLD,
+                )
+                vector_retriever = Retriever(
+                    vector_store=vector_store,
+                    top_k=RAG_TOP_K,
+                    score_threshold=RAG_SCORE_THRESHOLD,
+                )
+                routes.append(RetrieverRoute("vector", vector_retriever, weight=1.0))
+                logger.info("[RAG] 向量检索已启用: %s:%d", QDRANT_HOST, QDRANT_PORT)
+            except Exception as e:
+                logger.warning("[RAG] Qdrant 初始化失败，跳过向量检索: %s", e)
+
+        # 路线 2: 关键词召回（从 qd_analysis_memory 加载历史分析）
+        try:
+            kw_docs = _load_analysis_memory_docs()
+            if kw_docs:
+                keyword_retriever = KeywordRetriever(documents=kw_docs, top_k=RAG_TOP_K)
+                routes.append(RetrieverRoute("keyword", keyword_retriever, weight=0.6))
+                logger.info("[RAG] 关键词召回已启用: %d 条文档", len(kw_docs))
+        except Exception as e:
+            logger.warning("[RAG] 关键词召回初始化失败: %s", e)
+
+        if not routes:
+            logger.warning("[RAG] 无可用检索路线，RAG 禁用")
+            return None
+
+        if len(routes) == 1:
+            return routes[0].retriever
+
+        return MultiRouteRetriever(routes=routes, top_k=RAG_TOP_K)
+
+    except Exception as e:
+        logger.warning("[RAG] 初始化失败: %s", e)
+        return None
+
+
+def _load_analysis_memory_docs() -> list:
+    """从 qd_analysis_memory 加载历史分析文档，供关键词召回。"""
+    if not DATABASE_URL:
+        return []
+    try:
+        import psycopg2
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT summary, decision, symbol, created_at
+            FROM qd_analysis_memory
+            WHERE summary IS NOT NULL AND summary != ''
+            ORDER BY created_at DESC
+            LIMIT 500
+        """)
+        docs = []
+        for row in cur.fetchall():
+            summary, decision, symbol, created_at = row
+            content = f"{decision or ''} {symbol or ''} {summary}"
+            docs.append({
+                "content": content[:500],
+                "metadata": {
+                    "source": "analysis_memory",
+                    "symbol": symbol or "",
+                    "decision": decision or "",
+                    "date": str(created_at) if created_at else "",
+                },
+            })
+        cur.close()
+        conn.close()
+        return docs
+    except Exception as e:
+        logger.debug("[RAG] 加载 analysis_memory 失败: %s", e)
+        return []
+
+
+retriever = _build_retriever()
 
 # 模式：固定 task（工具由 MCP 动态发现，不再需要 ToolRegistry 预扫描）
 # ToolRegistry 已移除：

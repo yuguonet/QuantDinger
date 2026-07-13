@@ -344,13 +344,20 @@ def make_chat_node(ctx: NodeContext):
             except Exception as e:
                 logger.warning("[Chat] RAG 检索失败: %s", e)
 
-        # ── 2. 实体解析 ──
+        # ── 2. 实体解析（RAG 上下文辅助）──
         entity_code = ""
         entity_name = ""
         entity_type = ""
+        # RAG 辅助：用户消息无明确代码时，从 context 中提取最近分析的标的
+        resolve_input = user_input
+        if context and not re.search(r'\b\d{6}\b', user_input):
+            code_match = re.search(r'(?:代码|code|symbol)[：:]*\s*(\d{6})', context, re.IGNORECASE)
+            if code_match:
+                resolve_input = f"{user_input} {code_match.group(1)}"
+                logger.info("[Chat] RAG 辅助实体解析: 注入代码 %s", code_match.group(1))
         if ctx.entity_resolver:
             try:
-                entity = ctx.entity_resolver.resolve(user_input)
+                entity = ctx.entity_resolver.resolve(resolve_input)
                 if entity:
                     entity_code = entity.get("code", "")
                     entity_name = entity.get("name", "")
@@ -372,15 +379,18 @@ def make_chat_node(ctx: NodeContext):
         if entity_code:
             needs_task = True
         else:
-            # 无实体，用 LLM 快速判断意图
+            # 无实体，用 LLM 快速判断意图（RAG 上下文辅助）
             try:
+                intent_system = (
+                    "你是意图分类器。判断用户消息是否需要调用工具完成任务。\n"
+                    "需要工具（分析、查询、搜索、计算、对比等）回复: task\n"
+                    "不需要工具（闲聊、问候、简单知识问答、感谢等）回复: chat\n"
+                    "只回复一个词: task 或 chat"
+                )
+                if context:
+                    intent_system += f"\n\n【参考上下文】\n{context[:1000]}\n如果上下文中提到过具体标的或分析，优先判断为 task。"
                 intent_messages = [
-                    ChatMessage(role="system", content=(
-                        "你是意图分类器。判断用户消息是否需要调用工具完成任务。\n"
-                        "需要工具（分析、查询、搜索、计算、对比等）回复: task\n"
-                        "不需要工具（闲聊、问候、简单知识问答、感谢等）回复: chat\n"
-                        "只回复一个词: task 或 chat"
-                    )),
+                    ChatMessage(role="system", content=intent_system),
                     ChatMessage(role="user", content=user_input),
                 ]
                 intent_resp = await ctx.llm.generate(messages=intent_messages)
@@ -443,8 +453,13 @@ def make_plan_node(ctx: NodeContext):
         if not ctx.mcp_tool_list:
             ctx.init_mcp()
         if not ctx.mcp_tool_list:
-            logger.error("[Plan] MCP 不可用，无法执行任务流程")
-            return {"task": "", "step_budget": 0, "planning_interval": 6}
+            logger.error("[Plan] MCP 不可用，退回直接回答")
+            # 用 LLM 直接回答，不进 execute
+            direct = await ctx.llm.generate(messages=[
+                ChatMessage(role="system", content=ctx.system_prompt),
+                ChatMessage(role="user", content=effective_input),
+            ])
+            return {"task": "", "step_budget": 0, "planning_interval": 6, "direct_answer": direct.content or ""}
 
         # 复盘时注入前轮结果
         prev_result = state.get("result_raw", "")
@@ -539,8 +554,16 @@ def make_execute_node(ctx: NodeContext):
             )
             # 注入工具列表到 planning prompt
             all_tools = list(ctx.mcp_tool_list) + skill_tools
+            injection_ok = False
             if all_tools:
-                agent_instance._inject_tools_to_planning(agent, all_tools)
+                injection_ok = agent_instance._inject_tools_to_planning(agent, all_tools)
+            if not injection_ok:
+                logger.error("[Execute] 工具注入失败，退回直接回答")
+                direct = await ctx.llm.generate(messages=[
+                    ChatMessage(role="system", content=ctx.system_prompt),
+                    ChatMessage(role="user", content=task),
+                ])
+                return {"result_raw": direct.content or "", "hit_max_steps": False, "replan_count": state.get("replan_count", 0)}
             logger.info("[Execute] 新建 CodeAgent 实例")
         else:
             logger.info("[Execute] 复用 CodeAgent 实例，memory 自然衔接")
