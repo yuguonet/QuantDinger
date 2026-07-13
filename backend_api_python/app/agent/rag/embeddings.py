@@ -139,9 +139,9 @@ class LlamaCppEmbedding(OpenAIEmbedding):
 
     使用方式：
         # llama.cpp 启动 embedding 模型（和 chat 模型共用端口或独立端口）
-        # ./llama-server --model nomic-embed-text-v1.5.f16.gguf --port 8080
+        # ./llama-server --model bge-m3-Q8_0.gguf --port 8080 --embedding
         embedding = LlamaCppEmbedding(
-            model="nomic-embed-text-v1.5.f16",
+            model="bge-m3-Q8_0",
             base_url="http://localhost:8080/v1",
         )
     """
@@ -180,7 +180,7 @@ class EmbeddingModel:
             )
         if provider == "llamacpp":
             return LlamaCppEmbedding(
-                model=model or "nomic-embed-text-v1.5.f16",
+                model=model or "bge-m3-Q8_0",
                 base_url=base_url or "http://localhost:8080/v1",
             )
         raise ValueError(f"不支持的 Embedding Provider: {provider}")

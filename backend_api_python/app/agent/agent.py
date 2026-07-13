@@ -93,13 +93,40 @@ else:
 skills = QDSkillAdapter()
 
 # RAG 检索器
-# 三路召回：向量(llama.cpp本地) + PostgreSQL FTS + 关键词
+# 三路召回：向量(llama.cpp本地) + PostgreSQL FTS + 关键词 + Reranker精排
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
 RAG_SCORE_THRESHOLD = float(os.getenv("RAG_SCORE_THRESHOLD", "0.3"))
 EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "")  # llamacpp / dashscope / openai
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "")
 EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", "")
 EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "")
+
+# Reranker 配置
+RERANKER_PROVIDER = os.getenv("RERANKER_PROVIDER", "")  # local / api
+RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+RERANKER_API_URL = os.getenv("RERANKER_API_URL", "")
+RERANKER_API_KEY = os.getenv("RERANKER_API_KEY", "")
+RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", "20"))  # RRF 后送入 reranker 的数量
+
+def _build_reranker():
+    """构建 Reranker 精排模型。"""
+    if not RERANKER_PROVIDER:
+        return None
+    try:
+        from rag.retriever import BGEReranker
+        use_api = RERANKER_PROVIDER.lower() == "api"
+        reranker = BGEReranker(
+            model_path=RERANKER_MODEL,
+            use_api=use_api,
+            api_url=RERANKER_API_URL,
+            api_key=RERANKER_API_KEY,
+        )
+        logger.info("[RAG] Reranker 已启用: provider=%s model=%s", RERANKER_PROVIDER, RERANKER_MODEL)
+        return reranker
+    except Exception as e:
+        logger.warning("[RAG] Reranker 初始化失败: %s", e)
+        return None
+
 
 def _build_retriever():
     """构建 RAG 检索器。"""
@@ -160,10 +187,20 @@ def _build_retriever():
             logger.warning("[RAG] 无可用检索路线，RAG 禁用")
             return None
 
-        if len(routes) == 1:
+        # 构建 Reranker
+        reranker = _build_reranker()
+
+        # 单路召回直接返回
+        if len(routes) == 1 and not reranker:
             return routes[0].retriever
 
-        return MultiRouteRetriever(routes=routes, top_k=RAG_TOP_K)
+        # 多路召回 + RRF + 精排
+        return MultiRouteRetriever(
+            routes=routes,
+            top_k=RAG_TOP_K,
+            reranker=reranker,
+            rerank_top_k=RERANK_TOP_K,
+        )
 
     except Exception as e:
         logger.warning("[RAG] 初始化失败: %s", e)

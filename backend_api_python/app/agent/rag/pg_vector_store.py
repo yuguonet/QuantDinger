@@ -74,7 +74,7 @@ class PgVectorStore:
             logger.warning("[PgVectorStore] schema 初始化失败: %s", e)
             conn.rollback()
 
-    def add_texts(self, texts: list[str], metadatas: Optional[list[dict]] = None) -> list[str]:
+    async def add_texts(self, texts: list[str], metadatas: Optional[list[dict]] = None) -> list[str]:
         """添加文本到向量存储。"""
         try:
             import psycopg2
@@ -106,7 +106,7 @@ class PgVectorStore:
             logger.error("[PgVectorStore] 添加失败: %s", e)
             return []
 
-    def similarity_search(self, query: str, k: int = 5, filter: Optional[dict] = None) -> list[dict]:
+    async def similarity_search(self, query: str, k: int = 5, filter: Optional[dict] = None) -> list[dict]:
         """相似度检索。"""
         try:
             import psycopg2

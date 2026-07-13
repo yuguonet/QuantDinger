@@ -6,7 +6,7 @@ RAG 检索增强层
 from rag.embeddings import EmbeddingBase, DashScopeEmbedding, OpenAIEmbedding, LlamaCppEmbedding, EmbeddingModel
 from rag.vector_store import QdrantVectorStore, VectorStoreBase
 from rag.pg_vector_store import PgVectorStore
-from rag.retriever import KeywordRetriever, MultiRouteRetriever, Retriever, RetrieverRoute
+from rag.retriever import KeywordRetriever, MultiRouteRetriever, Retriever, RetrieverRoute, BGEReranker
 from rag.postgres_fts import PostgresFTSRetriever
 
 __all__ = [
@@ -22,5 +22,6 @@ __all__ = [
     "KeywordRetriever",
     "RetrieverRoute",
     "MultiRouteRetriever",
+    "BGEReranker",
     "PostgresFTSRetriever",
 ]

@@ -181,12 +181,140 @@ class RetrieverRoute:
     top_k: Optional[int] = None
 
 
+class BGEReranker:
+    """
+    BGE-reranker 精排模型。
+
+    使用 Cross-Encoder 对检索结果进行重排序，显著提升精度。
+    支持本地 sentence-transformers 或远程 API。
+
+    使用方式：
+        reranker = BGEReranker()
+        reranked = reranker.rerank(query, docs, top_k=5)
+    """
+
+    def __init__(
+        self,
+        model_path: str = "BAAI/bge-reranker-v2-m3",
+        use_api: bool = False,
+        api_url: str = "",
+        api_key: str = "",
+    ):
+        self.model_path = model_path
+        self.use_api = use_api
+        self.api_url = api_url
+        self.api_key = api_key
+        self._model = None
+
+    def _get_model(self):
+        """懒加载模型"""
+        if self._model is None:
+            try:
+                from sentence_transformers import CrossEncoder
+                self._model = CrossEncoder(self.model_path)
+                logger.info(f"[BGEReranker] 模型加载完成: {self.model_path}")
+            except ImportError:
+                logger.error("sentence_transformers 未安装，请执行: pip install sentence-transformers")
+                raise
+            except Exception as e:
+                logger.error(f"[BGEReranker] 模型加载失败: {e}")
+                raise
+        return self._model
+
+    def rerank(
+        self,
+        query: str,
+        docs: list[dict],
+        top_k: int = 5,
+    ) -> list[dict]:
+        """
+        对检索结果重排序。
+
+        :param query: 查询文本
+        :param docs: 文档列表 [{"content": ..., "score": ...}]
+        :param top_k: 返回数量
+        :return: 重排序后的文档列表
+        """
+        if not docs:
+            return []
+
+        try:
+            if self.use_api:
+                return self._rerank_api(query, docs, top_k)
+            return self._rerank_local(query, docs, top_k)
+        except Exception as e:
+            logger.error(f"[BGEReranker] 重排序失败: {e}")
+            return docs[:top_k]
+
+    def _rerank_local(
+        self,
+        query: str,
+        docs: list[dict],
+        top_k: int,
+    ) -> list[dict]:
+        """本地模型重排序"""
+        model = self._get_model()
+        pairs = [(query, d.get("content", "")) for d in docs]
+        scores = model.predict(pairs)
+
+        for doc, score in zip(docs, scores):
+            doc["rerank_score"] = float(score)
+
+        reranked = sorted(docs, key=lambda x: x.get("rerank_score", 0), reverse=True)
+        return reranked[:top_k]
+
+    def _rerank_api(
+        self,
+        query: str,
+        docs: list[dict],
+        top_k: int,
+    ) -> list[dict]:
+        """远程 API 重排序（兼容 jina/cohere/siliconflow 等）"""
+        import requests
+
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        documents = [d.get("content", "") for d in docs]
+        payload = {
+            "model": self.model_path,
+            "query": query,
+            "documents": documents,
+            "top_n": top_k,
+        }
+
+        resp = requests.post(self.api_url, json=payload, headers=headers, timeout=30)
+        resp.raise_for_status()
+        result = resp.json()
+
+        # 兼容不同 API 格式
+        reranked_docs = []
+        for item in result.get("results", result.get("data", [])):
+            idx = item.get("index", item.get("document_index", 0))
+            score = item.get("relevance_score", item.get("score", 0))
+            if 0 <= idx < len(docs):
+                doc = docs[idx].copy()
+                doc["rerank_score"] = float(score)
+                reranked_docs.append(doc)
+
+        return reranked_docs[:top_k]
+
+
 class MultiRouteRetriever:
     """
-    多路召回 + RRF 融合检索器。
+    多路召回 + RRF 融合 + 精排检索器。
 
     支持把向量召回、关键词召回、不同 collection、不同过滤条件等多条路线
-    并发执行，然后用 Reciprocal Rank Fusion 合并排序。
+    并发执行，然后用 Reciprocal Rank Fusion 合并排序，最后用 Reranker 精排。
+
+    使用示例：
+        retriever = MultiRouteRetriever(
+            routes=[...],
+            top_k=5,
+            reranker=BGEReranker(),
+        )
+        docs = await retriever.retriever("查询内容")
     """
 
     def __init__(
@@ -195,6 +323,8 @@ class MultiRouteRetriever:
         top_k: int = 5,
         rrf_k: int = 60,
         query_variants: Optional[list[str]] = None,
+        reranker: Optional[object] = None,
+        rerank_top_k: int = 20,
     ):
         if not routes:
             raise ValueError("MultiRouteRetriever 至少需要一条检索路线")
@@ -202,6 +332,8 @@ class MultiRouteRetriever:
         self.top_k = top_k
         self.rrf_k = rrf_k
         self.query_variants = query_variants or []
+        self.reranker = reranker
+        self.rerank_top_k = rerank_top_k  # RRF 后送入 reranker 的数量
 
     async def retrieve(
         self,
@@ -209,6 +341,7 @@ class MultiRouteRetriever:
         top_k: Optional[int] = None,
         filter: Optional[dict] = None,
     ) -> list[dict]:
+        # 1. 多路召回
         queries = [query, *[q for q in self.query_variants if q and q != query]]
         tasks = []
         task_meta = []
@@ -222,6 +355,7 @@ class MultiRouteRetriever:
         route_results = await asyncio.gather(*tasks, return_exceptions=True)
         fused: dict[str, dict] = {}
 
+        # 2. RRF 融合
         for docs, (route_name, weight, q) in zip(route_results, task_meta):
             if isinstance(docs, Exception):
                 logger.warning(f"检索路线失败: {route_name}, error={docs}")
@@ -249,12 +383,28 @@ class MultiRouteRetriever:
                     "score": doc.get("score", 0),
                 })
 
-        docs = sorted(fused.values(), key=lambda x: x["score"], reverse=True)
-        for doc in docs:
-            doc["score"] = round(doc["score"], 6)
+        fused_docs = sorted(fused.values(), key=lambda x: x["score"], reverse=True)
+
+        # 3. Reranker 精排（可选）
+        if self.reranker and fused_docs:
+            try:
+                rerank_k = min(self.rerank_top_k, len(fused_docs))
+                docs_to_rerank = fused_docs[:rerank_k]
+                fused_docs = self.reranker.rerank(
+                    query=query,
+                    docs=docs_to_rerank,
+                    top_k=top_k or self.top_k,
+                )
+            except Exception as e:
+                logger.warning(f"[MultiRouteRetriever] Reranker 失败，回退到 RRF 排序: {e}")
+
+        # 4. 格式化输出
+        result_docs = fused_docs[:top_k or self.top_k]
+        for doc in result_docs:
+            doc["score"] = round(doc.get("rerank_score", doc.get("score", 0)), 6)
             doc["metadata"] = {
                 **(doc.get("metadata") or {}),
                 "retrieval_routes": doc.pop("routes", []),
                 "raw_scores": doc.pop("raw_scores", []),
             }
-        return docs[:top_k or self.top_k]
+        return result_docs
