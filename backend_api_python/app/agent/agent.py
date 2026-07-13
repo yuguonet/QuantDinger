@@ -93,16 +93,13 @@ else:
 skills = QDSkillAdapter()
 
 # RAG 检索器
-# 优先用 Qdrant（需 QDRANT_HOST），降级到关键词召回（无需外部服务）
-QDRANT_HOST = os.getenv("QDRANT_HOST", "")
-QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
-QDRANT_GRPC_PORT = int(os.getenv("QDRANT_GRPC_PORT", "6334"))
+# 三路召回：向量(llama.cpp本地) + PostgreSQL FTS + 关键词
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
 RAG_SCORE_THRESHOLD = float(os.getenv("RAG_SCORE_THRESHOLD", "0.3"))
-EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "dashscope")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-v2")
-EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", LLM_API_KEY)
-EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "1536"))
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "")  # llamacpp / dashscope / openai
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "")
+EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", "")
+EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "")
 
 def _build_retriever():
     """构建 RAG 检索器。"""
@@ -114,21 +111,19 @@ def _build_retriever():
 
         routes = []
 
-        # 路线 1: 向量检索（需 Qdrant）
-        if QDRANT_HOST:
+        # 路线 1: 向量检索（llama.cpp 本地 Embedding + PostgreSQL 存储）
+        if DATABASE_URL and EMBEDDING_PROVIDER:
             try:
                 embedding = EmbeddingModel(
                     provider=EMBEDDING_PROVIDER,
                     model=EMBEDDING_MODEL,
                     api_key=EMBEDDING_API_KEY,
+                    base_url=EMBEDDING_BASE_URL,
                 )
-                vector_store = QdrantVectorStore(
-                    collection_name="quantdinger",
+                from rag.pg_vector_store import PgVectorStore
+                vector_store = PgVectorStore(
+                    dsn=DATABASE_URL,
                     embedding=embedding,
-                    host=QDRANT_HOST,
-                    port=QDRANT_PORT,
-                    grpc_port=QDRANT_GRPC_PORT,
-                    dimension=EMBEDDING_DIMENSION,
                     score_threshold=RAG_SCORE_THRESHOLD,
                 )
                 vector_retriever = Retriever(
@@ -137,11 +132,21 @@ def _build_retriever():
                     score_threshold=RAG_SCORE_THRESHOLD,
                 )
                 routes.append(RetrieverRoute("vector", vector_retriever, weight=1.0))
-                logger.info("[RAG] 向量检索已启用: %s:%d", QDRANT_HOST, QDRANT_PORT)
+                logger.info("[RAG] 向量检索已启用: provider=%s model=%s", EMBEDDING_PROVIDER, EMBEDDING_MODEL)
             except Exception as e:
-                logger.warning("[RAG] Qdrant 初始化失败，跳过向量检索: %s", e)
+                logger.warning("[RAG] 向量检索初始化失败，跳过: %s", e)
 
-        # 路线 2: 关键词召回（从 qd_analysis_memory 加载历史分析）
+        # 路线 2: PostgreSQL 全文搜索（从 qd_analysis_memory）
+        if DATABASE_URL:
+            try:
+                from rag.postgres_fts import PostgresFTSRetriever
+                fts_retriever = PostgresFTSRetriever(dsn=DATABASE_URL, top_k=RAG_TOP_K)
+                routes.append(RetrieverRoute("fts", fts_retriever, weight=0.8))
+                logger.info("[RAG] PostgreSQL FTS 已启用")
+            except Exception as e:
+                logger.warning("[RAG] PostgreSQL FTS 初始化失败: %s", e)
+
+        # 路线 3: 关键词召回（从 qd_analysis_memory 加载历史分析）
         try:
             kw_docs = _load_analysis_memory_docs()
             if kw_docs:

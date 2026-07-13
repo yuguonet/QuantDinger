@@ -130,6 +130,26 @@ class OpenAIEmbedding(EmbeddingBase):
             return []
 
 
+class LlamaCppEmbedding(OpenAIEmbedding):
+    """
+    llama.cpp 本地 Embedding 实现。
+
+    复用 OpenAIEmbedding，base_url 指向 llama.cpp 的 /v1 端点。
+    llama.cpp 加载 embedding 模型后，/v1/embeddings 接口兼容 OpenAI API。
+
+    使用方式：
+        # llama.cpp 启动 embedding 模型（和 chat 模型共用端口或独立端口）
+        # ./llama-server --model nomic-embed-text-v1.5.f16.gguf --port 8080
+        embedding = LlamaCppEmbedding(
+            model="nomic-embed-text-v1.5.f16",
+            base_url="http://localhost:8080/v1",
+        )
+    """
+
+    def __init__(self, model: str = "", base_url: str = ""):
+        super().__init__(model=model, api_key="not-needed", base_url=base_url)
+
+
 class EmbeddingModel:
     """
     Embedding 工厂兼容层。
@@ -157,5 +177,10 @@ class EmbeddingModel:
                 model=model or "text-embedding-3-small",
                 api_key=api_key,
                 base_url=base_url,
+            )
+        if provider == "llamacpp":
+            return LlamaCppEmbedding(
+                model=model or "nomic-embed-text-v1.5.f16",
+                base_url=base_url or "http://localhost:8080/v1",
             )
         raise ValueError(f"不支持的 Embedding Provider: {provider}")
