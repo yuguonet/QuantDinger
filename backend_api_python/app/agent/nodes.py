@@ -190,6 +190,8 @@ class AgentState(TypedDict, total=False):
     hit_max_steps: bool   # True=max_steps 耗尽，需复盘
     replan_count: int     # 已复盘次数
     _code_agent: Any      # CodeAgent 实例（跨轮复用，不序列化）
+    _failed_tools: list   # 失败工具列表
+    _agent_plan: str      # smolagents 最终规划
 
     # ── finalize_node 输出 ──
     elapsed: float
@@ -257,7 +259,9 @@ class NodeContext:
 
 def _expand_entity_query(user_input: str, entity_name: str, entity_code: str, entity_type: str) -> str:
     """将简短的实体分析指令扩写为完整的分析指令。"""
-    return f"分析{entity_name}({entity_code}): {user_input}"
+    # 默认分析参数（后续从 formatter rules.yaml 读取）
+    default_params = "周期：T+3（T+1/T+3/1W/1M），深度：标准（简单/标准/深度）"
+    return f"分析{entity_name}({entity_code}): {user_input}，{default_params}"
 
 
 def _set_llm_timeout(agent, timeout_seconds: int):
@@ -548,7 +552,7 @@ def make_execute_node(ctx: NodeContext):
         _set_llm_timeout(agent, 180)
 
         # 执行
-        logger.info("[Execute] 开始执行，step_budget=%d, planning_interval=%d, timeout=180s", step_budget, planning_interval)
+        logger.info("[Execute] 开始执行，step_budget=%d, timeout=180s", step_budget)
         react_start = time.time()
 
         hit_max_steps = False
@@ -576,11 +580,23 @@ def make_execute_node(ctx: NodeContext):
         if failed_tools:
             logger.info("[Execute] 失败工具: %s", [n for n, _ in failed_tools])
 
+        # 提取 smolagents 的最终规划
+        agent_plan = ""
+        try:
+            from smolagents.memory import PlanningStep
+            for step in reversed(getattr(agent.memory, 'steps', []) or []):
+                if isinstance(step, PlanningStep):
+                    agent_plan = step.plan or ""
+                    break
+        except Exception:
+            pass
+
         if trace:
             trace.record("execute_done", {
                 "elapsed_seconds": react_elapsed,
                 "hit_max_steps": hit_max_steps,
                 "result_preview": result[:200],
+                "agent_plan": agent_plan[:500] if agent_plan else None,
             })
 
         return {
@@ -589,6 +605,7 @@ def make_execute_node(ctx: NodeContext):
             "replan_count": state.get("replan_count", 0),
             "_code_agent": agent,  # 保留实例，下轮复用
             "_failed_tools": failed_tools,  # 失败工具列表，由 finalize_node 追加到输出
+            "_agent_plan": agent_plan,  # smolagents 最终规划
         }
 
     return execute_node
@@ -601,6 +618,7 @@ def _finalize_domain(ctx: NodeContext, state: dict, result_raw: str) -> int | No
         root_id 如果存库成功，否则 None
     """
     entity_type = state.get("entity_type", "")
+    agent_plan = state.get("_agent_plan", "")
 
     if entity_type == "stock":
         stock_data = extract_stock_data(result_raw)
@@ -620,6 +638,7 @@ def _finalize_domain(ctx: NodeContext, state: dict, result_raw: str) -> int | No
                 action=stock_data.get("action", ""),
                 signal=stock_data.get("signal", ""),
                 analysis=result_raw[:2000],
+                plan=agent_plan,
                 input_params={"user_query": state.get("user_input", "")},
                 status=Status.OK.value,
             )
@@ -643,6 +662,11 @@ def make_finalize_node(ctx: NodeContext):
         direct_answer = state.get("direct_answer", "")
         result_raw = state.get("result_raw", "") or direct_answer or "[错误] 无执行结果"
         failed_tools = state.get("_failed_tools", [])
+        agent_plan = state.get("_agent_plan", "")
+
+        # 记录 smolagents 最终规划
+        if agent_plan:
+            logger.info("[Finalize] Agent 规划:\n%s", agent_plan[:500])
 
         # ── 1. 领域特化：从干净的 result_raw 提取数据 + 存库 ──
         domain_root_id = None

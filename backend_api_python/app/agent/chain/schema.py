@@ -184,6 +184,7 @@ class EvalNode:
     factors: List[FactorItem] = field(default_factory=list)
     output_data: Dict[str, Any] = field(default_factory=dict)
     analysis: str = ""                 # 分析文字（内容主体）
+    plan: str = ""                     # smolagents 最终规划
 
     # 正向: 调用信息
     input_params: Dict[str, Any] = field(default_factory=dict)

@@ -1,7 +1,0 @@
-# 追加到 system_prompt 开头的规则（开头权重更高）
-system_prompt_prefix: |
-  【铁律 - 最高优先级】
-  1. 禁止 print()！变量赋值即可，print 浪费 tokens
-  2. 工具返回数据后，必须逐项分析指标数值再调用 final_answer()，不要忽略数据
-  3. 出错看字段名，同一错误不重试
-

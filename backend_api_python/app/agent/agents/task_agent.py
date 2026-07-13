@@ -667,7 +667,6 @@ class TaskAgent(AgentBase):
 
         task = plan.get("task", "") or plan.get("expanded_query", "") or user_input
         step_budget = plan.get("step_budget", 10) or 10
-        # planning_interval: 最少 step_budget//2+1，保证最多触发 1 次 replan
         planning_interval = max(step_budget // 2 + 1, 6)
 
         logger.info("[TaskAgent] plan: task=%s..., step_budget=%d, planning_interval=%d",
