@@ -27,7 +27,7 @@ from typing import Any, List, Optional
 from chain.schema import (
     EvalNode, Layer, Status,
 )
-from json_extractor import extract_decision
+from utils.json_parser import extract_decision
 class TraceCollector:
     """Agent 执行过程中的自动追踪器。
 

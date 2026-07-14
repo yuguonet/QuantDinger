@@ -27,7 +27,7 @@ import os
 import sys
 import time
 
-# ── 路径设置 ──────────────────────────────────────────────────
+# ── 路径设置（直接运行 cli.py 时需要，-m 方式由 __init__.py 处理）──
 _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 _agent_dir = os.path.abspath(os.path.dirname(__file__))
 if _project_root not in sys.path:
@@ -37,19 +37,15 @@ if _agent_dir not in sys.path:
 
 try:
     from dotenv import load_dotenv
-    load_dotenv(os.path.join(_project_root, ".env"), override=False)
+    load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"), override=False)
 except ImportError:
     pass
 
 
-def _ensure_agent_path():
-    """确保 app/agent/ 在 sys.path 头部。"""
-    if sys.path[0] != _agent_dir:
-        try:
-            sys.path.remove(_agent_dir)
-        except ValueError:
-            pass
-        sys.path.insert(0, _agent_dir)
+def _import_agent():
+    """延迟导入 agent 组件（避免包命名空间冲突）。"""
+    from agent import agent, settings, skills, DEFAULT_SESSION_ID
+    return agent, settings, skills, DEFAULT_SESSION_ID
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -58,8 +54,7 @@ def _ensure_agent_path():
 
 async def _run_chat(message: str, session_id: str = "cli"):
     """统一对话入口。"""
-    _ensure_agent_path()
-    from agent import agent, skills
+    agent, _, skills, _ = _import_agent()
 
     print(f"\n📎 Session: {session_id}")
     print(f"💬 Message: {message}")
@@ -80,8 +75,7 @@ async def _run_chat(message: str, session_id: str = "cli"):
 
 def _print_info():
     """显示配置信息。"""
-    _ensure_agent_path()
-    from agent import settings, skills
+    _, settings, skills, _ = _import_agent()
 
     print("=" * 60)
     print("QuantDinger Agent — CLI")
@@ -111,8 +105,7 @@ def _list_tools():
 
 def _list_skills():
     """列出所有技能。"""
-    _ensure_agent_path()
-    from agent import skills
+    _, _, skills, _ = _import_agent()
 
     print(f"\n🎯 可用技能 ({len(skills)} 个):\n")
     for info in skills.list_skills():
@@ -143,12 +136,10 @@ def main():
         _list_skills()
         return
 
-    _ensure_agent_path()
-    from agent import DEFAULT_SESSION_ID
+    _, _, _, DEFAULT_SESSION_ID = _import_agent()
     session_id = args.session or DEFAULT_SESSION_ID
 
     if args.message:
-        _ensure_agent_path()
         try:
             from app.agent.llm.qd_llm import _load_llm_service
             LLMService_cls, _, _ = _load_llm_service()

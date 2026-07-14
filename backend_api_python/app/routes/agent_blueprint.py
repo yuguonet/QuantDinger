@@ -7,16 +7,8 @@ This file just fixes sys.path so the agent modules can import each other,
 then re-exports flask_app's working routes under the /api/agent prefix.
 """
 import logging
-import os
-import sys
 
 logger = logging.getLogger(__name__)
-
-# Ensure app/agent/ is on sys.path so "from llm import ..." and other
-# agent-relative imports work at runtime.
-_agent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "agent"))
-if _agent_dir not in sys.path:
-    sys.path.insert(0, _agent_dir)
 
 from flask import Blueprint
 

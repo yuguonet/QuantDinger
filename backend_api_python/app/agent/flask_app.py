@@ -21,7 +21,6 @@ import json
 import logging
 import os
 import queue
-import sys
 import threading
 import uuid
 
@@ -29,31 +28,12 @@ from flask import Blueprint, Response, jsonify, request
 
 logger = logging.getLogger(__name__)
 
-# ── 路径设置 ──────────────────────────────────────────────────
-_project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-_agent_dir = os.path.abspath(os.path.dirname(__file__))
-if _project_root not in sys.path:
-    sys.path.insert(0, _project_root)
-if _agent_dir not in sys.path:
-    sys.path.insert(0, _agent_dir)
-
-
-def _ensure_agent_path():
-    if sys.path[0] != _agent_dir:
-        try:
-            sys.path.remove(_agent_dir)
-        except ValueError:
-            pass
-        sys.path.insert(0, _agent_dir)
-
-
 # ── Blueprint ─────────────────────────────────────────────────
 agent_v2_bp = Blueprint("agent_v2", __name__, url_prefix="/api/agent-v2")
 
 
 def _run_agent(message: str, session_id: str) -> str:
     """同步执行 TaskAgent.chat()（在后台线程中调用）。"""
-    _ensure_agent_path()
     from agent import agent
 
     loop = asyncio.new_event_loop()
@@ -95,7 +75,6 @@ def _sse_stream(message: str, session_id: str, timeout: int = 300):
 @agent_v2_bp.route("/health", methods=["GET"])
 def health():
     try:
-        _ensure_agent_path()
         from agent import settings, skills
         return jsonify({
             "status": "ok",
@@ -110,7 +89,6 @@ def health():
 @agent_v2_bp.route("/info", methods=["GET"])
 def info():
     try:
-        _ensure_agent_path()
         from agent import settings, skills
         return jsonify({
             "version": settings.version,
@@ -130,7 +108,6 @@ def list_tools():
 @agent_v2_bp.route("/skills", methods=["GET"])
 def list_skills():
     try:
-        _ensure_agent_path()
         from agent import skills
         return jsonify({"total": len(skills), "skills": skills.list_skills()})
     except Exception as e:

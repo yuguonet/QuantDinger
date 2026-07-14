@@ -2,14 +2,13 @@
 """
 统一 Agent 入口
 
-提供 FastAPI 服务端点，也可作为 CLI 入口。
+提供 Flask Blueprint 端点，也可作为 CLI 入口。
 """
 from __future__ import annotations
 
 import os
 import logging
 from types import SimpleNamespace
-from typing import Optional
 
 from llm import create_llm, QDSkillAdapter
 from memory import (
@@ -20,14 +19,7 @@ from agents import TaskAgent
 
 logger = logging.getLogger(__name__)
 
-# ---------- FastAPI（可选）----------
-try:
-    from fastapi import FastAPI, HTTPException
-except ImportError:
-    FastAPI = None
-    HTTPException = None
-
-# ---------- 加载 .env（FastAPI/uvicorn 入口需要显式加载）----------
+# ---------- 加载 .env（Flask/uvicorn 入口需要显式加载）----------
 try:
     from dotenv import load_dotenv
     _dotenv_path = os.path.join(os.path.dirname(__file__), "..", "..", ".env")
@@ -95,7 +87,7 @@ skills = QDSkillAdapter()
 # RAG 检索器
 # 三路召回：向量(llama.cpp本地) + PostgreSQL FTS + 关键词 + Reranker精排
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
-RAG_SCORE_THRESHOLD = float(os.getenv("RAG_SCORE_THRESHOLD", "0.3"))
+RAG_SCORE_THRESHOLD = float(os.getenv("RAG_SCORE_THRESHOLD", "0.5"))
 EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "")  # llamacpp / dashscope / openai
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "")
 EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", "")
@@ -266,48 +258,6 @@ agent = TaskAgent(
     skill_adapter=skills,
 )
 
-
-# ---------- FastAPI 路由（可选）----------
-if FastAPI is not None:
-
-    app = FastAPI(
-        title="QuantDinger Agent",
-        version=settings.version,
-        description="QuantDinger 量化分析 AI 助手",
-    )
-
-    @app.get("/health")
-    async def health():
-        return {
-            "status": "ok",
-            "version": settings.version,
-            "mode": _mode,
-            "skills": len(skills),
-        }
-
-    @app.post("/chat")
-    async def chat_route(message: str, session_id: Optional[str] = "default"):
-        try:
-            session_id = session_id or "default"
-            response = await agent.chat(message, session_id=session_id)
-            return {
-                "reply": response.content,
-                "session_id": session_id,
-                "mode": _mode,
-                "elapsed_seconds": response.elapsed_seconds,
-                "trace_id": response.metadata.get("trace_id"),
-            }
-        except Exception as e:
-            logger.error("对话异常: %s", e, exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e))
-
-    @app.get("/tools")
-    async def list_tools():
-        return {"total": 0, "tools": [], "note": "工具由 MCP 动态发现，详见 /health"}
-
-    @app.get("/skills")
-    async def list_skills():
-        return {"total": len(skills), "skills": skills.list_skills()}
 
 # ---------- 盘后回溯评估 Worker ----------
 try:

@@ -828,71 +828,6 @@ class TaskAgent(AgentBase):
 
         return agent
 
-    def _inject_tools_to_planning(self, agent, mcp_tool_list: list):
-        """注入工具列表（含权重）到 smolagents 的 planning prompts。"""
-        # 获取低权重工具集合
-        low_weight_tools = set()
-        try:
-            from chain.store import query_low_weight_tools
-            low_weight_tools = query_low_weight_tools()
-        except Exception as e:
-            logger.debug("[Inject] 获取工具权重失败: %s", e)
-
-        tool_lines = []
-        for t in mcp_tool_list:
-            inputs = getattr(t, 'inputs', {}) or {}
-            params = ', '.join(f"{p}: {i.get('type', 'string')}" for p, i in inputs.items()) if inputs else ''
-            desc = (getattr(t, 'description', '') or '')[:80]
-            tag = " ⚠️低权重" if t.name in low_weight_tools else ""
-            tool_lines.append(f"  {t.name}({params}) — {desc}{tag}")
-        tools_text = '\n'.join(tool_lines)
-
-        low_weight_note = ""
-        if low_weight_tools:
-            low_weight_note = f"\n\n⚠️ 标记「低权重」的工具历史胜率低，优先用未标记的工具。"
-
-        placeholder = "可用工具见系统提示中的「可用工具」部分。"
-        tool_block = f"可用工具（通过 mcp(action='call', tool_name='...', args={{...}}) 调用）：\n{tools_text}{low_weight_note}"
-
-        # 检查 prompt_templates 结构
-        logger.info("[Inject] prompt_templates 类型: %s", type(agent.prompt_templates))
-        logger.info("[Inject] prompt_templates 顶层 keys: %s", list(agent.prompt_templates.keys()) if isinstance(agent.prompt_templates, dict) else "非字典")
-
-        planning = agent.prompt_templates.get("planning", {})
-        logger.info("[Inject] planning 类型: %s, keys: %s", type(planning), list(planning.keys()) if isinstance(planning, dict) else "非字典")
-
-        if not isinstance(planning, dict):
-            logger.error("[Inject] planning 不是字典，无法注入工具！实际类型: %s", type(planning))
-            # 尝试直接修改字符串模板
-            if isinstance(agent.prompt_templates, dict) and isinstance(agent.prompt_templates.get("planning"), str):
-                logger.info("[Inject] planning 是字符串，尝试直接替换...")
-                planning_str = agent.prompt_templates["planning"]
-                if placeholder in planning_str:
-                    agent.prompt_templates["planning"] = planning_str.replace(placeholder, tool_block)
-                    logger.info("[Inject] 字符串 planning 已注入 %d 个工具", len(mcp_tool_list))
-                    return True
-            return False
-
-        injected = False
-        for key in ("initial_plan", "update_plan_pre_messages", "update_plan_post_messages"):
-            if key not in planning:
-                logger.warning("[Inject] planning 中无 key '%s'，跳过", key)
-                continue
-            val = planning[key]
-            logger.info("[Inject] planning['%s'] 类型: %s, 前80字符: %s", key, type(val), repr(str(val)[:80]))
-            if not isinstance(val, str):
-                logger.warning("[Inject] planning['%s'] 不是字符串，跳过", key)
-                continue
-            if placeholder not in val:
-                logger.warning("[Inject] planning['%s'] 中未找到 placeholder", key)
-                continue
-            planning[key] = val.replace(placeholder, tool_block)
-            injected = True
-            logger.info("[TaskAgent] planning[%s] 已注入 %d 个工具", key, len(mcp_tool_list))
-        if not injected:
-            logger.error("[Inject] 工具注入失败！")
-        return injected
-
     async def _execute_phase(
         self,
         task: str,
@@ -1062,19 +997,3 @@ class TaskAgent(AgentBase):
             return True
         except (TypeError, ValueError):
             return False
-
-    def _build_phase_roadmap(self, phases: list, current_phase_id: int) -> str:
-        """构建阶段路线图提示（全量可见，标记当前阶段）。"""
-        lines = ["【执行路线图】（仅作参考，不要跳过当前阶段）"]
-        for phase in phases:
-            pid = phase.get("id", 0)
-            name = phase.get("name", "")
-            goal = phase.get("goal", "")
-            if pid == current_phase_id:
-                lines.append(f"  → 阶段{pid}: {name} — {goal} ← 你在这里")
-            elif pid < current_phase_id:
-                lines.append(f"  ✓ 阶段{pid}: {name}")
-            else:
-                lines.append(f"  ○ 阶段{pid}: {name} — {goal}")
-        lines.append("\n【约束】完成当前阶段后输出结果，不要自行进入下一阶段。")
-        return "\n".join(lines)

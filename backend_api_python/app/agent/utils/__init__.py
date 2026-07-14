@@ -31,4 +31,4 @@ def detect_market(stock_code: str) -> str:
     return "CNStock"
 
 
-__all__ = ["get_logger", "safe_parse_json", "load_prompt", "AgentTraceRecorder", "detect_market"]
+__all__ = ["get_logger", "safe_parse_json", "extract_json", "extract_decision", "load_prompt", "AgentTraceRecorder", "detect_market"]
