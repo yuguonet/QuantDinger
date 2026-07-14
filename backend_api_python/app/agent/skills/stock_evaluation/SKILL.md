@@ -1,5 +1,5 @@
 ---
-name: stock-evaluation
+name: stock_evaluation
 version: 3.0.0
 description: 个股综合评估系统。用户问"分析XX股票""XX股票怎么样""评估XX"时使用。
 tags: [stock, evaluation, analysis, technical, fundamental]
@@ -15,7 +15,7 @@ tools:
   - stock_report
 ---
 
-# 个股综合评估 (stock-evaluation)
+# 个股综合评估 (stock_evaluation)
 
 ## 使用场景
 
@@ -51,6 +51,15 @@ result = evaluate_stock(codes="300129", depth="standard", period="T+3")
 result = evaluate_stocks(codes="600519,300129,000858", depth="standard", period="T+3")
 ```
 
+**⚠️ 必须先检查错误再使用结果：**
+```python
+if "error" in result:
+    final_answer(f"评估失败: {result['error']}")
+else:
+    report = result["report"]
+    # ... 继续处理
+```
+
 返回：
 ```python
 {
@@ -67,26 +76,66 @@ result = evaluate_stocks(codes="600519,300129,000858", depth="standard", period=
 }
 ```
 
-### Step 3: LLM 综合分析
+### Step 3: 综合分析 + 输出
 
-将 `report` + `summary` + `tool_results` + `llm_data` 注入到任务上下文，由 CodeAgent 做综合分析：
+从 result 中提取数据，生成综合分析，最终用 `final_answer()` 输出：
 
 ```python
-task_parts.append(f"【stock_report 结果】\n{result['report']}")
-task_parts.append(f"【结构化摘要】\n{result['summary']}")
-task_parts.append(f"【交叉验证】\n{result['verified']}")
-task_parts.append(f"【LLM分析数据】\n{result['llm_data']}")
+result = evaluate_stock(codes="300129", depth="standard", period="T+3")
+
+if "error" in result:
+    final_answer(f"评估失败: {result['error']}")
+    return
+
+report = result["report"]      # 标准化报告（含注意栏）
+llm_data = result["llm_data"]  # 技术因子/资金面/指标详情
+verified = result["verified"]  # 交叉验证
 ```
 
-LLM 根据以上数据生成：
-- 核心逻辑（为什么涨/跌）
-- 风险点（需要注意什么）
-- 操作建议（具体策略）
-- 综合评估（一句话总结）
+基于 llm_data 生成综合分析（150字以内），拼在 report 后面：
 
-### Step 4: 输出
+```python
+analysis = "你的分析内容..."  # 核心逻辑 + 风险点 + 操作建议
+final_answer(report + "\n**综合分析**: " + analysis)
+```
 
-用 `final_answer()` 输出最终报告。
+**最终输出顺序**：报告 → 注意 → 综合分析（注意由 evaluate_stock 自动生成，你只需追加综合分析）
+
+**综合分析要求：**
+- 核心逻辑：为什么涨/跌（基于技术面+资金面数据）
+- 风险点：需要注意什么
+- 操作建议：具体策略（持有/买入/卖出的时机）
+- 控制在 150 字以内
+
+**错误示范：**
+- ❌ `final_answer(str(result))` — 输出原始 dict
+- ❌ `final_answer("综合分析报告内容")` — 占位符
+
+### Step 3b: 多股分析
+
+多股时用 `evaluate_stocks()`，返回每只股的标准化报告 + 对比排名：
+
+```python
+result = evaluate_stocks(codes="600519,300129,000858", depth="standard", period="T+3")
+
+if "error" in result:
+    final_answer(f"评估失败: {result['error']}")
+    return
+
+# result["comparison"] 已包含每只股的标准化报告 + 对比排名表
+comparison = result["comparison"]
+
+# 为每只股生成综合分析（可选）
+analyses = []
+for s in result["stocks"]:
+    llm_data = s.get("llm_data", {})
+    # 基于 llm_data 生成该股的综合分析
+    analysis = f"{s['name']}: 你的分析..."
+    analyses.append(analysis)
+
+# 输出：对比报告 + 各股综合分析
+final_answer(comparison + "\n\n**综合分析**:\n" + "\n".join(analyses))
+```
 
 ## 深度级别
 

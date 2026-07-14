@@ -128,10 +128,13 @@ def _generate_report(
     }
 
     # ── 输出（结构化数据，不含综合分析）──
+    direction_cn = _direction_cn(direction)
+    direction_line = f"**方    向**: {direction_cn}\n" if direction_cn else ""
     report = (
         f"**股票名称**: {stock_name} ({stock_code})\n"
         f"**综合评分**: {score}\n"
         f"**操作建议**: {action}\n"
+        f"{direction_line}"
         f"**置 信 度**: {confidence}\n"
         f"**时间窗口**: T+3\n"
         f"**技术面**: {score}分 ({factors_str})\n"
@@ -190,5 +193,7 @@ def _determine_confidence(technical: dict, fund_signal: str, capital_signal: str
 
 
 def _direction_cn(direction: str) -> str:
-    """英文方向 → 中文。"""
-    return {"bullish": "看涨", "bearish": "看跌", "neutral": "中性"}.get(direction, direction)
+    """英文方向 → 中文。未知/空值返回空字符串（不显示）。"""
+    if not direction or direction in ("unknown", ""):
+        return ""
+    return {"bullish": "看涨", "bearish": "看跌", "neutral": "中性"}.get(direction, "")

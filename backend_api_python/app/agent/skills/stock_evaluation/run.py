@@ -165,11 +165,11 @@ def _web_search(query: str) -> Dict[str, Any]:
         return {"error": str(e)}
 
 
-def _stock_report(quote: Dict, indicator: Dict, volume: Dict, trend: Dict, capital: Dict) -> Dict[str, Any]:
+def _stock_report(info: Dict, technical: Dict, capital: Dict, quote: Dict, fund_flow: Dict) -> Dict[str, Any]:
     """生成 stock_report（技能内版本）。"""
     try:
-        from skills.stock_evaluation.stock_report import stock_report
-        return stock_report(quote=quote, indicator=indicator, volume=volume, trend=trend, capital=capital)
+        from .stock_report import stock_report
+        return stock_report(info=info, technical=technical, capital=capital, quote=quote, fund_flow=fund_flow)
     except Exception as e:
         return {"error": str(e)}
 
@@ -258,6 +258,35 @@ def _fetch_data_single(code: str, depth: str, stock_name: str = "") -> Dict[str,
     return results
 
 
+def _check_data_warnings(tool_results: Dict[str, Dict[str, Any]], depth: str) -> str:
+    """检查当前深度实际调用的工具，返回未获取或错误的数据列表。"""
+    # 按深度定义实际调用的工具
+    depth_tools = {
+        "simple": ["technical_analysis"],
+        "standard": ["technical_analysis", "get_realtime_quote", "get_indicator_snapshot",
+                     "get_volume_analysis", "analyze_trend", "get_capital_summary", "get_fund_flow"],
+        "deep": ["technical_analysis", "get_realtime_quote", "get_indicator_snapshot",
+                 "get_volume_analysis", "analyze_trend", "get_capital_summary", "get_fund_flow",
+                 "get_stock_info", "search_stock_intel"],
+        "complete": ["technical_analysis", "get_realtime_quote", "get_indicator_snapshot",
+                     "get_volume_analysis", "analyze_trend", "get_capital_summary", "get_fund_flow",
+                     "get_stock_info", "search_stock_intel", "web_search"],
+    }
+    expected = depth_tools.get(depth, depth_tools["standard"])
+    warnings = []
+    for tool_name in expected:
+        result = tool_results.get(tool_name)
+        if result is None:
+            warnings.append(f"{tool_name} 未返回数据")
+            continue
+        if isinstance(result, dict):
+            if "error" in result:
+                warnings.append(f"{tool_name}: {result['error']}")
+            elif not result:
+                warnings.append(f"{tool_name} 返回空数据")
+    return "\n".join(warnings)
+
+
 def _check_cross_verification(tool_results: Dict[str, Dict[str, Any]]) -> List[str]:
     """交叉验证：两个不同来源验证同一结论时加星。"""
     verifications = []
@@ -328,17 +357,21 @@ def evaluate_stock(
     logger.info("[StockEval] %s(%s) 深度=%s 周期=%s", stock_name, code, depth, period)
     tool_results = _fetch_data_single(code, depth, stock_name)
 
-    # 生成 stock_report
+    # 生成 stock_report（参数对齐 stock_report.py 签名）
     quote = tool_results.get("get_realtime_quote", {})
-    indicator = tool_results.get("get_indicator_snapshot", {})
-    volume = tool_results.get("get_volume_analysis", {})
-    trend = tool_results.get("analyze_trend", {})
+    technical = tool_results.get("technical_analysis", {})
     capital = tool_results.get("get_capital_summary", {})
+    fund_flow = tool_results.get("get_fund_flow", {})
 
-    report_result = _stock_report(quote=quote, indicator=indicator, volume=volume, trend=trend, capital=capital)
+    report_result = _stock_report(info={}, technical=technical, capital=capital, quote=quote, fund_flow=fund_flow)
 
     report = report_result.get("report", "")
     summary = report_result.get("summary", {})
+
+    # 数据完整性检查：所有工具结果中 error 或空数据的都要提示
+    warnings = _check_data_warnings(tool_results, depth)
+    if warnings:
+        report = f"{report}\n**注意**:\n{warnings}"
 
     # 交叉验证
     verified = _check_cross_verification(tool_results)
@@ -349,8 +382,8 @@ def evaluate_stock(
         "technical_signals": tool_results.get("technical_analysis", {}).get("signal", ""),
         "fund_flow": tool_results.get("get_fund_flow", {}),
         "capital": tool_results.get("get_capital_summary", {}),
-        "indicator_details": indicator,
-        "trend_details": trend,
+        "indicator_details": tool_results.get("get_indicator_snapshot", {}),
+        "trend_details": tool_results.get("analyze_trend", {}),
         "period": period,
         "weights": PERIOD_WEIGHTS.get(period, DEFAULT_WEIGHTS),
     }
@@ -421,15 +454,34 @@ def evaluate_stocks(
 
 
 def _generate_comparison(stocks: List[Dict], period: str) -> str:
-    """生成多股对比报告。"""
-    lines = [f"## 多股对比 (周期: {period})", "",
-             "| # | 股票 | 评分 | 方向 | 信号 | 验证 |",
-             "|---|------|------|------|------|------|"]
+    """生成多股对比报告（标准化格式）。"""
+    if not stocks:
+        return "无有效股票数据"
 
+    lines = [f"**多股对比** (周期: {period})\n"]
+
+    # 每只股票的标准化报告
     for i, s in enumerate(stocks):
-        star = "⭐" if s.get("verified") else ""
-        signal = s.get("summary", {}).get("signal_short", "")[:15]
-        lines.append(f"| {i+1} | {s['name']}({s['code']}) | {s['score']:.0f} | {s['direction']} | {signal} | {star} |")
+        report = s.get("report", "")
+        if report:
+            lines.append(report)
+            # 追加注意栏（如果有）
+            warnings = _check_data_warnings(s.get("tool_results", {}), s.get("depth", "standard"))
+            if warnings:
+                lines.append(f"**注意**:\n{warnings}")
+            lines.append("")  # 空行分隔
+
+    # 对比排名表
+    lines.append(f"**对比排名**:")
+    lines.append(f"{'排名':<4} {'股票':<14} {'评分':<6} {'方向':<6} {'操作':<6} {'信号':<20}")
+    lines.append("-" * 60)
+    for i, s in enumerate(stocks):
+        name_code = f"{s['name']}({s['code']})"
+        score = s.get('score', 0)
+        direction = s.get('direction', '中性')
+        action = s.get('action', '跳过')
+        signal = s.get('summary', {}).get('signal_short', '')[:18]
+        lines.append(f"{i+1:<4} {name_code:<14} {score:<6} {direction:<6} {action:<6} {signal:<20}")
 
     return "\n".join(lines)
 

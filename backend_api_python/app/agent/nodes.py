@@ -29,137 +29,10 @@ logger = logging.getLogger(__name__)
 #  格式化函数
 # ═══════════════════════════════════════════════════════════════
 
-def format_stock_report(data: dict) -> str:
-    """将结构化股票分析数据格式化为人类可读文本。"""
-    if not data:
-        return ""
-    parts = []
-    name = data.get("stock_name", "")
-    code = data.get("stock_code", "")
-    if name or code:
-        parts.append(f"**股票名称**: {name} ({code})" if name and code else f"**股票名称**: {name or code}")
-    field_map = [
-        ("action", "操作建议"),
-        ("score", "评    分"),
-        ("direction", "方    向"),
-        ("confidence", "置 信 度"),
-        ("time_window", "时间窗口"),
-        ("signal", "信    号"),
-        ("analysis", "分    析"),
-    ]
-    for key, label in field_map:
-        val = data.get(key)
-        if val is not None and val != "":
-            parts.append(f"**{label}**: {val}")
-    return "\n".join(parts)
-
-
-# markdown 字段标签 → 结构化 key
-_FIELD_MAP = {
-    "股票名称": "stock_name", "股票代码": "stock_code",
-    "操作建议": "action",
-    "评分": "score", "评    分": "score",
-    "方向": "direction", "方    向": "direction",
-    "置信度": "confidence", "置 信 度": "confidence",
-    "时间窗口": "time_window",
-    "信号": "signal", "信    号": "signal",
-    "分析": "analysis", "分    析": "analysis",
-}
-
-
-def extract_stock_data(content: str) -> dict | None:
-    """从 LLM 输出中提取结构化股票分析数据。支持 markdown 和 JSON。"""
-    if not content:
-        return None
-
-    # 方式1: 尝试 JSON 解析
-    from json_extractor import extract_json
-    parsed = extract_json(content)
-    if parsed and isinstance(parsed, dict):
-        # 壳格式：data 字段里有结构化数据
-        inner = parsed.get("data")
-        if isinstance(inner, dict) and any(inner.get(k) for k in ("action", "score", "direction", "signal")):
-            return inner
-        # 直接格式：顶层有结构化数据
-        if any(parsed.get(k) for k in ("action", "score", "direction", "signal")):
-            return parsed
-
-    # 方式2: 从 markdown 格式提取
-    data = {}
-    for m in re.finditer(r"\*\*(.+?)\*\*\s*[:：]\s*(.+)", content):
-        label = m.group(1).strip()
-        value = m.group(2).strip()
-        key = _FIELD_MAP.get(label)
-        if key:
-            data[key] = value
-
-    if not any(data.get(k) for k in ("action", "score", "direction", "signal")):
-        return None
-
-    # 从 stock_name 中拆出 code
-    if "stock_name" in data and not data.get("stock_code"):
-        code_match = re.search(r"(\d{6})", data["stock_name"])
-        if code_match:
-            data["stock_code"] = code_match.group(1)
-            data["stock_name"] = data["stock_name"].replace(code_match.group(0), "").strip(" ()")
-
-    # score 转 int
-    if "score" in data:
-        try:
-            data["score"] = int(re.search(r"\d+", str(data["score"])).group())
-        except (ValueError, AttributeError):
-            pass
-
-    return data
-
 
 # ═══════════════════════════════════════════════════════════════
 #  AgentState — 状态类型定义
 # ═══════════════════════════════════════════════════════════════
-
-class EntityResolver:
-    """实体解析器接口（通用）。
-
-    不同领域实现不同的解析逻辑：
-      - 股票：解析股票代码/名称
-      - 商品：解析商品代码
-      - 加密货币：解析币种
-    """
-
-    def resolve(self, user_input: str) -> dict | None:
-        """从用户输入中解析实体。
-
-        Returns:
-            {"code": str, "name": str, "type": str} 或 None
-        """
-        raise NotImplementedError
-
-
-class StockResolver(EntityResolver):
-    """股票实体解析器（金融领域）。"""
-
-    def resolve(self, user_input: str) -> dict | None:
-        try:
-            from tools.data_tools import resolve_stock
-            code_match = re.search(r'\b(\d{6})\b', user_input)
-            if code_match:
-                code = code_match.group(1)
-                return {"code": code, "name": "", "type": "stock"}
-
-            clean_input = re.sub(r'分析|看看|查一下|怎么样|什么股|股票|推荐|选|买|卖', '', user_input).strip()
-            if clean_input and len(clean_input) >= 2:
-                result = resolve_stock(clean_input, limit=1)
-                if isinstance(result, dict) and not result.get('error'):
-                    if result.get('code'):
-                        return {"code": result['code'], "name": result.get('name', ''), "type": "stock"}
-                    elif result.get('data'):
-                        first = result['data'][0]
-                        return {"code": first.get('code', ''), "name": first.get('name', ''), "type": "stock"}
-        except Exception as e:
-            logger.debug("[StockResolver] 解析跳过: %s", e)
-        return None
-
-
 class AgentState(TypedDict, total=False):
     """Graph 状态。节点之间通过它传递数据。"""
 
@@ -182,6 +55,9 @@ class AgentState(TypedDict, total=False):
 
     # ── plan_node 输出 ──
     task: str             # 完整任务描述
+    selected_skill: str   # plan 选中的技能名（None=无技能）
+    skill_body: str       # 选中技能的 SKILL.md 正文
+    skill_tools: list     # 选中技能的工具列表（_SkillResourceTool + _SkillFuncTool）
     step_budget: int      # CodeAgent 本轮步数预算
     planning_interval: int
 
@@ -229,7 +105,7 @@ class NodeContext:
         self.system_prompt = system_prompt
         self.memory_window_size = memory_window_size
         self.max_tool_rounds = max_tool_rounds
-        self.entity_resolver = entity_resolver or StockResolver()  # 默认股票解析器
+        self.entity_resolver = entity_resolver  # 由外部注入（如 StockResolver）
 
         # MCP 运行时（惰性初始化）
         self.mcp_tool_list = []
@@ -337,44 +213,16 @@ def make_chat_node(ctx: NodeContext):
         if use_rag and ctx.retriever:
             try:
                 docs = await ctx.retriever.retrieve(user_input)
+                # 过滤低相关度文档（避免噪音污染任务）
+                RAG_SCORE_THRESHOLD = 0.5
+                docs = [d for d in docs if d.get("score", 0) >= RAG_SCORE_THRESHOLD]
                 if docs:
                     from rag.retriever import Retriever
                     context = Retriever.format_context(docs)
                     sources = [{"content": d["content"][:200], "score": d.get("score", 0)} for d in docs]
-                    logger.info("[Chat] RAG 检索到 %d 条文档, %d 字符", len(docs), len(context))
+                    logger.info("[Chat] RAG 检索到 %d 条文档（相关度>=%.2f）, %d 字符", len(docs), RAG_SCORE_THRESHOLD, len(context))
             except Exception as e:
                 logger.warning("[Chat] RAG 检索失败: %s", e)
-
-        # ── 1.1 RAG 结果不足时，用 web_search 补充实时信息 ──
-        if len(docs) < 3:
-            try:
-                from tools.web_search_tools import web_search
-                # 构建搜索关键词（优先用实体名+股票代码）
-                search_query = user_input
-                if entity_name and entity_code:
-                    search_query = f"{entity_name} {entity_code} 最新消息 分析"
-                elif entity_code:
-                    search_query = f"{entity_code} 股票 最新分析"
-
-                web_result = web_search(search_query, count=5, freshness="pw")
-                if web_result.get("success") and web_result.get("results"):
-                    web_docs = []
-                    for r in web_result["results"]:
-                        web_docs.append({
-                            "content": f"{r['title']}: {r['snippet']}",
-                            "metadata": {"source": "web_search", "url": r.get("url", "")},
-                            "score": 0.5,
-                        })
-                    # 合并到 docs 和 context
-                    docs.extend(web_docs)
-                    web_context = "\n".join([f"[实时{i+1}] {r['title']}: {r['snippet'][:200]}" for i, r in enumerate(web_result["results"])])
-                    context = (context + "\n\n【实时信息补充】\n" + web_context).strip() if context else web_context
-                    sources.extend([{"content": d["content"][:200], "score": 0.5} for d in web_docs])
-                    logger.info("[Chat] web_search 补充 %d 条实时信息", len(web_docs))
-                    if web_result.get("summary"):
-                        context += f"\n\n【AI摘要】{web_result['summary'][:500]}"
-            except Exception as e:
-                logger.warning("[Chat] web_search 补充失败: %s", e)
 
         # ── 2. 实体解析（RAG 上下文辅助）──
         entity_code = ""
@@ -505,22 +353,40 @@ def make_plan_node(ctx: NodeContext):
 
         plan_input = effective_input + replan_context
 
-        # 第一层：只注入 name + description（简历），不注入 SKILL.md body
-        if ctx.skill_adapter:
-            for s in ctx.skill_adapter.list_skills():
-                name = s['name']
-                if name in plan_input or name.replace('-', ' ') in plan_input:
-                    desc = s.get('description', '')[:200]
-                    plan_input += f"\n\n【可用技能】{name}: {desc}"
-                    logger.info("[Plan] 第一层：技能 '%s' 简历已注入", name)
-                    break
-
+        # _plan() 内部已将所有技能名+描述注入到 plan prompt，由 LLM 选择
         plan = await ctx.agent._plan(plan_input, ctx.llm, trace)
+
+        # ── 渐进式加载：plan 选中技能后，加载 SKILL.md body + 工具 ──
+        selected_skill = plan.get("selected_skill")
+        skill_body = ""
+        skill_tools = []
+
+        if selected_skill and ctx.skill_adapter:
+            # 加载 SKILL.md 正文
+            body = ctx.skill_adapter.load_body(selected_skill)
+            if body:
+                skill_body = body
+                logger.info("[Plan] 渐进加载技能 '%s': SKILL.md %d 字符", selected_skill, len(body))
+
+            # 加载技能工具（SkillResourceTool + SkillFuncTool）
+            from agents.task_agent import _SkillResourceTool, _load_skill_functions
+            skill_tools.append(_SkillResourceTool(ctx.skill_adapter, selected_skill))
+            skill_tools.extend(_load_skill_functions(selected_skill))
+            logger.info("[Plan] 渐进加载技能 '%s': %d 个工具", selected_skill, len(skill_tools))
+
+            trace.record("skill_loaded", {
+                "skill": selected_skill,
+                "body_chars": len(skill_body),
+                "tool_count": len(skill_tools),
+            })
 
         return {
             "task": plan["task"],
+            "selected_skill": selected_skill or "",
+            "skill_body": skill_body,
+            "skill_tools": skill_tools,
             "step_budget": plan["step_budget"],
-            "planning_interval": plan["planning_interval"],
+            "planning_interval": plan.get("planning_interval", 6),
             "replan_count": replan_count + (1 if prev_hit else 0),
         }
 
@@ -554,21 +420,15 @@ def make_execute_node(ctx: NodeContext):
         if state.get("context"):
             task_parts.append(f"【参考资料】\n{state['context']}")
 
-        # 第二层：SKILL.md body → 注入 task context
-        # 第三层：_SkillResourceTool → CodeAgent 按需读取资源
-        skill_tools = []
-        if ctx.skill_adapter:
-            from agents.task_agent import _load_skill_functions, _SkillResourceTool
-            for s in ctx.skill_adapter.list_skills():
-                name = s['name']
-                if name in task or name.replace('-', ' ') in task:
-                    body = ctx.skill_adapter.load_body(name)
-                    if body:
-                        task_parts.append(f"【技能指令: {name}】\n{body}")
-                        logger.info("[Execute] 第二层：SKILL.md '%s'，%d 字符", name, len(body))
-                    skill_tools.append(_SkillResourceTool(ctx.skill_adapter, name))
-                    skill_tools.extend(_load_skill_functions(name))
-                    break
+        # 渐进式加载：从 state 读取 plan 阶段已选中的技能信息
+        selected_skill = state.get("selected_skill", "")
+        skill_body = state.get("skill_body", "")
+        skill_tools = list(state.get("skill_tools", []))
+
+        if selected_skill and skill_body:
+            task_parts.append(f"【技能指令: {selected_skill}】\n{skill_body}")
+            logger.info("[Execute] 注入技能 '%s': SKILL.md %d 字符, %d 个工具",
+                        selected_skill, len(skill_body), len(skill_tools))
 
         task_parts.append(f"【任务】\n{task}")
         full_task = "\n\n".join(task_parts)
@@ -577,25 +437,17 @@ def make_execute_node(ctx: NodeContext):
         agent = state.get("_code_agent")
         if agent is None:
 
+            # 技能模式下关闭 smolagents 内部 planning（外部 plan 已规划）
+            # 非技能模式保持原样
+            effective_interval = None if selected_skill else planning_interval
+
             agent = agent_instance._build_code_agent(
                 model=ctx.model,
                 mcp_tool_list=ctx.mcp_tool_list,
                 skill_tools=skill_tools,
-                planning_interval=planning_interval,
+                planning_interval=effective_interval,
                 phase_id=0,
             )
-            # 注入工具列表到 planning prompt
-            all_tools = list(ctx.mcp_tool_list) + skill_tools
-            injection_ok = False
-            if all_tools:
-                injection_ok = agent_instance._inject_tools_to_planning(agent, all_tools)
-            if not injection_ok:
-                logger.error("[Execute] 工具注入失败，退回直接回答")
-                direct = await ctx.llm.generate(messages=[
-                    ChatMessage(role="system", content=ctx.system_prompt),
-                    ChatMessage(role="user", content=task),
-                ])
-                return {"result_raw": direct.content or "", "hit_max_steps": False, "replan_count": state.get("replan_count", 0)}
             logger.info("[Execute] 新建 CodeAgent 实例")
         else:
             logger.info("[Execute] 复用 CodeAgent 实例，memory 自然衔接")
@@ -666,46 +518,6 @@ def make_execute_node(ctx: NodeContext):
     return execute_node
 
 
-def _finalize_domain(ctx: NodeContext, state: dict, result_raw: str) -> int | None:
-    """领域特化后处理（可扩展）。
-
-    Returns:
-        root_id 如果存库成功，否则 None
-    """
-    entity_type = state.get("entity_type", "")
-    agent_plan = state.get("_agent_plan", "")
-
-    if entity_type == "stock":
-        stock_data = extract_stock_data(result_raw)
-        if stock_data:
-            from chain.schema import EvalNode, Layer, Status
-            from chain.store import save_tree
-            from datetime import date
-
-            root = EvalNode(
-                layer=Layer.CHAIN.value,
-                name=f"stock+analyze+{state.get('entity_code', '')}",
-                exec_date=date.today(),
-                stock_code=state.get("entity_code", ""),
-                stock_name=state.get("entity_name", ""),
-                score=stock_data.get("score"),
-                direction=stock_data.get("direction", ""),
-                action=stock_data.get("action", ""),
-                signal=stock_data.get("signal", ""),
-                analysis=result_raw[:2000],
-                plan=agent_plan,
-                input_params={"user_query": state.get("user_input", "")},
-                status=Status.OK.value,
-            )
-            root_id = save_tree(root)
-            logger.info("[Finalize:stock] EvalNode 已存储: root_id=%s score=%s action=%s",
-                        root_id, stock_data.get("score"), stock_data.get("action"))
-            return root_id
-
-    # 扩展点：elif entity_type == "crypto": ...
-    return None
-
-
 def make_finalize_node(ctx: NodeContext):
     """创建 finalize_node（闭包捕获 ctx）。"""
 
@@ -723,14 +535,8 @@ def make_finalize_node(ctx: NodeContext):
         if agent_plan:
             logger.info("[Finalize] Agent 规划:\n%s", agent_plan[:500])
 
-        # ── 1. 领域特化：从干净的 result_raw 提取数据 + 存库 ──
+        # ── 2. TraceCollector 存库 ──
         domain_root_id = None
-        try:
-            domain_root_id = _finalize_domain(ctx, state, result_raw)
-        except Exception as e:
-            logger.debug("[Finalize] 领域后处理跳过: %s", e)
-
-        # ── 2. TraceCollector 存库（仅当领域后处理未存时） ──
         collector_root_id = None
         collector = _collectors.get(session_id)
         if collector:

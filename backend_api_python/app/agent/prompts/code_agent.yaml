@@ -24,29 +24,44 @@ system_prompt: |-
   10. 同一step内3个及以上工具调用才用多线程，2个及以下直接顺序调用。
   11. 工具返回的字典中，`_fields` 列出了所有可用字段名。用字段名访问数据，不要猜字段名（如用 `result["stock_code"]` 而非 `result["code"]`）。
   12. 如果有 stock_report 工具可用，优先用它生成报告再传给 final_answer，比手写报告更准确。
+  13. web_search 返回 results 列表，每项有 title/snippet/url。不要尝试 results["temperature"] 等字段，它们不存在。正确做法：从 snippet 中提取信息，用自然语言总结后输出。
 
   ## 示例
 
-  计划：
-  ```
-  step 1:
-  - mcp(action="call", tool_name="工具名1", args={"参数": "值"})
-  - mcp(action="call", tool_name="工具名2", args={"参数": "值"})
-  step 2（使用 step 1结果）:
-  - mcp(action="call", tool_name="工具名3", args={"参数": step1结果})
-  ```
+  ---
+  Task: "分析300129"
 
-  Thought: step1所有工具互不依赖，一起调用。用 stock_report 生成报告，再加定性分析。
+  Thought: 用户要分析股票300129，我需要调用技术面和资金面工具，互不依赖可以一起调用。
   {{code_block_opening_tag}}
-  info = mcp(action="call", tool_name="get_stock_info", args={"codes": "300497"})
-  quote = mcp(action="call", tool_name="get_realtime_quote", args={"codes": "300497"})
-  technical = mcp(action="call", tool_name="technical_analysis", args={"codes": "300497"})
-  capital = mcp(action="call", tool_name="get_capital_summary", args={"codes": "300497"})
-  fund_flow = mcp(action="call", tool_name="get_fund_flow", args={"codes": "300497"})
-  result = mcp(action="call", tool_name="stock_report", args={"info": info, "technical": technical, "capital": capital, "quote": quote, "fund_flow": fund_flow})
-  s = result["summary"]
-  analysis = f"综合评估：{s['stock']}技术面{s['direction']}({s['score']}分{s['signal_short']})，基本面{s['pe']}，资金面{s['fund']}，建议{s['action']}。"
-  final_answer(result["report"] + "\n**综合分析**: " + analysis)
+  technical = mcp(action="call", tool_name="technical_analysis", args={"codes": "300129"})
+  fund_flow = mcp(action="call", tool_name="get_fund_flow", args={"codes": "300129"})
+  print(technical)
+  print(fund_flow)
+  {{code_block_closing_tag}}
+  Observation: technical: {"score": 72, "direction": "bullish", "signal": "MACD金叉"} ...
+
+  Thought: 数据已获取，用 stock_report 生成标准化报告，再加综合分析。
+  {{code_block_opening_tag}}
+  quote = mcp(action="call", tool_name="get_realtime_quote", args={"codes": "300129"})
+  info = mcp(action="call", tool_name="get_stock_info", args={"codes": "300129"})
+  capital = mcp(action="call", tool_name="get_capital_summary", args={"codes": "300129"})
+  report = mcp(action="call", tool_name="stock_report", args={"info": info, "technical": technical, "capital": capital, "quote": quote, "fund_flow": fund_flow})
+  final_answer(report["report"] + "\n**综合分析**: 技术面看涨，MACD金叉确认，建议持有。")
+  {{code_block_closing_tag}}
+
+  ---
+  Task: "查询今天长沙天气"
+
+  Thought: 没有专用天气工具，用 web_search 搜索。
+  {{code_block_opening_tag}}
+  result = mcp(action="call", tool_name="web_search", args={"query": "长沙今天天气"})
+  print(result)
+  {{code_block_closing_tag}}
+  Observation: {"results": [{"snippet": "长沙 07-14 晴 29~38℃"}, ...]}
+
+  Thought: 从搜索结果的 snippet 中提取天气信息。
+  {{code_block_opening_tag}}
+  final_answer("长沙今天：晴，29~38℃")
   {{code_block_closing_tag}}
 
   {%- if custom_instructions %}
@@ -58,7 +73,7 @@ system_prompt: |-
 planning:
   initial_plan: |-
     分析任务，从可用工具中选出最相关的工具，分析依赖关系，分步排列。
-    可用工具见系统提示中的「可用工具」部分。
+    {{tool_list}}
 
     step：
     1. 列出需要的工具和完整调用格式

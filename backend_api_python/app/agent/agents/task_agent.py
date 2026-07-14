@@ -398,11 +398,14 @@ class _SkillFuncTool(SmolToolBase):
         return self.forward(**kwargs)
 
 
-def _load_skill_functions(skill_name: str) -> list:
-    """加载 skill 的 run.py 中的公开函数，包装为 CodeAgent 工具。"""
+def _load_skill_functions(skill_name: str, skill_adapter=None) -> list:
+    """加载 skill 的 run.py 中的公开函数，包装为 CodeAgent 工具。
+
+    约定：skill 目录名使用下划线（如 stock_evaluation），不用连字符。
+    """
+    import importlib
     module_name = skill_name.replace("-", "_")
     try:
-        import importlib
         mod = importlib.import_module(f"skills.{module_name}.run")
     except Exception:
         return []
@@ -669,17 +672,27 @@ class TaskAgent(AgentBase):
         step_budget = plan.get("step_budget", 10) or 10
         planning_interval = max(step_budget // 2 + 1, 6)
 
-        logger.info("[TaskAgent] plan: task=%s..., step_budget=%d, planning_interval=%d",
-                     task[:80], step_budget, planning_interval)
+        # 从 plan 结果中提取选中的技能名
+        selected_skill = plan.get("selected_skill") or plan.get("skill") or None
+        # 校验技能名是否真实存在
+        if selected_skill and self.skill_adapter:
+            if not self.skill_adapter.get(selected_skill):
+                logger.warning("[TaskAgent] plan 选择了不存在的技能 '%s'，忽略", selected_skill)
+                selected_skill = None
+
+        logger.info("[TaskAgent] plan: task=%s..., selected_skill=%s, step_budget=%d",
+                     task[:80], selected_skill, step_budget)
         trace.record("plan_result", {
             "route": "plan",
             "task": task,
+            "selected_skill": selected_skill,
             "step_budget": step_budget,
             "planning_interval": planning_interval,
         })
 
         return {
             "task": task,
+            "selected_skill": selected_skill,
             "step_budget": step_budget,
             "planning_interval": planning_interval,
         }
@@ -774,6 +787,9 @@ class TaskAgent(AgentBase):
         # 覆盖 smolagents 默认 prompt_templates，使用自定义 YAML 模板
         try:
             custom_templates = _load_code_agent_yaml()
+            # deepcopy 隔离全局缓存，避免运行时修改污染后续请求
+            import copy
+            custom_templates = copy.deepcopy(custom_templates)
 
             # 调试：检查 YAML 加载的 planning 内容
             yaml_planning = custom_templates.get("planning", {})
@@ -781,6 +797,22 @@ class TaskAgent(AgentBase):
             if isinstance(yaml_planning, dict):
                 for k, v in yaml_planning.items():
                     logger.info("[TaskAgent] YAML planning['%s'] 前100字符: %s", k, repr(str(v)[:100]))
+
+            # 替换 {{tool_list}} 占位符（在 apply 之前，避免 smolagents 内部处理干扰）
+            planning = custom_templates.get("planning", {})
+            if isinstance(planning, dict) and mcp_tool_list:
+                tool_lines = []
+                for t in mcp_tool_list:
+                    inputs = getattr(t, 'inputs', {}) or {}
+                    params = ', '.join(f"{p}: {i.get('type', 'string')}" for p, i in inputs.items()) if inputs else ''
+                    desc = (getattr(t, 'description', '') or '')[:80]
+                    tool_lines.append(f"  {t.name}({params}) — {desc}")
+                tools_text = '\n'.join(tool_lines)
+                for key in ("initial_plan", "update_plan_pre_messages", "update_plan_post_messages"):
+                    val = planning.get(key, "")
+                    if isinstance(val, str) and "{{tool_list}}" in val:
+                        planning[key] = val.replace("{{tool_list}}", tools_text)
+                        logger.info("[TaskAgent] YAML planning['%s'] 已注入 %d 个工具", key, len(mcp_tool_list))
 
             agent.prompt_templates.update(custom_templates)
             logger.info("[TaskAgent] 已加载自定义 prompt_templates (YAML)")
@@ -934,6 +966,7 @@ class TaskAgent(AgentBase):
 
         try:
             # 创建运行时上下文
+            from resolvers.stock import StockResolver
             ctx = NodeContext(
                 llm=self.llm,
                 memory=self.memory,
@@ -942,6 +975,7 @@ class TaskAgent(AgentBase):
                 system_prompt=self.system_prompt,
                 memory_window_size=self.memory_window_size,
                 max_tool_rounds=self.max_tool_rounds,
+                entity_resolver=StockResolver(),
             )
             ctx.agent = self  # 传递 TaskAgent 实例，供节点调用 _build_code_agent 等方法
             # MCP 延迟初始化：chat_node 不需要 MCP，只在 plan/execute 路径才初始化
