@@ -8,19 +8,20 @@
 输出 JSON:
 {{
   "task": "完整任务描述，CodeAgent 可直接执行",
+  "skill": "技能名或null",
   "step_budget": 10,
   "planning_interval": 6
 }}
 
 规则：
 - task: 完整、自包含的任务描述，包含所有必要上下文
+- skill: 如果任务匹配可用技能，输出技能名（如 "stock-evaluation"）；不匹配则输出 null
 - step_budget: CodeAgent 执行步数预算（简单任务 5-8，复杂任务 10-15）
 - planning_interval: CodeAgent 内部进度检查间隔（默认 6，由系统自动计算）
 - CodeAgent 内部会自动规划工具调用顺序，不需要你拆分步骤
 - 技能名后 [权重:0.xx] 是历史准确率，优先选高的
-- 如果需要使用技能，在 task 中说明
 
 示例：
-"分析300129" → {{"task": "分析300129的多维度数据，给出标准评估结果", "step_budget": 10, "planning_interval": 6}}
-"今天选什么股" → {{"task": "使用 market-screener 技能筛选今日值得关注的标的", "step_budget": 8, "planning_interval": 5}}
-"写一个交易接口" → {{"task": "设计并实现交易接口", "step_budget": 10, "planning_interval": 6}}
+"分析300129" → {{"task": "分析300129的多维度数据，给出标准评估结果", "skill": "stock-evaluation", "step_budget": 10, "planning_interval": 6}}
+"今天选什么股" → {{"task": "使用 market-screener 技能筛选今日值得关注的标的", "skill": "market-screener", "step_budget": 8, "planning_interval": 5}}
+"写一个交易接口" → {{"task": "设计并实现交易接口", "skill": null, "step_budget": 10, "planning_interval": 6}}
