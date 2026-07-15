@@ -171,10 +171,10 @@ def list_tools(category: str) -> str:
 
 
 @mcp.tool()
-def search_tools(query: str) -> str:
+def mcp_search_tools(query: str) -> str:
     """
-    按关键词搜索工具。返回匹配的工具名、描述和所属分类。
-    用于 Agent 不确定工具在哪個分类时，用关键词快速定位。
+    按关键词搜索 MCP 工具。返回匹配的工具名、描述和所属分类。
+    用于 Agent 不确定工具在哪个分类时，用关键词快速定位。
 
     Args:
         query: 搜索关键词（如 '资金流', 'K线', '板块'）

@@ -660,7 +660,7 @@ final_answer:             # 最终回答模板
 │    ├→ Step 1: 规划                                          │
 │    │   └→ 选择工具: get_stock_info, get_realtime_quote, ... │
 │    ├→ Step 2: 执行                                          │
-│    │   └→ mcp(action="call", tool_name="...", args={...})   │
+│    │   └→ tool_name(param="value")                        │
 │    ├→ Step 3: 观察                                          │
 │    │   └→ 获取返回数据                                       │
 │    └→ Step N: final_answer()                                │

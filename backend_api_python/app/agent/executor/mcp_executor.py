@@ -178,7 +178,7 @@ class MCPRouterTool(SmolToolBase):
                     example_args = ", ".join(f"'{k}': '300599'" for k in correct_params)
                     return {
                         "error": f"参数名错误。你用了 {list(args.keys())}，但 {tool_name} 需要 {correct_params}",
-                        "correct_code": f"mcp(action='call', tool_name='{tool_name}', args={{{example_args}}})",
+                        "correct_code": f"{tool_name}({example_args})",
                         "hint": f"复制上面的 correct_code 重试，注意参数名是 {correct_params} 不是 {list(args.keys())}",
                     }
             return {"error": f"Tool '{tool_name}' failed: {e}"}

@@ -40,7 +40,7 @@ from llm.base import ChatMessage, LLMBase
 from memory.base import MemoryBase
 from rag.retriever import Retriever
 from smolagents import Tool as SmolToolBase
-from executor.mcp_executor import MCPRouterTool, MCPExecutor, build_tool_catalog
+from executor.mcp_executor import MCPRouterTool, build_tool_catalog
 from utils.json_parser import safe_parse_json
 from utils.tracing import AgentTraceRecorder, llm_response_to_dict
 
@@ -729,30 +729,59 @@ class TaskAgent(AgentBase):
         phase_id: 阶段ID，用于缓存key前缀。
         """
         from smolagents import CodeAgent as SmolCodeAgent
+        from smolagents.local_python_executor import LocalPythonExecutor
         from smolagents.memory import ActionStep
         from pathlib import Path
 
-        catalog = build_tool_catalog(mcp_tool_list)
+        # ── 构建工具函数字典（直接注入执行上下文）──
+        tool_functions = {}
 
-        router_tool = MCPRouterTool(
-            tool_map={},
-            tool_catalog=catalog,
-        )
+        # MCP 工具：包装为直接可调用的 Python 函数
+        for t in mcp_tool_list:
+            def _make_wrapper(tool_obj):
+                def wrapper(**kwargs):
+                    return tool_obj.forward(**kwargs)
+                wrapper.__name__ = tool_obj.name
+                wrapper.__doc__ = getattr(tool_obj, 'description', '')[:200]
+                return wrapper
+            tool_functions[t.name] = _make_wrapper(t)
 
-        full_tool_map = {t.name: t for t in mcp_tool_list}
+        # 技能工具
         for st in skill_tools:
             sname = getattr(st, "name", "unknown")
-            full_tool_map[sname] = st
+            tool_functions[sname] = st
 
-        mcp_executor = MCPExecutor(
-            router_tool=router_tool,
-            full_tool_map=full_tool_map,
-            additional_authorized_imports=["json", "datetime", "math", "re", "collections", "itertools", "concurrent.futures"],
+        # mcp router（兜底调用）
+        catalog = build_tool_catalog(mcp_tool_list)
+        router_tool = MCPRouterTool(tool_map={t.name: t for t in mcp_tool_list}, tool_catalog=catalog)
+        tool_functions["mcp"] = router_tool.forward
+
+        # search_tools — 工具发现函数（扫描 tools/ 目录，支持领域化搜索）
+        from tools.search_tools import search_tools
+        tool_functions["search_tools"] = search_tools
+
+        # final_answer — 必须通过 additional_functions 注入 static_tools
+        # evaluate_python_code 只对 static_tools 中的 final_answer 包装 FinalAnswerException
+        def _final_answer(answer=None, **kwargs):
+            return answer if answer is not None else kwargs
+
+        # 创建 LocalPythonExecutor（替代 MCPExecutor，简化架构）
+        executor = LocalPythonExecutor(
+            additional_authorized_imports=[
+                "json", "datetime", "math", "re", "collections", "itertools",
+                "concurrent.futures", "queue", "time", "unicodedata", "stat",
+                "statistics", "random", "os", "sys", "pathlib", "importlib",
+                "skills", "skills.*","tools", "tools.*",
+            ],
+            additional_functions={"final_answer": _final_answer},
         )
+        # 注入工具到 custom_tools（不被 send_tools 覆盖）
+        executor.custom_tools = tool_functions
+        logger.info("[TaskAgent] executor 已注入 %d 个工具函数", len(tool_functions))
 
         # tools=[] 是故意的：MCP 工具通过 MCPExecutor router 模式注入，不走 smolagents 原生 Tool。
         # 原因：MCP 工具数量大（70+），注册为 smolagents Tool 会全量写入 system prompt，token 爆炸。
-        # router 模式只注册 mcp 一个工具，LLM 通过 mcp(action="list") 动态发现，mcp(action="call") 调用。
+        # router 模式保留（search_tools + 兜底调用），LLM 通过 mcp(action="list") 动态发现，mcp(action="call") 调用
         # 不要把 MCP 工具往 tools=[] 里塞，那是打补丁，不是正路。详见 mcp_executor.py 注释。
 
         # 阶段内 observations 截断（保留最近 2 步完整，防止 token 爆炸）
@@ -771,7 +800,7 @@ class TaskAgent(AgentBase):
             tools=[],
             model=model,
             max_steps=self.max_tool_rounds,
-            executor=mcp_executor,
+            executor=executor,
             planning_interval=planning_interval,
             step_callbacks=[_truncate_observations],
             instructions=(
