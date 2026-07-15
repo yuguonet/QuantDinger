@@ -4,37 +4,105 @@ from __future__ import annotations
 
 import logging
 import re
+from typing import Optional
 
-from .base import EntityResolver
+from .base import EntityResolver, ResolveResult
 
 logger = logging.getLogger(__name__)
+
+# 中文分隔符
+_SEPARATORS = re.compile(r'[和、，,\s]+')
+# 股票相关动词（清理用）
+_STOCK_VERBS = re.compile(r'分析|看看|查一下|怎么样|什么股|股票|推荐|选|买|卖|对比|比较')
 
 
 class StockResolver(EntityResolver):
     """股票实体解析器。
 
-    解析用户输入中的股票代码或名称：
-      - 6位数字 → 直接识别为股票代码
-      - 中文名称 → 调用 resolve_stock 查询代码
+    解析用户输入中的股票代码或名称，支持多股：
+      - "分析300129" → entities=[{code: "300129"}]
+      - "分析南威软件和雪天盐业" → entities=[{code: "603636"}, {code: "600929"}]
+      - effective_input 含标准分析指令
     """
 
-    def resolve(self, user_input: str) -> dict | None:
+    def resolve(self, user_input: str) -> Optional[ResolveResult]:
         try:
             from tools.data_tools import resolve_stock
-            code_match = re.search(r'\b(\d{6})\b', user_input)
-            if code_match:
-                code = code_match.group(1)
-                return {"code": code, "name": "", "type": "stock"}
+        except ImportError:
+            return None
 
-            clean_input = re.sub(r'分析|看看|查一下|怎么样|什么股|股票|推荐|选|买|卖', '', user_input).strip()
-            if clean_input and len(clean_input) >= 2:
-                result = resolve_stock(clean_input, limit=1)
-                if isinstance(result, dict) and not result.get('error'):
-                    if result.get('code'):
-                        return {"code": result['code'], "name": result.get('name', ''), "type": "stock"}
-                    elif result.get('data'):
-                        first = result['data'][0]
-                        return {"code": first.get('code', ''), "name": first.get('name', ''), "type": "stock"}
-        except Exception as e:
-            logger.debug("[StockResolver] 解析跳过: %s", e)
-        return None
+        entities = []
+
+        # 1. 提取所有6位股票代码
+        codes = re.findall(r'\b(\d{6})\b', user_input)
+        for code in codes:
+            # 查询代码对应的名称
+            name = ""
+            try:
+                info = resolve_stock(code, limit=1)
+                if isinstance(info, dict) and info.get('name'):
+                    name = info['name']
+                elif isinstance(info, dict) and info.get('data'):
+                    name = info['data'][0].get('name', '')
+            except Exception:
+                pass
+            entities.append({"code": code, "name": name, "type": "stock"})
+
+        # 2. 提取中文股票名称（去掉动词后按分隔符拆分）
+        clean_input = _STOCK_VERBS.sub('', user_input).strip()
+        for code in codes:
+            clean_input = clean_input.replace(code, '')
+        clean_input = clean_input.strip()
+
+        if clean_input:
+            names = [n.strip() for n in _SEPARATORS.split(clean_input) if n.strip() and len(n.strip()) >= 2]
+            for name in names:
+                if name in [e['code'] for e in entities]:
+                    continue
+                try:
+                    result = resolve_stock(name, limit=1)
+                    if isinstance(result, dict) and not result.get('error'):
+                        if result.get('code'):
+                            entities.append({"code": result['code'], "name": result.get('name', ''), "type": "stock"})
+                        elif result.get('data'):
+                            first = result['data'][0]
+                            entities.append({"code": first.get('code', ''), "name": first.get('name', ''), "type": "stock"})
+                except Exception as e:
+                    logger.debug("[StockResolver] 解析 '%s' 跳过: %s", name, e)
+
+        # 去重
+        seen = set()
+        unique = []
+        for e in entities:
+            if e['code'] and e['code'] not in seen:
+                seen.add(e['code'])
+                unique.append(e)
+
+        if not unique:
+            return None
+
+        # 构建结果
+        entity_code = ",".join(e['code'] for e in unique)
+        entity_name = ",".join(e['name'] for e in unique if e['name'])
+        entity_type = "stock"
+
+        # 扩写：将代码/名称注入原始消息
+        # "分析南威软件和雪天盐业" → "分析南威软件(603636)和雪天盐业(600929)"
+        # "分析泰胜风能和300497" → "分析泰胜风能(300129)和海辰药业(300497)"
+        effective_input = user_input
+        for e in unique:
+            if e['name'] and e['code']:
+                if e['name'] in effective_input:
+                    # 用户输入了名称：替换名称为 名称(代码)
+                    effective_input = effective_input.replace(e['name'], f"{e['name']}({e['code']})", 1)
+                elif e['code'] in effective_input:
+                    # 用户输入了代码：替换代码为 名称(代码)
+                    effective_input = effective_input.replace(e['code'], f"{e['name']}({e['code']})", 1)
+
+        return ResolveResult(
+            entities=unique,
+            entity_code=entity_code,
+            entity_name=entity_name,
+            entity_type=entity_type,
+            effective_input=effective_input,
+        )
