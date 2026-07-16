@@ -18,6 +18,7 @@ import os
 import re
 import time
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import requests
 
@@ -61,6 +62,37 @@ def _clean(text: str) -> str:
     text = re.sub(r"<[^>]+>", "", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+def _normalize_title(title: str) -> str:
+    """标题归一化：去标点、去空白、统一小写，用于去重判断。"""
+    if not title:
+        return ""
+    t = re.sub(r"[^\w\u4e00-\u9fff]", "", title)
+    t = t.lower().strip()
+    return t
+
+
+def _deduplicate(results: List[Dict]) -> List[Dict]:
+    """基于归一化标题 + URL 域名联合去重。"""
+    seen = set()
+    unique = []
+    for r in results:
+        title_key = _normalize_title(r.get("title", ""))
+        url_domain = ""
+        url = r.get("url", "")
+        if url:
+            try:
+                url_domain = urlparse(url).netloc.lower()
+            except Exception:
+                pass
+        dedup_key = f"{title_key}|{url_domain}"
+
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+        unique.append(r)
+    return unique
 
 
 def _ok(results, provider, **extra) -> Dict[str, Any]:
@@ -143,7 +175,6 @@ def _tavily_search(query: str, count: int = 8, days: int = 7) -> Dict[str, Any]:
         from tavily import TavilyClient
         client = TavilyClient(api_key=_TAVILY_API_KEY)
 
-        # days → Tavily topic + days 参数
         search_depth = "advanced" if count > 5 else "basic"
         response = client.search(
             query=query,
@@ -198,12 +229,10 @@ def _baidu_search(query: str, count: int = 8) -> Dict[str, Any]:
         results = []
         for item in raw:
             title = _clean(item.get("title", ""))
-            # baidusearch 返回 url 或 href 字段，可能是相对路径
             url = _clean(item.get("url", "") or item.get("href", ""))
             snippet = _clean(item.get("abstract", "") or item.get("snippet", ""))
             if not title:
                 continue
-            # 补全相对路径
             if url and not url.startswith("http"):
                 url = "https://www.baidu.com" + url
             if not url:
@@ -293,6 +322,8 @@ def _unified_search(query: str, count: int = 8, freshness: str = "",
         result = fn(query, count, freshness)
         if result["success"]:
             result["query"] = query
+            # 写入缓存前去重
+            result["results"] = _deduplicate(result.get("results", []))
             _cache_set(cache_key, result)
             return result
         errors.append(f"{name}: {result.get('error', '?')}")
@@ -327,11 +358,11 @@ def web_search(query: str, count: int = 8, freshness: str = "") -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  输出格式化
+#  输出格式化（去重归一化 + 去掉 url）
 # ═══════════════════════════════════════════════════════════════
 
 def _format_output(result: Dict[str, Any]) -> dict:
-    """统一输出格式。"""
+    """统一输出格式：去掉 url，基于标题归一化二次去重。"""
     output = {
         "success": result["success"],
         "provider": result["provider"],
@@ -340,12 +371,22 @@ def _format_output(result: Dict[str, Any]) -> dict:
     if result.get("summary"):
         output["ai_summary"] = result["summary"]
 
+    # 二次去重：基于归一化标题
+    seen_titles = set()
+    unique_results = []
+    for r in result.get("results", []):
+        title_key = _normalize_title(r.get("title", ""))
+        if not title_key or title_key in seen_titles:
+            continue
+        seen_titles.add(title_key)
+        unique_results.append(r)
+
     output["results"] = []
-    for i, r in enumerate(result.get("results", []), 1):
+    for i, r in enumerate(unique_results, 1):
         entry = {
             "index": i,
             "title": r["title"],
-            "url": r["url"],
+            # url 已去掉，不再输出
             "snippet": r["snippet"][:300] if r.get("snippet") else "",
             "source": r.get("source", ""),
             "published": r.get("published", ""),
