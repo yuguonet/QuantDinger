@@ -3,7 +3,7 @@
 stock_report — 从工具结果生成个股分析报告（纯规则，0 幻觉）
 
 完全兼容 OpenAI Function Calling 标准。
-MCP 自动发现：函数名 = MCP 工具名 = stock_report。
+函数名 = 工具名 = stock_report，由 list_tools 自动发现。
 """
 from __future__ import annotations
 

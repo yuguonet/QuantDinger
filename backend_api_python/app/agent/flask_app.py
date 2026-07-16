@@ -102,7 +102,7 @@ def info():
 
 @agent_v2_bp.route("/tools", methods=["GET"])
 def list_tools():
-    return jsonify({"total": 0, "tools": [], "note": "工具由 MCP 动态发现"})
+    return jsonify({"total": 0, "tools": [], "note": "工具通过 list_tools/search_tools 动态发现"})
 
 
 @agent_v2_bp.route("/skills", methods=["GET"])

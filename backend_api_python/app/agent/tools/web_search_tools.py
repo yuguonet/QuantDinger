@@ -311,7 +311,7 @@ def _unified_search(query: str, count: int = 8, freshness: str = "",
 
 def web_search(query: str, count: int = 8, freshness: str = "") -> dict:
     """
-    联网搜索 — 获取实时互联网信息。用于查询最新新闻、政策、市场动态、公司公告等。
+    联网搜索 — 获取互联网实时信息。任何工具无法覆盖的查询（天气、新闻、百科、实时数据等）都可使用。
 
     Args:
         query: 搜索关键词，支持自然语言（如 "2025年央行降准最新消息"）

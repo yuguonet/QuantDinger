@@ -1,6 +1,6 @@
 # QuantDinger Agent 模块设计文档
 
-> 最后更新: 2026-07-14
+> 最后更新: 2026-07-15
 > 版本: v1.0
 > 状态: 生产环境运行中
 
@@ -69,7 +69,7 @@ Agent 模块是 QuantDinger 系统的智能决策核心，负责：
 │                                                                                 │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐        │
 │  │    RAG       │  │    LLM       │  │    Tools     │  │   Skills     │        │
-│  │  检索增强    │  │  大模型调用  │  │  MCP 工具集  │  │  技能系统    │        │
+│  │  检索增强    │  │  大模型调用  │  │  工具集      │  │  技能系统    │        │
 │  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘        │
 └─────────────────────────────────────────────────────────────────────────────────┘
           │
@@ -131,10 +131,9 @@ backend_api_python/app/agent/
 │   ├── postgres_memory.py # PostgreSQL 实现
 │   └── redis_memory.py   # Redis 实现
 │
-├── executor/             # 执行器
-│   └── mcp_executor.py   # MCP 工具执行器
-│
 ├── tools/                # 工具集（102 个）
+│   ├── list_tools.py     # 工具发现（扫描 tools/ 目录）
+│   ├── search_tools.py   # 工具搜索（按关键词匹配）
 │   ├── data_tools.py     # 数据查询
 │   ├── analysis_tools.py # 技术分析
 │   ├── indicator_tools.py # 指标计算
@@ -258,13 +257,14 @@ class AgentState(TypedDict):
 task + context
   │
   ├─→ 构建 CodeAgent
-  │     ├─→ 加载 MCP 工具（102）
+  │     ├─→ 扫描加载 tools/*.py 工具函数
   │     ├─→ 加载 Skill 工具
-  │     ├─→ 注入工具到 planning prompt
   │     └─→ 加载自定义 YAML 模板
   │
   ├─→ CodeAgent.run(task)
   │     └─→ ReAct 循环：思考 → 代码 → 观察
+  │           ├─→ list_tools() 发现可用工具
+  │           └─→ search_tools("关键词") 搜索工具
   │
   ├─→ 提取失败工具
   │
@@ -276,24 +276,31 @@ task + context
 #### 核心职责
 
 - 构建 smolagents CodeAgent 实例
-- 管理 MCP 连接（单例常驻）
-- 注入工具到 planning prompt
+- 扫描加载 tools/*.py 工具函数
 - 执行 ReAct 循环
 
 #### CodeAgent 构建
 
 ```python
-def _build_code_agent(self, model, mcp_tool_list, skill_tools, ...):
-    # 1. 构建工具目录
-    catalog = build_tool_catalog(mcp_tool_list)
+def _build_code_agent(self, model, skill_tools, ...):
+    # 1. 扫描 tools/ 目录，加载所有工具函数
+    tool_functions = {}
+    for py_file in sorted(tools_dir.glob("*.py")):
+        mod = importlib.import_module(f"tools.{py_file.stem}")
+        for attr_name in dir(mod):
+            func = getattr(mod, attr_name)
+            if callable(func) and not inspect.isclass(func):
+                tool_functions[attr_name] = func
 
-    # 2. 创建 MCP 路由工具
-    router_tool = MCPRouterTool(tool_map={}, tool_catalog=catalog)
+    # 2. 注入 list_tools / search_tools
+    tool_functions["list_tools"] = list_tools
+    tool_functions["search_tools"] = search_tools
 
-    # 3. 创建 MCP 执行器
-    executor = MCPExecutor(router_tool=router_tool, full_tool_map=...)
+    # 3. 创建 LocalPythonExecutor（工具注入 custom_tools）
+    executor = LocalPythonExecutor(...)
+    executor.custom_tools = tool_functions
 
-    # 4. 创建 CodeAgent（tools=[]，通过 MCPExecutor 注入）
+    # 4. 创建 CodeAgent（tools=[]，通过 executor 注入）
     agent = SmolCodeAgent(tools=[], model=model, executor=executor, ...)
 
     # 5. 加载自定义 YAML 模板
@@ -302,22 +309,18 @@ def _build_code_agent(self, model, mcp_tool_list, skill_tools, ...):
     return agent
 ```
 
-#### MCP 单例连接
+#### 工具发现机制
+
+工具不写入 system prompt，通过 list_tools/search_tools 动态发现：
 
 ```python
-class _MCPSingleton:
-    """MCP 常驻连接，避免每次请求重复启动"""
-    _tools: list | None      # 工具列表
-    _ctx: ToolCollection     # 上下文管理器
-    _lock: threading.Lock    # 线程锁
-
-    def _ensure() -> bool    # 懒加载
-    @property
-    def tools() -> list      # 获取工具列表
-    @property
-    def available() -> bool  # 是否可用
-    def close()              # 关闭连接
+# LLM 在 CodeAgent 中调用
+tools = list_tools()              # 列出所有可用工具
+tools = list_tools("all")        # 列出所有领域工具
+result = search_tools("资金")    # 按关键词搜索
 ```
+
+优势：工具数量增长不影响 prompt token，102 个工具与 10 个工具的 token 开销相同。
 
 ### 3.4 RAG 检索增强 (`rag/`)
 
@@ -446,25 +449,26 @@ def create_llm(config) -> LLMBase:
 | 联网搜索 | 12 | Bocha/Tavily/百度/SearXNG |
 | 选股筛选 | 6 | 条件选股、板块筛选 |
 | 其他工具 | 50+ | 资金流、龙虎榜、回测等 |
-| **总计** | **102** | 自动注册到 MCP |
+| **总计** | **102** | 自动扫描注册 |
 
-#### MCP 集成
+#### 工具发现与调用
 
-工具通过 MCP（Model Context Protocol）暴露给 CodeAgent：
+工具通过 `list_tools` / `search_tools` 动态发现，不写入 system prompt：
 
 ```python
-class MCPExecutor:
-    """MCP 工具执行器"""
-    router_tool: MCPRouterTool
-    full_tool_map: dict
+# 工具发现（list_tools.py）
+def list_tools(domain: str = "") -> str:
+    """扫描 tools/ 目录，列出所有可用工具"""
 
-    def call_tool(name, args) -> Any  # 调用工具
-
-class MCPRouterTool:
-    """MCP 路由工具（smolagents Tool）"""
-    def forward(action, tool_name, args) -> str
-    # action: "list" | "call"
+def search_tools(query: str, domain: str = "") -> str:
+    """按关键词搜索工具"""
 ```
+
+工作原理：
+- 工具函数通过 `executor.custom_tools` 注入执行命名空间
+- 工具**可调用但不占 prompt token**
+- LLM 需要时调 `list_tools()` 或 `search_tools("关键词")` 动态发现
+- 102 个工具与 10 个工具的 prompt 开销相同（~100 token）
 
 #### 联网搜索 (`web_search_tools.py`)
 
@@ -652,8 +656,7 @@ final_answer:             # 最终回答模板
 │ execute_node                                                │
 │                                                             │
 │ 1. 构建 CodeAgent                                           │
-│    ├→ 加载 MCP 工具 (102个)                                  │
-│    ├→ 注入工具到 planning prompt                             │
+│    ├→ 扫描加载 tools/*.py 工具函数                          │
 │    └→ 加载 YAML 模板                                        │
 │                                                             │
 │ 2. CodeAgent.run(task)                                      │
@@ -758,12 +761,6 @@ AGENT_MAX_STEPS=6
 AGENT_ENV=development
 
 # ═══════════════════════════════════════════════════════════════
-#  MCP 配置
-# ═══════════════════════════════════════════════════════════════
-AGENT_MCP_SERVER_CMD=python
-AGENT_MCP_SERVER_ARGS=app/agent/tools/mcp_bridge.py
-
-# ═══════════════════════════════════════════════════════════════
 #  联网搜索配置
 # ═══════════════════════════════════════════════════════════════
 BOCHA_AI_API_KEY=***                    # 博查 AI（推荐）
@@ -857,7 +854,7 @@ def my_tool(param1: str, param2: int) -> dict:
     return {"result": "...", "_fields": ["result"]}
 ```
 
-工具自动被 `mcp_bridge.py` 发现并注册。
+工具自动被 `list_tools` 发现并注册。
 
 ### 7.2 添加新技能
 
@@ -927,11 +924,11 @@ if provider == "my": return MyEmbedding(...)
 
 ## 八、性能优化
 
-### 8.1 MCP 连接优化
+### 8.1 工具发现优化
 
-- **常驻连接**：首次启动 2-3s，后续 0 开销
-- **单例模式**：进程内只维护一个连接
-- **懒加载**：首次调用时才启动子进程
+- **动态发现**：工具不写入 system prompt，运行时按需发现
+- **零启动开销**：无子进程启动，工具直接在 executor 命名空间
+- **token 节省**：102 个工具仅占 ~100 prompt token（list_tools 描述）
 
 ### 8.2 RAG 优化
 
@@ -992,7 +989,6 @@ class TraceCollector:
 | `[Execute]` | execute_node 相关 |
 | `[Finalize]` | finalize_node 相关 |
 | `[RAG]` | RAG 检索相关 |
-| `[MCP]` | MCP 连接相关 |
 | `[Inject]` | 工具注入相关 |
 | `[WebSearch]` | 联网搜索相关 |
 
@@ -1077,7 +1073,7 @@ data: {"type": "done", "content": "**股票名称**: ...", "session_id": "..."}
 
 ### GET /api/agent-v2/tools
 
-工具列表（由 MCP 动态发现）
+工具列表（通过 list_tools 动态发现）
 
 ### GET /api/agent-v2/skills
 

@@ -100,7 +100,7 @@ def _print_info():
 
 def _list_tools():
     """列出所有工具。"""
-    print("\n🔧 工具由 MCP 动态发现，启动时自动加载。")
+    print("\n🔧 工具通过 list_tools/search_tools 动态发现。")
 
 
 def _list_skills():
@@ -180,12 +180,7 @@ def main():
                         import traceback
                         traceback.print_exc()
             finally:
-                # 退出时关闭 MCP 连接，避免 "Cannot close a running event loop" 警告
-                try:
-                    from agents.task_agent import _mcp
-                    _mcp.close()
-                except Exception:
-                    pass
+                pass
 
         asyncio.run(_interactive_loop())
 
