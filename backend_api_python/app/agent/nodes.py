@@ -133,6 +133,13 @@ class NodeContext:
 #  节点函数
 # ═══════════════════════════════════════════════════════════════
 
+def _expand_entity_query(user_input: str, entity_name: str, entity_code: str, entity_type: str) -> str:
+    """将简短的实体分析指令扩写为完整的分析指令。"""
+    # 默认分析参数（后续从 formatter rules.yaml 读取）
+    default_params = "周期：T+3（T+1/T+3/1W/1M），深度：标准（简单/标准/深度）"
+    return f"分析{entity_name}({entity_code}): {user_input}，{default_params}"
+
+
 def _set_llm_timeout(agent, timeout_seconds: int):
     """设置 LLM 超时（直接改底层 OpenAI 客户端，而非 model 属性）。"""
     try:
@@ -217,12 +224,10 @@ def make_chat_node(ctx: NodeContext):
             except Exception as e:
                 logger.warning("[Chat] RAG 检索失败: %s", e)
 
-        # ── 2. 实体解析 ──
+        # ── 2. 实体解析（RAG 上下文辅助）──
         entity_code = ""
         entity_name = ""
         entity_type = ""
-        effective_input = user_input
-
         # RAG 辅助：用户消息无明确代码时，从 context 中提取最近分析的标的
         resolve_input = user_input
         if context and not re.search(r'\b\d{6}\b', user_input):
@@ -230,25 +235,21 @@ def make_chat_node(ctx: NodeContext):
             if code_match:
                 resolve_input = f"{user_input} {code_match.group(1)}"
                 logger.info("[Chat] RAG 辅助实体解析: 注入代码 %s", code_match.group(1))
-
         if ctx.entity_resolver:
             try:
-                result = ctx.entity_resolver.resolve(resolve_input)
-                if result:
-                    entity_code = result.entity_code
-                    entity_name = result.entity_name
-                    entity_type = result.entity_type
-                    effective_input = result.effective_input or user_input
+                entity = ctx.entity_resolver.resolve(resolve_input)
+                if entity:
+                    entity_code = entity.get("code", "")
+                    entity_name = entity.get("name", "")
+                    entity_type = entity.get("type", "")
                     logger.info("[Chat] 实体解析: %s → %s %s (%s)", user_input, entity_code, entity_name, entity_type)
             except Exception as e:
                 logger.debug("[Chat] 实体解析跳过: %s", e)
 
-        # ── 3. 注入当前日期上下文 ──
-        from datetime import datetime, timedelta
-        _now = datetime.now()
-        _yesterday = (_now - timedelta(days=1)).strftime("%Y-%m-%d")
-        _today = _now.strftime("%Y-%m-%d")
-        effective_input = f"[当前日期: {_today}，昨天: {_yesterday}] {effective_input}"
+        # ── 3. 消息标准化 ──
+        effective_input = user_input
+        if entity_code and entity_name:
+            effective_input = _expand_entity_query(user_input, entity_name, entity_code, entity_type)
 
         # ── 4. 意图分类：是否需要任务流程 ──
         needs_task = True

@@ -1239,7 +1239,7 @@ def main():
         help="Coordinator 全局超时秒数（默认 120）")
     parser.add_argument("--preferred-source", default="",
         help="指定首选数据源")
-    parser.add_argument("--adj", default="qfq", choices=["qfq", "hfq", ""],
+    parser.add_argument("--adj", default="", choices=["qfq", "hfq", ""],
         help="复权方式")
     parser.add_argument("--start-date", default="",
         help="数据起始日期 (YYYY-MM-DD)，默认按 timeframe 自动选择 (1D→2021-01-04, 15m→2024-01-02)")

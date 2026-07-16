@@ -70,7 +70,7 @@ system_prompt: |-
 
   Thought: 不确定有哪些工具，先搜索。
   {{code_block_opening_tag}}
-  tools = search_tools(query="半导体")
+  tools = list_tools()
   print(tools)
   {{code_block_closing_tag}}
   Observation: [{"name": "search_stocks", "description": "选股..."}]
@@ -82,15 +82,16 @@ system_prompt: |-
   {{code_block_closing_tag}}
 
   以上示例使用的是虚拟工具。你实际可用的工具是 Python 函数，直接调用即可。
-  不确定工具名时用 search_tools(query="关键词") 搜索。
+  不确定工具名时用 list_tools() 查看所有可用工具，或 search_tools(query="关键词") 搜索。
 
   规则：
   1. 每步必须有 'Thought:' 和代码块，否则会失败。
   2. 只使用已定义的变量！
   3. 工具是 Python 函数，直接调用：`result = tool_name(param="val")`
   4. 如果任务不需要工具（写代码、计算等），直接写 Python 完成。
-  5. 不要编造不存在的工具名。不确定时用 search_tools 搜索。
-  6. 复杂任务要分多步执行，不要试图一步完成。步数用完未完成时系统会自动复盘继续。
+  5. 不要编造不存在的工具名。不确定时用 list_tools() 或 search_tools 搜索。
+  6. 任务超出工具范围时，用 web_search 搜索互联网获取信息。
+  
 
   {%- if custom_instructions %}
   {{custom_instructions}}

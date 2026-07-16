@@ -732,48 +732,52 @@ class TaskAgent(AgentBase):
         from smolagents.local_python_executor import LocalPythonExecutor
         from smolagents.memory import ActionStep
         from pathlib import Path
-        import importlib
 
-        # ── 加载工具（直接扫描 tools/ 目录）──
-        from tools.search_tools import search_tools
+        # ── 构建工具函数字典（直接注入执行上下文）──
         tool_functions = {}
-        for py_file in sorted((Path(__file__).resolve().parent.parent / "tools").glob("*.py")):
-            if py_file.stem in {"__init__", "base", "registry", "em_utils", "pagination",
-                                "screener_config", "mcp_bridge", "cache_tools", "search_tools"}:
-                continue
-            try:
-                mod = importlib.import_module(f"tools.{py_file.stem}")
-            except Exception:
-                continue
-            for attr_name in dir(mod):
-                if attr_name.startswith("_"):
-                    continue
-                func = getattr(mod, attr_name)
-                if callable(func) and not inspect.isclass(func) and getattr(func, "__module__", "") == mod.__name__:
-                    tool_functions[attr_name] = func
+
+        # MCP 工具：包装为直接可调用的 Python 函数
+        for t in mcp_tool_list:
+            def _make_wrapper(tool_obj):
+                def wrapper(**kwargs):
+                    return tool_obj.forward(**kwargs)
+                wrapper.__name__ = tool_obj.name
+                wrapper.__doc__ = getattr(tool_obj, 'description', '')[:200]
+                return wrapper
+            tool_functions[t.name] = _make_wrapper(t)
 
         # 技能工具
         for st in skill_tools:
-            tool_functions[getattr(st, "name", "unknown")] = st
+            sname = getattr(st, "name", "unknown")
+            tool_functions[sname] = st
 
-        # search_tools — 工具发现函数
+        # mcp router（兜底调用）
+        catalog = build_tool_catalog(mcp_tool_list)
+        router_tool = MCPRouterTool(tool_map={t.name: t for t in mcp_tool_list}, tool_catalog=catalog)
+        tool_functions["mcp"] = router_tool.forward
+
+        # search_tools — 工具发现函数（扫描 tools/ 目录，支持领域化搜索）
+        from tools.search_tools import search_tools
+        from tools.list_tools import list_tools
         tool_functions["search_tools"] = search_tools
+        tool_functions["list_tools"] = list_tools
 
         # final_answer — 必须通过 additional_functions 注入 static_tools
+        # evaluate_python_code 只对 static_tools 中的 final_answer 包装 FinalAnswerException
         def _final_answer(answer=None, **kwargs):
             return answer if answer is not None else kwargs
 
-        # 创建 LocalPythonExecutor
+        # 创建 LocalPythonExecutor（替代 MCPExecutor，简化架构）
         executor = LocalPythonExecutor(
             additional_authorized_imports=[
                 "json", "datetime", "math", "re", "collections", "itertools",
                 "concurrent.futures", "queue", "time", "unicodedata", "stat",
                 "statistics", "random", "os", "sys", "pathlib", "importlib",
                 "skills", "skills.*",
-                "tools", "tools.*",
             ],
             additional_functions={"final_answer": _final_answer},
         )
+        # 注入工具到 custom_tools（不被 send_tools 覆盖）
         executor.custom_tools = tool_functions
         logger.info("[TaskAgent] executor 已注入 %d 个工具函数", len(tool_functions))
 
