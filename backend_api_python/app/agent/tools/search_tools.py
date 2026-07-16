@@ -27,7 +27,7 @@ def search_tools(query: str, domain: str = "") -> str:
         search_tools("", "all")           # 空关键词，等同于 list_tools("all")
     """
     if not query:
-        return list_tools(domain) if domain else list_tools()
+        return "请提供搜索关键词。"
 
     query_lower = query.lower()
     all_tools = _scan_tools(domain)
@@ -36,7 +36,7 @@ def search_tools(query: str, domain: str = "") -> str:
                if query_lower in t["name"].lower() or query_lower in t["desc"].lower()]
 
     if not matched:
-        return f"未找到匹配 '{query}' 的工具。请使用 list_tools() 查看所有可用工具，或 list_tools('all') 查看所有领域工具。"
+        return f"未找到匹配 '{query}' 的工具。请使用 mcp(action='list') 查看所有可用工具。"
 
     title = f"找到 {len(matched)} 个工具："
 
