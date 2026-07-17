@@ -14,6 +14,7 @@ nodes.py — Graph 节点定义
 """
 from __future__ import annotations
 
+import inspect
 import logging
 import re
 import time
@@ -57,6 +58,7 @@ class AgentState(TypedDict, total=False):
     # ── plan_node 输出 ──
     task: str             # 完整任务描述
     selected_skill: str   # plan 选中的技能名（None=无技能）
+    selected_domain: str  # plan 选中的领域名（空=仅通用工具）
     skill_body: str       # 选中技能的 SKILL.md 正文
     skill_tools: list     # 选中技能的工具列表（_SkillResourceTool + _SkillFuncTool）
     step_budget: int      # CodeAgent 本轮步数预算
@@ -108,8 +110,8 @@ class NodeContext:
         self.max_tool_rounds = max_tool_rounds
         self.entity_resolver = entity_resolver  # 由外部注入（如 StockResolver）
 
-        # MCP 运行时（惰性初始化）
-        self.mcp_tool_list = []
+        # ToolProvider 运行时（惰性初始化）
+        self.tool_provider = None
         self.model = None
 
         # TaskAgent 实例（用于调用 _build_code_agent 等方法）
@@ -118,16 +120,26 @@ class NodeContext:
         # TraceCollector（session 级）
         self.collectors: Dict[str, Any] = {}
 
-    def init_mcp(self):
-        """初始化 MCP 连接。"""
-        from agents.task_agent import _mcp, _LLMAdapter
+    def init_tools(self):
+        """初始化 ToolProvider（扫描 tools/ 目录）+ LLM 适配器。"""
+        from tools.base import ToolProvider
+        from agents.task_agent import _LLMAdapter
+        from pathlib import Path
 
-        if _mcp.available:
-            self.mcp_tool_list = _mcp.tools
-            self.model = _LLMAdapter(self.llm)
-            logger.info("[Context] MCP 初始化完成: %d 个工具", len(self.mcp_tool_list))
-        else:
-            logger.error("[Context] MCP 不可用")
+        tools_dir = Path(__file__).resolve().parent / "tools"
+        provider = ToolProvider()
+        # 扫描 tools/ 根目录（通用工具）
+        provider.scan_directory(tools_dir, domain="common", package_prefix="tools")
+        # 扫描 tools/ 子目录（领域工具）
+        provider.scan_subdirectories(tools_dir, package_prefix="tools")
+
+        self.tool_provider = provider
+        self.model = _LLMAdapter(self.llm)
+
+        # 设置全局默认 provider，供工具内部调用
+        ToolProvider.set_default(provider)
+
+        logger.info("[Context] ToolProvider 初始化完成: %d 个工具", len(provider))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -156,17 +168,12 @@ def _set_llm_timeout(agent, timeout_seconds: int):
         logger.debug("[Execute] 设置超时失败: %s", e)
 
 
-def _extract_failed_tools(agent, mcp_tool_list: list = None) -> list:
+def _extract_failed_tools(agent, tool_provider=None) -> list:
     """从 agent memory 中提取失败工具。
 
-    MCPExecutor._call_tool() 在工具返回含 error 的 dict 时，
-    会添加 '_failed_tool' 字段标记工具名。这里从 observations 中提取。
+    工具返回含 error 的 dict 时，observations 中会标记失败。
+    这里从 observations 中提取失败工具名。
     """
-    tool_desc = {}
-    if mcp_tool_list:
-        for t in mcp_tool_list:
-            tool_desc[t.name] = getattr(t, 'description', '') or ''
-
     failed = []
     seen = set()
     try:
@@ -180,7 +187,12 @@ def _extract_failed_tools(agent, mcp_tool_list: list = None) -> list:
                 name = m.group(1)
                 if name and name not in seen:
                     seen.add(name)
-                    failed.append((name, tool_desc.get(name, '')))
+                    desc = ""
+                    if tool_provider:
+                        func = tool_provider.get(name)
+                        if func:
+                            desc = (inspect.getdoc(func) or "").split("\n")[0][:60]
+                    failed.append((name, desc))
     except Exception:
         pass
     return failed
@@ -243,6 +255,10 @@ def make_chat_node(ctx: NodeContext):
                     # 直接用 resolver 生成的 effective_input（含实体注入+扩写）
                     if entity.get("effective_input"):
                         effective_input = entity["effective_input"]
+                    elif entity_code:
+                        # resolver 没生成 effective_input，手动注入实体信息
+                        entity_desc = f"{entity_name}({entity_code})" if entity_name else entity_code
+                        effective_input = f"{user_input} 【实体】{entity_desc} [{entity_type}]"
                     logger.info("[Chat] 实体解析: %s → %s %s (%s)", user_input, entity_code, entity_name, entity_type)
             except Exception as e:
                 logger.debug("[Chat] 实体解析跳过: %s", e)
@@ -358,11 +374,11 @@ def make_plan_node(ctx: NodeContext):
         entity_type = state.get("entity_type", "")
         task_type = state.get("task_type", "")
 
-        # MCP 延迟初始化（首次进入任务流程时才启动，直接回答路径跳过）
-        if not ctx.mcp_tool_list:
-            ctx.init_mcp()
-        if not ctx.mcp_tool_list:
-            logger.error("[Plan] MCP 不可用，退回直接回答")
+        # ToolProvider 延迟初始化（首次进入任务流程时才扫描，直接回答路径跳过）
+        if not ctx.tool_provider:
+            ctx.init_tools()
+        if not ctx.tool_provider:
+            logger.error("[Plan] ToolProvider 不可用，退回直接回答")
             direct = await ctx.llm.generate(messages=[
                 ChatMessage(role="system", content=ctx.system_prompt),
                 ChatMessage(role="user", content=effective_input),
@@ -379,11 +395,20 @@ def make_plan_node(ctx: NodeContext):
             replan_context = f"\n\n【前轮执行结果（步数耗尽）】\n{prev_result[:2000]}\n请基于上述进度继续完成任务。"
             logger.info("[Plan] 复盘第 %d 轮，前轮结果 %d 字符", replan_count, len(prev_result))
 
-        # 组装 plan 输入：扩写消息 + 实体信息 + RAG 上下文 + 复盘结果
-        plan_parts = [effective_input]
-        if entity_code:
-            entity_desc = f"{entity_name}({entity_code})" if entity_name else entity_code
-            plan_parts.append(f"【实体】{entity_desc} [{entity_type}]")
+        # 加载历史对话
+        history_text = ""
+        if ctx.memory:
+            try:
+                history = await ctx.memory.get_history(state.get("session_id", "default"), limit=ctx.memory_window_size)
+                if history:
+                    history_lines = []
+                    for msg in history[-10:]:  # 最近 10 条
+                        role = "用户" if msg.role == "user" else "助手"
+                        history_lines.append(f"{role}: {msg.content[:300]}")
+                    history_text = "\n".join(history_lines)
+            except Exception as e:
+                logger.debug("[Plan] 加载历史对话失败: %s", e)
+
         # 意图类型映射
         _TASK_TYPE_DESC = {
             "analysis": "分析/评估/诊断",
@@ -394,12 +419,43 @@ def make_plan_node(ctx: NodeContext):
             "explain": "解释/说明/教学",
             "general": "通用任务",
         }
+
+        # 设置分离的上下文变量，供 _plan() 模板使用
+        entity_info_str = ""
+        if entity_code:
+            entity_desc = f"{entity_name}({entity_code})" if entity_name else entity_code
+            entity_info_str = f"【实体】{entity_desc} [{entity_type}]"
+
+        task_type_str = ""
         if task_type:
-            plan_parts.append(f"【意图】{_TASK_TYPE_DESC.get(task_type, task_type)}")
+            task_type_str = f"【意图】{_TASK_TYPE_DESC.get(task_type, task_type)}"
+
+        rag_context_str = ""
+        if context:
+            rag_context_str = f"【参考上下文】\n{context[:1500]}"
+
+        history_context_str = ""
+        if history_text:
+            history_context_str = f"【历史对话】\n{history_text}"
+
+        # 传递给 _plan() 的 agent 实例
+        ctx.agent._plan_entity_info = entity_info_str
+        ctx.agent._plan_task_type_info = task_type_str
+        ctx.agent._plan_rag_context = rag_context_str
+        ctx.agent._plan_history_context = history_context_str
+
+        # 组装 plan 输入（保留拼接版本作为 task 的基础）
+        plan_parts = [effective_input]
+        if entity_info_str:
+            plan_parts.append(entity_info_str)
+        if task_type_str:
+            plan_parts.append(task_type_str)
         if original_input != effective_input:
             plan_parts.append(f"【原始消息】{original_input}")
         if context:
             plan_parts.append(f"【参考上下文】\n{context[:1500]}")
+        if history_text:
+            plan_parts.append(f"【历史对话】\n{history_text}")
         if replan_context:
             plan_parts.append(replan_context)
         plan_input = "\n\n".join(plan_parts)
@@ -434,6 +490,7 @@ def make_plan_node(ctx: NodeContext):
         return {
             "task": plan["task"],
             "selected_skill": selected_skill or "",
+            "selected_domain": plan.get("selected_domain", ""),
             "skill_body": skill_body,
             "skill_tools": skill_tools,
             "step_budget": plan["step_budget"],
@@ -471,8 +528,9 @@ def make_execute_node(ctx: NodeContext):
         if state.get("context"):
             task_parts.append(f"【参考资料】\n{state['context']}")
 
-        # 渐进式加载：从 state 读取 plan 阶段已选中的技能信息
+        # 渐进式加载：从 state 读取 plan 阶段已选中的技能/域信息
         selected_skill = state.get("selected_skill", "")
+        selected_domain = state.get("selected_domain", "")
         skill_body = state.get("skill_body", "")
         skill_tools = list(state.get("skill_tools", []))
 
@@ -494,10 +552,11 @@ def make_execute_node(ctx: NodeContext):
 
             agent = agent_instance._build_code_agent(
                 model=ctx.model,
-                mcp_tool_list=ctx.mcp_tool_list,
+                provider=ctx.tool_provider,
                 skill_tools=skill_tools,
                 planning_interval=effective_interval,
                 phase_id=0,
+                domain=selected_domain,
             )
             logger.info("[Execute] 新建 CodeAgent 实例")
         else:
@@ -513,9 +572,21 @@ def make_execute_node(ctx: NodeContext):
         logger.info("[Execute] 开始执行，step_budget=%d, timeout=180s", step_budget)
         react_start = time.time()
 
+        import signal as _signal
         hit_max_steps = False
+        _interrupted = False
+
+        def _sigint_handler(signum, frame):
+            nonlocal _interrupted
+            _interrupted = True
+            logger.warning("[Execute] 收到 SIGINT，正在停止...")
+
+        old_handler = _signal.signal(_signal.SIGINT, _sigint_handler)
         try:
             result = agent.run(full_task)
+            if _interrupted:
+                result = "[中断] 用户中断"
+                logger.warning("[Execute] 被用户中断")
             result = str(result) if result else ""
         except KeyboardInterrupt:
             logger.warning("[Execute] 被用户中断")
@@ -529,12 +600,14 @@ def make_execute_node(ctx: NodeContext):
             else:
                 logger.error("[Execute] 执行异常: %s", e)
                 result = f"[错误] {e}"
+        finally:
+            _signal.signal(_signal.SIGINT, old_handler)
 
         react_elapsed = round(time.time() - react_start, 2)
         logger.info("[Execute] 完成，耗时 %.1fs，hit_max_steps=%s", react_elapsed, hit_max_steps)
 
         # 从 agent memory 提取失败的工具调用（不追加到 result，由 finalize_node 处理）
-        failed_tools = _extract_failed_tools(agent, ctx.mcp_tool_list)
+        failed_tools = _extract_failed_tools(agent, ctx.tool_provider)
         if failed_tools:
             logger.info("[Execute] 失败工具: %s", [n for n, _ in failed_tools])
 
@@ -614,14 +687,8 @@ def make_finalize_node(ctx: NodeContext):
 
         # ── 4. 追加失败工具信息（在领域提取之后，不污染提取） ──
         if failed_tools:
-            tool_desc_map = {}
-            if ctx.mcp_tool_list:
-                for t in ctx.mcp_tool_list:
-                    tool_desc_map[t.name] = getattr(t, 'description', '') or ''
-
             lines = []
             for name, desc in failed_tools:
-                desc = desc or tool_desc_map.get(name, '')
                 lines.append(f"{name} -- {desc[:60]}" if desc else name)
             missing = "\n".join(lines)
             result_raw = f"{result_raw}\n\n【数据完整性】以下工具未获取到数据:\n{missing}"

@@ -550,13 +550,16 @@ def bb_screener_scan(codes: str = "") -> dict:
     Args:
         codes: 股票代码，可选，为空则全市场扫描
     """
-    from app.agent.tools import registry as tool_registry
-    tool_registry.discover()
+    from tools.base import ToolProvider
+    provider = ToolProvider.get_default()
+    if provider is None:
+        return {"error": "ToolProvider 未初始化", "status": "error"}
 
     def call_tool_fn(tool_name, **kwargs):
-        spec = tool_registry.get(tool_name)
-        if not spec: raise ValueError(f"Unknown tool: {tool_name}")
-        return spec.fn(**kwargs)
+        func = provider.get(tool_name)
+        if not func:
+            raise ValueError(f"Unknown tool: {tool_name}")
+        return func(**kwargs)
 
     skill = BBScreenerSkill()
     result = skill.run(call_tool_fn=call_tool_fn)

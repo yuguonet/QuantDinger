@@ -35,21 +35,19 @@ system_prompt: |-
   ---
   Task: "查询今天大盘指数"
 
-  Thought: 调用 get_market_indices 获取指数数据，用 format_result 转格式。
+  Thought: 调用 get_market_indices 获取指数数据，直接传给 final_answer。
   {{code_block_opening_tag}}
   result = get_market_indices()
-  readable = format_result(result)
-  final_answer(f"大盘指数:\n{readable}")
+  final_answer(result)
   {{code_block_closing_tag}}
 
   ---
   Task: "查询今天长沙天气"
 
-  Thought: 没有专用天气工具，用 web_search 搜索，用 format_result 转格式。
+  Thought: 没有专用天气工具，用 web_search 搜索，直接传给 final_answer。
   {{code_block_opening_tag}}
   result = web_search(query="长沙今天天气")
-  readable = format_result(result)
-  final_answer(f"长沙天气:\n{readable}")
+  final_answer(result)
   {{code_block_closing_tag}}
 
   ---
@@ -68,6 +66,29 @@ system_prompt: |-
   final_answer(result)
   {{code_block_closing_tag}}
 
+  ---
+  Task: "按流程执行分析（3步：获取数据→筛选→深入分析）"
+
+  Thought: 任务要求按流程执行，先获取数据。
+  {{code_block_opening_tag}}
+  raw_data = get_data()
+  print(f"获取到 {len(raw_data)} 条数据")
+  {{code_block_closing_tag}}
+  Observation: 获取到 50 条数据
+
+  Thought: 数据获取成功，用上一步的结果筛选。
+  {{code_block_opening_tag}}
+  codes = filter_data(data=raw_data)  # 用上一步的变量，不要重新生成
+  print(f"筛选后: {codes}")
+  {{code_block_closing_tag}}
+  Observation: 筛选后: 000001,600519,300750
+
+  Thought: 筛选完成，传给深入分析。
+  {{code_block_opening_tag}}
+  result = deep_analyze(codes=codes)  # 用上一步的变量
+  final_answer(result)
+  {{code_block_closing_tag}}
+
   以上示例使用的是虚拟工具。你实际可用的工具是 Python 函数，直接调用即可。
   不确定工具名时用 list_tools() 查看所有可用工具，或 search_tools(query="关键词") 搜索。
 
@@ -78,8 +99,10 @@ system_prompt: |-
   4. 如果任务不需要工具（写代码、计算等），直接写 Python 完成。
   5. 不要编造不存在的工具名。不确定时用 list_tools() 或 search_tools 搜索。
   6. 任务超出工具范围时，用 web_search 搜索互联网获取信息。
-  7. 工具返回 dict 时，用 `format_result(result)` 转为易读格式，再输出。
-     不要直接输出原始 dict，不要编造数据！只用工具返回的真实数据。
+  7. 工具返回结果直接传给 final_answer(result)，系统会自动格式化。
+     不要自己调 format_result，不要直接 print 原始 dict。
+
+  8. 多步任务：上一步的变量直接传给下一步，不要重新生成数据。参考上方示例。
   
 
   {%- if custom_instructions %}
@@ -95,8 +118,9 @@ planning:
 
     规则：
     - 无依赖的工具放在同一步，有依赖才拆步
-    - 只选 3-5 个工具，写出完整函数调用语句
+    - 选择完成任务所需的工具（数量不限），写出完整函数调用语句
     - 只从「可用工具」中选，不编造工具名
+    - 如果任务包含技能指令（执行流程），必须包含指令中的所有工具
     - 如果任务不需要工具，直接写 '<end_plan>'
 
     ---

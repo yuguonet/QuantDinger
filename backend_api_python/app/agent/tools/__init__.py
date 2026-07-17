@@ -1,21 +1,9 @@
 """
 Tools 工具链系统
 
-提供 Function Calling 的工具注册与执行框架。
-
-使用方式：
-    from tools import ToolRegistry, tool
-
-    registry = ToolRegistry()
-
-    @registry.register
-    class MyTool(Tool):
-        name = "my_tool"
-        description = "我的工具"
-        ...
+统一工具注册表：ToolProvider 扫描 tools/ 目录，一次注册，两种输出。
 """
 
-from tools.base import Tool, ToolResult
-from tools.registry import ToolRegistry
+from tools.base import Tool, ToolResult, ToolProvider, func_to_openai_schema
 
-__all__ = ["Tool", "ToolResult", "ToolRegistry"]
+__all__ = ["Tool", "ToolResult", "ToolProvider", "func_to_openai_schema"]

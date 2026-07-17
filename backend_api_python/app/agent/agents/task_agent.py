@@ -8,14 +8,15 @@
     -> plan: LLM 选择技能、划分阶段（不选具体工具）
     -> 统一多阶段循环：
        - skill 阶段：加载技能指令 + 工具 → CodeAgent 执行
-       - execute 阶段：MCP 通用工具 → CodeAgent 执行
+       - execute 阶段：通用工具 → CodeAgent 执行
        - direct 阶段：LLM 直接回答
     -> 规则 eval（结果非空 → passed）
     -> response
 
 设计要点：
-  - MCP 常驻连接，首次启动后复用，避免每次请求 2-3s 启动开销
-  - _plan() 只看技能列表，不看 MCP 全量工具（工具在执行阶段自动注入）
+  - ToolProvider 统一管理所有工具（本地扫描 + skill 动态注册）
+  - _plan() 只看技能列表，工具在执行阶段通过 ToolProvider 注入
+  - 必选工具（list_tools/search_tools/format_result/web_search）通过 smolagents tools=[] 注入
   - 统一多阶段：所有任务走同一套循环，无单阶段/多阶段分支
   - eval 用规则判断，不调 LLM，省 token
 """
@@ -26,7 +27,6 @@ import inspect
 import logging
 import os
 import re
-import threading
 import time
 from typing import Dict, List, Optional
 
@@ -40,7 +40,6 @@ from llm.base import ChatMessage, LLMBase
 from memory.base import MemoryBase
 from rag.retriever import Retriever
 from smolagents import Tool as SmolToolBase
-from executor.mcp_executor import MCPRouterTool, build_tool_catalog
 from utils.json_parser import safe_parse_json
 from utils.tracing import AgentTraceRecorder, llm_response_to_dict
 
@@ -52,16 +51,6 @@ except ImportError:
 
 # ── 模块级 TraceCollector 存储 ──
 _collectors: Dict[str, "TraceCollector"] = {}
-
-# ── MCP 配置 ──────────────────────────────────────────────────
-_MCP_SERVER_CMD = os.getenv("AGENT_MCP_SERVER_CMD", "python")
-# 默认路径：相对于本文件(app/agent/)定位 mcp_bridge.py
-# 从 backend_api_python/ 运行时，子进程 cwd 是 backend_api_python/
-# 所以需要用 app/agent/tools/mcp_bridge.py 而非 tools/mcp_bridge.py
-_MCP_SERVER_ARGS = os.getenv(
-    "AGENT_MCP_SERVER_ARGS",
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tools", "mcp_bridge.py")),
-).split()
 
 # Plan 提示词模板
 _PLAN_TEMPLATE: str | None = None
@@ -427,96 +416,6 @@ def _load_skill_functions(skill_name: str, skill_adapter=None) -> list:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  MCP 常驻连接（单例，首次调用启动，之后复用）
-# ═══════════════════════════════════════════════════════════════
-
-class _MCPSingleton:
-    """MCP 连接单例 — 常驻子进程，避免每次请求重复启动。
-
-    设计原因：
-      - MCP 子进程启动 + 工具注册需要 2-3s，每条消息都启动一次浪费严重
-      - 常驻连接后，首次 2-3s，后续 0 开销
-      - smolagents ToolCollection 上下文管理器保持连接存活
-
-    生命周期：
-      - 进程启动 → _mcp = _MCPSingleton()（不启动子进程）
-      - 首次 _mcp.tools / _mcp.available → 触发 _ensure() → 启动子进程
-      - 进程退出 → 自动回收（daemon 线程）
-      - 需要手动关闭时 → _mcp.close()
-
-    扩展点：
-      - 未来可加健康检查、自动重连、工具热更新
-      - 未来可改为 SSE 模式连接远程 MCP server
-    """
-
-    def __init__(self):
-        self._tools: list | None = None
-        self._ctx = None  # ToolCollection 上下文管理器
-        self._collection = None
-        self._lock = threading.Lock()
-
-    def _ensure(self) -> bool:
-        if self._tools is not None:
-            return True
-        with self._lock:
-            if self._tools is not None:
-                return True
-            try:
-                from mcp import StdioServerParameters
-                from smolagents import ToolCollection
-
-                server = StdioServerParameters(
-                    command=_MCP_SERVER_CMD,
-                    args=_MCP_SERVER_ARGS,
-                )
-                self._ctx = ToolCollection.from_mcp(server, trust_remote_code=True)
-                self._collection = self._ctx.__enter__()
-                self._tools = list(self._collection.tools) if hasattr(self._collection, 'tools') else list(self._collection)
-                logger.info("[MCP] 常驻连接已建立，%d 个工具", len(self._tools))
-                return True
-            except ImportError:
-                logger.warning("[TaskAgent] MCP 依赖未安装 (pip install mcp)")
-                return False
-            except Exception as e:
-                logger.warning("[TaskAgent] MCP 初始化失败: %s", e)
-                return False
-
-    @property
-    def tools(self) -> list:
-        self._ensure()
-        return self._tools or []
-
-    @property
-    def available(self) -> bool:
-        return self._ensure()
-
-    def close(self):
-        if self._ctx:
-            try:
-                import threading
-                # Windows ProactorEventLoop 下 __exit__ 可能挂住，加超时保护
-                done = threading.Event()
-                def _do_close():
-                    try:
-                        self._ctx.__exit__(None, None, None)
-                    except Exception:
-                        pass
-                    done.set()
-                t = threading.Thread(target=_do_close, daemon=True)
-                t.start()
-                done.wait(timeout=3)
-            except Exception:
-                pass
-            self._ctx = None
-            self._collection = None
-            self._tools = None
-            logger.info("[MCP] 连接已关闭")
-
-
-_mcp = _MCPSingleton()
-
-
-# ═══════════════════════════════════════════════════════════════
 #  TaskAgent
 # ═══════════════════════════════════════════════════════════════
 
@@ -541,6 +440,7 @@ class TaskAgent(AgentBase):
         memory_window_size: int = 10,
         max_tool_rounds: int = 10,
         skill_adapter=None,
+        tool_provider=None,
     ):
         super().__init__(
             llm=llm,
@@ -551,6 +451,7 @@ class TaskAgent(AgentBase):
         )
         self.max_tool_rounds = max_tool_rounds
         self.skill_adapter = skill_adapter
+        self._tool_provider = tool_provider
 
     def _get_skill_loader(self):
         return self.skill_adapter
@@ -566,17 +467,18 @@ class TaskAgent(AgentBase):
         """Plan 节点：选择技能、划分执行阶段。
 
         设计决策：
-          - _plan() 只看技能列表，不看 MCP 全量工具（工具在执行阶段自动注入）
-          - 输出统一格式：phases + planning_interval
-          - phase.type=skill → 加载该技能的 SKILL.md + 工具
-          - phase.type=execute → CodeAgent + MCP 通用工具
-          - phase.type=direct → LLM 直接回答（不调工具）
+          - _plan() 只看技能列表，不看全量工具（工具在执行阶段通过 ToolProvider 注入）
+          - 输出统一格式：task + selected_skill + step_budget
+          - selected_skill → 加载该技能的 SKILL.md + 工具
+          - 无技能 → CodeAgent + 通用工具
 
         Returns:
             {
-              "phases": list[dict],    # [{id, name, type, skill?, goal}]
+              "task": str,
+              "selected_skill": str | None,
+              "selected_domain": str,
+              "step_budget": int,
               "planning_interval": int,
-              "expanded_query": str,
             }
         """
         # 构建技能描述（含权重 + SKILL.md 执行流程）
@@ -602,21 +504,29 @@ class TaskAgent(AgentBase):
                 skills_desc.append(f"- {name}{weight_tag}: {desc}")
         skills_text = "\n".join(skills_desc) if skills_desc else "(无可用技能)"
 
-        # 注入 MCP 工具名列表，让规划器知道 CodeAgent 能调什么
-        tool_names = []
-        try:
-            from agents.task_agent import _mcp
-            if _mcp.available:
-                tool_names = [t.name for t in _mcp.tools]
-        except Exception:
-            pass
-        tools_hint = f"\n\n可用工具（CodeAgent 可直接调用，无需拆分阶段）：{', '.join(tool_names[:30])}..." if tool_names else ""
+        # 注入可用域和工具名列表，让规划器知道 CodeAgent 能调什么
+        tools_hint = ""
+        if self._tool_provider:
+            # 可用域列表（子目录名）
+            domains = sorted(set(
+                d for d in self._tool_provider._domains.values() if d != "common"
+            ))
+            if domains:
+                tools_hint += f"\n\n可用工具域：{', '.join(domains)}"
+                tools_hint += "\n（domain 为空时仅加载通用工具，指定域时加载域+通用工具）"
+            tool_names = self._tool_provider.get_tool_names(limit=30)
+            if tool_names:
+                tools_hint += f"\n\n可用工具（CodeAgent 可直接调用）：{', '.join(tool_names)}..."
 
         template = _load_plan_template()
         # completed_phases_text: 已完成阶段的摘要（用于多轮规划），首次调用为空
         prompt = template.format(
             skills_text=skills_text,
             user_input=user_input,
+            entity_info=getattr(self, '_plan_entity_info', '') or '',
+            task_type_info=getattr(self, '_plan_task_type_info', '') or '',
+            rag_context=getattr(self, '_plan_rag_context', '') or '',
+            history_context=getattr(self, '_plan_history_context', '') or '',
             completed_phases_text=getattr(self, '_completed_phases_text', '') or '',
         ) + tools_hint
 
@@ -657,12 +567,26 @@ class TaskAgent(AgentBase):
                 logger.warning("[TaskAgent] plan 选择了不存在的技能 '%s'，忽略", selected_skill)
                 selected_skill = None
 
-        logger.info("[TaskAgent] plan: task=%s..., selected_skill=%s, step_budget=%d",
-                     task[:80], selected_skill, step_budget)
+        # 从 plan 结果中提取选中的域
+        selected_domain = ""
+        if not selected_skill:  # 技能模式不加载域工具
+            selected_domain = plan.get("selected_domain") or plan.get("domain") or ""
+            # 校验域是否真实存在
+            if selected_domain and self._tool_provider:
+                available_domains = set(
+                    d for d in self._tool_provider._domains.values() if d != "common"
+                )
+                if selected_domain not in available_domains:
+                    logger.warning("[TaskAgent] plan 选择了不存在的域 '%s'，忽略", selected_domain)
+                    selected_domain = ""
+
+        logger.info("[TaskAgent] plan: task=%s..., skill=%s, domain=%s, step_budget=%d",
+                     task[:80], selected_skill, selected_domain or "(通用)", step_budget)
         trace.record("plan_result", {
             "route": "plan",
             "task": task,
             "selected_skill": selected_skill,
+            "selected_domain": selected_domain,
             "step_budget": step_budget,
             "planning_interval": planning_interval,
         })
@@ -670,6 +594,7 @@ class TaskAgent(AgentBase):
         return {
             "task": task,
             "selected_skill": selected_skill,
+            "selected_domain": selected_domain,
             "step_budget": step_budget,
             "planning_interval": planning_interval,
         }
@@ -694,59 +619,51 @@ class TaskAgent(AgentBase):
     def _build_code_agent(
         self,
         model,
-        mcp_tool_list: list,
+        provider,
         skill_tools: list,
         planning_interval: int | None = None,
         phase_id: int = 0,
+        domain: str = "",
     ):
         """构建 smolagents CodeAgent 实例。
 
         每个阶段独立构建，避免状态污染。
         planning_interval: None=不 replan，3~5=每 N 步 replan。
         phase_id: 阶段ID，用于缓存key前缀。
+        domain: 领域名，用于过滤工具。
+
+        工具架构：
+          - 必选工具（list_tools/search_tools/format_result/web_search）→ smolagents tools=[]
+          - 领域工具 + 通用工具 → executor.custom_tools（通过 ToolProvider 注入）
+          - 技能工具 → executor.custom_tools
+          - 全量工具 schema → planning YAML {{tool_list}}（供 smolagents 内部 planning 选工具）
         """
         from smolagents import CodeAgent as SmolCodeAgent
         from smolagents.local_python_executor import LocalPythonExecutor
         from smolagents.memory import ActionStep
-        from pathlib import Path
 
-        # ── 构建工具函数字典（直接注入执行上下文）──
-        tool_functions = {}
+        # ── 工具函数：按 domain 过滤 + 技能工具 ──
+        if domain:
+            # 指定域：域工具 + 通用工具
+            allowed = set(provider.list_by_domain("common") + provider.list_by_domain(domain))
+            tool_functions = {n: f for n, f in provider.get_functions().items() if n in allowed}
+            logger.info("[TaskAgent] domain='%s'，加载 %d 个工具（通用+%s）", domain, len(tool_functions), domain)
+        else:
+            # 无域：仅通用工具
+            allowed = set(provider.list_by_domain("common"))
+            tool_functions = {n: f for n, f in provider.get_functions().items() if n in allowed}
+            logger.info("[TaskAgent] 无域，加载 %d 个通用工具", len(tool_functions))
 
-        # MCP 工具：包装为直接可调用的 Python 函数
-        for t in mcp_tool_list:
-            def _make_wrapper(tool_obj):
-                def wrapper(**kwargs):
-                    return tool_obj.forward(**kwargs)
-                wrapper.__name__ = tool_obj.name
-                wrapper.__doc__ = getattr(tool_obj, 'description', '')[:200]
-                return wrapper
-            tool_functions[t.name] = _make_wrapper(t)
-
-        # 技能工具
+        # 技能工具（私有，不和 tools/ 通用）
         for st in skill_tools:
             sname = getattr(st, "name", "unknown")
             tool_functions[sname] = st
 
-        # mcp router（兜底调用）
-        catalog = build_tool_catalog(mcp_tool_list)
-        router_tool = MCPRouterTool(tool_map={t.name: t for t in mcp_tool_list}, tool_catalog=catalog)
-        tool_functions["mcp"] = router_tool.forward
-
-        # search_tools — 工具发现函数（扫描 tools/ 目录，支持领域化搜索）
-        from tools.search_tools import search_tools
-        from tools.list_tools import list_tools
-        from tools.format_utils import format_result
-        tool_functions["search_tools"] = search_tools
-        tool_functions["list_tools"] = list_tools
-        tool_functions["format_result"] = format_result
-
-        # final_answer — 必须通过 additional_functions 注入 static_tools
-        # evaluate_python_code 只对 static_tools 中的 final_answer 包装 FinalAnswerException
+        # final_answer
         def _final_answer(answer=None, **kwargs):
             return answer if answer is not None else kwargs
 
-        # 创建 LocalPythonExecutor（替代 MCPExecutor，简化架构）
+        # executor
         executor = LocalPythonExecutor(
             additional_authorized_imports=[
                 "json", "datetime", "math", "re", "collections", "itertools",
@@ -756,14 +673,63 @@ class TaskAgent(AgentBase):
             ],
             additional_functions={"final_answer": _final_answer},
         )
-        # 注入工具到 custom_tools（不被 send_tools 覆盖）
         executor.custom_tools = tool_functions
         logger.info("[TaskAgent] executor 已注入 %d 个工具函数", len(tool_functions))
 
-        # tools=[] 是故意的：MCP 工具通过 MCPExecutor router 模式注入，不走 smolagents 原生 Tool。
-        # 原因：MCP 工具数量大（70+），注册为 smolagents Tool 会全量写入 system prompt，token 爆炸。
-        # router 模式保留（search_tools + 兜底调用），LLM 通过 mcp(action="list") 动态发现，mcp(action="call") 调用
-        # 不要把 MCP 工具往 tools=[] 里塞，那是打补丁，不是正路。详见 mcp_executor.py 注释。
+        # ── 必选工具：注册为 smolagents Tool，放入 tools=[] ──
+        # smolagents 自动在 system prompt 中描述这些工具，LLM 天然知道可以用
+        class _SearchToolsTool(SmolToolBase):
+            skip_forward_signature_validation = True
+            name = "search_tools"
+            description = "按关键词搜索可用工具。返回匹配的工具名、参数和描述。用于不确定工具名时快速定位。"
+            output_type = "string"
+            inputs = {
+                "query": {"type": "string", "description": "搜索关键词（如 资金流、K线、选股）"},
+                "domain": {"type": "string", "description": "领域过滤（可选）", "nullable": True},
+            }
+            def forward(self, query: str = "", domain: str = "", **kwargs):
+                return provider.search_tools(query, domain)
+
+        class _ListToolsTool(SmolToolBase):
+            skip_forward_signature_validation = True
+            name = "list_tools"
+            description = "列出所有可用工具。可按领域过滤。用于了解当前有哪些工具可用。"
+            output_type = "string"
+            inputs = {
+                "domain": {"type": "string", "description": "领域名称（可选，空=全部）", "nullable": True},
+            }
+            def forward(self, domain: str = "", **kwargs):
+                return provider.list_tools(domain)
+
+        class _FormatResultTool(SmolToolBase):
+            skip_forward_signature_validation = True
+            name = "format_result"
+            description = "把任意格式的数据转换为 LLM 容易理解的字符串。用于格式化工具返回的结果。"
+            output_type = "string"
+            inputs = {
+                "result": {"type": "object", "description": "任意格式的数据"},
+                "max_depth": {"type": "integer", "description": "最大递归深度", "nullable": True},
+                "max_items": {"type": "integer", "description": "最多显示的项数", "nullable": True},
+            }
+            def forward(self, result=None, max_depth: int = 3, max_items: int = 20, **kwargs):
+                from tools.format_utils import format_result
+                return format_result(result, max_depth, max_items)
+
+        class _WebSearchTool(SmolToolBase):
+            skip_forward_signature_validation = True
+            name = "web_search"
+            description = "联网搜索最新信息。用于补充新闻面、政策面、市场情绪等实时数据。"
+            output_type = "object"
+            inputs = {
+                "query": {"type": "string", "description": "搜索关键词"},
+                "count": {"type": "integer", "description": "结果数量", "nullable": True},
+                "freshness": {"type": "string", "description": "时效性过滤", "nullable": True},
+            }
+            def forward(self, query: str = "", count: int = 8, freshness: str = "", **kwargs):
+                from tools.web_search_tools import web_search
+                return web_search(query, count, freshness)
+
+        smol_tools = [_SearchToolsTool(), _ListToolsTool(), _FormatResultTool(), _WebSearchTool()]
 
         # 阶段内 observations 截断（保留最近 2 步完整，防止 token 爆炸）
         keep_recent = 2
@@ -778,14 +744,13 @@ class TaskAgent(AgentBase):
                             step.observations_images = None
 
         agent = SmolCodeAgent(
-            tools=[],
+            tools=smol_tools,
             model=model,
             max_steps=self.max_tool_rounds,
             executor=executor,
             planning_interval=planning_interval,
             step_callbacks=[_truncate_observations],
             instructions=(
-
                 "【数据补充策略】\n"
                 "- 当关键工具返回 error 或数据为空时，使用 web_search 搜索最新信息补充\n"
                 "- web_search 搜索关键词示例：'{股票名称} {股票代码} 最新消息 分析'\n"
@@ -797,42 +762,25 @@ class TaskAgent(AgentBase):
         # 覆盖 smolagents 默认 prompt_templates，使用自定义 YAML 模板
         try:
             custom_templates = _load_code_agent_yaml()
-            # deepcopy 隔离全局缓存，避免运行时修改污染后续请求
             import copy
             custom_templates = copy.deepcopy(custom_templates)
 
-            # 调试：检查 YAML 加载的 planning 内容
-            yaml_planning = custom_templates.get("planning", {})
-            logger.info("[TaskAgent] YAML planning 类型: %s, keys: %s", type(yaml_planning), list(yaml_planning.keys()) if isinstance(yaml_planning, dict) else "非字典")
-            if isinstance(yaml_planning, dict):
-                for k, v in yaml_planning.items():
-                    logger.info("[TaskAgent] YAML planning['%s'] 前100字符: %s", k, repr(str(v)[:100]))
-
-            # 替换 {{tool_list}} 占位符（在 apply 之前，避免 smolagents 内部处理干扰）
+            # 替换 {{tool_list}} 占位符：注入 domain 相关工具 schema，供 smolagents 内部 planning 选工具
             planning = custom_templates.get("planning", {})
-            if isinstance(planning, dict) and mcp_tool_list:
-                tool_lines = []
-                for t in mcp_tool_list:
-                    inputs = getattr(t, 'inputs', {}) or {}
-                    params = ', '.join(f"{p}: {i.get('type', 'string')}" for p, i in inputs.items()) if inputs else ''
-                    desc = (getattr(t, 'description', '') or '')[:80]
-                    tool_lines.append(f"  {t.name}({params}) — {desc}")
-                tools_text = '\n'.join(tool_lines)
+            if isinstance(planning, dict) and provider:
+                if domain:
+                    allowed_names = set(provider.list_by_domain("common") + provider.list_by_domain(domain))
+                    tools_text = provider.get_schemas_text(names_filter=allowed_names)
+                else:
+                    tools_text = provider.get_schemas_text(names_filter=set(provider.list_by_domain("common")))
                 for key in ("initial_plan", "update_plan_pre_messages", "update_plan_post_messages"):
                     val = planning.get(key, "")
                     if isinstance(val, str) and "{{tool_list}}" in val:
                         planning[key] = val.replace("{{tool_list}}", tools_text)
-                        logger.info("[TaskAgent] YAML planning['%s'] 已注入 %d 个工具", key, len(mcp_tool_list))
+                        logger.info("[TaskAgent] YAML planning['%s'] 已注入 %d 个工具 schema", key, len(provider))
 
             agent.prompt_templates.update(custom_templates)
             logger.info("[TaskAgent] 已加载自定义 prompt_templates (YAML)")
-
-            # 调试：检查 update 后的 planning 内容
-            after_planning = agent.prompt_templates.get("planning", {})
-            logger.info("[TaskAgent] update 后 planning 类型: %s", type(after_planning))
-            if isinstance(after_planning, dict):
-                for k, v in after_planning.items():
-                    logger.info("[TaskAgent] update 后 planning['%s'] 前100字符: %s", k, repr(str(v)[:100]))
         except Exception as e:
             logger.warning("[TaskAgent] 自定义 prompt_templates 加载失败: %s，使用默认", e)
 
@@ -923,7 +871,6 @@ class TaskAgent(AgentBase):
                 entity_resolver=StockResolver(),
             )
             ctx.agent = self  # 传递 TaskAgent 实例，供节点调用 _build_code_agent 等方法
-            # MCP 延迟初始化：chat_node 不需要 MCP，只在 plan/execute 路径才初始化
 
             # 构建图
             graph = StateGraph(AgentState)

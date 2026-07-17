@@ -48,7 +48,7 @@ class AgentBase:
     - LLM: 大语言模型调用
     - Memory: 对话历史管理
     - Retriever: RAG 检索增强（可选）
-    - ToolRegistry: 工具注册中心（可选）
+    - ToolProvider: 统一工具注册表（可选）
 
     使用示例：
         llm = create_llm(config)

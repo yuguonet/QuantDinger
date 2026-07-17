@@ -237,11 +237,12 @@ def _load_analysis_memory_docs() -> list:
 
 retriever = _build_retriever()
 
-# 模式：固定 task（工具通过 list_tools/search_tools 动态发现，不再需要 ToolRegistry 预扫描）
-# ToolRegistry 已移除：
-#   - tools/*.py 直接扫描，工具集完全对齐，无需重复扫描
-#   - Plan 和 CodeAgent 都通过 list_tools/search_tools 发现工具，省掉 ToolRegistry 的维护成本
-#   - 独立脚本（如 bb_screener_scan.py）仍可自行 import ToolRegistry
+# 模式：固定 task
+# 工具架构：
+#   - ToolProvider 统一注册（tools/ 通用 + 子目录领域工具），一次扫描两种输出（函数 + schema）
+#   - 必选工具（list_tools/search_tools/format_result/web_search）→ smolagents tools=[]
+#   - 领域工具 → executor.custom_tools，LLM 通过 search_tools/list_tools 动态发现
+#   - 全量工具 schema → planning YAML {{tool_list}}，供 smolagents 内部 planning 选工具
 _mode = "task"
 logger.info(
     "QuantDinger Agent 启动: %s 模式 | %d 技能 | provider=%s model=%s",

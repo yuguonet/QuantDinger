@@ -12,21 +12,24 @@ backfill_db.py — A 股 K 线盘后覆写（mootdx 直连）
 
 设计原则:
   1. mootdx 直连，不走 coordinator
-  2. 盘后全量覆写：DELETE 当日 → 拉取 → INSERT
+  2. 盘后全量覆写：先拉取 → 有数据才 DELETE → INSERT
   3. 无 cn_last_update，无修复循环
-  4. 对外接口: run_1d() / run_15m() / start_scheduler() / stop_scheduler()
+  4. 对外接口: run_1d() / run_15m()（调度由 scheduler.py 管理）
+
+数据说明:
+  - mootdx bars() 返回的是不复权原始数据，与 kline 表存储方式一致
+  - 复权因子由 app/data_sources/provider/adjustment.py 单独维护，查询时按需复权
 """
 
 import threading
-import time as _time
-from datetime import datetime, timedelta, timezone, time as dt_time
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
-from app.utils.db_market import get_market_db_manager, get_market_kline_writer
-from app.utils.trading_calendar import is_trading_day, prev_trading_day, next_trading_day
+from app.utils.db_market import get_market_db_manager
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
 
 TZ_CN = timezone(timedelta(hours=8))
 
@@ -216,6 +219,25 @@ def _batch_insert(records: list, tf: str) -> int:
 # 同步主逻辑
 # ================================================================
 
+def _count_existing(tf: str, bar_time: datetime) -> int:
+    """查询目标日期已有多少个 symbol 的数据。"""
+    table = f'"kline_{tf}_{bar_time.year}"'
+    naive = bar_time.replace(tzinfo=None) if bar_time.tzinfo else bar_time
+    try:
+        mgr = get_market_db_manager()
+        pool = mgr._get_pool("CNStock")
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"""
+                    SELECT COUNT(DISTINCT symbol) FROM {table}
+                    WHERE time::date = %s::date
+                """, (naive,))
+                return cur.fetchone()[0]
+    except Exception as e:
+        logger.warning(f"[同步] 查询 {tf} 已有数据失败: {e}")
+        return 0
+
+
 def _get_all_symbols() -> List[str]:
     """获取全市场活跃股票代码。"""
     try:
@@ -226,22 +248,10 @@ def _get_all_symbols() -> List[str]:
         return []
 
 
-def _target_trading_day(tf: str) -> str:
-    """计算目标交易日。
-
-    15m: 15:05 后 → 今天, 否则 → 上一个交易日
-    1D:  17:00 后 → 今天, 否则 → 上一个交易日
-    """
-    now = datetime.now(TZ_CN)
-    today_str = now.strftime("%Y-%m-%d")
-    if tf == "15m":
-        if now.time() >= dt_time(15, 5) and is_trading_day(today_str):
-            return today_str
-        return prev_trading_day(today_str)
-    else:  # 1D
-        if now.time() >= dt_time(17, 0) and is_trading_day(today_str):
-            return today_str
-        return prev_trading_day(today_str)
+def _target_trading_day() -> str:
+    """计算目标交易日（最近一个已收盘的交易日）。"""
+    from app.utils.trading_calendar import last_finish_trading_day
+    return last_finish_trading_day()
 
 
 def sync_tf(tf: str, symbols: Optional[List[str]] = None) -> dict:
@@ -249,9 +259,9 @@ def sync_tf(tf: str, symbols: Optional[List[str]] = None) -> dict:
 
     流程:
       1. 计算目标交易日
-      2. DELETE 当日数据
+      2. 检查 DB 已有数据量，> 90% 则跳过
       3. 逐标的从 mootdx 拉取
-      4. 批量写入
+      4. 有数据才 DELETE + INSERT
 
     Returns:
         {"status": "ok"|"error", "written": int, "failed": int, "report": str}
@@ -261,7 +271,7 @@ def sync_tf(tf: str, symbols: Optional[List[str]] = None) -> dict:
     if not symbols:
         return {"status": "error", "written": 0, "failed": 0, "report": "无股票列表"}
 
-    target_td = _target_trading_day(tf)
+    target_td = _target_trading_day()
     bar_time = datetime.strptime(target_td, "%Y-%m-%d").replace(
         hour=15 if tf == "15m" else 0,
         minute=0 if tf == "15m" else 0,
@@ -269,9 +279,16 @@ def sync_tf(tf: str, symbols: Optional[List[str]] = None) -> dict:
     )
 
     total = len(symbols)
-    logger.info(f"[同步] {tf} 目标={target_td} 标的={total} 开始覆写")
 
-    # 1. 逐标的拉取 + 收集（先拉完再删写，避免中途失败丢数据）
+    # 检查是否已写入，>90% 跳过，避免节假日重复覆写
+    existing = _count_existing(tf, bar_time)
+    if total > 0 and existing / total > 0.9:
+        logger.info(f"[同步] {tf} 目标={target_td} 已有 {existing}/{total} 条，跳过")
+        return {"status": "ok", "written": 0, "failed": 0, "report": f"已有 {existing}/{total}，跳过"}
+
+    logger.info(f"[同步] {tf} 目标={target_td} 标的={total} 已有={existing} 开始覆写")
+
+    # 逐标的拉取 + 收集（先拉完再删写，避免中途失败丢数据）
     all_records = []
     failed = 0
     failed_list = []
@@ -299,13 +316,20 @@ def sync_tf(tf: str, symbols: Optional[List[str]] = None) -> dict:
         if (i + 1) % 500 == 0:
             logger.info(f"[同步] {tf} 进度 {i+1}/{total}")
 
-    # 3. 删除当日数据 + 批量写入（先拉后删，保证原子性）
+    # 有数据才删写，避免拉取失败导致丢数据
+    if not all_records:
+        logger.error(f"[同步] {tf} 拉取到 0 条记录，跳过删除和写入")
+        return {
+            "status": "error", "written": 0, "failed": failed,
+            "report": f"拉取到 0 条数据（目标 {target_td}），未删除旧数据",
+        }
+
     deleted = _delete_day(bar_time, tf)
     if deleted > 0:
         logger.info(f"[同步] {tf} 已删除 {deleted} 条旧数据")
     written = _batch_insert(all_records, tf)
 
-    # 4. 统计
+    # 统计
     ok = total - failed
     sync_rate = ok / total if total > 0 else 0
     status = "ok" if sync_rate > 0.9 else "error"
@@ -340,118 +364,4 @@ def run_15m(symbols: Optional[List[str]] = None) -> str:
     return result["status"]
 
 
-# ================================================================
-# 定时调度器
-# ================================================================
 
-_INITIAL_DELAY = 300      # 启动延迟（秒）
-_RETRY_INTERVAL = 60      # 重试间隔（秒）
-
-_timers: dict[str, threading.Timer] = {}
-_running = False
-
-
-def _next_trigger_time(task: str) -> datetime:
-    """返回下次触发时间，跳过非交易日。"""
-    now = datetime.now(TZ_CN)
-    today_str = now.strftime("%Y-%m-%d")
-    trigger_h, trigger_m = (15, 5) if task == "15m" else (17, 0)
-
-    if is_trading_day(today_str) and now.time() < dt_time(trigger_h, trigger_m):
-        return datetime(now.year, now.month, now.day, trigger_h, trigger_m, 0, tzinfo=TZ_CN)
-
-    next_td = next_trading_day(today_str)
-    dt_obj = datetime.strptime(next_td, "%Y-%m-%d")
-    return datetime(dt_obj.year, dt_obj.month, dt_obj.day, trigger_h, trigger_m, 0, tzinfo=TZ_CN)
-
-
-def _schedule_next(task: str, trigger_at: datetime = None, delay_seconds: float = None):
-    """安排下次执行。"""
-    global _running
-    if not _running:
-        return
-
-    old = _timers.pop(task, None)
-    if old:
-        old.cancel()
-
-    if delay_seconds is not None:
-        delay = max(30, delay_seconds)
-    elif trigger_at is not None:
-        now = datetime.now(TZ_CN)
-        delay = max(30, (trigger_at - now).total_seconds())
-    else:
-        delay = _INITIAL_DELAY
-
-    timer = threading.Timer(delay, _run_task, args=[task])
-    timer.daemon = True
-    timer.name = f"backfill-{task}"
-    timer.start()
-    _timers[task] = timer
-
-    run_at = datetime.now(TZ_CN) + timedelta(seconds=delay)
-    logger.info(f"[调度] {task} 下次执行: {run_at:%Y-%m-%d %H:%M:%S}")
-
-
-def _run_task(task: str):
-    """执行同步任务。"""
-    global _running
-    if not _running:
-        return
-
-    try:
-        # 盘中不执行
-        now = datetime.now(TZ_CN)
-        today_str = now.strftime("%Y-%m-%d")
-        if is_trading_day(today_str) and dt_time(9, 15) <= now.time() <= dt_time(15, 0, 59):
-            logger.info(f"[调度] {task} 盘中，跳过")
-            _schedule_next(task, _next_trigger_time(task))
-            return
-
-        # 执行同步
-        result = sync_tf(task)
-        status = result["status"]
-
-        if status == "ok":
-            _schedule_next(task, _next_trigger_time(task))
-        else:
-            # 失败：短暂重试
-            logger.warning(f"[调度] {task} status={status}, {_RETRY_INTERVAL}s 后重试")
-            _schedule_next(task, delay_seconds=_RETRY_INTERVAL)
-
-    except Exception as e:
-        logger.error(f"[调度] {task} 异常: {e}", exc_info=True)
-        _schedule_next(task, delay_seconds=_RETRY_INTERVAL)
-
-
-def start_scheduler():
-    """启动调度器（幂等）。"""
-    global _running
-    if _running:
-        return
-    _running = True
-
-    logger.info("[调度] 启动 (15m@15:05 + 1D@17:00)")
-
-    # 盘中不执行
-    now = datetime.now(TZ_CN)
-    today_str = now.strftime("%Y-%m-%d")
-    if is_trading_day(today_str) and dt_time(9, 15) <= now.time() <= dt_time(15, 0, 59):
-        logger.info("[调度] 盘中，安排下次触发")
-        for task in ("15m", "1D"):
-            _schedule_next(task, _next_trigger_time(task))
-        return
-
-    # 启动后延迟执行
-    for task in ("15m", "1D"):
-        _schedule_next(task, delay_seconds=_INITIAL_DELAY)
-
-
-def stop_scheduler():
-    """停止调度器。"""
-    global _running
-    _running = False
-    for task, timer in list(_timers.items()):
-        timer.cancel()
-    _timers.clear()
-    logger.info("[调度] 已停止")

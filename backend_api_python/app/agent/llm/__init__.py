@@ -6,10 +6,8 @@ LLM 多模型抽象层
 保留原始 DashScope / OpenAI 实现以兼容独立运行场景。
 
 使用方式：
-    from app.agent.llm import create_llm, QDToolAdapter, QDSkillAdapter
-
+    from app.agent.llm import create_llm, QDSkillAdapter
     llm = create_llm()
-    tools = QDToolAdapter()
     skills = QDSkillAdapter()
 """
 
@@ -20,12 +18,6 @@ try:
     from .qd_llm import QDLLM
 except ImportError:
     QDLLM = None
-
-try:
-    from .qd_tools import QDToolAdapter, run_with_tools
-except ImportError:
-    QDToolAdapter = None
-    run_with_tools = None
 
 try:
     from .qd_skills import QDSkillAdapter
@@ -41,7 +33,5 @@ __all__ = [
     "list_providers",
     "register_provider",
     "QDLLM",
-    "QDToolAdapter",
     "QDSkillAdapter",
-    "run_with_tools",
 ]
