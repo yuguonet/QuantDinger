@@ -599,30 +599,7 @@ class TaskAgent(AgentBase):
                 desc = s.get('description', '')[:150]
                 weight = skill_weights.get(name)
                 weight_tag = f" [权重:{weight:.2f}]" if weight is not None else ""
-
-                # 加载 SKILL.md 的执行流程段落
-                flow = ""
-                try:
-                    body = self.skill_adapter.load_body(name)
-                    if body:
-                        lines = body.split('\n')
-                        in_flow = False
-                        flow_lines = []
-                        for line in lines:
-                            if '执行流程' in line or '执行步骤' in line:
-                                in_flow = True
-                            elif in_flow and line.startswith('#') and '执行' not in line:
-                                break
-                            if in_flow:
-                                flow_lines.append(line)
-                        if flow_lines:
-                            flow = '\n'.join(flow_lines[:30])
-                except Exception:
-                    pass
-                if flow:
-                    skills_desc.append(f"- {name}{weight_tag}: {desc}\n{flow}")
-                else:
-                    skills_desc.append(f"- {name}{weight_tag}: {desc}")
+                skills_desc.append(f"- {name}{weight_tag}: {desc}")
         skills_text = "\n".join(skills_desc) if skills_desc else "(无可用技能)"
 
         # 注入 MCP 工具名列表，让规划器知道 CodeAgent 能调什么

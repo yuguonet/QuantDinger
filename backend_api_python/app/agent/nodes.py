@@ -133,11 +133,7 @@ class NodeContext:
 #  节点函数
 # ═══════════════════════════════════════════════════════════════
 
-def _expand_entity_query(user_input: str, entity_name: str, entity_code: str, entity_type: str) -> str:
-    """将简短的实体分析指令扩写为完整的分析指令。"""
-    # 默认分析参数（后续从 formatter rules.yaml 读取）
-    default_params = "周期：T+3（T+1/T+3/1W/1M），深度：标准（简单/标准/深度）"
-    return f"分析{entity_name}({entity_code}): {user_input}，{default_params}"
+
 
 
 def _set_llm_timeout(agent, timeout_seconds: int):
@@ -214,7 +210,7 @@ def make_chat_node(ctx: NodeContext):
             try:
                 docs = await ctx.retriever.retrieve(user_input)
                 # 过滤低相关度文档（避免噪音污染任务）
-                RAG_SCORE_THRESHOLD = 0.5
+                RAG_SCORE_THRESHOLD = 0.7
                 docs = [d for d in docs if d.get("score", 0) >= RAG_SCORE_THRESHOLD]
                 if docs:
                     from rag.retriever import Retriever
@@ -228,6 +224,7 @@ def make_chat_node(ctx: NodeContext):
         entity_code = ""
         entity_name = ""
         entity_type = ""
+        effective_input = user_input
         # RAG 辅助：用户消息无明确代码时，从 context 中提取最近分析的标的
         resolve_input = user_input
         if context and not re.search(r'\b\d{6}\b', user_input):
@@ -242,14 +239,12 @@ def make_chat_node(ctx: NodeContext):
                     entity_code = entity.get("code", "")
                     entity_name = entity.get("name", "")
                     entity_type = entity.get("type", "")
+                    # 直接用 resolver 生成的 effective_input（含实体注入+扩写）
+                    if entity.get("effective_input"):
+                        effective_input = entity["effective_input"]
                     logger.info("[Chat] 实体解析: %s → %s %s (%s)", user_input, entity_code, entity_name, entity_type)
             except Exception as e:
                 logger.debug("[Chat] 实体解析跳过: %s", e)
-
-        # ── 3. 消息标准化 ──
-        effective_input = user_input
-        if entity_code and entity_name:
-            effective_input = _expand_entity_query(user_input, entity_name, entity_code, entity_type)
 
         # ── 4. 意图分类：是否需要任务流程 ──
         needs_task = True
@@ -328,13 +323,17 @@ def make_plan_node(ctx: NodeContext):
         """规划：初始化 MCP + 生成任务描述。复盘时带前轮结果。"""
         trace = state.get("_trace")
         effective_input = state.get("effective_input", state["user_input"])
+        original_input = state.get("user_input", "")
+        context = state.get("context", "")
+        entity_code = state.get("entity_code", "")
+        entity_name = state.get("entity_name", "")
+        entity_type = state.get("entity_type", "")
 
         # MCP 延迟初始化（首次进入任务流程时才启动，直接回答路径跳过）
         if not ctx.mcp_tool_list:
             ctx.init_mcp()
         if not ctx.mcp_tool_list:
             logger.error("[Plan] MCP 不可用，退回直接回答")
-            # 用 LLM 直接回答，不进 execute
             direct = await ctx.llm.generate(messages=[
                 ChatMessage(role="system", content=ctx.system_prompt),
                 ChatMessage(role="user", content=effective_input),
@@ -351,7 +350,18 @@ def make_plan_node(ctx: NodeContext):
             replan_context = f"\n\n【前轮执行结果（步数耗尽）】\n{prev_result[:2000]}\n请基于上述进度继续完成任务。"
             logger.info("[Plan] 复盘第 %d 轮，前轮结果 %d 字符", replan_count, len(prev_result))
 
-        plan_input = effective_input + replan_context
+        # 组装 plan 输入：扩写消息 + 实体信息 + RAG 上下文 + 复盘结果
+        plan_parts = [effective_input]
+        if entity_code:
+            entity_desc = f"{entity_name}({entity_code})" if entity_name else entity_code
+            plan_parts.append(f"【实体】{entity_desc} [{entity_type}]")
+        if original_input != effective_input:
+            plan_parts.append(f"【原始消息】{original_input}")
+        if context:
+            plan_parts.append(f"【参考上下文】\n{context[:1500]}")
+        if replan_context:
+            plan_parts.append(replan_context)
+        plan_input = "\n\n".join(plan_parts)
 
         # _plan() 内部已将所有技能名+描述注入到 plan prompt，由 LLM 选择
         plan = await ctx.agent._plan(plan_input, ctx.llm, trace)

@@ -225,12 +225,22 @@ class MCPExecutor(LocalPythonExecutor):
         self._full_tool_map = full_tool_map or {}
 
     def send_tools(self, tools: dict):
-        """Override: 注入全量工具到 router，再注入 router 到 static_tools。"""
+        """Override: 注入全量工具到 router + 注入单个工具到 static_tools。"""
         # 先把全量工具注入 router 的 tool_map（运行时可调任何工具）
         self._router._tool_map.update(self._full_tool_map)
         super().send_tools(tools)
         self.static_tools["mcp"] = self._router.forward
-        logger.debug("[MCPExecutor] mcp router 已注入 static_tools，可调用 %d 个工具", len(self._router._tool_map))
+        # 注入单个工具到 static_tools（LLM 可直接调用，不需要走 mcp(action="call")）
+        for name, tool_obj in self._full_tool_map.items():
+            if name not in self.static_tools:
+                def _make_wrapper(t):
+                    def wrapper(**kwargs):
+                        return t.forward(**kwargs)
+                    wrapper.__name__ = t.name
+                    wrapper.__doc__ = getattr(t, 'description', '')[:200]
+                    return wrapper
+                self.static_tools[name] = _make_wrapper(tool_obj)
+        logger.debug("[MCPExecutor] 已注入 %d 个工具到 static_tools", len(self._full_tool_map))
 
 
 # ═══════════════════════════════════════════════════════════════
