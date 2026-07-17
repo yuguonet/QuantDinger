@@ -257,6 +257,9 @@ agent = TaskAgent(
     system_prompt="你是 QuantDinger 量化分析 AI 助手。用中文回答。",
     max_tool_rounds=MAX_TOOL_ROUNDS,
     skill_adapter=skills,
+    # tool_provider 未传入，_plan() 看不到可用工具列表和域列表。
+    # 如果 plan 阶段需要选择域，需要传入 tool_provider 并在 _plan() 中使用 self._tool_provider。
+    # 当前设计：plan 只选技能，不选域，工具在 execute 阶段通过 ctx.tool_provider 注入。
 )
 
 

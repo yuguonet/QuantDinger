@@ -1,7 +1,7 @@
 # QuantDinger Agent 模块设计文档
 
-> 最后更新: 2026-07-15
-> 版本: v1.0
+> 最后更新: 2026-07-18
+> 版本: v1.1
 > 状态: 生产环境运行中
 
 ---
@@ -68,8 +68,8 @@ Agent 模块是 QuantDinger 系统的智能决策核心，负责：
 │                              能力层                                             │
 │                                                                                 │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐        │
-│  │    RAG       │  │    LLM       │  │    Tools     │  │   Skills     │        │
-│  │  检索增强    │  │  大模型调用  │  │  工具集      │  │  技能系统    │        │
+│  │    RAG       │  │    LLM       │  │ToolProvider  │  │   Skills     │        │
+│  │  检索增强    │  │  大模型调用  │  │  统一工具表  │  │  技能系统    │        │
 │  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘        │
 └─────────────────────────────────────────────────────────────────────────────────┘
           │
@@ -115,7 +115,6 @@ backend_api_python/app/agent/
 │   ├── dashscope_llm.py  # 阿里云 DashScope
 │   ├── qd_llm.py         # QD 私有 LLM
 │   ├── qd_skills.py      # 技能适配器
-│   ├── qd_tools.py       # 工具注册
 │   └── factory.py        # LLM 工厂
 │
 ├── rag/                  # RAG 检索增强
@@ -131,15 +130,15 @@ backend_api_python/app/agent/
 │   ├── postgres_memory.py # PostgreSQL 实现
 │   └── redis_memory.py   # Redis 实现
 │
-├── tools/                # 工具集（102 个）
-│   ├── list_tools.py     # 工具发现（扫描 tools/ 目录）
-│   ├── search_tools.py   # 工具搜索（按关键词匹配）
+├── tools/                # 工具集（72 个）
+│   ├── base.py           # Tool 基类 + ToolProvider 统一注册表
 │   ├── data_tools.py     # 数据查询
 │   ├── analysis_tools.py # 技术分析
 │   ├── indicator_tools.py # 指标计算
 │   ├── news_search_tools.py # 新闻搜索
 │   ├── web_search_tools.py # 联网搜索
 │   ├── screener_tools.py # 选股器
+│   ├── format_utils.py   # 格式化工具（必选）
 │   └── ...               # 更多领域工具
 │
 ├── skills/               # 技能系统
@@ -208,8 +207,13 @@ class AgentState(TypedDict):
 
     # plan_node 输出
     task: str               # 任务描述
+    selected_skill: str     # 选中的技能名
+    selected_domain: str    # 选中的工具域
+    skill_body: str         # SKILL.md 正文
+    skill_tools: list       # 技能工具列表
     step_budget: int        # 步数预算
     planning_interval: int  # 规划间隔
+    task_type: str          # 任务子类型
 
     # execute_node 输出
     result_raw: str         # 执行结果
@@ -229,7 +233,7 @@ class AgentState(TypedDict):
 | 节点 | 职责 | 输入 | 输出 |
 |------|------|------|------|
 | `chat_node` | RAG检索 + 实体解析 + 意图分类 | user_input | context, entity, needs_task |
-| `plan_node` | 任务规划 + 工具选择 | effective_input | task, step_budget |
+| `plan_node` | 任务规划 + 技能/域选择 + 加载 SKILL.md | effective_input, context, history | task, selected_skill, selected_domain, skill_body, skill_tools, step_budget |
 | `execute_node` | CodeAgent 执行任务 | task, context | result_raw |
 | `finalize_node` | 存库 + 记忆 + 后处理 | result_raw | 最终输出 |
 
@@ -254,17 +258,21 @@ class AgentState(TypedDict):
 #### execute_node 详细流程
 
 ```
-task + context
+task + context + selected_domain + skill_tools
   │
-  ├─→ 构建 CodeAgent
-  │     ├─→ 扫描加载 tools/*.py 工具函数
-  │     ├─→ 加载 Skill 工具
-  │     └─→ 加载自定义 YAML 模板
+  ├─→ 构建 CodeAgent（通过 ToolProvider）
+  │     ├─→ ToolProvider 按 domain 过滤工具 → executor.custom_tools
+  │     ├─→ 技能工具注入 → executor.custom_tools
+  │     ├─→ 4 个必选工具 → smolagents tools=[]（system prompt 可见）
+  │     │     ├─ list_tools() — 列出工具
+  │     │     ├─ search_tools() — 搜索工具
+  │     │     ├─ format_result() — 格式化
+  │     │     └─ web_search() — 联网搜索
+  │     └─→ 全量工具 schema → planning YAML {{tool_list}}
   │
   ├─→ CodeAgent.run(task)
   │     └─→ ReAct 循环：思考 → 代码 → 观察
-  │           ├─→ list_tools() 发现可用工具
-  │           └─→ search_tools("关键词") 搜索工具
+  │           └─→ 工具直接调用，无需 router
   │
   ├─→ 提取失败工具
   │
@@ -276,51 +284,57 @@ task + context
 #### 核心职责
 
 - 构建 smolagents CodeAgent 实例
-- 扫描加载 tools/*.py 工具函数
+- 通过 ToolProvider 按 domain 过滤加载工具
 - 执行 ReAct 循环
+
+#### 工具架构（3 层可见性）
+
+| 层 | 包含什么 | 用途 |
+|---|---|---|
+| smolagents tools=[] | 4 个必选工具 | system prompt 自动描述，LLM 天然可见 |
+| executor.custom_tools | 领域工具 + 通用工具 + 技能工具 | LLM 代码可调用，但不占 prompt token |
+| YAML {{tool_list}} | 全量工具 schema（按 domain 过滤） | planning/replan 选工具 |
+
+必选工具：list_tools、search_tools、format_result、web_search
 
 #### CodeAgent 构建
 
 ```python
-def _build_code_agent(self, model, skill_tools, ...):
-    # 1. 扫描 tools/ 目录，加载所有工具函数
-    tool_functions = {}
-    for py_file in sorted(tools_dir.glob("*.py")):
-        mod = importlib.import_module(f"tools.{py_file.stem}")
-        for attr_name in dir(mod):
-            func = getattr(mod, attr_name)
-            if callable(func) and not inspect.isclass(func):
-                tool_functions[attr_name] = func
+def _build_code_agent(self, model, provider, skill_tools, domain, ...):
+    # 1. ToolProvider 按 domain 过滤工具函数
+    if domain:
+        allowed = provider.list_by_domain("common") + provider.list_by_domain(domain)
+    else:
+        allowed = provider.list_by_domain("common")
+    tool_functions = {n: f for n, f in provider.get_functions().items() if n in allowed}
 
-    # 2. 注入 list_tools / search_tools
-    tool_functions["list_tools"] = list_tools
-    tool_functions["search_tools"] = search_tools
+    # 2. 技能工具注入（私有，不和 tools/ 通用）
+    for st in skill_tools:
+        tool_functions[st.name] = st
 
-    # 3. 创建 LocalPythonExecutor（工具注入 custom_tools）
+    # 3. 创建 executor，注入 custom_tools
     executor = LocalPythonExecutor(...)
     executor.custom_tools = tool_functions
 
-    # 4. 创建 CodeAgent（tools=[]，通过 executor 注入）
-    agent = SmolCodeAgent(tools=[], model=model, executor=executor, ...)
+    # 4. 4 个必选工具注册为 smolagents Tool，放入 tools=[]
+    smol_tools = [_SearchToolsTool(), _ListToolsTool(), _FormatResultTool(), _WebSearchTool()]
 
-    # 5. 加载自定义 YAML 模板
-    agent.prompt_templates.update(_load_code_agent_yaml())
+    # 5. 创建 CodeAgent
+    agent = SmolCodeAgent(tools=smol_tools, model=model, executor=executor, ...)
+
+    # 6. 注入 YAML 模板，替换 {{tool_list}}
+    planning["initial_plan"] = planning["initial_plan"].replace("{{tool_list}}", provider.get_schemas_text(names_filter=allowed))
 
     return agent
 ```
 
-#### 工具发现机制
-
-工具不写入 system prompt，通过 list_tools/search_tools 动态发现：
+#### LLM 工作流
 
 ```python
-# LLM 在 CodeAgent 中调用
-tools = list_tools()              # 列出所有可用工具
-tools = list_tools("all")        # 列出所有领域工具
-result = search_tools("资金")    # 按关键词搜索
+result = search_tools("资金")                    # 发现（必选工具，system prompt 可见）
+result = get_fund_flow(codes="600519")           # 直接调用（在 custom_tools 中）
+final_answer(result)                              # 输出（系统自动格式化）
 ```
-
-优势：工具数量增长不影响 prompt token，102 个工具与 10 个工具的 token 开销相同。
 
 ### 3.4 RAG 检索增强 (`rag/`)
 
@@ -438,6 +452,28 @@ def create_llm(config) -> LLMBase:
 
 ### 3.6 工具系统 (`tools/`)
 
+#### ToolProvider 统一注册表
+
+```python
+class ToolProvider:
+    # 扫描 tools/ 根目录（通用工具）+ 子目录（领域工具）
+    scan_directory(tools_dir, domain, package_prefix)
+    scan_subdirectories(tools_dir, package_prefix)
+
+    # 两种输出
+    get_functions() -> Dict[str, Callable]   # executor 用
+    get_schemas() -> List[dict]              # planning 用
+    get_schemas_text(names_filter) -> str    # YAML {{tool_list}} 注入
+
+    # LLM 面向接口
+    list_tools(domain) -> str    # 列出工具
+    search_tools(query, domain) -> str  # 搜索工具
+
+    # 单例
+    set_default(provider)
+    get_default() -> ToolProvider
+```
+
 #### 工具分类
 
 | 类别 | 工具数 | 说明 |
@@ -449,26 +485,24 @@ def create_llm(config) -> LLMBase:
 | 联网搜索 | 12 | Bocha/Tavily/百度/SearXNG |
 | 选股筛选 | 6 | 条件选股、板块筛选 |
 | 其他工具 | 50+ | 资金流、龙虎榜、回测等 |
-| **总计** | **102** | 自动扫描注册 |
+| **总计** | **72** | ToolProvider 自动扫描注册 |
 
 #### 工具发现与调用
 
-工具通过 `list_tools` / `search_tools` 动态发现，不写入 system prompt：
+必选工具（4 个）通过 smolagents tools=[] 注入 system prompt：
+- `list_tools()` — 列出可用工具
+- `search_tools()` — 按关键词搜索
+- `format_result()` — 格式化输出
+- `web_search()` — 联网搜索
+
+领域工具通过 executor.custom_tools 注入，可调用但不占 prompt token：
 
 ```python
-# 工具发现（list_tools.py）
-def list_tools(domain: str = "") -> str:
-    """扫描 tools/ 目录，列出所有可用工具"""
-
-def search_tools(query: str, domain: str = "") -> str:
-    """按关键词搜索工具"""
+# LLM 工作流
+result = search_tools("资金")                    # 发现
+result = get_fund_flow(codes="600519")           # 直接调用
+final_answer(result)                              # 输出
 ```
-
-工作原理：
-- 工具函数通过 `executor.custom_tools` 注入执行命名空间
-- 工具**可调用但不占 prompt token**
-- LLM 需要时调 `list_tools()` 或 `search_tools("关键词")` 动态发现
-- 102 个工具与 10 个工具的 prompt 开销相同（~100 token）
 
 #### 联网搜索 (`web_search_tools.py`)
 
@@ -586,11 +620,19 @@ skills/market_screener/
 
 #### plan_system.txt
 
-Plan 阶段的系统提示词，指导 LLM：
-- 分析任务
-- 选择技能
-- 划分阶段
-- 生成 step_budget
+Plan 阶段的系统提示词，多占位符注入上下文：
+
+```
+用户消息: {user_input}
+{entity_info}        ← 实体信息
+{task_type_info}     ← 意图类型
+{rag_context}        ← RAG 检索结果
+{history_context}    ← 历史对话
+可用技能: {skills_text}
+{completed_phases_text}  ← 复盘上下文
+```
+
+输出 JSON：`task` + `selected_skill` + `selected_domain` + `step_budget`
 
 #### code_agent.yaml
 
@@ -854,7 +896,7 @@ def my_tool(param1: str, param2: int) -> dict:
     return {"result": "...", "_fields": ["result"]}
 ```
 
-工具自动被 `list_tools` 发现并注册。
+工具自动被 ToolProvider 扫描注册。必选工具（list_tools/search_tools/format_result/web_search）放在 `_MUST_HAVE` 中，provider 不扫描。
 
 ### 7.2 添加新技能
 
@@ -926,9 +968,10 @@ if provider == "my": return MyEmbedding(...)
 
 ### 8.1 工具发现优化
 
-- **动态发现**：工具不写入 system prompt，运行时按需发现
-- **零启动开销**：无子进程启动，工具直接在 executor 命名空间
-- **token 节省**：102 个工具仅占 ~100 prompt token（list_tools 描述）
+- **3 层可见性**：必选工具占 prompt token，领域工具不占，schema 仅 planning 可见
+- **零启动开销**：无子进程启动（已移除 MCP），工具直接在 executor 命名空间
+- **domain 过滤**：plan 选域后只加载域+通用工具，减少 executor 噪音
+- **直接调用**：无需 router，LLM 直接调工具函数
 
 ### 8.2 RAG 优化
 
@@ -1000,7 +1043,7 @@ class TraceCollector:
 
 | 问题 | 状态 | 说明 |
 |------|------|------|
-| CodeAgent planning prompt 工具注入失败 | 🔧 调试中 | YAML 模板结构问题 |
+| ~~CodeAgent planning prompt 工具注入失败~~ | ✅ 已修复 | 通过 {{tool_list}} 注入 |
 | llama.cpp router mode 不支持 embedding | ⚠️ 已知 | 需要两个实例 |
 | PgVectorStore 性能瓶颈 | 📋 待优化 | 需引入 pgvector 扩展 |
 
@@ -1073,7 +1116,7 @@ data: {"type": "done", "content": "**股票名称**: ...", "session_id": "..."}
 
 ### GET /api/agent-v2/tools
 
-工具列表（通过 list_tools 动态发现）
+工具列表（通过 ToolProvider 动态发现）
 
 ### GET /api/agent-v2/skills
 
