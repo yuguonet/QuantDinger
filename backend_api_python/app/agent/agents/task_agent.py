@@ -736,8 +736,10 @@ class TaskAgent(AgentBase):
         # search_tools — 工具发现函数（扫描 tools/ 目录，支持领域化搜索）
         from tools.search_tools import search_tools
         from tools.list_tools import list_tools
+        from tools.format_utils import format_result
         tool_functions["search_tools"] = search_tools
         tool_functions["list_tools"] = list_tools
+        tool_functions["format_result"] = format_result
 
         # final_answer — 必须通过 additional_functions 注入 static_tools
         # evaluate_python_code 只对 static_tools 中的 final_answer 包装 FinalAnswerException
