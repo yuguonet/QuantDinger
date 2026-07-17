@@ -51,6 +51,7 @@ class AgentState(TypedDict, total=False):
 
     # ── chat_node 路由 ──
     needs_task: bool      # True=进 plan→execute 任务流程, False=直接回答
+    task_type: str        # 任务子类型: analysis/screen/compare/query/general
     direct_answer: str    # 直接回答内容（needs_task=False 时有值）
 
     # ── plan_node 输出 ──
@@ -246,38 +247,64 @@ def make_chat_node(ctx: NodeContext):
             except Exception as e:
                 logger.debug("[Chat] 实体解析跳过: %s", e)
 
-        # ── 4. 意图分类：是否需要任务流程 ──
+        # ── 4. 意图分类：统一 LLM 分类 ──
         needs_task = True
         direct_answer = ""
+        task_type = ""
 
-        # 有实体 → 必须走任务流程
-        if entity_code:
-            needs_task = True
-        else:
-            # 无实体，用 LLM 快速判断意图（RAG 上下文辅助）
+        try:
+            # 从文件加载意图分类器 prompt
+            intent_system = ""
             try:
+                import os
+                intent_prompt_path = os.path.join(os.path.dirname(__file__), "prompts", "intent_classifier.txt")
+                with open(intent_prompt_path, encoding="utf-8") as f:
+                    intent_system = f.read()
+            except Exception:
+                # 兜底：硬编码
                 intent_system = (
-                    "你是意图分类器。判断用户消息是否需要调用工具完成任务。\n"
-                    "需要工具（分析、查询、搜索、计算、对比等）回复: task\n"
-                    "不需要工具（闲聊、问候、简单知识问答、感谢等）回复: chat\n"
-                    "只回复一个词: task 或 chat"
+                    "你是意图分类器。判断用户消息的意图类型。\n"
+                    "输出格式: 只回复一个类型词\n"
+                    "类型说明：\n"
+                    "- task: 需要工具完成任务（分析、查询、搜索、计算、对比等）\n"
+                    "- chat: 不需要工具（闲聊、问候、简单知识问答、感谢等）\n"
+                    "- analysis: 分析、评估、诊断\n"
+                    "- screen: 筛选、选股、推荐、找\n"
+                    "- compare: 对比、比较、PK\n"
+                    "- query: 查询、查一下、获取数据\n"
+                    "- code: 写代码、开发、编程、实现功能\n"
+                    "- explain: 解释、说明、教学、教程\n"
+                    "- general: 其他需要工具的任务\n"
+                    "只回复一个类型词，不要解释"
                 )
-                if context:
-                    intent_system += f"\n\n【参考上下文】\n{context[:1000]}\n如果上下文中提到过具体标的或分析，优先判断为 task。"
-                intent_messages = [
-                    ChatMessage(role="system", content=intent_system),
-                    ChatMessage(role="user", content=user_input),
-                ]
-                intent_resp = await ctx.llm.generate(messages=intent_messages)
-                intent = (intent_resp.content or "").strip().lower()
-                if "chat" in intent and "task" not in intent:
-                    needs_task = False
-                    logger.info("[Chat] 意图分类: chat（直接回答）")
-                else:
-                    logger.info("[Chat] 意图分类: task（进入任务流程）")
-            except Exception as e:
-                logger.warning("[Chat] 意图分类失败，默认走任务流程: %s", e)
+            if context:
+                intent_system += f"\n\n【参考上下文】\n{context[:1000]}\n如果上下文中提到过具体标的或分析，优先判断为 task。"
+            if entity_code:
+                intent_system += f"\n\n【已识别实体】{entity_name}({entity_code}) [{entity_type}]\n该实体已解析完成，用户消息必然需要工具，优先判断为 task。"
+            intent_messages = [
+                ChatMessage(role="system", content=intent_system),
+                ChatMessage(role="user", content=user_input),
+            ]
+            intent_resp = await ctx.llm.generate(messages=intent_messages)
+            intent = (intent_resp.content or "").strip().lower()
+            if "chat" in intent and "task" not in intent:
+                needs_task = False
+                logger.info("[Chat] 意图分类: chat（直接回答）")
+            else:
                 needs_task = True
+                # 提取 task_type
+                _ALL_TYPES = ["analysis", "screen", "compare", "query", "code", "explain", "general"]
+                for tt in _ALL_TYPES:
+                    if tt in intent:
+                        task_type = tt
+                        break
+                if not task_type:
+                    task_type = "general"
+                logger.info("[Chat] 意图分类: task, 子类型=%s", task_type)
+        except Exception as e:
+            logger.warning("[Chat] 意图分类失败，默认走任务流程: %s", e)
+            needs_task = True
+            task_type = "general"
 
         # ── 5. 直接回答（不需要工具）──
         if not needs_task:
@@ -310,6 +337,7 @@ def make_chat_node(ctx: NodeContext):
             "sources": sources,
             "effective_input": effective_input,
             "needs_task": needs_task,
+            "task_type": task_type,
             "direct_answer": direct_answer,
         }
 
@@ -328,6 +356,7 @@ def make_plan_node(ctx: NodeContext):
         entity_code = state.get("entity_code", "")
         entity_name = state.get("entity_name", "")
         entity_type = state.get("entity_type", "")
+        task_type = state.get("task_type", "")
 
         # MCP 延迟初始化（首次进入任务流程时才启动，直接回答路径跳过）
         if not ctx.mcp_tool_list:
@@ -355,6 +384,18 @@ def make_plan_node(ctx: NodeContext):
         if entity_code:
             entity_desc = f"{entity_name}({entity_code})" if entity_name else entity_code
             plan_parts.append(f"【实体】{entity_desc} [{entity_type}]")
+        # 意图类型映射
+        _TASK_TYPE_DESC = {
+            "analysis": "分析/评估/诊断",
+            "screen": "筛选/选股/推荐",
+            "compare": "对比/比较",
+            "query": "查询/获取数据",
+            "code": "写代码/开发/编程",
+            "explain": "解释/说明/教学",
+            "general": "通用任务",
+        }
+        if task_type:
+            plan_parts.append(f"【意图】{_TASK_TYPE_DESC.get(task_type, task_type)}")
         if original_input != effective_input:
             plan_parts.append(f"【原始消息】{original_input}")
         if context:

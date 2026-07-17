@@ -55,9 +55,12 @@ result = evaluate_stocks(codes="600519,300129,000858", depth="standard", period=
 ```python
 if "error" in result:
     final_answer(f"评估失败: {result['error']}")
-else:
-    report = result["report"]
-    # ... 继续处理
+    return  # 错误时才 final_answer，成功时继续到 Step 3
+
+# 成功时不要 final_answer，继续到 Step 3
+report = result["report"]
+llm_data = result["llm_data"]
+verified = result["verified"]
 ```
 
 返回：
@@ -95,6 +98,15 @@ verified = result["verified"]  # 交叉验证
 基于 llm_data 生成综合分析（150字以内），拼在 report 后面：
 
 ```python
+# llm_data 实际字段（不要用不存在的字段名）
+tech_factors = llm_data.get("technical_factors", [])  # 技术因子列表
+tech_signals = llm_data.get("technical_signals", "")  # 技术信号
+fund_flow = llm_data.get("fund_flow", {})  # 资金流向
+capital = llm_data.get("capital", {})  # 资本结构
+indicator_details = llm_data.get("indicator_details", {})  # 指标详情
+trend_details = llm_data.get("trend_details", {})  # 趋势详情
+
+# 基于以上数据生成综合分析，不要输出原始 dict
 analysis = "你的分析内容..."  # 核心逻辑 + 风险点 + 操作建议
 final_answer(report + "\n**综合分析**: " + analysis)
 ```
@@ -106,10 +118,6 @@ final_answer(report + "\n**综合分析**: " + analysis)
 - 风险点：需要注意什么
 - 操作建议：具体策略（持有/买入/卖出的时机）
 - 控制在 150 字以内
-
-**错误示范：**
-- ❌ `final_answer(str(result))` — 输出原始 dict
-- ❌ `final_answer("综合分析报告内容")` — 占位符
 
 ### Step 3b: 多股分析
 
