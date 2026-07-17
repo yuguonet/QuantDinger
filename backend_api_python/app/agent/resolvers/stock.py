@@ -16,6 +16,42 @@ _SEPARATORS = re.compile(r'[和、，,\s]+')
 _STOCK_VERBS = re.compile(r'分析|看看|查一下|怎么样|什么股|股票|推荐|选|买|卖|对比|比较')
 
 
+def _expand_stock_query(user_input: str, entities: list[dict]) -> str:
+    """将股票分析指令扩写为完整指令。
+
+    Args:
+        user_input: 原始用户消息
+        entities: 解析出的实体列表 [{code, name, type}, ...]
+
+    Returns:
+        扩写后的指令，如 "分析贵州茅台(600519): 帮我看看最近能不能买，周期：T+3，深度：标准"
+    """
+    if not entities:
+        return user_input
+
+    # 构建实体描述：名称(代码)
+    entity_parts = []
+    for e in entities:
+        if e.get('name') and e.get('code'):
+            entity_parts.append(f"{e['name']}({e['code']})")
+        elif e.get('code'):
+            entity_parts.append(e['code'])
+    entity_desc = ",".join(entity_parts)
+
+    # 注入实体信息
+    expanded = user_input
+    for e in entities:
+        if e.get('name') and e.get('code'):
+            if e['name'] in expanded:
+                expanded = expanded.replace(e['name'], f"{e['name']}({e['code']})", 1)
+            elif e['code'] in expanded:
+                expanded = expanded.replace(e['code'], f"{e['name']}({e['code']})", 1)
+
+    # 加默认分析参数
+    default_params = "周期：T+3（T+1/T+3/1W/1M），深度：标准（简单/标准/深度）"
+    return f"{expanded}，{default_params}"
+
+
 class StockResolver(EntityResolver):
     """股票实体解析器。
 
@@ -86,18 +122,8 @@ class StockResolver(EntityResolver):
         entity_name = ",".join(e['name'] for e in unique if e['name'])
         entity_type = "stock"
 
-        # 扩写：将代码/名称注入原始消息
-        # "分析南威软件和雪天盐业" → "分析南威软件(603636)和雪天盐业(600929)"
-        # "分析泰胜风能和300497" → "分析泰胜风能(300129)和海辰药业(300497)"
-        effective_input = user_input
-        for e in unique:
-            if e['name'] and e['code']:
-                if e['name'] in effective_input:
-                    # 用户输入了名称：替换名称为 名称(代码)
-                    effective_input = effective_input.replace(e['name'], f"{e['name']}({e['code']})", 1)
-                elif e['code'] in effective_input:
-                    # 用户输入了代码：替换代码为 名称(代码)
-                    effective_input = effective_input.replace(e['code'], f"{e['name']}({e['code']})", 1)
+        # 扩写：注入实体信息 + 默认分析参数
+        effective_input = _expand_stock_query(user_input, unique)
 
         return ResolveResult(
             entities=unique,
