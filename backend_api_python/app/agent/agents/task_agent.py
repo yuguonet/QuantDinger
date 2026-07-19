@@ -22,7 +22,6 @@
 """
 from __future__ import annotations
 
-import asyncio
 import inspect
 import logging
 import os
@@ -32,8 +31,7 @@ from typing import Dict, List, Optional
 
 import yaml
 
-import nest_asyncio
-nest_asyncio.apply()
+
 
 from agents.base import AgentBase, AgentResponse
 from llm.base import ChatMessage, LLMBase
@@ -86,11 +84,35 @@ def _load_code_agent_yaml() -> dict:
 # ═══════════════════════════════════════════════════════════════
 
 class _LLMAdapter:
-    """把 LLMBase 包装为 smolagents Model 接口。"""
+    """把 LLMBase 包装为 smolagents Model 接口。
+
+    直接使用同步 OpenAI client 调用 LLM，避免 asyncio.run() 的
+    事件循环开销和 nest_asyncio 依赖。
+    """
 
     def __init__(self, llm: LLMBase):
         self._llm = llm
         self.model_id = getattr(llm, "model", "unknown")
+        self._sync_client = None
+
+    def _get_sync_client(self):
+        """惰性创建同步 OpenAI client（复用 _llm 的连接配置）。"""
+        if self._sync_client is not None:
+            return self._sync_client
+        try:
+            from openai import OpenAI
+        except ImportError:
+            raise ImportError("openai 未安装，请运行: pip install openai")
+        client_kwargs = {
+            "api_key": self._llm.api_key,
+            "timeout": self._llm.timeout,
+            "max_retries": self._llm.max_retries,
+        }
+        base_url = getattr(self._llm, "base_url", None)
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        self._sync_client = OpenAI(**client_kwargs)
+        return self._sync_client
 
     @staticmethod
     def _normalize_code_blocks(content: str) -> str:
@@ -125,7 +147,43 @@ class _LLMAdapter:
             chat_messages.append(ChatMessage(role=role, content=content))
 
         try:
-            resp = asyncio.run(self._llm.generate(chat_messages))
+            client = self._get_sync_client()
+            formatted_messages = [m.to_dict() for m in chat_messages]
+            response = client.chat.completions.create(
+                model=self._llm.model,
+                messages=formatted_messages,
+                temperature=self._llm.temperature,
+                max_tokens=self._llm.max_tokens,
+                top_p=self._llm.top_p,
+            )
+            choice = response.choices[0]
+            content = choice.message.content or ""
+            finish_reason = choice.finish_reason or "stop"
+            tool_calls = []
+            if choice.message.tool_calls:
+                for tc in choice.message.tool_calls:
+                    tool_calls.append({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    })
+                finish_reason = "tool_calls"
+            usage = response.usage
+            prompt_tokens = usage.prompt_tokens if usage else 0
+            completion_tokens = usage.completion_tokens if usage else 0
+            from llm.base import LLMResponse
+            resp = LLMResponse(
+                content=content,
+                tool_calls=tool_calls,
+                model=self._llm.model,
+                finish_reason=finish_reason,
+                tokens_used=prompt_tokens + completion_tokens,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
         except KeyboardInterrupt:
             logger.warning("[LLMAdapter] LLM 调用被中断")
             raise

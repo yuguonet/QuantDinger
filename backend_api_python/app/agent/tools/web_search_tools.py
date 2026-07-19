@@ -182,6 +182,7 @@ def _tavily_search(query: str, count: int = 8, days: int = 7) -> Dict[str, Any]:
             search_depth=search_depth,
             include_answer=True,
             topic="general",
+            days=days,
         )
 
         results = []
@@ -310,6 +311,67 @@ _ENGINES = [
 ]
 
 
+def _filter_by_date(results: List[Dict], max_age_days: int = 180) -> List[Dict]:
+    """后置过滤：根据 published 字段剔除超过 max_age_days 天的结果。
+
+    解析 published 字段中的日期，与当前日期比较。
+    无法解析日期的结果保留（可能是实时数据或格式不标准）。
+    """
+    from datetime import datetime, timedelta
+
+    if not results or max_age_days <= 0:
+        return results
+
+    cutoff = datetime.now() - timedelta(days=max_age_days)
+    filtered = []
+
+    # 常见日期格式
+    date_patterns = [
+        (r"(\d{4})-(\d{2})-(\d{2})", "%Y-%m-%d"),
+        (r"(\d{4})/(\d{2})/(\d{2})", "%Y/%m/%d"),
+        (r"(\d{4})年(\d{1,2})月(\d{1,2})日", None),  # 中文格式特殊处理
+    ]
+
+    for r in results:
+        published = r.get("published", "") or ""
+        if not published:
+            # 无日期信息，保留
+            filtered.append(r)
+            continue
+
+        parsed_date = None
+        # 尝试 ISO 格式 (2026-07-19T10:00:00)
+        try:
+            parsed_date = datetime.fromisoformat(published[:19])
+        except (ValueError, TypeError):
+            pass
+
+        # 尝试常见格式
+        if not parsed_date:
+            for pattern, fmt in date_patterns:
+                m = re.search(pattern, published)
+                if m:
+                    try:
+                        if fmt:
+                            parsed_date = datetime.strptime(m.group(0), fmt)
+                        else:
+                            # 中文格式
+                            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                            parsed_date = datetime(y, mo, d)
+                    except (ValueError, TypeError):
+                        pass
+                    break
+
+        if parsed_date and parsed_date >= cutoff:
+            filtered.append(r)
+        elif not parsed_date:
+            # 无法解析，保守保留
+            filtered.append(r)
+        # parsed_date < cutoff 的结果被丢弃
+
+    return filtered
+
+
 def _unified_search(query: str, count: int = 8, freshness: str = "",
                     engines: str = "", language: str = "zh") -> Dict[str, Any]:
     cache_key = f"{query}|{count}|{freshness}"
@@ -317,15 +379,31 @@ def _unified_search(query: str, count: int = 8, freshness: str = "",
     if cached:
         return cached
 
+    # freshness → max_age_days 映射（后置过滤用）
+    # "" = 不过滤（知识型查询），有值时按值过滤
+    _FRESHNESS_DAYS = {"pd": 1, "pw": 7, "pm": 30, "py": 365}
+    max_age_days = _FRESHNESS_DAYS.get(freshness, 0)  # 0 = 不过滤
+
     errors = []
     for name, fn in _ENGINES:
         result = fn(query, count, freshness)
         if result["success"]:
             result["query"] = query
-            # 写入缓存前去重
-            result["results"] = _deduplicate(result.get("results", []))
-            _cache_set(cache_key, result)
-            return result
+            # 后置日期过滤：剔除过期结果
+            before_filter = len(result.get("results", []))
+            result["results"] = _filter_by_date(result.get("results", []), max_age_days)
+            after_filter = len(result["results"])
+            if before_filter > after_filter:
+                logger.info("[WebSearch] 日期过滤: %d → %d 条（剔除 %d 条超过 %d 天的）",
+                            before_filter, after_filter, before_filter - after_filter, max_age_days)
+            # 去重
+            result["results"] = _deduplicate(result["results"])
+            if result["results"]:  # 过滤后仍有结果
+                _cache_set(cache_key, result)
+                return result
+            # 过滤后无结果，尝试下一个引擎
+            logger.info("[WebSearch] %s 日期过滤后无结果，尝试下一个引擎", name)
+            continue
         errors.append(f"{name}: {result.get('error', '?')}")
         logger.info("[WebSearch] %s 失败 → 下一个", name)
 
@@ -340,14 +418,14 @@ def _unified_search(query: str, count: int = 8, freshness: str = "",
 #  工具函数 (ToolRegistry 自动发现)
 # ═══════════════════════════════════════════════════════════════
 
-def web_search(query: str, count: int = 8, freshness: str = "") -> dict:
+def web_search(query: str, count: int = 8, freshness: str = "pm") -> dict:
     """
     联网搜索 — 获取互联网实时信息。任何工具无法覆盖的查询（天气、新闻、百科、实时数据等）都可使用。
 
     Args:
         query: 搜索关键词，支持自然语言（如 "2025年央行降准最新消息"）
         count: 返回结果数量，1-10，默认 8
-        freshness: 时效过滤（pd=当天, pw=本周, pm=本月, py=今年，空=不限）
+        freshness: 时效过滤（pd=当天, pw=本周, pm=本月, py=今年，空=不限），默认 pm（本月）
 
     Returns:
         搜索结果列表 + AI 摘要（如有）

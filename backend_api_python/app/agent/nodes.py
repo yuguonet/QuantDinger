@@ -646,7 +646,14 @@ def make_finalize_node(ctx: NodeContext):
     """创建 finalize_node（闭包捕获 ctx）。"""
 
     async def finalize_node(state: dict) -> dict:
-        """最终阶段：格式化汇总 → 存库 → 追加错误信息 → 保存 memory。"""
+        """最终阶段：保存原始结果 → 存库 → 追加错误信息 → 格式化输出。
+
+        保存顺序设计：
+          1. memory 存原始 result_raw（复盘时 plan_node 拿到真实进度）
+          2. TraceCollector 存原始 result_raw（Evaluator 回溯用原始数据）
+          3. 追加失败工具信息
+          4. 格式化（仅 task 模式 + 有工具产出时，只影响最终输出给用户）
+        """
         from agents.task_agent import _collectors
 
         session_id = state.get("session_id", "default")
@@ -660,9 +667,51 @@ def make_finalize_node(ctx: NodeContext):
         if agent_plan:
             logger.info("[Finalize] Agent 规划:\n%s", agent_plan[:500])
 
-        # ── 1. 结果格式化汇总 ──
-        # selected_skill 有值时跳过（SKILL.md 已定义输出规范）
-        if not selected_skill and result_raw and not result_raw.startswith("["):
+        # ── 1. 保存 memory（原始 result_raw，给复盘用）──
+        if ctx.memory:
+            try:
+                await ctx.memory.add(session_id, "user", state["user_input"])
+                await ctx.memory.add(session_id, "assistant", result_raw)
+            except Exception as e:
+                logger.warning("[Finalize] memory 保存失败: %s", e)
+
+        # ── 2. TraceCollector 存库（原始 result_raw，给 Evaluator 用）──
+        domain_root_id = None
+        collector_root_id = None
+        collector = _collectors.get(session_id)
+        if collector:
+            try:
+                collector.on_agent_finish(
+                    final_answer=result_raw,
+                    total_steps=1,
+                    total_tokens=0,
+                    model=getattr(ctx.llm, "model", "unknown"),
+                )
+                if not domain_root_id:
+                    collector_root_id = collector.flush()
+            except Exception as e:
+                logger.warning("[Finalize] TraceCollector 存库失败: %s", e)
+            finally:
+                _collectors.pop(session_id, None)
+
+        # ── 3. 记录 root_id 供反馈闭环使用 ──
+        root_id = domain_root_id or collector_root_id
+        if root_id:
+            from feedback import record_session_root
+            record_session_root(session_id, root_id)
+
+        # ── 4. 追加失败工具信息 ──
+        if failed_tools:
+            lines = []
+            for name, desc in failed_tools:
+                lines.append(f"{name} -- {desc[:60]}" if desc else name)
+            missing = "\n".join(lines)
+            result_raw = f"{result_raw}\n\n【数据完整性】以下工具未获取到数据:\n{missing}"
+
+        # ── 5. 结果格式化（仅 task 模式 + 有工具产出时）──
+        needs_task = state.get("needs_task", True)
+        has_tool_output = bool(state.get("result_raw"))  # execute_node 产出过结果
+        if needs_task and has_tool_output and not selected_skill:
             try:
                 from formatters.base import get_formatter
                 entity_type = state.get("entity_type", "")
@@ -678,48 +727,6 @@ def make_finalize_node(ctx: NodeContext):
                 result_raw = await formatter.format(result_raw, fmt_context)
             except Exception as e:
                 logger.warning("[Finalize] 格式化失败，使用原始数据: %s", e)
-
-        # ── 2. TraceCollector 存库 ──
-        domain_root_id = None
-        collector_root_id = None
-        collector = _collectors.get(session_id)
-        if collector:
-            try:
-                collector.on_agent_finish(
-                    final_answer=result_raw,
-                    total_steps=1,
-                    total_tokens=0,
-                    model=getattr(ctx.llm, "model", "unknown"),
-                )
-                if not domain_root_id:
-                    # 领域后处理未存，由 collector 存
-                    collector_root_id = collector.flush()
-            except Exception as e:
-                logger.warning("[Finalize] TraceCollector 存库失败: %s", e)
-            finally:
-                _collectors.pop(session_id, None)
-
-        # ── 3. 记录 root_id 供反馈闭环使用 ──
-        root_id = domain_root_id or collector_root_id
-        if root_id:
-            from feedback import record_session_root
-            record_session_root(session_id, root_id)
-
-        # ── 4. 追加失败工具信息（在领域提取之后，不污染提取） ──
-        if failed_tools:
-            lines = []
-            for name, desc in failed_tools:
-                lines.append(f"{name} -- {desc[:60]}" if desc else name)
-            missing = "\n".join(lines)
-            result_raw = f"{result_raw}\n\n【数据完整性】以下工具未获取到数据:\n{missing}"
-
-        # ── 5. 保存 memory ──
-        if ctx.memory:
-            try:
-                await ctx.memory.add(session_id, "user", state["user_input"])
-                await ctx.memory.add(session_id, "assistant", result_raw)
-            except Exception as e:
-                logger.warning("[Finalize] memory 保存失败: %s", e)
 
         # 计算耗时
         start_time = state.get("_start_time", 0)
