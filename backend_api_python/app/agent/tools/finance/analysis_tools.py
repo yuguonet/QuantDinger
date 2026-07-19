@@ -11,7 +11,7 @@ import math
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.agent.log import logger
-from app.agent.tools._analysis_utils import (
+from app.agent.tools.finance._analysis_utils import (
     _get_ds, _fetch_klines, _fetch_closes, _fetch_ohlcv, _safe_round, _calc_obv, _fetch_realtime_volume_ratio,
 )
 
@@ -1530,7 +1530,7 @@ def analyze_pattern(codes: str) -> Dict[str, Any]:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
 # get_chip_distribution 已迁移至 chip_distribution.py
-from app.agent.tools.chip_distribution import get_chip_distribution  # noqa: F401
+from app.agent.tools.finance.chip_distribution import get_chip_distribution  # noqa: F401
 def get_indicator_snapshot(codes: str) -> Dict[str, Any]:
     """指标快照：一次返回MACD/RSI/BOLL/KDJ/KD的最新数值和金叉/死叉/超买超卖状态。
 

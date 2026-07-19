@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any, Dict, List
 from app.agent.utils.md_format import _format_final_md, _lookup_stock_name
 
-from app.agent.tools.news_search_tools import (
+from app.agent.tools.finance.news_search_tools import (
     search_stock_intel,
     search_policy_intel,
 )

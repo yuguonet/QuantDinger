@@ -375,6 +375,23 @@ def make_chat_node(ctx: NodeContext):
             needs_task = True
             task_type = "general"
 
+        # ── 4.5 Cron 意图拦截：直接创建定时任务，不走 plan/execute ──
+        if task_type == "cron":
+            try:
+                from agents.task_agent import TaskAgent
+                cron_result = TaskAgent._try_intercept_cron(user_input, session_id)
+                if cron_result is not None:
+                    needs_task = False
+                    direct_answer = cron_result.content
+                    logger.info("[Chat] Cron 意图拦截成功: %s", direct_answer[:80])
+                else:
+                    # 正则未匹配，降级为普通 task
+                    task_type = "general"
+                    logger.info("[Chat] Cron 意图但正则未匹配，降级为 task")
+            except Exception as e:
+                task_type = "general"
+                logger.warning("[Chat] Cron 拦截异常，降级为 task: %s", e)
+
         # ── 5. 直接回答（不需要工具）──
         if not needs_task:
             messages = [ChatMessage(role="system", content=ctx.system_prompt)]

@@ -14,7 +14,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from app.agent.log import logger
-from app.agent.tools._analysis_utils import _fetch_klines
+from app.agent.tools.finance._analysis_utils import _fetch_klines
 
 
 # ═══════════════════════════════════════════════════════════════

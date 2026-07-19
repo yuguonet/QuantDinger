@@ -15,7 +15,7 @@
 from __future__ import annotations
 import json
 
-from app.agent.tools.em_utils import em_datacenter
+from app.agent.tools.finance.em_utils import em_datacenter
 def _strip_prefix(s):
     from app.data_sources.normalizer import strip_market_prefix
     return strip_market_prefix(s)

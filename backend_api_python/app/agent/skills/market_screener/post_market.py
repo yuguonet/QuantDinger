@@ -167,7 +167,7 @@ def prescreen(date: str) -> Dict[str, Any]:
     main_themes = [(tag, cnt) for tag, cnt in hot_tags[:5]]
 
     try:
-        from app.agent.tools.screener_tools import search_stocks
+        from app.agent.tools.finance.screener_tools import search_stocks
         # 常规盘后选股
         screener_result = search_stocks(
             query="涨幅1%到8% 换手率大于2% 非ST",

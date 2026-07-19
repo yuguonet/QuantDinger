@@ -63,7 +63,7 @@ class StockResolver(EntityResolver):
 
     def resolve(self, user_input: str) -> Optional[ResolveResult]:
         try:
-            from tools.data_tools import resolve_stock
+            from tools.finance.data_tools import resolve_stock
         except ImportError:
             return None
 

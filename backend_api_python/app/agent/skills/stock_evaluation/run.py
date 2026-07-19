@@ -49,7 +49,7 @@ def _technical_analysis_multi(codes: str) -> Dict[str, Any]:
         if not code:
             continue
         try:
-            from tools.technical_analysis import technical_analysis
+            from tools.finance.technical_analysis import technical_analysis
             results[code] = technical_analysis(code)
         except Exception as e:
             results[code] = {"error": str(e)}
@@ -64,7 +64,7 @@ def _get_indicator_snapshot_multi(codes: str) -> Dict[str, Any]:
         if not code:
             continue
         try:
-            from tools.analysis_tools import get_indicator_snapshot
+            from tools.finance.analysis_tools import get_indicator_snapshot
             results[code] = get_indicator_snapshot(code)
         except Exception as e:
             results[code] = {"error": str(e)}
@@ -79,7 +79,7 @@ def _get_volume_analysis_multi(codes: str) -> Dict[str, Any]:
         if not code:
             continue
         try:
-            from tools.analysis_tools import get_volume_analysis
+            from tools.finance.analysis_tools import get_volume_analysis
             results[code] = get_volume_analysis(code)
         except Exception as e:
             results[code] = {"error": str(e)}
@@ -94,7 +94,7 @@ def _analyze_trend_multi(codes: str) -> Dict[str, Any]:
         if not code:
             continue
         try:
-            from tools.analysis_tools import analyze_trend
+            from tools.finance.analysis_tools import analyze_trend
             results[code] = analyze_trend(code)
         except Exception as e:
             results[code] = {"error": str(e)}
@@ -109,7 +109,7 @@ def _get_capital_summary_multi(codes: str) -> Dict[str, Any]:
         if not code:
             continue
         try:
-            from tools.capital_tools import get_capital_summary
+            from tools.finance.capital_tools import get_capital_summary
             results[code] = get_capital_summary(code)
         except Exception as e:
             results[code] = {"error": str(e)}
@@ -123,7 +123,7 @@ def _get_capital_summary_multi(codes: str) -> Dict[str, Any]:
 def _get_realtime_quote(codes: str) -> Dict[str, Any]:
     """实时行情（直接调用，已支持多股）。"""
     try:
-        from tools.data_tools import get_realtime_quote
+        from tools.finance.data_tools import get_realtime_quote
         return get_realtime_quote(codes)
     except Exception as e:
         return {"error": str(e)}
@@ -132,7 +132,7 @@ def _get_realtime_quote(codes: str) -> Dict[str, Any]:
 def _get_fund_flow(codes: str) -> Dict[str, Any]:
     """资金流向（直接调用，已支持多股）。"""
     try:
-        from tools.fund_flow_tools import get_fund_flow
+        from tools.finance.fund_flow_tools import get_fund_flow
         return get_fund_flow(codes)
     except Exception as e:
         return {"error": str(e)}
@@ -141,7 +141,7 @@ def _get_fund_flow(codes: str) -> Dict[str, Any]:
 def _get_stock_info(codes: str, detail: bool = True) -> Dict[str, Any]:
     """股票信息（直接调用，已支持多股）。"""
     try:
-        from tools.data_tools import get_stock_info
+        from tools.finance.data_tools import get_stock_info
         return get_stock_info(codes, detail=detail)
     except Exception as e:
         return {"error": str(e)}
@@ -150,7 +150,7 @@ def _get_stock_info(codes: str, detail: bool = True) -> Dict[str, Any]:
 def _search_stock_intel(codes: str, name: str = "") -> Dict[str, Any]:
     """新闻情报（直接调用，已支持多股）。"""
     try:
-        from tools.news_search_tools import search_stock_intel
+        from tools.finance.news_search_tools import search_stock_intel
         return search_stock_intel(codes, name=name)
     except Exception as e:
         return {"error": str(e)}

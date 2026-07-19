@@ -335,7 +335,7 @@ def _parse_filters_from_text(text: str) -> Dict[str, Any]:
 
 def _build_keyword_from_filters(filters: Dict[str, Any]) -> str:
     """将结构化筛选条件转换为自然语言关键词字符串。"""
-    from app.agent.tools.screener_tools import build_keyword_from_filters
+    from app.agent.tools.finance.screener_tools import build_keyword_from_filters
     return build_keyword_from_filters(filters)
 
 
@@ -346,7 +346,7 @@ def _build_keyword_from_filters(filters: Dict[str, Any]) -> str:
 @stock_screener_bp.route("/search", methods=["POST"])
 def search_stocks():
     """智能选股搜索。支持 keyword 模式和 filters 模式。"""
-    from app.agent.tools.screener_tools import search_stocks as _search_stocks
+    from app.agent.tools.finance.screener_tools import search_stocks as _search_stocks
 
     data = request.get_json(silent=True) or {}
     keyword = (data.get("keyword") or "").strip()
@@ -375,7 +375,7 @@ def search_stocks():
 @stock_screener_bp.route("/presets", methods=["GET"])
 def get_presets():
     """获取选股器支持的所有筛选条件分类和示例。"""
-    from app.agent.tools.screener_tools import get_screener_presets
+    from app.agent.tools.finance.screener_tools import get_screener_presets
     try:
         return jsonify({"code": 0, "data": get_screener_presets()})
     except Exception as e:
@@ -417,7 +417,7 @@ def build_text():
 @stock_screener_bp.route("/batch", methods=["POST"])
 def batch_screen():
     """批量筛选：一次请求多个条件。"""
-    from app.agent.tools.screener_tools import search_stocks as _search_stocks
+    from app.agent.tools.finance.screener_tools import search_stocks as _search_stocks
 
     data = request.get_json(silent=True) or {}
     queries = data.get("queries") or []

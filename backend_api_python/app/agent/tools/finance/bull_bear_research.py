@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """多空研究员 — 同时构建多头和空头论据，综合判断方向。"""
 from typing import Any, Dict, List
-from app.agent.tools.news_search_tools import search_stock_intel, search_policy_intel
+from app.agent.tools.finance.news_search_tools import search_stock_intel, search_policy_intel
 def bull_bear_research(codes: str, stock_name: str = "") -> dict:
     """多空研究：对单只股票做技术面+筹码+情报综合分析，返回多空评分和方向判断。
 
@@ -588,7 +588,7 @@ def _analyze_pattern(codes: str) -> Dict[str, Any]:
 
 def _get_chip_distribution(codes: str, lookback_days: int = 120) -> Dict[str, Any]:
     """筹码分布分析 — 委托给 chip_distribution.get_chip_distribution。"""
-    from app.agent.tools.chip_distribution import get_chip_distribution
+    from app.agent.tools.finance.chip_distribution import get_chip_distribution
     return get_chip_distribution(codes, lookback_days=lookback_days)
 
 def _get_indicator_snapshot(codes: str) -> Dict[str, Any]:

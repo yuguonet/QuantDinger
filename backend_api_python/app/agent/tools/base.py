@@ -259,7 +259,6 @@ def func_to_openai_schema(func: Callable) -> Dict[str, Any]:
 # 跳过的文件（框架文件，非工具）
 _SKIP_FILES = {
     "__init__", "base", "em_utils", "pagination",
-    "screener_config", "cache_tools",
 }
 
 # 必选工具（通过 smolagents tools=[] 注入，provider 不扫描）

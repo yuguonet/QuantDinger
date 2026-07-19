@@ -9,7 +9,7 @@ import json
 from app.agent.log import logger
 from typing import Any, Dict, List, Optional
 
-from app.agent.tools._analysis_utils import _get_ds
+from app.agent.tools.finance._analysis_utils import _get_ds
 
 # ── Tool functions ────────────────────────────────────────────
 
@@ -254,7 +254,7 @@ def get_stock_info(codes: str, detail: bool = False) -> Dict[str, Any]:
 
         # ── 4) 腾讯实时估值补全（3s 超时保护）──
         try:
-            from app.agent.tools.quote_tools import _tencent_quote_raw
+            from app.agent.tools.finance.quote_tools import _tencent_quote_raw
             def _tencent_fetch():
                 return _tencent_quote_raw([sym])
             _tpool = ThreadPoolExecutor(max_workers=1)

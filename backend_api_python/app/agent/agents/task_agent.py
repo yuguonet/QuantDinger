@@ -669,7 +669,190 @@ class TaskAgent(AgentBase):
             check_negative_feedback(user_input, session_id=session_id)
         except Exception:
             pass
+
         return await self._chat_plan_graph(user_input, session_id, use_rag)
+
+    # ── 定时任务拦截 ──────────────────────────────────────
+
+    @staticmethod
+    def _try_intercept_cron(user_input: str, session_id: str) -> Optional[AgentResponse]:
+        """检测调度意图，匹配到则直接创建定时任务并返回，跳过 agent 流程。
+
+        匹配模式：
+          - 开盘期间/交易时间/盘中,每N分钟<动作>
+          - 每N分钟/小时/天<动作>
+          - 每天/每周X/每月X号 HH:MM<动作>
+          - HH:MM<动作> / 明天HH:MM<动作>
+          - 提醒我<动作>
+
+        Returns:
+            AgentResponse if intercepted, None if not a cron request.
+        """
+        import re
+        from datetime import datetime, timedelta, timezone
+
+        text = user_input.strip()
+        if not text or len(text) > 200:
+            return None
+
+        TZ_CN = timezone(timedelta(hours=8))
+
+        # ── 模式匹配 ──────────────────────────────────────
+        at = ""
+        cron_expr = ""
+        content = ""
+        is_cron = False
+
+        # 模式1: 开盘期间/交易时间/盘中,每N分钟<动作>
+        m = re.match(r'(?:开盘期间|交易时间|盘中)\s*,?\s*每(\d+)分钟\s*(.+)', text)
+        if m:
+            step = m.group(1)
+            content = m.group(2).strip()
+            at = f"开盘期间,每{step}分钟"
+            is_cron = True
+
+        # 模式2: 每N分钟<动作>
+        if not is_cron:
+            m = re.match(r'每(\d+)分钟\s*(.+)', text)
+            if m:
+                step = m.group(1)
+                content = m.group(2).strip()
+                at = f"每天"
+                # 用 cron_expr 而非 at
+                at = ""
+                is_cron = True
+                cron_expr = f"*/{step} * * * *"
+
+        # 模式3: 每N小时<动作>
+        if not is_cron:
+            m = re.match(r'每(\d+)小时\s*(.+)', text)
+            if m:
+                step = m.group(1)
+                content = m.group(2).strip()
+                cron_expr = f"0 */{step} * * *"
+                at = ""
+                is_cron = True
+
+        # 模式4: 每天HH:MM<动作>
+        if not is_cron:
+            m = re.match(r'每天\s*(\d{1,2}):(\d{2})\s*(.+)', text)
+            if m:
+                h, mi = m.group(1), m.group(2)
+                content = m.group(3).strip()
+                at = f"每天 {h}:{mi}"
+                is_cron = True
+
+        # 模式5: 每周X HH:MM<动作>
+        if not is_cron:
+            m = re.match(r'每(?:周|星期)([一二三四五六日天])\s*(\d{1,2}):(\d{2})\s*(.+)', text)
+            if m:
+                content = m.group(4).strip()
+                at = f"每{m.group(1)} {m.group(2)}:{m.group(3)}"
+                is_cron = True
+
+        # 模式6: 每月X号 HH:MM<动作>
+        if not is_cron:
+            m = re.match(r'每月(\d{1,2})[号日]\s*(\d{1,2}):(\d{2})\s*(.+)', text)
+            if m:
+                content = m.group(4).strip()
+                at = f"每月{m.group(1)}号 {m.group(2)}:{m.group(3)}"
+                is_cron = True
+
+        # 模式7: HH:MM<动作>（一次性）
+        if not is_cron:
+            m = re.match(r'(\d{1,2}):(\d{2})\s*(.+)', text)
+            if m:
+                content = m.group(3).strip()
+                at = f"{m.group(1)}:{m.group(2)}"
+                is_cron = True
+
+        # 模式8: 明天HH:MM<动作>（一次性）
+        if not is_cron:
+            m = re.match(r'明天\s*(\d{1,2}):(\d{2})\s*(.+)', text)
+            if m:
+                content = m.group(3).strip()
+                at = f"tomorrow {m.group(1)}:{m.group(2)}"
+                is_cron = True
+
+        # 模式9: N分钟/小时/秒以后<动作>（一次性）
+        if not is_cron:
+            m = re.match(r'(\d+)\s*(?:分钟|min)\s*(?:以后|后|之后)\s*(.+)', text)
+            if m:
+                delay = int(m.group(1))
+                content = m.group(2).strip()
+                now = datetime.now(TZ_CN)
+                target = now + timedelta(minutes=delay)
+                at = f"{target.hour}:{target.minute:02d}"
+                is_cron = True
+        if not is_cron:
+            m = re.match(r'(\d+)\s*(?:小时|hour)\s*(?:以后|后|之后)\s*(.+)', text)
+            if m:
+                delay = int(m.group(1))
+                content = m.group(2).strip()
+                now = datetime.now(TZ_CN)
+                target = now + timedelta(hours=delay)
+                at = f"{target.hour}:{target.minute:02d}"
+                is_cron = True
+        if not is_cron:
+            m = re.match(r'(\d+)\s*(?:秒|sec)\s*(?:以后|后|之后)\s*(.+)', text)
+            if m:
+                delay = int(m.group(1))
+                content = m.group(2).strip()
+                now = datetime.now(TZ_CN)
+                target = now + timedelta(seconds=delay)
+                at = f"{target.hour}:{target.minute:02d}"
+                is_cron = True
+
+        # 模式10: 提醒我<动作>（默认1分钟后执行）
+        if not is_cron:
+            m = re.match(r'提醒我\s*(.+)', text)
+            if m:
+                content = f"提醒：{m.group(1).strip()}"
+                now = datetime.now(TZ_CN)
+                target = now + timedelta(minutes=1)
+                at = f"{target.hour}:{target.minute:02d}"
+                is_cron = True
+
+        if not is_cron or not content:
+            return None
+
+        # ── 创建定时任务 ──────────────────────────────────
+        try:
+            from cron.cron_tools import create_cron_job
+
+            # 提取任务名（取前20字）
+            name = content[:20]
+
+            result = create_cron_job(
+                name=name,
+                prompt=content,
+                cron_expr=cron_expr,
+                at=at,
+                one_shot=False,
+            )
+
+            if "error" in result:
+                return None  # 创建失败，走正常流程
+
+            job_id = result.get("job_id")
+            next_run = result.get("next_run", "")
+            one_shot = result.get("one_shot", False)
+
+            if one_shot:
+                reply = f"✅ 已创建一次性任务 #{job_id}，将在 {next_run} 执行：{content}"
+            else:
+                cron = result.get("cron_expr", "")
+                reply = f"✅ 已创建定时任务 #{job_id}（{cron}），下次执行：{next_run}\n执行内容：{content}"
+
+            return AgentResponse(
+                content=reply,
+                session_id=session_id,
+                metadata={"intercepted": "cron", "job_id": job_id},
+            )
+
+        except Exception as e:
+            logger.warning("[TaskAgent] Cron 拦截失败: %s", e)
+            return None  # 失败走正常流程
 
     # ── 阶段执行与评估 ──────────────────────────────────────
 

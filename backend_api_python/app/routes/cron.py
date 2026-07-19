@@ -104,7 +104,7 @@ def create_job():
 
         # 自调度：立即注册 Timer
         try:
-            from app.agent.cron_worker import schedule_job_from_db
+            from app.agent.cron import schedule_job_from_db
             schedule_job_from_db(row["id"])
         except Exception as e:
             logger.warning("[CronAPI] 调度注册失败: %s", e)
@@ -151,7 +151,7 @@ def update_job(job_id):
 
         # 自调度：重算 Timer
         try:
-            from app.agent.cron_worker import schedule_job_from_db, unschedule_job
+            from app.agent.cron import schedule_job_from_db, unschedule_job
             if row["enabled"]:
                 schedule_job_from_db(row["id"])
             else:
@@ -182,7 +182,7 @@ def delete_job(job_id):
 
         # 自调度：取消 Timer
         try:
-            from app.agent.cron_worker import unschedule_job
+            from app.agent.cron import unschedule_job
             unschedule_job(job_id)
         except Exception as e:
             logger.warning("[CronAPI] 取消调度失败: %s", e)
@@ -211,7 +211,7 @@ def trigger_job(job_id):
         mode = job.get("mode", "prompt")
 
         import threading
-        from app.agent.cron_worker import _execute_prompt_job, _execute_function_job
+        from app.agent.cron.cron_worker import _execute_prompt_job, _execute_function_job
 
         target = _execute_function_job if mode == "function" else _execute_prompt_job
         t = threading.Thread(target=target, args=(job,), daemon=True,

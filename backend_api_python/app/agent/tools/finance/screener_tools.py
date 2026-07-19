@@ -10,7 +10,7 @@ from __future__ import annotations
 from app.agent.log import logger
 from typing import Any, Dict, List, Optional
 
-from app.agent.tools.screener_config import (
+from app.agent.tools.finance.screener_config import (
     INDUSTRY_OPTIONS,
     CONCEPT_OPTIONS,
     MARKET_FILTER_MAP,

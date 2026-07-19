@@ -10,7 +10,7 @@ from __future__ import annotations
 from app.agent.log import logger
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.agent.tools._analysis_utils import (
+from app.agent.tools.finance._analysis_utils import (
     _fetch_ohlcv,
     _safe_round,
     _calc_obv,

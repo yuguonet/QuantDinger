@@ -67,7 +67,7 @@ def _get_actual_return(
         {"pnl_pct": float, "hold_days": int, "direction": str} 或 None
     """
     try:
-        from app.agent.tools.data_tools import agent_get_kline
+        from app.agent.tools.finance.data_tools import agent_get_kline
 
         klines = agent_get_kline(stock_code, timeframe="1D", days=hold_days + 10, market=market)
         if not klines or len(klines) < 2:

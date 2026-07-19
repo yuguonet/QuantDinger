@@ -28,7 +28,7 @@ def resolve_names(code_list: List[str]) -> Dict[str, str]:
     if not code_list:
         return {}
     try:
-        from app.agent.tools.data_tools import get_realtime_quote
+        from app.agent.tools.finance.data_tools import get_realtime_quote
         q = get_realtime_quote(",".join(code_list))
         name_map = {}
         if isinstance(q, dict):

@@ -40,7 +40,7 @@ def api_health_check():
 def cron_worker_status():
     """查看 Cron Worker 健康状态。"""
     try:
-        from app.agent.cron_worker import get_scheduled_jobs
+        from app.agent.cron import get_scheduled_jobs
         from app.utils.db import get_db_connection
 
         scheduled = get_scheduled_jobs()
@@ -78,7 +78,7 @@ def cron_events_stream():
         data: {"type":"job_success","job_id":1,"job_name":"盘后回溯","steps":3,...}
         data: {"type":"job_error","job_id":1,"job_name":"盘后回溯","error":"..."}
     """
-    from app.agent.cron_worker import subscribe, unsubscribe
+    from app.agent.cron import subscribe, unsubscribe
 
     def _stream():
         q = subscribe()

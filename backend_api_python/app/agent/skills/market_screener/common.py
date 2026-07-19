@@ -265,8 +265,8 @@ def _today_str() -> str:
 #  工具分发
 # ═══════════════════════════════════════════════════════════════
 
-from app.agent.tools.screener_tools import search_stocks
-from app.agent.tools.analysis_tools import get_indicator_snapshot
+from app.agent.tools.finance.screener_tools import search_stocks
+from app.agent.tools.finance.analysis_tools import get_indicator_snapshot
 from app.market_cn.tape import get_fund_flow_realtime
 
 _TOOL_REGISTRY = {

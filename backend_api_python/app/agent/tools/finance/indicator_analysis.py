@@ -4,7 +4,7 @@
 from app.agent.log import logger
 from typing import Any, Dict, List, Optional
 
-from app.agent.tools.indicator_tools import run_indicator_signal
+from app.agent.tools.finance.indicator_tools import run_indicator_signal
 def indicator_analysis(codes: str, user_id: int = 1) -> dict:
     """指标策略批量分析：对多只股票执行用户自定义指标策略，返回每只股票的最新信号(buy/sell)和评分。
 
