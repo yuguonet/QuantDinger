@@ -6,7 +6,7 @@ nodes.py — Graph 节点定义
   - chat_node：RAG + 实体解析 + 意图分类 + 简单问题直接回答
   - plan_node：生成任务描述 + step_budget（复盘时带前轮结果）
   - execute_node：单 CodeAgent 执行，跨轮复用实例
-  - finalize_node：格式化汇总 + 保存 memory + TraceCollector 存库
+  - finalize_node：格式化汇总 + 保存 memory + trace.finish() 写入 qd_traces
 
 每个节点签名为 async def node(state: dict) -> dict | None：
   - 输入：完整状态
@@ -166,6 +166,59 @@ def _set_llm_timeout(agent, timeout_seconds: int):
             llm_adapter.timeout = timeout_seconds
     except Exception as e:
         logger.debug("[Execute] 设置超时失败: %s", e)
+
+
+def _record_tool_calls_to_trace(trace, agent):
+    """从 smolagents agent memory 提取工具调用，写入 AgentTraceRecorder。"""
+    try:
+        from smolagents.memory import ActionStep
+        for step in getattr(agent.memory, 'steps', []) or []:
+            if not isinstance(step, ActionStep):
+                continue
+
+            tool_name = ""
+            tool_args = {}
+            if hasattr(step, 'tool_calls') and step.tool_calls:
+                tc = step.tool_calls[0]
+                tool_name = getattr(tc, 'name', '') or getattr(tc, 'function', {}).get('name', '')
+                raw_args = getattr(tc, 'arguments', None) or getattr(tc, 'function', {}).get('arguments', {})
+                if isinstance(raw_args, str):
+                    try:
+                        tool_args = json.loads(raw_args)
+                    except Exception:
+                        tool_args = {}
+                elif isinstance(raw_args, dict):
+                    tool_args = raw_args
+            elif hasattr(step, 'tool_name') and step.tool_name:
+                tool_name = step.tool_name
+                raw_args = getattr(step, 'tool_arguments', None) or {}
+                if isinstance(raw_args, dict):
+                    tool_args = raw_args
+
+            if not tool_name:
+                continue
+
+            observations = str(getattr(step, 'observations', '') or '')
+            elapsed_ms = 0.0
+            if hasattr(step, 'start_time') and hasattr(step, 'end_time'):
+                if step.start_time and step.end_time:
+                    elapsed_ms = (step.end_time - step.start_time) * 1000
+
+            error = ""
+            if "_failed_tool" in observations or "error" in observations.lower():
+                m = re.search(r"'error'\s*:\s*'([^']*)'", observations)
+                if m:
+                    error = m.group(1)[:200]
+
+            trace.add_tool_call(
+                tool_name=tool_name,
+                arguments=tool_args,
+                result=observations[:2000] if observations else None,
+                elapsed_ms=elapsed_ms,
+                error=error,
+            )
+    except Exception as e:
+        logger.debug("[Execute] trace.add_tool_call 提取失败: %s", e)
 
 
 def _extract_failed_tools(agent, tool_provider=None) -> list:
@@ -336,14 +389,10 @@ def make_chat_node(ctx: NodeContext):
             direct_answer = llm_response.content or ""
             logger.info("[Chat] 直接回答: %s 字符", len(direct_answer))
 
-        # ── 6. TraceCollector ──
-        try:
-            from trace_collector import TraceCollector
-            from agents.task_agent import _collectors
-            collector = TraceCollector(session_id=session_id, user_query=user_input)
-            _collectors[session_id] = collector
-        except Exception as e:
-            logger.debug("[Chat] TraceCollector 创建失败: %s", e)
+        # ── 6. 设置 trace 上下文 ──
+        trace = state.get("_trace")
+        if trace and entity_code:
+            trace.set_stock(code=entity_code, name=entity_name)
 
         return {
             "entity_code": entity_code,
@@ -568,6 +617,11 @@ def make_execute_node(ctx: NodeContext):
         # LLM 超时设 180s（上限，不是等待时间）
         _set_llm_timeout(agent, 180)
 
+        # ── trace: 记录技能 ──
+        trace = state.get("_trace")
+        if trace and selected_skill:
+            trace.set_skill(selected_skill)
+
         # 执行
         logger.info("[Execute] 开始执行，step_budget=%d, timeout=180s", step_budget)
         react_start = time.time()
@@ -605,6 +659,10 @@ def make_execute_node(ctx: NodeContext):
 
         react_elapsed = round(time.time() - react_start, 2)
         logger.info("[Execute] 完成，耗时 %.1fs，hit_max_steps=%s", react_elapsed, hit_max_steps)
+
+        # ── trace: 从 agent memory 提取工具调用 ──
+        if trace:
+            _record_tool_calls_to_trace(trace, agent)
 
         # 从 agent memory 提取失败的工具调用（不追加到 result，由 finalize_node 处理）
         failed_tools = _extract_failed_tools(agent, ctx.tool_provider)
@@ -646,16 +704,14 @@ def make_finalize_node(ctx: NodeContext):
     """创建 finalize_node（闭包捕获 ctx）。"""
 
     async def finalize_node(state: dict) -> dict:
-        """最终阶段：保存原始结果 → 存库 → 追加错误信息 → 格式化输出。
+        """最终阶段：保存原始结果 → 追加错误信息 → 格式化输出 → trace.finish()。
 
         保存顺序设计：
           1. memory 存原始 result_raw（复盘时 plan_node 拿到真实进度）
-          2. TraceCollector 存原始 result_raw（Evaluator 回溯用原始数据）
-          3. 追加失败工具信息
-          4. 格式化（仅 task 模式 + 有工具产出时，只影响最终输出给用户）
+          2. 追加失败工具信息
+          3. 格式化（仅 task 模式 + 有工具产出时，只影响最终输出给用户）
+          4. trace.finish() 写 JSONL + qd_traces（Evaluator/Feedback 用）
         """
-        from agents.task_agent import _collectors
-
         session_id = state.get("session_id", "default")
         direct_answer = state.get("direct_answer", "")
         result_raw = state.get("result_raw", "") or direct_answer or "[错误] 无执行结果"
@@ -674,31 +730,6 @@ def make_finalize_node(ctx: NodeContext):
                 await ctx.memory.add(session_id, "assistant", result_raw)
             except Exception as e:
                 logger.warning("[Finalize] memory 保存失败: %s", e)
-
-        # ── 2. TraceCollector 存库（原始 result_raw，给 Evaluator 用）──
-        domain_root_id = None
-        collector_root_id = None
-        collector = _collectors.get(session_id)
-        if collector:
-            try:
-                collector.on_agent_finish(
-                    final_answer=result_raw,
-                    total_steps=1,
-                    total_tokens=0,
-                    model=getattr(ctx.llm, "model", "unknown"),
-                )
-                if not domain_root_id:
-                    collector_root_id = collector.flush()
-            except Exception as e:
-                logger.warning("[Finalize] TraceCollector 存库失败: %s", e)
-            finally:
-                _collectors.pop(session_id, None)
-
-        # ── 3. 记录 root_id 供反馈闭环使用 ──
-        root_id = domain_root_id or collector_root_id
-        if root_id:
-            from feedback import record_session_root
-            record_session_root(session_id, root_id)
 
         # ── 4. 追加失败工具信息 ──
         if failed_tools:
@@ -727,6 +758,21 @@ def make_finalize_node(ctx: NodeContext):
                 result_raw = await formatter.format(result_raw, fmt_context)
             except Exception as e:
                 logger.warning("[Finalize] 格式化失败，使用原始数据: %s", e)
+
+        # ── 6. trace.finish() 写 JSONL + qd_traces ──
+        trace = state.get("_trace")
+        if trace:
+            try:
+                root_id = trace.finish(
+                    final_answer=state.get("result_raw", ""),  # 用原始结果提取结构化字段
+                    status="success",
+                    response={"content": result_raw},
+                )
+                if root_id:
+                    from feedback import record_session_root
+                    record_session_root(session_id, root_id)
+            except Exception as e:
+                logger.warning("[Finalize] trace.finish 失败: %s", e)
 
         # 计算耗时
         start_time = state.get("_start_time", 0)

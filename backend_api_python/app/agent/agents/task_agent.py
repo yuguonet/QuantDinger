@@ -47,8 +47,7 @@ try:
 except ImportError:
     logger = logging.getLogger(__name__)
 
-# ── 模块级 TraceCollector 存储 ──
-_collectors: Dict[str, "TraceCollector"] = {}
+
 
 # Plan 提示词模板
 _PLAN_TEMPLATE: str | None = None
