@@ -44,8 +44,8 @@ except ImportError:
 
 def _import_agent():
     """延迟导入 agent 组件（避免包命名空间冲突）。"""
-    from agent import agent, settings, skills, DEFAULT_SESSION_ID
-    return agent, settings, skills, DEFAULT_SESSION_ID
+    from agent import agent, settings, skills, DEFAULT_SESSION_ID, llm
+    return agent, settings, skills, DEFAULT_SESSION_ID, llm
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -54,7 +54,7 @@ def _import_agent():
 
 async def _run_chat(message: str, session_id: str = "cli"):
     """统一对话入口。"""
-    agent, _, skills, _ = _import_agent()
+    agent, _, skills, _, _ = _import_agent()
 
     print(f"\n📎 Session: {session_id}")
     print(f"💬 Message: {message}")
@@ -75,7 +75,7 @@ async def _run_chat(message: str, session_id: str = "cli"):
 
 def _print_info():
     """显示配置信息。"""
-    _, settings, skills, _ = _import_agent()
+    _, settings, skills, _, _ = _import_agent()
 
     print("=" * 60)
     print("QuantDinger Agent — CLI")
@@ -105,7 +105,7 @@ def _list_tools():
 
 def _list_skills():
     """列出所有技能。"""
-    _, _, skills, _ = _import_agent()
+    _, _, skills, _, _ = _import_agent()
 
     print(f"\n🎯 可用技能 ({len(skills)} 个):\n")
     for info in skills.list_skills():
@@ -136,7 +136,7 @@ def main():
         _list_skills()
         return
 
-    _, _, _, DEFAULT_SESSION_ID = _import_agent()
+    _, _, _, DEFAULT_SESSION_ID, _ = _import_agent()
     session_id = args.session or DEFAULT_SESSION_ID
 
     if args.message:
@@ -152,35 +152,56 @@ def main():
         asyncio.run(_run_chat(args.message, session_id))
     else:
         # 交互模式（单个事件循环，避免 PostgresMemory 连接池随循环销毁重建）
+        import signal
+
+        _ctrl_c_count = 0
+
+        def _force_exit(signum, frame):
+            """第二次 Ctrl+C 强制退出"""
+            nonlocal _ctrl_c_count
+            _ctrl_c_count += 1
+            if _ctrl_c_count >= 2:
+                print("\n👋 强制退出!")
+                os._exit(0)
+            print("\n⚠️ 再按一次 Ctrl+C 强制退出")
+
         print(f"\n🤖 QuantDinger Agent CLI")
         print(f"📎 Session: {session_id}")
-        print(f"💡 /quit 退出\n")
+        print(f"💡 /quit 退出，Ctrl+C 中断当前任务\n")
 
         async def _interactive_loop():
-            try:
-                while True:
-                    try:
-                        message = input("You> ").strip()
-                    except (EOFError, KeyboardInterrupt):
-                        print("\n👋 再见!")
-                        break
+            nonlocal _ctrl_c_count
+            _, _, _, _, llm = _import_agent()
+            while True:
+                try:
+                    _ctrl_c_count = 0  # 每轮重置
+                    message = input("You> ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print("\n👋 再见!")
+                    break
 
-                    if not message:
-                        continue
-                    if message == "/quit":
-                        print("👋 再见!")
-                        break
+                if not message:
+                    continue
+                if message == "/quit":
+                    print("👋 再见!")
+                    break
 
-                    try:
-                        await _run_chat(message, session_id)
-                    except KeyboardInterrupt:
-                        print("\n⚠️ 已中断")
-                    except Exception as e:
-                        print(f"\n❌ 异常: {e}")
-                        import traceback
-                        traceback.print_exc()
-            finally:
-                pass
+                try:
+                    signal.signal(signal.SIGINT, _force_exit)
+                    await _run_chat(message, session_id)
+                except KeyboardInterrupt:
+                    print("\n⚠️ 已中断")
+                except Exception as e:
+                    print(f"\n❌ 异常: {e}")
+                    import traceback
+                    traceback.print_exc()
+                finally:
+                    _ctrl_c_count = 0
+                    signal.signal(signal.SIGINT, signal.default_int_handler)
+
+            # 退出时关闭 LLM 客户端，释放连接
+            if llm and hasattr(llm, 'close'):
+                await llm.close()
 
         asyncio.run(_interactive_loop())
 

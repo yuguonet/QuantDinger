@@ -6,7 +6,7 @@ nodes.py — Graph 节点定义
   - chat_node：RAG + 实体解析 + 意图分类 + 简单问题直接回答
   - plan_node：生成任务描述 + step_budget（复盘时带前轮结果）
   - execute_node：单 CodeAgent 执行，跨轮复用实例
-  - finalize_node：保存 memory + TraceCollector 存库
+  - finalize_node：格式化汇总 + 保存 memory + TraceCollector 存库
 
 每个节点签名为 async def node(state: dict) -> dict | None：
   - 输入：完整状态
@@ -646,7 +646,7 @@ def make_finalize_node(ctx: NodeContext):
     """创建 finalize_node（闭包捕获 ctx）。"""
 
     async def finalize_node(state: dict) -> dict:
-        """最终阶段：领域提取 → 存库 → 追加错误信息 → 保存 memory。"""
+        """最终阶段：格式化汇总 → 存库 → 追加错误信息 → 保存 memory。"""
         from agents.task_agent import _collectors
 
         session_id = state.get("session_id", "default")
@@ -654,10 +654,30 @@ def make_finalize_node(ctx: NodeContext):
         result_raw = state.get("result_raw", "") or direct_answer or "[错误] 无执行结果"
         failed_tools = state.get("_failed_tools", [])
         agent_plan = state.get("_agent_plan", "")
+        selected_skill = state.get("selected_skill", "")
 
         # 记录 smolagents 最终规划
         if agent_plan:
             logger.info("[Finalize] Agent 规划:\n%s", agent_plan[:500])
+
+        # ── 1. 结果格式化汇总 ──
+        # selected_skill 有值时跳过（SKILL.md 已定义输出规范）
+        if not selected_skill and result_raw and not result_raw.startswith("["):
+            try:
+                from formatters.base import get_formatter
+                entity_type = state.get("entity_type", "")
+                formatter = get_formatter(entity_type)
+                fmt_context = {
+                    "entity_type": entity_type,
+                    "entity_code": state.get("entity_code", ""),
+                    "entity_name": state.get("entity_name", ""),
+                    "task": state.get("task", ""),
+                    "user_input": state.get("user_input", ""),
+                    "_llm": ctx.llm,
+                }
+                result_raw = await formatter.format(result_raw, fmt_context)
+            except Exception as e:
+                logger.warning("[Finalize] 格式化失败，使用原始数据: %s", e)
 
         # ── 2. TraceCollector 存库 ──
         domain_root_id = None

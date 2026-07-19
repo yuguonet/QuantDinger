@@ -1,7 +1,7 @@
 # QuantDinger Agent 模块设计文档
 
 > 最后更新: 2026-07-18
-> 版本: v1.1
+> 版本: v1.2
 > 状态: 生产环境运行中
 
 ---
@@ -144,6 +144,11 @@ backend_api_python/app/agent/
 ├── skills/               # 技能系统
 │   └── market_screener/  # 市场筛选技能
 │
+├── formatters/           # 结果格式化
+│   ├── base.py           # BaseFormatter 基类 + 注册表
+│   ├── default.py        # 通用兜底（纯 LLM 自适应）
+│   └── finance.py        # 金融领域模板
+│
 ├── prompts/              # 提示词模板
 │   ├── plan_system.txt   # Plan 阶段系统提示
 │   └── code_agent.yaml   # CodeAgent 提示词模板
@@ -235,7 +240,7 @@ class AgentState(TypedDict):
 | `chat_node` | RAG检索 + 实体解析 + 意图分类 | user_input | context, entity, needs_task |
 | `plan_node` | 任务规划 + 技能/域选择 + 加载 SKILL.md | effective_input, context, history | task, selected_skill, selected_domain, skill_body, skill_tools, step_budget |
 | `execute_node` | CodeAgent 执行任务 | task, context | result_raw |
-| `finalize_node` | 存库 + 记忆 + 后处理 | result_raw | 最终输出 |
+| `finalize_node` | 格式化汇总 + 存库 + 记忆 + 后处理 | result_raw | 最终输出 |
 
 #### chat_node 详细流程
 
@@ -536,7 +541,63 @@ class MemoryBase(ABC):
 | `PostgresMemory` | PostgreSQL | ✅ | 生产环境 |
 | `RedisMemory` | Redis | ✅ | 高并发场景 |
 
-### 3.8 可追责链 (`chain/`)
+### 3.8 结果格式化 (`formatters/`)
+
+#### 设计模式
+
+采用和 `resolvers/` 相同的注册表模式：
+- `BaseFormatter`：抽象基类，定义 `format()` 接口
+- `_REGISTRY`：全局注册表，key=entity_type, value=formatter_class
+- `@register_formatter()`：装饰器，注册 formatter
+- `get_formatter()`：根据 entity_type 查找 formatter，找不到返回 default
+
+#### 格式化流程
+
+```
+finalize_node
+  ├→ selected_skill 有值？→ 跳过（SKILL.md 已定义输出规范）
+  └→ 没有 skill？
+       ├→ entity_type 有对应 formatter？→ 用领域 formatter
+       └→ 没有？→ 用 default formatter
+```
+
+#### 核心类
+
+```python
+class BaseFormatter(ABC):
+    @abstractmethod
+    async def format(self, raw_result: str, context: dict) -> str:
+        """格式化/汇总结果"""
+        pass
+
+def get_formatter(entity_type: str) -> BaseFormatter:
+    """根据 entity_type 查找 formatter"""
+
+def register_formatter(entity_type: str):
+    """装饰器：注册 formatter"""
+```
+
+#### 已实现的 Formatter
+
+| Formatter | entity_type | 说明 |
+|-----------|-------------|------|
+| `DefaultFormatter` | （兜底） | 通用 LLM 自适应 |
+| `FinanceFormatter` | `finance` | 金融领域结构化报告 |
+
+#### 扩展新领域
+
+```python
+# formatters/crypto.py
+from .base import BaseFormatter, register_formatter
+
+@register_formatter("crypto")
+class CryptoFormatter(BaseFormatter):
+    async def format(self, raw_result: str, context: dict) -> str:
+        # 加密货币领域特定格式
+        ...
+```
+
+### 3.9 可追责链 (`chain/`)
 
 #### EvalNode 树
 
@@ -716,11 +777,12 @@ final_answer:             # 最终回答模板
 ┌─────────────────────────────────────────────────────────────┐
 │ finalize_node                                               │
 │                                                             │
-│ 1. 领域特化：提取股票数据                                    │
-│ 2. EvalNode 存库（root_id=1120）                            │
-│ 3. TraceCollector 存库                                      │
-│ 4. 追加失败工具信息                                          │
-│ 5. 保存 memory                                              │
+│ 1. 结果格式化汇总（selected_skill 有值时跳过）               │
+│    ├→ 根据 entity_type 选择 formatter                       │
+│    └→ LLM 生成结构化报告                                    │
+│ 2. TraceCollector 存库                                      │
+│ 3. 追加失败工具信息                                          │
+│ 4. 保存 memory                                              │
 └─────────────────────────────────────────────────────────────┘
   │
   ▼
