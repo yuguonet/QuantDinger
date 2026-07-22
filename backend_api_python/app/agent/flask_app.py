@@ -16,12 +16,8 @@ Flask 壳 — 共用 agent.py 全局组件。
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-import os
-import queue
-import threading
 import uuid
 
 from flask import Blueprint, Response, jsonify, request
@@ -32,34 +28,17 @@ logger = logging.getLogger(__name__)
 agent_v2_bp = Blueprint("agent_v2", __name__, url_prefix="/api/agent-v2")
 
 
-def _run_agent(message: str, session_id: str) -> str:
-    """同步执行 TaskAgent.chat()（在后台线程中调用）。"""
-    from agent import run_agent
-    return run_agent(message, session_id=session_id)
-
-
 def _sse_stream(message: str, session_id: str, timeout: int = 300):
-    """SSE 生成器：在线程中运行 agent，通过队列推送结果。"""
-    q: queue.Queue = queue.Queue()
+    """SSE 生成器：通过统一消息队列执行 agent，推送结果。"""
+    from message_queue import submit
 
-    def _run():
-        try:
-            result = _run_agent(message, session_id)
-            q.put({"type": "done", "content": result, "session_id": session_id})
-        except Exception as exc:
-            logger.error("Agent 异常: %s", exc, exc_info=True)
-            q.put({"type": "error", "message": str(exc)})
-
-    threading.Thread(target=_run, daemon=True).start()
-    while True:
-        try:
-            ev = q.get(timeout=timeout)
-            yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
-            if ev.get("type") in ("done", "error"):
-                break
-        except queue.Empty:
-            yield f'data: {json.dumps({"type": "error", "message": "超时"}, ensure_ascii=False)}\n\n'
-            break
+    try:
+        future = submit(message, session_id=session_id, timeout=timeout)
+        result = future.result(timeout=timeout)
+        yield f"data: {json.dumps({'type': 'done', 'content': result, 'session_id': session_id}, ensure_ascii=False)}\n\n"
+    except Exception as exc:
+        logger.error("Agent 异常: %s", exc, exc_info=True)
+        yield f"data: {json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
 
 
 # ── 路由 ──────────────────────────────────────────────────────

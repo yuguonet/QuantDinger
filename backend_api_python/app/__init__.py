@@ -403,6 +403,14 @@ def create_app(config_name='default'):
         except Exception as e:
             logger.warning(f"CronWorker not started: {e}")
 
+        # ── 统一消息队列 Worker 线程池 ─────────────────────
+        try:
+            from app.agent.message_queue import init_workers
+            init_workers(4)
+            logger.info("[MQ] 统一消息队列 worker 已启动")
+        except Exception as e:
+            logger.warning(f"MQ workers not started: {e}")
+
         # ── market_cn 数据刷新调度器 ─────────────────────────
         try:
             from app.market_cn.scheduler import start as start_market_cn_scheduler

@@ -39,11 +39,8 @@ _subscribers: List[queue.Queue] = []
 _subscribers_lock = threading.Lock()
 
 # ═══════════════════════════════════════════════════════════════
-#  定时任务投递队列（cron_worker 只投，consumer 单线程消费）
+#  定时任务执行
 # ═══════════════════════════════════════════════════════════════
-
-_pending_tasks: queue.Queue = queue.Queue()
-_consumer_thread: threading.Thread | None = None
 
 
 def subscribe() -> queue.Queue:
@@ -233,85 +230,37 @@ def _import_function(path: str) -> Callable:
     return fn
 
 
-def _pending_consumer():
-    """单线程消费队列：到点通过统一入口执行 agent 任务。"""
-    import asyncio
-    from agent import run_agent
-
-    logger.info("[CronConsumer] 消费线程启动")
-    while True:
-        job = _pending_tasks.get()
-        if job is None:  # 毒丸，停止消费
-            break
-        job_id = job.get("id", 0)
-        job_name = job.get("name", "unknown")
-        prompt = job.get("prompt", "")
-        session_id = job.get("session_id", "default")
-
-        logger.info("[CronConsumer] 开始执行: %s (session=%s)", job_name, session_id)
-        _publish(_make_event("job_start", job_id, job_name, mode="prompt"))
-
-        try:
-            content = run_agent(prompt, session_id=session_id, timeout=300)
-
-            # 将结果写回用户会话
-            if content:
-                try:
-                    from memory.postgres_memory import PostgresMemory
-                    mem = PostgresMemory()
-                    loop = asyncio.new_event_loop()
-                    try:
-                        loop.run_until_complete(mem.add(session_id, "assistant", content))
-                    finally:
-                        loop.close()
-                except Exception as e:
-                    logger.debug("[CronConsumer] 写入 memory 失败: %s", e)
-
-            _update_job_status(job_id, success=True)
-            _publish(_make_event("job_success", job_id, job_name,
-                                 mode="prompt",
-                                 content_preview=(content or "")[:500]))
-            logger.info("[CronConsumer] ✅ 完成: %s", job_name)
-        except asyncio.TimeoutError:
-            _update_job_status(job_id, success=False, error="执行超时")
-            _publish(_make_event("job_error", job_id, job_name, mode="prompt", error="执行超时"))
-            logger.error("[CronConsumer] ⏰ 超时: %s", job_name)
-        except Exception as e:
-            _update_job_status(job_id, success=False, error=str(e))
-            _publish(_make_event("job_error", job_id, job_name, mode="prompt", error=str(e)))
-            logger.error("[CronConsumer] ❌ 失败: %s — %s", job_name, e)
-
-
-def _start_consumer():
-    """启动消费线程（幂等，只启动一次）。"""
-    global _consumer_thread
-    if _consumer_thread and _consumer_thread.is_alive():
-        return
-    _consumer_thread = threading.Thread(target=_pending_consumer, daemon=True, name="cron-consumer")
-    _consumer_thread.start()
-
-
 def _execute_prompt_job(job: Dict[str, Any]):
     prompt = job.get("prompt", "")
     job_name = job.get("name", "unknown")
     job_id = job.get("id", 0)
 
+    # 一次性任务：先删后执行，防止中间崩溃导致重复触发
+    if job.get("one_shot"):
+        _delete_one_shot(job_id, job_name)
+
     _publish(_make_event("job_start", job_id, job_name, mode="prompt"))
 
     try:
-        # prompt 模式：投递到队列，由 consumer 单线程串行执行
-        _start_consumer()
-        _pending_tasks.put(job)
-        logger.info("[CronWorker] ⏳ prompt 任务已投递: %s", job_name)
+        from message_queue import submit
+        future = submit(prompt, session_id=job.get("session_id", "default"), timeout=300)
+        content = future.result(timeout=300)
 
+        _update_job_status(job_id, success=True)
+        _publish(_make_event("job_success", job_id, job_name,
+                             mode="prompt",
+                             content_preview=(content or "")[:500]))
+        logger.info("[CronWorker] ✅ 完成: %s", job_name)
+
+        # 打印结果到终端
+        now = datetime.now(TZ_CN).strftime("%H:%M")
+        print(f"\n🔔 [{now}] {content}\nYou> ", end="", flush=True)
     except Exception as e:
         _update_job_status(job_id, success=False, error=str(e))
         _publish(_make_event("job_error", job_id, job_name, mode="prompt", error=str(e)))
-        logger.error("[CronWorker] ❌ prompt 任务异常: %s — %s", job_name, e, exc_info=True)
+        logger.error("[CronWorker] ❌ 失败: %s — %s", job_name, e, exc_info=True)
     finally:
-        if job.get("one_shot"):
-            _delete_one_shot(job_id, job_name)
-        else:
+        if not job.get("one_shot"):
             _reschedule_job(job_id)
 
 

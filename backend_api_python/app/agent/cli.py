@@ -53,20 +53,18 @@ def _import_agent():
 # ═══════════════════════════════════════════════════════════════
 
 async def _run_chat(message: str, session_id: str = "cli"):
-    """统一对话入口。"""
-    agent, _, skills, _, _ = _import_agent()
+    """统一对话入口：通过消息队列执行，和 Flask/Cron 同一条链路。"""
+    from message_queue import submit
 
     print(f"\n📎 Session: {session_id}")
     print(f"💬 Message: {message}")
-    print(f"🔧 模式: task | 技能: {len(skills)} 个")
+    print(f"🔧 模式: task | 技能: {len(_import_agent()[2])} 个")
     print("-" * 50)
 
-    response = await agent.chat(message, session_id=session_id)
-
-    print(f"\n{response.content}")
-    if response.tool_calls:
-        print(f"\n📊 工具调用: {len(response.tool_calls)} 个")
-    return response.content
+    future = submit(message, session_id=session_id, timeout=300)
+    content = future.result(timeout=300)
+    print(f"\n{content}")
+    return content
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -149,10 +147,14 @@ def main():
         except Exception:
             pass
 
+        from message_queue import init_workers
+        init_workers(4)
         asyncio.run(_run_chat(args.message, session_id))
     else:
         # 交互模式（单个事件循环，避免 PostgresMemory 连接池随循环销毁重建）
         import signal
+        from message_queue import init_workers
+        init_workers(4)
 
         _ctrl_c_count = 0
 
