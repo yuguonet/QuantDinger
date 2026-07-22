@@ -82,7 +82,7 @@ class LLMBase(ABC):
         self.temperature = kwargs.get("temperature", 0.7)
         self.max_tokens = kwargs.get("max_tokens", 2048)
         self.top_p = kwargs.get("top_p", 0.95)
-        self.timeout = kwargs.get("timeout", 30)
+        self.timeout = kwargs.get("timeout", 180)
         self.max_retries = kwargs.get("max_retries", 1)
 
     @abstractmethod
