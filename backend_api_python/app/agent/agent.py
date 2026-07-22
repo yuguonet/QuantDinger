@@ -263,6 +263,33 @@ agent = TaskAgent(
 )
 
 
+
+
+def run_agent(message: str, session_id: str = "default", timeout: int = 300) -> str:
+    """统一同步入口：Flask / CLI / Cron 等所有调用方都走这里。
+
+    内部处理事件循环 + LLM 客户端重置，调用方无需关心 async 细节。
+
+    Args:
+        message: 用户消息
+        session_id: 会话 ID
+        timeout: 超时秒数，0 表示不超时
+    """
+    import asyncio
+    # 重置 LLM 异步客户端，避免旧 client 绑定旧事件循环
+    agent.llm._client = None
+    loop = asyncio.new_event_loop()
+    try:
+        coro = agent.chat(message, session_id=session_id)
+        if timeout > 0:
+            resp = loop.run_until_complete(asyncio.wait_for(coro, timeout=timeout))
+        else:
+            resp = loop.run_until_complete(coro)
+        return resp.content or ""
+    finally:
+        loop.close()
+
+
 # ---------- 盘后回溯评估 Worker ----------
 try:
     from chain.evaluator import start_eval_worker

@@ -23,13 +23,14 @@
 
 规则：
 - task: 完整、自包含的任务描述，包含所有必要上下文（实体信息、参考上下文等）
-- selected_skill: 从「可用技能」中选择最匹配的一个技能名；无匹配则为 null
+- selected_skill: 从「可用技能」中选择最匹配的一个技能名；无匹配或匹配度中低值则为 null
 - selected_domain: 如果任务属于某个工具域（如 finance、technical），填域名；否则为空字符串
 - step_budget: CodeAgent 执行步数预算（简单任务 8-10，复杂/创造性任务 10-15）
 - 步数用完未完成时系统会自动复盘继续，所以宁可多给不要少给
 - 技能名后 [权重:0.xx] 是历史准确率，优先选高的
 - 如果用户问题不涉及任何技能（闲聊/通用问题），selected_skill 设为 null
 - task 中必须包含实体代码和名称（如有），让 CodeAgent 知道分析哪个标的
+
 
 示例：
 "分析300129" → {{"task": "分析泰胜风能(300129)的多维度数据，给出标准评估结果", "selected_skill": "stock_evaluation", "selected_domain": "", "step_budget": 10}}

@@ -362,7 +362,7 @@ def make_chat_node(ctx: NodeContext):
             else:
                 needs_task = True
                 # 提取 task_type
-                _ALL_TYPES = ["analysis", "screen", "compare", "query", "code", "explain", "general"]
+                _ALL_TYPES = ["cron", "analysis", "screen", "compare", "query", "code", "explain", "general"]
                 for tt in _ALL_TYPES:
                     if tt in intent:
                         task_type = tt
@@ -381,9 +381,12 @@ def make_chat_node(ctx: NodeContext):
                 from agents.task_agent import TaskAgent
                 cron_result = TaskAgent._try_intercept_cron(user_input, session_id)
                 if cron_result is not None:
-                    needs_task = False
-                    direct_answer = cron_result.content
-                    logger.info("[Chat] Cron 意图拦截成功: %s", direct_answer[:80])
+                    logger.info("[Chat] Cron 意图拦截成功: %s", cron_result.content[:80])
+                    return {
+                        "needs_task": False,
+                        "task_type": "cron",
+                        "direct_answer": cron_result.content,
+                    }
                 else:
                     # 正则未匹配，降级为普通 task
                     task_type = "general"
@@ -443,6 +446,9 @@ def make_plan_node(ctx: NodeContext):
         # ToolProvider 延迟初始化（首次进入任务流程时才扫描，直接回答路径跳过）
         if not ctx.tool_provider:
             ctx.init_tools()
+            # 同步到 TaskAgent，让 _plan() 能看到工具列表和域列表
+            if ctx.tool_provider and ctx.agent:
+                ctx.agent._tool_provider = ctx.tool_provider
         if not ctx.tool_provider:
             logger.error("[Plan] ToolProvider 不可用，退回直接回答")
             direct = await ctx.llm.generate(messages=[
@@ -644,15 +650,18 @@ def make_execute_node(ctx: NodeContext):
         react_start = time.time()
 
         import signal as _signal
+        import threading as _threading
         hit_max_steps = False
         _interrupted = False
+        _is_main_thread = _threading.current_thread() is _threading.main_thread()
 
         def _sigint_handler(signum, frame):
             nonlocal _interrupted
             _interrupted = True
             logger.warning("[Execute] 收到 SIGINT，正在停止...")
 
-        old_handler = _signal.signal(_signal.SIGINT, _sigint_handler)
+        if _is_main_thread:
+            old_handler = _signal.signal(_signal.SIGINT, _sigint_handler)
         try:
             result = agent.run(full_task)
             if _interrupted:
@@ -672,7 +681,8 @@ def make_execute_node(ctx: NodeContext):
                 logger.error("[Execute] 执行异常: %s", e)
                 result = f"[错误] {e}"
         finally:
-            _signal.signal(_signal.SIGINT, old_handler)
+            if _is_main_thread:
+                _signal.signal(_signal.SIGINT, old_handler)
 
         react_elapsed = round(time.time() - react_start, 2)
         logger.info("[Execute] 完成，耗时 %.1fs，hit_max_steps=%s", react_elapsed, hit_max_steps)

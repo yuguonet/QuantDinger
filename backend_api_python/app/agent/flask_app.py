@@ -34,15 +34,8 @@ agent_v2_bp = Blueprint("agent_v2", __name__, url_prefix="/api/agent-v2")
 
 def _run_agent(message: str, session_id: str) -> str:
     """同步执行 TaskAgent.chat()（在后台线程中调用）。"""
-    from agent import agent
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        response = loop.run_until_complete(agent.chat(message, session_id=session_id))
-        return response.content
-    finally:
-        loop.close()
+    from agent import run_agent
+    return run_agent(message, session_id=session_id)
 
 
 def _sse_stream(message: str, session_id: str, timeout: int = 300):
