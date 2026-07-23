@@ -171,6 +171,68 @@ class KeywordRetriever:
         return scored[:top_k or self.top_k]
 
 
+class ChatHistoryRetriever:
+    """聊天历史全文检索器。
+
+    封装 PostgresMemory.search()，作为 MultiRouteRetriever 的一路召回。
+    使用 PostgreSQL tsvector/tsquery 做中文关键词检索，不依赖 Embedding。
+
+    使用方式：
+        from memory.postgres_memory import PostgresMemory
+        memory = PostgresMemory()
+        history_retriever = ChatHistoryRetriever(memory, top_k=5)
+        docs = await history_retriever.retrieve("茅台")
+    """
+
+    def __init__(self, memory, top_k: int = 5, weight: float = 0.5):
+        """
+        Args:
+            memory: PostgresMemory 实例
+            top_k: 默认返回条数
+            weight: RRF 融合权重（聊天记录权重应低于知识文档）
+        """
+        self.memory = memory
+        self.top_k = top_k
+        self.weight = weight
+
+    async def retrieve(
+        self,
+        query: str,
+        top_k: Optional[int] = None,
+        filter: Optional[dict] = None,
+    ) -> list[dict]:
+        """搜索历史聊天记录。
+
+        Args:
+            query: 搜索关键词
+            top_k: 返回数量（覆盖默认值）
+            filter: 可选过滤条件（如 {"session_id": "xxx"}）
+
+        Returns:
+            list[dict]: 与 MultiRouteRetriever 兼容的文档格式
+        """
+        k = top_k or self.top_k
+        session_id = (filter or {}).get("session_id")
+
+        results = await self.memory.search(query, limit=k, session_id=session_id)
+
+        # 转换为 MultiRouteRetriever 兼容的文档格式
+        docs = []
+        for r in results:
+            docs.append({
+                "content": r["content"],
+                "metadata": {
+                    "source": "chat_history",
+                    "role": r["role"],
+                    "session_id": r["session_id"],
+                    "date": r["created_at"],
+                },
+                "score": r["score"],
+                "retrieval_route": "chat_history",
+            })
+        return docs
+
+
 @dataclass
 class RetrieverRoute:
     """多路召回中的单条检索路线"""

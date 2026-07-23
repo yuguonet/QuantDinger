@@ -18,6 +18,7 @@ import logging
 from typing import Optional
 
 from memory.base import MemoryBase, MemoryMessage
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,26 @@ logger = logging.getLogger(__name__)
 DEFAULT_TABLE = "agent_messages"
 # 默认 TTL：7 天
 DEFAULT_TTL_SECONDS = 7 * 24 * 3600
+
+
+# ── 中文分词辅助（复用 postgres_fts.py 的思路）──
+import re as _re
+
+def _tokenize_chinese(text: str) -> str:
+    """简单中文分词：单字 + 双字 gram，用空格连接。
+
+    PostgreSQL 'simple' 配置按空格分词，所以需要手动预处理。
+    与 rag/postgres_fts.py 的实现保持一致。
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+    cjk = _re.findall(r"[\u4e00-\u9fff]", text)
+    words = _re.findall(r"[a-zA-Z0-9]+", text.lower())
+    grams = list(cjk)
+    for i in range(len(cjk) - 1):
+        grams.append(cjk[i] + cjk[i + 1])
+    return " ".join(grams + words)
 
 
 def _raw_cursor(conn):
@@ -110,6 +131,30 @@ class PostgresMemory(MemoryBase):
                         c.execute(sql.SQL("""
                             DELETE FROM {} WHERE created_at < NOW() - make_interval(secs => %s)
                         """).format(tbl), (self._ttl_seconds,))
+
+                        # ── FTS: 为聊天记录全文检索添加 tsvector 列 + GIN 索引 ──
+                        fts_col = sql.Identifier("fts_vector")
+                        fts_idx = sql.Identifier(f"idx_{self._table_name}_fts")
+                        # Python 层检查列是否存在（PL/pgSQL 内 sql.Identifier 引号会导致 information_schema 匹配失败）
+                        c.execute(
+                            "SELECT 1 FROM information_schema.columns "
+                            "WHERE table_name = %s AND column_name = 'fts_vector'",
+                            (self._table_name,),
+                        )
+                        if c.fetchone() is None:
+                            c.execute(sql.SQL(
+                                "ALTER TABLE {} ADD COLUMN fts_vector tsvector"
+                            ).format(tbl))
+                        c.execute(sql.SQL("""
+                            CREATE INDEX IF NOT EXISTS {} ON {} USING gin({})
+                        """).format(fts_idx, tbl, fts_col))
+                        # 回填已有数据的 tsvector
+                        c.execute(sql.SQL("""
+                            UPDATE {} SET fts_vector =
+                                to_tsvector('simple', COALESCE(content, ''))
+                            WHERE fts_vector IS NULL
+                        """).format(tbl))
+
                         conn.commit()
                     finally:
                         c.close()
@@ -139,8 +184,9 @@ class PostgresMemory(MemoryBase):
                 c = _raw_cursor(conn)
                 try:
                     c.execute(sql.SQL(
-                        "INSERT INTO {} (session_id, role, content) VALUES (%s, %s, %s)"
-                    ).format(tbl), (session_id, role, content))
+                        "INSERT INTO {} (session_id, role, content, fts_vector) "
+                        "VALUES (%s, %s, %s, to_tsvector('simple', %s))"
+                    ).format(tbl), (session_id, role, content, content))
                     c.execute(sql.SQL("""
                         DELETE FROM {}
                         WHERE session_id = %s
@@ -304,3 +350,82 @@ class PostgresMemory(MemoryBase):
                     c.close()
 
         return await self._run_sync(_stats)
+
+    async def search(
+        self,
+        query: str,
+        limit: int = 5,
+        session_id: Optional[str] = None,
+    ) -> list[dict]:
+        """全文搜索历史聊天记录。
+
+        使用 PostgreSQL tsvector + tsquery 实现中文检索。
+        对用户消息和助手回复都做搜索，返回按相关度排序的结果。
+
+        Args:
+            query: 搜索关键词（支持中文，内部做分词处理）
+            limit: 最大返回条数
+            session_id: 可选，限定在某个会话内搜索
+
+        Returns:
+            list[dict]: [{"role", "content", "session_id", "created_at", "score"}]
+        """
+        await self._ensure_init()
+
+        tokens = _tokenize_chinese(query)
+        if not tokens:
+            return []
+
+        from psycopg2 import sql
+        tbl = sql.Identifier(self._table_name)
+
+        # 构建 tsquery（simple 配置，OR 逻辑）
+        # tokens 已是空格分隔的 gram，拆开用 | 连接
+        tsquery = " | ".join(tokens.split())
+
+        def _search():
+            with self._get_connection() as conn:
+                c = _raw_cursor(conn)
+                try:
+                    if session_id:
+                        c.execute(sql.SQL("""
+                            SELECT role, content, session_id, created_at,
+                                   ts_rank(fts_vector, q) AS rank
+                            FROM {tbl}, to_tsquery('simple', %s) AS q
+                            WHERE fts_vector @@ q AND session_id = %s
+                            ORDER BY rank DESC, created_at DESC
+                            LIMIT %s
+                        """).format(tbl=tbl), (tsquery, session_id, limit))
+                    else:
+                        c.execute(sql.SQL("""
+                            SELECT role, content, session_id, created_at,
+                                   ts_rank(fts_vector, q) AS rank
+                            FROM {tbl}, to_tsquery('simple', %s) AS q
+                            WHERE fts_vector @@ q
+                            ORDER BY rank DESC, created_at DESC
+                            LIMIT %s
+                        """).format(tbl=tbl), (tsquery, limit))
+                    rows = c.fetchall()
+                    return [
+                        {
+                            "role": r["role"],
+                            "content": r["content"],
+                            "session_id": r["session_id"],
+                            "created_at": str(r["created_at"]) if r["created_at"] else "",
+                            "score": float(r["rank"]) if r["rank"] else 0.0,
+                        }
+                        for r in rows
+                    ]
+                finally:
+                    c.close()
+
+        try:
+            results = await self._run_sync(_search)
+            logger.info(
+                "[PostgresMemory] 搜索 '%s' → %d 条结果 (session=%s)",
+                query[:30], len(results), session_id or "all",
+            )
+            return results
+        except Exception as e:
+            logger.error("[PostgresMemory] search 失败: %s", e, exc_info=True)
+            return []

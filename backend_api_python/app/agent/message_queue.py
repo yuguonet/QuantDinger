@@ -84,13 +84,18 @@ def _worker_loop():
             continue
 
         try:
-            agent.llm._client = None
             loop = asyncio.new_event_loop()
             try:
                 coro = agent.chat(task["message"], session_id=task["session_id"])
                 resp = loop.run_until_complete(asyncio.wait_for(coro, timeout=task["timeout"]))
                 future.set_result(resp.content or "")
             finally:
+                # 关闭 LLM 底层 httpx 客户端，避免 "Event loop is closed" 警告
+                try:
+                    loop.run_until_complete(agent.llm.close())
+                except Exception:
+                    pass
                 loop.close()
         except Exception as e:
+            logger.error("[MQ] Worker 异常: %s", e, exc_info=True)
             future.set_exception(e)

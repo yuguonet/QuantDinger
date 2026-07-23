@@ -100,6 +100,9 @@ RERANKER_API_URL = os.getenv("RERANKER_API_URL", "")
 RERANKER_API_KEY = os.getenv("RERANKER_API_KEY", "")
 RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", "20"))  # RRF 后送入 reranker 的数量
 
+# 聊天历史检索开关（.env 中设置 CHAT_HISTORY_SEARCH_ENABLED=true 启用）
+CHAT_HISTORY_SEARCH_ENABLED = os.getenv("CHAT_HISTORY_SEARCH_ENABLED", "").lower() in ("true", "1", "yes")
+
 def _build_reranker():
     """构建 Reranker 精排模型。"""
     if not RERANKER_PROVIDER:
@@ -165,7 +168,21 @@ def _build_retriever():
             except Exception as e:
                 logger.warning("[RAG] PostgreSQL FTS 初始化失败: %s", e)
 
-        # 路线 3: 关键词召回（从 qd_analysis_memory 加载历史分析）
+        # 路线 3: 聊天历史全文检索（PG FTS，需开启总开关）
+        if CHAT_HISTORY_SEARCH_ENABLED and MEMORY_BACKEND == "postgres":
+            try:
+                from rag.retriever import ChatHistoryRetriever
+                chat_history_retriever = ChatHistoryRetriever(
+                    memory=memory,
+                    top_k=RAG_TOP_K,
+                    weight=0.4,  # 聊天记录权重低于知识文档，避免噪音干扰
+                )
+                routes.append(RetrieverRoute("chat_history", chat_history_retriever, weight=0.4))
+                logger.info("[RAG] 聊天历史检索已启用 (PG FTS)")
+            except Exception as e:
+                logger.warning("[RAG] 聊天历史检索初始化失败: %s", e)
+
+        # 路线 4: 关键词召回（从 qd_analysis_memory 加载历史分析）
         try:
             kw_docs = _load_analysis_memory_docs()
             if kw_docs:
@@ -203,6 +220,7 @@ def _load_analysis_memory_docs() -> list:
     """从 qd_analysis_memory 加载历史分析文档，供关键词召回。"""
     if not DATABASE_URL:
         return []
+    conn = None
     try:
         import psycopg2
         conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
@@ -228,11 +246,16 @@ def _load_analysis_memory_docs() -> list:
                 },
             })
         cur.close()
-        conn.close()
         return docs
     except Exception as e:
         logger.debug("[RAG] 加载 analysis_memory 失败: %s", e)
         return []
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 retriever = _build_retriever()
@@ -276,8 +299,6 @@ def run_agent(message: str, session_id: str = "default", timeout: int = 300) -> 
         timeout: 超时秒数，0 表示不超时
     """
     import asyncio
-    # 重置 LLM 异步客户端，避免旧 client 绑定旧事件循环
-    agent.llm._client = None
     loop = asyncio.new_event_loop()
     try:
         coro = agent.chat(message, session_id=session_id)
@@ -287,6 +308,11 @@ def run_agent(message: str, session_id: str = "default", timeout: int = 300) -> 
             resp = loop.run_until_complete(coro)
         return resp.content or ""
     finally:
+        # 关闭 LLM 底层 httpx 客户端，避免 "Event loop is closed" 警告
+        try:
+            loop.run_until_complete(agent.llm.close())
+        except Exception:
+            pass
         loop.close()
 
 

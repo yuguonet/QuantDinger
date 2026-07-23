@@ -169,9 +169,16 @@ def _set_llm_timeout(agent, timeout_seconds: int):
 
 
 def _record_tool_calls_to_trace(trace, agent):
-    """从 smolagents agent memory 提取工具调用，写入 AgentTraceRecorder。"""
+    """从 smolagents agent memory 提取工具调用 + 推理链，写入 AgentTraceRecorder。
+
+    提取内容：
+      - ActionStep: tool_name, args, observations, model_output, code_action, token_usage
+      - PlanningStep: 每轮规划文本（不只是最后一轮）
+    """
     try:
-        from smolagents.memory import ActionStep
+        from smolagents.memory import ActionStep, PlanningStep
+
+        # ── 1. 遍历 ActionStep，提取工具调用 + 推理链 ──
         for step in getattr(agent.memory, 'steps', []) or []:
             if not isinstance(step, ActionStep):
                 continue
@@ -210,13 +217,45 @@ def _record_tool_calls_to_trace(trace, agent):
                 if m:
                     error = m.group(1)[:200]
 
+            # ── 提取推理链（model_output / code_action / token_usage）──
+            model_output = (getattr(step, 'model_output', '') or '')[:1000]
+            code_action = (getattr(step, 'code_action', '') or '')[:500]
+            token_usage = None
+            raw_usage = getattr(step, 'token_usage', None)
+            if raw_usage:
+                token_usage = {
+                    'input': getattr(raw_usage, 'input_tokens', 0),
+                    'output': getattr(raw_usage, 'output_tokens', 0),
+                    'total': getattr(raw_usage, 'total_tokens', 0),
+                }
+
             trace.add_tool_call(
                 tool_name=tool_name,
                 arguments=tool_args,
-                result=observations[:2000] if observations else None,
+                result={
+                    'observations': observations[:2000] if observations else '',
+                    'model_output': model_output,
+                    'code_action': code_action,
+                    'token_usage': token_usage,
+                },
                 elapsed_ms=elapsed_ms,
                 error=error,
             )
+
+        # ── 2. 遍历 PlanningStep，记录每轮规划 ──
+        for step in getattr(agent.memory, 'steps', []) or []:
+            if not isinstance(step, PlanningStep):
+                continue
+            plan_text = (getattr(step, 'plan', '') or '').strip()
+            if plan_text:
+                trace.record('planning', {
+                    'plan': plan_text[:2000],
+                    'token_usage': {
+                        'input': getattr(getattr(step, 'token_usage', None), 'input_tokens', 0),
+                        'output': getattr(getattr(step, 'token_usage', None), 'output_tokens', 0),
+                    } if getattr(step, 'token_usage', None) else None,
+                })
+
     except Exception as e:
         logger.debug("[Execute] trace.add_tool_call 提取失败: %s", e)
 

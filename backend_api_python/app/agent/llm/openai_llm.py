@@ -75,6 +75,15 @@ class OpenAILLM(LLMBase):
         self._client = AsyncOpenAI(**client_kwargs)
         return self._client
 
+    async def close(self):
+        """关闭底层 AsyncOpenAI 客户端，释放 httpx 连接池。"""
+        if self._client is not None:
+            try:
+                await self._client.close()
+            except Exception:
+                pass
+            self._client = None
+
     async def generate(
         self,
         messages: list[ChatMessage],

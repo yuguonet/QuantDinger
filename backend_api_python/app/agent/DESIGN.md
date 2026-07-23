@@ -1,7 +1,7 @@
 # QuantDinger Agent 模块设计文档
 
-> 最后更新: 2026-07-18
-> 版本: v1.2
+> 最后更新: 2026-07-22
+> 版本: v1.3
 > 状态: 生产环境运行中
 
 ---
@@ -44,7 +44,7 @@ Agent 模块是 QuantDinger 系统的智能决策核心，负责：
           ▼                 ▼                 ▼
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │                              接入层 (Flask/FastAPI)                              │
-│  flask_app.py  ←→  agent.py  ←→  graph.py                                      │
+│  flask_app.py  ←→  message_queue.py  ←→  agent.py  ←→  graph.py                │
 └─────────────────────────────────────────────────────────────────────────────────┘
           │
           ▼
@@ -93,12 +93,11 @@ backend_api_python/app/agent/
 ├── nodes.py              # Graph 节点定义（chat/plan/execute/finalize）
 ├── flask_app.py          # Flask 路由接入
 ├── cli.py                # CLI 入口
-├── checkpointer.py       # 状态持久化（PostgreSQL）
+├── message_queue.py      # 统一消息队列（Flask/Cron 共用）
 ├── trace_collector.py    # 决策追踪收集器
 ├── feedback.py           # 负面反馈检测
-├── json_extractor.py     # JSON 提取工具
 ├── log.py                # 日志配置
-├── cache.py              # 缓存工具
+├── cache.py              # TTL 缓存工具
 │
 ├── agents/               # Agent 实现
 │   ├── base.py           # AgentBase 基类
@@ -130,19 +129,53 @@ backend_api_python/app/agent/
 │   ├── postgres_memory.py # PostgreSQL 实现
 │   └── redis_memory.py   # Redis 实现
 │
-├── tools/                # 工具集（72 个）
+├── tools/                # 工具集（78 个公开函数）
 │   ├── base.py           # Tool 基类 + ToolProvider 统一注册表
-│   ├── data_tools.py     # 数据查询
-│   ├── analysis_tools.py # 技术分析
-│   ├── indicator_tools.py # 指标计算
-│   ├── news_search_tools.py # 新闻搜索
-│   ├── web_search_tools.py # 联网搜索
-│   ├── screener_tools.py # 选股器
 │   ├── format_utils.py   # 格式化工具（必选）
-│   └── ...               # 更多领域工具
+│   ├── web_search_tools.py # 联网搜索（四引擎降级）
+│   ├── pagination.py     # 分页工具
+│   ├── mcp_bridge.py     # MCP 桥接
+│   └── finance/          # 金融领域工具（27 个模块）
+│       ├── analysis_tools.py    # 技术分析（1613行，最大）
+│       ├── data_tools.py        # 数据查询
+│       ├── indicator_tools.py   # 指标计算
+│       ├── indicator_analysis.py # 指标分析
+│       ├── quote_tools.py       # 实时行情
+│       ├── news_search_tools.py # 新闻搜索
+│       ├── screener_tools.py    # 选股器
+│       ├── fund_flow_tools.py   # 资金流
+│       ├── capital_tools.py     # 资金汇总
+│       ├── sector_analysis_tools.py # 板块分析
+│       ├── chip_distribution.py # 筹码分布
+│       ├── chart_patterns.py    # 形态识别
+│       ├── technical_analysis.py # 技术面
+│       ├── intelligence_analysis.py # 情报分析
+│       ├── research_tools.py    # 研究分析
+│       ├── dragon_tools.py      # 龙虎榜
+│       ├── trading_tools.py     # 交易管理
+│       ├── backtest_tools.py    # 回测工具
+│       ├── backtest_analysis.py # 回测分析
+│       ├── batch_review_tools.py # 批量复盘
+│       ├── bull_bear_research.py # 多空研究
+│       ├── bb_screener_scan.py  # BB筛选扫描
+│       ├── index_tools.py       # 指数工具
+│       ├── em_utils.py          # 东方财富工具
+│       └── screener_config.py   # 选股配置
 │
-├── skills/               # 技能系统
-│   └── market_screener/  # 市场筛选技能
+├── skills/               # 技能系统（插件化，零配置）
+│   ├── base.py           # SkillAdapter 基类
+│   ├── market_screener/  # 市场筛选技能
+│   │   ├── SKILL.md      # 技能指令
+│   │   ├── run.py        # 技能函数
+│   │   ├── common.py     # 公共逻辑
+│   │   ├── intraday.py   # 盘中分析
+│   │   ├── post_market.py # 盘后分析
+│   │   ├── eod.py        # 日终分析
+│   │   └── references/   # 参考资料
+│   └── stock_evaluation/ # 股票评估技能
+│       ├── SKILL.md      # 技能指令
+│       ├── run.py        # 技能函数
+│       └── stock_report.py # 评估报告
 │
 ├── formatters/           # 结果格式化
 │   ├── base.py           # BaseFormatter 基类 + 注册表
@@ -151,13 +184,15 @@ backend_api_python/app/agent/
 │
 ├── prompts/              # 提示词模板
 │   ├── plan_system.txt   # Plan 阶段系统提示
-│   └── code_agent.yaml   # CodeAgent 提示词模板
+│   ├── code_agent.yaml   # CodeAgent 提示词模板
+│   └── intent_classifier.txt # 意图分类器提示
 │
 └── utils/                # 工具函数
     ├── json_parser.py    # JSON 安全解析
     ├── md_format.py      # Markdown 格式化
     ├── tracing.py        # 追踪记录
-    └── prompt_loader.py  # 提示词加载
+    ├── prompt_loader.py  # 提示词加载
+    └── logger.py         # 日志工具
 ```
 
 ---
@@ -349,25 +384,29 @@ final_answer(result)                              # 输出（系统自动格式�
 用户查询
   │
   ▼
-┌─────────────────────────────────────────────────┐
-│           MultiRouteRetriever                   │
-│                                                 │
-│  ┌─────────┐  ┌─────────┐  ┌─────────┐        │
-│  │ 向量检索 │  │ FTS检索  │  │ 关键词  │        │
-│  │(bge-m3) │  │(Postgres)│  │ (BM25)  │        │
-│  └────┬────┘  └────┬────┘  └────┬────┘        │
-│       │            │            │              │
-│       └────────────┼────────────┘              │
-│                    ▼                           │
-│            RRF 融合排序                         │
-│                    │                           │
-│                    ▼                           │
-│          BGE-reranker 精排                     │
-│                    │                           │
-└────────────────────┼───────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                 MultiRouteRetriever                         │
+│                                                             │
+│  ┌─────────┐  ┌─────────┐  ┌──────────┐  ┌─────────┐     │
+│  │ 向量检索 │  │ FTS检索  │  │聊天历史  │  │ 关键词  │     │
+│  │(bge-m3) │  │(Postgres)│  │(PG FTS) │  │ (BM25)  │     │
+│  │ w=1.0   │  │ w=0.8   │  │ w=0.4   │  │ w=0.6   │     │
+│  └────┬────┘  └────┬────┘  └────┬─────┘  └────┬────┘     │
+│       │            │            │              │          │
+│       └────────────┼────────────┼──────────────┘          │
+│                    ▼                                        │
+│            RRF 融合排序                                     │
+│                    │                                        │
+│                    ▼                                        │
+│          BGE-reranker 精排                                 │
+│                    │                                        │
+└────────────────────┼────────────────────────────────────────┘
                      ▼
                检索结果
 ```
+
+> 聊天历史检索需开启总开关：`.env` 中 `CHAT_HISTORY_SEARCH_ENABLED=true`
+> 且 `MEMORY_BACKEND=postgres`
 
 #### Embedding 模型
 
@@ -387,10 +426,11 @@ final_answer(result)                              # 输出（系统自动格式�
 #### 检索器
 
 ```python
-class Retriever:           # 单路检索器
-class KeywordRetriever:    # 关键词召回（BM25）
-class MultiRouteRetriever: # 多路召回 + RRF + Reranker
-class BGEReranker:         # BGE-reranker 精排
+class Retriever:             # 单路检索器
+class KeywordRetriever:      # 关键词召回（BM25）
+class ChatHistoryRetriever:  # 聊天历史全文检索（PG FTS）
+class MultiRouteRetriever:   # 多路召回 + RRF + Reranker
+class BGEReranker:           # BGE-reranker 精排
 ```
 
 #### RRF 融合算法
@@ -418,6 +458,7 @@ class BGEReranker:
 ```python
 class LLMBase(ABC):
     async def generate(messages, **kwargs) -> LLMResponse
+    async def close()  # 释放底层资源（如 httpx 连接池）
 
 class ChatMessage:
     role: str           # user / assistant / system / tool
@@ -479,18 +520,22 @@ class ToolProvider:
     get_default() -> ToolProvider
 ```
 
-#### 工具分类
+#### 工具分类（78 个公开函数）
 
-| 类别 | 工具数 | 说明 |
-|------|--------|------|
-| 数据查询 | 5 | 股票信息、行情、财务 |
-| 技术分析 | 18 | 指标、趋势、形态 |
-| 指标计算 | 3 | RSI、MACD、KDJ 等 |
-| 新闻情报 | 7 | 新闻搜索、舆情分析 |
-| 联网搜索 | 12 | Bocha/Tavily/百度/SearXNG |
-| 选股筛选 | 6 | 条件选股、板块筛选 |
-| 其他工具 | 50+ | 资金流、龙虎榜、回测等 |
-| **总计** | **72** | ToolProvider 自动扫描注册 |
+| 分组 | 工具数 | 代表工具 | 职责 |
+|------|--------|----------|------|
+| 行情数据 | 5 | get_realtime_quote, agent_get_kline, get_stock_info | K线/实时行情/盘口 |
+| 指标计算 | 7 | analyze_trend, get_indicator_snapshot, analyze_pattern | 技术指标/形态/筹码 |
+| 市场数据 | 7 | get_market_overview, get_northbound_flow, get_sector_rankings | 大盘/板块/北向 |
+| 情报搜索 | 4 | search_stock_intel, search_comprehensive_intel | 个股/板块/政策情报 |
+| 选股筛选 | 4 | search_stocks, get_screener_presets | 综合选股/策略/筛选 |
+| 信号捕捉 | 5 | get_hot_stocks_with_reasons, get_dragon_tiger_detail | 热点/概念/龙虎榜 |
+| 研究分析 | 5 | get_consensus_eps, batch_valuation_compare | 盈利预测/估值/新闻 |
+| 板块分析 | 7 | get_hot_sectors, get_sector_trend_analysis | 板块趋势/周期/成分股 |
+| 交易管理 | 4 | list_strategies, start_strategy | 策略管理/执行 |
+| 联网搜索 | 1 | web_search（四引擎降级） | 联网实时信息 |
+| 系统工具 | 3 | format_result, list_tools, search_tools | 格式化/工具发现 |
+| **总计** | **78** | ToolProvider 自动扫描注册 | |
 
 #### 工具发现与调用
 
@@ -535,13 +580,57 @@ class MemoryBase(ABC):
 
 #### 实现
 
-| 实现 | 存储 | 持久化 | 适用场景 |
-|------|------|--------|----------|
-| `LocalMemory` | 内存 dict | ❌ | 开发/测试 |
-| `PostgresMemory` | PostgreSQL | ✅ | 生产环境 |
-| `RedisMemory` | Redis | ✅ | 高并发场景 |
+| 实现 | 存储 | 持久化 | 全文检索 | 适用场景 |
+|------|------|--------|----------|----------|
+| `LocalMemory` | 内存 dict | ❌ | ❌ | 开发/测试 |
+| `PostgresMemory` | PostgreSQL | ✅ | ✅ PG FTS | 生产环境 |
+| `RedisMemory` | Redis | ✅ | ❌ | 高并发场景 |
 
-### 3.8 结果格式化 (`formatters/`)
+#### PostgresMemory 全文检索
+
+`PostgresMemory` 内置 PG FTS 全文检索，`agent_messages` 表自动添加 `tsvector` 列 + GIN 索引：
+
+```python
+class PostgresMemory(MemoryBase):
+    async def search(query, limit, session_id) -> list[dict]:
+        """全文搜索历史聊天记录。"""
+        # 中文分词：单字 + 双字 gram
+        # tsvector + tsquery（OR 逻辑）
+        # ts_rank 排序
+```
+
+新消息插入时自动填充 `fts_vector`，旧数据首次查询时回填。
+
+与 `ChatHistoryRetriever` 配合，作为 RAG 多路召回的一路。
+
+### 3.8 消息队列 (`message_queue.py`)
+
+Flask 和 Cron 共用同一个队列 + worker 线程池，所有消息走同一条链路：
+
+```
+Flask 请求 / Cron 定时
+  │
+  ▼
+submit(message, session_id) → Future
+  │
+  ▼
+_task_queue (Queue, maxsize=256)
+  │
+  ▼
+worker 线程 (4个)
+  ├→ asyncio.new_event_loop()
+  ├→ agent.chat(message)
+  ├→ agent.llm.close()  ← 关闭 httpx 客户端
+  ├→ loop.close()
+  └→ future.set_result(content)
+```
+
+关键设计：
+- 每个 worker 创建独立 event loop，避免跨线程共享
+- 执行完毕后显式关闭 LLM 客户端（`agent.llm.close()`），防止 httpx 连接池泄漏
+- 异常通过 `future.set_exception()` 传递给调用方，同时记录日志
+
+### 3.9 结果格式化 (`formatters/`)
 
 #### 设计模式
 
@@ -597,7 +686,7 @@ class CryptoFormatter(BaseFormatter):
         ...
 ```
 
-### 3.9 可追责链 (`chain/`)
+### 3.10 可追责链 (`chain/`)
 
 #### EvalNode 树
 
@@ -658,7 +747,7 @@ def start_eval_worker():
     # 更新技能/工具权重
 ```
 
-### 3.9 技能系统 (`skills/`)
+### 3.11 技能系统 (`skills/`)
 
 #### 技能定义
 
@@ -677,7 +766,7 @@ skills/market_screener/
 | 第二层 | execute_node | SKILL.md body（完整指令） |
 | 第三层 | execute_node | _SkillResourceTool（按需读取资源） |
 
-### 3.10 提示词系统 (`prompts/`)
+### 3.12 提示词系统 (`prompts/`)
 
 #### plan_system.txt
 
@@ -857,6 +946,7 @@ RERANK_TOP_K=20
 # ═══════════════════════════════════════════════════════════════
 MEMORY_BACKEND=local                    # local / postgres / redis
 MEMORY_MAX_HISTORY=2000
+CHAT_HISTORY_SEARCH_ENABLED=false       # 聊天历史全文检索（需 MEMORY_BACKEND=postgres）
 
 # ═══════════════════════════════════════════════════════════════
 #  Agent 配置
@@ -1085,6 +1175,19 @@ class TraceCollector:
     def flush() -> root_id  # 存库
 ```
 
+#### trace 记录的 smolagents 内部数据
+
+`_record_tool_calls_to_trace()` 从 smolagents `agent.memory.steps` 提取：
+
+| 数据 | 来源 | 用途 |
+|------|------|------|
+| `tool_name` / `tool_args` | ActionStep.tool_calls | 工具调用记录 |
+| `observations` | ActionStep.observations | 工具返回结果（截断 2000 字符）|
+| `model_output` | ActionStep.model_output | LLM 每步推理文本（截断 1000 字符）|
+| `code_action` | ActionStep.code_action | LLM 生成的代码块（截断 500 字符）|
+| `token_usage` | ActionStep.token_usage | 每步 token 消耗（input/output/total）|
+| `plan` | PlanningStep.plan | 每轮规划文本（截断 2000 字符）|
+
 ### 9.3 关键日志点
 
 | 日志前缀 | 说明 |
@@ -1106,6 +1209,8 @@ class TraceCollector:
 | 问题 | 状态 | 说明 |
 |------|------|------|
 | ~~CodeAgent planning prompt 工具注入失败~~ | ✅ 已修复 | 通过 {{tool_list}} 注入 |
+| ~~LLM 客户端泄漏 (Event loop is closed)~~ | ✅ v1.3 修复 | LLMBase.close() + 资源清理 |
+| ~~agent.py 连接泄漏~~ | ✅ v1.3 修复 | _load_analysis_memory_docs() 加 finally |
 | llama.cpp router mode 不支持 embedding | ⚠️ 已知 | 需要两个实例 |
 | PgVectorStore 性能瓶颈 | 📋 待优化 | 需引入 pgvector 扩展 |
 
@@ -1115,13 +1220,37 @@ class TraceCollector:
 |--------|--------|------|
 | 引入 pgvector 扩展 | 高 | 数据库级 ANN 检索 |
 | 统一 VectorStoreBase 接口 | 中 | PgVectorStore 继承基类 |
-| 添加连接池 | 中 | psycopg2 pool / qdrant 单例 |
+| ~~添加连接池~~ | ✅ 已有 | PostgresMemory 用 app.utils.db 连接池，_load_analysis_memory_docs 已修复 |
 | 中文分词优化 | 低 | jieba 分词 + 停用词过滤 |
 | Embedding 分块 | 低 | 长文本自动切分 |
 
 ---
 
-## 附录 A：依赖清单
+## 附录 A：版本历史
+
+### v1.3 (2026-07-22)
+
+| 类别 | 改动 | 文件 |
+|------|------|------|
+| 🐛 修复 | `run_agent()` LLM 客户端泄漏：删 `_client=None`，加 `agent.llm.close()` | agent.py |
+| 🐛 修复 | `_load_analysis_memory_docs()` 连接泄漏：加 `finally: conn.close()` | agent.py |
+| 🐛 修复 | MQ worker 异常静默吞掉：加 `logger.error` | message_queue.py |
+| 🐛 修复 | cache import 路径不一致：`from app.agent.log` → `from log` | cache.py |
+| ✨ 新增 | `LLMBase.close()` 基类方法 + `OpenAILLM.close()` 关闭 httpx 客户端 | llm/base.py, llm/openai_llm.py |
+| ✨ 新增 | `PostgresMemory.search()` 全文检索（PG FTS） | memory/postgres_memory.py |
+| ✨ 新增 | `ChatHistoryRetriever` 聊天历史检索器 | rag/retriever.py |
+| ✨ 新增 | RAG 第 3 路召回：聊天历史检索（权重 0.4） | agent.py |
+| ✨ 新增 | `CHAT_HISTORY_SEARCH_ENABLED` 环境变量总开关 | agent.py |
+| ✨ 新增 | trace 记录 smolagents 推理链（model_output/code_action/token_usage） | nodes.py |
+| ✨ 新增 | trace 记录每轮 PlanningStep（不只是最后一轮） | nodes.py |
+| 🐛 修复 | PostgresMemory FTS 列检测：PL/pgSQL 内 Identifier 引号导致 information_schema 匹配失败，改用 Python 层参数化查询 | memory/postgres_memory.py |
+
+### v1.2 (2026-07-18)
+- 初始版本
+
+---
+
+## 附录 B：依赖清单
 
 ```txt
 # 核心依赖
@@ -1145,7 +1274,7 @@ pandas>=1.5.0                  # 数据处理
 redis>=5.0.0                   # Redis 缓存（可选）
 ```
 
-## 附录 B：API 接口
+## 附录 C：API 接口
 
 ### POST /api/agent-v2/chat
 

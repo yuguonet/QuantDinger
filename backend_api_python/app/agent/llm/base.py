@@ -135,3 +135,7 @@ class LLMBase(ABC):
             temperature if temperature is not None else self.temperature,
             max_tokens if max_tokens is not None else self.max_tokens,
         )
+
+    async def close(self):
+        """释放底层资源（如 httpx 客户端）。子类应覆盖此方法。"""
+        pass

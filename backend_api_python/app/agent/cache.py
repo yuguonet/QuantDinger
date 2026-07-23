@@ -11,7 +11,7 @@ import time
 from functools import wraps
 from typing import Any, Callable, Optional
 
-from app.agent.log import logger
+from log import logger
 
 
 class _InMemoryCache:
