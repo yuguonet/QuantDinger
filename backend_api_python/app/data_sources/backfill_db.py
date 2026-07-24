@@ -22,6 +22,7 @@ backfill_db.py — A 股 K 线盘后覆写（mootdx 直连）
 """
 
 import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
@@ -39,6 +40,8 @@ TZ_CN = timezone(timedelta(hours=8))
 
 _client = None
 _client_lock = threading.Lock()
+# 共享线程池：用于 mootdx 超时保护，单线程避免并发冲突
+_executor = ThreadPoolExecutor(max_workers=1)
 
 
 def _get_client():
@@ -73,14 +76,21 @@ _TDX_FREQ = {
 # 数据拉取
 # ================================================================
 
-def _fetch_kline(code: str, tf: str, count: int = 800) -> Optional[list]:
+def _fetch_kline(code: str, tf: str, count: int = 800, timeout: int = 15) -> Optional[list]:
     """从 mootdx 拉取单标的 K 线。
+
+    Args:
+        code: 股票代码
+        tf: 周期
+        count: 数量
+        timeout: 单只股票超时秒数（默认 15s，防止 mootdx 卡死）
 
     Returns:
         [{"time": datetime, "open": float, "high": float,
           "low": float, "close": float, "volume": float}, ...]
         失败返回 None
     """
+    global _client
     cli = _get_client()
     if cli is None:
         return None
@@ -90,8 +100,19 @@ def _fetch_kline(code: str, tf: str, count: int = 800) -> Optional[list]:
         logger.error(f"[mootdx] 不支持的周期: {tf}")
         return None
 
+    def _do_fetch():
+        return cli.bars(symbol=code, frequency=freq, offset=min(count, 800))
+
     try:
-        df = cli.bars(symbol=code, frequency=freq, offset=min(count, 800))
+        # 单只股票超时保护：mootdx 可能卡死在某只股票
+        # 使用模块级共享 Executor，避免每只股票创建线程池
+        future = _executor.submit(_do_fetch)
+        try:
+            df = future.result(timeout=timeout)
+        except FuturesTimeoutError:
+            logger.warning(f"[mootdx] {code}/{tf} 超时 ({timeout}s)，跳过")
+            _client = None  # 重置客户端，下次重连
+            return None
         if df is None or df.empty:
             return None
 
@@ -131,7 +152,6 @@ def _fetch_kline(code: str, tf: str, count: int = 800) -> Optional[list]:
     except Exception as e:
         logger.warning(f"[mootdx] 拉取 {code}/{tf} 失败: {e}")
         # 连接异常时重置客户端，下次自动重连
-        global _client
         if "connection" in str(e).lower() or "timeout" in str(e).lower():
             _client = None
         return None
@@ -295,6 +315,9 @@ def sync_tf(tf: str, symbols: Optional[List[str]] = None) -> dict:
 
     count = 16 if tf == "15m" else 1
     target_date = bar_time.strftime("%Y-%m-%d")
+    consecutive_fail = 0       # 连续失败计数
+    MAX_CONSECUTIVE_FAIL = 200 # 连续失败 200 只 → mootdx 不可用，提前退出
+
     for i, sym in enumerate(symbols):
         records = _fetch_kline(sym, tf, count=count)
         if records:
@@ -304,17 +327,26 @@ def sync_tf(tf: str, symbols: Optional[List[str]] = None) -> dict:
                 for r in filtered:
                     r["symbol"] = sym
                 all_records.extend(filtered)
+                consecutive_fail = 0  # 成功则重置
             else:
-                # mootdx 返回了数据但不是目标日期 → 停牌/退市，跳过
-                failed += 1
-                failed_list.append(sym)
+                # mootdx 返回了数据但不是目标日期 → 停牌/退市，不算失败
+                pass
         else:
             failed += 1
             failed_list.append(sym)
+            consecutive_fail += 1
+            # 前 5 只失败打详情，便于排查
+            if failed <= 5:
+                logger.warning(f"[同步] {tf} {sym} 拉取失败 (第{failed}只)")
 
-        # 进度日志
-        if (i + 1) % 500 == 0:
-            logger.info(f"[同步] {tf} 进度 {i+1}/{total}")
+        # 连续失败过多 → mootdx 不可用，提前退出
+        if consecutive_fail >= MAX_CONSECUTIVE_FAIL:
+            logger.error(f"[同步] {tf} 连续失败 {MAX_CONSECUTIVE_FAIL} 只，mootdx 不可用，提前退出")
+            break
+
+        # 进度日志（每 100 只打一次，避免长时间无输出）
+        if (i + 1) % 100 == 0 or (i + 1) == total:
+            logger.info(f"[同步] {tf} 进度 {i+1}/{total} (成功={i+1-failed} 失败={failed})")
 
     # 有数据才删写，避免拉取失败导致丢数据
     if not all_records:

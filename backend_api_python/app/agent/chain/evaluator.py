@@ -69,7 +69,7 @@ def _get_actual_return(
     try:
         from app.agent.tools.finance.data_tools import agent_get_kline
 
-        klines = agent_get_kline(stock_code, timeframe="1D", days=hold_days + 10, market=market)
+        klines = agent_get_kline(stock_code, timeframe="1D", days=hold_days + 10)
         if not klines or len(klines) < 2:
             return None
 
