@@ -21,45 +21,21 @@ backfill_db.py — A 股 K 线盘后覆写（mootdx 直连）
   - 复权因子由 app/data_sources/provider/adjustment.py 单独维护，查询时按需复权
 """
 
-import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from app.utils.db_market import get_market_db_manager
 from app.utils.logger import get_logger
+from app.utils.mootdx_client import get_client as _get_client, reset_client as _reset_mootdx_client
 
 logger = get_logger(__name__)
 
 
 TZ_CN = timezone(timedelta(hours=8))
 
-# ================================================================
-# mootdx 客户端（单例，复用连接）
-# ================================================================
-
-_client = None
-_client_lock = threading.Lock()
 # 共享线程池：用于 mootdx 超时保护，单线程避免并发冲突
 _executor = ThreadPoolExecutor(max_workers=1)
-
-
-def _get_client():
-    """获取 mootdx 客户端单例。"""
-    global _client
-    if _client is not None:
-        return _client
-    with _client_lock:
-        if _client is not None:
-            return _client
-        try:
-            from mootdx.quotes import Quotes
-            _client = Quotes.factory(market='std', bestip=True)
-            logger.info("[mootdx] 连接成功")
-        except Exception as e:
-            logger.error(f"[mootdx] 连接失败: {e}")
-            return None
-    return _client
 
 
 # ================================================================
@@ -90,7 +66,6 @@ def _fetch_kline(code: str, tf: str, count: int = 800, timeout: int = 15) -> Opt
           "low": float, "close": float, "volume": float}, ...]
         失败返回 None
     """
-    global _client
     cli = _get_client()
     if cli is None:
         return None
@@ -111,7 +86,7 @@ def _fetch_kline(code: str, tf: str, count: int = 800, timeout: int = 15) -> Opt
             df = future.result(timeout=timeout)
         except FuturesTimeoutError:
             logger.warning(f"[mootdx] {code}/{tf} 超时 ({timeout}s)，跳过")
-            _client = None  # 重置客户端，下次重连
+            _reset_mootdx_client()  # 重置共享客户端，下次重连
             return None
         if df is None or df.empty:
             return None
@@ -153,7 +128,7 @@ def _fetch_kline(code: str, tf: str, count: int = 800, timeout: int = 15) -> Opt
         logger.warning(f"[mootdx] 拉取 {code}/{tf} 失败: {e}")
         # 连接异常时重置客户端，下次自动重连
         if "connection" in str(e).lower() or "timeout" in str(e).lower():
-            _client = None
+            _reset_mootdx_client()
         return None
 
 

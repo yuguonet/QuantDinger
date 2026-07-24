@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from typing import Any, Dict, List, Optional
 
 from app.utils.logger import get_logger
@@ -23,42 +22,10 @@ from app.utils.logger import get_logger
 logger = logging.getLogger(__name__)
 
 # ══════════════════════════════════════════════════════════════
-#  mootdx 客户端管理（独立单例，与 index/tape 模块互不干扰）
+#  mootdx 客户端管理 — 使用全局共享客户端
 # ══════════════════════════════════════════════════════════════
 
-_client = None       # mootdx Quotes 实例
-_client_ts = 0       # 上次连接成功的时间戳
-_CLIENT_TTL = 3600   # 连接有效期: 1小时
-
-
-def _get_client():
-    """获取 mootdx 客户端单例（finance 模块专用）。
-
-    Returns:
-        mootdx.quotes.Quotes 实例，或 None（连接失败时）
-    """
-    global _client, _client_ts
-
-    # 检查现有连接: 未过期 + 未关闭 → 复用
-    if _client is not None and (time.time() - _client_ts) < _CLIENT_TTL:
-        try:
-            if not _client.closed:
-                return _client
-        except Exception:
-            pass
-        _client = None
-
-    # 创建新连接
-    try:
-        from mootdx.quotes import Quotes
-        _client = Quotes.factory(market='std', timeout=10, heartbeat=True)
-        _client_ts = time.time()
-        logger.info("[mootdx:f10] 连接成功")
-        return _client
-    except Exception as e:
-        logger.warning("[mootdx:f10] 连接失败: %s", e)
-        _client = None
-        return None
+from app.utils.mootdx_client import get_client as _get_client
 
 
 def _market(code: str) -> int:

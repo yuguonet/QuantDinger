@@ -29,7 +29,6 @@ import json
 import logging
 import os
 import threading
-import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -79,64 +78,10 @@ TDX_FREQ: Dict[str, int] = {
 }
 
 # ══════════════════════════════════════════════════════════════
-#  mootdx 客户端管理（单例 + TTL 自动重建）
+#  mootdx 客户端管理 — 使用全局共享客户端
 # ══════════════════════════════════════════════════════════════
 
-# 全局单例: 三个模块(index/tape/finance)各自维护独立的 _client
-# 这样做的好处是互不干扰——某个模块连接断开不会影响其他模块
-_client = None       # mootdx Quotes 实例
-_client_ts = 0       # 上次连接成功的时间戳（Unix epoch）
-_CLIENT_TTL = 3600   # 连接有效期: 3600秒 = 1小时，超时后自动重建
-
-
-def _get_client():
-    """获取 mootdx 客户端单例（复用 provider 层 TDX 服务器探测结果）。
-
-    策略:
-      1. 已有连接且未过期且未关闭 → 直接复用
-      2. 从 provider 层获取已探测的可用 HQ 服务器，逐个尝试连接
-      3. 无可用服务器 → 返回 None
-
-    Returns:
-        mootdx.quotes.Quotes 实例，或 None（连接失败时）
-    """
-    global _client, _client_ts
-
-    # 检查现有连接是否可用: 未过期 + 未关闭
-    if _client is not None and (time.time() - _client_ts) < _CLIENT_TTL:
-        try:
-            if not _client.closed:
-                return _client
-        except Exception:
-            pass
-        _client = None
-
-    # 从 provider 层获取已探测的可用服务器
-    try:
-        from app.data_sources.provider.tdx_ex import TdxExDataSource
-        provider = TdxExDataSource()
-        servers = [(h, p) for h, p, proto in provider._live_servers if proto == "hq"]
-        if not servers:
-            logger.warning("[mootdx] 无可用 HQ 服务器")
-            return None
-    except Exception as e:
-        logger.warning("[mootdx] 获取服务器列表失败: %s", e)
-        return None
-
-    from mootdx.quotes import Quotes
-    for host, port in servers:
-        try:
-            _client = Quotes.factory(market='std', timeout=10,
-                                     heartbeat=True, server=(host, port))
-            _client_ts = time.time()
-            logger.info("[mootdx] 连接成功 %s:%d", host, port)
-            return _client
-        except Exception:
-            continue
-
-    logger.warning("[mootdx] 所有服务器连接失败")
-    _client = None
-    return None
+from app.utils.mootdx_client import get_client as _get_client
 
 
 def _idx_market(code: str) -> int:
