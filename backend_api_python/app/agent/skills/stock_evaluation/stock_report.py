@@ -13,6 +13,14 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 
+def _safe_round(val: Any, ndigits: int = 2) -> Any:
+    """安全四舍五入，非数值原样返回。"""
+    try:
+        return round(float(val), ndigits)
+    except (TypeError, ValueError):
+        return val
+
+
 def stock_report(
     info: Optional[Dict[str, Any]] = None,
     technical: Optional[Dict[str, Any]] = None,
@@ -57,6 +65,130 @@ def stock_report(
 #  核心逻辑：从工具结果提取数据 → 评分 → 拼 markdown
 # ═══════════════════════════════════════════════════════════════
 
+def _calc_support_resistance(
+    technical: dict, quote: dict, capital: dict, fund_flow: dict
+) -> tuple[Optional[float], Optional[float], str]:
+    """计算支撑位和压力位，返回 (support, resistance, signal_desc)。
+
+    优先级：Bollinger 带 > MA 均线 > 近期高低点。
+    """
+    import math
+
+    latest = technical.get("latest_close", 0) or quote.get("price", 0) or quote.get("latest_price", 0)
+    support = None
+    resistance = None
+
+    # ── 方法1: Bollinger 带 ──
+    boll = technical.get("boll", {})
+    if isinstance(boll, dict) and "error" not in boll:
+        upper = boll.get("upper")
+        lower = boll.get("lower")
+        mid = boll.get("mid")
+        if upper and lower and latest:
+            # 压力位: 上轨（如果当前价在中轨以下）或中轨（如果在上轨附近）
+            if latest < mid:
+                resistance = mid
+            else:
+                resistance = upper
+            # 支撑位: 下轨（如果当前价在中轨以上）或中轨（如果在下轨附近）
+            if latest > mid:
+                support = mid
+            else:
+                support = lower
+
+    # ── 方法2: MA 均线作为支撑/压力 ──
+    ma20 = technical.get("ma20")
+    ma60 = technical.get("ma60")
+    if latest and ma20:
+        if support is None:
+            if latest > ma20:
+                support = ma20
+            elif ma60 and latest > ma60:
+                support = ma60
+        if resistance is None:
+            if latest < ma20:
+                resistance = ma20
+            elif ma60 and latest < ma60:
+                resistance = ma60
+
+    # ── 信号描述 ──
+    signal = technical.get("signal", "")
+    signal_parts = []
+    if signal:
+        short_signal = signal.split("|")[0].strip() if "|" in signal else signal
+        signal_parts.append(short_signal)
+
+    # 布林带位置信号
+    if isinstance(boll, dict) and "error" not in boll:
+        pos = boll.get("position_pct", 50)
+        if pos and pos <= 20:
+            signal_parts.append(f"接近布林下轨，关注支撑")
+        elif pos and pos >= 80:
+            signal_parts.append(f"接近布林上轨，注意压力")
+
+    # MA 偏离信号（避免与主信号重复）
+    bias20 = technical.get("bias_ma20")
+    if bias20 is not None and abs(bias20) > 10:
+        bias_desc = f"偏离MA20达{bias20:.1f}%，{'超跌反弹' if bias20 < 0 else '超涨回调'}"
+        if bias_desc not in signal_parts:
+            signal_parts.append(bias_desc)
+
+    # 去重
+    seen = set()
+    unique_parts = []
+    for p in signal_parts:
+        if p not in seen:
+            seen.add(p)
+            unique_parts.append(p)
+    full_signal = "+".join(unique_parts) if unique_parts else "数据不足"
+
+    return _safe_round(support), _safe_round(resistance), full_signal
+
+
+def _build_comprehensive_analysis(
+    technical: dict, fund_signal: str, capital_signal: str,
+    action: str, direction: str,
+) -> str:
+    """生成综合分析摘要（150字以内）。"""
+    parts = []
+
+    # 形态信号
+    factors = technical.get("factors", [])
+    good_factors = [f for f in factors if f.get("score", 0) >= 70]
+    if good_factors:
+        # 用 factor value（具体描述）而非 name（可能和"形态"重复）
+        descs = [f.get("value", f["name"]) for f in good_factors[:2]]
+        parts.append(f"形态:{','.join(descs)}")
+
+    # 资金面
+    if fund_signal and "无数据" not in fund_signal:
+        parts.append(f"资金{fund_signal}")
+
+    # 指标状态
+    rsi = technical.get("rsi", {})
+    if isinstance(rsi, dict):
+        rsi_val = rsi.get("value", 50)
+        if rsi_val < 30:
+            parts.append("RSI超卖")
+        elif rsi_val > 70:
+            parts.append("RSI超买")
+        else:
+            parts.append("指标健康")
+
+    # 趋势
+    trend = technical.get("trend", "") or technical.get("direction", "")
+    if "bullish" in str(trend) or "上升" in str(trend):
+        parts.append("趋势向上")
+    elif "bearish" in str(trend) or "下降" in str(trend):
+        parts.append("趋势向下")
+
+    if not parts:
+        return "数据不足，建议观望。"
+
+    analysis = "，".join(parts) + f"。建议{action}。"
+    return analysis[:150]
+
+
 def _generate_report(
     info: dict, technical: dict, capital: dict, quote: dict, fund_flow: dict
 ) -> tuple[str, dict]:
@@ -73,11 +205,10 @@ def _generate_report(
     # ── 技术面 ──
     score = technical.get("score", 0)
     direction = technical.get("direction", "neutral")
-    signal = technical.get("signal", "")
 
-    # ── 估值 ──
-    pe_ttm = info.get("pe_ttm") or info.get("pe_static") or info.get("pe_ratio")
-    pe_str = f"{pe_ttm:.2f}" if pe_ttm and pe_ttm > 0 else ("亏损" if pe_ttm and pe_ttm < 0 else "未知")
+    # ── 当前价 ──
+    latest_price = technical.get("latest_close", 0) or quote.get("price", 0) or quote.get("latest_price", 0)
+    price_str = f"{latest_price:.2f}" if latest_price else "--"
 
     # ── 资金面 ──
     fund_signal = ""
@@ -96,51 +227,55 @@ def _generate_report(
         capital_signal = capital_data.get("overall_signal", "")
 
     # ── 综合判断 ──
-    action = _determine_action(score, direction, pe_ttm, fund_signal)
+    action = _determine_action(score, direction, None, fund_signal)
     confidence = _determine_confidence(technical, fund_signal, capital_signal)
+    direction_cn = _direction_cn(direction)
 
-    # ── 信号描述 ──
-    signal_parts = []
-    if signal:
-        short_signal = signal.split("|")[0].strip() if "|" in signal else signal
-        signal_parts.append(short_signal)
-    if pe_ttm and pe_ttm < 0:
-        signal_parts.append("基本面亏损")
-    full_signal = "+".join(signal_parts) if signal_parts else "数据不足"
+    # ── 支撑位 / 压力位 ──
+    support, resistance, signal_desc = _calc_support_resistance(
+        technical, quote, capital, fund_flow
+    )
+    support_str = f"{support:.2f}" if support else "--"
+    resistance_str = f"{resistance:.2f}" if resistance else "--"
+
+    # ── 综合分析 ──
+    analysis = _build_comprehensive_analysis(
+        technical, fund_signal, capital_signal, action, direction
+    )
 
     # ── 结构化摘要（供 LLM 做定性分析）──
-    # 提取技术面因子明细
     factors = technical.get("factors", [])
     factors_str = ", ".join([f"{f['name']}:{f['score']}" for f in factors if f.get('score')]) if factors else ""
 
     summary = {
         "stock": f"{stock_name}({stock_code})",
         "score": score,
-        "direction": _direction_cn(direction),
+        "direction": direction_cn,
         "action": action,
-        "pe": pe_str,
-        "signal_short": signal.split("|")[0].strip() if "|" in signal else signal,
-        "signal_full": signal,
+        "signal_short": signal_desc.split("+")[0] if signal_desc else "",
+        "signal_full": signal_desc,
         "fund": fund_signal or "无数据",
         "capital": capital_signal or "无数据",
         "factors": factors_str,
         "confidence": confidence,
+        "latest_price": latest_price,
+        "support": support,
+        "resistance": resistance,
     }
 
-    # ── 输出（结构化数据，不含综合分析）──
-    direction_cn = _direction_cn(direction)
-    direction_line = f"**方    向**: {direction_cn}\n" if direction_cn else ""
+    # ── 输出（精简格式，含支撑/压力位）──
     report = (
         f"**股票名称**: {stock_name} ({stock_code})\n"
         f"**综合评分**: {score}\n"
         f"**操作建议**: {action}\n"
-        f"{direction_line}"
+        f"**方    向**: {direction_cn}\n"
         f"**置 信 度**: {confidence}\n"
         f"**时间窗口**: T+3\n"
-        f"**技术面**: {score}分 ({factors_str})\n"
-        f"**资金面**: {fund_signal or '无数据'}\n"
-        f"**基本面**: PE {pe_str}\n"
-        f"**信号**: {full_signal}"
+        f"**当 前 价**: {price_str}\n"
+        f"**支 撑 位**: {support_str}\n"
+        f"**压 力 位**: {resistance_str}\n"
+        f"**信号**: {signal_desc}\n"
+        f"**综合分析**: {analysis}"
     )
     return report, summary
 

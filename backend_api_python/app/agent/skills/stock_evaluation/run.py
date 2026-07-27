@@ -363,7 +363,9 @@ def evaluate_stock(
     capital = tool_results.get("get_capital_summary", {})
     fund_flow = tool_results.get("get_fund_flow", {})
 
-    report_result = _stock_report(info={}, technical=technical, capital=capital, quote=quote, fund_flow=fund_flow)
+    # 传入股票基本信息（含名称），不要传空 dict
+    stock_info = {"stock_code": code, "name": stock_name}
+    report_result = _stock_report(info=stock_info, technical=technical, capital=capital, quote=quote, fund_flow=fund_flow)
 
     report = report_result.get("report", "")
     summary = report_result.get("summary", {})

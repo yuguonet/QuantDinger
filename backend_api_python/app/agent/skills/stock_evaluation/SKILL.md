@@ -79,9 +79,9 @@ verified = result["verified"]
 }
 ```
 
-### Step 3: 综合分析 + 输出
+### Step 3: 直接输出
 
-从 result 中提取数据，生成综合分析，最终用 `final_answer()` 输出：
+report 已包含综合分析，直接输出即可：
 
 ```python
 result = evaluate_stock(codes="300129", depth="standard", period="T+3")
@@ -90,34 +90,24 @@ if "error" in result:
     final_answer(f"评估失败: {result['error']}")
     return
 
-report = result["report"]      # 标准化报告（含注意栏）
-llm_data = result["llm_data"]  # 技术因子/资金面/指标详情
-verified = result["verified"]  # 交叉验证
+# report 已含支撑位/压力位/信号/综合分析，直接输出
+final_answer(result["report"])
 ```
 
-基于 llm_data 生成综合分析（150字以内），拼在 report 后面：
-
-```python
-# llm_data 实际字段（不要用不存在的字段名）
-tech_factors = llm_data.get("technical_factors", [])  # 技术因子列表
-tech_signals = llm_data.get("technical_signals", "")  # 技术信号
-fund_flow = llm_data.get("fund_flow", {})  # 资金流向
-capital = llm_data.get("capital", {})  # 资本结构
-indicator_details = llm_data.get("indicator_details", {})  # 指标详情
-trend_details = llm_data.get("trend_details", {})  # 趋势详情
-
-# 基于以上数据生成综合分析，不要输出原始 dict
-analysis = "你的分析内容..."  # 核心逻辑 + 风险点 + 操作建议
-final_answer(report + "\n**综合分析**: " + analysis)
+**最终输出示例**：
 ```
-
-**最终输出顺序**：报告 → 注意 → 综合分析（注意由 evaluate_stock 自动生成，你只需追加综合分析）
-
-**综合分析要求：**
-- 核心逻辑：为什么涨/跌（基于技术面+资金面数据）
-- 风险点：需要注意什么
-- 操作建议：具体策略（持有/买入/卖出的时机）
-- 控制在 150 字以内
+**股票名称**: 多氟多 (002407)
+**综合评分**: 56
+**操作建议**: 持有
+**方    向**: 中性
+**置 信 度**: 高
+**时间窗口**: T+3
+**当 前 价**: 31.70
+**支 撑 位**: 30.00
+**压 力 位**: 32.31
+**信号**: 偏离MA20达-17.9%，超跌反弹
+**综合分析**: 形态:三连阳（多头排列） | 形态:红三兵（强烈看多），资金流向健康，指标健康。趋势向上，建议持有。
+```
 
 ### Step 3b: 多股分析
 

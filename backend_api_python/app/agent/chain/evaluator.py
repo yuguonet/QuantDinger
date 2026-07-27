@@ -70,12 +70,19 @@ def _get_actual_return(
         from app.agent.tools.finance.data_tools import agent_get_kline
 
         klines = agent_get_kline(stock_code, timeframe="1D", days=hold_days + 10)
-        if not klines or len(klines) < 2:
+
+        # 校验返回类型：dict 表示错误，需要 list 才能遍历
+        if isinstance(klines, dict):
+            logger.warning("[Evaluator] %s K线返回错误: %s", stock_code, klines.get("error", klines))
+            return None
+        if not isinstance(klines, list) or len(klines) < 2:
             return None
 
         from_str = from_date.strftime("%Y-%m-%d")
         base_idx = None
         for i, k in enumerate(klines):
+            if not isinstance(k, dict):
+                continue
             k_date = k.get("t", "")[:10]
             if k_date >= from_str:
                 base_idx = i
@@ -84,12 +91,16 @@ def _get_actual_return(
         if base_idx is None:
             return None
 
-        base_close = klines[base_idx]["c"]
+        base_close = klines[base_idx].get("c", 0)
+        if not base_close:
+            return None
         exit_idx = min(base_idx + hold_days, len(klines) - 1)
         if exit_idx <= base_idx:
             return None
 
-        exit_close = klines[exit_idx]["c"]
+        exit_close = klines[exit_idx].get("c", 0)
+        if not exit_close:
+            return None
         pnl_pct = round((exit_close - base_close) / base_close * 100, 2)
         actual_hold = exit_idx - base_idx
         direction = classify_return(pnl_pct / 100)
@@ -98,7 +109,7 @@ def _get_actual_return(
             "pnl_pct": pnl_pct,
             "hold_days": actual_hold,
             "direction": direction,
-            "exit_date": klines[exit_idx].get("t", "")[:10],
+            "exit_date": klines[exit_idx].get("t", "")[:10] if isinstance(klines[exit_idx], dict) else "",
         }
 
     except Exception as e:

@@ -341,12 +341,12 @@ def make_chat_node(ctx: NodeContext):
             try:
                 entity = ctx.entity_resolver.resolve(resolve_input)
                 if entity:
-                    entity_code = entity.get("code", "")
-                    entity_name = entity.get("name", "")
-                    entity_type = entity.get("type", "")
+                    entity_code = entity.entity_code
+                    entity_name = entity.entity_name
+                    entity_type = entity.entity_type
                     # 直接用 resolver 生成的 effective_input（含实体注入+扩写）
-                    if entity.get("effective_input"):
-                        effective_input = entity["effective_input"]
+                    if entity.effective_input:
+                        effective_input = entity.effective_input
                     elif entity_code:
                         # resolver 没生成 effective_input，手动注入实体信息
                         entity_desc = f"{entity_name}({entity_code})" if entity_name else entity_code

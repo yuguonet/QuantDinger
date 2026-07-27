@@ -242,6 +242,10 @@ def _algo_analyze(
         md += "\n" + " ".join(signals[:3])
     analysis = md
 
+    # ── 透传原始数据（供 stock_report 计算支撑/压力位）──
+    trend_raw = tool_results.get("analyze_trend", {})
+    indicator_raw = tool_results.get("get_indicator_snapshot", {})
+
     _r = {
         "score": final_score,
         "direction": direction,
@@ -250,6 +254,13 @@ def _algo_analyze(
         "factors": factors,
         "analysis": analysis,
         "stock_code": stock_code,
+        # 原始数据透传
+        "latest_close": trend_raw.get("latest_close", 0) if isinstance(trend_raw, dict) else 0,
+        "boll": trend_raw.get("boll", {}) if isinstance(trend_raw, dict) else {},
+        "ma20": trend_raw.get("ma20") if isinstance(trend_raw, dict) else None,
+        "ma60": trend_raw.get("ma60") if isinstance(trend_raw, dict) else None,
+        "bias_ma20": trend_raw.get("bias_ma20") if isinstance(trend_raw, dict) else None,
+        "rsi": indicator_raw.get("rsi", {}) if isinstance(indicator_raw, dict) else {},
     }
     return _r
 def technical_analysis(codes: str) -> dict:
