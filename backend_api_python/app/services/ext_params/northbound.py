@@ -15,12 +15,18 @@ northbound — 北向资金 (沪深港通) 持股扩展参数
     stock_north_trend    近期趋势 ("增持"/"减持"/"持平")
 """
 import logging
+from datetime import datetime, timedelta
+
 import requests
 
 from . import provider
 from app.data_sources.normalizer import safe_float as _safe_float
+from app.utils.trading_calendar import trading_days_count
 
 logger = logging.getLogger(__name__)
+
+# 北向持股数据仅当天有效（1 个交易日）
+_MAX_STALE_TRADING_DAYS = 1
 
 _cache = {}
 
@@ -42,6 +48,47 @@ def _to_secid(symbol: str) -> str:
 
 
 
+def _is_north_data_stale(north_data: list, df, max_stale_days: int = _MAX_STALE_TRADING_DAYS) -> bool:
+    """校验北向数据是否过期。
+
+    使用 trading_calendar.trading_days_count 计算北向数据最新日期
+    与 df 最新日期之间相隔的交易日数，超过 max_stale_days 则视为过期。
+    """
+    if not north_data:
+        return True
+
+    latest_north_date = north_data[0].get('date', '')
+    if not latest_north_date:
+        return True
+
+    north_date_str = latest_north_date[:10]
+
+    # 取 df 最新日期
+    try:
+        if 'date' in df.columns:
+            df_latest = str(df['date'].iloc[-1])[:10]
+        else:
+            df_latest = str(df.index[-1])[:10]
+    except Exception:
+        return True
+
+    # 北向日期比 df 最新还新 → 不过期
+    if north_date_str >= df_latest:
+        return False
+
+    # 用交易日历精确计算相隔交易日数
+    gap = trading_days_count(north_date_str, df_latest) - 1  # -1: 包含两端需减一
+
+    if gap > max_stale_days:
+        logger.info(
+            "northbound: 数据过期 — 北向最新 %s, df最新 %s, 相隔 %d 个交易日",
+            north_date_str, df_latest, gap
+        )
+        return True
+
+    return False
+
+
 def _fetch_north_hold(symbol: str, days: int = 10) -> list:
     """获取个股沪深港通持股历史数据（带缓存）。"""
     cache_key = f"{symbol}_{days}"
@@ -55,7 +102,7 @@ def _fetch_north_hold(symbol: str, days: int = 10) -> list:
     try:
         url = "https://datacenter-web.eastmoney.com/api/data/v1/get"
         params = {
-            "sortColumns": "TRADE_DATE",
+            "sortColumns": "HOLD_DATE",
             "sortTypes": "-1",
             "pageSize": days,
             "pageNumber": 1,
@@ -70,11 +117,11 @@ def _fetch_north_hold(symbol: str, days: int = 10) -> list:
         results = []
         for item in items:
             results.append({
-                "date": str(item.get("TRADE_DATE", ""))[:10],
-                "hold_vol": _safe_float(item.get("HOLD_SHARES")),           # 持股数量 (股)
-                "hold_pct": _safe_float(item.get("A_SHARES_RATIO")),        # 持股占流通比 (%)
-                "hold_vol_chg": _safe_float(item.get("HOLD_SHARES_CHG")),   # 持股变化 (股)
-                "hold_market_value": _safe_float(item.get("HOLD_MARKET")),  # 持股市值 (元)
+                "date": str(item.get("HOLD_DATE", ""))[:10],
+                "hold_vol": _safe_float(item.get("HOLD_NUM")),              # 持股数量 (股)
+                "hold_pct": _safe_float(item.get("HOLD_SHARES_RATIO")),     # 持股占流通比 (%)
+                "hold_vol_chg": _safe_float(item.get("HOLD_SHARES_CHG", 0)),  # 持股变化 (股, 该字段已废弃, 默认0)
+                "hold_market_value": _safe_float(item.get("HOLD_MARKET_CAP")),  # 持股市值 (元)
             })
 
         _cache[cache_key] = results
@@ -97,12 +144,23 @@ def register(ctx: dict) -> dict:
     if symbol and df is not None and len(df) > 0:
         north_data = _fetch_north_hold(symbol, days=20)
 
-        if north_data:
-            # 构建日期映射
+        if north_data and not _is_north_data_stale(north_data, df):
+            # 构建日期映射（同一天多个机构 → 按日期聚合求和）
             north_map = {}
             for nd in north_data:
                 d = str(nd['date']).replace('-', '')[:8]
-                north_map[d] = nd
+                if d in north_map:
+                    north_map[d]['hold_vol'] += nd.get('hold_vol', 0)
+                    north_map[d]['hold_pct'] += nd.get('hold_pct', 0)
+                    north_map[d]['hold_vol_chg'] += nd.get('hold_vol_chg', 0)
+                    north_map[d]['hold_market_value'] += nd.get('hold_market_value', 0)
+                else:
+                    north_map[d] = {
+                        'hold_vol': nd.get('hold_vol', 0),
+                        'hold_pct': nd.get('hold_pct', 0),
+                        'hold_vol_chg': nd.get('hold_vol_chg', 0),
+                        'hold_market_value': nd.get('hold_market_value', 0),
+                    }
 
             hold_vol_list = []
             hold_pct_list = []

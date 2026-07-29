@@ -27,6 +27,10 @@ def stock_report(
     capital: Optional[Dict[str, Any]] = None,
     quote: Optional[Dict[str, Any]] = None,
     fund_flow: Optional[Dict[str, Any]] = None,
+    chip: Optional[Dict[str, Any]] = None,
+    period: str = "T+3",
+    intel: Optional[Dict[str, Any]] = None,
+    web: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """从工具返回的结构化数据直接生成个股分析报告。
 
@@ -36,6 +40,7 @@ def stock_report(
     - capital: 调用 get_capital_summary 获取
     - quote: 调用 get_realtime_quote 获取
     - fund_flow: 调用 get_fund_flow 获取
+    - chip: 调用 get_chip_distribution 获取（可选，deep/complete 级别）
 
     Args:
         info: get_stock_info 的返回结果
@@ -43,6 +48,7 @@ def stock_report(
         capital: get_capital_summary 的返回结果
         quote: get_realtime_quote 的返回结果
         fund_flow: get_fund_flow 的返回结果
+        chip: get_chip_distribution 的返回结果（可选）
 
     Returns:
         {"report": "markdown 报告", "summary": {结构化摘要}} 或 {"error": "..."}
@@ -51,7 +57,7 @@ def stock_report(
         return {"error": "未传入任何工具数据"}
 
     try:
-        report, summary = _generate_report(info or {}, technical or {}, capital or {}, quote or {}, fund_flow or {})
+        report, summary = _generate_report(info or {}, technical or {}, capital or {}, quote or {}, fund_flow or {}, chip or {}, period, intel or {}, web or {})
         return {
             "report": report,
             "summary": summary,  # 结构化摘要，供 LLM 做定性分析
@@ -66,11 +72,12 @@ def stock_report(
 # ═══════════════════════════════════════════════════════════════
 
 def _calc_support_resistance(
-    technical: dict, quote: dict, capital: dict, fund_flow: dict
+    technical: dict, quote: dict, capital: dict, fund_flow: dict, chip_data: dict = None
 ) -> tuple[Optional[float], Optional[float], str]:
-    """计算支撑位和压力位，返回 (support, resistance, signal_desc)。
+    """计算支撑位和压力位（技术面 + 筹码面融合）。
 
     优先级：Bollinger 带 > MA 均线 > 近期高低点。
+    筹码面作为修正：筹码支撑/压力与技术面接近时取均值，差异大时保留两者。
     """
     import math
 
@@ -85,12 +92,10 @@ def _calc_support_resistance(
         lower = boll.get("lower")
         mid = boll.get("mid")
         if upper and lower and latest:
-            # 压力位: 上轨（如果当前价在中轨以下）或中轨（如果在上轨附近）
             if latest < mid:
                 resistance = mid
             else:
                 resistance = upper
-            # 支撑位: 下轨（如果当前价在中轨以上）或中轨（如果在下轨附近）
             if latest > mid:
                 support = mid
             else:
@@ -110,6 +115,35 @@ def _calc_support_resistance(
                 resistance = ma20
             elif ma60 and latest < ma60:
                 resistance = ma60
+
+    # ── 筹码面修正 ──
+    if chip_data:
+        chip_supports = chip_data.get("support_prices", [])
+        chip_resists = chip_data.get("resistance_prices", [])
+        if chip_supports and latest:
+            # 取离当前价最近且低于当前价的筹码支撑
+            valid_s = [p for p in chip_supports if p < latest]
+            if valid_s:
+                chip_sup = max(valid_s)
+                if support is None:
+                    support = chip_sup
+                else:
+                    # 技术支撑与筹码支撑接近（<5%），取均值更稳定
+                    if abs(chip_sup - support) / latest < 0.05:
+                        support = round((support + chip_sup) / 2, 2)
+                    elif chip_sup > support:
+                        support = chip_sup  # 筹码支撑更高，用更保守的
+        if chip_resists and latest:
+            valid_r = [p for p in chip_resists if p > latest]
+            if valid_r:
+                chip_res = min(valid_r)
+                if resistance is None:
+                    resistance = chip_res
+                else:
+                    if abs(chip_res - resistance) / latest < 0.05:
+                        resistance = round((resistance + chip_res) / 2, 2)
+                    elif chip_res < resistance:
+                        resistance = chip_res  # 筹码压力更低，用更保守的
 
     # ── 信号描述 ──
     signal = technical.get("signal", "")
@@ -148,15 +182,15 @@ def _calc_support_resistance(
 def _build_comprehensive_analysis(
     technical: dict, fund_signal: str, capital_signal: str,
     action: str, direction: str,
+    chip: dict = None, intel: dict = None, web: dict = None,
 ) -> str:
-    """生成综合分析摘要（150字以内）。"""
+    """生成综合分析摘要（200字以内），整合技术面+资金面+筹码+新闻+搜索。"""
     parts = []
 
     # 形态信号
     factors = technical.get("factors", [])
     good_factors = [f for f in factors if f.get("score", 0) >= 70]
     if good_factors:
-        # 用 factor value（具体描述）而非 name（可能和"形态"重复）
         descs = [f.get("value", f["name"]) for f in good_factors[:2]]
         parts.append(f"形态:{','.join(descs)}")
 
@@ -182,15 +216,48 @@ def _build_comprehensive_analysis(
     elif "bearish" in str(trend) or "下降" in str(trend):
         parts.append("趋势向下")
 
+    # 筹码
+    if chip and "error" not in chip:
+        chip_data = chip if "profit_ratio_pct" in chip else chip.get("data", {})
+        if isinstance(chip_data, dict):
+            profit = chip_data.get("profit_ratio_pct", "")
+            avg = chip_data.get("avg_cost")
+            if profit:
+                chip_desc = f"筹码获利{profit}"
+                if avg:
+                    chip_desc += f"，均价{avg:.2f}"
+                parts.append(chip_desc)
+
+    # 新闻情报
+    if intel and "error" not in intel:
+        news_list = intel.get("news", [])
+        if news_list:
+            # 取第一条有情感倾向的新闻
+            for n in news_list[:3]:
+                title = n.get("title", "")[:40]
+                sentiment = n.get("sentiment", "")
+                if sentiment and sentiment != "neutral":
+                    parts.append(f"新闻:{title}({sentiment})")
+                    break
+
+    # web_search 关键信息
+    if web and web.get("success"):
+        results = web.get("results", [])
+        if results:
+            snippet = results[0].get("snippet", "")[:60]
+            if snippet:
+                parts.append(f"资讯:{snippet}")
+
     if not parts:
         return "数据不足，建议观望。"
 
     analysis = "，".join(parts) + f"。建议{action}。"
-    return analysis[:150]
+    return analysis[:200]
 
 
 def _generate_report(
-    info: dict, technical: dict, capital: dict, quote: dict, fund_flow: dict
+    info: dict, technical: dict, capital: dict, quote: dict, fund_flow: dict,
+    chip: dict = None, period: str = "T+3", intel: dict = None, web: dict = None,
 ) -> tuple[str, dict]:
     """纯规则生成报告，不经过 LLM。
 
@@ -226,24 +293,92 @@ def _generate_report(
         fund_signal = fund_signal or margin.get("signal", "")
         capital_signal = capital_data.get("overall_signal", "")
 
+    # ── 筹码数据提取（如有）──
+    chip_data = {}
+    chip_info = ""
+    if chip and "error" not in chip:
+        raw = chip.get("data", {}).get(stock_code, chip)
+        if isinstance(raw, dict) and "error" not in raw:
+            chip_data = raw
+            profit_pct = chip_data.get("profit_pct")
+            avg_cost = chip_data.get("avg_cost")
+            concentration = chip_data.get("concentration_90pct")
+            if profit_pct is not None:
+                chip_info = f"获利{profit_pct:.1f}%"
+                if avg_cost:
+                    chip_info += f"，均价{avg_cost:.2f}"
+                if concentration:
+                    low, high = concentration.get("low", 0), concentration.get("high", 0)
+                    chip_info += f"，90%筹码[{low:.2f}-{high:.2f}]"
+
+    # ── 新闻情报提取（如有）──
+    news_signal = ""
+    news_titles = []
+    if intel and "error" not in intel:
+        for n in intel.get("news", [])[:3]:
+            title = n.get("title", "")[:50]
+            sentiment = n.get("sentiment", "neutral")
+            news_titles.append(title)
+            if sentiment == "positive" and not news_signal:
+                news_signal = "偏多"
+            elif sentiment == "negative" and not news_signal:
+                news_signal = "偏空"
+
+    # ── 评分修正（筹码 + 新闻）──
+    score_adjust = 0
+    if chip_data:
+        profit_ratio = chip_data.get("profit_ratio", 0.5)
+        if profit_ratio >= 0.8:
+            score_adjust += 5   # 高度获利，多头强势
+        elif profit_ratio <= 0.2:
+            score_adjust -= 5   # 深度套牢，抛压大
+    if news_signal == "偏多":
+        score_adjust += 3
+    elif news_signal == "偏空":
+        score_adjust -= 3
+    score = max(0, min(100, score + score_adjust))
+
+    # ── 方向修正 ──
+    if direction == "neutral":
+        if fund_signal and "流入" in fund_signal and chip_data and chip_data.get("profit_ratio", 0) >= 0.6:
+            direction = "bullish"
+        elif fund_signal and "流出" in fund_signal and chip_data and chip_data.get("profit_ratio", 0) <= 0.3:
+            direction = "bearish"
+
     # ── 综合判断 ──
-    action = _determine_action(score, direction, None, fund_signal)
-    confidence = _determine_confidence(technical, fund_signal, capital_signal)
+    action = _determine_action(score, direction, None, fund_signal, news_signal=news_signal)
+    multi_source = _count_sources(technical, fund_signal, capital_signal, chip_data, news_signal)
+    confidence = _determine_confidence(technical, fund_signal, capital_signal, chip_data, news_signal)
     direction_cn = _direction_cn(direction)
 
-    # ── 支撑位 / 压力位 ──
+    # ── 支撑位 / 压力位（技术面 + 筹码面融合）──
     support, resistance, signal_desc = _calc_support_resistance(
-        technical, quote, capital, fund_flow
+        technical, quote, capital, fund_flow, chip_data
     )
     support_str = f"{support:.2f}" if support else "--"
     resistance_str = f"{resistance:.2f}" if resistance else "--"
 
+    # ── 信号补充（筹码 + 新闻）──
+    extra_signals = []
+    if chip_data:
+        chip_supports = chip_data.get("support_prices", [])
+        chip_resists = chip_data.get("resistance_prices", [])
+        if chip_supports:
+            extra_signals.append(f"筹码支撑{chip_supports[0]:.2f}")
+        if chip_resists:
+            extra_signals.append(f"筹码压力{chip_resists[0]:.2f}")
+    if news_signal:
+        extra_signals.append(f"新闻{news_signal}")
+    if extra_signals:
+        signal_desc = signal_desc + " | " + ",".join(extra_signals) if signal_desc else ",".join(extra_signals)
+
     # ── 综合分析 ──
     analysis = _build_comprehensive_analysis(
-        technical, fund_signal, capital_signal, action, direction
+        technical, fund_signal, capital_signal, action, direction,
+        chip=chip, intel=intel, web=web,
     )
 
-    # ── 结构化摘要（供 LLM 做定性分析）──
+    # ── 结构化摘要 ──
     factors = technical.get("factors", [])
     factors_str = ", ".join([f"{f['name']}:{f['score']}" for f in factors if f.get('score')]) if factors else ""
 
@@ -261,6 +396,7 @@ def _generate_report(
         "latest_price": latest_price,
         "support": support,
         "resistance": resistance,
+        "chip": chip_info or "无数据",
     }
 
     # ── 输出（精简格式，含支撑/压力位）──
@@ -270,18 +406,20 @@ def _generate_report(
         f"**操作建议**: {action}\n"
         f"**方    向**: {direction_cn}\n"
         f"**置 信 度**: {confidence}\n"
-        f"**时间窗口**: T+3\n"
+        f"**时间窗口**: {period}\n"
         f"**当 前 价**: {price_str}\n"
         f"**支 撑 位**: {support_str}\n"
         f"**压 力 位**: {resistance_str}\n"
         f"**信号**: {signal_desc}\n"
         f"**综合分析**: {analysis}"
     )
+    if chip_info:
+        report += f"\n**筹 码**: {chip_info}"
     return report, summary
 
 
-def _determine_action(score: int, direction: str, pe: float | None, fund_signal: str) -> str:
-    """根据多维度数据决定操作建议。"""
+def _determine_action(score: int, direction: str, pe: float | None, fund_signal: str, news_signal: str = "") -> str:
+    """根据多维度数据决定操作建议（含新闻修正）。"""
     # 评分→操作
     if score >= 70:
         base_action = "买入"
@@ -304,27 +442,50 @@ def _determine_action(score: int, direction: str, pe: float | None, fund_signal:
     if "流出" in (fund_signal or "") and base_action == "买入":
         base_action = "持有"
 
+    # 新闻修正
+    if news_signal == "偏空" and base_action == "买入":
+        base_action = "持有"
+    if news_signal == "偏多" and base_action == "跳过" and score >= 50:
+        base_action = "持有"
+
     return base_action
 
 
-def _determine_confidence(technical: dict, fund_signal: str, capital_signal: str) -> str:
-    """判断置信度。"""
+def _count_sources(technical: dict, fund_signal: str, capital_signal: str, chip_data: dict, news_signal: str) -> int:
+    """统计有效数据源数量。"""
+    count = 0
+    if technical.get("score"):
+        count += 1
+    if fund_signal:
+        count += 1
+    if capital_signal:
+        count += 1
+    if chip_data:
+        count += 1
+    if news_signal:
+        count += 1
+    return count
+
+
+def _determine_confidence(technical: dict, fund_signal: str, capital_signal: str, chip_data: dict = None, news_signal: str = "") -> str:
+    """判断置信度（多源交叉验证）。"""
     confidence_val = technical.get("confidence", "")
     if confidence_val in ("high", "高"):
+        base_conf = "高"
+    elif confidence_val in ("low", "低"):
+        base_conf = "低"
+    else:
+        base_conf = "中"
+
+    # 根据数据源数量升级
+    sources = _count_sources(technical, fund_signal, capital_signal, chip_data or {}, news_signal)
+    if sources >= 4:
         return "高"
-    if confidence_val in ("low", "低"):
+    if sources >= 2 and base_conf != "低":
+        return "高" if base_conf == "高" else "中"
+    if sources <= 1:
         return "低"
-
-    # 根据数据完整性判断
-    has_technical = bool(technical.get("score"))
-    has_fund = bool(fund_signal)
-    has_capital = bool(capital_signal)
-
-    if has_technical and has_fund and has_capital:
-        return "高"
-    if has_technical and (has_fund or has_capital):
-        return "中"
-    return "低"
+    return base_conf
 
 
 def _direction_cn(direction: str) -> str:

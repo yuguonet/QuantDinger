@@ -332,7 +332,7 @@ def make_chat_node(ctx: NodeContext):
         effective_input = user_input
         # RAG 辅助：用户消息无明确代码时，从 context 中提取最近分析的标的
         resolve_input = user_input
-        if context and not re.search(r'\b\d{6}\b', user_input):
+        if context and not re.search(r'(?<!\d)\d{6}(?!\d)', user_input):
             code_match = re.search(r'(?:代码|code|symbol)[：:]*\s*(\d{6})', context, re.IGNORECASE)
             if code_match:
                 resolve_input = f"{user_input} {code_match.group(1)}"
@@ -649,6 +649,11 @@ def make_execute_node(ctx: NodeContext):
             task_parts.append(f"【技能指令: {selected_skill}】\n{skill_body}")
             logger.info("[Execute] 注入技能 '%s': SKILL.md %d 字符, %d 个工具",
                         selected_skill, len(skill_body), len(skill_tools))
+
+        # 注入原始用户输入（Planner 可能重新描述任务，丢失关键词如“深度”“明天”）
+        original_input = state.get("user_input", "")
+        if original_input and original_input != task:
+            task_parts.append(f"【用户原始输入】{original_input}")
 
         task_parts.append(f"【任务】\n{task}")
         full_task = "\n\n".join(task_parts)

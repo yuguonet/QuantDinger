@@ -69,8 +69,8 @@ class StockResolver(EntityResolver):
 
         entities = []
 
-        # 1. 提取所有6位股票代码
-        codes = re.findall(r'\b(\d{6})\b', user_input)
+        # 1. 提取所有6位股票代码（前后不能紧跟数字）
+        codes = re.findall(r'(?<!\d)(\d{6})(?!\d)', user_input)
         for code in codes:
             # 查询代码对应的名称
             name = ""

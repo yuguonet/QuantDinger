@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from app.utils.logger import get_logger
+from app.utils.trading_calendar import is_trading_day_today
 
 logger = logging.getLogger(__name__)
 
@@ -668,8 +669,8 @@ def get_northbound_realtime(force: bool = False) -> Dict[str, Any]:
     hgt = d.get("hgt", [])
     sgt = d.get("sgt", [])
 
-    # 组装数据点
-    n = min(len(times), len(hgt), len(sgt))
+    # 组装数据点（三者长度可能不一致，按 time 长度填充）
+    n = len(times)
     points = []
     for i in range(n):
         points.append({
@@ -678,9 +679,25 @@ def get_northbound_realtime(force: bool = False) -> Dict[str, Any]:
             "sgt_yi": sgt[i] if i < len(sgt) else None,
         })
 
-    # 取最后一个非零值作为最新净买入
-    hgt_latest = next((p["hgt_yi"] for p in reversed(points) if p["hgt_yi"] is not None and p["hgt_yi"] != 0), 0)
-    sgt_latest = next((p["sgt_yi"] for p in reversed(points) if p["sgt_yi"] is not None and p["sgt_yi"] != 0), 0)
+    # 日期校验：今天不是交易日 → 数据非当天，不输出
+    if not is_trading_day_today():
+        logger.info("[hexin] 今天非交易日，北向实时数据不适用")
+        return {"error": "今天非交易日，无实时北向数据"}
+
+    # 数据完整性校验：hgt/sgt 任一严重缺失 → 数据不可信，不输出
+    if len(times) > 0:
+        hgt_ratio = len(hgt) / len(times)
+        sgt_ratio = len(sgt) / len(times)
+        if hgt_ratio < 0.5 or sgt_ratio < 0.5:
+            logger.warning(
+                "[hexin] 北向数据不完整: time=%d, hgt=%d(%.0f%%), sgt=%d(%.0f%%)，跳过",
+                len(times), len(hgt), hgt_ratio * 100, len(sgt), sgt_ratio * 100
+            )
+            return {"error": "北向数据不完整，无法展示"}
+
+    # hgt/sgt 长度可能不同，分别取各自最后一个非零值
+    hgt_latest = next((h for h in reversed(hgt) if h is not None and h != 0), 0)
+    sgt_latest = next((s for s in reversed(sgt) if s is not None and s != 0), 0)
 
     return {
         "points": len(points),

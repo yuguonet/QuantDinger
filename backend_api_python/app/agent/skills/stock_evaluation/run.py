@@ -165,11 +165,20 @@ def _web_search(query: str) -> Dict[str, Any]:
         return {"error": str(e)}
 
 
-def _stock_report(info: Dict, technical: Dict, capital: Dict, quote: Dict, fund_flow: Dict) -> Dict[str, Any]:
+def _get_chip_distribution(codes: str, lookback_days: int = 120) -> Dict[str, Any]:
+    """筹码分布（直接调用，已支持多股）。"""
+    try:
+        from tools.finance.chip_distribution import get_chip_distribution
+        return get_chip_distribution(codes, lookback_days=lookback_days)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _stock_report(info: Dict, technical: Dict, capital: Dict, quote: Dict, fund_flow: Dict, chip: Optional[Dict] = None, period: str = "T+3", intel: Optional[Dict] = None, web: Optional[Dict] = None) -> Dict[str, Any]:
     """生成 stock_report（技能内版本）。"""
     try:
         from .stock_report import stock_report
-        return stock_report(info=info, technical=technical, capital=capital, quote=quote, fund_flow=fund_flow)
+        return stock_report(info=info, technical=technical, capital=capital, quote=quote, fund_flow=fund_flow, chip=chip, period=period, intel=intel, web=web)
     except Exception as e:
         return {"error": str(e)}
 
@@ -179,24 +188,55 @@ def _stock_report(info: Dict, technical: Dict, capital: Dict, quote: Dict, fund_
 # ═══════════════════════════════════════════════════════════════
 
 def parse_user_input(user_input: str) -> Dict[str, Any]:
-    """解析用户输入，提取参数。"""
+    """解析用户输入，提取股票代码、分析周期、分析深度。
+
+    支持自然语言映射：
+      - "明天"/"今日" → T+1
+      - "后天"/"三天" → T+3
+      - "这周"/"本周"/"一周" → 1W
+      - "半个月"/"一个月"/"中线" → 1M
+      - "短线" → T+1, "波段" → T+5, "中线"/"长线" → 1M
+      - "深度"/"详细" → deep, "快速"/"简单" → simple
+    """
     import re
 
-    codes = re.findall(r'\b(\d{6})\b', user_input)
+    # ── 股票代码 ──（6位数字，前后不能紧跟数字，避免匹配到日期等）
+    codes = re.findall(r'(?<!\d)(\d{6})(?!\d)', user_input)
     codes_str = ",".join(codes) if codes else ""
 
-    period = "T+3"
+    # ── 周期：先匹配显式标记，再匹配自然语言 ──
+    period = "T+3"  # 默认
+    # 显式标记（T+1, T+3, 1W 等）
     for p in ["T+1", "T+3", "T+5", "1W", "1M"]:
         if p in user_input.upper():
             period = p
             break
+    else:
+        # 自然语言映射
+        _period_map = [
+            # 短期
+            (["明天", "明日", "今日", "今天", "当日", "日内", "短线", "超短"], "T+1"),
+            (["后天", "两三天", "两三天内", "几天"], "T+3"),
+            # 中短期
+            (["三天", "三日", "几个交易日"], "T+3"),
+            (["五天", "五日", "一周内", "下周", "波段"], "T+5"),
+            # 周级
+            (["这周", "本周", "一周", "一个星期", "1周"], "1W"),
+            # 月级
+            (["半月", "半个月", "一个月", "月中", "下个月", "下月", "中线", "长线", "中长期"], "1M"),
+        ]
+        for keywords, p in _period_map:
+            if any(kw in user_input for kw in keywords):
+                period = p
+                break
 
+    # ── 深度：关键词匹配 ──
     depth = "standard"
-    if any(kw in user_input for kw in ["快速", "简单", "L1"]):
+    if any(kw in user_input for kw in ["快速", "简单", "大致", "粗略", "L1"]):
         depth = "simple"
-    elif any(kw in user_input for kw in ["深度", "详细", "L3"]):
+    elif any(kw in user_input for kw in ["深度", "详细", "深入", "仔细", "L3"]):
         depth = "deep"
-    elif any(kw in user_input for kw in ["完整", "全面", "L4"]):
+    elif any(kw in user_input for kw in ["全面分析", "完整", "全方位", "极致", "L4"]):
         depth = "complete"
 
     return {
@@ -215,25 +255,28 @@ def _fetch_data_single(code: str, depth: str, stock_name: str = "") -> Dict[str,
     """单股一趟水获取数据。"""
     tools = []
 
-    # L1: 技术面（私有函数，多股版本）
-    tools.append(("technical_analysis", lambda: _technical_analysis_multi(code)))
+    # L1: 技术面 + 基础行情（保证报告可读：当前价/支撑位/压力位/资金面）
+    tools.extend([
+        ("technical_analysis", lambda: _technical_analysis_multi(code)),
+        ("get_realtime_quote", lambda: _get_realtime_quote(code)),
+        ("get_fund_flow", lambda: _get_fund_flow(code)),
+        ("get_capital_summary", lambda: _get_capital_summary_multi(code)),
+    ])
 
-    # L2: +资金面+行情
+    # L2: +指标快照+量价+趋势
     if depth in ["standard", "deep", "complete"]:
         tools.extend([
-            ("get_realtime_quote", lambda: _get_realtime_quote(code)),
             ("get_indicator_snapshot", lambda: _get_indicator_snapshot_multi(code)),
             ("get_volume_analysis", lambda: _get_volume_analysis_multi(code)),
             ("analyze_trend", lambda: _analyze_trend_multi(code)),
-            ("get_capital_summary", lambda: _get_capital_summary_multi(code)),
-            ("get_fund_flow", lambda: _get_fund_flow(code)),
         ])
 
-    # L3: +基本面+新闻
+    # L3: +基本面+新闻+筹码
     if depth in ["deep", "complete"]:
         tools.extend([
             ("get_stock_info", lambda: _get_stock_info(code, detail=True)),
             ("search_stock_intel", lambda: _search_stock_intel(code, stock_name)),
+            ("get_chip_distribution", lambda: _get_chip_distribution(code)),
         ])
 
     # L4: +web_search
@@ -262,15 +305,15 @@ def _check_data_warnings(tool_results: Dict[str, Dict[str, Any]], depth: str) ->
     """检查当前深度实际调用的工具，返回未获取或错误的数据列表。"""
     # 按深度定义实际调用的工具
     depth_tools = {
-        "simple": ["technical_analysis"],
-        "standard": ["technical_analysis", "get_realtime_quote", "get_indicator_snapshot",
-                     "get_volume_analysis", "analyze_trend", "get_capital_summary", "get_fund_flow"],
-        "deep": ["technical_analysis", "get_realtime_quote", "get_indicator_snapshot",
-                 "get_volume_analysis", "analyze_trend", "get_capital_summary", "get_fund_flow",
-                 "get_stock_info", "search_stock_intel"],
-        "complete": ["technical_analysis", "get_realtime_quote", "get_indicator_snapshot",
-                     "get_volume_analysis", "analyze_trend", "get_capital_summary", "get_fund_flow",
-                     "get_stock_info", "search_stock_intel", "web_search"],
+        "simple": ["technical_analysis", "get_realtime_quote", "get_fund_flow", "get_capital_summary"],
+        "standard": ["technical_analysis", "get_realtime_quote", "get_fund_flow", "get_capital_summary",
+                     "get_indicator_snapshot", "get_volume_analysis", "analyze_trend"],
+        "deep": ["technical_analysis", "get_realtime_quote", "get_fund_flow", "get_capital_summary",
+                 "get_indicator_snapshot", "get_volume_analysis", "analyze_trend",
+                 "get_stock_info", "search_stock_intel", "get_chip_distribution"],
+        "complete": ["technical_analysis", "get_realtime_quote", "get_fund_flow", "get_capital_summary",
+                     "get_indicator_snapshot", "get_volume_analysis", "analyze_trend",
+                     "get_stock_info", "search_stock_intel", "get_chip_distribution", "web_search"],
     }
     expected = depth_tools.get(depth, depth_tools["standard"])
     warnings = []
@@ -362,10 +405,11 @@ def evaluate_stock(
     technical = tool_results.get("technical_analysis", {})
     capital = tool_results.get("get_capital_summary", {})
     fund_flow = tool_results.get("get_fund_flow", {})
+    chip = tool_results.get("get_chip_distribution", {})
 
     # 传入股票基本信息（含名称），不要传空 dict
     stock_info = {"stock_code": code, "name": stock_name}
-    report_result = _stock_report(info=stock_info, technical=technical, capital=capital, quote=quote, fund_flow=fund_flow)
+    report_result = _stock_report(info=stock_info, technical=technical, capital=capital, quote=quote, fund_flow=fund_flow, chip=chip, period=period, intel=tool_results.get("search_stock_intel", {}), web=tool_results.get("web_search", {}))
 
     report = report_result.get("report", "")
     summary = report_result.get("summary", {})
@@ -386,6 +430,7 @@ def evaluate_stock(
         "capital": tool_results.get("get_capital_summary", {}),
         "indicator_details": tool_results.get("get_indicator_snapshot", {}),
         "trend_details": tool_results.get("analyze_trend", {}),
+        "chip_distribution": tool_results.get("get_chip_distribution", {}),
         "period": period,
         "weights": PERIOD_WEIGHTS.get(period, DEFAULT_WEIGHTS),
     }

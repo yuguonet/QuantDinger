@@ -31,24 +31,23 @@ tools:
 - `depth`: 分析深度（simple/standard/deep/complete，默认 standard）
 
 ```python
-# 示例：用户输入 "分析300129 T+3深度分析"
-codes = "300129"
-period = "T+3"
-depth = "deep"
+# 用户说 “全面分析300497明天的走向” → depth=complete, period=T+1
+# 用户说 “深度分析300129” → depth=deep
+# 用户说 “快速看看000858” → depth=simple
 ```
 
 ### Step 2: 执行代码生成标准输出
 
-调用 `evaluate_stock()` 一趟水获取数据，生成 stock_report：
-
 ```python
-from skills.stock_evaluation.run import evaluate_stock, evaluate_stocks
+from skills.stock_evaluation.run import parse_user_input, evaluate_stock, evaluate_stocks
 
-# 单股
-result = evaluate_stock(codes="300129", depth="standard", period="T+3")
+params = parse_user_input(user_input)
+
+# 再执行（单股）
+result = evaluate_stock(codes=params["codes"], depth=params["depth"], period=params["period"])
 
 # 多股
-result = evaluate_stocks(codes="600519,300129,000858", depth="standard", period="T+3")
+result = evaluate_stocks(codes=params["codes"], depth=params["depth"], period=params["period"])
 ```
 
 **⚠️ 必须先检查错误再使用结果：**
@@ -100,7 +99,7 @@ final_answer(result["report"])
 **综合评分**: 56
 **操作建议**: 持有
 **方    向**: 中性
-**置 信 度**: 高
+**置 信 度**: 高 ⭐
 **时间窗口**: T+3
 **当 前 价**: 31.70
 **支 撑 位**: 30.00
@@ -139,10 +138,10 @@ final_answer(comparison + "\n\n**综合分析**:\n" + "\n".join(analyses))
 
 | 级别 | 名称 | 工具调用 | 适用场景 |
 |------|------|----------|----------|
-| **L1** | 快速 | technical_analysis | 盘中快速筛选 |
-| **L2** | 标准 | +get_fund_flow+get_realtime_quote | 日常分析 |
-| **L3** | 深度 | +get_stock_info+search_stock_intel | 详细研究 |
-| **L4** | 完整 | +web_search+LLM深度分析 | 重要决策 |
+| **L1** | 快速 | technical_analysis + realtime_quote + fund_flow + capital | 盘中快速筛选 |
+| **L2** | 标准 | +indicator_snapshot + volume_analysis + trend | 日常分析 |
+| **L3** | 深度 | +stock_info + search_stock_intel + chip_distribution | 详细研究 |
+| **L4** | 完整 | +web_search | 重要决策 |
 
 ## 周期配置
 
