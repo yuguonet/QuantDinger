@@ -109,7 +109,7 @@ def _get_capital_summary_multi(codes: str) -> Dict[str, Any]:
         if not code:
             continue
         try:
-            from tools.finance.capital_tools import get_capital_summary
+            from tools.finance.data_tools import get_capital_summary
             results[code] = get_capital_summary(code)
         except Exception as e:
             results[code] = {"error": str(e)}

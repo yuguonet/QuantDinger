@@ -137,9 +137,15 @@ def _fetch_kline(code: str, tf: str, count: int = 800, timeout: int = 15) -> Opt
 # ================================================================
 
 def _delete_day(bar_time: datetime, tf: str) -> int:
-    """删除指定日期的 bar 数据（所有 symbol）。"""
+    """删除指定日期的 bar 数据（所有 symbol）。
+    
+    使用时间范围查询确保删除当日所有时间点的数据，包括 00:00:00。
+    """
     table = f'"kline_{tf}_{bar_time.year}"'
     naive = bar_time.replace(tzinfo=None) if bar_time.tzinfo else bar_time
+    # 计算当日时间范围 [start_of_day, start_of_next_day)
+    start_of_day = naive.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_of_next_day = start_of_day + timedelta(days=1)
     try:
         mgr = get_market_db_manager()
         pool = mgr._get_pool("CNStock")
@@ -147,8 +153,8 @@ def _delete_day(bar_time: datetime, tf: str) -> int:
             with conn.cursor() as cur:
                 cur.execute(f"""
                     DELETE FROM {table}
-                    WHERE time::date = %s::date
-                """, (naive,))
+                    WHERE time >= %s AND time < %s
+                """, (start_of_day, start_of_next_day))
                 deleted = cur.rowcount
                 conn.commit()
                 return deleted
@@ -215,9 +221,15 @@ def _batch_insert(records: list, tf: str) -> int:
 # ================================================================
 
 def _count_existing(tf: str, bar_time: datetime) -> int:
-    """查询目标日期已有多少个 symbol 的数据。"""
+    """查询目标日期已有多少个 symbol 的数据。
+    
+    使用时间范围查询确保统计当日所有时间点的数据，包括 00:00:00。
+    """
     table = f'"kline_{tf}_{bar_time.year}"'
     naive = bar_time.replace(tzinfo=None) if bar_time.tzinfo else bar_time
+    # 计算当日时间范围 [start_of_day, start_of_next_day)
+    start_of_day = naive.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_of_next_day = start_of_day + timedelta(days=1)
     try:
         mgr = get_market_db_manager()
         pool = mgr._get_pool("CNStock")
@@ -225,8 +237,8 @@ def _count_existing(tf: str, bar_time: datetime) -> int:
             with conn.cursor() as cur:
                 cur.execute(f"""
                     SELECT COUNT(DISTINCT symbol) FROM {table}
-                    WHERE time::date = %s::date
-                """, (naive,))
+                    WHERE time >= %s AND time < %s
+                """, (start_of_day, start_of_next_day))
                 return cur.fetchone()[0]
     except Exception as e:
         logger.warning(f"[同步] 查询 {tf} 已有数据失败: {e}")
@@ -359,10 +371,19 @@ def sync_tf(tf: str, symbols: Optional[List[str]] = None) -> dict:
 # 对外接口（保持兼容）
 # ================================================================
 
-def run_1d(symbols: Optional[List[str]] = None) -> str:
-    """覆写 1D，返回 "ok" / "error"。"""
+def run_1d(symbols: Optional[List[str]] = None) -> dict:
+    """覆写 1D，返回 {status, written, skipped}。
+    
+    - status: "ok" / "error"
+    - written: 实际写入的记录数
+    - skipped: 是否因已有数据而跳过 (>90%)
+    """
     result = sync_tf("1D", symbols)
-    return result["status"]
+    return {
+        "status": result["status"],
+        "written": result["written"],
+        "skipped": result["written"] == 0 and result["status"] == "ok",
+    }
 
 
 def run_15m(symbols: Optional[List[str]] = None) -> str:

@@ -135,9 +135,10 @@ def _refresh_backfill_15m():
     run_15m()
 
 
-def _refresh_backfill_1d():
+def _refresh_backfill_1d() -> dict:
+    """覆写 1D，返回 {status, written, skipped}。"""
     from app.data_sources.backfill_db import run_1d
-    run_1d()
+    return run_1d()
 
 
 def _refresh_adj_factors():
@@ -164,8 +165,13 @@ def _post_market_batch():
     _refresh_post_market()
 
     # 1D 最后跑，完成后触发板块统计
-    _refresh_backfill_1d()
-    _refresh_sector_daily()
+    result_1d = _refresh_backfill_1d()
+    # 只有实际写入了新数据才重新采集板块统计
+    if result_1d.get("written", 0) > 0:
+        logger.info("[post_market] 1D 写入 %d 条，触发板块统计", result_1d["written"])
+        _refresh_sector_daily()
+    else:
+        logger.info("[post_market] 1D 无新数据 (skipped=%s)，跳过板块统计", result_1d.get("skipped"))
 
     # 检测数据是否到位
     dt_date = nb_date = ""
