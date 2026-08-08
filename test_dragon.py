@@ -257,7 +257,7 @@ def find_limit_ups(bars, board_type):
             result.append(i)
     return result
 
-def run_backtest(bars, entry_idx, entry_price, hold_days=20, stop_loss=-10.0, trailing_stop=-8.0, board_type="main", peak_exit=False, is_v1=False, d1_limit_up=None):
+def run_backtest(bars, entry_idx, entry_price, hold_days=20, stop_loss=-10.0, trailing_stop=-8.0, board_type="main", peak_exit=False, is_v1=False, d1_limit_up=None, d1_change=None, d1_gap=None):
     if entry_price <= 0 or entry_idx >= len(bars):
         return None
     limit_threshold = 0.098 if board_type == "main" else 0.198
@@ -290,24 +290,25 @@ def run_backtest(bars, entry_idx, entry_price, hold_days=20, stop_loss=-10.0, tr
         b = bars[idx]
         if b['high'] > peak: peak = b['high']
 
-        # V1专属: D1没涨停 → D+2开盘跑路 (首板次日未封板=不及预期, 不恋战)
-        if is_v1 and d == 2 and not d1_limit_up:
-            d1_bar = bars[entry_idx + 1]
-            d1_high = d1_bar['high']
-            d1_close = d1_bar['close']
-            d2_open_gap = (b['open'] / d1_close - 1) * 100 if d1_close > 0 else 0
-            # 止损优先
-            if b['low'] <= entry_price * (1 + stop_loss / 100):
-                exit_p = entry_price * (1 + stop_loss / 100); exit_d = d; break
-            # D2高开>2%直接走 (趁高开跑路)
-            if d2_open_gap > 2.0:
+        # V1出场 (v3): 日内动量<0 → D2开盘清仓
+        # 日内动量 = D1收盘涨幅 - D1开盘涨幅 (盘中买卖力量指标)
+        #   <0: 盘中出货, D2大概率续跌, 100%捕获D2跌>3%的信号
+        #   >=0: 盘中有买盘承接, 继续持有
+        # 注: -10%止损已移除, 日内动量规则在D2开盘即清仓, 不需要等止损位
+        if is_v1 and d == 2:
+            # 日内动量 = D1收盘涨幅 - D1开盘涨幅 = (D1 close - D1 open) / D0 close
+            # d1_change 和 d1_gap 由调用方传入, 也可从bars计算
+            if d1_change is not None and d1_gap is not None:
+                intraday = d1_change - d1_gap
+            else:
+                # fallback: 从bars计算
+                d1_bar = bars[entry_idx]
+                d0_close = bars[entry_idx - 1]['close'] if entry_idx > 0 else entry_price
+                intraday = (d1_bar['close'] - d1_bar['open']) / d0_close * 100 if d0_close > 0 else 0
+            d1_weak = intraday < 3
+            if d1_weak:
+                # D2开盘直接清仓, 不等止损位
                 exit_p = b['open']; exit_d = d; break
-            # D2跌破D1高点×0.99走 (反弹无力)
-            exit_trigger = d1_high * 0.99
-            if b['low'] <= exit_trigger:
-                exit_p = exit_trigger; exit_d = d; break
-            # 以上都没触发 → D2收盘走 (无论如何D2了结)
-            exit_p = b['close']; exit_d = d; break
 
         # ① 峰值逃顶(优先): 涨>7%后大上影线(>30%)→收盘逃顶
         if peak_exit:
@@ -441,7 +442,7 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
         # 预计算 d1_limit_up: 基于 D1 收盘 vs D0 收盘 (信号日)
         d1_limit_up_val = is_limit_up(d1['close'], last_pb['close'], board_type)
 
-        result = run_backtest(bars, entry_idx, entry_price, hold_days, stop_loss, trailing_stop, board_type, peak_exit=True, d1_limit_up=d1_limit_up_val)
+        result = run_backtest(bars, entry_idx, entry_price, hold_days, stop_loss, trailing_stop, board_type, peak_exit=True, d1_limit_up=d1_limit_up_val, d1_change=d1_change)
         if not result: continue
 
         trades.append({
@@ -621,11 +622,12 @@ def strategy_4in1(bars, code,
                                                 if circ > 0:
                                                     turnover_rate = lu_vol / circ * 100
 
+                                            d1_gap_v1 = (d1['open'] / lu_close - 1) * 100 if lu_close > 0 else 0
                                             result = run_backtest(
                                                 bars, entry_idx, entry_price,
                                                 vp['v1_hold_days'], vp['v1_stop_loss'],
                                                 vp['v1_trailing_stop'], bt,
-                                                is_v1=True, d1_limit_up=d1_limit_up)
+                                                is_v1=True, d1_limit_up=d1_limit_up, d1_change=d1_change, d1_gap=d1_gap_v1)
                                             if result:
                                                 trade = {
                                                     'code': code, 'board': get_board_name(code),
@@ -814,7 +816,7 @@ def _dragon_phase(bars, code, lu_idx, min_pb, max_pb, params, bt, threshold,
     result = run_backtest(bars, entry_idx, entry_price,
                           params['hold_days'], params['stop_loss'],
                           params['trailing_stop'], bt, peak_exit=True,
-                          d1_limit_up=d1_limit_up_val)
+                          d1_limit_up=d1_limit_up_val, d1_change=d1_change)
     if not result:
         return None
 
@@ -845,22 +847,37 @@ def strategy_v1(bars, code,
                 d_1_pullback_min=-10.0, d_1_pullback_max=-3.0,
                 obv_filter=True,
                 d_1_vol_max=1.5):
-    """V1策略 v2 — 强趋势回踩买入
+    """V1策略 v3 — 强趋势回踩买入 (追击连板)
 
-    核心逻辑 (数据驱动, 305个2+连板样本验证):
+    核心逻辑 (数据驱动, 241个全市场样本验证):
     ┌──────────────────────────────────────────────────────┐
-    │ 20日涨>30% + D-1回调 + OBV锁仓 + D-1非放量          │
-    │ → 实测15个信号, 80%胜率, D+1均+3.90%                │
+    │ 入场: 20日涨>30% + D-1回调 + OBV锁仓 + D-1非放量    │
+    │ 出场: D1日内动量<0 → D2开盘清仓                      │
+    │ → next_open模式: 66.4%胜率, 均+3.73%, 盈亏比1.86    │
     └──────────────────────────────────────────────────────┘
 
-    四因子:
+    入场四因子:
     1. 强趋势: 20日涨幅>30%                                │ 区分度24.8pp
     2. 回踩确认: D-1跌3~10%                                │ 区分度17.6pp
     3. 资金锁仓: OBV 5日趋势上升                           │ 区分度23.4pp
     4. 非放量出货: D-1量<1.5x5日均量                       │ 区分度21.1pp
 
-    buy_mode:
-      signal_close — 涨停股收盘时封板买不到, 仅回测用
+    出场规则:
+      D1日内动量 = D1收盘涨幅 - D1开盘涨幅
+      日内动量<3% → D2开盘清仓 (盘中买盘不足, 宁缺毋滥)
+      日内动量>=3% → 继续持有, 按追踪止损/止损/持仓上限出场
+      注: 日内动量>=3%持有组 93.4%胜率, 均+6.73%
+
+    入场过滤 (v3新增):
+      创/科板(gem_star) D1开盘涨幅>=5% → 不入场
+      原因: 创/科板高开追涨亏损率73%, 日内回落概率高
+
+    待优化 (需补充D0盘中数据, 当前K线仅OHLCV):
+      - D0涨停时间: 10:00前封板 vs 14:00封板, 强度完全不同
+      - D0封单量/成交量比: 封单越大越强, 次日溢价概率越高
+      - D0是否一字板: 一字板=极强, 但实盘买不进
+      - D0动量强度可决定D1追涨幅度上限: 强D0允许追更高D1 open
+      - D1高开(>=5%)且未涨停信号(35笔, 25.7%胜率): 需D0强度辅助过滤
       next_open    — D+1开盘买
     """
     board_type = get_board_type(code)
@@ -910,6 +927,9 @@ def strategy_v1(bars, code,
         d1 = bars[i + 1]
         d1_change = (d1['close'] / d0['close'] - 1) * 100
 
+        # D1开盘涨幅 (next_open模式下有实际意义)
+        d1_gap = (d1['open'] / d0['close'] - 1) * 100
+
         if buy_mode == "signal_close":
             entry_price = d0['close']
             entry_idx = i
@@ -918,16 +938,18 @@ def strategy_v1(bars, code,
             entry_price = d1['open']
             entry_idx = i + 1
             entry_date = d1['time']
-            d1_gap = (entry_price / d0['close'] - 1) * 100
             min_d1_gap = -3.0 if board_type == "main" else -5.0
             if d1_gap < min_d1_gap: continue
             if d1_change < 0: continue
+            # 创/科板高开追涨风险大: d1_gap>=5%时亏损率73%, 且日内回落概率高
+            # 限制创/科板D1开盘涨幅上限, 避免追高开被套
+            if board_type == "gem_star" and d1_gap >= 5.0: continue
         else:
             continue
         if entry_price <= 0: continue
 
         d1_limit_up_val = is_limit_up(d1['close'], d0['close'], board_type)
-        bt = run_backtest(bars, entry_idx, entry_price, hold_days, stop_loss, trailing_stop, board_type, is_v1=True, d1_limit_up=d1_limit_up_val)
+        bt = run_backtest(bars, entry_idx, entry_price, hold_days, stop_loss, trailing_stop, board_type, is_v1=True, d1_limit_up=d1_limit_up_val, d1_change=d1_change, d1_gap=d1_gap)
         if not bt: continue
 
         result.append({
@@ -940,6 +962,8 @@ def strategy_v1(bars, code,
             'ret_20d': round(ret_20d, 2),
             'd_1_change': round(d_1_change, 2),
             'd1_change': round(d1_change, 2),
+            'd1_gap': round(d1_gap, 2),
+            'intraday': round(d1_change - d1_gap, 2),
             **bt,
         })
 
