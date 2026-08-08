@@ -300,35 +300,26 @@ def analyze_code(
         ma20 = compute_ma(closes, 20)
         rsi_val = rsi[-1]
 
-        score = float(pattern_score)
         signals = [p["pattern"] for p in patterns]
         factors = []
 
-        if rsi_val > 80:
-            score -= 10
-        elif rsi_val > 70:
-            score -= 3
-        elif 40 <= rsi_val <= 60:
-            score += 3
-
-        if kdj["k"][-1] > kdj["d"][-1] and kdj["k"][-2] <= kdj["d"][-2]:
-            score += 5
-            signals.append("KDJ金叉")
-
-        if ma5[-1] and ma10[-1] and ma20[-1]:
-            if ma5[-1] > ma10[-1] > ma20[-1]:
-                score += 5
-                signals.append("MA多头排列")
-            factors.append(FactorItem(
-                name="均线",
-                value=f"MA5={ma5[-1]:.2f} MA10={ma10[-1]:.2f} MA20={ma20[-1]:.2f}",
-                score=65 if (ma5[-1] or 0) > (ma20[-1] or 0) else 45,
-            ))
+        # ── 调用 technical_analysis 获取五维加权评分（与 stock_evaluation 一致）──
+        from app.agent.tools.finance.technical_analysis import technical_analysis as _ta
+        ta_result = _ta(code)
+        if isinstance(ta_result, dict) and "error" not in ta_result:
+            score = float(ta_result.get("score", 50))
+            for f in ta_result.get("factors", []):
+                factors.append(FactorItem(name=f["name"], value=f.get("value", ""), score=f.get("score")))
+            ta_signals = ta_result.get("signal", "").split(" | ")
+            for s in ta_signals:
+                if s and s not in signals:
+                    signals.append(s)
+        else:
+            score = 50.0
 
         vol_5 = sum(b["volume"] for b in bars[-6:-1]) / 5 if len(bars) > 5 else 1
         vol_ratio = today["volume"] / vol_5 if vol_5 > 0 else 1
-        if vol_ratio > 1.5:
-            signals.append(f"放量{vol_ratio:.1f}倍")
+        # 注：形态分已在 technical_analysis 五维加权中计算（权重10%），不再重复叠加
 
         # ── 指标快照 ──
         snapshot = call_tool("get_indicator_snapshot", codes=code)
@@ -376,10 +367,67 @@ def analyze_code(
                 score=65 if main_net > 0 else (35 if main_net < -5000000 else 50),
             ))
 
+        # ── 压力位 / 支撑位（与 stock_evaluation 逻辑一致）──
+        # 优先级：BOLL 带 > MA 均线 > 近期高低点
+        # 直接用 ta_result 中的 BOLL/MA 数据，不重复调用 get_indicator_snapshot
+        boll_data = {}
+        if isinstance(ta_result, dict) and "boll" in ta_result:
+            boll_data = ta_result.get("boll", {})
+        elif isinstance(snapshot, dict) and "boll" in snapshot:
+            boll_data = snapshot.get("boll", {})
+
+        boll_upper = None
+        boll_lower = None
+        boll_mid = None
+        if isinstance(boll_data, dict) and "error" not in boll_data:
+            try:
+                boll_upper = float(boll_data.get("upper", 0) or 0) or None
+                boll_lower = float(boll_data.get("lower", 0) or 0) or None
+                boll_mid = float(boll_data.get("mid", 0) or 0) or None
+            except (ValueError, TypeError):
+                pass
+
+        # 压力位
+        resistance = None
+        if boll_upper and boll_upper > close:
+            if boll_mid and close < boll_mid:
+                resistance = boll_mid
+            else:
+                resistance = boll_upper
+        if resistance is None:
+            ma60_val = ta_result.get("ma60") if isinstance(ta_result, dict) else None
+            if ma60_val and ma60_val > close:
+                resistance = ma60_val
+            elif ma20[-1] and ma20[-1] > close:
+                resistance = ma20[-1]
+        if resistance is None:
+            prev_bars_20 = bars[-21:-1] if len(bars) >= 21 else bars[:-1]
+            resistance = max(b["high"] for b in prev_bars_20) if prev_bars_20 else close * 1.05
+        resistance = round(resistance, 2)
+        upside_pct = round((resistance - close) / close * 100, 1)
+
+        # 支撑位
+        support = None
+        if boll_mid and close > boll_mid:
+            support = boll_mid
+        elif boll_lower and boll_lower < close:
+            support = boll_lower
+        if support is None:
+            ma60_val = ta_result.get("ma60") if isinstance(ta_result, dict) else None
+            if ma20[-1] and ma20[-1] < close:
+                support = ma20[-1]
+            elif ma60_val and ma60_val < close:
+                support = ma60_val
+        if support is None:
+            prev_bars_20 = bars[-21:-1] if len(bars) >= 21 else bars[:-1]
+            support = min(b["low"] for b in prev_bars_20) if prev_bars_20 else close * 0.95
+        support = round(support, 2)
+        downside_pct = round((close - support) / close * 100, 1)
+
         # ── 介入点计算 ──
         entry_low = round(close * 0.995, 2)
         entry_high = round(close * 1.005, 2)
-        stop_loss = round((ma10[-1] or close * 0.97) if ma10[-1] else close * 0.97, 2)
+        stop_loss = round(support if support < close else close * 0.97, 2)
         risk = close - stop_loss
         if risk <= 0:
             risk = close * 0.03
@@ -412,6 +460,12 @@ def analyze_code(
                 "price_low": entry_low, "price_high": entry_high,
                 "stop_loss": stop_loss, "target_1": target_1, "target_2": target_2,
                 "risk_reward": "1:1.5 / 1:2.5",
+            },
+            "levels": {
+                "resistance": resistance,
+                "support": support,
+                "upside_pct": upside_pct,
+                "downside_pct": downside_pct,
             },
             "tech": {
                 "close": round(close, 2), "rsi": round(rsi_val, 1),

@@ -16,7 +16,9 @@ def select_strategy() -> str:
     if now.weekday() >= 5:
         return "post_market"
     t = now.time()
-    if time(9, 30) <= t < time(14, 30):
+    if time(9, 30) <= t < time(10, 0):
+        return "early"    # 早盘：独立策略，5m 趋势 + 板块搜索
+    if time(10, 0) <= t < time(14, 30):
         return "intraday"
     if time(14, 30) <= t < time(15, 0):
         return "eod"
@@ -134,6 +136,10 @@ def filter_candidates(prescreen_result: Dict) -> str:
         change = abs(c.get("change_pct", 0) or 0)
         trn = c.get("turnover_pct", 0) or 0
         reason = c.get("reason", "") or ""
+        # 从 source 中提取搜索关键词（如 "条件搜索(放量突破 站上20日均线)" → "放量突破 站上20日均线"）
+        s_query = c.get("search_query", "") or ""
+        if not s_query and "(" in src and src.endswith(")"):
+            s_query = src[src.index("(") + 1:-1]
 
         # ST股排除
         if src in ("ST股",):
@@ -164,19 +170,26 @@ def filter_candidates(prescreen_result: Dict) -> str:
             if c.get("close_at_high", False) or (change >= 4 and trn > 2.5):
                 filtered.append(c)
 
-        else:  # intraday
+        else:  # intraday / early (早盘条件搜索结果结构与 intraday 相同)
+            # 连板：无条件保留
             if src == "连板":
                 filtered.append(c)
-            elif src == "龙回头" and reason == "弱转强信号":
+            # 龙回头：source 包含 "龙回头" 即保留（不限 reason=="弱转强信号"）
+            elif "龙回头" in src:
                 filtered.append(c)
-            elif any(t in reason for t in themes):
-                if mood in ("偏强",) or mood_score >= 70:
+            # 条件搜索：按市场情绪分级处理
+            elif "条件搜索" in src:
+                if mood_score >= 60:
+                    # 偏强：保留全部
                     filtered.append(c)
-                elif mood in ("中性",) or mood_score >= 50:
-                    if reason:
-                        filtered.append(c)
-                # 偏弱: 只保留连板/龙回头(已在上面处理)
-                # post_market 的 mood 规则不受此限制
+                elif mood_score >= 40:
+                    # 中性：有搜索关键词即保留（早盘 themes 为空时不过度过滤）
+                    filtered.append(c)
+                # 偏弱(<40): 不保留条件搜索，只保留连板/龙回头
+            # 其他来源（如热点题材）：按主题匹配
+            # 早盘 themes 可能为空，此时 mood>=50 的来源直接保留
+            elif mood_score >= 50 and (not themes or any(t in reason for t in themes)):
+                filtered.append(c)
 
     filtered = filtered[:15]
     codes = ",".join([c["code"] for c in filtered if c.get("code")])

@@ -36,7 +36,10 @@ def pre_screen() -> Dict[str, Any]:
     logger.info("[market_screener] Phase 1 获取候选，策略: %s", strategy)
 
     try:
-        if strategy == "intraday":
+        if strategy == "early":
+            from .early import prescreen
+            result = prescreen()
+        elif strategy == "intraday":
             from .intraday import prescreen
             result = prescreen(today)
         elif strategy == "eod":
@@ -84,7 +87,14 @@ def deep_analyze(codes: str) -> Dict[str, Any]:
     # 解析股票名称
     name_map = resolve_names(code_list)
 
-    if strategy == "intraday":
+    if strategy == "early":
+        from .early import analyze_code as _deep
+        raw = analyze_batch(
+            [{"code": c, "name": name_map.get(c, "")} for c in code_list],
+            lambda item: _deep(item["code"], item["name"], _tool_calls, _tool_nodes, _missing_data),
+            max_candidates=15,
+        )
+    elif strategy == "intraday":
         from .intraday import analyze_code as _deep
         raw = analyze_batch(
             [{"code": c, "name": name_map.get(c, "")} for c in code_list],
@@ -139,11 +149,54 @@ def filter_candidates(prescreen_result: Dict) -> str:
 
 
 
-def run() -> Dict[str, Any]:
-    """完整选股流程：Phase 1 + Phase 2。agent 通常不调此函数，按 SKILL.md 规则分步调用。"""
+def run() -> str:
+    """完整选股流程：pre_screen → filter → deep_analyze → 格式化 markdown。
+
+    agent 只需调一次 run()，拿到 markdown 文本直接用 final_answer() 输出。
+    不需要分步调用，不需要理解内部逻辑。
+
+    Returns:
+        格式化的 markdown 文本，可直接用于 final_answer()
+    """
+    # Phase 1: 获取候选
     prescreen_result = pre_screen()
     if prescreen_result.get("error"):
-        return prescreen_result
-    candidates = prescreen_result.get("candidates", [])
-    codes = ",".join(c.get("code", "") for c in candidates if c.get("code"))
-    return deep_analyze(codes)
+        return f"选股失败: {prescreen_result['error']}"
+
+    strategy = prescreen_result.get("strategy", "")
+
+    # Phase 2: 筛选
+    codes = filter_candidates(prescreen_result)
+    if not codes:
+        return "当前无符合条件的股票，建议观望。"
+
+    # Phase 3: 深入分析
+    deep_result = deep_analyze(codes)
+
+    # Phase 4: 格式化输出
+    score = deep_result.get("score", 0)
+    direction = deep_result.get("direction", "neutral")
+    confidence = deep_result.get("confidence", 0)
+    analyzed = deep_result.get("analyzed", [])
+
+    direction_cn = {"bullish": "看多", "bearish": "看空", "neutral": "中性"}.get(direction, direction)
+
+    lines = [
+        f"**{strategy}**",
+        f" 综合评分: {score}/100",
+        f" 方    向: {direction_cn}",
+        f" 置 信 度: {confidence}",
+        "",
+        "股票代码\t股票名称\t评分\t方向\t置信度\t压力位\t支撑位\t上空间\t下空间\t信号",
+    ]
+    for a in analyzed:
+        a_dir = {"bullish": "看多", "bearish": "看空", "neutral": "中性"}.get(a.get("direction", ""), a.get("direction", ""))
+        levels = a.get("levels", {})
+        lines.append(
+            f"{a.get('code','')}\t{a.get('name','')}\t{a.get('score',0)}\t"
+            f"{a_dir}\t{a.get('confidence',0)}\t"
+            f"{levels.get('resistance', '-')}\t{levels.get('support', '-')}\t"
+            f"{levels.get('upside_pct', '-')}%\t{levels.get('downside_pct', '-')}%\t"
+            f"{a.get('signal','')}"
+        )
+    return "\n".join(lines)

@@ -495,10 +495,12 @@ def prescreen(date: str) -> Dict[str, Any]:
     for s in search_candidates:
         code = s.get("code", "")
         if code and code not in candidates:
+            sq = s.get("search_query", "")
             candidates[code] = {
                 "code": code, "name": s.get("name", ""),
-                "source": f"条件搜索({s.get('search_query', '')})",
-                "continuous_days": 0, "zt_time": "", "reason": "",
+                "source": f"条件搜索({sq})",
+                "continuous_days": 0, "zt_time": "",
+                "reason": sq,  # 搜索关键词作为 reason，用于主题匹配
                 "change_pct": s.get("change_pct", 0),
                 "tags": [], "pullback_signals": [],
                 "turnover_pct": s.get("turnover_pct", 0),
@@ -584,11 +586,20 @@ def analyze_code(
         if not daily:
             return None
 
-        score = 55.0
+        # ── 基础分：调用 technical_analysis（与 stock_evaluation 一致）──
+        from app.agent.tools.finance.technical_analysis import technical_analysis as _ta
+        ta_result = _ta(code)
+        if isinstance(ta_result, dict) and "error" not in ta_result:
+            score = float(ta_result.get("score", 50))
+        else:
+            score = 50.0
         signals = []
         factors = []
 
-        # ── 弱转强/强转弱 ──
+        # ── 盘中特有信号（technical_analysis 不覆盖的多周期信号）──
+        # 注：均线/MACD/RSI/量价等日线指标已在 technical_analysis 五维加权中计算，不重复叠加
+
+        # 弱转强/强转弱（日线+5m 多周期判断，technical_analysis 不含）
         if mtf.get("weak_to_strong"):
             score += 15
             signals.append("弱转强")
@@ -597,71 +608,8 @@ def analyze_code(
             score -= 15
             signals.append("强转弱")
             factors.append(FactorItem(name="趋势转折", value="强转弱", score=20))
-        else:
-            factors.append(FactorItem(name="趋势转折", value="中性", score=50))
 
-        # ── 量价形态 ──
-        vol_pattern = mtf.get("volume_pattern", "neutral")
-        if vol_pattern == "放量上涨":
-            score += 12
-            signals.append("放量上涨(热度上升)")
-            factors.append(FactorItem(name="量价", value="放量上涨", score=80))
-        elif vol_pattern == "缩量上涨(拉升)":
-            score += 10
-            signals.append("缩量上涨(控盘拉升)")
-            factors.append(FactorItem(name="量价", value="缩量拉升", score=75))
-        elif vol_pattern == "放量下跌(抛盘)":
-            score -= 10
-            signals.append("放量下跌(抛压)")
-            factors.append(FactorItem(name="量价", value="放量下跌", score=25))
-        else:
-            factors.append(FactorItem(name="量价", value=vol_pattern, score=50))
-
-        # ── 均线位置 ──
-        if daily.get("above_ma5"):
-            score += 5
-            signals.append("站上MA5")
-        if daily.get("above_ma20"):
-            score += 5
-            signals.append("站上MA20")
-        factors.append(FactorItem(
-            name="均线",
-            value=f"MA5{'上' if daily.get('above_ma5') else '下'} MA20{'上' if daily.get('above_ma20') else '下'}",
-            score=70 if daily.get("above_ma5") else 40,
-        ))
-
-        # ── MA5 斜率 ──
-        ma5_slope = daily.get("ma5_slope", 0)
-        if ma5_slope > 0.5:
-            score += 5
-            signals.append(f"MA5上升({ma5_slope:.1f}%)")
-        elif ma5_slope < -0.5:
-            score -= 3
-
-        # ── MACD ──
-        macd_bar = daily.get("macd_bar", 0)
-        if macd_bar > 0:
-            score += 3
-            signals.append("MACD红柱")
-        elif macd_bar < 0 and daily.get("above_ma5"):
-            score += 5
-            signals.append("MACD绿柱+价格稳在MA5上方")
-        factors.append(FactorItem(
-            name="MACD", value=f"{'红' if macd_bar > 0 else '绿'}柱",
-            score=65 if macd_bar > 0 else 50,
-        ))
-
-        # ── RSI ──
-        rsi_val = daily.get("rsi", 50)
-        if 40 <= rsi_val <= 60:
-            score += 3
-            signals.append(f"RSI{rsi_val:.0f}中性")
-        elif rsi_val > 75:
-            score -= 5
-            signals.append(f"RSI{rsi_val:.0f}偏高")
-        factors.append(FactorItem(name="RSI", value=f"{rsi_val:.0f}", score=int(max(0, min(100, rsi_val)))))
-
-        # ── 多周期共振 + 5m MACD 承压/拉升强度 ──
+        # 多周期共振（15m+5m，technical_analysis 不含）
         mtf_score = 0
         if daily.get("above_ma5") and mtf.get("intraday_15m", {}).get("above_ma5"):
             mtf_score += 5
@@ -681,20 +629,52 @@ def analyze_code(
             score += mtf_score
             factors.append(FactorItem(name="多周期共振", value=f"+{mtf_score}", score=70))
 
-        # ── 资金流向 ──
-        if isinstance(fund_flow, dict) and not fund_flow.get("error"):
-            net = fund_flow.get("net_inflow", 0) or 0
-            if net > 0:
-                score += 5
-                signals.append(f"资金净流入{net/1e4:.0f}万")
-                factors.append(FactorItem(name="资金流向", value=f"流入{net/1e4:.0f}万", score=70))
-            else:
-                factors.append(FactorItem(name="资金流向", value=f"流出{abs(net)/1e4:.0f}万", score=35))
-
         # ── 最终评分 ──
         score = max(0, min(100, score))
         direction = "bullish" if score >= 60 else ("bearish" if score < 45 else "neutral")
         confidence = min(0.9, 0.4 + len(signals) * 0.05)
+
+        # ── 支撑位 / 压力位 ──
+        from app.agent.tools.finance.analysis_tools import get_indicator_snapshot as _snap
+        try:
+            snap = _snap(code)
+        except Exception:
+            snap = {}
+        boll = snap.get("boll", {}) if isinstance(snap, dict) else {}
+        boll_upper = boll.get("upper") if isinstance(boll, dict) else None
+        boll_lower = boll.get("lower") if isinstance(boll, dict) else None
+        boll_mid = boll.get("mid") if isinstance(boll, dict) else None
+        try:
+            boll_upper = float(boll_upper) if boll_upper else None
+            boll_lower = float(boll_lower) if boll_lower else None
+            boll_mid = float(boll_mid) if boll_mid else None
+        except (ValueError, TypeError):
+            boll_upper = boll_lower = boll_mid = None
+
+        resistance = None
+        if boll_upper and boll_upper > daily["close"]:
+            resistance = boll_mid if boll_mid and daily["close"] < boll_mid else boll_upper
+        if resistance is None and daily.get("ma20") and daily["ma20"] > daily["close"]:
+            resistance = daily["ma20"]
+        if resistance is None:
+            resistance = daily["close"] * 1.05
+
+        support = None
+        if boll_mid and daily["close"] > boll_mid:
+            support = boll_mid
+        elif boll_lower and boll_lower < daily["close"]:
+            support = boll_lower
+        if support is None and daily.get("ma20") and daily["ma20"] < daily["close"]:
+            support = daily["ma20"]
+        if support is None:
+            support = daily["close"] * 0.95
+
+        levels = {
+            "resistance": round(resistance, 2),
+            "support": round(support, 2),
+            "upside_pct": round((resistance - daily["close"]) / daily["close"] * 100, 1),
+            "downside_pct": round((daily["close"] - support) / daily["close"] * 100, 1),
+        }
 
         return {
             "code": code,
@@ -705,6 +685,7 @@ def analyze_code(
             "signal": " | ".join(signals[:5]),
             "signals": signals,
             "factors": factors,
+            "levels": levels,
             "daily": daily,
             "intraday_15m": mtf.get("intraday_15m", {}),
             "intraday_5m": mtf.get("intraday_5m", {}),
