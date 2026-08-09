@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""
-4IN1 统一涨停策略 + 独立策略回测
+"""4IN1 统一涨停策略 + 独立策略回测
 
 用法:
   python test_dragon.py --source db --days 300              # DB全市场, 最近300个交易日
   python test_dragon.py --source db --days 60 --strategy 4in1  # 4IN1策略, 最近60天
   python test_dragon.py --codes 000066,002010 --days 300    # 指定股票
-  python test_dragon.py --source db --days 60 --today       # 统计今日买点
+  python test_dragon.py --source db --days 60 --today       # D0收盘后查看今日涨停买点
   python test_dragon.py --source db --days 60 --today --today-date 2026-08-07
   python test_dragon.py --strategy v1 --buy-mode next_open  # V1策略, 次日开盘买
   python test_dragon.py --strategy v1 --ret-20d-min 30 --d1-pullback-min -10 --d1-pullback-max -3
@@ -15,48 +14,152 @@
   --source db       从数据库加载全市场 (默认 manual)
   --days N          向前取N个交易日 (默认300, 从当前日期往前推)
   --strategy        all|dragon|v1|break|4in1 (默认all)
-  --buy-mode        signal_close|next_open (默认signal_close)
+  --buy-mode        next_open|signal_close (默认next_open)
   --pullback N      龙回头最少回调天数 (默认3)
-  --today           统计今日买点信号
+  --today           显示买点+持仓卖出建议 (15天内买入的持仓)
   --today-date      指定"今天"的日期, 配合--today使用
+  --all-trades      输出每笔交易明细
 
-V1核心参数 (数据驱动优化版 v2):
+V1核心参数:
   --ret-20d-min N   20日最小涨幅%% (默认30, 强趋势过滤)
   --d1-pullback-min N  D-1回调最小%% (默认-10)
   --d1-pullback-max N  D-1回调最大%% (默认-3)
   --no-obv-filter   禁用OBV上升过滤
   --d1-vol-max N    D-1量vs5日均量上限 (默认1.5x)
-  --min-d0-gap N    D0跳空下限%% (默认1.0)
-  --max-d0-gap N    D0跳空上限%% (默认5.0)
-  --min-vol-ratio N D0最小量比 (默认1.0)
+  --v1-stop-loss N  V1止损%% (默认-10, 当前已由日内动量规则替代)
+  --v1-trailing-stop N  V1追踪止损%% (默认-5)
 
-═══════════════════════════════════════════════════
-4IN1 策略 (--strategy 4in1): 一次涨停驱动, 分阶段决策
-═══════════════════════════════════════════════════
+═══════════════════════════════════════════════════════════════════════════════
+                          策略入场/出场规则
+═══════════════════════════════════════════════════════════════════════════════
 
-流程:
-  D0  涨停(首板/连板) ──→ V1检查D1入场条件
-  D1  涨停 ──→ V1入场, 按V1出场规则持有
-       没涨停 ──→ 断板检查D1~D2窗口
-  D3~D5  依旧没涨停 ──→ 龙回头A(短回调)
-  D6~D11 依旧没涨停 ──→ 龙回头B(长回调)
-  D12  放弃
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ V1 策略 (追击连板) — next_open 模式                                        │
+│ v3版本, 213样本回测: 70.4%胜率, 均+4.07%, 盈亏比2.35                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│ 入场: D0涨停日筛选, D1开盘买入                                              │
+│ ────────────────────────────────────────────────────────                     │
+│ 因子1 强趋势:   20日涨幅 >= 30%                                             │
+│ 因子2 回踩确认: D-1涨跌幅在 -10% ~ -3%                                     │
+│ 因子3 资金锁仓: OBV 5日趋势上升                                            │
+│ 因子4 非放量:   D-1成交量 < 1.5倍5日均量                                   │
+│                                                                             │
+│ D1过滤 (next_open模式):                                                     │
+│   主板:    D1开盘涨幅 >= -3% 且 D1收盘涨幅 >= 0                             │
+│   创/科板: D1开盘涨幅 >= -5% 且 < 5% 且 D1收盘涨幅 >= 0                     │
+│   创/科板 D1开>=5%不入场 (高开追涨亏损率73%)                                │
+│                                                                             │
+│ 出场: D1日内动量决定                                                         │
+│ ────────────────────────────────────────────────────────                     │
+│ 日内动量 = D1收盘涨幅 - D1开盘涨幅 (盘中买卖力量指标)                       │
+│                                                                             │
+│   日内动量 < 3%  → D2开盘清仓 (买盘不足, 宁缺毋滥)                         │
+│   日内动量 >= 3% → 继续持有, 按以下规则出场:                                │
+│     - 追踪止损: 从峰值回撤 -5%                                              │
+│     - 持仓上限: 20个交易日                                                  │
+│                                                                             │
+│ 数据验证:                                                                    │
+│   日内>=3% 持有组: 97笔, 99.0%胜率, 均+8.75%, 仅1笔亏-0.81%                │
+│   日内>=5% 子集:  64笔, 100%胜率, 均+10.67%                                │
+│   日内<3% 退出组: 116笔, 全部亏损, 日内<0%为亏损重灾区                      │
+│                                                                             │
+│ D0质量评分 (今日买点输出):                                                   │
+│   趋势强度(ret_20d): 0~30分                                                │
+│   回踩质量(d_1_change): 0~30分                                             │
+│   D1涨停(d1_limit_up): 0~20分                                             │
+│   日内动量(intraday): 0~20分 (D1收盘后可知)                                │
+│                                                                             │
+│ 实盘工作流:                                                                  │
+│   D0 15:00+  --today 查看买点信号 + 买入建议价 + 持仓卖出建议              │
+│   D1 09:30   按建议价买入                                                  │
+│   D1 15:00+  --today 查看持仓日内动量, <3%的明天开盘清仓                   │
+│   D2 09:30   执行清仓/持有                                                 │
+│                                                                             │
+│ 待优化 (需补充D0盘中数据, 当前K线仅OHLCV):                                 │
+│   - D0涨停时间: 10:00前封板 vs 14:00封板, 强度完全不同                     │
+│   - D0封单量/成交量比: 封单越大越强                                         │
+│   - D0是否一字板: 一字板=极强, 但实盘买不进                                 │
+│   - D0动量强度可决定D1追涨幅度上限                                         │
+└─────────────────────────────────────────────────────────────────────────────┘
 
-规则:
-  - 每个涨停日独立评估, 连板的每个涨停日都走V1判断
-  - 前阶段出信号则后续阶段跳过, 一个D0最多一笔交易
-  - 各阶段入场策略和出场策略相对独立
-  - 默认 next_open 买入, 可选 signal_close
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 龙回头 策略 (--strategy dragon)                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│ 入场: 涨停 → 回调 → 末期缩量小阴                                           │
+│ ────────────────────────────────────────────────────────                     │
+│ 1. 找到涨停日(D0)                                                          │
+│ 2. 回调期: D0后连续收盘<D0收盘价, 持续3~11天                               │
+│ 3. 信号日(D0回调末期):                                                     │
+│    - 涨跌幅在 -3% ~ -0.5% (末期小阴, 抛压枯竭)                            │
+│    - 量比(D0量/D-1量)在 0.5x ~ 0.8x (缩量)                                │
+│ 4. 买入:                                                                   │
+│    signal_close: 信号日收盘买 (回测用)                                     │
+│    next_open:    信号日后第2天开盘买 (实盘可行, 需D+1收盘确认信号)         │
+│                                                                             │
+│ 出场:                                                                       │
+│ ────────────────────────────────────────────────────────                     │
+│   止损:     -5%                                                             │
+│   追踪止损: -5% (从峰值回撤)                                               │
+│   峰值逃顶: 涨>7%后大上影线(>30%)收盘逃顶                                  │
+│   持仓上限: 10个交易日                                                      │
+│                                                                             │
+│ 参数:                                                                       │
+│   --pullback N          最少回调天数 (默认3)                               │
+│   --max-pullback N      最多回调天数 (默认11)                              │
+│   --max-last-chg N%%     信号日最大涨幅 (默认3.0)                           │
+└─────────────────────────────────────────────────────────────────────────────┘
 
-═══════════════════════════════════════════════════
-独立策略 (--strategy all / dragon / v1 / break)
-═══════════════════════════════════════════════════
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 断板 策略 (--strategy break)                                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│ 入场: 连板≥2 → 断板 → 次日开盘买入                                        │
+│ ────────────────────────────────────────────────────────                     │
+│ 1. 找到连板(连续涨停≥2天)                                                  │
+│ 2. 断板期: 连板后第一个非涨停日                                            │
+│ 3. 断板期检查:                                                              │
+│    - 低点 >= 涨停日开盘价 (支撑有效)                                       │
+│    - 断板期均量在 1.2x~2.0x涨停日量 (适度换手)                             │
+│    - 首个断板日涨跌在 -5% ~ +8%                                            │
+│    - 首个断板日开盘跳空在 -3% ~ +5%                                        │
+│    - 回撤 >= -10%                                                          │
+│ 4. 买入: 断板期结束后次日开盘价                                            │
+│                                                                             │
+│ 出场:                                                                       │
+│ ────────────────────────────────────────────────────────                     │
+│   止损:     -8% (主板) / -10% (创/科板)                                    │
+│   追踪止损: -6% (主板) / -8% (创/科板)                                     │
+│   峰值逃顶: 涨>10%后大上影线(>40%)收盘逃顶                                │
+│   持仓上限: 20天 (主板) / 15天 (创/科板)                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
 
-  龙回头: 涨停 → 回调3-11天 → 末期缩量小阴 → 买入
-  V1:     首板次日放量涨停 → D+1开盘买入
-  断板:   连板≥2 → 断板 → 次日开盘买入
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 4IN1 策略 (--strategy 4in1): 一次涨停驱动, 分阶段决策                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│ 流程:                                                                       │
+│   D0      涨停(首板/连板) ──→ V1检查D1入场条件                            │
+│   D1      涨停 ──→ V1入场, 按V1出场规则持有                                │
+│            没涨停 ──→ 断板检查D1~D2窗口                                    │
+│   D3~D5   依旧没涨停 ──→ 龙回头A(短回调, 3~5天)                           │
+│   D6~D11  依旧没涨停 ──→ 龙回头B(长回调, 6~11天)                          │
+│   D12     放弃                                                             │
+│                                                                             │
+│ 规则:                                                                       │
+│   - 每个涨停日独立评估, 连板的每个涨停日都走V1判断                         │
+│   - 前阶段出信号则后续阶段跳过, 一个D0最多一笔交易                         │
+│   - 各阶段入场/出场策略独立, 见上文各策略说明                              │
+│   - 默认 next_open 买入                                                     │
+└─────────────────────────────────────────────────────────────────────────────┘
 
-  独立策略之间互不干扰, 各自产生信号
+═══════════════════════════════════════════════════════════════════════════════
+                          独立策略 (--strategy all)
+═══════════════════════════════════════════════════════════════════════════════
+
+  龙回头 + V1 + 断板 三策略独立运行, 互不干扰, 各自产生信号
+  同一股票同一日可能被多个策略同时命中
 """
 from __future__ import annotations
 import json, time, argparse, os, sys
@@ -339,7 +442,7 @@ def run_backtest(bars, entry_idx, entry_price, hold_days=20, stop_loss=-10.0, tr
 def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=11,
                              max_last_chg=3.0,
                              hold_days=15, stop_loss=-5.0, trailing_stop=-5.0,
-                             buy_mode="signal_close"):
+                             buy_mode="next_open"):
     """
     龙回头v4 (优化版):
     D-N涨停 → 回调3-11天 → 末期缩量小阴(-3%~-0.5%)+量比0.5~0.8 → 买入
@@ -351,8 +454,8 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
       peak_escape : 涨>7%后上影线>30%逃顶 (原10%/40%)
 
     buy_mode:
-      signal_close — 信号日收盘买 (默认, 14:50盘中扫描可行)
-      next_open    — D+1开盘买
+      next_open    — D+1开盘买 (默认, 实盘推荐)
+      signal_close — 信号日收盘买 (回测用, 14:50盘中扫描可行)
     """
     board_type = get_board_type(code)
     threshold = 0.098 if board_type == "main" else 0.198
@@ -417,14 +520,12 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
             entry_idx = pullback_end
             entry_date = last_pb['time']
         elif buy_mode == "next_open":
-            # 龙回头信号需D+1收盘后才能确认（末期缩量小阴在D0，
-            # 但需D+1收盘数据验证信号有效性），因此D+1开盘时
-            # 无法预知是否为买点。实际最早只能在D+2开盘买入。
-            if pullback_end + 2 >= len(bars): continue
-            d2 = bars[pullback_end + 2]
-            entry_price = d2['open']
-            entry_idx = pullback_end + 2
-            entry_date = d2['time']
+            # D0是信号日(缩量小阴), D0收盘确认信号, D1开盘买入
+            if pullback_end + 1 >= len(bars): continue
+            d1 = bars[pullback_end + 1]
+            entry_price = d1['open']
+            entry_idx = pullback_end + 1
+            entry_date = d1['time']
         else:
             continue
         if entry_price <= 0: continue
@@ -458,7 +559,10 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
             'entry_date': entry_date,
             'entry_price': round(entry_price, 3),
             'buy_mode': buy_mode,
+            'signal_price': round(last_pb['close'], 3),
             'd1_change': round(d1_change, 2),
+            'd1_gap': round((entry_price / last_pb['close'] - 1) * 100, 2) if last_pb['close'] > 0 else 0,
+            'intraday': round(d1_change - (entry_price / last_pb['close'] - 1) * 100, 2) if last_pb['close'] > 0 else 0,
             **result,
         })
 
@@ -796,12 +900,13 @@ def _dragon_phase(bars, code, lu_idx, min_pb, max_pb, params, bt, threshold,
         entry_idx = pullback_end
         entry_date = last_pb['time']
     else:  # next_open
-        if pullback_end + 2 >= len(bars):
+        # D0信号确认, D1开盘买入
+        if pullback_end + 1 >= len(bars):
             return None
-        d2 = bars[pullback_end + 2]
-        entry_price = d2['open']
-        entry_idx = pullback_end + 2
-        entry_date = d2['time']
+        d1_entry = bars[pullback_end + 1]
+        entry_price = d1_entry['open']
+        entry_idx = pullback_end + 1
+        entry_date = d1_entry['time']
 
     if entry_price <= 0:
         return None
@@ -835,14 +940,17 @@ def _dragon_phase(bars, code, lu_idx, min_pb, max_pb, params, bt, threshold,
         'entry_date': entry_date,
         'entry_price': round(entry_price, 3),
         'buy_mode': buy_mode,
+        'signal_price': round(last_pb['close'], 3),
         'd1_change': round(d1_change, 2),
+        'd1_gap': round((entry_price / last_pb['close'] - 1) * 100, 2) if last_pb['close'] > 0 else 0,
+        'intraday': round(d1_change - (entry_price / last_pb['close'] - 1) * 100, 2) if last_pb['close'] > 0 else 0,
         **result,
     }
 
 
 def strategy_v1(bars, code,
                 hold_days=20, stop_loss=-10.0, trailing_stop=-5.0,
-                buy_mode="signal_close",
+                buy_mode="next_open",
                 ret_20d_min=30.0,
                 d_1_pullback_min=-10.0, d_1_pullback_max=-3.0,
                 obv_filter=True,
@@ -1127,7 +1235,11 @@ def strategy_break_buy(bars, code, min_streak=2, max_break_gap=5, override_param
             'break_chg': round(first_break_chg, 2),
             'break_gap': round(first_break_gap, 2),
             'break_vol_r': round(break_vol_r, 2),
-            'entry_date': bars[entry_idx]['time'], 'entry_price': round(entry_price, 3), 'buy_mode': 'next_open', **result,
+            'entry_date': bars[entry_idx]['time'], 'entry_price': round(entry_price, 3), 'buy_mode': 'next_open',
+            'd1_change': round((bars[entry_idx]['close'] / bars[entry_idx]['open'] - 1) * 100, 2) if bars[entry_idx]['open'] > 0 else 0,
+            'd1_gap': round((bars[entry_idx]['open'] / bars[entry_idx - 1]['close'] - 1) * 100, 2) if entry_idx > 0 and bars[entry_idx - 1]['close'] > 0 else 0,
+            'intraday': round((bars[entry_idx]['close'] - bars[entry_idx]['open']) / bars[entry_idx - 1]['close'] * 100, 2) if entry_idx > 0 and bars[entry_idx - 1]['close'] > 0 else 0,
+            **result,
         })
         i = streak_end + 1
 
@@ -1176,75 +1288,160 @@ def print_stats(trades, label):
         pl = 0.0
     print(f"  {label}: {len(trades):>4}笔 胜率{wr:>5.1f}% 均收益{avg:>+6.2f}% 均峰值{peak:>+6.2f}% 盈亏比{pl:.2f}")
 
-def print_today_signals(all_trades, today_str):
-    """统计今日出现买点的股票"""
-    today_trades = [t for t in all_trades if t['entry_date'] == today_str]
-    if not today_trades:
-        print(f"\n{'=' * 80}")
-        print(f"📅 {today_str} 今日买点统计")
-        print(f"{'=' * 80}")
-        print(f"  今日无买点信号")
-        return today_trades
+def calc_momentum_score(t):
+    """计算V1动量强度评分 (0~100)
 
-    # 按策略分组
-    dc_today = [t for t in today_trades if t['path'] == 'dragon_callback']
-    v1_today = [t for t in today_trades if t['path'] == 'v1']
-    bb_today = [t for t in today_trades if t['path'] == 'break_buy']
+    基于D0已知数据:
+    - 趋势强度 (ret_20d): 20日涨幅越大趋势越强
+    - 回踩质量 (d_1_change): D-1回调深度
+    - 涨停质量 (d1_limit_up): D1是否涨停
+    """
+    score = 0
+    # 趋势强度 (0~30分)
+    ret = t.get('ret_20d', 0)
+    if ret >= 80: score += 30
+    elif ret >= 60: score += 25
+    elif ret >= 50: score += 20
+    elif ret >= 40: score += 15
+    elif ret >= 30: score += 10
+    # 回踩质量 (0~30分): 回踩越深越好
+    pb = t.get('d_1_change', 0)
+    if -10 <= pb < -7: score += 30
+    elif -7 <= pb < -5: score += 25
+    elif -5 <= pb < -3: score += 20
+    # D1涨停 (0~20分)
+    if t.get('d1_limit_up'): score += 20
+    # 日内动量 (0~20分): 仅已知时计入
+    intra = t.get('intraday')
+    if intra is not None:
+        if intra >= 5: score += 20
+        elif intra >= 3: score += 15
+        elif intra >= 0: score += 10
+    return score
 
-    # 按板块分组
-    main_today = [t for t in today_trades if t['board'] in ('沪主板', '深主板')]
-    gem_today = [t for t in today_trades if t['board'] == '创业板']
-    star_today = [t for t in today_trades if t['board'] == '科创板']
+
+def momentum_label(score):
+    """动量强度标签"""
+    if score >= 80: return '🔴 极强'
+    if score >= 60: return '🟠 强'
+    if score >= 40: return '🟡 中'
+    return '⚪ 弱'
+
+
+def calc_buy_tiers(d0_close, board_type):
+    """基于D0收盘价计算D1多档买入建议价
+
+    D0涨停后, D1开盘可能的跳空区间:
+    主板: -3% ~ +5% (过滤条件范围内)
+    创/科板: -5% ~ +5% (过滤条件: >=-5% 且 <5%)
+    """
+    if board_type == 'main':
+        gaps = [-3, -2, -1, 0, 1, 2, 3, 4, 5]
+    else:
+        gaps = [-5, -3, -1, 0, 1, 2, 3, 4]  # 创/科板上限5%
+    tiers = []
+    for g in gaps:
+        price = round(d0_close * (1 + g / 100), 2)
+        tiers.append((g, price))
+    return tiers
+
+
+def print_today_signals(all_trades, today_str, buy_mode="next_open"):
+    """D0收盘后运行, 显示今日信号 + 次日买入建议
+
+    所有策略按信号日筛选 (信号日=今天):
+    - 龙回头: signal_date = D0缩量小阴日
+    - V1:     d0_date = D0涨停日
+    - 断板:   break_date = 断板确认日
+
+    买入时机: 次日D1开盘
+    """
+    # 按信号日筛选 (信号日=今天, 买入日=明天)
+    dc_today = [t for t in all_trades if t['path'] == 'dragon_callback' and t.get('signal_date') == today_str]
+    v1_today = [t for t in all_trades if t['path'] == 'v1' and t.get('d0_date') == today_str]
+    bb_today = [t for t in all_trades if t['path'] == 'break_buy' and t.get('break_date') == today_str]
+    today_trades = dc_today + v1_today + bb_today
 
     print(f"\n{'=' * 80}")
-    print(f"📅 {today_str} 今日买点统计")
+    print(f"📅 {today_str} 今日信号 (D0收盘后, 次日D1开盘买入)")
     print(f"{'=' * 80}")
-    print(f"  共 {len(today_trades)} 只股票出现买点信号")
 
-    # 策略分布
-    print(f"\n  📊 策略分布:")
+    if not today_trades:
+        print(f"  今日无信号")
+        return today_trades
+
+    print(f"  共 {len(today_trades)} 只股票出现信号")
+
+    # 龙回头信号
     if dc_today:
-        print(f"    🐉 龙回头: {len(dc_today)} 只")
-    if v1_today:
-        print(f"    🔥 V1: {len(v1_today)} 只")
-    if bb_today:
-        print(f"    💥 断板: {len(bb_today)} 只")
-
-    # 板块分布
-    print(f"\n  📊 板块分布:")
-    if main_today:
-        print(f"    🏛️  主板: {len(main_today)} 只")
-    if gem_today:
-        print(f"    💎 创业板: {len(gem_today)} 只")
-    if star_today:
-        print(f"    🚀 科创板: {len(star_today)} 只")
-
-    # 股票代码汇总
-    all_codes = sorted(set(t['code'] for t in today_trades))
-    print(f"\n  📋 今日买点股票代码汇总 ({len(all_codes)}只):")
-    print(f"    {', '.join(all_codes)}")
-
-    # 按策略列出股票
-    if dc_today:
-        print(f"\n  🐉 龙回头信号 ({len(dc_today)}只):")
+        print(f"\n  🐉 龙回头 ({len(dc_today)}只) — 缩量小阴确认, 次日D1开盘买:")
         for t in sorted(dc_today, key=lambda x: x.get('entry_vol_r', 0), reverse=True):
+            bt = get_board_type(t['code'])
+            signal_price = t.get('signal_price', t['entry_price'])
+            tiers = calc_buy_tiers(signal_price, bt)
+            tier_str = ' / '.join([f"{g:+.0f}%→{p:.2f}" for g, p in tiers])
             print(f"    {t['code']:<8} {t['board']:<6} 涨停{t['lu_date']} 回调{t['pullback_days']}天 "
-                  f"信号{t['signal_date']} {t['signal_chg']:+.1f}% "
-                  f"买入{t['entry_date']} 量比{t['entry_vol_r']:.2f}x {t['entry_price']:.2f}")
+                  f"信号{t['signal_date']} {t['signal_chg']:+.1f}% 量比{t['entry_vol_r']:.2f}x")
+            print(f"{'':>10} 信号价{signal_price:.2f} 买入建议: {tier_str}")
 
+    # V1信号
     if v1_today:
-        print(f"\n  🔥 V1信号 ({len(v1_today)}只):")
-        for t in sorted(v1_today, key=lambda x: x.get('vol_ratio', 0), reverse=True):
-            print(f"    {t['code']:<8} {t['board']:<6} 涨停{t['d0_date']} "
-                  f"量比{t['vol_ratio']:.2f}x D1{t['d1_change']:+.1f}% "
-                  f"买入{t['entry_price']:.2f}")
+        print(f"\n  🔥 V1 ({len(v1_today)}只) — D0涨停确认, 次日D1开盘买:")
+        print(f"  {'代码':>8} {'板块':>6} {'动量':>6} {'评分':>4} {'D0收':>8} {'D-1回调':>8} {'20日涨':>8} {'买入建议'}")
+        print(f"  {'-' * 85}")
+        for t in sorted(v1_today, key=lambda x: calc_momentum_score(x), reverse=True):
+            code, board = t['code'], t['board']
+            bt = get_board_type(code)
+            d1_gap = t.get('d1_gap', 0)
+            d0_close = t['entry_price'] / (1 + d1_gap / 100) if d1_gap != 0 else t['entry_price']
+            score = calc_momentum_score(t)
+            label = momentum_label(score)
+            tiers = calc_buy_tiers(d0_close, bt)
+            tier_str = ' / '.join([f"{g:+.0f}%→{p:.2f}" for g, p in tiers])
+            print(f"  {code:>8} {board:>6} {label:>6} {score:>3}  {d0_close:>7.2f} "
+                  f"{t['d_1_change']:>+7.1f}% {t['ret_20d']:>+7.1f}%  {tier_str}")
 
+    # 断板信号
     if bb_today:
-        print(f"\n  💥 断板信号 ({len(bb_today)}只):")
+        print(f"\n  💥 断板 ({len(bb_today)}只) — 连板后断板确认, 次日开盘买:")
         for t in sorted(bb_today, key=lambda x: x.get('streak_len', 0), reverse=True):
             print(f"    {t['code']:<8} {t['board']:<6} {t['streak_len']}板连板 "
-                  f"断板{t['break_date']} {t['break_chg']:+.1f}% 量{t['break_vol_r']:.2f}x "
-                  f"买入{t['entry_price']:.2f}")
+                  f"断板{t['break_date']} {t['break_chg']:+.1f}% 量{t['break_vol_r']:.2f}x 预计开盘{t['entry_price']:.2f}")
+
+    # ===== 持仓卖出建议 (15天内买入的持仓) =====
+    from datetime import datetime, timedelta
+    today_dt = datetime.strptime(today_str, '%Y-%m-%d')
+    recent_entries = [t for t in all_trades
+                      if t['entry_date'] <= today_str
+                      and t['entry_date'] >= (today_dt - timedelta(days=20)).strftime('%Y-%m-%d')]
+
+    if recent_entries:
+        sell = [t for t in recent_entries if t['intraday'] < 3]
+        hold = [t for t in recent_entries if t['intraday'] >= 3]
+
+        print(f"\n{'=' * 80}")
+        print(f"📊 持仓分析 (15天内买入, 次日开盘执行)")
+        print(f"{'=' * 80}")
+        print(f"  持仓: {len(recent_entries)}只 | 卖出: {len(sell)}只 | 持有: {len(hold)}只")
+
+        if sell:
+            print(f"\n  🔴 明日开盘清仓 ({len(sell)}只) — 日内动量<3%:")
+            print(f"  {'代码':>8} {'板块':>6} {'策略':>6} {'买入日':>12} {'买入价':>8} {'D1收':>7} {'日内':>7}")
+            print(f"  {'-' * 65}")
+            for t in sorted(sell, key=lambda x: x['intraday']):
+                pl = {'dragon_callback': '龙回头', 'v1': 'V1', 'break_buy': '断板'}.get(t['path'], '')
+                print(f"  {t['code']:>8} {t['board']:>6} {pl:>6} {t['entry_date']:>12} "
+                      f"{t['entry_price']:>7.2f} {t['d1_change']:>+6.1f}% {t['intraday']:>+6.1f}%")
+
+        if hold:
+            print(f"\n  🟢 继续持有 ({len(hold)}只) — 日内动量>=3%:")
+            print(f"  {'代码':>8} {'板块':>6} {'策略':>6} {'买入日':>12} {'买入价':>8} {'D1收':>7} {'日内':>7}")
+            print(f"  {'-' * 65}")
+            for t in sorted(hold, key=lambda x: -x['intraday']):
+                pl = {'dragon_callback': '龙回头', 'v1': 'V1', 'break_buy': '断板'}.get(t['path'], '')
+                print(f"  {t['code']:>8} {t['board']:>6} {pl:>6} {t['entry_date']:>12} "
+                      f"{t['entry_price']:>7.2f} {t['d1_change']:>+6.1f}% {t['intraday']:>+6.1f}%")
+            print(f"\n    出场规则: 追踪止损-5% / 持仓上限20天")
 
     return today_trades
 
@@ -1261,9 +1458,9 @@ def main():
     parser.add_argument("--max-last-chg", type=float, default=3.0, help="龙回头末期小阳最大涨幅%%")
     parser.add_argument("--strategy", default="all", choices=["all", "dragon", "v1", "break", "4in1"],
                         help="运行策略: all=全部, dragon=龙回头, v1=V1, break=断板, 4in1=四合一")
-    parser.add_argument("--buy-mode", default="signal_close",
+    parser.add_argument("--buy-mode", default="next_open",
                         choices=["signal_close", "next_open"],
-                        help="买入模式: signal_close=信号日收盘买(默认), next_open=D+1开盘买")
+                        help="买入模式: next_open=D+1开盘买(默认), signal_close=信号日收盘买(回测用)")
     parser.add_argument("--v1-stop-loss", type=float, default=-10.0, help="V1: 止损%% (默认-10)")
     parser.add_argument("--v1-trailing-stop", type=float, default=-5.0, help="V1: 追踪止损%% (默认-5)")
     # V1 v2 核心四因子
@@ -1272,7 +1469,7 @@ def main():
     parser.add_argument("--d1-pullback-max", type=float, default=-3.0, help="V1: D-1回调最大%% (默认-3)")
     parser.add_argument("--no-obv-filter", action="store_true", help="V1: 禁用OBV上升过滤")
     parser.add_argument("--d1-vol-max", type=float, default=1.5, help="V1: D-1量vs5日均量上限 (默认1.5x)")
-    parser.add_argument("--today", action="store_true", help="仅统计今日出现买点的股票")
+    parser.add_argument("--today", action="store_true", help="显示买点+持仓卖出建议 (15天内买入的持仓)")
     parser.add_argument("--today-date", type=str, default="", help="指定日期(YYYY-MM-DD), 默认为当天")
     args = parser.parse_args()
     codes = [c.strip() for c in args.codes.split(",") if c.strip()] if args.codes else TEST_CODES
@@ -1478,7 +1675,7 @@ def main():
     if args.today:
         today_str = args.today_date or time.strftime("%Y-%m-%d")
         all_for_today = dc_trades + v1_trades + bb_trades + f4in1_trades
-        today_trades = print_today_signals(all_for_today, today_str)
+        today_trades = print_today_signals(all_for_today, today_str, buy_mode=args.buy_mode)
         if today_trades:
             with open(f"today_signals_{today_str}.json", "w", encoding="utf-8") as f:
                 json.dump(today_trades, f, ensure_ascii=False, indent=2)
