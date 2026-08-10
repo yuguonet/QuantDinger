@@ -467,6 +467,11 @@ def _prev_trading_day(d: str) -> Optional[str]:
 # DB 写入（删旧 + 写新）
 # ═══════════════════════════════════════════════════════
 
+def _normalize_1d_time(dt: datetime) -> datetime:
+    """写库时统一将 1D 时间归一为 15:00:00（仅改时分秒，日期不变）"""
+    return dt.replace(hour=15, minute=0, second=0, microsecond=0)
+
+
 def write_stock_data(
     writer,
     pool,
@@ -499,6 +504,8 @@ def write_stock_data(
             continue
         if dt.tzinfo:
             dt = dt.replace(tzinfo=None)
+        if timeframe == "1D":
+            dt = _normalize_1d_time(dt)
         # 过滤超出 DELETE 范围的记录，避免主键冲突
         if dt < start_cutoff or dt > end_cutoff:
             continue
@@ -622,6 +629,8 @@ def write_batch_data(
                 continue
             if dt.tzinfo:
                 dt = dt.replace(tzinfo=None)
+            if timeframe == "1D":
+                dt = _normalize_1d_time(dt)
             # 过滤超出 DELETE 范围的记录，避免主键冲突
             if dt < start_cutoff or dt > end_cutoff:
                 continue

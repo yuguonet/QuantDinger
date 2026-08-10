@@ -152,28 +152,28 @@ def _is_in_trading_hours() -> bool:
 
 
 def _prev_trading_day_ts() -> int:
-    """前一交易日的 1D 时间戳（当天 00:00:00）。
+    """前一交易日的 1D 时间戳（当天 15:00:00）。
 
     用途：判断 DB 数据是否足够新——如果 DB 最后一条 ≥ 前一交易日，
     说明 DB 已经包含了上一个交易日的收盘数据，可以走快速路径。
     """
     today_str = datetime.now().strftime("%Y-%m-%d")
     prev_td = prev_trading_day(today_str)
-    return int(datetime.strptime(prev_td, "%Y-%m-%d").timestamp())
+    return int(datetime.strptime(prev_td, "%Y-%m-%d").replace(hour=15).timestamp())
 
 
 def _today_ts() -> int:
-    """今日的 1D 时间戳（00:00:00），用于过滤/拼接今日数据。"""
+    """今日的 1D 时间戳（15:00:00），用于过滤/拼接今日数据。"""
     today_str = datetime.now().strftime("%Y-%m-%d")
-    return int(datetime.strptime(today_str, "%Y-%m-%d").timestamp())
+    return int(datetime.strptime(today_str, "%Y-%m-%d").replace(hour=15).timestamp())
 
 
 def _normalize_1d_bars(bars: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """1D 归一化：每天只留一条 bar，time 统一归零到当天 00:00:00，按时间排序。
+    """1D 归一化：每天只留一条 bar，time 统一归一到当天 15:00:00，按时间排序。
 
     规则：同一日期出现多条时，后面的覆盖前面的。
     这样当 DB 旧数据和远端新数据合并时，远端（排在后面）会覆盖 DB。
-    time 归零后，后续 _merge_bars 用精确时间戳做 key 也不会出现同一天多条的问题。
+    time 归一到 15:00 后，后续 _merge_bars 用精确时间戳做 key 也不会出现同一天多条的问题。
     """
     if not bars:
         return bars
@@ -181,8 +181,8 @@ def _normalize_1d_bars(bars: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for bar in bars:
         dt = datetime.fromtimestamp(bar["time"])
         date_str = dt.strftime("%Y-%m-%d")
-        # 归一化 time 到当天 00:00:00
-        bar["time"] = int(datetime.strptime(date_str, "%Y-%m-%d").timestamp())
+        # 归一化 time 到当天 15:00:00
+        bar["time"] = int(datetime.strptime(date_str, "%Y-%m-%d").replace(hour=15).timestamp())
         by_date[date_str] = bar
     return sorted(by_date.values(), key=lambda b: b["time"])
 
@@ -209,7 +209,7 @@ def _bar_from_ticker(quote: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     price = float(price)
     today_str = datetime.now().strftime("%Y-%m-%d")
-    bar_ts = int(datetime.strptime(today_str, "%Y-%m-%d").timestamp())
+    bar_ts = int(datetime.strptime(today_str, "%Y-%m-%d").replace(hour=15).timestamp())
 
     return {
         "time": bar_ts,
@@ -776,6 +776,8 @@ class CNStockDataSource(BaseDataSource):
                 if isinstance(t, (int, float)):
                     # Convert epoch to naive Beijing time for DB storage
                     bar["time"] = datetime.fromtimestamp(t, tz=_beijing).replace(tzinfo=None)
+                # 写库统一为 15:00:00（1D 收盘时间），与 kline_1D 其它写入路径一致
+                bar["time"] = bar["time"].replace(hour=15, minute=0, second=0, microsecond=0)
                 db_bars.append(bar)
             writer.upsert("CNStock", db_symbol, "1D", db_bars)
             logger.debug(f"[DB写入] {db_symbol}/1D 写入 {len(db_bars)} 条")
