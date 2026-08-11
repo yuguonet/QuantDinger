@@ -85,6 +85,17 @@ def _ensure_datetime(value) -> datetime:
                 continue
     raise ValueError(f"无法解析时间值: {value!r}")
 
+
+def normalize_1d_time(dt) -> datetime:
+    """1D K 线时间统一归一到当天 15:00:00（收盘时间），返回 naive datetime。
+
+    所有写 kline_1D_YYYY 的路径都必须经过这里，
+    避免同一天出现 00:00:00 与 15:00:00 两条记录。
+    """
+    if not isinstance(dt, datetime):
+        return dt
+    return dt.replace(tzinfo=None, hour=15, minute=0, second=0, microsecond=0)
+
 # ---------------------------------------------------------------------------
 # MarketKlineWriter — K线数据写入
 # ---------------------------------------------------------------------------

@@ -42,6 +42,8 @@ sys.path.insert(0, str(_root / "backend_api_python"))
 
 import pandas as pd
 
+from app.utils.db_market import normalize_1d_time
+
 # ============================================================
 # 指数配置 — symbol: {name, ak, bs}
 # ============================================================
@@ -197,19 +199,12 @@ def fetch_index_daily(symbol: str, start: str = "", end: str = "") -> Optional[p
 # 写入数据库
 # ============================================================
 
-def write_to_db(pool, symbol: str, df: pd.DataFrame, dry_run: bool = False) -> int:
-    """将 DataFrame 写入 kline_1D_YYYY 表，按年分表，UPSERT"""
-    if df is None or df.empty:
-        return 0
-
-    # 按年分组
-    year_groups: Dict[int, list] = {}
+def _df_to_records(df: pd.DataFrame, symbol: str) -> List[dict]:
+    """将 DataFrame 转为待写入记录，1D bar 时间统一归一到当天 15:00:00（收盘时间）。"""
+    records: List[dict] = []
     for _, row in df.iterrows():
-        dt = row["date"].to_pydatetime().replace(hour=0, minute=0, second=0)
-        year = dt.year
-        if year not in year_groups:
-            year_groups[year] = []
-        year_groups[year].append({
+        dt = normalize_1d_time(row["date"].to_pydatetime())
+        records.append({
             "symbol": symbol,
             "time": dt,
             "open": float(row["open"]) if pd.notna(row["open"]) else 0,
@@ -218,6 +213,24 @@ def write_to_db(pool, symbol: str, df: pd.DataFrame, dry_run: bool = False) -> i
             "close": float(row["close"]) if pd.notna(row["close"]) else 0,
             "volume": float(row["volume"]) if pd.notna(row["volume"]) else 0,
         })
+    return records
+
+
+def write_to_db(pool, symbol: str, df: pd.DataFrame, dry_run: bool = False) -> int:
+    """将 DataFrame 写入 kline_1D_YYYY 表，按年分表，UPSERT"""
+    if df is None or df.empty:
+        return 0
+
+    records = _df_to_records(df, symbol)
+
+    # 按年分组
+    year_groups: Dict[int, list] = {}
+    for rec in records:
+        dt = rec["time"]
+        year = dt.year
+        if year not in year_groups:
+            year_groups[year] = []
+        year_groups[year].append(rec)
 
     total_written = 0
     for year, records in sorted(year_groups.items()):

@@ -163,6 +163,14 @@ def _delete_day(bar_time: datetime, tf: str) -> int:
         return 0
 
 
+def _normalize_bar_time(dt: datetime, tf: str) -> datetime:
+    """bar 时间归一化：1D 统一为当天 15:00:00（收盘时间），其它周期保留原值。"""
+    if tf == "1D":
+        from app.utils.db_market import normalize_1d_time
+        return normalize_1d_time(dt)
+    return dt
+
+
 def _batch_insert(records: list, tf: str) -> int:
     """原生批量 INSERT，按年分表。"""
     if not records:
@@ -171,6 +179,10 @@ def _batch_insert(records: list, tf: str) -> int:
     from app.utils.db_multi import _table_name
     from app.utils.db_market import _ensure_datetime
     from psycopg2.extras import execute_values
+
+    # 1D bar 时间统一归一到 15:00:00（收盘时间），避免同一天 00:00/15:00 并存
+    for r in records:
+        r["time"] = _normalize_bar_time(r["time"], tf)
 
     mgr = get_market_db_manager()
     pool = mgr._get_pool("CNStock")
@@ -280,8 +292,8 @@ def sync_tf(tf: str, symbols: Optional[List[str]] = None) -> dict:
 
     target_td = _target_trading_day()
     bar_time = datetime.strptime(target_td, "%Y-%m-%d").replace(
-        hour=15 if tf == "15m" else 0,
-        minute=0 if tf == "15m" else 0,
+        hour=15,
+        minute=0,
         second=0, tzinfo=TZ_CN
     )
 

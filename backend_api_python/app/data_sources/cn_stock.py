@@ -764,7 +764,7 @@ class CNStockDataSource(BaseDataSource):
         if not bars:
             return
         try:
-            from app.utils.db_market import get_market_kline_writer
+            from app.utils.db_market import get_market_kline_writer, normalize_1d_time
             writer = get_market_kline_writer()
             db_symbol = strip_market_prefix(symbol) if symbol else symbol
             from zoneinfo import ZoneInfo
@@ -777,7 +777,7 @@ class CNStockDataSource(BaseDataSource):
                     # Convert epoch to naive Beijing time for DB storage
                     bar["time"] = datetime.fromtimestamp(t, tz=_beijing).replace(tzinfo=None)
                 # 写库统一为 15:00:00（1D 收盘时间），与 kline_1D 其它写入路径一致
-                bar["time"] = bar["time"].replace(hour=15, minute=0, second=0, microsecond=0)
+                bar["time"] = normalize_1d_time(bar["time"])
                 db_bars.append(bar)
             writer.upsert("CNStock", db_symbol, "1D", db_bars)
             logger.debug(f"[DB写入] {db_symbol}/1D 写入 {len(db_bars)} 条")

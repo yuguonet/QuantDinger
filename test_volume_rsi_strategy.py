@@ -62,7 +62,7 @@
   # 每天只选1个最优信号（RSI最低优先）
   python test_volume_rsi_strategy.py --source db --exit-mode momentum --top-per-day 1
 
-  # 每天选2个 + 动量出场（默认推荐配置）
+  # 每天选2个 + 动量出场（推荐配置，参数已内置）
   python test_volume_rsi_strategy.py --source db --exit-mode momentum --top-per-day 2
 
   # 不过滤（同一天所有信号都保留）
@@ -97,8 +97,9 @@
     效果：胜率 43.8%→64.4%，均值 -2.15%→+3.76%
 
   momentum（动量出场）
-    在RSI出场基础上，增加RSI动量出场条件：
+    在RSI出场基础上，增加动量出场条件：
     - RSI从持仓期峰值回落N点（参数：--rsi-drop，默认5）
+    - 从峰值回撤X%强制出场（参数：--drawdown-pct，默认8%）
     优点：出场点接近峰值，保留利润最多
 
   vol_stagnation（缩量滞涨）
@@ -119,12 +120,14 @@
   --rsi-oversold   RSI 超卖阈值（默认25）
   --rsi-overbought RSI 超买阈值，出场条件①（默认75）
   --rsi-extreme    RSI 极端超买阈值，出场条件②（默认82）
-  --max-hold       最大持仓天数（默认20，0=不限制）
+  --max-hold       最大持仓天数（默认15，0=不限制）
   --gain-threshold RSI<30后涨幅阈值%（默认8.0）
   --exit-mode      出场模式: rsi/trail/momentum/vol_stagnation（默认rsi）
   --trail-pct      跟踪止损回撤%（默认3.0，trail/vol_stagnation模式）
   --rsi-drop       RSI回落点数（默认5，momentum模式）
+  --drawdown-pct   峰值回撤强制出场%（默认8.0，momentum模式）
   --vol-shrink     缩量阈值（默认0.6，vol_stagnation模式）
+  --top-per-day    每天最多选前N个最优信号（默认2，0=不过滤）
   --top            显示TOP N（默认10）
   --all-trades     打印全部交易明细
   --today          仅统计今日买点
@@ -330,9 +333,10 @@ def compute_macd(closes, fast=12, slow=26, signal=9):
 # 回测引擎
 # ================================================================
 def run_backtest(bars, entry_idx, entry_price, exit_signals,
-                 max_hold_days=20, exit_mode="rsi",
+                 max_hold_days=15, exit_mode="rsi",
                  rsi_values=None, dif=None, dea=None, macd_hist=None,
-                 trail_pct=3.0, rsi_drop=5, vol_shrink=0.6):
+                 trail_pct=3.0, rsi_drop=5, vol_shrink=0.6,
+                 drawdown_pct=8.0):
     """
     出场规则（由 exit_mode 选择）:
 
@@ -345,7 +349,7 @@ def run_backtest(bars, entry_idx, entry_price, exit_signals,
 
     momentum: 动量出场
       ① RSI原策略出场  ② RSI从持仓期峰值回落 rsi_drop 点出场
-      ③ 持仓天数上限  ④ 数据耗尽
+      ③ 价格从峰值回撤 drawdown_pct% 强制出场  ④ 持仓天数上限  ⑤ 数据耗尽
 
     vol_stagnation: 缩量滞涨
       ① RSI原策略出场  ② 量缩至5日均量 vol_shrink 倍 + 价格在峰值附近(2%内)
@@ -405,6 +409,21 @@ def run_backtest(bars, entry_idx, entry_price, exit_signals,
                 exit_p = b['close']
                 exit_d = d
                 exit_reason = "rsi_drop"
+                break
+            # 从峰值回撤 drawdown_pct% 强制出场
+            if peak > entry_price:
+                dd = (peak - b['close']) / peak * 100
+                if dd >= drawdown_pct:
+                    exit_p = b['close']
+                    exit_d = d
+                    exit_reason = "drawdown_stop"
+                    break
+            # 绝对亏损止损：从买入价亏了 drawdown_pct% 强制出场
+            abs_loss = (entry_price - b['close']) / entry_price * 100
+            if abs_loss >= drawdown_pct:
+                exit_p = b['close']
+                exit_d = d
+                exit_reason = "drawdown_stop"
                 break
 
         # ---- 缩量滞涨 ----
@@ -489,10 +508,10 @@ def _check_dif_bottom_divergence(closes, dif, cur_idx, lookback=30):
 
 def strategy_volume_rsi(bars, code, rsi_len=14, rsi_oversold=25,
                         rsi_overbought=75, rsi_extreme=82,
-                        max_hold_days=60, gain_threshold=10.0,
+                        max_hold_days=15, gain_threshold=10.0,
                         circ_shares=0.0, exit_mode="rsi",
                         trail_pct=3.0, rsi_drop=5, vol_shrink=0.6,
-                        top_per_day=2):
+                        top_per_day=2, drawdown_pct=8.0):
     """
     量价RSI策略:
 
@@ -630,7 +649,7 @@ def strategy_volume_rsi(bars, code, rsi_len=14, rsi_oversold=25,
                               rsi_values=rsi_values, dif=dif, dea=dea,
                               macd_hist=macd_hist,
                               trail_pct=trail_pct, rsi_drop=rsi_drop,
-                              vol_shrink=vol_shrink)
+                              vol_shrink=vol_shrink, drawdown_pct=drawdown_pct)
         if not result:
             continue
 
@@ -749,7 +768,7 @@ def main():
     parser.add_argument("--rsi-oversold", type=float, default=25, help="RSI 超卖阈值 (默认25)")
     parser.add_argument("--rsi-overbought", type=float, default=75, help="RSI 超买阈值 (默认75)")
     parser.add_argument("--rsi-extreme", type=float, default=82, help="RSI 极端超买阈值 (默认82)")
-    parser.add_argument("--max-hold", type=int, default=20, help="最大持仓天数 (默认20, 0=不限制)")
+    parser.add_argument("--max-hold", type=int, default=15, help="最大持仓天数 (默认15, 0=不限制)")
     parser.add_argument("--all-trades", action="store_true", help="打印全部交易明细")
     parser.add_argument("--today", action="store_true", help="仅统计今日买点")
     parser.add_argument("--today-date", type=str, default="", help="指定日期(YYYY-MM-DD)")
@@ -766,6 +785,8 @@ def main():
                         help="缩量阈值: 当日量/5日均量 (默认0.6, 仅vol_stagnation模式)")
     parser.add_argument("--top-per-day", type=int, default=2,
                         help="每天最多选前N个最优信号 (默认2, 0=不过滤)")
+    parser.add_argument("--drawdown-pct", type=float, default=8.0,
+                        help="从峰值回撤强制出场百分比 (默认8.0, 仅momentum模式)")
     args = parser.parse_args()
 
     codes = [c.strip() for c in args.codes.split(",") if c.strip()] if args.codes else TEST_CODES
@@ -793,6 +814,7 @@ def main():
     elif args.exit_mode == "momentum":
         print(f"  ① RSI>{args.rsi_overbought} 且 量比>2.0 / RSI>{args.rsi_extreme}")
         print(f"  ② RSI从峰值回落{args.rsi_drop}点")
+        print(f"  ③ 峰值回撤{args.drawdown_pct}%强制出场")
     elif args.exit_mode == "vol_stagnation":
         print(f"  ① RSI>{args.rsi_overbought} 且 量比>2.0 / RSI>{args.rsi_extreme}")
         print(f"  ② 缩量滞涨: 量<{args.vol_shrink}*5日均量 + 价格在峰值2%内")
@@ -828,6 +850,7 @@ def main():
             rsi_drop=args.rsi_drop,
             vol_shrink=args.vol_shrink,
             top_per_day=args.top_per_day,
+            drawdown_pct=args.drawdown_pct,
         )
         all_trades.extend(trades)
 
