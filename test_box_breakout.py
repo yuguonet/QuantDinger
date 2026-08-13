@@ -118,6 +118,9 @@ def get_board_name(code):
 def run_backtest(bars, entry_idx, entry_price, stop_loss_pct=5.0,
                  trailing_pct=5.0, max_hold_days=15,
                  take_profit_pct=15.0, trailing_activate_pct=5.0):
+    """
+    简化回测: 买入后跟踪峰值，从峰值回撤 peak_drop_pct% 出场，最多持有 max_hold_days 天。
+    """
     if entry_price <= 0 or entry_idx >= len(bars):
         return None
 
@@ -138,39 +141,17 @@ def run_backtest(bars, entry_idx, entry_price, stop_loss_pct=5.0,
         if b['high'] > peak:
             peak = b['high']
 
-        # 止盈：用收盘价判断
-        gain_from_entry = (b['close'] / entry_price - 1) * 100
-        if gain_from_entry >= take_profit_pct:
-            exit_p = b['close']
-            exit_d = d
-            exit_reason = "take_profit"
-            break
-
-        # 止损：用盘中最低价判断，触及止损线以止损价出场
-        # 这样能避免跳空低开导致止损失效
-        stop_price = entry_price * (1 - stop_loss_pct / 100)
-        if b['low'] <= stop_price:
-            # 跳空低开：以开盘价出场（实际无法以止损价成交）
-            if b['open'] < stop_price:
+        # 从峰值回撤 peak_drop_pct% 出场
+        drop_from_peak = (peak - b['low']) / peak * 100
+        if drop_from_peak >= stop_loss_pct:
+            drop_price = peak * (1 - stop_loss_pct / 100)
+            if b['open'] < drop_price:
                 exit_p = b['open']
             else:
-                exit_p = stop_price
+                exit_p = drop_price
             exit_d = d
-            exit_reason = "stop_loss"
+            exit_reason = "peak_drop"
             break
-
-        # 跟踪止损：用收盘价判断
-        peak_gain = (peak / entry_price - 1) * 100
-        if peak_gain >= trailing_activate_pct:
-            trail_price = peak * (1 - trailing_pct / 100)
-            if b['low'] <= trail_price:
-                if b['open'] < trail_price:
-                    exit_p = b['open']
-                else:
-                    exit_p = trail_price
-                exit_d = d
-                exit_reason = "trail_stop"
-                break
 
         if max_hold_days > 0 and d >= max_hold_days:
             exit_p = b['close']
@@ -470,29 +451,253 @@ def strategy_w_bottom(bars, code,
     return trades
 
 # ================================================================
+# 箱体突破 + 站上MA60 策略
+# ================================================================
+def strategy_peak_breakout(bars, code,
+                           box_days=25, box_max_range=10.0, box_min_bars=10,
+                           vol_expand_min=1.5, vol_expand_max=3.0,
+                           stop_loss_pct=12.0, trailing_pct=5.0,
+                           trailing_activate_pct=5.0, take_profit_pct=15.0,
+                           max_hold_days=10, top_per_day=2,
+                           require_ma60=True, require_ma20_up=False,
+                           min_rsi=0, max_rsi=100,
+                           pullback_confirm=False, pullback_days=3,
+                           pullback_max_pct=3.0):
+    """
+    箱体突破 + 站上MA60 入场策略（优化版）
+
+    入场条件:
+      ① 箱体: 最近 box_days 天内，价格在 [下沿, 上沿] 区间震荡
+      ② 窄幅: 振幅 <= box_max_range%
+      ③ 不破底: 低点 >= 箱体下沿
+      ④ 突破: 收盘价 > 箱体上沿，收阳线
+      ⑤ MA60: 突破日收盘站上60日均线
+      ⑥ 放量: 突破日量 >= 区间均量 x vol_expand_min
+      ⑦ (可选) MA20向上 / RSI过滤
+      ⑧ (可选) 回踩确认: 突破后N天内回踩不破箱体上沿
+      ⑨ 买入: 确认后次日开盘买
+    """
+    if len(bars) < box_days + 65:
+        return []
+
+    closes = [b["close"] for b in bars]
+    highs = [b["high"] for b in bars]
+    lows = [b["low"] for b in bars]
+    volumes = [b["volume"] for b in bars]
+
+    candidates = []
+
+    for i in range(box_days + 60, len(bars)):
+        ma60 = sum(closes[i-59:i+1]) / 60
+        ma20 = sum(closes[i-19:i+1]) / 20
+        ma20_prev = sum(closes[i-20:i]) / 20 if i >= 20 else ma20
+
+        # RSI(14)
+        if i >= 15:
+            gains = [max(closes[j] - closes[j-1], 0) for j in range(i-13, i+1)]
+            loss_list = [max(closes[j-1] - closes[j], 0) for j in range(i-13, i+1)]
+            avg_g = sum(gains) / 14
+            avg_l = sum(loss_list) / 14
+            rsi = 100 - 100 / (1 + avg_g / avg_l) if avg_l > 0 else 100
+        else:
+            rsi = 50
+
+        box_start = i - box_days
+        box_high = max(highs[box_start:i])
+        box_low = min(lows[box_start:i])
+        if box_low <= 0:
+            continue
+
+        box_range_pct = (box_high - box_low) / box_low * 100
+        if box_range_pct > box_max_range:
+            continue
+        if lows[i] < box_low:
+            continue
+        if closes[i] <= box_high:
+            continue
+        if i >= 1 and closes[i] <= closes[i-1]:
+            continue
+        if require_ma60 and closes[i] < ma60:
+            continue
+        if require_ma20_up and ma20 <= ma20_prev:
+            continue
+        if rsi < min_rsi or rsi > max_rsi:
+            continue
+
+        box_avg_vol = sum(volumes[box_start:i]) / box_days
+        vol_ratio = volumes[i] / box_avg_vol if box_avg_vol > 0 else 0
+        if vol_ratio < vol_expand_min:
+            continue
+
+        breakout_idx = i
+        breakout_close = closes[i]
+
+        # 回踩确认模式
+        if pullback_confirm:
+            confirmed = False
+            for j in range(i + 1, min(i + pullback_days + 1, len(bars))):
+                if lows[j] < box_high:
+                    confirmed = False
+                    break
+                if lows[j] >= box_high and closes[j] > closes[j-1]:
+                    confirmed = True
+                    i = j
+                    break
+            if not confirmed:
+                continue
+
+        entry_idx = i + 1
+        if entry_idx >= len(bars):
+            continue
+        entry_price = bars[entry_idx]["open"]
+        if entry_price <= 0:
+            continue
+
+        candidates.append({
+            "idx": i, "signal_date": bars[i]["time"],
+            "entry_price": entry_price, "entry_idx": entry_idx,
+            "entry_date": bars[entry_idx]["time"],
+            "box_high": round(box_high, 3), "box_low": round(box_low, 3),
+            "box_range_pct": round(box_range_pct, 2), "box_days": box_days,
+            "breakout_close": round(breakout_close, 3),
+            "vol_ratio": round(vol_ratio, 2), "ma60": round(ma60, 3),
+            "rsi": round(rsi, 1),
+            "close_vs_ma60": round((breakout_close / ma60 - 1) * 100, 2),
+            "pullback_confirmed": pullback_confirm,
+        })
+
+    daily_candidates = defaultdict(list)
+    for c in candidates:
+        daily_candidates[c["signal_date"]].append(c)
+
+    filtered = []
+    for date, cands in daily_candidates.items():
+        cands.sort(key=lambda c: (c["box_range_pct"], -c["vol_ratio"], abs(c.get("rsi", 50) - 50)))
+        filtered.extend(cands[:top_per_day])
+
+    trades = []
+    for c in filtered:
+        result = run_backtest(bars, c["entry_idx"], c["entry_price"],
+                              stop_loss_pct, trailing_pct, max_hold_days,
+                              take_profit_pct, trailing_activate_pct)
+        if not result:
+            continue
+
+        trades.append({
+            "code": code, "board": get_board_name(code),
+            "path": "box_breakout",
+            "path_label": "箱体回踩确认" if pullback_confirm else "箱体突破+MA60",
+            "signal_date": c["signal_date"], "signal_close": closes[c["idx"]],
+            "box_high": c["box_high"], "box_low": c["box_low"],
+            "box_range_pct": c["box_range_pct"], "box_days": c["box_days"],
+            "breakout_close": c["breakout_close"],
+            "vol_ratio_vs_pullback": c["vol_ratio"],
+            "ma60": c["ma60"], "rsi": c.get("rsi", 0),
+            "close_vs_ma60": c["close_vs_ma60"],
+            "entry_date": c["entry_date"],
+            "entry_price": round(c["entry_price"], 3),
+            "buy_mode": "pullback_confirm_next_open" if pullback_confirm else "box_breakout_next_open",
+            "neckline_high": c["box_high"], "neckline_gain_pct": c["box_range_pct"],
+            "first_trough_low": c["box_low"], "second_trough_low": c["box_low"],
+            "peak_high": c["box_high"], "peak_gain_pct": c["box_range_pct"],
+            "pullback_low": c["box_low"], "pullback_pct": 0,
+            "breakout_pct": round((c["breakout_close"] / c["box_high"] - 1) * 100, 2),
+            "accel_gain": 0, "accel_days": 0, "pullback_days": 0,
+            "wave1_days": 0, "wave2_days": 0, "wave3_days": 0, "wave_total_days": 0,
+            **result,
+        })
+
+    return trades
+
+
+# ================================================================
 # 测试股票列表
 # ================================================================
 TEST_CODES = [
-    "000066","000402","000553","000586","000601","000637","000720","000753","000767","000783",
-    "000925","000950","001208","001259","001316","002010","002011","002012","002013","002014",
-    "002015","002016","002017","002018","002019","002020","002021","002022","002023","002024",
-    "002025","002026","002027","002028","002029","002030","002031","002032","002033","002034",
-    "002035","002036","002037","002038","002039","002040","002041","002042","002043","002044",
-    "002045","002046","002047","002048","002049","002050","002055","002056","002063","002065",
-    "002074","002077","002079","002081","002084","002088","002092","002093","002095","002097",
-    "002100","002104","002106","002111","002115","002119","002120","002125","002127","002130",
-    "002131","002137","002139","002141","002146","002149","002150","002152","002153","002156",
-    "002158","002160","002163","002165","002169","002170","002172","002175","002177","002180",
-    "002183","002185","002188","002190","002191","002194","002196","002198","002200","002202",
-    "002208","002209","002211","002214","002218","002222","002227","002230","002232","002234",
-    "002236","002238","002240","002242","002244","002248","002249","002252","002253","002255",
-    "002258","002261","002263","002266","002268","002270","002272","002274","002276","002278",
-    "002280","002297","002366","002464","002468","002498","002510","002512","002535","002552",
-    "002560","002580","002640","002805","002858","002918","002989","300001","300002","300003",
-    "300004","300005","300006","300007","300008","300009","300010","300011","300012","300013",
-    "300014","300015","300016","300017","300018","300019","300020","300021","300022","300023",
-    "300024","300025","300026","300027","300028","300029","300030","300031","300032","300033",
-    "300034","300035","300036","300037","300038","300039","300059","300106","300124","300152",
+    # ── 沪主板 (60) ── 科技/制造/消费/医药
+    "600031","600048","600056","600066","600085","600089","600100",
+    "600104","600109","600111","600115","600132","600143","600150",
+    "600160","600161","600170","600176","600183","600184","600196",
+    "600201","600206","600216","600219","600233","600256","600260",
+    "600271","600276","600298","600309","600316","600329","600332",
+    "600346","600352","600362","600366","600372","600388","600392",
+    "600406","600418","600426","600436","600438","600460","600487",
+    "600489","600498","600507","600519","600521","600529","600557",
+    "600566","600570","600580","600584","600585","600588","600600",
+    "600660","600663","600690","600703","600737","600741","600745",
+    "600760","600765","600782","600809","600845","600862","600867",
+    "600885","600886","600893","600900","600918","601012","601066",
+    "601100","601111","601138","601155","601162","601168","601200",
+    "601211","601225","601231","601236","601238","601318","601336",
+    "601360","601390","601555","601577","601615","601618","601628",
+    "601633","601668","601669","601688","601698","601700","601766",
+    "601788","601799","601800","601808","601816","601818","601838",
+    "601858","601865","601868","601877","601881","601888","601899",
+    "601901","601916","601919","601933","601939","601958","601966",
+    "601985","601988","601989","601992","601998","603019","603056",
+    "603077","603087","603160","603185","603198","603228","603233",
+    "603259","603260","603288","603290","603345","603369","603392",
+    "603444","603486","603501","603515","603517","603568","603583",
+    "603596","603605","603613","603658","603659","603688","603707",
+    "603712","603719","603737","603799","603806","603816","603833",
+    "603858","603882","603883","603885","603893","603899","603960",
+    "603986","603993",
+    # ── 深主板 (00) ──
+    "000009","000012","000021","000027","000031","000039","000049",
+    "000060","000063","000066","000069","000078","000088","000100",
+    "000157","000333","000338","000400","000401","000408","000425",
+    "000513","000519","000528","000536","000537","000539","000547",
+    "000553","000559","000568","000581","000591","000596","000598",
+    "000601","000612","000623","000625","000630","000636","000651",
+    "000656","000661","000671","000683","000703","000709","000723",
+    "000725","000727","000733","000738","000768","000776","000778",
+    "000783","000786","000800","000807","000810","000811","000822",
+    "000825","000830","000831","000848","000858","000860","000876",
+    "000877","000878","000883","000893","000895","000898","000902",
+    "000905","000917","000930","000932","000938","000960","000963",
+    "000969","000970","000975","000977","000983","000987","000988",
+    "000998","001914","001979","002001","002002","002007","002008",
+    "002010","002013","002019","002024","002025","002027","002028",
+    "002030","002032","002035","002038","002044","002049","002050",
+    "002055","002056","002060","002064","002065","002074","002078",
+    "002080","002081","002092","002100","002110","002120","002127",
+    "002129","002131","002138","002142","002146","002152","002155",
+    "002156","002157","002163","002166","002170","002171","002174",
+    "002176","002179","002180","002185","002190","002191","002195",
+    "002196","002202","002203","002212","002214","002218","002221",
+    "002223","002227","002230","002233","002234","002236","002238",
+    "002241","002244","002249","002250","002252","002254","002255",
+    "002258","002261","002263","002266","002268","002270","002271",
+    "002273","002274","002276","002281","002285","002292","002294",
+    "002299","002304","002311","002312","002340","002352","002353",
+    "002371","002372","002375","002382","002385","002390","002399",
+    "002405","002407","002408","002409","002414","002415","002416",
+    "002419","002421","002430","002432","002436","002438","002439",
+    "002444","002456","002460","002463","002466","002468","002470",
+    "002475","002493","002497","002500","002505","002507","002511",
+    "002531","002555","002557","002568","002572","002594","002595",
+    "002600","002601","002602","002607","002624","002625","002643",
+    "002648","002653","002670","002673","002683","002709","002714",
+    "002736","002739","002745","002756","002761","002791","002797",
+    "002812","002821","002831","002841","002850","002867","002916",
+    "002920","002926","002938","002945","002966","002984","003816",
+    # ── 创业板 (300/301) ── 少量活跃股
+    "300003","300009","300012","300014","300015","300017","300024",
+    "300027","300033","300037","300042","300044","300058","300059",
+    "300070","300072","300073","300078","300088","300098","300115",
+    "300118","300122","300124","300130","300133","300136","300140",
+    "300142","300144","300146","300152","300166","300168","300170",
+    "300171","300176","300182","300188","300197","300207","300212",
+    "300223","300226","300233","300236","300244","300251","300253",
+    "300257","300271","300274","300284","300285","300296","300308",
+    "300315","300316","300323","300324","300327","300347","300357",
+    "300363","300373","300376","300383","300390","300394","300395",
+    "300398","300408","300413","300418","300433","300438","300442",
+    "300450","300454","300457","300459","300474","300482","300487",
+    "300496","300498","300502","300529","300558","300568","300595",
+    "300601","300618","300628","300630","300661","300676","300699",
+    "300724","300750","300760","300763","300769","300773","300782",
+    "300832","300841","300861","300866","300888","300896","301269",
 ]
 
 # ================================================================
@@ -542,7 +747,7 @@ if __name__ == "__main__":
                         help="洗盘缩量比例 (默认0.7)")
 
     # 突破参数
-    parser.add_argument("--vol-expand-min", type=float, default=1.0,
+    parser.add_argument("--vol-expand-min", type=float, default=1.5,
                         help="突破放量下限 (默认1.0)")
     parser.add_argument("--vol-expand-max", type=float, default=3.0,
                         help="突破放量上限 (默认3.0)")
@@ -562,6 +767,24 @@ if __name__ == "__main__":
                         help="启用波段周期过滤 (默认关闭)")
     parser.add_argument("--require-ma60", action="store_true", default=False,
                         help="要求站上60日均线 (默认关闭)")
+    parser.add_argument("--peak-break", action="store_true", default=False,
+                        help="启用箱体突破+站上MA60入场规则 (默认关闭)")
+    parser.add_argument("--box-days", type=int, default=20,
+                        help="箱体整理天数 (默认20)")
+    parser.add_argument("--box-max-range", type=float, default=10.0,
+                        help="箱体最大振幅%% (默认10.0, 越窄越好)")
+    parser.add_argument("--require-ma20-up", action="store_true", default=False,
+                        help="要求MA20向上 (默认关闭)")
+    parser.add_argument("--min-rsi", type=float, default=0,
+                        help="RSI下限 (默认0)")
+    parser.add_argument("--max-rsi", type=float, default=100,
+                        help="RSI上限 (默认100)")
+    parser.add_argument("--pullback-confirm", action="store_true", default=False,
+                        help="启用突破后回踩确认模式 (默认关闭)")
+    parser.add_argument("--pullback-days", type=int, default=3,
+                        help="回踩确认天数 (默认3)")
+    parser.add_argument("--box-min-bars", type=int, default=10,
+                        help="箱体内最少K线数 (默认10)")
     parser.add_argument("--wave1-min", type=int, default=3,
                         help="第一波最小天数 (默认3)")
     parser.add_argument("--wave1-max", type=int, default=15,
@@ -578,7 +801,7 @@ if __name__ == "__main__":
                         help="回踩/第一波最大比例 (默认1.0)")
 
     # 出场参数
-    parser.add_argument("--stop-loss", type=float, default=5.0,
+    parser.add_argument("--stop-loss", type=float, default=12.0,
                         help="固定止损%% (默认5.0, 主板自动用8%%)")
     parser.add_argument("--trailing-pct", type=float, default=5.0,
                         help="跟踪止损回撤%% (默认5.0)")
@@ -586,7 +809,7 @@ if __name__ == "__main__":
                         help="跟踪止损激活门槛%% (默认5.0)")
     parser.add_argument("--take-profit", type=float, default=15.0,
                         help="止盈%% (默认15.0)")
-    parser.add_argument("--max-hold", type=int, default=15,
+    parser.add_argument("--max-hold", type=int, default=10,
                         help="最大持仓天数 (默认15)")
     parser.add_argument("--board-adaptive", action="store_true", default=True,
                         help="板块自适应参数 (默认开启)")
@@ -619,6 +842,11 @@ if __name__ == "__main__":
     print(f"  ⑤ 加速确认: 突破后{args.accel_days}天继续涨>={args.accel_min_pct}%")
     if args.require_ma60:
         print(f"  ⑥ MA60过滤: 要求站上60日均线")
+    if args.peak_break:
+        pb = " + 回踩确认" if args.pullback_confirm else ""
+        ma20 = " + MA20向上" if args.require_ma20_up else ""
+        rsi_s = f" + RSI{args.min_rsi:.0f}-{args.max_rsi:.0f}" if args.max_rsi < 100 else ""
+        print(f"  ⑦ 箱体突破: {args.box_days}日箱体, 振幅<={args.box_max_range}%, 放量>={args.vol_expand_min}x, 站上MA60{pb}{ma20}{rsi_s}")
     print(f"出场条件:")
     print(f"  ① 止盈: {args.take_profit}%")
     print(f"  ② 止损: {args.stop_loss}%")
@@ -677,6 +905,31 @@ if __name__ == "__main__":
             wave_ratio_max=args.wave_ratio_max if args.wave_filter else 10.0,
             require_ma60=args.require_ma60,
         )
+
+        # 箱体突破+站上MA60
+        if args.peak_break:
+            trades2 = strategy_peak_breakout(
+                bars, code,
+                box_days=args.box_days,
+                box_max_range=args.box_max_range,
+                box_min_bars=args.box_min_bars,
+                vol_expand_min=args.vol_expand_min,
+                vol_expand_max=args.vol_expand_max,
+                stop_loss_pct=_stop_loss,
+                trailing_pct=args.trailing_pct,
+                trailing_activate_pct=args.trailing_activate,
+                take_profit_pct=args.take_profit,
+                max_hold_days=args.max_hold,
+                top_per_day=args.top_per_day,
+                require_ma60=True,
+                require_ma20_up=args.require_ma20_up,
+                min_rsi=args.min_rsi,
+                max_rsi=args.max_rsi,
+                pullback_confirm=args.pullback_confirm,
+                pullback_days=args.pullback_days,
+            )
+            trades.extend(trades2)
+
         all_trades.extend(trades)
 
         if trades:
@@ -698,6 +951,13 @@ if __name__ == "__main__":
             seg = [t for t in all_trades if t['board'] == board]
             if seg:
                 print_stats(seg, board)
+
+        # 按策略路径统计
+        print(f"\n--- 策略路径统计 ---")
+        for path_label in sorted(set(t.get('path_label', t.get('path', '')) for t in all_trades)):
+            seg = [t for t in all_trades if t.get('path_label', t.get('path', '')) == path_label]
+            if seg:
+                print_stats(seg, path_label)
 
         # 按出场原因统计
         print(f"\n--- 出场原因统计 ---")
