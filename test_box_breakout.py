@@ -1,36 +1,34 @@
 #!/usr/bin/env python3
 """
-经典 W 底（双底）突破策略 - 独立回测
+箱体突破 + 站上MA60 策略 - 独立回测
 
 ═══════════════════════════════════════════════════════════════════
-  W 底形态
+  箱体突破形态
 ═══════════════════════════════════════════════════════════════════
 
-               颈线 (neckline)
-          ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
-         /\\              突破↑
-        /  \\            /    \\
-       /    \\    W     /      \\  → 加速上涨
-      /      \\        /        \\
-     /        \\      /          \\
-    第一底    第二底
-    (最低点)  (回踩不破第一底)
+          箱体上沿 ─ ─ ─ ─ ─ ─ ─ 突破↑
+         /─────────\\         /──────\\  → 上涨
+        /           \\       /
+       /             \\     /
+      /───────────────\\───/
+          箱体下沿
 
-  ① 第一底: lookback 内最低点
-  ② 颈线: 从第一底反弹到局部高点，涨幅 peak_min_pct~peak_max_pct%
-  ③ 第二底: 回踩洗盘，低点 >= 第一底（核心条件！）
-  ④ 突破颈线: 放量突破
-  ⑤ 加速确认: 突破后继续上涨 N 天
-  ⑥ 买入: 加速确认后次日开盘买
+  ① 箱体: 最近N天内价格在 [下沿, 上沿] 区间震荡
+  ② 窄幅: 振幅 <= box_max_range%
+  ③ 突破: 收盘价 > 箱体上沿，收阳线
+  ④ MA60: 突破日收盘站上60日均线
+  ⑤ 放量: 突破日量 >= 区间均量 x vol_expand_min
+  ⑥ (可选) MACD柱过滤 / RSI过滤 / MA20向上
+  ⑦ 买入: 确认后次日开盘买
 
 ═══════════════════════════════════════════════════════════════════
   使用方法
 ═══════════════════════════════════════════════════════════════════
 
-  python test_box_breakout.py
-  python test_box_breakout.py --accel-days 1
-  python test_box_breakout.py --w-bottom-tolerance 3.0
-  python test_box_breakout.py --all-trades
+  python test_box_breakout.py --require-ma60
+  python test_box_breakout.py --require-ma60 --min-macd-hist 0.5
+  python test_box_breakout.py --require-ma60 --min-rsi 50 --max-rsi 80
+  python test_box_breakout.py --require-ma60 --pullback-confirm
 """
 from __future__ import annotations
 import json, time, argparse, os, sys
@@ -172,295 +170,17 @@ def run_backtest(bars, entry_idx, entry_price, stop_loss_pct=5.0,
     }
 
 # ================================================================
-# W 底策略
-# ================================================================
-def strategy_w_bottom(bars, code,
-                      lookback=60, peak_min_pct=5.0, peak_max_pct=20.0,
-                      peak_within_days=45, min_pullback_days=3,
-                      pullback_min_pct=2.0, pullback_max_pct=8.0,
-                      vol_shrink_ratio=0.7,
-                      vol_expand_min=1.0, vol_expand_max=3.0,
-                      w_bottom_tolerance=2.0,
-                      stop_loss_pct=5.0, trailing_pct=5.0,
-                      trailing_activate_pct=5.0, take_profit_pct=15.0,
-                      max_hold_days=15, top_per_day=2,
-                      accel_days=2, accel_min_pct=1.5,
-                      wave1_min=3, wave1_max=15,
-                      wave2_min=3, wave2_max=15,
-                      wave3_min=1, wave3_max=10,
-                      wave_ratio_max=1.0,
-                      require_ma60=True):
-    """
-    经典 W 底（双底）突破 + 加速确认策略
-
-    入场条件:
-      ① 第一底: lookback 内最低点
-      ② 颈线: 第一底反弹后的局部高点，涨幅 peak_min_pct~peak_max_pct%
-      ③ 第二底: 回踩不破第一底（W底核心！容差 w_bottom_tolerance%）
-      ④ 突破颈线: 放量突破，收阳线
-      ⑤ 加速确认: 突破后 accel_days 天继续上涨，累计 >= accel_min_pct%
-      ⑥ 买入: 加速确认后次日开盘买
-
-    出场条件:
-      ① 止盈: take_profit_pct%
-      ② 固定止损: stop_loss_pct%
-      ③ 跟踪止损: trailing_activate_pct% 后回撤 trailing_pct%
-      ④ 持仓上限: max_hold_days 天
-    """
-    if len(bars) < lookback + accel_days + 10:
-        return []
-
-    closes = [b['close'] for b in bars]
-    highs = [b['high'] for b in bars]
-    lows = [b['low'] for b in bars]
-    volumes = [b['volume'] for b in bars]
-
-    candidates = []
-
-    for i in range(lookback + accel_days, len(bars)):
-        breakout_idx = i - accel_days
-        if breakout_idx < lookback:
-            continue
-
-        # ══════════════════════════════════════════════════════════
-        # ① 找第一底 + 颈线
-        # ══════════════════════════════════════════════════════════
-        w_start = max(0, breakout_idx - lookback)
-        if breakout_idx - w_start < 10:
-            continue
-
-        # 第一底：区间最低点
-        first_trough_idx = w_start
-        first_trough_low = lows[w_start]
-        for j in range(w_start, breakout_idx - 3):
-            if lows[j] < first_trough_low:
-                first_trough_low = lows[j]
-                first_trough_idx = j
-
-        if first_trough_low <= 0:
-            continue
-
-        # 颈线：第一底之后到 breakout_idx 之间的局部高点
-        neckline_high = 0
-        neckline_idx = first_trough_idx
-        for j in range(first_trough_idx + 1, breakout_idx):
-            if highs[j] > neckline_high:
-                neckline_high = highs[j]
-                neckline_idx = j
-
-        if neckline_high <= first_trough_low:
-            continue
-
-        # 颈线涨幅检查
-        neckline_gain_pct = (neckline_high / first_trough_low - 1) * 100
-        if neckline_gain_pct < peak_min_pct or neckline_gain_pct > peak_max_pct:
-            continue
-
-        # 颈线距 breakout_idx 不能太远
-        if breakout_idx - neckline_idx > peak_within_days:
-            continue
-
-        # ══════════════════════════════════════════════════════════
-        # 波段周期过滤
-        # ══════════════════════════════════════════════════════════
-        wave1_days = neckline_idx - first_trough_idx  # 第一波: 第一底→颈线
-        if wave1_days < wave1_min or wave1_days > wave1_max:
-            continue
-
-        # ══════════════════════════════════════════════════════════
-        # ② 第二底：回踩不破第一底（W 底核心条件）
-        # ══════════════════════════════════════════════════════════
-        second_trough_low = lows[neckline_idx]
-        second_trough_idx = neckline_idx
-        for j in range(neckline_idx + 1, breakout_idx):
-            if lows[j] < second_trough_low:
-                second_trough_low = lows[j]
-                second_trough_idx = j
-
-        # 关键：第二底不能跌破第一底（允许 w_bottom_tolerance% 容差）
-        if second_trough_low < first_trough_low * (1 - w_bottom_tolerance / 100):
-            continue
-
-        # 第二底到 breakout 之间要有足够的洗盘天数
-        pullback_days = breakout_idx - neckline_idx
-        if pullback_days < min_pullback_days:
-            continue
-
-        # 回踩周期过滤: 颈线→第二底
-        wave2_days = second_trough_idx - neckline_idx
-        if wave2_days < wave2_min or wave2_days > wave2_max:
-            continue
-
-        # 蓄力周期过滤: 第二底→突破
-        wave3_days = breakout_idx - second_trough_idx
-        if wave3_days < wave3_min or wave3_days > wave3_max:
-            continue
-
-        # 回踩/第一波比例过滤: 回踩应该比第一波短
-        if wave1_days > 0 and wave2_days / wave1_days > wave_ratio_max:
-            continue
-
-        # 洗盘缩量
-        pullback_bars_list = bars[neckline_idx + 1:breakout_idx]
-        if len(pullback_bars_list) > 0:
-            pullback_avg_vol = sum(b['volume'] for b in pullback_bars_list) / len(pullback_bars_list)
-        else:
-            pullback_avg_vol = bars[neckline_idx]['volume'] * 0.5
-
-        neckline_vol = bars[neckline_idx]['volume']
-        if neckline_vol > 0 and pullback_avg_vol > neckline_vol * vol_shrink_ratio:
-            continue
-
-        # ══════════════════════════════════════════════════════════
-        # ③ 突破颈线
-        # ══════════════════════════════════════════════════════════
-        if bars[breakout_idx]['close'] <= neckline_high:
-            continue
-
-        # 突破日收阳线
-        if breakout_idx >= 1 and bars[breakout_idx]['close'] <= bars[breakout_idx - 1]['close']:
-            continue
-
-        # 放量确认
-        vol_ratio = bars[breakout_idx]['volume'] / pullback_avg_vol if pullback_avg_vol > 0 else 0
-        if vol_ratio < vol_expand_min or vol_ratio > vol_expand_max:
-            continue
-
-        # ══════════════════════════════════════════════════════════
-        # ④ 加速确认
-        # ══════════════════════════════════════════════════════════
-        # 突破后不跌破颈线
-        accel_low = min(bars[j]['low'] for j in range(breakout_idx, i + 1))
-        if accel_low < neckline_high * 0.98:
-            continue
-
-        # 累计涨幅
-        accel_gain = (bars[i]['close'] / bars[breakout_idx]['close'] - 1) * 100
-        if accel_gain < accel_min_pct:
-            continue
-
-        # 突破后第1天收盘 > 突破日收盘
-        if accel_days >= 1 and i > breakout_idx:
-            if bars[breakout_idx + 1]['close'] <= bars[breakout_idx]['close']:
-                continue
-
-        # 量能不爆量
-        accel_avg_vol = sum(bars[j]['volume'] for j in range(breakout_idx, i + 1)) / (accel_days + 1)
-        if pullback_avg_vol > 0 and accel_avg_vol > pullback_avg_vol * vol_expand_max * 1.5:
-            continue
-
-        # 突破幅度
-        breakout_pct = (bars[breakout_idx]['close'] / neckline_high - 1) * 100
-
-        # ══════════════════════════════════════════════════════════
-        # MA60过滤（可选）
-        # ══════════════════════════════════════════════════════════
-        if require_ma60 and i >= 60:
-            ma60 = sum(closes[i-59:i+1]) / 60
-            if closes[i] < ma60:
-                continue
-
-        # ══════════════════════════════════════════════════════════
-        # ⑤ 买入：加速确认后次日开盘买
-        # ══════════════════════════════════════════════════════════
-        entry_idx = i + 1
-        if entry_idx >= len(bars):
-            continue
-        entry_price = bars[entry_idx]['open']
-        if entry_price <= 0:
-            continue
-
-        candidates.append({
-            'idx': i,
-            'signal_date': bars[i]['time'],
-            'entry_price': entry_price,
-            'entry_idx': entry_idx,
-            'entry_date': bars[entry_idx]['time'],
-            'first_trough_low': round(first_trough_low, 3),
-            'neckline_high': round(neckline_high, 3),
-            'neckline_gain_pct': round(neckline_gain_pct, 2),
-            'second_trough_low': round(second_trough_low, 3),
-            'pullback_days': pullback_days,
-            'breakout_close': bars[breakout_idx]['close'],
-            'breakout_pct': round(breakout_pct, 2),
-            'vol_ratio_vs_pullback': round(vol_ratio, 2),
-            'accel_gain': round(accel_gain, 2),
-            'accel_days': accel_days,
-            'wave1_days': wave1_days,
-            'wave2_days': wave2_days,
-            'wave3_days': wave3_days,
-            'wave_total_days': wave1_days + wave2_days + wave3_days,
-            # 兼容旧字段名
-            'peak_high': round(neckline_high, 3),
-            'peak_gain_pct': round(neckline_gain_pct, 2),
-        })
-
-    # 同一天按优先级排序
-    daily_candidates = defaultdict(list)
-    for c in candidates:
-        daily_candidates[c['signal_date']].append(c)
-
-    filtered = []
-    for date, cands in daily_candidates.items():
-        cands.sort(key=lambda c: (
-            -c['accel_gain'],
-            -c['breakout_pct'],
-            -c['vol_ratio_vs_pullback'],
-            c['pullback_days'],
-        ))
-        filtered.extend(cands[:top_per_day])
-
-    # 生成交易记录
-    trades = []
-    for c in filtered:
-        result = run_backtest(bars, c['entry_idx'], c['entry_price'],
-                              stop_loss_pct, trailing_pct, max_hold_days,
-                              take_profit_pct, trailing_activate_pct)
-        if not result:
-            continue
-
-        trades.append({
-            'code': code,
-            'board': get_board_name(code),
-            'path': 'w_bottom',
-            'path_label': 'W底突破(加速版)',
-            'signal_date': c['signal_date'],
-            'signal_close': closes[c['idx']],
-            'first_trough_low': c['first_trough_low'],
-            'peak_high': c['neckline_high'],
-            'neckline_high': c['neckline_high'],
-            'neckline_gain_pct': c['neckline_gain_pct'],
-            'second_trough_low': c['second_trough_low'],
-            'peak_gain_pct': c['neckline_gain_pct'],
-            'pullback_days': c['pullback_days'],
-            'breakout_close': c['breakout_close'],
-            'breakout_pct': c['breakout_pct'],
-            'vol_ratio_vs_pullback': c['vol_ratio_vs_pullback'],
-            'accel_gain': c['accel_gain'],
-            'accel_days': c['accel_days'],
-            'wave1_days': c['wave1_days'],
-            'wave2_days': c['wave2_days'],
-            'wave3_days': c['wave3_days'],
-            'wave_total_days': c['wave_total_days'],
-            'entry_date': c['entry_date'],
-            'entry_price': round(c['entry_price'], 3),
-            'buy_mode': 'accel_confirm_next_open',
-            **result,
-        })
-
-    return trades
-
-# ================================================================
 # 箱体突破 + 站上MA60 策略
 # ================================================================
 def strategy_peak_breakout(bars, code,
-                           box_days=25, box_max_range=10.0, box_min_bars=10,
+                           box_days=25, box_max_range=15.0, box_min_range=0.0, box_min_bars=10,
                            vol_expand_min=1.5, vol_expand_max=3.0,
                            stop_loss_pct=12.0, trailing_pct=5.0,
                            trailing_activate_pct=5.0, take_profit_pct=15.0,
                            max_hold_days=10, top_per_day=2,
                            require_ma60=True, require_ma20_up=False,
                            min_rsi=0, max_rsi=100,
+                           min_macd_hist=0.0,
                            pullback_confirm=False, pullback_days=3,
                            pullback_max_pct=3.0):
     """
@@ -473,7 +193,7 @@ def strategy_peak_breakout(bars, code,
       ④ 突破: 收盘价 > 箱体上沿，收阳线
       ⑤ MA60: 突破日收盘站上60日均线
       ⑥ 放量: 突破日量 >= 区间均量 x vol_expand_min
-      ⑦ (可选) MA20向上 / RSI过滤
+      ⑦ (可选) MA20向上 / RSI过滤 / MACD柱过滤
       ⑧ (可选) 回踩确认: 突破后N天内回踩不破箱体上沿
       ⑨ 买入: 确认后次日开盘买
     """
@@ -484,6 +204,22 @@ def strategy_peak_breakout(bars, code,
     highs = [b["high"] for b in bars]
     lows = [b["low"] for b in bars]
     volumes = [b["volume"] for b in bars]
+
+    # ── 预计算 MACD(12,26,9) ──
+    ema12 = [0.0] * len(closes)
+    ema26 = [0.0] * len(closes)
+    dif = [0.0] * len(closes)
+    dea = [0.0] * len(closes)
+    macd_hist = [0.0] * len(closes)
+    if len(closes) >= 26:
+        ema12[0] = closes[0]
+        ema26[0] = closes[0]
+        for t in range(1, len(closes)):
+            ema12[t] = ema12[t-1] + 2/13 * (closes[t] - ema12[t-1])
+            ema26[t] = ema26[t-1] + 2/27 * (closes[t] - ema26[t-1])
+            dif[t] = ema12[t] - ema26[t]
+            dea[t] = dea[t-1] + 2/10 * (dif[t] - dea[t-1]) if t > 0 else dif[t]
+            macd_hist[t] = 2 * (dif[t] - dea[t])
 
     candidates = []
 
@@ -511,6 +247,8 @@ def strategy_peak_breakout(bars, code,
         box_range_pct = (box_high - box_low) / box_low * 100
         if box_range_pct > box_max_range:
             continue
+        if box_range_pct < box_min_range:
+            continue
         if lows[i] < box_low:
             continue
         if closes[i] <= box_high:
@@ -522,6 +260,10 @@ def strategy_peak_breakout(bars, code,
         if require_ma20_up and ma20 <= ma20_prev:
             continue
         if rsi < min_rsi or rsi > max_rsi:
+            continue
+
+        # MACD柱过滤
+        if min_macd_hist > 0 and macd_hist[i] < min_macd_hist:
             continue
 
         box_avg_vol = sum(volumes[box_start:i]) / box_days
@@ -562,6 +304,7 @@ def strategy_peak_breakout(bars, code,
             "breakout_close": round(breakout_close, 3),
             "vol_ratio": round(vol_ratio, 2), "ma60": round(ma60, 3),
             "rsi": round(rsi, 1),
+            "macd_hist": round(macd_hist[i], 4),
             "close_vs_ma60": round((breakout_close / ma60 - 1) * 100, 2),
             "pullback_confirmed": pullback_confirm,
         })
@@ -593,6 +336,7 @@ def strategy_peak_breakout(bars, code,
             "breakout_close": c["breakout_close"],
             "vol_ratio_vs_pullback": c["vol_ratio"],
             "ma60": c["ma60"], "rsi": c.get("rsi", 0),
+            "macd_hist": c.get("macd_hist", 0),
             "close_vs_ma60": c["close_vs_ma60"],
             "entry_date": c["entry_date"],
             "entry_price": round(c["entry_price"], 3),
@@ -720,85 +464,43 @@ def print_stats(trades, label):
 # 主流程
 # ================================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="W底突破策略 独立回测")
+    parser = argparse.ArgumentParser(description="箱体突破 + 站上MA60 策略 独立回测")
     parser.add_argument("--codes", default="", help="逗号分隔的股票代码")
     parser.add_argument("--days", type=int, default=300, help="加载K线天数 (默认300)")
     parser.add_argument("--source", choices=["manual", "db"], default="manual",
                         help="数据源: manual(默认), db")
 
-    # W底参数
-    parser.add_argument("--lookback", type=int, default=60,
-                        help="回看窗口 (默认60)")
-    parser.add_argument("--peak-min-pct", type=float, default=5.0,
-                        help="颈线最小涨幅%% (默认5.0)")
-    parser.add_argument("--peak-max-pct", type=float, default=20.0,
-                        help="颈线最大涨幅%% (默认20.0)")
-    parser.add_argument("--peak-within-days", type=int, default=45,
-                        help="颈线距今最大天数 (默认45)")
-
-    # 洗盘参数
-    parser.add_argument("--min-pullback-days", type=int, default=3,
-                        help="最小洗盘天数 (默认3)")
-    parser.add_argument("--pullback-min-pct", type=float, default=2.0,
-                        help="洗盘最小回调幅度%% (默认2.0)")
-    parser.add_argument("--pullback-max-pct", type=float, default=8.0,
-                        help="洗盘最大回调幅度%% (默认8.0)")
-    parser.add_argument("--vol-shrink-ratio", type=float, default=0.7,
-                        help="洗盘缩量比例 (默认0.7)")
-
     # 突破参数
     parser.add_argument("--vol-expand-min", type=float, default=1.5,
-                        help="突破放量下限 (默认1.0)")
+                        help="突破放量下限 (默认1.5)")
     parser.add_argument("--vol-expand-max", type=float, default=3.0,
                         help="突破放量上限 (默认3.0)")
 
-    # W底核心参数
-    parser.add_argument("--w-bottom-tolerance", type=float, default=2.0,
-                        help="第二底跌破第一底的容差%% (默认2.0)")
-
-    # 加速确认
-    parser.add_argument("--accel-days", type=int, default=2,
-                        help="加速确认天数 (默认2)")
-    parser.add_argument("--accel-min-pct", type=float, default=1.5,
-                        help="加速期间最小累计涨幅%% (默认1.5)")
-
-    # 波段周期过滤
-    parser.add_argument("--wave-filter", action="store_true", default=False,
-                        help="启用波段周期过滤 (默认关闭)")
-    parser.add_argument("--require-ma60", action="store_true", default=False,
-                        help="要求站上60日均线 (默认关闭)")
-    parser.add_argument("--peak-break", action="store_true", default=False,
-                        help="启用箱体突破+站上MA60入场规则 (默认关闭)")
+    # 箱体参数
     parser.add_argument("--box-days", type=int, default=20,
                         help="箱体整理天数 (默认20)")
-    parser.add_argument("--box-max-range", type=float, default=10.0,
-                        help="箱体最大振幅%% (默认10.0, 越窄越好)")
+    parser.add_argument("--box-max-range", type=float, default=15.0,
+                        help="箱体最大振幅%% (默认15.0)")
+    parser.add_argument("--box-min-range", type=float, default=0.0,
+                        help="箱体最小振幅%% (默认0, 建议8)")
+    parser.add_argument("--box-min-bars", type=int, default=10,
+                        help="箱体内最少K线数 (默认10)")
+
+    # 过滤参数
+    parser.add_argument("--require-ma60", action="store_true", default=False,
+                        help="要求站上60日均线 (默认关闭)")
     parser.add_argument("--require-ma20-up", action="store_true", default=False,
                         help="要求MA20向上 (默认关闭)")
     parser.add_argument("--min-rsi", type=float, default=0,
                         help="RSI下限 (默认0)")
     parser.add_argument("--max-rsi", type=float, default=100,
                         help="RSI上限 (默认100)")
+    parser.add_argument("--min-macd-hist", type=float, default=0,
+                        help="MACD柱最小值过滤 (默认0, 建议0.5)")
     parser.add_argument("--pullback-confirm", action="store_true", default=False,
                         help="启用突破后回踩确认模式 (默认关闭)")
     parser.add_argument("--pullback-days", type=int, default=3,
                         help="回踩确认天数 (默认3)")
-    parser.add_argument("--box-min-bars", type=int, default=10,
-                        help="箱体内最少K线数 (默认10)")
-    parser.add_argument("--wave1-min", type=int, default=3,
-                        help="第一波最小天数 (默认3)")
-    parser.add_argument("--wave1-max", type=int, default=15,
-                        help="第一波最大天数 (默认15)")
-    parser.add_argument("--wave2-min", type=int, default=1,
-                        help="回踩最小天数 (默认1)")
-    parser.add_argument("--wave2-max", type=int, default=10,
-                        help="回踩最大天数 (默认10)")
-    parser.add_argument("--wave3-min", type=int, default=1,
-                        help="蓄力最小天数 (默认1)")
-    parser.add_argument("--wave3-max", type=int, default=8,
-                        help="蓄力最大天数 (默认8)")
-    parser.add_argument("--wave-ratio-max", type=float, default=1.0,
-                        help="回踩/第一波最大比例 (默认1.0)")
 
     # 出场参数
     parser.add_argument("--stop-loss", type=float, default=12.0,
@@ -832,21 +534,22 @@ if __name__ == "__main__":
         print(f"   全市场: {len(codes)} 只股票")
 
     print(f"{'=' * 80}")
-    print(f"W底（双底）突破策略 独立回测")
+    print(f"箱体突破 + 站上MA60 策略 独立回测")
     print(f"{'=' * 80}")
     print(f"入场条件:")
-    print(f"  ① 第一底: 前{args.lookback}日内最低点")
-    print(f"  ② 颈线: 从第一底反弹 {args.peak_min_pct}%~{args.peak_max_pct}%")
-    print(f"  ③ 第二底: 回踩不破第一底（容差{args.w_bottom_tolerance}%）, 洗盘>={args.min_pullback_days}天")
-    print(f"  ④ 突破颈线: 温和放量{args.vol_expand_min}x~{args.vol_expand_max}x")
-    print(f"  ⑤ 加速确认: 突破后{args.accel_days}天继续涨>={args.accel_min_pct}%")
+    print(f"  ① 箱体: {args.box_days}日内价格在区间震荡, 振幅{args.box_min_range}%~{args.box_max_range}%")
+    print(f"  ② 突破: 收盘价>箱体上沿, 收阳线")
     if args.require_ma60:
-        print(f"  ⑥ MA60过滤: 要求站上60日均线")
-    if args.peak_break:
-        pb = " + 回踩确认" if args.pullback_confirm else ""
-        ma20 = " + MA20向上" if args.require_ma20_up else ""
-        rsi_s = f" + RSI{args.min_rsi:.0f}-{args.max_rsi:.0f}" if args.max_rsi < 100 else ""
-        print(f"  ⑦ 箱体突破: {args.box_days}日箱体, 振幅<={args.box_max_range}%, 放量>={args.vol_expand_min}x, 站上MA60{pb}{ma20}{rsi_s}")
+        print(f"  ③ MA60: 突破日收盘站上60日均线")
+    print(f"  ④ 放量: 突破日量>=区间均量x{args.vol_expand_min}")
+    if args.min_macd_hist > 0:
+        print(f"  ⑤ MACD柱>={args.min_macd_hist}")
+    if args.require_ma20_up:
+        print(f"  ⑥ MA20向上")
+    if args.min_rsi > 0 or args.max_rsi < 100:
+        print(f"  ⑦ RSI {args.min_rsi:.0f}-{args.max_rsi:.0f}")
+    if args.pullback_confirm:
+        print(f"  ⑧ 回踩确认: 突破后{args.pullback_days}天内不破箱体上沿")
     print(f"出场条件:")
     print(f"  ① 止盈: {args.take_profit}%")
     print(f"  ② 止损: {args.stop_loss}%")
@@ -865,70 +568,32 @@ if __name__ == "__main__":
         # 板块自适应参数
         board = get_board_name(code)
         if args.board_adaptive and board in ('沪主板', '深主板'):
-            # 主板10%涨跌停: 放宽止损, 更严格加速确认
             _stop_loss = 8.0
-            _accel_days = max(args.accel_days, 3)
-            _accel_min_pct = max(args.accel_min_pct, 3.0)
         else:
-            # 创/科板20%涨跌停: 用默认参数
             _stop_loss = args.stop_loss
-            _accel_days = args.accel_days
-            _accel_min_pct = args.accel_min_pct
 
-        trades = strategy_w_bottom(
+        trades = strategy_peak_breakout(
             bars, code,
-            lookback=args.lookback,
-            peak_min_pct=args.peak_min_pct,
-            peak_max_pct=args.peak_max_pct,
-            peak_within_days=args.peak_within_days,
-            min_pullback_days=args.min_pullback_days,
-            pullback_min_pct=args.pullback_min_pct,
-            pullback_max_pct=args.pullback_max_pct,
-            vol_shrink_ratio=args.vol_shrink_ratio,
+            box_days=args.box_days,
+            box_max_range=args.box_max_range,
+            box_min_range=args.box_min_range,
+            box_min_bars=args.box_min_bars,
             vol_expand_min=args.vol_expand_min,
             vol_expand_max=args.vol_expand_max,
-            w_bottom_tolerance=args.w_bottom_tolerance,
             stop_loss_pct=_stop_loss,
             trailing_pct=args.trailing_pct,
             trailing_activate_pct=args.trailing_activate,
             take_profit_pct=args.take_profit,
             max_hold_days=args.max_hold,
             top_per_day=args.top_per_day,
-            accel_days=_accel_days,
-            accel_min_pct=_accel_min_pct,
-            wave1_min=args.wave1_min if args.wave_filter else 1,
-            wave1_max=args.wave1_max if args.wave_filter else 100,
-            wave2_min=args.wave2_min if args.wave_filter else 1,
-            wave2_max=args.wave2_max if args.wave_filter else 100,
-            wave3_min=args.wave3_min if args.wave_filter else 1,
-            wave3_max=args.wave3_max if args.wave_filter else 100,
-            wave_ratio_max=args.wave_ratio_max if args.wave_filter else 10.0,
-            require_ma60=args.require_ma60,
+            require_ma60=True,
+            require_ma20_up=args.require_ma20_up,
+            min_rsi=args.min_rsi,
+            max_rsi=args.max_rsi,
+            min_macd_hist=args.min_macd_hist,
+            pullback_confirm=args.pullback_confirm,
+            pullback_days=args.pullback_days,
         )
-
-        # 箱体突破+站上MA60
-        if args.peak_break:
-            trades2 = strategy_peak_breakout(
-                bars, code,
-                box_days=args.box_days,
-                box_max_range=args.box_max_range,
-                box_min_bars=args.box_min_bars,
-                vol_expand_min=args.vol_expand_min,
-                vol_expand_max=args.vol_expand_max,
-                stop_loss_pct=_stop_loss,
-                trailing_pct=args.trailing_pct,
-                trailing_activate_pct=args.trailing_activate,
-                take_profit_pct=args.take_profit,
-                max_hold_days=args.max_hold,
-                top_per_day=args.top_per_day,
-                require_ma60=True,
-                require_ma20_up=args.require_ma20_up,
-                min_rsi=args.min_rsi,
-                max_rsi=args.max_rsi,
-                pullback_confirm=args.pullback_confirm,
-                pullback_days=args.pullback_days,
-            )
-            trades.extend(trades2)
 
         all_trades.extend(trades)
 

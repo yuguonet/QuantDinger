@@ -193,33 +193,41 @@ def prescreen() -> Dict[str, Any]:
     # 强势股 + 热榜（东财搜索，与前端卡片一致）
     strong_stocks = _fetch_strong_stocks_em()
     hot_stocks = _fetch_hot_stocks_em()
-    for s in strong_stocks[:10]:
+
+    # 归一化处理：按排名线性插值，排名越前分数越高
+    # 强势股: rank 0 → 100, rank N-1 → 50
+    for rank, s in enumerate(strong_stocks[:100]):
         code = s.get("code", "")
         if code and not any(c["code"] == code for c in candidates):
+            n = min(len(strong_stocks), 100)
+            score = round(100 - 50 * rank / max(n - 1, 1), 1)
             candidates.append({
                 "code": code, "name": s.get("name", ""),
                 "change_pct": s.get("change_rate", 0),
                 "turnover_pct": s.get("turnoverrate", 0),
                 "close": s.get("new_price", 0), "high": 0,
                 "close_to_high": 0, "vol_ratio": 0, "rsi": 0,
-                "reason": "强势股", "eod_score": 60,
-                "signals": ["强势股"],
+                "reason": "强势股", "eod_score": score,
+                "signals": [f"强势股(rank#{rank+1})"],
                 "source": "强势股",
-                "evaluation": {"score": 60, "highlights": ["强势股"], "warnings": []},
+                "evaluation": {"score": score, "highlights": ["强势股"], "warnings": []},
             })
-    for s in hot_stocks[:10]:
+    # 热榜: rank 0 → 95, rank N-1 → 45
+    for rank, s in enumerate(hot_stocks[:100]):
         code = s.get("code", "")
         if code and not any(c["code"] == code for c in candidates):
+            n = min(len(hot_stocks), 100)
+            score = round(95 - 50 * rank / max(n - 1, 1), 1)
             candidates.append({
                 "code": code, "name": s.get("name", ""),
                 "change_pct": s.get("change_rate", 0),
                 "turnover_pct": s.get("turnoverrate", 0),
                 "close": s.get("new_price", 0), "high": 0,
                 "close_to_high": 0, "vol_ratio": 0, "rsi": 0,
-                "reason": "热榜", "eod_score": 55,
-                "signals": ["热榜"],
+                "reason": "热榜", "eod_score": score,
+                "signals": [f"热榜(rank#{rank+1})"],
                 "source": "热榜",
-                "evaluation": {"score": 55, "highlights": ["热榜"], "warnings": []},
+                "evaluation": {"score": score, "highlights": ["热榜"], "warnings": []},
             })
     logger.info("[MktScreen] 强势股: %d只, 热榜: %d只", len(strong_stocks), len(hot_stocks))
 

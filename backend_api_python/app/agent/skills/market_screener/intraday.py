@@ -241,12 +241,12 @@ def _fetch_dt_pool_em(date: str) -> List[Dict]:
 
 def _fetch_strong_stocks_em() -> List[Dict]:
     """东财搜索强势股（与前端强势股卡片一致）。"""
-    return _em_search_direct("强势股 涨停", page_size=50)
+    return _em_search_direct("强势股 涨停", page_size=100)
 
 
 def _fetch_hot_stocks_em() -> List[Dict]:
     """东财搜索热榜（与前端热榜卡片一致）。"""
-    return _em_search_direct("热门股票", page_size=50)
+    return _em_search_direct("热门股票", page_size=100)
 
 
 def search_candidates_by_market(market: Dict) -> List[Dict]:
@@ -593,31 +593,37 @@ def prescreen(date: str) -> Dict[str, Any]:
             }
 
     # 强势股（东财搜索，与前端强势股卡片一致）
-    for s in strong_stocks[:15]:
+    for rank, s in enumerate(strong_stocks[:100]):
         code = s.get("code", "")
         if code and code not in candidates:
+            n = min(len(strong_stocks), 100)
+            score = round(100 - 50 * rank / max(n - 1, 1), 1)
             candidates[code] = {
                 "code": code, "name": s.get("name", ""),
                 "source": "强势股",
                 "continuous_days": 0, "zt_time": "",
-                "reason": "强势股",
+                "reason": f"强势股(rank#{rank+1})",
                 "change_pct": s.get("change_rate", 0),
                 "tags": [], "pullback_signals": [],
                 "turnover_pct": s.get("turnoverrate", 0),
+                "eod_score": score,
             }
 
     # 热榜（东财搜索，与前端热榜卡片一致）
-    for s in hot_stocks[:10]:
+    for rank, s in enumerate(hot_stocks[:100]):
         code = s.get("code", "")
         if code and code not in candidates:
+            n = min(len(hot_stocks), 100)
+            score = round(95 - 50 * rank / max(n - 1, 1), 1)
             candidates[code] = {
                 "code": code, "name": s.get("name", ""),
                 "source": "热榜",
                 "continuous_days": 0, "zt_time": "",
-                "reason": "热榜",
+                "reason": f"热榜(rank#{rank+1})",
                 "change_pct": s.get("change_rate", 0),
                 "tags": [], "pullback_signals": [],
                 "turnover_pct": s.get("turnoverrate", 0),
+                "eod_score": score,
             }
 
     # ── 5. 批量回填实时行情 ──

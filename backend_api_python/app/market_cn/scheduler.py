@@ -119,6 +119,23 @@ def _refresh_sector_daily():
         logger.warning("[sector_daily] collect_sector_daily 失败: %s", e)
 
 
+def _save_dragon_hot_daily():
+    """龙虎榜 & 热榜持久化 — 每天 18:00 调用，写入 PostgreSQL。"""
+    from app.market_cn.dragon_tiger_store import save_daily
+    try:
+        result = save_daily()
+        dt = result.get("dragon_tiger", {})
+        hr = result.get("hot_rank", {})
+        logger.info(
+            "[dragon_hot_daily] 完成: 龙虎榜 %d/%d, 热榜 %d/%d, 状态=%s",
+            dt.get("written", 0), dt.get("total", 0),
+            hr.get("written", 0), hr.get("total", 0),
+            result.get("status", "unknown"),
+        )
+    except Exception as e:
+        logger.error("[dragon_hot_daily] 执行失败: %s", e)
+
+
 def _refresh_daily():
     from app.market_cn.index_daily import sync_index_daily
     from app.market_cn.index import refresh_northbound_holdings
@@ -247,6 +264,7 @@ TASKS = [
     # 日级任务 (定时触发，一天一次)
     Task("morning_batch",     _morning_batch,     interval=86400, trading_only=False, once_per_day=True, trigger_hour=6,  trigger_minute=0),
     Task("post_market_batch", _post_market_batch, interval=86400, trading_only=False, once_per_day=True, trigger_hour=15, trigger_minute=30),
+    Task("dragon_hot_daily",  _save_dragon_hot_daily, interval=86400, trading_only=False, once_per_day=True, trigger_hour=18, trigger_minute=0),
 ]
 
 

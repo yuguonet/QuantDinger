@@ -123,6 +123,9 @@ def deep_analyze(codes: str) -> Dict[str, Any]:
     if hasattr(report, "output_data") and report.output_data:
         analyzed = report.output_data.get("analyzed", [])
 
+    # 按评分从高到低排序
+    analyzed.sort(key=lambda x: -x.get("score", 0))
+
     return SkillResult({
         "score": report.score,
         "direction": report.direction,

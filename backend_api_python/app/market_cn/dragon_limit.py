@@ -32,20 +32,25 @@ logger = get_logger(__name__)
 # ══════════════════════════════════════════════════════════════
 
 def _normalize_dragon_tiger(raw: Dict[str, Any], source: str = "") -> Dict[str, Any]:
-    """标准化一条龙虎榜记录（内部用）"""
+    """标准化一条龙虎榜记录（内部用）
+    
+    兼容 AkShare stock_lhb_detail_em 返回的列名:
+      代码, 名称, 上榜日, 解读, 收盘价, 涨跌幅, 龙虎榜净买额, 龙虎榜买入额,
+      龙虎榜卖出额, 龙虎榜成交额, 换手率, 上榜原因
+    """
     if source == "akshare" or "代码" in raw:
         return {
             "stock_code": _ss(raw.get("代码", raw.get("code", raw.get("stock_code")))),
             "stock_name": _ss(raw.get("名称", raw.get("name", raw.get("stock_name")))),
-            "trade_date": _ss(raw.get("上榜日", raw.get("trade_date", raw.get("stock_code", ""))))[:10],
+            "trade_date": _ss(raw.get("上榜日", raw.get("trade_date", "")))[:10],
             "reason": _ss(raw.get("解读", raw.get("reason", raw.get("EXPLANATION"))))[:100],
             "buy_amount": _sf(raw.get("龙虎榜买入额", raw.get("buy_amount", raw.get("BUY")))),
             "sell_amount": _sf(raw.get("龙虎榜卖出额", raw.get("sell_amount", raw.get("SELL")))),
-            "net_amount": _sf(raw.get("龙虎榜净额", raw.get("net_amount", raw.get("NET_BUY")))),
+            "net_amount": _sf(raw.get("龙虎榜净买额", raw.get("龙虎榜净额", raw.get("net_amount", raw.get("NET_BUY"))))),
             "change_percent": _sf(raw.get("涨跌幅", raw.get("change_percent", raw.get("CHANGE_RATE")))),
             "close_price": _sf(raw.get("收盘价", raw.get("close_price", raw.get("CLOSE_PRICE")))),
             "turnover_rate": _sf(raw.get("换手率", raw.get("turnover_rate", raw.get("TURNOVERRATE")))),
-            "amount": _sf(raw.get("成交额", raw.get("amount", raw.get("ACCUM_AMOUNT")))),
+            "amount": _sf(raw.get("龙虎榜成交额", raw.get("成交额", raw.get("amount", raw.get("ACCUM_AMOUNT"))))),
             "buy_seat_count": _si(raw.get("买入席位数", raw.get("buy_seat_count", raw.get("BUYER_NUM", 0)))),
             "sell_seat_count": _si(raw.get("卖出席位数", raw.get("sell_seat_count", raw.get("SELLER_NUM", 0)))),
         }
@@ -211,7 +216,10 @@ def _ak_dragon_tiger(start_date: str, end_date: str) -> List[Dict[str, Any]]:
     ak = _import_akshare()
     get_akshare_limiter().wait()
     try:
-        df = ak.stock_dragon_tiger_em(start_date=start_date, end_date=end_date)
+        # 格式转换: YYYY-MM-DD -> YYYYMMDD
+        start_fmt = start_date.replace("-", "") if start_date else ""
+        end_fmt = end_date.replace("-", "") if end_date else ""
+        df = ak.stock_lhb_detail_em(start_date=start_fmt, end_date=end_fmt)
     except Exception as e:
         logger.debug("[AkShare] dragon_tiger failed: %s", e)
         return []
@@ -407,6 +415,30 @@ def refresh_dragon_tiger():
         _rt_dragon_tiger = _fetch_dragon_tiger()
     except Exception as e:
         logger.warning("[refresh] refresh_dragon_tiger 失败: %s", e)
+
+def load_dragon_tiger_from_db(trade_date: str = ""):
+    """从 CNStock_db 加载龙虎榜数据到缓存"""
+    global _rt_dragon_tiger
+    try:
+        from app.market_cn.dragon_tiger_store import query_dragon_tiger
+        data = query_dragon_tiger(trade_date=trade_date)
+        if data:
+            _rt_dragon_tiger = data
+            logger.info("[db] 龙虎榜从DB加载: %d 条", len(data))
+    except Exception as e:
+        logger.warning("[db] 从DB加载龙虎榜失败: %s", e)
+
+def load_hot_rank_from_db(trade_date: str = ""):
+    """从 CNStock_db 加载热榜数据到缓存"""
+    global _rt_hot_rank
+    try:
+        from app.market_cn.dragon_tiger_store import query_hot_rank
+        data = query_hot_rank(trade_date=trade_date)
+        if data:
+            _rt_hot_rank = data
+            logger.info("[db] 热榜从DB加载: %d 条", len(data))
+    except Exception as e:
+        logger.warning("[db] 从DB加载热榜失败: %s", e)
 
 def refresh_zt_pool():
     global _rt_zt_pool

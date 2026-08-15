@@ -161,8 +161,11 @@ def _save(last_full_update: float):
 
 
 def _save_async(last_full_update: float):
-    """触发一次异步写盘。"""
-    threading.Thread(target=_save, args=(last_full_update,), daemon=True).start()
+    """触发异步写盘（非daemon，确保程序退出前完成）。"""
+    t = threading.Thread(target=_save, args=(last_full_update,), daemon=False)
+    t.start()
+    # 等待写入完成，最多5秒
+    t.join(timeout=5)
 
 
 def _startup_update():
@@ -403,9 +406,10 @@ def unadj_to_hfq(klines: list, code: str) -> list:
 def update_all_factors(max_workers: int = 16) -> int:
     """拉取所有活跃股票的因子。1天间隔，每次全量刷新，16并发。
 
-    时间戳判断以内存 _last_update_ts 为准（由 _load 从文件读取），
-    文件不存在或从未更新则强制拉取。
-    更新完成后将时间戳写入文件并更新内存。
+    时间戳判断:
+      1. 先检查内存 _last_update_ts
+      2. 如果内存为0，检查缓存文件的修改时间（备用）
+      3. 文件不存在或超过1天才更新
 
     Returns:
         更新的股票数量
@@ -413,10 +417,22 @@ def update_all_factors(max_workers: int = 16) -> int:
     global _last_update_ts
 
     now = time.time()
+
+    # 检查内存时间戳
     if now - _last_update_ts < _UPDATE_INTERVAL:
         print(f"[复权因子] 距上次更新不足1天，跳过 "
               f"(上次: {datetime.fromtimestamp(_last_update_ts):%Y-%m-%d %H:%M:%S})")
         return 0
+
+    # 内存时间戳为0，检查文件修改时间（备用）
+    if _last_update_ts == 0 and os.path.exists(_CACHE_FILE):
+        file_mtime = os.path.getmtime(_CACHE_FILE)
+        if now - file_mtime < _UPDATE_INTERVAL:
+            # 文件今天已更新，跳过
+            _last_update_ts = file_mtime
+            print(f"[复权因子] 缓存文件今日已更新，跳过 "
+                  f"(文件时间: {datetime.fromtimestamp(file_mtime):%Y-%m-%d %H:%M:%S})")
+            return 0
 
     from app.utils.basicinfo_db import get_stock_basic_db
 
