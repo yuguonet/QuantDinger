@@ -1,30 +1,41 @@
 #!/usr/bin/env python3
-"""龙虎榜涨停强势策略 v4
+"""龙虎榜游资D0策略 v5
 
 核心逻辑:
-  入场: D0涨停 + 技术分>85 → D1开盘买入
-  出场: D1日内动量<3% → D2开盘清仓 (买盘不足, 赶快跑)
-        D1日内动量>=3% → 继续持有, 追踪止损-8%, 止盈+15%
+  D0 = 游资首次大量买入日（龙虎榜），需同时满足:
+    ① D0 涨停（涨幅 ≥ 9.5%）
+    ② D0 收盘 > 前5天最高价（突破前高）
+    ③ 游资净买入 > 5000万
+    ④ D0 量比 < 2x（温和放量，非天量）
+
+  D1 入场:
+    D1 高开(>0%) → D1 开盘买入
+    D1 低开(≤0%) → 放弃, 不参与统计
+
+  出场:
+    追踪止损 -8%, 止盈 +95%, 持仓上限 7 天
+    (数据显示所有组合峰值均在7天内出现)
+
+数据验证 (半年 2295 只):
+  精选(4条件全满足): 278只, 均涨+18.7%, 胜率>5%=85%, 回撤-9.9%
+  D1高开高走: +24.9%, 98%胜率
+  D1低开低走: +6.0%, 38%胜率（放弃）
+  峰值天数: 4.5~7.0天 (全部组合)
 
 时间线:
-  D0 涨停 (盘后确认信号)
-  D1 买入日 (开盘买入, 收盘后计算日内动量)
-  D2 出场判断日 (日内动量<3%则开盘清仓)
+  D0 涨停 + 游资买入 (盘后龙虎榜确认信号)
+  D1 买入日 (高开→开盘买; 低开→放弃)
+  D2~D7 持有期 (追踪止损/止盈, 最多7天)
 
-出场规则:
-  D1日内动量 = (D1收盘 - D1开盘) / D1开盘 * 100
-  - <3%: D2开盘清仓 (买盘不足)
-  - >=3%: 继续持有, 追踪止损-8%, 止盈+15%, 持仓上限10天
-
-数据验证 (v1回测):
-  D1日内>=3%: 76.4%胜率, 均+6.67%
-  D1日内<3%: 14.8%胜率, 均-4.68%
+两种回测模式:
+  默认: 从龙虎榜反查, 直接用D0事件回测
+  --full-scan: 全市场每日扫描预筛选池 → D0确认 → D1入场 (更贴近实战)
 """
 from __future__ import annotations
 import json, time, argparse, os, sys
 from datetime import datetime, timedelta
 from collections import defaultdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # ================================================================
 # 环境初始化
@@ -36,7 +47,8 @@ if _backend_root not in sys.path:
 def _load_env():
     try:
         from dotenv import load_dotenv
-        for p in [os.path.join(_backend_root, '.env'), os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')]:
+        for p in [os.path.join(_backend_root, '.env'),
+                  os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')]:
             if os.path.isfile(p):
                 load_dotenv(p, override=False)
                 break
@@ -71,7 +83,8 @@ def _get_cnstock_pool():
 # 数据加载
 # ================================================================
 
-def fetch_dragon_tiger_from_db() -> List[Dict]:
+def fetch_dragon_tiger_from_db(limit: int = 50000) -> List[Dict]:
+    """从数据库加载龙虎榜数据"""
     try:
         pool = _get_cnstock_pool()
         with pool.connection() as conn:
@@ -80,7 +93,8 @@ def fetch_dragon_tiger_from_db() -> List[Dict]:
                 "SELECT trade_date, stock_code, stock_name, reason, "
                 "buy_amount, sell_amount, net_amount, change_percent, "
                 "close_price, turnover_rate, amount, buy_seat_count, sell_seat_count "
-                "FROM cnd_dragon_tiger_list ORDER BY trade_date DESC LIMIT 10000"
+                "FROM cnd_dragon_tiger_list ORDER BY trade_date DESC LIMIT %s",
+                (limit,)
             )
             columns = [desc[0] for desc in cur.description]
             rows = cur.fetchall()
@@ -92,6 +106,7 @@ def fetch_dragon_tiger_from_db() -> List[Dict]:
 
 
 def fetch_kline_db(code: str, days: int = 300) -> List[Dict]:
+    """从数据库加载K线(前复权)"""
     from app.data_sources.provider.adjustment import unadj_to_qfq
     end = datetime.now().strftime("%Y-%m-%d")
     start = (datetime.now() - timedelta(days=int(days * 1.5))).strftime("%Y-%m-%d")
@@ -137,7 +152,145 @@ def is_limit_up(close: float, prev_close: float, board_type: str) -> bool:
 
 
 # ================================================================
-# 技术指标
+# 全市场预筛选模式
+# ================================================================
+PRESCAN_MODES = {
+    'entry': {'name': '入门', 'conds': {'ma_bull': True, 'min_trend': 10, 'min_position': 80}},
+    'select': {'name': '精选', 'conds': {'ma_bull': True, 'min_trend': 10, 'min_position': 80, 'max_vol_5_20': 1}},
+    'elite': {'name': '精英RSI', 'conds': {'ma_bull': True, 'min_trend': 10, 'min_position': 80, 'max_vol_5_20': 1, 'min_rsi14': 80}},
+    'elite_kdj': {'name': '精英KDJ', 'conds': {'ma_bull': True, 'min_trend': 10, 'min_position': 80, 'max_vol_5_20': 1, 'kdj_overbought': True}},
+    'elite_full': {'name': '全维度', 'conds': {'ma_bull': True, 'min_trend': 10, 'min_position': 80, 'max_vol_5_20': 1, 'never_below_ma10': True}},
+}
+
+
+def fetch_all_stock_codes() -> List[str]:
+    """获取全市场股票代码列表"""
+    pool = _get_cnstock_pool()
+    with pool.connection() as conn:
+        cur = conn.cursor()
+        # 方法1: 从龙虎榜获取 (至少覆盖有游资活动的股票)
+        cur.execute("SELECT DISTINCT stock_code FROM cnd_dragon_tiger_list ORDER BY stock_code")
+        codes = [r[0] for r in cur.fetchall()]
+        cur.close()
+    if codes:
+        print(f"  股票列表(龙虎榜): {len(codes)}只", file=sys.stderr)
+        return codes
+    return []
+
+
+def fetch_all_klines(days: int = 200) -> Dict[str, List[Dict]]:
+    """加载全市场K线, 返回 {code: [bars]}"""
+    from app.data_sources.provider.adjustment import unadj_to_qfq
+    end = datetime.now().strftime("%Y-%m-%d")
+    start = (datetime.now() - timedelta(days=int(days * 1.5))).strftime("%Y-%m-%d")
+    codes = fetch_all_stock_codes()
+    print(f"  加载K线...", file=sys.stderr)
+    writer = _get_writer()
+    klines = {}
+    for i, code in enumerate(codes):
+        if (i + 1) % 500 == 0:
+            print(f"  加载进度: {i+1}/{len(codes)}", file=sys.stderr)
+        try:
+            data = writer.query("CNStock", code, "1D", start_time=start, end_time=end, limit=0)
+            if not data:
+                continue
+            bars = []
+            for r in data:
+                bars.append({
+                    "time": str(r["time"])[:10],
+                    "open": float(r["open"]),
+                    "high": float(r["high"]),
+                    "low": float(r["low"]),
+                    "close": float(r["close"]),
+                    "volume": float(r["volume"]),
+                })
+            klines[code] = unadj_to_qfq(bars, code)
+        except Exception:
+            continue
+    print(f"  K线加载完成: {len(klines)}只", file=sys.stderr)
+    return klines
+
+
+def fetch_dragon_tiger_by_date() -> Tuple[Dict[str, List[Dict]], Dict[str, List[Dict]]]:
+    """加载龙虎榜, 返回 (by_date, by_code)
+    by_date: {date: [{code, name, net_amount, ...}]}
+    by_code: {code: [{date, ...}]}
+    """
+    pool = _get_cnstock_pool()
+    with pool.connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT trade_date, stock_code, stock_name, reason, "
+            "buy_amount, sell_amount, net_amount, change_percent, "
+            "close_price, turnover_rate, amount, buy_seat_count, sell_seat_count "
+            "FROM cnd_dragon_tiger_list ORDER BY trade_date"
+        )
+        columns = [desc[0] for desc in cur.description]
+        rows = cur.fetchall()
+        cur.close()
+    by_date = defaultdict(list)
+    by_code = defaultdict(list)
+    for row in rows:
+        d = dict(zip(columns, row))
+        by_date[d['trade_date']].append(d)
+        by_code[d['stock_code']].append(d)
+    print(f"  龙虎榜: {len(rows)}条, {len(by_date)}个交易日", file=sys.stderr)
+    return dict(by_date), dict(by_code)
+
+
+def check_prescan(bars_20: List[Dict], conditions: Dict) -> bool:
+    """检查20天K线是否符合预筛选条件"""
+    if len(bars_20) < 20:
+        return False
+    closes = [b['close'] for b in bars_20]
+    volumes = [b['volume'] for b in bars_20]
+    ma5 = sum(closes[-5:]) / 5
+    ma10 = sum(closes[-10:]) / 10
+    ma20 = sum(closes) / 20
+    ma_bull = ma5 > ma10 > ma20
+    if conditions.get('ma_bull') and not ma_bull:
+        return False
+    pre20_open = bars_20[0]['open']
+    pre20_close = bars_20[-1]['close']
+    pre20_high = max(b['high'] for b in bars_20)
+    pre20_low = min(b['low'] for b in bars_20)
+    pre20_trend = (pre20_close / pre20_open - 1) * 100 if pre20_open > 0 else 0
+    pre20_position = (pre20_close - pre20_low) / (pre20_high - pre20_low) * 100 if pre20_high > pre20_low else 50
+    if 'min_trend' in conditions and pre20_trend < conditions['min_trend']:
+        return False
+    if 'min_position' in conditions and pre20_position < conditions['min_position']:
+        return False
+    avg_vol = sum(volumes) / len(volumes)
+    last5_vol = sum(volumes[-5:]) / 5
+    vol_ratio_5_20 = last5_vol / avg_vol if avg_vol > 0 else 1
+    if 'max_vol_5_20' in conditions and vol_ratio_5_20 >= conditions['max_vol_5_20']:
+        return False
+    if 'min_rsi14' in conditions:
+        rsi = calc_rsi(closes, 14)
+        if rsi is None or rsi < conditions['min_rsi14']:
+            return False
+    if conditions.get('kdj_overbought'):
+        kdj_bars = bars_20[-9:] if len(bars_20) >= 9 else bars_20
+        high9 = max(b['high'] for b in kdj_bars)
+        low9 = min(b['low'] for b in kdj_bars)
+        if high9 == low9:
+            return False
+        rsv = (closes[-1] - low9) / (high9 - low9) * 100
+        if rsv <= 80:
+            return False
+    if conditions.get('never_below_ma10'):
+        ma10_arr = []
+        for i in range(max(0, len(closes)-10), len(closes)):
+            start = max(0, i - 9)
+            ma10_arr.append(sum(closes[start:i+1]) / (i - start + 1))
+        above = sum(1 for i, c in enumerate(closes[-10:]) if c >= ma10_arr[i] * 0.995)
+        if above < 9:
+            return False
+    return True
+
+
+# ================================================================
+# 技术指标 (保留, 供评分用)
 # ================================================================
 
 def calc_ma(closes: List[float], period: int) -> Optional[float]:
@@ -176,10 +329,8 @@ def calc_obv_trend(bars: List[Dict], period: int = 5) -> str:
             obv -= bars[i]['volume']
         obv_list.append(obv)
     change = obv_list[-1] - obv_list[-period]
-    if change > 0:
-        return "上升"
-    elif change < 0:
-        return "下降"
+    if change > 0: return "上升"
+    elif change < 0: return "下降"
     return "平"
 
 
@@ -193,6 +344,7 @@ def calc_vol_ratio(bars: List[Dict], idx: int, period: int = 5) -> float:
 
 
 def analyze_tech(bars: List[Dict], idx: int) -> Dict:
+    """技术分析评分 (0~100)"""
     if idx < 20 or idx >= len(bars):
         return {"tech_score": 0}
 
@@ -213,35 +365,22 @@ def analyze_tech(bars: List[Dict], idx: int) -> Dict:
 
     ma_align = "交叉"
     if ma5 and ma10 and ma20:
-        if ma5 > ma10 > ma20:
-            ma_align = "多头排列"
-        elif ma5 < ma10 < ma20:
-            ma_align = "空头排列"
+        if ma5 > ma10 > ma20: ma_align = "多头排列"
+        elif ma5 < ma10 < ma20: ma_align = "空头排列"
 
     score = 50
-    if ma5 and ma10 and ma5 > ma10:
-        score += 10
-    if ma10 and ma20 and ma10 > ma20:
-        score += 10
-    if ma_align == "多头排列":
-        score += 10
-    elif ma_align == "空头排列":
-        score -= 15
+    if ma5 and ma10 and ma5 > ma10: score += 10
+    if ma10 and ma20 and ma10 > ma20: score += 10
+    if ma_align == "多头排列": score += 10
+    elif ma_align == "空头排列": score -= 15
     if rsi14:
-        if 40 <= rsi14 <= 60:
-            score += 5
-        elif rsi14 > 70:
-            score -= 10
-        elif rsi14 < 30:
-            score += 10
-    if obv_trend == "上升":
-        score += 10
-    elif obv_trend == "下降":
-        score -= 10
-    if 1.0 <= vol_ratio <= 2.0:
-        score += 5
-    elif vol_ratio > 3.0:
-        score -= 5
+        if 40 <= rsi14 <= 60: score += 5
+        elif rsi14 > 70: score -= 10
+        elif rsi14 < 30: score += 10
+    if obv_trend == "上升": score += 10
+    elif obv_trend == "下降": score -= 10
+    if 1.0 <= vol_ratio <= 2.0: score += 5
+    elif vol_ratio > 3.0: score -= 5
 
     return {
         "ma5": round(ma5, 2) if ma5 else 0,
@@ -253,6 +392,113 @@ def analyze_tech(bars: List[Dict], idx: int) -> Dict:
         "vol_ratio": round(vol_ratio, 2),
         "change_pct": round(change_pct, 2),
         "tech_score": max(0, min(100, score)),
+    }
+
+
+# ================================================================
+# D0 筛选条件
+# ================================================================
+
+def check_d0_conditions(
+    bars: List[Dict],
+    d0_idx: int,
+    net_amount: float,
+    board_type: str,
+    min_net_wan: float = 5000,
+) -> Optional[Dict]:
+    """检查D0是否满足4个条件
+
+    Args:
+        bars: K线数据
+        d0_idx: D0在K线中的索引
+        net_amount: 游资净买入额(元)
+        board_type: 板块类型
+        min_net_wan: 最小净买入额(万元), 默认5000万
+
+    Returns:
+        满足条件返回特征字典, 不满足返回None
+    """
+    if d0_idx < 5 or d0_idx >= len(bars):
+        return None
+
+    d0 = bars[d0_idx]
+    prev_close = bars[d0_idx - 1]['close']
+
+    # 条件①: D0涨停
+    if not is_limit_up(d0['close'], prev_close, board_type):
+        return None
+
+    # 条件②: D0收盘 > 前5天最高价（突破前高）
+    pre5_bars = bars[max(0, d0_idx - 5):d0_idx]
+    pre5_high = max(b['high'] for b in pre5_bars) if pre5_bars else 0
+    if d0['close'] <= pre5_high:
+        return None
+
+    # 条件③: 净买入 > min_net_wan万
+    net_wan = net_amount / 10000
+    if net_wan < min_net_wan:
+        return None
+
+    # 条件④: 量比 < 2x（温和放量）
+    pre5_vols = [b['volume'] for b in pre5_bars if b['volume'] > 0]
+    avg_pre_vol = sum(pre5_vols) / len(pre5_vols) if pre5_vols else 1
+    vol_ratio = d0['volume'] / avg_pre_vol if avg_pre_vol > 0 else 999
+    if vol_ratio >= 2.0:
+        return None
+
+    # 全部满足, 返回特征
+    change_pct = (d0['close'] / prev_close - 1) * 100 if prev_close > 0 else 0
+    return {
+        "d0_change": round(change_pct, 2),
+        "d0_close": d0['close'],
+        "d0_high": d0['high'],
+        "d0_low": d0['low'],
+        "d0_volume": int(d0['volume']),
+        "vol_ratio": round(vol_ratio, 2),
+        "net_wan": round(net_wan, 2),
+        "pre5_high": round(pre5_high, 3),
+        "breakout_pct": round((d0['close'] / pre5_high - 1) * 100, 2) if pre5_high > 0 else 0,
+    }
+
+
+# ================================================================
+# D1 入场逻辑
+# ================================================================
+
+def get_d1_entry(
+    bars: List[Dict],
+    d0_idx: int,
+) -> Optional[Dict]:
+    """D1入场: 只做高开(>0%), 低开放弃
+
+    Returns:
+        {buy_price, buy_idx, buy_time, entry_type, d1_gap, d1_intraday}
+        不入场返回 None
+    """
+    d1_idx = d0_idx + 1
+    if d1_idx >= len(bars):
+        return None
+
+    d0_close = bars[d0_idx]['close']
+    d1 = bars[d1_idx]
+
+    if d1['open'] <= 0:
+        return None
+
+    d1_gap = (d1['open'] / d0_close - 1) * 100
+    d1_intraday = (d1['close'] - d1['open']) / d1['open'] * 100 if d1['open'] > 0 else 0
+
+    # 只做高开, 低开放弃
+    if d1_gap <= 0:
+        return None
+
+    return {
+        "buy_price": d1['open'],
+        "buy_idx": d1_idx,
+        "buy_time": d1['time'],
+        "entry_type": "高开买入",
+        "d1_gap": round(d1_gap, 2),
+        "d1_intraday": round(d1_intraday, 2),
     }
 
 
@@ -279,78 +525,38 @@ def extract_window(bars: List[Dict], center_idx: int, before: int = 5, after: in
 
 
 # ================================================================
-# 回测引擎 (D1买入, D1日内动量决定出场)
+# 回测引擎
 # ================================================================
 
-def run_backtest_v4(bars: List[Dict], d0_idx: int, buy_price: float,
-                    d1_intraday: float,
-                    hold_days: int = 10, stop_loss: float = -8.0,
-                    trailing_stop: float = -8.0, take_profit: float = 15.0,
-                    min_intraday: float = 3.0) -> Optional[Dict]:
-    """v4回测: D1买入, D1日内动量决定出场
-
-    时间线:
-      D0 涨停
-      D1 开盘买入 (buy_idx = d0_idx + 1)
-      D1 收盘后计算日内动量
-      D2: 日内动量<min_intraday → 开盘清仓
-          日内动量>=min_intraday → 继续持有
+def run_backtest_v5(
+    bars: List[Dict],
+    buy_idx: int,
+    buy_price: float,
+    hold_days: int = 10,
+    stop_loss: float = -8.0,
+    trailing_stop: float = -8.0,
+    take_profit: float = 15.0,
+) -> Optional[Dict]:
+    """v5回测: 从buy_idx开始持有, 追踪止损/止盈
 
     Args:
-        d0_idx: D0(涨停日)索引
-        buy_price: D1开盘价
-        d1_intraday: D1日内动量 = (D1收盘-D1开盘)/D1开盘*100
-        min_intraday: 日内动量阈值, <此值则D2开盘清仓
+        buy_idx: 买入日索引
+        buy_price: 买入价
     """
-    d1_idx = d0_idx + 1
-    if buy_price <= 0 or d1_idx >= len(bars):
+    if buy_price <= 0 or buy_idx >= len(bars):
         return None
 
-    d1 = bars[d1_idx]
-
-    # 收益从D1开始
-    d1_change = (d1['close'] / buy_price - 1) * 100
-    peak = max(buy_price, d1['high'])
-
-    # === 出场规则1: D1日内动量<min_intraday → D2开盘清仓 ===
-    if d1_intraday < min_intraday:
-        if d1_idx + 1 < len(bars):
-            d2 = bars[d1_idx + 1]
-            exit_p = d2['open']
-            exit_d = 2
-            exit_reason = "日内不足"
-        else:
-            exit_p = d1['close']
-            exit_d = 1
-            exit_reason = "持仓到期"
-
-        return_pct = (exit_p / buy_price - 1) * 100
-        peak_pct = (peak / buy_price - 1) * 100
-
-        return {
-            'exit_price': round(exit_p, 3),
-            'exit_day': exit_d,
-            'exit_reason': exit_reason,
-            'return_pct': round(return_pct, 2),
-            'peak_return_pct': round(peak_pct, 2),
-            'drawdown': round(peak_pct - return_pct, 2),
-            'd1_change': round(d1_change, 2),
-            'd1_intraday': round(d1_intraday, 2),
-            'daily_returns': [round(d1_change, 2)],
-            'ohlcv_window': extract_window(bars, d1_idx, before=5, after=10),
-        }
-
-    # === 出场规则2: D1日内动量>=min_intraday → 继续持有 ===
-    exit_p = d1['close']
-    exit_d = 1
+    exit_p = buy_price
+    exit_d = 0
     exit_reason = "持仓到期"
-    daily_returns = [round(d1_change, 2)]
+    peak = buy_price
+    daily_returns = []
 
-    # 从D2开始持有
-    for d in range(2, hold_days + 2):
-        idx = d1_idx + d - 1
+    for d in range(0, hold_days + 1):
+        idx = buy_idx + d
         if idx >= len(bars):
             break
+
         b = bars[idx]
         if b['high'] > peak:
             peak = b['high']
@@ -365,8 +571,8 @@ def run_backtest_v4(bars: List[Dict], d0_idx: int, buy_price: float,
             exit_reason = "止盈"
             break
 
-        # 追踪止损
-        if d > 2 and b['low'] <= peak * (1 + trailing_stop / 100):
+        # 追踪止损 (从第2天开始)
+        if d > 0 and b['low'] <= peak * (1 + trailing_stop / 100):
             exit_p = peak * (1 + trailing_stop / 100)
             exit_d = d
             exit_reason = "追踪止损"
@@ -392,10 +598,7 @@ def run_backtest_v4(bars: List[Dict], d0_idx: int, buy_price: float,
         'return_pct': round(return_pct, 2),
         'peak_return_pct': round(peak_pct, 2),
         'drawdown': round(peak_pct - return_pct, 2),
-        'd1_change': round(d1_change, 2),
-        'd1_intraday': round(d1_intraday, 2),
         'daily_returns': daily_returns,
-        'ohlcv_window': extract_window(bars, d1_idx, before=5, after=10),
     }
 
 
@@ -449,159 +652,307 @@ def print_stats(stats: Dict, label: str):
 # 策略
 # ================================================================
 
-def strategy_v4(dragon_data: List[Dict], kline_cache: Dict[str, List[Dict]],
-                min_tech_score: int = 85, min_intraday: float = 3.0,
-                hold_days: int = 10, stop_loss: float = -8.0,
-                trailing_stop: float = -8.0, take_profit: float = 15.0,
-                show_tech: bool = False, today_only: bool = False) -> List[Dict]:
-    """v4策略
+def strategy_v5(
+    dragon_data: List[Dict],
+    kline_cache: Dict[str, List[Dict]],
+    window_days: int = 20,
+    min_net_wan: float = 5000,
+    hold_days: int = 10,
+    stop_loss: float = -8.0,
+    trailing_stop: float = -8.0,
+    take_profit: float = 15.0,
+    show_detail: bool = False,
+    today_only: bool = False,
+) -> List[Dict]:
+    """v5策略: 游资D0选股 + D1动态入场
 
-    入场: D0涨停 + 技术分>85 → D1开盘买入
-    出场: D1日内动量<min_intraday → D2开盘清仓
-          D1日内动量>=min_intraday → 继续持有
+    流程:
+      1. 按股票聚合龙虎榜, 找每只股票在window_days内的首次大量买入日
+      2. 检查D0是否满足4个条件: 涨停 + 突破前高 + 净买入>5000万 + 量比<2x
+      3. D1入场: 高开→开盘买; 低开放弃
+      4. 回测出场
     """
-    trades = []
+    # 计算窗口起始日期
+    all_dates = sorted(set(r.get('trade_date', '') for r in dragon_data), reverse=True)
+    if not all_dates:
+        return []
+    latest_date = all_dates[0]
+    try:
+        cutoff = (datetime.strptime(latest_date, "%Y-%m-%d") - timedelta(days=window_days * 1.5)).strftime("%Y-%m-%d")
+    except Exception:
+        cutoff = ""
 
-    by_code = defaultdict(list)
+    # 按股票聚合
+    by_code: Dict[str, List[Dict]] = defaultdict(list)
     for row in dragon_data:
         code = row.get('stock_code', '')
         if code:
             by_code[code].append(row)
 
+    trades = []
+
     for code, rows in by_code.items():
         rows.sort(key=lambda x: x.get('trade_date', ''))
 
-        bars = kline_cache.get(code)
-        if not bars:
+        # 过滤窗口期内的记录
+        window_rows = [r for r in rows if r.get('trade_date', '') >= cutoff]
+        if not window_rows:
+            continue
+
+        # D0 = 窗口期内第一条记录（首次出现）
+        d0_row = window_rows[0]
+        d0_date = d0_row.get('trade_date', '')
+
+        # 加载K线
+        if code not in kline_cache:
             bars = fetch_kline_db(code, 300)
             if bars:
                 kline_cache[code] = bars
+        bars = kline_cache.get(code)
         if not bars:
             continue
 
+        # 找D0在K线中的索引
+        d0_idx = None
+        for j, b in enumerate(bars):
+            if b['time'] == d0_date:
+                d0_idx = j
+                break
+        if d0_idx is None:
+            continue
+
         board_type = get_board_type(code)
+        net_amount = float(d0_row.get('net_amount', 0) or 0)
 
-        for row in rows:
-            trade_date = row.get('trade_date', '')
-            change_pct = float(row.get('change_percent', 0) or 0)
-            net_amount = float(row.get('net_amount', 0) or 0)
-            buy_seats = int(row.get('buy_seat_count', 0) or 0)
+        # 检查D0的4个条件
+        d0_features = check_d0_conditions(bars, d0_idx, net_amount, board_type, min_net_wan)
+        if d0_features is None:
+            continue
 
-            # 条件1: D0涨停
-            if change_pct < 9.5:
-                continue
+        tech = analyze_tech(bars, d0_idx)
 
-            # 找到D0索引
-            d0_idx = None
-            for j, b in enumerate(bars):
-                if b['time'] == trade_date:
-                    d0_idx = j
-                    break
-            if d0_idx is None:
-                continue
-
-            # 验证涨停
-            if d0_idx > 0:
-                prev_close = bars[d0_idx - 1]['close']
-                if not is_limit_up(bars[d0_idx]['close'], prev_close, board_type):
-                    continue
-
-            # 条件2: 技术分>min_tech_score
-            tech = analyze_tech(bars, d0_idx)
-            if tech.get('tech_score', 0) < min_tech_score:
-                continue
-
-            d0_close = bars[d0_idx]['close']
-
-            # === today_only模式: D0盘后, 不需要D1数据 ===
-            if today_only:
-                buy_price = d0_close  # D1开盘价未知, 用D0收盘价近似
-
-                score = tech.get('tech_score', 50)
-                if net_amount > 50000000:
-                    score += 10
-                if buy_seats > 0:
-                    score += 5
-
-                trades.append({
-                    'code': code,
-                    'board': get_board_name(code),
-                    'strategy': 'v4',
-                    'signal_date': trade_date,
-                    'signal_type': '涨停+强势',
-                    'score': min(100, score),
-                    'd0_change': round(change_pct, 2),
-                    'd1_change': 0,
-                    'd1_intraday': 0,
-                    'net_amount': round(net_amount / 10000, 2),
-                    'buy_seats': buy_seats,
-                    'entry_date': '',  # D1日期未知
-                    'entry_price': round(buy_price, 3),
-                    'tech': tech,
-                })
-                continue
-
-            # === 正常回测模式 ===
-            if d0_idx + 1 >= len(bars):
-                continue
-
-            d1 = bars[d0_idx + 1]
-            buy_price = d1['open']
-            buy_idx = d0_idx + 1
-
-            if buy_price <= 0:
-                continue
-
-            # D1日内动量 = (D1收盘 - D1开盘) / D1开盘 * 100
-            d1_intraday = (d1['close'] - d1['open']) / d1['open'] * 100 if d1['open'] > 0 else 0
-
-            # D1开盘涨幅 (过滤过高)
-            d1_gap = (buy_price / d0_close - 1) * 100
-            if d1_gap > 5:
-                continue
-
-            # 回测
-            result = run_backtest_v4(bars, d0_idx, buy_price, d1_intraday,
-                                      hold_days, stop_loss, trailing_stop, take_profit,
-                                      min_intraday)
-            if not result:
-                continue
-
+        # === today_only模式: D0盘后, 输出信号 ===
+        if today_only:
             score = tech.get('tech_score', 50)
-            if d1_intraday >= min_intraday:
-                score += 15  # 日内动量达标加分
-            if d1_intraday >= 5:
-                score += 10
-            if net_amount > 50000000:
+            # D0条件全满足 +10
+            score += 10
+            # 突破幅度加分
+            if d0_features['breakout_pct'] > 3:
                 score += 5
-            if buy_seats > 0:
+            if d0_features['breakout_pct'] > 10:
                 score += 5
 
             trades.append({
                 'code': code,
+                'name': d0_row.get('stock_name', ''),
                 'board': get_board_name(code),
-                'strategy': 'v4',
-                'signal_date': trade_date,
-                'signal_type': '涨停+强势',
+                'strategy': 'v5',
+                'signal_date': d0_date,
+                'signal_type': 'D0游资买入',
                 'score': min(100, score),
-                'd0_change': round(change_pct, 2),
-                'd1_change': round(result['d1_change'], 2),
-                'd1_intraday': round(d1_intraday, 2),
-                'd1_gap': round(d1_gap, 2),
-                'net_amount': round(net_amount / 10000, 2),
-                'buy_seats': buy_seats,
-                'entry_date': bars[buy_idx]['time'],
-                'entry_price': round(buy_price, 3),
+                'd0_features': d0_features,
                 'tech': tech,
-                **result,
+                'd0_info': {
+                    'reason': d0_row.get('reason', ''),
+                    'buy_amount_wan': round(float(d0_row.get('buy_amount', 0) or 0) / 10000, 2),
+                    'sell_amount_wan': round(float(d0_row.get('sell_amount', 0) or 0) / 10000, 2),
+                    'buy_seat_count': int(d0_row.get('buy_seat_count', 0) or 0),
+                    'sell_seat_count': int(d0_row.get('sell_seat_count', 0) or 0),
+                },
             })
+            continue
 
-            if show_tech:
-                print(f"    {code} {trade_date}涨停{change_pct:.1f}% -> "
-                      f"D1开{d1_gap:+.1f}% 日内{d1_intraday:+.1f}% "
-                      f"技术{tech.get('tech_score', 0)} -> "
-                      f"{result['exit_reason']} 收益{result['return_pct']:+.1f}%")
+        # === 正常回测模式 ===
+        entry = get_d1_entry(bars, d0_idx)
+        if entry is None:
+            continue
 
+        buy_price = entry['buy_price']
+        buy_idx = entry['buy_idx']
+
+        # 回测
+        result = run_backtest_v5(bars, buy_idx, buy_price,
+                                  hold_days, stop_loss, trailing_stop, take_profit)
+        if not result:
+            continue
+
+        score = tech.get('tech_score', 50)
+        score += 10  # D0条件全满足
+        if d0_features['breakout_pct'] > 3:
+            score += 5
+        if d0_features['breakout_pct'] > 10:
+            score += 5
+        if entry['entry_type'] == "高开买入":
+            score += 5  # 高开买入加分
+        if entry['d1_gap'] > 3:
+            score += 5
+
+        trades.append({
+            'code': code,
+            'name': d0_row.get('stock_name', ''),
+            'board': get_board_name(code),
+            'strategy': 'v5',
+            'signal_date': d0_date,
+            'signal_type': 'D0游资买入',
+            'score': min(100, score),
+            'd0_features': d0_features,
+            'tech': tech,
+            'd0_info': {
+                'reason': d0_row.get('reason', ''),
+                'buy_amount_wan': round(float(d0_row.get('buy_amount', 0) or 0) / 10000, 2),
+                'sell_amount_wan': round(float(d0_row.get('sell_amount', 0) or 0) / 10000, 2),
+                'buy_seat_count': int(d0_row.get('buy_seat_count', 0) or 0),
+                'sell_seat_count': int(d0_row.get('sell_seat_count', 0) or 0),
+            },
+            'entry_type': entry['entry_type'],
+            'd1_gap': entry['d1_gap'],
+            'd1_intraday': entry['d1_intraday'],
+            'entry_date': entry['buy_time'],
+            'entry_price': round(buy_price, 3),
+            **result,
+        })
+
+        if show_detail:
+            print(f"    {code} {d0_date} D0涨{d0_features['d0_change']:.0f}% "
+                  f"突破{d0_features['breakout_pct']:+.1f}% "
+                  f"净买{d0_features['net_wan']:.0f}万 "
+                  f"量比{d0_features['vol_ratio']:.1f}x "
+                  f"-> {entry['entry_type']} gap{entry['d1_gap']:+.1f}% "
+                  f"-> {result['exit_reason']} 收益{result['return_pct']:+.1f}%")
+
+    return trades
+
+
+# ================================================================
+# 全市场扫描回测 (--full-scan 模式)
+# ================================================================
+
+def full_scan_backtest(
+    mode: str = 'select',
+    min_net_wan: float = 5000,
+    hold_days: int = 7,
+    stop_loss: float = -8.0,
+    trailing_stop: float = -8.0,
+    take_profit: float = 15.0,
+    show_detail: bool = False,
+) -> List[Dict]:
+    """全市场扫描回测
+
+    流程:
+      每天盘后 → 全市场预筛选 → 次日D0涨停确认 → D1入场 → 7天出场
+    """
+    mode_cfg = PRESCAN_MODES.get(mode, PRESCAN_MODES['select'])
+    conditions = mode_cfg['conds']
+    print(f"📊 全市场扫描模式: {mode_cfg['name']} | 条件: {conditions}", file=sys.stderr)
+    print(f"   净买入>{min_net_wan}万 | 持仓{hold_days}天 | 止损{stop_loss}%", file=sys.stderr)
+
+    # 加载数据
+    print(f"\n📋 加载数据...", file=sys.stderr)
+    t0 = time.time()
+    klines = fetch_all_klines(200)
+    dragon_by_date, _ = fetch_dragon_tiger_by_date()
+    print(f"  耗时: {time.time()-t0:.1f}秒", file=sys.stderr)
+
+    # 建立时间索引: {code: {date: bar_idx}}
+    code_date_idx = {}
+    for code, bars in klines.items():
+        idx_map = {}
+        for i, b in enumerate(bars):
+            idx_map[b['time']] = i
+        code_date_idx[code] = idx_map
+
+    all_dates = sorted(set(d for d in dragon_by_date.keys()))
+    print(f"  交易日: {len(all_dates)}天 ({all_dates[0]} ~ {all_dates[-1]})\n", file=sys.stderr)
+
+    trades = []
+    prescan_pool_size = 0
+    d0_confirmed = 0
+
+    for di in range(len(all_dates) - 1):
+        date = all_dates[di]
+        next_date = all_dates[di + 1]
+
+        # Step 1: 扫描预筛选池
+        prescan_pool = set()
+        for code, bars in klines.items():
+            date_idx = code_date_idx.get(code, {}).get(date)
+            if date_idx is None or date_idx < 20:
+                continue
+            window = bars[date_idx - 19:date_idx + 1]
+            if check_prescan(window, conditions):
+                prescan_pool.add(code)
+
+        if not prescan_pool:
+            continue
+        prescan_pool_size += len(prescan_pool)
+
+        # Step 2: 次日D0涨停确认
+        dragon_today = dragon_by_date.get(next_date, [])
+        for d_rec in dragon_today:
+            code = d_rec['stock_code']
+            net_amount = float(d_rec.get('net_amount', 0) or 0)
+            change_pct = float(d_rec.get('change_percent', 0) or 0)
+
+            if code not in prescan_pool:
+                continue
+            if change_pct < 9.5:
+                continue
+            if net_amount / 10000 < min_net_wan:
+                continue
+
+            bars = klines.get(code)
+            if not bars:
+                continue
+            d0_idx = code_date_idx.get(code, {}).get(next_date)
+            if d0_idx is None or d0_idx < 1 or d0_idx >= len(bars) - 1:
+                continue
+
+            board_type = get_board_type(code)
+            prev_close = bars[d0_idx - 1]['close']
+            if not is_limit_up(bars[d0_idx]['close'], prev_close, board_type):
+                continue
+
+            d0_confirmed += 1
+
+            # Step 3: D1入场
+            entry = get_d1_entry(bars, d0_idx)
+            if entry is None:
+                continue
+
+            buy_price = entry['buy_price']
+            buy_idx = entry['buy_idx']
+
+            # Step 4: 出场
+            result = run_backtest_v5(bars, buy_idx, buy_price,
+                                     hold_days, stop_loss, trailing_stop, take_profit)
+            if not result:
+                continue
+
+            trade = {
+                'code': code,
+                'name': d_rec.get('stock_name', ''),
+                'd0_date': next_date,
+                'entry_type': entry['entry_type'],
+                'd1_gap': entry['d1_gap'],
+                'd1_intraday': entry['d1_intraday'],
+                'buy_price': round(buy_price, 3),
+                'net_wan': round(net_amount / 10000, 0),
+                **result,
+            }
+            trades.append(trade)
+
+            if show_detail:
+                emoji = '✅' if result['return_pct'] > 0 else '❌'
+                print(f"  {emoji} {code} {next_date} 净买{net_amount/10000:.0f}万 "
+                      f"-> {entry['entry_type']} gap{entry['d1_gap']:+.1f}% "
+                      f"-> {result['exit_reason']} {result['return_pct']:+.1f}%",
+                      file=sys.stderr)
+
+    avg_pool = prescan_pool_size / max(len(all_dates), 1)
+    print(f"\n📊 回测完成:", file=sys.stderr)
+    print(f"  预筛选池日均: {avg_pool:.0f}只", file=sys.stderr)
+    print(f"  D0确认: {d0_confirmed}次", file=sys.stderr)
+    print(f"  成交: {len(trades)}笔", file=sys.stderr)
     return trades
 
 
@@ -610,28 +961,93 @@ def strategy_v4(dragon_data: List[Dict], kline_cache: Dict[str, List[Dict]],
 # ================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="龙虎榜涨停强势策略 v4")
-    parser.add_argument("--days", type=int, default=30, help="分析最近N天")
-    parser.add_argument("--hold-days", type=int, default=10, help="持仓天数")
+    parser = argparse.ArgumentParser(description="龙虎榜游资D0策略 v5")
+    parser.add_argument("--days", type=int, default=20, help="D0搜索窗口(交易日)")
+    parser.add_argument("--hold-days", type=int, default=7, help="持仓天数")
     parser.add_argument("--stop-loss", type=float, default=-8.0, help="止损%%")
     parser.add_argument("--trailing-stop", type=float, default=-8.0, help="追踪止损%%")
-    parser.add_argument("--take-profit", type=float, default=15.0, help="止盈%%")
-    parser.add_argument("--min-tech", type=int, default=97, help="最低技术分")
-    parser.add_argument("--min-intraday", type=float, default=3.0, help="D1日内动量阈值%%")
-    parser.add_argument("--today", action="store_true", help="D0盘后信号")
+    parser.add_argument("--take-profit", type=float, default=95.0, help="止盈%%")
+    parser.add_argument("--min-net", type=float, default=5000, help="最小净买入额(万)")
+    parser.add_argument("--today", action="store_true", help="D0盘后信号模式")
     parser.add_argument("--today-date", type=str, default="", help="指定D0日期")
     parser.add_argument("--all-trades", action="store_true", help="输出交易明细")
-    parser.add_argument("--tech", action="store_true", help="输出技术分析")
+    parser.add_argument("--detail", action="store_true", help="输出详细匹配信息")
     parser.add_argument("--compare", action="store_true", help="对比不同参数")
+    parser.add_argument("--full-scan", action="store_true", help="全市场扫描回测(需数据库)")
+    parser.add_argument("--prescan-mode", type=str, default="select",
+                        choices=list(PRESCAN_MODES.keys()),
+                        help="预筛选模式: entry/select/elite/elite_kdj/elite_full")
     args = parser.parse_args()
 
     print("=" * 80)
-    print("龙虎榜涨停强势策略 v4")
-    print("入场: D0涨停 + 技术分>85 -> D1开盘买")
-    print("出场: D1日内动量<3% -> D2开盘跑 | >=3% -> 持有")
+    print("龙虎榜游资D0策略 v5")
+    print("D0: 涨停 + 突破前高 + 净买入>5000万 + 量比<2x")
+    print("D1: 高开(>0%)→开盘买 | 低开(≤0%)→放弃")
     print("=" * 80)
 
-    print("\n📊 加载龙虎榜数据...")
+    # === 全市场扫描回测模式 ===
+    if args.full_scan:
+        print(f"\n🔄 全市场扫描回测...")
+        trades = full_scan_backtest(
+            mode=args.prescan_mode,
+            min_net_wan=args.min_net,
+            hold_days=args.hold_days,
+            stop_loss=args.stop_loss,
+            trailing_stop=args.trailing_stop,
+            take_profit=args.take_profit,
+            show_detail=args.detail,
+        )
+        if not trades:
+            print("\n❌ 无交易")
+            return
+
+        print(f"\n{'=' * 80}")
+        print(f"📊 全市场扫描回测结果")
+        print(f"{'=' * 80}")
+
+        stats = calc_stats(trades)
+        print_stats(stats, PRESCAN_MODES.get(args.prescan_mode, {}).get('name', args.prescan_mode))
+
+        total_ret = sum(t['return_pct'] for t in trades)
+        total_days = sum(t['exit_day'] for t in trades)
+        rpd = total_ret / total_days if total_days > 0 else 0
+        print(f"\n    单位时间: 日均{rpd:+.3f}% | 年化{rpd * 250:+.1f}%")
+
+        # 入场类型
+        print(f"\n  入场类型: 高开买入")
+        seg = [t for t in trades if t.get('entry_type') == '高开买入']
+        if seg:
+            s = calc_stats(seg)
+            seg_rpd = sum(t['return_pct'] for t in seg) / sum(t['exit_day'] for t in seg) if sum(t['exit_day'] for t in seg) > 0 else 0
+            print(f"    {s['total']:>3}笔 胜率{s['win_rate']:>5.1f}% "
+                  f"均收益{s['avg_return']:>+6.2f}% 日均{seg_rpd:>+.3f}%")
+
+        # 月度统计
+        print(f"\n  月度统计:")
+        monthly = defaultdict(list)
+        for t in trades:
+            monthly[t['d0_date'][:7]].append(t)
+        for month in sorted(monthly.keys()):
+            seg = monthly[month]
+            s = calc_stats(seg)
+            total_r = sum(t['return_pct'] for t in seg)
+            print(f"    {month}: {s['total']:>3}笔 胜率{s['win_rate']:>5.1f}% "
+                  f"均收益{s['avg_return']:>+6.2f}% 总收益{total_r:>+8.2f}%")
+
+        if args.all_trades:
+            print(f"\n{'=' * 80}")
+            print(f"📋 交易明细 ({len(trades)}笔)")
+            print(f"{'=' * 80}")
+            for t in sorted(trades, key=lambda x: x['d0_date']):
+                emoji = '✅' if t['return_pct'] > 0 else '❌'
+                print(f"  {emoji} {t['code']:>8} {t['d0_date']} "
+                      f"净买{t['net_wan']:.0f}万 {t['entry_type'][:4]} gap{t['d1_gap']:+.1f}% "
+                      f"买{t['buy_price']:>7.2f} -> {t['exit_reason'][:6]} "
+                      f"持{t['exit_day']}天 收益{t['return_pct']:>+6.2f}%")
+        return
+
+    # === 原有模式: 龙虎榜反查 ===
+    print(f"\n📊 加载龙虎榜数据 (窗口={args.days}天)...")
     dragon_data = fetch_dragon_tiger_from_db()
     print(f"  龙虎榜: {len(dragon_data)}条")
 
@@ -647,82 +1063,76 @@ def main():
         print(f"📊 参数对比")
         print(f"{'=' * 80}")
 
-        for min_tech in [70, 80, 85, 90, 95]:
-            for min_intraday in [2, 3, 5]:
-                trades = strategy_v4(dragon_data, kline_cache,
-                                      min_tech_score=min_tech, min_intraday=min_intraday,
-                                      hold_days=args.hold_days, stop_loss=args.stop_loss,
-                                      trailing_stop=args.trailing_stop, take_profit=args.take_profit)
-                if trades:
-                    stats = calc_stats(trades)
-                    total_ret = sum(t['return_pct'] for t in trades)
-                    total_days = sum(t['exit_day'] for t in trades)
-                    rpd = total_ret / total_days if total_days > 0 else 0
-                    print(f"  技术>{min_tech:>2} 日内>{min_intraday}%: "
-                          f"{stats['total']:>4}笔 胜率{stats['win_rate']:>5.1f}% "
-                          f"均收益{stats['avg_return']:>+6.2f}% 日均{rpd:>+.3f}%")
+        for min_net in [1000, 3000, 5000, 8000, 10000]:
+            trades = strategy_v5(dragon_data, kline_cache,
+                                  window_days=args.days, min_net_wan=min_net,
+                                  hold_days=args.hold_days, stop_loss=args.stop_loss,
+                                  trailing_stop=args.trailing_stop, take_profit=args.take_profit)
+            if trades:
+                stats = calc_stats(trades)
+                total_ret = sum(t['return_pct'] for t in trades)
+                total_days = sum(t['exit_day'] for t in trades)
+                rpd = total_ret / total_days if total_days > 0 else 0
+                print(f"  净买入>{min_net:>6}万: "
+                      f"{stats['total']:>4}笔 胜率{stats['win_rate']:>5.1f}% "
+                      f"均收益{stats['avg_return']:>+6.2f}% 日均{rpd:>+.3f}%")
         return
 
     # === today模式 ===
     if args.today:
         d0_str = args.today_date or datetime.now().strftime("%Y-%m-%d")
 
-        print(f"\n🔄 筛选 {d0_str} 涨停信号 (技术分>{args.min_tech})...")
-        trades = strategy_v4(dragon_data, kline_cache,
-                              min_tech_score=args.min_tech, min_intraday=args.min_intraday,
+        print(f"\n🔄 筛选 {d0_str} D0信号 (净买入>{args.min_net}万)...")
+        trades = strategy_v5(dragon_data, kline_cache,
+                              window_days=args.days, min_net_wan=args.min_net,
                               today_only=True)
         trades = [t for t in trades if t.get('signal_date') == d0_str]
 
         print(f"\n{'=' * 80}")
-        print(f"📅 {d0_str} 盘后信号 -> D1开盘买入")
-        print(f"   {len(trades)} 只股票符合条件")
+        print(f"📅 {d0_str} 盘后信号 -> D1操作")
+        print(f"   {len(trades)} 只股票满足D0条件")
         print(f"{'=' * 80}")
 
         if trades:
             trades.sort(key=lambda x: -x.get('score', 0))
 
-            print(f"\n  {'排名':>4} {'代码':>8} {'板块':>6} {'评分':>4} {'D0涨幅':>7} {'建议买入价':>10} {'D1预判':>8} {'技术详情'}")
-            print(f"  {'-' * 85}")
+            print(f"\n  {'排名':>4} {'代码':>8} {'板块':>6} {'评分':>4} "
+                  f"{'D0涨幅':>7} {'突破':>7} {'净买入':>8} {'量比':>5} {'操作建议'}")
+            print(f"  {'-' * 90}")
 
             for rank, t in enumerate(trades, 1):
+                d0f = t.get('d0_features', {})
                 tech = t.get('tech', {})
-                d0_chg = t.get('d0_change', 0)
-                entry_price = t.get('entry_price', 0)
 
-                tech_str = (f"{tech.get('ma_align', '')[:4]} "
-                           f"RSI{tech.get('rsi14', 0):.0f} "
-                           f"OBV{tech.get('obv_trend', '')[:2]} "
-                           f"量{tech.get('vol_ratio', 0):.1f}x")
-
-                d1_hint = "看多"
-                if tech.get('obv_trend') == '下降':
-                    d1_hint = "谨慎"
+                action = "D1高开→开盘买"
                 if tech.get('rsi14', 50) > 70:
-                    d1_hint = "高风险"
+                    action += " ⚠️RSI高"
 
                 print(f"  {rank:>4} {t['code']:>8} {t['board']:>6} {t['score']:>4} "
-                      f"{d0_chg:>+6.1f}% {entry_price:>9.2f} {d1_hint:>8} {tech_str}")
+                      f"{d0f.get('d0_change', 0):>+6.1f}% "
+                      f"{d0f.get('breakout_pct', 0):>+6.1f}% "
+                      f"{d0f.get('net_wan', 0):>7.0f}万 "
+                      f"{d0f.get('vol_ratio', 0):>4.1f}x "
+                      f"{action}")
 
             print(f"\n  操作建议:")
-            print(f"  1. D1开盘价 <= 建议买入价 才入场")
-            print(f"  2. D1开盘涨幅 > 5% 不追")
-            print(f"  3. D1收盘后看日内动量:")
-            print(f"     - 日内<3%: D2开盘立即清仓")
-            print(f"     - 日内>=3%: 继续持有, 追踪止损-8%, 止盈+15%")
+            print(f"  1. D1 高开(>0%) → 开盘买入")
+            print(f"  2. D1 低开(≤0%) → 放弃不买")
+            print(f"  3. 买入后: 追踪止损-8%, 止盈+95%, 持仓上限7天")
         else:
-            print(f"  今日无符合条件的信号")
+            print(f"  今日无符合条件的D0信号")
         return
 
     # === 正常回测 ===
-    print(f"  参数: 技术分>{args.min_tech} 日内动量>{args.min_intraday}% "
+    print(f"  参数: 窗口{args.days}天 净买入>{args.min_net}万 "
           f"持仓{args.hold_days}天 止损{args.stop_loss}% 止盈{args.take_profit}%")
 
     print(f"\n🔄 运行策略...")
-    trades = strategy_v4(dragon_data, kline_cache,
-                          min_tech_score=args.min_tech, min_intraday=args.min_intraday,
+    trades = strategy_v5(dragon_data, kline_cache,
+                          window_days=args.days, min_net_wan=args.min_net,
                           hold_days=args.hold_days, stop_loss=args.stop_loss,
                           trailing_stop=args.trailing_stop, take_profit=args.take_profit,
-                          show_tech=args.tech)
+                          show_detail=args.detail)
 
     # 结果
     print(f"\n{'=' * 80}")
@@ -730,7 +1140,7 @@ def main():
     print(f"{'=' * 80}")
 
     stats = calc_stats(trades)
-    print_stats(stats, "v4策略")
+    print_stats(stats, "v5策略")
 
     if trades:
         total_ret = sum(t['return_pct'] for t in trades)
@@ -738,10 +1148,20 @@ def main():
         rpd = total_ret / total_days if total_days > 0 else 0
         print(f"\n    单位时间: 日均{rpd:+.3f}% | 年化{rpd * 250:+.1f}%")
 
+    # 入场类型
+    if trades:
+        print(f"\n  入场类型: 高开买入")
+        seg = [t for t in trades if t.get('entry_type') == '高开买入']
+        if seg:
+            s = calc_stats(seg)
+            seg_rpd = sum(t['return_pct'] for t in seg) / sum(t['exit_day'] for t in seg) if sum(t['exit_day'] for t in seg) > 0 else 0
+            print(f"    {s['total']:>3}笔 胜率{s['win_rate']:>5.1f}% "
+                  f"均收益{s['avg_return']:>+6.2f}% 均持仓{s['avg_hold']:.1f}天 日均{seg_rpd:>+.3f}%")
+
     # 按出场原因分组
     if trades:
         print(f"\n  出场原因:")
-        for reason in ['日内不足', '止盈', '追踪止损', '止损', '持仓到期']:
+        for reason in ['止盈', '追踪止损', '止损', '持仓到期']:
             seg = [t for t in trades if t.get('exit_reason') == reason]
             if seg:
                 s = calc_stats(seg)
@@ -749,24 +1169,41 @@ def main():
                 print(f"    {reason:>6}: {s['total']:>3}笔 胜率{s['win_rate']:>5.1f}% "
                       f"均收益{s['avg_return']:>+6.2f}% 均持仓{s['avg_hold']:.1f}天 日均{seg_rpd:>+.3f}%")
 
+    # D1 gap分段
+    if trades:
+        print(f"\n  D1开盘gap分段:")
+        for lo, hi in [(-10, 0), (0, 1), (1, 3), (3, 5), (5, 10)]:
+            seg = [t for t in trades if lo <= t.get('d1_gap', 0) < hi]
+            if seg:
+                s = calc_stats(seg)
+                print(f"    {lo:>+3}%~{hi:>+3}%: {s['total']:>3}笔 胜率{s['win_rate']:>5.1f}% 均收益{s['avg_return']:>+6.2f}%")
+
     # 交易明细
     if args.all_trades and trades:
         print(f"\n{'=' * 80}")
         print(f"📋 交易明细 ({len(trades)}笔)")
         print(f"{'=' * 80}")
-        for t in sorted(trades, key=lambda x: x['entry_date']):
+        for t in sorted(trades, key=lambda x: x.get('entry_date', '')):
             emoji = '✅' if t['return_pct'] > 0 else '❌'
+            d0f = t.get('d0_features', {})
             print(f"  {emoji} {t['code']:>8} {t['board']:>6} "
-                  f"{t['signal_date']}涨停{t['d0_change']:.0f}% -> "
-                  f"{t['entry_date']}买{t['entry_price']:>7.2f} "
-                  f"D1日内{t['d1_intraday']:>+5.1f}% "
+                  f"{t['signal_date']} D0涨{d0f.get('d0_change', 0):.0f}% "
+                  f"突破{d0f.get('breakout_pct', 0):+.0f}% "
+                  f"净买{d0f.get('net_wan', 0):.0f}万 "
+                  f"-> {t.get('entry_type', '')} {t.get('d1_gap', 0):+.1f}% "
+                  f"买{t['entry_price']:>7.2f} "
                   f"-> {t['exit_reason'][:6]} 收益{t['return_pct']:>+6.2f}%")
 
     # 导出
     if trades:
         outfile = "test_dragon_hot_result.json"
+        # 清理不可序列化的内容
+        export = []
+        for t in trades:
+            row = {k: v for k, v in t.items() if k != 'ohlcv_window'}
+            export.append(row)
         with open(outfile, "w", encoding="utf-8") as f:
-            json.dump(trades, f, ensure_ascii=False, indent=2)
+            json.dump(export, f, ensure_ascii=False, indent=2)
         print(f"\n💾 {outfile} ({len(trades)}笔)")
 
 
