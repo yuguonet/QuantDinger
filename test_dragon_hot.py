@@ -1,28 +1,27 @@
 #!/usr/bin/env python3
-"""龙虎榜涨停强势策略 v4
+"""龙虎榜涨停强势策略 v5
 
 核心逻辑:
-  入场: D0涨停 + 技术分>95 + D1跳空高开(>5%) → D1开盘买入
-  出场: D1日内动量<3% → D2开盘清仓 (买盘不足, 赶快跑)
-        D1日内动量>=3% → 继续持有, 追踪止损-8%, 止盈+15%
-        D2~D7 持有期 (追踪止损/止盈, 最多7天)(数据显示所有组合峰值均在7天内出现)
+  入场: D0涨停 + 技术分>95 + D1跳空高开(>5%) + 排除机构2~3家买入
+  出场:
+    1. D1日内动量 < -3%% → D2开盘清仓 (高开低走止损)
+    2. D2~D7 每天检查:
+       主板: 涨幅<10%% → 当天收盘清仓
+       创科板: 涨幅<3%% OR 日内动量<-3%% → 当天收盘清仓
+    3. 持仓上限7天 (兜底)
 
 时间线:
   D0 涨停 (盘后确认信号)
-  D1 买入日 (开盘买入, 收盘后计算日内动量)
-  D2 出场判断日 (日内动量<3%则开盘清仓)
+  D1 买入日 (开盘买入)
+  D2~D7 持有期 (每天检查涨幅/日内动量)
 
-出场规则:
-  D1日内动量 = (D1收盘 - D1开盘) / D1开盘 * 100
-  - <3%: D2开盘清仓 (买盘不足)
-  - >=3%: 继续持有, 追踪止损-8%, 止盈+15%, 持仓上限10天
-
-数据验证 (v1回测):
-  D1日内>=3%: 76.4%胜率, 均+6.67%
-  D1日内<3%: 14.8%胜率, 均-4.68%
+数据验证:
+  排除机构2~3家买入: 日均+0.891%% (全部+0.605%%, 提升47%%)
+  主板: D2涨停率24%%, 涨幅<10%%清仓 日均+1.111%%
+  创科板: 涨幅<3%% OR 日内<-3%%清仓 日均+0.699%%
 """
 from __future__ import annotations
-import json, time, argparse, os, sys
+import json, time, argparse, os, sys, re
 from datetime import datetime, timedelta
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
@@ -72,16 +71,18 @@ def _get_cnstock_pool():
 # 数据加载
 # ================================================================
 
-def fetch_dragon_tiger_from_db() -> List[Dict]:
+def fetch_dragon_tiger_from_db(days: int = 30) -> List[Dict]:
     try:
         pool = _get_cnstock_pool()
+        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
         with pool.connection() as conn:
             cur = conn.cursor()
             cur.execute(
                 "SELECT trade_date, stock_code, stock_name, reason, "
                 "buy_amount, sell_amount, net_amount, change_percent, "
                 "close_price, turnover_rate, amount, buy_seat_count, sell_seat_count "
-                "FROM cnd_dragon_tiger_list ORDER BY trade_date DESC LIMIT 10000"
+                "FROM cnd_dragon_tiger_list WHERE trade_date >= %s ORDER BY trade_date DESC",
+                (cutoff,)
             )
             columns = [desc[0] for desc in cur.description]
             rows = cur.fetchall()
@@ -280,54 +281,59 @@ def extract_window(bars: List[Dict], center_idx: int, before: int = 5, after: in
 
 
 # ================================================================
-# 回测引擎 (D1买入, D1日内动量决定出场)
+# 回测引擎 (D1买入, 连板出场)
 # ================================================================
+
+def _is_limit_up(close, prev_close, limit_pct):
+    """判断是否涨停"""
+    if prev_close <= 0:
+        return False
+    return (close / prev_close - 1) * 100 >= limit_pct * 0.95
+
 
 def run_backtest_v4(bars: List[Dict], d0_idx: int, buy_price: float,
                     d1_intraday: float,
-                    hold_days: int = 10, stop_loss: float = -8.0,
-                    trailing_stop: float = -8.0, take_profit: float = 15.0,
-                    min_intraday: float = 3.0) -> Optional[Dict]:
-    """v4回测: D1买入, D1日内动量决定出场
+                    hold_days: int = 7, stop_loss: float = -8.0,
+                    trailing_stop: float = -5.0, take_profit: float = 100.0,
+                    min_intraday: float = 0.0,
+                    board_type: str = 'main') -> Optional[Dict]:
+    """v5回测: D1买入, 涨幅/日内动量出场
 
-    时间线:
-      D0 涨停
-      D1 开盘买入 (buy_idx = d0_idx + 1)
-      D1 收盘后计算日内动量
-      D2: 日内动量<min_intraday → 开盘清仓
-          日内动量>=min_intraday → 继续持有
+    出场规则:
+      1. D1日内动量 < -3%% → D2开盘清仓 (高开低走止损)
+      2. D2~D7 每天检查:
+         主板: 涨幅<10%% → 清仓
+         创科板: 涨幅<3%% OR 日内<-3%% → 清仓
+      3. 持仓上限7天 (兜底)
 
     Args:
         d0_idx: D0(涨停日)索引
         buy_price: D1开盘价
         d1_intraday: D1日内动量 = (D1收盘-D1开盘)/D1开盘*100
-        min_intraday: 日内动量阈值, <此值则D2开盘清仓
     """
     d1_idx = d0_idx + 1
     if buy_price <= 0 or d1_idx >= len(bars):
         return None
 
     d1 = bars[d1_idx]
-
-    # 收益从D1开始
     d1_change = (d1['close'] / buy_price - 1) * 100
     peak = max(buy_price, d1['high'])
 
-    # === 出场规则1: D1日内动量<min_intraday → D2开盘清仓 ===
-    if d1_intraday < min_intraday:
+    limit_pct = 20.0 if board_type == 'gem_star' else 10.0
+
+    # === 规则1: D1日内动量 < -3%% → D2开盘清仓 ===
+    if d1_intraday < -3:
         if d1_idx + 1 < len(bars):
             d2 = bars[d1_idx + 1]
             exit_p = d2['open']
             exit_d = 2
-            exit_reason = "日内不足"
+            exit_reason = "高开低走(D1日内{:.1f}%)".format(d1_intraday)
         else:
             exit_p = d1['close']
             exit_d = 1
             exit_reason = "持仓到期"
-
         return_pct = (exit_p / buy_price - 1) * 100
         peak_pct = (peak / buy_price - 1) * 100
-
         return {
             'exit_price': round(exit_p, 3),
             'exit_day': exit_d,
@@ -341,44 +347,50 @@ def run_backtest_v4(bars: List[Dict], d0_idx: int, buy_price: float,
             'ohlcv_window': extract_window(bars, d1_idx, before=5, after=10),
         }
 
-    # === 出场规则2: D1日内动量>=min_intraday → 继续持有 ===
+    # === 规则2: D2~D7 任一天未涨停 → 当天收盘清仓 ===
     exit_p = d1['close']
     exit_d = 1
     exit_reason = "持仓到期"
     daily_returns = [round(d1_change, 2)]
 
-    # 从D2开始持有
     for d in range(2, hold_days + 2):
         idx = d1_idx + d - 1
         if idx >= len(bars):
             break
         b = bars[idx]
+        prev_b = bars[idx - 1]
         if b['high'] > peak:
             peak = b['high']
 
         daily_ret = (b['close'] / buy_price - 1) * 100
         daily_returns.append(round(daily_ret, 2))
 
-        # 止盈
-        if b['high'] >= buy_price * (1 + take_profit / 100):
-            exit_p = buy_price * (1 + take_profit / 100)
-            exit_d = d
-            exit_reason = "止盈"
-            break
-
-        # 追踪止损
-        if d > 2 and b['low'] <= peak * (1 + trailing_stop / 100):
-            exit_p = peak * (1 + trailing_stop / 100)
-            exit_d = d
-            exit_reason = "追踪止损"
-            break
-
-        # 止损
+        # 硬止损 (兜底)
         if b['low'] <= buy_price * (1 + stop_loss / 100):
             exit_p = buy_price * (1 + stop_loss / 100)
             exit_d = d
             exit_reason = "止损"
             break
+
+        # 未达标 → 清仓
+        # 主板: 涨幅<10% (涨停阈值)
+        # 创科板: 涨幅<3% OR 日内动量<-3% (20%涨停太难连续)
+        if limit_pct >= 15.0:
+            # 创科板: 涨幅<3% OR 日内<-3%
+            intraday = (b['close'] - b['open']) / b['open'] * 100 if b['open'] > 0 else 0
+            chg = (b['close'] / prev_b['close'] - 1) * 100 if prev_b['close'] > 0 else 0
+            if chg < 3 or intraday < -3:
+                exit_p = b['close']
+                exit_d = d
+                exit_reason = "D{}涨幅{:+.1f}%日内{:+.1f}%".format(d, chg, intraday)
+                break
+        else:
+            # 主板: 涨幅<10%
+            if not _is_limit_up(b['close'], prev_b['close'], limit_pct):
+                exit_p = b['close']
+                exit_d = d
+                exit_reason = "D{}涨幅不足".format(d)
+                break
 
         exit_p = b['close']
         exit_d = d
@@ -451,15 +463,15 @@ def print_stats(stats: Dict, label: str):
 # ================================================================
 
 def strategy_v4(dragon_data: List[Dict], kline_cache: Dict[str, List[Dict]],
-                min_tech_score: int = 85, min_intraday: float = 3.0,
-                hold_days: int = 10, stop_loss: float = -8.0,
-                trailing_stop: float = -8.0, take_profit: float = 15.0,
-                show_tech: bool = False, today_only: bool = False) -> List[Dict]:
-    """v4策略
+                min_tech_score: int = 85, min_intraday: float = 0.0,
+                hold_days: int = 7, stop_loss: float = -8.0,
+                trailing_stop: float = -5.0, take_profit: float = 100.0,
+                show_tech: bool = False, today_only: bool = False,
+                no_inst_filter: bool = False) -> List[Dict]:
+    """v5策略
 
-    入场: D0涨停 + 技术分>95 + D1高开(>3%) → D1开盘买入
-    出场: D1日内动量<min_intraday → D2开盘清仓
-          D1日内动量>=min_intraday → 继续持有
+    入场: D0涨停 + 技术分>95 + D1高开(>5%) + 排除机构2~3家买入
+    出场: D1日内<-3%清仓 | 主板:涨幅<10% 创科:涨幅<3%+日内<-3% | 上限7天
     """
     trades = []
 
@@ -487,10 +499,17 @@ def strategy_v4(dragon_data: List[Dict], kline_cache: Dict[str, List[Dict]],
             change_pct = float(row.get('change_percent', 0) or 0)
             net_amount = float(row.get('net_amount', 0) or 0)
             buy_seats = int(row.get('buy_seat_count', 0) or 0)
+            reason = row.get('reason', '')
 
             # 条件1: D0涨停
             if change_pct < 9.5:
                 continue
+
+            # 过滤: 排除机构2~3家买入 (出货信号)
+            if not no_inst_filter:
+                _inst_m = re.search(r'(\d+)家机构买入', reason)
+                if _inst_m and int(_inst_m.group(1)) in [2, 3]:
+                    continue
 
             # 找到D0索引
             d0_idx = None
@@ -566,17 +585,13 @@ def strategy_v4(dragon_data: List[Dict], kline_cache: Dict[str, List[Dict]],
             # 回测
             result = run_backtest_v4(bars, d0_idx, buy_price, d1_intraday,
                                       hold_days, stop_loss, trailing_stop, take_profit,
-                                      min_intraday)
+                                      min_intraday, board_type)
             if not result:
                 continue
 
             score = tech.get('tech_score', 50)
-            if d1_intraday >= min_intraday:
-                score += 15  # 日内动量达标加分
-            if d1_intraday >= 5:
-                score += 10
             if net_amount > 50000000:
-                score += 5
+                score += 10
             if buy_seats > 0:
                 score += 5
 
@@ -615,12 +630,13 @@ def strategy_v4(dragon_data: List[Dict], kline_cache: Dict[str, List[Dict]],
 def main():
     parser = argparse.ArgumentParser(description="龙虎榜涨停强势策略 v4")
     parser.add_argument("--days", type=int, default=30, help="分析最近N天")
-    parser.add_argument("--hold-days", type=int, default=10, help="持仓天数")
+    parser.add_argument("--hold-days", type=int, default=7, help="持仓天数")
     parser.add_argument("--stop-loss", type=float, default=-8.0, help="止损%%")
-    parser.add_argument("--trailing-stop", type=float, default=-8.0, help="追踪止损%%")
-    parser.add_argument("--take-profit", type=float, default=15.0, help="止盈%%")
+    parser.add_argument("--trailing-stop", type=float, default=-5.0, help="追踪止损%%")
+    parser.add_argument("--take-profit", type=float, default=100.0, help="止盈%% (100=不启用)")
     parser.add_argument("--min-tech", type=int, default=95, help="最低技术分")
-    parser.add_argument("--min-intraday", type=float, default=3.0, help="D1日内动量阈值%%")
+    parser.add_argument("--min-intraday", type=float, default=0.0, help="D1日内动量阈值%% (0=不启用)")
+    parser.add_argument("--no-inst-filter", action="store_true", help="不排除机构2~3家买入")
     parser.add_argument("--today", action="store_true", help="D0盘后信号")
     parser.add_argument("--today-date", type=str, default="", help="指定D0日期")
     parser.add_argument("--all-trades", action="store_true", help="输出交易明细")
@@ -629,13 +645,13 @@ def main():
     args = parser.parse_args()
 
     print("=" * 80)
-    print("龙虎榜涨停强势策略 v4")
-    print("入场: D0涨停 + 技术分>95 + D1跳空高开(>3%) -> D1开盘买")
-    print("出场: D1日内动量<3% -> D2开盘跑 | >=3% -> 持有")
+    print("龙虎榜涨停强势策略 v5")
+    print("入场: D0涨停 + 技术分>95 + D1跳空高开(>5%) + 排除机构2~3家买入")
+    print("出场: D1日内<-3%清仓 | 主板:涨幅<10%清仓 创科:涨幅<3%+日内<-3%清仓 | 上限7天")
     print("=" * 80)
 
     print("\n📊 加载龙虎榜数据...")
-    dragon_data = fetch_dragon_tiger_from_db()
+    dragon_data = fetch_dragon_tiger_from_db(args.days)
     print(f"  龙虎榜: {len(dragon_data)}条")
 
     if not dragon_data:
@@ -651,19 +667,19 @@ def main():
         print(f"{'=' * 80}")
 
         for min_tech in [70, 80, 85, 90, 95]:
-            for min_intraday in [2, 3, 5]:
-                trades = strategy_v4(dragon_data, kline_cache,
-                                      min_tech_score=min_tech, min_intraday=min_intraday,
-                                      hold_days=args.hold_days, stop_loss=args.stop_loss,
-                                      trailing_stop=args.trailing_stop, take_profit=args.take_profit)
-                if trades:
-                    stats = calc_stats(trades)
-                    total_ret = sum(t['return_pct'] for t in trades)
-                    total_days = sum(t['exit_day'] for t in trades)
-                    rpd = total_ret / total_days if total_days > 0 else 0
-                    print(f"  技术>{min_tech:>2} 日内>{min_intraday}%: "
-                          f"{stats['total']:>4}笔 胜率{stats['win_rate']:>5.1f}% "
-                          f"均收益{stats['avg_return']:>+6.2f}% 日均{rpd:>+.3f}%")
+            trades = strategy_v4(dragon_data, kline_cache,
+                                  min_tech_score=min_tech,
+                                  hold_days=args.hold_days, stop_loss=args.stop_loss,
+                                  trailing_stop=args.trailing_stop, take_profit=args.take_profit,
+                                  no_inst_filter=args.no_inst_filter)
+            if trades:
+                stats = calc_stats(trades)
+                total_ret = sum(t['return_pct'] for t in trades)
+                total_days = sum(t['exit_day'] for t in trades)
+                rpd = total_ret / total_days if total_days > 0 else 0
+                print(f"  技术>{min_tech:>2}: "
+                      f"{stats['total']:>4}笔 胜率{stats['win_rate']:>5.1f}% "
+                      f"均收益{stats['avg_return']:>+6.2f}% 日均{rpd:>+.3f}%")
         return
 
     # === today模式 ===
@@ -673,7 +689,8 @@ def main():
         print(f"\n🔄 筛选 {d0_str} 涨停信号 (技术分>{args.min_tech})...")
         trades = strategy_v4(dragon_data, kline_cache,
                               min_tech_score=args.min_tech, min_intraday=args.min_intraday,
-                              today_only=True)
+                              today_only=True,
+                              no_inst_filter=args.no_inst_filter)
         trades = [t for t in trades if t.get('signal_date') == d0_str]
 
         print(f"\n{'=' * 80}")
@@ -709,23 +726,24 @@ def main():
             print(f"\n  操作建议:")
             print(f"  1. D1开盘价 <= 建议买入价 才入场")
             print(f"  2. D1开盘涨幅 > 5% 不追")
-            print(f"  3. D1收盘后看日内动量:")
-            print(f"     - 日内<3%: D2开盘立即清仓")
-            print(f"     - 日内>=3%: 继续持有, 追踪止损-8%, 止盈+15%")
+            print(f"  3. 持仓规则:")
+            print(f"     - D1日内<-3%: D2开盘清仓")
+            print(f"     - D2~D7: 主板涨幅<10%清仓 创科涨幅<3%+日内<-3%清仓")
+            print(f"     - 持仓上限7天")
         else:
             print(f"  今日无符合条件的信号")
         return
 
     # === 正常回测 ===
-    print(f"  参数: 技术分>{args.min_tech} 日内动量>{args.min_intraday}% "
-          f"持仓{args.hold_days}天 止损{args.stop_loss}% 止盈{args.take_profit}%")
+    print(f"  参数: 技术分>{args.min_tech} 持仓上限{args.hold_days}天")
 
     print(f"\n🔄 运行策略...")
     trades = strategy_v4(dragon_data, kline_cache,
-                          min_tech_score=args.min_tech, min_intraday=args.min_intraday,
+                          min_tech_score=args.min_tech,
                           hold_days=args.hold_days, stop_loss=args.stop_loss,
                           trailing_stop=args.trailing_stop, take_profit=args.take_profit,
-                          show_tech=args.tech)
+                          show_tech=args.tech,
+                          no_inst_filter=args.no_inst_filter)
 
     # 结果
     print(f"\n{'=' * 80}")
@@ -744,13 +762,43 @@ def main():
     # 按出场原因分组
     if trades:
         print(f"\n  出场原因:")
-        for reason in ['日内不足', '止盈', '追踪止损', '止损', '持仓到期']:
-            seg = [t for t in trades if t.get('exit_reason') == reason]
-            if seg:
-                s = calc_stats(seg)
-                seg_rpd = sum(t['return_pct'] for t in seg) / sum(t['exit_day'] for t in seg) if sum(t['exit_day'] for t in seg) > 0 else 0
-                print(f"    {reason:>6}: {s['total']:>3}笔 胜率{s['win_rate']:>5.1f}% "
-                      f"均收益{s['avg_return']:>+6.2f}% 均持仓{s['avg_hold']:.1f}天 日均{seg_rpd:>+.3f}%")
+        reason_groups = {
+            '高开低走': [], 'D2': [], 'D3': [],
+            'D4': [], 'D5': [], 'D6': [],
+            'D7': [], '止损': [], '持仓到期': []
+        }
+        for t in trades:
+            r = t.get('exit_reason', '')
+            matched = False
+            # 高开低走
+            if r.startswith('高开低走'):
+                reason_groups['高开低走'].append(t)
+                matched = True
+            # 止损
+            elif r == '止损':
+                reason_groups['止损'].append(t)
+                matched = True
+            # 持仓到期
+            elif r == '持仓到期':
+                reason_groups['持仓到期'].append(t)
+                matched = True
+            # D{N}开头的出场原因
+            if not matched:
+                for d in range(2, 8):
+                    if r.startswith('D{}'.format(d)):
+                        reason_groups['D{}'.format(d)].append(t)
+                        matched = True
+                        break
+            if not matched:
+                reason_groups.setdefault('其他', []).append(t)
+
+        for reason, seg in reason_groups.items():
+            if not seg:
+                continue
+            s = calc_stats(seg)
+            seg_rpd = sum(t['return_pct'] for t in seg) / sum(t['exit_day'] for t in seg) if sum(t['exit_day'] for t in seg) > 0 else 0
+            print(f"    {reason}: {s['total']:>3}笔 胜率{s['win_rate']:>5.1f}% "
+                  f"均收益{s['avg_return']:>+6.2f}% 均持仓{s['avg_hold']:.1f}天 日均{seg_rpd:>+.3f}%")
 
     # 交易明细
     if args.all_trades and trades:
@@ -763,7 +811,7 @@ def main():
                   f"{t['signal_date']}涨停{t['d0_change']:.0f}% -> "
                   f"{t['entry_date']}买{t['entry_price']:>7.2f} "
                   f"D1日内{t['d1_intraday']:>+5.1f}% "
-                  f"-> {t['exit_reason'][:6]} 收益{t['return_pct']:>+6.2f}%")
+                  f"-> {t['exit_reason']} 收益{t['return_pct']:>+6.2f}%")
 
     # 导出
     if trades:

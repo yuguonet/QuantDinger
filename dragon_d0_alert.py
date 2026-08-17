@@ -1,15 +1,21 @@
 """
-龙虎榜 D0 预警系统 (双层策略)
+龙虎榜 D0 预警系统 (双层策略 + 技术综合评分)
 
-高确信: 周期 + 多头+角>0.3+RSI>60+KDJ>80+D1涨>10%   → 命中率~57%
-标准:   周期 + 多头+角>0.3+RSI>60+KDJ>80+D1涨>3%+连涨>=2 → 命中率~51%
+高确信: 周期 + 技术分>=70 + 多头+角>0.3+RSI>60+KDJ>80+信号日涨>10%   → 命中率~57%
+标准:   周期 + 技术分>=70 + 多头+角>0.3+RSI>60+KDJ>80+信号日涨>3%+连涨>=2 → 命中率~51%
 
 逻辑:
   1. 维护龙虎榜常客池 (历史上榜>=10次)
   2. 追踪每只的上榜间隔中位数
   3. 当某只安静天数 > 中位间隔 × 1.0 → 周期信号
-  4. 信号日当天需满足: 多头排列 + MA5角>0.3% + RSI14>60 + KDJ K>70 + 涨幅>10%
-  5. 全部满足 → 输出预警, 预计1-3天内上龙虎榜
+  4. 综合技术分 >= 70 (MA排列+RSI+KDJ+OBV+量比+角度)
+  5. 信号日当天需满足: 多头排列 + MA5角>0.3% + RSI14>60 + KDJ K>70 + 涨幅>10%
+  6. 全部满足 → 输出预警, 预计1-3天内上龙虎榜
+
+技术综合评分 (calc_tech_score, 0-100):
+  MA排列: 多头+20, 空头-15  |  RSI: 40~60中性+5, >70超买-10
+  OBV趋势: 上升+10, 下降-10  |  量比: 1~2x温和+5, >3x过度-5
+  MA5角: >0.5%+10, >0.3%+5  |  KDJ: >90+10, >80+5
 
 运行:
   python dragon_d0_alert.py --scan           # 扫描当前预警
@@ -77,7 +83,7 @@ TECH_STD = {
     'min_ma5_angle': 0.3,    # MA5斜率 > 0.3%/天
     'min_rsi14': 60,         # RSI14 > 60
     'min_kdj_k': 80,         # KDJ K > 80
-    'min_d1_chg': 3,         # 信号日涨幅 > 3%
+    'min_signal_chg': 3,    # 信号日涨幅 > 3%
     'min_up_streak': 2,      # 连涨 >= 2天
 }
 
@@ -86,8 +92,15 @@ TECH_HIGH = {
     'min_ma5_angle': 0.3,
     'min_rsi14': 60,
     'min_kdj_k': 80,
-    'min_d1_chg': 10,        # 信号日涨幅 > 10% (涨停级)
+    # min_signal_chg 不在这里定义，由 _get_limit_chg() 按板块动态返回
 }
+
+# 涨停阈值 (按板块)
+LIMIT_CHG_MAIN = 10.0      # 主板涨停 10%
+LIMIT_CHG_GEM_STAR = 20.0  # 创科板涨停 20%
+
+# 综合技术分阈值 (0-100, 来自 analyze_tech 评分体系)
+MIN_TECH_SCORE = 70        # 技术分 >= 70 才出预警
 
 
 # ================================================================
@@ -131,6 +144,17 @@ def load_kline(code: str, days: int = 300) -> List[Dict]:
 # ================================================================
 # 技术指标
 # ================================================================
+
+def _get_board_type(code):
+    """根据股票代码判断板块: 'gem_star'(创科板) / 'main'(主板)"""
+    c = str(code)[:3]
+    return 'gem_star' if c.startswith('30') or c.startswith('68') else 'main'
+
+
+def _get_limit_chg(code, name=''):
+    """根据股票代码返回涨停阈值 (主板10%, 创科20%)"""
+    return LIMIT_CHG_GEM_STAR if _get_board_type(code) == 'gem_star' else LIMIT_CHG_MAIN
+
 
 def calc_ma5_angle(closes, period=5, days=3):
     if len(closes) < period + days:
@@ -181,7 +205,113 @@ def calc_kdj_k(closes, highs, lows, period=9):
     return k_val
 
 
-def check_tech(bars, date, conditions):
+def calc_obv_trend(bars, period=5):
+    """OBV趋势: 最近period天OBV变化方向"""
+    if len(bars) < period + 1:
+        return "平"
+    obv = 0
+    obv_list = [0]
+    for i in range(1, len(bars)):
+        if bars[i]['close'] > bars[i-1]['close']:
+            obv += bars[i]['volume']
+        elif bars[i]['close'] < bars[i-1]['close']:
+            obv -= bars[i]['volume']
+        obv_list.append(obv)
+    change = obv_list[-1] - obv_list[-period]
+    if change > 0:
+        return "上升"
+    elif change < 0:
+        return "下降"
+    return "平"
+
+
+def calc_vol_ratio(bars, idx, period=5):
+    """量比: 当日成交量 / 近period天均量"""
+    if idx < period or period <= 0:
+        return 1.0
+    avg_vol = sum(bars[i]['volume'] for i in range(idx - period, idx)) / period
+    if avg_vol <= 0:
+        return 1.0
+    return bars[idx]['volume'] / avg_vol
+
+
+def calc_tech_score(bars, idx):
+    """综合技术评分 (0-100)
+
+    评分维度:
+      MA排列: 多头+20, 空头-15, 交叉+10
+      RSI14:  40~60中性+5, >70超买-10, <30超卖+10
+      OBV趋势: 上升+10, 下降-10
+      量比:   1~2x温和+5, >3x过度-5
+      MA5角:  >0.3%+5, >0.5%+10
+      KDJ K:  >80+5, >90+10
+    """
+    if idx < 20 or idx >= len(bars):
+        return 0
+
+    closes = [bars[i]['close'] for i in range(max(0, idx - 60), idx + 1)]
+    highs = [bars[i]['high'] for i in range(max(0, idx - 60), idx + 1)]
+    lows = [bars[i]['low'] for i in range(max(0, idx - 60), idx + 1)]
+
+    ma5 = sum(closes[-5:]) / 5 if len(closes) >= 5 else None
+    ma10 = sum(closes[-10:]) / 10 if len(closes) >= 10 else None
+    ma20 = sum(closes[-20:]) / 20 if len(closes) >= 20 else None
+    rsi14 = calc_rsi(closes, 14)
+    kdj_k = calc_kdj_k(closes, highs, lows, 9)
+    obv_trend = calc_obv_trend(bars[:idx + 1])
+    vol_ratio = calc_vol_ratio(bars, idx)
+    angle = calc_ma5_angle(closes[-20:], 5, 3) if len(closes) >= 20 else None
+
+    score = 50
+
+    # MA排列
+    if ma5 and ma10 and ma20:
+        if ma5 > ma10 > ma20:
+            score += 20
+        elif ma5 < ma10 < ma20:
+            score -= 15
+        elif ma5 > ma10:
+            score += 10
+
+    # RSI
+    if rsi14 is not None:
+        if 40 <= rsi14 <= 60:
+            score += 5
+        elif rsi14 > 70:
+            score -= 10
+        elif rsi14 < 30:
+            score += 10
+
+    # OBV趋势
+    if obv_trend == "上升":
+        score += 10
+    elif obv_trend == "下降":
+        score -= 10
+
+    # 量比
+    if 1.0 <= vol_ratio <= 2.0:
+        score += 5
+    elif vol_ratio > 3.0:
+        score -= 5
+
+    # MA5 角度
+    if angle is not None:
+        if angle > 0.5:
+            score += 10
+        elif angle > 0.3:
+            score += 5
+
+    # KDJ
+    if kdj_k is not None:
+        if kdj_k > 90:
+            score += 10
+        elif kdj_k > 80:
+            score += 5
+
+    return max(0, min(100, score))
+
+
+def check_tech(bars, date, conditions, code='', name=''):
     """检查某天是否满足全部技术条件"""
     idx = None
     for i, b in enumerate(bars):
@@ -206,10 +336,10 @@ def check_tech(bars, date, conditions):
     kdj = calc_kdj_k(closes, highs, lows, 9)
 
     prev_close = bars[idx - 1]['close'] if idx > 0 else 0
-    d1_chg = (bars[idx]['close'] / prev_close - 1) * 100 if prev_close > 0 else 0
+    signal_chg = (bars[idx]['close'] / prev_close - 1) * 100 if prev_close > 0 else 0
 
     vol5 = sum(volumes[-6:-1]) / 5 if len(volumes) >= 6 else 1
-    d1_vol = bars[idx]['volume'] / vol5 if vol5 > 0 else 1
+    signal_vol = bars[idx]['volume'] / vol5 if vol5 > 0 else 1
 
     # 连涨天数
     streak = 0
@@ -225,9 +355,11 @@ def check_tech(bars, date, conditions):
         'angle': round(angle, 2) if angle else None,
         'rsi14': round(rsi, 1) if rsi else None,
         'kdj_k': round(kdj, 1) if kdj else None,
-        'd1_chg': round(d1_chg, 2),
-        'd1_vol': round(d1_vol, 2),
+        'signal_chg': round(signal_chg, 2),
+        'signal_vol': round(signal_vol, 2),
         'up_streak': streak,
+        'obv_trend': calc_obv_trend(bars[:idx + 1]),
+        'tech_score': calc_tech_score(bars, idx),
     }
 
     # 检查条件
@@ -239,9 +371,17 @@ def check_tech(bars, date, conditions):
         return False, details
     if 'min_kdj_k' in conditions and (kdj is None or kdj < conditions['min_kdj_k']):
         return False, details
-    if 'min_d1_chg' in conditions and d1_chg < conditions['min_d1_chg']:
-        return False, details
-    if 'min_d1_vol_ratio' in conditions and d1_vol < conditions['min_d1_vol_ratio']:
+    # 涨停阈值按板块动态判断 (主板10%, 创科板20%, ST 5%)
+    # 仅当 conditions 未指定 min_signal_chg 时使用涨停阈值 (即 TECH_HIGH)
+    # TECH_STD 自带 min_signal_chg: 3，走原有逻辑
+    if 'min_signal_chg' in conditions:
+        if signal_chg < conditions['min_signal_chg']:
+            return False, details
+    elif code:
+        limit_chg = _get_limit_chg(code, name)
+        if signal_chg < limit_chg * 0.95:
+            return False, details
+    if 'min_signal_vol_ratio' in conditions and signal_vol < conditions['min_signal_vol_ratio']:
         return False, details
     if 'min_up_streak' in conditions and streak < conditions['min_up_streak']:
         return False, details
@@ -318,16 +458,33 @@ def scan_alerts(records, kline_cache=None, show_detail=False):
         if not bars:
             continue
 
-        passed_high, details = check_tech(bars, latest, TECH_HIGH)
-        passed_std, details = check_tech(bars, latest, TECH_STD)
+        # 技术综合评分
+        tech_idx = None
+        for i, b in enumerate(bars):
+            if b['time'] == latest:
+                tech_idx = i
+                break
+        if tech_idx is None or tech_idx < 20:
+            continue
+
+        tech_score = calc_tech_score(bars, tech_idx)
+        if tech_score < MIN_TECH_SCORE:
+            continue
+
+        name = by_code[code][-1].get('stock_name', '')
+        passed_high, details = check_tech(bars, latest, TECH_HIGH, code=code, name=name)
+        passed_std, details = check_tech(bars, latest, TECH_STD, code=code, name=name)
         if not passed_high and not passed_std:
             continue
         tier = 'high' if passed_high else 'std'
 
-        name = by_code[code][-1].get('stock_name', '')
+        board = '创科' if _get_board_type(code) == 'gem_star' else '主板'
+        limit = _get_limit_chg(code, name)
         candidates.append({
             'code': code,
             'name': name,
+            'board': board,
+            'limit_chg': limit,
             'tier': tier,
             'count': len(dates),
             'last_dragon': last,
@@ -341,7 +498,7 @@ def scan_alerts(records, kline_cache=None, show_detail=False):
 
     print(f"\n{'='*70}")
     print(f"  龙虎榜 D0 预警 ({latest})")
-    print(f"  双层策略: 高确信(D1涨>10%) + 标准(D1涨>3%+连涨>=2)")
+    print(f"  双层策略: 高确信(信号日涨>10%) + 标准(信号日涨>3%+连涨>=2)")
     print(f"{'='*70}")
 
     high_cands = [c for c in candidates if c['tier']=='high']
@@ -349,19 +506,23 @@ def scan_alerts(records, kline_cache=None, show_detail=False):
     print(f"  高确信: {len(high_cands)}只 | 标准: {len(std_cands)}只")
 
     if candidates:
-        print(f"\n  {'层级':>4} {'代码':>8} {'名称':>8} {'上榜':>4} {'安静':>4} {'中位':>4} {'倍数':>5} {'D1涨':>6} {'RSI':>5} {'KDJ':>5} {'角':>5}")
-        print(f"  {'-'*70}")
+        print(f"\n  {'层级':>4} {'代码':>8} {'板块':>4} {'名称':>8} {'上榜':>4} {'安静':>4} {'中位':>4} {'倍数':>5} {'信号涨':>6} {'技分':>4} {'OBV':>4}")
+        print(f"  {'-'*72}")
         for c in candidates:
             d = c['details']
             tier_name = '★高' if c['tier']=='high' else '☆标'
-            print(f"  {tier_name:>4} {c['code']:>8} {c['name']:>8} {c['count']:>4}次 {c['days_since']:>3}天 "
+            obv = d.get('obv_trend', '平')
+            obv_short = {'上升':'↑','下降':'↓','平':'—'}.get(obv, '—')
+            print(f"  {tier_name:>4} {c['code']:>8} {c['board']:>4} {c['name']:>8} {c['count']:>4}次 {c['days_since']:>3}天 "
                   f"{c['median_gap']:>3.0f}天 {c['ratio']:>4.1f}x "
-                  f"{d['d1_chg']:>+5.1f}% {d['rsi14']:>5.1f} {d['kdj_k']:>5.1f} {d['angle']:>5.2f}")
+                  f"{d['signal_chg']:>+5.1f}% {d['tech_score']:>4} {obv_short:>4}")
 
             if show_detail:
                 print(f"          MA5={d['ma5']} MA10={d['ma10']} MA20={d['ma20']} "
                       f"多头={'✓' if d['ma_bull'] else '✗'} "
-                      f"量比={d['d1_vol']} 连涨={d['up_streak']}天")
+                      f"RSI={d['rsi14']} KDJ={d['kdj_k']} "
+                      f"量比={d['signal_vol']} 连涨={d['up_streak']}天 OBV={obv} "
+                      f"涨停阈={c['limit_chg']:.0f}%")
     else:
         print(f"\n  今日无预警信号")
 
@@ -435,17 +596,30 @@ def simulate_trade(bars, buy_date, hold_days=7, stop_loss=-8.0, take_profit=15.0
 # 回测
 # ================================================================
 
-def classify_signal(code, date, kline_cache):
-    """判断信号层级: high / std / None"""
+def classify_signal(code, date, kline_cache, name=''):
+    """判断信号层级: high / std / None (含技术分过滤)"""
     if code not in kline_cache:
         kline_cache[code] = load_kline(code)
     bars = kline_cache[code]
     if not bars:
         return None, {}
-    high_pass, details = check_tech(bars, date, TECH_HIGH)
+
+    # 技术分过滤
+    idx = None
+    for i, b in enumerate(bars):
+        if b['time'] == date:
+            idx = i
+            break
+    if idx is None or idx < 20:
+        return None, {}
+    tech_score = calc_tech_score(bars, idx)
+    if tech_score < MIN_TECH_SCORE:
+        return None, {}
+
+    high_pass, details = check_tech(bars, date, TECH_HIGH, code=code, name=name)
     if high_pass:
         return 'high', details
-    std_pass, details = check_tech(bars, date, TECH_STD)
+    std_pass, details = check_tech(bars, date, TECH_STD, code=code, name=name)
     if std_pass:
         return 'std', details
     return None, {}
@@ -502,7 +676,8 @@ def backtest(records, show_detail=False):
         # 分层分类
         high_codes, std_codes = [], []
         for code in cycle_codes:
-            tier, _ = classify_signal(code, date, kline_cache)
+            name = by_code[code][-1].get('stock_name', '') if code in by_code else ''
+            tier, _ = classify_signal(code, date, kline_cache, name=name)
             if tier == 'high':
                 high_codes.append(code)
             elif tier == 'std':
@@ -538,7 +713,8 @@ def backtest(records, show_detail=False):
                     if result:
                         stats[tier]['trades'].append({
                             'code': code, 'signal_date': date, 'buy_date': buy_date,
-                            'tier': tier, 'hit': code in hit_codes, **result
+                            'tier': tier, 'hit': code in hit_codes,
+                            'board': _get_board_type(code), **result
                         })
 
         daily_stats.append(day_stat)
@@ -552,7 +728,7 @@ def backtest(records, show_detail=False):
     print(f"{'='*60}")
     print(f"  统计天数: {len(daily_stats)}")
 
-    for tier, label in [('high', '高确信(D1涨>10%)'), ('std', '标准(D1涨>3%+连涨>=2)')]:
+    for tier, label in [('high', '高确信(涨停级: 主板>=10% / 创科>=20%)'), ('std', '标准(信号日涨>3%+连涨>=2)')]:
         s = stats[tier]
         n = s['signals']
         if n == 0:
@@ -601,6 +777,18 @@ def backtest(records, show_detail=False):
                 m_avg = sum(t['return_pct'] for t in miss_trades)/len(miss_trades)
                 print(f"  命中({len(hit_trades)}笔): {h_avg:+.2f}% | 未命中({len(miss_trades)}笔): {m_avg:+.2f}%")
 
+            # 按板块分组统计
+            main_trades = [t for t in trades if t.get('board') == 'main']
+            gem_trades = [t for t in trades if t.get('board') == 'gem_star']
+            for b_label, b_trades in [('主板', main_trades), ('创科', gem_trades)]:
+                if not b_trades:
+                    continue
+                bn = len(b_trades)
+                bw = sum(1 for t in b_trades if t['return_pct'] > 0)
+                b_avg = sum(t['return_pct'] for t in b_trades) / bn
+                b_rpd = sum(t['return_pct'] for t in b_trades) / sum(t['hold_days'] for t in b_trades) if sum(t['hold_days'] for t in b_trades) > 0 else 0
+                print(f"  {b_label}: {bn}笔 胜率{bw/bn*100:.1f}% 均收益{b_avg:+.2f}% 日均{b_rpd:+.3f}%")
+
     # 汇总
     all_trades = stats['high']['trades'] + stats['std']['trades']
     if all_trades:
@@ -625,7 +813,11 @@ def main():
     parser.add_argument("--backtest", action="store_true", help="回测验证")
     parser.add_argument("--detail", action="store_true", help="输出详细信息")
     parser.add_argument("--years", type=int, default=2, help="数据年数")
+    parser.add_argument("--min-tech", type=int, default=70, help="最低技术分 (0-100)")
     args = parser.parse_args()
+
+    global MIN_TECH_SCORE
+    MIN_TECH_SCORE = args.min_tech
 
     print("加载龙虎榜数据...", file=sys.stderr)
     records = load_dragon_data(args.years)
