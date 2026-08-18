@@ -55,8 +55,8 @@ def _normalize_dragon_tiger(raw: Dict[str, Any], source: str = "") -> Dict[str, 
             "sell_seat_count": _si(raw.get("卖出席位数", raw.get("sell_seat_count", raw.get("SELLER_NUM", 0)))),
         }
     return {
-        "stock_code": _ss(raw.get("stock_code", raw.get("SECURITY_CODE"))),
-        "stock_name": _ss(raw.get("stock_name", raw.get("SECURITY_NAME_ABBR"))),
+        "stock_code": _ss(raw.get("stock_code", raw.get("code", raw.get("SECURITY_CODE")))),
+        "stock_name": _ss(raw.get("stock_name", raw.get("name", raw.get("SECURITY_NAME_ABBR")))),
         "trade_date": _ss(raw.get("trade_date", raw.get("TRADE_DATE", "")))[:10],
         "reason": _ss(raw.get("reason", raw.get("EXPLANATION"))),
         "buy_amount": _sf(raw.get("buy_amount", raw.get("BUY"))),
@@ -360,19 +360,32 @@ _rt_broken_board = None
 _rt_hot_rank = None
 
 def _fetch_dragon_tiger() -> List[Dict[str, Any]]:
-    """拉取龙虎榜数据（HTTP 优先，AkShare 兜底）"""
+    """拉取龙虎榜数据（AkShare 为主，东财搜索兜底）"""
+    # AkShare 有完整龙虎榜字段（买卖额、净额、席位、上榜原因）
+    data = _ak_dragon_tiger("")
+    if data:
+        logger.info("[AkShare] dragon_tiger: %d stocks", len(data))
+        return data
+    # 东财搜索只有代码和价格，缺少龙虎榜专属字段，仅作兜底
     data = _em_search("龙虎榜", 200)
     if data:
-        logger.info("[HTTP] dragon_tiger: %d stocks", len(data))
-        return data
-    logger.info("[HTTP] dragon_tiger 无结果，回退 AkShare")
-    return _ak_dragon_tiger("")
+        normalized = _normalize_dragon_tiger_list(data, source="em")
+        logger.info("[HTTP] dragon_tiger (兜底): %d stocks", len(normalized))
+        return normalized
+    logger.warning("[dragon_limit] dragon_tiger: 所有数据源均无结果")
+    return []
 
 
 def _fetch_zt_pool() -> List[Dict[str, Any]]:
     """拉取涨停池数据"""
     data = _em_search("涨停", 200)
     if data:
+        # 东财搜索返回 code/name 字段，归一化
+        for r in data:
+            if "code" in r and "stock_code" not in r:
+                r["stock_code"] = r.pop("code")
+            if "name" in r and "stock_name" not in r:
+                r["stock_name"] = r.pop("name")
         logger.info("[HTTP] zt_pool: %d stocks", len(data))
         return data
     logger.info("[HTTP] zt_pool 无结果，回退 AkShare")
@@ -383,6 +396,11 @@ def _fetch_dt_pool() -> List[Dict[str, Any]]:
     """拉取跌停池数据"""
     data = _em_search("跌停", 200)
     if data:
+        for r in data:
+            if "code" in r and "stock_code" not in r:
+                r["stock_code"] = r.pop("code")
+            if "name" in r and "stock_name" not in r:
+                r["stock_name"] = r.pop("name")
         logger.info("[HTTP] dt_pool: %d stocks", len(data))
         return data
     logger.info("[HTTP] dt_pool 无结果，回退 AkShare")
@@ -393,6 +411,11 @@ def _fetch_broken_board() -> List[Dict[str, Any]]:
     """拉取炸板池数据"""
     data = _em_search("炸板", 200)
     if data:
+        for r in data:
+            if "code" in r and "stock_code" not in r:
+                r["stock_code"] = r.pop("code")
+            if "name" in r and "stock_name" not in r:
+                r["stock_name"] = r.pop("name")
         logger.info("[HTTP] broken_board: %d stocks", len(data))
         return data
     logger.info("[HTTP] broken_board 无结果，回退 AkShare")
@@ -400,13 +423,24 @@ def _fetch_broken_board() -> List[Dict[str, Any]]:
 
 
 def _fetch_hot_rank() -> List[Dict[str, Any]]:
-    """拉取热榜数据"""
-    data = _em_search("热门股票", 100)
+    """拉取热榜数据（AkShare 为主，东财搜索兜底）"""
+    # AkShare 有完整热榜字段（排名、人气值、排名变化）
+    data = _ak_hot_rank()
     if data:
-        logger.info("[HTTP] hot_rank: %d stocks", len(data))
+        logger.info("[AkShare] hot_rank: %d stocks", len(data))
         return data
-    logger.info("[HTTP] hot_rank 无结果，回退 AkShare")
-    return _ak_hot_rank()
+    # 东财搜索缺少排名和人气值，仅作兜底
+    data = _em_search("热门股票", 200)
+    if data:
+        for r in data:
+            if "code" in r and "stock_code" not in r:
+                r["stock_code"] = r.pop("code")
+            if "name" in r and "stock_name" not in r:
+                r["stock_name"] = r.pop("name")
+        logger.info("[HTTP] hot_rank (兜底): %d stocks", len(data))
+        return data
+    logger.warning("[dragon_limit] hot_rank: 所有数据源均无结果")
+    return []
 
 
 def refresh_dragon_tiger():

@@ -300,10 +300,31 @@ def _scheduler_loop():
     """每 10 秒检查一次，到期任务拉新线程执行。"""
     logger.info("[scheduler] 调度线程启动，每 10 秒检查一次")
 
+    now_dt = datetime.now()
+    today = now_dt.strftime("%Y-%m-%d")
+
     # 首次立即执行周期任务
     for task in TASKS:
         if not task.once_per_day:
             _launch(task)
+
+    # 启动补跑：日级任务触发时刻已过且未执行过，立即补跑
+    # 跳过 post_market_batch（会唤醒 EvalWorker，与 mq-worker 产生导入竞争）
+    from app.utils.trading_calendar import is_trading_day
+    for task in TASKS:
+        if not task.once_per_day or task.trigger_hour < 0:
+            continue
+        if task.name == "post_market_batch":
+            continue
+        if now_dt.hour < task.trigger_hour or (
+            now_dt.hour == task.trigger_hour and now_dt.minute < task.trigger_minute
+        ):
+            continue
+        if not is_trading_day(today):
+            continue
+        logger.info("[scheduler] 启动补跑: %s (今日 %02d:%02d 已过)",
+                     task.name, task.trigger_hour, task.trigger_minute)
+        _launch(task)
 
     while True:
         _time.sleep(10)

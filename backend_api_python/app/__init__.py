@@ -7,6 +7,7 @@ import sys as _sys
 # Make app/nanobot/ shadow any pip-installed nanobot-ai package,
 # so local patches are always used without touching import paths.
 _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__))))
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "agent"))
 
 import math
 import logging

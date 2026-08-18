@@ -383,10 +383,10 @@ def _normalize_dragon_tiger_record(raw: Dict[str, Any], source: str = "akshare")
             "sell_seat_count": _si(raw.get("卖出席位数", raw.get("sell_seat_count", raw.get("SELLER_NUM", 0)))),
         }
     
-    # em source: 东财搜索
+    # em source: 东财搜索（search_stocks 返回 code/name 字段）
     return {
-        "stock_code": _ss(raw.get("stock_code", raw.get("SECURITY_CODE"))),
-        "stock_name": _ss(raw.get("stock_name", raw.get("SECURITY_NAME_ABBR"))),
+        "stock_code": _ss(raw.get("stock_code", raw.get("code", raw.get("SECURITY_CODE")))),
+        "stock_name": _ss(raw.get("stock_name", raw.get("name", raw.get("SECURITY_NAME_ABBR")))),
         "trade_date": _ss(raw.get("trade_date", raw.get("TRADE_DATE", "")))[:10],
         "reason": _ss(raw.get("reason", raw.get("EXPLANATION"))),
         "buy_amount": _sf(raw.get("buy_amount", raw.get("BUY"))),
@@ -422,8 +422,8 @@ def _normalize_hot_rank_record(raw: Dict[str, Any], source: str = "akshare") -> 
         }
     return {
         "rank": _si(raw.get("rank", raw.get("RANK"))),
-        "stock_code": _ss(raw.get("stock_code", raw.get("SECURITY_CODE"))),
-        "stock_name": _ss(raw.get("stock_name", raw.get("SECURITY_NAME_ABBR"))),
+        "stock_code": _ss(raw.get("stock_code", raw.get("code", raw.get("SECURITY_CODE")))),
+        "stock_name": _ss(raw.get("stock_name", raw.get("name", raw.get("SECURITY_NAME_ABBR")))),
         "price": _sf(raw.get("price", raw.get("NEWEST_PRICE"))),
         "change_percent": _sf(raw.get("change_percent", raw.get("CHANGE_RATE"))),
         "popularity_score": _sf(raw.get("popularity_score", raw.get("HOT_NUM", raw.get("SCORE")))),
@@ -527,8 +527,11 @@ def _fetch_hot_rank_from_pywencai(trade_date: str = "") -> List[Dict[str, Any]]:
         
         df = pywencai.get(query=query, loop=True)
         
-        if not isinstance(df, pd.DataFrame) or df.empty:
-            logger.warning("[pywencai] 热榜 %s: 无数据", trade_date)
+        if not isinstance(df, pd.DataFrame):
+            logger.warning("[pywencai] 热榜 %s: 返回类型 %s，非 DataFrame", trade_date, type(df).__name__)
+            return []
+        if df.empty:
+            logger.warning("[pywencai] 热榜 %s: DataFrame 为空", trade_date)
             return []
         
         # 解析同花顺返回的 DataFrame
@@ -576,7 +579,7 @@ def _fetch_hot_rank_from_pywencai(trade_date: str = "") -> List[Dict[str, Any]]:
         return []
 
 
-def _fetch_hot_rank_from_em(page_size: int = 100, trade_date: str = "") -> List[Dict[str, Any]]:
+def _fetch_hot_rank_from_em(page_size: int = 200, trade_date: str = "") -> List[Dict[str, Any]]:
     """从东财搜索获取热榜数据（仅当天，兜底用）"""
     from datetime import datetime
     
@@ -735,8 +738,10 @@ def import_history(
             date_str = current.strftime("%Y-%m-%d")
             day_data = _fetch_hot_rank_from_pywencai(date_str)
             if not day_data and date_str == datetime.now().strftime("%Y-%m-%d"):
-                # 当天数据用东财兜底
-                day_data = _fetch_hot_rank_from_em(trade_date=date_str)
+                # 当天数据: AkShare 专用 API → 东财搜索兜底
+                day_data = _fetch_hot_rank_from_akshare()
+                if not day_data:
+                    day_data = _fetch_hot_rank_from_em(trade_date=date_str)
             hr_data.extend(day_data)
             current += timedelta(days=1)
         result["hot_rank"]["total"] = len(hr_data)
@@ -772,7 +777,9 @@ def save_daily() -> Dict[str, Any]:
     """每日保存龙虎榜 + 热榜到 CNStock_db
 
     由 scheduler.py 在工作日 18:00 调用。
-    数据源: dragon_limit (HTTP 东财搜索 + AkShare 兜底)
+    数据源策略与 import_history 一致:
+      龙虎榜: AkShare 优先（字段完整），东财搜索兜底
+      热榜: pywencai → AkShare → 东财搜索
 
     Returns:
         {
@@ -796,18 +803,15 @@ def save_daily() -> Dict[str, Any]:
         "status": "ok",
     }
 
-    # 先刷新内存缓存
-    try:
-        refresh_dragon_tiger()
-        refresh_hot_rank()
-    except Exception as e:
-        logger.warning("[dragon_tiger_store] 刷新缓存失败: %s", e)
+    # 获取龙虎榜（AkShare 优先，字段完整；东财搜索兜底）
+    dt_data = _fetch_dragon_tiger_from_akshare(trade_date, trade_date)
+    if not dt_data:
+        dt_data = _fetch_dragon_tiger_from_em("龙虎榜", 200)
 
-    # 读取缓存数据
-    dt_data = get_dragon_tiger()
-    
-    # 获取热榜（pywencai 优先，东财兜底）
+    # 获取热榜（pywencai → AkShare → 东财搜索）
     hr_data = _fetch_hot_rank_from_pywencai(trade_date)
+    if not hr_data:
+        hr_data = _fetch_hot_rank_from_akshare()
     if not hr_data:
         hr_data = _fetch_hot_rank_from_em(trade_date=trade_date)
     
