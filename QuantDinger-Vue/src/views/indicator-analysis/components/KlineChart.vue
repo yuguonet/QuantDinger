@@ -3172,15 +3172,7 @@ registerOverlay({
       const isDark = chartTheme.value === 'dark'
 
       chartRef.value.setStyles({
-        // 顶层 bars：VOL 等内置副图指标读取 defaultStyles.bars[0] 而非 indicator.bar
-        bars: [{
-          upColor: isDark ? '#ef5350' : '#f5222d',
-          downColor: isDark ? '#0ecb81' : '#52c41a',
-          noChangeColor: theme.borderColor,
-          upBorderColor: isDark ? '#ef5350' : '#f5222d',
-          downBorderColor: isDark ? '#0ecb81' : '#52c41a',
-          noChangeBorderColor: theme.borderColor
-        }],
+        // A股惯例：红涨绿跌（klinecharts 默认绿涨红跌，需覆盖）
         grid: {
           show: true,
           horizontal: {
@@ -3250,17 +3242,16 @@ registerOverlay({
             showRule: 'always',
             showType: 'standard'
           },
-          bar: {
+          // indicator.bars 控制副图指标（VOL等）的柱状图颜色
+          bars: [{
+            style: 'fill',
             upColor: isDark ? '#ef5350' : '#f5222d',
             downColor: isDark ? '#0ecb81' : '#52c41a',
             noChangeColor: theme.borderColor,
             upBorderColor: isDark ? '#ef5350' : '#f5222d',
             downBorderColor: isDark ? '#0ecb81' : '#52c41a',
-            noChangeBorderColor: theme.borderColor,
-            upWickColor: isDark ? '#ef5350' : '#f5222d',
-            downWickColor: isDark ? '#0ecb81' : '#52c41a',
-            noChangeWickColor: theme.borderColor
-          }
+            noChangeBorderColor: theme.borderColor
+          }]
         },
         xAxis: {
           show: true,
