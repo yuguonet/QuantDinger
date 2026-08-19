@@ -472,6 +472,8 @@
     <% for (var i in htmlWebpackPlugin.options.cdn && htmlWebpackPlugin.options.cdn.js) { %>
     <script type="text/javascript" src="<%= htmlWebpackPlugin.options.cdn.js[i] %>"></script>
     <% } %>
+    <!-- klinecharts-pro -->
+    <link rel="stylesheet" href="<%= BASE_URL %>static/klinecharts-pro.css">
     <!-- built files will be auto injected -->
   </body>
 </html>

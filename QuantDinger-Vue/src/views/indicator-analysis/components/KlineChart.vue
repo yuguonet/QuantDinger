@@ -3172,7 +3172,6 @@ registerOverlay({
       const isDark = chartTheme.value === 'dark'
 
       chartRef.value.setStyles({
-        // A股惯例：红涨绿跌（klinecharts 默认绿涨红跌，需覆盖）
         grid: {
           show: true,
           horizontal: {

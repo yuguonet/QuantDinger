@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-强势股盘中实时弱转强监控
-━━━━━━━━━━━━━━━━━━━━━━━━━
+首板/2连板盘中实时监控
+━━━━━━━━━━━━━━━━━━━━━
 
 功能:
-  1. 盘前选股: 三均线多头排列 + MA5陡峭上攻 + 近期龙虎榜
+  1. 盘前选股: 4类候选 (排除ST, 首板放量)
   2. 盘中实时: 每分钟拉取分时数据, 检测弱转强信号
   3. 买入建议: 触发时输出建议买入价 + 信号类型
 
@@ -12,19 +12,29 @@
   python realtime_monitor.py                    # 完整运行 (选股+监控)
   python realtime_monitor.py --scan             # 仅选股, 不监控
   python realtime_monitor.py --codes 000001,600519  # 手动指定股票
-  python realtime_monitor.py --dragon-days 10   # 龙虎榜回看天数
-  python realtime_monitor.py --angle 1.0        # MA5斜率阈值 (%/天)
+  python realtime_monitor.py --refresh           # 强制刷新 (忽略当天缓存)
   python realtime_monitor.py --interval 30      # 盘中轮询间隔(秒)
 
-弱转强信号:
-  A. 分时突破: 开盘弱势(低于VWAP) → 放量突破VWAP → 站稳
-  B. 平缓上升: 价格沿VWAP平缓上行 + VWAP持续向上 + 量能温和放大
+选股池 (4类):
+  首板(新) — 昨日涨停+前5日无涨停+放量 (新热点)
+  首板(旧) — 昨日涨停+前5日有涨停+放量 (老热点二次启动)
+  昨日2连板 — 昨日是连板第2天+放量 (强势确认)
+  非昨日2连板 — 近期有2连板但昨日不是涨停 (回调观察)
+  排除ST股, 首板量比>=1.5
+
+候选列表缓存到 .openclaw/tmp/realtime_candidates.json (文件内判断日期)
+
+盘中信号规则 (按分类触发):
+  昨日2连板 — 高开>0% 且 现价不破VWAP
+  非昨日2连板 — 突破VWAP并连续站稳超15分钟
+  首板(旧)   — 突破VWAP并连续站稳超15分钟
+  首板(新)   — 今日动量 > 昨日动量 × 1.5
 """
 from __future__ import annotations
-import json, time, argparse, os, sys, re, math
+import json, time, argparse, os, sys
 from datetime import datetime, timedelta
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 # ================================================================
 # 环境初始化
@@ -58,14 +68,7 @@ def _get_writer():
     _writer_cache = get_market_kline_writer()
     return _writer_cache
 
-_pool_cache = None
-def _get_pool():
-    global _pool_cache
-    if _pool_cache is not None:
-        return _pool_cache
-    from app.utils.db_market import get_market_db_manager
-    _pool_cache = get_market_db_manager()._get_pool("CNStock")
-    return _pool_cache
+
 
 # ================================================================
 # 板块判断
@@ -89,26 +92,165 @@ def get_limit_pct(code: str) -> float:
 # 数据加载
 # ================================================================
 
-def load_dragon_tiger(days: int = 15) -> Dict[str, List[Dict]]:
-    """加载龙虎榜, 返回 {code: [{trade_date, stock_name, ...}, ...]}"""
-    pool = _get_pool()
-    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    with pool.connection() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT trade_date, stock_code, stock_name, reason, "
-            "buy_amount, sell_amount, net_amount, change_percent "
-            "FROM cnd_dragon_tiger_list WHERE trade_date >= %s ORDER BY trade_date DESC",
-            (cutoff,)
-        )
-        columns = [desc[0] for desc in cur.description]
-        rows = cur.fetchall()
-        cur.close()
-    result = defaultdict(list)
-    for row in rows:
-        r = dict(zip(columns, row))
-        result[r['stock_code']].append(r)
-    return dict(result)
+def get_all_codes_db() -> List[str]:
+    """从数据库获取全市场股票代码列表 (抄 test_dragon.py)"""
+    writer = _get_writer()
+    stats = writer.stats("CNStock")
+    return stats.get("symbol_list", []) if stats.get("exists") else []
+
+
+def _is_limit_up(close: float, prev_close: float, board_type: str) -> bool:
+    """判断是否涨停 (抄 test_dragon.py)"""
+    threshold = 0.098 if board_type == "main" else 0.198
+    if prev_close <= 0:
+        return False
+    return (close / prev_close - 1) >= threshold * 0.98
+
+
+def _find_limit_up_indices(bars: List[Dict], board_type: str) -> List[int]:
+    """找到所有涨停日的索引 (抄 test_dragon.py)"""
+    result = []
+    for i in range(1, len(bars)):
+        if _is_limit_up(bars[i]['close'], bars[i-1]['close'], board_type):
+            result.append(i)
+    return result
+
+
+def _load_stock_names() -> Dict[str, str]:
+    """加载全量股票名称 (从 stock_basic_info 表)"""
+    try:
+        from app.utils.basicinfo_db import get_stock_basic_db
+        db = get_stock_basic_db()
+        pool = db._get_pool()
+        with pool.cursor() as cur:
+            cur.execute("SELECT symbol, name FROM stock_basic_info WHERE status='active'")
+            return {row[0]: row[1] or '' for row in cur.fetchall()}
+    except Exception:
+        return {}
+
+
+def _load_st_codes() -> set:
+    """加载ST股代码集合 (从 stock_basic_info 表)"""
+    try:
+        from app.utils.basicinfo_db import get_stock_basic_db
+        db = get_stock_basic_db()
+        pool = db._get_pool()
+        with pool.cursor() as cur:
+            cur.execute(
+                "SELECT symbol FROM stock_basic_info "
+                "WHERE status='active' AND name ILIKE '%%ST%%'"
+            )
+            return {row[0] for row in cur.fetchall()}
+    except Exception:
+        return set()
+
+
+def _calc_vol_ratio(bars: List[Dict], limit_idx: int, window: int = 5) -> float:
+    """计算涨停日量比: 涨停日成交量 / 前N日均量"""
+    if limit_idx < window + 1:
+        return 0.0
+    avg_vol = sum(bars[j]['volume'] for j in range(limit_idx - window, limit_idx)) / window
+    if avg_vol <= 0:
+        return 0.0
+    return bars[limit_idx]['volume'] / avg_vol
+
+
+def _has_recent_limit_up(bars: List[Dict], before_idx: int, lookback: int, board_type: str) -> bool:
+    """检查 before_idx 之前 lookback 天内是否有涨停"""
+    start = max(0, before_idx - lookback)
+    for i in range(start, before_idx):
+        if _is_limit_up(bars[i]['close'], bars[i-1]['close'], board_type):
+            return True
+    return False
+
+
+def load_all_candidates(kline_days: int = 30) -> List[Dict]:
+    """从日K线数据提取候选股, 分4类 (排除ST, 首板放量)
+
+    分类:
+      1. 首板(新) — 昨日涨停+前日没涨停+前5日无涨停+放量
+      2. 首板(旧) — 昨日涨停+前日没涨停+前5日有涨停+放量
+      3. 昨日2连板 — 昨日是连板的第2天+放量
+      4. 非昨日2连板 — 近期有2连板但昨日不是涨停日
+    """
+    all_codes = get_all_codes_db()
+    st_codes = _load_st_codes()
+    stock_names = _load_stock_names()
+    print(f"        全市场: {len(all_codes)}只, ST: {len(st_codes)}只")
+
+    candidates = []
+    for code in all_codes:
+        if code in st_codes:
+            continue
+        bars = load_kline_db(code, kline_days)
+        if not bars or len(bars) < 8:
+            continue
+        bt = get_board_type(code)
+        idx = len(bars) - 1  # 最新一天 (昨日)
+        yesterday_lu = _is_limit_up(bars[idx]['close'], bars[idx-1]['close'], bt)
+        day_before_lu = idx >= 2 and _is_limit_up(bars[idx-1]['close'], bars[idx-2]['close'], bt)
+
+        if yesterday_lu and not day_before_lu:
+            # 昨日首板 (涨停+前日没涨停)
+            vol_ratio = _calc_vol_ratio(bars, idx, 5)
+            if vol_ratio < 1.5:
+                continue
+            has_recent = _has_recent_limit_up(bars, idx - 1, 5, bt)
+            cat = '首板(新)' if not has_recent else '首板(旧)'
+            candidates.append({
+                'stock_code': code, 'stock_name': stock_names.get(code, ''),
+                'source': cat, 'continuous_zt_days': 1,
+                'vol_ratio': round(vol_ratio, 2),
+            })
+
+        elif yesterday_lu and day_before_lu:
+            # 昨日是连板 (2连板或更多)
+            # 往前数连续涨停天数
+            streak = 2
+            while idx - streak >= 1 and _is_limit_up(
+                    bars[idx - streak + 1]['close'], bars[idx - streak]['close'], bt):
+                streak += 1
+            # 取首板日的量比
+            first_lu_idx = idx - streak + 1
+            vol_ratio = _calc_vol_ratio(bars, first_lu_idx, 5)
+            if vol_ratio < 1.5:
+                continue
+            candidates.append({
+                'stock_code': code, 'stock_name': stock_names.get(code, ''),
+                'source': '昨日2连板', 'continuous_zt_days': streak,
+                'vol_ratio': round(vol_ratio, 2),
+            })
+
+        else:
+            # 昨日不是涨停, 检查近期是否有2连板
+            limit_indices = _find_limit_up_indices(bars, bt)
+            if len(limit_indices) < 2:
+                continue
+            # 找最长连续涨停
+            max_streak = 1
+            cur_streak = 1
+            best_start = limit_indices[0]
+            for j in range(1, len(limit_indices)):
+                if limit_indices[j] == limit_indices[j-1] + 1:
+                    cur_streak += 1
+                    if cur_streak > max_streak:
+                        max_streak = cur_streak
+                        best_start = limit_indices[j - cur_streak + 1]
+                else:
+                    cur_streak = 1
+            if max_streak < 2:
+                continue
+            # 首板放量
+            vol_ratio = _calc_vol_ratio(bars, best_start, 5)
+            if vol_ratio < 1.5:
+                continue
+            candidates.append({
+                'stock_code': code, 'stock_name': stock_names.get(code, ''),
+                'source': '非昨日2连板', 'continuous_zt_days': max_streak,
+                'vol_ratio': round(vol_ratio, 2),
+            })
+
+    return candidates
 
 
 def load_kline_db(code: str, days: int = 60) -> List[Dict]:
@@ -130,260 +272,285 @@ def load_kline_db(code: str, days: int = 60) -> List[Dict]:
 
 
 # ================================================================
-# 技术指标计算
+# 候选缓存 (当天只分析一次, 文件内判断日期)
 # ================================================================
 
-def calc_ma(bars: List[Dict], period: int, field: str = "close") -> List[Optional[float]]:
-    """计算移动平均线, 返回与bars等长的列表"""
-    result = []
-    for i in range(len(bars)):
-        if i < period - 1:
-            result.append(None)
-        else:
-            vals = [bars[j][field] for j in range(i - period + 1, i + 1)]
-            result.append(sum(vals) / period)
-    return result
+_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".openclaw", "tmp")
+_CACHE_FILE = "realtime_candidates.json"
 
+def _cache_path() -> str:
+    os.makedirs(_CACHE_DIR, exist_ok=True)
+    return os.path.join(_CACHE_DIR, _CACHE_FILE)
 
-def calc_ma5_angle(ma5_values: List[Optional[float]], idx: int, lookback: int = 5) -> Optional[float]:
-    """计算MA5斜率 (线性回归, %/天)
-
-    返回值含义:
-      1.0  → MA5每天上涨幅度约1% (对应45度角左右)
-      0.5  → 每天约0.5% (温和上升)
-      2.0  → 每天约2% (非常陡峭)
-
-    注: 角度 = arctan(slope), slope=1 → 45°
-         实际图表角度取决于Y轴缩放, 此处以百分比斜率为准
-    """
-    if idx < lookback - 1:
+def _load_cache() -> Optional[List[Dict]]:
+    """加载缓存, 文件内日期是今天则有效, 否则返回 None"""
+    path = _cache_path()
+    if not os.path.isfile(path):
         return None
-    vals = []
-    for i in range(idx - lookback + 1, idx + 1):
-        if ma5_values[i] is None:
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if data.get('date') != datetime.now().strftime("%Y-%m-%d"):
             return None
-        vals.append(ma5_values[i])
-    if not vals or vals[0] <= 0:
+        cands = data.get('candidates', [])
+        print(f"  📦 从缓存加载 ({len(cands)}只, 保存于 {data.get('saved_at', '?')})")
+        return cands
+    except Exception:
         return None
-    # 线性回归斜率
-    n = len(vals)
-    sum_x = n * (n - 1) / 2
-    sum_y = sum(vals)
-    sum_xy = sum(i * vals[i] for i in range(n))
-    sum_x2 = n * (n - 1) * (2 * n - 1) / 6
-    denom = n * sum_x2 - sum_x * sum_x
-    if denom == 0:
-        return None
-    slope = (n * sum_xy - sum_x * sum_y) / denom
-    # 转为百分比斜率 (相对于MA5当前值)
-    return slope / vals[-1] * 100 if vals[-1] > 0 else None
 
-
-def check_bullish_alignment(ma5: float, ma10: float, ma20: float) -> bool:
-    """三均线多头排列: MA5 > MA10 > MA20"""
-    return ma5 > ma10 > ma20
-
+def _save_cache(candidates: List[Dict]):
+    """保存候选列表到缓存 (固定文件名, 内部写日期)"""
+    path = _cache_path()
+    data = {
+        'date': datetime.now().strftime("%Y-%m-%d"),
+        'saved_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'count': len(candidates),
+        'candidates': candidates,
+    }
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        print(f"  💾 已缓存到 {path}")
+    except Exception as e:
+        print(f"  ⚠️ 缓存保存失败: {e}")
 
 # ================================================================
-# 选股: 盘前筛选
+# 选股: 盘前筛选 (首板 + 2连板)
 # ================================================================
 
-def screen_candidates(dragon_days: int = 15, angle_threshold: float = 1.0,
-                      kline_days: int = 60) -> List[Dict]:
-    """盘前选股: 多头排列 + MA5陡峭 + 近期龙虎榜
+def screen_candidates(kline_days: int = 30, force_refresh: bool = False) -> List[Dict]:
+    """盘前选股: 4类候选 (排除ST, 首板放量)
+
+    分类:
+      首板(新) — 昨日涨停+前5日无涨停+放量
+      首板(旧) — 昨日涨停+前5日有涨停+放量
+      昨日2连板 — 昨日是连板第2天+放量
+      非昨日2连板 — 近期有2连板但昨日不是涨停
 
     Args:
-        dragon_days: 龙虎榜回看天数
-        angle_threshold: MA5斜率阈值 (%/天), 1.0 ≈ 45度角
         kline_days: 日K线回看天数
-
-    Returns:
-        候选股列表, 每项含 code, name, board, ma5, angle, dragon_date 等
+        force_refresh: 强制刷新, 忽略缓存
     """
     print(f"\n{'='*70}")
     print(f"  📋 盘前选股")
-    print(f"  条件: MA5>MA10>MA20 + MA5斜率>{angle_threshold}%/天 + 近{dragon_days}日龙虎榜")
+    print(f"  选股池: 首板(新/旧) + 昨日2连板 + 非昨日2连板")
+    print(f"  过滤: 排除ST, 首板放量(量比>=1.5)")
     print(f"{'='*70}")
 
-    # 1. 加载龙虎榜
-    print(f"\n  [1/3] 加载龙虎榜数据...")
-    dragon_data = load_dragon_tiger(dragon_days)
-    dragon_codes = list(dragon_data.keys())
-    print(f"        龙虎榜股票: {len(dragon_codes)}只")
+    # 0. 检查缓存
+    if not force_refresh:
+        cached = _load_cache()
+        if cached is not None:
+            return cached
 
-    if not dragon_codes:
-        print("  ❌ 龙虎榜无数据")
+    # 1. 加载候选
+    print(f"\n  [1/2] 扫描全市场...")
+    raw = load_all_candidates(kline_days)
+
+    # 统计
+    counts = {}
+    for c in raw:
+        counts[c['source']] = counts.get(c['source'], 0) + 1
+    for cat in ['首板(新)', '首板(旧)', '昨日2连板', '非昨日2连板']:
+        if counts.get(cat):
+            print(f"        {cat}: {counts[cat]}只")
+
+    if not raw:
+        print("  ❌ 无候选")
         return []
 
-    # 2. 逐只检查技术面
-    print(f"\n  [2/3] 技术面筛选...")
+    # 2. 构建候选列表 (只取K线历史数据, 实时数据在过滤阶段获取)
+    print(f"\n  [2/2] 构建候选 ({len(raw)}只)...")
     candidates = []
-    for code in dragon_codes:
+    for info in raw:
+        code = info['stock_code']
         bars = load_kline_db(code, kline_days)
-        if not bars or len(bars) < 25:
+        if not bars or len(bars) < 2:
             continue
 
-        # 计算均线
-        ma5_list = calc_ma(bars, 5)
-        ma10_list = calc_ma(bars, 10)
-        ma20_list = calc_ma(bars, 20)
-
-        idx = len(bars) - 1  # 最新一天
-        ma5 = ma5_list[idx]
-        ma10 = ma10_list[idx]
-        ma20 = ma20_list[idx]
-
-        if ma5 is None or ma10 is None or ma20 is None:
-            continue
-
-        # 条件1: 多头排列
-        if not check_bullish_alignment(ma5, ma10, ma20):
-            continue
-
-        # 条件2: MA5斜率 > 阈值
-        angle = calc_ma5_angle(ma5_list, idx, lookback=5)
-        if angle is None or angle < angle_threshold:
-            continue
-
-        # 取最近一次龙虎榜日期
-        dragon_entries = dragon_data[code]
-        latest_dragon = dragon_entries[0]['trade_date'] if dragon_entries else ""
-
-        name = dragon_entries[0].get('stock_name', '') if dragon_entries else ''
-        board = get_board_name(code)
-
-        # 日内动量 (最新一天)
+        idx = len(bars) - 1
         last_bar = bars[idx]
         prev_close = bars[idx - 1]['close'] if idx > 0 else 0
         change_pct = (last_bar['close'] / prev_close - 1) * 100 if prev_close > 0 else 0
+        yesterday_momentum = (last_bar['close'] - last_bar['open']) / prev_close * 100 if prev_close > 0 else 0
 
         candidates.append({
             'code': code,
-            'name': name,
-            'board': board,
+            'name': info.get('stock_name', ''),
+            'board': get_board_name(code),
             'limit_pct': get_limit_pct(code),
-            'ma5': round(ma5, 2),
-            'ma10': round(ma10, 2),
-            'ma20': round(ma20, 2),
-            'angle': round(angle, 2),
+            'source': info['source'],
+            'continuous_zt_days': int(info.get('continuous_zt_days', 1) or 1),
             'last_close': last_bar['close'],
             'last_date': last_bar['time'],
             'change_pct': round(change_pct, 2),
-            'dragon_date': latest_dragon,
-            'dragon_count': len(dragon_entries),
+            'yesterday_momentum': round(yesterday_momentum, 2),
+            'vol_ratio': info.get('vol_ratio', 0),
             'prev_close': prev_close,
         })
 
-    # 按斜率降序
-    candidates.sort(key=lambda x: -x['angle'])
+    # 按分类排序
+    order = {'首板(新)': 0, '首板(旧)': 1, '昨日2连板': 2, '非昨日2连板': 3}
+    candidates.sort(key=lambda x: order.get(x['source'], 9))
 
-    print(f"\n  [3/3] 结果: {len(candidates)}只通过筛选")
+    # 按分类输出全部候选
+    print(f"\n  结果: {len(candidates)}只")
     if candidates:
-        print(f"\n  {'代码':>8} {'名称':>8} {'板块':>6} {'MA5':>8} {'MA10':>8} {'MA20':>8} "
-              f"{'斜率%/天':>8} {'最新涨跌':>8} {'龙虎榜':>10}")
-        print(f"  {'-'*82}")
-        for c in candidates:
-            angle_emoji = '🔥' if c['angle'] >= 2.0 else ('📈' if c['angle'] >= 1.5 else '')
-            print(f"  {c['code']:>8} {c['name']:>8} {c['board']:>6} "
-                  f"{c['ma5']:>8.2f} {c['ma10']:>8.2f} {c['ma20']:>8.2f} "
-                  f"{c['angle']:>7.2f}% {angle_emoji} {c['change_pct']:>+7.1f}% "
-                  f"{c['dragon_date']:>10}")
+        for cat in ['首板(新)', '首板(旧)', '昨日2连板', '非昨日2连板']:
+            group = [c for c in candidates if c['source'] == cat]
+            if not group:
+                continue
+            cat_emoji = {'首板(新)': '🆕', '首板(旧)': '🔄', '昨日2连板': '🔗', '非昨日2连板': '📌'}
+            print(f"\n  {cat_emoji.get(cat, '')} {cat} ({len(group)}只)")
+            print(f"  {'代码':>8} {'名称':>8} {'板块':>6} {'量比':>5} {'昨动量':>7}")
+            print(f"  {'-'*50}")
+            for c in group:
+                ym = c['yesterday_momentum']
+                vr = c.get('vol_ratio', 0)
+                ym_emoji = '💪' if ym >= 5 else ('📈' if ym >= 3 else '')
+                vr_str = f"{vr:.1f}x" if vr > 0 else '-'
+                print(f"  {c['code']:>8} {c['name']:>8} {c['board']:>6} "
+                      f"{vr_str:>5} {ym:>+6.1f}%{ym_emoji}")
+
+    # 保存缓存
+    _save_cache(candidates)
 
     return candidates
 
 
 # ================================================================
-# 实时分时数据 (东财 push2 API)
+# 实时行情 (批量 + 单股分时)
 # ================================================================
 
-import urllib.request, ssl, json as _json
+_batch_cache = {}  # code -> {price, open, prev_close, change_pct, ...}
 
-_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36",
-    "Accept": "*/*",
-}
-_SSL_CTX = ssl.create_default_context()
-_SSL_CTX.check_hostname = False
-_SSL_CTX.verify_mode = ssl.CERT_NONE
-_opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=_SSL_CTX))
+def fetch_batch_quotes(codes: List[str]) -> Dict[str, Dict]:
+    """批量获取实时行情 (新浪500只/次, 1~2次HTTP搞定)
+
+    返回: {code: {last, open, previousClose, changePercent, volume, amount}}
+    """
+    try:
+        from app.data_sources.coordinator import get_coordinator
+        coord = get_coordinator()
+        quotes = coord.coordinate_tickers(symbols=codes, market="CNStock", timeout=15)
+        result = {}
+        for q in quotes:
+            sym = q.get('symbol', '')
+            if sym:
+                result[sym] = q
+        return result
+    except Exception:
+        return {}
+
+def _quick_momentum(code: str, quote: Dict) -> Tuple[float, float]:
+    """从批量行情快速计算: (今日动量, 高开幅度)
+
+    今日动量 = (最新价 - 开盘) / 昨收 * 100
+    高开幅度 = (开盘 - 昨收) / 昨收 * 100
+    """
+    last = quote.get('last', 0) or quote.get('price', 0)
+    open_p = quote.get('open', 0)
+    prev = quote.get('previousClose', 0) or quote.get('prev_close', 0)
+    if prev <= 0 or last <= 0:
+        return 0.0, 0.0
+    momentum = (last - open_p) / prev * 100 if open_p > 0 else 0.0
+    gap = (open_p - prev) / prev * 100 if prev > 0 else 0.0
+    return round(momentum, 2), round(gap, 2)
+
+def _quick_above_vwap(code: str, quote: Dict) -> bool:
+    """粗略判断: 现价 > 开盘价 (代替VWAP判断, 批量行情无法算精确VWAP)"""
+    last = quote.get('last', 0) or quote.get('price', 0)
+    open_p = quote.get('open', 0)
+    return last > 0 and open_p > 0 and last >= open_p
 
 
-def to_em_secid(code: str) -> str:
-    """股票代码 → 东财 secid (1.沪 0.深)"""
-    c = str(code).zfill(6)
-    return f"1.{c}" if c.startswith("6") else f"0.{c}"
+def prefilter_by_rules(candidates: List[Dict]) -> List[Dict]:
+    """用批量行情做快速预筛选, 只对通过的再拉分时数据
+
+    规则:
+      昨日2连板 — 高开>0% 且 现价>开盘价
+      非昨日2连板 / 首板(旧) — 需要VWAP, 无法预筛, 全部保留
+      首板(新) — 今动量 > 昨动量*1.5
+    """
+    global _batch_cache
+    codes = [c['code'] for c in candidates]
+    quotes = fetch_batch_quotes(codes)
+    if not quotes:
+        return candidates  # 批量失败, 降级为全部
+    _batch_cache = quotes  # 缓存供状态行使用
+
+    matched = []
+    for c in candidates:
+        q = quotes.get(c['code'])
+        if not q:
+            continue
+        c['_quote'] = q
+        source = c.get('source', '')
+        today_mom, open_gap = _quick_momentum(c['code'], q)
+        c['today_momentum'] = today_mom
+
+        if source == '昨日2连板':
+            # 高开>0% 且 现价>开盘价
+            if open_gap > 0 and _quick_above_vwap(c['code'], q):
+                matched.append(c)
+        elif source == '首板(新)':
+            # 今动量 > 昨动量*1.5
+            ym = c.get('yesterday_momentum', 0)
+            if ym > 0 and today_mom > ym * 1.5:
+                matched.append(c)
+        else:
+            # 首板(旧) / 非昨日2连板 — 需要VWAP, 全部保留
+            matched.append(c)
+
+    return matched
+
+
+# ================================================================
+# 分时数据 (coordinator 批量1分钟K线)
+# ================================================================
+
+def fetch_minute_klines_batch(codes: List[str], count: int = 240) -> Dict[str, List[Dict]]:
+    """批量获取1分钟K线 (coordinator 多源并发, 有限流/熔断/重试)
+
+    Args:
+        codes: 股票代码列表
+        count: 每只股票取多少根K线 (默认240, 约一个交易日)
+
+    Returns:
+        {code: [{time, open, high, low, close, volume}, ...]}
+    """
+    try:
+        from app.data_sources.coordinator import get_coordinator
+        coord = get_coordinator()
+        bars_list = coord.coordinate_market_kline(
+            market="CNStock", timeframe="1m", count=count,
+            symbols=codes, timeout=30,
+        )
+        result = {}
+        for bar in bars_list:
+            sym = bar.get('symbol', '')
+            if not sym:
+                continue
+            if sym not in result:
+                result[sym] = []
+            result[sym].append({
+                'time': str(bar.get('time', '')),
+                'open': float(bar.get('open', 0)),
+                'high': float(bar.get('high', 0)),
+                'low': float(bar.get('low', 0)),
+                'close': float(bar.get('close', 0)),
+                'volume': float(bar.get('volume', 0)),
+            })
+        return result
+    except Exception:
+        return {}
 
 
 def fetch_realtime_ticks(code: str) -> Optional[List[Dict]]:
-    """拉取今日1分钟K线 (东财 trends2 API)
-
-    返回: [{time, open, high, low, close, volume, amount}, ...]
-    每个交易日约 240 根 (9:30~15:00)
-    """
-    secid = to_em_secid(code)
-    url = (f"https://push2.eastmoney.com/api/qt/stock/trends2/get?"
-           f"secid={secid}&fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13"
-           f"&fields2=f51,f52,f53,f54,f55,f56,f57,f58&iscr=0&ndays=1")
-    try:
-        req = urllib.request.Request(url, headers=_HEADERS)
-        with _opener.open(req, timeout=8) as resp:
-            raw = resp.read().decode("utf-8", "ignore")
-        d = _json.loads(raw)
-        trends = (d.get("data") or {}).get("trends") or []
-        if not trends:
-            return None
-        bars = []
-        for t in trends:
-            p = t.split(",")
-            if len(p) < 7:
-                continue
-            bars.append({
-                "time": p[0],
-                "open": float(p[1]),
-                "close": float(p[2]),
-                "high": float(p[3]),
-                "low": float(p[4]),
-                "volume": float(p[5]),
-                "amount": float(p[6]),
-            })
-        return bars if bars else None
-    except Exception as e:
-        return None
-
-
-def fetch_realtime_quote(code: str) -> Optional[Dict]:
-    """拉取实时行情快照 (东财 push2 单股接口)
-
-    返回: {price, open, high, low, prev_close, volume, amount, change_pct, ...}
-    """
-    secid = to_em_secid(code)
-    url = (f"https://push2.eastmoney.com/api/qt/stock/get?"
-           f"secid={secid}&fields=f43,f44,f45,f46,f47,f48,f50,f51,f52,f55,f57,f58,f60,f170")
-    try:
-        req = urllib.request.Request(url, headers=_HEADERS)
-        with _opener.open(req, timeout=8) as resp:
-            raw = resp.read().decode("utf-8", "ignore")
-        d = _json.loads(raw)
-        data = d.get("data") or {}
-        if not data:
-            return None
-        # f43=最新价 f44=最高 f45=最低 f46=今开 f47=成交量 f48=成交额
-        # f50=量比 f55=涨速 f57=代码 f58=名称 f60=昨收 f170=涨跌幅
-        def _p(v):
-            return float(v) / 100 if v and v != '-' else 0.0
-        return {
-            'price': _p(data.get('f43')),
-            'high': _p(data.get('f44')),
-            'low': _p(data.get('f45')),
-            'open': _p(data.get('f46')),
-            'volume': float(data.get('f47', 0) or 0),
-            'amount': float(data.get('f48', 0) or 0),
-            'vol_ratio': float(data.get('f50', 0) or 0) / 100 if data.get('f50') else 0,
-            'prev_close': _p(data.get('f60')),
-            'change_pct': float(data.get('f170', 0) or 0) / 100 if data.get('f170') else 0,
-        }
-    except Exception:
-        return None
+    """单股1分钟K线 (兼容旧接口, 内部走coordinator)"""
+    result = fetch_minute_klines_batch([code], count=240)
+    bars = result.get(code)
+    return bars if bars else None
 
 
 # ================================================================
@@ -431,27 +598,31 @@ def calc_intraday_vol_ratio(ticks: List[Dict], idx: int, window: int = 5) -> flo
 # 弱转强信号检测
 # ================================================================
 
-def detect_weak_to_strong(ticks: List[Dict], candidate: Dict,
-                          lookback: int = 15) -> Optional[Dict]:
-    """检测弱转强信号
+def _count_minutes_above_vwap(ticks: List[Dict]) -> int:
+    """从当前往回数, 连续站稳VWAP上方的分钟数"""
+    count = 0
+    for i in range(len(ticks) - 1, -1, -1):
+        v = calc_vwap(ticks[:i + 1])
+        if ticks[i]['close'] >= v:
+            count += 1
+        else:
+            break
+    return count
 
-    信号A - 分时突破:
-      条件: 价格曾低于VWAP → 当前突破VWAP → 突破时量能放大
-      含义: 早盘弱势, 买盘介入, 放量突破均价线
 
-    信号B - 平缓上升+VWAP向上:
-      条件: 价格在VWAP上方平缓上升 → VWAP持续走高 → 量能温和
-      含义: 稳定买盘, 趋势延续
+def detect_signal(ticks: List[Dict], candidate: Dict) -> Optional[Dict]:
+    """按候选分类检测信号 (不同分类不同规则)
 
-    Args:
-        ticks: 今日1分钟K线
-        candidate: 候选股信息 (含prev_close等)
-        lookback: 回看窗口 (分钟)
+    规则:
+      昨日2连板 — 高开>0% 且 现价不破VWAP
+      非昨日2连板 — 突破VWAP并连续站稳超15分钟
+      首板(旧)   — 突破VWAP并连续站稳超15分钟
+      首板(新)   — 今日动量 > 昨日动量 * 1.5
 
     Returns:
         信号详情 dict 或 None
     """
-    if len(ticks) < 10:
+    if len(ticks) < 5:
         return None
 
     current = ticks[-1]
@@ -460,117 +631,54 @@ def detect_weak_to_strong(ticks: List[Dict], candidate: Dict,
     if prev_close <= 0:
         return None
 
-    # 当前涨跌幅
+    source = candidate.get('source', '')
     change_pct = (current_price / prev_close - 1) * 100
-
-    # VWAP
     vwap = calc_vwap(ticks)
     if vwap <= 0:
         return None
-
-    # 价格相对VWAP
     price_vs_vwap = (current_price / vwap - 1) * 100
-
-    # 分时均线 (20分钟)
-    intraday_ma = calc_intraday_ma(ticks, 20)
-
-    # 最近N分钟的VWAP序列 (用于判断VWAP趋势)
-    vwap_seq = []
-    for i in range(max(0, len(ticks) - lookback), len(ticks)):
-        vwap_seq.append(calc_vwap(ticks[:i + 1]))
-
-    # VWAP趋势: 最近N分钟VWAP是否持续上升
-    vwap_rising = False
-    if len(vwap_seq) >= 5:
-        vwap_changes = [vwap_seq[i] - vwap_seq[i - 1] for i in range(1, len(vwap_seq))]
-        rising_count = sum(1 for c in vwap_changes if c > 0)
-        vwap_rising = rising_count >= len(vwap_changes) * 0.6  # 60%以上时间VWAP在涨
-
-    # 最近5分钟量比
-    vol_ratio_recent = 0.0
-    if len(ticks) >= 6:
-        recent_vols = [ticks[i]['volume'] for i in range(len(ticks) - 5, len(ticks))]
-        prev_vols = [ticks[i]['volume'] for i in range(max(0, len(ticks) - 10), len(ticks) - 5)]
-        avg_prev = sum(prev_vols) / len(prev_vols) if prev_vols else 1
-        vol_ratio_recent = (sum(recent_vols) / len(recent_vols)) / avg_prev if avg_prev > 0 else 1.0
+    today_open = ticks[0]['open'] if ticks else 0
+    open_gap = (today_open / prev_close - 1) * 100 if prev_close > 0 else 0
+    today_momentum = (current_price - today_open) / prev_close * 100 if prev_close > 0 else 0
+    yesterday_momentum = candidate.get('yesterday_momentum', 0)
 
     signal = None
 
-    # ========== 信号A: 分时突破 ==========
-    # 检查: 最近lookback分钟内, 价格从VWAP下方突破到上方
-    if len(ticks) >= lookback:
-        # 找lookback窗口内VWAP下方最低点
-        below_vwap_count = 0
-        min_below = 0  # 低于VWAP的最大幅度
-        for i in range(len(ticks) - lookback, len(ticks)):
-            t = ticks[i]
-            v = calc_vwap(ticks[:i + 1])
-            if t['close'] < v:
-                below_vwap_count += 1
-                gap = (t['close'] / v - 1) * 100
-                if gap < min_below:
-                    min_below = gap
-
-        # 当前在VWAP上方 + 之前有在VWAP下方 + 量能放大
-        if (price_vs_vwap > 0.1
-                and below_vwap_count >= 3
-                and min_below < -0.3
-                and vol_ratio_recent >= 1.3):
+    # ========== 昨日2连板: 高开>0% 且 现价不破VWAP ==========
+    if source == '昨日2连板':
+        if open_gap > 0 and current_price >= vwap:
             signal = {
-                'type': 'A_分时突破',
-                'label': '突破VWAP',
-                'emoji': '🚀',
-                'price': current_price,
-                'vwap': round(vwap, 3),
-                'price_vs_vwap': round(price_vs_vwap, 2),
-                'change_pct': round(change_pct, 2),
-                'vol_ratio': round(vol_ratio_recent, 2),
-                'detail': (f"从VWAP下方{min_below:+.1f}%拉起, "
-                           f"当前高于VWAP {price_vs_vwap:+.1f}%, "
-                           f"量比{vol_ratio_recent:.1f}x"),
+                'type': '2连板_高开不破均线',
+                'label': '高开不破均线',
+                'emoji': '🔗',
+                'detail': (f"高开{open_gap:+.1f}%, "
+                           f"现价{current_price:.2f} VWAP{vwap:.2f} "
+                           f"({price_vs_vwap:+.1f}%)"),
             }
 
-    # ========== 信号B: 平缓上升+VWAP向上 ==========
-    if signal is None and len(ticks) >= lookback:
-        # 检查: 最近N分钟价格在VWAP上方, 且走势平缓上升
-        above_vwap_count = 0
-        price_changes = []
-        for i in range(len(ticks) - lookback, len(ticks)):
-            t = ticks[i]
-            v = calc_vwap(ticks[:i + 1])
-            if t['close'] >= v:
-                above_vwap_count += 1
-            if i > len(ticks) - lookback:
-                price_changes.append(t['close'] - ticks[i - 1]['close'])
-
-        # 价格在VWAP上方占比 > 70%
-        above_ratio = above_vwap_count / lookback
-
-        # 价格变化方向: 上涨分钟数 > 下跌分钟数
-        up_moves = sum(1 for c in price_changes if c > 0)
-        down_moves = sum(1 for c in price_changes if c < 0)
-
-        # 涨幅不能太大 (平缓: 最近N分钟涨幅 < 3%)
-        window_start_price = ticks[len(ticks) - lookback]['close']
-        window_change = (current_price / window_start_price - 1) * 100 if window_start_price > 0 else 0
-
-        if (above_ratio >= 0.7
-                and vwap_rising
-                and up_moves >= down_moves
-                and 0.3 < window_change < 3.0):  # 平缓: 涨0.3%~3%
+    # ========== 非昨日2连板 / 首板(旧): 突破VWAP站稳>20分钟 ==========
+    elif source in ('非昨日2连板', '首板(旧)'):
+        minutes_above = _count_minutes_above_vwap(ticks)
+        if minutes_above >= 15 and current_price >= vwap:
             signal = {
-                'type': 'B_平缓上升',
-                'label': '趋势延续',
-                'emoji': '📈',
-                'price': current_price,
-                'vwap': round(vwap, 3),
-                'price_vs_vwap': round(price_vs_vwap, 2),
-                'change_pct': round(change_pct, 2),
-                'vol_ratio': round(vol_ratio_recent, 2),
-                'detail': (f"VWAP上方{above_ratio * 100:.0f}%, "
-                           f"VWAP持续↑, "
-                           f"{lookback}分涨{window_change:+.1f}%, "
-                           f"量比{vol_ratio_recent:.1f}x"),
+                'type': f'{source}_站稳均线',
+                'label': '站稳VWAP>15min',
+                'emoji': '📈' if source == '首板(旧)' else '📌',
+                'above_vwap_minutes': minutes_above,
+                'detail': (f"连续{minutes_above}分钟站稳VWAP, "
+                           f"当前高于VWAP {price_vs_vwap:+.1f}%"),
+            }
+
+    # ========== 首板(新): 今日动量 > 昨日动量 * 1.5 ==========
+    elif source == '首板(新)':
+        if yesterday_momentum > 0 and today_momentum > yesterday_momentum * 1.5:
+            signal = {
+                'type': '首板新_动量加速',
+                'label': '动量加速',
+                'emoji': '🆕',
+                'detail': (f"今日动量{today_momentum:+.1f}% "
+                           f"> 昨日{yesterday_momentum:+.1f}%×1.5="
+                           f"{yesterday_momentum * 1.5:+.1f}%"),
             }
 
     if signal is None:
@@ -582,8 +690,14 @@ def detect_weak_to_strong(ticks: List[Dict], candidate: Dict,
         'name': candidate['name'],
         'board': candidate['board'],
         'limit_pct': candidate['limit_pct'],
-        'angle': candidate['angle'],
-        'dragon_date': candidate['dragon_date'],
+        'source': source,
+        'yesterday_momentum': yesterday_momentum,
+        'today_momentum': round(today_momentum, 2),
+        'price': current_price,
+        'vwap': round(vwap, 3),
+        'price_vs_vwap': round(price_vs_vwap, 2),
+        'change_pct': round(change_pct, 2),
+        'open_gap': round(open_gap, 2),
         'time': current['time'],
         'intraday_high': max(t['high'] for t in ticks),
         'intraday_low': min(t['low'] for t in ticks),
@@ -643,8 +757,7 @@ def run_monitor(candidates: List[Dict], interval: int = 60,
     print(f"\n{'='*70}")
     print(f"  🔴 盘中实时监控已启动")
     print(f"  候选: {len(candidates)}只 | 间隔: {interval}秒 | 冷却: {cooldown}分钟")
-    print(f"  信号A: 分时突破VWAP (放量)")
-    print(f"  信号B: 平缓上升+VWAP向上")
+    print(f"  规则: 2连板高开不破均线 | 首板(旧)/非昨日2连板站稳VWAP>20min | 首板(新)动量加速")
     print(f"  按 Ctrl+C 停止")
     print(f"{'='*70}\n")
 
@@ -681,61 +794,119 @@ def run_monitor(candidates: List[Dict], interval: int = 60,
             current_time = now.strftime("%Y-%m-%d %H:%M")
             triggered_this_round = []
 
-            for cand in candidates:
+            # Step1: 批量行情预筛选 (1次HTTP, 过滤掉大部分)
+            quick_matched = prefilter_by_rules(candidates)
+
+            # Step2: 只对需要VWAP的股票拉分时数据
+            for cand in quick_matched:
                 code = cand['code']
+                source = cand.get('source', '')
 
-                # 拉取分时数据
-                ticks = fetch_realtime_ticks(code)
-                if not ticks or len(ticks) < 5:
+                # 昨日2连板和首板(新) 已在预筛选中判断, 直接构建信号
+                if source in ('昨日2连板', '首板(新)'):
+                    q = cand.get('_quote', {})
+                    last = q.get('last', 0) or q.get('price', 0)
+                    prev = q.get('previousClose', 0) or q.get('prev_close', 0)
+                    open_p = q.get('open', 0)
+                    change_pct = (last / prev - 1) * 100 if prev > 0 else 0
+                    open_gap = (open_p / prev - 1) * 100 if prev > 0 else 0
+                    today_mom = cand.get('today_momentum', 0)
+                    ym = cand.get('yesterday_momentum', 0)
+
+                    if source == '昨日2连板':
+                        sig = {
+                            'type': '2连板_高开不破均线', 'label': '高开不破均线',
+                            'emoji': '🔗', 'source': source,
+                            'code': code, 'name': cand.get('name', ''),
+                            'board': cand.get('board', ''), 'limit_pct': cand.get('limit_pct', 10),
+                            'price': last, 'vwap': 0, 'price_vs_vwap': 0,
+                            'change_pct': round(change_pct, 2),
+                            'open_gap': round(open_gap, 2),
+                            'today_momentum': today_mom, 'yesterday_momentum': ym,
+                            'time': current_time,
+                            'detail': f"高开{open_gap:+.1f}%, 现价{last:.2f}",
+                        }
+                    else:  # 首板(新)
+                        sig = {
+                            'type': '首板新_动量加速', 'label': '动量加速',
+                            'emoji': '🆕', 'source': source,
+                            'code': code, 'name': cand.get('name', ''),
+                            'board': cand.get('board', ''), 'limit_pct': cand.get('limit_pct', 10),
+                            'price': last, 'vwap': 0, 'price_vs_vwap': 0,
+                            'change_pct': round(change_pct, 2),
+                            'open_gap': round(open_gap, 2),
+                            'today_momentum': today_mom, 'yesterday_momentum': ym,
+                            'time': current_time,
+                            'detail': f"今动量{today_mom:+.1f}% > 昨{ym:+.1f}%×1.5={ym*1.5:+.1f}%",
+                        }
+
+                    if tracker.should_alert(code, current_time):
+                        tracker.record(code, current_time)
+                        triggered_this_round.append(sig)
+                        all_signals.append(sig)
                     continue
 
-                # 检测信号
-                signal = detect_weak_to_strong(ticks, cand)
-                if signal is None:
-                    continue
+                # 首板(旧) / 非昨日2连板 — 需要VWAP, 标记待拉分时
+                cand['_need_vwap'] = True
 
-                # 检查冷却
-                if not tracker.should_alert(code, signal['time']):
-                    continue
+            # Step3: 批量拉取需要VWAP的股票的1分钟K线 (1次并发请求)
+            vwap_candidates = [c for c in quick_matched if c.get('_need_vwap')]
+            if vwap_candidates:
+                vwap_codes = [c['code'] for c in vwap_candidates]
+                minute_data = fetch_minute_klines_batch(vwap_codes, count=240)
+                for cand in vwap_candidates:
+                    code = cand['code']
+                    ticks = minute_data.get(code)
+                    if not ticks or len(ticks) < 5:
+                        continue
+                    signal = detect_signal(ticks, cand)
+                    if signal is None:
+                        continue
+                    if not tracker.should_alert(code, current_time):
+                        continue
+                    tracker.record(code, current_time)
+                    triggered_this_round.append(signal)
+                    all_signals.append(signal)
 
-                tracker.record(code, signal['time'])
-                triggered_this_round.append(signal)
-                all_signals.append(signal)
-
-            # 输出本轮结果
+            # 输出本轮结果 (表格, 每股一行)
             if triggered_this_round:
-                for sig in triggered_this_round:
-                    print(f"\n  {'━'*65}")
-                    print(f"  {sig['emoji']} 弱转强信号 [{sig['type']}]")
-                    print(f"  {'━'*65}")
-                    print(f"  股票: {sig['code']} {sig['name']} ({sig['board']})")
-                    print(f"  时间: {sig['time']}")
-                    print(f"  价格: {sig['price']:.2f}  涨跌: {sig['change_pct']:+.2f}%")
-                    print(f"  VWAP: {sig['vwap']:.2f}  价格偏离: {sig['price_vs_vwap']:+.2f}%")
-                    print(f"  量比: {sig['vol_ratio']:.1f}x  MA5斜率: {sig['angle']:.2f}%/天")
-                    print(f"  龙虎榜: {sig['dragon_date']}")
-                    print(f"  详情: {sig['detail']}")
+                # 分类简称
+                _src_short = {'首板(新)': '首板新', '首板(旧)': '首板旧',
+                              '昨日2连板': '2连板', '非昨日2连板': '非昨2连'}
 
-                    # 买入建议
+                # 首次触发时打印表头
+                if not hasattr(run_monitor, '_header_printed'):
+                    run_monitor._header_printed = True
+                    print(f"\n  {'#':>3} {'时间':>5} {'代码':>7} {'名称':>6} {'分类':>7} {'价格':>7} {'涨跌':>6} "
+                          f"{'高开':>5} {'动量':>5} {'站稳':>4} {'止损':>7} {'涨停':>7}")
+                    print(f"  {'-'*84}")
+
+                for sig in triggered_this_round:
                     limit_pct = sig['limit_pct']
                     board = sig['board']
                     buy_price = sig['price']
-                    # 追踪止损建议
                     stop_loss = -5.0 if board in ['沪主板', '深主板'] else -8.0
-                    print(f"\n  💡 买入建议:")
-                    print(f"     建议价: {buy_price:.2f} (当前价)")
-                    print(f"     止损位: {buy_price * (1 + stop_loss / 100):.2f} ({stop_loss}%)")
-                    print(f"     涨停价: {sig['price'] / (1 + sig['change_pct'] / 100) * (1 + limit_pct / 100):.2f} ({limit_pct}%)")
-                    print(f"  {'━'*65}")
+                    stop_price = buy_price * (1 + stop_loss / 100)
+                    limit_price = buy_price / (1 + sig['change_pct'] / 100) * (1 + limit_pct / 100) if sig['change_pct'] != -100 else 0
+                    time_str = now.strftime('%H:%M')
+                    above_min = sig.get('above_vwap_minutes', 0)
+                    above_str = f"{above_min}m" if above_min > 0 else '-'
+                    src = _src_short.get(sig['source'], sig['source'])
+                    name = sig.get('name', '')[:4]
+                    count = sum(1 for s in all_signals if s['code'] == sig['code']) + 1
+                    print(f"  {count:>3} {time_str:>5} {sig['code']:>7} {name:>6} {src:>7} "
+                          f"{buy_price:>7.2f} {sig['change_pct']:>+5.1f}% {sig.get('open_gap', 0):>+5.1f}% "
+                          f"{sig.get('today_momentum', 0):>+5.1f}% {above_str:>4} {stop_price:>7.2f} {limit_price:>7.2f}")
             else:
                 # 静默状态行
                 latest_price = ""
                 if candidates:
-                    # 随机取一个显示价格 (避免全部拉取)
                     c = candidates[0]
-                    q = fetch_realtime_quote(c['code'])
+                    q = _batch_cache.get(c['code'])
                     if q:
-                        latest_price = f" | {c['code']} {q['price']:.2f} {q['change_pct']:+.1f}%"
+                        last = q.get('last', 0) or q.get('price', 0)
+                        chg = q.get('changePercent', q.get('change_pct', 0))
+                        latest_price = f" | {c['code']} {last:.2f} {chg:+.1f}%"
                 print(f"\r  ⏱ [{scan_count}] {now.strftime('%H:%M:%S')} "
                       f"扫描{len(candidates)}只 无信号{latest_price}    ", end="", flush=True)
 
@@ -744,17 +915,8 @@ def run_monitor(candidates: List[Dict], interval: int = 60,
     except KeyboardInterrupt:
         print(f"\n\n  ⛔ 手动停止")
 
-    # 汇总
     if all_signals:
-        print(f"\n{'='*70}")
-        print(f"  📊 今日信号汇总 ({len(all_signals)}个)")
-        print(f"{'='*70}")
-        by_code = defaultdict(list)
-        for s in all_signals:
-            by_code[s['code']].append(s)
-        for code, sigs in sorted(by_code.items(), key=lambda x: -len(x[1])):
-            types = ', '.join(set(s['type'] for s in sigs))
-            print(f"  {code} {sigs[0]['name']}: {len(sigs)}次 [{types}]")
+        print(f"\n  📊 今日共 {len(all_signals)} 个信号")
     else:
         print(f"\n  📊 今日无信号")
 
@@ -762,7 +924,7 @@ def run_monitor(candidates: List[Dict], interval: int = 60,
     if all_signals:
         outfile = "realtime_signals.json"
         with open(outfile, "w", encoding="utf-8") as f:
-            _json.dump(all_signals, f, ensure_ascii=False, indent=2)
+            json.dump(all_signals, f, ensure_ascii=False, indent=2)
         print(f"\n  💾 信号已导出: {outfile}")
 
 
@@ -772,70 +934,52 @@ def run_monitor(candidates: List[Dict], interval: int = 60,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="强势股盘中实时弱转强监控",
+        description="首板/2连板盘中实时监控",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
   python realtime_monitor.py                     # 完整运行
   python realtime_monitor.py --scan              # 仅选股
   python realtime_monitor.py --codes 000066,300001  # 手动指定
-  python realtime_monitor.py --angle 0.8         # 降低斜率阈值
-  python realtime_monitor.py --dragon-days 10    # 龙虎榜10天
         """)
     parser.add_argument("--scan", action="store_true", help="仅选股, 不启动盘中监控")
     parser.add_argument("--codes", type=str, default="", help="手动指定股票代码, 逗号分隔")
-    parser.add_argument("--dragon-days", type=int, default=15, help="龙虎榜回看天数 (默认15)")
-    parser.add_argument("--angle", type=float, default=1.0, help="MA5斜率阈值 %%/天 (默认1.0, 约45度)")
+    parser.add_argument("--refresh", action="store_true", help="强制刷新, 忽略当天缓存")
     parser.add_argument("--interval", type=int, default=60, help="盘中轮询间隔秒数 (默认60)")
     parser.add_argument("--cooldown", type=int, default=30, help="信号冷却时间分钟 (默认30)")
-    parser.add_argument("--kline-days", type=int, default=60, help="日K线回看天数 (默认60)")
+    parser.add_argument("--kline-days", type=int, default=30, help="日K线回看天数 (默认30)")
     args = parser.parse_args()
 
     print("=" * 70)
-    print("  🔍 强势股盘中实时弱转强监控")
+    print("  🔍 首板/2连板盘中实时监控")
     print("=" * 70)
-    print(f"  条件: MA5>MA10>MA20 + MA5斜率>{args.angle}%/天(≈45°) + 近{args.dragon_days}日龙虎榜")
-    print(f"  信号A: 分时突破VWAP (放量突破均价线)")
-    print(f"  信号B: 平缓上升+VWAP向上 (趋势延续)")
+    print(f"  选股池: 昨日首板 + 5日内2连板")
+    print(f"  规则: 2连板高开不破均线 | 首板(旧)/非昨日2连板站稳VWAP>20min | 首板(新)动量加速")
 
     # 选股
     if args.codes:
-        # 手动指定代码
         codes = [c.strip() for c in args.codes.split(",") if c.strip()]
         candidates = []
         for code in codes:
             bars = load_kline_db(code, args.kline_days)
-            if not bars or len(bars) < 25:
+            if not bars or len(bars) < 2:
                 print(f"  ⚠️ {code}: K线数据不足")
                 continue
-            ma5_list = calc_ma(bars, 5)
-            ma10_list = calc_ma(bars, 10)
-            ma20_list = calc_ma(bars, 20)
             idx = len(bars) - 1
-            ma5, ma10, ma20 = ma5_list[idx], ma10_list[idx], ma20_list[idx]
-            if ma5 is None or ma10 is None or ma20 is None:
-                continue
-            angle = calc_ma5_angle(ma5_list, idx, 5)
             last_bar = bars[idx]
             prev_close = bars[idx - 1]['close'] if idx > 0 else 0
             change_pct = (last_bar['close'] / prev_close - 1) * 100 if prev_close > 0 else 0
             candidates.append({
                 'code': code, 'name': '', 'board': get_board_name(code),
                 'limit_pct': get_limit_pct(code),
-                'ma5': round(ma5, 2), 'ma10': round(ma10, 2), 'ma20': round(ma20, 2),
-                'angle': round(angle, 2) if angle else 0,
                 'last_close': last_bar['close'], 'last_date': last_bar['time'],
                 'change_pct': round(change_pct, 2),
-                'dragon_date': '(手动指定)', 'dragon_count': 0,
+                'source': '(手动指定)',
                 'prev_close': prev_close,
             })
         print(f"\n  手动指定: {len(candidates)}只")
     else:
-        candidates = screen_candidates(
-            dragon_days=args.dragon_days,
-            angle_threshold=args.angle,
-            kline_days=args.kline_days,
-        )
+        candidates = screen_candidates(kline_days=args.kline_days, force_refresh=args.refresh)
 
     if args.scan:
         print(f"\n  ✅ 选股完成 (--scan 模式, 不启动监控)")

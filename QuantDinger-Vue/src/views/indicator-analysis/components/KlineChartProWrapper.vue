@@ -6,18 +6,14 @@
 import request from '@/utils/request'
 import * as klinecharts from 'klinecharts'
 
-// klinecharts-pro UMD 需要 window.klinecharts 全局变量
-if (typeof window !== 'undefined' && !window.klinecharts) {
+// 设置全局变量供 Pro UMD 使用
+if (typeof window !== 'undefined') {
   window.klinecharts = klinecharts
 }
-import './klinecharts-pro.umd.js'
-import './klinecharts-pro.css'
-
-const klinechartspro = (typeof window !== 'undefined' && window.klinechartspro) || {}
 
 /**
  * KLineChartPro Vue 包装组件
- * 直接使用 @klinecharts/pro 的 UMD 版本，无需 npm install
+ * 动态加载 public/static/klinecharts-pro.umd.js
  */
 export default {
   name: 'KlineChartProWrapper',
@@ -31,12 +27,12 @@ export default {
   data () {
     return {
       chartPro: null,
-      realtimeTimer: null
+      realtimeTimer: null,
+      proReady: false
     }
   },
   computed: {
     periodObj () {
-      // 将 timeframe 转换为 Pro 的 period 格式
       const map = {
         '1m': { multiplier: 1, timespan: 'minute', text: '1m' },
         '5m': { multiplier: 5, timespan: 'minute', text: '5m' },
@@ -76,12 +72,40 @@ export default {
     }
   },
   mounted () {
-    this.initChart()
+    this.loadProScript()
   },
   beforeDestroy () {
-    this.destroyChart()
+    this.clearRealtimeTimer()
   },
   methods: {
+    loadProScript () {
+      // 检查是否已加载
+      if (window.klinechartspro && window.klinechartspro.KLineChartPro) {
+        this.proReady = true
+        this.initChart()
+        return
+      }
+
+      // 动态加载 CSS
+      if (!document.querySelector('link[href*="klinecharts-pro.css"]')) {
+        const link = document.createElement('link')
+        link.rel = 'stylesheet'
+        link.href = process.env.BASE_URL + 'static/klinecharts-pro.css'
+        document.head.appendChild(link)
+      }
+
+      // 动态加载 JS
+      const script = document.createElement('script')
+      script.src = process.env.BASE_URL + 'static/klinecharts-pro.umd.js'
+      script.onload = () => {
+        this.proReady = true
+        this.initChart()
+      }
+      script.onerror = (e) => {
+        console.error('Failed to load klinecharts-pro.umd.js:', e)
+      }
+      document.body.appendChild(script)
+    },
     createDatafeed () {
       const self = this
       return {
@@ -103,7 +127,6 @@ export default {
             }
             return []
           } catch (e) {
-            console.warn('searchSymbols error:', e)
             return []
           }
         },
@@ -138,12 +161,10 @@ export default {
             }
             return []
           } catch (e) {
-            console.warn('getHistoryKLineData error:', e)
             return []
           }
         },
         subscribe (symbol, period, callback) {
-          // 简单轮询实现，每 5 秒获取最新数据
           self.clearRealtimeTimer()
           self.realtimeTimer = setInterval(async () => {
             try {
@@ -166,14 +187,15 @@ export default {
               })
               if (res.code === 1 && Array.isArray(res.data) && res.data.length > 0) {
                 const latest = res.data[res.data.length - 1]
-                callback({
+                const klineData = {
                   timestamp: (latest.time || latest.timestamp) * (latest.time < 1e10 ? 1000 : 1),
                   open: parseFloat(latest.open),
                   high: parseFloat(latest.high),
                   low: parseFloat(latest.low),
                   close: parseFloat(latest.close),
                   volume: parseFloat(latest.volume || 0)
-                })
+                }
+                callback(klineData)
               }
             } catch (e) { /* ignore */ }
           }, 5000)
@@ -190,9 +212,17 @@ export default {
       }
     },
     initChart () {
-      if (!this.$refs.chartContainer || !klinechartspro.KLineChartPro) return
+      if (!this.$refs.chartContainer || !this.proReady) return
+
+      const KLineChartPro = window.klinechartspro && window.klinechartspro.KLineChartPro
+      if (!KLineChartPro) {
+        console.error('klinecharts-pro not loaded')
+        return
+      }
+
       try {
-        this.chartPro = new klinechartspro.KLineChartPro({
+        const isDark = this.theme === 'dark'
+        this.chartPro = new KLineChartPro({
           container: this.$refs.chartContainer,
           theme: this.theme,
           locale: this.locale,
@@ -201,19 +231,35 @@ export default {
           drawingBarVisible: true,
           mainIndicators: ['MA'],
           subIndicators: ['VOL'],
-          datafeed: this.createDatafeed()
+          datafeed: this.createDatafeed(),
+          styles: {
+            // A股惯例：红涨绿跌
+            candle: {
+              bar: {
+                upColor: isDark ? '#ef5350' : '#f5222d',
+                downColor: isDark ? '#0ecb81' : '#52c41a',
+                noChangeColor: '#888888',
+                upBorderColor: isDark ? '#ef5350' : '#f5222d',
+                downBorderColor: isDark ? '#0ecb81' : '#52c41a',
+                noChangeBorderColor: '#888888',
+                upWickColor: isDark ? '#ef5350' : '#f5222d',
+                downWickColor: isDark ? '#0ecb81' : '#52c41a',
+                noChangeWickColor: '#888888'
+              }
+            },
+            indicator: {
+              bars: [{
+                style: 'fill',
+                upColor: isDark ? '#ef5350' : '#f5222d',
+                downColor: isDark ? '#0ecb81' : '#52c41a',
+                noChangeColor: '#888888'
+              }]
+            }
+          }
         })
       } catch (e) {
         console.error('KLineChartPro init error:', e)
       }
-    },
-    destroyChart () {
-      this.clearRealtimeTimer()
-      // Pro 组件没有 destroy 方法，清理容器即可
-      if (this.$refs.chartContainer) {
-        this.$refs.chartContainer.innerHTML = ''
-      }
-      this.chartPro = null
     }
   }
 }

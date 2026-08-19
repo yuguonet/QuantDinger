@@ -3,63 +3,6 @@
     <!-- Header toolbar -->
     <div class="ide-toolbar">
       <div class="toolbar-left">
-        <div class="ide-toolbar-group ide-toolbar-group--tf">
-          <span class="ide-toolbar-label">{{ $t('indicatorIde.toolbar.timeframe') }}</span>
-          <a-radio-group
-            v-model="timeframe"
-            button-style="solid"
-            size="small"
-            class="tf-group ide-tf-seg"
-          >
-            <a-radio-button v-for="tf in timeframeOptions" :key="tf" :value="tf">{{ tf }}</a-radio-button>
-          </a-radio-group>
-        </div>
-
-        <div class="ide-toolbar-group ide-toolbar-group--indicator">
-          <span class="ide-toolbar-label">{{ $t('indicatorIde.toolbar.indicator') }}</span>
-          <a-select
-            v-model="selectedIndicatorId"
-            class="ide-toolbar-select ide-toolbar-select--indicator"
-            :placeholder="$t('backtest-center.indicator.selectIndicatorPlaceholder')"
-            size="small"
-            :loading="loadingIndicators"
-            allow-clear
-            show-search
-            option-filter-prop="children"
-            @change="onIndicatorChange"
-          >
-            <a-select-option
-              v-for="ind in indicators"
-              :key="ind.id"
-              :value="ind.id"
-            >
-              <span>{{ ind.name || ('Indicator #' + ind.id) }}</span>
-              <a-tag
-                v-if="Number(ind.is_buy) === 1"
-                color="purple"
-                style="margin-left: 6px; font-size: 10px; line-height: 16px; padding: 0 4px;"
-              >{{ $t('indicatorIde.purchasedBadge') }}</a-tag>
-            </a-select-option>
-          </a-select>
-        </div>
-
-      </div>
-
-      <div class="toolbar-right">
-        <a-tooltip placement="bottomLeft">
-          <template slot="title">
-            {{ quickTradeDrawerVisible ? $t('indicatorIde.hideQuickTrade') : $t('indicatorIde.showQuickTrade') }}
-          </template>
-          <a-button
-            class="ide-toolbar-qt-btn"
-            size="small"
-            :type="quickTradeDrawerVisible ? 'primary' : 'default'"
-            @click="toggleQuickTradeDrawer"
-          >
-            <a-icon type="thunderbolt" theme="filled" />
-            <span class="ide-toolbar-qt-label">{{ $t('quickTrade.title') }}</span>
-          </a-button>
-        </a-tooltip>
       </div>
     </div>
 
@@ -96,6 +39,28 @@
               <a-tag v-if="tab.key === 'code' && codeDirty && !selectedIndicatorIsPurchased" color="orange" size="small" class="ide-chart-tab-badge">{{ $t('indicatorIde.modified') }}</a-tag>
               <a-tag v-if="tab.key === 'code' && selectedIndicatorIsPurchased" color="purple" size="small" class="ide-chart-tab-badge">{{ $t('indicatorIde.purchasedReadOnlyTag') }}</a-tag>
             </div>
+            <!-- 指标选择 -->
+            <div class="ide-chart-tab-indicator">
+              <a-select
+                v-model="selectedIndicatorId"
+                size="small"
+                :placeholder="$t('backtest-center.indicator.selectIndicatorPlaceholder')"
+                :loading="loadingIndicators"
+                allow-clear
+                show-search
+                option-filter-prop="children"
+                @change="onIndicatorChange"
+              >
+                <a-select-option
+                  v-for="ind in indicators"
+                  :key="ind.id"
+                  :value="ind.id"
+                >
+                  <span>{{ ind.name || ('Indicator #' + ind.id) }}</span>
+                  <a-tag v-if="Number(ind.is_buy) === 1" color="purple" size="small" style="margin-left: 6px;">{{ $t('indicatorIde.purchasedBadge') }}</a-tag>
+                </a-select-option>
+              </a-select>
+            </div>
             <!-- 代码编辑器操作按钮（仅代码tab激活时显示） -->
             <div v-if="activeChartTab === 'code'" class="ide-chart-tab-actions">
               <a-tooltip :title="$t('dashboard.indicator.create')">
@@ -126,17 +91,19 @@
 
           <!-- K线图 -->
           <div v-show="activeChartTab === 'chart'" class="ide-chart-tab-content">
-            <kline-chart
-              ref="klineChart"
+            <kline-chart-pro-wrapper
+              v-if="symbol"
+              ref="klineChartPro"
               :symbol="symbol"
               :market="market"
               :timeframe="timeframe"
               :theme="chartTheme"
-              :activeIndicators="activeIndicators"
-              :userId="userId"
-              :realtime-enabled="klineRealtimeEnabled"
-              @indicator-toggle="handleIndicatorToggle"
+              locale="zh-CN"
             />
+            <div v-else class="result-empty">
+              <a-icon type="stock" style="font-size: 48px; color: #d9d9d9;" />
+              <p>{{ $t('indicatorIde.emptyHint') || '请先选择标的' }}</p>
+            </div>
           </div>
 
           <!-- 代码编辑器 -->
@@ -956,6 +923,7 @@ import request from '@/utils/request'
 import { getUserInfo } from '@/api/login'
 import { getWatchlist, addWatchlist, searchSymbols } from '@/api/market'
 import KlineChart from '@/views/indicator-analysis/components/KlineChart.vue'
+import KlineChartProWrapper from '@/views/indicator-analysis/components/KlineChartProWrapper.vue'
 import BacktestHistoryDrawer from '@/views/indicator-analysis/components/BacktestHistoryDrawer.vue'
 import QuickTradePanel from '@/components/QuickTradePanel/QuickTradePanel'
 import WatchlistPanel from '@/components/WatchlistPanel'
@@ -1003,7 +971,7 @@ function ideUiCacheStorageKey (userId) {
 export default {
   name: 'IndicatorIDE',
   mixins: [baseMixin],
-  components: { KlineChart, BacktestHistoryDrawer, QuickTradePanel, WatchlistPanel },
+  components: { KlineChart, KlineChartProWrapper, BacktestHistoryDrawer, QuickTradePanel, WatchlistPanel },
   data () {
     return {
       userId: null,
@@ -4529,6 +4497,18 @@ export default {
   border-bottom: 1px solid #e8e8e8;
   flex-shrink: 0;
   height: 36px;
+}
+.ide-chart-tab-indicator {
+  margin-left: auto;
+  padding-right: 4px;
+}
+.ide-chart-tab-indicator .ant-select {
+  min-width: 150px;
+  font-size: 12px;
+}
+/* 隐藏自选股市场标签 */
+.ide-left .wl-market {
+  display: none !important;
 }
 .ide-chart-tab {
   display: inline-flex;
