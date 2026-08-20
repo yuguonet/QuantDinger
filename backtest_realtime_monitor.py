@@ -6,16 +6,24 @@ realtime_monitor 盘中策略回测 (基于15分钟K线)
   python backtest_realtime_monitor.py --days 60          # 最近60个交易日
   python backtest_realtime_monitor.py --days 120 --all   # 输出每笔明细
   python backtest_realtime_monitor.py --days 30 --category 首板新  # 只测某一类
+  python backtest_realtime_monitor.py --compare          # 参数对比模式
+  python backtest_realtime_monitor.py --take-profit 8    # 止盈+8%
 
 回测逻辑:
   1. 日线识别候选: 首板(新)/首板(旧)/昨日2连板/非昨日2连板 (排除ST, 放量)
   2. 次日用15mK线模拟盘中信号规则
-  3. 信号触发后追踪出场 (止损-5% / 追踪止损-5% / 持仓上限7天)
+  3. 信号触发后追踪出场 (止损 / 追踪止损 / 止盈 / 持仓上限)
+
+出场规则:
+  止损: 跌破 entry × (1 + stop_loss/100)
+  追踪止损: 从峰值回撤 trailing_stop%
+  止盈: 峰值达到 entry × (1 + take_profit/100) 时, 追踪止损收紧一半锁定利润
+  持仓到期: 最后一根bar收盘
 
 信号规则 (与 realtime_monitor.py 一致):
   首板(新)   — 今日动量 > 昨日动量 × 1.5
   首板(旧)   — 突破VWAP并站稳超2根15m bar (≈30min)
-  昨日2连板  — 高开>0% 且 收盘>VWAP
+  昨日2连板  — 高开>0% + 收盘>VWAP + 缩量(今日量/昨日量<70%)
   非昨日2连板 — 突破VWAP并站稳超2根15m bar (≈30min)
 """
 from __future__ import annotations
@@ -174,15 +182,16 @@ def classify_candidates(daily_bars: List[Dict], code: str) -> List[Dict]:
                 'date': bar['time'], 'source': cat, 'close': bar['close'],
                 'prev_close': prev['close'], 'open': bar['open'],
                 'yesterday_momentum': round(ym, 2), 'vol_ratio': round(vr, 2),
+                'last_volume': bar['volume'],
             })
 
         elif yesterday_lu and day_before_lu:
-            # 连板
-            streak = 2
-            while idx - streak >= 1 and is_limit_up(
-                    daily_bars[idx - streak + 1]['close'], daily_bars[idx - streak]['close'], bt):
-                streak += 1
-            first_lu_idx = idx - streak + 1
+            # 连板 — 排除3连板以上: 前天之前一天不能是涨停
+            prev2 = daily_bars[idx - 3] if idx >= 3 else None
+            day_before2_lu = prev2 and is_limit_up(daily_bars[idx-2]['close'], prev2['close'], bt)
+            if day_before2_lu:
+                continue  # 3连板以上, 跳过
+            first_lu_idx = idx - 1  # 首板日
             vr = calc_vol_ratio(daily_bars, first_lu_idx, 5)
             if vr < 1.5:
                 continue
@@ -190,11 +199,11 @@ def classify_candidates(daily_bars: List[Dict], code: str) -> List[Dict]:
                 'date': bar['time'], 'source': '昨日2连板', 'close': bar['close'],
                 'prev_close': prev['close'], 'open': bar['open'],
                 'yesterday_momentum': round(ym, 2), 'vol_ratio': round(vr, 2),
-                'streak': streak,
+                'streak': 2, 'last_volume': bar['volume'],
             })
 
         else:
-            # 非昨日2连板: 近期有2连板
+            # 非昨日2连板: 近期有恰好2连板
             limit_indices = find_limit_up_indices(daily_bars[:idx + 1], bt)
             if len(limit_indices) < 2:
                 continue
@@ -209,7 +218,15 @@ def classify_candidates(daily_bars: List[Dict], code: str) -> List[Dict]:
                         best_start = limit_indices[j - cur_streak + 1]
                 else:
                     cur_streak = 1
-            if max_streak < 2:
+            if max_streak != 2:
+                continue
+            # 额外校验: 确保是真正的2连板
+            if not is_limit_up(daily_bars[best_start]['close'], daily_bars[best_start-1]['close'], bt):
+                continue
+            if not is_limit_up(daily_bars[best_start+1]['close'], daily_bars[best_start]['close'], bt):
+                continue
+            # 前一天不能是涨停 (否则是3连板)
+            if best_start >= 2 and is_limit_up(daily_bars[best_start-1]['close'], daily_bars[best_start-2]['close'], bt):
                 continue
             vr = calc_vol_ratio(daily_bars, best_start, 5)
             if vr < 1.5:
@@ -218,6 +235,7 @@ def classify_candidates(daily_bars: List[Dict], code: str) -> List[Dict]:
                 'date': bar['time'], 'source': '非昨日2连板', 'close': bar['close'],
                 'prev_close': prev['close'], 'open': bar['open'],
                 'yesterday_momentum': round(ym, 2), 'vol_ratio': round(vr, 2),
+                'last_volume': bar['volume'],
             })
 
     return candidates
@@ -274,9 +292,14 @@ def detect_signal_15m(bars_15m: List[Dict], candidate: Dict) -> Optional[Dict]:
         signal = None
 
         if source == '昨日2连板':
-            # 高开>0% 且 第一根bar收盘>VWAP
+            # 高开>0% + 第一根bar收盘>VWAP + 缩量
             if open_gap > 0 and bars_15m[0]['close'] > vwap_seq[0]:
-                signal = {'type': '2连板_高开不破均线'}
+                # 缩量: 今日累计量 / 昨日量 < 0.7
+                today_vol = sum(b['volume'] for b in bars_15m[:i + 1])
+                yesterday_vol = candidate.get('last_volume', 0)
+                vol_shrink = today_vol / yesterday_vol if yesterday_vol > 0 else 1.0
+                if vol_shrink < 0.7:
+                    signal = {'type': '2连板_高开缩量', 'vol_shrink': round(vol_shrink, 2)}
 
         elif source == '首板(新)':
             if yesterday_momentum > 0 and today_momentum > yesterday_momentum * 1.5:
@@ -314,15 +337,16 @@ def detect_signal_15m(bars_15m: List[Dict], candidate: Dict) -> Optional[Dict]:
 
 def run_exit_backtest(bars_15m: List[Dict], entry_idx: int, entry_price: float,
                       stop_loss: float = -5.0, trailing_stop: float = -5.0,
-                      max_hold_bars: int = 32) -> Dict:
+                      take_profit: float = 0, max_hold_bars: int = 32) -> Dict:
     """15m级别出场回测
 
     max_hold_bars: 32根15m bar ≈ 7个交易日 (32×15min=480min=8h=1天, ×7≈7天)
 
     出场规则:
-      1. 止损: 跌破 entry_price × (1 + stop_loss/100)
-      2. 追踪止损: 从峰值回撤 trailing_stop%
-      3. 持仓到期: 最后一根bar收盘
+      1. 止盈: 峰值达到 entry_price × (1 + take_profit/100) 时锁定
+      2. 止损: 跌破 entry_price × (1 + stop_loss/100)
+      3. 追踪止损: 从峰值回撤 trailing_stop%
+      4. 持仓到期: 最后一根bar收盘
     """
     if entry_price <= 0 or entry_idx >= len(bars_15m):
         return {}
@@ -330,6 +354,7 @@ def run_exit_backtest(bars_15m: List[Dict], entry_idx: int, entry_price: float,
     peak = entry_price
     exit_price = entry_price
     exit_bar = 0
+    take_profit_hit = False
 
     for d in range(max_hold_bars):
         idx = entry_idx + d
@@ -338,6 +363,19 @@ def run_exit_backtest(bars_15m: List[Dict], entry_idx: int, entry_price: float,
         b = bars_15m[idx]
         if b['high'] > peak:
             peak = b['high']
+
+        # 止盈: 峰值达到目标, 用追踪止损锁定利润
+        if take_profit and peak >= entry_price * (1 + take_profit / 100):
+            take_profit_hit = True
+            # 进入追踪止损模式, 用更紧的回撤阈值
+            tp_trailing = trailing_stop / 2  # 止盈后追踪止损收紧一半
+            if b['low'] <= peak * (1 + tp_trailing / 100):
+                exit_price = peak * (1 + tp_trailing / 100)
+                exit_bar = d
+                break
+            exit_price = b['close']
+            exit_bar = d
+            continue
 
         # 追踪止损
         if d > 0 and b['low'] <= peak * (1 + trailing_stop / 100):
@@ -362,6 +400,9 @@ def run_exit_backtest(bars_15m: List[Dict], entry_idx: int, entry_price: float,
         'exit_bar': exit_bar,
         'return_pct': round(ret, 2),
         'peak_return_pct': round(peak_ret, 2),
+        'exit_reason': 'take_profit' if take_profit_hit and ret > 0 else (
+            'trailing_stop' if ret < 0 and exit_bar > 0 else (
+                'stop_loss' if ret < 0 and exit_bar <= 1 else 'max_hold')),
     }
 
 # ================================================================
@@ -369,7 +410,8 @@ def run_exit_backtest(bars_15m: List[Dict], entry_idx: int, entry_price: float,
 # ================================================================
 
 def backtest_stock(code: str, daily_bars: List[Dict],
-                   hold_bars: int = 32) -> List[Dict]:
+                   hold_bars: int = 32, stop_loss: float = -5.0,
+                   trailing_stop: float = -5.0, take_profit: float = 0) -> List[Dict]:
     """单股回测: 识别候选日 → 拉15m数据 → 检测信号 → 模拟出场"""
     candidates = classify_candidates(daily_bars, code)
     if not candidates:
@@ -420,6 +462,8 @@ def backtest_stock(code: str, daily_bars: List[Dict],
         entry_idx = signal['bar_idx']
         entry_price = signal['entry_price']
         exit_result = run_exit_backtest(all_bars_after, entry_idx, entry_price,
+                                        stop_loss=stop_loss, trailing_stop=trailing_stop,
+                                        take_profit=take_profit,
                                         max_hold_bars=hold_bars)
         if not exit_result:
             continue
@@ -464,7 +508,14 @@ def print_stats(trades: List[Dict], label: str = ""):
     else:
         pl = 0.0
 
-    print(f"  {label}: {total}笔 胜率{wr:.1f}% 均收益{avg_ret:+.2f}% 均峰值{avg_peak:+.2f}% 盈亏比{pl:.2f}")
+    # 出场原因分布
+    reasons = {}
+    for t in trades:
+        r = t.get('exit_reason', '?')
+        reasons[r] = reasons.get(r, 0) + 1
+    dist = ' '.join(f"{k}:{v}" for k, v in sorted(reasons.items()))
+
+    print(f"  {label}: {total}笔 胜率{wr:.1f}% 均收益{avg_ret:+.2f}% 均峰值{avg_peak:+.2f}% 盈亏比{pl:.2f} | {dist}")
 
 def print_detail(trades: List[Dict]):
     if not trades:
@@ -490,14 +541,18 @@ def main():
                         choices=["all", "首板新", "首板旧", "昨日2连板", "非昨日2连板"],
                         help="只测某一类")
     parser.add_argument("--hold", type=int, default=32, help="最大持仓bar数 (默认32≈7天)")
+    parser.add_argument("--stop-loss", type=float, default=-5.0, help="止损百分比 (默认-5)")
+    parser.add_argument("--trailing-stop", type=float, default=-5.0, help="追踪止损百分比 (默认-5)")
+    parser.add_argument("--take-profit", type=float, default=0, help="止盈百分比 (默认0=不禁用)")
+    parser.add_argument("--compare", action="store_true", help="参数对比模式, 测试多组参数")
     parser.add_argument("--all", action="store_true", help="输出每笔明细")
     args = parser.parse_args()
+
+    cat_map = {'首板新': '首板(新)', '首板旧': '首板(旧)', '昨日2连板': '昨日2连板', '非昨日2连板': '非昨日2连板'}
 
     print("=" * 70)
     print("  📊 realtime_monitor 盘中策略回测 (15m)")
     print("=" * 70)
-
-    cat_map = {'首板新': '首板(新)', '首板旧': '首板(旧)', '昨日2连板': '昨日2连板', '非昨日2连板': '非昨日2连板'}
 
     # 获取股票列表
     if args.codes:
@@ -508,19 +563,91 @@ def main():
     codes = [c for c in codes if c not in st_codes]
     print(f"  股票: {len(codes)}只 (排除ST)")
 
+    # 预加载所有股票的日线数据 (避免对比模式重复拉取)
+    print(f"  加载日线数据...")
+    daily_cache = {}
+    for i, code in enumerate(codes):
+        if (i + 1) % 200 == 0:
+            print(f"\r  加载: {i+1}/{len(codes)}...", end="", flush=True)
+        daily = fetch_daily_kline(code, args.days)
+        if daily:
+            daily_cache[code] = daily
+    print(f"\r  日线加载完成: {len(daily_cache)}只有数据")
+
+    # ── 参数对比模式 ──
+    if args.compare:
+        param_sets = [
+            {'label': '当前(无止盈)',  'stop_loss': -5.0, 'trailing_stop': -5.0, 'take_profit': 0},
+            {'label': '止盈+8%',      'stop_loss': -5.0, 'trailing_stop': -5.0, 'take_profit': 8.0},
+            {'label': '止盈+10%',     'stop_loss': -5.0, 'trailing_stop': -5.0, 'take_profit': 10.0},
+            {'label': '止盈+8%+追踪-3%', 'stop_loss': -5.0, 'trailing_stop': -3.0, 'take_profit': 8.0},
+            {'label': '止盈+10%+追踪-3%', 'stop_loss': -5.0, 'trailing_stop': -3.0, 'take_profit': 10.0},
+            {'label': '止损-3%+止盈+8%', 'stop_loss': -3.0, 'trailing_stop': -5.0, 'take_profit': 8.0},
+        ]
+
+        print(f"\n{'='*90}")
+        print(f"  📊 参数对比 ({len(daily_cache)}只股票, hold={args.hold}bar)")
+        print(f"{'='*90}")
+        print(f"  {'方案':<22} {'笔数':>6} {'胜率':>7} {'均收益':>8} {'均峰值':>8} {'盈亏比':>7} {'单位时间':>9} {'出场分布':>20}")
+        print(f"  {'-'*90}")
+
+        for ps in param_sets:
+            all_trades = []
+            for code, daily in daily_cache.items():
+                trades = backtest_stock(code, daily, hold_bars=args.hold,
+                                        stop_loss=ps['stop_loss'],
+                                        trailing_stop=ps['trailing_stop'],
+                                        take_profit=ps['take_profit'])
+                if args.category != 'all':
+                    trades = [t for t in trades if t['source'] == cat_map.get(args.category)]
+                all_trades.extend(trades)
+
+            if not all_trades:
+                print(f"  {ps['label']:<22} {'无交易':>6}")
+                continue
+
+            total = len(all_trades)
+            pnls = [t['return_pct'] for t in all_trades]
+            peaks = [t['peak_return_pct'] for t in all_trades]
+            holds = [t['exit_bar'] for t in all_trades]
+            wins = [p for p in pnls if p > 0]
+            losses = [p for p in pnls if p <= 0]
+            wr = len(wins) / total * 100
+            avg_ret = sum(pnls) / total
+            avg_peak = sum(peaks) / total
+            avg_hold = sum(holds) / len(holds)
+            avg_win = sum(wins) / len(wins) if wins else 0
+            avg_loss = abs(sum(losses)) / len(losses) if losses else 0
+            pl = avg_win / avg_loss if avg_loss > 0 else 999
+            rpd = ((len(wins)/total * avg_win - len(losses)/total * avg_loss) / max(avg_hold, 1))
+
+            # 出场原因分布
+            reasons = {}
+            for t in all_trades:
+                r = t.get('exit_reason', '?')
+                reasons[r] = reasons.get(r, 0) + 1
+            dist = ' '.join(f"{k}:{v}" for k, v in sorted(reasons.items()))
+
+            print(f"  {ps['label']:<22} {total:>6} {wr:>6.1f}% {avg_ret:>+7.2f}% {avg_peak:>+7.2f}% {pl:>6.2f}x {rpd:>+8.4f}% {dist}")
+
+        print(f"\n  单位时间收益率 = (胜率×均盈 - 败率×均亏) / 均持仓bar数")
+        return
+
+    # ── 单次回测模式 ──
+    cat_map = {'首板新': '首板(新)', '首板旧': '首板(旧)', '昨日2连板': '昨日2连板', '非昨日2连板': '非昨日2连板'}
+
     # 回测
     all_trades = []
     cat_trades = defaultdict(list)
 
-    for i, code in enumerate(codes):
+    for i, (code, daily) in enumerate(daily_cache.items()):
         if (i + 1) % 100 == 0:
-            print(f"\r  进度: {i+1}/{len(codes)}...", end="", flush=True)
+            print(f"\r  进度: {i+1}/{len(daily_cache)}...", end="", flush=True)
 
-        daily = fetch_daily_kline(code, args.days)
-        if not daily:
-            continue
-
-        trades = backtest_stock(code, daily, hold_bars=args.hold)
+        trades = backtest_stock(code, daily, hold_bars=args.hold,
+                                stop_loss=args.stop_loss,
+                                trailing_stop=args.trailing_stop,
+                                take_profit=args.take_profit)
 
         for t in trades:
             src = t['source']
@@ -529,7 +656,7 @@ def main():
             all_trades.append(t)
             cat_trades[src].append(t)
 
-    print(f"\r  回测完成: {len(codes)}只股票, {len(all_trades)}笔交易")
+    print(f"\r  回测完成: {len(daily_cache)}只股票, {len(all_trades)}笔交易")
 
     # 按分类统计
     print(f"\n{'='*70}")
@@ -553,7 +680,9 @@ def main():
     outfile = "backtest_realtime_monitor_result.json"
     with open(outfile, "w", encoding="utf-8") as f:
         json.dump({
-            'params': {'days': args.days, 'hold': args.hold, 'category': args.category},
+            'params': {'days': args.days, 'hold': args.hold, 'category': args.category,
+                      'stop_loss': args.stop_loss, 'trailing_stop': args.trailing_stop,
+                      'take_profit': args.take_profit},
             'total_trades': len(all_trades),
             'by_category': {cat: len(trades) for cat, trades in cat_trades.items()},
             'trades': all_trades,

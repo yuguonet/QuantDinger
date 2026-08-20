@@ -27,6 +27,7 @@ export default {
   data () {
     return {
       chartPro: null,
+      innerChart: null,
       realtimeTimer: null,
       proReady: false
     }
@@ -233,7 +234,6 @@ export default {
           subIndicators: ['VOL'],
           datafeed: this.createDatafeed(),
           styles: {
-            // A股惯例：红涨绿跌
             candle: {
               bar: {
                 upColor: isDark ? '#ef5350' : '#f5222d',
@@ -257,8 +257,40 @@ export default {
             }
           }
         })
+
+        // 获取内部klinecharts实例
+        this.$nextTick(() => {
+          this._bindInnerChart()
+        })
       } catch (e) {
         console.error('KLineChartPro init error:', e)
+      }
+    },
+    _bindInnerChart () {
+      // Pro内部的chart容器是 .klinecharts-pro-widget
+      const widgetEl = this.$refs.chartContainer.querySelector('.klinecharts-pro-widget')
+      if (widgetEl && typeof klinecharts.init === 'function') {
+        // klinecharts.init 会返回已有实例（如果容器已初始化）
+        const chart = klinecharts.init(widgetEl)
+        if (chart) {
+          this.innerChart = chart
+        }
+      }
+    },
+    /** 获取内部klinecharts实例，供外部添加自定义指标 */
+    getChart () {
+      return this.innerChart
+    },
+    // 兼容原 KlineChart 组件的方法
+    updateIndicators () {
+      // 由外部调用，通过getChart()获取实例后自行操作
+    },
+    executePythonStrategy () {
+      return null
+    },
+    resize () {
+      if (this.innerChart) {
+        this.innerChart.resize()
       }
     }
   }

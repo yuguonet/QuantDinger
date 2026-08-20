@@ -133,6 +133,65 @@ logger = get_logger(__name__)
 
 
 # ================================================================
+# 实时行情快照字段归一化
+# ================================================================
+# 各源返回的 quote dict 字段名不统一, 归一化后调用方只需读一套字段:
+#   last / open / high / low / previousClose / change / changePercent
+#   / volume / time / name / symbol
+#
+# 归一化规则:
+#   - prev_close → previousClose (保留原字段, 同时补充标准字段)
+#   - change_pct → changePercent (同上)
+#   - 补充缺失的 change = last - previousClose
+#   - 补充缺失的 changePercent = change / previousClose * 100
+#
+# 调用方: 各 Provider 的 fetch_ticker / fetch_batch_quotes 返回前调用。
+# Coordinator 和上层代码只需读标准字段名。
+# ================================================================
+
+def normalize_quote(q: Dict[str, Any]) -> Dict[str, Any]:
+    """归一化单条实时行情快照的字段名。
+
+    原地修改并返回 q, 同时保留原始字段不破坏兼容性。
+    """
+    if not isinstance(q, dict):
+        return q
+
+    # ── 昨收: prev_close → previousClose ──
+    prev = q.get('previousClose') or q.get('prev_close') or 0
+    if prev:
+        q['previousClose'] = prev
+        # 保留 prev_close 不删, 避免破坏依赖它的旧代码
+
+    # ── 最新价: 确保 last 字段存在 ──
+    last = q.get('last') or q.get('price') or q.get('close') or 0
+    if last:
+        q['last'] = last
+
+    # ── 涨跌额: change ──
+    if 'change' not in q and prev > 0 and last > 0:
+        q['change'] = round(last - prev, 4)
+
+    # ── 涨跌幅: changePercent ──
+    if 'changePercent' not in q:
+        change_pct = q.get('change_pct')
+        if change_pct is not None:
+            q['changePercent'] = change_pct
+        elif prev > 0 and last > 0:
+            q['changePercent'] = round((last - prev) / prev * 100, 2)
+    # 保留 change_pct 不删
+
+    return q
+
+
+def normalize_quotes(quotes: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """归一化批量行情快照。对每个 quote 调用 normalize_quote。"""
+    for q in quotes.values():
+        normalize_quote(q)
+    return quotes
+
+
+# ================================================================
 # 各数据源最大并发线程数 (max_concurrency)
 # ================================================================
 # 每个 Provider 文件定义自己的 MAX_CONCURRENCY 常量（模块级），

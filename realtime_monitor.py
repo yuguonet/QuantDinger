@@ -204,12 +204,11 @@ def load_all_candidates(kline_days: int = 30) -> List[Dict]:
             })
 
         elif yesterday_lu and day_before_lu:
-            # 昨日是连板 (2连板或更多)
-            # 往前数连续涨停天数
+            # 昨日是连板 — 排除3连板以上: 前天之前一天不能是涨停
+            day_before2_lu = idx >= 3 and _is_limit_up(bars[idx-2]['close'], bars[idx-3]['close'], bt)
+            if day_before2_lu:
+                continue  # 3连板以上, 跳过
             streak = 2
-            while idx - streak >= 1 and _is_limit_up(
-                    bars[idx - streak + 1]['close'], bars[idx - streak]['close'], bt):
-                streak += 1
             # 取首板日的量比
             first_lu_idx = idx - streak + 1
             vol_ratio = _calc_vol_ratio(bars, first_lu_idx, 5)
@@ -217,7 +216,7 @@ def load_all_candidates(kline_days: int = 30) -> List[Dict]:
                 continue
             candidates.append({
                 'stock_code': code, 'stock_name': stock_names.get(code, ''),
-                'source': '昨日2连板', 'continuous_zt_days': streak,
+                'source': '昨日2连板', 'continuous_zt_days': 2,
                 'vol_ratio': round(vol_ratio, 2),
             })
 
@@ -226,7 +225,7 @@ def load_all_candidates(kline_days: int = 30) -> List[Dict]:
             limit_indices = _find_limit_up_indices(bars, bt)
             if len(limit_indices) < 2:
                 continue
-            # 找最长连续涨停
+            # 找最长连续涨停 (索引必须严格相邻)
             max_streak = 1
             cur_streak = 1
             best_start = limit_indices[0]
@@ -238,7 +237,16 @@ def load_all_candidates(kline_days: int = 30) -> List[Dict]:
                         best_start = limit_indices[j - cur_streak + 1]
                 else:
                     cur_streak = 1
-            if max_streak < 2:
+            if max_streak != 2:
+                continue
+            # 额外校验: 确保是真正的2连板 (不是中间隔了天的)
+            # best_start 和 best_start+1 都必须是涨停日
+            if not _is_limit_up(bars[best_start]['close'], bars[best_start-1]['close'], bt):
+                continue
+            if not _is_limit_up(bars[best_start+1]['close'], bars[best_start]['close'], bt):
+                continue
+            # best_start-1 不能是涨停 (否则是3连板)
+            if best_start >= 2 and _is_limit_up(bars[best_start-1]['close'], bars[best_start-2]['close'], bt):
                 continue
             # 首板放量
             vol_ratio = _calc_vol_ratio(bars, best_start, 5)
@@ -387,6 +395,7 @@ def screen_candidates(kline_days: int = 30, force_refresh: bool = False) -> List
             'yesterday_momentum': round(yesterday_momentum, 2),
             'vol_ratio': info.get('vol_ratio', 0),
             'prev_close': prev_close,
+            'last_volume': last_bar['volume'],
         })
 
     # 按分类排序
@@ -442,15 +451,34 @@ def fetch_batch_quotes(codes: List[str]) -> Dict[str, Dict]:
     except Exception:
         return {}
 
+def _get_quote_price(quote: Dict) -> float:
+    """从行情dict取最新价, 兼容不同源的字段名"""
+    return quote.get('last', 0) or quote.get('price', 0) or quote.get('close', 0)
+
+
+def _get_quote_prev_close(quote: Dict) -> float:
+    """从行情dict取昨收, 兼容不同源的字段名"""
+    return quote.get('previousClose', 0) or quote.get('prev_close', 0)
+
+
+def _calc_change_pct(quote: Dict) -> float:
+    """实时计算涨跌幅, 不依赖源的 changePercent/change_pct 字段(可能过期)"""
+    last = _get_quote_price(quote)
+    prev = _get_quote_prev_close(quote)
+    if prev <= 0 or last <= 0:
+        return 0.0
+    return round((last / prev - 1) * 100, 2)
+
+
 def _quick_momentum(code: str, quote: Dict) -> Tuple[float, float]:
     """从批量行情快速计算: (今日动量, 高开幅度)
 
     今日动量 = (最新价 - 开盘) / 昨收 * 100
     高开幅度 = (开盘 - 昨收) / 昨收 * 100
     """
-    last = quote.get('last', 0) or quote.get('price', 0)
+    last = _get_quote_price(quote)
     open_p = quote.get('open', 0)
-    prev = quote.get('previousClose', 0) or quote.get('prev_close', 0)
+    prev = _get_quote_prev_close(quote)
     if prev <= 0 or last <= 0:
         return 0.0, 0.0
     momentum = (last - open_p) / prev * 100 if open_p > 0 else 0.0
@@ -459,7 +487,7 @@ def _quick_momentum(code: str, quote: Dict) -> Tuple[float, float]:
 
 def _quick_above_vwap(code: str, quote: Dict) -> bool:
     """粗略判断: 现价 > 开盘价 (代替VWAP判断, 批量行情无法算精确VWAP)"""
-    last = quote.get('last', 0) or quote.get('price', 0)
+    last = _get_quote_price(quote)
     open_p = quote.get('open', 0)
     return last > 0 and open_p > 0 and last >= open_p
 
@@ -489,18 +517,17 @@ def prefilter_by_rules(candidates: List[Dict]) -> List[Dict]:
         today_mom, open_gap = _quick_momentum(c['code'], q)
         c['today_momentum'] = today_mom
 
-        if source == '昨日2连板':
-            # 高开>0% 且 现价>开盘价
-            if open_gap > 0 and _quick_above_vwap(c['code'], q):
-                matched.append(c)
-        elif source == '首板(新)':
+        if source == '首板(新)':
             # 今动量 > 昨动量*1.5
             ym = c.get('yesterday_momentum', 0)
             if ym > 0 and today_mom > ym * 1.5:
                 matched.append(c)
         else:
-            # 首板(旧) / 非昨日2连板 — 需要VWAP, 全部保留
+            # 首板(旧) / 非昨日2连板 / 昨日2连板 — 都需要分时数据, 全部保留
             matched.append(c)
+
+        # 用实时数据覆盖涨跌幅(不依赖源的 changePercent, 可能过期)
+        c['realtime_change_pct'] = _calc_change_pct(q)
 
     return matched
 
@@ -644,17 +671,23 @@ def detect_signal(ticks: List[Dict], candidate: Dict) -> Optional[Dict]:
 
     signal = None
 
-    # ========== 昨日2连板: 高开>0% 且 现价不破VWAP ==========
+    # ========== 昨日2连板: 高开>0% + 现价不破VWAP + 缩量 ==========
     if source == '昨日2连板':
         if open_gap > 0 and current_price >= vwap:
-            signal = {
-                'type': '2连板_高开不破均线',
-                'label': '高开不破均线',
-                'emoji': '🔗',
-                'detail': (f"高开{open_gap:+.1f}%, "
-                           f"现价{current_price:.2f} VWAP{vwap:.2f} "
-                           f"({price_vs_vwap:+.1f}%)"),
-            }
+            # 缩量检查: 今日累计量 / 昨日量 < 0.7
+            today_vol = sum(t['volume'] for t in ticks)
+            yesterday_vol = candidate.get('last_volume', 0)
+            vol_shrink = today_vol / yesterday_vol if yesterday_vol > 0 else 1.0
+            if vol_shrink < 0.7:
+                signal = {
+                    'type': '2连板_高开缩量',
+                    'label': '高开缩量',
+                    'emoji': '🔗',
+                    'detail': (f"高开{open_gap:+.1f}%, "
+                               f"现价{current_price:.2f} VWAP{vwap:.2f} "
+                               f"({price_vs_vwap:+.1f}%), "
+                               f"缩量{vol_shrink:.0%}"),
+                }
 
     # ========== 非昨日2连板 / 首板(旧): 突破VWAP站稳>20分钟 ==========
     elif source in ('非昨日2连板', '首板(旧)'):
@@ -797,48 +830,34 @@ def run_monitor(candidates: List[Dict], interval: int = 60,
             # Step1: 批量行情预筛选 (1次HTTP, 过滤掉大部分)
             quick_matched = prefilter_by_rules(candidates)
 
-            # Step2: 只对需要VWAP的股票拉分时数据
+            # Step2: 只对需要分时数据的股票预处理
             for cand in quick_matched:
                 code = cand['code']
                 source = cand.get('source', '')
 
-                # 昨日2连板和首板(新) 已在预筛选中判断, 直接构建信号
-                if source in ('昨日2连板', '首板(新)'):
+                # 首板(新) 已在预筛选中判断, 直接构建信号
+                if source == '首板(新)':
                     q = cand.get('_quote', {})
-                    last = q.get('last', 0) or q.get('price', 0)
-                    prev = q.get('previousClose', 0) or q.get('prev_close', 0)
-                    open_p = q.get('open', 0)
-                    change_pct = (last / prev - 1) * 100 if prev > 0 else 0
-                    open_gap = (open_p / prev - 1) * 100 if prev > 0 else 0
+                    last = _get_quote_price(q)
+                    prev = _get_quote_prev_close(q)
+                    change_pct = _calc_change_pct(q)
                     today_mom = cand.get('today_momentum', 0)
                     ym = cand.get('yesterday_momentum', 0)
+                    open_p = q.get('open', 0)
+                    open_gap = (open_p / prev - 1) * 100 if prev > 0 else 0
 
-                    if source == '昨日2连板':
-                        sig = {
-                            'type': '2连板_高开不破均线', 'label': '高开不破均线',
-                            'emoji': '🔗', 'source': source,
-                            'code': code, 'name': cand.get('name', ''),
-                            'board': cand.get('board', ''), 'limit_pct': cand.get('limit_pct', 10),
-                            'price': last, 'vwap': 0, 'price_vs_vwap': 0,
-                            'change_pct': round(change_pct, 2),
-                            'open_gap': round(open_gap, 2),
-                            'today_momentum': today_mom, 'yesterday_momentum': ym,
-                            'time': current_time,
-                            'detail': f"高开{open_gap:+.1f}%, 现价{last:.2f}",
-                        }
-                    else:  # 首板(新)
-                        sig = {
-                            'type': '首板新_动量加速', 'label': '动量加速',
-                            'emoji': '🆕', 'source': source,
-                            'code': code, 'name': cand.get('name', ''),
-                            'board': cand.get('board', ''), 'limit_pct': cand.get('limit_pct', 10),
-                            'price': last, 'vwap': 0, 'price_vs_vwap': 0,
-                            'change_pct': round(change_pct, 2),
-                            'open_gap': round(open_gap, 2),
-                            'today_momentum': today_mom, 'yesterday_momentum': ym,
-                            'time': current_time,
-                            'detail': f"今动量{today_mom:+.1f}% > 昨{ym:+.1f}%×1.5={ym*1.5:+.1f}%",
-                        }
+                    sig = {
+                        'type': '首板新_动量加速', 'label': '动量加速',
+                        'emoji': '🆕', 'source': source,
+                        'code': code, 'name': cand.get('name', ''),
+                        'board': cand.get('board', ''), 'limit_pct': cand.get('limit_pct', 10),
+                        'price': last, 'vwap': 0, 'price_vs_vwap': 0,
+                        'change_pct': round(change_pct, 2),
+                        'open_gap': round(open_gap, 2),
+                        'today_momentum': today_mom, 'yesterday_momentum': ym,
+                        'time': current_time,
+                        'detail': f"今动量{today_mom:+.1f}% > 昨{ym:+.1f}%×1.5={ym*1.5:+.1f}%",
+                    }
 
                     if tracker.should_alert(code, current_time):
                         tracker.record(code, current_time)
@@ -846,7 +865,7 @@ def run_monitor(candidates: List[Dict], interval: int = 60,
                         all_signals.append(sig)
                     continue
 
-                # 首板(旧) / 非昨日2连板 — 需要VWAP, 标记待拉分时
+                # 首板(旧) / 非昨日2连板 / 昨日2连板 — 需要分时数据, 标记待拉
                 cand['_need_vwap'] = True
 
             # Step3: 批量拉取需要VWAP的股票的1分钟K线 (1次并发请求)
@@ -898,15 +917,18 @@ def run_monitor(candidates: List[Dict], interval: int = 60,
                           f"{buy_price:>7.2f} {sig['change_pct']:>+5.1f}% {sig.get('open_gap', 0):>+5.1f}% "
                           f"{sig.get('today_momentum', 0):>+5.1f}% {above_str:>4} {stop_price:>7.2f} {limit_price:>7.2f}")
             else:
-                # 静默状态行
-                latest_price = ""
-                if candidates:
-                    c = candidates[0]
+                # 静默状态行 — 显示所有候选股的实时状态
+                status_parts = []
+                for c in candidates:
                     q = _batch_cache.get(c['code'])
                     if q:
-                        last = q.get('last', 0) or q.get('price', 0)
-                        chg = q.get('changePercent', q.get('change_pct', 0))
-                        latest_price = f" | {c['code']} {last:.2f} {chg:+.1f}%"
+                        last = _get_quote_price(q)
+                        if last > 0:
+                            chg = _calc_change_pct(q)
+                            status_parts.append(f"{c['code']} {last:.2f} {chg:+.1f}%")
+                latest_price = " | ".join(status_parts) if status_parts else ""
+                if latest_price:
+                    latest_price = f" | {latest_price}"
                 print(f"\r  ⏱ [{scan_count}] {now.strftime('%H:%M:%S')} "
                       f"扫描{len(candidates)}只 无信号{latest_price}    ", end="", flush=True)
 

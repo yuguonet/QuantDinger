@@ -72,7 +72,7 @@ from typing import Any, Dict, List, Optional
 
 _TZ_CN = timezone(timedelta(hours=8))
 
-from app.data_sources.provider import register, NotSupportedResult
+from app.data_sources.provider import register, NotSupportedResult, normalize_quote, normalize_quotes
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -389,6 +389,7 @@ def _parse_sohu_heartbeat(text: str) -> Optional[Dict[str, Any]]:
     if len(time_arr) >= 6:
         result["time"] = f"{time_arr[0]}-{time_arr[1]}-{time_arr[2]} {time_arr[3]}:{time_arr[4]}:{time_arr[5]}"
 
+    normalize_quote(result)
     return result
 
 
@@ -494,7 +495,9 @@ def _fetch_sohu_batch_quotes(codes: List[str], timeout: int = 10) -> Dict[str, D
     batches = [all_biz[i:i + _SOHU_BATCH_LIMIT] for i in range(0, len(all_biz), _SOHU_BATCH_LIMIT)]
 
     if len(batches) <= 1:
-        return _parse_batch(batches[0]) if batches else {}
+        parsed = _parse_batch(batches[0]) if batches else {}
+        normalize_quotes(parsed)
+        return parsed
 
     result: Dict[str, Dict[str, Any]] = {}
     lock = threading.Lock()
@@ -514,6 +517,7 @@ def _fetch_sohu_batch_quotes(codes: List[str], timeout: int = 10) -> Dict[str, D
             except Exception:
                 pass
 
+    normalize_quotes(result)
     return result
 
 
