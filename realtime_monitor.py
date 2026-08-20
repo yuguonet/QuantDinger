@@ -20,9 +20,9 @@
   首板(旧) — 昨日涨停+前5日有涨停+放量 (老热点二次启动)
   昨日2连板 — 昨日是连板第2天+放量 (强势确认)
   非昨日2连板 — 近期有2连板但昨日不是涨停 (回调观察)
-  排除ST股, 首板量比>=1.5
+  排除ST股, 首板量比>=2.0
 
-候选列表缓存到 .openclaw/tmp/realtime_candidates.json (文件内判断日期)
+候选列表缓存到 tmp/realtime_candidates.json (文件内判断日期)
 
 盘中信号规则 (按分类触发):
   昨日2连板 — 高开>0% 且 现价不破VWAP
@@ -31,10 +31,10 @@
   首板(新)   — 今日动量 > 昨日动量 × 1.5
 """
 from __future__ import annotations
-import json, time, argparse, os, sys
+import json, time, argparse, os, sys, threading
 from datetime import datetime, timedelta
 from collections import defaultdict
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # ================================================================
 # 环境初始化
@@ -193,7 +193,7 @@ def load_all_candidates(kline_days: int = 30) -> List[Dict]:
         if yesterday_lu and not day_before_lu:
             # 昨日首板 (涨停+前日没涨停)
             vol_ratio = _calc_vol_ratio(bars, idx, 5)
-            if vol_ratio < 1.5:
+            if vol_ratio < 2.0:
                 continue
             has_recent = _has_recent_limit_up(bars, idx - 1, 5, bt)
             cat = '首板(新)' if not has_recent else '首板(旧)'
@@ -212,7 +212,7 @@ def load_all_candidates(kline_days: int = 30) -> List[Dict]:
             # 取首板日的量比
             first_lu_idx = idx - streak + 1
             vol_ratio = _calc_vol_ratio(bars, first_lu_idx, 5)
-            if vol_ratio < 1.5:
+            if vol_ratio < 2.0:
                 continue
             candidates.append({
                 'stock_code': code, 'stock_name': stock_names.get(code, ''),
@@ -239,6 +239,14 @@ def load_all_candidates(kline_days: int = 30) -> List[Dict]:
                     cur_streak = 1
             if max_streak != 2:
                 continue
+            # 时间窗口: 2连板距今不超过10个交易日
+            days_since = idx - (best_start + 1)
+            if days_since > 10:
+                continue
+            # 跌幅限制: 昨日跌幅不超过-8%
+            last_change = (bars[idx]['close'] / bars[idx-1]['close'] - 1) * 100
+            if last_change < -8.0:
+                continue
             # 额外校验: 确保是真正的2连板 (不是中间隔了天的)
             # best_start 和 best_start+1 都必须是涨停日
             if not _is_limit_up(bars[best_start]['close'], bars[best_start-1]['close'], bt):
@@ -250,7 +258,7 @@ def load_all_candidates(kline_days: int = 30) -> List[Dict]:
                 continue
             # 首板放量
             vol_ratio = _calc_vol_ratio(bars, best_start, 5)
-            if vol_ratio < 1.5:
+            if vol_ratio < 2.0:
                 continue
             candidates.append({
                 'stock_code': code, 'stock_name': stock_names.get(code, ''),
@@ -283,7 +291,7 @@ def load_kline_db(code: str, days: int = 60) -> List[Dict]:
 # 候选缓存 (当天只分析一次, 文件内判断日期)
 # ================================================================
 
-_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".openclaw", "tmp")
+_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp")
 _CACHE_FILE = "realtime_candidates.json"
 
 def _cache_path() -> str:
@@ -496,9 +504,8 @@ def prefilter_by_rules(candidates: List[Dict]) -> List[Dict]:
     """用批量行情做快速预筛选, 只对通过的再拉分时数据
 
     规则:
-      昨日2连板 — 高开>0% 且 现价>开盘价
-      非昨日2连板 / 首板(旧) — 需要VWAP, 无法预筛, 全部保留
-      首板(新) — 今动量 > 昨动量*1.5
+      所有分类全部保留 — 实时信号由 detect_signal 统一判断
+      预筛选仅用于获取批量行情缓存
     """
     global _batch_cache
     codes = [c['code'] for c in candidates]
@@ -513,21 +520,10 @@ def prefilter_by_rules(candidates: List[Dict]) -> List[Dict]:
         if not q:
             continue
         c['_quote'] = q
-        source = c.get('source', '')
         today_mom, open_gap = _quick_momentum(c['code'], q)
         c['today_momentum'] = today_mom
-
-        if source == '首板(新)':
-            # 今动量 > 昨动量*1.5
-            ym = c.get('yesterday_momentum', 0)
-            if ym > 0 and today_mom > ym * 1.5:
-                matched.append(c)
-        else:
-            # 首板(旧) / 非昨日2连板 / 昨日2连板 — 都需要分时数据, 全部保留
-            matched.append(c)
-
-        # 用实时数据覆盖涨跌幅(不依赖源的 changePercent, 可能过期)
         c['realtime_change_pct'] = _calc_change_pct(q)
+        matched.append(c)
 
     return matched
 
@@ -567,6 +563,7 @@ def fetch_minute_klines_batch(codes: List[str], count: int = 240) -> Dict[str, L
                 'low': float(bar.get('low', 0)),
                 'close': float(bar.get('close', 0)),
                 'volume': float(bar.get('volume', 0)),
+                'amount': float(bar.get('amount', 0)),
             })
         return result
     except Exception:
@@ -587,9 +584,21 @@ def fetch_realtime_ticks(code: str) -> Optional[List[Dict]]:
 def calc_vwap(ticks: List[Dict]) -> float:
     """计算VWAP (成交量加权平均价)
 
-    VWAP = Σ(price × volume) / Σ(volume)
-    price = (high + low + close) / 3  (典型价格)
+    优先用 成交额/成交量 (最准确), amount 不可用时回退到典型价格.
     """
+    total_amount = 0.0
+    total_vol = 0.0
+    has_amount = False
+    for t in ticks:
+        amt = t.get('amount', 0)
+        vol = t.get('volume', 0)
+        if amt > 0 and vol > 0:
+            total_amount += amt
+            total_vol += vol
+            has_amount = True
+    if has_amount and total_vol > 0:
+        return total_amount / total_vol
+    # 回退: 典型价格加权
     total_pv = 0.0
     total_vol = 0.0
     for t in ticks:
@@ -622,15 +631,114 @@ def calc_intraday_vol_ratio(ticks: List[Dict], idx: int, window: int = 5) -> flo
 
 
 # ================================================================
+# VWAP 精确计算 (mootdx 直连)
+# ================================================================
+
+def fetch_vwap_from_mootdx(codes: List[str]) -> Dict[str, float]:
+    """用 mootdx 拉取当日1分钟K线，计算精确 VWAP。
+
+    mootdx bars(frequency=8) 返回通达信原始数据，含 amount(成交额)。
+    VWAP = cumsum(amount) / cumsum(volume)
+
+    Returns:
+        {code: vwap_price}  — 不可用时返回空 dict
+    """
+    try:
+        from app.utils.mootdx_client import get_client
+        cli = get_client()
+        if cli is None:
+            return {}
+    except Exception:
+        return {}
+
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    result = {}
+    for code in codes:
+        try:
+            df = cli.bars(symbol=code, frequency=8, offset=800)  # 1分钟线
+            if df is None or len(df) < 5:
+                continue
+            total_amount = 0.0
+            total_vol = 0.0
+            for _, row in df.iterrows():
+                # 只取今天的数据
+                dt = str(row.get('datetime', ''))
+                if today_str not in dt:
+                    continue
+                amt = float(row.get('amount', 0) or 0)
+                vol = float(row.get('vol', 0) or row.get('volume', 0) or 0)
+                if amt > 0 and vol > 0:
+                    total_amount += amt
+                    total_vol += vol
+            if total_vol > 0:
+                result[code] = total_amount / total_vol
+        except Exception:
+            continue
+    return result
+
+
+def fetch_minutes_from_mootdx(codes: List[str]) -> Dict[str, List[Dict]]:
+    """用 mootdx 拉取当日1分钟K线，返回含 amount 的 ticks。
+
+    Returns:
+        {code: [{time, open, high, low, close, volume, amount}, ...]}
+    """
+    try:
+        from app.utils.mootdx_client import get_client
+        cli = get_client()
+        if cli is None:
+            return {}
+    except Exception:
+        return {}
+
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    result = {}
+    for code in codes:
+        try:
+            df = cli.bars(symbol=code, frequency=8, offset=800)
+            if df is None or len(df) < 5:
+                continue
+            ticks = []
+            for _, row in df.iterrows():
+                dt = str(row.get('datetime', ''))
+                # 只取今天的数据
+                if today_str not in dt:
+                    continue
+                ticks.append({
+                    'time': dt,
+                    'open': float(row.get('open', 0)),
+                    'high': float(row.get('high', 0)),
+                    'low': float(row.get('low', 0)),
+                    'close': float(row.get('close', 0)),
+                    'volume': float(row.get('vol', 0) or row.get('volume', 0)),
+                    'amount': float(row.get('amount', 0)),
+                })
+            if ticks:
+                result[code] = ticks
+        except Exception:
+            continue
+    return result
+
+
+# ================================================================
 # 弱转强信号检测
 # ================================================================
 
-def _count_minutes_above_vwap(ticks: List[Dict]) -> int:
-    """从当前往回数, 连续站稳VWAP上方的分钟数"""
+def _count_minutes_above_vwap(ticks: List[Dict], vwap: float = 0) -> int:
+    """从当前往回数, 连续站稳VWAP上方的分钟数
+
+    用给定的 VWAP (或从 ticks 计算), 往回逐分钟检查 close >= VWAP.
+    遇到第一根 close < VWAP 即中断, 返回连续站稳的分钟数.
+    """
+    if not ticks:
+        return 0
+    if vwap <= 0:
+        vwap = calc_vwap(ticks)
+    if vwap <= 0:
+        return 0
     count = 0
     for i in range(len(ticks) - 1, -1, -1):
-        v = calc_vwap(ticks[:i + 1])
-        if ticks[i]['close'] >= v:
+        if ticks[i]['close'] >= vwap:
             count += 1
         else:
             break
@@ -660,7 +768,10 @@ def detect_signal(ticks: List[Dict], candidate: Dict) -> Optional[Dict]:
 
     source = candidate.get('source', '')
     change_pct = (current_price / prev_close - 1) * 100
-    vwap = calc_vwap(ticks)
+    # 优先用 mootdx 精确 VWAP, 回退到 ticks 计算
+    vwap = candidate.get('_precise_vwap', 0)
+    if vwap <= 0:
+        vwap = calc_vwap(ticks)
     if vwap <= 0:
         return None
     price_vs_vwap = (current_price / vwap - 1) * 100
@@ -691,7 +802,7 @@ def detect_signal(ticks: List[Dict], candidate: Dict) -> Optional[Dict]:
 
     # ========== 非昨日2连板 / 首板(旧): 突破VWAP站稳>20分钟 ==========
     elif source in ('非昨日2连板', '首板(旧)'):
-        minutes_above = _count_minutes_above_vwap(ticks)
+        minutes_above = _count_minutes_above_vwap(ticks, vwap)
         if minutes_above >= 15 and current_price >= vwap:
             signal = {
                 'type': f'{source}_站稳均线',
@@ -743,54 +854,61 @@ def detect_signal(ticks: List[Dict], candidate: Dict) -> Optional[Dict]:
 # 状态跟踪 (避免重复信号)
 # ================================================================
 
-class SignalTracker:
-    """跟踪已触发信号, 避免每分钟重复报警"""
+class ConsecutiveTracker:
+    """跟踪每只股票连续符合信号的次数
 
-    def __init__(self, cooldown_minutes: int = 30):
-        self._triggered = {}  # code -> last_trigger_time
-        self._cooldown = cooldown_minutes
+    - 每次扫描到信号: count += 1, 显示
+    - 中断(本轮未扫到): count 归零, 下次从 1 重新计数
+    - 同一分钟内同一只股票只计一次
+    """
 
-    def should_alert(self, code: str, current_time: str) -> bool:
-        """是否应该发出警报"""
-        last = self._triggered.get(code)
-        if last is None:
-            return True
-        # 解析时间差
-        try:
-            t_now = datetime.strptime(current_time, "%Y-%m-%d %H:%M")
-            t_last = datetime.strptime(last, "%Y-%m-%d %H:%M")
-            return (t_now - t_last).total_seconds() >= self._cooldown * 60
-        except Exception:
-            return True
+    def __init__(self):
+        self._counts = {}      # code -> 连续符合次数
+        self._this_round = set()  # 本轮已记录的 code
 
-    def record(self, code: str, current_time: str):
-        self._triggered[code] = current_time
+    def start_round(self):
+        """每轮扫描开始时调用"""
+        self._this_round = set()
+
+    def record(self, code: str) -> int:
+        """记录一次符合, 返回当前连续次数"""
+        if code in self._this_round:
+            return self._counts.get(code, 1)
+        self._this_round.add(code)
+        self._counts[code] = self._counts.get(code, 0) + 1
+        return self._counts[code]
+
+    def finalize_round(self):
+        """本轮扫描结束, 清零本轮未出现的股票"""
+        to_remove = [c for c in self._counts if c not in self._this_round]
+        for c in to_remove:
+            del self._counts[c]
 
 
 # ================================================================
 # 主监控循环
 # ================================================================
 
-def run_monitor(candidates: List[Dict], interval: int = 60,
-                cooldown: int = 30):
+def run_monitor(candidates: List[Dict], interval: int = 60, force: bool = False):
     """盘中实时监控循环
 
     Args:
         candidates: 候选股列表 (来自screen_candidates)
         interval: 轮询间隔(秒)
-        cooldown: 同一股票信号冷却时间(分钟)
+        force: 忽略交易时间限制 (用于午休/盘前测试)
     """
     if not candidates:
         print("\n  ❌ 无候选股, 退出监控")
         return
 
-    tracker = SignalTracker(cooldown)
+    tracker = ConsecutiveTracker()
     all_signals = []
+    _stop_event = threading.Event()
 
     print(f"\n{'='*70}")
     print(f"  🔴 盘中实时监控已启动")
-    print(f"  候选: {len(candidates)}只 | 间隔: {interval}秒 | 冷却: {cooldown}分钟")
-    print(f"  规则: 2连板高开不破均线 | 首板(旧)/非昨日2连板站稳VWAP>20min | 首板(新)动量加速")
+    print(f"  候选: {len(candidates)}只 | 间隔: {interval}秒")
+    print(f"  规则: 2连板高开不破均线 | 首板(旧)/非昨2连板站稳VWAP>15min | 首板(新)动量加速")
     print(f"  按 Ctrl+C 停止")
     print(f"{'='*70}\n")
 
@@ -804,15 +922,15 @@ def run_monitor(candidates: List[Dict], interval: int = 60,
     scan_count = 0
 
     try:
-        while True:
+        while not _stop_event.is_set():
             now = datetime.now()
 
-            # 非交易时间
-            if not is_trading_time():
+            # 非交易时间 (force 模式跳过)
+            if not force and not is_trading_time():
                 t = now.hour * 100 + now.minute
                 if 1130 < t < 1300:
                     print(f"\r  ⏸  午休中... ({now.strftime('%H:%M')})", end="", flush=True)
-                    time.sleep(30)
+                    _stop_event.wait(timeout=30)
                     continue
                 elif t > 1500:
                     print(f"\n\n  📊 收盘, 监控结束")
@@ -820,85 +938,114 @@ def run_monitor(candidates: List[Dict], interval: int = 60,
                 elif t < 925:
                     wait_sec = ((9 - now.hour) * 60 + (25 - now.minute)) * 60
                     print(f"\r  ⏳ 等待开盘... ({now.strftime('%H:%M')}, 约{wait_sec // 60}分钟后)", end="", flush=True)
-                    time.sleep(min(60, max(10, wait_sec)))
+                    _stop_event.wait(timeout=min(60, max(10, wait_sec)))
                     continue
 
             scan_count += 1
             current_time = now.strftime("%Y-%m-%d %H:%M")
             triggered_this_round = []
+            tracker.start_round()
 
-            # Step1: 批量行情预筛选 (1次HTTP, 过滤掉大部分)
+            # Step1: 批量行情 (1次HTTP, 获取实时价格)
             quick_matched = prefilter_by_rules(candidates)
 
-            # Step2: 只对需要分时数据的股票预处理
-            for cand in quick_matched:
-                code = cand['code']
-                source = cand.get('source', '')
+            if quick_matched:
+                vwap_codes = [c['code'] for c in quick_matched]
 
-                # 首板(新) 已在预筛选中判断, 直接构建信号
-                if source == '首板(新)':
-                    q = cand.get('_quote', {})
-                    last = _get_quote_price(q)
-                    prev = _get_quote_prev_close(q)
-                    change_pct = _calc_change_pct(q)
-                    today_mom = cand.get('today_momentum', 0)
-                    ym = cand.get('yesterday_momentum', 0)
-                    open_p = q.get('open', 0)
-                    open_gap = (open_p / prev - 1) * 100 if prev > 0 else 0
+                # Step2a: mootdx 拉取精确 VWAP (含 amount)
+                mootdx_vwap = {}
+                mootdx_minutes = {}
+                try:
+                    mootdx_vwap = fetch_vwap_from_mootdx(vwap_codes)
+                    mootdx_minutes = fetch_minutes_from_mootdx(vwap_codes)
+                except Exception:
+                    pass
 
-                    sig = {
-                        'type': '首板新_动量加速', 'label': '动量加速',
-                        'emoji': '🆕', 'source': source,
-                        'code': code, 'name': cand.get('name', ''),
-                        'board': cand.get('board', ''), 'limit_pct': cand.get('limit_pct', 10),
-                        'price': last, 'vwap': 0, 'price_vs_vwap': 0,
-                        'change_pct': round(change_pct, 2),
-                        'open_gap': round(open_gap, 2),
-                        'today_momentum': today_mom, 'yesterday_momentum': ym,
-                        'time': current_time,
-                        'detail': f"今动量{today_mom:+.1f}% > 昨{ym:+.1f}%×1.5={ym*1.5:+.1f}%",
-                    }
-
-                    if tracker.should_alert(code, current_time):
-                        tracker.record(code, current_time)
-                        triggered_this_round.append(sig)
-                        all_signals.append(sig)
-                    continue
-
-                # 首板(旧) / 非昨日2连板 / 昨日2连板 — 需要分时数据, 标记待拉
-                cand['_need_vwap'] = True
-
-            # Step3: 批量拉取需要VWAP的股票的1分钟K线 (1次并发请求)
-            vwap_candidates = [c for c in quick_matched if c.get('_need_vwap')]
-            if vwap_candidates:
-                vwap_codes = [c['code'] for c in vwap_candidates]
+                # Step2b: coordinator 拉取1分钟K线 (作为 fallback)
                 minute_data = fetch_minute_klines_batch(vwap_codes, count=240)
-                for cand in vwap_candidates:
+
+                for cand in quick_matched:
                     code = cand['code']
-                    ticks = minute_data.get(code)
+
+                    # 优先用 mootdx 的 ticks (含 amount，VWAP 更准)
+                    ticks = mootdx_minutes.get(code)
+                    if not ticks or len(ticks) < 5:
+                        ticks = minute_data.get(code)
                     if not ticks or len(ticks) < 5:
                         continue
+
+                    # 如果有 mootdx 精确 VWAP，注入到 candidate 供 detect_signal 使用
+                    if code in mootdx_vwap:
+                        cand['_precise_vwap'] = mootdx_vwap[code]
+
                     signal = detect_signal(ticks, cand)
                     if signal is None:
                         continue
-                    if not tracker.should_alert(code, current_time):
-                        continue
-                    tracker.record(code, current_time)
+                    count = tracker.record(code)
+                    signal['_consecutive'] = count
+                    # 保存调试数据 (含原始 ticks 用于分析)
+                    vwap_val = cand.get('_precise_vwap', 0) or calc_vwap(ticks)
+                    signal['_debug'] = {
+                        'ticks_count': len(ticks),
+                        'first_tick': ticks[0] if ticks else None,
+                        'last_tick': ticks[-1] if ticks else None,
+                        'calc_vwap': round(calc_vwap(ticks), 4),
+                        'mootdx_vwap': cand.get('_precise_vwap', 0),
+                        'open': ticks[0]['open'] if ticks else 0,
+                        'high': max(t['high'] for t in ticks) if ticks else 0,
+                        'low': min(t['low'] for t in ticks) if ticks else 0,
+                        # 保存全部 ticks (精简: 只存 close 和 amount)
+                        'ticks': [round(t['close'], 4) for t in ticks],
+                        'tick_times': ticks[0]['time'][-8:] + '~' + ticks[-1]['time'][-8:],
+                        'vwap': round(vwap_val, 4),
+                    }
                     triggered_this_round.append(signal)
                     all_signals.append(signal)
 
-            # 输出本轮结果 (表格, 每股一行)
+            # 保存全量候选 VWAP 状态 (每轮)
+            _vwap_debug = []
+            for cand in quick_matched:
+                code = cand['code']
+                q = _batch_cache.get(code, {})
+                last = _get_quote_price(q)
+                vwap_val = cand.get('_precise_vwap', 0)
+                if vwap_val <= 0:
+                    tks = mootdx_minutes.get(code) or minute_data.get(code)
+                    if tks:
+                        vwap_val = calc_vwap(tks)
+                _vwap_debug.append({
+                    'code': code, 'name': cand.get('name', ''),
+                    'source': cand.get('source', ''),
+                    'price': last, 'vwap': round(vwap_val, 4),
+                    'above': last >= vwap_val if vwap_val > 0 else None,
+                    'mootdx': code in mootdx_vwap,
+                })
+            try:
+                _vwap_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                          'tmp', 'realtime_vwap_status.json')
+                with open(_vwap_file, 'w', encoding='utf-8') as f:
+                    json.dump({'time': current_time, 'count': len(_vwap_debug),
+                               'stocks': _vwap_debug}, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+            # 本轮结束, 清零未出现的
+            tracker.finalize_round()
+
+            # 输出本轮结果
             if triggered_this_round:
-                # 分类简称
                 _src_short = {'首板(新)': '首板新', '首板(旧)': '首板旧',
                               '昨日2连板': '2连板', '非昨日2连板': '非昨2连'}
 
-                # 首次触发时打印表头
                 if not hasattr(run_monitor, '_header_printed'):
                     run_monitor._header_printed = True
-                    print(f"\n  {'#':>3} {'时间':>5} {'代码':>7} {'名称':>6} {'分类':>7} {'价格':>7} {'涨跌':>6} "
+                    print(f"  {'连续':>4} {'时间':>5} {'代码':>7} {'名称':>6} {'分类':>7} {'价格':>7} {'涨跌':>6} "
                           f"{'高开':>5} {'动量':>5} {'站稳':>4} {'止损':>7} {'涨停':>7}")
-                    print(f"  {'-'*84}")
+                    print(f"  {'-'*88}")
+                elif hasattr(run_monitor, '_prev_round'):
+                    print(f"  {'·'*88}")
+
+                run_monitor._prev_round = True
 
                 for sig in triggered_this_round:
                     limit_pct = sig['limit_pct']
@@ -912,42 +1059,75 @@ def run_monitor(candidates: List[Dict], interval: int = 60,
                     above_str = f"{above_min}m" if above_min > 0 else '-'
                     src = _src_short.get(sig['source'], sig['source'])
                     name = sig.get('name', '')[:4]
-                    count = sum(1 for s in all_signals if s['code'] == sig['code']) + 1
-                    print(f"  {count:>3} {time_str:>5} {sig['code']:>7} {name:>6} {src:>7} "
+                    c = sig['_consecutive']
+                    print(f"  {c:>4} {time_str:>5} {sig['code']:>7} {name:>6} {src:>7} "
                           f"{buy_price:>7.2f} {sig['change_pct']:>+5.1f}% {sig.get('open_gap', 0):>+5.1f}% "
                           f"{sig.get('today_momentum', 0):>+5.1f}% {above_str:>4} {stop_price:>7.2f} {limit_price:>7.2f}")
-            else:
-                # 静默状态行 — 显示所有候选股的实时状态
-                status_parts = []
-                for c in candidates:
-                    q = _batch_cache.get(c['code'])
-                    if q:
-                        last = _get_quote_price(q)
-                        if last > 0:
-                            chg = _calc_change_pct(q)
-                            status_parts.append(f"{c['code']} {last:.2f} {chg:+.1f}%")
-                latest_price = " | ".join(status_parts) if status_parts else ""
-                if latest_price:
-                    latest_price = f" | {latest_price}"
-                print(f"\r  ⏱ [{scan_count}] {now.strftime('%H:%M:%S')} "
-                      f"扫描{len(candidates)}只 无信号{latest_price}    ", end="", flush=True)
 
-            time.sleep(interval)
+                # 保存本轮调试数据
+                _debug_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                           'tmp', 'realtime_debug.json')
+                _debug_data = []
+                for sig in triggered_this_round:
+                    dbg = sig.get('_debug', {})
+                    _debug_data.append({
+                        'time': sig.get('time', ''),
+                        'code': sig.get('code', ''),
+                        'name': sig.get('name', ''),
+                        'source': sig.get('source', ''),
+                        'price': sig.get('price', 0),
+                        'change_pct': sig.get('change_pct', 0),
+                        'open_gap': sig.get('open_gap', 0),
+                        'today_momentum': sig.get('today_momentum', 0),
+                        'vwap': sig.get('vwap', 0),
+                        'above_vwap_minutes': sig.get('above_vwap_minutes', 0),
+                        'calc_vwap': dbg.get('calc_vwap', 0),
+                        'mootdx_vwap': dbg.get('mootdx_vwap', 0),
+                        'ticks_count': dbg.get('ticks_count', 0),
+                        'day_open': dbg.get('open', 0),
+                        'day_high': dbg.get('high', 0),
+                        'day_low': dbg.get('low', 0),
+                        'first_tick': dbg.get('first_tick'),
+                        'last_tick': dbg.get('last_tick'),
+                        'ticks': dbg.get('ticks', []),
+                    })
+                try:
+                    os.makedirs(os.path.dirname(_debug_file), exist_ok=True)
+                    with open(_debug_file, 'w', encoding='utf-8') as f:
+                        json.dump({'scan_time': current_time, 'signals': _debug_data},
+                                  f, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+            else:
+                # 静默: 仅显示计数, 不显示个股价格
+                print(f"\r  ⏱ [{scan_count}] {now.strftime('%H:%M:%S')} "
+                      f"扫描{len(candidates)}只 无信号    ", end="", flush=True)
+
+            # 可中断的 sleep
+            _stop_event.wait(timeout=interval)
 
     except KeyboardInterrupt:
         print(f"\n\n  ⛔ 手动停止")
 
+    # 清理
     if all_signals:
-        print(f"\n  📊 今日共 {len(all_signals)} 个信号")
+        print(f"\n  📊 今日共 {len(all_signals)} 个信号 (去重{len(set(s['code'] for s in all_signals))}只)")
     else:
         print(f"\n  📊 今日无信号")
 
-    # 导出
+    # 导出 (精简版, 不含大字段)
     if all_signals:
         outfile = "realtime_signals.json"
-        with open(outfile, "w", encoding="utf-8") as f:
-            json.dump(all_signals, f, ensure_ascii=False, indent=2)
-        print(f"\n  💾 信号已导出: {outfile}")
+        export = []
+        for s in all_signals:
+            d = {k: v for k, v in s.items() if k not in ('_debug',)}
+            export.append(d)
+        try:
+            with open(outfile, "w", encoding="utf-8") as f:
+                json.dump(export, f, ensure_ascii=False, indent=2)
+            print(f"\n  💾 信号已导出: {outfile}")
+        except Exception as e:
+            print(f"\n  ⚠️ 导出失败: {e}")
 
 
 # ================================================================
@@ -968,7 +1148,7 @@ def main():
     parser.add_argument("--codes", type=str, default="", help="手动指定股票代码, 逗号分隔")
     parser.add_argument("--refresh", action="store_true", help="强制刷新, 忽略当天缓存")
     parser.add_argument("--interval", type=int, default=60, help="盘中轮询间隔秒数 (默认60)")
-    parser.add_argument("--cooldown", type=int, default=30, help="信号冷却时间分钟 (默认30)")
+    parser.add_argument("--force", action="store_true", help="强制运行, 忽略交易时间限制")
     parser.add_argument("--kline-days", type=int, default=30, help="日K线回看天数 (默认30)")
     args = parser.parse_args()
 
@@ -1008,7 +1188,10 @@ def main():
         return
 
     # 盘中监控
-    run_monitor(candidates, interval=args.interval, cooldown=args.cooldown)
+    run_monitor(candidates, interval=args.interval, force=args.force)
+
+    # 强制退出: mootdx/coordinator/数据库连接池的非守护线程会阻止进程退出
+    os._exit(0)
 
 
 if __name__ == "__main__":
