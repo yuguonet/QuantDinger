@@ -54,6 +54,53 @@ def _load_env():
         pass
 
 # ================================================================
+# 斜率 + 换手率 工具函数
+# ================================================================
+def calc_ma_slope(closes, idx, ma_period=5, slope_days=3):
+    """MA斜率: 线性回归角度 (% / 天)"""
+    if idx < ma_period + slope_days - 1:
+        return 0
+    ma_vals = []
+    for i in range(idx - slope_days + 1, idx + 1):
+        ma_vals.append(sum(closes[i - ma_period + 1:i + 1]) / ma_period)
+    if not ma_vals or ma_vals[0] <= 0:
+        return 0
+    n = len(ma_vals)
+    sx = n * (n - 1) / 2
+    sy = sum(ma_vals)
+    sxy = sum(i * ma_vals[i] for i in range(n))
+    sx2 = n * (n - 1) * (2 * n - 1) / 6
+    denom = n * sx2 - sx * sx
+    if denom == 0: return 0
+    slope = (n * sxy - sx * sy) / denom
+    return slope / ma_vals[-1] * 100
+
+def calc_ma_slope_accel(closes, idx, ma_period=5, slope_days=3):
+    """MA斜率加速度 = 当前斜率 - 前一段斜率"""
+    return calc_ma_slope(closes, idx, ma_period, slope_days) - calc_ma_slope(closes, idx - slope_days, ma_period, slope_days)
+
+_circ_cache = None
+def _load_circ():
+    global _circ_cache
+    if _circ_cache is not None: return _circ_cache
+    try:
+        from app.utils.basicinfo_db import get_stock_basic_db
+        db = get_stock_basic_db(); pool = db._get_pool()
+        with pool.cursor() as cur:
+            cur.execute("SELECT symbol, circ_shares FROM stock_basic_info WHERE status='active' AND circ_shares > 0")
+            _circ_cache = {row[0]: float(row[1]) for row in cur.fetchall()}
+    except: _circ_cache = {}
+    return _circ_cache
+
+def get_turnover(code, volume):
+    circ = _load_circ().get(code, 0)
+    return volume / circ * 100 if circ > 0 else 0
+
+def get_circ_mcap(code, price):
+    circ = _load_circ().get(code, 0)
+    return circ * price / 1e8 if circ > 0 else 0
+
+# ================================================================
 # DB 数据加载
 # ================================================================
 _writer_cache = None
@@ -180,7 +227,7 @@ def strategy_peak_breakout(bars, code,
                            max_hold_days=10, top_per_day=2,
                            require_ma60=True, require_ma20_up=False,
                            min_rsi=0, max_rsi=100,
-                           min_macd_hist=0.0,
+                           min_macd_hist=0.0, max_macd_hist=100.0,
                            pullback_confirm=False, pullback_days=3,
                            pullback_max_pct=3.0):
     """
@@ -265,11 +312,33 @@ def strategy_peak_breakout(bars, code,
         # MACD柱过滤
         if min_macd_hist > 0 and macd_hist[i] < min_macd_hist:
             continue
+        if macd_hist[i] > max_macd_hist:
+            continue
+
+        # MA5/MA10 斜率
+        ma5_slope = calc_ma_slope(closes, i, 5, 3)
+        ma10_slope = calc_ma_slope(closes, i, 10, 3)
+        ma5_accel = calc_ma_slope_accel(closes, i, 5, 3)
+
+        # 流通市值过滤 (<50亿 或 >2000亿 排除)
+        circ_mcap = get_circ_mcap(code, closes[i])
+        if circ_mcap > 0 and (circ_mcap < 50 or circ_mcap > 2000):
+            continue
 
         box_avg_vol = sum(volumes[box_start:i]) / box_days
         vol_ratio = volumes[i] / box_avg_vol if box_avg_vol > 0 else 0
-        if vol_ratio < vol_expand_min:
+        if vol_ratio < vol_expand_min or vol_ratio > vol_expand_max:
             continue
+
+        # 换手率 (有数据才检查)
+        turnover = get_turnover(code, volumes[i])
+        if circ_mcap > 0 and turnover > 0:
+            import math
+            scale = math.sqrt(100 / circ_mcap)
+            tr_min = 1.0 * scale
+            tr_max = 20.0 * scale
+            if turnover < tr_min or turnover > tr_max:
+                continue
 
         breakout_idx = i
         breakout_close = closes[i]
@@ -302,7 +371,13 @@ def strategy_peak_breakout(bars, code,
             "box_high": round(box_high, 3), "box_low": round(box_low, 3),
             "box_range_pct": round(box_range_pct, 2), "box_days": box_days,
             "breakout_close": round(breakout_close, 3),
-            "vol_ratio": round(vol_ratio, 2), "ma60": round(ma60, 3),
+            "vol_ratio": round(vol_ratio, 2),
+            "ma5_slope": round(ma5_slope, 3),
+            "ma10_slope": round(ma10_slope, 3),
+            "ma5_accel": round(ma5_accel, 3),
+            "turnover": round(turnover, 2),
+            "circ_mcap": round(circ_mcap, 1),
+            "ma60": round(ma60, 3),
             "rsi": round(rsi, 1),
             "macd_hist": round(macd_hist[i], 4),
             "close_vs_ma60": round((breakout_close / ma60 - 1) * 100, 2),
@@ -335,6 +410,11 @@ def strategy_peak_breakout(bars, code,
             "box_range_pct": c["box_range_pct"], "box_days": c["box_days"],
             "breakout_close": c["breakout_close"],
             "vol_ratio_vs_pullback": c["vol_ratio"],
+            "ma5_slope": c.get("ma5_slope", 0),
+            "ma10_slope": c.get("ma10_slope", 0),
+            "ma5_accel": c.get("ma5_accel", 0),
+            "turnover": c.get("turnover", 0),
+            "circ_mcap": c.get("circ_mcap", 0),
             "ma60": c["ma60"], "rsi": c.get("rsi", 0),
             "macd_hist": c.get("macd_hist", 0),
             "close_vs_ma60": c["close_vs_ma60"],
@@ -455,10 +535,16 @@ def print_stats(trades, label):
     if not rets:
         print(f"  {label}: 无收益数据")
         return
+    n = len(rets)
     win = [r for r in rets if r > 0]
-    wr = len(win) / len(rets) * 100
-    avg = sum(rets) / len(rets)
-    print(f"  {label}: {len(rets)}笔, 胜率{wr:.1f}%, 均值{avg:+.2f}%")
+    loss = [r for r in rets if r <= 0]
+    wr = len(win) / n * 100
+    avg = sum(rets) / n
+    avg_pk = sum(t.get('peak_return_pct', 0) for t in trades) / n
+    avg_w = sum(win) / len(win) if win else 0
+    avg_l = abs(sum(loss)) / len(loss) if loss else 0
+    pl = avg_w / avg_l if avg_l > 0 else 999
+    print(f"  {label}: {n}笔 胜率{wr:.1f}% 均收{avg:+.2f}% 均峰{avg_pk:+.2f}% 盈亏比{pl:.2f}")
 
 # ================================================================
 # 主流程
@@ -501,6 +587,8 @@ if __name__ == "__main__":
                         help="启用突破后回踩确认模式 (默认关闭)")
     parser.add_argument("--pullback-days", type=int, default=3,
                         help="回踩确认天数 (默认3)")
+    parser.add_argument("--mid-term", action="store_true", default=False,
+                        help="中线模式: MA5/10斜率+换手率+MACD1~2+温和突破")
 
     # 出场参数
     parser.add_argument("--stop-loss", type=float, default=12.0,
@@ -524,6 +612,24 @@ if __name__ == "__main__":
     parser.add_argument("--top", type=int, default=10, help="显示TOP N (默认10)")
     parser.add_argument("--all-trades", action="store_true", help="打印全部交易明细")
     args = parser.parse_args()
+
+    # 中线模式参数 (基于1422笔原版数据分析)
+    if args.mid_term:
+        args.box_days = 15           # 箱体缩短
+        args.box_max_range = 15.0    # 振幅15% (数据:8~12%最佳)
+        args.box_min_range = 5.0     # 最小5%
+        args.require_ma60 = True
+        args.require_ma20_up = False
+        args.min_macd_hist = 1.0     # MACD柱1~2: 58.8%胜率
+        args.max_macd_hist = 2.0     # 上限2 (避免暴量)
+        args.min_rsi = 0
+        args.max_rsi = 100           # 不用RSI过滤
+        args.vol_expand_min = 1.5    # 放量1.5~2.5x (温和)
+        args.vol_expand_max = 2.5
+        args.max_hold = 10           # 持仓上限10天
+        args.stop_loss = 8.0         # 主板止损8%
+        args.trailing_pct = 5.0
+        args.take_profit = 15.0
 
     codes = [c.strip() for c in args.codes.split(",") if c.strip()] if args.codes else TEST_CODES
     use_db = args.source == "db"
@@ -591,6 +697,7 @@ if __name__ == "__main__":
             min_rsi=args.min_rsi,
             max_rsi=args.max_rsi,
             min_macd_hist=args.min_macd_hist,
+            max_macd_hist=getattr(args, "max_macd_hist", 100),
             pullback_confirm=args.pullback_confirm,
             pullback_days=args.pullback_days,
         )
@@ -651,6 +758,36 @@ if __name__ == "__main__":
             seg = [t for t in all_trades if lo <= t['vol_ratio_vs_pullback'] < hi]
             if seg:
                 print_stats(seg, f"放量[{lo},{hi})x")
+
+        # MA5斜率
+        print(f"\n--- MA5斜率 ---")
+        for lo,hi,label in [(-99,0,'负'),(0,0.3,'缓'),(0.3,0.6,'中'),(0.6,99,'快')]:
+            ts=[t for t in all_trades if lo<=t.get('ma5_slope',0)<hi]
+            if ts: print_stats(ts, label)
+
+        # MA5加速度
+        print(f"\n--- MA5加速度 ---")
+        for lo,hi,label in [(-99,-0.1,'减速'),(-0.1,0.1,'平稳'),(0.1,0.3,'加速'),(0.3,99,'强加速')]:
+            ts=[t for t in all_trades if lo<=t.get('ma5_accel',0)<hi]
+            if ts: print_stats(ts, label)
+
+        # MA10斜率
+        print(f"\n--- MA10斜率 ---")
+        for lo,hi,label in [(-99,0,'负'),(0,0.2,'缓'),(0.2,0.5,'中'),(0.5,99,'快')]:
+            ts=[t for t in all_trades if lo<=t.get('ma10_slope',0)<hi]
+            if ts: print_stats(ts, label)
+
+        # 流通市值
+        print(f"\n--- 流通市值 ---")
+        for lo,hi,label in [(0,50,'<50亿'),(50,100,'50~100亿'),(100,500,'100~500亿'),(500,2000,'500~2000亿')]:
+            ts=[t for t in all_trades if lo<=t.get('circ_mcap',0)<hi]
+            if ts: print_stats(ts, label)
+
+        # 换手率
+        print(f"\n--- 换手率 ---")
+        for lo,hi in [(0,2),(2,5),(5,10),(10,20),(20,100)]:
+            ts=[t for t in all_trades if lo<=t.get('turnover',0)<hi]
+            if ts: print_stats(ts, f"[{lo},{hi})%")
 
         # TOP N
         n = min(args.top, len(all_trades))

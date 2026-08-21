@@ -1557,14 +1557,8 @@ export default {
     ensureChartReady () {
       this.$nextTick(() => {
         setTimeout(() => {
-          const chart = this.$refs.klineChart
-          if (!chart || !this.symbol) return
-          if (!chart.chartRef && typeof chart.initChart === 'function') {
-            chart.initChart()
-          }
-          if (typeof chart.loadKlineData === 'function') {
-            chart.loadKlineData()
-          }
+          const chartWrapper = this.$refs.klineChartPro
+          if (!chartWrapper || !this.symbol) return
           if (this.selectedIndicatorId) {
             this.syncSelectedIndicatorToChart()
           }
@@ -1635,24 +1629,15 @@ export default {
     buildSelectedIndicatorForChart (codeOverride) {
       const ind = this.selectedIndicatorObj
       if (!ind) return null
-      const chart = this.$refs.klineChart
       const code = typeof codeOverride === 'string' ? codeOverride : (this.currentCode || ind.code || '')
-      if (!code || !chart || typeof chart.executePythonStrategy !== 'function') return null
+      if (!code) return null
       return {
         ...ind,
         id: 'selected-python-indicator',
         originalId: ind.id,
         type: 'python',
         code,
-        params: {},
-        calculate: async (klineData, params = {}) => {
-          return chart.executePythonStrategy(code, klineData, params, {
-            ...ind,
-            originalId: ind.id,
-            id: ind.id,
-            userId: this.userId
-          })
-        }
+        params: {}
       }
     },
     syncSelectedIndicatorToChart (codeOverride) {
@@ -1664,10 +1649,52 @@ export default {
       this.activeIndicators = selectedIndicator
         ? [...nonSelectedIndicators, selectedIndicator]
         : nonSelectedIndicators
-      this.$nextTick(() => {
-        const chart = this.$refs.klineChart
-        if (chart && typeof chart.updateIndicators === 'function') {
-          chart.updateIndicators()
+      this.$nextTick(async () => {
+        const chartWrapper = this.$refs.klineChartPro
+        if (!chartWrapper) return
+        const chart = chartWrapper.getChart ? chartWrapper.getChart() : null
+        if (!chart) return
+        // 先移除旧的 Python 指标
+        try { chart.removeIndicator('candle_pane', 'selected-python-indicator') } catch (e) {}
+        // 如果有选中的指标，尝试添加
+        if (selectedIndicator && selectedIndicator.name) {
+          // 尝试添加内置指标
+          const builtinIndicators = ['MA', 'EMA', 'SMA', 'BOLL', 'SAR', 'BBI', 'VOL', 'MACD', 'KDJ', 'RSI', 'BIAS', 'BRAR', 'CCI', 'DMI', 'CR', 'PSY', 'DMA', 'TRIX', 'OBV', 'VR', 'WR', 'MTM', 'EMV', 'ROC', 'PVT', 'AO']
+          const name = selectedIndicator.name.toUpperCase()
+          if (builtinIndicators.includes(name)) {
+            try {
+              chart.createIndicator({ name: name, id: selectedIndicator.id }, true, { id: 'candle_pane' })
+            } catch (e) { /* ignore */ }
+          } else if (selectedIndicator.type === 'python' && selectedIndicator.code) {
+            // Python 指标：执行并注册
+            try {
+              const klineData = chart.getDataList ? chart.getDataList() : []
+              if (klineData.length > 0 && chartWrapper.executePythonStrategy) {
+                const result = await chartWrapper.executePythonStrategy(
+                  selectedIndicator.code, klineData, selectedIndicator.params || {},
+                  { ...selectedIndicator, userId: this.userId }
+                )
+                if (result && result.plots && result.plots.length > 0) {
+                  // 注册并添加指标
+                  const figures = result.plots.map(p => ({ key: p.name, title: p.name, type: 'line' }))
+                  const calcFunc = (dataList) => {
+                    const map = {}
+                    result.plots.forEach(p => {
+                      dataList.forEach((item, i) => {
+                        if (!map[item.timestamp]) map[item.timestamp] = {}
+                        map[item.timestamp][p.name] = p.data[i] !== undefined ? p.data[i] : null
+                      })
+                    })
+                    return map
+                  }
+                  chartWrapper.registerCustomIndicator(selectedIndicator.name, calcFunc, figures, [], 2, false)
+                  chart.createIndicator({ name: selectedIndicator.name, id: 'selected-python-indicator' }, true, { id: 'candle_pane' })
+                }
+              }
+            } catch (e) {
+              console.warn('Python indicator execution failed:', e)
+            }
+          }
         }
       })
     },
@@ -1681,8 +1708,8 @@ export default {
       this.activeChartTab = tabKey
       this.$nextTick(() => {
         if (tabKey === 'chart') {
-          const chart = this.$refs.klineChart
-          if (chart && typeof chart.resize === 'function') chart.resize()
+          const chartWrapper = this.$refs.klineChartPro
+          if (chartWrapper && typeof chartWrapper.resize === 'function') chartWrapper.resize()
           this.ensureChartReady()
         } else if (tabKey === 'code') {
           if (this.cmInstance) this.cmInstance.refresh()
@@ -1768,23 +1795,22 @@ export default {
     },
     clearBacktestSignalOverlays (opts = {}) {
       const silent = !!(opts && opts.silent)
-      const chart = this.$refs.klineChart
-      if (!chart || !chart.chartRef) {
+      const chartWrapper = this.$refs.klineChartPro
+      if (!chartWrapper) {
         if (!silent) this.$message.info(this.$t('indicatorIde.clearSignalsNoChart'))
         return
       }
-      const chartInstance = chart.chartRef
-      if (chart.addedSignalOverlayIds && chart.addedSignalOverlayIds.length) {
-        chart.addedSignalOverlayIds.forEach(id => {
-          try {
-            if (typeof chartInstance.removeOverlay === 'function') chartInstance.removeOverlay(id)
-          } catch (_) {}
-        })
-        chart.addedSignalOverlayIds = []
-      }
-      // Re-render indicator signals after clearing backtest overlays
-      if (!silent && typeof chart.updateIndicators === 'function') {
-        chart.updateIndicators()
+      const chart = chartWrapper.getChart ? chartWrapper.getChart() : null
+      if (chart) {
+        // 移除所有 overlay
+        try {
+          const overlays = chart.getOverlays ? chart.getOverlays() : []
+          if (overlays && overlays.length) {
+            overlays.forEach(o => {
+              try { chart.removeOverlay(o.id) } catch (e) {}
+            })
+          }
+        } catch (e) {}
       }
       if (!silent) this.$message.success(this.$t('indicatorIde.clearSignalsDone'))
     },
@@ -2797,17 +2823,12 @@ export default {
     renderBacktestSignals () {
       const trades = (this.result && this.result.trades) || []
       if (!trades.length) return
-      const chart = this.$refs.klineChart
-      if (!chart || !chart.chartRef) return
-      const chartInstance = chart.chartRef
+      const chartWrapper = this.$refs.klineChartPro
+      if (!chartWrapper) return
+      const chartInstance = chartWrapper.getChart ? chartWrapper.getChart() : null
+      if (!chartInstance) return
 
       this.clearBacktestSignalOverlays({ silent: true })
-
-      // Hide indicator raw signals to avoid duplicate markers
-      // (indicator signals at bar i vs backtest trades at bar i+1)
-      if (typeof chart.hideIndicatorSignals === 'function') {
-        chart.hideIndicatorSignals()
-      }
 
       // Build sorted kline timestamp array for snap matching
       const klineData = (typeof chartInstance.getDataList === 'function') ? chartInstance.getDataList() : []
@@ -2864,7 +2885,7 @@ export default {
 
         try {
           if (typeof chartInstance.createOverlay === 'function') {
-            const overlayId = chartInstance.createOverlay({
+            chartInstance.createOverlay({
               name: 'signalTag',
               points: [
                 { timestamp, value: price },
@@ -2879,9 +2900,6 @@ export default {
               },
               lock: true
             }, 'candle_pane')
-            if (overlayId && chart.addedSignalOverlayIds) {
-              chart.addedSignalOverlayIds.push(overlayId)
-            }
           }
         } catch (_) {}
       }
@@ -3750,8 +3768,8 @@ export default {
     activeChartTab () {
       this.$nextTick(() => {
         if (this.activeChartTab === 'chart') {
-          const chart = this.$refs.klineChart
-          if (chart && typeof chart.resize === 'function') chart.resize()
+          const chartWrapper = this.$refs.klineChartPro
+          if (chartWrapper && typeof chartWrapper.resize === 'function') chartWrapper.resize()
           this.ensureChartReady()
         } else if (this.activeChartTab === 'code') {
           if (this.cmInstance) this.cmInstance.refresh()

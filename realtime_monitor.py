@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-首板/2连板盘中实时监控
-━━━━━━━━━━━━━━━━━━━━━
+首板/2连板盘中实时监控 (V2 — 多维过滤版)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 功能:
   1. 盘前选股: 4类候选 (排除ST, 首板放量)
-  2. 盘中实时: 每分钟拉取分时数据, 检测弱转强信号
-  3. 买入建议: 触发时输出建议买入价 + 信号类型
+  2. 技术评分: 综合技术分 >= 60 才进入监控 (MA排列/RSI/KDJ/OBV/量比/角度)
+  3. 盘中实时: 每分钟拉取分时数据, 检测弱转强信号
+  4. 信号强度: 强/中/弱 三级 (基于日内动量, 移植自 V1 策略核心胜率因子)
+  5. 买入建议: 触发时输出建议买入价 + 信号类型
 
 用法:
   python realtime_monitor.py                    # 完整运行 (选股+监控)
@@ -21,14 +23,26 @@
   昨日2连板 — 昨日是连板第2天+放量 (强势确认)
   非昨日2连板 — 近期有2连板但昨日不是涨停 (回调观察)
   排除ST股, 首板量比>=2.0
+  技术分过滤: tech_score >= 60 (MA排列+RSI+KDJ+OBV+量比+MA5角度)
 
 候选列表缓存到 tmp/realtime_candidates.json (文件内判断日期)
 
-盘中信号规则 (按分类触发):
-  昨日2连板 — 高开>0% 且 现价不破VWAP
-  非昨日2连板 — 突破VWAP并连续站稳超15分钟
-  首板(旧)   — 突破VWAP并连续站稳超15分钟
-  首板(新)   — 今日动量 > 昨日动量 × 1.5
+盘中信号规则 (V2, 多维过滤):
+  前置条件 — tech_score >= 60 + 日内动量 > -2%
+  昨日2连板 — 高开>0% + 现价不破VWAP + 缩量 + 多头排列
+  非昨日2连板 — 突破VWAP站稳>20分钟 + 多头排列 + RSI>50
+  首板(旧)   — 突破VWAP站稳>20分钟 + 多头排列 + RSI>50
+  首板(新)   — 今日动量 > 昨日动量 × 1.5 + OBV不下降
+
+信号强度 (日内动量, 移植自 V1 策略):
+  强 💪 — 日内动量 >= 3% (V1持有组99%胜率)
+  中 📊 — 日内动量 0%~3%
+  弱 ⚠️ — 日内动量 -2%~0% (谨慎, 建议观望)
+
+技术评分体系 (来自 dragon_d0_alert.py):
+  MA排列: 多头+20, 空头-15  |  RSI: 40~60中性+5, >70超买-10
+  OBV趋势: 上升+10, 下降-10  |  量比: 1~2x温和+5, >3x过度-5
+  MA5角: >0.5%+10, >0.3%+5  |  KDJ: >90+10, >80+5
 """
 from __future__ import annotations
 import json, time, argparse, os, sys, threading
@@ -68,6 +82,190 @@ def _get_writer():
     _writer_cache = get_market_kline_writer()
     return _writer_cache
 
+
+
+# ================================================================
+# 技术指标 (移植自 dragon_d0_alert.py, 用于信号质量过滤)
+# ================================================================
+
+def calc_rsi(closes, period=14):
+    """RSI 相对强弱指数"""
+    if len(closes) < period + 1:
+        return None
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i-1]
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
+    avg_g = sum(gains[:period]) / period
+    avg_l = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_g = (avg_g * (period - 1) + gains[i]) / period
+        avg_l = (avg_l * (period - 1) + losses[i]) / period
+    return 100 - 100 / (1 + avg_g / avg_l) if avg_l > 0 else 100.0
+
+
+def calc_kdj_k(closes, highs, lows, period=9):
+    """KDJ K值"""
+    if len(closes) < period:
+        return None
+    rsvs = []
+    for i in range(period - 1, len(closes)):
+        hn = max(highs[i-period+1:i+1])
+        ln = min(lows[i-period+1:i+1])
+        c = closes[i]
+        rsvs.append((c - ln) / (hn - ln) * 100 if hn != ln else 50)
+    k_val = 50.0
+    for rsv in rsvs:
+        k_val = 2/3 * k_val + 1/3 * rsv
+    return k_val
+
+
+def calc_obv_trend(bars, period=5):
+    """OBV趋势: 最近period天OBV变化方向"""
+    if len(bars) < period + 1:
+        return "平"
+    obv = 0
+    obv_list = [0]
+    for i in range(1, len(bars)):
+        if bars[i]['close'] > bars[i-1]['close']:
+            obv += bars[i]['volume']
+        elif bars[i]['close'] < bars[i-1]['close']:
+            obv -= bars[i]['volume']
+        obv_list.append(obv)
+    change = obv_list[-1] - obv_list[-period]
+    if change > 0:
+        return "上升"
+    elif change < 0:
+        return "下降"
+    return "平"
+
+
+def calc_ma5_angle(closes, period=5, days=3):
+    """MA5 斜率 (角度)"""
+    if len(closes) < period + days:
+        return None
+    ma = [sum(closes[i-period+1:i+1]) / period for i in range(period - 1, len(closes))]
+    if len(ma) < days:
+        return None
+    recent = ma[-days:]
+    n = days
+    sum_x = n * (n - 1) / 2
+    sum_y = sum(recent)
+    sum_xy = sum(i * recent[i] for i in range(n))
+    sum_x2 = n * (n - 1) * (2 * n - 1) / 6
+    denom = n * sum_x2 - sum_x * sum_x
+    slope = (n * sum_xy - sum_x * sum_y) / denom if denom != 0 else 0
+    return slope / recent[-1] * 100 if recent[-1] else None
+
+
+def calc_tech_score(bars, idx):
+    """综合技术评分 (0-100, 移植自 dragon_d0_alert.py)
+
+    评分维度:
+      MA排列: 多头+20, 空头-15, 交叉+10
+      RSI14:  40~60中性+5, >70超买-10, <30超卖+10
+      OBV趋势: 上升+10, 下降-10
+      量比:   1~2x温和+5, >3x过度-5
+      MA5角:  >0.3%+5, >0.5%+10
+      KDJ K:  >80+5, >90+10
+    """
+    if idx < 20 or idx >= len(bars):
+        return 0
+
+    closes = [bars[i]['close'] for i in range(max(0, idx - 60), idx + 1)]
+    highs = [bars[i]['high'] for i in range(max(0, idx - 60), idx + 1)]
+    lows = [bars[i]['low'] for i in range(max(0, idx - 60), idx + 1)]
+
+    ma5 = sum(closes[-5:]) / 5 if len(closes) >= 5 else None
+    ma10 = sum(closes[-10:]) / 10 if len(closes) >= 10 else None
+    ma20 = sum(closes[-20:]) / 20 if len(closes) >= 20 else None
+    rsi14 = calc_rsi(closes, 14)
+    kdj_k = calc_kdj_k(closes, highs, lows, 9)
+    obv_trend = calc_obv_trend(bars[:idx + 1])
+    vol_ratio = _calc_vol_ratio(bars, idx) if idx >= 5 else 1.0
+    angle = calc_ma5_angle(closes[-20:], 5, 3) if len(closes) >= 20 else None
+
+    score = 50
+
+    # MA排列
+    if ma5 and ma10 and ma20:
+        if ma5 > ma10 > ma20:
+            score += 20
+        elif ma5 < ma10 < ma20:
+            score -= 15
+        elif ma5 > ma10:
+            score += 10
+
+    # RSI
+    if rsi14 is not None:
+        if 40 <= rsi14 <= 60:
+            score += 5
+        elif rsi14 > 70:
+            score -= 10
+        elif rsi14 < 30:
+            score += 10
+
+    # OBV趋势
+    if obv_trend == "上升":
+        score += 10
+    elif obv_trend == "下降":
+        score -= 10
+
+    # 量比
+    if 1.0 <= vol_ratio <= 2.0:
+        score += 5
+    elif vol_ratio > 3.0:
+        score -= 5
+
+    # MA5 角度
+    if angle is not None:
+        if angle > 0.5:
+            score += 10
+        elif angle > 0.3:
+            score += 5
+
+    # KDJ
+    if kdj_k is not None:
+        if kdj_k > 90:
+            score += 10
+        elif kdj_k > 80:
+            score += 5
+
+    return max(0, min(100, score))
+
+
+def calc_daily_tech_details(bars, idx):
+    """计算日K线技术指标详情 (用于候选注入和信号输出)"""
+    if idx < 20 or idx >= len(bars):
+        return {}
+
+    closes = [bars[i]['close'] for i in range(max(0, idx - 60), idx + 1)]
+    highs = [bars[i]['high'] for i in range(max(0, idx - 60), idx + 1)]
+    lows = [bars[i]['low'] for i in range(max(0, idx - 60), idx + 1)]
+
+    ma5 = sum(closes[-5:]) / 5 if len(closes) >= 5 else None
+    ma10 = sum(closes[-10:]) / 10 if len(closes) >= 10 else None
+    ma20 = sum(closes[-20:]) / 20 if len(closes) >= 20 else None
+    ma_bull = bool(ma5 and ma10 and ma20 and ma5 > ma10 > ma20)
+
+    rsi14 = calc_rsi(closes, 14)
+    kdj_k = calc_kdj_k(closes, highs, lows, 9)
+    obv_trend = calc_obv_trend(bars[:idx + 1])
+    angle = calc_ma5_angle(closes[-20:], 5, 3) if len(closes) >= 20 else None
+    tech_score = calc_tech_score(bars, idx)
+
+    return {
+        'ma5': round(ma5, 2) if ma5 else None,
+        'ma10': round(ma10, 2) if ma10 else None,
+        'ma20': round(ma20, 2) if ma20 else None,
+        'ma_bull': ma_bull,
+        'rsi14': round(rsi14, 1) if rsi14 else None,
+        'kdj_k': round(kdj_k, 1) if kdj_k else None,
+        'obv_trend': obv_trend,
+        'ma5_angle': round(angle, 2) if angle else None,
+        'tech_score': tech_score,
+    }
 
 
 # ================================================================
@@ -411,6 +609,33 @@ def screen_candidates(kline_days: int = 30, force_refresh: bool = False) -> List
     candidates.sort(key=lambda x: order.get(x['source'], 9))
 
     # 按分类输出全部候选
+    # 注入技术分 (tech_score), 过滤低分候选
+    print(f"\n  [3/3] 技术评分过滤 (tech_score >= 60)...")
+    filtered = []
+    for c in candidates:
+        code = c['code']
+        bars = load_kline_db(code, kline_days)
+        if not bars or len(bars) < 20:
+            continue
+        idx = len(bars) - 1
+        tech = calc_daily_tech_details(bars, idx)
+        c['tech_score'] = tech.get('tech_score', 0)
+        c['ma_bull'] = tech.get('ma_bull', False)
+        c['rsi14'] = tech.get('rsi14', 0)
+        c['kdj_k'] = tech.get('kdj_k', 0)
+        c['obv_trend'] = tech.get('obv_trend', '平')
+        c['ma5_angle'] = tech.get('ma5_angle', 0)
+
+        # 技术分过滤: 低于60分的候选不进入监控
+        if c['tech_score'] < 60:
+            continue
+        filtered.append(c)
+
+    dropped = len(candidates) - len(filtered)
+    if dropped > 0:
+        print(f"        过滤掉 {dropped} 只低技术分候选 (tech_score < 60)")
+    candidates = filtered
+
     print(f"\n  结果: {len(candidates)}只")
     if candidates:
         for cat in ['首板(新)', '首板(旧)', '昨日2连板', '非昨日2连板']:
@@ -419,17 +644,20 @@ def screen_candidates(kline_days: int = 30, force_refresh: bool = False) -> List
                 continue
             cat_emoji = {'首板(新)': '🆕', '首板(旧)': '🔄', '昨日2连板': '🔗', '非昨日2连板': '📌'}
             print(f"\n  {cat_emoji.get(cat, '')} {cat} ({len(group)}只)")
-            print(f"  {'代码':>8} {'名称':>8} {'板块':>6} {'量比':>5} {'昨动量':>7}")
-            print(f"  {'-'*50}")
+            print(f"  {'代码':>8} {'名称':>8} {'板块':>6} {'量比':>5} {'昨动量':>7} {'技分':>4} {'多头':>3} {'RSI':>5} {'OBV':>3}")
+            print(f"  {'-'*65}")
             for c in group:
                 ym = c['yesterday_momentum']
                 vr = c.get('vol_ratio', 0)
                 ym_emoji = '💪' if ym >= 5 else ('📈' if ym >= 3 else '')
                 vr_str = f"{vr:.1f}x" if vr > 0 else '-'
+                obv_short = {'上升':'↑','下降':'↓','平':'—'}.get(c.get('obv_trend',''), '—')
+                bull = '✓' if c.get('ma_bull') else '✗'
+                rsi_str = f"{c.get('rsi14', 0):.0f}" if c.get('rsi14') else '-'
                 print(f"  {c['code']:>8} {c['name']:>8} {c['board']:>6} "
-                      f"{vr_str:>5} {ym:>+6.1f}%{ym_emoji}")
+                      f"{vr_str:>5} {ym:>+6.1f}%{ym_emoji} {c.get('tech_score',0):>4} {bull:>3} {rsi_str:>5} {obv_short:>3}")
 
-    # 保存缓存
+    # 保存缓存 (含技术分)
     _save_cache(candidates)
 
     return candidates
@@ -746,13 +974,11 @@ def _count_minutes_above_vwap(ticks: List[Dict], vwap: float = 0) -> int:
 
 
 def detect_signal(ticks: List[Dict], candidate: Dict) -> Optional[Dict]:
-    """按候选分类检测信号 (不同分类不同规则)
+    """盘中信号检测 (简化版)
 
-    规则:
-      昨日2连板 — 高开>0% 且 现价不破VWAP
-      非昨日2连板 — 突破VWAP并连续站稳超15分钟
-      首板(旧)   — 突破VWAP并连续站稳超15分钟
-      首板(新)   — 今日动量 > 昨日动量 * 1.5
+    日线筛选已做过滤, 盘中只判断入场时机:
+      核心条件: 现价 > VWAP + 日内动量 > 0%
+      强度分级: 强(>=3%) 中(0~3%) 弱(<0%)
 
     Returns:
         信号详情 dict 或 None
@@ -768,7 +994,6 @@ def detect_signal(ticks: List[Dict], candidate: Dict) -> Optional[Dict]:
 
     source = candidate.get('source', '')
     change_pct = (current_price / prev_close - 1) * 100
-    # 优先用 mootdx 精确 VWAP, 回退到 ticks 计算
     vwap = candidate.get('_precise_vwap', 0)
     if vwap <= 0:
         vwap = calc_vwap(ticks)
@@ -778,64 +1003,34 @@ def detect_signal(ticks: List[Dict], candidate: Dict) -> Optional[Dict]:
     today_open = ticks[0]['open'] if ticks else 0
     open_gap = (today_open / prev_close - 1) * 100 if prev_close > 0 else 0
     today_momentum = (current_price - today_open) / prev_close * 100 if prev_close > 0 else 0
-    yesterday_momentum = candidate.get('yesterday_momentum', 0)
 
-    signal = None
+    # 日内动量分级
+    if today_momentum >= 3.0:
+        strength = '强'
+    elif today_momentum >= 0:
+        strength = '中'
+    else:
+        strength = '弱'
 
-    # ========== 昨日2连板: 高开>0% + 现价不破VWAP + 缩量 ==========
-    if source == '昨日2连板':
-        if open_gap > 0 and current_price >= vwap:
-            # 缩量检查: 今日累计量 / 昨日量 < 0.7
-            today_vol = sum(t['volume'] for t in ticks)
-            yesterday_vol = candidate.get('last_volume', 0)
-            vol_shrink = today_vol / yesterday_vol if yesterday_vol > 0 else 1.0
-            if vol_shrink < 0.7:
-                signal = {
-                    'type': '2连板_高开缩量',
-                    'label': '高开缩量',
-                    'emoji': '🔗',
-                    'detail': (f"高开{open_gap:+.1f}%, "
-                               f"现价{current_price:.2f} VWAP{vwap:.2f} "
-                               f"({price_vs_vwap:+.1f}%), "
-                               f"缩量{vol_shrink:.0%}"),
-                }
-
-    # ========== 非昨日2连板 / 首板(旧): 突破VWAP站稳>20分钟 ==========
-    elif source in ('非昨日2连板', '首板(旧)'):
-        minutes_above = _count_minutes_above_vwap(ticks, vwap)
-        if minutes_above >= 15 and current_price >= vwap:
-            signal = {
-                'type': f'{source}_站稳均线',
-                'label': '站稳VWAP>15min',
-                'emoji': '📈' if source == '首板(旧)' else '📌',
-                'above_vwap_minutes': minutes_above,
-                'detail': (f"连续{minutes_above}分钟站稳VWAP, "
-                           f"当前高于VWAP {price_vs_vwap:+.1f}%"),
-            }
-
-    # ========== 首板(新): 今日动量 > 昨日动量 * 1.5 ==========
-    elif source == '首板(新)':
-        if yesterday_momentum > 0 and today_momentum > yesterday_momentum * 1.5:
-            signal = {
-                'type': '首板新_动量加速',
-                'label': '动量加速',
-                'emoji': '🆕',
-                'detail': (f"今日动量{today_momentum:+.1f}% "
-                           f"> 昨日{yesterday_momentum:+.1f}%×1.5="
-                           f"{yesterday_momentum * 1.5:+.1f}%"),
-            }
-
-    if signal is None:
+    # ===== 核心信号: 现价 > VWAP + 日内动量 > 0% =====
+    if current_price < vwap or today_momentum < 0:
         return None
 
-    # 补充公共字段
+    signal = {
+        'type': f'{source}_入场',
+        'label': f'VWAP上方+动量{today_momentum:+.1f}%',
+        'emoji': '💪' if strength == '强' else ('📊' if strength == '中' else '⚠️'),
+        'strength': strength,
+        'detail': (f"现价{current_price:.2f} VWAP{vwap:.2f}({price_vs_vwap:+.1f}%) "
+                   f"高开{open_gap:+.1f}% 日内{today_momentum:+.1f}%[{strength}]"),
+    }
+
     signal.update({
         'code': candidate['code'],
-        'name': candidate['name'],
-        'board': candidate['board'],
-        'limit_pct': candidate['limit_pct'],
+        'name': candidate.get('name', ''),
+        'board': candidate.get('board', ''),
+        'limit_pct': candidate.get('limit_pct', 10),
         'source': source,
-        'yesterday_momentum': yesterday_momentum,
         'today_momentum': round(today_momentum, 2),
         'price': current_price,
         'vwap': round(vwap, 3),
@@ -845,6 +1040,7 @@ def detect_signal(ticks: List[Dict], candidate: Dict) -> Optional[Dict]:
         'time': current['time'],
         'intraday_high': max(t['high'] for t in ticks),
         'intraday_low': min(t['low'] for t in ticks),
+        'intraday_momentum': round(today_momentum, 2),
     })
 
     return signal
@@ -1039,9 +1235,9 @@ def run_monitor(candidates: List[Dict], interval: int = 60, force: bool = False)
 
                 if not hasattr(run_monitor, '_header_printed'):
                     run_monitor._header_printed = True
-                    print(f"  {'连续':>4} {'时间':>5} {'代码':>7} {'名称':>6} {'分类':>7} {'价格':>7} {'涨跌':>6} "
-                          f"{'高开':>5} {'动量':>5} {'站稳':>4} {'止损':>7} {'涨停':>7}")
-                    print(f"  {'-'*88}")
+                    print(f"  {'连续':>4} {'时间':>5} {'代码':>7} {'名称':>6} {'分类':>7} {'强度':>4} {'技分':>4} "
+                          f"{'价格':>7} {'涨跌':>6} {'高开':>5} {'日内':>5} {'站稳':>4} {'止损':>7} {'涨停':>7}")
+                    print(f"  {'-'*96}")
                 elif hasattr(run_monitor, '_prev_round'):
                     print(f"  {'·'*88}")
 
@@ -1060,9 +1256,14 @@ def run_monitor(candidates: List[Dict], interval: int = 60, force: bool = False)
                     src = _src_short.get(sig['source'], sig['source'])
                     name = sig.get('name', '')[:4]
                     c = sig['_consecutive']
+                    strength = sig.get('strength', '-')
+                    strength_emoji = {'强': '💪', '中': '📊', '弱': '⚠️'}.get(strength, '')
+                    ts = sig.get('tech_score', 0)
+                    intra = sig.get('intraday_momentum', sig.get('today_momentum', 0))
                     print(f"  {c:>4} {time_str:>5} {sig['code']:>7} {name:>6} {src:>7} "
+                          f"{strength_emoji:>2}{strength:>2} {ts:>4} "
                           f"{buy_price:>7.2f} {sig['change_pct']:>+5.1f}% {sig.get('open_gap', 0):>+5.1f}% "
-                          f"{sig.get('today_momentum', 0):>+5.1f}% {above_str:>4} {stop_price:>7.2f} {limit_price:>7.2f}")
+                          f"{intra:>+5.1f}% {above_str:>4} {stop_price:>7.2f} {limit_price:>7.2f}")
 
                 # 保存本轮调试数据
                 _debug_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -1075,10 +1276,13 @@ def run_monitor(candidates: List[Dict], interval: int = 60, force: bool = False)
                         'code': sig.get('code', ''),
                         'name': sig.get('name', ''),
                         'source': sig.get('source', ''),
+                        'strength': sig.get('strength', '-'),
+                        'tech_score': sig.get('tech_score', 0),
                         'price': sig.get('price', 0),
                         'change_pct': sig.get('change_pct', 0),
                         'open_gap': sig.get('open_gap', 0),
                         'today_momentum': sig.get('today_momentum', 0),
+                        'intraday_momentum': sig.get('intraday_momentum', 0),
                         'vwap': sig.get('vwap', 0),
                         'above_vwap_minutes': sig.get('above_vwap_minutes', 0),
                         'calc_vwap': dbg.get('calc_vwap', 0),
@@ -1109,9 +1313,25 @@ def run_monitor(candidates: List[Dict], interval: int = 60, force: bool = False)
     except KeyboardInterrupt:
         print(f"\n\n  ⛔ 手动停止")
 
-    # 清理
+    # 清理 + 汇总 (含 V1 日内动量出场建议)
     if all_signals:
-        print(f"\n  📊 今日共 {len(all_signals)} 个信号 (去重{len(set(s['code'] for s in all_signals))}只)")
+        codes_set = set(s['code'] for s in all_signals)
+        print(f"\n  📊 今日共 {len(all_signals)} 个信号 (去重{len(codes_set)}只)")
+
+        # 按信号强度统计
+        strong = [s for s in all_signals if s.get('strength') == '强']
+        medium = [s for s in all_signals if s.get('strength') == '中']
+        weak = [s for s in all_signals if s.get('strength') == '弱']
+        print(f"  💪 强信号(日内>=3%): {len(strong)}个 | "
+              f"📊 中信号(0~3%): {len(medium)}个 | "
+              f"⚠️ 弱信号(<0%): {len(weak)}个")
+
+        # V1 日内动量出场建议
+        if strong:
+            print(f"\n  💡 V1出场规则 (来自 test_dragon.py, 99%胜率持有组):")
+            print(f"     日内动量>=3% → 继续持有, 追踪止损-5%, 持仓上限20天")
+            print(f"     日内动量<3%  → 明日开盘清仓 (盘中买盘不足)")
+            print(f"     建议关注: {[s['code'] for s in strong]}")
     else:
         print(f"\n  📊 今日无信号")
 
@@ -1136,7 +1356,7 @@ def run_monitor(candidates: List[Dict], interval: int = 60, force: bool = False)
 
 def main():
     parser = argparse.ArgumentParser(
-        description="首板/2连板盘中实时监控",
+        description="首板/2连板盘中实时监控 (V2 — 多维过滤版)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
@@ -1150,16 +1370,39 @@ def main():
     parser.add_argument("--interval", type=int, default=60, help="盘中轮询间隔秒数 (默认60)")
     parser.add_argument("--force", action="store_true", help="强制运行, 忽略交易时间限制")
     parser.add_argument("--kline-days", type=int, default=30, help="日K线回看天数 (默认30)")
+    parser.add_argument("--pool", type=str, default="", help="加载 daily_screener 产出的候选池 JSON")
     args = parser.parse_args()
 
     print("=" * 70)
     print("  🔍 首板/2连板盘中实时监控")
     print("=" * 70)
-    print(f"  选股池: 昨日首板 + 5日内2连板")
-    print(f"  规则: 2连板高开不破均线 | 首板(旧)/非昨日2连板站稳VWAP>20min | 首板(新)动量加速")
 
-    # 选股
-    if args.codes:
+    # 候选池加载
+    if args.pool:
+        # 从 daily_screener 产出的候选池加载
+        with open(args.pool, 'r', encoding='utf-8') as f:
+            pool_data = json.load(f)
+        raw = pool_data.get('candidates', [])
+        print(f"  📦 从候选池加载: {len(raw)}只 (生成于 {pool_data.get('generated_at', '?')})")
+        candidates = []
+        for c in raw:
+            candidates.append({
+                'code': c['code'],
+                'name': c.get('name', ''),
+                'board': get_board_name(c['code']),
+                'limit_pct': get_limit_pct(c['code']),
+                'source': c.get('primary_source', c.get('source', '')),
+                'sources': c.get('sources', []),
+                'quality_score': c.get('quality_score', 0),
+                'prev_close': 0,  # 盘中实时获取
+                'last_close': 0,
+                'last_volume': 0,
+                'yesterday_momentum': 0,
+                'vol_ratio': c.get('vol_ratio', 0),
+                'tech_score': c.get('tech_score', 0),
+            })
+        print(f"        来源分布: {dict(pool_data.get('sources', {}))}")
+    elif args.codes:
         codes = [c.strip() for c in args.codes.split(",") if c.strip()]
         candidates = []
         for code in codes:
@@ -1170,18 +1413,24 @@ def main():
             idx = len(bars) - 1
             last_bar = bars[idx]
             prev_close = bars[idx - 1]['close'] if idx > 0 else 0
-            change_pct = (last_bar['close'] / prev_close - 1) * 100 if prev_close > 0 else 0
             candidates.append({
                 'code': code, 'name': '', 'board': get_board_name(code),
                 'limit_pct': get_limit_pct(code),
                 'last_close': last_bar['close'], 'last_date': last_bar['time'],
-                'change_pct': round(change_pct, 2),
+                'change_pct': round((last_bar['close'] / prev_close - 1) * 100, 2) if prev_close > 0 else 0,
                 'source': '(手动指定)',
                 'prev_close': prev_close,
+                'last_volume': last_bar['volume'],
+                'yesterday_momentum': 0,
+                'vol_ratio': 0,
+                'tech_score': 0,
             })
-        print(f"\n  手动指定: {len(candidates)}只")
+        print(f"  手动指定: {len(candidates)}只")
     else:
         candidates = screen_candidates(kline_days=args.kline_days, force_refresh=args.refresh)
+
+    print(f"  信号规则: 现价>VWAP + 日内动量>0%")
+    print(f"  强度分级: 强(日内>=3%) 中(0~3%) 弱(<0%)")
 
     if args.scan:
         print(f"\n  ✅ 选股完成 (--scan 模式, 不启动监控)")
