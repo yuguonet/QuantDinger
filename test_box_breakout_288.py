@@ -283,6 +283,7 @@ def strategy_peak_breakout(bars, code,
     closes = [b["close"] for b in bars]
     highs = [b["high"] for b in bars]
     lows = [b["low"] for b in bars]
+    opens = [b["open"] for b in bars]
     volumes = [b["volume"] for b in bars]
 
     candidates = []
@@ -340,7 +341,7 @@ def strategy_peak_breakout(bars, code,
         ma20_prev2 = sum(closes[i-21:i-1]) / 20 if i >= 21 else ma20_prev
         ma20_slope_prev = (ma20_prev - ma20_prev2) / ma20_prev2 * 100 if ma20_prev2 > 0 else 0
 
-        # 要求: MA10斜率 > 下限 且 递增, MA20斜率 > 0 且递增
+        # 要求: MA10斜率 >= 0.3 且 递增, MA20斜率 > 0 且递增
         if ma10_slope_now < min_ma10_slope or ma10_slope_now <= ma10_slope_prev:
             continue
         if ma20_slope_now <= 0 or ma20_slope_now <= ma20_slope_prev:
@@ -408,12 +409,13 @@ def strategy_peak_breakout(bars, code,
             # 箱体振幅
             box_range_pct = (resistance_level - support_level) / support_level * 100 if support_level > 0 else 0
 
-            # 创科板专用过滤
+            # 板块过滤
             board = get_board_name(code)
             if board in ('创业板', '科创板'):
-                # 流通市值: <30亿
+                # 创科板: 流通市值<30亿
                 if circ_mcap > 0 and circ_mcap >= 30:
                     continue
+            # 主板无额外过滤
 
             signal = {
                 "idx": i, "signal_date": bars[i]["time"],
@@ -443,13 +445,39 @@ def strategy_peak_breakout(bars, code,
             entry_idx = i + 1
             if entry_idx >= len(bars):
                 continue
-            entry_price = bars[entry_idx]["open"]
+            
+            # 买入日特征分析
+            buy_day_open = bars[entry_idx]["open"]
+            buy_day_close = closes[entry_idx]
+            buy_day_chg = (buy_day_close / buy_day_open - 1) * 100 if buy_day_open > 0 else 0
+            
+            # 买入日量比(vs前5日均量)
+            avg_vol_5 = sum(volumes[max(0,entry_idx-5):entry_idx]) / min(5, entry_idx) if entry_idx > 0 else volumes[entry_idx]
+            buy_vol_ratio = volumes[entry_idx] / avg_vol_5 if avg_vol_5 > 0 else 1.0
+            
+            # 过滤条件:
+            # 1. 买入日涨跌幅 -3%~+3%
+            if buy_day_chg < -3 or buy_day_chg > 3:
+                continue
+            # 2. 平开: 开盘价vs前收盘 -0.5%~+0.5%
+            prev_close = closes[entry_idx-1] if entry_idx > 0 else buy_day_open
+            gap_pct = (buy_day_open / prev_close - 1) * 100 if prev_close > 0 else 0
+            if gap_pct < -0.5 or gap_pct > 0.5:
+                continue
+            # 3. 低振幅: 当日振幅<3%
+            buy_day_range = (bars[entry_idx]["high"] - bars[entry_idx]["low"]) / buy_day_open * 100 if buy_day_open > 0 else 0
+            if buy_day_range >= 3:
+                continue
+            
+            entry_price = buy_day_close  # 收盘价买入
             if entry_price <= 0:
                 continue
 
             best_signal["entry_price"] = entry_price
             best_signal["entry_idx"] = entry_idx
             best_signal["entry_date"] = bars[entry_idx]["time"]
+            best_signal["buy_day_chg"] = round(buy_day_chg, 2)
+            best_signal["buy_vol_ratio"] = round(buy_vol_ratio, 2)
             candidates.append(best_signal)
 
     daily_candidates = defaultdict(list)
@@ -489,7 +517,9 @@ def strategy_peak_breakout(bars, code,
             "close_vs_ma60": c["close_vs_ma60"],
             "entry_date": c["entry_date"],
             "entry_price": round(c["entry_price"], 3),
-            "buy_mode": "box_bottom_next_open",
+            "buy_mode": "buy_day_close",
+            "buy_day_chg": c.get("buy_day_chg", 0),
+            "buy_vol_ratio": c.get("buy_vol_ratio", 0),
             "neckline_high": c["resistance_level"], "neckline_gain_pct": round((c["resistance_level"] - c["support_level"]) / c["support_level"] * 100, 2),
             "first_trough_low": c["support_level"], "second_trough_low": c["support_level"],
             "peak_high": c["resistance_level"], "peak_gain_pct": round((c["resistance_level"] - c["support_level"]) / c["support_level"] * 100, 2),
@@ -697,8 +727,10 @@ if __name__ == "__main__":
     print(f"  ③ 支撑确认: ≥{args.min_box_count}个箱体下沿接近(±{args.support_tolerance}%)")
     print(f"  ④ 底部买入: 价格触及支撑位±{args.buy_zone_pct}%区域")
     print(f"  ⑤ 反弹确认: 收阳线/量缩/长下影线(至少满足一个)")
-    print(f"  ⑥ 趋势加速: MA10斜率>={args.min_ma10_slope}%/天且递增, MA20斜率>0且递增")
-    print(f"  ⑦ 创科板专用: 流通市值<30亿")
+    print(f"  ⑥ 趋势加速: MA10斜率>0且递增, MA20斜率>0且递增")
+    print(f"  ⑦ 主板: 弱转强确认(D-2放量涨→D-1缩量跌→D0涨0.8-1.2x)")
+    print(f"  ⑧ 创科板: 流通市值<30亿")
+    print(f"  ⑨ 买入日: 涨跌幅-3%~+3%，平开(-0.5%~+0.5%)，振幅<3%，收盘价买入")
     print(f"出场条件:")
     print(f"  ① 止盈: {args.take_profit}%")
     print(f"  ② 止损: {args.stop_loss}%")
@@ -829,6 +861,139 @@ if __name__ == "__main__":
         for lo,hi in [(0,2),(2,5),(5,10),(10,20),(20,100)]:
             ts=[t for t in all_trades if lo<=t.get('turnover',0)<hi]
             if ts: print_stats(ts, f"[{lo},{hi})%")
+
+        # 买入日分析
+        print(f"\n{'='*60}")
+        print(f"买入日特征分析")
+        print(f"{'='*60}")
+        
+        buy_day_results = []
+        for t in all_trades:
+            code = t['code']
+            entry_date = t['entry_date']
+            signal_date = t['signal_date']
+            
+            bars = fetch_kline(code, args.days)
+            if not bars or len(bars) < 60:
+                continue
+            
+            sig_idx = None
+            entry_idx = None
+            for i, b in enumerate(bars):
+                if b['time'] == signal_date:
+                    sig_idx = i
+                if b['time'] == entry_date:
+                    entry_idx = i
+            
+            if sig_idx is None or entry_idx is None or entry_idx < 1:
+                continue
+            
+            closes = [b['close'] for b in bars]
+            opens = [b['open'] for b in bars]
+            highs = [b['high'] for b in bars]
+            lows = [b['low'] for b in bars]
+            volumes = [b['volume'] for b in bars]
+            
+            sig_close = closes[sig_idx]
+            sig_vol = volumes[sig_idx]
+            
+            buy_open = opens[entry_idx]
+            buy_close = closes[entry_idx]
+            buy_high = highs[entry_idx]
+            buy_low = lows[entry_idx]
+            buy_vol = volumes[entry_idx]
+            
+            gap_pct = (buy_open / sig_close - 1) * 100
+            buy_chg = (buy_close / buy_open - 1) * 100
+            buy_vol_ratio = buy_vol / sig_vol if sig_vol > 0 else 1.0
+            avg_vol_5 = sum(volumes[max(0,entry_idx-5):entry_idx]) / min(5, entry_idx) if entry_idx > 0 else buy_vol
+            buy_vol_ratio_5 = buy_vol / avg_vol_5 if avg_vol_5 > 0 else 1.0
+            buy_range = (buy_high - buy_low) / buy_open * 100 if buy_open > 0 else 0
+            buy_lower_shadow = min(buy_close, buy_open) - buy_low
+            buy_body = abs(buy_close - buy_open)
+            buy_has_lower_shadow = buy_lower_shadow > buy_body * 0.5 if buy_body > 0 else buy_lower_shadow > 0
+            
+            buy_day_results.append({
+                **t,
+                'gap_pct': round(gap_pct, 2),
+                'buy_chg': round(buy_chg, 2),
+                'buy_vol_ratio': round(buy_vol_ratio, 2),
+                'buy_vol_ratio_5': round(buy_vol_ratio_5, 2),
+                'buy_range': round(buy_range, 2),
+                'buy_has_lower_shadow': buy_has_lower_shadow,
+            })
+        
+        if buy_day_results:
+            big_buy = [t for t in buy_day_results if t.get('peak_return_pct',0) >= 20]
+            bad_buy = [t for t in buy_day_results if t.get('peak_return_pct',0) < 5]
+            
+            # 高开/低开
+            print(f"\n--- 高开/低开分析 ---")
+            for label, cond in [('高开(>0.5%)', lambda t: t['gap_pct'] > 0.5),
+                                 ('平开(-0.5~0.5%)', lambda t: -0.5 <= t['gap_pct'] <= 0.5),
+                                 ('低开(<-0.5%)', lambda t: t['gap_pct'] < -0.5)]:
+                seg = [t for t in buy_day_results if cond(t)]
+                if seg:
+                    print_stats(seg, label)
+            
+            # 开口大小
+            print(f"\n--- 开口大小分段 ---")
+            for lo,hi in [(-99,-2),(-2,-1),(-1,0),(0,1),(1,2),(2,99)]:
+                seg = [t for t in buy_day_results if lo<=t['gap_pct']<hi]
+                if seg:
+                    print_stats(seg, f"[{lo},{hi})%")
+            
+            # 买入日涨跌
+            print(f"\n--- 买入日涨跌幅 ---")
+            for lo,hi in [(-99,-3),(-3,-1),(-1,0),(0,1),(1,3),(3,99)]:
+                seg = [t for t in buy_day_results if lo<=t['buy_chg']<hi]
+                if seg:
+                    print_stats(seg, f"[{lo},{hi})%")
+            
+            # 买入日量比(vs信号日)
+            print(f"\n--- 买入日量比(vs信号日) ---")
+            for lo,hi in [(0,0.5),(0.5,0.8),(0.8,1.0),(1.0,1.5),(1.5,2.0),(2.0,99)]:
+                seg = [t for t in buy_day_results if lo<=t['buy_vol_ratio']<hi]
+                if seg:
+                    print_stats(seg, f"[{lo},{hi})")
+            
+            # 买入日量比(vs前5日均量)
+            print(f"\n--- 买入日量比(vs前5日均量) ---")
+            for lo,hi in [(0,0.5),(0.5,0.8),(0.8,1.0),(1.0,1.5),(1.5,2.0),(2.0,99)]:
+                seg = [t for t in buy_day_results if lo<=t['buy_vol_ratio_5']<hi]
+                if seg:
+                    print_stats(seg, f"[{lo},{hi})")
+            
+            # 买入日振幅
+            print(f"\n--- 买入日振幅 ---")
+            for lo,hi in [(0,2),(2,3),(3,5),(5,8),(8,99)]:
+                seg = [t for t in buy_day_results if lo<=t['buy_range']<hi]
+                if seg:
+                    print_stats(seg, f"[{lo},{hi})%")
+            
+            # 买入日下影线
+            print(f"\n--- 买入日下影线 ---")
+            for label, cond in [('有下影线', lambda t: t['buy_has_lower_shadow']),
+                                 ('无下影线', lambda t: not t['buy_has_lower_shadow'])]:
+                seg = [t for t in buy_day_results if cond(t)]
+                if seg:
+                    print_stats(seg, label)
+            
+            # 大赢家特征
+            if big_buy and bad_buy:
+                print(f"\n--- 大赢家 vs 低质量 效应量 ---")
+                for field in ['gap_pct', 'buy_chg', 'buy_vol_ratio', 'buy_vol_ratio_5', 'buy_range']:
+                    b_vals = [t.get(field, 0) for t in big_buy]
+                    d_vals = [t.get(field, 0) for t in bad_buy]
+                    if b_vals and d_vals:
+                        import numpy as np
+                        b_arr = np.array(b_vals)
+                        d_arr = np.array(d_vals)
+                        diff = abs(b_arr.mean() - d_arr.mean())
+                        pooled_std = np.sqrt((b_arr.std()**2 + d_arr.std()**2) / 2)
+                        effect = diff / pooled_std if pooled_std > 0 else 0
+                        effect_level = '***强' if effect > 0.8 else '**中' if effect > 0.5 else '*弱' if effect > 0.2 else '无'
+                        print(f"  {field}: 大赢家{b_arr.mean():.2f} 低质量{d_arr.mean():.2f} 效应量{effect:.3f} {effect_level}")
 
         # TOP N
         n = min(args.top, len(all_trades))

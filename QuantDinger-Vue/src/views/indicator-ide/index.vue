@@ -1652,8 +1652,8 @@ export default {
       this.$nextTick(async () => {
         const chartWrapper = this.$refs.klineChartPro
         if (!chartWrapper) return
-        // 先移除旧的 Python 指标
-        try { chartWrapper.removeIndicatorFromPro('candle_pane', 'selected-python-indicator') } catch (e) {}
+        // 先移除旧的 Python 指标（不重建 Pro）
+        try { chartWrapper.removeIndicatorFromPro('candle_pane', 'selected-python-indicator', true) } catch (e) {}
         // 如果有选中的指标，尝试添加
         if (selectedIndicator && selectedIndicator.name) {
           // 内置指标：Pro 自己管理
@@ -1665,48 +1665,56 @@ export default {
             // Python 指标：注册 → 注入 Pro → 异步计算 → 更新数据
             try {
               // 等待 K 线数据加载完成
-              let klineData = chartWrapper._cachedKlineData || []
+              let klineData = chartWrapper.cachedKlineData || []
               if (!klineData.length) {
                 for (let w = 0; w < 20; w++) {
                   await new Promise(resolve => setTimeout(resolve, 250))
-                  klineData = chartWrapper._cachedKlineData || []
+                  klineData = chartWrapper.cachedKlineData || []
                   if (klineData.length) break
                 }
               }
               if (klineData.length > 0 && chartWrapper.executePythonStrategy) {
-                // 1. 先注册空壳指标（calc 从 extendData 读取预计算结果）
-                const figures = []
-                const calcFunc = (dataList, indicator) => {
-                  const ext = indicator.extendData?.precomputed
-                  if (!ext || !ext.length) return []
-                  return dataList.map((item, i) => {
-                    const row = {}
-                    ext.forEach(p => { row[p.name] = p.data[i] !== undefined ? p.data[i] : null })
-                    return row
-                  })
-                }
-                chartWrapper.registerCustomIndicator(selectedIndicator.name, calcFunc, figures, [], 2, false)
-
-                // 2. 注入 Pro 主图（叠加在 candle_pane）
-                chartWrapper.injectIndicatorToPro(selectedIndicator.name, true, {
-                  id: 'selected-python-indicator',
-                  extendData: { precomputed: [] }
-                })
-
-                // 3. 异步执行 Python 计算
+                // 异步执行 Python 计算
                 const result = await chartWrapper.executePythonStrategy(
                   selectedIndicator.code, klineData, selectedIndicator.params || {},
                   { ...selectedIndicator, userId: this.userId }
                 )
 
-                // 4. 更新指标的 figures 和数据
                 if (result && result.plots && result.plots.length > 0) {
-                  const precomputed = result.plots.map(p => ({ name: p.name, data: p.data }))
-                  const dynamicFigures = result.plots.map(p => ({ key: p.name, title: p.name, type: 'line' }))
-                  // 重新注册（带 figures）
-                  chartWrapper.registerCustomIndicator(selectedIndicator.name, calcFunc, dynamicFigures, [], 2, false)
-                  // 注入数据触发重绘
-                  chartWrapper.updateIndicatorData(selectedIndicator.name, precomputed)
+                  const allPlots = result.plots
+                  const figures = []
+                  const plotDataMap = {}
+
+                  for (let plotIdx = 0; plotIdx < allPlots.length; plotIdx++) {
+                    const plot = allPlots[plotIdx]
+                    const plotName = plot.name || `PLOT_${plotIdx}`
+                    const figureKey = plotName.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '_')
+                    const plotColor = plot.color || this.getIndicatorColor(plotIdx)
+                    const figureType = plot.type || 'line'
+                    figures.push({ key: figureKey, title: plot.name || plotName, type: figureType, color: plotColor })
+                    plotDataMap[figureKey] = plot.data
+                  }
+
+                  const allOverlay = allPlots.every(plot => plot.overlay !== false)
+
+                  // 用闭包捕获 plotDataMap（与旧版 KlineChart.vue 一致）
+                  const calcFunc = (dataList) => {
+                    const resultArr = []
+                    for (let i = 0; i < dataList.length; i++) {
+                      const dataPoint = {}
+                      for (const figureKey in plotDataMap) {
+                        const plotData = plotDataMap[figureKey]
+                        dataPoint[figureKey] = i < plotData.length ? plotData[i] : null
+                      }
+                      resultArr.push(dataPoint)
+                    }
+                    return resultArr
+                  }
+
+                  chartWrapper.registerCustomIndicator(selectedIndicator.name, calcFunc, figures, [], 2, allOverlay)
+                  chartWrapper.injectIndicatorToPro(selectedIndicator.name, true, {
+                    id: 'selected-python-indicator'
+                  })
                 }
               }
             } catch (e) {
@@ -1715,6 +1723,13 @@ export default {
           }
         }
       })
+    },
+    getIndicatorColor (idx) {
+      if (this.isDarkTheme) {
+        return ['#13c2c2', '#e040fb', '#ffeb3b', '#00e676', '#ff6d00', '#9c27b0'][idx % 6]
+      } else {
+        return ['#13c2c2', '#9c27b0', '#f57c00', '#1976d2', '#c2185b', '#7b1fa2'][idx % 6]
+      }
     },
     toggleChartIndicatorRun () {
       if (!this.chartIndicatorRunning && this.chartIndicatorToggleDisabled) return

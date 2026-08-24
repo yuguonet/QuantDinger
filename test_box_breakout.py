@@ -1,34 +1,30 @@
 #!/usr/bin/env python3
 """
-箱体突破 + 站上MA60 策略 - 独立回测
+底部震荡 + 弱转强 策略 - 独立回测
 
 ═══════════════════════════════════════════════════════════════════
-  箱体突破形态
+  弱转强形态
 ═══════════════════════════════════════════════════════════════════
 
-          箱体上沿 ─ ─ ─ ─ ─ ─ ─ 突破↑
-         /─────────\\         /──────\\  → 上涨
-        /           \\       /
-       /             \\     /
-      /───────────────\\───/
-          箱体下沿
+  底部震荡期          弱转强信号           大行情启动
+  ┌─────────┐      ┌─────────────┐      ┌──────────────┐
+  │ 反复洗盘 │  →   │ 放量上涨     │  →   │  持续上涨     │
+  │ 量能萎缩 │      │ 缩量回调     │      │              │
+  │ 买卖平衡 │      │ 缩量上涨     │      │              │
+  └─────────┘      └─────────────┘      └──────────────┘
 
-  ① 箱体: 最近N天内价格在 [下沿, 上沿] 区间震荡
-  ② 窄幅: 振幅 <= box_max_range%
-  ③ 突破: 收盘价 > 箱体上沿，收阳线
-  ④ MA60: 突破日收盘站上60日均线
-  ⑤ 放量: 突破日量 >= 区间均量 x vol_expand_min
-  ⑥ (可选) MACD柱过滤 / RSI过滤 / MA20向上
-  ⑦ 买入: 确认后次日开盘买
+  ① 底部震荡: 前20日箱体整理，量能逐步萎缩
+  ② 平衡确认: 连续缩量，不再创新低
+  ③ 弱转强: 放量上涨→缩量回调→缩量上涨
+  ④ 买入: 弱转强确认日次日开盘买
 
 ═══════════════════════════════════════════════════════════════════
   使用方法
 ═══════════════════════════════════════════════════════════════════
 
-  python test_box_breakout.py --require-ma60
-  python test_box_breakout.py --require-ma60 --min-macd-hist 0.5
-  python test_box_breakout.py --require-ma60 --min-rsi 50 --max-rsi 80
-  python test_box_breakout.py --require-ma60 --pullback-confirm
+  python test_box_breakout.py
+  python test_box_breakout.py --box-days 20 --vol-expand 1.3
+  python test_box_breakout.py --max-hold 30 --stop-loss 8
 """
 from __future__ import annotations
 import json, time, argparse, os, sys
@@ -54,7 +50,7 @@ def _load_env():
         pass
 
 # ================================================================
-# 斜率 + 换手率 工具函数
+# 斜率工具函数
 # ================================================================
 def calc_ma_slope(closes, idx, ma_period=5, slope_days=3):
     """MA斜率: 线性回归角度 (% / 天)"""
@@ -87,18 +83,25 @@ def _load_circ():
         from app.utils.basicinfo_db import get_stock_basic_db
         db = get_stock_basic_db(); pool = db._get_pool()
         with pool.cursor() as cur:
-            cur.execute("SELECT symbol, circ_shares FROM stock_basic_info WHERE status='active' AND circ_shares > 0")
-            _circ_cache = {row[0]: float(row[1]) for row in cur.fetchall()}
+            cur.execute("SELECT symbol, circ_shares, total_shares FROM stock_basic_info WHERE status='active' AND circ_shares > 0")
+            _circ_cache = {row[0]: {'circ_shares': float(row[1]), 'total_shares': float(row[2]) if row[2] else 0} for row in cur.fetchall()}
     except: _circ_cache = {}
     return _circ_cache
 
 def get_turnover(code, volume):
-    circ = _load_circ().get(code, 0)
-    return volume / circ * 100 if circ > 0 else 0
+    circ = _load_circ().get(code, {})
+    circ_shares = circ.get('circ_shares', 0) if isinstance(circ, dict) else 0
+    return volume / circ_shares * 100 if circ_shares > 0 else 0
 
 def get_circ_mcap(code, price):
-    circ = _load_circ().get(code, 0)
-    return circ * price / 1e8 if circ > 0 else 0
+    circ = _load_circ().get(code, {})
+    circ_shares = circ.get('circ_shares', 0) if isinstance(circ, dict) else 0
+    return circ_shares * price / 1e8 if circ_shares > 0 else 0
+
+def get_total_mcap(code, price):
+    circ = _load_circ().get(code, {})
+    total_shares = circ.get('total_shares', 0) if isinstance(circ, dict) else 0
+    return total_shares * price / 1e8 if total_shares > 0 else 0
 
 # ================================================================
 # DB 数据加载
@@ -164,7 +167,9 @@ def run_backtest(bars, entry_idx, entry_price, stop_loss_pct=5.0,
                  trailing_pct=5.0, max_hold_days=15,
                  take_profit_pct=15.0, trailing_activate_pct=5.0):
     """
-    简化回测: 买入后跟踪峰值，从峰值回撤 peak_drop_pct% 出场，最多持有 max_hold_days 天。
+    回测出场规则:
+      峰值回撤12%出场
+      持仓上限出场
     """
     if entry_price <= 0 or entry_idx >= len(bars):
         return None
@@ -186,18 +191,17 @@ def run_backtest(bars, entry_idx, entry_price, stop_loss_pct=5.0,
         if b['high'] > peak:
             peak = b['high']
 
-        # 从峰值回撤 peak_drop_pct% 出场
-        drop_from_peak = (peak - b['low']) / peak * 100
-        if drop_from_peak >= stop_loss_pct:
-            drop_price = peak * (1 - stop_loss_pct / 100)
-            if b['open'] < drop_price:
+        # 峰值回撤12%出场
+        drop_pct = (peak - b['low']) / peak * 100
+        if drop_pct >= 12:
+            exit_p = peak * 0.88  # 峰值-12%
+            if b['open'] < exit_p:
                 exit_p = b['open']
-            else:
-                exit_p = drop_price
             exit_d = d
-            exit_reason = "peak_drop"
+            exit_reason = "peak_drop_12"
             break
 
+        # 持仓上限
         if max_hold_days > 0 and d >= max_hold_days:
             exit_p = b['close']
             exit_d = d
@@ -217,65 +221,124 @@ def run_backtest(bars, entry_idx, entry_price, stop_loss_pct=5.0,
     }
 
 # ================================================================
-# 箱体突破 + 站上MA60 策略
+# 底部震荡 + 弱转强 策略
 # ================================================================
-def strategy_peak_breakout(bars, code,
-                           box_days=25, box_max_range=15.0, box_min_range=0.0, box_min_bars=10,
-                           vol_expand_min=1.5, vol_expand_max=3.0,
-                           stop_loss_pct=12.0, trailing_pct=5.0,
-                           trailing_activate_pct=5.0, take_profit_pct=15.0,
-                           max_hold_days=10, top_per_day=2,
-                           require_ma60=True, require_ma20_up=False,
-                           min_rsi=0, max_rsi=100,
-                           min_macd_hist=0.0, max_macd_hist=100.0,
-                           pullback_confirm=False, pullback_days=3,
-                           pullback_max_pct=3.0):
+def strategy_bottom_reversal(bars, code,
+                              box_days=20, box_max_range=15.0, box_min_range=0.0,
+                              vol_expand=1.3, vol_shrink_ratio=0.8,
+                              min_ma10_slope=0.3, min_ma60_slope=-0.3, max_ma60_slope=0.3,
+                              max_ma_dispersion=5.0, max_chg_20d=12.0,
+                              stop_loss_pct=12.0, trailing_pct=5.0,
+                              trailing_activate_pct=5.0, take_profit_pct=15.0,
+                              max_hold_days=30, top_per_day=2):
     """
-    箱体突破 + 站上MA60 入场策略（优化版）
+    底部震荡 + 弱转强 入场策略
 
     入场条件:
-      ① 箱体: 最近 box_days 天内，价格在 [下沿, 上沿] 区间震荡
-      ② 窄幅: 振幅 <= box_max_range%
-      ③ 不破底: 低点 >= 箱体下沿
-      ④ 突破: 收盘价 > 箱体上沿，收阳线
-      ⑤ MA60: 突破日收盘站上60日均线
-      ⑥ 放量: 突破日量 >= 区间均量 x vol_expand_min
-      ⑦ (可选) MA20向上 / RSI过滤 / MACD柱过滤
-      ⑧ (可选) 回踩确认: 突破后N天内回踩不破箱体上沿
-      ⑨ 买入: 确认后次日开盘买
+      ① 底部震荡: 前20日箱体整理，振幅<15%
+      ② 平衡确认: 前20日涨幅<12%，底部区域
+      ③ 弱转强信号:
+         - D-2: 放量上涨 (量>1.3x均量，收阳)
+         - D-1: 缩量回调 (量<D-2的80%，收阴)
+         - D0: 缩量上涨 (量<D-2的80%，收阳，价格>D-1)
+      ④ MA趋势: MA10斜率>0.3%且递增，MA60走平(-0.3%~0.3%)
+      ⑤ 三线粘合: (MA10-MA60)/MA60<=5%
+      ⑥ 买入: 弱转强确认日次日开盘买
     """
-    if len(bars) < box_days + 65:
+    if len(bars) < 80:
         return []
 
     closes = [b["close"] for b in bars]
     highs = [b["high"] for b in bars]
     lows = [b["low"] for b in bars]
     volumes = [b["volume"] for b in bars]
-
-    # ── 预计算 MACD(12,26,9) ──
-    ema12 = [0.0] * len(closes)
-    ema26 = [0.0] * len(closes)
-    dif = [0.0] * len(closes)
-    dea = [0.0] * len(closes)
-    macd_hist = [0.0] * len(closes)
-    if len(closes) >= 26:
-        ema12[0] = closes[0]
-        ema26[0] = closes[0]
-        for t in range(1, len(closes)):
-            ema12[t] = ema12[t-1] + 2/13 * (closes[t] - ema12[t-1])
-            ema26[t] = ema26[t-1] + 2/27 * (closes[t] - ema26[t-1])
-            dif[t] = ema12[t] - ema26[t]
-            dea[t] = dea[t-1] + 2/10 * (dif[t] - dea[t-1]) if t > 0 else dif[t]
-            macd_hist[t] = 2 * (dif[t] - dea[t])
+    opens = [b["open"] for b in bars]
 
     candidates = []
 
-    for i in range(box_days + 60, len(bars)):
-        ma60 = sum(closes[i-59:i+1]) / 60
-        ma20 = sum(closes[i-19:i+1]) / 20
-        ma20_prev = sum(closes[i-20:i]) / 20 if i >= 20 else ma20
+    for i in range(30, len(bars) - 1):
+        # ── ① 弱转强信号检测 ──
+        # D-2: 放量上涨
+        avg_vol_before = sum(volumes[max(0,i-7):i-2]) / min(7, i-2) if i > 7 else volumes[i-2]
+        d2_vol_expand = volumes[i-2] > avg_vol_before * vol_expand
+        d2_bullish = closes[i-2] > opens[i-2]
 
-        # RSI(14)
+        if not (d2_vol_expand and d2_bullish):
+            continue
+
+        # D-1: 缩量回调
+        d1_vol_shrink = volumes[i-1] < volumes[i-2] * vol_shrink_ratio
+        d1_bearish = closes[i-1] < closes[i-2]
+
+        if not (d1_vol_shrink and d1_bearish):
+            continue
+
+        # D0: 上涨，量在0.8-1.2倍D-1量之间
+        d0_vol_ratio = volumes[i] / volumes[i-1] if volumes[i-1] > 0 else 1.0
+        d0_bullish = closes[i] > opens[i]
+        d0_recover = closes[i] > closes[i-1]
+
+        if not (d0_bullish and d0_recover and 0.8 <= d0_vol_ratio <= 1.2):
+            continue
+
+        # ── ② 底部确认: 前20日涨幅<阈值 且 前20日振幅<阈值 ──
+        chg_20d = (closes[i] / closes[i-20] - 1) * 100 if i >= 20 else 0
+        if chg_20d > max_chg_20d:
+            continue
+
+        # 前20日振幅检查
+        high_20d = max(highs[max(0,i-19):i+1])
+        low_20d = min(lows[max(0,i-19):i+1])
+        box_range_20d = (high_20d - low_20d) / low_20d * 100 if low_20d > 0 else 0
+        if box_range_20d > box_max_range:
+            continue
+
+        # ── 换手率过滤 ──
+        circ_data = _load_circ().get(code, {})
+        circ_shares = circ_data.get('circ_shares', 0) if isinstance(circ_data, dict) else 0
+        total_shares = circ_data.get('total_shares', 0) if isinstance(circ_data, dict) else 0
+        if circ_shares > 0:
+            turnover = volumes[i] / circ_shares * 100
+            if turnover < 2.5 or turnover > 6:  # 换手率2.5~6%最佳区间
+                continue
+        else:
+            turnover = 0
+
+        # ── ③ MA趋势检查 ──
+        ma10_now = sum(closes[i-9:i+1]) / 10
+        ma10_prev = sum(closes[i-10:i]) / 10
+        ma10_slope = (ma10_now - ma10_prev) / ma10_prev * 100 if ma10_prev > 0 else 0
+
+        # MA10前一段斜率
+        ma10_prev2 = sum(closes[i-11:i-1]) / 10 if i >= 11 else ma10_prev
+        ma10_slope_prev = (ma10_prev - ma10_prev2) / ma10_prev2 * 100 if ma10_prev2 > 0 else 0
+
+        if ma10_slope < min_ma10_slope:
+            continue
+
+        # MA20斜率
+        ma20_now = sum(closes[i-19:i+1]) / 20 if i >= 19 else closes[i]
+        ma20_prev = sum(closes[i-20:i]) / 20 if i >= 20 else ma20_now
+        ma20_slope = (ma20_now - ma20_prev) / ma20_prev * 100 if ma20_prev > 0 else 0
+
+        ma20_prev2 = sum(closes[i-21:i-1]) / 20 if i >= 21 else ma20_prev
+        ma20_slope_prev = (ma20_prev - ma20_prev2) / ma20_prev2 * 100 if ma20_prev2 > 0 else 0
+
+        if ma20_slope <= 0 or ma20_slope <= ma20_slope_prev:
+            continue
+
+        # MA60斜率
+        ma60_now = sum(closes[i-59:i+1]) / 60 if i >= 59 else closes[i]
+        ma60_prev = sum(closes[i-60:i]) / 60 if i >= 60 else ma60_now
+        ma60_slope = (ma60_now - ma60_prev) / ma60_prev * 100 if ma60_prev > 0 else 0
+
+        if ma60_slope < min_ma60_slope or ma60_slope > max_ma60_slope:
+            continue
+
+        # 三线离散度 (已屏蔽)
+        ma_dispersion = (ma10_now - ma60_now) / ma60_now * 100 if ma60_now > 0 else 0
+
+        # ── ④ 记录指标 ──
         if i >= 15:
             gains = [max(closes[j] - closes[j-1], 0) for j in range(i-13, i+1)]
             loss_list = [max(closes[j-1] - closes[j], 0) for j in range(i-13, i+1)]
@@ -285,78 +348,33 @@ def strategy_peak_breakout(bars, code,
         else:
             rsi = 50
 
-        box_start = i - box_days
-        box_high = max(highs[box_start:i])
-        box_low = min(lows[box_start:i])
-        if box_low <= 0:
-            continue
-
-        box_range_pct = (box_high - box_low) / box_low * 100
-        if box_range_pct > box_max_range:
-            continue
-        if box_range_pct < box_min_range:
-            continue
-        if lows[i] < box_low:
-            continue
-        if closes[i] <= box_high:
-            continue
-        if i >= 1 and closes[i] <= closes[i-1]:
-            continue
-        if require_ma60 and closes[i] < ma60:
-            continue
-        if require_ma20_up and ma20 <= ma20_prev:
-            continue
-        if rsi < min_rsi or rsi > max_rsi:
-            continue
-
-        # MACD柱过滤
-        if min_macd_hist > 0 and macd_hist[i] < min_macd_hist:
-            continue
-        if macd_hist[i] > max_macd_hist:
-            continue
-
-        # MA5/MA10 斜率
         ma5_slope = calc_ma_slope(closes, i, 5, 3)
-        ma10_slope = calc_ma_slope(closes, i, 10, 3)
         ma5_accel = calc_ma_slope_accel(closes, i, 5, 3)
-
-        # 流通市值过滤 (<50亿 或 >2000亿 排除)
         circ_mcap = get_circ_mcap(code, closes[i])
-        if circ_mcap > 0 and (circ_mcap < 50 or circ_mcap > 2000):
-            continue
+        total_mcap = get_total_mcap(code, closes[i])
+        # turnover already calculated above
 
-        box_avg_vol = sum(volumes[box_start:i]) / box_days
-        vol_ratio = volumes[i] / box_avg_vol if box_avg_vol > 0 else 0
-        if vol_ratio < vol_expand_min or vol_ratio > vol_expand_max:
-            continue
+        # D-2/D-1/D0 量价数据
+        d2_volume = volumes[i-2]
+        d1_volume = volumes[i-1]
+        d0_volume = volumes[i]
+        d2_chg = (closes[i-2] / closes[i-3] - 1) * 100 if i >= 3 else 0
+        d1_chg = (closes[i-1] / closes[i-2] - 1) * 100
+        d0_chg = (closes[i] / closes[i-1] - 1) * 100
+        vol_ratio_d0_d2 = volumes[i] / volumes[i-2] if volumes[i-2] > 0 else 1.0
 
-        # 换手率 (有数据才检查)
-        turnover = get_turnover(code, volumes[i])
-        if circ_mcap > 0 and turnover > 0:
-            import math
-            scale = math.sqrt(100 / circ_mcap)
-            tr_min = 1.0 * scale
-            tr_max = 20.0 * scale
-            if turnover < tr_min or turnover > tr_max:
-                continue
+        # 前20日量价数据
+        low_20d = min(lows[max(0,i-19):i+1])
+        high_20d = max(highs[max(0,i-19):i+1])
+        avg_vol_20 = sum(volumes[max(0,i-19):i+1]) / min(20, i+1)
+        d2_vol_expand = volumes[i-2] / avg_vol_20 if avg_vol_20 > 0 else 1.0
 
-        breakout_idx = i
-        breakout_close = closes[i]
+        # 箱体振幅
+        box_high = high_20d
+        box_low = low_20d
+        box_range = (box_high - box_low) / box_low * 100 if box_low > 0 else 0
 
-        # 回踩确认模式
-        if pullback_confirm:
-            confirmed = False
-            for j in range(i + 1, min(i + pullback_days + 1, len(bars))):
-                if lows[j] < box_high:
-                    confirmed = False
-                    break
-                if lows[j] >= box_high and closes[j] > closes[j-1]:
-                    confirmed = True
-                    i = j
-                    break
-            if not confirmed:
-                continue
-
+        # ── ⑤ 买入: 次日开盘 ──
         entry_idx = i + 1
         if entry_idx >= len(bars):
             continue
@@ -365,23 +383,40 @@ def strategy_peak_breakout(bars, code,
             continue
 
         candidates.append({
-            "idx": i, "signal_date": bars[i]["time"],
-            "entry_price": entry_price, "entry_idx": entry_idx,
+            "idx": i,
+            "signal_date": bars[i]["time"],
+            "entry_price": entry_price,
+            "entry_idx": entry_idx,
             "entry_date": bars[entry_idx]["time"],
-            "box_high": round(box_high, 3), "box_low": round(box_low, 3),
-            "box_range_pct": round(box_range_pct, 2), "box_days": box_days,
-            "breakout_close": round(breakout_close, 3),
-            "vol_ratio": round(vol_ratio, 2),
+            "d2_date": bars[i-2]["time"],
+            "d1_date": bars[i-1]["time"],
+            "d0_date": bars[i]["time"],
+            "d2_volume": d2_volume,
+            "d1_volume": d1_volume,
+            "d0_volume": d0_volume,
+            "d2_chg": round(d2_chg, 2),
+            "d1_chg": round(d1_chg, 2),
+            "d0_chg": round(d0_chg, 2),
+            "vol_ratio_d0_d2": round(vol_ratio_d0_d2, 2),
+            "chg_20d": round(chg_20d, 2),
+            "low_20d": round(low_20d, 3),
+            "high_20d": round(high_20d, 3),
+            "avg_vol_20": avg_vol_20,
+            "d2_vol_expand": round(d2_vol_expand, 2),
+            "box_range": round(box_range, 2),
             "ma5_slope": round(ma5_slope, 3),
             "ma10_slope": round(ma10_slope, 3),
             "ma5_accel": round(ma5_accel, 3),
             "turnover": round(turnover, 2),
             "circ_mcap": round(circ_mcap, 1),
-            "ma60": round(ma60, 3),
+            "total_mcap": round(total_mcap, 1),
+            "circ_shares": circ_shares,
+            "total_shares": total_shares,
+            "ma60": round(ma60_now, 3),
+            "ma60_slope": round(ma60_slope, 3),
+            "ma_dispersion": round(ma_dispersion, 2),
             "rsi": round(rsi, 1),
-            "macd_hist": round(macd_hist[i], 4),
-            "close_vs_ma60": round((breakout_close / ma60 - 1) * 100, 2),
-            "pullback_confirmed": pullback_confirm,
+            "close_vs_ma60": round((closes[i] / ma60_now - 1) * 100, 2) if ma60_now > 0 else 0,
         })
 
     daily_candidates = defaultdict(list)
@@ -390,7 +425,7 @@ def strategy_peak_breakout(bars, code,
 
     filtered = []
     for date, cands in daily_candidates.items():
-        cands.sort(key=lambda c: (c["box_range_pct"], -c["vol_ratio"], abs(c.get("rsi", 50) - 50)))
+        cands.sort(key=lambda c: (-c["ma10_slope"], c["chg_20d"]))
         filtered.extend(cands[:top_per_day])
 
     trades = []
@@ -403,31 +438,36 @@ def strategy_peak_breakout(bars, code,
 
         trades.append({
             "code": code, "board": get_board_name(code),
-            "path": "box_breakout",
-            "path_label": "箱体回踩确认" if pullback_confirm else "箱体突破+MA60",
+            "path": "bottom_reversal",
+            "path_label": "底部弱转强",
             "signal_date": c["signal_date"], "signal_close": closes[c["idx"]],
-            "box_high": c["box_high"], "box_low": c["box_low"],
-            "box_range_pct": c["box_range_pct"], "box_days": c["box_days"],
-            "breakout_close": c["breakout_close"],
-            "vol_ratio_vs_pullback": c["vol_ratio"],
+            # 弱转强三日数据
+            "d2_date": c["d2_date"], "d1_date": c["d1_date"], "d0_date": c["d0_date"],
+            "d2_volume": c["d2_volume"], "d1_volume": c["d1_volume"], "d0_volume": c["d0_volume"],
+            "d2_chg": c["d2_chg"], "d1_chg": c["d1_chg"], "d0_chg": c["d0_chg"],
+            "vol_ratio_d0_d2": c["vol_ratio_d0_d2"],
+            # 前20日数据
+            "chg_20d": c["chg_20d"],
+            "low_20d": c["low_20d"], "high_20d": c["high_20d"],
+            "avg_vol_20": c["avg_vol_20"], "d2_vol_expand": c["d2_vol_expand"],
+            "box_high": c["high_20d"], "box_low": c["low_20d"], "box_range_pct": c["box_range"],
+            # MA指标
             "ma5_slope": c.get("ma5_slope", 0),
             "ma10_slope": c.get("ma10_slope", 0),
             "ma5_accel": c.get("ma5_accel", 0),
+            "ma60": c["ma60"], "ma60_slope": c.get("ma60_slope", 0), "ma_dispersion": c.get("ma_dispersion", 0),
+            "rsi": c.get("rsi", 0),
+            "close_vs_ma60": c["close_vs_ma60"],
+            # 市值和换手率
             "turnover": c.get("turnover", 0),
             "circ_mcap": c.get("circ_mcap", 0),
-            "ma60": c["ma60"], "rsi": c.get("rsi", 0),
-            "macd_hist": c.get("macd_hist", 0),
-            "close_vs_ma60": c["close_vs_ma60"],
+            "total_mcap": c.get("total_mcap", 0),
+            "circ_shares": c.get("circ_shares", 0),
+            "total_shares": c.get("total_shares", 0),
+            # 入场和出场
             "entry_date": c["entry_date"],
             "entry_price": round(c["entry_price"], 3),
-            "buy_mode": "pullback_confirm_next_open" if pullback_confirm else "box_breakout_next_open",
-            "neckline_high": c["box_high"], "neckline_gain_pct": c["box_range_pct"],
-            "first_trough_low": c["box_low"], "second_trough_low": c["box_low"],
-            "peak_high": c["box_high"], "peak_gain_pct": c["box_range_pct"],
-            "pullback_low": c["box_low"], "pullback_pct": 0,
-            "breakout_pct": round((c["breakout_close"] / c["box_high"] - 1) * 100, 2),
-            "accel_gain": 0, "accel_days": 0, "pullback_days": 0,
-            "wave1_days": 0, "wave2_days": 0, "wave3_days": 0, "wave_total_days": 0,
+            "buy_mode": "weak_to_strong_next_open",
             **result,
         })
 
@@ -505,23 +545,7 @@ TEST_CODES = [
     "002736","002739","002745","002756","002761","002791","002797",
     "002812","002821","002831","002841","002850","002867","002916",
     "002920","002926","002938","002945","002966","002984","003816",
-    # ── 创业板 (300/301) ── 少量活跃股
-    "300003","300009","300012","300014","300015","300017","300024",
-    "300027","300033","300037","300042","300044","300058","300059",
-    "300070","300072","300073","300078","300088","300098","300115",
-    "300118","300122","300124","300130","300133","300136","300140",
-    "300142","300144","300146","300152","300166","300168","300170",
-    "300171","300176","300182","300188","300197","300207","300212",
-    "300223","300226","300233","300236","300244","300251","300253",
-    "300257","300271","300274","300284","300285","300296","300308",
-    "300315","300316","300323","300324","300327","300347","300357",
-    "300363","300373","300376","300383","300390","300394","300395",
-    "300398","300408","300413","300418","300433","300438","300442",
-    "300450","300454","300457","300459","300474","300482","300487",
-    "300496","300498","300502","300529","300558","300568","300595",
-    "300601","300618","300628","300630","300661","300676","300699",
-    "300724","300750","300760","300763","300769","300773","300782",
-    "300832","300841","300861","300866","300888","300896","301269",
+    # ── 创业板/科创板已移除，仅保留主板 ──
 ]
 
 # ================================================================
@@ -550,17 +574,17 @@ def print_stats(trades, label):
 # 主流程
 # ================================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="箱体突破 + 站上MA60 策略 独立回测")
+    parser = argparse.ArgumentParser(description="底部震荡 + 弱转强 策略 独立回测")
     parser.add_argument("--codes", default="", help="逗号分隔的股票代码")
     parser.add_argument("--days", type=int, default=300, help="加载K线天数 (默认300)")
     parser.add_argument("--source", choices=["manual", "db"], default="manual",
                         help="数据源: manual(默认), db")
 
-    # 突破参数
-    parser.add_argument("--vol-expand-min", type=float, default=1.5,
-                        help="突破放量下限 (默认1.5)")
-    parser.add_argument("--vol-expand-max", type=float, default=3.0,
-                        help="突破放量上限 (默认3.0)")
+    # 弱转强参数
+    parser.add_argument("--vol-expand", type=float, default=1.3,
+                        help="D-2放量倍数 (默认1.3)")
+    parser.add_argument("--vol-shrink-ratio", type=float, default=0.8,
+                        help="D0/D1缩量比例 (默认0.8)")
 
     # 箱体参数
     parser.add_argument("--box-days", type=int, default=20,
@@ -568,39 +592,31 @@ if __name__ == "__main__":
     parser.add_argument("--box-max-range", type=float, default=15.0,
                         help="箱体最大振幅%% (默认15.0)")
     parser.add_argument("--box-min-range", type=float, default=0.0,
-                        help="箱体最小振幅%% (默认0, 建议8)")
-    parser.add_argument("--box-min-bars", type=int, default=10,
-                        help="箱体内最少K线数 (默认10)")
+                        help="箱体最小振幅%% (默认0)")
 
-    # 过滤参数
-    parser.add_argument("--require-ma60", action="store_true", default=False,
-                        help="要求站上60日均线 (默认关闭)")
-    parser.add_argument("--require-ma20-up", action="store_true", default=False,
-                        help="要求MA20向上 (默认关闭)")
-    parser.add_argument("--min-rsi", type=float, default=0,
-                        help="RSI下限 (默认0)")
-    parser.add_argument("--max-rsi", type=float, default=100,
-                        help="RSI上限 (默认100)")
-    parser.add_argument("--min-macd-hist", type=float, default=0,
-                        help="MACD柱最小值过滤 (默认0, 建议0.5)")
-    parser.add_argument("--pullback-confirm", action="store_true", default=False,
-                        help="启用突破后回踩确认模式 (默认关闭)")
-    parser.add_argument("--pullback-days", type=int, default=3,
-                        help="回踩确认天数 (默认3)")
-    parser.add_argument("--mid-term", action="store_true", default=False,
-                        help="中线模式: MA5/10斜率+换手率+MACD1~2+温和突破")
+    # MA参数
+    parser.add_argument("--min-ma10-slope", type=float, default=0.3,
+                        help="MA10斜率下限%%/天 (默认0.3)")
+    parser.add_argument("--min-ma60-slope", type=float, default=-0.3,
+                        help="MA60斜率下限%% (默认-0.3)")
+    parser.add_argument("--max-ma60-slope", type=float, default=0.3,
+                        help="MA60斜率上限%% (默认0.3)")
+    parser.add_argument("--max-ma-dispersion", type=float, default=5.0,
+                        help="三线离散度上限%% (默认5.0)")
+    parser.add_argument("--max-chg20d", type=float, default=12.0,
+                        help="20日涨幅上限%% (默认12.0)")
 
     # 出场参数
     parser.add_argument("--stop-loss", type=float, default=12.0,
-                        help="固定止损%% (默认5.0, 主板自动用8%%)")
+                        help="跟踪止损回撤%% (默认12.0)")
     parser.add_argument("--trailing-pct", type=float, default=5.0,
                         help="跟踪止损回撤%% (默认5.0)")
     parser.add_argument("--trailing-activate", type=float, default=5.0,
                         help="跟踪止损激活门槛%% (默认5.0)")
     parser.add_argument("--take-profit", type=float, default=15.0,
                         help="止盈%% (默认15.0)")
-    parser.add_argument("--max-hold", type=int, default=10,
-                        help="最大持仓天数 (默认15)")
+    parser.add_argument("--max-hold", type=int, default=30,
+                        help="最大持仓天数 (默认30)")
     parser.add_argument("--board-adaptive", action="store_true", default=True,
                         help="板块自适应参数 (默认开启)")
     parser.add_argument("--no-board-adaptive", action="store_false", dest="board_adaptive",
@@ -613,24 +629,6 @@ if __name__ == "__main__":
     parser.add_argument("--all-trades", action="store_true", help="打印全部交易明细")
     args = parser.parse_args()
 
-    # 中线模式参数 (基于1422笔原版数据分析)
-    if args.mid_term:
-        args.box_days = 15           # 箱体缩短
-        args.box_max_range = 15.0    # 振幅15% (数据:8~12%最佳)
-        args.box_min_range = 5.0     # 最小5%
-        args.require_ma60 = True
-        args.require_ma20_up = False
-        args.min_macd_hist = 1.0     # MACD柱1~2: 58.8%胜率
-        args.max_macd_hist = 2.0     # 上限2 (避免暴量)
-        args.min_rsi = 0
-        args.max_rsi = 100           # 不用RSI过滤
-        args.vol_expand_min = 1.5    # 放量1.5~2.5x (温和)
-        args.vol_expand_max = 2.5
-        args.max_hold = 10           # 持仓上限10天
-        args.stop_loss = 8.0         # 主板止损8%
-        args.trailing_pct = 5.0
-        args.take_profit = 15.0
-
     codes = [c.strip() for c in args.codes.split(",") if c.strip()] if args.codes else TEST_CODES
     use_db = args.source == "db"
 
@@ -640,33 +638,28 @@ if __name__ == "__main__":
         print(f"   全市场: {len(codes)} 只股票")
 
     print(f"{'=' * 80}")
-    print(f"箱体突破 + 站上MA60 策略 独立回测")
+    print(f"底部震荡 + 弱转强 策略 独立回测")
     print(f"{'=' * 80}")
     print(f"入场条件:")
-    print(f"  ① 箱体: {args.box_days}日内价格在区间震荡, 振幅{args.box_min_range}%~{args.box_max_range}%")
-    print(f"  ② 突破: 收盘价>箱体上沿, 收阳线")
-    if args.require_ma60:
-        print(f"  ③ MA60: 突破日收盘站上60日均线")
-    print(f"  ④ 放量: 突破日量>=区间均量x{args.vol_expand_min}")
-    if args.min_macd_hist > 0:
-        print(f"  ⑤ MACD柱>={args.min_macd_hist}")
-    if args.require_ma20_up:
-        print(f"  ⑥ MA20向上")
-    if args.min_rsi > 0 or args.max_rsi < 100:
-        print(f"  ⑦ RSI {args.min_rsi:.0f}-{args.max_rsi:.0f}")
-    if args.pullback_confirm:
-        print(f"  ⑧ 回踩确认: 突破后{args.pullback_days}天内不破箱体上沿")
+    print(f"  ① 弱转强信号: D-2放量上涨(>{args.vol_expand}x) → D-1缩量回调(<0.8x) → D0上涨(0.8-1.2x D0/D-1)")
+    print(f"  ② 底部确认: 前20日涨幅<{args.max_chg20d}%, 前20日振幅<{args.box_max_range}%")
+    print(f"  ③ MA10加速: 斜率>={args.min_ma10_slope}%")
+    print(f"  ④ MA20加速: 斜率>0且递增")
+    print(f"  ⑤ MA60走平: {args.min_ma60_slope}%~{args.max_ma60_slope}%")
+    print(f"  ⑥ 换手率: 2.5%~6%")
     print(f"出场条件:")
-    print(f"  ① 止盈: {args.take_profit}%")
-    print(f"  ② 止损: {args.stop_loss}%")
-    print(f"  ③ 跟踪止损: {args.trailing_pct}%（{args.trailing_activate}%后激活）")
-    print(f"  ④ 持仓上限: {args.max_hold}天")
+    print(f"  ① 峰值回撤12%出场")
+    print(f"  ② 持仓上限: {args.max_hold}天")
     print(f"股票: {len(codes)}只\n")
 
     all_trades = []
     success = 0
 
     for i, code in enumerate(codes):
+        # 屏蔽创业板/科创板
+        if code.startswith('300') or code.startswith('301') or code.startswith('688'):
+            continue
+
         bars = fetch_kline_db(code, args.days) if use_db else fetch_kline(code, args.days)
         if not bars:
             continue
@@ -678,28 +671,24 @@ if __name__ == "__main__":
         else:
             _stop_loss = args.stop_loss
 
-        trades = strategy_peak_breakout(
+        trades = strategy_bottom_reversal(
             bars, code,
             box_days=args.box_days,
             box_max_range=args.box_max_range,
             box_min_range=args.box_min_range,
-            box_min_bars=args.box_min_bars,
-            vol_expand_min=args.vol_expand_min,
-            vol_expand_max=args.vol_expand_max,
+            vol_expand=args.vol_expand,
+            vol_shrink_ratio=args.vol_shrink_ratio,
+            min_ma10_slope=args.min_ma10_slope,
+            min_ma60_slope=args.min_ma60_slope,
+            max_ma60_slope=args.max_ma60_slope,
+            max_ma_dispersion=args.max_ma_dispersion,
+            max_chg_20d=args.max_chg20d,
             stop_loss_pct=_stop_loss,
             trailing_pct=args.trailing_pct,
             trailing_activate_pct=args.trailing_activate,
             take_profit_pct=args.take_profit,
             max_hold_days=args.max_hold,
             top_per_day=args.top_per_day,
-            require_ma60=True,
-            require_ma20_up=args.require_ma20_up,
-            min_rsi=args.min_rsi,
-            max_rsi=args.max_rsi,
-            min_macd_hist=args.min_macd_hist,
-            max_macd_hist=getattr(args, "max_macd_hist", 100),
-            pullback_confirm=args.pullback_confirm,
-            pullback_days=args.pullback_days,
         )
 
         all_trades.extend(trades)
@@ -724,13 +713,6 @@ if __name__ == "__main__":
             if seg:
                 print_stats(seg, board)
 
-        # 按策略路径统计
-        print(f"\n--- 策略路径统计 ---")
-        for path_label in sorted(set(t.get('path_label', t.get('path', '')) for t in all_trades)):
-            seg = [t for t in all_trades if t.get('path_label', t.get('path', '')) == path_label]
-            if seg:
-                print_stats(seg, path_label)
-
         # 按出场原因统计
         print(f"\n--- 出场原因统计 ---")
         from collections import Counter
@@ -738,38 +720,19 @@ if __name__ == "__main__":
             seg = [t for t in all_trades if t['exit_reason'] == reason]
             print_stats(seg, reason)
 
-        # 按突破幅度分段
-        print(f"\n--- 突破幅度分段 ---")
-        for lo, hi in [(0, 1), (1, 3), (3, 5), (5, 100)]:
-            seg = [t for t in all_trades if lo <= t['breakout_pct'] < hi]
+        # 按20日涨幅分段
+        print(f"\n--- 20日涨幅分段 ---")
+        for lo, hi in [(-99, 0), (0, 5), (5, 10), (10, 15)]:
+            seg = [t for t in all_trades if lo <= t['chg_20d'] < hi]
             if seg:
-                print_stats(seg, f"突破[{lo},{hi})%")
-
-        # 按洗盘天数分段
-        print(f"\n--- 洗盘天数分段 ---")
-        for lo, hi in [(3, 8), (8, 12), (12, 20), (20, 100)]:
-            seg = [t for t in all_trades if lo <= t['pullback_days'] < hi]
-            if seg:
-                print_stats(seg, f"洗盘[{lo},{hi})天")
+                print_stats(seg, f"20日涨幅[{lo},{hi})%")
 
         # 按放量倍数分段
-        print(f"\n--- 放量倍数分段(相对洗盘期间) ---")
-        for lo, hi in [(1.0, 1.3), (1.3, 1.5), (1.5, 2.0), (2.0, 3.0)]:
-            seg = [t for t in all_trades if lo <= t['vol_ratio_vs_pullback'] < hi]
+        print(f"\n--- D0/D-2量比 ---")
+        for lo, hi in [(0, 0.5), (0.5, 0.8), (0.8, 1.0), (1.0, 1.5), (1.5, 2.0)]:
+            seg = [t for t in all_trades if lo <= t['vol_ratio_d0_d2'] < hi]
             if seg:
-                print_stats(seg, f"放量[{lo},{hi})x")
-
-        # MA5斜率
-        print(f"\n--- MA5斜率 ---")
-        for lo,hi,label in [(-99,0,'负'),(0,0.3,'缓'),(0.3,0.6,'中'),(0.6,99,'快')]:
-            ts=[t for t in all_trades if lo<=t.get('ma5_slope',0)<hi]
-            if ts: print_stats(ts, label)
-
-        # MA5加速度
-        print(f"\n--- MA5加速度 ---")
-        for lo,hi,label in [(-99,-0.1,'减速'),(-0.1,0.1,'平稳'),(0.1,0.3,'加速'),(0.3,99,'强加速')]:
-            ts=[t for t in all_trades if lo<=t.get('ma5_accel',0)<hi]
-            if ts: print_stats(ts, label)
+                print_stats(seg, f"量比[{lo},{hi})")
 
         # MA10斜率
         print(f"\n--- MA10斜率 ---")
@@ -777,35 +740,51 @@ if __name__ == "__main__":
             ts=[t for t in all_trades if lo<=t.get('ma10_slope',0)<hi]
             if ts: print_stats(ts, label)
 
-        # 流通市值
-        print(f"\n--- 流通市值 ---")
-        for lo,hi,label in [(0,50,'<50亿'),(50,100,'50~100亿'),(100,500,'100~500亿'),(500,2000,'500~2000亿')]:
-            ts=[t for t in all_trades if lo<=t.get('circ_mcap',0)<hi]
+        # MA60斜率
+        print(f"\n--- MA60斜率 ---")
+        for lo,hi,label in [(-99,-0.3,'弱下'),(-0.3,0,'走平'),(0,0.3,'弱上'),(0.3,99,'强上')]:
+            ts=[t for t in all_trades if lo<=t.get('ma60_slope',0)<hi]
+            if ts: print_stats(ts, label)
+
+        # 三线离散度
+        print(f"\n--- 三线离散度 ---")
+        for lo,hi,label in [(-99,0,'MA10<MA60'),(0,2,'粘合'),(2,5,'轻微'),(5,10,'中等')]:
+            ts=[t for t in all_trades if lo<=t.get('ma_dispersion',0)<hi]
             if ts: print_stats(ts, label)
 
         # 换手率
         print(f"\n--- 换手率 ---")
-        for lo,hi in [(0,2),(2,5),(5,10),(10,20),(20,100)]:
+        for lo,hi in [(2.5,3),(3,4),(4,5),(5,6)]:
             ts=[t for t in all_trades if lo<=t.get('turnover',0)<hi]
             if ts: print_stats(ts, f"[{lo},{hi})%")
+
+        # 流通市值
+        print(f"\n--- 流通市值 ---")
+        for lo,hi,label in [(0,30,'<30亿'),(30,100,'30~100亿'),(100,500,'100~500亿'),(500,9999,">500亿")]:
+            ts=[t for t in all_trades if lo<=t.get('circ_mcap',0)<hi]
+            if ts: print_stats(ts, label)
+
+        # 总市值
+        print(f"\n--- 总市值 ---")
+        for lo,hi,label in [(0,50,'<50亿'),(50,200,'50~200亿'),(200,1000,'200~1000亿'),(1000,9999,">1000亿")]:
+            ts=[t for t in all_trades if lo<=t.get('total_mcap',0)<hi]
+            if ts: print_stats(ts, label)
 
         # TOP N
         n = min(args.top, len(all_trades))
         print(f"\n--- TOP {n} 最佳交易 ---")
         for t in sorted(all_trades, key=lambda x: -x['return_pct'])[:n]:
             print(f"  {t['code']}({t['board']}) {t['signal_date']} "
-                  f"第一底{t['first_trough_low']} 颈线{t['neckline_high']} "
-                  f"第二底{t['second_trough_low']} "
-                  f"→ {t['entry_date']}买{t['entry_price']:>7.2f} "
-                  f"收益{t['return_pct']:+.2f}% 持仓{t['exit_day']}天")
+                  f"买{t['entry_price']:>7.2f} "
+                  f"收益{t['return_pct']:+.2f}% 均峰{t['peak_return_pct']:+.2f}% "
+                  f"持仓{t['exit_day']}天 {t['exit_reason']}")
 
         print(f"\n--- TOP {n} 最差交易 ---")
         for t in sorted(all_trades, key=lambda x: x['return_pct'])[:n]:
             print(f"  {t['code']}({t['board']}) {t['signal_date']} "
-                  f"第一底{t['first_trough_low']} 颈线{t['neckline_high']} "
-                  f"第二底{t['second_trough_low']} "
-                  f"→ {t['entry_date']}买{t['entry_price']:>7.2f} "
-                  f"收益{t['return_pct']:+.2f}% 持仓{t['exit_day']}天")
+                  f"买{t['entry_price']:>7.2f} "
+                  f"收益{t['return_pct']:+.2f}% 均峰{t['peak_return_pct']:+.2f}% "
+                  f"持仓{t['exit_day']}天 {t['exit_reason']}")
 
     # 保存JSON
     if all_trades:
