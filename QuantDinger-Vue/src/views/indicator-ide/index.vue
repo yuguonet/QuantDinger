@@ -1652,19 +1652,24 @@ export default {
       this.$nextTick(async () => {
         const chartWrapper = this.$refs.klineChartPro
         if (!chartWrapper) return
-        // 先移除旧的 Python 指标（不重建 Pro）
-        try { chartWrapper.removeIndicatorFromPro('candle_pane', 'selected-python-indicator', true) } catch (e) {}
-        // 如果有选中的指标，尝试添加
+        // 移除旧的 Python 指标 + 信号 overlay
+        // 用上一次的指标名来移除（klinecharts.removeIndicator 按 name 移除）
+        if (this._lastPythonIndicatorName) {
+          try { chartWrapper.removeIndicatorFromPro('candle_pane', this._lastPythonIndicatorName, true) } catch (e) {}
+        }
+        this._lastPythonIndicatorName = null
+        if (this._lastSignalOverlayIds && this._lastSignalOverlayIds.length) {
+          this._lastSignalOverlayIds.forEach(id => { try { chartWrapper.removeOverlay(id) } catch (e) {} })
+        }
+        this._lastSignalOverlayIds = []
+
         if (selectedIndicator && selectedIndicator.name) {
-          // 内置指标：Pro 自己管理
           const builtinIndicators = ['MA', 'EMA', 'SMA', 'BOLL', 'SAR', 'BBI', 'VOL', 'MACD', 'KDJ', 'RSI', 'BIAS', 'BRAR', 'CCI', 'DMI', 'CR', 'PSY', 'DMA', 'TRIX', 'OBV', 'VR', 'WR', 'MTM', 'EMV', 'ROC', 'PVT', 'AO']
           const name = selectedIndicator.name.toUpperCase()
           if (builtinIndicators.includes(name)) {
-            // Pro 内置指标，无需手动添加
+            // Pro 内置指标
           } else if (selectedIndicator.type === 'python' && selectedIndicator.code) {
-            // Python 指标：注册 → 注入 Pro → 异步计算 → 更新数据
             try {
-              // 等待 K 线数据加载完成
               let klineData = chartWrapper.cachedKlineData || []
               if (!klineData.length) {
                 for (let w = 0; w < 20; w++) {
@@ -1674,7 +1679,6 @@ export default {
                 }
               }
               if (klineData.length > 0 && chartWrapper.executePythonStrategy) {
-                // 异步执行 Python 计算
                 const result = await chartWrapper.executePythonStrategy(
                   selectedIndicator.code, klineData, selectedIndicator.params || {},
                   { ...selectedIndicator, userId: this.userId }
@@ -1684,6 +1688,7 @@ export default {
                   const allPlots = result.plots
                   const figures = []
                   const plotDataMap = {}
+                  const klineLen = klineData.length
 
                   for (let plotIdx = 0; plotIdx < allPlots.length; plotIdx++) {
                     const plot = allPlots[plotIdx]
@@ -1692,12 +1697,17 @@ export default {
                     const plotColor = plot.color || this.getIndicatorColor(plotIdx)
                     const figureType = plot.type || 'line'
                     figures.push({ key: figureKey, title: plot.name || plotName, type: figureType, color: plotColor })
-                    plotDataMap[figureKey] = plot.data
+                    // 对齐数据长度：Python 结果可能比 K 线短，补齐 null
+                    const raw = plot.data || []
+                    const aligned = new Array(klineLen)
+                    for (let i = 0; i < klineLen; i++) {
+                      aligned[i] = i < raw.length ? raw[i] : null
+                    }
+                    plotDataMap[figureKey] = aligned
                   }
 
                   const allOverlay = allPlots.every(plot => plot.overlay !== false)
 
-                  // 用闭包捕获 plotDataMap（与旧版 KlineChart.vue 一致）
                   const calcFunc = (dataList) => {
                     const resultArr = []
                     for (let i = 0; i < dataList.length; i++) {
@@ -1715,6 +1725,12 @@ export default {
                   chartWrapper.injectIndicatorToPro(selectedIndicator.name, true, {
                     id: 'selected-python-indicator'
                   })
+                  this._lastPythonIndicatorName = selectedIndicator.name
+
+                  // 渲染买卖信号 overlay
+                  if (result.signals && result.signals.length > 0) {
+                    this._renderSignalOverlays(chartWrapper, result.signals, klineData)
+                  }
                 }
               }
             } catch (e) {
@@ -1723,6 +1739,42 @@ export default {
           }
         }
       })
+    },
+
+    /** 渲染买卖信号为 K 线图上的 overlay 标记 */
+    _renderSignalOverlays (chartWrapper, signals, klineData) {
+      const addedIds = []
+      for (const signal of signals) {
+        if (!signal.data || !Array.isArray(signal.data)) continue
+        for (let i = 0; i < signal.data.length && i < klineData.length; i++) {
+          const point = signal.data[i]
+          if (!point || point === null) continue
+          const kline = klineData[i]
+          const timestamp = kline.timestamp
+          const isBuy = point.side === 'buy' || point.action === 'buy' || point > 0
+          const displayText = point.text || (isBuy ? 'B' : 'S')
+          const overlayId = chartWrapper.createOverlay({
+            name: 'simpleTag',
+            extendData: {
+              text: displayText,
+              color: isBuy ? '#f5222d' : '#52c41a',
+              side: isBuy ? 'buy' : 'sell',
+              price: point.price || kline.close
+            },
+            points: [{
+              timestamp: timestamp,
+              value: point.price || kline.close
+            }],
+            styles: {
+              line: { style: 'dashed', color: isBuy ? '#f5222d' : '#52c41a' },
+              text: { color: '#ffffff', backgroundColor: isBuy ? '#f5222d' : '#52c41a' }
+            },
+            lock: true
+          }, 'candle_pane')
+          if (overlayId) addedIds.push(overlayId)
+        }
+      }
+      this._lastSignalOverlayIds = addedIds
     },
     getIndicatorColor (idx) {
       if (this.isDarkTheme) {

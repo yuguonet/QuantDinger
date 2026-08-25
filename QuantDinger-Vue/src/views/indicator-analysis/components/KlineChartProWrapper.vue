@@ -423,10 +423,11 @@ json.dumps(output)
      *   2. 直接调 innerChart.createIndicator — 需要 innerChart
      */
     injectIndicatorToPro (name, isMainPane, options) {
-      // 方式 1：如果 innerChart 可用，直接创建
       if (this.innerChart) {
         try {
           const paneId = isMainPane ? 'candle_pane' : undefined
+          // 先移除同名旧指标（klinecharts 按 name 移除）
+          try { this.innerChart.removeIndicator(paneId || 'candle_pane', name) } catch (e) { /* ignore */ }
           const result = this.innerChart.createIndicator(
             { name, ...options },
             isMainPane,
@@ -463,18 +464,13 @@ json.dumps(output)
 
     /** 从 Pro 移除自定义指标 */
     removeIndicatorFromPro (paneId, name, noRebuild) {
-      // 从列表中移除
       this.currentMainIndicators = this.currentMainIndicators.filter(n => n !== name)
       this.currentSubIndicators = this.currentSubIndicators.filter(n => n !== name)
-      if (noRebuild) return
-      // 如果 innerChart 可用，直接移除
+      // 尝试从 chart 上直接移除
       if (this.innerChart) {
-        try {
-          this.innerChart.removeIndicator(paneId, name)
-          return
-        } catch (e) { /* ignore */ }
+        try { this.innerChart.removeIndicator(paneId, name) } catch (e) { /* ignore */ }
       }
-      // 否则重建 Pro
+      if (noRebuild) return
       this._rebuildPro()
     },
 

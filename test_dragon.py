@@ -510,7 +510,9 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
         if skip: continue
 
         # D+1数据 (用于过滤)
-        if pullback_end + 1 >= len(bars): continue
+        has_d1 = pullback_end + 1 < len(bars)
+        if not has_d1:
+            continue  # D1数据不存在，跳过
         d1 = bars[pullback_end + 1]
         d1_change = (d1['close'] / last_pb['close'] - 1) * 100
 
@@ -521,8 +523,6 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
             entry_date = last_pb['time']
         elif buy_mode == "next_open":
             # D0是信号日(缩量小阴), D0收盘确认信号, D1开盘买入
-            if pullback_end + 1 >= len(bars): continue
-            d1 = bars[pullback_end + 1]
             entry_price = d1['open']
             entry_idx = pullback_end + 1
             entry_date = d1['time']
@@ -647,106 +647,96 @@ def strategy_4in1(bars, code,
 
         trade = None
 
-        # ==================== 阶段1: V1 ====================
-        if d1_limit_up and d1_change >= vp['d1_min_change']:
-            # D0 上影线
-            upper_shadow = (bars[lu_idx]['high'] - lu_close) / lu_prev_close * 100
-            if upper_shadow >= vp['max_upper_shadow']:
-                pass  # V1条件不满足, 继续到下一阶段
+        # ==================== 阶段1: V1 (4因子版) ====================
+        # 因子1: 强趋势 20日涨>30%
+        ret_20d = 0
+        if lu_idx >= 20 and bars[lu_idx-20]['close'] > 0:
+            ret_20d = (lu_close / bars[lu_idx-20]['close'] - 1) * 100
+        if ret_20d < vp.get('ret_20d_min', 30.0):
+            pass  # V1条件不满足, 继续到下一阶段
+        else:
+            # 因子2: D-1回调 -10% ~ -3%
+            d_1 = bars[lu_idx - 1] if lu_idx > 0 else None
+            d_2 = bars[lu_idx - 2] if lu_idx > 1 else None
+            d_1_change = (d_1['close'] / d_2['close'] - 1) * 100 if d_1 and d_2 and d_2['close'] > 0 else 0
+            d_1_pullback_min = vp.get('d_1_pullback_min', -10.0)
+            d_1_pullback_max = vp.get('d_1_pullback_max', -3.0)
+            if d_1_change < d_1_pullback_min or d_1_change >= d_1_pullback_max:
+                pass
             else:
-                # D0 量比
-                vol_ratio = lu_vol / bars[lu_idx - 1]['volume'] if bars[lu_idx - 1]['volume'] > 0 else 0
-                if vol_ratio < vp['min_vol_ratio']:
+                # 因子3: OBV 5日趋势上升
+                obv_ok = True
+                if vp.get('obv_filter', True) and lu_idx >= 20:
+                    obv = 0; obv_list = []
+                    for j in range(max(0, lu_idx-20), lu_idx+1):
+                        if j > 0:
+                            if bars[j]['close'] > bars[j-1]['close']:
+                                obv += bars[j]['volume']
+                            elif bars[j]['close'] < bars[j-1]['close']:
+                                obv -= bars[j]['volume']
+                        obv_list.append(obv)
+                    if len(obv_list) >= 5 and obv_list[-1] - obv_list[-5] <= 0:
+                        obv_ok = False  # OBV下降, 资金流出
+                if not obv_ok:
                     pass
                 else:
-                    # D0 跳空
-                    d0_gap = (bars[lu_idx]['open'] / lu_prev_close - 1) * 100
-                    if d0_gap > vp['max_d0_gap']:
+                    # 因子4: D-1非放量 < 1.5x 5日均量
+                    vol_ok = True
+                    d_1_vol_max = vp.get('d_1_vol_max', 1.5)
+                    if lu_idx >= 6:
+                        vol_ma5_d1 = sum(bars[j]['volume'] for j in range(lu_idx-6, lu_idx-1)) / 5
+                        if vol_ma5_d1 > 0 and d_1['volume'] / vol_ma5_d1 >= d_1_vol_max:
+                            vol_ok = False  # D-1放量, 可能是出货
+                    if not vol_ok:
                         pass
                     else:
-                        # 4IN1: 不做前N日无涨停过滤, 连板的每个涨停日都走V1判断
-                        # EMA 趋势
-                        ema_ok = True
-                        if vp['use_ema_filter'] and lu_idx >= 20:
-                            closes = [bars[j]['close'] for j in range(lu_idx - 20, lu_idx + 1)]
-                            ema10 = ema(closes, 10)
-                            ema20 = ema(closes, 20)
-                            if ema10 and ema20 and ema10 <= ema20:
-                                ema_ok = False
-                        if not ema_ok:
-                            pass
-                        else:
-                            # RSI
-                            rsi_ok = True
-                            if vp['use_rsi_filter'] and lu_idx >= 15:
-                                closes = [bars[j]['close'] for j in range(lu_idx - 15, lu_idx + 1)]
-                                r = rsi(closes, 14)
-                                if r and (r <= 30 or r >= 70):
-                                    rsi_ok = False
-                            if not rsi_ok:
+                        # === V1 信号确认 ===
+                        if buy_mode == "signal_close":
+                            entry_price = lu_close
+                            entry_idx = lu_idx
+                            entry_date = bars[lu_idx]['time']
+                        else:  # next_open
+                            entry_price = d1['open']
+                            entry_idx = lu_idx + 1
+                            entry_date = d1['time']
+                            # D1过滤
+                            d1_gap = (d1['open'] / lu_close - 1) * 100 if lu_close > 0 else 0
+                            min_d1_gap = -3.0 if bt == "main" else -5.0
+                            if d1_gap < min_d1_gap:
                                 pass
+                            elif d1_change < 0:
+                                pass
+                            elif bt == "gem_star" and d1_gap >= 5.0:
+                                pass  # 创/科板高开追涨风险大
                             else:
-                                # 换手率
-                                tr_ok = True
-                                if stock_info and code in stock_info:
-                                    circ = stock_info[code]['circ_shares']
-                                    if circ > 0:
-                                        turnover = lu_vol / circ * 100
-                                        if turnover < vp['min_turnover'] or turnover > vp['max_turnover']:
-                                            tr_ok = False
-                                    else:
-                                        tr_ok = False
-                                if not tr_ok:
-                                    pass
-                                else:
-                                    # 板块效应
-                                    sec_ok = True
-                                    if sector_counts_by_date and stock_info and code in stock_info:
-                                        sc = sector_counts_by_date.get(bars[lu_idx]['time'], {})
-                                        sec_max = get_stock_sector_limit_count(code, stock_info, sc)
-                                        if sec_max < vp['min_sector_limits']:
-                                            sec_ok = False
-                                    if not sec_ok:
-                                        pass
-                                    else:
-                                        # === V1 信号确认 ===
-                                        if buy_mode == "signal_close":
-                                            entry_price = lu_close
-                                            entry_idx = lu_idx
-                                            entry_date = bars[lu_idx]['time']
-                                        else:  # next_open
-                                            entry_price = d1['open']
-                                            entry_idx = lu_idx + 1
-                                            entry_date = d1['time']
-
-                                        if entry_price > 0:
-                                            turnover_rate = 0.0
-                                            if stock_info and code in stock_info:
-                                                circ = stock_info[code]['circ_shares']
-                                                if circ > 0:
-                                                    turnover_rate = lu_vol / circ * 100
-
-                                            d1_gap_v1 = (d1['open'] / lu_close - 1) * 100 if lu_close > 0 else 0
-                                            result = run_backtest(
-                                                bars, entry_idx, entry_price,
-                                                vp['v1_hold_days'], vp['v1_stop_loss'],
-                                                vp['v1_trailing_stop'], bt,
-                                                is_v1=True, d1_limit_up=d1_limit_up, d1_change=d1_change, d1_gap=d1_gap_v1)
-                                            if result:
-                                                trade = {
-                                                    'code': code, 'board': get_board_name(code),
-                                                    'path': '4in1_v1', 'path_label': '4IN1-V1',
-                                                    'phase': 1, 'phase_label': 'V1',
-                                                    'd0_date': bars[lu_idx]['time'],
-                                                    'entry_date': entry_date,
-                                                    'entry_price': round(entry_price, 3),
-                                                    'buy_mode': buy_mode,
-                                                    'vol_ratio': round(vol_ratio, 2),
-                                                    'turnover_rate': round(turnover_rate, 2),
-                                                    'd0_gap': round(d0_gap, 2),
-                                                    'd1_change': round(d1_change, 2),
-                                                    **result,
-                                                }
+                                if entry_price > 0:
+                                    d1_gap_v1 = (d1['open'] / lu_close - 1) * 100 if lu_close > 0 else 0
+                                    d1_limit_up_val = is_limit_up(d1['close'], lu_close, bt)
+                                    result = run_backtest(
+                                        bars, entry_idx, entry_price,
+                                        vp['v1_hold_days'], vp['v1_stop_loss'],
+                                        vp['v1_trailing_stop'], bt,
+                                        is_v1=True, d1_limit_up=d1_limit_up_val, d1_change=d1_change, d1_gap=d1_gap_v1)
+                                    if result:
+                                        turnover_rate = 0.0
+                                        if stock_info and code in stock_info:
+                                            circ = stock_info[code]['circ_shares']
+                                            if circ > 0:
+                                                turnover_rate = lu_vol / circ * 100
+                                        trade = {
+                                            'code': code, 'board': get_board_name(code),
+                                            'path': '4in1_v1', 'path_label': '4IN1-V1',
+                                            'phase': 1, 'phase_label': 'V1',
+                                            'd0_date': bars[lu_idx]['time'],
+                                            'entry_date': entry_date,
+                                            'entry_price': round(entry_price, 3),
+                                            'buy_mode': buy_mode,
+                                            'ret_20d': round(ret_20d, 2),
+                                            'd_1_change': round(d_1_change, 2),
+                                            'd1_change': round(d1_change, 2),
+                                            'turnover_rate': round(turnover_rate, 2),
+                                            **result,
+                                        }
 
         # ==================== 阶段2: 断板 (D1~D2) ====================
         if trade is None and not d1_limit_up:
