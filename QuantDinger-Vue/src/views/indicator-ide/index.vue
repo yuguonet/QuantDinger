@@ -3,6 +3,54 @@
     <!-- Header toolbar -->
     <div class="ide-toolbar">
       <div class="toolbar-left">
+        <!-- Tab 切换按钮 -->
+        <div
+          v-for="tab in chartTabOptions"
+          :key="tab.key"
+          class="ide-toolbar-tab"
+          :class="{ active: activeChartTab === tab.key }"
+          @click="switchChartTab(tab.key)"
+        >
+          <a-icon :type="tab.icon" />
+          <span>{{ tab.label }}</span>
+          <a-tag v-if="tab.key === 'code' && codeDirty && !selectedIndicatorIsPurchased" color="orange" size="small" class="ide-toolbar-tab-badge">{{ $t('indicatorIde.modified') }}</a-tag>
+          <a-tag v-if="tab.key === 'code' && selectedIndicatorIsPurchased" color="purple" size="small" class="ide-toolbar-tab-badge">{{ $t('indicatorIde.purchasedReadOnlyTag') }}</a-tag>
+        </div>
+      </div>
+
+      <div class="toolbar-right">
+        <!-- 外置指标选择器 -->
+        <div class="ide-toolbar-ext-indicator">
+          <a-select
+            v-model="selectedIndicatorId"
+            size="small"
+            :placeholder="$t('backtest-center.indicator.selectIndicatorPlaceholder')"
+            :loading="loadingIndicators"
+            allow-clear
+            show-search
+            option-filter-prop="children"
+            @change="onIndicatorChange"
+          >
+            <a-select-option
+              v-for="ind in indicators"
+              :key="ind.id"
+              :value="ind.id"
+            >
+              <span>{{ ind.name || ('Indicator #' + ind.id) }}</span>
+              <a-tag v-if="Number(ind.is_buy) === 1" color="purple" size="small" style="margin-left: 6px;">{{ $t('indicatorIde.purchasedBadge') }}</a-tag>
+            </a-select-option>
+          </a-select>
+        </div>
+        <a-tooltip :title="$t('indicatorIde.toolbar.settings') || '设置'">
+          <a-button class="ide-toolbar-icon-btn" size="small" @click="openChartSettings">
+            <a-icon type="setting" />
+          </a-button>
+        </a-tooltip>
+        <a-tooltip :title="$t('indicatorIde.toolbar.fullscreen') || '全屏'">
+          <a-button class="ide-toolbar-icon-btn" size="small" @click="toggleFullscreen">
+            <a-icon :type="isFullscreen ? 'fullscreen-exit' : 'fullscreen'" />
+          </a-button>
+        </a-tooltip>
       </div>
     </div>
 
@@ -26,83 +74,101 @@
       <div class="ide-right">
         <!-- K线视窗 / 代码编辑器 / AI生成 tab 切换 -->
         <div class="ide-chart-area" :style="{ flex: 'none', height: chartPanelHeight + '%' }">
-          <div class="ide-chart-tabs">
-            <div
-              v-for="tab in chartTabOptions"
-              :key="tab.key"
-              class="ide-chart-tab"
-              :class="{ active: activeChartTab === tab.key }"
-              @click="switchChartTab(tab.key)"
-            >
-              <a-icon :type="tab.icon" />
-              <span>{{ tab.label }}</span>
-              <a-tag v-if="tab.key === 'code' && codeDirty && !selectedIndicatorIsPurchased" color="orange" size="small" class="ide-chart-tab-badge">{{ $t('indicatorIde.modified') }}</a-tag>
-              <a-tag v-if="tab.key === 'code' && selectedIndicatorIsPurchased" color="purple" size="small" class="ide-chart-tab-badge">{{ $t('indicatorIde.purchasedReadOnlyTag') }}</a-tag>
-            </div>
-            <!-- 指标选择 -->
-            <div class="ide-chart-tab-indicator">
-              <a-select
-                v-model="selectedIndicatorId"
-                size="small"
-                :placeholder="$t('backtest-center.indicator.selectIndicatorPlaceholder')"
-                :loading="loadingIndicators"
-                allow-clear
-                show-search
-                option-filter-prop="children"
-                @change="onIndicatorChange"
-              >
-                <a-select-option
-                  v-for="ind in indicators"
-                  :key="ind.id"
-                  :value="ind.id"
-                >
-                  <span>{{ ind.name || ('Indicator #' + ind.id) }}</span>
-                  <a-tag v-if="Number(ind.is_buy) === 1" color="purple" size="small" style="margin-left: 6px;">{{ $t('indicatorIde.purchasedBadge') }}</a-tag>
-                </a-select-option>
-              </a-select>
-            </div>
-            <!-- 代码编辑器操作按钮（仅代码tab激活时显示） -->
-            <div v-if="activeChartTab === 'code'" class="ide-chart-tab-actions">
-              <a-tooltip :title="$t('dashboard.indicator.create')">
-                <a-button size="small" :loading="creatingIndicator" @click="handleCreateIndicator"><a-icon type="plus" /></a-button>
-              </a-tooltip>
-              <a-tooltip :title="selectedIndicatorIsPurchased ? $t('indicatorIde.saveBlockedPurchased') : $t('indicatorIde.save')">
-                <a-button size="small" :disabled="!selectedIndicatorId || !codeDirty || selectedIndicatorIsPurchased" @click="saveIndicator"><a-icon type="save" /></a-button>
-              </a-tooltip>
-              <a-tooltip :title="selectedIndicatorIsPurchased ? $t('indicatorIde.deleteBlockedPurchased') : $t('dashboard.indicator.action.delete')">
-                <a-button size="small" :disabled="!selectedIndicatorId || selectedIndicatorIsPurchased" :loading="deletingIndicator" @click="handleDeleteIndicator"><a-icon type="delete" /></a-button>
-              </a-tooltip>
-              <a-tooltip :title="selectedIndicatorIsPurchased ? $t('indicatorIde.publishBlockedPurchased') : $t('dashboard.indicator.action.publish')">
-                <a-button size="small" :disabled="!selectedIndicatorId || selectedIndicatorIsPurchased" @click="handlePublishIndicator"><a-icon type="cloud-upload" /></a-button>
-              </a-tooltip>
-              <a-tooltip :title="$t('dashboard.indicator.action.createStrategy')">
-                <a-button size="small" :disabled="!selectedIndicatorId" @click="handleCreateStrategyFromIndicator"><a-icon type="deployment-unit" /></a-button>
-              </a-tooltip>
-              <a-tooltip :title="$t('indicatorIde.saveAsNew')">
-                <a-button size="small" :disabled="!userId || !currentCode" @click="openSaveAsIndicatorModal"><a-icon type="copy" /></a-button>
-              </a-tooltip>
-              <a-tooltip :title="chartIndicatorRunning ? $t('indicatorIde.stopIndicatorOnChart') : $t('indicatorIde.runIndicatorOnChart')">
-                <a-button size="small" :disabled="chartIndicatorToggleDisabled" @click="toggleChartIndicatorRun">
-                  <a-icon :type="chartIndicatorRunning ? 'pause-circle' : 'play-circle'" />
-                </a-button>
-              </a-tooltip>
-            </div>
-          </div>
-
           <!-- K线图 -->
           <div v-show="activeChartTab === 'chart'" class="ide-chart-tab-content">
-            <kline-chart-pro-wrapper
-              v-if="symbol"
-              ref="klineChartPro"
+            <!-- 蜡烛图区域内工具栏：K线周期 + fx内置指标按钮 -->
+            <div class="ide-chart-toolbar">
+              <div class="ide-chart-toolbar-tf">
+                <span class="ide-chart-toolbar-label">K线周期</span>
+                <a-radio-group
+                  v-model="timeframe"
+                  button-style="solid"
+                  size="small"
+                  class="tf-group ide-tf-seg"
+                >
+                  <a-radio-button v-for="tf in timeframeOptions" :key="tf" :value="tf">{{ tf }}</a-radio-button>
+                </a-radio-group>
+              </div>
+              <a-popover
+                v-model="indicatorPopoverVisible"
+                trigger="click"
+                placement="bottomLeft"
+                overlay-class-name="indicator-checkbox-popover"
+              >
+                <template slot="content">
+                  <div class="indicator-popover-header">
+                    <a-input
+                      v-model="indicatorSearchText"
+                      size="small"
+                      :placeholder="$t('common.search') || '搜索指标...'"
+                      allow-clear
+                      class="indicator-popover-search"
+                    />
+                  </div>
+                  <div class="indicator-popover-list">
+                    <div
+                      v-for="ind in filteredBuiltinIndicators"
+                      :key="ind.id"
+                      class="indicator-popover-item"
+                      :class="{ 'indicator-popover-item--active': isBuiltinIndicatorActive(ind.id) }"
+                      @click="toggleBuiltinIndicator(ind)"
+                    >
+                      <a-checkbox :checked="isBuiltinIndicatorActive(ind.id)" @click.stop="toggleBuiltinIndicator(ind)">
+                        <span>{{ ind.shortName }}</span>
+                        <span class="indicator-popover-item-name">{{ ind.name }}</span>
+                      </a-checkbox>
+                    </div>
+                  </div>
+                </template>
+                <a-button size="small" class="indicator-popover-trigger">
+                  <span>fx</span>
+                  <a-icon type="down" style="font-size: 10px; margin-left: 2px;" />
+                </a-button>
+              </a-popover>
+            </div>
+            <kline-chart
+              ref="klineChart"
               :symbol="symbol"
               :market="market"
               :timeframe="timeframe"
               :theme="chartTheme"
-              locale="zh-CN"
+              :activeIndicators="activeIndicators"
+              :userId="userId"
+              :realtime-enabled="klineRealtimeEnabled"
+              :showIndicatorBar="true"
+              @indicator-toggle="handleIndicatorToggle"
             />
-            <div v-else class="result-empty">
-              <a-icon type="stock" style="font-size: 48px; color: #d9d9d9;" />
-              <p>{{ $t('indicatorIde.emptyHint') || '请先选择标的' }}</p>
+          </div>
+
+          <!-- 代码编辑器 -->
+          <div v-show="activeChartTab === 'code'" class="ide-chart-tab-content ide-code-tab-content">
+            <!-- 代码编辑器操作按钮 -->
+            <div class="ide-code-toolbar">
+              <div class="ide-code-toolbar-actions">
+                <a-tooltip :title="$t('dashboard.indicator.create')">
+                  <a-button size="small" :loading="creatingIndicator" @click="handleCreateIndicator"><a-icon type="plus" /></a-button>
+                </a-tooltip>
+                <a-tooltip :title="selectedIndicatorIsPurchased ? $t('indicatorIde.saveBlockedPurchased') : $t('indicatorIde.save')">
+                  <a-button size="small" :disabled="!selectedIndicatorId || !codeDirty || selectedIndicatorIsPurchased" @click="saveIndicator"><a-icon type="save" /></a-button>
+                </a-tooltip>
+                <a-tooltip :title="selectedIndicatorIsPurchased ? $t('indicatorIde.deleteBlockedPurchased') : $t('dashboard.indicator.action.delete')">
+                  <a-button size="small" :disabled="!selectedIndicatorId || selectedIndicatorIsPurchased" :loading="deletingIndicator" @click="handleDeleteIndicator"><a-icon type="delete" /></a-button>
+                </a-tooltip>
+                <a-tooltip :title="selectedIndicatorIsPurchased ? $t('indicatorIde.publishBlockedPurchased') : $t('dashboard.indicator.action.publish')">
+                  <a-button size="small" :disabled="!selectedIndicatorId || selectedIndicatorIsPurchased" @click="handlePublishIndicator"><a-icon type="cloud-upload" /></a-button>
+                </a-tooltip>
+                <a-tooltip :title="$t('dashboard.indicator.action.createStrategy')">
+                  <a-button size="small" :disabled="!selectedIndicatorId" @click="handleCreateStrategyFromIndicator"><a-icon type="deployment-unit" /></a-button>
+                </a-tooltip>
+                <a-tooltip :title="$t('indicatorIde.saveAsNew')">
+                  <a-button size="small" :disabled="!userId || !currentCode" @click="openSaveAsIndicatorModal"><a-icon type="copy" /></a-button>
+                </a-tooltip>
+                <a-tooltip :title="chartIndicatorRunning ? $t('indicatorIde.stopIndicatorOnChart') : $t('indicatorIde.runIndicatorOnChart')">
+                  <a-button size="small" :disabled="chartIndicatorToggleDisabled" @click="toggleChartIndicatorRun">
+                    <a-icon :type="chartIndicatorRunning ? 'pause-circle' : 'play-circle'" />
+                  </a-button>
+                </a-tooltip>
+              </div>
             </div>
           </div>
 
@@ -329,6 +395,7 @@
                     <div class="param-strategy-hint" style="display: none;">止损、止盈、仓位与追踪止损等请在代码中用 # @strategy 声明；成交时机固定为下一根 K 线开盘（贴近实盘）。</div>
                   </div>
                 </div>
+              </div>
               </div>
             </a-tab-pane>
 
@@ -745,36 +812,6 @@
           </a-tabs>
         </div>
       </div>
-
-      <!-- 闪电交易：与左侧代码区相同，主布局内右侧抽拉（非全屏悬浮） -->
-      <div v-show="quickTradeDrawerVisible" class="ide-quick-right">
-        <div class="ide-quick-panel-head">
-          <span class="ide-quick-panel-head-title">
-            <a-icon type="thunderbolt" theme="filled" class="ide-quick-panel-head-icon" />
-            {{ $t('quickTrade.title') }}
-          </span>
-          <a-button type="link" size="small" class="ide-quick-panel-close" @click="closeQuickTradeDrawer">
-            <a-icon type="close" />
-          </a-button>
-        </div>
-        <div class="ide-quick-panel-body">
-          <quick-trade-panel
-            key="ide-embedded-qt"
-            embedded
-            embedded-ide
-            :visible="true"
-            :symbol="qtSymbol"
-            :market="market"
-            :preset-side="qtSide"
-            :preset-price="qtPrice"
-            source="indicator"
-            market-type="swap"
-            @order-success="onQuickTradeSuccess"
-            @update:symbol="handleQuickTradeSymbolChange"
-          />
-        </div>
-      </div>
-
     </div>
 
     <!-- Add symbol modal -->
@@ -923,9 +960,7 @@ import request from '@/utils/request'
 import { getUserInfo } from '@/api/login'
 import { getWatchlist, addWatchlist, searchSymbols } from '@/api/market'
 import KlineChart from '@/views/indicator-analysis/components/KlineChart.vue'
-import KlineChartProWrapper from '@/views/indicator-analysis/components/KlineChartProWrapper.vue'
 import BacktestHistoryDrawer from '@/views/indicator-analysis/components/BacktestHistoryDrawer.vue'
-import QuickTradePanel from '@/components/QuickTradePanel/QuickTradePanel'
 import WatchlistPanel from '@/components/WatchlistPanel'
 import { Modal } from 'ant-design-vue'
 
@@ -971,7 +1006,7 @@ function ideUiCacheStorageKey (userId) {
 export default {
   name: 'IndicatorIDE',
   mixins: [baseMixin],
-  components: { KlineChart, KlineChartProWrapper, BacktestHistoryDrawer, QuickTradePanel, WatchlistPanel },
+  components: { KlineChart, BacktestHistoryDrawer, WatchlistPanel },
   data () {
     return {
       userId: null,
@@ -1021,7 +1056,26 @@ export default {
       /** 是否在 K 线图上运行当前指标（关闭后仅保留 K 线，不计算/绘制指标） */
       chartIndicatorRunning: true,
       resultTab: 'params',
-      quickTradeDrawerVisible: false,
+      indicatorPopoverVisible: false,
+      indicatorSearchText: '',
+      isFullscreen: false,
+      /** 内置技术指标列表（与 KlineChart indicatorButtons 一致） */
+      builtinIndicators: [
+        { id: 'sma', name: '简单移动平均', shortName: 'SMA' },
+        { id: 'ema', name: '指数移动平均', shortName: 'EMA' },
+        { id: 'rsi', name: '相对强弱指标', shortName: 'RSI' },
+        { id: 'macd', name: 'MACD', shortName: 'MACD' },
+        { id: 'bb', name: '布林带', shortName: 'BB' },
+        { id: 'atr', name: '平均真实波幅', shortName: 'ATR' },
+        { id: 'cci', name: '商品通道指数', shortName: 'CCI' },
+        { id: 'williams', name: '威廉指标', shortName: 'W%R' },
+        { id: 'mfi', name: '资金流量指标', shortName: 'MFI' },
+        { id: 'adx', name: '平均趋向指数', shortName: 'ADX' },
+        { id: 'obv', name: '能量潮', shortName: 'OBV' },
+        { id: 'adosc', name: '积累/派发振荡器', shortName: 'ADOSC' },
+        { id: 'ad', name: '积累/派发线', shortName: 'AD' },
+        { id: 'kdj', name: 'KDJ 随机指标', shortName: 'KDJ' }
+      ],
 
       // AI generation
       aiPanelExpanded: true,
@@ -1057,12 +1111,6 @@ export default {
       experimentLiveHint: '',
       lastAppliedExperimentCandidateName: '',
       lastAppliedExperimentChanges: [],
-
-      // Quick Trade drawer reuse
-      qtSymbol: '',
-      qtSide: '',
-      qtPrice: 0,
-
       creatingIndicator: false,
       deletingIndicator: false,
       showPublishModal: false,
@@ -1144,6 +1192,15 @@ export default {
     },
     tfMaxDays () {
       return TF_MAX_DAYS[this.timeframe] || 3650
+    },
+    /** 根据搜索文本过滤内置指标列表 */
+    filteredBuiltinIndicators () {
+      const q = (this.indicatorSearchText || '').toLowerCase().trim()
+      if (!q) return this.builtinIndicators
+      return this.builtinIndicators.filter(ind =>
+        ind.shortName.toLowerCase().includes(q) ||
+        ind.name.toLowerCase().includes(q)
+      )
     },
     filteredDatePresets () {
       return DATE_PRESETS.filter(p => p.days <= this.tfMaxDays)
@@ -1368,6 +1425,12 @@ export default {
       this.initCodeMirror()
       this.ensureChartReady()
     })
+    // 监听全屏状态变化
+    this._onFullscreenChange = () => {
+      this.isFullscreen = !!(document.fullscreenElement || document.webkitFullscreenElement)
+    }
+    document.addEventListener('fullscreenchange', this._onFullscreenChange)
+    document.addEventListener('webkitfullscreenchange', this._onFullscreenChange)
   },
   activated () {
     // keep-alive: 从其它页面切回来时，重新绑定 resize 监听
@@ -1396,6 +1459,8 @@ export default {
     window.removeEventListener('resize', this._onResize)
   },
   beforeDestroy () {
+    document.removeEventListener('fullscreenchange', this._onFullscreenChange)
+    document.removeEventListener('webkitfullscreenchange', this._onFullscreenChange)
     if (this._persistIdeUiTimer) {
       clearTimeout(this._persistIdeUiTimer)
       this._persistIdeUiTimer = null
@@ -1462,14 +1527,12 @@ export default {
         if (s.market && s.symbol) {
           this.market = String(s.market)
           this.symbol = String(s.symbol)
-          this.qtSymbol = String(s.market) === 'Crypto' ? this.symbol : ''
           this.selectedWatchlistKey = `${this.market}:${this.symbol}`
         } else if (s.selectedWatchlistKey && typeof s.selectedWatchlistKey === 'string') {
           const [m, sym] = s.selectedWatchlistKey.split(':')
           if (m && sym) {
             this.market = m
             this.symbol = sym
-            this.qtSymbol = m === 'Crypto' ? sym : ''
             this.selectedWatchlistKey = s.selectedWatchlistKey
           }
         }
@@ -1557,8 +1620,14 @@ export default {
     ensureChartReady () {
       this.$nextTick(() => {
         setTimeout(() => {
-          const chartWrapper = this.$refs.klineChartPro
-          if (!chartWrapper || !this.symbol) return
+          const chart = this.$refs.klineChart
+          if (!chart || !this.symbol) return
+          if (!chart.chartRef && typeof chart.initChart === 'function') {
+            chart.initChart()
+          }
+          if (typeof chart.loadKlineData === 'function') {
+            chart.loadKlineData()
+          }
           if (this.selectedIndicatorId) {
             this.syncSelectedIndicatorToChart()
           }
@@ -1629,15 +1698,24 @@ export default {
     buildSelectedIndicatorForChart (codeOverride) {
       const ind = this.selectedIndicatorObj
       if (!ind) return null
+      const chart = this.$refs.klineChart
       const code = typeof codeOverride === 'string' ? codeOverride : (this.currentCode || ind.code || '')
-      if (!code) return null
+      if (!code || !chart || typeof chart.executePythonStrategy !== 'function') return null
       return {
         ...ind,
         id: 'selected-python-indicator',
         originalId: ind.id,
         type: 'python',
         code,
-        params: {}
+        params: {},
+        calculate: async (klineData, params = {}) => {
+          return chart.executePythonStrategy(code, klineData, params, {
+            ...ind,
+            originalId: ind.id,
+            id: ind.id,
+            userId: this.userId
+          })
+        }
       }
     },
     syncSelectedIndicatorToChart (codeOverride) {
@@ -1649,139 +1727,12 @@ export default {
       this.activeIndicators = selectedIndicator
         ? [...nonSelectedIndicators, selectedIndicator]
         : nonSelectedIndicators
-      this.$nextTick(async () => {
-        const chartWrapper = this.$refs.klineChartPro
-        if (!chartWrapper) return
-        // 移除旧的 Python 指标 + 信号 overlay
-        // 用上一次的指标名来移除（klinecharts.removeIndicator 按 name 移除）
-        if (this._lastPythonIndicatorName) {
-          try { chartWrapper.removeIndicatorFromPro('candle_pane', this._lastPythonIndicatorName, true) } catch (e) {}
-        }
-        this._lastPythonIndicatorName = null
-        if (this._lastSignalOverlayIds && this._lastSignalOverlayIds.length) {
-          this._lastSignalOverlayIds.forEach(id => { try { chartWrapper.removeOverlay(id) } catch (e) {} })
-        }
-        this._lastSignalOverlayIds = []
-
-        if (selectedIndicator && selectedIndicator.name) {
-          const builtinIndicators = ['MA', 'EMA', 'SMA', 'BOLL', 'SAR', 'BBI', 'VOL', 'MACD', 'KDJ', 'RSI', 'BIAS', 'BRAR', 'CCI', 'DMI', 'CR', 'PSY', 'DMA', 'TRIX', 'OBV', 'VR', 'WR', 'MTM', 'EMV', 'ROC', 'PVT', 'AO']
-          const name = selectedIndicator.name.toUpperCase()
-          if (builtinIndicators.includes(name)) {
-            // Pro 内置指标
-          } else if (selectedIndicator.type === 'python' && selectedIndicator.code) {
-            try {
-              let klineData = chartWrapper.cachedKlineData || []
-              if (!klineData.length) {
-                for (let w = 0; w < 20; w++) {
-                  await new Promise(resolve => setTimeout(resolve, 250))
-                  klineData = chartWrapper.cachedKlineData || []
-                  if (klineData.length) break
-                }
-              }
-              if (klineData.length > 0 && chartWrapper.executePythonStrategy) {
-                const result = await chartWrapper.executePythonStrategy(
-                  selectedIndicator.code, klineData, selectedIndicator.params || {},
-                  { ...selectedIndicator, userId: this.userId }
-                )
-
-                if (result && result.plots && result.plots.length > 0) {
-                  const allPlots = result.plots
-                  const figures = []
-                  const plotDataMap = {}
-                  const klineLen = klineData.length
-
-                  for (let plotIdx = 0; plotIdx < allPlots.length; plotIdx++) {
-                    const plot = allPlots[plotIdx]
-                    const plotName = plot.name || `PLOT_${plotIdx}`
-                    const figureKey = plotName.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '_')
-                    const plotColor = plot.color || this.getIndicatorColor(plotIdx)
-                    const figureType = plot.type || 'line'
-                    figures.push({ key: figureKey, title: plot.name || plotName, type: figureType, color: plotColor })
-                    // 对齐数据长度：Python 结果可能比 K 线短，补齐 null
-                    const raw = plot.data || []
-                    const aligned = new Array(klineLen)
-                    for (let i = 0; i < klineLen; i++) {
-                      aligned[i] = i < raw.length ? raw[i] : null
-                    }
-                    plotDataMap[figureKey] = aligned
-                  }
-
-                  const allOverlay = allPlots.every(plot => plot.overlay !== false)
-
-                  const calcFunc = (dataList) => {
-                    const resultArr = []
-                    for (let i = 0; i < dataList.length; i++) {
-                      const dataPoint = {}
-                      for (const figureKey in plotDataMap) {
-                        const plotData = plotDataMap[figureKey]
-                        dataPoint[figureKey] = i < plotData.length ? plotData[i] : null
-                      }
-                      resultArr.push(dataPoint)
-                    }
-                    return resultArr
-                  }
-
-                  chartWrapper.registerCustomIndicator(selectedIndicator.name, calcFunc, figures, [], 2, allOverlay)
-                  chartWrapper.injectIndicatorToPro(selectedIndicator.name, true, {
-                    id: 'selected-python-indicator'
-                  })
-                  this._lastPythonIndicatorName = selectedIndicator.name
-
-                  // 渲染买卖信号 overlay
-                  if (result.signals && result.signals.length > 0) {
-                    this._renderSignalOverlays(chartWrapper, result.signals, klineData)
-                  }
-                }
-              }
-            } catch (e) {
-              console.warn('Python indicator execution failed:', e)
-            }
-          }
+      this.$nextTick(() => {
+        const chart = this.$refs.klineChart
+        if (chart && typeof chart.updateIndicators === 'function') {
+          chart.updateIndicators()
         }
       })
-    },
-
-    /** 渲染买卖信号为 K 线图上的 overlay 标记 */
-    _renderSignalOverlays (chartWrapper, signals, klineData) {
-      const addedIds = []
-      for (const signal of signals) {
-        if (!signal.data || !Array.isArray(signal.data)) continue
-        for (let i = 0; i < signal.data.length && i < klineData.length; i++) {
-          const point = signal.data[i]
-          if (!point || point === null) continue
-          const kline = klineData[i]
-          const timestamp = kline.timestamp
-          const isBuy = point.side === 'buy' || point.action === 'buy' || point > 0
-          const displayText = point.text || (isBuy ? 'B' : 'S')
-          const overlayId = chartWrapper.createOverlay({
-            name: 'simpleTag',
-            extendData: {
-              text: displayText,
-              color: isBuy ? '#f5222d' : '#52c41a',
-              side: isBuy ? 'buy' : 'sell',
-              price: point.price || kline.close
-            },
-            points: [{
-              timestamp: timestamp,
-              value: point.price || kline.close
-            }],
-            styles: {
-              line: { style: 'dashed', color: isBuy ? '#f5222d' : '#52c41a' },
-              text: { color: '#ffffff', backgroundColor: isBuy ? '#f5222d' : '#52c41a' }
-            },
-            lock: true
-          }, 'candle_pane')
-          if (overlayId) addedIds.push(overlayId)
-        }
-      }
-      this._lastSignalOverlayIds = addedIds
-    },
-    getIndicatorColor (idx) {
-      if (this.isDarkTheme) {
-        return ['#13c2c2', '#e040fb', '#ffeb3b', '#00e676', '#ff6d00', '#9c27b0'][idx % 6]
-      } else {
-        return ['#13c2c2', '#9c27b0', '#f57c00', '#1976d2', '#c2185b', '#7b1fa2'][idx % 6]
-      }
     },
     toggleChartIndicatorRun () {
       if (!this.chartIndicatorRunning && this.chartIndicatorToggleDisabled) return
@@ -1793,8 +1744,8 @@ export default {
       this.activeChartTab = tabKey
       this.$nextTick(() => {
         if (tabKey === 'chart') {
-          const chartWrapper = this.$refs.klineChartPro
-          if (chartWrapper && typeof chartWrapper.resize === 'function') chartWrapper.resize()
+          const chart = this.$refs.klineChart
+          if (chart && typeof chart.resize === 'function') chart.resize()
           this.ensureChartReady()
         } else if (tabKey === 'code') {
           if (this.cmInstance) this.cmInstance.refresh()
@@ -1880,21 +1831,23 @@ export default {
     },
     clearBacktestSignalOverlays (opts = {}) {
       const silent = !!(opts && opts.silent)
-      const chartWrapper = this.$refs.klineChartPro
-      if (!chartWrapper) {
+      const chart = this.$refs.klineChart
+      if (!chart || !chart.chartRef) {
         if (!silent) this.$message.info(this.$t('indicatorIde.clearSignalsNoChart'))
         return
       }
-      const chart = chartWrapper.getChart ? chartWrapper.getChart() : null
-      if (chart) {
-        try {
-          const overlays = chart.getOverlays ? chart.getOverlays() : []
-          if (overlays && overlays.length) {
-            overlays.forEach(o => {
-              try { chart.removeOverlay(o.id) } catch (e) {}
-            })
-          }
-        } catch (e) {}
+      const chartInstance = chart.chartRef
+      if (chart.addedSignalOverlayIds && chart.addedSignalOverlayIds.length) {
+        chart.addedSignalOverlayIds.forEach(id => {
+          try {
+            if (typeof chartInstance.removeOverlay === 'function') chartInstance.removeOverlay(id)
+          } catch (_) {}
+        })
+        chart.addedSignalOverlayIds = []
+      }
+      // Re-render indicator signals after clearing backtest overlays
+      if (!silent && typeof chart.updateIndicators === 'function') {
+        chart.updateIndicators()
       }
       if (!silent) this.$message.success(this.$t('indicatorIde.clearSignalsDone'))
     },
@@ -2907,12 +2860,17 @@ export default {
     renderBacktestSignals () {
       const trades = (this.result && this.result.trades) || []
       if (!trades.length) return
-      const chartWrapper = this.$refs.klineChartPro
-      if (!chartWrapper) return
-      const chartInstance = chartWrapper.getChart ? chartWrapper.getChart() : null
-      if (!chartInstance) return
+      const chart = this.$refs.klineChart
+      if (!chart || !chart.chartRef) return
+      const chartInstance = chart.chartRef
 
       this.clearBacktestSignalOverlays({ silent: true })
+
+      // Hide indicator raw signals to avoid duplicate markers
+      // (indicator signals at bar i vs backtest trades at bar i+1)
+      if (typeof chart.hideIndicatorSignals === 'function') {
+        chart.hideIndicatorSignals()
+      }
 
       // Build sorted kline timestamp array for snap matching
       const klineData = (typeof chartInstance.getDataList === 'function') ? chartInstance.getDataList() : []
@@ -2969,7 +2927,7 @@ export default {
 
         try {
           if (typeof chartInstance.createOverlay === 'function') {
-            chartInstance.createOverlay({
+            const overlayId = chartInstance.createOverlay({
               name: 'signalTag',
               points: [
                 { timestamp, value: price },
@@ -2984,6 +2942,9 @@ export default {
               },
               lock: true
             }, 'candle_pane')
+            if (overlayId && chart.addedSignalOverlayIds) {
+              chart.addedSignalOverlayIds.push(overlayId)
+            }
           }
         } catch (_) {}
       }
@@ -3248,35 +3209,37 @@ export default {
       this.$nextTick(() => { this.aiOptimizing = false })
     },
 
-    // ===== Quick Trade =====
-    toggleQuickTradeDrawer () {
-      if (!this.quickTradeDrawerVisible && this.market !== 'Crypto') {
-        this.$message.warning(this.$t('quickTrade.cryptoOnly'))
-        return
+    // ===== Settings & Fullscreen =====
+    openChartSettings () {
+      // 打开图表个性化设置弹窗（主题、颜色方案等）
+      const chart = this.$refs.klineChart
+      if (chart && typeof chart.openSettings === 'function') {
+        chart.openSettings()
+      } else {
+        this.$message.info(this.$t('indicatorIde.settingsNotAvailable') || '图表设置功能开发中')
       }
-      this.quickTradeDrawerVisible = !this.quickTradeDrawerVisible
     },
-    closeQuickTradeDrawer () {
-      this.quickTradeDrawerVisible = false
-    },
-    openQuickTrade () {
-      if (this.market !== 'Crypto') {
-        this.$message.warning(this.$t('quickTrade.cryptoOnly'))
-        return
+    toggleFullscreen () {
+      const el = this.$el
+      if (!document.fullscreenElement) {
+        (el.requestFullscreen || el.webkitRequestFullscreen || el.mozRequestFullScreen || el.msRequestFullscreen).call(el)
+        this.isFullscreen = true
+      } else {
+        (document.exitFullscreen || document.webkitExitFullscreen || document.mozCancelFullScreen || document.msExitFullscreen).call(document)
+        this.isFullscreen = false
       }
-      this.qtSymbol = this.symbol || ''
-      const trades = (this.result && this.result.trades) || []
-      const latestTrade = trades.length ? trades[trades.length - 1] : null
-      this.qtPrice = latestTrade && latestTrade.price ? Number(latestTrade.price) : 0
-      this.qtSide = ''
-      this.quickTradeDrawerVisible = true
     },
-    onQuickTradeSuccess () {
-      this.$message.success(this.$t('quickTrade.orderSuccess'))
+    /** 判断内置指标是否已激活 */
+    isBuiltinIndicatorActive (indicatorId) {
+      return this.activeIndicators.some(ind => ind.id === indicatorId)
     },
-    handleQuickTradeSymbolChange (newSymbol) {
-      if (newSymbol && this.market === 'Crypto') {
-        this.qtSymbol = newSymbol
+    /** 切换内置指标的显示/隐藏 */
+    toggleBuiltinIndicator (indicator) {
+      const isActive = this.isBuiltinIndicatorActive(indicator.id)
+      if (isActive) {
+        this.handleIndicatorToggle({ action: 'remove', indicator: { id: indicator.id } })
+      } else {
+        this.handleIndicatorToggle({ action: 'add', indicator: { ...indicator, instanceId: indicator.id } })
       }
     },
     goToIndicatorMarket () {
@@ -3575,15 +3538,6 @@ export default {
         this.market = stock.market
         this.symbol = stock.symbol
         this.selectedWatchlistKey = `${stock.market}:${stock.symbol}`
-        // QuickTradePanel 仅支持 Crypto，非 Crypto 时关闭抽屉并清空 qtSymbol
-        if (stock.market === 'Crypto') {
-          this.qtSymbol = stock.symbol
-        } else {
-          this.qtSymbol = ''
-          if (this.quickTradeDrawerVisible) {
-            this.quickTradeDrawerVisible = false
-          }
-        }
         this.ensureChartReady()
         this.schedulePersistIdeUiState()
       }
@@ -3695,15 +3649,6 @@ export default {
       if (run.market) this.market = String(run.market)
       if (run.symbol) {
         this.symbol = String(run.symbol)
-        // QuickTradePanel 仅支持 Crypto，非 Crypto 时清空 qtSymbol 并关闭抽屉
-        if (String(run.market) === 'Crypto') {
-          this.qtSymbol = String(run.symbol)
-        } else {
-          this.qtSymbol = ''
-          if (this.quickTradeDrawerVisible) {
-            this.quickTradeDrawerVisible = false
-          }
-        }
       }
       if (this.market && this.symbol) {
         this.selectedWatchlistKey = `${this.market}:${this.symbol}`
@@ -3852,30 +3797,18 @@ export default {
     activeChartTab () {
       this.$nextTick(() => {
         if (this.activeChartTab === 'chart') {
-          const chartWrapper = this.$refs.klineChartPro
-          if (chartWrapper && typeof chartWrapper.resize === 'function') chartWrapper.resize()
+          const chart = this.$refs.klineChart
+          if (chart && typeof chart.resize === 'function') chart.resize()
           this.ensureChartReady()
         } else if (this.activeChartTab === 'code') {
           if (this.cmInstance) this.cmInstance.refresh()
         }
       })
     },
-    quickTradeDrawerVisible () {
-      this.$nextTick(() => this.ensureChartReady())
-    },
     paramsPanelExpanded () {
       this.$nextTick(() => this.ensureChartReady())
     },
     symbol () {
-      // QuickTradePanel 仅支持 Crypto，非 Crypto 时不同步 qtSymbol
-      if (this.market === 'Crypto') {
-        this.qtSymbol = this.symbol
-      } else {
-        this.qtSymbol = ''
-        if (this.quickTradeDrawerVisible) {
-          this.quickTradeDrawerVisible = false
-        }
-      }
       this.ensureChartReady()
       this.schedulePersistIdeUiState()
     },
@@ -3941,22 +3874,15 @@ export default {
     flex-wrap: wrap;
     min-width: 0;
   }
+  .toolbar-center {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    margin: 0 auto;
+  }
   .toolbar-right { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
 }
-.ide-toolbar-qt-btn {
-  border-radius: 10px !important;
-  font-weight: 600;
-  display: inline-flex !important;
-  align-items: center;
-  gap: 6px;
-  height: 34px !important;
-  padding: 0 12px !important;
-  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
-}
-.ide-toolbar-qt-label {
-  font-size: 13px;
-  letter-spacing: 0.02em;
-}
+
 /* 与右侧带标签的工具组垂直居中对齐（避免单独贴在行底） */
 .ide-toolbar-code-slot {
   display: flex;
@@ -3974,6 +3900,107 @@ export default {
   align-items: center;
   justify-content: center;
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+/* 工具栏 Tab 切换按钮 */
+.ide-toolbar-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: #666;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+  &:hover { background: rgba(24, 144, 255, 0.06); color: #333; }
+  &.active { background: #e6f7ff; color: #1890ff; font-weight: 600; }
+}
+.ide-toolbar-tab-badge {
+  font-size: 10px !important;
+  line-height: 16px !important;
+  padding: 0 4px !important;
+}
+/* 代码编辑器工具栏 */
+.ide-code-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid #e8e8e8;
+  background: #fafafa;
+}
+.ide-code-toolbar-select {
+  flex-shrink: 0;
+}
+.ide-code-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+/* 指标弹出选择器样式 */
+.indicator-popover-trigger {
+  display: inline-flex !important;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  border-radius: 6px !important;
+}
+.indicator-popover-header {
+  margin-bottom: 8px;
+}
+.indicator-popover-search {
+  width: 200px;
+}
+.indicator-popover-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 360px;
+  overflow-y: auto;
+  min-width: 220px;
+}
+.indicator-popover-item {
+  padding: 4px 8px;
+  border-radius: 4px;
+  transition: background 0.15s;
+  cursor: pointer;
+  &:hover {
+    background: rgba(24, 144, 255, 0.06);
+  }
+  &--active {
+    background: rgba(24, 144, 255, 0.08);
+  }
+}
+.indicator-popover-item-name {
+  font-size: 11px;
+  color: #999;
+  margin-left: 6px;
+}
+/* 蜡烛图区域内工具栏 */
+.ide-chart-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 10px;
+  border-bottom: 1px solid #e8e8e8;
+  background: #fafafa;
+  flex-shrink: 0;
+}
+.ide-chart-toolbar-tf {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.ide-chart-toolbar-label {
+  font-size: 12px;
+  color: #666;
+  white-space: nowrap;
+}
+/* 工具栏外置指标选择器 */
+.ide-toolbar-ext-indicator {
+  flex-shrink: 0;
+  min-width: 180px;
 }
 .ide-toolbar-group {
   display: flex;
@@ -4600,18 +4627,6 @@ export default {
   flex-shrink: 0;
   height: 36px;
 }
-.ide-chart-tab-indicator {
-  margin-left: auto;
-  padding-right: 4px;
-}
-.ide-chart-tab-indicator .ant-select {
-  min-width: 150px;
-  font-size: 12px;
-}
-/* 隐藏自选股市场标签 */
-.ide-left .wl-market {
-  display: none !important;
-}
 .ide-chart-tab {
   display: inline-flex;
   align-items: center;
@@ -4689,90 +4704,6 @@ export default {
 }
 
 /* 闪电交易：主布局内右侧栏，与 .ide-left 同为抽拉分栏（无全屏遮罩） */
-.ide-quick-right {
-  width: 30%;
-  min-width: 280px;
-  max-width: 400px;
-  flex-shrink: 0;
-  display: flex;
-  flex-direction: column;
-  border-left: 1px solid #e8e8e8;
-  background: #f8fafc;
-  overflow: hidden;
-  min-height: 0;
-  align-self: stretch;
-}
-.ide-quick-panel-head {
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 10px 12px;
-  background: linear-gradient(180deg, #ffffff 0%, #f1f5f9 100%);
-  border-bottom: 1px solid rgba(15, 23, 42, 0.08);
-}
-.ide-quick-panel-head-title {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 13px;
-  font-weight: 700;
-  color: #0f172a;
-  letter-spacing: 0.02em;
-}
-.ide-quick-panel-head-icon {
-  font-size: 16px;
-  color: @primary-color;
-}
-.ide-quick-panel-close {
-  color: #64748b !important;
-  padding: 0 4px !important;
-  &:hover {
-    color: #0f172a !important;
-  }
-}
-.ide-quick-panel-body {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  padding: 0 0 8px;
-  /deep/ .quick-trade-panel-root {
-    flex: 1;
-    min-height: 0;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-  }
-  /deep/ .quick-trade-embedded {
-    flex: 1;
-    min-height: 0;
-    overflow-y: auto;
-    overflow-x: hidden;
-  }
-  /deep/ .qt-embedded-split--cols {
-    flex-direction: column;
-    padding-left: 12px;
-    padding-right: 12px;
-  }
-  /deep/ .qt-embedded-split--cols .qt-embedded-col-left,
-  /deep/ .qt-embedded-split--cols .qt-embedded-col-right {
-    width: 100%;
-    max-width: 100%;
-    box-sizing: border-box;
-    padding-left: 0;
-    padding-right: 0;
-    margin-left: 0;
-  }
-  /deep/ .qt-embedded-split--cols .qt-embedded-col-right {
-    border-left: none;
-    border-top: 1px solid rgba(15, 23, 42, 0.08);
-    padding-top: 12px;
-  }
-}
-
 .ide-resize-handle {
   flex: 0 0 7px;
   display: flex;
@@ -5621,6 +5552,20 @@ export default {
     border-color: #434343;
     box-shadow: none;
   }
+  .ide-toolbar-tab {
+    color: rgba(255, 255, 255, 0.55);
+    &:hover { background: rgba(255, 255, 255, 0.06); color: rgba(255, 255, 255, 0.85); }
+    &.active { background: rgba(24, 144, 255, 0.15); color: #58a6ff; }
+  }
+  .ide-code-toolbar {
+    background: #1a1a1a;
+    border-bottom-color: #303030;
+  }
+  .ide-chart-toolbar {
+    background: #1a1a1a;
+    border-bottom-color: #303030;
+  }
+  .ide-chart-toolbar-label { color: rgba(255,255,255,0.45); }
   .tf-group /deep/ .ant-radio-button-wrapper {
     background: #262626;
     border-color: #434343;
@@ -5657,41 +5602,7 @@ export default {
     color: rgba(255, 255, 255, 0.65);
     &:hover { border-color: #177ddc; color: #177ddc; }
   }
-  .ide-toolbar-qt-btn.ant-btn-default {
-    background: #262626;
-    border-color: #434343;
-    color: rgba(255, 255, 255, 0.85);
-    box-shadow: none;
-    &:hover {
-      border-color: #177ddc;
-      color: #58a6ff;
-    }
-  }
-  .ide-quick-right {
-    background: #141414;
-    border-left-color: #303030;
-  }
-  .ide-quick-panel-head {
-    background: linear-gradient(180deg, #1f1f1f 0%, #1a1a1a 100%);
-    border-bottom-color: #303030;
-  }
-  .ide-quick-panel-head-title {
-    color: rgba(255, 255, 255, 0.92);
-  }
-  .ide-quick-panel-head-icon {
-    color: #58a6ff;
-  }
-  .ide-quick-panel-close {
-    color: rgba(255, 255, 255, 0.45) !important;
-    &:hover {
-      color: rgba(255, 255, 255, 0.88) !important;
-    }
-  }
-  .ide-quick-panel-body {
-    /deep/ .qt-embedded-split--cols .qt-embedded-col-right {
-      border-top-color: #303030;
-    }
-  }
+
   .ide-tuning-launch-header {
     background: linear-gradient(135deg, rgba(24, 144, 255, 0.06) 0%, rgba(114, 46, 209, 0.04) 100%);
     border-color: rgba(88, 166, 255, 0.12);

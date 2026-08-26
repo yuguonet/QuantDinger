@@ -26,8 +26,8 @@
       </div>
       <!-- 图表内容区域 -->
       <div class="chart-content-area">
-        <!-- 指标工具栏 -->
-        <div class="indicator-toolbar">
+        <!-- 指标工具栏（外部管理时可通过 showIndicatorBar 隐藏） -->
+        <div v-if="showIndicatorBar" class="indicator-toolbar">
           <div
             v-for="indicator in indicatorButtons"
             :key="indicator.id"
@@ -39,7 +39,7 @@
             {{ indicator.shortName }}
           </div>
         </div>
-        <div v-if="activePresetIndicators.length" class="indicator-active-bar">
+        <div v-if="showIndicatorBar && activePresetIndicators.length" class="indicator-active-bar">
           <div
             v-for="indicator in activePresetIndicators"
             :key="indicator.instanceId || indicator.id"
@@ -174,7 +174,7 @@
 
 <script>
 import { ref, reactive, computed, onMounted, onBeforeUnmount, nextTick, watch, shallowRef, getCurrentInstance } from 'vue'
-import { init, registerIndicator, registerOverlay } from 'klinecharts'
+import { init, registerIndicator, registerOverlay, setLocale } from 'klinecharts'
 import request from '@/utils/request'
 import { decryptCodeAuto, needsDecrypt } from '@/utils/codeDecrypt'
 import ExchangeKlineWs from '@/utils/exchangeWs'
@@ -209,6 +209,11 @@ export default {
     userId: {
       type: Number,
       default: null
+    },
+    /** 是否显示内部指标按钮栏和激活指标条（外部管理时可关闭） */
+    showIndicatorBar: {
+      type: Boolean,
+      default: true
     }
   },
   emits: ['retry', 'price-change', 'load', 'indicator-toggle'],
@@ -2903,18 +2908,22 @@ registerOverlay({
           throw new Error('容器元素不存在')
         }
 
-        // 尝试使用配置选项初始化，看是否支持内置画线工具栏
+        // 设置中文语言
+        try { setLocale('zh-CN') } catch (_) {}
+
+        // 尝试使用配置选项初始化
         try {
-          // 尝试使用第二个参数传入配置选项
           chartRef.value = init(container, {
-            drawingBarVisible: true, // 尝试启用内置画线工具栏
-            overlay: {
-              visible: true
-            }
+            locale: 'zh-CN',
+            drawingBarVisible: true,
+            overlay: { visible: true }
           })
         } catch (e) {
-          // 如果不支持配置选项，使用默认初始化
-          chartRef.value = init(container)
+          try {
+            chartRef.value = init(container, { locale: 'zh-CN' })
+          } catch (_) {
+            chartRef.value = init(container)
+          }
         }
 
         // 如果配置选项方式不支持，尝试调用方法启用画线工具栏
@@ -3274,6 +3283,13 @@ registerOverlay({
               style: 'dashed',
               color: theme.gridLineColor,
               size: 1
+            },
+            text: {
+              show: true,
+              style: 'fill',
+              color: '#fff',
+              size: 11,
+              backgroundColor: theme.axisLabelColor || '#485368'
             }
           },
           vertical: {
@@ -3283,6 +3299,13 @@ registerOverlay({
               style: 'dashed',
               color: theme.gridLineColor,
               size: 1
+            },
+            text: {
+              show: true,
+              style: 'fill',
+              color: '#fff',
+              size: 11,
+              backgroundColor: theme.axisLabelColor || '#485368'
             }
           }
         },

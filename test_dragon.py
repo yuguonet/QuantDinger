@@ -1398,7 +1398,7 @@ def print_today_signals(all_trades, today_str, buy_mode="next_open"):
             print(f"    {t['code']:<8} {t['board']:<6} {t['streak_len']}板连板 "
                   f"断板{t['break_date']} {t['break_chg']:+.1f}% 量{t['break_vol_r']:.2f}x 预计开盘{t['entry_price']:.2f}")
 
-    # ===== 持仓卖出建议 (15天内买入的持仓) =====
+    # ===== 持仓卖出建议 (20天内买入的持仓) =====
     from datetime import datetime, timedelta
     today_dt = datetime.strptime(today_str, '%Y-%m-%d')
     recent_entries = [t for t in all_trades
@@ -1406,31 +1406,35 @@ def print_today_signals(all_trades, today_str, buy_mode="next_open"):
                       and t['entry_date'] >= (today_dt - timedelta(days=20)).strftime('%Y-%m-%d')]
 
     if recent_entries:
-        sell = [t for t in recent_entries if t['intraday'] < 3]
-        hold = [t for t in recent_entries if t['intraday'] >= 3]
+        # 计算当前收益(用today_date的收盘价)
+        # 这里简化: 用d1_change和intraday估算
+        sell = [t for t in recent_entries if t.get('intraday', 0) < 3]
+        hold = [t for t in recent_entries if t.get('intraday', 0) >= 3]
 
         print(f"\n{'=' * 80}")
-        print(f"📊 持仓分析 (15天内买入, 次日开盘执行)")
+        print(f"📊 持仓分析 (20天内买入, 次日开盘执行)")
         print(f"{'=' * 80}")
         print(f"  持仓: {len(recent_entries)}只 | 卖出: {len(sell)}只 | 持有: {len(hold)}只")
 
         if sell:
             print(f"\n  🔴 明日开盘清仓 ({len(sell)}只) — 日内动量<3%:")
-            print(f"  {'代码':>8} {'板块':>6} {'策略':>6} {'买入日':>12} {'买入价':>8} {'D1收':>7} {'日内':>7}")
-            print(f"  {'-' * 65}")
-            for t in sorted(sell, key=lambda x: x['intraday']):
-                pl = {'dragon_callback': '龙回头', 'v1': 'V1', 'break_buy': '断板'}.get(t['path'], '')
+            print(f"  {'代码':>8} {'板块':>6} {'策略':>6} {'买入日':>12} {'买入价':>8} {'持仓天':>6} {'D1收':>7} {'日内':>7}")
+            print(f"  {'-' * 75}")
+            for t in sorted(sell, key=lambda x: x.get('intraday', 0)):
+                pl = {'dragon_callback': '龙回头', 'v1': 'V1', 'break_buy': '断板', '4in1_v1': '4IN1-V1', '4in1_break': '4IN1-断板', '4in1_dragon_a': '4IN1-龙回A', '4in1_dragon_b': '4IN1-龙回B'}.get(t['path'], t['path'])
+                hold_days = (today_dt - datetime.strptime(t['entry_date'], '%Y-%m-%d')).days if t.get('entry_date') else 0
                 print(f"  {t['code']:>8} {t['board']:>6} {pl:>6} {t['entry_date']:>12} "
-                      f"{t['entry_price']:>7.2f} {t['d1_change']:>+6.1f}% {t['intraday']:>+6.1f}%")
+                      f"{t['entry_price']:>7.2f} {hold_days:>5}天 {t.get('d1_change',0):>+6.1f}% {t.get('intraday',0):>+6.1f}%")
 
         if hold:
             print(f"\n  🟢 继续持有 ({len(hold)}只) — 日内动量>=3%:")
-            print(f"  {'代码':>8} {'板块':>6} {'策略':>6} {'买入日':>12} {'买入价':>8} {'D1收':>7} {'日内':>7}")
-            print(f"  {'-' * 65}")
-            for t in sorted(hold, key=lambda x: -x['intraday']):
-                pl = {'dragon_callback': '龙回头', 'v1': 'V1', 'break_buy': '断板'}.get(t['path'], '')
+            print(f"  {'代码':>8} {'板块':>6} {'策略':>6} {'买入日':>12} {'买入价':>8} {'持仓天':>6} {'D1收':>7} {'日内':>7}")
+            print(f"  {'-' * 75}")
+            for t in sorted(hold, key=lambda x: -x.get('intraday', 0)):
+                pl = {'dragon_callback': '龙回头', 'v1': 'V1', 'break_buy': '断板', '4in1_v1': '4IN1-V1', '4in1_break': '4IN1-断板', '4in1_dragon_a': '4IN1-龙回A', '4in1_dragon_b': '4IN1-龙回B'}.get(t['path'], t['path'])
+                hold_days = (today_dt - datetime.strptime(t['entry_date'], '%Y-%m-%d')).days if t.get('entry_date') else 0
                 print(f"  {t['code']:>8} {t['board']:>6} {pl:>6} {t['entry_date']:>12} "
-                      f"{t['entry_price']:>7.2f} {t['d1_change']:>+6.1f}% {t['intraday']:>+6.1f}%")
+                      f"{t['entry_price']:>7.2f} {hold_days:>5}天 {t.get('d1_change',0):>+6.1f}% {t.get('intraday',0):>+6.1f}%")
             print(f"\n    出场规则: 追踪止损-5% / 持仓上限20天")
 
     return today_trades
