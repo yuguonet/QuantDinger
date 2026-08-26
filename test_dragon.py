@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""4IN1 统一涨停策略 + 独立策略回测
+"""涨停策略独立回测
 
 用法:
   python test_dragon.py --source db --days 300              # DB全市场, 最近300个交易日
-  python test_dragon.py --source db --days 60 --strategy 4in1  # 4IN1策略, 最近60天
+  python test_dragon.py --source db --days 60 --strategy all  # 全部策略, 最近60天
   python test_dragon.py --codes 000066,002010 --days 300    # 指定股票
   python test_dragon.py --source db --days 60 --today       # D0收盘后查看今日涨停买点
   python test_dragon.py --source db --days 60 --today --today-date 2026-08-07
@@ -13,11 +13,11 @@
 参数:
   --source db       从数据库加载全市场 (默认 manual)
   --days N          向前取N个交易日 (默认300, 从当前日期往前推)
-  --strategy        all|dragon|v1|break|4in1 (默认all)
+  --strategy        all|dragon|v1|break (默认all)
   --buy-mode        next_open|signal_close (默认next_open)
   --pullback N      龙回头最少回调天数 (默认3)
-  --today           显示买点+持仓卖出建议 (15天内买入的持仓)
-  --today-date      指定"今天"的日期, 配合--today使用
+  --today           显示买点+持仓卖出建议 (7天内买入的持仓)
+  --today-date      指定“今天”的日期, 配合--today使用
   --all-trades      输出每笔交易明细
 
 V1核心参数:
@@ -34,7 +34,7 @@ V1核心参数:
 ═══════════════════════════════════════════════════════════════════════════════
 
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ V1 策略 (追击连板) — next_open 模式                                        │
+│ V1 策略 (追击连板) - next_open 模式                                        │
 │ v3版本, 213样本回测: 70.4%胜率, 均+4.07%, 盈亏比2.35                        │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
@@ -103,7 +103,7 @@ V1核心参数:
 │   止损:     -5%                                                             │
 │   追踪止损: -5% (从峰值回撤)                                               │
 │   峰值逃顶: 涨>7%后大上影线(>30%)收盘逃顶                                  │
-│   持仓上限: 10个交易日                                                      │
+│   持仓上限: 7个交易日                                                      │
 │                                                                             │
 │ 参数:                                                                       │
 │   --pullback N          最少回调天数 (默认3)                               │
@@ -132,30 +132,11 @@ V1核心参数:
 │   止损:     -8% (主板) / -10% (创/科板)                                    │
 │   追踪止损: -6% (主板) / -8% (创/科板)                                     │
 │   峰值逃顶: 涨>10%后大上影线(>40%)收盘逃顶                                │
-│   持仓上限: 20天 (主板) / 15天 (创/科板)                                   │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 4IN1 策略 (--strategy 4in1): 一次涨停驱动, 分阶段决策                      │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│ 流程:                                                                       │
-│   D0      涨停(首板/连板) ──→ V1检查D1入场条件                            │
-│   D1      涨停 ──→ V1入场, 按V1出场规则持有                                │
-│            没涨停 ──→ 断板检查D1~D2窗口                                    │
-│   D3~D5   依旧没涨停 ──→ 龙回头A(短回调, 3~5天)                           │
-│   D6~D11  依旧没涨停 ──→ 龙回头B(长回调, 6~11天)                          │
-│   D12     放弃                                                             │
-│                                                                             │
-│ 规则:                                                                       │
-│   - 每个涨停日独立评估, 连板的每个涨停日都走V1判断                         │
-│   - 前阶段出信号则后续阶段跳过, 一个D0最多一笔交易                         │
-│   - 各阶段入场/出场策略独立, 见上文各策略说明                              │
-│   - 默认 next_open 买入                                                     │
+│   持仓上限: 7天                                   │
 └─────────────────────────────────────────────────────────────────────────────┘
 
 ═══════════════════════════════════════════════════════════════════════════════
-                          独立策略 (--strategy all)
+                          三策略独立运行 (--strategy all)
 ═══════════════════════════════════════════════════════════════════════════════
 
   龙回头 + V1 + 断板 三策略独立运行, 互不干扰, 各自产生信号
@@ -413,7 +394,7 @@ def run_backtest(bars, entry_idx, entry_price, hold_days=7, stop_loss=-10.0, tra
                 # D2开盘直接清仓, 不等止损位
                 exit_p = b['open']; exit_d = d; break
 
-        # ① 峰值逃顶(优先): 涨>7%后大上影线(>30%)→收盘逃顶
+        # 1 峰值逃顶(优先): 涨>7%后大上影线(>30%)→收盘逃顶
         if peak_exit:
             ret = (b['close'] / entry_price - 1) * 100
             if ret > 7:
@@ -422,14 +403,14 @@ def run_backtest(bars, entry_idx, entry_price, hold_days=7, stop_loss=-10.0, tra
                 if upper > 30 and b['close'] < b['high'] * 0.98:
                     exit_p = b['close']; exit_d = d; break
 
-        # ② 追踪止损
+        # 2 追踪止损
         if d > 1 and b['low'] <= peak * (1 + trailing_stop / 100):
             exit_p = peak * (1 + trailing_stop / 100); exit_d = d; break
-        # ③ 止损
+        # 3 止损
         if b['low'] <= entry_price * (1 + stop_loss / 100):
             exit_p = entry_price * (1 + stop_loss / 100); exit_d = d; break
 
-        # ④ 兜底: 持仓到期收盘走
+        # 4 兜底: 持仓到期收盘走
         exit_p = b['close']; exit_d = d
 
     return {
@@ -454,8 +435,8 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
       peak_escape : 涨>7%后上影线>30%逃顶 (原10%/40%)
 
     buy_mode:
-      next_open    — D+1开盘买 (默认, 实盘推荐)
-      signal_close — 信号日收盘买 (回测用, 14:50盘中扫描可行)
+      next_open    - D+1开盘买 (默认, 实盘推荐)
+      signal_close - 信号日收盘买 (回测用, 14:50盘中扫描可行)
     """
     board_type = get_board_type(code)
     threshold = 0.098 if board_type == "main" else 0.198
@@ -512,7 +493,7 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
         # D+1数据 (用于过滤)
         has_d1 = pullback_end + 1 < len(bars)
         if not has_d1:
-            continue  # D1数据不存在，跳过
+            continue  # D1数据不存在,跳过
         d1 = bars[pullback_end + 1]
         d1_change = (d1['close'] / last_pb['close'] - 1) * 100
 
@@ -569,10 +550,8 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
     return trades
 
 # ================================================================
-# 4IN1 统一策略
-# ================================================================
-
 # V1 默认参数 (v2 - 只保留核心四因子)
+# ================================================================
 _V1_PARAMS = dict(
     v1_hold_days=7, v1_stop_loss=-10.0, v1_trailing_stop=-5.0,
     ret_20d_min=30.0,
@@ -581,363 +560,6 @@ _V1_PARAMS = dict(
     d_1_vol_max=1.5,
 )
 
-# 断板默认参数
-_BREAK_PARAMS = dict(
-    stop_loss=-8.0, trailing_stop=-6.0, take_profit=15.0,
-    hold_days=7, vol_min=1.2, vol_max=2.0, drawdown_max=-10,
-)
-
-# 龙回头 A 默认参数 (D3~D5, 短回调)
-_DRAGON_A_PARAMS = dict(
-    stop_loss=-5.0, trailing_stop=-5.0, hold_days=7,
-    max_last_chg=3.0, min_vol_ratio=0.5, max_vol_ratio=0.8,
-)
-
-# 龙回头 B 默认参数 (D6~D11, 长回调)
-_DRAGON_B_PARAMS = dict(
-    stop_loss=-5.0, trailing_stop=-5.0, hold_days=7,
-    max_last_chg=3.0, min_vol_ratio=0.5, max_vol_ratio=0.8,
-)
-
-def strategy_4in1(bars, code,
-                  buy_mode="next_open",
-                  v1_params=None, break_params=None,
-                  dragon_a_params=None, dragon_b_params=None,
-                  stock_info=None, sector_counts_by_date=None):
-    """
-    4IN1 统一策略: 一次涨停驱动, 分阶段决策
-
-    流程:
-      D0  涨停 ──→ V1检查D1入场条件
-      D1  涨停 ──→ V1入场, 按V1出场规则持有
-           没涨停 ──→ 断板检查D1~D2窗口
-      D3~D5  没涨停 ──→ 龙回头A
-      D6~D11 没涨停 ──→ 龙回头B
-      D12  放弃
-
-    每个D0最多产生一笔交易, 前阶段出信号则后续阶段跳过。
-    """
-    vp = dict(_V1_PARAMS); vp.update(v1_params or {})
-    bp = dict(_BREAK_PARAMS); bp.update(break_params or {})
-    dap = dict(_DRAGON_A_PARAMS); dap.update(dragon_a_params or {})
-    dbp = dict(_DRAGON_B_PARAMS); dbp.update(dragon_b_params or {})
-
-    bt = get_board_type(code)
-    threshold = 0.098 if bt == "main" else 0.198
-    limit_ups = find_limit_ups(bars, bt)
-    trades = []
-    used_ranges = []
-
-    for lu_idx in limit_ups:
-        # 4IN1: 每个涨停日独立评估, 不做主循环去重
-        # (龙回头阶段内部有自己的去重逻辑)
-
-        lu_close = bars[lu_idx]['close']
-        lu_vol = bars[lu_idx]['volume']
-        lu_prev_close = bars[lu_idx - 1]['close'] if lu_idx > 0 else 0
-        if lu_prev_close <= 0:
-            continue
-
-        # D1 检查
-        if lu_idx + 1 >= len(bars):
-            continue
-        d1 = bars[lu_idx + 1]
-        d1_limit_up = is_limit_up(d1['close'], lu_close, bt)
-        d1_change = (d1['close'] / lu_close - 1) * 100
-
-        trade = None
-
-        # ==================== 阶段1: V1 (4因子版) ====================
-        # 因子1: 强趋势 20日涨>30%
-        ret_20d = 0
-        if lu_idx >= 20 and bars[lu_idx-20]['close'] > 0:
-            ret_20d = (lu_close / bars[lu_idx-20]['close'] - 1) * 100
-        if ret_20d < vp.get('ret_20d_min', 30.0):
-            pass  # V1条件不满足, 继续到下一阶段
-        else:
-            # 因子2: D-1回调 -10% ~ -3%
-            d_1 = bars[lu_idx - 1] if lu_idx > 0 else None
-            d_2 = bars[lu_idx - 2] if lu_idx > 1 else None
-            d_1_change = (d_1['close'] / d_2['close'] - 1) * 100 if d_1 and d_2 and d_2['close'] > 0 else 0
-            d_1_pullback_min = vp.get('d_1_pullback_min', -10.0)
-            d_1_pullback_max = vp.get('d_1_pullback_max', -3.0)
-            if d_1_change < d_1_pullback_min or d_1_change >= d_1_pullback_max:
-                pass
-            else:
-                # 因子3: OBV 5日趋势上升
-                obv_ok = True
-                if vp.get('obv_filter', True) and lu_idx >= 20:
-                    obv = 0; obv_list = []
-                    for j in range(max(0, lu_idx-20), lu_idx+1):
-                        if j > 0:
-                            if bars[j]['close'] > bars[j-1]['close']:
-                                obv += bars[j]['volume']
-                            elif bars[j]['close'] < bars[j-1]['close']:
-                                obv -= bars[j]['volume']
-                        obv_list.append(obv)
-                    if len(obv_list) >= 5 and obv_list[-1] - obv_list[-5] <= 0:
-                        obv_ok = False  # OBV下降, 资金流出
-                if not obv_ok:
-                    pass
-                else:
-                    # 因子4: D-1非放量 < 1.5x 5日均量
-                    vol_ok = True
-                    d_1_vol_max = vp.get('d_1_vol_max', 1.5)
-                    if lu_idx >= 6:
-                        vol_ma5_d1 = sum(bars[j]['volume'] for j in range(lu_idx-6, lu_idx-1)) / 5
-                        if vol_ma5_d1 > 0 and d_1['volume'] / vol_ma5_d1 >= d_1_vol_max:
-                            vol_ok = False  # D-1放量, 可能是出货
-                    if not vol_ok:
-                        pass
-                    else:
-                        # === V1 信号确认 ===
-                        if buy_mode == "signal_close":
-                            entry_price = lu_close
-                            entry_idx = lu_idx
-                            entry_date = bars[lu_idx]['time']
-                        else:  # next_open
-                            entry_price = d1['open']
-                            entry_idx = lu_idx + 1
-                            entry_date = d1['time']
-                            # D1过滤
-                            d1_gap = (d1['open'] / lu_close - 1) * 100 if lu_close > 0 else 0
-                            min_d1_gap = -3.0 if bt == "main" else -5.0
-                            if d1_gap < min_d1_gap:
-                                pass
-                            elif d1_change < 0:
-                                pass
-                            elif bt == "gem_star" and d1_gap >= 5.0:
-                                pass  # 创/科板高开追涨风险大
-                            else:
-                                if entry_price > 0:
-                                    d1_gap_v1 = (d1['open'] / lu_close - 1) * 100 if lu_close > 0 else 0
-                                    d1_limit_up_val = is_limit_up(d1['close'], lu_close, bt)
-                                    result = run_backtest(
-                                        bars, entry_idx, entry_price,
-                                        vp['v1_hold_days'], vp['v1_stop_loss'],
-                                        vp['v1_trailing_stop'], bt,
-                                        is_v1=True, d1_limit_up=d1_limit_up_val, d1_change=d1_change, d1_gap=d1_gap_v1)
-                                    if result:
-                                        turnover_rate = 0.0
-                                        if stock_info and code in stock_info:
-                                            circ = stock_info[code]['circ_shares']
-                                            if circ > 0:
-                                                turnover_rate = lu_vol / circ * 100
-                                        trade = {
-                                            'code': code, 'board': get_board_name(code),
-                                            'path': '4in1_v1', 'path_label': '4IN1-V1',
-                                            'phase': 1, 'phase_label': 'V1',
-                                            'd0_date': bars[lu_idx]['time'],
-                                            'entry_date': entry_date,
-                                            'entry_price': round(entry_price, 3),
-                                            'buy_mode': buy_mode,
-                                            'ret_20d': round(ret_20d, 2),
-                                            'd_1_change': round(d_1_change, 2),
-                                            'd1_change': round(d1_change, 2),
-                                            'turnover_rate': round(turnover_rate, 2),
-                                            **result,
-                                        }
-
-        # ==================== 阶段2: 断板 (D1~D2) ====================
-        if trade is None and not d1_limit_up:
-            break_days_since_lu = 0
-            for j in range(lu_idx + 1, min(lu_idx + 3, len(bars))):
-                if is_limit_up(bars[j]['close'], bars[j-1]['close'], bt):
-                    break  # 遇到新涨停, 断板期结束
-                break_days_since_lu += 1
-
-            if break_days_since_lu > 0:
-                break_bars_list = bars[lu_idx + 1:lu_idx + 1 + break_days_since_lu]
-                break_low = min(float(b['low']) for b in break_bars_list)
-                break_vol_avg = sum(float(b['volume']) for b in break_bars_list) / len(break_bars_list)
-                break_vol_r = break_vol_avg / lu_vol if lu_vol > 0 else 0
-
-                limit_open = float(bars[lu_idx]['open'])
-                break_drawdown = (break_low / lu_close - 1) * 100
-
-                # 逐日检查断板信号
-                for bi, bbar in enumerate(break_bars_list):
-                    bchg = (bbar['close'] / lu_close - 1) * 100
-                    bgap = (bbar['open'] / lu_close - 1) * 100
-
-                    checks = (
-                        break_low >= limit_open
-                        and bp['vol_min'] <= break_vol_r < bp['vol_max']
-                        and -5 <= bchg < 8
-                        and -3 <= bgap < 5
-                        and break_drawdown >= bp['drawdown_max']
-                    )
-                    if not checks:
-                        continue
-
-                    if buy_mode == "signal_close":
-                        entry_price = bbar['close']
-                        entry_idx = lu_idx + 1 + bi
-                        entry_date = bbar['time']
-                    else:  # next_open
-                        next_idx = lu_idx + 1 + bi + 1
-                        if next_idx >= len(bars):
-                            continue
-                        entry_price = bars[next_idx]['open']
-                        entry_idx = next_idx
-                        entry_date = bars[next_idx]['time']
-
-                    if entry_price <= 0:
-                        continue
-
-                    result = run_backtest_breakbuy(
-                        bars, entry_idx, entry_price,
-                        bp['hold_days'], bp['stop_loss'],
-                        bp['trailing_stop'], bt)
-                    if result:
-                        trade = {
-                            'code': code, 'board': get_board_name(code),
-                            'path': '4in1_break', 'path_label': '4IN1-断板',
-                            'phase': 2, 'phase_label': '断板',
-                            'd0_date': bars[lu_idx]['time'],
-                            'break_date': bbar['time'],
-                            'break_days': break_days_since_lu,
-                            'break_chg': round(bchg, 2),
-                            'break_gap': round(bgap, 2),
-                            'break_vol_r': round(break_vol_r, 2),
-                            'entry_date': entry_date,
-                            'entry_price': round(entry_price, 3),
-                            'buy_mode': buy_mode,
-                            **result,
-                        }
-                        break  # 断板信号找到, 停止逐日检查
-
-        # ==================== 阶段3: 龙回头 A (D3~D5) ====================
-        if trade is None and not d1_limit_up:
-            trade = _dragon_phase(bars, code, lu_idx, 3, 5, dap, bt, threshold,
-                                  buy_mode, '4in1_dragon_a', '4IN1-龙回头A', 3, used_ranges)
-
-        # ==================== 阶段4: 龙回头 B (D6~D11) ====================
-        if trade is None and not d1_limit_up:
-            trade = _dragon_phase(bars, code, lu_idx, 6, 11, dbp, bt, threshold,
-                                  buy_mode, '4in1_dragon_b', '4IN1-龙回头B', 4, used_ranges)
-
-        # ==================== 记录交易 ====================
-        if trade is not None:
-            # 龙回头阶段: 用 pullback_idx 去重, 避免连板的涨停日互相干扰
-            if trade.get('path', '').startswith('4in1_dragon') and 'pullback_idx' in trade:
-                used_ranges.append((trade['pullback_idx'], trade['pullback_idx']))
-            trades.append(trade)
-
-    return trades
-
-
-def _dragon_phase(bars, code, lu_idx, min_pb, max_pb, params, bt, threshold,
-                  buy_mode, path, path_label, phase, used_ranges):
-    """4IN1 龙回头阶段通用检查 (阶段3/4共用)
-
-    检查 lu_idx 后 min_pb~max_pb 天内是否出现龙回头信号:
-      涨停 → 回调 → 末期缩量小阴(-3%~-0.5%) → 买入
-    """
-    lu_close = bars[lu_idx]['close']
-    lu_vol = bars[lu_idx]['volume']
-
-    # 找回调期: close < lu_close 的最后一天
-    pullback_end = None
-    for j in range(lu_idx + 1, min(lu_idx + 20, len(bars))):
-        if bars[j]['close'] < lu_close:
-            pullback_end = j
-        elif j >= lu_idx + min_pb:
-            break
-        else:
-            break
-
-    if pullback_end is None:
-        return None
-
-    pullback_days = pullback_end - lu_idx
-    if pullback_days < min_pb or pullback_days > max_pb:
-        return None
-
-    # 信号日检查
-    last_pb = bars[pullback_end]
-    last_pb_prev = bars[pullback_end - 1] if pullback_end > 0 else bars[lu_idx]
-    last_pb_prev_c = last_pb_prev['close']
-    if last_pb_prev_c <= 0:
-        return None
-
-    last_chg = (last_pb['close'] / last_pb_prev_c - 1) * 100
-
-    # 排除大阴
-    if last_chg < -params['max_last_chg']:
-        return None
-
-    # 末期小阴: 缩量下跌, 抛压枯竭
-    if not (-params['max_last_chg'] < last_chg < -0.5):
-        return None
-
-    # 信号日量比 (D0量 / D-1量)
-    signal_vol = last_pb['volume']
-    signal_prev_vol = bars[pullback_end - 1]['volume'] if pullback_end > 0 else 0
-    vol_ratio = signal_vol / signal_prev_vol if signal_prev_vol > 0 else 0
-    if vol_ratio < params['min_vol_ratio'] or vol_ratio >= params['max_vol_ratio']:
-        return None
-
-    # D1 数据 (用于过滤和 d1_limit_up 预计算)
-    if pullback_end + 1 >= len(bars):
-        return None
-    d1 = bars[pullback_end + 1]
-    d1_change = (d1['close'] / last_pb['close'] - 1) * 100
-
-    # 根据 buy_mode 确定入场价
-    if buy_mode == "signal_close":
-        entry_price = last_pb['close']
-        entry_idx = pullback_end
-        entry_date = last_pb['time']
-    else:  # next_open
-        # D0信号确认, D1开盘买入
-        if pullback_end + 1 >= len(bars):
-            return None
-        d1_entry = bars[pullback_end + 1]
-        entry_price = d1_entry['open']
-        entry_idx = pullback_end + 1
-        entry_date = d1_entry['time']
-
-    if entry_price <= 0:
-        return None
-
-    # 去重
-    for (s, e) in used_ranges:
-        if abs(pullback_end - s) <= 4 or abs(pullback_end - e) <= 4:
-            return None
-
-    d1_limit_up_val = is_limit_up(d1['close'], last_pb['close'], bt)
-
-    result = run_backtest(bars, entry_idx, entry_price,
-                          params['hold_days'], params['stop_loss'],
-                          params['trailing_stop'], bt, peak_exit=True,
-                          d1_limit_up=d1_limit_up_val, d1_change=d1_change)
-    if not result:
-        return None
-
-    phase_label_map = {3: '龙回头A', 4: '龙回头B'}
-    return {
-        'code': code, 'board': get_board_name(code),
-        'path': path, 'path_label': path_label,
-        'phase': phase, 'phase_label': phase_label_map.get(phase, path_label),
-        'lu_date': bars[lu_idx]['time'],
-        'pullback_days': pullback_days,
-        'pullback_idx': pullback_end,
-        'signal_date': last_pb['time'],
-        'signal_chg': round(last_chg, 2),
-        'signal_vol_r': round(vol_ratio, 2),
-        'entry_vol_r': round(vol_ratio, 2),
-        'entry_date': entry_date,
-        'entry_price': round(entry_price, 3),
-        'buy_mode': buy_mode,
-        'signal_price': round(last_pb['close'], 3),
-        'd1_change': round(d1_change, 2),
-        'd1_gap': round((entry_price / last_pb['close'] - 1) * 100, 2) if last_pb['close'] > 0 else 0,
-        'intraday': round(d1_change - (entry_price / last_pb['close'] - 1) * 100, 2) if last_pb['close'] > 0 else 0,
-        **result,
-    }
-
-
 def strategy_v1(bars, code,
                 hold_days=7, stop_loss=-10.0, trailing_stop=-5.0,
                 buy_mode="next_open",
@@ -945,7 +567,7 @@ def strategy_v1(bars, code,
                 d_1_pullback_min=-10.0, d_1_pullback_max=-3.0,
                 obv_filter=True,
                 d_1_vol_max=1.5):
-    """V1策略 v3 — 强趋势回踩买入 (追击连板)
+    """V1策略 v3 - 强趋势回踩买入 (追击连板)
 
     核心逻辑 (数据驱动, 241个全市场样本验证):
     ┌──────────────────────────────────────────────────────┐
@@ -976,7 +598,7 @@ def strategy_v1(bars, code,
       - D0是否一字板: 一字板=极强, 但实盘买不进
       - D0动量强度可决定D1追涨幅度上限: 强D0允许追更高D1 open
       - D1高开(>=5%)且未涨停信号(35笔, 25.7%胜率): 需D0强度辅助过滤
-      next_open    — D+1开盘买
+      next_open    - D+1开盘买
     """
     board_type = get_board_type(code)
     threshold = 0.098 if board_type == "main" else 0.198
@@ -1364,7 +986,7 @@ def print_today_signals(all_trades, today_str, buy_mode="next_open"):
 
     # 龙回头信号
     if dc_today:
-        print(f"\n  🐉 龙回头 ({len(dc_today)}只) — 缩量小阴确认, 次日D1开盘买:")
+        print(f"\n  🐉 龙回头 ({len(dc_today)}只) - 缩量小阴确认, 次日D1开盘买:")
         for t in sorted(dc_today, key=lambda x: x.get('entry_vol_r', 0), reverse=True):
             bt = get_board_type(t['code'])
             signal_price = t.get('signal_price', t['entry_price'])
@@ -1376,7 +998,7 @@ def print_today_signals(all_trades, today_str, buy_mode="next_open"):
 
     # V1信号
     if v1_today:
-        print(f"\n  🔥 V1 ({len(v1_today)}只) — D0涨停确认, 次日D1开盘买:")
+        print(f"\n  🔥 V1 ({len(v1_today)}只) - D0涨停确认, 次日D1开盘买:")
         print(f"  {'代码':>8} {'板块':>6} {'动量':>6} {'评分':>4} {'D0收':>8} {'D-1回调':>8} {'20日涨':>8} {'买入建议'}")
         print(f"  {'-' * 85}")
         for t in sorted(v1_today, key=lambda x: calc_momentum_score(x), reverse=True):
@@ -1393,12 +1015,12 @@ def print_today_signals(all_trades, today_str, buy_mode="next_open"):
 
     # 断板信号
     if bb_today:
-        print(f"\n  💥 断板 ({len(bb_today)}只) — 连板后断板确认, 次日开盘买:")
+        print(f"\n  💥 断板 ({len(bb_today)}只) - 连板后断板确认, 次日开盘买:")
         for t in sorted(bb_today, key=lambda x: x.get('streak_len', 0), reverse=True):
             print(f"    {t['code']:<8} {t['board']:<6} {t['streak_len']}板连板 "
                   f"断板{t['break_date']} {t['break_chg']:+.1f}% 量{t['break_vol_r']:.2f}x 预计开盘{t['entry_price']:.2f}")
 
-    # ===== 持仓卖出建议 (20天内买入的持仓) =====
+    # ===== 持仓卖出建议 (7天内买入的持仓) =====
     from datetime import datetime, timedelta
     today_dt = datetime.strptime(today_str, '%Y-%m-%d')
     recent_entries = [t for t in all_trades
@@ -1412,26 +1034,26 @@ def print_today_signals(all_trades, today_str, buy_mode="next_open"):
         hold = [t for t in recent_entries if t.get('intraday', 0) >= 3]
 
         print(f"\n{'=' * 80}")
-        print(f"📊 持仓分析 (20天内买入, 次日开盘执行)")
+        print(f"📊 持仓分析 (7天内买入, 次日开盘执行)")
         print(f"{'=' * 80}")
         print(f"  持仓: {len(recent_entries)}只 | 卖出: {len(sell)}只 | 持有: {len(hold)}只")
 
         if sell:
-            print(f"\n  🔴 明日开盘清仓 ({len(sell)}只) — 日内动量<3%:")
+            print(f"\n  🔴 明日开盘清仓 ({len(sell)}只) - 日内动量<3%:")
             print(f"  {'代码':>8} {'板块':>6} {'策略':>6} {'买入日':>12} {'买入价':>8} {'持仓天':>6} {'D1收':>7} {'日内':>7}")
             print(f"  {'-' * 75}")
             for t in sorted(sell, key=lambda x: x.get('intraday', 0)):
-                pl = {'dragon_callback': '龙回头', 'v1': 'V1', 'break_buy': '断板', '4in1_v1': '4IN1-V1', '4in1_break': '4IN1-断板', '4in1_dragon_a': '4IN1-龙回A', '4in1_dragon_b': '4IN1-龙回B'}.get(t['path'], t['path'])
+                pl = {'dragon_callback': '龙回头', 'v1': 'V1', 'break_buy': '断板', }.get(t['path'], t['path'])
                 hold_days = (today_dt - datetime.strptime(t['entry_date'], '%Y-%m-%d')).days if t.get('entry_date') else 0
                 print(f"  {t['code']:>8} {t['board']:>6} {pl:>6} {t['entry_date']:>12} "
                       f"{t['entry_price']:>7.2f} {hold_days:>5}天 {t.get('d1_change',0):>+6.1f}% {t.get('intraday',0):>+6.1f}%")
 
         if hold:
-            print(f"\n  🟢 继续持有 ({len(hold)}只) — 日内动量>=3%:")
+            print(f"\n  🟢 继续持有 ({len(hold)}只) - 日内动量>=3%:")
             print(f"  {'代码':>8} {'板块':>6} {'策略':>6} {'买入日':>12} {'买入价':>8} {'持仓天':>6} {'D1收':>7} {'日内':>7}")
             print(f"  {'-' * 75}")
             for t in sorted(hold, key=lambda x: -x.get('intraday', 0)):
-                pl = {'dragon_callback': '龙回头', 'v1': 'V1', 'break_buy': '断板', '4in1_v1': '4IN1-V1', '4in1_break': '4IN1-断板', '4in1_dragon_a': '4IN1-龙回A', '4in1_dragon_b': '4IN1-龙回B'}.get(t['path'], t['path'])
+                pl = {'dragon_callback': '龙回头', 'v1': 'V1', 'break_buy': '断板', }.get(t['path'], t['path'])
                 hold_days = (today_dt - datetime.strptime(t['entry_date'], '%Y-%m-%d')).days if t.get('entry_date') else 0
                 print(f"  {t['code']:>8} {t['board']:>6} {pl:>6} {t['entry_date']:>12} "
                       f"{t['entry_price']:>7.2f} {hold_days:>5}天 {t.get('d1_change',0):>+6.1f}% {t.get('intraday',0):>+6.1f}%")
@@ -1450,8 +1072,8 @@ def main():
     parser.add_argument("--pullback", type=int, default=3, help="龙回头最少回调天数")
     parser.add_argument("--max-pullback", type=int, default=11, help="龙回头最多回调天数")
     parser.add_argument("--max-last-chg", type=float, default=3.0, help="龙回头末期小阳最大涨幅%%")
-    parser.add_argument("--strategy", default="all", choices=["all", "dragon", "v1", "break", "4in1"],
-                        help="运行策略: all=全部, dragon=龙回头, v1=V1, break=断板, 4in1=四合一")
+    parser.add_argument("--strategy", default="all", choices=["all", "dragon", "v1", "break"],
+                        help="运行策略: all=全部, dragon=龙回头, v1=V1, break=断板")
     parser.add_argument("--buy-mode", default="next_open",
                         choices=["signal_close", "next_open"],
                         help="买入模式: next_open=D+1开盘买(默认), signal_close=信号日收盘买(回测用)")
@@ -1463,7 +1085,7 @@ def main():
     parser.add_argument("--d1-pullback-max", type=float, default=-3.0, help="V1: D-1回调最大%% (默认-3)")
     parser.add_argument("--no-obv-filter", action="store_true", help="V1: 禁用OBV上升过滤")
     parser.add_argument("--d1-vol-max", type=float, default=1.5, help="V1: D-1量vs5日均量上限 (默认1.5x)")
-    parser.add_argument("--today", action="store_true", help="显示买点+持仓卖出建议 (15天内买入的持仓)")
+    parser.add_argument("--today", action="store_true", help="显示买点+持仓卖出建议 (7天内买入的持仓)")
     parser.add_argument("--today-date", type=str, default="", help="指定日期(YYYY-MM-DD), 默认为当天")
     args = parser.parse_args()
     codes = [c.strip() for c in args.codes.split(",") if c.strip()] if args.codes else TEST_CODES
@@ -1478,33 +1100,28 @@ def main():
     run_dc = args.strategy in ("all", "dragon")
     run_v1 = args.strategy in ("all", "v1")
     run_bb = args.strategy in ("all", "break")
-    run_4in1 = args.strategy == "4in1"
 
     mode_label = {"signal_close": "信号日收盘买", "next_open": "D+1开盘买"}[args.buy_mode]
 
     print(f"{'=' * 80}")
-    if run_4in1:
-        print(f"4IN1 统一策略回测 (V1 → 断板 → 龙回头A → 龙回头B)")
-    else:
-        print(f"龙回头 + V1 + 断板 三策略回测")
+    print(f"龙回头 + V1 + 断板 三策略回测")
     print(f"{'=' * 80}")
     print(f"买入模式: {mode_label}")
     labels = []
-    if run_4in1:
-        labels.append("4IN1(统一管道)")
+    
     if run_dc: labels.append(f"龙回头(回调{args.pullback}-{args.max_pullback}天)")
     if run_v1: labels.append("V1")
     if run_bb: labels.append(f"断板(连板≥2)")
     print(f"运行: {' + '.join(labels)}")
     print(f"股票: {len(codes)}只\n")
 
-    dc_trades, v1_trades, bb_trades, f4in1_trades = [], [], [], []
+    dc_trades, v1_trades, bb_trades = [], [], []
     success = 0
 
     # 加载stock_basic_info (换手率 + 板块效应)
     stock_info = None
     sector_counts_by_date = None
-    need_stock_info = run_4in1  # V1 v2 不再需要 stock_info
+    need_stock_info = False
     if need_stock_info:
         try:
             stock_info = fetch_stock_info_db()
@@ -1514,7 +1131,7 @@ def main():
 
     # 预加载所有K线, 计算板块涨停统计
     all_bars = {}
-    need_sector = run_4in1 and stock_info is not None  # V1 v2 不再需要板块数据
+    need_sector = False
     if need_sector:
         print(f"📊 预加载K线计算板块效应...")
         for code in codes:
@@ -1553,15 +1170,7 @@ def main():
             continue
 
         parts = []
-        if run_4in1:
-            code_bars = all_bars.get(code) if all_bars else bars
-            f4 = strategy_4in1(code_bars, code, buy_mode=args.buy_mode,
-                               stock_info=stock_info,
-                               sector_counts_by_date=sector_counts_by_date)
-            f4in1_trades.extend(f4)
-            if f4:
-                phases = [t['phase_label'] for t in f4]
-                parts.append(f"4IN1{len(f4)}({'+'.join(phases)})")
+
         if run_dc:
             dc = strategy_dragon_callback(bars, code,
                                            min_pullback_days=args.pullback,
@@ -1589,7 +1198,7 @@ def main():
             bb_trades.extend(bb)
             parts.append(f"断板{len(bb)}")
 
-        has_signal = (run_4in1 and len(f4) > 0) or (run_dc and len(dc) > 0) or (run_v1 and len(v1) > 0) or (run_bb and len(bb) > 0)
+        has_signal = (run_dc and len(dc) > 0) or (run_v1 and len(v1) > 0) or (run_bb and len(bb) > 0)
         if has_signal:
             print(f"[{i+1}/{len(codes)}] {code} ({get_board_name(code)}) ✓{len(bars)}根 → {' '.join(parts)}")
         success += 1
@@ -1613,6 +1222,13 @@ def main():
             for lo, hi, label in [(3,5,"3-4天"), (5,8,"5-7天"), (8,12,"8-11天")]:
                 seg = [t for t in dc_trades if lo <= t['pullback_days'] < hi]
                 if seg: print_stats(seg, f"    {label}")
+            print(f"\n  🏆 龙回头TOP5:")
+            for t in sorted(dc_trades, key=lambda x: -x['peak_return_pct'])[:5]:
+                print(f"    {t['code']} 涨停{t['lu_date']} 回调{t['pullback_days']}天 → {t['signal_date']}信号{t['signal_chg']:+.1f}% 量{t['signal_vol_r']:.2f}x → {t['entry_date']}买 收益{t['return_pct']:+.1f}% 峰值{t['peak_return_pct']:+.1f}%")
+            if len(dc_trades) > 5:
+                print(f"\n  💀 龙回头BOTTOM5:")
+                for t in sorted(dc_trades, key=lambda x: x['return_pct'])[:5]:
+                    print(f"    {t['code']} 涨停{t['lu_date']} 回调{t['pullback_days']}天 → {t['signal_date']}信号{t['signal_chg']:+.1f}% 量{t['signal_vol_r']:.2f}x → {t['entry_date']}买 收益{t['return_pct']:+.1f}% 峰值{t['peak_return_pct']:+.1f}%")
 
     if run_v1:
         print(f"\n📊 V1:")
@@ -1629,19 +1245,12 @@ def main():
                     seg = [t for t in streak_trades if t['streak_len'] == sl]
                     print_stats(seg, f"    {sl}板后断")
 
-    if run_4in1:
-        print(f"\n📊 4IN1 统一策略:")
-        print_stats(f4in1_trades, "4IN1")
+
         # 按阶段统计
         for phase, label in [(1, 'V1'), (2, '断板'), (3, '龙回头A'), (4, '龙回头B')]:
-            seg = [t for t in f4in1_trades if t.get('phase') == phase]
+            seg = [t for t in bb_trades if t.get('phase') == phase]
             if seg:
                 print_stats(seg, f"  阶段{phase} {label}")
-        if f4in1_trades:
-            print(f"\n  🏆 4IN1 TOP5:")
-            for t in sorted(f4in1_trades, key=lambda x: -x['peak_return_pct'])[:5]:
-                print(f"    {t['code']} {t['phase_label']:<6} {t['entry_date']}买 "
-                      f"收益{t['return_pct']:+.1f}% 峰值{t['peak_return_pct']:+.1f}%")
 
     # ===== 混合结果 =====
     all_trades = dc_trades + v1_trades + bb_trades
@@ -1661,7 +1270,7 @@ def main():
     # ===== 今日买点统计 =====
     if args.today:
         today_str = args.today_date or time.strftime("%Y-%m-%d")
-        all_for_today = dc_trades + v1_trades + bb_trades + f4in1_trades
+        all_for_today = dc_trades + v1_trades + bb_trades
         today_trades = print_today_signals(all_for_today, today_str, buy_mode=args.buy_mode)
         if today_trades:
             with open(f"today_signals_{today_str}.json", "w", encoding="utf-8") as f:
@@ -1678,7 +1287,7 @@ def main():
                   f"收益{t['return_pct']:>+6.2f}% 峰值{t['peak_return_pct']:>+6.2f}%")
 
     # 导出
-    all_out = dc_trades + v1_trades + bb_trades + f4in1_trades
+    all_out = dc_trades + v1_trades + bb_trades
     if all_out:
         with open("test_dragon_callback_result.json", "w", encoding="utf-8") as f:
             json.dump(all_out, f, ensure_ascii=False, indent=2)
