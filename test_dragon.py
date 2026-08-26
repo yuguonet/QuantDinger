@@ -57,7 +57,7 @@ V1核心参数:
 │   日内动量 < 3%  → D2开盘清仓 (买盘不足, 宁缺毋滥)                         │
 │   日内动量 >= 3% → 继续持有, 按以下规则出场:                                │
 │     - 追踪止损: 从峰值回撤 -5%                                              │
-│     - 持仓上限: 20个交易日                                                  │
+│     - 持仓上限: 7个交易日                                                  │
 │                                                                             │
 │ 数据验证:                                                                    │
 │   日内>=3% 持有组: 97笔, 99.0%胜率, 均+8.75%, 仅1笔亏-0.81%                │
@@ -360,7 +360,7 @@ def find_limit_ups(bars, board_type):
             result.append(i)
     return result
 
-def run_backtest(bars, entry_idx, entry_price, hold_days=20, stop_loss=-10.0, trailing_stop=-8.0, board_type="main", peak_exit=False, is_v1=False, d1_limit_up=None, d1_change=None, d1_gap=None):
+def run_backtest(bars, entry_idx, entry_price, hold_days=7, stop_loss=-10.0, trailing_stop=-8.0, board_type="main", peak_exit=False, is_v1=False, d1_limit_up=None, d1_change=None, d1_gap=None):
     if entry_price <= 0 or entry_idx >= len(bars):
         return None
     limit_threshold = 0.098 if board_type == "main" else 0.198
@@ -441,7 +441,7 @@ def run_backtest(bars, entry_idx, entry_price, hold_days=20, stop_loss=-10.0, tr
 
 def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=11,
                              max_last_chg=3.0,
-                             hold_days=15, stop_loss=-5.0, trailing_stop=-5.0,
+                             hold_days=7, stop_loss=-5.0, trailing_stop=-5.0,
                              buy_mode="next_open"):
     """
     龙回头v4 (优化版):
@@ -574,7 +574,7 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
 
 # V1 默认参数 (v2 - 只保留核心四因子)
 _V1_PARAMS = dict(
-    v1_hold_days=20, v1_stop_loss=-10.0, v1_trailing_stop=-5.0,
+    v1_hold_days=7, v1_stop_loss=-10.0, v1_trailing_stop=-5.0,
     ret_20d_min=30.0,
     d_1_pullback_min=-10.0, d_1_pullback_max=-3.0,
     obv_filter=True,
@@ -584,18 +584,18 @@ _V1_PARAMS = dict(
 # 断板默认参数
 _BREAK_PARAMS = dict(
     stop_loss=-8.0, trailing_stop=-6.0, take_profit=15.0,
-    hold_days=20, vol_min=1.2, vol_max=2.0, drawdown_max=-10,
+    hold_days=7, vol_min=1.2, vol_max=2.0, drawdown_max=-10,
 )
 
 # 龙回头 A 默认参数 (D3~D5, 短回调)
 _DRAGON_A_PARAMS = dict(
-    stop_loss=-5.0, trailing_stop=-5.0, hold_days=10,
+    stop_loss=-5.0, trailing_stop=-5.0, hold_days=7,
     max_last_chg=3.0, min_vol_ratio=0.5, max_vol_ratio=0.8,
 )
 
 # 龙回头 B 默认参数 (D6~D11, 长回调)
 _DRAGON_B_PARAMS = dict(
-    stop_loss=-5.0, trailing_stop=-5.0, hold_days=10,
+    stop_loss=-5.0, trailing_stop=-5.0, hold_days=7,
     max_last_chg=3.0, min_vol_ratio=0.5, max_vol_ratio=0.8,
 )
 
@@ -939,7 +939,7 @@ def _dragon_phase(bars, code, lu_idx, min_pb, max_pb, params, bt, threshold,
 
 
 def strategy_v1(bars, code,
-                hold_days=20, stop_loss=-10.0, trailing_stop=-5.0,
+                hold_days=7, stop_loss=-10.0, trailing_stop=-5.0,
                 buy_mode="next_open",
                 ret_20d_min=30.0,
                 d_1_pullback_min=-10.0, d_1_pullback_max=-3.0,
@@ -1076,7 +1076,7 @@ BOARD_PARAMS = {
     "gem_star": {"stop_loss": -10.0, "trailing_stop": -8.0, "take_profit": 20.0, "hold_days": 15, "vol_min": 1.2, "vol_max": 2.5, "drawdown_max": -15},
 }
 
-def run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=20, stop_loss=-8.0,
+def run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=7, stop_loss=-8.0,
                           trailing_stop=-6.0, board_type="main"):
     """断板专用回测: 追踪止损 + 峰值逃顶信号"""
     if entry_price <= 0 or entry_idx >= len(bars):
@@ -1435,7 +1435,7 @@ def print_today_signals(all_trades, today_str, buy_mode="next_open"):
                 hold_days = (today_dt - datetime.strptime(t['entry_date'], '%Y-%m-%d')).days if t.get('entry_date') else 0
                 print(f"  {t['code']:>8} {t['board']:>6} {pl:>6} {t['entry_date']:>12} "
                       f"{t['entry_price']:>7.2f} {hold_days:>5}天 {t.get('d1_change',0):>+6.1f}% {t.get('intraday',0):>+6.1f}%")
-            print(f"\n    出场规则: 追踪止损-5% / 持仓上限20天")
+            print(f"\n    出场规则: 追踪止损-5% / 持仓上限7天")
 
     return today_trades
 
@@ -1613,13 +1613,6 @@ def main():
             for lo, hi, label in [(3,5,"3-4天"), (5,8,"5-7天"), (8,12,"8-11天")]:
                 seg = [t for t in dc_trades if lo <= t['pullback_days'] < hi]
                 if seg: print_stats(seg, f"    {label}")
-            print(f"\n  🏆 龙回头TOP5:")
-            for t in sorted(dc_trades, key=lambda x: -x['peak_return_pct'])[:5]:
-                print(f"    {t['code']} 涨停{t['lu_date']} 回调{t['pullback_days']}天 → {t['signal_date']}信号{t['signal_chg']:+.1f}% 量{t['signal_vol_r']:.2f}x → {t['entry_date']}买 收益{t['return_pct']:+.1f}% 峰值{t['peak_return_pct']:+.1f}%")
-            if len(dc_trades) > 5:
-                print(f"\n  💀 龙回头BOTTOM5:")
-                for t in sorted(dc_trades, key=lambda x: x['return_pct'])[:5]:
-                    print(f"    {t['code']} 涨停{t['lu_date']} 回调{t['pullback_days']}天 → {t['signal_date']}信号{t['signal_chg']:+.1f}% 量{t['signal_vol_r']:.2f}x → {t['entry_date']}买 收益{t['return_pct']:+.1f}% 峰值{t['peak_return_pct']:+.1f}%")
 
     if run_v1:
         print(f"\n📊 V1:")

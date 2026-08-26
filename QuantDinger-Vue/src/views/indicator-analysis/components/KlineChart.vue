@@ -2272,6 +2272,12 @@ registerOverlay({
               setTimeout(() => {
                 if (chartRef.value) {
                   updateIndicators()
+                  // 滚动到最新K线，Y轴自动适配可见区域极值
+                  try {
+                    if (typeof chartRef.value.scrollToRealTime === 'function') {
+                      chartRef.value.scrollToRealTime()
+                    }
+                  } catch (_) {}
                 }
               }, 100)
             }
@@ -4501,11 +4507,16 @@ registerOverlay({
     }
 
     // 生命周期
-    watch(() => props.symbol, () => {
-      if (props.symbol) {
-        loadKlineData()
-      }
-    })
+    /** debounce 包装，防止 symbol/market/timeframe 同时变化时重复加载 */
+    let _loadDebounceTimer = null
+    const debouncedLoad = () => {
+      clearTimeout(_loadDebounceTimer)
+      _loadDebounceTimer = setTimeout(() => {
+        if (props.symbol) loadKlineData()
+      }, 80)
+    }
+
+    watch(() => props.symbol, debouncedLoad)
     watch(() => props.theme, (newTheme) => {
       chartTheme.value = newTheme
       if (chartRef.value) {
@@ -4515,17 +4526,8 @@ registerOverlay({
       nextTick(() => _ensureWmLayer())
     })
 
-    watch(() => props.market, () => {
-      if (props.symbol) {
-        loadKlineData()
-      }
-    })
-
-    watch(() => props.timeframe, () => {
-      if (props.symbol) {
-        loadKlineData()
-      }
-    })
+    watch(() => props.market, debouncedLoad)
+    watch(() => props.timeframe, debouncedLoad)
 
     watch(() => props.activeIndicators, (newVal, oldVal) => {
       // 当指标列表变化时，重新渲染图表
@@ -4837,6 +4839,48 @@ registerOverlay({
       showIndicatorSignals () {
         // Re-trigger indicator signal rendering by re-running the indicator
         // Caller should invoke updateActiveIndicators() or equivalent
+      },
+      /** 切换K线配色方案: cn=红涨绿跌, intl=绿涨红跌 */
+      setChartColorScheme (scheme) {
+        if (!chartRef.value) return
+        const isIntl = scheme === 'intl'
+        const isDark = props.theme === 'dark'
+        try {
+          chartRef.value.setStyles({
+            candle: {
+              bar: {
+                upColor: isIntl ? (isDark ? '#0ecb81' : '#52c41a') : (isDark ? '#ef5350' : '#f5222d'),
+                downColor: isIntl ? (isDark ? '#ef5350' : '#f5222d') : (isDark ? '#0ecb81' : '#52c41a'),
+                upBorderColor: isIntl ? (isDark ? '#0ecb81' : '#52c41a') : (isDark ? '#ef5350' : '#f5222d'),
+                downBorderColor: isIntl ? (isDark ? '#ef5350' : '#f5222d') : (isDark ? '#0ecb81' : '#52c41a'),
+                upWickColor: isIntl ? (isDark ? '#0ecb81' : '#52c41a') : (isDark ? '#ef5350' : '#f5222d'),
+                downWickColor: isIntl ? (isDark ? '#ef5350' : '#f5222d') : (isDark ? '#0ecb81' : '#52c41a')
+              }
+            },
+            indicator: {
+              bars: [{
+                upColor: isIntl ? (isDark ? '#0ecb81' : '#52c41a') : (isDark ? '#ef5350' : '#f5222d'),
+                downColor: isIntl ? (isDark ? '#ef5350' : '#f5222d') : (isDark ? '#0ecb81' : '#52c41a')
+              }]
+            }
+          })
+        } catch (e) { console.warn('setChartColorScheme failed:', e) }
+      },
+      /** 显示/隐藏画线工具栏 */
+      setDrawingBarVisible (visible) {
+        const el = document.querySelector('.drawing-toolbar')
+        if (el) el.style.display = visible ? 'flex' : 'none'
+      },
+      /** 切换Y轴模式: price=金额, percent=比例 */
+      setYAxisMode (mode) {
+        if (!chartRef.value) return
+        try {
+          chartRef.value.setStyles({
+            yAxis: {
+              type: mode === 'percent' ? 'percentage' : 'normal'
+            }
+          })
+        } catch (e) { console.warn('setYAxisMode failed:', e) }
       }
     }
   }
@@ -4882,7 +4926,7 @@ registerOverlay({
   width: 40px;
   background: #fff;
   border-right: 1px solid #e8e8e8;
-  display: flex;
+  display: none;
   flex-direction: column;
   align-items: center;
   padding: 8px 4px;

@@ -1,59 +1,5 @@
 <template>
   <div class="indicator-ide" :class="{ 'theme-dark': isDarkTheme }">
-    <!-- Header toolbar -->
-    <div class="ide-toolbar">
-      <div class="toolbar-left">
-        <!-- Tab 切换按钮 -->
-        <div
-          v-for="tab in chartTabOptions"
-          :key="tab.key"
-          class="ide-toolbar-tab"
-          :class="{ active: activeChartTab === tab.key }"
-          @click="switchChartTab(tab.key)"
-        >
-          <a-icon :type="tab.icon" />
-          <span>{{ tab.label }}</span>
-          <a-tag v-if="tab.key === 'code' && codeDirty && !selectedIndicatorIsPurchased" color="orange" size="small" class="ide-toolbar-tab-badge">{{ $t('indicatorIde.modified') }}</a-tag>
-          <a-tag v-if="tab.key === 'code' && selectedIndicatorIsPurchased" color="purple" size="small" class="ide-toolbar-tab-badge">{{ $t('indicatorIde.purchasedReadOnlyTag') }}</a-tag>
-        </div>
-      </div>
-
-      <div class="toolbar-right">
-        <!-- 外置指标选择器 -->
-        <div class="ide-toolbar-ext-indicator">
-          <a-select
-            v-model="selectedIndicatorId"
-            size="small"
-            :placeholder="$t('backtest-center.indicator.selectIndicatorPlaceholder')"
-            :loading="loadingIndicators"
-            allow-clear
-            show-search
-            option-filter-prop="children"
-            @change="onIndicatorChange"
-          >
-            <a-select-option
-              v-for="ind in indicators"
-              :key="ind.id"
-              :value="ind.id"
-            >
-              <span>{{ ind.name || ('Indicator #' + ind.id) }}</span>
-              <a-tag v-if="Number(ind.is_buy) === 1" color="purple" size="small" style="margin-left: 6px;">{{ $t('indicatorIde.purchasedBadge') }}</a-tag>
-            </a-select-option>
-          </a-select>
-        </div>
-        <a-tooltip :title="$t('indicatorIde.toolbar.settings') || '设置'">
-          <a-button class="ide-toolbar-icon-btn" size="small" @click="openChartSettings">
-            <a-icon type="setting" />
-          </a-button>
-        </a-tooltip>
-        <a-tooltip :title="$t('indicatorIde.toolbar.fullscreen') || '全屏'">
-          <a-button class="ide-toolbar-icon-btn" size="small" @click="toggleFullscreen">
-            <a-icon :type="isFullscreen ? 'fullscreen-exit' : 'fullscreen'" />
-          </a-button>
-        </a-tooltip>
-      </div>
-    </div>
-
     <!-- Main split panels -->
     <div class="ide-main">
       <!-- Left panel: 自选股 -->
@@ -72,11 +18,97 @@
 
       <!-- Right panel (chart/code/AI tabs + results) -->
       <div class="ide-right">
+        <!-- Header toolbar -->
+        <div class="ide-toolbar">
+          <div class="toolbar-left">
+            <!-- Tab 切换按钮 -->
+            <div
+              v-for="tab in chartTabOptions"
+              :key="tab.key"
+              class="ide-toolbar-tab"
+              :class="{ active: activeChartTab === tab.key }"
+              @click="switchChartTab(tab.key)"
+            >
+              <a-icon :type="tab.icon" />
+              <span>{{ tab.label }}</span>
+              <a-tag v-if="tab.key === 'code' && codeDirty && !selectedIndicatorIsPurchased" color="orange" size="small" class="ide-toolbar-tab-badge">{{ $t('indicatorIde.modified') }}</a-tag>
+              <a-tag v-if="tab.key === 'code' && selectedIndicatorIsPurchased" color="purple" size="small" class="ide-toolbar-tab-badge">{{ $t('indicatorIde.purchasedReadOnlyTag') }}</a-tag>
+            </div>
+          </div>
+
+          <div class="toolbar-right">
+            <!-- 外置指标选择器 -->
+            <div class="ide-toolbar-ext-indicator">
+              <a-select
+                v-model="selectedIndicatorId"
+                size="small"
+                :placeholder="$t('backtest-center.indicator.selectIndicatorPlaceholder')"
+                :loading="loadingIndicators"
+                allow-clear
+                show-search
+                option-filter-prop="children"
+                @change="onIndicatorChange"
+              >
+                <a-select-option
+                  v-for="ind in indicators"
+                  :key="ind.id"
+                  :value="ind.id"
+                >
+                  <span>{{ ind.name || ('Indicator #' + ind.id) }}</span>
+                  <a-tag v-if="Number(ind.is_buy) === 1" color="purple" size="small" style="margin-left: 6px;">{{ $t('indicatorIde.purchasedBadge') }}</a-tag>
+                </a-select-option>
+              </a-select>
+            </div>
+            <a-popover
+              v-model="settingsPopoverVisible"
+              trigger="click"
+              placement="bottomRight"
+              overlay-class-name="settings-popover"
+            >
+              <template slot="content">
+                <div class="settings-popover-body">
+                  <div class="settings-group">
+                    <div class="settings-group-title">K线配色</div>
+                    <a-radio-group v-model="chartColorScheme" size="small" @change="onColorSchemeChange">
+                      <a-radio-button value="cn">红涨绿跌</a-radio-button>
+                      <a-radio-button value="intl">绿涨红跌</a-radio-button>
+                    </a-radio-group>
+                  </div>
+                  <div class="settings-group">
+                    <div class="settings-group-title">画线工具栏</div>
+                    <a-switch
+                      :checked="drawingBarVisible"
+                      checked-children="显示"
+                      un-checked-children="隐藏"
+                      @change="toggleDrawingBar"
+                    />
+                  </div>
+                  <div class="settings-group">
+                    <div class="settings-group-title">右侧Y轴</div>
+                    <a-radio-group v-model="yAxisMode" size="small" @change="onYAxisModeChange">
+                      <a-radio-button value="price">金额</a-radio-button>
+                      <a-radio-button value="percent">比例(%)</a-radio-button>
+                    </a-radio-group>
+                  </div>
+                </div>
+              </template>
+              <a-button class="ide-toolbar-icon-btn" size="small">
+                <a-icon type="setting" />
+              </a-button>
+            </a-popover>
+            <a-tooltip :title="$t('indicatorIde.toolbar.fullscreen') || '全屏'">
+              <a-button class="ide-toolbar-icon-btn" size="small" @click="toggleFullscreen">
+                <a-icon :type="isFullscreen ? 'fullscreen-exit' : 'fullscreen'" />
+              </a-button>
+            </a-tooltip>
+          </div>
+        </div>
+
         <!-- K线视窗 / 代码编辑器 / AI生成 tab 切换 -->
         <div class="ide-chart-area" :style="{ flex: 'none', height: chartPanelHeight + '%' }">
           <!-- K线图 -->
           <div v-show="activeChartTab === 'chart'" class="ide-chart-tab-content">
-            <!-- 蜡烛图区域内工具栏：K线周期 + fx内置指标按钮 -->
+            <!-- 蜡烛图区域内工具栏 -->
             <div class="ide-chart-toolbar">
               <div class="ide-chart-toolbar-tf">
                 <span class="ide-chart-toolbar-label">K线周期</span>
@@ -96,27 +128,50 @@
                 overlay-class-name="indicator-checkbox-popover"
               >
                 <template slot="content">
-                  <div class="indicator-popover-header">
-                    <a-input
-                      v-model="indicatorSearchText"
-                      size="small"
-                      :placeholder="$t('common.search') || '搜索指标...'"
-                      allow-clear
-                      class="indicator-popover-search"
-                    />
-                  </div>
-                  <div class="indicator-popover-list">
-                    <div
-                      v-for="ind in filteredBuiltinIndicators"
-                      :key="ind.id"
-                      class="indicator-popover-item"
-                      :class="{ 'indicator-popover-item--active': isBuiltinIndicatorActive(ind.id) }"
-                      @click="toggleBuiltinIndicator(ind)"
-                    >
-                      <a-checkbox :checked="isBuiltinIndicatorActive(ind.id)" @click.stop="toggleBuiltinIndicator(ind)">
-                        <span>{{ ind.shortName }}</span>
-                        <span class="indicator-popover-item-name">{{ ind.name }}</span>
-                      </a-checkbox>
+                  <div class="indicator-pro-popover">
+                    <div class="indicator-pro-header">
+                      <span class="indicator-pro-title">指标</span>
+                      <a-icon type="close" class="indicator-pro-close" @click="indicatorPopoverVisible = false" />
+                    </div>
+                    <div class="indicator-pro-search">
+                      <a-input
+                        v-model="indicatorSearchText"
+                        size="small"
+                        placeholder="搜索指标..."
+                        allow-clear
+                      />
+                    </div>
+                    <div class="indicator-pro-body">
+                      <div class="indicator-pro-section">
+                        <div class="indicator-pro-section-title">主图指标</div>
+                        <div
+                          v-for="ind in filteredMainIndicators"
+                          :key="ind.id"
+                          class="indicator-pro-item"
+                          :class="{ active: isBuiltinIndicatorActive(ind.id) }"
+                          @click="toggleBuiltinIndicator(ind)"
+                        >
+                          <span class="indicator-pro-check" :class="{ checked: isBuiltinIndicatorActive(ind.id) }">
+                            <a-icon v-if="isBuiltinIndicatorActive(ind.id)" type="check" />
+                          </span>
+                          <span class="indicator-pro-label">{{ ind.shortName }}({{ ind.name }})</span>
+                        </div>
+                      </div>
+                      <div class="indicator-pro-section">
+                        <div class="indicator-pro-section-title">副图指标</div>
+                        <div
+                          v-for="ind in filteredSubIndicators"
+                          :key="ind.id"
+                          class="indicator-pro-item"
+                          :class="{ active: isBuiltinIndicatorActive(ind.id) }"
+                          @click="toggleBuiltinIndicator(ind)"
+                        >
+                          <span class="indicator-pro-check" :class="{ checked: isBuiltinIndicatorActive(ind.id) }">
+                            <a-icon v-if="isBuiltinIndicatorActive(ind.id)" type="check" />
+                          </span>
+                          <span class="indicator-pro-label">{{ ind.shortName }}({{ ind.name }})</span>
+                        </div>
+                      </div>
                     </div>
                   </div>
                 </template>
@@ -135,7 +190,7 @@
               :activeIndicators="activeIndicators"
               :userId="userId"
               :realtime-enabled="klineRealtimeEnabled"
-              :showIndicatorBar="true"
+              :showIndicatorBar="false"
               @indicator-toggle="handleIndicatorToggle"
             />
           </div>
@@ -170,10 +225,6 @@
                 </a-tooltip>
               </div>
             </div>
-          </div>
-
-          <!-- 代码编辑器 -->
-          <div v-show="activeChartTab === 'code'" class="ide-chart-tab-content ide-code-tab-content">
             <div class="ide-guide-bar">
               <a-icon type="book" />
               <span>{{ $t('indicatorIde.devGuideTooltip') }}</span>
@@ -395,7 +446,6 @@
                     <div class="param-strategy-hint" style="display: none;">止损、止盈、仓位与追踪止损等请在代码中用 # @strategy 声明；成交时机固定为下一根 K 线开盘（贴近实盘）。</div>
                   </div>
                 </div>
-              </div>
               </div>
             </a-tab-pane>
 
@@ -1059,22 +1109,38 @@ export default {
       indicatorPopoverVisible: false,
       indicatorSearchText: '',
       isFullscreen: false,
-      /** 内置技术指标列表（与 KlineChart indicatorButtons 一致） */
+      settingsPopoverVisible: false,
+      chartColorScheme: 'cn',
+      drawingBarVisible: false,
+      yAxisMode: 'price',
+      /** 内置技术指标列表（分主图/副图） */
       builtinIndicators: [
-        { id: 'sma', name: '简单移动平均', shortName: 'SMA' },
-        { id: 'ema', name: '指数移动平均', shortName: 'EMA' },
-        { id: 'rsi', name: '相对强弱指标', shortName: 'RSI' },
-        { id: 'macd', name: 'MACD', shortName: 'MACD' },
-        { id: 'bb', name: '布林带', shortName: 'BB' },
-        { id: 'atr', name: '平均真实波幅', shortName: 'ATR' },
-        { id: 'cci', name: '商品通道指数', shortName: 'CCI' },
-        { id: 'williams', name: '威廉指标', shortName: 'W%R' },
-        { id: 'mfi', name: '资金流量指标', shortName: 'MFI' },
-        { id: 'adx', name: '平均趋向指数', shortName: 'ADX' },
-        { id: 'obv', name: '能量潮', shortName: 'OBV' },
-        { id: 'adosc', name: '积累/派发振荡器', shortName: 'ADOSC' },
-        { id: 'ad', name: '积累/派发线', shortName: 'AD' },
-        { id: 'kdj', name: 'KDJ 随机指标', shortName: 'KDJ' }
+        // 主图指标
+        { id: 'sma', name: '移动平均线', shortName: 'MA', group: 'main' },
+        { id: 'ema', name: '指数平滑移动平均线', shortName: 'EMA', group: 'main' },
+        { id: 'bb', name: '布林线', shortName: 'BOLL', group: 'main' },
+        { id: 'sar', name: '停损点转向指标', shortName: 'SAR', group: 'main' },
+        { id: 'sma2', name: '简单移动平均', shortName: 'SMA', group: 'main' },
+        { id: 'bbi', name: '多空指数', shortName: 'BBI', group: 'main' },
+        // 副图指标
+        { id: 'macd', name: '指数平滑异同平均', shortName: 'MACD', group: 'sub' },
+        { id: 'rsi', name: '相对强弱指标', shortName: 'RSI', group: 'sub' },
+        { id: 'kdj', name: '随机指标', shortName: 'KDJ', group: 'sub' },
+        { id: 'cci', name: '商品通道指数', shortName: 'CCI', group: 'sub' },
+        { id: 'williams', name: '威廉指标', shortName: 'WR', group: 'sub' },
+        { id: 'atr', name: '平均真实波幅', shortName: 'ATR', group: 'sub' },
+        { id: 'adx', name: '平均趋向指数', shortName: 'ADX', group: 'sub' },
+        { id: 'mfi', name: '资金流量指标', shortName: 'MFI', group: 'sub' },
+        { id: 'obv', name: '能量潮', shortName: 'OBV', group: 'sub' },
+        { id: 'adosc', name: '积累派发振荡器', shortName: 'ADOSC', group: 'sub' },
+        { id: 'ad', name: '积累派发线', shortName: 'AD', group: 'sub' },
+        { id: 'dmi', name: '趋向指标', shortName: 'DMI', group: 'sub' },
+        { id: 'trix', name: '三重指数平滑', shortName: 'TRIX', group: 'sub' },
+        { id: 'dpo', name: '去趋势价格', shortName: 'DPO', group: 'sub' },
+        { id: 'psy', name: '心理线', shortName: 'PSY', group: 'sub' },
+        { id: 'vr', name: '成交量比率', shortName: 'VR', group: 'sub' },
+        { id: 'emv', name: '简易波动', shortName: 'EMV', group: 'sub' },
+        { id: 'vwap', name: '成交量加权均价', shortName: 'VWAP', group: 'sub' }
       ],
 
       // AI generation
@@ -1193,14 +1259,13 @@ export default {
     tfMaxDays () {
       return TF_MAX_DAYS[this.timeframe] || 3650
     },
-    /** 根据搜索文本过滤内置指标列表 */
-    filteredBuiltinIndicators () {
-      const q = (this.indicatorSearchText || '').toLowerCase().trim()
-      if (!q) return this.builtinIndicators
-      return this.builtinIndicators.filter(ind =>
-        ind.shortName.toLowerCase().includes(q) ||
-        ind.name.toLowerCase().includes(q)
-      )
+    /** 主图指标（过滤后） */
+    filteredMainIndicators () {
+      return this._filterIndicators('main')
+    },
+    /** 副图指标（过滤后） */
+    filteredSubIndicators () {
+      return this._filterIndicators('sub')
     },
     filteredDatePresets () {
       return DATE_PRESETS.filter(p => p.days <= this.tfMaxDays)
@@ -1625,9 +1690,7 @@ export default {
           if (!chart.chartRef && typeof chart.initChart === 'function') {
             chart.initChart()
           }
-          if (typeof chart.loadKlineData === 'function') {
-            chart.loadKlineData()
-          }
+          // 不再在此调用 loadKlineData，由 KlineChart 内部 watcher(debounce) 统一处理
           if (this.selectedIndicatorId) {
             this.syncSelectedIndicatorToChart()
           }
@@ -3210,13 +3273,25 @@ export default {
     },
 
     // ===== Settings & Fullscreen =====
-    openChartSettings () {
-      // 打开图表个性化设置弹窗（主题、颜色方案等）
+    onColorSchemeChange (e) {
+      const scheme = e.target ? e.target.value : e
       const chart = this.$refs.klineChart
-      if (chart && typeof chart.openSettings === 'function') {
-        chart.openSettings()
-      } else {
-        this.$message.info(this.$t('indicatorIde.settingsNotAvailable') || '图表设置功能开发中')
+      if (chart && chart.setChartColorScheme) {
+        chart.setChartColorScheme(scheme)
+      }
+    },
+    toggleDrawingBar (checked) {
+      this.drawingBarVisible = checked
+      const chart = this.$refs.klineChart
+      if (chart && chart.setDrawingBarVisible) {
+        chart.setDrawingBarVisible(checked)
+      }
+    },
+    onYAxisModeChange (e) {
+      const mode = e.target ? e.target.value : e
+      const chart = this.$refs.klineChart
+      if (chart && chart.setYAxisMode) {
+        chart.setYAxisMode(mode)
       }
     },
     toggleFullscreen () {
@@ -3228,6 +3303,12 @@ export default {
         (document.exitFullscreen || document.webkitExitFullscreen || document.mozCancelFullScreen || document.msExitFullscreen).call(document)
         this.isFullscreen = false
       }
+    },
+    _filterIndicators (group) {
+      const q = (this.indicatorSearchText || '').toLowerCase().trim()
+      const list = this.builtinIndicators.filter(ind => ind.group === group)
+      if (!q) return list
+      return list.filter(ind => ind.shortName.toLowerCase().includes(q) || ind.name.toLowerCase().includes(q))
     },
     /** 判断内置指标是否已激活 */
     isBuiltinIndicatorActive (indicatorId) {
@@ -3878,7 +3959,10 @@ export default {
     display: flex;
     align-items: center;
     gap: 2px;
-    margin: 0 auto;
+    flex: 1;
+    justify-content: center;
+    overflow-x: auto;
+    min-width: 0;
   }
   .toolbar-right { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
 }
@@ -3938,44 +4022,94 @@ export default {
   align-items: center;
   gap: 4px;
 }
-/* 指标弹出选择器样式 */
+/* 指标弹出触发按钮 */
 .indicator-popover-trigger {
   display: inline-flex !important;
   align-items: center;
   gap: 4px;
   font-size: 12px;
+  font-weight: 600;
   border-radius: 6px !important;
+  color: #555;
+  &:hover { color: #1890ff; border-color: #1890ff; }
 }
-.indicator-popover-header {
-  margin-bottom: 8px;
-}
-.indicator-popover-search {
-  width: 200px;
-}
-.indicator-popover-list {
+/* KlineChartPro 风格指标弹出框 */
+.indicator-pro-popover {
+  width: 280px;
+  max-height: 420px;
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  max-height: 360px;
-  overflow-y: auto;
-  min-width: 220px;
 }
-.indicator-popover-item {
-  padding: 4px 8px;
-  border-radius: 4px;
-  transition: background 0.15s;
-  cursor: pointer;
-  &:hover {
-    background: rgba(24, 144, 255, 0.06);
-  }
-  &--active {
-    background: rgba(24, 144, 255, 0.08);
-  }
+.indicator-pro-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px 8px;
+  flex-shrink: 0;
 }
-.indicator-popover-item-name {
-  font-size: 11px;
+.indicator-pro-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: #1a1a1a;
+}
+.indicator-pro-close {
+  font-size: 14px;
   color: #999;
-  margin-left: 6px;
+  cursor: pointer;
+  padding: 4px;
+  &:hover { color: #333; }
+}
+.indicator-pro-search {
+  padding: 0 16px 8px;
+  flex-shrink: 0;
+}
+.indicator-pro-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 8px 8px;
+}
+.indicator-pro-section {
+  margin-bottom: 4px;
+}
+.indicator-pro-section-title {
+  font-size: 12px;
+  color: #999;
+  padding: 8px 8px 4px;
+  font-weight: 600;
+}
+.indicator-pro-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.12s;
+  &:hover { background: #f0f5ff; }
+  &.active { background: #e6f7ff; }
+}
+.indicator-pro-check {
+  width: 16px;
+  height: 16px;
+  border: 1.5px solid #d0d0d0;
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: all 0.15s;
+  font-size: 10px;
+  color: transparent;
+  &.checked {
+    background: #1890ff;
+    border-color: #1890ff;
+    color: #fff;
+  }
+}
+.indicator-pro-label {
+  font-size: 13px;
+  color: #333;
+  .active & { color: #1890ff; font-weight: 600; }
 }
 /* 蜡烛图区域内工具栏 */
 .ide-chart-toolbar {
@@ -4000,7 +4134,22 @@ export default {
 /* 工具栏外置指标选择器 */
 .ide-toolbar-ext-indicator {
   flex-shrink: 0;
-  min-width: 180px;
+  width: 200px;
+  .ant-select { width: 100% !important; }
+}
+/* 设置弹窗 */
+.settings-popover-body {
+  min-width: 200px;
+}
+.settings-group {
+  margin-bottom: 12px;
+  &:last-child { margin-bottom: 0; }
+}
+.settings-group-title {
+  font-size: 12px;
+  color: #666;
+  margin-bottom: 6px;
+  font-weight: 600;
 }
 .ide-toolbar-group {
   display: flex;
@@ -5566,6 +5715,7 @@ export default {
     border-bottom-color: #303030;
   }
   .ide-chart-toolbar-label { color: rgba(255,255,255,0.45); }
+  .indicator-popover-trigger { color: rgba(255,255,255,0.65); &:hover { color: #58a6ff; } }
   .tf-group /deep/ .ant-radio-button-wrapper {
     background: #262626;
     border-color: #434343;
